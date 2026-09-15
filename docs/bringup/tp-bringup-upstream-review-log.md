@@ -1715,7 +1715,7 @@ emits fewer, larger dispatches. Making each dispatch cheaper to ISSUE is measura
 regime turns host-bound, not as a latency lever. It has no measured effect available to it on
 either path today.
 
-## The decode tick is 832 individual hipBLASLt calls: what can be fused, what cannot, and why fusion alone still misses 25 ms (2026-09-15, CPU-only `disasm` + `op-audit`)
+## The decode tick is 832 individual Tensile dispatches that PLOW ITSELF issues: what can be fused, what cannot, and why fusion alone still misses 25 ms (2026-09-15, CPU-only `disasm` + `op-audit`)
 
 Everything here is offline — `plowrt disasm --program <T> --stream` carries each stream entry's `seg`,
 and `derive_segments` is just `max(seg)+1`, so the segment structure of every rung is readable from
@@ -1751,13 +1751,13 @@ the ladder contains a direct counter-example.
 
 | | segments | |
 |---|---|---|
-| solo `GemmLtPf` (op 158) | **832** | one hipBLASLt matmul dispatch each — 64% of all segments |
+| solo `GemmLtPf` (op 158) | **832** | one plow-issued Tensile matmul dispatch each — 64% of all segments |
 | solo `RmsNorm` (op 1) | 78 | |
 | solo `MoeAiterFp8Pf` (op 156) | 75 | the aiter fused-MoE native |
 | multi-instruction segments | 308 | holding 1049 instructions — the interpreter runs, MLA, and indexer |
 | **total** | **1293** | 2034 instructions |
 
-832 hipBLASLt calls over 78 layers is **~10.7 projection GEMMs per layer, each its own dispatch**.
+832 dispatches over 78 layers is **~10.7 projection GEMMs per layer, each its own AQL packet**.
 
 ### The register and wave-geometry gate
 
@@ -1798,12 +1798,49 @@ Recorded as a separate finding: the decode megakernel runs at **2 waves per SIMD
 cap and the LDS budget pinning it there *independently* — relieving one alone changes nothing. The
 aiter natives run at 1 wave/SIMD. At batch 1 there is almost no latency hiding on this path.
 
-### So the lever is the 832 hipBLASLt calls, and it is an API question, not a register question
+### So the lever is the 832 Tensile dispatches — and plow owns every one of them
 
-Those are library kernels. "Fusing" them does not mean merging kernels and is not constrained by any
-ceiling above — it means issuing a **grouped/batched matmul** instead of one `hipblasLtMatmul` per
-projection. The opportunity is concrete because the emitter already knows which projections share an
-input: entry 67's `PLOW_GLM_DECODE_GEMM_GROUP` exists precisely to emit same-input decode GEMMs
+**CORRECTION (2026-09-15, same day).** An earlier draft of this section called these "hipBLASLt
+calls" and argued the grouping was gated by an external library API. That is wrong, and the
+distinction matters. **There is no hipBLASLt runtime call anywhere on this path.** The Tensile
+kernels were PORTED INTO PLOW: `glm_lt_gfx942.elf` is a 95 MB plow-owned code object carrying
+**465 Tensile kernels**, hash-pinned against a qualified ABI at load time, and
+`amd_gemm_lt::Kernels::enqueue` dispatches them through **plow's own backend** —
+
+```rust
+let args = arguments(route, tensors, &self.specs[index], info1);   // the 160-byte UserArgs
+be.launch(self.kernels[index], args.dims[3], 256, 0, bytemuck::bytes_of(&args))?;
+```
+
+plow builds the kernarg block itself, computes the grid itself
+(`grid = n.div_ceil(spec.mt_i) * m.div_ceil(spec.mt_j)`), and rings its own doorbell. No
+`hipblasLtMatmul`, no dlopen, no vendor dispatch layer. "hipBLASLt" survives in this tree only as
+the PROVENANCE name in error strings and spec filenames.
+
+**So the register and LDS gate DOES apply to these kernels, and it is favourable.** The 8 pinned
+decode specs, read from the shipped object:
+
+| macro tile | vgpr | scratch | LDS | wg | waves/SIMD | wg/CU |
+|---|---|---|---|---|---|---|
+| 16x16x512 | 179 | **0** | 33792 | 256 | 2 | 1 |
+| 32x16x256 | 141 | **0** | 25600 | 256 | 3 | 2 |
+| 32x32x256 | 113 | **0** | 33792 | 256 | 4 | 1 |
+| 32x16x512 | 71 | **0** | 50176 | 256 | 7 | 1 |
+| 16x16x256 | 158 | **0** | 17408 | 256 | 3 | 3 |
+| 64x16x256 | 109 | **0** | 41984 | 256 | 4 | 1 |
+| 16x32x256 | 249 | **0** | 25600 | 256 | 2 | 2 |
+| 16x16x512 | 127 | **0** | 33792 | 256 | 4 | 1 |
+
+Unlike the decode megakernel (256 VGPR and spilling 6384 B/lane) and the aiter natives (512 VGPR and
+all 64 KiB of LDS), **not one of these spills**, they run 71-249 VGPR at 2-7 waves/SIMD, and LDS
+rather than registers is the binding limit on most. There is real headroom here — which is the
+opposite of what "we don't own these kernels" implied.
+
+"Fusing" them therefore means a **grouped launch we can actually build**: one dispatch covering
+several projections, with the workgroup-to-problem mapping done in the kernel or by emitting a
+descriptor array. Two things make that concrete rather than speculative — the shipped kernels are
+built with Tensile's `UserArgs` ABI (the same ABI Tensile's own grouped-GEMM path uses), and the
+emitter already knows which projections share an input: entry 67's `PLOW_GLM_DECODE_GEMM_GROUP` exists precisely to emit same-input decode GEMMs
 adjacent (gate/up after the router GEMM; idx k/w beside q_a/kv_a/k_rope; idx q_b beside
 q_absorb/q_rope). Adjacency was the cheap half; grouping those same sets into one call is the rest.
 
@@ -1829,10 +1866,10 @@ Collapsing the same-input projections optimistically takes ~10.7 GEMMs per layer
 Three caveats on the 23.6 ms floor, all pointing the same way — it is optimistic:
 the 12.7 us rate comes from a 7-layer tier-3 A/B projected class-weighted to 78 layers under the
 defaults of the time; those 138 merges were the easy ones (adjacent, same input, no dependency to
-break); and the rate was measured removing interpreter segment boundaries, not hipBLASLt calls,
+break); and the rate was measured removing interpreter segment boundaries, not Tensile dispatches,
 whose per-call overhead may differ in either direction.
 
-**What this leaves.** Grouped hipBLASLt is the largest single reduction available on the decode path
+**What this leaves.** A grouped Tensile launch is the largest single reduction available on the decode path
 and should be priced first. But the ladder's own cliff is the more interesting object: rung 1 pays
 ~151 segments and loses 10.5 ms to bad arithmetic; rung 8 pays 1293 segments to win it back. Neither
 end is the optimum, and nothing in the packet today offers rung-8 arithmetic at rung-1 dispatch
@@ -1883,13 +1920,13 @@ memory-bound to issue-bound."
 
 Cross-check on the earlier extrapolation: at 12.7 us/segment, rung 8 would carry 16.4 ms of
 dispatch overhead and rung 4 only 1.9 ms, implying non-dispatch work of 24.8 ms vs 58.5 ms — the
-hipBLASLt path doing the same arithmetic 2.4x better. That is consistent with the in-tree
+Tensile path doing the same arithmetic 2.4x better. That is consistent with the in-tree
 measurement of plow's GEMV streaming weights at 839 GB/s against vLLM's 2111 GB/s.
 
 ### The GEMV scan: every instruction lever is already built, measured, and bounded
 
 `gemv_rows` and its siblings are not on the production decode path at all — rung 20 sends the
-projections to hipBLASLt as `GemmLtPf` x832 — but the scan matters because it says what a
+projections to the ported Tensile kernels as `GemmLtPf` x832 — but the scan matters because it says what a
 plow-native low-batch GEMM would have to beat.
 
 **The arithmetic is emulated, and that is a hardware fact.** `v_dot2c_f32_bf16` is CDNA4;
