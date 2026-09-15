@@ -1994,6 +1994,11 @@ pub enum DevOp {
     /// t3=overlay(f32[overlay_rows,width]) t4=overlay_index(u32[rows])` ·
     /// `i0=rows i1=width i2=vocab i3=overlay_rows`.
     EmbedOverlayBf16 = 179,
+    /// GLM router projection with vLLM's precision boundary. The source checkpoint gate is BF16,
+    /// but prep preserves an FP32-expanded copy because vLLM loads the gate into an FP32 Linear.
+    /// Inputs remain BF16 values widened exactly at multiply; accumulation and output are FP32.
+    /// `t0=C(f32[M,N]) t1=A(bf16[M,K]) t2=W(f32[N,K])` · `i0=M i1=N i2=K`.
+    GemmF32 = 180,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2189,6 +2194,7 @@ impl DevOp {
         DevOp::PackNcfwRowsF32,
         DevOp::GroupedAttentionF32,
         DevOp::EmbedOverlayBf16,
+        DevOp::GemmF32,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2389,6 +2395,7 @@ impl DevOp {
             DevOp::PackNcfwRowsF32 => "PLOW_DOP_PACK_NCFW_ROWS_F32",
             DevOp::GroupedAttentionF32 => "PLOW_DOP_GROUPED_ATTENTION_F32",
             DevOp::EmbedOverlayBf16 => "PLOW_DOP_EMBED_OVERLAY_BF16",
+            DevOp::GemmF32 => "PLOW_DOP_GEMM_F32",
         }
     }
 
@@ -2436,7 +2443,8 @@ impl DevOp {
     /// 156 on main; merging them after the gfx942 ops at 156-160 moved every one up by 5.
     /// 178 -> 179 for backend-neutral grouped FP32 attention.
     /// 179 -> 180 for backend-neutral multimodal embedding overlay.
-    pub const COUNT: u16 = 180;
+    /// 180 -> 181 for GLM's BF16-input/FP32-weight/FP32-output router GEMM.
+    pub const COUNT: u16 = 181;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

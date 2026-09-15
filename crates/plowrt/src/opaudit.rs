@@ -363,6 +363,7 @@ pub fn classify(op: DevOp) -> OpClass {
         ),
         DevOp::GemmBlkPf => a_rows("i0=T; native FP8 projection has no per-sequence state"),
         DevOp::Gemm | DevOp::GemmSmall | DevOp::GemmMed | DevOp::GemmWide | DevOp::GemmC5
+        | DevOp::GemmF32
         | DevOp::GemvAffineQ4 | DevOp::GemmAffineQ4 => {
             a_rows("i0=M")
         }

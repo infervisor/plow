@@ -461,6 +461,39 @@ mod f32_packet_tests {
     }
 
     #[test]
+    fn glm_router_projection_widens_bf16_inputs_and_keeps_f32_logits() {
+        init(Isa::Scalar).unwrap();
+        let input = [0x3f81u16, 0x4000, 0xbf80, 0x3f00, 0xc000, 0x4040];
+        let weight = [
+            1.0078125f32, -2.0, 0.5,
+            -0.25, 4.0, 2.0,
+        ];
+        let mut logits = [0.0f32; 4];
+        let mut table = vec![std::ptr::null_mut(); 3];
+        table[0] = logits.as_mut_ptr().cast();
+        table[1] = input.as_ptr().cast_mut().cast();
+        table[2] = weight.as_ptr().cast_mut().cast();
+        let mut gemm = inst(DevOp::GemmF32);
+        gemm.t[..3].copy_from_slice(&[0, 1, 2]);
+        gemm.i[..3].copy_from_slice(&[2, 2, 3]);
+        let mut ctx = PlowCpuCtx::new(0, 0);
+        unsafe { kernel(gemm.op).unwrap()(&gemm, 0, 1, table.as_ptr(), &mut ctx) };
+        let mut expected = [0.0f32; 4];
+        for row in 0..2 {
+            for column in 0..2 {
+                expected[row * 2 + column] = (0..3)
+                    .map(|inner| {
+                        f32::from_bits(u32::from(input[row * 3 + inner]) << 16)
+                            * weight[column * 3 + inner]
+                    })
+                    .sum();
+            }
+        }
+        assert_eq!(logits, expected);
+        assert!(logits.iter().any(|v| v.to_bits() & 0xffff != 0));
+    }
+
+    #[test]
     fn rnnt_f32_primitives_execute_as_packets() {
         init(Isa::Scalar).unwrap();
         let mut ctx = PlowCpuCtx::new(0, 0);

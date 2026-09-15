@@ -346,7 +346,7 @@ __device__ __forceinline__ unsigned gm_remap(unsigned lin, unsigned n_tiles, uns
 #endif
 template <int BM, int BN, int BK, int WM, int WN, bool NORM, int SWZ = GM_SWZ, int WGM = GM_WGM,
           bool PP = (GM_PP != 0), bool KEXACT = true, bool GLU = false, bool WFP4 = false,
-          bool WFP8BLK = false
+          bool WFP8BLK = false, bool WFP32 = false, bool CF32 = false
 #if PLOW_GLM_FUSE_POST
           , bool ROPE = false
 #endif
@@ -407,6 +407,13 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
     static_assert(!WFP8BLK || !NORM, "block-fp8 weights + fused RMSNorm-A is not emitted");
     static_assert(!WFP8BLK || !GLU, "block-fp8 gate|up is emitted as two GEMMs + Glu, not fused");
     static_assert(!WFP8BLK || !WFP4, "one weight encoding at a time");
+    static_assert(!WFP32 || (!WFP4 && !WFP8BLK && !GLU && !NORM),
+                  "the fp32-expanded weight arm is a plain projection");
+    static_assert(!CF32 || (!GLU
+#if PLOW_GLM_FUSE_POST
+                            && !ROPE
+#endif
+                            ), "the fp32-output arm has no bf16 epilogue");
     static_assert(!WFP8BLK || BK == 64, "the 128-K scale block must be exactly two BK tiles");
     static_assert(!WFP8BLK || BN % 128 == 0, "n0 must be 128-aligned for a per-lane N-scale block");
     (void)act;
@@ -521,7 +528,8 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
      * 64x128 231 -> 268, 128x128 317 -> 378, 128x256 359 -> 451.
      * gfx950 is untouched: PLOW_CDNA4 is 1 there, the builtin is real, and DBUF=2 gives the DMA
      * its idle buffer to stream into a cluster ahead. */
-    constexpr bool DIRECT = PLOW_GM_DIRECT_STAGE && !NORM && !GLU && KEXACT && !WFP4 && !WFP8BLK;
+    constexpr bool DIRECT =
+        PLOW_GM_DIRECT_STAGE && !NORM && !GLU && KEXACT && !WFP4 && !WFP8BLK && !WFP32;
     /* Two-deep GLOBAL prefetch, the register-bank analogue of Tensile's PGR2. Only reachable on
      * the single-buffered register-staging path -- with two LDS buffers the DMA already has the
      * idle buffer to stream into, and DIRECT has no register bank to double. */
@@ -608,6 +616,11 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
             } else {                                                                          \
                 _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] = 0;             \
             }                                                                                 \
+        } else if constexpr (WFP32) {                                                        \
+            const float* wf = reinterpret_cast<const float*>(bsrc);                          \
+            if (r < N) _Pragma("unroll") for (int j = 0; j < 8; j++)                        \
+                rb[it * 8 + j] = f2bf(wf[(size_t)r * K + kk + j]);                            \
+            else _Pragma("unroll") for (int j = 0; j < 8; j++) rb[it * 8 + j] = 0;          \
         } else if constexpr (KEXACT) {                                                        \
             if (r < M) *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * K + kk);     \
             else _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] = 0;            \
@@ -997,7 +1010,13 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
 #pragma unroll
                 for (int e = 0; e < 16; e++) {
                     const unsigned mm = m0 + wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e);
-                    if (mm < M) st_act1(&Cg[(size_t)mm * N + nn], f2bf(acc[i][j][e]));
+                    if (mm < M) {
+                        if constexpr (CF32)
+                            as_glob(reinterpret_cast<float*>(C))[(size_t)mm * N + nn] =
+                                acc[i][j][e];
+                        else
+                            st_act1(&Cg[(size_t)mm * N + nn], f2bf(acc[i][j][e]));
+                    }
                 }
             }
         }
@@ -1052,6 +1071,18 @@ __device__ void d_gemm(bf16* C, const bf16* A, const bf16* B, unsigned M, unsign
                        unsigned slice, unsigned nblk, bf16* lds) {
     d_gemm_t<GM_BM, GM_BN, GM_BK, GM_WM, GM_WN, false>(C, A, B, nullptr, nullptr, M, N, K, slice,
                                                        nblk, lds);
+}
+
+/* GLM's checkpoint gate is bf16, but vLLM materializes it as fp32 and computes fp32 router
+ * logits. Prep writes that exact bf16->fp32 expansion. Loading it back to bf16 here is exact, so
+ * the bf16 MFMA products equal fp32 products of the widened operands; only the output store stays
+ * fp32. This retains the prefill GEMM throughput shape instead of sending 8192 rows through the
+ * scalar decode GEMV. */
+__device__ void d_gemm_f32(float* C, const bf16* A, const float* B, unsigned M, unsigned N,
+                           unsigned K, unsigned slice, unsigned nblk, bf16* lds) {
+    d_gemm_t<GM_BM, GM_BN, GM_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true,
+             false, false, false, true, true>((bf16*)C, A, (const bf16*)B, nullptr, nullptr, M, N,
+                                              K, slice, nblk, lds);
 }
 
 /* MXFP4 (w4a16) PREFILL GEMM. A is bf16 activations, W is packed-2/byte fp4 weights (row stride

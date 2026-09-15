@@ -64,6 +64,7 @@ fn router_flag_bits_do_not_collide() {
     }
     assert_ne!(super::GLM_ROUTER_FLAGS & f::SIGMOID, 0);
     assert_ne!(super::GLM_ROUTER_FLAGS & f::BIAS, 0);
+    assert_ne!(super::GLM_ROUTER_FLAGS & f::F32_LOGIT, 0);
     assert_eq!(super::GLM_ROUTER_FLAGS & f::SQRTSOFTPLUS, 0);
 }
 
@@ -611,7 +612,7 @@ fn ref_sequence(use_fp8: bool) -> Vec<u16> {
         Gemv,           // o_proj
         Residual,       // x_mid
         RmsNorm,        // post_attention_layernorm
-        Gemv,           // router SCORE GEMV (multi-CU wave-cooperative; the router split)
+        GemvF32,        // router SCORE GEMV (bf16 input, f32-expanded weight and f32 output)
         MoeRouterTopk,  // router tail: sigmoid+bias+norm_topk+scale (1-CU bit-exact selection)
         GemvGlu,        // shared expert gate|up
         Gemv,           // shared expert down
@@ -2860,8 +2861,8 @@ fn glm_native_decode_gemm_ext_covers_rung8_and_narrow_projections() {
 }
 
 /// `PLOW_GLM_DECODE_GEMM_GROUP` only reorders: every program keeps the same instructions, rungs
-/// without native decode GEMMs keep their order, and on the native rungs the MoE layer's router and
-/// shared gate/up GEMMs are adjacent while top-k and Glu share one segment.
+/// without native decode GEMMs keep their order, and on the native rungs the MoE layer's FP32
+/// router and shared gate/up GEMMs are adjacent while top-k and Glu share one segment.
 #[test]
 fn glm_decode_gemm_group_reorders_native_gemms_without_changing_work() {
     let _guard = crate::test_env::env_guard();
@@ -2958,17 +2959,23 @@ fn glm_decode_gemm_group_reorders_native_gemms_without_changing_work() {
         }
         native_rungs += 1;
         let n_seg = |p: &[Inst]| p.iter().map(|i| i.3).max().unwrap();
-        // One MoE layer in this model: top-k and Glu now share a segment.
-        assert_eq!(n_seg(b) + 1, n_seg(a), "rows={rows}");
+        // The mixed-dtype router projection is a standalone dispatch, so grouping may keep the
+        // same total segment count; it must not add one, and top-k/Glu must still co-locate.
+        assert!(n_seg(b) <= n_seg(a), "rows={rows}");
         let topk = b
             .iter()
             .position(|i| i.0 == DevOp::MoeRouterTopkPf as u16)
             .unwrap();
+        assert_eq!(
+            (b[topk - 3].0, b[topk - 3].1, b[topk - 3].2),
+            (DevOp::GemvF32 as u16, 256, 6144),
+            "rows={rows}: FP32 router must lead the projection run"
+        );
         assert!(
-            b[topk - 3..topk]
+            b[topk - 2..topk]
                 .iter()
                 .all(|i| (i.0, i.1, i.2) == (lt, 256, 6144)),
-            "rows={rows}: router, shared gate and shared up must precede top-k back to back"
+            "rows={rows}: shared gate and up must precede top-k back to back"
         );
         let glu = b.iter().position(|i| i.0 == DevOp::Glu as u16).unwrap();
         assert_eq!(
@@ -4063,8 +4070,12 @@ fn glm_seq_par_proj_routes_on_the_band() {
     assert!(name(router.t[0]).ends_with("@band8192.rt"));
     assert!(name(router.t[1]).ends_with("@band8192"));
     let score = p.insts.iter().find(|d| d.t[0] == router.t[1]).unwrap();
+    assert_eq!(score.op, DevOp::GemmF32 as u16);
     assert_eq!(score.i[0], tb);
     assert_eq!(name(score.t[1]), "act.xn2@band8192");
+    assert_eq!(p.tensors[score.t[0] as usize].bytes, tb as u64 * c.n_exp as u64 * 4);
+    assert_eq!(name(score.t[2]), "model.layers.3.mlp.gate.derived.f32.weight");
+    assert_ne!(router.i[3] & router_flag::F32_LOGIT, 0);
     let ag: Vec<_> = p.insts.iter().filter(|d| is(d, DevOp::XAllGather)).collect();
     assert_eq!(ag.len(), 3, "entry projections, post-attention norm, route table");
     assert_eq!((ag[2].t[0], ag[2].i[0], ag[2].i[5]), (n.tab, t * c.top_k * 4, 5 * n.slot_b));

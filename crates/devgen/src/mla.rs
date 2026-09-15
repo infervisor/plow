@@ -1687,8 +1687,10 @@ pub(crate) mod router_flag {
 }
 
 /// GLM/DeepSeek-V3/Kimi: sigmoid scoring, normalised gates, and a selection bias.
-const GLM_ROUTER_FLAGS: u32 =
-    router_flag::SIGMOID | router_flag::NORM_TOPK | router_flag::BIAS;
+const GLM_ROUTER_FLAGS: u32 = router_flag::SIGMOID
+    | router_flag::NORM_TOPK
+    | router_flag::BIAS
+    | router_flag::F32_LOGIT;
 /// Expert/shared GLU activation = SiLU (SwiGLU). Mirrors ACT in the B4 harness.
 const GLM_ACT_SILU: u32 = 1;
 
@@ -1707,7 +1709,6 @@ struct GlmLW {
     ckvd_s: u32,
     krotd_s: u32,
     wo_s: u32,
-    wr_s: u32,
     shg_s: u32,
     shu_s: u32,
     shd_s: u32,
@@ -1730,7 +1731,7 @@ struct GlmLW {
     wofold: u32, // DERIVED fused W_uv·W_o (NH*DK -> H), prefill ofold arm only; else NONE
     gpost: u32, // post_attention_layernorm
     // MoE (sparse layers): router + shared expert + the two loader-filled pointer tables.
-    wr: u32,   // mlp.gate.weight [E,H] bf16
+    wr_f32: u32, // mlp.gate.derived.f32.weight [E,H] f32, matching vLLM's gate parameter
     bias: u32, // mlp.gate.e_score_correction_bias [E] f32
     shg: u32,  // shared_experts.gate_proj
     shu: u32,  // shared_experts.up_proj
@@ -1833,7 +1834,7 @@ pub(crate) struct GlmTn {
     xn2: u32,
     // MoE activations
     tab: u32,
-    rlogit: u32, // router score-GEMV output [n_exp] bf16 (feeds MoeRouterTopk)
+    rlogit: u32, // router score output [n_exp] f32 (feeds MoeRouterTopk)
     shfu: u32,
     /// `up` half of the shared-expert GLU — MXFP4 prefill only (no fused GemmGluMxfp4 exists).
     shfu_up: u32,
@@ -2175,7 +2176,7 @@ fn declare_glm_rows_batched_for_prefill(
     let fold = glm_shared_fold(c, enc);
     let (e_all, tk_all) = (e + u32::from(fold), tk + u32::from(fold));
     let tab = ac(b, "tab", rows * tk_all as u64 * 8);
-    let rlogit = ac(b, "rlogit", rows * e as u64 * BF16); // router score output [T][n_exp] bf16
+    let rlogit = ac(b, "rlogit", rows * e as u64 * F32); // router score output [T][n_exp] f32
     let shfu = ac(b, "shfu", rows * imoe_l as u64 * BF16);
     // The `up` half of the shared expert's GLU. Needed on the MXFP4 PREFILL arm, where the absence
     // of a GemmGluMxfp4 forces gate and up into separate GEMMs with an explicit Glu between; on the
@@ -2693,11 +2694,6 @@ fn declare_glm_rows_batched_for_prefill(
             } else {
                 mxs(b, "self_attn.o_proj.weight", h as u64, (nh_l * vd) as u64)
             },
-            wr_s: if dense {
-                TENSOR_NONE
-            } else {
-                mxs(b, "mlp.gate.weight", e as u64, h as u64)
-            },
             shg_s: if dense {
                 TENSOR_NONE
             } else if lin_fp8 {
@@ -2825,10 +2821,10 @@ fn declare_glm_rows_batched_for_prefill(
                 TENSOR_NONE
             },
             gpost: t(b, "post_attention_layernorm.weight", h as u64 * BF16),
-            wr: if dense {
+            wr_f32: if dense {
                 TENSOR_NONE
             } else {
-                tw(b, "mlp.gate.weight", e as u64, h as u64)
+                t(b, "mlp.gate.derived.f32.weight", e as u64 * h as u64 * F32)
             },
             bias: if dense {
                 TENSOR_NONE
@@ -7341,7 +7337,7 @@ fn emit_glm_moe_ffn_prefill(
         tp > 1 && !raw_output && !det && n.ug_tp != TENSOR_NONE && glm_sp(c, n, b, t);
     // PLOW_GLM_ROUTER_OVERLAP: slot 3's band holds the bytes the hidden gather copies into
     // `xn2@band`, and its next writer is behind this layer's FFN reduce-scatter.
-    let overlap = if band_router && !(lt_ext.router && enc != MoeEnc::Mxfp4) {
+    let overlap = if band_router {
         emit_config::active().glm_router_overlap.unwrap_or(0).min(2)
     } else {
         0
@@ -7354,27 +7350,27 @@ fn emit_glm_moe_ffn_prefill(
             (n.xn2, c_rn2)
         };
         let xb = glm_band(b, src, t, tp, h as u64 * 2);
-        let lb = glm_band(b, n.rlogit, t, tp, e as u64 * 2);
-        let cs = if lt_ext.router && enc != MoeEnc::Mxfp4 {
-            emit_glm_lt_ext(b, c, lb, xb, w.wr, t, tb, [e, h], &[dep])
-        } else {
-            let op = glm_prefill_projection_op(c, tb, e, h, n_cu, mxfp4_quant(enc));
-            b.emit(op, all.clone(), &[dep], |d| {
-                d.t[0] = lb;
-                d.t[1] = xb;
-                d.t[2] = w.wr;
-                if enc == MoeEnc::Mxfp4 {
-                    d.t[3] = w.wr_s;
-                }
-                d.i[0] = tb;
-                d.i[1] = e;
-                d.i[2] = h;
-            })
-        };
+        let lb = glm_band(b, n.rlogit, t, tp, e as u64 * F32);
+        let cs = b.emit(DevOp::GemmF32, all.clone(), &[dep], |d| {
+            d.t[0] = lb;
+            d.t[1] = xb;
+            d.t[2] = w.wr_f32;
+            d.i[0] = tb;
+            d.i[1] = e;
+            d.i[2] = h;
+        });
         let tab_b = glm_band_as(b, n.rt_tp, t, tp, tk_all as u64 * 8, ".rt");
         (tb, lb, tab_b, cs)
     } else {
-        (t, n.rlogit, n.tab, gemm(b, n.rlogit, n.xn2, w.wr, w.wr_s, e, h, &[c_rn2]))
+        let cs = b.emit(DevOp::GemmF32, all.clone(), &[c_rn2], |d| {
+            d.t[0] = n.rlogit;
+            d.t[1] = n.xn2;
+            d.t[2] = w.wr_f32;
+            d.i[0] = t;
+            d.i[1] = e;
+            d.i[2] = h;
+        });
+        (t, n.rlogit, n.tab, cs)
     };
     // PLOW_GLM_GEMM_LT_PF_EXT: the shared expert's gate and up go next to the router score so the
     // native segments form one run; their GLU is emitted below as its own op.
@@ -8293,32 +8289,19 @@ fn emit_glm_moe_ffn_rows(
 
     // Router score at M = rows, then the PREFILL top-k tail (the decode tail under a token loop,
     // bit-identical per token) and the align/sort that the grouped ops read.
-    let score_op = if enc == MoeEnc::Mxfp4 {
-        DevOp::GemvMxfp4
-    } else {
-        DevOp::Gemv
-    };
-    let c_score =
-        emit_glm_decode_gemm_lt(b, c, enc, rows, [n.rlogit, n.xn2, w.wr], [e, h], &[c_rn2])
-            .unwrap_or_else(|| {
-                b.emit(
-                    score_op,
-                    glm_decode_gemv_cus(&all, score_op, e, h),
-                    &[c_rn2],
-                    |d| {
-                        d.t[0] = n.rlogit;
-                        d.t[1] = n.xn2;
-                        d.t[2] = w.wr;
-                        if enc == MoeEnc::Mxfp4 {
-                            d.t[3] = w.wr_s;
-                        }
-                        d.i[0] = rows;
-                        d.i[1] = e;
-                        d.i[2] = h;
-                        d.f[0] = 1.0;
-                    },
-                )
-            });
+    let c_score = b.emit(
+        DevOp::GemvF32,
+        glm_decode_gemv_cus(&all, DevOp::GemvF32, e, h),
+        &[c_rn2],
+        |d| {
+            d.t[0] = n.rlogit;
+            d.t[1] = n.xn2;
+            d.t[2] = w.wr_f32;
+            d.i[0] = rows;
+            d.i[1] = e;
+            d.i[2] = h;
+        },
+    );
     // PLOW_GLM_DECODE_GEMM_GROUP: the shared gate/up read only `xn2`, so emit them straight after
     // the router GEMM. The three native GEMMs become adjacent (one overlap run under
     // PLOW_AMD_DECODE_GEMM_OVERLAP) and top-k and Glu share one interpreter segment.
@@ -8785,35 +8768,18 @@ pub(crate) fn emit_glm_moe_ffn(
     //   wave-cooperative GEMV (all.clone()) — was the single-CU scalar dot that measured 73% of the
     //   MoE layer — feeding a cheap 1-CU MoeRouterTopk tail (bit-exact selection). GLM_ROUTER_OLD=1
     //   emits the fused single-CU d_moe_router for the before/after A/B.
-    let c_router = if emit_config::active().glm_router_old {
-        b.emit(DevOp::MoeRouter, one.clone(), &[c_rn2], |d| {
-            d.t[0] = n.tab;
-            d.t[1] = n.xn2;
-            d.t[2] = w.wr;
-            d.t[3] = w.bias;
-            d.i[0] = h;
-            d.i[1] = e;
-            d.i[2] = tk;
-            d.i[3] = GLM_ROUTER_FLAGS;
-            d.f[0] = c.route_scale;
-        })
-    } else {
-        let score_op = if enc == MoeEnc::Mxfp4 {
-            DevOp::GemvMxfp4
-        } else {
-            DevOp::Gemv
-        };
-        let c_score = b.emit(score_op, router_cus.clone(), &[c_rn2], |d| {
+    assert!(
+        !emit_config::active().glm_router_old,
+        "GLM_ROUTER_OLD cannot represent GLM's FP32 router logits"
+    );
+    let c_router = {
+        let c_score = b.emit(DevOp::GemvF32, router_cus.clone(), &[c_rn2], |d| {
             d.t[0] = n.rlogit;
             d.t[1] = n.xn2;
-            d.t[2] = w.wr;
-            if enc == MoeEnc::Mxfp4 {
-                d.t[3] = w.wr_s;
-            }
+            d.t[2] = w.wr_f32;
             d.i[0] = 1;
             d.i[1] = e;
             d.i[2] = h;
-            d.f[0] = 1.0;
         });
         b.emit(DevOp::MoeRouterTopk, one.clone(), &[c_score], |d| {
             d.t[0] = n.tab;

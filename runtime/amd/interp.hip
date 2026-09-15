@@ -3976,6 +3976,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                        PLOW_RUNTIME_DECODE_ROWS);
             break;
 #endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_F32
+        case PLOW_DOP_GEMM_F32:
+            d_gemm_f32((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
+                       PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk, sm->gm);
+            break;
+#endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_SMALL
         case PLOW_DOP_GEMM_SMALL:
             exec_gemm_small(in, T, slice, nblk, sm->gm);

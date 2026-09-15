@@ -268,6 +268,7 @@ const DOC: &[S] = &[
     S { op: DevOp::DsaQQuant, t: &["q_fp8", "q_scale", "q_raw"], i: &["n_rows", "head_dim"], f: &[], j: &[] },
     S { op: DevOp::IndexScoreKpool, t: &["Score", "Qfp8", "Qscale", "Kfp8", "Kscale", "W", "kv_len"], i: &["n_batch", "index_heads", "pool_stride", "index_head_dim", "pool_size", "prefill"], f: &["scale"], j: &[] },
     S { op: DevOp::GemvF32, t: &["C", "x", "W"], i: &["M", "N", "K"], f: &[], j: &[] },
+    S { op: DevOp::GemmF32, t: &["C", "A", "W"], i: &["M", "N", "K"], f: &[], j: &[] },
     // GPT-OSS flat MXFP4 MoE. No pointer tables: expert strides derive from i[].
     S { op: DevOp::MoeGluMx, t: &["fu", "x", "table", "W_gu", "S_gu", "bias_gu?"], i: &["k", "I", "K", "n_exp", "layout", "act", "n_batch"], f: &["alpha", "limit"], j: &[] },
     S { op: DevOp::MoeDownMx, t: &["part", "fu", "table", "W_d", "S_d", "bias_d?"], i: &["k", "H", "I", "n_exp", "", "", "n_batch"], f: &[], j: &[] },

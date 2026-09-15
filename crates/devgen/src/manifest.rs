@@ -3655,6 +3655,7 @@ mod tests {
         for op in [
             DevOp::Gemv,
             DevOp::Gemm,
+            DevOp::GemmF32,
             DevOp::GemmSmall,
             DevOp::GemmMed,
             DevOp::GemmWide,
