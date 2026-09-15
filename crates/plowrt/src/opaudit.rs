@@ -537,10 +537,23 @@ pub fn classify(op: DevOp) -> OpClass {
              i0=nparts i1=n_batch i2=vocab_l i3=gate i4=val_slot and takes n_gpu from the \
              kernarg. Classified from the interpreter",
         ),
-        DevOp::XReduceScatter => no_body(
-            "i0=n",
-            "class A by operand shape, but op_collective.h has no arm; a packet carrying one \
-             must be refused at load (PLOW_SEQ_PAR_SEAMS)",
+        // WAS `no_body`, and that was stale: interp.hip:5832 dispatches
+        // `d_xreduce_scatter_mega` under PLOW_SEQ_PAR_SEAMS, and the shipping GLM TP8 packet
+        // carries 78-156 of these per prefill rung and runs them correctly. The old entry made
+        // op-audit report the one blocker it named as unfixable-from-here, when the arm had
+        // already landed.
+        //
+        // Class A by operand shape AND by body: the reduce-scatter is elementwise over the flat
+        // [n] partial, where rank r owns [n*r/N, n*(r+1)/N). Nothing in it is per-sequence —
+        // no position, no kv_len, no per-row table — so a packed launch whose `n` covers two
+        // requests' rows reduces them exactly as it reduces one's. `gcols`'s row arithmetic
+        // (row_w = nranks*gcols) is a fixed layout independent of which sequence a row is.
+        // The emitter's `rows % N != 0` refusal is an emit-time constraint on the band, not a
+        // packing one.
+        DevOp::XReduceScatter => note(
+            a_elem("i0=n"),
+            "host sets the live element count; op_collective.h:1668 d_xreduce_scatter_mega, \
+             dispatched at interp.hip:5832 under PLOW_SEQ_PAR_SEAMS",
         ),
         DevOp::XFlashMerge => no_body(
             "mirrors FlashMerge",
