@@ -1131,25 +1131,28 @@ if [ "${PLOW_DSV41_BLKFP8:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_DSV41_BLKFP8=1"
 fi
 
-# OPT-IN (PLOW_PREFILL_K3=1): compile the `#if PLOW_K3` block into the ORDINARY prefill rows.
+# OPT-IN (PLOW_PREFILL_DSV41=1): make the ORDINARY prefill rows able to run a DeepSeek-V4.1 packet.
 #
-# `AX_K3` / `AX_MLA_K3` already carry the axis, but only onto the `_k3` stems, and those are the
-# objects a Kimi-K3 packet loads. DeepSeek-V4.1 loads `interp_prefill_mla_moe` and needs three ops
-# out of that same block -- `HyperConnPre`, `HyperConnPost` and `GemvF32`, which are its mHC, not
-# anything of Kimi's. They are inside `#if PLOW_K3` (interp.hip:3485-3887), so today the only way
-# to reach them from an MLA object is to compile the whole axis in.
+# V4.1 loads `interp_prefill_mla_moe` ($AX_PREFILL $AX_MLA $AX_MOE) and needs three axes that row
+# does not carry. Each is marker-checked, so a missing one is a refusal by name at load rather than
+# a wrong answer -- and the three refusals are how this list was assembled, one GPU attempt each:
+#
+#   PLOW_K3        -- `HyperConnPre`, `HyperConnPost` and `GemvF32`, which are V4.1's mHC. None of
+#                     them are Kimi ops and none are KDA, but they live inside `#if PLOW_K3`
+#                     (interp.hip:3485-3887), so that is the axis that compiles them today.
+#   PLOW_QWEN_GDN  -- op 142, per-head norm + interior-range rotary. Qwen's name, V4.1's rope.
+#   $AX_A4W4       -- the MXFP4 grouped MoE body its 384 routed experts run on.
 #
 # NOT DRIVEN FROM THE PACKET'S `requires`, deliberately. A K3 packet also requires PLOW_K3, and
-# auto-mapping it here would start compiling the axis into every ordinary prefill row of every K3
-# build -- objects those packets never load, and the axis is default-0 precisely because its arms
-# are expensive to inline. That is a decision about every K3 build, so it is stated on the command
-# line rather than inferred.
+# auto-mapping would start compiling these into every ordinary prefill row of every K3 build --
+# objects those packets never load. That is a decision about every build, so it is stated on a
+# command line rather than inferred from a field.
 #
-# FOLLOW-UP: the narrow fix is an `#if PLOW_MHC` around just the three ops, so a V4.1 object can
-# have its hyper-connection without KDA's register pressure. That is a change to interp.hip's
-# guard structure and is not this.
-if [ "${PLOW_PREFILL_K3:-0}" = 1 ]; then
-  AX_PREFILL="$AX_PREFILL -DPLOW_K3=1 -DGV_UNROLL=14"
+# Measured rather than assumed: adding PLOW_K3 to this row moved `interp_prefill_mla_moe` not at
+# all on registers (256 VGPR, 122 spills, before and after) and 160 B on LDS. A narrow
+# `#if PLOW_MHC` guard is still the better shape; it is not urgent on that evidence.
+if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_K3=1 -DGV_UNROLL=14 -DPLOW_QWEN_GDN=1 $AX_A4W4"
 fi
 
 # CEILING INSTRUMENT ONLY (PLOW_MLA_PF2_ABL=1..4): the V2 MLA prefill's ablation probes —

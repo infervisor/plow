@@ -1287,6 +1287,14 @@ fn backend_amd(
     if has("GemmFp8Mx") {
         req.push("PLOW_DSV41_BLKFP8=1".into());
     }
+    // Op 142, the per-head norm + interior-range rotary. Qwen's name, but DeepSeek-V4.1 dispatches
+    // it for its own RoPE: `head_dim` 512 contains the 64 rope dims as a SUFFIX, which is what the
+    // op's `rot_offset` expresses. The arm is behind `PLOW_QWEN_GDN` and an object without it
+    // leaves `q`/`kv` unrotated -- every position attends as if it were position zero, which reads
+    // as a long-context regression rather than as a missing kernel.
+    if has("QwenHeadNormRope") {
+        req.push("PLOW_QWEN_GDN=1".into());
+    }
     if on("a4w4") {
         req.push("PLOW_MOE_PF_A4W4=1".into());
     }
