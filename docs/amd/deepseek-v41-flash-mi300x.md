@@ -1545,3 +1545,77 @@ residual alone.
 confirming that `pre_mix` is genuinely loop-carried across layers (§6.1) and
 that the first layer needs an explicit identity rather than reading a previous
 sublayer's mix.
+
+## 12. First hardware numbers: layer 0 runs at 1k and 8k
+
+THE RUNG RUNS END TO END. `plowc --block 0` at TP8 on 8x MI300X, driven by
+`plowrt/examples/rung_run`, returns `rc=0` with every probed activation finite
+and no NaN or Inf at both bucket widths:
+
+| T | exit range | NaN/Inf | median layer time |
+|---|---|---|---|
+| 1024 | +-3.11 | 0 / 0 | 159 ms |
+| 8192 | +-3.53 | 0 / 0 | 1697 ms |
+
+This is ONE layer on a synthetic input. There is no parity check against a
+reference here -- `rung_run`'s entry is a seeded activation, so the numbers are
+meaningless as text. What they establish is that every arm the packet names
+exists, nothing faults, and the layer is numerically stable.
+
+Two defects stood between the emit and these numbers, both fixed:
+
+  * The grouped MXFP4 GEMM read a whole k-tile when K was 2.25 of them. V4.1 is
+    the first shape whose per-rank `I_moe` (2304/8 = 288) is not a multiple of
+    the staged K tile, so the DOWN GEMM built a partial last tile and read 48 B
+    past every weight row -- off the end of the packed expert slab on the last
+    expert's down projection. Latent until the router was fixed, because until
+    then every token routed to experts 0-5 and expert 383 was never dispatched.
+    It was also wrong math, not only a bad read: the tail staged the next row's
+    bytes and multiplied them in.
+
+  * `scripts/build_gfx942.sh` defined `PLOW_MLA_PF_NOPE_ARM` where the marker
+    plowrt checks is guarded by `PLOW_MLA_PF2_NOPE_ARM`, and the header's shim
+    only maps pf2 -> pf. The flash object compiled the zero-rope arm and could
+    not prove it. Invisible at T=1024, which keeps its MLA segment in the
+    prefill object; at T=8192 the segment routes to the four-wave flash object.
+
+### 12.1 The performance gap is ~870x and it is not the tile map
+
+Against a per-layer roofline near 1.95 ms (7.04 TFLOP/layer, 8 GPUs, 35% of
+matrix peak), 1697 ms is ~870x off. Forty layers at this cost is 68 s against
+the campaign's 90 ms target for the whole model. THE TARGET IS NOT CLOSE, and
+the reason is not tuning.
+
+WHAT THE SCALING SAYS. 1024 -> 8192 tokens is 8x the context and 10.7x the
+time: 155 us/token/layer at 1k against 207 us/token/layer at 8k. Cost is very
+nearly LINEAR in T, so the quadratic term -- attention -- is not what dominates.
+The per-token work is: the dense projections, the shared expert, and the 384
+routed experts.
+
+ONE STRUCTURAL CAUSE IS CONFIRMED. `PLOW_HAS_MX_MMA` is `PLOW_CDNA4`
+(`runtime/amd/amd_arch.h:35`) and gfx942 is CDNA3, so `d_moe_group_pf_a4w4`
+compiles its SIMULATED arm: every fp4 weight block is dequantized to bf16 in
+LDS staging before an ordinary bf16 MFMA. V4.1's routed experts are MXFP4 and
+are the majority of the layer's FLOPs. There is no fp4 matrix core on MI300X to
+run them on, so this is a property of the hardware against the checkpoint's
+encoding, not a kernel that needs tuning.
+
+WHAT IT IS NOT. `mpf_expert_of_tile` defaults to a linear walk of `tilep[]`,
+which at 6-of-384 routing is ~384 dependent global loads per tile -- an obvious
+suspect, and wrong. Building the prefill objects with
+`PLOW_MOE_TILE_BINSEARCH=1` and A/B-ing them at T=8192 gives 1694.6 ms against
+1696.8 ms, a 0.13% difference with a bit-identical exit. The change was reverted
+rather than shipped on a hypothesis it does not support.
+
+The remaining gap is unprofiled. plowrt has no per-op timing on the rung path,
+and identifying where 1.7 s goes needs one before any more guesses are worth
+running.
+
+### 12.2 What is still not demonstrated
+
+  * ONE layer, not 40. The whole-model emit is still blocked on the subsystems
+    section 5 lists as unimplemented.
+  * No reference parity. The input is synthetic; correctness so far is
+    "finite and stable", not "right".
+  * The 90 ms target is unvalidated and, on the evidence above, out of reach on
+    this path without addressing the fp4 simulation.
