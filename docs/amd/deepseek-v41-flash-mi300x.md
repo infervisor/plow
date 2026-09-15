@@ -1988,6 +1988,82 @@ the compressed-KV attention read, 4 need the compressor that writes it, 8 need i
 the read side additionally needs the top-k gather wired into the attention core, for which
 `FlashGatherPrefill` (op 55) is the intended kernel and is already built and dispatched.
 
+### 12.10 What the remaining 39 layers actually need, from the reference
+
+The checkpoint ships its own inference code at `inference/model.py`, which is what the `model.py:NNN`
+citations throughout this tree point at. This section is read off it, not inferred, so the next
+session does not re-derive it. Line numbers are that file.
+
+**The shape of it (`class Attention`, 613).** Its own docstring: *"Latent attention over two KV
+sources at once, concatenated into one `sparse_attn` call: a sliding window of raw KV, plus -- when
+compress_ratio > 0 -- `index_topk` compressed positions reaching further back."* The forward is
+
+    kv, topk_idxs = self._window_kv(...)                 # window KV + window INDICES
+    if self.compress_ratio:
+        compress_kv, compress_idxs = self._compress_kv(...)
+        kv         = torch.cat([kv, compress_kv], dim=1)
+        topk_idxs  = torch.cat([topk_idxs, compress_idxs], dim=-1)
+    o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+    apply_rotary_emb(o[..., -rd:], freqs_cis, True)      # INVERSE rope -> op 181
+
+so it is ONE gathered attention over a concatenation, not two attentions merged. Note the window is
+expressed as indices too (`get_window_topk_idxs`), which makes plow's current `FlashMlaPrefill` +
+window-mask form a *specialization valid only at ratio 0*. `FlashGatherPrefill` (op 55) takes the
+`[b, m, topk] int32` table in `t7` and `top_k` in `i6`, which is exactly this.
+
+**1. The rope tables are wrong for 38 layers, independently of everything else** (658-666):
+
+    if self.compress_ratio: original_seq_len, rope_theta = args.original_seq_len, args.compress_rope_theta
+    else:                   original_seq_len, rope_theta = 0, args.rope_theta   # disable YaRN
+
+Ratio-0 layers (0 and 1 only) use base `rope_theta` 10000 with YaRN OFF. **Every other layer uses
+YaRN at `compress_rope_theta` = 160 000**, `original_seq_len` 65 536, factor 16, beta_fast 32,
+beta_slow 1. `emit_dsv41_block` currently builds the ratio-0 table (`RopeScale::None`, base theta)
+and hands it to whatever layer it is emitting.
+
+**2. The compressor, 4 layers (`class Compressor`, 429).** Ratio 1 (layer 20) is `norm(wkv(x))` --
+no gate, bf16 weights. Ratio 2 (layers 2, 8, 14) promotes `wkv`/`wgate` to fp32 and pools
+`kv = (kv * score.softmax(dim=2)).sum(dim=2)` over the ratio axis, then `norm(kv.to(bf16))`. It
+returns the latent **before RoPE** -- the indexer needs it unrotated -- and `Attention` then ropes
+at position `j * ratio` and fake-quants.
+
+Against op 180, which implements **V4's** compressor, three differences: V4.1 has **no `ape`** (no
+learned position-in-block gate bias), **no overlap** (`coff = 1`; V4's ratio-4 form draws 8 slots
+through a `2*d` projection), and the fake-quant's per-block scale is **E4M3, not a power of two**
+(`fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)`, 672). `qblk` already accepts
+16 and `ROTATE` already selects e2m1, so the only *kernel* work is a third scale arm beside
+`plow_round_scale`. Everything else is emit.
+
+**3. The indexer, 8 layers (`class Indexer`, 488).** q from `wq_b(qr)` at 32 heads x 128, roped;
+k from the compressor latent via `wk` + `k_norm`, which only the 4 kv_source layers can produce
+(the other 4 read that layer's `k_cache`); scores rectified and combined per token by
+`weights_proj`. Reachability: position `j` becomes visible once the query has passed its last
+token, `compress_lens = arange(1, T+1) // ratio`. Then the two levels:
+
+  * Layer 20 (`candidate_source_layer_id`) publishes `select_candidate_blocks` (585): score each
+    block of 8 by its **best** position, pin the block holding this query's newest position with
+    `+inf` so a partly-filled recent block cannot be outscored by an older full one, take the top
+    2048, and expand back to a per-position bool mask.
+  * Layers after 20 mask their own scores with that shared mask before their own top-k.
+
+Then `topk = min(512, end_pos // ratio)`, taken by score, **re-sorted into position order**, with
+unreachable entries `-1` and the rest shifted by `offset` (the window KV length, so the indices
+address the concatenated `kv`).
+
+**4. Cross-layer shared state, and it is what keeps this tractable.** `shared_attn.compress_kv`,
+`shared_attn.topk_idxs` and `shared_attn.candidates` are module-level and carried across layers.
+A layer that is not an index source **reuses the last indexer's `topk_idxs` verbatim** (`_compress_topk_idxs`,
+722). So the index table is computed **8 times, not 38** -- the other 30 layers only need the
+gather. In plow that is three arena tensors declared once for the whole chain, which is what the
+`--block l..r` chaining added in §12.7 makes expressible.
+
+**Engram** (layers 1 and 14) is separate and its opcode (182) is already specified and hardware-verified.
+
+None of this is emitted today. It is a multi-piece build -- one small kernel arm, four emit paths,
+and correct rope tables -- and the honest blocker on signing any of it off is that there is still no
+parity harness: `rung_run` feeds a seeded synthetic, so "finite and stable" is the only bar
+available, and it is not one this work can be checked against.
+
 ### 12.2 What is still not demonstrated
 
   * ONE layer, not 40. The whole-model emit is still blocked on the subsystems

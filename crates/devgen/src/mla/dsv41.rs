@@ -1747,8 +1747,13 @@ pub(crate) fn dsv41_emit_block_plan(c: &Dsv41Cfg, l: u32) -> Result<Vec<&'static
          \nA rung is a validation artifact, not a serving model, so it MAY be narrower than the \
          full emit -- but it must not be wrong. A blob missing its attention core loads, runs, and \
          produces fluent-looking garbage, so this refuses instead of writing one.\n\
-         The kernels are NOT the gap: ops 180/181, 182/183 and 184 all exist and pass on gfx942. \
-         What is missing is the emit around them. Missing capability: `emit_dsv41_block`.",
+         Mostly the emit is the gap -- ops 180/181, 182/183, 184 and 55 exist and pass on gfx942 \
+         -- but not entirely, and the one kernel difference is easy to miss: `op_compress.h` \
+         implements V4's contract, where the fake-quant rounds the per-block scale to a POWER OF \
+         TWO. V4.1's compressed KV wants an E4M3 scale at group 16 (`fp4_act_quant(latent, 16, \
+         True, scale_dtype=torch.float8_e4m3fn)`, inference/model.py:672). `qblk` already takes \
+         16 and ROTATE already selects e2m1, so the gap is the scale format alone. \
+         Missing capability: `emit_dsv41_block`.",
         done.len(),
         parts.len(),
         done.iter()
