@@ -5119,6 +5119,36 @@ __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
                            unsigned slice, unsigned nblk) {
     const unsigned wave = threadIdx.x / PLOW_WAVE;
     const unsigned lane = threadIdx.x % PLOW_WAVE;
+    /* WIDE-M ARM. The loop below parallelises over N ALONE, which is right for the op's original
+     * caller (M is a token or three) and catastrophic for V4.1's mHC, where the same opcode is
+     * M=8192, N=24, K=20480. At N=24 the n-stride `nblk * PLOW_WAVES` = 2432 leaves waves 24..2431
+     * with nothing to do: THREE of 304 workgroups compute the whole 8192x24x20480 product while
+     * 301 fall straight through the M loop. Measured on 8x MI300X at 8k: 827 ms per packet, two
+     * packets per layer, 1654 ms of a 1694 ms layer -- 97.6% of it, in an op whose 335 MB of reads
+     * should cost ~63 us.
+     *
+     * When there are at least as many rows as blocks, give each BLOCK a row and each WAVE a column
+     * instead. All 304 x 8 waves then work, and the eight waves of a block sweep one `xm` at the
+     * same time, so the row is read from HBM once and hit in cache by the other seven.
+     *
+     * BIT-IDENTICAL, both arms: an output is still one wave's `wave_sum` over the same lane-strided
+     * K in the same order. Only WHICH wave owns (m, n) changes, and no caller depends on that --
+     * `GemvF32` is RowClass::A and the packet is coarse, so every block waits on the same counter
+     * and none of them claims a designated row band. */
+    if (M >= nblk) {
+        for (unsigned m = slice; m < M; m += nblk) {
+            const bf16* const xm = x + (size_t)m * K;
+            float* const cm = C + (size_t)m * N;
+            for (unsigned n = wave; n < N; n += PLOW_WAVES) {
+                const float* const wn = W + (size_t)n * K;
+                float acc = 0.0f;
+                for (unsigned k = lane; k < K; k += PLOW_WAVE) acc += bf2f(xm[k]) * wn[k];
+                acc = wave_sum(acc);
+                if (lane == 0) cm[n] = acc;
+            }
+        }
+        return;
+    }
     for (unsigned m = 0; m < M; m++) {
         const bf16* const xm = x + (size_t)m * K;
         float* const cm = C + (size_t)m * N;

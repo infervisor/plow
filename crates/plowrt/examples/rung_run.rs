@@ -127,6 +127,10 @@ mod hsa {
         // fault reports an address, so the way to learn WHICH op produces it is to find the
         // smallest prefix of the layer that still faults.
         let mut segs = usize::MAX;
+        // Per-(workgroup, packet) timestamps for the LAST launch. The layer is ONE cooperative
+        // dispatch, so this is the only instrument that can attribute time to an op: a kernel
+        // profiler sees one number and `--segs` sees one segment.
+        let mut trace: Option<PathBuf> = None;
         while let Some(a) = args.next() {
             match a.as_str() {
                 "--checkpoint" => checkpoint = args.next().map(PathBuf::from),
@@ -137,8 +141,16 @@ mod hsa {
                 "--entry" => entry = args.next().ok_or("--entry needs a value")?,
                 "--probe" => probe = args.next().ok_or("--probe needs a value")?,
                 "--segs" => segs = args.next().ok_or("--segs needs a value")?.parse()?,
+                "--trace" => trace = args.next().map(PathBuf::from),
                 other => return Err(format!("unknown argument {other}").into()),
             }
+        }
+
+        // `d_trace` is allocated in `AmdEngine::load` under this knob and nowhere else, so it
+        // must be set BEFORE the load rather than at dump time.
+        if trace.is_some() && std::env::var_os("PLOW_TRACE_RAW").is_none() {
+            // SAFETY: single-threaded, before any backend exists.
+            unsafe { std::env::set_var("PLOW_TRACE_RAW", "1") };
         }
 
         let mut backends = Vec::with_capacity(tp as usize);
@@ -270,6 +282,15 @@ mod hsa {
                 "  a 40-layer model at this per-layer cost would be {:.1} ms, which OVER-COUNTS: \
                  a whole-model emit overlaps seams this measures in isolation.",
                 us[us.len() / 2] * 40.0 / 1000.0
+            );
+        }
+        // AFTER the timed loop: the buffer holds the LAST launch's records, and the warm-up's
+        // page-in costs are not the layer's.
+        if let Some(path) = &trace {
+            g.rank(0).trace_write(path)?;
+            println!(
+                "trace: wrote {} -- reduce with scripts/k3_trace_report.py",
+                path.display()
             );
         }
         Ok(())
