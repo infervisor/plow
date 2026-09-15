@@ -3587,7 +3587,9 @@ pub(crate) fn blocked_gemv_cus_tuned(cus: &[u32], n: u32, k: u32) -> Vec<u32> {
 }
 
 fn glm_decode_gemv_cus(cus: &[u32], op: DevOp, n: u32, k: u32) -> Vec<u32> {
-    if op == DevOp::Gemv && emit_config::active().gemv_wg_for(n, k).is_some() {
+    if matches!(op, DevOp::Gemv | DevOp::GemmF32)
+        && emit_config::active().gemv_wg_for(n, k).is_some()
+    {
         blocked_gemv_cus_tuned(cus, n, k)
     } else {
         cus.to_vec()
@@ -7351,7 +7353,8 @@ fn emit_glm_moe_ffn_prefill(
         };
         let xb = glm_band(b, src, t, tp, h as u64 * 2);
         let lb = glm_band(b, n.rlogit, t, tp, e as u64 * F32);
-        let cs = b.emit(DevOp::GemmF32, all.clone(), &[dep], |d| {
+        let score_op = if c.has_dsa { DevOp::GemmF32 } else { DevOp::Gemv };
+        let cs = b.emit(score_op, all.clone(), &[dep], |d| {
             d.t[0] = lb;
             d.t[1] = xb;
             d.t[2] = w.wr;
@@ -7362,7 +7365,8 @@ fn emit_glm_moe_ffn_prefill(
         let tab_b = glm_band_as(b, n.rt_tp, t, tp, tk_all as u64 * 8, ".rt");
         (tb, lb, tab_b, cs)
     } else {
-        let cs = b.emit(DevOp::GemmF32, all.clone(), &[c_rn2], |d| {
+        let score_op = if c.has_dsa { DevOp::GemmF32 } else { DevOp::Gemv };
+        let cs = b.emit(score_op, all.clone(), &[c_rn2], |d| {
             d.t[0] = n.rlogit;
             d.t[1] = n.xn2;
             d.t[2] = w.wr;
@@ -8289,9 +8293,10 @@ fn emit_glm_moe_ffn_rows(
 
     // Router score at M = rows, then the PREFILL top-k tail (the decode tail under a token loop,
     // bit-identical per token) and the align/sort that the grouped ops read.
+    let score_op = if c.has_dsa { DevOp::GemmF32 } else { DevOp::Gemv };
     let c_score = b.emit(
-        DevOp::GemmF32,
-        glm_decode_gemv_cus(&all, DevOp::GemmF32, e, h),
+        score_op,
+        glm_decode_gemv_cus(&all, score_op, e, h),
         &[c_rn2],
         |d| {
             d.t[0] = n.rlogit;
@@ -8773,7 +8778,8 @@ pub(crate) fn emit_glm_moe_ffn(
         "GLM_ROUTER_OLD cannot represent GLM's FP32 router logits"
     );
     let c_router = {
-        let c_score = b.emit(DevOp::GemmF32, router_cus.clone(), &[c_rn2], |d| {
+        let score_op = if c.has_dsa { DevOp::GemmF32 } else { DevOp::Gemv };
+        let c_score = b.emit(score_op, router_cus.clone(), &[c_rn2], |d| {
             d.t[0] = n.rlogit;
             d.t[1] = n.xn2;
             d.t[2] = w.wr;

@@ -2059,7 +2059,10 @@ fn glm_decode_gemv_tuning_preserves_live_column_ownership() {
             );
             if before.blocks != after.blocks {
                 changed += 1;
-                assert_eq!(after.op, DevOp::Gemv as u16);
+                assert!(matches!(
+                    DevOp::from_u16(after.op),
+                    Some(DevOp::Gemv | DevOp::GemmF32)
+                ));
                 assert!(matches!(after.i[1], 64 | 256));
                 assert_eq!(after.i[2], 6144);
                 let n = after.i[1];
@@ -2077,6 +2080,7 @@ fn glm_decode_gemv_tuning_preserves_live_column_ownership() {
     let all: Vec<_> = (0..304).rev().collect();
     let _tuning = crate::test_env::EnvScope::set(&[("PLOW_GEMV_WG_TUNING", "64x6144=304")]);
     assert_eq!(glm_decode_gemv_cus(&all, DevOp::Gemv, 64, 6144), all[..64]);
+    assert_eq!(glm_decode_gemv_cus(&all, DevOp::GemmF32, 64, 6144), all[..64]);
     for op in [DevOp::GemvMxfp4, DevOp::GemvFp8Blk, DevOp::GemvQkv] {
         assert_eq!(glm_decode_gemv_cus(&all, op, 64, 6144), all);
     }
@@ -4182,8 +4186,8 @@ fn glm_router_overlap_runs_the_band_router_beside_the_hidden_gather() {
     }
 }
 
-/// `PLOW_GLM_GEMM_LT_PF_EXT` on one sequence-parallel MoE layer: every band projection, o_proj,
-/// the band router and the shared expert's gate/up/down become `GemmLtPf`, each alone in its
+/// `PLOW_GLM_GEMM_LT_PF_EXT` on one sequence-parallel MoE layer: every BF16-output band
+/// projection, o_proj and the shared expert's gate/up/down become `GemmLtPf`, each alone in its
 /// segment, the native runs back to back; `0` emits exactly what the unset knob does.
 #[test]
 fn glm_gemm_lt_pf_ext_routes_the_interpreter_projections() {
@@ -4225,7 +4229,13 @@ fn glm_gemm_lt_pf_ext_routes_the_interpreter_projections() {
     let on = layer(Some("1"));
 
     let is_gemm = |d: &crate::DevInst| {
-        [DevOp::Gemm, DevOp::GemmSmall, DevOp::GemmMed, DevOp::GemmWide, DevOp::GemmC5]
+        [
+            DevOp::Gemm,
+            DevOp::GemmSmall,
+            DevOp::GemmMed,
+            DevOp::GemmWide,
+            DevOp::GemmC5,
+        ]
             .iter()
             .any(|&o| d.op == o as u16)
     };
@@ -4248,7 +4258,7 @@ fn glm_gemm_lt_pf_ext_routes_the_interpreter_projections() {
         .map(|d| (d.i[0], d.i[1], d.i[2]))
         .collect();
     band_off.sort_unstable();
-    for shape in [(tb, 2048, 6144), (tb, 512, 6144), (tb, 64, 6144), (tb, 256, 6144)] {
+    for shape in [(tb, 2048, 6144), (tb, 512, 6144), (tb, 64, 6144)] {
         assert!(band_off.contains(&shape), "{shape:?}");
     }
     assert_eq!(lt(&on, 2), band_off);
@@ -4280,7 +4290,14 @@ fn glm_gemm_lt_pf_ext_routes_the_interpreter_projections() {
     }
     let q_a = find(2, 2048, 6144)[0];
     assert_eq!([find(2, 512, 6144)[0], find(2, 64, 6144)[0]], [q_a + 1, q_a + 2]);
-    let router = find(2, 256, 6144)[0];
+    let router = on
+        .insts
+        .iter()
+        .position(|d| {
+            d.op == DevOp::GemmF32 as u16 && (d.i[0], d.i[1], d.i[2]) == (tb, 256, 6144)
+        })
+        .map(seg_of)
+        .unwrap();
     assert_eq!(find(0, 256, 6144), [router + 1, router + 2], "router, gate, up in one run");
     let moe = on.insts.iter().position(|d| d.op == DevOp::MoeAiterFp8Pf as u16).unwrap();
     assert_eq!(find(0, 6144, 256), [seg_of(moe) - 1], "shared down right before the MoE call");

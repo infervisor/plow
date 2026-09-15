@@ -285,6 +285,11 @@ const GFX950_UNEMITTED: &[(&str, &str)] = &[
     // The prefill twin (`emit_glm_dsa_prefill_select`) and `glm53.rs` itself are still
     // pending; HyperConnPre/HyperConnPost below remain unrouted until glm53.rs exists.
     (
+        "PLOW_DOP_MOE_ROUTER",
+        "Legacy fused router score and top-k arm. MLA emitters use the split GEMV/GEMM_F32 + \
+         MoeRouterTopk path and explicitly refuse the legacy GLM_ROUTER_OLD selector.",
+    ),
+    (
         "PLOW_DOP_FLASH_GATHER_PREFILL",
         "Sparse MLA prefill needs one causal top-k index row per query token. IndexScore and \
           IndexSelect currently produce only a single-query index, so mla.rs deliberately emits \
