@@ -153,47 +153,101 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
                 const float v = (mrow[n + j] * inv) * hc_scale[1] + hc_base[n + j];
                 post_mix[(size_t)t * n + j] = (1.0f / (1.0f + expf(-v))) * PLOW_HC_POST_MULT;
             }
-            /* comb_mix: softmax over the LAST axis (dim=-1, fixed row i, varying column j),
-             * then one dim=-2 (column) normalize, then (sinkhorn_repeat-1) more (dim=-1,
-             * dim=-2) pairs — exactly mhc_pre_torch's loop, not a reordering of it. */
-            for (unsigned i = 0; i < n; i++) {
-                float m = -3.0e38f;
-                for (unsigned j = 0; j < n; j++) {
-                    const float v = (mrow[2 * n + i * n + j] * inv) * hc_scale[2] +
-                                    hc_base[2 * n + i * n + j];
-                    comb_lds[i * n + j] = v;
-                    m = fmaxf(m, v);
-                }
-                float s = 0.0f;
-                for (unsigned j = 0; j < n; j++) {
-                    const float e = expf(comb_lds[i * n + j] - m);
-                    comb_lds[i * n + j] = e;
-                    s += e;
-                }
-#if PLOW_HC_SINKHORN_RCP
-                hc_normalize<true>(comb_lds, i * n, 1, n, s, hc_eps);
-#else
-                for (unsigned j = 0; j < n; j++) comb_lds[i * n + j] = comb_lds[i * n + j] / s + hc_eps;
-#endif
-            }
-            for (unsigned j = 0; j < n; j++) {
-                float s = 0.0f;
-                for (unsigned i = 0; i < n; i++) s += comb_lds[i * n + j];
-#if PLOW_HC_SINKHORN_RCP
-                hc_normalize<false>(comb_lds, j, n, n, s + hc_eps, hc_eps);
-#else
-                for (unsigned i = 0; i < n; i++) comb_lds[i * n + j] = comb_lds[i * n + j] / (s + hc_eps);
-#endif
-            }
-            for (unsigned r = 1; r < sinkhorn_repeat; r++) {
-                for (unsigned i = 0; i < n; i++) {
+            /* REGISTER-RESIDENT 4x4. The Sinkhorn below is ~1300 dependent scalar ops on lane 0,
+             * and with `comb_lds` in LDS every one of them is an LDS round trip -- at 2 waves/SIMD
+             * there is nothing to hide that latency behind. A local array indexed only by constants
+             * (which is what `NC = 4` makes these loops) is promoted to registers instead.
+             *
+             * WHY THE FILE HEADER'S "no measurable throughput" NO LONGER HOLDS: it was written for
+             * GLM-5.3 DECODE, where this op sees one token. V4.1 PREFILL dispatches it at T=8192, so
+             * a block runs the whole serial section 27 times. Measured by ablation on 8x MI300X at
+             * 8k -- hc_sinkhorn_iters 20 -> 2 moves the layer 30.34 -> 25.49 ms -- the Sinkhorn is
+             * ~5.4 ms of a 30 ms layer. The `T >= nblk` gate keeps the decode path on the shipped
+             * block verbatim, which is the arm the gfx950 oracle signed off.
+             *
+             * BIT-IDENTICAL: the copy below is generated from the shipped block by substitution, so
+             * it is the same statements in the same order at the same precision. Only the storage
+             * class of the 4x4 changes. */
+            if (n == 4u && T >= nblk) {
+                constexpr unsigned NC = 4u;
+                float c[NC * NC];
+                /* comb_mix: softmax over the LAST axis (dim=-1, fixed row i, varying column j),
+                 * then one dim=-2 (column) normalize, then (sinkhorn_repeat-1) more (dim=-1,
+                 * dim=-2) pairs — exactly mhc_pre_torch's loop, not a reordering of it. */
+                for (unsigned i = 0; i < NC; i++) {
+                    float m = -3.0e38f;
+                    for (unsigned j = 0; j < NC; j++) {
+                        const float v = (mrow[2 * NC + i * NC + j] * inv) * hc_scale[2] +
+                                        hc_base[2 * NC + i * NC + j];
+                        c[i * NC + j] = v;
+                        m = fmaxf(m, v);
+                    }
                     float s = 0.0f;
-                    for (unsigned j = 0; j < n; j++) s += comb_lds[i * n + j];
+                    for (unsigned j = 0; j < NC; j++) {
+                        const float e = expf(c[i * NC + j] - m);
+                        c[i * NC + j] = e;
+                        s += e;
+                    }
 #if PLOW_HC_SINKHORN_RCP
-                    hc_normalize<false>(comb_lds, i * n, 1, n, s + hc_eps, hc_eps);
+                    hc_normalize<true>(c, i * NC, 1, NC, s, hc_eps);
 #else
-                    for (unsigned j = 0; j < n; j++)
-                        comb_lds[i * n + j] = comb_lds[i * n + j] / (s + hc_eps);
+                    for (unsigned j = 0; j < NC; j++) c[i * NC + j] = c[i * NC + j] / s + hc_eps;
+#endif
+                }
+                for (unsigned j = 0; j < NC; j++) {
+                    float s = 0.0f;
+                    for (unsigned i = 0; i < NC; i++) s += c[i * NC + j];
+#if PLOW_HC_SINKHORN_RCP
+                    hc_normalize<false>(c, j, NC, NC, s + hc_eps, hc_eps);
+#else
+                    for (unsigned i = 0; i < NC; i++) c[i * NC + j] = c[i * NC + j] / (s + hc_eps);
+#endif
+                }
+                for (unsigned r = 1; r < sinkhorn_repeat; r++) {
+                    for (unsigned i = 0; i < NC; i++) {
+                        float s = 0.0f;
+                        for (unsigned j = 0; j < NC; j++) s += c[i * NC + j];
+#if PLOW_HC_SINKHORN_RCP
+                        hc_normalize<false>(c, i * NC, 1, NC, s + hc_eps, hc_eps);
+#else
+                        for (unsigned j = 0; j < NC; j++)
+                            c[i * NC + j] = c[i * NC + j] / (s + hc_eps);
+#endif
+                    }
+                    for (unsigned j = 0; j < NC; j++) {
+                        float s = 0.0f;
+                        for (unsigned i = 0; i < NC; i++) s += c[i * NC + j];
+#if PLOW_HC_SINKHORN_RCP
+                        hc_normalize<false>(c, j, NC, NC, s + hc_eps, hc_eps);
+#else
+                        for (unsigned i = 0; i < NC; i++)
+                            c[i * NC + j] = c[i * NC + j] / (s + hc_eps);
+#endif
+                    }
+                }
+                for (unsigned k = 0; k < NC * NC; k++) comb_mix[(size_t)t * NC * NC + k] = c[k];
+            } else {
+                /* comb_mix: softmax over the LAST axis (dim=-1, fixed row i, varying column j),
+                 * then one dim=-2 (column) normalize, then (sinkhorn_repeat-1) more (dim=-1,
+                 * dim=-2) pairs — exactly mhc_pre_torch's loop, not a reordering of it. */
+                for (unsigned i = 0; i < n; i++) {
+                    float m = -3.0e38f;
+                    for (unsigned j = 0; j < n; j++) {
+                        const float v = (mrow[2 * n + i * n + j] * inv) * hc_scale[2] +
+                                        hc_base[2 * n + i * n + j];
+                        comb_lds[i * n + j] = v;
+                        m = fmaxf(m, v);
+                    }
+                    float s = 0.0f;
+                    for (unsigned j = 0; j < n; j++) {
+                        const float e = expf(comb_lds[i * n + j] - m);
+                        comb_lds[i * n + j] = e;
+                        s += e;
+                    }
+#if PLOW_HC_SINKHORN_RCP
+                    hc_normalize<true>(comb_lds, i * n, 1, n, s, hc_eps);
+#else
+                    for (unsigned j = 0; j < n; j++) comb_lds[i * n + j] = comb_lds[i * n + j] / s + hc_eps;
 #endif
                 }
                 for (unsigned j = 0; j < n; j++) {
@@ -202,12 +256,33 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
 #if PLOW_HC_SINKHORN_RCP
                     hc_normalize<false>(comb_lds, j, n, n, s + hc_eps, hc_eps);
 #else
-                    for (unsigned i = 0; i < n; i++)
-                        comb_lds[i * n + j] = comb_lds[i * n + j] / (s + hc_eps);
+                    for (unsigned i = 0; i < n; i++) comb_lds[i * n + j] = comb_lds[i * n + j] / (s + hc_eps);
 #endif
                 }
+                for (unsigned r = 1; r < sinkhorn_repeat; r++) {
+                    for (unsigned i = 0; i < n; i++) {
+                        float s = 0.0f;
+                        for (unsigned j = 0; j < n; j++) s += comb_lds[i * n + j];
+#if PLOW_HC_SINKHORN_RCP
+                        hc_normalize<false>(comb_lds, i * n, 1, n, s + hc_eps, hc_eps);
+#else
+                        for (unsigned j = 0; j < n; j++)
+                            comb_lds[i * n + j] = comb_lds[i * n + j] / (s + hc_eps);
+#endif
+                    }
+                    for (unsigned j = 0; j < n; j++) {
+                        float s = 0.0f;
+                        for (unsigned i = 0; i < n; i++) s += comb_lds[i * n + j];
+#if PLOW_HC_SINKHORN_RCP
+                        hc_normalize<false>(comb_lds, j, n, n, s + hc_eps, hc_eps);
+#else
+                        for (unsigned i = 0; i < n; i++)
+                            comb_lds[i * n + j] = comb_lds[i * n + j] / (s + hc_eps);
+#endif
+                    }
+                }
+                for (unsigned k = 0; k < n * n; k++) comb_mix[(size_t)t * n * n + k] = comb_lds[k];
             }
-            for (unsigned k = 0; k < n * n; k++) comb_mix[(size_t)t * n * n + k] = comb_lds[k];
         }
         __syncthreads(); /* logits[0..n) (pre_mix) must be visible before reduction 2 reads it */
 
