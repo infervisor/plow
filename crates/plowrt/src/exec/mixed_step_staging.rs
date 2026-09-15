@@ -51,6 +51,7 @@ pub struct MixedStepStaging {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CanonicalDeviceMetadata<'a> {
     pub decode_slots: &'a [i32],
+    pub sample_input_rows: &'a [u32],
     pub prefill_spans: &'a [packet::dev::PrefillSpan],
     pub parked: &'a [u32],
     pub rows: u32,
@@ -230,6 +231,7 @@ impl MixedStepStaging {
     pub fn pending_device_metadata(&self) -> Option<CanonicalDeviceMetadata<'_>> {
         self.pending.then(|| CanonicalDeviceMetadata {
             decode_slots: &self.plan.decode_slots,
+            sample_input_rows: &self.plan.sample_input_rows,
             prefill_spans: &self.plan.prefill_spans,
             parked: &self.plan.parked,
             rows: self.plan.rows.len() as u32,
@@ -322,6 +324,7 @@ pub(crate) struct HostLayout {
     pub(crate) pos: std::ops::Range<usize>,
     pub(crate) kvlen: std::ops::Range<usize>,
     pub(crate) decode_slot: std::ops::Range<usize>,
+    pub(crate) sample_row: std::ops::Range<usize>,
     pub(crate) parked: std::ops::Range<usize>,
     pub(crate) prefill_spans: std::ops::Range<usize>,
 }
@@ -340,6 +343,7 @@ impl HostLayout {
         let pos = take(rows)?;
         let kvlen = take(rows)?;
         let decode_slot = take(decode)?;
+        let sample_row = take(decode)?;
         let parked = take(rows)?;
         let prefill_spans =
             take(spans.checked_mul(SPAN_WORDS).ok_or_else(|| {
@@ -353,6 +357,7 @@ impl HostLayout {
             pos,
             kvlen,
             decode_slot,
+            sample_row,
             parked,
             prefill_spans,
         })
@@ -371,6 +376,7 @@ pub(crate) fn fill_words(
     if words.len() < layout.words()
         || plan.rows.len() > layout.rows
         || plan.decode_slots.len() > layout.decode
+        || plan.sample_input_rows.len() > layout.decode
         || plan.prefill_spans.len() > layout.spans
     {
         return Err(RuntimeError::Rejected(
@@ -385,6 +391,8 @@ pub(crate) fn fill_words(
     for (index, &slot) in plan.decode_slots.iter().enumerate() {
         words[layout.decode_slot.start + index] = slot as u32;
     }
+    words[layout.sample_row.start..layout.sample_row.start + plan.sample_input_rows.len()]
+        .copy_from_slice(&plan.sample_input_rows);
     words[layout.parked.start..layout.parked.start + plan.parked.len()]
         .copy_from_slice(&plan.parked);
     for (index, span) in plan.prefill_spans.iter().enumerate() {

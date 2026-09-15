@@ -150,6 +150,13 @@ PLOW_TB_INLINE PlowTokenBatchView plow_tb_view(const PlowProgram* prog) {
         const PlowPrefillSpan* s = v.spans + i;
         if (!s->n_rows) plow_tb_trap();                 /* no zero-length entries */
         if (s->row0 != expect) plow_tb_trap();          /* dense cover, monotone row0 */
+        const unsigned allowed = PLOW_PREFILL_SPAN_RESET_STATE | PLOW_PREFILL_SPAN_DECODE |
+                                 PLOW_PREFILL_SPAN_SAMPLE;
+        if (s->flags & ~allowed) plow_tb_trap();
+        if (!!(s->flags & PLOW_PREFILL_SPAN_RESET_STATE) != (s->kv_row0 == 0u)) plow_tb_trap();
+        if ((s->flags & PLOW_PREFILL_SPAN_DECODE) &&
+            !(s->flags & PLOW_PREFILL_SPAN_SAMPLE))
+            plow_tb_trap();
         const unsigned end = s->row0 + s->n_rows;
         if (end < s->row0 || end > v.row_capacity) plow_tb_trap();
         /* §4.4: a span starts at its committed frontier and ends at the new one. */
@@ -204,20 +211,25 @@ PLOW_TB_INLINE PlowTokenBatchRow plow_tb_row(const PlowTokenBatchView& v, unsign
 
 /* THE ATTENTION PARTITION, defined exactly once.
  *
- * §4.1 forbids the HOST PLAN from classifying a span as decode because its length is one — a
- * final prefill chunk can also have length one. It explicitly allows the other thing: "Kernel
- * selection derives query geometry from span lengths." This is that, and only that: which of
- * two attention kernels covers a span, on a route where both are numerically the same function.
- * A one-row span at frontier p attends over [0, p+1) with its query at p whichever kernel runs
- * it, so a final chunk of length one landing here is CORRECT, not merely tolerated.
- *
- * Spans are decode-first ordered (§4.1), so the partition is a prefix and both consumers agree
- * on it by construction. ndec == 0 (pure prefill) and ndec == n_spans (pure decode) are both
- * legal and both write nothing on the other side — which is how this route serves an
- * intermediate pure-prefill step that the mixed-step resolver refuses outright. */
+ * Sampling and attention phase are explicit. Decode spans are a prefix and carry both DECODE
+ * and SAMPLE. A completing prefill span carries SAMPLE and remains in natural token order; the
+ * output tail gathers its final row through the host-provided sample-row table. */
 PLOW_TB_INLINE unsigned plow_tb_decode_spans(const PlowTokenBatchView& v) {
     unsigned n = 0;
-    while (n < v.n_spans && v.spans[n].n_rows == 1u) ++n;
+    while (n < v.n_spans && (v.spans[n].flags & PLOW_PREFILL_SPAN_DECODE)) {
+        if (v.spans[n].n_rows != 1u || !(v.spans[n].flags & PLOW_PREFILL_SPAN_SAMPLE))
+            plow_tb_trap();
+        ++n;
+    }
+    for (unsigned i = n; i < v.n_spans; ++i)
+        if (v.spans[i].flags & PLOW_PREFILL_SPAN_DECODE) plow_tb_trap();
+    return n;
+}
+
+PLOW_TB_INLINE unsigned plow_tb_sample_spans(const PlowTokenBatchView& v) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < v.n_spans; ++i)
+        if (v.spans[i].flags & PLOW_PREFILL_SPAN_SAMPLE) ++n;
     return n;
 }
 
@@ -233,15 +245,22 @@ PLOW_TB_INLINE PlowTokenBatchView plow_tb_span_range(const PlowTokenBatchView& v
     return o;
 }
 
-/* Live rows for a packet compiled at `capacity`. Class-A operators over the whole batch need
- * exactly this and nothing else (§5.1); an attention-partition packet compiled at the decode
- * capacity gets the live decode-span count. Any other capacity is a mis-planned batch. */
+/* Live rows for a packet compiled at `capacity`. Class-A operators over the whole batch use M;
+ * compact output operators use S. FlashDecode bypasses this helper and consumes the explicit
+ * DECODE prefix, which may be shorter than S when a prompt completes in the same step. */
 PLOW_TB_INLINE unsigned plow_tb_rows(const PlowProgram* prog, unsigned capacity) {
     const PlowTokenBatchView v = plow_tb_view(prog);
     if (capacity == v.row_capacity) return v.real_rows;
-    const unsigned ndec = plow_tb_decode_spans(v);
-    if (capacity < ndec || capacity >= v.row_capacity) plow_tb_trap();
-    return ndec;
+    const unsigned samples = plow_tb_sample_spans(v);
+    if (capacity < samples || capacity >= v.row_capacity) plow_tb_trap();
+    return samples;
+}
+
+PLOW_TB_INLINE unsigned plow_tb_sample_rows(const PlowProgram* prog, unsigned capacity) {
+    const PlowTokenBatchView v = plow_tb_view(prog);
+    const unsigned samples = plow_tb_sample_spans(v);
+    if (capacity < samples || capacity >= v.row_capacity) plow_tb_trap();
+    return samples;
 }
 
 #undef PLOW_TB_INLINE

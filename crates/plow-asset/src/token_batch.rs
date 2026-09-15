@@ -829,8 +829,7 @@ impl Capabilities {
     /// A route that converted only the first would be a silent wrong answer, because a missing
     /// arm on AMD writes nothing and does not trap.
     ///
-    /// `RowGather` is deliberately absent from `descriptor_aware`: the object has the arm, but
-    /// this route emits no terminal segment, so [`Self::can_run_output`] must keep saying no.
+    /// The output tail gathers explicitly named terminal rows before final norm and LM head.
     pub fn amd_dense_gqa(target: impl Into<String>, row_capacity: u32, sample_capacity: u32) -> Self {
         Capabilities {
             target: target.into(),
@@ -865,6 +864,7 @@ impl Capabilities {
                 DevOp::FlashMerge as u16,
                 DevOp::Argmax as u16,
                 DevOp::ArgmaxFin as u16,
+                DevOp::RowGather as u16,
             ],
             converted_c: vec![DevOp::FlashPrefill as u16, DevOp::HeadNormRope as u16],
         }

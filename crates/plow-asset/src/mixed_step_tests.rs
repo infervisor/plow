@@ -452,6 +452,7 @@ fn buffers(rows: usize, spans: usize, parked: usize, mapped: usize) -> Plan {
         real_rows: 0,
         rows: Vec::with_capacity(rows),
         decode_slots: Vec::with_capacity(rows),
+        sample_input_rows: Vec::with_capacity(mapped),
         prefill_spans: Vec::with_capacity(spans),
         parked: Vec::with_capacity(parked),
         mapped_ends: Vec::with_capacity(mapped),
@@ -827,23 +828,28 @@ fn prefix_free_spans_tile_the_batch_with_no_decode_prefix() {
     assert_eq!(expect, plan.real_rows);
     assert_eq!(plan.prefill_spans[0].row0, 0, "there is no decode prefix");
 
-    // The leading run of length-one spans is exactly S. `plow_tb_decode_spans` reads that run
-    // as the attention partition AND, through PLOW_SAMPLE_ROWS, as the selection row count.
-    let leading = plan.prefill_spans.iter().take_while(|s| s.n_rows == 1).count();
-    assert_eq!(leading as u32, plan.decode_rows);
-
-    // The completing prompt's terminal token leads the batch at its own absolute position, and
-    // its body follows: two spans, one slot, contiguous in KV.
-    let terminal = plan.prefill_spans[2];
-    assert_eq!((terminal.slot, terminal.kv_row0, terminal.kv_len), (2, 119, 120));
-    let body = plan
+    // Sampling and attention phase are independent: two decode samples use FlashDecode, while
+    // the completing prompt remains sampled but uses FlashPrefill.
+    let leading = plan
         .prefill_spans
         .iter()
-        .find(|s| s.slot == 2 && s.n_rows > 1)
-        .expect("body span");
-    assert_eq!((body.kv_row0, body.kv_len), (70, 119));
-    assert_eq!(plan.rows[terminal.row0 as usize].token, c[49]);
-    assert_eq!(plan.rows[terminal.row0 as usize].position, 119);
+        .filter(|s| s.flags & PREFILL_SPAN_SAMPLE != 0)
+        .count();
+    assert_eq!(leading as u32, plan.decode_rows);
+    assert!(plan.prefill_spans[..2]
+        .iter()
+        .all(|s| s.flags & PREFILL_SPAN_DECODE != 0));
+
+    // The completing prompt stays in natural order as one sampled prefill span. Its final row
+    // is selected explicitly for the output tail.
+    let completing = plan.prefill_spans[2];
+    assert_eq!((completing.slot, completing.kv_row0, completing.kv_len), (2, 70, 120));
+    assert_eq!(completing.n_rows, 50);
+    assert_ne!(completing.flags & PREFILL_SPAN_SAMPLE, 0);
+    assert_eq!(completing.flags & PREFILL_SPAN_DECODE, 0);
+    assert_eq!(plan.sample_input_rows, [0, 1, 51]);
+    assert_eq!(plan.rows[51].token, c[49]);
+    assert_eq!(plan.rows[51].position, 119);
 
     // The intermediate chunk samples nothing and its span is not in the leading run.
     let intermediate = plan.prefill_spans.last().unwrap();
@@ -971,16 +977,17 @@ fn two_cached_prefix_suffixes_fill_one_1024_row_token_batch() {
 
     assert_eq!((plan.real_rows, plan.decode_rows), (1024, 2));
     assert_eq!(owners, [100, 200]);
-    assert_eq!(plan.prefill_spans.len(), 4);
+    assert_eq!(plan.prefill_spans.len(), 2);
     assert_eq!(
         plan.prefill_spans
             .iter()
             .filter(|span| {
-                span.n_rows == 511 && span.kv_row0 == 1024 && span.kv_len == 1535
+                span.n_rows == 512 && span.kv_row0 == 1024 && span.kv_len == 1536
             })
             .count(),
         2
     );
+    assert_eq!(plan.sample_input_rows, [511, 1023]);
     assert_eq!(
         plan.commits,
         [
@@ -1009,6 +1016,8 @@ fn a_one_token_prompt_is_one_length_one_span() {
     assert_eq!(plan.prefill_spans[0].n_rows, 1);
     assert_eq!(plan.prefill_spans[0].kv_row0, 0);
     assert_ne!(plan.prefill_spans[0].flags & PREFILL_SPAN_RESET_STATE, 0);
+    assert_ne!(plan.prefill_spans[0].flags & PREFILL_SPAN_SAMPLE, 0);
+    assert_eq!(plan.prefill_spans[0].flags & PREFILL_SPAN_DECODE, 0);
     assert_eq!(plan.decode_rows, 1);
     assert_eq!(plan.real_rows, 1);
 }

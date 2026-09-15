@@ -583,13 +583,14 @@ mod tests {
             layout.pos.clone(),
             layout.kvlen.clone(),
             layout.decode_slot.clone(),
+            layout.sample_row.clone(),
             layout.parked.clone(),
             layout.prefill_spans.clone(),
         ];
         for pair in ranges.windows(2) {
             assert_eq!(pair[0].end, pair[1].start);
         }
-        assert_eq!(layout.words(), 128 * 4 + 16 + 16 * SPAN_WORDS);
+        assert_eq!(layout.words(), 128 * 4 + 16 * 2 + 16 * SPAN_WORDS);
     }
 
     #[test]
@@ -620,6 +621,7 @@ mod tests {
             assert_eq!(words[layout.pos.start], 8);
             assert_eq!(words[layout.kvlen.start], 9);
             assert_eq!(words[layout.decode_slot.start], 2);
+            assert_eq!(words[layout.sample_row.start], 0);
             assert_eq!(words[layout.prefill_spans.start], 1);
             assert_eq!(words.as_ptr(), pointer);
             assert_eq!(words.capacity(), capacity);

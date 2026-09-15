@@ -40,7 +40,7 @@
  *       -c runtime/tests/token_batch_dense_gfx942_test.hip -o /tmp/tb_host.o
  *   c++ /tmp/tb_host.o /tmp/tb_dev.o -L$ROCM_PATH/lib -Wl,-rpath,$ROCM_PATH/lib -lamdhip64 \
  *       -o /tmp/tb_dense
- *   GPU_LEASE_TIMEOUT=21600 perf-data/tools/gpulease -n 1 tb-dense /tmp/tb_dense
+ *   $GPUQ_SUBMIT tb-dense 1 /tmp/tb_dense
  */
 #define PLOW_MIXED_STEP 1
 #define PLOW_TOKEN_BATCH 1
@@ -148,6 +148,18 @@ __global__ __launch_bounds__(PLOW_WG_WAVES * 64, 1) void tb_gemm(bf16* C, const 
 #endif
 }
 
+__global__ void tb_phase_counts(unsigned* out, const PlowProgram* prog) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        const PlowTokenBatchView tb = plow_tb_view(prog);
+        out[0] = plow_tb_decode_spans(tb);
+        out[1] = plow_tb_sample_spans(tb);
+        out[2] = plow_tb_rows(prog, tb.row_capacity);
+        out[3] = plow_tb_sample_rows(prog, tb.row_capacity - 1u);
+    }
+#endif
+}
+
 extern "C" void tb_launch_prefill_packed(unsigned grid, float* Opart, float* mlpart, bf16* O,
                                          const bf16* Q, const bf16* K, const bf16* V,
                                          const void* prog, unsigned pn_q, unsigned pn_kv,
@@ -184,6 +196,10 @@ extern "C" void tb_launch_merge(unsigned grid, bf16* out, const float* partial, 
 extern "C" void tb_launch_gemm(unsigned grid, bf16* C, const bf16* A, const bf16* B, unsigned M) {
     hipLaunchKernelGGL(tb_gemm, dim3(grid), dim3(PLOW_WG_WAVES * 64), 0, 0, C, A, B, M);
 }
+extern "C" void tb_launch_phase_counts(unsigned* out, const void* prog) {
+    hipLaunchKernelGGL(tb_phase_counts, dim3(1), dim3(1), 0, 0, out,
+                       (const PlowProgram*)prog);
+}
 
 #else
 /* ======================================================================== host driver */
@@ -209,6 +225,7 @@ extern "C" void tb_launch_decode_isolated(unsigned, float*, float*, const bf16*,
                                           unsigned);
 extern "C" void tb_launch_merge(unsigned, bf16*, const float*, const float*, unsigned, unsigned);
 extern "C" void tb_launch_gemm(unsigned, bf16*, const bf16*, const bf16*, unsigned);
+extern "C" void tb_launch_phase_counts(unsigned*, const void*);
 
 static unsigned g_fail = 0, g_pass = 0;
 
@@ -269,6 +286,7 @@ static void report(const std::string& name, bool ok, const std::string& extra = 
 /* One admitted request's contribution to a step. */
 struct Span {
     unsigned row0, n_rows, slot, kv_row0;
+    unsigned flags = 0;
 };
 
 /* Build the device-side PlowProgram carrying the descriptor. See runtime/amd/token_batch.h for
@@ -294,7 +312,8 @@ static DeviceBatch make_batch(const std::vector<Span>& spans, unsigned capacity)
         s.state_slot = spans[i].slot;
         s.kv_row0 = spans[i].kv_row0;
         s.kv_len = spans[i].kv_row0 + spans[i].n_rows;
-        s.flags = spans[i].kv_row0 == 0 ? PLOW_PREFILL_SPAN_RESET_STATE : 0u;
+        s.flags = spans[i].flags |
+                  (spans[i].kv_row0 == 0 ? PLOW_PREFILL_SPAN_RESET_STATE : 0u);
         rows = s.row0 + s.n_rows;
     }
     std::vector<unsigned> hp(capacity, 0u);
@@ -481,10 +500,11 @@ static void gate3_control(Fixture& fx) {
 static void gate4(Fixture& fx) {
     const unsigned cap = fx.q_capacity;
     const unsigned nsplit = 4;
-    const std::vector<Span> spans = {{0u, 1u, 0u, 100u},
-                                     {1u, 1u, 1u, 7u},
-                                     {2u, 1u, 3u, 383u},
-                                     {3u, 1u, 2u, 0u}};
+    const unsigned phase = PLOW_PREFILL_SPAN_DECODE | PLOW_PREFILL_SPAN_SAMPLE;
+    const std::vector<Span> spans = {{0u, 1u, 0u, 100u, phase},
+                                     {1u, 1u, 1u, 7u, phase},
+                                     {2u, 1u, 3u, 383u, phase},
+                                     {3u, 1u, 2u, 0u, phase}};
     const unsigned B = (unsigned)spans.size();
     const size_t pelems = (size_t)cap * TB_HEADS * nsplit * TB_HD;
     const size_t melems = (size_t)cap * TB_HEADS * nsplit * 2;
@@ -526,6 +546,23 @@ static void gate4(Fixture& fx) {
     for (void* p : {(void*)Opart, (void*)ml, (void*)out_a, (void*)out_b, (void*)dlen,
                     (void*)dslot})
         check(hipFree(p));
+
+    const std::vector<Span> mixed = {
+        {0u, 1u, 0u, 100u, phase},
+        {1u, 21u, 1u, 31u, PLOW_PREFILL_SPAN_SAMPLE},
+    };
+    DeviceBatch phase_batch = make_batch(mixed, cap);
+    unsigned* dcounts = dev_alloc<unsigned>(4);
+    tb_launch_phase_counts(dcounts, phase_batch.prog);
+    check(hipDeviceSynchronize());
+    const auto counts = down(dcounts, 4);
+    const bool phase_ok = counts == std::vector<unsigned>({1u, 2u, 22u, 2u});
+    char phase_msg[96];
+    std::snprintf(phase_msg, sizeof(phase_msg), "decode=%u sample=%u rows=%u compact=%u",
+                  counts[0], counts[1], counts[2], counts[3]);
+    report("gate4 explicit decode/sample phase partition", phase_ok, phase_msg);
+    check(hipFree(dcounts));
+    free_batch(phase_batch);
 }
 
 /* ============================================ GATE 5: combined-M projections */

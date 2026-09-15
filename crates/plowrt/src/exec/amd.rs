@@ -13826,7 +13826,7 @@ impl AmdEngine {
             .as_ref()
             .expect("just allocated")
             .base;
-        let pairs = self.prefix_copy_pairs(slot, rows, dst_base, false);
+        let pairs = self.prefix_copy_pairs(slot, rows, dst_base, false, None);
         // ONE completion wait for all 276 tensors. Per-copy `memcpy_dtod` blocks the host on its
         // own signal, and at this count that synchronisation — not the 56 MiB — is the cost.
         let t = std::time::Instant::now();
@@ -13836,7 +13836,14 @@ impl AmdEngine {
         Ok(())
     }
 
-    fn prefix_copy_pairs(&self, slot: usize, rows: u32, buffer: u64, restore: bool) -> Vec<(u64, u64, u64)> {
+    fn prefix_copy_pairs(
+        &self,
+        slot: usize,
+        rows: u32,
+        buffer: u64,
+        restore: bool,
+        dirty_rows: Option<u32>,
+    ) -> Vec<(u64, u64, u64)> {
         let capacity = self.prefix_regions.as_ref().map_or(self.carried_slot.len(),
             |regions| regions.iter().map(prefix::Region::max_copies).sum());
         let mut pairs = Vec::with_capacity(capacity);
@@ -13844,10 +13851,19 @@ impl AmdEngine {
         if let Some(regions) = &self.prefix_regions {
             for region in regions {
                 let base = self.devp[region.tensor].base + region.slot_bytes * slot as u64;
-                region.copy_spans(rows, |dst, src, bytes| {
+                let mut add = |dst, src, bytes| {
                     let (snapshot, live) = (buffer + offset + dst, base + src);
                     pairs.push(if restore { (live, snapshot, bytes) } else { (snapshot, live, bytes) });
-                });
+                };
+                if restore {
+                    if let Some(dirty) = dirty_rows {
+                        region.restore_spans(rows, dirty, &mut add);
+                    } else {
+                        region.copy_spans(rows, &mut add);
+                    }
+                } else {
+                    region.copy_spans(rows, &mut add);
+                }
                 offset += region.bytes();
             }
         } else {
@@ -13874,7 +13890,36 @@ impl AmdEngine {
         self.prefix_tick += 1;
         self.prefix_used[slot] = self.prefix_tick;
         let src_base = self.prefix_snap[slot].as_ref().expect("checked").base;
-        let pairs = self.prefix_copy_pairs(slot, self.prefix_rows[slot], src_base, true);
+        let pairs = self.prefix_copy_pairs(slot, self.prefix_rows[slot], src_base, true, None);
+        let t = std::time::Instant::now();
+        self.be.memcpy_dtod_batch(&pairs)?;
+        self.kda_conv_alt_stale[slot] = false;
+        crate::obs::pfx::RESTORE.add(t.elapsed().as_nanos() as u64);
+        Ok(())
+    }
+
+    /// Restore the saved recurrent state and only the sliding-cache rows that the outgoing
+    /// request could have overwritten after this snapshot.
+    pub fn restore_carried_since(&mut self, slot: usize, dirty_until: u32) -> Result<()> {
+        if !self.has_snapshot(slot) {
+            return Err(RuntimeError::Device(format!(
+                "restore_carried_since: slot {slot} has no snapshot"
+            )));
+        }
+        if self.prefix_regions.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(());
+        }
+        let rows = self.prefix_rows[slot];
+        let actual = dirty_until.saturating_sub(rows).saturating_add(1);
+        let dirty_rows = self
+            .plan_for(actual)
+            .ok()
+            .and_then(|chunks| chunks.into_iter().try_fold(0u32, u32::checked_add))
+            .unwrap_or(u32::MAX);
+        self.prefix_tick += 1;
+        self.prefix_used[slot] = self.prefix_tick;
+        let src_base = self.prefix_snap[slot].as_ref().expect("checked").base;
+        let pairs = self.prefix_copy_pairs(slot, rows, src_base, true, Some(dirty_rows));
         let t = std::time::Instant::now();
         self.be.memcpy_dtod_batch(&pairs)?;
         self.kda_conv_alt_stale[slot] = false;

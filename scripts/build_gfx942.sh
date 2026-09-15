@@ -1783,7 +1783,8 @@ for row in "${ROWS[@]}"; do
         # a device round trip everywhere else.
         for m in plow_token_batch_1 plow_token_batch_dense_gqa_1 \
                  plow_token_batch_combined_m_1 plow_token_batch_span_attn_1 \
-                 plow_token_batch_split_merge_1; do
+                 plow_token_batch_split_merge_1 plow_token_batch_phase_flags_1 \
+                 plow_token_batch_row_gather_1; do
           grep -qE "OBJECT .* $m\$" <<<"$symbols" || {
             echo "  MISSING TOKEN-BATCH MARKER: expected $m"
             fail=1

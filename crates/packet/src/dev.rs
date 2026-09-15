@@ -2803,7 +2803,7 @@ pub struct PrefillSpan {
     pub n_rows: u32,
     /// Decode/KV slot that owns the request.
     pub slot: u32,
-    /// [`PREFILL_SPAN_RESET_STATE`] when this is the request's first span.
+    /// Bitset of `PREFILL_SPAN_*` values.
     pub flags: u32,
     /// Request-local absolute KV row of `row0`.
     pub kv_row0: u32,
@@ -2816,6 +2816,11 @@ pub struct PrefillSpan {
 }
 
 pub const PREFILL_SPAN_RESET_STATE: u32 = 1;
+/// This span is a decode input and must use decode attention.
+pub const PREFILL_SPAN_DECODE: u32 = 1 << 1;
+/// This span produces one next-token distribution. Completing prefills may contain many rows;
+/// their terminal row is selected by the token-batch sample-row table.
+pub const PREFILL_SPAN_SAMPLE: u32 = 1 << 2;
 
 /// [`TokenBatch::version`] this build implements. A descriptor carrying anything else is
 /// refused at load; it is not reinterpreted.

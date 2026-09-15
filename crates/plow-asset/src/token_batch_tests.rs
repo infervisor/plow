@@ -747,11 +747,9 @@ fn dropping_a_conversion_refuses_the_program_naming_the_opcode() {
     }
 }
 
-/// The object HAS a `RowGather` arm, but this route emits no terminal segment. "Armed" and
-/// "can fire" are different claims and only the second licenses a measurement of one.
+/// The AMD dense-GQA route emits and admits its terminal RowGather segment.
 #[test]
-fn the_dense_gqa_pair_does_not_claim_an_output_segment() {
+fn the_dense_gqa_pair_claims_its_output_segment() {
     let caps = Capabilities::amd_dense_gqa("gfx942", 4096, 3);
-    let err = caps.can_run_output().expect_err("no terminal segment is emitted");
-    assert!(err.capability.contains(ROW_GATHER_CAPABILITY), "{err}");
+    caps.can_run_output().expect("RowGather is descriptor-aware");
 }

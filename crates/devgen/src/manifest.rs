@@ -1678,6 +1678,11 @@ fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) ->
             token_batch.insert(plain(DevOp::GemmGlu));
         }
     }
+    token_batch.insert(Arm {
+        op: op_name(DevOp::RowGather),
+        hd: None,
+        variant: None,
+    });
     let flash_family = |arm: &&Arm| arm.op.starts_with("Flash") || arm.op == "MlaMergeFold";
     let keys = |arms: &BTreeSet<Arm>| arms.iter().map(Arm::key).collect::<Vec<_>>();
     let families = |arms: &BTreeSet<Arm>| {
@@ -4033,6 +4038,7 @@ mod tests {
             "Gemm",
             "NormResidual",
             "RmsNorm",
+            "RowGather",
         ] {
             assert!(
                 arms.contains(&arm),
@@ -4049,6 +4055,7 @@ mod tests {
             "GEMM",
             "NORM_RESIDUAL",
             "RMSNORM",
+            "ROW_GATHER",
         ] {
             assert!(
                 h.contains(&format!(

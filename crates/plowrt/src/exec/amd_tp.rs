@@ -1299,6 +1299,13 @@ impl AmdTpGroup {
         Ok(())
     }
 
+    pub fn restore_carried_since(&mut self, slot: usize, dirty_until: u32) -> Result<()> {
+        for e in &mut self.ranks {
+            e.restore_carried_since(slot, dirty_until)?;
+        }
+        Ok(())
+    }
+
     /// `all`, not `any`: `attach_shared_prefixes` requires every rank to carry the cache, so a
     /// group predicate that said "enabled" on one rank would fail every admission.
     pub fn shared_prefix_enabled(&self) -> bool {
