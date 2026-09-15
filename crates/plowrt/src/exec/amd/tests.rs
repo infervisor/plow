@@ -3332,17 +3332,17 @@ fn split_dsa_selection_checks_phases_operands_and_object() {
         check_dsa_select_local(std::slice::from_ref(p), t, "gfx942", true).is_ok()
     }
     let mut prog = segmented_prog(&[DevOp::IndexSelect], &[0]);
-    prog.t = 20;
-    prog.role = packet::devbuild::ProgramRole::DecodeRung { rows: 20 };
+    prog.t = 16;
+    prog.role = packet::devbuild::ProgramRole::DecodeRung { rows: 16 };
     prog.insts[0].t = [0, 1, 3, 4, 2, 5, 6, 65535];
     let mut tensors: Vec<_> = [
-        20 * 2048 * 4,
-        20 * 81920 * 4,
-        20 * 4,
-        20 * 4096 * 4,
-        20 * 16 * 4,
-        20 * 2560 * 4,
-        20 * 81920 * 8,
+        16 * 2048 * 4,
+        16 * 81920 * 4,
+        16 * 4,
+        16 * 4096 * 4,
+        16 * 16 * 4,
+        16 * 2560 * 4,
+        16 * 81920 * 8,
     ]
     .into_iter()
     .enumerate()
@@ -3354,19 +3354,19 @@ fn split_dsa_selection_checks_phases_operands_and_object() {
     .collect();
     // Phases 1-2 run g workgroups per row, phase 3 one.
     for (phase, blocks, want) in [
-        (1, 300, true),
-        (2, 300, true),
-        (3, 20, true),
-        (3, 300, false),
-        (1, 20, false),
-        (0, 300, false),
-        (4, 20, false),
+        (1, 240, true),
+        (2, 240, true),
+        (3, 16, true),
+        (3, 240, false),
+        (1, 16, false),
+        (0, 240, false),
+        (4, 16, false),
     ] {
         prog.insts[0].blocks = blocks;
         prog.insts[0].i = [81920, 2048, 0, 0, 2, 15, phase, 0];
         assert_eq!(ok(&prog, &tensors), want, "phase {phase} blocks {blocks}");
     }
-    prog.insts[0].blocks = 300;
+    prog.insts[0].blocks = 240;
     prog.insts[0].i = [81920, 2048, 0, 0, 2, 15, 2, 0];
     // Every operand, strips included, covers all rows; the strips are their own tensors.
     for operand in 0..7 {
@@ -3381,9 +3381,9 @@ fn split_dsa_selection_checks_phases_operands_and_object() {
     assert!(!ok(&prog, &tensors));
     prog.insts[0].i[5] = 15;
     // Decode rungs only.
-    prog.role = packet::devbuild::ProgramRole::PrefillBucket { rows: 20 };
+    prog.role = packet::devbuild::ProgramRole::PrefillBucket { rows: 16 };
     assert!(!ok(&prog, &tensors));
-    prog.role = packet::devbuild::ProgramRole::DecodeRung { rows: 20 };
+    prog.role = packet::devbuild::ProgramRole::DecodeRung { rows: 16 };
     let requires = packet_decode_arm_requirements(std::slice::from_ref(&prog));
     assert_eq!(requires, ["PLOW_DSA_SELECT_SPLIT=1"]);
     assert!(check_decode_object(

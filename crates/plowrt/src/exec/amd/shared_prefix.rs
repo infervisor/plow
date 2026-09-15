@@ -873,7 +873,7 @@ mod tests {
                     ("PLOW_GLM_DSA_PF", "1"),
                     ("PLOW_GLM_DSA_PF_SPAN", "3"),
                     ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
-                    ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+                    ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,32"),
                     ("PLOW_MLA_PF_V2", "1"),
                     ("PLOW_MLA_PF_AITER", "1"),
                     ("PLOW_UNISEG", "0"),
@@ -934,7 +934,7 @@ mod tests {
             .bytes
             / 4) as u32;
         let batch = blob.progs.last().unwrap().t as usize;
-        assert_eq!(batch, 20);
+        assert_eq!(batch, 32);
         assert!(
             Layout::from_blob(&blob, batch, context).is_some(),
             "the default GLM gfx942 TP8 packet no longer admits the shared radix prefix cache"
