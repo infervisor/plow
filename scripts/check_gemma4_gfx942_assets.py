@@ -15,6 +15,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("build_json", type=Path)
     parser.add_argument("precision", choices=("bf16", "fp8"))
+    parser.add_argument("profile", choices=("c128", "wide"))
     args = parser.parse_args()
     build = json.loads(args.build_json.read_text())
 
@@ -30,13 +31,20 @@ def main():
         require(precision.get(axis) == value, f"{axis} is not {value}")
 
     shapes = build.get("shapes", {})
-    require(
-        shapes.get("prefill_buckets") == [128, 512, 1024, 2048, 4096, 8192],
-        "prefill ladder is not 128,512,1024,2048,4096,8192",
+    expected_prefill = (
+        [128, 512, 1024]
+        if args.profile == "c128"
+        else [128, 512, 1024, 2048, 4096, 8192]
     )
+    require(shapes.get("prefill_buckets") == expected_prefill, "wrong prefill ladder")
     programs = build.get("programs", [])
     decode = sorted({p.get("batch") for p in programs if p.get("kind") == "decode"})
-    require(decode == [1, 2, 4, 8], "decode ladder is not 1,2,4,8")
+    expected_decode = (
+        [1, 2, 4, 8, 16, 32, 64, 128]
+        if args.profile == "c128"
+        else [1, 2, 4, 8]
+    )
+    require(decode == expected_decode, "wrong decode ladder")
     packed = build.get("objects", {}).get("packed_prefill", {})
     require(packed.get("required") is True, "packed-prefill sibling topology is absent")
     topologies = {p.get("topology") for p in programs if p.get("kind") == "prefill"}
@@ -59,12 +67,12 @@ def main():
 
     replay = build.get("emit_config", {}).get("replay", {})
     required_replay = {
-        "PLOW_DECODE_BATCH": "8",
-        "PLOW_DECODE_BATCH_LADDER": "1,2,4,8",
+        "PLOW_DECODE_BATCH": str(expected_decode[-1]),
+        "PLOW_DECODE_BATCH_LADDER": ",".join(map(str, expected_decode)),
         "PLOW_DENSE_PF_NS": "1",
         "PLOW_EMIT_PACKED_PREFILL": "1",
         "PLOW_L2_PLACE_PREFILL": "0",
-        "PLOW_MAX_CHUNK": "8192",
+        "PLOW_MAX_CHUNK": str(expected_prefill[-1]),
     }
     for name, value in required_replay.items():
         require(str(replay.get(name)) == value, f"emit replay does not pin {name}={value}")
