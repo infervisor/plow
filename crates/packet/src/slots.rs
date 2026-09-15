@@ -191,6 +191,7 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeGroupDownFp8Blk, t: &["part", "fu", "routing_table", "expert_weight_table", "expert_scale_table"], i: &["k", "H", "I_moe", "n_exp"], f: &[], j: &[] },
     S { op: DevOp::FlashMlaDecode, t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "qr_cos?"], i: &["n_batch", "n_head", "kv_stride", "window", "nsplit", "kv_mask", "qr_sin", "gf"], f: &["scale"], j: &[] },
     S { op: DevOp::OUvFold, t: &["O", "Olat", "Wuv"], i: &["n_batch", "n_head", "V"], f: &[], j: &[] },
+    S { op: DevOp::FlashGatherPrefill, t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "idx"], i: &["n_batch", "n_head", "kv_stride", "nope", "n_tok", "kv_mask", "top_k"], f: &["scale"], j: &[] },
     S { op: DevOp::FlashGatherDecode, t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "idx"], i: &["n_batch", "n_head", "kv_stride", "", "nsplit", "kv_mask", "top_k"], f: &["scale"], j: &[] },
     S { op: DevOp::MoeRouterTopk, t: &["table", "logit", "", "bias"], i: &["", "n_exp", "k", "flags"], f: &["route_scale"], j: &[] },
     S { op: DevOp::MlaMergeFold, t: &["O", "Opart", "mlpart", "Wuv"], i: &["n_batch", "n_head", "V", "", "nsplit", "native_fp32"], f: &[], j: &[] },

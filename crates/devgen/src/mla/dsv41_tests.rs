@@ -663,18 +663,16 @@ fn the_rung_plan_is_per_layer_and_names_what_is_emitted() {
         .collect();
     assert_eq!(
         done.len(),
-        8,
+        9,
         "mhc_pre/mhc_post, the attention projections, the output projection, its all-reduce, \
-         ffn_norm, the routed experts and the shared expert are emitted; this count is the \
+         ffn_norm, the routed experts, the shared expert and the attention core are emitted; \
          thing that grows as bricks land, so it is asserted exactly rather than as a lower bound"
     );
-    // And the rung still REFUSES, because a partial blob would run and produce garbage.
-    let err = super::dsv41::dsv41_emit_block_plan(&cfg, plain).unwrap_err();
-    assert!(err.contains("fluent-looking garbage"), "the refusal must say why: {err}");
-    assert!(
-        err.contains("kernels are NOT the gap"),
-        "and must not read as a kernel gap, since ops 180-184 all pass on gfx942: {err}"
-    );
+    // Every part is emitted now, so the plan RESOLVES rather than refusing. What is left is the
+    // writer that turns these bricks into a blob, which is a different missing thing and says so.
+    let parts = super::dsv41::dsv41_emit_block_plan(&cfg, plain)
+        .expect("all nine parts are emitted, so the plan must resolve");
+    assert_eq!(parts.len(), 9);
 }
 
 /// The output projection at TP8, where the grouped LoRA costs nothing extra.
@@ -1100,4 +1098,86 @@ fn layer_zero_attends_over_the_window_only() {
     let full = t * t / 2;
     let win = t * cfg.sliding_window as u64;
     assert!(win * 30 < full, "the window must be the cheap form, not a detail");
+}
+
+/// The attention core: interior rope, a WINDOWED absorbed-MLA flash, and the sink merge.
+///
+/// The load-bearing assertion is `i[3]`. It packs two independent facts -- bit 31 NoPE and the
+/// sliding window in the low bits -- and getting the window wrong is not wrong output: a zero
+/// window is full causal attention, the same answer at 32x the arithmetic, visible only as a
+/// missed latency target. So it is asserted as a value, not as "nonzero".
+#[test]
+fn the_attention_core_is_windowed_nope_mla_over_the_shared_latent() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let (t, tp, ctx) = (1024u32, 8u32, 8192u32);
+    let nh_l = cfg.heads / tp;
+    let (hd, nope, rope) = super::dsv41::dsv41_attn_core_shape(&cfg);
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0], tp);
+    let all: Vec<u32> = (0..304u32).collect();
+    let q = b.tensor("act.q", (t as u64) * (nh_l as u64) * (hd as u64) * 2);
+    let kv = b.tensor("act.kv", (t as u64) * (hd as u64) * 2);
+    let kvlen = b.tensor("in.kvlen", 4);
+    let pos = b.tensor("in.pos", (t as u64) * 4);
+    let cos = b.tensor("gen.cos", (ctx as u64) * 32 * 4);
+    let sin = b.tensor("gen.sin", (ctx as u64) * 32 * 4);
+    let (act, _) = super::dsv41::emit_dsv41_attn_core(
+        &mut b, &cfg, &w, &all, 0, tp, q, kv, kvlen, pos, cos, sin, t, ctx, &[],
+    );
+    let p = b.finish();
+
+    // TWO ropes: the query's, and the shared latent's. The latent has ONE row per token for all
+    // 64 heads, so its head count is 1 -- passing nh_l there would rotate 8x too much memory.
+    let ropes: Vec<_> = p
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::QwenHeadNormRope as u16)
+        .collect();
+    assert_eq!(ropes.len(), 2, "q and the latent");
+    for r in &ropes {
+        assert_eq!(r.i[1], hd, "the whole 512-wide head");
+        assert_eq!(r.i[2], rope, "64 rotated dims");
+        assert_eq!(r.i[7], nope, "starting at 448 -- the SUFFIX, not the prefix");
+        assert_eq!(r.i[5], 0, "normalize off; q_norm and kv_norm already ran");
+    }
+    assert_eq!(ropes[0].i[0], nh_l, "the query is per-head");
+    assert_eq!(ropes[1].i[0], 1, "the latent is ONE row shared by every head");
+
+    let fl = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::FlashMlaPrefill as u16)
+        .expect("the MLA prefill flash");
+    assert_eq!(fl.i[1], nh_l, "per-rank heads");
+    assert_eq!(
+        fl.i[3],
+        (1u32 << 31) | cfg.sliding_window,
+        "bit 31 NoPE (the rope is interior and already applied) plus the 128 window. A zero \
+         window here is full causal attention: the same answer at 32x the arithmetic"
+    );
+    assert_eq!(fl.i[3] & 0x7fff_ffff, 128);
+    assert_ne!(fl.i[3] & 0x8000_0000, 0);
+    // NoPE aliases the rope operands onto the nope ones.
+    assert_eq!(fl.t[3], fl.t[2]);
+    assert_eq!(fl.t[5], fl.t[4]);
+    assert_eq!(fl.t[4], act.kvr, "K and V are the SAME latent");
+
+    // The merge folds the attention sinks -- one unscaled logit per head, no value row.
+    let mg = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::FlashMerge as u16)
+        .expect("the merge");
+    assert_eq!(mg.t[0], act.o);
+    assert_eq!(mg.t[3], w.get(0, "attn.attn_sink"), "sinks in t3");
+    assert_eq!(mg.i[3], hd, "O is head_dim wide, which is what wo_a reads");
+    assert_eq!(mg.i[2], 1, "nsplit 1");
+
+    // And the core's output width is exactly the output LoRA's input.
+    let (groups, _, ocol) = cfg.wo_a_groups();
+    assert_eq!(nh_l * hd, ocol, "one rank's heads ARE one wo_a group");
+    assert_eq!(groups, tp);
 }

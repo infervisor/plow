@@ -799,6 +799,156 @@ pub(crate) fn emit_dsv41_moe(
     )
 }
 
+/// Scratch for the attention core.
+pub(crate) struct Dsv41CoreAct {
+    /// `q` after the interior RoPE, `[T][nh_l][head_dim]` bf16.
+    pub(crate) qr: u32,
+    /// The shared latent after the interior RoPE, `[T][head_dim]` bf16.
+    pub(crate) kvr: u32,
+    /// Flash partials: `[T][nh_l][DK]` f32 and `[T][nh_l][2]` f32 at nsplit 1.
+    pub(crate) opart: u32,
+    pub(crate) mlpart: u32,
+    /// The merged output, `[T][nh_l][head_dim]` bf16 -- which IS `wo_a`'s input.
+    pub(crate) o: u32,
+}
+
+/// Emit the attention core: interior RoPE, the windowed absorbed-MLA flash, and the merge.
+///
+/// # Every operand here is already built
+///
+/// `head_dim` is 512 with the rope INSIDE it, so there is no separate rope strip and the flash runs
+/// its NoPE arm over the whole 512 (`dsv41_attn_core_shape`). `d_flash_mla_prefill<512, 0>` is
+/// instantiated, and `i[3]` carries both facts at once: bit 31 is NoPE and the low bits are the
+/// sliding WINDOW, which is why layer 0 costs `T * 128` and not `T^2`. GLM passes `1 << 31` there
+/// with a zero window, meaning full causal; V4.1 passes `1 << 31 | 128`.
+///
+/// So the core needs no gathered flash and no selection table. That is worth stating because the
+/// obvious reading -- window attention is sparse attention, sparse attention is op 55 -- leads to
+/// `FlashGatherPrefill` and its `[b][t][top_k]` idx array, which is a much larger job for the same
+/// answer. A CONTIGUOUS causal window is what the dense arm's own `keep` predicate already is.
+///
+/// `t3`/`t5` repeat `t2`/`t4`: under NoPE the rope operands are unused, and GLM spells the same
+/// aliasing (`if dr > 0 { n.qr } else { n.qa }`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_dsv41_attn_core(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    w: &Dsv41Weights,
+    cus: &[u32],
+    l: u32,
+    tp: u32,
+    q: u32,
+    kv: u32,
+    kvlen: u32,
+    pos: u32,
+    cos: u32,
+    sin: u32,
+    t: u32,
+    ctx: u32,
+    deps: &[u32],
+) -> (Dsv41CoreAct, u32) {
+    let (hd, nope, rope) = dsv41_attn_core_shape(c);
+    assert_eq!(
+        c.heads % tp,
+        0,
+        "tp={tp} must divide the {} attention heads",
+        c.heads
+    );
+    let nh_l = c.heads / tp;
+    // The rope range must start on a wave boundary -- the kernel indexes a REGISTER by
+    // `rot_offset / 64`, so an offset that is not a multiple of 64 would rotate a neighbouring
+    // register's elements. 448 = 7 * 64 on this checkpoint.
+    assert_eq!(
+        nope % 64,
+        0,
+        "the interior rope starts at {nope}, which is not a register boundary; \
+         `d_qwen_headnorm_rope` indexes x[rot_offset / 64]. Missing capability: \
+         `rope_interior_unaligned_{nope}`"
+    );
+    assert!(
+        rope <= 64 && rope.is_power_of_two(),
+        "the rotary width {rope} must fit one register and be a power of two"
+    );
+    let act = Dsv41CoreAct {
+        qr: b.tensor(
+            &format!("act.l{l}.qr"),
+            (t as u64) * (nh_l as u64) * (hd as u64) * 2,
+        ),
+        kvr: b.tensor(&format!("act.l{l}.kvr"), (t as u64) * (hd as u64) * 2),
+        opart: b.tensor(
+            &format!("act.l{l}.opart"),
+            (t as u64) * (nh_l as u64) * (hd as u64) * 4,
+        ),
+        mlpart: b.tensor(
+            &format!("act.l{l}.mlpart"),
+            (t as u64) * (nh_l as u64) * 2 * 4,
+        ),
+        o: b.tensor(
+            &format!("act.l{l}.attn_o"),
+            (t as u64) * (nh_l as u64) * (hd as u64) * 2,
+        ),
+    };
+    let all = cus.to_vec();
+    // The interior RoPE, on q and on the shared latent. `normalize = 0`: q's norm was applied to
+    // the q-LoRA before `wq_b` and the latent's by `kv_norm`, so this op only rotates.
+    let mut rope_op = |b: &mut Builder, out: u32, x: u32, heads: u32, dep: &[u32]| {
+        b.emit(DevOp::QwenHeadNormRope, all.clone(), dep, |d| {
+            d.t[0] = out;
+            d.t[1] = x;
+            d.t[2] = TENSOR_NONE;
+            d.t[3] = cos;
+            d.t[4] = sin;
+            d.t[5] = pos;
+            d.i[0] = heads;
+            d.i[1] = hd;
+            d.i[2] = rope;
+            d.i[3] = t;
+            d.i[4] = 0; // no cache ring: prefill writes row-major
+            d.i[5] = 0; // normalize off
+            d.i[6] = 1; // prefill
+            d.i[7] = nope; // rotate [nope, head_dim) -- the SUFFIX
+        })
+    };
+    let c_q = rope_op(b, act.qr, q, nh_l, deps);
+    // ONE latent row per token, shared by every head: heads = 1, not nh_l.
+    let c_kv = rope_op(b, act.kvr, kv, 1, deps);
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let window = c.sliding_window;
+    let c_fl = b.emit(DevOp::FlashMlaPrefill, all.clone(), &[c_q, c_kv], |d| {
+        d.t[0] = act.opart;
+        d.t[1] = act.mlpart;
+        d.t[2] = act.qr;
+        d.t[3] = act.qr; // NoPE: the rope operands are unused
+        d.t[4] = act.kvr;
+        d.t[5] = act.kvr;
+        d.t[6] = kvlen;
+        d.i[0] = 1; // one sequence per prefill chunk
+        d.i[1] = nh_l;
+        d.i[2] = ctx;
+        // Bit 31 NoPE + the sliding window in the low bits. A zero window here is FULL CAUSAL:
+        // the same answer at 32x the arithmetic, which shows up only as a missed latency target.
+        d.i[3] = (1u32 << 31) | window;
+        d.i[4] = t;
+        d.i[5] = KV_MASK_NONE;
+        d.f[0] = scale;
+    });
+    // nsplit = 1, so the merge is the softmax normalisation plus the attention SINKS -- one extra
+    // unscaled logit per head that joins the denominator with no value row. V4.1 has one per head
+    // and `FlashMerge` is the only place it can be folded.
+    let sink = w.get(l, "attn.attn_sink");
+    let c_mg = b.emit(DevOp::FlashMerge, all.clone(), &[c_fl], |d| {
+        d.t[0] = act.o;
+        d.t[1] = act.opart;
+        d.t[2] = act.mlpart;
+        d.t[3] = sink;
+        d.i[0] = t;
+        d.i[1] = nh_l;
+        d.i[2] = 1; // nsplit
+        d.i[3] = hd;
+    });
+    (act, c_mg)
+}
+
 /// The o_proj TP partial's tensor name, fixed by `plowrt`'s peer-slot table (slot 0).
 ///
 /// `crates/plowrt/src/exec/amd.rs` matches this string literally to bind the tensor into the peer
@@ -1094,14 +1244,24 @@ pub(crate) enum Part {
 /// the projections (82.98 TFLOP) and the experts (139.16 + 23.19) are.
 ///
 /// And it needs no new kernel. `get_window_topk_idxs` (`model.py:410`) materialises exactly a
-/// `[b, m, topk] int32` table -- "sparse_attn needs real [b, m, topk] int32 memory" -- which is the
-/// shape [`DevOp::FlashGatherPrefill`] already takes in `t7` with `top_k` in `i6`. The window is a
-/// selection table whose rows happen to be contiguous, so the sparse gather arm GLM's DSA path
-/// already uses serves it directly. `-1` marks a slot before the sequence started.
+/// `[b, m, topk] int32` table -- "sparse_attn needs real [b, m, topk] int32 memory" -- which is
+/// what [`DevOp::FlashGatherPrefill`] (op 55) takes in `t7`, with `top_k` in `i6`.
+/// `d_flash_gather_prefill` is built and dispatched, and the `nope` branch is instantiated at
+/// `<512, 0>` -- V4.1's geometry exactly, once the interior rope has been applied.
 ///
-/// That reframes "SWA Bounded Replay" from a kernel feature to a table to fill. What remains is
-/// building the table and the emit around it -- and the decode ring form
-/// (`model.py:422`, oldest-first over a `start_pos % window` rotation), which prefill does not need.
+/// Op 55 had no emit site, and the reason was the SELECTOR, not the flash: a learned top-k needs
+/// T-row `IndexScore`/`IndexSelect`, which `mla.rs`'s scoping note calls a real design question. A
+/// WINDOW needs none of that -- row `t` is `clamp(t - 127, 0) ..= t`, pure arithmetic. It also
+/// discharges the causality obligation that note flags, since the gather flash applies no mask and
+/// trusts the selector: a window cannot name a future row, and `-1` marks a slot before the
+/// sequence started.
+///
+/// (NOT op 51 with `t7` set. That slot on 51 is the DSA per-64-query-tile UNION table, which only
+/// the four-wave V2 object understands; the eight-wave object traps on it rather than silently
+/// running dense attention where the model was trained sparse.)
+///
+/// So what remains for the core is the index table, the emit around it, and the decode ring form
+/// (`model.py:422`, oldest-first over a `start_pos % window` rotation) which prefill does not need.
 pub(crate) fn dsv41_attn_core_shape(c: &Dsv41Cfg) -> (u32, u32, u32) {
     let nope = c.head_dim - c.qk_rope;
     (c.head_dim, nope, c.qk_rope)
@@ -1124,8 +1284,8 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
         p.push(("indexer queries (two-level)", Part::Todo));
     }
     p.push((
-        "attention core -- needs an INTERIOR rope (see `dsv41_attn_core_shape`)",
-        Part::Todo,
+        "attention core (interior rope + windowed absorbed MLA + sink merge)",
+        Part::Done,
     ));
     p.push(("output projection wo_a + wo_b (op 184)", Part::Done));
     p.push(("output all-reduce (XReduce, wo_b is input-parallel)", Part::Done));

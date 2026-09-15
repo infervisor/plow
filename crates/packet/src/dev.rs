@@ -595,7 +595,27 @@ pub enum DevOp {
     /// t7=idx(i32)` · `i0=n_batch i1=n_head i2=kv_stride i4=nsplit i5=kv_mask i6=top_k` ·
     /// `f0=scale`.
     FlashGatherDecode = 54,
-    /// Gathered flash prefill — reserved, not yet built.
+    /// Gathered flash PREFILL — the MLA latent flash reading only the rows `idx` names, with a
+    /// DIFFERENT selection per query token. `d_flash_gather_prefill` is built and dispatched
+    /// (`interp.hip`), at `<512, 0>` and `<512, 64>`.
+    ///
+    /// `idx` is `[b][t][top_k]` — one row PER QUERY, which is the axis the decode gather
+    /// ([`DevOp::FlashGatherDecode`]) does not have. The flash applies NO causal mask under
+    /// GATHER: the selected set is assumed causal because the selector produced it, so a selector
+    /// that lets query `t` name a row past `kv_len - n_tok + t` is not caught here.
+    ///
+    /// What kept this without an emit site is the SELECTOR, not the flash: a learned top-k needs
+    /// T-row `IndexScore`/`IndexSelect`, which is a real design problem. A sliding WINDOW needs
+    /// none of it — row `t` is `clamp(t - w + 1, 0) ..= t`, pure arithmetic, causal by
+    /// construction, with `-1` for a slot before the sequence started.
+    ///
+    /// `t0=Opart(f32) t1=mlpart(f32) t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len(i32)
+    /// t7=idx(i32)` · `i0=n_batch i1=n_head i2=kv_stride i3=nope i4=n_tok i5=kv_mask i6=top_k` ·
+    /// `f0=scale`.
+    ///
+    /// `i3` bit 31 is NOPE: the rope width is 0, `t3`/`t5` repeat `t2`/`t4`, and the whole head is
+    /// scored unrotated. DeepSeek-V4.1 sets it because its rope is INTERIOR to `head_dim` and has
+    /// already been applied by then.
     FlashGatherPrefill = 55,
 
     /// ROUTER TOP-K tail (the router SPLIT). The score matmul `logit = x·Wr` is now the ordinary
