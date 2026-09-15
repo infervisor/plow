@@ -1769,6 +1769,33 @@ streams it. The next structural cut is that `GemvF32` is really an 8192x24x20480
 196 608 independent wave-level dot products with no register reuse; a tiled GEMM would read `x` and
 `W` once each. That is an emit change (pick a GEMM opcode when `rows` is large), not a kernel one.
 
+### 12.6 Two more cuts, and one that did not work
+
+`HyperConnPost` computes `new_residual[j][d] = sum_i comb_mix[i][j] * residual[i][d] +
+post_mix[j] * x_out[d]` with the `rrow` load INSIDE the j loop, so each of the n output streams
+re-read all n input streams: 16 loads to produce 4 outputs at n=4, i.e. 1.34 GB of reads against
+a 335 MB tensor. Hoisting the n reads into registers ahead of the j loop took the op from 1738 to
+**314 us per packet (5.5x)** and the layer from 26.27 to **23.27 ms** -- more than the 4x the read
+count predicts, because the re-reads were also serialising the j loop behind a load.
+
+**NEGATIVE RESULT, recorded so it is not re-tried.** `GemvF32` reads W -- 24 rows of K floats,
+2 MB -- once per output ROW, so a block re-reads it for all 27 rows it owns, ~51 MB out of L2.
+Carrying TWO rows against the same four `w` loads halves that and gives eight independent FMA
+chains instead of four. It is SLOWER: 23.26 -> 23.61 ms, and `GemvF32` itself 3148 -> 3290 us per
+packet. Register pressure did not move (256 VGPR, 122 spills, identical), so the extra state was
+not the cost; W simply is not the binding constraint. Reverted.
+
+That matters for what to try next. `GemvF32`'s x traffic is 2.7 GB (eight waves each sweep the
+whole 40 KB row) = ~510 us at HBM speed, and its W traffic is now shown not to bind, yet the op
+costs 3148 us. So it is neither x- nor W-bandwidth-bound: it is latency-bound, 320 loop iterations
+of dependent loads at the megakernel's fixed 2 waves/SIMD with nothing to hide them behind. More
+register tiling will not fix that; a tiled GEMM that stages x and W in LDS, or an emit that picks
+a real GEMM opcode for this shape, is the actual fix.
+
+**Layer at 23.3 ms**, `GemvF32` 6.3 ms (27%), routed MoE ~5.7 ms, dense+shared 2.7 ms, collectives
+2.0 ms, attention 1.8 ms, `HyperConnPre` 2.4 ms, `HyperConnPost` 0.6 ms. 40 x 23.3 = 932 ms
+against 90 ms: **10.4x**.
+
 ### 12.5 The nulls re-run, and where the 26 ms goes
 
 Two of §12.1's null results, re-run against the 26 ms layer. Both were real all along; a 5 ms
