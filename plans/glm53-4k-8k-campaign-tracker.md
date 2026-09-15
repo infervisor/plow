@@ -34,6 +34,18 @@ Detailed log: `docs/bringup/tp-bringup-upstream-review-log.md` (rows #81–#99);
 - Mux fix retained: bounded KV wait queue, backfill past oversized waiters, accurate queue depth and
   one arrival-rate update per ingress event. This prevents head-of-line idle slots but does not
   change the prefill-bound ceiling.
+- Corrected GLM router flags and compact native-prefill scratch are pushed at `2d189faa` and
+  `d917e9cc`. Scratch falls by 1.52 GiB/rank (`act.part`, `act.moe_fug`, `act.shared`; unused
+  `act.zero_h` removed). A paired 16-prompt 70K prefill gate passed 16/16 in both arms: compact
+  median TTFT 40.17 s vs 41.33 s control. A compact-only 70K/700/C16 sustained gate also passed
+  16/16 through decode rung 20: 80.19 output tok/s, median TTFT 39.88 s, median TPOT 98.84 ms.
+- The earlier exact 100-prompt compact run faulted at decode rung 16 with only 9 occupied, before
+  slot turnover. A deterministic capacity or compact-scratch OOB is therefore not established:
+  both the long-prefill and sustained C16 gates pass. Do not loosen admission from the current
+  conservative 13-request 70K cap until the mixed C20/N100 fault is isolated.
+- The historical ordinary-8192 -> row-band poisoning is not an open workspace bug. `rbfault16`
+  already disproved the sparse-MLA clear hypothesis; `rbfault21` identified and verified the
+  shared `@band` view memo fix (`f584a1e0`).
 - Next structural kernel lever remains a plow-owned grouped block-FP8 MoE kernel with a ≥256-row
   expert tile. The pinned AITER family has no tile wider than 64; the old generic MPF_BM=128 result
   was only −5.1% vs its EPI-off control and remained slower than shipped BM64/EPI-on.
