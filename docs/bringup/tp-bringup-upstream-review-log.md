@@ -1642,6 +1642,52 @@ This is a live defect for RAGGED SEAMS generally, not only for row-band: any two
 a `@band{t}` family could desynchronise the same way. Row-band is simply the first pair where one
 sibling never goes ragged and so never re-derives the binding for itself.
 
+## The 8K goal cell, end to end and CORRECT under mixed traffic, is 512.0 ms (2026-09-15, job `e2e-fixed-8k`)
+
+`stack-t4` measured 509.8 ms cold 8192 TTFT on this packet, but on a binary carrying the `@band`
+view memo defect: any RAGGED 8192-bucket chunk poisoned every later row-band chunk on that server.
+A single cold 8192 request never triggers it, so 509.8 ms was a valid latency number for the cold
+path and nothing more. This is the first run of the goal cell that is fast AND correct under
+traffic that mixes lengths, which is what serving is.
+
+Both arms on the fixed binary, stack packet `9e76b70bf97ee4a6` with row-band, 32 prompts at
+`--random-input-len 8192 --random-output-len 128 --max-concurrency 1`, prefix cache at its
+default (on), the same vLLM `bench serve` stamp `stack-t4` used:
+
+| arm | poison | needles | TTFT median | TTFT p99 | TPOT | ITL | completed | failed |
+|---|---|---|---|---|---|---|---|---|
+| `cold` | none | **24/24** | **512.0 ms** | 585.9 | 40.33 | 40.13 | 32 | 0 |
+| `mixed` | 4096 first | **24/24** | **512.6 ms** | 631.8 | 40.40 | 40.19 | 32 | 0 |
+
+Zero server error lines in either arm, and the 4096 poisoner itself passed 3/3.
+
+**Three things this establishes.**
+
+*The fix holds in serving, not just in the probe.* The `mixed` arm runs the exact sequence that
+poisoned before — a 4096 request, ragged in the 8192 bucket, ahead of the 8K work — and its eight
+band centres all pass. Before the fix that arm was 0/24.
+
+*The restore is free.* `mixed - cold` is **+0.61 ms** on a 512 ms number. Re-uploading the band
+view table when the family's binding changes costs nothing measurable, so there is no reason to
+chase a cheaper restore.
+
+*The goal gap is 22.0 ms, and it is not where the tiles were.* 512.0 against 490. That is the same
+gap `stack-t4` reported (509.8, +19.8), so the fix cost nothing and the gap is structural, not an
+artefact of the defect. Tiles are already ruled out as the route to it (measurement loses to the
+model at every rung). The remaining structurally-disjoint candidate is the host admission path:
+the rung board prices roughly 33 ms per 8192 request OUTSIDE the engine — tokenize 8.6-17 ms, the
+untimed handler-to-first-SSE remainder 10-16 ms, prompt upload 1.1-2.0 ms, JSON and HTTP about 3 —
+and `PLOW_ENCODE_FAST` is ids-identical, so it cannot change a token.
+
+**On goal 2 in this configuration.** TPOT is 40.33 ms here, against a 25 ms target. That is the
+non-MTP decode; the 16.35 ms that meets the goal is the MTP path, which this packet does not
+carry. The two goals are currently met by different configurations, and no single run has yet
+shown 8K TTFT and C1 TPOT at target together.
+
+**Harness note.** The probe's own summary block printed `(missing)` for both arms: it looked for
+`<tag>/bench.json` while `--result-dir` writes `<tag>/main/bench.json`. The per-arm lines it
+printed during the run are correct and the table above is read from the bench files directly.
+
 ## The measured tiles are SLOWER at every rung, so the store must not reach the shipping packet (2026-09-15, job `tileab-rungs-t4`)
 
 The 8192-only A/B found nothing (+0.8 ms inside a 0.9 ms drift). 8192 is the rung where M is
