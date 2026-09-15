@@ -226,6 +226,7 @@ impl RungController {
                 RungReason::Backlog
             };
         } else if self.target + 1 < self.rungs.len()
+            && self.target + 1 <= seat
             && self.utilization(self.target, load) >= WIDEN_UTIL
         {
             self.target += 1;
@@ -396,6 +397,11 @@ mod tests {
         let d = c.decide(load(20, 80));
         assert_eq!(c.width(d.admission), 16);
         assert_eq!(d.reason, RungReason::Throughput);
+        let mut saturated = load(20, 80);
+        saturated.arrival_rps = 100.0;
+        saturated.mean_output_tokens = 700.0;
+        let admission = c.decide(saturated).admission;
+        assert_eq!(c.width(admission), 16);
     }
 
     #[test]
@@ -472,11 +478,13 @@ mod tests {
         let demand = RungLoad {
             arrival_rps: 1.0,
             mean_output_tokens: 50.0,
-            ..load(1, 0)
+            ..load(4, 0)
         };
         assert_eq!(single.utilization(0, demand), multi.utilization(0, demand));
-        assert_eq!(single.decide(demand).reason, RungReason::Hold);
-        assert_eq!(multi.decide(demand).reason, RungReason::Hold);
+        let single_admission = single.decide(demand).admission;
+        let multi_admission = multi.decide(demand).admission;
+        assert_eq!(single.width(single_admission), 1);
+        assert_eq!(multi.width(multi_admission), 1);
         assert_eq!(unnormalized.decide(demand).reason, RungReason::Utilization);
     }
 
