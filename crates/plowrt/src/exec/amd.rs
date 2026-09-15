@@ -8753,7 +8753,8 @@ impl AmdEngine {
         let mut shared_prefix = shared_layout.map(|layout| {
             shared_prefix::SharedPrefix::new(be.clone(), layout,
                 config.prefix_cache_cap_bytes(be.vram_bytes()),
-                crate::memory::vmm::kv_pool_cap())
+                crate::memory::vmm::kv_pool_cap(),
+                config.vmm_cache_min_free_bytes(be.vram_bytes()))
         }).transpose()?;
         let vmm = if shared_prefix.is_none() {
             Self::vmm_bringup(&be, &blob, checkpoint, max_decode_batch as usize)

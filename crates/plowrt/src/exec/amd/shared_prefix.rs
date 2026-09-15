@@ -350,11 +350,15 @@ pub(super) fn attach_ranks<T>(
 }
 
 impl SharedPrefix {
+    /// `min_free` is the free-device-memory floor for pressure eviction, `None` to trim on the
+    /// static `cache_cap` alone. The caller resolves it because it, not this, knows the device
+    /// size ([`crate::config::RuntimeConfig::vmm_cache_min_free_bytes`]).
     pub fn new(
         ops: Arc<dyn VmmOps>,
         layout: Layout,
         cache_cap: u64,
         pool_cap: u64,
+        min_free: Option<u64>,
     ) -> Result<Self> {
         let granularity = ops.granularity()?;
         let total_row_bytes: u64 = layout.groups.iter().flatten().map(|t| t.row_bytes).sum();
@@ -392,7 +396,7 @@ impl SharedPrefix {
                     pool.enable_release_retire();
                 }
             }
-            if let Some(min_free) = crate::config::RuntimeConfig::get().vmm_cache_min_free_bytes() {
+            if let Some(min_free) = min_free {
                 pool.enable_pressure_eviction(min_free);
             }
             groups.push(Group { pool, tensors });
@@ -1200,7 +1204,7 @@ mod tests {
     fn cache(ops: Arc<Driver>) -> (SharedPrefix, Vec<u64>) {
         let tensors = tensors();
         let layout = Layout::from_tensors(&tensors, 3, 256).unwrap();
-        let mut cache = SharedPrefix::new(ops.clone(), layout, 0, 0).unwrap();
+        let mut cache = SharedPrefix::new(ops.clone(), layout, 0, 0, None).unwrap();
         let bases: Vec<_> = tensors
             .iter()
             .enumerate()
@@ -1310,7 +1314,7 @@ mod tests {
         let ops = Arc::new(Driver::default());
         let layout = Layout::from_tensors(&tensors(), 3, 256).unwrap();
         let budget = (512 + 128 + 256) * 256;
-        let mut cache = SharedPrefix::new(ops.clone(), layout, 0, budget).unwrap();
+        let mut cache = SharedPrefix::new(ops.clone(), layout, 0, budget, None).unwrap();
         // The release-retire default maps its spare copy targets at load, off the reuse pool: no
         // window or cache block exists yet and nothing is pooled.
         cache.sync_reclaim();

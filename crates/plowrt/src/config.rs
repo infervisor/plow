@@ -134,8 +134,8 @@ pub struct RuntimeConfig {
     /// Keep every cached prefix (whole shared blocks and private boundary snapshots alike)
     /// until free device memory would drop below this many MiB, instead of trimming as soon
     /// as `--vmm-cache-mib`/`--vmm-cache-memory-utilization` bytes of cache are held. Unset
-    /// (the default) leaves the static byte budget as the only trim trigger — this is opt-in
-    /// because it needs the backend to report free device memory cheaply
+    /// (the default) derives 4% of the device; `=0` is the rollback to the static byte budget
+    /// as the only trim trigger. Needs the backend to report free device memory cheaply
     /// (`VmmOps::free_bytes`); a backend that cannot degrades to the static budget unchanged.
     #[arg(long = "vmm-cache-min-free-mib", env = "PLOW_VMM_CACHE_MIN_FREE_MIB", global = true)]
     pub vmm_cache_min_free_mib: Option<u32>,
@@ -962,8 +962,15 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-phase-objects", env = "PLOW_PHASE_OBJECTS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub phase_objects: bool,
 
-    /// VMM-backed KV on ROCr (opt-in, requires hsa_amd_vmem_*).
-    #[arg(long = "amd-vmm-kv", env = "PLOW_VMM_KV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// VMM-backed KV on ROCr: reserve virtual address space for `max_ctx`, map physical pages
+    /// at each sequence's frontier instead of carving the whole rectangle. Requires
+    /// `hsa_amd_vmem_*`; every failure path warns and falls back to the flat carve.
+    ///
+    /// Only reached when the shared-prefix pool is absent (`exec/amd.rs` calls `vmm_bringup`
+    /// iff `shared_prefix.is_none()`) — that pool already reserves VA and maps at the frontier,
+    /// so with the prefix cache on, the default, this changes nothing. On by default so the
+    /// fallback path has the same memory behaviour as the primary one.
+    #[arg(long = "amd-vmm-kv", env = "PLOW_VMM_KV", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_kv: bool,
 
     /// Map the KV block after a prefill chunk's last row while the chunk drains, so the
@@ -1447,18 +1454,38 @@ impl RuntimeConfig {
         ((device_bytes as f64 * fraction) as u64) >> 20 << 20
     }
 
-    /// `--vmm-cache-min-free-mib` in bytes, or `None` when unset (the static budget from
-    /// [`Self::prefix_cache_cap_bytes`] is the only trim trigger, unchanged from before this
-    /// existed). See [`crate::memory::vmm::VmmKv::enable_pressure_eviction`].
-    pub(crate) fn vmm_cache_min_free_bytes(&self) -> Option<u64> {
+    /// The free-device-memory floor the prefix cache evicts to hold, in bytes, for a device
+    /// with `device_bytes` of memory. `None` disables pressure mode and leaves the static
+    /// budget from [`Self::prefix_cache_cap_bytes`] as the only trim trigger.
+    ///
+    /// An explicit `--vmm-cache-min-free-mib` wins; `=0` is the rollback to the static-budget
+    /// behaviour. Unset derives [`Self::VMM_CACHE_MIN_FREE_FRACTION`] of the device, because a
+    /// fixed MiB figure that is right on a 192 GiB MI300X is a third of a small card. A
+    /// backend that cannot report free bytes degrades to the static budget on its own
+    /// ([`crate::memory::vmm::VmmKv::enable_pressure_eviction`]), so arming this is safe
+    /// everywhere.
+    pub(crate) fn vmm_cache_min_free_bytes(&self, device_bytes: u64) -> Option<u64> {
         let allow_env = !Self::is_initialized();
         let mib: Option<u32> = if allow_env {
             Self::env_parse("PLOW_VMM_CACHE_MIN_FREE_MIB").or(self.vmm_cache_min_free_mib)
         } else {
             self.vmm_cache_min_free_mib
         };
-        mib.map(|mib| (mib as u64) << 20)
+        match mib {
+            Some(0) => None,
+            Some(mib) => Some((mib as u64) << 20),
+            None if device_bytes == 0 => Some(4096u64 << 20),
+            // Whole MiB, so the figure in logs reads like the knob.
+            None => Some(
+                ((device_bytes as f64 * Self::VMM_CACHE_MIN_FREE_FRACTION) as u64) >> 20 << 20,
+            ),
+        }
     }
+
+    /// Fraction of device memory the prefix cache keeps free by default. 4% is ~7.7 GiB on a
+    /// 192 GiB MI300X: above the largest transient the 8192 prefill rung takes, and small
+    /// enough that the cache is not evicting on an idle device.
+    const VMM_CACHE_MIN_FREE_FRACTION: f64 = 0.04;
 
     /// `--amd-prefix-fine-rows` / `PLOW_AMD_PREFIX_FINE_ROWS`, or `None` when unset (fine
     /// matching off, the default). See [`crate::memory::vmm::VmmKv::enable_fine_matching`].

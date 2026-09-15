@@ -60,6 +60,29 @@ const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
 };
 
+/// Pressure eviction armed by default. The cache previously trimmed only on its static 5%
+/// budget, so it never reacted to real device pressure however little was free.
+const PRESSURE_EVICTION_DEFAULT: Status = Status::Candidate {
+    evidence: &[
+        "review log: unset meant `enable_pressure_eviction` was never called, so the only trim trigger was the static `rt.vmm_cache_memory_utilization` budget (~9.6 GB of 192)",
+        "device/hsa.rs `free_bytes` reports HSA_AMD_AGENT_INFO_MEMORY_AVAIL, reflecting every consumer of the device's VRAM, so the floor is measured not modelled",
+        "memory/vmm.rs `enable_pressure_eviction`: a backend that cannot report free bytes degrades to the static budget, so arming this is safe on every backend",
+        "docs/flags-reference.md: `=0` is the rollback to the static budget",
+    ],
+};
+
+/// VMM-backed KV for the path that does NOT have the shared-prefix pool. Inert when the prefix
+/// cache is selected, which is the production default -- that path already reserves VA and maps
+/// physical at the frontier (`SharedPrefix::new`). This makes the fallback match it.
+const VMM_KV_DEFAULT: Status = Status::Candidate {
+    evidence: &[
+        "exec/amd.rs: `vmm_bringup` runs only when `shared_prefix.is_none()`, so with the prefix cache on this knob changes nothing",
+        "review log: measured B=8 ~1k ctx, 75.55 vs 83.05 GiB resident, 7.50 of 10.0 GiB reclaimed, TPOT unchanged (38.0 vs 39.0 ms)",
+        "every failure path is a warn + the flat carve, so the fallback is always correct",
+        "docs/flags-reference.md: `=false` is the rollback",
+    ],
+};
+
 /// Runtime knobs change no packet byte; their scope is the route a workload takes.
 /// G1 (review log #85) skips union segments inside the sparse prefill programs; the packet does not
 /// change, so the route is its whole scope.
@@ -315,7 +338,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.encode_threads", Some("PLOW_ENCODE_THREADS"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.05")), OPT_IN),
-    KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
+    KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PRESSURE_EVICTION_DEFAULT),
     KnobSpec::new("rt.amd_prefix_fine_rows", Some("PLOW_AMD_PREFIX_FINE_ROWS"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
     KnobSpec::new("rt.mla_pf_row_split", Some("PLOW_MLA_PF_ROW_SPLIT"), Layer::Runtime, Domain::Bool, ON, ROW_SPLIT_QUALIFIED),
     KnobSpec::new("rt.mla_pf_row_split_native_lo", Some("PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO"), Layer::Runtime, Domain::Bool, ON, NATIVE_LO_QUALIFIED),
@@ -398,7 +421,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.attnres_f32mix_grid", Some("PLOW_ATTNRES_F32MIX_GRID"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.moe_prefill_ep_max_extra_bytes", Some("PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES"), Layer::Runtime, USIZE, UNSET, DIAG),
     KnobSpec::new("rt.phase_objects", Some("PLOW_PHASE_OBJECTS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.vmm_kv", Some("PLOW_VMM_KV"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.vmm_kv", Some("PLOW_VMM_KV"), Layer::Runtime, Domain::Bool, ON, VMM_KV_DEFAULT),
     KnobSpec::new("rt.kv_map_ahead", Some("PLOW_KV_MAP_AHEAD"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.kv_map_next_chunk", Some("PLOW_KV_MAP_NEXT_CHUNK"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.publish_defer", Some("PLOW_AMD_PUBLISH_DEFER"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
