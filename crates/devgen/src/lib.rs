@@ -7380,18 +7380,9 @@ fn apply_production_defaults(
             cfg.token_batch_tp = true;
             emit_config::note_production_default("token_batch_tp", "true".into());
         }
-        // The long-context token-batch route is not retrieval-qualified with sequence-parallel
-        // seams. Replayed recipes may still carry the old explicit values, so resolve the whole
-        // dependent arm before emission instead of reaching a late row-band assertion.
+        // Row-band attention is not composable with token-batch bodies. Sequence-parallel seams
+        // are: bodies carry their bucket's seams and route rank-band norms off the packed twin.
         if cfg.token_batch_tp {
-            if cfg.glm_seq_par == Some(true) {
-                cfg.glm_seq_par = Some(false);
-                emit_config::note_production_default("glm_seq_par", "false".into());
-            }
-            if cfg.glm_seq_par_proj == Some(true) {
-                cfg.glm_seq_par_proj = Some(false);
-                emit_config::note_production_default("glm_seq_par_proj", "false".into());
-            }
             if cfg.glm_rowband_attn == Some(true) {
                 cfg.glm_rowband_attn = Some(false);
                 emit_config::note_production_default("glm_rowband_attn", "false".into());

@@ -425,6 +425,76 @@ fn dense_exact_rungs_join_the_production_emit_beside_an_unchanged_ladder() {
 }
 
 #[test]
+fn a_token_batch_body_carries_its_buckets_seams_and_fold() {
+    // A body is its bucket's prefill program plus a decode band, so everything but the band's
+    // decode attention chain must lower the same way, the sequence-parallel seams included.
+    // Without them the 8192 body ran full-width two-shots (156 against the prefill program's
+    // reduce-scatter/all-gather seams) and served +114 ms per middle chunk (tier 4, tb-t4).
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_FP8_KV", "1"), ("PLOW_UNISEG", "0"), ("PLOW_MLA_PF_V2", "1"),
+        ("PLOW_GLM_SEQ_PAR", "1"), ("PLOW_GLM_SEQ_PAR_PROJ", "1"), ("PLOW_GLM_FOLD_LT", "1"),
+        ("PLOW_GLM_DSA_PF", "1"), ("PLOW_PACKED_SPARSE_PF", "1"), ("PLOW_GLM_INDEX_TP", "1"),
+    ]);
+    crate::with_emit_target_amd(true, || {
+        let (ctx, dbatch) = (81920, 32);
+        for (full, t) in [(false, 2048u32), (false, 8192), (true, 2048), (true, 8192)] {
+            let mut c = glm_ref_cfg();
+            c.tp = 8;
+            // Layer 3 is the first MoE layer; a full one runs the band's own decode indexer.
+            c.indexer_full[3] = full;
+            let emit = |band: Option<u32>| {
+                let mut decl = Builder::new(304);
+                let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[3], t, dbatch, MoeEnc::Fp8Blk);
+                let mut b = Builder::new(304);
+                if let Some(bw) = band {
+                    b.set_packed_prefill_segments(true);
+                    b.set_token_batch_band(bw);
+                }
+                b.adopt_tensors(decl.tensors());
+                let xr = b.all();
+                emit_glm_block_prefill(
+                    &mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, n.xnext, &[], &mut 0, &xr, band,
+                );
+                b.finish()
+            };
+            let (plain, body) = (emit(None), emit(Some(dbatch)));
+            let count = |p: &packet::devbuild::Program, keep: &dyn Fn(&crate::DevInst) -> bool| {
+                p.insts.iter().filter(|d| keep(d)).count()
+            };
+            let is = |op: DevOp| move |d: &crate::DevInst| d.op == op as u16;
+            assert!(count(&plain, &is(DevOp::XReduceScatter)) > 0, "t={t} full={full}: no seams to compare");
+            for op in [DevOp::XReduceScatter, DevOp::XReduceTwoShot] {
+                assert_eq!(count(&body, &is(op)), count(&plain, &is(op)), "t={t} full={full}: {op:?}");
+            }
+            // The band projections gather the indexer weights only on a sparse bucket, and the
+            // band's decode indexer reads its rows' weights, so a dense bucket's indexer layer
+            // keeps the full normed-hidden gather in its body.
+            if glm_dsa_pf_bucket(&c, t) {
+                let banded = |p: &packet::devbuild::Program| {
+                    count(p, &|d| {
+                        d.t.iter().any(|&h| {
+                            p.tensors.get(h as usize).is_some_and(|x| x.name.contains("@band"))
+                        })
+                    })
+                };
+                let ag = is(DevOp::XAllGather);
+                assert_eq!(count(&body, &ag), count(&plain, &ag), "t={t} full={full}: XAllGather");
+                assert_eq!(banded(&body), banded(&plain), "t={t} full={full}: sequence-parallel seam band ops");
+            }
+            for (p, what) in [(&plain, "prefill"), (&body, "body")] {
+                let names: Vec<&str> = p.tensors.iter().map(|x| x.name.as_str()).collect();
+                assert_eq!(band_only_reads(&p.insts, &names), Vec::<String>::new(), "t={t} full={full}: {what}");
+            }
+            let native_fold =
+                |d: &crate::DevInst| d.op == DevOp::MlaMergeFold as u16 && d.i[5] == 1;
+            assert_eq!(count(&body, &native_fold), count(&plain, &native_fold), "t={t} full={full}: native W_uv fold");
+        }
+    });
+}
+
+
+#[test]
 fn single_row_prefill_gemv_preserves_bf16_projection_layout() {
     let _guard = crate::test_env::env_guard();
     let _env = crate::test_env::EnvScope::set(&[

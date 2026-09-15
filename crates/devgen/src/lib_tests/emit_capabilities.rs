@@ -395,10 +395,10 @@ fn glm_recipe_precedence_is_cli_then_env_then_production_default() {
         assert_eq!(rec[id], ("true".into(), "production_default"), "{id}");
     }
     for id in ["glm_seq_par", "glm_seq_par_proj"] {
-        assert_eq!(rec[id], ("false".into(), "production_default"), "{id}");
+        assert_eq!(rec[id], ("true".into(), "production_default"), "{id}");
     }
     assert!(cfg.glm_fold_lt());
-    assert!(!cfg.glm_seq_par() && !cfg.glm_seq_par_proj());
+    assert!(cfg.glm_seq_par() && cfg.glm_seq_par_proj());
     assert!(
         cfg.glm_fp8_kv()
             && cfg.glm_moe_aiter()
@@ -443,8 +443,8 @@ fn non_qualified_targets_record_no_glm_production_default() {
     assert!(!cfg.glm_fold_lt() && !cfg.glm_seq_par() && !cfg.glm_seq_par_proj());
 }
 
-/// Token-batch production keeps the two sequence-parallel knobs off while retaining fold, and
-/// explicit rollbacks plus non-qualified targets keep their precedence.
+/// Token-batch production composes with sequence parallelism and fold; explicit rollbacks plus
+/// non-qualified targets keep their precedence.
 #[test]
 fn glm_seq_par_and_fold_defaults_roll_back_per_knob() {
     let _guard = crate::test_env::env_guard();
@@ -463,14 +463,14 @@ fn glm_seq_par_and_fold_defaults_roll_back_per_knob() {
     };
     let glm = |argv: &[&str]| resolve(argv, "glm_moe_dsa");
 
-    assert_eq!(glm(&["test"]).0, (false, false, true));
+    assert_eq!(glm(&["test"]).0, (true, true, true));
 
     let (on, rec) = glm(&["test", "--glm-fold-lt=false"]);
-    assert_eq!(on, (false, false, false));
+    assert_eq!(on, (true, true, false));
     assert_eq!(rec["glm_fold_lt"], ("false".into(), "cli"));
 
     let (on, rec) = glm(&["test", "--glm-seq-par-proj=false"]);
-    assert_eq!(on, (false, false, true));
+    assert_eq!(on, (true, false, true));
     assert_eq!(rec["glm_seq_par_proj"], ("false".into(), "cli"));
 
     let (on, rec) = glm(&["test", "--glm-seq-par=false"]);

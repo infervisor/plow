@@ -1597,7 +1597,6 @@ impl EmitConfig {
     pub fn glm_seq_par(&self) -> bool {
         self.glm_seq_par.unwrap_or(
             self.glm_production_defaults
-                && !self.token_batch_tp
                 && !self.glm_xr_res
                 && self.glm_xr_band.unwrap_or(1) <= 1,
         )
