@@ -500,9 +500,17 @@ pub fn spawn(
             "mux: KV-capacity admission armed"
         );
     }
-    // One job held back because its KV did not fit. Retried ahead of anything newer, so the
-    // budget never reorders the queue.
-    let mut deferred: Option<(Job, Instant)> = None;
+    // Jobs the KV budget could not back yet. Retried in arrival order ahead of anything
+    // newer, so the budget never reorders the queue.
+    //
+    // NOT a single blocking slot. A large request at the head must not idle slots that a
+    // smaller one behind it would fill: with no preemption path, a held request frees nothing
+    // by waiting, so refusing to look past it converts "this one does not fit" into "nothing
+    // runs". vLLM tolerates the same head-of-line stall only because it preempts a running
+    // request to make room; until plow does, backfilling is what keeps the batch full.
+    // Bounded because the ingress channel is bounded and a request that can never fit is
+    // answered, not parked (see `admit_into`).
+    let mut waiting: std::collections::VecDeque<(Job, Instant)> = std::collections::VecDeque::new();
 
     // Per-model KV arena from the first decode bucket that declares paging
     // (all rungs share the same paging shape). `None` when no bucket carries
@@ -656,7 +664,7 @@ pub fn spawn(
                 note_dequeued(&msg, &metrics);
                 match msg {
                     MuxMsg::Job(job, arrived) => {
-                        deferred = admit_into(
+                        let held = admit_into(
                             &mut slots,
                             usize::MAX,
                             job,
@@ -668,6 +676,9 @@ pub fn spawn(
                             &health,
                             kv_budget,
                         );
+                        if let Some(j) = held {
+                            waiting.push_back(j);
+                        }
                     }
                     MuxMsg::Drain(done) => {
                         // No in-flight work; signal immediately.
@@ -739,26 +750,37 @@ pub fn spawn(
             // Non-blocking drain: fill every idle slot the queue can serve.
             // A short hold when we still have empty slots and no live work
             // yet keeps us from waking up on a single arrival amid a burst.
-            // FIFO: whatever the budget held back goes first, before any newer arrival.
-            if let Some((job, arrived)) = deferred.take() {
-                deferred = admit_into(
-                    &mut slots,
-                    admission_limit,
-                    job,
-                    arrived,
-                    &mut load,
-                    &mut last_arrival,
-                    arena.as_ref(),
-                    &metrics,
-                    &health,
-                    kv_budget,
-                );
+            // FIFO first, then backfill: every held job gets a try, in arrival order, before
+            // any newer arrival is dequeued. One that still does not fit goes back on the front
+            // in its original position, so the budget never reorders the queue — but a later,
+            // smaller job is free to take a slot the held one cannot use.
+            if !waiting.is_empty() {
+                let mut still: std::collections::VecDeque<(Job, Instant)> =
+                    std::collections::VecDeque::new();
+                while let Some((job, arrived)) = waiting.pop_front() {
+                    match admit_into(
+                        &mut slots,
+                        admission_limit,
+                        job,
+                        arrived,
+                        &mut load,
+                        &mut last_arrival,
+                        arena.as_ref(),
+                        &metrics,
+                        &health,
+                        kv_budget,
+                    ) {
+                        Some(held) => still.push_back(held),
+                        None => {}
+                    }
+                }
+                waiting = still;
             }
             let idle = slots[..admission_limit]
                 .iter()
                 .filter(|s| s.is_none())
                 .count();
-            if !draining && deferred.is_none() && idle > 0 {
+            if !draining && idle > 0 {
                 let lambda = load.lambda.get();
                 // Only hold when the slot table is empty (cold-start burst);
                 // if any slot is already live, spinning up the tick delivers
@@ -778,9 +800,7 @@ pub fn spawn(
                     Metrics::inc(&metrics.hold_count);
                     let deadline =
                         Instant::now() + std::time::Duration::from_secs_f64(hold_ms / 1000.0);
-                    while deferred.is_none()
-                        && slots[..admission_limit].iter().any(|s| s.is_none())
-                    {
+                    while slots[..admission_limit].iter().any(|s| s.is_none()) {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
                             break;
@@ -790,7 +810,7 @@ pub fn spawn(
                                 note_dequeued(&msg, &metrics);
                                 match msg {
                                     MuxMsg::Job(job, arrived) => {
-                                        deferred = admit_into(
+                                        if let Some(j) = admit_into(
                                             &mut slots,
                                             admission_limit,
                                             job,
@@ -801,9 +821,8 @@ pub fn spawn(
                                             &metrics,
                                             &health,
                                             kv_budget,
-                                        );
-                                        if deferred.is_some() {
-                                            break;
+                                        ) {
+                                            waiting.push_back(j);
                                         }
                                         if cfg.idle_dispatch
                                             && rx.is_empty()
@@ -825,16 +844,13 @@ pub fn spawn(
                     }
                 }
                 // Any additional pending arrivals (no wait).
-                while !draining
-                    && deferred.is_none()
-                    && slots[..admission_limit].iter().any(|s| s.is_none())
-                {
+                while !draining && slots[..admission_limit].iter().any(|s| s.is_none()) {
                     match rx.try_recv() {
                         Ok(msg) => {
                             note_dequeued(&msg, &metrics);
                             match msg {
                                 MuxMsg::Job(job, arrived) => {
-                                    deferred = admit_into(
+                                    if let Some(j) = admit_into(
                                         &mut slots,
                                         admission_limit,
                                         job,
@@ -845,9 +861,8 @@ pub fn spawn(
                                         &metrics,
                                         &health,
                                         kv_budget,
-                                    );
-                                    if deferred.is_some() {
-                                        break;
+                                    ) {
+                                        waiting.push_back(j);
                                     }
                                 }
                                 MuxMsg::Drain(done) => {
