@@ -1715,6 +1715,129 @@ emits fewer, larger dispatches. Making each dispatch cheaper to ISSUE is measura
 regime turns host-bound, not as a latency lever. It has no measured effect available to it on
 either path today.
 
+## Decode fusion alone cannot reach 25 ms: the whole per-segment overhead is ~16 ms of a 40 ms tick (2026-09-15, CPU-only `op-audit`)
+
+Following the correction above, the question is how much the one surviving decode lever — fewer,
+larger dispatches — is actually worth. This needs no GPU: `plowrt op-audit <assets> --program 1`
+reads the decode program straight out of the packet.
+
+```
+T=1  1644 insts, 22 distinct opcodes
+     instructions by class: A=1194  B=252  C=198  D=0
+```
+
+**1644 instructions, 1293 segments.** 1.27 instructions per segment — 79% of the decode program's
+instructions are their own dispatch. The reason is structural: the interpreter route is a
+cooperative megakernel that runs a whole run of ops in one launch, so a segment boundary appears
+wherever a NATIVE kernel interrupts it. The segment count is therefore roughly *native ops +
+interpreter runs*, and the native ops dominate. The GEMV family alone is 526 of 1644 (32%):
+`Gemv` x292, `GemvQkv` x156, `GemvGlu` x75, `GemvFp8Blk` x3. Then `HeadNormRope` x198,
+`XReduce` x156, `AddNorm` x155, `RmsNorm` x80, `FlashMlaDecodeFp8` / `MlaMergeFold` /
+`HeadNormRopeFp8` x78 each, `MoeRouterTopkPf` / `MoeCombinePf` / `MoeAiterFp8Pf` x75 each,
+`IndexScore` / `IndexSelect` / `LayerNorm` x21 each.
+
+**The measured price of a segment is ~12.7 microseconds, and that closes the question.** Entry 67
+is the one paired A/B of exactly this lever: `PLOW_GLM_DECODE_GEMM_GROUP` emitted same-input native
+decode GEMMs adjacent, took the rung-20 chain 1431 -> 1293, and measured a class-weighted 78-layer
+projection of -1.75 ms/step. That is **-138 segments for -1.75 ms = 12.7 us per segment removed**.
+The knob is `GLM_RECIPE_ON` and `glm_decode_gemm_group()` falls back to `glm_production_defaults`,
+so the 1293 measured today is already POST-grouping — 12.7 us/segment is the marginal rate for
+further merges, not a rate already spent.
+
+Extrapolate it across the whole program:
+
+| quantity | value |
+|---|---|
+| segments per token per rank | 1293 |
+| measured marginal price per segment | 12.7 us |
+| **total per-segment overhead in the tick** | **~16.4 ms** |
+| tick today | 40.03 ms |
+| **floor if every segment boundary were free** | **~23.6 ms** |
+| goal 2 | 25 ms |
+
+So goal 2 sits just BELOW the floor that removing all per-dispatch overhead would reach, and
+fusion — which removes some boundaries, never all — cannot get there on its own. Closing 40.5 to 25
+by fusion would take roughly -1220 of the 1293 segments. Two further reasons the 23.6 ms floor is
+optimistic, not conservative: the 12.7 us rate comes from a 7-layer tier-3 A/B projected
+class-weighted to 78 layers under the defaults of the time, and those 138 merges were the EASY ones
+(adjacent, same-input, no dependency to break), so the next 138 should price lower.
+
+**What this reprioritises.** Fusion is still worth doing — it is real milliseconds and the mechanism
+is proven — but it is a partial-credit lever, not a route to 25 ms. Reaching the goal needs the
+per-dispatch overhead removed WHOLESALE rather than boundary by boundary: a decode-side replay so
+the 1293 packets are not rebuilt per tick (the prefill mechanism does not apply — see the correction
+above), or pulling native work inside the interpreter megakernel so the boundaries stop existing.
+Both are larger pieces of work than the fusion they displace, and this table is the argument for
+funding them.
+
+Caveat: 1293 is `dec_segs`, segments, and an active `SparseMlaDecode` segment enqueues two AQL
+packets, so the packet count is higher and the true per-PACKET overhead lower than 12.7 us. That
+does not change the total, which is anchored to the measured -1.75 ms, not to a per-packet price.
+
+## Which decode segments can actually be fused: the register and wave-geometry gate, answered from the objects (2026-09-15, CPU-only)
+
+The fusion lever needs a feasibility test before a cost estimate, and the right test is the obvious
+one: **two kernels may merge only if the combined register footprint does not spill and the wave
+geometry matches.** Both are readable straight out of the shipped code objects' AMDGPU metadata
+(`llvm-readelf --notes`), so this needs no GPU. gfx942 facts used: 4 SIMDs per CU, one 512-entry
+unified VGPR+AGPR file per SIMD, 64 KiB LDS per CU.
+
+| kernel | vgpr | scratch | LDS | wg max | waves/SIMD | wg/CU |
+|---|---|---|---|---|---|---|
+| `plow_interp_dec_gfx942` (the decode megakernel) | **256** (arch cap) | **6384 B — SPILLS** | 64560 / 65536 | 512 | **2** | 1 |
+| `aiter::fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256` | **512** (whole file) | 0 | **65536** (all) | 256 | **1** | 1 |
+| `aiter::mla_a16w16_qh8_qseqlen1_gqaratio8_v3` | **512** | 0 | **65536** | 256 | **1** | 1 |
+| `aiter::mla_dec_stage1_bf16_a16w16_subQ16_mqa16` | **512** | 0 | **65536** | 256 | **1** | 1 |
+| `plow_dsa_tp_score` | 98 | 0 | 34816 | 512 | 4 | 1 |
+| `plow_dsa_tp_select` | 55 | 0 | 1044 | 512 | 8 | 62 |
+| `plow_glm_fold_normalize` / `_grouped` | 14 | 0 | 0 | 1024 | 8 | — |
+| `plow_glm_fold_convert` / `_weight` | 3 / 5 | 0 | 0 | 1024 | 8 | — |
+| `plow_dsa_tp_gather` / `_complete` / `_local` | 12 / 5 / 8 | 0 | 4 / 4 / 0 | 1024 | 8 | — |
+
+**The answer for the heavy kernels is no, on both counts, and it is not close.**
+
+* **Registers.** The decode interpreter is already pinned at the 256-VGPR architectural cap for a
+  512-thread workgroup and is **already spilling 6384 bytes per lane to scratch**, with 64560 of
+  65536 LDS bytes taken (98.5%). The three aiter natives each consume the **entire** 512-entry
+  unified register file and the **entire** 64 KiB of LDS. There is no headroom in any of them to
+  absorb another op; folding work in deepens the existing spill or creates a new one. This is not
+  an oversight — MFMA kernels deliberately trade occupancy for register blocking — but it does
+  close the fusion question for them.
+* **Waves.** Three incompatible geometries ship side by side: 256 threads (the aiter natives, 1
+  wave/SIMD), 512 threads (the interpreter, `dsa_tp_score`, `dsa_tp_select`), and 1024 threads (the
+  fold and gather adapters, 8 waves/SIMD). A merged kernel must launch at the SMALLEST
+  `max_flat_workgroup_size` among its members, so folding a 1024-thread adapter into a 256-thread
+  aiter kernel costs that adapter 4x its per-workgroup parallelism even before the register
+  question.
+
+Note the occupancy the table exposes as a separate finding: the decode megakernel runs at **2 waves
+per SIMD**, and the VGPR limit and the LDS limit pin it there independently — relieving one alone
+changes nothing. The aiter natives run at 1 wave/SIMD. At batch 1 there is almost no latency hiding
+anywhere on the decode path.
+
+**Where merging IS legal: the cheap tail, and only it.** `plow_glm_fold_normalize`/`_grouped`/
+`_convert`/`_weight` and `plow_dsa_tp_gather`/`_complete`/`_local` are 3-14 VGPR, zero scratch,
+zero-to-4 bytes of LDS, all at 1024 threads. Any subset of those merges inside one wave geometry
+with enormous margin — worst-case combined 26 VGPR against a 256 cap. `plow_dsa_tp_select` (55
+VGPR, 1044 B LDS, 512 threads) can join if the merged kernel launches at 512. That is the complete
+list of register-and-geometry-legal merges in the shipped decode object set.
+
+And that is the sting: those are precisely the kernels that are already cheap and already at full
+occupancy. They correspond to roughly `IndexSelect` x21 + `IndexScore` x21 + `MlaMergeFold` x78 ≈
+120 of 1293 segments, so at the measured 12.7 us/segment they are worth **~1.5 ms of the 15.5 ms
+goal 2 needs**. Merging everything the hardware permits does not approach the target.
+
+**The one large merge left is not a register question at all.** The GEMV family is 526 of the
+decode program's 1644 instructions (`Gemv` x292, `GemvQkv` x156, `GemvGlu` x75, `GemvFp8Blk` x3),
+and `DecodeSegmentRoute::GemmLt` sends those to hipBLASLt. We do not own those kernels, so
+"fusing" them means calling a GROUPED/batched matmul instead of one call per GEMV — an API-shape
+change against hipBLASLt, not a kernel merge, and unconstrained by the ceilings above. It is the
+largest single reduction in segment count available on the decode path and should be priced before
+any of the small merges. (How many of the 526 actually take the `GemmLt` route rather than staying
+inside the interpreter is a load-time decision in `amd_gemm_lt::decode_routes` and is NOT settled
+by this offline audit — it needs a route dump from a loaded server, and the grouped-GEMM estimate
+above is only as good as that count.)
+
 ## The 8192 chunk has no dominant cost, and the two open prefill projections are stale by a large factor (2026-09-15, job `segattrib-8192`)
 
 With every non-GPU route to the remaining 22 ms closed, the question became which part of the
