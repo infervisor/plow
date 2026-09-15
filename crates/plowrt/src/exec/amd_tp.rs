@@ -1690,6 +1690,66 @@ impl AmdTpGroup {
     ///
     /// `next` is the same prompt's following chunk, if the plan has one; see
     /// [`AmdEngine::prefill_map_ahead`].
+    /// Launch program `p` on every rank, SEGMENT-MAJOR, with a host drain between segments.
+    ///
+    /// The bare collective launcher, for a packet that carries no tokens: a single-block PREFILL
+    /// RUNG, whose entry is an activation the caller uploaded with `write_tensor` and whose exit is
+    /// one it reads back. `prefill_chunk` cannot serve that -- it begins with `prefill_prepare`,
+    /// which stages a prompt and a KV mapping a rung has neither of.
+    ///
+    /// SEGMENT-MAJOR is the part that is not a style choice. `AmdEngine::run_segmented` enqueues
+    /// all of one rank's segments before moving to the next, and `tp_decode.c` recorded what that
+    /// does at TP>=4: the ranks desync, a lagging rank makes its peers time out and bail, and the
+    /// reduction comes back WRONG and 100x slow. A class-8 segment holds a layer's all-reduces and
+    /// their inline system-scope gate only rendezvouses cheaply when every rank is inside that
+    /// segment at once -- so every rank enqueues segment `s` before any rank enqueues `s + 1`, and
+    /// every rank drains before the next segment goes out.
+    pub fn run_rung(&mut self, p: usize) -> Result<()> {
+        if p >= self.ranks[0].n_programs() {
+            return Err(RuntimeError::Device(format!(
+                "program {p} does not exist (the packet has {})",
+                self.ranks[0].n_programs()
+            )));
+        }
+        for e in &mut self.ranks {
+            e.rearm_prog(p)?;
+        }
+        let launches = self.ranks[0].prog_dispatch(p).launches();
+        if launches == 0 {
+            return Err(RuntimeError::Device(format!(
+                "program {p} has no segments to launch -- an empty program, such as the decode                  placeholder a prefill-only rung carries"
+            )));
+        }
+        let n_ranks = self.ranks.len();
+        let phase_replay = self.ranks[0].graph_phase_replay(p);
+        if self
+            .ranks
+            .iter()
+            .any(|rank| rank.graph_phase_replay(p) != phase_replay)
+        {
+            return Err(RuntimeError::Device(
+                "graph phase-object selection differs across TP ranks".into(),
+            ));
+        }
+        if phase_replay {
+            for rank in &self.ranks {
+                rank.begin_graph_phase_replay(p)?;
+            }
+        }
+        for (seg, rank) in segment_major_order(launches, n_ranks) {
+            self.ranks[rank].enqueue_segment(p, seg)?;
+        }
+        if phase_replay {
+            for rank in &self.ranks {
+                rank.commit_graph_phase_replay()?;
+            }
+        }
+        for e in &self.ranks {
+            e.drain()?;
+        }
+        Ok(())
+    }
+
     pub fn prefill_chunk(
         &mut self,
         prompt: &[u32],

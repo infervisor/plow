@@ -4446,7 +4446,7 @@ fn bind_packed_experts(
         if ep_full.is_some() {
             return ep_full;
         }
-        dec.insts.iter().find_map(|d| {
+        let width_of = |d: &DevInst64| -> Option<u64> {
             if d.t[3] as usize == i_ewt && GLU_ARMS.iter().any(|&o| o as u16 == d.op) {
                 Some(d.i[1] as u64)
             } else if d.t[2] as usize == i_ewt && d.op == DevOp::MoeGroupGluPf as u16 {
@@ -4456,7 +4456,20 @@ fn bind_packed_experts(
             } else {
                 None
             }
-        })
+        };
+        // The DECODE program first, so every packet that has one answers exactly as it did.
+        //
+        // Then every other program, because a packet need not have a decode program that streams
+        // experts. A single-block PREFILL RUNG is the case: `derive_roles` reads a parent blob's
+        // roles positionally, so such a rung carries an empty decode program purely to make its
+        // real work classify as a prefill bucket, and the instruction that streams the experts is
+        // in the bucket. `I_moe` is a property of the PACKET's sharding -- the two programs cannot
+        // disagree about how wide one expert is -- so which program is asked does not change the
+        // answer, only whether there is one.
+        dec.insts
+            .iter()
+            .find_map(&width_of)
+            .or_else(|| blob.progs.iter().flat_map(|p| &p.insts).find_map(&width_of))
     };
 
     let mut bufs = Vec::with_capacity(layers.len() * 2);
