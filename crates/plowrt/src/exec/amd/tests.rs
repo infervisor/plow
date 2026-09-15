@@ -3439,7 +3439,7 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
             matches!(rows, 2 | 4 | 8)
         );
     }
-    let mut wide: Vec<_> = [20 * 2048 * 4, 20 * 81920 * 4, 20 * 4]
+    let mut wide: Vec<_> = [32 * 2048 * 4, 32 * 81920 * 4, 32 * 4]
         .into_iter()
         .enumerate()
         .map(|(i, bytes)| crate::asset::devblob::DevTensor {
@@ -3454,11 +3454,11 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
         prog.insts[0].blocks = rows as u16;
         assert_eq!(
             check_dsa_select_local(std::slice::from_ref(&prog), &wide, "gfx942", true).is_ok(),
-            matches!(rows, 16 | 20)
+            matches!(rows, 16 | 32)
         );
     }
-    prog.t = 20;
-    prog.insts[0].blocks = 20;
+    prog.t = 32;
+    prog.insts[0].blocks = 32;
     for operand in 0..3 {
         wide[operand].bytes -= 1;
         assert!(
@@ -5370,7 +5370,7 @@ fn decode_tier_discovery_matches_variant_scheduler_and_orders_all_widths() {
     ));
     std::fs::create_dir_all(&root).unwrap();
     for (dir, file) in [
-        ("lowrung20", "interp_decode_fp8kv_gq.elf"),
+        ("lowrung32", "interp_decode_fp8kv_gq.elf"),
         ("lowrung16", "interp_decode_fp8kv_gq.elf"),
         ("lowrung1", "interp_decode_fp8kv_gq.elf"),
         ("lowrung2", "interp_decode_gq.elf"),
@@ -5383,7 +5383,7 @@ fn decode_tier_discovery_matches_variant_scheduler_and_orders_all_widths() {
         std::fs::write(root.join(dir).join(file), []).unwrap();
     }
     for (variant, sched, widths) in [
-        (Variant::Fp8Kv, Sched::GlobalQueue, vec![1, 16, 20]),
+        (Variant::Fp8Kv, Sched::GlobalQueue, vec![1, 16, 32]),
         (Variant::Fp8Kv, Sched::Static, vec![4]),
         (Variant::Bf16, Sched::GlobalQueue, vec![2]),
         (Variant::Fp8, Sched::GlobalQueue, vec![]),
@@ -5628,13 +5628,64 @@ fn token_batch_body_refuses_a_native_only_packet_without_its_route() {
 
 #[test]
 fn decode_upload_rows_must_cover_the_batch() {
-    assert!(check_decode_rows(20, &[5; 20], &[6; 20]).is_ok());
+    assert!(check_decode_rows(32, &[5; 32], &[6; 32]).is_ok());
     assert!(check_decode_rows(1, &[0], &[1]).is_ok());
-    // The single-sequence TP call used to hand a batch-20 rung one row; the other 19 positions
+    // A single-sequence TP call must not hand a batch-32 rung only one initialized row.
     // came from stale staging bytes.
-    assert!(check_decode_rows(20, &[5], &[6]).is_err());
-    assert!(check_decode_rows(20, &[5; 20], &[6; 19]).is_err());
+    assert!(check_decode_rows(32, &[5], &[6]).is_err());
+    assert!(check_decode_rows(32, &[5; 32], &[6; 31]).is_err());
     assert!(check_decode_rows(1, &[], &[]).is_err());
+}
+
+#[test]
+fn token_batch_seam_norms_stay_on_the_primary_object() {
+    use packet::dev::{DevInst64, DevOp, StreamEnt};
+    use packet::devbuild::ProgramRole;
+    let inst = |op: DevOp, rows: u32| DevInst64 {
+        op: op as u16,
+        i: [rows, 0, 0, 0, 0, 0, 0, 0],
+        ..Default::default()
+    };
+    let prog = |role, insts: Vec<DevInst64>, segs: &[u16]| DevProg {
+        t: 8192,
+        role,
+        n_counter: 0,
+        stream: segs.iter().enumerate().map(|(i, &seg)| StreamEnt {
+            inst: i as u32,
+            seg,
+            ..Default::default()
+        }).collect(),
+        insts,
+        stream_ofs: vec![],
+        stream_len: vec![],
+        waits: vec![],
+        succs: vec![],
+        gq_stream: vec![],
+        gq_seg_ofs: vec![],
+        l2_domains: 0,
+    };
+    let insts = || vec![
+        inst(DevOp::RmsNorm, 8192),
+        inst(DevOp::HeadNormRope, 32),
+        inst(DevOp::RmsNorm, 1024),
+        inst(DevOp::FlashMlaPrefillFp8, 8192),
+    ];
+    let body = ProgramRole::TokenBatchBody { band: 32, rows: 8192 };
+    assert_eq!(
+        derive_packed_segment_families(&prog(body, insts(), &[0, 1, 2, 3])).unwrap(),
+        [5, 5, 0, 6]
+    );
+    let mixed = prog(
+        body,
+        vec![inst(DevOp::RmsNorm, 1024), inst(DevOp::HeadNormRope, 8192)],
+        &[0, 0],
+    );
+    assert!(derive_packed_segment_families(&mixed).is_err());
+    let plain = ProgramRole::PrefillBucket { rows: 8192 };
+    assert_eq!(
+        derive_packed_segment_families(&prog(plain, insts(), &[0, 1, 2, 3])).unwrap(),
+        [5, 5, 5, 6]
+    );
 }
 
 #[test]

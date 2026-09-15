@@ -3602,7 +3602,7 @@ fn glm_decode_lt_routes(rows: u32, shape: [u32; 2]) -> bool {
     // (k_rope, q_rope, indexer k/weights, lm_head). Measured against the pinned kernels on one
     // MI300X; see docs/flags-reference.md `PLOW_GLM_GEMM_LT_DECODE_EXT`.
     let ext = cfg.glm_gemm_lt_decode_ext();
-    let rows_ok = matches!(rows, 16 | 20) || (ext && rows == 8);
+    let rows_ok = rows == 16 || (ext && rows == 8);
     let shape_ok = matches!(
         shape,
         [2048, 6144] | [512, 6144] | [4096, 2048] | [6144, 2048] | [256, 6144] | [6144, 256]
@@ -4193,7 +4193,7 @@ pub(crate) fn emit_glm_mla(
             nh_l == 8
                 && dk == 512
                 && dr == 64
-                && rows <= 20
+                && matches!(rows, 1 | 2 | 4 | 8 | 16 | 32)
                 && glm_gf(ctx, nh_l) == 4
                 && glm_dsa_select_width(c, ctx) == 2048,
             "sparse FP8 decode requires qualified QH8 latent512/rope64 GF4 geometry"
@@ -4794,8 +4794,8 @@ fn emit_glm_dsa_select_split(
     g: u32,
 ) -> u32 {
     assert!(
-        c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16 | 20),
-        "split GLM decode selection requires gfx942 TP8 with 2/4/8/16/20 rows"
+        c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16 | 32),
+        "split GLM decode selection requires gfx942 TP8 with 2/4/8/16/32 rows"
     );
     let g = g.min(b.n_cu() / rows);
     let phase = |b: &mut Builder, blocks: u32, phase: u32, dep: u32| {
@@ -4832,8 +4832,8 @@ fn emit_glm_dsa_select_rows(
 ) -> u32 {
     if emit_config::active().glm_select_local() && rows > 1 {
         assert!(
-            c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16 | 20),
-            "local GLM decode selection requires gfx942 TP8 with 2/4/8/16/20 rows"
+            c.tp == 8 && b.n_cu() == 304 && matches!(rows, 2 | 4 | 8 | 16 | 32),
+            "local GLM decode selection requires gfx942 TP8 with 2/4/8/16/32 rows"
         );
         return b.emit(DevOp::IndexSelect, (0..rows).collect(), &[c_sc], |d| {
             d.t[0] = n.iidx;
@@ -4927,7 +4927,7 @@ fn emit_glm_band_attention(
             nh_l == 8
                 && dk == 512
                 && dr == 64
-                && band <= 20
+                && matches!(band, 1 | 2 | 4 | 8 | 16 | 32)
                 && glm_gf(ctx, nh_l) == 4
                 && glm_dsa_select_width(c, ctx) == 2048,
             "sparse FP8 decode requires qualified QH8 latent512/rope64 GF4 geometry"
@@ -8317,8 +8317,8 @@ fn emit_glm_moe_ffn_rows(
     });
     let resident = emit_config::active().glm_moe_resident();
     assert!(
-        !resident || matches!(rows, 1 | 2 | 4 | 8 | 16 | 20),
-        "resident GLM MoE decode requires rows 1/2/4/8/16/20"
+        !resident || matches!(rows, 1 | 2 | 4 | 8 | 16 | 32),
+        "resident GLM MoE decode requires rows 1/2/4/8/16/32"
     );
     let flat = resident || (emit_config::active().glm_moe_flat_decode && matches!(rows, 2 | 4 | 8));
     if flat {
@@ -9567,6 +9567,15 @@ fn glm_emit_full(
                 .map(|t| (t, PfKind::RowSplit)),
         )
         .collect();
+    if emit_config::active().packed_prefill_on() && token_batch_tp && sparse_spans {
+        for &t in &pf {
+            assert!(
+                pf_plan.contains(&(t, PfKind::Packed))
+                    && pf_plan.contains(&(t, PfKind::TokenBatch)),
+                "GLM prefill rung {t} must carry both a packed-prefill sibling and packed-decode body"
+            );
+        }
+    }
     for &(t, kind) in &pf_plan {
         let packed_segments = matches!(kind, PfKind::Packed | PfKind::TokenBatch);
         let band = (kind == PfKind::TokenBatch).then_some(dbatch);
@@ -9716,7 +9725,7 @@ fn glm_emit_full(
             b.deny_uniseg();
         }
         if emit_config::active().glm_gemm_lt_decode()
-            && (matches!(rb, 16 | 20) || (emit_config::active().glm_gemm_lt_decode_ext() && rb == 8))
+            && (rb == 16 || (emit_config::active().glm_gemm_lt_decode_ext() && rb == 8))
         {
             assert!(
                 crate::emit_is_amd() && target == "gfx942",

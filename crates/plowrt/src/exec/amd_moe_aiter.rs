@@ -155,7 +155,7 @@ pub(super) fn routes(
         // row-agnostic over the dense live rows (the align maps sort real tokens; parked rows
         // route to nothing a live row reads), which is what lets the packet pack requests.
         if !(if flat {
-                matches!(prog.t, 2 | 4 | 8) || (resident && matches!(prog.t, 1 | 16 | 20))
+                matches!(prog.t, 2 | 4 | 8) || (resident && matches!(prog.t, 1 | 16 | 32))
             } else {
                 (1..=8192).contains(&prog.t)
             })
@@ -163,7 +163,7 @@ pub(super) fn routes(
             || inst.i != geometry
             || !(inst.fj == [0; 3] || native_align_form(inst, flat))
         {
-            return Err(err("requires H6144/I256 with E256/top8 or the shared-expert fold's E257/top9; sorted prefill rows1..8192 or flat decode rows2/4/8 (resident:1/2/4/8/16/20)"));
+            return Err(err("requires H6144/I256 with E256/top8 or the shared-expert fold's E257/top9; sorted prefill rows1..8192 or flat decode rows2/4/8 (resident:1/2/4/8/16/32)"));
         }
         if flat {
             let router = prog.insts[..ix]
@@ -1550,7 +1550,7 @@ mod tests {
 
     #[test]
     fn resident_routes_cover_all_decode_rungs() {
-        for rows in [1, 2, 4, 8, 16, 20] {
+        for rows in [1, 2, 4, 8, 16, 32] {
             let (mut p, mut t) = flat_fixture();
             p.t = rows;
             p.insts[0].i[4] = rows;
@@ -1857,9 +1857,9 @@ mod tests {
         } else {
             vec![]
         };
-        let out = upload(&vec![0xa5; 20 * 6144 * 2 + 8 + 512]);
+        let out = upload(&vec![0xa5; 32 * 6144 * 2 + 8 + 512]);
         let rungs: &[u32] = if resident {
-            &[20, 16, 8, 4, 2, 1, 20, 3]
+            &[32, 16, 8, 4, 2, 1, 32, 3]
         } else {
             &[8, 3, 2, 1, 4, 8]
         };

@@ -3142,15 +3142,22 @@ fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
         .unwrap_or(1);
     let mut family = vec![None; n_seg];
     let mut pure = vec![true; n_seg];
+    let packed = prog.role.is_packed_sibling() || prog.role.is_token_batch_body();
+    let band = prog.role.token_batch_band().filter(|&b| b > 0);
+    let mut narrow_norm = vec![None; n_seg];
     for e in &prog.stream {
         let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
             RuntimeError::Device(format!("stream entry references instruction {}", e.inst))
         })?;
         let op = inst.op;
-        let next = if op == DevOp::RmsNorm as u16
+        let norm = op == DevOp::RmsNorm as u16
             || op == DevOp::HeadNormRope as u16
-            || op == DevOp::HeadNormRopeFp8 as u16
-        {
+            || op == DevOp::HeadNormRopeFp8 as u16;
+        if norm && packed && inst.i[0] != prog.t && Some(inst.i[0]) != band {
+            narrow_norm[e.seg as usize] = Some(inst.i[0]);
+            continue;
+        }
+        let next = if norm {
             Some(5)
         } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
             Some(6)
@@ -3183,6 +3190,15 @@ fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
             (Some(a), Some(b)) if a == b => {}
             _ => pure[s] = false,
         }
+    }
+    if let Some((segment, rows)) = narrow_norm.iter().enumerate().find_map(|(segment, rows)| {
+        rows.filter(|_| family[segment].is_some()).map(|rows| (segment, rows))
+    }) {
+        return Err(RuntimeError::Device(format!(
+            "program T={} segment {segment} mixes a {rows}-row norm (neither the batch nor the \
+             decode band) with packed-family packets",
+            prog.t
+        )));
     }
     Ok(family
         .into_iter()

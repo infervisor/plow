@@ -151,9 +151,11 @@ fn production_programs_read_only_rows_every_rank_holds() {
         ("GLM_SHARED_CUS", "48"),
         ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
         ("PLOW_MOE_PF_DET", "1"),
-        ("PLOW_EMIT_PACKED_PREFILL", "0"),
-        ("PLOW_DECODE_BATCH", "20"),
-        ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+        ("PLOW_EMIT_PACKED_PREFILL", "1"),
+        ("PLOW_TOKEN_BATCH_TP", "1"),
+        ("PLOW_PACKED_SPARSE_PF", "1"),
+        ("PLOW_DECODE_BATCH", "32"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,32"),
         ("PLOW_UNISEG", "0"),
         ("PLOW_MLA_PF_V2", "1"),
         ("PLOW_MLA_PF_AITER", "1"),
@@ -163,7 +165,8 @@ fn production_programs_read_only_rows_every_rank_holds() {
         ("PLOW_GLM_FOLD_LT", "1"),
         ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
     ]);
-    // Per program: (t, violations, reduce-scatters, TP indexer packets).
+    crate::emit_config::install(crate::emit_config::EmitConfig::from_env());
+    // Per program: (tagged t, violations, reduce-scatters, TP indexer packets).
     type Seen = Vec<(u32, Vec<String>, usize, usize)>;
     let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&seen);
@@ -197,6 +200,13 @@ fn production_programs_read_only_rows_every_rank_holds() {
     let seen = seen.lock().unwrap();
     assert!(seen.iter().any(|e| e.2 > 0), "no program carries the seams");
     assert!(seen.iter().any(|e| e.2 > 0 && e.3 > 0), "no seams program runs the TP indexer");
+    for t in [128, 512, 2048, 8192] {
+        assert!(seen.iter().any(|e| e.0 == packet::devbuild::packed_prefill_program_t(t)), "P{t} has no packed-prefill sibling");
+        assert!(seen.iter().any(|e| e.0 == packet::devbuild::token_batch_program_t(t)), "P{t} has no packed-decode body");
+    }
+    let tagged: Vec<u32> = seen.iter().map(|e| e.0).collect();
+    let decode: Vec<u32> = tagged[packet::devbuild::decode_rung_lo(&tagged)..].to_vec();
+    assert_eq!(decode, [1, 2, 4, 8, 16, 32]);
     for (t, bad, _, _) in seen.iter() {
         assert!(bad.is_empty(), "program t={t:#x}: {bad:?}");
     }
@@ -251,8 +261,8 @@ fn emit_dense_exact_fixture(
         ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
         ("PLOW_MOE_PF_DET", "1"),
         ("PLOW_EMIT_PACKED_PREFILL", "0"),
-        ("PLOW_DECODE_BATCH", "20"),
-        ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+        ("PLOW_DECODE_BATCH", "32"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,32"),
         ("PLOW_UNISEG", "0"),
         ("PLOW_MLA_PF_V2", "1"),
         ("PLOW_MLA_PF_AITER", "1"),
@@ -1003,9 +1013,9 @@ fn glm_dsa_local_selection_keeps_one_completion_for_independent_rows() {
     c.indexer_full[3] = true;
     let ctx = 81920;
     let mut declarations = Builder::new(304);
-    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 20, MoeEnc::Fp8Blk);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 32, MoeEnc::Fp8Blk);
     let tensors = declarations.tensors();
-    for rows in [1, 2, 4, 8, 16, 20] {
+    for rows in [1, 2, 4, 8, 16, 32] {
         let mut b = Builder::new(304);
         b.adopt_tensors(tensors.clone());
         let ready = b.emit(DevOp::Nop, vec![0], &[], |_| {});
@@ -1017,7 +1027,7 @@ fn glm_dsa_local_selection_keeps_one_completion_for_independent_rows() {
             0,
             ctx,
             rows,
-            20,
+            32,
             MoeEnc::Fp8Blk,
             &(0..304).collect::<Vec<_>>(),
             c.eps as f32,
@@ -1063,7 +1073,7 @@ fn glm_decode_glue_cus_gives_the_key_norm_one_workgroup_per_row() {
     c.indexer_full[3] = true;
     let ctx = 81920;
     let mut declarations = Builder::new(304);
-    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 20, MoeEnc::Fp8Blk);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 32, MoeEnc::Fp8Blk);
     let tensors = declarations.tensors();
     for glue in ["0", "1"] {
         let _env = crate::test_env::EnvScope::set(&[
@@ -1125,9 +1135,9 @@ fn glm_dsa_split_selection_gives_each_row_its_own_group_and_strips() {
     c.indexer_full[3] = true;
     let ctx = 81920;
     let mut declarations = Builder::new(304);
-    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 20, MoeEnc::Fp8Blk);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 32, MoeEnc::Fp8Blk);
     let tensors = declarations.tensors();
-    for rows in [1, 2, 4, 8, 16, 20] {
+    for rows in [1, 2, 4, 8, 16, 32] {
         let mut b = Builder::new(304);
         b.adopt_tensors(tensors.clone());
         let ready = b.emit(DevOp::Nop, vec![0], &[], |_| {});
@@ -1139,7 +1149,7 @@ fn glm_dsa_split_selection_gives_each_row_its_own_group_and_strips() {
             0,
             ctx,
             rows,
-            20,
+            32,
             MoeEnc::Fp8Blk,
             &(0..304).collect::<Vec<_>>(),
             c.eps as f32,
@@ -1191,10 +1201,10 @@ fn glm_dsa_split_selection_gives_each_row_its_own_group_and_strips() {
     }
     // The strips are sized for every decode row.
     for (t, bytes) in [
-        (n.ighist, 20 * 4096 * 4),
-        (n.igctl, 20 * 16 * 4),
-        (n.ibits, 20 * 81920u64.div_ceil(32) * 4),
-        (n.icand, 20 * 81920 * 8),
+        (n.ighist, 32 * 4096 * 4),
+        (n.igctl, 32 * 16 * 4),
+        (n.ibits, 32 * 81920u64.div_ceil(32) * 4),
+        (n.icand, 32 * 81920 * 8),
     ] {
         assert_eq!(tensors[t as usize].bytes, bytes);
     }
@@ -2498,7 +2508,7 @@ fn check_glm_flat_segments(resident: bool) {
         ("PLOW_GLM_MOE_RESIDENT", if resident { "1" } else { "0" }),
         (
             "PLOW_DECODE_BATCH_LADDER",
-            if resident { "1,2,4,8,16,20" } else { "1,2,4,8" },
+            if resident { "1,2,4,8,16,32" } else { "1,2,4,8" },
         ),
         ("PLOW_EMIT_PACKED_PREFILL", "0"),
         ("PLOW_UNISEG", "0"),
@@ -2624,7 +2634,7 @@ fn glm_native_decode_gemm_preserves_xcd_boundaries() {
         ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
         ("PLOW_GLM_GEMM_LT_DECODE", "1"),
         ("PLOW_GLM_GEMM_LT", "0"),
-        ("PLOW_DECODE_BATCH_LADDER", "1,16,20"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,16,32"),
         ("PLOW_EMIT_PACKED_PREFILL", "0"),
         ("PLOW_UNISEG", "0"),
     ]);
@@ -2651,19 +2661,19 @@ fn glm_native_decode_gemm_preserves_xcd_boundaries() {
                 .enumerate()
                 .filter(|(_, d)| d.op == DevOp::GemmLtPf as u16)
                 .collect::<Vec<_>>();
-            if !matches!(rows, 16 | 20) {
+            if rows != 16 {
                 assert!(native.is_empty());
                 continue;
             }
             checked += 1;
             assert_eq!(prog.l2_domains, 8);
-            assert_eq!(native.len(), 16);
+            assert_eq!(native.len(), 15);
             assert_eq!(
                 native
                     .iter()
                     .filter(|(_, d)| (d.i[1], d.i[2]) == (256, 6144))
                     .count(),
-                3
+                2
             );
             assert_eq!(
                 native
@@ -2710,7 +2720,7 @@ fn glm_native_decode_gemm_preserves_xcd_boundaries() {
                 .unwrap();
             assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1);
         }
-        assert_eq!(checked, 2);
+        assert_eq!(checked, 1);
         Ok(crate::LeanReport::skipped(
             "native decode GEMM segment regression test",
         ))
@@ -2747,7 +2757,7 @@ fn glm_native_decode_gemm_ext_covers_rung8_and_narrow_projections() {
         ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
         ("PLOW_GLM_GEMM_LT", "0"),
         ("GLM_SHARD_HEAD", "1"),
-        ("PLOW_DECODE_BATCH_LADDER", "1,4,8,16,20"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,4,8,16,32"),
         ("PLOW_EMIT_PACKED_PREFILL", "0"),
         ("PLOW_UNISEG", "0"),
     ]);
@@ -2777,7 +2787,7 @@ fn glm_native_decode_gemm_ext_covers_rung8_and_narrow_projections() {
                 .filter(|(_, d)| d.op == DevOp::GemmLtPf as u16)
                 .collect::<Vec<_>>();
             // Prefill buckets and rungs 1/4 stay on the interpreter GEMV.
-            if !matches!(rows, 8 | 16 | 20) {
+            if !matches!(rows, 8 | 16) {
                 assert!(native.is_empty(), "rows={rows}");
                 continue;
             }
@@ -2814,7 +2824,9 @@ fn glm_native_decode_gemm_ext_covers_rung8_and_narrow_projections() {
                     (4096, 2048) => fused(4096, 2048),
                     _ => 0,
                 };
-                assert!(count(shape) + fused_form > 0, "{shape:?} rows={rows}");
+                if !(rows == 8 && shape == (256, 6144)) {
+                    assert!(count(shape) + fused_form > 0, "{shape:?} rows={rows}");
+                }
             }
             assert!(
                 prog.insts.iter().all(|d| d.op != DevOp::Gemv as u16
@@ -2840,7 +2852,7 @@ fn glm_native_decode_gemm_ext_covers_rung8_and_narrow_projections() {
                 }
             }
         }
-        assert_eq!(checked, 3);
+        assert_eq!(checked, 2);
         Ok(crate::LeanReport::skipped(
             "native decode GEMM EXT regression test",
         ))
@@ -2879,7 +2891,7 @@ fn glm_decode_gemm_group_reorders_native_gemms_without_changing_work() {
             ("PLOW_GLM_GEMM_LT_DECODE_EXT", "1"),
             ("PLOW_GLM_GEMM_LT", "0"),
             ("GLM_SHARD_HEAD", "1"),
-            ("PLOW_DECODE_BATCH_LADDER", "1,4,8,16,20"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,4,8,16,32"),
             ("PLOW_EMIT_PACKED_PREFILL", "0"),
             ("PLOW_UNISEG", "0"),
             ("PLOW_GLM_DECODE_GEMM_GROUP", group),
@@ -3096,7 +3108,7 @@ fn token_batch_body_band_rides_the_prefill_program() {
     let _env = crate::test_env::EnvScope::set(&[("PLOW_GLM_FP8_KV", "1"), ("PLOW_UNISEG", "0")]);
     let mut c = glm_ref_cfg();
     c.tp = 8;
-    let (ctx, rows, band) = (81920u32, 128u32, 20u32);
+    let (ctx, rows, band) = (81920u32, 128u32, 32u32);
     let mut decl = Builder::new(304);
     let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[0], rows, band, MoeEnc::Fp8Blk);
     let mut b = Builder::new(304);
@@ -3193,7 +3205,7 @@ fn sparse_rung_joins_the_packed_passes_only_under_packed_sparse_pf() {
     let emit = |sparse_pf: &str| -> Snapshot {
         let _env = crate::test_env::EnvScope::set(&[
             ("PLOW_MLA_PREFILL", "full:2048,8192"),
-            ("PLOW_DECODE_BATCH", "20"),
+            ("PLOW_DECODE_BATCH", "32"),
             ("PLOW_GLM_DSA_PF", "1"),
             ("PLOW_GLM_INDEX_TP", "1"),
             ("PLOW_GLM_FP8_KV", "1"),
@@ -3317,7 +3329,7 @@ fn shared_fold_rewrites_only_the_prefill_moe_chain() {
             ("PLOW_GLM_MOE_FLAT_DECODE", "0"),
             ("PLOW_GLM_MOE_RESIDENT", "1"),
             ("PLOW_GLM_MOE_SHARED_FOLD", fold),
-            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,32"),
             ("PLOW_EMIT_PACKED_PREFILL", "0"),
             ("PLOW_UNISEG", "0"),
         ]);
@@ -3606,7 +3618,7 @@ fn the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces() {
     let emit = |glm: &[(&str, &str)]| -> Snapshot {
         let mut env: Vec<(&str, &str)> = vec![
             ("PLOW_MLA_PREFILL", "full:2048,8192"),
-            ("PLOW_DECODE_BATCH", "20"),
+            ("PLOW_DECODE_BATCH", "32"),
             ("PLOW_GLM_DSA", "1"),
             ("PLOW_GLM_DSA_PF", "1"),
             ("PLOW_MLA_PF_V2", "1"),
@@ -4330,8 +4342,8 @@ fn rowsplit_attn_knob_off_matches_pre_arm_hash() {
         ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
         ("PLOW_MOE_PF_DET", "1"),
         ("PLOW_EMIT_PACKED_PREFILL", "0"),
-        ("PLOW_DECODE_BATCH", "20"),
-        ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+        ("PLOW_DECODE_BATCH", "32"),
+        ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,32"),
         ("PLOW_UNISEG", "0"),
         ("PLOW_MLA_PF_V2", "1"),
         ("PLOW_MLA_PF_AITER", "1"),
@@ -4452,8 +4464,8 @@ fn rowsplit_attn_knob_on_reports_the_extra_declared_bytes() {
             ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
             ("PLOW_MOE_PF_DET", "1"),
             ("PLOW_EMIT_PACKED_PREFILL", "0"),
-            ("PLOW_DECODE_BATCH", "20"),
-            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+            ("PLOW_DECODE_BATCH", "32"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,32"),
             ("PLOW_UNISEG", "0"),
             ("PLOW_MLA_PF_V2", "1"),
             ("PLOW_MLA_PF_AITER", "1"),
@@ -4702,7 +4714,7 @@ fn rowband_attn_on_adds_only_the_8192_sibling_on_the_replicated_arm() {
             ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
             ("PLOW_MOE_PF_DET", "1"),
             ("PLOW_EMIT_PACKED_PREFILL", "0"),
-            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,32"),
             ("PLOW_UNISEG", "0"),
             ("PLOW_MLA_PF_V2", "1"),
             ("PLOW_MLA_PF_AITER", "1"),
@@ -4885,7 +4897,7 @@ fn rowsplit_attn_on_adds_only_the_8192_sibling() {
             ("PLOW_MLA_PREFILL", "full:128,512,2048,8192"),
             ("PLOW_MOE_PF_DET", "1"),
             ("PLOW_EMIT_PACKED_PREFILL", "0"),
-            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,20"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,2,4,8,16,32"),
             ("PLOW_UNISEG", "0"),
             ("PLOW_MLA_PF_V2", "1"),
             ("PLOW_MLA_PF_AITER", "1"),

@@ -1989,7 +1989,7 @@ pub(super) fn check_dsa_select_local(
         {
             let err = || {
                 RuntimeError::Device(
-                "local DSA selection requires unpacked gfx942 TP8 decode rows 2/4/8/16/20, unpooled top2048 and row-sized operands".into())
+                "local DSA selection requires unpacked gfx942 TP8 decode rows 2/4/8/16/32, unpooled top2048 and row-sized operands".into())
             };
             // The split form (`i[4] == 2`, PLOW_GLM_SELECT_SPLIT) is three gated packets, `i[6]` =
             // phase 1/2/3, with `i[5]` workgroups per row in phases 1-2 and one in phase 3, over
@@ -2014,7 +2014,7 @@ pub(super) fn check_dsa_select_local(
             if arch != "gfx942"
                 || !tp8
                 || !(p.role.is_decode_rung() || (!split && p.role.is_token_batch_body()))
-                || !matches!(rows, 2 | 4 | 8 | 16 | 20)
+                || !matches!(rows, 2 | 4 | 8 | 16 | 32)
                 || g == 0
                 || (split && !(1..=3).contains(&phase))
                 || u32::from(d.blocks) != rows * per_row
@@ -2143,7 +2143,10 @@ pub(super) fn check_sparse_fp8_packet(
             || ctx < 2048
             || ctx > 81920
             || rows == 0
-            || (decode && (rows > 20 || d.i[6] != 2048 || d.i[7] != 4))
+            || (decode
+                && (!matches!(rows, 1 | 2 | 4 | 8 | 16 | 32)
+                    || d.i[6] != 2048
+                    || d.i[7] != 4))
             || (!decode
                 && (d.i[0] != 1
                     || if row_split {

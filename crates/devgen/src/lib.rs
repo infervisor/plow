@@ -7371,6 +7371,19 @@ fn apply_production_defaults(
     // tree's defaults rather than pinning today's.
     if capabilities.glm && arch == "gfx942" && tp == 8 && n_cu == 304 && !cfg.mxfp4 {
         cfg.glm_production_defaults = true;
+        if cfg.decode_ladder.is_none() {
+            cfg.decode_ladder = Some("1,2,4,8,16,32".into());
+            cfg.decode_ladder_default = true;
+            emit_config::note_production_default("decode_ladder", "1,2,4,8,16,32".into());
+        }
+        if !cfg.token_batch_tp {
+            cfg.token_batch_tp = true;
+            emit_config::note_production_default("token_batch_tp", "true".into());
+        }
+        if !cfg.packed_sparse_pf {
+            cfg.packed_sparse_pf = true;
+            emit_config::note_production_default("packed_sparse_pf", "true".into());
+        }
         for (id, unset, value) in cfg.glm_recipe_unset() {
             if unset {
                 emit_config::note_production_default(id, value.to_string());

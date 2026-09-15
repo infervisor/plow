@@ -2133,9 +2133,9 @@ pub(super) struct SparseMlaDecode {
 
 impl SparseMlaDecode {
     pub fn load(be: &HsaBackend, dir: &Path, rows: u32, modules: &mut Vec<Module>) -> Result<Self> {
-        if !(1..=20).contains(&rows) {
+        if !matches!(rows, 1 | 2 | 4 | 8 | 16 | 32) {
             return Err(RuntimeError::Device(
-                "sparse AITER MLA decode requires 1..20 rows".into(),
+                "sparse AITER MLA decode requires rows 1/2/4/8/16/32".into(),
             ));
         }
         let attention = load_attention(be, dir, modules)?;
