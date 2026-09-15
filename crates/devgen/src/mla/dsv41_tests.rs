@@ -541,7 +541,7 @@ fn the_attention_projection_chain_emits_against_the_real_weights() {
     let all: Vec<u32> = (0..304u32).collect();
     let t = 512u32;
     let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
-    let (act, _last) = super::dsv41::emit_dsv41_attn_proj(&mut b, &cfg, &w, &all, 0, x, t, &[]);
+    let (act, _last) = super::dsv41::emit_dsv41_attn_proj(&mut b, &cfg, &w, &all, 0, 1, x, t, &[]);
     let p = b.finish();
 
     // Two RmsNorm + four... no: two norms and THREE GEMMs (q_a, q_b, kv). wo_a/wo_b are the
@@ -601,7 +601,7 @@ fn the_latent_and_the_query_are_parallel_branches_off_the_same_norm() {
     let all: Vec<u32> = (0..304u32).collect();
     let t = 512u32;
     let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
-    let (act, _) = super::dsv41::emit_dsv41_attn_proj(&mut b, &cfg, &w, &all, 0, x, t, &[]);
+    let (act, _) = super::dsv41::emit_dsv41_attn_proj(&mut b, &cfg, &w, &all, 0, 1, x, t, &[]);
     let p = b.finish();
     let kv = p.insts.iter().find(|d| d.t[0] == act.kv).unwrap();
     let qa = p.insts.iter().find(|d| d.t[0] == act.q_a).unwrap();
@@ -783,7 +783,7 @@ fn the_shared_expert_uses_the_clamped_swiglu_not_plain_silu() {
     let all: Vec<u32> = (0..304u32).collect();
     let t = 512u32;
     let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
-    let (act, _) = super::dsv41::emit_dsv41_ffn_shared(&mut b, &cfg, &w, &all, 0, x, t, &[]);
+    let (act, _) = super::dsv41::emit_dsv41_ffn_shared(&mut b, &cfg, &w, &all, 0, 1, x, t, &mut 0, &[]);
     let p = b.finish();
 
     let glu = p
@@ -988,8 +988,10 @@ fn the_routed_experts_run_glms_prefill_body_at_v41_shapes() {
         d.f[0] = eps;
     });
     let mut xgate = 0;
+    // The shared expert is emitted separately (block-FP8, op 184); the MoE body only combines it.
+    let sh = b.tensor("act.shared", (t as u64) * (cfg.hidden as u64) * 2);
     super::dsv41::emit_dsv41_moe(
-        &mut b, &cfg, &w, 0, tp, t, x_out, xn2, c_norm, &mut xgate, &all,
+        &mut b, &cfg, &w, 0, tp, t, x_out, xn2, c_norm, (sh, c_norm), &mut xgate, &all,
     );
     let p = b.finish();
 
@@ -1180,4 +1182,191 @@ fn the_attention_core_is_windowed_nope_mla_over_the_shared_latent() {
     let (groups, _, ocol) = cfg.wo_a_groups();
     assert_eq!(nh_l * hd, ocol, "one rank's heads ARE one wo_a group");
     assert_eq!(groups, tp);
+}
+
+/// Every tensor-parallel weight is READ at the width it was DECLARED at.
+///
+/// This is the invariant three separate bugs in this emitter violated in one sitting -- `wo_b`,
+/// `wq_b` and the shared expert's `w1`/`w2`/`w3` -- and the failure mode is identical each time.
+/// `declare_dsv41_weights` divides an `OutSplit` tensor by `tp`, so the table says rank r holds
+/// `[N/tp, K]`; an emit that asks for `[N, K]` reads 8x past the end of the shard. Nothing faults:
+/// the loader bound only `N/tp` rows, so every rank computes rows `0..N` out of rank 0's shard and
+/// the answer is wrong on 7 of 8 ranks, plausibly.
+///
+/// `emit_pf_gemm_fp8_mx` now asserts this per operand, so the test's job is only to prove the
+/// whole layer passes through it -- which it cannot do vacuously, since it emits the real thing.
+#[test]
+fn every_tp_weight_is_read_at_the_width_it_was_declared() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, 256);
+    let byname = |h: u32| m.tensors[h as usize].name.clone();
+
+    // The q UP projection: OutSplit over heads, so 8 of 64 heads per rank.
+    let qb = m.progs[0]
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::GemmFp8Mx as u16 && byname(d.t[2]).ends_with("attn.wq_b.weight"))
+        .expect("the layer projects q through wq_b");
+    assert_eq!(
+        qb.i[1],
+        cfg.heads / 8 * cfg.head_dim,
+        "wq_b emits THIS rank's 8 heads (8 * 512), not all 64"
+    );
+
+    // The absorbed latent is the counter-example: REPLICATED, so it does NOT divide. A per-rank
+    // wkv would give rank r a 64-wide slice of a 512-wide latent that all 64 heads read.
+    let kv = m.progs[0]
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::GemmFp8Mx as u16 && byname(d.t[2]).ends_with("attn.wkv.weight"))
+        .expect("the layer projects the shared latent through wkv");
+    assert_eq!(kv.i[1], cfg.head_dim, "wkv is replicated: the full 512, on every rank");
+
+    // The shared expert: OutSplit gate/up and InSplit down, all over `moe_inter`.
+    for (suffix, n, k) in [
+        ("ffn.shared_experts.w1.weight", cfg.moe_inter / 8, cfg.hidden),
+        ("ffn.shared_experts.w3.weight", cfg.moe_inter / 8, cfg.hidden),
+        ("ffn.shared_experts.w2.weight", cfg.hidden, cfg.moe_inter / 8),
+    ] {
+        let d = m.progs[0]
+            .insts
+            .iter()
+            .find(|d| d.op == DevOp::GemmFp8Mx as u16 && byname(d.t[2]).ends_with(suffix))
+            .unwrap_or_else(|| panic!("{suffix} is not emitted"));
+        assert_eq!([d.i[1], d.i[2]], [n, k], "{suffix} is per-rank over moe_inter");
+    }
+}
+
+/// The shared expert's down projection is INPUT-parallel, so its output is a PARTIAL that must
+/// land in a peer slot and be summed.
+///
+/// `d_xreduce` sums `peer_scratch[r] + slot` over every rank and never reads `out`, so a partial
+/// written to an ordinary arena tensor contributes NOTHING to the sum -- the reduce returns
+/// whatever the other ranks left at that offset. This is exactly the K3 bug (`k3.rs:1599`) that
+/// made 92 of 93 layers compute `ffn = up_latent + attn` instead of `+ shared_expert`, with
+/// finite, plausible logits.
+///
+/// And it must be SLOT 2, not slot 0. Slot 0 holds this same layer's attention partial; passing
+/// the attention reduce proves only that every peer ARRIVED, not that every peer has finished
+/// READING, so a fast rank would overwrite slot 0 under a slow peer. K3 gets away with reusing
+/// slot 0 only because its shared expert is ordered after a SECOND collective; V4.1's runs before
+/// the MoE combine, so no such collective exists to hide behind.
+#[test]
+fn the_shared_experts_partial_lands_in_its_own_peer_slot_and_is_summed() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let t = 256u32;
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, t);
+    let p = &m.progs[0];
+    let byname = |h: u32| m.tensors[h as usize].name.clone();
+
+    let down = p
+        .insts
+        .iter()
+        .find(|d| {
+            d.op == DevOp::GemmFp8Mx as u16
+                && byname(d.t[2]).ends_with("ffn.shared_experts.w2.weight")
+        })
+        .expect("the shared expert has a down projection");
+    assert_eq!(
+        byname(down.t[0]),
+        super::dsv41::PEER_SLOT_SHARED,
+        "the down projection writes the PEER SLOT, not a local arena tensor"
+    );
+    assert_eq!(super::dsv41::PEER_SLOT_SHARED, "act.ug_tp", "peer slot 2");
+
+    let slot_b = t * cfg.hidden * 2;
+    let xr = p
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceTwoShot as u16)
+        .find(|d| d.i[2] == 2 * slot_b)
+        .expect("the shared partial is reduced out of slot 2");
+    assert_eq!(xr.i[0], t * cfg.hidden, "the whole [T, hidden] partial");
+    assert_eq!(xr.i[1], 8, "over all 8 ranks");
+
+    // Three distinct slots, one per row-parallel site. Two sites sharing an offset is the hazard
+    // above; the test names the offsets so a fourth site cannot quietly collide with one.
+    let slots: std::collections::BTreeSet<u32> = p
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceTwoShot as u16)
+        .map(|d| d.i[2])
+        .collect();
+    assert!(
+        slots.contains(&0) && slots.contains(&(2 * slot_b)),
+        "attention reduces slot 0 and the shared expert slot 2, got {slots:?}"
+    );
+}
+
+/// The routed combine's peer slot is BOUND. `GlmTn::none()` leaves `dg_tp` at `TENSOR_NONE` and
+/// the GLM body writes it unconditionally at tp>1, so an unset field aims every rank's routed
+/// output at the null handle.
+#[test]
+fn the_routed_combine_writes_a_real_peer_slot() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, 256);
+    let dg = m
+        .tensors
+        .iter()
+        .find(|t| t.name == super::dsv41::PEER_SLOT_MOE)
+        .expect("the routed combine declares act.dg_tp at tp>1");
+    assert_eq!(dg.bytes, 256 * cfg.hidden as u64 * 2, "one [T, hidden] slot");
+    assert!(
+        m.progs[0]
+            .insts
+            .iter()
+            .any(|d| d.t[0] != packet::dev::TENSOR_NONE
+                && m.tensors[d.t[0] as usize].name == super::dsv41::PEER_SLOT_MOE),
+        "something must actually write it"
+    );
+}
+
+/// The whole layer emits, in dataflow order, and every dependency points BACKWARD.
+///
+/// A rung is only worth building on if the program it produces is well-formed: `to_blob_v6` does
+/// not check topology and the interpreter does not either, so a forward edge is a read of a buffer
+/// that has not been written -- stale bytes, no fault.
+#[test]
+fn the_layer_zero_rung_is_a_topological_program() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let (m, desc) = super::dsv41::emit_dsv41_block(&cfg, 0, 8, 304, 2048, 256);
+    assert_eq!(m.progs.len(), 1, "one prefill program");
+    let p = &m.progs[0];
+    assert!(!p.insts.is_empty());
+    for (i, d) in p.insts.iter().enumerate() {
+        for w in &p.waits[d.wait_ofs as usize..][..d.wait_len as usize] {
+            assert!(
+                (w.id as usize) < i,
+                "op {i} ({}) waits on {}, which is not before it",
+                d.op,
+                w.id
+            );
+        }
+    }
+    // The chain the layer is: pre-norm, q/kv, rope, flash, output LoRA, mHC, FFN, MoE.
+    let has = |op: DevOp| p.insts.iter().any(|d| d.op == op as u16);
+    for op in [
+        DevOp::FlashMlaPrefill,
+        DevOp::QwenHeadNormRope,
+        DevOp::GemmFp8Mx,
+        DevOp::Glu,
+        DevOp::RmsNorm,
+        DevOp::Residual,
+    ] {
+        assert!(has(op), "layer 0 must emit {op:?}");
+    }
+    assert_eq!(desc.programs.prefill_buckets, vec![256]);
+    assert_eq!(desc.dims.heads, Some(cfg.heads as i64));
 }

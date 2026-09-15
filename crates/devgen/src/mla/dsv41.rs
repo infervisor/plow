@@ -486,17 +486,25 @@ pub(crate) fn emit_dsv41_attn_proj(
     w: &Dsv41Weights,
     cus: &[u32],
     l: u32,
+    tp: u32,
     x: u32,
     t: u32,
     deps: &[u32],
 ) -> (Dsv41ProjAct, u32) {
     let hidden = c.hidden;
     let q_lora = c.q_lora;
+    assert_eq!(c.heads % tp, 0, "tp={tp} must divide {} heads", c.heads);
     // `head_dim` (512) ALREADY CONTAINS the rope half: qk_rope is 64 of it and nope is the other
     // 448. Adding qk_rope here would widen every projection by 64 per head against weights that
     // are not that shape -- the tensor list says `wq_b` is `heads * head_dim * q_lora` and `wkv`
     // is `head_dim * hidden`, and both are checked against the shards.
-    let q_out = c.heads * c.head_dim;
+    //
+    // PER-RANK, because `wq_b` is OutSplit and `declare_dsv41_weights` sized it that way. Reading
+    // the full 64 heads against a per-rank declaration is the silent bug the operand check in
+    // `emit_pf_gemm_fp8_mx` exists for: every rank would compute heads 0..63 out of rank 0's
+    // shard. `wkv` is REPLICATED -- one 512-wide latent serves all 64 heads on every rank -- so
+    // it does NOT divide.
+    let q_out = c.heads / tp * c.head_dim;
     // ONE row for every head, which is what "fully absorbed" means -- there is no kv_b to expand
     // it, and num_key_value_heads is 1.
     let kv_out = c.head_dim;
@@ -713,9 +721,13 @@ pub(crate) fn emit_dsv41_moe(
     x_out: u32,
     xn2: u32,
     c_norm: u32,
+    // The shared expert's output tensor and completion dep. V4.1's shared expert is block-FP8
+    // while these experts are MXFP4, so the caller emits it on op 184 and this only combines it.
+    shared: (u32, u32),
     xgate: &mut u32,
     cus: &[u32],
 ) -> u32 {
+    let shared_pre = Some(shared.1);
     assert_eq!(
         c.raw.scoring_func, "sqrtsoftplus",
         "the emit reads the score transform from the checkpoint; a new value needs a kernel arm, \
@@ -753,6 +765,7 @@ pub(crate) fn emit_dsv41_moe(
     // same mixed-encoding fact `glm_shared_fold` refuses on (`enc == Fp8Blk`).
     let mut n = super::GlmTn::none();
     n.lw = vec![lw];
+    n.shared = shared.0;
     n.xn2 = xn2;
     n.xnext = x_out;
     n.xmid = b.tensor(&format!("act.l{l}.moe_xmid"), (t as u64) * (c.hidden as u64) * 2);
@@ -762,6 +775,12 @@ pub(crate) fn emit_dsv41_moe(
         (t as u64) * (c.n_exp as u64) * 2,
     );
     n.tab = b.tensor(&format!("act.l{l}.tab"), (t as u64) * (c.top_k as u64) * 8);
+    if tp > 1 {
+        // The combine's partial. `GlmTn::none()` leaves this TENSOR_NONE, and the body writes it
+        // unconditionally at tp>1 (`emit_glm_moe_ffn_prefill`: `d.t[0] = n.dg_tp`), so leaving it
+        // unset would aim every rank's routed output at the null handle.
+        n.dg_tp = b.tensor(PEER_SLOT_MOE, (t as u64) * (c.hidden as u64) * 2);
+    }
     // `fold` is false for V4.1 (it requires Fp8Blk experts), so e_all/tk_all are the plain counts.
     let sc = super::declare_moe_pf_scratch(
         b,
@@ -793,6 +812,7 @@ pub(crate) fn emit_dsv41_moe(
         xgate,
         cus,
         false,
+        shared_pre,
         super::router_flag::SQRTSOFTPLUS
             | super::router_flag::BIAS
             | if c.raw.norm_topk_prob { super::router_flag::NORM_TOPK } else { 0 },
@@ -954,6 +974,13 @@ pub(crate) fn emit_dsv41_attn_core(
 /// `crates/plowrt/src/exec/amd.rs` matches this string literally to bind the tensor into the peer
 /// region instead of local VRAM. Renaming it here silently un-peers the buffer.
 pub(crate) const PEER_SLOT_O: &str = "act.og_tp";
+/// Peer slot 2, where the shared expert's down projection writes its partial. Slot 1
+/// (`act.dg_tp`) is the routed combine's and slot 0 is attention's; see `emit_dsv41_ffn_shared`
+/// for why this one cannot share either.
+pub(crate) const PEER_SLOT_SHARED: &str = "act.ug_tp";
+/// Peer slot 1, the routed-expert combine's partial. The GLM MoE body writes `GlmTn::dg_tp` and
+/// reduces it, and a `TENSOR_NONE` there would make the combine write nothing at tp>1.
+pub(crate) const PEER_SLOT_MOE: &str = "act.dg_tp";
 
 /// Scratch for the output side: the per-group LoRA output and the projected residual.
 pub(crate) struct Dsv41OutAct {
@@ -1083,12 +1110,15 @@ const DSV41_ACT_SWIGLU_CLAMP: u32 = 4;
 pub(crate) struct Dsv41FfnAct {
     /// Residual after the FFN RMSNorm, `[T][hidden]` bf16.
     pub(crate) xn: u32,
-    /// Shared-expert gate and up, each `[T][moe_inter]` bf16.
+    /// Shared-expert gate and up, each `[T][moe_inter / tp]` bf16.
     pub(crate) sh_gate: u32,
     pub(crate) sh_up: u32,
-    /// After the clamped SwiGLU, `[T][moe_inter]` bf16.
+    /// After the clamped SwiGLU, `[T][moe_inter / tp]` bf16.
     pub(crate) sh_act: u32,
-    /// Shared-expert output, `[T][hidden]` bf16.
+    /// The down projection's PARTIAL, in peer slot 2, `[T][hidden]` bf16. At tp=1 nothing
+    /// reduces it and `sh_out` is left untouched, so the caller reads this one.
+    pub(crate) sh_part: u32,
+    /// Shared-expert output after the cross-rank sum, `[T][hidden]` bf16.
     pub(crate) sh_out: u32,
 }
 
@@ -1109,16 +1139,43 @@ pub(crate) fn emit_dsv41_ffn_shared(
     w: &Dsv41Weights,
     cus: &[u32],
     l: u32,
+    tp: u32,
     x: u32,
     t: u32,
+    xgate: &mut u32,
     deps: &[u32],
 ) -> (Dsv41FfnAct, u32) {
-    let (hidden, inter) = (c.hidden, c.moe_inter);
+    let hidden = c.hidden;
+    assert_eq!(
+        c.moe_inter % tp,
+        0,
+        "tp={tp} must divide the shared expert's intermediate {}",
+        c.moe_inter
+    );
+    // PER-RANK. `w1`/`w3` are OutSplit over `moe_inter` and `w2` is InSplit over it, so all three
+    // are DECLARED at `inter / tp` and every intermediate activation is that wide too.
+    let inter = c.moe_inter / tp;
     let act = Dsv41FfnAct {
         xn: b.tensor(&format!("act.l{l}.ffn_xn"), (t as u64) * (hidden as u64) * 2),
         sh_gate: b.tensor(&format!("act.l{l}.sh_gate"), (t as u64) * (inter as u64) * 2),
         sh_up: b.tensor(&format!("act.l{l}.sh_up"), (t as u64) * (inter as u64) * 2),
         sh_act: b.tensor(&format!("act.l{l}.sh_act"), (t as u64) * (inter as u64) * 2),
+        // The DOWN projection's output is a PARTIAL over this rank's slice of the intermediate,
+        // and it has to land where peers can read it. `d_xreduce` sums `peer_scratch[r] + slot`
+        // over every rank and never reads `out`, so a partial written to an ordinary arena tensor
+        // contributes nothing and the reduce returns the sum of whatever else is at that offset.
+        // SLOT 2 (`act.ug_tp`), not slot 0: slot 0 is this same layer's attention partial, and
+        // passing the attention reduce only proves every peer ARRIVED, not that every peer has
+        // finished READING -- a fast rank would overwrite slot 0 under a slow peer. K3 reuses
+        // slot 0 safely only because its shared expert is ordered after a SECOND collective
+        // (`k3.rs:1609`); V4.1's shared expert runs before the MoE combine, so it cannot be.
+        sh_part: if tp == 1 {
+            // A group of one has nothing to reduce, and slot 2 does not exist at tp=1 (the host
+            // maps no peer region), so the down projection writes the output directly.
+            b.tensor(&format!("act.l{l}.sh_out"), (t as u64) * (hidden as u64) * 2)
+        } else {
+            b.tensor(PEER_SLOT_SHARED, (t as u64) * (hidden as u64) * 2)
+        },
         sh_out: b.tensor(&format!("act.l{l}.sh_out"), (t as u64) * (hidden as u64) * 2),
     };
     let all = cus.to_vec();
@@ -1168,7 +1225,7 @@ pub(crate) fn emit_dsv41_ffn_shared(
     let c_down = emit_pf_gemm_fp8_mx(
         b,
         cus,
-        act.sh_out,
+        act.sh_part,
         act.sh_act,
         w.get(l, "ffn.shared_experts.w2.weight"),
         w.get(l, "ffn.shared_experts.w2.scale"),
@@ -1177,7 +1234,25 @@ pub(crate) fn emit_dsv41_ffn_shared(
         inter,
         &[c_act],
     );
-    (act, c_down)
+    if tp == 1 {
+        // `sh_part` IS `sh_out` here, so the answer is already in place.
+        return (act, c_down);
+    }
+    let xr = super::xr_cus_capped(b.n_cu(), cus);
+    let c_xr = crate::emit_xreduce(
+        b,
+        xgate,
+        false,
+        &xr,
+        c_down,
+        act.sh_out,
+        t * hidden,
+        tp,
+        // Byte offset, not an index: the host binds `act.ug_tp` at `scratch_base + 2 * slot_b`
+        // (`exec/amd.rs:8838`) and `slot_b` is the blob's `t * hidden * 2`.
+        2 * t * hidden * 2,
+    );
+    (act, c_xr)
 }
 
 /// One sublayer a V4.1 rung has to emit, and whether it is emitted yet.
@@ -1265,6 +1340,165 @@ pub(crate) enum Part {
 pub(crate) fn dsv41_attn_core_shape(c: &Dsv41Cfg) -> (u32, u32, u32) {
     let nope = c.head_dim - c.qk_rope;
     (c.head_dim, nope, c.qk_rope)
+}
+
+/// Emit ONE V4.1 layer as a prefill rung: a tensor table, one program, and a descriptor.
+///
+/// The entry is `act.x`, uploaded by the harness, and the exit is whichever residual buffer the mHC
+/// ping-pong left the answer in. There is no embed and no tail -- a rung is a validation artifact
+/// for one layer, not a servable model.
+///
+/// Layer 0 only, for now. Every other layer adds a group this does not emit: a compressor
+/// (2, 8, 14, 20), indexer queries (those plus 24, 28, 32, 36) or an Engram table (1, 14). The
+/// refusal names which.
+pub(crate) fn emit_dsv41_block(
+    c: &Dsv41Cfg,
+    l: u32,
+    tp: u32,
+    n_cu: u32,
+    ctx: u32,
+    t: u32,
+) -> (crate::Model, plow_asset::BlockDescriptor) {
+    let parts = dsv41_layer_parts(c, l);
+    let todo: Vec<&str> = parts
+        .iter()
+        .filter(|(_, st)| *st == Part::Todo)
+        .map(|(n, _)| *n)
+        .collect();
+    assert!(
+        todo.is_empty(),
+        "layer {l} cannot be emitted as a rung: {} of {} parts are missing -- {todo:?}. \
+         Missing capability: `emit_dsv41_block_l{l}`.",
+        todo.len(),
+        parts.len()
+    );
+    let (hd, _nope, rope) = dsv41_attn_core_shape(c);
+    let nh_l = c.heads / tp;
+
+    let mut tb = Builder::new(n_cu);
+    tb.set_tensor_dedup(true);
+    let w = declare_dsv41_weights(&mut tb, c, &[l], tp);
+    let x = tb.tensor("act.x", (t as u64) * (c.hidden as u64) * 2);
+    let xnext = tb.tensor("act.xnext", (t as u64) * (c.hidden as u64) * 2);
+    let pos = tb.tensor("in.pos", (ctx as u64) * 4);
+    let kvlen = tb.tensor("in.kvlen", 4);
+    // Layer 0 is pure sliding-window attention, and the reference disables YaRN there outright
+    // (`model.py:686`: "disable YaRN and use base rope_theta in pure sliding-window attention").
+    // Materialising a scaled table here would rotate every query by the wrong angle and still
+    // produce fluent output.
+    let [cos_t, sin_t] = packet::rope::GenTensor::rope_pair(
+        ctx,
+        rope,
+        c.raw.rope_theta as f64,
+        1.0,
+        packet::rope::RopeScale::None,
+    );
+    let cos = tb.tensor_gen("in.cos", cos_t.byte_len(), cos_t);
+    let sin = tb.tensor_gen("in.sin", sin_t.byte_len(), sin_t);
+    let mhc = declare_dsv41_mhc(&mut tb, c, t);
+    let tensors = tb.tensors();
+    let gen = tb.gen_tensors();
+
+    let mut b = Builder::new(n_cu);
+    b.set_tensor_dedup(true);
+    b.adopt_tensors(tensors);
+    let all = b.all();
+    let mut xgate = 0u32;
+
+    // The residual stream starts in copy 0. Each sublayer reads one copy and its POST writes the
+    // other, which is why `ri` flips twice per layer -- once for attention, once for the FFN.
+    let mut ri = 0usize;
+    let c_seed = b.emit(DevOp::Residual, all.clone(), &[], |d| {
+        d.t[0] = mhc.residual[0];
+        d.t[1] = x;
+        d.t[2] = x;
+        d.i[0] = t * c.hidden;
+        d.f[0] = 0.5; // (x + x) * 0.5 == x: seed every mHC copy from the block entry
+    });
+
+    let c_pre = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, false, ri, t, &[c_seed]);
+    let (proj, c_proj) = emit_dsv41_attn_proj(&mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre]);
+    let (core, c_core) = emit_dsv41_attn_core(
+        &mut b, c, &w, &all, l, tp, proj.q, proj.kv, kvlen, pos, cos, sin, t, ctx, &[c_proj],
+    );
+    let (_out, c_out) =
+        emit_dsv41_attn_out(&mut b, c, &w, &all, l, tp, core.o, t, &mut xgate, &[c_core]);
+    let c_post = emit_dsv41_mhc_post(&mut b, c, &mhc, _out.o, ri, t, &[c_out]);
+    ri ^= 1;
+
+    let c_pre2 = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, true, ri, t, &[c_post]);
+    let (ffn, c_sh) = emit_dsv41_ffn_shared(
+        &mut b, c, &w, &all, l, tp, mhc.layer_input, t, &mut xgate, &[c_pre2],
+    );
+    let c_moe = emit_dsv41_moe(
+        &mut b, c, &w, l, tp, t, xnext, ffn.xn, c_sh, (ffn.sh_out, c_sh), &mut xgate, &all,
+    );
+    let _ = emit_dsv41_mhc_post(&mut b, c, &mhc, xnext, ri, t, &[c_moe]);
+    ri ^= 1;
+
+    let prog = b.finish();
+    let out_name = if ri == 0 { "act.hc_residual_a" } else { "act.hc_residual_b" };
+    let tensors = prog.tensors.clone();
+    let m = crate::Model {
+        n_cu,
+        target: 0,
+        tensors,
+        progs: vec![prog],
+        kv_row_insts: Vec::new(),
+        prog_t: vec![t],
+        gen,
+    };
+    use plow_asset::*;
+    let hidden = c.hidden as i64;
+    let d = BlockDescriptor {
+        model: "DeepSeek-V4.1-Flash".into(),
+        arch: "mla_moe_swa".into(),
+        layer: l,
+        kind: vec!["mla_attn_swa".into(), "moe_ffn".into()],
+        hidden,
+        // The ACTIVATIONS are bf16. The weights are mixed -- block-FP8 dense and shared, MXFP4
+        // routed -- which this field has no way to say, so it does not try to.
+        dtype: "bf16".into(),
+        dims: BlockDims {
+            heads: Some(c.heads as i64),
+            // The absorbed latent, which is `head_dim` here and NOT a separate kv_lora_rank:
+            // V4.1's config has no such key and the 512 includes the 64 rope dims.
+            kv_lora: Some(hd as i64),
+            q_lora: Some(c.q_lora as i64),
+            n_exp: Some(c.n_exp as i64),
+            top_k: Some(c.top_k as i64),
+            shared_exp: Some(1),
+            moe_inter: Some(c.moe_inter as i64),
+            ..Default::default()
+        },
+        // No DSA indexer on layer 0; `index_source_layer_ids` starts at 2.
+        dsa_role: None,
+        inputs: vec![BlockTensor {
+            name: "act.x".into(),
+            shape: vec![Dim::Symbolic("T".into()), Dim::Fixed(hidden)],
+            dtype: "bf16".into(),
+        }],
+        outputs: vec![BlockTensor {
+            name: out_name.into(),
+            shape: vec![Dim::Symbolic("T".into()), Dim::Fixed(hidden)],
+            dtype: "bf16".into(),
+        }],
+        // Layer 0 carries nothing between calls: pure sliding window, one chunk per run.
+        carried_state: Vec::new(),
+        weights: BlockWeights {
+            mode: "symlink".into(),
+            ckpt: "DeepSeek-V4.1-Flash".into(),
+            prefix: format!("layers.{l}."),
+        },
+        programs: BlockPrograms {
+            // Prefill only. There is no decode program: the rung exists to prove the prefill
+            // chain, and a `decode_t: 1` here would advertise one that was never emitted.
+            prefill_buckets: vec![t as i64],
+            decode_t: 0,
+        },
+    };
+    let _ = nh_l;
+    (m, d)
 }
 
 /// The ops one layer needs, in dataflow order, each marked done or not.

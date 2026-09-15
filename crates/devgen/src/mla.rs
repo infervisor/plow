@@ -895,7 +895,8 @@ fn emit_glm53_program(
             // (emit_glm_moe_ffn_rows) and cannot serve a real prefill bucket. See
             // emit_glm_moe_ffn_prefill's doc comment for why.
             emit_glm_moe_ffn_prefill(
-                b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true, GLM_ROUTER_FLAGS,
+                b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true, None,
+                GLM_ROUTER_FLAGS,
             )
         } else {
             emit_glm_moe_ffn(
@@ -7135,7 +7136,7 @@ fn emit_glm_block_prefill(
     let c_rn2 =
         emit_glm_mla_prefill(b, c, n, slot, ctx, t, enc, x_in, pre, false, xgate, xr_cus, band);
     emit_glm_moe_ffn_prefill(
-        b, c, n, slot, t, enc, x_out, c_rn2, xgate, xr_cus, false, GLM_ROUTER_FLAGS,
+        b, c, n, slot, t, enc, x_out, c_rn2, xgate, xr_cus, false, None, GLM_ROUTER_FLAGS,
     )
 }
 
@@ -7499,6 +7500,12 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
     xgate: &mut u32,
     xr_cus: &[u32],
     raw_output: bool,
+    // The shared expert, WHEN THE CALLER ALREADY EMITTED IT. `Some(dep)` means `n.shared` is
+    // already being written by somebody else and this body must not emit its own pair; it still
+    // COMBINES `n.shared`, which is the whole point. DeepSeek-V4.1 needs this because its shared
+    // expert is block-FP8 on a [32,32] grid while its routed experts are MXFP4 -- one layer, two
+    // encodings -- and `enc` selects one arm for both. `None` is GLM, unchanged.
+    shared_pre: Option<u32>,
     // The router `i[3]`. A parameter and not GLM_ROUTER_FLAGS because the score transform is a
     // property of the CHECKPOINT: GLM and DeepSeek-V3 score with sigmoid, DeepSeek-V4.1 with
     // sqrt(softplus(.)). Both are monotone, so the wrong one here still selects plausible experts
@@ -7716,7 +7723,9 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
     // two packets — the 54 ms per 8192-row chunk the fold exists to remove — are not emitted and
     // the combine's `shared` operand goes away with them.
     let lin_fp8 = glm_linear_fp8(enc);
-    let c_shglu = if fold {
+    let c_shglu = if let Some(dep) = shared_pre {
+        dep
+    } else if fold {
         c_rn2
     } else if enc == MoeEnc::Mxfp4 && glu_fusion_wins_mxfp4(t, imoe_l, h, n_cu) {
         b.emit(DevOp::GemmGluMxfp4, all.clone(), &[c_rn2], |d| {
@@ -7795,7 +7804,7 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
         && !raw_output
         && glm_sp(c, n, b, t);
     // 17 shared expert down — row-parallel (imoe_l input): a PARTIAL [T,H] under TP.
-    let c_shd = if fold {
+    let c_shd = if shared_pre.is_some() || fold {
         c_shglu
     } else if lin_fp8 {
         emit_pf_gemm_fp8_blk(
@@ -10864,6 +10873,42 @@ pub(crate) fn glm_emit_block(
     );
     report_mla_prefill(&m, &pf, scope, enc);
     write_mla_manifest(&m, out, target, enc, &lean);
+    eprintln!("  block.json sibling written next to {out}");
+}
+
+/// `--block L` on the DeepSeek-V4.1 path: emit ONE layer as a prefill rung and write the blob.
+///
+/// The GLM `--block` sibling, at V4.1's shapes. It writes the same three artifacts -- the PLOWDEV
+/// blob, the `block.json` descriptor section, and the `build.json` manifest that says which object
+/// arms the packet needs -- because a blob whose object lacks an arm does not trap on AMD, it
+/// leaves the output untouched.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dsv41_emit_block(
+    dir: &Path,
+    l: u32,
+    ctx: u32,
+    t: u32,
+    out: &str,
+    n_cu: u32,
+    tp: u32,
+    rope_gen: bool,
+    target: &str,
+    verify: Option<&crate::VerifyHook>,
+) {
+    let c = dsv41::cfg_dsv41(dir).unwrap_or_else(|e| panic!("deepseek_v41 --block {l}: {e}"));
+    let (mut m, desc) = dsv41::emit_dsv41_block(&c, l, tp, n_cu, ctx, t);
+    let section = write_block_descriptor(out, &desc);
+    if !rope_gen {
+        m.bake_gen();
+    }
+    let lean = crate::apply_verify_gate(&m, verify);
+    std::fs::write(out, m.to_blob_v6(&[section])).unwrap();
+    eprintln!(
+        "deepseek_v41 --block {l}: {} prefill ops at T={t}, tp={tp}, window={} -> {out}",
+        m.progs.first().map(|p| p.insts.len()).unwrap_or(0),
+        c.sliding_window
+    );
+    write_mla_manifest(&m, out, target, MoeEnc::Mxfp4, &lean);
     eprintln!("  block.json sibling written next to {out}");
 }
 

@@ -3999,7 +3999,7 @@ fn glm_seq_par_proj_routes_on_the_band() {
     let c_rn2 = emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false,
         &mut xgate, &all, None);
     emit_glm_moe_ffn_prefill(&mut b, &c, &n, 0, t, MoeEnc::Fp8Blk, n.xnext, c_rn2, &mut xgate,
-        &all, false, GLM_ROUTER_FLAGS);
+        &all, false, None, GLM_ROUTER_FLAGS);
     let p = b.finish();
     let name = |h: u32| p.tensors[h as usize].name.as_str();
     let is = |d: &crate::DevInst, op: DevOp| d.op == op as u16;
@@ -4048,7 +4048,7 @@ fn glm_gemm_lt_pf_ext_routes_the_interpreter_projections() {
         let c_rn2 = emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false,
             &mut xgate, &all, None);
         emit_glm_moe_ffn_prefill(&mut b, &c, &n, 0, t, MoeEnc::Fp8Blk, n.xnext, c_rn2, &mut xgate,
-            &all, false, GLM_ROUTER_FLAGS);
+            &all, false, None, GLM_ROUTER_FLAGS);
         b.finish()
     };
     let off = layer(None);
@@ -4564,6 +4564,7 @@ fn the_moe_prefill_emission_is_pinned() {
     );
     emit_glm_moe_ffn_prefill(
         &mut b, &c, &n, 0, t, MoeEnc::Fp8Blk, n.xnext, c_rn2, &mut xgate, &all, false,
+        None,
         GLM_ROUTER_FLAGS,
     );
     let p = b.finish();

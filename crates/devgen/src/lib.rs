@@ -7766,11 +7766,19 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                 .unwrap_or_else(|e| panic!("deepseek_v41 --block {l}: the config does not parse, \
                      so there is nothing to plan a rung against: {e}"));
             match mla::dsv41_emit_block_plan(&c, l) {
-                Ok(parts) => panic!(
-                    "deepseek_v41 layer {l}: every part is emitted ({}) but no writer is wired \
-                     yet. Missing capability: `emit_dsv41_block_writer`.",
-                    parts.len()
-                ),
+                Ok(_) => {
+                    // Every part of this layer is emitted, so write the rung. The prefill width
+                    // is the largest requested bucket; `ctx` bounds the rope tables.
+                    let t = mla::glm_prefill_buckets_env(ctx)
+                        .0
+                        .last()
+                        .copied()
+                        .unwrap_or_else(|| ctx.min(1024));
+                    mla::dsv41_emit_block(
+                        &dir, l, ctx, t, &out, n_cu, tp, rope_gen, &arch, verify.as_ref(),
+                    );
+                    return;
+                }
                 Err(report) => panic!("{report}"),
             }
         }
