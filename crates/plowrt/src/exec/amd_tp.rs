@@ -1705,6 +1705,26 @@ impl AmdTpGroup {
     /// segment at once -- so every rank enqueues segment `s` before any rank enqueues `s + 1`, and
     /// every rank drains before the next segment goes out.
     pub fn run_rung(&mut self, p: usize) -> Result<()> {
+        self.run_rung_upto(p, usize::MAX)
+    }
+
+    /// Run program `p`, but enqueue only its first `max_segs` SEGMENTS.
+    ///
+    /// A bring-up instrument, and the one a memory-access fault actually needs. A fault reports
+    /// an ADDRESS and nothing else -- not the op, not the dispatch -- so on a 34-instruction
+    /// layer it names a suspect only by inference, and three runs in a row can be spent
+    /// exonerating the wrong stage. Capping the segment count turns that into a bisection: the
+    /// smallest cap that still faults contains the op that faults, and the largest that does not
+    /// is a run whose `--probe` output is READABLE, which is the other half of the answer.
+    ///
+    /// Segments, not instructions, because segments are the dispatch unit -- `enqueue_segment` is
+    /// what reaches the queue, and a partial segment is not a thing the engine can launch.
+    ///
+    /// CUT BEFORE A COLLECTIVE, not inside one. Every rank truncates at the same segment (the cap
+    /// is uniform here), so a cut that lands between collectives is consistent across the group;
+    /// a cut that drops the second half of a two-shot reduce would leave peers waiting on a gate
+    /// this rank will now never pass, and `drain` would block rather than return.
+    pub fn run_rung_upto(&mut self, p: usize, max_segs: usize) -> Result<()> {
         if p >= self.ranks[0].n_programs() {
             return Err(RuntimeError::Device(format!(
                 "program {p} does not exist (the packet has {})",
@@ -1750,6 +1770,9 @@ impl AmdTpGroup {
             }
         }
         for (seg, rank) in segment_major_order(launches, n_ranks) {
+            if seg >= max_segs {
+                continue;
+            }
             self.ranks[rank].enqueue_segment(p, seg)?;
         }
         if phase_replay {

@@ -123,6 +123,10 @@ mod hsa {
         // question a non-finite exit raises is not "is it wrong" but "WHERE does it first go
         // wrong", and a layer is 35 ops deep -- reading the exit alone cannot answer that.
         let mut probe = String::new();
+        // Enqueue only this many SEGMENTS. The bisection handle for a memory-access fault: the
+        // fault reports an address, so the way to learn WHICH op produces it is to find the
+        // smallest prefix of the layer that still faults.
+        let mut segs = usize::MAX;
         while let Some(a) = args.next() {
             match a.as_str() {
                 "--checkpoint" => checkpoint = args.next().map(PathBuf::from),
@@ -132,6 +136,7 @@ mod hsa {
                 "--exit" => exit = args.next().ok_or("--exit needs a value")?,
                 "--entry" => entry = args.next().ok_or("--entry needs a value")?,
                 "--probe" => probe = args.next().ok_or("--probe needs a value")?,
+                "--segs" => segs = args.next().ok_or("--segs needs a value")?.parse()?,
                 other => return Err(format!("unknown argument {other}").into()),
             }
         }
@@ -166,6 +171,9 @@ mod hsa {
             .ok_or_else(|| format!("this packet has no `{exit}`; pass --exit with the right name"))?
             as usize;
         println!("entry {entry} = {x_bytes} B, exit {exit} = {out_bytes} B");
+        if segs != usize::MAX {
+            println!("  HALTING after {segs} segments -- this is a PREFIX of the layer, so the exit and every probe past the cut are whatever the arena held.");
+        }
 
         // EVERY RANK gets the same entry. The residual stream is replicated under TP — the shard
         // is in the weights — so a rank seeded differently would diverge from its peers at the
@@ -195,7 +203,7 @@ mod hsa {
 
         // Warm-up, then timed. The first launch pays for object load and page-in, which is a real
         // cost but not the layer's.
-        g.run_rung(prog)?;
+        g.run_rung_upto(prog, segs)?;
         let mut out = vec![0u8; out_bytes];
         g.rank(0).read_tensor(&exit, &mut out)?;
         let st = stats(&out);
@@ -247,7 +255,7 @@ mod hsa {
         let mut us: Vec<f64> = Vec::with_capacity(iters as usize);
         for _ in 0..iters {
             let t = std::time::Instant::now();
-            g.run_rung(prog)?;
+            g.run_rung_upto(prog, segs)?;
             us.push(t.elapsed().as_secs_f64() * 1e6);
         }
         if !us.is_empty() {

@@ -1264,13 +1264,16 @@ fn every_tp_weight_is_read_at_the_width_it_was_declared() {
 /// made 92 of 93 layers compute `ffn = up_latent + attn` instead of `+ shared_expert`, with
 /// finite, plausible logits.
 ///
-/// And it must be SLOT 2, not slot 0. Slot 0 holds this same layer's attention partial; passing
-/// the attention reduce proves only that every peer ARRIVED, not that every peer has finished
-/// READING, so a fast rank would overwrite slot 0 under a slow peer. K3 gets away with reusing
-/// slot 0 only because its shared expert is ordered after a SECOND collective; V4.1's runs before
-/// the MoE combine, so no such collective exists to hide behind.
+/// And it lands in SLOT 0, attention's, because only TWO peer slots exist: `DevBlob::parse`
+/// recovers `slot_bytes` as `max(i[2])` over the collectives, so an op that asks for `2 * slot_b`
+/// does not buy a third slot -- it redefines the UNIT as twice what every other op meant by it.
+///
+/// Reusing slot 0 is safe here for the reason K3's could not be: K3's worry is a ONE-SHOT gate,
+/// which proves every peer ARRIVED and not that every peer finished READING. Attention's reduce
+/// is `XReduceTwoShot` -- reduce-scatter then all-gather -- so no rank completes it until every
+/// peer has both contributed and published its band, which is exactly "finished reading slot 0".
 #[test]
-fn the_shared_experts_partial_lands_in_its_own_peer_slot_and_is_summed() {
+fn the_shared_experts_partial_lands_in_a_peer_slot_and_is_summed() {
     let Some((cfg, _)) = checkpoint() else {
         return;
     };
@@ -1293,20 +1296,25 @@ fn the_shared_experts_partial_lands_in_its_own_peer_slot_and_is_summed() {
         super::dsv41::PEER_SLOT_SHARED,
         "the down projection writes the PEER SLOT, not a local arena tensor"
     );
-    assert_eq!(super::dsv41::PEER_SLOT_SHARED, "act.ug_tp", "peer slot 2");
+    assert_eq!(
+        super::dsv41::PEER_SLOT_SHARED,
+        super::dsv41::PEER_SLOT_O,
+        "slot 0, shared with attention -- only two peer slots exist"
+    );
 
     let slot_b = t * cfg.hidden * 2;
     let xr = p
         .insts
         .iter()
         .filter(|d| d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceTwoShot as u16)
-        .find(|d| d.i[2] == 2 * slot_b)
-        .expect("the shared partial is reduced out of slot 2");
+        .find(|d| d.i[2] == 0 && d.t[0] == m.tensors.iter().position(|x| x.name == "act.l0.sh_out").expect("sh_out") as u32)
+        .expect("the shared partial is reduced out of slot 0");
     assert_eq!(xr.i[0], t * cfg.hidden, "the whole [T, hidden] partial");
     assert_eq!(xr.i[1], 8, "over all 8 ranks");
 
-    // Three distinct slots, one per row-parallel site. Two sites sharing an offset is the hazard
-    // above; the test names the offsets so a fourth site cannot quietly collide with one.
+    // EVERY offset this layer reduces at must be one the host actually binds, and the host binds
+    // exactly two: 0 and `slot_b`. An offset outside that set is the failure this pins -- it does
+    // not fault, it silently moves the unit `DevBlob::parse` recovers for every other collective.
     let slots: std::collections::BTreeSet<u32> = p
         .insts
         .iter()
@@ -1314,9 +1322,10 @@ fn the_shared_experts_partial_lands_in_its_own_peer_slot_and_is_summed() {
         .map(|d| d.i[2])
         .collect();
     assert!(
-        slots.contains(&0) && slots.contains(&(2 * slot_b)),
-        "attention reduces slot 0 and the shared expert slot 2, got {slots:?}"
+        slots.iter().all(|s| *s == 0 || *s == slot_b),
+        "only slots 0 and slot_b={slot_b} exist, got {slots:?}"
     );
+    assert!(slots.contains(&0), "attention and the shared expert reduce slot 0");
 }
 
 /// The routed combine's peer slot is BOUND. `GlmTn::none()` leaves `dg_tp` at `TENSOR_NONE` and
