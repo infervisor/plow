@@ -1899,6 +1899,8 @@ impl Builder {
                     && matches!((inst.i[1], inst.i[2]), (15_360, 3_840) | (21_504, 5_376));
                 let down_shape = rows
                     && matches!((inst.i[1], inst.i[2]), (3_840, 15_360) | (5_376, 21_504));
+                let output_shape =
+                    rows && matches!((inst.i[1], inst.i[2]), (3_840, 4_096) | (3_840, 8_192));
                 let common = inst.i[4] == 0
                     && inst.i[5] == 0
                     && inst.f.iter().all(|value| value.to_bits() == 0)
@@ -1913,7 +1915,7 @@ impl Builder {
                     && inst.i[6..] == [0; 2]
                     && inst.t[..7].iter().all(|&tensor| tensor != TENSOR_NONE)
                     && inst.t[7] == TENSOR_NONE;
-                let bf16_down = matches!(
+                let bf16_linear = matches!(
                     DevOp::from_u16(inst.op),
                     Some(
                         DevOp::Gemm
@@ -1938,8 +1940,9 @@ impl Builder {
                     && inst.t[..5].iter().all(|&tensor| tensor != TENSOR_NONE)
                     && inst.t[5..] == [TENSOR_NONE; 3];
                 let glu = glu_shape && common && (bf16_glu || fp8_glu);
-                let down = down_shape && (bf16_down || fp8_down);
-                if (glu || down) && op.cus.len() == n_cu {
+                let down = down_shape && (bf16_linear || fp8_down);
+                let output = output_shape && bf16_linear;
+                if (glu || down || output) && op.cus.len() == n_cu {
                     op.isolated = true;
                     native_gemma4_glu = true;
                 }
@@ -5254,7 +5257,14 @@ mod xreduce_wave_rs_segment_tests {
 mod gemma4_glu_segment_tests {
     use super::*;
 
-    fn program(l2: bool, rows: u32, fp8: bool, down: bool) -> Program {
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Glu,
+        Down,
+        Output,
+    }
+
+    fn program(l2: bool, rows: u32, fp8: bool, kind: Kind) -> Program {
         let mut b = Builder::new(8);
         b.deny_uniseg();
         b.set_native_gemma4_glu_segments(true);
@@ -5268,18 +5278,19 @@ mod gemma4_glu_segment_tests {
         let all = b.all();
         let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
         let glu = b.emit(
-            match (fp8, down) {
-                (true, true) => DevOp::GemmFp8,
-                (true, false) => DevOp::GemmGluFp8,
-                (false, true) => DevOp::Gemm,
-                (false, false) => DevOp::GemmGlu,
+            match (fp8, kind) {
+                (true, Kind::Down) => DevOp::GemmFp8,
+                (true, Kind::Glu) => DevOp::GemmGluFp8,
+                (false, Kind::Down | Kind::Output) => DevOp::Gemm,
+                (false, Kind::Glu) => DevOp::GemmGlu,
+                (true, Kind::Output) => unreachable!(),
             },
             all.clone(),
             &[before],
             |d| {
-                if down && fp8 {
+                if matches!(kind, Kind::Down) && fp8 {
                     d.t = [0, 1, 2, 3, 4, TENSOR_NONE, TENSOR_NONE, TENSOR_NONE];
-                } else if down {
+                } else if matches!(kind, Kind::Down | Kind::Output) {
                     d.t = [
                         0,
                         1,
@@ -5304,10 +5315,10 @@ mod gemma4_glu_segment_tests {
                         TENSOR_NONE,
                     ];
                 }
-                d.i = if down {
-                    [rows, 3_840, 15_360, 0, 0, 0, 0, 0]
-                } else {
-                    [rows, 15_360, 3_840, 0, 0, 0, 0, 0]
+                d.i = match kind {
+                    Kind::Down => [rows, 3_840, 15_360, 0, 0, 0, 0, 0],
+                    Kind::Output => [rows, 3_840, 4_096, 0, 0, 0, 0, 0],
+                    Kind::Glu => [rows, 15_360, 3_840, 0, 0, 0, 0, 0],
                 };
             },
         );
@@ -5317,10 +5328,13 @@ mod gemma4_glu_segment_tests {
 
     #[test]
     fn exact_gfx942_glu_is_a_counter_free_raw_segment() {
-        for down in [false, true] {
+        for kind in [Kind::Glu, Kind::Down, Kind::Output] {
             for fp8 in [false, true] {
+                if fp8 && matches!(kind, Kind::Output) {
+                    continue;
+                }
                 for rows in [1024, 2048, 4096, 8192] {
-                    let p = program(false, rows, fp8, down);
+                    let p = program(false, rows, fp8, kind);
                     let segment = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
                     assert!(p
                         .stream
@@ -5335,9 +5349,12 @@ mod gemma4_glu_segment_tests {
 
     #[test]
     fn l2_placement_keeps_the_interpreter_counter_protocol() {
-        for down in [false, true] {
+        for kind in [Kind::Glu, Kind::Down, Kind::Output] {
             for fp8 in [false, true] {
-                let p = program(true, 1024, fp8, down);
+                if fp8 && matches!(kind, Kind::Output) {
+                    continue;
+                }
+                let p = program(true, 1024, fp8, kind);
                 assert_ne!(p.insts[1].wait_len, 0);
                 assert_ne!(p.insts[1].succ_len, 0);
             }

@@ -20,6 +20,9 @@
 #ifndef PLOW_TK_SAFE_ONLY
 #define PLOW_TK_SAFE_ONLY 0
 #endif
+#ifndef PLOW_GEMMA4_QO_EXACT_BENCH
+#define PLOW_GEMMA4_QO_EXACT_BENCH 0
+#endif
 
 /* The Gemma-4 MoE bodies are compiled into THIS file unconditionally, where the interpreter
  * gates them behind PLOW_MOE_GEMMA / PLOW_MOE_GEMMA_PF. That asymmetry is deliberate: the
@@ -150,6 +153,19 @@ GEMM_VARIANT(gemm_c1, 256, 128, 64)
 #endif
 #if GM_TILE_FITS(128, 256, 64)
 GEMM_VARIANT(gemm_c2, 128, 256, 64)
+#if PLOW_GEMMA4_QO_EXACT_BENCH
+#define GEMMA4_QO_BF16_EXACT(NAME, N, K)                                          \
+    extern "C" __global__ __attribute__((flatten))                              \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                    \
+        bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned, unsigned) {   \
+        __shared__ bf16 lds[GM_LDS_HALVES_T(128, 256, 64)];                       \
+        d_gemm_t<128, 256, 64, GM_WM, GM_WN, false>(                              \
+            C, A, B, nullptr, nullptr, M, N, K, blockIdx.x, gridDim.x, lds);      \
+    }
+GEMMA4_QO_BF16_EXACT(gemm_g12_qs_c2_exact, 4096, 3840)
+GEMMA4_QO_BF16_EXACT(gemm_g12_os_c2_exact, 3840, 4096)
+GEMMA4_QO_BF16_EXACT(gemm_g12_og_c2_exact, 3840, 8192)
+#endif
 #endif
 #if GM_TILE_FITS(128, 128, 64)
 GEMM_VARIANT(gemm_c3, 128, 128, 64)
@@ -204,6 +220,20 @@ GEMM_FP8_VARIANT(gemm_fp8_c0, 256, 256, 64)
 #endif
 #if GM_TILE_FITS(128, 256, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c2, 128, 256, 64) /* GemmWideFp8: the fifth selectable fp8 rung */
+#if PLOW_GEMMA4_QO_EXACT_BENCH
+#define GEMMA4_QO_FP8_EXACT(NAME, N, K)                                            \
+    extern "C" __global__ __attribute__((flatten))                               \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                     \
+        bf16* C, const unsigned char* A, const unsigned char* B,                   \
+        const float* ascale, const float* wscale, unsigned M, unsigned, unsigned) { \
+        __shared__ unsigned char lds[(128 + 256) * 128];                           \
+        d_gemm_fp8_t<128, 256, 128, GM_WM, GM_WN>(                                \
+            C, A, B, ascale, wscale, M, N, K, blockIdx.x, gridDim.x, (bf16*)lds); \
+    }
+GEMMA4_QO_FP8_EXACT(gemm_g12_qs_fp8_c2_exact, 4096, 3840)
+GEMMA4_QO_FP8_EXACT(gemm_g12_os_fp8_c2_exact, 3840, 4096)
+GEMMA4_QO_FP8_EXACT(gemm_g12_og_fp8_c2_exact, 3840, 8192)
+#endif
 #endif
 #if GM_TILE_FITS(128, 128, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c3, 128, 128, 64)

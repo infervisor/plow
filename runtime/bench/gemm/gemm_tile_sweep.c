@@ -64,7 +64,8 @@ static double now(void) {
 
 /* Keep in sync with test_kernels.hip's GEMM_VARIANT list. Symbol lookup failing is the
  * signal that a variant is not compiled, so an entry costs nothing when absent. */
-static const struct { const char* sym; unsigned bm, bn, bk; } TILES[] = {
+struct tile_spec { const char* sym; unsigned bm, bn, bk, exact_n, exact_k; };
+static const struct tile_spec TILES[] = {
     {"gemm_c0", 256, 256, 64}, {"gemm_c1", 256, 128, 64}, {"gemm_c2", 128, 256, 64},
     {"gemm_c3", 128, 128, 64}, {"gemm_c4", 64, 128, 64},  {"gemm_c5", 192, 256, 64},
     {"gemm_c6", 320, 128, 64}, {"gemm_c7", 384, 128, 64}, {"gemm_c8", 128, 384, 64},
@@ -75,13 +76,19 @@ static const struct { const char* sym; unsigned bm, bn, bk; } TILES[] = {
     {"gemm_e3", 128, 64, 64},  {"gemm_e4", 64, 192, 64},  {"gemm_e5", 128, 128, 128},
 };
 #define NTILES ((int)(sizeof TILES / sizeof TILES[0]))
+static const struct tile_spec EXACT_TILES[] = {
+    {"gemm_g12_qs_c2_exact", 128, 256, 64, 4096, 3840},
+    {"gemm_g12_os_c2_exact", 128, 256, 64, 3840, 4096},
+    {"gemm_g12_og_c2_exact", 128, 256, 64, 3840, 8192},
+};
+#define NEXACT_TILES ((int)(sizeof EXACT_TILES / sizeof EXACT_TILES[0]))
 
 /* The MXFP4 (w4a16) ladder plus the CDNA3 small-rung geometry.
  *
  * Deliberately not the twelve-entry bf16 list. Ingest matches these probes against the live
  * inventory; calibration-only tiles have no mxfp4 dispatch arm and are omitted.
  * `test_kernels.hip`'s GEMM_MXFP4_VARIANT list is the other half of this pair. */
-static const struct { const char* sym; unsigned bm, bn, bk; } MXTILES[] = {
+static const struct tile_spec MXTILES[] = {
     {"gemm_mxfp4_c0", 256, 256, 64}, {"gemm_mxfp4_c2", 128, 256, 64},
     {"gemm_mxfp4_c3", 128, 128, 64}, {"gemm_mxfp4_c4", 64, 128, 64},
     {"gemm_mxfp4_e2", 64, 128, 128}, {"gemm_mxfp4_c5", 192, 256, 64},
@@ -90,12 +97,18 @@ static const struct { const char* sym; unsigned bm, bn, bk; } MXTILES[] = {
 
 /* The W8A8 ladder plus the CDNA3 small-rung geometry. Ingest matches these probes against
  * the live inventory, so c4 is selectable on gfx950 and e2 is selectable on gfx942. */
-static const struct { const char* sym; unsigned bm, bn, bk; } F8TILES[] = {
+static const struct tile_spec F8TILES[] = {
     {"gemm_fp8_c0", 256, 256, 64}, {"gemm_fp8_c2", 128, 256, 64},
     {"gemm_fp8_c3", 128, 128, 64}, {"gemm_fp8_c4", 64, 128, 64},
     {"gemm_fp8_e2", 64, 128, 128}, {"gemm_fp8_c5", 192, 256, 64},
 };
 #define NF8TILES ((int)(sizeof F8TILES / sizeof F8TILES[0]))
+static const struct tile_spec F8EXACT_TILES[] = {
+    {"gemm_g12_qs_fp8_c2_exact", 128, 256, 128, 4096, 3840},
+    {"gemm_g12_os_fp8_c2_exact", 128, 256, 128, 3840, 4096},
+    {"gemm_g12_og_fp8_c2_exact", 128, 256, 128, 3840, 8192},
+};
+#define NF8EXACT_TILES ((int)(sizeof F8EXACT_TILES / sizeof F8EXACT_TILES[0]))
 
 /* OCP e2m1: three magnitude bits on the ladder 0,0.5,1,1.5,2,3,4,6 and a sign bit. This is the
  * HOST-side twin of `amd_common.h`'s `fp4_to_bf16v8`, and it is exact — every code is a small
@@ -206,10 +219,10 @@ int main(int argc, char** argv) {
     unsigned char* hS = mx ? plow_hsa_alloc_host(H, nS) : NULL;
     float* hWs = f8 ? plow_hsa_alloc_host(H, N * sizeof(float)) : NULL;
     bf16* hC = plow_hsa_alloc_host(H, nC * 2);
-    bf16* hC2 = (mx || f8) ? NULL : malloc(nC * sizeof(*hC2));
+    bf16* hC2 = mx ? NULL : malloc(nC * sizeof(*hC2));
     int have_c2 = 0;
     if ((!f8 && !hA) || (!mx && !f8 && (!hB || !hC2)) || (mx && (!hW || !hS)) ||
-        (f8 && (!hAq || !hAs || !hW || !hWs)) || !hC) {
+        (f8 && (!hAq || !hAs || !hW || !hWs || !hC2)) || !hC) {
         fprintf(stderr, "host allocation failed\n");
         return 1;
     }
@@ -299,12 +312,16 @@ int main(int argc, char** argv) {
     const char* jsonl = getenv("PLOW_GEMM_JSONL");
     FILE* jf = jsonl ? fopen(jsonl, "a") : NULL;
 
-    const int ntiles = mx ? NMXTILES : (f8 ? NF8TILES : NTILES);
+    const int ntiles = mx ? NMXTILES
+                          : (f8 ? NF8TILES + NF8EXACT_TILES : NTILES + NEXACT_TILES);
     for (int t = 0; t < ntiles; t++) {
-        const char* sym = mx ? MXTILES[t].sym : (f8 ? F8TILES[t].sym : TILES[t].sym);
-        const unsigned tbm = mx ? MXTILES[t].bm : (f8 ? F8TILES[t].bm : TILES[t].bm);
-        const unsigned tbn = mx ? MXTILES[t].bn : (f8 ? F8TILES[t].bn : TILES[t].bn);
-        const unsigned tbk = mx ? MXTILES[t].bk : (f8 ? F8TILES[t].bk : TILES[t].bk);
+        const struct tile_spec* tile =
+            mx ? &MXTILES[t]
+               : (f8 ? (t < NF8TILES ? &F8TILES[t] : &F8EXACT_TILES[t - NF8TILES])
+                     : (t < NTILES ? &TILES[t] : &EXACT_TILES[t - NTILES]));
+        if (tile->exact_n && (N != tile->exact_n || K != tile->exact_k)) continue;
+        const char* sym = tile->sym;
+        const unsigned tbm = tile->bm, tbn = tile->bn, tbk = tile->bk;
         plow_hsa_kernel k;
         if (plow_hsa_get_kernel(H, 0, sym, &k) != 0) continue;
         /* A NaN sentinel makes incomplete tile coverage fail instead of inheriting a prior result. */
@@ -341,10 +358,13 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < nC; i++) {
             if (!isfinite(bf2f(hC[i]))) { bad++; break; }
         }
-        if (!mx && !f8 && strcmp(sym, "gemm_c2") == 0) {
+        if ((!f8 && strcmp(sym, "gemm_c2") == 0) ||
+            (f8 && strcmp(sym, "gemm_fp8_c2") == 0)) {
             memcpy(hC2, hC, nC * sizeof(*hC2));
             have_c2 = 1;
         } else if (!mx && !f8 && strcmp(sym, "gemm_c8") == 0) {
+            if (!have_c2 || memcmp(hC2, hC, nC * sizeof(*hC2)) != 0) bad++;
+        } else if (!mx && strstr(sym, "_exact")) {
             if (!have_c2 || memcmp(hC2, hC, nC * sizeof(*hC2)) != 0) bad++;
         }
         for (int s = 0; s < 24; s++) {

@@ -6729,6 +6729,10 @@ impl AmdEngine {
             && blob
                 .prefill_phase()
                 .any(amd_gemma4_glu::program_down_candidate);
+        let wants_gemma4_output = arch == "gfx942"
+            && blob
+                .prefill_phase()
+                .any(amd_gemma4_glu::program_output_candidate);
         // Weights and scale grids the route binds in its own layout (shuffled, doubled).
         let gemm_blk_bound = if use_gemm_blk {
             amd_gemm_blk::bound_weights(&blob.progs)?
@@ -8608,6 +8612,7 @@ impl AmdEngine {
                 blob.n_cu,
                 wants_gemma4_glu_fp8,
                 wants_gemma4_down,
+                wants_gemma4_output,
                 &mut modules,
             )?
         } else {

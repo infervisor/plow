@@ -78,6 +78,22 @@
    "no_scratch": true,
    "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
   },
+  "output_s_c2_gfx942": {
+   "mfma_min": 32,
+   "burst_min": 7,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x8_bf16": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
+  "output_g_c2_gfx942": {
+   "mfma_min": 32,
+   "burst_min": 7,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x8_bf16": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
   "down_c5_gfx942": {
    "mfma_min": 48,
    "burst_min": 11,

@@ -31,6 +31,7 @@ enum Precision {
 enum Kind {
     Glu,
     Down,
+    Output,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +48,7 @@ fn classify(inst: &DevInst64) -> Option<(Model, Kind)> {
         (21_504, 5_376) => Some((Model::Gemma31, Kind::Glu)),
         (3_840, 15_360) => Some((Model::Gemma12, Kind::Down)),
         (5_376, 21_504) => Some((Model::Gemma31, Kind::Down)),
+        (3_840, 4_096 | 8_192) => Some((Model::Gemma12, Kind::Output)),
         _ => None,
     }
 }
@@ -92,7 +94,7 @@ fn native(inst: &DevInst64) -> bool {
                 && inst.t[..7].iter().all(|&tensor| tensor != TENSOR_NONE16)
                 && inst.t[7] == TENSOR_NONE16
         }
-        (Kind::Down, Some(Precision::Bf16)) => {
+        (Kind::Down | Kind::Output, Some(Precision::Bf16)) => {
             inst.i[3..] == [0; 5]
                 && inst.t[..3].iter().all(|&tensor| tensor != TENSOR_NONE16)
                 && inst.t[3..] == [TENSOR_NONE16; 5]
@@ -137,6 +139,14 @@ pub(super) fn program_down_candidate(prog: &DevProg) -> bool {
             .any(|inst| native(inst) && classify(inst).is_some_and(|(_, k)| k == Kind::Down))
 }
 
+pub(super) fn program_output_candidate(prog: &DevProg) -> bool {
+    program_candidate(prog)
+        && prog
+            .insts
+            .iter()
+            .any(|inst| native(inst) && classify(inst).is_some_and(|(_, k)| k == Kind::Output))
+}
+
 fn tile(model: Model, kind: Kind, precision: Precision, rows: u32) -> Tile {
     match (model, kind, precision, rows) {
         (Model::Gemma12, Kind::Down, Precision::Bf16, 8192) => Tile::C6,
@@ -145,6 +155,13 @@ fn tile(model: Model, kind: Kind, precision: Precision, rows: u32) -> Tile {
         (Model::Gemma31, Kind::Down, Precision::Fp8, 4096) => Tile::C3,
         (Model::Gemma31, Kind::Down, Precision::Fp8, rows) if rows <= 2048 => Tile::C5,
         (Model::Gemma31, Kind::Down, _, _) => Tile::C2,
+        (Model::Gemma12, Kind::Output, Precision::Bf16, _) => Tile::C2,
+        (Model::Gemma12 | Model::Gemma31, Kind::Output, Precision::Fp8, _) => {
+            unreachable!("FP8 output is not a native route")
+        }
+        (Model::Gemma31, Kind::Output, Precision::Bf16, _) => {
+            unreachable!("31B output is not yet a native route")
+        }
         (Model::Gemma12, Kind::Glu, _, rows) if rows <= 4096 => Tile::C2,
         (Model::Gemma31, Kind::Glu, _, rows) if rows <= 1024 => Tile::C2,
         (Model::Gemma12 | Model::Gemma31, Kind::Glu, _, _) => Tile::C5,
@@ -221,7 +238,7 @@ pub(super) fn routes(
                 (inst.t[5], n * k),
                 (inst.t[6], n * 4),
             ],
-            (Kind::Down, Precision::Bf16) => vec![
+            (Kind::Down | Kind::Output, Precision::Bf16) => vec![
                 (inst.t[0], m * n * 2),
                 (inst.t[1], m * k * 2),
                 (inst.t[2], n * k * 2),
@@ -233,6 +250,7 @@ pub(super) fn routes(
                 (inst.t[3], m * 4),
                 (inst.t[4], n * 4),
             ],
+            (Kind::Output, Precision::Fp8) => unreachable!("FP8 output is not a native route"),
         };
         for (handle, bytes) in operands {
             if handle == TENSOR_NONE16
@@ -335,6 +353,8 @@ pub(super) struct Gemma4Glu {
     down_fp8_c2_31: Option<HsaKernel>,
     down_fp8_c3_31: Option<HsaKernel>,
     down_fp8_c5_31: Option<HsaKernel>,
+    output_s_c2_12: Option<HsaKernel>,
+    output_g_c2_12: Option<HsaKernel>,
     n_cu: u32,
 }
 
@@ -345,6 +365,7 @@ impl Gemma4Glu {
         n_cu: u32,
         need_fp8: bool,
         need_down: bool,
+        need_output: bool,
         modules: &mut Vec<Module>,
     ) -> Result<Option<Self>> {
         let path = dir.join(OBJECT);
@@ -399,6 +420,12 @@ impl Gemma4Glu {
                 }
             }
         }
+        if need_output && !symbols.contains(&"plow_gemma4_output_128x256x64_1") {
+            return Err(RuntimeError::Device(format!(
+                "{} lacks required marker `plow_gemma4_output_128x256x64_1`",
+                path.display()
+            )));
+        }
         let module = EngineDevice::module_load(be, &image)?;
         let c2 = EngineDevice::get_function(be, &module, "plow_gemma4_gemm_glu_c2_gfx942")?;
         let c5_12 = EngineDevice::get_function(be, &module, "plow_gemma4_12b_gemm_glu_c5_gfx942")?;
@@ -427,6 +454,13 @@ impl Gemma4Glu {
         let down_fp8_c2_31 = load_down("plow_gemma4_31b_down_fp8_c2_gfx942")?;
         let down_fp8_c3_31 = load_down("plow_gemma4_31b_down_fp8_c3_gfx942")?;
         let down_fp8_c5_31 = load_down("plow_gemma4_31b_down_fp8_c5_gfx942")?;
+        let load_output = |name| {
+            need_output
+                .then(|| EngineDevice::get_function(be, &module, name))
+                .transpose()
+        };
+        let output_s_c2_12 = load_output("plow_gemma4_12b_output_s_c2_gfx942")?;
+        let output_g_c2_12 = load_output("plow_gemma4_12b_output_g_c2_gfx942")?;
         for (name, kernel, lds) in [
             ("C2", c2, C2_LDS),
             ("12B C5", c5_12, C5_LDS),
@@ -461,6 +495,23 @@ impl Gemma4Glu {
             if !kernargs.contains(&kernarg)
                 || kernel.private_segment_size() != 0
                 || HsaBackend::kernel_lds_bytes(&kernel) != lds
+            {
+                return Err(RuntimeError::Device(format!(
+                    "Gemma-4 {name} resource ABI mismatch: kernarg={kernarg}, LDS={}, private={}",
+                    HsaBackend::kernel_lds_bytes(&kernel),
+                    kernel.private_segment_size()
+                )));
+            }
+        }
+        for (name, kernel) in [
+            ("12B sliding output C2", output_s_c2_12),
+            ("12B global output C2", output_g_c2_12),
+        ] {
+            let Some(kernel) = kernel else { continue };
+            let kernarg = kernel.kernarg_size();
+            if ![40, 296].contains(&kernarg)
+                || kernel.private_segment_size() != 0
+                || HsaBackend::kernel_lds_bytes(&kernel) != C2_LDS
             {
                 return Err(RuntimeError::Device(format!(
                     "Gemma-4 {name} resource ABI mismatch: kernarg={kernarg}, LDS={}, private={}",
@@ -507,6 +558,8 @@ impl Gemma4Glu {
             down_fp8_c2_31,
             down_fp8_c3_31,
             down_fp8_c5_31,
+            output_s_c2_12,
+            output_g_c2_12,
             n_cu,
         }))
     }
@@ -613,6 +666,29 @@ impl Gemma4Glu {
                     RuntimeError::Device("native Gemma-4 FP8 down kernel was not loaded".into())
                 })?;
                 be.launch(kernel, self.n_cu, 512, 0, bytemuck::bytes_of(&args))?;
+            }
+            (Kind::Output, Precision::Bf16) => {
+                let args = LinearArgs {
+                    out: pointer(route.inst.t[0]),
+                    input: pointer(route.inst.t[1]),
+                    weight: pointer(route.inst.t[2]),
+                    rows: route.rows,
+                    n: route.inst.i[1],
+                    k: route.inst.i[2],
+                    reserved: 0,
+                };
+                let kernel = match (route.model, route.inst.i[2]) {
+                    (Model::Gemma12, 4_096) => self.output_s_c2_12,
+                    (Model::Gemma12, 8_192) => self.output_g_c2_12,
+                    _ => unreachable!("only Gemma-12B BF16 output projections are qualified"),
+                }
+                .ok_or_else(|| {
+                    RuntimeError::Device("native Gemma-4 output kernel was not loaded".into())
+                })?;
+                be.launch(kernel, self.n_cu, 512, 0, bytemuck::bytes_of(&args))?;
+            }
+            (Kind::Output, Precision::Fp8) => {
+                unreachable!("FP8 output is not a native route")
             }
         }
         Ok(())
@@ -779,6 +855,27 @@ mod tests {
                         }
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn gemma12_bf16_output_projections_are_serial_candidates() {
+        for rows in [1024, 2048, 4096, 8192] {
+            for k in [4096, 8192] {
+                let (prog, tensors) = down_fixture(rows, 3840, k, Precision::Bf16);
+                assert!(program_candidate(&prog));
+                assert!(program_output_candidate(&prog));
+                assert!(!program_down_candidate(&prog));
+                let route = routes(&prog, &tensors, 1).unwrap()[0].unwrap();
+                assert_eq!(
+                    (route.model, route.kind, route.precision, route.tile),
+                    (Model::Gemma12, Kind::Output, Precision::Bf16, Tile::C2)
+                );
+
+                let (fp8, fp8_tensors) = down_fixture(rows, 3840, k, Precision::Fp8);
+                assert!(!program_candidate(&fp8));
+                assert!(routes(&fp8, &fp8_tensors, 1).unwrap()[0].is_none());
             }
         }
     }
