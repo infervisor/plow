@@ -1642,6 +1642,57 @@ This is a live defect for RAGGED SEAMS generally, not only for row-band: any two
 a `@band{t}` family could desynchronise the same way. Row-band is simply the first pair where one
 sibling never goes ragged and so never re-derives the binding for itself.
 
+## The measured tiles do not move 8192 TTFT, and the shipping packet never had them anyway (2026-09-15, jobs `tileab-ttft-t4`, `tileab-ttft-t4b`)
+
+Two facts, in the order they matter.
+
+**The campaign does not reach a packet by itself.** Tiles are chosen at EMIT time and baked in. The
+shipping packet's `build.json` records:
+
+    tuning: {"gv_mm_max": 32, "tile_lookups": 1584, "tile_measured": 0, "tile_source": "analytical"}
+
+so every one of its 1584 tile lookups came from the cost model, and populating the store changed
+nothing about it. Only a re-emit can. Emitting from the same HEAD binary with the same replay
+knobs, differing only in whether the store is readable (`PLOW_TUNEDB=""` disables it):
+
+| arm | packet | tile_lookups | tile_measured | source |
+|---|---|---|---|---|
+| analytical | `0x164ae4a829ecebec` | 1584 | 0 | `analytical` |
+| measured | `0x9abd6d2277d7707a` | 1584 | **1509** | `mixed` |
+
+1509 of 1584 lookups change hands, and at least one audited GLM prefill shape changes opcode as
+well as tile: `512x6144x256` goes `GemmMed 128x128` to `GemmSmall 64x128`.
+
+**And it makes no difference at 8192.** Paired, control run first and last, 12 prompts each at
+`--random-input-len 8192 --max-concurrency 1`, each packet on its own object set:
+
+| arm | packet | median TTFT |
+|---|---|---|
+| `ctrl` | analytical | 586.8 ms |
+| `treat` | measured | 587.2 ms |
+| `ctrl2` | analytical | 585.9 ms |
+
+Control drift 0.9 ms; treat is +0.8 ms against the control mean, **inside the drift**. The
+analytical cost model was already picking as well as measurement can for GLM's 8192 prefill
+shapes. The campaign's value is therefore not speed at this rung: it is that `pick_tile` now
+reports a truthful tier, that the 4961 stale records are no longer the whole cell, and that a
+shape where the model picks badly would now be caught. **Tiles are not a lever for the 490 ms
+goal.**
+
+Two things this does NOT say. It prices the 8192 rung only — the tiles differ at every rung and at
+decode M=1, and a short-rung effect would not show here. And neither packet carries row-band or
+the rest of the qualified stack, so 586 ms is not comparable to `stack-t4`'s 509.8 ms; it is the
+ordinary prefill path at HEAD, which is the right control for a tile question and the wrong one
+for a goal number.
+
+**An object-set trap worth recording.** `build_gfx942.sh` builds the 53 interpreter and adapter
+rows the packet is compiled for and reports `ready (53 objects)` — but the loader also demands
+hand-written and vendor kernels it does not build, and the first run of this A/B lost three GPU
+slots to `mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co: No such file or directory` on a clean build.
+Ten of them (4 `.co`, 6 adapter `.elf`) are packet-independent and are carried byte-identical by
+both the shipping set and the row-band set, so they are seeded from the shipping set. The probe's
+preflight now names all ten.
+
 ## The tile campaign passes, and the shipping demand is 40 shapes, not 56 (2026-09-14, job `gemmtune-glm53-r3`)
 
 `gemmtune-glm53-r3` completed rc=0 in 10.1 min with both fixes in place — the packet-scoped object
