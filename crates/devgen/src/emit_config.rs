@@ -1596,7 +1596,10 @@ impl EmitConfig {
     /// `PLOW_GLM_XR_RES` / `PLOW_GLM_XR_BAND` emit keeps working without naming this one.
     pub fn glm_seq_par(&self) -> bool {
         self.glm_seq_par.unwrap_or(
-            self.glm_production_defaults && !self.glm_xr_res && self.glm_xr_band.unwrap_or(1) <= 1,
+            self.glm_production_defaults
+                && !self.token_batch_tp
+                && !self.glm_xr_res
+                && self.glm_xr_band.unwrap_or(1) <= 1,
         )
     }
 

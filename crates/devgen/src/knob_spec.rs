@@ -56,9 +56,10 @@ const GEMMA_NATIVE_PURE_GEMM: Status = Status::Qualified {
 const UNISEG: Status = Status::Qualified {
     evidence: &["crates/plowc/src/main.rs effective_uniseg: the sm_120 interpreter implements the single-segment path only"],
 };
-const TOKEN_BATCH_TP_CANDIDATE: Status = Status::Candidate {
+const TOKEN_BATCH_TP_PARKED: Status = Status::Parked {
+    reason: "token-batch bodies with sequence-parallel seams failed long-context retrieval",
     evidence: &[
-        "crates/plowrt/src/exec/amd.rs: narrow sequence-par seam norms remain on the primary object",
+        "review log #63: retrieval 9/18 base, 0/21 tail",
         "docs/flags-reference.md: PLOW_TOKEN_BATCH_TP",
     ],
 };
@@ -94,6 +95,7 @@ const GLM_SEQ_PAR_DEFAULT: Default = Default::Production {
         DefaultCase {
             when: F::And(&[
                 GLM_TARGET,
+                F::Not(&F::Atom("emit.token_batch_tp", Cmp::Eq, TRUE)),
                 F::Not(&F::Atom("emit.glm_xr_res", Cmp::Eq, TRUE)),
                 F::Not(&F::Atom("emit.glm_xr_band", Cmp::Gt, Val::Nat(1))),
             ]),
@@ -304,6 +306,16 @@ const C_SEQ_PAR_PROJ: &[Constraint] = &[Constraint {
         &F::Atom("emit.glm_seq_par", Cmp::Eq, TRUE),
     ),
     site: "crates/devgen/src/mla.rs: PLOW_GLM_SEQ_PAR_PROJ extends PLOW_GLM_SEQ_PAR; set both",
+    check: Check::Load,
+}];
+
+const C_TOKEN_BATCH_TP: &[Constraint] = &[Constraint {
+    id: "token_batch_tp_excludes_seq_par",
+    formula: F::Not(&F::And(&[
+        F::Atom("emit.token_batch_tp", Cmp::Eq, TRUE),
+        F::Atom("emit.glm_seq_par", Cmp::Eq, TRUE),
+    ])),
+    site: "review log #63: token-batch bodies with sequence-parallel seams corrupted long-context prefill",
     check: Check::Load,
 }];
 
@@ -760,7 +772,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_moe_resident", Some("PLOW_GLM_MOE_RESIDENT"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_moe_shared_fold", Some("PLOW_GLM_MOE_SHARED_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_moe_shared_seed", Some("PLOW_GLM_MOE_SHARED_SEED"), Layer::Emit, Domain::Bool, OFF, MOE_SHARED_SEED_CANDIDATE).scoped(MOE_SHARED_SEED_SCOPE),
-    KnobSpec::new("emit.token_batch_tp", Some("PLOW_TOKEN_BATCH_TP"), Layer::Emit, Domain::Bool, OFF, TOKEN_BATCH_TP_CANDIDATE),
+    KnobSpec::new("emit.token_batch_tp", Some("PLOW_TOKEN_BATCH_TP"), Layer::Emit, Domain::Bool, OFF, TOKEN_BATCH_TP_PARKED).with(C_TOKEN_BATCH_TP),
     KnobSpec::new("emit.packed_sparse_pf", Some("PLOW_PACKED_SPARSE_PF"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_PACKED_SPARSE_PF),
     KnobSpec::new("emit.glm_index_tp", Some("PLOW_GLM_INDEX_TP"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_select_local", Some("PLOW_GLM_SELECT_LOCAL"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
@@ -1971,6 +1983,7 @@ mod tests {
         let cases: &[(&[(&str, Val)], &str)] = &[
             (
                 &[
+                    ("emit.token_batch_tp", FALSE),
                     ("emit.glm_seq_par", TRUE),
                     ("emit.glm_xr_band", Val::Nat(2)),
                 ],
@@ -1981,8 +1994,16 @@ mod tests {
                 "ofold_excludes_dsa_pf_and_fp8_kv",
             ),
             (
-                &[("emit.glm_seq_par_proj", TRUE), ("emit.glm_seq_par", FALSE)],
+                &[
+                    ("emit.token_batch_tp", FALSE),
+                    ("emit.glm_seq_par_proj", TRUE),
+                    ("emit.glm_seq_par", FALSE),
+                ],
                 "seq_par_proj_requires_seq_par",
+            ),
+            (
+                &[("emit.token_batch_tp", TRUE), ("emit.glm_seq_par", TRUE)],
+                "token_batch_tp_excludes_seq_par",
             ),
         ];
         for (extra, expect) in cases {
@@ -2072,7 +2093,7 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "{mismatches:#?}");
-        assert_eq!(lookup(&resolved, "emit.glm_seq_par"), TRUE);
+        assert_eq!(lookup(&resolved, "emit.glm_seq_par"), FALSE);
         assert_eq!(
             lookup(&resolved, "emit.glm_gemm_lt_pf_ext").to_json(),
             json!("o_proj,band,shared")
