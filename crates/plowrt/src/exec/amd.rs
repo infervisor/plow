@@ -3968,8 +3968,15 @@ impl ExpertNames {
 
     /// Is the scale an MX microscaling row (one E8M0 byte per 32 elements along
     /// K) rather than a block-fp8 `[N/128][K/128]` f32 grid?
+    ///
+    /// Keyed on the SCALE's spelling, and both MX spellings are listed. `.weight_scale` is the
+    /// compressed-tensors one that rides `.weight_packed`; `.scale` is DeepSeek-V4.1's, which
+    /// rides a plain `.weight`. Only `.weight_scale_inv` -- block-fp8's -- is not MX, and
+    /// enumerating the MX side rather than excluding that one means a spelling nobody has taught
+    /// this function is read as block-fp8 and caught by `check_expert_geometry`'s grid arithmetic,
+    /// rather than read as MX and accepted because the byte counts happened to line up.
     fn microscaled(&self) -> bool {
-        self.scale == ".weight_scale"
+        self.scale == ".weight_scale" || self.scale == ".scale"
     }
 }
 

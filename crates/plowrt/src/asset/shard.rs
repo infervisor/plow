@@ -237,6 +237,21 @@ pub fn shard_of(name: &str) -> Shard {
         "ffn.gate.",
         "attn.compressor.",
     ];
+    // The ROUTED experts: `ffn.experts.{e}.w{1,2,3}.{weight,scale}`. Same classes as the shared
+    // expert -- gate/up column-parallel over `moe_inter`, down reducing over it -- but the expert
+    // INDEX sits in the middle, so no fixed substring can name them. `ffn.shared_experts.` does not
+    // contain `ffn.experts.`, so the two families cannot be confused here.
+    //
+    // These reach `slice_for` from `bind_packed_experts`, one expert at a time, on the way into the
+    // packed slab -- not from the blob's tensor table, which does not declare them.
+    if let Some(rest) = name.split("ffn.experts.").nth(1) {
+        if rest.contains(".w1.") || rest.contains(".w3.") {
+            return Shard::Column;
+        }
+        if rest.contains(".w2.") {
+            return Shard::Row;
+        }
+    }
     if DSV41_REPLICATED.iter().any(|s| name.contains(s)) {
         return Shard::Replicated;
     }
@@ -1116,6 +1131,10 @@ mod mxfp4_shard_tests {
             "layers.0.ffn.shared_experts.w1.weight",
             "layers.0.ffn.shared_experts.w3.scale",
             "layers.2.attn.indexer.wq_b.weight",
+            // Routed experts, which carry the expert index mid-name.
+            "layers.0.ffn.experts.0.w1.weight",
+            "layers.0.ffn.experts.383.w1.scale",
+            "layers.0.ffn.experts.17.w3.weight",
         ] {
             assert_eq!(shard_of(n), Shard::Column, "{n}");
         }
@@ -1124,6 +1143,8 @@ mod mxfp4_shard_tests {
             "layers.0.attn.wo_b.scale",
             "layers.0.ffn.shared_experts.w2.weight",
             "layers.0.ffn.shared_experts.w2.scale",
+            "layers.0.ffn.experts.0.w2.weight",
+            "layers.0.ffn.experts.383.w2.scale",
         ] {
             assert_eq!(shard_of(n), Shard::Row, "{n}");
         }
