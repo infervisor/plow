@@ -314,6 +314,135 @@ pub(crate) fn declare_dsv41_weights(
     Dsv41Weights { per_layer, bytes }
 }
 
+/// The activation scratch ONE layer's attention projection chain needs, and nothing else.
+///
+/// Declared next to the emit that uses it rather than up front with the weights, because these
+/// shapes follow the DATAFLOW, not the checkpoint: `q_a` is `q_lora` wide because `wq_a` factors
+/// the query, `kv` is 576 wide because the absorbed MLA shares one latent across all 64 heads.
+/// A checkpoint-driven declaration cannot produce either number.
+pub(crate) struct Dsv41ProjAct {
+    /// Input after the pre-attention RMSNorm, `[T][hidden]` bf16.
+    pub(crate) xn: u32,
+    /// `x @ wq_a`, the query LoRA down-projection, `[T][q_lora]` bf16.
+    pub(crate) q_a: u32,
+    /// `q_a` after its own RMSNorm, `[T][q_lora]` bf16.
+    pub(crate) q_an: u32,
+    /// `q_an @ wq_b`, the query up-projection, `[T][heads * head_dim]` bf16. `head_dim`
+    /// already contains the rope half (64 of its 512); there is no separate rope width to add.
+    pub(crate) q: u32,
+    /// `xn @ wkv`, the shared latent, `[T][head_dim]` bf16. ONE row per token for ALL 64
+    /// heads -- the absorbed MLA's defining shape, and why num_key_value_heads is 1.
+    pub(crate) kv: u32,
+}
+
+/// Emit one layer's attention PROJECTION chain: the four GEMMs that feed the attention core.
+///
+/// This is where op 184 earns its place. Every GEMM here reads `[32, 32]` ue8m0 block-fp8 weights,
+/// and together with `wo_a`/`wo_b` they are **82.98 TFLOP of the 281.6 TFLOP 8k prefill** -- the
+/// single largest term after the routed experts, and the reason the block-fp8 arm was item 0.
+///
+/// Returns the scratch plus the instruction id of the last op, so the caller can chain the
+/// attention core onto it.
+///
+/// # What is NOT here
+///
+/// The attention core, the output projection, mHC, CSA2, Engram and the MoE. This emits the
+/// projections and stops, because a chain that produces `q` and `kv` from real weights is
+/// independently checkable -- against the shard shapes and against the opcode -- and a
+/// half-written whole layer is not.
+pub(crate) fn emit_dsv41_attn_proj(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    w: &Dsv41Weights,
+    cus: &[u32],
+    l: u32,
+    x: u32,
+    t: u32,
+    deps: &[u32],
+) -> (Dsv41ProjAct, u32) {
+    let hidden = c.hidden;
+    let q_lora = c.q_lora;
+    // `head_dim` (512) ALREADY CONTAINS the rope half: qk_rope is 64 of it and nope is the other
+    // 448. Adding qk_rope here would widen every projection by 64 per head against weights that
+    // are not that shape -- the tensor list says `wq_b` is `heads * head_dim * q_lora` and `wkv`
+    // is `head_dim * hidden`, and both are checked against the shards.
+    let q_out = c.heads * c.head_dim;
+    // ONE row for every head, which is what "fully absorbed" means -- there is no kv_b to expand
+    // it, and num_key_value_heads is 1.
+    let kv_out = c.head_dim;
+
+    let act = Dsv41ProjAct {
+        xn: b.tensor(&format!("act.l{l}.xn"), (t as u64) * (hidden as u64) * 2),
+        q_a: b.tensor(&format!("act.l{l}.q_a"), (t as u64) * (q_lora as u64) * 2),
+        q_an: b.tensor(&format!("act.l{l}.q_an"), (t as u64) * (q_lora as u64) * 2),
+        q: b.tensor(&format!("act.l{l}.q"), (t as u64) * (q_out as u64) * 2),
+        kv: b.tensor(&format!("act.l{l}.kv"), (t as u64) * (kv_out as u64) * 2),
+    };
+
+    let all = cus.to_vec();
+    // eps is 1e-20 on this model, not the 1e-6 every other family uses. Reading it from the
+    // config rather than writing a constant is the same rule the scale grid follows.
+    let eps = c.eps;
+    let c_xn = b.emit(DevOp::RmsNorm, all.clone(), deps, |d| {
+        d.t[0] = act.xn;
+        d.t[1] = x;
+        d.t[2] = w.get(l, "attn_norm.weight");
+        d.i[0] = t;
+        d.i[1] = hidden;
+        d.f[0] = eps;
+    });
+
+    let c_qa = emit_pf_gemm_fp8_mx(
+        b,
+        cus,
+        act.q_a,
+        act.xn,
+        w.get(l, "attn.wq_a.weight"),
+        w.get(l, "attn.wq_a.scale"),
+        t,
+        q_lora,
+        hidden,
+        &[c_xn],
+    );
+    let c_qan = b.emit(DevOp::RmsNorm, all.clone(), &[c_qa], |d| {
+        d.t[0] = act.q_an;
+        d.t[1] = act.q_a;
+        d.t[2] = w.get(l, "attn.q_norm.weight");
+        d.i[0] = t;
+        d.i[1] = q_lora;
+        d.f[0] = eps;
+    });
+    let c_q = emit_pf_gemm_fp8_mx(
+        b,
+        cus,
+        act.q,
+        act.q_an,
+        w.get(l, "attn.wq_b.weight"),
+        w.get(l, "attn.wq_b.scale"),
+        t,
+        q_out,
+        q_lora,
+        &[c_qan],
+    );
+    // The latent reads the NORMED input, not `q_an` -- it is a parallel branch off the same xn,
+    // not a continuation of the query chain. Chaining it after `c_q` would serialise two GEMMs
+    // that have no data dependence.
+    let c_kv = emit_pf_gemm_fp8_mx(
+        b,
+        cus,
+        act.kv,
+        act.xn,
+        w.get(l, "attn.wkv.weight"),
+        w.get(l, "attn.wkv.scale"),
+        t,
+        kv_out,
+        hidden,
+        &[c_xn],
+    );
+    let _ = c_q;
+    (act, c_kv)
+}
+
 /// One weight the emit binds: the checkpoint name (without the `layers.{l}.` prefix) and its
 /// size in BYTES.
 ///

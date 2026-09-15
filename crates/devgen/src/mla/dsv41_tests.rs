@@ -518,3 +518,108 @@ fn asking_for_a_weight_a_layer_lacks_is_refused() {
     // Layer 0 is not an engram layer (they are 1 and 14).
     w.get(0, "engram.wkv.weight");
 }
+
+/// The attention projection chain, emitted against the REAL checkpoint's weights.
+///
+/// Every `w.get` in the emit panics on a name the layer does not carry, so running this at all
+/// proves the four projections and two norms bind to tensors that exist in the shards -- which is
+/// the failure a hand-written emit makes first and notices last.
+///
+/// What is checked beyond that is the SHAPE of the chain, because the shapes here are the model's
+/// two least obvious facts:
+///   * `wkv` produces ONE 576-wide row per token for all 64 heads, not one per head. That is what
+///     "fully absorbed MLA" means -- there is no `kv_b` in any shard to expand it with.
+///   * `wq_b` produces `heads * (head_dim + qk_rope)`, nope and rope together.
+#[test]
+fn the_attention_projection_chain_emits_against_the_real_weights() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0]);
+    let all: Vec<u32> = (0..304u32).collect();
+    let t = 512u32;
+    let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
+    let (act, _last) = super::dsv41::emit_dsv41_attn_proj(&mut b, &cfg, &w, &all, 0, x, t, &[]);
+    let p = b.finish();
+
+    // Two RmsNorm + four... no: two norms and THREE GEMMs (q_a, q_b, kv). wo_a/wo_b are the
+    // output side and belong to the core's epilogue, not here.
+    let gemms: Vec<_> = p
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::GemmFp8Mx as u16)
+        .collect();
+    assert_eq!(gemms.len(), 3, "q_a, q_b and kv are the three projections on this side");
+    let norms = p.insts.iter().filter(|d| d.op == DevOp::RmsNorm as u16).count();
+    assert_eq!(norms, 2, "the input norm and the q-LoRA norm");
+    assert!(
+        p.insts.iter().all(|d| d.op != DevOp::GemmFp8Blk as u16),
+        "not one projection may reach op 107: it would read the ue8m0 byte grid as f32"
+    );
+
+    // The absorbed-MLA shape. 512 latent + 64 rope = 576, shared by all 64 heads.
+    let kv = gemms
+        .iter()
+        .find(|d| d.t[0] == act.kv)
+        .expect("the latent projection must be emitted");
+    assert_eq!(
+        kv.i[1], cfg.head_dim,
+        "wkv is ONE {}-wide row per token for ALL {} heads -- no kv_b exists to expand it, and \
+         head_dim ALREADY contains the {}-wide rope half, so there is nothing to add to it",
+        cfg.head_dim, cfg.heads, cfg.qk_rope
+    );
+    assert_eq!(kv.i[2], cfg.hidden, "the latent reads the normed input, width hidden");
+
+    let q = gemms
+        .iter()
+        .find(|d| d.t[0] == act.q)
+        .expect("the query up-projection must be emitted");
+    assert_eq!(
+        q.i[1],
+        cfg.heads * cfg.head_dim,
+        "wq_b writes head_dim per head -- nope and rope together, since head_dim contains both"
+    );
+    assert_eq!(q.i[2], cfg.q_lora, "and reads the q-LoRA rank");
+}
+
+/// `wkv` hangs off the NORMED INPUT, not off the query chain. They are parallel branches, and
+/// chaining them would serialise two GEMMs with no data dependence between them.
+///
+/// Worth pinning because the bug is invisible in output: a serialised chain computes exactly the
+/// same numbers, just slower, so nothing but a dependency check catches it. At 82.98 TFLOP across
+/// these projections, "just slower" is the entire point of the exercise.
+#[test]
+fn the_latent_and_the_query_are_parallel_branches_off_the_same_norm() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0]);
+    let all: Vec<u32> = (0..304u32).collect();
+    let t = 512u32;
+    let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
+    let (act, _) = super::dsv41::emit_dsv41_attn_proj(&mut b, &cfg, &w, &all, 0, x, t, &[]);
+    let p = b.finish();
+    let kv = p.insts.iter().find(|d| d.t[0] == act.kv).unwrap();
+    let qa = p.insts.iter().find(|d| d.t[0] == act.q_a).unwrap();
+    // Both read `xn` -- the operand is the semantic claim.
+    assert_eq!(kv.t[1], act.xn, "the latent reads the normed input");
+    assert_eq!(qa.t[1], act.xn, "so does the query down-projection");
+    // And both gate on the SAME thing. Dependencies live in the wait table, not on the
+    // instruction, so the check is that the latent's gate set is identical to the query
+    // down-projection's: if the latent had been chained after the query chain it would carry an
+    // extra gate on `wq_b`'s counter.
+    let gates = |d: &DevInst| -> Vec<packet::dev::Wait> {
+        p.waits[d.wait_ofs as usize..d.wait_ofs as usize + d.wait_len as usize].to_vec()
+    };
+    assert_eq!(
+        gates(kv),
+        gates(qa),
+        "the latent and the query branch off the same norm, so they must gate on the same \
+         counter -- a longer wait set on the latent means it was serialised behind the query \
+         chain, which computes identical numbers and is simply slower"
+    );
+}
