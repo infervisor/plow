@@ -1642,6 +1642,61 @@ This is a live defect for RAGGED SEAMS generally, not only for row-band: any two
 a `@band{t}` family could desynchronise the same way. Row-band is simply the first pair where one
 sibling never goes ragged and so never re-derives the binding for itself.
 
+## The packet counter protocol is batchable but off the critical path in BOTH regimes; decode's problem is 1293 dispatches per token (2026-09-15, job `ctrpipe-decode`)
+
+**The protocol.** Every AQL dispatch pays, on the host, in `device/hsa.rs` `dispatch`: a write-index
+reserve (or `chain_next` fetch_add inside a prepared chain); the kernarg write, and with the
+default `PLOW_AMD_KERNARG_VRAM=1` a `publish_device_kernarg` — sfence, write_volatile, mfence, and
+an **uncached BAR read back**; a 60-byte packet memset plus field writes;
+**`hsa_signal_add_screlease(done_signal, 1)`, one atomic per packet** through an indirect call into
+ROCr; a release store of header|setup; and a doorbell store unless inside a chain. `done_signal` is
+a COUNTING signal created at `hsa.rs:1174` — N dispatches raise it by N, the device decrements each
+on completion, and `synchronize()` waits for `< 1`. That counter is the "packet counter protocol".
+
+**It is trivially batchable, and the mechanism already exists.** `begin_dispatch_chain(packets)`
+reserves all N slots with ONE `hsa_queue_add_write_index_screlease`, and `commit_dispatch_chain`
+rings ONE doorbell — so no packet in a prepared chain is visible to the packet processor until the
+commit. A single `hsa_signal_add_screlease(done_signal, N)` at reservation is therefore exactly
+equivalent to N `add(1)`s and strictly better ordered: the count is raised before any header is
+published rather than interleaved with them. It is roughly a ten-line change, with the only care
+needed on the abort path (a chain that commits fewer packets than reserved must subtract the
+remainder).
+
+**And it would buy essentially nothing, because the host is not the bottleneck in either regime.**
+Prefill was already settled: the host finishes its enqueue 39.9 ms in while the GPU has 474 ms of
+work queued, 12x ahead. Decode is the regime where it could plausibly have mattered, and it does
+not. `PLOW_TICK_LOG=1` at isl8192 C1, 1017 steady-state ticks:
+
+| quantity | median |
+|---|---|
+| tick total | 40.035 ms |
+| decode portion | 40.032 ms |
+| **other (host)** | **0.003 ms** |
+| dispatches per tick, rank 0 | **1293** |
+| in-flight AFTER enqueue | **632** |
+| in-flight after re-arm | 589 |
+
+`obs/tick.rs` states the reading rule itself: "large = the GPU is behind the host, so the enqueue
+and re-arm overlap it; near 0 = the GPU waited on the host." At 632 of 1293 — 49% — the host
+finishes with **632 dispatches of runway still queued**. It is ahead, then waits. Shaving host
+enqueue time lengthens the runway; it does not shorten the tick. The counter adds themselves are
+1293 x 8 = 10344 atomics per tick, perhaps 0.5-1.0 ms of host time, entirely hidden behind 40 ms of
+GPU work. Host work outside the decode call is 3 microseconds.
+
+**The number that matters is 1293.** That is dispatches per rank PER DECODE TOKEN — about 16.6 per
+layer over 78 layers — and the tick is 40.03 ms, so **31 microseconds per dispatch**. At batch 1 the
+kernels are tiny, so a substantial share of that is per-dispatch launch and packet-processor
+latency rather than arithmetic. Goal 2 wants 40.5 ms down to 25.
+
+So the decode lever is **the dispatch COUNT, not the cost of issuing one**: fusing ops so the tick
+emits fewer, larger dispatches, or using the graph/phase-replay path
+(`graph_phase_replay` / `begin_graph_phase_replay`, already in `amd_tp.rs`) so the packets are not
+rebuilt per tick at all. Making each dispatch cheaper to ISSUE is measurably not the problem.
+
+**Recommendation on the counter batch itself:** implement it only as tidiness or if a future
+regime turns host-bound, not as a latency lever. It has no measured effect available to it on
+either path today.
+
 ## The 8192 chunk has no dominant cost, and the two open prefill projections are stale by a large factor (2026-09-15, job `segattrib-8192`)
 
 With every non-GPU route to the remaining 22 ms closed, the question became which part of the
