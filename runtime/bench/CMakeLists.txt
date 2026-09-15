@@ -199,6 +199,37 @@ if(PLOW_ROCM)
         DEPENDS gemma12_gemv_glu_decode_gfx942_elf
         VERBATIM)
 
+    set(GEMMA_FLASH_NATIVE_ELF
+        ${CMAKE_CURRENT_BINARY_DIR}/gemma_flash_native_prefill_gfx942.elf)
+    add_custom_command(
+        OUTPUT ${GEMMA_FLASH_NATIVE_ELF}
+        COMMAND "${PLOW_MLA_HIPCC}" --offload-arch=gfx942 -O3 -w -std=c++17 --genco
+                -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH=1 -DPLOW_WG_WAVES=4
+                -DFA_DC=256 -DFA_DBUF=1 -DGM_BM=64 -DGM_BN=128
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                ${CMAKE_CURRENT_SOURCE_DIR}/amd/gemma_flash_native_prefill_gfx942.hip
+                -o ${GEMMA_FLASH_NATIVE_ELF}.co
+        COMMAND "${PLOW_MLA_BUNDLER}" --unbundle --type=o
+                --targets=hipv4-amdgcn-amd-amdhsa--gfx942
+                --input=${GEMMA_FLASH_NATIVE_ELF}.co --output=${GEMMA_FLASH_NATIVE_ELF}
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${GEMMA_FLASH_NATIVE_ELF}.co
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/amd/gemma_flash_native_prefill_gfx942.hip
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_gfx942.h
+        VERBATIM)
+    add_custom_target(gemma_flash_native_prefill_gfx942_elf DEPENDS ${GEMMA_FLASH_NATIVE_ELF})
+    add_custom_target(gemma_flash_native_prefill_gfx942_audit
+        COMMAND ${PLOW_GEMMA12_BENCH_PYTHON}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/asm_audit.py
+                --expect
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tests/gemma_flash_native_prefill_gfx942_expect.json
+                ${GEMMA_FLASH_NATIVE_ELF}
+        DEPENDS gemma_flash_native_prefill_gfx942_elf
+        VERBATIM)
+
     set(MLA_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/mla_fixture.bin)
     set(MLA_REF ${CMAKE_CURRENT_BINARY_DIR}/mla_ref)
     find_program(PLOW_BENCH_RUSTC rustc REQUIRED)

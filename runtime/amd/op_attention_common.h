@@ -227,6 +227,10 @@
 #define FA_QCH_D512 16
 #endif
 #endif
+/* A flat token-batch span walk keeps additional per-request bounds live. */
+#ifndef FA_QCH_D256_TB
+#define FA_QCH_D256_TB 16
+#endif
 /* Direct-to-LDS K/V staging (see [LDS-DMA-4B]). Default OFF: the register path is what every
  * shipped object is measured on. */
 #ifndef FA_LDS_DMA
@@ -454,7 +458,11 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
          *     waves_per_eu(2,2). QCH=2 (still | 8) trims 8 VGPR to land at occ=2; the only cost is
          *     re-reading the L2-resident Q tile twice as often, negligible at D=128. D>=256 keeps 4. */
         constexpr int QCH = (PLOW_WAVES <= 4)
-                                ? (FA_DBUF ? (D == 512 ? FA_QCH_D512 : (NK < 16 ? NK : 16)) : NK)
+                                ? (FA_DBUF
+                                       ? (D == 512 ? FA_QCH_D512
+                                                   : (D == 256 && TB ? FA_QCH_D256_TB
+                                                                    : (NK < 16 ? NK : 16)))
+                                       : NK)
                                 : (NK <= 8 ? 2 : 4);
         constexpr bool QHOIST = (QCH == NK);
         static_assert(NK % QCH == 0, "Q fragment chunk must divide the k-steps");
