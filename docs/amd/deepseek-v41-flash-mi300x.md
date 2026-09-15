@@ -2064,6 +2064,44 @@ and correct rope tables -- and the honest blocker on signing any of it off is th
 parity harness: `rung_run` feeds a seeded synthetic, so "finite and stable" is the only bar
 available, and it is not one this work can be checked against.
 
+### 12.11 There IS a parity harness, and §12.10's spec now passes it
+
+I said four times that nothing here could be checked against a reference, because serving V4.1
+needs vLLM >= 0.30 and this box has no container runtime. That was true about vLLM and wrong about
+parity. The tree's own method for this is an oracle on tiny synthetic shapes -- it is how
+`op_hyperconn.h` was signed off (*"Verified against a numerical oracle (tiny synthetic shapes,
+hand-checkable) BEFORE this file was written"*) -- and that needs torch, not vLLM.
+
+The installed torch is a ROCm 6.3 build whose `libamdhip64.so.6` is missing, and `/opt/rocm-6.3.1`
+turns out to be a hipblaslt-only stub. But a CSA2 oracle needs no GPU at all: `pip install torch
+--index-url .../whl/cpu` into `/workspace/oracle-venv/site` gives a working CPU torch 2.14, and the
+reference module (`inference/model.py`) is plain PyTorch with no tilelang on the paths that matter.
+
+`scripts/dsv41_csa2_oracle.py` runs the reference `Compressor` against a transcription of what
+op 180 computes, and turns §12.10's three READ claims into measured ones:
+
+| check | result |
+|---|---|
+| op 180 with `ape = 0`, `coff = 1` vs the reference compressor | **max err 0.000e+00** |
+| the same with a nonzero `ape` | max err 1.65 |
+| ratio-1 (layer 20) as a plain projection + norm | **max err 0.000e+00** |
+| fake-quant with an E4M3 scale vs a power-of-two scale, both fp4 at block 16 | max err 0.875, **15.3% of latent amax** |
+
+So: op 180's pooling, its per-channel slot softmax and its post-norm ARE V4.1's compressor once
+`ape` is omitted and the overlap transform is off -- exactly, not approximately. `ape` is not
+zero-equivalent, so it has to be left out rather than passed as zeros-by-accident. And the scale
+format really is the one kernel difference, worth 15% of the latent's amax rather than a rounding
+detail that would wash out.
+
+That also fixes the tolerance question a hardware test has to answer: the epilogue is lossy
+(fake-quant vs the unquantized latent is 0.75 here), so a test asserts against the QUANTIZED
+reference, not the pre-quant latent.
+
+**What this changes.** "Nothing can be signed off on numerics" was the stated reason for not
+building the emit. It is no longer true for the compressor, and the same harness extends to the
+indexer and the gather -- both are plain PyTorch in the reference. The bar now exists; what remains
+is the work in §12.10 against it.
+
 ### 12.2 What is still not demonstrated
 
   * ONE layer, not 40. The whole-model emit is still blocked on the subsystems
