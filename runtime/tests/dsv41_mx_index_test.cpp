@@ -19,10 +19,14 @@
 //   upper j-groups address rows past ceil(N/32). Those fragments own no live column and their
 //   output is discarded at the guarded store, but the promotion READS the scale byte first.
 //
-//   DeepSeek-V4.1's `attn.wkv` is what makes that real: N = 576 = 512 latent + 64 rope is not a
-//   multiple of 128, so the last tile addresses rows 18 and 19 of an 18-row grid -- 320 bytes
-//   past the end. `op_gemm_common.h` now clamps the row, exactly as the K axis was already
-//   clamped, and this test models the clamp and pins both properties.
+//   CORRECTION. This test was written claiming DeepSeek-V4.1's `attn.wkv` is N = 576 = 512 latent
+//   + 64 rope. It is not: the shard is [512, 5120], read straight from the safetensors header, and
+//   576 was devgen's own wrong declaration at the time (`head_dim + qk_rope`, before head_dim was
+//   established to already CONTAIN the rope). No V4.1 dense projection has an N that misses 128.
+//   So the overread this pins is not reachable from this checkpoint today -- it stays because the
+//   guard is a property of the [32,32] arm and not of one model, and because the N=130 and N=33
+//   cases below exercise it directly. `op_gemm_common.h` clamps the row, exactly as the K axis was
+//   already clamped, and this test models the clamp and pins both properties.
 //
 // Worth noting why the GPU test did not stand in for this: it already covers N=576, N=130 and
 // N=33, so it exercised the overread every run. hipMalloc pads to page granularity, so 320 bytes
@@ -106,7 +110,10 @@ int main() {
         printf("-- wave grid WN=%d --\n", WN);
         mx_case("attn.wq_a  [1280,5120]", 1280, 5120, WN);
         mx_case("attn.wq_b  [4608,1280]", 4608, 1280, WN);
-        mx_case("attn.wkv   [ 576,5120]", 576, 5120, WN);
+        mx_case("attn.wkv   [ 512,5120]", 512, 5120, WN);
+        /* N=576 is NOT a V4.1 shape (see the CORRECTION above); kept purely as a ragged case,
+         * because 576 is the smallest interesting N that misses 128 while exceeding one BN tile. */
+        mx_case("ragged N=576            ", 576, 5120, WN);
         mx_case("attn.wo_a  [8192,4096]", 8192, 4096, WN);
         mx_case("attn.wo_b  [5120,8192]", 5120, 8192, WN);
         mx_case("shared_exp [2304,5120]", 2304, 5120, WN);

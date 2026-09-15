@@ -5050,7 +5050,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                  (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
                                  (const int*)TEN(6), in->i[0], in->i[1], in->i[2], in->i[3],
                                  in->i[4], in->i[5], in->fj[0].f, in->fj[1].f, slice, nblk,
-                                 in->i[6]);
+                                 in->i[6], in->i[7]);
             break;
         case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
             d_qwen_gdn_conv_prefill((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),

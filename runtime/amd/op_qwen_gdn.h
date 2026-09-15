@@ -303,7 +303,7 @@ __device__ void d_qwen_headnorm_rope_t(bf16* out, const bf16* in, const bf16* ga
                                        const int* active, unsigned heads, unsigned dim,
                                        unsigned rotary, unsigned batch, unsigned context,
                                        unsigned normalize, float eps, float offset, unsigned slice,
-                                       unsigned nblk, unsigned prefill) {
+                                       unsigned nblk, unsigned prefill, unsigned rot_offset = 0) {
     const unsigned lane = threadIdx.x & (PLOW_WAVE - 1u), wave = threadIdx.x >> 6;
     const unsigned waves = blockDim.x >> 6;
     for (unsigned row = slice * waves + wave; row < batch * heads; row += nblk * waves) {
@@ -330,15 +330,27 @@ __device__ void d_qwen_headnorm_rope_t(bf16* out, const bf16* in, const bf16* ga
         }
         if (rotary) {
             const unsigned half = rotary >> 1;
+            /* WHICH register holds the rotary section. The row is lane-strided -- element
+             * `lane + j*PLOW_WAVE` lives in `x[j]` -- so a rotary range starting at `rot_offset`
+             * is register `rot_offset / PLOW_WAVE`, with the SAME lane layout register 0 has.
+             * That is what makes an interior range cost an index and not a rewrite.
+             *
+             * `rot_offset = 0` is the prefix form and the only one Qwen emits, so `rreg` is 0 and
+             * every existing packet is byte-identical. DeepSeek-V4.1 needs the SUFFIX: it rotates
+             * `q[..., -64:]` of a 512-wide head (`inference/model.py:772`), which is elements
+             * [448, 512) = register 7. The emitter is responsible for `rot_offset % PLOW_WAVE == 0`
+             * and `rotary <= PLOW_WAVE`; both are checked packet-side, where a message is possible.
+             */
+            const unsigned rreg = rot_offset / PLOW_WAVE;
             /* Unconditional: a shuffle under divergence leaves the inactive lanes' contribution
              * undefined, so every lane exchanges and only the rotary section applies the result. */
-            const float partner = __shfl_xor(x[0], half, PLOW_WAVE);
+            const float partner = __shfl_xor(x[rreg], half, PLOW_WAVE);
             if (lane < rotary) {
                 /* vLLM stores its Qwen rotary cache in the model BF16 dtype; the round is load
                  * bearing — the tables are f32 in HBM and the reference reads them as bf16. */
                 const float c = bf2f(f2bf(cos[(size_t)pos * half + (lane & (half - 1u))]));
                 const float s = bf2f(f2bf(sin[(size_t)pos * half + (lane & (half - 1u))]));
-                x[0] = lane < half ? x[0] * c - partner * s : x[0] * c + partner * s;
+                x[rreg] = lane < half ? x[rreg] * c - partner * s : x[rreg] * c + partner * s;
             }
         }
         const size_t dest = context
@@ -355,21 +367,29 @@ __device__ void d_qwen_headnorm_rope(bf16* out, const bf16* in, const bf16* gamm
                                      const int* active, unsigned heads, unsigned dim,
                                      unsigned rotary, unsigned batch, unsigned context,
                                      unsigned normalize, float eps, float offset, unsigned slice,
-                                     unsigned nblk, unsigned prefill) {
-    /* `rotary <= PLOW_WAVE` keeps the rotated section inside register 0, which is what makes the
-     * partner a single `lane ^ (rotary/2)` shuffle. Qwen3.5 uses rotary = 64 on a 256-wide head. */
-    if ((dim % PLOW_WAVE) || (rotary && (rotary > PLOW_WAVE || (rotary & (rotary - 1u))))) {
+                                     unsigned nblk, unsigned prefill, unsigned rot_offset = 0) {
+    /* `rotary <= PLOW_WAVE` keeps the rotated section inside ONE register, which is what makes the
+     * partner a single `lane ^ (rotary/2)` shuffle. Qwen3.5 uses rotary = 64 on a 256-wide head.
+     *
+     * `rot_offset` picks WHICH register, so it must land on a register boundary and the rotated
+     * range must stay inside the row. 0 is the prefix form and every Qwen packet emits it.
+     * DeepSeek-V4.1 emits 448 on a 512-wide head: the suffix rope of `q[..., -64:]`. */
+    if ((dim % PLOW_WAVE) || (rotary && (rotary > PLOW_WAVE || (rotary & (rotary - 1u)))) ||
+        (rot_offset % PLOW_WAVE) || (rot_offset + rotary > dim)) {
         if (threadIdx.x == 0) __builtin_trap();
         return;
     }
 #define PLOW_QWEN_HNR_CALL(PL_)                                                                    \
     d_qwen_headnorm_rope_t<PL_>(out, in, gamma, cos, sin, positions, active, heads, dim, rotary,   \
-                                batch, context, normalize, eps, offset, slice, nblk, prefill)
+                                batch, context, normalize, eps, offset, slice, nblk, prefill,      \
+                                rot_offset)
     switch (dim) {
         case 64: PLOW_QWEN_HNR_CALL(1); break;
         case 128: PLOW_QWEN_HNR_CALL(2); break;
         case 192: PLOW_QWEN_HNR_CALL(3); break;
         case 256: PLOW_QWEN_HNR_CALL(4); break;
+        /* DeepSeek-V4.1's head is 512 wide (448 nope + 64 rope, both inside `head_dim`). */
+        case 512: PLOW_QWEN_HNR_CALL(8); break;
         default:
             if (threadIdx.x == 0) __builtin_trap();
             return;

@@ -1754,7 +1754,13 @@ pub enum DevOp {
     QwenRmsNorm = 141,
     /// D=256; rotary is 0 or 64. BF16 x[rows,H,D] and optional gamma[D]. FP32 cos/sin tables are required when rotary is nonzero and round to BF16 before rotation; normalization also rounds to BF16 first. Optional I32 pos[rows] defaults to zero; optional I32 active[rows] masks writes. ctx=0 writes contiguous output; otherwise writes KV[slot,H,ctx,D]. prefill=1 treats rows as query tokens and writes the single selected KV slot, while decode uses one slot per row.
     ///
-    /// `t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos? t6=active?` · `i0=H i1=D i2=rotary i3=rows i4=ctx i5=normalize i6=prefill` · `f0=eps f1=gamma_offset`.
+    /// `t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos? t6=active?` · `i0=H i1=D i2=rotary i3=rows i4=ctx i5=normalize i6=prefill i7=rot_offset` · `f0=eps f1=gamma_offset`.
+    ///
+    /// `i7` is where the rotated range STARTS, default 0. The row is lane-strided, so the range
+    /// must begin on a `PLOW_WAVE` boundary and `rotary` must fit one register; the kernel traps
+    /// otherwise. Qwen rotates the prefix and emits 0, which keeps every existing packet
+    /// byte-identical. DeepSeek-V4.1 rotates the SUFFIX -- `q[..., -64:]` of a 512-wide head --
+    /// and emits 448.
     QwenHeadNormRope = 142,
     /// BF16 causal convolution plus SiLU for exactly T valid tokens: x/out[T,C], weight[C,W], mutable oldest-first history[1,C,W-1]. Updates history after the chunk.
     ///

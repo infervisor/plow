@@ -128,7 +128,7 @@ const DOC: &[S] = &[
     S { op: DevOp::QwenQGateSplit, t: &["Q", "gate", "packed", "active?"], i: &["H", "D", "B"], f: &[], j: &[] },
     S { op: DevOp::QwenSigmoidGate, t: &["out", "x", "gate", "active?"], i: &["width", "B"], f: &[], j: &[] },
     S { op: DevOp::QwenRmsNorm, t: &["out", "x", "gamma", "active?"], i: &["width", "B"], f: &["eps", "gamma_offset"], j: &[] },
-    S { op: DevOp::QwenHeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos?", "active?"], i: &["H", "D", "rotary", "rows", "ctx", "normalize", "prefill"], f: &["eps", "gamma_offset"], j: &[] },
+    S { op: DevOp::QwenHeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos?", "active?"], i: &["H", "D", "rotary", "rows", "ctx", "normalize", "prefill", "rot_offset"], f: &["eps", "gamma_offset"], j: &[] },
     S { op: DevOp::QwenGdnConvPrefill, t: &["out", "x", "weight", "history"], i: &["C", "W", "T"], f: &[], j: &[] },
     S { op: DevOp::QwenGdnQkvPrep, t: &["Q", "K", "V", "packed"], i: &["HK", "HV", "K", "V", "T"], f: &["l2_eps"], j: &[] },
     S { op: DevOp::QwenGdnGatePrep, t: &["alpha", "beta", "a", "b", "A_log", "dt_bias"], i: &["HV", "T"], f: &[], j: &[] },
