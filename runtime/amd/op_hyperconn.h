@@ -332,6 +332,32 @@ __device__ void d_hyperconn_post(bf16* __restrict__ new_residual, const bf16* __
         const float* pm = post_mix + (size_t)t * n;
         const float* cm = comb_mix + (size_t)t * n * n;
         bf16* orow = new_residual + (size_t)t * n * hidden;
+        /* HOIST THE n RESIDUAL READS OUT OF THE j LOOP. Each output stream j sums over all n
+         * input streams, so reading `rrow[i][d]` inside the j loop reads every residual element
+         * n TIMES -- 16 loads to produce 4 outputs at n=4. At T=8192 that is 1.34 GB of reads
+         * against a 335 MB tensor, and this op measured 3477 us where its traffic wants ~126 us.
+         *
+         * Needs the literal 4 to keep `rv` in registers: with a runtime `n` the loops do not
+         * unroll and the array lands in scratch, which is worse than the re-reads. Same
+         * `T >= nblk` gate as the pre op, for the same reason -- the decode path keeps the
+         * shipped loop, which is the arm the gfx950 oracle signed off.
+         *
+         * BIT-IDENTICAL: the same products accumulated in the same i order. */
+        if (n == 4u && T >= nblk) {
+            constexpr unsigned NC = 4u;
+            for (unsigned d = threadIdx.x; d < hidden; d += PLOW_THREADS) {
+                const float xv = bf2f(xrow[d]);
+                float rv[NC];
+                for (unsigned i = 0; i < NC; i++) rv[i] = bf2f(rrow[(size_t)i * hidden + d]);
+                for (unsigned j = 0; j < NC; j++) {
+                    float acc = 0.0f;
+                    for (unsigned i = 0; i < NC; i++) acc += cm[i * NC + j] * rv[i];
+                    acc += pm[j] * xv;
+                    orow[(size_t)j * hidden + d] = f2bf(acc);
+                }
+            }
+            continue;
+        }
         for (unsigned d = threadIdx.x; d < hidden; d += PLOW_THREADS) {
             const float xv = bf2f(xrow[d]);
             for (unsigned j = 0; j < n; j++) {
