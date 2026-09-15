@@ -1271,6 +1271,12 @@ fn note_arrival(
     }
 }
 
+fn reserved_kv_rows(prompt_tokens: usize, max_tokens: usize, generated_tokens: usize) -> u64 {
+    prompt_tokens
+        .saturating_add(max_tokens.max(1))
+        .saturating_sub(generated_tokens) as u64
+}
+
 /// Place a job into the first idle slot, asking the arena for the KV
 /// footprint upfront. Under temporary KV pressure the request remains queued without occupying
 /// a slot. The prompt arrives pre-tokenized (see [`Job::prompt_ids`]).
@@ -1333,7 +1339,7 @@ fn admit_into(
         return None;
     };
 
-    let seq_upper = (job.prompt_ids.len() + job.gen.max_tokens.max(1)) as i64;
+    let seq_upper = reserved_kv_rows(job.prompt_ids.len(), job.gen.max_tokens, 0) as i64;
 
     // KV CAPACITY, charged over every live slot and not just the admission window.
     if let Some(budget) = kv_budget {
@@ -1362,7 +1368,7 @@ fn admit_into(
         let committed = slots
             .iter()
             .flatten()
-            .map(|s| (s.prompt_ids.len() + s.gen.max_tokens.max(1)) as u64);
+            .map(|s| reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()));
         if !budget.fits_requests(committed.chain(std::iter::once(want))) {
             tracing::debug!(
                 want,
@@ -4808,6 +4814,14 @@ mod tests {
             poisoned.update(420.0);
         }
         assert!(poisoned.get() > 250.0, "control: unfiltered EWMA sheds");
+    }
+
+    #[test]
+    fn kv_reservation_releases_generated_output_credit() {
+        assert_eq!(reserved_kv_rows(70_000, 700, 0), 70_700);
+        assert_eq!(reserved_kv_rows(70_000, 700, 512), 70_188);
+        assert_eq!(reserved_kv_rows(4, 0, 0), 5);
+        assert_eq!(reserved_kv_rows(4, 0, usize::MAX), 0);
     }
 
     #[test]
