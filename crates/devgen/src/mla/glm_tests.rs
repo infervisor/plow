@@ -69,6 +69,51 @@ fn router_flag_bits_do_not_collide() {
 }
 
 #[test]
+fn glm53_fp8_tensor_bytes_match_runtime_dtype_contracts() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[("PLOW_GLM_FP8_KV", "1")]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    c.index_kpool = 4;
+    c.indexer_full = vec![true, false, false, false];
+    let (ctx, rows, slots) = (70_000u32, 8192u32, 3u32);
+    let mut b = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut b, &c, ctx, &[0, 3], rows, slots, MoeEnc::Fp8Blk);
+    let tensors = b.tensors();
+    let bytes = |h: u32| tensors[h as usize].bytes;
+
+    assert_eq!(bytes(n.xn2), rows as u64 * c.hidden as u64 * BF16);
+    assert_eq!(bytes(n.rlogit), rows as u64 * c.n_exp as u64 * F32);
+    assert_eq!(bytes(n.lw[1].wr), c.n_exp as u64 * c.hidden as u64 * BF16);
+    assert_eq!(bytes(n.lw[1].bias), c.n_exp as u64 * F32);
+
+    assert_eq!(
+        bytes(n.ckv[0]),
+        slots as u64 * ctx as u64 * c.kv_lora as u64
+    );
+    assert_eq!(
+        bytes(n.krot[0]),
+        slots as u64 * ctx as u64 * c.qk_rope as u64 * BF16
+    );
+    assert_eq!(bytes(n.kv_scale[0]), slots as u64 * ctx as u64 * F32);
+    let pools = ctx.div_ceil(c.index_kpool);
+    assert_eq!(
+        bytes(n.kidx_pool[0]),
+        slots as u64 * pools as u64 * c.index_dim as u64
+    );
+    assert_eq!(
+        bytes(n.kidx_pool_scale[0]),
+        slots as u64 * pools as u64 * F32
+    );
+    for h in [n.kidx_ring[0], n.kidx_ring_score[0]] {
+        assert_eq!(
+            bytes(h),
+            slots as u64 * c.index_kpool as u64 * c.index_dim as u64 * BF16
+        );
+    }
+}
+
+#[test]
 fn native_prefill_scratch_is_sized_for_emitted_fallbacks() {
     let _guard = crate::test_env::env_guard();
     let _env = crate::test_env::EnvScope::set(&[
