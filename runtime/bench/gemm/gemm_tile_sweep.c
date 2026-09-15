@@ -80,6 +80,12 @@ static const struct tile_spec EXACT_TILES[] = {
     {"gemm_g12_qs_c2_exact", 128, 256, 64, 4096, 3840},
     {"gemm_g12_os_c2_exact", 128, 256, 64, 3840, 4096},
     {"gemm_g12_og_c2_exact", 128, 256, 64, 3840, 8192},
+    {"gemm_g31_os_c2_exact", 128, 256, 64, 5376, 8192},
+    {"gemm_g31_og_c2_exact", 128, 256, 64, 5376, 16384},
+    {"gemm_g31_os_c6_exact", 320, 128, 64, 5376, 8192},
+    {"gemm_g31_og_c6_exact", 320, 128, 64, 5376, 16384},
+    {"gemm_g31_os_c5_exact", 192, 256, 64, 5376, 8192},
+    {"gemm_g31_og_c5_exact", 192, 256, 64, 5376, 16384},
 };
 #define NEXACT_TILES ((int)(sizeof EXACT_TILES / sizeof EXACT_TILES[0]))
 
@@ -107,6 +113,12 @@ static const struct tile_spec F8EXACT_TILES[] = {
     {"gemm_g12_qs_fp8_c2_exact", 128, 256, 128, 4096, 3840},
     {"gemm_g12_os_fp8_c2_exact", 128, 256, 128, 3840, 4096},
     {"gemm_g12_og_fp8_c2_exact", 128, 256, 128, 3840, 8192},
+    {"gemm_g31_os_fp8_c2_exact", 128, 256, 128, 5376, 8192},
+    {"gemm_g31_og_fp8_c2_exact", 128, 256, 128, 5376, 16384},
+    {"gemm_g31_os_fp8_c3_exact", 128, 128, 128, 5376, 8192},
+    {"gemm_g31_og_fp8_c3_exact", 128, 128, 128, 5376, 16384},
+    {"gemm_g31_os_fp8_c5_exact", 192, 256, 128, 5376, 8192},
+    {"gemm_g31_og_fp8_c5_exact", 192, 256, 128, 5376, 16384},
 };
 #define NF8EXACT_TILES ((int)(sizeof F8EXACT_TILES / sizeof F8EXACT_TILES[0]))
 

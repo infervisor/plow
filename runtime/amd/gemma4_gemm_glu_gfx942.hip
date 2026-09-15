@@ -18,6 +18,11 @@ extern "C" __device__ unsigned plow_gemma4_down_fp8_128x256x128_1 = 1;
 extern "C" __device__ unsigned plow_gemma4_down_fp8_128x128x128_1 = 1;
 extern "C" __device__ unsigned plow_gemma4_down_fp8_192x256x128_1 = 1;
 extern "C" __device__ unsigned plow_gemma4_output_128x256x64_1 = 1;
+extern "C" __device__ unsigned plow_gemma4_output_192x256x64_1 = 1;
+extern "C" __device__ unsigned plow_gemma4_output_320x128x64_1 = 1;
+extern "C" __device__ unsigned plow_gemma4_output_fp8_128x256x128_1 = 1;
+extern "C" __device__ unsigned plow_gemma4_output_fp8_128x128x128_1 = 1;
+extern "C" __device__ unsigned plow_gemma4_output_fp8_192x256x128_1 = 1;
 
 extern "C" __global__ __attribute__((flatten))
 __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void plow_gemma4_gemm_glu_c2_gfx942(
@@ -79,6 +84,9 @@ GEMMA4_DOWN_ENTRY(plow_gemma4_31b_down_c2_gfx942, 128, 256, 5376, 21504)
 GEMMA4_DOWN_ENTRY(plow_gemma4_31b_down_c5_gfx942, 192, 256, 5376, 21504)
 GEMMA4_DOWN_ENTRY(plow_gemma4_12b_output_s_c2_gfx942, 128, 256, 3840, 4096)
 GEMMA4_DOWN_ENTRY(plow_gemma4_12b_output_g_c2_gfx942, 128, 256, 3840, 8192)
+GEMMA4_DOWN_ENTRY(plow_gemma4_31b_output_s_c5_gfx942, 192, 256, 5376, 8192)
+GEMMA4_DOWN_ENTRY(plow_gemma4_31b_output_g_c5_gfx942, 192, 256, 5376, 16384)
+GEMMA4_DOWN_ENTRY(plow_gemma4_31b_output_g_c6_gfx942, 320, 128, 5376, 16384)
 
 #define GEMMA4_DOWN_FP8_ENTRY(NAME, BM, BN, N, K)                                \
     extern "C" __global__ __attribute__((flatten))                              \
@@ -96,3 +104,9 @@ GEMMA4_DOWN_FP8_ENTRY(plow_gemma4_12b_down_fp8_c5_gfx942, 192, 256, 3840, 15360)
 GEMMA4_DOWN_FP8_ENTRY(plow_gemma4_31b_down_fp8_c2_gfx942, 128, 256, 5376, 21504)
 GEMMA4_DOWN_FP8_ENTRY(plow_gemma4_31b_down_fp8_c3_gfx942, 128, 128, 5376, 21504)
 GEMMA4_DOWN_FP8_ENTRY(plow_gemma4_31b_down_fp8_c5_gfx942, 192, 256, 5376, 21504)
+GEMMA4_DOWN_FP8_ENTRY(plow_gemma4_31b_output_s_fp8_c2_gfx942, 128, 256, 5376, 8192)
+GEMMA4_DOWN_FP8_ENTRY(plow_gemma4_31b_output_s_fp8_c3_gfx942, 128, 128, 5376, 8192)
+GEMMA4_DOWN_FP8_ENTRY(plow_gemma4_31b_output_s_fp8_c5_gfx942, 192, 256, 5376, 8192)
+GEMMA4_DOWN_FP8_ENTRY(plow_gemma4_31b_output_g_fp8_c2_gfx942, 128, 256, 5376, 16384)
+GEMMA4_DOWN_FP8_ENTRY(plow_gemma4_31b_output_g_fp8_c3_gfx942, 128, 128, 5376, 16384)
+GEMMA4_DOWN_FP8_ENTRY(plow_gemma4_31b_output_g_fp8_c5_gfx942, 192, 256, 5376, 16384)

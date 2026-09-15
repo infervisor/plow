@@ -165,6 +165,8 @@ GEMM_VARIANT(gemm_c2, 128, 256, 64)
 GEMMA4_QO_BF16_EXACT(gemm_g12_qs_c2_exact, 4096, 3840)
 GEMMA4_QO_BF16_EXACT(gemm_g12_os_c2_exact, 3840, 4096)
 GEMMA4_QO_BF16_EXACT(gemm_g12_og_c2_exact, 3840, 8192)
+GEMMA4_QO_BF16_EXACT(gemm_g31_os_c2_exact, 5376, 8192)
+GEMMA4_QO_BF16_EXACT(gemm_g31_og_c2_exact, 5376, 16384)
 #endif
 #endif
 #if GM_TILE_FITS(128, 128, 64)
@@ -233,6 +235,8 @@ GEMM_FP8_VARIANT(gemm_fp8_c2, 128, 256, 64) /* GemmWideFp8: the fifth selectable
 GEMMA4_QO_FP8_EXACT(gemm_g12_qs_fp8_c2_exact, 4096, 3840)
 GEMMA4_QO_FP8_EXACT(gemm_g12_os_fp8_c2_exact, 3840, 4096)
 GEMMA4_QO_FP8_EXACT(gemm_g12_og_fp8_c2_exact, 3840, 8192)
+GEMMA4_QO_FP8_EXACT(gemm_g31_os_fp8_c2_exact, 5376, 8192)
+GEMMA4_QO_FP8_EXACT(gemm_g31_og_fp8_c2_exact, 5376, 16384)
 #endif
 #endif
 #if GM_TILE_FITS(128, 128, 64)
@@ -246,6 +250,21 @@ GEMM_FP8_VARIANT(gemm_fp8_e2, 64, 128, 128)
 #endif
 #if GM_TILE_FITS(192, 256, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c5, 192, 256, 64) /* the Qwen prefill tile, vs bf16 c5 */
+#endif
+#if PLOW_GEMMA4_QO_EXACT_BENCH
+#define GEMMA4_QO_FP8_TILE_EXACT(NAME, BM, BN, N, K)                              \
+    extern "C" __global__ __attribute__((flatten))                              \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                    \
+        bf16* C, const unsigned char* A, const unsigned char* B,                   \
+        const float* ascale, const float* wscale, unsigned M, unsigned, unsigned) { \
+        __shared__ unsigned char lds[(BM + BN) * 128];                             \
+        d_gemm_fp8_t<BM, BN, 128, GM_WM, GM_WN>(                                  \
+            C, A, B, ascale, wscale, M, N, K, blockIdx.x, gridDim.x, (bf16*)lds); \
+    }
+GEMMA4_QO_FP8_TILE_EXACT(gemm_g31_os_fp8_c3_exact, 128, 128, 5376, 8192)
+GEMMA4_QO_FP8_TILE_EXACT(gemm_g31_og_fp8_c3_exact, 128, 128, 5376, 16384)
+GEMMA4_QO_FP8_TILE_EXACT(gemm_g31_os_fp8_c5_exact, 192, 256, 5376, 8192)
+GEMMA4_QO_FP8_TILE_EXACT(gemm_g31_og_fp8_c5_exact, 192, 256, 5376, 16384)
 #endif
 
 /* MXFP4 (w4a16) GEMM variants — the five SELECTABLE rungs, one kernel each.
@@ -299,9 +318,33 @@ GEMM_MXFP4_VARIANT(gemm_mxfp4_c5, 192, 256, 64)
  * 320x128->80 384x128->96 128x384->96 192x128->48; all measured 0 AGPR / occ 2 standalone. */
 #if GM_TILE_FITS(192, 256, 64)
 GEMM_VARIANT(gemm_c5, 192, 256, 64)
+#if PLOW_GEMMA4_QO_EXACT_BENCH
+#define GEMMA4_QO_BF16_C5_EXACT(NAME, N, K)                                      \
+    extern "C" __global__ __attribute__((flatten))                              \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                    \
+        bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned, unsigned) {   \
+        __shared__ bf16 lds[GM_LDS_HALVES_T(192, 256, 64)];                       \
+        d_gemm_t<192, 256, 64, GM_WM, GM_WN, false>(                              \
+            C, A, B, nullptr, nullptr, M, N, K, blockIdx.x, gridDim.x, lds);      \
+    }
+GEMMA4_QO_BF16_C5_EXACT(gemm_g31_os_c5_exact, 5376, 8192)
+GEMMA4_QO_BF16_C5_EXACT(gemm_g31_og_c5_exact, 5376, 16384)
+#endif
 #endif
 #if GM_TILE_FITS(320, 128, 64)
 GEMM_VARIANT(gemm_c6, 320, 128, 64)
+#if PLOW_GEMMA4_QO_EXACT_BENCH
+#define GEMMA4_QO_BF16_C6_EXACT(NAME, N, K)                                      \
+    extern "C" __global__ __attribute__((flatten))                              \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                    \
+        bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned, unsigned) {   \
+        __shared__ bf16 lds[GM_LDS_HALVES_T(320, 128, 64)];                       \
+        d_gemm_t<320, 128, 64, GM_WM, GM_WN, false>(                              \
+            C, A, B, nullptr, nullptr, M, N, K, blockIdx.x, gridDim.x, lds);      \
+    }
+GEMMA4_QO_BF16_C6_EXACT(gemm_g31_os_c6_exact, 5376, 8192)
+GEMMA4_QO_BF16_C6_EXACT(gemm_g31_og_c6_exact, 5376, 16384)
+#endif
 #endif
 #if GM_TILE_FITS(384, 128, 64)
 GEMM_VARIANT(gemm_c7, 384, 128, 64)
