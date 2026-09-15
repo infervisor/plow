@@ -5,7 +5,13 @@
  * 0-1789234094-a2a-collective-bench3).
  *
  *   TP_MODE=q   Q form  (dir=0): [8192][8][576]  per rank -> [1024][64][576] per rank
- *   TP_MODE=o   O form  (dir=1): [1024][64][512] per rank -> [8192][8][512]  per rank
+ *   TP_MODE=o   O form  (dir=1), one interleaved group: [1024][64][512] -> [8192][8][512]
+ *   TP_MODE=og  O form  (dir=1), GROUP-MAJOR source (heads_per_group=16, matching the
+ *               row-split fold's actual output — see `d_xalltoall_heads_mega`'s dir=1 doc):
+ *               4 dense [1024][16][512] blocks back to back instead of one interleaved
+ *               [1024][64][512] array. Same destination shape and oracle as TP_MODE=o; only
+ *               the SOURCE layout and `j0` differ, so a wrong head-offset shows up as parity
+ *               failure against the exact same reference.
  * env: TP_NWG (workgroup cap == in.blocks; default 48, must equal PLOW_XA2A_NWG for every
  *      launched workgroup to be "active") TP_REPS (default 5) TP_ELF
  *
@@ -30,6 +36,7 @@
 #define NHT 64u
 #define DQ 576u
 #define DO 512u
+#define HG 16u /* heads per group for TP_MODE=og */
 
 typedef uint16_t bf16;
 static uint32_t tp_hash(uint32_t x) {
@@ -62,8 +69,9 @@ int main(int argc, char** argv) {
     if (argc != NR + 1) { fprintf(stderr, "usage: %s gpu0 ... gpu7\n", argv[0]); return 2; }
     const char* mode = getenv("TP_MODE") ? getenv("TP_MODE") : "q";
     const uint32_t nwg = envu("TP_NWG", 48), reps = envu("TP_REPS", 5);
-    const int is_o = !strcmp(mode, "o");
-    if (strcmp(mode, "q") && !is_o) { fprintf(stderr, "TP_MODE must be q|o\n"); return 2; }
+    const int is_og = !strcmp(mode, "og");
+    const int is_o = !strcmp(mode, "o") || is_og;
+    if (strcmp(mode, "q") && !is_o) { fprintf(stderr, "TP_MODE must be q|o|og\n"); return 2; }
     const size_t xoff = S1 + S2;
     const size_t region = xoff + XCTR_BYTES;
     int dev[NR]; for (int r = 0; r < NR; r++) dev[r] = atoi(argv[r + 1]);
@@ -115,6 +123,7 @@ int main(int argc, char** argv) {
     in.t[0] = 0;
     in.i[0] = RPR; in.i[1] = NHL; in.i[2] = is_o ? DO : DQ; in.i[3] = NHT;
     in.i[4] = 1u; in.i[5] = NR; in.i[6] = is_o ? (uint32_t)S1 : 0u; in.i[7] = is_o ? 1u : 0u;
+    in.fj[1].u = is_og ? HG : NHT; /* j0=heads_per_group; NHT = one interleaved group */
 
     static uint8_t zero[XCTR_BYTES];
     double* a = calloc(reps, sizeof(double));
@@ -163,7 +172,12 @@ int main(int argc, char** argv) {
                 const uint32_t p = grow / RPR, lrow = grow % RPR;
                 for (uint32_t lh = 0; lh < NHL; lh++) {
                     const uint32_t head = (uint32_t)r * NHL + lh;
-                    const uint32_t e = (lrow * NHT + head) * DO;
+                    /* Interleaved (TP_MODE=o): row outer, all NHT heads contiguous within it.
+                     * Group-major (TP_MODE=og): group=head/HG outer, RPR rows of HG heads
+                     * each — the row-split fold's real output shape. */
+                    const uint32_t e = is_og
+                        ? ((head / HG) * RPR + lrow) * (HG * DO) + (head % HG) * DO
+                        : (lrow * NHT + head) * DO;
                     for (uint32_t d = 0; d < DO; d++)
                         bad += hb[(grow * NHL + lh) * DO + d] != word(p, e + d);
                 }

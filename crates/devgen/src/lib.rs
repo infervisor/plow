@@ -3426,6 +3426,7 @@ pub(crate) fn emit_xall_gather(
 /// written into this rank's own peer slot at `slot_bytes` by an earlier packet (the `deps`).
 /// One xctr gate, one-workgroup rendezvous. TP8 only.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_xalltoall_heads(
     b: &mut Builder,
     xgate: &mut u32,
@@ -3439,6 +3440,7 @@ pub(crate) fn emit_xalltoall_heads(
     tp: u32,
     slot_bytes: u32,
     dir: u32,
+    heads_per_group: u32,
 ) -> u32 {
     assert_eq!(
         nh_total,
@@ -3446,6 +3448,12 @@ pub(crate) fn emit_xalltoall_heads(
         "XAllToAllHeads: nh_total must be nh_l * tp"
     );
     assert!(dir <= 1, "XAllToAllHeads: dir must be 0 (Q) or 1 (O)");
+    assert!(
+        heads_per_group > 0
+            && heads_per_group % nh_l == 0
+            && nh_total % heads_per_group == 0,
+        "XAllToAllHeads: heads_per_group must divide nh_total and be a multiple of nh_l"
+    );
     let elems = rpr * nh_total * d;
     let need = (elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
     let xr_cus = &xr_cus[..need];
@@ -3461,6 +3469,7 @@ pub(crate) fn emit_xalltoall_heads(
         inst.i[5] = tp;
         inst.i[6] = slot_bytes;
         inst.i[7] = dir;
+        inst.j[0] = heads_per_group;
     })
 }
 
@@ -7362,6 +7371,27 @@ fn apply_production_defaults(
     // tree's defaults rather than pinning today's.
     if capabilities.glm && arch == "gfx942" && tp == 8 && n_cu == 304 && !cfg.mxfp4 {
         cfg.glm_production_defaults = true;
+        if cfg.decode_ladder.is_none() {
+            cfg.decode_ladder = Some("1,2,4,8,16,32".into());
+            cfg.decode_ladder_default = true;
+            emit_config::note_production_default("decode_ladder", "1,2,4,8,16,32".into());
+        }
+        if !cfg.token_batch_tp {
+            cfg.token_batch_tp = true;
+            emit_config::note_production_default("token_batch_tp", "true".into());
+        }
+        // Row-band attention is not composable with token-batch bodies. Sequence-parallel seams
+        // are: bodies carry their bucket's seams and route rank-band norms off the packed twin.
+        if cfg.token_batch_tp {
+            if cfg.glm_rowband_attn == Some(true) {
+                cfg.glm_rowband_attn = Some(false);
+                emit_config::note_production_default("glm_rowband_attn", "false".into());
+            }
+        }
+        if !cfg.packed_sparse_pf {
+            cfg.packed_sparse_pf = true;
+            emit_config::note_production_default("packed_sparse_pf", "true".into());
+        }
         for (id, unset, value) in cfg.glm_recipe_unset() {
             if unset {
                 emit_config::note_production_default(id, value.to_string());
@@ -8082,6 +8112,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMM_C5",
     "PLOW_DOP_GEMM_C5_FP8",
     "PLOW_DOP_GEMM_C5_MXFP4",
+    "PLOW_DOP_GEMM_F32",
     "PLOW_DOP_GEMM_FP8",
     "PLOW_DOP_GEMM_FP8_BLK",
     "PLOW_DOP_GEMM_GLU",
@@ -8842,17 +8873,8 @@ fn emit_dense_gqa(
         }
     }
 
-    // PREFILL PLACEMENT IS OFF BY DEFAULT ON AMD, and that is what makes the DECODE placement
-    // usable at all. `PLOW_L2_PLACE` already defaults ON for gfx942/gfx950, but
-    // `scripts/build_gfx942.sh` gates `-DPLOW_L2_PLACE_DISPATCH` on the PREFILL objects behind
-    // `PLOW_L2HIER_PF`, which is off — so `plowrt` REFUSES a blob whose prefill programs are
-    // placed, and the only way past that was `PLOW_L2_PLACE=0`, which throws away the decode
-    // half too. That is how the shipped Gemma-4-31B blob came to be unplaced (`PLOWDEV\x09`,
-    // not `\x0b`) with `PLOW_GATE_HIER` compiled into the decode object and INERT at run time:
-    // the hierarchy's precondition is `prog.l2_domains != 0`. Measured cost of that accident,
-    // Gemma-4-31B BF16 TP1 MI300X, served, medians of six: TPOT +4.7% to +8.0%.
-    // An explicit `PLOW_L2_PLACE_PREFILL=1` still asks for it (pair it with `PLOW_L2HIER_PF=1`
-    // objects); NVIDIA is unchanged, where one cooperative launch reads no wave class.
+    // Dense-GQA AMD prefill placement remains explicit until that path is separately qualified.
+    // GLM has its own placed builder and default below in `mla.rs`.
     let l2_place_prefill = ecfg.l2_place_prefill
         && (!amd || std::env::var_os("PLOW_L2_PLACE_PREFILL").is_some());
     let mut progs = Vec::new();

@@ -29,6 +29,11 @@ thread_local! {
     static PREP_PATCH_NS: Cell<u64> = const { Cell::new(0) };
     static PUB_FILL_NS: Cell<u64> = const { Cell::new(0) };
     static PUB_DEFERRED_NS: Cell<u64> = const { Cell::new(0) };
+    static DEC_RUNG: Cell<u32> = const { Cell::new(0) };
+    static DEC_DX: Cell<u32> = const { Cell::new(0) };
+    static DEC_DSA: Cell<u32> = const { Cell::new(0) };
+    static DX_TOTAL: Cell<u64> = const { Cell::new(0) };
+    static DSA_TOTAL: Cell<u64> = const { Cell::new(0) };
 }
 
 pub struct TickGuard {
@@ -57,6 +62,9 @@ pub fn begin() -> Option<TickGuard> {
     DEC_INFLIGHT_ENQ.with(|c| c.set(-1));
     DEC_INFLIGHT_SUB.with(|c| c.set(-1));
     PUB_DEFERRED_NS.with(|c| c.set(0));
+    DEC_RUNG.with(|c| c.set(0));
+    DEC_DX.with(|c| c.set(0));
+    DEC_DSA.with(|c| c.set(0));
     Some(TickGuard { started, idle_ns })
 }
 
@@ -103,6 +111,19 @@ pub fn decode_in_flight(after_enqueue: i64, after_rearm: i64, segs: u32) {
     DEC_INFLIGHT_ENQ.with(|c| c.set(after_enqueue));
     DEC_INFLIGHT_SUB.with(|c| c.set(after_rearm));
     DEC_SEGS.with(|c| c.set(segs));
+}
+
+/// One decode dispatch launched rung `rung` as its dense-exact twin (`PLOW_AMD_DECODE_DENSE_EXACT`)
+/// or as the rung program itself.
+#[inline]
+pub fn decode_prog(rung: u32, dense_exact: bool) {
+    if !on() {
+        return;
+    }
+    DEC_RUNG.with(|c| c.set(rung));
+    let (tick, total) = if dense_exact { (&DEC_DX, &DX_TOTAL) } else { (&DEC_DSA, &DSA_TOTAL) };
+    tick.with(|c| c.set(c.get() + 1));
+    total.with(|c| c.set(c.get() + 1));
 }
 
 /// One rank's `prefill_prepare` spent `ns` in `vmm_ensure`.
@@ -160,7 +181,7 @@ impl Drop for TickGuard {
         let dec_ns = DEC_NS.with(Cell::get);
         let ms = |ns: u64| ns as f64 / 1e6;
         eprintln!(
-            "TICK n={seq} total={:.3} pf_launches={} pf_rows={} pf={:.3} dec_rows={} dec={:.3} dec_vmm={:.3} dec_maps={} dec_segs={} dec_inflight_enq={} dec_inflight_sub={} pub_deferred={:.3} other={:.3} idle_before={:.3}",
+            "TICK n={seq} total={:.3} pf_launches={} pf_rows={} pf={:.3} dec_rows={} dec={:.3} dec_vmm={:.3} dec_maps={} dec_segs={} dec_inflight_enq={} dec_inflight_sub={} pub_deferred={:.3} other={:.3} idle_before={:.3} dec_rung={} dec_dx={} dec_dsa={}",
             ms(total),
             PF_LAUNCHES.with(Cell::get),
             PF_ROWS.with(Cell::get),
@@ -175,7 +196,13 @@ impl Drop for TickGuard {
             ms(PUB_DEFERRED_NS.with(Cell::get)),
             ms(total.saturating_sub(pf_ns + dec_ns)),
             ms(self.idle_ns),
+            DEC_RUNG.with(Cell::get),
+            DEC_DX.with(Cell::get),
+            DEC_DSA.with(Cell::get),
         );
+        if seq % 1000 == 0 {
+            eprintln!("TICKDX n={seq} dx={} dsa={}", DX_TOTAL.with(Cell::get), DSA_TOTAL.with(Cell::get));
+        }
         LAST_END.with(|l| l.set(Some(end)));
     }
 }

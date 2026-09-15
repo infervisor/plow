@@ -568,9 +568,16 @@ pub(crate) fn mla_live_nsplit(baked: u32, kv_len: u32) -> u32 {
 /// The DSA selector keeps `min(select_width, kv_len[row])` keys, `kv_len` counting the current
 /// token (`d_index_select_coop`, `d_index_select_pf`, the gather flash's `tk_live`). So while
 /// every row the rung advances holds at most `select_width` keys it selects all of them and dense
-/// attention reads the same key set. One row past it and the sets differ.
-pub(crate) fn decode_dense_exact(kvlen: &[u32], select_width: u32) -> bool {
-    !kvlen.is_empty() && kvlen.iter().all(|&k| k <= select_width)
+/// attention reads the same key set. One row past it and the sets differ. A row `parked` marks
+/// (non-zero) is not advanced and its output is discarded, so it does not count; rows past the end
+/// of `parked` do.
+pub(crate) fn decode_dense_exact(kvlen: &[u32], parked: &[u32], select_width: u32) -> bool {
+    let mut advanced = kvlen
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| parked.get(i).is_none_or(|&p| p == 0))
+        .peekable();
+    advanced.peek().is_some() && advanced.all(|(_, &k)| k <= select_width)
 }
 
 /// The decode program's MLA split sites — every instruction whose `i[4]` is the

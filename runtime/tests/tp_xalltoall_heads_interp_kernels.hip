@@ -45,7 +45,7 @@ extern "C" __global__ void txh_dispatch_bench(
     const uint64_t t0 = txh_now();
     d_xalltoall_heads_mega(peer_scratch, n_gpu, rank, xctr_byte_off, in->i[4], deadline_ticks,
                            status, blockIdx.x, in->blocks, (bf16*)tens[in->t[0]], in->i[0],
-                           in->i[1], in->i[2], in->i[3], in->i[6], in->i[7]);
+                           in->i[1], in->i[2], in->i[3], in->i[6], in->i[7], in->fj[1].u);
     __syncthreads();
     if (threadIdx.x == 0 && ts) { ts[2 * blockIdx.x] = t0; ts[2 * blockIdx.x + 1] = txh_now(); }
 }

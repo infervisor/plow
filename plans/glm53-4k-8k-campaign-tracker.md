@@ -1,7 +1,8 @@
 # GLM-5.3-FP8 4K/8K TTFT campaign tracker
 
 Updated: 2026-09-14
-Branch: `tp-bringup-mi300x`
+Branch: `glm53-8k-ttft` (continuation). `tp-bringup-mi300x` and `worktree-tp-merge` (tip `2655520b`) are merged
+into `origin/main` at `e72ffa79`; the new branch is cut from that merge commit.
 Checkpoint: `zai-org/GLM-5.3` (FP8), TP8 on 8x AMD MI300X (gfx942)
 Production serving set: `a7596da2` (packet `8b15f4a2…`, stamp `0xb47295d1df086e6b`)
 Detailed log: `docs/bringup/tp-bringup-upstream-review-log.md` (rows #81–#99); live rung board `plans/rung-board.md` (local)
@@ -17,6 +18,43 @@ Detailed log: `docs/bringup/tp-bringup-upstream-review-log.md` (rows #81–#99);
 - Values: cross-process runs are nondeterministic (#50), so gates use logit floors vs off/off2, byte identity only within one
   process, plus retrieval 39/39.
 - A default flips only after T4 passes and checkpoint P certifies every touched rung (#90).
+
+## 70K/C20 host review (2026-09-15)
+
+- Exact 100-prompt baseline on the current stack: row-band on 88.76 output tok/s; row-band off
+  90.11. Off returns 29.25 GiB/rank and removes nearly all KV admission deferrals, but worsens
+  median TPOT from 129.86 to 198.09 ms. Capacity is not the throughput gap.
+- The KV path already reserves stable virtual addresses and maps physical 2 MiB blocks at the
+  frontier. Admission must reserve prompt + output logical rows until active-sequence KV offload
+  or preemption exists; optimistic admission alone would defer the OOM instead of solving it.
+- A wider 32768 prefill step budget was prototyped as four existing 8192 launches. Paired 20-prompt
+  screens: row-band on 82.28 → 82.87 tok/s with median TTFT +3.3 s; row-band off 76.06 → 75.67
+  with median TTFT +4.9 s; P99 ITL regressed. Rejected and removed. Keep one standard 8192 launch
+  per AMD tick.
+- Mux fix retained: bounded KV wait queue, backfill past oversized waiters, accurate queue depth and
+  one arrival-rate update per ingress event. This prevents head-of-line idle slots but does not
+  change the prefill-bound ceiling.
+- Corrected GLM router flags and compact native-prefill scratch are pushed at `2d189faa` and
+  `d917e9cc`. Scratch falls by 1.52 GiB/rank (`act.part`, `act.moe_fug`, `act.shared`; unused
+  `act.zero_h` removed). A paired 16-prompt 70K prefill gate passed 16/16 in both arms: compact
+  median TTFT 40.17 s vs 41.33 s control. A compact-only 70K/700/C16 sustained gate also passed
+  16/16 through decode rung 20: 80.19 output tok/s, median TTFT 39.88 s, median TPOT 98.84 ms.
+- The earlier exact 100-prompt compact run faulted at decode rung 16 with only 9 occupied, before
+  slot turnover. A deterministic capacity or compact-scratch OOB is therefore not established:
+  the long-prefill and sustained C16 gates pass. A 32-prompt 70K/700/C20 turnover gate also passed
+  32/32: 86.90 output tok/s, median TTFT 54.20 s, median TPOT 116.54 ms. Do not loosen admission
+  from the current conservative 13-request 70K cap until the mixed C20/N100 fault is isolated.
+- The historical ordinary-8192 -> row-band poisoning is not an open workspace bug. `rbfault16`
+  already disproved the sparse-MLA clear hypothesis; `rbfault21` identified and verified the
+  shared `@band` view memo fix (`f584a1e0`).
+- Do not rebase the old 26-file MTP experiment as-is. Its measured speedup is confounded by four
+  correctness gaps against vLLM: normalized rather than raw recurrent state, an extra BF16
+  projection rounding, BF16 rather than FP32 router logits, and no position-0 embedding mask.
+  Standard decode rung widths remain, but MTP-on also rewrites their bodies with EXTEND and draft
+  roles. Correct and oracle-gate these points before using its performance numbers.
+- Next structural kernel lever remains a plow-owned grouped block-FP8 MoE kernel with a ≥256-row
+  expert tile. The pinned AITER family has no tile wider than 64; the old generic MPF_BM=128 result
+  was only −5.1% vs its EPI-off control and remained slower than shipped BM64/EPI-on.
 
 ## Target matrix
 
@@ -107,10 +145,651 @@ ISL 1024, OSL 4096), 8192 TTFT < 550 with band rows > 0 on every prefill tick an
 
 With step 4 at ≈ −4 and step 6 at ≈ −7 (G5 T2 byte-identical but ≈ −1.6 ms in flow), steps 1–7 predict ≈ 562–566 ms: the goal needs step 8 or new levers. Lever hunt: the simple swaps are exhausted (every P8192-0 attention row already native; MoE already on AITER's tuned `64x256` kernel with no wider tile; GEMM picks equal the 456-kernel sweep best; collective transport concurrency-limited at ≈ 256–261 GB/s). Remaining structural levers, all T2 queued: (1) row-band attention with replicated q_absorb/q_rope/fold/o_proj, each rank running its 1024 rows × 64 heads as 4 × 16-head launches with no o_proj reduce-scatter or Q/O all-to-all, −50…−110 ms predicted from #71's 1.88× and the rowsplit-attn attribution, ≈ +29 GB VRAM/rank to check; (3) o_proj on the row band, −12…−17, a subset of (1); (4) bit-identical ns=1 fold normalize + fused permute/convert, −3…−12; (5) shared expert on the band beside the MoE all-gather, −8…−15; (6) seam all-gather cap 24 → 16, −1…−3; (2) a plow-owned grouped block-FP8 MoE kernel with a ≥ 256-row tile, −25…−45, no cheap T2. Rank-3 skew is the card: with 65:00.0 rotated to rank 7 (confirmed on NUMA node 1), its native time stays +5.9 ms over the other ranks' median (+5.86 as rank 3, +5.92 as rank 7) and its late arrivals move with it (109 → 122 of 405), while rank 3 on another card drops to +2.7 ms; per-device probe +2.0…+3.2% on the pinned attention kernel. Reseating or swapping it is worth ≈ −3…−5 ms served.
 
+## Continuation branch and row-band re-verdict (2026-09-14)
+
+The campaign branch is merged. Work continues on `glm53-8k-ttft`, cut from `origin/main` `e72ffa79`. Stale worktrees
+pruned 49 -> 12 (37 removed, all ancestors of main; uncommitted state from 3 of them archived under
+`/workspace/c08d1232-scratch-archive/worktree-diffs/`). Both unlanded patches still apply clean to main:
+`patch1-glm-recipe-parity.patch` (#106) and `router-overlap-on-2655520b.patch` (#103).
+
+**Row-band stage 2 was a PASS misreported as a failure.** `lh-t3-stage2-rowband` exited rc=1 and was recorded as an
+unexplained failure. It did not fault; it ran all three arms and the gate tripped on one cell:
+
+| cell | ctrl | treat | ctrl2 | delta | floor | gate |
+|---|---:|---:|---:|---:|---:|---|
+| P8192-0 (owner) | 574.79 | 465.06 | 575.79 | **-110.23** | 6.33 | PASS |
+| P8192-S (prior 65536) | 650.85 | 515.68 | 650.77 | **-135.13** | 3.95 | PASS |
+| P4096-0 | 324.64 | 325.55 | 324.89 | +0.78 | 0.61 | FAIL |
+
+The whole gate failed on a +0.78 ms (0.24%) move at the 4096 rung while 8192 got 110-135 ms faster. That FAIL is not
+attributable to the lever: `emit.glm_rowband_attn` is scoped `rows: (8192, 8192)`, and a structural diff of the two
+packets confirms it — keying programs on (kind, topology, batch, segment), **all 5689 shared program keys are
+byte-identical between knob-off `8b15f4a2` and row-band `b73d4440`; zero differ.** The row-band packet only adds 1414
+new `(prefill, rowsplit, *)` sibling programs. So the 4096 program is unchanged instruction for instruction and the
++0.78 ms is second-order (the +29.25 GiB/rank of replicated attention weights perturbing residency), inside a run whose
+ctrl2 arm also threw a 1411.9 ms outlier rep at 8192 (spread 145.8%). The rung rule needs to distinguish "this rung's
+program changed" from "this rung moved"; checkpoint S already supplies that distinction and should gate it.
+
+Measured memory matches the corrected estimate, not the original: replicated 29.25 GiB/rank, 55.58 GiB free after load
+(knob-off leaves 83.44). That is above the ~40-43 GiB/rank long-context KV need, so the knob is viable at production
+max_ctx, but it is the binding constraint and every row-band run must keep reporting free-after-load.
+
+Served T4 queued as `rb-t4-{a-ctl,b-treat,c-ctl2,d-treat2}` (`/workspace/ttft550-c08d1232/rb-t4/t4-arm.sh`): one arm per
+job, same plowrt `b013a9f9` on every arm so the packet is the only variable, cells isl8192-c1 / isl8192-c16 / isl4096-c1.
+If the -110 ms carries to the served path it lands C1 8192 near 485-495 ms and the 550 ms goal is met by this lever alone.
+
+**Dense-exact decode flip, scored.** The T4 that had been sitting unreported: a real decode win, not a TTFT lever.
+Pooled treat-vs-ctl TPOT -1.79 ms at isl1024-c1 (floor 0.041) and -2.58 ms at isl1024-c16 (floor 0.629), both beyond
+floor; twin share 0 -> 1.000 in the treat arms and the controls never fire the twin. On the goal cell isl8192-c1 the
+effect is -1.3 ms against a 3.68 ms floor, i.e. nothing. The harness verdict is T4 FAIL, from the isl1024-c16 TTFT cell
+where the two treatment arms disagree (treat-ctl +137.8 [+60.1, +225.4], treat2-ctl2 -1.4 [-50.7, +49.1]) -- an outlier
+in one arm, not an effect, but unresolved until that cell is repeated.
+
+**The three decode-rung T3s were PASSes recorded as FAILs: a scorer bug, not a result.**
+`harness/t3-score.py` declared `ARMS = ("ctl", "treat", "ctl2")` and then unpacked
+`c, c2, t = (median(r[a]) for a in ARMS)`, so `c2` received *treat* and `t` received *ctl2*. The printed
+"drift" was therefore the ctl-vs-treat gap and the "effect" was ctl2 against the ctl/treat mean; both printed
+numbers reproduce exactly under that reading, which is what identified it. Corrected (`c, t, c2`):
+
+| rung | ctl | treat | ctl2 | effect | drift | floor | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| D8  | 40.609 | 38.475 | 40.612 | **-2.135 ms (-5.26%)** | 0.003 | 0.193 | PASS |
+| D16 | 46.177 | 43.453 | 46.292 | **-2.781 ms (-6.02%)** | 0.116 | 0.570 | PASS |
+| D20 | 52.781 | 49.460 | 52.719 | **-3.290 ms (-6.24%)** | 0.062 | 0.725 | PASS |
+
+Twin firing 1.0000 in treat and 0.0000 in both controls at every rung. A second bug in the same scorer opened
+`{D}/set-on/assets/build.json` while `load()` globs `{D}/{arm}/round*/ticks.log`, so the ledger write always
+died on the path; it now resolves the set from the script's own location. Both fixed in the harness (not the
+repo). 45 ledger entries appended for D8/D16/D20 + the served cells.
+
+Checkpoint P is still not stampable: the request's `facts` block needs the retrieval/serving-guard result, and
+that job had been failing preflight because `serving8k/validate.sh` hard-coded `quality.py` inside
+`worktrees/agent-ae72ad71d98fa7843` -- a worktree removed during this session's cleanup. `quality.py` is
+byte-identical between that worktree's commit and the branch, so the two live references were repointed at the
+tp-merge worktree and the gate re-queued as `dxflip-retrieval-refix`. The historical `wt=` build scripts were
+left pointing at the removed path deliberately: they should fail loudly rather than silently build from a
+different tree.
+
+The runtime half of that work is landed on this branch: `decode_dense_exact` takes a `parked` row list so rows that are
+not advancing no longer disqualify the batch from the dense-exact twin. Without it the twin never fired in a mixed
+batch (mix-fire twin share 0.000 -> 1.000 decode-only, 0.028 -> 1.000 with_prefill; short-request median TPOT
+53.97 -> 49.74 ms retained, 50.05 -> 46.06 ms mixed). The default flip itself (`flip-draft/flip-code.diff`) is NOT
+landed as a commit: it is applied and saved at
+`/workspace/ttft550-c08d1232/dense-exact-default-flip-staged.patch`, but `scripts/perf_gate_ci.sh` fails any run
+whose flipped knob has no `perf-certs/<id>.json`, and that certificate cannot be made until the retrieval fact
+exists. The isl1024-c16 objection is withdrawn: per-request TTFT distributions show ctl, ctl2 and treat2
+identical to the decimal (med 0.3, p90 0.4, p99 2.9, max 3.1, 11 requests > 3x median) and only treat fat
+(p90 1.5, max 4.5, 16 requests), with the twin equally active in both treatment arms -- a stall in one run, not
+an effect of the knob.
+
+## Row-band ported in-tree, behind a serve-start knob (2026-09-14)
+
+Row-band was never in the repo: `git log --all -S"ROWBAND"` hit one commit and it edited only tracker prose.
+It lived as the export `/workspace/lever-hunt-c08d1232/rowband-e724`, based on `e724c7bd` (an ancestor of main).
+Ported by diffing that export against its base: 3963 lines, 34 files, of which 31 applied clean. Hand-merged
+three one-line op-signature edits in `crates/packet/src/slots.rs` (`XAllToAllHeads` gains `heads_per_group`,
+`MlaMergeFold` gains `group`, `IndexTpPf` gains `local_band`); skipped the generated `knob_gen.rs` (regenerated
+instead) and the review log (separate merge).
+
+**Why a serve-start knob and not a runtime one.** The programs were never the problem: sibling *selection* is
+already a per-chunk runtime decision. The cost is the packet's TENSOR declarations -- the full-width
+`q_absorb`/`q_rope`/`o_proj` twins. `amd.rs` prices them from `blob.tensors` and hard-errors unless free memory
+clears `replicated + 8 GiB`, so a packet that declares the twins pays the 29.25 GiB at load whether or not a
+single chunk dispatches the sibling. A per-request flag is therefore impossible without paying always. The
+extension container cannot help either: `crates/packet/src/ext.rs` says it "carries programs only -- no
+checkpoint, no weights, no tensor data", with the tensor table a reference to the parent's. Extensions could
+ship the siblings; they cannot ship the twins.
+
+`PLOW_GLM_ROWBAND` / `--glm-rowband` (runtime, default off, read once at engine build) gates four points:
+
+1. `column_twins` returns all-`None` when off, so each column shard carves its own storage (the ordinary path).
+2. New `rowband_twin_ids` marks the full-width declarations; when off they are excluded from `carved`, so they
+   are neither allocated nor uploaded.
+3. The load-time free-VRAM refusal applies only when the arm is actually bound.
+4. `chunk_program` will not select a sibling when off.
+
+Program tensor handles are positional, so the twins still need a binding when off: they get a one-byte view at
+address 0, which faults on a stray read instead of silently returning another tensor's weights. Registered as
+`rt.glm_rowband`; evaluator regenerated; devgen knob gate 12 passed, plowrt knob gate 17 passed.
+`rowband_twins_are_the_full_width_declarations_only` asserts only the full-width declarations are skippable and
+that the skipped bytes reconcile with what the load-time refusal prices.
+
+Net: ONE packet carries the metadata and the knob decides whether the deployment pays for it -- a latency
+profile and a capacity profile from the same artifact.
+
+**Scaling.** Compute scales: -19.2% at prior 0, -20.8% at prior 65536, -23.1% on the 73728 sweep. Two effects
+stack -- deleting the collectives saves a roughly constant absolute amount per chunk (they are sized by chunk
+rows, not KV length), while the kernel reshape (T/8 rows x 64 heads instead of T rows x 8 heads, 1854.8 ->
+1226.4 us/layer) scales with attention work. Coverage also improves with context, since the sibling needs a full
+8192 chunk and long prompts are mostly full chunks. Capacity does NOT scale: the 29.25 GiB is fixed while KV
+grows, and the failure mode is a refused load, not graceful degradation. Row-band is prefill-only, so a
+long-context decode-heavy workload pays the squeeze and gets nothing. The T=73728 treat arm also ran noisier
+(spread 8.09% vs ctrl 0.84%), unexplained.
+
+The served T4 `rb-t4-{a..d}` gained an `isl65536-c1` cell for exactly this; without it the run could not have
+answered the context question.
+
+## The GEMMs are already plow-dispatched; hipBLASLt is not linked (2026-09-14)
+
+The attribution row "hipBLASLt GEMMs | 52" reads like library time. It is not, and the distinction
+decides what is left to win.
+
+`scripts/build_glm_lt.sh` takes hipBLASLt's fat binary and runs
+`clang-offload-bundler --unbundle --targets=hipv4-amdgcn-amd-amdhsa--gfx942`, pinning the sha256 of
+BOTH the input bundle and the unbundled image. The result, `glm_lt_gfx942.elf`, is loaded by
+`crates/plowrt/src/exec/amd_gemm_lt.rs:315`, which re-checks the hash against `OBJECT_HASH`
+(`efa5b036...`) and resolves each Tensile kernel by name. `enqueue()` (:401) then builds the launch
+itself: the 160-byte Tensile kernarg (`dims`, `pointers`, `strides`, `alpha`, `beta`, `epilogue`), the
+grid from the macro-tile (`n.div_ceil(mt_i) * m.div_ceil(mt_j)`), workgroup 256. Load verifies the
+resource ABI: `kernarg_size == 160`, `private_segment_size == 0`, `lds == spec.lds`.
+
+Evidence that the library is gone at run time: no `hipblaslt` in any `Cargo.toml` or `build.rs`, no
+`hipblasLt*()` call anywhere in `crates/plowrt/src`, and `ldd` on a built plowrt reports five shared
+objects, none of them hipBLASLt or Tensile. 29 kernels are pinned: 4 prefill (`glm_lt_gfx942.json`),
+8 decode (`glm_lt_decode_gfx942.json`), 17 prefill-ext (`glm_lt_pf_ext_gfx942.json`).
+
+So "capture the exact launch and dispatch it ourselves" is done and shipping. What is NOT plow-native
+is the kernel BODIES -- Tensile assembly, extracted rather than authored. Re-authoring them is #87 in
+the rejected table: hipBLASLt wins every prefill shape on one clock. That is the version of this idea
+that has already been measured and lost.
+
+Two openings that remain, both better than a rewrite:
+
+1. **Coverage.** `glm_tests.rs:3463` asserts `has(GemmLtPf) == (rows >= 2048)`: only GEMMs at 2048+
+   rows take the native path, the rest stay interpreted (the 20 ms row). Widening that is the same
+   capture technique applied where it still pays. The gate is structural, not numeric --
+   `segment_owners` (`amd_gemm_lt.rs:164`) refuses a native GEMM unless it owns its segment alone
+   ("native GEMM segment contains other interpreter work", "native segment retains interpreter counter
+   obligations"), so coverage is an emitter-segmentation question, not a kernel question.
+2. **The epilogue is nearly unused, and it can do SiLU.** Read off the image's own AMDGPU metadata
+   note (`kernarg_segment_size = 160`, matching `Args`), plow's `epilogue: [u32; 14]` is exactly
+   Tensile's post-GEMM argument block, and `arguments()` writes one field of it:
+
+   | `epilogue[]` | byte | Tensile arg | plow writes |
+   |---|---:|---|---|
+   | `[0..1]` | 104 | `AddressScaleAlphaVec` | zero |
+   | `[2..3]` | 112 | `bias` | zero |
+   | `[4]` | 120 | `biasType` | zero |
+   | `[5]` | 124 | `StrideBias` | zero |
+   | `[6]` | 128 | `activationAlpha` | zero |
+   | `[7]` | 132 | `activationBeta` | zero |
+   | `[8]` | 136 | `activationType` | zero |
+   | `[9..10]` | 140 | `dstD` | **the only one set** |
+   | `[11..12]` | 148 | `Synchronizer` | zero |
+   | `[13]` | 156 | `GSUSync` | zero |
+
+   The bodies carry `label_Activation_{None,Relu,Gelu,Sigmoid,Silu,Clamp}` plus `BiasAddrValid` and
+   `ScaleAlphaVecAddrValid`, so bias add, a per-column alpha vector and SiLU are all compiled into
+   kernels plow already launches -- reachable by writing fields that currently go out as zero, with
+   no kernel authored and no object rebuilt.
+
+   The concrete first target is the shared expert: `glm_tests.rs:4021` records that the band router
+   and the shared expert's gate/up/down are each `GemmLtPf` alone in their own segment, and the gate
+   is followed by a separate SiLU pass over its output. Folding that into `activationType` removes a
+   full read+write of the gate tensor per layer. `AddressScaleAlphaVec` is a per-column alpha vector,
+   which is the shape a per-channel dequant scale wants -- worth re-opening "FP8 block-scale prefill
+   GEMMs: no end-to-end gain" against, since the epilogue applies the scale inside the GEMM rather
+   than as a pass after it.
+
+   This is also the clean way to get what `fusepost` (-4.1 ms, bit-exact, opt-in only because T3
+   missed its floor by 0.1 ms) and `packproj` (-8 ms in T2 13/13, T3 FAIL at +73 ms purely because
+   packing forced a `ColSplit` copy OUTSIDE the GEMM) were reaching for: an epilogue that writes each
+   projection to its own destination removes packproj's copy by construction.
+
+   Checked on the descriptor plow actually dispatches, not a lookalike: the image holds 465 kernels
+   and several share a macro-tile at different kernarg sizes (an `MT256x224x64 ... AFC0` variant is
+   144 bytes), so the layout above was read off the exact pinned name
+   `MT256x224x64_MI16x16x1_SN_LDSB0_AFC1`, which is 160 bytes and carries the full epilogue.
+   Still unverified before building: the integer `activationType` expects for SiLU. The bodies
+   dispatch activation through a PC table, and the shipped ROCm headers do not carry the enum --
+   `hipblaslt-ext.hpp:389` is just `int activationType; //!< The activation type`, and no Tensile
+   header is installed -- so it is not a lookup. Settle it with a 1-GPU T2 that launches one pinned
+   kernel per candidate value and compares the output against a reference SiLU; guessing the value
+   silently computes the wrong activation. Tool: `scripts/tensile_args.py <image.elf> [substring]`.
+
+## The rewrite finds more fusion than the emitter lowers (2026-09-14)
+
+Cross-block fusion is not missing -- it is discovered and then dropped.
+
+`crates/rewrite` lowers a shape-inferred graph into egglog, runs the fusion rules to equality
+saturation and extracts the lowest-cost form. It is whole-graph, not block-local (`plan_from_all_blocks`),
+and `PLOW_EMIT_REWRITE` is default-on (#102). `egl/rules.egg` produces 28 fused kinds, several of them
+genuinely across block boundaries: `FusedNormResidualNorm` and `FusedNormResidualScaleNorm`
+(norm -> residual -> norm, spanning the sub-block seam), `FusedResidualNorm`, `FusedResidual3Norm`,
+and `FusedMaterializedResidualBlock` / `FusedMaterializedResidual3Block` (whole block).
+
+`crates/devgen/src/rewrite_lower.rs` defines exactly two lowerings: `Lowering::AddNorm`
+(`FusedResidualNorm`, `FusedResidual3Norm`) and `Lowering::NormResidualNorm`
+(`FusedNormResidualNorm`, `FusedNormResidualScaleNorm`). Every other fused kind has no devgen
+lowering -- `FusedLinearAct`, `FusedLinearBiasAct`, `FusedRmsNormSiluGate`, `FusedNormRope`,
+`FusedMlaOutGate`, `FusedMaterializedResidualBlock` and the rest appear nowhere in devgen or plowc.
+
+The caveat that keeps this honest: no rewrite lowering is NOT the same as not fused. Several are done
+by hand instead -- the MoE gate/up SiLU is inside AITER's fused kernel
+(`fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_psx_64x256.co`), and `fusepost` does GEMM + q RoPE by hand.
+The rewrite decides fusions the emitter lowers; where no lowering exists, the hand path or nothing
+applies. So the gap is an upper bound on what is being left behind, not a measured loss.
+
+Where it matters most: `FusedLinearAct` / `FusedLinearBiasAct` is exactly GEMM + bias + activation.
+The rewrite already identifies those sites, the pinned Tensile bodies already carry `bias`,
+`activationType` and a SiLU label, and plow already dispatches them -- three of the four parts exist
+and only the devgen lowering that writes those epilogue words is missing. See the epilogue map above.
+
+Two structural limits on pushing fusion further, both real and both worth respecting:
+
+- Collectives are fusion barriers. `rewrite_lower.rs`: a residual3 site's inner (combine) add "stays
+  with the MoE combine, which under TP precedes the collective".
+- A native GEMM must own its segment alone (`segment_owners`, `amd_gemm_lt.rs:164`), so anything
+  fused into a GEMM's segment has to preserve that invariant -- which an epilogue does by
+  construction and a separate op does not. That is the same invariant `packproj` broke with its
+  out-of-GEMM `ColSplit` copy.
+
+## Router overlap level 1: T3 PASSED and sat unreported (2026-09-14)
+
+Second recovered result of the day, found the same way as the dense-exact flip -- by reading the
+queue's own `done/` directory instead of trusting the tracker's "queued". `agband-t3-l1` ran this
+morning (`done/1789248838-z9i5-agband-t3-l1`, rc=0, 9.9 min) and passed every rung:
+
+| rung | ctrl | treat | ctrl2 | treat - mean(ctrl) | floor | |
+|---|---:|---:|---:|---:|---:|---|
+| P8192-0 | 582.3 | 571.1 | 582.2 | **-11.2** | 4.4 | PASS |
+| P8192-S | 650.4 | 637.5 | 650.8 | **-13.1** | 3.0 | PASS |
+| P4096-S | 381.5 | 369.1 | 381.3 | **-12.3** | 1.1 | PASS |
+
+`RUNG GATE PASS`, and the independent sweep sanity agrees (8192: ctl 585.9 / treat 574.4 / ctl2 585.7;
+73728: 5592.4 / 5482.1 / 5597.5). Spread is tight -- 0.17-0.29% at 8192.
+
+The T3 measures time only; the values gate for this lever was the T2 (act.xn2 / act.xn / act.tab /
+logits at the ctl-vs-ctl2 floor, argmax equal), and T1 had the knob-off packet byte-identical with
+checkpoint S accepted for both levels. So level 1 now has K, S, T2 values, and a three-rung T3.
+
+Two things worth noting. First, -11.2 ms at P8192-0 lands exactly on the T2 prediction (150 us/layer
+over 75 MoE layers), which is the rarer outcome -- most levers shrink between T2 and T3. Second,
+P4096-S -12.3 ms means this one transfers to the 4K rung essentially undiminished, unlike row-band,
+whose 4096 cell was provably non-attributable. It is currently the best-evidenced answer to "what
+from the 8K work helps 4K".
+
+Remaining for the flip: a served T4 plus retrieval, then checkpoint P. Landing patch is cut on
+86da9dc3 (`/workspace/agband-c08d1232/router-overlap-on-2655520b.patch`, verified to apply clean to
+main). No kernel, runtime, object or collective change, and the packet stamp is unchanged, so the
+T4 needs a serving set emitted from the level-1 packet against the existing objects.
+
+Paired with G4 MoE shared seed (P certificate already accepted, -8.6 ms at P8192-0, waiting only on a
+serving-set regeneration), these two are -19.8 ms at the goal cell's prior from work that is already
+done rather than proposed.
+
+Having been caught twice by a passing result nobody read, all 67 campaign jobs in the queue's `done/`
+were then swept by exit code. Nothing else is hiding: the remaining unreported rc=0 runs are genuine
+nulls, and both say so in their own output. `parbranch-t3-d20` moves the decode tick by less than the
+control drift (rows 8: ctl 42.73 / on 42.71 / ctl2 42.78; rows 16: 48.83 / 48.72 / 48.93), with
+retrieval 39/39 and the serving guard passing. `kvslots2-gate-f` prints its own verdict --
+`ms/step: ctl 45.29 on 45.34 ctl2 46.06, on-ctl -0.33 floor 0.77 neutral` -- with all 8 ranks
+token-identical. Worth repeating as method: a job's rc=0 means it ran, not that anyone read it, and
+the tracker's "queued" is not evidence of anything.
+
+## The in-tree port emits the packet rb-t4 is measuring (2026-09-14)
+
+`rb-t4` runs the EXPORT's packet, built on `e724c7bd`. What was committed is a PORT onto main. Those
+are not the same tree, so before the T4 numbers could be claimed for the commit, the emit had to be
+reproduced in-tree. Both gates ran against `target/release/plowc` from this branch, using the same
+recipe replay and flags as lever-hunt `scripts/emit_t1.sh`:
+
+| gate | result |
+|---|---|
+| knob-off `model.pkt` | `8b15f4a28b289a72` -- **byte-identical to production**, so the port does not touch the default path |
+| `PLOW_GLM_ROWBAND_ATTN=1` `model.pkt` | `b73d4440c2814625` -- **byte-identical to the export's packet, which is what rb-t4 runs** |
+
+So the served T4 describes this commit, not only its ancestor.
+
+The knob-off `PLOW_PACKET_HASH` does NOT match production (`0x164ae4a829ecebec` vs
+`0x6dc830f4826df097`) even though the packet bytes are identical, and that is expected rather than a
+defect: `pairing_hash` (manifest.rs:2252) covers `union` / `objects` / `tuning`, and `tuning` carries
+`tile_lookups` (manifest.rs:980). This tree probes as build `gfx942-97116a9dc1be9326`, against which
+all 4961 tuning records are stale, so tile selection fell back to the analytical model and the stamp
+moved with it. A deployment emitted from this tree therefore needs its own object set -- the ordinary
+packet/objects pairing contract, not a regression.
+
+Worth collecting separately: BOTH emits print `ALL 1584 (resp. 1659) dense-GEMM tile(s) chosen by the
+ANALYTICAL MODEL. This build is UNMEASURED -- pick_tile reports tier portable, which is what it
+reports when no campaign has ever run.` The export fell back the same way (its own log says so
+against build `gfx942-fd1cb965cd14133c`), so the A/B is fair and the comparison stands. But it means
+every number in this campaign's row-band work was measured on analytically-tiled GEMMs, and a tuning
+campaign for the current build hash is an uncollected win the compiler is explicitly asking for.
+
+Method note: the first attempt aborted at `knob_spec.rs:1682` with `checkpoint K rejected the knob
+configuration: spawn failed`. That was the harness, not the port -- `PLOW_VERIFY_BIN` was unset, so
+checkpoint K could not spawn the Lean verifier. stageD is required here; stageC rejects rule names
+this tree carries.
+
+## Toward 490 ms: the qualified emit levers stack in one packet (2026-09-14)
+
+The goal moved from 550 to 490 ms. Row-band alone puts the served `isl8192-c1` median at 529.5, so
+another ~40 ms has to come from somewhere, and landing levers one at a time cannot get there before
+the serving-set regenerations pile up. The alternative is one regeneration carrying every lever that
+is already qualified. Checkpoint K runs per emit, so whether they can coexist is answerable on CPU
+before any object is built -- and they can:
+
+| emit | packet | stamp | size |
+|---|---|---|---:|
+| knob-off baseline | `8b15f4a28b289a72` | `0x164ae4a829ecebec` | 252.98 MB |
+| row-band only | `b73d4440c2814625` | `0xcb199ced952dd0cd` | 274.49 MB |
+| G4+G3+G5+fusepost | `adb919ca12df9c56` | `0xdd1caa721c7f7a8f` | 245.91 MB |
+| the same + row-band | `9e76b70bf97ee4a6` | `0xa62d50f49ecc4f9a` | 265.60 MB |
+
+Both stacked emits returned rc=0: `PLOW_GLM_MOE_SHARED_SEED` (G4, P certificate accepted, -8.6 at
+P8192-0), `PLOW_GLM_MOE_NATIVE_ALIGN` + `PLOW_GLM_FUSE_SEAM_RN` (G3+G5, T4 PASS and retrieval 39/39
+on 2026-09-14) and `PLOW_GLM_FUSE_POST` (-4.1, bit-exact) coexist, and coexist with
+`PLOW_GLM_ROWBAND_ATTN`.
+
+The sizes are a useful cross-check rather than noise: the stack is 7.1 MB SMALLER than the knob-off
+baseline, which is what fusions should do -- G3's native align, G5's fused Residual+RmsNorm and
+fusepost's GEMM+q-RoPE each collapse ops -- while row-band adds about 20 MB of siblings in both
+variants, matching its T1 program counts.
+
+Predicted path to 490 from the 529.5 row-band figure, all from measured work:
+
+| step | ms | cumulative |
+|---|---:|---:|
+| the stack above (G4 -8.6, G3 ~-5, G5 ~-2.3...-3.3, fusepost -4.1) | ~-20 | ~510 |
+| router overlap L1 (T3 PASS; patch not yet in-tree) | -11.2 | ~499 |
+| packproj, once the Tensile epilogue removes its out-of-GEMM ColSplit copy | -8 | ~491 |
+| row-split salvage A (union in its own segment) | -6.6 | ~484 |
+
+Independence is a prediction, not a measurement: row-band deletes ATTENTION collectives (the Q/O
+all-to-all and the o_proj reduce-scatter) while router overlap targets the MoE hidden all-gather, and
+G3/G4/G5 are MoE and glue, so they act on different structures. The stacked T4 is what tests it.
+`PLOW_GLM_ROUTER_OVERLAP` is not in-tree yet; its landing patch is
+`/workspace/agband-c08d1232/router-overlap-on-2655520b.patch`, verified to apply clean to main.
+
+Note the wildcard that sits under all of these: every emit here reports `ALL dense-GEMM tile(s)
+chosen by the ANALYTICAL MODEL ... tier portable, which is what it reports when no campaign has ever
+run`. The whole ladder is being measured on unmeasured tiles.
+
+## Row-band served T4: PASS, and the 550 ms goal is met (2026-09-14)
+
+Four arms, three metrics, four cells, zero failed requests anywhere. No arm is worse than the control
+mean beyond its floor, so the P serving gate passes.
+
+| cell | metric | pooled effect | floor | x floor |
+|---|---|---:|---:|---|
+| **isl8192-c1** | TTFT | **-84.4** | 4.93 | **17.1** |
+| isl8192-c16 | TTFT | -166.3 | 5.04 | 33.0 |
+| isl8192-c16 | TPOT | -9.3 | 1.85 | 5.0 |
+| isl8192-c16 | E2E | -1375.9 | 289.6 | 4.8 |
+| isl4096-c1 | TTFT | +2.4 | 7.58 | 0.3 (not worse) |
+| isl65536-c1 | TTFT | -1208.9 | 47.7 | 25.3 |
+| isl65536-c1 | E2E | -1263.7 | 56.5 | 22.4 |
+
+**Goal cell 613.4 -> 528.4 ms.** The arms reproduce almost exactly: controls 613.9 / 612.9, treatments
+529.5 / 528.4, so the effect is about 84x the harness's own null.
+
+Three things this settles that earlier rounds could not.
+
+**The 4096 cell is not a regression.** Mid-run the treat arm read +4.0 ms against ctl and that looked
+like a real cost. `ctl2` then came in at 361.0, a control-to-control drift of +4.3, with treat sitting
+BETWEEN the two controls. Scored properly the effect is +2.43 at 0.3x floor. The byte-identical
+program argument holds after all, and the lesson is that a two-arm read of a small effect is worth
+nothing without the second control.
+
+**Long context does not bind, it benefits.** The `isl65536-c1` cell was added expecting row-band's
+fixed replicated weights to squeeze KV as context grew. Instead it is the largest win in the run:
+TTFT -1208.9 ms (-23%), E2E -1263.7, zero failures, and the server log prices the cost exactly --
+`replicated_gib=29.25`, `free_gib=55.58` per rank against the control's 83.44, with no refusal, no
+OOM and the same ten warnings as the control. The compute saving scales with attention work while the
+memory cost stays flat. Caveat: that cell is concurrency 1, so it shows long context works, not long
+context under load.
+
+**The T4 describes the committed port, not just the export.** Emitting in-tree reproduces
+`b73d4440c2814625` byte for byte, and the knob-off packet stays `8b15f4a2`.
+
+Ledger: 48 entries appended. Remaining for a default flip: retrieval with the arm on (the harness
+gate now points at these four PASS markers) and checkpoint P.
+
+Against the 490 ms target that replaced 550, row-band alone leaves 38.4 ms. `stack-t4` follows.
+
+## Two decode/serving traps found while chasing 490 and 25 ms (2026-09-14)
+
+**A serving object set that is missing ONE file refuses the packet, and the message names neither
+the file nor the knob.** `stack-t4-b-treat` died 18 s into load with `Device("sparse FP8 MLA
+requires qualified gfx942 QH8 geometry and V2 prefill routing")`, while the control -- same
+runtime, same env, same row-band knob -- loaded fine. The cause is not the stacked levers. In
+`exec/amd.rs` the `row_split_ready` argument to `check_sparse_fp8_packet` is literally
+`hsaco_dir.join(amd_sparse_mla::OBJECT16).exists()`, i.e. whether
+`mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co` sits in the object directory. Without it the guard's
+row-split branch is unreachable, every row-band `i[1]=64` instruction falls to the `d.i[1] != 8`
+test, and the packet is refused. `objs-stack-rb` had been built without that pinned vendor object
+(it is copied, not compiled). Installing it -- sha matches the pinned `OBJECT16_HASH` -- and
+re-running the manifest (120 -> 121 entries) fixes the arm. **Check object-set diffs against a
+KNOWN-GOOD set before blaming a lever**: `comm` over two `ls` listings found this in one command.
+
+**The low-rung decode tiers are already on, so their headroom is already spent.** Chasing
+"C1 decode 25 ms" it is tempting to reach for the two T2 numbers in Side findings -- the
+production decode object at one row costing 5.6x the MM=1 build, and the fused shared gate|up
+GEMV at 103 us against 31 us for two plain GEMVs. Neither is available:
+
+* `PLOW_HSACO_LOWRUNG` is unset in every serving arm (`t4-arm.sh` even unsets it explicitly), but
+  the runtime DISCOVERS the tiers anyway -- `exec/amd.rs` falls back to `discover_lowrung_tiers`
+  and logs `decode tiers discovered next to the object dir (PLOW_HSACO_LOWRUNG unset)`. Every
+  rb-t4 and stack-t4 server log carries that line with
+  `lowrung1:1,lowrung2:2,lowrung4:4,lowrung8:8,lowrung16:16`. **The measured TPOT 40.0 ms at C1
+  already runs the MM=1 object at rung 1.**
+* Both T2 figures were measured ON THE MM=16 OBJECT, which rung 1 therefore never executes. The
+  un-fused gate|up candidate may still be real, but it has to be re-priced on the `lowrung1`
+  object before it can be counted; the old number does not transfer.
+
+So the C1 decode lever list is MTP (`spec-t3`, full-depth gate B PASS: 90.7% acceptance, 3.68
+committed tokens per verify at k=3) and not much else that is already priced. Note MTP moves TTFT
+the WRONG way for the 490 goal: prefill must run layer 78 to fill the MTP KV, about +1/78 of a
+prefill, and the two goals are then in tension on the same packet.
+
+**"Beat vLLM on throughput" had no measurement to stand on.** The only recorded vLLM figures are
+C1 TTFT 570.0 (8192) and 310.6 (4096), and `reports/vllm-8k-profile.md` is gone from scratch.
+There is NO recorded vLLM TPOT or output throughput at ANY concurrency. `vllm-t4/vllm-arm.sh`
+fixes that: same `vllm bench serve` client, dataset, seeds, lengths and prompt counts as
+stack-t4, two arms for a vLLM-side drift floor. It needs the ROCm shim
+(`scripts/glm53_vllm_shim.sh`, recovered from history) because the 0.28 wheel runs with nix glibc
+first and every system binary its AITER workers fork dies without it; `VLLM_ROCM_USE_AITER=0` is
+not an escape hatch, since GLM-5.3's DSA indexer has no non-AITER ROCm kernel.
+
+Control reproducibility on this runtime is excellent: stack-t4 ctl 520.6 / ctl2 519.0 ms at
+`isl8192-c1`, a 1.6 ms drift, and the c16 cell reproduced rb-t4 to 0.1 ms across two runtimes.
+Row-band alone under this branch's plowrt is ~9 ms faster than under lever-hunt's, so the stack
+needs -29.8 ms rather than -38.4 to reach 490.
+
+## MTP and the TTFT stack are on mutually exclusive packets (2026-09-14)
+
+The goal now has three parts -- 8K C1 TTFT under 490 ms, C1 decode TPOT 25 ms, and serving
+throughput beating vLLM. The first two cannot be satisfied by one packet as things stand.
+
+`assets-c6-mtp` (packet `1f7776fd053480f7`, the one `spec-t3` measures) was emitted with
+`PLOW_GLM_SEQ_PAR=0` and `PLOW_GLM_SEQ_PAR_PROJ=0` EXPLICITLY. `emit.glm_seq_par` is a
+Production default that resolves TRUE for GLM TP8 (`knob_spec.rs:799`; the resolver test at
+`knob_spec.rs:2087` asserts it), and `emit_config.replay` omits defaults -- so its presence in
+the MTP replay block means it was deliberately overridden, while `rb-rowband` and `stack-rb`
+carry no entry and therefore run WITH sequence parallelism.
+
+`plans/mtp-spec-decode.md` gives the reason in one line: prefill-MTP runs the layer-78 block over
+all T rows to fill `kv.78`, but "under SP prefill, `xn` is valid on the rank's band only
+(`mla.rs:9452`). Refuse SP+MTP first."
+
+Consequences to hold onto:
+
+* **`spec-t3`'s TPOT win will not transfer as measured.** It runs a packet with neither SP nor
+  row-band, so its TTFT is nowhere near 519 ms and its decode step is not the decode step the
+  490 ms configuration runs. Treat it as "does MTP work and what is the accept length", not as
+  "what is C1 TPOT on the shipping packet".
+* **MTP costs TTFT.** Prefill gains a 79th layer's worth of work (about +1/78) to fill the MTP
+  KV, so turning MTP on moves the 490 ms goal away by roughly +7 ms unless the fill is deferred
+  past the first token or overlapped.
+* **The 90.7% acceptance figure is from random-token prompts with `--ignore-eos`**, which
+  generate degenerate repetitive text that MTP predicts almost for free. `spec-t3` has
+  natural-text cells precisely for this; the natural cells decide the lever.
+
+The path to holding both goals at once is to lift the SP refusal rather than to choose between
+them, and row-band is the precedent: it already makes ATTENTION run on each rank's own T/8 band.
+Either the layer-78 block runs per band the same way, or `xn` is all-gathered once before it.
+Neither is scoped yet.
+
+## SP+MTP looks liftable: the handoff hidden is already gathered (2026-09-14)
+
+The previous section recorded that MTP and the TTFT stack sit on mutually exclusive packets
+because `plans/mtp-spec-decode.md` refuses SP+MTP: prefill-MTP wants `xn` over all T rows and
+under SP each rank holds only its band. Reading the reference implementation changes the
+estimate, because the refusal turns on a question the plan left open -- whether MTP recycles the
+PRE- or POST-final-norm hidden -- and vLLM answers it.
+
+`deepseek_mtp.py` `DeepSeekMultiTokenPredictorLayer.forward` ends:
+
+    hidden_states = residual + hidden_states  # pre-final-norm (logits hidden)
+    if self.mtp_block.use_sequence_parallel_moe:
+        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+        hidden_states = hidden_states[: positions.shape[0]]
+    # Recycle the post-final-norm hidden into the next draft step.
+    # compute_logits applies shared_head (== final norm) to the pre-norm
+    # element, so logits and the recycle each get exactly one final-norm.
+    # Matches SGLang's deepseek_nextn.
+    return hidden_states, self.shared_head(hidden_states)
+
+Two things follow.
+
+**The recycle is POST-final-norm.** Element 0 is pre-norm and goes to `compute_logits`, which
+applies `shared_head` itself; element 1 is already normed and is what the next draft step
+consumes as `previous_hidden_states` (`hnorm` then runs on it inside MTP). The plan's family
+table calls `h_t` the "target pre-norm final hidden", and that is the imprecise line; the plan's
+own note at the recycle-point risk ("vLLM DeepSeek/GLM-DSA recycles post-norm") is the correct
+one.
+
+**Plow already produces exactly that tensor, gathered, under SP.** The prefill tail calls
+`glm_sp_norm_gather` (`mla.rs:5138`), which RMSNorms this rank's band into peer slot 3 and then
+`emit_xall_gather`s `(out, t * h, 3 * n.slot_b)` -- so `n.xn` is the full T x h POST-final-norm
+hidden on every rank, which is precisely what prefill-MTP needs to fill `kv.78`. **No new
+collective is required for the handoff.** Lifting the refusal looks like an emission-ordering
+change: emit the layer-78 block after the tail gather rather than against a band-only `xn`.
+
+Note also that vLLM runs MTP WITH sequence-parallel MoE -- the all-gather above is the MTP
+block's own SP handling -- so SP and MTP coexisting is not novel, it is what the reference does.
+
+This does not make MTP free for the 490 ms goal: prefill still gains a 79th layer's work to fill
+the MTP KV (about +1/78, roughly +7 ms on a 520 ms TTFT) unless that fill is deferred past the
+first published token or overlapped. But it removes the "needs a new T x h all-gather" cost from
+the estimate, which was the expensive branch.
+
+Still unverified here: that plow's `n.xn` and vLLM's recycled tensor agree numerically. That is
+the plan's P2 gate (layer-78 hidden and top-1 against `DeepSeekMTPModel` on the same prompts),
+and it should be run before anyone ports the emit.
+
+## Stacked-lever T4: PASS, and the levers cannibalise each other (2026-09-14)
+
+Four arms, three cells, three metrics, zero failed requests. No arm worse than the control mean
+beyond its floor, so the P serving gate passes. `ctl`/`ctl2` = row-band alone (`b73d4440`),
+`treat`/`treat2` = row-band + G4 + G3 + G5 + fusepost (`9e76b70b`), ONE plowrt for every arm.
+
+| cell | metric | pooled effect | floor | x floor |
+|---|---|---:|---:|---|
+| **isl8192-c1** | TTFT | **-8.86** | 5.42 | 1.6 |
+| isl8192-c16 | TTFT | -18.21 | 5.84 | 3.1 |
+| isl8192-c16 | TPOT | -1.21 | 2.12 | 0.6 (not beyond) |
+| **isl4096-c1** | TTFT | **-13.33** | 3.36 | **4.0** |
+
+**Goal cell 519.8 -> 509.8 ms. The 490 ms target is NOT met, by 19.8 ms.**
+
+**The headline finding is that the levers are not additive, and at 8192 they are worse than
+not-additive.** Priced separately the stack is G4 -8.6, G3 ~-5, G5 ~-2.3...-3.3 and fusepost
+-4.1, about -20 total. It delivers -8.86 at 8192. Worse, at 4096 -- where `FUSE_POST_SCOPE` is
+`rows: (8192, 8192)` so fusepost is NOT in the packet's path at all -- the same stack delivers
+**-13.33**, half again as much. Adding a lever priced at -4.1 made the total SMALLER. At floors
+of 3.4 and 5.4 that is not noise.
+
+The mechanism is presumably that G3's native align, G5's fused Residual+RmsNorm and fusepost's
+GEMM+q-RoPE all collapse ops in the same MoE/glue region, so each one's saving is partly the
+saving the next one was going to make; fusepost, arriving last and only at 8192, may also be
+displacing a better hipBLASLt pick. Row-band is the counter-example that proves the point: it
+deletes ATTENTION collectives, is structurally disjoint from all of them, and stacked cleanly.
+
+Two consequences for how this campaign should pick levers:
+
+* **Stop adding levers that act on the same structure.** The remaining ladder (router overlap
+  -11.2, packproj -8) is priced the same separate way and should be expected to under-deliver by
+  a similar fraction when combined with what is already in the packet.
+* **Next experiment is a SUBTRACTION, not an addition:** emit G3+G4+G5 WITHOUT fusepost and
+  re-run the 8192 cells. If 8192 then behaves like 4096 that is ~4 ms recovered and it identifies
+  the toxic pairing. One CPU emit, no new objects if the tensor set is unchanged.
+
+Caveat on the goal cell specifically: its harness null is `ctl2 - ctl -3.2 [-7.0, -1.0]`, which
+does NOT contain zero -- real control-to-control drift at exactly the cell the goal is judged on.
+The floor absorbs it and the effect still clears at 1.6x, but `isl4096-c1` (4.0x, null contains
+0) and `isl8192-c16` (3.1x, null contains 0) are cleaner reads than the goal number itself.
+
+TPOT is unchanged everywhere beyond its floor, as expected for prefill-only levers: the C1 decode
+goal gets nothing from this packet.
+
+## TTFT is 8% segment-launch overhead, and the row-20 ceiling is written twice (2026-09-14)
+
+**Where the 8192 C1 TTFT actually goes.** `PLOW_TTFT_LOG=1` on the stack packet, medians over 10
+requests (`ttftgap/probe.sh`):
+
+| phase | ms | % of TTFT |
+|---|---:|---:|
+| tokenize (HF BPE) | 15.53 | 3.1 |
+| prefill total (engine thread) | ~480 | 97.2 |
+| ... `enqueue_segment` (AQL launch) | **39.81** | **8.0** |
+| ... `drain` (host barrier, the GPU) | 431.27 | 87.6 |
+| `begin_slot` | 0.27 | 0.1 |
+| first-token detok + send | 0.02 | 0.0 |
+| UNACCOUNTED (HTTP, axum, SSE) | 0.06 | 0.0 |
+
+Two corrections to what this campaign believed. The rung board priced roughly 33 ms "outside the
+engine" at 8192 (tokenize 8.6-17, an untimed handler->first-SSE remainder 10-16, upload, JSON);
+measured now, host admission is about 15 ms total and the untimed remainder is **0.055 ms**.
+`begin_slot` is 0.27 ms, so `PLOW_VMM_RELEASE_RETIRE` genuinely fixed the 98-134 ms clear.
+
+The real non-GPU cost is **`enqueue_segment`: 39.8 ms to launch 1414 segments, about 28 us each,
+8% of TTFT and nearly twice the remaining gap to 490.** Segment count is not just a structural
+tax on token-batch bodies -- it is already the largest addressable non-GPU item in the shipping
+configuration. Any change that halves segments is worth about 20 ms of TTFT on the host side
+alone, before any GPU effect.
+
+This reframes review log #63's "deficit is structural: 1314 vs 625 segments": at 28 us a segment
+a body adds roughly 19 ms of pure enqueue, which is most of its measured -6.6% tok/s. A unified
+prefill/decode rung ladder only pays if it REDUCES segment count.
+
+`PLOW_ENCODE_FAST=1` moved tokenize 15.53 -> 13.69 ms median (TTFT 499.13 -> 496.99), consistent
+with the documented 12.3 -> 11.1, but at n=10 against a 9.8-19.9 ms spread it is directional, not
+resolved. Ids are identical to the default `encode`, so it cannot change a token.
+
+**Decode rungs above 20: three walls, not one.** Emitting ladders 32/64/128 (`wide-ladder`,
+`defaults` probes) gives `1,2,4,8,16,20` rc=0 (baseline packet `8b15f4a2`) and everything wider
+aborting, in this order:
+
+1. `mla.rs:4763` -- `PLOW_GLM_SELECT_LOCAL`'s radix selection asserts
+   `matches!(rows, 2|4|8|16|20)`. A production default worth +10.6% C20 / -19% median ITL.
+2. `mla.rs:4121` (with select_local off) -- `sparse && fp8kv` asserts
+   `nh_l == 8 && dk == 512 && dr == 64 && rows <= 20 && glm_gf(ctx, nh_l) == 4`.
+3. `exec/amd/object.rs:2146` -- the same `rows > 20`, again, at LOAD.
+
+So `rows <= 20` is written in the emitter AND the loader, on top of `build_gfx942.sh` capping
+`PLOW_GEMV_MM` at 16 (a wider width refuses without `PLOW_GEMV_WALK=1`) and the objects needing
+to exist at those widths. That is the Band64 project, whose route the rung board still records as
+"none" after three T2 load refusals, and 128 is past even its `SPARSE_FP8_DECODE_ROW_MAX=64`
+design.
+
+**Packed-prefill siblings emit clean and are worth a T4.** `emit.emit_packed_prefill` is already
+a Qualified production default (`true` on gfx942 with the `packed_prefill_siblings` cap,
+evidence: ordinary programs byte-identical with the siblings). It is off for us only because
+`GLM53_RECIPE` -- documented as mirroring the build.json replay rather than as an independent
+judgement -- pins it false, following the a7596da2 recipe. The recorded reason to hold it was
+"packed prefill + token-batch bodies stay opt-in UNTIL SPAN-AWARE 8192 LANDS", and span-aware
+8192 plus final-chunk packing both landed. Emitted on top of the stack it is accepted by
+checkpoint K: `packedpf-rb` `4b505c63a9540501` / `0xb0670117e48b8979`, and alone
+`packedpf-bare` `b7c2d5f2fac2639a` / `0x573a11097fea18b3`. Note this is REQUEST packing and is a
+different mechanism from the token-batch bodies that measured -6.6% tok/s; it needs objects and a
+T4 before any flip.
+
 ## Rejected or parked
 
 | candidate | reason |
 |---|---|
+| Router/hidden-gather overlap level 1 | T3 saved 11.2 ms/P8192, but exact T4 100×70K/C20 regressed output 93.31 → 91.94 tok/s (−1.47%), median TTFT 58.678 → 58.746 s, TPOT 126.65 → 128.55 ms, ITL 51.37 → 51.43 ms. Keep opt-in. |
 | Plow GEMM tiles, split-K, grid (#87) | hipBLASLt wins every prefill shape on one clock; plow keeps GEMV at decode 1–2 |
 | Decode kernel re-pick (#88) | T2 −7.7 ms predicted; T3 +0.5 ms measured |
 | G2 router pre-all-gather | −1.2 ms, inside the 4.3 ms floor |
@@ -168,6 +847,23 @@ Row-split attention (`PLOW_GLM_ROWSPLIT_ATTN`, rowsplit agent, −40…−75 ms 
 packproj reconciliation: the band-width `ColSplit` calls (78 per 8192 program) cost 480–547 µs each, which explains ≈ 40 of the 50–73 ms. With the fixed kernel it predicts D20 −2.0 ms/step and prefill −3.5…+0.6 ms (unresolvable), so `packproj-t3b` decides it as a decode lever.
 
 ## Side findings
+
+- Exact 100×70K/C20 on the corrected host mux, row-band on: 100/0, 93.31 output tok/s,
+  median TTFT 58.678 s, TPOT 126.65 ms, ITL 51.37 ms. This is +5.1% over the prior 88.76
+  tok/s run; live metrics showed 13 admitted + 7 queued at the 966,018-row KV budget with no OOM.
+- GLM router correctness blocker: `GLM_ROUTER_FLAGS` used bit 2 for bias while `op_moe.h`
+  also decoded it as sqrtsoftplus. GLM therefore used the wrong gate transform on every normal
+  split prefill/decode route. The fix moves sqrtsoftplus to bit 5 and pins distinct named bits.
+  All interpreter objects must be rebuilt, then retrieval/output and performance rebaselined.
+- Dtype audit vs vLLM found two more gaps: GLM router logits must be FP32 (current `rlogit` is
+  BF16 and no BF16×BF16→FP32 producer exists), and the indexer Q/K cache should use dynamic FP8
+  plus scales (current pool=1 path is BF16). The latter is expected to save about 3.4 GiB/rank
+  at 70K/C20 and about 182 MB/rank of index-K reads per decode token over 21 full-index layers.
+- Production AITER/shared-seed scratch now sizes emitted fallbacks instead of the widest generic
+  MoE path: `part` 1,610,612,736 → 201,326,592 B, `fu_g` 50,200,576 → 25,555,968 B,
+  `shared` 100,663,296 → 6,291,456 B, and the unused 100,663,296 B `zero_h` is gone. Recovery
+  = 1,628,965,888 B/rank (1.517 GiB). The full standard ladder emits with all Lean ordering/LDS
+  checks passing; 66 GLM tests pass. Packet stamp remains `0xa62d50f49ecc4f9a` so objects are reusable.
 
 - MTP speculative decoding (full depth): gate B PASS after fixing draft steps 2+ reusing step 1's top-k over a longer
   kv_len (read a −1 selection row → GPU fault). Acceptance 739/815 drafted (90.7%), 3.68 committed tokens per verify

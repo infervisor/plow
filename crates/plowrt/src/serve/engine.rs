@@ -288,6 +288,19 @@ impl ServeEngine {
         }
     }
 
+    /// What the device can back, so the mux admits on KV bytes instead of free slots alone.
+    /// `None` = admit on slots, the behaviour every non-AMD engine keeps.
+    pub fn kv_admission_budget(&self) -> Option<crate::sched::admission::KvBudget> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => None,
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => e.kv_admission_budget(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => None,
+        }
+    }
+
     pub fn prefix_cache_enabled(&self) -> bool {
         match self {
             #[cfg(feature = "cuda")]
@@ -1207,6 +1220,17 @@ mod amd_serve {
         }
     }
 
+    /// On a step the dense-exact twin serves, a parked row attends one key instead of its whole
+    /// window. Its output is discarded, the twin reads `kv_len` only in its flash, and every KV
+    /// and indexer-key writer takes its row from `pos`, so the row's writes are unchanged.
+    fn park_kvlen(kvlen: &mut [u32], parked: &[u32]) {
+        for (k, &p) in kvlen.iter_mut().zip(parked) {
+            if p != 0 {
+                *k = 1;
+            }
+        }
+    }
+
     fn invalidate_prefix_metadata(
         enabled: bool,
         cached_prompt: &mut [Vec<u32>],
@@ -1476,6 +1500,12 @@ mod amd_serve {
 
         pub fn decode_rungs(&self) -> &[u32] {
             &self.decode_rungs
+        }
+
+        /// Rank 0's budget. The ranks are symmetric — the same packet, the same shard shape and
+        /// the same KV geometry on every one — so one rank's figure is the group's.
+        pub fn kv_admission_budget(&self) -> Option<crate::sched::admission::KvBudget> {
+            self.ranks.rank0().kv_admission()
         }
 
         pub fn overlap_evidence(&self) -> Vec<AmdOverlapRankEvidence> {
@@ -2980,7 +3010,11 @@ mod amd_serve {
                                 quantum,
                             )?,
                             Ranks::Tp(g) => {
-                                g.submit_decode_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
+                                let run = g.decode_prog_advancing(dp, &self.kvlen_stage, &self.parked_stage);
+                                if g.rank(0).prog_dense_exact(run) {
+                                    park_kvlen(&mut self.kvlen_stage, &self.parked_stage);
+                                }
+                                g.submit_decode_batched_at(&self.pos_stage, &self.kvlen_stage, run)?;
                                 g.complete_decode_batched_deferred(self.batch, step, quantum)?;
                             }
                         }
@@ -3301,6 +3335,10 @@ mod amd_serve {
                         tracing::info!(rung = w, occupied = rows, "decode ladder rung");
                         self.last_rung = w;
                     }
+                    let run = g.decode_prog_advancing(dp, &self.kvlen_stage, &self.parked_stage);
+                    if g.rank(0).prog_dense_exact(run) {
+                        park_kvlen(&mut self.kvlen_stage, &self.parked_stage);
+                    }
                     tracing::debug!(
                         rung = w,
                         pos = ?&self.pos_stage[..(w as usize).min(self.pos_stage.len())],
@@ -3312,7 +3350,7 @@ mod amd_serve {
                     g.upload_parked(&self.parked_stage)?;
                     g.seed_ids(&self.next_id)?;
                     let started = measure_dispatch.then(std::time::Instant::now);
-                    let out = g.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
+                    let out = g.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, run)?;
                     (
                         out,
                         dp,
@@ -4013,6 +4051,27 @@ mod amd_serve {
 
             stage_parked(&mut parked, &[]);
             assert_eq!(parked, [1, 1, 1, 1]);
+        }
+
+        #[test]
+        fn dense_exact_twin_counts_and_parks_only_rows_outside_advance() {
+            use crate::exec::kvrow::decode_dense_exact;
+            // Slot 0 decodes at 2047 keys, slot 1 is mid-chunked-prefill at frontier 4096, slot 2
+            // retains a 3000-row prefix, slot 3 is idle.
+            let mut kvlen = vec![
+                slot_decode_position(2046, true, None, true) + 1,
+                4097,
+                slot_decode_position(3000, false, None, true) + 1,
+                slot_decode_position(0, false, None, true) + 1,
+            ];
+            let mut parked = vec![0; 4];
+            stage_parked(&mut parked, &[0]);
+            assert!(!decode_dense_exact(&kvlen, &[], 2048));
+            assert!(decode_dense_exact(&kvlen, &parked, 2048));
+            super::park_kvlen(&mut kvlen, &parked);
+            assert_eq!(kvlen, [2047, 1, 1, 1]);
+            kvlen[0] = 2049;
+            assert!(!decode_dense_exact(&kvlen, &parked, 2048));
         }
 
         #[test]

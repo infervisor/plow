@@ -113,6 +113,7 @@ Severity: **blocker** (must fix before main), **should-fix** (correctness/robust
 | 102 | 2026-09-14 | this commit | compiler (egglog rewrite reaches devgen, default on) | `PLOW_EMIT_REWRITE` default on (`emit_config.rs`, `knob_spec.rs` Qualified + `EMIT_REWRITE_SCOPE`, generated `knob_gen.rs`); `rewrite::rewrite_graph_outputs` / `FusedGraph::sites` / `fused_sites_for_config` / `SitesError` (`extract.rs`, `lower.rs`, `lib.rs`); new rules `norm-residual-rmsnorm-fuse`, `norm-residual-scale-rmsnorm-fuse` (`rules.egg`, `schema.egg`, `Plow/Rewrite.lean`); `devgen/src/rewrite_lower.rs`; sites in `lib.rs` `emit_phase` and `mla.rs` `emit_glm_mla` / `glm_fuse_seam`; plowc `main.rs` `rewrite_sites` | **The fused graph the egg rules extract now decides devgen's residual/norm seam fusions by default (was: `rewrite` analysis-only, hand fusions per emitter).** plowc runs the existing `rewrite_graph` pass (same rules, extraction, cost model) over every graph output and passes fused kind -> anchor checkpoint weight names; `rewrite_lower` maps `FusedResidualNorm`/`FusedResidual3Norm` -> `AddNorm` and `FusedNormResidualNorm`/`FusedNormResidualScaleNorm` -> `NormResidualNorm`; each emitter asks with the gamma it would fuse on, and its preconditions (TP, rows, LDS fit, decode only) still gate. Knobs with no rule (XRN, XR_RES, FUSE_ROPE, FUSE_POST, FUSE_QNORM) keep control. **Fallback, not refusal:** with no graph builder or an unparseable config the emit logs one line and keeps the hand fusions (a rewrite failure on a supported architecture warns and does the same); only an explicit `PLOW_EMIT_REWRITE=1` refuses. Fallback emits byte-identical to pristine e724c7bd: gpt_oss, qwen3_5 (fixture config lacks `mrope_interleaved`), Kimi-K2 golden fixture (no `scoring_func`), Gemma-4-26B-A4B MoE. kimi_k25 block, deepseek_v4 and qwen3_asr (config-only, every target) panic identically in pristine and patched devgen, after the fallback line. **Unchanged by the flip** (defaults vs pristine e724c7bd, `model.pkt` / `plow_config.h` / `PLOW_PACKET_HASH`): GLM-5.3 TP8 production emit (build.json replay + `PLOW_MLA_PF_V2=1 PLOW_MLA_PF_AITER=1 PLOW_UNISEG=0`) 8b15f4a2 / 51032889 / 0x6dc830f4826df097, checkpoint S 0 differences 11/11; GLM-5.3 TP4 recipe S 0 differences 12/12; Gemma-4-12B gfx942 bad5030e, S 8/8; plowc llama / qwen3 / gemma4 fixtures and qwen3 metal3; devgen qwen3 / llama / gemma4 goldens. **Changed by the flip** (checkpoint S, `=0` vs default, all in scope): GLM-5.3 TP8 production recipe with `PLOW_GLM_FUSE_B1=0 PLOW_GLM_FUSE_SEAM=0`, and the unflagged gfx942 TP8 emit (production defaults only): 2797 differences, per decode rung (1,2,4,8,16,20) 155 `Residual` + 155 `RmsNorm` -> 155 `AddNorm` (78 B1 + 77 seams), prefill unchanged; Kimi-K2 synthetic block 2 with a complete router config: 1 `Residual` + `RmsNorm` -> `AddNorm`. **Numerics change on those emits:** `AddNorm` reduces over the un-rounded sum, so it is not bit-identical to the split pair (the reason B1 was opt-in); any MLA recipe that did not already set `PLOW_GLM_FUSE_B1` (and SEAM at TP > 1) needs `PLOW_EMIT_REWRITE=0` to keep its packet. **Cost:** the whole-graph rewrite runs on every plowc devblob emit, about +3 s CPU on GLM-5.3 (about +1 s Gemma-4-12B). **Verification:** checkpoint A covers the two new rules (`rfl`; 29 rules; `plow_verify-stageD` accepts, stageC rejects the new names; stageD re-verifies the four `perf-certs`). No Lean statement ties a devgen opcode to its unfused pair: `lower_AddNorm` and `lower_NormResidualNorm` are named, not proven, and rest on the hardware gates that qualified the hand fusions. `PLOW_EMIT_REWRITE=0` is the rollback. | landed |
 | 104 | 2026-09-14 | this commit | perf (prefill, opt-in) | `PLOW_GLM_MOE_NATIVE_ALIGN`; `runtime/amd/moe_align_adapter.hip`, `exec/amd_moe_aiter.rs` native-align route, `devgen/src/mla.rs` | **The AITER MoE segment sorts its own routing table.** The four interpreter `MoeAlignPf` packets (11.8 ms tail per P8192-0 chunk, 157 us per layer, in the `Glu+MoeAlignPf+MoeRouterTopkPf+XAllGather` segment) become four host launches of `d_moe_align_pf` in a separate adapter object, same grids and partitions, so meta and row maps are the interpreter's bytes. T2 (1 GPU, captured 8192-row table, `glue3-t2align`, `glue3-t2align2`): byte-identical row maps and prepare-visible meta; 90.0 us per layer at 64 partitions (count 10.8, prefix 25.1, init 10.6, scatter 60.6), 118.2 at 304 (prefix 81.5). Knob off: `model.pkt` byte-identical; on: 300 `MoeAlignPf` fewer and 75 `MoeAiterFp8Pf` with `j = [table + 1, 64]` in programs 2 and 3, stamp unchanged. T3 stacked with #105 (`glue3-t3stack`, ctl/treat/ctl2, 6 reps, floor = |Δctl| + 2·MAD): P8192-S 650.5 / 644.2 / 650.6 ms, **−6.3** (floor 4.8, predicted −5.8); P4096-S −6.1 (floor 0.9); P8192-0 −6.0 (floor 8.0). Opt-in. |
 | 105 | 2026-09-14 | this commit | perf (prefill, opt-in) | `PLOW_GLM_FUSE_SEAM_RN`; `runtime/amd/op_norm.h` `d_residual_rmsnorm`, `interp.hip` AddNorm i2 = 1, `devgen/src/mla.rs` `glm_sp_residual_norm`, manifest / `object.rs` requires, `kvrow.rs` | **The SP attention seam's band Residual + RmsNorm run as one packet.** `d_add_norm` was not reusable: it norms the unrounded sum with a different reduction. The new arm rounds first and reduces with `rn_sumsq` over `rn_index`, like `d_rmsnorm`. T2 (1 GPU, `glue3-t2g5`, 304 blocks, prefill -D set with `PLOW_RN_ROWS=2` / `PLOW_RESID_U=4`): residual and norm byte-identical on the captured layer-77 band, a synthetic band and a 1000-row ragged band; kernel 30.4 -> 28.3 us per seam, the rest of the saving is the dropped packet. Knob off: `model.pkt` and objects unchanged (the arm and its marker compile only under the define); on: 78 `Residual` + 78 `RmsNorm` -> 78 `AddNorm` in programs 2 and 3, requires `PLOW_GLM_FUSE_SEAM_RN=1` (new stamp). T3: stacked with #104 (`glue3-t3stack`), P8192-S −6.3 (floor 4.8), P4096-S −6.1, P8192-0 −6.0. Opt-in. |
+| 106 | 2026-09-14 | this commit | perf (prefill TTFT, opt-in) | `PLOW_GLM_ROUTER_OVERLAP` (`emit_config.rs`; `knob_spec.rs` `ROUTER_OVERLAP_SCOPE`; `mla.rs` band-router emission; `mla/glm_tests.rs`; generated `knob_gen.rs`; `docs/flags-reference.md`) | **The MoE band router no longer waits on the hidden all-gather it does not read.** The router score reads the post-attention norm's band in peer slot 3 -- the same bytes the hidden `XAllGather` copies into `xn2@band` -- and is made to depend on that norm instead of on the gather, so score and top-k run while the gather is still in flight. `1`: score and top-k are emitted ahead of the shared gate/up `GemmLtPf`, inside the attention-seam segment. `2`: the route-table gather and `MoeAlignPf` move there too. Scoped to GLM TP8 sequence-parallel prefill, 2048..8192 buckets. **Bit-identical by construction** (same kernels, same input bytes, no object change); unset/`0` emits a byte-identical blob, which is the rollback. The knob-on emit stops declaring the now-unread `act.xn2@band<t>` views, so the scope allows a global `TensorBytes` difference. Evidence: T3 PASS at L1, -11.2 ms, recovered from the earlier sweep. **Lands opt-in, default unset:** a flip needs T4 plus retrieval plus a checkpoint P certificate, none of which this knob has yet. | open (opt-in) |
 | 7 | 2026-09-11 | (main) | note | devgen/tests/tuned_tile_selection.rs | 5 tests red on main and branch: tunedb records stale vs kernel-source digest; gfx950 cell cannot be refreshed here | open — re-run gfx942 campaign; gfx950 needs MI350X |
 
 ## Fixed on this branch
@@ -816,6 +817,1941 @@ chunks ride.
     retarget exists to avoid: 2.4–6.8× per the serving-8k agent's read. The retarget's own note
     measures a 464-row dense tail at 65K prior at 1.9 s, twice a full sparse 8192 chunk.
 * **Verdict:** no-go. The branch stays unmerged and the token-batch body stays opt-in.
+
+## The concurrency ceiling is an admission cap, not kernel serialisation (2026-09-14, job `conc-probe`)
+
+Every cell this campaign had measured stopped at C16/C20, so the curve past the ladder was inferred.
+It is now measured: one server on the stack packet `9e76b70bf97ee4a6`, `vllm bench serve`,
+isl 8192 / osl 128, `--request-rate inf`, C1→128 in one sweep. Seven cells, rc=0, **zero** server
+error lines and zero load refusals.
+
+| C | out tok/s | median TTFT ms | median TPOT ms | median ITL ms |
+|---|---|---|---|---|
+| 1 | 22.75 | 506.9 | 40.3 | 40.1 |
+| 8 | 107.43 | 1034.8 | 67.0 | 42.9 |
+| 16 | 140.31 | 1046.6 | 105.0 | 48.8 |
+| 20 | **146.21** | 1049.3 | 127.5 | 56.2 |
+| 32 | 137.63 | 13697.7 | 138.9 | 56.3 |
+| 64 | 139.76 | 39616.9 | 139.6 | — |
+| 128 | 133.72 | 35814.3 | 137.1 | — |
+
+* **Result:** throughput peaks at **C20 = 146.2 tok/s** and then flatlines at 134–140 for every higher
+  concurrency, while TTFT climbs to 39.6 s. ITL stays at ~56 ms from C20 on.
+* **Cause, and it is not the kernels.** `serve/mux.rs:446` — *"Slot capacity from the compiler-emitted
+  ladder — the largest decode bucket sets the ceiling for concurrent live requests."* `capacity` is the
+  widest decode rung, so the server logs `mux capacity resolved capacity=20 ingress_capacity=80`
+  (`ingress = capacity × 4`). Past C20 the surplus requests never reach the engine; they queue in
+  ingress. Flat ITL is the proof: the engine keeps running exactly 20 rows, and all the added latency
+  is queueing, none of it is work.
+* **This falsifies the probe's own stated hypothesis**, which was that beyond 20 the engine would
+  "serialise into ceil(C/20) full passes over every weight" and step the per-token cost up at each
+  multiple of 20. It does not serialise — it refuses admission. TPOT is flat at ~138 ms from C32 on,
+  not stepping.
+* **Consequence for "beat vLLM on throughput":** our ceiling is 146.2 tok/s at C20 against the recorded
+  vLLM C64 = 729.5 tok/s, a ~5× gap that no kernel-level lever can close, because the binding
+  constraint is `capacity = max decode rung = 20`. Widening the ladder is the whole lever, i.e. Band64
+  and its three walls (`devgen/src/mla.rs:4763` select_local, `devgen/src/mla.rs:4121` sparse FP8
+  geometry, `plowrt/src/exec/amd/object.rs:2146` loader), plus the `PLOW_GEMV_MM` 16 cap.
+
+## Correction: prefill segment launch is NOT 8 % of TTFT (2026-09-14)
+
+Commit `ce5ead11` records "8 % of TTFT is segment launch" from the `ttftgap` breakdown. **Both halves
+of that reading are wrong** and the conclusion it supported — that segment-count reduction was the
+largest addressable non-GPU TTFT lever — is withdrawn.
+
+* **Per-packet cost was off by 8×.** `PF_SEGMENTS.tally(launches)` (`exec/amd_tp.rs:1748`) counts ONE
+  rank's segments; the loop beneath it is `for (seg, rank) in segment_major_order(launches, n_ranks)`,
+  so the AQL packets submitted are 1414 × 8 = 11 312, not 1414. 39.81 ms / 11 312 = **3.52 µs per
+  packet**, not ~28 µs. There is no slow path to hunt.
+* **And it is not on the critical path.** The dump's COUNT column reads **1** for both
+  `enqueue_segment` and `drain`: one chunk, one uninterrupted enqueue of all 11 312 packets, one drain
+  at the end. The engine already submits everything and waits only on the last segment — the
+  `segment_major` branch at `exec/amd_tp.rs:1774`, and `submit_decode` at `exec/amd_tp.rs:1059`
+  ("segment-major, all ranks, with no intermediate drain"). The doorbell rings per packet, and
+  `QUEUE_SIZE = 4096` (`device/hsa.rs:243`) against 1414 packets per rank means the host never spins on
+  the read index. The host finishes its 39.9 ms while the GPU has 474 ms of work — 12× ahead, never
+  starving it. Deleting the entire enqueue path would move TTFT by ~0.
+* **What is in those 3.52 µs** (`device/hsa.rs:2278` `dispatch`): no module parse and no module load —
+  every `.co` is loaded once at serve start and `kernel_object` is a `u64` in the packet. Per launch it
+  is a kernarg write, a 60-byte packet memset, one atomic signal add, one doorbell store. With the
+  default `PLOW_AMD_KERNARG_VRAM=1` the ring is in VRAM behind the large BAR and
+  `publish_device_kernarg` (`device/hsa.rs:675`) adds an uncached device READ of the last byte to
+  confirm the BAR write landed.
+* **What survives:** of the host-side items only **tokenize (15.53 ms)** is genuinely additive — it is
+  serial, on the handler task, before the job is ever submitted. `text/tokenizer.rs` already has a
+  rayon split-encode path (`encode_split`), gated off because `PLOW_ENCODE_THREADS` is UNSET and
+  because it requires `split_safe(&inner)`. GLM-5.3's `tokenizer.json` was checked against that
+  predicate clause by clause and **passes**. Queued as `hostpath-probe`.
+* **Where a per-launch submit cost could still bite is decode**, which re-enqueues its segments on
+  every ~40 ms token with no 474 ms GPU run to hide behind; `obs/dstep.rs` already partitions the tick
+  (SEED/PREPARE/REARM/XCTR/ENQUEUE/DRAIN/AUDIT/READ/AGREE/STREAM), so `hostpath-probe` runs with
+  `PLOW_DSTEP_LOG=1` and osl=64 to price it against the 40 → 25 ms goal.
+
+## Row-band takes an aperture violation on the C20 retrieval suite (2026-09-14, job `rb-retrieval`)
+
+`rb-retrieval` (the `rb-rowband` packet, full-depth `PLOW_GLM_ROWBAND_ATTN` set, `quality.py
+--suite all --concurrency 20`) died rc=1 at **base 9/18, tail 0/6**:
+
+```
+Queue error: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION:
+  The agent attempted to access memory beyond the largest legal address.
+Queue at 0x7ffebc00e000 inactivated due to async error
+```
+
+The harness also printed "server error lines: 11"; **those are false positives** — its grep matches
+`fault_ms=0` inside ordinary INFO lines. The crash is the signal.
+
+Last lines before it:
+
+```
+decode ladder rung rung=20 occupied=17
+decode ladder rung rung=8  occupied=4
+decode admission rung from=20 to=16 occupied_extent=19 queued=0 reason=LowLoad
+Queue error: ...APERTURE_VIOLATION
+```
+
+Host-side suspects checked and **cleared**, so they are not the bug:
+
+* `occupied` in the engine log is already the EXTENT, not the live count
+  (`(0..batch).filter(live||pf).map(|s| s+1).max()`, `serve/engine.rs`), and it carries a
+  release-mode guard that refuses to advance a slot the rung does not cover.
+* The mux narrows ADMISSION only (`serve/mux.rs:658`, "existing high slots are never moved");
+  execution takes `controller.covering(extent)`, which for extent 19 returns the 20-wide rung.
+* `rowsplit_chunk_prog` takes the row-band sibling only when `step.clen == bucket_rows` — so ragged
+  final chunks are excluded — AND `rowsplit_prior_ok(c0, bucket_rows/8)`, which at
+  `SPAN_MIN_PRIOR = 2047` admits only prior 0 or prior >= 2047, never a band straddling row 2047.
+
+Queued `0-1789405497-rbfault-probe`: the SAME packet, objects, pinned binary and workload with
+`PLOW_GLM_ROWBAND=1` and `=0`. The packet is built to load with the gate off
+(`rowband_on || !rb_twin[id]` at load; `!rowband_on && rb_twin[i]` skips the twins), so this is a
+true null rather than a different build. Read it as: on faults + off clean => row-band's bug;
+both fault => the C20 retrieval path owns it; neither => intermittent, needs repeats first.
+
+**Until this resolves, row-band is not a default candidate**, and the stacked T4 result that rests
+on it (`-8.86 ms` at isl8192 C1) is provisional at depth.
+
+### The first A/B was VOID — it produced no null (2026-09-14, job `0-rbfault-probe`)
+
+Both arms faulted, and that reads as "not row-band" only if the `off` arm actually turned row-band
+off. **It did not.** The probe ran `lever-hunt-c08d1232/bin-rb/plowrt`, the binary the original job
+used, and that build predates the RUNTIME serve gate:
+
+```
+strings bin-rb/plowrt         | grep -c PLOW_GLM_ROWBAND  ->  4   (all *_ATTN, the EMIT knob)
+strings target/release/plowrt | grep -c PLOW_GLM_ROWBAND  ->  6   (adds the serve gate)
+```
+
+So `PLOW_GLM_ROWBAND=0` was a no-op and **both arms logged `row-split sibling selected prog=4`**.
+The design error is mine: the gate-off load path (`rowband_on || !rb_twin[id]`) was verified in
+CURRENT source, then exercised with the OLDER pinned binary. Nothing about causation follows from
+that run, in either direction.
+
+What it did establish, and this is worth keeping:
+
+* **The fault is reliably reproducible — four runs for four**, always under `quality.py --suite all
+  --concurrency 20`, always after the same rung walk (`rung=20 occupied=17` → `rung=8 occupied=4` →
+  `admission 20→16 at occupied_extent=19`). A deterministic repro makes the next A/B decisive
+  rather than a coin flip.
+* **Three signatures, all memory-safety class**: `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`
+  (`rb-retrieval`); `Memory access fault by GPU node-11 on address 0x7ef1a4199000` (v1 on);
+  `HSA_STATUS_ERROR_EXCEPTION`, an HSAIL hardware exception (v1 off).
+
+`rbfault/probe2.sh` (job `0-rbfault2`) redoes it on the CURRENT binary and the CURRENT stack packet
+`9e76b70bf97ee4a6` — the pair `conc-probe` already drove C1..C128 with zero server errors, so a
+fault under this harness is the workload's doing and not a load mismatch. Two guards this time: a
+preflight that refuses any plowrt without the serve gate, and a per-arm assertion that the sibling
+line appears exactly when the knob says it should, reporting an arm INVALID rather than scoring it.
+That assertion is precisely what v1 lacked.
+
+### v2: the fault is in the CURRENT stack packet, and `PLOW_GLM_ROWBAND=0` is a BROKEN ROLLBACK (2026-09-14, job `rbfault2`)
+
+| arm | result |
+|---|---|
+| `on` (gate=1) | **VALID: FAULTED** — sibling selected as wanted, 3 fault lines, quality rc=1 |
+| `off` (gate=0) | **server never became ready** — faulted during LOAD |
+
+Two findings, and the second was not what the probe went looking for.
+
+1. **The fault is not specific to the old `rb-rowband` packet.** It reproduces on the CURRENT
+   binary with the CURRENT stack packet `9e76b70bf97ee4a6` — the artifact the stacked T4 result
+   (`-8.86 ms` at isl8192 C1) rests on.
+2. **`PLOW_GLM_ROWBAND=0` does not work as a rollback.** With the gate off the packet faults at
+   LOAD: `Memory access fault by GPU node-8 (Agent handle: 0x5555563f8680) on address 0x13000` —
+   a near-null address — immediately after `checkpoint weights uploaded rank=0`. `flags-reference`
+   documents `=0` as the rollback for this knob; it is not one. The earlier reading of
+   `rowband_on || !rb_twin[id]` as a safe skip path was wrong. **This is a separate bug from the
+   C20 fault and needs its own fix**: a landed lever whose documented rollback crashes at load is
+   not shippable even if the C20 fault turns out to belong to something else.
+
+So a null cannot come from the knob at all. `rbfault/probe3.sh` (job `0-rbfault3-null`) takes it
+from a packet with no row-band in it: the SHIPPING serving set `plow-serving/glm53-tp8-a7596da2`,
+packet `8b15f4a28b289a72`, its own 70 objects and its own pinned `plowrt` per its README. Its
+preflight asserts the set carries **no** `OBJECT16` — that file IS the `row_split_ready` gate
+(`exec/amd.rs`: `hsaco_dir.join(OBJECT16).exists()`), so its absence is what makes the arm a null.
+One arm only, since the positive is established. Clean => row-band convicted. Faults => row-band
+exonerated AND the shipping set has a memory-safety fault under concurrent retrieval, which is the
+bigger problem and wants escalating on its own.
+
+### VERDICT: the null is clean — ROW-BAND IS THE CAUSE (2026-09-14, job `0-rbfault3-null`)
+
+```
+preflight ok: shipping set 8b15f4a28b289a72, no OBJECT16 (row_split_ready false by construction)
+   quality rc=0
+   sibling selected: 0   (MUST be 0 for this to be a null)
+   fault lines:      0
+== NULL CLEAN => ROW-BAND CONVICTED.
+```
+
+The shipping set ran the identical suite — same `quality.py --suite all --concurrency 20`, same
+client, same 67 000-token tails — **clean, with a passing quality run**. It also walked the same
+rung transitions the faulting arms did (`decode admission rung from=16 to=8 occupied_extent=20`,
+then `rung=20 occupied=20`), so the rung/admission machinery is exonerated as well. Against the
+established positive (`rbfault2` `on`: VALID, FAULTED), the lever is the only difference.
+
+**Consequences.**
+
+* Row-band causes a memory-safety fault under concurrent retrieval. It is not a default candidate
+  and not a merge candidate until fixed.
+* **The stacked T4 result is withdrawn as a shippable finding.** `-8.86 ms` at isl8192 C1 was
+  measured on `9e76b70bf97ee4a6`, and `rbfault2` showed that packet faults under C20 retrieval. The
+  number stands as a measurement of what row-band would buy; it does not stand as a result we can
+  take.
+* Row-band now has **two** separate defects: this one, and the broken `PLOW_GLM_ROWBAND=0` rollback
+  (twins bound to address 0 as a poison pointer, and something dereferences one at load — the fault
+  address `0x13000` is that base plus an offset, so the comment "nothing may read it, because the
+  siblings that would are never dispatched" is false).
+* The shipping set is healthy under this workload, which is worth recording in its own right: 18/18
+  base, 21/21 tail, zero faults at C20 with 67k tails.
+
+**Where to look next**, stated as a lead and not a conclusion: the fault needs C20 with mixed
+lengths, and does not appear in the C1/C16 fixed-shape T4 cells. Under row-band each rank owns rows
+`[rank*T/8, (rank+1)*T/8)` of the chunk; the sparse-MLA span path that feeds it is per-sequence. A
+band that spans rows belonging to more than one packed sequence, or that indexes a KV slot from the
+wrong member, would produce exactly this signature. That is the first thing to check, before the
+`rowsplit_prior_ok` / `band_keys` gate, which reads correctly in isolation.
+
+## Correction: row-band is not a memory-safety bug — wherever it runs, the answer is wrong (2026-09-14, job `rbfault4-localise`)
+
+The section above convicts row-band of "a memory-safety fault under concurrent retrieval". That
+classification is wrong, and the localisation probe that was meant to name the faulting launch is
+what falsifies it.
+
+**The instrument.** `PLOW_PREFILL_SEG_TIMING=1` takes the other branch in `amd_tp.rs`: one segment
+enqueued across all ranks, then a drain, per segment. A drain after every launch makes an async GPU
+fault synchronous, so the last line printed names the faulting segment. The probe ran the same
+`quality.py --suite all --concurrency 20` that faults, on the same stack packet `9e76b70bf97ee4a6`.
+
+**What came back.** Zero fault lines in 245,229 segment records — and the probe's own banner
+therefore printed "NO FAULT … points AWAY from one bad launch and TOWARD a cross-segment overlap".
+**That banner is read off the fault counter alone and is wrong.** `rc=1` was neither a timeout nor
+a null: the suite ran to completion, through the 67k tails, and returned
+
+| suite | length | pass | fail |
+|---|---|---|---|
+| base | 8000 | 9 | 0 |
+| base | 100000 | 0 | 9 |
+| tail | 65807 | 0 | 3 |
+| tail | 66234 | 0 | 9 |
+| tail | 67000 | 0 | 9 |
+
+with the failures returning not wrong answers but **garbage**: `" n 6 say none yes.   all .  not
+ # #"`, `"5).66).5b9.2  not et."`, `"381. o81 no3..4.enu956 but ..2.3"`. Serialising every segment
+removed the *fault* and left the *answer* wrong. A missing barrier does not behave that way. This
+is a wrong computation, and the aperture violation is a downstream symptom of it.
+
+**Why the 8000 cell passes, and why that is not evidence of correctness.** The row-split sibling is
+selected only for a full chunk (`rowsplit_chunk_prog`: `step.clen == bucket_rows`). The probe's log
+separates the two 8192-bucket programs exactly:
+
+```
+program=4   clen=8192 only,  c0 = 0, 8192, 16384, … 57344     <- the row-split sibling
+program=3   clen 271 … 5438, never 8192                        <- the ordinary program
+```
+
+The 8000-token base prompts tokenize to 5437/5438, run program 3, and never execute row-band at
+all. **Every cell in which program 4 actually ran failed.** So the finding is not "row-band faults
+under concurrency" but *wherever row-band runs, the output is wrong* — and the C20 mixed-length
+condition earlier believed necessary is only the condition under which the corruption escalates
+into an unmapped address instead of a mapped one.
+
+**Consequences, replacing the three above.**
+
+* The defect is numerical, not a race. The "cross-segment overlap" lead in the previous section, and
+  the per-sequence-span lead that closes it, are both withdrawn — neither survives a corruption that
+  is present with every segment serialised.
+* **The `-8.86 ms` isl8192 C1 figure is withdrawn outright, not merely as unshippable.** isl8192 C1
+  is `clen == 8192`, so it ran program 4 with no quality gate attached: it timed a computation that
+  produces garbage. It is not a measurement of what row-band would buy.
+* The broken `PLOW_GLM_ROWBAND=0` rollback remains a second, independent defect, unchanged.
+* The shipping set's health at C20 (18/18 base, 21/21 tail, no faults) is unaffected and still holds.
+
+**One theory checked and discarded before it reached a patch**, recorded because it is the obvious
+one to try next and it is wrong. `enqueue_window_rowsplit` offsets the selection table by
+`index_row0 = rank * route.rows`, while the load-time contract in the same file says the table is
+sized at the packet's full row count and each rank reads its band at `rank * rows` where `rows` is
+`inst.i[4]`, the *band*. That reads like an 8× over-offset. It is not: `Route::rebase` reassigns
+`self.rows = self.inst.i[4]` on the row-split arm, so `route.rows` **is** the band by the time
+`enqueue` runs, and the offset is correct.
+
+**Next**, queued as `rbfault5-determinism`: the same tail suite at concurrency 1 and 4 against the
+shipping control. Every row-band observation to date comes from C20. If C1 reproduces the garbage
+the defect is deterministic — one prompt, one program, no mux, no admission, no packed multi-
+sequence window — and reduces to bisecting numerics against the ordinary program, which is a far
+cheaper object than a scheduler.
+
+## The row-band defect is deterministic at C1 and the first chunk is already wrong (2026-09-14, job `rbfault6-chunkladder`)
+
+An exact-length chunk ladder at concurrency 1. The row-split sibling is selected only for a full
+chunk (`rowsplit_chunk_prog`: `clen == bucket_rows == 8192`), so a prompt built to an exact token
+count sets the number of times row-band runs, and prompts are token ids from the server's own
+`/tokenize` with a served-length mismatch counted as a failure, so the chunk count is provable
+rather than assumed.
+
+| length | full chunks | row-band `9e76b70bf97ee4a6` | shipping `8b15f4a28b289a72` |
+|---|---|---|---|
+| 4096 | 0 | **3/3 pass** | 3/3 pass |
+| 8192 | 1 | **0/3** | 3/3 pass |
+| 16384 | 2 | 0/3 | 3/3 pass |
+| 32768 | 4 | 0/3 | 3/3 pass |
+| 65536 | 8 | 0/3 | 3/3 pass |
+
+**Zero fault lines in both arms.** Three things follow, and they narrow the defect a long way.
+
+* The corruption is **deterministic at concurrency 1**. The mux, the admission ladder, rung
+  transitions and packed multi-sequence windows are all out of the picture. The minimal reproducer
+  is one 8192-token prompt at C1.
+* The **first chunk, at `c0 = 0`, is already wrong**. The "needs `c0 > 0`" reading that the prior /
+  band-key derivation would have supported is dead; so is the `prior`-dependent half of the
+  `band_keys` story. The band decomposition is wrong from the first launch.
+* **There is no memory fault at all without concurrency.** The APERTURE_VIOLATION that opened this
+  investigation is downstream of a wrong computation, not the defect. Concurrency only decides
+  whether the bad address lands on mapped memory (garbage) or unmapped (fault).
+
+The shipping set passing all five lengths at identical prompts is what licenses those readings: the
+harness, the packet loading, the checkpoint, the lengths and the client are jointly exonerated at
+exactly the cells where row-band fails.
+
+Worth recording precisely because it constrains the fix: the failures return **structured text**,
+not noise — `"!7.1.0.5. The1 and1.2. The3.0.5.</think>"`, `"!9 and0.5. The1.5 the0. The1.5.5.5.0"`.
+The model runs and emits plausible tokens while attending to the wrong thing. That is the signature
+of mis-indexed attention, not of reading unmapped memory, and it is the reason the C20 arms produced
+an address fault rather than merely bad answers.
+
+**Next**, queued as `rbfault7-bandsweep`: hold the chunk count at one and move the needle through
+that single chunk at the eight band centres. Under row-band rank `r` owns rows
+`[r*1024, (r+1)*1024)`, so a needle at row `at` sits in band `at // 1024`. Uniform failure across
+all eight depths indicts the whole row-band path — `emit_glm_rowband_q` and the single group-major
+`MlaMergeFold`, the two things the ordinary path never runs. A passing contiguous prefix (bands 0-1
+are exactly the two that take `BandKeys::Identity` at prior 0, while 2-7 take `Selection`) would
+instead indict the selection arm alone.
+
+**Host-side candidates already eliminated by reading, recorded so they are not re-tried:** every AQL
+packet carries the barrier bit, so intra-rank overlap cannot happen; `LoCsr::stage` already
+synchronises and is per-rank (`ranks: Vec<AmdEngine>`); `index_row0 = rank * route.rows` is correct
+because `Route::rebase` reassigns `self.rows = self.inst.i[4]`, the band; `rowsplit_launch_args` is
+unit-tested against `rowsplit_probe.cpp`'s constants and its four groups exactly tile the output;
+and a missing `plow_glm_fold_normalize_grouped` is refused at load rather than silently falling back
+to the token-major kernel.
+
+**One unguarded coupling found in passing, not the cause here.** `rowband` and `sp` are computed
+independently in `mla.rs` (`let rowband = use_rowsplit && ...` / `let sp = !raw_output && glm_sp(...)`),
+but the row-band o_proj exists only inside the `if sp` branch: with `sp` false the fold writes
+`rb.oat` while o_proj reads `n.oat`, which nothing wrote that layer. `glm_sp` is false whenever
+`t < 2048`, `packed_prefill_segments()` is set, or a token-batch band is active. The stack packet
+has `glm_seq_par = true` (production_default) so it took the correct branch, but nothing in the
+emitter enforces that, and the failure mode would be silent corruption identical to this one. An
+assert belongs there whatever the root cause turns out to be.
+
+## Every gfx942 GEMM tile is chosen by the analytical model, and 4961 measured records sit unused (2026-09-14)
+
+`plowc tune status --gpu MI300X` states it directly:
+
+```
+tuning digest: gfx942-fea2746522ef589b
+records      : 4961 (4961 qualified)
+*** EVERY RECORD IN THIS CELL IS STALE. ***
+The store holds 4961 record(s) and the compiler can use NONE of them: selection
+falls back to the analytical model for every shape and reports tier `portable`.
+```
+
+The 4961 records key to **14 older build digests**, every one marked STALE on implementation,
+interpreter, or toolchain. So the campaign-wide observation that every emit reports `tier portable`
+is not "tiles were never measured" — it is "they were measured 4961 times and the store cannot
+reach the compiler". `select_gemm_over` falls through `gfx950_gemm_measurements()` (which does have
+a CDNA3/gfx942 slot) to the analytical `tile_cost` for every shape.
+
+The demand is not hypothetical. Under the shipping replay knobs, with `GLM_FULL=1` so the TP8 emit
+clears `mla.rs:9978`'s `tp == 1` single-layer assert:
+
+```
+demand   : 40 distinct shapes
+coverage : 0 HIT / 40 MISS against tuning
+```
+
+M over {128, 256, 512, 1024, 2048, 8192} against GLM's own N,K — including the **K=6144** column
+that `lib.rs` records was never in the store at all (every M>=256 record there was a Gemma-31B or
+Qwen shape with K in {2560, 4096, 5376, 8192, 21504}).
+
+`scripts/rebench_tune_gemm_gfx942.sh` is the in-tree fix and already encodes the environment rules.
+Queued as `gemmtune-glm53` through `/workspace/ttft550-c08d1232/gemmtune/run.sh`, which changes only
+the checkpoint (GLM-5.3-plow-lite, not 5.2-FP8), the scratch root (/workspace, not /tmp — the root
+overlay runs near 100% here) and max-ctx (81920), then adds the check the script cannot make: it
+re-derives the demand under the **production** `--replay-knobs` afterwards and requires 0 MISS. The
+script observes `PLOW_MLA_PREFILL=full` with no replay (48 shapes), a neighbour of the compile that
+ships (40) — and "48 ought to be a superset of 40" is the reasoning that let this cell go stale in
+the first place.
+
+## The row-band defect is triggered by a PRECEDING request, not by the prompt (2026-09-14, jobs `rbfault7`, `rbfault8`, `rbfault9`)
+
+Three hypotheses died to get here, and the reproducer at the end is three requests long.
+
+**The contradiction that opened it.** Same packet `9e76b70bf97ee4a6`, same binary, same 8192-token
+single-chunk prompts:
+
+| job | what it issued | 8192 result |
+|---|---|---|
+| `rbfault6` | lengths 4096, 8192, 16384, 32768, 65536 against ONE server | **0/3 fail** |
+| `rbfault7` | length 8192 only, fresh server, needle at 8 band centres | 24/24 pass |
+| `rbfault8` | length 8192 only, fresh server, needle at 11 exact rows | 33/33 pass |
+
+**Hypotheses falsified, recorded so they are not retried.**
+
+* *A whole-path error in row-band* (band q, the grouped fold, the band o_proj). Cannot survive
+  `rbfault7`: eight needles, one per band centre, all found.
+* *A band-seam straddle.* `rbfault8` placed needles at absolute row `B-8` for all seven band
+  boundaries so a ~17-token needle provably spans each one: **21/21 straddling cells passed**,
+  alongside 12/12 mid-band controls, identical to the shipping control. The mechanism this
+  suggested — a band's edge rows attending across the boundary before the neighbouring rank's k/v
+  is visible — is withdrawn with it.
+* *`c0 > 0` / the prior and band-key derivation.* Already dead from `rbfault6`: the first chunk at
+  `c0 = 0` failed there.
+
+**What the three runs actually differ in** is that `rbfault6` issued OTHER REQUESTS FIRST. Every
+prompt in this suite is the same filler repeated, so its 4096 and 8192 prompts share about two
+thousand leading tokens, while `rbfault7`/`rbfault8` prompts diverge at the needle and share only a
+few hundred. `rbfault9` tests that directly, three arms each on its own fresh server:
+
+| arm | sequence | 8192 depth 0.5 |
+|---|---|---|
+| `rb-cold` | row-band, ONLY the 8192 request | **3/3 pass** |
+| `rb-after4k` | row-band, 4096 first, then the same 8192 | **0/3 fail** |
+| `ship-after4k` | shipping, identical two-step | 3/3 pass, both steps |
+
+Zero fault lines in every arm, and the 4096 request passes everywhere. **The identical 8192 prompt
+passes cold and fails after a preceding request, on the row-band packet only.**
+
+**The reproducer is now minimal:** start a row-band server, send one 4096-token request, send an
+8192-token request sharing a prefix with it, read garbage
+(`"! The2. If1 answer:1.0.0.0.0.0.0.0."`). Three requests, concurrency 1, deterministic, no fault.
+
+**What this exonerates.** The band decomposition, the band seam, the 16-head grouped attention, the
+single group-major fold, the mux, admission, rung transitions and concurrency. It also explains why
+every host-side structural candidate read clean, and why the original APERTURE_VIOLATION only ever
+appeared at C20 — that is where slot reuse is heaviest, so it is the same trigger with a bad address
+landing on unmapped memory instead of mapped.
+
+**Next**, queued as `rbfault10-prefix`, two arms on the failing sequence: one with
+`PLOW_PREFILL_SEG_TIMING=1` to print `program/bucket/c0/clen` and say whether the row-split sibling
+is selected at all on the second request — if an attached prefix leaves `clen = 4096`, then
+`rowsplit_chunk_prog`'s `clen == bucket_rows` means row-band never runs on the failing request and
+the defect is in what the row-band PACKET does on the prefix path, not in the row-band chunk — and
+one with `PLOW_PREFIX_CACHE=0`, which is both the attribution and, if it passes, a mitigation.
+
+## `build_gfx942.sh` cannot produce a contract-passing build at HEAD, which blocks the tile campaign (2026-09-14, job `gemmtune-glm53`)
+
+The GLM gfx942 GEMM tile campaign cannot run, for a reason that has nothing to do with tiles. Two
+separate breakages, found in order.
+
+**First, the two scripts had drifted apart.** `rebench_tune_gemm_gfx942.sh` step 1/5 overrode
+`PLOW_HIPCC=/opt/rocm-7.2.4/bin/hipcc`, and its header documented, as an environment rule "learned
+the expensive way", that `build_gfx942.sh` runs OUTSIDE nix with the system hipcc. That is now
+backwards: `build_gfx942.sh` refuses unless `IN_NIX_SHELL` is set, `PLOW_TOOLCHAIN_LABEL` is
+`rocm-7.14.0-nix`, and hipcc, clang-offload-bundler and llvm-readelf all resolve into `/nix/store`.
+The override is exactly what trips that guard, so the campaign died at step 1/5 in 0.0 min with
+`FAIL: hipcc must resolve into /nix/store`. Fixed by building step 1 under `nix develop` with the
+flake's own tools, the way steps 2-5 already run plowc.
+
+**Second, and this is the blocker.** With the toolchain right, the objects build and the audit at
+the bottom of `build_gfx942.sh` then refuses them: **374 FAIL lines over 44 objects**. Most are one
+bookkeeping class — geometry profile `p4` records `GM_BK/BM/BN`, `GM_BLK_*`, `GM_MD_*`, `GM_SM_*`
+but none of `GM_C5_*`, `GM_C8_*`, `GM_WD_*`, nine knobs HEAD now compiles. But the rest are not
+bookkeeping:
+
+```
+d_moe_expert_glu_fp8_blk:  105 spill instructions, expected none   (4 objects)
+d_moe_expert_down_fp8_blk:  80 spill instructions, expected none   (4 objects)
+interp_prefill_k3:        2632 scratch ops > budget 1957           (+675, +35 %)
+interp_prefill_k3_gq:     2628 scratch ops > budget 1953
+interp_prefill_fp8kv_mla: 1440 scratch ops > budget 1434
+interp_prefill_mla_moe:   2077 scratch ops > budget 2076
+```
+
+**These were not blessed away, deliberately.** `--bless` is the documented mechanism and the diff
+is meant to be the review, so blessing was the obvious move and was very nearly taken — on a
+four-object sample that showed only the nine missing knobs and two budgets over by one. Enumerating
+all 44 objects is what changed the answer: a bless here would absorb a 35 % scratch blowup and 105
+spill instructions in a MoE decode kernel into a committed contract, which is the exact regression
+class the contract exists to catch. It needs an owner's decision and probably a fix, not a re-bless.
+
+**Why the shipping set does not show this.** Every shipping object audits as
+`built with different axes than the baseline records; resource and arm budgets not compared`, so
+`want` is `None` and the whole resource/spill/geometry comparison is SKIPPED for it — its `PASS` is
+the absence of a check, not the presence of one. The freshly built objects match the baseline's
+recorded axes (baseline `lds=64560` equals the fresh build's, against the shipping set's `64568`),
+so they are the first gfx942 objects in a while to actually be measured against the contract, and
+they fail it. The same row differs materially between the two builds: `interp_prefill_mla_moe` is
+2139 ISA ops shipping versus 2077 fresh.
+
+**Consequence for the campaign.** The store still holds 4961 gfx942 records across 14 older digests,
+none keyed to the current family, so every GEMM tile in every GLM packet is still chosen by the
+analytical cost model at tier `portable` against a demand of 40 shipping shapes at 0 HIT. Refreshing
+it requires building the objects the campaign then measures, and that build is refused at HEAD.
+Until the spill and scratch regressions are explained or fixed, the tile cell stays stale.
+
+## The row-band poison has a threshold, and it sits between 2048 and 4096 tokens (2026-09-14, jobs `rbfault13-firsttouch`, `rbfault14-threshold`)
+
+Two probes, six curve points, one reversal. Each arm is a FRESH server: one first request of the
+stated length, then the same 8192-token needle request, concurrency 1, zero fault lines throughout.
+
+| first request | program it runs | then 8192 |
+|---|---|---|
+| 128 | — | **3/3 pass** |
+| 512 | — | **3/3 pass** |
+| 2048 | — | **3/3 pass** |
+| 4096 | 3 (ordinary) | **0/3 FAIL** |
+| 8100 | 3 (ordinary, ~full row count) | **0/3 FAIL** |
+| 8192 | 4 (row-split sibling) | **3/3 pass** |
+
+**`rbfault13` was designed to separate the program from the row count, and it did.** A first
+request of 8100 tokens is within one percent of 8192, so it carries essentially the same row
+count, but `rowsplit_chunk_prog` takes the row-split sibling only when `step.clen == bucket_rows`
+and 8100 is not 8192 — so it runs the ordinary program 3. It poisons exactly like 4096. Among the
+POISONING lengths, therefore, the row count is irrelevant and the program decides. Both controls
+landed (8192 first passes 3/3, 4096 first fails 0/3), so the discriminating arm is readable.
+
+**`rbfault14` then overturned the obvious generalisation.** "Any program-3 execution poisons,
+however small" predicts that 128 tokens poison. They do not, and neither do 512 or 2048. So the
+harmless lengths are not harmless because they take a different program by construction — they are
+harmless because they are SMALL, and the boundary lies somewhere in `(2048, 4096]`.
+
+**The two readings that survive, and they put the fix in different places.**
+
+* *Bucket admission.* A 2048-token prompt may never reach the sparse 8192 bucket at all, taking a
+  smaller prefill rung, so no program-3 execution touches the shared sparse-MLA workspace and there
+  is nothing to poison. Then the boundary is an artefact of rung admission, the rule stays "any
+  program-3 execution IN THE 8192 BUCKET poisons", and the target is whatever that path writes, at
+  any size.
+* *Volume.* A 2048-token prompt does run program 3 in the 8192 bucket and is still harmless. Then
+  the size of the first request genuinely matters, the stale-tail reading survives, and the boundary
+  names how far past its own writes the row-band read runs.
+
+Neither probe recorded which program and bucket the harmless 2048 request actually took, which is
+exactly what separates them. Queued as `rbfault15-bucket`: two `PLOW_PREFILL_SEG_TIMING=1` arms that
+print `program/bucket/c0/clen` for a lone 2048 and a lone 4096 request, plus a 3072-then-8192 pair
+with segment timing OFF to bisect the boundary on the pass/fail axis. Segment timing takes the other
+branch in `amd_tp.rs`, so it is kept off the arm that judges correctness.
+
+**What this does not change.** The defect is still not a memory-safety bug (per-segment drain
+removes the APERTURE_VIOLATION and leaves the answer garbage), still deterministic at C1 with the
+first chunk at `c0 = 0` already wrong, and still unrelated to the band decomposition, the band seam,
+prefix attach or prefix sharing — all falsified earlier and not retried.
+
+## The row-band threshold was bucket admission, and any program-3 chunk in the 8192 bucket poisons (2026-09-14, job `rbfault15-bucket`)
+
+The section above left two readings open and named the fact that separates them: which program and
+bucket the harmless 2048-token request actually took. `PLOW_PREFILL_SEG_TIMING=1` prints it, and the
+answer was already visible offline in the packet's own `build.json`, where
+`shapes/prefill_buckets = [128, 512, 2048, 8192]`. `rbfault14`'s three harmless first requests —
+128, 512 and 2048 — are EXACTLY the three smaller prefill rungs.
+
+| first request | chunk shape it ran | then 8192 |
+|---|---|---|
+| 2048 | `program=2 bucket=2048 c0=0 clen=2048` | 3/3 pass |
+| 3072 | (the 8192 bucket, by admission) | **0/3 FAIL** |
+| 4096 | `program=3 bucket=8192 c0=0 clen=4096` | **0/3 FAIL** |
+
+**So there is no volume threshold.** A 2048-token prompt is harmless because it takes its own rung
+and never enters the 8192 bucket at all; 3072 is the first length that does, and it poisons. The
+rule is now flat and has no size term in it:
+
+> Any ordinary (program 3) execution in the 8192 bucket poisons every later row-band chunk on that
+> server, however short its `clen`, and it stays poisoned.
+
+**This kills the stale-tail reading** that the apparent threshold had kept alive. What program 3
+leaves behind is a specific value — a count, a header, a pointer — not an unwritten tail that a
+large enough first request happens to cover. It also closes the last confound in the chain:
+`rbfault13`'s "the program decides" was right, and `rbfault14`'s apparent counter-example was an
+artefact of picking three lengths that are all rung boundaries.
+
+**Next, and it needs a build rather than another probe.** The sparse-MLA workspace (`q`, `kv`,
+`part`, `lse`, `qp`, `kp`, `last`, `splits`, and the lower-half CSR) is allocated in
+`SparseMla::load`, not in the packet's tensor table, so no per-sequence state clear covers it — it
+is the only device memory the two paths share on that footing. `PLOW_GLM_ROWBAND_CLEAR_WS=1`
+(diagnostic, off by default) zeroes all of it and forgets the CSR's staged key before every
+row-band dispatch, so the dispatch sees the device state a freshly loaded server would give it.
+Queued as `rbfault16-clearws` with both controls: knob off on the poisoned sequence must fail, and
+knob on with no preceding request must pass, or the middle arm says nothing. A pass in the middle
+arm puts the carrier inside that allocation and the next step is bisecting its regions; a fail
+exonerates the whole allocation in one run and moves the search to interpreter activations, the KV
+cache, or the peer reduction slots.
+
+## Clearing the sparse-MLA workspace does not undo the row-band poison, which exonerates it (2026-09-14, job `rbfault16-clearws`)
+
+The standing lead through this whole hunt was the sparse-MLA workspace: `q`, `kv`, `part`, `lse`,
+`qp`, `kp`, `last`, `splits` and the lower-half CSR are allocated in `SparseMla::load`, not in the
+packet's tensor table, so no per-sequence state clear covers any of it (`PLOW_STATE_CLEAR_DEVICE`
+only chooses how that clear runs, not what it reaches). With `rbfault15` having established that the
+trigger is any program-3 chunk in the 8192 bucket, however short, the workspace was the one piece of
+device memory both siblings share on that footing.
+
+`PLOW_GLM_ROWBAND_CLEAR_WS=1` (diagnostic, default off) zeroes every byte of that allocation and
+forgets the CSR's staged `(prior, rows)` key before every row-band dispatch, so the dispatch sees
+exactly the device state a freshly loaded server would give it. Three arms, both controls landing:
+
+| arm | sequence | 8192 depth 0.5 |
+|---|---|---|
+| `ctrl` | knob off, 4096 then 8192 | **0/3 FAIL** — the reproducer holds in this binary |
+| `clear` | knob **on**, 4096 then 8192 | **0/3 FAIL** |
+| `clearcold` | knob **on**, 8192 only | 3/3 pass — the clear is harmless by itself |
+
+Zero fault lines in all three. `clearcold` is what makes the middle arm readable: a full zero of the
+workspace on every dispatch does not itself break a correct run, so the middle arm's failure is the
+poison surviving the clear and not the clear breaking the path.
+
+**The whole allocation is exonerated in one run.** That is the point of spending a build on a
+bisection instrument rather than another black-box arm: the negative result removes nine regions at
+once, including the one every previous section had been pointing at.
+
+**What is left, and the shape it has to fit.** The carrier must be server-lifetime (not
+per-sequence), shared between the ordinary program and its row-split sibling, and **written once by
+whichever of the two first uses the 8192 bucket and never revised after** — `rbfault12` showed that
+once a row-band request has run first, later ordinary requests no longer poison anything, so it is
+first-touch and not last-writer. Three candidates remain: the interpreter activation tensors, the
+VMM-backed KV, and the peer reduction slots. So does the prefix cache, which has the right shape and
+is the only one never actually measured: `rbfault10` and `rbfault11` both tried
+`PLOW_PREFIX_CACHE=0` and both arms were void, each dying at load with
+`hsa_amd_memory_pool_allocate(1207959552 bytes)` → `HSA_STATUS_ERROR_OUT_OF_RESOURCES` seconds after
+a previous server was killed. Queued as `rbfault17-prefixcache`, which runs the cache-off arm FIRST
+on a cold machine so that a load failure there is itself a readable answer — an allocation-plan
+defect independent of VRAM pressure — rather than another void arm.
+
+Worth keeping straight: this is not a test of whether prefix REUSE corrupts the chunk. That is
+already answered no, twice — `rbfault10` showed no prefix is attached to the failing request (it
+runs `program=4 c0=0 clen=8192`, the full chunk), and `rbfault11` showed a preceding 4096 whose
+needle sits at row 0, sharing no prefix at all, poisons identically.
+
+## `PLOW_PREFIX_CACHE=0` cannot load the packet on a cold machine either, so the prefix cache stays unmeasured (2026-09-14, job `rbfault17-prefixcache`)
+
+`rbfault10` and `rbfault11` both tried `PLOW_PREFIX_CACHE=0` and both arms were void, each dying
+during load with `hsa_amd_memory_pool_allocate(1207959552 bytes)` →
+`HSA_STATUS_ERROR_OUT_OF_RESOURCES` seconds after a previous server had been killed. That was read
+as leftover VRAM. **It is not.** `rbfault17` ran the cache-off arm FIRST, as the very first server
+of the job, after waiting for any prior `plowrt` to exit, on a machine with nothing else resident:
+
+| arm | sequence | result |
+|---|---|---|
+| `cold0` | cache off, 8192 only | **server died during load**, same 1.2 GB pool allocation |
+| `off` | cache off, 4096 then 8192 | **server died during load**, identically |
+| `on` | cache on, 4096 then 8192 | 0/3 FAIL — the reproducer control holds |
+
+Each failure comes right after `weights carved from one allocation slab_mib=126795 carved=1907
+views=272`, i.e. ~124 GiB of weights are already resident and a further 1.2 GB pool allocation has
+nowhere to go. So with the prefix cache off, something else in the allocation plan grows enough to
+leave no room, and the knob does not work as a rollback on this packet at all. Filed as its own
+task; it is not a row-band defect.
+
+**The consequence for the row-band hunt is that the prefix cache remains the one candidate never
+actually measured**, and this knob cannot measure it. Testing it needs a different instrument.
+
+## The row-band carrier is a one-time DECISION, not residue anywhere (2026-09-14, reading `rbfault12` again)
+
+Worth stating separately because it has been underused and it narrows the search more than any
+single probe has. `rbfault12` ran the whole sequence in ONE server with 8192 FIRST, and the 4096 it
+issued afterwards did **not** poison the 8192s that followed it. If the ordinary program left a
+damaging residue, it would leave it every time it ran, and that post-8192 4096 would have poisoned
+exactly like a pre-8192 one. It did not.
+
+**That rules out stale data in every buffer at once**, not merely the sparse-MLA workspace
+`rbfault16` cleared, and it leaves exactly one shape: something is decided ONCE, by whichever
+sibling first uses the 8192 bucket, and never revised. Run the row-band program first and the
+decision is right for it; run the ordinary program first and the decision is wrong for the sibling
+that comes later.
+
+Two more candidates fall out for free. `PLOW_VMM_KV` defaults **off**, so the VMM-backed KV was
+never in play in any of these runs. And the prefix cache cannot be tested by its own knob, per the
+section above.
+
+**So look for the decision directly.** A one-time initialization usually says so once, in the log,
+at the moment it happens. Queued as `rbfault18-logdiff`: two servers identical but for the order —
+one 8192 request, versus one 4096 then one 8192 — both at `RUST_LOG=debug`, then a normalized diff
+(timestamps, hex, integers and floats collapsed) over the message SHAPES each emits, both scoped to
+the 8192 request and scoped to everything after load. The second scope is the one that matters: a
+decision taken at the first chunk is made during the 4096 in the poisoned arm and during the 8192 in
+the healthy arm, so it cancels out of a request-scoped diff and appears only in the whole-server
+one. If the diff is empty the decision is silent, and the candidates get instrumented by hand
+instead of guessed at.
+
+## The healthy and poisoned servers agree on every logged decision, so the divergence is silent (2026-09-14, job `rbfault18-logdiff`)
+
+Two servers, identical but for the order of the first request, both at `RUST_LOG=debug`:
+`bandfirst` issues one 8192 request and passes 3/3; `ordfirst` issues one 4096 and then the same
+8192 and fails 0/3. Their logs were then compared on the SET of normalized message shapes —
+timestamps, ANSI, hex, integers and floats collapsed — so two lines that say the same thing about
+different numbers fall together.
+
+| scope | only in `bandfirst` | only in `ordfirst` |
+|---|---|---|
+| the 8192 request | 4 shapes | 0 |
+| **everything after load** | **0** | **0** |
+
+The four request-scoped shapes are an artefact of the window, not a difference: engine-thread
+pinning, the decode-ladder rung, `PLOW_RAGGED_CHUNK` and `prefill chunk policy` are all emitted
+once per server, and in `bandfirst` the 8192 IS the first request while in `ordfirst` they were
+emitted during the 4096. The whole-server row is the real comparison and it is **empty in both
+directions**.
+
+`prefill chunk policy` was the promising one — a decision logged once per server, naming
+`launch_rows` and `max_chunk` — so its values were compared directly rather than through the
+normalizer. They are identical:
+
+```
+PLOW_RAGGED_CHUNK: fewest-launch cover, last chunk runs at its real row count
+                   buckets=[128, 512, 2048, 8192, 8192, 1, 2, 4, 8, 16]
+prefill chunk policy launch_rows=416 overridden=false ragged=true max_chunk=8192
+                     requested_max_chunk=4294967295 buckets=[128, 512, 2048, 8192]
+```
+
+**So the two servers agree on every decision they narrate, and the divergence is not reflected in
+any log line.** Combined with `rbfault16`'s exoneration of the sparse-MLA workspace, continuing to
+ask "which buffer" by clearing candidates one at a time is now an expensive way to guess.
+
+**Change the question: which part of the OUTPUT is wrong?** The row-split sibling does not treat
+its eight bands alike. At 8192 the chunk has `prior = 0` and 1024 rows per rank, so
+`band_keys(prior, rank, rows)` gives rank 0 the Identity CSR at `band_prior = 0`, rank 1 the same
+CSR at 1024, and ranks 2-7 the Selection path — `self.kp` from the pack kernel plus the `IndexTpPf`
+index tensor at `index_row0`. Two code paths inside one dispatch, split at a known row.
+
+`rbfault7` put a needle at each of the eight band centres and found all eight, 24/24 — but on a
+COLD server, which is the healthy order, so it says nothing about the poisoned one. Queued as
+`rbfault19-whichband`: the same sweep after a 4096, with the cold sweep as the control. All eight
+wrong means the defect is common to both branches or upstream of the dispatch; only ranks 2-7 means
+the Selection branch; only ranks 0-1 would point back at the CSR, which would be surprising given
+`rbfault16` zeroed that buffer and forgot its staged key on every dispatch without helping. Any
+other split names the quantity by where the boundary falls. Client-side only — no build, no knob.
+
+## On a poisoned server ALL EIGHT bands are wrong, which clears both `band_keys` arms (2026-09-14, job `rbfault19-whichband`)
+
+`rbfault18` having shown the two servers narrate nothing different, the question changed from
+"which buffer is wrong" to "which part of the output is wrong". The row-split sibling does not
+treat its eight bands alike: at 8192 the chunk has `prior = 0` and 1024 rows per rank, so
+`band_keys(prior, rank, rows)` gives rank 0 the Identity lower-half CSR at `band_prior = 0`, rank 1
+the same CSR at 1024, and ranks 2-7 the Selection path — `self.kp` from the pack kernel plus the
+`IndexTpPf` index tensor at `index_row0`. Two code paths inside one dispatch, split at a known row.
+
+A needle at each of the eight band centres (absolute rows `b*1024 + 512`), three samples each:
+
+| arm | sequence | result |
+|---|---|---|
+| `healthy` | 8192 only | **24/24 pass** — reproduces `rbfault7` on this binary |
+| `poisoned` | 4096 first, then the sweep | **0/24 — every band fails** |
+
+Zero fault lines in both, and the preceding 4096 passed 3/3.
+
+**Both arms of `band_keys` are wrong together, so neither is the defect.** The Identity CSR was
+already the weaker candidate — `rbfault16` zeroed that buffer and forgot its staged key before
+every dispatch without helping — and this removes the Selection arm alongside it. What is left is
+what FEEDS the dispatch (the row-band Q, the FP8 single-pass pack's inputs, the latent cache) or
+what happens to its result (the single grouped `MlaMergeFold`, the band `o_proj`, the sequence-
+parallel residual and norm gather).
+
+**Why the next step is a trace and not another arm.** Every quantity the dispatch derives —
+`w.rows`, `w.kv_len`, `w.kv_base`, `prior`, `route.kv_len`, `route.local_index`, `index_row0`, and
+which `band_keys` arm was actually taken — is computed inside `enqueue_window_rowsplit` and then
+used, silently. `rbfault18` could only compare log lines that exist, and none of these did. One
+`tracing::debug!` per rank per dispatch now prints them, and `rbfault20-dispatchnums` diffs a
+healthy against a poisoned dispatch field by field.
+
+One hypothesis is worth naming in advance because it predicts exactly this "all eight wrong"
+signature: if `w.kv_len` is larger than the chunk on a poisoned server, then
+`prior = kv_len - rows*8` is no longer 0, every band's `band_prior` shifts by the same amount,
+`band_keys` sends ALL ranks down Selection, and every band reads the wrong keys — deterministic,
+in bounds, no fault, first chunk already wrong. `rbfault10` reported `program=4 bucket=8192 c0=0
+clen=8192` with no prefix attached, which establishes the CHUNK is right; it says nothing about
+what `route.kv_len` was. If instead every field matches, the inputs agree and the corruption is in
+the tensors those addresses point at, which is a different set of things to instrument.
+
+## The row-band defect is a shared `@band` view memo keyed by the wrong thing (2026-09-14, jobs `rbfault20-dispatchnums`, `rbfault21-bandmemo-fix`)
+
+`rbfault20` printed, per rank per dispatch, every quantity `enqueue_window_rowsplit` derives. On a
+healthy server and on one poisoned by a single preceding 4096 they are **identical on all eight
+ranks** — `rows=1024 kv_len=8192 kv_base=0 row0=0 prior=0 route_kv_len=8192 local_index=true
+index_row0=0`, ranks 0-1 `identity@0` / `identity@1024`, ranks 2-7 `selection` — while the healthy
+arm passes 3/3 and the poisoned arm fails 0/3. The named hypothesis (a stale `w.kv_len` shifting
+`prior` and sending all ranks down Selection) is **falsified**: `prior` is 0 in both.
+
+So the addresses and the geometry are right and the corruption is in what they point at. It is:
+
+**`rebind_band_views`'s "already bound" memo was keyed by PROGRAM, but the views it guards are
+global and shared by band FAMILY.** `ragged_band_views` finds the views by the name tag
+`@band{t}`, and they live in the one `tens_table` — so every program at the same bucket rows
+shares them, the row-split sibling included. The sequence that poisons:
+
+| step | program | clen | ragged? | wants `b` | memo (keyed by prog) | effect |
+|---|---|---|---|---|---|---|
+| 1 | ordinary | 4096 | yes | 512 | no entry, default 1024 ≠ 512 | **rebinds the shared views to 512**, records under its own key |
+| 2 | row-band sibling | 8192 | never | 1024 | no entry of its own, default 1024 == 1024 | **skips the restore** — runs on step 1's addresses |
+
+`ragged_band_views`' own doc says `b = t / tp` reproduces the load-time binding, so the restore
+path existed; the per-program key is what stopped it ever being issued for the sibling.
+
+It accounts for every measurement this hunt made, which is why it is the answer and not another
+candidate:
+
+* `rbfault19` — all eight bands wrong together, across both `band_keys` arms. The views are the
+  per-rank band BASE ADDRESSES, so all eight move at once and neither arm is implicated.
+* `rbfault20` — every host-side dispatch field identical. The corruption is in the device tensor
+  table, which that trace does not print.
+* `rbfault16` — zeroing the entire sparse-MLA workspace and forgetting the staged CSR changed
+  nothing. Wrong buffer entirely.
+* `rbfault12` — row-band first poisons nothing. The ordinary program rebinds whenever its OWN `b`
+  changes, so it is always right; only the sibling skips.
+* `rbfault15` — 128 / 512 / 2048 harmless, 3072 the first length that poisons. An exact rung is
+  never ragged and never rebinds; 3072 is the first length admitted to the 8192 bucket RAGGED, and
+  a ragged chunk is exactly what writes the shared table. The "volume threshold" of `rbfault14`
+  was never a threshold.
+* "In bounds, deterministic, no fault, permanent" — the addresses are legal, just the wrong band,
+  and nothing ever restores them.
+
+The fix keys `band_rows_bound` by `t`. Unit test
+`ragged_seams_band_view_memo_is_keyed_by_band_family_not_program` asserts both halves: that the
+ragged and load-time views are the same tensor slot at different addresses (so skipping the
+restore is not benign), and that the poisoning sequence now issues the restore.
+
+**Verified on 8 GPUs (`rbfault21-bandmemo-fix`).** The same eight band centres `rbfault19` used,
+three samples each, on three servers:
+
+| arm | first request | 8 band centres | before the fix |
+|---|---|---|---|
+| `healthy` | none | **24/24 pass** | 24/24 (control holds) |
+| `poisoned` | 4096 | **24/24 pass** | **0/24** |
+| `poisoned3072` | 3072 | **24/24 pass** | 0/24 (`rbfault15`) |
+
+Zero fault lines on all three, and each poisoning request passed 3/3 itself. The defect is closed.
+
+This is a live defect for RAGGED SEAMS generally, not only for row-band: any two programs sharing
+a `@band{t}` family could desynchronise the same way. Row-band is simply the first pair where one
+sibling never goes ragged and so never re-derives the binding for itself.
+
+## The packet counter protocol is batchable but off the critical path in BOTH regimes; decode's problem is 1293 segments per token (2026-09-15, job `ctrpipe-decode`)
+
+**The protocol.** Every AQL dispatch pays, on the host, in `device/hsa.rs` `dispatch`: a write-index
+reserve (or `chain_next` fetch_add inside a prepared chain); the kernarg write, and with the
+default `PLOW_AMD_KERNARG_VRAM=1` a `publish_device_kernarg` — sfence, write_volatile, mfence, and
+an **uncached BAR read back**; a 60-byte packet memset plus field writes;
+**`hsa_signal_add_screlease(done_signal, 1)`, one atomic per packet** through an indirect call into
+ROCr; a release store of header|setup; and a doorbell store unless inside a chain. `done_signal` is
+a COUNTING signal created at `hsa.rs:1174` — N dispatches raise it by N, the device decrements each
+on completion, and `synchronize()` waits for `< 1`. That counter is the "packet counter protocol".
+
+**It is trivially batchable, and the mechanism already exists.** `begin_dispatch_chain(packets)`
+reserves all N slots with ONE `hsa_queue_add_write_index_screlease`, and `commit_dispatch_chain`
+rings ONE doorbell — so no packet in a prepared chain is visible to the packet processor until the
+commit. A single `hsa_signal_add_screlease(done_signal, N)` at reservation is therefore exactly
+equivalent to N `add(1)`s and strictly better ordered: the count is raised before any header is
+published rather than interleaved with them. It is roughly a ten-line change, with the only care
+needed on the abort path (a chain that commits fewer packets than reserved must subtract the
+remainder).
+
+**And it would buy essentially nothing, because the host is not the bottleneck in either regime.**
+Prefill was already settled: the host finishes its enqueue 39.9 ms in while the GPU has 474 ms of
+work queued, 12x ahead. Decode is the regime where it could plausibly have mattered, and it does
+not. `PLOW_TICK_LOG=1` at isl8192 C1, 1017 steady-state ticks:
+
+| quantity | median |
+|---|---|
+| tick total | 40.035 ms |
+| decode portion | 40.032 ms |
+| **other (host)** | **0.003 ms** |
+| segments per tick, rank 0 (`dec_segs`) | **1293** |
+| in-flight AFTER enqueue | **632** |
+| in-flight after re-arm | 589 |
+
+`obs/tick.rs` states the reading rule itself: "large = the GPU is behind the host, so the enqueue
+and re-arm overlap it; near 0 = the GPU waited on the host." At 632 packets against 1293 segments the host
+finishes with **632 dispatches of runway still queued**. It is ahead, then waits. Shaving host
+enqueue time lengthens the runway; it does not shorten the tick. The counter adds themselves are
+1293 x 8 = 10344 atomics per tick, perhaps 0.5-1.0 ms of host time, entirely hidden behind 40 ms of
+GPU work. Host work outside the decode call is 3 microseconds.
+
+**The number that matters is 1293.** That is `dec_segs` — rank 0's decode SEGMENTS per token,
+`prog_dispatch(dp).launches()`, about 16.6 per layer over 78 layers — and the tick is 40.03 ms, so
+**31 microseconds per segment**. At batch 1 the kernels are tiny, so a substantial share of that is
+per-dispatch launch and packet-processor latency rather than arithmetic. Goal 2 wants 40.5 ms down
+to 25.
+
+Two corrections to the units, made after re-reading the call path:
+
+* **Segments are not packets, and packets are the larger number.** `dec_segs` counts segments;
+  `in_flight()` counts AQL packets against `done_signal`. `enqueue_decode_segment` emits ONE packet
+  for the interpreter and MLA routes but **two** for an active `SparseMlaDecode`
+  (`self.seg_launches += 2`, `amd.rs:12212`). So packets per token per rank are ≥ 1293 and 31 µs is
+  per SEGMENT — an upper bound on per-packet cost, not the cost itself. The ratio printed as
+  `in-flight / segs = 0.49` is likewise packets over segments, mixed units: read it as "the host
+  finished with 632 packets still queued", which is the claim that carries the conclusion, not as a
+  percentage of anything.
+* **Graph phase replay is a PREFILL mechanism and is not available to the decode tick.**
+  `graph_phase_replay` tests `progs[p].prefill_routes` for `GraphPhaseXReduceWaveRs`
+  (`amd.rs:12110`), and both call sites are prefill-side: `run_segmented` (`amd.rs:12466`) and
+  `token_batch_body_step_inner` / `prefill` (`amd_tp.rs:1506`, `:1758`). The plain decode tick goes
+  `submit_decode_batched_at` → `enqueue_decode_segment` → `decode_routes` and consults no replay
+  path at all. Naming it as a ready-made decode lever was wrong. The nearest real options are to
+  route decode rows through the token-batch body (task #52), which DOES reach replay, or to build a
+  decode-side equivalent.
+
+So the decode lever is **the dispatch COUNT, not the cost of issuing one**: fuse ops so the tick
+emits fewer, larger dispatches. Making each dispatch cheaper to ISSUE is measurably not the problem.
+
+**Recommendation on the counter batch itself:** implement it only as tidiness or if a future
+regime turns host-bound, not as a latency lever. It has no measured effect available to it on
+either path today.
+
+## The decode tick is 832 individual Tensile dispatches that PLOW ITSELF issues: what can be fused, what cannot, and why fusion alone still misses 25 ms (2026-09-15, CPU-only `disasm` + `op-audit`)
+
+Everything here is offline — `plowrt disasm --program <T> --stream` carries each stream entry's `seg`,
+and `derive_segments` is just `max(seg)+1`, so the segment structure of every rung is readable from
+the packet without a GPU.
+
+**The decode ladder has a cliff between rung 4 and rung 8.**
+
+| rung | insts | segments | insts/seg | shape |
+|---|---|---|---|---|
+| T=1 | 1644 | **151** | 10.9 | interpreter-GEMV |
+| T=2 | 1650 | **151** | 10.9 | interpreter-GEMV |
+| T=4 | 1956 | **151** | 13.0 | interpreter-GEMV |
+| T=8 | 2034 | **1293** | 1.57 | native-GEMM |
+| T=16 | 2034 | **1293** | 1.57 | native-GEMM |
+| T=20 | 2034 | **1293** | 1.57 | native-GEMM |
+
+The two shapes are different programs, not the same program at different widths. Rungs 1-4 carry
+`Gemv` x292, `GemvQkv` x156, `GemvGlu` x75 and **no `GemmLtPf` at all** — the projections run inside
+the interpreter megakernel, which is why 151 segments hold 1644 instructions (75 solo natives plus
+76 interpreter runs of 7-102 ops). Rungs 8-20 replace all of that with **`GemmLtPf` x832**, and the
+segment count follows.
+
+**`dec_segs` = 1293 is rung 8-or-wider, and TP always lands there.** `decode_prog_for` floors the
+requested rows at `amd_decode_min_rung()` when `self.tp.is_some()`, and that default is **8**
+(`config.rs:835`) with the measurement recorded in its own doc comment: on GLM-5.3 TP8 a lone row
+decodes in **41.4 ms on rung 8 against 51.9 ms on rung 1**, because rung 1's one-row GEMVs run over
+every workgroup. So a single sequence at concurrency 1 deliberately runs a 20-wide native-GEMM
+program. That is not a bug, and it is the first thing to internalise here: **the 1293 segments are
+the price already paid for a 10.5 ms arithmetic win.** Fewer segments is not the same as faster —
+the ladder contains a direct counter-example.
+
+**What the 1293 are made of** (rung 20; the histogram is identical at 8 and 16):
+
+| | segments | |
+|---|---|---|
+| solo `GemmLtPf` (op 158) | **832** | one plow-issued Tensile matmul dispatch each — 64% of all segments |
+| solo `RmsNorm` (op 1) | 78 | |
+| solo `MoeAiterFp8Pf` (op 156) | 75 | the aiter fused-MoE native |
+| multi-instruction segments | 308 | holding 1049 instructions — the interpreter runs, MLA, and indexer |
+| **total** | **1293** | 2034 instructions |
+
+832 dispatches over 78 layers is **~10.7 projection GEMMs per layer, each its own AQL packet**.
+
+### The register and wave-geometry gate
+
+The right feasibility test for merging two kernels is that the combined register footprint must not
+spill and the wave geometry must match. Both are readable from the shipped objects'
+AMDGPU metadata (`llvm-readelf --notes`). gfx942: 4 SIMDs per CU, one 512-entry unified VGPR+AGPR
+file per SIMD, 64 KiB LDS per CU.
+
+| kernel | vgpr | scratch | LDS | wg max | waves/SIMD |
+|---|---|---|---|---|---|
+| `plow_interp_dec_gfx942` (decode megakernel) | **256** (arch cap) | **6384 B — SPILLS** | 64560 / 65536 | 512 | **2** |
+| `aiter::fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256` | **512** (whole file) | 0 | **65536** (all) | 256 | **1** |
+| `aiter::mla_a16w16_qh8_qseqlen1_gqaratio8_v3` | **512** | 0 | **65536** | 256 | **1** |
+| `aiter::mla_dec_stage1_bf16_a16w16_subQ16_mqa16` | **512** | 0 | **65536** | 256 | **1** |
+| `plow_dsa_tp_score` | 98 | 0 | 34816 | 512 | 4 |
+| `plow_dsa_tp_select` | 55 | 0 | 1044 | 512 | 8 |
+| `plow_glm_fold_normalize` / `_grouped` / `_convert` / `_weight` | 14 / 14 / 3 / 5 | 0 | 0 | 1024 | 8 |
+| `plow_dsa_tp_gather` / `_complete` / `_local` | 12 / 5 / 8 | 0 | 4 / 4 / 0 | 1024 | 8 |
+
+**For the plow- and aiter-owned kernels the answer is no, on both counts.** The decode interpreter
+is already pinned at the 256-VGPR architectural cap for a 512-thread workgroup and is **already
+spilling 6384 bytes per lane**, with 64560 of 65536 LDS bytes taken. The three aiter natives each
+consume the **entire** 512-entry register file and **all** 64 KiB of LDS. Nothing can be folded into
+any of them; merging deepens an existing spill or creates a new one. And three wave geometries ship
+side by side — 256 threads (aiter), 512 (interpreter, `dsa_tp_score`, `dsa_tp_select`), 1024 (the
+fold and gather adapters) — while a merged kernel must launch at the smallest
+`max_flat_workgroup_size` of its members, so a 1024-thread adapter folded into a 256-thread aiter
+kernel loses 4x its per-workgroup parallelism before the register question is even reached.
+
+Register-and-geometry-legal merges are therefore only the cheap tail:
+`plow_glm_fold_normalize`/`_grouped`/`_convert`/`_weight` and
+`plow_dsa_tp_gather`/`_complete`/`_local` (3-14 VGPR, no scratch, ≤4 B LDS, all 1024 threads —
+worst-case combined 26 VGPR against a 256 cap), plus `plow_dsa_tp_select` if the merged kernel
+launches at 512. Those live in the 308 multi-instruction segments and are worth a few tens of
+segments at most.
+
+Recorded as a separate finding: the decode megakernel runs at **2 waves per SIMD**, with the VGPR
+cap and the LDS budget pinning it there *independently* — relieving one alone changes nothing. The
+aiter natives run at 1 wave/SIMD. At batch 1 there is almost no latency hiding on this path.
+
+### So the lever is the 832 Tensile dispatches — and plow owns every one of them
+
+**CORRECTION (2026-09-15, same day).** An earlier draft of this section called these "hipBLASLt
+calls" and argued the grouping was gated by an external library API. That is wrong, and the
+distinction matters. **There is no hipBLASLt runtime call anywhere on this path.** The Tensile
+kernels were PORTED INTO PLOW: `glm_lt_gfx942.elf` is a 95 MB plow-owned code object carrying
+**465 Tensile kernels**, hash-pinned against a qualified ABI at load time, and
+`amd_gemm_lt::Kernels::enqueue` dispatches them through **plow's own backend** —
+
+```rust
+let args = arguments(route, tensors, &self.specs[index], info1);   // the 160-byte UserArgs
+be.launch(self.kernels[index], args.dims[3], 256, 0, bytemuck::bytes_of(&args))?;
+```
+
+plow builds the kernarg block itself, computes the grid itself
+(`grid = n.div_ceil(spec.mt_i) * m.div_ceil(spec.mt_j)`), and rings its own doorbell. No
+`hipblasLtMatmul`, no dlopen, no vendor dispatch layer. "hipBLASLt" survives in this tree only as
+the PROVENANCE name in error strings and spec filenames.
+
+**So the register and LDS gate DOES apply to these kernels, and it is favourable.** The 8 pinned
+decode specs, read from the shipped object:
+
+| macro tile | vgpr | scratch | LDS | wg | waves/SIMD | wg/CU |
+|---|---|---|---|---|---|---|
+| 16x16x512 | 179 | **0** | 33792 | 256 | 2 | 1 |
+| 32x16x256 | 141 | **0** | 25600 | 256 | 3 | 2 |
+| 32x32x256 | 113 | **0** | 33792 | 256 | 4 | 1 |
+| 32x16x512 | 71 | **0** | 50176 | 256 | 7 | 1 |
+| 16x16x256 | 158 | **0** | 17408 | 256 | 3 | 3 |
+| 64x16x256 | 109 | **0** | 41984 | 256 | 4 | 1 |
+| 16x32x256 | 249 | **0** | 25600 | 256 | 2 | 2 |
+| 16x16x512 | 127 | **0** | 33792 | 256 | 4 | 1 |
+
+Unlike the decode megakernel (256 VGPR and spilling 6384 B/lane) and the aiter natives (512 VGPR and
+all 64 KiB of LDS), **not one of these spills**, they run 71-249 VGPR at 2-7 waves/SIMD, and LDS
+rather than registers is the binding limit on most. There is real headroom here — which is the
+opposite of what "we don't own these kernels" implied.
+
+"Fusing" them therefore means a **grouped launch we can actually build**: one dispatch covering
+several projections, with the workgroup-to-problem mapping done in the kernel or by emitting a
+descriptor array. Two things make that concrete rather than speculative — the shipped kernels are
+built with Tensile's `UserArgs` ABI (the same ABI Tensile's own grouped-GEMM path uses), and the
+emitter already knows which projections share an input: entry 67's `PLOW_GLM_DECODE_GEMM_GROUP` exists precisely to emit same-input decode GEMMs
+adjacent (gate/up after the router GEMM; idx k/w beside q_a/kv_a/k_rope; idx q_b beside
+q_absorb/q_rope). Adjacency was the cheap half; grouping those same sets into one call is the rest.
+
+**What it is worth, and why it is still not enough.** Entry 67 is the one paired A/B of this lever:
+-138 segments for a class-weighted 78-layer projection of **-1.75 ms/step**, i.e. **12.7 us per
+segment removed**. The knob is `GLM_RECIPE_ON` and `glm_decode_gemm_group()` falls back to
+`glm_production_defaults`, so today's 1293 is already post-grouping and 12.7 us is the MARGINAL rate.
+Applying it across the program:
+
+| quantity | value |
+|---|---|
+| segments per token per rank | 1293 |
+| marginal price per segment | 12.7 us |
+| **implied total per-segment overhead** | **~16.4 ms** |
+| tick today | 40.03 ms |
+| **floor if every boundary were free** | **~23.6 ms** |
+| goal 2 | 25 ms |
+
+Collapsing the same-input projections optimistically takes ~10.7 GEMMs per layer to ~4-5, so
+832 -> ~350: **-480 segments, about -6.1 ms**, landing near 34 ms. Real but not sufficient. Reaching
+25 ms needs essentially all 16.4 ms, and fusion removes boundaries one at a time.
+
+Three caveats on the 23.6 ms floor, all pointing the same way — it is optimistic:
+the 12.7 us rate comes from a 7-layer tier-3 A/B projected class-weighted to 78 layers under the
+defaults of the time; those 138 merges were the easy ones (adjacent, same input, no dependency to
+break); and the rate was measured removing interpreter segment boundaries, not Tensile dispatches,
+whose per-call overhead may differ in either direction.
+
+**What this leaves.** A grouped Tensile launch is the largest single reduction available on the decode path
+and should be priced first. But the ladder's own cliff is the more interesting object: rung 1 pays
+~151 segments and loses 10.5 ms to bad arithmetic; rung 8 pays 1293 segments to win it back. Neither
+end is the optimum, and nothing in the packet today offers rung-8 arithmetic at rung-1 dispatch
+count. That — not incremental fusion — is the shape of a 25 ms decode.
+
+Units note carried from the correction above: `dec_segs` counts SEGMENTS; an active
+`SparseMlaDecode` segment enqueues two AQL packets (`amd.rs:12212`), so packets per token exceed
+1293 and 12.7 us is a per-segment price. The totals here are anchored to the measured -1.75 ms, not
+to any per-packet figure.
+
+
+## Production end-to-end, all via `vllm bench serve`: 203.7 tok/s peak, both latency goals still open, and a new 70k/C20 aperture fault (2026-09-15, job `e2e-prod`)
+
+One server, production defaults, five arms against the same load so every number is comparable.
+Packet `9e76b70bf97ee4a6`, row-band serve gate on, no other campaign knob set.
+
+| arm | C | isl | TTFT ms | TPOT ms | out tok/s | total tok/s | per-stream tok/s |
+|---|---|---|---|---|---|---|---|
+| c1 | 1 | 8192 | **513.9** | **40.55** | 23.5 | 776.0 | 24.7 |
+| c8 | 8 | 8192 | 1042.3 | 55.41 | 134.5 | 4438.5 | 18.0 |
+| **c20** | 20 | 8192 | 1051.8 | 92.78 | **203.7** | 6721.2 | 10.8 |
+| c32 | 32 | 8192 | 16088.0 | 98.45 | 198.0 | 6535.4 | 10.2 |
+| c20-70k | 20 | 70000 | — | — | — | — | server faulted, see below |
+
+**Goal 1 — 8K C1 TTFT < 490 ms: NOT MET at 513.9 ms (+23.9).** Unchanged in substance from the
+512.0 ms measured on the fixed stack; the gap is the same structural ~22-24 ms.
+
+**Goal 2 — C1 decode TPOT 25 ms: NOT MET at 40.55 ms (+15.55), i.e. 24.7 tok/s per stream.**
+Consistent with the 41.19 ms the rung sweep measured independently an hour earlier.
+
+**Goal 3 — throughput.** Peak aggregate output is **203.7 tok/s at C20**, with the knee between
+C20 and C32: pushing to C32 loses throughput (198.0) and destroys TTFT (1.05 s to 16.1 s), which is
+queueing, not compute. **The 140 tok/s mark is passed at 8K prompts** — already 134.5 at C8 and
+203.7 at C20, with no MTP and no speculative decoding.
+
+**Reconciling 203.7 with the ~82 tok/s on record.** Entry 69's tier-4 measured 75.6/81.7/76.3 out
+tok/s and projected ~87-88 — but at **70,000-token** prompts, which are prefill-dominated: at C20
+those arms spend most of their GPU time on 8192-row prefill chunks, not on decode ticks. The two
+numbers describe different workloads and neither supersedes the other. Quote the prompt length with
+the throughput or the figure is meaningless.
+
+**Goal 3 is still not ADJUDICATED, only measured on one side.** There is no vLLM arm in this run:
+both vLLM arms still die with `illegal memory access` on Worker_TP3/TP6 for this model. "Beats
+vLLM" remains unmeasured rather than met, and that should not be softened — 203.7 tok/s is plow's
+absolute number, not a comparison.
+
+### New defect: aperture violation at 70k / C20
+
+The fifth arm faulted the GPU and the server dumped core:
+
+```
+Queue error: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION:
+  The agent attempted to access memory beyond the largest legal address.
+Queue at 0x7ffc80036000 inactivated due to async error
+```
+
+The last lines before it are decode-ladder rung transitions under changing load —
+`20 -> 16` (LowLoad), `16 -> 8` (LowLoad), `8 -> 16` (Utilization), `16 -> 20` (Backlog, queued=18),
+then `rung=8 occupied=1`, `rung=16 occupied=9`, then the fault. The four 8192 arms that ran before
+it on the same server were clean, including their own rung transitions, so the trigger involves the
+70k context specifically rather than rung switching alone.
+
+This is NOT a known-good configuration failing in a new way to be waved off: entry 69 ran
+20 x 70k/700 at C20 to completion. Either something since has regressed it, or the fault is
+load-timing dependent and that earlier run was lucky. It needs a reproduction before any claim
+either way — and it means the long-context throughput cell currently has no number at all.
+
+## The decode rung crossover has NOT moved, and the GEMV's instruction levers are exhausted (2026-09-15, job `decode-rungsweep` + CPU-only ISA scan)
+
+Two questions, one answered on hardware and one in the shipped ISA: is the 1293-segment native-GEMM
+rung actually the right choice, and is there an instruction-level or producer/consumer win left in
+the low-batch GEMV?
+
+### The rung sweep: the default is right, by 9-19 ms
+
+`PLOW_AMD_DECODE_MIN_RUNG` swept at isl8192 C1, one server per arm, 3 prompts x 192 output tokens,
+`dec_segs` read from `PLOW_TICK_LOG` as the check that the knob actually changed program:
+
+| arm | TPOT ms | TTFT ms | dec_segs | tick ms | errors |
+|---|---|---|---|---|---|
+| min_rung 1 | 50.55 | 514.2 | 151 | 50.328 | 0 |
+| min_rung 2 | 55.83 | 514.8 | 151 | 55.453 | 0 |
+| min_rung 4 | 60.42 | 513.8 | 151 | 60.178 | 0 |
+| **min_rung 8 (default)** | **41.19** | 510.8 | **1293** | 40.030 | 0 |
+
+Every arm is valid — the segment count moved exactly as the offline `disasm` predicted (151 below
+rung 8, 1293 at it), and no arm logged an error or a cross-rank disagreement.
+
+**The hypothesis is falsified and the default's justification still holds.** `config.rs:835` records
+41.4 ms on rung 8 against 51.9 on rung 1; this re-measures **41.19 against 50.55** after NUMA-local
+kernarg, the VRAM kernarg ring, the W_uv fold, FP8 sparse-MLA keys and
+`PLOW_GLM_DECODE_GEMM_GROUP` all landed. The crossover did not move.
+
+**And it settles the dispatch-count question directly.** Rung 4 runs 151 segments — 8.6x FEWER than
+rung 8's 1293 — and is **19.2 ms SLOWER**. Whatever per-segment dispatch overhead costs, the
+arithmetic difference between the two program shapes dwarfs it. Fewer dispatches is not the same as
+faster, and this is the counter-example in the shipped ladder.
+
+It also reproduces the documented mechanism independently: TPOT gets monotonically WORSE from rung 1
+to 2 to 4 (50.55 -> 55.83 -> 60.42) at a CONSTANT 151 segments. Same dispatches, more activation
+rows, worse time — exactly `op_gemm_common.h`'s "~24 VALU ops per 16 bytes of weight PER ACTIVATION
+ROW ... at batch 4 the arithmetic is 4x while the bytes are 1x, and the body crosses from
+memory-bound to issue-bound."
+
+Cross-check on the earlier extrapolation: at 12.7 us/segment, rung 8 would carry 16.4 ms of
+dispatch overhead and rung 4 only 1.9 ms, implying non-dispatch work of 24.8 ms vs 58.5 ms — the
+Tensile path doing the same arithmetic 2.4x better. That is consistent with the in-tree
+measurement of plow's GEMV streaming weights at 839 GB/s against vLLM's 2111 GB/s.
+
+### The GEMV scan: every instruction lever is already built, measured, and bounded
+
+`gemv_rows` and its siblings are not on the production decode path at all — rung 20 sends the
+projections to the ported Tensile kernels as `GemmLtPf` x832 — but the scan matters because it says what a
+plow-native low-batch GEMM would have to beat.
+
+**The arithmetic is emulated, and that is a hardware fact.** `v_dot2c_f32_bf16` is CDNA4;
+gfx942 has the fp16 dot but NOT the bf16 one (`amd_arch.h:143`), so `plow_dot2_bf16` widens to f32
+and issues two FMAs — 6 VALU ops per bf16 PAIR, 24 per 16 bytes of weight. Confirmed in the shipped
+object (`interp_decode_fp8kv.elf`, per-function `llvm-objdump`):
+
+| function | insts | 16B loads | ds_read_b128 | f32 FMA | MFMA | shift/mask | scratch | max load clause |
+|---|---|---|---|---|---|---|---|---|
+| `d_gemv_fp8_blk` | 21330 | 139 | 127 | 2871 | **0** | **7152** | 88 | 2 |
+| `d_gemv_fp8` | 13175 | 174 | 181 | 4274 | **0** | 3121 | 182 | 2 |
+| `d_gemv_qkv_fp8` | 10877 | 97 | 198 | 2999 | **0** | 2606 | 140 | 2 |
+| `d_gemv_fp8_nrn` | 6704 | 8 | 159 | 2014 | **0** | 1697 | 77 | 1 |
+| `d_gemv_glu` | 6249 | 11 | 61 | 996 | **0** | 550 | **1191** | 10 |
+| `d_gemv_qkvg` | 2818 | 3 | 80 | 651 | **0** | 729 | 70 | 1 |
+
+The six GEMV bodies are **61153 of the object's 66573 instructions — 92%**. Zero MFMA anywhere, and
+the shift/mask column is the bf16 widening: `d_gemv_fp8_blk` issues 7152 shifts and masks against
+2871 FMAs.
+
+**What has already been tried, with its measured result:**
+
+| lever | knob | outcome |
+|---|---|---|
+| collapse the emulated dot to one op (wrong answer, prices the ceiling) | `GV_HACK_CHEAPDOT` | **-3.2% of the token — this is the hard ceiling on ANY dot-instruction change** |
+| MFMA GEMV at M=1, 32x32 diagonal mapping | `GV_MFMA` | correct, faster standalone (3152 vs 2900 GB/s), **loses 1.6%** in-model: 15 dependent MFMAs per row with nothing to hide ~32 cycles each |
+| MFMA GEMV batched, `v_mfma_f32_4x4x4bf16_1k` (vLLM `wvSplitK_hf_sml_` shape) | `GV_MFMA4` | built, OFF — it REDEFINES the reference arithmetic, so bit identity is impossible by construction; a model-owner call, not a perf one |
+| delete the whole cross-lane reduction (wrong answer) | `GV_HACK_NOSUM` | 0.16% |
+| SGPR descriptors to kill the load waterfall | `GV_USCALAR`/`GV_URSRC` | ~0 — at M=1 the issue pipe is only ~23% busy |
+| in-flight load depth | `GV_UNROLL_M4=6`, `_M8=3` | tuned and shipped: 4.8x at M=8 and 9.1x at M=16 over a flat 11 |
+| R-column split (more in-flight WORK) | `GV_RS_WIDE=1` | shipped, -0.96 ms of 27.29 at T=4 |
+| 16-byte wide LDS staging | `stage_x_lds` | shipped, 1.02-1.27x per packet |
+| **producer/consumer DMA ring, global->LDS with zero VGPRs** | `GV_DMA` | **built and LOST: 16.8 baseline -> 18.4 (ring16/batch8), 19.3 (ring16/batch4), 27.3 (ring4/batch1)** |
+
+**Direct-to-LDS is blocked by the hardware anyway.** CDNA3's `global_load_lds` moves 1, 2 or 4 bytes
+per lane; the 12- and 16-byte forms are CDNA4 (`amd_common.h:333`, `op_gemm_gfx942.h:34`). The
+zero-VGPR ring that would make a deep producer/consumer pipeline free does not exist at the width
+this loop needs on this chip.
+
+**One in-tree claim does not reproduce, and it is the one the `GV_DMA` autopsy rests on.** That
+autopsy dismisses its own premise by asserting the compiler already emits "TWENTY back-to-back
+`global_load_dwordx4` ... ~20 KB in flight per wave held in `v[108:167]` ... staggered `s_waitcnt
+vmcnt(7), vmcnt(6), vmcnt(5)` ... It NEVER drains." On the shipped object that is not what is there:
+the longest back-to-back 16-byte load clause in any GEMV body is **10** (and 1-2 in five of the
+six), and the `vmcnt` mass sits on **full drains** — `d_gemv_glu` waits `vmcnt(0)` 660 times out of
+710 (93% draining), `d_gemv_fp8` 224 of 315 (71%). The autopsy may have been reading a different
+object or a different build; either way its "there was no hole to fill" conclusion is not supported
+by what ships today. That does NOT resurrect `GV_DMA` — the measured 16.8 -> 18.4 loss stands on
+its own, and the hardware limit above caps what a rewrite could do — but the stated REASON for the
+loss should not be carried forward as established.
+
+**What the ISA does show is spill.** `d_gemv_glu` spends **1191 of its 6249 instructions (19%) on
+scratch**, by far the largest concentration in the object, and the whole kernel carries 6384 bytes
+per lane of scratch at the 256-VGPR cap (2 waves/SIMD). The register wall is the same one that
+blocked the MFMA arm's second accumulator and hand-rolled software pipelining. If anything in this
+body is worth another look it is the spill, not the dot instruction and not the load issue pattern.
+
+### Conclusion
+
+The low-batch GEMV has no instruction lever left worth taking: the ceiling on all dot-arithmetic
+changes is a measured 3.2%, the MFMA arms lose or change the numerics, the producer/consumer ring
+lost and its clean form needs CDNA4 hardware, and the path is not in production regardless. The
+sweep says production is already on the better arithmetic by 9-19 ms. Goal 2 will not be reached
+inside this kernel family.
+
+
+## The 8192 chunk has no dominant cost, and the two open prefill projections are stale by a large factor (2026-09-15, job `segattrib-8192`)
+
+With every non-GPU route to the remaining 22 ms closed, the question became which part of the
+drain to attack. `PLOW_PREFILL_SEG_TIMING=1` on the stack packet, one 8192 request, summed by
+segment family over the single 8192-bucket chunk (`program=4 c0=0 clen=8192`):
+
+| family | critical (inflated) | share | segments | enqueue |
+|---|---|---|---|---|
+| `interpreter` | 397.38 ms | **24.8%** | 1218 | 22.20 |
+| `moe_aiter_fp8` | 372.64 ms | **23.3%** | 225 | 22.15 |
+| `gemm_lt` | 354.78 ms | **22.1%** | 2268 | 38.90 |
+| `mla_sparse_aiter` | 343.28 ms | **21.4%** | 234 | 26.23 |
+| `mla_fold` | 101.72 ms | 6.3% | 234 | 10.61 |
+| `index_tp` | 32.10 ms | 2.0% | 63 | 3.14 |
+| TOTAL | 1601.90 ms | | 4242 | 123.24 |
+
+**The totals are inflated and must not be quoted as latency.** `amd_tp.rs:1754` computes
+`segment_major = ... && !segment_timing`, so the instrument disables the segment-major path and
+forces an all-rank `drain()` after every one of the 4242 segments. The total is 3.7x the real
+431 ms drain. The SHARES are the result.
+
+**The profile is flat.** Four families sit within 3.4 points of each other, 21.4% to 24.8%. There
+is no hot spot to delete. Against the real 431 ms drain the shares scale to roughly `interpreter`
+107 ms, `moe_aiter_fp8` 100, `gemm_lt` 95, `mla_sparse_aiter` 92, `mla_fold` 27, `index_tp` 9. The
+goal needs 22 ms, which is 5.1% of the drain — so it takes **a 20-25% improvement in one of the
+big four**, or a smaller win taken from several at once. Nothing below `mla_fold` can close it
+even if deleted outright.
+
+**Both open prefill tasks are mis-scaled against this, and should be re-derived before either is
+resourced.**
+
+* **#25, FP8 block-scale prefill GEMMs via CK/AITER, projected -70..95 ms/chunk.** The family it
+  targets, `gemm_lt`, is only about 95 ms of the drain in total. The projection is the whole
+  family, which would require the GEMMs to become free. It also names the destination as if the
+  GEMMs were not already there: `gemm_lt` IS the hipBLASLt adapter path
+  (`glm_lt_gfx942.elf` / `glm_fold_lt_gfx942.elf`), so part of that move has already happened and
+  the remaining headroom is whatever CK/AITER beats hipBLASLt by, not the family's whole cost.
+* **#26, sequence-parallel collective seams, projected -150 ms/chunk.** Collectives do not appear
+  as a family at all here — `XReduceScatter` and `XAllGather` are interpreter ops, so they are
+  inside `interpreter`'s 107 ms. A -150 ms projection exceeds the entire family that contains
+  them. Both numbers date from the era when the chunk was ~1511 ms; the chunk is now 431 ms and
+  the earlier wins (two-shot all-reduce, the shared-expert fold, the W_uv fold, row-band) have
+  already taken most of what they were projecting.
+
+**`gemm_lt` is worth a second look for a different reason.** It carries 2268 of the 4242 segments
+— more than half of all segments — for 22.1% of the time, so its per-segment cost is the lowest of
+the big four. That many segments at that granularity is itself a candidate: fewer, larger
+dispatches would cut per-segment overhead without touching the arithmetic. That is a launch-shape
+question, not a kernel question, and it is the one lever this table suggests that nothing has tried.
+
+**Caveat on all of the above.** This is a relative attribution taken on a distorted path, and the
+per-segment barrier does not fall evenly across families — a family of many small segments pays
+the barrier more often than one of few large segments, which likely inflates `gemm_lt`'s share
+(2268 segments) relative to `moe_aiter_fp8`'s (225). The ranking of the big four should be treated
+as "all four are comparable", not as a strict order, and any lever it points at still needs a
+paired T4 on the undistorted path before it counts.
+
+## The encode split does NOT survive pairing, and a T4 that scores only its controls can be fooled (2026-09-15, job `encode-t4`)
+
+`hostpath-probe` put `PLOW_ENCODE_THREADS=32` at -4.8 ms and said it needed a real A/B to claim.
+The four-arm paired T4, 32 prompts per arm at isl8192-c1 on the stack packet:
+
+| arm | knobs confirmed live | median TTFT | mean | p99 |
+|---|---|---|---|---|
+| `ctl` | `encode_fast: false, encode_threads: None` | 498.52 | 509.99 | 682.21 |
+| `treat` | `encode_fast: true, encode_threads: Some(32)` | 498.26 | 503.57 | 582.53 |
+| `ctl2` | `encode_fast: false, encode_threads: None` | 498.64 | 500.78 | 537.39 |
+| `treat2` | `encode_fast: true, encode_threads: Some(32)` | 492.67 | 497.79 | 536.88 |
+
+The scorer printed `VERDICT: REAL ... -3.11 ms`. **That verdict is wrong and the arms show why.**
+
+* The two CONTROLS agree to **0.12 ms**.
+* The two arms of the SAME TREATMENT disagree by **5.59 ms** — 47x the control drift.
+* Against the control mean, `treat` is **-0.32 ms** (nothing at all) and `treat2` is **-5.91 ms**.
+  The reported -3.11 is one null arm averaged with one outlier arm.
+* The p99 tail falls monotonically with RUN ORDER across the whole job: 682 -> 583 -> 537 -> 537.
+  Arm position is confounded with treatment, and the two controls happen to agree at the median
+  while their distributions do not.
+
+**Verdict: not convictable.** The encode split is neither established nor refuted at 8192; what is
+established is that this measurement cannot tell. It is also worth noting the knobs were confirmed
+live in every arm (the probe greps the resolved config), so this is not a silently-unset arm.
+
+**The design flaw, fixed.** The probe floored the effect on the control-to-control gap alone. That
+is only half the floor: two arms of the same treatment must also agree, or an outlier in one of
+them becomes an "effect". The scorer now computes `tspread = |treat - treat2|`, floors on
+`max(drift, tspread)`, and refuses the comparison outright when `tspread > 3 * drift`. **Every
+other four-arm T4 in this campaign that scored its floor from controls only is open to the same
+error** — `dxflip`'s scorer computes its P floor from `|med ctl - med ctl2| + 2*max(MAD)`, which
+has the same blind spot, though its TPOT effects (-1.8 and -2.9 ms against floors of 0.12 and 1.02)
+are large enough and its two treat arms close enough (36.007 vs 35.997; 52.190 vs 51.875) that the
+conclusion there survives the stricter rule.
+
+**Where this leaves the goal.** The end-to-end cell is 512.0 ms against 490, and the host path is
+now closed as a route to it: enqueue is off the critical path by construction, the kernarg ring
+must stay in VRAM (removing it costs +17 ms of enqueue), and the encode split cannot be shown to
+help. Tiles are closed. **The remaining 22 ms has to come out of the 431 ms drain — the prefill
+chunk on the GPU** — which is where tasks #25 (FP8 block-scale prefill GEMMs, -70..95 ms/chunk
+projected) and #26 (sequence-parallel collective seams, -150 ms/chunk projected) already point.
+
+## The host path has about 5 ms in it, not 33, and the VRAM kernarg ring must stay (2026-09-15, job `hostpath-probe`)
+
+The 22 ms gap to 490 needed a lever structurally disjoint from everything already in the packet,
+and the host admission path was the candidate. It is much smaller than the campaign believed.
+
+**The retraction first.** Earlier notes called prefill enqueue "8% of TTFT, the largest
+addressable non-GPU item". That is wrong, for two independent reasons the probe's header sets out:
+`PF_SEGMENTS.tally()` counts ONE rank's segments, so the 39.81 ms covers 1414 x 8 = 11312 AQL
+packets at 3.52 us each, not 28 us; and the COUNT column reads 1 for both `enqueue_segment` and
+`drain`, meaning one uninterrupted enqueue of all 11312 packets and one drain at the end. The
+doorbell rings per packet against a 4096-deep queue, so the GPU is running from packet 0 while the
+host is still submitting — it finishes 39.9 ms in against 474 ms of GPU work, 12x ahead. **Deleting
+the entire enqueue cost would move TTFT by roughly zero.** Of the host items only tokenize is real.
+
+Five arms, medians of the main phase at isl8192-c1 on the stack packet:
+
+| arm | knobs | median TTFT | vs base |
+|---|---|---|---|
+| `base` | — | 499.27 ms | — |
+| `et8` | `PLOW_ENCODE_THREADS=8 PLOW_ENCODE_FAST=1` | 497.06 ms | **-2.2** |
+| `et32` | `=32`, `PLOW_ENCODE_SPLIT_MIN=1024` | **494.43 ms** | **-4.8** |
+| `kh` | `PLOW_AMD_KERNARG_VRAM=0` | 515.61 ms | **+16.3** |
+| `both` | et32 + kh | 497.09 ms | -2.2 |
+
+**`kh` is decisively bad and the mechanism is visible.** The phase table shows `enqueue` at
+4.75 ms in every other arm and **21.96 ms** under `kh` — a 17.2 ms increase that accounts for the
+whole regression. So the per-launch BAR readback that `publish_device_kernarg` does is not a cost
+worth removing; removing the VRAM ring *adds* 17 ms of enqueue. The landed default from tasks
+#43/#44 is right, and `both` shows the two levers partly cancelling, as this campaign keeps finding
+for levers that touch the same region.
+
+**The encode split is worth a few ms and needs a real T4 to claim.** -4.8 ms at 32 threads is the
+right sign and the mechanism is sound (the rayon `encode_split` path, whose `split_safe` predicate
+GLM-5.3's tokenizer passes clause by clause, on a ~32 KB prompt), and `PLOW_ENCODE_FAST` is
+ids-identical so it cannot change a token. But this probe is a MEASUREMENT, not an A/B: eight
+prompts per arm, no repeated control, and its own header says it resolves a 10 ms phase rather
+than a 1 ms one. A -4.8 ms effect is below what it can convict on.
+
+**Arithmetic on the goal.** The end-to-end cell is 512.0 ms and the goal is 490. Even if the full
+-4.8 ms survives a paired T4, that is 507 ms — still 17 ms over. **The host path cannot close this
+gap by itself**, and with tiles already ruled out, the remaining 17 ms has to come from the 431 ms
+`drain`, which is GPU work: the prefill chunk itself.
+
+## `PLOW_*_DECODE_DENSE_EXACT` passes its TPOT claim on a paired T4, and the T4's FAIL is TTFT drift (2026-09-15, jobs `dxflip-t4r-{a-ctl,b-treat,c-ctl2,d-treat2}`)
+
+Row 100 landed the dense-exact decode twin opt-in on a single T3 (TPOT 37.72/35.93/37.70,
+-1.78 ms, -4.7%). The four-arm paired T4 reproduces that with proper confidence intervals and
+extends it to concurrency 16:
+
+| cell | arm TPOT medians (ctl / treat / ctl2 / treat2) | pooled TPOT effect | floor | out tok/s | twin fires |
+|---|---|---|---|---|---|
+| isl1024-c1 | 37.85 / 36.01 / 37.78 / 36.00 | **-1.802** [-1.892, -1.712] | 0.122 | 25.92 -> 27.2 (**+4.8%**) | 1.000 |
+| isl1024-c16 | 55.01 / 52.19 / 54.67 / 51.88 | **-2.879** [-2.914, -2.846] | 1.023 | 282.2 -> 298 (**+5.6%**) | 1.000 |
+| isl8192-c1 | 42.32 / 41.88 / 42.05 / 41.92 | -0.354 [-0.472, -0.237] | 0.493 | 21.18 -> 21.41 | **0.000** |
+
+Zero failed requests in all arms of all cells, and the controls never fire the twin.
+
+**The TPOT claim holds and is bigger at concurrency.** Both short-context cells beat their
+checkpoint-P floor by more than an order of magnitude, and C16 — which row 100 never measured — is
+the larger win at -2.88 ms and +5.6% out tok/s.
+
+**The scorer's `T4 FAIL` is a TTFT verdict, and the harness fails its own control.** Every FAIL
+line is TTFT, the intervals straddle zero by wide margins (`+3.0 [-28.0, +31.6]` at C16), the
+point effects are -1.7 to +2.0 ms against floors of 1.0 to 8.4 ms, and `ctl2-ctl` is flagged
+`DRIFT (harness suspect)` in all three cells. A control that cannot reproduce itself cannot
+convict the treatment. Read as: TPOT faster beyond floor, TTFT not resolvable by this harness.
+
+**It is not a lever for the 8K goal.** At isl8192-c1 the twin fires 0/4064 times in every arm, so
+the dense-exact program is never selected — exactly what row 100 predicted ("no step of a
+long-prompt workload qualifies"), now measured directly. Its TPOT effect there, -0.35 ms, is
+inside its own 0.49 ms floor. The lever belongs to short-context serving throughput, not to the
+490 ms cell.
+
+## The 8K goal cell, end to end and CORRECT under mixed traffic, is 512.0 ms (2026-09-15, job `e2e-fixed-8k`)
+
+`stack-t4` measured 509.8 ms cold 8192 TTFT on this packet, but on a binary carrying the `@band`
+view memo defect: any RAGGED 8192-bucket chunk poisoned every later row-band chunk on that server.
+A single cold 8192 request never triggers it, so 509.8 ms was a valid latency number for the cold
+path and nothing more. This is the first run of the goal cell that is fast AND correct under
+traffic that mixes lengths, which is what serving is.
+
+Both arms on the fixed binary, stack packet `9e76b70bf97ee4a6` with row-band, 32 prompts at
+`--random-input-len 8192 --random-output-len 128 --max-concurrency 1`, prefix cache at its
+default (on), the same vLLM `bench serve` stamp `stack-t4` used:
+
+| arm | poison | needles | TTFT median | TTFT p99 | TPOT | ITL | completed | failed |
+|---|---|---|---|---|---|---|---|---|
+| `cold` | none | **24/24** | **512.0 ms** | 585.9 | 40.33 | 40.13 | 32 | 0 |
+| `mixed` | 4096 first | **24/24** | **512.6 ms** | 631.8 | 40.40 | 40.19 | 32 | 0 |
+
+Zero server error lines in either arm, and the 4096 poisoner itself passed 3/3.
+
+**Three things this establishes.**
+
+*The fix holds in serving, not just in the probe.* The `mixed` arm runs the exact sequence that
+poisoned before — a 4096 request, ragged in the 8192 bucket, ahead of the 8K work — and its eight
+band centres all pass. Before the fix that arm was 0/24.
+
+*The restore is free.* `mixed - cold` is **+0.61 ms** on a 512 ms number. Re-uploading the band
+view table when the family's binding changes costs nothing measurable, so there is no reason to
+chase a cheaper restore.
+
+*The goal gap is 22.0 ms, and it is not where the tiles were.* 512.0 against 490. That is the same
+gap `stack-t4` reported (509.8, +19.8), so the fix cost nothing and the gap is structural, not an
+artefact of the defect. Tiles are already ruled out as the route to it (measurement loses to the
+model at every rung). The remaining structurally-disjoint candidate is the host admission path:
+the rung board prices roughly 33 ms per 8192 request OUTSIDE the engine — tokenize 8.6-17 ms, the
+untimed handler-to-first-SSE remainder 10-16 ms, prompt upload 1.1-2.0 ms, JSON and HTTP about 3 —
+and `PLOW_ENCODE_FAST` is ids-identical, so it cannot change a token.
+
+**On goal 2 in this configuration.** TPOT is 40.33 ms here, against a 25 ms target. That is the
+non-MTP decode; the 16.35 ms that meets the goal is the MTP path, which this packet does not
+carry. The two goals are currently met by different configurations, and no single run has yet
+shown 8K TTFT and C1 TPOT at target together.
+
+**Harness note.** The probe's own summary block printed `(missing)` for both arms: it looked for
+`<tag>/bench.json` while `--result-dir` writes `<tag>/main/bench.json`. The per-arm lines it
+printed during the run are correct and the table above is read from the bench files directly.
+
+## The measured tiles are SLOWER at every rung, so the store must not reach the shipping packet (2026-09-15, job `tileab-rungs-t4`)
+
+The 8192-only A/B found nothing (+0.8 ms inside a 0.9 ms drift). 8192 is the rung where M is
+largest and the tile choice matters least, so the same paired question was asked at all four
+prefill rungs, one server per arm benched at each length in turn:
+
+| rung | ctrl | treat | ctrl2 | drift | delta | verdict |
+|---|---|---|---|---|---|---|
+| 128 | 96.1 | 96.5 | 96.1 | 0.0 | +0.4 | slower |
+| 512 | 352.9 | 360.7 | 353.5 | 0.6 | **+7.6** | slower |
+| 2048 | 427.9 | 435.3 | 427.6 | 0.2 | **+7.5** | slower |
+| 8192 | 952.1 | 957.8 | 953.9 | 1.9 | **+4.8** | slower |
+
+Measurement-chosen tiles lose at every rung, by more than that rung's own drift everywhere except
+128, where the effect is real but sub-millisecond. **The store must not reach the shipping packet**:
+re-emitting with `PLOW_TUNEDB` live would cost 5-8 ms per prefill rung.
+
+**The harness caveat, stated because it matters.** This probe's own tie-check FAILED: 8192 reads
+952 ms here against 586 ms in the single-rung run. The difference is rung ordering — here 8192 is
+benched fourth, on a server that has already served 128, 512 and 2048, so its slot and cache state
+are not a cold server's. The absolute numbers in this table are therefore NOT comparable to
+`tileab-ttft-t4b`'s, and none of them are goal numbers. The PAIRED comparison inside the table is
+unaffected: all three arms ran the identical sequence in the identical order, which is the whole
+reason the design runs the control twice.
+
+**Why measurement can lose to the model, which is the part worth understanding.** `tune gemm`
+times each shape in isolation and picks the fastest tile for that shape alone. The packet then
+runs those tiles inside a whole program, where the choice interacts with everything around it:
+L2 residency across neighbouring ops, occupancy against the co-resident MoE, and the launch
+geometry of the dispatch it sits in. The measured set also changes OPCODE at some shapes
+(`512x6144x256`: `GemmMed 128x128` to `GemmSmall 64x128`), which changes how many tiles the
+dispatch has to place and therefore how it fills. A per-shape optimum that does not compose is
+exactly what this measures, and the analytical model — which prices the dispatch, not the kernel —
+evidently composes better on this packet.
+
+So the campaign's worth is what it always was minus the speed claim: `pick_tile` now reports a
+truthful tier instead of `portable` over a dead cell, and a shape where the model picks badly
+would now be visible. It is diagnostic infrastructure, not a lever. **Tiles are closed as a route
+to 490 ms.**
+
+The open question it leaves is whether a tile campaign that measured shapes IN PROGRAM CONTEXT
+(or that only overrode the model where it beats it by more than the drift) would do better. That
+is a different campaign from the one `rebench_tune_gemm_gfx942.sh` runs.
+
+## The measured tiles do not move 8192 TTFT, and the shipping packet never had them anyway (2026-09-15, jobs `tileab-ttft-t4`, `tileab-ttft-t4b`)
+
+Two facts, in the order they matter.
+
+**The campaign does not reach a packet by itself.** Tiles are chosen at EMIT time and baked in. The
+shipping packet's `build.json` records:
+
+    tuning: {"gv_mm_max": 32, "tile_lookups": 1584, "tile_measured": 0, "tile_source": "analytical"}
+
+so every one of its 1584 tile lookups came from the cost model, and populating the store changed
+nothing about it. Only a re-emit can. Emitting from the same HEAD binary with the same replay
+knobs, differing only in whether the store is readable (`PLOW_TUNEDB=""` disables it):
+
+| arm | packet | tile_lookups | tile_measured | source |
+|---|---|---|---|---|
+| analytical | `0x164ae4a829ecebec` | 1584 | 0 | `analytical` |
+| measured | `0x9abd6d2277d7707a` | 1584 | **1509** | `mixed` |
+
+1509 of 1584 lookups change hands, and at least one audited GLM prefill shape changes opcode as
+well as tile: `512x6144x256` goes `GemmMed 128x128` to `GemmSmall 64x128`.
+
+**And it makes no difference at 8192.** Paired, control run first and last, 12 prompts each at
+`--random-input-len 8192 --max-concurrency 1`, each packet on its own object set:
+
+| arm | packet | median TTFT |
+|---|---|---|
+| `ctrl` | analytical | 586.8 ms |
+| `treat` | measured | 587.2 ms |
+| `ctrl2` | analytical | 585.9 ms |
+
+Control drift 0.9 ms; treat is +0.8 ms against the control mean, **inside the drift**. The
+analytical cost model was already picking as well as measurement can for GLM's 8192 prefill
+shapes. The campaign's value is therefore not speed at this rung: it is that `pick_tile` now
+reports a truthful tier, that the 4961 stale records are no longer the whole cell, and that a
+shape where the model picks badly would now be caught. **Tiles are not a lever for the 490 ms
+goal.**
+
+Two things this does NOT say. It prices the 8192 rung only — the tiles differ at every rung and at
+decode M=1, and a short-rung effect would not show here. And neither packet carries row-band or
+the rest of the qualified stack, so 586 ms is not comparable to `stack-t4`'s 509.8 ms; it is the
+ordinary prefill path at HEAD, which is the right control for a tile question and the wrong one
+for a goal number.
+
+**An object-set trap worth recording.** `build_gfx942.sh` builds the 53 interpreter and adapter
+rows the packet is compiled for and reports `ready (53 objects)` — but the loader also demands
+hand-written and vendor kernels it does not build, and the first run of this A/B lost three GPU
+slots to `mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co: No such file or directory` on a clean build.
+Ten of them (4 `.co`, 6 adapter `.elf`) are packet-independent and are carried byte-identical by
+both the shipping set and the row-band set, so they are seeded from the shipping set. The probe's
+preflight now names all ten.
+
+## The tile campaign passes, and the shipping demand is 40 shapes, not 56 (2026-09-14, job `gemmtune-glm53-r3`)
+
+`gemmtune-glm53-r3` completed rc=0 in 10.1 min with both fixes in place — the packet-scoped object
+build (no `PLOW_OCC4`) that passes the contract over all 53 objects, and `--replay-knobs` on step 4
+that keeps the emit off `mla.rs:5461`. Step 5's gating test
+`gfx942_measurements_reach_the_compiler` passes, and step 6 reports **40 distinct shapes,
+40 HIT / 0 MISS** at digest `gfx942-97116a9dc1be9326`. The emit's own line is the one that matters:
+
+    tunedb: all 2598 dense-GEMM tile(s) chosen BY MEASUREMENT
+
+against the `>>> tunedb: ALL ... chosen by the ANALYTICAL MODEL. This build is UNMEASURED` that
+every GLM emit carried before. The cell is no longer stale and the packets are no longer
+`portable`.
+
+**Correcting the previous entry.** The commit that added `--replay-knobs` recorded "under the true
+shipping knobs the demand is 56 distinct shapes ... the 40 recorded earlier came from a neighbour
+compile". That is backwards. Re-deriving the demand both ways at the same digest:
+
+| env | tiles | demand | coverage |
+|---|---|---|---|
+| serving (`PLOW_MLA_PF_V2/AITER`, `PLOW_UNISEG=0`, replay) | 2598 | 40 | 40 HIT / 0 MISS |
+| step 4's (`GLM_MOE_CORESIDENT=2 GLM_SHARED_CUS=48 GLM_SHARD_HEAD=1 PLOW_MLA_PREFILL=full`, replay) | 3918 | 56 | 0 HIT / 56 MISS |
+
+3918 tiles against 2598 is a different compile, not a different reading of one. The 56 is the
+neighbour; 40 is what ships. Coverage is unaffected either way, because the store is keyed by the
+OBJECT digest and the objects were built packet-scoped: step 4's env only chose which shapes to
+time, and the 40 the shipping emit asks for are all among them.
+
+## The tile-campaign blocker resolves into three classes with three different owners (2026-09-14, job `gemmtune-glm53`, follow-up)
+
+The section above records 374 FAIL lines over 44 objects and stops at "it wants an owner". Building
+two earlier trees with the same nix toolchain names the owners. Both builds are plain
+`build_gfx942.sh` runs from `git archive` exports on `/workspace`, `JOBS=8`, no other change.
+
+| build | geometry FAILs | scratch-budget FAILs | K3 MoE spill FAILs |
+|---|---|---|---|
+| HEAD | 360 | 6 | 8 |
+| `3d54bd95` (parent of `f89d3a5c`) | **0** | **0** | 8 |
+| `ee624310` (the last re-bless, 2026-09-11) | **0** | **0** | 8 |
+
+**Class 1 — the nine geometry knobs are bookkeeping, and they are one day old.** No profile in the
+committed baseline carries `GM_C5_*`, `GM_C8_*` or `GM_WD_*`; all eight profiles hold 86 keys and
+none of them is one of the nine. Upstream `f89d3a5c` ("Enable split attention in unified token
+batches", 2026-09-14 04:47) is what added them to `runtime/amd/geom_contract.h`, three days after the
+last bless. This class is a stale baseline and nothing else; re-blessing it is correct.
+
+**Class 2 — the scratch-budget regressions belong to `f89d3a5c` too.** `interp_prefill_k3` at 2632
+scratch ops against a budget of 1957 (+675, +35 %), `interp_prefill_k3_gq` at 2628 against 1953, and
+`interp_prefill_fp8kv_mla` / `interp_prefill_mla_moe` over by single digits. All six are absent at
+`3d54bd95` and appear at HEAD, so the same commit that changed `interp.hip`, `op_gemm_common.h` and
+`amd_common.h` is what moved them. This is a real regression with a name on it, one day old, and
+blessing it would be absorbing it.
+
+Two refinements matter for whoever picks it up. First, the `-D` axes for `interp_prefill_k3` are
+BYTE-IDENTICAL between the two builds, so nothing about the flags changed: the +675 scratch ops come
+purely from `f89d3a5c`'s source edits. The visible candidate is that every FP8 GEMM arm and the FP8
+quantizer stopped reading `M` from `in->i[0]` inside the callee and now take it as a parameter,
+`PLOW_RUNTIME_ROWS(in->i[0])` — which expands to `(capacity)`, an exact no-op, on an object that
+sets neither `PLOW_TOKEN_BATCH` nor `PLOW_MIXED_STEP`, as this one does not. So the semantics are
+unchanged and the cost is an emergent register-allocation effect, which is precisely the class the
+committed budget exists to catch and precisely the class that is invisible without it.
+
+Second, and it changes the urgency rather than the verdict: **the 35 % blowup is not on the GLM
+path.** `interp_prefill_k3` compiles `-DPLOW_K3=1 -DPLOW_MXFP4=1`, the K3/MXFP4 family; the two GLM
+prefill rows in the same list, `interp_prefill_mla_moe` and `interp_prefill_fp8kv_mla`, are over by
+1 and 6 scratch ops, which is noise. The 8K TTFT campaign is not paying for this regression. The
+K3/MXFP4 prefill family is.
+
+**Class 3 — the K3 MoE expert spills are `PLOW_OCC4=1`, and that flag does not ship.**
+`d_moe_expert_glu_fp8_blk` at 105 spill instructions and `d_moe_expert_down_fp8_blk` at 80, across
+four decode objects, are present at HEAD, at `3d54bd95` and at `ee624310` — identical counts in all
+three, which first read as a standing failure that predated the last bless. It is not. All three of
+those builds passed `PLOW_OCC4=1`, because that is what `rebench_tune_gemm_gfx942.sh` passed and the
+control builds copied it. **Build the same 53 objects at HEAD without `PLOW_OCC4` and all eight FAIL
+lines disappear**, with nothing else about them changing.
+
+The mechanism is in the recorded axes: with `PLOW_OCC4=1`, `interp_decode_k3` compiles
+`-DPLOW_WPE=5` (plus `-DGM_BK=32 -DGM_BM=128 -DGM_BN=256`); without it, none of those. `PLOW_WPE=5`
+is the occupancy-4 register ration, and rationing registers is what pushes those two outlined bodies
+to scratch. `no_scratch` in `scripts/asm_expect_gfx942.json` is written for the default build and
+does not model that axis, so it fires on an OCC4 build by construction.
+
+**And `PLOW_OCC4=1` cannot ship for this model anyway**, which is the part that settles it.
+`build_gfx942.sh` refuses the flag outright once the packet's decode ladder has batch > 1 — GLM's
+ends at 20 — with "the WPE=5/4 register ration hangs the batched program's first decode dispatch".
+The shipped serving set proves the same thing from the other side: its `build_defines.json` carries
+no `PLOW_WPE=5` and no `GM_BK=32`, and every row carries `-DPLOW_CONFIG="plow_config.h"`. The
+shipping recipe is a PACKET-SCOPED build with no OCC4.
+
+**What this means for the campaign**, and it is now a fix rather than an owner's decision. The
+rebench script's step 1 called `PLOW_OCC4=1` "the SHIPPING recipe, not a special one", and the store
+is keyed by the object digest, so the campaign was measuring tiles for a `-D` set that does not
+ship — exactly the staleness that script's own header warns about. Step 1 now drops `PLOW_OCC4` and
+takes `PLOW_TUNE_CONFIG=<assets dir>` to build for one packet the way the shipped set is built. A
+packet build at HEAD matched the contract over all 53 objects, zero FAIL lines, so the campaign has
+a green step 1 again without blessing anything.
+
+Classes 1 and 2 survive on the generic build and keep their owners: the stale geometry profile is
+bookkeeping that wants a re-bless, and `f89d3a5c`'s scratch-budget regressions want their author. A
+packet build sidesteps both by the axis rule rather than by fixing them, which is worth saying
+plainly — its PASS on those rows is the absence of a check. The tile cell is still stale for the
+reason already recorded: 4961 records over 14 older digests, none keyed to the current family, 40
+shipping shapes at 0 HIT, tier `portable`.
+
+Artefacts on `/workspace`: `objcontract-c08d1232/parent-build.log` and `.../bless-build.log`.
+
+## MTP takes isl8192 C1 decode to 16.35 ms, and the T3 gate is red for two unrelated reasons (2026-09-14, job `spec-t3`)
+
+Three arms (ctrl / treat / ctrl2), 69.8 min, `spec_t3.py` scoring. Both controls pinned tight, so
+the treat deltas are readable.
+
+| cell | ctrl / **treat** / ctrl2 TPOT ms | spread | Δ | verdict |
+|---|---|---|---|---|
+| isl1024-c1 | 40.20 / **12.55** / 40.15 | 0.05 | −68.8% | FAIL (ttft) |
+| isl1024-c4 | 42.96 / **31.02** / 42.91 | 0.05 | −27.8% | PASS |
+| **isl8192-c1** | 42.99 / **16.35** / 42.95 | 0.03 | **−62.0%** | **PASS** |
+| isl8192-c4 | 51.20 / **40.78** / 51.17 | 0.03 | −20.3% | PASS |
+
+* **The goal cell passes at 16.35 ms against a 25 ms target**, with tok/s 21.3 → 48.8 and TTFT
+  1007.2 → 947.2. Acceptance 2568/2955 = 86.9%, 3.42 committed per verify over 1059 verifies.
+* **What the number is**: time per COMMITTED token. The decode tick is not faster; it commits ~3.4
+  tokens. The 2.3× tok/s says the amortisation is real end to end, but it is amortisation.
+* **Quality holds**: retrieval treat **18/18 base, 21/21 tail**; GSM8K ctrl 98/100 vs treat 97/100
+  (tolerance 3). Both PASS. `treat server error lines: 0`, `ctrl2 server error lines: 0`.
+
+The overall `T3 FAIL` has two causes, and only one of them is MTP's. Reading `spec_t3.py:80`, the
+printed booleans are the `*_ok` flags — **True means that criterion passed**:
+
+1. **All four natural-text cells fail on `failed` alone** (`tpot True, ttft True, failed False`).
+   The natural client failed on **every arm, controls included** — `gate C1: 2/16 ok` on ctrl2,
+   `1/16` on treat, `gate C4: 4/32 ok` on both — while both servers logged zero error lines. That is
+   a client-side defect in `nat_client.py`, not a property of the lever; those cells carry no signal
+   in either direction and should not be read as evidence against MTP.
+2. **`isl1024-c1` fails on `ttft`**: 194.4 → 242.3 ms, +48 ms / +25%. This one IS MTP's and is the
+   real finding in the red gate — at short context there is too little decode to amortise the draft
+   cost against. Note it does not appear at 8192, where TTFT improved.
+
+Next: fix `nat_client.py` before re-running T3, and decide whether MTP should be gated by prompt
+length (the isl1024 TTFT regression is exactly the shape a length gate would remove).
+
+## Prefill packing is REFUSED on every program of the shipping packet; prefix caching is already on, but its eviction never arms (2026-09-15, CPU-only `op-audit` + production log audit)
+
+Three questions, three answers. The first one overturns something this campaign has been
+assuming, including in my own earlier write-ups.
+
+### 1. Packed prefill has never fired, and cannot fire on this packet
+
+`serve/mux.rs:2856` keeps a `std::sync::Once` whose only job is to separate two claims its own
+comment refuses to conflate:
+
+> ONE info line the first time it actually fires. "Armed" (the load-time line in exec/amd.rs) and
+> "firing" are different claims, and only the second one is evidence that a measured delta belongs
+> to this feature.
+
+`AMD packed prefill fired` appears **0 times** in both production server logs on disk
+(`e2eprod/runs-e2eprod/server.log`, `decoderung/runs-rungsweep/rung8.server.log`). That alone is
+an absence, so it is not the finding. These are:
+
+**The load-time route report is also absent, which localises the reason.**
+`report_packed_prefill_route` (`exec/amd.rs:10591`) logs in *all three* of its outcome branches —
+two `warn!`, one `info!` — every one of them visible at `RUST_LOG=info`. Neither log has any of
+them. The single path that produces no output is the early return at `:10596`:
+
+```rust
+if !route && cfg.pf_batch.is_none() {
+    // No siblings, no explicit opt-in: an ordinary packet on the default mux.
+    return;
+}
+```
+
+So `packed_prefill_route_armed()` was **false**. `rt.packed_prefill_route` is UNSET, which means
+AUTO — follow the packet — and the packet's answer is no. UNSET is automatic, not off; here
+automatic resolves to off because there are no packed-prefill topology siblings to resolve.
+
+**The packet itself refuses, by name and by count.** `plowrt op-audit <packet>` exits 1:
+
+```
+T=128 [REFUSED]  T=512 [REFUSED]  T=2048 [REFUSED]  T=8192 [REFUSED]  T=8192 [REFUSED]
+T=1 [REFUSED]  T=2 [REFUSED]  T=4 [REFUSED]  T=8 [REFUSED]  T=16 [REFUSED]  T=20 [REFUSED]
+```
+
+All eleven programs, prefill and decode. The blockers on the production 8192 prefill rung:
+
+| opcode | count | class | why it refuses |
+| --- | --- | --- | --- |
+| `HeadNormRope` (3) | 120–198 | C / needs-conversion | `i3=out_row0` with `i6=n_batch_kv == 0` |
+| `HeadNormRopeFp8` (37) | 78 | C / needs-conversion | same shape |
+| `FlashMlaPrefillFp8` (110) | 78 | C / needs-conversion | `i4=n_tok` shared across rows; `q_pos0 = kv_len[b] - n_tok` |
+| `XReduceScatter` (25) | 78–156 | A / **refuse** | `i0=n` |
+| `IndexUnionPf` (119) | 21 | C / needs-conversion | `q_pos0 = kv_len[0] - n_tok` (`op_attention.h:5474`) |
+| `IndexTpPf` (157) | 21 | C / needs-conversion | `kv_len[0] - T` isolated; `PlowKvSpan` table under packing |
+
+Only one of these is a hard wall. `XReduceScatter` is class A / **refuse** — not convertible from
+here. Everything else is class C / needs-conversion, and `HeadNormRope` even carries its own
+route out: *"class B when `i6 != 0` (batch-major ring at `t5=pos[t]`)"*. The attention family
+(`FlashMlaPrefillFp8`, `IndexUnionPf`, `IndexTpPf`) all fail the same way — they derive one query
+position from a single shared `n_tok`, so one launch cannot serve two sequences.
+
+**Two further gates, each independently sufficient**, so fixing the opcodes alone would still not
+make packing fire at the production shape:
+
+* *A pack needs two chunks in one rung.* `sched/prefill.rs:381` states it as arithmetic, not
+  policy: "Dense co-packing is arithmetic, not a feature flag... A chunk sized AT the widest rung
+  therefore admits exactly one span, the mux's `packed.len() >= 2` test fails, and packing
+  silently never runs." Its test asserts `pack_at(8192).spans().len() == 1` and
+  `pack_at(4096).spans().len() == 2`. The gfx942 ladder tops out at 8192; `PLOW_PF_CHUNK` unset
+  becomes `u32::MAX` (`serve/engine.rs:1442`), i.e. the widest rung. Production sits exactly on
+  the unpackable point.
+* *A prompt's final chunk is never packable.* `packable_prefill_step` (`serve/engine.rs:985`)
+  requires `cur.next + 1 < cur.steps.len()`, because the last chunk produces a token. An
+  8192-token prompt at an 8192 chunk is one step, which is also its last. `sched/step.rs:282`
+  names this shape outright: "The default shape on the GLM-5.3 TP8 packet: 8192-row planned
+  chunks (**unpackable** — the rung is a sparse bucket)."
+
+**Correction to my earlier note in this log.** I reported packing "armed" off the knob values —
+`rt.token_batch` ON/PROMOTED, `pf_batch_amd()` → `unwrap_or(true)`, `rt.packed_prefill_route`
+UNSET = AUTO. Those knobs are all permissive and that part stands. What I had not checked was
+whether the packet answers AUTO with yes. It does not, and the op-audit is the direct evidence,
+not the log absence. Consequence: **no number this campaign has ever recorded contains a packing
+effect**, because the path has never run. Nothing measured is invalidated; the feature simply is
+not in any of it.
+
+The unified token-batch route is a *different* feature and it IS firing —
+`route="unified-token-batch/dense-gqa"` appears on every rank in both logs. Do not read this
+section as an indictment of that.
+
+### 2. Prefix caching is already on; what is off is eviction under real pressure
+
+`rt.prefix_cache` is ON/PROMOTED, and the production log confirms it at runtime, not just at
+config time: `AMD prefix cache selection requested=true selected=true`. There is nothing to
+enable.
+
+The defect is one layer down. `pool.enable_pressure_eviction(min_free)`
+(`exec/amd/shared_prefix.rs:396`) is called only `if let Some(min_free) = ...
+vmm_cache_min_free_bytes()`, and `rt.vmm_cache_min_free_mib` is UNSET, so it is **never called**.
+The only trim trigger left is the static budget `rt.vmm_cache_memory_utilization` = 0.05 (~9.6 GB
+of 192). The cache therefore trims at a fixed 5% whether the device has 100 GiB free or 2 —
+it never reacts to actual device pressure.
+
+The backend supports the feature it is not being asked for: `device/hsa.rs:3717` implements
+`free_bytes()` from `HSA_AMD_AGENT_INFO_MEMORY_AVAIL`, "not a snapshot this process keeps itself,
+so it reflects every other consumer of the device's VRAM too", degrading to `None` on any query
+failure. And `memory/vmm.rs:1209`'s contract makes arming it safe on *either* backend: "a backend
+that cannot report `free_bytes` (the default) makes this a no-op and `trim_cache` keeps using
+`cache_cap`, so requesting pressure mode on an unsupported backend degrades to today's behaviour
+rather than disabling eviction outright."
+
+This is #53's "eviction on real pressure", now localised to one unset knob and one uncalled line.
+It is also the most plausible lever on the 70k/C20 aperture fault, where the requirement is that
+the cache evict or the request queue — never that the process die.
+
+### 3. What `PLOW_VMM_KV` does, and what it is worth here
+
+VMM-backed KV on ROCr: it reserves *virtual* address space for `max_ctx` but maps *physical*
+pages only for the live context, instead of carving the full rectangle up front. Opt-in, off by
+default, needs `hsa_amd_vmem_*`; every failure path warns and falls back to the flat carve. Only
+the full-attention `kv.{l}.k` / `kv.{l}.v` tensors are VMM-backed.
+
+The KV declaration on this packet is **84.375 GiB per rank** — ckv 60.9375, krot 15.234375, kidx
+8.203125 — for `max_ctx` 81,920 rows × 20 slots, i.e. **55,296 B per token per rank**.
+
+> **CORRECTED the same day.** I first wrote that 76.37 GiB of this was "reserved-and-unused" HBM
+> at the 8192 cell. That was wrong, and wrong in a way worth naming: those are DECLARED TENSOR
+> BYTES, which is the *virtual* reservation, not an allocation. The production log reports them
+> as `va_gib` on three VMM pools per rank, and the physical pages are mapped at each sequence's
+> frontier. So the growth this section credits to `PLOW_VMM_KV` was already running — through the
+> shared-prefix pool, not through that knob, which `vmm_bringup` only reaches when
+> `shared_prefix.is_none()`. The figure is still the right one for ADMISSION, where it prices
+> what an admitted sequence may grow into; it was never idle memory waiting to be reclaimed. See
+> "The 70k/C20 fault is an unchecked KV overcommit" below.
+
+Measured, B=8 at ~1k context: 75.55 vs 83.05 GiB resident, 7.50 of 10.0 GiB reclaimed, TPOT
+unchanged (38.0 vs 39.0 ms). It buys memory, not latency.
+
+### What this changes
+
+* Packing is not a tuning knob away, but it is closer than this section first claimed. **The one
+  hard wall was not real**: `XReduceScatter`'s class-A `refuse` came from a stale `no_body`
+  classifier entry — `d_xreduce_scatter_mega` is `op_collective.h:1668`, dispatched at
+  `interp.hip:5832`, and this very packet runs 78–156 of them per rung correctly. With that
+  corrected, **every remaining blocker on every rung is class C / needs-conversion**, and none of
+  them needs a kernel written from scratch:
+  * `HeadNormRope` / `HeadNormRopeFp8` — the kernel already has the batched-ring form, so this is
+    an emitter flip to `i6 != 0`;
+  * `FlashMlaPrefillFp8` / `IndexUnionPf` / `IndexTpPf` — the shared-`n_tok` query position, which
+    is exactly what `PLOW_PACKED_SPARSE_PF` was built to cover, and whose two prerequisites
+    (`PLOW_GLM_INDEX_TP`, FP8 KV) the shipping recipe **already sets**.
+  What the shipping packet is actually missing is `PLOW_EMIT_PACKED_PREFILL`, recorded as
+  `false` in its own `build.json`. So the route is a re-emit plus an object build plus
+  qualification, then halving `PLOW_PF_CHUNK` so two chunks fit one rung.
+* Every "packed prefill" claim about this packet — mine included — should be read as describing an
+  unexercised path until an `AMD packed prefill fired` line exists to anchor it.
+* `rt.vmm_cache_min_free_mib` is now armed by default (4% of the device, `=0` the rollback); the
+  contract already guaranteed safe degradation on backends that cannot report free bytes.
+
+## The 70k/C20 fault is an unchecked KV overcommit, and admission counted slots instead of bytes (2026-09-15, job `70k-fault2`)
+
+Four arms, each on its own fresh server, and the verdicts are unambiguous:
+
+| arm | cell | result |
+| --- | --- | --- |
+| A | 1 × 70,000 | clean — 4 requests, median TTFT 4.71 s |
+| B | 4 × 70,000 | clean — 8 requests, median TTFT 6.59 s |
+| C | 20 × 70,000, **first on the server** | **FAULT** |
+| D | 8192 ×3 then 20 × 70,000 | **FAULT**, after all three 8192 steps ran clean |
+
+C faulting on a fresh server kills the accumulated-state hypothesis outright, and D's three
+clean 8192 steps before the same cell confirm it from the other side. The trigger is
+concurrency × long context, somewhere between C4 and C20.
+
+### The arithmetic closes exactly
+
+Everything needed is in the faulting server's own load log, which is the part worth keeping:
+
+* three VMM pools per rank, `va_gib` **60.9375 + 15.234375 + 8.203125 = 84.375 GiB**, over
+  `max_ctx=81920 × batch=20` = 1,638,400 row-slots → **55,296 bytes per token per rank**;
+* `device memory after load rank=N free_gib=55.58984375` on every rank.
+
+| cell | rows | KV wanted | vs 55.59 GiB free |
+| --- | --- | --- | --- |
+| 20 × 8,192 | 163,840 | 8.4 GiB | fits — this is every clean run ever measured |
+| 1 × 70,000 | 70,000 | 3.6 GiB | fits (arm A) |
+| 4 × 70,000 | 280,000 | 14.4 GiB | fits (arm B) |
+| **20 × 70,000** | **1,400,000** | **72.1 GiB** | **short by 16.5 GiB** |
+
+Maximum backable concurrency at 70,000 is about **15 sequences**; the server admits 20. The
+final error is `HSA_STATUS_ERROR_OUT_OF_RESOURCES` — "the runtime failed to allocate the
+necessary resources" — arriving after `occupied_extent=20` with the decode rung ladder walking
+20 → 16 → 8 trying to cope. The `APERTURE_VIOLATION` seen in `e2e-prod` is the same overcommit
+surfacing at a different allocation, not a second bug.
+
+### What was actually wrong
+
+`admit_into` (`serve/mux.rs`) chose a slot with
+
+```rust
+let Some(idx) = slots.iter().position(|s| s.is_none()) else { /* reject */ };
+```
+
+Slot count, nothing else. A KV-capacity gate *does* exist three lines later —
+`arena.allocate_slot(seq_upper)`, which sheds cleanly with `RuntimeError::Oom` — but `arena` is
+built from `bundle…map.kv_paging`, and only the CUDA paged path declares that. On AMD `arena` is
+`None`, so **nothing bounded admission by memory at all** and the overcommit reached the device
+as an async queue fault instead of as backpressure.
+
+This is worth stating plainly because it is the difference between a serving stack and a
+benchmark harness: the request that could not be backed was not rejected, not queued, not
+degraded. It was dispatched, and it took the process with it.
+
+### The fix, and why it needs no new queue
+
+The engine now prices its own KV at load — `KvBudget { bytes_per_token, budget_bytes }`, the
+second being `PLOW_KV_ADMIT_HEADROOM` (0.9) of the free-after-load bytes — and the mux charges
+every live slot's reserved rows (`prompt + max_tokens`) against it before admitting.
+
+The queue was already there. Jobs wait in the ingress `mpsc` and are drained only when a slot
+frees, so a request that does not fit is simply *handed back*: `admit_into` returns it, the mux
+holds it in one `deferred` slot and retries it **ahead of anything newer** on the next tick.
+FIFO is preserved, no request is rejected, and the drain loops stop while one is held rather
+than reordering around it.
+
+One case must not be deferred: a request whose reservation exceeds the *entire* budget can
+never fit, and holding it would wedge the queue behind it forever. That one is answered with a
+context-length error naming what the device can back. Note this is a different bound from
+`max_ctx`, which limits the PROMPT; this limits prompt + generation against what the load left.
+
+`KvBudget::fits` is unit-tested directly against the measured cell, which is the only reason to
+trust it: the arms that ran clean on hardware are admissible, the two that faulted are not, and
+the knee lands at 13 concurrent 70,000-token sequences at the default headroom.
+
+### Two things this changes about how to read the rest of this log
+
+* **`PLOW_VMM_KV` was never the lever it looked like.** `vmm_bringup` runs only when
+  `shared_prefix.is_none()`, and the prefix cache is selected in production — so the growable,
+  frontier-mapped KV has been running all along through the shared-prefix pool, and the knob
+  would have been inert. It now defaults on so the no-prefix-cache fallback matches.
+* **An earlier entry called the 84.375 GiB figure "reserved-and-unused" HBM.** That was wrong:
+  it is `va_gib`, virtual address space, and the physical pages are mapped at each sequence's
+  frontier. Declared tensor bytes are the VA reservation, not an allocation. The number is still
+  the right one for *admission* — it prices what an admitted sequence may grow into — but it was
+  never idle memory waiting to be reclaimed.
+
+### What this does not fix
+
+The budget bounds admission; it does not make 20 × 70,000 *run*. That cell now completes with a
+queued tail instead of a core dump, at lower concurrency than requested. Raising real
+long-context concurrency needs either more free memory after load (the prefix cache's static
+budget is the obvious donor, which is why pressure eviction is now armed) or fewer bytes per
+token.
 
 ## Artefact policy (applied on every merge)
 

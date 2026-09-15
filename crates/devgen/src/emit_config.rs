@@ -756,6 +756,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_PF_NS")]
     pub glm_pf_ns: Option<u32>,
 
+    /// GLM TP8 sequence-parallel prefill: the band router reads the post-attention norm's band in
+    /// peer slot 3 and runs while the hidden all-gather is in flight (1 = score + top-k, 2 = also
+    /// the route-table gather and the align). Unset/0 = byte-identical blob.
+    #[arg(long, env = "PLOW_GLM_ROUTER_OVERLAP")]
+    pub glm_router_overlap: Option<u32>,
+
     /// Sparse-prefill selection reuse span: layers after an indexer layer that gather against
     /// its union (0 = indexer layers only, 3 = every GLM-5.3 layer).
     #[arg(long, env = "PLOW_GLM_DSA_PF_SPAN", default_value_t = 1)]
@@ -813,8 +819,8 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_PF_WIDE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_pf_wide: bool,
 
-    /// Per-XCD CU placement for the GLM prefill chain.
-    #[arg(long, env = "PLOW_GLM_PLACE_PF", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Per-XCD CU placement for the GLM prefill chain. Default on; pass `=0` for rollback.
+    #[arg(long, env = "PLOW_GLM_PLACE_PF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_place_pf: bool,
 
     /// Band count for a prefill TP seam (2..=8; unset/1 = the unbanded emit).
@@ -863,6 +869,15 @@ pub struct EmitConfig {
     /// order). `=true` to enable.
     #[arg(long, env = "PLOW_GLM_ROWSPLIT_ATTN", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_rowsplit_attn: Option<bool>,
+
+    /// Row-band sparse attention with replicated projections for the GLM 8192 prefill rung
+    /// (`PLOW_GLM_ROWBAND_ATTN`), the row-split sibling's other arm: each rank runs its `T/8`
+    /// rows with every head, q_absorb/q_rope/o_proj at full width on that band and one native
+    /// 64-head fold, with no head all-to-all and no attention reduce-scatter. Opt-in, OFF by
+    /// default; the full-width projections cost ~16.9 GiB per rank on GLM-5.3 TP8. Excludes
+    /// `PLOW_GLM_ROWSPLIT_ATTN`.
+    #[arg(long, env = "PLOW_GLM_ROWBAND_ATTN", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_rowband_attn: Option<bool>,
 
     /// Size the batched-decode glue packets to their work items: the FP8 latent KV writer at one
     /// wave per row instead of one workgroup, the router top-k at one workgroup per token, the
@@ -1322,12 +1337,13 @@ impl EmitConfig {
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
+            glm_router_overlap: env_u32("PLOW_GLM_ROUTER_OVERLAP"),
             glm_dsa_pf_span: env_u32("PLOW_GLM_DSA_PF_SPAN").unwrap_or(1),
             glm_dsa_pf_dexact: env_u32("PLOW_GLM_DSA_PF_DEXACT"),
             dense_pf_ns: env_u32("PLOW_DENSE_PF_NS"),
             pf_floor: env_bool("PLOW_PF_FLOOR"),
             glm_pf_wide: env_opt_out("PLOW_GLM_PF_WIDE"),
-            glm_place_pf: env_bool("PLOW_GLM_PLACE_PF"),
+            glm_place_pf: env_opt_out("PLOW_GLM_PLACE_PF"),
             glm_xr_band: env_u32("PLOW_GLM_XR_BAND"),
             glm_xr_band_cus: env_u32("PLOW_GLM_XR_BAND_CUS"),
             attnres_decode_mwg: env_u32("PLOW_ATTNRES_DECODE_MWG"),
@@ -1336,6 +1352,7 @@ impl EmitConfig {
             glm_seq_par: env_bool_opt("PLOW_GLM_SEQ_PAR"),
             glm_seq_par_proj: env_bool_opt("PLOW_GLM_SEQ_PAR_PROJ"),
             glm_rowsplit_attn: env_bool_opt("PLOW_GLM_ROWSPLIT_ATTN"),
+            glm_rowband_attn: env_bool_opt("PLOW_GLM_ROWBAND_ATTN"),
             glm_decode_glue_cus: env_bool("PLOW_GLM_DECODE_GLUE_CUS"),
             glm_decode_gemm_group: env_bool_opt("PLOW_GLM_DECODE_GEMM_GROUP"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
@@ -1579,7 +1596,9 @@ impl EmitConfig {
     /// `PLOW_GLM_XR_RES` / `PLOW_GLM_XR_BAND` emit keeps working without naming this one.
     pub fn glm_seq_par(&self) -> bool {
         self.glm_seq_par.unwrap_or(
-            self.glm_production_defaults && !self.glm_xr_res && self.glm_xr_band.unwrap_or(1) <= 1,
+            self.glm_production_defaults
+                && !self.glm_xr_res
+                && self.glm_xr_band.unwrap_or(1) <= 1,
         )
     }
 
@@ -1595,6 +1614,25 @@ impl EmitConfig {
     /// produced before the arm existed.
     pub fn glm_rowsplit_attn(&self) -> bool {
         self.glm_rowsplit_attn.unwrap_or(false)
+    }
+
+    /// OFF by default, like [`Self::glm_rowsplit_attn`].
+    pub fn glm_rowband_attn(&self) -> bool {
+        self.glm_rowband_attn.unwrap_or(false)
+    }
+
+    /// The row-split sibling's arm, or `None` when neither knob is on. Checkpoint K refuses
+    /// both (`rowband_attn_excludes_rowsplit_attn`); this is the backstop.
+    pub fn glm_rowsplit_arm(&self) -> Option<packet::devbuild::RowSplitArm> {
+        use packet::devbuild::RowSplitArm;
+        match (self.glm_rowsplit_attn(), self.glm_rowband_attn()) {
+            (true, true) => panic!(
+                "PLOW_GLM_ROWSPLIT_ATTN and PLOW_GLM_ROWBAND_ATTN are two arms of one row-split sibling; set one"
+            ),
+            (true, false) => Some(RowSplitArm::AllToAll),
+            (false, true) => Some(RowSplitArm::Replicated),
+            (false, false) => None,
+        }
     }
 
     /// The `(clap id, still unset, resolved value)` triples [`super::apply_production_defaults`]

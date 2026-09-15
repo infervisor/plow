@@ -167,3 +167,16 @@ extern "C" __global__ void plow_dsa_tp_complete(DsaTpGatherArgs a) {
                          a.deadline, a.status, 0, &bailed);
 #endif
 }
+
+// Row-split sibling (local band): copies this rank's own band, which select wrote at its global
+// rows of the rank's slot, into rows [0, band) of `out`. No peer reads, no rendezvous.
+extern "C" __global__ void plow_dsa_tp_local(DsaTpGatherArgs a) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    const unsigned band_vectors = ((a.rows + 7u) / 8u) * 512u;
+    const auto* source =
+        (const uint4*)((const char*)a.peers[a.rank] + a.slot_offset) + a.rank * band_vectors;
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < band_vectors;
+         i += gridDim.x * blockDim.x)
+        a.out[i] = source[i];
+#endif
+}

@@ -26,6 +26,20 @@ impl Route {
         self.rows = rows;
         Ok(())
     }
+
+    /// `i[7] = 1`, a row-split sibling: select keeps this rank's own band and one launch copies
+    /// it to rows `[0, T/8)`; the gather and complete gates are never used.
+    pub fn local_band(&self) -> bool {
+        self.inst.i[7] == 1
+    }
+
+    pub fn launches(&self) -> usize {
+        if self.local_band() {
+            3
+        } else {
+            4
+        }
+    }
 }
 
 /// `span_aware`: the loaded adapter carries `plow_dsa_tp_abi_2`, whose score/select kernels take
@@ -60,7 +74,8 @@ pub(super) fn routes(
             || u64::from(inst.i[4]) != tp.slot_b
             || inst.i[5].checked_add(2) != Some(inst.i[6])
             || inst.i[6] >= tp.xstatus_id
-            || inst.i[7] != 0
+            || inst.i[7] > 1
+            || (inst.i[7] == 1 && !prog.role.is_rowsplit_sibling())
             || inst.fj != [0x3c7fffff, 0, 0]
             || inst.t[7] != TENSOR_NONE16
         {
@@ -245,6 +260,8 @@ const _: () = assert!(std::mem::size_of::<GatherArgs>() == 64);
 
 pub(super) struct IndexTp {
     kernels: [HsaKernel; 4],
+    /// `plow_dsa_tp_local`, the row-split sibling's band copy; absent on older adapters.
+    local: Option<HsaKernel>,
     /// 1 = single-request kernargs; 2 = the span-table form (`plow_dsa_tp_abi_2`).
     abi: u8,
 }
@@ -285,10 +302,20 @@ impl IndexTp {
             }
             kernels.push(kernel);
         }
+        let local = match EngineDevice::get_function(be, &module, "plow_dsa_tp_local") {
+            Ok(k) if [64, 320].contains(&k.kernarg_size()) && k.private_segment_size() == 0 => Some(k),
+            Ok(_) => {
+                return Err(RuntimeError::Device(
+                    "TP indexer resource ABI mismatch for plow_dsa_tp_local".into(),
+                ))
+            }
+            Err(_) => None,
+        };
         modules.push(module);
         tracing::info!(abi, object = %path.display(), "TP indexer adapter loaded");
         Ok(Self {
             kernels: kernels.try_into().ok().unwrap(),
+            local,
             abi,
         })
     }
@@ -393,6 +420,13 @@ impl IndexTp {
             be.launch(ki, 304, 512, 0, bytemuck::bytes_of(&select))?;
         }
         timer.report("index_tp", route.rows);
+        if route.local_band() {
+            let local = self.local.ok_or_else(|| {
+                RuntimeError::Device("TP indexer adapter lacks plow_dsa_tp_local".into())
+            })?;
+            be.launch(local, GATHER_GRID, 256, 0, bytemuck::bytes_of(&gather))?;
+            return Ok(());
+        }
         be.launch(kg, GATHER_GRID, 256, 0, bytemuck::bytes_of(&gather))?;
         be.launch(kc, 1, 64, 0, bytemuck::bytes_of(&gather))?;
         Ok(())
@@ -477,6 +511,20 @@ mod tests {
             served[(wg % 8) as usize] += 1;
         }
         assert!(served.iter().all(|&n| n == GATHER_GRID / 8));
+    }
+
+    #[test]
+    fn local_band_is_the_row_split_sibling_form_with_three_launches() {
+        let (mut p, t, tp) = fixture();
+        assert_eq!(routes(&p, &t, 1, tp, false).unwrap()[0].unwrap().launches(), 4);
+        p.insts[0].i[7] = 1;
+        assert!(routes(&p, &t, 1, tp, false).is_err(), "an ordinary bucket gathers every band");
+        p.role = packet::devbuild::ProgramRole::RowSplitSibling { of_rows: p.t };
+        let route = routes(&p, &t, 1, tp, false).unwrap()[0].unwrap();
+        assert!(route.local_band());
+        assert_eq!(route.launches(), 3);
+        p.insts[0].i[7] = 2;
+        assert!(routes(&p, &t, 1, tp, false).is_err());
     }
 
     #[test]

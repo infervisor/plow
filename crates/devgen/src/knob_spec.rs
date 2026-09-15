@@ -56,10 +56,9 @@ const GEMMA_NATIVE_PURE_GEMM: Status = Status::Qualified {
 const UNISEG: Status = Status::Qualified {
     evidence: &["crates/plowc/src/main.rs effective_uniseg: the sm_120 interpreter implements the single-segment path only"],
 };
-const TOKEN_BATCH_TP_PARKED: Status = Status::Parked {
-    reason: "the seams-aware body corrupted long-context prefill (retrieval 9/18 base, 0/21 tail)",
+const TOKEN_BATCH_TP_CANDIDATE: Status = Status::Candidate {
     evidence: &[
-        "review log #63",
+        "review log #63 follow-up: bodies carry sequence-parallel seams, gathered indexer weights, and primary-routed seam norms",
         "docs/flags-reference.md: PLOW_TOKEN_BATCH_TP",
     ],
 };
@@ -95,6 +94,7 @@ const GLM_SEQ_PAR_DEFAULT: Default = Default::Production {
         DefaultCase {
             when: F::And(&[
                 GLM_TARGET,
+                F::Not(&F::Atom("emit.token_batch_tp", Cmp::Eq, TRUE)),
                 F::Not(&F::Atom("emit.glm_xr_res", Cmp::Eq, TRUE)),
                 F::Not(&F::Atom("emit.glm_xr_band", Cmp::Gt, Val::Nat(1))),
             ]),
@@ -308,16 +308,6 @@ const C_SEQ_PAR_PROJ: &[Constraint] = &[Constraint {
     check: Check::Load,
 }];
 
-const C_TOKEN_BATCH_TP: &[Constraint] = &[Constraint {
-    id: "token_batch_tp_excludes_seq_par",
-    formula: F::Not(&F::And(&[
-        F::Atom("emit.token_batch_tp", Cmp::Eq, TRUE),
-        F::Atom("emit.glm_seq_par", Cmp::Eq, TRUE),
-    ])),
-    site: "review log #63: token-batch bodies with seams corrupted long-context prefill",
-    check: Check::Load,
-}];
-
 const C_K3_WALK: &[Constraint] = &[Constraint {
     id: "k3_wide_decode_requires_walk",
     formula: F::Implies(
@@ -336,8 +326,8 @@ const C_K3_WALK: &[Constraint] = &[Constraint {
 /// environment).
 const GLM53_RECIPE: &[(&str, Val)] = &[
     ("emit.fp8", TRUE),
-    ("emit.decode_ladder", Val::Str("1,2,4,8,16,20")),
-    ("emit.emit_packed_prefill", FALSE),
+    ("emit.decode_ladder", Val::Str("1,2,4,8,16,32")),
+    ("emit.emit_packed_prefill", TRUE),
     ("emit.uniseg", FALSE),
     ("emit.mla_prefill", Val::Str("full:128,512,2048,8192")),
     ("emit.moe_pf_det", TRUE),
@@ -353,13 +343,15 @@ const GLM53_RECIPE: &[(&str, Val)] = &[
     ("emit.glm_moe_aiter", TRUE),
     ("emit.glm_moe_flat_decode", FALSE),
     ("emit.glm_moe_resident", TRUE),
+    ("emit.token_batch_tp", TRUE),
+    ("emit.packed_sparse_pf", TRUE),
     ("emit.glm_index_tp", TRUE),
     ("emit.glm_select_local", TRUE),
     ("emit.glm_decode_norm_rows", TRUE),
     ("emit.glm_gemm_lt", TRUE),
     ("emit.glm_gemm_lt_decode", TRUE),
     ("emit.glm_dsa_pf_span", Val::Nat(3)),
-    ("emit.glm_place_pf", FALSE),
+    ("emit.glm_place_pf", TRUE),
     ("env.PLOW_UNISEG", Val::Str("0")),
     ("env.PLOW_MLA_PF_V2", Val::Str("1")),
     ("env.PLOW_MLA_PF_AITER", Val::Str("1")),
@@ -391,6 +383,24 @@ const MOE_SHARED_SEED_SCOPE: &[Allow] = &[
         kinds: &["global"],
         fields: &[ScopeField::ObjectFacts],
         facts: &["moe_aiter"],
+        ..Allow::ANY
+    },
+];
+
+/// The band router score reads slot 3's band behind the norm; score, top-k (and at 2 the route
+/// gather and the align) move ahead of the shared gate/up `GemmLtPf` in the 2048..8192 buckets.
+const ROUTER_OVERLAP_SCOPE: &[Allow] = &[
+    Allow {
+        kinds: &["prefill"],
+        rows: (2048, 8192),
+        ops: OpSel::In(&["gemm", "moe", "collective"]),
+        fields: &[ScopeField::Op, ScopeField::Operands, ScopeField::Segments],
+        ..Allow::ANY
+    },
+    // The unread `act.xn2@band<t>` views are no longer declared.
+    Allow {
+        kinds: &["global"],
+        fields: &[ScopeField::TensorBytes],
         ..Allow::ANY
     },
 ];
@@ -504,6 +514,40 @@ const DENSE_EXACT_SCOPE: &[Allow] = &[Allow {
 
 /// The row-split attention arm: attention and the all-to-all in the 2048..8192 prefill buckets,
 /// and the packet-wide object facts its arm adds.
+const ROWBAND_ATTN_SCOPE: &[Allow] = &[
+    Allow {
+        kinds: &["prefill"],
+        rows: (8192, 8192),
+        topology: Some("rowsplit"),
+        fields: &[
+            ScopeField::ProgramSet,
+            ScopeField::Op,
+            ScopeField::Operands,
+            ScopeField::Shape,
+            ScopeField::Cus,
+            ScopeField::Segments,
+            ScopeField::TensorBytes,
+            ScopeField::ObjectFacts,
+        ],
+        ..Allow::ANY
+    },
+    Allow {
+        kinds: &["global"],
+        fields: &[ScopeField::ObjectFacts, ScopeField::TensorBytes],
+        ..Allow::ANY
+    },
+];
+
+const C_ROWBAND_ATTN: &[Constraint] = &[Constraint {
+    id: "rowband_attn_excludes_rowsplit_attn",
+    formula: F::Implies(
+        &F::Atom("emit.glm_rowband_attn", Cmp::Eq, TRUE),
+        &F::Not(&F::Atom("emit.glm_rowsplit_attn", Cmp::Eq, TRUE)),
+    ),
+    site: "crates/devgen/src/emit_config.rs: PLOW_GLM_ROWBAND_ATTN and PLOW_GLM_ROWSPLIT_ATTN are two arms of one row-split sibling",
+    check: Check::Load,
+}];
+
 const ROWSPLIT_ATTN_SCOPE: &[Allow] = &[
     Allow {
         kinds: &["prefill"],
@@ -717,7 +761,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_moe_resident", Some("PLOW_GLM_MOE_RESIDENT"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_moe_shared_fold", Some("PLOW_GLM_MOE_SHARED_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_moe_shared_seed", Some("PLOW_GLM_MOE_SHARED_SEED"), Layer::Emit, Domain::Bool, OFF, MOE_SHARED_SEED_CANDIDATE).scoped(MOE_SHARED_SEED_SCOPE),
-    KnobSpec::new("emit.token_batch_tp", Some("PLOW_TOKEN_BATCH_TP"), Layer::Emit, Domain::Bool, OFF, TOKEN_BATCH_TP_PARKED).with(C_TOKEN_BATCH_TP),
+    KnobSpec::new("emit.token_batch_tp", Some("PLOW_TOKEN_BATCH_TP"), Layer::Emit, Domain::Bool, OFF, TOKEN_BATCH_TP_CANDIDATE),
     KnobSpec::new("emit.packed_sparse_pf", Some("PLOW_PACKED_SPARSE_PF"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_PACKED_SPARSE_PF),
     KnobSpec::new("emit.glm_index_tp", Some("PLOW_GLM_INDEX_TP"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_select_local", Some("PLOW_GLM_SELECT_LOCAL"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
@@ -732,12 +776,13 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_gemv_wg", Some("PLOW_GLM_GEMV_WG"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_ofold", Some("PLOW_GLM_OFOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_OFOLD),
     KnobSpec::new("emit.glm_pf_ns", Some("PLOW_GLM_PF_NS"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.glm_router_overlap", Some("PLOW_GLM_ROUTER_OVERLAP"), Layer::Emit, U32, UNSET, OPT_IN).scoped(ROUTER_OVERLAP_SCOPE),
     KnobSpec::new("emit.glm_dsa_pf_span", Some("PLOW_GLM_DSA_PF_SPAN"), Layer::Emit, U32, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("emit.glm_dsa_pf_dexact", Some("PLOW_GLM_DSA_PF_DEXACT"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.pf_floor", Some("PLOW_PF_FLOOR"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.dense_pf_ns", Some("PLOW_DENSE_PF_NS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_pf_wide", Some("PLOW_GLM_PF_WIDE"), Layer::Emit, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("emit.glm_place_pf", Some("PLOW_GLM_PLACE_PF"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_place_pf", Some("PLOW_GLM_PLACE_PF"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.glm_xr_band", Some("PLOW_GLM_XR_BAND"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_xr_band_cus", Some("PLOW_GLM_XR_BAND_CUS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.attnres_decode_mwg", Some("PLOW_ATTNRES_DECODE_MWG"), Layer::Emit, U32, UNSET, OPT_IN),
@@ -746,6 +791,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_seq_par", Some("PLOW_GLM_SEQ_PAR"), Layer::Emit, Domain::Bool, GLM_SEQ_PAR_DEFAULT, GLM_RECIPE).with(C_SEQ_PAR),
     KnobSpec::new("emit.glm_seq_par_proj", Some("PLOW_GLM_SEQ_PAR_PROJ"), Layer::Emit, Domain::Bool, GLM_SEQ_PAR_PROJ_DEFAULT, GLM_RECIPE).with(C_SEQ_PAR_PROJ),
     KnobSpec::new("emit.glm_rowsplit_attn", Some("PLOW_GLM_ROWSPLIT_ATTN"), Layer::Emit, Domain::Bool, UNSET, OPT_IN).scoped(ROWSPLIT_ATTN_SCOPE),
+    KnobSpec::new("emit.glm_rowband_attn", Some("PLOW_GLM_ROWBAND_ATTN"), Layer::Emit, Domain::Bool, UNSET, OPT_IN).scoped(ROWBAND_ATTN_SCOPE).with(C_ROWBAND_ATTN),
     KnobSpec::new("emit.glm_decode_glue_cus", Some("PLOW_GLM_DECODE_GLUE_CUS"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_decode_gemm_group", Some("PLOW_GLM_DECODE_GEMM_GROUP"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_fuse_xrn", Some("GLM_FUSE_XRN"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -1016,6 +1062,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_HAS_FLASH_PREFILL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_FLASH_PREFILL_FP8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_GEMM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_GEMM_F32", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_GEMM_C5", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_GEMM_C5_FP8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_GEMM_C5_MXFP4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1925,6 +1972,7 @@ mod tests {
         let cases: &[(&[(&str, Val)], &str)] = &[
             (
                 &[
+                    ("emit.token_batch_tp", FALSE),
                     ("emit.glm_seq_par", TRUE),
                     ("emit.glm_xr_band", Val::Nat(2)),
                 ],
@@ -1935,11 +1983,11 @@ mod tests {
                 "ofold_excludes_dsa_pf_and_fp8_kv",
             ),
             (
-                &[("emit.token_batch_tp", TRUE)],
-                "token_batch_tp_excludes_seq_par",
-            ),
-            (
-                &[("emit.glm_seq_par_proj", TRUE), ("emit.glm_seq_par", FALSE)],
+                &[
+                    ("emit.token_batch_tp", FALSE),
+                    ("emit.glm_seq_par_proj", TRUE),
+                    ("emit.glm_seq_par", FALSE),
+                ],
                 "seq_par_proj_requires_seq_par",
             ),
         ];
@@ -2030,7 +2078,7 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "{mismatches:#?}");
-        assert_eq!(lookup(&resolved, "emit.glm_seq_par"), TRUE);
+        assert_eq!(lookup(&resolved, "emit.glm_seq_par"), FALSE);
         assert_eq!(
             lookup(&resolved, "emit.glm_gemm_lt_pf_ext").to_json(),
             json!("o_proj,band,shared")

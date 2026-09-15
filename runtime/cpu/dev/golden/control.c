@@ -44,6 +44,7 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_PACK_NCFW_ROWS_F32] = g_pack_ncfw_rows_f32;
     tab[PLOW_DOP_GROUPED_ATTENTION_F32] = g_grouped_attention_f32;
     tab[PLOW_DOP_GEMM] = g_gemm;
+    tab[PLOW_DOP_GEMM_F32] = g_gemm_f32;
     tab[PLOW_DOP_GEMM_SMALL] = g_gemm_small;
     tab[PLOW_DOP_GEMM_MED] = g_gemm_med;
     tab[PLOW_DOP_GEMM_WIDE] = g_gemm_wide;

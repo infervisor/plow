@@ -103,9 +103,8 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         Gemm | GemmNorm | GemmSmall | GemmMed | GemmGlu | GemmFp8 | GemmMedFp8 | GemmSmallFp8
         | GemmGluFp8 | GemmMxfp4 | GemmWide | GemmC5 | GemmMedMxfp4 | GemmSmallMxfp4
         | GemmWideMxfp4 | GemmC5Mxfp4 | GemmWideFp8 | GemmC5Fp8 | GemmFp8Blk | GemmGluMxfp4
-        | GemmSplitK | DenseGluFp8Blk | GemmAffineQ4 | Q8GemmF32 | DenseGemmF32 | Conv2dF32 => {
-            &["gemm"]
-        }
+        | GemmSplitK | GemmF32 | DenseGluFp8Blk | GemmAffineQ4 | Q8GemmF32 | DenseGemmF32
+        | Conv2dF32 => &["gemm"],
         GemmLtPf | GemmBlkPf => &["gemm", "native_route"],
 
         Gemv | GemvGlu | GemvQkv | GemvFp8 | GemvGluFp8 | GemvFp8Blk | GemvSz | GemvGluSz

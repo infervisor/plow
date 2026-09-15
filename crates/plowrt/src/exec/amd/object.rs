@@ -1103,6 +1103,8 @@ pub(super) fn graph_phase_xreduce_segments_from_manifest(
             "packed"
         } else if role.is_dense_exact_rung() {
             "dense_exact"
+        } else if role.is_rowsplit_sibling() {
+            "rowsplit"
         } else {
             "ordinary"
         };
@@ -1987,7 +1989,7 @@ pub(super) fn check_dsa_select_local(
         {
             let err = || {
                 RuntimeError::Device(
-                "local DSA selection requires unpacked gfx942 TP8 decode rows 2/4/8/16/20, unpooled top2048 and row-sized operands".into())
+                "local DSA selection requires unpacked gfx942 TP8 decode rows 2/4/8/16/32, unpooled top2048 and row-sized operands".into())
             };
             // The split form (`i[4] == 2`, PLOW_GLM_SELECT_SPLIT) is three gated packets, `i[6]` =
             // phase 1/2/3, with `i[5]` workgroups per row in phases 1-2 and one in phase 3, over
@@ -2012,7 +2014,7 @@ pub(super) fn check_dsa_select_local(
             if arch != "gfx942"
                 || !tp8
                 || !(p.role.is_decode_rung() || (!split && p.role.is_token_batch_body()))
-                || !matches!(rows, 2 | 4 | 8 | 16 | 20)
+                || !matches!(rows, 2 | 4 | 8 | 16 | 32)
                 || g == 0
                 || (split && !(1..=3).contains(&phase))
                 || u32::from(d.blocks) != rows * per_row
@@ -2075,8 +2077,8 @@ pub(super) fn check_xalltoall_heads(
     };
     for p in progs {
         for d in p.insts.iter().filter(|d| d.op == DevOp::XAllToAllHeads as u16) {
-            let (rpr, nh_l, dsz, nh_total, n_gpu, dir) =
-                (d.i[0], d.i[1], d.i[2], d.i[3], d.i[5], d.i[7]);
+            let (rpr, nh_l, dsz, nh_total, n_gpu, dir, hg) =
+                (d.i[0], d.i[1], d.i[2], d.i[3], d.i[5], d.i[7], d.fj[1]);
             if arch != "gfx942"
                 || n_gpu != 8
                 || dir > 1
@@ -2084,6 +2086,9 @@ pub(super) fn check_xalltoall_heads(
                 || nh_l == 0
                 || dsz == 0
                 || nh_total != nh_l.saturating_mul(n_gpu)
+                || hg == 0
+                || hg % nh_l != 0
+                || nh_total % hg != 0
                 || d.t[0] == packet::dev::TENSOR_NONE16
             {
                 return Err(err());
@@ -2111,6 +2116,7 @@ pub(super) fn check_sparse_fp8_packet(
     progs: &[DevProg],
     tensors: &[crate::asset::devblob::DevTensor],
     arch: &str,
+    row_split_ready: bool,
 ) -> Result<()> {
     for (p, d) in progs
         .iter()
@@ -2120,19 +2126,34 @@ pub(super) fn check_sparse_fp8_packet(
         let decode = d.op == DevOp::FlashMlaDecodeFp8 as u16;
         let rows = u64::from(if decode { d.i[0] } else { d.i[4] });
         let ctx = u64::from(d.i[2]);
+        // PLOW_GLM_ROWSPLIT_ATTN: nh=64 over this rank's own T/8 row band instead of the QH8
+        // arm's nh=8 over the whole T, only when the 16-head object is actually installed and
+        // this program carries the head all-to-all that makes the geometry meaningful. Knob-off
+        // packets never set `i[1]=64` here, so this widens nothing for them.
+        let row_split = !decode
+            && row_split_ready
+            && d.i[1] == 64
+            && (p.role.is_rowsplit_sibling()
+                || p.insts.iter().any(|q| q.op == DevOp::XAllToAllHeads as u16));
         if arch != "gfx942"
-            || d.i[1] != 8
+            || (d.i[1] != 8 && !row_split)
             || d.i[3] != 0
             || d.i[5] != u32::MAX
             || d.fj[2] != 0
             || ctx < 2048
             || ctx > 81920
             || rows == 0
-            || (decode && (rows > 20 || d.i[6] != 2048 || d.i[7] != 4))
+            || (decode
+                && (!matches!(rows, 1 | 2 | 4 | 8 | 16 | 32)
+                    || d.i[6] != 2048
+                    || d.i[7] != 4))
             || (!decode
                 && (d.i[0] != 1
-                    || rows < 2048
-                    || rows > 8192
+                    || if row_split {
+                        rows != u64::from(p.t) / 8
+                    } else {
+                        rows < 2048 || rows > 8192
+                    }
                     || d.i[6] != d.i[2].min(16384)
                     || !mla_pf_v2_enabled()))
         {
@@ -2318,11 +2339,10 @@ pub(super) fn l2_pairing_refusal(path: &Path, phase: Phase) -> String {
         ),
         Phase::Prefill | Phase::Flash => (
             "prefill",
-            "no PLOW_L2_PLACE_PREFILL=1, which is the AMD default and leaves decode \
-             placement on",
+            "PLOW_L2_PLACE_PREFILL=0 at emit, which leaves decode placement on",
             "scripts/build_gfx942.sh PLOW_L2HIER_PF=1, which puts -DPLOW_L2_PLACE_DISPATCH on \
-             the prefill rows (the flash rows already carry it); build_gfx950.sh passes it on \
-             both under PLOW_L2_PLACE=1",
+             the prefill rows (the flash rows already carry it) — this is the default; \
+             build_gfx950.sh passes it on both under PLOW_L2_PLACE=1",
         ),
     };
     format!(
@@ -2345,10 +2365,10 @@ pub(super) fn check_gate_hier_object(
     if !syms.contains(&GATE_HIER_SYM) {
         return Ok(());
     }
-    if phase != Phase::Decode || sched != Sched::GlobalQueue || !syms.contains(&L2_DISPATCH_SYM) {
+    if sched != Sched::GlobalQueue || !syms.contains(&L2_DISPATCH_SYM) {
         return Err(RuntimeError::Device(format!(
             "{} advertises `{GATE_HIER_SYM}`, but hierarchical gates are valid only for a \
-             decode global-queue object carrying `{L2_DISPATCH_SYM}`",
+             global-queue object carrying `{L2_DISPATCH_SYM}` (phase {phase:?})",
             path.display()
         )));
     }

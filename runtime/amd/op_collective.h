@@ -1802,10 +1802,15 @@ __device__ __forceinline__ void d_xall_gather_mega(
  * [rank*rpr, (rank+1)*rpr) — a CONTIGUOUS run in p's source — into the LOCAL
  * dst = [rpr][nh_total][d] at head offset p*nh_l (strided across rows).
  *
- * dir=1 (O form): this rank's own peer-visible source is [rpr][nh_total][d] (this rank's row
- * band, every head). Rank `rank` pulls, from every peer p, p's head slice
- * [rank*nh_l, (rank+1)*nh_l) at each of p's rpr rows — STRIDED in p's source — into the LOCAL
- * dst = [T][nh_l][d] at row band [p*rpr, (p+1)*rpr) (contiguous).
+ * dir=1 (O form): this rank's own peer-visible source is GROUP-MAJOR — `groups` dense blocks
+ * of [rpr][heads_per_group][d] back to back (heads_per_group == nh_total, groups == 1
+ * reproduces the plain interleaved [rpr][nh_total][d] source byte for byte: the row-split
+ * attention kernel writes each of its head-groups to its OWN dense block, with no independent
+ * row stride to interleave them — see amd_sparse_mla.rs's `rowsplit_launch_args`). Rank `rank`
+ * pulls, from every peer p, the group g = rank / (heads_per_group / nh_l) and the
+ * (rank % (heads_per_group / nh_l)) * nh_l head offset within it, at each of p's rpr rows —
+ * STRIDED in p's source — into the LOCAL dst = [T][nh_l][d] at row band [p*rpr, (p+1)*rpr)
+ * (contiguous).
  *
  * Both are pure permutations (no arithmetic): a copied element is byte-exact against the
  * source word. `row_elems (= nh_l * d)` is a multiple of 8 by construction on the shapes this
@@ -1815,7 +1820,7 @@ __device__ __forceinline__ void d_xalltoall_heads_mega(
     const void* const* peer_scratch, uint32_t nranks, uint32_t rank, size_t xctr_byte_off,
     uint32_t gate, uint64_t deadline_ticks, uint32_t* status, unsigned slice, unsigned nblk,
     bf16* __restrict__ dst, uint32_t rpr, uint32_t nh_l, uint32_t d, uint32_t nh_total,
-    uint32_t slot_bytes, uint32_t dir) {
+    uint32_t slot_bytes, uint32_t dir, uint32_t heads_per_group) {
     __shared__ int bailed;
     if (slice >= PLOW_XA2A_NWG) return;
     const unsigned dnblk = nblk < PLOW_XA2A_NWG ? nblk : PLOW_XA2A_NWG;
@@ -1838,9 +1843,14 @@ __device__ __forceinline__ void d_xalltoall_heads_mega(
                     ld_glob8(src + (size_t)v * 8u));
         }
     } else {
-        const uint32_t src_row_vecs = (nh_total * d) >> 3u;
-        const bf16* src = (const bf16*)((const char*)peer_scratch[p] + slot_bytes);
-        const uint32_t src_head_vecs = rank * vrow;
+        const uint32_t ranks_per_group = heads_per_group / nh_l;
+        const uint32_t g = rank / ranks_per_group;
+        const uint32_t local_head_off = (rank % ranks_per_group) * nh_l;
+        const uint32_t src_row_vecs = (heads_per_group * d) >> 3u;
+        const uint32_t group_base_vecs = g * rpr * src_row_vecs;
+        const bf16* src =
+            (const bf16*)((const char*)peer_scratch[p] + slot_bytes) + (size_t)group_base_vecs * 8u;
+        const uint32_t src_head_vecs = (local_head_off * d) >> 3u;
         bf16* dp = dst + (size_t)p * chunk_vecs * 8u;
         for (uint32_t v = t0; v < chunk_vecs; v += tstep) {
             const uint32_t row = v / vrow, r_in_row = v % vrow;

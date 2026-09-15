@@ -59,6 +59,21 @@ impl Moe2dLayout {
         balanced_expert_range(experts, self.expert_degree, self.expert_group(rank))
     }
 
+    /// Expert-group owner for a global expert id. All ranks in that group own
+    /// a different intermediate slice of the same expert.
+    pub fn expert_group_owner(self, experts: u32, expert: u32) -> u32 {
+        expert_owner(experts, self.expert_degree, expert)
+    }
+
+    /// Local dense index within this rank's packed expert slab. Remote experts
+    /// return `None`; their pointer-table entries must remain null.
+    pub fn local_expert_index(self, experts: u32, rank: u32, expert: u32) -> Option<u32> {
+        let range = self.expert_range(experts, rank);
+        range
+            .contains(&expert)
+            .then_some(expert.saturating_sub(range.start))
+    }
+
     pub fn local_intermediate(self, full_intermediate: u32) -> u32 {
         assert!(full_intermediate.is_multiple_of(self.intra_expert_tp()));
         full_intermediate / self.intra_expert_tp()
@@ -490,5 +505,25 @@ mod tests {
         assert_eq!(layout.expert_range(896, 2), 224..448);
         assert_eq!(layout.intra_rank(0), 0);
         assert_eq!(layout.intra_rank(1), 1);
+    }
+
+    #[test]
+    fn expert_id_routes_to_one_group_and_one_dense_local_slot() {
+        let layout = Moe2dLayout {
+            world_size: 8,
+            expert_degree: 8,
+        };
+        layout.validate(256, 2048).unwrap();
+        for expert in 0..256 {
+            let owner = layout.expert_group_owner(256, expert);
+            assert_eq!(owner, expert / 32);
+            for rank in 0..8 {
+                let local = layout.local_expert_index(256, rank, expert);
+                assert_eq!(local.is_some(), rank == owner);
+                if let Some(local) = local {
+                    assert_eq!(local, expert % 32);
+                }
+            }
+        }
     }
 }

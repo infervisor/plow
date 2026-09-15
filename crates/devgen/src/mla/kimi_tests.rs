@@ -517,6 +517,17 @@ fn mla_prefill_tp_emits_two_shot_allreduce() {
 fn mla_ep_keeps_routed_experts_whole_beside_prefill() {
     let mut c = kimi_tp_cfg(4);
     c.ep = true;
+    let layout = c.expert_shard_layout().expect("EP layout");
+    let per_rank = c.n_exp / 4;
+    let last_on_rank_2 = 3 * per_rank - 1;
+    assert_eq!(layout.expert_range(c.n_exp, 0), 0..per_rank);
+    assert_eq!(layout.expert_range(c.n_exp, 3), 3 * per_rank..c.n_exp);
+    assert_eq!(layout.expert_group_owner(c.n_exp, last_on_rank_2), 2);
+    assert_eq!(
+        layout.local_expert_index(c.n_exp, 2, last_on_rank_2),
+        Some(per_rank - 1)
+    );
+    assert_eq!(layout.local_expert_index(c.n_exp, 1, last_on_rank_2), None);
     let (m, _) = pf_block(&c, 512, &[128]);
     let dec = m.progs.last().unwrap();
     let glu = find_op(dec, DevOp::MoeExpertGluFp8Blk);
@@ -540,11 +551,20 @@ fn mla_ep_keeps_routed_experts_whole_beside_prefill() {
     let mut c_tp = c.clone();
     c_tp.ep = false;
     let (m2, _) = pf_block(&c_tp, 512, &[128]);
+    assert_eq!(m.prog_t, m2.prog_t, "EP preserves the compiled rung ladder");
     assert_eq!(
         find_op(m2.progs.last().unwrap(), DevOp::MoeExpertGluFp8Blk).i[1],
         c.moe_inter / 4,
         "without EP the routed expert IS TP-sliced"
     );
+}
+
+#[test]
+#[should_panic(expected = "GLM_EP requires a multi-rank TP world")]
+fn mla_ep_refuses_a_single_rank_emit() {
+    let mut c = kimi_tp_cfg(1);
+    c.ep = true;
+    let _ = pf_block(&c, 512, &[128]);
 }
 
 /// One tensor table serves every program, so the row-dimensioned activations are sized for the

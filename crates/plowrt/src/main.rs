@@ -1913,9 +1913,14 @@ fn amd_bench_tp(
                         .tensor_bytes(name)
                         .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
                         as usize;
-                    let mut buf = vec![0u8; limit.map_or(n, |l| l.min(n))];
-                    g.rank(0).read_tensor(name, &mut buf)?;
-                    std::fs::write(format!("{path}.{tag}.bin"), &buf)?;
+                    // PLOW_TRACE_ALLRANKS: every rank's copy, as `<path>.rk<r>.<tag>.bin`.
+                    let all = plowrt::config::RuntimeConfig::get().amd.trace_allranks;
+                    for rank in 0..if all { g.n_gpu() } else { 1 } {
+                        let mut buf = vec![0u8; limit.map_or(n, |l| l.min(n))];
+                        g.rank(rank).read_tensor(name, &mut buf)?;
+                        let rk = if all { format!(".rk{rank}") } else { String::new() };
+                        std::fs::write(format!("{path}{rk}.{tag}.bin"), &buf)?;
+                    }
                 }
             }
         }
@@ -2085,6 +2090,11 @@ fn amd_bench_tp(
     // representative and the ids are not.
     let mut pos = ctx;
     if let Some(p) = &prompt {
+        // `@path`: the ids from a file, for prompts longer than one argv string allows.
+        let p = match p.strip_prefix('@') {
+            Some(path) => std::fs::read_to_string(path)?,
+            None => p.clone(),
+        };
         let ids: Vec<u32> = p
             .split(',')
             .map(|s| s.trim().parse::<u32>())

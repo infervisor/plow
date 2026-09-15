@@ -151,7 +151,7 @@ extern "C" __global__ void plow_mla_sparse_decode_pack(SparseDecodePackArgs a) {
 #if defined(__HIP_DEVICE_COMPILE__)
     const unsigned first = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned stride = blockDim.x * gridDim.x;
-    unsigned kp[21];
+    unsigned kp[33];
     kp[0] = 0;
     for (unsigned b = 0; b < a.rows; ++b) {
         const int len = a.kvlen[b];

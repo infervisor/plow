@@ -721,6 +721,9 @@ impl DevBlob {
                 }
                 ProgramRole::TokenBatchBody { .. } => packet::devbuild::token_batch_program_t(p.t),
                 ProgramRole::DenseExactRung { .. } => packet::devbuild::dense_exact_program_t(p.t),
+                ProgramRole::RowSplitSibling { .. } => {
+                    packet::devbuild::rowsplit_prefill_program_t(p.t)
+                }
                 ProgramRole::DecodeRung { .. } if self.parent.is_some() => {
                     packet::devbuild::decode_rung_program_t(p.t)
                 }
@@ -1792,6 +1795,9 @@ mod tests {
                 }
                 packet::devbuild::ProgramRole::DenseExactRung { .. } => {
                     packet::devbuild::dense_exact_program_t(p.t)
+                }
+                packet::devbuild::ProgramRole::RowSplitSibling { .. } => {
+                    packet::devbuild::rowsplit_prefill_program_t(p.t)
                 }
                 _ => p.t,
             })
