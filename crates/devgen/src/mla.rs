@@ -7515,6 +7515,16 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
     let all = b.all();
     let one = vec![0u32];
     let n_cu = b.n_cu();
+    // IS THE ROUTER MICROSCALED? Read from whether the caller bound a router SCALE, not from `enc`.
+    // `enc` describes the EXPERTS. GLM prequantises its router alongside them and binds `wr_s`;
+    // DeepSeek-V4.1 ships `ffn.gate.weight` as BF16 next to MXFP4 experts and has no scale to bind.
+    // Keying on `enc` emitted the MXFP4 arm with a null scale operand, and that arm writes nothing.
+    let router_mx = enc == MoeEnc::Mxfp4 && n.lw[slot].wr_s != TENSOR_NONE;
+    let router_quant = if router_mx {
+        kernelcaps::QuantScheme::Mxfp4
+    } else {
+        kernelcaps::QuantScheme::None
+    };
     let (h, e, tk, imoe) = (c.hidden, c.n_exp, c.top_k, c.moe_inter);
     let tp = c.tp;
     let imoe_l = imoe / tp;
@@ -7611,12 +7621,12 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
         let cs = if lt_ext.router && enc != MoeEnc::Mxfp4 {
             emit_glm_lt_ext(b, c, lb, xb, w.wr, t, tb, [e, h], &[c_rn2])
         } else {
-            let op = glm_prefill_projection_op(c, tb, e, h, n_cu, mxfp4_quant(enc));
+            let op = glm_prefill_projection_op(c, tb, e, h, n_cu, router_quant);
             b.emit(op, all.clone(), &[c_rn2], |d| {
                 d.t[0] = lb;
                 d.t[1] = xb;
                 d.t[2] = w.wr;
-                if enc == MoeEnc::Mxfp4 {
+                if router_mx {
                     d.t[3] = w.wr_s;
                 }
                 d.i[0] = tb;
@@ -7627,7 +7637,31 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
         let tab_b = glm_band_as(b, n.rt_tp, t, tp, tk_all as u64 * 8, ".rt");
         (tb, lb, tab_b, cs)
     } else {
-        (t, n.rlogit, n.tab, gemm(b, n.rlogit, n.xn2, w.wr, w.wr_s, e, h, &[c_rn2]))
+        (
+            t,
+            n.rlogit,
+            n.tab,
+            if router_mx {
+                gemm(b, n.rlogit, n.xn2, w.wr, w.wr_s, e, h, &[c_rn2])
+            } else {
+                // A BF16 ROUTER INSIDE AN MXFP4 LAYER. DeepSeek-V4.1 ships `ffn.gate.weight` as
+                // BF16 [n_exp, hidden] while its 384 routed experts are MXFP4, so `enc` cannot
+                // answer for both -- the same one-layer-two-encodings split `shared_pre` exists
+                // for. Emitting the MXFP4 arm here binds a TENSOR_NONE scale and the kernel writes
+                // NOTHING: the gfx942 run came back with all 393216 router logits exactly zero,
+                // which does not fault and does not look like a missing scale. It looks like every
+                // token preferring the same six experts.
+                let op = glm_prefill_projection_op(c, t, e, h, n_cu, router_quant);
+                b.emit(op, all.clone(), &[c_rn2], |d| {
+                    d.t[0] = n.rlogit;
+                    d.t[1] = n.xn2;
+                    d.t[2] = w.wr;
+                    d.i[0] = t;
+                    d.i[1] = e;
+                    d.i[2] = h;
+                })
+            },
+        )
     };
     // PLOW_GLM_GEMM_LT_PF_EXT: the shared expert's gate and up go next to the router score so the
     // native segments form one run; their GLU is emitted below as its own op.
