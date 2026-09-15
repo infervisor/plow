@@ -663,9 +663,9 @@ fn the_rung_plan_is_per_layer_and_names_what_is_emitted() {
         .collect();
     assert_eq!(
         done.len(),
-        7,
+        8,
         "mhc_pre/mhc_post, the attention projections, the output projection, its all-reduce, \
-         ffn_norm and the shared expert are emitted; this count is the \
+         ffn_norm, the routed experts and the shared expert are emitted; this count is the \
          thing that grows as bricks land, so it is asserted exactly rather than as a lower bound"
     );
     // And the rung still REFUSES, because a partial blob would run and produce garbage.
@@ -953,4 +953,91 @@ fn v41_scores_with_sqrtsoftplus_not_sigmoid() {
     assert_eq!(cfg.raw.topk_method, "noaux_tc");
     // Group-limited routing is the identity here: no n_group/topk_group in the config at all.
     assert!(cfg.raw.norm_topk_prob);
+}
+
+/// V4.1's routed experts run through GLM's measured prefill MoE body, at V4.1's own shapes.
+///
+/// This is the largest block in the model -- 139.16 TFLOP of an 8k prefill, 49.4% of the census --
+/// so what it asserts is that the reuse actually took: the grouped expert ops are there, they carry
+/// 384 experts and top-6 rather than GLM's 256/top-8, and the router asks for the score transform
+/// this checkpoint names rather than the one GLM happens to use.
+#[test]
+fn the_routed_experts_run_glms_prefill_body_at_v41_shapes() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    // NOT PLOW_GLM_MOE_AITER: that arm asserts block-FP8 experts and V4.1's are MXFP4.
+    let _env = crate::test_env::EnvScope::set(&[("PLOW_UNISEG", "0")]);
+    let (t, tp) = (1024u32, 8u32);
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0], tp);
+    let all: Vec<u32> = (0..304u32).collect();
+    let xn2 = b.tensor("act.xn2", (t as u64) * (cfg.hidden as u64) * 2);
+    let x_out = b.tensor("act.xnext", (t as u64) * (cfg.hidden as u64) * 2);
+    let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
+    // The MoE body takes the post-norm's completion id, so give it a real producer.
+    let eps = cfg.eps;
+    let hidden = cfg.hidden;
+    let gw = w.get(0, "ffn_norm.weight");
+    let c_norm = b.emit(DevOp::RmsNorm, all.clone(), &[], |d| {
+        d.t[0] = xn2;
+        d.t[1] = x;
+        d.t[2] = gw;
+        d.i[0] = t;
+        d.i[1] = hidden;
+        d.f[0] = eps;
+    });
+    let mut xgate = 0;
+    super::dsv41::emit_dsv41_moe(
+        &mut b, &cfg, &w, 0, tp, t, x_out, xn2, c_norm, &mut xgate, &all,
+    );
+    let p = b.finish();
+
+    // The router tail carries THIS model's expert count and top-k, not the GLM body's defaults.
+    let rt = p
+        .insts
+        .iter()
+        .find(|d| {
+            d.op == DevOp::MoeRouterTopkPf as u16 || d.op == DevOp::MoeRouterTopk as u16
+        })
+        .expect("a router top-k");
+    assert_eq!(rt.i[1], cfg.n_exp, "384 routed experts");
+    assert_eq!(rt.i[1], 384);
+    assert_eq!(rt.i[2], cfg.top_k, "top-6");
+    assert_eq!(rt.i[2], 6);
+    // And it asks for sqrtsoftplus scoring -- the bit that is NOT GLM's.
+    use crate::mla::router_flag as f;
+    assert_ne!(
+        rt.i[3] & f::SQRTSOFTPLUS,
+        0,
+        "V4.1 scores with sqrt(softplus(.)); emitting sigmoid here still selects plausible \
+         experts and silently reweights every one of them"
+    );
+    assert_eq!(rt.i[3] & f::SIGMOID, 0, "and not sigmoid, which is a different function");
+    assert_ne!(rt.i[3] & f::BIAS, 0, "noaux_tc binds e_score_correction_bias");
+
+    // The grouped expert ops are the MXFP4 pair, and they see this rank's TP slice of moe_inter.
+    let glu: Vec<_> = p
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::MoeGroupGluPf as u16)
+        .collect();
+    assert!(!glu.is_empty(), "the routed experts must emit the grouped gate/up (op 85)");
+    for g in &glu {
+        // op 85: i0=I_moe i1=H i2=n_exp.
+        assert_eq!(g.i[2], cfg.n_exp, "the expert op carries the bound expert table");
+        assert_eq!(g.i[1], cfg.hidden);
+        assert_eq!(
+            g.i[0],
+            cfg.moe_inter / tp,
+            "TP (not EP): each rank runs its slice of moe_inter, 2304/8 = 288"
+        );
+    }
+    // And the down half, which is what scatters into `part`.
+    assert!(
+        p.insts.iter().any(|d| d.op == DevOp::MoeGroupDownPf as u16),
+        "the grouped down GEMM (op 86) must be emitted too"
+    );
 }

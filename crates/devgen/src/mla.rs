@@ -895,7 +895,7 @@ fn emit_glm53_program(
             // (emit_glm_moe_ffn_rows) and cannot serve a real prefill bucket. See
             // emit_glm_moe_ffn_prefill's doc comment for why.
             emit_glm_moe_ffn_prefill(
-                b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true,
+                b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true, GLM_ROUTER_FLAGS,
             )
         } else {
             emit_glm_moe_ffn(
@@ -1905,7 +1905,7 @@ const GLM_ACT_SILU: u32 = 1;
 /// Per-layer GLM weights. Derived (absorbed / rope-folded) tensors are bf16 and named under a
 /// `.derived.` segment the host weight-prep writes; the block-fp8 projections, router, and experts
 /// keep their checkpoint names. `TENSOR_NONE` for the sub-block a layer does not have (dense vs MoE).
-struct GlmLW {
+pub(crate) struct GlmLW {
     // MXFP4 (w4a16) E8M0 scale rows for the matmul weights below — one byte per 32 K-elements,
     // row stride K/32. TENSOR_NONE on the bf16 and block-fp8 arms, which have no such tensor: bf16
     // needs no scale and block-fp8 keeps its own [N/128][K/128] f32 grid under the checkpoint's
@@ -2399,55 +2399,16 @@ pub(crate) fn declare_glm_rows_batched(
     // fields come from, because a size that disagreed with the kernel arm is a silent k-fold
     // heap overrun rather than a fault. The `.max()` term is the DECODE expert ops, which still
     // write f32 `part` for their single token out of this buffer.
-    let part_pf = match moe_pf_fuse(tk) {
-        MoePfFuse::Det => rows * h as u64 * 8,
-        MoePfFuse::None => rows * (tk * h) as u64 * F32,
-    };
-    let part = ac(b, "part", part_pf.max((tk * h) as u64 * F32));
-    // Grouped MoE prefill scratch. `MPF_MAX_ROWS(T,k,n_exp) = T*k + n_exp*(MPF_BM-1)` is the padded
-    // gathered-row bound: the align op pads each expert's row range up to a whole MPF_BM tile, so
-    // every expert can waste at most MPF_BM-1 rows. Sizing this from T*k alone is an out-of-bounds
-    // device write with no symptom at low expert counts and a guaranteed one at 384.
-    let (meta, row_token, row_partidx, row_gate, fu_g, fu_scale) =
-        if rows > 1 || emit_config::active().glm_moe_resident() {
-            let pad_rows = rows * tk_all as u64 + (e_all * (MPF_BM - 1)) as u64;
-            // The gathered GLU output is bf16 on the bf16/block-fp8 arms and PACKED fp4 under A4W4 —
-            // half a byte per value plus one E8M0 byte per 32. The buffer is sized for whichever the
-            // packet asks for; the fp4 form is SMALLER, so a bf16-sized allocation would merely waste,
-            // but the E8M0 rows have no bf16 counterpart and must be declared or the bridge writes to a
-            // null handle.
-            let fug_bytes = match enc {
-                MoeEnc::Mxfp4 => pad_rows * (imoe_e / 2) as u64,
-                _ => pad_rows * imoe_e as u64 * BF16,
-            };
-            const ALIGN_BLOCKS: u64 = 64;
-            let align_extra = if emit_config::active().moe_align_par && rows >= 1024 {
-                ALIGN_BLOCKS * e_all as u64
-            } else {
-                0
-            };
-            (
-                ac(b, "moe_meta", ((3 * e_all + 1) as u64 + align_extra) * I32),
-                ac(b, "moe_rowtok", pad_rows * I32),
-                ac(b, "moe_rowpart", pad_rows * I32),
-                ac(b, "moe_rowgate", pad_rows * F32),
-                ac(b, "moe_fug", fug_bytes),
-                if enc == MoeEnc::Mxfp4 {
-                    ac(b, "moe_fuscale", pad_rows * (imoe_e / MX_BLOCK) as u64)
-                } else {
-                    TENSOR_NONE
-                },
-            )
-        } else {
-            (
-                TENSOR_NONE,
-                TENSOR_NONE,
-                TENSOR_NONE,
-                TENSOR_NONE,
-                TENSOR_NONE,
-                TENSOR_NONE,
-            )
-        };
+    let sc = declare_moe_pf_scratch(b, rows, h, tk, tk_all, e_all, imoe_e, enc);
+    let (part, meta, row_token, row_partidx, row_gate, fu_g, fu_scale) = (
+        sc.part,
+        sc.meta,
+        sc.row_token,
+        sc.row_partidx,
+        sc.row_gate,
+        sc.fu_g,
+        sc.fu_scale,
+    );
     let xnext = ac(b, "xnext", rows * h as u64 * BF16);
     let logits = ac(b, "logits", dbatch as u64 * glm_vocab_l(c) as u64 * BF16);
     let amax = ac(b, "amax.part", dbatch as u64 * AMAX_BLOCKS as u64 * 8);
@@ -7173,7 +7134,332 @@ fn emit_glm_block_prefill(
 ) -> u32 {
     let c_rn2 =
         emit_glm_mla_prefill(b, c, n, slot, ctx, t, enc, x_in, pre, false, xgate, xr_cus, band);
-    emit_glm_moe_ffn_prefill(b, c, n, slot, t, enc, x_out, c_rn2, xgate, xr_cus, false)
+    emit_glm_moe_ffn_prefill(
+        b, c, n, slot, t, enc, x_out, c_rn2, xgate, xr_cus, false, GLM_ROUTER_FLAGS,
+    )
+}
+
+impl GlmLW {
+    /// Every handle absent. See [`GlmTn::none`].
+    pub(crate) fn none() -> Self {
+        Self {
+            qad_s: TENSOR_NONE,
+            wqa_s: TENSOR_NONE,
+            wqr_s: TENSOR_NONE,
+            ckvd_s: TENSOR_NONE,
+            krotd_s: TENSOR_NONE,
+            wo_s: TENSOR_NONE,
+            wr_s: TENSOR_NONE,
+            shg_s: TENSOR_NONE,
+            shu_s: TENSOR_NONE,
+            shd_s: TENSOR_NONE,
+            gin: TENSOR_NONE,
+            qad: TENSOR_NONE,
+            gqa: TENSOR_NONE,
+            wqa: TENSOR_NONE,
+            wqr: TENSOR_NONE,
+            ckvd: TENSOR_NONE,
+            gkva: TENSOR_NONE,
+            krotd: TENSOR_NONE,
+            wuv: TENSOR_NONE,
+            wuv_full: TENSOR_NONE,
+            wo: TENSOR_NONE,
+            wofold: TENSOR_NONE,
+            gpost: TENSOR_NONE,
+            wr: TENSOR_NONE,
+            bias: TENSOR_NONE,
+            shg: TENSOR_NONE,
+            shu: TENSOR_NONE,
+            shd: TENSOR_NONE,
+            ewt: TENSOR_NONE,
+            est: TENSOR_NONE,
+            _ewt_moe2: TENSOR_NONE,
+            _est_moe2: TENSOR_NONE,
+            dgate: TENSOR_NONE,
+            dgate_s: TENSOR_NONE,
+            dup: TENSOR_NONE,
+            dup_s: TENSOR_NONE,
+            ddown: TENSOR_NONE,
+            ddown_s: TENSOR_NONE,
+            dwt: TENSOR_NONE,
+            dst: TENSOR_NONE,
+            iwqb: TENSOR_NONE,
+            iwk: TENSOR_NONE,
+            iknw: TENSOR_NONE,
+            iknb: TENSOR_NONE,
+            iwp: TENSOR_NONE,
+            ikpg: TENSOR_NONE,
+            ikpa: TENSOR_NONE,
+            iwp_f32: TENSOR_NONE,
+            blk_qad: TENSOR_NONE,
+            blk_qad_s: TENSOR_NONE,
+            blk_ckvd: TENSOR_NONE,
+            blk_ckvd_s: TENSOR_NONE,
+            blk_iwqb: TENSOR_NONE,
+            blk_iwqb_s: TENSOR_NONE,
+            blk_wo: TENSOR_NONE,
+            blk_wo_s: TENSOR_NONE,
+        }
+    }
+}
+
+impl GlmTn {
+    /// Every handle absent (`TENSOR_NONE`), every list empty.
+    ///
+    /// For a caller that wants ONE sublayer of the GLM emitter rather than the whole tower:
+    /// fill the handles that sublayer reads, leave the rest absent, and a field the body turns out
+    /// to need shows up as `TENSOR_NONE` rather than as handle 0, which is a real tensor and would
+    /// be read as silently wrong data.
+    ///
+    /// DeepSeek-V4.1 uses this to call [`emit_glm_moe_ffn_prefill`] -- 516 lines of measured,
+    /// tile-picked prefill MoE that its routed experts want unchanged -- without a V4.1
+    /// `declare_glm_rows_batched`, which is a rewrite it does not have yet. The alternative was to
+    /// parameterise that body over its config and scratch, but it hands `c` and `n` whole to
+    /// `glm_sp`, `glm_shared_fold` and the tile pickers, so the change would have cascaded through
+    /// the helpers of a shipped, measured path. Adapting the caller costs one constructor.
+    fn none() -> Self {
+        Self {
+            ids: TENSOR_NONE,
+            pos: TENSOR_NONE,
+            kvlen: TENSOR_NONE,
+            cos: TENSOR_NONE,
+            sin: TENSOR_NONE,
+            emb: TENSOR_NONE,
+            fin: TENSOR_NONE,
+            head: TENSOR_NONE,
+            x: TENSOR_NONE,
+            xn: TENSOR_NONE,
+            qlr: TENSOR_NONE,
+            qlat: TENSOR_NONE,
+            ckvraw: TENSOR_NONE,
+            qa: TENSOR_NONE,
+            qrr: TENSOR_NONE,
+            qr: TENSOR_NONE,
+            krr: TENSOR_NONE,
+            opart: TENSOR_NONE,
+            mlpart: TENSOR_NONE,
+            olat: TENSOR_NONE,
+            oat: TENSOR_NONE,
+            qa_rs: TENSOR_NONE,
+            qr_rs: TENSOR_NONE,
+            oat_rs: TENSOR_NONE,
+            attn: TENSOR_NONE,
+            xmid: TENSOR_NONE,
+            xn2: TENSOR_NONE,
+            tab: TENSOR_NONE,
+            rlogit: TENSOR_NONE,
+            shfu: TENSOR_NONE,
+            shfu_up: TENSOR_NONE,
+            shared: TENSOR_NONE,
+            fu: TENSOR_NONE,
+            dfu: TENSOR_NONE,
+            part: TENSOR_NONE,
+            xnext: TENSOR_NONE,
+            logits: TENSOR_NONE,
+            amax: TENSOR_NONE,
+            og_tp: TENSOR_NONE,
+            dg_tp: TENSOR_NONE,
+            zero_h: TENSOR_NONE,
+            slot_b: TENSOR_NONE,
+            h2_tp: TENSOR_NONE,
+            ug_tp: TENSOR_NONE,
+            xe_tp: TENSOR_NONE,
+            rt_tp: TENSOR_NONE,
+            qidx_pf: TENSOR_NONE,
+            kidx_pf: TENSOR_NONE,
+            widx_pf: TENSOR_NONE,
+            iscore_pf: TENSOR_NONE,
+            iidx_pf: TENSOR_NONE,
+            iuni: TENSOR_NONE,
+            iumask: TENSOR_NONE,
+            qidx: TENSOR_NONE,
+            kidx_raw: TENSOR_NONE,
+            kidx_normed: TENSOR_NONE,
+            widx: TENSOR_NONE,
+            iscore: TENSOR_NONE,
+            iidx: TENSOR_NONE,
+            ighist: TENSOR_NONE,
+            igctl: TENSOR_NONE,
+            ibits: TENSOR_NONE,
+            icand: TENSOR_NONE,
+            icos: TENSOR_NONE,
+            isin: TENSOR_NONE,
+            gate_score: TENSOR_NONE,
+            q_fp8: TENSOR_NONE,
+            q_scale: TENSOR_NONE,
+            widx_f32: TENSOR_NONE,
+            iidx_pool: TENSOR_NONE,
+            gate_score_pf: TENSOR_NONE,
+            q_fp8_pf: TENSOR_NONE,
+            q_scale_pf: TENSOR_NONE,
+            widx_f32_pf: TENSOR_NONE,
+            iidx_pool_pf: TENSOR_NONE,
+            meta: TENSOR_NONE,
+            row_token: TENSOR_NONE,
+            row_partidx: TENSOR_NONE,
+            row_gate: TENSOR_NONE,
+            fu_g: TENSOR_NONE,
+            fu_scale: TENSOR_NONE,
+            blk_xq: TENSOR_NONE,
+            blk_xs: TENSOR_NONE,
+            blk_bias: TENSOR_NONE,
+            ckv: Vec::new(),
+            krot: Vec::new(),
+            kv_scale: Vec::new(),
+            kidx: Vec::new(),
+            kidx_pool: Vec::new(),
+            kidx_pool_scale: Vec::new(),
+            kidx_ring: Vec::new(),
+            kidx_ring_score: Vec::new(),
+            lw: Vec::new(),
+        }
+    }
+}
+
+impl GlmCfg {
+    /// A config valid for [`emit_glm_moe_ffn_prefill`] AND NOTHING ELSE.
+    ///
+    /// That body reads nine fields. The other twenty-three describe an attention stack this
+    /// caller is not emitting, and they are left at zero rather than at a plausible-looking
+    /// value: a zero `heads` or an empty `softmax_layers` fails loudly the moment some other
+    /// emitter is handed this, which is the point. DeepSeek-V4.1 uses it to run its routed
+    /// experts through GLM's measured prefill MoE instead of growing a second copy.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn moe_only(
+        hidden: u32,
+        n_exp: u32,
+        top_k: u32,
+        moe_inter: u32,
+        tp: u32,
+        ep: bool,
+        route_scale: f32,
+        n_group: u32,
+        topk_group: u32,
+    ) -> Self {
+        Self {
+            hidden,
+            n_exp,
+            top_k,
+            moe_inter,
+            tp,
+            ep,
+            route_scale,
+            n_group,
+            topk_group,
+            layers: 0,
+            heads: 0,
+            kv_lora: 0,
+            q_lora: 0,
+            qk_nope: 0,
+            qk_rope: 0,
+            v_head: 0,
+            vocab: 0,
+            eps: 0.0,
+            dense_inter: 0,
+            first_k_dense: 0,
+            attn_scale: 0.0,
+            rope_theta: None,
+            rope_scale: packet::rope::RopeScale::None,
+            prefix: String::new(),
+            group: false,
+            index_heads: 0,
+            index_dim: 0,
+            index_topk: 0,
+            index_kpool: 0,
+            indexer_full: Vec::new(),
+            softmax_layers: Vec::new(),
+            has_dsa: false,
+        }
+    }
+}
+
+/// The grouped-MoE prefill scratch, and the row bound that sizes it.
+pub(crate) struct MoePfScratch {
+    /// `[T*k, H]` f32 expert output the combine reduces (or the `MoePfFuse::Det` fixed-point form).
+    pub(crate) part: u32,
+    /// `MoeAlignPf`'s per-expert row-count table.
+    pub(crate) meta: u32,
+    /// Per-GATHERED-ROW maps: which token a row came from, which partial it scatters to, and the
+    /// router gate that scales it.
+    pub(crate) row_token: u32,
+    pub(crate) row_partidx: u32,
+    pub(crate) row_gate: u32,
+    /// The gathered GLU output the DOWN GEMM consumes, and its E8M0 scale rows under A4W4.
+    pub(crate) fu_g: u32,
+    pub(crate) fu_scale: u32,
+}
+
+/// Declare the grouped-MoE prefill scratch for `rows` tokens.
+///
+/// Split out of `declare_glm_rows_batched` so a family with its own tensor table can size this
+/// buffer set the same way rather than re-deriving it. The sizing is the part worth sharing: the
+/// padded row bound below is not `T*k`, and every wrong answer here is an out-of-bounds DEVICE
+/// write, which is silent at small expert counts and certain at 384.
+///
+/// Declaration ORDER is part of the contract -- handles are indices, so reordering these renames
+/// every later tensor in the program. `the_moe_prefill_emission_is_pinned` would catch it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn declare_moe_pf_scratch(
+    b: &mut Builder,
+    rows: u64,
+    h: u32,
+    tk: u32,
+    tk_all: u32,
+    e_all: u32,
+    imoe_e: u32,
+    enc: MoeEnc,
+) -> MoePfScratch {
+    let ac = |b: &mut Builder, n: &str, sz: u64| b.tensor(&format!("act.{n}"), sz);
+    let part_pf = match moe_pf_fuse(tk) {
+        MoePfFuse::Det => rows * h as u64 * 8,
+        MoePfFuse::None => rows * (tk * h) as u64 * F32,
+    };
+    let part = ac(b, "part", part_pf.max((tk * h) as u64 * F32));
+    // Grouped MoE prefill scratch. `MPF_MAX_ROWS(T,k,n_exp) = T*k + n_exp*(MPF_BM-1)` is the padded
+    // gathered-row bound: the align op pads each expert's row range up to a whole MPF_BM tile, so
+    // every expert can waste at most MPF_BM-1 rows. Sizing this from T*k alone is an out-of-bounds
+    // device write with no symptom at low expert counts and a guaranteed one at 384.
+    let (meta, row_token, row_partidx, row_gate, fu_g, fu_scale) =
+        if rows > 1 || emit_config::active().glm_moe_resident() {
+            let pad_rows = rows * tk_all as u64 + (e_all * (MPF_BM - 1)) as u64;
+            // The gathered GLU output is bf16 on the bf16/block-fp8 arms and PACKED fp4 under A4W4 —
+            // half a byte per value plus one E8M0 byte per 32. The buffer is sized for whichever the
+            // packet asks for; the fp4 form is SMALLER, so a bf16-sized allocation would merely waste,
+            // but the E8M0 rows have no bf16 counterpart and must be declared or the bridge writes to a
+            // null handle.
+            let fug_bytes = match enc {
+                MoeEnc::Mxfp4 => pad_rows * (imoe_e / 2) as u64,
+                _ => pad_rows * imoe_e as u64 * BF16,
+            };
+            const ALIGN_BLOCKS: u64 = 64;
+            let align_extra = if emit_config::active().moe_align_par && rows >= 1024 {
+                ALIGN_BLOCKS * e_all as u64
+            } else {
+                0
+            };
+            (
+                ac(b, "moe_meta", ((3 * e_all + 1) as u64 + align_extra) * I32),
+                ac(b, "moe_rowtok", pad_rows * I32),
+                ac(b, "moe_rowpart", pad_rows * I32),
+                ac(b, "moe_rowgate", pad_rows * F32),
+                ac(b, "moe_fug", fug_bytes),
+                if enc == MoeEnc::Mxfp4 {
+                    ac(b, "moe_fuscale", pad_rows * (imoe_e / MX_BLOCK) as u64)
+                } else {
+                    TENSOR_NONE
+                },
+            )
+        } else {
+            (
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+            )
+        };
+    MoePfScratch { part, meta, row_token, row_partidx, row_gate, fu_g, fu_scale }
 }
 
 /// Emit ONE MoE FFN for a PREFILL bucket of `t` rows, given the attention output's completion dep
@@ -7201,7 +7487,7 @@ fn emit_glm_block_prefill(
 /// scatter shrinks).
 const GLM_MOE_NATIVE_ALIGN_NPART: u32 = 64;
 
-fn emit_glm_moe_ffn_prefill(
+pub(crate) fn emit_glm_moe_ffn_prefill(
     b: &mut Builder,
     c: &GlmCfg,
     n: &GlmTn,
@@ -7213,6 +7499,11 @@ fn emit_glm_moe_ffn_prefill(
     xgate: &mut u32,
     xr_cus: &[u32],
     raw_output: bool,
+    // The router `i[3]`. A parameter and not GLM_ROUTER_FLAGS because the score transform is a
+    // property of the CHECKPOINT: GLM and DeepSeek-V3 score with sigmoid, DeepSeek-V4.1 with
+    // sqrt(softplus(.)). Both are monotone, so the wrong one here still selects plausible experts
+    // and silently reweights all of them -- see the [DSV4-ROUTE] note in op_moe.h.
+    router_flags: u32,
 ) -> u32 {
     let all = b.all();
     let one = vec![0u32];
@@ -7351,7 +7642,7 @@ fn emit_glm_moe_ffn_prefill(
         }
         d.i[1] = e;
         d.i[2] = tk;
-        d.i[3] = GLM_ROUTER_FLAGS;
+        d.i[3] = router_flags;
         d.i[4] = tr;
         // PLOW_GLM_MOE_SHARED_FOLD: the table stride becomes k+1 slots per token and the tail
         // slot is written `{expert n_exp, gate 1.0}`. The SELECTION is untouched — the same

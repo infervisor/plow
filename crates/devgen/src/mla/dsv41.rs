@@ -675,6 +675,130 @@ pub(crate) fn emit_dsv41_mhc_post(
     )
 }
 
+/// Emit V4.1's MoE: the router and the 384 MXFP4 routed experts.
+///
+/// # This calls GLM's prefill MoE body rather than growing a second one
+///
+/// The routed experts are 139.16 TFLOP of an 8k prefill -- 49.4% of the model, the largest single
+/// block in the census -- so this is the part where a hand-rolled emit would cost the 90 ms target
+/// outright. `emit_glm_moe_ffn_prefill` is 516 measured lines: `pick_tile` geometry, the align op's
+/// padded row bound, lean segments, and the EP/TP placement rule. V4.1 wants all of it, unchanged.
+///
+/// What V4.1 does NOT have is a `declare_glm_rows_batched` -- 1182 lines whose tensors differ
+/// throughout -- so the adaptation runs the other way: build the nine `GlmCfg` fields that body
+/// reads, bind V4.1's weights into a `GlmLW`, fill the MoE scratch of a `GlmTn::none()`, and leave
+/// every other handle absent. `TENSOR_NONE` rather than handle 0, so a field this turns out to
+/// need is a loud missing operand rather than a silent read of somebody else's tensor.
+///
+/// The alternative -- parameterising the GLM body over its config and scratch -- was tried first
+/// and abandoned: it hands `c` and `n` whole to `glm_sp`, `glm_shared_fold` and the tile pickers,
+/// so it would have cascaded through the helpers of a shipped, measured path for no gain over
+/// adapting the caller. The sizing that IS genuinely shared -- the padded gathered-row bound, where
+/// a wrong answer is an out-of-bounds device write -- moved into `declare_moe_pf_scratch`, which
+/// both families now call.
+///
+/// # The router
+///
+/// `sqrtsoftplus`, not sigmoid. Both are monotone, so a sigmoid emit would still select plausible
+/// experts and only the gate weights would be wrong -- which is exactly how the bit-2 collision in
+/// `op_moe.h` went unnoticed. The flags are built from the config's own `scoring_func`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_dsv41_moe(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    w: &Dsv41Weights,
+    l: u32,
+    tp: u32,
+    t: u32,
+    x_out: u32,
+    xn2: u32,
+    c_norm: u32,
+    xgate: &mut u32,
+    cus: &[u32],
+) -> u32 {
+    assert_eq!(
+        c.raw.scoring_func, "sqrtsoftplus",
+        "the emit reads the score transform from the checkpoint; a new value needs a kernel arm, \
+         not a substitution. Missing capability: `dsv41_router_scoring_{}`.",
+        c.raw.scoring_func
+    );
+    assert_eq!(
+        c.raw.topk_method, "noaux_tc",
+        "selection bias is bound on the noaux_tc contract. Missing capability: \
+         `dsv41_router_topk_{}`.",
+        c.raw.topk_method
+    );
+    // Group-limited routing is the IDENTITY here: V4.1's config carries no `n_group`/`topk_group`
+    // at all, so every expert is in play. `1`/`1` is how the GLM body spells that.
+    let gc = super::GlmCfg::moe_only(
+        c.hidden,
+        c.n_exp,
+        c.top_k,
+        c.moe_inter,
+        tp,
+        false, // EP is opt-in and this emit does not implement it; see `dsv41_shard_of`.
+        c.raw.routed_scaling_factor,
+        1,
+        1,
+    );
+    let mut lw = super::GlmLW::none();
+    lw.wr = w.get(l, "ffn.gate.weight");
+    lw.bias = w.get(l, "ffn.gate.bias");
+    // The routed-expert weight and scale TABLES. The grouped GEMM resolves each expert's base from
+    // these rather than taking 384 operands, which is why one handle stands for 384 tensors.
+    lw.ewt = w.get(l, "ffn.experts.0.w1.weight");
+    lw.est = w.get(l, "ffn.experts.0.w1.scale");
+    // The shared expert is emitted separately (`emit_dsv41_ffn_shared`): it is block-FP8 on the
+    // [32,32] grid while these are MXFP4, so it cannot fold into the routed table -- which is the
+    // same mixed-encoding fact `glm_shared_fold` refuses on (`enc == Fp8Blk`).
+    let mut n = super::GlmTn::none();
+    n.lw = vec![lw];
+    n.xn2 = xn2;
+    n.xnext = x_out;
+    n.xmid = b.tensor(&format!("act.l{l}.moe_xmid"), (t as u64) * (c.hidden as u64) * 2);
+    n.attn = b.tensor(&format!("act.l{l}.moe_attn"), (t as u64) * (c.hidden as u64) * 2);
+    n.rlogit = b.tensor(
+        &format!("act.l{l}.rlogit"),
+        (t as u64) * (c.n_exp as u64) * 2,
+    );
+    n.tab = b.tensor(&format!("act.l{l}.tab"), (t as u64) * (c.top_k as u64) * 8);
+    // `fold` is false for V4.1 (it requires Fp8Blk experts), so e_all/tk_all are the plain counts.
+    let sc = super::declare_moe_pf_scratch(
+        b,
+        t as u64,
+        c.hidden,
+        c.top_k,
+        c.top_k,
+        c.n_exp,
+        c.moe_inter / tp,
+        super::MoeEnc::Mxfp4,
+    );
+    n.part = sc.part;
+    n.meta = sc.meta;
+    n.row_token = sc.row_token;
+    n.row_partidx = sc.row_partidx;
+    n.row_gate = sc.row_gate;
+    n.fu_g = sc.fu_g;
+    n.fu_scale = sc.fu_scale;
+    n.slot_b = (t as u64 * c.hidden as u64 * 2) as u32;
+    super::emit_glm_moe_ffn_prefill(
+        b,
+        &gc,
+        &n,
+        0,
+        t,
+        super::MoeEnc::Mxfp4,
+        x_out,
+        c_norm,
+        xgate,
+        cus,
+        false,
+        super::router_flag::SQRTSOFTPLUS
+            | super::router_flag::BIAS
+            | if c.raw.norm_topk_prob { super::router_flag::NORM_TOPK } else { 0 },
+    )
+}
+
 /// The o_proj TP partial's tensor name, fixed by `plowrt`'s peer-slot table (slot 0).
 ///
 /// `crates/plowrt/src/exec/amd.rs` matches this string literally to bind the tensor into the peer
@@ -941,7 +1065,7 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
     if c.engram_layers.contains(&l) {
         p.push(("engram gate + embed (ops 182/183)", Part::Todo));
     }
-    p.push(("moe router + routed experts (ops 85/86, MXFP4)", Part::Todo));
+    p.push(("moe router + routed experts (ops 85/86, MXFP4)", Part::Done));
     p.push(("shared expert (op 184 + clamped SwiGLU)", Part::Done));
     p.push(("mhc_post", Part::Done));
     p
