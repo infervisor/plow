@@ -1378,10 +1378,29 @@ fn the_layer_zero_rung_is_a_topological_program() {
         DevOp::GemmFp8Mx,
         DevOp::Glu,
         DevOp::RmsNorm,
-        DevOp::Residual,
+        DevOp::HyperConnPre,
+        DevOp::HyperConnPost,
     ] {
         assert!(has(op), "layer 0 must emit {op:?}");
     }
+    // NO `Residual`. Both of the ones this layer used to carry were wrong: the MoE's
+    // `x_out = xmid + ffn` read a buffer nothing wrote (`raw_output` removed it, and mHC's
+    // `HyperConnPost` is what rejoins the residual), and the rung's seed wrote one copy of a
+    // `[hc_mult][T][hidden]` entry and left the other three to the arena. The entry IS the mHC
+    // stream now, so there is nothing left to seed.
+    assert!(
+        !has(DevOp::Residual),
+        "a Residual here is one of the two the layer must not have; see this test's body"
+    );
+    assert_eq!(
+        desc.inputs[0].name, "act.hc_residual_a",
+        "the entry is the mHC stream, not a plain hidden state"
+    );
+    assert_eq!(
+        desc.inputs[0].shape.len(),
+        3,
+        "and it is [hc_mult][T][hidden] -- a 2-D claim has a harness fill a quarter of it"
+    );
     assert_eq!(desc.programs.prefill_buckets, vec![256]);
     assert_eq!(desc.dims.heads, Some(cfg.heads as i64));
 }

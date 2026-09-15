@@ -1409,7 +1409,6 @@ pub(crate) fn emit_dsv41_block(
     let mut tb = Builder::new(n_cu);
     tb.set_tensor_dedup(true);
     let w = declare_dsv41_weights(&mut tb, c, &[l], tp);
-    let x = tb.tensor("act.x", (t as u64) * (c.hidden as u64) * 2);
     let xnext = tb.tensor("act.xnext", (t as u64) * (c.hidden as u64) * 2);
     let pos = tb.tensor("in.pos", (ctx as u64) * 4);
     let kvlen = tb.tensor("in.kvlen", 4);
@@ -1439,15 +1438,21 @@ pub(crate) fn emit_dsv41_block(
     // The residual stream starts in copy 0. Each sublayer reads one copy and its POST writes the
     // other, which is why `ri` flips twice per layer -- once for attention, once for the FFN.
     let mut ri = 0usize;
-    let c_seed = b.emit(DevOp::Residual, all.clone(), &[], |d| {
-        d.t[0] = mhc.residual[0];
-        d.t[1] = x;
-        d.t[2] = x;
-        d.i[0] = t * c.hidden;
-        d.f[0] = 0.5; // (x + x) * 0.5 == x: seed every mHC copy from the block entry
-    });
 
-    let c_pre = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, false, ri, t, &[c_seed]);
+    // NO SEED OP. The entry IS `act.hc_residual_a`, the mHC stream itself, all `hc_mult` copies of
+    // it, uploaded by the harness.
+    //
+    // The seed this replaces wrote `t * hidden` elements into a `[hc_mult][T][hidden]` buffer, so
+    // copies 1..hc_mult were never written and `HyperConnPre` mixed three copies of whatever the
+    // arena held. On hardware that is exactly what it looked like: 167104 Inf out of 20971520, on
+    // a layer whose input was bounded by +-0.04.
+    //
+    // It could not be fixed by widening `i[0]`: `Residual` reads `t[1]`/`t[2]` for as many elements
+    // as it writes, so a 4-copy write would run 3 copies off the end of a 1-copy `act.x`. There is
+    // no output offset on the op to write the copies one at a time with. And the seed was a
+    // RUNG-ONLY fiction in the first place -- in a whole model the embedding produces this stream
+    // -- so the honest entry for a rung is the stream, not a hidden state plus a fake expansion.
+    let c_pre = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, false, ri, t, &[]);
     let (proj, c_proj) = emit_dsv41_attn_proj(&mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre]);
     let (core, c_core) = emit_dsv41_attn_core(
         &mut b, c, &w, &all, l, tp, proj.q, proj.kv, kvlen, pos, cos, sin, t, ctx, &[c_proj],
@@ -1522,14 +1527,25 @@ pub(crate) fn emit_dsv41_block(
         },
         // No DSA indexer on layer 0; `index_source_layer_ids` starts at 2.
         dsa_role: None,
+        // `[hc_mult][T][hidden]`, NOT `[T][hidden]`. The mHC carries `hc_mult` parallel residual
+        // streams and `HyperConnPre` mixes all of them; a descriptor claiming `[T][hidden]` would
+        // have a harness upload one copy and leave the rest to the arena.
         inputs: vec![BlockTensor {
-            name: "act.x".into(),
-            shape: vec![Dim::Symbolic("T".into()), Dim::Fixed(hidden)],
+            name: "act.hc_residual_a".into(),
+            shape: vec![
+                Dim::Fixed(c.hc_mult as i64),
+                Dim::Symbolic("T".into()),
+                Dim::Fixed(hidden),
+            ],
             dtype: "bf16".into(),
         }],
         outputs: vec![BlockTensor {
             name: out_name.into(),
-            shape: vec![Dim::Symbolic("T".into()), Dim::Fixed(hidden)],
+            shape: vec![
+                Dim::Fixed(c.hc_mult as i64),
+                Dim::Symbolic("T".into()),
+                Dim::Fixed(hidden),
+            ],
             dtype: "bf16".into(),
         }],
         // Layer 0 carries nothing between calls: pure sliding window, one chunk per run.

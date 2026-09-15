@@ -118,6 +118,7 @@ mod hsa {
         let mut iters = 10u32;
         let mut prog = 0usize;
         let mut exit = String::from("act.hc_residual_a");
+        let mut entry = String::from("act.hc_residual_a");
         while let Some(a) = args.next() {
             match a.as_str() {
                 "--checkpoint" => checkpoint = args.next().map(PathBuf::from),
@@ -125,6 +126,7 @@ mod hsa {
                 "--iters" => iters = args.next().ok_or("--iters needs a value")?.parse()?,
                 "--prog" => prog = args.next().ok_or("--prog needs a value")?.parse()?,
                 "--exit" => exit = args.next().ok_or("--exit needs a value")?,
+                "--entry" => entry = args.next().ok_or("--entry needs a value")?,
                 other => return Err(format!("unknown argument {other}").into()),
             }
         }
@@ -150,24 +152,27 @@ mod hsa {
 
         // The entry's declared size IS the row count: `act.x` is `[T][hidden]` bf16, and the
         // packet's own program width is the T that was compiled.
-        let x_bytes = g
-            .rank(0)
-            .tensor_bytes("act.x")
-            .ok_or("this packet has no `act.x` — is it a block rung?")?
-            as usize;
+        let x_bytes = g.rank(0).tensor_bytes(&entry).ok_or_else(|| {
+            format!("this packet has no `{entry}`; pass --entry with the right name")
+        })? as usize;
         let out_bytes = g
             .rank(0)
             .tensor_bytes(&exit)
             .ok_or_else(|| format!("this packet has no `{exit}`; pass --exit with the right name"))?
             as usize;
-        println!("entry act.x = {x_bytes} B, exit {exit} = {out_bytes} B");
+        println!("entry {entry} = {x_bytes} B, exit {exit} = {out_bytes} B");
 
         // EVERY RANK gets the same entry. The residual stream is replicated under TP — the shard
         // is in the weights — so a rank seeded differently would diverge from its peers at the
         // first reduce and the collective would mix two different sequences.
+        // THE WHOLE ENTRY, every byte of it. On a V4.1 rung the entry is `[hc_mult][T][hidden]` --
+        // the mHC's parallel residual streams -- and filling only the first `[T][hidden]` leaves
+        // `HyperConnPre` mixing three copies of whatever the arena holds. Not hypothetical: it
+        // produced 167104 Inf out of 20971520 on a layer whose real input was bounded by +-0.04,
+        // and it read as a numerics bug in the layer rather than as an unwritten buffer.
         let x = seeded_activation(x_bytes / 2, 1);
         for r in 0..g.n_gpu() {
-            g.rank_mut(r).write_tensor("act.x", &x)?;
+            g.rank_mut(r).write_tensor(&entry, &x)?;
             // Positions 0..T for the rotary tables, and the attended length. A rung has no KV
             // history: it attends over its own rows, so kv_len is the bucket width.
             if let Some(b) = g.rank(r).tensor_bytes("in.pos") {
@@ -177,7 +182,8 @@ mod hsa {
                 g.rank_mut(r).write_tensor("in.pos", &pos)?;
             }
             if g.rank(r).tensor_bytes("in.kvlen").is_some() {
-                let rows = (x_bytes / 2 / 5120) as u32;
+                // Rows, not copies: the entry carries `hc_mult` of them.
+                let rows = (x_bytes / 2 / 5120 / 4) as u32;
                 g.rank_mut(r).write_tensor("in.kvlen", &rows.to_le_bytes())?;
             }
         }
