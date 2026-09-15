@@ -1896,14 +1896,21 @@ impl Builder {
                 let inst = &op.inst;
                 let shape = matches!(inst.i[0], 1024 | 2048 | 4096 | 8192)
                     && matches!((inst.i[1], inst.i[2]), (15_360, 3_840) | (21_504, 5_376));
-                let abi = inst.op == DevOp::GemmGlu as u16
-                    && inst.i[3..5] == [0; 2]
+                let common = inst.i[4] == 0
                     && inst.i[5] == 0
-                    && inst.i[6..] == [0; 2]
                     && inst.f.iter().all(|value| value.to_bits() == 0)
-                    && inst.j == [0; 2]
+                    && inst.j == [0; 2];
+                let bf16 = inst.op == DevOp::GemmGlu as u16
+                    && inst.i[3] == 0
+                    && inst.i[6..] == [0; 2]
                     && inst.t[3..5] == [TENSOR_NONE; 2]
                     && inst.t[6..] == [TENSOR_NONE; 2];
+                let fp8 = inst.op == DevOp::GemmGluFp8 as u16
+                    && inst.i[3] == 0
+                    && inst.i[6..] == [0; 2]
+                    && inst.t[..7].iter().all(|&tensor| tensor != TENSOR_NONE)
+                    && inst.t[7] == TENSOR_NONE;
+                let abi = common && (bf16 || fp8);
                 if shape && abi && op.cus.len() == n_cu {
                     op.isolated = true;
                     native_gemma4_glu = true;
@@ -5219,7 +5226,7 @@ mod xreduce_wave_rs_segment_tests {
 mod gemma4_glu_segment_tests {
     use super::*;
 
-    fn program(l2: bool, rows: u32) -> Program {
+    fn program(l2: bool, rows: u32, fp8: bool) -> Program {
         let mut b = Builder::new(8);
         b.deny_uniseg();
         b.set_native_gemma4_glu_segments(true);
@@ -5232,42 +5239,59 @@ mod gemma4_glu_segment_tests {
         }
         let all = b.all();
         let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
-        let glu = b.emit(DevOp::GemmGlu, all.clone(), &[before], |d| {
-            d.t = [
-                0,
-                1,
-                2,
-                TENSOR_NONE,
-                TENSOR_NONE,
-                3,
-                TENSOR_NONE,
-                TENSOR_NONE,
-            ];
-            d.i = [rows, 15_360, 3_840, 0, 0, 0, 0, 0];
-        });
+        let glu = b.emit(
+            if fp8 {
+                DevOp::GemmGluFp8
+            } else {
+                DevOp::GemmGlu
+            },
+            all.clone(),
+            &[before],
+            |d| {
+                if fp8 {
+                    d.t = [0, 1, 2, 3, 4, 5, 6, TENSOR_NONE];
+                } else {
+                    d.t = [
+                        0,
+                        1,
+                        2,
+                        TENSOR_NONE,
+                        TENSOR_NONE,
+                        3,
+                        TENSOR_NONE,
+                        TENSOR_NONE,
+                    ];
+                }
+                d.i = [rows, 15_360, 3_840, 0, 0, 0, 0, 0];
+            },
+        );
         b.emit(DevOp::Nop, all, &[glu], |_| {});
         b.finish()
     }
 
     #[test]
     fn exact_gfx942_glu_is_a_counter_free_raw_segment() {
-        for rows in [1024, 2048, 4096, 8192] {
-            let p = program(false, rows);
-            let segment = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
-            assert!(p
-                .stream
-                .iter()
-                .filter(|e| e.seg == segment)
-                .all(|e| e.inst == 1 && e.wait_len == 0 && e.succ_len == 0));
-            assert!(p.insts.iter().all(|d| d.wait_len == 0 && d.succ_len == 0));
+        for fp8 in [false, true] {
+            for rows in [1024, 2048, 4096, 8192] {
+                let p = program(false, rows, fp8);
+                let segment = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
+                assert!(p
+                    .stream
+                    .iter()
+                    .filter(|e| e.seg == segment)
+                    .all(|e| e.inst == 1 && e.wait_len == 0 && e.succ_len == 0));
+                assert!(p.insts.iter().all(|d| d.wait_len == 0 && d.succ_len == 0));
+            }
         }
     }
 
     #[test]
     fn l2_placement_keeps_the_interpreter_counter_protocol() {
-        let p = program(true, 1024);
-        assert_ne!(p.insts[1].wait_len, 0);
-        assert_ne!(p.insts[1].succ_len, 0);
+        for fp8 in [false, true] {
+            let p = program(true, 1024, fp8);
+            assert_ne!(p.insts[1].wait_len, 0);
+            assert_ne!(p.insts[1].succ_len, 0);
+        }
     }
 }
 

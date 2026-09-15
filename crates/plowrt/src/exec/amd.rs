@@ -6721,6 +6721,10 @@ impl AmdEngine {
             && blob
                 .prefill_phase()
                 .any(amd_gemma4_glu::program_candidate);
+        let wants_gemma4_glu_fp8 = arch == "gfx942"
+            && blob
+                .prefill_phase()
+                .any(amd_gemma4_glu::program_fp8_candidate);
         // Weights and scale grids the route binds in its own layout (shuffled, doubled).
         let gemm_blk_bound = if use_gemm_blk {
             amd_gemm_blk::bound_weights(&blob.progs)?
@@ -8594,7 +8598,13 @@ impl AmdEngine {
             None
         };
         let gemma4_glu = if wants_gemma4_glu {
-            amd_gemma4_glu::Gemma4Glu::load(&be, &hsaco_dir, blob.n_cu, &mut modules)?
+            amd_gemma4_glu::Gemma4Glu::load(
+                &be,
+                &hsaco_dir,
+                blob.n_cu,
+                wants_gemma4_glu_fp8,
+                &mut modules,
+            )?
         } else {
             None
         };
@@ -9426,7 +9436,7 @@ impl AmdEngine {
                             program = prog_ix,
                             rows = p.t,
                             segments = route_count,
-                            "native Gemma-4 BF16 GemmGlu route enabled"
+                            "native Gemma-4 GemmGlu route enabled"
                         );
                     }
                     for (seg, route) in gemma4_glu_routes.into_iter().enumerate() {

@@ -752,9 +752,9 @@
    "defines": {
     "PLOW_ARCH_SUFFIX": "gfx942"
    },
-   "vgpr": 234,
+   "vgpr": 252,
    "agpr": 0,
-   "lds": 64512,
+   "lds": 57344,
    "occ": 2,
    "meta_spill": 0,
    "isa_spill": 0,

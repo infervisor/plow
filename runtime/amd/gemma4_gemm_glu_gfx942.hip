@@ -9,6 +9,8 @@ extern "C" __device__ unsigned plow_gemma4_glu_nospill_1 = 1;
 extern "C" __device__ unsigned plow_gemma4_glu_c2_128x256x64_1 = 1;
 extern "C" __device__ unsigned plow_gemma4_glu_c5_192x256x64_1 = 1;
 extern "C" __device__ unsigned plow_gemma4_glu_c5_exact_shape_1 = 1;
+extern "C" __device__ unsigned plow_gemma4_glu_fp8_128x256x128_1 = 1;
+extern "C" __device__ unsigned plow_gemma4_glu_fp8_192x256x128_1 = 1;
 
 extern "C" __global__ __attribute__((flatten))
 __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void plow_gemma4_gemm_glu_c2_gfx942(
@@ -34,3 +36,20 @@ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void plow_gemma4_gemm_glu_c2_gfx
 
 GEMMA4_GLU_ENTRY(plow_gemma4_12b_gemm_glu_c5_gfx942, 192, 256, 64, 15360, 3840)
 GEMMA4_GLU_ENTRY(plow_gemma4_31b_gemm_glu_c5_gfx942, 192, 256, 64, 21504, 5376)
+
+#define GEMMA4_GLU_FP8_ENTRY(NAME, BM, N, K)                                      \
+    extern "C" __global__ __attribute__((flatten))                               \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                    \
+        bf16* C, const unsigned char* A, const unsigned char* Bg,                  \
+        const unsigned char* Bu, const float* ascale, const float* gscale,         \
+        const float* uscale, unsigned M, unsigned, unsigned, unsigned act) {       \
+        __shared__ unsigned char lds[(BM + 256) * 128];                            \
+        d_gemm_fp8_t<BM, 256, 128, GM_WM, GM_WN, true, true>(                     \
+            C, A, Bg, ascale, gscale, M, N, K, blockIdx.x, gridDim.x,             \
+            (bf16*)lds, Bu, uscale, act);                                          \
+    }
+
+GEMMA4_GLU_FP8_ENTRY(plow_gemma4_12b_gemm_glu_fp8_c2_gfx942, 128, 15360, 3840)
+GEMMA4_GLU_FP8_ENTRY(plow_gemma4_12b_gemm_glu_fp8_c5_gfx942, 192, 15360, 3840)
+GEMMA4_GLU_FP8_ENTRY(plow_gemma4_31b_gemm_glu_fp8_c2_gfx942, 128, 21504, 5376)
+GEMMA4_GLU_FP8_ENTRY(plow_gemma4_31b_gemm_glu_fp8_c5_gfx942, 192, 21504, 5376)
