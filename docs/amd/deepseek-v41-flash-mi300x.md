@@ -3945,3 +3945,51 @@ EMIT change, not a kernel one — and the MoE needs the grouped GEMM at MFMA eff
 §12.25 already scoped.
 
 Layer 2 at the committed defaults: **16,138 us**, from 20,458.
+
+### 12.41 The hyper-connection streams walked `hidden` two bytes at a time
+
+Both mHC ops step `hidden` one bf16 per lane per iteration: the pre op's layer-input sum is four
+2-byte loads and one 2-byte store per element, the post op's n x n combine is five and four. Nine
+of every ten instructions in those loops is a 2-byte memory op where a 16-byte one carries the
+same bytes. `hidden` is a multiple of 8 everywhere these run, so the ragged remainder keeps the
+scalar loop.
+
+    layer 2, T=8192, TP8, median of 5, same run:
+
+      HYPER_CONN_PRE    654 -> 580 us   -11.3%
+      HYPER_CONN_POST   646 -> 537 us   -16.9%
+
+-183 us on the pair. Bit-identical — the same products accumulated in the same `i` order through
+the same `fmaf`, one `f2bf` per output — and the exits agree to the last printed digit.
+
+Much smaller than §12.38's 77% on the same kind of fix, and the reason is worth keeping: these two
+were never latency-starved the way `FLASH_MERGE` was. `FLASH_MERGE` had ten bytes of traffic per
+thread per work item; these have `4 * hidden` bytes per token and already ran a wave per token, so
+widening the load only removes issue slots. **The load-width fix pays in proportion to how little
+the loop had to do between loads.**
+
+### 12.42 Token-packing cannot rescue the head-packed gathered flash either
+
+§12.30 measured that the head-packed MFMA body loses at TP8 because `n_head` = 8 fills 8 of 32
+MFMA M-rows. The obvious escape is to pack four QUERY TOKENS alongside the eight heads to fill the
+tile, attending over the union of their four selections. §12.31's dump answers whether that pays
+without building it:
+
+    query tile       2      3      4      6      8     12     16
+    mean |union|   782   1005   1177   1419   1582   1773   1877
+    work vs ideal  1.63x  2.09x  2.45x  2.96x  3.30x  3.69x  3.91x
+
+Four tokens cost **2.45x the arithmetic** to gain 4x the M occupancy — a net 1.63x on the matrix
+work. Carry that through §12.30's measured decomposition (staging 2933, QK 1700, PV ~0, remainder
+~3050 us): the item count falls 4x but each item walks `1177/32` = 37 KV tiles instead of 16, so
+staging becomes 2933 x 0.57 = 1672, the scaffolding 3050 x 0.58 = 1770, the QK 1700 x 0.58 = 986.
+**About 4.4 ms, against the scalar arm's 2.96.** Two tokens is worse still (1.63x work for 2x
+occupancy).
+
+So the gathered attention cannot be fixed by any kernel change at TP8 — proven now by two
+independent measurements, a ceiling instrument and a selection-table audit. What fixes it is
+filling the M dimension with heads, which means each rank holding all 64 of them and sharding the
+QUERY TOKENS instead: an emit and collective change (replicated q/o weights, an all-gather over
+tokens in place of an all-reduce over heads), not a kernel one.
+
+Layer 2 at the committed defaults: **15,948 us**, from 20,458 at the start of §12.29 — **-22.0%**.

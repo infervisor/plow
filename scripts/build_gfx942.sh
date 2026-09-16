@@ -1408,6 +1408,10 @@ AX_GLUE=""
 [ "${PLOW_COMBINE_VEC:-1}" = 0 ] || AX_GLUE="$AX_GLUE -DPLOW_COMBINE_VEC=${PLOW_COMBINE_VEC:-1}"
 case "${PLOW_RN_ROWS:-2}" in 0|1) ;; *) AX_GLUE="$AX_GLUE -DPLOW_RN_ROWS=${PLOW_RN_ROWS:-2}" ;; esac
 case "${PLOW_RESID_U:-4}" in 0|1) ;; *) AX_GLUE="$AX_GLUE -DPLOW_RESID_U=${PLOW_RESID_U:-4}" ;; esac
+# PLOW_HC_VEC8=0: restore the hyper-connection ops' per-element scalar loops (the A/B control).
+if [ -n "${PLOW_HC_VEC8:-}" ]; then
+  AX_GLUE="$AX_GLUE -DPLOW_HC_VEC8=${PLOW_HC_VEC8}"
+fi
 AX_PREFILL="$AX_PREFILL$AX_GLUE"
 AX_FLASH="$AX_FLASH$AX_GLUE"
 

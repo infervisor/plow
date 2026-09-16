@@ -48,6 +48,18 @@
 #define PLOW_HC_WAVE_TOKEN 1
 #endif
 
+/* EIGHT ELEMENTS PER LANE in both hyper-connection streams. Both ops walk `hidden` one bf16 at a
+ * time -- the pre op's layer-input sum is four 2-byte loads and one 2-byte store per element, the
+ * post op's combine is five and four -- so nine of every ten instructions in the loop are a
+ * 2-byte memory op where a 16-byte one carries the same bytes. `hidden` is a multiple of 8 on
+ * every shape these ops serve, and the ragged remainder keeps the scalar loop.
+ *
+ * BIT-IDENTICAL: the same products accumulated in the same i order through the same fmaf, the
+ * same single f2bf per output. Only the load WIDTH changes. 0 restores the scalar loops. */
+#ifndef PLOW_HC_VEC8
+#define PLOW_HC_VEC8 1
+#endif
+
 /* PLOW_HC_SINKHORN_RCP — the Sinkhorn normalize's divisor is loop-invariant across the row
  * (or column) it normalizes, but an IEEE `f32` divide is NOT strength-reducible to a
  * reciprocal-and-multiply by the compiler, so the shipped body issues one full `v_div_*`
@@ -297,11 +309,34 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
                            ? (j == 0 ? 1.0f : 0.0f)
                            : pre_pair[(size_t)pre_in_half * T * 4u + (size_t)t * 4u + j];
             }
-            for (unsigned d = ln; d < hidden; d += PLOW_WAVE) {
+            bf16* const lrow = layer_input + (size_t)t * hidden;
+            unsigned d = 0;
+#if PLOW_HC_VEC8
+            const unsigned h8 = hidden & ~7u;
+            for (d = ln * 8u; d < h8; d += PLOW_WAVE * 8u) {
+                bf16v8 rv[4];
+#pragma unroll
+                for (unsigned i = 0; i < 4u; i++) rv[i] = ld_glob8(rrow + (size_t)i * hidden + d);
+                bf16v8 o;
+#pragma unroll
+                for (unsigned u = 0; u < 8u; u++) {
+                    float acc = 0.0f;
+#pragma unroll
+                    for (unsigned i = 0; i < 4u; i++)
+                        acc = __builtin_fmaf(g[i], bf2f(rv[i][u]), acc);
+                    o[u] = f2bf(acc);
+                }
+                st_glob8(lrow + d, o);
+            }
+            d = h8 + ln;
+#else
+            d = ln;
+#endif
+            for (; d < hidden; d += PLOW_WAVE) {
                 float acc = 0.0f;
                 for (unsigned i = 0; i < 4u; i++)
                     acc = __builtin_fmaf(g[i], bf2f(rrow[(size_t)i * hidden + d]), acc);
-                layer_input[(size_t)t * hidden + d] = f2bf(acc);
+                lrow[d] = f2bf(acc);
             }
         }
         return;
@@ -489,7 +524,38 @@ __device__ void d_hyperconn_post(bf16* __restrict__ new_residual, const bf16* __
          * BIT-IDENTICAL: the same products accumulated in the same i order. */
         if (n == 4u && T >= nblk) {
             constexpr unsigned NC = 4u;
-            for (unsigned d = threadIdx.x; d < hidden; d += PLOW_THREADS) {
+            unsigned d = 0;
+#if PLOW_HC_VEC8
+            const unsigned h8 = hidden & ~7u;
+            for (d = threadIdx.x * 8u; d < h8; d += PLOW_THREADS * 8u) {
+                const bf16v8 xv8 = ld_glob8(xrow + d);
+                bf16v8 rv8[NC];
+#pragma unroll
+                for (unsigned i = 0; i < NC; i++) rv8[i] = ld_glob8(rrow + (size_t)i * hidden + d);
+                bf16v8 ov[NC];
+#pragma unroll
+                for (unsigned u = 0; u < 8u; u++) {
+                    const float xv = bf2f(xv8[u]);
+                    float rv[NC];
+#pragma unroll
+                    for (unsigned i = 0; i < NC; i++) rv[i] = bf2f(rv8[i][u]);
+#pragma unroll
+                    for (unsigned j = 0; j < NC; j++) {
+                        float acc = 0.0f;
+#pragma unroll
+                        for (unsigned i = 0; i < NC; i++) acc += cm[i * NC + j] * rv[i];
+                        acc += pm[j] * xv;
+                        ov[j][u] = f2bf(acc);
+                    }
+                }
+#pragma unroll
+                for (unsigned j = 0; j < NC; j++) st_glob8(orow + (size_t)j * hidden + d, ov[j]);
+            }
+            d = h8 + threadIdx.x;
+#else
+            d = threadIdx.x;
+#endif
+            for (; d < hidden; d += PLOW_THREADS) {
                 const float xv = bf2f(xrow[d]);
                 float rv[NC];
                 for (unsigned i = 0; i < NC; i++) rv[i] = bf2f(rrow[(size_t)i * hidden + d]);
