@@ -3181,6 +3181,70 @@ work each pass over B amortises, and op 184's B is the whole weight — so the f
 was a 24% slower kernel. A tail is worth closing only when the work that hides it is free, and
 here it is the work.
 
+### 12.25 The MoE GEMMs do almost no GEMM, and two of the three ranked levers are dead
+
+§12.18 ranked the remaining work by op cost. `MOE_GROUP_DOWN_PF` (112.9 ms) and
+`MOE_GROUP_GLU_PF` (74.7 ms) are 23% of the run between them, and the ranked fixes were (2)
+vectorize the DOWN epilogue, whose own note records `global_store_short`, one element per store,
+and (3) `PLOW_MOE_PF_A8`, fp8 A rows to halve LDS traffic and double the MFMA rate.
+
+Both were ranked from a disassembly reading. Neither survives a measurement.
+
+#### Instrument 1: cap the k-loop (`PLOW_MOE_PF_ABL=1`, already in the tree)
+
+`NT = NT_full > 1 ? 1 : NT_full` computes a 1/NT slice of each dot product — wrong output, but
+every fixed cost (staging, routing, gather/scatter, epilogue, collectives) is still paid. At
+V4.1's shape DOWN runs NT=5 k-tiles (K = moe_inter/TP = 288, MPF_BK=64) and GLU runs NT=80
+(K = 5120). So this removes **80% of DOWN's and 98.75% of GLU's MFMA work**:
+
+| op | full | k-loop capped at 1 tile | delta |
+|---|---|---|---|
+| `MOE_GROUP_DOWN_PF` | 112,875 us | 112,604 us | **-0.24%** |
+| `MOE_GROUP_GLU_PF` | 74,745 us | 73,128 us | -2.2% |
+| whole model | 827.2 ms | 826.2 ms | -1.0 ms |
+
+Deleting 98.75% of an op's multiply-accumulate makes it 2.2% faster. **The grouped MoE GEMMs are
+not FLOP-bound, not weight-bandwidth-bound, and not k-loop-bound at all** — capping NT also cuts
+the weight stream 5x on DOWN and 80x on GLU, and that moves nothing either. Lever (3) is dead on
+arrival: fp8 A rows double a matrix rate that is already free.
+
+(The ablation is confirmed to engage: the object is 505 instructions smaller.)
+
+#### Instrument 2: cap the store (`PLOW_MOE_PF_EPIABL=1`, added here)
+
+Lever (2) said the cost was the store SHAPE — one `global_store` per output element, because a
+lane's 16 accumulator elements are 16 different ROWS at one column, so consecutive elements are
+`N` apart. The fix would be an LDS transpose so a lane writes contiguous `N`. Before building
+that, the same ablation asks the same question: issue **1 of every 16** stores, keeping the MFMA,
+the row metadata, the gate multiply and the address arithmetic.
+
+| op | full | 1/16 of the stores | delta |
+|---|---|---|---|
+| `MOE_GROUP_DOWN_PF` | 112,875 us | 116,463 us | **+3.2%** |
+
+Removing 94% of the stores makes the op *slower*. Lever (2) is dead too. This is consistent with
+the one prior datum: the `part16` arm halved the same stream's bytes and measured ~0%, and its
+note blamed the shape. The shape is not it either — **the scatter, in bytes and in instruction
+count, is not what op 86 is spending its time on.**
+
+#### What this leaves
+
+Of §12.18's ranked list, (1) op 184's tile is done and paid (§12.24), and (2) and (3) are now
+falsified by measurement rather than deferred. The 187.6 ms in the two MoE ops is in neither the
+math, nor the weight stream, nor the output stream. It is in what is left: the per-tile staging
+and barriers, the A-gather indirection, and the routing/alignment metadata — the fixed cost of
+**27,648 output tiles per layer per rank**. That is a different kind of fix from every one
+attempted in this campaign: not a wider load, but fewer, larger tiles. It is also the reading most
+consistent with §12.23, where the DET fusion's f64 atomic cost 893 us/layer against GLM's 44.8 —
+V4.1's MoE is dominated by per-tile and per-row overheads that scale with its 384 experts and
+top-6, not by anything that scales with FLOPs or bytes.
+
+**The method is the transferable part.** Three of this campaign's wins came from reading
+disassembly and finding narrow issue (§12.19, §12.20, §12.17's op 185). The same reading of op 86
+produced two confident, specific, wrong predictions. A ceiling instrument that deletes the
+suspected work and re-measures costs one build and one run, and it is the only thing that
+separates "this code looks expensive" from "this code is expensive".
+
 ### 12.2 What is still not demonstrated
 
   * ~~ONE layer, not 40.~~ **Superseded by §12.18**: all 40 layers emit and run as

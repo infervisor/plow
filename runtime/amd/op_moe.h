@@ -2149,6 +2149,19 @@ __device__ __forceinline__ double mpf_det_q(float v) {
 #ifndef PLOW_MOE_PF_ABL
 #define PLOW_MOE_PF_ABL 0
 #endif
+/* CEILING INSTRUMENT ONLY (-DPLOW_MOE_PF_EPIABL=1): issue 1 of every 16 DOWN scatter stores.
+ * WRONG OUTPUT by construction, never a serve asset. The twin of PLOW_MOE_PF_ABL: that one asks
+ * what the k-loop costs, this one asks what the per-ELEMENT store shape costs. Everything else --
+ * the MFMA, the row metadata, the gate multiply, the address arithmetic -- is still paid, so
+ * ablated minus full is the store issue rate's own share and nothing else's. */
+#ifndef PLOW_MOE_PF_EPIABL
+#define PLOW_MOE_PF_EPIABL 0
+#endif
+#if PLOW_MOE_PF_EPIABL
+#define MPF_EPIABL_KEEP(el_) if ((el_) & 15) continue;
+#else
+#define MPF_EPIABL_KEEP(el_)
+#endif
 
 #ifndef PLOW_MOE_PF_EPI
 #define PLOW_MOE_PF_EPI 0
@@ -3478,6 +3491,7 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
                         const unsigned rr =
                             wm * (MPF_BM / MPF_WM) + i * MFMA_M + mfma_acc_m(lane, el);
                         MPF_ROWMETA(rr, pidx, gv);
+                        MPF_EPIABL_KEEP(el)
                         __builtin_nontemporal_store(
                             f2bf(gv * accf[i][j][el]),
                             (PLOW_GLOB bf16*)&part[(size_t)pidx * N + nn]);
@@ -3500,6 +3514,7 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
                          * combine, after a full 304-CU round — at T=2048 it is ~400 MB per
                          * rank, far past L2, so caching these lines only evicts the weight
                          * stream this kernel is bound on. Same value, same address. */
+                        MPF_EPIABL_KEEP(el)
                         __builtin_nontemporal_store(
                             gv * accf[i][j][el],
                             (PLOW_GLOB float*)&part[(size_t)pidx * N + nn]);

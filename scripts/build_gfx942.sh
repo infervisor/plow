@@ -1010,6 +1010,11 @@ fi
 if [ "${PLOW_MOE_PF_ABL:-0}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_ABL=${PLOW_MOE_PF_ABL}"
 fi
+# CEILING INSTRUMENT ONLY (PLOW_MOE_PF_EPIABL=1): the DOWN scatter issuing 1 of every 16 stores.
+# WRONG OUTPUT by construction, never a serve asset. See op_moe.h.
+if [ "${PLOW_MOE_PF_EPIABL:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_EPIABL=${PLOW_MOE_PF_EPIABL}"
+fi
 
 # MPF_BM A/B escape hatch for the PREFILL objects (the decode row has carried its MPF_BK twin
 # since the OCC4 recut). The grouped MoE prefill GEMM is the term that binds once attention is
