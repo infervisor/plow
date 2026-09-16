@@ -3911,3 +3911,37 @@ Bit-identical — the same values in the same order through the same `fmaxf` fol
 `cmp_quant_rt` — and the exits agree to the last printed digit.
 
 Layer 2 at the committed defaults: **16,138 us**, from 20,458 at the start of §12.29.
+
+### 12.40 End to end after §12.37-§12.39: 620 ms
+
+All 40 layers, 8k, TP8, `all40.pkt` against objects rebuilt from this tree at the committed
+defaults, after the FLASH_MERGE widening and the compressor's cached rope:
+
+    run 3   min 617.1   median 620.2   max 634.3 ms
+    run 4   min 616.6   median 635.7   max 802.5 ms
+
+**620 ms**, from 645 at §12.36 and **755 at the start of §12.29 — -18%.** The `min` is the stable
+statistic (617.1 / 616.6); the median and max spread with machine contention, so the two runs
+bracket 620-636 rather than agreeing on a point.
+
+**90 ms is not met. 620 ms is 6.9x.**
+
+The session's ten shipped changes came to 4.3 ms of a 20.5 ms layer, and the pattern is worth
+stating because it is what the next campaign should start from. Six were a faster body the tree
+already had, excluded by a gate that was not structural — `!ons` on the dense prefill arm,
+`k == 1` on the 8-wide MoE combine, a serial 256-bin walk where a wave scan works, a span-fastest
+work order that a `4 | 304` coincidence turned into a per-workgroup bias, a workgroup-per-item
+merge asking 512 threads for one float each, and a compressor roping every channel twice. None
+needed a new kernel. Three more were falsified by building them, including a traffic cut that was
+right on paper and 6x slower on the machine (§12.37).
+
+What is left does need new kernels. `FLASH_GATHER_PREFILL` is 2.96 ms against 53 us of bf16 MFMA
+peak, and §12.30 measured that the one matrix body in the tree cannot beat its scalar arm at TP8
+(`n_head` = 8 fills 8 of 32 M-rows; `DK` = 512 caps the KV tile at 32; the softmax scaffolding is
+then paid sixteen times per query). The MoE pair is 2.24 ms against ~389 us at fp8 peak. Those two
+are 5.2 ms of a 16.1 ms layer and both are architectural: the gathered attention needs a
+decomposition that fills the M dimension — which at TP8 means sharding the heads differently, an
+EMIT change, not a kernel one — and the MoE needs the grouped GEMM at MFMA efficiency, which
+§12.25 already scoped.
+
+Layer 2 at the committed defaults: **16,138 us**, from 20,458.
