@@ -4700,3 +4700,20 @@ decision and not one to take unasked. Even at a 4x speedup on those ops it is ~1
 ms over 40 layers: 608 -> ~536 ms.
 
 **The target is unchanged by any of this. 90 ms is 0.99x the roofline floor (12.56).**
+
+### 12.58a Correction: the stores were still narrow, and they were worth 10x the tables
+
+12.58 read the table lane's -2.7% as "the remaining 34x is LATENCY under the occupancy wall, not
+width". That was wrong. The compressor's OUTPUT was still 16 scalar 2-byte stores over 32
+CONTIGUOUS bytes, under the same alignment the vector lane already guarantees. Widening it:
+
+    parent (reads wide, store scalar)   545.0 / 544.8 us    layer 15237.9 / 14947.2
+    store 16 B wide                     401.6 / 394.3 us    layer 14872.1 / 14928.9   -27%
+
+Bit-identical, exits -1.36719 / 3.64062 on every run of both arms. No new knob -- `PLOW_CMP_VEC8`
+already gates the lane, and the parent object is the control.
+
+Across the three load/store-width commits the op is **666.7 -> 398.0 us, -40%**, ~-150 us/layer.
+
+What 12.58 says about OCCUPANCY is unaffected and stands: Qsm alone is 37,376 B against the
+32,768 B a second workgroup would need, so occupancy 2 is a property of DK=512 on a 64 KiB part.

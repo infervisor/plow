@@ -465,8 +465,17 @@ __device__ void d_compress_rope_quant(bf16* __restrict__ out, const bf16* __rest
             }
             float inv_s;
             const float s = cmp_block_scale(amax, qmode, &inv_s);
-            for (unsigned i = 0; i < qblk; i++)
-                orow[c0 + i] = f2bf(cmp_quant_rt(v[i], s, inv_s, qmode));
+            /* ...and the OUTPUT was 16 scalar 2-byte stores over 32 CONTIGUOUS bytes. The guard
+             * that made the reads 16 B wide makes the writes so: `qblk % 8 == 0` and `d` a
+             * multiple of 8 keep `orow + c0 + i0` 16-byte aligned. PLOW_GATE_SC1 is 0, so
+             * `st_glob8` emits the same plain store the scalar loop did. */
+            for (unsigned i0 = 0; i0 < qblk; i0 += 8u) {
+                bf16v8 o;
+#pragma unroll
+                for (unsigned j = 0; j < 8u; j++)
+                    o[j] = f2bf(cmp_quant_rt(v[i0 + j], s, inv_s, qmode));
+                st_glob8(orow + c0 + i0, o);
+            }
             continue;
         }
         if (qblk <= QMAX) {
