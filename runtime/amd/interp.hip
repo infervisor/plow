@@ -4937,9 +4937,18 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             unsigned ep_lo = 0u, ep_hi = ~0u;
             const unsigned deg = in->i[5];
             if (deg > 1u && prog_meta && prog_meta->n_gpu == deg) {
-                const unsigned r = prog_meta->rank, q = in->i[1] / deg, rem = in->i[1] % deg;
-                ep_lo = r * q + (r < rem ? r : rem);
-                ep_hi = ep_lo + q + (r < rem ? 1u : 0u);
+                if (in->i[7] > in->i[6]) {
+                    /* The host PATCHED this rank's window in (PLOW_MOE_EP_CUTS). The instruction
+                     * stream is uploaded per rank, so these two fields are this rank's and
+                     * nobody else's -- which is the only way a calibrated, UNEVEN split can
+                     * reach the device, since the even split below is all `rank` can derive. */
+                    ep_lo = in->i[6];
+                    ep_hi = in->i[7];
+                } else {
+                    const unsigned r = prog_meta->rank, q = in->i[1] / deg, rem = in->i[1] % deg;
+                    ep_lo = r * q + (r < rem ? r : rem);
+                    ep_hi = ep_lo + q + (r < rem ? 1u : 0u);
+                }
             }
             d_moe_align_pf((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
                            (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2], slice,

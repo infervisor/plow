@@ -4972,10 +4972,27 @@ the pair and the collective are ONE block and only their sum is meaningful:
 That is the EP win: about 95 us of the block, and 100-180 us of the layer -- 4 to 7 ms over 40
 layers. Not the 570 us/layer rank 0's pair column reads as.
 
-The earlier conclusion that `PLOW_MOE_EP_CUTS` "buys nothing" was drawn from rank 0 as well. It
-should be read as UNTESTED rather than disproven: what balancing would have to shrink is the
-301..756 spread above, and nobody has measured that. (The knob is currently refused without the
-gfx950 specialist align, so re-testing it needs the cut points pushed device-side first.)
+### Balancing, re-tested on all eight ranks: still nothing, and slightly worse
+
+`PLOW_MOE_EP_CUTS` now reaches the device. The align takes its window from `i[6]`/`i[7]` when the
+host patched them, which works because the instruction stream is uploaded PER RANK, so those two
+fields are one rank's alone -- the only way an uneven split can reach a kernel that can otherwise
+derive nothing but the even one from its rank.
+
+    arm        moe per rank                                 max   spread   moe+XR avg   layer
+    ep-even    298 615 642 683 700 722 746 375               746   2.50x      2210 us   13928 us
+    ep-bal     283 620 646 686 326 700 1093 381             1093   3.86x      2314 us   13925 us
+
+The spread got WORSE, 2.50x -> 3.86x, and the block cost 104 us more. The layer did not move.
+
+So the conclusion stands, and now on the right statistic. It also shows plainly WHY: per-rank MoE
+time is not a function of tile count. Balancing moved rank 4 from 700 to 326 us and rank 6 from 746
+to 1093 us while moving both of their tile counts TOWARDS equality. Whatever orders these ranks, it
+is not the quantity the cut points equalise, and a calibrated split is not the lever for it.
+
+`moe + XREDUCE2` stays ~2210-2314 us either way, which is the same observation from the other side:
+the MoE op's measured body absorbs each rank's wait for what gates it, so only the block sum is
+meaningful and the block is not moved by placement.
 
 ### It was never a hardware gap
 

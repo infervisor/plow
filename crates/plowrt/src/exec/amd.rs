@@ -2099,6 +2099,38 @@ fn has_moe_combine_segment(prog: &DevProg) -> bool {
         .any(|set| set.len() == 1 && moe_combine_inst(&prog.insts[*set.first().unwrap()]))
 }
 
+/// This rank's copy of `insts`, with each EP align op carrying its own expert window.
+///
+/// Only needed for a CALIBRATED split: the device can derive the even split itself from the
+/// program uniform's rank, but not an uneven one, and `PLOW_MOE_EP_CUTS` is a host-side table.
+/// The instruction stream is uploaded per rank, so `i[6]`/`i[7]` here are this rank's alone.
+/// They are otherwise unread on this opcode -- the align takes T, n_exp, k, phase, npart and the
+/// degree in `i[0..=5]`.
+///
+/// Returns None when nothing needs patching, so the ordinary path uploads the blob's own slice.
+fn ep_align_window_patch(
+    prog: &DevProg,
+    tp: Option<(u32, u32)>,
+) -> Result<Option<Vec<DevInst64>>> {
+    if crate::config::RuntimeConfig::get().amd.moe_ep_cuts.is_none() {
+        return Ok(None);
+    }
+    let Some((rank, n_gpu)) = tp else {
+        return Ok(None);
+    };
+    let mut out: Option<Vec<DevInst64>> = None;
+    for (i, d) in prog.insts.iter().enumerate() {
+        if d.op != DevOp::MoeAlignPf as u16 || moe_ep_degree(d) != Some(n_gpu) {
+            continue;
+        }
+        let range = ep_expert_range(d.i[1], n_gpu, rank)?;
+        let v = out.get_or_insert_with(|| prog.insts.clone());
+        v[i].i[6] = range.start;
+        v[i].i[7] = range.end;
+    }
+    Ok(out)
+}
+
 fn has_moe_prefill_ep(prog: &DevProg) -> bool {
     prog.insts.iter().any(|d| moe_ep_degree(d).is_some())
 }
@@ -6734,20 +6766,7 @@ impl AmdEngine {
                     "replicated-input MoE EP with lean stage-1 MXFP4 segments requires gfx950 specialist objects, but this device is {arch}"
                 )));
             }
-            // PLOW_MOE_EP_CUTS is a HOST-side table. Without the specialist chain the align runs
-            // in the interpreter, which derives its expert window on-device from the program
-            // uniform's rank and can only reproduce the even split -- so honouring the cuts when
-            // binding weights while the device filtered on the even split would hand a rank rows
-            // for experts it does not hold. Refuse instead of returning a slightly wrong answer.
-            if arch != "gfx950"
-                && crate::config::RuntimeConfig::get().amd.moe_ep_cuts.is_some()
-            {
-                return Err(RuntimeError::Device(
-                    "PLOW_MOE_EP_CUTS needs the gfx950 specialist align; the interpreter align \
-                     derives the even split on-device and the two would disagree"
-                        .into(),
-                ));
-            }
+
             let bind = tp.ok_or_else(|| {
                 RuntimeError::Device(
                     "replicated-input MoE EP packet requires a tensor-parallel binding".into(),
@@ -9719,8 +9738,10 @@ impl AmdEngine {
                 *device_args = mem.base;
                 xreduce_attnres_args.push(mem);
             }
-            let d_inst = up(as_bytes(&p.insts))?;
-            let xaudit_insts = xaudit_insts(&p.insts);
+            let ep_patched = ep_align_window_patch(p, tp.map(|b| (b.rank, b.n_gpu)))?;
+            let insts = ep_patched.as_deref().unwrap_or(&p.insts);
+            let d_inst = up(as_bytes(insts))?;
+            let xaudit_insts = xaudit_insts(insts);
             let d_xaudit_inst = up(as_bytes(&xaudit_insts))?;
             let d_stream = up(as_bytes(&p.stream))?;
             let d_sofs = up(as_bytes(&p.stream_ofs))?;
