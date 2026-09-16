@@ -4209,3 +4209,48 @@ where 304 CUs are handed 320 tiles and most of the second round is idle. `glm_gl
 disjoint-CU-set mechanism already in the tree -- is the obvious tool, but the only independent
 pair here is (wq_a, wkv) at 604 and 197 us, and splitting 304 CUs between them costs more than the
 197 it could hide. Left alone, with the arithmetic recorded.
+
+### 12.48 Unrelated, found while trying to build a fallback: a FULL build of this tree fails
+
+Not V4.1's, not fixed here, and recorded because the campaign's own habits hide it. Every build in
+this campaign uses `PLOW_ROWS_ONLY`, so four rows have gone unbuilt for the whole of it:
+
+    FAIL  interp_mixed     d_flash_merge has no arm for head_dim [128, 256, 64]
+    FAIL  interp_mixed_gq          -- on AMD a missing arm does not trap, the dispatch
+    FAIL  interp_tokbatch             falls through and WRITES NOTHING
+    FAIL  interp_tokbatch_gq
+
+**It is pre-existing, not this session's.** Built with `PLOW_FMERGE_VEC=0` -- backing out the
+`d_flash_merge` vector arm added in §12.39 -- the four failures are byte-identical, so the new arm
+is not the cause. The dispatch audit is doing its job; the gap is real and the audit is the only
+reason it is visible rather than a silent zero-write.
+
+The practical consequence for this campaign: a packet emitted at a NEW layer count cannot get a
+matching object set, because the object stamps `PLOW_PACKET_HASH` from its config and the `cp -n`
+back-fill the single-block flow uses only works when the donor objects were built against the SAME
+config. That is what blocked the 20-layer fallback below.
+
+### 12.49 The end-to-end number for §12.46 could not be taken: the box stopped being measurable
+
+A co-tenant took the host partway through this round -- three KFD contexts in
+`/sys/class/kfd/kfd/proc` with no `/proc` entry, i.e. other containers. The progression, in order:
+
+  * the 40-layer run (~135 GB/GPU) OOMs on every one of eight retries over ~25 minutes, latterly
+    failing at allocations as small as 16 MB;
+  * the single block (13 GB) still LOADS, in 8.2 s;
+  * but it then fails with `cross-GPU gate 1 on rank 0 reads 1824, expected 2432. Some rank never
+    arrived -- a collective hit its deadline and returned WITHOUT reducing.`
+
+That last one is the mechanism behind the wrong exits in §12.46's caveat, caught in the act: the
+co-tenant starves a rank of CU time, the collective times out, and the run completes with a token
+that is not the sum of the ranks' partials. **A run that completes is therefore not evidence that
+it completed correctly**, which is why the parity window in §12.46 is stated as the first eight
+runs and not as all of them.
+
+Host RAM was never the constraint (2085 GB available); it is VRAM and CU time.
+
+**So the last MEASURED end-to-end figure remains 611 ms (§12.45).** §12.46's -783 us/layer predicts
+roughly -31 ms of that, i.e. ~580 ms. That is arithmetic on a single-block measurement, not a
+model-level result, and it should not be quoted as one until a 40-layer run lands on a quiet box.
+
+**90 ms is not met, and nothing in this round changes that.** 611 ms is 6.8x; 580 would be 6.4x.
