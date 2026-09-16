@@ -2071,6 +2071,21 @@ __device__ void d_moe_combine(bf16* out, const bf16* residual, const bf16* share
 #error "PLOW_MOE_PF_DET and PLOW_MOE_PF_ATOMIC are two writers for one accumulator - pick one"
 #endif
 #if PLOW_MOE_PF_DET
+/* `det_ksh` ENCODING, and it carries two arms because one of them cannot reach a top-k of 6.
+ *
+ *   1..5   log2(k)+1. The shipped form: `row_partidx[row] == token*k + slot` by construction, so
+ *          `pidx >> log2(k)` is the token -- one shift, no extra load, and ONLY for a
+ *          power-of-two k. DeepSeek-V4.1 routes top-6, so this arm cannot express it at all, and
+ *          a division in the innermost epilogue loop is not the answer either.
+ *   >= 32  the t6 slot carries `row_token` instead of `row_partidx`, so `pidx` IS the token and
+ *          the epilogue does no arithmetic at all. `d_moe_align_pf` already computes that table
+ *          (`row_token[pos] = s / k`, one host-side division per row) and already writes
+ *          PLOW_EXPERT_UNUSED into the padded rows, so the guard chain is unchanged. Works for
+ *          any k the exactness bound allows, and costs the shift arm nothing.
+ *
+ * The split is what keeps every existing blob byte-identical: a GLM blob still emits 1..5 and
+ * still takes the shift. */
+#define MPF_DET_TOK_DIRECT(ksh_) ((ksh_) >= 32u)
 #define MPF_DET_ARG , det_ksh
 /* 2^32 as the fixed-point scale and 2^17 as the pre-scale clamp: see the exactness bound above.
  * Both are exact powers of two, so the scale multiply and the op-87 unscale are exact. */
@@ -3428,6 +3443,8 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
              * is required because the k contributions come from k different XCDs. */
             double* const acc = (double*)Cout;
             const unsigned ksh = det_ksh - 1u;
+            /* Workgroup-uniform: t6 is `row_token` (pidx IS the token) or `row_partidx`. */
+            const bool tok_direct = MPF_DET_TOK_DIRECT(det_ksh);
 #pragma unroll
             for (int i = 0; i < SM; i++)
 #pragma unroll
@@ -3440,7 +3457,7 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
                             wm * (MPF_BM / MPF_WM) + i * MFMA_M + mfma_acc_m(lane, el);
                         MPF_ROWMETA(rr, pidx, gv);
                         __hip_atomic_fetch_add(
-                            (PLOW_GLOB double*)&acc[(size_t)(pidx >> ksh) * N + nn],
+                            (PLOW_GLOB double*)&acc[(size_t)(tok_direct ? pidx : (pidx >> ksh)) * N + nn],
                             mpf_det_q(gv * accf[i][j][el]), __ATOMIC_RELAXED,
                             __HIP_MEMORY_SCOPE_AGENT);
                     }
@@ -4218,6 +4235,8 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
         else if (det_ksh) {
             double* const acc_out = (double*)Cout;
             const unsigned ksh = det_ksh - 1u;
+            /* Workgroup-uniform: t6 is `row_token` (pidx IS the token) or `row_partidx`. */
+            const bool tok_direct = MPF_DET_TOK_DIRECT(det_ksh);
 #pragma unroll
             for (int i = 0; i < SMa; i++)
 #pragma unroll
@@ -4231,7 +4250,7 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                             wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
                         MPF4_ROWMETA(rr, pidx, gv);
                         __hip_atomic_fetch_add(
-                            (PLOW_GLOB double*)&acc_out[(size_t)(pidx >> ksh) * N + nn],
+                            (PLOW_GLOB double*)&acc_out[(size_t)(tok_direct ? pidx : (pidx >> ksh)) * N + nn],
                             mpf_det_q(gv * acc[i][j][el]), __ATOMIC_RELAXED,
                             __HIP_MEMORY_SCOPE_AGENT);
                     }
@@ -4699,6 +4718,8 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
         else if (det_ksh) {
             double* const acc_out = (double*)Cout;
             const unsigned ksh = det_ksh - 1u;
+            /* Workgroup-uniform: t6 is `row_token` (pidx IS the token) or `row_partidx`. */
+            const bool tok_direct = MPF_DET_TOK_DIRECT(det_ksh);
 #pragma unroll
             for (int i = 0; i < SMa; i++)
 #pragma unroll
@@ -4712,7 +4733,7 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                             wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
                         C3_ROWMETA(rr, pidx, gv);
                         __hip_atomic_fetch_add(
-                            (PLOW_GLOB double*)&acc_out[(size_t)(pidx >> ksh) * N + nn],
+                            (PLOW_GLOB double*)&acc_out[(size_t)(tok_direct ? pidx : (pidx >> ksh)) * N + nn],
                             mpf_det_q(gv * acc[i][j][el]), __ATOMIC_RELAXED,
                             __HIP_MEMORY_SCOPE_AGENT);
                     }

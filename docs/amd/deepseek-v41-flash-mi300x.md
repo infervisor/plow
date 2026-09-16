@@ -3061,6 +3061,58 @@ The mean moving by 3x is the confirmation that matters. Deleting a genuinely red
 changes the timing and nothing else; this changed the answer, which is what a `tp`-times-too-large
 shared expert would do.
 
+### 12.23 The MoE 86->87 fusion was unreachable at top-6, and is a LOSS once reached
+
+`PLOW_MOE_PF_DET` fuses the grouped MoE's DOWN epilogue into its combine: op 86 accumulates
+`rint(gate*value * 2^32)` into a `[T, H]` f64 accumulator with an order-independent atomic, and op
+87 then reads ONE contiguous stream instead of `k` slot streams at `H*4` stride. GLM measured
+**-980 us/layer** for it and it is DEFAULT ON in the gfx942 object build.
+
+**V4.1 could not use it, and nothing said so.** The emit gated on
+
+```rust
+if moe_pf_det() && tk != 0 && tk.is_power_of_two() && tk <= 16 { MoePfFuse::Det }
+```
+
+because the epilogue recovers the token as `pidx >> log2(k)` from `row_partidx[row] == token*k +
+slot`. **V4.1 routes top-6.** So the arm was compiled into every object this campaign built, cost
+its LDS and its marker symbol, and silently never fired — the emit fell through to `MoePfFuse::None`
+with no diagnostic.
+
+#### Reaching it costs nothing, because the table already exists
+
+A division in the innermost epilogue loop is not the answer. But `d_moe_align_pf` already writes
+`row_token[pos] = s / k` — one host-side division per row — over the same padded range, with the
+same `PLOW_EXPERT_UNUSED` sentinel in the padding. In the DET arm the `row_partidx` operand is used
+for *nothing but* deriving that token, so the emit can bind `row_token` in its slot and the
+epilogue does **no arithmetic at all**:
+
+* `det_ksh` **1..5** = `log2(k)+1`, the shipped encoding, t6 is `row_partidx`, one shift.
+* `det_ksh` **>= 32** = `32+k`, t6 is `row_token`, `pidx` IS the token.
+
+The split keeps every existing blob byte-identical — a GLM blob still emits 1..5 and still takes
+the shift — and needs no new operand slot, which matters because op 86 has all eight in use.
+
+#### And then it loses
+
+| op | DET off | DET on |
+|---|---|---|
+| `MOE_COMBINE_PF` (87) | 34.0 ms | **12.2 ms** (-21.8) |
+| `MOE_ROUTER_TOPK_PF` (83) | 14.2 ms | 17.5 ms (+3.3, the accumulator zeroing prologue) |
+| `MOE_GROUP_DOWN_PF` (86) | 117.4 ms | **153.1 ms** (+35.7) |
+| whole model | **841.6 ms** | 855.8 ms |
+
+The read side does exactly what GLM's note promises — op 87 goes 2.8x faster on one contiguous
+stream. The write side loses more. GLM's own note says "the atomic itself buys nothing — it COSTS
+44.8 us/layer"; at V4.1's shape it costs **893 us/layer**, because `k=6` contributions per token
+land as f64 atomics into a `[8192, 5120]` accumulator — 336 MB, six times over — where the shipped
+scatter writes `[T*k, H]` f32 once and streams it.
+
+So the arm stays OFF for V4.1. What was worth doing is making it REACHABLE: "this optimization does
+not apply to your model" and "this optimization silently does not apply to your model because your
+top-k is not a power of two" are different states, and only the first is a measurement. The
+generalization is kept, default off, with the number attached.
+
 ### 12.2 What is still not demonstrated
 
   * ~~ONE layer, not 40.~~ **Superseded by §12.18**: all 40 layers emit and run as
@@ -3071,7 +3123,7 @@ shared expert would do.
   * No reference parity. The input is synthetic; correctness so far is
     "finite and stable" plus an op census that matches the config (§12.18), not
     "right". This is now the largest single gap.
-  * **842 ms against 90 ms** (§12.19, §12.20 and §12.22 took 150 ms off §12.18's 992,
+  * **839 ms against 90 ms** (§12.19, §12.20 and §12.22 took 153 ms off §12.18's 992,
     neither in a V4.1 op; §12.21 showed the next 124 ms line is already on its
     finest legal tile). Closing the remaining 9.5x is not a list of point fixes:
     it needs the whole GEMM/MoE/collective pipeline at MFMA efficiency, which is

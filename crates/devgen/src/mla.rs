@@ -5543,7 +5543,10 @@ pub(crate) enum MoePfFuse {
     Det,
 }
 pub(crate) fn moe_pf_fuse(tk: u32) -> MoePfFuse {
-    if moe_pf_det() && tk != 0 && tk.is_power_of_two() && tk <= 16 {
+    // `tk <= 16` is the f64 exactness bound (op_moe.h: k * 2^49 <= 2^53). Power-of-two is NOT a
+    // requirement any more: a non-pow2 k binds `row_token` in the epilogue's t6 slot instead of
+    // `row_partidx`, so the token needs neither a shift nor a division. V4.1 routes top-6.
+    if moe_pf_det() && tk != 0 && tk <= 16 {
         MoePfFuse::Det
     } else {
         MoePfFuse::None
@@ -7626,7 +7629,9 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
     // PLOW_MOE_PF_DET: this packet also zeroes the [T, H] f64 accumulator op 86 will add into.
     // It is the earliest packet of the MoE chain (router -> align -> GLU -> DOWN), so the
     // existing edges already order the zero before every writer — no new packet, no new gate.
-    // `tk.is_power_of_two()` is what makes `tok = pidx >> log2(k)` exact.
+    // A power-of-two `tk` makes `tok = pidx >> log2(k)` exact; any other `tk` binds
+    // `row_token` in the epilogue's t6 slot instead, so the token needs no arithmetic
+    // (op_moe.h's `det_ksh` note). Either way the accumulator this zeroes is the same.
     let resident = emit_config::active().glm_moe_resident();
     let native_moe = emit_config::active().glm_moe_aiter() || resident;
     if native_moe {
@@ -7965,18 +7970,22 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
             if enc == MoeEnc::Mxfp4 {
                 d.t[5] = n.fu_scale;
             }
-            d.t[6] = n.row_partidx;
+            // DET with a non-power-of-two k reads the TOKEN here, not the part index: see
+            // op_moe.h's `det_ksh` encoding note. Same type, same length, same indexing,
+            // and the padded rows carry PLOW_EXPERT_UNUSED in both tables.
+            d.t[6] = if det && !tk.is_power_of_two() { n.row_token } else { n.row_partidx };
             d.t[7] = n.row_gate;
             d.i[0] = h;
             d.i[1] = imoe_e;
             d.i[2] = e;
             d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-            // PLOW_MOE_PF_DET: log2(k)+1 in i[5]. `row_partidx[row] == token*k + slot`
-            // (d_moe_align_pf), so the epilogue recovers the token with one shift and adds into
-            // acc[token][H]. i[4] was the retired atomic arm's field; an object carrying one arm can
-            // never read a blob emitted for the other as its own.
+            // PLOW_MOE_PF_DET, i[5]: log2(k)+1 for a power-of-two k (the shipped encoding --
+            // `row_partidx[row] == token*k + slot`, so one shift recovers the token), or 32+k when
+            // t6 carries `row_token` and the epilogue needs no arithmetic at all. op_moe.h's
+            // `det_ksh` note is the contract. i[4] was the retired atomic arm's field; an object
+            // carrying one arm can never read a blob emitted for the other as its own.
             if det {
-                d.i[5] = tk.trailing_zeros() + 1;
+                d.i[5] = if tk.is_power_of_two() { tk.trailing_zeros() + 1 } else { 32 + tk };
             }
         });
         c_d
@@ -8946,14 +8955,17 @@ fn emit_glm_moe_ffn_rows(
             if enc == MoeEnc::Mxfp4 {
                 d.t[5] = n.fu_scale;
             }
-            d.t[6] = n.row_partidx;
+            // DET with a non-power-of-two k reads the TOKEN here, not the part index: see
+            // op_moe.h's `det_ksh` encoding note. Same type, same length, same indexing,
+            // and the padded rows carry PLOW_EXPERT_UNUSED in both tables.
+            d.t[6] = if det && !tk.is_power_of_two() { n.row_token } else { n.row_partidx };
             d.t[7] = n.row_gate;
             d.i[0] = h;
             d.i[1] = imoe_e;
             d.i[2] = e;
             d.i[MoeEnc::PREFILL_SLOT] = enc.code();
             if det {
-                d.i[5] = tk.trailing_zeros() + 1;
+                d.i[5] = if tk.is_power_of_two() { tk.trailing_zeros() + 1 } else { 32 + tk };
             }
         })
     };
