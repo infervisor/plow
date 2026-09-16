@@ -798,7 +798,7 @@ fn the_shared_expert_uses_the_clamped_swiglu_not_plain_silu() {
     let all: Vec<u32> = (0..304u32).collect();
     let t = 512u32;
     let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
-    let (act, _) = super::dsv41::emit_dsv41_ffn_shared(&mut b, &cfg, &w, &all, 0, 1, x, t, &mut 0, &[]);
+    let (act, _) = super::dsv41::emit_dsv41_ffn_shared(&mut b, &cfg, &w, &all, 0, 1, x, t, &[]);
     let p = b.finish();
 
     let glu = p
@@ -1597,25 +1597,30 @@ fn every_tp_weight_is_read_at_the_width_it_was_declared() {
     }
 }
 
-/// The shared expert's down projection is INPUT-parallel, so its output is a PARTIAL that must
-/// land in a peer slot and be summed.
+/// The shared expert's down projection is INPUT-parallel, so its output is a PARTIAL -- and the
+/// ROUTED COMBINE is what consumes it, ONCE, with no cross-rank sum of its own.
 ///
-/// `d_xreduce` sums `peer_scratch[r] + slot` over every rank and never reads `out`, so a partial
-/// written to an ordinary arena tensor contributes NOTHING to the sum -- the reduce returns
-/// whatever the other ranks left at that offset. This is exactly the K3 bug (`k3.rs:1599`) that
-/// made 92 of 93 layers compute `ffn = up_latent + attn` instead of `+ shared_expert`, with
-/// finite, plausible logits.
+/// THIS TEST PREVIOUSLY ASSERTED THE OPPOSITE, and the assertion was the bug. `d_moe_combine_pf`
+/// computes `out = residual + shared + SUM_slot part` and the band reduce that FOLLOWS it sums
+/// `out` over all `tp` ranks. Hand that combine an already-reduced `shared` and every rank adds
+/// the FULL shared expert before a sum over 8 of them: the shared expert lands at `tp` times its
+/// value. Nothing about the shapes changes, every buffer is the right size, and the output stays
+/// finite -- the same class as the rope pairing and the missing inverse rope.
 ///
-/// And it lands in SLOT 0, attention's, because only TWO peer slots exist: `DevBlob::parse`
+/// GLM settles which one the combine means, by construction: its own body emits the shared down
+/// straight into `n.shared` with nothing between that GEMM and the combine, so `n.shared` is a
+/// PARTIAL. V4.1 emits that GEMM itself (block-FP8 against MXFP4 routed experts) and so has to
+/// hand the same thing back.
+///
+/// The partial still lands in a PEER SLOT, and that part of the old reasoning stands: `d_xreduce`
+/// sums `peer_scratch[r] + slot` and never reads `out`, so anything that IS reduced must live
+/// there. It is slot 0, attention's, because only TWO peer slots exist -- `DevBlob::parse`
 /// recovers `slot_bytes` as `max(i[2])` over the collectives, so an op that asks for `2 * slot_b`
-/// does not buy a third slot -- it redefines the UNIT as twice what every other op meant by it.
-///
-/// Reusing slot 0 is safe here for the reason K3's could not be: K3's worry is a ONE-SHOT gate,
-/// which proves every peer ARRIVED and not that every peer finished READING. Attention's reduce
-/// is `XReduceTwoShot` -- reduce-scatter then all-gather -- so no rank completes it until every
-/// peer has both contributed and published its band, which is exactly "finished reading slot 0".
+/// does not buy a third slot, it redefines the UNIT. The combine reads slot 0 LOCALLY (a rank
+/// only ever reads its own partial), so dropping the separate reduce removes a collective without
+/// removing the residency that made the old one work.
 #[test]
-fn the_shared_experts_partial_lands_in_a_peer_slot_and_is_summed() {
+fn the_shared_experts_partial_is_consumed_by_the_combine_not_reduced_twice() {
     let Some((cfg, _)) = checkpoint() else {
         return;
     };
@@ -1645,14 +1650,31 @@ fn the_shared_experts_partial_lands_in_a_peer_slot_and_is_summed() {
     );
 
     let slot_b = t * cfg.hidden * 2;
-    let xr = p
+
+    // The combine takes the PARTIAL, in the peer slot the down projection wrote.
+    let cmb = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::MoeCombinePf as u16)
+        .expect("the routed combine");
+    assert_eq!(
+        byname(cmb.t[2]),
+        super::dsv41::PEER_SLOT_SHARED,
+        "the combine's shared operand IS the down projection's partial, not a reduced copy"
+    );
+
+    // And nothing reduces it on its own: `act.l0.sh_out` does not exist at tp>1 any more, so the
+    // only collectives in the layer are attention's and the routed combine's.
+    assert!(
+        !m.tensors.iter().any(|x| x.name == "act.l0.sh_out"),
+        "a separate reduced shared buffer is what the tp-times bug was made of"
+    );
+    let n_xr = p
         .insts
         .iter()
         .filter(|d| d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceTwoShot as u16)
-        .find(|d| d.i[2] == 0 && d.t[0] == m.tensors.iter().position(|x| x.name == "act.l0.sh_out").expect("sh_out") as u32)
-        .expect("the shared partial is reduced out of slot 0");
-    assert_eq!(xr.i[0], t * cfg.hidden, "the whole [T, hidden] partial");
-    assert_eq!(xr.i[1], 8, "over all 8 ranks");
+        .count();
+    assert_eq!(n_xr, 2, "TWO collectives per layer: attention, and the routed combine");
 
     // EVERY offset this layer reduces at must be one the host actually binds, and the host binds
     // exactly two: 0 and `slot_b`. An offset outside that set is the failure this pins -- it does
@@ -1667,7 +1689,7 @@ fn the_shared_experts_partial_lands_in_a_peer_slot_and_is_summed() {
         slots.iter().all(|s| *s == 0 || *s == slot_b),
         "only slots 0 and slot_b={slot_b} exist, got {slots:?}"
     );
-    assert!(slots.contains(&0), "attention and the shared expert reduce slot 0");
+    assert!(slots.contains(&0), "attention reduces slot 0, which the shared partial also lives in");
 }
 
 /// The routed combine's peer slot is BOUND. `GlmTn::none()` leaves `dg_tp` at `TENSOR_NONE` and

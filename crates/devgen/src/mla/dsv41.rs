@@ -1983,11 +1983,10 @@ pub(crate) struct Dsv41FfnAct {
     pub(crate) sh_up: u32,
     /// After the clamped SwiGLU, `[T][moe_inter / tp]` bf16.
     pub(crate) sh_act: u32,
-    /// The down projection's PARTIAL, in peer slot 2, `[T][hidden]` bf16. At tp=1 nothing
-    /// reduces it and `sh_out` is left untouched, so the caller reads this one.
+    /// The down projection's PARTIAL, in peer slot 2, `[T][hidden]` bf16 -- and the partial is
+    /// what the routed combine takes, at every `tp`. Nothing reduces it here; the band reduce
+    /// after `d_moe_combine_pf` is the one cross-rank sum the shared expert gets.
     pub(crate) sh_part: u32,
-    /// Shared-expert output after the cross-rank sum, `[T][hidden]` bf16.
-    pub(crate) sh_out: u32,
 }
 
 /// Emit the FFN pre-norm and the SHARED expert (not the routed ones).
@@ -2010,7 +2009,6 @@ pub(crate) fn emit_dsv41_ffn_shared(
     tp: u32,
     x: u32,
     t: u32,
-    xgate: &mut u32,
     deps: &[u32],
 ) -> (Dsv41FfnAct, u32) {
     let hidden = c.hidden;
@@ -2049,13 +2047,11 @@ pub(crate) fn emit_dsv41_ffn_shared(
         // which is exactly "finished reading slot 0". `AmdTpGroup::run_rung` also drains every rank
         // between segments, and the two reduces are in different segments.
         sh_part: if tp == 1 {
-            // A group of one has nothing to reduce, and there is no peer region at tp=1, so the
-            // down projection writes the output directly.
+            // A group of one has no peer region, so the down projection writes an ordinary buffer.
             b.tensor(&format!("act.l{l}.sh_out"), (t as u64) * (hidden as u64) * 2)
         } else {
             b.tensor(PEER_SLOT_SHARED, (t as u64) * (hidden as u64) * 2)
         },
-        sh_out: b.tensor(&format!("act.l{l}.sh_out"), (t as u64) * (hidden as u64) * 2),
     };
     let all = cus.to_vec();
     let eps = c.eps;
@@ -2113,25 +2109,15 @@ pub(crate) fn emit_dsv41_ffn_shared(
         inter,
         &[c_act],
     );
-    if tp == 1 {
-        // `sh_part` IS `sh_out` here, so the answer is already in place.
-        return (act, c_down);
-    }
-    let xr = super::xr_cus_capped(b.n_cu(), cus);
-    let c_xr = crate::emit_xreduce(
-        b,
-        xgate,
-        false,
-        &xr,
-        c_down,
-        act.sh_out,
-        t * hidden,
-        tp,
-        // SLOT 0. The unit the host recovers is `max(i[2])` across the packet, and the routed
-        // combine's `n.slot_b` is what sets it; anything larger here would move that unit.
-        early_reduce_slot(t, hidden),
-    );
-    (act, c_xr)
+    // NO CROSS-RANK SUM HERE, and that is the contract, not an omission. `d_moe_combine_pf`
+    // computes `out = residual + shared + SUM_slot part` and the band reduce that FOLLOWS it sums
+    // `out` across ranks, so the `shared` it is handed must be the row-parallel PARTIAL. GLM says
+    // so by construction: its own body emits the shared down straight into `n.shared` with
+    // nothing between that GEMM and the combine. Reducing here and passing the reduced buffer
+    // made every rank add the FULL shared expert before a sum over 8 ranks -- the shared expert
+    // counted `tp` times, which no shape check can see and which cost 40 redundant all-reduces
+    // (~29 ms at 8k) on the way. `sh_part` is the answer the caller wants at every `tp`.
+    (act, c_down)
 }
 
 /// One sublayer a V4.1 rung has to emit, and whether it is emitted yet.
@@ -2497,10 +2483,10 @@ pub(crate) fn emit_dsv41_block(
         let c_pre2 = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, true, ri, pi, t, &[c_post]);
         pi += 1;
         let (ffn, c_sh) = emit_dsv41_ffn_shared(
-            &mut b, c, &w, &all, l, tp, mhc.layer_input, t, &mut xgate, &[c_pre2],
+            &mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre2],
         );
         let c_moe = emit_dsv41_moe(
-            &mut b, c, &w, l, tp, t, xnext, ffn.xn, c_sh, (ffn.sh_out, c_sh), &mut xgate, &all,
+            &mut b, c, &w, l, tp, t, xnext, ffn.xn, c_sh, (ffn.sh_part, c_sh), &mut xgate, &all,
             peer_w,
         );
         // CAPTURED, not discarded: it is the next layer's only dependency, and the thing that

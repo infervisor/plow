@@ -3000,6 +3000,67 @@ hand-written `--shapes <FILE>` is the way in. Also worth recording: the tuning d
 INTERPRETER, so every kernel change in §12.19-§12.21 invalidates the database again. **A tuning
 campaign has to be the last thing done, not the first.**
 
+### 12.22 The shared expert was counted EIGHT times, and it bought 40 all-reduces to do it
+
+Chasing the 90 ms target into the collectives turned up a correctness bug, which is the seventh
+instance of this campaign's recurring class and by a wide margin the largest.
+
+**The count that started it.** The 40-layer trace has **122** `XREDUCE2` calls. TP8 needs two per
+layer — one after the attention output projection, one after the MoE — plus Engram's two at layers
+1 and 14. That is 82. There were forty too many, one per layer, and they were the shared expert's.
+
+**Why a third one is not just waste.** `d_moe_combine_pf` computes
+
+    out[t] = residual[t] + shared[t] + SUM_slot part[t*k + slot]
+
+and the band all-reduce that FOLLOWS it sums `out` across all `tp` ranks. So whatever is handed to
+`shared` gets summed `tp` times. GLM settles what that operand means by construction: its own body
+emits the shared-expert down projection straight into `n.shared` with nothing between that GEMM and
+the combine, so `n.shared` is the row-parallel **PARTIAL**.
+
+V4.1 cannot reuse that body — its shared expert is block-FP8 while its routed experts are MXFP4, so
+the caller emits the GEMM itself and passes the result back. It passed `sh_out`: the buffer its own
+struct documents as *"Shared-expert output after the cross-rank sum"*. Every rank therefore added
+the FULL shared expert before a sum over eight of them.
+
+`scripts/dsv41_moe_tp_oracle.py` prices it, and the third check is the one that names the defect
+rather than just detecting it:
+
+```
+  PASS  the row-parallel split reproduces the shared expert exactly   max|err| = 9.537e-07
+  PASS  handing the combine the PARTIAL reproduces the reference      max|err| = 7.153e-07
+  PASS  handing it the REDUCED buffer does not                        max|err| = 2.134e+01
+  PASS  and the error is exactly (tp - 1) copies of the shared expert max|err| = 7.629e-06
+  PASS  it is not a rounding detail        relative error 6.595 of the layer's FFN output
+  PASS  every buffer is the same shape either way, and both are finite
+```
+
+**659% relative error on every layer's FFN output**, with every buffer the right shape and every
+value finite. No shape check, no NaN check and no "it runs" can see it — which is the whole point
+of the class, and the reason the fix had to be an oracle and not an inspection.
+
+**A test was pinning it.** `the_shared_experts_partial_lands_in_a_peer_slot_and_is_summed` asserted
+that the shared partial IS separately reduced. Its reasoning was sound as far as it went — a
+partial must live in a peer slot, because `d_xreduce` sums `peer_scratch[r] + slot` and never reads
+`out` — but it did not ask WHO does the summing, and the answer is the combine's own band reduce.
+The test is now
+`the_shared_experts_partial_is_consumed_by_the_combine_not_reduced_twice` and pins the operand
+(`t2 == PEER_SLOT_SHARED`) and the collective count (two per layer, not three). The peer-slot
+residency stands; the combine reads slot 0 LOCALLY, since a rank only ever reads its own partial.
+
+**On hardware**, 40 fewer collectives and a different answer:
+
+| | before | after |
+|---|---|---|
+| prefill ops | 1,513 | **1,473** |
+| `XREDUCE2` | 122 calls, 87.2 ms | **82 calls, 65.1 ms** |
+| whole model | 852.6 ms | **841.6 ms** |
+| exit mean | 0.1499 | **0.0496** |
+
+The mean moving by 3x is the confirmation that matters. Deleting a genuinely redundant collective
+changes the timing and nothing else; this changed the answer, which is what a `tp`-times-too-large
+shared expert would do.
+
 ### 12.2 What is still not demonstrated
 
   * ~~ONE layer, not 40.~~ **Superseded by §12.18**: all 40 layers emit and run as
@@ -3010,7 +3071,7 @@ campaign has to be the last thing done, not the first.**
   * No reference parity. The input is synthetic; correctness so far is
     "finite and stable" plus an op census that matches the config (§12.18), not
     "right". This is now the largest single gap.
-  * **853 ms against 90 ms** (§12.19 and §12.20 took 139 ms off §12.18's 992,
+  * **842 ms against 90 ms** (§12.19, §12.20 and §12.22 took 150 ms off §12.18's 992,
     neither in a V4.1 op; §12.21 showed the next 124 ms line is already on its
     finest legal tile). Closing the remaining 9.5x is not a list of point fixes:
     it needs the whole GEMM/MoE/collective pipeline at MFMA efficiency, which is
