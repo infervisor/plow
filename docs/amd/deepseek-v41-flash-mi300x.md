@@ -3891,3 +3891,23 @@ adding a barrier to share a tile destroyed the other. **At two waves per SIMD th
 hiding available is inside a lane's own instruction stream.**
 
 Layer 2 at the committed defaults: **16,312 us**, from 20,458 at the start of §12.29.
+
+### 12.39 The compressor roped every channel twice
+
+`d_compress_rope_quant` quantizes a block against its own amax, so it needs each channel's roped
+value twice: once to find the amax, once to quantize against the scale that implies. The shipped
+body calls `cmp_rope_at` both times — per channel two bf16 loads, two f32 table loads, two fmas
+and a bf16 round trip, done twice for one result.
+
+A quant block is `qblk` floats and nothing else, so it fits in registers. Holding it there
+(`qblk <= 32`; larger blocks keep the recompute) removes the second pass outright:
+
+    COMPRESS_ROPE_QUANT body, layer 2, T=8192, TP8, median of 5, same run:
+
+      recompute   878 us   strag 123
+      cached      665 us   strag  77     -24.3%
+
+Bit-identical — the same values in the same order through the same `fmaxf` fold and the same
+`cmp_quant_rt` — and the exits agree to the last printed digit.
+
+Layer 2 at the committed defaults: **16,138 us**, from 20,458 at the start of §12.29.

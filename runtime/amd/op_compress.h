@@ -385,13 +385,37 @@ __device__ void d_compress_rope_quant(bf16* __restrict__ out, const bf16* __rest
         const bf16* const srow = src + off * d;
         const size_t tb = (size_t)((rbase + r) * ratio) * (rd / 2);
 
+        bf16* const orow = out + off * d;
+        /* HOLD THE ROPED BLOCK IN REGISTERS. The two passes below need the same `qblk` values --
+         * one to find the block's amax, one to quantize against the scale it implies -- and the
+         * shipped form recomputes `cmp_rope_at` for the second: per channel that is two bf16
+         * loads, two f32 table loads, two fmas and a bf16 round trip, done twice. A quant block
+         * is `qblk` floats and nothing else, so it fits in registers whenever qblk is small
+         * enough to be worth it; larger blocks keep the recompute.
+         *
+         * Bit-identical: the same values in the same order through the same fmaxf fold and the
+         * same cmp_quant_rt. */
+        constexpr unsigned QMAX = 32u;
+        if (qblk <= QMAX) {
+            float v[QMAX];
+            float amax = 0.0f;
+            for (unsigned i = 0; i < qblk; i++) {
+                v[i] = cmp_rope_at(srow, c0 + i, c_rope0, cosb, sinb, tb);
+                amax = fmaxf(amax, fabsf(v[i]));
+            }
+            float inv_s;
+            const float s = cmp_block_scale(amax, qmode, &inv_s);
+            for (unsigned i = 0; i < qblk; i++)
+                orow[c0 + i] = f2bf(cmp_quant_rt(v[i], s, inv_s, qmode));
+            continue;
+        }
+
         float amax = 0.0f;
         for (unsigned i = 0; i < qblk; i++)
             amax = fmaxf(amax, fabsf(cmp_rope_at(srow, c0 + i, c_rope0, cosb, sinb, tb)));
         float inv_s;
         const float s = cmp_block_scale(amax, qmode, &inv_s);
 
-        bf16* const orow = out + off * d;
         for (unsigned i = 0; i < qblk; i++)
             orow[c0 + i] = f2bf(cmp_quant_rt(cmp_rope_at(srow, c0 + i, c_rope0, cosb, sinb, tb),
                                              s, inv_s, qmode));
