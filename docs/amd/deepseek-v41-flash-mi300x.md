@@ -4583,3 +4583,19 @@ ops stop inheriting each other's register union -- not any remaining tile or arm
 If 90 ms is a hard requirement, it needs a change of premise, not of code: fewer layers, a shorter
 context, more GPUs (the collective floor falls with a smaller per-GPU payload only if the reduction
 itself shrinks), or a different attention/MoE algorithm. The number as stated is not on this curve.
+
+**One concrete pointer left for whoever picks this up**, because the roofline names it and nothing
+in this campaign touched it. `COMPRESS_ROPE_QUANT` has the WORST ratio in the layer -- ~40x -- and
+it is not one op but three, with wildly different sizes. Per packet:
+
+    #10  COMPRESS_ROPE_QUANT    53.9 us     the KV cache compressor, T/ratio rows x 576
+    #13  COMPRESS_ROPE_QUANT    76.3 us     the index KEYS, n_pool rows x 128
+    #15  COMPRESS_ROPE_QUANT   508.1 us     the index QUERIES, 8192 x 32 heads x 128   <-- 80%
+
+Packet 15 alone is 508 us moving ~84 MB (67 MB of bf16 in, ~17 MB of fp4 + E8M0 out) = **165 GB/s,
+3% of HBM**, against a ~16 us floor. It is a pure streaming rope-then-quantise over
+`8192 * 32 * 128 = 33.6M` elements with `DSV41_IDX_QBLK = 16`, so one thread owns a whole 16-element
+quant block and the work is ~23 cycles/element. The §12.38/§12.41 class of fix -- widen the lane to
+8 elements and vectorise the load -- is exactly what it has never had; the register-caching pass in
+§12.40 cut the pair 878 -> 665 us and left the ACCESS WIDTH alone. Worth ~350 us/layer, ~14 ms end
+to end, and it is ordinary kernel work rather than an architectural change.
