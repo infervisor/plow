@@ -3879,7 +3879,7 @@ __device__ __forceinline__ bf16 mla_pf2_f2bf(float f) {
      2)
 
 
-template <int DK, int DR, bool GATHER = false, bool FP8 = false>
+template <int DK, int DR, bool GATHER = false, bool FP8 = false, bool SPLITOUT = false>
 __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restrict__ mlpart,
                                        const bf16* __restrict__ Qabs,
                                        const bf16* __restrict__ Qrope,
@@ -3892,7 +3892,16 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                                        const unsigned char* __restrict__ uni = nullptr,
                                        unsigned cap = 0, unsigned ns = 1, bool ofold = false,
                                        const float* __restrict__ kv_scale = nullptr,
-                                       unsigned krot_fp8 = 0) {
+                                       unsigned krot_fp8 = 0,
+                                       /* SPLIT-SLOT OUTPUT, as `d_flash_mla_prefill` and
+                                        * `d_flash_gather_prefill` already take it. A model whose
+                                        * attention is a SPLIT -- DeepSeek-V4.1 runs a windowed
+                                        * dense pass and a gathered compressed pass into the two
+                                        * halves of one partial pair, combined by FlashMerge --
+                                        * cannot use this body at all without it, because it
+                                        * would overwrite the other half. 0 keeps the shipped
+                                        * whole-output layout. */
+                                       unsigned out_nsplit = 0, unsigned out_sp0 = 0) {
     constexpr int RW = 16;                 /* q rows per wave                    */
     constexpr int BQ = 4 * RW;             /* 64 — the 4-wave tile               */
     constexpr int BKV = FA_MLA_PF2_BKV;    /* kv rows per staged slab            */
@@ -4572,7 +4581,9 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
             const unsigned qi = GATHER ? q_base + (row_i >> 3) : my_q0 + kg * 4 + i;
             const unsigned hh = GATHER ? (row_i & 7u) : h;
             if (qi >= n_tok) continue;
-            const size_t oh = (((size_t)b * n_tok + qi) * n_head + hh) * nsp + sp;
+            const unsigned ONS = SPLITOUT && out_nsplit ? out_nsplit : nsp;
+            const size_t oh = (((size_t)b * n_tok + qi) * n_head + hh) * ONS
+                              + (SPLITOUT ? out_sp0 : 0u) + sp;
             if (ofold) {
                 /* W_ofold epilogue: normalized bf16 rows for the fused o-GEMM. ns==1 is the
                  * emit contract (the fold consumes the un-split l), so nsp==1/sp==0 and oh

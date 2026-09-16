@@ -2955,18 +2955,30 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * masked off. i6 keeps its dense meaning (low 8 bits = causal KV-split ns) except
          * on the GATHER arm, where it is `cap`, disambiguated by t7 as in the DR=64 chain. */
         if (in->t[7] != PLOW_TENSOR_NONE)
-            d_flash_mla_prefill_v2<512, 0, /*GATHER=*/true>(
+            /* i7 = (out_nsplit << 8) | out_sp0, the same encoding op 55 carries, so a split
+             * attention can put its gathered half in partial 1 of 2. */
+            d_flash_mla_prefill_v2<512, 0, /*GATHER=*/true, /*FP8=*/false,
+                                   /*SPLITOUT=*/true>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), nullptr,
                 (const bf16*)TEN(4), nullptr, (const int*)TEN(6), in->i[0], in->i[4],
                 in->i[1], in->i[2], in->i[3] & 0x7fffffffu, in->fj[0].f, in->i[5], slice,
-                nblk, sm->fa, (const unsigned char*)TEN(7), in->i[6]);
+                nblk, sm->fa, (const unsigned char*)TEN(7), in->i[6], 1u, false, nullptr, 0u,
+                (in->i[7] >> 8) & 0xffu, in->i[7] & 0xffu);
         else
-            d_flash_mla_prefill_v2<512, 0>(
+            /* i7 CARRIES HERE TOO. The 8-wave dense bodies have always honoured the
+             * write-only output split, so a V4.1 packet routed to THIS object must as
+             * well: its windowed half is partial 0 of 2 and its gathered half partial 1,
+             * and a body that writes the un-split layout puts the window rows where the
+             * merge expects neither. Not a trap and not a crash -- a wrong answer that
+             * still looks like attention. */
+            d_flash_mla_prefill_v2<512, 0, /*GATHER=*/false, /*FP8=*/false,
+                                   /*SPLITOUT=*/true>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), nullptr,
                 (const bf16*)TEN(4), nullptr, (const int*)TEN(6), in->i[0], in->i[4],
                 in->i[1], in->i[2], in->i[3] & 0x7fffffffu, in->fj[0].f, in->i[5], slice,
                 nblk, sm->fa, nullptr, 0u, (in->i[6] & 0xffu) ? (in->i[6] & 0xffu) : 1u,
-                ((in->i[6] >> 8) & 1u) != 0u);
+                ((in->i[6] >> 8) & 1u) != 0u, nullptr, 0u,
+                (in->i[7] >> 8) & 0xffu, in->i[7] & 0xffu);
 #undef TEN
     } else
 #endif
