@@ -933,6 +933,9 @@ pub struct EmitConfig {
     /// (T >= 1024). Default on; `=0` is the rollback to the single align packet.
     #[arg(long, env = "PLOW_MOE_ALIGN_PAR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_align_par: bool,
+    /// `PLOW_DSV41_OPS`: truncate the V4.1 block to its first n ops. Profiling only.
+    #[arg(long, env = "PLOW_DSV41_OPS")]
+    pub dsv41_ops: Option<u32>,
 
     /// GLM TP8 prefill on the AITER MoE route: the shared expert's down projection writes the
     /// MoE seam's reduce-scatter source and the fused call accumulates the routed partials onto
@@ -1345,6 +1348,9 @@ impl EmitConfig {
             gemv_prefetch: env_bool("PLOW_GEMV_PREFETCH"),
             moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_opt_out("PLOW_MOE_ALIGN_PAR"),
+            dsv41_ops: std::env::var("PLOW_DSV41_OPS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok()),
             glm_moe_shared_seed: env_bool("PLOW_GLM_MOE_SHARED_SEED"),
             seq_par_seams: env_opt_out("PLOW_SEQ_PAR_SEAMS"),
             moe_prefill_ep: env_bool("PLOW_MOE_PREFILL_EP"),

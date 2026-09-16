@@ -3968,8 +3968,15 @@ impl ExpertNames {
 
     /// Is the scale an MX microscaling row (one E8M0 byte per 32 elements along
     /// K) rather than a block-fp8 `[N/128][K/128]` f32 grid?
+    ///
+    /// Keyed on the SCALE's spelling, and both MX spellings are listed. `.weight_scale` is the
+    /// compressed-tensors one that rides `.weight_packed`; `.scale` is DeepSeek-V4.1's, which
+    /// rides a plain `.weight`. Only `.weight_scale_inv` -- block-fp8's -- is not MX, and
+    /// enumerating the MX side rather than excluding that one means a spelling nobody has taught
+    /// this function is read as block-fp8 and caught by `check_expert_geometry`'s grid arithmetic,
+    /// rather than read as MX and accepted because the byte counts happened to line up.
     fn microscaled(&self) -> bool {
-        self.scale == ".weight_scale"
+        self.scale == ".weight_scale" || self.scale == ".scale"
     }
 }
 
@@ -3990,11 +3997,16 @@ fn resolve_expert_names(
     ckpt: &crate::asset::checkpoint::Checkpoint,
     pfx: &str,
 ) -> Result<ExpertNames> {
-    const TEMPLATES: [([&str; 3], &str); 2] = [
+    const TEMPLATES: [([&str; 3], &str); 3] = [
         (["gate_proj", "up_proj", "down_proj"], ".weight"),
         (["w1", "w3", "w2"], ".weight_packed"),
+        // DeepSeek-V4.1-Flash: `w1`/`w3`/`w2` with a PLAIN `.weight` payload and a `.scale` grid,
+        // which is neither of the two above. LAST, so it can only be reached once the other two
+        // have missed -- a checkpoint carrying `gate_proj.weight` still resolves as it always did,
+        // and one carrying `w1.weight_packed` still prefers the packed spelling over this one.
+        (["w1", "w3", "w2"], ".weight"),
     ];
-    const SCALES: [&str; 2] = [".weight_scale_inv", ".weight_scale"];
+    const SCALES: [&str; 3] = [".weight_scale_inv", ".weight_scale", ".scale"];
     let base = pfx.strip_prefix("moe.").unwrap_or(pfx);
     let mut tried: Vec<String> = Vec::new();
     for sub in ["", "mlp.", "block_sparse_moe."] {
@@ -4441,7 +4453,7 @@ fn bind_packed_experts(
         if ep_full.is_some() {
             return ep_full;
         }
-        dec.insts.iter().find_map(|d| {
+        let width_of = |d: &DevInst64| -> Option<u64> {
             if d.t[3] as usize == i_ewt && GLU_ARMS.iter().any(|&o| o as u16 == d.op) {
                 Some(d.i[1] as u64)
             } else if d.t[2] as usize == i_ewt && d.op == DevOp::MoeGroupGluPf as u16 {
@@ -4451,7 +4463,20 @@ fn bind_packed_experts(
             } else {
                 None
             }
-        })
+        };
+        // The DECODE program first, so every packet that has one answers exactly as it did.
+        //
+        // Then every other program, because a packet need not have a decode program that streams
+        // experts. A single-block PREFILL RUNG is the case: `derive_roles` reads a parent blob's
+        // roles positionally, so such a rung carries an empty decode program purely to make its
+        // real work classify as a prefill bucket, and the instruction that streams the experts is
+        // in the bucket. `I_moe` is a property of the PACKET's sharding -- the two programs cannot
+        // disagree about how wide one expert is -- so which program is asked does not change the
+        // answer, only whether there is one.
+        dec.insts
+            .iter()
+            .find_map(&width_of)
+            .or_else(|| blob.progs.iter().flat_map(|p| &p.insts).find_map(&width_of))
     };
 
     let mut bufs = Vec::with_capacity(layers.len() * 2);
@@ -10019,10 +10044,17 @@ impl AmdEngine {
 
         // --- pinned staging --------------------------------------------------
         let n_dec_inst = blob.progs[decode].insts.len();
-        let mut h_inst =
-            EngineDevice::host_alloc_pinned(&*be, n_dec_inst * std::mem::size_of::<DevInst64>())?;
-        h_inst
-            .as_mut_slice()
+        // `.max(1)`: a single-block PREFILL RUNG carries an EMPTY decode program -- `derive_roles`
+        // is positional, so the placeholder is what makes the rung's real work classify as a
+        // prefill bucket -- and `hsa_amd_memory_pool_allocate` refuses a zero-byte request with
+        // HSA_STATUS_ERROR_INVALID_ARGUMENT rather than returning a null. One unused instruction's
+        // worth of pinned staging is cheaper than a special case, and the copy below is a no-op at
+        // length zero.
+        let mut h_inst = EngineDevice::host_alloc_pinned(
+            &*be,
+            n_dec_inst.max(1) * std::mem::size_of::<DevInst64>(),
+        )?;
+        h_inst.as_mut_slice()[..n_dec_inst * std::mem::size_of::<DevInst64>()]
             .copy_from_slice(as_bytes(&blob.progs[decode].insts));
         // Prefill stages ids AND pos for a whole chunk, so this must hold
         // 2 * max_bucket_T * 4 bytes. Sizing it at a fixed 64 KiB silently

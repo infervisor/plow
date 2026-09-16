@@ -609,7 +609,129 @@ impl Ctx<'_> {
                 }
                 Ok(prefix)
             }
+
+            Op::HcMixes {
+                hc_mult,
+                sinkhorn_iters,
+                ..
+            } => {
+                self.expect_arity(inputs, 4)?;
+                if *hc_mult == 0 || *sinkhorn_iters == 0 {
+                    return Err(self.err("hc_mixes needs hc_mult > 0 and sinkhorn_iters > 0"));
+                }
+                let x = self.hc_stream_shape(inputs, 0, *hc_mult, "hc_mixes")?;
+                let hidden = req_static(self, x.dim(x.rank() - 1), "hc_mixes hidden")?;
+                let mix = (2 + *hc_mult as i64) * *hc_mult as i64;
+                // hc_fn reads the stream FLATTENED over copies, so its input
+                // width is hc_mult * hidden, not hidden.
+                let flat = *hc_mult as i64 * hidden;
+
+                let fnw = self.input_shape(inputs, 1)?;
+                if fnw.rank() != 2
+                    || req_static(self, fnw.dim(0), "hc_fn rows")? != mix
+                    || req_static(self, fnw.dim(1), "hc_fn columns")? != flat
+                {
+                    return Err(self.err(format!(
+                        "hc_mixes hc_fn has shape {fnw}, expected [{mix}, {flat}]"
+                    )));
+                }
+                let scale = self.input_shape(inputs, 2)?;
+                if scale.rank() != 1 || req_static(self, scale.dim(0), "hc_scale")? != 3 {
+                    return Err(self.err(format!(
+                        "hc_mixes hc_scale has shape {scale}, expected [3]"
+                    )));
+                }
+                let base = self.input_shape(inputs, 3)?;
+                if base.rank() != 1 || req_static(self, base.dim(0), "hc_base")? != mix {
+                    return Err(self.err(format!(
+                        "hc_mixes hc_base has shape {base}, expected [{mix}]"
+                    )));
+                }
+                // Drop the copy axis, replace hidden with the packed mixes.
+                let mut dims: Vec<Dim> = (0..x.rank() - 2).map(|i| x.dim(i).clone()).collect();
+                dims.push(Dim::stat(mix));
+                Ok(Shape::new(dims))
+            }
+
+            Op::HcPre { hc_mult } => {
+                self.expect_arity(inputs, 2)?;
+                let x = self.hc_stream_shape(inputs, 0, *hc_mult, "hc_pre")?;
+                let pre = self.input_shape(inputs, 1)?;
+                // pre_mix carries one weight per copy and no hidden axis; a
+                // pre_mix still carrying hidden is the single-pass wiring done
+                // wrong, and would broadcast instead of failing.
+                if pre.rank() != x.rank() - 1
+                    || req_static(self, pre.dim(pre.rank() - 1), "hc_pre mix")? != *hc_mult as i64
+                {
+                    return Err(self.err(format!(
+                        "hc_pre pre_mix has shape {pre}, expected the stream shape {x} without its \
+                         hidden axis (last dim {hc_mult})"
+                    )));
+                }
+                let mut dims: Vec<Dim> = (0..x.rank() - 2).map(|i| x.dim(i).clone()).collect();
+                dims.push(x.dim(x.rank() - 1).clone());
+                Ok(Shape::new(dims))
+            }
+
+            Op::HcPost { hc_mult } => {
+                self.expect_arity(inputs, 4)?;
+                let x = self.input_shape(inputs, 0)?;
+                if x.rank() == 0 {
+                    return Err(self.err("hc_post x must have rank >= 1"));
+                }
+                let resid = self.hc_stream_shape(inputs, 1, *hc_mult, "hc_post")?;
+                if resid
+                    .dim(resid.rank() - 1)
+                    .provably_ne(x.dim(x.rank() - 1))
+                {
+                    return Err(self.err(format!(
+                        "hc_post residual {resid} and sublayer output {x} disagree on hidden"
+                    )));
+                }
+                let post = self.input_shape(inputs, 2)?;
+                if post.rank() != x.rank()
+                    || req_static(self, post.dim(post.rank() - 1), "hc_post post_mix")?
+                        != *hc_mult as i64
+                {
+                    return Err(self.err(format!(
+                        "hc_post post_mix has shape {post}, expected last dim {hc_mult}"
+                    )));
+                }
+                // comb is the flattened [hc_mult, hc_mult] mixing matrix.
+                let comb = self.input_shape(inputs, 3)?;
+                let sq = *hc_mult as i64 * *hc_mult as i64;
+                if comb.rank() != x.rank()
+                    || req_static(self, comb.dim(comb.rank() - 1), "hc_post comb_mix")? != sq
+                {
+                    return Err(self.err(format!(
+                        "hc_post comb_mix has shape {comb}, expected last dim {sq} \
+                         (the flattened {hc_mult}x{hc_mult} mix)"
+                    )));
+                }
+                Ok(resid)
+            }
         }
+    }
+
+    /// Shape of an `[.., hc_mult, hidden]` mHC residual stream.
+    fn hc_stream_shape(
+        &self,
+        inputs: &[TensorId],
+        at: usize,
+        hc_mult: u32,
+        what: &str,
+    ) -> Result<Shape, InferError> {
+        let x = self.input_shape(inputs, at)?;
+        if x.rank() < 2 {
+            return Err(self.err(format!("{what} stream {x} must have rank >= 2")));
+        }
+        let copies = req_static(self, x.dim(x.rank() - 2), "hc copies")?;
+        if copies != hc_mult as i64 {
+            return Err(self.err(format!(
+                "{what} stream {x} carries {copies} residual copies, expected hc_mult={hc_mult}"
+            )));
+        }
+        Ok(x)
     }
 
     fn expect_arity_range(

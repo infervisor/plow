@@ -65,7 +65,11 @@ rustfft = "6"
 # builds fast and offline; a byte-fallback tokenizer stands in when absent.
 tokenizers = { version = "0.20", optional = true }
 rayon = { version = "1", optional = true }
-safetensors = { version = "0.4", optional = true }
+# 0.8, not 0.4: DeepSeek-V4.1-Flash stores its MXFP4 block scales as F8_E8M0, a
+# dtype 0.4's `Dtype` enum does not have, so `read_metadata` fails the whole
+# shard with `InvalidHeaderDeserialization` -- the header is valid, the reader is
+# older than the format. plowrt uses only `Dtype` and `read_metadata`.
+safetensors = { version = "0.8", optional = true }
 hf-hub = { workspace = true, optional = true }
 # Asset distribution (`dist` feature): an HTTP client for the registry and zstd
 # for the transport codec. Deliberately optional — `serve` performs no network

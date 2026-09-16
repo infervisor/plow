@@ -346,7 +346,7 @@ __device__ __forceinline__ unsigned gm_remap(unsigned lin, unsigned n_tiles, uns
 #endif
 template <int BM, int BN, int BK, int WM, int WN, bool NORM, int SWZ = GM_SWZ, int WGM = GM_WGM,
           bool PP = (GM_PP != 0), bool KEXACT = true, bool GLU = false, bool WFP4 = false,
-          bool WFP8BLK = false
+          bool WFP8BLK = false, bool WFP8MX = false
 #if PLOW_GLM_FUSE_POST
           , bool ROPE = false
 #endif
@@ -366,7 +366,8 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
 #endif
                          ) {
 #if PLOW_GLM_FUSE_POST
-    static_assert(!ROPE || (!NORM && !GLU && !WFP4 && !WFP8BLK), "the RoPE epilogue is bf16 only");
+    static_assert(!ROPE || (!NORM && !GLU && !WFP4 && !WFP8BLK && !WFP8MX),
+                  "the RoPE epilogue is bf16 only");
 #endif
     (void)B2;
     (void)bscale;
@@ -409,6 +410,30 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
     static_assert(!WFP8BLK || !WFP4, "one weight encoding at a time");
     static_assert(!WFP8BLK || BK == 64, "the 128-K scale block must be exactly two BK tiles");
     static_assert(!WFP8BLK || BN % 128 == 0, "n0 must be 128-aligned for a per-lane N-scale block");
+    /* WFP8MX (w8a16 block-fp8 at DeepSeek-V4.1's `weight_block_size: [32, 32]`): the SAME e4m3 B
+     * tensor as WFP8BLK, but the scale grid is `[ceil(N/32)][ceil(K/32)]` and its entries are
+     * UE8M0 BYTES, not f32 -- so it arrives in `bscale` (the u8 slot WFP4 uses) rather than in
+     * `bsblk`. Both differences are load-bearing and either alone silently rescales every output:
+     * V4.1's `attn.wq_a.weight` is [1280, 5120] and its `.scale` is `F8_E8M0 [40, 160]`.
+     *
+     * THE K AXIS IS WHY THIS IS A SEPARATE ARM RATHER THAN A SHIFT CONSTANT. WFP8BLK promotes on
+     * `(kt & 1)` because a 128-element K block is exactly two BK=64 tiles, so the boundary lands
+     * between k-tiles and never inside an MFMA burst. A 32-element block does not divide BK=64 at
+     * all -- it would land mid-burst. So this arm runs at BK=32, where one k-tile IS one scale
+     * block and the promotion is simply every tile. That halves the K step, which is a real cost
+     * and the reason a BK=64 variant promoting twice per tile is worth measuring later; it is NOT
+     * a reason to fold the two arms together, because the promotion site differs.
+     *
+     * THE N AXIS GETS EASIER, NOT HARDER. `MFMA_N` is 32 and the 32x32 MFMA gives a lane one
+     * output column, so a j-group's 32 columns map ONE-TO-ONE onto a 32-wide N-scale block. The
+     * `BN % 128` alignment WFP8BLK needs (to keep a 32-column group inside one 128-wide block)
+     * therefore relaxes to `BN % 32`, which every tile in this file already satisfies. */
+    static_assert(!WFP8MX || KEXACT, "the block-fp8 B-fetch requires KEXACT (K % BK == 0)");
+    static_assert(!WFP8MX || !NORM, "block-fp8 weights + fused RMSNorm-A is not emitted");
+    static_assert(!WFP8MX || !GLU, "block-fp8 gate|up is emitted as two GEMMs + Glu, not fused");
+    static_assert(!WFP8MX || (!WFP4 && !WFP8BLK), "one weight encoding at a time");
+    static_assert(!WFP8MX || BK == 32, "the 32-K scale block must be exactly one BK tile");
+    static_assert(!WFP8MX || BN % 32 == 0, "a j-group must sit inside one 32-wide N-scale block");
     (void)act;
     constexpr int THREADS = WM * WN * PLOW_WAVE;
     /* COMPACT row stride (no +8 pad). global_load_lds writes the 64 lanes CONTIGUOUSLY from a
@@ -521,7 +546,8 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
      * 64x128 231 -> 268, 128x128 317 -> 378, 128x256 359 -> 451.
      * gfx950 is untouched: PLOW_CDNA4 is 1 there, the builtin is real, and DBUF=2 gives the DMA
      * its idle buffer to stream into a cluster ahead. */
-    constexpr bool DIRECT = PLOW_GM_DIRECT_STAGE && !NORM && !GLU && KEXACT && !WFP4 && !WFP8BLK;
+    constexpr bool DIRECT =
+        PLOW_GM_DIRECT_STAGE && !NORM && !GLU && KEXACT && !WFP4 && !WFP8BLK && !WFP8MX;
     /* Two-deep GLOBAL prefetch, the register-bank analogue of Tensile's PGR2. Only reachable on
      * the single-buffered register-staging path -- with two LDS buffers the DMA already has the
      * idle buffer to stream into, and DIRECT has no register bank to double. */
@@ -562,17 +588,40 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
         /* The block-fp8 PROMOTION accumulator, and this lane's N-scale-block row — constant for
          * the whole tile (see the WFP8BLK note at the top of this function). Sized 1x1 and never
          * touched off the block-fp8 arm, so the bf16 and fp4 register allocations are unmoved. */
-        constexpr int FSM = WFP8BLK ? SM : 1, FSN = WFP8BLK ? SN : 1;
+        constexpr bool BLKQ = WFP8BLK || WFP8MX;
+        constexpr int FSM = BLKQ ? SM : 1, FSN = BLKQ ? SN : 1;
         f32x16 accf[FSM][FSN];
         unsigned nsblk[FSN];
-        const unsigned KB = (K + 127u) >> 7; /* 128-K scale blocks per output channel */
-        if constexpr (WFP8BLK) {
+        /* K scale blocks per output channel: 128 wide on the GLM/V4 grid, 32 on V4.1's. */
+        const unsigned KB = WFP8MX ? ((K + 31u) >> 5) : ((K + 127u) >> 7);
+        if constexpr (BLKQ) {
 #pragma unroll
             for (int i = 0; i < SM; i++)
 #pragma unroll
                 for (int j = 0; j < SN; j++) accf[i][j] = (f32x16)(0.0f);
 #pragma unroll
-            for (int j = 0; j < SN; j++) nsblk[j] = (n0 + wn * (BN / WN) + j * MFMA_N) >> 7;
+            for (int j = 0; j < SN; j++) {
+                nsblk[j] = (n0 + wn * (BN / WN) + j * MFMA_N) >> (WFP8MX ? 5 : 7);
+                /* CLAMP THE N-SCALE ROW, for the same reason the K axis is clamped below, and
+                 * ONLY on the 32 grid -- where it is load-bearing rather than defensive.
+                 *
+                 * At 128 the N-scale block is exactly BN wide, so a tile maps to ONE block row
+                 * and the row count ceil(N/128) can never be exceeded: the guard would be dead
+                 * code. At 32 a BN=128 tile spans FOUR block rows, so when N is not a multiple
+                 * of BN the tile's upper j-groups address rows past ceil(N/32) -- every column
+                 * they own is >= N and discarded at the guarded store, but the promotion still
+                 * READS the scale byte before anything is discarded.
+                 *
+                 * That is an out-of-bounds global read, not a wrong number: valid columns keep
+                 * taking the right scale either way (checked exhaustively on the host). It is
+                 * DeepSeek-V4.1's `attn.wkv` that makes this real rather than theoretical --
+                 * N = 576 = 512 latent + 64 rope is not a multiple of 128, so the last tile
+                 * addresses rows 18 and 19 of an 18-row grid, 320 bytes past the end. */
+                if constexpr (WFP8MX) {
+                    const unsigned nbmax = ((N + 31u) >> 5) - 1u;
+                    if (nsblk[j] > nbmax) nsblk[j] = nbmax;
+                }
+            }
         }
         (void)KB;
 
@@ -650,7 +699,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                 const unsigned char sc = as_glob(ssrc)[(size_t)r * (K >> 5) + (kk >> 5)];      \
                 *(bf16v8*)&rb[it * 8] = fp4_to_bf16v8(w32, e8m0_to_f32(sc));                   \
             } else _Pragma("unroll") for (int j = 0; j < 8; j++) rb[it * 8 + j] = 0;          \
-        } else if constexpr (WFP8BLK) {                                                       \
+        } else if constexpr (WFP8BLK || WFP8MX) {                                             \
             /* EXACT fp8 -> bf16, NO scale here. `bsrc` is the e4m3 weight (passed through the    \
              * B slot cast to bf16*, exactly as WFP4 passes its packed fp4); the block scale is    \
              * applied to the f32 accumulator at the 128-K boundary below. */                     \
@@ -885,6 +934,21 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                             acc[i][j] = (f32x16)(0.0f);
                         }
                 }
+            } else if constexpr (WFP8MX) {
+                /* BK == 32, so one k-tile IS one scale block and EVERY tile promotes -- no
+                 * parity test, and the boundary is still outside the MFMA burst. The scale is a
+                 * ue8m0 byte, decoded exactly the way the fp4 B-fetch decodes its MX rows. */
+                unsigned kb = kt;
+                if (kb >= KB) kb = KB - 1;
+#pragma unroll
+                for (int i = 0; i < SM; i++)
+#pragma unroll
+                    for (int j = 0; j < SN; j++) {
+                        const float bs =
+                            e8m0_to_f32(as_glob(bscale)[(size_t)nsblk[j] * KB + kb]);
+                        accf[i][j] += acc[i][j] * bs;
+                        acc[i][j] = (f32x16)(0.0f);
+                    }
             }
             if constexpr (!DBUF) {
                 /* Every wave has now read the whole tile, so the single buffer is free. This is
@@ -921,7 +985,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
             if constexpr (DBUF) buf ^= 1;
         }
         /* Hand the promoted result back to the shared epilogue below. */
-        if constexpr (WFP8BLK) {
+        if constexpr (BLKQ) {
 #pragma unroll
             for (int i = 0; i < SM; i++)
 #pragma unroll
@@ -1369,6 +1433,38 @@ __device__ void d_gemm_fp8_blk(bf16* C, const bf16* A, const unsigned char* W,
     d_gemm_t<GM_BLK_BM, GM_BLK_BN, GM_BLK_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0),
              true, false, false, true>(C, A, (const bf16*)W, nullptr, nullptr, M, N, K, slice, nblk,
                                        lds, nullptr, 0, nullptr, wscale);
+}
+
+/* BLOCK-FP8 AT A [32, 32] UE8M0 GRID -- DeepSeek-V4.1's quantization, and the arm without which
+ * 39.8% of a V4.1 8k prefill cannot be lowered at all (every projection: wq_a/wq_b/wkv/wo_a/wo_b,
+ * the shared expert, engram.wkv, indexer.wq_b). The routed experts do NOT need it; they are MXFP4.
+ *
+ * TWO differences from `d_gemm_fp8_blk`, and either alone silently rescales every output:
+ *   * the grid is `[ceil(N/32)][ceil(K/32)]`, not `[ceil(N/128)][ceil(K/128)]`;
+ *   * the entries are UE8M0 BYTES, not f32 -- so `wscale` is `const unsigned char*` here, and it
+ *     rides the u8 scale slot the MXFP4 fetch already uses rather than the f32 `bsblk` slot.
+ *
+ * BK=32 IS THE POINT, NOT AN ARBITRARY TILE. The promotion must land on a k-tile boundary (see the
+ * WFP8MX note in `d_gemm_t`), and a 32-element K block does not divide BK=64. At BK=32 one k-tile
+ * is exactly one scale block. The cost is a halved K step, i.e. twice the LDS traffic per MFMA,
+ * and it is UNMEASURED -- a BK=64 variant promoting twice per tile is the optimization to try
+ * once there is a number to beat. Do not assume this tile is the right one; it is the CORRECT one.
+ *
+ * BM/BN follow `d_gemm_fp8_blk`'s 128x128 for the same accumulator reason: the second (promotion)
+ * accumulator doubles the register cost, and 128x128 is the rung that measured 148 VGPR / 0 spill
+ * on gfx942 where the bf16 tile's 192x256 spilled 63. */
+#ifndef GM_MX_BM
+#define GM_MX_BM 128
+#endif
+#ifndef GM_MX_BN
+#define GM_MX_BN 128
+#endif
+__device__ void d_gemm_fp8_mx(bf16* C, const bf16* A, const unsigned char* W,
+                              const unsigned char* wscale, unsigned M, unsigned N, unsigned K,
+                              unsigned slice, unsigned nblk, bf16* lds) {
+    d_gemm_t<GM_MX_BM, GM_MX_BN, 32, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true,
+             false, false, false, true>(C, A, (const bf16*)W, nullptr, nullptr, M, N, K, slice,
+                                        nblk, lds, nullptr, 0, wscale);
 }
 
 /* GEMM over gate|up in ONE pass, act(g)*u applied in the EPILOGUE. The prefill twin of
@@ -5023,6 +5119,239 @@ __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
                            unsigned slice, unsigned nblk) {
     const unsigned wave = threadIdx.x / PLOW_WAVE;
     const unsigned lane = threadIdx.x % PLOW_WAVE;
+    /* WIDE-M ARM. The loop below parallelises over N ALONE, which is right for the op's original
+     * caller (M is a token or three) and catastrophic for V4.1's mHC, where the same opcode is
+     * M=8192, N=24, K=20480. At N=24 the n-stride `nblk * PLOW_WAVES` = 2432 leaves waves 24..2431
+     * with nothing to do: THREE of 304 workgroups compute the whole 8192x24x20480 product while
+     * 301 fall straight through the M loop. Measured on 8x MI300X at 8k: 827 ms per packet, two
+     * packets per layer, 1654 ms of a 1694 ms layer -- 97.6% of it, in an op whose 335 MB of reads
+     * should cost ~63 us.
+     *
+     * When there are at least as many rows as blocks, give each BLOCK a row and each WAVE a column
+     * instead. All 304 x 8 waves then work, and the eight waves of a block sweep one `xm` at the
+     * same time, so the row is read from HBM once and hit in cache by the other seven.
+     *
+     * BIT-IDENTICAL, both arms: an output is still one wave's `wave_sum` over the same lane-strided
+     * K in the same order. Only WHICH wave owns (m, n) changes, and no caller depends on that --
+     * `GemvF32` is RowClass::A and the packet is coarse, so every block waits on the same counter
+     * and none of them claims a designated row band. */
+#ifndef PLOW_GEMV_F32_ARM
+/* Who owns which (row, column) of the wide-M arm. 0 = a BLOCK owns a row and each of its 8 waves
+ * takes 4 column slots, one of which aliases at N=24. 1 = the same with the alias removed.
+ * 2 = a WAVE owns a row and sweeps N in groups of 8. 3 = a wave owns a row and carries every
+ * column at once, so x is read once. 4 = arm 2's traffic over a flattened (row, column group)
+ * index, for the tail balance.
+ *
+ * ALL FIVE ARE BIT-IDENTICAL -- an output is still one wave's `wave_sum` over the same
+ * lane-strided K in the same order, and only WHICH wave owns (m, n) changes. Demonstrated, not
+ * argued: all five produce the same layer exit to the last printed digit.
+ *
+ * MEASURED on 8x MI300X, V4.1 layer 0 at T=8192 (N=24, K=20480), `d_gemv_f32` over the layer's
+ * two packets and the layer median:
+ *
+ *     arm 0   block per row, 4 slots, 1 aliased      6311 us    23272 us
+ *     arm 1   the same, alias removed                6300 us    23284 us
+ *     arm 2   wave per row, groups of 8              3429 us    20465 us
+ *     arm 3   wave per row, all 24 in registers      8136 us    25207 us
+ *     arm 4   flattened (row, column group)          3362 us    20416 us   <- default
+ *
+ * Two of these are results reading would have got backwards. Arm 1 deletes a quarter of the FMAs
+ * and a quarter of the W reads and changes NOTHING, because W is 1.97 MB and lives in L2 -- the
+ * alias was already free. Arm 3 reads x once instead of three times, the largest traffic cut
+ * available, and is the WORST of the five: 24 live floats per lane on a kernel already at the
+ * 256-VGPR cap spill, and the spill traffic costs more than the x re-reads it saves (the straggler
+ * goes 460 -> 917 us per packet). Arm 4 beats arm 2 by the margin its rationale predicts and for
+ * the reason it predicts -- the straggler halves, 460 -> 201 us -- but only 2%, so the ragged tail
+ * was never the main cost either.
+ *
+ * At 3362 us this is still ~50x off the 63 us that 335 MB of x at HBM bandwidth would cost, so
+ * the op is not done; it is measured. */
+#define PLOW_GEMV_F32_ARM 4
+#endif
+
+#if PLOW_GEMV_F32_ARM == 3
+    /* WAVE PER ROW, WHOLE ROW IN REGISTERS. Arm 2 still sweeps `xm` once per column group -- three
+     * passes at N=24. Carrying every column at once reads it ONCE, which is the floor for this
+     * shape: 335 MB of x is the whole tensor, and W (24 x 20480 x 4 = 1.97 MB) is small enough to
+     * stay in L2 across every row.
+     *
+     * The cost is `NA` live floats per lane on a megakernel that is already at the 256-VGPR cap.
+     * The trip counts are compile-time so the accumulators can stay in registers rather than
+     * scratch; `N > NA` falls through to the arms below rather than reading off the end. */
+    {
+        constexpr unsigned NA = 24u; /* V4.1's mHC mix width, (2 + hc_mult) * hc_mult */
+        if (M >= nblk && N <= NA) {
+            for (unsigned m = slice * PLOW_WAVES + wave; m < M; m += nblk * PLOW_WAVES) {
+                const bf16* const xm = x + (size_t)m * K;
+                float* const cm = C + (size_t)m * N;
+                float a[NA];
+#pragma unroll
+                for (unsigned j = 0; j < NA; j++) a[j] = 0.0f;
+                for (unsigned k = lane; k < K; k += PLOW_WAVE) {
+                    const float xv = bf2f(xm[k]);
+#pragma unroll
+                    for (unsigned j = 0; j < NA; j++)
+                        /* A column past N reads column 0 again -- in cache, and its accumulator is
+                         * dropped unstored -- so the unrolled body stays branch-free. */
+                        a[j] += xv * W[(size_t)(j < N ? j : 0u) * K + k];
+                }
+#pragma unroll
+                for (unsigned j = 0; j < NA; j++) a[j] = wave_sum(a[j]);
+                if (lane == 0) {
+#pragma unroll
+                    for (unsigned j = 0; j < NA; j++)
+                        if (j < N) cm[j] = a[j];
+                }
+            }
+            return;
+        }
+    }
+#elif PLOW_GEMV_F32_ARM == 4
+    /* ARM 2's TRAFFIC, BETTER BALANCED. Arm 2 gives a wave whole ROWS, and 8192 rows over
+     * 304 x 8 = 2432 waves is 3.37 each -- so the wave that gets 4 sets the op's time and 18.7% of
+     * the machine idles at the tail. Measured: the straggler doubled, 230 -> 460 us per packet.
+     *
+     * Flattening (row, column group) into ONE index is the same memory traffic -- a wave still
+     * re-reads its row once per group -- over 8192 x 3 = 24576 items, which is 10.1 per wave
+     * instead of 3.37, so the ragged tail costs 8.9% rather than 18.7%. */
+    {
+        constexpr unsigned CG = 8u; /* columns per group, as arm 2 */
+        if (M >= nblk) {
+            const unsigned groups = (N + CG - 1u) / CG;
+            const unsigned items = M * groups;
+            for (unsigned it = slice * PLOW_WAVES + wave; it < items; it += nblk * PLOW_WAVES) {
+                const unsigned m = it / groups, n0 = (it % groups) * CG;
+                const bf16* const xm = x + (size_t)m * K;
+                float* const cm = C + (size_t)m * N;
+                const float* wp[CG];
+                float a[CG];
+                for (unsigned j = 0; j < CG; j++) {
+                    const unsigned nj = n0 + j;
+                    wp[j] = W + (size_t)(nj < N ? nj : n0) * K;
+                    a[j] = 0.0f;
+                }
+                for (unsigned k = lane; k < K; k += PLOW_WAVE) {
+                    const float xv = bf2f(xm[k]);
+                    for (unsigned j = 0; j < CG; j++) a[j] += xv * wp[j][k];
+                }
+                for (unsigned j = 0; j < CG; j++) a[j] = wave_sum(a[j]);
+                if (lane == 0) {
+                    for (unsigned j = 0; j < CG; j++)
+                        if (n0 + j < N) cm[n0 + j] = a[j];
+                }
+            }
+            return;
+        }
+    }
+#elif PLOW_GEMV_F32_ARM == 2
+    /* WAVE PER ROW. The shipped arm has all 8 waves of a block sweep ONE row, so the row is read
+     * eight times and held together only by L1. Here each wave owns its own row and re-reads it
+     * once per column group -- 3 passes at N=24 rather than 8 -- trading inter-wave spatial reuse
+     * for intra-wave temporal reuse. Eight accumulators, not 24: the megakernel is already at the
+     * 256-VGPR cap with 122 spills, so a full-N accumulator set would pay for this op's traffic
+     * out of every other op's register budget. */
+    if (M >= nblk) {
+        for (unsigned m = slice * PLOW_WAVES + wave; m < M; m += nblk * PLOW_WAVES) {
+            const bf16* const xm = x + (size_t)m * K;
+            float* const cm = C + (size_t)m * N;
+            for (unsigned n0 = 0; n0 < N; n0 += 8u) {
+                const float* wp[8];
+                float a[8];
+                for (unsigned j = 0; j < 8u; j++) {
+                    const unsigned nj = n0 + j;
+                    /* A slot past N aliases n0: it re-reads a row already in cache, its
+                     * accumulator is dropped unstored, and the k loop stays branch-free. */
+                    wp[j] = W + (size_t)(nj < N ? nj : n0) * K;
+                    a[j] = 0.0f;
+                }
+                for (unsigned k = lane; k < K; k += PLOW_WAVE) {
+                    const float xv = bf2f(xm[k]);
+                    for (unsigned j = 0; j < 8u; j++) a[j] += xv * wp[j][k];
+                }
+                for (unsigned j = 0; j < 8u; j++) a[j] = wave_sum(a[j]);
+                if (lane == 0) {
+                    for (unsigned j = 0; j < 8u; j++)
+                        if (n0 + j < N) cm[n0 + j] = a[j];
+                }
+            }
+        }
+        return;
+    }
+#elif PLOW_GEMV_F32_ARM == 1
+    /* NO ALIAS SLOT. At N=24 over 8 waves the shipped arm's fourth slot always aliases, so a
+     * quarter of the FMAs and a quarter of the W reads are thrown away. Three CONTIGUOUS columns
+     * per wave instead: exact at N=24, and the tail predicate covers every other N. */
+    if (M >= nblk) {
+        for (unsigned m = slice; m < M; m += nblk) {
+            const bf16* const xm = x + (size_t)m * K;
+            float* const cm = C + (size_t)m * N;
+            for (unsigned n0 = wave * 3u; n0 < N; n0 += PLOW_WAVES * 3u) {
+                const unsigned n1 = n0 + 1u, n2 = n0 + 2u;
+                const float* const w0 = W + (size_t)n0 * K;
+                const float* const w1 = W + (size_t)(n1 < N ? n1 : n0) * K;
+                const float* const w2 = W + (size_t)(n2 < N ? n2 : n0) * K;
+                float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+                for (unsigned k = lane; k < K; k += PLOW_WAVE) {
+                    const float xv = bf2f(xm[k]);
+                    a0 += xv * w0[k];
+                    a1 += xv * w1[k];
+                    a2 += xv * w2[k];
+                }
+                a0 = wave_sum(a0);
+                a1 = wave_sum(a1);
+                a2 = wave_sum(a2);
+                if (lane == 0) {
+                    cm[n0] = a0;
+                    if (n1 < N) cm[n1] = a1;
+                    if (n2 < N) cm[n2] = a2;
+                }
+            }
+        }
+        return;
+    }
+#endif
+    if (M >= nblk) {
+        for (unsigned m = slice; m < M; m += nblk) {
+            const bf16* const xm = x + (size_t)m * K;
+            float* const cm = C + (size_t)m * N;
+            /* FOUR COLUMNS PER PASS over x, not one. A column's dot product reads the whole
+             * `xm` row, so one-at-a-time reads the row once per column -- 24 times at V4.1's
+             * N=24, which is 8 GB of x traffic where the tensor is 335 MB. Carrying four
+             * accumulators against one `bf2f(xm[k])` cuts that by four and gives the VALU four
+             * independent FMA chains instead of one dependent one. */
+            for (unsigned n0 = wave; n0 < N; n0 += PLOW_WAVES * 4u) {
+                const unsigned n1 = n0 + PLOW_WAVES;
+                const unsigned n2 = n0 + 2u * PLOW_WAVES;
+                const unsigned n3 = n0 + 3u * PLOW_WAVES;
+                /* A tail slot with no column of its own ALIASES n0: it re-reads a row already
+                 * in cache, its accumulator is dropped unstored, and the k loop stays
+                 * branch-free. N=24 over 8 waves leaves exactly one such slot per wave. */
+                const float* const w0 = W + (size_t)n0 * K;
+                const float* const w1 = W + (size_t)(n1 < N ? n1 : n0) * K;
+                const float* const w2 = W + (size_t)(n2 < N ? n2 : n0) * K;
+                const float* const w3 = W + (size_t)(n3 < N ? n3 : n0) * K;
+                float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+                for (unsigned k = lane; k < K; k += PLOW_WAVE) {
+                    const float xv = bf2f(xm[k]);
+                    a0 += xv * w0[k];
+                    a1 += xv * w1[k];
+                    a2 += xv * w2[k];
+                    a3 += xv * w3[k];
+                }
+                a0 = wave_sum(a0);
+                a1 = wave_sum(a1);
+                a2 = wave_sum(a2);
+                a3 = wave_sum(a3);
+                if (lane == 0) {
+                    cm[n0] = a0;
+                    if (n1 < N) cm[n1] = a1;
+                    if (n2 < N) cm[n2] = a2;
+                    if (n3 < N) cm[n3] = a3;
+                }
+            }
+        }
+        return;
+    }
     for (unsigned m = 0; m < M; m++) {
         const bf16* const xm = x + (size_t)m * K;
         float* const cm = C + (size_t)m * N;

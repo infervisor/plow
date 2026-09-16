@@ -970,6 +970,16 @@ impl Builder {
         &self.tensors[h as usize].name
     }
 
+    /// The declared size of handle `h`, in bytes.
+    ///
+    /// For emitters that want to check an operand against the shape they are about to pass in
+    /// `i[]`. A weight declared at one size and read at another is the silent-wrongness case: the
+    /// kernel reads whatever is at the handle, so a full-size tensor read with a per-rank N gives
+    /// every rank the FIRST shard of the weight instead of its own, with no fault anywhere.
+    pub fn tensor_bytes(&self, h: u32) -> u64 {
+        self.tensors[h as usize].bytes
+    }
+
     /// Declare a tensor whose contents the compiler already knows (e.g. RoPE tables).
     pub fn tensor_init(&mut self, name: &str, init: Vec<u8>) -> u32 {
         self.tensors.push(TensorDecl {
@@ -1826,6 +1836,23 @@ impl Builder {
             self.ops[*combine].inst.i[6] = experts;
         }
         chains.len()
+    }
+
+    /// Drop every op after the first `n`, for BISECTION.
+    ///
+    /// A diagnostic, and the only sound direction to cut: dependencies point BACKWARDS, so no
+    /// surviving op can reference one this drops, and `finish` then computes waits and successors
+    /// over the remaining prefix exactly as if the emitter had stopped there. Cutting anywhere
+    /// but the tail would leave a dangling counter.
+    ///
+    /// Exists because a per-op cost on real hardware cannot be had any other way on this stack:
+    /// the interpreter is a MEGAKERNEL, so one launch covers the whole layer and a kernel-level
+    /// profiler reports one number for 34 ops. Emitting prefixes and differencing their run times
+    /// is the profiler.
+    pub fn truncate_ops(&mut self, n: usize) {
+        if n < self.ops.len() {
+            self.ops.truncate(n);
+        }
     }
 
     pub fn finish(mut self) -> Program {

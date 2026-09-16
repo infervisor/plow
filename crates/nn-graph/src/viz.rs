@@ -233,6 +233,13 @@ fn op_detail(op: &Op) -> serde_json::Value {
             "beta": beta, "linear_beta": linear_beta,
         }),
         Op::BlockResidual { max_snapshots } => json!({ "max_snapshots": max_snapshots }),
+        Op::HcMixes {
+            hc_mult,
+            sinkhorn_iters,
+            eps,
+        } => json!({ "hc_mult": hc_mult, "sinkhorn_iters": sinkhorn_iters, "eps": eps }),
+        Op::HcPre { hc_mult } => json!({ "hc_mult": hc_mult }),
+        Op::HcPost { hc_mult } => json!({ "hc_mult": hc_mult }),
     }
 }
 

@@ -7729,6 +7729,87 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         }
         mla::kimi_k3_emit(&dir, ctx, tp, block_spec.as_deref());
     }
+    // DeepSeek-V4.1-Flash (`deepseek_v41`, text tower `deepseek_v41_text`). Claimed HERE for the
+    // same reason `kimi_k3` above is: it nests its geometry under `text_config`, which `cfg_from`
+    // (crates/devgen/src/config.rs) treats as "Gemma-4 multimodal" unconditionally, so an
+    // unclaimed checkpoint dies unwrapping Gemma's `layer_types` -- an error naming the wrong
+    // field of the wrong architecture, which is worse than no support at all.
+    //
+    // It is ALSO the case that the `kimi`/`deepseek_v3` arm below would parse V4.1's MLA keys:
+    // they have the same spelling. That arm has no CSA2, no Engram and no two-level indexer, so
+    // it would emit a blob for a model this is not, and the blob would run. Hence a claim that
+    // refuses rather than an arm that is absent.
+    //
+    // What is actually missing is tracked in docs/amd/deepseek-v41-flash-mi300x.md section 5.6.
+    // mHC is NOT in the list: `glm53_emit_full` already emits ops 128/129 at V4.1's own constants
+    // (hc_mult 4, sinkhorn 20) reading V4.1's own tensor names, so the full-model emit forks that
+    // rather than starting over.
+    if model_type == "deepseek_v41" || model_type == "deepseek_v41_text" {
+        // A RUNG request (`--block L`, or PLOW_LAYERS=single:L) gets the per-layer plan rather
+        // than the whole-model refusal. The two say different things and the difference is the
+        // point: the model-level message lists what the EMITTER lacks, while a rung names which
+        // parts of ONE layer are emitted and which are not -- which is the thing that shrinks as
+        // work lands, and the thing gpuq's tier-3 bring-up path actually asks for.
+        //
+        // It still refuses. A rung that emitted only the parts that exist would load, run and
+        // produce fluent-looking garbage, which is worse than not emitting.
+        let single = emit_config::active().layer_cfg().2;
+        // `--block l..r` MEANS l..=r. It used to take `split("..").next()`, i.e. the left end
+        // alone, so `--block 0..39` silently emitted layer 0 and wrote a blob byte-identical to
+        // `--block 0` -- a whole-model request answered with one layer and no diagnostic. A
+        // malformed range is refused rather than narrowed, for the same reason.
+        let layers: Option<Vec<u32>> = block_spec
+            .as_deref()
+            .map(|s| {
+                let p: Vec<&str> = s.split("..").map(str::trim).collect();
+                let bad = || panic!("--block {s:?}: expected `l` or `l..r` with l <= r");
+                match p.as_slice() {
+                    [one] => vec![one.parse::<u32>().unwrap_or_else(|_| bad())],
+                    [lo, hi] => {
+                        let (lo, hi) = (
+                            lo.parse::<u32>().unwrap_or_else(|_| bad()),
+                            hi.parse::<u32>().unwrap_or_else(|_| bad()),
+                        );
+                        if lo > hi {
+                            bad();
+                        }
+                        (lo..=hi).collect()
+                    }
+                    _ => panic!("--block {s:?}: expected `l` or `l..r` with l <= r"),
+                }
+            })
+            .or_else(|| single.map(|l| vec![l]));
+        if let Some(layers) = layers {
+            let l = layers[0];
+            // A config that does not parse is a DIFFERENT failure from an unemitted part, and
+            // saying so keeps a checkpoint problem from reading as missing emit work.
+            let c = mla::cfg_dsv41(&dir)
+                .unwrap_or_else(|e| panic!("deepseek_v41 --block {l}: the config does not parse, \
+                     so there is nothing to plan a rung against: {e}"));
+            // Every layer, not just the first: a range whose tail is unemittable must say so
+            // before it writes a blob that is short some layers.
+            let plan = layers
+                .iter()
+                .try_fold((), |_, &li| mla::dsv41_emit_block_plan(&c, li).map(|_| ()));
+            match plan {
+                Ok(_) => {
+                    // Every part of this layer is emitted, so write the rung. The prefill width
+                    // is the largest requested bucket; `ctx` bounds the rope tables.
+                    let t = mla::glm_prefill_buckets_env(ctx)
+                        .0
+                        .last()
+                        .copied()
+                        .unwrap_or_else(|| ctx.min(1024));
+                    mla::dsv41_emit_block(
+                        &dir, &layers, ctx, t, &out, n_cu, tp, rope_gen, &arch, verify.as_ref(),
+                    );
+                    return;
+                }
+                Err(report) => panic!("{report}"),
+            }
+        }
+        panic!("{}", dsv41_refusal(&dir));
+    }
     if model_type == "glm5_next" {
         assert!(
             block_spec.is_none(),
@@ -8055,13 +8136,96 @@ pub(crate) fn require_mla_geometry(kv_lora: u32, qk_rope: u32, v_head: u32, mode
 ///
 /// Gating each flag as it is discovered is whack-a-mole. This is the general form: whatever the
 /// flags did, the STREAM is checked against what the target can run.
+/// The `deepseek_v41` refusal, with the checkpoint's own validated numbers in it.
+///
+/// The geometry comes from `nn_graph::models::config`, which parses and validates V4.1 once
+/// and is tested against the released shards -- devgen does NOT re-read the config. A
+/// checkpoint that fails to parse still gets the static half: the claim exists to keep V4.1
+/// away from the Gemma probe and the `deepseek_v3` arm, and that job does not depend on the
+/// config being readable.
+fn dsv41_refusal(dir: &std::path::Path) -> String {
+    // One V4.1 reader, in `mla::dsv41`, going through nn-graph's verified parser. This used to
+    // inline its own copy of the wrapper/`text_config` dance; the emit path needs exactly the same
+    // resolution, and two copies of it is how the two drift on the fields that are hard to read.
+    let cfg = match mla::cfg_dsv41(dir) {
+        Ok(c) => c,
+        // A config too partial to resolve still gets the ITEMISED list, just without the
+        // checkpoint's own numbers in it. The list is the actionable half of this message -- a
+        // reader who hands devgen a stub config needs to know what to build just as much as one
+        // who hands it the real shards, and "did not resolve" alone tells them nothing.
+        Err(e) => {
+            return format!(
+                "deepseek_v41: no device emit yet, and this refuses rather than emitting a wrong \
+                 model. The checkpoint at {} did not resolve through nn-graph: {e}. What the \
+                 EMITTER still needs, independent of this config: (1) CSA2 emit -- the compressor \
+                 runs on the kv_source layers and every other layer READS that cache; (2) the \
+                 two-level indexer, where only the kv_source layers own index KEYS; (3) Engram's \
+                 host side -- the tokenizer-derived compressed-token map and lookback cache; (4) \
+                 the grouped output LoRA, which is 8 ordinary GEMMs at prefill and wants one fused \
+                 kernel only at decode; (5) a full-model emit forking glm53_emit_full. See \
+                 docs/amd/deepseek-v41-flash-mi300x.md section 5.6 for the ordered path.",
+                dir.display()
+            )
+        }
+    };
+
+    let mut out = format!(
+        "deepseek_v41: no device emit yet, and this refuses rather than emitting a wrong model. \
+         The checkpoint parses and VALIDATES: {} layers, {} kv_source layers {:?} whose compressed \
+         cache all of them read, {} indexer layers {:?}, engram at {:?}. Attention is a FULLY \
+         ABSORBED MLA -- one {}-wide latent per token shared by all {} heads, no kv_b tensor at \
+         all -- with a grouped output LoRA ({} x {}).",
+        cfg.layers,
+        cfg.kv_source.len(),
+        cfg.kv_source,
+        cfg.index_source.len(),
+        cfg.index_source,
+        cfg.engram_layers,
+        cfg.head_dim,
+        cfg.heads,
+        cfg.o_groups,
+        cfg.o_lora_rank,
+    );
+
+    // A contradiction between the config and the tensors on disk outranks the gap list: it means
+    // the geometry below is not this checkpoint's, so say so first and loudly.
+    let bad = mla::dsv41_shard_check(&cfg, dir);
+    if !bad.is_empty() {
+        out.push_str(&format!(
+            " WARNING -- the shards CONTRADICT the config on {} tensor(s): {}. Fix that before \
+             reading anything below.",
+            bad.len(),
+            bad.join("; ")
+        ));
+    }
+
+    out.push_str(
+        " The runtime side is most of the way there -- mHC, the DSA indexer, the MXFP4 experts, \
+         the clamped SwiGLU, the CSA2 kernels (ops 180/181) and Engram (ops 182/183) all dispatch \
+         today. What the EMITTER still needs:",
+    );
+    for (i, gap) in mla::dsv41_gaps(&cfg).iter().enumerate() {
+        out.push_str(&format!(" ({}) {gap};", i + 1));
+    }
+    out.push_str(
+        " See docs/amd/deepseek-v41-flash-mi300x.md section 5.6 for the ordered path. `--block` is \
+         not a shortcut: `hc_mult` puts mHC on EVERY layer, so there is no mHC-free block to \
+         extract.",
+    );
+    out
+}
+
 const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_ADD_NORM",
     "PLOW_DOP_ARGMAX",
     "PLOW_DOP_ARGMAX_FIN",
     "PLOW_DOP_ATTN_RES",
     "PLOW_DOP_ATTN_SELECT",
+    "PLOW_DOP_COMPRESS_POOL",
+    "PLOW_DOP_COMPRESS_ROPE_QUANT",
     "PLOW_DOP_DENSE_GLU_FP8_BLK",
+    "PLOW_DOP_ENGRAM_EMBED",
+    "PLOW_DOP_ENGRAM_GATE",
     "PLOW_DOP_DSA_POOL_COMPRESS",
     "PLOW_DOP_DSA_POOL_EXPAND",
     "PLOW_DOP_DSA_POOL_STASH",
@@ -8084,6 +8248,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMM_C5_MXFP4",
     "PLOW_DOP_GEMM_FP8",
     "PLOW_DOP_GEMM_FP8_BLK",
+    "PLOW_DOP_GEMM_FP8_MX",
     "PLOW_DOP_GEMM_GLU",
     "PLOW_DOP_GEMM_GLU_FP8",
     "PLOW_DOP_GEMM_GLU_MXFP4",
@@ -8183,6 +8348,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_QWEN_SIGMOID_GATE",
     "PLOW_DOP_RESIDUAL",
     "PLOW_DOP_RMSNORM",
+    "PLOW_DOP_ROPE_INVERSE_O",
     "PLOW_DOP_ROWRMS",
     "PLOW_DOP_ROW_GATHER",
     "PLOW_DOP_SITU_GLU",

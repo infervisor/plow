@@ -267,6 +267,9 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
       PLOW_KDA_CONV_STEP_DB) [ "$val" = 1 ] && : "${PLOW_K3_KDA_CONV_STEP_DB:=1}" ;;
       PLOW_MOE_PF_ATOMIC)    [ "$val" = 1 ] && : "${PLOW_MOE_PF_ATOMIC:=1}" ;;
       PLOW_MOE_PF_DET)       [ "$val" = 1 ] && : "${PLOW_MOE_PF_DET:=1}" ;;
+      PLOW_DSV41_BLKFP8)     [ "$val" = 1 ] && : "${PLOW_DSV41_BLKFP8:=1}" ;;
+      PLOW_DSV41_ENGRAM)     [ "$val" = 1 ] && : "${PLOW_DSV41_ENGRAM:=1}" ;;
+      PLOW_DSV4_CSA2)        [ "$val" = 1 ] && : "${PLOW_DSV4_CSA2:=1}" ;;
       PLOW_GLM_FUSE_QNORM)   [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_QNORM:=1}" ;;
       PLOW_GLM_FUSE_POST)    [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_POST:=1}" ;;
       PLOW_GLM_FUSE_SEAM_RN) [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_SEAM_RN:=1}" ;;
@@ -795,8 +798,16 @@ fi
 # worst case over all of them, so two more full-column-wave bodies must not be forced on the
 # GLM / V3 blobs that never emit a NoPE packet. Without it the NoPE bit still TRAPS, so a
 # blob that needs the arm and an object that lacks it is a hard stop, not a wrong answer.
+# THE PF2 SPELLING IS THE ONE THAT MATTERS, and setting only the other name shipped an object
+# the loader refuses. `interp.hip` emits the marker plowrt looks for --
+# `plow_mla_pf2_nope_arm` -- under `#if PLOW_MLA_PF2_NOPE_ARM`, and its compatibility shim runs
+# ONE WAY: `#ifndef PLOW_MLA_PF_NOPE_ARM / #define PLOW_MLA_PF_NOPE_ARM PLOW_MLA_PF2_NOPE_ARM`.
+# Defining the non-2 name therefore satisfies the body and leaves the MARKER undefined, so the
+# object compiles the arm and cannot prove it: a V4.1 rung at T=8192 routes its NoPE MLA segment
+# to the flash object and the load dies with "has no zero-rope V2 arm". Define the pf2 name and
+# the shim gives the other for free.
 if [ "${PLOW_MLA_PF_NOPE:-0}" = 1 ]; then
-  AX_FLASH="$AX_FLASH -DPLOW_MLA_PF_NOPE_ARM=1"
+  AX_FLASH="$AX_FLASH -DPLOW_MLA_PF2_NOPE_ARM=1"
 fi
 
 # OPT-IN (PLOW_DSA_IDX64=1): the 64-index-head arm of the DSA prefill indexer score (op 117).
@@ -831,6 +842,25 @@ fi
 # collective's synchronization costs, never ships, and must not touch a serve asset.
 if [ "${PLOW_XR_NOWAIT:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_XR_NOWAIT=1"
+fi
+
+# PLOW_WPE on the PREFILL object. The decode arms already set this (see the AX_DECODE blocks
+# above); prefill never did, so it takes the default PLOW_WAVES/4 = 2 waves/SIMD and the
+# 256-register budget. That is the right default for a megakernel whose allocation is the union of
+# every op, and it is also why V4.1's mHC GemvF32 is latency-bound: 320 iterations of dependent
+# loads with only two waves on a SIMD to cover them. Raising this forces the allocator lower and it
+# will spill; whether the extra latency hiding outruns the spill is the measurement, exactly as
+# interp.hip's PLOW_WPE note says. Unset keeps the object byte-identical.
+if [ -n "${PLOW_WPE:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_WPE=${PLOW_WPE}"
+fi
+
+# PLOW_GEMV_F32_ARM picks how d_gemv_f32's wide-M arm splits (row, column) across waves -- see
+# op_gemm_common.h. All three arms are bit-identical; they differ in HBM traffic and in how much
+# work a wave has to hide latency behind, which only hardware can rank. Unset keeps the object
+# byte-identical to arm 0, the shipped one.
+if [ -n "${PLOW_GEMV_F32_ARM:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_GEMV_F32_ARM=${PLOW_GEMV_F32_ARM}"
 fi
 
 # Diagnostic-only XREDUCE2 / XREDUCE phase timeline in PlowTraceRec. Never a serve asset.
@@ -1113,6 +1143,70 @@ if [ "${PLOW_MOE_PF_DET:-1}" != 0 ]; then
   if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ]; then
     AX_DECODE="$AX_DECODE -DPLOW_MOE_PF_DET=${PLOW_MOE_PF_DET:-1}"
   fi
+fi
+
+# OPT-IN (PLOW_DSV41_BLKFP8=1): op 184, the [32,32] block-FP8 GEMM DeepSeek-V4.1-Flash's dense
+# and shared-expert projections are stored in. It is a separate opcode from op 107 rather than a
+# field on it -- `const unsigned char*` against `const float*`, over a grid blocked 32 on both axes
+# instead of 128 -- so the arm is additive and costs nothing when the packet does not ask for it.
+#
+# PREFILL ROWS ONLY: `exec_gemm_fp8_mx` lives inside `#if PLOW_BUCKET_PREFILL` (interp.hip:2681).
+#
+# Marker-checked, not silently skipped. `plow_dsv41_blkfp8_arm` is the symbol plowrt looks for, and
+# without it the load is REFUSED by name -- which is what a V4.1 rung did here on its first attempt.
+# The refusal is the point: the AMD dispatch `default:` does not trap, so an unbuilt arm would leave
+# every block-FP8 projection's output untouched and the prefill would complete with garbage.
+if [ "${PLOW_DSV41_BLKFP8:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_DSV41_BLKFP8=1"
+fi
+
+# OPT-IN (PLOW_DSV41_ENGRAM=1): ops 182/183, DeepSeek-V4.1-Flash's Engram conditional memory, on
+# layers 1 and 14 only. Same shape as the arm above and marker-checked the same way -- plowrt looks
+# for `plow_dsv41_engram_arm` and REFUSES the load by name without it, because the AMD dispatch's
+# `default:` does not trap, so an unbuilt arm would leave the gather and the gate writing nothing
+# and the prefill would complete with garbage.
+#
+# The C side and the packet side both already existed; this line did not, so the first layer-1
+# packet emitted, built 53 objects, reached the queue and was refused at load. The refusal worked
+# exactly as designed -- it is the reason that was a wasted queue slot rather than a wrong number.
+if [ "${PLOW_DSV41_ENGRAM:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_DSV41_ENGRAM=1"
+fi
+
+# OPT-IN (PLOW_DSV4_CSA2=1): ops 180/181/185, the CSA2 compressor, the inverse RoPE on the
+# attention output and the compressed-row rope+quant tail. Marker-checked as `plow_dsv4_csa2_arm`.
+#
+# THE SAME LINE THE ENGRAM ARM WAS MISSING, found the same way and before it cost a queue slot:
+# the C side, the ISA, the dispatch and `manifest.rs`'s `requires` all named PLOW_DSV4_CSA2 and
+# nothing here turned it into a -D. Op 181 makes this reach every V4.1 layer, not only the four
+# with a compressor -- `apply_rotary_emb(o[..., -rd:], freqs_cis, True)` runs on all 40 -- so an
+# object without it now refuses a layer-0 packet that used to load.
+if [ "${PLOW_DSV4_CSA2:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_DSV4_CSA2=1"
+fi
+
+# OPT-IN (PLOW_PREFILL_DSV41=1): make the ORDINARY prefill rows able to run a DeepSeek-V4.1 packet.
+#
+# V4.1 loads `interp_prefill_mla_moe` ($AX_PREFILL $AX_MLA $AX_MOE) and needs three axes that row
+# does not carry. Each is marker-checked, so a missing one is a refusal by name at load rather than
+# a wrong answer -- and the three refusals are how this list was assembled, one GPU attempt each:
+#
+#   PLOW_K3        -- `HyperConnPre`, `HyperConnPost` and `GemvF32`, which are V4.1's mHC. None of
+#                     them are Kimi ops and none are KDA, but they live inside `#if PLOW_K3`
+#                     (interp.hip:3485-3887), so that is the axis that compiles them today.
+#   PLOW_QWEN_GDN  -- op 142, per-head norm + interior-range rotary. Qwen's name, V4.1's rope.
+#   $AX_A4W4       -- the MXFP4 grouped MoE body its 384 routed experts run on.
+#
+# NOT DRIVEN FROM THE PACKET'S `requires`, deliberately. A K3 packet also requires PLOW_K3, and
+# auto-mapping would start compiling these into every ordinary prefill row of every K3 build --
+# objects those packets never load. That is a decision about every build, so it is stated on a
+# command line rather than inferred from a field.
+#
+# Measured rather than assumed: adding PLOW_K3 to this row moved `interp_prefill_mla_moe` not at
+# all on registers (256 VGPR, 122 spills, before and after) and 160 B on LDS. A narrow
+# `#if PLOW_MHC` guard is still the better shape; it is not urgent on that evidence.
+if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_K3=1 -DGV_UNROLL=14 -DPLOW_QWEN_GDN=1 $AX_A4W4"
 fi
 
 # CEILING INSTRUMENT ONLY (PLOW_MLA_PF2_ABL=1..4): the V2 MLA prefill's ablation probes —

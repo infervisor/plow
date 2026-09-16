@@ -1418,6 +1418,67 @@ enum {
     PLOW_DOP_PACK_NCFW_ROWS_F32 = 177,
     PLOW_DOP_GROUPED_ATTENTION_F32 = 178,
     PLOW_DOP_EMBED_OVERLAY_BF16 = 179,
+    /* DeepSeek-V4 CSA2: the learned-pooling KV compressor (`op_compress.h` d_compress_pool,
+     * [DSV4-COMPRESS]). One workgroup per compressed entry, grid-strided over `n_pools`; the
+     * per-channel softmax pools `ratio` source rows into one cache row, RMSNorms it, applies
+     * RoPE, and quantizes. `i7 = rotate` selects the template arm: 0 = the fp8 path, 1 = the
+     * Hadamard-rotated fp4 path (the ROTATE=true instantiation, different clamp constants).
+     *   t0=out t1=kv t2=score t3=ape t4=gamma t5=cosb t6=sinb t7=pos(decode only, may be 0)
+     *   i0=n_pools i1=ratio i2=coff i3=d i4=rd i5=qblk i6=out_base i7=rotate   f0=eps
+     * `t7` non-null makes this a DECODE call: the kernel gates on
+     * `(pos[0] + 1) % ratio == 0` and derives the output slot from pos[0] rather than
+     * `out_base`, so a decode packet needs no per-step immediate patching. */
+    PLOW_DOP_COMPRESS_POOL = 180,
+    /* DeepSeek-V4 CSA2: the conjugate rotation on the attention output's last `rd` dims
+     * (`op_compress.h` d_rope_inverse_o, [DSV4-IROPE]). `o` mixes cached rows each rotated by
+     * its OWN position, so de-rotating by the QUERY's position leaves a position-independent
+     * latent the fixed `wo_a` can consume -- skipping it builds a plausible wrong model.
+     * Interleaved (GPT-J) pairs, NOT the half-split HeadNormRope defaults to. In place.
+     *   t0=o(in/out) t1=cosb t2=sinb t3=pos(may be 0)
+     *   i0=n_tok i1=n_head i2=D i3=rd i4=pos0
+     * `t3` supersedes `i4` when present, for the same reason op 180's does. */
+    PLOW_DOP_ROPE_INVERSE_O = 181,
+    /* DeepSeek-V4.1 Engram conditional memory: the gate + mix (`op_engram.h` d_engram_gate,
+     * [DSV41-ENGRAM]). The n-gram HASH is host work -- integer over token ids alone, with its
+     * primes and multipliers fixed at load time -- and the embed + `wkv` projection are an
+     * ordinary gathered fp8 read and fp8 block-scale GEMM, so this opcode is only the third
+     * stage: the normalized dot of the residual stream against the key, and the shared value
+     * added into every hc copy under that gate. In place on t0.
+     *   t0=x(bf16[T][n][hidden], IN AND OUT) t1=kv(bf16[T][(n+1)*hidden]: n keys then the
+     *   shared value) t2=q_weight t3=k_weight t4=token_mask(u8[T], may be 0)
+     *   i0=T i1=n(hc_mult) i2=hidden   f0=norm_eps
+     * A zero in t4 SHUTS THE GATE, so that token passes through untouched -- it does not get a
+     * zero value added to it. That is the image-span case, where the position took no part in
+     * any n-gram. */
+    PLOW_DOP_ENGRAM_GATE = 182,
+    /* DeepSeek-V4.1 Engram stage 2: the gathered table read (`op_engram.h` d_engram_embed,
+     * [DSV41-ENGRAM]). The 24 hash ids fetch 24 fp8 rows of head_dim, each dequantized by its
+     * own ue8m0 block scale, flat as one n_cols*head_dim row per token -- exactly the operand
+     * the `wkv` GEMM wants, so nothing reshapes between them.
+     *   t0=out(bf16[T][n_cols*head_dim]) t1=table(fp8 e4m3 OCP[part_rows][head_dim])
+     *   t2=scale(ue8m0[part_rows][head_dim/blk]) t3=ids(i32[T][n_cols])
+     *   i0=T i1=n_cols i2=head_dim i3=blk i4=vocab_start i5=part_rows
+     * The table is sharded over its ROWS: an id outside [i4, i4+i5) writes ZEROS, and the
+     * emitter's XReduce sums the ranks back together. blk is 32 for V4.1 (weight_block_size
+     * [32,32]), NOT the [128,128] grid V4 used -- getting it wrong rescales every lookup. */
+    PLOW_DOP_ENGRAM_EMBED = 183,
+    /* DeepSeek-V4.1 block-fp8 PREFILL GEMM at a [32,32] ue8m0 grid (`op_gemm_common.h`
+     * d_gemm_fp8_mx -> d_gemm_t<WFP8MX>, [DSV41-BLKFP8]). The twin of op 107, and a SEPARATE
+     * opcode for the reason the two cannot share one: 107's kernel indexes its scale grid as
+     * `S[(n>>7)*ceil(K/128) + (k>>7)]` with f32 entries, and V4.1's grid is `[ceil(N/32)]
+     * [ceil(K/32)]` with UE8M0 BYTES. Handing 107 a V4.1 scale handle does not fault -- it
+     * rescales every output and the model merely gets worse, which is why the encoding is in
+     * the OPCODE rather than in a field.
+     *   t0=out(bf16[T][N]) t1=x(bf16[T][K]) t2=w(fp8 e4m3 OCP[N][K])
+     *   t3=scale(ue8m0[ceil(N/32)][ceil(K/32)], row-major, K innermost)
+     *   i0=T i1=N i2=K
+     * K % 32 == 0 is REQUIRED (the kernel is the KEXACT instantiation at BK=32); every V4.1
+     * projection satisfies it by construction, since the scale grid could not exist otherwise.
+     * This is what every V4.1 projection lowers to -- wq_a/wq_b/wkv/wo_a/wo_b, the shared
+     * expert, engram.wkv, indexer.wq_b -- i.e. 39.8% of an 8k prefill's FLOPs. The routed
+     * experts do NOT use it; they are MXFP4 on ops 85/86. */
+    PLOW_DOP_GEMM_FP8_MX = 184,
+    PLOW_DOP_COMPRESS_ROPE_QUANT = 185,
 
     PLOW_DOP__COUNT
 };

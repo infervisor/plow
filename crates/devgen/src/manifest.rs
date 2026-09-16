@@ -1266,6 +1266,35 @@ fn backend_amd(
     if on("moe_prefill") {
         req.push("PLOW_MOE_PREFILL=1".into());
     }
+    // DeepSeek-V4 CSA2 (ops 180/181). Its own axis for the same reason PLOW_MOE_PREFILL has one:
+    // the compressor is a second pooling body with its own LDS staging, and only a V4 object can
+    // reach it. An object without the axis has no case for either op, so a CSA2 packet would fall
+    // through the interpreter's switch -- which is what `plow_dsv4_csa2_arm` lets the loader
+    // refuse instead.
+    if has("CompressPool") || has("CompressRopeQuant") || has("RopeInverseO") {
+        req.push("PLOW_DSV4_CSA2=1".into());
+    }
+    // Engram (op 182). Separate from CSA2 above: V4 has the compressor without the tables, and
+    // only two V4.1 layers carry one. An object without the axis has no case for the op, so the
+    // packet would run as a no-op and the stream would simply lose its memory contribution.
+    if has("EngramGate") || has("EngramEmbed") {
+        req.push("PLOW_DSV41_ENGRAM=1".into());
+    }
+    // V4.1's [32,32] ue8m0 block-fp8 GEMM (op 184). Its own axis, not folded into the Engram one:
+    // the projections need it on EVERY layer where Engram is on two, and a V4.1 object could in
+    // principle want one without the other. Without the axis there is no case for op 184 and the
+    // packet would fall through the switch, leaving every projection's output untouched.
+    if has("GemmFp8Mx") {
+        req.push("PLOW_DSV41_BLKFP8=1".into());
+    }
+    // Op 142, the per-head norm + interior-range rotary. Qwen's name, but DeepSeek-V4.1 dispatches
+    // it for its own RoPE: `head_dim` 512 contains the 64 rope dims as a SUFFIX, which is what the
+    // op's `rot_offset` expresses. The arm is behind `PLOW_QWEN_GDN` and an object without it
+    // leaves `q`/`kv` unrotated -- every position attends as if it were position zero, which reads
+    // as a long-context regression rather than as a missing kernel.
+    if has("QwenHeadNormRope") {
+        req.push("PLOW_QWEN_GDN=1".into());
+    }
     if on("a4w4") {
         req.push("PLOW_MOE_PF_A4W4=1".into());
     }
@@ -1417,6 +1446,14 @@ fn backend_amd(
     // PLOW_K3 skips all of it through the non-trapping `default:` and returns fluent output from
     // a model that is missing most of itself.
     if has("AttnRes")
+        // DeepSeek-V4.1's mHC. Not Kimi ops and not KDA, but they live inside the same
+        // `#if PLOW_K3` block (interp.hip:3485-3887), so the axis that compiles them is the same
+        // one -- and the failure is the one this rule's header describes, on a model where the
+        // hyper-connection IS the residual stream. Without the arm, `HyperConnPost` writes
+        // nothing, every layer's residual stays whatever the seed left, and the run completes.
+        || has("HyperConnPre")
+        || has("HyperConnPost")
+        || has("GemvF32")
         || has("SituGlu")
         || has("MlaOutGate")
         || has("KdaStateStep")

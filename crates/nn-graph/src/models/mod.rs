@@ -84,6 +84,16 @@ pub fn build_graph(cfg: &ModelConfig, bucket: &ShapeBucket) -> Result<Graph, Bui
                 c.unimplemented(),
             )))
         }
+        // V4.1 likewise parses and validates (see `config::DeepSeekV41Config`)
+        // so the gap is a checklist derived from the checkpoint's own numbers.
+        // It has no lowering, and neither a V4 nor a V3 fallback would build
+        // the right model: V4 assumes a per-layer compressor where V4.1 shares
+        // one cache across all 40 layers.
+        ModelConfig::DeepSeekV41(c) => {
+            return Err(BuildError::Config(ConfigError::Unsupported(
+                c.unimplemented(),
+            )))
+        }
         ModelConfig::Siglip(c) => siglip::build(c),
         ModelConfig::QwenVl(c) => qwen_vl::build(c),
         ModelConfig::QwenImageDit(c) => qwen_image_dit::build(c, bucket),
@@ -110,6 +120,7 @@ pub fn build_encoder_graph(cfg: &ModelConfig, taps: &[u32]) -> Result<Graph, Bui
                 ModelConfig::KimiK3(_) => "kimi_k3",
                 ModelConfig::DeepSeek(_) => "deepseek",
                 ModelConfig::DeepSeekV4(_) => "deepseek_v4",
+                ModelConfig::DeepSeekV41(_) => "deepseek_v41",
                 ModelConfig::Siglip(_) => "siglip",
                 ModelConfig::QwenVl(_) => "qwen_vl",
                 ModelConfig::QwenImageDit(_) => "qwen_image_dit",

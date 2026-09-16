@@ -389,6 +389,19 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_gem
 }
 #endif
 
+/* The [32, 32] ue8m0 twin, for DeepSeek-V4.1. Same golden role as `d_gemm_fp8_blk_k` above: a
+ * divergence between this and a host oracle on the same weights IS a scale-convention bug, and
+ * that is the failure mode the arm has which does not crash. The scale is a BYTE here, so the
+ * signature differs from its f32 sibling in the operand type as well as the grid. */
+#if GM_TILE_FITS(GM_MX_BM, GM_MX_BN, 32)
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_gemm_fp8_mx_k(
+    bf16* C, const bf16* A, const unsigned char* W, const unsigned char* wscale, unsigned M,
+    unsigned N, unsigned K) {
+    __shared__ bf16 lds[GM_LDS_HALVES_T(GM_MX_BM, GM_MX_BN, 32)];
+    d_gemm_fp8_mx(C, A, W, wscale, M, N, K, blockIdx.x, gridDim.x, lds);
+}
+#endif
+
 /* Block-fp8 MoE expert gate/up + down, one slot, driven through the real table indirection.
  *
  * The trailing `enc` is the RUNTIME weight-encoding field the interpreter reads from the
