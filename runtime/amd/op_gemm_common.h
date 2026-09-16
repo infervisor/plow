@@ -432,7 +432,6 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
     static_assert(!WFP8MX || !NORM, "block-fp8 weights + fused RMSNorm-A is not emitted");
     static_assert(!WFP8MX || !GLU, "block-fp8 gate|up is emitted as two GEMMs + Glu, not fused");
     static_assert(!WFP8MX || (!WFP4 && !WFP8BLK), "one weight encoding at a time");
-    static_assert(!WFP8MX || BK == 32, "the 32-K scale block must be exactly one BK tile");
     static_assert(!WFP8MX || BN % 32 == 0, "a j-group must sit inside one 32-wide N-scale block");
     (void)act;
     constexpr int THREADS = WM * WN * PLOW_WAVE;
@@ -476,6 +475,13 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
     constexpr int SLICE = GM_SLICE;
     constexpr int NSL = BK / SLICE;      /* MEM/MFMA cluster pairs per staged tile */
     constexpr int KS = SLICE / MFMA_K;   /* MFMA k-steps per cluster (= 1)         */
+    /* The scale boundary must fall between MFMA bursts. The burst is per CLUSTER (SLICE
+     * k-elements), not per BK tile, so the real constraint is `32 % SLICE == 0` -- BK only has
+     * to be a whole number of scale blocks. At BK == 32 the boundary IS the tile boundary and
+     * GM_MX_PROMOTE fires exactly once, on the last cluster: bit-identical to the tile-level
+     * site it replaced. */
+    static_assert(!WFP8MX || (BK % 32 == 0 && 32 % SLICE == 0),
+                  "the 32-K scale block must be a whole number of MFMA clusters");
     constexpr int APT = BM * BK / THREADS;
     constexpr int BPT = BN * BK / THREADS;
     constexpr int APASS = APT / 8;       /* 16-byte passes                      */
@@ -813,6 +819,26 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
     if constexpr (PRIO) __builtin_amdgcn_s_setprio(0);
 #define GM_MFMA_BURST() GM_MFMA_FROM(af, bfr)
 
+/* MX PROMOTION, at the 32-element scale boundary -- which is a CLUSTER boundary, not a tile
+ * boundary. `acc` holds only clusters whose burst has already retired, so draining it here is
+ * outside every MFMA burst, the one property the tile-level site ever relied on. Every factor of
+ * the condition is a compile-time constant, so off the boundary -- and off the MX arm -- this
+ * folds away entirely. */
+#define GM_MX_PROMOTE(sl_)                                                                    \
+    if constexpr (WFP8MX) {                                                                   \
+        if ((((sl_) + 1) * SLICE) % 32 == 0) {                                                \
+            unsigned kb = kt * (BK / 32) + (unsigned)((((sl_) + 1) * SLICE) / 32) - 1u;       \
+            if (kb >= KB) kb = KB - 1;                                                        \
+            _Pragma("unroll") for (int i = 0; i < SM; i++)                                    \
+                _Pragma("unroll") for (int j = 0; j < SN; j++) {                              \
+                    const float bs =                                                          \
+                        e8m0_to_f32(as_glob(bscale)[(size_t)nsblk[j] * KB + kb]);             \
+                    accf[i][j] += acc[i][j] * bs;                                             \
+                    acc[i][j] = (f32x16)(0.0f);                                               \
+                }                                                                             \
+        }                                                                                     \
+    }
+
 /* sched_barrier(0) lets NOTHING cross. Without these the compiler hoists the
  * global loads across the cluster boundaries and the ping-pong evaporates.
  * With no ping-pong (GM_DBUF=1) that hoisting is the WHOLE POINT -- see GM_CLFENCE. */
@@ -894,6 +920,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
 
                     /* ---- MFMA cluster */
                     GM_MFMA_BURST()
+                    GM_MX_PROMOTE(sl)
                     GM_FENCE();
                     GM_CLUSTER_BARRIER();
                 }
@@ -916,6 +943,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                     if (sl + 1 < NSL) { GM_READ_INTO(afp[(sl + 1) & 1], bfp[(sl + 1) & 1], buf, sl + 1) }
                     GM_CLUSTER_GLOBAL(sl)
                     GM_MFMA_FROM(afp[sl & 1], bfp[sl & 1])
+                    GM_MX_PROMOTE(sl)
                 }
             }
             /* BLOCK-FP8 PROMOTION. A 128-element K scale block is exactly two BK=64 tiles, so the
@@ -934,21 +962,6 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                             acc[i][j] = (f32x16)(0.0f);
                         }
                 }
-            } else if constexpr (WFP8MX) {
-                /* BK == 32, so one k-tile IS one scale block and EVERY tile promotes -- no
-                 * parity test, and the boundary is still outside the MFMA burst. The scale is a
-                 * ue8m0 byte, decoded exactly the way the fp4 B-fetch decodes its MX rows. */
-                unsigned kb = kt;
-                if (kb >= KB) kb = KB - 1;
-#pragma unroll
-                for (int i = 0; i < SM; i++)
-#pragma unroll
-                    for (int j = 0; j < SN; j++) {
-                        const float bs =
-                            e8m0_to_f32(as_glob(bscale)[(size_t)nsblk[j] * KB + kb]);
-                        accf[i][j] += acc[i][j] * bs;
-                        acc[i][j] = (f32x16)(0.0f);
-                    }
             }
             if constexpr (!DBUF) {
                 /* Every wave has now read the whole tile, so the single buffer is free. This is
@@ -1070,6 +1083,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
 #undef GM_DMA
 #undef GM_READ_FRAGS
 #undef GM_MFMA_BURST
+#undef GM_MX_PROMOTE
 #undef GM_FENCE
 #undef GM_ASM
 #undef GM_BSM
@@ -1444,11 +1458,23 @@ __device__ void d_gemm_fp8_blk(bf16* C, const bf16* A, const unsigned char* W,
  *   * the entries are UE8M0 BYTES, not f32 -- so `wscale` is `const unsigned char*` here, and it
  *     rides the u8 scale slot the MXFP4 fetch already uses rather than the f32 `bsblk` slot.
  *
- * BK=32 IS THE POINT, NOT AN ARBITRARY TILE. The promotion must land on a k-tile boundary (see the
- * WFP8MX note in `d_gemm_t`), and a 32-element K block does not divide BK=64. At BK=32 one k-tile
- * is exactly one scale block. The cost is a halved K step, i.e. twice the LDS traffic per MFMA,
- * and it is UNMEASURED -- a BK=64 variant promoting twice per tile is the optimization to try
- * once there is a number to beat. Do not assume this tile is the right one; it is the CORRECT one.
+ * BK=32 WAS NEVER THE ONLY LEGAL TILE, and it is no longer the default. The promotion must land
+ * between MFMA bursts -- but a burst is one CLUSTER of GM_SLICE (16) k-elements, not one BK tile,
+ * so the constraint is `32 % SLICE == 0`, which BK does not enter at all. `GM_MX_PROMOTE` in
+ * `d_gemm_t` drains the accumulator at the scale boundary wherever it falls; at BK=32 that is the
+ * last cluster of every tile, which is why moving the promotion there is bit-identical at 32
+ * (verified: same instruction count, zero opcode differences, the only object delta being the new
+ * plow_geom_GM_MX_BK marker). BK=64 promotes twice per tile for the same total promotions -- both
+ * drain every 32 k-elements, in the same order, over the same terms -- and halves the tile-level
+ * stage and barrier count.
+ *
+ * MEASURED at V4.1 8k/TP8, op 184 body over 330 packets:
+ *   128x128 BK=32  124.1 ms   straggler 164 us/pk
+ *   128x128 BK=64  118.5 ms   straggler 157 us/pk   <-- default
+ *    64x128 BK=64  146.4 ms   straggler 117 us/pk
+ * The 64-row tile is what BK=64 makes legal at all (APT = BM*BK/512 needs BM >= 128 at BK=32) and
+ * it does close the ~44% tail it was predicted to close -- and loses 28 ms of body doing it. The
+ * tail was never the cost; halving the rows halves the MFMA work each B pass amortises.
  *
  * BM/BN follow `d_gemm_fp8_blk`'s 128x128 for the same accumulator reason: the second (promotion)
  * accumulator doubles the register cost, and 128x128 is the rung that measured 148 VGPR / 0 spill
@@ -1459,10 +1485,13 @@ __device__ void d_gemm_fp8_blk(bf16* C, const bf16* A, const unsigned char* W,
 #ifndef GM_MX_BN
 #define GM_MX_BN 128
 #endif
+#ifndef GM_MX_BK
+#define GM_MX_BK 64
+#endif
 __device__ void d_gemm_fp8_mx(bf16* C, const bf16* A, const unsigned char* W,
                               const unsigned char* wscale, unsigned M, unsigned N, unsigned K,
                               unsigned slice, unsigned nblk, bf16* lds) {
-    d_gemm_t<GM_MX_BM, GM_MX_BN, 32, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true,
+    d_gemm_t<GM_MX_BM, GM_MX_BN, GM_MX_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true,
              false, false, false, true>(C, A, (const bf16*)W, nullptr, nullptr, M, N, K, slice,
                                         nblk, lds, nullptr, 0, wscale);
 }

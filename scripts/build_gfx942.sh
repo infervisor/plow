@@ -870,6 +870,15 @@ if [ -n "${PLOW_HC_WAVE_TOKEN:-}" ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_HC_WAVE_TOKEN=${PLOW_HC_WAVE_TOKEN}"
 fi
 
+# GM_MX_BK sizes op 184's k-tile. 32 is the default and the shipped encoding; 64 is legal because
+# GM_MX_PROMOTE drains at the 32-element SCALE boundary, which is a cluster boundary at any BK that
+# is a multiple of 32. Value-identical up to f32 accumulation order (the promotion order is the
+# same; the staging is not). BM/BN ride the same hatch.
+for v in GM_MX_BM GM_MX_BN GM_MX_BK; do
+  eval "x=\${$v:-}"
+  if [ -n "$x" ]; then AX_PREFILL="$AX_PREFILL -D$v=$x"; fi
+done
+
 # Diagnostic-only XREDUCE2 / XREDUCE phase timeline in PlowTraceRec. Never a serve asset.
 if [ "${PLOW_XR_TRACE_PHASES:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_XR_TRACE_PHASES=1"

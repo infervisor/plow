@@ -3126,6 +3126,61 @@ shipped defaults are, on this model, the right ones everywhere they were tested 
 knowing before writing a kernel, and is why the audit fix in §12.21 mattered more than any tile it
 went on to reject.
 
+### 12.24 The largest GEMM's k-tile was held at 32 by a constraint that was never about BK
+
+§12.21 closed with op 184 at 128x128 and the note that this is the finest legal tile, because
+`APT = BM*BK/512` needs `BM >= 128` once `BK == 32`. It also recorded, from `d_gemm_fp8_mx`'s own
+header comment, why BK could not move:
+
+> BK=32 IS THE POINT, NOT AN ARBITRARY TILE. The promotion must land on a k-tile boundary [...] and
+> a 32-element K block does not divide BK=64. [...] it would land mid-burst.
+
+**The premise is false, and the kernel already contained the counter-example.** A k-tile is not one
+MFMA burst. `d_gemm_t` splits every tile into `NSL = BK / GM_SLICE` MEM/MFMA cluster pairs, and
+`GM_SLICE` is **16**. The burst is per cluster. So the real constraint on the 32-element MX scale
+block is `32 % SLICE == 0` — which BK does not enter at all. At `BK=64, SLICE=16` the scale
+boundary falls between cluster 1 and cluster 2, and again at the end of the tile: both are cluster
+boundaries, outside every burst, which is the one property the promotion ever needed. The sibling
+`WFP8BLK` arm's own comment says as much about its 128-element block ("exactly two BK=64 tiles"),
+and nobody asked what a *cluster* was.
+
+#### Moving the promotion is bit-identical at BK=32, and that was checked rather than argued
+
+`GM_MX_PROMOTE(sl)` drains `acc` into `accf` when `((sl+1)*SLICE) % 32 == 0`, with
+`kb = kt*(BK/32) + (sl+1)*SLICE/32 - 1`. Every factor is a compile-time constant, so off the
+boundary it folds to nothing. At `BK=32` the condition is true exactly once — on the last cluster,
+with `kb == kt` — so it is the tile-level site it replaced, spelled differently.
+
+That was verified by building the same emit twice, once per header, and diffing disassembly:
+
+* 137,122 instruction lines each, **zero opcode or register differences**;
+* 11 differing lines, all `s_add_u32 sX, sX, <imm>` PC-relative fixups, all by exactly `+0x40`;
+* `llvm-readelf -s` accounts for it — the new object carries one extra symbol,
+  `plow_geom_GM_MX_BK`, which shifts the data section by 64 B.
+
+Object BYTES differ across all 54 objects either way, because the build embeds its own
+`PLOW_HSACO_CONFIG` path; byte comparison is not the tool for this question and disassembly is.
+
+#### And then BK=64 wins, while the tile it unlocks loses
+
+| op 184 tile | body (330 pkts) | straggler/pk | whole model |
+|---|---|---|---|
+| 128x128, BK=32 | 124.1 ms | 164 us | 839.0 ms |
+| **128x128, BK=64** | **118.5 ms** | 157 us | **827.2 ms** |
+| 64x128, BK=64 | 146.4 ms | **117 us** | 860.0 ms |
+
+BK=64 takes **5.6 ms off op 184 (-4.5%)** while its neighbours move under 1% (GEMV_F32 -0.3%,
+XREDUCE2 +0.8%, FLASH_MLA_PREFILL -0.9%) — the win is attributable to the op it targets, which is
+the test the GH=2 knob in §12.23 failed. Confirmed twice at 827.2 ms, once via the env knob and
+once with 64 as the committed header default (827,152 and 827,242 us).
+
+**The 64-row tile is the interesting negative.** BK=64 is what makes it stage legally at all, and
+it does exactly what §12.21 predicted: the ~44% structural tail collapses, 157 -> 117 us/pk. It
+also costs 28 ms of body to do it. The tail was never the cost. Halving the rows halves the MFMA
+work each pass over B amortises, and op 184's B is the whole weight — so the fix for a straggler
+was a 24% slower kernel. A tail is worth closing only when the work that hides it is free, and
+here it is the work.
+
 ### 12.2 What is still not demonstrated
 
   * ~~ONE layer, not 40.~~ **Superseded by §12.18**: all 40 layers emit and run as
@@ -3136,7 +3191,7 @@ went on to reject.
   * No reference parity. The input is synthetic; correctness so far is
     "finite and stable" plus an op census that matches the config (§12.18), not
     "right". This is now the largest single gap.
-  * **839 ms against 90 ms** (§12.19, §12.20 and §12.22 took 153 ms off §12.18's 992,
+  * **827 ms against 90 ms** (§12.19, §12.20, §12.22 and §12.24 took 165 ms off §12.18's 992,
     neither in a V4.1 op; §12.21 showed the next 124 ms line is already on its
     finest legal tile). Closing the remaining 9.5x is not a list of point fixes:
     it needs the whole GEMM/MoE/collective pipeline at MFMA efficiency, which is
