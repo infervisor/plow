@@ -1354,6 +1354,64 @@ fn moe_combine_inst(d: &DevInst64) -> bool {
         && d.fj.iter().all(|&v| v == 0)
 }
 
+/// Which experts this rank owns, honouring `PLOW_MOE_EP_CUTS` when it is set.
+///
+/// The even split `balanced_expert_range` gives is only balanced if routing is uniform, and it is
+/// not: measured on V4.1 at 8k, 153 of 384 experts take any row at all, one takes 5868 rows
+/// against a mean of 128, and the even split's per-rank TILE load -- what the grouped GEMM bills,
+/// since a one-row expert costs the same MPF_BM tile as a full one -- runs 1.558x. That is paid at
+/// the next reduction, because the early ranks simply wait there.
+///
+/// An optimal set of UNEVEN contiguous cuts reaches 1.004x on the same histogram, as good as an
+/// unrestricted assignment, and without relabelling any expert -- so the router, the align filter
+/// and the weight binder keep agreeing by construction.
+///
+/// Cut points are a CALIBRATION of one routing distribution, not a property of the model.
+///
+/// MEASURED, AND IT DOES NOT HELP -- which is the reason to keep this documented rather than to
+/// keep reaching for it. Balancing V4.1 at 8k/TP8 from 1.558x to 1.004x left rank 0's MoE pair at
+/// 298 us against 296 us for the even split, and the layer at 13914 us against 13854 us: no
+/// better, slightly worse. Tile COUNT is not what sets the op's duration here. The grouped GEMM's
+/// work items are M-tiles x N-tiles, and at EP's full `moe_inter` there are 18 N-tiles per expert,
+/// so a rank's 29..45 M-tiles become 520..810 items over 304 CUs -- two or three rounds either
+/// way, with the rounding, not the total, deciding. Balancing moves an op that was never bound by
+/// the quantity being balanced.
+///
+/// So EP's give-back at XREDUCE2 is NOT expert load imbalance, and a calibrated cut list is not
+/// the lever for it.
+///
+/// A malformed list is FATAL rather than ignored. Every caller must reach ownership through here,
+/// and they arrive with the expert count spelled three different ways (the weight table's size,
+/// the align packet's `i[1]`, the combine's `i[6]`); silently falling back on one of them and not
+/// the others would leave a rank loading the weights of one expert set while its align kernel
+/// filtered for another, which does not fail -- it returns a slightly wrong answer.
+fn ep_expert_range(experts: u32, ranks: u32, rank: u32) -> Result<core::ops::Range<u32>> {
+    let Some(spec) = crate::config::RuntimeConfig::get().amd.moe_ep_cuts.as_deref() else {
+        return Ok(packet::moe_ep::balanced_expert_range(experts, ranks, rank));
+    };
+    let cuts: Vec<u32> = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| t.parse::<u32>().map_err(|_| {
+            RuntimeError::Device(format!("PLOW_MOE_EP_CUTS has a non-numeric entry {t:?}"))
+        }))
+        .collect::<Result<_>>()?;
+    if cuts.len() != ranks as usize + 1 || cuts[0] != 0 || cuts[ranks as usize] != experts {
+        return Err(RuntimeError::Device(format!(
+            "PLOW_MOE_EP_CUTS must be {} ascending cuts from 0 to {experts}; got {} ({spec})",
+            ranks + 1,
+            cuts.len()
+        )));
+    }
+    if cuts.windows(2).any(|w| w[0] > w[1]) {
+        return Err(RuntimeError::Device(format!(
+            "PLOW_MOE_EP_CUTS is not ascending ({spec})"
+        )));
+    }
+    Ok(cuts[rank as usize]..cuts[rank as usize + 1])
+}
+
 fn moe_ep_degree(d: &DevInst64) -> Option<u32> {
     let degree = match DevOp::from_u16(d.op) {
         Some(DevOp::MoeAlignPf | DevOp::MoeCombinePf) => d.i[5],
@@ -2208,7 +2266,7 @@ fn moe_mxfp4_routes_with_scratch(
                         prog.t
                     )));
                 }
-                let range = packet::moe_ep::balanced_expert_range(first.i[1], n_gpu, rank);
+                let range = ep_expert_range(first.i[1], n_gpu, rank)?;
                 let row_bytes = tensors
                     .get(first.t[2] as usize)
                     .ok_or_else(|| RuntimeError::Device("EP row-token handle is invalid".into()))?
@@ -2353,7 +2411,7 @@ fn moe_mxfp4_routes_with_scratch(
             }
             if moe_ep_combine_inst(d) {
                 let (rank, n_gpu) = ep_bind.expect("EP segment binding checked above");
-                let range = packet::moe_ep::balanced_expert_range(d.i[6], n_gpu, rank);
+                let range = ep_expert_range(d.i[6], n_gpu, rank)?;
                 let grid = d.i[2]
                     .checked_mul(d.i[0].div_ceil(256))
                     .ok_or_else(|| RuntimeError::Device("EP combine grid overflows".into()))?;
@@ -4554,7 +4612,7 @@ fn bind_packed_experts(
         let (owned, whole) = if i_moe == i_moe_full {
             // EP: this rank owns a contiguous block of WHOLE experts.
             (
-                packet::moe_ep::balanced_expert_range(n_exp, n_gpu, rank),
+                ep_expert_range(n_exp, n_gpu, rank)?,
                 true,
             )
         } else if i_moe * n_gpu as u64 == i_moe_full {
