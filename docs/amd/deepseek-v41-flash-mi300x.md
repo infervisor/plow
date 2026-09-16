@@ -3531,7 +3531,8 @@ wins found the same way. **The instrument is not a formality.**
   * No reference parity. The input is synthetic; correctness so far is
     "finite and stable" plus an op census that matches the config (§12.18), not
     "right". This is now the largest single gap.
-  * **755 ms against 90 ms** (§12.19, §12.20, §12.22, §12.24 and §12.26 took 237 ms off §12.18's 992,
+  * **614 ms against 90 ms** as of §12.43 (§12.29-§12.42 took a further 141 ms off the 755 below;
+    §12.19, §12.20, §12.22, §12.24 and §12.26 took 237 ms off §12.18's 992,
     neither in a V4.1 op; §12.21 showed the next 124 ms line is already on its
     finest legal tile). Closing the remaining 9.5x is not a list of point fixes:
     it needs the whole GEMM/MoE/collective pipeline at MFMA efficiency, which is
@@ -3993,3 +3994,40 @@ QUERY TOKENS instead: an emit and collective change (replicated q/o weights, an 
 tokens in place of an all-reduce over heads), not a kernel one.
 
 Layer 2 at the committed defaults: **15,948 us**, from 20,458 at the start of §12.29 — **-22.0%**.
+
+### 12.43 End to end after §12.41: 614 ms
+
+    min 610.7   median 614.5   max 763.1 ms   (5 iters, 40 layers, 8k, TP8)
+
+**614 ms, from 755 at the start of §12.29 — -18.7%.** Layer 2 is 15,948 us from 20,458 (-22.0%).
+
+**90 ms is not met. 614 ms is 6.8x.**
+
+Twelve shipped changes across §12.29-§12.42, every one verified against a single-block exit that
+never moved a printed digit, and four designs falsified by building them. The shipped set divides
+cleanly:
+
+  * **Seven were a gate, not a kernel** — a faster body the tree already had, excluded by a
+    condition that was not structural: `!ons` (§12.32), `k == 1` (§12.34), a serial 256-bin walk
+    (§12.33), a `4 | 304` work-order coincidence (§12.35), a workgroup-per-item merge (§12.38), a
+    doubled rope (§12.39), a hard-wired GF (§12.31).
+  * **Four were load width** — §12.38, §12.39, §12.41 and the GEMV MR, all the same shape: too few
+    bytes moved per instruction at two waves per SIMD.
+  * **One was a knob** (§12.31's GF).
+
+None required a new kernel, and that is the finding: **at 8.4x off target the tree's own faster
+paths were worth 18.7%, and they are now spent.** What remains is two ops and both are
+architectural:
+
+  * `FLASH_GATHER_PREFILL`, 2.94 ms against 53 us of bf16 MFMA peak. §12.30 and §12.42 measured,
+    independently, that no kernel change reaches it at TP8 — the head-packed body's floor IS the
+    scalar arm, and token-packing costs more union than it buys occupancy. The fix is to give each
+    rank all 64 heads and shard the query TOKENS: replicated q/o weights and an all-gather in
+    place of the head all-reduce. An emit and collective change.
+  * The MoE pair, 2.24 ms against ~389 us at fp8 peak. §12.25 proved it is neither FLOPs nor
+    bytes nor stores but the fixed cost of its output tiles; §12.26 halved that once. Going
+    further needs the tile geometry AND the host buffer bound in `mla.rs` to move together, which
+    is a packet change.
+
+Those two are 5.2 ms of a 15.9 ms layer. Everything else is ~15 ops each 2-10x off its own floor,
+which is §12.18's conclusion unchanged: reaching 90 ms is a pipeline campaign.
