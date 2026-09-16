@@ -4941,13 +4941,41 @@ far too short to amortise the grouped GEMM's per-tile expert-weight reload.
 
 Four paired samples, best of 6 iterations each, TP and EP back to back so co-tenancy hits both:
 
-    arm                 layer min   MoE pair   align   XREDUCE2   exits
-    TP (shipped)         14052 us     863 us   74.9 us   1543 us   -1.36719 / 3.64062 / -0.000761
-    EP                   13872 us     293 us   66.3 us   1731 us   identical
+    arm                 layer min   MoE pair(rk0)   align   XREDUCE2(rk0)   exits
+    TP (shipped)         14052 us        863 us    74.9 us      1543 us     -1.36719 / 3.64062 / -0.000761
+    EP                   13872 us        293 us    66.3 us      1731 us     identical
 
-The MoE pair falls 66%, 570 us. The layer falls 180 us, 1.3% -- about 7 ms over 40 layers. XREDUCE2
-takes back ~190 of the 570 and ordinary spread accounts for the rest. EP's align is slightly
-CHEAPER than TP's because it histograms only the slots this rank owns.
+The layer falls 180 us, 1.3%. THE MoE PAIR COLUMN IS RANK 0'S AND IT IS NOT THE MODEL'S -- see
+below. EP's align is genuinely cheaper than TP's, because it histograms only the slots this rank
+owns.
+
+### Reading one rank's trace overstates EP, and by 4x
+
+`rung_run` wrote rank 0 only. That is the wrong statistic for a change whose entire effect is to
+make the ranks UNEQUAL, and a collective bills the slowest one. With PLOW_TRACE_ALLRANKS (now
+honoured by `rung_run` too), the MoE pair per rank:
+
+    rank        0     1     2     3     4     5     6     7    max    spread
+    TP        868   848   878   881   841   865   862   848    881     1.05x
+    EP        301   607   652   690   703   731   756   348    756     2.51x
+
+Reproduced on a second pass to within ~20 us per rank, so the spread is structural, not noise.
+Rank 0 -- the one rank anybody had been looking at -- is the FASTEST under EP and typical under TP,
+which is exactly the shape that flatters EP most.
+
+`moe + XREDUCE2` is very nearly constant across ranks (EP: 2080, 2172, 2113, 1832, 2103, 2122,
+2039, 2089), because a rank that finishes the MoE early simply waits longer at the reduction. So
+the pair and the collective are ONE block and only their sum is meaningful:
+
+    moe + XREDUCE2, averaged over ranks:   TP ~2185 us   EP ~2090 us
+
+That is the EP win: about 95 us of the block, and 100-180 us of the layer -- 4 to 7 ms over 40
+layers. Not the 570 us/layer rank 0's pair column reads as.
+
+The earlier conclusion that `PLOW_MOE_EP_CUTS` "buys nothing" was drawn from rank 0 as well. It
+should be read as UNTESTED rather than disproven: what balancing would have to shrink is the
+301..756 spread above, and nobody has measured that. (The knob is currently refused without the
+gfx950 specialist align, so re-testing it needs the cut points pushed device-side first.)
 
 ### It was never a hardware gap
 

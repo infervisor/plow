@@ -324,11 +324,25 @@ mod hsa {
         // AFTER the timed loop: the buffer holds the LAST launch's records, and the warm-up's
         // page-in costs are not the layer's.
         if let Some(path) = &trace {
-            g.rank(0).trace_write(path)?;
-            println!(
-                "trace: wrote {} -- reduce with scripts/k3_trace_report.py",
-                path.display()
-            );
+            // PLOW_TRACE_ALLRANKS writes one file per rank, `.rk{n}`-suffixed, the same way
+            // `main.rs`'s `trace_dump` does. Rank 0 alone cannot answer a question about a
+            // COLLECTIVE: XREDUCE2 is ~99% straggler, so its cost is the spread between ranks,
+            // and a single rank's trace shows only how long that rank waited.
+            let all = plowrt::config::RuntimeConfig::get().amd.trace_allranks;
+            for rank in 0..if all { g.n_gpu() } else { 1 } {
+                let out = if all {
+                    let mut o = path.clone().into_os_string();
+                    o.push(format!(".rk{rank}"));
+                    PathBuf::from(o)
+                } else {
+                    path.clone()
+                };
+                g.rank(rank).trace_write(&out)?;
+                println!(
+                    "trace: wrote {} -- reduce with scripts/k3_trace_report.py",
+                    out.display()
+                );
+            }
         }
         Ok(())
     }
