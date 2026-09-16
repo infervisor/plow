@@ -646,6 +646,13 @@ if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ] && [ -z "${MPF_BM:-}" ]; then
   # FLASH_GATHER_PREFILL 3276 -> 3031 us, layer -321 us, exits identical. The dispatch falls back
   # to GF=4 when 8 does not divide n_head.
   PLOW_FA_GATHER_GF="${PLOW_FA_GATHER_GF:-8}"
+  # The k-block-max selection with the LOCAL first pass. n_exp = 384 fits 4*PLOW_THREADS, so the
+  # local pass loads every key to registers once and the k rounds never re-scan: 351 -> 255 us.
+  # The header defaults PLOW_MOE_ROUTER_SELECT to PLOW_K3 and _LOCAL reached only the K3 decode
+  # row, so a V4.1 object could not take either. All three arms pick the same keys in the same
+  # order; exits are identical.
+  PLOW_MOE_ROUTER_SELECT="${PLOW_MOE_ROUTER_SELECT:-2}"
+  PLOW_MOE_ROUTER_SELECT_LOCAL="${PLOW_MOE_ROUTER_SELECT_LOCAL:-1}"
   PLOW_MOE_PF_EPI="${PLOW_MOE_PF_EPI:-0}"
   PLOW_K3_A4W4_EPI="${PLOW_K3_A4W4_EPI:-0}"
 fi
@@ -1411,6 +1418,17 @@ case "${PLOW_RESID_U:-4}" in 0|1) ;; *) AX_GLUE="$AX_GLUE -DPLOW_RESID_U=${PLOW_
 # PLOW_HC_VEC8=0: restore the hyper-connection ops' per-element scalar loops (the A/B control).
 if [ -n "${PLOW_HC_VEC8:-}" ]; then
   AX_GLUE="$AX_GLUE -DPLOW_HC_VEC8=${PLOW_HC_VEC8}"
+fi
+
+# ROUTER SELECTION ARM for the PREFILL objects. The header defaults PLOW_MOE_ROUTER_SELECT to
+# PLOW_K3 and the _LOCAL variant is only ever handed to the K3 DECODE row (AX_K3_ROUTER_LOCAL
+# above), so a non-K3 prefill object has never been able to take either. All three arms pick the
+# same keys in the same order; this is a scheduling A/B, not a numerics one.
+if [ -n "${PLOW_MOE_ROUTER_SELECT:-}" ]; then
+  AX_GLUE="$AX_GLUE -DPLOW_MOE_ROUTER_SELECT=${PLOW_MOE_ROUTER_SELECT}"
+fi
+if [ -n "${PLOW_MOE_ROUTER_SELECT_LOCAL:-}" ]; then
+  AX_GLUE="$AX_GLUE -DPLOW_MOE_ROUTER_SELECT_LOCAL=${PLOW_MOE_ROUTER_SELECT_LOCAL}"
 fi
 AX_PREFILL="$AX_PREFILL$AX_GLUE"
 AX_FLASH="$AX_FLASH$AX_GLUE"

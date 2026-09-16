@@ -4031,3 +4031,27 @@ architectural:
 
 Those two are 5.2 ms of a 15.9 ms layer. Everything else is ~15 ops each 2-10x off its own floor,
 which is §12.18's conclusion unchanged: reaching 90 ms is a pipeline campaign.
+
+### 12.44 The router's fast selection arm was wired to the decode row only
+
+`d_moe_router_topk` has three selection arms and a `_LOCAL` first pass that loads every key to
+registers once so the `k` rounds never re-scan. `PLOW_MOE_ROUTER_SELECT` defaults to `PLOW_K3` —
+zero for a DeepSeek build — and `AX_K3_ROUTER_LOCAL` is handed only to the K3 DECODE row, so a
+V4.1 prefill object could take neither. `n_exp` is 384, well inside the `_LOCAL` arm's
+`4 * PLOW_THREADS` bound.
+
+    MOE_ROUTER_TOPK_PF body, layer 2, T=8192, TP8, median of 5:
+
+      default (arm 0, all-pairs rank)   351 us
+      arm 1 + LOCAL                     357 us
+      arm 2 + LOCAL                     255 us    <- new default under PLOW_PREFILL_DSV41
+
+**-27%.** All three arms pick the same keys in the same order, and the exits agree to the last
+printed digit. Arm 2 is the one its own comment calls "the previous K3 arm, kept as the bench
+control" — it wins here because `_LOCAL` removes the thing that made it slow.
+
+That is the eighth gate this campaign, and the registry test caught the ninth mistake: both knobs
+were ALREADY in `knob_spec.rs`, and adding them again failed `registry_is_well_formed` on
+duplicate ids before the build could ship them.
+
+Layer 2 at the committed defaults: **15,877 us**, from 20,458 at the start of §12.29 — **-22.4%**.
