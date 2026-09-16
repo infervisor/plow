@@ -4630,3 +4630,73 @@ trip and the same `fmaxf` fold, in the same order; only the loads changed.
 and the reason is visible in what is left: the `cosb`/`sinb` table gathers are still one scalar
 load per PAIR, and the `f2bf` round trip per channel is unchanged. The op is now ~34x off its
 floor instead of ~40x. The remaining width is in those tables, not in the source reads.
+## 12.58 The rope tables, and then the occupancy question answered for good
+
+12.57 said the width left in `d_compress_rope_quant` was the `cosb`/`sinb` tables, still one
+scalar f32 load each per PAIR. Taken: an 8-group lying wholly inside the rope region covers
+exactly four pairs at CONSECUTIVE `m`, so each table wants one 16 B load, not four 4 B ones.
+`PLOW_CMP_TAB4` (default 1), guarded on `c_rope0 % 8 == 0` (no group straddles the rope boundary,
+and `m0` is a multiple of 4) and `(rd/2) % 4 == 0` (so `tb` is too). MEASURED, interleaved:
+
+    PLOW_CMP_TAB4=0    561.5 / 570.5 us
+    PLOW_CMP_TAB4=1    555.0 / 546.1 us      -2.7%
+
+Bit-identical; exits -1.36719 / 3.64062 on every run of both arms.
+
+**-2.7% where the load count predicted far more, and that is the useful result.** At 8k the
+indexer's query call is ~32k items x 8 blocks = 262k work items against 304 CU x 512 threads =
+156k threads: 1.7 iterations per thread, two dependent memory round trips, at occupancy 2 with no
+third wave to hide either. The remaining 34x is LATENCY UNDER THE OCCUPANCY WALL, not width. So
+the wall is the only thing left to attack -- and it is now settled.
+
+### The bisect: what the 256 VGPRs and the 64,720 B of LDS actually are
+
+Fourteen single-row builds of `interp_prefill_mla_moe`, each knocking out one op family through
+the existing `PLOW_DECODE_INVENTORY_PRUNE` / `PLOW_HAS_*` machinery. **VGPR and LDS did not move
+once**: 256 / 0 / 64,720 in every arm, including the one with eight ops deleted. Only the spill
+count moved -- 122 baseline, 92 without flash, and **10 without RMSNORM alone**, which is not the
+multi-row arm (`PLOW_RN_ROWS` 1/2/4 all report 122).
+
+So 256 is not an op's demand. It is the ARCH CAP the allocator is handed once LDS has fixed
+occupancy, and the causality runs the other way from what 12.53 recorded:
+
+    LDS 64,720 B  ->  1 workgroup/CU (65,536 B per CU)
+                  ->  8 waves / 4 SIMDs = 2 waves/SIMD
+                  ->  512-register file / 2 = 256 VGPR, and 122 of them spill
+
+**12.53's "register wall, not an LDS wall" was backwards, and 12.53's GEMM arena figure was wrong
+too.** `GM_LDS_HALVES_T(192,256,64)` is `(192+256) * (64+8)` = 32,256 halves = **64,512 B**, not
+57,344 -- the earlier arithmetic dropped `GM_STRIDE`'s +8 bank-conflict pad, which is 7,168 B of
+it. 64,512 plus 208 B of interpreter scalars is exactly the 64,720 the object reports.
+
+### Occupancy 2 cannot be escaped, and the reason is the model, not the code
+
+2 workgroups/CU needs the WHOLE `plow_smem` union under 32,768 B. Its three members, evaluated:
+
+    GEMM tile (192,256,64)   (192+256) * (64+8)                  = 32,256 h = 64,512 B
+    FLASH_HD512              32*(512+8) + 32*(128+8) + 8*32*32   = 29,184 h = 58,368 B
+    MLA prefill (KSPLIT=2)   Qsm + Ksm + Psm + corr              = 30,272 h = 60,544 B
+
+All three exceed 32,768 B, so shrinking any one of them changes nothing -- which is exactly what
+the builds show (`PLOW_MLA_PF_KSPLIT` 2 vs 4: LDS 64,720 both ways; the GEMM tile cannot be cut
+at all without re-emitting, since the packet stamps `GM_BM=192` into
+`PLOW_PACKET_OBJECT_REQUIRES`).
+
+And the MLA-prefill member cannot be cut to fit **by arithmetic, not by measurement**:
+
+    Qsm alone = BQ * (DK + DR + FA_PAD) halves = 32 * (512 + 64 + 8) * 2 B = 37,376 B
+
+BQ=32 is one MFMA M-tile, the minimum. DK=512 is V4.1's latent head dim. **The query tile alone is
+37,376 B against a 32,768 B budget, before K, P or the correction strip are placed.** No tile, no
+split, no knob reaches it.
+
+**Occupancy 2 is a property of a 512-wide latent head on a 64 KiB-LDS part.** It is not a plow
+choice and no kernel change in this repo can move it. That closes the last structural lever named
+in 12.55/12.57 for the single-kernel interpreter: the only remaining escape is to stop putting
+these ops in the same kernel as the GEMM and the flash -- a second, low-LDS kernel for the light
+streaming ops (RMSNORM, GLU, the hyper-connection pair, the compressors: ~2.4 ms of a 15.1 ms
+layer). That changes the packet/object contract for EVERY model, not just V4.1, so it is a scope
+decision and not one to take unasked. Even at a 4x speedup on those ops it is ~1.8 ms/layer = ~72
+ms over 40 layers: 608 -> ~536 ms.
+
+**The target is unchanged by any of this. 90 ms is 0.99x the roofline floor (12.56).**
