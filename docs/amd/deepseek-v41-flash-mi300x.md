@@ -2601,6 +2601,159 @@ attends over the cache layer 2 publishes. The emit now says so on stderr rather 
 be discovered, and `every_activation_read_is_written_by_something` runs over five chain shapes —
 `[0]`, `[1]`, `[2,3]`, `[20]`, `[20,24]` — because no two of them read the same set.
 
+### 12.17 The first compressed layer runs, and the gather trusted its selector's pad
+
+Every compressed layer faulted. `--block 2`, `--block 2..4`, single-layer or chained: the packet
+loaded (`weights_bound=true`), ran, and died with
+
+    HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION
+
+The `--segs` bisection is layer-granular — one cooperative launch per layer — so it could only
+report "layer 2". Splitting this session's changes into a layer-0 packet (the always-on ones: op
+142's interleaved rope bit, op 181, the two rope tables) and a layer-2 packet (those plus the
+compressor, the indexer and the gathered read) narrowed it further: **layer 0 passed, layer 2
+faulted**, so the fault was in the compressed path and not in anything the window-only layers had
+started doing.
+
+#### It was not in the new code
+
+`d_index_select_pf` — op 118, shipped, GLM's selector — documents its own padding rule:
+
+> Rows with `len <= top_k` emit the identity and pad with **-1**.
+
+and `d_flash_mla_decode`'s GATHER arm read that table as
+
+```c
+const unsigned row = kv < hi ? (unsigned)ibase[kv] : 0u;
+```
+
+with no validity test. `(unsigned)(-1)` is `0xFFFFFFFF`, and `cbase + row * DK` is 4.4 TB past the
+latent base — not a wrong number, an address outside the aperture.
+
+What makes this reachable rather than theoretical is the **bound the gather actually walks**:
+
+```c
+const unsigned tk_live = GATHER ? (top_k < len ? top_k : len) : 0u;
+```
+
+`len` is `kv_len[b]`, the CHUNK-end token count — 8192 — not this query row's own length. So
+`tk_live` is 512 for every row, while the number of slots op 118 actually filled for row `t` is
+`min(top_k, (q_pos0 + t + 1) / pool_size)`. At `index_topk` 512 and pool ratio 2, **every query row
+below 1023 has padded slots inside `[lo, hi)`**. A quarter of the rows in the first chunk walk off
+the end of the cache.
+
+This is why the window-only layers never showed it: they do not gather. It is the seventh instance
+of the campaign's recurring class — the gather and the selector agree on the table's SHAPE and
+disagree on what a slot MEANS — and the first where both halves were already in the tree and
+already shipping.
+
+#### Two phases, two different fixes
+
+The score phase can branch, so it drops the slot outright:
+
+```c
+const int sel = GATHER ? (kv < hi ? ibase[kv] : -1) : 0;
+const bool keep = GATHER ? (kv < hi && sel >= 0) : ...;
+```
+
+That is also the right arithmetic, not just a guard: the pad stands for a key that does not exist,
+so it must not enter the softmax.
+
+The PV phase cannot branch — it is the vectorized column read, `VU` rows in flight per thread, and
+a per-slot test there costs the unroll. It does not need one. The slot's softmax weight is already
+zero (its score was `-inf`), so clamping the ROW keeps the contribution exactly zero and the
+address in range:
+
+```c
+__device__ __forceinline__ size_t fa_gather_row(int sel) {
+    return (size_t)(unsigned)(sel < 0 ? 0 : sel);
+}
+```
+
+The head-packed MFMA gather arm (`d_flash_mla_decode_mfma`, non-default but live) had the identical
+cast in both of its row reads and gets the same clamp.
+
+#### Layer 2 on hardware
+
+| | median | exit |
+|---|---|---|
+| layer 0 — window only | 20,707 us | min -2.875 max 3.781 NaN 0 Inf 0 |
+| layer 2 — compressor + indexer + gathered read | **36,380 us** | min -8.75 max 34.0 NaN 0 Inf 0 |
+
+The compressed path costs **15.7 ms per layer** on top of the window flash, unoptimized and not yet
+attributed between the compressor (op 180 + op 185), the indexer (ops 117/118, replicated across all
+8 ranks) and the second flash. The indexer is the suspect: its score array is `[T][4096]` f32 and
+§12.16 chose to replicate rather than shard it, with row-splitting the queries recorded as the next
+move. That attribution is the next measurement, not a conclusion.
+
+This is the first V4.1 layer to run its own attention as the reference defines it. It is not
+evidence of correctness — the input is still a seeded synthetic and there is still no reference
+parity harness — only that the shapes, the caches and the selection survive a real launch.
+
+#### Where the 15.7 ms went, and it was not where §12.16 guessed
+
+`--block 2..4` — layer 2 writes the cache and publishes the selection, 3 and 4 read both — runs in
+**82.4 ms for three layers**, and its trace answers the attribution question §12.16 left open:
+
+| op | calls | body / call |
+|---|---|---|
+| `COMPRESS_ROPE_QUANT` (185) | 3 | **3,231 us** |
+| `FLASH_GATHER_PREFILL` (55) | 3 | 3,317 us |
+| `INDEX_SELECT_PF` (118) | 1 | 1,152 us |
+| `INDEX_SCORE_PF` (117) | 1 | 504 us |
+| `COMPRESS_POOL` (180) | 1 | 61 us |
+
+**The indexer is cheap.** §12.16 named it the suspect and recorded "row-split the queries instead"
+as the next move; 1.7 ms of a 27 ms layer says that lever is not worth pulling, and the decision to
+replicate rather than shard stands on its own measurement now instead of on the `static_assert` that
+motivated it.
+
+Op 185 was the cost, at **80x its own roofline** — it moves 67 MB and took 3.2 ms. The shape of the
+error is the one a grid-strided megakernel op makes most easily: it claimed a whole WORKGROUP per
+row and then found nothing for the workgroup to do. The indexer's queries are `d`=128 at `qblk`=32,
+so the quant loop
+
+```c
+for (unsigned b = threadIdx.x; b < d / qblk; b += PLOW_THREADS)
+```
+
+ran **four** of 512 lanes, and the rope and staging loops before it ran 64 and 128. Three
+`__syncthreads()` and four dependent global round trips, 862 times per workgroup at 8k — 3.75 us per
+row, which is latency, not work.
+
+Nothing about the op needs a workgroup. A quant block's scale depends on its own `qblk` channels and
+on nothing else, and an interleaved (GPT-J) rope pair is two ADJACENT channels, so one thread can
+own a block end to end: `cmp_rope_at` computes a channel's roped value from the two bf16 its pair
+needs, and the kernel became a flat grid stride over (row, block) with no LDS and no barrier. The
+block's channels are read twice — once for the amax, once for the round trip — which is one HBM trip
+and one L1 hit, and cheaper than any buffer that would fit.
+
+**9,692 us to 820 us, 11.8x**, and the three-layer chain from 82.4 ms to **73.3 ms**. The exit's min
+and max are unchanged (-42.5, 316.0); the mean moves in its seventh digit, which is op 118 emitting
+a selected row "in arbitrary order (the union build is order-blind)" and the gather therefore summing
+it in a different order run to run — not the rewrite, which is value-identical by construction.
+
+#### What 73.3 ms says about 90 ms
+
+24.4 ms per layer, so a 40-layer model is ~977 ms against a 90 ms target. The gap is **not** in the
+V4.1 machinery this campaign added. Per layer, from the same trace:
+
+| op | per layer | what it is |
+|---|---|---|
+| `GEMV_F32` | 3.33 ms | the mHC's own GEMV — §12.13's open item |
+| `FLASH_GATHER_PREFILL` | 3.29 ms | the compressed read (512 slots vs the window's 128) |
+| `MOE_GROUP_DOWN_PF` | 2.76 ms | |
+| `GEMM_FP8_MX` | 2.67 ms | 25 calls |
+| `HYPER_CONN_PRE` | 2.52 ms | |
+| `XREDUCE2` | 2.05 ms | 674 of its 684 us per packet is STRAGGLER — TP imbalance, not work |
+| `MOE_GROUP_GLU_PF` | 1.94 ms | |
+| `FLASH_MLA_PREFILL` | 1.42 ms | the 128-token window |
+
+Six of the eight predate this session. The gathered flash is the only new line in the top half, and
+at 4x the window's KV for 2.3x its time it is already sublinear — it is the model's design cost, not
+a defect. The 90 ms target is a GEMM/MoE/collective problem, and the first two numbers to chase are
+`GEMV_F32` and `XREDUCE2`'s straggler, neither of which is about V4.1 at all.
+
 ### 12.2 What is still not demonstrated
 
   * ONE layer, not 40. The whole-model emit is still blocked on the subsystems

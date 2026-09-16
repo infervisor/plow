@@ -121,32 +121,60 @@ __device__ __forceinline__ float cmp_dequant_fp4(unsigned n) {
  * The mode is a runtime argument rather than a template parameter because op 185 picks it per
  * CALL -- compressed KV and index keys differ only here -- and this runs once per `blk` channels
  * against a pooling loop of `nslot * d`. */
-__device__ __forceinline__ void cmp_fake_quant_block(float* __restrict__ lds, unsigned c0,
-                                                     unsigned blk, unsigned qmode) {
-    const bool fp4 = qmode != PLOW_CMP_Q_FP8_POW2;
-    const float top = fp4 ? PLOW_CMP_FP4_MAX : PLOW_FP8_E4M3_MAX;
+__device__ __forceinline__ float cmp_block_scale(float amax, unsigned qmode,
+                                                 float* __restrict__ inv_s) {
+    const float top = qmode != PLOW_CMP_Q_FP8_POW2 ? PLOW_CMP_FP4_MAX : PLOW_FP8_E4M3_MAX;
     const float floor_ = qmode == PLOW_CMP_Q_FP8_POW2   ? 1e-4f
                          : qmode == PLOW_CMP_Q_FP4_POW2 ? PLOW_CMP_FP4_FLOOR
                                                         : PLOW_CMP_FP4_FLOOR_E4M3;
-    float amax = 0.0f;
-    for (unsigned i = 0; i < blk; i++) amax = fmaxf(amax, fabsf(lds[c0 + i]));
     amax = fmaxf(amax, floor_);
-    float s, inv_s = 0.0f;
+    float s;
+    *inv_s = 0.0f;
     /* An E4M3 scale is NOT a power of two, so neither `plow_round_scale` nor
      * `PLOW_QUANT_SCALE_DIV`'s reciprocal form applies: the divide is a real divide and the
      * dequant multiply is a real multiply. */
     if (qmode == PLOW_CMP_Q_FP4_E4M3)
         s = dequant_fp8(quant_fp8(amax / top));
     else
-        plow_round_scale(amax, top, &s, &inv_s);
-    for (unsigned i = 0; i < blk; i++) {
-        const float x = lds[c0 + i];
-        const float q = fminf(
-            fmaxf(qmode == PLOW_CMP_Q_FP4_E4M3 ? x / s : PLOW_QUANT_SCALE_DIV(x, s, inv_s), -top),
-            top);
-        const float r = fp4 ? cmp_dequant_fp4(quant_fp4(q)) : dequant_fp8(quant_fp8(q));
-        lds[c0 + i] = bf2f(f2bf(r * s));
-    }
+        plow_round_scale(amax, top, &s, inv_s);
+    return s;
+}
+
+/* One channel's round trip at a block scale already chosen. */
+__device__ __forceinline__ float cmp_quant_rt(float x, float s, float inv_s, unsigned qmode) {
+    const bool fp4 = qmode != PLOW_CMP_Q_FP8_POW2;
+    const float top = fp4 ? PLOW_CMP_FP4_MAX : PLOW_FP8_E4M3_MAX;
+    const float q = fminf(
+        fmaxf(qmode == PLOW_CMP_Q_FP4_E4M3 ? x / s : PLOW_QUANT_SCALE_DIV(x, s, inv_s), -top),
+        top);
+    const float r = fp4 ? cmp_dequant_fp4(quant_fp4(q)) : dequant_fp8(quant_fp8(q));
+    return bf2f(f2bf(r * s));
+}
+
+__device__ __forceinline__ void cmp_fake_quant_block(float* __restrict__ lds, unsigned c0,
+                                                     unsigned blk, unsigned qmode) {
+    float amax = 0.0f;
+    for (unsigned i = 0; i < blk; i++) amax = fmaxf(amax, fabsf(lds[c0 + i]));
+    float inv_s;
+    const float s = cmp_block_scale(amax, qmode, &inv_s);
+    for (unsigned i = 0; i < blk; i++)
+        lds[c0 + i] = cmp_quant_rt(lds[c0 + i], s, inv_s, qmode);
+}
+
+/* The ROPED value of channel `c` of `srow`, from the two bf16 its pair needs. Interleaved
+ * (GPT-J) pairs mean one thread owns both halves, so this is the entire rope for that channel:
+ * no staging, no barrier, and therefore no reason for a workgroup to own a whole row. The bf16
+ * round is the reference's -- `apply_rotary_emb` writes a bf16 tensor that the quant then
+ * reads, so dropping it would quantize a value the reference never sees. */
+__device__ __forceinline__ float cmp_rope_at(const bf16* __restrict__ srow, unsigned c,
+                                             unsigned c_rope0, const float* __restrict__ cosb,
+                                             const float* __restrict__ sinb, size_t tb) {
+    const float x = bf2f(srow[c]);
+    if (c < c_rope0) return x;
+    const unsigned k = c - c_rope0, m = k >> 1;
+    const float p = bf2f(srow[c_rope0 + (m << 1) + (1u - (k & 1u))]);
+    const float cs = cosb[tb + m], sn = sinb[tb + m];
+    return bf2f(f2bf((k & 1u) ? p * sn + x * cs : x * cs - p * sn));
 }
 
 /* ONE WORKGROUP PER COMPRESSED ENTRY, grid-strided over `n_pools`.
@@ -318,7 +346,9 @@ __device__ void d_compress_pool(bf16* __restrict__ out, const bf16* __restrict__
  * `fp4_act_quant(q, 32, True)` over each head's whole 128. The quant block never spans two heads,
  * so the two consumers of this op differ only in `n_head`, `qblk` and `qmode`.
  *
- * `lds` must hold `d` floats. No `part`: there is no cross-channel reduction here.
+ * No LDS and no barrier: a quant block's scale depends only on its own `qblk` channels and an
+ * interleaved rope pair is two adjacent channels, so one THREAD owns a block end to end. The
+ * `lds` parameter stays for the dispatch's uniform call shape and is unused.
  */
 __device__ void d_compress_rope_quant(bf16* __restrict__ out, const bf16* __restrict__ src,
                                       const float* __restrict__ cosb,
@@ -332,33 +362,39 @@ __device__ void d_compress_rope_quant(bf16* __restrict__ out, const bf16* __rest
     const unsigned rbase = (pos != nullptr) ? ((unsigned)pos[0] / ratio) : row_base;
 
     const unsigned items = n_rows * n_head;
-    for (unsigned it = slice; it < items; it += nblk) {
+    (void)lds;
+    if (d % qblk) __builtin_trap(); /* a block may not straddle the end of a row */
+
+    /* ONE THREAD PER QUANT BLOCK, not one workgroup per row. A quant block's scale depends on
+     * its own `qblk` channels and on nothing else, and `cmp_rope_at` makes a channel's rope
+     * self-contained, so the whole op is embarrassingly parallel at block granularity. The
+     * row-per-workgroup form this replaces left 508 of 512 lanes idle on the indexer's queries
+     * (`d`=128, `qblk`=32 => FOUR blocks) and paid three barriers and four dependent round
+     * trips per row: 862 rows per workgroup at 8k, measured 3.2 ms per call against a 67 MB
+     * roofline. The two reads of each channel below are one HBM trip and one L1 hit. */
+    const unsigned nb = d / qblk;
+    const unsigned c_rope0 = d - rd; /* rd == 0 => no channel ropes */
+    const size_t total = (size_t)items * nb;
+    for (size_t w = (size_t)slice * PLOW_THREADS + threadIdx.x; w < total;
+         w += (size_t)nblk * PLOW_THREADS) {
+        const unsigned it = (unsigned)(w / nb);
+        const unsigned c0 = (unsigned)(w % nb) * qblk;
         /* The POSITION is the row's, shared by all its heads; the OFFSET is the item's. */
         const unsigned r = it / n_head;
         const size_t off = (size_t)(rbase * n_head) + (size_t)it;
         const bf16* const srow = src + off * d;
-        for (unsigned c = threadIdx.x; c < d; c += PLOW_THREADS) lds[c] = bf2f(srow[c]);
-        __syncthreads();
+        const size_t tb = (size_t)((rbase + r) * ratio) * (rd / 2);
 
-        if (rd) {
-            const size_t tb = (size_t)((rbase + r) * ratio) * (rd / 2);
-            const unsigned c0 = d - rd;
-            for (unsigned i = threadIdx.x; i < rd / 2; i += PLOW_THREADS) {
-                const float x0 = lds[c0 + 2 * i], x1 = lds[c0 + 2 * i + 1];
-                const float cs = cosb[tb + i], sn = sinb[tb + i];
-                lds[c0 + 2 * i] = bf2f(f2bf(x0 * cs - x1 * sn));
-                lds[c0 + 2 * i + 1] = bf2f(f2bf(x0 * sn + x1 * cs));
-            }
-            __syncthreads();
-        }
-
-        for (unsigned b = threadIdx.x; b < d / qblk; b += PLOW_THREADS)
-            cmp_fake_quant_block(lds, b * qblk, qblk, qmode);
-        __syncthreads();
+        float amax = 0.0f;
+        for (unsigned i = 0; i < qblk; i++)
+            amax = fmaxf(amax, fabsf(cmp_rope_at(srow, c0 + i, c_rope0, cosb, sinb, tb)));
+        float inv_s;
+        const float s = cmp_block_scale(amax, qmode, &inv_s);
 
         bf16* const orow = out + off * d;
-        for (unsigned c = threadIdx.x; c < d; c += PLOW_THREADS) orow[c] = f2bf(lds[c]);
-        __syncthreads(); /* lds is reused by the next row */
+        for (unsigned i = 0; i < qblk; i++)
+            orow[c0 + i] = f2bf(cmp_quant_rt(cmp_rope_at(srow, c0 + i, c_rope0, cosb, sinb, tb),
+                                             s, inv_s, qmode));
     }
 }
 
