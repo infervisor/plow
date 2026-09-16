@@ -3531,7 +3531,8 @@ wins found the same way. **The instrument is not a formality.**
   * No reference parity. The input is synthetic; correctness so far is
     "finite and stable" plus an op census that matches the config (§12.18), not
     "right". This is now the largest single gap.
-  * **~581 ms against 90 ms** as of §12.50 (chain-sum 608.3 ms less a measured 27.3 ms seam offset) (§12.29-§12.42 took a further 141 ms off the 755 below;
+  * **~581 ms against 90 ms** as of §12.50 (chain-sum 608.3 ms less a measured 27.3 ms seam offset)
+  * **90 ms is 0.99x the ROOFLINE FLOOR of this model on this hardware — see §12.56. It is not reachable.** (§12.29-§12.42 took a further 141 ms off the 755 below;
     §12.19, §12.20, §12.22, §12.24 and §12.26 took 237 ms off §12.18's 992,
     neither in a V4.1 op; §12.21 showed the next 124 ms line is already on its
     finest legal tile). Closing the remaining 9.5x is not a list of point fixes:
@@ -4529,3 +4530,56 @@ build, so each step of that bisect is one 18-second row build and a `grep`.
 The campaign's honest position is that the tree's own unreached fast paths were worth
 755 -> ~581 ms (-23%), and the remainder is a pipeline-wide MFMA-efficiency problem whose root is
 one number in a build log that nobody had read.
+
+### 12.56 90 ms is below the floor, and here is the arithmetic
+
+The target has been carried for the whole campaign without anyone checking it against a roofline.
+`scripts/dsv41_roofline.py` does that: each op's own floor, taken GENEROUSLY -- compute at full
+MFMA peak (653 T MAC/s bf16, 1306 fp8), traffic at full HBM peak (5.3 TB/s), collectives at full
+xGMI (400 GB/s/GPU) -- whichever binds. No op can beat its own floor, so the SUM is a hard lower
+bound.
+
+    op                        measured     floor   x off
+    FLASH_GATHER_PREFILL         3008        56    53.8
+    GEMM_FP8_MX                  2813       312     9.0
+    MOE pair (GLU+DOWN)          1575       194     8.1
+    XREDUCE2                     1384       734     1.9
+    GEMV_F32                     1021        98    10.4
+    HYPER_CONN PRE+POST          1158       285     4.1
+    COMPRESS_ROPE_QUANT           674        11    63.1
+    RMSNORM                       333       127     2.6
+    MOE_COMBINE_PF                318       237     1.3
+    FLASH_MLA_PREFILL             423       228     1.9
+    ------------------------------------------------
+    SUM (these ten)             12707      2282     5.6
+    other ~10 ops                2393         --
+    LAYER                       15100
+
+    40-layer measured   604 ms
+    40-layer FLOOR       91 ms      <- ten ops only; the other ten counted as FREE
+    target               90 ms
+    target / floor      0.99x
+
+**90 ms is 0.99x the floor.** Reaching it would need every one of those ten ops at 100% of
+theoretical peak SIMULTANEOUSLY -- and would still miss, because the other ten ops (2.4 ms/layer
+measured today) are counted at zero here and their floors are not zero. This is not an optimisation
+gap; the target is below what the algorithm and the hardware allow.
+
+Two lines carry most of it:
+
+  * **`XREDUCE2`'s floor alone is 734 us/layer = 29 ms over 40 layers -- a THIRD of the entire
+    90 ms budget** -- and it is already within 1.9x of that floor. Two all-reduces of `[8192, 5120]`
+    bf16 per layer at TP8 is 147 MB per GPU per reduce after the ring factor; at full xGMI that is
+    what it costs. No kernel work touches it. Only a different parallelism (less frequent
+    reduction, or a sharding that reduces less) would.
+  * `MOE_COMBINE_PF` (1.3x) and `FLASH_MLA_PREFILL` (1.9x) are likewise nearly done.
+
+So the honest statement of where the campaign ended: **604 ms measured against a 91 ms floor is
+6.6x, and the reachable number is neither 604 nor 90.** A strong implementation runs its ops at
+roughly half of peak; that puts this model at **~180-250 ms on 8x MI300X at 8k**, and the work to
+get there is the pipeline-wide MFMA-efficiency problem of §12.55 -- splitting the interpreter so
+ops stop inheriting each other's register union -- not any remaining tile or arm.
+
+If 90 ms is a hard requirement, it needs a change of premise, not of code: fewer layers, a shorter
+context, more GPUs (the collective floor falls with a smaller per-GPU payload only if the reduction
+itself shrinks), or a different attention/MoE algorithm. The number as stated is not on this curve.
