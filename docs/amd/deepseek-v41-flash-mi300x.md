@@ -3454,6 +3454,73 @@ workgroups, nothing does. 226 GB/s of fabric traffic per packet at the measured 
 headroom, but suggesting is not measuring, and the two ceiling instruments in §12.25 are exactly
 why that distinction is now written down instead of assumed.
 
+### 12.29 Single-block is the right harness, and it kills two of my own hypotheses
+
+Everything in §12.17-§12.28 was measured on the 40-layer run: a 54-second load, ~135 GB per GPU,
+and a 6-minute object build per variant. Emitting ONE block (`--block 2`, the common case --
+`compress_ratio` 2 so it carries the gathered attention, plus the MoE and the mHC) changes the
+economics completely:
+
+| | 40 layers | one block |
+|---|---|---|
+| load | 54 s | **12.8 s** |
+| VRAM | ~135 GB/GPU | fits in 13 GB free |
+| object build per variant | ~6 min | **18 s** (`PLOW_ROWS_ONLY=interp_prefill_mla_moe`) |
+| exit range | -40,192 .. 137,216 (wanders) | **-1.37 .. 3.64, mean -0.0007** |
+
+The last row matters as much as the speed. One layer does not amplify a seeded synthetic the way
+forty do, so the exit is a usable equality check — every bit-identical knob below produced
+`min -1.36719 max 3.64062 mean -0.000712`, to the last printed digit, which is the parity evidence
+the whole-model run could never give (§12.26's open question). Two gotchas: the object stamps
+`PLOW_PACKET_HASH` from the `plow_config.h` in `PLOW_HSACO_CONFIG`, so a single-block packet needs
+objects built against ITS config; and the loader opens objects for buckets the run never executes,
+so a one-row build has to be back-filled (`cp -n`) AFTER the contract audit, not before.
+
+#### GEMV_F32: -37.8%, and the W-volume diagnosis was right
+
+`PLOW_GEMV_F32_MR` (§12.28's arm 6) blocks the wide-M GEMV over rows so each f32 W load feeds MR
+fmas instead of one. `d_gemv_f32` body over the layer's two packets, median of 5:
+
+| MR | op body | layer |
+|---|---|---|
+| 1 (== arm 5) | 1688 us | 20458 us |
+| 2 | 1476 us | 20133 us |
+| **4** | **1051 us** | **19771 us** |
+| 8 | 1009 us | 19812 us |
+
+**-37.8% on the op**, and the layer moves 640 us against an op delta of 637 -- attributable, not
+drift. Confirmed at the committed default: layer 19818 us, `GEMV_F32` 1045 us, same exit digits.
+MR=8 buys another 42 us on the op and gives 41 back on the layer, exactly the spill its scratch
+count predicted (2642 -> 2901 scratch ops), so the default is 4.
+
+#### Two hypotheses of mine, falsified by measurement
+
+**§12.28's collective lever is not there.** I argued `XREDUCE2` spends 64.5 ms of wall time on
+6.3 ms of machine-filling work because only 24 of 304 workgroups run it, and that
+`PLOW_XR_SCHED_NWG` -- tuned at GLM's 6144 hidden, not V4.1's 5120 -- was the largest remaining
+knob. Raising it makes the op WORSE:
+
+| NWG | 24 (default) | 48 | 64 | 96 | 152 |
+|---|---|---|---|---|---|
+| `XREDUCE2` body | **1439 us** | 1467 | 1622 | 1491 | 1723 |
+
+The collective is genuinely fabric-bound at 24 workgroups. The 280 idle CUs are not waste, they
+are what a 24-workgroup rendezvous costs, and `serial = 10.27` measured a schedule that is correct
+rather than a lever. The occupancy audit was still worth having -- it is what established that
+*every other* op fills the machine -- but its one actionable conclusion was wrong.
+
+**§12.27's union table would buy ~3%.** `PLOW_FA_GATHER_ABL=1` collapses every gathered row to a
+fixed 64-row window: same loads, same scores, same softmax, same PV, index still computed and read,
+only the address tamed. `FLASH_GATHER_PREFILL` goes **3278 -> 3187 us, -2.8%**. So the random
+scatter across top-512 cache rows is worth 91 us of a 3.3 ms op. Emitting op 119, writing a V2
+GATHER dispatch and resolving the 4-wave/8-wave topology -- the substantial work §12.27 scoped --
+would chase 3%. **The op's cost is its SCALAR MATH, not its locality**, and the only fix that
+matters is the matrix pipe.
+
+That is two expensive plans deleted by two cheap instruments, on top of §12.25's two. The score for
+this campaign is now four confident architectural readings falsified by ablation, against three
+wins found the same way. **The instrument is not a formality.**
+
 ### 12.2 What is still not demonstrated
 
   * ~~ONE layer, not 40.~~ **Superseded by §12.18**: all 40 layers emit and run as

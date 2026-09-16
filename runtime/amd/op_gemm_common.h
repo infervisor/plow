@@ -5221,7 +5221,21 @@ __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
  * MR rows per wave amortise each W load over MR fmas and cut that volume by MR. The cost is
  * `MR * CG` accumulators plus `MR * KV` staged x floats, on a kernel already at the 256-VGPR cap
  * -- which is exactly how arm 3 lost (24 live floats spilled and the straggler doubled), so MR is
- * a knob and not a constant, and the default stays 1 until hardware ranks it.
+ * a knob and not a constant.
+ *
+ * MEASURED, 8x MI300X, V4.1 layer 2 at T=8192 (N=24, K=20480), `d_gemv_f32` body over the layer's
+ * two packets, median of 5 iters:
+ *
+ *     MR=1  (== arm 5)   1688 us      layer 20458 us
+ *     MR=2               1476 us      layer 20133 us
+ *     MR=4               1051 us      layer 19771 us   <- default
+ *     MR=8               1009 us      layer 19812 us
+ *
+ * -37.8% on the op at MR=4, and the LAYER moves 687 us against an op delta of 637 -- so the win is
+ * attributable to this op rather than drift. MR=8 takes another 42 us on the op and gives 41 of
+ * them back on the layer: the spill its scratch count predicted (2642 -> 2901 scratch, 3543 -> 3903
+ * ds) lands on the other ops sharing the object, which is the trade arm 3 lost outright. Exits are
+ * IDENTICAL at every MR to the last printed digit, as the bit-identical claim requires.
  *
  * BIT-IDENTICAL TO ARM 5 at every MR: each (row, column) accumulator still folds the same
  * eight-consecutive-k groups in the same order through the same `wave_sum`. MR changes only how
@@ -5229,7 +5243,7 @@ __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
 #define PLOW_GEMV_F32_ARM 6
 #endif
 #ifndef PLOW_GEMV_F32_MR
-#define PLOW_GEMV_F32_MR 1
+#define PLOW_GEMV_F32_MR 4
 #endif
 
 #if PLOW_GEMV_F32_ARM == 6
