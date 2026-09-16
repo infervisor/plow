@@ -154,7 +154,10 @@ __device__ __forceinline__ void cmp_fake_quant_block(float* __restrict__ lds, un
  *   out      [*][d]            the destination cache region; row `out_base + pool` is written
  *   kv       [n_src][coff*d]   the `wkv` projection: per token (prefill) or per ring slot
  *   score    [n_src][coff*d]   the `wgate` projection, same rows, WITHOUT `ape` folded in
- *   ape      [ratio][coff*d]   the learned position-in-block gate bias
+ *   ape      [ratio][coff*d]   the learned position-in-block gate bias, or NULL -- V4.1's
+ *                              `Compressor` has no such parameter at all (`model.py:458-485`),
+ *                              and a zero-filled buffer would be a tensor the emitter has to
+ *                              keep zero rather than an absence the type says is an absence
  *   gamma    [d]               the post-pool RMSNorm gain
  *   cosb/sinb[*][rd/2]         interleaved (GPT-J) RoPE tables; may be null when rd == 0
  *   out_base                   pool index of `pool == 0`; the chunk/append base, op 130's
@@ -197,7 +200,7 @@ __device__ void d_compress_pool(bf16* __restrict__ out, const bf16* __restrict__
                                     : (int)(pool * ratio + r) - (int)((coff == 2 && half == 0) ? ratio : 0);
                 if (row < 0) continue;
                 mx = fmaxf(mx, bf2f(score[(size_t)row * kstr + half * d + c]) +
-                                   ape[(size_t)r * kstr + half * d + c]);
+                                   (ape ? ape[(size_t)r * kstr + half * d + c] : 0.0f));
             }
             float den = 0.0f, acc = 0.0f;
             for (unsigned s = 0; s < nslot; s++) {
@@ -207,7 +210,7 @@ __device__ void d_compress_pool(bf16* __restrict__ out, const bf16* __restrict__
                                     : (int)(pool * ratio + r) - (int)((coff == 2 && half == 0) ? ratio : 0);
                 if (row < 0) continue;
                 const float p = expf(bf2f(score[(size_t)row * kstr + half * d + c]) +
-                                     ape[(size_t)r * kstr + half * d + c] - mx);
+                                     (ape ? ape[(size_t)r * kstr + half * d + c] : 0.0f) - mx);
                 den += p;
                 acc += bf2f(kv[(size_t)row * kstr + half * d + c]) * p;
             }

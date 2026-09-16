@@ -1231,6 +1231,175 @@ fn the_attention_core_is_windowed_nope_mla_over_the_shared_latent() {
     assert_eq!(groups, tp);
 }
 
+/// The compressor pools with NO `ape`, at `coff = 1`, and stops before the RoPE.
+///
+/// Three claims the oracle priced and the emit has to hold:
+///   * `ape` is `TENSOR_NONE`, not a zero buffer. A nonzero one is worth 1.65 absolute
+///     (`scripts/dsv41_csa2_oracle.py` check [2]), and V4.1's `Compressor` has no such parameter
+///     at all -- a declared-and-kept-zero tensor is a promise, a sentinel is a type.
+///   * `coff = 1`: no overlap transform, so each pool draws from `ratio` slots and not `2*ratio`.
+///   * `i7 = 2`: pool, norm and STOP. The latent the indexer reads is the PRE-RoPE one
+///     (`model.py:432-434`), and op 185 is what finishes it.
+#[test]
+fn the_compressor_pools_with_no_ape_and_stops_before_the_rope() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let (t, tp, ctx) = (1024u32, 8u32, 8192u32);
+    let l = 2u32; // a ratio-2 kv_source
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[l], tp);
+    let cp = super::dsv41::declare_dsv41_compress(&mut b, &cfg, &[l], t, ctx)
+        .expect("layer 2 is a kv_source");
+    let all: Vec<u32> = (0..304u32).collect();
+    let xn = b.tensor("act.xn", (t as u64) * (cfg.hidden as u64) * 2);
+    let cos = b.tensor("gen.cos", (ctx as u64) * 32 * 4);
+    let sin = b.tensor("gen.sin", (ctx as u64) * 32 * 4);
+    super::dsv41::emit_dsv41_compressor(&mut b, &cfg, &w, &all, &cp, l, xn, cos, sin, t, &[]);
+    let p = b.finish();
+
+    let pool = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::CompressPool as u16)
+        .expect("a ratio-2 compressor pools");
+    assert_eq!(pool.t[3], TENSOR_NONE, "NO `ape` -- V4.1's Compressor has none");
+    assert_eq!(pool.t[5], TENSOR_NONE, "no cos on the pool: arm 2 stops before the rope");
+    assert_eq!(pool.t[6], TENSOR_NONE);
+    assert_eq!(pool.i[2], 1, "coff 1: no overlap transform");
+    assert_eq!(pool.i[7], 2, "arm 2 -- pool, norm, STOP");
+    assert_eq!(pool.i[1], 2, "layer 2 compresses at ratio 2");
+    assert_eq!(pool.i[0], t / 2, "one pool per `ratio` tokens");
+    assert_eq!(pool.t[0], cp.latent, "the PRE-RoPE latent, which the indexer reads");
+
+    let tail = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::CompressRopeQuant as u16)
+        .expect("op 185 finishes the cache row");
+    assert_eq!(tail.t[0], cp.cache, "the shared cache");
+    assert_eq!(tail.t[1], cp.latent, "reading the latent it must NOT overwrite");
+    assert_ne!(
+        tail.t[0], tail.t[1],
+        "the reference ropes in place; here the indexer still has to read `src`, and a \
+         write-after-read is not something the packet order expresses"
+    );
+    assert_eq!(tail.i[2], cfg.qk_rope, "only the last 64 rotate");
+    assert_eq!(tail.i[3], 16, "fp4_act_quant(latent, 16, ...)");
+    assert_eq!(tail.i[6], 2, "fp4 e2m1 with an E4M3 scale, not a power of two");
+    assert_eq!(tail.i[4], 2, "a latent stands for the FIRST token of its group");
+}
+
+/// Layer 20 compresses at ratio 1, and that is a plain projection with NO pool.
+///
+/// `Compressor.forward` returns on its first line there -- `self.norm(self.wkv(x))`, no gate, no
+/// fp32, no softmax (`model.py:461-462`). An emit that ran op 180 at ratio 1 would take a softmax
+/// over one slot, which is the identity, and then consult a `wgate` weight the checkpoint does
+/// not ship for that layer.
+#[test]
+fn layer_twenty_compresses_at_ratio_one_with_no_pool() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let (t, tp, ctx) = (1024u32, 8u32, 8192u32);
+    let l = 20u32;
+    assert!(cfg.kv_source.contains(&l));
+    assert!(
+        !cfg.raw.compressor_has_gate(l),
+        "layer 20 ships no `wgate`, which is the checkpoint's own statement that it does not pool"
+    );
+    let mut b = Builder::new(304);
+    let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[l], tp);
+    let cp = super::dsv41::declare_dsv41_compress(&mut b, &cfg, &[l], t, ctx).unwrap();
+    let all: Vec<u32> = (0..304u32).collect();
+    let xn = b.tensor("act.xn", (t as u64) * (cfg.hidden as u64) * 2);
+    let cos = b.tensor("gen.cos", (ctx as u64) * 32 * 4);
+    let sin = b.tensor("gen.sin", (ctx as u64) * 32 * 4);
+    super::dsv41::emit_dsv41_compressor(&mut b, &cfg, &w, &all, &cp, l, xn, cos, sin, t, &[]);
+    let p = b.finish();
+
+    assert!(
+        !p.insts.iter().any(|d| d.op == DevOp::CompressPool as u16),
+        "ratio 1 must not pool"
+    );
+    let norm = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::RmsNorm as u16)
+        .expect("the compressor's own norm");
+    assert_eq!(norm.t[0], cp.latent);
+    assert_eq!(norm.i[1], cfg.head_dim);
+    let tail = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::CompressRopeQuant as u16)
+        .expect("op 185 still finishes the row");
+    assert_eq!(tail.i[0], t, "ratio 1: one cache row per TOKEN");
+    assert_eq!(tail.i[4], 1);
+}
+
+/// A layer's rope table is chosen by `compress_ratio`, and window-only layers get a different one.
+///
+/// `Attention.__init__` builds ONE `freqs_cis` per layer (`model.py:680-687`): theta 160000 under
+/// YaRN when `compress_ratio` is set, theta 10000 with YaRN DISABLED when it is not. Every rope in
+/// that layer reads it -- the query's, the latent's, the compressor's. Two layers of the same
+/// shape take different tables, which is the kind of difference no shape check can see.
+#[test]
+fn window_layers_and_compressed_layers_rope_on_different_tables() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    // Layer 0 is window-only and must NOT materialise the YaRN table at all: two ROPE gen
+    // tensors (cos and sin), not four.
+    let (m0, _) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 8192, 256);
+    let ropes = m0
+        .gen
+        .iter()
+        .filter(|g| g.scale != packet::rope::ROPE_SCALE_NONE || g.theta > 0.0)
+        .count();
+    assert_eq!(
+        ropes, 2,
+        "a window-only chain has no compressed layer and must not carry the scaled table too"
+    );
+    assert!(
+        m0.gen
+            .iter()
+            .all(|g| g.theta == 0.0 || g.theta == cfg.raw.rope_theta as f64),
+        "every rope table in a window-only chain is the BASE theta, YaRN disabled"
+    );
+    // And the two tables are genuinely different data, not two names for one buffer.
+    let rope = cfg.qk_rope;
+    let [base, _] = packet::rope::GenTensor::rope_pair(
+        1024,
+        rope,
+        cfg.raw.rope_theta as f64,
+        1.0,
+        packet::rope::RopeScale::None,
+    );
+    let rs = &cfg.raw.rope_scaling;
+    let [yarn, _] = packet::rope::GenTensor::rope_pair(
+        1024,
+        rope,
+        cfg.raw.compress_rope_theta as f64,
+        1.0,
+        packet::rope::RopeScale::YarnDeepSeek {
+            factor: rs.factor as f64,
+            beta_fast: rs.beta_fast as f64,
+            beta_slow: rs.beta_slow as f64,
+            orig: rs.original_max_position_embeddings as f64,
+            truncate: true,
+        },
+    );
+    assert_ne!(
+        base.generate(),
+        yarn.generate(),
+        "theta 10000 unscaled and theta 160000 under YaRN must not produce the same table"
+    );
+}
+
 /// Every tensor-parallel weight is READ at the width it was DECLARED at.
 ///
 /// This is the invariant three separate bugs in this emitter violated in one sitting -- `wo_b`,

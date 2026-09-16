@@ -618,6 +618,202 @@ pub(crate) fn emit_dsv41_attn_proj(
     (act, c_kv)
 }
 
+/// CSA2's write side: the compressed-KV cache the whole chain shares, and one source's scratch.
+pub(crate) struct Dsv41Compress {
+    /// THE SHARED CACHE, `[ctx][head_dim]` bf16, ONE buffer for the whole chain. In the reference
+    /// it is a module-level global -- `shared_attn.compress_kv` (`model.py:745`) -- written by
+    /// whichever `kv_source` layer ran last and read by every layer after it until the next one
+    /// overwrites it. Sized at `ctx` rows because layer 20 compresses at ratio 1; the ratio-2
+    /// sources use the prefix.
+    pub(crate) cache: u32,
+    /// `xn @ compressor.wkv^T`, `[T][head_dim]` bf16.
+    kv: u32,
+    /// `xn @ compressor.wgate^T`, `[T][head_dim]` bf16. Unused at ratio 1, which has no gate.
+    gate: u32,
+    /// The post-norm, PRE-RoPE latent, `[ctx][head_dim]` bf16 -- what the INDEXER reads, and the
+    /// reason op 180 stops after the norm. Separate from `cache` because op 185 must not
+    /// overwrite what the indexer still has to read.
+    pub(crate) latent: u32,
+}
+
+/// Declare the compressor's scratch. `None` when no layer in the chain is a `kv_source`.
+pub(crate) fn declare_dsv41_compress(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    layers: &[u32],
+    t: u32,
+    ctx: u32,
+) -> Option<Dsv41Compress> {
+    if !layers.iter().any(|l| c.kv_source.contains(l)) {
+        return None;
+    }
+    let (r, hd, cx) = (t as u64, c.head_dim as u64, ctx as u64);
+    Some(Dsv41Compress {
+        cache: b.tensor("act.compress_kv", cx * hd * 2),
+        kv: b.tensor("act.compress_wkv", r * hd * 2),
+        gate: b.tensor("act.compress_wgate", r * hd * 2),
+        latent: b.tensor("act.compress_latent", cx * hd * 2),
+    })
+}
+
+/// Emit ONE `kv_source` layer's compressor: the pooled latent, and the cache row it becomes.
+///
+/// # Two shapes, because `compress_ratio` is not one number
+///
+/// `kv_source_layer_ids` is `[2, 8, 14, 20]` and `compress_ratios` gives 2, 2, 2 and **1**. At
+/// ratio 1 `Compressor.forward` returns on its first line -- `self.norm(self.wkv(x))`, no gate, no
+/// fp32, no pooling (`model.py:461-462`) -- so layer 20 is a plain GEMM plus an RMSNorm and op 180
+/// must not run at all. `compressor_has_gate` is what the tensor table already keys the `wgate`
+/// weight on, and this uses the same predicate rather than a second reading of the ratio.
+///
+/// # The pooled form
+///
+/// Op 180 with `coff = 1` and a NULL `ape`. V4.1 has neither the overlap transform nor the
+/// position-in-block bias -- `scripts/dsv41_csa2_oracle.py` check [1] puts op 180 at max err
+/// 0.000e+00 against the reference on those terms, and check [2] shows a nonzero `ape` is worth
+/// 1.65, so omitting it is a claim and not a formality.
+///
+/// `i7 = 2` stops the op after the norm. The rope and the fake quant are op 185, because
+/// `Compressor.forward` returns the latent BEFORE RoPE for the indexer's sake and `_compress_kv`
+/// finishes it afterwards (`model.py:751-761`).
+///
+/// # What it does NOT emit
+///
+/// The ragged tail. `n_pools` is `t / ratio` and `model.py:331-341` stashes the `seqlen % ratio`
+/// leftover tokens into `kv_state` for the next call -- a decode concern, and a prefill rung is
+/// one chunk. The emit refuses a `t` the ratio does not divide rather than silently dropping the
+/// remainder, because a dropped tail is invisible in the output.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_dsv41_compressor(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    w: &Dsv41Weights,
+    cus: &[u32],
+    cp: &Dsv41Compress,
+    l: u32,
+    xn: u32,
+    cos: u32,
+    sin: u32,
+    t: u32,
+    deps: &[u32],
+) -> u32 {
+    let hd = c.head_dim;
+    let hidden = c.hidden;
+    let ratio = match c.raw.attn_kind(l) {
+        nn_graph::models::config::V41Attn::Compressed { ratio } => ratio,
+        nn_graph::models::config::V41Attn::Window => {
+            panic!("layer {l} is a kv_source with compress_ratio 0, which cannot compress")
+        }
+    };
+    assert_eq!(
+        t % ratio,
+        0,
+        "t={t} leaves a {}-token tail at ratio {ratio}, and `Compressor` carries that tail into \
+         the NEXT call through `kv_state` (model.py:331-341) rather than dropping it. A prefill \
+         rung is one chunk, so the emit refuses instead of losing it silently.",
+        t % ratio
+    );
+    let all = cus.to_vec();
+    let n_pools = t / ratio;
+
+    // bf16 weights -- `dsv41_layer_tensors` declares the compressor in bf16 because that is what
+    // the SHARD holds, whatever `model.py:446` promotes to f32 in the pooling.
+    let bf16_gemm = |b: &mut Builder, out: u32, x: u32, weight: u32, n: u32, dep: &[u32]| {
+        let op = crate::pick_tile(t, n, hidden, b.n_cu(), kernelcaps::QuantScheme::None);
+        b.emit(op, all.clone(), dep, |d| {
+            d.t[0] = out;
+            d.t[1] = x;
+            d.t[2] = weight;
+            d.i[0] = t;
+            d.i[1] = n;
+            d.i[2] = hidden;
+        })
+    };
+
+    let c_lat = if ratio == 1 {
+        // Layer 20. No gate, no pool: `self.norm(self.wkv(x))` and nothing else.
+        let c_kv = bf16_gemm(
+            b,
+            cp.kv,
+            xn,
+            w.get(l, "attn.compressor.wkv.weight"),
+            hd,
+            deps,
+        );
+        b.emit(DevOp::RmsNorm, all.clone(), &[c_kv], |d| {
+            d.t[0] = cp.latent;
+            d.t[1] = cp.kv;
+            d.t[2] = w.get(l, "attn.compressor.norm.weight");
+            d.i[0] = t;
+            d.i[1] = hd;
+            d.f[0] = c.eps;
+        })
+    } else {
+        assert!(
+            c.raw.compressor_has_gate(l),
+            "layer {l} pools at ratio {ratio} but has no `wgate`; the softmax gate is what pooling \
+             IS"
+        );
+        let c_kv = bf16_gemm(
+            b,
+            cp.kv,
+            xn,
+            w.get(l, "attn.compressor.wkv.weight"),
+            hd,
+            deps,
+        );
+        let c_gt = bf16_gemm(
+            b,
+            cp.gate,
+            xn,
+            w.get(l, "attn.compressor.wgate.weight"),
+            hd,
+            deps,
+        );
+        b.emit(DevOp::CompressPool, all.clone(), &[c_kv, c_gt], |d| {
+            d.t[0] = cp.latent;
+            d.t[1] = cp.kv;
+            d.t[2] = cp.gate;
+            d.t[3] = TENSOR_NONE; // no `ape`: V4.1's Compressor has no such parameter
+            d.t[4] = w.get(l, "attn.compressor.norm.weight");
+            d.t[5] = TENSOR_NONE; // no cos/sin: arm 2 stops before the rope
+            d.t[6] = TENSOR_NONE;
+            d.t[7] = TENSOR_NONE; // prefill: the output slot comes from i6, not from a step
+            d.i[0] = n_pools;
+            d.i[1] = ratio;
+            d.i[2] = 1; // coff: no overlap transform on V4.1
+            d.i[3] = hd;
+            d.i[4] = 0; // rd unused on arm 2
+            d.i[5] = 0; // qblk unused on arm 2
+            d.i[6] = 0; // out_base: one chunk, starting at position 0
+            d.i[7] = 2; // pool, norm, STOP
+            d.f[0] = c.eps;
+        })
+    };
+
+    // The cache row: rope the last `qk_rope` at the group's FIRST token, then fp4 e2m1 at blocks
+    // of 16 with an E4M3 scale. Both numbers are the reference's own call
+    // (`fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)`, model.py:760) and the
+    // scale format is worth 15.3% of the latent's amax, not a rounding detail.
+    b.emit(DevOp::CompressRopeQuant, all.clone(), &[c_lat], |d| {
+        d.t[0] = cp.cache;
+        d.t[1] = cp.latent;
+        d.t[2] = cos;
+        d.t[3] = sin;
+        d.t[4] = TENSOR_NONE;
+        d.i[0] = n_pools;
+        d.i[1] = hd;
+        d.i[2] = c.qk_rope;
+        d.i[3] = DSV41_KV_QBLK;
+        d.i[4] = ratio;
+        d.i[5] = 0;
+        d.i[6] = 2; // PLOW_CMP_Q_FP4_E4M3
+    })
+}
+
+/// `fp4_act_quant(latent, 16, ...)` -- the compressed cache's quant block, model.py:760.
+pub(crate) const DSV41_KV_QBLK: u32 = 16;
+
 /// The mHC residual stream and its scratch, shared by every layer.
 ///
 /// V4.1's mHC is GLM-5.3's hyper-connection: the same `HyperConnPre`/`HyperConnPost` pair over the
@@ -1743,21 +1939,61 @@ pub(crate) fn emit_dsv41_block(
     let xnext = tb.tensor("act.xnext", (t as u64) * (c.hidden as u64) * 2);
     let pos = tb.tensor("in.pos", (ctx as u64) * 4);
     let kvlen = tb.tensor("in.kvlen", 4);
-    // Layer 0 is pure sliding-window attention, and the reference disables YaRN there outright
-    // (`model.py:686`: "disable YaRN and use base rope_theta in pure sliding-window attention").
-    // Materialising a scaled table here would rotate every query by the wrong angle and still
-    // produce fluent output.
-    let [cos_t, sin_t] = packet::rope::GenTensor::rope_pair(
-        ctx,
-        rope,
+    // TWO ROPE TABLES, and which one a layer takes is decided by `compress_ratio`, not by what
+    // the layer does with it. `Attention.__init__` (`model.py:680-687`) builds ONE `freqs_cis` per
+    // layer and every rope in that layer -- the query's, the latent's, the compressor's, the
+    // indexer's -- reads it:
+    //
+    //     if self.compress_ratio:   original_seq_len, rope_theta = args.original_seq_len,
+    //                                                              args.compress_rope_theta
+    //     else:                     original_seq_len, rope_theta = 0, args.rope_theta
+    //                               # "disable YaRN and use base rope_theta in pure
+    //                               #  sliding-window attention"
+    //
+    // So layers 0 and 1 rotate at theta 10000 with no scaling, and layers 2-39 rotate at theta
+    // 160000 under YaRN. Handing a layer the other table rotates every query by the wrong angle
+    // and still produces fluent output.
+    //
+    // `YarnDeepSeek`, not `Yarn`: the interpolation is identical and the ATTENTION FACTOR is not.
+    // `precompute_freqs_cis` returns `polar(ones_like(freqs), freqs)` -- magnitude exactly 1, no
+    // mscale anywhere -- and generic YaRN's `0.1*ln(factor)+1` would be 1.277 at factor 16,
+    // multiplied into every cos and sin.
+    let rope_tables = |tb: &mut Builder, name: &str, theta: f64, scale: packet::rope::RopeScale| {
+        let [cos_t, sin_t] = packet::rope::GenTensor::rope_pair(ctx, rope, theta, 1.0, scale);
+        (
+            tb.tensor_gen(&format!("in.cos{name}"), cos_t.byte_len(), cos_t),
+            tb.tensor_gen(&format!("in.sin{name}"), sin_t.byte_len(), sin_t),
+        )
+    };
+    let (cos, sin) = rope_tables(
+        &mut tb,
+        "",
         c.raw.rope_theta as f64,
-        1.0,
         packet::rope::RopeScale::None,
     );
-    let cos = tb.tensor_gen("in.cos", cos_t.byte_len(), cos_t);
-    let sin = tb.tensor_gen("in.sin", sin_t.byte_len(), sin_t);
+    let rs = &c.raw.rope_scaling;
+    let (cos_c, sin_c) = if layers
+        .iter()
+        .any(|&l| !matches!(c.raw.attn_kind(l), nn_graph::models::config::V41Attn::Window))
+    {
+        rope_tables(
+            &mut tb,
+            "_yarn",
+            c.raw.compress_rope_theta as f64,
+            packet::rope::RopeScale::YarnDeepSeek {
+                factor: rs.factor as f64,
+                beta_fast: rs.beta_fast as f64,
+                beta_slow: rs.beta_slow as f64,
+                orig: rs.original_max_position_embeddings as f64,
+                truncate: true,
+            },
+        )
+    } else {
+        (cos, sin)
+    };
     let mhc = declare_dsv41_mhc(&mut tb, c, t);
     let engram = declare_dsv41_engram(&mut tb, c, layers, t);
+    let compress = declare_dsv41_compress(&mut tb, c, layers, t, ctx);
     let peer_w = dsv41_peer_width(c, layers);
     let tensors = tb.tensors();
     let gen = tb.gen_tensors();
@@ -1817,8 +2053,33 @@ pub(crate) fn emit_dsv41_block(
         pi += 1;
         let (proj, c_proj) =
             emit_dsv41_attn_proj(&mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre]);
+        // Every rope in a layer reads that layer's ONE `freqs_cis`, and which table that is comes
+        // from `compress_ratio` alone -- see the two tables above.
+        let (lcos, lsin) = if matches!(
+            c.raw.attn_kind(l),
+            nn_graph::models::config::V41Attn::Window
+        ) {
+            (cos, sin)
+        } else {
+            (cos_c, sin_c)
+        };
+        // CSA2's write side, off the same normed input the projections read (`Compressor` takes
+        // `Attention.forward`'s `x`, as `wq_a` and `wkv` do). It joins the attention core's
+        // dependency list even though the core does not read the cache yet: the cache is shared
+        // with LATER layers, and an op outside the chain's dependency order is an op the
+        // scheduler may float past the layer that reads it.
+        let mut core_deps = vec![c_proj];
+        if c.kv_source.contains(&l) {
+            let cp = compress
+                .as_ref()
+                .expect("declare_dsv41_compress saw this layer in `layers`");
+            core_deps.push(emit_dsv41_compressor(
+                &mut b, c, &w, &all, cp, l, proj.xn, lcos, lsin, t, &[c_proj],
+            ));
+        }
         let (core, c_core) = emit_dsv41_attn_core(
-            &mut b, c, &w, &all, l, tp, proj.q, proj.kv, kvlen, pos, cos, sin, t, ctx, &[c_proj],
+            &mut b, c, &w, &all, l, tp, proj.q, proj.kv, kvlen, pos, lcos, lsin, t, ctx,
+            &core_deps,
         );
         let (_out, c_out) =
             emit_dsv41_attn_out(&mut b, c, &w, &all, l, tp, core.o, t, &mut xgate, &[c_core]);
@@ -1995,7 +2256,10 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
     p.push(("mhc_pre (ops 128/129, cross-sublayer `pre`)", Part::Done));
     p.push(("attn_norm + q_a/q_b/wkv projections (op 184)", Part::Done));
     if c.kv_source.contains(&l) {
-        p.push(("csa2 compressor (ops 180/181)", Part::Todo));
+        // Ops 180 (arm 2: pool, norm, STOP) and 185 (rope + fp4/E4M3 quant), or at layer 20's
+        // ratio 1 a plain GEMM and RMSNorm with no op 180 at all. NOT 181 -- that is the inverse
+        // rope on the attention OUTPUT, which every layer runs and which now sits in the core.
+        p.push(("csa2 compressor (ops 180/185), writes the shared cache", Part::Done));
     }
     if c.index_source.contains(&l) {
         p.push(("indexer queries (two-level)", Part::Todo));

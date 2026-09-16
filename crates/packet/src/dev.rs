@@ -2043,6 +2043,10 @@ pub enum DevOp {
     /// `i0=n_pools i1=ratio i2=coff i3=d i4=rd i5=qblk i6=out_base i7=rotate` ·
     /// `f0=eps`.
     ///
+    /// `t3 = ape` may be `TENSOR_NONE`, read as zero. V4.1's `Compressor` has no such parameter,
+    /// and `scripts/dsv41_csa2_oracle.py` check [2] shows a nonzero one is worth 1.65 absolute --
+    /// so the emit must OMIT it, which a sentinel says and a zero-filled buffer only promises.
+    ///
     /// `i7 = arm`: 0 is V4's fp8 path, 1 the Hadamard-rotated fp4 path (different clamp
     /// constants, not a tuning flag), 2 V4.1's — pool and norm and STOP, leaving the rope and
     /// the quant to [`DevOp::CompressRopeQuant`] and `t5`/`t6`/`i4`/`i5` unused.
