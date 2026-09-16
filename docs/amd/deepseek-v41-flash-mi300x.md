@@ -4480,6 +4480,26 @@ So the occupancy is a property of the megakernel's BASE op set, and nothing at t
 reaches it. Note also that both ceilings bind at once -- 256 > 128 VGPR AND 64,720 > 32,768 B LDS
 -- so a fix has to clear both.
 
+**The tile that fills the LDS is a hardcoded arch constant, and it is deliberate.**
+`hwspec/src/isa.rs` gives gfx942 a prefill `gemm_tile` of **192x256x64** with the comment
+"SINGLE-buffered 192x256x64 (64,512 B, fits)" -- i.e. the geometry is chosen to CONSUME the whole
+64 KiB LDS. Its accumulators are 192*256/512 = 96 VGPRs per thread. It is also not sweepable the
+way `MPF_BM` and `GM_MX_BM` are: `GM_BM=192 GM_BN=256` rides in
+`PLOW_PACKET_OBJECT_REQUIRES`, the loader refuses an object whose tile disagrees with its packet,
+and `PLOW_HSACO_EXTRA_DEFINES` explicitly rejects `-DGM_BM` for that reason. Which is why no
+section of this document has ever swept it.
+
+That choice maximises the efficiency of ONE class of op and sets the occupancy of all 24. The
+dense bf16 GEMMs it serves are `GEMM_MED` 449 us + `GEMM_SMALL` 93 us = **542 us of a 15.1 ms
+layer** -- 3.6%. The other 96.4% pays for their tile.
+
+**Neither ceiling is actually reached by that tile alone, though.** The GEMM arena is
+(192+256)*64*2 = 57,344 B against the object's 64,720, and the bare `interp_prefill` row -- no MLA,
+no MoE -- already reports both 64,720 and 256. On the LDS side the driver is the FLASH-PREFILL
+tiles, exactly as `interp.hip`'s own note describes for the decode bucket ("leaving the MEMBER in
+still sized the union at 58,368 B, which is what pinned the decode object to one workgroup per
+CU"). So a fix has to clear the flash tile AND the GEMM tile AND whatever sets 256 registers.
+
 **What follows for a next campaign.** Not "shrink the LDS", and not "split off the MoE": bisect
 within the BASE op set to find what needs 256, then either cut that op's demand or move the light
 streaming ops (RMSNORM, GLU, the hyper-connection pair, COMPRESS_*) into a second, low-register
