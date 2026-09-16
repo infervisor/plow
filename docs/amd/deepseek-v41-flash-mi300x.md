@@ -4500,7 +4500,26 @@ tiles, exactly as `interp.hip`'s own note describes for the decode bucket ("leav
 still sized the union at 58,368 B, which is what pinned the decode object to one workgroup per
 CU"). So a fix has to clear the flash tile AND the GEMM tile AND whatever sets 256 registers.
 
-**What follows for a next campaign.** Not "shrink the LDS", and not "split off the MoE": bisect
+**And the GEMM tile cannot be the fix on EITHER axis, which is worth stating before someone tries
+it.** Two facts settle it without a run:
+
+  * **LDS:** the GEMM arena at 192x256x64 is (192+256)*64*2 = **57,344 B, already BELOW the
+    object's 64,720 B union**. Shrinking the tile cannot reduce the union by one byte; the driver
+    is the flash-prefill tile. (`interp.hip` says the same thing about the decode bucket: gating
+    the `fa` member out still left 58,368 B.)
+  * **Registers:** `op_gemm_common.h`'s own tile note already records the measurement --
+    "removing flash from the object (the **128/128 register split is the op union, not flash**)".
+    The 256 is the union over all op bodies, so there is no single op to cut.
+
+I confirmed the mechanism the hard way: `GM_BM` is ARCH-defaulted in `op_gemm_gfx942.h` (192,
+`#ifndef`-guarded), while `hwspec/src/isa.rs`'s `gemm_tile` only DECLARES the value that lands in
+`PLOW_PACKET_OBJECT_REQUIRES`. Patching the hwspec constant alone re-emitted a packet requiring
+GM_BM=128 while the object still compiled at 192 -- and the object came out BYTE-IDENTICAL (same
+256 vgpr, same 64,720 lds, same 3441/3228/1940/288 ISA counts), which is the tell. The two must
+move together, and per the above, moving them buys nothing on either ceiling.
+
+**What follows for a next campaign.** Not "shrink the LDS", not "shrink the GEMM tile", and not
+"split off the MoE": bisect
 within the BASE op set to find what needs 256, then either cut that op's demand or move the light
 streaming ops (RMSNORM, GLU, the hyper-connection pair, COMPRESS_*) into a second, low-register
 kernel where they can run at 4 waves/SIMD. Those ops are ~2.4 ms of the 15.1 ms layer and are
