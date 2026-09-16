@@ -3384,6 +3384,69 @@ granularity, not from making the hardware go faster, and there is a limited supp
 packet is STRAGGLER — collective imbalance, not throughput) and `MOE_COMBINE_PF`. Each is a
 separate campaign.
 
+### 12.28 One op in thirteen fails to fill the machine, and it is the collective
+
+§12.25's lesson was to ablate before building. There is a cheaper instrument still: the trace
+already on disk. `rung_run --trace` writes one `PlowTraceRec` **per (workgroup, packet)** —
+406,872 records for a 40-layer run — and `k3_trace_report.py` folds them to per-packet envelopes.
+Folding them the other way, per workgroup, answers a question no per-op total can: **of the 304
+workgroups the megakernel launches for every packet, how many actually do work?**
+
+An op that confines itself to a subset serializes — its wall time is the subset's while the rest of
+the machine idles. Define `busy` as workgroups whose `t_end - t_ready` clears 5% of that packet's
+max, `aggregate` as the sum of every workgroup's busy time, `ideal304 = aggregate / 304` (the wall
+time if the same work filled the machine evenly), and `serial = max / ideal304`.
+
+| op | pkts | busy/304 | max us | aggregate | ideal304 | **serial** |
+|---|---|---|---|---|---|---|
+| FLASH_GATHER_PREFILL | 38 | 304 | 3309.6 | 37.4 s | 123.0 ms | 1.02 |
+| GEMM_FP8_MX | 330 | 286 | 360.5 | 30.1 s | 99.0 ms | 1.20 |
+| MOE_GROUP_DOWN_PF | 40 | 304 | 1799.7 | 21.2 s | 69.6 ms | 1.03 |
+| GEMV_F32 | 80 | 304 | 865.9 | 19.5 s | 64.2 ms | 1.08 |
+| **XREDUCE2** | 82 | **24** | 787.4 | 1.9 s | **6.3 ms** | **10.27** |
+| FLASH_MLA_PREFILL | 40 | 304 | 1527.7 | 18.0 s | 59.4 ms | 1.03 |
+| MOE_GROUP_GLU_PF | 40 | 304 | 1242.1 | 13.7 s | 45.2 ms | 1.10 |
+| MOE_COMBINE_PF | 40 | 304 | 864.1 | 10.2 s | 33.6 ms | 1.03 |
+| HYPER_CONN_PRE | 80 | 304 | 325.6 | 6.7 s | 22.0 ms | 1.18 |
+| HYPER_CONN_POST | 80 | 304 | 321.9 | 7.5 s | 24.8 ms | 1.04 |
+| FLASH_MERGE | 40 | 304 | 625.7 | 7.1 s | 23.4 ms | 1.07 |
+| MOE_ROUTER_TOPK_PF | 40 | 304 | 358.0 | 4.2 s | 13.9 ms | 1.03 |
+| RMSNORM | 125 | 304 | 93.4 | 3.1 s | 10.2 ms | 1.14 |
+
+**Twelve of thirteen fill the machine.** Every compute op runs all 304 workgroups within 1.02-1.20x
+of a perfectly even split — they are well balanced and the grid-stride loops work. That is a useful
+NEGATIVE result for the whole remaining campaign: the pipeline's 2-4% of peak is genuine per-CU
+inefficiency, not idle CUs, so "spread it wider" is not available as a fix anywhere except one
+place.
+
+#### XREDUCE2 is 64.5 ms of wall time for 6.3 ms of machine-filling work
+
+Exactly **24 of 304** workgroups do the work, and the 24 are near-perfectly balanced — on one
+packet, 649 / 648 / 648 / 648 / 647 / 647 / 647 / 647 us, a spread under 0.5%, on CUs 1-23. The
+other 280 sit for 12-16 us and exit. So this is not imbalance and not a straggler in the usual
+sense; `k3_trace_report`'s `strag/pk` of 782 out of 791 us is measuring a **deliberately narrow
+schedule inside a 304-wide packet**, and reading it as a tail would have sent the fix in the
+wrong direction.
+
+The 24 is `PLOW_XR_SCHED_NWG`, and `scripts/build_gfx942.sh` states where it came from:
+
+> MEASURED, 8x MI300X: 8192x6144 two-shot 1002 -> 728 us isolated [...] the other workgroups only
+> arrive.
+
+**8192x6144 is GLM's hidden size. V4.1's is 5120**, its collective count and surrounding megakernel
+differ, and the knob is env-exposed and bit-identical by its own contract (same per-element
+`r = 0..7` f32 sum; only the partition moves). This is the same cheap A/B class that paid in
+§12.24 and §12.26, against **64.5 ms** — the largest single quantified inefficiency left in the
+run, and the only one that is a knob rather than a kernel.
+
+Objects at `PLOW_XR_SCHED_NWG` = 48, 64 and 96 all build clean and pass the contract audit
+(`/workspace/xrnwg{48,64,96}`). **They are NOT yet measured** — the A/B is one run each and the
+machine was occupied by another job's `plowrt serve` throughout. The honest bound: if the reduce is
+compute-limited it scales toward `ideal304` and ~58 ms comes back; if it is XGMI-limited at 24
+workgroups, nothing does. 226 GB/s of fabric traffic per packet at the measured rate suggests
+headroom, but suggesting is not measuring, and the two ceiling instruments in §12.25 are exactly
+why that distinction is now written down instead of assumed.
+
 ### 12.2 What is still not demonstrated
 
   * ~~ONE layer, not 40.~~ **Superseded by §12.18**: all 40 layers emit and run as
