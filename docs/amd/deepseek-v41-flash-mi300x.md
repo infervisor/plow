@@ -4453,12 +4453,39 @@ for the fusion, and at 8k prefill the trade is losing.** Every op in the layer i
 latency hiding of two waves per SIMD, which is why so many of them sit at 2-10x off their own
 floors with no local explanation.
 
-**What follows for a next campaign.** Not "shrink the LDS". Either split the interpreter so that
-register-hungry ops (the GEMMs, the MoE) live in a different kernel from the light streaming ops
-that are paying their occupancy for nothing, or cut the worst op's register demand directly. Both
-are larger than anything attempted here, and both are testable cheaply first: the resource table
-above is printed by every build, so the hypothesis "op X sets the 256" can be bisected by building
-rows with ops compiled out.
+**The bisect, and it narrows the target.** The row-suffixed objects already differ in which ops
+they compile in, so a multi-row build log IS the attribution, free:
+
+    interp_prefill                 256 vgpr        64720 lds   occ 2    <- BARE row
+    interp_prefill_fp8             256             64720       2
+    interp_prefill_fp8_mla         256             64720       2
+    interp_prefill_fp8_mla_moe     256             64720       2
+    interp_mla_small               256             60544       2
+    interp_decode_fp8kv            255             64560       2
+    interp_flash                   512 + 256 agpr  58368       1
+
+**The BARE prefill row is already at 256.** Adding the fp8, MLA and MoE ops on top changes nothing
+-- so the ceiling is NOT set by the grouped MoE GEMM or the MLA bodies, which is what I assumed
+when I first wrote this section. It is set by whatever is already in the base prefill op set (the
+dense `d_gemm_t` at GM_BM=192/GM_BN=256 is the obvious suspect: its accumulators alone are
+192*256/512 = 96 VGPRs per thread).
+
+It is also invariant to every knob this campaign owns. Same 256 vgpr, same 64,720 lds, same occ 2
+at MPF_BM=64 and 192, at GM_MX_BM=64 and 128, and under the gather ablation:
+
+    kv-mpf192   256  64720  2        kv-mxbm64   256  64720  2
+    kv-mpf64    256  64720  2        kv-gabl     256  64720  2
+
+So the occupancy is a property of the megakernel's BASE op set, and nothing at the tile level
+reaches it. Note also that both ceilings bind at once -- 256 > 128 VGPR AND 64,720 > 32,768 B LDS
+-- so a fix has to clear both.
+
+**What follows for a next campaign.** Not "shrink the LDS", and not "split off the MoE": bisect
+within the BASE op set to find what needs 256, then either cut that op's demand or move the light
+streaming ops (RMSNORM, GLU, the hyper-connection pair, COMPRESS_*) into a second, low-register
+kernel where they can run at 4 waves/SIMD. Those ops are ~2.4 ms of the 15.1 ms layer and are
+paying full occupancy cost for registers they do not use. The resource table is printed by every
+build, so each step of that bisect is one 18-second row build and a `grep`.
 
 The campaign's honest position is that the tree's own unreached fast paths were worth
 755 -> ~581 ms (-23%), and the remainder is a pipeline-wide MFMA-efficiency problem whose root is
