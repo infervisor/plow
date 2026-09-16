@@ -5340,3 +5340,41 @@ genuine result -- `down`'s k-loop going from 3 iterations to 18, worth 3.7x on t
 capturing some other way. The obvious candidate is to give `down` a deeper k-loop WITHOUT sharding
 experts across ranks, since the k-loop depth was the whole mechanism and EP's rank skew was only
 the delivery vehicle.
+
+## 12.70 What actually binds DOWN, priced on correct arithmetic
+
+EP's 3.7x on `MOE_GROUP_DOWN_PF` was delivered by rank sharding, which costs more than it returns
+(12.69). The mechanism underneath it is not about ranks at all, and it is visible by comparing the
+two halves of the MoE pair, which run the SAME body over the SAME 56 576 padded rows:
+
+| | K | N | k-tiles/tile (BK=128) | tiles | MACs | body | achieved |
+|---|---|---|---|---|---|---|---|
+| GLU | 5120 | 576 | **40** | 884 x 3 = 2 652 | 166.8 G | 1 597 us | 208 TF/s |
+| DOWN | 288 | 5120 | **3** | 884 x 20 = 17 680 | 83.4 G | 2 536 us | **65 TF/s** |
+
+DOWN does HALF the multiply-accumulates in 1.6x the time. The two differ in exactly one structural
+way: GLU's tile amortises its prologue, staging double-buffer fill, barriers and epilogue over 40
+k-iterations, and DOWN's over 3 -- and the third of those three is only a quarter live, since
+288 = 2.25 x 128. **13x less amortisation, 3.2x less throughput.**
+
+K is 288 because `moe_intermediate` is TP-sharded: 2304/8. That is the whole story, and it is why
+EP fixes it (K becomes the full 2304, 18 k-tiles) without the fix having anything to do with expert
+placement. The placement skew is the delivery vehicle, not the mechanism.
+
+So the lever is to give DOWN a deeper k-loop, or fewer tiles, without sharding experts across
+ranks. Three candidates, none of them free:
+
+1. **A taller row tile for the DOWN arm only.** `MPF4_BM` is 64 and pinned there by the GLU arm's
+   `static_assert(!GLU || MPF4_BM == 64 && MPF4_BN == MPF4_WNc * 64)`; the body is already
+   templated on `GLU`, so a per-arm tile is a contained change. BM=128 halves the tile count.
+   Costs double the accumulators on an object at the 256-VGPR cap -- which is how the A4W4
+   `GEMV_F32` arm 3 lost (12.19), so it must be measured and not assumed.
+2. **A wider N tile for DOWN.** `tnc = 5120 / MPF4_BN` = 20. BN=512 halves it. Same static_assert
+   blocks it for the shared constant, same per-arm escape.
+3. **The n-loop inside the row-tile,** so A and the row metadata are staged once per row-tile
+   instead of 20 times. Smallest register cost of the three, smallest win: A is ~20% of a tile's
+   staged bytes.
+
+The 12.25 ceiling instruments that concluded "bound by neither its k-loop nor its scatter" were run
+against the 231-tile build, i.e. on 17.9% of the rows (12.67), so they need redoing before any of
+this is chosen. That is the first step, not the third.
