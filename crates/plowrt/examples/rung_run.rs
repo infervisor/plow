@@ -314,11 +314,30 @@ mod hsa {
 
         let mut us: Vec<f64> = Vec::with_capacity(iters as usize);
         for _ in 0..iters {
+            // RESTORE THE ENTRY EVERY ITERATION. The rung writes its result back over `act.x`, so
+            // without this the second iteration runs on the first one's output and the thirtieth
+            // on a value iterated thirty times -- and the activations degenerate. That is not a
+            // numerics curiosity, it is the timing: on the degenerated input FLASH_MLA_PREFILL
+            // costs 767 us against 1991 us on the real entry, because the index picks fewer
+            // distinct KV blocks, and the MoE router lights fewer experts, so the grouped GEMM
+            // bills fewer padded tiles. Every iteration but the first was measuring a cheaper
+            // model than the one being served. The upload is synchronous and sits OUTSIDE the
+            // timer (~47 ms of it), so it costs the benchmark wall time, not its reported number.
+            for r in 0..g.n_gpu() {
+                g.rank_mut(r).write_tensor(&entry, &x)?;
+            }
             let t = std::time::Instant::now();
             g.run_rung_upto(prog, segs)?;
             us.push(t.elapsed().as_secs_f64() * 1e6);
         }
         if !us.is_empty() {
+            // In ARRIVAL order, not just the order statistics: a per-iteration drift is invisible
+            // in min/median/max and is exactly the shape a polluted entry produces.
+            print!("  in order us:");
+            for v in &us {
+                print!(" {v:.0}");
+            }
+            println!();
             us.sort_by(f64::total_cmp);
             println!(
                 "layer time over {iters} iters: min {:.1} us  median {:.1} us  max {:.1} us",
