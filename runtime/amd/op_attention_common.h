@@ -2869,6 +2869,11 @@ __device__ void d_flash_mla_prefill_fp8(float* __restrict__ Opart, float* __rest
 #ifndef PLOW_FA_GATHER_GF
 #define PLOW_FA_GATHER_GF 4
 #endif
+/* Let the tiled MFMA prefill take the DENSE pass of a SPLIT packet (V4.1's window half). The arm
+ * writes split partials now; 0 restores the scalar dense body. */
+#ifndef PLOW_MLA_PF_MFMA_SPLIT
+#define PLOW_MLA_PF_MFMA_SPLIT 1
+#endif
 /* CEILING INSTRUMENT for the head-packed gathered body. WRONG OUTPUT by construction; never a
  * serve asset. At n_head=8 (V4.1 at TP8) the arm has two known inefficiencies -- n_mtile==1 makes
  * all PLOW_WAVES waves recompute the SAME 32x32 score tile, and only 8 of 32 M-rows are live --
@@ -3046,7 +3051,12 @@ __device__ void d_flash_mla_prefill_mfma(float* __restrict__ Opart,
                                          unsigned window, float scale, unsigned kv_mask,
                                          unsigned slice, unsigned nblk, float* lds_,
                                          const float* __restrict__ kv_scale,
-                                         unsigned krot_fp8) {
+                                         unsigned krot_fp8,
+                                         /* WRITE-ONLY OUTPUT SPLIT, same meaning as the scalar
+                                          * arm's: where this call's partials live in a wider
+                                          * [..][ONS][DK] array. Without it a split packet writes
+                                          * at the one-partial stride, on top of the other half. */
+                                         unsigned out_nsplit = 0, unsigned out_sp0 = 0) {
     constexpr int BKV = 32;                       /* one MFMA N-tile of KV per pass */
     constexpr int WPM = FA_MLA_PF_WPM;
     constexpr int NMT = FA_MLA_PF_NMT;
@@ -3090,6 +3100,7 @@ __device__ void d_flash_mla_prefill_mfma(float* __restrict__ Opart,
 
     const unsigned n_qt = (n_tok + BQ - 1) / BQ;
     const unsigned n_work = n_batch * n_qt * n_head;
+    const unsigned ONS = out_nsplit ? out_nsplit : 1u;
 
     for (unsigned w = slice; w < n_work; w += nblk) {
         const unsigned h = w % n_head;
@@ -3447,12 +3458,13 @@ __device__ void d_flash_mla_prefill_mfma(float* __restrict__ Opart,
         }
 
         /* UNNORMALIZED latent-wide partials, the layout d_flash_merge<DK> + d_o_uv_fold
-         * already consume: [b][t][head][nsplit=1][DK]. */
+         * already consume: [b][t][head][ONS][DK]. */
 #pragma unroll
         for (int i = 0; i < 16; i++) {
             const unsigned qi = my_q0 + mfma_acc_m(lane, i);
             if (qi >= n_tok) continue;
-            const size_t oh = ((size_t)b * n_tok + qi) * n_head + h;
+            const size_t oh =
+                (((size_t)b * n_tok + qi) * n_head + h) * ONS + out_sp0;
             float* op = Opart + oh * DK;
 #pragma unroll
             for (int t = 0; t < NDT; t++)

@@ -1074,6 +1074,12 @@ if [ -n "${PLOW_FA_GATHER_GF:-}" ]; then
   AX_FLASH="$AX_FLASH -DPLOW_FA_GATHER_GF=${PLOW_FA_GATHER_GF}"
 fi
 
+# PLOW_MLA_PF_MFMA_SPLIT=0: keep the SPLIT dense prefill on the scalar body (the A/B control).
+if [ -n "${PLOW_MLA_PF_MFMA_SPLIT:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MLA_PF_MFMA_SPLIT=${PLOW_MLA_PF_MFMA_SPLIT}"
+  AX_FLASH="$AX_FLASH -DPLOW_MLA_PF_MFMA_SPLIT=${PLOW_MLA_PF_MFMA_SPLIT}"
+fi
+
 # CEILING INSTRUMENT ONLY (PLOW_FA_GMFMA_ABL): deletes one term of the head-packed gathered flash
 # to price it. WRONG OUTPUT by construction, never a serve asset. See op_attention_common.h.
 if [ "${PLOW_FA_GMFMA_ABL:-0}" != 0 ]; then

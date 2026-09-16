@@ -3649,3 +3649,57 @@ and `n_grp = n_head / GF` silently does no work at zero. The dispatch falls back
 does not divide, so a different TP cannot hit that.
 
 Layer 2 at the committed defaults is now **19,435 us**, from 20,458 at the start of §12.29.
+
+### 12.32 The dense window pass was on the scalar body because of a missing output split: -68.7%
+
+§12.31's per-packet fold put `FLASH_MLA_PREFILL` second at 1380 us — and it is the DENSE pass over
+a **128-wide sliding window**, 1.05M query-kv pairs against the gathered pass's 3.93M. Per pair
+that is 1.30 ns against the gathered arm's 0.76: the dense, contiguous, tileable half of the
+attention was running 1.7x WORSE per pair than the scattered half.
+
+It was on the scalar body, and the dispatch said why:
+
+    /* The MFMA arm has no output-split form, and a split packet taking it would write its
+     * partials at the one-partial stride -- on top of the other half. `nope` already excludes
+     * DeepSeek-V4.1, but the exclusion should be the SPLIT's, not a geometry coincidence. */
+    if (!nope && !ons && mla_pf_tiled_fills(...))
+
+V4.1 emits `i[7] = (2<<8)|0` on op 51, so `ons` is 2 and the shipped, validated, 2.8x-faster tiled
+MFMA prefill was excluded — twice over, since `nope` (DR=0) excluded it as well.
+
+Neither exclusion is structural. `d_flash_mla_prefill_mfma` already takes `n_tok`, `n_head` and
+`window`, already bounds its KV range workgroup-uniformly against the tile's last causal horizon,
+and — unlike the decode arm §12.30 ported — its `NDT` and `CPW` are compile-time, so its
+accumulators never left registers. Every rope path is inside a loop bounded by `DR` or `NK_ROPE`,
+both zero at DR=0. **The whole change is `out_nsplit`/`out_sp0` on the epilogue's two writes**
+(`oh` becomes `(... )*ONS + out_sp0`), a `<512, 0>` instantiation, and deleting the guard.
+
+    FLASH_MLA_PREFILL body, layer 2, T=8192, TP8, median of 5:
+
+      scalar (PLOW_MLA_PF_MFMA_SPLIT=0)   1380 us     layer 19463 us
+      tiled MFMA (default 1)               431 us     layer 18559 us
+
+**-68.7% on the op**, and the layer moves 904 us against an op delta of 948 — attributable. Exits
+identical to the last printed digit. The fill heuristic `mla_pf_tiled_fills` still guards the
+short-chunk regression it was built for; nothing about it changes.
+
+This is the largest single-op win of the campaign, and it was not a kernel to write. It was a
+capability the kernel lacked by four lines, blocking a body that had been shipped and measured on
+another model for months. §12.30 spent a full port and three ceiling builds to learn the
+head-packed arm cannot win at TP8; this one was the SAME question — "which arm is this op on?" —
+asked of the op next to it.
+
+Layer 2 at the committed defaults: **18,556 us**, from 20,458 at the start of §12.29.
+
+    FLASH_GATHER_PREFILL   3069      (scalar; §12.30 shows its floor is the scaffolding)
+    GEMM_FP8_MX            2731  x9
+    XREDUCE2               1352  x2  (fabric-bound at NWG 24, §12.29)
+    INDEX_SELECT_PF        1303
+    MOE_GROUP_DOWN_PF      1240
+    GEMV_F32               1046  x2
+    MOE_GROUP_GLU_PF       1013
+    COMPRESS_ROPE_QUANT     870  x3
+    MOE_COMBINE_PF          864
+    HYPER_CONN_PRE/POST     643/637  x2
+    FLASH_MERGE             638
+    FLASH_MLA_PREFILL       431

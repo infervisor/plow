@@ -2192,15 +2192,22 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
 #if PLOW_MLA_PF_MFMA
         /* Dense only. The gathered arm above keeps the scalar body: its top_k set is per
          * QUERY, so a tile of query rows shares no KV range to stage. */
-        /* The MFMA arm has no output-split form, and a split packet taking it would write its
-         * partials at the one-partial stride -- on top of the other half. `nope` already excludes
-         * DeepSeek-V4.1, but the exclusion should be the SPLIT's, not a geometry coincidence. */
-        if (!nope && !ons && mla_pf_tiled_fills(in->i[0], in->i[4], in->i[1], nblk)) {
-            d_flash_mla_prefill_mfma<512, 64, /*FP8=*/false>(
-                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
-                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0],
-                in->i[4], in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk,
-                lds, nullptr, 0);
+        /* The arm carries out_nsplit/out_sp0 now, so a split packet writes its own half rather
+         * than the other one's. PLOW_MLA_PF_MFMA_SPLIT=0 restores the scalar dense body. */
+        if ((!ons || PLOW_MLA_PF_MFMA_SPLIT)
+            && mla_pf_tiled_fills(in->i[0], in->i[4], in->i[1], nblk)) {
+            if (nope)
+                d_flash_mla_prefill_mfma<512, 0, /*FP8=*/false>(
+                    (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                    (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0],
+                    in->i[4], in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk,
+                    lds, nullptr, 0, ons, osp0);
+            else
+                d_flash_mla_prefill_mfma<512, 64, /*FP8=*/false>(
+                    (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                    (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0],
+                    in->i[4], in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk,
+                    lds, nullptr, 0, ons, osp0);
             return;
         }
 #endif
