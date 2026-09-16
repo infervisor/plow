@@ -4907,6 +4907,28 @@ the objects that state builds, three passes at iters=10:
     new (512/32)   MoE pair  870.7 us   layer min 13983.2   median 14248.8
                              -44.4%           -738 us/layer, -5.0%
 
-Exits identical (-1.36719 / 3.64062) on all six runs. **-738 us/layer is ~-29.5 ms over 40 layers**
-(~572.4 -> ~543 ms). `mla.rs`'s sizing bound goes to 512 with it, costing ~60 MB/rank of `fu_g` --
+Exits identical (-1.36719 / 3.64062) on all six runs. -738 us/layer predicted ~-29.5 ms over 40
+layers, and **the 40-layer re-measure confirms it**: all four chains re-emitted and rebuilt at the
+new defaults give 144.1 + 151.0 + 141.6 + 132.3 = **568.9 ms chain-sum, ~541.6 ms whole-model**,
+against 599.7 / ~572.4 -- **-30.8 ms**. `mla.rs`'s sizing bound goes to 512 with it, costing ~60 MB/rank of `fu_g` --
 which is what buys the tile.
+
+### 12.63a The collective's workgroup cap is already right for this shape
+
+`PLOW_XR_SCHED_NWG` caps the aiter collective schedule at 24 workgroups (reduce-scatter at 8). That
+default was measured on GLM at 8192x6144; V4.1's hidden is 5120, so it was unverified here, and
+XREDUCE2 is 1673 us/layer -- 2.3x its XGMI floor and 67 ms over 40 layers. Swept, two passes,
+layer min (the reliable statistic; see below):
+
+    NWG=16   14397 us     +374 vs default
+    NWG=24   14023 us     <- default
+    NWG=32   14010 us     within noise
+    NWG=48   14053 us     within noise
+
+Exits identical at every cap. **The GLM-tuned cap transfers**: 16 is clearly worse, 32 and 48 buy
+nothing. Null result, and the default stands.
+
+Note on reading XREDUCE2's OWN number: it is not rankable across arms. Its straggler is 98.7% of
+its body (12.59's table), i.e. almost all of it is waiting on the slowest peer, and the spread
+WITHIN a single arm here is 377 us (NWG=24 measured 1668.5 and 1291.5 on two passes of the same
+object). The layer min is what carries signal for this op.
