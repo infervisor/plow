@@ -7376,7 +7376,12 @@ fn apply_production_defaults(
             cfg.decode_ladder_default = true;
             emit_config::note_production_default("decode_ladder", "1,2,4,8,16,32".into());
         }
-        if !cfg.token_batch_tp {
+        // "if nothing asked", not "always": both knobs are plain `bool`, so an explicit
+        // `PLOW_TOKEN_BATCH_TP=0` is indistinguishable from unset at the field, and turning them
+        // on unconditionally made the recipe UNTESTABLE — the control arm of any A/B emitted the
+        // treatment. `*_explicit` records that the environment named the knob, which is the same
+        // provenance `decode_ladder_default` already keeps, not a new knob.
+        if !cfg.token_batch_tp && !cfg.token_batch_tp_explicit {
             cfg.token_batch_tp = true;
             emit_config::note_production_default("token_batch_tp", "true".into());
         }
@@ -7403,7 +7408,7 @@ fn apply_production_defaults(
                 }
             }
         }
-        if !cfg.packed_sparse_pf {
+        if !cfg.packed_sparse_pf && !cfg.packed_sparse_pf_explicit {
             cfg.packed_sparse_pf = true;
             emit_config::note_production_default("packed_sparse_pf", "true".into());
         }
