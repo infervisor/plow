@@ -300,7 +300,12 @@ impl RungController {
             return demand_seat;
         }
         let widest = self.rungs.len() - 1;
-        if demand_seat == widest && self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES {
+        // Cold start seats the penultimate rung, then probes the widest: a rung only gains samples
+        // by running, so holding the widest back until it has samples would cap it forever.
+        if demand_seat == widest
+            && self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES
+            && self.stats[demand_seat - 1].samples < MIN_THROUGHPUT_SAMPLES
+        {
             return demand_seat - 1;
         }
         if self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES
@@ -493,6 +498,23 @@ mod tests {
         let d = c.decide(load(1, 99));
         assert_eq!(c.width(d.admission), 16);
         assert_eq!(d.reason, RungReason::Backlog);
+    }
+
+    #[test]
+    fn saturated_backlog_probes_the_widest_rung_once_the_penultimate_is_sampled() {
+        let mut c = controller(&[1, 2, 4, 8, 16]);
+        let admission = c.decide(load(1, 99)).admission;
+        assert_eq!(c.width(admission), 8);
+        for _ in 0..MIN_THROUGHPUT_SAMPLES {
+            c.observe_decode(3, 47.0, NonZeroUsize::MIN);
+        }
+        let admission = c.decide(load(8, 92)).admission;
+        assert_eq!(c.width(admission), 16);
+        for _ in 0..MIN_THROUGHPUT_SAMPLES {
+            c.observe_decode(4, 60.0, NonZeroUsize::MIN);
+        }
+        let admission = c.decide(load(16, 84)).admission;
+        assert_eq!(c.width(admission), 16);
     }
 
     #[test]
