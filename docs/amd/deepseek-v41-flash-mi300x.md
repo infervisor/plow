@@ -2363,10 +2363,53 @@ op owns. A parts table cannot see it, and neither can a reading of either op --
 `the_peer_slot_unit_divides_the_widest_collective` recovers both numbers the way `DevBlob::parse`
 does and asserts they divide, for every emittable layer.
 
-A second, smaller one behind it: `build_gfx942.sh` never passed `-DPLOW_DSV41_ENGRAM=1`, although
-the C side, the packet's `build.json` `requires` list and the knob registration all had it. plowrt
-refused the object **by name** -- `plow_dsv41_engram_arm` absent -- which is exactly why that cost
-a queue slot instead of producing a layer that ran and was wrong.
+Two smaller ones behind it, and both were caught by a refusal rather than by a wrong number:
+
+  * `build_gfx942.sh` never passed `-DPLOW_DSV41_ENGRAM=1`, although the C side, the packet's
+    `build.json` `requires` list and the knob registration all had it. plowrt refused the object
+    **by name** -- `plow_dsv41_engram_arm` absent, *"the AMD dispatch's `default:` does not trap,
+    so those ops would write nothing and the prefill would complete with garbage"*.
+  * `plowrt`'s `shard_of` is a SECOND name table, separate from devgen's `dsv41_shard_of` (plowrt
+    cannot depend on devgen), and it had no Engram rows -- so the 98.31 GB table fell through to
+    `Replicated` and the load died on the size check: *"replicated but the checkpoint has
+    98305579008 B and the blob declares 12288197376 B"*. The file's own header says this is exactly
+    how the V4.1 block was found the first time. `engram.embed.` is Column; `engram.wkv.`,
+    `engram.q_weight` and `engram.k_weight` are Replicated, and they do not collide with
+    `attn.wkv.`.
+
+#### Layer 1 on hardware
+
+```
+layer 0 (no engram)  median 20470 us   min -2.73438  max 3.53125  mean -0.000708  NaN 0  Inf 0
+layer 1 (ENGRAM)     median 33847 us   min -6.68750  max 6.56250  mean -0.000195  NaN 0  Inf 0
+```
+
+Finite and stable, and the wider range is the Engram value being added to the stream rather than
+noise. (The first iteration is 236 ms: paging in a 12.29 GB table slice per rank. The median is
+over the warm ones.)
+
+**Engram costs 13.4 ms, and 11.2 ms of it is one op.** From the trace, against layer 0:
+
+| op | layer 0 | layer 1 | note |
+|---|---|---|---|
+| GEMM_FP8_MX | 2512 us (8 pk) | **13734 us (9 pk)** | the 9th packet is `wkv` |
+| XREDUCE2 | 2071 us (3 pk) | 2934 us (4 pk) | the 4th is the gather's all-reduce |
+| ENGRAM_GATE | -- | 957 us | |
+| ENGRAM_EMBED | -- | 169 us | the gather itself is nearly free |
+| body total | 19869 us | 33129 us | |
+
+The gather -- 24 random rows of a 98 GB table per token -- costs 169 us, which is the result worth
+keeping: the sharded random-access read is not the problem. `wkv` is, and the reason is placement.
+It is `[8192, 6144] x [25600, 6144]^T` = 2.58 TFLOP, and because `self.wkv` is the plain `Linear`
+the emit replicates it, so **all eight ranks compute the same 2.58 TFLOP**. That is faithful to the
+reference, which is describing arithmetic and not a placement, and it is 8x redundant work on the
+largest op in the layer. Column-parallel over the 25600 output is the obvious alternative and is
+not obviously better -- the gate needs every column, so it would trade the redundancy for an
+all-gather of `[T][25600]` bf16, 419 MB -- but a placement that splits `hidden` instead, reduces
+only the `[T][hc_mult]` gates and leaves the mix elementwise, would avoid both. Not attempted.
+
+**This does not change the projection much**, because only layers 1 and 14 carry an Engram: 38
+layers at 20.4 ms plus 2 at 33.8 ms is ~843 ms, against 90 ms.
 
 ### 12.2 What is still not demonstrated
 

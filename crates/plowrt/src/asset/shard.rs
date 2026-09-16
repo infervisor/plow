@@ -206,7 +206,7 @@ pub fn shard_of(name: &str) -> Shard {
     //
     // Both `.weight` and `.scale` ride the same substring: the block-FP8 scale grid is 2-D and cuts
     // on the same axis as its weight.
-    const DSV41_COL: [&str; 6] = [
+    const DSV41_COL: [&str; 7] = [
         // The q UP projection, column-parallel by head.
         "attn.wq_b.",
         // The output LoRA's block-diagonal down: rank r's rows ARE group r's block.
@@ -219,6 +219,14 @@ pub fn shard_of(name: &str) -> Shard {
         "ffn.shared_experts.w3.",
         // Indexer queries, per index-head.
         "attn.indexer.wq_b.",
+        // THE ENGRAM TABLE, split over its ROWS by capacity rather than by preference: it is
+        // 384 006 168 rows of 256 fp8 = 98.31 GB, and there are two of them against 192 GB of
+        // HBM, so a replicated copy does not fit on one card at all. `ParallelEngramEmbedding`
+        // shards exactly this way -- `part_num_embeddings = ceil(rows / world_size)`,
+        // `vocab_start = rank * part` (`model.py:303-305`) -- and op 183 writes zeros for any id
+        // outside the shard, which the emit's XReduce then sums. Both `.weight` [rows, 256] and
+        // `.scale` [rows, 8] are 2-D and cut on the same row axis, so they ride the one substring.
+        "engram.embed.",
     ];
     const DSV41_ROW: [&str; 2] = [
         // wo_b reduces over every group's LoRA output, so it splits on the INPUT.
@@ -231,11 +239,19 @@ pub fn shard_of(name: &str) -> Shard {
     // serves all 64 heads, so a rank holding an eighth of it could not attend with the heads it
     // owns. `wq_a`'s rank is shared across heads, so there is nothing head-shaped to cut. The
     // router must score every expert on every rank or it cannot pick a global top-6.
-    const DSV41_REPLICATED: [&str; 4] = [
+    const DSV41_REPLICATED: [&str; 7] = [
         "attn.wkv.",
         "attn.wq_a.",
         "ffn.gate.",
         "attn.compressor.",
+        // ENGRAM, EVERYTHING DOWNSTREAM OF THE TABLE. `self.wkv` is the plain `Linear`
+        // (`model.py:345`), not `ColumnParallelLinear` or `RowParallelLinear`, and the gate
+        // weights are plain `[hc_mult, dim]` parameters -- so the only cross-rank exchange is the
+        // embedding's own `all_reduce`, and it happens before `wkv` ever runs. Note these do NOT
+        // collide with `attn.wkv.`: the spellings are `engram.wkv.` and `attn.wkv.`.
+        "engram.wkv.",
+        "engram.q_weight",
+        "engram.k_weight",
     ];
     // The ROUTED experts: `ffn.experts.{e}.w{1,2,3}.{weight,scale}`. Same classes as the shared
     // expert -- gate/up column-parallel over `moe_inter`, down reducing over it -- but the expert
@@ -1131,6 +1147,9 @@ mod mxfp4_shard_tests {
             "layers.0.ffn.shared_experts.w1.weight",
             "layers.0.ffn.shared_experts.w3.scale",
             "layers.2.attn.indexer.wq_b.weight",
+            // The Engram table, row-split because 98.31 GB cannot be replicated on a 192 GB card.
+            "layers.1.engram.embed.weight",
+            "layers.14.engram.embed.scale",
             // Routed experts, which carry the expert index mid-name.
             "layers.0.ffn.experts.0.w1.weight",
             "layers.0.ffn.experts.383.w1.scale",
@@ -1164,6 +1183,13 @@ mod mxfp4_shard_tests {
             "layers.0.attn.kv_norm.weight",
             "layers.0.hc_attn_fn",
             "layers.2.attn.compressor.wkv.weight",
+            // Everything downstream of the Engram all-reduce: `self.wkv` is the plain `Linear`,
+            // and the gate weights are plain [hc_mult, dim] parameters. `engram.wkv.` must NOT be
+            // caught by `attn.wkv.`, which is a different tensor of a different shape.
+            "layers.1.engram.wkv.weight",
+            "layers.1.engram.wkv.scale",
+            "layers.14.engram.q_weight",
+            "layers.14.engram.k_weight",
         ] {
             assert_eq!(shard_of(n), Shard::Replicated, "{n}");
         }
