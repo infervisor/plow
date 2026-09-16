@@ -4337,10 +4337,10 @@ open idea for the next reader to cost again.
 At the committed defaults the single block is **15.06-15.17 ms** and every large term has now been
 either improved or closed with a measurement:
 
-    FLASH_GATHER_PREFILL  3026   at 29% of SCALAR-f32 peak; its 48.3 GB of gathered reads move at
-                                 ~16 TB/s, i.e. L2 rate. The cost is the GATHER, not the math --
-                                 which is why §12.30's ceiling instrument found the MFMA arm's
-                                 floor IS the scalar arm. Only query-token sharding changes it.
+    FLASH_GATHER_PREFILL  3026   4.50 GiB of gathered latent per rank at 1.60 TB/s = 30% of HBM
+                                 peak. The cost is the GATHER, not the math -- which is why
+                                 §12.30's ceiling instrument found the MFMA arm's floor IS the
+                                 scalar arm. See §12.53: token sharding cuts the BYTES 8x.
     GEMM_FP8_MX           2813   tile optimal on both axes (§12.47, §12.51); BK=64 already taken.
     XREDUCE2              1384   already on all 304 CUs (`PLOW_XR_CUS` unset), and an all-reduce is
                                  a global sync -- nothing can run behind it. Needs a smaller
@@ -4354,3 +4354,45 @@ design: the three structural items are attention re-sharding (every rank holding
 sharding query TOKENS -- replicated q/o weights, an all-gather replacing the head all-reduce), MoE
 packet geometry, and the collective. Each is an emit/collective change, and the first is the one
 worth doing first because it is the largest single op.
+
+### 12.53 CORRECTION, and the re-sharding case re-opened on different grounds
+
+**First the correction.** §12.52 as first committed said this op moves "48.3 GB of gathered reads
+at ~16 TB/s, i.e. L2 rate". Both numbers were 10x out. The gathered latent is read once per
+(token, key) for all of a rank's local heads -- that is what `PLOW_FA_GATHER_GF=8` buys at TP8 --
+so it is
+
+    T * topk * d_latent * 2 B  =  8192 * 512 * 576 * 2  =  4.50 GiB per rank
+
+and 4.50 GiB / 3026 us = **1.60 TB/s, which is 30% of the 5.3 TB/s HBM peak**, not cache rate. The
+conclusion changes with it: the op is HBM-bound with real headroom, not pinned at L2 speed.
+
+**And that re-opens attention re-sharding on an argument §12.30 does not touch.** Every previous
+statement of the re-sharding case rested on MFMA FILL -- `n_head = 64/tp = 8` fills only 8 of a
+32-row MFMA M dimension. §12.30's three-way ceiling instrument refuted exactly that: with staging
+free AND QK free the head-packed MFMA body still floors at ~3050 us against the scalar arm's 3267,
+so filling M was never the lever. That result stands.
+
+The TRAFFIC argument is a different quantity and survives it. V4.1's attention is a FULLY ABSORBED
+MLA -- one 512-wide latent per token, shared by all 64 heads. Head-sharding therefore makes each of
+the 8 ranks read THE SAME LATENT for its own 8 heads:
+
+    per rank, head-sharded    4.50 GiB        aggregate over 8 ranks   36.0 GiB
+    per rank, token-sharded   0.56 GiB        aggregate                 4.50 GiB
+                              ---- 8x ----
+
+Sharding query TOKENS instead of heads gives each rank 1/8 of the tokens and ALL 64 heads, so the
+latent is amortised over 64 heads instead of 8 and the redundancy disappears. At the SAME measured
+1.60 TB/s that is **3026 -> 378 us, -2.65 ms/layer, ~-106 ms end to end** -- the largest single
+item left by a wide margin, and it does not depend on the MFMA arm being any good, because bytes
+are bytes whatever unit does the math. (The MFMA fill comes along for free at M = 64, but it is no
+longer what the case rests on.)
+
+**The cost, unchanged and still the reason not to half-land it.** Every rank must hold all 64
+heads' q/o weights -- replicated, not sharded -- and the head all-reduce after attention becomes an
+all-gather over tokens. That is an emit change, a collective change and a weight-layout change that
+have to land together. It is the right next project and it is not a kernel edit.
+
+**Even so it does not reach 90 ms.** ~581 - 106 = ~475 ms, still 5.3x. The MoE pair and XREDUCE2
+and the ~15 mid-size ops are all still 2-10x off their own floors, and §12.18's itemisation of why
+stands. 90 ms is the whole pipeline at MFMA efficiency, not one more change.
