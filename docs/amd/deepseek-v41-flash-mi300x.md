@@ -4249,6 +4249,12 @@ runs and not as all of them.
 
 Host RAM was never the constraint (2085 GB available); it is VRAM and CU time.
 
+**A later probe, after the box partly recovered, confirms BM=192's parity on a run that provably
+completed**: `exit: 167772160 elems  min -1.36719  max 3.64062  mean -0.000736  zero 0  NaN 0
+Inf 0` -- the same min/max as every other tile and the same mean §12.46 records for BM=192, with no
+collective failure. So the tile's exit is confirmed, and only the 40-layer CLOCK is outstanding;
+that run still OOMs at an 80 MB allocation.
+
 **So the last MEASURED end-to-end figure remains 611 ms (§12.45).** §12.46's -783 us/layer predicts
 roughly -31 ms of that, i.e. ~580 ms. That is arithmetic on a single-block measurement, not a
 model-level result, and it should not be quoted as one until a 40-layer run lands on a quiet box.
