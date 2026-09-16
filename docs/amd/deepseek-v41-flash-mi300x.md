@@ -3531,7 +3531,7 @@ wins found the same way. **The instrument is not a formality.**
   * No reference parity. The input is synthetic; correctness so far is
     "finite and stable" plus an op census that matches the config (§12.18), not
     "right". This is now the largest single gap.
-  * **611 ms against 90 ms** as of §12.45 (§12.29-§12.42 took a further 141 ms off the 755 below;
+  * **~581 ms against 90 ms** as of §12.50 (chain-sum 608.3 ms less a measured 27.3 ms seam offset) (§12.29-§12.42 took a further 141 ms off the 755 below;
     §12.19, §12.20, §12.22, §12.24 and §12.26 took 237 ms off §12.18's 992,
     neither in a V4.1 op; §12.21 showed the next 124 ms line is already on its
     finest legal tile). Closing the remaining 9.5x is not a list of point fixes:
@@ -4260,3 +4260,45 @@ roughly -31 ms of that, i.e. ~580 ms. That is arithmetic on a single-block measu
 model-level result, and it should not be quoted as one until a 40-layer run lands on a quiet box.
 
 **90 ms is not met, and nothing in this round changes that.** 611 ms is 6.8x; 580 would be 6.4x.
+
+### 12.50 All 40 layers measured after all, as four chains: 638.4 -> 608.3 ms
+
+The whole-model run never got its ~135 GB/GPU back. But a 10-layer chain needs ~34-46, and the
+`--block l..r` emit already chains, so all 40 layers were measured as FOUR chains -- 0..9, 10..19,
+20..29, 30..39 -- with the two arms INTERLEAVED per chain so co-tenant pressure lands on both.
+
+Two things had to be fixed to get there. §12.48's build gap blocks a matching object set at any new
+layer count; `PLOW_ROWS_ONLY` takes a comma list, so every row except the two broken stems builds
+(49 objects, rc=0). And the BM=128 control arm is only expressible at all because §12.46 scoped the
+`[ -z "$MPF_BM" ]` guard -- before that, naming MPF_BM to build the control would have silently
+dropped GF=8 and both router knobs, and the A/B would have measured five things.
+
+MEASURED, all 40 layers, 8k, TP8, median of 5 iters per chain:
+
+    chain      BM=128     BM=192      delta
+    0..9       160.2      152.0       -8.2
+    10..19     167.6      160.0       -7.6
+    20..29     158.2      152.3       -5.9
+    30..39     152.3      144.1       -8.2
+    SUM        638.4 ms   608.3 ms   -30.1 ms      sum(min) 635.1 -> 605.1
+
+**-30.1 ms, -4.7%, and all four chains move in the same direction** -- which is what makes it the
+tile and not drift. It also lands on the prediction: §12.46's -783 us/layer over 40 layers predicts
+-31.3 ms against -30.1 measured, so the single-block result scales.
+
+**The seam offset, measured rather than asserted.** A chain sum over-counts: a whole-model emit
+overlaps the three seams these measure in isolation. That over-count is now quantified, because the
+BM=128 arm has a whole-model twin -- §12.45's 611.1 ms. So the four-chain sum costs
+638.4 - 611.1 = **27.3 ms over 3 seams, ~9.1 ms each**. Applying the same offset to the BM=192 arm:
+
+    whole-model equivalent at BM=192  ~=  608.3 - 27.3  =  ~581 ms
+
+That last number is an estimate carrying one assumption -- that the seam cost is the same at both
+tiles, which it should be since a seam is a layer boundary and not a MoE tile. The MEASURED
+quantity is the 40-layer chain sum, 608.3 ms against the control's 638.4.
+
+**90 ms is not met.** ~581 ms is **6.5x**, from 755 ms at the start of §12.29 -- **-23%** over the
+campaign. The three terms that remain are the ones §12.45 named, and §12.47 closed two more doors
+on them: the fp8-MX tile is at its optimum and the dense-GEMM tuning store cannot be refilled for
+V4.1 until there is a full-model emit. Nothing kernel-level of this size is left; the next 6.5x is
+attention re-sharding, MoE packet geometry, and the collective.
