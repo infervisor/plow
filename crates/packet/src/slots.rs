@@ -191,13 +191,13 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeGroupDownFp8Blk, t: &["part", "fu", "routing_table", "expert_weight_table", "expert_scale_table"], i: &["k", "H", "I_moe", "n_exp"], f: &[], j: &[] },
     S { op: DevOp::FlashMlaDecode, t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "qr_cos?"], i: &["n_batch", "n_head", "kv_stride", "window", "nsplit", "kv_mask", "qr_sin", "gf"], f: &["scale"], j: &[] },
     S { op: DevOp::OUvFold, t: &["O", "Olat", "Wuv"], i: &["n_batch", "n_head", "V"], f: &[], j: &[] },
-    S { op: DevOp::FlashGatherPrefill, t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "idx"], i: &["n_batch", "n_head", "kv_stride", "nope", "n_tok", "kv_mask", "top_k"], f: &["scale"], j: &[] },
+    S { op: DevOp::FlashGatherPrefill, t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "idx"], i: &["n_batch", "n_head", "kv_stride", "nope", "n_tok", "kv_mask", "top_k", "out_split"], f: &["scale"], j: &[] },
     S { op: DevOp::FlashGatherDecode, t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "idx"], i: &["n_batch", "n_head", "kv_stride", "", "nsplit", "kv_mask", "top_k"], f: &["scale"], j: &[] },
     S { op: DevOp::MoeRouterTopk, t: &["table", "logit", "", "bias"], i: &["", "n_exp", "k", "flags"], f: &["route_scale"], j: &[] },
     S { op: DevOp::MlaMergeFold, t: &["O", "Opart", "mlpart", "Wuv"], i: &["n_batch", "n_head", "V", "", "nsplit", "native_fp32"], f: &[], j: &[] },
     S { op: DevOp::IndexScore, t: &["Score", "Qidx", "Kidx", "W", "kv_len"], i: &["n_batch", "index_heads", "kv_stride", "index_head_dim"], f: &["scale"], j: &[] },
     S { op: DevOp::IndexSelect, t: &["idx", "Score", "gHist", "gCtl", "kv_len"], i: &["len_max", "top_k", "pool_size", "batch_row", "local_rows"], f: &[], j: &[] },
-    S { op: DevOp::IndexScorePf, t: &["Score", "Qidx", "Kidx", "W", "kv_len"], i: &["n_tok", "index_heads", "kv_stride", "index_head_dim"], f: &["scale"], j: &[] },
+    S { op: DevOp::IndexScorePf, t: &["Score", "Qidx", "Kidx", "W", "kv_len"], i: &["n_tok", "index_heads", "kv_stride", "index_head_dim", "pool_size"], f: &["scale"], j: &[] },
     S { op: DevOp::IndexSelectPf, t: &["idx", "Score", "kv_len"], i: &["n_tok", "top_k", "kv_stride", "pool_size"], f: &[], j: &[] },
     S { op: DevOp::IndexUnionPf, t: &["union", "umask", "idx", "kv_len"], i: &["n_tok", "top_k", "kv_stride", "cap"], f: &[], j: &[] },
     S { op: DevOp::LayerNorm, t: &["out", "x", "gamma", "beta"], i: &["rows", "feat", "", "out_row0"], f: &["eps"], j: &[] },
@@ -303,7 +303,7 @@ const DOC: &[S] = &[
     S { op: DevOp::EngramGate, t: &["x", "kv", "q_weight", "k_weight", "token_mask"], i: &["T", "n", "hidden"], f: &["norm_eps"], j: &[] },
     S { op: DevOp::EngramEmbed, t: &["out", "table", "scale", "ids"], i: &["T", "n_cols", "head_dim", "blk", "vocab_start", "part_rows"], f: &[], j: &[] },
     S { op: DevOp::GemmFp8Mx, t: &["out", "x", "w", "scale"], i: &["T", "N", "K"], f: &[], j: &[] },
-    S { op: DevOp::CompressRopeQuant, t: &["out", "src", "cosb", "sinb", "pos"], i: &["n_rows", "d", "rd", "qblk", "ratio", "row_base", "qmode"], f: &[], j: &[] },
+    S { op: DevOp::CompressRopeQuant, t: &["out", "src", "cosb", "sinb", "pos"], i: &["n_rows", "d", "rd", "qblk", "ratio", "row_base", "qmode", "n_head"], f: &[], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

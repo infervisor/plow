@@ -269,6 +269,7 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
       PLOW_MOE_PF_DET)       [ "$val" = 1 ] && : "${PLOW_MOE_PF_DET:=1}" ;;
       PLOW_DSV41_BLKFP8)     [ "$val" = 1 ] && : "${PLOW_DSV41_BLKFP8:=1}" ;;
       PLOW_DSV41_ENGRAM)     [ "$val" = 1 ] && : "${PLOW_DSV41_ENGRAM:=1}" ;;
+      PLOW_DSV4_CSA2)        [ "$val" = 1 ] && : "${PLOW_DSV4_CSA2:=1}" ;;
       PLOW_GLM_FUSE_QNORM)   [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_QNORM:=1}" ;;
       PLOW_GLM_FUSE_POST)    [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_POST:=1}" ;;
       PLOW_GLM_FUSE_SEAM_RN) [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_SEAM_RN:=1}" ;;
@@ -1170,6 +1171,18 @@ fi
 # exactly as designed -- it is the reason that was a wasted queue slot rather than a wrong number.
 if [ "${PLOW_DSV41_ENGRAM:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_DSV41_ENGRAM=1"
+fi
+
+# OPT-IN (PLOW_DSV4_CSA2=1): ops 180/181/185, the CSA2 compressor, the inverse RoPE on the
+# attention output and the compressed-row rope+quant tail. Marker-checked as `plow_dsv4_csa2_arm`.
+#
+# THE SAME LINE THE ENGRAM ARM WAS MISSING, found the same way and before it cost a queue slot:
+# the C side, the ISA, the dispatch and `manifest.rs`'s `requires` all named PLOW_DSV4_CSA2 and
+# nothing here turned it into a -D. Op 181 makes this reach every V4.1 layer, not only the four
+# with a compressor -- `apply_rotary_emb(o[..., -rd:], freqs_cis, True)` runs on all 40 -- so an
+# object without it now refuses a layer-0 packet that used to load.
+if [ "${PLOW_DSV4_CSA2:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_DSV4_CSA2=1"
 fi
 
 # OPT-IN (PLOW_PREFILL_DSV41=1): make the ORDINARY prefill rows able to run a DeepSeek-V4.1 packet.

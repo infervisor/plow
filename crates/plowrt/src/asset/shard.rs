@@ -206,7 +206,7 @@ pub fn shard_of(name: &str) -> Shard {
     //
     // Both `.weight` and `.scale` ride the same substring: the block-FP8 scale grid is 2-D and cuts
     // on the same axis as its weight.
-    const DSV41_COL: [&str; 7] = [
+    const DSV41_COL: [&str; 6] = [
         // The q UP projection, column-parallel by head.
         "attn.wq_b.",
         // The output LoRA's block-diagonal down: rank r's rows ARE group r's block.
@@ -217,8 +217,7 @@ pub fn shard_of(name: &str) -> Shard {
         // Shared expert gate/up, column-parallel over the intermediate.
         "ffn.shared_experts.w1.",
         "ffn.shared_experts.w3.",
-        // Indexer queries, per index-head.
-        "attn.indexer.wq_b.",
+
         // THE ENGRAM TABLE, split over its ROWS by capacity rather than by preference: it is
         // 384 006 168 rows of 256 fp8 = 98.31 GB, and there are two of them against 192 GB of
         // HBM, so a replicated copy does not fit on one card at all. `ParallelEngramEmbedding`
@@ -239,11 +238,17 @@ pub fn shard_of(name: &str) -> Shard {
     // serves all 64 heads, so a rank holding an eighth of it could not attend with the heads it
     // owns. `wq_a`'s rank is shared across heads, so there is nothing head-shaped to cut. The
     // router must score every expert on every rank or it cannot pick a global top-6.
-    const DSV41_REPLICATED: [&str; 7] = [
+    const DSV41_REPLICATED: [&str; 8] = [
         "attn.wkv.",
         "attn.wq_a.",
         "ffn.gate.",
         "attn.compressor.",
+        // THE WHOLE INDEXER, queries included. `ColumnParallelLinear` would give a rank 4 of the
+        // 32 index heads and `d_index_score_pf_row`'s MFMA A tile IS the head axis -- its own
+        // static_assert says to "replicate a sharded indexer instead" ([DSV4-IDX]) rather than
+        // run a one-eighth-full tile. The alternative, an all-reduce of `index_score`, is
+        // 268 MB per layer at 8k. See `dsv41_shard_of`, which must agree with this.
+        "attn.indexer.",
         // ENGRAM, EVERYTHING DOWNSTREAM OF THE TABLE. `self.wkv` is the plain `Linear`
         // (`model.py:345`), not `ColumnParallelLinear` or `RowParallelLinear`, and the gate
         // weights are plain `[hc_mult, dim]` parameters -- so the only cross-rank exchange is the
@@ -1146,7 +1151,6 @@ mod mxfp4_shard_tests {
             "layers.0.attn.attn_sink",
             "layers.0.ffn.shared_experts.w1.weight",
             "layers.0.ffn.shared_experts.w3.scale",
-            "layers.2.attn.indexer.wq_b.weight",
             // The Engram table, row-split because 98.31 GB cannot be replicated on a 192 GB card.
             "layers.1.engram.embed.weight",
             "layers.14.engram.embed.scale",
@@ -1183,6 +1187,10 @@ mod mxfp4_shard_tests {
             "layers.0.attn.kv_norm.weight",
             "layers.0.hc_attn_fn",
             "layers.2.attn.compressor.wkv.weight",
+            // The indexer, replicated so its 32 heads fill the MFMA A tile on every rank.
+            "layers.2.attn.indexer.wq_b.weight",
+            "layers.2.attn.indexer.weights_proj.weight",
+            "layers.8.attn.indexer.wk.weight",
             // Everything downstream of the Engram all-reduce: `self.wkv` is the plain `Linear`,
             // and the gate weights are plain [hc_mult, dim] parameters. `engram.wkv.` must NOT be
             // caught by `attn.wkv.`, which is a different tensor of a different shape.

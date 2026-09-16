@@ -573,6 +573,9 @@ pub enum DevOp {
     /// combinations.
     FlashMlaDecode = 50,
     /// MLA prefill MFMA twin — not yet built (reserved so the ABI is stable).
+    ///
+    /// `i7 = out_split`, as on [`DevOp::FlashGatherPrefill`] and for the same reason: the two ops
+    /// are the two halves of one V4.1 attention. Default 0 keeps the shipped layout.
     FlashMlaPrefill = 51,
     /// Per-head `W_uv` fold (`sparse-attn-design.md §2.5`): `o[b][h][v] =
     /// Σ_l O_latent[b][h][l]·W_uv[h][l][v]` — the O(n_q) query-side epilogue that folds
@@ -610,12 +613,26 @@ pub enum DevOp {
     /// construction, with `-1` for a slot before the sequence started.
     ///
     /// `t0=Opart(f32) t1=mlpart(f32) t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len(i32)
-    /// t7=idx(i32)` · `i0=n_batch i1=n_head i2=kv_stride i3=nope i4=n_tok i5=kv_mask i6=top_k` ·
-    /// `f0=scale`.
+    /// t7=idx(i32)` · `i0=n_batch i1=n_head i2=kv_stride i3=nope i4=n_tok i5=kv_mask i6=top_k
+    /// i7=out_split` · `f0=scale`.
     ///
     /// `i3` bit 31 is NOPE: the rope width is 0, `t3`/`t5` repeat `t2`/`t4`, and the whole head is
     /// scored unrotated. DeepSeek-V4.1 sets it because its rope is INTERIOR to `head_dim` and has
     /// already been applied by then.
+    ///
+    /// `i7 = out_split` is the WRITE-ONLY output split — low 8 bits the partial index this call
+    /// fills, next 8 the total — and [`DevOp::FlashMlaPrefill`] takes the same handle at the same
+    /// slot. **Default 0**, the shipped one-partial layout, on every existing emission. It does
+    /// NOT divide the KV range (that is the merge's `nsplit`, which this then matches); it says
+    /// where this flash's partials LIVE, so two flashes over two DIFFERENT caches fill disjoint
+    /// halves of one `(Opart, mlpart)` pair and one [`DevOp::FlashMerge`] combines them under a
+    /// single online softmax with the sink folded ONCE.
+    ///
+    /// That pair IS DeepSeek-V4.1's attention: `Attention.forward` runs one `sparse_attn` over
+    /// `cat([window_kv, compress_kv])` with `cat([window_idxs, compress_idxs])`
+    /// (`model.py:775-779`), and a window pass at split 0 plus a gathered pass at split 1 is that
+    /// expression without materialising either concatenation — no copy of the shared compressed
+    /// cache into a per-layer buffer, and no `+offset` rewrite of the index table.
     FlashGatherPrefill = 55,
 
     /// ROUTER TOP-K tail (the router SPLIT). The score matmul `logit = x·Wr` is now the ordinary
@@ -1459,7 +1476,15 @@ pub enum DevOp {
     /// Σ_h w[t][h]·ReLU(q_idx[t][h]·k_idx[s]) for s <= q_pos0 + t. Score is f32
     /// [n_tok][kv_stride].
     /// `t0=Score t1=Qidx t2=Kidx t3=W t4=kv_len` · `i0=n_tok i1=index_heads i2=kv_stride
-    /// i3=index_head_dim` · `f0=scale`.
+    /// i3=index_head_dim i4=pool_size` · `f0=scale`.
+    ///
+    /// `i4=pool_size` makes the COLUMN axis pools rather than tokens (**default 1**, zero on
+    /// every existing emission and read as 1 at dispatch, so no existing blob changes). `kv_len`
+    /// stays token-granular — it is what the host patches — so the key axis is
+    /// `kv_len/pool_size` and a row's causal bound is `(q_pos0+t+1)/pool_size`, both FLOOR.
+    /// That is DeepSeek-V4.1's `compress_lens = arange(1, seqlen+1) // ratio` (`model.py:564`):
+    /// a compressed entry is visible only once the query has passed its LAST token. Same handle
+    /// [`DevOp::IndexSelectPf`] takes at `i3`, and the two MUST agree.
     IndexScorePf = 117,
     /// Per-query-row EXACT top-k select (op 118): one workgroup per row, the op-59
     /// radix key (score desc, lowest-index tie-break) with LDS-only histograms. idx is
@@ -2129,7 +2154,7 @@ pub enum DevOp {
     /// the blockwise fake quant, one workgroup per row (`op_compress.h`
     /// `d_compress_rope_quant`, `[DSV41-CQUANT]`).
     /// `t0=out t1=src t2=cosb t3=sinb t4=pos` ·
-    /// `i0=n_rows i1=d i2=rd i3=qblk i4=ratio i5=row_base i6=qmode`.
+    /// `i0=n_rows i1=d i2=rd i3=qblk i4=ratio i5=row_base i6=qmode i7=n_head`.
     ///
     /// V4.1 SPLIT WHAT V4 FUSED. [`DevOp::CompressPool`] with `i7 = 2` stops after the norm,
     /// because `Compressor.forward` returns the latent before RoPE for the indexer to consume;
@@ -2142,6 +2167,11 @@ pub enum DevOp {
     /// `t0` and `t1` must NOT alias: the indexer reads `src`, and the reference's in-place rope
     /// is a write-after-read the packet order does not express. `t4` supersedes `i5` when
     /// present, for the same reason [`DevOp::CompressPool`]'s `t7` does.
+    ///
+    /// `i7 = n_head` (**default 1**) makes a row `[n_head][d]` rotated at ONE position — the
+    /// indexer's queries, `apply_rotary_emb(q[..., -rd:], freqs_cis[start:end])` over
+    /// `[b, s, n_heads, index_head_dim]` then `fp4_act_quant(q, 32, True)` (`model.py:550-552`).
+    /// A third call site, differing from the other two only in `i3`/`i6`/`i7`.
     CompressRopeQuant = 185,
 }
 

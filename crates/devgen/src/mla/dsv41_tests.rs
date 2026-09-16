@@ -1142,7 +1142,7 @@ fn the_attention_core_is_windowed_nope_mla_over_the_shared_latent() {
     let cos = b.tensor("gen.cos", (ctx as u64) * 32 * 4);
     let sin = b.tensor("gen.sin", (ctx as u64) * 32 * 4);
     let (act, _) = super::dsv41::emit_dsv41_attn_core(
-        &mut b, &cfg, &w, &all, 0, tp, q, kv, kvlen, pos, cos, sin, t, ctx, &[],
+        &mut b, &cfg, &w, &all, 0, tp, q, kv, kvlen, pos, cos, sin, None, t, ctx, &[],
     );
     let p = b.finish();
 
@@ -1398,6 +1398,147 @@ fn window_layers_and_compressed_layers_rope_on_different_tables() {
         yarn.generate(),
         "theta 10000 unscaled and theta 160000 under YaRN must not produce the same table"
     );
+}
+
+/// The indexer scores POOLS, and both halves of the pair must agree about that.
+///
+/// op 117 bounds a query row at `(q_pos0 + t + 1) / pool_size` and op 118 scans the same count.
+/// If the two disagreed the score would be written over a range the select never reads, or --
+/// worse in the other direction -- the select would rank columns op 117 never wrote, which are
+/// whatever the arena holds. `scripts/dsv41_indexer_oracle.py` check [2] is the numerical half
+/// of this; that they are the SAME number in one emit is the half a test can hold.
+#[test]
+fn the_indexer_scores_pools_and_both_ops_agree_on_the_ratio() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    for (l, ratio) in [(2u32, 2u32), (20, 1)] {
+        let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[l], 8, 304, 8192, 256);
+        let sc = m
+            .progs[0]
+            .insts
+            .iter()
+            .find(|d| d.op == DevOp::IndexScorePf as u16)
+            .unwrap_or_else(|| panic!("layer {l} is an index_source and must score"));
+        let se = m
+            .progs[0]
+            .insts
+            .iter()
+            .find(|d| d.op == DevOp::IndexSelectPf as u16)
+            .unwrap_or_else(|| panic!("layer {l} must select"));
+        assert_eq!(sc.i[4], ratio, "op 117 pool_size");
+        assert_eq!(se.i[3], ratio, "op 118 pool_size");
+        assert_eq!(sc.i[4], se.i[3], "the score and the select MUST agree on the ratio");
+        assert_eq!(sc.i[1], cfg.index_heads, "all 32 heads: the indexer is replicated");
+        assert_eq!(sc.i[1], 32, "and 32 is what the MFMA A tile is");
+        assert_eq!(sc.i[3], cfg.index_dim);
+        assert_eq!(sc.i[2], se.i[2], "one score stride");
+        // `min(index_topk, end_pos // ratio)` -- at t=256 and ratio 2 that is 128, not 512.
+        assert_eq!(se.i[1], cfg.index_topk.min(256 / ratio), "the reference's own min");
+    }
+}
+
+/// An index layer that owns no KEYS derives none -- it reads the ones its source published.
+///
+/// "the index keys are derived from the compressor's latent, so only a layer that compresses its
+/// own KV can produce them; every other indexer reads them from that layer's cache"
+/// (`model.py:498-500`). Layers 24, 28, 32 and 36 run queries and weights against layer 20's
+/// keys. A layer that re-derived them would need a compressor it does not have.
+#[test]
+fn an_index_layer_that_owns_no_keys_derives_none() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    assert!(cfg.index_source.contains(&24) && !cfg.kv_source.contains(&24));
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[20, 24], 8, 304, 8192, 256);
+    // op 185 runs three times per KEY-OWNING index layer (cache row, index key, queries) and
+    // once for a query-only one. Layer 20 owns keys, layer 24 does not: 3 + 1.
+    let tails = m
+        .progs[0]
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::CompressRopeQuant as u16)
+        .count();
+    assert_eq!(
+        tails, 4,
+        "layer 20 ropes and quantizes its cache row, its index key and its queries; layer 24 \
+         only its queries"
+    );
+    // Both layers score and select: the SELECTION is per-layer, only the keys are shared.
+    assert_eq!(
+        m.progs[0].insts.iter().filter(|d| d.op == DevOp::IndexScorePf as u16).count(),
+        2
+    );
+    // And a single-layer chain at 24 must not invent a key derivation.
+    let (m24, _) = super::dsv41::emit_dsv41_block(&cfg, &[24], 8, 304, 8192, 256);
+    assert_eq!(
+        m24.progs[0].insts.iter().filter(|d| d.op == DevOp::CompressRopeQuant as u16).count(),
+        1,
+        "layer 24 alone ropes only its queries"
+    );
+}
+
+/// A compressed layer runs TWO flashes into one partial pair, and the sink is folded ONCE.
+///
+/// `Attention.forward` concatenates -- `kv = cat([kv, compress_kv])`,
+/// `topk_idxs = cat([topk_idxs, compress_idxs])` -- and runs ONE `sparse_attn`, whose kernel adds
+/// `attn_sink` to the denominator after the last block (`kernel.py:383-386`). Two partials merged
+/// by one online softmax is that expression: the window pass at split 0, the gathered pass at
+/// split 1, and `FlashMerge` folding the sink exactly once. Two merges, or a sink on each pass,
+/// would double-count the denominator.
+#[test]
+fn a_compressed_layer_merges_two_partials_with_the_sink_folded_once() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[3], 8, 304, 8192, 256);
+    let win = m
+        .progs[0]
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::FlashMlaPrefill as u16)
+        .expect("the window flash");
+    let gat = m
+        .progs[0]
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::FlashGatherPrefill as u16)
+        .expect("the compressed flash -- 38 of 40 layers need it");
+    assert_eq!(win.i[7], (2 << 8) | 0, "window is partial 0 of 2");
+    assert_eq!(gat.i[7], (2 << 8) | 1, "compressed is partial 1 of 2");
+    assert_eq!(win.t[0], gat.t[0], "ONE Opart, filled in disjoint halves");
+    assert_eq!(win.t[1], gat.t[1], "ONE mlpart");
+    assert_ne!(win.t[4], gat.t[4], "and two DIFFERENT caches: the window K and the CSA2 cache");
+    assert_ne!(gat.t[7], TENSOR_NONE, "the gather walks the selection table");
+    assert_ne!(gat.i[3] & 0x8000_0000, 0, "NoPE: the rope is interior and already applied");
+
+    let merges: Vec<_> = m
+        .progs[0]
+        .insts
+        .iter()
+        .filter(|d| d.op == DevOp::FlashMerge as u16)
+        .collect();
+    assert_eq!(merges.len(), 1, "ONE merge: the sink joins one denominator, not two");
+    assert_eq!(merges[0].i[2], 2, "nsplit 2");
+    assert_eq!(
+        merges[0].t[3],
+        m.progs[0].insts.iter().find(|d| d.op == DevOp::FlashMerge as u16).unwrap().t[3],
+    );
+    assert_ne!(merges[0].t[3], TENSOR_NONE, "the attention sink is folded here and only here");
+
+    // A window-only layer keeps the one-partial layout, byte-for-byte what it emitted before.
+    let (m0, _) = super::dsv41::emit_dsv41_block(&cfg, &[0], 8, 304, 8192, 256);
+    let w0 = m0
+        .progs[0]
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::FlashMlaPrefill as u16)
+        .unwrap();
+    assert_eq!(w0.i[7], 0, "no output split on a layer with one partial");
+    assert!(!m0.progs[0].insts.iter().any(|d| d.op == DevOp::FlashGatherPrefill as u16));
 }
 
 /// Every tensor-parallel weight is READ at the width it was DECLARED at.
@@ -1658,10 +1799,24 @@ fn every_activation_read_is_written_by_something() {
         return;
     };
     let _guard = crate::test_env::env_guard();
-    // BOTH emittable layers. Layer 1 is not layer 0 plus a bit: it opens with the Engram gather,
-    // its all-reduce and `wkv`, and those introduce `in.engram_ids` and two activations that
-    // nothing else in the layer writes.
-    for block in [&[0u32][..], &[1u32][..]] {
+    // ONE CHAIN PER SHAPE A LAYER CAN HAVE, because no two of them read the same set:
+    //   [0]      the window-only base
+    //   [1]      opens with the Engram gather, its all-reduce and `wkv` -- `in.engram_ids` plus
+    //            two activations nothing else in the layer writes
+    //   [2, 3]   a kv_source WITH an indexer, then a pure reader: the compressor's latent and
+    //            cache, the index keys, the score and the selection, and a layer that reads the
+    //            last two without writing either
+    //   [20]     the ratio-1 compressor, which has no pool and no `wgate`
+    //   [20, 24] a key OWNER and then an index_source that does NOT own keys: 24 runs its own
+    //            queries and weights against the keys 20 published, which is the two-level
+    //            indexer's whole point and the only chain that exercises the reuse
+    for block in [
+        &[0u32][..],
+        &[1u32][..],
+        &[2u32, 3u32][..],
+        &[20u32][..],
+        &[20u32, 24u32][..],
+    ] {
         every_activation_read_is_written_for(&cfg, block);
     }
 }
@@ -2088,47 +2243,45 @@ fn the_mhc_pre_gate_comes_from_the_previous_sublayer() {
     );
 }
 
-/// Reading the shared CSA2 cache is a PART, and a layer that needs it is not done.
+/// Reading the shared CSA2 cache is a PART, and it lands on the READER layers, not the writers.
 ///
 /// `kv_source` says who WRITES the cache -- 4 layers. `compress_ratios[l]` says which cache layer
 /// `l` READS, and only 0 means "sliding window only". The parts table used to consult the writer
 /// list alone, so all 38 reader layers were reported COMPLETE while the emit dispatched
-/// `FlashMlaPrefill` with `KV_MASK_NONE` and nothing but the 128-token window. A refusal that
-/// says "done" about a layer attending over a fraction of its keys is worse than no refusal, so
-/// the reader side is pinned here by layer id.
+/// `FlashMlaPrefill` with `KV_MASK_NONE` and nothing but the 128-token window. The row exists on
+/// exactly the layers whose ratio is nonzero, and it is pinned here by layer id so that a
+/// regression naming the wrong layers is as loud as one changing how many.
 #[test]
-fn a_layer_that_reads_the_compressed_cache_is_not_done() {
+fn the_compressed_read_lands_on_the_reader_layers_not_the_writers() {
     let Some((cfg, _)) = checkpoint() else {
         return;
     };
-    let needs = |l: u32| {
+    let reads = |l: u32| {
         super::dsv41::dsv41_layer_parts(&cfg, l)
             .iter()
-            .any(|(n, st)| n.starts_with("compressed-KV attention") && *st == super::dsv41::Part::Todo)
+            .any(|(n, _)| n.starts_with("compressed-KV attention"))
     };
 
     // Only layers 0 and 1 are window-only; compress_ratios is [0, 0, 2 x18, 1 x20, 0, 0, 0] and
     // the trailing three entries are DSpark blocks, not layers.
-    assert!(!needs(0), "layer 0 is window-only");
-    assert!(!needs(1), "layer 1 is window-only");
+    assert!(!reads(0), "layer 0 is window-only");
+    assert!(!reads(1), "layer 1 is window-only");
     for l in 2..cfg.layers {
-        assert!(needs(l), "layer {l} reads the compressed cache and must say so");
+        assert!(reads(l), "layer {l} reads the compressed cache and must say so");
     }
 
     // And the reader side is NOT the writer side: layer 3 reads without owning a compressor.
     assert!(!cfg.kv_source.contains(&3));
-    assert!(needs(3), "a pure reader still needs the read emitted");
+    assert!(reads(3), "a pure reader still needs the read emitted");
 
-    // The consequence, stated as the SET and not just the count, so that a regression naming the
-    // wrong layers is as loud as one changing how many. Layers 0 and 1 are the two whose
-    // `compress_ratio` is 0; layer 1 additionally carries an Engram, which is now emitted.
+    // ALL 40 LAYERS EMIT. Stated as the set, not the count.
     let emits: Vec<u32> = (0..cfg.layers)
         .filter(|l| super::dsv41::dsv41_emit_block_plan(&cfg, *l).is_ok())
         .collect();
     assert_eq!(
         emits,
-        vec![0, 1],
-        "exactly the two window-only layers emit; every other layer is missing its compressed-KV \
-         attention, and layer 14's Engram is not enough on its own"
+        (0..cfg.layers).collect::<Vec<u32>>(),
+        "every layer emits: the window everywhere, the compressor on 4, the indexer on 8, the \
+         Engram on 2 and the gathered read on 38"
     );
 }

@@ -319,12 +319,29 @@ pub(crate) fn dsv41_shard_of(suffix: &str) -> Option<Shard> {
         "attn.compressor.wkv.weight"
         | "attn.compressor.norm.weight"
         | "attn.compressor.wgate.weight" => Replicated,
-        // Indexer queries are per index-head (32 of them, 4 per rank at tp=8).
+        // THE INDEXER IS REPLICATED, and that is the tree's own standing recommendation rather
+        // than this emit's preference. `ColumnParallelLinear` would give each rank 4 of the 32
+        // index heads at tp=8, and `d_index_score_pf_row`'s A tile IS the head axis:
+        //
+        //     static_assert(HIc % 32 == 0, "the 32x32 MFMA A-tile is 32 index heads; HIc must be
+        //                                   a multiple of it (replicate a sharded indexer
+        //                                   instead)")   [DSV4-IDX]
+        //
+        // 4 heads would leave seven eighths of the tile idle, and the alternative -- sharding and
+        // all-reducing `index_score` -- is a `[T][compress_len]` f32 reduce: 268 MB per layer at
+        // 8k and ratio 1, on 8 layers. Replicating costs 5.2 MB of `wq_b` and 328 KB of
+        // `weights_proj` per rank and no collective at all. The ARITHMETIC is the reference's
+        // either way; only the head-sum order differs.
+        //
+        // The next step past this is to split the QUERY ROWS instead -- one eighth of the score
+        // work per rank and a `[T][512]` i32 all-gather, 16 MB -- which is not attempted here and
+        // is recorded rather than guessed at.
         "attn.indexer.wq_b.weight"
         | "attn.indexer.wq_b.scale"
-        | "attn.indexer.weights_proj.weight" => OutSplit,
+        | "attn.indexer.weights_proj.weight"
         // The index KEY is derived from the compressor's latent and is likewise one shared row.
-        "attn.indexer.wk.weight" | "attn.indexer.k_norm.weight" => Replicated,
+        | "attn.indexer.wk.weight"
+        | "attn.indexer.k_norm.weight" => Replicated,
         // `engram.embed` CANNOT be replicated: the two tables are 202.8 GB and an MI300X has 192 GB
         // of HBM, so a replicated copy does not fit on one GPU at all. Row-split is the only
         // placement that fits (25.35 GB per rank), which makes this OutSplit by capacity rather
@@ -636,7 +653,20 @@ pub(crate) struct Dsv41Compress {
     pub(crate) latent: u32,
 }
 
-/// Declare the compressor's scratch. `None` when no layer in the chain is a `kv_source`.
+/// Whether any layer in the chain touches the shared compressed cache -- as a WRITER
+/// (`kv_source`) or as a READER (`compress_ratio != 0`). The two disagree by construction, and
+/// declaring on the writer list alone is what left a reader chain without a cache to read.
+fn dsv41_chain_uses_compress(c: &Dsv41Cfg, layers: &[u32]) -> bool {
+    layers.iter().any(|&l| {
+        c.kv_source.contains(&l)
+            || !matches!(
+                c.raw.attn_kind(l),
+                nn_graph::models::config::V41Attn::Window
+            )
+    })
+}
+
+/// Declare the compressor's scratch. `None` when no layer in the chain writes OR reads the cache.
 pub(crate) fn declare_dsv41_compress(
     b: &mut Builder,
     c: &Dsv41Cfg,
@@ -644,7 +674,7 @@ pub(crate) fn declare_dsv41_compress(
     t: u32,
     ctx: u32,
 ) -> Option<Dsv41Compress> {
-    if !layers.iter().any(|l| c.kv_source.contains(l)) {
+    if !dsv41_chain_uses_compress(c, layers) {
         return None;
     }
     let (r, hd, cx) = (t as u64, c.head_dim as u64, ctx as u64);
@@ -813,6 +843,270 @@ pub(crate) fn emit_dsv41_compressor(
 
 /// `fp4_act_quant(latent, 16, ...)` -- the compressed cache's quant block, model.py:760.
 pub(crate) const DSV41_KV_QBLK: u32 = 16;
+
+/// The two-level indexer's scratch, and the two tables it shares across the chain.
+pub(crate) struct Dsv41Index {
+    /// THE SHARED INDEX KEYS, `[ctx][index_head_dim]` bf16. `shared_attn.index_k`
+    /// (`model.py:548`) -- only the four `kv_source` layers derive keys, from their own
+    /// compressor latent, and the other four index layers read whichever was written last.
+    pub(crate) keys: u32,
+    /// THE SHARED SELECTION, `[T][index_topk]` i32. `shared_attn.topk_idxs`
+    /// (`model.py:731`): an index layer publishes it and every layer up to the next index
+    /// layer reuses it without running an indexer at all (`_compress_topk_idxs`, 722-731).
+    pub(crate) idx: u32,
+    /// `qr @ indexer.wq_b^T`, then roped and fake-quantized in place of itself:
+    /// `[T][index_n_heads][index_head_dim]` bf16.
+    q: u32,
+    qr: u32,
+    /// `xn @ indexer.weights_proj^T`, `[T][index_n_heads]` bf16 -- the per-head ReLU weights.
+    w: u32,
+    /// `latent @ indexer.wk^T` and its norm, `[ctx][index_head_dim]` bf16.
+    k: u32,
+    kn: u32,
+    /// `[T][ctx/min_ratio]` f32. The widest score a layer in this chain needs.
+    score: u32,
+}
+
+/// Declare the indexer's scratch. `None` when no layer in the chain runs an indexer or reads a
+/// selection -- the same writer/reader split the cache has.
+pub(crate) fn declare_dsv41_index(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    layers: &[u32],
+    t: u32,
+    ctx: u32,
+) -> Option<Dsv41Index> {
+    if !dsv41_chain_uses_compress(c, layers) {
+        return None;
+    }
+    let (r, cx) = (t as u64, ctx as u64);
+    let (hi, di) = (c.index_heads as u64, c.index_dim as u64);
+    Some(Dsv41Index {
+        keys: b.tensor("act.index_k", cx * di * 2),
+        idx: b.tensor("act.index_idx", r * c.index_topk as u64 * 4),
+        q: b.tensor("act.index_q", r * hi * di * 2),
+        qr: b.tensor("act.index_qr", r * hi * di * 2),
+        w: b.tensor("act.index_w", r * hi * 2),
+        k: b.tensor("act.index_kpre", cx * di * 2),
+        kn: b.tensor("act.index_kn", cx * di * 2),
+        // The score is [T][pools] and `pools` is widest at the SMALLEST ratio in the chain.
+        score: b.tensor("act.index_score", r * cx * 4),
+    })
+}
+
+/// Emit ONE `index_source` layer's indexer: keys where it owns them, then the score and the
+/// top-k the 38 reader layers select their compressed positions with.
+///
+/// # This is the selector op 55 was waiting for
+///
+/// [`DevOp::FlashGatherPrefill`]'s own doc: *"What kept this without an emit site is the
+/// SELECTOR, not the flash: a learned top-k needs T-row `IndexScore`/`IndexSelect`, which is a
+/// real design problem."* Ops 117/118 are that pair, built for GLM-5.3's lightning indexer, and
+/// V4.1's is the same computation at the same `index_head_dim` and the same 32 heads --
+/// `scripts/dsv41_indexer_oracle.py` check [1] puts op 117 at 1.1e-07 relative against
+/// `Indexer.forward`'s own expression.
+///
+/// # Three differences, and only one needed a kernel change
+///
+///   1. **The columns are POOLS.** V4.1's index keys are compressed entries, so a query reaches
+///      `(t + 1) / ratio` of them and not `t + 1`. That is op 117's new `i4 = pool_size` and op
+///      118's existing `i3`, and the two MUST agree. Check [2].
+///   2. **The indexer is REPLICATED**, not column-parallel. See `dsv41_shard_of`: the MFMA A
+///      tile is the head axis and a tp=8 shard would leave it one-eighth full, which is what
+///      `d_index_score_pf_row`'s own `static_assert` tells an emitter to avoid.
+///   3. **The two-level candidate stage is SKIPPED**, and that is a statement about this
+///      context length rather than about the model. `candidate_topk_blocks` is 2048 over
+///      `candidate_block_size` 8 = 16384 compressed positions, and 8k gives 8192 at ratio 1.
+///      Level one therefore keeps every reachable block, and the mask level two applies is a
+///      block-rounded SUPERSET of the reachability mask `Indexer.forward` has already applied
+///      -- so it removes nothing. Checks [3] and [4], and the assert below is what stops this
+///      being silently wrong at a longer context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_dsv41_indexer(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    w: &Dsv41Weights,
+    cus: &[u32],
+    ix: &Dsv41Index,
+    cp: Option<&Dsv41Compress>,
+    l: u32,
+    xn: u32,
+    qr: u32,
+    kvlen: u32,
+    cos: u32,
+    sin: u32,
+    t: u32,
+    ctx: u32,
+    deps: &[u32],
+) -> u32 {
+    let ratio = match c.raw.attn_kind(l) {
+        nn_graph::models::config::V41Attn::Compressed { ratio } => ratio,
+        nn_graph::models::config::V41Attn::Window => {
+            panic!("layer {l} is an index_source with compress_ratio 0")
+        }
+    };
+    let (hi, di) = (c.index_heads, c.index_dim);
+    let rd = c.qk_rope;
+    let n_pool = t / ratio;
+    let blocks = (ctx / ratio).div_ceil(c.raw.candidate_block_size as u32);
+    assert!(
+        blocks <= c.raw.candidate_topk_blocks as u32,
+        "ctx={ctx} at ratio {ratio} gives {blocks} candidate blocks against \
+         candidate_topk_blocks={}, so `select_candidate_blocks` would actually DROP blocks and \
+         this emit's decision to skip the two-level selection stops being a no-op. \
+         Missing capability: `dsv41_indexer_two_level`.",
+        c.raw.candidate_topk_blocks
+    );
+    // `topk = min(self.index_topk, end_pos // ratio)` (model.py:578). A chunk with fewer pools
+    // than `index_topk` selects all of them, and the WIDTH the table is written at is what op 55
+    // then reads, so the two must be derived the same way -- `dsv41_index_topk` is that one
+    // derivation.
+    let topk = dsv41_index_topk(c, t, ratio);
+    let all = cus.to_vec();
+
+    let bf16_gemm = |b: &mut Builder, out: u32, x: u32, weight: u32, n: u32, k: u32, dep: &[u32]| {
+        let op = crate::pick_tile(t, n, k, b.n_cu(), kernelcaps::QuantScheme::None);
+        b.emit(op, all.clone(), dep, |d| {
+            d.t[0] = out;
+            d.t[1] = x;
+            d.t[2] = weight;
+            d.i[0] = t;
+            d.i[1] = n;
+            d.i[2] = k;
+        })
+    };
+
+    // ---- the index KEYS, on the four layers that own a compressor --------------------------
+    // "the index keys are derived from the compressor's latent, so only a layer that compresses
+    // its own KV can produce them; every other indexer reads them from that layer's cache"
+    // (model.py:498-500). And they are derived from the PRE-RoPE latent, which is the whole
+    // reason op 180 stops after the norm.
+    let mut key_dep: Vec<u32> = Vec::new();
+    if c.kv_source.contains(&l) {
+        let cp = cp.expect("a kv_source layer has a compressor");
+        let c_k = {
+            let op = crate::pick_tile(n_pool, di, c.head_dim, b.n_cu(), kernelcaps::QuantScheme::None);
+            b.emit(op, all.clone(), deps, |d| {
+                d.t[0] = ix.k;
+                d.t[1] = cp.latent;
+                d.t[2] = w.get(l, "attn.indexer.wk.weight");
+                d.i[0] = n_pool;
+                d.i[1] = di;
+                d.i[2] = c.head_dim;
+            })
+        };
+        let c_kn = b.emit(DevOp::RmsNorm, all.clone(), &[c_k], |d| {
+            d.t[0] = ix.kn;
+            d.t[1] = ix.k;
+            d.t[2] = w.get(l, "attn.indexer.k_norm.weight");
+            d.i[0] = n_pool;
+            d.i[1] = di;
+            d.f[0] = c.eps;
+        });
+        // `fp4_act_quant(k, fp4_block_size, True)` -- blocks of 32 with an E8M0 scale, which is
+        // the OTHER of op 185's two settings. A key stands for its group's first token, so it
+        // ropes at `j * ratio` exactly as the cache row does.
+        key_dep.push(b.emit(DevOp::CompressRopeQuant, all.clone(), &[c_kn], |d| {
+            d.t[0] = ix.keys;
+            d.t[1] = ix.kn;
+            d.t[2] = cos;
+            d.t[3] = sin;
+            d.t[4] = TENSOR_NONE;
+            d.i[0] = n_pool;
+            d.i[1] = di;
+            d.i[2] = rd;
+            d.i[3] = DSV41_IDX_QBLK;
+            d.i[4] = ratio;
+            d.i[5] = 0;
+            d.i[6] = 1; // PLOW_CMP_Q_FP4_POW2 -- E8M0, the fp4_act_quant default
+            d.i[7] = 1;
+        }));
+    }
+
+    // ---- the queries, and the per-head weights ---------------------------------------------
+    let c_q = emit_pf_gemm_fp8_mx(
+        b,
+        cus,
+        ix.q,
+        qr,
+        w.get(l, "attn.indexer.wq_b.weight"),
+        w.get(l, "attn.indexer.wq_b.scale"),
+        t,
+        hi * di,
+        c.q_lora,
+        deps,
+    );
+    // One angle per TOKEN across all 32 heads, then fp4 at 32 over each head's whole 128 --
+    // op 185's third call site, `i7 = n_head`.
+    let c_qr = b.emit(DevOp::CompressRopeQuant, all.clone(), &[c_q], |d| {
+        d.t[0] = ix.qr;
+        d.t[1] = ix.q;
+        d.t[2] = cos;
+        d.t[3] = sin;
+        d.t[4] = TENSOR_NONE;
+        d.i[0] = t;
+        d.i[1] = di;
+        d.i[2] = rd;
+        d.i[3] = DSV41_IDX_QBLK;
+        d.i[4] = 1; // a query stands for its OWN token
+        d.i[5] = 0;
+        d.i[6] = 1;
+        d.i[7] = hi;
+    });
+    let c_w = bf16_gemm(
+        b,
+        ix.w,
+        xn,
+        w.get(l, "attn.indexer.weights_proj.weight"),
+        hi,
+        c.hidden,
+        deps,
+    );
+
+    // ---- score, then select ------------------------------------------------------------------
+    // `scale` is `softmax_scale * n_heads**-0.5` (model.py:555), folded into op 117's epilogue
+    // instead of into `weights`: `part * scale` and `(w * scale) * relu` are the same expression
+    // by distributivity, and the epilogue is where the op already has a multiply.
+    let scale = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
+    let kv_stride = ctx / ratio;
+    let mut score_deps = vec![c_qr, c_w];
+    score_deps.extend_from_slice(&key_dep);
+    let c_sc = b.emit(DevOp::IndexScorePf, all.clone(), &score_deps, |d| {
+        d.t[0] = ix.score;
+        d.t[1] = ix.qr;
+        d.t[2] = ix.keys;
+        d.t[3] = ix.w;
+        d.t[4] = kvlen;
+        d.i[0] = t;
+        d.i[1] = hi;
+        d.i[2] = kv_stride;
+        d.i[3] = di;
+        d.i[4] = ratio; // POOLS, not tokens
+        d.f[0] = scale;
+    });
+    b.emit(DevOp::IndexSelectPf, all.clone(), &[c_sc], |d| {
+        d.t[0] = ix.idx;
+        d.t[1] = ix.score;
+        d.t[2] = kvlen;
+        d.i[0] = t;
+        d.i[1] = topk;
+        d.i[2] = kv_stride;
+        d.i[3] = ratio; // MUST equal op 117's i4
+    })
+}
+
+/// How many compressed positions one query selects: `min(index_topk, end_pos // ratio)`
+/// (`model.py:578`).
+///
+/// ONE derivation, because op 118 WRITES the table at this width and op 55 READS it at this
+/// width, from two different emit functions. A chunk shorter than `index_topk * ratio` selects
+/// every pool it has, and a reader that assumed the full 512 would walk past the row.
+pub(crate) fn dsv41_index_topk(c: &Dsv41Cfg, t: u32, ratio: u32) -> u32 {
+    c.index_topk.min(t / ratio)
+}
+
+/// `fp4_act_quant(k, fp4_block_size, True)` -- the indexer's quant block, model.py:546/552.
+pub(crate) const DSV41_IDX_QBLK: u32 = 32;
 
 /// The mHC residual stream and its scratch, shared by every layer.
 ///
@@ -1327,6 +1621,9 @@ pub(crate) fn emit_dsv41_attn_core(
     pos: u32,
     cos: u32,
     sin: u32,
+    // The shared compressed cache, the shared selection and `index_topk`, when this layer reads
+    // them. `None` is a layer whose `compress_ratio` is 0 -- 0 and 1 only.
+    compressed: Option<(u32, u32, u32)>,
     t: u32,
     ctx: u32,
     deps: &[u32],
@@ -1353,6 +1650,12 @@ pub(crate) fn emit_dsv41_attn_core(
         rope <= 64 && rope.is_power_of_two(),
         "the rotary width {rope} must fit one register and be a power of two"
     );
+    // TWO PARTIALS on a layer that also reads the compressed cache: the window pass and the
+    // gathered pass. `Attention.forward` runs ONE `sparse_attn` over `cat([window_kv,
+    // compress_kv])` with the sink added once at the end (model.py:775-779); a two-partial merge
+    // is that same expression, and it avoids copying the SHARED cache into a per-layer buffer
+    // and re-basing the index table by the window length.
+    let nsplit = if compressed.is_some() { 2u64 } else { 1u64 };
     let act = Dsv41CoreAct {
         qr: b.tensor(
             &format!("act.l{l}.qr"),
@@ -1361,11 +1664,11 @@ pub(crate) fn emit_dsv41_attn_core(
         kvr: b.tensor(&format!("act.l{l}.kvr"), (t as u64) * (hd as u64) * 2),
         opart: b.tensor(
             &format!("act.l{l}.opart"),
-            (t as u64) * (nh_l as u64) * (hd as u64) * 4,
+            (t as u64) * (nh_l as u64) * (hd as u64) * 4 * nsplit,
         ),
         mlpart: b.tensor(
             &format!("act.l{l}.mlpart"),
-            (t as u64) * (nh_l as u64) * 2 * 4,
+            (t as u64) * (nh_l as u64) * 2 * 4 * nsplit,
         ),
         o: b.tensor(
             &format!("act.l{l}.attn_o"),
@@ -1419,8 +1722,40 @@ pub(crate) fn emit_dsv41_attn_core(
         d.i[3] = (1u32 << 31) | window;
         d.i[4] = t;
         d.i[5] = KV_MASK_NONE;
+        // Write-only output split: this is partial 0 of `nsplit`. Zero when there is one partial,
+        // which is the layout every other emitter in the tree produces.
+        d.i[7] = if nsplit == 2 { (2u32 << 8) | 0 } else { 0 };
         d.f[0] = scale;
     });
+    // THE COMPRESSED READ. `compress_ratios[l] != 0` on 38 of 40 layers and every one of them
+    // attends over the shared CSA2 cache ON TOP of its window -- the parts table called this
+    // "38 of 40 layers silently attending over a fraction of what they should".
+    //
+    // No causal mask: the selector produced the set, and op 118 scanned only
+    // `(t + 1) / ratio` pools, so a query cannot name a compressed entry that is not complete
+    // yet (`scripts/dsv41_indexer_oracle.py` check [2]).
+    let c_fl = match compressed {
+        None => c_fl,
+        Some((cache, idx, topk)) => b.emit(DevOp::FlashGatherPrefill, all.clone(), &[c_q, c_kv, c_fl], |d| {
+            d.t[0] = act.opart;
+            d.t[1] = act.mlpart;
+            d.t[2] = act.qr;
+            d.t[3] = act.qr;
+            d.t[4] = cache;
+            d.t[5] = cache;
+            d.t[6] = kvlen;
+            d.t[7] = idx;
+            d.i[0] = 1;
+            d.i[1] = nh_l;
+            d.i[2] = ctx; // cache rows; the selection never names one past `ctx / ratio`
+            d.i[3] = 1u32 << 31; // NoPE, and NO window: the gather arm takes the whole set
+            d.i[4] = t;
+            d.i[5] = KV_MASK_NONE;
+            d.i[6] = topk;
+            d.i[7] = (2u32 << 8) | 1; // partial 1 of 2
+            d.f[0] = scale;
+        }),
+    };
     // nsplit = 1, so the merge is the softmax normalisation plus the attention SINKS -- one extra
     // unscaled logit per head that joins the denominator with no value row. V4.1 has one per head
     // and `FlashMerge` is the only place it can be folded.
@@ -1432,7 +1767,7 @@ pub(crate) fn emit_dsv41_attn_core(
         d.t[3] = sink;
         d.i[0] = t;
         d.i[1] = nh_l;
-        d.i[2] = 1; // nsplit
+        d.i[2] = nsplit as u32;
         d.i[3] = hd;
     });
     // THE INVERSE ROPE, which this emit used to leave out entirely.
@@ -1994,6 +2329,7 @@ pub(crate) fn emit_dsv41_block(
     let mhc = declare_dsv41_mhc(&mut tb, c, t);
     let engram = declare_dsv41_engram(&mut tb, c, layers, t);
     let compress = declare_dsv41_compress(&mut tb, c, layers, t, ctx);
+    let index = declare_dsv41_index(&mut tb, c, layers, t, ctx);
     let peer_w = dsv41_peer_width(c, layers);
     let tensors = tb.tensors();
     let gen = tb.gen_tensors();
@@ -2023,6 +2359,41 @@ pub(crate) fn emit_dsv41_block(
     // -- so the honest entry for a rung is the stream, not a hidden state plus a fake expansion.
     // The previous layer's last op. Empty for the first, so a one-layer chain emits exactly the
     // instruction stream it did before this was a loop.
+    // A RUNG THAT READS A CACHE NOTHING IN IT WROTE. `--block 3` is a legal one-layer rung and
+    // layer 3 attends over the cache layer 2 published; in a chain that starts at 3 nothing
+    // publishes it, so op 55 gathers from whatever the arena holds. That is a rung's usual
+    // bargain -- the entry residual is uploaded too -- but it is the difference between a
+    // timing artifact and a numerical one, so it is said out loud rather than discovered.
+    {
+        let first_src = layers.iter().position(|l| c.kv_source.contains(l));
+        let first_rd = layers.iter().position(|&l| {
+            !matches!(
+                c.raw.attn_kind(l),
+                nn_graph::models::config::V41Attn::Window
+            )
+        });
+        // `act.index_k` has its OWN owner list: the four `kv_source` layers derive index keys
+        // from their compressor latent, and the other four index layers read them. A chain
+        // starting at 24 runs an indexer against arena state, which is not the same gap as
+        // reading an unwritten cache and is not covered by the same test.
+        let first_idx = layers.iter().position(|l| c.index_source.contains(l));
+        let unwritten = match (first_rd, first_src) {
+            (Some(rd), src) => src.is_none_or(|s| s > rd),
+            (None, _) => false,
+        } || match (first_idx, first_src) {
+            (Some(ix), src) => src.is_none_or(|s| s > ix),
+            (None, _) => false,
+        };
+        if unwritten {
+            eprintln!(
+                "  NOTE: this chain reads shared CSA2 state that no earlier layer in it writes, \
+                 so `act.compress_kv`, `act.index_k` and `act.index_idx` enter as arena state. \
+                 TIME this blob, do not read it; a chain starting at or before the relevant \
+                 kv_source ({:?}) is the numerically meaningful one.",
+                c.kv_source
+            );
+        }
+    }
     let mut deps: Vec<u32> = Vec::new();
     // The sublayer index, counting attention and FFN separately: it is what picks the `pre_pair`
     // half, so it must advance twice per layer and never reset. See `emit_dsv41_mhc_pre`.
@@ -2077,9 +2448,46 @@ pub(crate) fn emit_dsv41_block(
                 &mut b, c, &w, &all, cp, l, proj.xn, lcos, lsin, t, &[c_proj],
             ));
         }
+        // THE SELECTION, on the 8 `index_source` layers. Every other layer REUSES the one its
+        // source published -- `_compress_topk_idxs` returns `shared_attn.topk_idxs` unchanged
+        // when `is_index_source` is false (model.py:722-731) -- so the emit runs an indexer
+        // exactly where the reference constructs one, and the layers between simply read the
+        // table. That reuse is why 8 indexers serve 38 readers.
+        if c.index_source.contains(&l) {
+            let ix = index
+                .as_ref()
+                .expect("declare_dsv41_index saw this layer in `layers`");
+            core_deps.push(emit_dsv41_indexer(
+                &mut b,
+                c,
+                &w,
+                &all,
+                ix,
+                compress.as_ref(),
+                l,
+                proj.xn,
+                proj.q_an,
+                kvlen,
+                lcos,
+                lsin,
+                t,
+                ctx,
+                &core_deps.clone(),
+            ));
+        }
+        // `compress_ratios[l]`, not `kv_source`: who WRITES the cache and who READS it disagree
+        // by construction, and reading the writer list is what left 38 layers window-only.
+        let compressed = match c.raw.attn_kind(l) {
+            nn_graph::models::config::V41Attn::Window => None,
+            nn_graph::models::config::V41Attn::Compressed { ratio } => {
+                let cp = compress.as_ref().expect("a compressed layer needs a cache");
+                let ix = index.as_ref().expect("a compressed layer needs a selection");
+                Some((cp.cache, ix.idx, dsv41_index_topk(c, t, ratio)))
+            }
+        };
         let (core, c_core) = emit_dsv41_attn_core(
-            &mut b, c, &w, &all, l, tp, proj.q, proj.kv, kvlen, pos, lcos, lsin, t, ctx,
-            &core_deps,
+            &mut b, c, &w, &all, l, tp, proj.q, proj.kv, kvlen, pos, lcos, lsin, compressed, t,
+            ctx, &core_deps,
         );
         let (_out, c_out) =
             emit_dsv41_attn_out(&mut b, c, &w, &all, l, tp, core.o, t, &mut xgate, &[c_core]);
@@ -2262,7 +2670,16 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
         p.push(("csa2 compressor (ops 180/185), writes the shared cache", Part::Done));
     }
     if c.index_source.contains(&l) {
-        p.push(("indexer queries (two-level)", Part::Todo));
+        // Ops 117/118, with the new pool-granular causal bound. "Two-level" is the candidate
+        // stage, and at 8k it is INERT -- `candidate_topk_blocks` 2048 x `candidate_block_size`
+        // 8 covers 16384 compressed positions and an 8k context has at most 8192, so level one
+        // keeps every reachable block and the mask level two applies is a SUPERSET of the
+        // reachability mask already applied. `emit_dsv41_indexer` asserts that rather than
+        // assuming it; a longer context trips the assert instead of quietly over-selecting.
+        p.push((
+            "indexer queries + keys + top-k (ops 117/118), publishes the shared selection",
+            Part::Done,
+        ));
     }
     p.push((
         "attention core (interior rope + windowed absorbed MLA + sink merge + inverse rope)",
@@ -2283,8 +2700,8 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
     // 0, 0, 0] -- the trailing three are the DSpark blocks, not layers).
     if !matches!(c.raw.attn_kind(l), nn_graph::models::config::V41Attn::Window) {
         p.push((
-            "compressed-KV attention (reads the shared CSA2 cache; compress_ratios != 0)",
-            Part::Todo,
+            "compressed-KV attention (op 55 beside the window flash, merged at nsplit 2)",
+            Part::Done,
         ));
     }
     p.push(("output projection wo_a + wo_b (op 184)", Part::Done));

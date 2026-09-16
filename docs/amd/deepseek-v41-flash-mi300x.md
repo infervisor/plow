@@ -2509,6 +2509,98 @@ Nine checks, all passing. What op 185 does NOT yet have is an emit site: the com
 next piece, and it is one of the three Todo rows layers 2-39 still carry, beside the two-level
 indexer and the gathered read.
 
+### 12.16 All 40 layers emit: the indexer, and the read side of CSA2
+
+Three Todo rows closed, and the count goes **2 of 40 to 40 of 40**. None of the three needed a new
+algorithm; each needed one handle added to an op the tree already had, and the reading that says
+which handle.
+
+#### The selector op 55 was waiting for
+
+Op 55's own doc names the blocker: *"What kept this without an emit site is the SELECTOR, not the
+flash: a learned top-k needs T-row `IndexScore`/`IndexSelect`, which is a real design problem."*
+Ops 117/118 ARE that pair — built for GLM-5.3's lightning indexer — and V4.1's indexer is the same
+computation at the same `index_head_dim` 128 and the same 32 heads.
+`scripts/dsv41_indexer_oracle.py` puts op 117 at **1.1e-07 relative** against `Indexer.forward`'s
+own expression.
+
+Three differences, and only one needed a kernel change:
+
+  1. **The columns are POOLS.** V4.1's index keys are compressed entries, so a query reaches
+     `(t + 1) / ratio` of them, not `t + 1` — `compress_lens = arange(1, seqlen+1) // ratio`
+     (`model.py:564`). Op 118 already had `pool_size` at `i3`; op 117 did not, and now takes it at
+     `i4` under the same zero-means-1 rule, so no existing blob changes. The two MUST agree, and a
+     test holds them to the same number: a score written over a range the select never reads is
+     merely wasted, but a select ranking columns the score never wrote reads the arena.
+  2. **The indexer is REPLICATED**, and that is the tree's own standing recommendation rather than
+     this emit's preference. `d_index_score_pf_row` says so in a `static_assert`:
+     > `HIc % 32 == 0` — "the 32x32 MFMA A-tile is 32 index heads; HIc must be a multiple of it
+     > (replicate a sharded indexer instead)" … "NOT generalized below 32: HIc = 16 or 8 (V4 at
+     > TP4/TP8 with the indexer SHARDED) would leave half or three quarters of the A tile idle."
+     > `[DSV4-IDX]`
+     Column-parallel would give a rank 4 of 32 heads. The alternative — shard and all-reduce
+     `index_score` — is a `[T][compress_len]` f32 reduce: **268 MB per layer** at 8k and ratio 1,
+     on 8 layers. Replicating costs 5.2 MB of `wq_b` and 328 KB of `weights_proj` per rank and no
+     collective at all. Both shard tables now say `Replicated`.
+  3. **The two-level candidate stage is SKIPPED**, and that is a statement about 8k, not about the
+     model. `candidate_topk_blocks` 2048 × `candidate_block_size` 8 covers 16384 compressed
+     positions; 8k gives 8192 at ratio 1 and 4096 at ratio 2. Level one therefore keeps every
+     reachable block, and — the part worth checking rather than asserting — the mask level two
+     applies is a block-rounded **superset** of the reachability mask `Indexer.forward` has
+     *already* applied, so it removes nothing. The oracle's first form of this check claimed the
+     mask EQUALS reachability and failed with 68 differences; the true statement is the superset
+     one. `emit_dsv41_indexer` asserts the block count rather than assuming it, so a longer context
+     trips an assert instead of quietly over-selecting.
+
+#### The read side: two partials, one softmax, one sink
+
+`Attention.forward` runs **one** `sparse_attn` over `cat([window_kv, compress_kv])` with
+`cat([window_idxs, compress_idxs])`, and `sparse_attn_kernel_` adds `attn_sink` to the denominator
+once, after the last block. The emit produces that without materialising either concatenation:
+
+| | op | writes |
+|---|---|---|
+| window | `FlashMlaPrefill` (51), 128-token window | partial 0 |
+| compressed | `FlashGatherPrefill` (55), the CSA2 cache + the selection | partial 1 |
+| | `FlashMerge` (13) at `nsplit = 2`, `t3 = attn_sink` | `O` |
+
+Both flashes needed a **write-only output split**, `i7`: low 8 bits the partial index this call
+fills, next 8 the total. It does NOT divide the KV range — that is the merge's `nsplit`, which this
+then matches — it says where a call's partials LIVE, so two flashes over two DIFFERENT caches fill
+disjoint halves of one `(Opart, mlpart)` pair. Inside `d_flash_mla_decode` it is two indices and a
+`ONS`; `out_nsplit = 0` is the shipped layout and every existing emission keeps it.
+
+The alternative was the reference's literal `torch.cat`: copy the SHARED compressed cache into a
+per-layer buffer beside that layer's window K (8.4 MB per layer), and rewrite the index table by
+`+window_len`. The split avoids both, and it avoids the question of what a shared cache is doing
+inside a per-layer buffer.
+
+Not everything got cheaper: **38 of 40 layers now run a second flash**, and 8 of them run an indexer
+whose score is `[T][8192]` f32. Nothing here is measured yet — the emit is the claim, the hardware
+run is the next one.
+
+#### The compressor's tail, and one more missing build line
+
+`PLOW_DSV4_CSA2` was never passed by `build_gfx942.sh` — the C side, the ISA, the dispatch and
+`manifest.rs`'s `requires` all named it and nothing turned it into a `-D`. That is the **same
+defect, in the same file, as §12.14's Engram line**, and this time it was found before it cost a
+queue slot. It matters more now than it did: op 181 makes CSA2 reach every V4.1 layer rather than
+only the four with a compressor, so an object without it refuses a layer-0 packet that used to
+load.
+
+#### What the count means, and what it does not
+
+40 of 40 layers EMIT. That is the first half of the campaign goal and it is not the second: nothing
+in this section has run on a GPU, and the last measured projection was ~843 ms against 90 ms with
+38 layers doing strictly less work than they now do. The parts table is also per-layer, so it still
+says nothing about the model TAIL — `Transformer.forward:1268` spends the dangling `ffn_pre` on one
+final `hc_pre` — which a whole-model emit owes and a block emit cannot show.
+
+A rung is also allowed to be a chain that reads shared CSA2 state nothing in it wrote: `--block 3`
+attends over the cache layer 2 publishes. The emit now says so on stderr rather than leaving it to
+be discovered, and `every_activation_read_is_written_by_something` runs over five chain shapes —
+`[0]`, `[1]`, `[2,3]`, `[20]`, `[20,24]` — because no two of them read the same set.
+
 ### 12.2 What is still not demonstrated
 
   * ONE layer, not 40. The whole-model emit is still blocked on the subsystems

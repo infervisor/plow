@@ -312,6 +312,12 @@ __device__ void d_compress_pool(bf16* __restrict__ out, const bf16* __restrict__
  * override, with the same gate and the same slot arithmetic `d_compress_pool` takes, so a decode
  * packet that emits op 180 can emit this one beside it without patching immediates.
  *
+ * `n_head > 1` makes a row `[n_head][d]` and ropes every head at the SAME position -- which is
+ * what the indexer's queries are: `apply_rotary_emb(q[..., -rd:], freqs_cis[start:end])` over
+ * `[b, s, n_local_heads, index_head_dim]` (`model.py:550-552`), one angle per TOKEN, then
+ * `fp4_act_quant(q, 32, True)` over each head's whole 128. The quant block never spans two heads,
+ * so the two consumers of this op differ only in `n_head`, `qblk` and `qmode`.
+ *
  * `lds` must hold `d` floats. No `part`: there is no cross-channel reduction here.
  */
 __device__ void d_compress_rope_quant(bf16* __restrict__ out, const bf16* __restrict__ src,
@@ -320,12 +326,17 @@ __device__ void d_compress_rope_quant(bf16* __restrict__ out, const bf16* __rest
                                       unsigned rd, unsigned qblk, unsigned ratio,
                                       unsigned row_base, unsigned qmode, unsigned slice,
                                       unsigned nblk, float* __restrict__ lds,
-                                      const int* __restrict__ pos = nullptr) {
+                                      const int* __restrict__ pos = nullptr,
+                                      unsigned n_head = 1u) {
     if (pos != nullptr && ((pos[0] + 1) % (int)ratio) != 0) return;
     const unsigned rbase = (pos != nullptr) ? ((unsigned)pos[0] / ratio) : row_base;
 
-    for (unsigned r = slice; r < n_rows; r += nblk) {
-        const bf16* const srow = src + (size_t)(rbase + r) * d;
+    const unsigned items = n_rows * n_head;
+    for (unsigned it = slice; it < items; it += nblk) {
+        /* The POSITION is the row's, shared by all its heads; the OFFSET is the item's. */
+        const unsigned r = it / n_head;
+        const size_t off = (size_t)(rbase * n_head) + (size_t)it;
+        const bf16* const srow = src + off * d;
         for (unsigned c = threadIdx.x; c < d; c += PLOW_THREADS) lds[c] = bf2f(srow[c]);
         __syncthreads();
 
@@ -345,7 +356,7 @@ __device__ void d_compress_rope_quant(bf16* __restrict__ out, const bf16* __rest
             cmp_fake_quant_block(lds, b * qblk, qblk, qmode);
         __syncthreads();
 
-        bf16* const orow = out + (size_t)(rbase + r) * d;
+        bf16* const orow = out + off * d;
         for (unsigned c = threadIdx.x; c < d; c += PLOW_THREADS) orow[c] = f2bf(lds[c]);
         __syncthreads(); /* lds is reused by the next row */
     }
