@@ -662,7 +662,16 @@ AX_K3_A4W4="-DPLOW_L2_PLACE_DISPATCH=1"
 # result; the BM=64-vs-128 numbers above were taken that way and the EPI note is the only reason
 # they survive. Scope the guard to the assignment it belongs to.
 if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ]; then
-  MPF_BM="${MPF_BM:-192}"
+  # 512/BK=32, not 192/BK=64. The MoE pair is bound by the PER-TILE EXPERT-WEIGHT RELOAD, not by
+  # the padding op_moe.h warns about: at T=8192 BM=64 pads an average expert least and is 2.6x the
+  # WORST, and the pair falls monotonically with the tile. TP8 is what makes the per-tile cost
+  # bite, since `down`'s K is moe_intermediate/TP = 288 -- far too short a k-loop to amortise it.
+  # BK=32 halves the LDS tile ((BM+BN)*BK*2) so BM can pass the 192 that BK=64 caps it at, and
+  # each expert weight byte still crosses HBM exactly once. MEASURED, 3 passes at iters=10,
+  # MoE pair / layer min: 192k64 1583.7/14795.5, 384k32 998.4/14196.8, 512k32 868.4/14185.3 us
+  # -- -45.2% on the pair, -610 us/layer, ~-24 ms over 40 layers. Exits identical at every arm.
+  MPF_BM="${MPF_BM:-512}"
+  MPF_BK="${MPF_BK:-32}"
   # n_head = 64/TP, so TP8 gives 8 and GF=8 reads the gathered latent ONCE instead of twice:
   # FLASH_GATHER_PREFILL 3276 -> 3031 us, layer -321 us, exits identical. The dispatch falls back
   # to GF=4 when 8 does not divide n_head.

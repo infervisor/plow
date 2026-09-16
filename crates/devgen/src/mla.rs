@@ -1910,13 +1910,16 @@ fn glm_glu_halves(cus: &[u32]) -> (Vec<u32>, Vec<u32>) {
 /// `runtime/amd/op_moe.h`: the align op pads each expert's gathered-row range up to a whole tile, so
 /// the padded row bound is `T*k + n_exp*(MPF_BM-1)` and NOT `T*k`. Sizing the gathered arrays from
 /// `T*k` would be an out-of-bounds device write that is invisible at small expert counts.
-// 192, not 128 or 64: this is a SIZING upper bound, and the align op pads each expert to the
+// 512, not 192: this is a SIZING upper bound, and the align op pads each expert to the
 // OBJECT'S tile height, so the host buffer bound must cover the largest variant a build can
 // pick — undersizing is an out-of-bounds device write with no symptom at low expert counts
 // (the header note above). The OCC4 batched-decode object builds at MPF_BM=128 and V4.1's
-// prefill objects are swept over {64, 128, 192} (build_gfx942.sh). Costs ~31 MB/rank of fu_g
-// at T=8192, n_exp=256 -- the bound is paid in bytes whatever tile the object then picks.
-pub(crate) const MPF_BM: u32 = 192;
+// prefill objects are swept over {64, 128, 192, 384, 512} (build_gfx942.sh), which now DEFAULTS
+// to 512 at MPF_BK=32: the MoE pair is per-tile weight-reload bound, not padding bound, and the
+// tile is worth -45.2% on the pair and ~-24 ms over 40 layers. Costs ~60 MB/rank of fu_g at
+// T=8192 -- the bound is paid in bytes whatever tile the object then picks, and that is what
+// buys the tile.
+pub(crate) const MPF_BM: u32 = 512;
 
 /// `i[3]` on the router ops, bit by bit. Mirrors FLAGS in the B4 harness.
 ///

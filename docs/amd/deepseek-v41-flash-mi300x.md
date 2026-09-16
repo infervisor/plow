@@ -4893,7 +4893,20 @@ k-passes while each expert weight byte still crosses HBM exactly once -- the str
 form exists to amortise is unchanged. `MPF_BK` is now plumbed to the prefill row (it had only ever
 reached the decode row), and BM=384 and BM=512 at BK=32 both build.
 
-Measurement PENDING: the co-tenants took the whole machine mid-sweep (three PIDs at ~205 GB each,
-0 GB free on all eight), so even the control arm OOMed. The sizing bound in `mla.rs` stays at 192
-until a number justifies raising it -- 512 costs ~60 MB/rank of `fu_g`, paid whatever tile the
-object then picks.
+MEASURED, and the tile is taken. Three passes at iters=10, MoE pair and layer min:
+
+    MPF_BM/BK     MoE pair     layer min
+    192 / 64       1583.7       14795.5 us
+    384 / 32        998.4       14196.8
+    512 / 32        868.4       14185.3     <- new default
+
+Then end to end at the SHIPPED defaults, each arm being the packet its own code state emits with
+the objects that state builds, three passes at iters=10:
+
+    old (192/64)   MoE pair 1566.9 us   layer min 14721.3   median 14915.7
+    new (512/32)   MoE pair  870.7 us   layer min 13983.2   median 14248.8
+                             -44.4%           -738 us/layer, -5.0%
+
+Exits identical (-1.36719 / 3.64062) on all six runs. **-738 us/layer is ~-29.5 ms over 40 layers**
+(~572.4 -> ~543 ms). `mla.rs`'s sizing bound goes to 512 with it, costing ~60 MB/rank of `fu_g` --
+which is what buys the tile.
