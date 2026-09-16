@@ -3703,3 +3703,43 @@ Layer 2 at the committed defaults: **18,556 us**, from 20,458 at the start of §
     HYPER_CONN_PRE/POST     643/637  x2
     FLASH_MERGE             638
     FLASH_MLA_PREFILL       431
+
+### 12.33 One lane walking 256 bins was 78% of the top-k selector, and the ablation that found it was invalid
+
+`INDEX_SELECT_PF` (op 118) was fourth at 1286 us. It is an MSB-first radix top-k, one workgroup
+per query row: each pass histograms the row into `SEL_NB` = 256 LDS bins, then finds the bin
+holding the k-th key. That last step is a **serial descending walk on `tid == 0`**, one dependent
+LDS read per bin, run once per pass per row — 27 rows per block, four passes.
+
+    serial walk (PLOW_IDXSEL_SCAN=0)   1286 us   strag 288   layer 18488 us
+    wave-parallel scan (default 1)      278 us   strag  39   layer 17470 us
+
+**-78.4%**, and the layer moves 1018 us against an op delta of 1009. Exits identical to the last
+printed digit, which an integer suffix sum reassociated across lanes must give. The straggler
+collapses with it (288 -> 39): a one-lane walk whose length is data-dependent is exactly what
+makes workgroups finish at different times.
+
+Lane `l` owns the l-th group of `SEL_NB/PLOW_WAVE` = 4 bins counting DOWN from the top, so an
+exclusive `__shfl_up` scan over lanes IS `acc` at that group's first bin; the single lane whose
+running total crosses `k_rem` then walks 4 bins instead of 256. The last lane reproduces the
+serial walk's fall-through (total below `k_rem`: `dsel` 0, `acc` = the total, `bnd` 0) so the
+degenerate case stays byte-identical as well.
+
+**The ablation that led here was invalid, and that is the part worth keeping.**
+`PLOW_IDXSEL_ABL=1` deleted the histogram `atomicAdd` to price bin contention, and the op got
+SLOWER — 1269 -> 3423 us. A zero histogram never satisfies the boundary test, so `k_rem` never
+falls, `FAST_EXIT` never fires, and the prefix filter never narrows: the instrument changed the
+PASS COUNT from four to eight and left every pass unfiltered. **A ceiling instrument that deletes
+a term feeding a data-dependent exit is not a ceiling.** Every instrument that worked in this
+campaign deleted work whose AMOUNT was fixed by the packet — a k-loop tile count, a store, an
+address computation. This one deleted a term the control flow reads back.
+
+It was still informative by accident: 428 us per pass with no atomics at all pointed at the scan
+rather than at the atomics, which is what got measured next. But it went into the tree as a trap
+and came straight back out, along with `PLOW_IDXSEL_ABL=2` (the emit pass's slot atomic), which
+measured null — 1269 vs 1286 us, so stream compaction through one LDS counter costs nothing here.
+
+The same serial walk exists in `d_index_select_coop`, the decode twin. Not measured; this campaign
+is prefill.
+
+Layer 2 at the committed defaults: **17,477 us**, from 20,458 at the start of §12.29.

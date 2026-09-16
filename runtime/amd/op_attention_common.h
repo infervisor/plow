@@ -2874,6 +2874,14 @@ __device__ void d_flash_mla_prefill_fp8(float* __restrict__ Opart, float* __rest
 #ifndef PLOW_MLA_PF_MFMA_SPLIT
 #define PLOW_MLA_PF_MFMA_SPLIT 1
 #endif
+/* Wave-parallel boundary-bin scan in d_index_select_pf (op 118). The shipped scan walks up to
+ * SEL_NB=256 bins on ONE lane with a dependent LDS read each, once per radix pass per row; this
+ * splits the same descending suffix-sum across a wave. Identical dsel/acc/bnd by construction --
+ * it is the same sum in the same order, only reassociated across lanes, and the values are
+ * integer counts, so there is no rounding to move. 0 restores the serial walk. */
+#ifndef PLOW_IDXSEL_SCAN
+#define PLOW_IDXSEL_SCAN 1
+#endif
 /* CEILING INSTRUMENT for the head-packed gathered body. WRONG OUTPUT by construction; never a
  * serve asset. At n_head=8 (V4.1 at TP8) the arm has two known inefficiencies -- n_mtile==1 makes
  * all PLOW_WAVES waves recompute the SAME 32x32 score tile, and only 8 of 32 M-rows are live --
@@ -5755,6 +5763,47 @@ __device__ void d_index_select_pf(int* __restrict__ idx, const float* __restrict
                     atomicAdd(&lh[(unsigned)((key >> sh) & (SEL_NB - 1u))], 1u);
             }
             __syncthreads();
+#if PLOW_IDXSEL_SCAN
+            /* Descending suffix sum over SEL_NB bins, split across ONE wave: lane l owns the
+             * l-th group of SEL_NB/PLOW_WAVE bins counting DOWN from the top, so an exclusive
+             * scan over lanes is exactly `acc` at that group's first bin. The group is then
+             * walked serially -- GRP bins, not SEL_NB. */
+            if (tid < PLOW_WAVE) {
+                constexpr unsigned GRP = SEL_NB / PLOW_WAVE;
+                const unsigned l = tid;
+                const unsigned d0 = SEL_NB - 1u - l * GRP; /* this lane's FIRST (highest) bin */
+                unsigned sum = 0;
+                for (unsigned j = 0; j < GRP; j++) sum += lh[d0 - j];
+                /* exclusive prefix over lanes, ascending l == descending bin */
+                unsigned pre = sum;
+                for (unsigned off = 1; off < PLOW_WAVE; off <<= 1) {
+                    const unsigned v = __shfl_up(pre, off, PLOW_WAVE);
+                    if (l >= off) pre += v;
+                }
+                unsigned acc = pre - sum; /* count in every bin ABOVE this lane's group */
+                /* The k-th key lands in the one group whose running total crosses k_rem. Lanes
+                 * whose group ends below k_rem do nothing; the first that reaches it writes. */
+                /* Total below k_rem: reproduce the serial walk's fall-through exactly
+                 * (dsel 0, acc = the whole total, bnd 0). The last lane holds that total. */
+                if (l == PLOW_WAVE - 1u && pre < k_rem) {
+                    red[0] = 0;
+                    red[1] = pre;
+                    red[3] = 0;
+                }
+                if (acc < k_rem && acc + sum >= k_rem) {
+                    for (unsigned j = 0; j < GRP; j++) {
+                        const unsigned hd = lh[d0 - j];
+                        if (acc + hd >= k_rem) {
+                            red[0] = d0 - j;
+                            red[1] = acc;
+                            red[3] = hd;
+                            break;
+                        }
+                        acc += hd;
+                    }
+                }
+            }
+#else
             if (tid == 0) {
                 unsigned acc = 0, dsel = 0, bnd = 0;
                 for (int d = (int)SEL_NB - 1; d >= 0; d--) {
@@ -5770,6 +5819,7 @@ __device__ void d_index_select_pf(int* __restrict__ idx, const float* __restrict
                 red[1] = acc;
                 red[3] = bnd; /* population of the boundary bin (the tied group at this digit) */
             }
+#endif
             __syncthreads();
             prefix |= (unsigned long long)red[0] << sh;
             himask |= 0xFFull << sh;

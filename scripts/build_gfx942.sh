@@ -1080,6 +1080,12 @@ if [ -n "${PLOW_MLA_PF_MFMA_SPLIT:-}" ]; then
   AX_FLASH="$AX_FLASH -DPLOW_MLA_PF_MFMA_SPLIT=${PLOW_MLA_PF_MFMA_SPLIT}"
 fi
 
+# PLOW_IDXSEL_SCAN=0: restore the top-k selector's serial 256-bin boundary walk (the A/B control).
+if [ -n "${PLOW_IDXSEL_SCAN:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_IDXSEL_SCAN=${PLOW_IDXSEL_SCAN}"
+  AX_FLASH="$AX_FLASH -DPLOW_IDXSEL_SCAN=${PLOW_IDXSEL_SCAN}"
+fi
+
 # CEILING INSTRUMENT ONLY (PLOW_FA_GMFMA_ABL): deletes one term of the head-packed gathered flash
 # to price it. WRONG OUTPUT by construction, never a serve asset. See op_attention_common.h.
 if [ "${PLOW_FA_GMFMA_ABL:-0}" != 0 ]; then
