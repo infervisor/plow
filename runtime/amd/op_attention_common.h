@@ -2858,6 +2858,21 @@ __device__ void d_flash_mla_prefill_fp8(float* __restrict__ Opart, float* __rest
 #ifndef PLOW_MLA_PF_MFMA
 #define PLOW_MLA_PF_MFMA 1
 #endif
+/* Route FLASH_GATHER_PREFILL to the head-packed MFMA body (d_flash_gather_prefill_mfma) instead
+ * of the scalar d_flash_gather_prefill. Opt-in until hardware ranks it. */
+#ifndef PLOW_FA_GATHER_MFMA
+#define PLOW_FA_GATHER_MFMA 0
+#endif
+/* CEILING INSTRUMENT for the head-packed gathered body. WRONG OUTPUT by construction; never a
+ * serve asset. At n_head=8 (V4.1 at TP8) the arm has two known inefficiencies -- n_mtile==1 makes
+ * all PLOW_WAVES waves recompute the SAME 32x32 score tile, and only 8 of 32 M-rows are live --
+ * and these price them before either is worth fixing.
+ *   1 = QK contracts 1/8 of its k-steps (prices the redundant score tile)
+ *   2 = PV skipped                      (prices the O accumulation)
+ *   3 = the LDS staging loop skipped    (prices the gathered latent read) */
+#ifndef PLOW_FA_GMFMA_ABL
+#define PLOW_FA_GMFMA_ABL 0
+#endif
 /* WAVES PER QUERY M-TILE. Four on CDNA4; on CDNA3 every wave shares ONE M-tile.
  *
  * This is an LDS decision, not a tuning one. The arena is Qsm[BQ][DK+DR+PAD] + Ksm + P, and
@@ -4501,8 +4516,16 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
                                         unsigned n_head, unsigned kv_stride, unsigned window,
                                         float scale, unsigned nsplit, unsigned kv_mask,
                                         unsigned slice, unsigned nblk, float* lds_,
-                                        const int* __restrict__ idx = nullptr, unsigned top_k = 0) {
-    (void)window; (void)kv_mask;
+                                        const int* __restrict__ idx = nullptr, unsigned top_k = 0,
+                                        /* PREFILL QUERY AXIS. Decode's work item is one (batch,
+                                         * split); a prefill chunk carries n_tok queries, and for
+                                         * GATHER each one owns its OWN top_k row -- which is the
+                                         * axis that makes this head-packed arm the only MFMA body
+                                         * a gathered prefill can take. The query-row-tiled
+                                         * `d_flash_mla_prefill_mfma` stages ONE K tile for a tile
+                                         * of query rows, and gathered rows share no KV range. */
+                                        unsigned n_tok = 1, unsigned out_nsplit = 0,
+                                        unsigned out_sp0 = 0) {
     constexpr int BKV = 32;                            /* one MFMA N-tile of KV per pass  */
     constexpr int STRIDE = FA_MLA_MFMA_STRIDE(DK, DR); /* Ksm row stride (latent|rope)    */
     constexpr int NK_ABS = DK / MFMA_K;                /* QK k-steps over the latent      */
@@ -4532,20 +4555,29 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
     const unsigned ndt = cpw / MFMA_N;                 /* out d-tiles this wave (<=MAXNDT) */
     const unsigned h_tile0 = m_tile * 32;              /* first head of this M-tile        */
 
-    const unsigned n_work = n_batch * nsplit;
+    const unsigned n_work = n_batch * n_tok * nsplit;
+    const unsigned ONS = out_nsplit ? out_nsplit : nsplit;
     for (unsigned w = slice; w < n_work; w += nblk) {
         const unsigned sp = w % nsplit;
-        const unsigned b = w / nsplit;
+        const unsigned qt = (w / nsplit) % n_tok;      /* query token; always 0 at n_tok=1 */
+        const unsigned b = w / (nsplit * n_tok);
         const unsigned len = (unsigned)kv_len[b];
-        const unsigned first = 0u;
-        const unsigned span = GATHER ? top_k : (len - first);
+        /* Query token qt of this chunk sits at len-n_tok+qt. Decode (n_tok=1) gives len-1. */
+        const unsigned cend = len - n_tok + qt + 1;
+        /* Only min(top_k, len) slots of idx[] were ever produced -- past that the table holds
+         * STALE rows, and GATHER applies no mask beyond `kv < hi`. Same expression
+         * d_index_select clamps to, off the same kv_len operand. */
+        const unsigned tk_live = GATHER ? (top_k < len ? top_k : len) : 0u;
+        const unsigned first = GATHER ? 0u : ((window && cend > window) ? (cend - window) : 0u);
+        const unsigned span = GATHER ? tk_live : (cend - first);
         const unsigned per = (span + nsplit - 1) / nsplit;
         const unsigned lo = first + sp * per;
-        const unsigned hi = GATHER ? (lo + per < top_k ? lo + per : top_k)
-                                   : (lo + per < len ? lo + per : len);
+        const unsigned hi = GATHER ? (lo + per < tk_live ? lo + per : tk_live)
+                                   : (lo + per < cend ? lo + per : cend);
         const auto* cbase = as_glob(Ckv) + (size_t)b * kv_stride * DK;
         const auto* rbase = as_glob(Krope) + (size_t)b * kv_stride * DR;
-        const int* ibase = GATHER ? idx + (size_t)b * top_k : nullptr;
+        const int* ibase = GATHER ? idx + ((size_t)b * n_tok + qt) * top_k : nullptr;
+        const size_t qrow = ((size_t)b * n_tok + qt) * n_head;
 
         f32x16 oacc[MAXNDT];
 #pragma unroll
@@ -4557,11 +4589,14 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
         for (unsigned kv0 = lo; kv0 < hi; kv0 += BKV) {
             /* Stage the latent|rope tile to LDS ONCE, cooperatively across all 512 threads. */
             __syncthreads();
-            for (unsigned e = tid; e < BKV * DK; e += PLOW_THREADS) {
+            for (unsigned e = tid; e < (PLOW_FA_GMFMA_ABL == 3 ? 0u : BKV * DK); e += PLOW_THREADS) {
                 const unsigned r = e / DK, c = e % DK, kv = kv0 + r;
                 bf16 v = 0;
-                if (kv < hi) {
-                    const size_t row = GATHER ? fa_gather_row(ibase[kv]) : (size_t)kv;
+                /* A gathered slot may be the -1 PAD d_index_select_pf writes when a query has
+                 * fewer than top_k candidates. fa_gather_row maps it to row 0, so it must be
+                 * masked here AND in the softmax, or row 0 gets real weight. */
+                if (kv < hi && (!GATHER || ibase[kv] >= 0)) {
+                    const size_t row = GATHER ? fa_gather_row(ibase[kv]) : (size_t)(kv & kv_mask);
                     v = cbase[row * DK + c];
                 }
                 Ksm[r * STRIDE + c] = v;
@@ -4569,8 +4604,8 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
             for (unsigned e = tid; e < BKV * DR; e += PLOW_THREADS) {
                 const unsigned r = e / DR, c = e % DR, kv = kv0 + r;
                 bf16 v = 0;
-                if (kv < hi) {
-                    const size_t row = GATHER ? fa_gather_row(ibase[kv]) : (size_t)kv;
+                if (kv < hi && (!GATHER || ibase[kv] >= 0)) {
+                    const size_t row = GATHER ? fa_gather_row(ibase[kv]) : (size_t)(kv & kv_mask);
                     v = rbase[row * DR + c];
                 }
                 Ksm[r * STRIDE + DK + c] = v;
@@ -4580,7 +4615,7 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
             /* QK: S[head, kv] = Q_abs.C_kv + Q_rope.K_rope, one 32x32 tile (this M-tile). */
             f32x16 s = (f32x16)(0.0f);
 #pragma unroll
-            for (int kk = 0; kk < NK; kk++) {
+            for (int kk = 0; kk < (PLOW_FA_GMFMA_ABL == 1 ? NK / 8 : NK); kk++) {
                 const unsigned d0 = mfma_frag_k(lane, kk * MFMA_K);
                 bf16x8 qf, kf;
                 /* Q fragment: abs for k-steps over [0,DK), rope for [DK,DK+DR). */
@@ -4589,8 +4624,8 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
                 bf16 q8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                 if (qv) {
                     const bf16* qp = (d0 < (unsigned)DK)
-                        ? as_glob(Qabs) + ((size_t)b * n_head + qh) * DK + d0
-                        : as_glob(Qrope) + ((size_t)b * n_head + qh) * DR + (d0 - DK);
+                        ? as_glob(Qabs) + (qrow + qh) * DK + d0
+                        : as_glob(Qrope) + (qrow + qh) * DR + (d0 - DK);
                     __builtin_memcpy(q8, qp, 16);
                 }
 #pragma unroll
@@ -4604,11 +4639,15 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
 
             /* Online softmax over this KV tile (row = head lives in one half-wave). */
             float p[16];
+            /* kv is the lane's accumulator COLUMN, so it is the same for all 16 rows: one
+             * index load per thread per tile, not sixteen. */
+            const unsigned kg = kv0 + accn;
+            bool kv_ok = (kg < hi);
+            if (GATHER && kv_ok) kv_ok = (ibase[kg] >= 0);
 #pragma unroll
             for (int i = 0; i < 16; i++) {
                 const unsigned qh = h_tile0 + mfma_acc_m(lane, i);
-                const unsigned kg = kv0 + accn;
-                const bool valid = (qh < n_head) && (kg < hi);
+                const bool valid = (qh < n_head) && kv_ok;
                 p[i] = valid ? (s[i] * FA_SCALE(scale)) : FA_NEG_INF;
             }
 #pragma unroll
@@ -4631,8 +4670,13 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
             for (int i = 0; i < 16; i++) myP[mfma_acc_m(lane, i) * BKV + accn] = f2bf(p[i]);
             __syncthreads();
 
-            /* O += P . V, V = the latent slice (Ksm cols [ncol0, ncol0+cpw)). */
-            for (unsigned t = 0; t < ndt; t++) {
+            /* O += P . V, V = the latent slice (Ksm cols [ncol0, ncol0+cpw)).
+             * MAXNDT and not `ndt`: oacc is a REGISTER array and a runtime index spills the
+             * whole accumulator to scratch. The bound is constant, the excess predicated off. */
+#pragma unroll
+            for (int t = 0; t < MAXNDT; t++) {
+                if (PLOW_FA_GMFMA_ABL == 2) break;
+                if ((unsigned)t >= ndt) break;
 #pragma unroll
                 for (int ks = 0; ks < BKV; ks += MFMA_K) {
                     const unsigned kk = mfma_frag_k(lane, ks);
@@ -4642,7 +4686,7 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
 #pragma unroll
                     for (int j = 0; j < 8; j++) {
                         bf16_t v; __builtin_memcpy(&v, &tp[j], 2); pf[j] = v;
-                        bf16 vv = Ksm[(kk + j) * STRIDE + ncol0 + t * MFMA_N + accn];
+                        bf16 vv = Ksm[(kk + j) * STRIDE + ncol0 + (unsigned)t * MFMA_N + accn];
                         bf16_t vb; __builtin_memcpy(&vb, &vv, 2); vf[j] = vb;
                     }
                     oacc[t] = plow_mfma_bf16_32x32(pf, vf, oacc[t]);
@@ -4651,14 +4695,16 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
         }
 
         /* Emit latent-wide partials (o, m, l) — same layout the scalar kernel writes. */
-        for (unsigned t = 0; t < ndt; t++) {
+#pragma unroll
+        for (int t = 0; t < MAXNDT; t++) {
+            if ((unsigned)t >= ndt) break;
 #pragma unroll
             for (int i = 0; i < 16; i++) {
                 const unsigned mh = mfma_acc_m(lane, i);
                 const unsigned qh = h_tile0 + mh;
                 if (qh >= n_head) continue;
-                const unsigned d = ncol0 + t * MFMA_N + accn;
-                float* op = Opart + ((size_t)(b * n_head + qh) * nsplit + sp) * DK + d;
+                const unsigned d = ncol0 + (unsigned)t * MFMA_N + accn;
+                float* op = Opart + ((qrow + qh) * ONS + out_sp0 + sp) * DK + d;
                 *op = oacc[t][i];
             }
         }
@@ -4670,7 +4716,7 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
                 const unsigned qh = h_tile0 + mh;
                 if (qh >= n_head) continue;
                 if (accn == 0) { /* one lane per row writes */
-                    float* ml = mlpart + ((size_t)(b * n_head + qh) * nsplit + sp) * 2;
+                    float* ml = mlpart + ((qrow + qh) * ONS + out_sp0 + sp) * 2;
                     st_act<float>(&ml[0], m_st[i]);
                     st_act<float>(&ml[1], l_st[i]);
                 }
@@ -4678,6 +4724,32 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
         }
         __syncthreads();
     }
+}
+
+/* GATHERED prefill, HEAD-PACKED MFMA. The scalar `d_flash_gather_prefill` above re-streams the
+ * gathered latent once per HEAD-GROUP and does every score and every PV MAC on the vector ALU;
+ * PLOW_FA_GATHER_ABL proved the op is bound by that arithmetic and not by the scatter (3278 ->
+ * 3187 us, -2.8%, with every address tamed to a 64-row window). This body puts the same math on
+ * the matrix core: one work item is one query token, all n_head heads ride the MFMA M-dimension,
+ * and the token's own top_k set stages to LDS once.
+ *
+ * nsplit is 1 (a prefill split is empty for early tokens), so `out_nsplit`/`out_sp0` carry the
+ * V4.1 two-partial layout through unchanged. */
+template <int DK, int DR>
+__device__ void d_flash_gather_prefill_mfma(float* __restrict__ Opart, float* __restrict__ mlpart,
+                                            const bf16* __restrict__ Qabs,
+                                            const bf16* __restrict__ Qrope,
+                                            const bf16* __restrict__ Ckv,
+                                            const bf16* __restrict__ Krope,
+                                            const int* __restrict__ kv_len,
+                                            const int* __restrict__ idx, unsigned top_k,
+                                            unsigned n_batch, unsigned n_tok, unsigned n_head,
+                                            unsigned kv_stride, float scale, unsigned kv_mask,
+                                            unsigned slice, unsigned nblk, float* lds,
+                                            unsigned out_nsplit = 0, unsigned out_sp0 = 0) {
+    d_flash_mla_decode_mfma<DK, DR, /*GATHER=*/true>(
+        Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len, n_batch, n_head, kv_stride, /*window*/ 0,
+        scale, /*nsplit*/ 1, kv_mask, slice, nblk, lds, idx, top_k, n_tok, out_nsplit, out_sp0);
 }
 
 /* ATTN_SELECT — on-device top-k KV selection (DeepSeek DSA).            [DEEPSEEK-MLA]

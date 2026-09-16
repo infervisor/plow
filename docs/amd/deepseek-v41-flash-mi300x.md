@@ -3539,3 +3539,70 @@ wins found the same way. **The instrument is not a formality.**
     2.8% of the time, and the gap is in `GEMV_F32` (134.8 ms), `GEMM_FP8_MX`
     (129.9), `MOE_GROUP_DOWN_PF` (109.5), `HYPER_CONN_PRE` (102.8) and
     `XREDUCE2` (86.1, of which 99% is straggler).
+
+### 12.30 The head-packed MFMA gathered flash is correct, and structurally wrong at TP8
+
+§12.29 closed with the one claim the gather ablation left standing: `FLASH_GATHER_PREFILL`
+(3.25 ms, the layer's largest op) is bound by its SCALAR ARITHMETIC, and only the matrix pipe
+addresses that. The tree already held a validated matrix body —
+`d_flash_mla_decode_mfma` (op_attention_common.h), "CORRECT (mla_test PASS incl n_head=64
+dense+gather) but NON-DEFAULT" — and its rejection note is decode-specific ("filling 256 CUs
+needs nsplit~256"), which a prefill with 8192 query work items does not hit.
+
+It is also the ONLY matrix body a gathered prefill can take. `d_flash_mla_prefill_mfma` tiles
+QUERY ROWS into M and stages one K tile for the tile, and a gathered prefill's rows share no KV
+range — the interpreter says so at the dispatch. The head-packed arm puts HEADS in M, and all of
+a token's heads share that token's top-k set. So one work item = one query token, and the port is
+a query axis: `n_work = n_batch * n_tok * nsplit`, `ibase = idx + (b*n_tok + t)*top_k`,
+`qrow = (b*n_tok + t)*n_head`, plus the two masks the decode arm had no reason to carry —
+`tk_live = min(top_k, len)` and the `-1` PAD `d_index_select_pf` writes for a query with fewer
+than top_k candidates (`fa_gather_row` maps PAD to row 0, so unmasked it gives row 0 real weight).
+
+**It is correct.** `PLOW_FA_GATHER_MFMA=1` on the single block reproduces the exit to the last
+printed digit: min -1.36719, max 3.64062, mean -0.000712, the same digits every bit-identical
+knob in §12.29 produced. Which is the whole value of the port, and is not the same as being fast.
+
+    FLASH_GATHER_PREFILL body, layer 2, T=8192, TP8, median of 5:
+
+      scalar (default)                      3267 us
+      MFMA, first build                    17064 us     5.2x SLOWER
+      MFMA, oacc index made compile-time    7604 us     2.3x slower
+
+The first build's `oacc[t]` was indexed by the RUNTIME `ndt`. It is a register array, so a runtime
+index spills the whole accumulator to scratch — object scratch ops 2641 -> 2869. Walking the
+constant `MAXNDT` and predicating the excess puts it back in registers (2637, below the control)
+and recovers 2.2x. That is the only free win in this shape.
+
+**A three-way ceiling instrument then kills it.** `PLOW_FA_GMFMA_ABL` deletes one term at a time:
+
+      full                                  7686 us
+      1  QK contracts 1/8 of its k-steps    6191 us    -1495
+      2  PV deleted entirely                7628 us      -58
+      3  LDS staging loop deleted           4752 us    -2933
+
+Staging 2933, QK 1700, PV nothing — and a **remainder of ~3050 us that none of the three touches**.
+With the gathered latent read free AND the score contraction free, the floor is still the scalar
+arm's measured 3267. There is no tuning inside this shape that wins.
+
+The remainder is the online-softmax scaffolding, and the reason is LDS arithmetic. `FA_DEC_TILE`
+is `PLOW_THREADS` = 512, so the scalar arm walks a query's whole 512-slot gathered set in ONE
+pass: one max, one sum, one correction. The MFMA arm stages `Ksm[BKV][DK+pad]`, and at DK=512
+that caps BKV at 32 — 16 passes per query, each with three `__syncthreads()`, sixteen `FA_EXP`
+and thirty-two half-wave reductions. **Sixteen times the softmax scaffolding, and at TP8
+`n_head = 64/8 = 8`, so only 8 of the 32 MFMA M-rows are live while it is paid.** Raising BKV to
+64 needs `Ksm` at 66.5 KB against a 64,720 B arena. The shape is not reachable.
+
+So the head-packed body wants `n_head >= 32` and V4.1 at TP8 has 8. Kept at
+`PLOW_FA_GATHER_MFMA=0`: correct, measured, and the validated foundation for the one shape that
+is left.
+
+**That shape is §12.27's union table, re-motivated.** §12.29 dismissed it on the gather ablation
+(-2.8%), and that was the wrong reading of the right number: `PLOW_FA_GATHER_ABL` prices the
+SCATTER, and the union table's value is not locality at all. It is that a per-64-query union set
+lets the QUERY-ROW-tiled MFMA arm run — 64 query rows fill two M-tiles completely, and the
+softmax scaffolding is paid once per 64 queries instead of once per query, which is exactly the
+~3050 us this section could not delete. The cost is arithmetic: each query attends |U| positions
+and masks down to its own 512, so the design pays |U|/512 and needs the union of 64 adjacent
+queries' top-512 sets over layer 2's 4096-row compressed cache to come in under ~2048. That
+number is measurable from the shipped `idx[]` before any kernel is written, and measuring it is
+the next step rather than building it.

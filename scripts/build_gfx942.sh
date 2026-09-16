@@ -1054,6 +1054,22 @@ if [ "${PLOW_FA_GATHER_ABL:-0}" != 0 ]; then
   AX_FLASH="$AX_FLASH -DPLOW_FA_GATHER_ABL=${PLOW_FA_GATHER_ABL}"
 fi
 
+# PLOW_FA_GATHER_MFMA=1: route FLASH_GATHER_PREFILL to the head-packed MFMA body. One work item
+# is one query token with all n_head heads in the MFMA M-dimension, so the token's own top_k set
+# stages to LDS once and the scores and PV run on the matrix core. Correct output; opt-in until
+# hardware ranks it against the scalar arm.
+if [ "${PLOW_FA_GATHER_MFMA:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_FA_GATHER_MFMA=${PLOW_FA_GATHER_MFMA}"
+  AX_FLASH="$AX_FLASH -DPLOW_FA_GATHER_MFMA=${PLOW_FA_GATHER_MFMA}"
+fi
+
+# CEILING INSTRUMENT ONLY (PLOW_FA_GMFMA_ABL): deletes one term of the head-packed gathered flash
+# to price it. WRONG OUTPUT by construction, never a serve asset. See op_attention_common.h.
+if [ "${PLOW_FA_GMFMA_ABL:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_FA_GMFMA_ABL=${PLOW_FA_GMFMA_ABL}"
+  AX_FLASH="$AX_FLASH -DPLOW_FA_GMFMA_ABL=${PLOW_FA_GMFMA_ABL}"
+fi
+
 # MPF_BM A/B escape hatch for the PREFILL objects (the decode row has carried its MPF_BK twin
 # since the OCC4 recut). The grouped MoE prefill GEMM is the term that binds once attention is
 # sparse -- 11.8 ms per layer per rank, 87.7 TF/s, 3.4% of this part's fp8 peak -- and TP8 is

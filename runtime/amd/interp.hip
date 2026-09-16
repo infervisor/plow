@@ -2143,6 +2143,17 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
     const unsigned osp0 = in->i[7] & 0xffu;
     const unsigned ons = (in->i[7] >> 8) & 0xffu;
     if (in->op == PLOW_DOP_FLASH_GATHER_PREFILL) {
+#if PLOW_FA_GATHER_MFMA
+        /* NoPE only: V4.1's compressed pass is the sole gathered emit and it is DR=0 (i3 bit 31),
+         * so the MFMA body's rope addendum has no caller to validate it. */
+        if (nope)
+            d_flash_gather_prefill_mfma<512, 0>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), (const int*)TEN(7),
+                in->i[6], in->i[0], in->i[4], in->i[1], in->i[2], in->fj[0].f, in->i[5], slice,
+                nblk, lds, ons, osp0);
+        else
+#endif
         if (nope && gf == 2)
             d_flash_gather_prefill<512, 0, 2>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
