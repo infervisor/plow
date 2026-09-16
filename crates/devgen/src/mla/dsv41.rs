@@ -659,6 +659,34 @@ pub(crate) fn declare_dsv41_mhc(b: &mut Builder, c: &Dsv41Cfg, t: u32) -> Dsv41M
     }
 }
 
+/// The peer slot UNIT for this packet: the widest per-token collective message it carries.
+///
+/// # Why this is not just `c.hidden`
+///
+/// `DevBlob::parse` recovers two numbers from the collectives and nothing else: `hidden` as
+/// `max(i[0] / program.t)` and `slot_bytes` as `max(i[2])`, the byte offset of partial slot B.
+/// `AmdTpGroup::load` then REFUSES a packet where `slot_bytes % (hidden * 2) != 0`, because it
+/// divides one by the other to recover `max_tokens`.
+///
+/// Every collective in this model is `hidden` = 5120 wide except ONE: Engram's all-reduce of the
+/// row-split gather, which is `n_cols * head_dim` = 6144. That single op raises the recovered
+/// `hidden` to 6144 while the routed combine's slot offset stays at `t * 5120 * 2`, and
+/// 83 886 080 is not a multiple of 12 288 -- so a layer-1 packet built with `c.hidden` here
+/// LOADS NOWHERE. It is caught at load rather than silently, which is the good case, but it is
+/// caught after an object build and a queue wait.
+///
+/// So the unit is the max, and it is conditional on the chain actually containing an engram
+/// layer: widening it unconditionally would break every OTHER packet the same way, since their
+/// recovered `hidden` stays 5120 and 6144-based offsets are not multiples of 10 240 either.
+pub(crate) fn dsv41_peer_width(c: &Dsv41Cfg, layers: &[u32]) -> u32 {
+    if layers.iter().any(|l| c.engram_layers.contains(l)) {
+        c.hidden
+            .max(engram_cols(c) * c.raw.engram_head_dim as u32)
+    } else {
+        c.hidden
+    }
+}
+
 /// Engram's scratch, declared only for a chain that contains an engram layer.
 ///
 /// `ids` is an INPUT, not an activation: the n-gram hash is integer work over token ids alone
@@ -957,6 +985,7 @@ pub(crate) fn emit_dsv41_moe(
     shared: (u32, u32),
     xgate: &mut u32,
     cus: &[u32],
+    peer_w: u32,
 ) -> u32 {
     let shared_pre = Some(shared.1);
     assert_eq!(
@@ -1036,7 +1065,9 @@ pub(crate) fn emit_dsv41_moe(
     n.row_gate = sc.row_gate;
     n.fu_g = sc.fu_g;
     n.fu_scale = sc.fu_scale;
-    n.slot_b = (t as u64 * c.hidden as u64 * 2) as u32;
+    // The UNIT, not this op's width: see `dsv41_peer_width`. The combine writes `t * hidden * 2`
+    // at this offset either way; what changes is where slot B begins.
+    n.slot_b = (t as u64 * peer_w as u64 * 2) as u32;
     super::emit_glm_moe_ffn_prefill(
         b,
         &gc,
@@ -1700,6 +1731,7 @@ pub(crate) fn emit_dsv41_block(
     let sin = tb.tensor_gen("in.sin", sin_t.byte_len(), sin_t);
     let mhc = declare_dsv41_mhc(&mut tb, c, t);
     let engram = declare_dsv41_engram(&mut tb, c, layers, t);
+    let peer_w = dsv41_peer_width(c, layers);
     let tensors = tb.tensors();
     let gen = tb.gen_tensors();
 
@@ -1773,6 +1805,7 @@ pub(crate) fn emit_dsv41_block(
         );
         let c_moe = emit_dsv41_moe(
             &mut b, c, &w, l, tp, t, xnext, ffn.xn, c_sh, (ffn.sh_out, c_sh), &mut xgate, &all,
+            peer_w,
         );
         // CAPTURED, not discarded: it is the next layer's only dependency, and the thing that
         // makes the chain a chain rather than 40 layers racing on one residual buffer.

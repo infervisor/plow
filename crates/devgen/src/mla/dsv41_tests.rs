@@ -1006,7 +1006,7 @@ fn the_routed_experts_run_glms_prefill_body_at_v41_shapes() {
     // The shared expert is emitted separately (block-FP8, op 184); the MoE body only combines it.
     let sh = b.tensor("act.shared", (t as u64) * (cfg.hidden as u64) * 2);
     super::dsv41::emit_dsv41_moe(
-        &mut b, &cfg, &w, 0, tp, t, x_out, xn2, c_norm, (sh, c_norm), &mut xgate, &all,
+        &mut b, &cfg, &w, 0, tp, t, x_out, xn2, c_norm, (sh, c_norm), &mut xgate, &all, cfg.hidden,
     );
     let p = b.finish();
 
@@ -1677,6 +1677,57 @@ fn engram_is_the_first_part_of_its_layer_not_an_ffn_one() {
         } else {
             assert!(at.is_none(), "layer {l} is not an engram layer");
         }
+    }
+}
+
+/// The peer region's two recovered numbers must DIVIDE, for every emittable layer.
+///
+/// `DevBlob::parse` recovers `hidden = max(i[0] / program.t)` and `slot_bytes = max(i[2])` over the
+/// collectives -- nothing else -- and `AmdTpGroup::load` then computes
+/// `max_tokens = slot_bytes / (hidden * 2)`, REFUSING the packet unless the division is exact.
+///
+/// This is not hypothetical. Engram's all-reduce of the row-split gather is 6144 wide where every
+/// other collective in the model is `hidden` = 5120, so a layer-1 packet whose slot unit was built
+/// from `c.hidden` recovered `hidden = 6144` against `slot_bytes = 8192 * 5120 * 2`, and
+/// 83 886 080 is not a multiple of 12 288. It loaded NOWHERE. The failure was loud, but it
+/// surfaced after an emit, an object build and a queue wait; here it is one test.
+#[test]
+fn the_peer_slot_unit_divides_the_widest_collective() {
+    let Some((cfg, _)) = checkpoint() else {
+        return;
+    };
+    let _guard = crate::test_env::env_guard();
+    let t = 256u32;
+
+    for l in (0..cfg.layers).filter(|l| super::dsv41::dsv41_emit_block_plan(&cfg, *l).is_ok()) {
+        let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[l], 8, 304, 2048, t);
+        let p = &m.progs[0];
+        let collective = [
+            DevOp::XReduce as u16,
+            DevOp::XReduceScatter as u16,
+            DevOp::XReduceTwoShot as u16,
+        ];
+        let (mut hidden, mut slot_bytes) = (0u32, 0u64);
+        for d in p.insts.iter().filter(|d| collective.contains(&d.op)) {
+            hidden = hidden.max(d.i[0] / t.max(1));
+            slot_bytes = slot_bytes.max(d.i[2] as u64);
+        }
+        assert!(hidden > 0, "layer {l} emits no collective at tp=8");
+        assert!(slot_bytes > 0, "layer {l} recovers a zero slot unit");
+        let msg = u64::from(hidden) * 2;
+        assert_eq!(
+            slot_bytes % msg,
+            0,
+            "layer {l}: the packet recovers hidden={hidden} and slot_bytes={slot_bytes}, and \
+             {slot_bytes} % {msg} != 0 -- AmdTpGroup::load divides these to get max_tokens and \
+             refuses the packet when it does not come out exact"
+        );
+        // And the unit has to be big enough to HOLD the widest partial, not merely divide it.
+        assert!(
+            slot_bytes >= u64::from(t) * u64::from(hidden) * 2,
+            "layer {l}: slot B begins at {slot_bytes}, inside the {} B slot A needs",
+            u64::from(t) * u64::from(hidden) * 2
+        );
     }
 }
 
