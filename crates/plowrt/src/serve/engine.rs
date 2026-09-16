@@ -2920,11 +2920,11 @@ mod amd_serve {
                 Ranks::Tp(g) => g.deferred_token_capture_available(),
             };
             if !available
-                || feeds.iter().enumerate().any(|(i, &(slot, _))| {
-                    self.live.get(slot).copied() != Some(true)
-                        || self.pf.get(slot).is_none_or(Option::is_some)
-                        || feeds[..i].iter().any(|&(previous, _)| previous == slot)
-                })
+                || !multistep_feeds_armable(
+                    feeds,
+                    |slot| self.live.get(slot).copied() == Some(true),
+                    |slot| self.pf.get(slot).is_none_or(Option::is_some),
+                )
                 || crate::config::RuntimeConfig::get().amd.ctr_snap.is_some()
                 || crate::config::RuntimeConfig::get().amd.tens_snap.is_some()
             {
@@ -3380,12 +3380,38 @@ mod amd_serve {
         }
     }
 
+    /// Whether a deferred-read quantum may cover `feeds`.
+    ///
+    /// Every fed slot must be live, must carry no prefill cursor of its OWN, and must appear
+    /// once. Note what is deliberately absent: any condition on a slot that is not fed. A
+    /// slot still mid-prefill has produced no token, so the mux never feeds it, and
+    /// `multi_step` advances nothing but the slots it is handed — a prefill cursor moves
+    /// only when the host calls `prefill_chunk_rows` on a later tick. So a finished sequence
+    /// may take a full quantum while a neighbour is still prefilling; the only thing the
+    /// quantum changes for that neighbour is WHEN its next chunk is issued.
+    ///
+    /// `pf_pending` reports true for an out-of-range slot as well, which `live` already
+    /// refuses — both are kept so neither can be the only bound.
+    #[inline]
+    fn multistep_feeds_armable(
+        feeds: &[(usize, u32)],
+        live: impl Fn(usize) -> bool,
+        pf_pending: impl Fn(usize) -> bool,
+    ) -> bool {
+        !feeds.iter().enumerate().any(|(i, &(slot, _))| {
+            !live(slot)
+                || pf_pending(slot)
+                || feeds[..i].iter().any(|&(previous, _)| previous == slot)
+        })
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{
             commit_mixed_prefill, commit_packed_prefill, invalidate_prefix_metadata,
             mixed_cursor_rows, mixed_prefill_continuation_fits, mixed_prefill_padding_fits,
             packable_prefill_step, parse_snapshot_tensors, snapshot_file_component,
+            multistep_feeds_armable,
             slot_decode_position, split_pending_prefill, split_terminal_prefill, stage_parked,
             body_respects_plan, cap_chunks_to_bodies, terminal_prefill_cursor,
             token_batch_host_step, token_batch_prefill_continuation_fits,
@@ -3478,6 +3504,29 @@ mod amd_serve {
                     assert_eq!(last.c0 + last.clen, n);
                 }
             }
+        }
+
+        /// §B1. The quantum is gated on the FED slots only. A slot that is still prefilling is
+        /// never in the feed set (it has produced no token), and nothing about it may stop a
+        /// finished sequence from taking a quantum — that refusal is what made decode pay a full
+        /// host turnaround per token under continuous batching.
+        #[test]
+        fn a_neighbours_prefill_does_not_disarm_a_finished_slots_quantum() {
+            // Slot 2 is mid-prefill: not live, cursor pending. Slots 0 and 1 are decoding.
+            let live = |slot: usize| matches!(slot, 0 | 1);
+            let pf_pending = |slot: usize| slot == 2;
+
+            assert!(multistep_feeds_armable(&[(0, 7), (1, 9)], live, pf_pending));
+            assert!(multistep_feeds_armable(&[(1, 9)], live, pf_pending));
+
+            // The guards that DO apply, each on its own.
+            assert!(!multistep_feeds_armable(&[(0, 7), (2, 1)], live, pf_pending));
+            assert!(!multistep_feeds_armable(&[(0, 7), (0, 7)], live, pf_pending));
+            assert!(!multistep_feeds_armable(&[(5, 7)], live, pf_pending));
+            // A live slot whose own cursor is somehow still pending is refused.
+            assert!(!multistep_feeds_armable(&[(0, 7)], live, |_| true));
+            // An empty feed set arms vacuously; `decode_quantum` returns 0 for it.
+            assert!(multistep_feeds_armable(&[], live, pf_pending));
         }
 
         #[test]

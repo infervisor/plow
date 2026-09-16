@@ -5262,7 +5262,14 @@ struct TokenCaptureArgs {
     batch: u32,
 }
 
-pub(crate) const DEFERRED_TOKEN_MAX_STEPS: usize = 4;
+/// Ceiling on the AMD deferred-read decode quantum.
+///
+/// 4 put it BELOW the nominal `--multistep` default of 8, so the knob's own default was
+/// unreachable on this backend. Nothing device-side is sized by it: `plow_token_capture` takes
+/// `step`/`quantum`/`batch` as runtime arguments, `d_token_ring` is allocated from it
+/// (`batch * steps * 4` bytes), and `read_token_capture` stages through `h_scalar`, which is at
+/// least 64 KiB against a 640-byte read at batch 20.
+pub(crate) const DEFERRED_TOKEN_MAX_STEPS: usize = 8;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -6449,6 +6456,13 @@ impl AmdEngine {
         // OBJECT below, so a genuinely mismatched pairing is still refused, by inspection instead
         // of by assertion. PLOW_L2_PLACE_DISPATCH=1 still works for anyone scripting it.
         let mut blob = DevBlob::parse_l2(&raw, true)?;
+        // BEFORE anything reads the blob's geometry: `max_ctx`, the KV slot
+        // stride, the VMM geometry and the prefill planner all derive from the
+        // tensor table, so narrowing here is the whole change and none of them
+        // learns about it.
+        if let Some(want) = crate::config::RuntimeConfig::get().amd.live_ctx {
+            crate::exec::ctx_bound::narrow(&mut blob, want)?;
+        }
         let has_fine_xctr = blob
             .progs
             .iter()

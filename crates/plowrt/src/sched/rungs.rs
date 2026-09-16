@@ -345,6 +345,89 @@ mod tests {
         }
     }
 
+    /// A burst must widen the admission window and a QUIET PERIOD must narrow it back.
+    ///
+    /// The defect this guards: λ was an EWMA updated only on an arrival, so once a burst ended
+    /// it held the burst rate forever. `utilization` never fell to `NARROW_UTIL`, the low-load
+    /// branch was never taken, and the window stayed at its burst width for the life of the
+    /// process. Nothing here calls `observe` during the quiet phase — elapsed time alone has to
+    /// move λ.
+    #[test]
+    fn a_quiet_period_narrows_the_rung_a_burst_widened() {
+        use crate::sched::admission::ArrivalRate;
+        use std::time::{Duration, Instant};
+
+        const TICK: Duration = Duration::from_millis(10);
+        let mut c = controller(&[1, 2, 4, 8]);
+        for rung in 0..4 {
+            for _ in 0..20 {
+                c.observe_decode(rung, 10.0, NonZeroUsize::MIN);
+            }
+        }
+        let busy = |c: &mut RungController, rps: f64| {
+            let mut l = load(8, 0);
+            l.arrival_rps = rps;
+            l.mean_output_tokens = 100.0;
+            c.decide(l)
+        };
+
+        // Burst: 8 req/s for 4 s. λ deposits and the window walks out to the widest rung.
+        let t0 = Instant::now();
+        let mut lambda = ArrivalRate::new(2.0);
+        let mut next_arrival = t0;
+        for tick in 0..400 {
+            let now = t0 + TICK * tick;
+            while next_arrival <= now {
+                lambda.observe(next_arrival);
+                next_arrival += Duration::from_millis(125);
+            }
+            busy(&mut c, lambda.rate(now));
+        }
+        let widened = c.admission_limit();
+        assert_eq!(widened, 8, "a sustained burst must reach the widest rung");
+
+        // Quiet: not one arrival. Slots drain, so the occupied extent goes to zero too.
+        let quiet_from = t0 + TICK * 400;
+        let hot = lambda.rate(quiet_from);
+        let mut narrowed_at = None;
+        for tick in 0..1_200 {
+            let now = quiet_from + TICK * tick;
+            let mut l = load(0, 0);
+            l.arrival_rps = lambda.rate(now);
+            l.mean_output_tokens = 100.0;
+            c.decide(l);
+            if narrowed_at.is_none() && c.admission_limit() < widened {
+                narrowed_at = Some(tick);
+            }
+        }
+        assert!(narrowed_at.is_some(), "12 s of silence must narrow the window");
+        assert_eq!(c.admission_limit(), 1, "idle must return to the narrowest rung");
+
+        // Control: with λ PINNED at the burst value — the old estimator's behaviour — the same
+        // 12 s of silence narrows nothing, because utilization never reaches NARROW_UTIL.
+        let mut stale = controller(&[1, 2, 4, 8]);
+        for rung in 0..4 {
+            for _ in 0..20 {
+                stale.observe_decode(rung, 10.0, NonZeroUsize::MIN);
+            }
+        }
+        for _ in 0..400 {
+            busy(&mut stale, hot);
+        }
+        assert_eq!(stale.admission_limit(), 8);
+        for _ in 0..1_200 {
+            let mut l = load(0, 0);
+            l.arrival_rps = hot;
+            l.mean_output_tokens = 100.0;
+            stale.decide(l);
+        }
+        assert_eq!(
+            stale.admission_limit(),
+            8,
+            "control: a λ that never decays never narrows"
+        );
+    }
+
     #[test]
     fn validates_arbitrary_ascending_widths_including_one() {
         let r = DecodeRungs::new(&[1, 3, 7, 16, 32], 32).unwrap();

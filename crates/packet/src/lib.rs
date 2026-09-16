@@ -29,6 +29,7 @@
 //! The matching C structs are in `include/packet.h`. No dependencies — the
 //! runtime links just this crate.
 
+pub mod ctx_bound;
 pub mod dcp;
 pub mod dev;
 pub mod devbuild;

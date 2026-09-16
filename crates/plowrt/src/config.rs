@@ -962,6 +962,21 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-phase-objects", env = "PLOW_PHASE_OBJECTS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub phase_objects: bool,
 
+    /// Serve this context bound instead of the one the packet was emitted at.
+    ///
+    /// The emitted `ctx` is a CEILING: it sizes the KV caches and every cache
+    /// stride, so a packet emitted at 81920 with a decode ladder topping at 32
+    /// holds 135 GiB of latent cache per rank whether or not anyone sends an
+    /// 80k prompt. This re-declares the ctx-scaled tensors and rewrites the
+    /// strides at load, which is the packet `plowc` would have written at this
+    /// bound — so ONE packet serves 8k and 70k and the two stacks are the same
+    /// artifact. Values at or above the emitted ceiling are a no-op.
+    ///
+    /// See `exec::ctx_bound` for what stays at the ceiling (the emitter's
+    /// policy terms, which saturate from 16384 up) and what is refused.
+    #[arg(long = "live-ctx", env = "PLOW_LIVE_CTX", global = true)]
+    pub live_ctx: Option<u32>,
+
     /// Fraction of the free-after-load device memory the mux may commit to admitted
     /// sequences' KV. Below 1.0 so transient prefill workspaces and allocator fragmentation
     /// are not competing with a budget that already counts every byte. `0` disables the
@@ -1515,8 +1530,14 @@ impl RuntimeConfig {
         }
     }
 
-    #[cfg(feature = "cuda")]
-    pub(crate) fn nv_multistep(&self) -> u32 {
+    /// `--multistep` / `PLOW_MULTISTEP`, the nominal decode quantum.
+    ///
+    /// Homed under `nv` only because that is where the flag was first declared; the knob spec
+    /// has always called it `rt.multistep`, and both the NVIDIA device-multistep object and the
+    /// AMD deferred-read quantum are driven by it. Read it through here — the AMD tick used to
+    /// reach into `self.nv.multistep` directly and so missed the env-compat path entirely.
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    pub(crate) fn multistep(&self) -> u32 {
         select_compat(
             self.nv.multistep,
             Self::env_parse("PLOW_MULTISTEP"),

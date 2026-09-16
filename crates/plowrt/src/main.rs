@@ -97,7 +97,7 @@ enum Cmd {
         /// Muxer: upper bound on the arrival-rate batch-formation hold (ms).
         #[arg(long, default_value_t = 8.0)]
         max_hold_ms: f64,
-        /// Muxer: admission SLO (ms) — predicted wait above this sheds requests.
+        /// Muxer: latency target (ms) — moves the decode admission window and sets the queue TTL.
         #[arg(long, default_value_t = 250.0)]
         slo_ms: f64,
         /// Requests allowed to wait outside engine slots. `0` = four batches.

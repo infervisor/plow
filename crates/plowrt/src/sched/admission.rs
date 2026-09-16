@@ -1,6 +1,34 @@
-//! §I Admission control — queuing-theory arrival/service estimation + shed.
+//! §I Admission control — queuing-theory arrival/service estimation + seating.
+//!
+//! There is no SLO-driven shed, and that is deliberate.
+//!
+//! `Admit::Shed` used to sit on the tick path, and the only thing it did was take every live
+//! slot and answer it 429. That is not backpressure: a live slot has already paid for its
+//! prefill, so dropping it burns the most expensive work in the system and hands the client a
+//! retry that arrives right back. Its three recorded regressions were each patched by making it
+//! fire less, and by the end it could not fire at all — `predicted_wait` was
+//! `ceil(live / rung_width) * service_ms`, the covering rung is never narrower than the live
+//! extent, so the ratio was always 1 against an SLO floored at 8 service ticks.
+//!
+//! Backpressure lives where a request has not started yet and refusing it is free:
+//!
+//! * memory — [`seat`] returns [`Denied::KvBudgetFull`] and the mux keeps the request queued;
+//! * latency — [`crate::sched::rungs::RungController`] consumes `slo_ms` and `oldest_wait_ms`
+//!   and moves the admission window ([`crate::sched::rungs::RungReason::Slo`]);
+//! * staleness — the mux sheds a QUEUED request whose wait passed its TTL, which is the one
+//!   place shedding costs no completed work.
 
-/// Exponentially-weighted moving-average rate estimator (arrival λ / service μ).
+use std::time::Instant;
+
+/// Time constant of the arrival-rate estimator. Matched to the rung controller's narrowing
+/// window (`NARROW_TICKS` x `MIN_DWELL_TICKS` at a ~40 ms decode tick is a few seconds), so λ
+/// has fallen most of the way to zero by the time narrowing is eligible.
+const ARRIVAL_TAU_S: f64 = 2.0;
+
+/// Exponentially-weighted moving-average estimator over VALUE samples (service time).
+///
+/// Sample-indexed, not time-indexed: it is only correct for a quantity that is observed once per
+/// event and whose staleness does not matter. A RATE needs [`ArrivalRate`].
 #[derive(Clone, Copy, Debug)]
 pub struct Ewma {
     value: f64,
@@ -23,16 +51,65 @@ impl Ewma {
     }
 }
 
+/// Arrival intensity λ, in requests per second, decaying toward zero with elapsed time.
+///
+/// An [`Ewma`] over `1/dt` samples was wrong twice over. It never decayed — updated only on an
+/// arrival, λ held the burst rate for as long as the model then sat idle, which is exactly when
+/// the rung controller has to see load fall, so [`crate::sched::rungs::RungController`] widened
+/// and never narrowed. And averaging reciprocals is biased high by Jensen's inequality
+/// (E[1/dt] ≥ 1/E[dt]), so even a live stream read hot.
+///
+/// This is the exponential intensity estimator instead: every arrival deposits `1/τ` and the
+/// deposit decays as `exp(-Δt/τ)`. For a Poisson stream of rate `r` its expectation is exactly
+/// `r` (∫ r·(1/τ)·e^(-s/τ) ds = r) — no reciprocal is ever averaged — and with no arrivals it
+/// falls to zero on the τ timescale.
+#[derive(Clone, Copy, Debug)]
+pub struct ArrivalRate {
+    /// Intensity as of `last`. Undecayed; every reader decays it forward.
+    value: f64,
+    tau_s: f64,
+    last: Option<Instant>,
+}
+
+impl ArrivalRate {
+    pub fn new(tau_s: f64) -> Self {
+        ArrivalRate {
+            value: 0.0,
+            tau_s,
+            last: None,
+        }
+    }
+
+    /// λ as of `now`. Pure: decaying on read costs one `exp` and keeps every reader honest
+    /// without needing `&mut` on the tick path.
+    #[inline]
+    pub fn rate(&self, now: Instant) -> f64 {
+        let Some(last) = self.last else {
+            return 0.0;
+        };
+        let dt = now.saturating_duration_since(last).as_secs_f64();
+        self.value * (-dt / self.tau_s).exp()
+    }
+
+    /// Record one arrival at `now`.
+    #[inline]
+    pub fn observe(&mut self, now: Instant) -> f64 {
+        self.value = self.rate(now) + 1.0 / self.tau_s;
+        self.last = Some(now);
+        self.value
+    }
+}
+
 /// Per-slug load estimate: arrival rate λ and per-batch service rate μ(B).
 pub struct LoadEstimator {
-    pub lambda: Ewma,
+    pub lambda: ArrivalRate,
     pub service_ms: Ewma,
 }
 
 impl Default for LoadEstimator {
     fn default() -> Self {
         LoadEstimator {
-            lambda: Ewma::new(0.2),
+            lambda: ArrivalRate::new(ARRIVAL_TAU_S),
             service_ms: Ewma::new(0.2),
         }
     }
@@ -40,44 +117,20 @@ impl Default for LoadEstimator {
 
 impl LoadEstimator {
     /// Utilization ρ = λ / μ given the current batch's service time.
-    pub fn utilization(&self) -> f64 {
+    ///
+    /// Reported as the `plowrt_utilization` gauge. Nothing schedules on it: the rung controller
+    /// computes its own per-rung utilization, which is the one that moves the admission window.
+    pub fn utilization(&self, now: Instant) -> f64 {
         let mu = if self.service_ms.get() > 0.0 {
             1000.0 / self.service_ms.get()
         } else {
             f64::INFINITY
         };
         if mu.is_finite() && mu > 0.0 {
-            self.lambda.get() / mu
+            self.lambda.rate(now) / mu
         } else {
             0.0
         }
-    }
-}
-
-/// Admission verdict.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Admit {
-    /// Run this iteration now.
-    Now,
-    /// Hold briefly to form a larger batch (queuing gain outweighs the wait).
-    Defer,
-    /// Reject — predicted wait blows the SLO or memory can't seat it.
-    Shed,
-}
-
-/// Decide admission from utilization, predicted wait, and the SLO.
-pub fn admit(util: f64, predicted_wait_ms: f64, slo_ms: f64, mem_ok: bool) -> Admit {
-    if !mem_ok || predicted_wait_ms > slo_ms {
-        return Admit::Shed;
-    }
-    // Below saturation there's headroom (and no queue to batch with): run
-    // immediately — deferring an isolated request only adds latency. Near
-    // saturation (ρ ≥ 0.85), hold briefly so the batch fills; the queuing
-    // (throughput) gain outweighs the short wait.
-    if util < 0.85 {
-        Admit::Now
-    } else {
-        Admit::Defer
     }
 }
 
@@ -393,5 +446,75 @@ mod kv_budget_tests {
         assert!(b.fits_requests([4_097, 1]));
         // 2 + 2 blocks. Rounding the sum instead (8,194 rows -> 3 blocks) would have admitted it.
         assert!(!b.fits_requests([4_097, 4_097]));
+    }
+}
+
+#[cfg(test)]
+mod arrival_rate_tests {
+    use super::{ArrivalRate, LoadEstimator};
+    use std::time::{Duration, Instant};
+
+    /// The defect: λ was updated only on an arrival, so a burst left it pinned at the burst rate
+    /// for as long as the model then sat idle. It must fall toward zero on elapsed time alone.
+    #[test]
+    fn a_quiet_period_decays_lambda_toward_zero() {
+        let t0 = Instant::now();
+        let mut lambda = ArrivalRate::new(2.0);
+        for i in 0..40 {
+            lambda.observe(t0 + Duration::from_millis(50 * i));
+        }
+        let busy = lambda.rate(t0 + Duration::from_millis(2_000));
+        assert!(busy > 5.0, "20 arrivals/s should read hot, got {busy}");
+
+        // Decay is monotone and reaches zero; no arrival is needed to move it.
+        let mut prev = busy;
+        for quiet_s in 1..=10 {
+            let now = t0 + Duration::from_millis(2_000) + Duration::from_secs(quiet_s);
+            let idle = lambda.rate(now);
+            assert!(idle < prev, "λ must fall while idle: {idle} !< {prev}");
+            prev = idle;
+        }
+        assert!(prev < busy * 0.01, "10 s of quiet leaves {prev} of {busy}");
+    }
+
+    /// Averaging `1/dt` is biased high by Jensen's inequality. A depositing estimator is not:
+    /// under a steady rate it converges ON the rate, which is what the rung controller compares
+    /// against a capacity in the same units.
+    #[test]
+    fn a_steady_stream_reads_its_own_rate_without_jensen_bias() {
+        let t0 = Instant::now();
+        let mut lambda = ArrivalRate::new(2.0);
+        // 10/s for 20 s, so the estimator is well past its transient.
+        for i in 0..200 {
+            lambda.observe(t0 + Duration::from_millis(100 * i));
+        }
+        let rate = lambda.rate(t0 + Duration::from_millis(19_900));
+        assert!((rate - 10.0).abs() < 1.0, "expected ~10/s, got {rate}");
+
+        // The jittered stream the old estimator overstated most: the same mean rate with dt
+        // alternating an order of magnitude either side of it. An EWMA of 1/dt reads several
+        // times high here; a depositing one still reads the mean.
+        let mut jittered = ArrivalRate::new(2.0);
+        let mut at = 0u64;
+        for i in 0..200 {
+            at += if i % 2 == 0 { 20 } else { 180 };
+            jittered.observe(t0 + Duration::from_millis(at));
+        }
+        let jr = jittered.rate(t0 + Duration::from_millis(at));
+        assert!((jr - 10.0).abs() < 2.0, "jitter must not inflate λ: {jr}");
+    }
+
+    /// Never observed means no load, not a divide-by-zero or a NaN into the controller.
+    #[test]
+    fn an_unobserved_estimator_is_zero_not_nan() {
+        let lambda = ArrivalRate::new(2.0);
+        assert_eq!(lambda.rate(Instant::now()), 0.0);
+        let load = LoadEstimator::default();
+        assert_eq!(load.utilization(Instant::now()), 0.0);
+        // A reader whose clock is behind the last arrival must not raise e to a positive power.
+        let t0 = Instant::now();
+        let mut l = ArrivalRate::new(2.0);
+        l.observe(t0 + Duration::from_secs(5));
+        assert!(l.rate(t0).is_finite() && l.rate(t0) <= l.rate(t0 + Duration::from_secs(5)));
     }
 }

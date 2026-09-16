@@ -956,7 +956,7 @@ pub(crate) fn glm53_emit_full(
 /// `exec_flash_mla_decode` instantiates 2, 4 and 8, and `GLM_MLA_GF_MAX = 8` in op_attention.h is
 /// what the LDS union is sized for.
 pub(crate) const GLM_MLA_GF: u32 = 4;
-const GLM_GF_CROSSOVER: u32 = 4096; // max_ctx <= this -> GF=2; else GF=8
+const GLM_GF_CROSSOVER: u32 = 4096; // max_ctx <= this -> GF=2; else GLM_MLA_GF (4)
 
 /// The head-fusion factor for a DECODE packet, clamped to a GF this rank's head shard can express.
 ///
@@ -11507,6 +11507,10 @@ pub(crate) use kimi_k3::{k3_emit_full, kimi_k3_emit};
 #[cfg(test)]
 #[path = "mla/ckpt_quant_tests.rs"]
 mod ckpt_quant_tests;
+
+#[cfg(test)]
+#[path = "mla/ctx_bound_tests.rs"]
+mod ctx_bound_tests;
 
 #[cfg(test)]
 #[path = "mla/glm_tests.rs"]
