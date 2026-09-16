@@ -5208,11 +5208,113 @@ __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
  * accumulates eight CONSECUTIVE k before the next stride instead of one, so `wave_sum` folds a
  * differently-associated f32 sum of 20480 terms. The op is f32 because bf16 costs ~1e-2 of
  * logit error (mla.rs:2032); a reassociation is orders below that, but it is a change and not a
- * no-op. */
-#define PLOW_GEMV_F32_ARM 5
+ * no-op.
+ *
+ * 6 = arm 5 BLOCKED OVER ROWS (`PLOW_GEMV_F32_MR` rows per wave; 1 reproduces arm 5 exactly).
+ * Arm 5 fixed the instruction MIX and left the traffic alone, and the note above prices x at
+ * 335 MB and W at 1.97 MB -- which is the wrong tensor to price. A wave owns ONE row, so it
+ * reads `CG * K` f32 weights to produce CG outputs: every W load feeds exactly ONE fma. The W
+ * READ VOLUME is therefore `M * N * K * 4` = 16.1 GB per packet, eight thousand times the 1.97 MB
+ * that is resident -- L2 traffic, not HBM, which is why five ownership maps and a vector rewrite
+ * all left it 27x off an x-bandwidth floor that was never the binding term.
+ *
+ * MR rows per wave amortise each W load over MR fmas and cut that volume by MR. The cost is
+ * `MR * CG` accumulators plus `MR * KV` staged x floats, on a kernel already at the 256-VGPR cap
+ * -- which is exactly how arm 3 lost (24 live floats spilled and the straggler doubled), so MR is
+ * a knob and not a constant, and the default stays 1 until hardware ranks it.
+ *
+ * BIT-IDENTICAL TO ARM 5 at every MR: each (row, column) accumulator still folds the same
+ * eight-consecutive-k groups in the same order through the same `wave_sum`. MR changes only how
+ * many accumulators a wave carries at once. */
+#define PLOW_GEMV_F32_ARM 6
+#endif
+#ifndef PLOW_GEMV_F32_MR
+#define PLOW_GEMV_F32_MR 1
 #endif
 
-#if PLOW_GEMV_F32_ARM == 5
+#if PLOW_GEMV_F32_ARM == 6
+    {
+        constexpr unsigned CG = 8u;                    /* columns per group, as arm 5      */
+        constexpr unsigned KV = 8u;                    /* k per lane per step              */
+        constexpr unsigned MR = PLOW_GEMV_F32_MR;      /* rows per wave -- the W amortiser */
+        const unsigned mblk = (M + MR - 1u) / MR;
+        if (mblk >= nblk) {
+            const unsigned groups = (N + CG - 1u) / CG;
+            const unsigned items = mblk * groups;
+            const unsigned kfull = K & ~(PLOW_WAVE * KV - 1u);
+            for (unsigned it = slice * PLOW_WAVES + wave; it < items; it += nblk * PLOW_WAVES) {
+                const unsigned mb = it / groups, n0 = (it % groups) * CG;
+                const unsigned m0 = mb * MR;
+                const float* wp[CG];
+                float a[MR][CG];
+#pragma unroll
+                for (unsigned j = 0; j < CG; j++) {
+                    const unsigned nj = n0 + j;
+                    /* A column past N reads column n0 again -- in cache, accumulator dropped
+                     * unstored -- so the unrolled body stays branch-free, as arm 5. */
+                    wp[j] = W + (size_t)(nj < N ? nj : n0) * K;
+#pragma unroll
+                    for (unsigned r = 0; r < MR; r++) a[r][j] = 0.0f;
+                }
+                /* A row past M reads row m0 again, for the same reason its accumulator is then
+                 * dropped unstored: the inner body must not branch per row. */
+                const bf16* xr[MR];
+#pragma unroll
+                for (unsigned r = 0; r < MR; r++)
+                    xr[r] = x + (size_t)((m0 + r) < M ? (m0 + r) : m0) * K;
+                for (unsigned k = lane * KV; k < kfull; k += PLOW_WAVE * KV) {
+                    float xf[MR][KV];
+#pragma unroll
+                    for (unsigned r = 0; r < MR; r++) {
+                        const bf16v8 xv = ld_glob8(xr[r] + k);
+#pragma unroll
+                        for (unsigned u = 0; u < KV; u++) xf[r][u] = bf2f(xv[u]);
+                    }
+#pragma unroll
+                    for (unsigned j = 0; j < CG; j++) {
+                        const f32x4 w0 =
+                            *(const PLOW_GLOB f32x4*)(const PLOW_GLOB void*)(wp[j] + k);
+                        const f32x4 w1 =
+                            *(const PLOW_GLOB f32x4*)(const PLOW_GLOB void*)(wp[j] + k + 4u);
+#pragma unroll
+                        for (unsigned r = 0; r < MR; r++) {
+#pragma unroll
+                            for (unsigned u = 0; u < 4; u++)
+                                a[r][j] = __builtin_fmaf(xf[r][u], w0[u], a[r][j]);
+#pragma unroll
+                            for (unsigned u = 0; u < 4; u++)
+                                a[r][j] = __builtin_fmaf(xf[r][4u + u], w1[u], a[r][j]);
+                        }
+                    }
+                }
+                for (unsigned k = kfull + lane; k < K; k += PLOW_WAVE) {
+#pragma unroll
+                    for (unsigned j = 0; j < CG; j++) {
+                        const float wv = wp[j][k];
+#pragma unroll
+                        for (unsigned r = 0; r < MR; r++)
+                            a[r][j] = __builtin_fmaf(bf2f(xr[r][k]), wv, a[r][j]);
+                    }
+                }
+#pragma unroll
+                for (unsigned r = 0; r < MR; r++)
+#pragma unroll
+                    for (unsigned j = 0; j < CG; j++) a[r][j] = wave_sum(a[r][j]);
+                if (lane == 0) {
+#pragma unroll
+                    for (unsigned r = 0; r < MR; r++) {
+                        if (m0 + r >= M) continue;
+                        float* const cm = C + (size_t)(m0 + r) * N;
+#pragma unroll
+                        for (unsigned j = 0; j < CG; j++)
+                            if (n0 + j < N) cm[n0 + j] = a[r][j];
+                    }
+                }
+            }
+            return;
+        }
+    }
+#elif PLOW_GEMV_F32_ARM == 5
     {
         constexpr unsigned CG = 8u; /* columns per group, as arms 2 and 4 */
         constexpr unsigned KV = 8u; /* k per lane per step -- one bf16v8 of x */

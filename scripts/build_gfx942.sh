@@ -884,6 +884,14 @@ if [ -n "${PLOW_GEMV_F32_ARM:-}" ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_GEMV_F32_ARM=${PLOW_GEMV_F32_ARM}"
 fi
 
+# PLOW_GEMV_F32_MR: rows per wave in arm 6. 1 reproduces arm 5 exactly (bit-identical at every
+# MR); higher amortises each f32 W load over MR fmas, cutting the op's 16.1 GB of W read volume
+# by MR at the cost of MR*CG accumulators on a kernel already at the 256-VGPR cap. See
+# op_gemm_common.h -- arm 3 is the cautionary precedent for spending registers here.
+if [ -n "${PLOW_GEMV_F32_MR:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_GEMV_F32_MR=${PLOW_GEMV_F32_MR}"
+fi
+
 # PLOW_HC_WAVE_TOKEN=0 restores d_hyperconn_pre's shipped workgroup-per-token block. The default
 # arm gives a WAVE a token so the eight Sinkhorn serial sections of a block run concurrently; it
 # is not bit-identical (the sum of squares reassociates), which is why it is a named knob.
