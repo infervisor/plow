@@ -3831,3 +3831,29 @@ across every build in §12.29-§12.35, so this is amplification over 40 layers o
 not a wrong arm — which is exactly why §12.29 built the single-block harness in the first place.
 It is not evidence that anything here is wrong, and it is not evidence that nothing is; it is an
 unmeasured question that needs a deterministic 40-layer reference to answer.
+
+### 12.37 Staging W in LDS cut the traffic 8x and cost 6x, because the barriers are not free
+
+`GEMV_F32` is the mHC mixing projection, M=8192 N=24 K=20480, and §12.29's arm 6 established the
+binding term: a wave owns MR rows, so the W read volume is `M*N*K*4/MR` = 4.0 GB per packet
+against 1.97 MB resident. MR is the only divisor and it is capped by the 256-VGPR wall.
+
+LDS lifts that cap in principle. Let all `PLOW_WAVES` waves of a workgroup take the SAME column
+group and DIFFERENT row blocks, stage `Wsm[CG][KC]` once, and the volume divides by
+`PLOW_WAVES * MR` = 32 instead of 4 — 4.0 GB to 503 MB for 16 KB of LDS.
+
+    arm 6  wave-local W from L2        1060 us   layer 16789 us
+    arm 7  workgroup-shared W in LDS   6315 us   layer 22079 us
+
+**6x worse.** Exits identical, so the arithmetic was right and the structure was wrong. The
+barriers are the cost, not the LDS. Arm 6 has NO barriers, so its eight waves run fully out of
+step and each one's x loads hide the others'; arm 7 puts two barriers around every k-chunk, which
+pins all eight waves to the same chunk and exposes the x latency 40 times per work item — and the
+megakernel's LDS budget allows exactly ONE workgroup per CU, so there is no second workgroup to
+hide it with.
+
+That is the fifth architectural reading this campaign has had falsified by building it, and the
+second on this op (arm 3 lost the same way: the largest traffic cut available was the worst arm).
+**Inside a megakernel at one workgroup per CU, a barrier is not a synchronization primitive, it is
+a serialization of the only latency-hiding the kernel has.** Reverted. W is still 4.0 GB and still
+the binding term; closing it needs a decomposition that shares W without stepping the waves.

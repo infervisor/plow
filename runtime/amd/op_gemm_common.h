@@ -5239,7 +5239,25 @@ __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
  *
  * BIT-IDENTICAL TO ARM 5 at every MR: each (row, column) accumulator still folds the same
  * eight-consecutive-k groups in the same order through the same `wave_sum`. MR changes only how
- * many accumulators a wave carries at once. */
+ * many accumulators a wave carries at once.
+ *
+ * AND THE OBVIOUS NEXT STEP LOSES BY 6x. MR divides the W volume and is capped by the register
+ * wall, so the move is to stage the W chunk in LDS and let all PLOW_WAVES waves of a workgroup
+ * share it -- same column group, different row blocks -- which divides the volume by
+ * PLOW_WAVES * MR = 32 instead of MR = 4, 4.0 GB per packet down to 503 MB, for 16 KB of LDS.
+ * Written (Wsm[CG][KC] at KC = PLOW_WAVE * KV = 512, two barriers per k-chunk) and MEASURED:
+ *
+ *     arm 6  wave-local W from L2      1060 us     layer 16789 us
+ *     arm 7  workgroup-shared W in LDS 6315 us     layer 22079 us
+ *
+ * Exits identical, so the arithmetic was right and the structure was wrong. The barriers are the
+ * cost, not the LDS: arm 6 has NONE, so its waves run fully out of step and each one's x loads
+ * hide the others'. Arm 7 puts a barrier around every k-chunk, which pins all eight waves to the
+ * same chunk and exposes the x load latency 40 times per work item -- and the megakernel's LDS
+ * budget allows exactly ONE workgroup per CU, so there is no second workgroup to hide it with.
+ * The traffic cut was real and it bought nothing, which is the same way arm 3 lost. Reverted; the
+ * W volume is still 4.0 GB and still the binding term, and closing it needs a decomposition that
+ * does not serialize the waves. */
 #define PLOW_GEMV_F32_ARM 6
 #endif
 #ifndef PLOW_GEMV_F32_MR
