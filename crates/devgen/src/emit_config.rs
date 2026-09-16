@@ -879,6 +879,20 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_ROWBAND_ATTN", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_rowband_attn: Option<bool>,
 
+    /// Decode context parallelism: shard the shared-latent KV cache over this many ranks instead
+    /// of replicating it on all of them, so each rank holds `1/DCP` of the KV rows and one
+    /// collective folds the per-rank softmax partials back into the head-sharded layout
+    /// everything downstream already expects. Must divide `--tp`. Unset or 1 is the replicated
+    /// layout and emits a byte-identical packet.
+    #[arg(long, env = "PLOW_DCP")]
+    pub dcp: Option<u32>,
+
+    /// Rows per DCP page — the granularity ownership cycles at. Must be a power of two, at least
+    /// the flash KV tile (32), and must divide the KV pool's block rows. Unset = 64. Larger
+    /// pages coalesce better and balance worse for short sequences.
+    #[arg(long, env = "PLOW_DCP_PAGE")]
+    pub dcp_page: Option<u32>,
+
     /// Size the batched-decode glue packets to their work items: the FP8 latent KV writer at one
     /// wave per row instead of one workgroup, the router top-k at one workgroup per token, the
     /// MoE combine at one thread per element. Pure width changes, bit-identical.
@@ -1352,6 +1366,8 @@ impl EmitConfig {
             glm_seq_par: env_bool_opt("PLOW_GLM_SEQ_PAR"),
             glm_seq_par_proj: env_bool_opt("PLOW_GLM_SEQ_PAR_PROJ"),
             glm_rowsplit_attn: env_bool_opt("PLOW_GLM_ROWSPLIT_ATTN"),
+            dcp: env_u32("PLOW_DCP"),
+            dcp_page: env_u32("PLOW_DCP_PAGE"),
             glm_rowband_attn: env_bool_opt("PLOW_GLM_ROWBAND_ATTN"),
             glm_decode_glue_cus: env_bool("PLOW_GLM_DECODE_GLUE_CUS"),
             glm_decode_gemm_group: env_bool_opt("PLOW_GLM_DECODE_GEMM_GROUP"),
@@ -1638,6 +1654,32 @@ impl EmitConfig {
             (false, true) => Some(RowSplitArm::Replicated),
             (false, false) => None,
         }
+    }
+
+    /// This emit's KV row layout over `tp` ranks. Unset resolves to the replicated layout, whose
+    /// every map is the identity — so a caller threads this through unconditionally and the
+    /// non-DCP packet does not change by a byte.
+    ///
+    /// Panics on an inadmissible layout rather than silently rounding: a wrong KV stride is a
+    /// silently wrong token with no host-side signal, exactly the failure mode
+    /// `crates/plowrt/src/asset/shard.rs` exists to avoid.
+    pub fn dcp_layout(&self, tp: u32) -> packet::dcp::DcpLayout {
+        use packet::dcp::{DcpLayout, DCP_PAGE_ROWS_DEFAULT};
+        let tp = tp.max(1);
+        let Some(degree) = self.dcp.filter(|&d| d > 1) else {
+            return DcpLayout::new(tp, 1, self.dcp_page.unwrap_or(DCP_PAGE_ROWS_DEFAULT));
+        };
+        let layout = DcpLayout::new(tp, degree, self.dcp_page.unwrap_or(DCP_PAGE_ROWS_DEFAULT));
+        if let Err(e) = layout.validate(None) {
+            panic!("--dcp {degree} with --tp {tp}: {e}");
+        }
+        // The lowering (the two head collectives and the wide merge) is stage 2. Until it lands
+        // a degree above 1 would shrink the declared KV extent without shrinking the rows the
+        // flash reads, which is silent corruption rather than a crash.
+        panic!(
+            "--dcp {degree}: KV sharding is declared but its attention lowering is not emitted \
+             yet; only --dcp 1 is admissible"
+        );
     }
 
     /// The `(clap id, still unset, resolved value)` triples [`super::apply_production_defaults`]

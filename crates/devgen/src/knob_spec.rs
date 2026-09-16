@@ -70,6 +70,18 @@ const SEG_EXPERIMENT_PARKED: Status = Status::Parked {
     evidence: &["docs/flags-reference.md: Emit-side knobs that are NOT EmitConfig fields"],
 };
 
+/// The DCP page is meaningless without a DCP degree to cycle over, and a page silently ignored
+/// is a KV map nobody can reproduce from the recorded knobs.
+const C_DCP_PAGE: &[Constraint] = &[Constraint {
+    id: "dcp_page_needs_dcp",
+    formula: F::Implies(
+        &F::Atom("emit.dcp_page", Cmp::Ne, Val::Unset),
+        &F::Atom("emit.dcp", Cmp::Ne, Val::Unset),
+    ),
+    site: "crates/devgen/src/emit_config.rs dcp_layout: the page only shapes a sharded layout",
+    check: Check::Site,
+}];
+
 /// `apply_production_defaults`'s gate for the qualified GLM recipe.
 const GLM_TARGET: F = F::And(&[
     F::Target(T::Cap("glm")),
@@ -808,6 +820,8 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_seq_par", Some("PLOW_GLM_SEQ_PAR"), Layer::Emit, Domain::Bool, GLM_SEQ_PAR_DEFAULT, GLM_RECIPE).with(C_SEQ_PAR),
     KnobSpec::new("emit.glm_seq_par_proj", Some("PLOW_GLM_SEQ_PAR_PROJ"), Layer::Emit, Domain::Bool, GLM_SEQ_PAR_PROJ_DEFAULT, GLM_RECIPE).with(C_SEQ_PAR_PROJ),
     KnobSpec::new("emit.glm_rowsplit_attn", Some("PLOW_GLM_ROWSPLIT_ATTN"), Layer::Emit, Domain::Bool, UNSET, OPT_IN).scoped(ROWSPLIT_ATTN_SCOPE),
+    KnobSpec::new("emit.dcp", Some("PLOW_DCP"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.dcp_page", Some("PLOW_DCP_PAGE"), Layer::Emit, U32, UNSET, OPT_IN).with(C_DCP_PAGE),
     KnobSpec::new("emit.glm_rowband_attn", Some("PLOW_GLM_ROWBAND_ATTN"), Layer::Emit, Domain::Bool, UNSET, OPT_IN).scoped(ROWBAND_ATTN_SCOPE).with(C_ROWBAND_ATTN),
     KnobSpec::new("emit.glm_decode_glue_cus", Some("PLOW_GLM_DECODE_GLUE_CUS"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_decode_gemm_group", Some("PLOW_GLM_DECODE_GEMM_GROUP"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),

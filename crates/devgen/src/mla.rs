@@ -2524,6 +2524,15 @@ fn declare_glm_rows_batched_for_prefill(
     let mut kidx_ring = Vec::new();
     let mut kidx_ring_score = Vec::new();
     let mut lw = Vec::new();
+    // Rows of the shared latent KV cache THIS RANK holds. `local_capacity` is the identity at
+    // DCP degree 1, so the replicated packet does not change by a byte. The indexer's `kidx`
+    // cache stays replicated: its cross-rank combine is a distributed top-k, not an LSE merge.
+    let kv_ctx = u32::try_from(
+        emit_config::active()
+            .dcp_layout(c.tp)
+            .local_capacity(u64::from(ctx)),
+    )
+    .expect("DCP local capacity fits u32");
     for &l in layer_ids {
         let mla = c.is_softmax(l);
         // fp8 latent ([`glm_fp8_kv`]): 1 B/elt e4m3 plus one f32 scale per cached row, the K3
@@ -2531,7 +2540,7 @@ fn declare_glm_rows_batched_for_prefill(
         ckv.push(if mla {
             b.tensor(
                 &format!("kv.{l}.ckv"),
-                dbatch as u64 * (ctx * dk) as u64 * if fp8kv { 1 } else { BF16 },
+                dbatch as u64 * (kv_ctx * dk) as u64 * if fp8kv { 1 } else { BF16 },
             )
         } else {
             TENSOR_NONE
@@ -2539,13 +2548,13 @@ fn declare_glm_rows_batched_for_prefill(
         krot.push(if mla && dr > 0 {
             b.tensor(
                 &format!("kv.{l}.krot"),
-                dbatch as u64 * (ctx * dr) as u64 * BF16,
+                dbatch as u64 * (kv_ctx * dr) as u64 * BF16,
             )
         } else {
             TENSOR_NONE
         });
         kv_scale.push(if mla && fp8kv {
-            b.tensor(&format!("kv.{l}.scale"), dbatch as u64 * ctx as u64 * 4)
+            b.tensor(&format!("kv.{l}.scale"), dbatch as u64 * kv_ctx as u64 * 4)
         } else {
             TENSOR_NONE
         });

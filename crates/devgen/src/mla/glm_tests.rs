@@ -5149,3 +5149,110 @@ fn rowsplit_attn_on_adds_only_the_8192_sibling() {
     assert!(!local(ordinary).is_empty() && local(ordinary).iter().all(|&f| f == 0));
     assert_eq!(local(&sibling), vec![1; local(ordinary).len()], "every sibling indexer keeps its band");
 }
+
+/// DCP's foundational promise: threading the KV row layout through the emitter costs the
+/// replicated packet nothing. `PLOW_DCP` unset and `PLOW_DCP=1` must produce the same bytes,
+/// because `DcpLayout::local_capacity` is the identity at degree 1 — if that ever stops holding,
+/// every non-DCP packet in production silently changes its KV extents.
+#[test]
+fn dcp_degree_one_emits_a_byte_identical_packet() {
+    let _guard = crate::test_env::env_guard();
+    let dir = std::env::temp_dir().join(format!("plow-glm-dcp1-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 3,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 2, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0,
+        "indexer_types": ["full", "shared", "full"]
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+
+    let emit = |tag: &str, dcp: Option<&str>| -> Vec<u8> {
+        let mut env: Vec<(&str, &str)> = vec![
+            ("PLOW_FP8", "1"),
+            ("PLOW_GLM_FP8_KV", "1"),
+            ("PLOW_GLM_DSA", "1"),
+            ("PLOW_GLM_DSA_PF", "1"),
+            ("PLOW_GLM_INDEX_TP", "1"),
+            ("PLOW_GLM_SELECT_LOCAL", "1"),
+            ("PLOW_MLA_PF_V2", "1"),
+            ("PLOW_MLA_PREFILL", "full:512,2048"),
+            ("PLOW_DECODE_BATCH", "1"),
+            ("PLOW_EMIT_PACKED_PREFILL", "0"),
+            ("PLOW_UNISEG", "0"),
+        ];
+        if let Some(d) = dcp {
+            env.push(("PLOW_DCP", d));
+        }
+        let _env = crate::test_env::EnvScope::set(&env);
+        let out = dir.join(format!("model-{tag}.pkt"));
+        glm_emit_full(
+            &dir,
+            8192,
+            out.to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            None,
+        );
+        std::fs::read(&out).unwrap()
+    };
+
+    let unset = emit("unset", None);
+    let one = emit("one", Some("1"));
+    assert_eq!(
+        plow_asset::decode_objects::image_sha256(&unset),
+        plow_asset::decode_objects::image_sha256(&one),
+        "PLOW_DCP=1 is not the replicated layout"
+    );
+    assert_eq!(unset, one, "PLOW_DCP=1 changed the packet bytes");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A degree above 1 declares a smaller KV extent than the flash reads until the stage-2
+/// lowering lands. That is silent corruption, not a crash, so the emitter must refuse it.
+#[test]
+fn dcp_degree_above_one_is_refused_until_the_lowering_lands() {
+    use packet::dcp::DcpLayout;
+    // The refusal lives in `EmitConfig::dcp_layout`, reached through the emitter; check it
+    // directly so the test does not depend on a full emit.
+    let _guard = crate::test_env::env_guard();
+    let cfg = {
+        let _env = crate::test_env::EnvScope::set(&[("PLOW_DCP", "8")]);
+        crate::emit_config::EmitConfig::from_env()
+    };
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cfg.dcp_layout(8)))
+        .expect_err("--dcp 8 must be refused");
+    let msg = err
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()).unwrap());
+    assert!(msg.contains("--dcp 8"), "{msg}");
+
+    // An inadmissible degree is refused for its own reason, before the not-yet-lowered one.
+    let bad = {
+        let _env = crate::test_env::EnvScope::set(&[("PLOW_DCP", "3")]);
+        crate::emit_config::EmitConfig::from_env()
+    };
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bad.dcp_layout(8)))
+        .expect_err("--dcp 3 must be refused");
+    let msg = err
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()).unwrap());
+    assert!(msg.contains("divide"), "{msg}");
+
+    // And degree 1 resolves to the replicated layout whose maps are all identities.
+    let ok = crate::emit_config::EmitConfig::from_env().dcp_layout(8);
+    assert_eq!(ok, DcpLayout::replicated(8));
+    assert_eq!(ok.local_capacity(81_920), 81_920);
+}

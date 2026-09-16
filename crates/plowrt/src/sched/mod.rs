@@ -7,6 +7,10 @@ pub mod batching;
 // Allowed dead until the head pool drives it.
 #[allow(dead_code)]
 pub mod het;
+/// KV seating: how many sequences of a given length one rank holds, and the `mem_ok` predicate
+/// [`admission::admit`] takes. Allowed dead until `serve::mux` stops passing a literal `true`.
+#[allow(dead_code)]
+pub mod kv_budget;
 pub mod mdq;
 pub mod multistep;
 pub mod prefill;
