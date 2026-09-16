@@ -4416,10 +4416,50 @@ Every large term now has a measurement against it rather than an argument:
     MOE pair              1575   -33% this round, at the LDS ceiling (§12.46, §12.50).
     GEMV_F32              1021   past its traffic knee (MR 4->8 halves W volume for 4%).
 
-None of these is one change away from 6.7x. The campaign's honest position is that the tree's own
-unreached fast paths were worth 755 -> ~581 ms (-23%), and the remainder is a pipeline-wide MFMA
-efficiency problem: the matrix core is doing almost none of this model's work, and every attempt to
-hand it more (§12.30, §12.47, §12.51) has lost to register pressure or to the megakernel's
-one-workgroup-per-CU occupancy. That occupancy -- `plow_smem` at 64,720 B forcing 1 WG/CU and 2
-waves/SIMD -- is the one structural fact that recurs in every one of those losses, and it is the
-thing a next campaign should attack first.
+None of these is one change away from 6.7x.
+
+### 12.55 The occupancy wall is a REGISTER wall, and it is the megakernel itself
+
+I have twice written in this document that the binding constraint is `plow_smem` at 64,720 B
+forcing one workgroup per CU, and recommended shrinking the LDS union below 32,768 B so two
+workgroups fit. **That is the wrong mechanism.** The build's own resource table says so:
+
+    object                     vgpr agpr    lds  occ
+    interp_prefill_mla_moe      256    0  64720    2
+
+**256 VGPRs is the hard architectural ceiling**, and it pins the kernel to 2 waves/SIMD by itself:
+gfx942 has a 512-register file per SIMD, so 512/256 = 2. With `PLOW_WG_WAVES=8` and 4 SIMDs per CU
+that is 8 waves = exactly ONE 512-thread workgroup. Cutting LDS to 32 KB would change nothing at
+all, because the registers would still allow only 2 waves/SIMD. Two workgroups per CU needs every
+wave under 128 VGPRs -- half the current budget.
+
+**And the cause is the megakernel design, not any one op.** Register allocation is per-KERNEL, and
+`plow_exec` contains all 24 ops in one switch. So the most demanding op sets the register count,
+and **every other op inherits its occupancy**. A 22-microsecond `GLU` runs at 2 waves/SIMD because
+the grouped MoE GEMM in the same switch needs 256 registers.
+
+That is the common cause behind every structural loss this campaign recorded, and they stop looking
+like three coincidences:
+
+  * GEMV arm 7 (LDS-staged W): traffic -8x, time +6x. "arm 6 has NO barriers, so its waves run
+    fully out of step and each one's x loads hide the others'... there is no second workgroup to
+    hide it with."
+  * MoE arm 7, same shape, same outcome.
+  * fp8-MX BN=256 / BM=256 (§12.47) and BM=192 (§12.51): every widening spills, because the
+    accumulators are being added to a kernel already at 256.
+
+Each was read at the time as a local result. They are one result: **the megakernel trades occupancy
+for the fusion, and at 8k prefill the trade is losing.** Every op in the layer is running with the
+latency hiding of two waves per SIMD, which is why so many of them sit at 2-10x off their own
+floors with no local explanation.
+
+**What follows for a next campaign.** Not "shrink the LDS". Either split the interpreter so that
+register-hungry ops (the GEMMs, the MoE) live in a different kernel from the light streaming ops
+that are paying their occupancy for nothing, or cut the worst op's register demand directly. Both
+are larger than anything attempted here, and both are testable cheaply first: the resource table
+above is printed by every build, so the hypothesis "op X sets the 256" can be bisected by building
+rows with ops compiled out.
+
+The campaign's honest position is that the tree's own unreached fast paths were worth
+755 -> ~581 ms (-23%), and the remainder is a pipeline-wide MFMA-efficiency problem whose root is
+one number in a build log that nobody had read.
