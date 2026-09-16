@@ -3743,3 +3743,33 @@ The same serial walk exists in `d_index_select_coop`, the decode twin. Not measu
 is prefill.
 
 Layer 2 at the committed defaults: **17,477 us**, from 20,458 at the start of §12.29.
+
+### 12.34 The 8-wide MoE combine was gated on k == 1, and V4.1 is top-6 plus a shared tail
+
+`d_moe_combine_pf` (op 87) has had an 8-wide arm since `PLOW_COMBINE_VEC`, and
+`build_gfx942.sh` turns it on by default — but it fires only at `k == 1`, because it walks `part`
+as one flat `[T*H]` stream. V4.1 emits `k = 7` (top-6 routed plus the shared fold), so every V4.1
+blob fell through to the scalar loop the arm's own comment describes: *"ONE 2 B or 4 B load per
+operand per iteration and waits on it"*.
+
+The gate is not structural. With `k` slots the element index splits into `(token, h)` and a slot's
+row is `part[(tok*k + s)*H + h]` — still eight CONTIGUOUS elements in `h`, so the load widens the
+same way. `H` is a multiple of 8, so a group never straddles a token and one divide covers all
+eight; the slot loop is unrolled by four to keep loads in flight.
+
+    MOE_COMBINE_PF body, layer 2, T=8192, TP8, median of 5:
+
+      scalar (PLOW_COMBINE_VEC=0)   865 us   strag 44   layer 17454 us
+      8-wide (default 1)            334 us   strag 31   layer 16868 us
+
+**-61.4%**, layer -586 us against an op delta of 531. Same operands in the same order (residual,
+shared, slots 0..k-1), f32 accumulate, rounded once — bit-identical to the scalar loop, and the
+exits agree to the last printed digit. The `k == 1` arm is untouched, so no existing model moves.
+
+**Three of this session's four wins are the same finding.** §12.32's dense prefill, §12.33's
+selector scan and this one were not kernels to write: they were a fast body that a gate excluded
+(`!ons`), a fast decomposition nobody had applied (the boundary scan), and a fast arm gated on a
+geometry V4.1 does not have (`k == 1`). The question that found all three is *"which arm is this
+op actually on, and why not the other one?"* — and it is cheaper than every ablation in §12.30.
+
+Layer 2 at the committed defaults: **16,920 us**, from 20,458 at the start of §12.29.

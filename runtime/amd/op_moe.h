@@ -5052,6 +5052,62 @@ __device__ void d_moe_combine_pf(bf16* out, const bf16* residual, const bf16* sh
         }
         return;
     }
+    /* THE SAME 8-WIDE LOAD FOR k > 1, which is every top-k blob that does not fold its slots
+     * (DeepSeek-V4.1 is top-6 plus a shared tail, so k = 7). The arm above needs k == 1 only
+     * because it walks `part` as one flat [T*H] stream; with k slots the element index splits
+     * into (token, h) and a slot's row is `part[(tok*k + s)*H + h]` -- still eight CONTIGUOUS
+     * elements in h, so the load widens exactly the same way. H is a multiple of 8, so the
+     * eight elements of a group always share a token and one divide covers the group.
+     *
+     * Same operands in the same order (residual, shared, slots 0..k-1) accumulated in f32 and
+     * rounded once, so it is bit-identical to the scalar loop below. */
+    if (k > 1u && (H & 7u) == 0u
+#if PLOW_MOE_PF_DET
+        && !det
+#endif
+    ) {
+        const size_t vH = (size_t)H >> 3;
+        const size_t vt = total >> 3;
+        const auto* rg = as_glob(residual);
+        const auto* sg = as_glob(shared);
+        const auto* ph = as_glob(part_h);
+        const auto* pg = as_glob(part);
+        auto* og = as_glob(out);
+        for (size_t v = gid; v < vt; v += stride) {
+            const size_t tok = v / vH;
+            const size_t e = (v - tok * vH) * 8;   /* h of this group's first element */
+            const size_t ge = v * 8;               /* flat element index              */
+            float acc[8];
+            const bf16v8 vr = residual ? ld_glob8(rg + ge) : bf16v8_zero();
+            const bf16v8 vs = shared ? ld_glob8(sg + ge) : bf16v8_zero();
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                acc[j] = residual ? bf2f(vr[j]) : 0.0f;
+                if (shared) acc[j] += bf2f(vs[j]);
+            }
+            const size_t p0 = tok * (size_t)k * (size_t)H + e;
+            /* Unrolled so four slot loads are in flight; k is runtime, hence the remainder. */
+#pragma unroll 4
+            for (unsigned sl = 0; sl < k; sl++) {
+                const size_t pe = p0 + (size_t)sl * (size_t)H;
+                if (part16) {
+                    const bf16v8 vp = ld_glob8(ph + pe);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) acc[j] += bf2f(vp[j]);
+                } else {
+                    const float4 f0 = *(const float4*)(pg + pe);
+                    const float4 f1 = *(const float4*)(pg + pe + 4);
+                    acc[0] += f0.x; acc[1] += f0.y; acc[2] += f0.z; acc[3] += f0.w;
+                    acc[4] += f1.x; acc[5] += f1.y; acc[6] += f1.z; acc[7] += f1.w;
+                }
+            }
+            bf16v8 o;
+#pragma unroll
+            for (int j = 0; j < 8; j++) o[j] = f2bf(acc[j]);
+            st_glob8(og + ge, o);
+        }
+        return;
+    }
 #endif
     for (size_t i = gid; i < total; i += stride) {
         const unsigned tok = (unsigned)(i / H), h = (unsigned)(i - (size_t)tok * H);

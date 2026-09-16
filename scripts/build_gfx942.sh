@@ -1378,7 +1378,7 @@ if [ "${PLOW_MLA_FOLD_TB:-8}" != 0 ]; then
 fi
 
 # DEFAULT ON for the gfx942 PREFILL and FLASH objects (2026-09-11): the three glue memory arms —
-# PLOW_COMBINE_VEC (8-wide k==1 MoE combine, op_moe.h), PLOW_RN_ROWS (RMSNorm issues R rows of
+# PLOW_COMBINE_VEC (8-wide MoE combine at any k, op_moe.h), PLOW_RN_ROWS (RMSNorm issues R rows of
 # loads before reducing any, op_norm.h) and PLOW_RESID_U (residual keeps U iterations of loads in
 # flight, op_elementwise.h). Rollback per axis: PLOW_COMBINE_VEC=0, PLOW_RN_ROWS=0, PLOW_RESID_U=0
 # (1 is also the shipped single-row / non-unrolled body for the last two).
