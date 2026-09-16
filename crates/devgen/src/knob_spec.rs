@@ -358,7 +358,7 @@ const GLM53_RECIPE: &[(&str, Val)] = &[
     ("emit.decode_ladder", Val::Str("1,2,4,8,16,32")),
     ("emit.emit_packed_prefill", TRUE),
     ("emit.uniseg", FALSE),
-    ("emit.mla_prefill", Val::Str("full:128,512,2048,8192")),
+    ("emit.mla_prefill", Val::Str(crate::emit_config::GLM53_MLA_PREFILL)),
     ("emit.moe_pf_det", TRUE),
     ("emit.glm_dsa", Val::Str("1")),
     ("emit.glm_shard_head", TRUE),
@@ -385,6 +385,36 @@ const GLM53_RECIPE: &[(&str, Val)] = &[
     ("env.PLOW_MLA_PF_V2", Val::Str("1")),
     ("env.PLOW_MLA_PF_AITER", Val::Str("1")),
 ];
+
+/// The GLM-5.3 TP8 recipe as `(env var, value)` pairs.
+///
+/// Exists for the gate that asserts an unflagged production emit already produces EVERY recipe
+/// entry. `the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces` compares a
+/// hand-written list of 12 and hardcodes five more into both of its arms, so it stayed green
+/// while `glm_dsa_pf`, `glm_dsa_pf_span` and `PLOW_MLA_PF_AITER` had no applier at all. Driving
+/// the gate off this table means a knob cannot join the recipe without joining the check.
+///
+/// `env.*` entries name their variable directly; `emit.*` entries resolve theirs through `EMIT`.
+/// A knob with no env var cannot be named on a command line, so it is not comparable this way.
+#[cfg(test)]
+pub(crate) fn glm53_recipe_env() -> Vec<(&'static str, String)> {
+    GLM53_RECIPE
+        .iter()
+        .filter_map(|(id, v)| {
+            let env = match id.strip_prefix("env.") {
+                Some(name) => name,
+                None => EMIT.iter().find(|k| k.id == *id)?.env?,
+            };
+            let val = match v {
+                Val::Bool(b) => u8::from(*b).to_string(),
+                Val::Nat(n) => n.to_string(),
+                Val::Str(s) => (*s).to_string(),
+                Val::Unset => return None,
+            };
+            Some((env, val))
+        })
+        .collect()
+}
 
 const DENSE_CAPS: &[&str] = &["dense_packet_contracts", "decode_objects", "decode_ladder"];
 const GEMMA4_W8A8_RECIPE: &[(&str, Val)] = &[("emit.w8a8", TRUE)];
@@ -936,6 +966,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_SEG_PURE_GEMM", Some("PLOW_SEG_PURE_GEMM"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_SEG_SLICE_ALL", Some("PLOW_SEG_SLICE_ALL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_SEG_V2", Some("PLOW_SEG_V2"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_SKIP_ASM_AUDIT", Some("PLOW_SKIP_ASM_AUDIT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_SOURCE_ROOT", Some("PLOW_SOURCE_ROOT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_TOKEN_BATCH_TP_OBJECTS", Some("PLOW_TOKEN_BATCH_TP_OBJECTS"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_TOOLCHAIN_LABEL", Some("PLOW_TOOLCHAIN_LABEL"), Layer::RawEnv, Domain::Str, UNSET, DIAG),

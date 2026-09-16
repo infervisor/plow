@@ -7381,7 +7381,11 @@ fn apply_production_defaults(
         // on unconditionally made the recipe UNTESTABLE — the control arm of any A/B emitted the
         // treatment. `*_explicit` records that the environment named the knob, which is the same
         // provenance `decode_ladder_default` already keeps, not a new knob.
-        if !cfg.token_batch_tp && !cfg.token_batch_tp_explicit {
+        // Read the variable, not a field: `EmitConfig` is built by clap on the plowc path and by
+        // `from_env` elsewhere, so a field set in one constructor is silently `false` in the other.
+        // Both knobs are already registered, so this adds no unregistered env read.
+        let named = |k: &str| std::env::var(k).is_ok();
+        if !cfg.token_batch_tp && !named("PLOW_TOKEN_BATCH_TP") {
             cfg.token_batch_tp = true;
             emit_config::note_production_default("token_batch_tp", "true".into());
         }
@@ -7408,9 +7412,31 @@ fn apply_production_defaults(
                 }
             }
         }
-        if !cfg.packed_sparse_pf && !cfg.packed_sparse_pf_explicit {
+        if !cfg.packed_sparse_pf && !named("PLOW_PACKED_SPARSE_PF") {
             cfg.packed_sparse_pf = true;
             emit_config::note_production_default("packed_sparse_pf", "true".into());
+        }
+        // Declared qualified in GLM53_RECIPE and applied by NOTHING until now: an unflagged emit
+        // produced a different packet from the recipe for each of these, and only the driver
+        // script typing them out kept production right.
+        // `every_glm_recipe_entry_holds_without_being_named` is the gate that found them and is
+        // what stops the next one. Same `named()` shape as token_batch_tp above, for the same
+        // reason: a plain `bool` cannot tell `=0` from unset, so the rollback has to read the
+        // variable.
+        for (field, env, id) in [
+            (&mut cfg.glm_shard_head, "GLM_SHARD_HEAD", "glm_shard_head"),
+            (&mut cfg.glm_fuse_b1, "PLOW_GLM_FUSE_B1", "glm_fuse_b1"),
+            (&mut cfg.glm_fuse_seam, "PLOW_GLM_FUSE_SEAM", "glm_fuse_seam"),
+        ] {
+            if !*field && !named(env) {
+                *field = true;
+                emit_config::note_production_default(id, "true".into());
+            }
+        }
+        // The prefill bucket set. `Option`, so unset is unambiguous and no `named()` is needed.
+        if cfg.mla_prefill.is_none() {
+            cfg.mla_prefill = Some(emit_config::GLM53_MLA_PREFILL.into());
+            emit_config::note_production_default("mla_prefill", emit_config::GLM53_MLA_PREFILL.into());
         }
         for (id, unset, value) in cfg.glm_recipe_unset() {
             if unset {

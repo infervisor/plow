@@ -57,6 +57,10 @@ use clap::Args;
 /// (review log #65), worth about -6.5 ms of the -35 ms per chunk all four groups would give.
 pub const GLM_GEMM_LT_PF_EXT_QUALIFIED: &str = "o_proj,band,shared";
 
+/// The qualified GLM-5.3 gfx942 TP8 prefill bucket set. Shared by `GLM53_RECIPE` and
+/// `apply_production_defaults` so the declared recipe and the applied default are one string.
+pub const GLM53_MLA_PREFILL: &str = "full:128,512,2048,8192";
+
 #[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Emit knobs")]
 pub struct EmitConfig {
@@ -679,12 +683,6 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_TOKEN_BATCH_TP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub token_batch_tp: bool,
 
-    /// Whether the environment named `PLOW_TOKEN_BATCH_TP` at all. Not a knob — provenance, like
-    /// `decode_ladder_default`, so the GLM recipe can turn the flag on when nothing asked while
-    /// still yielding to an explicit `=0`. Without it the recipe's control arm is unreachable.
-    #[arg(skip)]
-    pub token_batch_tp_explicit: bool,
-
     /// Let the packed-prefill siblings and token-batch bodies cover the SPARSE (DSA) prefill
     /// buckets too. Their selection chain resolves rows per request span at the runtime (the
     /// native TP indexer takes a `PlowKvSpan` table, the AITER sparse flash runs one chain per
@@ -693,10 +691,6 @@ pub struct EmitConfig {
     /// the sparse rung is GPU-qualified; unset ⇒ byte-identical blob.
     #[arg(long, env = "PLOW_PACKED_SPARSE_PF", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub packed_sparse_pf: bool,
-
-    /// Whether the environment named `PLOW_PACKED_SPARSE_PF`. See `token_batch_tp_explicit`.
-    #[arg(skip)]
-    pub packed_sparse_pf_explicit: bool,
 
     /// Partition large GLM prefill index queries across eight gfx942 ranks.
     /// On by default for GLM on gfx942 TP8; `=false` is the rollback.
@@ -1347,8 +1341,6 @@ impl EmitConfig {
             glm_moe_resident: env_bool_opt("PLOW_GLM_MOE_RESIDENT"),
             glm_moe_shared_fold: env_bool("PLOW_GLM_MOE_SHARED_FOLD"),
             token_batch_tp: env_bool("PLOW_TOKEN_BATCH_TP"),
-            token_batch_tp_explicit: std::env::var("PLOW_TOKEN_BATCH_TP").is_ok(),
-            packed_sparse_pf_explicit: std::env::var("PLOW_PACKED_SPARSE_PF").is_ok(),
             packed_sparse_pf: env_bool("PLOW_PACKED_SPARSE_PF"),
             glm_index_tp: env_bool_opt("PLOW_GLM_INDEX_TP"),
             glm_select_local: env_bool_opt("PLOW_GLM_SELECT_LOCAL"),

@@ -259,6 +259,16 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::GemmGluMxfp4, RowField::Rows(0)),
     (DevOp::GemmAffineQ4, RowField::Rows(0)),
     (DevOp::GemvAffineQ4, RowField::Rows(0)),
+    // The MoE router logit GEMM (75 per GLM prefill program). Added to the ISA as opcode 180
+    // AFTER the 4096 census above, which is why it was missing: a ragged tail kept `M = bucket`
+    // and paid up to 4x the router work it needed. `slots.rs` names its `i` fields `M, N, K`.
+    (DevOp::GemmF32, RowField::Rows(0)),
+    // Also absent from that census, and ordinary interpreter GEMMs like every entry above:
+    // `slots.rs` names their `i[0]` `M`. The shrink is inert unless they appear in a prefill
+    // bucket AND carry exactly the bucket width, so listing them costs nothing and stops the
+    // next packet that does emit them from silently paying full width.
+    (DevOp::GemmC5Fp8, RowField::Rows(0)),
+    (DevOp::GemmSplitK, RowField::Rows(0)),
     (DevOp::PerLayerInput, RowField::Rows(0)),
     (DevOp::FlashMlaPrefill, RowField::Rows(4)),
     (DevOp::FlashMlaPrefillFp8, RowField::Rows(4)),
@@ -690,4 +700,101 @@ pub(crate) fn kv_contract_digest(tensors: &[KvSlotTensor]) -> String {
         })
         .collect();
     plow_asset::kv_contract::digest(&set)
+}
+
+#[cfg(test)]
+mod row_field_tests {
+    use super::{RowField, PREFILL_ROW_FIELDS};
+    use packet::dev::DevOp;
+
+    /// Field names that mean "this instruction's row count" and "an element count that scales
+    /// with rows", from `packet::slots`. `Rows` overwrites its field with the live row count, so
+    /// the field must BE the row count; `RowsTimes` rescales, so its field is rows times a
+    /// per-instruction width.
+    const ROW_NAMES: &[&str] = &["rows", "ntok", "n_tok", "T", "M", "n_batch"];
+    const ELEM_NAMES: &[&str] = &["n", "H"];
+
+    /// Every entry's field index must name a row field in the slot table.
+    ///
+    /// The table was hand-derived from a `disasm --program 4096` census of a GLM-5.2 packet, so
+    /// it records what that packet happened to contain and nothing checks it against the ISA.
+    /// `GemmF32` (opcode 180, the MoE router logit GEMM, 75 per GLM prefill program) was added
+    /// after that census and was simply missing: a ragged tail kept `M = bucket` and paid up to
+    /// 4x the router work it needed, silently, because the shrink's `match` ends in `_ => {}`.
+    ///
+    /// `slots.rs` already names each field and is itself gated against `dev.rs`'s doc comments,
+    /// so it is the right thing to check against -- a wrong INDEX is caught here, not just a
+    /// missing op.
+    #[test]
+    fn every_prefill_row_field_names_a_row_field_in_the_slot_table() {
+        let mut wrong = Vec::new();
+        for &(op, field) in PREFILL_ROW_FIELDS {
+            let slots = packet::slots::slots_for(op);
+            let (ix, want) = match field {
+                RowField::Rows(f) => (f, ROW_NAMES),
+                RowField::RowsTimes(f) => (f, ELEM_NAMES),
+            };
+            // An op whose slot row is a partial override carries no `i` names of its own and
+            // `slots_for` does not inherit them (HeadNormRopeFp8 is `i: &[]` over HeadNormRope's
+            // seven). Unverifiable here, not wrong -- a gap in slots.rs, recorded rather than
+            // failed, so this test stays about PREFILL_ROW_FIELDS.
+            if slots.i.iter().all(Option::is_none) {
+                continue;
+            }
+            match slots.i[ix] {
+                Some(name) if want.contains(&name) => {}
+                other => wrong.push(format!(
+                    "{op:?} {field:?} -> i[{ix}] is {other:?}, expected one of {want:?} \
+                     (slot table: {:?})",
+                    slots.i
+                )),
+            }
+        }
+        assert!(wrong.is_empty(), "PREFILL_ROW_FIELDS disagrees with packet::slots:\n{}", wrong.join("\n"));
+    }
+
+    /// No opcode listed twice: `prefill_row_field` takes the FIRST match, so a duplicate with a
+    /// different index would be silently dead.
+    #[test]
+    fn prefill_row_fields_has_no_duplicate_opcode() {
+        let mut seen: Vec<u16> = PREFILL_ROW_FIELDS.iter().map(|&(o, _)| o as u16).collect();
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "PREFILL_ROW_FIELDS lists an opcode twice");
+    }
+
+    /// Every `Gemm*` opcode is placed deliberately.
+    ///
+    /// Scoped to the GEMM family because that is where the drift happened and because it is
+    /// enumerable: a new GEMM variant joining the ISA now has to be added to the table or
+    /// named here with a reason, instead of defaulting into the silent `_ => {}`.
+    #[test]
+    fn every_gemm_opcode_is_either_row_shrunk_or_exempt() {
+        /// `Gemm*` opcodes deliberately NOT in `PREFILL_ROW_FIELDS`, with the reason.
+        ///
+        /// Both of these are NATIVE-ROUTED and already shrink themselves: the route owns a
+        /// `rebase(rows)` that re-picks the kernel for the live row count
+        /// (`amd_gemm_lt.rs:21`, `amd_gemm_blk.rs:157`, both driven from `patch_prefill`).
+        /// Adding them to the table would shrink `i[0]` a SECOND time, and `rebase` derives its
+        /// band cap and its `rows != i[0]` guard from that same field -- so the table would feed
+        /// the route an already-shrunk bucket and break the sequence-parallel band case.
+        const EXEMPT: &[DevOp] = &[DevOp::GemmLtPf, DevOp::GemmBlkPf];
+        let mut missing = Vec::new();
+        for op in DevOp::ALL {
+            let name = format!("{op:?}");
+            if !name.starts_with("Gemm") {
+                continue;
+            }
+            let listed = PREFILL_ROW_FIELDS.iter().any(|&(o, _)| o == *op);
+            if !listed && !EXEMPT.contains(op) {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "GEMM opcodes in neither PREFILL_ROW_FIELDS nor EXEMPT, so a ragged prefill tail \
+             would compute them at the full bucket width: {missing:?}"
+        );
+    }
 }

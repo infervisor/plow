@@ -1876,7 +1876,7 @@ done
 # no baseline still apply to a partial build.
 EXPECT="$REPO/scripts/asm_expect_gfx942.json"
 BASELINE="$REPO/scripts/obj_baseline_gfx942.json"
-if [ -f "$EXPECT" ] && command -v python3 >/dev/null; then
+if [ "${PLOW_SKIP_ASM_AUDIT:-0}" != 1 ] && [ -f "$EXPECT" ] && command -v python3 >/dev/null; then
   echo ""
   echo "   --- instruction-selection audit + static performance contract ---"
   # Captured rather than piped: `cmd | tail` reports tail's status, so piping would swallow the

@@ -3447,8 +3447,14 @@ fn packed_sparse_refusal(
         if d.op == DevOp::FlashMlaPrefillFp8 as u16 && sparse_fp8(d) {
             if !sparse_mla {
                 return Some(
-                    "packed sparse prefill: the sparse FP8 flash needs the AITER route \
-                     (PLOW_MLA_PF_AITER=1); the packed flash object has no gathered arm"
+                    // Names the KNOB, not an object arm. The old wording blamed "the packed flash
+                    // object has no gathered arm", which sent a reader to build_gfx942.sh's
+                    // -DPLOW_DSA_PF_ARM; the test here is `RuntimeConfig::get().amd.mla_pf_aiter`
+                    // and nothing else, so the object was never the problem.
+                    "packed sparse prefill: the sparse FP8 flash needs the AITER sparse-MLA \
+                     route, which is off because PLOW_MLA_PF_AITER is not 1; every packed and \
+                     token-batch program carrying the sparse chain falls back to the unpacked \
+                     prefill path"
                         .into(),
                 );
             }
@@ -8830,6 +8836,22 @@ impl AmdEngine {
         if shared_requested && config.amd.shared_prefix == Some(true) && shared_layout.is_none() {
             return Err(RuntimeError::Rejected(
                 "AMD shared prefixes require gfx942, ROCr VMM, no legacy fusion, and complete MLA cache writes with supported geometry on every rung".into()));
+        }
+        // The prefix cache asked for and not built is otherwise SILENT: `shared_layout` is None,
+        // the engine falls back to slot-local KV, and the only symptom is a permanent 0% hit
+        // rate that reads like a workload with no shared prefixes. Several unrelated packet
+        // properties land here -- a pooled indexer (`index_kpool > 1`) and a DCP degree above 1
+        // each make `Layout::from_blob` refuse -- so say so rather than leave it to be inferred.
+        if shared_requested && shared_layout.is_none() {
+            tracing::warn!(
+                arch,
+                has_vmm = be.has_vmm(),
+                fusion = config.fusion,
+                "prefix cache requested but not built; serving with slot-local KV and a \
+                 permanent 0% hit rate. Layout::from_blob refused this packet: a pooled indexer \
+                 (index_kpool > 1), a DCP degree above 1, or an unsupported cache geometry on \
+                 some rung. Set --amd-shared-prefix=true to turn this into a load-time refusal."
+            );
         }
         let mut shared_prefix = shared_layout.map(|layout| {
             shared_prefix::SharedPrefix::new(be.clone(), layout,

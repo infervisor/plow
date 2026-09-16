@@ -3844,6 +3844,154 @@ fn the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// EVERY recipe entry must already hold in an unflagged production emit.
+///
+/// The test above compares a hand-written list of 12 knobs and hardcodes five more
+/// (`PLOW_GLM_DSA_PF`, `PLOW_GLM_DSA`, `PLOW_MLA_PF_AITER`, `PLOW_MLA_PF_V2`, `PLOW_UNISEG`)
+/// into BOTH of its arms, so those five cancel and are never actually checked. `GLM53_RECIPE`
+/// has 30 entries. The gap is not hypothetical: the shipped production packet prefilled DENSE
+/// because `glm_dsa_pf` was declared `TRUE` in the recipe and applied by nothing, and the same
+/// held for `glm_dsa_pf_span` and the runtime's `PLOW_MLA_PF_AITER`.
+///
+/// So this drives off the table, not a list, and its base environment is EMPTY: naming the
+/// whole recipe must not move the packet away from what an unflagged emit produces. Runtime
+/// (`rt.*`) knobs do not reach the emitter and are excluded by `glm53_recipe_env` only when
+/// they carry no `emit.*` id — `env.PLOW_MLA_PF_AITER` is an `env.*` entry and IS named here,
+/// which is the point: if the emitter ignores it the packets match and the gate stays green,
+/// while the SERVE path setting it is checked separately.
+///
+/// On failure the message names the offending knobs by bisecting one at a time, because
+/// "the packets differ" is not actionable on a 30-entry table.
+#[test]
+fn every_glm_recipe_entry_holds_without_being_named() {
+    use std::sync::{Arc, Mutex};
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let dir = std::env::temp_dir().join(format!("plow-glm-recipe-all-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = serde_json::json!({
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 4,
+        "hidden_size": 6144, "num_attention_heads": 64,
+        "kv_lora_rank": 512, "q_lora_rank": 2048,
+        "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+        "vocab_size": 128, "rms_norm_eps": 1e-5,
+        "n_routed_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048, "intermediate_size": 12288,
+        "first_k_dense_replace": 3, "routed_scaling_factor": 2.5,
+        "rope_theta": 8000000.0,
+        "indexer_types": ["full", "shared", "full", "shared"]
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    type Snapshot = Vec<(u32, Vec<packet::dev::DevInst>, Vec<packet::dev::StreamEnt>)>;
+    let emit = |env: &[(&str, &str)]| -> Snapshot {
+        let _env = crate::test_env::EnvScope::set(env);
+        let mut cfg = crate::emit_config::EmitConfig::from_env();
+        crate::apply_production_defaults(
+            &mut cfg,
+            crate::emit_capabilities("glm_moe_dsa"),
+            "gfx942",
+            8,
+            304,
+        );
+        crate::emit_config::install(cfg);
+        let seen: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let verify: crate::VerifyHook = Box::new(move |model| {
+            *sink.lock().unwrap() = model
+                .progs
+                .iter()
+                .zip(&model.prog_t)
+                .map(|(p, &t)| (t, p.insts.clone(), p.stream.clone()))
+                .collect();
+            Ok(crate::LeanReport::skipped("recipe reconciliation"))
+        });
+        glm_emit_full(
+            &dir,
+            81920,
+            dir.join("model.pkt").to_str().unwrap(),
+            304,
+            8,
+            true,
+            true,
+            "gfx942",
+            None,
+            Some(&verify),
+        );
+        let out = seen.lock().unwrap().clone();
+        out
+    };
+
+    // Recipe entries an unflagged emit deliberately does NOT produce yet. A TOMBSTONE, not a
+    // waiver: the assertion below is equality, so a knob that gets an applier must be deleted
+    // from here, and a knob that silently loses one cannot be absorbed by it.
+    const NOT_YET_APPLIED: &[(&str, &str)] = &[
+        (
+            "PLOW_GLM_DSA_PF",
+            "sparse prefill measures 3.27x at 70k C1 with retrieval 36/36, but FAULTS at C16 \
+             (write to a read-only page, task #70). Applying it here would make a crashing \
+             configuration the unflagged default. Promote with the span knob once #70 clears.",
+        ),
+        (
+            "PLOW_MLA_PF_V2",
+            "env layer, not an EmitConfig field: the emitter reads the variable directly, so \
+             apply_production_defaults cannot set it. scripts/glm53_serve_inner.sh exports it; \
+             every_env_recipe_entry_is_set_by_a_driver_script is the gate for that half.",
+        ),
+    ];
+
+    let recipe = crate::knob_spec::glm53_recipe_env();
+    assert!(recipe.len() >= 25, "the recipe accessor lost entries: {}", recipe.len());
+    let named: Vec<(&str, &str)> = recipe.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+    let unflagged = emit(&[]);
+    assert!(!unflagged.is_empty());
+    let explicit = emit(&named);
+
+    if unflagged != explicit {
+        // LEAVE ONE OUT, not add one in. Naming a knob alone can be inert because it depends on
+        // another recipe knob (`glm_dsa_pf` does nothing without `glm_dsa`), which would report a
+        // knob as applied when it is only shadowed. Dropping k from the full recipe lets k take
+        // its unflagged resolution with everything else held at the recipe, so a difference means
+        // exactly "the production default for k is not the recipe's value".
+        let mut unapplied = Vec::new();
+        for (k, v) in &recipe {
+            let without: Vec<(&str, &str)> = recipe
+                .iter()
+                .filter(|(o, _)| o != k)
+                .map(|(o, w)| (*o, w.as_str()))
+                .collect();
+            if emit(&without) != explicit {
+                unapplied.push(*k);
+            }
+        }
+        unapplied.sort_unstable();
+        let mut expect: Vec<&str> = NOT_YET_APPLIED.iter().map(|(k, _)| *k).collect();
+        expect.sort_unstable();
+        assert_eq!(
+            unapplied,
+            expect,
+            "\nGLM53_RECIPE entries an unflagged gfx942 TP8 emit does not produce changed.\n\
+             Each is declared qualified but applied by nothing, so only a driver script typing \
+             it out keeps production right.\n\
+             Give it an applier in apply_production_defaults (and glm_recipe_unset), take it out \
+             of the recipe, or add it to NOT_YET_APPLIED with the reason and the blocking task.\n\
+             Tombstoned right now:\n{}",
+            NOT_YET_APPLIED
+                .iter()
+                .map(|(k, why)| format!("  {k}: {why}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    } else {
+        assert!(
+            NOT_YET_APPLIED.is_empty(),
+            "the full recipe now matches an unflagged emit, so NOT_YET_APPLIED is stale: {:?}",
+            NOT_YET_APPLIED.iter().map(|(k, _)| *k).collect::<Vec<_>>()
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// `PLOW_GLM_GEMM_BLK`: at a >=2048-row bucket, q_a / kv_a / o_proj each sit alone in a segment
 /// as `GemmBlkPf`; q_a quantizes `xn` and kv_a reuses it; q_absorb (a prep product) stays on
 /// `GemmLtPf`; the 128-row bucket keeps the bf16 arms.
