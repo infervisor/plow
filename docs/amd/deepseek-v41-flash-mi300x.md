@@ -5216,3 +5216,60 @@ cannot find this, because both arms are wrong and the faster one looks better.
 That makes MoE scheduling a live target again for the first time since 12.46, and on honest
 arithmetic: 884 tiles x 3 n-tiles = 2652 GLU tiles over 304 CUs is 8.72 waves, so the 54% tail the
 231-tile build showed is gone on its own.
+
+## 12.68 EP re-measured on arithmetic that is actually happening: DOWN is 3.7x
+
+12.64 priced EP at ~95-180 us/layer. That was measured against a MoE pair of 858 us which was
+doing 17.9% of its work (12.67), so it was pricing EP against a baseline that barely existed. On
+the fixed build the MoE pair is 4129 us and EP's case is completely different.
+
+Interleaved, 8k/TP8, block 2, union arm, MoE fixed, two repeats each:
+
+| | TP | EP | |
+|---|---|---|---|
+| `MOE_GROUP_DOWN_PF` | 2531 us | **688 us** | 3.68x |
+| `MOE_GROUP_GLU_PF` | 1597 us | 1143 us | 1.40x |
+| MoE pair | 4129 us | **1832 us** | -55.6% |
+| layer | 14581 us | **14151 us** | -430 us |
+
+Exits identical at -1.36719 / 3.67188 / -0.000643.
+
+**DOWN is where EP pays, and the reason is its k-loop.** Under TP, `down`'s K is
+`moe_intermediate / tp` = 2304/8 = 288 -- three MPF4_BK=128 tiles, with the per-tile cost (the
+expert weight pointers, the LDS double-buffer fill, the `row_partidx`/`row_gate` epilogue) amortised
+over almost nothing. EP shards the EXPERTS instead of the intermediate, so K is the full 2304 and
+the same total MACs run through an 18-deep k-loop. GLU never had the problem -- its K is the hidden
+5120 either way -- and its 1.40x is the ordinary benefit of 48 experts instead of 384.
+
+That 65 TF/s DOWN was running at is the clearest instance of this campaign's recurring pattern
+(12.20): an op 5-50x off its roofline is not short of bandwidth, it is short of work per unit of
+overhead.
+
+**The collective takes most of it back.** `XREDUCE2` goes 1374 -> 5833 us on rank 0's trace, so the
+layer moves only -430 of the -2297. Per-rank attribution is not reliable here for the reason 12.64
+gives -- under EP, rank 0 is the FASTEST rank and its trace reads the others' skew as its own wait
+-- but the direction is not in doubt: all eight ranks' `moe pair + XREDUCE2` sums to a near-constant
+7.6 ms under EP (spread +/-1%), against 5.5 ms under TP. The expert placement is uneven and the
+collective bills the slowest rank.
+
+**Balancing still does not help, and now we know why it cannot.** The even contiguous split gives
+tile loads `[183, 129, 28, 217, 63, 152, 35, 77]`, 1.96x imbalance; a DP over contiguous cuts gets
+`[115, 111, 117, 121, 121, 121, 105, 73]`, 1.095x. Applied through `PLOW_MOE_EP_CUTS` the layer
+reads 14011 us even against 14040 us balanced -- no change, exactly as 12.65's predecessor found on
+the broken build and for the same reason: **per-rank MoE time is not a function of tile count.** The
+1.96x tile imbalance and the 20x per-rank time spread are not the same quantity, so a cut list that
+fixes the first does not touch the second.
+
+(The routing here comes from `rung_run`'s seeded synthetic `act.x`, so these specific cuts are a
+benchmark artefact and not a shippable default. The mechanism and the negative result are real.)
+
+### Where the layer stands
+
+    TP,  union arm, MoE fixed     14 566 us/layer     583 ms
+    EP,  union arm, MoE fixed     14 151 us/layer     566 ms
+
+EP is not enabled by default: it needs `PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES` raised to 2 GB,
+because the largest rank holds more experts than an even byte split assumes. -430 us/layer is worth
+having but it is a config decision with a memory cost attached, so it stays opt-in until the
+placement skew that feeds the collective is addressed -- which is the actual open problem, and it
+is a scheduling problem, not a tiling one.
