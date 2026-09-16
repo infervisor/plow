@@ -3113,6 +3113,19 @@ not apply to your model" and "this optimization silently does not apply to your 
 top-k is not a power of two" are different states, and only the first is a measurement. The
 generalization is kept, default off, with the number attached.
 
+#### Three knobs measured and rejected, which is also a result
+
+| axis | what it targets | verdict at V4.1's shape |
+|---|---|---|
+| `GM_MX_BM/BN` 256x128 | op 184's tile | **worse**: 123.8 -> 138.9 ms, straggler 164 -> 279 us |
+| `PLOW_MOE_PF_DET` | fuse op 86 -> 87 | **worse**: 841.6 -> 855.8 ms (87 wins 21.8, 86 loses 35.7) |
+| `PLOW_MOE_PF_GH=2` | hoist + pipeline the MoE A-gather index | **noise**: 839.0 -> 837.2 ms, inside the +-8 ms spread; GLU unchanged at 78.4 ms |
+
+`PLOW_COMBINE_VEC` was already default ON, so op 87's 8-wide arm was not a lever either. The
+shipped defaults are, on this model, the right ones everywhere they were tested — which is worth
+knowing before writing a kernel, and is why the audit fix in §12.21 mattered more than any tile it
+went on to reject.
+
 ### 12.2 What is still not demonstrated
 
   * ~~ONE layer, not 40.~~ **Superseded by §12.18**: all 40 layers emit and run as
