@@ -9508,8 +9508,15 @@ impl AmdEngine {
             .map(|m| (m.base, m.base + stage1_a4_payload));
 
         let mla_fold = if use_mla_fold {
+            // Row-band off: skip the siblings. Their full-width W_uv twin is bound at address 0
+            // (see `rb_twin` above), and `MlaFold::load` converts every routed weight to FP32 at
+            // load time — including one it will never dispatch. Reading that bind is the
+            // near-null fault that made `PLOW_GLM_ROWBAND=0` unusable as a rollback.
+            let progs = blob
+                .prefill_phase()
+                .filter(|p| rowband_on || !p.role.is_rowsplit_sibling());
             Some(amd_mla_fold::MlaFold::load(
-                &be, hsaco_dir, blob.prefill_phase(), &blob.tensors, &devp, &mut modules,
+                &be, hsaco_dir, progs, &blob.tensors, &devp, &mut modules,
             )?)
         } else {
             None
@@ -9581,7 +9588,7 @@ impl AmdEngine {
                         }
                     }
                 }
-                if use_mla_fold {
+                if use_mla_fold && (rowband_on || !p.role.is_rowsplit_sibling()) {
                     for (seg, route) in amd_mla_fold::routes(p, &blob.tensors, seg_class.len())?
                         .into_iter()
                         .enumerate()
