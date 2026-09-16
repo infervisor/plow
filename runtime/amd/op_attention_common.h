@@ -2069,6 +2069,28 @@ __device__ __noinline__ void d_flash_decode_slots(
  * overflows that form's denominator, and the sink CAN dominate: an empty split set leaves
  * gm = FA_NEG_INF, where this form gives rescale = 0, gl' = 1, O = 0 — all mass on the sink, no
  * value row, which is the right answer rather than a NaN. */
+/* WAVE PER WORK ITEM, EIGHT ELEMENTS PER LANE.
+ *
+ * The shipped loop gives a work item to the whole WORKGROUP: at V4.1's prefill geometry
+ * `n_bh` = T*n_head = 65536 against nblk = 304, so `dsplit` is 1, `dchunk` is D, and 512 threads
+ * each handle exactly ONE d. That is a 4-byte load per split and a 2-byte store per thread per
+ * item -- ten bytes of traffic against the item's index math and its three transcendentals -- and
+ * the megakernel's LDS budget leaves two waves per SIMD to hide the latency with. 636 us for
+ * 335 MB, against 63 us of HBM.
+ *
+ * At D = 8*PLOW_WAVE one WAVE covers a whole item with eight elements per lane, so the loads
+ * widen to two `f32x4`, the store becomes one `st_glob8`, and PLOW_WAVES items are in flight
+ * instead of one. The set of items each workgroup owns is UNCHANGED -- still
+ * {slice + j*nblk} -- which flash_merge_map() in crates/devgen/src/lib.rs requires: the fine dep
+ * gates a workgroup on the flash slices of exactly those items.
+ *
+ * BIT-IDENTICAL: the same four-accumulator fold in the same order over the same splits, the same
+ * `(a0+a1)+(a2+a3)`, the same single `f2bf(acc * inv)`. Only the lane that owns a given d changes,
+ * and no consumer depends on that. */
+#ifndef PLOW_FMERGE_VEC
+#define PLOW_FMERGE_VEC 1
+#endif
+
 template <int D>
 __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ Opart_,
                               const float* __restrict__ mlpart_, unsigned n_batch,
@@ -2087,6 +2109,71 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
     const unsigned dsplit = (nblk + n_bh - 1) / n_bh;
     const unsigned dchunk = ((unsigned)D + dsplit - 1) / dsplit;
     const unsigned n_work = n_bh * dsplit;
+#if PLOW_FMERGE_VEC
+    if (dsplit == 1u && D == (int)(8u * PLOW_WAVE)) {
+        const unsigned wv = threadIdx.x >> 6, ln = threadIdx.x & (PLOW_WAVE - 1u);
+        const unsigned d = ln * 8u;
+        for (unsigned j0 = 0; slice + j0 * nblk < n_work; j0 += PLOW_WAVES) {
+            const unsigned w = slice + (j0 + wv) * nblk;
+            if (w >= n_work) continue;
+            const unsigned hb = w; /* dsplit == 1 => dp = 0, hb = w */
+            const unsigned h = hb % n_head;
+            const auto* ml = mlpart + (size_t)hb * nsplit * 2;
+            float gm;
+            float gl = fa_merge_ml(ml, nsplit, gm);
+            float rescale = 1.0f;
+            if (sinks) {
+                const float sink = FA_SCALE(bf2f(sinks[h]));
+                if (sink > gm) {
+                    rescale = FA_EXP(gm - sink);
+                    gl = gl * rescale + 1.0f;
+                } else {
+                    gl += FA_EXP(sink - gm);
+                }
+            }
+            const float inv = (gl > 0.0f) ? rescale * FA_RECIP(gl) : 0.0f;
+            const auto* obase = Opart + (size_t)hb * nsplit * (size_t)D;
+            float a0[8], a1[8], a2[8], a3[8];
+#pragma unroll
+            for (int u = 0; u < 8; u++) { a0[u] = a1[u] = a2[u] = a3[u] = 0.0f; }
+            unsigned sp = 0;
+            for (; sp + 4 <= nsplit; sp += 4) {
+                float* const acc[4] = {a0, a1, a2, a3};
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    const float mq = ml[(sp + (unsigned)q) * 2];
+                    const float sc = (mq == FA_NEG_INF) ? 0.0f : FA_EXP(mq - gm);
+                    const float* const op = obase + ((size_t)sp + (size_t)q) * D + d;
+                    const f32x4 va = *(const PLOW_GLOB f32x4*)(const PLOW_GLOB void*)op;
+                    const f32x4 vb = *(const PLOW_GLOB f32x4*)(const PLOW_GLOB void*)(op + 4);
+#pragma unroll
+                    for (int u = 0; u < 4; u++)
+                        acc[q][u] = __builtin_fmaf(va[u], sc, acc[q][u]);
+#pragma unroll
+                    for (int u = 0; u < 4; u++)
+                        acc[q][4 + u] = __builtin_fmaf(vb[u], sc, acc[q][4 + u]);
+                }
+            }
+            for (; sp < nsplit; sp++) {
+                const float mq = ml[sp * 2];
+                const float sc = (mq == FA_NEG_INF) ? 0.0f : FA_EXP(mq - gm);
+                const float* const op = obase + (size_t)sp * D + d;
+                const f32x4 va = *(const PLOW_GLOB f32x4*)(const PLOW_GLOB void*)op;
+                const f32x4 vb = *(const PLOW_GLOB f32x4*)(const PLOW_GLOB void*)(op + 4);
+#pragma unroll
+                for (int u = 0; u < 4; u++) a0[u] = __builtin_fmaf(va[u], sc, a0[u]);
+#pragma unroll
+                for (int u = 0; u < 4; u++) a0[4 + u] = __builtin_fmaf(vb[u], sc, a0[4 + u]);
+            }
+            bf16v8 o;
+#pragma unroll
+            for (int u = 0; u < 8; u++)
+                o[u] = f2bf(((a0[u] + a1[u]) + (a2[u] + a3[u])) * inv);
+            st_glob8(O + (size_t)hb * (size_t)D + d, o);
+        }
+        return;
+    }
+#endif
     for (unsigned w = slice; w < n_work; w += nblk) {
         const unsigned dp = w % dsplit, hb = w / dsplit;
         const unsigned h = hb % n_head, b = hb / n_head;

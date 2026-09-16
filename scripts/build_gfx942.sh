@@ -1092,6 +1092,12 @@ if [ -n "${PLOW_IDXPF_PACKFAST:-}" ]; then
   AX_FLASH="$AX_FLASH -DPLOW_IDXPF_PACKFAST=${PLOW_IDXPF_PACKFAST}"
 fi
 
+# PLOW_FMERGE_VEC=0: restore d_flash_merge's workgroup-per-item scalar loop (the A/B control).
+if [ -n "${PLOW_FMERGE_VEC:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_FMERGE_VEC=${PLOW_FMERGE_VEC}"
+  AX_FLASH="$AX_FLASH -DPLOW_FMERGE_VEC=${PLOW_FMERGE_VEC}"
+fi
+
 # CEILING INSTRUMENT ONLY (PLOW_FA_GMFMA_ABL): deletes one term of the head-packed gathered flash
 # to price it. WRONG OUTPUT by construction, never a serve asset. See op_attention_common.h.
 if [ "${PLOW_FA_GMFMA_ABL:-0}" != 0 ]; then

@@ -3857,3 +3857,37 @@ second on this op (arm 3 lost the same way: the largest traffic cut available wa
 **Inside a megakernel at one workgroup per CU, a barrier is not a synchronization primitive, it is
 a serialization of the only latency-hiding the kernel has.** Reverted. W is still 4.0 GB and still
 the binding term; closing it needs a decomposition that shares W without stepping the waves.
+
+### 12.38 FLASH_MERGE gave a work item to 512 threads and asked each for one float: -77.1%
+
+At V4.1's prefill geometry `n_bh` = T*n_head = 65536 against `nblk` = 304, so `d_flash_merge`'s
+`dsplit` is 1, `dchunk` is D = 512, and the shipped loop hands one work item to the WHOLE
+workgroup — 512 threads each doing exactly one `d`. That is one 4-byte load per split and one
+2-byte store per thread per item, **ten bytes of traffic** against the item's index math and its
+three transcendentals, with the megakernel's LDS budget leaving two waves per SIMD to hide the
+latency. 648 us for 335 MB, against 63 us of HBM.
+
+`D` is `8 * PLOW_WAVE`, so one WAVE covers a whole item at eight elements per lane: the loads
+widen to two `f32x4`, the store becomes one `st_glob8`, and `PLOW_WAVES` items are in flight
+instead of one.
+
+    FLASH_MERGE body, layer 2, T=8192, TP8, median of 5:
+
+      workgroup per item (PLOW_FMERGE_VEC=0)   648 us   strag 90   layer 16752 us
+      wave per item, 8/lane (default 1)        149 us   strag 26   layer 16283 us
+
+**-77.1%**, layer -469 us against an op delta of 499, and 149 us is 2.4x off the traffic floor
+where 648 was 10x. Scratch moves 2720 -> 2735 ops: the four accumulator groups cost fifteen
+instructions, not a spill.
+
+The item SET each workgroup owns is unchanged — still `{slice + j*nblk}` — which
+`flash_merge_map()` requires, because the fine dep gates a workgroup on exactly those items'
+flash slices. Bit-identical: the same four-accumulator fold in the same order, the same
+`(a0+a1)+(a2+a3)`, the same single `f2bf(acc * inv)`; only which lane owns a given `d` changes.
+
+§12.37 and this section are the same measurement from opposite ends. Both ops were starved of
+memory-level parallelism at one workgroup per CU. Widening the per-lane work fixed this one;
+adding a barrier to share a tile destroyed the other. **At two waves per SIMD the only latency
+hiding available is inside a lane's own instruction stream.**
+
+Layer 2 at the committed defaults: **16,312 us**, from 20,458 at the start of §12.29.
