@@ -65,6 +65,22 @@ impl Route {
 /// kernels on one MI300X (cold-cache medians, FP64 oracle); the rung-8 entries reuse the rung-16
 /// kernels, whose 16-row tiles cover eight live rows through the kernel's own M edge.
 fn decode_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
+    // A rung above the measured set snaps DOWN to the widest rung that was measured. `arguments`
+    // covers M through the launch grid (`m.div_ceil(spec.mt_j)`), so a 20-row tile spans 32, 64 or
+    // 128 live rows as more M tiles: the route stays correct at any rung, and only its ranking
+    // against the other eleven kernels is unmeasured. This is the same argument by which the
+    // rung-8 entries already reuse the rung-16 kernels.
+    //
+    // It is a routing rule, not a tuning claim. The wider the rung runs past 20, the more likely a
+    // larger-M tile (MT32x*/MT64x*) beats the snapped choice, so a ladder that adds 64 or 128 --
+    // or MTP, which multiplies every decode GEMM's M by (1 + proposals) -- should re-sweep these
+    // shapes rather than inherit this.
+    const MEASURED_RUNGS: [u32; 3] = [8, 16, 20];
+    let rows = MEASURED_RUNGS
+        .into_iter()
+        .rev()
+        .find(|&r| r <= rows)
+        .unwrap_or(rows);
     Some(match (rows, n, k) {
         (8, 256, 6144) => (5, 524289),
         (8, 6144, 256) => (4, 524289),
@@ -709,7 +725,7 @@ mod tests {
 
     #[test]
     fn decode_routes_check_mode_geometry_and_rebasing() {
-        for rows in [8, 16, 20] {
+        for rows in [8, 16, 20, 32, 64, 128] {
             for (n, k) in DECODE_SHAPES {
                 let (mut p, t) = fixture();
                 p.t = rows;
@@ -735,7 +751,7 @@ mod tests {
             "../../../../runtime/amd/glm_lt_decode_gfx942.json"
         ))
         .unwrap();
-        for rows in [8, 16, 20] {
+        for rows in [8, 16, 20, 32, 64, 128] {
             for (n, k) in DECODE_SHAPES {
                 let (index, info1) = decode_choice(rows, n, k).unwrap();
                 // decode kernels follow the four prefill kernels in the pinned object
@@ -760,7 +776,9 @@ mod tests {
             (4, 2048, 6144),
             (8, 1024, 6144),
             (16, 6144, 512),
-            (32, 2048, 6144),
+            // Any rung at or above 8 routes by snapping down, so what must still be refused is an
+            // unpinned SHAPE, at a rung wider than anything measured.
+            (128, 1024, 6144),
         ] {
             assert!(decode_choice(rows, n, k).is_none(), "{rows}x{n}x{k}");
         }
