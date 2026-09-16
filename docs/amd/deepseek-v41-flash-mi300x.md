@@ -5254,7 +5254,8 @@ layer moves only -430 of the -2297. Per-rank attribution is not reliable here fo
 gives -- under EP, rank 0 is the FASTEST rank and its trace reads the others' skew as its own wait
 -- but the direction is not in doubt: all eight ranks' `moe pair + XREDUCE2` sums to a near-constant
 7.6 ms under EP (spread +/-1%), against 5.5 ms under TP. The expert placement is uneven and the
-collective bills the slowest rank.
+collective bills the slowest rank. (12.71 retracts this sentence: the ranks are not
+skewed.)
 
 **Balancing still does not help, and now we know why it cannot.** The even contiguous split gives
 tile loads `[183, 129, 28, 217, 63, 152, 35, 77]`, 1.96x imbalance; a DP over contiguous cuts gets
@@ -5327,9 +5328,8 @@ it balances tiles, and tiles do not predict time. Balanced cuts take the tile im
 to 1.095x and move the layer by 0 us (14 011 even against 14 040 balanced).
 
 **Whatever sets a rank's MoE time under EP, it is not the amount of gathered-row arithmetic it was
-given.** That is the open question, and it is the one that has to be answered before EP or any
-other expert-sharding scheme can be scheduled properly -- balancing the wrong quantity is what both
-attempts so far have done.
+given.** 12.71 answers that: it is not a measurement of work at all, and there is no imbalance to
+balance.
 
 ### Honest position
 
@@ -5378,3 +5378,54 @@ ranks. Three candidates, none of them free:
 The 12.25 ceiling instruments that concluded "bound by neither its k-loop nor its scatter" were run
 against the 231-tile build, i.e. on 17.9% of the rows (12.67), so they need redoing before any of
 this is chosen. That is the first step, not the third.
+
+## 12.71 There is no EP imbalance. Every rank is slower by the same 2.15 ms
+
+Three rounds of this campaign have tried to fix EP by balancing expert placement -- even cuts, a DP
+over contiguous cuts, and a hunt for what predicts a rank's MoE time. The premise was wrong.
+
+**Total body, per rank, one traced iteration, 8k/TP8, block 2, union arm, MoE fixed:**
+
+    TP   13 986  14 032  14 037  14 044  14 043  14 044  13 986  14 039     spread 58 us  (0.4%)
+    EP   16 175  16 169  16 172  16 174  16 184  16 157  16 159  16 165     spread 27 us  (0.17%)
+
+Every EP rank is slower than every TP rank, by 2.15 ms, to within 0.17%. **There is no straggler.**
+A balancing pass cannot help a distribution whose spread is already a sixth of a percent.
+
+The 20x per-rank "MoE pair" spread that motivated all of it (319 to 6 367 us) is an attribution
+artefact, and the constant sum is the tell: `moe pair + XREDUCE2` is 7 524 - 7 720 us on every rank
+(+/-1.3%) while its two halves swing 20x and 6x in opposite directions. The trace is splitting one
+fixed interval at a boundary that moves with arrival phase. That is also why the correlations came
+out at exactly zero rather than merely weak:
+
+    corr(per-rank tiles, per-rank MoE us)   -0.001
+    corr(per-rank rows,  per-rank MoE us)   -0.003
+    corr(used experts,   per-rank MoE us)   -0.171
+
+Zero correlation with three different measures of work is not a hard scheduling problem. It is a
+number that does not measure work.
+
+**The partition itself was never in doubt, and is now verified.** Per-rank `act.moe_meta` under EP
+(`--dump` now honours `PLOW_TRACE_ALLRANKS`, since rank 0's metadata says nothing about what rank 4
+was asked to compute):
+
+    rank      0     1     2     3     4     5     6     7    total
+    rows  10595  7314   988 12815  3140  8826  1296  4178    49152
+    tiles   183   129    28   217    63   152    35    77      884
+
+884 tiles, exactly TP's single-rank total, each rank's window exactly its cut. The expert weights
+are uniform too -- every expert's `w2.scale` on layer 2 is 368 640 E8M0 bytes with 0.00% zeros and
+0.00% 0xFF, so no rank is running MFMAs against denormal or NaN scales.
+
+### What this leaves
+
+EP costs a uniform +2.15 ms/layer while making the MoE arithmetic 2.3 ms cheaper, so something in
+the EP path costs ~4.4 ms that the TP path does not, on every rank equally. It is not placement, not
+skew, not the tile map and not the weight values -- all four are now excluded by measurement. The
+candidates left are structural and cheap to enumerate: the second `XREDUCE2`'s operand shape
+(`i2 = 2 621 440, i3 = 2, i4 = 3` under TP -- unchecked under EP), the `MOE_COMBINE_PF` contract
+when experts are whole rather than sliced, and the EP align's own four-dispatch segmentation, which
+12.64 already priced at ~450 us at the next collective on the broken build.
+
+**`PLOW_MOE_EP_CUTS` should be treated as answered in the negative.** It balances tiles; tiles are
+not the problem; nothing is imbalanced. It stays in the tree as a diagnostic, not as a tuning knob.

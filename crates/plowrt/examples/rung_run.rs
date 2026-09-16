@@ -291,13 +291,24 @@ mod hsa {
         }
 
         if !dump.is_empty() {
+            // PLOW_TRACE_ALLRANKS writes one file per rank here too, `.rk{n}`-suffixed, for the
+            // same reason it does for traces: under EP the ranks hold DIFFERENT experts, so rank
+            // 0's `act.moe_meta` says nothing about what rank 4 was asked to compute.
+            let all = plowrt::config::RuntimeConfig::get().amd.trace_allranks;
             for spec in dump.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 let (name, path) = spec.split_once('=').ok_or("--dump wants name=path")?;
-                let b = g.rank(0).tensor_bytes(name).ok_or_else(|| format!("{name} NOT DECLARED"))?;
-                let mut buf = vec![0u8; b as usize];
-                g.rank(0).read_tensor(name, &mut buf)?;
-                std::fs::write(path, &buf)?;
-                println!("dumped {name} -> {path} ({b} bytes)");
+                for rank in 0..if all { g.n_gpu() } else { 1 } {
+                    let out =
+                        if all { format!("{path}.rk{rank}") } else { path.to_string() };
+                    let b = g
+                        .rank(rank)
+                        .tensor_bytes(name)
+                        .ok_or_else(|| format!("{name} NOT DECLARED"))?;
+                    let mut buf = vec![0u8; b as usize];
+                    g.rank(rank).read_tensor(name, &mut buf)?;
+                    std::fs::write(&out, &buf)?;
+                    println!("dumped {name} -> {out} ({b} bytes)");
+                }
             }
         }
 
