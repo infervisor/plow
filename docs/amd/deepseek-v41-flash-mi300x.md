@@ -4128,6 +4128,12 @@ MEASURED, layer 2 at 8k/TP8, arms interleaved so thermal drift lands on both:
 **-783 us on the pair, -32.9%**, over five control repeats and four treatment repeats with no
 overlap between the arms. DOWN -26%, GLU -40%. Layer min-to-min 16,102 -> 15,374 us.
 
+**The end-to-end number for this change is NOT yet measured.** The 40-layer run needs ~135 GB/GPU
+and the co-tenant described below has held VRAM through eight retry attempts; allocations now fail
+at 16 MB. The single block needs 13 GB and still runs, which is why the op-level result above is
+solid and the model-level one is absent. -783 us/layer predicts roughly -31 ms of the 611, i.e.
+~580 ms -- PREDICTED, not measured, and not to be quoted as a result until a 40-layer run lands.
+
 Two things this cost, both worth recording:
 
 **The A/B harness was lying, and had been.** The whole V4.1 default block sat behind
@@ -4137,11 +4143,26 @@ experiment reported as a tile result. The guard is now scoped to the assignment 
 each default is individually `:-`. The §12.26 numbers survive only because the EPI note happened to
 force the one variable that mattered.
 
-**The exit MEAN is not a parity signal and never was.** BM=192 returns mean -0.000736 against the
-control's -0.000712 -- but one UNCHANGED object returns -0.000712 and -0.000713 on consecutive
-runs, so the MoE reduction is run-order dependent at the 1e-6 level. min/max hold to the printed
-digit (-1.36719 / 3.64062) across every tile and every run, and that is the parity check. Earlier
-sections quote the mean alongside min/max; read it as incidental.
+**The exit MEAN is TILE-dependent, and that is expected.** On a quiet machine each tile returns a
+STABLE mean and they differ from each other: BM=64 -0.000643, BM=128 -0.000712/-0.000713, BM=192
+-0.000736, while min/max hold to the printed digit (-1.36719 / 3.64062) at every tile. So this is
+a summation-order difference, not drift -- the tiling fixes the order in which the grouped GEMM's
+output tiles are produced, the combine is not on the deterministic arm (`moe_pf_det` off), and a
+mean that is a near-cancellation of 167M values of magnitude ~1.4 moves in its fifth decimal for
+an absolute rounding change of ~2e-5. **The 64 -> 128 transition already shipped a LARGER shift of
+exactly this kind** (-0.000643 -> -0.000712) and was validated end to end at 755 ms. min/max is
+the parity check; the mean is incidental, and earlier sections quote it only alongside them.
+
+**A caveat on every parity reading taken late in this round.** A co-tenant on this host took most
+of VRAM partway through (two KFD contexts in `/sys/class/kfd/kfd/proc` with no `/proc` entry --
+another container). Under that pressure runs begin to OOM, and some that DO complete return a
+visibly wrong exit -- the control at BM=128 returned `-1.34375 / 3.67188 / -0.000666` on one run
+of five, and BM=192 returned `-1.38281 / 1.72656` on another. That is the failure the runtime
+names itself elsewhere in this session: "a collective hit its deadline and returned WITHOUT
+reducing". **It is environmental and it affects BOTH arms equally**, so it does not implicate the
+tile -- but it means a parity check is only worth reading from a run that completes on a quiet
+machine. The stable numbers above are from the earlier quiet window, where all nine runs of the
+interleaved A/B completed and every one held min/max.
 
 Requires the `mla.rs` `MPF_BM` sizing bound raised to 192 and the packet RE-EMITTED: the align op
 pads to the OBJECT's tile height, so an object whose tile exceeds the bound its packet was sized
