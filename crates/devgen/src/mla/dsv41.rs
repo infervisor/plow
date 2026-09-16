@@ -866,6 +866,22 @@ pub(crate) struct Dsv41Index {
     kn: u32,
     /// `[T][ctx/min_ratio]` f32. The widest score a layer in this chain needs.
     score: u32,
+    /// THE PER-PACK UNION (op 119), and the `u64[n_qt][kv_stride]` membership scratch it builds
+    /// it through. This is what lets the gathered pass run the V2 arm instead of the scalar one:
+    /// 8 queries share one staged KV slab and carry a 64-bit mask per row (8 queries x 8 heads),
+    /// so the latent is read once per PACK rather than once per query.
+    uni: u32,
+    umask: u32,
+}
+
+/// Queries per union pack. Fixed by the kernel (`op_attention_common.h`, `QP`), which puts the
+/// pack's 8 queries x 8 heads on the MFMA M dimension and therefore requires `n_head == 8`.
+pub(crate) const DSV41_UNION_PACK: u32 = 8;
+
+/// The union table's per-pack row capacity. A pack cannot name more rows than its 8 queries
+/// select between them, nor more than the cache holds.
+pub(crate) fn dsv41_union_cap(topk: u32, kv_rows: u32) -> u32 {
+    (DSV41_UNION_PACK * topk).min(kv_rows)
 }
 
 /// Declare the indexer's scratch. `None` when no layer in the chain runs an indexer or reads a
@@ -892,6 +908,21 @@ pub(crate) fn declare_dsv41_index(
         kn: b.tensor("act.index_kn", cx * di * 2),
         // The score is [T][pools] and `pools` is widest at the SMALLEST ratio in the chain.
         score: b.tensor("act.index_score", r * cx * 4),
+        // Sized for the WIDEST case in the chain, like `score`: ratio 1, so `kv_rows == ctx`.
+        // Layout (dev_isa.h op 119): u32 count[n_qt], 256 B aligned, then per pack
+        // [cap i32 pos][cap u32 maskLo][cap u32 maskHi].
+        uni: b.tensor(
+            "act.index_uni",
+            {
+                let n_qt = (r + DSV41_UNION_PACK as u64 - 1) / DSV41_UNION_PACK as u64;
+                let cap = dsv41_union_cap(c.index_topk, ctx) as u64;
+                (n_qt * 4).next_multiple_of(256) + n_qt * cap * 12
+            },
+        ),
+        umask: b.tensor(
+            "act.index_umask",
+            ((r + DSV41_UNION_PACK as u64 - 1) / DSV41_UNION_PACK as u64) * cx * 8,
+        ),
     })
 }
 
@@ -1085,7 +1116,7 @@ pub(crate) fn emit_dsv41_indexer(
         d.i[4] = ratio; // POOLS, not tokens
         d.f[0] = scale;
     });
-    b.emit(DevOp::IndexSelectPf, all.clone(), &[c_sc], |d| {
+    let c_sel = b.emit(DevOp::IndexSelectPf, all.clone(), &[c_sc], |d| {
         d.t[0] = ix.idx;
         d.t[1] = ix.score;
         d.t[2] = kvlen;
@@ -1093,6 +1124,32 @@ pub(crate) fn emit_dsv41_indexer(
         d.i[1] = topk;
         d.i[2] = kv_stride;
         d.i[3] = ratio; // MUST equal op 117's i4
+    });
+    // THE PER-PACK UNION. Built here, beside the selection it summarises and once per PUBLICATION
+    // rather than once per reader: the 38 reader layers share `ix.idx`, so they share this too.
+    //
+    // It is what the gathered flash needs to take the V2 arm. The scalar arm walks one query's
+    // top-k at a time and re-reads the latent for each; the V2 arm stages the pack's union ONCE
+    // and masks per row. Measured on this model's own selections at 8k, a pack of 8 unions to
+    // 1582 rows against the 8 x 480 = 3840 the scalar arm reads: 2.43x fewer row reads.
+    b.emit(DevOp::IndexUnionPf, all.clone(), &[c_sel], |d| {
+        d.t[0] = ix.uni;
+        d.t[1] = ix.umask;
+        d.t[2] = ix.idx;
+        d.t[3] = kvlen;
+        d.i[0] = t;
+        d.i[1] = topk;
+        // THE SCAN BOUND IS IN TOKENS, THE SELECTIONS ARE IN POOLS, and `i2` has to cover the
+        // larger of the two. `d_index_union_pf` walks `[0, tile_end)` with
+        // `tile_end = kv_len[0] - n_tok + q_hi + 1` -- a TOKEN position -- while indexing
+        // `umask[slice * kv_stride + s]`. GLM reaches here after `DsaPoolExpand`, so its two
+        // spaces agree; V4.1 selects COMPRESSED entries directly and `ctx / ratio` would be half
+        // the row the scan writes, running off the end of the scratch (a hardware exception, not
+        // a wrong answer). `ctx` is the bound that covers it; positions above `ctx / ratio` are
+        // simply never set, and `cap` is unchanged because 8 * top_k is the binding term.
+        d.i[2] = ctx;
+        d.i[3] = dsv41_union_cap(topk, ctx);
+        d.i[4] = DSV41_UNION_PACK;
     })
 }
 
@@ -1740,7 +1797,16 @@ pub(crate) fn emit_dsv41_attn_core(
     // yet (`scripts/dsv41_indexer_oracle.py` check [2]).
     let c_fl = match compressed {
         None => c_fl,
-        Some((cache, idx, topk)) => b.emit(DevOp::FlashGatherPrefill, all.clone(), &[c_q, c_kv, c_fl], |d| {
+        // OP 51, NOT OP 55, and `t7` is the per-pack UNION rather than the per-query top-k.
+        //
+        // Op 55 is `d_flash_gather_prefill`, the scalar body: one query at a time, its own top-k,
+        // the latent re-read for each. The same packet as op 51 with the NoPE bit and a union in
+        // t7 selects `d_flash_mla_prefill_v2<512, 0, GATHER=true>` instead, which stages the
+        // pack's union once for 8 queries with all 8 per-rank heads on the MFMA M dimension.
+        // That arm requires `n_head == 8`, which is what TP8 gives this model.
+        //
+        // i6 is the union's `cap` here, disambiguated by t7 exactly as the DR=64 chain does it.
+        Some((cache, uni, topk)) => b.emit(DevOp::FlashMlaPrefill, all.clone(), &[c_q, c_kv, c_fl], |d| {
             d.t[0] = act.opart;
             d.t[1] = act.mlpart;
             d.t[2] = act.qr;
@@ -1748,14 +1814,14 @@ pub(crate) fn emit_dsv41_attn_core(
             d.t[4] = cache;
             d.t[5] = cache;
             d.t[6] = kvlen;
-            d.t[7] = idx;
+            d.t[7] = uni;
             d.i[0] = 1;
             d.i[1] = nh_l;
             d.i[2] = ctx; // cache rows; the selection never names one past `ctx / ratio`
             d.i[3] = 1u32 << 31; // NoPE, and NO window: the gather arm takes the whole set
             d.i[4] = t;
             d.i[5] = KV_MASK_NONE;
-            d.i[6] = topk;
+            d.i[6] = dsv41_union_cap(topk, ctx);
             d.i[7] = (2u32 << 8) | 1; // partial 1 of 2
             d.f[0] = scale;
         }),
@@ -2488,7 +2554,7 @@ pub(crate) fn emit_dsv41_block(
             nn_graph::models::config::V41Attn::Compressed { ratio } => {
                 let cp = compress.as_ref().expect("a compressed layer needs a cache");
                 let ix = index.as_ref().expect("a compressed layer needs a selection");
-                Some((cp.cache, ix.idx, dsv41_index_topk(c, t, ratio)))
+                Some((cp.cache, ix.uni, dsv41_index_topk(c, t, ratio)))
             }
         };
         let (core, c_core) = emit_dsv41_attn_core(

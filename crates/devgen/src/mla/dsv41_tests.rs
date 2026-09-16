@@ -1495,24 +1495,30 @@ fn a_compressed_layer_merges_two_partials_with_the_sink_folded_once() {
     };
     let _guard = crate::test_env::env_guard();
     let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[3], 8, 304, 8192, 256);
+    // BOTH passes are op 51. The gathered one is the one carrying a table on t7 -- the per-pack
+    // union, which selects the V2 GATHER arm; the window pass leaves t7 unset and takes the dense
+    // arm of the same body.
     let win = m
         .progs[0]
         .insts
         .iter()
-        .find(|d| d.op == DevOp::FlashMlaPrefill as u16)
+        .find(|d| d.op == DevOp::FlashMlaPrefill as u16 && d.t[7] == TENSOR_NONE)
         .expect("the window flash");
     let gat = m
         .progs[0]
         .insts
         .iter()
-        .find(|d| d.op == DevOp::FlashGatherPrefill as u16)
+        .find(|d| d.op == DevOp::FlashMlaPrefill as u16 && d.t[7] != TENSOR_NONE)
         .expect("the compressed flash -- 38 of 40 layers need it");
     assert_eq!(win.i[7], (2 << 8) | 0, "window is partial 0 of 2");
     assert_eq!(gat.i[7], (2 << 8) | 1, "compressed is partial 1 of 2");
     assert_eq!(win.t[0], gat.t[0], "ONE Opart, filled in disjoint halves");
     assert_eq!(win.t[1], gat.t[1], "ONE mlpart");
     assert_ne!(win.t[4], gat.t[4], "and two DIFFERENT caches: the window K and the CSA2 cache");
-    assert_ne!(gat.t[7], TENSOR_NONE, "the gather walks the selection table");
+    assert_eq!(
+        m.tensors[gat.t[7] as usize].name, "act.index_uni",
+        "the gathered pass walks the per-pack UNION, not the raw per-query selection",
+    );
     assert_ne!(gat.i[3] & 0x8000_0000, 0, "NoPE: the rope is interior and already applied");
 
     let merges: Vec<_> = m
@@ -1538,7 +1544,10 @@ fn a_compressed_layer_merges_two_partials_with_the_sink_folded_once() {
         .find(|d| d.op == DevOp::FlashMlaPrefill as u16)
         .unwrap();
     assert_eq!(w0.i[7], 0, "no output split on a layer with one partial");
-    assert!(!m0.progs[0].insts.iter().any(|d| d.op == DevOp::FlashGatherPrefill as u16));
+    assert!(!m0.progs[0]
+        .insts
+        .iter()
+        .any(|d| d.op == DevOp::FlashMlaPrefill as u16 && d.t[7] != TENSOR_NONE));
 }
 
 /// Every tensor-parallel weight is READ at the width it was DECLARED at.
@@ -1801,6 +1810,10 @@ fn written_slots(op: u16) -> &'static [usize] {
         // `t0=Opart(f32) t1=mlpart(f32)` -- the split-K partial AND its running max/lse pair, both
         // written, both read back by `FlashMerge`.
         o if o == DevOp::FlashMlaPrefill as u16 => &[0, 1],
+        // t = [union, umask, idx, kv_len] -- op 119 builds the union table AND the u64 membership
+        // scratch it builds it through (it zeroes the row, scatters into it and reads it back);
+        // only `idx` and `kv_len` are inputs.
+        o if o == DevOp::IndexUnionPf as u16 => &[0, 1],
         _ => &[0],
     }
 }
