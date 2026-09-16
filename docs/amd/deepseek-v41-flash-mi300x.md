@@ -4717,3 +4717,38 @@ Across the three load/store-width commits the op is **666.7 -> 398.0 us, -40%**,
 
 What 12.58 says about OCCUPANCY is unaffected and stands: Qsm alone is 37,376 B against the
 32,768 B a second workgroup would need, so occupancy 2 is a property of DK=512 on a 64 KiB part.
+
+## 12.59 The layer's biggest op had an unranked MFMA body. Ranked: it loses by 2.6x
+
+`FLASH_GATHER_PREFILL` is 2955 us of a 14,900 us layer -- 20%, the single largest op -- and
+`op_attention_common.h` carried a written-but-never-measured alternative next to it,
+`d_flash_gather_prefill_mfma`, marked "opt-in until hardware ranks it". Ranked, interleaved with
+its control, two pairs:
+
+    PLOW_FA_GATHER_MFMA=0   2955.1 / 2980.9 us     layer 14914.5 / 14856.3
+    PLOW_FA_GATHER_MFMA=1   7729.2 / 7632.0 us     layer 19403.9 / 19448.5
+
+Exits IDENTICAL (-1.36719 / 3.64062) on every run of both arms, so the body is CORRECT; it is the
+wrong shape. It is `d_flash_mla_decode_mfma<GATHER=true>`, whose work item is ONE QUERY TOKEN: at
+TP8 that puts n_head=8 on the MFMA M-dimension against a 16-wide tile and stages each token's own
+top_k set with no reuse across tokens, where the scalar body groups GF=8 heads and streams the
+gathered latent once. Recorded in the knob's comment so it is not re-ranked unchanged.
+
+With `PLOW_FA_GATHER_ABL` (12.4x: traffic, +0.1%) and the re-sharding study (12.5x: identical ALU
+work either way) this closes the third and last cheap hypothesis about the layer's biggest op. It
+is ALU-bound at ~29.5% of scalar vector peak and the matrix core cannot take the work at this
+shape.
+
+### Where the layer stands after 12.58a
+
+    FLASH_GATHER_PREFILL   2955    ALU-bound; traffic, re-sharding and MFMA all falsified
+    GEMM_FP8_MX            2788    tile sized on both axes, all four points worse
+    XREDUCE2               1673    98.7% straggler -- collective wait, not work
+    GEMV_F32               1060    8 arms measured; register-bound at MR=4, LDS share lost 6x
+    MOE_GROUP_DOWN_PF       952    MPF_BM 128 -> 192 already taken (-32.9% on the pair)
+    MOE_GROUP_GLU_PF        610
+    HYPER_CONN_PRE/POST    1090    already fully vectorised (PLOW_HC_VEC8)
+    COMPRESS_ROPE_QUANT     378    666.7 -> 398.0 over three commits, -40%
+
+Every line above is either measured-and-closed or measured-and-taken. **90 ms remains 0.99x the
+roofline floor (12.56), and the gap is not in any one op.**

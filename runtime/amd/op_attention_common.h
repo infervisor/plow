@@ -2946,7 +2946,20 @@ __device__ void d_flash_mla_prefill_fp8(float* __restrict__ Opart, float* __rest
 #define PLOW_MLA_PF_MFMA 1
 #endif
 /* Route FLASH_GATHER_PREFILL to the head-packed MFMA body (d_flash_gather_prefill_mfma) instead
- * of the scalar d_flash_gather_prefill. Opt-in until hardware ranks it. */
+ * of the scalar d_flash_gather_prefill.
+ *
+ * RANKED, AND IT LOSES BY 2.6x. Measured on 8x MI300X, V4.1 layer 2 at T=8192, interleaved with
+ * its control, two pairs:
+ *
+ *     PLOW_FA_GATHER_MFMA=0   2955.1 / 2980.9 us     layer 14914.5 / 14856.3
+ *     PLOW_FA_GATHER_MFMA=1   7729.2 / 7632.0 us     layer 19403.9 / 19448.5
+ *
+ * Exits are IDENTICAL (-1.36719 / 3.64062) on every run of both arms, so the body is CORRECT --
+ * it is simply the wrong shape here. It is `d_flash_mla_decode_mfma<GATHER=true>`, whose work
+ * item is ONE QUERY TOKEN: at TP8 that puts n_head=8 on the MFMA M-dimension against a 16-wide
+ * tile, and it stages each token's own top_k set with no reuse across tokens. The scalar body
+ * groups GF=8 heads and streams the gathered latent ONCE. Kept as the arm that prices this, not
+ * as a candidate; do not re-rank without changing the work item. */
 #ifndef PLOW_FA_GATHER_MFMA
 #define PLOW_FA_GATHER_MFMA 0
 #endif
