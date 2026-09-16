@@ -4851,3 +4851,49 @@ Exits identical. Two reasons, and both are worth keeping:
 **The store is now populated with real records rather than a stale-by-14-digests pile**, which is
 worth having on its own -- but the emit-time warning, though accurate, is not the lever it looks
 like on this model. Both GEMM axes are now closed by measurement.
+
+## 12.62 All 40 layers, complete: 599.7 ms chain-sum / ~572 ms whole-model
+
+The two Engram-bearing chains finally cleared the co-tenant's memory. All four, at the current
+defaults (MPF_BM=192, PLOW_CMP_VEC8=1, PLOW_CMP_TAB4=1, and the compressor store lane of 12.58a):
+
+    0__9     min 151095.8  median 151620.5 us
+    10__19   min 156961.5  median 157115.3 us
+    20__29   min 147912.9  median 148954.4 us
+    30__39   min 141637.9  median 142023.9 us
+    ----------------------------------------
+    sum(min) 597.6 ms      sum(median) 599.7 ms
+    whole-model equivalent (less the measured 27.3 ms seam offset):  ~572.4 ms
+
+Against 12.50's 608.3 chain-sum / ~581 ms: **-8.6 ms**, which is what this session's compressor
+work predicted (-150 us/layer on COMPRESS_ROPE_QUANT alone is -6 ms).
+
+## 12.63 The MoE tile is not padding-bound, it is per-tile weight-reload bound
+
+`MPF_BM` sets the height every expert's gathered rows are padded up to, and op_moe.h calls the
+padding "pure MFMA waste". At T=8192 that padding is large -- 8192 tokens x top-6 plus shared =
+57,344 real rows over 385 experts (~149 each), padded to 192 gives ~81,984 rows, **~43% of the MoE
+GEMM computing zeros**. So the tile should want to be SMALL. Swept, op body, two passes:
+
+    MPF_BM      DOWN      GLU      pair
+      64       2412      1598     4010 us
+     128       1350      1020     2370 us
+     192        933       627     1560 us     <- shipped, and still falling steeply
+
+**Monotone the other way, and that settles the mechanism.** If padded rows were the cost, BM=64 --
+which pads an average expert to ~0% against BM=192's 50% -- would win. It is 2.6x WORSE. The cost
+is the PER-TILE EXPERT-WEIGHT RELOAD: an expert spanning two tiles streams its weights twice, and
+TP8 is what makes that bite, because `down`'s K is moe_intermediate/TP = 288, a k-loop far too
+short to amortise the fixed per-tile cost. op_moe.h's own note says exactly this and stops at 192.
+
+It stops there because of the arena, not the model: the single-buffered tile is
+`(MPF_BM+MPF_BN)*MPF_BK*2` bytes, so at BN=256/BK=64, BM=256 needs 65,536 B against `plow_smem`'s
+64,512. **BK=32 halves the tile and reopens BM to 512**, and per op_moe.h halving BK doubles the
+k-passes while each expert weight byte still crosses HBM exactly once -- the stream the grouped
+form exists to amortise is unchanged. `MPF_BK` is now plumbed to the prefill row (it had only ever
+reached the decode row), and BM=384 and BM=512 at BK=32 both build.
+
+Measurement PENDING: the co-tenants took the whole machine mid-sweep (three PIDs at ~205 GB each,
+0 GB free on all eight), so even the control arm OOMed. The sizing bound in `mla.rs` stays at 192
+until a number justifies raising it -- 512 costs ~60 MB/rank of `fu_g`, paid whatever tile the
+object then picks.

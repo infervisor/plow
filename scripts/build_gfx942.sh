@@ -1151,6 +1151,15 @@ fi
 if [ -n "${MPF_BM:-}" ]; then
   AX_PREFILL="$AX_PREFILL -DMPF_BM=$MPF_BM"
 fi
+# MPF_BK for the PREFILL row, the twin of the decode row's. The single-buffered tile is
+# (MPF_BM+MPF_BN)*MPF_BK*2 bytes against plow_smem, so at BN=256/BK=64 the arena caps BM at 192
+# ((192+256)*64*2 = 57,344 <= 64,512; 256 would need 65,536). BK=32 halves the tile and reopens
+# BM to 512 — and per op_moe.h's own note, halving BK doubles the k-passes but each expert weight
+# byte still crosses HBM exactly once, so the stream the grouped form exists to amortise is
+# unchanged. Compare any BM against a BK-matched control, or the measurement is BK and not BM.
+if [ -n "${MPF_BK:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DMPF_BK=$MPF_BK"
+fi
 
 # OPT-IN (PLOW_MOE_PF_EPI_SIB=1): THE SAME HOIST AT THE TWO SIBLING SITES (op_moe.h
 # PLOW_MOE_PF_EPI_SIB) -- `d_moe_group_pf_a4w4` (native CDNA4 and simulated CDNA3) and
