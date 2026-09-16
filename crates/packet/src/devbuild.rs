@@ -1901,8 +1901,8 @@ impl Builder {
                     && matches!((inst.i[1], inst.i[2]), (3_840, 15_360) | (5_376, 21_504));
                 let output12_shape =
                     rows && matches!((inst.i[1], inst.i[2]), (3_840, 4_096) | (3_840, 8_192));
-                let output31_shape =
-                    rows && matches!((inst.i[1], inst.i[2]), (5_376, 8_192) | (5_376, 16_384));
+                let output31_shape = matches!(inst.i[0], 4096 | 8192)
+                    && matches!((inst.i[1], inst.i[2]), (5_376, 8_192) | (5_376, 16_384));
                 let common = inst.i[4] == 0
                     && inst.i[5] == 0
                     && inst.f.iter().all(|value| value.to_bits() == 0)
@@ -5340,6 +5340,11 @@ mod gemma4_glu_segment_tests {
                 }
                 for rows in [1024, 2048, 4096, 8192] {
                     let p = program(false, rows, fp8, kind);
+                    if matches!(kind, Kind::Output31) && rows < 4096 {
+                        assert_ne!(p.insts[1].wait_len, 0);
+                        assert_ne!(p.insts[1].succ_len, 0);
+                        continue;
+                    }
                     let segment = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
                     assert!(p
                         .stream

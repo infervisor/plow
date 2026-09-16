@@ -83,6 +83,11 @@ fn native(inst: &DevInst64) -> bool {
     if (model, kind, precision(inst)) == (Model::Gemma12, Kind::Output, Some(Precision::Fp8)) {
         return false;
     }
+    if (model, kind) == (Model::Gemma31, Kind::Output)
+        && !matches!(inst.i[0], 4096 | 8192)
+    {
+        return false;
+    }
     match (kind, precision(inst)) {
         (Kind::Glu, Some(Precision::Bf16)) => {
             inst.op == DevOp::GemmGlu as u16
@@ -1015,11 +1020,20 @@ mod tests {
             for rows in [1024, 2048, 4096, 8192] {
                 for k in [8192, 16_384] {
                     let (prog, tensors) = down_fixture(rows, 5376, k, precision);
-                    assert!(program_candidate(&prog));
-                    assert!(program_output_candidate(&prog));
+                    let qualified = rows >= 4096;
+                    assert_eq!(program_candidate(&prog), qualified);
+                    assert_eq!(program_output_candidate(&prog), qualified);
                     assert!(!program_down_candidate(&prog));
-                    assert_eq!(program_fp8_candidate(&prog), precision == Precision::Fp8);
-                    let route = routes(&prog, &tensors, 1).unwrap()[0].unwrap();
+                    assert_eq!(
+                        program_fp8_candidate(&prog),
+                        qualified && precision == Precision::Fp8
+                    );
+                    let route = routes(&prog, &tensors, 1).unwrap()[0];
+                    if !qualified {
+                        assert!(route.is_none());
+                        continue;
+                    }
+                    let route = route.unwrap();
                     let expected = match (precision, rows, k) {
                         (Precision::Bf16, 1024 | 2048 | 4096, 16_384) => Tile::C6,
                         (Precision::Bf16, _, _) => Tile::C5,
@@ -1044,6 +1058,11 @@ mod tests {
         assert_eq!((route.rows, route.tile), (4096, Tile::C2));
         assert!(route.rebase(0).is_err());
         assert!(route.rebase(8193).is_err());
+
+        let (prog, tensors) = down_fixture(4096, 5376, 16_384, Precision::Fp8);
+        let mut route = routes(&prog, &tensors, 1).unwrap()[0].unwrap();
+        route.rebase(2048).unwrap();
+        assert_eq!((route.rows, route.tile), (2048, Tile::C5));
 
         let (mut l2_prog, l2_tensors) = fixture(8192, 15_360, 3_840);
         l2_prog.l2_domains = 8;
