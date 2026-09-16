@@ -5067,3 +5067,44 @@ Cost of the device-side filter: nothing. The prefill row is unchanged at 256 VGP
 `PLOW_MOE_EP_CUTS` is refused without the specialist align -- it is a host-side table and the
 interpreter derives the even split on-device, so binding weights one way while filtering the other
 would hand a rank rows for experts it does not hold.
+
+## 12.65 The biggest op has an arm it never took: the V2 pack-8 gathered flash
+
+FLASH_GATHER_PREFILL is ~2990 us/layer, the largest single op, and 12.59 left it "insensitive to
+scatter locality, sensitive to volume" at 3.3x its VALU floor. Volume is the thing to attack, and
+the tree already contains the arm that attacks it.
+
+V4.1 emits op 55, whose t7 is a PER-QUERY top-k list, and `d_flash_gather_prefill` walks it as
+`d_flash_mla_decode<512, 0, GF, GATHER=true>` -- scalar, one query at a time. The other arm is op
+51 with t7 = a per-PACK UNION table (op 119, `IndexUnionPf`), taken by
+`d_flash_mla_prefill_v2<512, 0, GATHER=true>`: it stages the pack's union ONCE and applies per-row
+u64 membership masks, with all 8 per-rank heads riding the MFMA M dimension.
+
+`d_flash_mla_prefill_v2<512, 0, GATHER=true>` IS ALREADY COMPILED, under PLOW_MLA_PF_NOPE_ARM.
+DK=512/DR=0 is exactly V4.1's compressed pass. The arm gates on `n_head == 8`, and V4.1 at TP8 has
+n_head == 8. What is missing is only the EMIT: dsv41 stops at ops 117/118 and never builds a union.
+
+Measured on this packet's own selections (`--dump act.index_idx`, 8192 queries x top_k 512):
+
+    selected entries        3932160   (480.0 live per query)
+    distinct positions         4094   (the compressed sequence, not the token sequence)
+
+    pack    per-query rows    union rows   reduction
+      8           3932160       1619738      2.43x
+     16           3932160        961120      4.09x
+     32           3932160        516359      7.62x
+     64           3932160        263502     14.92x
+
+The 64-row column is a trap and the kernel says so: the per-64-query union was tried for GLM and
+measured NET-NEGATIVE, because those unions reach 45-80% of the causal range and the indexer cost
+more than the gather saved. GLM_DSA_PF_PACK is 8.
+
+So the honest trade at pack 8 is 2.43x fewer latent row-reads for ~3.3x MORE score/PV math --
+8 queries scored densely against a 1582-row union instead of exactly against 480 -- except that the
+math moves from VALU to the matrix core, which is ~8x faster per MAC on this part. Net ~2x on the
+op, if it behaves. That is ~1.5 ms/layer, 60 ms over 40 layers, and it is the largest single lever
+left in the layer.
+
+NOT YET BUILT. The emit work is: declare `iuni`/`iumask`, emit op 119 at pack 8, and swap the
+gathered flash from op 55 to op 51 carrying the NoPE bit, t7 = union and i6 = cap -- then route the
+segment to the 4-wave flash object with PLOW_MLA_PF_NOPE=1.
