@@ -5499,3 +5499,70 @@ That is the thing to answer next, and it is worth answering: it is the ONLY reas
 2.3 ms/layer win, and 12.70's k-loop argument says the same mechanism is worth having under TP too.
 `PLOW_MOE_EP_CUTS` remains a dead end for the reason 12.71 gives -- it balances a quantity that does
 not predict the cost.
+
+## 12.73 The benchmark was feeding the layer its own output, and it is why 12.68-12.72 disagree
+
+`rung_run` wrote `act.x` once and then launched the rung `--iters` times. The rung writes its result
+back over `act.x`. So iteration 2 ran on iteration 1's output, iteration 30 on a value pushed
+through the same layer thirty times, and the activations degenerate.
+
+The tell is in arrival order, which none of 12.68-12.72 looked at. TP is flat; EP ramps:
+
+```
+TP  : 20814 15115 14872 14743 14608 14788 ... 14697   (flat from iter 3)
+EP  : 15145 15144 14090 14254 16157 16899 ... 19087   (climbs, no plateau)
+```
+
+Not thermal: a 100 ms gap between iterations leaves the curve identical, and a fresh process starts
+fast again on a GPU the previous process had just left hot. Iteration-count driven, so it is state,
+and the state is the entry.
+
+Restoring the entry every iteration (the upload is synchronous and sits outside the timer, ~47 ms of
+it) removes the drift from both programs and changes what is being measured:
+
+| op                  | degenerated | real entry |
+|---------------------|------------:|-----------:|
+| FLASH_MLA_PREFILL   |       767.1 |     1991.5 |
+| MOE_GROUP_DOWN_PF   |      2428.6 |     2696.7 |
+| MOE_GROUP_GLU_PF    |      1581.5 |     1724.4 |
+| RMSNORM             |       321.5 |      455.7 |
+
+Attention is 2.6x. The degenerated index picks fewer distinct KV blocks and the router lights fewer
+experts, so the grouped GEMM bills fewer padded tiles. Every attention and MoE number in 12.x before
+this section was measured on a cheaper model than the one being served.
+
+## 12.74 With a real entry, a balanced EP beats TP by 1.83 ms/layer
+
+Medians over 20 iterations, interleaved, repeated (min within 1.5%):
+
+| config                          | max tiles/rank | us/layer | 40 layers |
+|---------------------------------|---------------:|---------:|----------:|
+| TP8                             |              - |    16989 |    680 ms |
+| EP, even 48/rank                |            217 |    17150 |    686 ms |
+| EP, `0,72,144,216,228,240,300,342,384` | 254     |    17755 |    710 ms |
+| EP, `0,36,88,149,181,215,241,313,384`  | 121     |    15164 |    607 ms |
+
+The ordering is exactly the max-tiles ordering, 121 < 217 < 254. Tile balance was always the model;
+12.71 could not see it because the benchmark had already flattened the histogram it balances.
+
+Retractions this forces:
+
+* 12.69's "EP loses 2.4 ms/layer on the median" -- that 2.4 ms was the drift, not EP.
+* 12.71 and 12.72 both, and for the same reason. 12.72's "one rank's tile costs 9x another's" came
+  from reading per-rank `MOE_GROUP_*` body time as compute. It is not: on the isolated-band run rank
+  3 holds 26 tiles and spends 3336 us in GLU while rank 7 holds 40 tiles and spends 222 us. Fewer
+  tiles, 15x the time. GLU body absorbs the wait, and GLU+DOWN+XREDUCE2 is conserved across ranks to
+  within 4% -- which is what the barrier guarantees and therefore what 12.71 should never have read
+  as balance either.
+* The `ep_expert_range` comment in `crates/plowrt/src/exec/amd.rs`, which said balancing was
+  measured and inert.
+
+What stands: 12.67's MoE coverage bug (a correctness fix, verified by row count, not by timing), and
+12.66's union arm (verified by exit values).
+
+Caveat on the cut list: it is calibrated on the seeded synthetic entry's histogram, which lights 153
+of 384 experts. It is a demonstration that the tile load is the lever, not a shippable constant. The
+shippable form computes the assignment from the router's own histogram; that is the open item.
+
+Honest position against the goal: 607 ms at 40 layers, against 200 ms. Attention is now the largest
+single op at ~2.0 ms/layer and was under-measured 2.6x until this section.
