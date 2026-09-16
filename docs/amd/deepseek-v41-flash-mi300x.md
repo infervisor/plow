@@ -2821,6 +2821,63 @@ So the 90 ms target is a **GEMM, MoE and collective** problem, and three lines a
 Getting to 90 ms means roughly an 11x, which no single one of these delivers. It is a campaign, and
 this section is its baseline rather than its conclusion.
 
+### 12.19 The mHC GEMV was never bandwidth-bound, it was issue-bound
+
+`GEMV_F32` was the largest single line in §12.18 at 134.8 ms, and its own header records five
+ownership maps measured against each other — block-per-row, wave-per-row, all-24-in-registers,
+flattened — spanning a 2.4x range and all landing 25-50x off the 63 us that 335 MB of `x` at HBM
+bandwidth would cost. The header's closing line is "the op is not done; it is measured."
+
+Five maps all missing by the same order of magnitude is the signal. **None of them changed the
+instruction mix.** Every arm walks K as
+
+```c
+for (unsigned k = lane; k < K; k += PLOW_WAVE)
+```
+
+which is ONE element per lane per step: a 2-byte `x` read and CG 4-byte `W` reads, so a group of 8
+columns costs **nine load instructions per eight FMAs**. At that ratio the kernel is issue-bound
+long before it is bandwidth-bound, and rearranging WHICH wave owns (m, n) cannot help — which is
+precisely what the five measurements say, in retrospect.
+
+Arm 5 takes eight k per lane: one `bf16v8` of `x` and CG pairs of `f32x4` of `W`, **17 vector loads
+per 8 k-steps against 72 scalar ones** — the same bytes, 4.2x fewer instructions.
+
+**134.8 ms to 68.9 ms, 1.96x**, and the straggler with it, 193 to 76 us per packet. The whole model
+goes 992 to 921 ms.
+
+It is the first arm that is NOT bit-identical to the others: a lane now folds eight consecutive k
+before the next stride, so `wave_sum` sees a differently-associated f32 sum of 20480 terms. On the
+40-layer chain the exit extremes move visibly (-6784/6752 to -9344/18304) while the mean barely
+does (0.1494 to 0.1518) — which is what a chaotic 40-deep residual stream does to any perturbation,
+and NOT something to accept on that argument alone. **Layer 0 alone settles it**: one layer, nothing
+downstream to amplify, and the exit is identical to the arm-4 baseline to every printed digit —
+min -2.875, max 3.78125, mean -0.000706 — at 18,779 us against 20,707 us, a 1.93 ms saving that is
+exactly the layer's two GEMV calls.
+
+At 68.9 ms this is still ~9x off roofline and the op is still not done.
+
+#### `HYPER_CONN_PRE` is the same size and a different problem
+
+102.8 ms, 1.29 ms per call, against `HYPER_CONN_POST`'s 0.32 ms — and the two move almost the same
+bytes. POST reads the residual once, `x_out` once and writes the residual: 754 MB, 215 us at
+roofline, measured 319 us. **POST is at 1.5x roofline.** PRE reads the residual TWICE (the
+sum-of-squares, then the collapse) and writes `layer_input`: also ~754 MB, also 215 us at roofline,
+measured 1,285 us. **6x.**
+
+Same memory, same access pattern, 4x apart — so PRE's gap is not its loads. It is the **serial
+section**: one workgroup owns one token, lane 0 runs the ~1,300 dependent scalar ops of the 20
+Sinkhorn iterations while 511 lanes idle, and a block does that 27 times (8192 tokens / 304 blocks)
+with a `block_sum` and two `__syncthreads()` between each. The op's own comment already names why
+nothing hides it — LDS caps the interpreter at one workgroup per CU.
+
+The fix this points at is a WAVE per token rather than a workgroup: reduction 1 becomes a
+`wave_sum` over 320 elements per lane, reduction 2 gives each lane 80 of `hidden`, the per-wave
+`logits`/`comb` strips are 320 floats total, and eight serial sections then run concurrently
+instead of one — with no barrier at all. Gated on `T >= nblk && n == 4`, as the register-resident
+4x4 above it already is, so decode and the `head_only` and `n != 4` paths keep the shipped block.
+Not attempted here.
+
 ### 12.2 What is still not demonstrated
 
   * ~~ONE layer, not 40.~~ **Superseded by §12.18**: all 40 layers emit and run as
@@ -2831,7 +2888,8 @@ this section is its baseline rather than its conclusion.
   * No reference parity. The input is synthetic; correctness so far is
     "finite and stable" plus an op census that matches the config (§12.18), not
     "right". This is now the largest single gap.
-  * **992 ms against 90 ms.** §12.18 itemizes it: the V4.1-specific machinery is
+  * **921 ms against 90 ms** (§12.19 took 71 ms off §12.18's 992). §12.18 itemizes
+    the baseline: the V4.1-specific machinery is
     2.8% of the time, and the gap is in `GEMV_F32` (134.8 ms), `GEMM_FP8_MX`
     (129.9), `MOE_GROUP_DOWN_PF` (109.5), `HYPER_CONN_PRE` (102.8) and
     `XREDUCE2` (86.1, of which 99% is straggler).

@@ -5165,11 +5165,85 @@ __device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
  * was never the main cost either.
  *
  * At 3362 us this is still ~50x off the 63 us that 335 MB of x at HBM bandwidth would cost, so
- * the op is not done; it is measured. */
-#define PLOW_GEMV_F32_ARM 4
+ * the op is not done; it is measured.
+ *
+ * 5 = arm 4's decomposition with VECTOR loads, and it is the first arm to change the
+ * instruction MIX rather than the ownership map. Every arm above issues one load per lane per
+ * k: `for (k = lane; k < K; k += PLOW_WAVE)` is a 2-byte x read and CG 4-byte W reads, so a
+ * group costs NINE load instructions per EIGHT FMAs and the op is issue-bound long before it is
+ * bandwidth-bound -- which is why five ownership maps spanning a 2.4x range all landed 25-50x
+ * off roofline. Taking eight k per lane makes that one `bf16v8` plus CG pairs of `f32x4`: 17
+ * vector loads per 8 k-steps against 72 scalar ones, same bytes, 4.2x fewer instructions.
+ *
+ * NOT bit-identical to arms 0-4, and this is the one place that claim breaks. A lane now
+ * accumulates eight CONSECUTIVE k before the next stride instead of one, so `wave_sum` folds a
+ * differently-associated f32 sum of 20480 terms. The op is f32 because bf16 costs ~1e-2 of
+ * logit error (mla.rs:2032); a reassociation is orders below that, but it is a change and not a
+ * no-op. */
+#define PLOW_GEMV_F32_ARM 5
 #endif
 
-#if PLOW_GEMV_F32_ARM == 3
+#if PLOW_GEMV_F32_ARM == 5
+    {
+        constexpr unsigned CG = 8u; /* columns per group, as arms 2 and 4 */
+        constexpr unsigned KV = 8u; /* k per lane per step -- one bf16v8 of x */
+        if (M >= nblk) {
+            const unsigned groups = (N + CG - 1u) / CG;
+            const unsigned items = M * groups;
+            const unsigned kfull = K & ~(PLOW_WAVE * KV - 1u);
+            for (unsigned it = slice * PLOW_WAVES + wave; it < items; it += nblk * PLOW_WAVES) {
+                const unsigned m = it / groups, n0 = (it % groups) * CG;
+                const bf16* const xm = x + (size_t)m * K;
+                float* const cm = C + (size_t)m * N;
+                const float* wp[CG];
+                float a[CG];
+#pragma unroll
+                for (unsigned j = 0; j < CG; j++) {
+                    const unsigned nj = n0 + j;
+                    /* A column past N reads column n0 again -- in cache, accumulator dropped
+                     * unstored -- so the unrolled body stays branch-free, as arm 4. */
+                    wp[j] = W + (size_t)(nj < N ? nj : n0) * K;
+                    a[j] = 0.0f;
+                }
+                for (unsigned k = lane * KV; k < kfull; k += PLOW_WAVE * KV) {
+                    const bf16v8 xv = ld_glob8(xm + k);
+                    float xf[KV];
+#pragma unroll
+                    for (unsigned u = 0; u < KV; u++) xf[u] = bf2f(xv[u]);
+#pragma unroll
+                    for (unsigned j = 0; j < CG; j++) {
+                        const f32x4 w0 =
+                            *(const PLOW_GLOB f32x4*)(const PLOW_GLOB void*)(wp[j] + k);
+                        const f32x4 w1 =
+                            *(const PLOW_GLOB f32x4*)(const PLOW_GLOB void*)(wp[j] + k + 4u);
+#pragma unroll
+                        for (unsigned u = 0; u < 4; u++)
+                            a[j] = __builtin_fmaf(xf[u], w0[u], a[j]);
+#pragma unroll
+                        for (unsigned u = 0; u < 4; u++)
+                            a[j] = __builtin_fmaf(xf[4u + u], w1[u], a[j]);
+                    }
+                }
+                /* K is a multiple of 8 everywhere in the model, but not necessarily of
+                 * PLOW_WAVE*8; the tail is one scalar sweep and every k is still covered once. */
+                for (unsigned k = kfull + lane; k < K; k += PLOW_WAVE) {
+                    const float xv = bf2f(xm[k]);
+#pragma unroll
+                    for (unsigned j = 0; j < CG; j++) a[j] = __builtin_fmaf(xv, wp[j][k], a[j]);
+                }
+#pragma unroll
+                for (unsigned j = 0; j < CG; j++) a[j] = wave_sum(a[j]);
+                if (lane == 0) {
+#pragma unroll
+                    for (unsigned j = 0; j < CG; j++)
+                        if (n0 + j < N) cm[n0 + j] = a[j];
+                }
+            }
+            return;
+        }
+    }
+#elif PLOW_GEMV_F32_ARM == 3
+
     /* WAVE PER ROW, WHOLE ROW IN REGISTERS. Arm 2 still sweeps `xm` once per column group -- three
      * passes at N=24. Carrying every column at once reads it ONCE, which is the floor for this
      * shape: 335 MB of x is the whole tensor, and W (24 x 20480 x 4 = 1.97 MB) is small enough to
