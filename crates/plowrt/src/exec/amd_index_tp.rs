@@ -249,7 +249,10 @@ struct GatherArgs {
     rows: u32,
     rank: u32,
     gate: u32,
-    pad: u32,
+    /// Per-slot KV rows. The gather clamps every copied position to `{-1} U [0, kv_bound)`
+    /// (`dsa_tp_clamp` in dsa_tp_adapter.hip): a select that bails at its deadline leaves bf16
+    /// activations in the peer band, and unclamped those became wild writes and reads.
+    kv_bound: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<ScoreArgs>() == 56);
@@ -402,7 +405,7 @@ impl IndexTp {
             rows: route.rows,
             rank: tp.rank,
             gate: route.inst.i[5] + 1,
-            pad: 0,
+            kv_bound: route.inst.i[1],
         };
         let [ks, ki, kg, kc] = self.kernels;
         // Only the score pass can be drained here: select/gather/complete open with an all-rank

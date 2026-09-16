@@ -424,6 +424,16 @@ pub struct AmdTpGroup {
 }
 
 impl AmdTpGroup {
+    /// Wait for every rank's queue on an error path, keeping the original error. Rank errors here
+    /// are dropped deliberately: the caller already has the one that failed the step.
+    fn drain_all_ranks(&self) {
+        for e in &self.ranks {
+            if let Err(err) = e.drain() {
+                tracing::warn!(%err, "drain after a failed prefill enqueue");
+            }
+        }
+    }
+
     /// Bring up every rank of a sharded blob.
     ///
     /// `backends` are the group's devices, and a backend's INDEX is its rank —
@@ -1802,7 +1812,15 @@ impl AmdTpGroup {
                 }
             }
             for (seg, rank) in segment_major_order(launches, n_ranks) {
-                self.ranks[rank].enqueue_segment(step.prog, seg)?;
+                if let Err(e) = self.ranks[rank].enqueue_segment(step.prog, seg) {
+                    // Segments before this one are already queued on every rank. Returning with
+                    // them in flight let the caller's `kv_rebase_all(0)` rewrite the tensor table
+                    // under them (engine.rs), so queued KV writes landed on slot 0's rows or on a
+                    // half-rebased address. Drain first; a partially enqueued collective bails at
+                    // its deadline, which is slow but touches nothing it does not own.
+                    self.drain_all_ranks();
+                    return Err(e);
+                }
             }
             if phase_replay {
                 for rank in &self.ranks {
@@ -1825,11 +1843,19 @@ impl AmdTpGroup {
 
             let t = std::time::Instant::now();
             let mut rank_drain_ns = Vec::with_capacity(if tick_log { self.ranks.len() } else { 0 });
+            // Drain EVERY rank even after one fails: `?` on the first error returned with ranks
+            // 1..n still running, the same rebase-under-in-flight-work hazard as above.
+            let mut drain_err = None;
             for e in &self.ranks {
-                e.drain()?;
+                if let Err(err) = e.drain() {
+                    drain_err.get_or_insert(err);
+                }
                 if tick_log {
                     rank_drain_ns.push(t.elapsed().as_nanos() as u64);
                 }
+            }
+            if let Some(err) = drain_err {
+                return Err(err);
             }
             let ns = t.elapsed().as_nanos() as u64;
             ttft::PF_DRAIN.add(ns);

@@ -5951,7 +5951,12 @@ __device__ void d_index_union_pf(unsigned char* __restrict__ uni,
             const unsigned qi = qt * P + ql;
             if (qi >= n_tok) continue;
             const int s = as_glob(idx)[(size_t)qi * top_k + (e % top_k)];
-            if (s >= 0) atomicOr(&mrow[s], 1ull << ql);
+            /* Upper bound too, not just the -1 pad: `idx` is device data, and a position at or
+             * past tile_end is both out of causal range for every query in this tile and, past
+             * kv_stride, a write outside `umask` (measured: garbage from a bailed TP select
+             * faulted here, "Write access to a read-only page"). Below kv_stride but past
+             * tile_end it would also leave a bit the zeroing and compaction above never visit. */
+            if (s >= 0 && (unsigned)s < tile_end) atomicOr(&mrow[s], 1ull << ql);
         }
         __syncthreads();
         /* ordered compaction: chunked block scan over [0, tile_end). */
