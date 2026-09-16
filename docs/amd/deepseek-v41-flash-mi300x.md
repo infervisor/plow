@@ -2754,11 +2754,84 @@ at 4x the window's KV for 2.3x its time it is already sublinear — it is the mo
 a defect. The 90 ms target is a GEMM/MoE/collective problem, and the first two numbers to chase are
 `GEMV_F32` and `XREDUCE2`'s straggler, neither of which is about V4.1 at all.
 
+### 12.18 All 40 layers RUN: 992 ms against 90 ms, and where every millisecond is
+
+`--block 0..39` — **40 layers, 1,513 prefill ops**, a 20.4 MB packet — loads on 8x MI300X and runs.
+
+```
+loaded in 306.1 s: tp=8, weights_bound=true
+exit: 167772160 elems  min -6784.0  max 6752.0  mean 0.149356  zero 0  NaN 0  Inf 0
+layer time over 3 iters: min 982387.2 us  median 991968.6 us  max 1006351.4 us
+```
+
+This is the first half of the campaign goal. It is not the second: **992 ms against a 90 ms
+target**, 11x.
+
+#### The census is the correctness evidence, such as it is
+
+The trace's per-op call counts are the one structural check available without a parity harness,
+and every one of them is a number the config predicts and a wrong emit would miss:
+
+| op | calls | why that number |
+|---|---|---|
+| `COMPRESS_POOL` (180) | **3** | 4 kv_source layers, but layer 20 is ratio 1 — a plain projection with no softmax gate, so it pools nothing |
+| `COMPRESS_ROPE_QUANT` (185) | **16** | 4 compressed-KV + 4 index-key (only the kv_source layers own keys) + 8 index-query |
+| `INDEX_SCORE_PF` / `INDEX_SELECT_PF` | **8** each | `index_source_layer_ids` = [2, 8, 14, 20, 24, 28, 32, 36] |
+| `FLASH_GATHER_PREFILL` (55) | **38** | every layer whose `compress_ratios` entry is non-zero — all but 0 and 1 |
+| `FLASH_MLA_PREFILL` (51) | **40** | the 128-token window, every layer |
+| `ROPE_INVERSE_O` (181) | **40** | `Attention.forward` runs it unconditionally (model.py:781) |
+| `ENGRAM_GATE` / `ENGRAM_EMBED` | **2** each | `engram_layer_ids` = [1, 14] |
+
+None of this says the numbers are right — the input is still a seeded synthetic, there is still no
+reference parity harness, and an exit spanning +-6.8e3 after 40 layers with no final norm is
+plausible rather than checked. It says the SHAPE of the model that ran is the shape of V4.1.
+
+#### The 90 ms budget, itemized
+
+980.4 ms of body across 1,513 packets:
+
+| op | total | calls | per call | share |
+|---|---|---|---|---|
+| `GEMV_F32` | 134.8 ms | 80 | 1.68 ms | 13.7% |
+| `GEMM_FP8_MX` | 129.9 ms | 330 | 0.39 ms | 13.2% |
+| `FLASH_GATHER_PREFILL` | 126.3 ms | 38 | 3.32 ms | 12.9% |
+| `MOE_GROUP_DOWN_PF` | 109.5 ms | 40 | 2.73 ms | 11.2% |
+| `HYPER_CONN_PRE` | 102.8 ms | 80 | 1.28 ms | 10.5% |
+| `XREDUCE2` | 86.1 ms | 122 | 0.70 ms | 8.8% |
+| `MOE_GROUP_GLU_PF` | 77.0 ms | 40 | 1.92 ms | 7.9% |
+| `FLASH_MLA_PREFILL` | 57.8 ms | 40 | 1.44 ms | 5.9% |
+| `MOE_COMBINE_PF` | 34.5 ms | 40 | 0.86 ms | 3.5% |
+| everything else | 121.7 ms | 903 | | 12.4% |
+
+**Everything V4.1-specific is in the noise.** The compressor, the indexer and the inverse rope
+together are 27.6 ms — 2.8% — and after §12.17's rewrite op 185 is 6.6 ms of that. The gathered
+flash is the one new line that matters at 126 ms, and it is the model's design cost: 512 selected
+pools against the window's 128, for 2.3x the window flash's time.
+
+So the 90 ms target is a **GEMM, MoE and collective** problem, and three lines are worth naming:
+
+* **`GEMV_F32`, 134.8 ms.** Two calls per layer at 1.68 ms each, and §12.13 already took 2.8 ms out
+  of this same mHC GEMV once. It is the largest single line in the model and it is a GEMV.
+* **`XREDUCE2`, 86.1 ms.** 690 of its 699 us per packet is STRAGGLER — the spread between the first
+  and last workgroup to finish. That is TP imbalance, not arithmetic, so it is the cheapest 80 ms
+  on the list if the imbalance has a cause rather than a cost.
+* **`HYPER_CONN_PRE`, 102.8 ms** at 1.28 ms x 80 against `HYPER_CONN_POST`'s 0.32 ms x 80. The two
+  halves of the same mHC differ by 4x and nothing about their shapes says they should.
+
+Getting to 90 ms means roughly an 11x, which no single one of these delivers. It is a campaign, and
+this section is its baseline rather than its conclusion.
+
 ### 12.2 What is still not demonstrated
 
-  * ONE layer, not 40. The whole-model emit is still blocked on the subsystems
-    section 5 lists as unimplemented.
+  * ~~ONE layer, not 40.~~ **Superseded by §12.18**: all 40 layers emit and run as
+    one chain, 1,513 ops, 992 ms median. What is still missing from a WHOLE MODEL
+    is the tail, not the layers — no embedding lookup, no final norm, no lm_head,
+    no DSpark — because those go through the nn-graph builder, which is still
+    unimplemented and is not on the devgen serving path.
   * No reference parity. The input is synthetic; correctness so far is
-    "finite and stable", not "right".
-  * The 90 ms target is unvalidated and, on the evidence above, out of reach on
-    this path without addressing the fp4 simulation.
+    "finite and stable" plus an op census that matches the config (§12.18), not
+    "right". This is now the largest single gap.
+  * **992 ms against 90 ms.** §12.18 itemizes it: the V4.1-specific machinery is
+    2.8% of the time, and the gap is in `GEMV_F32` (134.8 ms), `GEMM_FP8_MX`
+    (129.9), `MOE_GROUP_DOWN_PF` (109.5), `HYPER_CONN_PRE` (102.8) and
+    `XREDUCE2` (86.1, of which 99% is straggler).
