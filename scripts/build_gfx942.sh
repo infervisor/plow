@@ -863,6 +863,13 @@ if [ -n "${PLOW_GEMV_F32_ARM:-}" ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_GEMV_F32_ARM=${PLOW_GEMV_F32_ARM}"
 fi
 
+# PLOW_HC_WAVE_TOKEN=0 restores d_hyperconn_pre's shipped workgroup-per-token block. The default
+# arm gives a WAVE a token so the eight Sinkhorn serial sections of a block run concurrently; it
+# is not bit-identical (the sum of squares reassociates), which is why it is a named knob.
+if [ -n "${PLOW_HC_WAVE_TOKEN:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_HC_WAVE_TOKEN=${PLOW_HC_WAVE_TOKEN}"
+fi
+
 # Diagnostic-only XREDUCE2 / XREDUCE phase timeline in PlowTraceRec. Never a serve asset.
 if [ "${PLOW_XR_TRACE_PHASES:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_XR_TRACE_PHASES=1"

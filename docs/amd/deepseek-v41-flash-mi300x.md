@@ -2878,6 +2878,61 @@ instead of one — with no barrier at all. Gated on `T >= nblk && n == 4`, as th
 4x4 above it already is, so decode and the `head_only` and `n != 4` paths keep the shipped block.
 Not attempted here.
 
+### 12.20 `HyperConnPre` was not slow, it was SERIAL
+
+§12.19 left this one diagnosed and not attempted. The diagnosis held exactly, and it is worth
+stating why it was checkable in advance rather than by trying things.
+
+`HYPER_CONN_PRE` and `HYPER_CONN_POST` are the two halves of the same mHC and move almost the same
+bytes: POST reads the residual once, `x_out` once and writes the residual; PRE reads the residual
+TWICE — once for the sum of squares, once for the collapse — and writes `layer_input`. Both about
+754 MB, both 215 us at roofline. POST measured 319 us. **POST is at 1.5x roofline; PRE was at 6x.**
+
+Same memory, same access pattern, 4x apart. That is not a bandwidth result, and it says so before
+any experiment: the only thing PRE has that POST does not is the serial section. One workgroup owns
+one token, lane 0 runs the ~1,300 dependent scalar ops of 20 Sinkhorn iterations while 511 lanes
+idle, and a block does that 27 times (8192 tokens over 304 blocks) with a `block_sum` and two
+`__syncthreads()` between each. Nothing hides it, because LDS caps the interpreter at one workgroup
+per CU — which the op's own comment already said.
+
+A **wave** per token runs eight of those concurrently and needs no barrier at all:
+
+| | workgroup per token | wave per token |
+|---|---|---|
+| sum of squares | 512 lanes, 40 elements each, `block_sum` | 64 lanes, 320 each (8-wide loads), `wave_sum` |
+| the gate | LDS + `__syncthreads()` | `__shfl` from lane 0 |
+| the collapse | 512 lanes over `hidden` | 64 lanes, 80 of `hidden` each |
+| serial sections in flight per CU | 1 | 8 |
+
+**102.8 ms to 25.7 ms, 4.0x**, straggler 102 to 83 us. PRE now costs **321 us per call against
+POST's 323** — the parity the diagnosis predicted, and a better sign that the op is done than the
+speedup is. The whole model goes 921 to **854 ms**.
+
+The 4x4 Sinkhorn is lifted into `hc_sinkhorn4` so the new arm and the shipped `n == 4` branch share
+one copy. It is the most error-prone block in the file and two copies of it is not a trade worth
+making.
+
+Like §12.19's GEMV arm it is **not bit-identical** — `inv` is now a 64-lane reduction of
+320-element partials where it was a 512-lane reduction of 40-element ones — so it sits behind
+`PLOW_HC_WAVE_TOKEN` (default 1) rather than being taken silently. GLM-5.3's mHC is `n = 4` as
+well, and a V4.1 change should not quietly reassociate another model's reduction. Layer 0 alone
+settles the numerics the same way §12.19 did: the same exit to every printed digit — min -2.875,
+max 3.78125, mean -0.000706 — at 17,018 us.
+
+#### Layer 0 across this session
+
+| | layer 0 median | whole model |
+|---|---|---|
+| session start | 20,707 us | — |
+| + §12.19 GEMV arm 5 | 18,779 us | 992 -> 921 ms |
+| + §12.20 wave per token | **17,018 us** | 921 -> **854 ms** |
+
+Two ops, 138 ms off the model, and neither was a V4.1 op. The pattern both share is the one worth
+carrying forward: **a megakernel op that is 5-50x off its own roofline is almost never short of
+bandwidth.** It is issuing one element per lane per step (§12.19) or running a serial section with
+nothing resident to hide it (§12.20), and both are visible by reading the loop and comparing
+against a sibling op that does the same traffic.
+
 ### 12.2 What is still not demonstrated
 
   * ~~ONE layer, not 40.~~ **Superseded by §12.18**: all 40 layers emit and run as
@@ -2888,8 +2943,9 @@ Not attempted here.
   * No reference parity. The input is synthetic; correctness so far is
     "finite and stable" plus an op census that matches the config (§12.18), not
     "right". This is now the largest single gap.
-  * **921 ms against 90 ms** (§12.19 took 71 ms off §12.18's 992). §12.18 itemizes
-    the baseline: the V4.1-specific machinery is
+  * **854 ms against 90 ms** (§12.19 and §12.20 took 138 ms off §12.18's 992,
+    neither in a V4.1 op). §12.18 itemizes the baseline: the V4.1-specific
+    machinery is
     2.8% of the time, and the gap is in `GEMV_F32` (134.8 ms), `GEMM_FP8_MX`
     (129.9), `MOE_GROUP_DOWN_PF` (109.5), `HYPER_CONN_PRE` (102.8) and
     `XREDUCE2` (86.1, of which 99% is straggler).

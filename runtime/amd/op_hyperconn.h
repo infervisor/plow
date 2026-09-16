@@ -42,6 +42,12 @@
  * before ever selecting this kernel — see the opcode's doc comment. */
 #define PLOW_HC_POST_MULT 2.0f
 
+/* `d_hyperconn_pre`'s wave-per-token arm. On by default: it is what takes the op off its serial
+ * section (see the arm's own comment). 0 restores the shipped workgroup-per-token block. */
+#ifndef PLOW_HC_WAVE_TOKEN
+#define PLOW_HC_WAVE_TOKEN 1
+#endif
+
 /* PLOW_HC_SINKHORN_RCP — the Sinkhorn normalize's divisor is loop-invariant across the row
  * (or column) it normalizes, but an IEEE `f32` divide is NOT strength-reducible to a
  * reciprocal-and-multiply by the compiler, so the shipped body issues one full `v_div_*`
@@ -102,6 +108,70 @@ __device__ __forceinline__ void hc_normalize(float* v, unsigned base, unsigned s
  * slots) as the pre-mix gate the second reduction reads — both threads' worth of state
  * live in the SAME shared array on purpose, matching `d_rmsnorm`'s "produce once, consume
  * from registers/LDS, no second HBM round trip" discipline. */
+/* THE 4x4 SINKHORN, REGISTER-RESIDENT. Lifted verbatim out of `d_hyperconn_pre`'s n==4 branch so
+ * that branch and the wave-per-token arm share one copy rather than two: it is ~1300 dependent
+ * scalar ops and the single most error-prone block in the file. `c` is a local array indexed only
+ * by constants, which is what keeps it in registers instead of scratch.
+ *
+ * softmax over the LAST axis (dim=-1, fixed row i, varying column j), then one dim=-2 (column)
+ * normalize, then (repeat-1) more (dim=-1, dim=-2) pairs -- exactly mhc_pre_torch's loop, not a
+ * reordering of it. */
+__device__ __forceinline__ void hc_sinkhorn4(float* c, const float* __restrict__ mrow, float inv,
+                                             const float* __restrict__ hc_scale,
+                                             const float* __restrict__ hc_base, float hc_eps,
+                                             unsigned repeat) {
+    constexpr unsigned NC = 4u;
+    for (unsigned i = 0; i < NC; i++) {
+        float m = -3.0e38f;
+        for (unsigned j = 0; j < NC; j++) {
+            const float v =
+                (mrow[2 * NC + i * NC + j] * inv) * hc_scale[2] + hc_base[2 * NC + i * NC + j];
+            c[i * NC + j] = v;
+            m = fmaxf(m, v);
+        }
+        float s = 0.0f;
+        for (unsigned j = 0; j < NC; j++) {
+            const float e = expf(c[i * NC + j] - m);
+            c[i * NC + j] = e;
+            s += e;
+        }
+#if PLOW_HC_SINKHORN_RCP
+        hc_normalize<true>(c, i * NC, 1, NC, s, hc_eps);
+#else
+        for (unsigned j = 0; j < NC; j++) c[i * NC + j] = c[i * NC + j] / s + hc_eps;
+#endif
+    }
+    for (unsigned j = 0; j < NC; j++) {
+        float s = 0.0f;
+        for (unsigned i = 0; i < NC; i++) s += c[i * NC + j];
+#if PLOW_HC_SINKHORN_RCP
+        hc_normalize<false>(c, j, NC, NC, s + hc_eps, hc_eps);
+#else
+        for (unsigned i = 0; i < NC; i++) c[i * NC + j] = c[i * NC + j] / (s + hc_eps);
+#endif
+    }
+    for (unsigned r = 1; r < repeat; r++) {
+        for (unsigned i = 0; i < NC; i++) {
+            float s = 0.0f;
+            for (unsigned j = 0; j < NC; j++) s += c[i * NC + j];
+#if PLOW_HC_SINKHORN_RCP
+            hc_normalize<false>(c, i * NC, 1, NC, s + hc_eps, hc_eps);
+#else
+            for (unsigned j = 0; j < NC; j++) c[i * NC + j] = c[i * NC + j] / (s + hc_eps);
+#endif
+        }
+        for (unsigned j = 0; j < NC; j++) {
+            float s = 0.0f;
+            for (unsigned i = 0; i < NC; i++) s += c[i * NC + j];
+#if PLOW_HC_SINKHORN_RCP
+            hc_normalize<false>(c, j, NC, NC, s + hc_eps, hc_eps);
+#else
+            for (unsigned i = 0; i < NC; i++) c[i * NC + j] = c[i * NC + j] / (s + hc_eps);
+#endif
+        }
+    }
+}
+
 __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict__ comb_mix,
                                 bf16* __restrict__ layer_input, const float* __restrict__ mixes,
                                 const bf16* __restrict__ residual, const float* __restrict__ hc_scale,
@@ -152,6 +222,91 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
      * WRONG one here; the tower exit is gated and learned. Both survive.  [DSV4-MHC] */
     const unsigned n3 = head_only ? n : (2 * n + n * n);
     const unsigned nh = n * hidden;
+
+    /* ONE WAVE PER TOKEN, and it is the SERIAL SECTION this buys, not the loads.
+     *
+     * The workgroup-per-token form below is at 6x its memory roofline while `d_hyperconn_post`,
+     * moving the same ~754 MB in the same access pattern, runs at 1.5x -- so the gap is not
+     * bandwidth. It is that lane 0 runs ~1300 dependent scalar ops of Sinkhorn with 511 lanes
+     * idle, once per token, 27 times per block at T=8192 over 304 blocks, and LDS caps the
+     * interpreter at ONE workgroup per CU so there is nothing resident to hide it behind.
+     *
+     * A wave owning a token runs eight of those concurrently and needs no barrier at all: the
+     * sum of squares becomes a `wave_sum` over 320 elements per lane, the gate broadcasts by
+     * `__shfl` instead of through LDS, and the collapse gives each lane 80 of `hidden`.
+     *
+     * NOT bit-identical: `inv` is now a 64-lane reduction of 320-element partials where it was a
+     * 512-lane reduction of 40-element ones, so the sum of 20480 squares is differently
+     * associated. Everything downstream of `inv` is unchanged, statement for statement.
+     *
+     * Gated as the register-resident 4x4 it calls -- `n == 4 && T >= nblk`, so decode and any
+     * other `n` keep the shipped block -- and ALSO behind `PLOW_HC_WAVE_TOKEN`, because GLM-5.3's
+     * mHC is n=4 too and would otherwise take a non-bit-identical arm without anyone choosing it.
+     * Build with -DPLOW_HC_WAVE_TOKEN=0 to restore the shipped block for an A/B. */
+    if (PLOW_HC_WAVE_TOKEN && n == 4u && T >= nblk) {
+        const unsigned wv = threadIdx.x / PLOW_WAVE;
+        const unsigned ln = threadIdx.x % PLOW_WAVE;
+        for (unsigned t = slice * PLOW_WAVES + wv; t < T; t += nblk * PLOW_WAVES) {
+            const float* const mrow = mixes + (size_t)t * n3;
+            const bf16* const rrow = residual + (size_t)t * nh;
+
+            float ss = 0.0f;
+            const unsigned nfull = nh & ~(PLOW_WAVE * 8u - 1u);
+            for (unsigned i = ln * 8u; i < nfull; i += PLOW_WAVE * 8u) {
+                const bf16v8 v = ld_glob8(rrow + i);
+#pragma unroll
+                for (unsigned u = 0; u < 8; u++) {
+                    const float x = bf2f(v[u]);
+                    ss = __builtin_fmaf(x, x, ss);
+                }
+            }
+            for (unsigned i = nfull + ln; i < nh; i += PLOW_WAVE) {
+                const float x = bf2f(rrow[i]);
+                ss = __builtin_fmaf(x, x, ss);
+            }
+            const float inv = rsqrtf(wave_sum(ss) / (float)nh + rms_eps);
+
+            float g[4] = {0.0f, 0.0f, 0.0f, 0.0f}; /* every lane reads them via __shfl */
+            if (ln == 0) {
+                for (unsigned j = 0; j < 4u; j++) {
+                    const float v = (mrow[j] * inv) * hc_scale[0] + hc_base[j];
+                    g[j] = 1.0f / (1.0f + expf(-v)) + hc_eps;
+                }
+                if (pre_mode != PLOW_HC_PRE_OWN) {
+                    float* const po =
+                        pre_pair + (size_t)(pre_in_half ^ 1u) * T * 4u + (size_t)t * 4u;
+                    for (unsigned j = 0; j < 4u; j++) po[j] = g[j];
+                }
+                if (!head_only) {
+                    for (unsigned j = 0; j < 4u; j++) {
+                        const float v = (mrow[4u + j] * inv) * hc_scale[1] + hc_base[4u + j];
+                        post_mix[(size_t)t * 4u + j] =
+                            (1.0f / (1.0f + expf(-v))) * PLOW_HC_POST_MULT;
+                    }
+                    float c[16];
+                    hc_sinkhorn4(c, mrow, inv, hc_scale, hc_base, hc_eps, sinkhorn_repeat);
+                    for (unsigned k = 0; k < 16u; k++) comb_mix[(size_t)t * 16u + k] = c[k];
+                }
+            }
+            /* The collapse gate: lane 0's `g` for PRE_OWN, a one-hot for PRE_SEED, the PREVIOUS
+             * sublayer's for PRE_DEFER -- the same three cases as below, with `__shfl` where the
+             * workgroup form used LDS and a barrier. */
+            for (unsigned j = 0; j < 4u; j++) {
+                g[j] = pre_mode == PLOW_HC_PRE_OWN ? __shfl(g[j], 0, PLOW_WAVE)
+                       : pre_mode == PLOW_HC_PRE_SEED
+                           ? (j == 0 ? 1.0f : 0.0f)
+                           : pre_pair[(size_t)pre_in_half * T * 4u + (size_t)t * 4u + j];
+            }
+            for (unsigned d = ln; d < hidden; d += PLOW_WAVE) {
+                float acc = 0.0f;
+                for (unsigned i = 0; i < 4u; i++)
+                    acc = __builtin_fmaf(g[i], bf2f(rrow[(size_t)i * hidden + d]), acc);
+                layer_input[(size_t)t * hidden + d] = f2bf(acc);
+            }
+        }
+        return;
+    }
+
     __shared__ float logits[24]; /* n fixed at 4 — see the file header */
     __shared__ float comb_lds[16];
 
@@ -203,63 +358,9 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
              * it is the same statements in the same order at the same precision. Only the storage
              * class of the 4x4 changes. */
             if (n == 4u && T >= nblk) {
-                constexpr unsigned NC = 4u;
-                float c[NC * NC];
-                /* comb_mix: softmax over the LAST axis (dim=-1, fixed row i, varying column j),
-                 * then one dim=-2 (column) normalize, then (sinkhorn_repeat-1) more (dim=-1,
-                 * dim=-2) pairs — exactly mhc_pre_torch's loop, not a reordering of it. */
-                for (unsigned i = 0; i < NC; i++) {
-                    float m = -3.0e38f;
-                    for (unsigned j = 0; j < NC; j++) {
-                        const float v = (mrow[2 * NC + i * NC + j] * inv) * hc_scale[2] +
-                                        hc_base[2 * NC + i * NC + j];
-                        c[i * NC + j] = v;
-                        m = fmaxf(m, v);
-                    }
-                    float s = 0.0f;
-                    for (unsigned j = 0; j < NC; j++) {
-                        const float e = expf(c[i * NC + j] - m);
-                        c[i * NC + j] = e;
-                        s += e;
-                    }
-#if PLOW_HC_SINKHORN_RCP
-                    hc_normalize<true>(c, i * NC, 1, NC, s, hc_eps);
-#else
-                    for (unsigned j = 0; j < NC; j++) c[i * NC + j] = c[i * NC + j] / s + hc_eps;
-#endif
-                }
-                for (unsigned j = 0; j < NC; j++) {
-                    float s = 0.0f;
-                    for (unsigned i = 0; i < NC; i++) s += c[i * NC + j];
-#if PLOW_HC_SINKHORN_RCP
-                    hc_normalize<false>(c, j, NC, NC, s + hc_eps, hc_eps);
-#else
-                    for (unsigned i = 0; i < NC; i++) c[i * NC + j] = c[i * NC + j] / (s + hc_eps);
-#endif
-                }
-                for (unsigned r = 1; r < sinkhorn_repeat; r++) {
-                    for (unsigned i = 0; i < NC; i++) {
-                        float s = 0.0f;
-                        for (unsigned j = 0; j < NC; j++) s += c[i * NC + j];
-#if PLOW_HC_SINKHORN_RCP
-                        hc_normalize<false>(c, i * NC, 1, NC, s + hc_eps, hc_eps);
-#else
-                        for (unsigned j = 0; j < NC; j++)
-                            c[i * NC + j] = c[i * NC + j] / (s + hc_eps);
-#endif
-                    }
-                    for (unsigned j = 0; j < NC; j++) {
-                        float s = 0.0f;
-                        for (unsigned i = 0; i < NC; i++) s += c[i * NC + j];
-#if PLOW_HC_SINKHORN_RCP
-                        hc_normalize<false>(c, j, NC, NC, s + hc_eps, hc_eps);
-#else
-                        for (unsigned i = 0; i < NC; i++)
-                            c[i * NC + j] = c[i * NC + j] / (s + hc_eps);
-#endif
-                    }
-                }
-                for (unsigned k = 0; k < NC * NC; k++) comb_mix[(size_t)t * NC * NC + k] = c[k];
+                float c[16];
+                hc_sinkhorn4(c, mrow, inv, hc_scale, hc_base, hc_eps, sinkhorn_repeat);
+                for (unsigned k = 0; k < 16u; k++) comb_mix[(size_t)t * 16u + k] = c[k];
             } else {
                 /* comb_mix: softmax over the LAST axis (dim=-1, fixed row i, varying column j),
                  * then one dim=-2 (column) normalize, then (sinkhorn_repeat-1) more (dim=-1,
