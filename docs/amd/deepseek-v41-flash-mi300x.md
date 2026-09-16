@@ -3352,9 +3352,18 @@ rather than the ranking, it is substantial in a different place than assumed:
   the GATHER arm", `mla.rs:6873`) for a non-fp8 sparse V2 prefill; nothing consumes it. That
   pairing is refused at load by `plowrt`'s `check_dsa_pf_arm`, so this is a guarded gap and not a
   live defect — the interpreter trap is, in its own words, "the belt to that braces".
-* V4.1's layer is ONE 8-wave cooperative launch, and the V2 arm lives in the 4-wave flash object.
-  Routing V4.1's attention to it means either a segment boundary mid-layer or compiling the V2
-  GATHER arm into the 8-wave interpreter.
+* V4.1's layer is ONE 8-wave cooperative launch, and the V2 arm is **hard-wired to four waves** --
+  not merely housed in the 4-wave flash object. Inside `d_flash_mla_prefill_v2`:
+  `constexpr unsigned WG = 256; /* V2 is always a four-wave kernel */`, `BQ = 4 * RW`, and the
+  LDS layout allocates exactly four per-wave P strips (`Pw0 + 4 * RW * BKV` is where the
+  membership-mask array starts). Waves 4-7 of an 8-wave workgroup would index `Pw0 + wave*RW*BKV`
+  straight into `Msm`. The existing test kernel agrees: `__launch_bounds__(256, 1)`.
+  So routing V4.1's attention here means a mid-layer segment boundary into the 4-wave object, or
+  reworking RW/BQ and the LDS layout for eight waves, or parking waves 4-7 -- which halves the
+  occupancy of the op being sped up. This is the real cost of the lever and it was measured from
+  the source, not assumed: an earlier reading of this section claimed the 8-wave default plus the
+  compiled test kernel made the constraint go away. It does not. `PLOW_WG_WAVES` does default to 8
+  and `test_kernels` takes no axes, but that kernel sets its own 256-thread launch bound.
 
 So the work is: emit op 119 for V4.1, write the V2 GATHER dispatch, resolve the wave-count
 topology, and re-validate numerics — against a top-k *union* whose size is data-dependent
