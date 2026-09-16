@@ -5219,6 +5219,10 @@ arithmetic: 884 tiles x 3 n-tiles = 2652 GLU tiles over 304 CUs is 8.72 waves, s
 
 ## 12.68 EP re-measured on arithmetic that is actually happening: DOWN is 3.7x
 
+> **CORRECTION (12.69): the `-430 us` layer figure below is a MIN, and EP's min is a lucky
+> iteration.** On the median EP is +2.4 ms/layer WORSE than TP. The MoE numbers in this section are
+> right and the k-loop argument stands; the layer verdict is inverted. Read 12.69.
+
 12.64 priced EP at ~95-180 us/layer. That was measured against a MoE pair of 858 us which was
 doing 17.9% of its work (12.67), so it was pricing EP against a baseline that barely existed. On
 the fixed build the MoE pair is 4129 us and EP's case is completely different.
@@ -5273,3 +5277,66 @@ because the largest rank holds more experts than an even byte split assumes. -43
 having but it is a config decision with a memory cost attached, so it stays opt-in until the
 placement skew that feeds the collective is addressed -- which is the actual open problem, and it
 is a scheduling problem, not a tiling one.
+
+## 12.69 EP loses on the median, and the min is what made it look like a win
+
+12.68 quoted `min` layer times, as every arm in this document has. For TP that is harmless -- its
+min and median differ by 0.8% -- and for EP it inverts the result. Three interleaved repeats,
+12 iterations each, 8k/TP8, block 2, union arm, MoE fixed:
+
+| | min | **median** | max |
+|---|---|---|---|
+| TP | 14 653 - 14 736 us | **14 792 - 14 834 us** | 16 488 - 16 558 us |
+| EP | 14 076 - 14 218 us | **17 142 - 17 341 us** | 17 633 - 17 758 us |
+
+EP's min is ~570 us BETTER and its median is ~2 450 us WORSE, reproducibly, three times out of
+three. TP's min-to-median gap is 0.8%; EP's is 22%. **That gap is the placement skew**, and a min
+over twelve iterations is precisely the statistic that hides it -- it reports the one iteration
+where the routing happened to land evenly.
+
+The all-ranks traces said so plainly and I read the wrong column first: every rank's total body is
+16 157 - 16 185 us under EP against 13 986 - 14 044 us under TP. There is no rank for which EP is
+cheaper. The body agrees with the median, not the min.
+
+### What the constant sum means
+
+Per rank, `moe pair + XREDUCE2` is near-constant -- 7 524 to 7 720 us under EP (+/-1.3%), 5 295 to
+5 568 us under TP (+/-2.5%) -- while the MoE half alone spreads 20x under EP (319 to 6 367 us).
+That is the signature of two adjacent ops with a barrier between them: whatever a rank does not
+spend computing its experts, it spends waiting at the collective, and the SUM is set by the
+slowest rank's MoE plus the collective's own cost.
+
+    EP:  slowest rank MoE 6367 + collective ~1250  =  ~7600
+    TP:  slowest rank MoE 4171 + collective ~1270  =  ~5440
+
+So EP's problem states exactly: **it halves the AVERAGE MoE (2205 us against TP's 4116) and raises
+the MAXIMUM (6367 against 4171).** A barrier bills the maximum. The -55.6% on the pair is real and
+it is measured on the average, which is not the quantity that reaches the layer.
+
+### And the maximum is not predicted by tile count
+
+Even-split per-rank tiles against per-rank MoE time:
+
+    rank      0     1     2     3     4     5     6     7
+    tiles   183   129    28   217    63   152    35    77
+    MoE us 1778  2512   317  1428  6367  3052  1411   740
+
+Rank 4 holds 63 tiles and is the SLOWEST at 6367 us; rank 3 holds 217 -- 3.4x the rows -- and runs
+in 1428. The relationship is not weak, it is inverted. This is why `PLOW_MOE_EP_CUTS` cannot work:
+it balances tiles, and tiles do not predict time. Balanced cuts take the tile imbalance from 1.96x
+to 1.095x and move the layer by 0 us (14 011 even against 14 040 balanced).
+
+**Whatever sets a rank's MoE time under EP, it is not the amount of gathered-row arithmetic it was
+given.** That is the open question, and it is the one that has to be answered before EP or any
+other expert-sharding scheme can be scheduled properly -- balancing the wrong quantity is what both
+attempts so far have done.
+
+### Honest position
+
+    TP, union arm, MoE fixed     median 14 810 us/layer     ~592 ms at 40 layers
+
+EP stays off. It is not a 430 us win with a memory cost; it is a 2.4 ms/layer regression whose one
+genuine result -- `down`'s k-loop going from 3 iterations to 18, worth 3.7x on that op -- is worth
+capturing some other way. The obvious candidate is to give `down` a deeper k-loop WITHOUT sharding
+experts across ranks, since the k-loop depth was the whole mechanism and EP's rank skew was only
+the delivery vehicle.
