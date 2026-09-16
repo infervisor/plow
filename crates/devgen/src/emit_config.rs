@@ -1595,8 +1595,13 @@ impl EmitConfig {
     /// The default stands aside for the two-shot seam knobs it replaces, so an explicit
     /// `PLOW_GLM_XR_RES` / `PLOW_GLM_XR_BAND` emit keeps working without naming this one.
     pub fn glm_seq_par(&self) -> bool {
+        // `!token_batch_tp` mirrors GLM_SEQ_PAR_DEFAULT in knob_spec.rs. Without it the registry
+        // record and the emitter disagree, and the production recipe (token_batch_tp = TRUE)
+        // emits the pair `token_batch_tp_excludes_seq_par` refuses at load — the combination
+        // measured at retrieval 9/18 base, 0/21 tail in review log #63.
         self.glm_seq_par.unwrap_or(
             self.glm_production_defaults
+                && !self.token_batch_tp
                 && !self.glm_xr_res
                 && self.glm_xr_band.unwrap_or(1) <= 1,
         )

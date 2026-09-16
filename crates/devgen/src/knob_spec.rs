@@ -215,6 +215,23 @@ const C_W8A8: &[Constraint] = &[Constraint {
     check: Check::Load,
 }];
 
+/// Restored after `6058cb29` removed it. The narrow-seam fix moved seam norms back onto the
+/// primary object, which is why `token_batch_tp` was re-rated Candidate — but the measured
+/// failure (review log #63: retrieval 9/18 base, 0/21 tail) was never re-run with both arms on,
+/// and a deleted `Check::Load` cannot protect a packet emitted before that fix. The production
+/// default already resolves `glm_seq_par` to off under `token_batch_tp`; this catches the
+/// explicitly-flagged emit that walks around the default.
+const C_TOKEN_BATCH_TP: &[Constraint] = &[Constraint {
+    id: "token_batch_tp_excludes_seq_par",
+    formula: F::Not(&F::And(&[
+        F::Atom("emit.token_batch_tp", Cmp::Eq, TRUE),
+        F::Atom("emit.glm_seq_par", Cmp::Eq, TRUE),
+    ])),
+    site: "review log #63: the seams-aware token-batch body corrupted long-context prefill \
+           (retrieval 9/18 base, 0/21 tail) with sequence parallelism on",
+    check: Check::Load,
+}];
+
 const C_MXFP4: &[Constraint] = &[Constraint {
     id: "mxfp4_excludes_fp8_activations",
     formula: F::Not(&F::And(&[
@@ -761,7 +778,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_moe_resident", Some("PLOW_GLM_MOE_RESIDENT"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_moe_shared_fold", Some("PLOW_GLM_MOE_SHARED_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_moe_shared_seed", Some("PLOW_GLM_MOE_SHARED_SEED"), Layer::Emit, Domain::Bool, OFF, MOE_SHARED_SEED_CANDIDATE).scoped(MOE_SHARED_SEED_SCOPE),
-    KnobSpec::new("emit.token_batch_tp", Some("PLOW_TOKEN_BATCH_TP"), Layer::Emit, Domain::Bool, OFF, TOKEN_BATCH_TP_CANDIDATE),
+    KnobSpec::new("emit.token_batch_tp", Some("PLOW_TOKEN_BATCH_TP"), Layer::Emit, Domain::Bool, OFF, TOKEN_BATCH_TP_CANDIDATE).with(C_TOKEN_BATCH_TP),
     KnobSpec::new("emit.packed_sparse_pf", Some("PLOW_PACKED_SPARSE_PF"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_PACKED_SPARSE_PF),
     KnobSpec::new("emit.glm_index_tp", Some("PLOW_GLM_INDEX_TP"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_select_local", Some("PLOW_GLM_SELECT_LOCAL"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),

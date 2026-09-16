@@ -92,6 +92,72 @@ pub fn admit(util: f64, predicted_wait_ms: f64, slo_ms: f64, mem_ok: bool) -> Ad
 /// sequence's rows are written on every rank. The pools reserve VA for `max_ctx` and map
 /// physical at the frontier, so this prices what an admitted sequence may grow into, which is
 /// exactly what admission must not oversubscribe.
+/// Why a request did not take a slot.
+///
+/// The whole seat decision lives in [`seat`], so this enum is the complete list of ways a request
+/// can fail to be admitted. Only [`Denied::KvBudgetFull`] is retryable: the caller keeps that
+/// request queued and tries again once a slot retires. Every other variant is terminal and the
+/// caller answers the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Denied {
+    /// The engine is poisoned; admitting would dispatch into a dead context.
+    EngineDead,
+    /// Arrival met a full slot table inside the admission window.
+    NoFreeSlot,
+    /// No amount of retirement frees enough — deferring would wedge the queue behind it.
+    ExceedsWholeBudget { want: u64, max_rows: u64 },
+    /// Live sequences hold the KV today. Retryable.
+    KvBudgetFull { want: u64 },
+}
+
+impl Denied {
+    /// Whether the caller should keep the request queued rather than answer its stream.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Denied::KvBudgetFull { .. })
+    }
+}
+
+/// KV rows a sequence still has promised: its prompt plus the generation it has not produced yet.
+///
+/// The charge only ever shrinks, so subtracting `generated_tokens` is safe without preemption.
+pub fn reserved_kv_rows(prompt_tokens: usize, max_tokens: usize, generated_tokens: usize) -> u64 {
+    prompt_tokens
+        .saturating_add(max_tokens.max(1))
+        .saturating_sub(generated_tokens) as u64
+}
+
+/// THE seat decision, in one place and in this order: liveness, then a slot, then the whole-device
+/// bound, then what live sequences already hold.
+///
+/// Pure — no metrics, no streams, no allocation — so the order of the checks reads in one screen
+/// and is testable without an engine. The caller supplies `free_slot` (the first idle index inside
+/// the decode-rung admission window) and `committed_rows` over EVERY live slot, including those
+/// above that window, because their KV is just as resident.
+pub fn seat(
+    engine_dead: bool,
+    free_slot: Option<usize>,
+    want_rows: u64,
+    committed_rows: impl IntoIterator<Item = u64>,
+    budget: Option<KvBudget>,
+) -> Result<usize, Denied> {
+    if engine_dead {
+        return Err(Denied::EngineDead);
+    }
+    let slot = free_slot.ok_or(Denied::NoFreeSlot)?;
+    if let Some(budget) = budget {
+        if !budget.fits_requests([want_rows]) {
+            return Err(Denied::ExceedsWholeBudget {
+                want: want_rows,
+                max_rows: budget.max_rows(),
+            });
+        }
+        if !budget.fits_requests(committed_rows.into_iter().chain(std::iter::once(want_rows))) {
+            return Err(Denied::KvBudgetFull { want: want_rows });
+        }
+    }
+    Ok(slot)
+}
+
 pub const MAX_KV_BLOCK_GROUPS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -143,13 +209,18 @@ impl KvBudget {
         self.block_groups[..self.block_group_count as usize]
             .iter()
             .fold(0u64, |total, group| {
-                // Row zero of every slot/group is mapped before free memory is sampled.
-                let extra_blocks = rows
+                // Charge every block the sequence will physically map. There is no per-sequence
+                // prepaid block to credit back: `SharedPrefix::new` reserves VA only and leaves
+                // every frontier at 0, and `free` is sampled after it, so the budget already
+                // reflects zero resident KV. The one genuinely prepaid block per group
+                // (`blocks_kept`) is device-wide and only exists after a sequence retires;
+                // crediting it per sequence handed back ~354 MiB each and moved the 70k knee
+                // from 12 to 14.
+                let blocks = rows
                     .saturating_add(group.block_rows - 1)
                     .checked_div(group.block_rows)
-                    .unwrap_or(u64::MAX)
-                    .saturating_sub(1);
-                total.saturating_add(extra_blocks.saturating_mul(group.block_bytes))
+                    .unwrap_or(u64::MAX);
+                total.saturating_add(blocks.saturating_mul(group.block_bytes))
             })
     }
 
@@ -198,6 +269,62 @@ impl KvBudget {
 }
 
 #[cfg(test)]
+mod seat_tests {
+    use super::{seat, Denied, KvBudget};
+
+    fn glm_budget() -> KvBudget {
+        let free = (55.58984375f64 * (1u64 << 30) as f64) as u64;
+        KvBudget::linear(55_608, (free as f64 * 0.9) as u64)
+            .with_block_groups(&[
+                (16_384, 78 * (2 << 20)),
+                (8_192, 21 * (2 << 20)),
+                (4_096, 78 * (2 << 20)),
+            ])
+            .unwrap()
+    }
+
+    /// The order of the checks is the contract: a dead engine is reported as dead even when the
+    /// slot table is also full, so the caller answers with the fault that killed the engine
+    /// rather than a misleading 429.
+    #[test]
+    fn liveness_is_decided_before_capacity() {
+        assert_eq!(seat(true, None, 1, [], None), Err(Denied::EngineDead));
+        assert_eq!(seat(false, None, 1, [], None), Err(Denied::NoFreeSlot));
+        assert_eq!(seat(false, Some(3), 1, [], None), Ok(3));
+    }
+
+    /// A request larger than the whole device is terminal, not retryable: deferring it would
+    /// wedge the queue behind a request no retirement can ever seat.
+    #[test]
+    fn a_request_over_the_whole_budget_is_terminal_not_queued() {
+        let b = glm_budget();
+        let max = b.max_rows();
+        let err = seat(false, Some(0), max + 1, [], Some(b)).unwrap_err();
+        assert!(matches!(err, Denied::ExceedsWholeBudget { .. }));
+        assert!(!err.is_retryable());
+    }
+
+    /// Pressure from live sequences is retryable, and is charged over every live slot — including
+    /// slots above the admission window, whose KV is just as resident.
+    #[test]
+    fn live_sequences_push_a_fitting_request_back_onto_the_queue() {
+        let b = glm_budget();
+        assert_eq!(seat(false, Some(0), 70_700, [], Some(b)), Ok(0));
+        let err = seat(false, Some(0), 70_700, [70_700; 12], Some(b)).unwrap_err();
+        assert_eq!(err, Denied::KvBudgetFull { want: 70_700 });
+        assert!(err.is_retryable());
+        // 11 already seated leaves room for the twelfth.
+        assert_eq!(seat(false, Some(0), 70_700, [70_700; 11], Some(b)), Ok(0));
+    }
+
+    /// Without a budget the seat decision is slots alone — the pre-KV-admission behaviour.
+    #[test]
+    fn no_budget_means_slots_alone() {
+        assert_eq!(seat(false, Some(0), u64::MAX, [u64::MAX; 4], None), Ok(0));
+    }
+}
+
+#[cfg(test)]
 mod kv_budget_tests {
     use super::KvBudget;
 
@@ -234,8 +361,11 @@ mod kv_budget_tests {
         assert_eq!(KvBudget::linear(0, 8).max_rows(), 8);
     }
 
+    /// 12, not 14: `bytes_for_rows` charges every block the sequence maps. The earlier `-1`
+    /// credited a prepaid row-zero block per sequence per group — 354 MiB each — that nothing
+    /// funds, because `SharedPrefix::new` reserves VA only and `free` is sampled after it.
     #[test]
-    fn block_rounded_glm_budget_admits_fourteen_70k_sequences() {
+    fn block_rounded_glm_budget_admits_twelve_70k_sequences() {
         let free = (55.58984375f64 * (1u64 << 30) as f64) as u64;
         let b = KvBudget::linear(55_608, (free as f64 * 0.9) as u64)
             .with_block_groups(&[
@@ -245,21 +375,23 @@ mod kv_budget_tests {
             ])
             .unwrap();
 
-        assert_eq!(
-            b.bytes_for_rows(1),
-            0,
-            "the prepaid first column is not charged twice"
-        );
-        assert!(b.fits_requests(std::iter::repeat_n(70_700, 14)));
-        assert!(!b.fits_requests(std::iter::repeat_n(70_700, 15)));
+        // One row still maps one block in every group — 156 + 42 + 156 MiB.
+        assert_eq!(b.bytes_for_rows(1), 354 * (1 << 20));
+        assert_eq!(b.bytes_for_rows(70_700), 3966 * (1 << 20));
+        assert!(b.fits_requests(std::iter::repeat_n(70_700, 12)));
+        assert!(!b.fits_requests(std::iter::repeat_n(70_700, 13)));
     }
 
+    /// Each sequence rounds up on its own; the budget never rounds the SUM of their rows, which
+    /// would hide a partial block behind another sequence's remainder.
     #[test]
     fn block_rounding_is_per_sequence() {
-        let b = KvBudget::linear(1, 2 << 20)
+        let b = KvBudget::linear(1, 3 * (2 << 20))
             .with_block_groups(&[(4_096, 2 << 20)])
             .unwrap();
-        assert!(b.fits_requests([4_096, 4_096]));
+        // 2 + 1 blocks, exactly the budget.
+        assert!(b.fits_requests([4_097, 1]));
+        // 2 + 2 blocks. Rounding the sum instead (8,194 rows -> 3 blocks) would have admitted it.
         assert!(!b.fits_requests([4_097, 4_097]));
     }
 }

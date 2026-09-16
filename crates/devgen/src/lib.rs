@@ -7380,12 +7380,27 @@ fn apply_production_defaults(
             cfg.token_batch_tp = true;
             emit_config::note_production_default("token_batch_tp", "true".into());
         }
-        // Row-band attention is not composable with token-batch bodies. Sequence-parallel seams
-        // are: bodies carry their bucket's seams and route rank-band norms off the packed twin.
+        // Neither row-band attention nor the sequence-parallel seams compose with token-batch
+        // bodies. The seams were re-rated composable on a source reading (narrow seam norms moved
+        // back to the primary object), but the measured failure behind
+        // `token_batch_tp_excludes_seq_par` — review log #63, retrieval 9/18 base, 0/21 tail —
+        // was never re-run with both arms on. Until it is, the recipe FORCES both off rather than
+        // defaulting them off: a default yields to an explicit `--glm-seq-par=true`, and the
+        // resulting packet is silent long-context corruption, not a fault. Every force is recorded,
+        // so `build.json` still names what the flag asked for and what the recipe did.
         if cfg.token_batch_tp {
             if cfg.glm_rowband_attn == Some(true) {
                 cfg.glm_rowband_attn = Some(false);
                 emit_config::note_production_default("glm_rowband_attn", "false".into());
+            }
+            for (field, id) in [
+                (&mut cfg.glm_seq_par, "glm_seq_par"),
+                (&mut cfg.glm_seq_par_proj, "glm_seq_par_proj"),
+            ] {
+                if *field != Some(false) {
+                    *field = Some(false);
+                    emit_config::note_production_default(id, "false".into());
+                }
             }
         }
         if !cfg.packed_sparse_pf {

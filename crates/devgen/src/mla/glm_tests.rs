@@ -2780,7 +2780,9 @@ fn glm_native_decode_gemm_preserves_xcd_boundaries() {
                 .enumerate()
                 .filter(|(_, d)| d.op == DevOp::GemmLtPf as u16)
                 .collect::<Vec<_>>();
-            if rows != 16 {
+            // Both wide rungs route natively: `glm_decode_lt_rung` is the shared predicate, and 32
+            // is the rung that sets serving `capacity`, so it must not fall back to GEMV.
+            if !matches!(rows, 16 | 32) {
                 assert!(native.is_empty());
                 continue;
             }
@@ -2839,7 +2841,7 @@ fn glm_native_decode_gemm_preserves_xcd_boundaries() {
                 .unwrap();
             assert_eq!(prog.gq_seg_ofs.len(), segments * 8 + 1);
         }
-        assert_eq!(checked, 1);
+        assert_eq!(checked, 2);
         Ok(crate::LeanReport::skipped(
             "native decode GEMM segment regression test",
         ))
@@ -2905,8 +2907,9 @@ fn glm_native_decode_gemm_ext_covers_rung8_and_narrow_projections() {
                 .enumerate()
                 .filter(|(_, d)| d.op == DevOp::GemmLtPf as u16)
                 .collect::<Vec<_>>();
-            // Prefill buckets and rungs 1/4 stay on the interpreter GEMV.
-            if !matches!(rows, 8 | 16) {
+            // Prefill buckets and rungs 1/4 stay on the interpreter GEMV. 8, 16 and 32 are
+            // exactly `glm_decode_lt_rung` with EXT on.
+            if !matches!(rows, 8 | 16 | 32) {
                 assert!(native.is_empty(), "rows={rows}");
                 continue;
             }
@@ -2971,7 +2974,7 @@ fn glm_native_decode_gemm_ext_covers_rung8_and_narrow_projections() {
                 }
             }
         }
-        assert_eq!(checked, 2);
+        assert_eq!(checked, 3);
         Ok(crate::LeanReport::skipped(
             "native decode GEMM EXT regression test",
         ))
@@ -3082,8 +3085,9 @@ fn glm_decode_gemm_group_reorders_native_gemms_without_changing_work() {
         x.sort();
         y.sort();
         assert_eq!(x, y, "rows={rows}: the reorder must keep the same instructions");
-        // The shared expert splits into native gate/up halves + Glu only at row 16; below it,
-        // or with no native GEMM, there is nothing to move.
+        // The shared expert splits into native gate/up halves + Glu only on the rungs
+        // `glm_decode_lt_rung` admits (16 and 32); below them, or with no native GEMM, there is
+        // nothing to move.
         if !a.iter().any(|i| i.0 == lt) || !a.iter().any(|i| i.0 == DevOp::Glu as u16) {
             assert_eq!(pa, pb, "rows={rows}: nothing to group, no reorder");
             continue;
@@ -3114,7 +3118,7 @@ fn glm_decode_gemm_group_reorders_native_gemms_without_changing_work() {
             "rows={rows}: top-k and Glu share a segment"
         );
     }
-    assert_eq!(native_rungs, 1);
+    assert_eq!(native_rungs, 2);
 }
 
 #[test]
@@ -3821,6 +3825,20 @@ fn the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces() {
                 .collect()
         };
         let base = if parent.is_some() { emit(&with(None)) } else { rolled_back.clone() };
+        // The two sequence-parallel knobs are the exception, and deliberately so: the recipe
+        // forces `token_batch_tp` on, and `token_batch_tp` in turn FORCES both of these off (see
+        // `apply_production_defaults`), because the pair is the measured long-context corruption
+        // behind `token_batch_tp_excludes_seq_par`. So they must be inert here — asking for them
+        // must not move the packet. Flip them back to `assert_ne!` only together with a retrieval
+        // run that clears the pair at long context.
+        if matches!(knob, "PLOW_GLM_SEQ_PAR" | "PLOW_GLM_SEQ_PAR_PROJ") {
+            assert_eq!(
+                base,
+                emit(&with(Some(knob))),
+                "{knob}=1 moved the packet, but token_batch_tp must force it off"
+            );
+            continue;
+        }
         assert_ne!(base, emit(&with(Some(knob))), "{knob}=1 changed nothing");
     }
     std::fs::remove_dir_all(dir).unwrap();

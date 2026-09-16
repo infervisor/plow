@@ -1271,11 +1271,7 @@ fn note_arrival(
     }
 }
 
-fn reserved_kv_rows(prompt_tokens: usize, max_tokens: usize, generated_tokens: usize) -> u64 {
-    prompt_tokens
-        .saturating_add(max_tokens.max(1))
-        .saturating_sub(generated_tokens) as u64
-}
+use crate::sched::admission::{reserved_kv_rows, seat, Denied};
 
 /// Place a job into the first idle slot, asking the arena for the KV
 /// footprint upfront. Under temporary KV pressure the request remains queued without occupying
@@ -1302,82 +1298,76 @@ fn admit_into(
         return None;
     }
 
-    // A dead engine cannot serve anyone — reject up front with the fault that
-    // killed it (fatal DeviceFault → 503), instead of admitting into a
-    // poisoned context. The poisoning itself was logged once; this stays at
-    // debug so a request flood doesn't become a log flood.
-    if let EngineHealth::Dead(info) = health {
-        tracing::debug!("mux: engine dead — request rejected");
-        Metrics::inc(&metrics.rejected);
-        let _ = job
-            .respond
-            .try_send(StreamChunk::Err(crate::RuntimeError::DeviceFault {
-                info: info.clone(),
-            }));
-        return None;
-    }
-
-    let Some(idx) = slots[..limit.min(slots.len())]
+    let want = reserved_kv_rows(job.prompt_ids.len(), job.gen.max_tokens, 0);
+    let seq_upper = want as i64;
+    let free_slot = slots[..limit.min(slots.len())]
         .iter()
-        .position(|s| s.is_none())
-    else {
-        // Capacity exhausted — reject fast rather than sitting on the request.
-        tracing::warn!(
-            capacity = slots.len(),
-            "mux: no free slot — request rejected"
-        );
-        // Counted here and NOT in the admission-shed path above: both end as a
-        // 429, but shedding is the controller dropping live work because
-        // predicted wait passed the SLO, while this is arrival meeting a full
-        // slot table. Adding them together hides which pressure caused the 429.
-        Metrics::inc(&metrics.rejected);
-        let _ = job
-            .respond
-            .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
-                "engine at capacity — no free slot".into(),
-            )));
-        return None;
-    };
+        .position(Option::is_none);
+    let committed = slots
+        .iter()
+        .flatten()
+        .map(|s| reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()));
 
-    let seq_upper = reserved_kv_rows(job.prompt_ids.len(), job.gen.max_tokens, 0) as i64;
-
-    // KV CAPACITY, charged over every live slot and not just the admission window.
-    if let Some(budget) = kv_budget {
-        let want = seq_upper.max(0) as u64;
-        if !budget.fits_requests([want]) {
-            // Nothing will ever free enough: deferring would wedge the queue behind it, so
-            // this one is answered now. Distinct from max_ctx, which bounds the PROMPT — this
-            // bounds prompt + generation against what this device was left after the load.
-            tracing::warn!(
-                want,
-                max_rows = budget.max_rows(),
-                "mux: request exceeds the whole KV budget — rejected"
-            );
+    let idx = match seat(
+        matches!(health, EngineHealth::Dead(_)),
+        free_slot,
+        want,
+        committed,
+        kv_budget,
+    ) {
+        Ok(idx) => idx,
+        Err(denied) => {
+            // Retryable: stays queued, says nothing, costs no slot. This is the whole
+            // backpressure mechanism.
+            if denied.is_retryable() {
+                if let Denied::KvBudgetFull { want } = denied {
+                    tracing::debug!(
+                        want,
+                        max_rows = kv_budget.map(|b| b.max_rows()).unwrap_or(0),
+                        "mux: KV budget full — request stays queued"
+                    );
+                }
+                return Some((job, arrived));
+            }
+            // Terminal: answer the stream with the reason this request can never be seated.
+            let err = match denied {
+                Denied::EngineDead => {
+                    // The poisoning itself was logged once; this stays at debug so a request
+                    // flood does not become a log flood.
+                    tracing::debug!("mux: engine dead — request rejected");
+                    let EngineHealth::Dead(info) = health else {
+                        unreachable!("seat only returns EngineDead for a dead engine")
+                    };
+                    crate::RuntimeError::DeviceFault { info: info.clone() }
+                }
+                Denied::NoFreeSlot => {
+                    tracing::warn!(
+                        capacity = slots.len(),
+                        "mux: no free slot — request rejected"
+                    );
+                    crate::RuntimeError::Rejected("engine at capacity — no free slot".into())
+                }
+                Denied::ExceedsWholeBudget { want, max_rows } => {
+                    tracing::warn!(
+                        want,
+                        max_rows,
+                        "mux: request exceeds the whole KV budget — rejected"
+                    );
+                    crate::RuntimeError::ContextLength(format!(
+                        "request reserves {want} tokens; this device can back {max_rows} across \
+                         all concurrent sequences"
+                    ))
+                }
+                Denied::KvBudgetFull { .. } => unreachable!("handled as retryable above"),
+            };
+            // Counted for every terminal denial. Kept separate from the admission-shed path:
+            // both end as a 429, but shedding is the controller dropping live work because
+            // predicted wait passed the SLO, while these are arrival meeting a hard limit.
             Metrics::inc(&metrics.rejected);
-            let _ = job
-                .respond
-                .try_send(StreamChunk::Err(crate::RuntimeError::ContextLength(
-                    format!(
-                        "request reserves {want} tokens; this device can back {} across all \
-                     concurrent sequences",
-                        budget.max_rows()
-                    ),
-                )));
+            let _ = job.respond.try_send(StreamChunk::Err(err));
             return None;
         }
-        let committed = slots
-            .iter()
-            .flatten()
-            .map(|s| reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()));
-        if !budget.fits_requests(committed.chain(std::iter::once(want))) {
-            tracing::debug!(
-                want,
-                max_rows = budget.max_rows(),
-                "mux: KV budget full — request stays queued"
-            );
-            return Some((job, arrived));
-        }
-    }
+    };
 
     let kv = if let Some(arena) = arena {
         match arena.lock().arena.allocate_slot(seq_upper) {

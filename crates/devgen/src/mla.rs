@@ -1731,7 +1731,8 @@ struct GlmLW {
     wofold: u32, // DERIVED fused W_uv·W_o (NH*DK -> H), prefill ofold arm only; else NONE
     gpost: u32, // post_attention_layernorm
     // MoE (sparse layers): router + shared expert + the two loader-filled pointer tables.
-    wr: u32, // mlp.gate.weight [E,H] bf16; router accumulation/output remain f32
+    wr: u32, // mlp.gate.weight [E,H], bf16 or packed MXFP4; accumulation/output stay f32
+    wr_s: u32, // mlp.gate.weight E8M0 scale rows, MXFP4 arm only; else NONE
     bias: u32, // mlp.gate.e_score_correction_bias [E] f32
     shg: u32,  // shared_experts.gate_proj
     shu: u32,  // shared_experts.up_proj
@@ -2826,6 +2827,11 @@ fn declare_glm_rows_batched_for_prefill(
             } else {
                 tw(b, "mlp.gate.weight", e as u64, h as u64)
             },
+            wr_s: if dense {
+                TENSOR_NONE
+            } else {
+                mxs(b, "mlp.gate.weight", e as u64, h as u64)
+            },
             bias: if dense {
                 TENSOR_NONE
             } else {
@@ -3596,6 +3602,22 @@ fn glm_decode_gemv_cus(cus: &[u32], op: DevOp, n: u32, k: u32) -> Vec<u32> {
     }
 }
 
+/// Decode rungs that may carry native GEMMs at all.
+///
+/// The single source of truth for the rung half of the native-GEMM predicate. The decode builder
+/// must call `deny_uniseg` for exactly these rungs (`glm_emit_decode`): a raw Tensile kernel
+/// cannot join the interpreter's counter protocol, so it needs its own ordered segment. Deriving
+/// the two independently is how rung 32 came to emit 15 native GEMMs into a single segment.
+///
+/// 32 is the widest rung, and serving `capacity` is exactly that width — a rung that misses this
+/// route sets the concurrency ceiling while running the GEMV arithmetic the rung sweep measured at
+/// 2.4x the Tensile path. `glm_lt_decode_gfx942.json` pins MT32x16x256, MT32x16x512 and
+/// MT32x32x256, which lost their only consumer when the ladder dropped rung 20.
+fn glm_decode_lt_rung(rows: u32) -> bool {
+    let cfg = emit_config::active();
+    matches!(rows, 16 | 32) || (cfg.glm_gemm_lt_decode_ext() && rows == 8)
+}
+
 /// Whether [`emit_glm_decode_gemm_lt`] routes a `rows`-row decode projection of `shape` to the
 /// native GEMM.
 fn glm_decode_lt_routes(rows: u32, shape: [u32; 2]) -> bool {
@@ -3604,7 +3626,7 @@ fn glm_decode_lt_routes(rows: u32, shape: [u32; 2]) -> bool {
     // (k_rope, q_rope, indexer k/weights, lm_head). Measured against the pinned kernels on one
     // MI300X; see docs/flags-reference.md `PLOW_GLM_GEMM_LT_DECODE_EXT`.
     let ext = cfg.glm_gemm_lt_decode_ext();
-    let rows_ok = rows == 16 || (ext && rows == 8);
+    let rows_ok = glm_decode_lt_rung(rows);
     let shape_ok = matches!(
         shape,
         [2048, 6144] | [512, 6144] | [4096, 2048] | [6144, 2048] | [256, 6144] | [6144, 256]
@@ -6445,6 +6467,15 @@ pub(crate) fn emit_glm_mla_prefill(
 
     // 1 input_layernorm, T rows (on the band + all-gather under the sequence-parallel seams).
     let sp = !raw_output && glm_sp(c, n, b, t);
+    // The row-band fold writes `rb.oat`, but the o_proj that reads it lives inside the `sp`
+    // arm; with `sp` off, o_proj reads `n.oat` and nothing wrote it that layer — legal,
+    // deterministic, wrong. Fail the emit instead of shipping silent long-context corruption.
+    assert!(
+        !rowband || sp,
+        "row-band attention requires sequence parallelism: the full-width o_proj that consumes \
+         the band fold's `rb.oat` is emitted only under `sp`. Enable PLOW_GLM_SEQ_PAR or disable \
+         PLOW_GLM_ROWBAND_ATTN (token_batch_tp forces seq_par off — they cannot both be on)."
+    );
     // A body's band indexer needs its rows' indexer weights, which only the sparse chain gathers.
     let band_indexer = band.is_some() && c.dsa(ctx) && w.iwqb != TENSOR_NONE;
     // Band projections: `widx` rides slot 0, whose next writer (this layer's o_proj) is ordered
@@ -7368,11 +7399,22 @@ fn emit_glm_moe_ffn_prefill(
         };
         let xb = glm_band(b, src, t, tp, h as u64 * 2);
         let lb = glm_band(b, n.rlogit, t, tp, e as u64 * F32);
-        let score_op = if c.has_dsa { DevOp::GemmF32 } else { DevOp::Gemv };
+        // PREFILL. `rlogit` is f32 for every model on this emitter (GLM_ROUTER_FLAGS always
+        // carries F32_LOGIT), so the router projection must both write f32 and be a prefill-legal
+        // op. `Gemv` is neither — it is decode-only and writes bf16, which is what
+        // `mla_full_prefill_bucket_op_sequence` reports.
+        let score_op = if enc == MoeEnc::Mxfp4 {
+            DevOp::GemvMxfp4
+        } else {
+            DevOp::GemmF32
+        };
         let cs = b.emit(score_op, all.clone(), &[dep], |d| {
             d.t[0] = lb;
             d.t[1] = xb;
             d.t[2] = w.wr;
+            if enc == MoeEnc::Mxfp4 {
+                d.t[3] = w.wr_s;
+            }
             d.i[0] = tb;
             d.i[1] = e;
             d.i[2] = h;
@@ -7380,11 +7422,22 @@ fn emit_glm_moe_ffn_prefill(
         let tab_b = glm_band_as(b, n.rt_tp, t, tp, tk_all as u64 * 8, ".rt");
         (tb, lb, tab_b, cs)
     } else {
-        let score_op = if c.has_dsa { DevOp::GemmF32 } else { DevOp::Gemv };
+        // PREFILL. `rlogit` is f32 for every model on this emitter (GLM_ROUTER_FLAGS always
+        // carries F32_LOGIT), so the router projection must both write f32 and be a prefill-legal
+        // op. `Gemv` is neither — it is decode-only and writes bf16, which is what
+        // `mla_full_prefill_bucket_op_sequence` reports.
+        let score_op = if enc == MoeEnc::Mxfp4 {
+            DevOp::GemvMxfp4
+        } else {
+            DevOp::GemmF32
+        };
         let cs = b.emit(score_op, all.clone(), &[c_rn2], |d| {
             d.t[0] = n.rlogit;
             d.t[1] = n.xn2;
             d.t[2] = w.wr;
+            if enc == MoeEnc::Mxfp4 {
+                d.t[3] = w.wr_s;
+            }
             d.i[0] = t;
             d.i[1] = e;
             d.i[2] = h;
@@ -8308,7 +8361,13 @@ fn emit_glm_moe_ffn_rows(
 
     // Router score at M = rows, then the PREFILL top-k tail (the decode tail under a token loop,
     // bit-identical per token) and the align/sort that the grouped ops read.
-    let score_op = if c.has_dsa { DevOp::GemmF32 } else { DevOp::Gemv };
+    let score_op = if c.has_dsa {
+            DevOp::GemmF32
+        } else if enc == MoeEnc::Mxfp4 {
+            DevOp::GemvMxfp4
+        } else {
+            DevOp::Gemv
+        };
     let c_score = b.emit(
         score_op,
         glm_decode_gemv_cus(&all, score_op, e, h),
@@ -8317,6 +8376,9 @@ fn emit_glm_moe_ffn_rows(
             d.t[0] = n.rlogit;
             d.t[1] = n.xn2;
             d.t[2] = w.wr;
+            if enc == MoeEnc::Mxfp4 {
+                d.t[3] = w.wr_s;
+            }
             d.i[0] = rows;
             d.i[1] = e;
             d.i[2] = h;
@@ -8793,11 +8855,20 @@ pub(crate) fn emit_glm_moe_ffn(
         "GLM_ROUTER_OLD cannot represent GLM's FP32 router logits"
     );
     let c_router = {
-        let score_op = if c.has_dsa { DevOp::GemmF32 } else { DevOp::Gemv };
+        let score_op = if c.has_dsa {
+            DevOp::GemmF32
+        } else if enc == MoeEnc::Mxfp4 {
+            DevOp::GemvMxfp4
+        } else {
+            DevOp::Gemv
+        };
         let c_score = b.emit(score_op, router_cus.clone(), &[c_rn2], |d| {
             d.t[0] = n.rlogit;
             d.t[1] = n.xn2;
             d.t[2] = w.wr;
+            if enc == MoeEnc::Mxfp4 {
+                d.t[3] = w.wr_s;
+            }
             d.i[0] = 1;
             d.i[1] = e;
             d.i[2] = h;
@@ -9745,9 +9816,7 @@ fn glm_emit_full(
             );
             b.deny_uniseg();
         }
-        if emit_config::active().glm_gemm_lt_decode()
-            && (rb == 16 || (emit_config::active().glm_gemm_lt_decode_ext() && rb == 8))
-        {
+        if emit_config::active().glm_gemm_lt_decode() && glm_decode_lt_rung(rb) {
             assert!(
                 crate::emit_is_amd() && target == "gfx942",
                 "native GLM decode GEMM requires gfx942"
