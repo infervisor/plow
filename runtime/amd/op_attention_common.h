@@ -2297,6 +2297,14 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
  * quantization error here is common-mode across all `n_head` heads rather than confined to one.
  * That is a reason to MEASURE this family separately from the dense one, not a reason it cannot
  * work; the numbers are in perf-data/mla-fp8-kv.md. */
+/* A gathered index slot may be the -1 PAD `d_index_select_pf` writes for a row with fewer live
+ * keys than top_k. In the PV phase the slot's softmax weight is already zero, so clamping the ROW
+ * keeps the contribution zero AND the address inside the cache; the score phase drops the slot
+ * outright (`keep`). Without this a pad casts to a 4 Gi row offset -- an aperture violation. */
+__device__ __forceinline__ size_t fa_gather_row(int sel) {
+    return (size_t)(unsigned)(sel < 0 ? 0 : sel);
+}
+
 template <int DK, int DR, int GF, bool GATHER = false, bool FP8 = false>
 __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                    const bf16* __restrict__ Qabs, const bf16* __restrict__ Qrope,
@@ -2478,10 +2486,17 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
             for (unsigned p = 0; p < KPASS; p++) {
                 const unsigned rl = wave * KRW + p * KR + krl;
                 const unsigned kv = kv0 + rl;
-                /* dense: cache row (kv & kv_mask); gather: the selected index ibase[kv]. */
-                const unsigned row = GATHER ? (kv < hi ? (unsigned)ibase[kv] : 0u) : (kv & kv_mask);
+                /* dense: cache row (kv & kv_mask); gather: the selected index ibase[kv].
+                 * A gathered slot may be the -1 PAD `d_index_select_pf` writes when a row has
+                 * fewer live keys than top_k. `tk_live` bounds the walk by the CHUNK length, not
+                 * by this row's, so those pads are inside [lo,hi) for every query below top_k and
+                 * a cast to unsigned turns one into a 4 GiB row offset -- an aperture violation,
+                 * not a wrong number. Dropping the slot is also the right math: the pad stands
+                 * for a key that does not exist. */
+                const int sel = GATHER ? (kv < hi ? ibase[kv] : -1) : 0;
+                const unsigned row = GATHER ? (unsigned)(sel < 0 ? 0 : sel) : (kv & kv_mask);
                 const bool keep =
-                    GATHER ? (kv < hi)
+                    GATHER ? (kv < hi && sel >= 0)
                            : (kv < hi && kv <= qpos && (!window || (qpos - kv) < window));
                 float s0[GF];
 #pragma unroll
@@ -2631,7 +2646,7 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
 #pragma unroll
                 for (int c = 0; c < VU; c++) {
                     const unsigned t = kv0 + r + (unsigned)c * NG;
-                    const size_t vrow = GATHER ? (size_t)(unsigned)ibase[t] : (t & kv_mask);
+                    const size_t vrow = GATHER ? fa_gather_row(ibase[t]) : (t & kv_mask);
                     if constexpr (FP8) {
                         vv[c] = fp8v8_to_bf16v8(ld_glob_fp8v8(cb8 + vrow * DK + dbase));
                         vsf[c] = csc[vrow];
@@ -2651,7 +2666,7 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
                 }
             }
             for (; r < rmax; r += NG) {
-                const size_t vrow = GATHER ? (size_t)(unsigned)ibase[kv0 + r] : ((kv0 + r) & kv_mask);
+                const size_t vrow = GATHER ? fa_gather_row(ibase[kv0 + r]) : ((kv0 + r) & kv_mask);
                 bf16v8 v;
                 float vsf = 1.0f;
                 if constexpr (FP8) {
@@ -4532,7 +4547,7 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
                 const unsigned r = e / DK, c = e % DK, kv = kv0 + r;
                 bf16 v = 0;
                 if (kv < hi) {
-                    const size_t row = GATHER ? (size_t)(unsigned)ibase[kv] : (size_t)kv;
+                    const size_t row = GATHER ? fa_gather_row(ibase[kv]) : (size_t)kv;
                     v = cbase[row * DK + c];
                 }
                 Ksm[r * STRIDE + c] = v;
@@ -4541,7 +4556,7 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
                 const unsigned r = e / DR, c = e % DR, kv = kv0 + r;
                 bf16 v = 0;
                 if (kv < hi) {
-                    const size_t row = GATHER ? (size_t)(unsigned)ibase[kv] : (size_t)kv;
+                    const size_t row = GATHER ? fa_gather_row(ibase[kv]) : (size_t)kv;
                     v = rbase[row * DR + c];
                 }
                 Ksm[r * STRIDE + DK + c] = v;
