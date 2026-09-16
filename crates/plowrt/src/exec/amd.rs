@@ -1368,17 +1368,15 @@ fn moe_combine_inst(d: &DevInst64) -> bool {
 ///
 /// Cut points are a CALIBRATION of one routing distribution, not a property of the model.
 ///
-/// MEASURED, AND IT DOES NOT HELP -- which is the reason to keep this documented rather than to
-/// keep reaching for it. Balancing V4.1 at 8k/TP8 from 1.558x to 1.004x left rank 0's MoE pair at
-/// 298 us against 296 us for the even split, and the layer at 13914 us against 13854 us: no
-/// better, slightly worse. Tile COUNT is not what sets the op's duration here. The grouped GEMM's
-/// work items are M-tiles x N-tiles, and at EP's full `moe_inter` there are 18 N-tiles per expert,
-/// so a rank's 29..45 M-tiles become 520..810 items over 304 CUs -- two or three rounds either
-/// way, with the rounding, not the total, deciding. Balancing moves an op that was never bound by
-/// the quantity being balanced.
+/// MEASURED, AND IT IS THE LEVER: on V4.1 at 8k/TP8, balancing the tile load from 1.558x to
+/// 1.004x takes the layer from 17149 us (even cuts) to 15164 us, against 16989 us for TP8 -- so
+/// the even split gives EP away and the balanced one wins 1.83 ms/layer over TP.
 ///
-/// So EP's give-back at XREDUCE2 is NOT expert load imbalance, and a calibrated cut list is not
-/// the lever for it.
+/// An earlier revision of this comment said the opposite, on numbers (13914 us against 13854 us)
+/// taken before `rung_run` restored its entry between iterations. It did not, so every iteration
+/// but the first ran on the previous one's output; the activations degenerate, the router lights
+/// fewer experts, and the tile histogram being balanced here is not the one that was measured.
+/// Balance looked inert because the benchmark had already flattened it.
 ///
 /// A malformed list is FATAL rather than ignored. Every caller must reach ownership through here,
 /// and they arrive with the expert count spelled three different ways (the weight table's size,
