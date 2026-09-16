@@ -81,6 +81,29 @@
  * are exact powers of two and the dequant is a bare exponent add. */
 #define PLOW_CMP_FP4_MAX 6.0f
 #define PLOW_CMP_FP4_FLOOR 7.052966328760454e-38f /* 6 * 2**-126 */
+/* The E4M3-scale arm floors amax at `6 * 2**-9` instead (kernel.py:160), and the value is chosen,
+ * not conservative: `amax / 6` is then exactly 2**-9, e4m3's smallest subnormal, so the rounded
+ * scale of an all-zero block is the smallest NONZERO one. The 2**-126 floor would round to 0 and
+ * the dequant would divide by it. */
+#define PLOW_CMP_FP4_FLOOR_E4M3 0.01171875f /* 6 * 2**-9 */
+
+/* Quantization mode: value format, scale format and amax floor together, because each is one
+ * reference call site rather than three independent choices.
+ *
+ *   FP8_POW2  V4's attention compressor -- `act_quant(..., round_scale=True)`, e4m3 values,
+ *             power-of-two scale, and the only arm that leaves the rope tail unquantized.
+ *   FP4_POW2  the indexer -- `fp4_act_quant(k, 32, True)`, e2m1 values, E8M0 scale.
+ *   FP4_E4M3  V4.1's compressed KV -- `fp4_act_quant(latent, 16, True, scale_dtype=e4m3)`,
+ *             e2m1 values over the WHOLE latent, and a scale that is NOT a power of two.
+ *             `scripts/dsv41_csa2_oracle.py` prices the scale format at 15.3% of the latent's
+ *             amax and the span at 0.406 absolute, so neither is a rounding detail. */
+#define PLOW_CMP_Q_FP8_POW2 0u
+#define PLOW_CMP_Q_FP4_POW2 1u
+#define PLOW_CMP_Q_FP4_E4M3 2u
+
+/* `d_compress_pool` epilogue: V4 fused rope+quant into the pool, V4.1 stops after the norm. */
+#define PLOW_CMP_EPI_ROPE_QUANT 0u
+#define PLOW_CMP_EPI_NORM 1u
 
 /* e2m1 nibble -> its value. `quant_fp4` (amd_common.h) produces sign in bit 3 + a 0..7 code on
  * the ladder {0, .5, 1, 1.5, 2, 3, 4, 6}; the fake quant needs the round trip, not the byte. */
@@ -91,23 +114,37 @@ __device__ __forceinline__ float cmp_dequant_fp4(unsigned n) {
 }
 
 /* The fake quant of kernel.py:84-91 / :156-167, for ONE block of `blk` channels held in `lds`:
- * absmax -> power-of-two scale -> quantize -> dequantize -> store back as bf16. `ROTATE`
- * selects fp4/e2m1 (the indexer compressor, `rotate=True`) over fp8/e4m3 (the attention
- * compressor). The clamp is the reference's, and it is not dead on the fp8 arm: an absmax at
- * the 1e-4 floor makes `x / s` exceed 448 for any channel above the floor. */
-template <bool ROTATE>
+ * absmax -> scale -> quantize -> dequantize -> store back as bf16. `qmode` is one of
+ * `PLOW_CMP_Q_*` above. The clamp is the reference's, and it is not dead on the fp8 arm: an
+ * absmax at the 1e-4 floor makes `x / s` exceed 448 for any channel above the floor.
+ *
+ * The mode is a runtime argument rather than a template parameter because op 185 picks it per
+ * CALL -- compressed KV and index keys differ only here -- and this runs once per `blk` channels
+ * against a pooling loop of `nslot * d`. */
 __device__ __forceinline__ void cmp_fake_quant_block(float* __restrict__ lds, unsigned c0,
-                                                     unsigned blk) {
-    const float top = ROTATE ? PLOW_CMP_FP4_MAX : PLOW_FP8_E4M3_MAX;
-    const float floor_ = ROTATE ? PLOW_CMP_FP4_FLOOR : 1e-4f;
+                                                     unsigned blk, unsigned qmode) {
+    const bool fp4 = qmode != PLOW_CMP_Q_FP8_POW2;
+    const float top = fp4 ? PLOW_CMP_FP4_MAX : PLOW_FP8_E4M3_MAX;
+    const float floor_ = qmode == PLOW_CMP_Q_FP8_POW2   ? 1e-4f
+                         : qmode == PLOW_CMP_Q_FP4_POW2 ? PLOW_CMP_FP4_FLOOR
+                                                        : PLOW_CMP_FP4_FLOOR_E4M3;
     float amax = 0.0f;
     for (unsigned i = 0; i < blk; i++) amax = fmaxf(amax, fabsf(lds[c0 + i]));
     amax = fmaxf(amax, floor_);
-    float s, inv_s;
-    plow_round_scale(amax, top, &s, &inv_s);
+    float s, inv_s = 0.0f;
+    /* An E4M3 scale is NOT a power of two, so neither `plow_round_scale` nor
+     * `PLOW_QUANT_SCALE_DIV`'s reciprocal form applies: the divide is a real divide and the
+     * dequant multiply is a real multiply. */
+    if (qmode == PLOW_CMP_Q_FP4_E4M3)
+        s = dequant_fp8(quant_fp8(amax / top));
+    else
+        plow_round_scale(amax, top, &s, &inv_s);
     for (unsigned i = 0; i < blk; i++) {
-        const float q = fminf(fmaxf(PLOW_QUANT_SCALE_DIV(lds[c0 + i], s, inv_s), -top), top);
-        const float r = ROTATE ? cmp_dequant_fp4(quant_fp4(q)) : dequant_fp8(quant_fp8(q));
+        const float x = lds[c0 + i];
+        const float q = fminf(
+            fmaxf(qmode == PLOW_CMP_Q_FP4_E4M3 ? x / s : PLOW_QUANT_SCALE_DIV(x, s, inv_s), -top),
+            top);
+        const float r = fp4 ? cmp_dequant_fp4(quant_fp4(q)) : dequant_fp8(quant_fp8(q));
         lds[c0 + i] = bf2f(f2bf(r * s));
     }
 }
@@ -136,7 +173,8 @@ __device__ void d_compress_pool(bf16* __restrict__ out, const bf16* __restrict__
                                 unsigned ratio, unsigned coff, unsigned d, unsigned rd,
                                 unsigned qblk, float eps, unsigned out_base, unsigned slice,
                                 unsigned nblk, float* __restrict__ lds, float* __restrict__ part,
-                                const int* __restrict__ pos = nullptr) {
+                                const int* __restrict__ pos = nullptr,
+                                unsigned epilogue = PLOW_CMP_EPI_ROPE_QUANT) {
     /* Workgroup-uniform: every thread reads the same pos[0], so a divergent return could not
      * happen and the barriers below stay safe. */
     if (pos != nullptr && ((pos[0] + 1) % (int)ratio) != 0) return;
@@ -187,6 +225,20 @@ __device__ void d_compress_pool(bf16* __restrict__ out, const bf16* __restrict__
             lds[c] = bf2f(f2bf(lds[c] * inv * bf2f(gamma[c])));
         __syncthreads();
 
+        /* V4.1 STOPS HERE. `Compressor.forward` returns the post-norm latent BEFORE RoPE
+         * (model.py:432-434) -- "Pre-RoPE is deliberate: the indexer needs the unrotated form, so
+         * Attention rotates afterwards" -- and `_compress_kv` does the rope and the quant only
+         * after the indexer has read it (model.py:751-761). That tail is op 185.
+         *
+         * `epilogue` is a kernel-wide immediate, so this early `continue` is workgroup-uniform and
+         * the barriers below stay safe, exactly as the decode gate at the top is. */
+        if (epilogue == PLOW_CMP_EPI_NORM) {
+            bf16* const lrow = out + (size_t)(pbase + pool) * d;
+            for (unsigned c = threadIdx.x; c < d; c += PLOW_THREADS) lrow[c] = f2bf(lds[c]);
+            __syncthreads(); /* lds is reused by the next pool */
+            continue;
+        }
+
         /* ---- interleaved (GPT-J) RoPE on the last rd channels, at the pool's FIRST token.
          * Prefill: `freqs_cis[:cutoff:ratio]`, i.e. absolute position (pbase + pool) * ratio.
          * Decode: `freqs_cis[start_pos + 1 - ratio]`, which at a boundary step
@@ -222,15 +274,77 @@ __device__ void d_compress_pool(bf16* __restrict__ out, const bf16* __restrict__
 
         /* ---- fake quant: blocks of `qblk` channels, one thread per block. ROTATE covers all
          * d; the attention arm covers [0, d-rd) only -- "rope dims stay bf16 for positional
-         * precision" (model.py:510). ---- */
+         * precision" (model.py:510). V4.1 does neither here; it takes the branch above. ---- */
         const unsigned qspan = ROTATE ? d : (d - rd);
+        const unsigned qmode = ROTATE ? PLOW_CMP_Q_FP4_POW2 : PLOW_CMP_Q_FP8_POW2;
         for (unsigned b = threadIdx.x; b < qspan / qblk; b += PLOW_THREADS)
-            cmp_fake_quant_block<ROTATE>(lds, b * qblk, qblk);
+            cmp_fake_quant_block(lds, b * qblk, qblk, qmode);
         __syncthreads();
 
         bf16* orow = out + (size_t)(pbase + pool) * d;
         for (unsigned c = threadIdx.x; c < d; c += PLOW_THREADS) orow[c] = f2bf(lds[c]);
         __syncthreads(); /* lds is reused by the next pool */
+    }
+}
+
+/* ROPE + FAKE QUANT ON ONE COMPRESSED ROW.  [DSV41-CQUANT]
+ *
+ * V4.1 splits what V4 fused. `Compressor.forward` returns the latent before RoPE, the indexer
+ * turns that latent into index keys, and only then does `Attention._compress_kv` rope it and
+ * quantize it into the shared cache (`model.py:751-761`). This op is that tail, and ONE op
+ * covers both consumers because they differ in nothing else:
+ *
+ *   compressed KV   fp4 e2m1, blocks of 16, E4M3 scale   `fp4_act_quant(latent, 16, True, e4m3)`
+ *   index keys      fp4 e2m1, blocks of 32, E8M0 scale   `fp4_act_quant(k, 32, True)`
+ *
+ * Over the WHOLE row in both cases -- there is no "leave the rope tail in bf16" here, which is
+ * the V4-only behaviour `d_compress_pool`'s `qspan` still has.
+ *
+ * `out` and `src` are SEPARATE for a reason the reference hides by running in-place: the indexer
+ * reads `src`, and an in-place rope would be a write-after-read the packet's dependency order
+ * does not express. One extra `[n_rows][d]` bf16 buffer buys that.
+ *
+ * Row `rbase + r` ropes at absolute position `(rbase + r) * ratio`: a latent stands for the FIRST
+ * token of its group. Interleaved (GPT-J) pairs, as everywhere in this file. `pos` is the decode
+ * override, with the same gate and the same slot arithmetic `d_compress_pool` takes, so a decode
+ * packet that emits op 180 can emit this one beside it without patching immediates.
+ *
+ * `lds` must hold `d` floats. No `part`: there is no cross-channel reduction here.
+ */
+__device__ void d_compress_rope_quant(bf16* __restrict__ out, const bf16* __restrict__ src,
+                                      const float* __restrict__ cosb,
+                                      const float* __restrict__ sinb, unsigned n_rows, unsigned d,
+                                      unsigned rd, unsigned qblk, unsigned ratio,
+                                      unsigned row_base, unsigned qmode, unsigned slice,
+                                      unsigned nblk, float* __restrict__ lds,
+                                      const int* __restrict__ pos = nullptr) {
+    if (pos != nullptr && ((pos[0] + 1) % (int)ratio) != 0) return;
+    const unsigned rbase = (pos != nullptr) ? ((unsigned)pos[0] / ratio) : row_base;
+
+    for (unsigned r = slice; r < n_rows; r += nblk) {
+        const bf16* const srow = src + (size_t)(rbase + r) * d;
+        for (unsigned c = threadIdx.x; c < d; c += PLOW_THREADS) lds[c] = bf2f(srow[c]);
+        __syncthreads();
+
+        if (rd) {
+            const size_t tb = (size_t)((rbase + r) * ratio) * (rd / 2);
+            const unsigned c0 = d - rd;
+            for (unsigned i = threadIdx.x; i < rd / 2; i += PLOW_THREADS) {
+                const float x0 = lds[c0 + 2 * i], x1 = lds[c0 + 2 * i + 1];
+                const float cs = cosb[tb + i], sn = sinb[tb + i];
+                lds[c0 + 2 * i] = bf2f(f2bf(x0 * cs - x1 * sn));
+                lds[c0 + 2 * i + 1] = bf2f(f2bf(x0 * sn + x1 * cs));
+            }
+            __syncthreads();
+        }
+
+        for (unsigned b = threadIdx.x; b < d / qblk; b += PLOW_THREADS)
+            cmp_fake_quant_block(lds, b * qblk, qblk, qmode);
+        __syncthreads();
+
+        bf16* const orow = out + (size_t)(rbase + r) * d;
+        for (unsigned c = threadIdx.x; c < d; c += PLOW_THREADS) orow[c] = f2bf(lds[c]);
+        __syncthreads(); /* lds is reused by the next row */
     }
 }
 

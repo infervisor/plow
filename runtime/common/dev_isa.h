@@ -1478,6 +1478,7 @@ enum {
      * expert, engram.wkv, indexer.wq_b -- i.e. 39.8% of an 8k prefill's FLOPs. The routed
      * experts do NOT use it; they are MXFP4 on ops 85/86. */
     PLOW_DOP_GEMM_FP8_MX = 184,
+    PLOW_DOP_COMPRESS_ROPE_QUANT = 185,
 
     PLOW_DOP__COUNT
 };

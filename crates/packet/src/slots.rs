@@ -303,6 +303,7 @@ const DOC: &[S] = &[
     S { op: DevOp::EngramGate, t: &["x", "kv", "q_weight", "k_weight", "token_mask"], i: &["T", "n", "hidden"], f: &["norm_eps"], j: &[] },
     S { op: DevOp::EngramEmbed, t: &["out", "table", "scale", "ids"], i: &["T", "n_cols", "head_dim", "blk", "vocab_start", "part_rows"], f: &[], j: &[] },
     S { op: DevOp::GemmFp8Mx, t: &["out", "x", "w", "scale"], i: &["T", "N", "K"], f: &[], j: &[] },
+    S { op: DevOp::CompressRopeQuant, t: &["out", "src", "cosb", "sinb", "pos"], i: &["n_rows", "d", "rd", "qblk", "ratio", "row_base", "qmode"], f: &[], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

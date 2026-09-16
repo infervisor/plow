@@ -2411,6 +2411,104 @@ only the `[T][hc_mult]` gates and leaves the mix elementwise, would avoid both. 
 **This does not change the projection much**, because only layers 1 and 14 carry an Engram: 38
 layers at 20.4 ms plus 2 at 33.8 ms is ~843 ms, against 90 ms.
 
+### 12.15 Two defects in the layers that already run, and the compressor's split
+
+Going after the 38 reader layers meant reading `Attention.forward` end to end rather than the
+compressed branch alone. That turned up two defects in the part marked Done -- the attention core
+of layers 0 and 1, the two layers that emit, load and produce finite output today. Both are the
+campaign's recurring class: **the tensor shapes agree and the structure does not.**
+
+#### The RoPE pairing
+
+`emit_dsv41_attn_core` rotates `q` and the shared latent with [`DevOp::QwenHeadNormRope`] (op 142),
+whose body pairs element `i` with element `i + rotary/2` -- the half-split (NeoX) convention every
+Qwen packet wants. V4.1's `apply_rotary_emb` says otherwise in its first line:
+
+> Rotate `x` in place, **taking adjacent element pairs as complex numbers**.
+
+`view_as_complex(x.float().unflatten(-1, (-1, 2)))` (`model.py:392-397`) is the interleaved (GPT-J)
+convention. Same tensor, same `[ctx][rd/2]` table, same table CONTENTS -- a different operator.
+
+The interesting question was whether it cancels. Both `q` and the latent go through the same op, and
+a rotation applied in a permuted basis is conjugate to the right one, so a consistent relabelling
+would be free. It is not a relabelling: half-split gives the pair `(i, i+32)` the angle of frequency
+`i` and interleaved gives the pair `(2m, 2m+1)` the angle of frequency `m`, so the two assign
+DIFFERENT angles to the same channels. `scripts/dsv41_rope_oracle.py` asks the attention score
+rather than the vectors:
+
+| check | result |
+|---|---|
+| `q` after interleaved vs half-split rope | 6.63 |
+| **attention score, both sides consistently wrong** | **31.3, 41.2% of the max score** |
+| `irope(rope(q)) == q` | 4.8e-07 |
+| attention output with vs without op 181 | 7.05 |
+
+Op 142 now takes the pairing in **bit 31 of `i2`** -- it rides the width because the op has no free
+`i` slot -- and the interleaved arm's partner is `lane ^ 1` with both lanes of a pair reading table
+entry `lane >> 1`. It also reads the tables as f32 rather than rounding them to bf16, because the
+reference multiplies by a complex64 `freqs_cis` and rounds only the result; the bf16 round in the
+half-split arm is vLLM's Qwen cache convention and does not belong to DeepSeek.
+
+#### The inverse RoPE was never emitted
+
+`Attention.forward` ends:
+
+```python
+o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+apply_rotary_emb(o[..., -rd:], freqs_cis, True)     # model.py:781
+```
+
+on EVERY layer, window-only ones included. The emit stopped at `FlashMerge`. Op 181
+(`RopeInverseO`) has existed since the CSA2 wiring and had **no emit site anywhere in the tree** --
+`grep RopeInverseO crates/devgen` returned nothing. Its own header calls it "STRUCTURAL, not
+cosmetic": `o` mixes cached rows each rotated by its own position, and de-rotating by the QUERY's
+position is what leaves the position-independent latent the fixed `wo_a` was trained against.
+
+A layer without it runs, stays finite, and is wrong -- which is exactly what §12.9's refusal exists
+to prevent and exactly what the parts table said was Done. The row now reads "interior rope +
+windowed absorbed MLA + sink merge + **inverse rope**", and the test asserts op 181 is the core's
+LAST instruction, after the merge, because `o` is what carries the rotation and the partials are
+not.
+
+#### The compressor: V4.1 splits what V4 fused
+
+§12.11 found three differences in op 180's epilogue and called the third a factorization change.
+It is, and the reference states the reason in the class docstring:
+
+> Returns the latent before RoPE ... **Pre-RoPE is deliberate: the indexer needs the unrotated
+> form, so Attention rotates afterwards.**
+
+So `Compressor.forward` is pool -> norm and stops; `_compress_kv` ropes and fake-quantizes into the
+cache only after the indexer has turned that latent into index keys. Op 180 gained `i7 = 2`, an arm
+that stops after the norm, and the tail became **op 185 `CompressRopeQuant`**, which serves both
+consumers of the latent because they differ in nothing else:
+
+| consumer | reference | `i3` (qblk) | `i6` (qmode) |
+|---|---|---|---|
+| compressed KV | `fp4_act_quant(latent, 16, True, scale_dtype=e4m3)` | 16 | fp4 e2m1, **E4M3 scale** |
+| index keys | `fp4_act_quant(k, fp4_block_size, True)` | 32 | fp4 e2m1, E8M0 scale |
+
+`t0` and `t1` are separate buffers rather than the reference's in-place rope: the indexer reads
+`src`, and an in-place rope is a write-after-read the packet order does not express. That costs one
+`[n_rows][d]` bf16 buffer -- 8.4 MB at ratio 1 and 8k.
+
+`cmp_fake_quant_block` now takes the mode at runtime, because the three call sites differ in value
+format, scale format AND amax floor together, and the floor is chosen rather than conservative:
+`6 * 2**-9` makes `amax / 6` exactly `2**-9`, e4m3's smallest subnormal, so an all-zero block gets
+the smallest NONZERO scale. The E8M0 branch's `6 * 2**-126` rounds to zero in e4m3 and the dequant
+would divide by it. `scripts/dsv41_csa2_oracle.py` grew four checks for this:
+
+| check | result |
+|---|---|
+| op 180 (stop after norm) + op 185 vs `_compress_kv` | **max err 0.000e+00** |
+| all-zero block's scale at the E4M3 floor / at the E8M0 floor | 2**-9 / **0** |
+| index-key settings vs KV settings on the same row | 0.625 |
+| the pre-RoPE tap vs the cache row it becomes | 7.52 |
+
+Nine checks, all passing. What op 185 does NOT yet have is an emit site: the compressor emit is the
+next piece, and it is one of the three Todo rows layers 2-39 still carry, beside the two-level
+indexer and the gathered read.
+
 ### 12.2 What is still not demonstrated
 
   * ONE layer, not 40. The whole-model emit is still blocked on the subsystems

@@ -1189,7 +1189,12 @@ pub(crate) fn emit_dsv41_attn_core(
             d.t[5] = pos;
             d.i[0] = heads;
             d.i[1] = hd;
-            d.i[2] = rope;
+            // BIT 31 = INTERLEAVED. `apply_rotary_emb` takes "adjacent element pairs as complex
+            // numbers" (`model.py:392`); op 142's default arm pairs `(i, i + rotary/2)`. The two
+            // are different operators and the mistake does NOT cancel when q and the latent take
+            // it together -- `scripts/dsv41_rope_oracle.py` prices the swap at 41.2% of the
+            // maximum attention score, on a tensor of exactly the right shape.
+            d.i[2] = rope | (1u32 << 31);
             d.i[3] = t;
             d.i[4] = 0; // no cache ring: prefill writes row-major
             d.i[5] = 0; // normalize off
@@ -1234,7 +1239,29 @@ pub(crate) fn emit_dsv41_attn_core(
         d.i[2] = 1; // nsplit
         d.i[3] = hd;
     });
-    (act, c_mg)
+    // THE INVERSE ROPE, which this emit used to leave out entirely.
+    //
+    // `Attention.forward` ends `apply_rotary_emb(o[..., -rd:], freqs_cis, True)` (model.py:781) on
+    // EVERY layer, window-only ones included -- op 181's own header calls it "STRUCTURAL, not
+    // cosmetic", because `o` mixes cached rows each rotated by its OWN position and de-rotating by
+    // the QUERY's position is what leaves a position-independent latent for the fixed `wo_a`. The
+    // op has existed since the CSA2 wiring and had no emit site; a layer without it runs, stays
+    // finite, and is wrong. `scripts/dsv41_rope_oracle.py` check [5].
+    //
+    // `i4 = 0`: a rung is one chunk starting at position 0, and `t3 = TENSOR_NONE` because the
+    // tensor form carries ONE step and exists for decode.
+    let c_ir = b.emit(DevOp::RopeInverseO, all.clone(), &[c_mg], |d| {
+        d.t[0] = act.o;
+        d.t[1] = cos;
+        d.t[2] = sin;
+        d.t[3] = TENSOR_NONE;
+        d.i[0] = t;
+        d.i[1] = nh_l;
+        d.i[2] = hd;
+        d.i[3] = rope;
+        d.i[4] = 0;
+    });
+    (act, c_ir)
 }
 
 /// The o_proj TP partial's tensor name, fixed by `plowrt`'s peer-slot table (slot 0).
@@ -1974,7 +2001,7 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
         p.push(("indexer queries (two-level)", Part::Todo));
     }
     p.push((
-        "attention core (interior rope + windowed absorbed MLA + sink merge)",
+        "attention core (interior rope + windowed absorbed MLA + sink merge + inverse rope)",
         Part::Done,
     ));
     // THE READ SIDE OF CSA2, which this table used to omit entirely.

@@ -305,6 +305,12 @@ const GFX950_UNEMITTED: &[(&str, &str)] = &[
           GLM/Kimi DSA chain uses DSA_POOL_COMPRESS (op 130), a different computation.",
     ),
     (
+        "PLOW_DOP_COMPRESS_ROPE_QUANT",
+        "DeepSeek-V4.1's compressed-row tail (op 185): the rope and the fake quant that V4 fused \
+          into op 180 and V4.1 runs after the indexer has read the pre-rope latent. Same axis as \
+          op 180 -- PLOW_DSV4_CSA2 -- and it is dispatched on both arches for the same reason.",
+    ),
+    (
         "PLOW_DOP_ROPE_INVERSE_O",
         "DeepSeek-V4 CSA2's conjugate rotation on the attention output (op 181). Same standing as \
           COMPRESS_POOL above, and the same emit site will claim both -- they are a pair, since \

@@ -49,6 +49,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | FlashMlaMaterializedPrefill
         | DsaPoolCompress
         | CompressPool
+        | CompressRopeQuant
         | RopeInverseO
         | DsaPoolExpand
         | DsaPoolStash

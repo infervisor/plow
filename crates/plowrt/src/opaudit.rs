@@ -482,6 +482,10 @@ pub fn classify(op: DevOp) -> OpClass {
             cls_c("i6=out_base for the whole packet; source rows are pool * i1 + r off it"),
             "t7=pos makes it a decode call: the slot comes from pos[0] / i1 and the gate from              (pos[0] + 1) % i1, so the scalar base is unused there -- but pos carries ONE step,              not a per-row array, so the class does not lift",
         ),
+        DevOp::CompressRopeQuant => note(
+            cls_c("i5=row_base for the whole packet; row r ropes at (i5 + r) * i4"),
+            "t4=pos supersedes i5 and is read at index 0 only; same single-step limit as              CompressPool, which produced the rows this op finishes",
+        ),
         DevOp::RopeInverseO => note(
             cls_c("i4=pos0 for the whole packet; row t de-rotates by pos0 + t"),
             "t3=pos supersedes i4 and is read at index 0 only; same single-step limit as              CompressPool, and the same hazard HeadNormRope's out_row0 form has",

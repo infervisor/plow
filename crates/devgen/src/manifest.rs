@@ -1271,7 +1271,7 @@ fn backend_amd(
     // reach it. An object without the axis has no case for either op, so a CSA2 packet would fall
     // through the interpreter's switch -- which is what `plow_dsv4_csa2_arm` lets the loader
     // refuse instead.
-    if has("CompressPool") || has("RopeInverseO") {
+    if has("CompressPool") || has("CompressRopeQuant") || has("RopeInverseO") {
         req.push("PLOW_DSV4_CSA2=1".into());
     }
     // Engram (op 182). Separate from CSA2 above: V4 has the compressor without the tables, and

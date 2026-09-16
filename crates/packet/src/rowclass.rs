@@ -207,7 +207,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         // wrong for every row outside the last span under packing. The `pos` tensor each
         // gained supersedes the scalar, but it carries ONE step, not a per-row array, so it
         // does not lift either op out of C.
-        CompressPool | RopeInverseO => RowClass::C,
+        CompressPool | CompressRopeQuant | RopeInverseO => RowClass::C,
 
         // Attention couples rows within one sequence. Packed request spans require per-span
         // execution until the op gains an explicit span descriptor.

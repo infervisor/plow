@@ -1156,7 +1156,17 @@ fn the_attention_core_is_windowed_nope_mla_over_the_shared_latent() {
     assert_eq!(ropes.len(), 2, "q and the latent");
     for r in &ropes {
         assert_eq!(r.i[1], hd, "the whole 512-wide head");
-        assert_eq!(r.i[2], rope, "64 rotated dims");
+        assert_eq!(r.i[2] & 0x7fff_ffff, rope, "64 rotated dims");
+        // BIT 31 = INTERLEAVED (GPT-J), and it is not a flavour. op 142's default arm pairs
+        // `(i, i + rotary/2)`; `apply_rotary_emb` pairs adjacent elements (model.py:392). The
+        // shapes are identical either way and the score moves 41.2%
+        // (`scripts/dsv41_rope_oracle.py`), so nothing downstream would catch a clear bit.
+        assert_ne!(
+            r.i[2] & 0x8000_0000,
+            0,
+            "V4.1's rope is INTERLEAVED; the half-split arm is a different operator and does \
+             NOT cancel when q and the latent take it together"
+        );
         assert_eq!(r.i[7], nope, "starting at 448 -- the SUFFIX, not the prefix");
         assert_eq!(r.i[5], 0, "normalize off; q_norm and kv_norm already ran");
     }
@@ -1192,6 +1202,28 @@ fn the_attention_core_is_windowed_nope_mla_over_the_shared_latent() {
     assert_eq!(mg.t[3], w.get(0, "attn.attn_sink"), "sinks in t3");
     assert_eq!(mg.i[3], hd, "O is head_dim wide, which is what wo_a reads");
     assert_eq!(mg.i[2], 1, "nsplit 1");
+
+    // THE INVERSE ROPE CLOSES THE CORE, and it is the last op, not an optional epilogue.
+    // `Attention.forward` runs it on every layer (model.py:781) and the emit used to stop at the
+    // merge -- op 181 existed with no emit site. Without it `o` still carries the query's
+    // rotation and the fixed `wo_a` reads a position-DEPENDENT latent.
+    let ir = p
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::RopeInverseO as u16)
+        .expect(
+            "the inverse rope on the attention output -- op 181, `apply_rotary_emb(o[..., -rd:], \
+             freqs_cis, True)`",
+        );
+    assert_eq!(ir.t[0], act.o, "in place on the merged output");
+    assert_eq!(ir.i[1], nh_l);
+    assert_eq!(ir.i[2], hd, "the row is head_dim wide");
+    assert_eq!(ir.i[3], rope, "only the last 64 de-rotate");
+    assert_eq!(
+        p.insts.last().map(|d| d.op),
+        Some(DevOp::RopeInverseO as u16),
+        "it must run AFTER the merge: `o` is what carries the rotation, not the partials"
+    );
 
     // And the core's output width is exactly the output LoRA's input.
     let (groups, _, ocol) = cfg.wo_a_groups();

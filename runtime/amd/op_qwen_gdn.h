@@ -303,7 +303,8 @@ __device__ void d_qwen_headnorm_rope_t(bf16* out, const bf16* in, const bf16* ga
                                        const int* active, unsigned heads, unsigned dim,
                                        unsigned rotary, unsigned batch, unsigned context,
                                        unsigned normalize, float eps, float offset, unsigned slice,
-                                       unsigned nblk, unsigned prefill, unsigned rot_offset = 0) {
+                                       unsigned nblk, unsigned prefill, unsigned rot_offset = 0,
+                                       unsigned interleaved = 0) {
     const unsigned lane = threadIdx.x & (PLOW_WAVE - 1u), wave = threadIdx.x >> 6;
     const unsigned waves = blockDim.x >> 6;
     for (unsigned row = slice * waves + wave; row < batch * heads; row += nblk * waves) {
@@ -344,13 +345,33 @@ __device__ void d_qwen_headnorm_rope_t(bf16* out, const bf16* in, const bf16* ga
             const unsigned rreg = rot_offset / PLOW_WAVE;
             /* Unconditional: a shuffle under divergence leaves the inactive lanes' contribution
              * undefined, so every lane exchanges and only the rotary section applies the result. */
-            const float partner = __shfl_xor(x[rreg], half, PLOW_WAVE);
+            const float partner = __shfl_xor(x[rreg], interleaved ? 1u : half, PLOW_WAVE);
             if (lane < rotary) {
-                /* vLLM stores its Qwen rotary cache in the model BF16 dtype; the round is load
-                 * bearing — the tables are f32 in HBM and the reference reads them as bf16. */
-                const float c = bf2f(f2bf(cos[(size_t)pos * half + (lane & (half - 1u))]));
-                const float s = bf2f(f2bf(sin[(size_t)pos * half + (lane & (half - 1u))]));
-                x[rreg] = lane < half ? x[rreg] * c - partner * s : x[rreg] * c + partner * s;
+                if (interleaved) {
+                    /* GPT-J pairs: (2m, 2m+1) are ADJACENT, so the partner is `lane ^ 1` and both
+                     * lanes of a pair read table entry `m = lane >> 1`. DeepSeek spells its rope
+                     * this way -- "taking adjacent element pairs as complex numbers",
+                     * `view_as_complex(x.unflatten(-1, (-1, 2)))` (model.py:392-397) -- and it is
+                     * a DIFFERENT OPERATOR from the half-split form below, not a relabelling of
+                     * it: the two assign different angles to the same channels, and applying the
+                     * wrong one CONSISTENTLY to q and k does not cancel.
+                     * `scripts/dsv41_rope_oracle.py` prices the swap at 41.2% of the maximum
+                     * attention score.
+                     *
+                     * No bf16 round on the table here, unlike the arm below: `apply_rotary_emb`
+                     * multiplies by a complex64 `freqs_cis` in f32 and rounds only the result,
+                     * which is the single `f2bf` on the store. op 180/181 read these same tables
+                     * as f32 for the same reason. */
+                    const float c = cos[(size_t)pos * half + (lane >> 1)];
+                    const float s = sin[(size_t)pos * half + (lane >> 1)];
+                    x[rreg] = (lane & 1u) ? partner * s + x[rreg] * c : x[rreg] * c - partner * s;
+                } else {
+                    /* vLLM stores its Qwen rotary cache in the model BF16 dtype; the round is load
+                     * bearing — the tables are f32 in HBM and the reference reads them as bf16. */
+                    const float c = bf2f(f2bf(cos[(size_t)pos * half + (lane & (half - 1u))]));
+                    const float s = bf2f(f2bf(sin[(size_t)pos * half + (lane & (half - 1u))]));
+                    x[rreg] = lane < half ? x[rreg] * c - partner * s : x[rreg] * c + partner * s;
+                }
             }
         }
         const size_t dest = context
@@ -368,8 +389,14 @@ __device__ void d_qwen_headnorm_rope(bf16* out, const bf16* in, const bf16* gamm
                                      unsigned rotary, unsigned batch, unsigned context,
                                      unsigned normalize, float eps, float offset, unsigned slice,
                                      unsigned nblk, unsigned prefill, unsigned rot_offset = 0) {
+    /* BIT 31 OF `rotary` SELECTS THE PAIRING: set is interleaved (GPT-J, adjacent pairs), clear is
+     * half-split (NeoX, `i` with `i + rotary/2`). It rides the width rather than taking an operand
+     * because op 142 has no free `i` slot, and it is a handle on the model's convention, not a
+     * tuning flag -- see the arm in `_t`. */
+    const unsigned interleaved = (rotary >> 31) & 1u;
+    rotary &= ~(1u << 31);
     /* `rotary <= PLOW_WAVE` keeps the rotated section inside ONE register, which is what makes the
-     * partner a single `lane ^ (rotary/2)` shuffle. Qwen3.5 uses rotary = 64 on a 256-wide head.
+     * partner a single shuffle. Qwen3.5 uses rotary = 64 on a 256-wide head.
      *
      * `rot_offset` picks WHICH register, so it must land on a register boundary and the rotated
      * range must stay inside the row. 0 is the prefix form and every Qwen packet emits it.
@@ -382,7 +409,7 @@ __device__ void d_qwen_headnorm_rope(bf16* out, const bf16* in, const bf16* gamm
 #define PLOW_QWEN_HNR_CALL(PL_)                                                                    \
     d_qwen_headnorm_rope_t<PL_>(out, in, gamma, cos, sin, positions, active, heads, dim, rotary,   \
                                 batch, context, normalize, eps, offset, slice, nblk, prefill,      \
-                                rot_offset)
+                                rot_offset, interleaved)
     switch (dim) {
         case 64: PLOW_QWEN_HNR_CALL(1); break;
         case 128: PLOW_QWEN_HNR_CALL(2); break;

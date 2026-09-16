@@ -1800,6 +1800,14 @@ pub enum DevOp {
     /// otherwise. Qwen rotates the prefix and emits 0, which keeps every existing packet
     /// byte-identical. DeepSeek-V4.1 rotates the SUFFIX -- `q[..., -64:]` of a 512-wide head --
     /// and emits 448.
+    ///
+    /// `i2` BIT 31 IS THE PAIRING, not part of the width: set selects interleaved (GPT-J,
+    /// adjacent pairs `(2m, 2m+1)`), clear the half-split (NeoX, `(i, i + rotary/2)`) arm every
+    /// Qwen packet emits. DeepSeek-V4.1 sets it — `apply_rotary_emb` takes "adjacent element
+    /// pairs as complex numbers" (`model.py:392`) — and the two are different operators, not
+    /// relabellings: applying the wrong one consistently to q AND k does not cancel.
+    /// The interleaved arm also reads the tables as f32, because the reference multiplies by a
+    /// complex64 `freqs_cis` and rounds only the result.
     QwenHeadNormRope = 142,
     /// BF16 causal convolution plus SiLU for exactly T valid tokens: x/out[T,C], weight[C,W], mutable oldest-first history[1,C,W-1]. Updates history after the chunk.
     ///
@@ -2035,8 +2043,9 @@ pub enum DevOp {
     /// `i0=n_pools i1=ratio i2=coff i3=d i4=rd i5=qblk i6=out_base i7=rotate` ·
     /// `f0=eps`.
     ///
-    /// `i7 = rotate` picks the template arm: 0 is the fp8 path, 1 the
-    /// Hadamard-rotated fp4 path (different clamp constants, not a tuning flag).
+    /// `i7 = arm`: 0 is V4's fp8 path, 1 the Hadamard-rotated fp4 path (different clamp
+    /// constants, not a tuning flag), 2 V4.1's — pool and norm and STOP, leaving the rope and
+    /// the quant to [`DevOp::CompressRopeQuant`] and `t5`/`t6`/`i4`/`i5` unused.
     /// A non-null `t7` makes it a DECODE call — the kernel gates on
     /// `(pos[0] + 1) % ratio == 0` and takes the output slot from `pos[0]` instead
     /// of `i6`, so the decode packet needs no per-step immediate patching.
@@ -2112,6 +2121,24 @@ pub enum DevOp {
     /// expert, `engram.wkv` and `indexer.wq_b` -- 39.8% of an 8k prefill's FLOPs. The routed
     /// experts do NOT; they are MXFP4 on ops 85/86.
     GemmFp8Mx = 184,
+    /// DeepSeek-V4.1's compressed-row tail: interleaved RoPE on the last `rd` channels, then
+    /// the blockwise fake quant, one workgroup per row (`op_compress.h`
+    /// `d_compress_rope_quant`, `[DSV41-CQUANT]`).
+    /// `t0=out t1=src t2=cosb t3=sinb t4=pos` ·
+    /// `i0=n_rows i1=d i2=rd i3=qblk i4=ratio i5=row_base i6=qmode`.
+    ///
+    /// V4.1 SPLIT WHAT V4 FUSED. [`DevOp::CompressPool`] with `i7 = 2` stops after the norm,
+    /// because `Compressor.forward` returns the latent before RoPE for the indexer to consume;
+    /// this op is the rest, and it serves both consumers of that latent —
+    /// `i6 = 2` (fp4 e2m1, E4M3 scale) with `i3 = 16` is the compressed KV cache,
+    /// `i6 = 1` (fp4 e2m1, E8M0 scale) with `i3 = 32` is the indexer's keys.
+    /// The whole row is quantized either way; the rope tail stays bf16 only on
+    /// [`DevOp::CompressPool`]'s V4 arm.
+    ///
+    /// `t0` and `t1` must NOT alias: the indexer reads `src`, and the reference's in-place rope
+    /// is a write-after-read the packet order does not express. `t4` supersedes `i5` when
+    /// present, for the same reason [`DevOp::CompressPool`]'s `t7` does.
+    CompressRopeQuant = 185,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2312,6 +2339,7 @@ impl DevOp {
         DevOp::EngramGate,
         DevOp::EngramEmbed,
         DevOp::GemmFp8Mx,
+        DevOp::CompressRopeQuant,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2517,6 +2545,7 @@ impl DevOp {
             DevOp::EngramGate => "PLOW_DOP_ENGRAM_GATE",
             DevOp::EngramEmbed => "PLOW_DOP_ENGRAM_EMBED",
             DevOp::GemmFp8Mx => "PLOW_DOP_GEMM_FP8_MX",
+            DevOp::CompressRopeQuant => "PLOW_DOP_COMPRESS_ROPE_QUANT",
         }
     }
 
