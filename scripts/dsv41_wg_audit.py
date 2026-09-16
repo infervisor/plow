@@ -31,7 +31,7 @@ n = len(blob) // REC.size
 per = defaultdict(lambda: defaultdict(list))  # op -> inst -> [busy_us]
 for i in range(n):
     cu, pc, inst, op, sl, ta, tr, te = REC.unpack_from(blob, i * REC.size)
-    if not te or op not in OPS:
+    if not te:
         continue
     per[op][inst].append((te - tr) / TPUS)
 
@@ -49,7 +49,7 @@ for op, insts in per.items():
         wg_n += len(dur)
     k = len(insts)
     ideal = tot_agg / NCU
-    rows.append((tot_max, OPS[op], k, wg_n // k, busy_n / k, tot_max,
+    rows.append((tot_max, OPS.get(op, f"op{op}"), k, wg_n // k, busy_n / k, tot_max,
                  tot_agg, ideal, tot_max / ideal if ideal else 0))
 for _, nm, k, wgs, busy, mx, agg, ideal, ser in sorted(rows, reverse=True):
     print(f"{nm:<24}{k:>6}{wgs:>6}{busy:>7.0f}{mx/k:>9.1f}"

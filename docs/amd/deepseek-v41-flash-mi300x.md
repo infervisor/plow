@@ -3413,6 +3413,13 @@ time if the same work filled the machine evenly), and `serial = max / ideal304`.
 | MOE_ROUTER_TOPK_PF | 40 | 304 | 358.0 | 4.2 s | 13.9 ms | 1.03 |
 | RMSNORM | 125 | 304 | 93.4 | 3.1 s | 10.2 ms | 1.14 |
 
+The sweep covers EVERY op in the trace, not just these thirteen. The only other sub-linear
+schedule is `MOE_ALIGN_PF` (op 84), which launches 48 workgroups rather than 304 and scores
+serial 7.80 -- by construction, since part of it is a single-workgroup prefix, and its entire
+cost is 4.5 ms. Everything else lands between 1.02 and 2.51, the outliers being small ops
+(op 117 at 1.84, op 14 at 2.51) whose totals are single-digit ms. The audit is
+`scripts/dsv41_wg_audit.py`.
+
 **Twelve of thirteen fill the machine.** Every compute op runs all 304 workgroups within 1.02-1.20x
 of a perfectly even split — they are well balanced and the grid-stride loops work. That is a useful
 NEGATIVE result for the whole remaining campaign: the pipeline's 2-4% of peak is genuine per-CU
