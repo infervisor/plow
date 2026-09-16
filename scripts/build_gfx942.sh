@@ -1442,6 +1442,11 @@ if [ -n "${PLOW_HC_VEC8:-}" ]; then
   AX_GLUE="$AX_GLUE -DPLOW_HC_VEC8=${PLOW_HC_VEC8}"
 fi
 
+# PLOW_CMP_VEC8=0: restore d_compress_rope_quant's per-channel scalar reads (the A/B control).
+if [ -n "${PLOW_CMP_VEC8:-}" ]; then
+  AX_GLUE="$AX_GLUE -DPLOW_CMP_VEC8=${PLOW_CMP_VEC8}"
+fi
+
 # ROUTER SELECTION ARM for the PREFILL objects. The header defaults PLOW_MOE_ROUTER_SELECT to
 # PLOW_K3 and the _LOCAL variant is only ever handed to the K3 DECODE row (AX_K3_ROUTER_LOCAL
 # above), so a non-K3 prefill object has never been able to take either. All three arms pick the

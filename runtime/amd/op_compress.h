@@ -350,6 +350,11 @@ __device__ void d_compress_pool(bf16* __restrict__ out, const bf16* __restrict__
  * interleaved rope pair is two adjacent channels, so one THREAD owns a block end to end. The
  * `lds` parameter stays for the dispatch's uniform call shape and is unused.
  */
+/* PLOW_CMP_VEC8=0 restores the per-channel scalar reads (the A/B control for the vector lane
+ * inside d_compress_rope_quant). */
+#ifndef PLOW_CMP_VEC8
+#define PLOW_CMP_VEC8 1
+#endif
 __device__ void d_compress_rope_quant(bf16* __restrict__ out, const bf16* __restrict__ src,
                                       const float* __restrict__ cosb,
                                       const float* __restrict__ sinb, unsigned n_rows, unsigned d,
@@ -396,6 +401,49 @@ __device__ void d_compress_rope_quant(bf16* __restrict__ out, const bf16* __rest
          * Bit-identical: the same values in the same order through the same fmaxf fold and the
          * same cmp_quant_rt. */
         constexpr unsigned QMAX = 32u;
+        /* VECTOR LANE. The register arm above still reads CHANNEL BY CHANNEL, and `cmp_rope_at`
+         * touches TWO channels per call -- its own and the rotary partner -- so a qblk=16 block
+         * costs 32 scalar bf16 loads where the data is 32 CONTIGUOUS bytes. The indexer's query
+         * call is 8192 x 32 heads x 128 at qblk 16, and it measured 508 us moving ~84 MB: 165 GB/s,
+         * 3% of HBM, ~40x off roofline and the worst ratio in the layer.
+         *
+         * The partner is always inside the same 8-element vector, so one `ld_glob8` serves both
+         * reads. RoPE here is INTERLEAVED (GPT-J): channel `c_rope0 + 2m` pairs with
+         * `c_rope0 + 2m + 1`, adjacent. A pair therefore straddles an 8-aligned boundary only if
+         * `c_rope0 + 2m == 7 (mod 8)`, which is odd and so impossible whenever `c_rope0` is even --
+         * the guard below. `c0` is a multiple of `qblk` and `qblk % 8 == 0`, so each 8-group is
+         * 8-aligned within the row and `srow` is `d`-strided, keeping the 16 B load aligned.
+         *
+         * BIT-IDENTICAL: the same two bf16 values per channel, through the same f32 fma pair, the
+         * same `f2bf` round trip and the same `fmaxf` fold, in the same order. Only the LOADS
+         * change -- 32 of them become 2. */
+        if (PLOW_CMP_VEC8 && qblk <= QMAX && (qblk & 7u) == 0u && (c_rope0 & 1u) == 0u) {
+            float v[QMAX];
+            float amax = 0.0f;
+            for (unsigned i0 = 0; i0 < qblk; i0 += 8u) {
+                const bf16v8 xv = ld_glob8(srow + c0 + i0);
+#pragma unroll
+                for (unsigned j = 0; j < 8u; j++) {
+                    const unsigned c = c0 + i0 + j;
+                    float val;
+                    if (c < c_rope0) {
+                        val = bf2f(xv[j]);
+                    } else {
+                        const unsigned k = c - c_rope0, m = k >> 1;
+                        const float x = bf2f(xv[j]), p = bf2f(xv[j ^ 1u]);
+                        const float cs = cosb[tb + m], sn = sinb[tb + m];
+                        val = bf2f(f2bf((k & 1u) ? p * sn + x * cs : x * cs - p * sn));
+                    }
+                    v[i0 + j] = val;
+                    amax = fmaxf(amax, fabsf(val));
+                }
+            }
+            float inv_s;
+            const float s = cmp_block_scale(amax, qmode, &inv_s);
+            for (unsigned i = 0; i < qblk; i++)
+                orow[c0 + i] = f2bf(cmp_quant_rt(v[i], s, inv_s, qmode));
+            continue;
+        }
         if (qblk <= QMAX) {
             float v[QMAX];
             float amax = 0.0f;

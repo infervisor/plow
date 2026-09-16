@@ -4599,3 +4599,34 @@ quant block and the work is ~23 cycles/element. The §12.38/§12.41 class of fix
 8 elements and vectorise the load -- is exactly what it has never had; the register-caching pass in
 §12.40 cut the pair 878 -> 665 us and left the ACCESS WIDTH alone. Worth ~350 us/layer, ~14 ms end
 to end, and it is ordinary kernel work rather than an architectural change.
+
+### 12.57 The compressor's access width, taken: 667 -> 567 us
+
+§12.56 named `COMPRESS_ROPE_QUANT` as the worst ratio in the layer and pointed at the load width.
+Taken, and it is the fifth win of the LOAD-WIDTH class.
+
+The register arm from §12.40 still read CHANNEL BY CHANNEL, and `cmp_rope_at` touches TWO channels
+per call -- its own and the rotary partner -- so a `qblk=16` block cost **32 scalar bf16 loads over
+32 CONTIGUOUS bytes**. The partner is always inside the same 8-element vector: RoPE here is
+interleaved (GPT-J), so `c_rope0 + 2m` pairs with `c_rope0 + 2m + 1`, and a pair straddles an
+8-aligned boundary only if `c_rope0 + 2m == 7 (mod 8)` -- odd, hence impossible whenever `c_rope0`
+is even. So one `ld_glob8` serves both reads and 32 loads become 2.
+
+`PLOW_CMP_VEC8` (default 1), guarded on `qblk % 8 == 0 && c_rope0 % 2 == 0`. MEASURED, interleaved
+with its control:
+
+    PLOW_CMP_VEC8=0    669.0 / 664.4 us
+    PLOW_CMP_VEC8=1    557.3 / 576.2 us      -15%
+
+and per packet the one that matters moves with it:
+
+    #15 (index queries, 8192 x 32 x 128)    508.1 -> 436.6 us
+
+**Bit-identical, and exits confirm it**: min/max hold at -1.36719 / 3.64062 on every run of both
+arms. The same two bf16 values per channel go through the same f32 fma pair, the same `f2bf` round
+trip and the same `fmaxf` fold, in the same order; only the loads changed.
+
+**It is -100 us/layer, ~-4 ms end to end -- well short of the ~350 us the load count predicted**,
+and the reason is visible in what is left: the `cosb`/`sinb` table gathers are still one scalar
+load per PAIR, and the `f2bf` round trip per channel is unchanged. The op is now ~34x off its
+floor instead of ~40x. The remaining width is in those tables, not in the source reads.
