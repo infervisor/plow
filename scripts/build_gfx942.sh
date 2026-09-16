@@ -625,6 +625,27 @@ esac
 # script otherwise builds. Arm the queue interpretation on exactly the K3 A4W4 rows; hierarchy
 # remains a separate, unmeasured PLOW_L2HIER_PF experiment.
 AX_K3_A4W4="-DPLOW_L2_PLACE_DISPATCH=1"
+# V4.1's MoE TILE. DeepSeek-V4.1-Flash routes top-6 over 384 experts at TP8, so `down`'s K is
+# moe_intermediate/TP = 288 -- a five-iteration k-loop that cannot amortize anything. Two ceiling
+# instruments (docs/amd/deepseek-v41-flash-mi300x.md 12.25) showed the pair is bound by NEITHER its
+# k-loop (capping it at one tile moved DOWN -0.24%) NOR its scatter (issuing 1 store in 16 moved it
+# +3.2%): the cost is the fixed per-tile overhead of 27,648 output tiles per layer per rank, which
+# is what the MPF_BM note below predicts and what raising BM halves.
+#
+# MEASURED at 8k/TP8, both arms built with both hoists off so the A/B is the tile and not the hoist:
+#   BM=64    DOWN 119.4 ms   GLU 74.0 ms   model 833.8 ms
+#   BM=128   DOWN  72.0 ms   GLU 49.7 ms   model 755.4 ms
+# The metadata hoist is worth ~6.6 ms at BM=64 (827.2 ms with it), and it CANNOT ride BM=128 --
+# both hoists `#error` unless MPF_BM == PLOW_WAVE. 78.5 ms beats 6.6 ms, so V4.1 takes the tile.
+#
+# Confined to PLOW_PREFILL_DSV41 so no other model's objects move, and a caller's own MPF_BM still
+# wins (in which case the hoist defaults are left alone and the `#error` is the caller's to resolve).
+if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ] && [ -z "${MPF_BM:-}" ]; then
+  MPF_BM=128
+  PLOW_MOE_PF_EPI="${PLOW_MOE_PF_EPI:-0}"
+  PLOW_K3_A4W4_EPI="${PLOW_K3_A4W4_EPI:-0}"
+fi
+
 case "${PLOW_KDA_PF_STATE_RESIDENT:-0}" in
   0) AX_K3_PF_STATE="" ;;
   1) AX_K3_PF_STATE="-DPLOW_KDA_PF_STATE_RESIDENT=1" ;;

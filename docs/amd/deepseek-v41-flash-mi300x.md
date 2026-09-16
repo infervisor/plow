@@ -3245,6 +3245,62 @@ produced two confident, specific, wrong predictions. A ceiling instrument that d
 suspected work and re-measures costs one build and one run, and it is the only thing that
 separates "this code looks expensive" from "this code is expensive".
 
+### 12.26 Fewer, larger MoE tiles: -72 ms, and the emit had been asking for it all along
+
+§12.25 ended with the only reading left: the 187.6 ms in the two MoE ops is the fixed cost of
+**27,648 output tiles per layer per rank**, and the fix is fewer, larger tiles rather than a wider
+load. `scripts/build_gfx942.sh` already carried that hypothesis, written for a different model:
+
+> TP8 is what makes its overhead PER-TILE rather than per-byte [...] Raising BM halves the tile
+> count and so halves the fixed cost that k-loop is too short to amortize.
+
+and an `MPF_BM` escape hatch to test it. It also carried the reason the test is not free: both
+DOWN metadata hoists `#error` unless `MPF_BM == PLOW_WAVE == 64`, so a BM=128 arm must be compared
+against a BM=64 arm **with the hoists off too**, or the measurement is the hoist and not the tile.
+(V4.1's routed experts are MXFP4, so its DOWN runs `d_moe_group_pf_a4w4` and the live hoist is
+`PLOW_MOE_PF_EPI_SIB`, which the K3 A4W4 row forces on independently of `PLOW_MOE_PF_EPI`. Both
+had to come off.)
+
+| | DOWN | GLU | whole model |
+|---|---|---|---|
+| BM=64, hoists on (shipped) | 112.9 ms | 74.7 ms | 827.2 ms |
+| BM=64, hoists off (control) | 119.4 ms | 74.0 ms | 833.8 ms |
+| **BM=128, hoists off** | **72.0 ms** | **49.7 ms** | **755.4 ms** |
+
+**DOWN -39.7%, GLU -32.9%, the model -71.8 ms** against what was shipped. The metadata hoist is
+worth ~6.6 ms and cannot ride the larger tile; 78.5 ms beats 6.6 ms, so V4.1 takes the tile.
+Confirmed three times at 755.4 / 755.6 / 755.9 ms.
+
+This is the first fix of the campaign that is not "issue wider loads". Every earlier win (§12.17
+op 185, §12.19 GEMV, §12.20 HyperConnPre) was one lane-serial inner loop made vector. This one
+does not touch an instruction: it changes how much work a tile amortises its fixed cost over. It
+was reachable only because the two ablations in §12.25 ruled out the math and the stores first —
+the disassembly reading pointed at the stores, twice, with confidence, and was wrong.
+
+#### The emit had already been sized for it
+
+`crates/devgen/src/mla.rs:1918` declares `MPF_BM = 128` host-side, with a comment saying the align
+op pads each expert to the OBJECT's tile height so the buffer bound must cover the largest
+variant. So the packet's gathered-row arrays were **already** allocated at
+`T*k + n_exp*(MPF_BM-1)` for BM=128, and the prefill objects had been tiling at 64 inside them.
+Raising the object's tile does not enlarge any allocation; it stops under-using one. That is why
+this is a build-flag change and not an emit change.
+
+The default is scoped to `PLOW_PREFILL_DSV41=1` so no other model's objects move, and an explicit
+`MPF_BM` from the caller still wins.
+
+#### Unresolved: the exit magnitude is wider at BM=128
+
+`rung_run` feeds a seeded synthetic and reports only `min/max/mean/NaN/Inf`. Across runs the exit
+mean is stable (0.054-0.061) and there is never a NaN or an Inf, but the magnitude range at BM=128
+is visibly wider than at BM=64: every BM=64 run of this campaign landed within +-8,160, while
+BM=128 gave 1,080 / 73,728 / 137,216 on three runs of identical objects. The harness is not
+run-to-run deterministic (the MoE routing and its atomics reassociate), and a different tile
+changes the f32 summation order in a way 40 layers will amplify, so this is consistent with
+numerical wander. **It is also exactly what a padding bug would look like, and this campaign has
+no reference parity harness to tell the two apart** -- see §12.2. The buffer itself is not the
+suspect: the emit sizes it for 128 deliberately. Recorded here rather than resolved.
+
 ### 12.2 What is still not demonstrated
 
   * ~~ONE layer, not 40.~~ **Superseded by §12.18**: all 40 layers emit and run as
@@ -3255,7 +3311,7 @@ separates "this code looks expensive" from "this code is expensive".
   * No reference parity. The input is synthetic; correctness so far is
     "finite and stable" plus an op census that matches the config (§12.18), not
     "right". This is now the largest single gap.
-  * **827 ms against 90 ms** (§12.19, §12.20, §12.22 and §12.24 took 165 ms off §12.18's 992,
+  * **755 ms against 90 ms** (§12.19, §12.20, §12.22, §12.24 and §12.26 took 237 ms off §12.18's 992,
     neither in a V4.1 op; §12.21 showed the next 124 ms line is already on its
     finest legal tile). Closing the remaining 9.5x is not a list of point fixes:
     it needs the whole GEMM/MoE/collective pipeline at MFMA efficiency, which is
