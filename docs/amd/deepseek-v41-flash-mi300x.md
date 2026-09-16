@@ -3301,6 +3301,80 @@ numerical wander. **It is also exactly what a padding bug would look like, and t
 no reference parity harness to tell the two apart** -- see §12.2. The buffer itself is not the
 suspect: the emit sizes it for 128 deliberately. Recorded here rather than resolved.
 
+### 12.27 The largest op runs a scalar body ON PURPOSE, and its MFMA replacement is built but unwired
+
+After §12.24 and §12.26, `FLASH_GATHER_PREFILL` is the largest single op in the run: **125.1 ms**,
+3,293 us per packet over 38 packets. Its arithmetic is about 73 GFLOP per layer per rank
+(QK over top-512 selected keys, then PV), so it is running at roughly **22 TFLOP/s — under 2% of
+this part's bf16 peak.** That is the 5-50x-off-roofline signature that paid three times in this
+campaign.
+
+It is not an oversight. `interp.hip` says so at the dispatch:
+
+> Dense only. The gathered arm above keeps the SCALAR body: its top_k set is per QUERY, so a tile
+> of query rows shares no KV range to stage.
+
+Op 55's index table is one top-512 row per query token, so 64 queries in a tile select 64
+different key sets, and there is nothing to stage in LDS or feed an MFMA fragment with. Given that
+operand shape the scalar body is the correct kernel. **The fix is to change the operand, not the
+kernel** — and plow already contains the machinery for it.
+
+#### The DSA sparse-prefill chain exists, and one of its four pieces is missing
+
+`op_attention_common.h` §[GLM52-DSA-PF] documents a four-piece chain built for exactly this:
+
+* **op 117** `d_index_score_pf` — the T-row lightning-indexer score, **MFMA**, one
+  (query, 32-position) subtile per wave. Its `pool_size` arm already implements
+  **DeepSeek-V4.1's own** `compress_lens = arange(1, seqlen+1) // ratio` (`model.py:564`), floor
+  rule and all, and it `static_assert`s `index_n_heads == 32` — V4.1's value.
+* **op 118** — per-row EXACT top-k, the op-59 radix run inside one workgroup.
+* **op 119** — the **per-64-query-tile UNION table**, whose stated purpose is that the gathered
+  flash "stages each tile's selected KV rows ONCE and masks per query, instead of vLLM's
+  per-token random gather with zero reuse".
+* **the `GATHER=true` arm of `d_flash_mla_prefill_v2`** — the MFMA gathered flash that consumes it.
+
+V4.1 already emits **117 and 118**: they are the `INDEX_SCORE_PF` (7.0 ms) and `INDEX_SELECT_PF`
+(11.0 ms) rows in the trace, at n=8, one per `index_source_layer_id`. It does **not** emit 119, so
+its selection stays per-query and its attention necessarily takes the scalar op-55 body. V4.1 is
+the "per-token random gather with zero reuse" the union table was written to avoid.
+
+#### What it would actually take, stated honestly
+
+This was ranked in §12.18 as "MFMA gathered flash" and described as substantial. Reading the tree
+rather than the ranking, it is substantial in a different place than assumed:
+
+* The kernel arm **is written and does compile for gfx942** — `test_kernels.hip:1065` instantiates
+  `d_flash_mla_prefill_v2<512, 0, GATHER=true, false>` as `mla_flash_prefill_v2_nope_gather_512`,
+  and it is in the shipped object's test set.
+* It has **no interpreter dispatch at all.** Every `d_flash_mla_prefill_v2` call site in
+  `interp.hip` passes `GATHER=false` (lines 2814, 2863), and the non-FP8 site
+  `__builtin_trap()`s when `t[7]` is set. devgen *can* emit `t[7] = n.iuni` ("its presence selects
+  the GATHER arm", `mla.rs:6873`) for a non-fp8 sparse V2 prefill; nothing consumes it. That
+  pairing is refused at load by `plowrt`'s `check_dsa_pf_arm`, so this is a guarded gap and not a
+  live defect — the interpreter trap is, in its own words, "the belt to that braces".
+* V4.1's layer is ONE 8-wave cooperative launch, and the V2 arm lives in the 4-wave flash object.
+  Routing V4.1's attention to it means either a segment boundary mid-layer or compiling the V2
+  GATHER arm into the 8-wave interpreter.
+
+So the work is: emit op 119 for V4.1, write the V2 GATHER dispatch, resolve the wave-count
+topology, and re-validate numerics — against a top-k *union* whose size is data-dependent
+(`glm_dsa_pf_cap` bounds a tile's union at `min(64*top_k, ctx)`, so the staging cost depends on
+how much adjacent queries actually overlap, which is unmeasured at V4.1's shape). **None of that
+was attempted here, and none of it is validated.** It is recorded because it is the only lever
+left with the right order of magnitude: 125 ms of scalar attention against an MFMA arm that is
+already written.
+
+#### The honest state of the target
+
+755 ms against 90 ms is 8.4x. §12.26's arithmetic still holds: ~600 GFLOP per layer per rank means
+90 ms is ~267 TFLOP/s sustained, about 20% of this part's bf16 peak, and the pipeline is at roughly
+2-4%. The two wins in this session came from finding work that was being done at the wrong
+granularity, not from making the hardware go faster, and there is a limited supply of that. Closing
+8.4x needs the attention path on the matrix pipe (above), and then the same question asked of
+`GEMV_F32` (69 ms for a GEMM-shaped mHC projection), `XREDUCE2` (62 ms, of which 782 of 791 us per
+packet is STRAGGLER — collective imbalance, not throughput) and `MOE_COMBINE_PF`. Each is a
+separate campaign.
+
 ### 12.2 What is still not demonstrated
 
   * ~~ONE layer, not 40.~~ **Superseded by §12.18**: all 40 layers emit and run as
