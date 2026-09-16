@@ -662,16 +662,23 @@ AX_K3_A4W4="-DPLOW_L2_PLACE_DISPATCH=1"
 # result; the BM=64-vs-128 numbers above were taken that way and the EPI note is the only reason
 # they survive. Scope the guard to the assignment it belongs to.
 if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ]; then
-  # 512/BK=32, not 192/BK=64. The MoE pair is bound by the PER-TILE EXPERT-WEIGHT RELOAD, not by
-  # the padding op_moe.h warns about: at T=8192 BM=64 pads an average expert least and is 2.6x the
-  # WORST, and the pair falls monotonically with the tile. TP8 is what makes the per-tile cost
-  # bite, since `down`'s K is moe_intermediate/TP = 288 -- far too short a k-loop to amortise it.
-  # BK=32 halves the LDS tile ((BM+BN)*BK*2) so BM can pass the 192 that BK=64 caps it at, and
-  # each expert weight byte still crosses HBM exactly once. MEASURED, 3 passes at iters=10,
-  # MoE pair / layer min: 192k64 1583.7/14795.5, 384k32 998.4/14196.8, 512k32 868.4/14185.3 us
-  # -- -45.2% on the pair, -610 us/layer, ~-24 ms over 40 layers. Exits identical at every arm.
-  MPF_BM="${MPF_BM:-512}"
+  # 64, AND IT IS NOT A TUNING CHOICE. V4.1's routed experts are MXFP4, so its grouped MoE runs
+  # `d_moe_group_pf_a4w4`, which strides its gathered rows by MPF4_BM -- a fixed 64, asserted, and
+  # set by the MFMA fragment map rather than by a tile budget. `d_moe_align_pf` pads to MPF_BM.
+  # Unequal, the body covers `tiles_e * 64` of each expert's rows and drops the rest.
+  #
+  # THE SWEEP THIS REPLACES WAS MEASURING THAT. "192k64 1583.7, 384k32 998.4, 512k32 868.4 us,
+  # -45.2% on the pair" is what deleting arithmetic looks like: each arm raised MPF_BM, which cut
+  # the tile count, while every tile still covered 64 rows. At 512 the GLU wrote 8,783 of 49,152
+  # live routed rows -- 17.9% -- and the exits did not move, because the block exit's min/max/mean
+  # over a 335 MB residual is an attention statistic and a missing routed FFN does not disturb it.
+  # op_moe.h now static_asserts MPF_BM == MPF4_BM so this cannot be chosen again by accident.
+  #
+  # PLOW_MOE_GEMMA_PF=0 comes with it: the Gemma grouped-MoE twin asserts APT >= 8, and
+  # BM=64/BK=32 gives 4. AX_DECODE has carried the same pairing since its own BK=32 recut.
+  MPF_BM="${MPF_BM:-64}"
   MPF_BK="${MPF_BK:-32}"
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_GEMMA_PF=0"
   # n_head = 64/TP, so TP8 gives 8 and GF=8 reads the gathered latent ONCE instead of twice:
   # FLASH_GATHER_PREFILL 3276 -> 3031 us, layer -321 us, exits identical. The dispatch falls back
   # to GF=4 when 8 does not divide n_head.

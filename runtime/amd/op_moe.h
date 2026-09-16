@@ -3608,6 +3608,26 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
 #define MPF4_WNc 4
 #endif
 static_assert(MPF4_BM == 32 || MPF4_BM == 64, "A4W4 grouped MoE supports BM32 or BM64");
+/* THE ALIGN'S TILE HEIGHT IS THIS BODY'S TILE HEIGHT, and nothing else checks it.
+ *
+ * `d_moe_align_pf` builds `tilep` and `rowoff` in MPF_BM units -- `tiles_e = ceil(count_e/MPF_BM)`
+ * and `rowoff[e] = tilep[e] * MPF_BM` -- and this body walks them as
+ * `rowbase = rowoff[e] + (mt - tilep[e]) * MPF4_BM`. The two are separate knobs. When they
+ * disagree the walk covers `tiles_e * MPF4_BM` of an expert's `count_e` live rows and the rest
+ * are NEVER COMPUTED: no fault, no NaN, and a block exit whose min/max/mean still look like
+ * attention, because the routed FFN's contribution is simply missing.
+ *
+ * MEASURED, and this is why the assert exists: V4.1 at 8k/TP8 set MPF_BM=512 while MPF4_BM stayed
+ * 64, and `act.moe_fug` carried 8,783 written rows of 49,152 live ones -- 17.9%, matching
+ * `sum_e min(count_e, tiles_e * 64)` to the row. It also read as a 45% SPEEDUP on the MoE pair,
+ * because raising MPF_BM deletes tiles and each tile covers 64 rows however tall the tile is
+ * declared to be. A tuning sweep over a knob that silently deletes arithmetic reports the
+ * deletion as a win, monotonically. */
+#if PLOW_MOE_PF_A4W4
+static_assert(MPF_BM == MPF4_BM,
+              "the grouped-MoE align pads to MPF_BM but the A4W4 body strides MPF4_BM; "
+              "unequal means the body silently skips every live row past tiles*MPF4_BM");
+#endif
 #if PLOW_MOE_PF_A4W4
 static_assert(PLOW_WAVES == MPF4_WMc * MPF4_WNc,
               "A4W4 grouped MoE tile must cover the full workgroup");

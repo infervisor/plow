@@ -1913,12 +1913,14 @@ fn glm_glu_halves(cus: &[u32]) -> (Vec<u32>, Vec<u32>) {
 // 512, not 192: this is a SIZING upper bound, and the align op pads each expert to the
 // OBJECT'S tile height, so the host buffer bound must cover the largest variant a build can
 // pick — undersizing is an out-of-bounds device write with no symptom at low expert counts
-// (the header note above). The OCC4 batched-decode object builds at MPF_BM=128 and V4.1's
-// prefill objects are swept over {64, 128, 192, 384, 512} (build_gfx942.sh), which now DEFAULTS
-// to 512 at MPF_BK=32: the MoE pair is per-tile weight-reload bound, not padding bound, and the
-// tile is worth -45.2% on the pair and ~-24 ms over 40 layers. Costs ~60 MB/rank of fu_g at
-// T=8192 -- the bound is paid in bytes whatever tile the object then picks, and that is what
-// buys the tile.
+// (the header note above). The OCC4 batched-decode object builds at MPF_BM=128, so the bound has
+// to cover at least that. It stays 512 because it is an UPPER bound and an oversized one is only
+// bytes, where an undersized one is an out-of-bounds device write.
+//
+// It is NOT evidence that any object should pick 512. V4.1's own prefill objects are pinned at 64
+// by a static_assert (op_moe.h): its MXFP4 body strides MPF4_BM = 64 and the align pads MPF_BM, so
+// a taller align tile does not make a taller GEMM tile -- it makes the GEMM skip rows. The sweep
+// that once justified 512 here was measuring exactly that skip.
 pub(crate) const MPF_BM: u32 = 512;
 
 /// `i[3]` on the router ops, bit by bit. Mirrors FLAGS in the B4 harness.
