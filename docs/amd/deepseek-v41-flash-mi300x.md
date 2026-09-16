@@ -5111,6 +5111,11 @@ segment to the 4-wave flash object with PLOW_MLA_PF_NOPE=1.
 
 ## 12.66 Built, and it beat the estimate: 14.09 -> 11.37 ms/layer
 
+> **The absolute layer numbers in this section are measured on a MoE that was computing 17.9% of
+> its routed rows** (12.67). The union DELTA is unaffected -- the MoE is identical on both arms and
+> the change is entirely in attention -- and it re-measures at -2556 us on the fixed build, against
+> -2720 here. The corrected pair is **17122 -> 14566 us/layer**.
+
 12.65 predicted "net ~2x on the op, if it behaves". It behaves, and it is 4.2x. Paired back to
 back at 8k, block 2, TP8, gfx942:
 
@@ -5153,3 +5158,61 @@ Op 119 itself costs 79 us/layer and is emitted once per PUBLICATION, not once pe
 reader layers share `ix.idx`, so they share its union too.
 
 The gathered flash is no longer the largest op in the layer.
+
+## 12.67 The MoE prefill was computing 17.9% of its routed rows, and the tuning sweep rewarded it
+
+`d_moe_align_pf` pads each expert's gathered rows up to a whole tile and publishes
+`tiles_e = ceil(count_e / MPF_BM)` with `rowoff[e] = tilep[e] * MPF_BM`. `d_moe_group_pf_a4w4`
+walks that table as `rowbase = rowoff[e] + (mt - tilep[e]) * MPF4_BM`. **They are two different
+knobs.** MPF4_BM is a fixed 64 -- it is the MFMA fragment map, static_asserted to 32 or 64, not a
+tile budget -- and MPF_BM defaults to 64 everywhere in the tree except V4.1, which set 512.
+
+Unequal, the body covers `tiles_e * 64` rows of an expert that has `count_e` of them. The rest are
+never computed. Measured on `act.moe_fug` against the align's own metadata, 8k/TP8, block 2:
+
+    tiles (tilep[E])     231
+    live routed rows   49152     T*k = 8192 * 6
+    rows written        8783     17.9%, equal to sum_e min(count_e, tiles_e * 64) to the row
+    first gap                    expert 17, row 128: 1010 live rows, 2 tiles, 2 * 64 covered
+
+At MPF_BM = MPF4_BM = 64 the same probe reads 884 tiles and 49152 of 49152.
+
+**Nothing in the stack could see it.** The skipped rows are not written, so they keep whatever the
+arena held -- no fault, no NaN, no shape check, and `part` is f32 so there is not even a layout
+tell. The block exit did not move: min and max over a 335 MB residual are attention statistics and
+a missing routed FFN does not reach them. Only the exit MEAN shifts, -0.000761 -> -0.000643, and
+that lands inside the 1e-6 band build_gfx942.sh had already documented the MoE reduction as being
+run-order noisy in. "Exits identical at every arm" was true and meant nothing.
+
+**And it read as a 45% speedup.** This is the part worth carrying forward. Raising MPF_BM cuts the
+tile count, and every tile covers 64 rows however tall the tile claims to be, so each step of the
+sweep deleted arithmetic and got faster for it:
+
+| arm | reported MoE pair | rows actually covered |
+|---|---|---|
+| 192 / BK=64 | 1583.7 us | 380 tiles x 64 = 24 320 |
+| 384 / BK=32 | 998.4 us | 289 tiles x 64 = 18 496 |
+| 512 / BK=32 | 868.4 us | 231 tiles x 64 = 14 784 |
+
+Monotonic, with a clean rationale attached to it ("the pair is per-tile weight-reload bound"), and
+every arm's exits identical. The true pair is **4049 us**.
+
+The lesson is not "check your tiles". It is that a sweep over a knob that can delete work will
+report the deletion as a win, and the only defence is a coverage probe that does not go through the
+same knob -- here, the align's `count_e` against what the GEMM's output actually contains. An A/B
+cannot find this, because both arms are wrong and the faster one looks better.
+
+`op_moe.h` now static_asserts `MPF_BM == MPF4_BM` whenever the A4W4 body is compiled.
+
+### Where this leaves the campaign
+
+| | per layer | 40 layers |
+|---|---|---|
+| op 55 gathered, MoE fixed | 17 122 us | 685 ms |
+| op 51 union, MoE fixed | **14 566 us** | **583 ms** |
+
+583 ms, not the 455 ms 12.66 reported. The MoE pair is now the largest single line in the layer at
+4049 us -- ahead of `GEMM_FP8_MX` at 2813 -- and it is genuinely 884 tiles of work rather than 231.
+That makes MoE scheduling a live target again for the first time since 12.46, and on honest
+arithmetic: 884 tiles x 3 n-tiles = 2652 GLU tiles over 304 CUs is 8.72 waves, so the 54% tail the
+231-tile build showed is gone on its own.
