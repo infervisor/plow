@@ -268,6 +268,7 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
       PLOW_MOE_PF_ATOMIC)    [ "$val" = 1 ] && : "${PLOW_MOE_PF_ATOMIC:=1}" ;;
       PLOW_MOE_PF_DET)       [ "$val" = 1 ] && : "${PLOW_MOE_PF_DET:=1}" ;;
       PLOW_DSV41_BLKFP8)     [ "$val" = 1 ] && : "${PLOW_DSV41_BLKFP8:=1}" ;;
+      PLOW_DSV41_ENGRAM)     [ "$val" = 1 ] && : "${PLOW_DSV41_ENGRAM:=1}" ;;
       PLOW_GLM_FUSE_QNORM)   [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_QNORM:=1}" ;;
       PLOW_GLM_FUSE_POST)    [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_POST:=1}" ;;
       PLOW_GLM_FUSE_SEAM_RN) [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_SEAM_RN:=1}" ;;
@@ -1156,6 +1157,19 @@ fi
 # every block-FP8 projection's output untouched and the prefill would complete with garbage.
 if [ "${PLOW_DSV41_BLKFP8:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_DSV41_BLKFP8=1"
+fi
+
+# OPT-IN (PLOW_DSV41_ENGRAM=1): ops 182/183, DeepSeek-V4.1-Flash's Engram conditional memory, on
+# layers 1 and 14 only. Same shape as the arm above and marker-checked the same way -- plowrt looks
+# for `plow_dsv41_engram_arm` and REFUSES the load by name without it, because the AMD dispatch's
+# `default:` does not trap, so an unbuilt arm would leave the gather and the gate writing nothing
+# and the prefill would complete with garbage.
+#
+# The C side and the packet side both already existed; this line did not, so the first layer-1
+# packet emitted, built 53 objects, reached the queue and was refused at load. The refusal worked
+# exactly as designed -- it is the reason that was a wasted queue slot rather than a wrong number.
+if [ "${PLOW_DSV41_ENGRAM:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_DSV41_ENGRAM=1"
 fi
 
 # OPT-IN (PLOW_PREFILL_DSV41=1): make the ORDINARY prefill rows able to run a DeepSeek-V4.1 packet.

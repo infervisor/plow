@@ -3913,15 +3913,23 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif /* PLOW_DSV4_CSA2 */
 #if PLOW_DSV41_ENGRAM
         case PLOW_DOP_ENGRAM_EMBED:
-            /* i4 = PLOW_TENSOR_NONE_I means DERIVE the shard base from this rank:
+            /* i4 = PLOW_TENSOR_NONE means DERIVE the shard base from this rank:
              * `ParallelEngramEmbedding` puts rank r's rows at `r * part_num_embeddings`
              * (model.py:303-305) and nowhere else, so the emitter cannot write it as an immediate
              * -- one program serves all eight ranks -- and there is no need to patch it per rank
-             * either, because `prog.rank` is right here. An explicit i4 still wins, for tests. */
+             * either, because `prog_meta->rank` is right here. An explicit i4 still wins, which is
+             * what a single-rank test passes.
+             *
+             * The sentinel is the WIRE one (0xFFFF), not `TENSOR_NONE`'s 0xFFFF_FFFF: `i[]` does
+             * not narrow the way `t[]` does, so devgen widens `TENSOR_NONE16` and the device
+             * compares against `PLOW_TENSOR_NONE`. Both are 0xFFFF; see `dev.rs`'s
+             * `TENSOR_NONE_I`. It matters that it is not 0, because rank 0's base IS 0. */
             d_engram_embed((bf16*)TEN(0), (const unsigned char*)TEN(1),
                            (const unsigned char*)TEN(2), (const int*)TEN(3), in->i[0], in->i[1],
                            in->i[2], in->i[3],
-                           in->i[4] == PLOW_TENSOR_NONE_I ? prog.rank * in->i[5] : in->i[4],
+                           in->i[4] == PLOW_TENSOR_NONE
+                               ? (prog_meta ? prog_meta->rank : 0u) * in->i[5]
+                               : in->i[4],
                            in->i[5], slice, nblk);
             break;
         case PLOW_DOP_ENGRAM_GATE:

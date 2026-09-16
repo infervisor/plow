@@ -2074,7 +2074,8 @@ pub enum DevOp {
     /// t3=ids(i32[T][n_cols])` · `i0=T i1=n_cols i2=head_dim i3=blk i4=vocab_start
     /// i5=part_rows`.
     ///
-    /// `i4 = `[`TENSOR_NONE_I`] means DERIVE the shard base as `rank * i5`. One program
+    /// `i4 = `[`TENSOR_NONE_I`] (the wire sentinel, 0xFFFF -- NOT zero, because rank 0's
+    /// base IS zero) means DERIVE the shard base as `rank * i5`. One program
     /// serves all eight ranks, so the emitter cannot write `vocab_start` as an immediate
     /// -- and does not need to patch it per rank either, since the interpreter has
     /// `prog.rank`. `ParallelEngramEmbedding` places rank `r` at `r * part_num_embeddings`

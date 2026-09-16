@@ -2294,6 +2294,80 @@ and is not addressable from inside this op.
 and it is a floor measured on a layer that is missing its compressed-KV attention entirely. The
 performance half of the goal is not close, and this is an honest 12%, not a step toward it.
 
+### 12.14 Layer 1 emits: Engram, and a defect no parts table can see
+
+§12.9 corrected the emittable count to 1 of 40. It is now **2 of 40**. Layer 1 is the cheapest
+remaining layer -- its `compress_ratio` is 0, so it needs no compressed-KV attention, and Engram
+was the only thing it was missing.
+
+**The kernels were already right.** `scripts/dsv41_engram_oracle.py` transcribes
+`ParallelEngramEmbedding.forward` and `Engram.forward` from the reference, and `d_engram_embed` /
+`d_engram_gate` from `op_engram.h`, separately, then runs them against each other:
+
+| check | result |
+|---|---|
+| op 183 vs `ParallelEngramEmbedding`, all ids in shard | **0.000e+00** |
+| ... with ids below AND above the shard | 0.000e+00, out-of-shard exactly 0 |
+| op 182 vs `Engram.forward` | **2.220e-16** |
+| ... with a `token_mask`, and the masked token untouched | 2.220e-16, 0.000e+00 |
+| signed-sqrt gate vs a plain `sigmoid(dot)` | 0.104 at `dot = -3.36` |
+| joint normalization vs per-`(token, hc copy)` | 47.8% relative |
+
+The last two are `op_engram.h`'s own "three things that look like details and are not", priced
+rather than asserted: the gate at `dot = 0` is 0.50025 (the clamp, square-rooted), not 0.5 and not
+0. The checkpoint corroborates the rest -- `q_weight`/`k_weight` are BF16 `[4, 5120]`, which is what
+the kernel reads them as, and `embed.scale [rows, 8]` and `wkv.scale [800, 192]` are both the
+`blk=32` the ops assume, not V4's 128.
+
+**So the gap was the emit**, four ops: op 183 gathers 24 rows of 256 fp8 per token, an `XReduce`
+sums the row-split shards, op 184 projects `[T][6144] -> [T][25600]`, and op 182 gates and mixes in
+place. The all-reduce is the reference's own `dist.all_reduce` (`model.py:323`) -- the table is
+98.31 GB and two of them do not fit in 192 GB, so row-splitting is forced and a rank's gather is a
+partial by construction.
+
+Three things could not be written as constants, and each was settled from the reference rather
+than chosen: `vocab_start` (one program serves eight ranks, so `i4 = TENSOR_NONE_I` now means
+"derive `rank * i5`" -- the interpreter has `prog.rank`); the peer slot (the gather is a partial,
+so it must land in the peer region, and with no third slot it reuses attention's, safely, because
+Engram runs at the top of the layer); and the split rule for `engram.wkv`/`q_weight`/`k_weight`,
+which is Replicated because `self.wkv` is the plain `Linear` and not `ColumnParallelLinear`
+(`model.py:345`). A note in the split table had said that last one "follows from how the row gather
+exchanges between ranks, and that is not designed yet". It does not -- the exchange is the embed's
+own all-reduce, and it happens before `wkv` ever runs.
+
+#### The defect: a packet invariant that spans two ops
+
+The layer-1 packet emitted, built 53 objects, reached the queue -- and the loader refused it:
+
+```
+TP  n_gpu=8 hidden=6144 slot_bytes=83886080        83886080 % 12288 = 8192
+```
+
+`DevBlob::parse` recovers exactly two numbers from a packet's collectives, `hidden` as
+`max(i[0] / program.t)` and `slot_bytes` as `max(i[2])` (the byte offset of partial slot B), and
+`AmdTpGroup::load` divides one by the other to get `max_tokens`, refusing the packet unless it is
+exact. Every collective in V4.1 is 5120 wide except **one** -- Engram's all-reduce of the gather,
+which is `n_cols * head_dim` = 6144. That single op raised the recovered `hidden` while the slot
+offset stayed `t * c.hidden * 2`.
+
+The fix is that the slot **unit** is the widest per-token message in the packet, not the model's
+hidden size, and it has to be conditional on the chain containing an engram layer -- widening it
+unconditionally breaks every other packet the same way, since their recovered `hidden` stays 5120
+and a 6144-based offset is not a multiple of 10240 either. Layer 1 now reads `slot_bytes =
+100663296`, and `100663296 / 12288 = 8192` exactly.
+
+**This is a different class from §12.9 through §12.13.** Those four were MODEL structure that the
+tensor shapes agreed about. This is PACKET structure that the shapes agreed about: the emit was
+locally correct at every single op, and what broke was an invariant spanning two ops that neither
+op owns. A parts table cannot see it, and neither can a reading of either op --
+`the_peer_slot_unit_divides_the_widest_collective` recovers both numbers the way `DevBlob::parse`
+does and asserts they divide, for every emittable layer.
+
+A second, smaller one behind it: `build_gfx942.sh` never passed `-DPLOW_DSV41_ENGRAM=1`, although
+the C side, the packet's `build.json` `requires` list and the knob registration all had it. plowrt
+refused the object **by name** -- `plow_dsv41_engram_arm` absent -- which is exactly why that cost
+a queue slot instead of producing a layer that ran and was wrong.
+
 ### 12.2 What is still not demonstrated
 
   * ONE layer, not 40. The whole-model emit is still blocked on the subsystems
