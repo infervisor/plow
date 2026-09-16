@@ -3802,3 +3802,32 @@ in a total-time profile and obvious in the straggler column.
 
 Layer 2 at the committed defaults: **16,784 us**, from 20,458 at the start of §12.29 — **-18.0%**
 across §12.29-§12.35, all of it verified by an exit that never moved a printed digit.
+
+### 12.36 End to end: 645 ms, from 755
+
+§12.29-§12.35 were all measured on the single block, so the model run is the check that the wins
+are real and that nothing about the whole-model emit undoes them. All 40 layers, 8k context, TP8,
+`all40.pkt` against objects rebuilt from this tree at the committed defaults:
+
+    run 1   min 636.7   median 645.5   max 777.5 ms   (5 iters)
+    run 2   min 640.3   median 644.6   max 740.6 ms   (5 iters)
+
+**645 ms, from 755 at §12.29** — -14.6%. The single block predicted 619 ms
+(755 x 16,784/20,458); the model lands 4% above that, which is what the 38 layers that are not
+layer 2 cost: two are window-only (no gathered pass, so §12.31's GF and §12.30's floor do not
+apply to them) and the compress ratios differ, so layer 2 is not a uniform sample.
+
+**90 ms is not met. 645 ms is 7.2x the target**, and the honest read of §12.29-§12.36 is that
+nothing in the remaining profile closes a 7x. The five wins here came to 3.7 ms of a 16.8 ms
+layer, and four of the five were gates rather than kernels — a class that is now largely
+exhausted for the ops that matter. What is left is FLASH_GATHER_PREFILL at 3.0 ms with a measured
+floor at its own scalar body (§12.30), the MoE pair at 2.3 ms already worked in §12.25-§12.26,
+and a collective that is fabric-bound by design (§12.28). Reaching 90 ms is a pipeline campaign,
+not a knob list, and §12.18's itemization still stands.
+
+ONE OPEN ITEM, AND IT IS NOT NEW. The 40-layer exit is NOT reproducible run to run: -7424/6720
+mean 0.0586 against -6432/30208 mean 0.0605. The single block reproduces to the last printed digit
+across every build in §12.29-§12.35, so this is amplification over 40 layers of something small,
+not a wrong arm — which is exactly why §12.29 built the single-block harness in the first place.
+It is not evidence that anything here is wrong, and it is not evidence that nothing is; it is an
+unmeasured question that needs a deterministic 40-layer reference to answer.
