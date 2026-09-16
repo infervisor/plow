@@ -4161,8 +4161,11 @@ of five, and BM=192 returned `-1.38281 / 1.72656` on another. That is the failur
 names itself elsewhere in this session: "a collective hit its deadline and returned WITHOUT
 reducing". **It is environmental and it affects BOTH arms equally**, so it does not implicate the
 tile -- but it means a parity check is only worth reading from a run that completes on a quiet
-machine. The stable numbers above are from the earlier quiet window, where all nine runs of the
-interleaved A/B completed and every one held min/max.
+machine. The stable numbers above are from the earlier quiet window: counting only runs that
+printed an exit, the first EIGHT consecutive ones -- across all three tiles, 64 and 128 and 192 --
+held min/max at -1.36719 / 3.64062, and the deviations begin at the ninth and then appear on both
+arms. (The interleaved A/B itself reported only the clock and the MoE pair, so it contributes
+timing evidence and no parity evidence.)
 
 Requires the `mla.rs` `MPF_BM` sizing bound raised to 192 and the packet RE-EMITTED: the align op
 pads to the OBJECT's tile height, so an object whose tile exceeds the bound its packet was sized
