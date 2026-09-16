@@ -5381,6 +5381,11 @@ this is chosen. That is the first step, not the third.
 
 ## 12.71 There is no EP imbalance. Every rank is slower by the same 2.15 ms
 
+> **WRONG, and corrected in 12.72.** Equal total body per rank is what a barrier at each end of
+> the block GUARANTEES -- it is not evidence that the ranks did equal work. The zero correlations
+> and the verified partition below stand; the headline does not. There IS an imbalance, it is
+> genuine compute, and 12.72 localises it.
+
 Three rounds of this campaign have tried to fix EP by balancing expert placement -- even cuts, a DP
 over contiguous cuts, and a hunt for what predicts a rank's MoE time. The premise was wrong.
 
@@ -5429,3 +5434,68 @@ when experts are whole rather than sliced, and the EP align's own four-dispatch 
 
 **`PLOW_MOE_EP_CUTS` should be treated as answered in the negative.** It balances tiles; tiles are
 not the problem; nothing is imbalanced. It stays in the tree as a diagnostic, not as a tuning knob.
+
+## 12.72 The imbalance is real, it is all in one packet, and it is 9x per TILE
+
+12.71 concluded "no imbalance" from equal per-rank total body. That inference is invalid: the block
+is bracketed by collectives, so every rank necessarily leaves it at the same instant. Equal totals
+are what the barrier does, not what the ranks did. Retracted.
+
+The per-PACKET view, which is what should have been read, localises the whole regression to one
+instruction. Rank 0, one traced iteration:
+
+| inst | op | TP | EP |
+|---|---|---|---|
+| 28 | XREDUCE2 (post-attention) | 667.7 us (strag 657.4) | 649.5 us (strag 639.9) |
+| 43 | MOE_GROUP_GLU_PF | 1568.3 | 1154.6 |
+| 44 | MOE_GROUP_DOWN_PF | 2476.8 | 692.8 |
+| 45 | MOE_COMBINE_PF | 330.2 | 314.7 |
+| **46** | **XREDUCE2 (post-MoE)** | **729.7 (strag 720.5)** | **5117.2 (strag 5105.2)** |
+
+The first collective is unchanged. **All of EP's +2.15 ms sits in the second one, at 99.8%
+straggler** -- rank 0 finishes its own MoE in 1847 us and then waits 5117 us for a peer. The
+arithmetic closes: 1847 + 5117 = 6964, and the slowest rank's MoE is 6367 + its own ~600 us of
+collective.
+
+An instruction diff of the two emitted programs shows only four instructions differ at all (op 84
+gains the EP degree in `i5`; ops 85/86 take `i_moe` 288 -> 2304 and the `_ep` weight table; op 87
+gains the routing table on `t4`), and **XREDUCE2 is byte-identical**. The collective is not doing
+anything different. It is waiting.
+
+### And the wait is genuine compute on the slow rank
+
+Straggler separates the two cases, and it is unambiguous here:
+
+    rank 2  GLU body  199.7 us, straggler 188.8  -- 94% spread: a few workgroups work, most exit
+    rank 4  GLU body 3920.1 us, straggler 279.1  --  7% spread: nearly every workgroup is busy
+
+Rank 4 is not waiting. It is computing, for 3.9 ms, on 63 row-tiles. Per GLU tile (`tnc` = 18 under
+EP, 3 under TP):
+
+    rank 2   504 tiles   199.7 us   0.40 us/tile
+    TP      2652 tiles  1568.3 us   0.59 us/tile
+    rank 4  1134 tiles  3920.1 us   **3.46 us/tile**
+
+Rank 2 is FASTER per tile than TP. Rank 4 is 5.8x slower than TP and 8.7x slower than rank 2, on
+tiles of identical shape running identical code. Every measure of how much work the rank was given
+predicts a ratio of 2.25x.
+
+### What is excluded, by measurement
+
+* **The partition.** Per-rank `act.moe_meta`: 884 tiles total, exactly TP's, each rank's window
+  exactly its cut.
+* **Tile count, row count, used-expert count.** Correlate with per-rank MoE time at -0.001, -0.003
+  and -0.171.
+* **The weight values.** Every expert's `w2.scale` on layer 2 is 368 640 E8M0 bytes, 0.00% zero and
+  0.00% 0xFF -- no rank is running MFMAs against denormal or NaN scales.
+* **The collective's shape.** Byte-identical instruction; the post-attention one is unchanged.
+
+So the open question is sharp and small: **why does one rank's A4W4 tile cost 3.46 us when another
+rank's identically-shaped tile costs 0.40 us?** It is per-tile, it is compute, it follows the
+expert index range rather than the rank (balanced cuts move the slow rank from 4 to 5, tracking
+experts ~215-290), and it is reproducible to within 1% across runs.
+
+That is the thing to answer next, and it is worth answering: it is the ONLY reason EP is not a
+2.3 ms/layer win, and 12.70's k-loop argument says the same mechanism is worth having under TP too.
+`PLOW_MOE_EP_CUTS` remains a dead end for the reason 12.71 gives -- it balances a quantity that does
+not predict the cost.
