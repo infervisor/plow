@@ -1446,6 +1446,10 @@ fi
 if [ -n "${PLOW_CMP_VEC8:-}" ]; then
   AX_GLUE="$AX_GLUE -DPLOW_CMP_VEC8=${PLOW_CMP_VEC8}"
 fi
+# PLOW_CMP_TAB4=0: restore d_compress_rope_quant's per-pair scalar cos/sin reads (the A/B control).
+if [ -n "${PLOW_CMP_TAB4:-}" ]; then
+  AX_GLUE="$AX_GLUE -DPLOW_CMP_TAB4=${PLOW_CMP_TAB4}"
+fi
 
 # ROUTER SELECTION ARM for the PREFILL objects. The header defaults PLOW_MOE_ROUTER_SELECT to
 # PLOW_K3 and the _LOCAL variant is only ever handed to the K3 DECODE row (AX_K3_ROUTER_LOCAL

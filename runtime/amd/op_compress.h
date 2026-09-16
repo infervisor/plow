@@ -355,6 +355,10 @@ __device__ void d_compress_pool(bf16* __restrict__ out, const bf16* __restrict__
 #ifndef PLOW_CMP_VEC8
 #define PLOW_CMP_VEC8 1
 #endif
+/* PLOW_CMP_TAB4=0 restores the per-pair scalar table reads (the A/B control for the lane below). */
+#ifndef PLOW_CMP_TAB4
+#define PLOW_CMP_TAB4 1
+#endif
 __device__ void d_compress_rope_quant(bf16* __restrict__ out, const bf16* __restrict__ src,
                                       const float* __restrict__ cosb,
                                       const float* __restrict__ sinb, unsigned n_rows, unsigned d,
@@ -417,21 +421,42 @@ __device__ void d_compress_rope_quant(bf16* __restrict__ out, const bf16* __rest
          * BIT-IDENTICAL: the same two bf16 values per channel, through the same f32 fma pair, the
          * same `f2bf` round trip and the same `fmaxf` fold, in the same order. Only the LOADS
          * change -- 32 of them become 2. */
+        /* ...and the TABLES are still one scalar f32 load per pair. An 8-group that lies wholly
+         * inside the rope region covers exactly FOUR pairs, at consecutive `m`, so `cosb`/`sinb`
+         * each want one 16 B load instead of four 4 B ones -- 8 scalar loads per group become 2.
+         *
+         * Alignment, and why the guard is what it is: `c_rope0 % 8 == 0` makes every 8-group lie
+         * wholly on one side of the rope boundary (no straddle, so the group is all-rope or
+         * none), and makes `m0 = (c8 - c_rope0)/2` a multiple of 4. `tb` is `pos * (rd/2)`, so
+         * `(rd/2) % 4 == 0` makes it a multiple of 4 too, and `tb + m0` is 4-float aligned
+         * against a tensor base that hsa_memory_allocate gave 4 KiB. Both hold for the indexer's
+         * queries (`d`=128, `rd`=64) and the MLA compressor; anything else takes the scalar path.
+         *
+         * BIT-IDENTICAL: the same floats, only fewer loads. */
+        const bool tab4 = PLOW_CMP_TAB4 && (c_rope0 & 7u) == 0u && ((rd >> 1) & 3u) == 0u;
         if (PLOW_CMP_VEC8 && qblk <= QMAX && (qblk & 7u) == 0u && (c_rope0 & 1u) == 0u) {
             float v[QMAX];
             float amax = 0.0f;
             for (unsigned i0 = 0; i0 < qblk; i0 += 8u) {
                 const bf16v8 xv = ld_glob8(srow + c0 + i0);
+                const unsigned c8 = c0 + i0;
+                f32x4 cv = {0.f, 0.f, 0.f, 0.f}, sv = {0.f, 0.f, 0.f, 0.f};
+                if (tab4 && c8 >= c_rope0) {
+                    const size_t mb = tb + (size_t)((c8 - c_rope0) >> 1);
+                    cv = *(const PLOW_GLOB f32x4*)(const PLOW_GLOB void*)(cosb + mb);
+                    sv = *(const PLOW_GLOB f32x4*)(const PLOW_GLOB void*)(sinb + mb);
+                }
 #pragma unroll
                 for (unsigned j = 0; j < 8u; j++) {
-                    const unsigned c = c0 + i0 + j;
+                    const unsigned c = c8 + j;
                     float val;
                     if (c < c_rope0) {
                         val = bf2f(xv[j]);
                     } else {
                         const unsigned k = c - c_rope0, m = k >> 1;
                         const float x = bf2f(xv[j]), p = bf2f(xv[j ^ 1u]);
-                        const float cs = cosb[tb + m], sn = sinb[tb + m];
+                        const float cs = tab4 ? cv[j >> 1] : cosb[tb + m];
+                        const float sn = tab4 ? sv[j >> 1] : sinb[tb + m];
                         val = bf2f(f2bf((k & 1u) ? p * sn + x * cs : x * cs - p * sn));
                     }
                     v[i0 + j] = val;
