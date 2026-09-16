@@ -638,10 +638,31 @@ AX_K3_A4W4="-DPLOW_L2_PLACE_DISPATCH=1"
 # The metadata hoist is worth ~6.6 ms at BM=64 (827.2 ms with it), and it CANNOT ride BM=128 --
 # both hoists `#error` unless MPF_BM == PLOW_WAVE. 78.5 ms beats 6.6 ms, so V4.1 takes the tile.
 #
-# Confined to PLOW_PREFILL_DSV41 so no other model's objects move, and a caller's own MPF_BM still
-# wins (in which case the hoist defaults are left alone and the `#error` is the caller's to resolve).
-if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ] && [ -z "${MPF_BM:-}" ]; then
-  MPF_BM=128
+# 192 IS THE CEILING AND IT BEATS 128, because at V4.1's shape BM cuts BOTH terms at once. The
+# align op pads each expert to a whole tile, and TP8 puts all 385 experts (384 routed + the shared
+# fold) on every rank with T*k/385 ~ 149 gathered rows each. BM=128 therefore spends TWO tiles per
+# expert and pads 149 rows to 256 -- 72% waste -- where BM=192 spends ONE and pads to 192, 29%.
+# Half the tiles AND half the padded rows. 256 does not exist: (256+256)*64*2 = 65,536 B against
+# `plow_smem`'s 64,512, while (192+256)*64*2 = 57,344 fits with MPF_DBUF still 1.
+#
+# MEASURED, layer 2 at 8k/TP8, three interleaved repeats per arm (docs 12.46):
+#   BM=64    DOWN 2489.4 us   GLU 1574.0 us   pair 4063
+#   BM=128   DOWN 1275.8 us   GLU 1011.5 us   pair 2361 / 2354 / 2402
+#   BM=192   DOWN  971.2 us   GLU  613.4 us   pair 1609 / 1588 / 1571   <- default
+# -33% on the pair, -783 us on the layer, min-to-min 16,102 -> 15,374. Exits hold min/max to the
+# printed digit; the EXIT MEAN is not a parity signal here and never was -- one unchanged object
+# returns -0.000712 and -0.000713 on consecutive runs, so the MoE reduction is run-order dependent
+# at the 1e-6 level. Requires the mla.rs MPF_BM sizing bound at 192 and a RE-EMITTED packet: an
+# object whose tile exceeds the bound its packet was sized from is an out-of-bounds device write.
+#
+# Confined to PLOW_PREFILL_DSV41 so no other model's objects move. Each default is `:-`, so a
+# caller's own value wins INDIVIDUALLY -- the whole block used to sit behind `[ -z "$MPF_BM" ]`,
+# which meant that naming MPF_BM to A/B the MoE tile silently also dropped GF=8, both router
+# knobs and both epilogue settings. That A/B then measures five changes and reads as a tile
+# result; the BM=64-vs-128 numbers above were taken that way and the EPI note is the only reason
+# they survive. Scope the guard to the assignment it belongs to.
+if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ]; then
+  MPF_BM="${MPF_BM:-192}"
   # n_head = 64/TP, so TP8 gives 8 and GF=8 reads the gathered latent ONCE instead of twice:
   # FLASH_GATHER_PREFILL 3276 -> 3031 us, layer -321 us, exits identical. The dispatch falls back
   # to GF=4 when 8 does not divide n_head.
@@ -653,7 +674,8 @@ if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ] && [ -z "${MPF_BM:-}" ]; then
   # order; exits are identical.
   PLOW_MOE_ROUTER_SELECT="${PLOW_MOE_ROUTER_SELECT:-2}"
   PLOW_MOE_ROUTER_SELECT_LOCAL="${PLOW_MOE_ROUTER_SELECT_LOCAL:-1}"
-  PLOW_MOE_PF_EPI="${PLOW_MOE_PF_EPI:-0}"
+  # The hoist `#error`s unless MPF_BM == PLOW_WAVE, so it cannot default ON at any other tile.
+  if [ "$MPF_BM" = 64 ]; then PLOW_MOE_PF_EPI="${PLOW_MOE_PF_EPI:-1}"; else PLOW_MOE_PF_EPI=0; fi
   PLOW_K3_A4W4_EPI="${PLOW_K3_A4W4_EPI:-0}"
 fi
 

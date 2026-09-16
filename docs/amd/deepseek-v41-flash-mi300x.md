@@ -4097,3 +4097,91 @@ Those three are 6.6 ms of a 15.9 ms layer. The other ~15 ops are each 2-10x off 
 and §12.18's itemization of why stands unchanged. Reaching 90 ms means the whole
 GEMM/MoE/attention/collective pipeline at MFMA efficiency — a campaign, and the two entries above
 are where it starts.
+
+### 12.46 The MoE tile had one more halving in it: MPF_BM 128 -> 192
+
+§12.25 established that the grouped MoE prefill pair is bound by the FIXED PER-TILE cost of its
+output tiles -- not its k-loop (capping it at one tile moved DOWN -0.24%) and not its scatter
+(issuing 1 store in 16 moved it +3.2%) -- and §12.26 halved that cost once by taking BM from 64 to
+128. The tile was then left alone for the rest of the campaign on the belief that 128 was the top.
+
+It was not, and the reason is arithmetic nobody had done. TP8 puts ALL 385 experts (384 routed
+plus the shared fold) on EVERY rank, so each expert gathers `T*k/385 ~ 149` rows. The align op
+pads each expert's range up to a whole tile. So:
+
+    BM=64    ceil(149/64) = 3 tiles   192 padded rows   29% waste
+    BM=128   ceil(149/128) = 2 tiles  256 padded rows   72% waste
+    BM=192   ceil(149/192) = 1 tile   192 padded rows   29% waste
+
+**BM=192 cuts BOTH terms at once** -- half the tiles of 128 AND the padding back down to 64's
+ratio. That is why it is not the usual tiles-versus-waste trade, and why the 64-vs-128 result did
+not predict it. 256 does not exist: `(256+256)*64*2 = 65,536 B` against `plow_smem`'s 64,512,
+where `(192+256)*64*2 = 57,344` fits with `MPF_DBUF` still 1. **192 is the ceiling and the
+optimum.**
+
+MEASURED, layer 2 at 8k/TP8, arms interleaved so thermal drift lands on both:
+
+    BM=64     DOWN 2489.4   GLU 1574.0   pair 4063
+    BM=128    DOWN 1275.8   GLU 1011.5   pair 2361 / 2354 / 2402 / 2399 / 2385
+    BM=192    DOWN  971.2   GLU  613.4   pair 1609 / 1588 / 1571 / 1619     <- default
+
+**-783 us on the pair, -32.9%**, over five control repeats and four treatment repeats with no
+overlap between the arms. DOWN -26%, GLU -40%. Layer min-to-min 16,102 -> 15,374 us.
+
+Two things this cost, both worth recording:
+
+**The A/B harness was lying, and had been.** The whole V4.1 default block sat behind
+`[ -z "${MPF_BM:-}" ]`, so naming MPF_BM to sweep the tile ALSO silently dropped `PLOW_FA_GATHER_GF=8`,
+both router knobs and both epilogue settings. Every MPF_BM A/B ever run was a five-variable
+experiment reported as a tile result. The guard is now scoped to the assignment it belongs to and
+each default is individually `:-`. The §12.26 numbers survive only because the EPI note happened to
+force the one variable that mattered.
+
+**The exit MEAN is not a parity signal and never was.** BM=192 returns mean -0.000736 against the
+control's -0.000712 -- but one UNCHANGED object returns -0.000712 and -0.000713 on consecutive
+runs, so the MoE reduction is run-order dependent at the 1e-6 level. min/max hold to the printed
+digit (-1.36719 / 3.64062) across every tile and every run, and that is the parity check. Earlier
+sections quote the mean alongside min/max; read it as incidental.
+
+Requires the `mla.rs` `MPF_BM` sizing bound raised to 192 and the packet RE-EMITTED: the align op
+pads to the OBJECT's tile height, so an object whose tile exceeds the bound its packet was sized
+from is an out-of-bounds device write with no symptom at low expert counts. The bound costs ~4 MB
+of arena, not 40x that -- the gathered arrays are shared across layers, not per-layer.
+
+### 12.47 What else was tried this round, and did not survive
+
+**The fp8-MX GEMM tile is already at its optimum.** `GEMM_FP8_MX` is now the SECOND op of the layer
+at 2765 us (18%), nine packets of 604 / 375 / 373 / 341 / 335 / 197 / 193 / 191 / 156 us -- the
+five projections wq_a [8192,1280,5120], wq_b [.,4608,1280], wkv [.,576,5120], wo_a [.,1024,4096],
+wo_b [.,5120,1024], ~406 GFLOP/layer against a ~311 us bf16-MFMA floor, so 8.9x off. `GM_MX_BK=64`
+was already taken (the file's own note measured it). The untried axis was BN, because A is bf16 and
+re-read once per n-tile, so A traffic (~3.2 of the 4.8 GB/layer) halves at BN=256. MEASURED:
+
+    128x128 BK=64 (default)   2921 us   straggler 163 us/pk
+    128x256 BK=64             5910 us   straggler 453 us/pk
+    256x128 BK=64             5437 us   straggler 421 us/pk
+    128x256 BK=32             so slow the collective hit its deadline and the run failed
+
+Both wider tiles are ~2x WORSE and their stragglers nearly triple -- the register-spill signature
+the file's own 128x128 note predicts ("the second promotion accumulator doubles the register
+cost"). The traffic cut was real and bought nothing, the third time this campaign that a real
+traffic cut has lost to the megakernel's one-workgroup-per-CU occupancy (GEMV arm 7, MoE arm 7,
+and now this). Not committed; the default stands.
+
+**The dense-GEMM tuning store is 100% stale and cannot currently be refilled for V4.1.**
+`plowc tune status --gpu mi300x` reports 4961 records across 14 digests, EVERY one stale, so all
+five dense tiles come from the analytical model at tier `portable`. The campaign's `--shapes auto`
+derives its list from a full-model emit, which V4.1 does not have -- `tune gemm` panics on the
+`deepseek_v41: no device emit yet` refusal. `PLOW_TUNE_DUMP=1` on the block emit gives the demand
+by hand, and it is small: `4096x128x512`, `8192x32x5120`, `8192x384x5120`, `8192x512x5120`, plus
+`TUNEDUMP_GEMV 8192x24x20480` for the mHC mix. Those are GEMM_MED + GEMM_SMALL = 553 us of a
+15,778 us layer, so the ceiling on tuning them is ~0.5% of the layer. The `--shapes <FILE>` escape
+hatch (the one Kimi-K3 uses) is the route if it is ever worth it. Recorded so the next reader does
+not re-derive it.
+
+**Straggler, not tile, is where the fp8-MX loss actually sits.** Three of the nine packets have a
+straggler LARGER than their body (245/197, 184/193, 367/191 us): those are the small-N projections
+where 304 CUs are handed 320 tiles and most of the second round is idle. `glm_glu_halves` -- the
+disjoint-CU-set mechanism already in the tree -- is the obvious tool, but the only independent
+pair here is (wq_a, wkv) at 604 and 197 us, and splitting 304 CUs between them costs more than the
+197 it could hide. Left alone, with the arithmetic recorded.
