@@ -3532,7 +3532,7 @@ wins found the same way. **The instrument is not a formality.**
     "finite and stable" plus an op census that matches the config (§12.18), not
     "right". This is now the largest single gap.
   * **~581 ms against 90 ms** as of §12.50 (chain-sum 608.3 ms less a measured 27.3 ms seam offset)
-  * **90 ms is 0.99x the ROOFLINE FLOOR of this model on this hardware — see §12.56. It is not reachable.** (§12.29-§12.42 took a further 141 ms off the 755 below;
+  * **90 ms is 0.72x the ROOFLINE FLOOR of this model on this hardware — see §12.56 and §12.60. It is not reachable.** (The floor is 125 ms, not the 91 ms §12.56 published: that figure priced FLASH_GATHER_PREFILL against MFMA peak, and §12.59 measured that the matrix core cannot take that op.) (§12.29-§12.42 took a further 141 ms off the 755 below;
     §12.19, §12.20, §12.22, §12.24 and §12.26 took 237 ms off §12.18's 992,
     neither in a V4.1 op; §12.21 showed the next 124 ms line is already on its
     finest legal tile). Closing the remaining 9.5x is not a list of point fixes:
@@ -4773,3 +4773,31 @@ Exits identical at every GF. Monotone, so register pressure is NOT what bounds t
 what neither says alone: the op is insensitive to scatter LOCALITY and sensitive to VOLUME.** The
 default was already right, and this is the fourth and last hypothesis about the layer's biggest op
 to be measured and closed.
+
+## 12.60 The floor was wrong, and it was too LOW: 125 ms, not 91 ms
+
+12.56 summed generous per-op floors to 2282 us/layer = 91 ms for 40 layers and concluded 90 ms is
+0.99x of it. One line of that sum was wrong, and 12.59 is what exposes it.
+
+`scripts/dsv41_roofline.py` priced `FLASH_GATHER_PREFILL` -- the layer's biggest op, 2955 us -- at
+`mac / MFMA_BF16` = 56 us, i.e. against the MATRIX CORE. **But 12.59 ranked the written MFMA body
+on hardware and it is 2.6x SLOWER**, because its work item is one query token and TP8 leaves
+n_head=8 on a 16-wide MFMA M-dimension. The shipped body does every score and every PV MAC on the
+VECTOR ALU by construction. Pricing it against an engine it provably cannot use made its floor
+53x too generous.
+
+Corrected to `mac / VALU_F32`:
+
+    FLASH_GATHER_PREFILL   floor 56 -> 892 us     x off  52.9 -> 3.3
+    SUM (these ops)        floor 2282 -> 3118 us  x off   5.5 -> 4.0
+    40-layer FLOOR         91 -> 125 ms
+    target / floor         0.99x -> 0.72x
+
+Two things change. **The target moves further out of reach, not closer**: 90 ms is 0.72x a floor
+that ignores ~10 other ops entirely, so the real bound is above 125 ms. And **the layer's biggest
+op stops being an outlier** -- at 3.3x off its true floor it is one of the better-behaved ops in
+the table, which is exactly why four successive hypotheses about it (traffic, re-sharding, MFMA,
+GF) all measured null or negative. It was never mis-implemented; it was mis-priced.
+
+The measured column was also refreshed from the 2026-09-16 trace (layer 15,100 -> 14,900 us;
+COMPRESS_ROPE_QUANT 674 -> 378, 63.1x -> 35.4x off).
