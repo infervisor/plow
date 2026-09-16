@@ -4302,3 +4302,55 @@ campaign. The three terms that remain are the ones §12.45 named, and §12.47 cl
 on them: the fp8-MX tile is at its optimum and the dense-GEMM tuning store cannot be refilled for
 V4.1 until there is a full-model emit. Nothing kernel-level of this size is left; the next 6.5x is
 attention re-sharding, MoE packet geometry, and the collective.
+
+### 12.51 op 184's tile is optimal on both axes, and per-shape tiling is not worth building
+
+§12.47 measured the BN axis and found the default best. The BM axis is now measured too, at the
+default BN=128, interleaved with the control and repeated:
+
+    GM_MX_BM = 64      3415.2 / 3399.9 us     +21%
+    GM_MX_BM = 128     2831.0 / 2795.7 us     <- default
+    GM_MX_BM = 192     2899.0 / 2919.6 us     +3.4%
+    GM_MX_BM = 256     5437.4 us (§12.47)     +93%
+
+With §12.47's BN sweep (256 -> +102%) that is **four points on each axis, and 128x128x64 wins
+both**. Exits held min/max at -1.36719 / 3.64062 on every arm.
+
+**BM=192 was the interesting one and it is instructive that it lost.** It was predicted to help by
+DISPATCH FILL: m-tiles are `ceil(8192/BM)`, so BM=128 gives `wkv` (N=576, 5 n-tiles) 320 tiles over
+304 CUs -- 1.05 rounds, 53% fill, a whole second round for 16 tiles -- where BM=192 gives 215, one
+round, 71%. That is real and it still lost 3.4%, because one tile serves NINE shapes: the same move
+takes `wo_a` (8 n-tiles) from 512 tiles/84% to 344/57%, and SM goes 2 -> 3, adding a third
+accumulator row to a kernel the file already measured at 148 VGPR.
+
+**So per-shape tiling is bounded and the bound is small.** The obvious follow-up -- instantiate two
+or three tiles and dispatch on shape -- is sized by this sweep: the shapes' optima are only 3.4%
+apart, and the three underfilled packets are 197 + 193 + 191 us of a 2813 us total, so even PERFECT
+fill on all of them buys well under 150 us/layer, ~6 ms end to end, for several template
+instantiations and a dispatch rule. Recorded as measured-and-declined rather than left as an
+open idea for the next reader to cost again.
+
+`GEMM_FP8_MX` therefore stays ~9x off its ~311 us bf16-MFMA floor, and the gap is not the tile.
+
+### 12.52 Where the layer stands, and what is genuinely left
+
+At the committed defaults the single block is **15.06-15.17 ms** and every large term has now been
+either improved or closed with a measurement:
+
+    FLASH_GATHER_PREFILL  3026   at 29% of SCALAR-f32 peak; its 48.3 GB of gathered reads move at
+                                 ~16 TB/s, i.e. L2 rate. The cost is the GATHER, not the math --
+                                 which is why §12.30's ceiling instrument found the MFMA arm's
+                                 floor IS the scalar arm. Only query-token sharding changes it.
+    GEMM_FP8_MX           2813   tile optimal on both axes (§12.47, §12.51); BK=64 already taken.
+    XREDUCE2              1384   already on all 304 CUs (`PLOW_XR_CUS` unset), and an all-reduce is
+                                 a global sync -- nothing can run behind it. Needs a smaller
+                                 payload or a pipelined consumer, not a knob.
+    MOE pair              1575   -33% this round (§12.46), at the LDS ceiling (§12.50).
+    GEMV_F32              1021   past its traffic knee: MR 4->8 halves W volume for 4%, so W
+                                 traffic is no longer binding despite the arm-6 note.
+
+**90 ms means 2.25 ms/layer against 15.1.** No kernel-level lever of that size exists in this
+design: the three structural items are attention re-sharding (every rank holding all 64 heads and
+sharding query TOKENS -- replicated q/o weights, an all-gather replacing the head all-reduce), MoE
+packet geometry, and the collective. Each is an emit/collective change, and the first is the one
+worth doing first because it is the largest single op.
