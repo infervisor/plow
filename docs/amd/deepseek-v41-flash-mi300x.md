@@ -3606,3 +3606,46 @@ and masks down to its own 512, so the design pays |U|/512 and needs the union of
 queries' top-512 sets over layer 2's 4096-row compressed cache to come in under ~2048. That
 number is measurable from the shipped `idx[]` before any kernel is written, and measuring it is
 the next step rather than building it.
+
+### 12.31 The union set is half the cache, and the cheap lever on the same op was GF
+
+§12.30 ended by naming the union table as the one shape left and the union SIZE as the thing to
+measure before building it. `rung_run --dump act.index_idx=<path>` (new; `--probe` reports f32
+stats, which say nothing about an i32 selection table) writes layer 2's shipped `[8192][512]`
+table, and it is 93.75% live — every query past the warm-up selects a full 512 of the 4096-row
+compressed cache.
+
+    tile of adjacent queries     16      32      64     128     256
+    mean |union|               1877    2017    2059    2078    2110
+    work vs the sparse ideal   3.91x   4.20x   4.29x   4.33x   4.40x
+
+**At the 64-query tile the union is 2059 rows — half the whole cache — for 4.29x the arithmetic.**
+The selection is nothing like as clustered as a union design needs. A query-row-tiled MFMA arm
+over that union has to beat the scalar body by more than 4.29x before it returns anything, and it
+would need a new device op (union plus per-query membership bitmap), a new kernel, and 32 KB of
+LDS for the bitmaps on top of a 33 KB K tile against a 64,720 B arena. The curve is also flat:
+halving the tile to 32 buys only 2%, so there is no tile size that makes it comfortable. §12.27's
+plan is now measured rather than argued, and it is marginal.
+
+**The cheap lever on the same op was GF.** `d_flash_gather_prefill` re-streams the gathered latent
+once per HEAD-GROUP, `n_grp = n_head / GF`, and V4.1 at TP8 has `n_head = 64/8 = 8` against a
+hard-wired GF=4 — so it read the top-512 set twice per query for no reason. (The dispatch's `gf`
+cannot say otherwise: on op 55 `i[7]` carries the output split, so `gf = in->i[7]` is 513 and only
+the final GF=4 arm was ever reachable.)
+
+    FLASH_GATHER_PREFILL body, layer 2, T=8192, TP8, median of 5:
+
+      GF=2  (4 groups)   4416 us      layer 20799 us
+      GF=4  (2 groups)   3276 us      layer 19759 us   <- was the default
+      GF=8  (1 group)    3002 us      layer 19435 us   <- new default
+
+Exits identical at every GF. -8.4% on the op and -324 us on the layer, against an op delta of 274
+— attributable. The curve's shape is the same finding §12.30's ablation made: 2->4 saves 1140 us
+and 4->8 saves only 274, so the latent re-read was never the dominant term. It was simply the one
+term that cost nothing to delete.
+
+Defaulted under `PLOW_PREFILL_DSV41` (build_gfx942.sh), not in the header: GF must DIVIDE n_head,
+and `n_grp = n_head / GF` silently does no work at zero. The dispatch falls back to GF=4 when 8
+does not divide, so a different TP cannot hit that.
+
+Layer 2 at the committed defaults is now **19,435 us**, from 20,458 at the start of §12.29.

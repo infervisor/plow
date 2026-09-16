@@ -2160,12 +2160,22 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), (const int*)TEN(7),
                 in->i[6], in->i[0], in->i[4], in->i[1], in->i[2], in->fj[0].f, in->i[5], slice,
                 nblk, lds, ons, osp0);
-        else if (nope)
-            d_flash_gather_prefill<512, 0, 4>(
-                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
-                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), (const int*)TEN(7),
-                in->i[6], in->i[0], in->i[4], in->i[1], in->i[2], in->fj[0].f, in->i[5], slice,
-                nblk, lds, ons, osp0);
+        else if (nope) {
+            /* GF must divide n_head -- n_grp = n_head/GF, and a zero group count silently does no
+             * work. At the default 4 the first arm is a compile-time false and costs nothing. */
+            if (PLOW_FA_GATHER_GF != 4 && (in->i[1] % PLOW_FA_GATHER_GF) == 0)
+                d_flash_gather_prefill<512, 0, PLOW_FA_GATHER_GF>(
+                    (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                    (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6),
+                    (const int*)TEN(7), in->i[6], in->i[0], in->i[4], in->i[1], in->i[2],
+                    in->fj[0].f, in->i[5], slice, nblk, lds, ons, osp0);
+            else
+                d_flash_gather_prefill<512, 0, 4>(
+                    (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                    (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6),
+                    (const int*)TEN(7), in->i[6], in->i[0], in->i[4], in->i[1], in->i[2],
+                    in->fj[0].f, in->i[5], slice, nblk, lds, ons, osp0);
+        }
         else if (gf == 2)
             d_flash_gather_prefill<512, 64, 2>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),

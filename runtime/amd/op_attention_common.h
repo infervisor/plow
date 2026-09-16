@@ -2863,6 +2863,12 @@ __device__ void d_flash_mla_prefill_fp8(float* __restrict__ Opart, float* __rest
 #ifndef PLOW_FA_GATHER_MFMA
 #define PLOW_FA_GATHER_MFMA 0
 #endif
+/* Heads per group in the NoPE gathered prefill. GF is what sets how many times the gathered latent
+ * is re-streamed: n_head/GF groups, each re-reading the whole top_k set. V4.1 at TP8 has n_head=8,
+ * so GF=8 reads it ONCE. The cost is oacc[GF][8] in arch-VGPR. */
+#ifndef PLOW_FA_GATHER_GF
+#define PLOW_FA_GATHER_GF 4
+#endif
 /* CEILING INSTRUMENT for the head-packed gathered body. WRONG OUTPUT by construction; never a
  * serve asset. At n_head=8 (V4.1 at TP8) the arm has two known inefficiencies -- n_mtile==1 makes
  * all PLOW_WAVES waves recompute the SAME 32x32 score tile, and only 8 of 32 M-rows are live --

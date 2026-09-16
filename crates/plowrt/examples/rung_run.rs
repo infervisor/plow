@@ -131,6 +131,10 @@ mod hsa {
         // dispatch, so this is the only instrument that can attribute time to an op: a kernel
         // profiler sees one number and `--segs` sees one segment.
         let mut trace: Option<PathBuf> = None;
+        // `name=path`: write one tensor's RAW bytes after the first launch. `--probe` reports f32
+        // stats, which say nothing about an i32 index table -- and the selection tables are where
+        // the sparse-attention design questions are decided.
+        let mut dump = String::new();
         while let Some(a) = args.next() {
             match a.as_str() {
                 "--checkpoint" => checkpoint = args.next().map(PathBuf::from),
@@ -142,6 +146,7 @@ mod hsa {
                 "--probe" => probe = args.next().ok_or("--probe needs a value")?,
                 "--segs" => segs = args.next().ok_or("--segs needs a value")?.parse()?,
                 "--trace" => trace = args.next().map(PathBuf::from),
+                "--dump" => dump = args.next().ok_or("--dump needs name=path")?,
                 other => return Err(format!("unknown argument {other}").into()),
             }
         }
@@ -282,6 +287,17 @@ mod hsa {
                     st.inf,
                     if st.nan > 0 || st.inf > 0 { "  <-- NON-FINITE" } else { "" }
                 );
+            }
+        }
+
+        if !dump.is_empty() {
+            for spec in dump.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let (name, path) = spec.split_once('=').ok_or("--dump wants name=path")?;
+                let b = g.rank(0).tensor_bytes(name).ok_or_else(|| format!("{name} NOT DECLARED"))?;
+                let mut buf = vec![0u8; b as usize];
+                g.rank(0).read_tensor(name, &mut buf)?;
+                std::fs::write(path, &buf)?;
+                println!("dumped {name} -> {path} ({b} bytes)");
             }
         }
 

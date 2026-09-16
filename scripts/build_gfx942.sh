@@ -642,6 +642,10 @@ AX_K3_A4W4="-DPLOW_L2_PLACE_DISPATCH=1"
 # wins (in which case the hoist defaults are left alone and the `#error` is the caller's to resolve).
 if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ] && [ -z "${MPF_BM:-}" ]; then
   MPF_BM=128
+  # n_head = 64/TP, so TP8 gives 8 and GF=8 reads the gathered latent ONCE instead of twice:
+  # FLASH_GATHER_PREFILL 3276 -> 3031 us, layer -321 us, exits identical. The dispatch falls back
+  # to GF=4 when 8 does not divide n_head.
+  PLOW_FA_GATHER_GF="${PLOW_FA_GATHER_GF:-8}"
   PLOW_MOE_PF_EPI="${PLOW_MOE_PF_EPI:-0}"
   PLOW_K3_A4W4_EPI="${PLOW_K3_A4W4_EPI:-0}"
 fi
@@ -1061,6 +1065,13 @@ fi
 if [ "${PLOW_FA_GATHER_MFMA:-0}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_FA_GATHER_MFMA=${PLOW_FA_GATHER_MFMA}"
   AX_FLASH="$AX_FLASH -DPLOW_FA_GATHER_MFMA=${PLOW_FA_GATHER_MFMA}"
+fi
+
+# PLOW_FA_GATHER_GF: heads per group in the NoPE gathered prefill, i.e. how many times the
+# gathered latent is re-streamed (n_head/GF groups). Correct output at any legal GF.
+if [ -n "${PLOW_FA_GATHER_GF:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_FA_GATHER_GF=${PLOW_FA_GATHER_GF}"
+  AX_FLASH="$AX_FLASH -DPLOW_FA_GATHER_GF=${PLOW_FA_GATHER_GF}"
 fi
 
 # CEILING INSTRUMENT ONLY (PLOW_FA_GMFMA_ABL): deletes one term of the head-packed gathered flash
