@@ -2169,8 +2169,18 @@ impl Builder {
             .ops
             .iter()
             .any(|op| op.inst.op == DevOp::FlashMlaPrefillFp8 as u16 && op.inst.j[1] != 0);
+        // A GATHERED op 51 -- t[7] = the per-pack union table -- has an arm on the FOUR-WAVE
+        // object only; the 8-wave interpreter traps on it by design rather than attend the full
+        // causal range of a model trained sparse. So the routing is a property of the PACKET and
+        // not of a knob: emitting one of these without V2 segmentation cannot produce a program
+        // that runs at all.
+        let mla_gather_union = self
+            .ops
+            .iter()
+            .any(|op| op.inst.op == DevOp::FlashMlaPrefill as u16 && op.inst.t[7] != TENSOR_NONE);
         let mla_v2 = !uniseg
             && (split_mla
+                || mla_gather_union
                 || match knobs.mla_pf_v2 {
                     Some(explicit) => explicit,
                     // A placed packet is an AMD production artifact. Isolating a pure MLA flash
