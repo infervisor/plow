@@ -2371,10 +2371,26 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
 __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* row_token,
                                unsigned* row_partidx, float* row_gate, unsigned T, unsigned n_exp,
                                unsigned k, unsigned slice, unsigned* lds, unsigned phase = 0,
-                               unsigned nblk = 1, unsigned npart = 0) {
+                               unsigned nblk = 1, unsigned npart = 0, unsigned ep_lo = 0u,
+                               unsigned ep_hi = ~0u) {
     const unsigned tid = threadIdx.x;
     const unsigned nslot = T * k;
     const bool synth = (table == nullptr);
+    /* EXPERT PARALLEL. [ep_lo, ep_hi) is the window of experts whose weights THIS rank holds; the
+     * default [0, ~0) is every expert, which is the TP placement and changes nothing.
+     *
+     * A slot routed outside the window is mapped to ~0u, and every `< n_exp` guard below already
+     * drops that: it is not histogrammed, gets no gathered row, and is not scattered. So the
+     * padded prefix, the tile list and both grouped GEMMs see only local experts -- the rank does
+     * 1/degree of the tiles at the FULL moe_inter instead of all of them at moe_inter/degree.
+     *
+     * The combine still sums every slot of every token. The slots this rank dropped were never
+     * written into `part`, and `part` is zero there, so they contribute nothing here and the peer
+     * that does own them contributes the value in the reduction that follows. */
+    const auto slot_expert = [&](unsigned s) -> unsigned {
+        const unsigned e = synth ? 0u : moe_slot_expert(table, s);
+        return (e >= ep_lo && e < ep_hi) ? e : ~0u;
+    };
 
     /* Multi-packet path. Packet completion is the grid barrier; no resident-grid assumption is
      * made. The emitter appends [nblk,n_exp] partial counts after the public meta layout. */
@@ -2392,7 +2408,7 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
             const unsigned first = (unsigned)(((unsigned long long)nslot * slice) / npart);
             const unsigned last = (unsigned)(((unsigned long long)nslot * (slice + 1u)) / npart);
             for (unsigned s = first + tid; s < last; s += PLOW_THREADS) {
-                const unsigned e = synth ? 0u : moe_slot_expert(table, s);
+                const unsigned e = slot_expert(s);
                 if (e < n_exp)
                     __hip_atomic_fetch_add(&cnt[e], 1u, __ATOMIC_RELAXED,
                                            __HIP_MEMORY_SCOPE_WORKGROUP);
@@ -2456,7 +2472,7 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
             const unsigned last = (unsigned)(((unsigned long long)nslot * (slice + 1u)) / npart);
             for (unsigned base = first; base < last; base += PLOW_WAVE) {
                 const unsigned s = base + lane;
-                const unsigned e = s < last ? (synth ? 0u : moe_slot_expert(table, s)) : ~0u;
+                const unsigned e = s < last ? slot_expert(s) : ~0u;
                 const unsigned long long peers = __match_any(e);
                 const unsigned leader = __builtin_ctzll(peers);
                 const unsigned rank = __builtin_popcountll(peers & ((1ull << lane) - 1ull));
@@ -2490,7 +2506,7 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
     __syncthreads();
 
     for (unsigned s = tid; s < nslot; s += PLOW_THREADS) {
-        const unsigned eid = synth ? 0u : moe_slot_expert(table, s);
+        const unsigned eid = slot_expert(s);
         if (eid < n_exp) __hip_atomic_fetch_add(&cnt[eid], 1u, __ATOMIC_RELAXED,
                                                 __HIP_MEMORY_SCOPE_WORKGROUP);
     }
@@ -2557,7 +2573,7 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
     __syncthreads();
 
     for (unsigned s = tid; s < nslot; s += PLOW_THREADS) {
-        const unsigned eid = synth ? 0u : moe_slot_expert(table, s);
+        const unsigned eid = slot_expert(s);
         if (eid >= n_exp) continue;
         const unsigned pos = __hip_atomic_fetch_add(&cur[eid], 1u, __ATOMIC_RELAXED,
                                                     __HIP_MEMORY_SCOPE_WORKGROUP);

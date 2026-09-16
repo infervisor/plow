@@ -2168,6 +2168,7 @@ fn moe_mxfp4_routes_with_scratch(
     devp: &[DeviceMem],
     stage1_a4_scratch: Option<(u64, u64)>,
     ep_bind: Option<(u32, u32)>,
+    ep_specialists: bool,
 ) -> Result<Vec<PrefillSegmentRoute>> {
     let n_seg = prog
         .stream
@@ -2227,7 +2228,12 @@ fn moe_mxfp4_routes_with_scratch(
                     .and_then(|d| moe_ep_degree(d).map(|n| (d, n)))
             })
             .collect();
-        if !ep_members.is_empty() {
+        // Without the gfx950 specialist chain there is nothing to route TO, and nothing to route
+        // FOR: `d_moe_align_pf` filters to this rank's expert window off `i[5]` and the program
+        // uniform's rank, and both grouped GEMMs already skip a null weight base. Leaving the
+        // segment to the interpreter is then not a fallback but the whole EP boundary, and it
+        // costs no standalone dispatches between cooperative packets.
+        if !ep_members.is_empty() && ep_specialists {
             let (rank, n_gpu) = ep_bind.ok_or_else(|| {
                 RuntimeError::Device(format!(
                     "program T={} segment {seg} declares expert parallelism without a TP binding",
@@ -2760,7 +2766,7 @@ fn moe_mxfp4_routes(
     tensors: &[crate::asset::devblob::DevTensor],
     devp: &[DeviceMem],
 ) -> Result<Vec<PrefillSegmentRoute>> {
-    moe_mxfp4_routes_with_scratch(prog, tensors, devp, None, None)
+    moe_mxfp4_routes_with_scratch(prog, tensors, devp, None, None, true)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6728,6 +6734,20 @@ impl AmdEngine {
                     "replicated-input MoE EP with lean stage-1 MXFP4 segments requires gfx950 specialist objects, but this device is {arch}"
                 )));
             }
+            // PLOW_MOE_EP_CUTS is a HOST-side table. Without the specialist chain the align runs
+            // in the interpreter, which derives its expert window on-device from the program
+            // uniform's rank and can only reproduce the even split -- so honouring the cuts when
+            // binding weights while the device filtered on the even split would hand a rank rows
+            // for experts it does not hold. Refuse instead of returning a slightly wrong answer.
+            if arch != "gfx950"
+                && crate::config::RuntimeConfig::get().amd.moe_ep_cuts.is_some()
+            {
+                return Err(RuntimeError::Device(
+                    "PLOW_MOE_EP_CUTS needs the gfx950 specialist align; the interpreter align \
+                     derives the even split on-device and the two would disagree"
+                        .into(),
+                ));
+            }
             let bind = tp.ok_or_else(|| {
                 RuntimeError::Device(
                     "replicated-input MoE EP packet requires a tensor-parallel binding".into(),
@@ -8460,7 +8480,12 @@ impl AmdEngine {
             None
         };
 
-        let (k_moe_ep_align, k_moe_ep_stage2, k_moe_ep_combine) = if need_moe_ep {
+        // The specialist chain is gfx950's. Its align exists to feed the lean stage-1/stage-2
+        // pair at THEIR 64-row tile, and its combine to serve that pair's row lists -- there is
+        // no use for either without them. Elsewhere the interpreter runs the whole boundary.
+        let (k_moe_ep_align, k_moe_ep_stage2, k_moe_ep_combine) = if need_moe_ep
+            && arch == "gfx950"
+        {
             let mut load_ep = |name: &str,
                                symbol: &str,
                                markers: &[&str],
@@ -9450,6 +9475,7 @@ impl AmdEngine {
                     &devp,
                     stage1_a4_scratch,
                     tp.map(|b| (b.rank, b.n_gpu)),
+                    k_moe_ep_align.is_some(),
                 )?
             } else {
                 vec![PrefillSegmentRoute::Interpreter; seg_class.len()]

@@ -4932,3 +4932,68 @@ Note on reading XREDUCE2's OWN number: it is not rankable across arms. Its strag
 its body (12.59's table), i.e. almost all of it is waiting on the slowest peer, and the spread
 WITHIN a single arm here is 377 us (NWG=24 measured 1668.5 and 1291.5 on two passes of the same
 object). The layer min is what carries signal for this op.
+
+## 12.64 Expert parallelism, and the two things it is not
+
+EP runs on gfx942 now. `PLOW_MOE_PREFILL_EP` gives each rank 48 WHOLE experts at the full
+`moe_inter` 2304 instead of all 384 sliced to 288, and 288 was §12.63's finding: `down`'s k-loop is
+far too short to amortise the grouped GEMM's per-tile expert-weight reload.
+
+    arm                 layer min   MoE pair   XREDUCE2   exits
+    TP (shipped)         14028 us     850 us    1589 us   -1.36719 / 3.64062 / -0.000761
+    EP                   13854 us     296 us    2010 us   identical
+
+The MoE pair falls 65%. The layer falls 1.2%.
+
+### It was never a hardware gap
+
+Four things refused EP on gfx942 and three of them were not requirements. The blanket
+`arch != "gfx950"` check; the lean stage-1 A4 quantization scratch; the `_moe2` shuffled
+down-weight companions; and `moe_ep_stage2` itself. Only the last is genuinely CDNA4 --
+`v_mfma_scale_f32_16x16x128_f8f6f4` -- and it is an ACCELERATION of a contract the interpreter
+already implements, because `d_moe_group_down_pf` scatters `part[row_partidx[row]][H]` scaled by
+`row_gate[row]` and skips a null weight base, which is exactly what stage-2 does.
+
+Two more refusals were Kimi-K3 constants: `top_k == 16` hardcoded in the packet rewrite AND in the
+runtime route builder. V4.1 routes top-6 and was rejected at both.
+
+And `filter_align.hip` hardcoded the gathered-row tile height at 64 while the interpreter GEMM is
+compiled MPF_BM=512. The consumer reads the align's tables back as
+`rowoff[e] + (mt - tilep[e]) * MPF_BM`, so the mismatch does not degrade -- it addresses ANOTHER
+EXPERT'S ROWS and multiplies the tile count by the ratio. The exits still passed; what caught it
+was EP's GLU running 2.6x TP's at identical padded MAC work.
+
+### It is not expert load imbalance
+
+Routing is wildly skewed. Dumped from `act.moe_meta` (`--dump`), at 8k only 153 of 384 experts take
+any row at all, one takes 5868 against a mean of 128, and the even split's per-rank TILE load runs
+1.558x: [42, 29, 17, 45, 22, 34, 19, 23].
+
+`PLOW_MOE_EP_CUTS` replaces the even split with calibrated cut points. UNEVEN CONTIGUOUS cuts
+suffice -- the optimal contiguous partition of this histogram reaches 1.004x, as good as an
+unrestricted assignment, so no expert is relabelled and the router, the align filter and the weight
+binder keep agreeing by construction.
+
+It buys NOTHING. Rank 0's tile count went 42 -> 29 and its MoE pair did not move (298 vs 296 us);
+the layer got slightly worse (13914 vs 13854 us). Tile count is not what sets this op's duration:
+the grouped GEMM's work items are M-tiles x N-tiles, and at EP's full `moe_inter` there are 18
+N-tiles per expert, so 29..45 M-tiles become 520..810 items over 304 CUs -- two or three rounds
+either way, with the ROUNDING and not the total deciding. Balancing moved a quantity the op was
+never bound by, which is also why EP's MoE ops show an 88-94% straggler.
+
+### The benchmark's routing is not the model's
+
+`rung_run` says so in its own header: `act.x` is a seeded synthetic. A synthetic activation through
+a trained router is what collapses 384 experts onto 153. Real traffic routes far more evenly, so
+the imbalance measured here is an ARTEFACT and the EP give-back it causes is pessimistic. The MoE
+pair win is not an artefact: it is the k-loop length, which does not depend on the input.
+
+Read the -174 us/layer as a LOWER BOUND on EP, not an estimate of it.
+
+### What is actually left
+
+XREDUCE2 is 99% straggler in BOTH arms -- it is pure wait -- and EP adds 301 us per collective to
+it. Since balancing is ruled out, what remains is the dispatch structure EP adds: 4 standalone
+align launches between cooperative packets, residual 1.5 -> 100.9 us. Hence the interpreter align
+now filters to this rank's expert window itself (off `i[5]` and the program uniform's rank), so EP
+needs no specialist object on gfx942 and adds no standalone dispatch at all.

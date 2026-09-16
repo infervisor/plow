@@ -4928,11 +4928,24 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                  nullptr, nullptr, in->i[5]
             );
             break;
-        case PLOW_DOP_MOE_ALIGN_PF:
+        /* i5 = EXPERT-PARALLEL DEGREE, 0 or 1 meaning the ordinary TP placement. Under EP this
+         * rank keeps only the experts whose weights it holds, and the window is derived here
+         * rather than baked per rank: `balanced_expert_range(n_exp, degree, rank)`, the same even
+         * split `packet::moe_ep` computes host-side when it binds the weights. The two must agree
+         * or a rank gathers rows for experts it has no weights for. */
+        case PLOW_DOP_MOE_ALIGN_PF: {
+            unsigned ep_lo = 0u, ep_hi = ~0u;
+            const unsigned deg = in->i[5];
+            if (deg > 1u && prog_meta && prog_meta->n_gpu == deg) {
+                const unsigned r = prog_meta->rank, q = in->i[1] / deg, rem = in->i[1] % deg;
+                ep_lo = r * q + (r < rem ? r : rem);
+                ep_hi = ep_lo + q + (r < rem ? 1u : 0u);
+            }
             d_moe_align_pf((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
                            (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2], slice,
-                           (unsigned*)sm->raw, in->i[3], nblk, in->i[4]);
+                           (unsigned*)sm->raw, in->i[3], nblk, in->i[4], ep_lo, ep_hi);
             break;
+        }
         /* i3 = weight encoding (0 bf16, 1 block-fp8, 2 MXFP4/A4W4) — a precision swap is a
          * field change, not a re-emit. t6=row_partidx, t7=row_gate on DOWN; under A4W4 the GLU
          * arm also takes t6 (so the fused bridge can skip pad rows) and t7 = the E8M0 scale
