@@ -180,7 +180,8 @@ done
 if [ "$TOKEN_BATCH" = 1 ]; then
     for marker in plow_token_batch_1 plow_token_batch_dense_gqa_1 \
                   plow_token_batch_combined_m_1 plow_token_batch_span_attn_1 \
-                  plow_token_batch_split_merge_1 \
+                  plow_token_batch_split_merge_1 plow_token_batch_phase_flags_1 \
+                  plow_token_batch_row_gather_1 \
                   plow_mixed_dynamic_rows_1 plow_mixed_step_bf16_1 \
                   plow_mixed_gemm_glu_1 plow_mixed_prefill_split_1; do
         grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS" || fail "$OUT is missing $marker"

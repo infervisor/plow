@@ -2675,9 +2675,10 @@ impl HsaUploadRing {
     /// VALUE-IDENTICAL: `-0 == +0` in every product a weight byte enters. The point is the
     /// CDNA3 decoder: gfx942's `v_cvt_pk_f32_fp8` reads e4m3fnuz, where 0x80 is NaN, so the
     /// kernels guarded every decode with a ~8-VALU neg-0 mask. A scrubbed-at-rest payload
-    /// lets the hot staging loop drop that mask (`mpf_fp8x4_to_bf16_h`, op_moe.h). Callers:
-    /// block-fp8 expert payloads ONLY — never scales, never bf16, and never MXFP4 payloads
-    /// (there 0x80 is two fp4 nibbles, and zeroing them would corrupt real values).
+    /// lets hot staging loops drop that mask (`GM8_FIX8`, op_gemm_gfx942.h, and
+    /// `mpf_fp8x4_to_bf16_h`, op_moe.h). Callers may pass only OCP F8_E4M3 payloads — never
+    /// scales, bf16, or MXFP4 payloads (there 0x80 is two fp4 nibbles, and zeroing them would
+    /// corrupt real values).
     pub fn push_scrub_fp8_neg0(&mut self, dptr: u64, src: &[u8]) -> Result<()> {
         self.push_inner(dptr, src, true)
     }

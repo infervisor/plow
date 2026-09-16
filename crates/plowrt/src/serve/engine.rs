@@ -461,10 +461,10 @@ mod amd_serve {
             e.chunk_steps_from(&chunks, from, to)
         }
 
-        fn restore_carried(&mut self, slot: usize) -> Result<()> {
+        fn restore_carried_since(&mut self, slot: usize, dirty_until: u32) -> Result<()> {
             match self {
-                Self::One(e) => e.restore_carried(slot),
-                Self::Tp(g) => g.restore_carried(slot),
+                Self::One(e) => e.restore_carried_since(slot, dirty_until),
+                Self::Tp(g) => g.restore_carried_since(slot, dirty_until),
             }
         }
 
@@ -1764,6 +1764,7 @@ mod amd_serve {
                         self.max_ctx
                     )));
                 }
+                let dirty_until = self.pos[slot];
                 let t_clear = std::time::Instant::now();
                 crate::obs::ttft::timed(&crate::obs::ttft::PF_STATE_CLEAR, || {
                     match &mut self.ranks {
@@ -1804,7 +1805,7 @@ mod amd_serve {
                 let resume = resume.max(head);
                 let max_bucket = self.prefill_chunk_rows.min(tick_max_bucket);
                 if resume > 0 && !shared && !head_wins {
-                    self.ranks.restore_carried(slot)?;
+                    self.ranks.restore_carried_since(slot, dirty_until)?;
                 }
                 // With bodies armed, a middle chunk must fit its bucket's body to ride it.
                 let (g, tb) = (&self.ranks, self.token_batch_tp.as_ref());

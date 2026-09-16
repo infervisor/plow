@@ -29,7 +29,7 @@
 //! grounds that a measurement without a correctness oracle cannot be published.
 //! The premise is right and the conclusion no longer follows: the GEMM campaign
 //! HAS an oracle (`runtime/ubench/gemm_tile_sweep.c`'s f64 dot spot-check,
-//! keyed into every record as `tunedb::GEMM_ORACLE`), so its measurements do
+//! keyed into every record by `tunedb::gemm_oracle`), so its measurements do
 //! reach `qualified`. What still holds is the separation that made the old rule
 //! sound — `compile` may read qualified records and must never write them.
 //!
@@ -196,7 +196,7 @@ pub fn run(opts: &TuneOptions) -> Result<(), Box<dyn std::error::Error>> {
                 implementation: tuning_build.label(),
                 interpreter: tuning_build.label(),
                 toolchain: tuning_build.toolchain.clone(),
-                oracle: tunedb::GEMM_ORACLE.to_string(),
+                oracle: tunedb::gemm_oracle(hw.isa).to_string(),
             };
             status::status(&opts.db, &hw.tuning_path(), &want, coverage_from.as_ref())?
         }

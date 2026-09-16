@@ -1039,6 +1039,10 @@ pub struct EmitConfig {
     #[arg(long = "emit-prefill-cublaslt", env = "PLOW_EMIT_PREFILL_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub prefill_cublaslt: bool,
 
+    /// Emit qualified Gemma-31B gfx942 BF16 o/down projections as pinned assembly segments.
+    #[arg(long = "emit-gemma-gemm-lt", env = "PLOW_GEMMA_GEMM_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub gemma_gemm_lt: bool,
+
     #[arg(
         long = "emit-decode-native-tc",
         env = "PLOW_EMIT_DECODE_NATIVE_TC",
@@ -1371,6 +1375,7 @@ impl EmitConfig {
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
             decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),
             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
+            gemma_gemm_lt: env_bool("PLOW_GEMMA_GEMM_LT"),
             decode_native_tc: env_bool("PLOW_EMIT_DECODE_NATIVE_TC"),
             qwen_fuse_ab: env_bool("PLOW_QWEN_FUSE_AB"),
             qwen_fuse_mlp: env_bool("PLOW_QWEN_FUSE_MLP"),
@@ -2004,6 +2009,21 @@ mod tests {
             .unwrap()
             .emit
             .prefill_cublaslt);
+    }
+
+    #[test]
+    fn gemma_gemm_lt_is_explicit_and_default_off() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMMA_GEMM_LT", "0")]);
+        assert!(!EmitConfig::from_env().gemma_gemm_lt);
+        assert!(!TestArgs::try_parse_from(["test"])
+            .unwrap()
+            .emit
+            .gemma_gemm_lt);
+        assert!(TestArgs::try_parse_from(["test", "--emit-gemma-gemm-lt"])
+            .unwrap()
+            .emit
+            .gemma_gemm_lt);
     }
 
     #[test]

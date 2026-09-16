@@ -21,16 +21,20 @@ use std::path::{Path, PathBuf};
 /// * `plow_token_batch_combined_m_1` — projections run at combined M, with no phase band.
 /// * `plow_token_batch_span_attn_1` — FlashPrefill/FlashDecode read their bounds from spans.
 /// * `plow_token_batch_split_merge_1` — split FlashMerge reads the prefix-free span table.
+/// * `plow_token_batch_phase_flags_1` — sampling and attention phase use explicit span flags.
+/// * `plow_token_batch_row_gather_1` — RowGather consumes live S and explicit terminal rows.
 /// * `plow_token_batch_fp8_gemm_1` — required separately for FP8-weight programs.
 ///
 /// `scripts/build_gfx942.sh`'s object contract fails a build that drops any of them, so a
 /// missing marker here means a stale object, not a fresh one built wrong.
-pub(super) const TOKEN_BATCH_MARKERS: [&str; 5] = [
+pub(super) const TOKEN_BATCH_MARKERS: [&str; 7] = [
     "plow_token_batch_1",
     "plow_token_batch_dense_gqa_1",
     "plow_token_batch_combined_m_1",
     "plow_token_batch_span_attn_1",
     "plow_token_batch_split_merge_1",
+    "plow_token_batch_phase_flags_1",
+    "plow_token_batch_row_gather_1",
 ];
 
 /// The object file and kernel the route needs. The kernel symbol is deliberately NOT
@@ -218,7 +222,7 @@ mod tests {
             [1, 2, 4, 8, 16, 32, 64, 128]
         );
         let batch = blob.decode_progs().last().unwrap().t as usize;
-        let synthesized = crate::exec::mixed_program::synthesize(&blob, batch, false).unwrap();
+        let synthesized = crate::exec::mixed_program::synthesize(&blob, batch, false, true).unwrap();
         assert_eq!(
             synthesized
                 .programs
@@ -308,6 +312,27 @@ mod tests {
                 .insts
                 .iter()
                 .any(|i| i.op == DevOp::FlashPrefill as u16));
+            let gathers: Vec<_> = program
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, inst)| inst.op == DevOp::RowGather as u16)
+                .collect();
+            assert_eq!(gathers.len(), 1, "bucket {} terminal gather count", program.rows);
+            let (gather_index, gather) = gathers[0];
+            let final_norm = &program.insts[gather_index + 1];
+            assert_eq!(gather.i[..3], [spec.decode_rows, final_norm.i[1], program.rows]);
+            assert_eq!(final_norm.op, DevOp::RmsNorm as u16);
+            assert_eq!(final_norm.i[0], spec.decode_rows);
+            assert_eq!(final_norm.t[1], gather.t[0]);
+            assert_eq!(
+                synthesized
+                    .tensors
+                    .iter()
+                    .find(|tensor| tensor.handle == gather.t[2])
+                    .map(|tensor| tensor.name.as_str()),
+                Some(plow_asset::mixed_step::SAMPLE_ROW_TENSOR),
+            );
             for inst in program
                 .insts
                 .iter()
@@ -401,6 +426,7 @@ mod tests {
         assert!(text.contains("plow_token_batch_combined_m_1"), "{text}");
         assert!(text.contains("plow_token_batch_span_attn_1"), "{text}");
         assert!(text.contains("plow_token_batch_split_merge_1"), "{text}");
+        assert!(text.contains("plow_token_batch_phase_flags_1"), "{text}");
     }
 
     #[test]

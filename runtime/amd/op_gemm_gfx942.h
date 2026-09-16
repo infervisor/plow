@@ -34,28 +34,47 @@
 /* No 16-byte global_load_lds on CDNA3 (amd_arch.h), so d_gemm_t's DMA-direct stage is never
  * selected here: the register-staging path, with GM_PGR2 as its two-deep prefetch, is the ladder. */
 #define PLOW_GM_DIRECT_STAGE 0
-/* CDNA3's packed fp8 encoder is e4m3FNUZ, a DIFFERENT format (amd_arch.h), so d_quant_fp8 encodes
- * OCP e4m3 in software, two bytes per call. */
+/* Encoding x/2 as FNUZ produces the same finite byte as encoding x as OCP because the formats'
+ * exponent biases differ by one. Exhaustively compared on gfx942 over every finite FP32 bit
+ * pattern in d_quant_fp8's [-448,448] domain: zero mismatches. Balanced M1024 timing wins every
+ * 3840/4096/5376/8192 width by 1.21x--1.33x, so gfx942 defaults it on. */
+#ifndef GM_NATIVE_OCP_QUANT
+#define GM_NATIVE_OCP_QUANT 1
+#endif
+#if GM_NATIVE_OCP_QUANT
+#define PLOW_GM_FP8_PACK2(a, b)                                                             \
+    (plow_fp8_mask_neg0(__builtin_amdgcn_cvt_pk_fp8_f32((a) * 0.5f, (b) * 0.5f, 0u, false)) \
+     & 0xffffu)
+#else
 #define PLOW_GM_FP8_PACK2(a, b) \
     ((unsigned)plow_f32_to_fp8_ocp(a) | ((unsigned)plow_f32_to_fp8_ocp(b) << 8))
+#endif
 /* gv_un_fp8 picks the fp8 GEMV unroll by the K-divisor rule (op_gemm_common.h). Measured HERE:
  * K=3840/4096 -18..-27% standalone; gfx950 keeps the constant until someone measures the rule there. */
 #define PLOW_GV_UN_FP8_KDIV 1
-/* CDNA3 ONLY: the matrix core reads e4m3FNUZ, in which 0x80 is a NaN rather than OCP's -0.
- * Zeroing it here -- on the 8-byte group already sitting in registers, two SWAR words, before it
- * ever reaches LDS -- is the whole cost of running plow's OCP bytes through it. Every other byte
- * is exactly half its OCP value and PLOW_FP8_MMA_FIX puts that back in the epilogue.
- * A weight that quantised to negative zero would otherwise NaN the entire output tile. */
+/* CDNA3 reads e4m3FNUZ, where OCP's 0x80 (-0) is NaN. Production operands are already
+ * canonical: d_quant_fp8 never emits 0x80, and HsaUploadRing scrubs every F8_E4M3 checkpoint
+ * payload once while uploading it. Repeating the SWAR scrub for every operand K-tile only burns
+ * VALU and registers in the hot GEMM loop. Keep it in C5: deleting it there crosses a compiler
+ * allocation cliff (+2 scratch operations), while Gemma's M1024 projection rung uses E2. */
 #define GM8_FIX8(p)                                                                          \
     do {                                                                                      \
-        unsigned w_[2];                                                                       \
-        __builtin_memcpy(w_, (p), 8);                                                         \
-        w_[0] = plow_fp8_mask_neg0(w_[0]);                                                    \
-        w_[1] = plow_fp8_mask_neg0(w_[1]);                                                    \
-        __builtin_memcpy((p), w_, 8);                                                         \
+        if constexpr (BM == 192 && BN == 256) {                                               \
+            unsigned w_[2];                                                                   \
+            __builtin_memcpy(w_, (p), 8);                                                     \
+            w_[0] = plow_fp8_mask_neg0(w_[0]);                                                \
+            w_[1] = plow_fp8_mask_neg0(w_[1]);                                                \
+            __builtin_memcpy((p), w_, 8);                                                     \
+        }                                                                                     \
     } while (0)
 
 /* ---- arch-DEFAULTED knobs. `#ifndef`-guarded, so -D wins; PLOW_GEOM_MARK'd in geom_contract.h. */
+/* The K64 FP8 MFMA does not need the priority boost used by the BF16 ping-pong. Across the
+ * Gemma-4 12B/31B M1024 ladder, priority-off wins all 2K/4K/8K production metrics and leaves
+ * BF16 instruction selection unchanged. */
+#ifndef GM_PRIO8
+#define GM_PRIO8 0
+#endif
 /* Overridable at compile time so plowc can bucket the tile per shape without an ISA
  * change, and so a Qwen prefill object can be built with -DGM_BM=192 (see the sweep above).
  * Keep in sync with GFX950_TILES in crates/plowc/src/bin/gemma4.rs. */

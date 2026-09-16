@@ -15,6 +15,8 @@ pub mod amd;
 #[cfg(feature = "hsa")]
 mod amd_gemm_blk;
 #[cfg(feature = "hsa")]
+mod amd_gemma4_glu;
+#[cfg(feature = "hsa")]
 mod amd_gemm_lt;
 #[cfg(feature = "hsa")]
 mod amd_index_tp;

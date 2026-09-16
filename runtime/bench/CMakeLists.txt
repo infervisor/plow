@@ -158,6 +158,78 @@ if(PLOW_ROCM)
     target_link_libraries(mla_prefill_bench_gfx942 PRIVATE hsa-runtime64 m)
     add_dependencies(mla_prefill_bench_gfx942 mla_prefill_bench_gfx942_elf)
 
+    set(GEMMA12_GEMV_GLU_ELF ${CMAKE_CURRENT_BINARY_DIR}/gemma12_gemv_glu_decode_gfx942.elf)
+    add_custom_command(
+        OUTPUT ${GEMMA12_GEMV_GLU_ELF}
+        COMMAND "${PLOW_MLA_HIPCC}" --offload-arch=gfx942 -O3 -w -std=c++17 --genco
+                -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=1 -DPLOW_WG_WAVES=8
+                -DGM_BM=192 -DGM_BN=256 -DGM_BK=64 -DGM_DBUF=1
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                ${CMAKE_CURRENT_SOURCE_DIR}/amd/gemma12_gemv_glu_decode_bench.hip
+                -o ${GEMMA12_GEMV_GLU_ELF}.co
+        COMMAND "${PLOW_MLA_BUNDLER}" --unbundle --type=o
+                --targets=hipv4-amdgcn-amd-amdhsa--gfx942
+                --input=${GEMMA12_GEMV_GLU_ELF}.co --output=${GEMMA12_GEMV_GLU_ELF}
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${GEMMA12_GEMV_GLU_ELF}.co
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/amd/gemma12_gemv_glu_decode_bench.hip
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm_gfx942.h
+        VERBATIM)
+    add_custom_target(gemma12_gemv_glu_decode_gfx942_elf DEPENDS ${GEMMA12_GEMV_GLU_ELF})
+    add_executable(gemma12_gemv_glu_decode_bench
+        amd/gemma12_gemv_glu_decode_bench.c
+        ../amd/hsa_backend.c)
+    target_include_directories(gemma12_gemv_glu_decode_bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+        ${CMAKE_CURRENT_SOURCE_DIR}/../common)
+    target_compile_definitions(gemma12_gemv_glu_decode_bench PRIVATE _POSIX_C_SOURCE=199309L)
+    target_compile_options(gemma12_gemv_glu_decode_bench PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(gemma12_gemv_glu_decode_bench PRIVATE hsa-runtime64 m)
+    add_dependencies(gemma12_gemv_glu_decode_bench gemma12_gemv_glu_decode_gfx942_elf)
+    find_program(PLOW_GEMMA12_BENCH_PYTHON python3 REQUIRED)
+    add_custom_target(gemma12_gemv_glu_decode_gfx942_audit
+        COMMAND ${PLOW_GEMMA12_BENCH_PYTHON}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/asm_audit.py
+                --expect
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tests/gemma12_gemv_glu_decode_gfx942_expect.json
+                ${GEMMA12_GEMV_GLU_ELF}
+        DEPENDS gemma12_gemv_glu_decode_gfx942_elf
+        VERBATIM)
+
+    set(GEMMA_FLASH_NATIVE_ELF
+        ${CMAKE_CURRENT_BINARY_DIR}/gemma_flash_native_prefill_gfx942.elf)
+    add_custom_command(
+        OUTPUT ${GEMMA_FLASH_NATIVE_ELF}
+        COMMAND "${PLOW_MLA_HIPCC}" --offload-arch=gfx942 -O3 -w -std=c++17 --genco
+                -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH=1 -DPLOW_WG_WAVES=4
+                -DFA_DC=256 -DFA_DBUF=1 -DGM_BM=64 -DGM_BN=128
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                ${CMAKE_CURRENT_SOURCE_DIR}/amd/gemma_flash_native_prefill_gfx942.hip
+                -o ${GEMMA_FLASH_NATIVE_ELF}.co
+        COMMAND "${PLOW_MLA_BUNDLER}" --unbundle --type=o
+                --targets=hipv4-amdgcn-amd-amdhsa--gfx942
+                --input=${GEMMA_FLASH_NATIVE_ELF}.co --output=${GEMMA_FLASH_NATIVE_ELF}
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${GEMMA_FLASH_NATIVE_ELF}.co
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/amd/gemma_flash_native_prefill_gfx942.hip
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention_gfx942.h
+        VERBATIM)
+    add_custom_target(gemma_flash_native_prefill_gfx942_elf DEPENDS ${GEMMA_FLASH_NATIVE_ELF})
+    add_custom_target(gemma_flash_native_prefill_gfx942_audit
+        COMMAND ${PLOW_GEMMA12_BENCH_PYTHON}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/asm_audit.py
+                --expect
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tests/gemma_flash_native_prefill_gfx942_expect.json
+                ${GEMMA_FLASH_NATIVE_ELF}
+        DEPENDS gemma_flash_native_prefill_gfx942_elf
+        VERBATIM)
+
     set(MLA_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/mla_fixture.bin)
     set(MLA_REF ${CMAKE_CURRENT_BINARY_DIR}/mla_ref)
     find_program(PLOW_BENCH_RUSTC rustc REQUIRED)
@@ -750,6 +822,17 @@ if(PLOW_ROCM)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
     target_compile_definitions(gemm_tile_sweep PRIVATE _POSIX_C_SOURCE=199309L)
     target_link_libraries(gemm_tile_sweep PRIVATE hsa-runtime64 m)
+
+    add_executable(quant_fp8_bench
+        gemm/quant_fp8_bench.c
+        ../amd/hsa_backend.c)
+    target_include_directories(quant_fp8_bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+        ${CMAKE_CURRENT_SOURCE_DIR}/../common
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_compile_definitions(quant_fp8_bench PRIVATE _POSIX_C_SOURCE=199309L)
+    target_compile_options(quant_fp8_bench PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(quant_fp8_bench PRIVATE hsa-runtime64 m)
 
     # Same-tile fused-vs-unfused MXFP4 GLU through the gfx942 interpreter.
     add_executable(interp_mxfp4_glu_gfx942

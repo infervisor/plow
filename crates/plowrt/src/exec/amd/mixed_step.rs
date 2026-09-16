@@ -73,6 +73,7 @@ pub(super) struct MixedAmdStep {
     ids_base: u64,
     pos_base: u64,
     kvlen_base: u64,
+    sample_row_base: Option<u64>,
     vocab: u32,
     _buffers: Vec<DeviceMem>,
     /// Unloaded by `Drop`. `Module` has no destructor of its own, so a plain field here
@@ -125,7 +126,12 @@ impl MixedAmdStep {
             && crate::config::RuntimeConfig::get()
                 .amd
                 .token_batch_wide_tiles;
-        let mut synthesized = crate::exec::mixed_program::synthesize(blob, batch, wide_tiles)?;
+        let mut synthesized = crate::exec::mixed_program::synthesize(
+            blob,
+            batch,
+            wide_tiles,
+            route == StepRoute::TokenBatch,
+        )?;
         let fp8_weights = synthesized.programs.iter().any(|spec| {
             spec.program.insts.iter().any(|inst| {
                 matches!(
@@ -191,6 +197,9 @@ impl MixedAmdStep {
             .iter()
             .copied()
             .chain(token_markers.into_iter().flatten())
+            .chain(
+                (route == StepRoute::TokenBatch).then_some("plow_row_gather_1"),
+            )
             .chain(wide_tiles.then_some("plow_token_batch_wide_gemm_1"))
             .chain(
                 (route == StepRoute::TokenBatch && fp8_weights)
@@ -244,13 +253,8 @@ impl MixedAmdStep {
                 route.label()
             )));
         }
-        // PrefixFree turns each decode request into a span and splits a completing prompt into
-        // two, so the span table is bounded by `2 * batch` rather than by `batch`.
-        let span_capacity = if route == StepRoute::TokenBatch {
-            batch * 2
-        } else {
-            batch
-        };
+        // Every active request owns at most one span.
+        let span_capacity = batch;
         let count = synthesized
             .tensors
             .iter()
@@ -299,13 +303,17 @@ impl MixedAmdStep {
         let ids_base = base("in.ids")?;
         let pos_base = base("in.pos")?;
         let kvlen_base = base("in.kvlen")?;
+        let sample_row_base = if route == StepRoute::TokenBatch {
+            Some(base(plow_asset::mixed_step::SAMPLE_ROW_TENSOR)?)
+        } else {
+            None
+        };
         let table = EngineDevice::alloc(&**be, (addresses.len() * 8) as u64)?;
         EngineDevice::upload(&**be, &table, 0, as_bytes(&addresses))?;
         let tensor_table = table.base;
         buffers.push(table);
-        // Under PrefixFree the leading sampled rows are decode rows PLUS the terminal row of
-        // every prompt completing this step, so the compact decode-slot image is `batch` long,
-        // not `decode` (= batch - 1) long.
+        // Token batches can sample decode rows plus completing-prefill terminal rows, so both
+        // compact sample tables are sized for the full active batch.
         let leading = if route == StepRoute::TokenBatch {
             batch
         } else {
@@ -375,6 +383,8 @@ impl MixedAmdStep {
                 let audit = caps
                     .refuse_program(program.insts.iter().map(|i| i.op))
                     .map_err(|refusal| RuntimeError::Rejected(refusal.to_string()))?;
+                caps.can_run_output()
+                    .map_err(|refusal| RuntimeError::Rejected(refusal.to_string()))?;
                 tracing::debug!(
                     rows = program.rows,
                     sample_capacity = spec.decode_rows,
@@ -417,6 +427,7 @@ impl MixedAmdStep {
             ids_base,
             pos_base,
             kvlen_base,
+            sample_row_base,
             vocab: vocab.unwrap(),
             _buffers: buffers,
             module: guard.module.take().expect("armed above, taken once"),
@@ -466,6 +477,7 @@ fn validate_program(program: &plow_asset::aux_program::Program) -> Result<()> {
                     | DevOp::ArgmaxFin
                     | DevOp::SoftCap
                     | DevOp::NormResidual
+                    | DevOp::RowGather
             )
         ) {
             return Err(RuntimeError::Rejected(format!(
@@ -574,7 +586,7 @@ impl AmdEngine {
         )
     }
 
-    /// One unified token-batch step. `output` receives one sampled id per LEADING row, in
+    /// One unified token-batch step. `output` receives one sampled id per sample-table row, in
     /// plan order: the decode requests first, then the prompts that complete in this step.
     pub fn token_batch_step(
         &mut self,
@@ -680,7 +692,10 @@ impl AmdEngine {
                 ),
             }
             .map_err(|e| RuntimeError::Rejected(e.to_string()))?;
-            if plan.decode_rows as usize != leading || plan.prefill_spans.len() > mixed.layout.spans
+            if plan.decode_rows as usize != leading
+                || plan.decode_slots.len() != leading
+                || plan.sample_input_rows.len() != leading
+                || plan.prefill_spans.len() > mixed.layout.spans
             {
                 return Err(RuntimeError::Rejected(format!(
                     "{} AMD plan shape mismatch",
@@ -693,6 +708,7 @@ impl AmdEngine {
                     rows,
                     self.batch,
                     leading,
+                    &plan.sample_input_rows,
                     &plan.prefill_spans,
                     &plan.parked,
                 )
@@ -754,7 +770,24 @@ impl AmdEngine {
                     &mixed.zero.as_slice()[..program.counter_bytes],
                 ),
             ];
-            self.be.memcpy_htod_pinned_batch(&uploads)?;
+            if let Some(sample_row_base) = mixed.sample_row_base {
+                let token_uploads: [(u64, &[u8]); 8] = [
+                    uploads[0],
+                    uploads[1],
+                    uploads[2],
+                    uploads[3],
+                    (
+                        sample_row_base,
+                        slice(&mixed.layout.sample_row, leading),
+                    ),
+                    uploads[4],
+                    uploads[5],
+                    uploads[6],
+                ];
+                self.be.memcpy_htod_pinned_batch(&token_uploads)?;
+            } else {
+                self.be.memcpy_htod_pinned_batch(&uploads)?;
+            }
             let mut arg = program.arg;
             arg.n_prefill_spans = n_spans as u32;
             let started = Instant::now();

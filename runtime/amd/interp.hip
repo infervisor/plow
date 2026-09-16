@@ -52,6 +52,8 @@ extern "C" __device__ unsigned plow_mixed_block = 256;
  *   plow_token_batch_combined_m_1   projections run at combined M (no phase band)
  *   plow_token_batch_span_attn_1    FlashPrefill/FlashDecode read their bounds from spans
  *   plow_token_batch_split_merge_1  split FlashMerge reads the prefix-free span table
+ *   plow_token_batch_phase_flags_1  sampling and attention phase are explicit span flags
+ *   plow_token_batch_row_gather_1   RowGather uses live S and explicit terminal row indices
  *   plow_token_batch_wide_gemm_1    GEMM_WIDE/GEMM_C5 take their M from the descriptor too,
  *                                   so the synthesizer may keep the rung plowc chose instead
  *                                   of collapsing every projection onto GEMM's one tile
@@ -70,6 +72,8 @@ extern "C" __device__ unsigned plow_token_batch_dense_gqa_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_combined_m_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_span_attn_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_split_merge_1 = 1;
+extern "C" __device__ unsigned plow_token_batch_phase_flags_1 = 1;
+extern "C" __device__ unsigned plow_token_batch_row_gather_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_wide_gemm_1 = 1;
 #if PLOW_FP8
 extern "C" __device__ unsigned plow_token_batch_fp8_gemm_1 = 1;
@@ -1124,6 +1128,11 @@ __device__ __forceinline__ unsigned token_batch_rows(unsigned capacity, const Pl
     return plow_tb_rows(prog, capacity);
 }
 
+__device__ __forceinline__ unsigned token_batch_sample_rows(unsigned capacity,
+                                                            const PlowProgram* prog) {
+    return plow_tb_sample_rows(prog, capacity);
+}
+
 /* The largest M this object's compiled GEMV may be handed.
  *
  * `PLOW_GEMV_MAXM` (16) is the range of the GEMV PATH; `PLOW_GEMV_MM` is the row bucket THIS
@@ -1510,13 +1519,13 @@ __device__ __forceinline__ void exec_flash_decode(CInst in, CTens T,
         const PlowTokenBatchView tbv_ = plow_tb_view(tbprog);                                   \
         const PlowTokenBatchView dec_ =                                                         \
             plow_tb_span_range(tbv_, 0u, plow_tb_decode_spans(tbv_));                           \
-        if (n_batch_runtime > dec_.n_spans) __builtin_trap();                                   \
-        d_flash_decode<DD, PLOW_FA_GF(DD), false, false, /*SLOTMAP=*/false, /*TB=*/true>(       \
-            (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),           \
-            (const bf16*)TEN(4), (const int*)TEN(5), n_batch_runtime, in->i[1], in->i[2],       \
-            in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds, nullptr,     \
-            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0.0f, 0, nullptr,    \
-            nullptr, nullptr, dec_);                                                            \
+        if (dec_.n_spans)                                                                       \
+            d_flash_decode<DD, PLOW_FA_GF(DD), false, false, /*SLOTMAP=*/false, /*TB=*/true>(   \
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),       \
+                (const bf16*)TEN(4), (const int*)TEN(5), dec_.n_spans, in->i[1], in->i[2],     \
+                in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds, nullptr, \
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0.0f, 0,         \
+                nullptr, nullptr, nullptr, dec_);                                               \
     } while (0)
 #else
 #define PLOW_AMD_FLASH_DECODE(DD)                                                               \
@@ -2775,7 +2784,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
  * compiled capacity, and there is no decode band to carve out. */
 #define PLOW_HEADNORM_ARGS , prog_meta, (const int*)TEN(6)
 #define PLOW_RUNTIME_ROWS(capacity) token_batch_rows((capacity), prog_meta)
-#define PLOW_SAMPLE_ROWS(capacity) token_batch_rows((capacity) ? (capacity) : 1u, prog_meta)
+#define PLOW_SAMPLE_ROWS(capacity) token_batch_sample_rows((capacity) ? (capacity) : 1u, prog_meta)
 #define PLOW_RUNTIME_DECODE_ROWS 0u
 #elif PLOW_MIXED_STEP
 #define PLOW_HEADNORM_ARGS , prog_meta, (const int*)TEN(6)
@@ -3401,8 +3410,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * a bounds-checked copy with no resource cost worth pruning, and a pruned arm here is
          * indistinguishable at runtime from a gather that silently wrote nothing. */
         case PLOW_DOP_ROW_GATHER:
-            d_row_gather((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2), in->i[0],
-                         in->i[1], in->i[2], slice, nblk);
+            d_row_gather((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2),
+                         PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk);
             break;
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_SOFTCAP
         case PLOW_DOP_SOFTCAP:

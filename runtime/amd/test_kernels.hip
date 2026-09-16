@@ -20,6 +20,9 @@
 #ifndef PLOW_TK_SAFE_ONLY
 #define PLOW_TK_SAFE_ONLY 0
 #endif
+#ifndef PLOW_GEMMA4_QO_EXACT_BENCH
+#define PLOW_GEMMA4_QO_EXACT_BENCH 0
+#endif
 
 /* The Gemma-4 MoE bodies are compiled into THIS file unconditionally, where the interpreter
  * gates them behind PLOW_MOE_GEMMA / PLOW_MOE_GEMMA_PF. That asymmetry is deliberate: the
@@ -124,9 +127,12 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
  * the compiler allocate registers for the WORST config across all arms, so every
  * config spills (measured: 3588 B/thread). Register allocation is per-kernel, so
  * bucket specialisation has to be a compile-time split — which is exactly what a
- * compiler-driven bucket system is for. */
+ * compiler-driven bucket system is for. `flatten` is also required: without it
+ * clang outlines C5/MXFP4-C5 and the harness measures call-boundary scratch traffic
+ * instead of the register allocation the production rung should receive. */
 #define GEMM_VARIANT(NAME, BM, BN, BK)                                             \
-    extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                     \
+    extern "C" __global__ __attribute__((flatten))                                \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                     \
         bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned N, unsigned K) { \
         __shared__ bf16 lds[GM_LDS_HALVES_T(BM, BN, BK)];                          \
         d_gemm_t<BM, BN, BK, GM_WM, GM_WN, false>(C, A, B, nullptr, nullptr, M, N, K, blockIdx.x, \
@@ -147,6 +153,21 @@ GEMM_VARIANT(gemm_c1, 256, 128, 64)
 #endif
 #if GM_TILE_FITS(128, 256, 64)
 GEMM_VARIANT(gemm_c2, 128, 256, 64)
+#if PLOW_GEMMA4_QO_EXACT_BENCH
+#define GEMMA4_QO_BF16_EXACT(NAME, N, K)                                          \
+    extern "C" __global__ __attribute__((flatten))                              \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                    \
+        bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned, unsigned) {   \
+        __shared__ bf16 lds[GM_LDS_HALVES_T(128, 256, 64)];                       \
+        d_gemm_t<128, 256, 64, GM_WM, GM_WN, false>(                              \
+            C, A, B, nullptr, nullptr, M, N, K, blockIdx.x, gridDim.x, lds);      \
+    }
+GEMMA4_QO_BF16_EXACT(gemm_g12_qs_c2_exact, 4096, 3840)
+GEMMA4_QO_BF16_EXACT(gemm_g12_os_c2_exact, 3840, 4096)
+GEMMA4_QO_BF16_EXACT(gemm_g12_og_c2_exact, 3840, 8192)
+GEMMA4_QO_BF16_EXACT(gemm_g31_os_c2_exact, 5376, 8192)
+GEMMA4_QO_BF16_EXACT(gemm_g31_og_c2_exact, 5376, 16384)
+#endif
 #endif
 #if GM_TILE_FITS(128, 128, 64)
 GEMM_VARIANT(gemm_c3, 128, 128, 64)
@@ -188,7 +209,8 @@ GEMM_VARIANT(gemm_e5, 128, 128, 128)
 /* FP8 (w8a8) GEMM variants — same tile family, fp8 operands, dequant epilogue. LDS is bytes, so
  * the tile fits in HALF the halves the bf16 arena reserves (rounded up to a whole bf16 count). */
 #define GEMM_FP8_VARIANT(NAME, BM, BN, BK)                                          \
-    extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(  \
+    extern "C" __global__ __attribute__((flatten))                                 \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                      \
         bf16* C, const unsigned char* A, const unsigned char* B, const float* asc,   \
         const float* wsc, unsigned M, unsigned N, unsigned K) {                      \
         __shared__ bf16 lds[GM_LDS_HALVES_T(BM, BN, BK)];                            \
@@ -200,6 +222,22 @@ GEMM_FP8_VARIANT(gemm_fp8_c0, 256, 256, 64)
 #endif
 #if GM_TILE_FITS(128, 256, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c2, 128, 256, 64) /* GemmWideFp8: the fifth selectable fp8 rung */
+#if PLOW_GEMMA4_QO_EXACT_BENCH
+#define GEMMA4_QO_FP8_EXACT(NAME, N, K)                                            \
+    extern "C" __global__ __attribute__((flatten))                               \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                     \
+        bf16* C, const unsigned char* A, const unsigned char* B,                   \
+        const float* ascale, const float* wscale, unsigned M, unsigned, unsigned) { \
+        __shared__ unsigned char lds[(128 + 256) * 128];                           \
+        d_gemm_fp8_t<128, 256, 128, GM_WM, GM_WN>(                                \
+            C, A, B, ascale, wscale, M, N, K, blockIdx.x, gridDim.x, (bf16*)lds); \
+    }
+GEMMA4_QO_FP8_EXACT(gemm_g12_qs_fp8_c2_exact, 4096, 3840)
+GEMMA4_QO_FP8_EXACT(gemm_g12_os_fp8_c2_exact, 3840, 4096)
+GEMMA4_QO_FP8_EXACT(gemm_g12_og_fp8_c2_exact, 3840, 8192)
+GEMMA4_QO_FP8_EXACT(gemm_g31_os_fp8_c2_exact, 5376, 8192)
+GEMMA4_QO_FP8_EXACT(gemm_g31_og_fp8_c2_exact, 5376, 16384)
+#endif
 #endif
 #if GM_TILE_FITS(128, 128, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c3, 128, 128, 64)
@@ -207,8 +245,26 @@ GEMM_FP8_VARIANT(gemm_fp8_c3, 128, 128, 64)
 #if GM_TILE_FITS(64, 128, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c4, 64, 128, 64)
 #endif
+#if GM_TILE_FITS(64, 128, 128)
+GEMM_FP8_VARIANT(gemm_fp8_e2, 64, 128, 128)
+#endif
 #if GM_TILE_FITS(192, 256, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c5, 192, 256, 64) /* the Qwen prefill tile, vs bf16 c5 */
+#endif
+#if PLOW_GEMMA4_QO_EXACT_BENCH
+#define GEMMA4_QO_FP8_TILE_EXACT(NAME, BM, BN, N, K)                              \
+    extern "C" __global__ __attribute__((flatten))                              \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                    \
+        bf16* C, const unsigned char* A, const unsigned char* B,                   \
+        const float* ascale, const float* wscale, unsigned M, unsigned, unsigned) { \
+        __shared__ unsigned char lds[(BM + BN) * 128];                             \
+        d_gemm_fp8_t<BM, BN, 128, GM_WM, GM_WN>(                                  \
+            C, A, B, ascale, wscale, M, N, K, blockIdx.x, gridDim.x, (bf16*)lds); \
+    }
+GEMMA4_QO_FP8_TILE_EXACT(gemm_g31_os_fp8_c3_exact, 128, 128, 5376, 8192)
+GEMMA4_QO_FP8_TILE_EXACT(gemm_g31_og_fp8_c3_exact, 128, 128, 5376, 16384)
+GEMMA4_QO_FP8_TILE_EXACT(gemm_g31_os_fp8_c5_exact, 192, 256, 5376, 8192)
+GEMMA4_QO_FP8_TILE_EXACT(gemm_g31_og_fp8_c5_exact, 192, 256, 5376, 16384)
 #endif
 
 /* MXFP4 (w4a16) GEMM variants — the five SELECTABLE rungs, one kernel each.
@@ -228,7 +284,8 @@ GEMM_FP8_VARIANT(gemm_fp8_c5, 192, 256, 64) /* the Qwen prefill tile, vs bf16 c5
  * LDS is the bf16 arena, NOT the fp8 one: w4a16 dequants fp4->bf16 in the B-FETCH and stages
  * bf16, so a tile occupies the same halves the bf16 rung does. */
 #define GEMM_MXFP4_VARIANT(NAME, BM, BN, BK)                                                 \
-    extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(         \
+    extern "C" __global__ __attribute__((flatten))                                          \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                               \
         bf16* C, const bf16* A, const unsigned char* W, const unsigned char* wscale,         \
         unsigned M, unsigned N, unsigned K) {                                                \
         __shared__ bf16 lds[GM_LDS_HALVES_T(BM, BN, BK)];                                    \
@@ -248,6 +305,9 @@ GEMM_MXFP4_VARIANT(gemm_mxfp4_c3, 128, 128, 64)
 #if GM_TILE_FITS(64, 128, 64)
 GEMM_MXFP4_VARIANT(gemm_mxfp4_c4, 64, 128, 64)
 #endif
+#if GM_TILE_FITS(64, 128, 128)
+GEMM_MXFP4_VARIANT(gemm_mxfp4_e2, 64, 128, 128)
+#endif
 #if GM_TILE_FITS(192, 256, 64)
 GEMM_MXFP4_VARIANT(gemm_mxfp4_c5, 192, 256, 64)
 #endif
@@ -258,9 +318,33 @@ GEMM_MXFP4_VARIANT(gemm_mxfp4_c5, 192, 256, 64)
  * 320x128->80 384x128->96 128x384->96 192x128->48; all measured 0 AGPR / occ 2 standalone. */
 #if GM_TILE_FITS(192, 256, 64)
 GEMM_VARIANT(gemm_c5, 192, 256, 64)
+#if PLOW_GEMMA4_QO_EXACT_BENCH
+#define GEMMA4_QO_BF16_C5_EXACT(NAME, N, K)                                      \
+    extern "C" __global__ __attribute__((flatten))                              \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                    \
+        bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned, unsigned) {   \
+        __shared__ bf16 lds[GM_LDS_HALVES_T(192, 256, 64)];                       \
+        d_gemm_t<192, 256, 64, GM_WM, GM_WN, false>(                              \
+            C, A, B, nullptr, nullptr, M, N, K, blockIdx.x, gridDim.x, lds);      \
+    }
+GEMMA4_QO_BF16_C5_EXACT(gemm_g31_os_c5_exact, 5376, 8192)
+GEMMA4_QO_BF16_C5_EXACT(gemm_g31_og_c5_exact, 5376, 16384)
+#endif
 #endif
 #if GM_TILE_FITS(320, 128, 64)
 GEMM_VARIANT(gemm_c6, 320, 128, 64)
+#if PLOW_GEMMA4_QO_EXACT_BENCH
+#define GEMMA4_QO_BF16_C6_EXACT(NAME, N, K)                                      \
+    extern "C" __global__ __attribute__((flatten))                              \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                    \
+        bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned, unsigned) {   \
+        __shared__ bf16 lds[GM_LDS_HALVES_T(320, 128, 64)];                       \
+        d_gemm_t<320, 128, 64, GM_WM, GM_WN, false>(                              \
+            C, A, B, nullptr, nullptr, M, N, K, blockIdx.x, gridDim.x, lds);      \
+    }
+GEMMA4_QO_BF16_C6_EXACT(gemm_g31_os_c6_exact, 5376, 8192)
+GEMMA4_QO_BF16_C6_EXACT(gemm_g31_og_c6_exact, 5376, 16384)
+#endif
 #endif
 #if GM_TILE_FITS(384, 128, 64)
 GEMM_VARIANT(gemm_c7, 384, 128, 64)
@@ -300,6 +384,49 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
     d_gemm(C, A, B, M, N, K, blockIdx.x, gridDim.x, lds);
 }
 
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_gemm_glu_bf16(
+    bf16* C, const bf16* A, const bf16* Bg, const bf16* Bu, unsigned M, unsigned N, unsigned K,
+    unsigned act) {
+    __shared__ bf16 lds[GM_LDS_HALVES];
+    d_gemm_glu(C, A, Bg, Bu, M, N, K, act, blockIdx.x, gridDim.x, lds);
+}
+
+/* Fused GLU has two logical output halves in each MFMA tile, so its legal calibration family
+ * keeps SN == 2. On gfx942 the default entry above is C5 (192x256); C0 exceeds the 64 KiB LDS
+ * ceiling, leaving C2 as the useful alternate row tile. Do not emit a second C5 symbol: clang
+ * then shares the identical specialization through an outlined helper and adds 504 B/lane of
+ * private storage to both entries. Fusion changes CU fill and the epilogue, so the non-fused
+ * rung winner is not evidence here. Gemma-12B ABBA on MI300X selects C2 at M=2048, keeps C2 as
+ * the M=4096 production candidate, and retains C5 at M=8192; a serving A/B is still required. */
+#define GEMM_GLU_VARIANT(NAME, BM, BN, BK)                                             \
+    extern "C" __global__ __attribute__((flatten))                                    \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                         \
+        bf16* C, const bf16* A, const bf16* Bg, const bf16* Bu, unsigned M, unsigned N, \
+        unsigned K, unsigned act) {                                                     \
+        __shared__ bf16 lds[GM_LDS_HALVES_T(BM, BN, BK)];                              \
+        d_gemm_t<BM, BN, BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true,   \
+                 true>(C, A, Bg, nullptr, nullptr, M, N, K, blockIdx.x, gridDim.x, lds, \
+                       Bu, act);                                                        \
+    }
+
+#if GM_TILE_FITS(128, 256, 64)
+GEMM_GLU_VARIANT(gemma_gemm_glu_bf16_c2, 128, 256, 64)
+#endif
+
+__device__ __attribute__((noinline)) void d_gemm_glu_outlined_probe(
+    bf16* C, const bf16* A, const bf16* Bg, const bf16* Bu, unsigned M, unsigned N, unsigned K,
+    unsigned act, unsigned slice, unsigned nblk, bf16* lds) {
+    d_gemm_glu(C, A, Bg, Bu, M, N, K, act, slice, nblk, lds);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void gemma_gemm_glu_bf16_outlined(bf16* C, const bf16* A, const bf16* Bg, const bf16* Bu,
+                                  unsigned M, unsigned N, unsigned K, unsigned act) {
+    __shared__ bf16 lds[GM_LDS_HALVES];
+    d_gemm_glu_outlined_probe(C, A, Bg, Bu, M, N, K, act, blockIdx.x, gridDim.x, lds);
+}
+
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_gemm_norm_bf16(
     bf16* C, const bf16* A, const bf16* B, const float* rms, const bf16* gamma, unsigned M,
     unsigned N, unsigned K) {
@@ -326,8 +453,8 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
  * absmax/round path that produces it. (The GEMM itself is already covered by gemm_fp8_c0, whose
  * 256/256/64 tile is the one the interpreter carries.) */
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_quant_fp8_k(
-    unsigned char* xq, bf16* x, float* ascale, unsigned M, unsigned K) {
-    d_quant_fp8(xq, x, ascale, M, K, blockIdx.x, gridDim.x);
+    unsigned char* xq, bf16* x, float* ascale, unsigned M, unsigned K, unsigned nblk) {
+    d_quant_fp8(xq, x, ascale, M, K, blockIdx.x, nblk);
 }
 
 /* MXFP4 (OCP microscaling e2m1 + one E8M0 scale per 32 K) decode GEMV, w4a16.

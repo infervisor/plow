@@ -172,6 +172,7 @@ pub(crate) fn synthesize(
     blob: &DevBlob,
     physical_batch: usize,
     wide_tiles: bool,
+    terminal_gather: bool,
 ) -> Result<SynthesizedMixed> {
     if blob.tp.is_some()
         || physical_batch < 2
@@ -264,13 +265,16 @@ pub(crate) fn synthesize(
         );
     }
     let next = u16::try_from(blob.tensors.len()).map_err(|_| reject("tensor handle overflow"))?;
-    if next > TENSOR_NONE16 - 3 {
+    let extra = if terminal_gather { 5 } else { 3 };
+    if next > TENSOR_NONE16 - extra {
         return Err(reject("tensor handle overflow"));
     }
     let decode_slot = next;
     let pf_partial = next + 1;
     let pf_ml = next + 2;
-    for (handle, name, size) in [
+    let sample_row = terminal_gather.then_some(next + 3);
+    let selected_x = terminal_gather.then_some(next + 4);
+    let mut runtime_tensors = vec![
         (
             decode_slot,
             plow_asset::mixed_step::DECODE_SLOT_TENSOR,
@@ -278,7 +282,18 @@ pub(crate) fn synthesize(
         ),
         (pf_partial, "act.mixed_prefill_opart", 4),
         (pf_ml, "act.mixed_prefill_mlpart", 4),
-    ] {
+    ];
+    if let (Some(rows), Some(selected)) = (sample_row, selected_x) {
+        runtime_tensors.extend([
+            (
+                rows,
+                plow_asset::mixed_step::SAMPLE_ROW_TENSOR,
+                bytes(&[physical_batch as u32, 4])?,
+            ),
+            (selected, "act.token_batch.selected_x", 4),
+        ]);
+    }
+    for (handle, name, size) in runtime_tensors {
         if blob.tensors.iter().any(|t| t.name == name) {
             return Err(reject("runtime tensor name already exists"));
         }
@@ -300,10 +315,43 @@ pub(crate) fn synthesize(
         let dcap = (physical_batch as u32 - 1).min(source.t - 1);
         let mut instructions = Vec::new();
         let mut paired = BTreeSet::new();
+        let mut gathered_tail = false;
         let mut index = 0;
         while index < source.insts.len() {
             let mut inst = source.insts[index];
             let code = op(&inst)?;
+            let gather_final_norm = terminal_gather
+                && code == DevOp::RmsNorm
+                && source.insts.get(index + 1).is_some_and(|head| {
+                    head.op == DevOp::Gemv as u16
+                        && head.t[1] == inst.t[0]
+                        && head.i[0] == 1
+                        && head.i[4] == source.t - 1
+                });
+            if gather_final_norm {
+                if gathered_tail || inst.i[0] != source.t || inst.i[1] == 0 {
+                    return Err(reject("unsupported terminal RMSNorm"));
+                }
+                let selected = selected_x.expect("terminal gather handles allocated");
+                let mut gather = DevInst64 {
+                    op: DevOp::RowGather as u16,
+                    t: [TENSOR_NONE16; 8],
+                    ..Default::default()
+                };
+                gather.t[..3].copy_from_slice(&[
+                    selected,
+                    inst.t[1],
+                    sample_row.expect("terminal gather handles allocated"),
+                ]);
+                gather.i[..3].copy_from_slice(&[dcap, inst.i[1], source.t]);
+                let selected_bytes = bytes(&[dcap, inst.i[1], 2])?;
+                let selected_spec = specs.get_mut(&selected).expect("selected tensor registered");
+                selected_spec.bytes = selected_spec.bytes.max(selected_bytes);
+                instructions.push(gather);
+                inst.t[1] = selected;
+                inst.i[0] = dcap;
+                gathered_tail = true;
+            }
             if gemm(code)
                 && source
                     .insts
@@ -346,7 +394,7 @@ pub(crate) fn synthesize(
                 | DevOp::GemmGlu
                 | DevOp::GemmGluFp8
                 | DevOp::QuantFp8 => {
-                    if inst.i[0] != source.t {
+                    if inst.i[0] != source.t && !gather_final_norm {
                         return Err(reject("body row count mismatch"));
                     }
                 }
@@ -497,6 +545,9 @@ pub(crate) fn synthesize(
         }
         if paired.len() != attention.len() {
             return Err(reject("prefill/decode layer count mismatch"));
+        }
+        if terminal_gather && !gathered_tail {
+            return Err(reject("no terminal RMSNorm/GEMV tail"));
         }
         let mut builder = Builder::new(blob.n_cu);
         builder.force_uniseg();

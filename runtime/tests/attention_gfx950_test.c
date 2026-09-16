@@ -6,6 +6,12 @@
  *   prefill hd=512, GQA 8:1, full causal          <- the global layers
  *   decode  hd=256 / hd=512, split-KV + merge
  *
+ * PLOW_ATTN_BENCH=1 skips the CPU oracle and times the isolated prefill wrapper. Select the
+ * rung with PLOW_ATTN_HD, PLOW_ATTN_NQ, PLOW_ATTN_HEADS, PLOW_ATTN_KV_HEADS,
+ * PLOW_ATTN_WINDOW, PLOW_ATTN_NSPLIT, PLOW_ATTN_THREADS, PLOW_ATTN_WARMUP, and
+ * PLOW_ATTN_ITERS. PLOW_ATTN_OBJECT and PLOW_ATTN_SYMBOL can select a standalone candidate.
+ * The default is Gemma HD512 at 2048 rows and eight KV splits.
+ *
  * The reference is written from HF `modeling_gemma4.py` semantics, not from the
  * kernel: scale = 1.0 (there is NO 1/sqrt(head_dim)), causal is kv <= q, and the
  * sliding window is INCLUSIVE of the current token (0 <= q-kv <= window-1).
@@ -17,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef unsigned short bf16;
 static float bf2f(bf16 b) { unsigned u = (unsigned)b << 16; float f; memcpy(&f, &u, 4); return f; }
@@ -106,7 +113,222 @@ static void check(const char* what, const bf16* got, const float* want, size_t n
 }
 
 static plow_hsa* H;
+static unsigned wg_threads = PLOW_WG_THREADS;
 static void* dev(size_t b) { return plow_hsa_alloc(H, 0, b); }
+
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static unsigned env_u32(const char* name, unsigned fallback) {
+    const char* value = getenv(name);
+    return value ? (unsigned)strtoul(value, NULL, 10) : fallback;
+}
+
+static int bench_prefill(plow_hsa_kernel* k, const char* symbol, unsigned ncu, unsigned hd,
+                         unsigned n_q,
+                         unsigned n_head, unsigned n_kv_head, unsigned window,
+                         unsigned nsplit, unsigned warmup, unsigned iters) {
+    if (!n_q || !n_head || !n_kv_head || n_head % n_kv_head || !nsplit || !iters) return 2;
+    const unsigned n_kv = n_q;
+    const size_t nq = (size_t)n_q * n_head * hd;
+    const size_t nkv = (size_t)n_kv * n_kv_head * hd;
+    bf16* hQ = plow_hsa_alloc_host(H, nq * 2);
+    bf16* hK = plow_hsa_alloc_host(H, nkv * 2);
+    bf16* hV = plow_hsa_alloc_host(H, nkv * 2);
+    if (!hQ || !hK || !hV) return 1;
+    for (size_t i = 0; i < nq; i++) hQ[i] = f2bf((float)(i % 31) * 0.001f);
+    for (size_t i = 0; i < nkv; i++) {
+        hK[i] = f2bf((float)(i % 29) * 0.001f);
+        hV[i] = f2bf((float)(i % 23) * 0.01f);
+    }
+    void *dQ = dev(nq * 2), *dK = dev(nkv * 2), *dV = dev(nkv * 2);
+    void* dOp = dev((size_t)n_q * n_head * nsplit * hd * sizeof(float));
+    void* dMl = dev((size_t)n_q * n_head * nsplit * 2 * sizeof(float));
+    if (!dQ || !dK || !dV || !dOp || !dMl) return 1;
+    plow_hsa_copy_h2d(H, 0, dQ, hQ, nq * 2);
+    plow_hsa_copy_h2d(H, 0, dK, hK, nkv * 2);
+    plow_hsa_copy_h2d(H, 0, dV, hV, nkv * 2);
+    struct __attribute__((packed)) {
+        void *op, *ml; const void *q, *k, *v;
+        unsigned n_q, n_kv, n_head, n_kv_head, q_pos0, window; float scale; unsigned nsplit;
+    } a = {dOp, dMl, dQ, dK, dV, n_q, n_kv, n_head, n_kv_head, 0, window, 1.0f, nsplit};
+
+    for (unsigned i = 0; i < warmup; i++) {
+        if (plow_hsa_launch(H, 0, k, ncu * wg_threads, 1, 1, wg_threads, 1, 1, 0,
+                            &a, sizeof(a)) != 0) return 1;
+        plow_hsa_wait(H, 0);
+    }
+    const uint64_t begin = now_ns();
+    for (unsigned i = 0; i < iters; i++) {
+        if (plow_hsa_launch(H, 0, k, ncu * wg_threads, 1, 1, wg_threads, 1, 1, 0,
+                            &a, sizeof(a)) != 0) return 1;
+        plow_hsa_wait(H, 0);
+    }
+    const double ms = (double)(now_ns() - begin) / 1.0e6 / iters;
+    printf("BENCH symbol=%s hd=%u nq=%u heads=%u kv_heads=%u window=%u nsplit=%u "
+           "iters=%u ms=%.6f\n",
+           symbol, hd, n_q, n_head, n_kv_head, window, nsplit, iters, ms);
+    plow_hsa_free(H, dQ); plow_hsa_free(H, dK); plow_hsa_free(H, dV);
+    plow_hsa_free(H, dOp); plow_hsa_free(H, dMl);
+    return 0;
+}
+
+static int bench_prefill_fused(plow_hsa_kernel* k, const char* symbol, unsigned ncu, unsigned hd,
+                               unsigned n_q, unsigned n_head, unsigned n_kv_head,
+                               unsigned window, unsigned warmup, unsigned iters) {
+    if (!n_q || !n_head || !n_kv_head || n_head % n_kv_head || !iters) return 2;
+    const unsigned n_kv = n_q;
+    const unsigned kv_stride = env_u32("PLOW_ATTN_KV_STRIDE", n_kv);
+    const unsigned kv_mask = env_u32("PLOW_ATTN_KV_MASK", UINT32_MAX);
+    const size_t nq = (size_t)n_q * n_head * hd;
+    const size_t nkv = (size_t)kv_stride * n_kv_head * hd;
+    bf16* hQ = plow_hsa_alloc_host(H, nq * 2);
+    bf16* hK = plow_hsa_alloc_host(H, nkv * 2);
+    bf16* hV = plow_hsa_alloc_host(H, nkv * 2);
+    if (!hQ || !hK || !hV) return 1;
+    for (size_t i = 0; i < nq; i++) hQ[i] = f2bf((float)(i % 31) * 0.001f);
+    for (size_t i = 0; i < nkv; i++) {
+        hK[i] = f2bf((float)(i % 29) * 0.001f);
+        hV[i] = f2bf((float)(i % 23) * 0.01f);
+    }
+    void *dQ = dev(nq * 2), *dK = dev(nkv * 2), *dV = dev(nkv * 2), *dO = dev(nq * 2);
+    if (!dQ || !dK || !dV || !dO) return 1;
+    plow_hsa_copy_h2d(H, 0, dQ, hQ, nq * 2);
+    plow_hsa_copy_h2d(H, 0, dK, hK, nkv * 2);
+    plow_hsa_copy_h2d(H, 0, dV, hV, nkv * 2);
+    struct {
+        void* o; const void *q, *k, *v;
+        unsigned n_q, n_kv, n_head, n_kv_head, q_pos0, window;
+        float scale; unsigned kv_stride, kv_mask, pad;
+    } a = {dO, dQ, dK, dV, n_q, n_kv, n_head, n_kv_head, 0, window,
+           1.0f, kv_stride, kv_mask, 0};
+
+    for (unsigned i = 0; i < warmup; i++) {
+        if (plow_hsa_launch(H, 0, k, ncu * wg_threads, 1, 1, wg_threads, 1, 1, 0,
+                            &a, sizeof(a)) != 0) return 1;
+        plow_hsa_wait(H, 0);
+    }
+    const uint64_t begin = now_ns();
+    for (unsigned i = 0; i < iters; i++) {
+        if (plow_hsa_launch(H, 0, k, ncu * wg_threads, 1, 1, wg_threads, 1, 1, 0,
+                            &a, sizeof(a)) != 0) return 1;
+        plow_hsa_wait(H, 0);
+    }
+    const double ms = (double)(now_ns() - begin) / 1.0e6 / iters;
+    printf("BENCH symbol=%s hd=%u nq=%u heads=%u kv_heads=%u window=%u nsplit=1 "
+           "kv_stride=%u kv_mask=%u iters=%u ms=%.6f\n",
+           symbol, hd, n_q, n_head, n_kv_head, window, kv_stride, kv_mask, iters, ms);
+    plow_hsa_free(H, dQ); plow_hsa_free(H, dK); plow_hsa_free(H, dV); plow_hsa_free(H, dO);
+    return 0;
+}
+
+static void prefill_case_fused(plow_hsa_kernel* k, unsigned ncu, const char* label, unsigned hd,
+                               unsigned n_q, unsigned n_head, unsigned n_kv_head,
+                               unsigned window) {
+    const unsigned q_pos0 = env_u32("PLOW_ATTN_Q_POS0", 0);
+    const unsigned n_kv = q_pos0 + n_q;
+    const unsigned kv_stride = env_u32("PLOW_ATTN_KV_STRIDE", n_kv);
+    const unsigned kv_mask = env_u32("PLOW_ATTN_KV_MASK", UINT32_MAX);
+    if (n_kv < q_pos0 || kv_stride < n_kv) { fails++; return; }
+    const size_t nq = (size_t)n_q * n_head * hd;
+    const size_t nkv = (size_t)kv_stride * n_kv_head * hd;
+    bf16* hQ = plow_hsa_alloc_host(H, nq * 2);
+    bf16* hK = plow_hsa_alloc_host(H, nkv * 2);
+    bf16* hV = plow_hsa_alloc_host(H, nkv * 2);
+    bf16* hO = plow_hsa_alloc_host(H, nq * 2);
+    for (size_t i = 0; i < nq; i++) hQ[i] = f2bf(frand() * 0.15f);
+    for (size_t i = 0; i < nkv; i++) { hK[i] = f2bf(frand() * 0.15f); hV[i] = f2bf(frand()); }
+    void *dQ = dev(nq * 2), *dK = dev(nkv * 2), *dV = dev(nkv * 2), *dO = dev(nq * 2);
+    plow_hsa_copy_h2d(H, 0, dQ, hQ, nq * 2);
+    plow_hsa_copy_h2d(H, 0, dK, hK, nkv * 2);
+    plow_hsa_copy_h2d(H, 0, dV, hV, nkv * 2);
+    struct {
+        void* o; const void *q, *k, *v;
+        unsigned n_q, n_kv, n_head, n_kv_head, q_pos0, window;
+        float scale; unsigned kv_stride, kv_mask, pad;
+    } a = {dO, dQ, dK, dV, n_q, n_kv, n_head, n_kv_head, q_pos0, window,
+           1.0f, kv_stride, kv_mask, 0};
+    if (plow_hsa_launch(H, 0, k, ncu * wg_threads, 1, 1, wg_threads, 1, 1, 0,
+                        &a, sizeof(a)) != 0) {
+        fprintf(stderr, "fused launch: %s\n", plow_hsa_last_error()); fails++; return;
+    }
+    plow_hsa_wait(H, 0);
+    plow_hsa_copy_d2h(H, 0, hO, dO, nq * 2);
+    float* want = malloc(nq * sizeof(float));
+    ref_attn(want, hQ, hK, hV, n_q, n_kv, n_head, n_kv_head, hd, q_pos0,
+             window, 1.0f, NULL);
+    check(label, hO, want, nq);
+    free(want);
+    plow_hsa_free(H, dQ); plow_hsa_free(H, dK); plow_hsa_free(H, dV); plow_hsa_free(H, dO);
+}
+
+static void prefill_case_packed(plow_hsa_kernel* k, unsigned ncu, const char* label, unsigned hd,
+                                unsigned n_q, unsigned n_head, unsigned n_kv_head,
+                                unsigned window) {
+    if (n_q < 4) { fails++; return; }
+    const unsigned n_spans = getenv("PLOW_ATTN_PACKED_ONE") ? 1 : 2;
+    const unsigned n0 = n_spans == 1 ? n_q : n_q / 2;
+    const unsigned n1 = n_q - n0, prior = 7;
+    const unsigned kv_stride = n0 > prior + n1 ? n0 : prior + n1;
+    const size_t nq = (size_t)n_q * n_head * hd;
+    const size_t slot_elems = (size_t)n_kv_head * kv_stride * hd;
+    bf16* hQ = plow_hsa_alloc_host(H, nq * 2);
+    bf16* hK = plow_hsa_alloc_host(H, 2 * slot_elems * 2);
+    bf16* hV = plow_hsa_alloc_host(H, 2 * slot_elems * 2);
+    bf16* hO = plow_hsa_alloc_host(H, nq * 2);
+    for (size_t i = 0; i < nq; i++) hQ[i] = f2bf(frand() * 0.15f);
+    for (size_t i = 0; i < 2 * slot_elems; i++) {
+        hK[i] = f2bf(frand() * 0.15f);
+        hV[i] = f2bf(frand());
+    }
+    PlowPrefillSpan spans[2] = {
+        {0, n0, 0, PLOW_PREFILL_SPAN_RESET_STATE, 0, n0, 0, 0},
+        {n0, n1, 1, 0, prior, prior + n1, 1, 0},
+    };
+    void *dQ = dev(nq * 2), *dK = dev(2 * slot_elems * 2),
+         *dV = dev(2 * slot_elems * 2), *dO = dev(nq * 2), *dS = dev(sizeof(spans));
+    plow_hsa_copy_h2d(H, 0, dQ, hQ, nq * 2);
+    plow_hsa_copy_h2d(H, 0, dK, hK, 2 * slot_elems * 2);
+    plow_hsa_copy_h2d(H, 0, dV, hV, 2 * slot_elems * 2);
+    plow_hsa_upload(H, 0, dS, spans, sizeof(spans));
+    struct {
+        void* o; const void *q, *k, *v, *spans;
+        unsigned n_spans, n_head, n_kv_head, window;
+        float scale; unsigned kv_stride, kv_mask, pad;
+    } a = {dO, dQ, dK, dV, dS, n_spans, n_head, n_kv_head, window,
+           1.0f, kv_stride, UINT32_MAX, 0};
+    if (plow_hsa_launch(H, 0, k, ncu * wg_threads, 1, 1, wg_threads, 1, 1, 0,
+                        &a, sizeof(a)) != 0) {
+        fprintf(stderr, "packed fused launch: %s\n", plow_hsa_last_error()); fails++; return;
+    }
+    plow_hsa_wait(H, 0);
+    plow_hsa_copy_d2h(H, 0, hO, dO, nq * 2);
+    float* want = calloc(nq, sizeof(float));
+    bf16* compact_k = malloc(slot_elems * 2);
+    bf16* compact_v = malloc(slot_elems * 2);
+    for (unsigned si = 0; si < n_spans; si++) {
+        const PlowPrefillSpan* s = &spans[si];
+        for (unsigned h = 0; h < n_kv_head; h++) {
+            const bf16* src_k = hK + ((size_t)si * n_kv_head + h) * kv_stride * hd;
+            const bf16* src_v = hV + ((size_t)si * n_kv_head + h) * kv_stride * hd;
+            memcpy(compact_k + (size_t)h * s->kv_len * hd, src_k,
+                   (size_t)s->kv_len * hd * 2);
+            memcpy(compact_v + (size_t)h * s->kv_len * hd, src_v,
+                   (size_t)s->kv_len * hd * 2);
+        }
+        ref_attn(want + (size_t)s->row0 * n_head * hd,
+                 hQ + (size_t)s->row0 * n_head * hd, compact_k, compact_v,
+                 s->n_rows, s->kv_len, n_head, n_kv_head, hd, s->kv_row0,
+                 window, 1.0f, NULL);
+    }
+    check(label, hO, want, nq);
+    free(compact_k); free(compact_v); free(want);
+    plow_hsa_free(H, dQ); plow_hsa_free(H, dK); plow_hsa_free(H, dV);
+    plow_hsa_free(H, dO); plow_hsa_free(H, dS);
+}
 
 /* `sink_mag` != 0 runs the ATTENTION-SINK merge: per-head sinks are drawn in
  * [-sink_mag, +sink_mag] and `mk` must be a *_sinks merge kernel (four pointers, not three). */
@@ -144,7 +366,8 @@ static void prefill_case_s(plow_hsa_kernel* k, plow_hsa_kernel* mk, unsigned NCU
         unsigned n_q, n_kv, n_head, n_kv_head, q_pos0, window; float scale; unsigned nsplit;
     } a = {dOp, dMl, dQ, dK, dV, n_q, n_kv, n_head, n_kv_head, 0, window, SCALE, nsplit};
 
-    if (plow_hsa_launch(H, 0, k, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0, &a, sizeof(a)) != 0) {
+    if (plow_hsa_launch(H, 0, k, NCU * wg_threads, 1, 1, wg_threads, 1, 1, 0, &a,
+                        sizeof(a)) != 0) {
         fprintf(stderr, "launch: %s\n", plow_hsa_last_error()); fails++; return;
     }
     plow_hsa_wait(H, 0);
@@ -157,7 +380,7 @@ static void prefill_case_s(plow_hsa_kernel* k, plow_hsa_kernel* mk, unsigned NCU
     } ms = {dO, dOp, dMl, dS, n_q, n_head, nsplit};
     const void* marg = hS ? (const void*)&ms : (const void*)&m;
     const size_t msz = hS ? sizeof(ms) : sizeof(m);
-    if (plow_hsa_launch(H, 0, mk, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0,
+    if (plow_hsa_launch(H, 0, mk, NCU * wg_threads, 1, 1, wg_threads, 1, 1, 0,
                         (void*)marg, msz) != 0) {
         fprintf(stderr, "merge launch: %s\n", plow_hsa_last_error()); fails++; return;
     }
@@ -171,7 +394,7 @@ static void prefill_case_s(plow_hsa_kernel* k, plow_hsa_kernel* mk, unsigned NCU
      * sink reference, or a no-op `sinks` argument would pass every case above. */
     if (hS) {
         ms.sinks = NULL;
-        plow_hsa_launch(H, 0, mk, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0,
+        plow_hsa_launch(H, 0, mk, NCU * wg_threads, 1, 1, wg_threads, 1, 1, 0,
                         &ms, sizeof(ms));
         plow_hsa_wait(H, 0);
         plow_hsa_copy_d2h(H, 0, hO, dO, nq * 2);
@@ -226,7 +449,7 @@ static void decode_case_s(plow_hsa_kernel* kd, plow_hsa_kernel* km, unsigned NCU
         void* op; void* ml; const void* q; const void* k; const void* v; const void* len;
         unsigned n_batch, n_head, n_kv_head, kv_stride, window; float scale; unsigned nsplit;
     } a = {dOp, dMl, dQ, dK, dV, dLen, B, n_head, n_kv_head, n_kv, window, SCALE, nsplit};
-    plow_hsa_launch(H, 0, kd, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0, &a, sizeof(a));
+    plow_hsa_launch(H, 0, kd, NCU * wg_threads, 1, 1, wg_threads, 1, 1, 0, &a, sizeof(a));
 
     struct __attribute__((packed)) {
         void* o; const void* op; const void* ml; unsigned n_batch, n_head, nsplit;
@@ -235,10 +458,10 @@ static void decode_case_s(plow_hsa_kernel* kd, plow_hsa_kernel* km, unsigned NCU
         void* o; const void *op, *ml, *sinks; unsigned n_batch, n_head, nsplit;
     } ms = {dO, dOp, dMl, dS, B, n_head, nsplit};
     if (hS)
-        plow_hsa_launch(H, 0, km, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0, &ms,
+        plow_hsa_launch(H, 0, km, NCU * wg_threads, 1, 1, wg_threads, 1, 1, 0, &ms,
                         sizeof(ms));
     else
-        plow_hsa_launch(H, 0, km, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0, &m,
+        plow_hsa_launch(H, 0, km, NCU * wg_threads, 1, 1, wg_threads, 1, 1, 0, &m,
                         sizeof(m));
     plow_hsa_wait(H, 0);
     plow_hsa_copy_d2h(H, 0, hO, dO, nq * 2);
@@ -260,20 +483,118 @@ static void decode_case(plow_hsa_kernel* kd, plow_hsa_kernel* km, unsigned NCU,
 }
 
 int main(void) {
+    wg_threads = env_u32("PLOW_ATTN_THREADS", PLOW_WG_THREADS);
+    if (!wg_threads || wg_threads > 1024 || wg_threads % 64) {
+        fprintf(stderr, "invalid PLOW_ATTN_THREADS=%u\n", wg_threads);
+        return 2;
+    }
     H = plow_hsa_init();
     if (!H) { fprintf(stderr, "%s\n", plow_hsa_last_error()); return 1; }
     char nm[64]; uint32_t cus = 0, lds = 0;
     plow_hsa_device_info(H, 0, nm, &cus, &lds);
     printf("dev0: %s  CUs=%u  LDS=%u B\n\n", nm, cus, lds);
 
-    FILE* f = fopen("test_kernels.elf", "rb");
-    if (!f) { perror("test_kernels.elf"); return 1; }
+    const char* object = getenv("PLOW_ATTN_OBJECT");
+    if (!object) object = "test_kernels.elf";
+    FILE* f = fopen(object, "rb");
+    if (!f) { perror(object); return 1; }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     void* co = malloc(n);
     if (fread(co, 1, n, f) != (size_t)n) return 1;
     fclose(f);
     if (plow_hsa_load_code_object(H, 0, co, n) != 0) {
         fprintf(stderr, "load: %s\n", plow_hsa_last_error()); return 1;
+    }
+
+    if (getenv("PLOW_ATTN_BENCH")) {
+        const unsigned hd = env_u32("PLOW_ATTN_HD", 512);
+        const unsigned n_q = env_u32("PLOW_ATTN_NQ", 2048);
+        const unsigned n_head = env_u32("PLOW_ATTN_HEADS", 8);
+        const unsigned n_kv_head = env_u32("PLOW_ATTN_KV_HEADS", hd == 512 ? 1 : 4);
+        const unsigned window = env_u32("PLOW_ATTN_WINDOW", hd == 512 ? 0 : 1024);
+        const unsigned nsplit = env_u32("PLOW_ATTN_NSPLIT", 8);
+        const unsigned warmup = env_u32("PLOW_ATTN_WARMUP", 3);
+        const unsigned iters = env_u32("PLOW_ATTN_ITERS", 10);
+        const char* symbol = getenv("PLOW_ATTN_SYMBOL");
+        if (!symbol)
+            symbol = hd == 256 ? "gemma_flash_prefill_256"
+                     : hd == 512 ? "gemma_flash_prefill_512"
+                                 : NULL;
+        plow_hsa_kernel kernel;
+        if (!symbol || plow_hsa_get_kernel(H, 0, symbol, &kernel)) {
+            fprintf(stderr, "unsupported bench hd=%u: %s\n", hd, plow_hsa_last_error());
+            return 2;
+        }
+        const int rc = getenv("PLOW_ATTN_FUSED")
+                           ? bench_prefill_fused(&kernel, symbol, cus, hd, n_q, n_head,
+                                                 n_kv_head, window, warmup, iters)
+                           : bench_prefill(&kernel, symbol, cus, hd, n_q, n_head, n_kv_head,
+                                           window, nsplit, warmup, iters);
+        plow_hsa_shutdown(H);
+        return rc;
+    }
+
+    if (getenv("PLOW_ATTN_CHECK")) {
+        const unsigned hd = env_u32("PLOW_ATTN_HD", 512);
+        const unsigned n_q = env_u32("PLOW_ATTN_NQ", 300);
+        const unsigned n_head = env_u32("PLOW_ATTN_HEADS", 8);
+        const unsigned n_kv_head = env_u32("PLOW_ATTN_KV_HEADS", hd == 512 ? 1 : 4);
+        const unsigned window = env_u32("PLOW_ATTN_WINDOW", hd == 512 ? 0 : 1024);
+        char prefill_symbol[64], merge_symbol[64], label[96];
+        if (!n_q || !n_head || !n_kv_head || n_head % n_kv_head) {
+            fprintf(stderr, "invalid check geometry: n_q=%u heads=%u kv_heads=%u\n", n_q,
+                    n_head, n_kv_head);
+            return 2;
+        }
+        const char* selected = getenv("PLOW_ATTN_SYMBOL");
+        if (selected)
+            snprintf(prefill_symbol, sizeof(prefill_symbol), "%s", selected);
+        else
+            snprintf(prefill_symbol, sizeof(prefill_symbol), "gemma_flash_prefill_%u", hd);
+        if (getenv("PLOW_ATTN_PACKED")) {
+            plow_hsa_kernel prefill;
+            if ((hd != 256 && hd != 512) ||
+                plow_hsa_get_kernel(H, 0, prefill_symbol, &prefill)) {
+                fprintf(stderr, "unsupported packed check hd=%u: %s\n", hd,
+                        plow_hsa_last_error());
+                return 2;
+            }
+            srand(13);
+            snprintf(label, sizeof(label), "packed hd=%u n_q=%u window=%u", hd, n_q, window);
+            prefill_case_packed(&prefill, cus, label, hd, n_q, n_head, n_kv_head, window);
+            plow_hsa_shutdown(H);
+            return fails ? 1 : 0;
+        }
+        if (getenv("PLOW_ATTN_FUSED")) {
+            plow_hsa_kernel prefill;
+            if ((hd != 256 && hd != 512) ||
+                plow_hsa_get_kernel(H, 0, prefill_symbol, &prefill)) {
+                fprintf(stderr, "unsupported fused check hd=%u: %s\n", hd,
+                        plow_hsa_last_error());
+                return 2;
+            }
+            srand(13);
+            snprintf(label, sizeof(label), "fused hd=%u n_q=%u window=%u", hd, n_q, window);
+            prefill_case_fused(&prefill, cus, label, hd, n_q, n_head, n_kv_head, window);
+            plow_hsa_shutdown(H);
+            return fails ? 1 : 0;
+        }
+        snprintf(merge_symbol, sizeof(merge_symbol), "gemma_flash_merge_%u", hd);
+        plow_hsa_kernel prefill, merge;
+        if ((hd != 256 && hd != 512) ||
+            plow_hsa_get_kernel(H, 0, prefill_symbol, &prefill) ||
+            plow_hsa_get_kernel(H, 0, merge_symbol, &merge)) {
+            fprintf(stderr, "unsupported check hd=%u: %s\n", hd, plow_hsa_last_error());
+            return 2;
+        }
+        for (unsigned nsplit = 1; nsplit <= 8; nsplit *= 2) {
+            snprintf(label, sizeof(label), "hd=%u n_q=%u window=%u nsplit=%u", hd, n_q,
+                     window, nsplit);
+            prefill_case(&prefill, &merge, cus, label, hd, n_q, n_q, n_head, n_kv_head,
+                         window, nsplit);
+        }
+        plow_hsa_shutdown(H);
+        return fails ? 1 : 0;
     }
 
     plow_hsa_kernel p128, m128;

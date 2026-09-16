@@ -1587,6 +1587,8 @@ typedef struct {
 /* One request span in a ragged prefill pack. This is metadata only until a
  * PlowProgram points at a span table; old objects therefore retain their ABI. */
 #define PLOW_PREFILL_SPAN_RESET_STATE 1u
+#define PLOW_PREFILL_SPAN_DECODE 2u
+#define PLOW_PREFILL_SPAN_SAMPLE 4u
 typedef struct {
     uint32_t row0;       /* first row in packed activation tensors */
     uint32_t n_rows;     /* real rows in this request span */

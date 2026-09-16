@@ -38,8 +38,8 @@ pub mod sample;
 pub mod store;
 
 pub use gemm::{
-    amd_tuning_cell, gemm_op_case, gemm_rung_emit_plan, gemm_rung_opcode, GemmEmitPlan,
-    GEMM_ORACLE, GEMM_WIDE_C8_MEASUREMENT_ID, GFX950_CELL,
+    amd_tuning_cell, gemm_op_case, gemm_oracle, gemm_rung_emit_plan, gemm_rung_opcode,
+    GemmEmitPlan, GEMM_ORACLE, GEMM_WIDE_C8_MEASUREMENT_ID, GFX942_GEMM_ORACLE, GFX950_CELL,
 };
 pub use gemv::{gemv_case, gemv_op_case, gemv_sample_bucket, gemv_sample_opcode, GEMV_ORACLE};
 

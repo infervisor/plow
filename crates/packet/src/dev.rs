@@ -1846,7 +1846,8 @@ pub enum DevOp {
     /// groups and combines routed experts in BF16. Mode 0 converts the result to FP32.
     /// This is a separate numerical contract from the FP64 grouped-down path.
     /// `t0=out t1=x t2=weights t3=scales t4=meta_or_raw_routes t5=row_token t6=row_part t7=row_gate` ·
-    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile i6=mode i7=resident_weights`. Requires an isolated native segment.
+    /// `i0=T i1=H i2=I i3=E i4=topk i5=align_tile i6=mode i7=resident_weights` ·
+    /// `j0=align_table j1=align_npart`. Requires an isolated native segment.
     /// `i6=1`: flat A16 decode, BF16 output plus eight scratch bytes, raw routing in t4,
     /// t5..t7 absent and i5=0. Combine as one BF16 partial (MoeCombinePf.i7=1).
     /// `i6=2`: sorted A8 prefill with direct BF16 output; combine as one BF16 partial.
@@ -2802,7 +2803,7 @@ pub struct PrefillSpan {
     pub n_rows: u32,
     /// Decode/KV slot that owns the request.
     pub slot: u32,
-    /// [`PREFILL_SPAN_RESET_STATE`] when this is the request's first span.
+    /// Bitset of `PREFILL_SPAN_*` values.
     pub flags: u32,
     /// Request-local absolute KV row of `row0`.
     pub kv_row0: u32,
@@ -2815,6 +2816,11 @@ pub struct PrefillSpan {
 }
 
 pub const PREFILL_SPAN_RESET_STATE: u32 = 1;
+/// This span is a decode input and must use decode attention.
+pub const PREFILL_SPAN_DECODE: u32 = 1 << 1;
+/// This span produces one next-token distribution. Completing prefills may contain many rows;
+/// their terminal row is selected by the token-batch sample-row table.
+pub const PREFILL_SPAN_SAMPLE: u32 = 1 << 2;
 
 /// [`TokenBatch::version`] this build implements. A descriptor carrying anything else is
 /// refused at load; it is not reinterpreted.

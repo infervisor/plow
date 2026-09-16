@@ -29,6 +29,184 @@
   "-> checks. _arch is asserted against each object's ELF header before any rule runs."
  ],
  "_arch": "gfx942",
+ "gemma4_gemm_glu_gfx942": {
+  "plow_gemma4_gemm_glu_c2_gfx942": {
+   "mfma_min": 32,
+   "burst_min": 7,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
+  "plow_gemma4_12b_gemm_glu_c5_gfx942": {
+   "mfma_min": 48,
+   "burst_min": 12,
+   "stalled_max": 7,
+   "require_min": {"v_mfma_f32_32x32x8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
+  "plow_gemma4_31b_gemm_glu_c5_gfx942": {
+   "mfma_min": 48,
+   "burst_min": 12,
+   "stalled_max": 7,
+   "require_min": {"v_mfma_f32_32x32x8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
+  "gemm_glu_fp8_c2_gfx942": {
+   "mfma_min": 32,
+   "burst_min": 12,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x16_fp8_fp8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x16_bf16"]
+  },
+  "gemm_glu_fp8_c5_gfx942": {
+   "mfma_min": 48,
+   "burst_min": 12,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x16_fp8_fp8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x16_bf16"]
+  },
+  "down_c2_gfx942": {
+   "mfma_min": 32,
+   "burst_min": 7,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x8_bf16": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
+  "output_s_c2_gfx942": {
+   "mfma_min": 32,
+   "burst_min": 7,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x8_bf16": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
+  "output_g_c2_gfx942": {
+   "mfma_min": 32,
+   "burst_min": 7,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x8_bf16": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
+  "output_s_c5_gfx942": {
+   "mfma_min": 48,
+   "burst_min": 11,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x8_bf16": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
+  "output_g_c5_gfx942": {
+   "mfma_min": 48,
+   "burst_min": 11,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x8_bf16": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
+  "output_g_c6_gfx942": {
+   "mfma_min": 40,
+   "burst_min": 10,
+   "stalled_max": 4,
+   "require_min": {"v_mfma_f32_32x32x8_bf16": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
+  "down_c5_gfx942": {
+   "mfma_min": 48,
+   "burst_min": 11,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x8_bf16": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
+  "down_c6_gfx942": {
+   "mfma_min": 40,
+   "burst_min": 10,
+   "stalled_max": 4,
+   "require_min": {"v_mfma_f32_32x32x8_bf16": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
+  "down_fp8_c2_gfx942": {
+   "mfma_min": 32,
+   "burst_min": 14,
+   "stalled_max": 7,
+   "require_min": {"v_mfma_f32_32x32x16_fp8_fp8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x16_bf16"]
+  },
+  "down_fp8_c3_gfx942": {
+   "mfma_min": 16,
+   "burst_min": 4,
+   "stalled_max": 5,
+   "require_min": {"v_mfma_f32_32x32x16_fp8_fp8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x16_bf16"]
+  },
+  "down_fp8_c5_gfx942": {
+   "mfma_min": 48,
+   "burst_min": 12,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x16_fp8_fp8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x16_bf16"]
+  },
+  "output_s_fp8_c2_gfx942": {
+   "mfma_min": 32,
+   "burst_min": 14,
+   "stalled_max": 7,
+   "require_min": {"v_mfma_f32_32x32x16_fp8_fp8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x16_bf16"]
+  },
+  "output_g_fp8_c2_gfx942": {
+   "mfma_min": 32,
+   "burst_min": 14,
+   "stalled_max": 7,
+   "require_min": {"v_mfma_f32_32x32x16_fp8_fp8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x16_bf16"]
+  },
+  "output_s_fp8_c3_gfx942": {
+   "mfma_min": 16,
+   "burst_min": 4,
+   "stalled_max": 5,
+   "require_min": {"v_mfma_f32_32x32x16_fp8_fp8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x16_bf16"]
+  },
+  "output_g_fp8_c3_gfx942": {
+   "mfma_min": 16,
+   "burst_min": 4,
+   "stalled_max": 5,
+   "require_min": {"v_mfma_f32_32x32x16_fp8_fp8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x16_bf16"]
+  },
+  "output_s_fp8_c5_gfx942": {
+   "mfma_min": 48,
+   "burst_min": 12,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x16_fp8_fp8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x16_bf16"]
+  },
+  "output_g_fp8_c5_gfx942": {
+   "mfma_min": 48,
+   "burst_min": 12,
+   "stalled_max": 8,
+   "require_min": {"v_mfma_f32_32x32x16_fp8_fp8": 1},
+   "no_scratch": true,
+   "forbid": ["v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x16_bf16"]
+  }
+ },
  "interp_mixed": {
   "plow_exec": {
    "require_min": {

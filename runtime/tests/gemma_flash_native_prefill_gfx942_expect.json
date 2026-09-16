@@ -1,0 +1,22 @@
+{
+  "_arch": "gfx942",
+  "_Z15d_flash_prefill": {
+    "mfma": "v_mfma_f32_32x32x8_bf16",
+    "mfma_min": 64,
+    "scratch_max": 900
+  },
+  "gemma_flash_prefill_256_native": {
+    "mfma": "v_mfma_f32_32x32x8_bf16",
+    "mfma_min": 64,
+    "burst_min": 2,
+    "stalled_max": 15,
+    "no_scratch": true
+  },
+  "gemma_flash_prefill_512_native": {
+    "mfma": "v_mfma_f32_32x32x8_bf16",
+    "mfma_min": 64,
+    "burst_min": 2,
+    "stalled_max": 16,
+    "no_scratch": true
+  }
+}

@@ -26,7 +26,8 @@ use crate::exec::kvrow::{
     RowField,
 };
 use crate::exec::{
-    amd_gemm_blk, amd_gemm_lt, amd_index_tp, amd_mla_fold, amd_moe_aiter, amd_sparse_mla,
+    amd_gemm_blk, amd_gemm_lt, amd_gemma4_glu, amd_index_tp, amd_mla_fold, amd_moe_aiter,
+    amd_sparse_mla,
 };
 use crate::memory::slab_carve;
 use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
@@ -1008,6 +1009,7 @@ enum PrefillSegmentRoute {
     IndexTp(amd_index_tp::Route),
     GemmLt(amd_gemm_lt::Route),
     GemmBlk(amd_gemm_blk::Route),
+    Gemma4Glu(amd_gemma4_glu::Route),
     MlaFold(amd_mla_fold::Route),
     XReduceWaveRs,
     GraphPhaseXReduceWaveRs,
@@ -3283,6 +3285,13 @@ fn check_packed_dense_program(insts: &[DevInst64]) -> Result<()> {
                     | DevOp::GemmMed
                     | DevOp::GemmWide
                     | DevOp::GemmGlu
+                    | DevOp::QuantFp8
+                    | DevOp::GemmFp8
+                    | DevOp::GemmMedFp8
+                    | DevOp::GemmSmallFp8
+                    | DevOp::GemmWideFp8
+                    | DevOp::GemmC5Fp8
+                    | DevOp::GemmGluFp8
                     | DevOp::NormResidual
                     | DevOp::NormResidualNorm
             )
@@ -5878,6 +5887,7 @@ pub struct AmdEngine {
     index_tp: Option<amd_index_tp::IndexTp>,
     gemm_lt: Option<amd_gemm_lt::GemmLt>,
     gemm_blk: Option<amd_gemm_blk::GemmBlk>,
+    gemma4_glu: Option<amd_gemma4_glu::Gemma4Glu>,
     mla_fold: Option<amd_mla_fold::MlaFold>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
@@ -6071,6 +6081,10 @@ fn discover_lowrung_tiers(hsaco_dir: &Path, object: &str) -> Option<String> {
     })
 }
 
+fn select_vmm_kv(configured: Option<bool>, required: bool) -> bool {
+    configured.unwrap_or(required)
+}
+
 impl AmdEngine {
     pub fn overlap_evidence(&self, rank: usize) -> AmdOverlapRankEvidence {
         let range = |name: String, address_space, start, len: u64| AmdOwnedRange {
@@ -6156,8 +6170,8 @@ impl AmdEngine {
     ///
     /// Every failure is a warn + `None` — the flat path is always correct, so a
     /// missing `config.json` or a geometry the blob does not match must not
-    /// stop the engine loading. Off by default (`--amd-vmm-kv` /
-    /// `PLOW_VMM_KV=1`).
+    /// stop the engine loading. The route is automatic when the flat tensor slab
+    /// exceeds VRAM; `--amd-vmm-kv=true|false` / `PLOW_VMM_KV=1|0` overrides it.
     ///
     /// Only FULL-attention `kv.{l}.k`/`.v` are backed. Sliding-window rings are
     /// bounded by `window`, not by context, so they have nothing to grow into,
@@ -6168,9 +6182,14 @@ impl AmdEngine {
         blob: &DevBlob,
         checkpoint: Option<&Path>,
         batch: usize,
+        required: bool,
     ) -> Option<VmmKv> {
-        if !crate::config::RuntimeConfig::get().amd.vmm_kv {
+        let configured = crate::config::RuntimeConfig::get().amd.vmm_kv;
+        if !select_vmm_kv(configured, required) {
             return None;
+        }
+        if configured.is_none() {
+            tracing::info!("flat tensor slab exceeds VRAM; enabling VMM KV");
         }
         if !be.has_vmm() {
             tracing::warn!("PLOW_VMM_KV=1 but this ROCr has no hsa_amd_vmem_* — vmm off");
@@ -6673,14 +6692,18 @@ impl AmdEngine {
         }
         let has_gemm_lt = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmLtPf as u16);
         let use_gemm_lt = blob.progs.iter().any(has_gemm_lt);
+        let gemma_gemm_lt = blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
+            d.op == DevOp::GemmLtPf as u16 && d.i[3] == 3
+        });
         if use_gemm_lt
             && (arch != "gfx942"
-                || tp.is_none_or(|b| b.n_gpu != 8)
-                || !blob.progs.iter().all(amd_gemm_lt::modes_match))
+                || !amd_gemm_lt::topology_matches(
+                    &blob.progs,
+                    tp.as_ref().map(|b| b.n_gpu),
+                ))
         {
             return Err(RuntimeError::Device(
-                "hipBLASLt projection requires gfx942 TP8 and a matching prefill/decode mode"
-                    .into(),
+                "hipBLASLt projection requires a qualified gfx942 topology and mode".into(),
             ));
         }
         let has_gemm_blk = |p: &DevProg| p.insts.iter().any(|d| d.op == DevOp::GemmBlkPf as u16);
@@ -6694,6 +6717,22 @@ impl AmdEngine {
                 "block-scale FP8 projection requires gfx942 TP8 prefill".into(),
             ));
         }
+        let wants_gemma4_glu = arch == "gfx942"
+            && blob
+                .prefill_phase()
+                .any(amd_gemma4_glu::program_candidate);
+        let wants_gemma4_glu_fp8 = arch == "gfx942"
+            && blob
+                .prefill_phase()
+                .any(amd_gemma4_glu::program_fp8_candidate);
+        let wants_gemma4_down = arch == "gfx942"
+            && blob
+                .prefill_phase()
+                .any(amd_gemma4_glu::program_down_candidate);
+        let wants_gemma4_output = arch == "gfx942"
+            && blob
+                .prefill_phase()
+                .any(amd_gemma4_glu::program_output_candidate);
         // Weights and scale grids the route binds in its own layout (shuffled, doubled).
         let gemm_blk_bound = if use_gemm_blk {
             amd_gemm_blk::bound_weights(&blob.progs)?
@@ -8552,12 +8591,30 @@ impl AmdEngine {
             None => None,
         };
         let gemm_lt = if use_gemm_lt {
-            Some(amd_gemm_lt::GemmLt::load(&be, &hsaco_dir, &mut modules)?)
+            Some(amd_gemm_lt::GemmLt::load(
+                &be,
+                &hsaco_dir,
+                gemma_gemm_lt,
+                &mut modules,
+            )?)
         } else {
             None
         };
         let gemm_blk = if use_gemm_blk {
             Some(amd_gemm_blk::GemmBlk::load(&be, &hsaco_dir, &mut modules)?)
+        } else {
+            None
+        };
+        let gemma4_glu = if wants_gemma4_glu {
+            amd_gemma4_glu::Gemma4Glu::load(
+                &be,
+                &hsaco_dir,
+                blob.n_cu,
+                wants_gemma4_glu_fp8,
+                wants_gemma4_down,
+                wants_gemma4_output,
+                &mut modules,
+            )?
         } else {
             None
         };
@@ -8644,6 +8701,24 @@ impl AmdEngine {
         // Must precede the tensor loop: it decides whether each full-layer KV
         // tensor gets an allocation or a view onto the pool's VA reservation.
         let config = crate::config::RuntimeConfig::get();
+        let is_peer_slot = |name: &str| {
+            matches!(
+                (tp.is_some(), name),
+                (true, "act.og_tp")
+                    | (true, "act.dg_tp")
+                    | (true, "act.ug_tp")
+                    | (true, "act.h2_tp")
+                    | (true, "act.xe_tp")
+                    | (true, "act.rt_tp")
+            )
+        };
+        let is_band_view = |name: &str| tp.is_some() && name.contains("@band");
+        let flat_slab_bytes: u64 = blob
+            .tensors
+            .iter()
+            .filter(|td| !is_peer_slot(&td.name) && !is_band_view(&td.name))
+            .map(|td| slab_carve(td.bytes))
+            .sum();
         let shared_requested = config.prefix_cache && config.amd.shared_prefix != Some(false);
         let shared_layout = if shared_requested && arch == "gfx942" && be.has_vmm() && !config.fusion {
             blob.tensors.iter().find(|t| t.name == "in.pos")
@@ -8662,7 +8737,13 @@ impl AmdEngine {
                 crate::memory::vmm::kv_pool_cap())
         }).transpose()?;
         let vmm = if shared_prefix.is_none() {
-            Self::vmm_bringup(&be, &blob, checkpoint, max_decode_batch as usize)
+            Self::vmm_bringup(
+                &be,
+                &blob,
+                checkpoint,
+                max_decode_batch as usize,
+                flat_slab_bytes > be.vram_bytes(),
+            )
         } else {
             None
         };
@@ -8727,21 +8808,9 @@ impl AmdEngine {
         //     have every rank reduce slots its peers never wrote.
         //   * full-layer KV under VMM — the pool's VA reservation, mapped lazily
         //     at the per-sequence frontier.
-        let is_peer_slot = |name: &str| {
-            matches!(
-                (tp.is_some(), name),
-                (true, "act.og_tp")
-                    | (true, "act.dg_tp")
-                    | (true, "act.ug_tp")
-                    | (true, "act.h2_tp")
-                    | (true, "act.xe_tp")
-                    | (true, "act.rt_tp")
-            )
-        };
         // Rank-relative BAND VIEWS (`<base>@band<t>`, sequence-parallel seams): rows
         // `[rank*t/tp, (rank+1)*t/tp)` of an already-bound base, i.e. `base + rank * bytes`.
         // Storage belongs to the base, so they are views like the peer slots.
-        let is_band_view = |name: &str| tp.is_some() && name.contains("@band");
         let slab_bytes: u64 = blob
             .tensors
             .iter()
@@ -9368,6 +9437,29 @@ impl AmdEngine {
                         }
                     }
                 }
+                if gemma4_glu.is_some() {
+                    let gemma4_glu_routes =
+                        amd_gemma4_glu::routes(p, &blob.tensors, seg_class.len())?;
+                    let route_count = gemma4_glu_routes.iter().flatten().count();
+                    if route_count != 0 {
+                        tracing::info!(
+                            program = prog_ix,
+                            rows = p.t,
+                            segments = route_count,
+                            "native Gemma-4 dense GEMM route enabled"
+                        );
+                    }
+                    for (seg, route) in gemma4_glu_routes.into_iter().enumerate() {
+                        if let Some(route) = route {
+                            if !matches!(prefill_routes[seg], PrefillSegmentRoute::Interpreter) {
+                                return Err(RuntimeError::Device(
+                                    "native Gemma-4 dense GEMM overlaps another route".into(),
+                                ));
+                            }
+                            prefill_routes[seg] = PrefillSegmentRoute::Gemma4Glu(route);
+                        }
+                    }
+                }
                 if use_gemm_lt {
                     for (seg, route) in amd_gemm_lt::routes(p, &blob.tensors, seg_class.len())?
                         .into_iter()
@@ -9477,6 +9569,9 @@ impl AmdEngine {
                             | PrefillSegmentRoute::MlaMaterializedPrefill { .. }
                     )
                 });
+                let has_gemma4_glu = prefill_routes
+                    .iter()
+                    .any(|r| matches!(r, PrefillSegmentRoute::Gemma4Glu(_)));
                 let has_ep = prefill_routes.iter().any(|r| {
                     matches!(
                         r,
@@ -9502,11 +9597,12 @@ impl AmdEngine {
                     || use_index_tp
                     || use_gemm_lt
                     || use_gemm_blk
+                    || has_gemma4_glu
                     || use_mla_fold)
                     && !prefill_segment_specialization_allowed(dispatch)
                 {
                     return Err(RuntimeError::Device(
-                        "native AITER kernels require ordered segment dispatch".into(),
+                        "native prefill kernels require ordered segment dispatch".into(),
                     ));
                 }
                 if has_ep && !prefill_segment_specialization_allowed(dispatch) {
@@ -10295,6 +10391,7 @@ impl AmdEngine {
             index_tp,
             gemm_lt,
             gemm_blk,
+            gemma4_glu,
             mla_fold,
             k_xaudit,
             k_state_clear,
@@ -11413,6 +11510,16 @@ impl AmdEngine {
             self.seg_launches += 1;
             return Ok(());
         }
+        if let Some(PrefillSegmentRoute::Gemma4Glu(route)) =
+            self.progs[p].prefill_routes.get(seg).copied()
+        {
+            let kernel = self.gemma4_glu.as_ref().ok_or_else(|| {
+                RuntimeError::Device("native Gemma-4 dense GEMM route has no loaded kernel".into())
+            })?;
+            kernel.enqueue(&self.be, route, &self.tens_table)?;
+            self.seg_launches += 1;
+            return Ok(());
+        }
         if let Some(PrefillSegmentRoute::GemmBlk(route)) =
             self.progs[p].prefill_routes.get(seg).copied()
         {
@@ -11964,6 +12071,7 @@ impl AmdEngine {
                     .as_ref()
                     .map_or(1, |s| s.span_launches(*route, &self.packed_spans)),
                 Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+                Some(PrefillSegmentRoute::Gemma4Glu(_)) => 1,
                 Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
                 Some(PrefillSegmentRoute::MlaFold(_)) => 3,
                 Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
@@ -11978,6 +12086,7 @@ impl AmdEngine {
                 .as_ref()
                 .map_or(1, |s| s.native_lo_launches(*route)),
             Some(PrefillSegmentRoute::GemmLt(_)) => 1,
+            Some(PrefillSegmentRoute::Gemma4Glu(_)) => 1,
             Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
             Some(PrefillSegmentRoute::MlaFold(_)) => 3,
             Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
@@ -12740,6 +12849,9 @@ impl AmdEngine {
                 route.rebase(rows)?;
             }
             if let PrefillSegmentRoute::GemmLt(route) = route {
+                route.rebase(rows)?;
+            }
+            if let PrefillSegmentRoute::Gemma4Glu(route) = route {
                 route.rebase(rows)?;
             }
             if let PrefillSegmentRoute::GemmBlk(route) = route {
@@ -13734,7 +13846,7 @@ impl AmdEngine {
             .as_ref()
             .expect("just allocated")
             .base;
-        let pairs = self.prefix_copy_pairs(slot, rows, dst_base, false);
+        let pairs = self.prefix_copy_pairs(slot, rows, dst_base, false, None);
         // ONE completion wait for all 276 tensors. Per-copy `memcpy_dtod` blocks the host on its
         // own signal, and at this count that synchronisation — not the 56 MiB — is the cost.
         let t = std::time::Instant::now();
@@ -13744,7 +13856,14 @@ impl AmdEngine {
         Ok(())
     }
 
-    fn prefix_copy_pairs(&self, slot: usize, rows: u32, buffer: u64, restore: bool) -> Vec<(u64, u64, u64)> {
+    fn prefix_copy_pairs(
+        &self,
+        slot: usize,
+        rows: u32,
+        buffer: u64,
+        restore: bool,
+        dirty_rows: Option<u32>,
+    ) -> Vec<(u64, u64, u64)> {
         let capacity = self.prefix_regions.as_ref().map_or(self.carried_slot.len(),
             |regions| regions.iter().map(prefix::Region::max_copies).sum());
         let mut pairs = Vec::with_capacity(capacity);
@@ -13752,10 +13871,19 @@ impl AmdEngine {
         if let Some(regions) = &self.prefix_regions {
             for region in regions {
                 let base = self.devp[region.tensor].base + region.slot_bytes * slot as u64;
-                region.copy_spans(rows, |dst, src, bytes| {
+                let mut add = |dst, src, bytes| {
                     let (snapshot, live) = (buffer + offset + dst, base + src);
                     pairs.push(if restore { (live, snapshot, bytes) } else { (snapshot, live, bytes) });
-                });
+                };
+                if restore {
+                    if let Some(dirty) = dirty_rows {
+                        region.restore_spans(rows, dirty, &mut add);
+                    } else {
+                        region.copy_spans(rows, &mut add);
+                    }
+                } else {
+                    region.copy_spans(rows, &mut add);
+                }
                 offset += region.bytes();
             }
         } else {
@@ -13782,7 +13910,36 @@ impl AmdEngine {
         self.prefix_tick += 1;
         self.prefix_used[slot] = self.prefix_tick;
         let src_base = self.prefix_snap[slot].as_ref().expect("checked").base;
-        let pairs = self.prefix_copy_pairs(slot, self.prefix_rows[slot], src_base, true);
+        let pairs = self.prefix_copy_pairs(slot, self.prefix_rows[slot], src_base, true, None);
+        let t = std::time::Instant::now();
+        self.be.memcpy_dtod_batch(&pairs)?;
+        self.kda_conv_alt_stale[slot] = false;
+        crate::obs::pfx::RESTORE.add(t.elapsed().as_nanos() as u64);
+        Ok(())
+    }
+
+    /// Restore the saved recurrent state and only the sliding-cache rows that the outgoing
+    /// request could have overwritten after this snapshot.
+    pub fn restore_carried_since(&mut self, slot: usize, dirty_until: u32) -> Result<()> {
+        if !self.has_snapshot(slot) {
+            return Err(RuntimeError::Device(format!(
+                "restore_carried_since: slot {slot} has no snapshot"
+            )));
+        }
+        if self.prefix_regions.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(());
+        }
+        let rows = self.prefix_rows[slot];
+        let actual = dirty_until.saturating_sub(rows).saturating_add(1);
+        let dirty_rows = self
+            .plan_for(actual)
+            .ok()
+            .and_then(|chunks| chunks.into_iter().try_fold(0u32, u32::checked_add))
+            .unwrap_or(u32::MAX);
+        self.prefix_tick += 1;
+        self.prefix_used[slot] = self.prefix_tick;
+        let src_base = self.prefix_snap[slot].as_ref().expect("checked").base;
+        let pairs = self.prefix_copy_pairs(slot, rows, src_base, true, Some(dirty_rows));
         let t = std::time::Instant::now();
         self.be.memcpy_dtod_batch(&pairs)?;
         self.kda_conv_alt_stale[slot] = false;

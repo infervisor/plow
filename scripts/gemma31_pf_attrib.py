@@ -2,6 +2,8 @@
 """Attribute one prefill chunk's GPU envelope to ops, using the raw PlowTraceRec dump
 plus `plowrt disasm --format json` for op/tensor identity.
 
+  scripts/gemma31_pf_attrib.py TRACE DISASM PROGRAM_INDEX
+
   PlowTraceRec = { u32 cu, u32 pc, u32 inst, u16 op, u16 slice, u64 t_arrive, u64 t_ready, u64 t_end }
 
 Ticks are s_memrealtime, 100 MHz (10 ns).  Packets are walked in INSTRUCTION order against a
@@ -18,15 +20,28 @@ REC = struct.Struct("<IIIHHQQQ")
 TPMS = 100_000.0  # ticks per millisecond
 
 
-def load_disasm(path):
-    txt = open(path).read()
+def load_disasm(path, program_index):
+    with open(path) as source:
+        txt = source.read()
     d = json.loads(txt[txt.index('{\n  "blob"'):])
-    return d['programs'][0]['insts']
+    programs = d['programs']
+    if not 0 <= program_index < len(programs):
+        raise SystemExit(
+            f"program index {program_index} is outside disassembly range 0..{len(programs) - 1}"
+        )
+    return programs[program_index]
 
 
 def main():
-    trace, dis = sys.argv[1], sys.argv[2]
-    insts = load_disasm(dis)
+    if len(sys.argv) != 4:
+        raise SystemExit(f"usage: {sys.argv[0]} TRACE DISASM PROGRAM_INDEX")
+    trace, dis, program_arg = sys.argv[1:]
+    try:
+        program_index = int(program_arg)
+    except ValueError:
+        raise SystemExit(f"program index must be an integer, got {program_arg!r}") from None
+    program = load_disasm(dis, program_index)
+    insts = program['insts']
     buf = open(trace, 'rb').read()
     n = len(buf) // REC.size
     arrive = {}
@@ -37,6 +52,17 @@ def main():
         cu, pc, inst, op, sl, ta, tr, te = REC.unpack_from(buf, i * REC.size)
         if te == 0:
             continue
+        if inst >= len(insts):
+            raise SystemExit(
+                f"trace instruction {inst} is outside program {program_index} (T={program['t']}, "
+                f"{len(insts)} instructions)"
+            )
+        expected_op = insts[inst]['op']
+        if op != expected_op:
+            raise SystemExit(
+                f"trace/disassembly mismatch at instruction {inst}: trace op={op}, "
+                f"program {program_index} (T={program['t']}) op={expected_op}; select the exact rung"
+            )
         wg[inst] += 1
         if inst not in arrive or ta < arrive[inst]:
             arrive[inst] = ta
@@ -84,7 +110,8 @@ def main():
         tot_gate += g
         tot_body += b
     span = (clock - lo) / TPMS
-    print(f"packets={len(rows)} groups, records={n}, chain span={span:.2f} ms, "
+    print(f"program={program_index} T={program['t']}, packets={len(rows)} groups, "
+          f"records={n}, chain span={span:.2f} ms, "
           f"gate={tot_gate/TPMS:.2f} ms ({100*tot_gate/(tot_gate+tot_body):.1f}%), "
           f"body={tot_body/TPMS:.2f} ms")
     print()
@@ -101,4 +128,5 @@ def main():
     print(f"{'TOTAL':<46}{'':>5}{'':>8}{tot_gate / TPMS:>9.2f}{tot_body / TPMS:>9.2f}{tot / TPMS:>9.2f}")
 
 
-main()
+if __name__ == '__main__':
+    main()

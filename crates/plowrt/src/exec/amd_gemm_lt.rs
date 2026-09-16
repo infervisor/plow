@@ -10,6 +10,7 @@ use crate::device::Module;
 use crate::{Result, RuntimeError};
 
 const OBJECT_HASH: &str = "efa5b0365bedc2effa52265c85eded14fb63febd9c067bab37138d99db607db5";
+const NOBIAS_OBJECT_HASH: &str = "0ab860e928c070fa3ee22f5f91725539caaa0a12223296060b8a2bda818ace0d";
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Route {
@@ -41,6 +42,7 @@ impl Route {
         match self.inst.i[3] {
             1 => return decode_choice(self.rows, n, k).unwrap(),
             2 => return band_choice(self.rows, n, k).unwrap(),
+            3 => return gemma_choice(self.inst.i[0], n, k).unwrap(),
             _ => {}
         }
         if let Some(choice) = ext_choice(self.rows, n, k) {
@@ -106,6 +108,22 @@ fn decode_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
 /// First `PLOW_GLM_GEMM_LT_PF_EXT` kernel: its list follows the four prefill and eight decode
 /// kernels.
 const EXT: usize = 12;
+const GEMMA_BIAS: usize = 26;
+const GEMMA_NOBIAS: usize = 31;
+
+fn gemma_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
+    Some(match (rows, n, k) {
+        (2048, 5376, 8192) => (GEMMA_NOBIAS + 1, 524292),
+        (2048, 5376, 21504) => (GEMMA_NOBIAS, 1),
+        (4096, 5376, 8192) => (GEMMA_BIAS + 2, 524294),
+        (4096, 5376, 16384) => (GEMMA_BIAS + 1, 524304),
+        (4096, 5376, 21504) => (GEMMA_BIAS, 524292),
+        (8192, 5376, 8192) => (GEMMA_BIAS + 4, 524294),
+        (8192, 5376, 16384) => (GEMMA_NOBIAS + 2, 524290),
+        (8192, 5376, 21504) => (GEMMA_BIAS + 3, 524289),
+        _ => return None,
+    })
+}
 
 /// Pinned `PLOW_GLM_GEMM_LT_PF_EXT` kernel per bucket-row shape (o_proj, shared gate/up, shared
 /// down) and row tier (<= 2048, <= 4096, above). Chosen by `runtime/bench/amd/glm_projection/
@@ -142,7 +160,7 @@ fn band_choice(rows: u32, n: u32, k: u32) -> Option<(usize, u32)> {
 }
 
 /// The `GemmLtPf` mode each program role may carry: decode rungs `1`; prefill-side programs `0`
-/// (bucket rows) and `2` (the sequence-parallel band's fixed rows).
+/// (GLM bucket rows), `2` (GLM sequence-parallel bands), and `3` (Gemma bucket rows).
 pub(super) fn modes_match(prog: &DevProg) -> bool {
     let decode = prog.role.is_decode_rung();
     prog.insts
@@ -150,9 +168,24 @@ pub(super) fn modes_match(prog: &DevProg) -> bool {
         .filter(|d| d.op == DevOp::GemmLtPf as u16)
         .all(|d| match d.i[3] {
             1 => decode,
-            0 | 2 => !decode,
+            0 | 2 | 3 => !decode,
             _ => false,
         })
+}
+
+pub(super) fn topology_matches(progs: &[DevProg], tp: Option<u32>) -> bool {
+    let modes: Vec<u32> = progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .filter(|d| d.op == DevOp::GemmLtPf as u16)
+        .map(|d| d.i[3])
+        .collect();
+    progs.iter().all(modes_match)
+        && if modes.iter().any(|&mode| mode == 3) {
+            modes.iter().all(|&mode| mode == 3) && tp.unwrap_or(1) == 1
+        } else {
+            tp == Some(8)
+        }
 }
 
 pub(super) fn segment_owners(
@@ -233,6 +266,11 @@ pub(super) fn routes(
                 (2048..=8192).contains(&prog.t)
                     && prog.t % 8 == 0
                     && band_choice(rows, inst.i[1], inst.i[2]).is_some()
+            }
+            3 => {
+                matches!(prog.t, 2048 | 4096 | 8192)
+                    && inst.i[0] == prog.t
+                    && gemma_choice(prog.t, inst.i[1], inst.i[2]).is_some()
             }
             _ => false,
         };
@@ -328,12 +366,14 @@ pub(super) fn load_kernels(
         let field = image
             .get_mut(spec.kernarg_offset..spec.kernarg_offset + 4)
             .ok_or_else(|| RuntimeError::Device("hipBLASLt descriptor is outside object".into()))?;
-        if field != [0; 4] {
+        let encoded = args_bytes.to_le_bytes();
+        if field == [0; 4] {
+            field.copy_from_slice(&encoded);
+        } else if field != encoded {
             return Err(RuntimeError::Device(
                 "hipBLASLt descriptor differs from qualified ABI".into(),
             ));
         }
-        field.copy_from_slice(&args_bytes.to_le_bytes());
     }
     let module = EngineDevice::module_load(be, &image)?;
     let mut kernels = Vec::new();
@@ -359,7 +399,12 @@ pub(super) struct GemmLt {
 }
 
 impl GemmLt {
-    pub fn load(be: &HsaBackend, dir: &Path, modules: &mut Vec<Module>) -> Result<Self> {
+    pub fn load(
+        be: &HsaBackend,
+        dir: &Path,
+        gemma: bool,
+        modules: &mut Vec<Module>,
+    ) -> Result<Self> {
         let mut specs: Vec<KernelSpec> =
             serde_json::from_str(include_str!("../../../../runtime/amd/glm_lt_gfx942.json"))
                 .map_err(|e| {
@@ -380,7 +425,19 @@ impl GemmLt {
         ))
         .map_err(|e| RuntimeError::Device(format!("hipBLASLt extension specification: {e}")))?;
         specs.extend(ext_specs);
-        let kernels = load_kernels(
+        if specs.len() != GEMMA_BIAS {
+            return Err(RuntimeError::Device(
+                "hipBLASLt Gemma extension base moved".into(),
+            ));
+        }
+        let gemma_bias: Vec<KernelSpec> = serde_json::from_str(include_str!(
+            "../../../../runtime/amd/gemma_lt_bias_gfx942.json"
+        ))
+        .map_err(|e| RuntimeError::Device(format!("Gemma hipBLASLt bias specification: {e}")))?;
+        if gemma {
+            specs.extend(gemma_bias);
+        }
+        let mut kernels = load_kernels(
             be,
             dir,
             "glm_lt_gfx942.elf",
@@ -389,6 +446,29 @@ impl GemmLt {
             160,
             modules,
         )?;
+        if gemma {
+            if specs.len() != GEMMA_NOBIAS {
+                return Err(RuntimeError::Device(
+                    "hipBLASLt Gemma no-bias extension base moved".into(),
+                ));
+            }
+            let no_bias: Vec<KernelSpec> = serde_json::from_str(include_str!(
+                "../../../../runtime/amd/gemma_lt_nobias_gfx942.json"
+            ))
+            .map_err(|e| {
+                RuntimeError::Device(format!("Gemma hipBLASLt no-bias specification: {e}"))
+            })?;
+            kernels.extend(load_kernels(
+                be,
+                dir,
+                "gemma_lt_nobias_gfx942.elf",
+                NOBIAS_OBJECT_HASH,
+                &no_bias,
+                160,
+                modules,
+            )?);
+            specs.extend(no_bias);
+        }
         Ok(Self { kernels, specs })
     }
 
@@ -503,7 +583,7 @@ mod tests {
 
     #[test]
     fn lt_arguments_preserve_live_rows_and_inline_abi() {
-        let mut specs: Vec<KernelSpec> =
+        let specs: Vec<KernelSpec> =
             serde_json::from_str(include_str!("../../../../runtime/amd/glm_lt_gfx942.json"))
                 .unwrap();
         for (n, k) in [(2048, 6144), (512, 6144), (4096, 2048)] {
@@ -550,6 +630,11 @@ mod tests {
         ))
         .unwrap();
         specs.extend(ext);
+        let gemma: Vec<KernelSpec> = serde_json::from_str(include_str!(
+            "../../../../runtime/amd/gemma_lt_bias_gfx942.json"
+        ))
+        .unwrap();
+        specs.extend(gemma);
         specs
     }
 
@@ -560,16 +645,63 @@ mod tests {
             (ProgramRole::PrefillBucket { rows: 8192 }, 0, true),
             (ProgramRole::PrefillBucket { rows: 8192 }, 2, true),
             (ProgramRole::PrefillBucket { rows: 8192 }, 1, false),
-            (ProgramRole::PrefillBucket { rows: 8192 }, 3, false),
+            (ProgramRole::PrefillBucket { rows: 8192 }, 3, true),
             (ProgramRole::DecodeRung { rows: 20 }, 1, true),
             (ProgramRole::DecodeRung { rows: 20 }, 0, false),
             (ProgramRole::DecodeRung { rows: 20 }, 2, false),
+            (ProgramRole::DecodeRung { rows: 20 }, 3, false),
         ] {
             let (mut p, _) = fixture();
             p.role = role;
             p.insts[0].i[3] = mode;
             assert_eq!(modes_match(&p), ok, "{role:?} mode {mode}");
         }
+    }
+
+    #[test]
+    fn gemma_routes_are_exact_and_tp1_only() {
+        let bias: Vec<KernelSpec> = serde_json::from_str(include_str!(
+            "../../../../runtime/amd/gemma_lt_bias_gfx942.json"
+        ))
+        .unwrap();
+        let no_bias: Vec<KernelSpec> = serde_json::from_str(include_str!(
+            "../../../../runtime/amd/gemma_lt_nobias_gfx942.json"
+        ))
+        .unwrap();
+        assert_eq!((bias.len(), no_bias.len()), (5, 3));
+        let expected = [
+            ((2048, 5376, 8192), (GEMMA_NOBIAS + 1, 524292)),
+            ((2048, 5376, 21504), (GEMMA_NOBIAS, 1)),
+            ((4096, 5376, 8192), (GEMMA_BIAS + 2, 524294)),
+            ((4096, 5376, 16384), (GEMMA_BIAS + 1, 524304)),
+            ((4096, 5376, 21504), (GEMMA_BIAS, 524292)),
+            ((8192, 5376, 8192), (GEMMA_BIAS + 4, 524294)),
+            ((8192, 5376, 16384), (GEMMA_NOBIAS + 2, 524290)),
+            ((8192, 5376, 21504), (GEMMA_BIAS + 3, 524289)),
+        ];
+        for (shape, choice) in expected {
+            assert_eq!(gemma_choice(shape.0, shape.1, shape.2), Some(choice));
+        }
+        for shape in [
+            (2048, 5376, 16384),
+            (8192, 2048, 5376),
+            (8192, 16384, 5376),
+            (8192, 5376, 5376),
+            (16384, 5376, 21504),
+        ] {
+            assert_eq!(gemma_choice(shape.0, shape.1, shape.2), None, "{shape:?}");
+        }
+
+        let (mut gemma, _) = fixture();
+        gemma.insts[0].i = [8192, 5376, 21504, 3, 0, 0, 0, 0];
+        assert!(topology_matches(std::slice::from_ref(&gemma), None));
+        assert!(topology_matches(std::slice::from_ref(&gemma), Some(1)));
+        assert!(!topology_matches(std::slice::from_ref(&gemma), Some(8)));
+
+        let (glm, _) = fixture();
+        assert!(topology_matches(std::slice::from_ref(&glm), Some(8)));
+        assert!(!topology_matches(std::slice::from_ref(&glm), Some(1)));
+        assert!(!topology_matches(&[gemma, glm], Some(1)));
     }
 
     /// CPU preflight: every program of the packets named by `PLOW_LT_PACKETS` (comma list of
@@ -598,15 +730,22 @@ mod tests {
         }
     }
 
-    /// `load_kernels` patches each descriptor once and refuses one it already patched, so no
-    /// kernel may appear in two spec lists: a shared kernel is reused by index.
+    /// A descriptor shared by two qualified routes must describe the same kernel ABI. The loader
+    /// patches it once and accepts the identical already-patched value on the second route.
     #[test]
-    fn spec_lists_name_each_descriptor_once() {
+    fn aliased_descriptors_have_one_abi() {
         let specs = all_specs();
-        let mut offsets: Vec<_> = specs.iter().map(|s| s.kernarg_offset).collect();
-        offsets.sort_unstable();
-        offsets.dedup();
-        assert_eq!(offsets.len(), specs.len());
+        for (ix, spec) in specs.iter().enumerate() {
+            for alias in &specs[..ix] {
+                if alias.kernarg_offset == spec.kernarg_offset {
+                    assert_eq!(alias.name, spec.name);
+                    assert_eq!(
+                        (alias.lds, alias.mt_i, alias.mt_j),
+                        (spec.lds, spec.mt_i, spec.mt_j)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

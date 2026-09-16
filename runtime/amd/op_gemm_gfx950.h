@@ -39,6 +39,9 @@
     defined(GM8_FIX8)
 #error "PLOW_GM_DIRECT_STAGE / PLOW_GM_FP8_PACK2 / PLOW_GV_UN_FP8_KDIV / GM8_FIX8 are arch policy set by op_gemm_gfx950.h, not -D knobs"
 #endif
+#ifdef GM_NATIVE_OCP_QUANT
+#error "GM_NATIVE_OCP_QUANT is gfx942-only; gfx950 already emits OCP e4m3 natively"
+#endif
 /* 16-byte global_load_lds is real here (amd_arch.h), so the plain bf16 d_gemm_t rungs stage A/B
  * straight into LDS and GM_DBUF=2 gives the DMA an idle buffer to stream into a cluster ahead. */
 #define PLOW_GM_DIRECT_STAGE 1
