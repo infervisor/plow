@@ -2301,7 +2301,21 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
  * keys than top_k. In the PV phase the slot's softmax weight is already zero, so clamping the ROW
  * keeps the contribution zero AND the address inside the cache; the score phase drops the slot
  * outright (`keep`). Without this a pad casts to a 4 Gi row offset -- an aperture violation. */
+/* CEILING INSTRUMENT ONLY (-DPLOW_FA_GATHER_ABL=1): collapse every gathered row to a FIXED
+ * cache row. WRONG OUTPUT by construction, never a serve asset -- the twin of PLOW_MOE_PF_ABL
+ * and PLOW_MOE_PF_EPIABL. It keeps every load, every score, every softmax and every PV FMA, and
+ * changes only WHERE the KV rows come from: a stride-0 read that is L1-resident instead of
+ * top_k scattered rows. Ablated minus full is therefore the RANDOM-ACCESS cost of the gather and
+ * nothing else's -- which is the question that decides whether this op wants a union table and
+ * staged KV (docs 12.27) or wants the matrix pipe. The row index is still COMPUTED and still
+ * read from the index table, so the indirection's latency is paid; only the address is tamed.
+ *
+ * `keep`/`sel >= 0` are untouched, so the pad contract below is unaffected by the instrument. */
+#ifndef PLOW_FA_GATHER_ABL
+#define PLOW_FA_GATHER_ABL 0
+#endif
 __device__ __forceinline__ size_t fa_gather_row(int sel) {
+    if (PLOW_FA_GATHER_ABL) return (size_t)((unsigned)(sel < 0 ? 0 : sel) & 63u);
     return (size_t)(unsigned)(sel < 0 ? 0 : sel);
 }
 
@@ -2494,7 +2508,7 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
                  * not a wrong number. Dropping the slot is also the right math: the pad stands
                  * for a key that does not exist. */
                 const int sel = GATHER ? (kv < hi ? ibase[kv] : -1) : 0;
-                const unsigned row = GATHER ? (unsigned)(sel < 0 ? 0 : sel) : (kv & kv_mask);
+                const unsigned row = GATHER ? (unsigned)fa_gather_row(sel) : (kv & kv_mask);
                 const bool keep =
                     GATHER ? (kv < hi && sel >= 0)
                            : (kv < hi && kv <= qpos && (!window || (qpos - kv) < window));

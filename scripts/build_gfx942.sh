@@ -1037,6 +1037,15 @@ if [ "${PLOW_MOE_PF_EPIABL:-0}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_EPIABL=${PLOW_MOE_PF_EPIABL}"
 fi
 
+# CEILING INSTRUMENT ONLY (PLOW_FA_GATHER_ABL=1): the gathered flash reading a FIXED 64-row window
+# instead of its top_k scattered cache rows. Same loads, same scores, same softmax, same PV --
+# only the addresses are tamed, so ablated minus full prices the gather's RANDOM ACCESS alone.
+# WRONG OUTPUT by construction, never a serve asset. See op_attention_common.h.
+if [ "${PLOW_FA_GATHER_ABL:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_FA_GATHER_ABL=${PLOW_FA_GATHER_ABL}"
+  AX_FLASH="$AX_FLASH -DPLOW_FA_GATHER_ABL=${PLOW_FA_GATHER_ABL}"
+fi
+
 # MPF_BM A/B escape hatch for the PREFILL objects (the decode row has carried its MPF_BK twin
 # since the OCC4 recut). The grouped MoE prefill GEMM is the term that binds once attention is
 # sparse -- 11.8 ms per layer per rank, 87.7 TF/s, 3.4% of this part's fp8 peak -- and TP8 is
