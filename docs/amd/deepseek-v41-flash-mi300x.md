@@ -4939,11 +4939,15 @@ EP runs on gfx942 now. `PLOW_MOE_PREFILL_EP` gives each rank 48 WHOLE experts at
 `moe_inter` 2304 instead of all 384 sliced to 288, and 288 was §12.63's finding: `down`'s k-loop is
 far too short to amortise the grouped GEMM's per-tile expert-weight reload.
 
-    arm                 layer min   MoE pair   XREDUCE2   exits
-    TP (shipped)         14028 us     850 us    1589 us   -1.36719 / 3.64062 / -0.000761
-    EP                   13854 us     296 us    2010 us   identical
+Four paired samples, best of 6 iterations each, TP and EP back to back so co-tenancy hits both:
 
-The MoE pair falls 65%. The layer falls 1.2%.
+    arm                 layer min   MoE pair   align   XREDUCE2   exits
+    TP (shipped)         14052 us     863 us   74.9 us   1543 us   -1.36719 / 3.64062 / -0.000761
+    EP                   13872 us     293 us   66.3 us   1731 us   identical
+
+The MoE pair falls 66%, 570 us. The layer falls 180 us, 1.3% -- about 7 ms over 40 layers. XREDUCE2
+takes back ~190 of the 570 and ordinary spread accounts for the rest. EP's align is slightly
+CHEAPER than TP's because it histograms only the slots this rank owns.
 
 ### It was never a hardware gap
 
