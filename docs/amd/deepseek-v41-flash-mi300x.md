@@ -5108,3 +5108,48 @@ left in the layer.
 NOT YET BUILT. The emit work is: declare `iuni`/`iumask`, emit op 119 at pack 8, and swap the
 gathered flash from op 55 to op 51 carrying the NoPE bit, t7 = union and i6 = cap -- then route the
 segment to the 4-wave flash object with PLOW_MLA_PF_NOPE=1.
+
+## 12.66 Built, and it beat the estimate: 14.09 -> 11.37 ms/layer
+
+12.65 predicted "net ~2x on the op, if it behaves". It behaves, and it is 4.2x. Paired back to
+back at 8k, block 2, TP8, gfx942:
+
+    arm                        layer us      gathered us     exits (min / max / mean)
+    op 55, 8-wave routing     14086-14165      2969-2996     -1.36719  3.64062  -0.000761
+    op 55, V2 routing         13859-13995      2934-2950     -1.36719  3.64062  -0.000761
+    op 51 + union             11366-11376     ~620 + 79      -1.36719  3.67188  -0.000761
+
+-19.3% on the whole layer, which is 563 -> 455 ms at 40 layers. The 2.43x fewer row-reads was the
+conservative half of the estimate; the other half -- score/PV moving from VALU onto the matrix
+core -- is evidently worth more than the 3.3x extra MAC count it costs.
+
+The middle row is the point of the table. It is the same packet as the first with only the routing
+changed, so it isolates the four-wave move from the union arm, and it reproduces the exits
+EXACTLY. min and mean are then exact on the union arm too; max moves two bf16 ulps, which is the
+P-rounding of a different row order. Nothing structural changed.
+
+Three things the estimate did not mention, each of which cost a build/run cycle:
+
+**The routing is not optional and not a knob.** An op 51 carrying t7 has a body on the four-wave
+object ONLY -- `interp.hip` traps on it deliberately on the 8-wave one rather than attend the full
+causal range of a model trained sparse. Emitting the union without `PLOW_MLA_PF_V2=1` produced
+`HSA_STATUS_ERROR_EXCEPTION` with no address in it, which is an `s_trap` and looks exactly like a
+memory fault. `devbuild` now derives the segmentation from the instruction, the way `split_mla`
+already did.
+
+**i2 is `ctx`, not `ctx / ratio`.** Op 119 derives its scan bound from `kv_len` -- a TOKEN position
+-- while indexing `umask[slice * i2 + s]`. GLM reaches op 119 after `DsaPoolExpand` so its two
+spaces agree; V4.1 selects COMPRESSED entries directly, and the narrower stride walks off the end
+of the row. Also a hardware exception, and the one that had to be ruled out first: emitting op 119
+while leaving the flash on op 55 ran clean at 80 us, which put the fault in the other op.
+
+**The four-wave dense body could not write half a partial pair.** V4.1's attention IS a split --
+window at partial 0, gathered at partial 1, one FlashMerge folding the sink once -- and
+`d_flash_mla_prefill_v2` had no `out_nsplit`/`out_sp0`, so routing the packet there silently moved
+the window rows. That is what the control row above was built to catch, and before the fix it read
+-1.53125 / 4.50000 / -0.000849 on a packet with no union in it at all.
+
+Op 119 itself costs 79 us/layer and is emitted once per PUBLICATION, not once per reader: the 38
+reader layers share `ix.idx`, so they share its union too.
+
+The gathered flash is no longer the largest op in the layer.
