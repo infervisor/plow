@@ -4801,3 +4801,53 @@ GF) all measured null or negative. It was never mis-implemented; it was mis-pric
 
 The measured column was also refreshed from the 2026-09-16 trace (layer 15,100 -> 14,900 us;
 COMPRESS_ROPE_QUANT 674 -> 378, 63.1x -> 35.4x off).
+
+## 12.61 The dense-GEMM tuning store was 100% stale. Refilling it changed nothing, and here is why
+
+Every V4.1 emit prints a warning nobody had acted on: `>>> tunedb: ALL 5 dense-GEMM tile(s) chosen
+by the ANALYTICAL MODEL. This build is UNMEASURED`. `plowc tune status` confirmed it -- 4961
+records, every one STALE against the probed digest `gfx942-295749b0e5a2b676`, so **zero** usable
+measurements. Acted on.
+
+`--shapes auto` cannot run for V4.1 (it derives demand from a full-model emit, which V4.1 has no
+graph builder for), but `PLOW_TUNE_DUMP=1` on the `--block` emit observes the same demand:
+
+    TUNEDUMP      8192  512  5120  None   MISS  (x2)
+    TUNEDUMP      8192  384  5120  None   MISS
+    TUNEDUMP      8192   32  5120  None   MISS
+    TUNEDUMP      4096  128   512  None   MISS
+    TUNEDUMP_GEMV 8192   24 20480  None   MISS  (x2, PLOW_DOP_GEMV_F32)
+
+Campaign run on those five (`--campaign dsv41-prefill-8k`, 40 rows, 30 published). **The analytical
+model's pick is the worst or near-worst tile for every shape:**
+
+    shape              best tile      best ms    c5 192x256x64 (picked)   speedup
+    8192x512x5120      128x128x64      0.1323            0.2544            1.92x
+    8192x384x5120      128x128x64      0.1214            0.2533            2.09x
+    8192x32x5120        64x128x128     0.0622            0.2240            3.60x
+    4096x128x512        64x128x128     0.0185            0.0618            3.34x
+    8192x24x20480       64x128x128     0.2079            0.7940            3.82x
+    TOTAL                              0.5423            1.5875            2.93x
+
+Ingested; the re-emit then prints `tunedb: all 5 dense-GEMM tile(s) chosen BY MEASUREMENT`, the
+packet's geometry contract moves to `GM_BM=128 GM_BN=256`, and the rebuilt object's LDS drops
+64,720 -> 60,752 B. **And the layer does not move:**
+
+    base    14902.1 / 14882.5 us     GEMM_FP8_MX 2875.8 / 2806.3   GEMM_MED 486.6 / 472.6
+    tuned   14942.4 / 14907.1 us     GEMM_FP8_MX 2839.7 / 2790.3   GEMM_MED 487.8 / 471.3
+
+Exits identical. Two reasons, and both are worth keeping:
+
+1. **The campaign covers the wrong ~4% of the layer.** The demand dump is all `quant=None`. The
+   layer's big GEMM is `GEMM_FP8_MX` at 2815 us, on the MX path, which does not consult this store
+   at all -- the dense rungs it does cover are `GEMM_MED` (480 us) + `GEMM_SMALL` (97 us), 577 us
+   of 14,900. The MX tile was already hand-swept on both axes (12.4x: BN 256 +102%, BM 64 +21%,
+   192 +3.4%, 256 +93%), and 192x256 won, so that axis was already measured and already optimal.
+2. **A standalone tile ranking does not transfer into the megakernel.** `gemm_tile_sweep` runs the
+   GEMM alone, at whatever occupancy its own registers and LDS allow. Inside `plow_exec` the same
+   GEMM runs at occupancy 2 in a shared 60 KB arena (12.58), where the tile is not what bounds it.
+   This is the same way GEMV_F32's arm 7 and arm 3 lost, and the same lesson.
+
+**The store is now populated with real records rather than a stale-by-14-digests pile**, which is
+worth having on its own -- but the emit-time warning, though accurate, is not the lever it looks
+like on this model. Both GEMM axes are now closed by measurement.
