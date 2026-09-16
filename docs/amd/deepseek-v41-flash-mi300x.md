@@ -3773,3 +3773,32 @@ geometry V4.1 does not have (`k == 1`). The question that found all three is *"w
 op actually on, and why not the other one?"* — and it is cheaper than every ablation in §12.30.
 
 Layer 2 at the committed defaults: **16,920 us**, from 20,458 at the start of §12.29.
+
+### 12.35 Every workgroup got the same span for the whole packet, because 4 divides 304
+
+`INDEX_SCORE_PF` was 503 us of which **428 was straggler** — 85%, the worst ratio outside the
+collective. `d_index_score_pf_row` decomposes into `(pack, span)` items and walked them
+SPAN-fastest: `p = w / n_span, sp = w % n_span`. At the shipped geometry `n_span` is
+`len / IDXPF_SPAN` = 4096/1024 = 4, and the grid-stride step is `nblk` = 304. **4 divides 304**,
+so `w % n_span` is invariant along a workgroup's stride — every workgroup processed exactly ONE
+span value for the entire packet.
+
+The spans are not equal work. A pack only reaches the spans below its causal end, so span 0 has
+work for all 1024 packs and span 3 for only the last quarter. One workgroup in four did four times
+its share while the rest waited at the packet's release signal.
+
+    INDEX_SCORE_PF body, layer 2, T=8192, TP8, median of 5:
+
+      span-fastest (PLOW_IDXPF_PACKFAST=0)   503 us   strag 428   layer 16928 us
+      pack-fastest (default 1)               330 us   strag  65   layer 16754 us
+
+`p = w % n_pack, sp = w / n_pack`. -34.4% on the op and **-85% on the straggler**, which is the
+number that identifies the cause: the item -> data mapping is untouched, only which workgroup
+takes which item, so nothing but balance can have moved. Exits identical.
+
+This is a class of bug, not an instance: any grid-stride loop that decomposes `w` with a modulus
+that shares a factor with `nblk` gives each workgroup a biased slice of the work. It is invisible
+in a total-time profile and obvious in the straggler column.
+
+Layer 2 at the committed defaults: **16,784 us**, from 20,458 at the start of §12.29 — **-18.0%**
+across §12.29-§12.35, all of it verified by an exit that never moved a printed digit.

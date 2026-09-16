@@ -2882,6 +2882,14 @@ __device__ void d_flash_mla_prefill_fp8(float* __restrict__ Opart, float* __rest
 #ifndef PLOW_IDXSEL_SCAN
 #define PLOW_IDXSEL_SCAN 1
 #endif
+/* Walk d_index_score_pf_row's (pack, span) work items PACK-fastest instead of SPAN-fastest.
+ * n_span divides nblk at the shipped geometry (len/IDXPF_SPAN = 4 against 304 workgroups), so
+ * span-fastest hands every workgroup ONE span for the whole packet -- and the spans are not
+ * equal work, because a pack only reaches the spans below its causal end. 0 restores the
+ * shipped order. Item -> data mapping is unchanged; only which workgroup takes which item. */
+#ifndef PLOW_IDXPF_PACKFAST
+#define PLOW_IDXPF_PACKFAST 1
+#endif
 /* CEILING INSTRUMENT for the head-packed gathered body. WRONG OUTPUT by construction; never a
  * serve asset. At n_head=8 (V4.1 at TP8) the arm has two known inefficiencies -- n_mtile==1 makes
  * all PLOW_WAVES waves recompute the SAME 32x32 score tile, and only 8 of 32 M-rows are live --
@@ -5609,7 +5617,11 @@ __device__ void d_index_score_pf_row(float* __restrict__ Score, const bf16* __re
      * reached by all 512 threads the same number of times. Only `live`/`row_end` vary by wave,
      * and those gate compute only, never a barrier. */
     for (unsigned w = slice; w < n_work; w += nblk) {
+#if PLOW_IDXPF_PACKFAST
+        const unsigned p = w % n_pack, sp = w / n_pack;
+#else
         const unsigned p = w / n_span, sp = w % n_span;
+#endif
         unsigned pack_last = row_begin + p * NW + (NW - 1u);
         if (pack_last >= end) pack_last = end - 1u;
         /* causal bound of the pack's last row, in COLUMNS */
