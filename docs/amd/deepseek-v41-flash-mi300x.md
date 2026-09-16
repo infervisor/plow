@@ -4994,6 +4994,27 @@ Read the -174 us/layer as a LOWER BOUND on EP, not an estimate of it.
 
 XREDUCE2 is 99% straggler in BOTH arms -- it is pure wait -- and EP adds 301 us per collective to
 it. Since balancing is ruled out, what remains is the dispatch structure EP adds: 4 standalone
-align launches between cooperative packets, residual 1.5 -> 100.9 us. Hence the interpreter align
-now filters to this rank's expert window itself (off `i[5]` and the program uniform's rank), so EP
-needs no specialist object on gfx942 and adds no standalone dispatch at all.
+align launches between cooperative packets, residual 1.5 -> 100.9 us.
+
+So the interpreter align now filters to this rank's expert window itself, off `i[5]` and the
+program uniform's rank, reproducing `balanced_expert_range` on-device. EP then needs no specialist
+object on gfx942 and adds no standalone dispatch at all. That was the cause:
+
+                             specialist align   interpreter align
+    packets (TP has 47)            43                  47
+    MOE_ALIGN_PF in trace       absent              68.3 us
+    residual                   100.9 us             51.6 us
+    XREDUCE2 vs TP              +602 us             +152 us
+    traced body vs TP           -148 us             -423 us
+
+Four dispatches per layer, on 8 ranks, cost ~450 us of the 561 us the MoE pair had saved -- not
+because the launches are slow but because each is a point where 8 ranks resynchronise, and the
+next collective bills the spread. It is worth stating plainly: the MoE arithmetic was never the
+problem with EP, and neither was expert placement. The SEGMENTATION was.
+
+Cost of the device-side filter: nothing. The prefill row is unchanged at 256 VGPR / 64720 B LDS /
+122 spills, because the window collapses into `< n_exp` guards the op already had.
+
+`PLOW_MOE_EP_CUTS` is refused without the specialist align -- it is a host-side table and the
+interpreter derives the even split on-device, so binding weights one way while filtering the other
+would hand a rank rows for experts it does not hold.
