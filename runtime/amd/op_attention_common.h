@@ -2965,7 +2965,23 @@ __device__ void d_flash_mla_prefill_fp8(float* __restrict__ Opart, float* __rest
 #endif
 /* Heads per group in the NoPE gathered prefill. GF is what sets how many times the gathered latent
  * is re-streamed: n_head/GF groups, each re-reading the whole top_k set. V4.1 at TP8 has n_head=8,
- * so GF=8 reads it ONCE. The cost is oacc[GF][8] in arch-VGPR. */
+ * so GF=8 reads it ONCE. The cost is oacc[GF][8] in arch-VGPR.
+ *
+ * SWEPT, and the maximum wins outright. Measured on 8x MI300X, V4.1 layer 2 at T=8192, two
+ * interleaved passes, FLASH_GATHER_PREFILL body and the layer median:
+ *
+ *     GF=8   2968.8 / 2925.2 us    layer 14888.5 / 14988.1   <- V4.1 default
+ *     GF=4   3291.1 / 3302.8 us    layer 15079.9 / 15338.4    +12%
+ *     GF=2   4417.8 / 4413.9 us    layer 16137.4 / 16143.6    +50%
+ *
+ * Exits identical at every GF. The trade this prices is REGISTERS against TRAFFIC -- GF=8 carries
+ * 64 f32 accumulators (oacc[8][8]) on a kernel already at the 256-VGPR cap, and halving GF halves
+ * them while doubling the latent re-streaming -- and traffic loses monotonically, so the register
+ * pressure is not what bounds this op.
+ *
+ * Read together with PLOW_FA_GATHER_ABL (+0.1% with every address tamed to a 64-row window), the
+ * pair says something neither says alone: the op is INSENSITIVE TO SCATTER LOCALITY and SENSITIVE
+ * TO VOLUME. The gather's randomness is free; the bytes are not. */
 #ifndef PLOW_FA_GATHER_GF
 #define PLOW_FA_GATHER_GF 4
 #endif

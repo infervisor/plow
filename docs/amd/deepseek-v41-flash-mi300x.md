@@ -4752,3 +4752,24 @@ shape.
 
 Every line above is either measured-and-closed or measured-and-taken. **90 ms remains 0.99x the
 roofline floor (12.56), and the gap is not in any one op.**
+
+### 12.59a The gather's randomness is free; its bytes are not
+
+12.59 closed the MFMA hypothesis for `FLASH_GATHER_PREFILL`. One lever on that op had still never
+been swept: `PLOW_FA_GATHER_GF`, which trades ARCH REGISTERS against TRAFFIC. GF=8 carries 64 f32
+accumulators (`oacc[8][8]`) on a kernel already at the 256-VGPR cap and reads the gathered latent
+ONCE; halving GF halves the accumulators and doubles the re-streaming. Given 12.53's spill count
+and the ABL result that the op is not scatter-bound, the smaller GF looked like it should win.
+
+It does not. Two interleaved passes, op body and layer median:
+
+    GF=8   2968.8 / 2925.2 us    layer 14888.5 / 14988.1   <- V4.1 default, unchanged
+    GF=4   3291.1 / 3302.8 us    layer 15079.9 / 15338.4    +12%
+    GF=2   4417.8 / 4413.9 us    layer 16137.4 / 16143.6    +50%
+
+Exits identical at every GF. Monotone, so register pressure is NOT what bounds this op.
+
+**Read with `PLOW_FA_GATHER_ABL` (+0.1% with every address tamed to a 64-row window), the pair says
+what neither says alone: the op is insensitive to scatter LOCALITY and sensitive to VOLUME.** The
+default was already right, and this is the fourth and last hypothesis about the layer's biggest op
+to be measured and closed.
