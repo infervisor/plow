@@ -1689,6 +1689,36 @@ impl Builder {
         i as u32
     }
 
+    /// Why no chain qualified. The bare assert named the shape it wanted and nothing about what
+    /// the graph actually had, which is the difference between a five-minute answer and a bisect.
+    fn ep_ineligibility_report(&self, degree: u32) -> String {
+        let mut out = String::new();
+        for op in self.ops.iter() {
+            let g = &op.inst;
+            if g.op != DevOp::MoeGroupGluPf as u16 {
+                continue;
+            }
+            let full_i = g.i[0].checked_mul(degree);
+            out.push_str(&format!(
+                "\n  MoeGroupGluPf enc=i[3]={} (EP needs 2=MXFP4), ep=i[6]={} (needs 0), \
+                 imoe=i[0]={} hidden=i[1]={} n_exp=i[2]={}; full_i={:?} (needs %128==0), \
+                 hidden%128={}, n_exp>=degree: {}",
+                g.i[3],
+                g.i[6],
+                g.i[0],
+                g.i[1],
+                g.i[2],
+                full_i,
+                g.i[1] % 128,
+                g.i[2] >= degree,
+            ));
+        }
+        if out.is_empty() {
+            out.push_str("\n  the graph emits no MoeGroupGluPf at all");
+        }
+        out
+    }
+
     fn rewrite_replicated_moe_prefill_ep(&mut self, degree: u32) -> usize {
         assert!(degree > 1, "EP degree must exceed one");
         let mut chains = Vec::new();
@@ -1718,7 +1748,11 @@ impl Builder {
                 c.op == DevOp::MoeCombinePf as u16
                     && c.t[3] == d.t[0]
                     && c.i[0] == d.i[0]
-                    && c.i[1] == 16
+                    // i[1] is the combine's top_k. This used to require == 16, which is Kimi-K3's
+                    // top_k and not a property of the rewrite: DeepSeek-V4.1 routes top-6 and was
+                    // silently ineligible. What the rewrite actually needs is a real per-slot
+                    // combine (k > 1) whose k agrees with the align's, which is checked below.
+                    && c.i[1] > 1
                     && c.i[2] != 0
                     && c.i[3..].iter().all(|&v| v == 0)
             }) else {
@@ -1746,7 +1780,9 @@ impl Builder {
                         && a.t[0] == g.t[4]
                         && a.i[0] == self.ops[combine].inst.i[2]
                         && a.i[1] == g.i[2]
-                        && a.i[2] == 16)
+                        // ...and the align's top_k must be the combine's, rather than both being
+                        // required to be the literal 16.
+                        && a.i[2] == self.ops[combine].inst.i[1])
                         .then_some(i)
                 })
                 .collect();
@@ -1861,7 +1897,8 @@ impl Builder {
             let rewritten = self.rewrite_replicated_moe_prefill_ep(degree);
             assert!(
                 rewritten != 0,
-                "replicated MoE EP requested at degree {degree}, but the complete graph has no eligible MXFP4 align/GLU/down/combine -> TP-reduction boundary"
+                "replicated MoE EP requested at degree {degree}, but the complete graph has no eligible MXFP4 align/GLU/down/combine -> TP-reduction boundary.{}",
+                self.ep_ineligibility_report(degree)
             );
             eprintln!("  whole-graph placement: {rewritten} routed-MoE boundaries use EP{degree}");
         }

@@ -2190,9 +2190,12 @@ fn moe_mxfp4_routes_with_scratch(
                 .all(|(d, _)| d.op == DevOp::MoeAlignPf as u16)
             {
                 let first = ep_members[0].0;
+                // `i[2]` is the align op's top_k. It used to be required to equal 16, which is
+                // Kimi-K3's top_k and not a property of the boundary -- DeepSeek-V4.1 routes
+                // top-6 and reached here only to be rejected as an "invalid EP align packet set".
                 if first.i[0] != prog.t
                     || first.i[1] == 0
-                    || first.i[2] != 16
+                    || first.i[2] == 0
                     || ep_members.iter().any(|(d, _)| {
                         d.t[..5] != first.t[..5]
                             || d.i[0] != first.i[0]
@@ -2298,12 +2301,12 @@ fn moe_mxfp4_routes_with_scratch(
         if set.len() == 1 {
             let i = *set.first().unwrap();
             let d = &prog.insts[i];
-            if moe_ep_stage1_inst(d) {
-                let (a4, a4_scale) = stage1_a4_scratch.ok_or_else(|| {
-                    RuntimeError::Device(
-                        "EP stage-1 requires the reusable A4 quantization scratch".into(),
-                    )
-                })?;
+            // `stage1_a4_scratch` is Some exactly when BOTH lean stage-1 specialists loaded
+            // (they are gfx950-only), so its absence means "no specialist", not "bad packet":
+            // the interpreter's `d_moe_group_glu_pf` runs the same GLU and skips a null weight
+            // base, which is all EP asks of stage 1. Falling through is what makes the boundary
+            // reachable on gfx942.
+            if let (true, Some((a4, a4_scale))) = (moe_ep_stage1_inst(d), stage1_a4_scratch) {
                 let row_bytes = tensors
                     .get(d.t[5] as usize)
                     .ok_or_else(|| RuntimeError::Device("EP row-token handle is invalid".into()))?
@@ -2369,23 +2372,22 @@ fn moe_mxfp4_routes_with_scratch(
                 }));
                 continue;
             }
-            if moe_ep_stage2_inst(d) {
-                let weight_table =
-                    companion(d.t[2], "expert_weight_table", "expert_weight_table_moe2")?
-                        .ok_or_else(|| {
-                            RuntimeError::Device(
-                                "EP stage-2 requires its shuffled down-weight companion table"
-                                    .into(),
-                            )
-                        })?;
-                let weight_scale_table =
-                    companion(d.t[3], "expert_scale_table", "expert_scale_table_moe2")?
-                        .ok_or_else(|| {
-                            RuntimeError::Device(
-                                "EP stage-2 requires its shuffled down-scale companion table"
-                                    .into(),
-                            )
-                        })?;
+            // The `_moe2` companions hold the down weights RE-SHUFFLED for the CDNA4 stage-2
+            // kernel's fragment order, so a packet built for a part without that kernel does not
+            // declare them. Absent, the interpreter's `d_moe_group_down_pf` runs the segment: it
+            // already scatters `part[row_partidx[row]][H]` scaled by `row_gate[row]` and skips a
+            // null weight base, which is stage-2's contract in the shipped layout.
+            // Resolved BEFORE the `if` and only for a stage-2 instruction: `companion` rejects a
+            // `TENSOR_NONE16` handle, and every other op in the segment reaches this line.
+            let ep_stage2_tables = if moe_ep_stage2_inst(d) {
+                (
+                    companion(d.t[2], "expert_weight_table", "expert_weight_table_moe2")?,
+                    companion(d.t[3], "expert_scale_table", "expert_scale_table_moe2")?,
+                )
+            } else {
+                (None, None)
+            };
+            if let (Some(weight_table), Some(weight_scale_table)) = ep_stage2_tables {
                 let rows = tensors
                     .get(d.t[6] as usize)
                     .ok_or_else(|| RuntimeError::Device("EP row-part handle is invalid".into()))?
@@ -4512,12 +4514,28 @@ fn bind_packed_experts(
                 blob.tensors[*i_ewt].bytes
             )));
         }
-        i_moe = i_moe_of(*i_ewt).ok_or_else(|| {
-            RuntimeError::Device(format!(
-                "{pfx}expert_weight_table is declared but no decode instruction \
-                 streams experts through it — nothing to pack against"
-            ))
-        })?;
+        i_moe = match i_moe_of(*i_ewt) {
+            Some(width) => width,
+            // An EP packet declares BOTH tables. `rewrite_replicated_moe_prefill_ep` points every
+            // prefill GLU/DOWN at the `_ep` companion and leaves the base table to the decode
+            // program -- so on a PREFILL-ONLY rung the base table is provably dead rather than
+            // mis-bound, and packing it would gather a checkpoint slice no op ever reads.
+            //
+            // The guard still fires for its own case: a table with no streaming instruction and
+            // no EP companion to explain it.
+            None if !*ep_table
+                && !*shared_fold
+                && names.iter().any(|x| *x == format!("{pfx}expert_weight_table_ep")) =>
+            {
+                continue;
+            }
+            None => {
+                return Err(RuntimeError::Device(format!(
+                    "{pfx}expert_weight_table is declared but no decode instruction \
+                     streams experts through it — nothing to pack against"
+                )));
+            }
+        };
         // WHICH SPELLING, from the checkpoint, before anything is sized against
         // it — then the weight/scale size agreement, once, for expert 0.
         let en = resolve_expert_names(ckpt, pfx)?;
@@ -6636,9 +6654,20 @@ impl AmdEngine {
             .prefill_phase()
             .any(|p| p.insts.iter().any(lean_attn_res_f32mix_inst64));
         if need_moe_ep {
-            if arch != "gfx950" {
+            // EP's DEVICE requirement is that the grouped prefill GEMM skip an expert whose weight
+            // base is null, and `d_moe_group_pf_a4w4` does exactly that on both parts:
+            //     if (wb0 == 0ull) continue;  /* EP: expert not local */   [op_moe.h]
+            // The gfx950 lean stage-1 specialist ELF is a FASTER path, not a correctness one, and
+            // it is already loaded conditionally (`arch == "gfx950" && need_moe_stage1_lean`
+            // below), so on gfx942 EP simply runs on the ordinary grouped kernel. What genuinely
+            // cannot run elsewhere is a packet carrying lean stage-1 MXFP4 SEGMENTS, whose kernel
+            // (`plow_moe1_a4_reuse_16x16x128_gfx950`) is built on a CDNA4-only MFMA shape.
+            //
+            // This used to refuse ALL non-gfx950 EP, which made the whole placement unreachable on
+            // MI300X even though the kernel supports it.
+            if arch != "gfx950" && blob.prefill_phase().any(has_moe_stage1_mxfp4_segment) {
                 return Err(RuntimeError::Device(format!(
-                    "replicated-input MoE EP requires gfx950 specialist objects, but this device is {arch}"
+                    "replicated-input MoE EP with lean stage-1 MXFP4 segments requires gfx950 specialist objects, but this device is {arch}"
                 )));
             }
             let bind = tp.ok_or_else(|| {
@@ -8424,18 +8453,34 @@ impl AmdEngine {
                 std::mem::size_of::<MoeEpAlignArgs>() as u32,
                 0,
             )?;
-            let stage2 = load_ep(
-                "moe_ep_stage2_gfx950.elf",
-                "plow_moe2_ep_full_i_16x16x128_gfx950",
-                &[
-                    "plow_moe2_mxfp4_stage2_abi_3",
-                    "plow_moe2_mxfp4_stage2_no_spill_1",
-                    "plow_moe2_ep_full_i_3072",
-                    "plow_moe2_ep_full_i_vgpr_le_128",
-                ],
-                std::mem::size_of::<MoeStage2Mxfp4Args>() as u32,
-                4_352,
-            )?;
+            // OPTIONAL, unlike align and combine. Stage-2's body is the scaled MFMA
+            // `v_mfma_scale_f32_16x16x128_f8f6f4`, which exists only on CDNA4, so gfx942 cannot
+            // build it -- but it is an ACCELERATION of a contract the interpreter already
+            // implements: `d_moe_group_down_pf` scatters `part[row_partidx[row]][H]` scaled by
+            // `row_gate[row]` and skips a null weight base, which is byte-for-byte the work
+            // stage-2 does. Absent, `prefill_segment_launches` falls through to the interpreter.
+            //
+            // Align and combine stay REQUIRED because nothing else does their work: align is what
+            // restricts the tile list to `[expert_begin, expert_end)`, and combine is what makes
+            // the boundary correct at all -- under EP the ranks that do not own slot `s` never
+            // write `part[token*k + s]`, so a combine that summed every slot would read rows no
+            // kernel wrote. Both are pure VALU and build on either arch.
+            let stage2 = if hsaco_dir.join("moe_ep_stage2_gfx950.elf").exists() {
+                Some(load_ep(
+                    "moe_ep_stage2_gfx950.elf",
+                    "plow_moe2_ep_full_i_16x16x128_gfx950",
+                    &[
+                        "plow_moe2_mxfp4_stage2_abi_3",
+                        "plow_moe2_mxfp4_stage2_no_spill_1",
+                        "plow_moe2_ep_full_i_3072",
+                        "plow_moe2_ep_full_i_vgpr_le_128",
+                    ],
+                    std::mem::size_of::<MoeStage2Mxfp4Args>() as u32,
+                    4_352,
+                )?)
+            } else {
+                None
+            };
             let combine = load_ep(
                 "moe_ep_combine_gfx950.elf",
                 "plow_moe_ep_combine_gfx950",
@@ -8448,7 +8493,7 @@ impl AmdEngine {
                 std::mem::size_of::<MoeEpCombineArgs>() as u32,
                 0,
             )?;
-            (Some(align), Some(stage2), Some(combine))
+            (Some(align), stage2, Some(combine))
         } else {
             (None, None, None)
         };

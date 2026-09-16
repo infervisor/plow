@@ -303,11 +303,12 @@ pub(crate) fn dsv41_shard_of(suffix: &str) -> Option<Shard> {
         // its own 48 experts could not pick the global top-6. 384 * 5120 bf16 is 3.9 MB, so the
         // replication costs nothing worth splitting for.
         "ffn.gate.weight" | "ffn.gate.bias" | "ffn.gate.bias_vl" => Replicated,
-        // The routed experts under the DEFAULT (TP) placement: gate/up column-parallel over
-        // `moe_inter`, down reducing over it, exactly like the shared expert. `PLOW_MOE_PREFILL_EP`
-        // would instead give each rank 384/8 = 48 WHOLE experts, which is a different answer for
-        // these names -- but it is opt-in and OFF by default (`knob_spec.rs:762`), and this emit
-        // does not implement it, so the default is what is encoded here.
+        // The routed experts: gate/up column-parallel over `moe_inter`, down reducing over it,
+        // exactly like the shared expert. `PLOW_MOE_PREFILL_EP` gives each rank 384/8 = 48 WHOLE
+        // experts at the full `moe_inter` instead -- but these arms are reached ONLY for the byte
+        // budget (the routed experts are packed by `bind_packed_experts`, never declared as packet
+        // tensors), and the budget is the same number either way: 48 * 2304 == 384 * 288. So one
+        // answer serves both placements here, and the placement itself is chosen in the runtime.
         _ if is_routed_expert(suffix, "w1") || is_routed_expert(suffix, "w3") => OutSplit,
         _ if is_routed_expert(suffix, "w2") => InSplit,
         // mHC mixes the RESIDUAL stream, which is replicated -- restoring it is what the reduce
@@ -1498,7 +1499,10 @@ pub(crate) fn emit_dsv41_moe(
         c.top_k,
         c.moe_inter,
         tp,
-        false, // EP is opt-in and this emit does not implement it; see `dsv41_shard_of`.
+        // The GLM MoE descriptor's own EP flag stays FALSE even under `PLOW_MOE_PREFILL_EP`: the
+        // placement is applied by the whole-graph rewrite in `Builder::finish`, not by emitting
+        // pre-widened ops here. See the note at `set_moe_prefill_ep_degree`.
+        false,
         c.raw.routed_scaling_factor,
         1,
         1,
@@ -2322,6 +2326,22 @@ pub(crate) fn emit_dsv41_block(
 
     let mut b = Builder::new(n_cu);
     b.set_tensor_dedup(true);
+    // EXPERT PARALLEL for the routed MoE (PLOW_MOE_PREFILL_EP, opt-in). Under the default TP
+    // placement each rank holds all 384 experts sliced to moe_inter/tp = 288, and 288 is what makes
+    // `down`'s k-loop too short to amortise the grouped GEMM's per-tile expert-weight reload --
+    // the term 12.63 measured as the MoE pair's binding cost. EP gives each rank 384/tp = 48 WHOLE
+    // experts at the full 2304 instead.
+    //
+    // It needs no new collective: every rank already holds the whole replicated residual, so each
+    // one runs only its LOCAL experts and writes zeros elsewhere, and the XReduce that already sums
+    // the shared-expert partials folds the routed ones in the SAME reduction. `Builder::finish`
+    // does the whole-graph rewrite (`rewrite_replicated_moe_prefill_ep`), which finds the
+    // align/GLU/down/combine -> TP-reduction chains, swaps the expert weight/scale tables for `_ep`
+    // companions the runtime binds with local bases, and derives the full width as i[0] * degree --
+    // so the emit below keeps its TP-sliced `moe_inter / tp` and does NOT pre-divide anything.
+    b.set_moe_prefill_ep_degree(
+        (crate::emit_is_amd() && crate::emit_config::active().moe_prefill_ep).then_some(tp),
+    );
     b.adopt_tensors(tensors);
     let all = b.all();
     let mut xgate = 0u32;

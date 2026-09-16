@@ -2175,6 +2175,42 @@ if { [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] || [ "${PLOW_K3_DECODE_GROUPED:-0}" = 1
   fi
 fi
 
+# --- prefill expert-parallel boundary objects -----------------------------------------------
+# The gfx950 twin builds three of these; this builds TWO, and the missing one is deliberate.
+#
+#   align    filters the tile list to this rank's `[expert_begin, expert_end)`. Pure VALU. It
+#            gets THE SAME -DMPF_BM as the interpreter row, because the consumer reads its
+#            `rowoff`/`tilep` back as `rowoff[e] + (mt - tilep[e]) * MPF_BM`: at the wrong tile
+#            height that addresses another expert's rows rather than degrading.
+#   combine  sums only the slots whose expert this rank owns, which is what makes EP CORRECT:
+#            the ranks that do not own slot `s` never write `part[token*k + s]`, so the ordinary
+#            combine would read rows no kernel wrote. Pure VALU.
+#   stage2   is NOT built here. Its body is `v_mfma_scale_f32_16x16x128_f8f6f4`, CDNA4-only. It
+#            is an acceleration, not a requirement: `d_moe_group_down_pf` already scatters
+#            `part[row_partidx[row]][H]` scaled by `row_gate[row]` and skips a null weight base,
+#            which is the same contract, and plowrt loads stage2 only if the object exists.
+#
+# The `_gfx950` stem is kept because plowrt resolves these by literal filename and symbol, and
+# neither name is derived from the agent (unlike `plow_interp*_gfx942`). $OUT is arch-qualified.
+rm -f "$OUT/moe_ep_align_gfx950.co" "$OUT/moe_ep_align_gfx950.elf" \
+      "$OUT/moe_ep_combine_gfx950.co" "$OUT/moe_ep_combine_gfx950.elf"
+if [ -n "$CFG" ] &&
+   grep -qx '#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP 1' "$CFG"; then
+  echo ""
+  echo ">>> prefill expert-parallel boundary objects"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_ep_align_gfx950.elf" plow_moe_ep_filter_align_gfx950 64 2 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    ${MPF_BM:+-DMPF_BM=$MPF_BM} \
+    -DPLOW_REQUIRED_MARKER=plow_moe_ep_filter_align_no_spill_1 \
+    "$R/bench/amd/moe_ep_boundary/filter_align.hip" || exit 1
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_ep_combine_gfx950.elf" plow_moe_ep_combine_gfx950 64 2 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe_ep_combine_no_spill_1 \
+    "$R/bench/amd/moe_ep_boundary/combine.hip" || exit 1
+fi
+
 echo ""
 [ "$fail" = 0 ] || { echo "!!! one or more rows are over the cliff or missing"; exit 1; }
 
