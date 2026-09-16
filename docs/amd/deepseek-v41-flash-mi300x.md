@@ -2933,6 +2933,73 @@ bandwidth.** It is issuing one element per lane per step (§12.19) or running a 
 nothing resident to hide it (§12.20), and both are visible by reading the loop and comparing
 against a sibling op that does the same traffic.
 
+### 12.21 The largest GEMM's tile could not be shown to take, and it is already the finest legal one
+
+`GEMM_FP8_MX` (op 184) is 123.8 ms — the largest GEMM line in the model and second-largest line
+overall. Every build this campaign has run ended with
+
+```
+FAIL  geom_contract.h: GM_MX_BM is a tunable in runtime/amd but has no PLOW_GEOM_MARK line,
+      so a -DGM_MX_BM could not be shown to have taken
+FAIL  geom_contract.h: GM_MX_BN ...
+```
+
+and every one of those builds was waved through as "pre-existing, not mine". It was not noise. Its
+own file says what the rule is for: *"A knob added without a marker is therefore a build failure"* —
+because without the marker nothing proves a `-D` reached the object. **The tile knobs of the
+model's biggest GEMM were untunable, and the audit had been saying so all along.** Two
+`PLOW_GEOM_MARK` lines fix it, and the build goes **rc=1 to rc=0** — the first clean audit of this
+campaign.
+
+#### What the now-measurable knob measures
+
+| tile | `GEMM_FP8_MX` | straggler/pk | whole model |
+|---|---|---|---|
+| 128 x 128 (default) | **123.8 ms** | 164 us | **854 ms** |
+| 256 x 128 | 138.9 ms | 279 us | 865 ms |
+| 128 x 64, 64 x 128 | *will not compile* | | |
+
+The default wins, and the two that would have helped do not exist. `d_gemm_t`'s own static asserts
+say why:
+
+* `BN % (WN * MFMA_N) == 0` with `WN=4`, `MFMA_N=32` forces **BN % 128 == 0**.
+* `APT % 8 == 0` ("tile must stage in 16-byte units") with `APT = BM*BK/512` at **BK=32** forces
+  **BM % 128 == 0**.
+
+So the entire legal tile space here is {128, 256} x {128, 256}, and 128 x 128 is already the
+FINEST member of it. That matters because of what the straggler is: 164 us of a 375 us body is a
+**44% tail**, and at N=1280 a 128 x 128 tile gives (8192/128) x (1280/128) = 640 tiles over 304 CUs
+= 2.1 waves, whose last wave is ~10% occupied. The arithmetic and the measurement agree, which
+means the tail is not a tuning miss — **it is structural, and no legal tile fixes it.**
+
+The route out is the one the kernel's own header already named and had no number for:
+
+> BK=32 IS THE POINT, NOT AN ARBITRARY TILE. ... The cost is a halved K step, i.e. twice the LDS
+> traffic per MFMA, and it is UNMEASURED -- a BK=64 variant promoting twice per tile is the
+> optimization to try once there is a number to beat.
+
+There is now a number to beat (123.8 ms), and a second reason to want BK=64 that the note does not
+mention: at BK=64, `APT = BM*64/512` makes **BM=64 stage legally**, so BK=64 is not just half the
+LDS traffic — it is the only way to reach the finer tile that would close the 44% tail. Both wins
+come from the same change. Not attempted here; it is a real change inside a heavily-templated
+`d_gemm_t`.
+
+#### And the tuning database cannot help, for a nameable reason
+
+The emit warns on every build:
+
+> `tunedb amd/gfx942/mi300x: 4961 record(s) skipped as STALE ... NO usable records remain, so tile
+> selection fell back to the analytical model` — `pick_tile` reports tier `portable`, "what it
+> reports when no campaign has ever run."
+
+`plowc tune gemm --shapes auto` derives the compiler's demand by **running a real emit**, so it
+takes the whole-model path and hits `deepseek_v41: no device emit yet` — it never sees `--block`.
+V4.1 is therefore in exactly the category the CLI documents an escape for ("the models `auto`
+cannot yet reach (Kimi-K3 has no full-model emit, so its demand cannot be observed)"), and a
+hand-written `--shapes <FILE>` is the way in. Also worth recording: the tuning digest includes the
+INTERPRETER, so every kernel change in §12.19-§12.21 invalidates the database again. **A tuning
+campaign has to be the last thing done, not the first.**
+
 ### 12.2 What is still not demonstrated
 
   * ~~ONE layer, not 40.~~ **Superseded by §12.18**: all 40 layers emit and run as
@@ -2943,9 +3010,11 @@ against a sibling op that does the same traffic.
   * No reference parity. The input is synthetic; correctness so far is
     "finite and stable" plus an op census that matches the config (§12.18), not
     "right". This is now the largest single gap.
-  * **854 ms against 90 ms** (§12.19 and §12.20 took 138 ms off §12.18's 992,
-    neither in a V4.1 op). §12.18 itemizes the baseline: the V4.1-specific
-    machinery is
+  * **853 ms against 90 ms** (§12.19 and §12.20 took 139 ms off §12.18's 992,
+    neither in a V4.1 op; §12.21 showed the next 124 ms line is already on its
+    finest legal tile). Closing the remaining 9.5x is not a list of point fixes:
+    it needs the whole GEMM/MoE/collective pipeline at MFMA efficiency, which is
+    a campaign. §12.18 itemizes the baseline: the V4.1-specific machinery is
     2.8% of the time, and the gap is in `GEMV_F32` (134.8 ms), `GEMM_FP8_MX`
     (129.9), `MOE_GROUP_DOWN_PF` (109.5), `HYPER_CONN_PRE` (102.8) and
     `XREDUCE2` (86.1, of which 99% is straggler).
