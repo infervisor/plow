@@ -5799,3 +5799,70 @@ wrong answer rather than a fault -- which is the failure mode this campaign has 
 (12.67, 12.73).
 
 The ablation is default off and the unablated emit is byte-identical to the packet 12.80 measured.
+
+## 12.82 Sequence parallelism, built: 1.09 ms/layer, and why 12.81 over-promised
+
+12.81 priced sequence parallelism at 2.55 ms/layer by ablation. Built, it is **1.09 ms/layer**.
+The ablation was not wrong about the work it deleted; it was wrong about the work that deleting it
+makes necessary.
+
+**What SP does here.** Under plain TP the seam is an all-reduce, so every rank leaves it holding all
+8192 rows and every rank runs the mHC pair over all of them. That redundancy is the target: eight
+ranks each computing the same `HYPER_CONN_PRE`/`HYPER_CONN_POST`. Turn the seam into a
+reduce-scatter and rank `r` owns rows `[r*t/tp, (r+1)*t/tp)` -- 1024 of them -- so the pair runs on
+an eighth of the work. The next RMSNORM wants full rows again, so each seam gains an all-gather.
+
+    op                     TP        SP            delta
+    seam collectives     1709      1520 us         -189   XREDUCE2 -> XREDUCESCATTER + XALLGATHER
+                                   (923 + 597)
+    HYPER_CONN pair      1208      ~150 us       -1058    banded to t/tp rows
+    GEMV_F32             1211       930 us        -281
+    layer, min of 30    16280     15190 us       -1090
+
+**Where 12.81's 2.55 ms went.** The ablation removed the redundant mHC work and measured what was
+left. It never paid for the all-gathers, because in an ablation there is nothing to gather -- the
+rows were already there. Those two `XALLGATHER`s bill 597 us, and the scatter side saves only 189 us
+against the all-reduce it replaces, so the collective swap is very nearly free and the whole win is
+the banding. -2553 + 597 = -1956, and the remaining ~870 us is that the deleted mHC work was
+partly absorbing seam wait rather than adding to the critical path. The lesson is the one 12.72
+already taught in the other direction: an ablation prices a *cut*, not a *transform*, and a
+transform has to pay for the plumbing that makes the cut legal.
+
+**The ladder.**
+
+    before this campaign's attention work   16975 us   679 ms
+    + gather fold removed                   16560 us   662 ms
+    + gathered union split 2                16471 us   659 ms
+    + sequence parallelism                  15190 us   615 ms   (min-of-30 basis)
+
+**Measure on `min`, not `median`, on this machine.** A 30-iteration A/B showed multi-second
+outliers in *both* arms -- 628 ms and 245 ms iterations under plain TP, 20.7 s and 6.8 s under SP.
+They are contention from other tenants, not a collective hanging: they appear with the seam
+unchanged. The medians move with whatever else is running, so the contention-free floor is the only
+stable statistic here.
+
+**Numerics: reassociation, and the 97.5-ULP element is not a counterexample.** The whole-tensor exit
+statistics cannot verify SP at all -- under SP rank 0 writes only its own band, so 7/8 of the dumped
+residual is untouched entry data and the exit mean reads -0.000077 against the reference's
+-0.000643 *by design*. The verification that means something is band-by-band: rank `r`'s rows
+against the non-SP answer's same rows. A repeat-run control first established that the non-SP
+program is bit-deterministic (`maxd` exactly 0), so any SP difference is real.
+
+    mean |d| 7e-6 against RMS 0.137        2.4-2.8% of elements > 1 bf16 ULP
+    among |ref| > 1: max d 7.8e-3 = 2 ULP  rank 0 worst element: 97.5 ULP at |ref| = 0.1
+
+That last number looks alarming and is not. It is a *relative* measure on a near-zero element: the
+mHC mixes four residual copies with signed weights, so elements that land near zero do so by
+cancellation, and cancellation amplifies relative error without amplifying absolute error. The
+absolute difference there is 3.9e-2 on a tensor whose RMS is 0.137. The elements that are actually
+large -- where a wrong band would show -- agree to 2 ULP. A banding bug cannot produce that shape;
+it would corrupt large and small elements alike.
+
+**Inert when off.** With `PLOW_DSV41_SEQ_PAR=0` the emit is byte-identical to the packet 12.80
+measured, so the default path is unchanged.
+
+**What this does not do.** 615 ms against a 200 ms goal is still 3.1x. SP was the last *structural*
+win available on the seam; what remains is arithmetic efficiency, and it is all in two places. The
+MoE pair (`MOE_GROUP_GLU_PF` + `MOE_GROUP_DOWN_PF`) bills 4450 us against a ~335 us fp8 roofline,
+and `GEMM_FP8_MX` bills 2832 us across nine calls with a 48% straggler. Neither is a parallelism
+problem and neither is addressed by any form of sharding.
