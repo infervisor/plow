@@ -5682,3 +5682,29 @@ dynamic expert placement could reach, and dynamic placement means moving 6 MB of
 per batch. The MoE scheduling wins that were real this campaign are 12.67's coverage bug -- the
 grouped GEMM was computing 17.9% of its routed rows -- and the within-rank work distribution, which
 is histogram-independent.
+
+## 12.78 The shippable number is 662 ms, not 582
+
+12.75's 14540 us was measured on the EP packet with 12.74's cut list. 12.77 retired that cut list as
+an oracle, so the number it produced is not a configuration anyone can run. The shipping path is TP
+(`moe_prefill_ep` is opt-in and off), and the attention rebalance had not been measured there.
+
+Re-measured on TP, both sides carrying 12.67's MoE coverage fix, three interleaved pairs of 16:
+
+| TP8, real entry                  |  median us | 40 layers |
+|----------------------------------|-----------:|----------:|
+| before the attention rebalance    |      16978 |    679 ms |
+| after (no fold, gather split 2)   |      16539 |    662 ms |
+
+Exits identical on both sides (min -1.36719, max 3.67188, mean -0.000643). -440 us/layer, which
+tracks the -450 measured on the EP packet, as it should: the change is in the attention body and
+does not know which MoE parallelism it is running under.
+
+A NOTE ON THE BASELINE. The first attempt at this comparison read 13.6 ms for "before" and exit mean
+-0.000761. That object set predates 12.67 and was computing 17.9% of its routed rows -- it is fast
+because it is wrong. The exit mean is the tell, and it is worth keeping as the check: -0.000761 is
+the broken MoE, -0.000643 the fixed one. Any V4.1 layer-2 number quoted against -0.000761 is a
+number for a different model.
+
+Session position against the 200 ms goal: 662 ms, so 3.3x. Attention is now 1441 us of the 16539,
+and the backlog in 12.75 is unchanged.
