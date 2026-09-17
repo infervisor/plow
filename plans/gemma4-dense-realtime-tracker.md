@@ -104,6 +104,14 @@ checkpoint config, B=1 S=8192.
    (gelu_tanh), not SwiGLU". The unverified Tensile `activationType` integer to
    settle is the **gelu_tanh** one for this model.
 
+6. **On 12B the Tensile epilogue has no consumer.** The hipBLASLt route
+   (`GemmLtPf`, `lib.rs:4153`) is gated on 31B geometry (hidden 5376, inter
+   21504, N=5376 output projections). 12B (hidden 3840, inter 15360) routes its
+   output projections through Plow-native `gemma4_gemm_glu_gfx942.hip`
+   (`b9f85333`), whose epilogue already carries GeGLU. A1 as written is a
+   **31B** item; for 12B, epilogue fusion means the native body's epilogue,
+   and bias/scale there is a kernel edit, not a kernarg write.
+
 ## B0 — result
 
 The "ALL dense-GEMM tile(s) chosen by the ANALYTICAL MODEL" state had two
@@ -139,6 +147,63 @@ correctness oracle than the current one; the T2 numerics gate on hardware is
 not optional before any serving promotion. Re-running the campaign against
 the current family (`scripts/rebench_tune_gemm_gfx942.sh`) retires both
 caveats and is still the B0 deliverable.
+
+## A1 — Tensile epilogue word map (static, no hardware)
+
+Derived from the AMDGPU kernel metadata of the nix ROCm 7.14 hipBLASLt library
+the pinned specs are extracted from (`clang-offload-bundler --unbundle` of
+`TensileLibrary_BB_BB_HA_Bias_SAV_UA_Type_BB_…_Alik_Bljk_…_gfx942.co`, then
+`llvm-readelf --notes`). Validated against plow's existing `dstD` write at
+byte 140 (`amd_gemm_lt.rs:356`).
+
+The 5 bias specs (`…_BBS_BH_Bias_HA_S_SAV_UserArgs_…`, kernarg segment 160 B):
+
+| Byte | `Args` field | Tensile kernarg |
+|---:|---|---|
+| 0 | `dims[0]` | `Gemm info` — bits 31:30 select the argument mode; plow's `1` → mode 0 = **inline** kernargs |
+| 4..28 | `dims[1..7]` | `kernel info0/1`, `numWG`, `SizesFree0..2`, `SizesSum0` |
+| 32..56 | `pointers[0..3]` | `D`, `C`, `A`, `B` |
+| 64..92 | `strides[0..7]` | `strideD0/1`, `strideC0/1`, `strideA0/1`, `strideB0/1` |
+| 96, 100 | `alpha`, `beta` | f32 |
+| 104 | `epilogue[0..1]` | `AddressScaleAlphaVec` (f32 ptr, per-column alpha) |
+| 112 | `epilogue[2..3]` | `bias` (ptr) |
+| 120 | `epilogue[4]` | `biasType` (u32 enum) |
+| 124 | `epilogue[5]` | `StrideBias` |
+| 128 | `epilogue[6]` | `activationAlpha` (f32) |
+| 132 | `epilogue[7]` | `activationBeta` (f32) |
+| 136 | `epilogue[8]` | `activationType` (u32 enum) |
+| 140 | `epilogue[9..10]` | `dstD` (bf16 ptr) — the one word plow writes |
+| 148 | `epilogue[11..12]` | `Synchronizer` (ptr) |
+| 156 | `epilogue[13]` | `GSUSync` |
+
+The 3 no-bias specs (`…_BBS_BH_UserArgs_…`, `AFC0`) end at `beta`: kernarg
+segment **104 B**, no epilogue words at all. Plow's trailing 56 bytes are
+unread padding there, and the output goes through `D`. **A1 can attach only to
+the five bias specs.** The bias kernels are `AFC1` — the activation is a
+called function with its own symbol, not inlined in the kernel body.
+
+**`activationType` is settled statically, from the kernel's own dispatch.**
+`llvm-objdump` of the pinned `MT128x96x128` kernel: the inline-args path
+advances the kernarg base by 16 (`s_add_u32 s0, s0, 16`), then at
+`label_Load_Bias_End` compares the u32 at byte 136 with
+`3 → Gelu, 5 → Relu, 6 → Sigmoid, 11 → Silu, 13 → Clamp`, else None. The Gelu
+entry is the tanh approximation (`v_mul_f32 v8, 0x3d372713 (=0.044715), …`),
+which is Gemma's `gelu_tanh`. So for A1: **`epilogue[8] = 3`** for GeGLU
+(`11` for SiLU models). `hipblaslt.h` only carries the API-level
+`HIPBLASLT_EPILOGUE_*` enum (`GELU = 32`), which is not this value.
+
+Still unresolved, and not to be guessed: the `biasType` integer for a bf16
+bias (Tensile `DataType` enum). The bias load path is visible
+(`buffer_load_short_d16` + `v_lshlrev_b32 16`, i.e. bf16→f32), but which
+`biasType` selects it needs either the same disassembly pass on the bias
+cascade or a 1-GPU T2 (`scripts/tensile_args.py`). Not needed for an
+activation-only or scale-only epilogue.
+
+What A1 buys, stated plainly: Tensile has no *gated* epilogue. On the gate
+projection it can apply `gelu_tanh(gate)` in-register, but `act(gate) * up`
+still needs the multiply pass; the saving is the activation's read+write, not
+the whole GLU. And on 12B nothing routes through Tensile (finding 6), so A1 is
+a 31B item until 12B projections are re-routed to `GemmLtPf`.
 
 ## Workstream status
 
