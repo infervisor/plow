@@ -5708,3 +5708,54 @@ number for a different model.
 
 Session position against the 200 ms goal: 662 ms, so 3.3x. Attention is now 1441 us of the 16539,
 and the backlog in 12.75 is unchanged.
+
+## 12.79 Overlapping the TP seam: built, and the shape refuses it
+
+12.76 argued pipeline parallelism across GPUs is the wrong structure for one prefill. The structure
+that IS right for a TP collective is to pipeline it against its own producer, and the GLM prefill
+seam already had it (`emit_xreduce_twoshot_band`). Wired for V4.1: `PLOW_DSV41_XR_BAND=K` splits the
+`wo_b` GEMM into K row bands, each feeding its own two-shot, and `PLOW_DSV41_XR_BAND_CUS` gives the
+band collectives a CU prefix so workgroups outside it claim the next band's GEMM. Op 184 gained
+`a_row0`/`c_row0`.
+
+| V4.1 layer 2, 8k, TP8, real entry | median us |
+|-----------------------------------|----------:|
+| unbanded (default)                |     16471 |
+| K=2, band cus 152                 |     16549 |
+| K=2, band cus 228                 |     16542 |
+| K=2, full width                   |     16553 |
+| K=4, band cus 152                 |     16798 |
+
+Three interleaved folds of 16 iterations; run-to-run spread ~120 us. Everything but K=4 is inside
+it, and K=4 is worse. Exits identical at every K, so the row-band decomposition is right -- it is
+the overlap that does not pay.
+
+The reason is shape, and it is measurable rather than a matter of opinion. This seam's producer is
+ONE `[8192, hidden] x [orow]` GEMM of a few hundred us; its transfer is ~750 us. **There is less
+compute to hide the transfer under than there is transfer**, so finer bands only shrink the thing
+doing the hiding. The op that IS big enough is the MoE at 4.5 ms, and the MoE sits downstream of
+this collective through the residual and the norm, so it cannot hide it.
+
+What would work is sequence parallelism (`PLOW_GLM_SEQ_PAR` in the GLM path): the all-reduce becomes
+reduce-scatter plus all-gather and the norm/residual between seams runs on `t/tp` rows. That halves
+the seam traffic instead of trying to hide it, and it cuts the elementwise ops eightfold. It is not
+wired for V4.1 and is the open item this section leaves.
+
+## 12.80 Where the shipped number stands
+
+The TP ladder, each step measured against its own contemporaneous control, real entry, MoE coverage
+fix throughout:
+
+| step                                   | us/layer | 40 layers |
+|----------------------------------------|---------:|----------:|
+| before this campaign's attention work   |    16975 |    679 ms |
+| + gather fold removed (12.75)           |    16560 |    662 ms |
+| + gathered union split 2 (12.75)        |    16471 |    659 ms |
+
+12.78 attributed its 16539 to "no fold, gather split 2". It was fold-only: the packet it measured
+was emitted by a `plowc` built before the split default changed, which the 6-byte `opart`/`mlpart`
+sizing difference shows (nsplit 2 against 3). The split is worth a further ~90 us, in the same
+direction as the -113 us it measured on the EP packet, and at the edge of the TP noise.
+
+659 ms against the 200 ms goal, so 3.3x, and the gap is arithmetic efficiency: the MoE pair bills
+2154 us against a ~335 us fp8 roofline for the same MACs.
