@@ -556,6 +556,53 @@ bit-identical), 4-item rope passes with gamma hoisted (2 items at hd512),
 `#pragma unroll 4` GeGLU. Cell `campaign-bf16-light` (same packet + Lt table,
 objects rebuilt).
 
+**Refuted (2026-09-17, cell `campaign-bf16-light`, provisional).** The wide
+batches (8 chunks, 4 rope items) made every object wider: decode 194 → 255
+regs + 416 B stack, fat prefill stack 1176 → 2016 B, GEMM-only 1128 → 2296 B.
+TTFT 42.2 / 59.5 / 214.0 vs control 42.3 / 54.6 / 201.8; TPOT +0.4–0.9 ms.
+Seg-time at 4096: NormResidual+RmsNorm 153 → 227 µs, HeadNormRope 186 → 242,
+Glu 291 → 293 (unroll changed nothing). So the per-lane load-latency chain is
+NOT what bounds these bodies at 1 block/SM, and any extra register pressure in
+a light arm is paid by the whole megakernel. Next: ncu on the live fat
+launches (SOL, memory, warp-stall sections) before touching the bodies again.
+
+### The 128-token cell is launch-count bound (seg-time, 128 rows, one chunk)
+
+| family | launches | µs each | total |
+|---|---:|---:|---:|
+| Gemm (pre-Lt small rows; now Lt) | 69 | 54 | 3.7 ms |
+| NormResidual+RmsNorm | 76 | 37 | 2.8 ms |
+| FlashPrefill | 38 | 40 | 1.5 ms |
+| HeadNormRope | 38 | 22 | 0.8 ms |
+| Glu | 38 | 21 | 0.8 ms |
+
+The work per launch at 128 rows is microseconds (a 128×3840 norm moves 1 MB); the
+Argmax segment (no work) costs 13 µs, so ~13 µs is the fat object's per-launch
+floor and the light segments sit at 1.6–2.8× it — latency-bound (one row per SM,
+one warp active). Lt at M=128: 119 µs per layer (3 shapes, 300–330 TFLOP/s) =
+5.7 ms per chunk. Server-side plain-client TTFT 22 ms ≈ Lt 5.7 + fat 5.7 + FA 1.9
++ ~8 ms host/launch gaps. vLLM's 28.2 ms client-measured is ≈16 ms server-side.
+Conclusion: at 128 rows nothing is bandwidth- or compute-bound; the levers are
+(1) fewer launches (fused QKV = −96, fused gate|up = −48 Lt calls per chunk;
+folding light ops into GEMM epilogues needs Plow's own small-M GEMM), (2) a
+cheaper per-launch floor (light-only object: small smem, low regs), (3) the
+~8 ms of host gaps (graph capture INCLUDING the Lt calls — seg-graph alone was
+null; check whether the capture spans them).
+
+### plowrt VMM prefix review (merged 2026-09-17, branch `gemma4-plowrt-vmm-fixes`)
+
+Reviewed the four reported issues; merged as 50f89816.
+- A confirmed: auto-activation keyed to the 12B geometry; `PLOW_PREFIX_CACHE=0`
+  already disables every VMM side effect. Decision now logged (`mode=auto|explicit|off`).
+- B confirmed (worse): every prefill completion / slot recycle published a snapshot
+  (~160 pitched copies, cudaMalloc, stream sync, evictions) at any hit rate. New
+  `PLOW_VMM_PUBLISH_SHARED` (default on) publishes only leads seen on a second
+  sequence. Needs an H100 A/B with cache ON (unique prompts vs multi-turn).
+- C refuted on CUDA (sleep loops were AMD-only); condvar replaces them; CUDA prefix
+  pool now honours `PLOW_VMM_DEFERRED_RECLAIM` (default on) — needs a begin_slot A/B.
+- D refuted for the default config: packed prefill stays on with token batching on
+  and fusion off; the log now names the knobs.
+
 ### Next pipeline step — ctx-keyed attention selection at emit
 
 The attention roles are one object across all live-KV histories (tracker:
