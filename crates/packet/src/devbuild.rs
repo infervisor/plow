@@ -433,6 +433,9 @@ pub struct Builder {
     /// Split descriptor-consuming prefill families into independent wave classes.
     /// Callers must enable this only for prefill programs.
     packed_prefill_segments: bool,
+    /// The row-split sibling's attention arm (`PLOW_GLM_ROWSPLIT_ATTN` / `PLOW_GLM_ROWBAND_ATTN`);
+    /// `None` for every other program.
+    rowsplit_arm: Option<RowSplitArm>,
     /// Token-batch body: the slot band's width. The band's decode-attention packets get their
     /// own segment class so the runtime can route them to an object that carries those arms.
     token_batch_band: Option<u32>,
@@ -694,6 +697,7 @@ impl Builder {
             gq_order_asap: knobs.gq_order.as_deref() != Some("emit"),
             gq_order_seg: !matches!(knobs.gq_order.as_deref(), Some("emit") | Some("asap")),
             packed_prefill_segments: false,
+            rowsplit_arm: None,
             token_batch_band: None,
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
@@ -832,6 +836,18 @@ impl Builder {
     /// token-batch body), i.e. its cache writers will resolve rows through span metadata.
     pub fn packed_prefill_segments(&self) -> bool {
         self.packed_prefill_segments
+    }
+
+    pub fn set_rowsplit_arm(&mut self, arm: Option<RowSplitArm>) {
+        self.rowsplit_arm = arm;
+    }
+
+    pub fn rowsplit_attn(&self) -> bool {
+        self.rowsplit_arm.is_some()
+    }
+
+    pub fn rowsplit_arm(&self) -> Option<RowSplitArm> {
+        self.rowsplit_arm
     }
 
     /// Mark this program as a token-batch BODY with a slot band of `band` rows.
@@ -975,6 +991,11 @@ impl Builder {
     /// The declared name of handle `h`.
     pub fn tensor_name(&self, h: u32) -> &str {
         &self.tensors[h as usize].name
+    }
+
+    /// The declared byte size of handle `h`.
+    pub fn tensor_bytes(&self, h: u32) -> u64 {
+        self.tensors[h as usize].bytes
     }
 
     /// Declare a tensor whose contents the compiler already knows (e.g. RoPE tables).
@@ -3254,8 +3275,29 @@ pub const DECODE_RUNG_PROG: u32 = 1 << 29;
 /// it. Selected only by the runtime's dense-exact rule, never by width.
 pub const DENSE_EXACT_PROG: u32 = 1 << 28;
 
-const PROGRAM_ROLE_BITS: u32 =
-    PACKED_PREFILL_PROG | TOKEN_BATCH_PROG | DECODE_RUNG_PROG | DENSE_EXACT_PROG;
+/// How a row-split sibling runs its 64-head row-band attention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowSplitArm {
+    /// `PLOW_GLM_ROWSPLIT_ATTN`: head all-to-alls around the band attention; o_proj and its
+    /// reduce-scatter stay head-sharded.
+    AllToAll,
+    /// `PLOW_GLM_ROWBAND_ATTN`: q_absorb/q_rope/o_proj at full width on the band; no all-to-all
+    /// and no attention reduce-scatter.
+    Replicated,
+}
+
+/// [`BlobProgHeader::t`] bit marking a prefill bucket's ROW-SPLIT sibling
+/// (`PLOW_GLM_ROWSPLIT_ATTN`): the same bucket with its sparse attention on the 64-head
+/// row-split arm. Not a rung; the runtime runs it only for a full chunk whose every row owns
+/// the 2048 causal keys the native route needs, and the bucket itself for every other chunk.
+/// Bit 28 is [`DENSE_EXACT_PROG`].
+pub const ROWSPLIT_PREFILL_PROG: u32 = 1 << 27;
+
+const PROGRAM_ROLE_BITS: u32 = PACKED_PREFILL_PROG
+    | TOKEN_BATCH_PROG
+    | DECODE_RUNG_PROG
+    | DENSE_EXACT_PROG
+    | ROWSPLIT_PREFILL_PROG;
 
 pub fn program_rows(t: u32) -> u32 {
     t & !PROGRAM_ROLE_BITS
@@ -3282,11 +3324,20 @@ pub fn is_decode_rung_program(t: u32) -> bool {
     t & DECODE_RUNG_PROG != 0
 }
 
+pub fn is_rowsplit_prefill_program(t: u32) -> bool {
+    t & ROWSPLIT_PREFILL_PROG != 0
+}
+
+pub fn rowsplit_prefill_program_t(rows: u32) -> u32 {
+    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 28 bits");
+    rows | ROWSPLIT_PREFILL_PROG
+}
+
 pub fn decode_rung_program_t(rows: u32) -> u32 {
     assert_eq!(
         rows & PROGRAM_ROLE_BITS,
         0,
-        "program row count exceeds 29 bits"
+        "program row count exceeds 28 bits"
     );
     rows | DECODE_RUNG_PROG
 }
@@ -3295,7 +3346,7 @@ pub fn token_batch_program_t(rows: u32) -> u32 {
     assert_eq!(
         rows & PROGRAM_ROLE_BITS,
         0,
-        "program row count exceeds 29 bits"
+        "program row count exceeds 28 bits"
     );
     rows | TOKEN_BATCH_PROG
 }
@@ -3304,7 +3355,7 @@ pub fn packed_prefill_program_t(rows: u32) -> u32 {
     assert_eq!(
         rows & PROGRAM_ROLE_BITS,
         0,
-        "program row count exceeds 29 bits"
+        "program row count exceeds 28 bits"
     );
     rows | PACKED_PREFILL_PROG
 }
@@ -3357,6 +3408,9 @@ pub enum ProgramRole {
     /// A dense-exact decode rung ([`DENSE_EXACT_PROG`]): the decode rung of the same width
     /// without top-k selection. Decode-side, but not a rung of the width ladder.
     DenseExactRung { rows: u32 },
+    /// The row-split attention topology of the prefill bucket of the same width
+    /// ([`ROWSPLIT_PREFILL_PROG`]). Never selected as a rung of its own.
+    RowSplitSibling { of_rows: u32 },
 }
 
 impl ProgramRole {
@@ -3367,7 +3421,8 @@ impl ProgramRole {
             | Self::DecodeRung { rows }
             | Self::PackedSibling { of_rows: rows }
             | Self::TokenBatchBody { rows, .. }
-            | Self::DenseExactRung { rows } => rows,
+            | Self::DenseExactRung { rows }
+            | Self::RowSplitSibling { of_rows: rows } => rows,
         }
     }
 
@@ -3392,6 +3447,10 @@ impl ProgramRole {
         matches!(self, Self::TokenBatchBody { .. })
     }
 
+    pub fn is_rowsplit_sibling(self) -> bool {
+        matches!(self, Self::RowSplitSibling { .. })
+    }
+
     /// The band a token-batch body samples, or `None` for every other role.
     pub fn token_batch_band(self) -> Option<u32> {
         match self {
@@ -3414,6 +3473,7 @@ impl ProgramRole {
             Self::PackedSibling { .. } => "packed sibling",
             Self::TokenBatchBody { .. } => "token-batch body",
             Self::DenseExactRung { .. } => "dense-exact decode rung",
+            Self::RowSplitSibling { .. } => "row-split sibling",
         }
     }
 }
@@ -3475,6 +3535,8 @@ pub fn derive_roles(
                 }
             } else if is_packed_prefill_program(t) {
                 ProgramRole::PackedSibling { of_rows: rows }
+            } else if is_rowsplit_prefill_program(t) {
+                ProgramRole::RowSplitSibling { of_rows: rows }
             } else if is_dense_exact_program(t) {
                 ProgramRole::DenseExactRung { rows }
             } else if is_decode_rung_program(t) || i >= lo {
@@ -6323,6 +6385,17 @@ mod v6_tests {
         // Width 128 is legal for decode. The equal-width prefill bucket remains outside the
         // trailing ladder because the scan is strict.
         assert_eq!(decode_rung_lo(&[128, 512, 1, 16, 32, 64, 128]), 2);
+        let rs = [128, 8192, rowsplit_prefill_program_t(8192), 1, 4, 8];
+        assert_eq!(decode_rung_lo(&rs), 3);
+        assert_eq!(
+            derive_roles(&rs, RoleSource::Positional, |_| 0)[..3],
+            [
+                ProgramRole::PrefillBucket { rows: 128 },
+                ProgramRole::PrefillBucket { rows: 8192 },
+                ProgramRole::RowSplitSibling { of_rows: 8192 },
+            ]
+        );
+        assert_eq!(program_rows(rowsplit_prefill_program_t(8192)), 8192);
         assert_eq!(decode_rung_lo(&[128, 128]), 1);
         // A packed-only copy of each prefill rung sits between the ordinary
         // ladder and decode. Its tag cannot be mistaken for a decode width.

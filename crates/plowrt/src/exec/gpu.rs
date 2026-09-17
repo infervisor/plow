@@ -3146,7 +3146,7 @@ impl GpuEngine {
             .unwrap_or_default();
         let kv_maps = kv_tensor_maps(&blob.tensors, &blob.gen, blob.decode_prog()?.t as usize)?;
         let recurrent = recurrent_state_layout(&blob.tensors, blob.decode_prog()?.t as usize)?;
-        let configured_multistep = RuntimeConfig::get().nv_multistep();
+        let configured_multistep = RuntimeConfig::get().multistep();
         let multistep_disabled_by_decode = decode_objects.is_some()
             || prepared_contexts.is_some()
             || !decode_packet_roles.is_empty()

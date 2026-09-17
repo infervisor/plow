@@ -8,6 +8,8 @@ const WIDEN_UTIL: f64 = 0.85;
 const NARROW_UTIL: f64 = 0.60;
 const NARROW_TICKS: u32 = 32;
 const MIN_DWELL_TICKS: u32 = 64;
+const MIN_THROUGHPUT_SAMPLES: u64 = 4;
+const THROUGHPUT_HYSTERESIS: f64 = 1.03;
 
 /// Number of leading slots a decode dispatch must cover.
 ///
@@ -43,6 +45,7 @@ pub enum RungReason {
     Backlog,
     Slo,
     Utilization,
+    Throughput,
     LowLoad,
 }
 
@@ -198,14 +201,20 @@ impl RungController {
             .occupied_extent
             .saturating_add(load.queued)
             .min(self.rungs.width(self.rungs.len() - 1));
-        let seat = self.rungs.covering(demanded);
+        let demand_seat = self.rungs.covering(demanded);
+        let seat = self.throughput_seat(demand_seat);
         let mut reason = if actual > self.target {
             RungReason::Occupied
         } else {
             RungReason::Hold
         };
 
-        if load.queued > 0 && seat > self.target {
+        if seat < demand_seat && seat < self.target {
+            self.target = seat;
+            self.dwell_ticks = 0;
+            self.low_load_ticks = 0;
+            reason = RungReason::Throughput;
+        } else if load.queued > 0 && seat > self.target {
             let wait = self.projected_wait_ms(self.target, load);
             let slo = load.slo_ms.max(8.0 * self.service_ms(self.target));
             self.target = seat;
@@ -217,6 +226,7 @@ impl RungController {
                 RungReason::Backlog
             };
         } else if self.target + 1 < self.rungs.len()
+            && self.target + 1 <= seat
             && self.utilization(self.target, load) >= WIDEN_UTIL
         {
             self.target += 1;
@@ -284,6 +294,33 @@ impl RungController {
         let waves = load.queued.div_ceil(width.max(1));
         load.oldest_wait_ms.max(0.0) + waves as f64 * self.service_ms(rung)
     }
+
+    fn throughput_seat(&self, demand_seat: usize) -> usize {
+        if demand_seat == 0 {
+            return demand_seat;
+        }
+        let widest = self.rungs.len() - 1;
+        // Cold start seats the penultimate rung, then probes the widest: a rung only gains samples
+        // by running, so holding the widest back until it has samples would cap it forever.
+        if demand_seat == widest
+            && self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES
+            && self.stats[demand_seat - 1].samples < MIN_THROUGHPUT_SAMPLES
+        {
+            return demand_seat - 1;
+        }
+        if self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES
+            || self.stats[demand_seat - 1].samples < MIN_THROUGHPUT_SAMPLES
+        {
+            return demand_seat;
+        }
+        let capacity = |rung: usize| self.rungs.width(rung) as f64 * 1000.0 / self.step_ms(rung);
+        let demanded_capacity = capacity(demand_seat);
+        (0..demand_seat)
+            .filter(|&rung| self.stats[rung].samples >= MIN_THROUGHPUT_SAMPLES)
+            .max_by(|&a, &b| capacity(a).total_cmp(&capacity(b)))
+            .filter(|&rung| capacity(rung) > demanded_capacity * THROUGHPUT_HYSTERESIS)
+            .unwrap_or(demand_seat)
+    }
 }
 
 #[cfg(test)]
@@ -311,6 +348,89 @@ mod tests {
             mean_output_tokens: 1.0,
             slo_ms: 250.0,
         }
+    }
+
+    /// A burst must widen the admission window and a QUIET PERIOD must narrow it back.
+    ///
+    /// The defect this guards: λ was an EWMA updated only on an arrival, so once a burst ended
+    /// it held the burst rate forever. `utilization` never fell to `NARROW_UTIL`, the low-load
+    /// branch was never taken, and the window stayed at its burst width for the life of the
+    /// process. Nothing here calls `observe` during the quiet phase — elapsed time alone has to
+    /// move λ.
+    #[test]
+    fn a_quiet_period_narrows_the_rung_a_burst_widened() {
+        use crate::sched::admission::ArrivalRate;
+        use std::time::{Duration, Instant};
+
+        const TICK: Duration = Duration::from_millis(10);
+        let mut c = controller(&[1, 2, 4, 8]);
+        for rung in 0..4 {
+            for _ in 0..20 {
+                c.observe_decode(rung, 10.0, NonZeroUsize::MIN);
+            }
+        }
+        let busy = |c: &mut RungController, rps: f64| {
+            let mut l = load(8, 0);
+            l.arrival_rps = rps;
+            l.mean_output_tokens = 100.0;
+            c.decide(l)
+        };
+
+        // Burst: 8 req/s for 4 s. λ deposits and the window walks out to the widest rung.
+        let t0 = Instant::now();
+        let mut lambda = ArrivalRate::new(2.0);
+        let mut next_arrival = t0;
+        for tick in 0..400 {
+            let now = t0 + TICK * tick;
+            while next_arrival <= now {
+                lambda.observe(next_arrival);
+                next_arrival += Duration::from_millis(125);
+            }
+            busy(&mut c, lambda.rate(now));
+        }
+        let widened = c.admission_limit();
+        assert_eq!(widened, 8, "a sustained burst must reach the widest rung");
+
+        // Quiet: not one arrival. Slots drain, so the occupied extent goes to zero too.
+        let quiet_from = t0 + TICK * 400;
+        let hot = lambda.rate(quiet_from);
+        let mut narrowed_at = None;
+        for tick in 0..1_200 {
+            let now = quiet_from + TICK * tick;
+            let mut l = load(0, 0);
+            l.arrival_rps = lambda.rate(now);
+            l.mean_output_tokens = 100.0;
+            c.decide(l);
+            if narrowed_at.is_none() && c.admission_limit() < widened {
+                narrowed_at = Some(tick);
+            }
+        }
+        assert!(narrowed_at.is_some(), "12 s of silence must narrow the window");
+        assert_eq!(c.admission_limit(), 1, "idle must return to the narrowest rung");
+
+        // Control: with λ PINNED at the burst value — the old estimator's behaviour — the same
+        // 12 s of silence narrows nothing, because utilization never reaches NARROW_UTIL.
+        let mut stale = controller(&[1, 2, 4, 8]);
+        for rung in 0..4 {
+            for _ in 0..20 {
+                stale.observe_decode(rung, 10.0, NonZeroUsize::MIN);
+            }
+        }
+        for _ in 0..400 {
+            busy(&mut stale, hot);
+        }
+        assert_eq!(stale.admission_limit(), 8);
+        for _ in 0..1_200 {
+            let mut l = load(0, 0);
+            l.arrival_rps = hot;
+            l.mean_output_tokens = 100.0;
+            stale.decide(l);
+        }
+        assert_eq!(
+            stale.admission_limit(),
+            8,
+            "control: a λ that never decays never narrows"
+        );
     }
 
     #[test]
@@ -355,9 +475,68 @@ mod tests {
     }
 
     #[test]
+    fn backlog_stays_on_the_faster_sampled_standard_rung() {
+        let mut c = controller(&[1, 2, 4, 8, 16, 32]);
+        for _ in 0..MIN_THROUGHPUT_SAMPLES {
+            c.observe_decode(4, 55.0, NonZeroUsize::MIN);
+            c.observe_decode(5, 125.0, NonZeroUsize::MIN);
+        }
+        c.target = 5;
+        let d = c.decide(load(20, 80));
+        assert_eq!(c.width(d.admission), 16);
+        assert_eq!(d.reason, RungReason::Throughput);
+        let mut saturated = load(20, 80);
+        saturated.arrival_rps = 100.0;
+        saturated.mean_output_tokens = 700.0;
+        let admission = c.decide(saturated).admission;
+        assert_eq!(c.width(admission), 16);
+    }
+
+    #[test]
+    fn cold_saturated_backlog_bootstraps_on_the_penultimate_rung() {
+        let mut c = controller(&[1, 2, 4, 8, 16, 32]);
+        let d = c.decide(load(1, 99));
+        assert_eq!(c.width(d.admission), 16);
+        assert_eq!(d.reason, RungReason::Backlog);
+    }
+
+    #[test]
+    fn saturated_backlog_probes_the_widest_rung_once_the_penultimate_is_sampled() {
+        let mut c = controller(&[1, 2, 4, 8, 16]);
+        let admission = c.decide(load(1, 99)).admission;
+        assert_eq!(c.width(admission), 8);
+        for _ in 0..MIN_THROUGHPUT_SAMPLES {
+            c.observe_decode(3, 47.0, NonZeroUsize::MIN);
+        }
+        let admission = c.decide(load(8, 92)).admission;
+        assert_eq!(c.width(admission), 16);
+        for _ in 0..MIN_THROUGHPUT_SAMPLES {
+            c.observe_decode(4, 60.0, NonZeroUsize::MIN);
+        }
+        let admission = c.decide(load(16, 84)).admission;
+        assert_eq!(c.width(admission), 16);
+    }
+
+    #[test]
+    fn throughput_cap_waits_for_adjacent_samples_and_a_real_gain() {
+        let mut c = controller(&[1, 8, 16, 32]);
+        for _ in 0..MIN_THROUGHPUT_SAMPLES {
+            c.observe_decode(3, 125.0, NonZeroUsize::MIN);
+        }
+        let admission = c.decide(load(20, 80)).admission;
+        assert_eq!(c.width(admission), 32);
+
+        for _ in 0..MIN_THROUGHPUT_SAMPLES {
+            c.observe_decode(2, 63.0, NonZeroUsize::MIN);
+        }
+        let admission = c.decide(load(20, 80)).admission;
+        assert_eq!(c.width(admission), 32);
+    }
+
+    #[test]
     fn narrowing_changes_admission_before_high_slots_drain() {
         let mut c = controller(&[1, 4, 16]);
-        c.decide(load(1, 15));
+        c.target = 2;
         assert_eq!(c.admission_limit(), 16);
         for _ in 0..64 {
             c.decide(load(12, 0));
@@ -404,11 +583,13 @@ mod tests {
         let demand = RungLoad {
             arrival_rps: 1.0,
             mean_output_tokens: 50.0,
-            ..load(1, 0)
+            ..load(4, 0)
         };
         assert_eq!(single.utilization(0, demand), multi.utilization(0, demand));
-        assert_eq!(single.decide(demand).reason, RungReason::Hold);
-        assert_eq!(multi.decide(demand).reason, RungReason::Hold);
+        let single_admission = single.decide(demand).admission;
+        let multi_admission = multi.decide(demand).admission;
+        assert_eq!(single.width(single_admission), 1);
+        assert_eq!(multi.width(multi_admission), 1);
         assert_eq!(unnormalized.decide(demand).reason, RungReason::Utilization);
     }
 

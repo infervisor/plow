@@ -49,6 +49,9 @@ pub mod ane_mlp;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod apple;
 pub mod counters;
+/// Narrows a loaded packet from its emitted context CEILING to the live bound
+/// this server serves (`PLOW_LIVE_CTX`).
+pub mod ctx_bound;
 /// CPU engine: device-ISA interpreter on persistent pinned worker threads,
 /// C kernels via `cpu::ffi`. See `plans/cpu-backend.md`.
 pub mod cpu;

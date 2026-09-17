@@ -147,6 +147,7 @@ pub struct ProgramArms {
     pub kind: &'static str,
     pub packed_prefill_only: bool,
     pub dense_exact: bool,
+    pub rowsplit_only: bool,
     /// Prefill chunk rows, or decode batch — the `T` the program was compiled for.
     pub t: u32,
     pub seg: Option<u32>,
@@ -180,6 +181,7 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
                 kind,
                 packed_prefill_only: packet::devbuild::is_packed_prefill_program(encoded_t),
                 dense_exact,
+                rowsplit_only: packet::devbuild::is_rowsplit_prefill_program(encoded_t),
                 t,
                 seg,
                 insts: arms.1,
@@ -450,6 +452,7 @@ fn shapes(m: &Model) -> Shapes {
         if !decode
             && !packet::devbuild::is_packed_prefill_program(encoded)
             && !packet::devbuild::is_token_batch_program(encoded)
+            && !packet::devbuild::is_rowsplit_prefill_program(encoded)
         {
             s.prefill_buckets.push(packet::devbuild::program_rows(
                 m.prog_t.get(pi).copied().unwrap_or(0),
@@ -1292,6 +1295,10 @@ fn backend_amd(
     if has("XAllToAllHeads") {
         req.push("PLOW_ROWSPLIT_A2A=1".into());
     }
+    // Decode context parallelism's owner gather (ops 181/182): same silent-no-op hazard.
+    if has("DcpKvPack") || has("XDcpGather") || has("DcpKvScatter") {
+        req.push("PLOW_DCP_GATHER=1".into());
+    }
     if union.iter().any(|a| {
         matches!(a.op.as_str(), "KdaChunkWu" | "KdaChunkCarry")
             && a.variant.as_deref().is_some_and(|v| v.ends_with("_qpre"))
@@ -1489,7 +1496,8 @@ fn analysis(progs: &[ProgramArms]) -> Value {
                 q.kind == p.kind
                     && (q.t != p.t
                         || q.seg != p.seg
-                        || q.packed_prefill_only != p.packed_prefill_only)
+                        || q.packed_prefill_only != p.packed_prefill_only
+                        || q.rowsplit_only != p.rowsplit_only)
             })
             .flat_map(|q| q.arms.iter())
             .collect();
@@ -1918,6 +1926,8 @@ fn dispatch_chains(progs: &[ProgramArms], arch: &str) -> Vec<Value> {
                 "packed"
             } else if first.dense_exact {
                 "dense_exact"
+            } else if first.rowsplit_only {
+                "rowsplit"
             } else {
                 "ordinary"
             },
@@ -2104,6 +2114,8 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
                     "packed"
                 } else if p.dense_exact {
                     "dense_exact"
+                } else if p.rowsplit_only {
+                    "rowsplit"
                 } else {
                     "ordinary"
                 }),
@@ -2222,10 +2234,13 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
 fn l2_placement(m: &Model) -> Value {
     let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
     let domains = m.progs.iter().map(|p| p.l2_domains).max().unwrap_or(0);
+    // Dense-exact twins sit below the ladder index but are decode programs.
+    let decode = |i: usize| i >= dec_lo || packet::devbuild::is_dense_exact_program(m.prog_t[i]);
+    let placed = |want: bool| m.progs.iter().enumerate().any(|(i, p)| decode(i) == want && p.l2_domains != 0);
     json!({
         "domains": domains,
-        "decode": m.progs[dec_lo..].iter().any(|p| p.l2_domains != 0),
-        "prefill": m.progs[..dec_lo].iter().any(|p| p.l2_domains != 0),
+        "decode": placed(true),
+        "prefill": placed(false),
         "requires_object_define": "PLOW_L2_PLACE_DISPATCH",
     })
 }
@@ -3009,6 +3024,15 @@ mod tests {
 
         m.progs[0].l2_domains = 8;
         assert_eq!(build(&m, "gfx942")["l2_placement"]["prefill"], true);
+
+        let mut m = model();
+        m.progs.insert(1, prog(vec![inst(DevOp::FlashDecodeFp8, [8, 8, 1, 0, 0, 0, 512, 0])]));
+        m.prog_t = vec![1024, packet::devbuild::dense_exact_program_t(8), 8];
+        m.progs[1].l2_domains = 8;
+        m.progs[2].l2_domains = 8;
+        let twin = build(&m, "gfx942")["l2_placement"].clone();
+        assert_eq!(twin["decode"], true);
+        assert_eq!(twin["prefill"], false, "a placed dense-exact twin is decode-side");
     }
 
     /// Per-program arm sets, keyed on (kind, bucket|batch, segment).
@@ -3640,6 +3664,7 @@ mod tests {
         for op in [
             DevOp::Gemv,
             DevOp::Gemm,
+            DevOp::GemmF32,
             DevOp::GemmSmall,
             DevOp::GemmMed,
             DevOp::GemmWide,
@@ -3658,11 +3683,15 @@ mod tests {
         ] {
             let case = format!("        case {}:", op.c_name());
             let guard = format!(
-                "#if !PLOW_DECODE_INVENTORY_PRUNE || {}\n{case}",
+                "#if !PLOW_DECODE_INVENTORY_PRUNE || {}",
                 op.c_name().replace("PLOW_DOP_", "PLOW_HAS_")
             );
+            let direct = format!("{guard}\n{case}");
+            let named_bound = format!(
+                "{guard}\n#define PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS 32u\n{case}"
+            );
             assert!(
-                src.contains(&guard),
+                src.contains(&direct) || (op == DevOp::GemmF32 && src.contains(&named_bound)),
                 "{} is not inventory-gated",
                 op.c_name()
             );
@@ -3810,6 +3839,7 @@ mod tests {
             kind: "prefill",
             packed_prefill_only: false,
             dense_exact: false,
+            rowsplit_only: false,
             t: 8192,
             seg: Some(1),
             arms: BTreeSet::from([arm(op)]),
@@ -3845,6 +3875,7 @@ mod tests {
             kind: "decode",
             packed_prefill_only: false,
             dense_exact: false,
+            rowsplit_only: false,
             t: 1,
             seg: Some(1),
             arms: ops.iter().map(|op| arm(op)).collect(),

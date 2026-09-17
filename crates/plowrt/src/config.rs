@@ -105,6 +105,13 @@ pub struct RuntimeConfig {
     #[arg(long = "encode-threads", env = "PLOW_ENCODE_THREADS", global = true)]
     pub encode_threads: Option<u32>,
 
+    /// Smallest piece a split encode hands a thread, in bytes (default 4096). This, not the
+    /// thread count, is what caps the parallelism of a given prompt: the split encode takes
+    /// `min(len / this, threads)` pieces, so an 8192-token prompt (~32 KB) uses at most 8 threads
+    /// at the default no matter how large the pool is.
+    #[arg(long = "encode-split-min", env = "PLOW_ENCODE_SPLIT_MIN", global = true)]
+    pub encode_split_min: Option<u32>,
+
     /// Soft cap on prefix blocks and boundary snapshots as a fraction of the device's
     /// memory, 0..=1 — the unit vLLM's `--gpu-memory-utilization` uses, scoped here to
     /// the prefix cache. A fixed byte count is the wrong unit: 4 GiB is 5% of an H100
@@ -127,8 +134,8 @@ pub struct RuntimeConfig {
     /// Keep every cached prefix (whole shared blocks and private boundary snapshots alike)
     /// until free device memory would drop below this many MiB, instead of trimming as soon
     /// as `--vmm-cache-mib`/`--vmm-cache-memory-utilization` bytes of cache are held. Unset
-    /// (the default) leaves the static byte budget as the only trim trigger — this is opt-in
-    /// because it needs the backend to report free device memory cheaply
+    /// (the default) derives 4% of the device; `=0` is the rollback to the static byte budget
+    /// as the only trim trigger. Needs the backend to report free device memory cheaply
     /// (`VmmOps::free_bytes`); a backend that cannot degrades to the static budget unchanged.
     #[arg(long = "vmm-cache-min-free-mib", env = "PLOW_VMM_CACHE_MIN_FREE_MIB", global = true)]
     pub vmm_cache_min_free_mib: Option<u32>,
@@ -199,6 +206,13 @@ pub struct RuntimeConfig {
     /// run. Unset = the throughput schedule (`PLOW_PF_INTERLEAVE`), unchanged.
     #[arg(long = "tbt-slo-ms", env = "PLOW_TBT_SLO_MS", global = true)]
     pub tbt_slo_ms: Option<f64>,
+
+    /// How long a request may wait for a slot before it is answered 429, ms. Unset = the
+    /// mux's derived TTL (`--slo-ms` x 40, at least 30 s); `0` = never shed a waiting request.
+    /// At 70k context a queued request waits for a whole generation of live sequences to
+    /// retire, which is minutes, not seconds.
+    #[arg(long = "queue-ttl-ms", env = "PLOW_QUEUE_TTL_MS", global = true)]
+    pub queue_ttl_ms: Option<f64>,
 
     /// AMD time-to-first-token target, ms. Prefill candidates are ordered by deadline slack
     /// (EDF), prompts finishing this tick first, requests that can no longer make it last.
@@ -324,6 +338,15 @@ pub struct RuntimeConfig {
     /// Default on (checkpoint P, perf-certs/rt.vmm_release_retire.json); `=0` is the rollback.
     #[arg(long = "vmm-release-retire", env = "PLOW_VMM_RELEASE_RETIRE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_release_retire: bool,
+
+    /// Row-band attention (`PLOW_GLM_ROWBAND_ATTN` siblings in the packet): each rank runs its
+    /// `T/8` rows at full head width, which deletes the Q/O all-to-all and the o_proj
+    /// reduce-scatter from the 8192 prefill seam. Read ONCE at engine build, never per request:
+    /// the cost is the full-width `q_absorb`/`q_rope`/`o_proj` twins resident on every rank, so
+    /// turning it off has to skip BINDING them, not just dispatching to them. Off, a packet that
+    /// carries the siblings costs only their program records.
+    #[arg(long = "glm-rowband", env = "PLOW_GLM_ROWBAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub glm_rowband: bool,
 
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / observability (shared, off by default)
@@ -914,6 +937,12 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-union-skip", env = "PLOW_AMD_UNION_SKIP", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub union_skip: bool,
 
+    /// Launch the TP indexer's threshold selection (`plow_dsa_tp_select_thr`: the same top-k set in
+    /// two row scans instead of five). Needs `dsa_tp_adapter_gfx942.elf` built with
+    /// `-DPLOW_DSA_TP_SELECT_THR=1`; the load fails by name otherwise. Off by default.
+    #[arg(long = "amd-dsa-select-threshold", env = "PLOW_DSA_SELECT_THRESHOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub dsa_select_threshold: bool,
+
     /// Directory to write token-batch device-state dumps into (body step and the ordinary
     /// prefill chunk, for row-by-row comparison). Diagnostic; unset = no dumps.
     #[arg(long = "amd-tb-dump", env = "PLOW_TB_DUMP", hide = true, global = true)]
@@ -945,6 +974,28 @@ pub struct AmdRuntimeConfig {
     /// Default off until an exact full-network gate demonstrates a device-time win.
     #[arg(long = "amd-phase-objects", env = "PLOW_PHASE_OBJECTS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub phase_objects: bool,
+
+    /// Serve this context bound instead of the one the packet was emitted at.
+    ///
+    /// The emitted `ctx` is a CEILING: it sizes the KV caches and every cache
+    /// stride, so a packet emitted at 81920 with a decode ladder topping at 32
+    /// holds 135 GiB of latent cache per rank whether or not anyone sends an
+    /// 80k prompt. This re-declares the ctx-scaled tensors and rewrites the
+    /// strides at load, which is the packet `plowc` would have written at this
+    /// bound — so ONE packet serves 8k and 70k and the two stacks are the same
+    /// artifact. Values at or above the emitted ceiling are a no-op.
+    ///
+    /// See `exec::ctx_bound` for what stays at the ceiling (the emitter's
+    /// policy terms, which saturate from 16384 up) and what is refused.
+    #[arg(long = "live-ctx", env = "PLOW_LIVE_CTX", global = true)]
+    pub live_ctx: Option<u32>,
+
+    /// Fraction of the free-after-load device memory the mux may commit to admitted
+    /// sequences' KV. Below 1.0 so transient prefill workspaces and allocator fragmentation
+    /// are not competing with a budget that already counts every byte. `0` disables the
+    /// KV-capacity gate and admits on free slots alone, which is what crashed 20x70k.
+    #[arg(long = "kv-admit-headroom", env = "PLOW_KV_ADMIT_HEADROOM", default_value_t = 0.9, value_parser = clap::value_parser!(f64), global = true)]
+    pub kv_admit_headroom: f64,
 
     /// VMM-backed KV on ROCr. Automatic when a flat tensor slab cannot fit;
     /// an explicit true/false forces the route (requires hsa_amd_vmem_*).
@@ -1272,6 +1323,14 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-mla-pf-row-split-native-lo", env = "PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_row_split_native_lo: bool,
 
+    /// DIAGNOSTIC. Zero the whole sparse-MLA workspace before every row-band dispatch, so the
+    /// dispatch sees the device state a freshly loaded server would give it. Bisects the
+    /// row-band wrong-answer defect: that defect is armed by any ordinary program-3 execution in
+    /// the 8192 bucket, and this workspace is the only device memory both paths share that no
+    /// per-sequence clear covers. Hundreds of MB of H2D per dispatch — never leave it on.
+    #[arg(long = "amd-glm-rowband-clear-ws", env = "PLOW_GLM_ROWBAND_CLEAR_WS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub glm_rowband_clear_ws: bool,
+
     /// Run native GLM MoE prefill rows >= 1024 on AITER's 64-row persistent tile
     /// (`..._psx_64x256.co`), the object its GLM-5 gfx942 tuning selects there.
     /// Unset = on when the object dir carries the pinned object and a tile64-marked
@@ -1424,18 +1483,48 @@ impl RuntimeConfig {
         ((device_bytes as f64 * fraction) as u64) >> 20 << 20
     }
 
-    /// `--vmm-cache-min-free-mib` in bytes, or `None` when unset (the static budget from
-    /// [`Self::prefix_cache_cap_bytes`] is the only trim trigger, unchanged from before this
-    /// existed). See [`crate::memory::vmm::VmmKv::enable_pressure_eviction`].
-    pub(crate) fn vmm_cache_min_free_bytes(&self) -> Option<u64> {
+    /// The free-device-memory floor the prefix cache evicts to hold, in bytes, for a device
+    /// with `device_bytes` of memory. `None` disables pressure mode and leaves the static
+    /// budget from [`Self::prefix_cache_cap_bytes`] as the only trim trigger.
+    ///
+    /// An explicit `--vmm-cache-min-free-mib` wins; `=0` is the rollback to the static-budget
+    /// behaviour. Unset derives [`Self::VMM_CACHE_MIN_FREE_FRACTION`] of the device, because a
+    /// fixed MiB figure that is right on a 192 GiB MI300X is a third of a small card. A
+    /// backend that cannot report free bytes degrades to the static budget on its own
+    /// ([`crate::memory::vmm::VmmKv::enable_pressure_eviction`]), so arming this is safe
+    /// everywhere.
+    pub(crate) fn vmm_cache_min_free_bytes(&self, device_bytes: u64) -> Option<u64> {
         let allow_env = !Self::is_initialized();
         let mib: Option<u32> = if allow_env {
             Self::env_parse("PLOW_VMM_CACHE_MIN_FREE_MIB").or(self.vmm_cache_min_free_mib)
         } else {
             self.vmm_cache_min_free_mib
         };
-        mib.map(|mib| (mib as u64) << 20)
+        match mib {
+            Some(0) => None,
+            Some(mib) => Some((mib as u64) << 20),
+            None if device_bytes == 0 => Some(4096u64 << 20),
+            // Whole MiB, so the figure in logs reads like the knob.
+            None => Some(
+                ((device_bytes as f64 * Self::VMM_CACHE_MIN_FREE_FRACTION) as u64) >> 20 << 20,
+            ),
+        }
     }
+
+    /// `--kv-admit-headroom`, clamped to a sane range. 0 disables the gate.
+    pub(crate) fn kv_admit_headroom(&self) -> f64 {
+        select_compat(
+            self.amd.kv_admit_headroom,
+            Self::env_parse("PLOW_KV_ADMIT_HEADROOM"),
+            !Self::is_initialized(),
+        )
+        .clamp(0.0, 1.0)
+    }
+
+    /// Fraction of device memory the prefix cache keeps free by default. 4% is ~7.7 GiB on a
+    /// 192 GiB MI300X: above the largest transient the 8192 prefill rung takes, and small
+    /// enough that the cache is not evicting on an idle device.
+    const VMM_CACHE_MIN_FREE_FRACTION: f64 = 0.04;
 
     /// `--amd-prefix-fine-rows` / `PLOW_AMD_PREFIX_FINE_ROWS`, or `None` when unset (fine
     /// matching off, the default). See [`crate::memory::vmm::VmmKv::enable_fine_matching`].
@@ -1448,8 +1537,14 @@ impl RuntimeConfig {
         }
     }
 
-    #[cfg(feature = "cuda")]
-    pub(crate) fn nv_multistep(&self) -> u32 {
+    /// `--multistep` / `PLOW_MULTISTEP`, the nominal decode quantum.
+    ///
+    /// Homed under `nv` only because that is where the flag was first declared; the knob spec
+    /// has always called it `rt.multistep`, and both the NVIDIA device-multistep object and the
+    /// AMD deferred-read quantum are driven by it. Read it through here — the AMD tick used to
+    /// reach into `self.nv.multistep` directly and so missed the env-compat path entirely.
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    pub(crate) fn multistep(&self) -> u32 {
         select_compat(
             self.nv.multistep,
             Self::env_parse("PLOW_MULTISTEP"),
@@ -1505,6 +1600,10 @@ impl RuntimeConfig {
             Self::env_bool("PLOW_VMM_RELEASE_RETIRE"),
             !Self::is_initialized(),
         )
+    }
+
+    pub(crate) fn glm_rowband(&self) -> bool {
+        select_compat(self.glm_rowband, Self::env_bool("PLOW_GLM_ROWBAND"), !Self::is_initialized())
     }
 
     #[cfg(feature = "cuda")]

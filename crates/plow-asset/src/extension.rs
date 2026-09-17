@@ -904,6 +904,7 @@ fn check_ladder(programs: &[(Origin, ProgramRole)], decode_batch: u32) -> Result
         let (kind, of) = match r {
             ProgramRole::PackedSibling { of_rows } => ("packed sibling", *of_rows),
             ProgramRole::TokenBatchBody { rows, .. } => ("token-batch body", *rows),
+            ProgramRole::RowSplitSibling { of_rows } => ("row-split sibling", *of_rows),
             _ => continue,
         };
         if !buckets.contains(&of) {

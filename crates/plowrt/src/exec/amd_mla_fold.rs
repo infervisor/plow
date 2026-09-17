@@ -13,6 +13,11 @@ use crate::{Result, RuntimeError};
 const OBJECT_HASH: &str = "209f4165a46672d5289816f0df6b41cf5a3f44d78452ff2a28c8cd7a0e1b77d1";
 const WEIGHT_BYTES: u64 = 8 * 512 * 256 * 4;
 
+/// FP32 W_uv bytes for `heads` heads.
+fn weight_bytes(heads: u32) -> u64 {
+    u64::from(heads) * 512 * 256 * 4
+}
+
 pub(super) fn native(inst: &DevInst64) -> bool {
     inst.op == DevOp::MlaMergeFold as u16 && inst.i[5] != 0
 }
@@ -21,10 +26,22 @@ pub(super) fn native(inst: &DevInst64) -> bool {
 pub(super) struct Route {
     inst: DevInst64,
     rows: u32,
+    heads: u32,
+    /// Heads per attention launch of a group-major row-band fold; 0 for token-major partials.
+    group: u32,
 }
 
 impl Route {
     pub fn rebase(&mut self, rows: u32) -> Result<()> {
+        if self.group != 0 {
+            // Row-band fold: this rank's fixed `T/8` rows, selected only for a full chunk.
+            if rows != self.inst.i[0] * 8 {
+                return Err(RuntimeError::Device(
+                    "row-band MLA fold runs only a full chunk".into(),
+                ));
+            }
+            return Ok(());
+        }
         if rows == 0 || rows > self.inst.i[0] {
             return Err(RuntimeError::Device(
                 "native MLA fold exceeds row capacity".into(),
@@ -49,25 +66,34 @@ pub(super) fn routes(
         let err = |s: &str| RuntimeError::Device(format!("native MLA fold {ix}: {s}"));
         // Packed-prefill siblings carry the fold unchanged: it consumes per-row partials and
         // reads no per-row position (class A).
+        // Row-band sibling (`PLOW_GLM_ROWBAND_ATTN`): one fold over this rank's `T/8` rows at every
+        // head, reading the group-major partials of 16-head attention launches.
+        let (heads, group) = (inst.i[1], inst.i[6]);
+        let band = prog.role.is_rowsplit_sibling() && heads == 64 && group == 16;
+        let band_rows = if band { prog.t / 8 } else { prog.t };
         if !(2048..=8192).contains(&prog.t)
-            || inst.i[0] != prog.t
-            || inst.i[1..4] != [8, 256, 0]
+            || inst.i[0] != band_rows
+            || !(band || (heads == 8 && group == 0))
+            || inst.i[2..4] != [256, 0]
             || !(1..8).contains(&inst.i[4])
-            || inst.i[5..] != [1, 0, 0]
+            || (band && inst.i[4] != 1)
+            || inst.i[5] != 1
+            || inst.i[7] != 0
             || inst.fj != [0; 3]
             || inst.t[4..] != [TENSOR_NONE16; 4]
         {
             return Err(err(
-                "requires prefill of 2048..8192 rows, eight heads, latent512/value256 and splits<8",
+                "requires prefill of 2048..8192 rows, eight heads (or a 64-head row band), latent512/value256 and splits<8",
             ));
         }
-        let rows = u64::from(prog.t);
+        let rows = u64::from(band_rows);
         let splits = u64::from(inst.i[4]);
+        let h = u64::from(heads);
         let sizes = [
-            rows * 8 * 256 * 2,
-            rows * 8 * splits * 512 * 4,
-            rows * 8 * splits * 2 * 4,
-            WEIGHT_BYTES / 2,
+            rows * h * 256 * 2,
+            rows * h * splits * 512 * 4,
+            rows * h * splits * 2 * 4,
+            weight_bytes(heads) / 2,
         ];
         let mut handles = BTreeSet::new();
         for (&handle, bytes) in inst.t[..4].iter().zip(sizes) {
@@ -82,7 +108,9 @@ pub(super) fn routes(
         }
         out[owners[ix].unwrap()] = Some(Route {
             inst: *inst,
-            rows: prog.t,
+            rows: band_rows,
+            heads,
+            group,
         });
     }
     Ok(out)
@@ -107,7 +135,7 @@ struct NormalizeArgs {
     rows: u32,
     heads: u32,
     splits: u32,
-    pad: u32,
+    group: u32,
 }
 
 #[repr(C)]
@@ -131,10 +159,10 @@ struct GemmArgs {
 }
 const _: () = assert!(std::mem::size_of::<GemmArgs>() == 144);
 
-fn arguments(rows: u32, weight: u64, input: u64, output: u64, spec: &KernelSpec) -> GemmArgs {
-    let grid = 256u32.div_ceil(spec.mt_i) * rows.div_ceil(spec.mt_j) * 8;
+fn arguments(rows: u32, heads: u32, weight: u64, input: u64, output: u64, spec: &KernelSpec) -> GemmArgs {
+    let grid = 256u32.div_ceil(spec.mt_i) * rows.div_ceil(spec.mt_j) * heads;
     GemmArgs {
-        dims: [1, 0x20104001, 0x4c080006, grid, 256, rows, 8, 512],
+        dims: [1, 0x20104001, 0x4c080006, grid, 256, rows, heads, 512],
         pointers: [output, output, weight, input],
         strides: [
             256,
@@ -156,6 +184,8 @@ pub(super) struct MlaFold {
     kernels: Vec<HsaKernel>,
     specs: Vec<KernelSpec>,
     normalize: HsaKernel,
+    /// `plow_glm_fold_normalize_grouped`, when the adapter carries it.
+    normalize_grouped: Option<HsaKernel>,
     convert: HsaKernel,
     _scratch: DeviceMem,
     _weights: DeviceMem,
@@ -198,7 +228,15 @@ impl MlaFold {
         let normalize = EngineDevice::get_function(be, &module, "plow_glm_fold_normalize")?;
         let convert = EngineDevice::get_function(be, &module, "plow_glm_fold_convert")?;
         let weight_convert = EngineDevice::get_function(be, &module, "plow_glm_fold_weight")?;
-        for (k, size) in [(normalize, 36), (convert, 24), (weight_convert, 16)] {
+        let normalize_grouped = if super::amd::elf_symbol_names(&image).contains(&"plow_glm_fold_grouped_abi_1") {
+            Some(EngineDevice::get_function(be, &module, "plow_glm_fold_normalize_grouped")?)
+        } else {
+            None
+        };
+        for (k, size) in [(normalize, 36), (convert, 24), (weight_convert, 16)]
+            .into_iter()
+            .chain(normalize_grouped.map(|k| (k, 40)))
+        {
             if ![size, size + 256].contains(&k.kernarg_size())
                 || k.private_segment_size() != 0
                 || HsaBackend::kernel_lds_bytes(&k) != 0
@@ -209,8 +247,8 @@ impl MlaFold {
             }
         }
         modules.push(module);
-        let mut handles = BTreeSet::new();
-        let mut max_rows = 0;
+        let mut handles = std::collections::BTreeMap::new();
+        let mut max_elems = 0u64;
         for prog in progs {
             let segments = prog
                 .stream
@@ -219,23 +257,33 @@ impl MlaFold {
                 .max()
                 .unwrap_or(0);
             for route in routes(prog, tensors, segments)?.into_iter().flatten() {
-                handles.insert(usize::from(route.inst.t[3]));
-                max_rows = max_rows.max(route.rows);
+                if route.group != 0 && normalize_grouped.is_none() {
+                    return Err(RuntimeError::Device(
+                        "row-band MLA fold needs plow_glm_fold_normalize_grouped \
+                         (glm_fold_adapter.elf lacks plow_glm_fold_grouped_abi_1)"
+                            .into(),
+                    ));
+                }
+                handles.insert(usize::from(route.inst.t[3]), route.heads);
+                max_elems = max_elems.max(u64::from(route.rows) * u64::from(route.heads));
             }
         }
         if handles.is_empty() {
             return Err(RuntimeError::Device("native MLA fold has no routes".into()));
         }
-        let norm_bytes = u64::from(max_rows) * 8 * 512 * 4;
+        let norm_bytes = max_elems * 512 * 4;
         let scratch = EngineDevice::alloc(be, norm_bytes + norm_bytes / 2)?;
-        let weight_storage = EngineDevice::alloc(be, handles.len() as u64 * WEIGHT_BYTES)?;
+        let weight_storage =
+            EngineDevice::alloc(be, handles.values().map(|&h| weight_bytes(h)).sum::<u64>())?;
         let mut weights = vec![0; tensors.len()];
-        for (index, handle) in handles.iter().copied().enumerate() {
-            weights[handle] = weight_storage.base + index as u64 * WEIGHT_BYTES;
+        let mut at = weight_storage.base;
+        for (&handle, &heads) in &handles {
+            weights[handle] = at;
+            at += weight_bytes(heads);
             let args = [weights[handle], device[handle].base];
             be.launch(
                 weight_convert,
-                (WEIGHT_BYTES / 4 / 256) as u32,
+                (weight_bytes(heads) / 4 / 256) as u32,
                 256,
                 0,
                 bytemuck::bytes_of(&args),
@@ -252,6 +300,7 @@ impl MlaFold {
             kernels,
             specs,
             normalize,
+            normalize_grouped,
             convert,
             normalized: scratch.base,
             product: scratch.base + norm_bytes,
@@ -271,20 +320,30 @@ impl MlaFold {
             partial,
             ml,
             rows: route.rows,
-            heads: 8,
+            heads: route.heads,
             splits: route.inst.i[4],
-            pad: 0,
+            group: route.group,
+        };
+        let (normalize, args_bytes) = match (route.group, self.normalize_grouped) {
+            (0, _) => (self.normalize, 36),
+            (_, Some(k)) => (k, 40),
+            (_, None) => {
+                return Err(RuntimeError::Device(
+                    "row-band MLA fold has no grouped normalize kernel".into(),
+                ))
+            }
         };
         be.launch(
-            self.normalize,
-            route.rows * 16,
+            normalize,
+            route.rows * route.heads * 2,
             256,
             0,
-            &bytemuck::bytes_of(&norm)[..36],
+            &bytemuck::bytes_of(&norm)[..args_bytes],
         )?;
         let index = kernel_index(route.rows);
         let gemm = arguments(
             route.rows,
+            route.heads,
             self.weights[usize::from(route.inst.t[3])],
             self.normalized,
             self.product,
@@ -301,11 +360,11 @@ impl MlaFold {
             out,
             input: self.product,
             rows: route.rows,
-            heads: 8,
+            heads: route.heads,
         };
         be.launch(
             self.convert,
-            route.rows * 8,
+            route.rows * route.heads,
             256,
             0,
             bytemuck::bytes_of(&convert),
@@ -409,6 +468,37 @@ mod tests {
     }
 
     #[test]
+    fn row_band_fold_takes_sixty_four_grouped_heads_on_the_sibling_only() {
+        let band = |role, i: [u32; 8]| {
+            let (mut p, mut t) = fixture();
+            p.role = role;
+            p.insts[0].i = i;
+            let sizes = [1024 * 64 * 256 * 2, 1024 * 64 * 512 * 4, 1024 * 64 * 2 * 4, weight_bytes(64) / 2];
+            for (tensor, bytes) in t.iter_mut().zip(sizes) {
+                tensor.bytes = bytes;
+            }
+            routes(&p, &t, 1)
+        };
+        let sibling = packet::devbuild::ProgramRole::RowSplitSibling { of_rows: 8192 };
+        let bucket = packet::devbuild::ProgramRole::PrefillBucket { rows: 8192 };
+        let mut route = band(sibling, [1024, 64, 256, 0, 1, 1, 16, 0]).unwrap()[0].unwrap();
+        assert_eq!((route.rows, route.heads, route.group), (1024, 64, 16));
+        route.rebase(8192).unwrap();
+        assert_eq!(route.rows, 1024, "a band keeps its own rows");
+        assert!(route.rebase(4096).is_err(), "a band runs only a full chunk");
+        assert!(band(bucket, [1024, 64, 256, 0, 1, 1, 16, 0]).is_err(), "64 heads only on the sibling");
+        assert!(band(sibling, [1024, 64, 256, 0, 1, 1, 0, 0]).is_err(), "64 heads need the group layout");
+        assert!(band(sibling, [1024, 64, 256, 0, 2, 1, 16, 0]).is_err(), "one split per head");
+        assert!(band(sibling, [8192, 64, 256, 0, 1, 1, 16, 0]).is_err(), "band rows are T/8");
+        let a = arguments(1024, 64, 0, 0, 0, &serde_json::from_str::<Vec<KernelSpec>>(include_str!(
+            "../../../../runtime/amd/glm_fold_lt_gfx942.json"
+        ))
+        .unwrap()[kernel_index(1024)]);
+        assert_eq!(a.dims[6], 64);
+        assert_eq!(a.dims[3] % 64, 0);
+    }
+
+    #[test]
     fn native_fold_arguments_match_library_exports() {
         let specs: Vec<KernelSpec> = serde_json::from_str(include_str!(
             "../../../../runtime/amd/glm_fold_lt_gfx942.json"
@@ -422,7 +512,7 @@ mod tests {
             let rows = record["rows"].as_u64().unwrap() as u32;
             let spec = &specs[kernel_index(rows)];
             assert_eq!(spec.name, record["name"].as_str().unwrap());
-            let args = arguments(rows, 0, 0, 0, spec);
+            let args = arguments(rows, 8, 0, 0, 0, spec);
             let text = record["args_hex"].as_str().unwrap();
             let mut expected: Vec<u8> = text
                 .as_bytes()

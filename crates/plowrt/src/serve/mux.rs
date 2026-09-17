@@ -48,7 +48,7 @@ use crate::memory::streamer::{KvArena, SlotHandle};
 use crate::memory::AddressSpace;
 use crate::obs::serving::RequestMetrics;
 use crate::obs::Metrics;
-use crate::sched::admission::{admit, Admit, LoadEstimator};
+use crate::sched::admission::LoadEstimator;
 use crate::sched::batching::{cold_start_hold_ms, select_bucket};
 use crate::sched::multistep::MultiStep;
 use crate::sched::rungs::{DecodeRungs, RungController, RungLoad};
@@ -121,13 +121,6 @@ mod packlog {
     }
 }
 
-/// Admission sheds only when the predicted wait exceeds this many ticks of the
-/// engine's observed service time (or the configured `slo_ms` floor, whichever
-/// is larger). 8 was chosen to clear the worst spurious shed observed — a B=32
-/// Gemma-4-12B blob at `predicted_wait_ms=329` against `service_ms≈58` (5.7
-/// ticks) — with margin, while still catching a genuinely wedged queue.
-const SLO_SERVICE_TICKS: f64 = 8.0;
-
 /// Dispatcher config. Cold-path — set once at startup from CLI flags.
 #[derive(Clone, Copy, Debug)]
 pub struct MuxConfig {
@@ -135,10 +128,9 @@ pub struct MuxConfig {
     /// only in the cold-start path (empty slot table) — with slots always
     /// draining, the hot path never sleeps.
     pub max_hold_ms: f64,
-    /// SLO used by admission (predicted wait above this sheds the request).
-    /// Treated as a FLOOR: the effective SLO is
-    /// `max(slo_ms, SLO_SERVICE_TICKS * service_ms)` so it scales with the
-    /// decode batch instead of shedding every request on a wide blob.
+    /// Latency target (ms) the decode-rung controller admits against, and the
+    /// floor under a queued request's TTL. It moves the admission WINDOW and
+    /// drops requests that have not started; it never touches a live slot.
     pub slo_ms: f64,
     /// Enable multi-step decode: produce `n` tokens per tick (SGLang overlap
     /// scheduling). Steps scale inversely with batch size — small batches are
@@ -481,6 +473,38 @@ pub fn spawn(
     let (tx, mut rx) = mpsc::channel::<MuxMsg>(ingress_capacity);
     tracing::info!(%slug, capacity, ingress_capacity, "mux capacity resolved");
 
+    // WHAT THE DEVICE CAN BACK, taken once like `gpu_shape` above. Admission used free SLOTS
+    // alone, which is right at 8k prompts and fatal at 70k: 20 x 70,000 rows wants 72.1 GiB of
+    // a 55.59 GiB budget, and the overcommit arrived as an async queue fault instead of as
+    // backpressure. `None` keeps slot-count admission for every engine without a budget.
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    let kv_budget = state
+        .gpu_engine(&slug)
+        .and_then(|e| e.lock().kv_admission_budget());
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+    let kv_budget: Option<crate::sched::admission::KvBudget> = None;
+    if let Some(b) = kv_budget {
+        tracing::info!(
+            %slug,
+            bytes_per_token = b.bytes_per_token,
+            budget_gib = b.budget_bytes as f64 / (1u64 << 30) as f64,
+            max_rows = b.max_rows(),
+            "mux: KV-capacity admission armed"
+        );
+    }
+    // Jobs the KV budget could not back yet. Retried in arrival order ahead of anything
+    // newer, so the budget never reorders the queue.
+    //
+    // NOT a single blocking slot. A large request at the head must not idle slots that a
+    // smaller one behind it would fill: with no preemption path, a held request frees nothing
+    // by waiting, so refusing to look past it converts "this one does not fit" into "nothing
+    // runs". vLLM tolerates the same head-of-line stall only because it preempts a running
+    // request to make room; until plow does, backfilling is what keeps the batch full.
+    // The internal deque is capped at `ingress_capacity`; once full, new arrivals stay in the
+    // bounded channel until a waiter is admitted. A request that can never fit is answered, not
+    // parked (see `admit_into`).
+    let mut waiting: std::collections::VecDeque<(Job, Instant)> = std::collections::VecDeque::new();
+
     // Per-model KV arena from the first decode bucket that declares paging
     // (all rungs share the same paging shape). `None` when no bucket carries
     // KvPaging (test bundles / attention-less models) — admission then skips
@@ -529,7 +553,6 @@ pub fn spawn(
     tokio::spawn(async move {
         let mut slots: Vec<Option<Slot>> = (0..capacity).map(|_| None).collect();
         let mut load = LoadEstimator::default();
-        let mut last_arrival: Option<Instant> = None;
         // Cache one BucketBufs per BucketKey — rung swaps are a swap-in, not
         // a rebuild. The dispatcher owns the map; each tick takes the entry
         // out, hands it to the tick thread, and puts it back on return.
@@ -582,13 +605,20 @@ pub fn spawn(
             if preempt_seen.swap(false, Ordering::AcqRel) {
                 turn.release();
                 preempt_slots(&mut slots, &arena).await;
+                while let Some((job, _)) = waiting.pop_front() {
+                    metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                    Metrics::inc(&metrics.rejected);
+                    let _ = job.respond.try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
+                        "model preempted for an S1 switch — retry".into(),
+                    )));
+                }
                 draining = true;
             }
             let live = slots.iter().filter(|s| s.is_some()).count();
 
             // Drain completion: if draining and no in-flight slots remain,
             // signal the drain future and exit the dispatcher loop.
-            if draining && live == 0 {
+            if draining && live == 0 && waiting.is_empty() {
                 turn.release();
                 if let Some(done) = drain_done.take() {
                     let _ = done.send(());
@@ -623,7 +653,7 @@ pub fn spawn(
 
             // Cold start: no live slots — block until an arrival (or exit
             // when every ModelMux clone has dropped and the channel closes).
-            if live == 0 {
+            if live == 0 && waiting.is_empty() {
                 metrics.decode_occupied_extent.store(0, Ordering::Relaxed);
                 metrics.decode_rung_actual.store(0, Ordering::Relaxed);
                 // Parking with the turn held would starve a co-tenant for as
@@ -633,20 +663,26 @@ pub fn spawn(
                 note_dequeued(&msg, &metrics);
                 match msg {
                     MuxMsg::Job(job, arrived) => {
-                        admit_into(
+                        note_arrival(job.arrived, &mut load, &metrics);
+                        let held = admit_into(
                             &mut slots,
+                            usize::MAX,
                             job,
                             arrived,
-                            &mut load,
-                            &mut last_arrival,
                             arena.as_ref(),
                             &metrics,
                             &health,
+                            kv_budget,
                         );
+                        if let Some(j) = held {
+                            Metrics::inc(&metrics.queued_requests);
+                            waiting.push_back(j);
+                        }
                     }
                     MuxMsg::Drain(done) => {
                         // No in-flight work; signal immediately.
                         let _ = done.send(());
+                        reject_pending_after_drain(&mut rx, &metrics);
                         break;
                     }
                 }
@@ -663,7 +699,7 @@ pub fn spawn(
                     .map(|i| i + 1)
                     .unwrap_or(1);
                 // Read the receiver directly for an exact local admission snapshot.
-                let queued = rx.len();
+                let queued = rx.len().saturating_add(waiting.len());
                 let (sum, n) = slots
                     .iter()
                     .flatten()
@@ -680,11 +716,16 @@ pub fn spawn(
                     });
                 let mean_output_tokens = if n == 0 { 1.0 } else { sum as f64 / n as f64 };
                 let before = controller.admission_limit();
+                let now = Instant::now();
+                let oldest_wait_ms = waiting
+                    .front()
+                    .map(|(_, arrived)| now.saturating_duration_since(*arrived).as_secs_f64() * 1e3)
+                    .unwrap_or(0.0);
                 let decision = controller.decide(RungLoad {
                     occupied_extent,
                     queued,
-                    oldest_wait_ms: 0.0,
-                    arrival_rps: load.lambda.get(),
+                    oldest_wait_ms,
+                    arrival_rps: load.lambda.rate(now),
                     mean_output_tokens,
                     slo_ms: cfg.slo_ms,
                 });
@@ -714,16 +755,29 @@ pub fn spawn(
             // Non-blocking drain: fill every idle slot the queue can serve.
             // A short hold when we still have empty slots and no live work
             // yet keeps us from waking up on a single arrival amid a burst.
+            if !waiting.is_empty() {
+                drain_waiting(
+                    &mut waiting,
+                    &mut slots,
+                    admission_limit,
+                    Instant::now(),
+                    cfg.slo_ms,
+                    arena.as_ref(),
+                    &metrics,
+                    &health,
+                    kv_budget,
+                );
+            }
             let idle = slots[..admission_limit]
                 .iter()
                 .filter(|s| s.is_none())
                 .count();
-            if !draining && idle > 0 {
-                let lambda = load.lambda.get();
+            if !draining && waiting.len() < ingress_capacity && idle > 0 {
+                let lambda = load.lambda.rate(Instant::now());
                 // Only hold when the slot table is empty (cold-start burst);
                 // if any slot is already live, spinning up the tick delivers
                 // TTFT faster than waiting for more arrivals.
-                let hold_ms = if live == 0 {
+                let hold_ms = if slots.iter().all(Option::is_none) {
                     cold_start_hold_ms(
                         lambda,
                         cfg.max_hold_ms,
@@ -734,11 +788,14 @@ pub fn spawn(
                     0.0
                 };
                 if hold_ms > 0.0 {
+                    turn.release();
                     Metrics::add(&metrics.hold_ms_sum, hold_ms as u64);
                     Metrics::inc(&metrics.hold_count);
                     let deadline =
                         Instant::now() + std::time::Duration::from_secs_f64(hold_ms / 1000.0);
-                    while slots[..admission_limit].iter().any(|s| s.is_none()) {
+                    while waiting.len() < ingress_capacity
+                        && slots[..admission_limit].iter().any(|s| s.is_none())
+                    {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
                             break;
@@ -748,16 +805,20 @@ pub fn spawn(
                                 note_dequeued(&msg, &metrics);
                                 match msg {
                                     MuxMsg::Job(job, arrived) => {
-                                        admit_into(
-                                            &mut slots[..admission_limit],
+                                        note_arrival(job.arrived, &mut load, &metrics);
+                                        if let Some(j) = admit_into(
+                                            &mut slots,
+                                            admission_limit,
                                             job,
                                             arrived,
-                                            &mut load,
-                                            &mut last_arrival,
                                             arena.as_ref(),
                                             &metrics,
                                             &health,
-                                        );
+                                            kv_budget,
+                                        ) {
+                                            Metrics::inc(&metrics.queued_requests);
+                                            waiting.push_back(j);
+                                        }
                                         if cfg.idle_dispatch
                                             && rx.is_empty()
                                             && ingress_seen.load(Ordering::Relaxed) == 0
@@ -778,21 +839,30 @@ pub fn spawn(
                     }
                 }
                 // Any additional pending arrivals (no wait).
-                while !draining && slots[..admission_limit].iter().any(|s| s.is_none()) {
+                while !draining
+                    && waiting.len() < ingress_capacity
+                    && slots[..admission_limit].iter().any(|s| s.is_none())
+                {
                     match rx.try_recv() {
                         Ok(msg) => {
                             note_dequeued(&msg, &metrics);
                             match msg {
-                                MuxMsg::Job(job, arrived) => admit_into(
-                                    &mut slots[..admission_limit],
-                                    job,
-                                    arrived,
-                                    &mut load,
-                                    &mut last_arrival,
-                                    arena.as_ref(),
-                                    &metrics,
-                                    &health,
-                                ),
+                                MuxMsg::Job(job, arrived) => {
+                                    note_arrival(job.arrived, &mut load, &metrics);
+                                    if let Some(j) = admit_into(
+                                        &mut slots,
+                                        admission_limit,
+                                        job,
+                                        arrived,
+                                        arena.as_ref(),
+                                        &metrics,
+                                        &health,
+                                        kv_budget,
+                                    ) {
+                                        Metrics::inc(&metrics.queued_requests);
+                                        waiting.push_back(j);
+                                    }
+                                }
                                 MuxMsg::Drain(done) => {
                                     draining = true;
                                     drain_done = Some(done);
@@ -809,17 +879,6 @@ pub fn spawn(
             if live == 0 {
                 continue;
             }
-            let service_capacity = if let Some(controller) = rung_controller.as_ref() {
-                let occupied_extent = slots
-                    .iter()
-                    .rposition(Option::is_some)
-                    .map(|i| i + 1)
-                    .unwrap_or(1);
-                let service_rung = controller.covering(occupied_extent);
-                controller.width(service_rung)
-            } else {
-                capacity
-            };
 
             // Pick the covering bucket for (Decode, live, max seq requirement)
             // and its cached bufs — CPU reference path only; the GPU engine
@@ -862,65 +921,13 @@ pub fn spawn(
                 (key, bufs)
             };
 
-            // Admit gate — reads updated λ/μ. Shed drops every live slot.
-            let util = load.utilization();
-            metrics
-                .util_milli
-                .store((util * 1000.0) as u64, Ordering::Relaxed);
-            // The GPU engine (and any SAMPLE_BATCH bucket) advances ALL live
-            // slots in ONE batched launch, so `service_ms` is the per-token
-            // service time for the WHOLE batch, not per slot. The wait a
-            // joining request sees is the number of *serial* batches ahead of
-            // it: ceil(live / capacity). For a batch-1 engine (the shipped B=1
-            // GPU path and the CPU reference walk) capacity == 1, so this is
-            // exactly `live * service_ms` — byte-identical admission. For B > 1
-            // it removes the serial-M/M/1 overestimate that 429'd every live
-            // stream once `live * step_ms` crossed the SLO: a correct B=16
-            // batch decoding at ~40 ms/token was sched-killed at 7 users even
-            // though every user's real inter-token latency was ~40 ms (well
-            // under the SLO). Proven on GPU: b16 8-way passes token-identity
-            // with the shed off, sheds to 1 token/req with it on.
-            let predicted_wait = predicted_wait_ms(live, service_capacity, load.service_ms.get());
-            // A FLAT SLO cannot be right across decode batches. `service_ms` is
-            // one tick of real work and grows with B (measured Gemma-4-12B:
-            // 22 ms at B=8, 26 ms at B=16, 58 ms at B=32), so a constant 250 ms
-            // silently becomes "shed everything" as the blob gets wider — a
-            // B=32 blob 429'd every request at `predicted_wait_ms=329` with a
-            // single live stream, and `vllm bench` reports those 429s as
-            // SUCCESSFUL requests, which reads as a 2592 tok/s result. Floor the
-            // SLO at a few ticks of the service time the engine actually shows,
-            // so the knob keeps its meaning (a user waiting far longer than
-            // normal) instead of tracking the blob's width.
-            let slo = cfg.slo_ms.max(SLO_SERVICE_TICKS * load.service_ms.get());
-            match admit(util, predicted_wait, slo, true) {
-                Admit::Shed => {
-                    Metrics::add(&metrics.admit_shed, live as u64);
-                    tracing::warn!(
-                        %slug,
-                        live,
-                        predicted_wait_ms = predicted_wait,
-                        slo_ms = slo,
-                        slo_ms_configured = cfg.slo_ms,
-                        service_ms = load.service_ms.get(),
-                        util,
-                        "admission shed: dropping every live slot (429 to each)"
-                    );
-                    for s in slots.iter_mut() {
-                        if let Some(slot) = s.take() {
-                            release_kv(&arena, slot.kv);
-                            let _ = slot.respond.try_send(StreamChunk::Err(
-                                crate::RuntimeError::Rejected("arrival-rate admission shed".into()),
-                            ));
-                        }
-                    }
-                    if let Some(b) = taken_bufs.take() {
-                        bufs_cache.insert(b.key, b);
-                    }
-                    continue;
-                }
-                // Formation waits belong to the idle ingress path; live work must advance.
-                Admit::Defer | Admit::Now => {}
-            }
+            // ρ = λ/μ, exported as the `plowrt_utilization` gauge. Reported only: the decode-rung
+            // controller computes its own per-rung utilization and that is what moves the
+            // admission window. Nothing on this path may refuse a LIVE slot.
+            metrics.util_milli.store(
+                (load.utilization(Instant::now()) * 1000.0) as u64,
+                Ordering::Relaxed,
+            );
 
             Metrics::add(&metrics.batch_size_sum, live as u64);
             Metrics::inc(&metrics.batch_count);
@@ -986,6 +993,7 @@ pub fn spawn(
                     arena_ref,
                     kv_pages_for_tick,
                     steps,
+                    cfg.multi_step,
                     co_scheduled,
                 )
             };
@@ -1128,74 +1136,281 @@ fn note_dequeued(msg: &MuxMsg, metrics: &Metrics) {
     }
 }
 
-/// Place a job into the first idle slot, asking the arena for the KV
-/// footprint upfront. On KV OOM the request is dropped with a typed error —
-/// the mux doesn't hold the slot open under memory pressure. The prompt
-/// arrives pre-tokenized (see [`Job::prompt_ids`]).
-fn admit_into(
+fn reject_pending_after_drain(rx: &mut mpsc::Receiver<MuxMsg>, metrics: &Metrics) {
+    while let Ok(msg) = rx.try_recv() {
+        note_dequeued(&msg, metrics);
+        match msg {
+            MuxMsg::Drain(done) => {
+                let _ = done.send(());
+            }
+            MuxMsg::Job(job, _) => {
+                Metrics::inc(&metrics.rejected);
+                let _ = job
+                    .respond
+                    .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
+                        "model is draining — retry".into(),
+                    )));
+            }
+        }
+    }
+}
+
+fn note_arrival(now: Instant, load: &mut LoadEstimator, metrics: &Metrics) {
+    let lambda = load.lambda.observe(now);
+    metrics
+        .lambda_milli
+        .store((lambda * 1000.0) as u64, Ordering::Relaxed);
+}
+
+use crate::sched::admission::{reserved_kv_rows, seat, Denied};
+
+/// How long a request may sit in `waiting` before it stops yielding to younger arrivals, as a
+/// multiple of the SLO. The queue is backfill-first on purpose — a small request should take a
+/// slot a large one cannot use — but unbounded backfill is precisely what starves the large one,
+/// because every small admission it yields to shrinks the budget it is waiting for.
+const AGING_SLO_MULTIPLE: f64 = 4.0;
+/// Floor under the aging bound, so a tiny `--slo-ms` cannot turn the queue strictly FIFO.
+const AGING_FLOOR_MS: f64 = 1_000.0;
+/// How long a request may sit in `waiting` at all, as a multiple of the SLO.
+const QUEUE_TTL_SLO_MULTIPLE: f64 = 40.0;
+/// Floor under the TTL. Deliberately far above the aging bound: a 70k prompt queueing behind
+/// live sequences for several seconds is the system working, not a failure, so the TTL only
+/// catches a request nothing is going to serve.
+const QUEUE_TTL_FLOOR_MS: f64 = 30_000.0;
+
+/// Wait after which a queued request blocks the backfill behind it.
+#[inline]
+fn queue_aging_ms(slo_ms: f64) -> f64 {
+    (slo_ms.max(0.0) * AGING_SLO_MULTIPLE).max(AGING_FLOOR_MS)
+}
+
+/// Wait after which a queued request is shed: `PLOW_QUEUE_TTL_MS` when set, else derived.
+#[inline]
+fn queue_ttl_ms(slo_ms: f64) -> f64 {
+    queue_ttl_with(slo_ms, crate::config::RuntimeConfig::get().queue_ttl_ms)
+}
+
+/// `Some(ms <= 0)` never sheds.
+#[inline]
+fn queue_ttl_with(slo_ms: f64, set: Option<f64>) -> f64 {
+    match set {
+        Some(ms) if ms > 0.0 => ms,
+        Some(_) => f64::INFINITY,
+        None => (slo_ms.max(0.0) * QUEUE_TTL_SLO_MULTIPLE).max(QUEUE_TTL_FLOOR_MS),
+    }
+}
+
+/// What to do with an entry in `waiting` before it is retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Queued {
+    /// Try to seat it.
+    Retry,
+    /// The client is gone. Drop it silently — there is nobody to answer.
+    Disconnected,
+    /// It has waited past the TTL. Answer 429 and drop it.
+    Expired,
+}
+
+/// The queue-entry policy, kept pure so the two ways a waiting request leaves without running
+/// are decided in one place.
+#[inline]
+fn queue_verdict(closed: bool, waited_ms: f64, slo_ms: f64) -> Queued {
+    if closed {
+        Queued::Disconnected
+    } else if waited_ms > queue_ttl_ms(slo_ms) {
+        Queued::Expired
+    } else {
+        Queued::Retry
+    }
+}
+
+#[inline]
+fn waited_ms(now: Instant, arrived: Instant) -> f64 {
+    now.saturating_duration_since(arrived).as_secs_f64() * 1e3
+}
+
+/// One pass over the wait queue: sweep what will never run, then seat what fits.
+///
+/// Two fairness rules on top of the backfill:
+///
+/// * **Sweep.** A disconnected client and a request past its TTL both hold a queue entry they
+///   will never use. The per-request disconnect check in [`admit_into`] only fires when a slot
+///   is free, so with a full slot table those entries used to sit in `waiting` indefinitely,
+///   counting against `ingress_capacity` and inflating the backlog the rung controller widens
+///   against. Sweeping is unconditional and costs one atomic load per queued entry.
+/// * **Aging.** The first request that does not fit and has waited past
+///   [`queue_aging_ms`] stops the pass. Younger requests keep backfilling until then, so the
+///   throughput win is preserved; after it, the aged request is only waiting on retirement,
+///   which is bounded. Without this a large request is starved forever by a stream of small
+///   ones: each small admission it yields to consumes the very budget it needs.
+///
+/// A request that can never fit is not this function's problem — [`seat`] answers
+/// [`Denied::ExceedsWholeBudget`] terminally, so the aging rule can never block on one.
+#[allow(clippy::too_many_arguments)]
+fn drain_waiting(
+    waiting: &mut std::collections::VecDeque<(Job, Instant)>,
     slots: &mut [Option<Slot>],
-    job: Job,
-    arrived: Instant,
-    load: &mut LoadEstimator,
-    last_arrival: &mut Option<Instant>,
+    admission_limit: usize,
+    now: Instant,
+    slo_ms: f64,
     arena: Option<&SharedKvState>,
     metrics: &Arc<Metrics>,
     health: &EngineHealth,
+    kv_budget: Option<crate::sched::admission::KvBudget>,
 ) {
-    // A dead engine cannot serve anyone — reject up front with the fault that
-    // killed it (fatal DeviceFault → 503), instead of admitting into a
-    // poisoned context. The poisoning itself was logged once; this stays at
-    // debug so a request flood doesn't become a log flood.
-    if let EngineHealth::Dead(info) = health {
-        tracing::debug!("mux: engine dead — request rejected");
-        Metrics::inc(&metrics.rejected);
-        let _ = job
-            .respond
-            .try_send(StreamChunk::Err(crate::RuntimeError::DeviceFault {
-                info: info.clone(),
-            }));
-        return;
-    }
-
-    // Refresh λ from the inter-arrival gap.
-    let now = job.arrived;
-    if let Some(prev) = last_arrival.replace(now) {
-        let dt = now.duration_since(prev).as_secs_f64();
-        if dt > 1e-6 {
-            load.lambda.update(1.0 / dt);
-            // PUBLISH IT. `lambda_milli` existed and was exported as
-            // `plowrt_arrival_rate` with no writer anywhere, so it read a flat
-            // 0.000 next to a live `plowrt_utilization` — which scrapes as "no
-            // traffic", not as "not implemented". The estimate was already
-            // here; only the store was missing.
-            metrics
-                .lambda_milli
-                .store((load.lambda.get() * 1000.0) as u64, Ordering::Relaxed);
+    waiting.retain(|(job, arrived)| {
+        match queue_verdict(job.respond.is_closed(), waited_ms(now, *arrived), slo_ms) {
+            Queued::Retry => true,
+            Queued::Disconnected => {
+                metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                false
+            }
+            Queued::Expired => {
+                Metrics::inc(&metrics.admit_shed);
+                metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                let _ = job
+                    .respond
+                    .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(format!(
+                        "queued {:.0} ms past the {:.0} ms queue TTL",
+                        waited_ms(now, *arrived),
+                        queue_ttl_ms(slo_ms)
+                    ))));
+                false
+            }
         }
-    } else {
-        load.lambda.update(1.0);
+    });
+
+    let aging = queue_aging_ms(slo_ms);
+    let mut still: std::collections::VecDeque<(Job, Instant)> =
+        std::collections::VecDeque::new();
+    while slots[..admission_limit.min(slots.len())]
+        .iter()
+        .any(Option::is_none)
+    {
+        let Some((job, arrived)) = waiting.pop_front() else {
+            break;
+        };
+        match admit_into(
+            slots,
+            admission_limit,
+            job,
+            arrived,
+            arena,
+            metrics,
+            health,
+            kv_budget,
+        ) {
+            Some(held) => {
+                let blocks = waited_ms(now, held.1) >= aging;
+                still.push_back(held);
+                if blocks {
+                    break;
+                }
+            }
+            None => {
+                metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+    still.append(waiting);
+    *waiting = still;
+}
+
+/// Place a job into the first idle slot, asking the arena for the KV
+/// footprint upfront. Under temporary KV pressure the request remains queued without occupying
+/// a slot. The prompt arrives pre-tokenized (see [`Job::prompt_ids`]).
+/// Returns the job UNADMITTED when the KV budget cannot back it yet; the caller holds it and
+/// retries before taking anything newer. That is the whole backpressure mechanism: a request
+/// the device cannot back stays in the queue instead of being dispatched into a fault.
+///
+/// `limit` bounds which slots a NEW request may take (the decode-rung admission window); the
+/// budget is charged over every live slot, including those above the limit, because their KV is
+/// just as resident.
+#[allow(clippy::too_many_arguments)]
+fn admit_into(
+    slots: &mut [Option<Slot>],
+    limit: usize,
+    job: Job,
+    arrived: Instant,
+    arena: Option<&SharedKvState>,
+    metrics: &Arc<Metrics>,
+    health: &EngineHealth,
+    kv_budget: Option<crate::sched::admission::KvBudget>,
+) -> Option<(Job, Instant)> {
+    if job.respond.is_closed() {
+        return None;
     }
 
-    let Some(idx) = slots.iter().position(|s| s.is_none()) else {
-        // Capacity exhausted — reject fast rather than sitting on the request.
-        tracing::warn!(
-            capacity = slots.len(),
-            "mux: no free slot — request rejected"
-        );
-        // Counted here and NOT in the admission-shed path above: both end as a
-        // 429, but shedding is the controller dropping live work because
-        // predicted wait passed the SLO, while this is arrival meeting a full
-        // slot table. Adding them together hides which pressure caused the 429.
-        Metrics::inc(&metrics.rejected);
-        let _ = job
-            .respond
-            .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
-                "engine at capacity — no free slot".into(),
-            )));
-        return;
-    };
+    let want = reserved_kv_rows(job.prompt_ids.len(), job.gen.max_tokens, 0);
+    let seq_upper = want as i64;
+    let free_slot = slots[..limit.min(slots.len())]
+        .iter()
+        .position(Option::is_none);
+    let committed = slots
+        .iter()
+        .flatten()
+        .map(|s| reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()));
 
-    let seq_upper = (job.prompt_ids.len() + job.gen.max_tokens.max(1)) as i64;
+    let idx = match seat(
+        matches!(health, EngineHealth::Dead(_)),
+        free_slot,
+        want,
+        committed,
+        kv_budget,
+    ) {
+        Ok(idx) => idx,
+        Err(denied) => {
+            // Retryable: stays queued, says nothing, costs no slot. This is the whole
+            // backpressure mechanism.
+            if denied.is_retryable() {
+                if let Denied::KvBudgetFull { want } = denied {
+                    tracing::debug!(
+                        want,
+                        max_rows = kv_budget.map(|b| b.max_rows()).unwrap_or(0),
+                        "mux: KV budget full — request stays queued"
+                    );
+                }
+                return Some((job, arrived));
+            }
+            // Terminal: answer the stream with the reason this request can never be seated.
+            let err = match denied {
+                Denied::EngineDead => {
+                    // The poisoning itself was logged once; this stays at debug so a request
+                    // flood does not become a log flood.
+                    tracing::debug!("mux: engine dead — request rejected");
+                    let EngineHealth::Dead(info) = health else {
+                        unreachable!("seat only returns EngineDead for a dead engine")
+                    };
+                    crate::RuntimeError::DeviceFault { info: info.clone() }
+                }
+                Denied::NoFreeSlot => {
+                    tracing::warn!(
+                        capacity = slots.len(),
+                        "mux: no free slot — request rejected"
+                    );
+                    crate::RuntimeError::Rejected("engine at capacity — no free slot".into())
+                }
+                Denied::ExceedsWholeBudget { want, max_rows } => {
+                    tracing::warn!(
+                        want,
+                        max_rows,
+                        "mux: request exceeds the whole KV budget — rejected"
+                    );
+                    crate::RuntimeError::ContextLength(format!(
+                        "request reserves {want} tokens; this device can back {max_rows} across \
+                         all concurrent sequences"
+                    ))
+                }
+                Denied::KvBudgetFull { .. } => unreachable!("handled as retryable above"),
+            };
+            // Counted for every terminal denial. Kept separate from the admission-shed path:
+            // both end as a 429, but shedding is the controller dropping live work because
+            // predicted wait passed the SLO, while these are arrival meeting a hard limit.
+            Metrics::inc(&metrics.rejected);
+            let _ = job.respond.try_send(StreamChunk::Err(err));
+            return None;
+        }
+    };
 
     let kv = if let Some(arena) = arena {
         match arena.lock().arena.allocate_slot(seq_upper) {
@@ -1208,7 +1423,7 @@ fn admit_into(
                     .try_send(StreamChunk::Err(crate::RuntimeError::Oom(format!(
                         "kv: {e}"
                     ))));
-                return;
+                return None;
             }
         }
     } else {
@@ -1238,6 +1453,7 @@ fn admit_into(
         cached_tokens: 0,
         kv,
     });
+    None
 }
 
 /// Return a slot's KV blocks to the arena (no-op when the slot never got one).
@@ -1391,6 +1607,13 @@ fn run_one_tick(
     arena: Option<SharedKvState>,
     kv_pages_range: std::ops::Range<usize>,
     steps: u32,
+    // `--multi-step` itself, kept apart from `steps` because `steps == 1` is ambiguous: it is
+    // both "multi-step is off" and "`MultiStep::for_batch` collapsed at this batch size".
+    #[cfg_attr(
+        not(any(feature = "hsa", feature = "cpu")),
+        allow(unused_variables)
+    )]
+    multi_step: bool,
     #[cfg_attr(
         not(any(feature = "cuda", feature = "hsa", feature = "cpu")),
         allow(unused_variables)
@@ -2439,23 +2662,18 @@ fn run_one_tick(
                             })
                         })
                         .count();
-                    // ADMIT ONLY A STEP THAT IS ACTUALLY BATCHING SOMETHING.
+                    // ADMIT ONLY A STEP THAT ACTUALLY PACKS PREFILLS.
                     //
                     // `feeds + completing > 0` is the CORRECTNESS floor: without a sampled row
-                    // there is no output segment to run. `>= 2` is the policy on top of it:
-                    // a prompt admitted alone does no cross-request packing and may run a rung
-                    // with fewer attention workgroups than ordinary execution would pick —
-                    // measured on Gemma-4 31B at concurrency 1, -3.5% throughput and -35% TTFT
-                    // at 512 input, -10.5% and -48.8% at 2048 — for no packing at all, because
-                    // there is nothing to pack it with. The ordinary route already samples a
-                    // completing prompt's last row in its own prefill program with no extra
-                    // pass, so there is nothing to win there either.
+                    // there is no output segment to run. Two prefill members is the policy on
+                    // top of it. Decode rows do not make a lone prefill a packed-prefill step:
+                    // at 70K/C20, fusing decode with one full 8192-row member was 4.5% slower
+                    // than the ordinary independent paths.
                     //
                     // `--amd-token-batch-solo` restores the unconditional form, which is what
                     // the first campaign measured; it exists so the policy stays falsifiable.
-                    let members = feeds.len() + pack.len();
                     if feeds.len() + completing > 0
-                        && (members >= 2
+                        && (pack.len() >= 2
                             || crate::config::RuntimeConfig::get().amd.token_batch_solo)
                     {
                         chosen = Some((rows, pack));
@@ -3035,10 +3253,10 @@ fn run_one_tick(
                 .map(|slot| slot.gen.max_tokens.saturating_sub(slot.out_ids.len()))
                 .min()
                 .unwrap_or(1);
-            let requested = multistep_requested(
+            let requested = amd_multistep_requested(
                 remaining,
-                steps as usize,
-                crate::config::RuntimeConfig::get().nv.multistep as usize,
+                multi_step,
+                crate::config::RuntimeConfig::get().multistep() as usize,
             );
             let multi = e.multistep_quantum(&feeds, requested);
             let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
@@ -3347,27 +3565,13 @@ fn deferred_token(tokens: &[u32], slot: usize, step: usize, quantum: usize) -> R
 
 /// Whether a tick's wall time is a valid **decode** service sample. Prefill
 /// ticks are excluded: a chunk-interleaved prefill tick is bounded by design
-/// (`PLOW_PF_INTERLEAVE` rows) and a long prompt runs MANY of them — feeding
-/// them to the admission EWMA inflates `predicted_wait` past the SLO and the
-/// shed kills every live decode stream (measured: any 32k prompt at the
-/// default `--slo-ms 250` shed itself and its neighbors). Free-standing for
-/// tests.
+/// (`PLOW_PF_INTERLEAVE` rows) and a long prompt runs MANY of them, so feeding
+/// them to the service EWMA reports a decode tick that costs an order of
+/// magnitude more than it does. The rung controller floors its SLO at eight of
+/// these (`RungController::decide`), so a poisoned sample moves the admission
+/// window on evidence from the wrong phase. Free-standing for tests.
 fn service_sample(ms: f64, did_prefill: bool) -> Option<f64> {
     (ms > 0.0 && !did_prefill).then_some(ms)
-}
-
-/// Predicted admission wait for a joining request, in ms.
-///
-/// `service_ms` is the wall time of ONE decode tick, which advances EVERY live
-/// slot in a single batched launch (GPU engine / SAMPLE_BATCH bucket). A
-/// joining request therefore waits on the number of *serial* batches ahead of
-/// it — `ceil(live / capacity)` — not on `live` serial services. For a
-/// batch-1 engine (`capacity == 1`: the shipped B=1 GPU path and the CPU
-/// reference walk) this is exactly `live * service_ms`, byte-identical to the
-/// pre-fix formula; for a B>1 batch it collapses to a single tick while any
-/// slot is free, which is what a data-parallel launch actually costs.
-fn predicted_wait_ms(live: usize, capacity: usize, service_ms: f64) -> f64 {
-    live.div_ceil(capacity.max(1)) as f64 * service_ms
 }
 
 /// The serve-layer interleave bound: max prefill-chunk rows per tick while
@@ -3455,6 +3659,32 @@ fn amd_defer_decode(enabled: bool, prefill_remains: bool) -> bool {
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 fn multistep_requested(remaining: usize, scheduler_steps: usize, configured: usize) -> usize {
     remaining.min(scheduler_steps).min(configured.max(1))
+}
+
+/// The AMD deferred-read decode quantum to ask for.
+///
+/// Deliberately NOT `multistep_requested`: that one is bounded by `MultiStep::for_batch`, which
+/// collapses to a single step above B=8 on the premise that a wide batch already amortises the
+/// launch. The premise belongs to the NVIDIA device-multistep object. This path issues one
+/// host-visible dispatch per token, so under continuous batching — where B is essentially always
+/// above 8 — the quantum was ALWAYS 1 and decode paid a full host turnaround on every token.
+///
+/// Arming a quantum while a DIFFERENT slot is mid-prefill is safe, and by construction rather
+/// than by luck: `feeds` carries only slots that have already produced a token, the engine
+/// clears a slot's prefill cursor at the instant that token is produced, and `multi_step`
+/// advances nothing but the slots it is fed. A prefill cursor moves only when the host calls
+/// `prefill_chunk_rows` on a later tick. The quantum therefore changes WHEN the next prefill
+/// chunk is issued — a TTFT tradeoff for the prefilling slot, governed by `--pf-defer-decode`
+/// and the interleave bound — never WHETHER it is correct.
+///
+/// What remains are the bounds that mean something: the client's own remaining output, the
+/// configured knob, and (applied downstream by `decode_quantum`) `DEFERRED_TOKEN_MAX_STEPS`.
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn amd_multistep_requested(remaining: usize, enabled: bool, configured: usize) -> usize {
+    if !enabled {
+        return 1;
+    }
+    remaining.min(configured.max(1))
 }
 
 #[cfg(any(feature = "hsa", feature = "cpu"))]
@@ -4392,6 +4622,38 @@ mod tests {
     use crate::serve::RunObserver;
     use plow_asset::{KvLayerPaging, KvPaging};
 
+    /// Every ingress event deposits into λ, and the gauge reports what the rung controller
+    /// reads. A one-per-second stream must settle on ~1/s, not on the reciprocal EWMA's answer.
+    #[test]
+    fn arrival_rate_is_updated_once_per_ingress_event() {
+        let metrics = Metrics::default();
+        let mut load = LoadEstimator::default();
+        let first = Instant::now();
+
+        note_arrival(first, &mut load, &metrics);
+        assert_eq!(metrics.lambda_milli.load(Ordering::Relaxed), 500);
+        for i in 1..30 {
+            note_arrival(first + std::time::Duration::from_secs(i), &mut load, &metrics);
+        }
+        let lambda = metrics.lambda_milli.load(Ordering::Relaxed) as f64 / 1000.0;
+        assert!((lambda - 1.0).abs() < 0.3, "1 req/s should read ~1, got {lambda}");
+    }
+
+    /// Idle time alone must move λ, and with it the utilization gauge — the whole point of the
+    /// decaying estimator. Nothing calls `note_arrival` between the two reads here.
+    #[test]
+    fn utilization_falls_during_a_quiet_period_with_no_ingress_event() {
+        let mut load = LoadEstimator::default();
+        let t0 = Instant::now();
+        for i in 0..20 {
+            load.lambda.observe(t0 + std::time::Duration::from_millis(100 * i));
+        }
+        load.service_ms.update(40.0);
+        let busy = load.utilization(t0 + std::time::Duration::from_millis(2_000));
+        let quiet = load.utilization(t0 + std::time::Duration::from_secs(12));
+        assert!(busy > 0.0 && quiet < busy * 0.01, "busy {busy} quiet {quiet}");
+    }
+
     fn test_job() -> Job {
         let (respond, _rx) = crate::serve::stream::channel();
         Job {
@@ -4407,6 +4669,43 @@ mod tests {
         let ring = [10, 11, 12, 20, 21, 22];
         assert_eq!(deferred_token(&ring, 1, 2, 3).unwrap(), 22);
         assert!(deferred_token(&ring, 2, 0, 3).is_err());
+    }
+
+    /// §B1. The AMD deferred-read quantum must not collapse at the batch sizes continuous
+    /// batching actually runs at. `MultiStep::for_batch` returns 1 for every B > 8, so routing
+    /// the AMD request through it made `quantum >= 2` unreachable at C16 and decode paid a full
+    /// host turnaround on every token.
+    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[test]
+    fn the_amd_quantum_survives_a_batch_wider_than_eight() {
+        // The defect, stated as the old call would have computed it.
+        for batch in [9, 16, 32, 70] {
+            let collapsed =
+                multistep_requested(512, MultiStep::for_batch(batch).steps as usize, 8);
+            assert_eq!(collapsed, 1, "control: for_batch collapses at B={batch}");
+        }
+        // Batch size no longer bounds it; the knob does.
+        assert_eq!(amd_multistep_requested(512, true, 8), 8);
+        assert_eq!(amd_multistep_requested(512, true, 4), 4);
+        // `--multi-step` off still means single-step, which `steps == 1` could not express.
+        assert_eq!(amd_multistep_requested(512, false, 8), 1);
+        // The client's remaining output still bounds it, and a zero knob cannot wedge it.
+        assert_eq!(amd_multistep_requested(3, true, 8), 3);
+        assert_eq!(amd_multistep_requested(0, true, 8), 0);
+        assert_eq!(amd_multistep_requested(512, true, 0), 1);
+        // And the nominal default is now reachable on this backend, which a ceiling of 4 made
+        // impossible: `decode_quantum` clamps the request to DEFERRED_TOKEN_MAX_STEPS.
+        let positions = [0u32; 16];
+        assert_eq!(
+            crate::sched::multistep::decode_quantum(
+                0..16,
+                &positions,
+                81_920,
+                amd_multistep_requested(512, true, 8),
+                crate::exec::amd::DEFERRED_TOKEN_MAX_STEPS,
+            ),
+            Ok(8)
+        );
     }
 
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
@@ -4457,6 +4756,292 @@ mod tests {
             Err(SubmitError::Closed(_))
         ));
         assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn idle_drain_rejects_pending_jobs_and_answers_followup_drains() {
+        let metrics = Metrics::default();
+        let (tx, mut rx) = mpsc::channel(4);
+        let (respond, mut chunks) = crate::serve::stream::channel();
+        let job = Job {
+            prompt_ids: vec![1],
+            gen: GenParams::default(),
+            arrived: Instant::now(),
+            respond,
+        };
+        metrics.queued_requests.store(1, Ordering::Relaxed);
+        assert!(tx.try_send(MuxMsg::Job(job, Instant::now())).is_ok());
+        let (done, mut done_rx) = tokio::sync::oneshot::channel();
+        assert!(tx.try_send(MuxMsg::Drain(done)).is_ok());
+
+        reject_pending_after_drain(&mut rx, &metrics);
+
+        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.rejected.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            chunks.try_recv(),
+            Ok(StreamChunk::Err(crate::RuntimeError::Rejected(_)))
+        ));
+        assert!(matches!(done_rx.try_recv(), Ok(())));
+    }
+
+    #[test]
+    fn disconnected_job_is_not_admitted() {
+        let metrics = Arc::new(Metrics::default());
+        let mut slots: Vec<Option<Slot>> = std::iter::once_with(|| None).collect();
+
+        assert!(admit_into(
+            &mut slots,
+            1,
+            test_job(),
+            Instant::now(),
+            None,
+            &metrics,
+            &EngineHealth::Healthy,
+            None,
+        )
+        .is_none());
+        assert!(slots[0].is_none());
+    }
+
+    /// A queued job whose client is still connected; the caller must keep the receiver alive.
+    fn queued_job(
+        prompt: usize,
+        arrived: Instant,
+    ) -> ((Job, Instant), crate::serve::stream::ChunkReceiver) {
+        let (respond, rx) = crate::serve::stream::channel();
+        let job = Job {
+            prompt_ids: vec![1; prompt],
+            gen: GenParams {
+                max_tokens: 1,
+                ..GenParams::default()
+            },
+            arrived,
+            respond,
+        };
+        ((job, arrived), rx)
+    }
+
+    /// 1000 rows of budget at one byte per row; a slot table nothing else is using.
+    fn starvation_fixture() -> (
+        Arc<Metrics>,
+        Vec<Option<Slot>>,
+        crate::sched::admission::KvBudget,
+        Vec<crate::serve::stream::ChunkReceiver>,
+    ) {
+        let metrics = Arc::new(Metrics::default());
+        let budget = crate::sched::admission::KvBudget::linear(1, 1_000);
+        let mut slots: Vec<Option<Slot>> = (0..8).map(|_| None).collect();
+        // One live sequence already holding 301 rows, so a 701-row request cannot be seated
+        // until something retires, but a 101-row one can.
+        let ((job, arrived), rx) = queued_job(300, Instant::now());
+        assert!(admit_into(
+            &mut slots,
+            8,
+            job,
+            arrived,
+            None,
+            &metrics,
+            &EngineHealth::Healthy,
+            Some(budget),
+        )
+        .is_none());
+        (metrics, slots, budget, vec![rx])
+    }
+
+    /// The backfill is a throughput win and stays on until the head has actually waited. Both
+    /// halves are the contract, so both are asserted here.
+    #[test]
+    fn a_young_head_yields_to_backfill_and_an_aged_one_stops_it() {
+        let now = Instant::now();
+        let aging = queue_aging_ms(250.0);
+        let young = now - std::time::Duration::from_millis(10);
+        let aged = now - std::time::Duration::from_secs_f64(aging / 1e3 + 1.0);
+
+        for (head_arrived, admitted_behind, remaining) in [(young, 3, 1), (aged, 0, 4)] {
+            let (metrics, mut slots, budget, mut keep) = starvation_fixture();
+            let live_before = slots.iter().flatten().count();
+            let mut waiting: std::collections::VecDeque<(Job, Instant)> =
+                std::collections::VecDeque::new();
+            // A 701-row head that does not fit behind the live sequence...
+            let (entry, rx) = queued_job(700, head_arrived);
+            keep.push(rx);
+            waiting.push_back(entry);
+            // ...and three 101-row requests that do.
+            for _ in 0..3 {
+                let (entry, rx) = queued_job(100, now - std::time::Duration::from_millis(5));
+                keep.push(rx);
+                waiting.push_back(entry);
+            }
+
+            drain_waiting(
+                &mut waiting,
+                &mut slots,
+                8,
+                now,
+                250.0,
+                None,
+                &metrics,
+                &EngineHealth::Healthy,
+                Some(budget),
+            );
+
+            assert_eq!(
+                slots.iter().flatten().count() - live_before,
+                admitted_behind,
+                "younger requests admitted past the head"
+            );
+            assert_eq!(waiting.len(), remaining);
+            // The head keeps its place either way — aging reorders nothing.
+            assert_eq!(waiting.front().unwrap().0.prompt_ids.len(), 700);
+        }
+    }
+
+    /// Repeated passes must not starve the aged head: once it blocks the backfill, the only
+    /// thing it waits on is retirement, and it takes the slot the moment one frees.
+    #[test]
+    fn an_aged_head_is_seated_as_soon_as_a_live_sequence_retires() {
+        let now = Instant::now();
+        let (metrics, mut slots, budget, mut keep) = starvation_fixture();
+        let mut waiting: std::collections::VecDeque<(Job, Instant)> =
+            std::collections::VecDeque::new();
+        let (entry, rx) = queued_job(700, now - std::time::Duration::from_secs(5));
+        keep.push(rx);
+        waiting.push_back(entry);
+        for _ in 0..3 {
+            let (entry, rx) = queued_job(100, now);
+            keep.push(rx);
+            waiting.push_back(entry);
+        }
+
+        let mut pass = |slots: &mut Vec<Option<Slot>>, waiting: &mut _| {
+            drain_waiting(
+                waiting,
+                slots,
+                8,
+                now,
+                250.0,
+                None,
+                &metrics,
+                &EngineHealth::Healthy,
+                Some(budget),
+            );
+        };
+        pass(&mut slots, &mut waiting);
+        assert_eq!(waiting.len(), 4, "blocked while the budget is held");
+
+        // The live sequence retires, freeing its 301 rows. The head takes them, and the
+        // backfill resumes behind it for as many of the 101-row requests as still fit
+        // (701 + 101 + 101 = 903 of 1000; the fourth is held again, this time fairly).
+        slots[0] = None;
+        pass(&mut slots, &mut waiting);
+        assert!(
+            slots.iter().flatten().any(|s| s.prompt_ids.len() == 700),
+            "the aged head goes first"
+        );
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting.front().unwrap().0.prompt_ids.len(), 100);
+    }
+
+    /// A queued entry whose client vanished must be swept even when no slot is free — the
+    /// per-request check inside `admit_into` only runs when there is somewhere to put it.
+    #[test]
+    fn waiting_entries_are_swept_for_disconnects_with_a_full_slot_table() {
+        let now = Instant::now();
+        let metrics = Arc::new(Metrics::default());
+        let mut slots: Vec<Option<Slot>> = Vec::new();
+        let mut waiting: std::collections::VecDeque<(Job, Instant)> =
+            std::collections::VecDeque::new();
+        metrics.queued_requests.store(2, Ordering::Relaxed);
+        let (gone, rx) = queued_job(10, now);
+        drop(rx);
+        waiting.push_back(gone);
+        let (live, keep) = queued_job(10, now);
+        waiting.push_back(live);
+
+        drain_waiting(
+            &mut waiting,
+            &mut slots,
+            0,
+            now,
+            250.0,
+            None,
+            &metrics,
+            &EngineHealth::Healthy,
+            None,
+        );
+
+        assert_eq!(waiting.len(), 1, "the disconnected entry is gone");
+        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.admit_shed.load(Ordering::Relaxed), 0, "not a shed");
+        drop(keep);
+    }
+
+    /// The TTL is the one shed plow performs, and it only ever touches a request that has not
+    /// started. It answers the stream rather than dropping it silently.
+    #[test]
+    fn queue_ttl_override_sets_or_disables_the_shed() {
+        assert_eq!(queue_ttl_with(250.0, None), QUEUE_TTL_FLOOR_MS);
+        assert_eq!(queue_ttl_with(1_000.0, None), 40_000.0);
+        assert_eq!(queue_ttl_with(250.0, Some(600_000.0)), 600_000.0);
+        assert!(queue_ttl_with(250.0, Some(0.0)).is_infinite());
+        assert_eq!(queue_verdict(false, 1e9, 250.0), Queued::Expired);
+    }
+
+    #[test]
+    fn a_request_past_the_queue_ttl_is_shed_with_an_answer() {
+        let now = Instant::now();
+        let metrics = Arc::new(Metrics::default());
+        let mut slots: Vec<Option<Slot>> = Vec::new();
+        let mut waiting: std::collections::VecDeque<(Job, Instant)> =
+            std::collections::VecDeque::new();
+        metrics.queued_requests.store(1, Ordering::Relaxed);
+        let ttl = queue_ttl_ms(250.0);
+        let (stale, mut rx) = queued_job(
+            10,
+            now - std::time::Duration::from_secs_f64(ttl / 1e3 + 1.0),
+        );
+        waiting.push_back(stale);
+
+        drain_waiting(
+            &mut waiting,
+            &mut slots,
+            0,
+            now,
+            250.0,
+            None,
+            &metrics,
+            &EngineHealth::Healthy,
+            None,
+        );
+
+        assert!(waiting.is_empty());
+        assert_eq!(metrics.admit_shed.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(StreamChunk::Err(crate::RuntimeError::Rejected(_)))
+        ));
+    }
+
+    /// Aging must always come first, or a request would be shed before it ever blocks the
+    /// backfill and the fairness rule would be unreachable.
+    #[test]
+    fn the_aging_bound_is_always_inside_the_ttl() {
+        for slo in [0.0, 1.0, 250.0, 5_000.0, 1e9] {
+            assert!(
+                queue_aging_ms(slo) < queue_ttl_ms(slo),
+                "slo {slo}: aging {} ttl {}",
+                queue_aging_ms(slo),
+                queue_ttl_ms(slo)
+            );
+        }
+        // A disconnect outranks a TTL expiry: there is nobody left to answer 429.
+        assert_eq!(queue_verdict(true, 1e9, 250.0), Queued::Disconnected);
+        assert_eq!(queue_verdict(false, 1e9, 250.0), Queued::Expired);
+        assert_eq!(queue_verdict(false, 0.0, 250.0), Queued::Retry);
+        // A nonsensical SLO must not produce a zero or negative bound.
+        assert!(queue_aging_ms(f64::NAN).is_finite() && queue_aging_ms(-1.0) > 0.0);
     }
 
     fn fault(fatal: bool) -> crate::DeviceErrorInfo {
@@ -4545,17 +5130,15 @@ mod tests {
         }
     }
 
-    /// Prefill ticks must never enter the decode-service EWMA (the admission
-    /// shed regression: one long prefill tick > slo_ms killed every live
-    /// decode stream). Decode ticks always do.
+    /// Prefill ticks must never enter the decode-service EWMA: the rung
+    /// controller floors its SLO at eight service ticks, so one 420 ms prefill
+    /// tick moves that floor past a 250 ms target on its own.
     #[test]
     fn service_sample_excludes_prefill_ticks() {
         assert_eq!(service_sample(420.0, true), None);
         assert_eq!(service_sample(18.3, false), Some(18.3));
         assert_eq!(service_sample(0.0, false), None);
 
-        // The shed math this guards: live=1, slo=250 — a decode-scale EWMA
-        // admits, a prefill-poisoned one sheds.
         let mut svc = crate::sched::admission::Ewma::new(0.2);
         for _ in 0..16 {
             svc.update(service_sample(420.0, true).unwrap_or(18.0));
@@ -4565,7 +5148,15 @@ mod tests {
         for _ in 0..16 {
             poisoned.update(420.0);
         }
-        assert!(poisoned.get() > 250.0, "control: unfiltered EWMA sheds");
+        assert!(poisoned.get() > 250.0, "control: unfiltered EWMA blows it");
+    }
+
+    #[test]
+    fn kv_reservation_releases_generated_output_credit() {
+        assert_eq!(reserved_kv_rows(70_000, 700, 0), 70_700);
+        assert_eq!(reserved_kv_rows(70_000, 700, 512), 70_188);
+        assert_eq!(reserved_kv_rows(4, 0, 0), 5);
+        assert_eq!(reserved_kv_rows(4, 0, usize::MAX), 0);
     }
 
     #[test]
@@ -4916,34 +5507,6 @@ mod tests {
         let newer = now - std::time::Duration::from_millis(5);
         assert!(arrival_key(older, now) < arrival_key(newer, now));
         assert_eq!(arrival_key(now, now), u64::MAX);
-    }
-
-    /// The batched-engine admission model: a decode tick advances every live
-    /// slot in ONE launch, so `predicted_wait` must not scale with `live` up to
-    /// the batch capacity. Regression guard for the B>8 serving-capacity bug —
-    /// a correct B=16 blob at ~40 ms/token was shed-killed at 7 live users
-    /// because the old `live * service_ms` formula predicted 280 ms > 250 ms SLO
-    /// even though every user's real inter-token latency was ~40 ms.
-    #[test]
-    fn predicted_wait_is_batched_not_serial() {
-        // Batch-1 engine (shipped B=1 GPU path / CPU reference walk): identical
-        // to the old serial formula `live * service_ms`.
-        for live in 0..4 {
-            assert_eq!(
-                predicted_wait_ms(live, 1, 40.0),
-                live as f64 * 40.0,
-                "capacity=1 must equal the pre-fix serial formula"
-            );
-        }
-        // B=16 engine at 40 ms/token: all 8 (and all 16) live users share one
-        // batched tick, so the wait stays at one service time — under a 250 ms
-        // SLO where the old formula (8*40=320) sheds.
-        assert_eq!(predicted_wait_ms(8, 16, 40.0), 40.0);
-        assert_eq!(predicted_wait_ms(16, 16, 40.0), 40.0);
-        assert!(predicted_wait_ms(8, 16, 40.0) <= 250.0, "b16@8 must admit");
-        assert!(8.0 * 40.0 > 250.0, "control: old serial formula would shed");
-        // No live slots → no wait.
-        assert_eq!(predicted_wait_ms(0, 16, 40.0), 0.0);
     }
 
     /// The incremental (windowed) detokenizer must reconstruct exactly the

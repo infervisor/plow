@@ -99,11 +99,11 @@ pub fn class_of(op: DevOp) -> RowClass {
         // `Embed` gathers rows of the EMBEDDING TABLE by token id — one id per row, no
         // position, no cross-row coupling. It is not a hidden-row gather; `RowGather` is.
         Embed => RowClass::A,
-        Gemm | GemmSmall | GemmMed | GemmLtPf | GemmBlkPf | GemmWide | GemmC5 | GemmNorm | GemmGlu
-        | GemmSplitK | GemmFp8 | GemmMedFp8 | GemmSmallFp8 | GemmGluFp8 | GemmWideFp8
-        | GemmC5Fp8 | GemmFp8Blk | GemmMxfp4 | GemmMedMxfp4 | GemmSmallMxfp4 | GemmWideMxfp4
-        | GemmC5Mxfp4 | GemmGluMxfp4 | DenseGluFp8Blk | GemmAffineQ4 | Q8GemmF32 | DenseGemmF32
-        | SiluF32 => RowClass::A,
+        Gemm | GemmSmall | GemmMed | GemmF32 | GemmLtPf | GemmBlkPf | GemmWide | GemmC5
+        | GemmNorm | GemmGlu | GemmSplitK | GemmFp8 | GemmMedFp8 | GemmSmallFp8 | GemmGluFp8
+        | GemmWideFp8 | GemmC5Fp8 | GemmFp8Blk | GemmMxfp4 | GemmMedMxfp4 | GemmSmallMxfp4
+        | GemmWideMxfp4 | GemmC5Mxfp4 | GemmGluMxfp4 | DenseGluFp8Blk | GemmAffineQ4
+        | Q8GemmF32 | DenseGemmF32 | SiluF32 => RowClass::A,
         Gemv | GemvSz | GemvGlu | GemvGluSz | GemvArgmax | GemvQkv | GemvQkvg | GemvF32
         | GemvFp8 | GemvGluFp8 | GemvFp8Blk | GemvQkvFp8 | GemvMxfp4 | GemvGluMxfp4
         | GemvQkvMxfp4 | GemvAffineQ4 => RowClass::A,
@@ -112,7 +112,11 @@ pub fn class_of(op: DevOp) -> RowClass {
         // Collectives reduce whole tensors at live row extents identical on every rank; the
         // element count is an input, the row identity is not.
         XReduce | XReduceScatter | XAllGather | XFlashMerge | XArgmaxFin | XReduceTwoShot
-        | XReduceAddNorm | XAllToAllHeads => RowClass::A,
+        | XReduceAddNorm | XAllToAllHeads | XDcpGather => RowClass::A,
+        // DCP pack: records are `b*K + j`, the batch row is an input like the flash's.
+        DcpKvPack => RowClass::A,
+        // DCP write: row t is decode slot t, or a row of the one prefilling sequence at pos[t].
+        DcpKvScatter => RowClass::A,
         // MoE. Routing, grouping, scatter and combine are the row-grouping contract shared
         // across families: each expert receives its rows from any request or phase, and the
         // maps are built from the batch. `MoeCombinePf`'s `i3 = t_row0` is a band OFFSET into

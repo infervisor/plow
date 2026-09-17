@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://plow.dev/schemas/perf-ledger-entry-v1.schema.json",
   "title": "Plow performance ledger entry (checkpoint P input)",
-  "description": "One arm's measurement of one rung on one metric. A treatment names its control and its repeated control, measured in the same job on the same hardware. Written by scripts/ledger_append.py to /workspace/plow-ledger/ledger.jsonl.",
+  "description": "One arm's measurement of one rung on one metric. A treatment names its control and its repeated control, measured in the same job on the same hardware. Written by scripts/ledger_append.py to /workspace/plow-glm53/plow-ledger/ledger.jsonl.",
   "type": "object",
   "required": [
     "id", "date", "job", "harness", "hardware", "rung", "recipe_digest", "knob_delta",

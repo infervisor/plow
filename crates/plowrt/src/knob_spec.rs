@@ -60,6 +60,27 @@ const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
 };
 
+/// KV-capacity admission. The mux admitted on free SLOTS alone, so a device that can back
+/// ~15 concurrent 70k sequences was handed 20 and faulted instead of applying backpressure.
+const KV_ADMIT_DEFAULT: Status = Status::Candidate {
+    evidence: &[
+        "review log: job 70k-fault2 arm C, 20 x 70,000 on a fresh server, HSA_STATUS_ERROR_OUT_OF_RESOURCES after occupied_extent=20; the C1 and C4 arms clean, and arm D clean through three 8192 steps before the same cell faulted",
+        "the same run's load log: 55,296 B per token per rank, 55.59 GiB free after load, so 20 x 70,000 rows wants 72.1 GiB against a 55.59 GiB budget",
+        "docs/flags-reference.md: `=0` is the rollback to slot-count-only admission",
+    ],
+};
+
+/// Pressure eviction armed by default. The cache previously trimmed only on its static 5%
+/// budget, so it never reacted to real device pressure however little was free.
+const PRESSURE_EVICTION_DEFAULT: Status = Status::Candidate {
+    evidence: &[
+        "review log: unset meant `enable_pressure_eviction` was never called, so the only trim trigger was the static `rt.vmm_cache_memory_utilization` budget (~9.6 GB of 192)",
+        "device/hsa.rs `free_bytes` reports HSA_AMD_AGENT_INFO_MEMORY_AVAIL, reflecting every consumer of the device's VRAM, so the floor is measured not modelled",
+        "memory/vmm.rs `enable_pressure_eviction`: a backend that cannot report free bytes degrades to the static budget, so arming this is safe on every backend",
+        "docs/flags-reference.md: `=0` is the rollback to the static budget",
+    ],
+};
+
 /// Runtime knobs change no packet byte; their scope is the route a workload takes.
 /// G1 (review log #85) skips union segments inside the sparse prefill programs; the packet does not
 /// change, so the route is its whole scope.
@@ -313,11 +334,14 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.idle_dispatch", Some("PLOW_IDLE_DISPATCH"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.encode_fast", Some("PLOW_ENCODE_FAST"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.encode_threads", Some("PLOW_ENCODE_THREADS"), Layer::Runtime, U32, UNSET, OPT_IN),
+    KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.05")), OPT_IN),
-    KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
+    KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PRESSURE_EVICTION_DEFAULT),
+    KnobSpec::new("rt.kv_admit_headroom", Some("PLOW_KV_ADMIT_HEADROOM"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.9")), KV_ADMIT_DEFAULT),
     KnobSpec::new("rt.amd_prefix_fine_rows", Some("PLOW_AMD_PREFIX_FINE_ROWS"), Layer::Runtime, U32, UNSET, PREFIX_CACHE_CANDIDATE),
     KnobSpec::new("rt.mla_pf_row_split", Some("PLOW_MLA_PF_ROW_SPLIT"), Layer::Runtime, Domain::Bool, ON, ROW_SPLIT_QUALIFIED),
     KnobSpec::new("rt.mla_pf_row_split_native_lo", Some("PLOW_MLA_PF_ROW_SPLIT_NATIVE_LO"), Layer::Runtime, Domain::Bool, ON, NATIVE_LO_QUALIFIED),
+    KnobSpec::new("rt.glm_rowband_clear_ws", Some("PLOW_GLM_ROWBAND_CLEAR_WS"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.vmm_cache_mib", Some("PLOW_VMM_CACHE_MIB"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_block_mib", Some("PLOW_VMM_BLOCK_MIB"), Layer::Runtime, U32, Default::Static(Val::Nat(2)), OPT_IN),
     KnobSpec::new("rt.weight_vmm", Some("PLOW_WEIGHT_VMM"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
@@ -328,6 +352,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_no_interleave", Some("PLOW_PF_NO_INTERLEAVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_defer_decode", Some("PLOW_PF_DEFER_DECODE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.tbt_slo_ms", Some("PLOW_TBT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.queue_ttl_ms", Some("PLOW_QUEUE_TTL_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.ttft_slo_ms", Some("PLOW_TTFT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.slab_keep", Some("PLOW_SLAB_KEEP"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.dstep_every", Some("PLOW_DSTEP_EVERY"), Layer::Runtime, U32, UNSET, OPT_IN),
@@ -391,11 +416,13 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.prefill_seg_timing", Some("PLOW_PREFILL_SEG_TIMING"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.native_launch_timing", Some("PLOW_NATIVE_LAUNCH_TIMING"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.union_skip", Some("PLOW_AMD_UNION_SKIP"), Layer::Runtime, Domain::Bool, ON, UNION_SKIP_QUALIFIED).scoped(UNION_SKIP_SCOPE),
+    KnobSpec::new("rt.dsa_select_threshold", Some("PLOW_DSA_SELECT_THRESHOLD"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.tb_dump", Some("PLOW_TB_DUMP"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.trace_allranks", Some("PLOW_TRACE_ALLRANKS"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.attnres_f32mix_grid", Some("PLOW_ATTNRES_F32MIX_GRID"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.moe_prefill_ep_max_extra_bytes", Some("PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES"), Layer::Runtime, USIZE, UNSET, DIAG),
     KnobSpec::new("rt.phase_objects", Some("PLOW_PHASE_OBJECTS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.live_ctx", Some("PLOW_LIVE_CTX"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_kv", Some("PLOW_VMM_KV"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.kv_map_ahead", Some("PLOW_KV_MAP_AHEAD"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.kv_map_next_chunk", Some("PLOW_KV_MAP_NEXT_CHUNK"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
@@ -424,6 +451,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.ragged_seams", Some("PLOW_AMD_RAGGED_SEAMS"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.mla_ns_live", Some("PLOW_MLA_NS_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.amd_decode_dense_exact", Some("PLOW_AMD_DECODE_DENSE_EXACT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN).scoped(DECODE_DENSE_EXACT_SCOPE),
+    KnobSpec::new("rt.glm_rowband", Some("PLOW_GLM_ROWBAND"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.rt_hsaco", Some("PLOW_HSACO"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.fp8_dir", Some("PLOW_FP8_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.trace_raw", Some("PLOW_TRACE_RAW"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -712,6 +740,11 @@ mod tests {
             "object.rs",
             "this packet requires PLOW_DSA_PF_ARM=1",
             Site::Encoded("dsa_pf_packet_requires_mla_pf_v2"),
+        ),
+        (
+            "mla.rs",
+            "PLOW_DCP requires PLOW_GLM_FP8_KV",
+            Site::Encoded("dcp_requires_glm_fp8_kv"),
         ),
         (
             "metal.rs",
@@ -1144,6 +1177,8 @@ mod tests {
 
         let rt = runtime_config();
         let mut k = production_knobs();
+        k["values"]["emit.token_batch_tp"] = false.into();
+        k["values"]["emit.glm_seq_par"] = true.into();
         k["values"]["emit.glm_xr_band"] = 2.into();
         let err = check_knobs(&k, &rt).unwrap_err();
         assert!(err.contains("seq_par_excludes_two_shot_seams"), "{err}");
@@ -1227,6 +1262,8 @@ mod tests {
         assert!(err.contains("did not verify"), "{err}");
 
         let mut violating = skipped;
+        violating["values"]["emit.token_batch_tp"] = false.into();
+        violating["values"]["emit.glm_seq_par"] = true.into();
         violating["values"]["emit.glm_xr_band"] = 2.into();
         let err = check_knobs(&violating, &rt).unwrap_err();
         assert!(err.contains("seq_par_excludes_two_shot_seams"), "{err}");

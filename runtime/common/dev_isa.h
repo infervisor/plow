@@ -1382,15 +1382,17 @@ enum {
      *   band [rank*rpr, (rank+1)*rpr) — a CONTIGUOUS run in p's source — into the LOCAL
      *   dst = [rpr][nh_total][d] at head offset p*nh_l (strided across rows).
      *
-     *   dir=1 (O form): this rank's own peer-visible source is [rpr][nh_total][d] (this rank's
-     *   row band, every head). Rank `rank` pulls, from every peer p, p's head slice
-     *   [rank*nh_l, (rank+1)*nh_l) at each of p's rpr rows — STRIDED in p's source — into the
-     *   LOCAL dst = [T][nh_l][d] at row band [p*rpr, (p+1)*rpr) (contiguous).
+     *   dir=1 (O form): this rank's own peer-visible source is GROUP-MAJOR — j0 (heads per
+     *   group) dense blocks of [rpr][j0][d] back to back, nh_total/j0 groups total (j0 ==
+     *   nh_total is one group, byte-identical to the plain interleaved [rpr][nh_total][d]
+     *   source). Rank `rank` pulls, from every peer p, group g = rank / (j0/nh_l) and head
+     *   offset (rank % (j0/nh_l)) * nh_l within it, at each of p's rpr rows — STRIDED in p's
+     *   source — into the LOCAL dst = [T][nh_l][d] at row band [p*rpr, (p+1)*rpr) (contiguous).
      *
      * Pure permutation (no arithmetic): a copied element is byte-exact against the source word.
      *   t0=dst
      *   i0=rpr i1=nh_l i2=d i3=nh_total i4=gate i5=n_gpu i6=slot_bytes(src offset into
-     *   peer_scratch) i7=dir(0=q,1=o) */
+     *   peer_scratch) i7=dir(0=q,1=o) j0=heads_per_group(dir=1 only) */
     PLOW_DOP_XALLTOALL_HEADS = 160,
     /* Unsigned affine Q4, group64: W=u32[N][K/8] low nibble first,
      * S/B=bf16[N][K/64]. t0=C t1=A t2=W t3=S t4=B; i0=M i1=N i2=K,
@@ -1418,6 +1420,10 @@ enum {
     PLOW_DOP_PACK_NCFW_ROWS_F32 = 177,
     PLOW_DOP_GROUPED_ATTENTION_F32 = 178,
     PLOW_DOP_EMBED_OVERLAY_BF16 = 179,
+    PLOW_DOP_GEMM_F32 = 180,
+    PLOW_DOP_DCP_KV_PACK = 181,
+    PLOW_DOP_XDCP_GATHER = 182,
+    PLOW_DOP_DCP_KV_SCATTER = 183,
 
     PLOW_DOP__COUNT
 };

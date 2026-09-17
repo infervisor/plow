@@ -151,7 +151,7 @@ extern "C" __global__ void plow_mla_sparse_decode_pack(SparseDecodePackArgs a) {
 #if defined(__HIP_DEVICE_COMPILE__)
     const unsigned first = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned stride = blockDim.x * gridDim.x;
-    unsigned kp[21];
+    unsigned kp[33];
     kp[0] = 0;
     for (unsigned b = 0; b < a.rows; ++b) {
         const int len = a.kvlen[b];
@@ -167,7 +167,11 @@ extern "C" __global__ void plow_mla_sparse_decode_pack(SparseDecodePackArgs a) {
         const unsigned slot = i / 72u, col = i % 72u;
         unsigned b = 0;
         while (kp[b + 1] <= slot) ++b;
-        const unsigned key = (unsigned)a.idx[b * 2048u + (slot - kp[b])];
+        /* `idx` is device data from the decode select; clamp to the row's live KV so a bad
+         * position reads row 0 of this slot instead of an arbitrary address (the same class of
+         * garbage index that faulted the prefill union). `slot - kp[b] < live <= kvlen[b]`. */
+        const unsigned raw = (unsigned)a.idx[b * 2048u + (slot - kp[b])];
+        const unsigned key = raw < (unsigned)a.kvlen[b] ? raw : 0u;
         const size_t src = (size_t)b * a.ctx + key;
         if (col >= 64u) {
             a.kv[i] = a.kr[src * 8u + col - 64u];

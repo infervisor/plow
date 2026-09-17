@@ -88,6 +88,13 @@ d = json.load(open(sys.argv[1]))
 tb = ("interp_packed_mla_norm_tb", "interp_packed_mla_flash_tb", "interp_packed_mla_norm_tb_fp8kv", "interp_packed_mla_flash_tb_fp8kv")
 sys.exit(0 if all(k in d and "-DPLOW_PACKED_PREFILL_BAND=1" in d[k].split() for k in tb) else 1)
 PY
+expect "token-batch GQ twins consume per-XCD packet windows" python3 - "$D" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+tb = ("interp_packed_mla_norm_tb_gq", "interp_packed_mla_flash_tb_gq", "interp_packed_mla_norm_tb_fp8kv_gq", "interp_packed_mla_flash_tb_fp8kv_gq")
+need = {"-DPLOW_L2_PLACE_DISPATCH=1", "-DPLOW_GATE_HIER=1"}
+sys.exit(0 if all(k in d and need <= set(d[k].split()) for k in tb) else 1)
+PY
 expect "small-rung MLA and split rows are in every build" python3 - "$D" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))

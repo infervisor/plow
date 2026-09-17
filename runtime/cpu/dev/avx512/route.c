@@ -35,6 +35,10 @@ V_K(v_moe_combine_pf) {
 
 #define ROUTE_MAX_TOPK 16u
 
+static inline float v_route_logit(const plow_bf16* logit, uint32_t e, uint32_t flags) {
+    return (flags & 8u) ? ((const float*)logit)[e] : plow_bf2f(logit[e]);
+}
+
 /* golden route_token with the O(n_exp^2) rank-by-counting replaced by k vector selection passes.
  * Golden ranks e by #{f : key_f > key_e} and puts e at wl[rank]; the keys are a total order, so
  * wl[j] is exactly the j-th largest key — what v_topk_u32 returns, with the same lowest-id tie
@@ -43,10 +47,10 @@ static void v_route_token(plow_moe_route* tab, const plow_bf16* logit, const flo
                           uint32_t k, uint32_t flags, float route_scale, float* score, uint32_t* key) {
     const int sigmoid = (flags & 1u) != 0, norm_topk = (flags & 2u) != 0;
     if (sigmoid) {
-        for (uint32_t e = 0; e < n_exp; e++) score[e] = 1.0f / (1.0f + expf(-plow_bf2f(logit[e])));
+        for (uint32_t e = 0; e < n_exp; e++) score[e] = 1.0f / (1.0f + expf(-v_route_logit(logit, e, flags)));
     } else {
         float m = -1e30f, s = 0.0f;
-        for (uint32_t e = 0; e < n_exp; e++) { score[e] = plow_bf2f(logit[e]); if (score[e] > m) m = score[e]; }
+        for (uint32_t e = 0; e < n_exp; e++) { score[e] = v_route_logit(logit, e, flags); if (score[e] > m) m = score[e]; }
         for (uint32_t e = 0; e < n_exp; e++) { score[e] = expf(score[e] - m); s += score[e]; }
         for (uint32_t e = 0; e < n_exp; e++) score[e] /= s;
     }
@@ -72,7 +76,8 @@ static void v_route_token(plow_moe_route* tab, const plow_bf16* logit, const flo
     }
 }
 
-/* t0=table([T*k]) t1=logit([T,n_exp] bf16) t3=bias?  i1=n_exp i2=k i3=flags i4=T i6=n_group
+/* t0=table([T*k]) t1=logit([T,n_exp] bf16, or f32 when flags&8) t3=bias?
+ * i1=n_exp i2=k i3=flags i4=T i6=n_group
  * i7=topk_group  f0=route_scale. Token t is owned by slice t % nblk, as golden. */
 V_K(v_moe_router_topk_pf) {
     const uint32_t n_exp = in->i[1], k = in->i[2], flags = in->i[3], nt = in->i[4] ? in->i[4] : 1u;
@@ -88,9 +93,12 @@ V_K(v_moe_router_topk_pf) {
     const float* bias = PLOW_CPU_TEN(in, T, 3);
     float* score = (float*)ctx->scratch;
     uint32_t* key = (uint32_t*)(score + n_exp);
-    for (uint32_t tok = slice; tok < nt; tok += nblk)
-        v_route_token(table + (size_t)tok * k, logit + (size_t)tok * n_exp, bias, n_exp, k, flags,
-                      in->fj[0].f, score, key);
+    for (uint32_t tok = slice; tok < nt; tok += nblk) {
+        const plow_bf16* row = (flags & 8u)
+            ? (const plow_bf16*)((const float*)logit + (size_t)tok * n_exp)
+            : logit + (size_t)tok * n_exp;
+        v_route_token(table + (size_t)tok * k, row, bias, n_exp, k, flags, in->fj[0].f, score, key);
+    }
 }
 
 void v_register_route(plow_cpu_kernel_fn* tab) {

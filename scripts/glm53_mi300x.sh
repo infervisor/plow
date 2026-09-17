@@ -22,7 +22,7 @@ OUT="${GLM53_DIR:-$WT/build-glm53}"
 BIN="${PLOW_BIN_DIR:-$WT/target-glm53/release}"
 MAXCTX="${MAXCTX:-18432}"
 LADDER="${LADDER:-full:128,512,2048,8192}"
-BATCH_LADDER="${BATCH_LADDER:-1,2,4}"
+BATCH_LADDER="${BATCH_LADDER:-1,2,4,8,16,32}"
 LEASE="$WT/perf-data/tools/gpulease"
 bundle () { echo "$OUT/tp$1"; }
 
@@ -38,7 +38,8 @@ emit)
       GLM_MOE_CORESIDENT=2 GLM_SHARED_CUS=48 GLM_SHARD_HEAD=1 \
       PLOW_GLM_FUSE_ROPE=1 PLOW_GLM_FUSE_SEAM=1 PLOW_GLM_FUSE_B1=1 \
       PLOW_MOE_PF_DET=1 \
-      PLOW_DECODE_BATCH_LADDER="$BATCH_LADDER" \
+      PLOW_DECODE_BATCH_LADDER="$BATCH_LADDER" PLOW_EMIT_PACKED_PREFILL=1 \
+      PLOW_TOKEN_BATCH_TP=1 PLOW_PACKED_SPARSE_PF=1 \
     "$BIN/plowc" --hf-dir "$CKPT" --emit devblob --gpu MI300X --arch gfx942 \
       --max-ctx "$MAXCTX" --n-cu "${NCU:-0}" --num-gpus "$tp" --out "$b/model.pkt" || exit 1
   # `checkpoint` MUST be the PREPPED dir: the blob binds derived.q_absorb/v_absorb/kv_a_latent

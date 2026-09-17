@@ -612,8 +612,12 @@ pub enum DevOp {
     /// killing the separate merge pass, its `Olat` HBM round-trip, and one dependency gate.
     /// Validated (rms ~0.004 vs the merge→fold sequence); ~1.1-1.24x on the MLA chain, composing
     /// with the ctx-scaled nsplit to 1.59x at 32k. `t0=O(v_head) t1=Opart(f32) t2=mlpart(f32)
-    /// t3=Wuv` · `i0=n_batch i1=n_head i2=V i4=nsplit i5=native_fp32`.
-    /// `native_fp32=1` selects isolated gfx942 TP8 prefill GEMMs.
+    /// t3=Wuv` · `i0=n_batch i1=n_head i2=V i3=group i4=nsplit i5=native_fp32`.
+    /// `native_fp32=1` selects isolated gfx942 TP8 prefill GEMMs. `group` (default 0, byte-
+    /// identical): row-split sparse attention's per-group fold (`PLOW_GLM_ROWSPLIT_ATTN`) calls
+    /// this op once per 16-head group against a group-major `Opart`/`mlpart`/`O`, `group`
+    /// selecting that group's dense `[n_batch][n_head][*]` slice of each and `Wuv`'s matching
+    /// `n_head`-wide slice — see `runtime/amd/interp.hip`'s `exec_mla_merge_fold`.
     MlaMergeFold = 57,
 
     // ===== DSA lightning indexer (GLM-5.2 GlmMoeDsa; sparse-attn-design.md §3.1, arXiv 2512.02556
@@ -1856,8 +1860,10 @@ pub enum DevOp {
     MoeAiterFp8Pf = 156,
     /// Native gfx942 TP8 query-partitioned DSA score, top-k and raw index gather.
     /// `t0=idx t1=score t2=q t3=k t4=w t5=kv_len t6=peer_slot` ·
-    /// `i0=T i1=ctx i2=topk i3=tp i4=slot_bytes i5=enter_gate i6=complete_gate` · `f0=scale`.
-    /// Requires an isolated native segment and three consecutive system-scope arrival gates.
+    /// `i0=T i1=ctx i2=topk i3=tp i4=slot_bytes i5=enter_gate i6=complete_gate i7=local_band` ·
+    /// `f0=scale`. Requires an isolated native segment and three consecutive system-scope
+    /// arrival gates. `i7=1`: the rank scores only its own row band (the row-split sibling),
+    /// so the q latents are not all-gathered first.
     IndexTpPf = 157,
     /// Native gfx942 BF16 projection using qualified hipBLASLt assembly.
     /// `t0=out t1=x t2=weight` · `i0=T i1=N i2=K i3=mode` (0 prefill rows, 1 decode rung, 2 the
@@ -1881,17 +1887,23 @@ pub enum DevOp {
     /// `p`'s row band `[rank*rpr, (rank+1)*rpr)` — a CONTIGUOUS run in `p`'s source — into the
     /// LOCAL `dst = [rpr][nh_total][d]` at head offset `p*nh_l` (strided across rows).
     ///
-    /// `dir=1` (O form): this rank's own peer-visible source is `[rpr][nh_total][d]` (this
-    /// rank's row band, every head). Rank `rank` pulls, from every peer `p`, `p`'s head slice
-    /// `[rank*nh_l, (rank+1)*nh_l)` at each of `p`'s `rpr` rows — STRIDED in `p`'s source —
-    /// into the LOCAL `dst = [T][nh_l][d]` at row band `[p*rpr, (p+1)*rpr)` (contiguous).
+    /// `dir=1` (O form): this rank's own peer-visible source is GROUP-MAJOR — `j0` (heads per
+    /// group) dense blocks of `[rpr][j0][d]` back to back, `nh_total/j0` groups total. `j0 ==
+    /// nh_total` reproduces the plain interleaved `[rpr][nh_total][d]` source byte for byte
+    /// (one group); `j0 < nh_total` is what the row-split attention kernel actually produces,
+    /// since it has no independent row stride to interleave its head-groups (see
+    /// `amd_sparse_mla.rs`'s `rowsplit_launch_args`). Rank `rank` pulls, from every peer `p`,
+    /// the group `g = rank / (j0/nh_l)` and the `(rank % (j0/nh_l)) * nh_l` head offset within
+    /// it, at each of `p`'s `rpr` rows — STRIDED in `p`'s source — into the LOCAL
+    /// `dst = [T][nh_l][d]` at row band `[p*rpr, (p+1)*rpr)` (contiguous).
     ///
     /// A pure permutation (no arithmetic): a copied element is byte-exact against the source
     /// word. This op moves bytes only — the row-split attention it composes with is not
     /// bit-identical against the head-sharded route, but that comes from a different
     /// accumulation order in the attention kernel, not from this op.
     /// `t0=dst` · `i0=rpr i1=nh_l i2=d i3=nh_total i4=gate i5=n_gpu i6=slot_bytes(src offset
-    /// into peer_scratch) i7=dir(0=q,1=o)`.
+    /// into peer_scratch) i7=dir(0=q,1=o)` · `j0=heads_per_group(dir=1 only; nh_total means one
+    /// interleaved group, matching dir=0's source layout)`.
     XAllToAllHeads = 160,
     /// Affine unsigned Q4, group64, BF16 scale/bias; decode uses BF16 four-input
     /// bias-correction sums and FP32 dot accumulation.
@@ -1983,6 +1995,35 @@ pub enum DevOp {
     /// t3=overlay(f32[overlay_rows,width]) t4=overlay_index(u32[rows])` ·
     /// `i0=rows i1=width i2=vocab i3=overlay_rows`.
     EmbedOverlayBf16 = 179,
+    /// BF16 projection with an FP32 accumulator/output, used for GLM router logits.
+    /// `t0=C(f32[M,N]) t1=A(bf16[M,K]) t2=W(bf16[N,K])` · `i0=M i1=N i2=K`.
+    GemmF32 = 180,
+    /// Decode context parallelism, pack half: this rank copies the latent KV records its DCP
+    /// shard OWNS into its peer slot, record-major at 656 B (`[512 e4m3 ckv][64 bf16 krot][f32
+    /// scale][pad]`). Record `r = b*K + j` is selected slot `j` of batch row `b`; its global row is
+    /// `idx[r]`, or `j` when `idx` is absent (the prefill prefix form). Live iff
+    /// `j < min(K, kv_len[b])`. Owned iff `(g >> page_shift) & (2^degree_shift - 1) == shard`;
+    /// read at local row `((g >> (page_shift + degree_shift)) << page_shift) | (g & (page - 1))`.
+    /// Slot bytes: `n_batch*K*656`. The shard is the executing rank's (`rank & (2^degree_shift -
+    /// 1)`): one packet serves every rank.
+    /// `t0=idx? t1=kv_len t2=ckv(u8 local) t3=krot(bf16 local) t4=kv_scale(f32 local)` ·
+    /// `i0=n_batch i1=K i2=local_stride i3=page_shift i4=degree_shift i5=slot_bytes`.
+    DcpKvPack = 181,
+    /// Decode context parallelism, gather half: rendezvous on `gate`, then pull every live record
+    /// from its owner's slot (owner rank = this rank's group base + shard) into dense gathered
+    /// buffers the unchanged flash reads with `kv_stride = K`. `glen[b] = min(K, kv_len[b])` when
+    /// present (the decode form, read by the flash as its kv_len).
+    /// `t0=idx? t1=kv_len t2=gckv(u8[B][K][512]) t3=gkrot(bf16[B][K][64]) t4=gscale(f32[B][K])
+    /// t5=glen?` · `i0=n_batch i1=K i3=page_shift i4=degree_shift i5=slot_bytes i6=gate i7=n_gpu`.
+    XDcpGather = 182,
+    /// Decode context parallelism, write half: the unchanged latent/rope writers wrote this step's
+    /// `rows` into staging buffers at row `t`; this copies row `t` into the local cache iff this
+    /// shard owns global row `pos[t]`, at the local row (`batched`: plus `t * local_stride`, row
+    /// `t` being decode slot `t`). Ownership reads the replicated `pos`, so nothing is staged per
+    /// rank; the shard is the executing rank's. `t0=pos t1=ckv_stage(u8[rows][512])
+    /// t2=krot_stage(bf16[rows][64]) t3=scale_stage(f32[rows]) t4=ckv t5=krot t6=kv_scale` ·
+    /// `i0=rows i1=local_stride i2=page_shift i3=degree_shift i5=batched`.
+    DcpKvScatter = 183,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2178,6 +2219,10 @@ impl DevOp {
         DevOp::PackNcfwRowsF32,
         DevOp::GroupedAttentionF32,
         DevOp::EmbedOverlayBf16,
+        DevOp::GemmF32,
+        DevOp::DcpKvPack,
+        DevOp::XDcpGather,
+        DevOp::DcpKvScatter,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2378,6 +2423,10 @@ impl DevOp {
             DevOp::PackNcfwRowsF32 => "PLOW_DOP_PACK_NCFW_ROWS_F32",
             DevOp::GroupedAttentionF32 => "PLOW_DOP_GROUPED_ATTENTION_F32",
             DevOp::EmbedOverlayBf16 => "PLOW_DOP_EMBED_OVERLAY_BF16",
+            DevOp::GemmF32 => "PLOW_DOP_GEMM_F32",
+            DevOp::DcpKvPack => "PLOW_DOP_DCP_KV_PACK",
+            DevOp::XDcpGather => "PLOW_DOP_XDCP_GATHER",
+            DevOp::DcpKvScatter => "PLOW_DOP_DCP_KV_SCATTER",
         }
     }
 
@@ -2425,7 +2474,10 @@ impl DevOp {
     /// 156 on main; merging them after the gfx942 ops at 156-160 moved every one up by 5.
     /// 178 -> 179 for backend-neutral grouped FP32 attention.
     /// 179 -> 180 for backend-neutral multimodal embedding overlay.
-    pub const COUNT: u16 = 180;
+    /// 180 -> 181 for GLM's BF16-input/FP32-weight/FP32-output router GEMM.
+    /// 181 -> 184 for `DcpKvPack = 181` / `XDcpGather = 182` / `DcpKvScatter = 183` (decode
+    /// context parallelism).
+    pub const COUNT: u16 = 184;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

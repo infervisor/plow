@@ -24,11 +24,15 @@
 # ------------------------------------------------------------------------------------------
 # THE ENVIRONMENT RULES, all of them learned the expensive way on this box:
 #
-#   * `build_gfx942.sh` runs OUTSIDE nix. hipcc is the system ROCm one and nix's
-#     CPATH/LIBRARY_PATH shadow the glibc it was built against. The digest the store keys on
-#     comes from THESE sources, so the campaign must build the objects it then measures.
-#   * `PLOW_HIPCC=/opt/rocm-7.2.4/bin/hipcc` and the matching ROCM_PATH/HIP_PATH:
-#     `/opt/rocm/bin/hipcc` on this box is broken (its internal clang++ is missing).
+#   * `build_gfx942.sh` runs INSIDE nix, and this script must NOT hand it a hipcc. It now
+#     refuses unless IN_NIX_SHELL is set, PLOW_HIPCC/PLOW_BUNDLER/PLOW_READELF all resolve into
+#     /nix/store, and PLOW_TOOLCHAIN_LABEL is `rocm-7.14.0-nix` -- the flake supplies all four.
+#     THIS RULE WAS THE REVERSE UNTIL 2026-09-14: the script used to build outside nix with
+#     `PLOW_HIPCC=/opt/rocm-7.2.4/bin/hipcc`, and that override is exactly what the guard now
+#     rejects ("FAIL: hipcc must resolve into /nix/store"). The campaign died at step 1/5 in
+#     0.0 min until this was corrected. The digest the store keys on comes from whatever built
+#     the objects, so measuring the nix-built objects is also the correct choice: those are the
+#     ones that ship, since build_gfx942.sh can no longer produce any other kind.
 #   * plowc runs INSIDE nix (it needs the cargo toolchain), and needs `/opt/rocm-*/lib` on
 #     LD_LIBRARY_PATH from INSIDE that shell -- the flake does not carry it, and without it the
 #     HSA dlopen fails.
@@ -74,11 +78,35 @@ if pgrep '^plowrt' >/dev/null 2>&1; then
   echo "FAIL: a plowrt is already running — kernel timings would be fiction:"; pgrep -a '^plowrt'; exit 1
 fi
 
-echo "=== 1/5  building the gfx942 objects + test_kernels.elf into $OBJ (outside nix)"
+echo "=== 1/5  building the gfx942 objects + test_kernels.elf into $OBJ (inside nix)"
 # The SHIPPING recipe, not a special one: the defines participate in the store's digest, so a
 # campaign measured against a different -D set is stale the moment it lands.
-PLOW_HIPCC="$ROCM/bin/hipcc" HIP_PATH="$ROCM" ROCM_PATH="$ROCM" ROCM_HOME="$ROCM" \
-  PLOW_OCC4=1 PLOW_L2HIER=1 JOBS="${JOBS:-14}" ./scripts/build_gfx942.sh "$OBJ"
+#
+# PLOW_OCC4=1 WAS HERE UNTIL 2026-09-14 AND IT IS NOT THE SHIPPING RECIPE. Three independent
+# facts, each checked on this box:
+#   * the shipped serving set's own `build_defines.json` carries no `PLOW_WPE=5` and no
+#     `GM_BK=32/GM_BM=128/GM_BN=256`, which is what PLOW_OCC4 adds -- it was built without it;
+#   * `build_gfx942.sh` REFUSES `PLOW_OCC4=1` outright once the packet's decode ladder has
+#     batch > 1, and GLM's ends at 20 ("the WPE=5/4 register ration hangs the batched program's
+#     first decode dispatch"), so this flag cannot ship for this model at all;
+#   * it is what produced the audit's only non-bookkeeping failures that are not a source
+#     regression -- `d_moe_expert_glu_fp8_blk` at 105 spill instructions and
+#     `d_moe_expert_down_fp8_blk` at 80, across four K3 decode objects, against an
+#     `asm_expect_gfx942.json` rule whose note says both bodies must remain spill-free. Drop
+#     PLOW_OCC4 and those eight FAIL lines disappear; nothing else about them changes.
+# So the flag both broke the build and pointed the campaign at a `-D` set that does not ship,
+# which is precisely the staleness this header warns about two paragraphs up.
+#
+# PLOW_TUNE_CONFIG=<assets dir | plow_config.h> builds for ONE PACKET, the way the shipped set
+# is built (its rows carry `-DPLOW_CONFIG="plow_config.h"`). Set it when tuning tiles for a
+# specific model -- which is the only kind of tile campaign there is, since the store is keyed
+# by the object digest. It is also what makes the contract audit pass: a packet build derives
+# its row set from the packet and matched the contract over all 53 objects here, where the
+# generic build still carries f89d3a5c's scratch-budget regressions and the stale geometry
+# profile (both attributed in docs/bringup/tp-bringup-upstream-review-log.md).
+"$NIX" develop "$WT" -c \
+  env ${PLOW_TUNE_CONFIG:+PLOW_HSACO_CONFIG="$PLOW_TUNE_CONFIG"} \
+      PLOW_L2HIER=1 JOBS="${JOBS:-14}" ./scripts/build_gfx942.sh "$OBJ"
 [ -f "$OBJ/test_kernels.elf" ] || {
   echo "FAIL: $OBJ/test_kernels.elf missing — build_gfx942.sh must build it (see its own note)"; exit 1; }
 
@@ -108,6 +136,21 @@ echo "=== 4/5  measuring and publishing (ROCR_VISIBLE_DEVICES=$ROCR)"
 # With both set the demand is 48 distinct shapes. The remaining three are the recipe's shipping
 # knobs; they do not change the shape set (checked), but the campaign should observe the compile
 # that ships rather than a neighbour of it.
+#
+# PLOW_TUNE_REPLAY=<build.json> closes that gap, and as of 2026-09-14 it is not optional for GLM.
+# `PLOW_GLM_GEMM_LT_PF_EXT` now DEFAULTS to "o_proj,band,shared" on a GLM target
+# (knob_spec.rs GLM_GEMM_LT_PF_EXT_DEFAULT), and `emit_glm_lt_ext` asserts
+# `(2048..=8192).contains(&t)` with band rows 256 or 1024. plowc's default `--seq` is
+# 512,2048,8192, so the 512 bucket reaches that assert and the campaign ABORTS mid-measurement:
+#
+#   panicked at crates/devgen/src/mla.rs:5461:
+#   PLOW_GLM_GEMM_LT_PF_EXT requires gfx942 TP8 GLM prefill (band rows 256 or 1024)
+#
+# The shipping packet does not hit it because its build.json predates that default and records
+# `PLOW_GLM_GEMM_LT=true` with no `_PF_EXT` entry at all, so replaying its knobs is both the
+# correct campaign (measure what ships) and the thing that keeps the emit off the assert.
+REPLAY_FLAG=""
+[ -z "${PLOW_TUNE_REPLAY:-}" ] || REPLAY_FLAG="--replay-knobs $PLOW_TUNE_REPLAY"
 "$NIX" develop "$WT" -c bash -c \
   "set -euo pipefail; cd '$WT'; \
    export LD_LIBRARY_PATH=\"\${LD_LIBRARY_PATH:-}:$ROCM/lib\"; \
@@ -115,7 +158,7 @@ echo "=== 4/5  measuring and publishing (ROCR_VISIBLE_DEVICES=$ROCR)"
    export ROCR_VISIBLE_DEVICES=$ROCR; unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES; \
    export GLM_FULL=1 PLOW_MLA_PREFILL=full GLM_MOE_CORESIDENT=2 GLM_SHARED_CUS=48 GLM_SHARD_HEAD=1; \
    ./target/release/plowc --hf-dir '$HF' --max-ctx $MAXCTX --n-cu $NCU --num-gpus $NGPU \
-       --gpu MI300X --arch gfx942 \
+       --gpu MI300X --arch gfx942 $REPLAY_FLAG \
        tune gemm --gpu MI300X --root . --obj '$OBJ' \
        --samples '$OUT/bf16.jsonl' --campaign gfx942-mi300x-gemm-tile"
 

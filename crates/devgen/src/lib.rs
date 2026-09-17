@@ -3426,6 +3426,7 @@ pub(crate) fn emit_xall_gather(
 /// written into this rank's own peer slot at `slot_bytes` by an earlier packet (the `deps`).
 /// One xctr gate, one-workgroup rendezvous. TP8 only.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_xalltoall_heads(
     b: &mut Builder,
     xgate: &mut u32,
@@ -3439,6 +3440,7 @@ pub(crate) fn emit_xalltoall_heads(
     tp: u32,
     slot_bytes: u32,
     dir: u32,
+    heads_per_group: u32,
 ) -> u32 {
     assert_eq!(
         nh_total,
@@ -3446,6 +3448,12 @@ pub(crate) fn emit_xalltoall_heads(
         "XAllToAllHeads: nh_total must be nh_l * tp"
     );
     assert!(dir <= 1, "XAllToAllHeads: dir must be 0 (Q) or 1 (O)");
+    assert!(
+        heads_per_group > 0
+            && heads_per_group % nh_l == 0
+            && nh_total % heads_per_group == 0,
+        "XAllToAllHeads: heads_per_group must divide nh_total and be a multiple of nh_l"
+    );
     let elems = rpr * nh_total * d;
     let need = (elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
     let xr_cus = &xr_cus[..need];
@@ -3461,6 +3469,7 @@ pub(crate) fn emit_xalltoall_heads(
         inst.i[5] = tp;
         inst.i[6] = slot_bytes;
         inst.i[7] = dir;
+        inst.j[0] = heads_per_group;
     })
 }
 
@@ -7391,6 +7400,73 @@ fn apply_production_defaults(
     // tree's defaults rather than pinning today's.
     if capabilities.glm && arch == "gfx942" && tp == 8 && n_cu == 304 && !cfg.mxfp4 {
         cfg.glm_production_defaults = true;
+        if cfg.decode_ladder.is_none() {
+            cfg.decode_ladder = Some("1,2,4,8,16,32".into());
+            cfg.decode_ladder_default = true;
+            emit_config::note_production_default("decode_ladder", "1,2,4,8,16,32".into());
+        }
+        // "if nothing asked", not "always": both knobs are plain `bool`, so an explicit
+        // `PLOW_TOKEN_BATCH_TP=0` is indistinguishable from unset at the field, and turning them
+        // on unconditionally made the recipe UNTESTABLE — the control arm of any A/B emitted the
+        // treatment. `*_explicit` records that the environment named the knob, which is the same
+        // provenance `decode_ladder_default` already keeps, not a new knob.
+        // Read the variable, not a field: `EmitConfig` is built by clap on the plowc path and by
+        // `from_env` elsewhere, so a field set in one constructor is silently `false` in the other.
+        // Both knobs are already registered, so this adds no unregistered env read.
+        let named = |k: &str| std::env::var(k).is_ok();
+        if !cfg.token_batch_tp && !named("PLOW_TOKEN_BATCH_TP") {
+            cfg.token_batch_tp = true;
+            emit_config::note_production_default("token_batch_tp", "true".into());
+        }
+        // Neither row-band attention nor the sequence-parallel seams compose with token-batch
+        // bodies. The seams were re-rated composable on a source reading (narrow seam norms moved
+        // back to the primary object), but the measured failure behind
+        // `token_batch_tp_excludes_seq_par` — review log #63, retrieval 9/18 base, 0/21 tail —
+        // was never re-run with both arms on. Until it is, the recipe FORCES both off rather than
+        // defaulting them off: a default yields to an explicit `--glm-seq-par=true`, and the
+        // resulting packet is silent long-context corruption, not a fault. Every force is recorded,
+        // so `build.json` still names what the flag asked for and what the recipe did.
+        if cfg.token_batch_tp {
+            if cfg.glm_rowband_attn == Some(true) {
+                cfg.glm_rowband_attn = Some(false);
+                emit_config::note_production_default("glm_rowband_attn", "false".into());
+            }
+            for (field, id) in [
+                (&mut cfg.glm_seq_par, "glm_seq_par"),
+                (&mut cfg.glm_seq_par_proj, "glm_seq_par_proj"),
+            ] {
+                if *field != Some(false) {
+                    *field = Some(false);
+                    emit_config::note_production_default(id, "false".into());
+                }
+            }
+        }
+        if !cfg.packed_sparse_pf && !named("PLOW_PACKED_SPARSE_PF") {
+            cfg.packed_sparse_pf = true;
+            emit_config::note_production_default("packed_sparse_pf", "true".into());
+        }
+        // Declared qualified in GLM53_RECIPE and applied by NOTHING until now: an unflagged emit
+        // produced a different packet from the recipe for each of these, and only the driver
+        // script typing them out kept production right.
+        // `every_glm_recipe_entry_holds_without_being_named` is the gate that found them and is
+        // what stops the next one. Same `named()` shape as token_batch_tp above, for the same
+        // reason: a plain `bool` cannot tell `=0` from unset, so the rollback has to read the
+        // variable.
+        for (field, env, id) in [
+            (&mut cfg.glm_shard_head, "GLM_SHARD_HEAD", "glm_shard_head"),
+            (&mut cfg.glm_fuse_b1, "PLOW_GLM_FUSE_B1", "glm_fuse_b1"),
+            (&mut cfg.glm_fuse_seam, "PLOW_GLM_FUSE_SEAM", "glm_fuse_seam"),
+        ] {
+            if !*field && !named(env) {
+                *field = true;
+                emit_config::note_production_default(id, "true".into());
+            }
+        }
+        // The prefill bucket set. `Option`, so unset is unambiguous and no `named()` is needed.
+        if cfg.mla_prefill.is_none() {
+            cfg.mla_prefill = Some(emit_config::GLM53_MLA_PREFILL.into());
+            emit_config::note_production_default("mla_prefill", emit_config::GLM53_MLA_PREFILL.into());
+        }
         for (id, unset, value) in cfg.glm_recipe_unset() {
             if unset {
                 emit_config::note_production_default(id, value.to_string());
@@ -7403,6 +7479,30 @@ fn apply_production_defaults(
                 "glm_gemm_lt_pf_ext",
                 emit_config::GLM_GEMM_LT_PF_EXT_QUALIFIED.to_string(),
             );
+        }
+        // DCP shards the latent cache per rank. Token-batch bodies, packed prefill and the
+        // row-split/row-band arms read the local cache directly instead of the owner gather
+        // (`emit_glm_mla_prefill` asserts it), so under `--dcp > 1` the recipe FORCES them off,
+        // recorded like the seq-par force above.
+        if cfg.dcp.is_some_and(|d| d > 1) {
+            if cfg.token_batch_tp {
+                cfg.token_batch_tp = false;
+                emit_config::note_production_default("token_batch_tp", "false".into());
+            }
+            if cfg.packed_sparse_pf {
+                cfg.packed_sparse_pf = false;
+                emit_config::note_production_default("packed_sparse_pf", "false".into());
+            }
+            for (field, id) in [
+                (&mut cfg.emit_packed_prefill, "emit_packed_prefill"),
+                (&mut cfg.glm_rowband_attn, "glm_rowband_attn"),
+                (&mut cfg.glm_rowsplit_attn, "glm_rowsplit_attn"),
+            ] {
+                if *field != Some(false) {
+                    *field = Some(false);
+                    emit_config::note_production_default(id, "false".into());
+                }
+            }
         }
     }
 }
@@ -8090,6 +8190,8 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_ARGMAX_FIN",
     "PLOW_DOP_ATTN_RES",
     "PLOW_DOP_ATTN_SELECT",
+    "PLOW_DOP_DCP_KV_PACK",
+    "PLOW_DOP_DCP_KV_SCATTER",
     "PLOW_DOP_DENSE_GLU_FP8_BLK",
     "PLOW_DOP_DSA_POOL_COMPRESS",
     "PLOW_DOP_DSA_POOL_EXPAND",
@@ -8111,6 +8213,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMM_C5",
     "PLOW_DOP_GEMM_C5_FP8",
     "PLOW_DOP_GEMM_C5_MXFP4",
+    "PLOW_DOP_GEMM_F32",
     "PLOW_DOP_GEMM_FP8",
     "PLOW_DOP_GEMM_FP8_BLK",
     "PLOW_DOP_GEMM_GLU",
@@ -8219,6 +8322,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_XALLGATHER",
     "PLOW_DOP_XALLTOALL_HEADS",
     "PLOW_DOP_XARGMAX_FIN",
+    "PLOW_DOP_XDCP_GATHER",
     "PLOW_DOP_XFLASHMERGE",
     "PLOW_DOP_XREDUCE",
     "PLOW_DOP_XREDUCE2",
@@ -8881,17 +8985,8 @@ fn emit_dense_gqa(
         }
     }
 
-    // PREFILL PLACEMENT IS OFF BY DEFAULT ON AMD, and that is what makes the DECODE placement
-    // usable at all. `PLOW_L2_PLACE` already defaults ON for gfx942/gfx950, but
-    // `scripts/build_gfx942.sh` gates `-DPLOW_L2_PLACE_DISPATCH` on the PREFILL objects behind
-    // `PLOW_L2HIER_PF`, which is off — so `plowrt` REFUSES a blob whose prefill programs are
-    // placed, and the only way past that was `PLOW_L2_PLACE=0`, which throws away the decode
-    // half too. That is how the shipped Gemma-4-31B blob came to be unplaced (`PLOWDEV\x09`,
-    // not `\x0b`) with `PLOW_GATE_HIER` compiled into the decode object and INERT at run time:
-    // the hierarchy's precondition is `prog.l2_domains != 0`. Measured cost of that accident,
-    // Gemma-4-31B BF16 TP1 MI300X, served, medians of six: TPOT +4.7% to +8.0%.
-    // An explicit `PLOW_L2_PLACE_PREFILL=1` still asks for it (pair it with `PLOW_L2HIER_PF=1`
-    // objects); NVIDIA is unchanged, where one cooperative launch reads no wave class.
+    // Dense-GQA AMD prefill placement remains explicit until that path is separately qualified.
+    // GLM has its own placed builder and default below in `mla.rs`.
     let l2_place_prefill = ecfg.l2_place_prefill
         && (!amd || std::env::var_os("PLOW_L2_PLACE_PREFILL").is_some());
     let mut progs = Vec::new();

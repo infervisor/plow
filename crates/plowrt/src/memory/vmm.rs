@@ -1122,7 +1122,14 @@ impl VmmKv {
             .map_err(|e| RuntimeError::Device(format!("vmm premap thread: {e}")))?;
         pool.premap_join = Some(join);
 
+        // The VA window, so a device fault address can be attributed to the KV pool (or ruled out).
+        let (va_lo, va_hi) = {
+            let inner = shared.inner.lock();
+            inner.tracks.iter().fold((u64::MAX, 0u64), |(lo, hi), t| (lo.min(t.va), hi.max(t.va + span)))
+        };
         tracing::info!(
+            va_lo = format_args!("{va_lo:#x}"),
+            va_hi = format_args!("{va_hi:#x}"),
             full_layers = shared.geo.full_layers.len(),
             kv_elem = shared.geo.elem,
             kv_elem_slide = shared.geo.elem_slide,

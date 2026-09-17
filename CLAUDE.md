@@ -5,6 +5,25 @@
 * Plans/research live in `plans/` (gitignored).
 * Read relevant plan before work. Update only when decisions change.
 
+## Tools & Environment
+
+Read `docs/bringup/agent-tools.md` before writing any benchmark, probe, or serve script.
+`scripts/` has 251 scripts; most campaigns still wrote a throwaway probe and re-hit the same
+environment failures on leased GPUs.
+
+* Everything runs inside `nix develop`. `ROCM_PATH` unset means you are outside it.
+* Not from nix, pass explicitly: vLLM client `/app/plow/build-gemma31/vllm-python` (built from
+  source), its `VLLM_ROCM_LIB=/opt/rocm/core-7.14/lib`, and `gpulease`
+  (`/app/plow/perf-data/tools/gpulease`, not on PATH).
+* Before leasing a GPU: `nix develop --command scripts/bench/plowbench-doctor.sh <assets> <objdir>`.
+  CPU only. It checks the shell, hazardous `PLOW_*` leftovers, binaries, packet hash, the object
+  set (including the vendor `.co` kernels `build_gfx942.sh` does not emit), the queue, and disk.
+* Main driver: `scripts/glm53_mi300x.sh emit|serve|bench|vllm|smoke`. The `serve` and `vllm`
+  subcommands are the two halves of a comparison — same client, two base URLs.
+* New probes `source scripts/bench/plowbench.sh` instead of re-implementing port choice, the
+  readiness poll, the bench invocation, or result parsing.
+* Every GPU process goes through the queue, never a raw lease.
+
 ## Core Rules
 
 ### Think First
