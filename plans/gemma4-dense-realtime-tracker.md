@@ -205,6 +205,23 @@ still needs the multiply pass; the saving is the activation's read+write, not
 the whole GLU. And on 12B nothing routes through Tensile (finding 6), so A1 is
 a 31B item until 12B projections are re-routed to `GemmLtPf`.
 
+## H100 realtime baseline — run notes
+
+- Packet: BF16 sm90a, `--max-ctx 8192`, `PLOW_MAX_CHUNK=4096`, decode ladder
+  `1` only, so it fits beside a co-tenant. Another user's idle `plowrt`
+  (0% util) holds 52.9 GB outside the lease, so `gpulease` stamps every run
+  "contended"; the full ladder packet (1..16 slots, 41 GiB KV) cannot load
+  until it is gone. **C4/C16 cells need the co-tenant stopped.**
+- The first runs failed the coherence gate with `111.111…` output. Not a
+  packet fault: plowrt's `/v1/completions` does not prepend BOS (vLLM's
+  does), and Gemma degenerates without it. Chat completions and an explicit
+  `<bos>` prompt are correct. Fixed on the bench side with a chat-formatted
+  `GATE_PROMPT`; the random-token workload differs from vLLM's by that one
+  BOS token of input.
+- `PLOW_UNISEG=1` (from the 31B FP8-KV recipe) is not needed here; the emit
+  audit's "impure flash segment" warning is an AMD relaunch concern and does
+  not affect the NVIDIA cooperative launch. Both packets serve correctly.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
