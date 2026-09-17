@@ -724,7 +724,7 @@ max-num-seqs 16 for ctx16k; 8192 / 32 for C32; prefix caching off):
 | 8192/4 | ctx16k, chunk 4096, ladder 16 | 1924 / 994 | 24.9 / 13.9 | 100 / 186 |
 | 8192/16 | same | 8460 / 2300 | 73.2 / 35.7 | 114 / 298 |
 | 15000/4 | same | 3904 / 1653 | 35.2 / 18.5 | 61 / 128 |
-| 15000/16 | same | rejected: 22–23 of 32 requests ("packed prefill: padding exceeds every request's physical context") | – / 61.8 | – / 172 |
+| 15000/16 | same, masked padding (`-mp` cell) | 19624 / 3948 (all 32 complete; without masked padding 22–23 were rejected) | 141.5 / 61.8 | 53 / 172 |
 
 The 15000/16 failure is an admission rule, not shedding (re-run with
 `PLOW_QUEUE_TTL_MS=0` failed identically): a packed launch pads its bucket and
