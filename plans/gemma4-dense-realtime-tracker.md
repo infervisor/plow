@@ -713,8 +713,11 @@ bit-identical bodies. The recipes never set `PLOW_BUILD_FATLITE`, so no cell
 had it. **Measured (paired C1, realtime, cache off):** 42.05 / 51.15 / 191.77
 vs control 42.43 / 53.96 / 196.55 (−2.8 ms @1024, −4.8 ms @4096); all five
 greedy continuations byte-identical. `PLOW_BUILD_FATLITE = "1"` is now in the
-recipes' objects env. Combined WG32 + fat-lite cell (`campaign-bf16-wg32fl`)
-pending. `PLOW_SEG_SLICE_ALL` is only recorded in the manifest, not
+recipes' objects env. Combined WG32 + fat-lite cell (`campaign-bf16-wg32fl`):
+42.07 / 50.42 / 186.13 ms (−3.5 ms @1024, −10.4 ms @4096 vs the paired control;
+greedy exactly as WG32 alone). Realtime standing with both: 1.49× / 1.08× /
+1.09× of vLLM's 28.2 / 46.7 / 170.2 (from 1.50× / 1.16× / 1.16× this morning's
+control), TPOT unchanged at 1.13–1.25×. `PLOW_SEG_SLICE_ALL` is only recorded in the manifest, not
 implemented; the occupancy query makes it unnecessary.
 
 ### hd512 WGMMA BQ64/BKV32 role — real but smaller than the plan's number (2026-09-17)
