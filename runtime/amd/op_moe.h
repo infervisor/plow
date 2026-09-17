@@ -3847,7 +3847,17 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
     const unsigned total_tiles = (unsigned)tilep[n_exp];
     const unsigned tnc = (N + NB - 1u) / NB;
     const unsigned n_tiles = total_tiles * tnc;
-    const unsigned NT = (K + MPF4_BK - 1u) / MPF4_BK;
+    /* CEILING INSTRUMENT ONLY (-DPLOW_MOE_PF_ABL=1): cap the k-loop at ONE tile, exactly as
+     * the d_moe_group_pf_t arm above. WRONG OUTPUT by construction. Without it the flag is
+     * SILENTLY NULL on any fp4 checkpoint -- DeepSeek-V4.1 routes `expert_dtype: "fp4"` to
+     * i3 = 2 and lands here, not in _t, so an ablation run there reads bit-identical output
+     * and unchanged time and looks like a measurement instead of a missing instrument. */
+    const unsigned NT_full = (K + MPF4_BK - 1u) / MPF4_BK;
+#if PLOW_MOE_PF_ABL
+    const unsigned NT = NT_full > 1u ? 1u : NT_full;
+#else
+    const unsigned NT = NT_full;
+#endif
     const unsigned KS = K >> 1;      /* fp4 row stride in BYTES */
     const unsigned KSC = K >> 5;     /* E8M0 scale bytes per row */
 
@@ -4455,7 +4465,17 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
     const unsigned total_tiles = (unsigned)tilep[n_exp];
     const unsigned tnc = (N + NB - 1u) / NB;
     const unsigned n_tiles = total_tiles * tnc;
-    const unsigned NT = (K + MPF4_C3_BK - 1u) / MPF4_C3_BK;
+    /* CEILING INSTRUMENT ONLY (-DPLOW_MOE_PF_ABL=1): cap the k-loop at ONE tile, exactly as
+     * the d_moe_group_pf_t arm above. WRONG OUTPUT by construction. Without it the flag is
+     * SILENTLY NULL on any fp4 checkpoint -- DeepSeek-V4.1 routes `expert_dtype: "fp4"` to
+     * i3 = 2 and lands here, not in _t, so an ablation run there reads bit-identical output
+     * and unchanged time and looks like a measurement instead of a missing instrument. */
+    const unsigned NT_full = (K + MPF4_C3_BK - 1u) / MPF4_C3_BK;
+#if PLOW_MOE_PF_ABL
+    const unsigned NT = NT_full > 1u ? 1u : NT_full;
+#else
+    const unsigned NT = NT_full;
+#endif
     const unsigned KS = K >> 1;  /* fp4 row stride in BYTES */
     const unsigned KSC = K >> 5; /* E8M0 scale bytes per row */
 

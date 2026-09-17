@@ -690,6 +690,11 @@ if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ]; then
   # order; exits are identical.
   PLOW_MOE_ROUTER_SELECT="${PLOW_MOE_ROUTER_SELECT:-2}"
   PLOW_MOE_ROUTER_SELECT_LOCAL="${PLOW_MOE_ROUTER_SELECT_LOCAL:-1}"
+  # V4.1's routed experts are MXFP4, so its DOWN epilogue is `d_moe_group_pf_a4w4`'s, not the
+  # `_t` one PLOW_MOE_PF_EPI (default on) covers -- the hoist has to come from _SIB or V4.1 pays
+  # the per-element `row_partidx`/`row_gate` drain in full. Measured on the 8k layer-2 rung:
+  # DOWN 2657.7 -> 2260.6 us and the layer 15072 -> 14810, output BYTE-IDENTICAL.
+  PLOW_MOE_PF_EPI_SIB="${PLOW_MOE_PF_EPI_SIB:-1}"
   # The hoist `#error`s unless MPF_BM == PLOW_WAVE, so it cannot default ON at any other tile.
   if [ "$MPF_BM" = 64 ]; then PLOW_MOE_PF_EPI="${PLOW_MOE_PF_EPI:-1}"; else PLOW_MOE_PF_EPI=0; fi
   PLOW_K3_A4W4_EPI="${PLOW_K3_A4W4_EPI:-0}"
