@@ -29,6 +29,15 @@ const REMOVED: Status = Status::Removed;
 const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=0` is the rollback"],
 };
+/// Digest-relaxed dense-GEMM tuner reads. Default on WITHOUT a hardware certificate: no MI300X
+/// was reachable when it was flipped, so the argument below is structural, not measured.
+const TUNE_IGNORE_DIGEST: Status = Status::Candidate {
+    evidence: &[
+        "devgen/src/lib.rs gfx950_gemm_measurements: current-digest records are loaded first and are never displaced; relaxed records fill only op cases that have none",
+        "for those cases the alternative is the ANALYTICAL MODEL, not a different measurement, so the comparison is measured-but-older vs never-measured",
+        "docs/flags-reference.md: `PLOW_TUNE_IGNORE_DIGEST=0` restores strict staleness",
+    ],
+};
 const GLM_RECIPE: Status = Status::Qualified {
     evidence: &[
         "crates/devgen/src/lib.rs apply_production_defaults: 47-50 out tok/s on 8x MI300X, retrieval 18/18",
@@ -817,6 +826,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_moe_native_align", Some("PLOW_GLM_MOE_NATIVE_ALIGN"), Layer::Emit, Domain::Bool, OFF, OPT_IN).scoped(NATIVE_ALIGN_SCOPE),
     KnobSpec::new("emit.glm_fuse_seam_rn", Some("PLOW_GLM_FUSE_SEAM_RN"), Layer::Emit, Domain::Bool, OFF, OPT_IN).scoped(FUSE_SEAM_RN_SCOPE),
     KnobSpec::new("emit.emit_rewrite", Some("PLOW_EMIT_REWRITE"), Layer::Emit, Domain::Bool, ON, PROMOTED).scoped(EMIT_REWRITE_SCOPE),
+    KnobSpec::new("emit.tune_ignore_digest", Some("PLOW_TUNE_IGNORE_DIGEST"), Layer::Emit, Domain::Bool, ON, TUNE_IGNORE_DIGEST),
     KnobSpec::new("emit.glm_router_off_shared", Some("GLM_ROUTER_OFF_SHARED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_router_old", Some("GLM_ROUTER_OLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.k3_fuse_ngemv", Some("PLOW_K3_FUSE_NGEMV"), Layer::Emit, Domain::Str, UNSET, OPT_IN),

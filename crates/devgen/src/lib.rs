@@ -1010,18 +1010,43 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
             return GemmMeasurements { by_case };
         };
         let mut stale = 0usize;
+        // `PLOW_TUNE_IGNORE_DIGEST` (default on): records whose digests have moved are parked
+        // here rather than dropped, and fill only the op cases that end with NO current-digest
+        // record. The strict rule -- "a stale record is more dangerous than none" -- is right
+        // when the choice is between two measurements, but the digest covers the whole
+        // preprocessed dense family, so ANY kernel edit invalidates the entire campaign at
+        // once and every tile silently degrades to the analytical model. For a case with no
+        // current record the real comparison is measured-but-older against never-measured.
+        let relax = emit_config::active().tune_ignore_digest;
+        let mut parked: std::collections::HashMap<String, std::collections::HashMap<u16, f64>> =
+            Default::default();
         for r in records {
             if !r.state.is_selectable() {
                 continue;
             }
-            if !r.digests.stale_against(&want).is_empty() {
+            let target = if r.digests.stale_against(&want).is_empty() {
+                &mut by_case
+            } else {
                 stale += 1;
-                continue;
-            }
-            let e = by_case.entry(r.op_case.clone()).or_default();
+                if !relax {
+                    continue;
+                }
+                &mut parked
+            };
+            let e = target.entry(r.op_case.clone()).or_default();
             // Best-of, so a re-measured campaign does not depend on file order.
             let cur = e.entry(r.kernel_id).or_insert(f64::INFINITY);
             *cur = cur.min(r.stats.median_ns);
+        }
+        // Current-digest records are never displaced: a parked case is taken whole, and only
+        // when the case is absent from `by_case` entirely. Mixing kernel ids from two builds
+        // within one case would rank medians that were never measured against each other.
+        let mut relaxed_cases = 0usize;
+        for (case, kernels) in parked {
+            if !by_case.contains_key(&case) {
+                by_case.insert(case, kernels);
+                relaxed_cases += 1;
+            }
         }
         // TOTAL staleness must be LOUDER than partial staleness, not silent.
         //
@@ -1045,8 +1070,16 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
                 if by_case.is_empty() {
                     " -- NO usable records remain, so tile selection fell back to the \
                      analytical model. Re-run the campaign or this compile is unmeasured."
+                        .to_string()
+                } else if relaxed_cases > 0 {
+                    format!(
+                        " -- PLOW_TUNE_IGNORE_DIGEST is on: {relaxed_cases} op case(s) with no \
+                         current-digest record were filled from those measurements instead of \
+                         the analytical model. Re-run the campaign to make this build's own \
+                         numbers decide."
+                    )
                 } else {
-                    ""
+                    String::new()
                 },
                 source_root.display(),
                 root,

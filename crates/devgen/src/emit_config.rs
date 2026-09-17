@@ -474,6 +474,18 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_REWRITE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub emit_rewrite: bool,
 
+    /// Use dense-GEMM tuner records whose build digests have since moved, for the op cases
+    /// that have NO current-digest record. Exact-digest records still win every case they
+    /// cover: this only replaces an ANALYTICAL-model fallback with a measured tile, never a
+    /// current measurement with an older one.
+    ///
+    /// The strict rule ("a stale record is more dangerous than none") costs the whole campaign
+    /// on any kernel edit, since the digest covers the preprocessed dense family: every tile
+    /// then degrades to the analytical model and the build reports tier `portable`. Default on;
+    /// `=0` restores strict staleness.
+    #[arg(long, env = "PLOW_TUNE_IGNORE_DIGEST", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub tune_ignore_digest: bool,
+
     /// GLM router off-shared dispatch (co-resident mode 2 only).
     #[arg(long, env = "GLM_ROUTER_OFF_SHARED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_router_off_shared: bool,
@@ -1307,6 +1319,7 @@ impl EmitConfig {
             glm_moe_native_align: env_bool("PLOW_GLM_MOE_NATIVE_ALIGN"),
             glm_fuse_seam_rn: env_bool("PLOW_GLM_FUSE_SEAM_RN"),
             emit_rewrite: env_opt_out("PLOW_EMIT_REWRITE"),
+            tune_ignore_digest: env_opt_out("PLOW_TUNE_IGNORE_DIGEST"),
             glm_router_off_shared: env_bool("GLM_ROUTER_OFF_SHARED"),
             glm_router_old: env_bool("GLM_ROUTER_OLD"),
             k3_fuse_ngemv: env_str("PLOW_K3_FUSE_NGEMV"),
