@@ -701,6 +701,22 @@ is 16.2 ms but 21.2 with prefill, and TTFT queues behind ~20K tok/s prefill
 Harness debt: the low-memory guard kills tracked background benches while a
 server pages in weights — launch benches detached (job tmp `launch_tp_c4.sh`).
 
+### Fat-lite light object at two blocks per SM (2026-09-17, late)
+
+The light ops ride the packed seg object at the 255-register ceiling set by
+arms they never execute here. `PLOW_NV_FATLITE=1` (T14: flash arms out,
+128-register cap) already exists; with the batched light bodies it compiles to
+128 regs / 24 B stack / 10 STL+LDL, and the loader's occupancy query launches
+it at grid 264. Seg-time at 4096: NormResidual+RmsNorm 119 → 97 µs, HeadNormRope
+187 → 106 µs, Glu 213 → 217 (unchanged), Flash unchanged: ≈ −4.8 ms per chunk,
+bit-identical bodies. The recipes never set `PLOW_BUILD_FATLITE`, so no cell
+had it. **Measured (paired C1, realtime, cache off):** 42.05 / 51.15 / 191.77
+vs control 42.43 / 53.96 / 196.55 (−2.8 ms @1024, −4.8 ms @4096); all five
+greedy continuations byte-identical. `PLOW_BUILD_FATLITE = "1"` is now in the
+recipes' objects env. Combined WG32 + fat-lite cell (`campaign-bf16-wg32fl`)
+pending. `PLOW_SEG_SLICE_ALL` is only recorded in the manifest, not
+implemented; the occupancy query makes it unnecessary.
+
 ### hd512 WGMMA BQ64/BKV32 role — real but smaller than the plan's number (2026-09-17)
 
 The plan file recorded the WGMMA BQ64/BKV32 hd512 body at 1.40 ms per launch

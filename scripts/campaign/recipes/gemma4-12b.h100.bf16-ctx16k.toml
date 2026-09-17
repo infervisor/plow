@@ -36,6 +36,7 @@ role_files = [
   "interp_sm90a_pfgemm_glu_gemma4.cubin",
 ]
 [objects.env]
+PLOW_BUILD_FATLITE = "1"           # light-op object: flash arms out, 128-reg cap, launches at 2 blocks/SM (2026-09-17: -2.8 ms @1024, -4.8 ms @4096, bit-identical)
 PLOW_BUILD_FA_GQA2_PAIR = "1"
 PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
