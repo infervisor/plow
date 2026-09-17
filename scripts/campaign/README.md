@@ -74,6 +74,16 @@ row against a different precision.
 - plowrt `/v1/completions` adds no BOS; Gemma degenerates without it. Use a
   chat-formatted `gate_prompt` with explicit special tokens.
 - The HF cache root may be unreadable; pass the tokenizer by snapshot path.
+- plowrt validates a packet's cuBLASLt segments with the same `plow-asset`
+  admission function the emitter used, so any change to that policy needs
+  `plowrt` rebuilt before the probe or bench — a stale serve binary refuses the
+  packet with "invalid packet-declared projection segments".
+- Long benches must run detached (setsid/nohup, watch the results file): the
+  CLI's low-memory guard kills tracked background commands while a server pages
+  24 GB of weights into the page cache, even with 240 GB available.
+- Queue scripts that wait on process names must spell the pattern so their own
+  command line does not match (`serv[e]`), and a helper must not carry the
+  pattern it kills in its own name or arguments.
 - `PLOW_UNISEG=1` is not needed for BF16 sm90a Gemma; the emit audit's "impure
   flash segment" warning is an AMD relaunch concern.
 - Packed prefill is default-on only for BF16 Hopper packets; W8A8 needs
