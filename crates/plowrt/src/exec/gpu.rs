@@ -3090,11 +3090,27 @@ impl GpuEngine {
         tracing::info!(
             requested = ?config.nv_vmm_prefix(),
             selected = prefix_layout.is_some(),
+            mode = match (config.nv_vmm_prefix(), prefix_layout.is_some()) {
+                (Some(true), _) => "explicit",
+                (None, true) => "auto",
+                _ => "off",
+            },
+            packed_prefix,
             "VMM prefix cache selection"
         );
         let packed_prefill = if prefix_requested && !packed_prefix {
             if packed_prefill_metadata.is_some() {
-                tracing::info!("packed prefill disabled because prefix reuse is active");
+                // A packed launch writes several slots' KV rows at once, so every
+                // row must be VMM-mapped before launch; only the unified token-batch
+                // route (PLOW_TOKEN_BATCH=1, PLOW_FUSION=0) or explicit PLOW_PF_BATCH=1
+                // plans that admission from the packed metadata.
+                tracing::info!(
+                    token_batch = config.token_batch,
+                    fusion = config.fusion,
+                    pf_batch = config.pf_batch_cuda(),
+                    "packed prefill disabled: prefix reuse needs pre-launch KV admission, \
+                     which only unified token batching or PLOW_PF_BATCH=1 provides"
+                );
             }
             None
         } else {

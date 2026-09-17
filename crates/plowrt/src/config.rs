@@ -332,6 +332,12 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-deferred-reclaim", env = "PLOW_VMM_DEFERRED_RECLAIM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_deferred_reclaim: bool,
 
+    /// CUDA VMM prefix cache: snapshot a sequence's boundary into the cache only once its
+    /// leading 32 tokens were seen on another sequence, so unique-prompt workloads pay no
+    /// snapshot copies. `0` publishes every sequence.
+    #[arg(long = "vmm-publish-shared", env = "PLOW_VMM_PUBLISH_SHARED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_publish_shared: bool,
+
     /// AMD shared-prefix VMM KV: when a request finishes, settle its slot's cache-shared row-0
     /// block on the pool's background thread, so the next admission finds row 0 private instead
     /// of paying the unmap/map inline in `begin_slot`. Needs `--vmm-deferred-reclaim`.
@@ -1601,6 +1607,14 @@ impl RuntimeConfig {
         select_compat(
             self.vmm_deferred_reclaim,
             Self::env_bool("PLOW_VMM_DEFERRED_RECLAIM"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn vmm_publish_shared(&self) -> bool {
+        select_compat(
+            self.vmm_publish_shared,
+            Self::env_bool("PLOW_VMM_PUBLISH_SHARED"),
             !Self::is_initialized(),
         )
     }
