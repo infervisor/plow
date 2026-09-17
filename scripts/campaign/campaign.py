@@ -125,7 +125,8 @@ def cmd_build(a: argparse.Namespace) -> None:
         for f in objects.get("role_files", []) if objects else []:
             (assets / f).write_bytes((obj_dir / f).read_bytes())
         print("== role emit", file=sys.stderr)
-        if run(nix([*base_args, "--out", str(assets)]), env_with(common, roles.get("env", {})), log):
+        # CLI overrides win over the recipe's role env too, so an A/B can switch a role off.
+        if run(nix([*base_args, "--out", str(assets)]), env_with(env_with(common, roles.get("env", {})), overrides), log):
             die("role emit failed; see build.log")
     else:
         assets = out / "assets"
