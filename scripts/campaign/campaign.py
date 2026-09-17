@@ -100,6 +100,9 @@ def cmd_build(a: argparse.Namespace) -> None:
         *emit.get("args", []),
     ]
     common = env_with(os.environ, emit.get("env", {}))
+    # The one emit-side variable of an A/B, named on the command line so build-record carries it.
+    overrides = dict(kv.split("=", 1) for kv in (a.env or []))
+    common.update(overrides)
 
     roles = r.get("emit_roles")
     objects = r.get("objects")
@@ -141,6 +144,7 @@ def cmd_build(a: argparse.Namespace) -> None:
     rec = {
         "recipe": str(Path(a.recipe).resolve()),
         "cell": cell,
+        "overrides": overrides,
         "commit": git("rev-parse", "HEAD"),
         "dirty": bool(git("status", "--porcelain")),
         "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -304,7 +308,9 @@ def cmd_ledger(a: argparse.Namespace) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = p.add_subparsers(dest="cmd", required=True)
-    b = sp.add_parser("build"); b.add_argument("recipe"); b.add_argument("--out", required=True); b.set_defaults(f=cmd_build)
+    b = sp.add_parser("build"); b.add_argument("recipe"); b.add_argument("--out", required=True)
+    b.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the emit env; recorded")
+    b.set_defaults(f=cmd_build)
     n = sp.add_parser("bench"); n.add_argument("recipe"); n.add_argument("--assets", required=True); n.add_argument("--out", required=True)
     n.add_argument("--concs"); n.add_argument("--in-lens"); n.add_argument("--label"); n.add_argument("--reference")
     n.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the server env; recorded")
