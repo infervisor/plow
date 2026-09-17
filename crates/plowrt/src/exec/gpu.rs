@@ -3090,6 +3090,12 @@ impl GpuEngine {
         tracing::info!(
             requested = ?config.nv_vmm_prefix(),
             selected = prefix_layout.is_some(),
+            mode = match (config.nv_vmm_prefix(), prefix_layout.is_some()) {
+                (Some(true), _) => "explicit",
+                (None, true) => "auto",
+                _ => "off",
+            },
+            packed_prefix,
             "VMM prefix cache selection"
         );
         let packed_prefill = if prefix_requested && !packed_prefix {

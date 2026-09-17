@@ -130,18 +130,32 @@ impl GpuEngine {
             return None;
         }
         let layout = Self::vmm_prefix_layout(blob, checkpoint_dir)?;
-        if requested.is_none()
-            && (layout.geo.elem != 2
-                || layout.geo.elem_slide != 2
-                || layout.geo.hd_full != 512
-                || layout.geo.hd_slide != 256
-                || layout.geo.window != 1024
-                || layout.slide.is_empty()
-                || recurrent_state_layout(&blob.tensors, layout.geo.batch as usize)
+        if requested.is_none() {
+            // Auto-selection is an allowlist of the geometry the sliding-ring
+            // snapshot path was qualified on (Gemma 4 hybrid BF16 KV), not a
+            // capability probe; other layouts need an explicit PLOW_VMM_PREFIX=1.
+            let g = &layout.geo;
+            let qualified = g.elem == 2
+                && g.elem_slide == 2
+                && g.hd_full == 512
+                && g.hd_slide == 256
+                && g.window == 1024
+                && !layout.slide.is_empty()
+                && recurrent_state_layout(&blob.tensors, g.batch as usize)
                     .ok()?
-                    .is_some())
-        {
-            return None;
+                    .is_none();
+            tracing::info!(
+                selected = qualified,
+                hd_full = g.hd_full,
+                hd_slide = g.hd_slide,
+                window = g.window,
+                kv_elem = g.elem,
+                "vmm prefix auto-selection (qualified Hopper hybrid BF16-KV geometry; \
+                 PLOW_PREFIX_CACHE=0 or PLOW_VMM_PREFIX=0 disables, =1 forces)"
+            );
+            if !qualified {
+                return None;
+            }
         }
         layout
             .geo
