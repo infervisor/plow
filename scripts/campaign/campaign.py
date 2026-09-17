@@ -220,11 +220,23 @@ def cmd_bench(a: argparse.Namespace) -> None:
     (out / "hf-home").mkdir(exist_ok=True)
     model_id = bench.get("model_id") or json.loads((assets / "build.json").read_text()).get("slug") or cell["revision"]
     label = a.label or f"{cell['name']}-{Path(a.recipe).stem}" + (f"-{a.profile}" if a.profile else "")
-    cmd = [str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label, str(BENCH),
-           str(assets), str(bench.get("port", 8765)), model_id, bench["tokenizer"], str(bench.get("ready_s", 1200))]
+    # The env is exported INSIDE the leased child, not passed through gpulease: gpulease assigns
+    # its own `LOG=` and an exported LOG would keep that value, sending the server log into the
+    # lease log (which is exactly what happened before this wrapper existed).
+    wrapper = out / "run.sh"
+    lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
+    for k, v in sorted(env.items()):
+        if k in os.environ and os.environ[k] == v and k not in overrides:
+            continue  # inherited, unchanged
+        lines.append(f"export {k}={shlex.quote(v)}")
+    lines.append("exec " + " ".join(shlex.quote(x) for x in [
+        str(BENCH), str(assets), str(bench.get("port", 8765)), model_id, bench["tokenizer"], str(bench.get("ready_s", 1200))]))
+    wrapper.write_text("\n".join(lines) + "\n")
+    wrapper.chmod(0o755)
+    cmd = [str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label, str(wrapper)]
     log = out / "run.log"
     log.write_bytes(b"")
-    rc = run(cmd, env, log)
+    rc = run(cmd, dict(os.environ), log)
     text = log.read_text(errors="replace")
     rows = [ln for ln in text.splitlines() if ln[:1].isdigit() and ln.count(",") == 12]
     (out / "results.csv").write_text(CSV_HEADER + "\n" + "\n".join(rows) + ("\n" if rows else ""))
