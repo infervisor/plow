@@ -5531,7 +5531,7 @@ Attention is 2.6x. The degenerated index picks fewer distinct KV blocks and the 
 experts, so the grouped GEMM bills fewer padded tiles. Every attention and MoE number in 12.x before
 this section was measured on a cheaper model than the one being served.
 
-## 12.74 With a real entry, a balanced EP beats TP by 1.83 ms/layer
+## 12.74 With a real entry, a balanced EP beats TP by 1.83 ms/layer -- but see 12.77, the balance is an oracle
 
 Medians over 20 iterations, interleaved, repeated (min within 1.5%):
 
@@ -5642,3 +5642,43 @@ So the 200 ms target is not reachable by changing the parallelism. At 14.54 ms/l
 and the 2.07 ms collective -- comes to about 7.5 ms even if every item went to zero. The remaining
 gap is arithmetic efficiency, not partitioning: the MoE pair alone bills 2154 us against a ~335 us
 fp8 roofline for the same MACs.
+
+## 12.77 EP's balance win is an oracle bound; TP is the right MoE parallelism at this shape
+
+12.74 scored a hand-solved cut list against the histogram of the run that produced it. That is not
+a schedule -- a request does not hand you its routing before it runs. The question is whether any
+REALIZABLE static expert-to-rank binding gets near it.
+
+**Not from the checkpoint.** The router is `top6(x @ gate.weight.T + gate.bias)`, both model
+properties, and the trained bias is a real concentrator (its std is ~1.0x the token-signal std at
+layer 2, and isotropic tokens light only 291/384 experts). But a Monte-Carlo through the real gate
+predicts the observed per-expert counts with corr 0.132 (rank corr 0.423), and cuts solved on the
+prediction score 228 max tiles against the even split's 217 -- no better.
+
+**Not from relabeling.** `corr(expert index, tiles) = -0.046`, so the imbalance is not index
+clustering that a permutation could break up. Round-robin ownership gets 198 against contiguous
+217; three random permutations give 200, 159, 210. All still ~1.8x.
+
+**Because the tail is the constraint.** The top 8 experts carry 68.6% of all rows, and the hottest
+single expert is 92 tiles against a fair share of 110.5 -- 83% of one rank's entire budget by
+itself. Unrestricted LPT with the histogram in hand reaches 1.005x; without it, one unlucky
+placement of one expert blows the bound. No static binding absorbs that.
+
+| assignment                          | max tiles/rank | imbalance |
+|-------------------------------------|---------------:|----------:|
+| contiguous even (ships today)       |            217 |    1.96x  |
+| round-robin                         |            198 |    1.79x  |
+| checkpoint-derived cuts             |            228 |    2.06x  |
+| oracle contiguous cuts (12.74)      |            121 |    1.10x  |
+| oracle LPT, unrestricted            |            111 |    1.005x |
+
+So the realizable EP number is the even split's 17150 us, against TP8's 16989 us. **TP is balanced
+by construction** -- every rank runs every expert at `moe_inter/8`, so routing skew cannot reach the
+partition at all -- and it is what ships. EP buys full-width `down` (12.70's k-loop argument) and
+gives it back to the tail.
+
+This closes the EP question rather than leaving it open: the 1.83 ms in 12.74 is HEADROOM that only
+dynamic expert placement could reach, and dynamic placement means moving 6 MB of weights per expert
+per batch. The MoE scheduling wins that were real this campaign are 12.67's coverage bug -- the
+grouped GEMM was computing 17.9% of its routed rows -- and the within-rank work distribution, which
+is histogram-independent.

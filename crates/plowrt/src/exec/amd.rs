@@ -1368,9 +1368,15 @@ fn moe_combine_inst(d: &DevInst64) -> bool {
 ///
 /// Cut points are a CALIBRATION of one routing distribution, not a property of the model.
 ///
-/// MEASURED, AND IT IS THE LEVER: on V4.1 at 8k/TP8, balancing the tile load from 1.558x to
-/// 1.004x takes the layer from 17149 us (even cuts) to 15164 us, against 16989 us for TP8 -- so
-/// the even split gives EP away and the balanced one wins 1.83 ms/layer over TP.
+/// MEASURED, AND IT IS AN ORACLE BOUND, NOT A SCHEDULE: on V4.1 at 8k/TP8, balancing the tile
+/// load from 1.558x to 1.004x takes the layer from 17149 us (even cuts) to 15164 us, against
+/// 16989 us for TP8. But those cuts were solved against the histogram that run produced, which a
+/// real request does not hand you in advance. Everything realizable lands at the even split's
+/// 17149 us, which is WORSE than TP8. See 12.77: expert popularity is predictable neither from
+/// the checkpoint (corr 0.13 between a Monte-Carlo through the real gate and the observed counts)
+/// nor from index position (corr -0.05, so round-robin gets 198 tiles against contiguous 217),
+/// and the top-8 experts carry 68.6% of the rows with the hottest alone at 83% of a rank's fair
+/// share. A static binding cannot absorb that tail. TP is balanced by construction here.
 ///
 /// An earlier revision of this comment said the opposite, on numbers (13914 us against 13854 us)
 /// taken before `rung_run` restored its entry between iterations. It did not, so every iteration
