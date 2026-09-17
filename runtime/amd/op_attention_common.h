@@ -3975,15 +3975,28 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
      * inside the packet). A split past the tile's causal tiles is DEAD: its walk is empty,
      * the epilogue writes (m=-inf, l=0, O=0), and d_mla_merge_fold weighs it 0 by the same
      * branch-free select the decode splits use. */
-    const unsigned nsp = GATHER ? 1u : (ns ? ns : 1u);
-    const unsigned n_work = GATHER ? n_batch * n_qt : n_batch * n_qt * n_head * nsp;
+    /* GATHER splits the UNION walk, not a causal range: item (q-pack, split) with each split
+     * owning a ceil-equal share of that pack's `ucount` entries. Same purpose as the dense
+     * split above -- 1024 packs over 304 workgroups is 3.37 rounds, so the packet pays 4 -- and
+     * the gathered arm is where that costs the most, because a pack's union size grows with its
+     * position until top-k caps it, so the 4th round is the expensive one. */
+    const unsigned nsp = ns ? ns : 1u;
+    const unsigned n_work = GATHER ? n_batch * n_qt * nsp : n_batch * n_qt * n_head * nsp;
 
     for (unsigned w = slice; w < n_work; w += nblk) {
-        const unsigned sp = GATHER ? 0u : w % nsp;
-        const unsigned wq = GATHER ? w : w / nsp;
+        const unsigned sp = w % nsp;
+        const unsigned wq = w / nsp;
         const unsigned h = GATHER ? 0u : wq % n_head;
         const unsigned rest = GATHER ? wq : wq / n_head;
-        const unsigned qt = mla_pf_fold(rest % n_qt, n_qt);
+        /* NO FOLD ON THE GATHER ARM. `mla_pf_fold` pairs the causal ends for a worker that walks
+         * the range SEQUENTIALLY; it sends even indices to the front half and odd to the back.
+         * The assignment here is a stride of `nblk`, and nblk = 304 is EVEN, so every item one
+         * workgroup draws has the same parity -- half the machine gets none but the cheap front
+         * packs and half none but the expensive back ones. The plain index already interleaves
+         * under a stride (workgroup s draws s, s+304, s+608, s+912: one from each quarter), so
+         * the fold is not an improvement on it but a de-interleaving of it. The dense arm keeps
+         * the fold: its tiles are window-bounded and equal-cost, so it is inert there. */
+        const unsigned qt = GATHER ? (rest % n_qt) : mla_pf_fold(rest % n_qt, n_qt);
         const unsigned b = rest / n_qt;
 
         const unsigned len = (unsigned)kv_len[b];
@@ -4015,6 +4028,16 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
         }
         unsigned walk_end = GATHER ? ucount : kv_end;
         unsigned walk_lo = GATHER ? 0u : kv_lo;
+        if (GATHER && nsp > 1) {
+            /* BKV-aligned so no union entry is walked twice; a split past `ucount` is dead and
+             * its epilogue writes (m=-inf, l=0, O=0), which d_mla_merge_fold weighs 0. */
+            const unsigned ntl = (ucount + (unsigned)BKV - 1) / (unsigned)BKV;
+            const unsigned cpt = (ntl + nsp - 1) / nsp;
+            walk_lo = sp * cpt * (unsigned)BKV;
+            const unsigned hi = (sp + 1u) * cpt * (unsigned)BKV;
+            walk_end = (hi < ucount) ? hi : ucount;
+            if (walk_lo >= ucount) walk_end = walk_lo;
+        }
         if (!GATHER && nsp > 1) {
             /* ceil-equal tile share; mid-split bounds are BKV-aligned so no row is walked
              * twice, and the last split's ragged end is masked by kv_end as before. */
