@@ -207,6 +207,36 @@ const PURE_GEMM_DEFAULT: Default = Default::Production {
     otherwise: Val::Unset,
 };
 
+/// Gemma-4 BF16 on sm_90a TP1: gate/up as two cuBLASLt GEMMs plus the GeGLU pass instead of the
+/// fused GLU role. Measured on H100 (perf-data/campaign/gemma4-12b.h100.bf16.csv): the fused
+/// role ran at ~20% of tensor-core peak at every bucket; Lt takes C1 TTFT@1024 from 89.9 to
+/// 56.4 ms and @4096 from 213.6 to 204.2 ms, in128 neutral, TPOT unchanged (decode is not
+/// touched). W8A8 is not covered: its GLU role has no Lt A/B.
+const LT_GLU_TARGET: F = F::And(&[
+    F::Target(T::Cap("gemma")),
+    F::Target(T::Arch("sm_90a")),
+    F::Target(T::Tp(1)),
+    F::Atom("emit.fp8", Cmp::Eq, FALSE),
+    F::Atom("emit.w8a8", Cmp::Eq, FALSE),
+    F::Atom("emit.w8a16", Cmp::Eq, FALSE),
+    F::Atom("emit.mxfp4", Cmp::Eq, FALSE),
+]);
+const LT_GLU_DEFAULT: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: LT_GLU_TARGET,
+        value: TRUE,
+    }],
+    // clap `bool` fields: off-target the knob is plainly false, not unset.
+    otherwise: FALSE,
+};
+const LT_GLU_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "perf-data/campaign/gemma4-12b.h100.bf16.csv: Lt gate/up vs fused GLU role, C1 TTFT@1024 89.9 -> 56.4 ms, @4096 -4%, in128 and TPOT neutral",
+        "perf-certs/emit.prefill_cublaslt.json and perf-certs/emit.no_glu_fuse.json: checkpoint P over ctrl/ctrl2/treat/treat2",
+        "plans/gemma4-dense-realtime-tracker.md: attribution (PLOW_PF_SEG_TIME) that ranked the GLU role first",
+    ],
+};
+
 /// `apply_production_defaults` forces the arms that read the local cache directly off under
 /// `--dcp > 1`: they bypass the owner gather.
 const GLM_DCP_SHARDED: F = F::And(&[GLM_TARGET, F::Atom("emit.dcp", Cmp::Gt, Val::Nat(1))]);
@@ -910,7 +940,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.moe_pf_det", Some("PLOW_MOE_PF_DET"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_stage1_body", Some("PLOW_MOE_STAGE1_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_stage2_body", Some("PLOW_MOE_STAGE2_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.no_glu_fuse", Some("PLOW_NO_GLU_FUSE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.no_glu_fuse", Some("PLOW_NO_GLU_FUSE"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED),
     KnobSpec::new("emit.tma_gemm", Some("PLOW_TMA_GEMM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_gemm_glu_role", Some("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_w8a8_gemm_glu_role", Some("PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -924,7 +954,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.qwen_fp8_m1_tma", Some("PLOW_QWEN_FP8_M1_TMA"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_w8a8_prefill", Some("PLOW_QWEN_W8A8_PREFILL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_cublaslt", Some("PLOW_EMIT_DECODE_CUBLASLT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.prefill_cublaslt", Some("PLOW_EMIT_PREFILL_CUBLASLT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.prefill_cublaslt", Some("PLOW_EMIT_PREFILL_CUBLASLT"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED),
     KnobSpec::new("emit.gemma_gemm_lt", Some("PLOW_GEMMA_GEMM_LT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_native_tc", Some("PLOW_EMIT_DECODE_NATIVE_TC"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_fuse_ab", Some("PLOW_QWEN_FUSE_AB"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

@@ -1,5 +1,8 @@
-# Gemma-4-12B-it, H100 SXM5, BF16 weights + BF16 KV, TP1: the qualified prefill roles.
-# Measured 2026-09-17 (C1, provisional/co-tenant): TTFT 42.2 / 89.8 / 213.6 ms, TPOT 12.0-13.2 ms.
+# Gemma-4-12B-it, H100 SXM5, BF16 weights + BF16 KV, TP1: the qualified attention roles with
+# gate/up on cuBLASLt (the fused GLU role measured ~20% of peak and is off).
+# Measured 2026-09-17 (C1, provisional/co-tenant): TTFT 42.2 / 56.4 / 204.2 ms, TPOT 12.0-13.3 ms.
+# The two Lt knobs are the sm_90a BF16 production default since this measurement; they stay
+# explicit here because the recipe is the source of the build.
 
 [cell]
 name = "gemma4-12b.h100.bf16"
@@ -19,6 +22,8 @@ PLOW_SEG_PURE_GEMM = "1"
 PLOW_SEG_FA512 = "1"
 PLOW_SEG_FA256_GQA2 = "1"
 PLOW_TMA_GEMM = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"   # projections and gate/up on cuBLASLt (policy: plow-asset segment_roles)
+PLOW_NO_GLU_FUSE = "1"             # gate/up as two GEMMs + GeGLU pass; the fused role is off
 PLOW_DECODE_BATCH_LADDER = "1"     # C1 cell; widen to 1,2,4,8,16 for C4/C16 (41 GiB KV at ctx 8192)
 PLOW_MAX_CHUNK = "4096"
 
@@ -37,7 +42,6 @@ PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
 
 [emit_roles.env]
-PLOW_GEMMA4_SM90_GEMM_GLU_ROLE = "1"
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
 
@@ -45,6 +49,8 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
 # Mirrors of the emit-side classing; a mismatch is a wrong-object launch.
 PLOW_PF_SEG_PURE = "1"
 PLOW_PF_SEG_FA512 = "1"
+# plowrt dlopens libcublasLt by soname; the host toolkit is not on the nix loader path.
+LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
 # PLOW_PF_SEG_DIR is the build's objects/ dir; set it at bench time:
 #   serve.env.PLOW_PF_SEG_DIR = "<out>/objects"
 

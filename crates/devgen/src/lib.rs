@@ -675,8 +675,7 @@ pub fn gfx950_prefill_tile_tier(
 /// record went stale — looks identical from the outside otherwise.
 pub fn gfx950_measured_rungs(m: i64, n: i64, k: i64, quant: kernelcaps::QuantScheme) -> usize {
     gfx950_gemm_measurements()
-        .by_case
-        .get(&tunedb::gemm_op_case(m, n, k, quant))
+        .lookup(&tunedb::gemm_op_case(m, n, k, quant))
         .map(|t| t.len())
         .unwrap_or(0)
 }
@@ -886,8 +885,24 @@ fn glu_era_inventory() -> &'static kernelcaps::Inventory {
 /// live). A missing store is not an error: it is the cold-start case, and the
 /// analytical model is the declared fallback tier.
 struct GemmMeasurements {
-    /// `op_case -> (opcode -> median ns)`.
+    /// `op_case -> (opcode -> median ns)`, records whose digests match the probed build.
     by_case: std::collections::HashMap<String, std::collections::HashMap<u16, f64>>,
+    /// The same for records whose digests have moved. Consulted only for op cases absent from
+    /// `by_case`, and only when `PLOW_TUNE_IGNORE_DIGEST` is on — decided per lookup, not when
+    /// this cache is built, so the first emit in a process does not fix the rule for every
+    /// later one (tests install their own config).
+    parked: std::collections::HashMap<String, std::collections::HashMap<u16, f64>>,
+}
+
+impl GemmMeasurements {
+    fn lookup(&self, case: &str) -> Option<&std::collections::HashMap<u16, f64>> {
+        self.by_case.get(case).or_else(|| {
+            emit_config::active()
+                .tune_ignore_digest
+                .then(|| self.parked.get(case))
+                .flatten()
+        })
+    }
 }
 
 /// The measured costs that apply to ONE shape. `select_kernel` asks per kernel,
@@ -912,7 +927,7 @@ impl GemmMeasurements {
         // without threading a lifetime through `pick_tile`; there is one per
         // distinct shape in a compile, and a compile is a process.
         let case = tunedb::gemm_op_case(m, n, k, quant);
-        let hit = self.by_case.get(&case);
+        let hit = self.lookup(&case);
         // THE ONE PLACE the compiler asks the store about a dense GEMM, and therefore the one
         // place its demand can be observed. `tune_demand` both prints the `PLOW_TUNE_DUMP=1`
         // line (unchanged) and records the lookup as typed data for `plowc tune gemm
@@ -937,7 +952,7 @@ impl GemmMeasurements {
         quant: kernelcaps::QuantScheme,
         measurement_id: u16,
     ) -> bool {
-        let Some(costs) = self.by_case.get(&tunedb::gemm_op_case(m, n, k, quant)) else {
+        let Some(costs) = self.lookup(&tunedb::gemm_op_case(m, n, k, quant)) else {
             return false;
         };
         let Some(candidate) = costs.get(&measurement_id) else {
@@ -987,14 +1002,14 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
         // about tuning should still get the calibrated answer, and one that explicitly asked
         // for the analytical model must get it.
         let root = match emit_config::active().tunedb_root() {
-            None => return GemmMeasurements { by_case },
+            None => return GemmMeasurements { by_case, parked: Default::default() },
             Some(s) => s,
         };
         let store = tunedb::TuneStore::new(std::path::PathBuf::from(root.clone()));
         let source_root = kernelcaps::source_root();
         let Ok(build) = kernelcaps::dense_gemm_tuning_build(&source_root, amd_target::active().1)
         else {
-            return GemmMeasurements { by_case };
+            return GemmMeasurements { by_case, parked: Default::default() };
         };
         // The sweep launches standalone GEMM kernels. Its key covers the
         // preprocessed dense family across all supported encodings, not
@@ -1007,7 +1022,7 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
         };
         let cell = amd_tuning_cell();
         let Ok(records) = store.load_kernels(&cell) else {
-            return GemmMeasurements { by_case };
+            return GemmMeasurements { by_case, parked: Default::default() };
         };
         let mut stale = 0usize;
         // `PLOW_TUNE_IGNORE_DIGEST` (default on): records whose digests have moved are parked
@@ -1017,7 +1032,6 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
         // preprocessed dense family, so ANY kernel edit invalidates the entire campaign at
         // once and every tile silently degrades to the analytical model. For a case with no
         // current record the real comparison is measured-but-older against never-measured.
-        let relax = emit_config::active().tune_ignore_digest;
         let mut parked: std::collections::HashMap<String, std::collections::HashMap<u16, f64>> =
             Default::default();
         for r in records {
@@ -1028,9 +1042,6 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
                 &mut by_case
             } else {
                 stale += 1;
-                if !relax {
-                    continue;
-                }
                 &mut parked
             };
             let e = target.entry(r.op_case.clone()).or_default();
@@ -1038,16 +1049,12 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
             let cur = e.entry(r.kernel_id).or_insert(f64::INFINITY);
             *cur = cur.min(r.stats.median_ns);
         }
-        // Current-digest records are never displaced: a parked case is taken whole, and only
-        // when the case is absent from `by_case` entirely. Mixing kernel ids from two builds
-        // within one case would rank medians that were never measured against each other.
-        let mut relaxed_cases = 0usize;
-        for (case, kernels) in parked {
-            if !by_case.contains_key(&case) {
-                by_case.insert(case, kernels);
-                relaxed_cases += 1;
-            }
-        }
+        // Current-digest records are never displaced: `lookup` takes a parked case whole, and
+        // only when the case is absent from `by_case` entirely. Mixing kernel ids from two
+        // builds within one case would rank medians that were never measured against each
+        // other. Counted here for the staleness line; applied per lookup.
+        parked.retain(|case, _| !by_case.contains_key(case));
+        let relaxed_cases = parked.len();
         // TOTAL staleness must be LOUDER than partial staleness, not silent.
         //
         // This was gated on `!by_case.is_empty()`, so the one case that actually matters --
@@ -1085,7 +1092,7 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
                 root,
             );
         }
-        GemmMeasurements { by_case }
+        GemmMeasurements { by_case, parked }
     })
 }
 
@@ -7365,6 +7372,19 @@ fn apply_production_defaults(
     {
         cfg.seg_pure_gemm = Some("1".into());
         emit_config::note_production_default("seg_pure_gemm", "1".into());
+    }
+    // Gemma-4 BF16 on sm_90a TP1: gate/up as two cuBLASLt GEMMs + the GeGLU pass beat the fused
+    // GLU role at every bucket Lt covers (`knob_spec::LT_GLU_QUALIFIED`). Both knobs stay
+    // explicit rollbacks (`=0`); the fused-GLU role knob is opt-in and is not touched here.
+    if bf16 && capabilities.gemma && arch == "sm_90a" && tp == 1 {
+        if !emit_config::explicitly_set("prefill_cublaslt") {
+            cfg.prefill_cublaslt = true;
+            emit_config::note_production_default("prefill_cublaslt", "true".into());
+        }
+        if !emit_config::explicitly_set("no_glu_fuse") {
+            cfg.no_glu_fuse = true;
+            emit_config::note_production_default("no_glu_fuse", "true".into());
+        }
     }
     // gfx942 STOPS AT 8, sm_90a KEEPS 16 — and the reason is the OBJECT, not the rung.
     //

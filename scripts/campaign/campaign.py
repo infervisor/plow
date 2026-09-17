@@ -284,6 +284,11 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "protocol": {k: env[k] for k in ("IN_LENS", "CONCS", "NPROMPT", "OUTLEN", "BENCH_BACKEND", "BENCH_EXTRA_ARGS")},
         "serve_env": serve.get("env", {}),
         "overrides": overrides,
+        "lt_algos": {
+            "pinned": env.get("PLOW_LT_ALGOS"),
+            "rows": sum(1 for ln in lt_table.read_text().splitlines() if ln.strip()) if lt_table.is_file() else 0,
+            "written": env.get("PLOW_LT_ALGOS_WRITE"),
+        },
         "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and p.suffix in (".pkt", ".cubin", ".elf", ".co")},
         "rows": len(rows),
         "bench_rc": rc,
@@ -374,6 +379,94 @@ def cmd_probe(a: argparse.Namespace) -> None:
     print(f"probe: {len(rows)} shape(s) selected -> {table}\n       {added} new row(s) -> {store}", file=sys.stderr)
 
 
+# ---------------------------------------------------------------- cert
+def _samples(run_dir: Path) -> dict:
+    """Per-request samples per (input_len, concurrency, metric) from a bench run's client JSONs."""
+    out = {}
+    for f in sorted((run_dir / "client").glob("in*_c*.json")):
+        d = json.loads(f.read_text())
+        key = (int(d["input_lens"][0]), int(d["max_concurrency"] or 1))
+        ttft = [x * 1e3 for x in d["ttfts"]]
+        tpot = [sum(i) / len(i) * 1e3 for i in d["itls"] if i]
+        out[(*key, "ttft_ms")] = ttft
+        out[(*key, "tpot_ms")] = tpot
+    return out
+
+
+def _stats(xs: list) -> dict:
+    s = sorted(xs)
+    n = len(s)
+    med = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+    dev = sorted(abs(x - med) for x in s)
+    mad = dev[n // 2] if n % 2 else (dev[n // 2 - 1] + dev[n // 2]) / 2
+    return {"median": med, "mad": mad, "n": n, "p95": s[min(n - 1, int(0.95 * n))]}
+
+
+def cmd_cert(a: argparse.Namespace) -> None:
+    """Checkpoint P certificate for a default flip from four bench runs (ctrl, ctrl2, treat,
+    treat2): the ledger entries are the runs' per-request samples, the request names every cell
+    as a touched serving rung, and `scripts/perf_cert.py make` runs the verifier."""
+    runs = {arm: Path(getattr(a, arm)).resolve() for arm in ("ctrl", "ctrl2", "treat", "treat2")}
+    recs = {arm: json.loads((p / "run-record.json").read_text()) for arm, p in runs.items()}
+    samples = {arm: _samples(p) for arm, p in runs.items()}
+    cells = sorted(set.intersection(*(set(s) for s in samples.values())))
+    if not cells:
+        die("the four runs share no (input_len, concurrency, metric) cell")
+    delta = dict(kv.split("=", 1) for kv in (a.knob_delta or []))
+    gpu = recs["treat"].get("gpu", {})
+    hardware = {"box": f"1x{gpu.get('name', 'GPU')}", "driver": gpu.get("driver_version"), "firmware": None, "cuda": None}
+    work = Path(a.out).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    ledger, touched, serving = [], [], []
+    for (L, C, metric) in cells:
+        rung = {"digest": f"{a.cell}/serve/in{L}-c{C}-out128", "prior": 0, "role": "serve", "rows": L, "topology": f"C{C}"}
+        ids = {arm: f"{a.job}:in{L}-c{C}:{metric}:{arm}" for arm in runs}
+        for arm in ("ctrl", "ctrl2", "treat", "treat2"):
+            xs = samples[arm][(L, C, metric)]
+            e = {
+                "id": ids[arm], "job": a.job, "metric": metric, "better": "lower",
+                "rung": rung, "samples": xs, "stats": _stats(xs),
+                "knob_delta": delta if arm.startswith("treat") else {},
+                "recipe_digest": recs[arm]["hashes"].get("model.pkt", "")[:16],
+                "hardware": hardware, "harness": "campaign-bench",
+                "date": recs[arm]["utc"][:10],
+            }
+            if arm.startswith("treat"):
+                e["control_of"] = ids["ctrl"]
+                e["repeat_control_of"] = ids["ctrl2"]
+            ledger.append(e)
+        t = {"rung": rung["digest"], "treat": ids["treat"]}
+        # `--neutral tpot_ms` (every rung) or `--neutral ttft_ms@in128` (one input length).
+        neutral = any(
+            spec == metric or spec == f"{metric}@in{L}" for spec in (a.neutral or [])
+        )
+        if neutral:
+            t["neutral_evidence"] = [a.neutral_evidence or "unchanged by the flip"]
+        touched.append(t)
+        serving += [ids["treat"], ids["treat2"]]
+    gates = all(recs[arm].get("gate") for arm in runs)
+    request = {
+        "touched": touched,
+        "untouched": [],
+        "tier4": True,
+        "serving": serving,
+        "numeric": bool(a.numeric),
+        "facts": [{"kind": "gate", "pass": gates,
+                   "evidence": "coherence gate PASS on ctrl, ctrl2, treat, treat2 (run-record.json of each)"}]
+                 + [{"kind": "note", "pass": True, "evidence": f} for f in (a.fact or [])],
+    }
+    (work / "ledger.jsonl").write_text("".join(json.dumps(e) + "\n" for e in ledger))
+    (work / "request.json").write_text(json.dumps(request, indent=1))
+    cert = REPO / "perf-certs" / f"{a.knob}.json"
+    cmd = ["python3", str(REPO / "scripts" / "perf_cert.py"), "make", "--knob", a.knob,
+           "--request", str(work / "request.json"), "--ledger", str(work / "ledger.jsonl"), "--out", str(cert)]
+    print("  $", " ".join(shlex.quote(c) for c in cmd), file=sys.stderr)
+    rc = subprocess.run(cmd, cwd=REPO).returncode
+    print(f"cert: ledger {len(ledger)} entries, {len(touched)} touched rungs -> {cert} (rc={rc})", file=sys.stderr)
+    if rc != 0:
+        sys.exit(rc)
+
+
 # ---------------------------------------------------------------- compare
 def read_rows(p: Path) -> dict:
     with open(p) as f:
@@ -439,6 +532,14 @@ def main() -> None:
     pr.add_argument("--store-cell", default="h100", help="tune-store cell under tuning/nvidia/<arch>/")
     pr.add_argument("--label"); pr.add_argument("--force", action="store_true")
     pr.add_argument("--env", action="append", metavar="K=V"); pr.set_defaults(f=cmd_probe)
+    ce = sp.add_parser("cert"); ce.add_argument("--knob", required=True); ce.add_argument("--job", required=True)
+    ce.add_argument("--cell", required=True, help="cell name used in rung digests, e.g. gemma4-12b.h100.bf16")
+    for arm in ("ctrl", "ctrl2", "treat", "treat2"):
+        ce.add_argument(f"--{arm}", required=True, help=f"bench run dir of the {arm} arm")
+    ce.add_argument("--knob-delta", action="append", metavar="K=V"); ce.add_argument("--numeric", action="store_true")
+    ce.add_argument("--neutral", action="append", metavar="METRIC", help="metric expected unchanged (e.g. tpot_ms)")
+    ce.add_argument("--neutral-evidence"); ce.add_argument("--fact", action="append")
+    ce.add_argument("--out", required=True, help="work dir for ledger.jsonl and request.json"); ce.set_defaults(f=cmd_cert)
     c = sp.add_parser("compare"); c.add_argument("results"); c.add_argument("reference"); c.set_defaults(f=cmd_compare)
     l = sp.add_parser("ledger"); l.add_argument("results"); l.add_argument("--cell", required=True); l.add_argument("--note", required=True)
     l.add_argument("--provisional", action="store_true"); l.set_defaults(f=cmd_ledger)
