@@ -1375,7 +1375,11 @@ fi
 # all on registers (256 VGPR, 122 spills, before and after) and 160 B on LDS. A narrow
 # `#if PLOW_MHC` guard is still the better shape; it is not urgent on that evidence.
 if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ]; then
-  AX_PREFILL="$AX_PREFILL -DPLOW_K3=1 -DGV_UNROLL=14 -DPLOW_QWEN_GDN=1 $AX_A4W4"
+  # $AX_K3_A4W4_TUNE rides along because V4.1's routed experts ARE a4w4 (12.83): without it
+  # PLOW_MOE_PF_A4W4_C3_BK / _PRIO reach only the K3 rows and V4.1 cannot A/B the kernel it
+  # actually dispatches. The defaults (BK 64, PRIO 1) are unchanged by adding the axis -- they
+  # were chosen on K3's shapes, and V4.1's DOWN is K=288, 4.5 tiles at BK=64.
+  AX_PREFILL="$AX_PREFILL -DPLOW_K3=1 -DGV_UNROLL=14 -DPLOW_QWEN_GDN=1 $AX_A4W4 $AX_K3_A4W4_TUNE"
 fi
 
 # CEILING INSTRUMENT ONLY (PLOW_MLA_PF2_ABL=1..4): the V2 MLA prefill's ablation probes —

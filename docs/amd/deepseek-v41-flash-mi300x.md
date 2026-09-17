@@ -5980,10 +5980,15 @@ each B pass amortises, which is the 28 ms of body it gave back.
 same K, independent, 192 tiles each. Fused over the concatenated N they are 576 wide -- 5 tiles,
 320 tiles total -- which fills 304 and collapses two packets into one, dropping the `gt`/`ut`
 round trip to HBM as well. `d_gemm_glu` already does exactly this for bf16 B and
-`d_gemm_glu_mxfp4` for fp4; there is no fp8-mx arm, and that is the whole gap. Worth roughly
-180 us/layer, about 7 ms over the model. Not attempted here: it is a new kernel arm with its own
-numerics, and it wants to land with its own byte-identity argument rather than at the end of a
-session.
+`d_gemm_glu_mxfp4` for fp4; there is no fp8-mx arm, and that is the whole gap.
+
+**CORRECTION (12.85).** The "roughly 180 us/layer" first written here was wrong, and the error is
+worth keeping because it is easy to repeat: a FUSED GLU tile emits `BN/2` fused columns, so over
+N = 288 it is still `64 * ceil(288/128) = 192` tiles, each doing twice the MFMA. 192 busy
+workgroups and 112 idle, exactly as before -- the fusion does not widen the GEMM, it deepens each
+tile. Occupancy is unchanged and the real saving is only the `gt`/`ut` round trip (2 x [8192, 288]
+bf16 written and read back, ~19 MB, ~4 us), one packet gate, and folding away the 28 us `GLU`
+packet: order 30 us/layer, ~1.2 ms over the model, not 7 ms.
 
 **The floor, stated honestly.** Per layer the model now costs 14.81 ms, of which the two seam
 collectives are 1.52 ms. Those move 336 MB per rank per layer and are running at ~221 GB/s, which
@@ -5998,3 +6003,43 @@ any more. The identified, mechanism-understood backlog -- this section's 505 us,
 -- sums to a few ms/layer even if every item went to zero, and every large item in it is an
 arithmetic-efficiency problem on kernels that currently run at 7-15% of peak. 200 ms is reachable
 only by a kernel suite at roughly half of peak, which is a rewrite programme, not a knob.
+
+## 12.85 V4.1 can now tune the MoE kernel it dispatches; BK=64 survives, BK=32 costs 600 us/layer
+
+12.83 found that V4.1's routed experts are MXFP4, so they run `d_moe_group_pf_a4w4` and not
+`d_moe_group_pf_t`. The same split runs through the BUILD: `$AX_K3_A4W4_TUNE`, which carries
+`PLOW_MOE_PF_A4W4_C3_BK` and `PLOW_MOE_PF_A4W4_PRIO`, rides only the `interp_prefill_k3_moe_a4w4`
+rows. V4.1's row is
+
+    "interp_prefill_mla_moe|$AX_PREFILL $AX_MLA $AX_MOE"
+
+and picks up the a4w4 BODY (the `PLOW_PREFILL_DSV41` block appends `$AX_A4W4` to `AX_PREFILL`) but
+none of its TUNING. The defaults it therefore compiled -- BK 64, PRIO 1 -- happen to equal what the
+axis sets, so nothing was mis-tuned; what was missing is the ability to A/B at all, on a kernel
+chosen for K3's shapes and not V4.1's. V4.1's DOWN has K = 288, which is 4.5 tiles at BK=64 and 9
+at BK=32, so the question was a real one. `$AX_K3_A4W4_TUNE` now rides the DSV41 axis; with the
+env var unset it expands to the empty string, and the object is bit-identical to the one before
+(verified by dumping `act.hc_residual_a` and comparing rank 0's band: `max|d| = 0` against both the
+pre-patch baseline and the EPI_SIB object).
+
+**The sweep is a negative.** Interleaved, twice each, 20 iterations:
+
+           layer min      MoE pair (DOWN + GLU)
+    BK=64   14801 us      4200.2 us   (r2: 14758, 4320.2)
+    BK=32   15407 us      4797.9 us   (r2: 15444, 4718.0)
+
+BK=32 costs about 600 us/layer on the pair and 640 us on the layer, in both rounds. BK=64 stays.
+The two are BIT-IDENTICAL in output -- both drain every 32 k-elements, in the same order, over the
+same terms -- so this is purely the tile-level stage and barrier count, the same argument
+`GM_MX_BK` records for the dense arm.
+
+**A measurement-hygiene note that cost real time.** The first run of this sweep reported BK=32
+"worse" on a run whose median was 9,986,930 us -- a hung iteration -- and simultaneously reported
+the BK=64 arm's dump differing from the baseline by `max|d| = 3.64`, which for a build that should
+be a no-op is alarming. Neither was real. Re-running the same object twice gave `max|d| = 0`, and
+that object's dump then matched the baseline, the EPI_SIB object and the BK=32 object exactly: the
+machine is bit-deterministic and the 3.64 file was a single corrupt dump written during a
+disturbed run. The rule this yields: when an A/B produces BOTH a surprising time and a surprising
+numeric difference, re-run the CONTROL against itself before believing either. On this machine
+multi-second and multi-SECOND-per-iteration outliers appear in every arm (12.82), so `min` over an
+interleaved, repeated pair is the only statistic worth quoting.
