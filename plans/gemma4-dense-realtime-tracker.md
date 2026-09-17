@@ -306,6 +306,21 @@ Same-precision scoreboard (C1, TPOT):
 | Plow BF16 / vLLM BF16 | 1.14 | 1.19 | 1.24 |
 | Plow FP8-weight / vLLM FP8 | 1.28 | 1.36 | 1.43 |
 
+### D4 — streaming granularity (harness A/B, one variable)
+
+`scripts/campaign/campaign.py bench … --env PLOW_MULTISTEP=0` vs default (8,
+mux quantum 4 at C1). BF16 roles packet, C1, provisional (co-tenant).
+
+| in | TPOT default | TPOT ms=0 | ITL med / p99 default | ITL med / p99 ms=0 |
+|---:|---:|---:|---:|---:|
+| 128 | 12.00 | 12.06 | 0.00 / 48.48 | 12.14 / 12.23 |
+| 1024 | 12.63 | 12.69 | 0.00 / 50.57 | 12.69 / 12.76 |
+| 4096 | 13.22 | 13.28 | 0.00 / 53.00 | 13.27 / 13.59 |
+
+Per-token streaming for +0.06 ms/tok (0.5 %). For a realtime profile
+`--multistep 0` is the right default; the throughput profile keeps 8. Ledger:
+`perf-data/campaign/gemma4-12b.h100.bf16.csv`.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |

@@ -1,0 +1,7 @@
+utc,commit,label,provisional,pkt_sha,note,input_len,concurrency,ttft_ms,ttft_med,tpot_ms,tpot_med,itl_ms,itl_med,itl_p99,out_tok_s,req_per_s,ok_reqs,gen_toks
+2026-09-17T13:03:42Z,b305e944bf68,bf16-roles-ms8,1,1bb3456855422c7b,"baseline: qualified roles, multistep default (8, mux quantum 4)",128,1,42.02,41.93,12.000,12.000,11.900,0.000,48.480,81.7,0.640,32,4096
+2026-09-17T13:03:42Z,b305e944bf68,bf16-roles-ms8,1,1bb3456855422c7b,"baseline: qualified roles, multistep default (8, mux quantum 4)",1024,1,89.83,90.03,12.630,12.630,12.530,0.000,50.570,75.6,0.590,32,4096
+2026-09-17T13:03:42Z,b305e944bf68,bf16-roles-ms8,1,1bb3456855422c7b,"baseline: qualified roles, multistep default (8, mux quantum 4)",4096,1,213.01,213.45,13.220,13.220,13.110,0.000,53.000,67.7,0.530,32,4096
+2026-09-17T13:08:42Z,b305e944bf68,bf16-roles-ms0,1,1bb3456855422c7b,"D4: PLOW_MULTISTEP=0 -> per-token ITL, +0.06 ms TPOT",128,1,42.12,42.10,12.060,12.060,11.970,12.140,12.230,81.3,0.640,32,4096
+2026-09-17T13:08:42Z,b305e944bf68,bf16-roles-ms0,1,1bb3456855422c7b,"D4: PLOW_MULTISTEP=0 -> per-token ITL, +0.06 ms TPOT",1024,1,89.70,89.90,12.690,12.690,12.590,12.690,12.760,75.2,0.590,32,4096
+2026-09-17T13:08:42Z,b305e944bf68,bf16-roles-ms0,1,1bb3456855422c7b,"D4: PLOW_MULTISTEP=0 -> per-token ITL, +0.06 ms TPOT",4096,1,213.20,213.63,13.280,13.280,13.180,13.270,13.590,67.4,0.530,32,4096
