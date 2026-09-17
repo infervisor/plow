@@ -74,6 +74,20 @@ static __device__ __forceinline__ float gemma_postnorm_round(float x) {
 #define PLOW_NV_T17_MIN_ROWS 32u
 #endif
 
+/* T17 row walk: PLOW_NV_ROW_NB chunks (8 bf16 per lane each) are issued per pass before any is
+ * consumed — 2 KB per warp in flight instead of one 16-byte load per lane. The one-chunk loop
+ * was a 15-deep load-latency chain per pass at feat 3840 and put the fat norm segments at
+ * 3–4x the HBM floor (h100 seg-time: 153 us per NormResidual+RmsNorm launch at 4096 rows).
+ * Batches cover only WHOLE 256-element chunks (feat >> 8 of them) and carry no per-chunk
+ * guard: a guarded load loop stops ptxas register-promoting the bf16v8 arrays (measured in
+ * experiments/h100_elementwise_ab.cu: +47 regs, +784 B spill; and here: the guarded 8-chunk
+ * form put the sm_90a DECODE object at 255 regs / 416 B stack and made every light segment
+ * SLOWER). Leftover chunks and the feat % 256 tail take the original one-chunk loop, so the
+ * per-lane accumulation order and the outputs are unchanged. */
+#ifndef PLOW_NV_ROW_NB
+#define PLOW_NV_ROW_NB 4
+#endif
+
 /* RMSNorm over `feat`. One block per row, strided by nblk.
  *
  * PRODUCER-THEN-CONSUMER is preserved from the AMD original and is not cosmetic: a decode
@@ -113,8 +127,23 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
             if (row >= rows) break;
             const size_t base = (size_t)row * feat;
             const size_t obase = (size_t)(out_row0 + row) * feat;
+            const unsigned nfull = feat >> 8; /* whole 256-element chunks: every lane in range */
             float ss = 0.0f;
-            for (unsigned i = lane * 8u; i < feat; i += 256u) {
+            unsigned kc = 0;
+            for (; kc + PLOW_NV_ROW_NB <= nfull; kc += PLOW_NV_ROW_NB) {
+                bf16v8 v[PLOW_NV_ROW_NB];
+#pragma unroll
+                for (int c = 0; c < PLOW_NV_ROW_NB; c++)
+                    v[c] = ld_glob8(x + base + lane * 8u + (kc + (unsigned)c) * 256u);
+#pragma unroll
+                for (int c = 0; c < PLOW_NV_ROW_NB; c++)
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const float f = __bfloat162float(v[c].x[j]);
+                        ss += f * f;
+                    }
+            }
+            for (unsigned i = lane * 8u + kc * 256u; i < feat; i += 256u) {
                 const bf16v8 v = ld_glob8(x + base + i);
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
@@ -125,7 +154,29 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
             const float inv =
                 rsqrtf(warp_sum32(ss) * __fdividef(1.0f, (float)feat) + eps);
             float am = 0.0f;
-            for (unsigned i = lane * 8u; i < feat; i += 256u) {
+            kc = 0;
+            for (; kc + PLOW_NV_ROW_NB <= nfull; kc += PLOW_NV_ROW_NB) {
+                bf16v8 v[PLOW_NV_ROW_NB], w[PLOW_NV_ROW_NB];
+#pragma unroll
+                for (int c = 0; c < PLOW_NV_ROW_NB; c++) {
+                    const unsigned i = lane * 8u + (kc + (unsigned)c) * 256u;
+                    v[c] = ld_glob8(x + base + i);
+                    w[c] = gamma ? ld_glob8(gamma + i) : bf16v8_zero();
+                }
+#pragma unroll
+                for (int c = 0; c < PLOW_NV_ROW_NB; c++) {
+                    const unsigned i = lane * 8u + (kc + (unsigned)c) * 256u;
+                    bf16v8 o;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const float g = gamma ? norm_weight(__bfloat162float(w[c].x[j])) : 1.0f;
+                        o.x[j] = __float2bfloat16(__bfloat162float(v[c].x[j]) * inv * g);
+                        if (xq) am = fmaxf(am, fabsf(__bfloat162float(o.x[j])));
+                    }
+                    st_glob8(out + obase + i, o);
+                }
+            }
+            for (unsigned i = lane * 8u + kc * 256u; i < feat; i += 256u) {
                 const bf16v8 v = ld_glob8(x + base + i);
                 const bf16v8 w = gamma ? ld_glob8(gamma + i) : bf16v8_zero();
                 bf16v8 o;
@@ -378,8 +429,23 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
             const unsigned row = slice + k * nblk;
             if (row >= rows) break;
             const size_t base = (size_t)row * feat;
+            const unsigned nfull = feat >> 8;
             float ss = 0.0f;
-            for (unsigned i = lane * 8u; i < feat; i += 256u) {
+            unsigned kc = 0;
+            for (; kc + PLOW_NV_ROW_NB <= nfull; kc += PLOW_NV_ROW_NB) {
+                bf16v8 v[PLOW_NV_ROW_NB];
+#pragma unroll
+                for (int c = 0; c < PLOW_NV_ROW_NB; c++)
+                    v[c] = ld_glob8(b + base + lane * 8u + (kc + (unsigned)c) * 256u);
+#pragma unroll
+                for (int c = 0; c < PLOW_NV_ROW_NB; c++)
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const float f = __bfloat162float(v[c].x[j]);
+                        ss += f * f;
+                    }
+            }
+            for (unsigned i = lane * 8u + kc * 256u; i < feat; i += 256u) {
                 const bf16v8 v = ld_glob8(b + base + i);
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
@@ -389,7 +455,30 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
             }
             const float inv =
                 rsqrtf(warp_sum32(ss) * __fdividef(1.0f, (float)feat) + eps);
-            for (unsigned i = lane * 8u; i < feat; i += 256u) {
+            kc = 0;
+            for (; kc + PLOW_NV_ROW_NB <= nfull; kc += PLOW_NV_ROW_NB) {
+                bf16v8 v[PLOW_NV_ROW_NB], av[PLOW_NV_ROW_NB], w[PLOW_NV_ROW_NB];
+#pragma unroll
+                for (int c = 0; c < PLOW_NV_ROW_NB; c++) {
+                    const unsigned i = lane * 8u + (kc + (unsigned)c) * 256u;
+                    v[c] = ld_glob8(b + base + i);
+                    av[c] = ld_glob8(a + base + i);
+                    w[c] = gamma ? ld_glob8(gamma + i) : bf16v8_zero();
+                }
+#pragma unroll
+                for (int c = 0; c < PLOW_NV_ROW_NB; c++) {
+                    const unsigned i = lane * 8u + (kc + (unsigned)c) * 256u;
+                    bf16v8 o;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const float g = gamma ? norm_weight(__bfloat162float(w[c].x[j])) : 1.0f;
+                        o.x[j] = __float2bfloat16(
+                            (__bfloat162float(av[c].x[j]) + gemma_postnorm_round(__bfloat162float(v[c].x[j]) * inv * g)) * scale);
+                    }
+                    st_glob8(out + base + i, o);
+                }
+            }
+            for (unsigned i = lane * 8u + kc * 256u; i < feat; i += 256u) {
                 const bf16v8 v = ld_glob8(b + base + i);
                 const bf16v8 av = ld_glob8(a + base + i);
                 const bf16v8 w = gamma ? ld_glob8(gamma + i) : bf16v8_zero();
