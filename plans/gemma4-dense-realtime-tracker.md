@@ -746,6 +746,21 @@ chunk. The 32-row rung itself is fine: checkpoint G now takes rows = 1 for
 the NVIDIA staged arms (they stage only at M=1), and the multi-tile walk
 holds 1.2–2.5 TB/s at M=32.
 
+### Long-context prefill is the hd512 global attention role (seg-time, 8192-token prompt)
+
+C1, 16K cell with masked padding, realtime profile: TTFT 432 ms for two
+4096-row chunks. Second chunk (KV 4K→8K): FlashPrefill 69.5 ms of 101 ms, of
+which the 8 hd512 global launches are 7.1–7.4 ms each (57 ms) and the 40 hd256
+sliding launches ~0.39 ms (16 ms); norms/GeGLU/rope unchanged at 119/212/204 µs.
+The hd512 launch goes 2.6 ms (4K KV) → 7.3 ms (8K KV): 1.1 TFLOP in 7.3 ms
+= 150 TFLOP/s, ~15 % of peak; extrapolated ~15 ms at 12K and ~30 ms at 16K, so
+a 15000-token prompt spends most of its 3.9 s (C4) / 19.6 s (C16) TTFT in this
+one role. The px4 BQ64 role is mma.sync; the earlier hd512 campaign (plans/
+gemma4-4k-8k-native-block.md) got 2–6 % steps on it, and the wgmma variants
+(`PLOW_NV_FA512_WG`, KV16/KV64) lost to px4 at the 255-register ceiling. This is
+the single largest item left for both realtime 4096 (20.7 ms) and every
+long-context cell, and it needs a redesigned kernel, not tuning.
+
 ### plowrt VMM prefix review (merged 2026-09-17, branch `gemma4-plowrt-vmm-fixes`)
 
 Reviewed the four reported issues; merged as 50f89816.
