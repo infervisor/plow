@@ -347,6 +347,9 @@ impl GpuEngine {
                     if rt.vmm_deferred_reclaim() {
                         kv.enable_deferred_reclaim();
                     }
+                    if rt.vmm_publish_shared() {
+                        kv.enable_shared_publish();
+                    }
                     kv
                 },
                 slide,
