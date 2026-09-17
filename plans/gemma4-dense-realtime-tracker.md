@@ -691,6 +691,19 @@ is 16.2 ms but 21.2 with prefill, and TTFT queues behind ~20K tok/s prefill
 Harness debt: the low-memory guard kills tracked background benches while a
 server pages in weights — launch benches detached (job tmp `launch_tp_c4.sh`).
 
+### Split-K for the narrow decode shapes (2026-09-17)
+
+`down` (480 row blocks over 132 blocks) idled half the warps: 1.4 TB/s. Warp
+pairs now share a row block and split K, reducing through static smem
+(`op_gemv_mma.cuh`, gated on ≤ WARPS/2 row blocks per block). Harness M=16:
+down 1412 → 1959 GB/s, o_proj 2156 → 2439; decode object 225 regs, no spills,
+3.6 KB smem. Measured (in128, decode-only): C16 TPOT 16.2 → 14.65 ms (935 →
+1030 tok/s; vLLM's 1024/16 aggregate is 940), C4 13.76 → 13.65. Decode-only
+at C16 is now 14.65 vs vLLM's 11.0 ms.
+Lesson recorded in the commit: the unclamped partition underflowed for trailing
+blocks and hung the walk — synccheck showed no barrier fault, so an infinite
+loop, not divergence.
+
 ### Long context and higher concurrency (2026-09-17, first cells)
 
 New cells and matched vLLM references (same client, max-model-len 16384 /
