@@ -1083,6 +1083,7 @@ fn devblob_verify_hook(
     do_oracle: bool,
     bw_bytes_per_cycle: u64,
     clock_hz: u64,
+    nvidia_target: bool,
 ) -> Result<devgen::VerifyHook, Box<dyn std::error::Error>> {
     use lean_verify::checkpoints::schedule as lv;
     Ok(Box::new(move |m: &packet::devbuild::Model| {
@@ -1251,10 +1252,20 @@ fn devblob_verify_hook(
                         } else {
                             return None;
                         };
+                        // The NVIDIA bf16 arms stage x only at M=1: op_gemm.cuh's arena
+                        // overloads of d_gemv_qkv / d_gemv_glu hand M>1 to the row-block walk,
+                        // which reads x from global (and, on sm_90a, from the tensor-core walk).
+                        // The demand model is the kernel's own arithmetic, so report the rows
+                        // the kernel actually stages; AMD's op_gemm.h stages every row.
+                        let staged_rows = if nvidia_target && (name == "GemvQkv" || name == "GemvGlu") {
+                            inst.i[0].min(1)
+                        } else {
+                            inst.i[0]
+                        };
                         Some(serde_json::json!({
                             "op": name,
                             "idx": ix,
-                            "rows": inst.i[0],
+                            "rows": staged_rows,
                             "k": inst.i[2],
                             "scratch": scratch,
                         }))
@@ -1397,6 +1408,7 @@ fn devblob_verify_hook(
     _do_oracle: bool,
     _bw: u64,
     _clock: u64,
+    _nvidia_target: bool,
 ) -> Result<devgen::VerifyHook, Box<dyn std::error::Error>> {
     Ok(devgen::skip_hook(
         "plowc was built without the `lean-verify` cargo feature",
@@ -1561,6 +1573,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             lean_oracle_on,
             bw_bytes_per_cycle,
             spec.clock_boost.0,
+            cli.arch.starts_with("sm_"),
         )?)
     };
     let verify = match (fusion_coverage, verify) {

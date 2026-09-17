@@ -43,10 +43,11 @@ __global__ void __launch_bounds__(256, 1) k_rows(__nv_bfloat16* C, const __nv_bf
                                                  unsigned K) {
     gemv_rows<MM>(C, x, W, M, N, K, blockIdx.x, gridDim.x);
 }
+template <int MT>
 __global__ void __launch_bounds__(256, 1) k_rows_mma(__nv_bfloat16* C, const __nv_bfloat16* x,
                                                      const __nv_bfloat16* W, unsigned M, unsigned N,
                                                      unsigned K) {
-    gemv_rows_mma<false>(C, x, W, M, N, K, blockIdx.x, gridDim.x);
+    gemv_rows_mma<false, MT>(C, x, W, M, N, K, blockIdx.x, gridDim.x);
 }
 template <int MM>
 __global__ void __launch_bounds__(256, 1) k_glu(__nv_bfloat16* C, const __nv_bfloat16* x,
@@ -54,10 +55,11 @@ __global__ void __launch_bounds__(256, 1) k_glu(__nv_bfloat16* C, const __nv_bfl
                                                 unsigned M, unsigned N, unsigned K) {
     gemv_glu_rows<MM>(C, x, Wg, Wu, M, N, K, 0u, blockIdx.x, gridDim.x);
 }
+template <int MT>
 __global__ void __launch_bounds__(256, 1) k_glu_mma(__nv_bfloat16* C, const __nv_bfloat16* x,
                                                     const __nv_bfloat16* Wg, const __nv_bfloat16* Wu,
                                                     unsigned M, unsigned N, unsigned K) {
-    gemv_glu_rows_mma(C, x, Wg, Wu, M, N, K, 0u, blockIdx.x, gridDim.x);
+    gemv_glu_rows_mma<MT>(C, x, Wg, Wu, M, N, K, 0u, blockIdx.x, gridDim.x);
 }
 template <int MM>
 __global__ void __launch_bounds__(256, 1) k_qkv(__nv_bfloat16* Cq, __nv_bfloat16* Ck, __nv_bfloat16* Cv,
@@ -67,12 +69,23 @@ __global__ void __launch_bounds__(256, 1) k_qkv(__nv_bfloat16* Cq, __nv_bfloat16
                                                 unsigned K) {
     gemv_qkv_rows<MM>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, blockIdx.x, gridDim.x);
 }
+template <int MT>
 __global__ void __launch_bounds__(256, 1) k_qkv_mma(__nv_bfloat16* Cq, __nv_bfloat16* Ck, __nv_bfloat16* Cv,
                                                     const __nv_bfloat16* x, const __nv_bfloat16* Wq,
                                                     const __nv_bfloat16* Wk, const __nv_bfloat16* Wv,
                                                     unsigned M, unsigned Nq, unsigned Nk, unsigned Nv,
                                                     unsigned K) {
-    gemv_qkv_rows_mma<false>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, blockIdx.x, gridDim.x);
+    gemv_qkv_rows_mma<false, MT>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, blockIdx.x, gridDim.x);
+}
+/* MT = ceil(M/16): 1, 2 or 4 m-tiles per weight pass (the interpreter's GV_MM_MAX rungs). */
+template <class... A> static void launch_rows_mma(unsigned M, A... a) {
+    if (M <= 16) k_rows_mma<1><<<GRID, BLOCK>>>(a...); else if (M <= 32) k_rows_mma<2><<<GRID, BLOCK>>>(a...); else k_rows_mma<4><<<GRID, BLOCK>>>(a...);
+}
+template <class... A> static void launch_glu_mma(unsigned M, A... a) {
+    if (M <= 16) k_glu_mma<1><<<GRID, BLOCK>>>(a...); else if (M <= 32) k_glu_mma<2><<<GRID, BLOCK>>>(a...); else k_glu_mma<4><<<GRID, BLOCK>>>(a...);
+}
+template <class... A> static void launch_qkv_mma(unsigned M, A... a) {
+    if (M <= 16) k_qkv_mma<1><<<GRID, BLOCK>>>(a...); else if (M <= 32) k_qkv_mma<2><<<GRID, BLOCK>>>(a...); else k_qkv_mma<4><<<GRID, BLOCK>>>(a...);
 }
 
 static void fill(std::vector<__nv_bfloat16>& v, unsigned seed) {
@@ -134,8 +147,8 @@ int main(int argc, char** argv) {
         fill(hx, 1); fill(hW, 2);
         std::vector<float> ref; cpu_gemv(ref, hx, hW, M, s.N, s.K);
         __nv_bfloat16 *dx = up(hx), *dW = up(hW), *dC = up(hC);
-        auto run_ref = [&] { k_rows<16><<<GRID, BLOCK>>>(dC, dx, dW, M, s.N, s.K); };
-        auto run_mma = [&] { k_rows_mma<<<GRID, BLOCK>>>(dC, dx, dW, M, s.N, s.K); };
+        auto run_ref = [&] { if (M <= 16) k_rows<16><<<GRID, BLOCK>>>(dC, dx, dW, M, s.N, s.K); else if (M <= 32) k_rows<32><<<GRID, BLOCK>>>(dC, dx, dW, M, s.N, s.K); else k_rows<64><<<GRID, BLOCK>>>(dC, dx, dW, M, s.N, s.K); };
+        auto run_mma = [&] { launch_rows_mma(M, dC, dx, dW, M, s.N, s.K); };
         CK(cudaMemset(dC, 0, hC.size() * 2)); run_ref(); CK(cudaDeviceSynchronize());
         CK(cudaMemcpy(hC.data(), dC, hC.size() * 2, cudaMemcpyDeviceToHost)); const double e_ref = relL2(ref, hC);
         CK(cudaMemset(dC, 0, hC.size() * 2)); run_mma(); CK(cudaDeviceSynchronize());
@@ -155,8 +168,8 @@ int main(int argc, char** argv) {
         std::vector<float> ref(rg.size());
         for (size_t i = 0; i < ref.size(); i++) ref[i] = gelu_tanh(rg[i]) * ru[i];
         __nv_bfloat16 *dx = up(hx), *dG = up(hG), *dU = up(hU), *dC = up(hC);
-        auto run_ref = [&] { k_glu<16><<<GRID, BLOCK>>>(dC, dx, dG, dU, M, N, K); };
-        auto run_mma = [&] { k_glu_mma<<<GRID, BLOCK>>>(dC, dx, dG, dU, M, N, K); };
+        auto run_ref = [&] { if (M <= 16) k_glu<16><<<GRID, BLOCK>>>(dC, dx, dG, dU, M, N, K); else if (M <= 32) k_glu<32><<<GRID, BLOCK>>>(dC, dx, dG, dU, M, N, K); else k_glu<64><<<GRID, BLOCK>>>(dC, dx, dG, dU, M, N, K); };
+        auto run_mma = [&] { launch_glu_mma(M, dC, dx, dG, dU, M, N, K); };
         run_ref(); CK(cudaDeviceSynchronize()); CK(cudaMemcpy(hC.data(), dC, hC.size() * 2, cudaMemcpyDeviceToHost)); const double e_ref = relL2(ref, hC);
         CK(cudaMemset(dC, 0, hC.size() * 2)); run_mma(); CK(cudaDeviceSynchronize()); CK(cudaMemcpy(hC.data(), dC, hC.size() * 2, cudaMemcpyDeviceToHost)); const double e_mma = relL2(ref, hC);
         const float t_ref = time_ms(run_ref), t_mma = time_ms(run_mma);
@@ -173,8 +186,8 @@ int main(int argc, char** argv) {
         fill(hx, 6); fill(hWq, 7); fill(hWk, 8); fill(hWv, 9);
         std::vector<float> rq, rk, rv; cpu_gemv(rq, hx, hWq, M, Nq, K); cpu_gemv(rk, hx, hWk, M, Nk, K); cpu_gemv(rv, hx, hWv, M, Nv, K);
         __nv_bfloat16 *dx = up(hx), *dWq = up(hWq), *dWk = up(hWk), *dWv = up(hWv), *dCq = up(hCq), *dCk = up(hCk), *dCv = up(hCv);
-        auto run_ref = [&] { k_qkv<16><<<GRID, BLOCK>>>(dCq, dCk, dCv, dx, dWq, dWk, dWv, M, Nq, Nk, Nv, K); };
-        auto run_mma = [&] { k_qkv_mma<<<GRID, BLOCK>>>(dCq, dCk, dCv, dx, dWq, dWk, dWv, M, Nq, Nk, Nv, K); };
+        auto run_ref = [&] { if (M <= 16) k_qkv<16><<<GRID, BLOCK>>>(dCq, dCk, dCv, dx, dWq, dWk, dWv, M, Nq, Nk, Nv, K); else if (M <= 32) k_qkv<32><<<GRID, BLOCK>>>(dCq, dCk, dCv, dx, dWq, dWk, dWv, M, Nq, Nk, Nv, K); else k_qkv<64><<<GRID, BLOCK>>>(dCq, dCk, dCv, dx, dWq, dWk, dWv, M, Nq, Nk, Nv, K); };
+        auto run_mma = [&] { launch_qkv_mma(M, dCq, dCk, dCv, dx, dWq, dWk, dWv, M, Nq, Nk, Nv, K); };
         auto check = [&](double& eq, double& ek, double& ev) {
             CK(cudaMemcpy(hCq.data(), dCq, hCq.size() * 2, cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(hCk.data(), dCk, hCk.size() * 2, cudaMemcpyDeviceToHost));

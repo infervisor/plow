@@ -31,7 +31,7 @@
 #endif
 /* k32 steps in flight per lane: UNB x (NW x 16 B) of weight loads before the first mma. */
 #ifndef PLOW_NV_GEMV_MMA_UNB
-#define PLOW_NV_GEMV_MMA_UNB 4
+#define PLOW_NV_GEMV_MMA_UNB 8
 #endif
 
 static __device__ __forceinline__ __nv_bfloat16 gemma_glu_epilogue(float gate, float up,
@@ -46,28 +46,36 @@ __device__ __forceinline__ void gvmma_mma16816(float (&d)[4], unsigned a0, unsig
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-/* acc[i] is the mma C fragment of x[0..16) x W[i][nb..nb+8)^T: lane (g,t) holds
- * C[g][2t], C[g][2t+1], C[g+8][2t], C[g+8][2t+1]. */
-template <int NW>
-__device__ __forceinline__ void gvmma_tile(float (&acc)[NW][4], const __nv_bfloat16* __restrict__ x,
+/* acc[i][mt] is the mma C fragment of x[16mt..16mt+16) x W[i][nb..nb+8)^T: lane (g,t) holds
+ * C[g][2t], C[g][2t+1], C[g+8][2t], C[g+8][2t+1]. MT m-tiles share one weight pass, so a 32- or
+ * 64-row rung still streams the weights once. */
+template <int NW, int MT>
+__device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_bfloat16* __restrict__ x,
                                            const __nv_bfloat16* const (&W)[NW], unsigned nb,
                                            unsigned rows, unsigned N, unsigned K) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned g = lane >> 2, t = lane & 3;
-    const __nv_bfloat16* x0 = x + (size_t)(g < rows ? g : 0u) * K;
-    const __nv_bfloat16* x1 = x + (size_t)(g + 8u < rows ? g + 8u : 0u) * K;
+    const __nv_bfloat16* xr[MT][2];
+#pragma unroll
+    for (int mt = 0; mt < MT; mt++) {
+        const unsigned r0 = 16u * mt + g, r1 = r0 + 8u;
+        xr[mt][0] = x + (size_t)(r0 < rows ? r0 : 0u) * K + t * 8u;
+        xr[mt][1] = x + (size_t)(r1 < rows ? r1 : 0u) * K + t * 8u;
+    }
     const unsigned n = nb + g;
     const __nv_bfloat16* w[NW];
 #pragma unroll
     for (int i = 0; i < NW; i++) w[i] = W[i] + (size_t)(n < N ? n : 0u) * K + t * 8u;
-    x0 += t * 8u;
-    x1 += t * 8u;
 #pragma unroll
     for (int i = 0; i < NW; i++)
 #pragma unroll
-        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+        for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+            for (int j = 0; j < 4; j++) acc[i][mt][j] = 0.0f;
 
-    constexpr unsigned UNB = PLOW_NV_GEMV_MMA_UNB;
+    /* Loads in flight scale down with the tile count: MT=4 (the 64-row rung) at the full depth
+     * pushed the sm_90a decode object to 255 regs + 3.7 KB spills; depth 8/MT keeps it clean. */
+    constexpr unsigned UNB = (PLOW_NV_GEMV_MMA_UNB / MT) < 2u ? 2u : (PLOW_NV_GEMV_MMA_UNB / MT);
     const unsigned nkb = K >> 5;
     unsigned kb = 0;
     for (; kb + UNB <= nkb; kb += UNB) {
@@ -78,23 +86,31 @@ __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][4], const __nv_bfloa
             for (int i = 0; i < NW; i++) wv[i][u] = *(const uint4*)(w[i] + (kb + u) * 32u);
 #pragma unroll
         for (unsigned u = 0; u < UNB; u++) {
-            const uint4 a0 = *(const uint4*)(x0 + (kb + u) * 32u);
-            const uint4 a1 = *(const uint4*)(x1 + (kb + u) * 32u);
 #pragma unroll
-            for (int i = 0; i < NW; i++) {
-                gvmma_mma16816(acc[i], a0.x, a1.x, a0.y, a1.y, wv[i][u].x, wv[i][u].y);
-                gvmma_mma16816(acc[i], a0.z, a1.z, a0.w, a1.w, wv[i][u].z, wv[i][u].w);
+            for (int mt = 0; mt < MT; mt++) {
+                const uint4 a0 = *(const uint4*)(xr[mt][0] + (kb + u) * 32u);
+                const uint4 a1 = *(const uint4*)(xr[mt][1] + (kb + u) * 32u);
+#pragma unroll
+                for (int i = 0; i < NW; i++) {
+                    gvmma_mma16816(acc[i][mt], a0.x, a1.x, a0.y, a1.y, wv[i][u].x, wv[i][u].y);
+                    gvmma_mma16816(acc[i][mt], a0.z, a1.z, a0.w, a1.w, wv[i][u].z, wv[i][u].w);
+                }
             }
         }
     }
     for (; kb < nkb; kb++) {
-        const uint4 a0 = *(const uint4*)(x0 + kb * 32u);
-        const uint4 a1 = *(const uint4*)(x1 + kb * 32u);
+        uint4 wv[NW];
 #pragma unroll
-        for (int i = 0; i < NW; i++) {
-            const uint4 wv = *(const uint4*)(w[i] + kb * 32u);
-            gvmma_mma16816(acc[i], a0.x, a1.x, a0.y, a1.y, wv.x, wv.y);
-            gvmma_mma16816(acc[i], a0.z, a1.z, a0.w, a1.w, wv.z, wv.w);
+        for (int i = 0; i < NW; i++) wv[i] = *(const uint4*)(w[i] + kb * 32u);
+#pragma unroll
+        for (int mt = 0; mt < MT; mt++) {
+            const uint4 a0 = *(const uint4*)(xr[mt][0] + kb * 32u);
+            const uint4 a1 = *(const uint4*)(xr[mt][1] + kb * 32u);
+#pragma unroll
+            for (int i = 0; i < NW; i++) {
+                gvmma_mma16816(acc[i][mt], a0.x, a1.x, a0.y, a1.y, wv[i].x, wv[i].y);
+                gvmma_mma16816(acc[i][mt], a0.z, a1.z, a0.w, a1.w, wv[i].z, wv[i].w);
+            }
         }
     }
 }
@@ -120,7 +136,7 @@ __device__ __forceinline__ void gvmma_store2(__nv_bfloat16* C, unsigned N, unsig
     }
 }
 
-template <bool BIAS>
+template <bool BIAS, int MT = 1>
 __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
                                               const __nv_bfloat16* __restrict__ x,
                                               const __nv_bfloat16* __restrict__ W, unsigned rows,
@@ -133,20 +149,24 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
     const gvmma_range r = gvmma_partition(N, slice, nblk);
     const __nv_bfloat16* const W1[1] = {W};
     for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
-        float acc[1][4];
-        gvmma_tile<1>(acc, x, W1, rb << 3, rows, N, K);
+        float acc[1][MT][4];
+        gvmma_tile<1, MT>(acc, x, W1, rb << 3, rows, N, K);
         const unsigned n = (rb << 3) + 2u * t;
-        float c0 = acc[0][0], c1 = acc[0][1], c2 = acc[0][2], c3 = acc[0][3];
+        float b0 = 0.0f, b1 = 0.0f;
         if constexpr (BIAS) {
-            const float b0 = (n < N) ? __bfloat162float(bias[n]) : 0.0f;
-            const float b1 = (n + 1u < N) ? __bfloat162float(bias[n + 1u]) : 0.0f;
-            c0 += b0; c1 += b1; c2 += b0; c3 += b1;
+            b0 = (n < N) ? __bfloat162float(bias[n]) : 0.0f;
+            b1 = (n + 1u < N) ? __bfloat162float(bias[n + 1u]) : 0.0f;
         }
-        if (g < rows) gvmma_store2(C, N, g, n, c0, c1);
-        if (g + 8u < rows) gvmma_store2(C, N, g + 8u, n, c2, c3);
+#pragma unroll
+        for (int mt = 0; mt < MT; mt++) {
+            const unsigned m0 = 16u * mt + g;
+            if (m0 < rows) gvmma_store2(C, N, m0, n, acc[0][mt][0] + b0, acc[0][mt][1] + b1);
+            if (m0 + 8u < rows) gvmma_store2(C, N, m0 + 8u, n, acc[0][mt][2] + b0, acc[0][mt][3] + b1);
+        }
     }
 }
 
+template <int MT = 1>
 __device__ __forceinline__ void gemv_glu_rows_mma(__nv_bfloat16* __restrict__ C,
                                                   const __nv_bfloat16* __restrict__ x,
                                                   const __nv_bfloat16* __restrict__ Wg,
@@ -159,24 +179,27 @@ __device__ __forceinline__ void gemv_glu_rows_mma(__nv_bfloat16* __restrict__ C,
     const gvmma_range r = gvmma_partition(N, slice, nblk);
     const __nv_bfloat16* const W2[2] = {Wg, Wu};
     for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
-        float acc[2][4];
-        gvmma_tile<2>(acc, x, W2, rb << 3, rows, N, K);
+        float acc[2][MT][4];
+        gvmma_tile<2, MT>(acc, x, W2, rb << 3, rows, N, K);
         const unsigned n = (rb << 3) + 2u * t;
-        if (g < rows) {
-            if (n < N) C[(size_t)g * N + n] = gemma_glu_epilogue(acc[0][0], acc[1][0], act);
-            if (n + 1u < N) C[(size_t)g * N + n + 1u] = gemma_glu_epilogue(acc[0][1], acc[1][1], act);
-        }
-        if (g + 8u < rows) {
-            if (n < N) C[(size_t)(g + 8u) * N + n] = gemma_glu_epilogue(acc[0][2], acc[1][2], act);
-            if (n + 1u < N)
-                C[(size_t)(g + 8u) * N + n + 1u] = gemma_glu_epilogue(acc[0][3], acc[1][3], act);
+#pragma unroll
+        for (int mt = 0; mt < MT; mt++) {
+            const unsigned m0 = 16u * mt + g, m1 = m0 + 8u;
+            if (m0 < rows) {
+                if (n < N) C[(size_t)m0 * N + n] = gemma_glu_epilogue(acc[0][mt][0], acc[1][mt][0], act);
+                if (n + 1u < N) C[(size_t)m0 * N + n + 1u] = gemma_glu_epilogue(acc[0][mt][1], acc[1][mt][1], act);
+            }
+            if (m1 < rows) {
+                if (n < N) C[(size_t)m1 * N + n] = gemma_glu_epilogue(acc[0][mt][2], acc[1][mt][2], act);
+                if (n + 1u < N) C[(size_t)m1 * N + n + 1u] = gemma_glu_epilogue(acc[0][mt][3], acc[1][mt][3], act);
+            }
         }
     }
 }
 
 /* Fused q|k|v: row blocks over the concatenated [0, Nq+Nk+Nv); Nq % 8 == Nk % 8 == 0 (caller
  * checks) so a block lies inside one matrix. */
-template <bool BIAS>
+template <bool BIAS, int MT = 1>
 __device__ __forceinline__ void gemv_qkv_rows_mma(
     __nv_bfloat16* Cq, __nv_bfloat16* Ck, __nv_bfloat16* Cv, const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ Wq, const __nv_bfloat16* __restrict__ Wk,
@@ -197,16 +220,19 @@ __device__ __forceinline__ void gemv_qkv_rows_mma(
         else if (gn < Nq + Nk) { W = Wk; C = Ck; Nx = Nk; n0 = Nq; bias = bk; }
         else { W = Wv; C = Cv; Nx = Nv; n0 = Nq + Nk; bias = bv; }
         const __nv_bfloat16* const W1[1] = {W};
-        float acc[1][4];
-        gvmma_tile<1>(acc, x, W1, gn - n0, rows, Nx, K);
+        float acc[1][MT][4];
+        gvmma_tile<1, MT>(acc, x, W1, gn - n0, rows, Nx, K);
         const unsigned n = (gn - n0) + 2u * t;
-        float c0 = acc[0][0], c1 = acc[0][1], c2 = acc[0][2], c3 = acc[0][3];
+        float b0 = 0.0f, b1 = 0.0f;
         if constexpr (BIAS) {
-            const float b0 = (n < Nx) ? __bfloat162float(bias[n]) : 0.0f;
-            const float b1 = (n + 1u < Nx) ? __bfloat162float(bias[n + 1u]) : 0.0f;
-            c0 += b0; c1 += b1; c2 += b0; c3 += b1;
+            b0 = (n < Nx) ? __bfloat162float(bias[n]) : 0.0f;
+            b1 = (n + 1u < Nx) ? __bfloat162float(bias[n + 1u]) : 0.0f;
         }
-        if (g < rows) gvmma_store2(C, Nx, g, n, c0, c1);
-        if (g + 8u < rows) gvmma_store2(C, Nx, g + 8u, n, c2, c3);
+#pragma unroll
+        for (int mt = 0; mt < MT; mt++) {
+            const unsigned m0 = 16u * mt + g;
+            if (m0 < rows) gvmma_store2(C, Nx, m0, n, acc[0][mt][0] + b0, acc[0][mt][1] + b1);
+            if (m0 + 8u < rows) gvmma_store2(C, Nx, m0 + 8u, n, acc[0][mt][2] + b0, acc[0][mt][3] + b1);
+        }
     }
 }

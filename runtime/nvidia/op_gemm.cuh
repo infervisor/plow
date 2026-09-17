@@ -142,13 +142,21 @@ __device__ __forceinline__ void gemv_rows(__nv_bfloat16* __restrict__ C,
                                           unsigned N, unsigned K, unsigned slice, unsigned nblk,
                                           const __nv_bfloat16* __restrict__ bias = nullptr) {
 #if PLOW_NV_GEMV_MMA
-    /* BATCH>=4 rungs on the tensor cores (op_gemv_mma.cuh); the dot8 walk stays for K % 32 != 0
-     * and for the 2-row rung (unmeasured there). */
+    /* BATCH>=4 rungs on the tensor cores (op_gemv_mma.cuh); the 2-row rung stays on dot8
+     * (unmeasured there). K % 32 != 0 (no shipped Gemma shape) walks 4-row dot8 sub-blocks
+     * instead of instantiating a wide dot8 body: gemv_rows<64>'s 64 accumulators alone put the
+     * sm_90a decode object at 255 regs + 3.7 KB spills even though it never runs. */
     if constexpr (MM >= 4) {
         if ((K & 31u) == 0u) {
-            gemv_rows_mma<BIAS>(C, x, W, M, N, K, slice, nblk, bias);
-            return;
+            gemv_rows_mma<BIAS, (MM + 15) / 16>(C, x, W, M, N, K, slice, nblk, bias);
+        } else {
+            for (unsigned m0 = 0; m0 < M; m0 += 4u) {
+                const unsigned rows = (M - m0 < 4u) ? (M - m0) : 4u;
+                gemv_rows<4, gv_un<4>::v, BIAS>(C + (size_t)m0 * N, x + (size_t)m0 * K, W, rows,
+                                                N, K, slice, nblk, bias);
+            }
         }
+        return;
     }
 #endif
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
@@ -560,9 +568,16 @@ __device__ __forceinline__ void gemv_qkv_rows(__nv_bfloat16* Cq, __nv_bfloat16* 
 #if PLOW_NV_GEMV_MMA
     if constexpr (MM >= 4) {
         if ((K & 31u) == 0u && ((Nq | Nk) & 7u) == 0u) {
-            gemv_qkv_rows_mma<BIAS>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, slice, nblk, bq, bk, bv);
-            return;
+            gemv_qkv_rows_mma<BIAS, (MM + 15) / 16>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, slice, nblk, bq, bk, bv);
+        } else {
+            for (unsigned m0 = 0; m0 < M; m0 += 4u) {
+                const unsigned rows = (M - m0 < 4u) ? (M - m0) : 4u;
+                gemv_qkv_rows<4, gv_un<4>::v, BIAS>(
+                    Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk, Cv + (size_t)m0 * Nv,
+                    x + (size_t)m0 * K, Wq, Wk, Wv, rows, Nq, Nk, Nv, K, slice, nblk, bq, bk, bv);
+            }
         }
+        return;
     }
 #endif
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
@@ -2326,9 +2341,15 @@ __device__ __forceinline__ void gemv_glu_rows(__nv_bfloat16* C, const __nv_bfloa
 #if PLOW_NV_GEMV_MMA
     if constexpr (MM >= 4) {
         if ((K & 31u) == 0u) {
-            gemv_glu_rows_mma(C, x, Wg, Wu, M, N, K, act, slice, nblk);
-            return;
+            gemv_glu_rows_mma<(MM + 15) / 16>(C, x, Wg, Wu, M, N, K, act, slice, nblk);
+        } else {
+            for (unsigned m0 = 0; m0 < M; m0 += 4u) {
+                const unsigned rows = (M - m0 < 4u) ? (M - m0) : 4u;
+                gemv_glu_rows<4>(C + (size_t)m0 * N, x + (size_t)m0 * K, Wg, Wu, rows, N, K, act,
+                                 slice, nblk);
+            }
         }
+        return;
     }
 #endif
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;

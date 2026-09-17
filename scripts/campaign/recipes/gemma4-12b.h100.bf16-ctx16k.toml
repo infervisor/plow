@@ -1,0 +1,86 @@
+# Gemma-4-12B-it, H100 SXM5, BF16 weights + BF16 KV, TP1: the qualified attention roles with
+# gate/up on cuBLASLt (the fused GLU role measured ~20% of peak and is off).
+# Measured 2026-09-17 (C1, provisional/co-tenant): TTFT 42.2 / 56.4 / 204.2 ms, TPOT 12.0-13.3 ms.
+# The two Lt knobs are the sm_90a BF16 production default since this measurement; they stay
+# explicit here because the recipe is the source of the build.
+
+[cell]
+name = "gemma4-12b.h100.bf16-ctx16k"
+model = "google/gemma-4-12B-it"
+revision = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+hf_dir = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "bf16"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_SEG_PURE_GEMM = "1"
+PLOW_SEG_FA512 = "1"
+PLOW_SEG_FA256_GQA2 = "1"
+PLOW_TMA_GEMM = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"   # projections and gate/up on cuBLASLt (policy: plow-asset segment_roles)
+PLOW_NO_GLU_FUSE = "1"             # gate/up as two GEMMs + GeGLU pass; the fused role is off
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"  # 32 is refused by LdsFitSound: the QKV arm stages rows x k in the 73728-half arena
+PLOW_MAX_CHUNK = "4096"     # the HD512 role needs the 4096/8192-row rungs; sliding ring 8192 rows -> ~3 GiB per slot at ctx 16384, 16 slots
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = [
+  "interp_sm90a_pfattn_hd512_px4_bq64.cubin",
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+  "interp_sm90a_pfgemm_glu_gemma4.cubin",
+]
+[objects.env]
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
+
+[serve.env]
+# vLLM 0.28 reference ran with prefix caching disabled; match it. A realtime-chat profile may
+# turn it on, but then the reference must too.
+PLOW_PREFIX_CACHE = "0"
+# Mirrors of the emit-side classing; a mismatch is a wrong-object launch.
+PLOW_PF_SEG_PURE = "1"
+PLOW_PF_SEG_FA512 = "1"
+# plowrt dlopens libcublasLt by soname; the host toolkit is not on the nix loader path.
+LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
+# PLOW_PF_SEG_DIR is the build's objects/ dir; set it at bench time:
+#   serve.env.PLOW_PF_SEG_DIR = "<out>/objects"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 16
+seed = 42
+tokenizer = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+model_id = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer in one short sentence.<end_of_turn>\n<start_of_turn>model\n"
+
+# Realtime owns C1-C4 latency (TTFT + TPOT, per-token streaming). Throughput owns C4-C16
+# output tok/s at long context; it needs a packet emitted with the full decode ladder
+# (PLOW_DECODE_BATCH_LADDER=1,2,4,8,16 -> 41 GiB KV at ctx 8192 -> the GPU must be free).
+[bench.profiles.realtime]
+in_lens = "128 1024 4096"
+concs = "1 4"
+serve_env = { PLOW_MULTISTEP = "0" }
+
+[bench.profiles.throughput]
+in_lens = "8192 15000"
+concs = "4 16"
+serve_env = { PLOW_MULTISTEP = "8" }
+
+[reference]
+csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.csv"
