@@ -250,6 +250,30 @@ Read plainly:
 - Provisional: gpulease stamped the run contended (idle co-tenant), ladder-1
   packet. C4/C16 need the co-tenant gone.
 
+### C1 result with the qualified H100 prefill roles — provisional
+
+Same protocol, same co-tenant caveat. Emit: `PLOW_SEG_PURE_GEMM=1
+PLOW_SEG_FA512=1 PLOW_SEG_FA256_GQA2=1 PLOW_TMA_GEMM=1` + the three
+`PLOW_GEMMA4_SM90_*_ROLE=1` + `--segmented`; objects from
+`build_sm90a_gemma4_segments.sh` with `PLOW_CUBIN_CONFIG`,
+`PLOW_BUILD_FA_GQA2_PAIR=1`, `PLOW_BUILD_PFATTN_HD256_BKV32=1`,
+`PLOW_BUILD_PFATTN_HD256_GQA2_BKV32=1`, `PLOW_BUILD_PFATTN_HD512_PX4_BQ64=1`
+(px4 direct entry 128 registers, zero stack/spills); serve mirrors
+`PLOW_PF_SEG_DIR`, `PLOW_PF_SEG_PURE=1`, `PLOW_PF_SEG_FA512=1`. The role
+objects are looked up in the emit `--out` dir, so the order is base emit →
+objects → role emit.
+
+| in | Plow TTFT | vs plain packet | vLLM BF16 | vLLM FP8 | Plow TPOT | vLLM BF16 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 42.23 | 46.98 | 28.19 | 28.15 | 12.00 | 10.55 |
+| 1024 | 89.75 | 164.72 | 46.71 | 37.83 | 12.62 | 10.62 |
+| 4096 | 213.58 | 654.74 | 170.17 | 134.34 | 13.22 | 10.64 |
+
+The recipe reproduces the campaign's recorded 221.6 ms at 4K. Prefill is now
+1.25× vLLM BF16 at 4K and 1.5–1.9× at ≤1K (small-M under-occupancy: the emit
+audit shows 15–60 GEMM tiles over 132 SMs at M≤1024). Decode is unchanged —
+the roles are prefill-only — and remains the realtime gap.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
