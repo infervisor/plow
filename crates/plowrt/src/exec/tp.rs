@@ -88,6 +88,21 @@ pub const XCTR_STRIDE: usize = 128;
 /// Alignment of every sub-region inside the peer scratch.
 const PEER_ALIGN: u64 = XCTR_STRIDE as u64;
 
+/// A collective's deadline bail writes `0xDEAD0000 | rank` (`op_collective.h`).
+pub(crate) fn is_deadline_status(status: u32) -> bool {
+    status & 0xFFFF_FF00 == 0xDEAD_0000
+}
+
+/// A gate short of its arrivals is a peer that missed the deadline; an over-count is a stale
+/// counter from an earlier dispatch, which a re-run would repeat.
+pub(crate) fn gate_error(v: u32, want: u32, msg: String) -> RuntimeError {
+    if v < want {
+        RuntimeError::CollectiveBail(msg)
+    } else {
+        RuntimeError::Device(msg)
+    }
+}
+
 /// COARSE peer-scratch layout — one peer-mapped
 /// region per GPU, laid out identically on every rank.
 ///
@@ -658,7 +673,7 @@ impl TpGroup {
                 let at = gate * XCTR_STRIDE;
                 let v = u32::from_le_bytes(buf[at..at + 4].try_into().expect("4 B"));
                 if v != want {
-                    return Err(RuntimeError::Device(format!(
+                    let msg = format!(
                         "cross-GPU gate {gate} on rank {} reads {v}, expected {want}. \
                          {} The reduction did not complete as compiled, so a layer's \
                          output is not the sum of the ranks' partials and the token is \
@@ -672,7 +687,8 @@ impl TpGroup {
                              survived from a previous dispatch (xctr must be zeroed on \
                              every rank before any rank launches)."
                         }
-                    )));
+                    );
+                    return Err(gate_error(v, want, msg));
                 }
             }
         }
@@ -697,11 +713,12 @@ impl TpGroup {
                 // 128-byte slot within the allocation, and the dispatch drained.
                 let v = unsafe { std::ptr::read_volatile(ptr) };
                 if v != *want {
-                    return Err(RuntimeError::Device(format!(
+                    let msg = format!(
                         "cross-GPU gate {gate} on rank {} reads {v}, expected {want}. \
                          Direct audit found an incomplete or stale collective.",
                         r.rank
-                    )));
+                    );
+                    return Err(gate_error(v, *want, msg));
                 }
             }
         }
@@ -722,10 +739,15 @@ impl TpGroup {
             // and all interpreter and audit dispatches have drained.
             let status = unsafe { std::ptr::read_volatile(r.xstatus as *const u32) };
             if status != 0 {
-                return Err(RuntimeError::Device(format!(
+                let msg = format!(
                     "compact cross-GPU audit failed on rank {} (status {status:#010x})",
                     r.rank
-                )));
+                );
+                return Err(if is_deadline_status(status) {
+                    RuntimeError::CollectiveBail(msg)
+                } else {
+                    RuntimeError::Device(msg)
+                });
             }
         }
         Ok(())

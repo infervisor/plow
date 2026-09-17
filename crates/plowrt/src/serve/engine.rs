@@ -394,6 +394,11 @@ mod amd_serve {
         Tp(AmdTpGroup),
     }
 
+    /// Re-runs of a decode dispatch whose collective missed its deadline. A peer queue stalled
+    /// by the driver (KFD eviction) recovers within one deadline; two stalls in a row on the
+    /// same step are treated as a real fault and fail the fed requests.
+    const COLLECTIVE_BAIL_RETRIES: usize = 2;
+
     const DEFAULT_SNAPSHOT_TENSORS: &str = "act.qa,act.oat,act.attn,act.xn";
     const MAX_SNAPSHOT_TENSORS: usize = 16;
     const MAX_SNAPSHOT_TENSOR_NAME: usize = 128;
@@ -1958,7 +1963,14 @@ mod amd_serve {
             g.kv_rebase_all(slot)?;
             let rebase_ns = t.elapsed().as_nanos() as u64;
             let t = std::time::Instant::now();
-            let r = g.prefill_chunk(prompt, step, cur.steps.get(cur.next + 1).copied());
+            let next = cur.steps.get(cur.next + 1).copied();
+            // The cursor moves only on success, so a re-run rewrites the same rows.
+            let mut r = g.prefill_chunk(prompt, step, next);
+            for retry in 1..=COLLECTIVE_BAIL_RETRIES {
+                let Err(err @ RuntimeError::CollectiveBail(_)) = &r else { break };
+                tracing::warn!(slot, c0 = step.c0, error = %err, retry, "amd: prefill collective missed its deadline; re-running the chunk");
+                r = g.prefill_chunk(prompt, step, next);
+            }
             let chunk_ns = t.elapsed().as_nanos() as u64;
             let t = std::time::Instant::now();
             let restore = g.kv_rebase_all(0);
@@ -2973,7 +2985,15 @@ mod amd_serve {
                 )));
             }
 
-            let result = (|| -> Result<()> {
+            // Rows the quantum has advanced so far. A bail discards the whole quantum — nothing
+            // has been read back — so a retry rewinds them and re-runs from the host seeds,
+            // rewriting the same KV rows.
+            let mut done = 0u32;
+            let mut run = || -> Result<()> {
+                for &slot in &advance {
+                    self.pos[slot] -= done;
+                }
+                done = 0;
                 let dp = self.ranks.rank0().decode_prog_for(rows);
                 let width = self.ranks.rank0().prog_t(dp);
                 if width != self.last_rung {
@@ -3021,6 +3041,7 @@ mod amd_serve {
                         for &slot in &advance {
                             self.pos[slot] += 1;
                         }
+                        done += 1;
                     }
                     match &mut self.ranks {
                         Ranks::One(e) => e.read_token_capture(width as usize, quantum, out),
@@ -3040,7 +3061,13 @@ mod amd_serve {
                         });
                 }
                 dispatch
-            })();
+            };
+            let mut result = run();
+            for retry in 1..=COLLECTIVE_BAIL_RETRIES {
+                let Err(err @ RuntimeError::CollectiveBail(_)) = &result else { break };
+                tracing::warn!(error = %err, retry, quantum, "amd: decode collective missed its deadline; re-running the quantum");
+                result = run();
+            }
             self.advance_stage = advance;
             result?;
             Ok(quantum)
@@ -3065,7 +3092,13 @@ mod amd_serve {
             let mut advance = std::mem::take(&mut self.advance_stage);
             advance.clear();
             advance.extend(feeds.iter().map(|&(s, _)| s));
-            let result = self.dispatch_all(&advance);
+            // A failed dispatch advanced no position, so a re-run rewrites the same KV rows.
+            let mut result = self.dispatch_all(&advance);
+            for retry in 1..=COLLECTIVE_BAIL_RETRIES {
+                let Err(err @ RuntimeError::CollectiveBail(_)) = &result else { break };
+                tracing::warn!(error = %err, retry, "amd: decode collective missed its deadline; re-running the step");
+                result = self.dispatch_all(&advance);
+            }
             self.advance_stage = advance;
             let out = result?;
             Ok(feeds.iter().map(|&(s, _)| (s, out[s])).collect())

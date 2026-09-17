@@ -184,7 +184,9 @@ use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::HsaBackend;
 use crate::device::Backend;
 use crate::exec::amd::{AmdEngine, ChunkStep, TpBind};
-use crate::exec::tp::{PeerLayout, TpGroup, XctrReset, PARTIAL_SLOTS, XCTR_STRIDE};
+use crate::exec::tp::{
+    gate_error, is_deadline_status, PeerLayout, TpGroup, XctrReset, PARTIAL_SLOTS, XCTR_STRIDE,
+};
 use crate::{Result, RuntimeError};
 use packet::dev::PrefillSpan;
 
@@ -2173,16 +2175,21 @@ fn check_xstate(rank: u32, buf: &[u8], expect: &[Option<u32>]) -> Result<()> {
     let word = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().expect("4 B"));
     let status = word(expect.len() * XCTR_STRIDE);
     if status != 0 {
-        return Err(RuntimeError::Device(format!(
+        let msg = format!(
             "cross-GPU status on rank {rank} is {status:#010x}: a collective bailed at its \
              deadline and returned WITHOUT reducing, or the device recorded another fault"
-        )));
+        );
+        return Err(if is_deadline_status(status) {
+            RuntimeError::CollectiveBail(msg)
+        } else {
+            RuntimeError::Device(msg)
+        });
     }
     for (gate, want) in expect.iter().enumerate() {
         let Some(want) = *want else { continue };
         let v = word(gate * XCTR_STRIDE);
         if v != want {
-            return Err(RuntimeError::Device(format!(
+            let msg = format!(
                 "cross-GPU gate {gate} on rank {rank} reads {v}, expected {want}. {}",
                 if v < want {
                     "Some rank never arrived — a collective hit its deadline and returned \
@@ -2191,7 +2198,8 @@ fn check_xstate(rank: u32, buf: &[u8], expect: &[Option<u32>]) -> Result<()> {
                     "MORE arrivals than the program can produce — a stale count survived from a \
                      previous dispatch."
                 }
-            )));
+            );
+            return Err(gate_error(v, want, msg));
         }
     }
     Ok(())
@@ -2502,6 +2510,11 @@ mod tests {
         assert!(err(buf([8, 0, 0, 72], 0)).contains("gate 3"));
         // Complete counts, bailed collective: only the status word shows it.
         assert!(err(buf([8, 0, 0, 64], 0xdead_0005)).contains("0xdead0005"));
+        let kind = |b: Vec<u8>| check_xstate(3, &b, &expect).unwrap_err();
+        assert!(matches!(kind(buf([8, 0, 0, 64], 0xdead_0005)), RuntimeError::CollectiveBail(_)));
+        assert!(matches!(kind(buf([7, 0, 0, 64], 0)), RuntimeError::CollectiveBail(_)));
+        assert!(matches!(kind(buf([8, 0, 0, 72], 0)), RuntimeError::Device(_)));
+        assert!(matches!(kind(buf([8, 0, 0, 64], 0x1)), RuntimeError::Device(_)));
     }
 
     /// The tagged one-shot's blob contract (`check_xr_tagged_blob`): the decode program's
