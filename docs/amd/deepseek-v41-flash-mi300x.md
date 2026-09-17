@@ -5866,3 +5866,71 @@ win available on the seam; what remains is arithmetic efficiency, and it is all 
 MoE pair (`MOE_GROUP_GLU_PF` + `MOE_GROUP_DOWN_PF`) bills 4450 us against a ~335 us fp8 roofline,
 and `GEMM_FP8_MX` bills 2832 us across nine calls with a 48% straggler. Neither is a parallelism
 problem and neither is addressed by any form of sharding.
+
+## 12.83 V4.1's MoE runs a different kernel than every MoE instrument was written for
+
+The MoE pair is the biggest single item left after sequence parallelism (12.82): 4,477 us of a
+15,072 us layer. This section is what it is made of, and it opens with a correction, because the
+first answer was an artifact.
+
+**The trap.** `PLOW_MOE_PF_ABL` (cap the k-loop at one tile) and `PLOW_MOE_PF_EPIABL` (issue 1 of
+every 16 DOWN stores) are the two ceiling instruments for the grouped MoE. Set on a V4.1 run, both
+read **null**: the MoE bodies did not move, the layer did not move, and the output was
+bit-identical. Read at face value that is a strong claim -- that V4.1's MoE is neither arithmetic-
+nor store-bound -- and it is wrong. Both instruments live in `d_moe_group_pf_t`. V4.1's routed
+experts are `expert_dtype: "fp4"`, which is `MoeEnc::Mxfp4 = 2`, which is op 85/86's `i3 = 2`,
+which dispatches **`d_moe_group_pf_a4w4`**. Neither ablation has a site in that function. The flag
+compiled, it visibly shrank the standalone `_t` symbols in the ELF, and it changed nothing that ran.
+
+The tell that saved it was the correctness control, and the FIRST control tried was itself
+invalid. Under SP the `exit:` fingerprint is 7/8 stale entry data (12.82), so it cannot see a
+wrong MoE at all -- it was identical across all three arms for that reason, not because the
+ablation was inert. The control that works is the one 12.82 introduced: dump `act.hc_residual_a`
+and compare **rank 0's own band**. An ablation that is wrong-output-by-construction and returns
+`max|d| == 0` on its own band is not executing. That is a cheap, general check and it belongs on
+every ceiling instrument before its number is quoted.
+
+This also retires the MoE half of 12.25 a second time. Those instruments were already suspect for
+running on 17.9% of the routed rows (the coverage bug); they were additionally pointed at a kernel
+V4.1 never dispatches.
+
+**With the instrument built for a4w4** (both arms, native CDNA4 and simulated CDNA3), the control
+now reads `max|d| = 1.59e-1` -- live -- and the decomposition is:
+
+                base        k-loop capped at 1 tile      the k-loop's own share
+    GLU       1819.5 us            290.2 us              1529 us   84%
+    DOWN      2657.7 us           2018.9 us               639 us   24%
+    layer    15072    us         12898    us
+
+GLU is k-loop bound: 84% of it is the inner GEMM over K = 5120, and a faster grouped GEMM is the
+only thing that moves it. DOWN is not. Its K is 288 (moe_intermediate/TP), the k-loop is 639 us,
+and the other ~1.7 ms is the epilogue -- the gate multiply and the scatter into `part[T*k, H]`.
+
+**The epilogue was already solved, for the other arm.** `PLOW_MOE_PF_EPI` collapses the DOWN
+epilogue's per-ELEMENT `row_partidx`/`row_gate` re-fetch (64 serialized dependent round trips per
+output tile -> 2) and has been default ON since 2026-08-09 -- on `d_moe_group_pf_t`.
+`PLOW_MOE_PF_EPI_SIB` applies the identical hoist to `d_moe_group_pf_a4w4` and was left default
+OFF, "gated on the model that uses each path". V4.1 is that model and nothing had turned it on, so
+V4.1 was paying the drain in full while the flag that fixes it sat off and the flag that was on
+covered a kernel it does not run. Defaulted on under `PLOW_PREFILL_DSV41`:
+
+    DOWN 2657.7 -> 2260.6 us,  layer 15072 -> 14810 us,  output BYTE-IDENTICAL
+
+Confirmed in both directions -- the new default reproduces it with no flag set (DOWN 2299.4 us),
+and `PLOW_MOE_PF_EPI_SIB=0` restores 2615.7 us -- and both dumps match the baseline band exactly,
+which is what the hoist's byte-identity argument predicts.
+
+**Ladder.** 615 -> 605 ms. Small, and it was free: the transform was written, proven and shipped
+for a sibling kernel, and the only thing missing was pointing it at the arm this model uses.
+
+**What is left in the MoE.** After the hoist, DOWN is ~2.26 ms of which ~0.64 ms is the k-loop, and
+GLU is ~1.82 ms of which ~1.53 ms is. So ~2.2 ms of the pair is now inner GEMM and ~1.3 ms is
+epilogue and staging. The pair still bills ~4.1 ms against a ~335 us fp8 compute roofline and a
+~160 us weight-traffic roofline, so the inner GEMM is roughly 7x off its own bound -- an MXFP4
+grouped GEMM efficiency problem, on gfx942, which has no native fp4 MFMA. That is the next thing
+worth attacking and it is a kernel rewrite, not a knob.
+
+**And it is still not enough.** 605 ms against 200 ms is 3.0x. Even a perfect MoE pair -- both ops
+to zero -- leaves ~10.6 ms/layer, 424 ms. The 200 ms target is not reachable by removing the MoE
+alone; it needs the MoE, `GEMM_FP8_MX` (2.83 ms across 9 calls) and `FLASH_MLA_PREFILL` (1.51 ms)
+all to come down together, and no single lever in this campaign has been worth more than 1.1 ms.
