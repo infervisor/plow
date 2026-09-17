@@ -177,6 +177,9 @@ def cmd_bench(a: argparse.Namespace) -> None:
     private.chmod(0o755)
 
     env = env_with(os.environ, serve.get("env", {}))
+    # The one variable of an A/B, named on the command line so the record carries it.
+    overrides = dict(kv.split("=", 1) for kv in (a.env or []))
+    env.update(overrides)
     # A `build` places the segment/role objects beside the assets; the serve-side mirror of
     # the emit classing needs that directory and must not be typed by hand.
     objects = assets.parent / "objects"
@@ -220,6 +223,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "gate": "coherence gate: PASS" in text,
         "protocol": {k: env[k] for k in ("IN_LENS", "CONCS", "NPROMPT", "OUTLEN", "BENCH_BACKEND", "BENCH_EXTRA_ARGS")},
         "serve_env": serve.get("env", {}),
+        "overrides": overrides,
         "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and p.suffix in (".pkt", ".cubin", ".elf", ".co")},
         "rows": len(rows),
         "bench_rc": rc,
@@ -288,7 +292,9 @@ def main() -> None:
     sp = p.add_subparsers(dest="cmd", required=True)
     b = sp.add_parser("build"); b.add_argument("recipe"); b.add_argument("--out", required=True); b.set_defaults(f=cmd_build)
     n = sp.add_parser("bench"); n.add_argument("recipe"); n.add_argument("--assets", required=True); n.add_argument("--out", required=True)
-    n.add_argument("--concs"); n.add_argument("--in-lens"); n.add_argument("--label"); n.add_argument("--reference"); n.set_defaults(f=cmd_bench)
+    n.add_argument("--concs"); n.add_argument("--in-lens"); n.add_argument("--label"); n.add_argument("--reference")
+    n.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the server env; recorded")
+    n.set_defaults(f=cmd_bench)
     c = sp.add_parser("compare"); c.add_argument("results"); c.add_argument("reference"); c.set_defaults(f=cmd_compare)
     l = sp.add_parser("ledger"); l.add_argument("results"); l.add_argument("--cell", required=True); l.add_argument("--note", required=True)
     l.add_argument("--provisional", action="store_true"); l.set_defaults(f=cmd_ledger)
