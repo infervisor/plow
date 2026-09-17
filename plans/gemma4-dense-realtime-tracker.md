@@ -321,6 +321,24 @@ Per-token streaming for +0.06 ms/tok (0.5 %). For a realtime profile
 `--multistep 0` is the right default; the throughput profile keeps 8. Ledger:
 `perf-data/campaign/gemma4-12b.h100.bf16.csv`.
 
+### D1 — occupancy-2 decode object (in progress)
+
+Object: `build_sm90a_cubin.sh` with `PLOW_EXTRA_DEFINES="-DPLOW_NV_FORCE_MINBLK=2
+-DGV_UNROLL=4"`, decode-only, bound to the packet config (`interp_sm90a.cu`
+includes `interp_sm120.cu`, so the sm120 MINBLK hook applies). Result:
+**128 registers, 176-byte stack frame** (bundled occ-1 object: 194 regs, no
+stack) — the plan's spill risk is real and must be priced, not assumed away.
+Loads at `grid=264, occ_per_sm=2`.
+
+Runtime contracts met so far: `interpreter grid 132 != packet n_cu 264` (occ-1
+object with a 264 packet — the documented pair), and `prefill grid 132 !=
+decode grid 264 — ordinary prefill launches must share the decode grid`
+(occ-2 object with a plain packet). `n_cu` is one blob-header field that sizes
+every program's slice table, so a per-phase width is a packet-format change,
+not a knob. The exemption is a fully segmented prefill chain; the experiment
+continues on a base segmented packet at `n_cu=264` (roles refuse 264: "one
+slice per packet block").
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
