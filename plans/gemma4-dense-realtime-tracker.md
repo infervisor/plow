@@ -701,6 +701,20 @@ is 16.2 ms but 21.2 with prefill, and TTFT queues behind ~20K tok/s prefill
 Harness debt: the low-memory guard kills tracked background benches while a
 server pages in weights — launch benches detached (job tmp `launch_tp_c4.sh`).
 
+### hd512 WGMMA BQ64/BKV32 role — real but smaller than the plan's number (2026-09-17)
+
+The plan file recorded the WGMMA BQ64/BKV32 hd512 body at 1.40 ms per launch
+vs px4's 2.5 ms, rejected only for a greedy-checksum change. Rebuilt it
+(`PLOW_NV_FA512_WG=1`, KV16/KV64 off, QK unroll 4, masked padding; 240 regs,
+no spills) and emitted with the px4 knob off (the WG32 role is the default
+selection when `interp_sm90a_pfattn_hd512.cubin` is present): paired C1,
+realtime profile, cache off: 42.22 / 52.88 / 190.81 vs 42.43 / 53.96 / 196.55
+(−1.1 ms @1024, −5.7 ms @4096). Numerics: 4 of 5 64-token greedy continuations
+(815–3239-token prompts) byte-identical, 1 diverges at ~token 12 —
+accumulation-order class. Shipped as the opt-in recipe
+`gemma4-12b.h100.bf16-hd512wg32.toml`; making it the default is a numerics-
+policy decision. Seg-time per-launch number pending (`wg32/c1-segtime`).
+
 ### cuBLASLt at every rung — NULL (2026-09-17, paired A/B)
 
 Admitting all eight Gemma-4 shapes at 128/256/512 rows (1288 → 1640 Lt
