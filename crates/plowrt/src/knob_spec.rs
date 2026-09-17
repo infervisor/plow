@@ -364,6 +364,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_no_interleave", Some("PLOW_PF_NO_INTERLEAVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_defer_decode", Some("PLOW_PF_DEFER_DECODE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.tbt_slo_ms", Some("PLOW_TBT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.queue_ttl_ms", Some("PLOW_QUEUE_TTL_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.ttft_slo_ms", Some("PLOW_TTFT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.slab_keep", Some("PLOW_SLAB_KEEP"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.dstep_every", Some("PLOW_DSTEP_EVERY"), Layer::Runtime, U32, UNSET, OPT_IN),

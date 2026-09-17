@@ -207,6 +207,13 @@ pub struct RuntimeConfig {
     #[arg(long = "tbt-slo-ms", env = "PLOW_TBT_SLO_MS", global = true)]
     pub tbt_slo_ms: Option<f64>,
 
+    /// How long a request may wait for a slot before it is answered 429, ms. Unset = the
+    /// mux's derived TTL (`--slo-ms` x 40, at least 30 s); `0` = never shed a waiting request.
+    /// At 70k context a queued request waits for a whole generation of live sequences to
+    /// retire, which is minutes, not seconds.
+    #[arg(long = "queue-ttl-ms", env = "PLOW_QUEUE_TTL_MS", global = true)]
+    pub queue_ttl_ms: Option<f64>,
+
     /// AMD time-to-first-token target, ms. Prefill candidates are ordered by deadline slack
     /// (EDF), prompts finishing this tick first, requests that can no longer make it last.
     /// Unset = arrival order.

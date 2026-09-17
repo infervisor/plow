@@ -1184,10 +1184,20 @@ fn queue_aging_ms(slo_ms: f64) -> f64 {
     (slo_ms.max(0.0) * AGING_SLO_MULTIPLE).max(AGING_FLOOR_MS)
 }
 
-/// Wait after which a queued request is shed.
+/// Wait after which a queued request is shed: `PLOW_QUEUE_TTL_MS` when set, else derived.
 #[inline]
 fn queue_ttl_ms(slo_ms: f64) -> f64 {
-    (slo_ms.max(0.0) * QUEUE_TTL_SLO_MULTIPLE).max(QUEUE_TTL_FLOOR_MS)
+    queue_ttl_with(slo_ms, crate::config::RuntimeConfig::get().queue_ttl_ms)
+}
+
+/// `Some(ms <= 0)` never sheds.
+#[inline]
+fn queue_ttl_with(slo_ms: f64, set: Option<f64>) -> f64 {
+    match set {
+        Some(ms) if ms > 0.0 => ms,
+        Some(_) => f64::INFINITY,
+        None => (slo_ms.max(0.0) * QUEUE_TTL_SLO_MULTIPLE).max(QUEUE_TTL_FLOOR_MS),
+    }
 }
 
 /// What to do with an entry in `waiting` before it is retried.
@@ -4969,6 +4979,15 @@ mod tests {
 
     /// The TTL is the one shed plow performs, and it only ever touches a request that has not
     /// started. It answers the stream rather than dropping it silently.
+    #[test]
+    fn queue_ttl_override_sets_or_disables_the_shed() {
+        assert_eq!(queue_ttl_with(250.0, None), QUEUE_TTL_FLOOR_MS);
+        assert_eq!(queue_ttl_with(1_000.0, None), 40_000.0);
+        assert_eq!(queue_ttl_with(250.0, Some(600_000.0)), 600_000.0);
+        assert!(queue_ttl_with(250.0, Some(0.0)).is_infinite());
+        assert_eq!(queue_verdict(false, 1e9, 250.0), Queued::Expired);
+    }
+
     #[test]
     fn a_request_past_the_queue_ttl_is_shed_with_an_answer() {
         let now = Instant::now();
