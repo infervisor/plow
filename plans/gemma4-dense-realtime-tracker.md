@@ -367,6 +367,39 @@ skips it when nothing else is queued — next A/B. P1 (native split-K) can at
 best match these Lt numbers at ≤512 and is deprioritized below the fixed-cost
 work.
 
+### Attribution — where ≤1K prefill time goes (measured, cache off)
+
+`PLOW_PF_SEG_TIME=1` per-segment event timing on the BF16-roles packet,
+`PLOW_PREFIX_CACHE=0`, distinct prompts, `--multistep 0`. Streaming first token
+measured with a plain client: **49.5 ms @159 tokens, 111 ms @1055**. The two
+earlier knob A/Bs (`PLOW_IDLE_DISPATCH`, `PLOW_PF_SEG_GRAPH`, both null) and
+the "≈14 ms non-GPU" hypothesis are retired: the time is GPU time.
+
+| request | chunks (bucket) | GPU ms | GemmGlu | Gemm ×5/layer | Flash | Norm | Rope |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 159 tok | 1 × 512 | 47.1 | 28.0 | 13.6 | 2.0 | 1.9 | 1.7 |
+| 1055 tok | 1024 + **31-token tail on the 128 bucket** | 81.5 + 26.6 | 52.8 + 9.2 | 16.7 + 12.6 | 7.3 + 1.9 | 2.1 + 1.8 | 2.6 + 1.1 |
+
+Findings:
+
+1. **Bucket padding.** 159 tokens run as 512 (47 ms; the 128 bucket runs in
+   26.6 ms). 1055 tokens pay a second full 26.6 ms chunk for 31 tokens. vLLM
+   has no such quantization. Finer buckets (256; a small tail bucket, or
+   folding a ≤N-token tail into the main chunk) are an emit-only change.
+2. **The fused GLU role is the dominant cost at every bucket** — 191 µs /
+   583 µs / 1.10 ms per layer at 128/512/1024, i.e. ~16–22 % of tensor-core
+   peak (M=1024: 241 GFLOP in 1.1 ms). cuBLASLt would do the gate/up GEMM at
+   ~0.35 ms; even with a separate GeGLU pass the 1024 chunk drops from ~82 to
+   ~50 ms, next to vLLM's 46.7 ms TTFT. This is the kernel-level target for
+   ≤1K prefill: a T2 of `interp_sm90a_pfgemm_glu_gemma4.cu` at M∈{128,512,1024}
+   against cuBLASLt on the same shape.
+3. Projection GEMMs cost 52–57 µs per launch regardless of M (240 per chunk):
+   launch/ramp-bound. P2 (cuBLASLt) barely moves them, so the fix is fewer
+   launches (fused QKV: −96/chunk) or a persistent small-M path, not a faster
+   tile.
+4. Non-GPU overhead is ~2.5 ms per request. Decode at C1 is unaffected by any
+   of this.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
