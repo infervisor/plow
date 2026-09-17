@@ -598,6 +598,16 @@ the uint4-punned store keeps the next loads behind it).
 TTFT 42.20 / 53.64 / 196.19 vs control 42.27 / 54.63 / 201.83; TPOT unchanged.
 Decode object 194 regs / 0 stack (unchanged), pfpackedseg spills 5716 → 3492 B.
 
+Operational lessons (2026-09-17 evening): (a) a cell build reads the runtime
+sources per object as it goes — never start a build while a kernel patch is
+mid-flight (the masked-padding 16K cell picked up the unclamped split-K and its
+server hung at the first rung-8 admission; rebuild one object with the cell's
+own `plow_config.h` and swap it); (b) detached queue scripts must wait on
+process names spelled so their own command line does not match (`serv[e]`),
+and a launcher's name must not contain the pattern it kills; (c) the harness's
+low-memory guard kills tracked benches while a server pages in weights — run
+benches detached and monitor their results file.
+
 Harness debt (not fixed today): a cell build compiles the interpreter object
 set twice (once inside the base emit, again in `build_sm90a_gemma4_segments.sh`
 with the segment/role defines) and the second pass runs one nvcc at a time;
