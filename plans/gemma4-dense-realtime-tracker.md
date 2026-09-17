@@ -502,6 +502,60 @@ protocol. The bench stays the yardstick; the server-side numbers are the ones
 kernel work should be priced against: **in128 TTFT 22 ms and TPOT 10.7 ms
 (BF16, exact-length, cache off) vs vLLM's client-measured 28.2 / 10.55.**
 
+### Full attribution of the Lt packet (cache off, C1) — where the 1024/4096 gap is
+
+Lt GEMM time from the pinned algorithm table (per layer q+k+v+o+gate+up+down),
+non-Lt segments from `PLOW_PF_SEG_TIME=1`, gaps = TTFT − both.
+
+| cell | Lt GEMM | attention | norm+resid | GeGLU | rope | gaps | TTFT | vLLM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 26.5 | 7.2 | 4.2 | 4.0 | 2.8 | ~10 | 54.5 | 46.7 |
+| 4096 | 105.0 | 34.8 | 14.7 | 13.8 | 8.9 | ~24 | 201 | 170 |
+
+- GEMM: cuBLASLt at 850 TFLOP/s at M=1024 — at the ceiling. Done.
+- Attention: ≈8 ms floor at 4096 (2.2 TFLOP global hd512 + 2.7 TFLOP sliding
+  hd256 at ~600 TFLOP/s) vs 34.8 measured — **~25 % of FA3-class**. The
+  "attn kernels pick flash attention" ask maps here: rent FA3/cuDNN SDPA for
+  the 40 hd256 sliding layers (both support hd ≤ 256, GQA, causal, window);
+  hd512 global layers stay native (no library supports hd512).
+- Light stages (norm+residual, GeGLU, rope): ≈13 ms bandwidth floor at 4096
+  vs 37.4 measured — they run on the fat occ-1 object (194 regs). A lean
+  light-ops object (norm/rope/GeGLU arms only, high occupancy) is the
+  prefill form of D2 and is a defines-only build if the arm gating follows
+  the FA-only object's pattern.
+- Gaps: 243 kernel segments + 336 Lt calls per chunk. Both launch-mode A/Bs on
+  this packet are NULL (cache off, C1, provisional/contended):
+  `PLOW_PF_SEG_GRAPH=1` 53.72 / 201.47, `PLOW_PF_SEG_NONCOOP=1` 54.54 / 201.95
+  vs control 54.63 / 201.83. Launch mode is not the lever; ~12 ms of the gap is
+  the vLLM bench client itself (plain client in128 TTFT 22 ms).
+
+Exact per-family cost of one 4096 chunk (`segment-site wall time`, 243 segments,
+73.4 ms non-Lt):
+
+| family | launches | µs each | total | floor |
+|---|---:|---:|---:|---:|
+| FlashPrefill | 48 | 742 | 35.6 ms | ~8 ms compute |
+| NormResidual+RmsNorm | 96 | 153 | 14.7 ms | ~4.7 ms HBM |
+| Glu | 48 | 291 | 14.0 ms | ~5.7 ms HBM |
+| HeadNormRope | 48 | 186 | 8.9 ms | ~2.0 ms HBM |
+
+FlashPrefill split (same chunk): 40 hd256 sliding launches at 353–386 µs
+(~15 ms, ~2.2× an FA3-class time) and 8 hd512 global launches at
+2450–2650 µs (~20.7 ms, 275 GFLOP each → 106 TFLOP/s, ~11 % of peak). The
+hd512 px4/BQ64 role is the single largest non-GEMM item at 4096; no library
+(FA2/FA3/cuDNN all cap at hd256) covers it, so it stays native. cuDNN 9 is on
+the box and is the stable-ABI library path for the hd256 sliding layers
+(causal + sliding window + GQA), the cuBLASLt analogue for attention.
+
+Root cause in the bodies (not occupancy): the warp-per-row norms walked one
+16-B chunk per lane per iteration (a 15-deep load-latency chain per pass at
+feat 3840), rope handled one (token, head) per warp iteration with 8-B lane
+accesses, and the GeGLU loop was not unrolled. Fix in flight (`op_norm.cuh`,
+`op_elementwise.cuh`): 8-chunk batched row walks (same accumulation order →
+bit-identical), 4-item rope passes with gamma hoisted (2 items at hd512),
+`#pragma unroll 4` GeGLU. Cell `campaign-bf16-light` (same packet + Lt table,
+objects rebuilt).
+
 ### Next pipeline step — ctx-keyed attention selection at emit
 
 The attention roles are one object across all live-KV histories (tracker:
