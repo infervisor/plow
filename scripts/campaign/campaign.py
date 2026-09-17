@@ -164,7 +164,20 @@ def gpu_header() -> dict:
 
 def cmd_bench(a: argparse.Namespace) -> None:
     r = load(a.recipe)
-    cell, bench, serve = r["cell"], r["bench"], r.get("serve", {})
+    cell, bench, serve = r["cell"], dict(r["bench"]), dict(r.get("serve", {}))
+    # A profile is a named workload on the same cell: `realtime` owns C1-C4 latency, `throughput`
+    # owns C4-C16 output tok/s at long context. Its keys override [bench]; its `serve_env`
+    # merges over [serve].env, so the two profiles can differ in multistep, ladder use, etc.
+    profile = None
+    if a.profile:
+        profiles = bench.get("profiles", {})
+        if a.profile not in profiles:
+            die(f"recipe has no [bench.profiles.{a.profile}]; have {sorted(profiles)}")
+        profile = dict(profiles[a.profile])
+        serve_env = dict(serve.get("env", {}))
+        serve_env.update(profile.pop("serve_env", {}))
+        serve["env"] = serve_env
+        bench.update(profile)
     assets = Path(a.assets).resolve()
     out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -202,7 +215,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
     })
     (out / "hf-home").mkdir(exist_ok=True)
     model_id = bench.get("model_id") or json.loads((assets / "build.json").read_text()).get("slug") or cell["revision"]
-    label = a.label or f"{cell['name']}-{Path(a.recipe).stem}"
+    label = a.label or f"{cell['name']}-{Path(a.recipe).stem}" + (f"-{a.profile}" if a.profile else "")
     cmd = [str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label, str(BENCH),
            str(assets), str(bench.get("port", 8765)), model_id, bench["tokenizer"], str(bench.get("ready_s", 1200))]
     log = out / "run.log"
@@ -215,6 +228,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "recipe": str(Path(a.recipe).resolve()),
         "cell": cell,
         "label": label,
+        "profile": a.profile,
         "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "commit": git("rev-parse", "HEAD"),
         "dirty": bool(git("status", "--porcelain")),
@@ -294,6 +308,7 @@ def main() -> None:
     n = sp.add_parser("bench"); n.add_argument("recipe"); n.add_argument("--assets", required=True); n.add_argument("--out", required=True)
     n.add_argument("--concs"); n.add_argument("--in-lens"); n.add_argument("--label"); n.add_argument("--reference")
     n.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the server env; recorded")
+    n.add_argument("--profile", help="named workload from [bench.profiles.*] (e.g. realtime, throughput)")
     n.set_defaults(f=cmd_bench)
     c = sp.add_parser("compare"); c.add_argument("results"); c.add_argument("reference"); c.set_defaults(f=cmd_compare)
     l = sp.add_parser("ledger"); l.add_argument("results"); l.add_argument("--cell", required=True); l.add_argument("--note", required=True)

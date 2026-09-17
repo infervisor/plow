@@ -40,6 +40,22 @@ python3 scripts/campaign/campaign.py ledger  /nvme/run/<id>/c1/results.csv --cel
    model name or a literal `hidden == N`. A new variant re-tunes by running the
    campaign, not by editing the emitter.
 
+## Profiles: realtime and throughput are both first-class
+
+A cell carries named workloads under `[bench.profiles.<name>]`; `bench --profile
+<name>` applies its keys over `[bench]` and its `serve_env` over `[serve].env`.
+
+| profile | owner metric | cells | serve |
+|---|---|---|---|
+| `realtime` | TTFT + TPOT, per-token ITL | C1, C4 at in 128/1024/4096 | `PLOW_MULTISTEP=0` |
+| `throughput` | output tok/s, TPOT under load | C4, C16 at in 1024/4096 (extend to 8192+ with a matched reference) | `PLOW_MULTISTEP=8` |
+
+A throughput run needs a packet whose decode ladder covers the concurrency
+(`PLOW_DECODE_BATCH_LADDER=1,2,4,8,16`) and the KV to back it (≈41 GiB at
+ctx 8192 for Gemma-4-12B), i.e. an unshared GPU. The reference CSV holds both
+profiles' rows; `compare` matches on `(input_len, concurrency)`. Never table a
+row against a different precision.
+
 ## Recipe schema
 
 ```toml
