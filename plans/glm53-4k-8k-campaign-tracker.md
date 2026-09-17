@@ -875,6 +875,54 @@ packproj reconciliation: the band-width `ColSplit` calls (78 per 8192 program) c
 - On the production decode object (MM=16) at one row, GEMV costs 5.6× the MM=1 build: q_a|kv_a|k_rope 60 vs 10.7 µs,
   o_proj 37.4 vs 11.0 µs (w8gemv T2). Relevant to the single-row decode program (b1) and to decode rungs 1–4.
 - The fused shared gate|up GEMV costs 103 µs at one row against 31 µs for two plain GEMVs on the same object.
+- 2026-09-16, DSA sparse-prefill clamp set (57bcf142, rung cap 8): the decode tick is flat at 45–47 ms for 1–8 rows and
+  for both 1k and 70k context (1,218 segments). in=1024/out=512: C8 170.1 output tok/s, ITL 43.6 ms; C16 169.6 tok/s,
+  TTFT 24.8 s (rung stuck at 8, fixed in 87365ae5, not yet GPU-measured). 70k/C16: 64.40 tok/s vs vLLM 64.01 (prefill-bound).
+- 2026-09-17, 70k/C16 rung 16 (87365ae5) + `PLOW_KV_ADMIT_HEADROOM=0.8` + `PLOW_VMM_CACHE_MIN_FREE_MIB=16384` (run 3):
+  99/100 (1 × `0xdead0000` compact audit on a prefill), output 73.64 tok/s, median TTFT 9.04 s (clamp 94.2),
+  TPOT 188 ms (clamp 110), derived prefill 9,730 tok/s, pure-decode 256.5 rows/s at 54.3 ms/tick. Prefill ticks
+  (817 ms, carrying ~14 decode rows) are 76% of wall. TPOT = tick-weighted mean (189 predicted, 188 measured).
+  Closed-loop model, k served slots, P = one 70k prefill (7.3 s), d = decode tick: lifetime L = (k−1)·P + 712·d,
+  TPOT = L/712, TTFT ≈ (16/k − 1)·L + P. Reproduces clamp (k=8: 115 ms / 89 s) and run 3 (k=16: 202 ms).
+  TTFT ≤ 84.8 s and TPOT ≤ 99 ms together need P ≤ 5.4 s at k=8 (≈13k tok/s effective prefill); no k works at P=7.3 s.
+  Scheduling alone cannot meet both — the prefill chunk must get ~26% faster (row-band's −1.2 s @65k is the largest lever).
+- 2026-09-17, decode by rows at 70k (run 3, pure-decode ticks): rung 16 is flat at 55.4 ms for 4–16 rows, so C16 = 288.6
+  tok/s (3,441 ticks); rung 8 = 47.5 ms. H200 70k/C20 reference: 273.7 output tok/s, 260 s for 100 prompts, TPOT 66 ms,
+  ≈27k tok/s prefill-inclusive — plow 70k/C16 end to end is 73.6 tok/s (3.7×), prefill-bound (780 ms per 8,192 prefill
+  tokens incl. the separate 55 ms decode launch vs ≈300 ms).
+- 2026-09-17, lever sweep aborted: base arm C1 decode stalled 30.1 s then `0xdead0003` (steady 44.6 ms before); G3 arm GPU
+  fault. Rung-32 arm (packet 77d5dd48, `PLOW_LIVE_CTX=32768`; 40960 refuses at load, head window must be a multiple of
+  2 MiB = live ctx multiple of 16,384) never reached rung 32: rank 5 sampled 17 GiB free at load (others 80), budget
+  13.7 GiB, 8 seats, 24/32 requests hit the 30 s queue TTL, then `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` after slot 3's
+  last chunk. Rung 8 at 30k: 51.2 ms / 156 tok/s. Throughout: foreign KFD processes outside the container, a new host pid
+  every 30–40 s (3298611, 3381027, 3386742, 3390024, 3396201, 3399224, 3404905), 3.8–5.8 GiB on each of our 8 GPUs, with
+  queue-eviction bursts on all 8 at each arrival. Retry for deadline bails landed in ed1f23a2 (not yet GPU-exercised).
+- 2026-09-17, rung-32 arm on clean GPUs (60 s no-foreign-KFD gate; one attempt before it failed load with OUT_OF_RESOURCES
+  while host pid 3426607 held 96.3 GiB on each GPU): 30k in / 1024 out, 0 failed. C32: 200.76 output tok/s, TTFT
+  47.5 s, TPOT 108.5 ms; C16: 228.44 tok/s, TTFT 16.5 s, TPOT 54.9 ms. Pure decode: rung 16 × 16 rows 52.9 ms = 302.4
+  tok/s (1,025 ticks); rung 32 × 32 rows 67.7 ms = 472.5 tok/s (894 ticks). No deadline bails.
+- 2026-09-17, rung-32 packet at 70k / 712 out: C16 16/16, 76.50 tok/s, TTFT 57.6 s, TPOT 122.7 ms; C32 16/32 — the other
+  16 answered 429 by the 30 s queue TTL (admission seats 16 at 70k: 63.0 GiB budget, 55,608 B/token). Pure decode never
+  exceeded 16 rows: rung 16 × 16 = 55.1 ms, 290.3 tok/s (2,300 ticks). 32 × 70.7k rows need ≈117 GiB/rank, so C32 decode
+  at 70k needs KV sharding (DCP stage 2–3), not a wider rung. The H200-matched C20×100 cell was shedding too (22 by 46/100)
+  and was stopped. `PLOW_QUEUE_TTL_MS` (81a81bfe; 0 = never shed) added; matched cell rerun with it at 0.
+- 2026-09-17, H200-matched cell (70k / 712 out, C20, 100 prompts, seed 8193) on the rung-32 packet, `PLOW_QUEUE_TTL_MS=0`,
+  clean GPUs: 100/100, 924.66 s, 77.00 output tok/s (H200 273.67, 3.55×; 1.5× needs ≥ 182), total 7,647 tok/s (H200
+  27,269), TTFT median 35.0 s / p99 162.2 s (H200 0.9 / 5.2 s), TPOT mean 181.2 ms (H200 65.9), ITL median 55.1 ms. No
+  bails, no faults. The gap is prefill throughput, not decode.
+- 2026-09-17, 8K prefill lever sweep, rerun on clean GPUs (60 s gate, bin-ttl = ed1f23a2+81a81bfe+cb0291b7): 70k C1,
+  4 requests (first dropped), seed 8193; retrieval 9/9 at 27k and 68k on every arm. Median 8192-row chunk ms at c0=0 /
+  c0 49k–66k, chunk tok/s, TTFT: base 810.1 / 752.5, 10,847, 6.56 s; G3 803.2 / 751.8; fusepost 795.4 / 751.4; SP
+  713.1 / 657.3, 12,417, 5.74 s; SP+G4 701.9 / 647.1; +G3 711.2 / 643.5; +G5 706.4 / 642.6, 12,691; +router overlap
+  678.1 / 618.1, 13,192, 5.42 s; +threshold select 675.5 / 618.3 (null again); +row-band 599.9 / 515.6, 15,509,
+  4.61 s (−31.5% deep chunk, +43% tok/s vs base). SP is the largest non-row-band lever (−95 ms deep). Single-sample
+  arms, no ctrl2: treat < 5 ms differences as noise. Row-band's ≈29 GiB/rank halves 70k KV seats without DCP.
+- 2026-09-17, H200-matched cell (70k / 712 out, C20×100, seed 8193, TTL 0, clean-GPU gate) on the lever stacks:
+  SP+G4+G3+G5+router overlap: 100/100, 812.29 s, 87.65 tok/s (+13.8% vs 77.00), TTFT median 29.8 s / p99 139.5 s,
+  TPOT 159.8 ms; KV budget 67.75 GiB. Same + row-band: 100/100, 827.30 s, 86.06 tok/s, TTFT median 82.7 s / p99
+  126.1 s, TPOT 113.0 ms; KV budget 45.45 GiB (fewer seats → longer queueing, faster decode). Both: 0 deadline bails,
+  0 faults, no desync — first served SP evidence at 70k/C20 since #64. Row-band nets nothing end to end at C20 until DCP
+  frees KV. H200 273.67; still 3.1×.
 
 ## Resume protocol
 
