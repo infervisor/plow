@@ -713,7 +713,10 @@ realtime profile, cache off: 42.22 / 52.88 / 190.81 vs 42.43 / 53.96 / 196.55
 (815–3239-token prompts) byte-identical, 1 diverges at ~token 12 —
 accumulation-order class. Shipped as the opt-in recipe
 `gemma4-12b.h100.bf16-hd512wg32.toml`; making it the default is a numerics-
-policy decision. Seg-time per-launch number pending (`wg32/c1-segtime`).
+policy decision. Seg-time at 4096: hd512 launches 1.73–1.95 ms (px4
+2.45–2.65), FlashPrefill 35.6 → 29.9 ms per chunk, non-Lt total 65.8 → 60.7 ms
+— consistent with the −5.7 ms TTFT. Expected ~5 ms per launch at 8K KV (px4
+7.3), so the long-context cells gain proportionally more.
 
 ### cuBLASLt at every rung — NULL (2026-09-17, paired A/B)
 
