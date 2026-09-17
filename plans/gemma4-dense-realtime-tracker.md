@@ -335,9 +335,17 @@ object with a 264 packet — the documented pair), and `prefill grid 132 !=
 decode grid 264 — ordinary prefill launches must share the decode grid`
 (occ-2 object with a plain packet). `n_cu` is one blob-header field that sizes
 every program's slice table, so a per-phase width is a packet-format change,
-not a knob. The exemption is a fully segmented prefill chain; the experiment
-continues on a base segmented packet at `n_cu=264` (roles refuse 264: "one
-slice per packet block").
+not a knob. The exemption is a fully segmented prefill chain; on a base segmented packet
+at `n_cu=264` the server loads (decode object `grid=264 occ_per_sm=2`) but the
+first prefill launch dies: `cuLaunchCooperativeKernel:
+CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE`. A packet's `n_cu` streams are one per
+block, so every launch — the occ-1 prefill objects included — needs 264
+co-resident blocks. **Conclusion: D1 requires per-program stream counts in the
+blob (prefill 132, decode 264) plus per-program launch grids and checks; it is
+a packet-format change, not a knob.** Estimated cost: packet writer/reader
+version bump, `gpu.rs` launch/grid checks keyed per program, AMD reader kept
+on the header value; gain per the plan −1.0…−1.6 ms/step, against a 176-byte
+stack frame at 128 registers that must be priced on hardware.
 
 ## Workstream status
 
