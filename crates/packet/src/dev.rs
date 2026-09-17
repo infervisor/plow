@@ -2004,9 +2004,10 @@ pub enum DevOp {
     /// `idx[r]`, or `j` when `idx` is absent (the prefill prefix form). Live iff
     /// `j < min(K, kv_len[b])`. Owned iff `(g >> page_shift) & (2^degree_shift - 1) == shard`;
     /// read at local row `((g >> (page_shift + degree_shift)) << page_shift) | (g & (page - 1))`.
-    /// Slot bytes: `n_batch*K*656`.
+    /// Slot bytes: `n_batch*K*656`. The shard is the executing rank's (`rank & (2^degree_shift -
+    /// 1)`): one packet serves every rank.
     /// `t0=idx? t1=kv_len t2=ckv(u8 local) t3=krot(bf16 local) t4=kv_scale(f32 local)` ·
-    /// `i0=n_batch i1=K i2=local_stride i3=page_shift i4=degree_shift i5=slot_bytes i6=shard`.
+    /// `i0=n_batch i1=K i2=local_stride i3=page_shift i4=degree_shift i5=slot_bytes`.
     DcpKvPack = 181,
     /// Decode context parallelism, gather half: rendezvous on `gate`, then pull every live record
     /// from its owner's slot (owner rank = this rank's group base + shard) into dense gathered
@@ -2019,9 +2020,9 @@ pub enum DevOp {
     /// `rows` into staging buffers at row `t`; this copies row `t` into the local cache iff this
     /// shard owns global row `pos[t]`, at the local row (`batched`: plus `t * local_stride`, row
     /// `t` being decode slot `t`). Ownership reads the replicated `pos`, so nothing is staged per
-    /// rank. `t0=pos t1=ckv_stage(u8[rows][512]) t2=krot_stage(bf16[rows][64])
-    /// t3=scale_stage(f32[rows]) t4=ckv t5=krot t6=kv_scale` ·
-    /// `i0=rows i1=local_stride i2=page_shift i3=degree_shift i4=shard i5=batched`.
+    /// rank; the shard is the executing rank's. `t0=pos t1=ckv_stage(u8[rows][512])
+    /// t2=krot_stage(bf16[rows][64]) t3=scale_stage(f32[rows]) t4=ckv t5=krot t6=kv_scale` ·
+    /// `i0=rows i1=local_stride i2=page_shift i3=degree_shift i5=batched`.
     DcpKvScatter = 183,
 }
 

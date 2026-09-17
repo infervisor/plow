@@ -5898,21 +5898,24 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         } else if (in->op == PLOW_DOP_DCP_KV_PACK) {
             /* DCP pack (local): owned latent KV records into this rank's peer slot.
              *   t0=idx? t1=kv_len t2=ckv t3=krot t4=kv_scale
-             *   i0=n_batch i1=K i2=local_stride i3=page_shift i4=degree_shift i5=slot_bytes i6=shard */
+             *   i0=n_batch i1=K i2=local_stride i3=page_shift i4=degree_shift i5=slot_bytes
+             * One packet serves every rank, so the shard is this rank's, not an immediate. */
             d_dcp_kv_pack((bf16*)((char*)prog.peer_scratch[prog.rank] + in->i[5]),
                           in->t[0] == PLOW_TENSOR_NONE ? nullptr : (const int*)tens[in->t[0]],
                           (const int*)tens[in->t[1]], (const unsigned char*)tens[in->t[2]],
                           (const bf16*)tens[in->t[3]], (const float*)tens[in->t[4]], in->i[0],
-                          in->i[1], in->i[2], in->i[3], in->i[4], in->i[6], e.slice, in->blocks);
+                          in->i[1], in->i[2], in->i[3], in->i[4],
+                          prog.rank & ((1u << in->i[4]) - 1u), e.slice, in->blocks);
         } else if (in->op == PLOW_DOP_DCP_KV_SCATTER) {
             /* DCP owner-only KV write from the staged rows.
              *   t0=pos t1=ckv_stage t2=krot_stage t3=scale_stage t4=ckv t5=krot t6=kv_scale
-             *   i0=rows i1=local_stride i2=page_shift i3=degree_shift i4=shard i5=batched */
+             *   i0=rows i1=local_stride i2=page_shift i3=degree_shift i5=batched */
             d_dcp_kv_scatter((const int*)tens[in->t[0]], (const unsigned char*)tens[in->t[1]],
                              (const bf16*)tens[in->t[2]], (const float*)tens[in->t[3]],
                              (unsigned char*)tens[in->t[4]], (bf16*)tens[in->t[5]],
                              (float*)tens[in->t[6]], in->i[0], in->i[1], in->i[2], in->i[3],
-                             in->i[4], in->i[5], e.slice, in->blocks);
+                             prog.rank & ((1u << in->i[3]) - 1u), in->i[5], e.slice,
+                             in->blocks);
         } else if (in->op == PLOW_DOP_XDCP_GATHER) {
             /* DCP gather (collective): every live record from its owner's slot.
              *   t0=idx? t1=kv_len t2=gckv t3=gkrot t4=gscale t5=glen?
