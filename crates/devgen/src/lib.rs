@@ -3307,7 +3307,7 @@ fn emit_xreduce_combine_fold(
 /// producer slice — the same collapse the M0 census measured. Splitting the PACKET is what
 /// makes the edge genuinely band-structured.
 #[allow(clippy::too_many_arguments)]
-fn emit_xreduce_twoshot_band(
+pub(crate) fn emit_xreduce_twoshot_band(
     b: &mut Builder,
     xgate: &mut u32,
     xr_cus: &[u32],

@@ -1942,7 +1942,7 @@ pub(crate) fn emit_dsv41_attn_out(
     t: u32,
     xgate: &mut u32,
     deps: &[u32],
-) -> (Dsv41OutAct, u32) {
+) -> (Dsv41OutAct, Vec<u32>) {
     let (groups, orow, ocol) = c.wo_a_groups();
     assert_eq!(
         tp, groups,
@@ -1973,31 +1973,93 @@ pub(crate) fn emit_dsv41_attn_out(
         deps,
     );
     // This rank's SLICE of wo_b: [T, orow] x [hidden, orow]^T -> a [T, hidden] PARTIAL.
-    let c_ob = emit_pf_gemm_fp8_mx(
-        b,
-        cus,
-        act.o_part,
-        act.o_a,
-        w.get(l, "attn.wo_b.weight"),
-        w.get(l, "attn.wo_b.scale"),
-        t,
-        c.hidden,
-        orow,
-        &[c_oa],
-    );
     let xr = super::xr_cus_capped(b.n_cu(), cus);
-    let c_xr = crate::emit_xreduce(
-        b,
-        xgate,
-        false,
-        &xr,
-        c_ob,
-        act.o,
-        t * c.hidden,
-        tp,
-        early_reduce_slot(t, c.hidden),
-    );
+    let kb = dsv41_xr_band(t);
+    let c_xr = if tp > 1 && kb > 1 {
+        // BANDED TP SEAM: K row-band wo_b GEMMs, each feeding its own two-shot, so band 0's
+        // fabric transfer overlaps bands 1..K-1's compute. The bands are disjoint rows of the
+        // same tiles, so the sums are bit-identical to the unbanded emit.
+        let rows = t / kb;
+        let bcus = dsv41_xr_band_cus(&xr);
+        let ends: Vec<u32> = (0..kb)
+            .map(|i| {
+                let c_p = super::emit_pf_gemm_fp8_mx_band(
+                    b,
+                    cus,
+                    act.o_part,
+                    act.o_a,
+                    w.get(l, "attn.wo_b.weight"),
+                    w.get(l, "attn.wo_b.scale"),
+                    rows,
+                    c.hidden,
+                    orow,
+                    i * rows,
+                    &[c_oa],
+                );
+                crate::emit_xreduce_twoshot_band(
+                    b,
+                    xgate,
+                    &bcus,
+                    &[c_p],
+                    act.o,
+                    rows * c.hidden,
+                    tp,
+                    0,
+                    i * rows * c.hidden,
+                    None,
+                )
+            })
+            .collect();
+        ends
+    } else {
+        let c_ob = emit_pf_gemm_fp8_mx(
+            b,
+            cus,
+            act.o_part,
+            act.o_a,
+            w.get(l, "attn.wo_b.weight"),
+            w.get(l, "attn.wo_b.scale"),
+            t,
+            c.hidden,
+            orow,
+            &[c_oa],
+        );
+        vec![crate::emit_xreduce(
+            b,
+            xgate,
+            false,
+            &xr,
+            c_ob,
+            act.o,
+            t * c.hidden,
+            tp,
+            early_reduce_slot(t, c.hidden),
+        )]
+    };
     (act, c_xr)
+}
+
+/// Band count for the V4.1 attention TP seam (`PLOW_DSV41_XR_BAND=K`, 2..=8; 1 = the unbanded
+/// emit, byte-identical). K row-bands of the `wo_b` GEMM each feed their own two-shot, so band
+/// 0's fabric transfer runs while bands 1..K-1 are still in the GEMM. The `t/K >= 512` floor keeps
+/// a band's GEMM from under-filling 304 CUs.
+pub(crate) fn dsv41_xr_band(t: u32) -> u32 {
+    let k = crate::emit_config::active().dsv41_xr_band;
+    if (2..=8).contains(&k) && t % k == 0 && t / k >= 512 {
+        k
+    } else {
+        1
+    }
+}
+
+/// The band collectives take a PREFIX of the seam's CUs so the workgroups outside it walk past
+/// them on the global queue and claim the next band's GEMM -- without that there is nothing for
+/// the transfer to overlap WITH.
+pub(crate) fn dsv41_xr_band_cus(xr: &[u32]) -> Vec<u32> {
+    match crate::emit_config::active().dsv41_xr_band_cus {
+        Some(c) if c > 0 && (c as usize) < xr.len() => xr[..c as usize].to_vec(),
+        _ => xr.to_vec(),
+    }
 }
 
 /// Suffix for the packed-expert table names: EMPTY in a real packet.
@@ -2569,7 +2631,7 @@ pub(crate) fn emit_dsv41_block(
         );
         let (_out, c_out) =
             emit_dsv41_attn_out(&mut b, c, &w, &all, l, tp, core.o, t, &mut xgate, &[c_core]);
-        let c_post = emit_dsv41_mhc_post(&mut b, c, &mhc, _out.o, ri, t, &[c_out]);
+        let c_post = emit_dsv41_mhc_post(&mut b, c, &mhc, _out.o, ri, t, &c_out);
         ri ^= 1;
 
         let c_pre2 = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, true, ri, pi, t, &[c_post]);

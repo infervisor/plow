@@ -1805,6 +1805,27 @@ fn emit_pf_gemm_fp8_mx(
     k: u32,
     deps: &[u32],
 ) -> u32 {
+    emit_pf_gemm_fp8_mx_band(b, cus, out, x, wt, sc, t, nn, k, 0, deps)
+}
+
+/// [`emit_pf_gemm_fp8_mx`] over ONE row band: `t` rows starting at `row0` of both A and C. The
+/// weight and its scale grid are indexed by N and K only, so they do not move with the rows, and
+/// disjoint bands over the same tiles sum identically to the whole -- which is what lets the
+/// caller start a band's all-reduce while later bands are still in the GEMM.
+#[allow(clippy::too_many_arguments)]
+fn emit_pf_gemm_fp8_mx_band(
+    b: &mut Builder,
+    cus: &[u32],
+    out: u32,
+    x: u32,
+    wt: u32,
+    sc: u32,
+    t: u32,
+    nn: u32,
+    k: u32,
+    row0: u32,
+    deps: &[u32],
+) -> u32 {
     // Same pairing rule as 107: a block-fp8 weight whose scale handle is TENSOR_NONE is a null
     // pointer inside the kernel's promotion, i.e. a fault or garbage rather than a wrong number.
     assert!(
@@ -1844,6 +1865,8 @@ fn emit_pf_gemm_fp8_mx(
         d.i[0] = t;
         d.i[1] = nn;
         d.i[2] = k;
+        d.i[4] = row0; // a_row0
+        d.i[5] = row0; // c_row0
     })
 }
 

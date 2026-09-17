@@ -2722,8 +2722,14 @@ __device__ __forceinline__ void exec_gemm_fp8_blk(CInst in, CTens T, unsigned sl
 __device__ __forceinline__ void exec_gemm_fp8_mx(CInst in, CTens T, unsigned slice, unsigned nblk,
                                                  bf16* lds) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
-    d_gemm_fp8_mx((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
-                  (const unsigned char*)TEN(3), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+    /* i4 = a_row0, i5 = c_row0, the same free pointer arithmetic exec_gemm documents: disjoint
+     * row bands over the same tiles give bit-identical sums, which is what lets a banded TP seam
+     * start band 0's all-reduce while bands 1..K-1 are still in this GEMM. The scale grid is
+     * indexed by N and K only, so it does NOT move with the rows. */
+    d_gemm_fp8_mx((bf16*)TEN(0) + (size_t)in->i[5] * in->i[1],
+                  (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                  (const unsigned char*)TEN(2), (const unsigned char*)TEN(3), in->i[0], in->i[1],
+                  in->i[2], slice, nblk, lds);
 #undef TEN
 }
 #endif /* PLOW_DSV41_BLKFP8 */

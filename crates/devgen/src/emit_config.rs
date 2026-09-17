@@ -362,6 +362,14 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MLA_GATHER_SPLIT", default_value_t = 2)]
     pub mla_gather_split: u32,
 
+    /// Row bands on the V4.1 attention TP seam (1 = the unbanded emit).
+    #[arg(long, env = "PLOW_DSV41_XR_BAND", default_value_t = 1)]
+    pub dsv41_xr_band: u32,
+
+    /// CU prefix each band's collective runs on; unset = the whole seam width.
+    #[arg(long, env = "PLOW_DSV41_XR_BAND_CUS")]
+    pub dsv41_xr_band_cus: Option<u32>,
+
     #[arg(long = "k3-ns", env = "PLOW_K3_NS", hide = true)]
     legacy_k3_ns: Option<u32>,
 
@@ -1201,6 +1209,8 @@ impl EmitConfig {
             max_request_chunk: env_u32("PLOW_MAX_REQUEST_CHUNK"),
             gemv_split: env_u32("PLOW_GEMV_SPLIT").unwrap_or(1),
             mla_gather_split: env_u32("PLOW_MLA_GATHER_SPLIT").unwrap_or(2),
+            dsv41_xr_band: env_u32("PLOW_DSV41_XR_BAND").unwrap_or(1),
+            dsv41_xr_band_cus: env_u32("PLOW_DSV41_XR_BAND_CUS"),
             decode_tiled: env_bool("PLOW_DECODE_TILED"),
             l2_place_prefill: env_bool_opt("PLOW_L2_PLACE_PREFILL").unwrap_or(true),
             fuse_argmax: env_bool("PLOW_FUSE_ARGMAX"),
