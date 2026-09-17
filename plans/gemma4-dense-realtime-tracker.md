@@ -449,6 +449,37 @@ shape**, not a promoted role.
 - Tuner-digest relaxation is now decided per lookup (`GemmMeasurements::lookup`),
   not when the process-wide cache is built; the C8 tests pin the strict rule.
 
+### Protocol correction — prefix cache was on in every harness bench
+
+`PLOW_PF_SEG_TIME=1` under the real client showed `prefix attached … rows=96
+prompt=128` and a 39-row token-batch prefill. vLLM-bench's random prompts share
+a **96-token prefix**, plowrt's prefix cache is on by default, and the vLLM
+references ran with prefix caching disabled. Hits per cell (32 requests):
+
+| cell | hits | cached rows | share of prompt |
+|---|---:|---:|---:|
+| in128 | 16 | 96 | 75 % |
+| in1024 | 24–27 | 96 | 9 % |
+| in4096 | 24–27 | 96 | 2 % |
+
+Consequences: same-packet A/Bs stand (both arms cached alike); the in128 cell
+was a 32-row prefill (~12 ms GPU) that still took 42 ms — so the "in128 gap" is
+prefix-attach/VMM/host work, not prefill; and every absolute row against vLLM
+must be re-measured with `PLOW_PREFIX_CACHE=0`. All vLLM-matched recipes now
+set it; cache-off control and Lt runs are in flight and the certificate is
+regenerated from cache-off arms. A realtime-chat profile may turn the cache
+on, but only against a reference that also has it on.
+
+### Next pipeline step — ctx-keyed attention selection at emit
+
+The attention roles are one object across all live-KV histories (tracker:
+"Live-KV attention object switching: missing"). Extend the harness `probe`
+to sweep KV buckets per query rung and geometry over the candidate objects
+and `nsplit`, record to tunedb (`attention_role` kind), packetize a
+`kv_bucket → (object, nsplit, geometry)` table per site, and select at launch
+by live KV (packed metadata carries `kvlen`; prefix hits change the effective
+bucket). T2 sweep is the selection gate; served C1/C4 remains promotion.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
