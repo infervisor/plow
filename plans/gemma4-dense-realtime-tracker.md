@@ -701,6 +701,16 @@ is 16.2 ms but 21.2 with prefill, and TTFT queues behind ~20K tok/s prefill
 Harness debt: the low-memory guard kills tracked background benches while a
 server pages in weights — launch benches detached (job tmp `launch_tp_c4.sh`).
 
+### cuBLASLt at every rung — NULL (2026-09-17, paired A/B)
+
+Admitting all eight Gemma-4 shapes at 128/256/512 rows (1288 → 1640 Lt
+segments; plowrt must be rebuilt after any admission change) measured
+42.13 / 53.53 / 195.17 vs the paired control 42.43 / 53.96 / 196.55 ms: null.
+So the ~176 native GEMM launches per 512-row chunk were not the 128-token
+cost; what remains there is the per-launch floor × 528 launches and the
+host gaps. The policy is kept (simpler, not slower); the lever for 128 tokens
+is launch COUNT (fused QKV / gate|up) or a cheaper launch, not the backend.
+
 ### Split-K for the narrow decode shapes (2026-09-17)
 
 `down` (480 row blocks over 132 blocks) idled half the warps: 1.4 TB/s. Warp
