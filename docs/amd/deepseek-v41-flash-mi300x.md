@@ -5759,3 +5759,43 @@ direction as the -113 us it measured on the EP packet, and at the edge of the TP
 
 659 ms against the 200 ms goal, so 3.3x, and the gap is arithmetic efficiency: the MoE pair bills
 2154 us against a ~335 us fp8 roofline for the same MACs.
+
+## 12.81 Sequence parallelism is worth 2.55 ms/layer, and it is the last big structural win
+
+12.79 ended by naming sequence parallelism as the seam structure that would pay where overlapping
+does not. This prices it before building it.
+
+The mHC and norm packets are PER-TOKEN work, and every rank runs all `t` rows of it -- eight GPUs
+computing the same 8192 rows of the same residual stream. Under SP each rank keeps only its `t/tp`
+band between the seams, the all-reduce becomes reduce-scatter plus all-gather (the same traffic a
+two-shot all-reduce already moves), and that replicated work divides by `tp`.
+
+`PLOW_DSV41_SP_ABL=1` gives those packets `t/tp` rows and changes nothing else. The answer is WRONG
+by construction -- 7/8 of the rows are never written, so the residual is garbage from layer 1 -- but
+the cost is the cost SP would reach. Three interleaved folds of 16 iterations, medians:
+
+| packet            | replicated | banded | delta |
+|-------------------|-----------:|-------:|------:|
+| HYPER_CONN_POST   |     537 us | 114 us | -423  |
+| HYPER_CONN_PRE    |     574    | 175    | -399  |
+| GEMV_F32          |    1040    | 908    | -132  |
+| RMSNORM           |     327    | 307    |  -20  |
+| **layer**         |  **16362** | **13809** | **-2553** |
+
+**-15.6%, or 102 ms over 40 layers**, taking 659 ms to ~557 ms.
+
+Two things in that table are worth reading carefully. `GEMV_F32` barely moves: at `t/8` it is
+occupancy-bound rather than work-bound, because a wave's `W` read is `CG * K` whatever its row count
+and 256 row-blocks cannot fill 2432 waves -- the same wall arm 6 documents. And `RMSNORM` barely
+moves because the FFN norms are not in the ablated set; banding those is additional.
+
+What building it needs, and why it was priced rather than built here: a reduce-scatter/all-gather
+pair around the mHC segment (both helpers exist and are generic -- `emit_xreduce_scatter`,
+`emit_xall_gather`), band views of the residual (the runtime's `<base>@band<t>` binding is generic
+too, `amd.rs:8917`), and a THIRD peer-slot region in the dsv41 layout. That last one is the
+obstacle: `DevBlob::parse` recovers `slot_bytes` as `max(i[2])` over the collectives and the TP
+loader validates it, so the slot map is a runtime contract, and getting it wrong yields a plausible
+wrong answer rather than a fault -- which is the failure mode this campaign has already hit twice
+(12.67, 12.73).
+
+The ablation is default off and the unablated emit is byte-identical to the packet 12.80 measured.
