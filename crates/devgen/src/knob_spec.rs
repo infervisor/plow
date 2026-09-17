@@ -82,6 +82,17 @@ const C_DCP_PAGE: &[Constraint] = &[Constraint {
     check: Check::Site,
 }];
 
+/// The DCP gather ships 656-B fp8 records; a bf16 cache has no record layout to shard.
+const C_DCP: &[Constraint] = &[Constraint {
+    id: "dcp_requires_glm_fp8_kv",
+    formula: F::Implies(
+        &F::Atom("emit.dcp", Cmp::Gt, Val::Nat(1)),
+        &F::Atom("emit.glm_fp8_kv", Cmp::Eq, TRUE),
+    ),
+    site: "crates/devgen/src/mla.rs emit_glm_mla: PLOW_DCP requires PLOW_GLM_FP8_KV",
+    check: Check::Site,
+}];
+
 /// `apply_production_defaults`'s gate for the qualified GLM recipe.
 const GLM_TARGET: F = F::And(&[
     F::Target(T::Cap("glm")),
@@ -187,14 +198,32 @@ const PURE_GEMM_DEFAULT: Default = Default::Production {
     otherwise: Val::Unset,
 };
 
-const PACKED_PREFILL_DEFAULT: Default = Default::Production {
+/// `apply_production_defaults` forces the arms that read the local cache directly off under
+/// `--dcp > 1`: they bypass the owner gather.
+const GLM_DCP_SHARDED: F = F::And(&[GLM_TARGET, F::Atom("emit.dcp", Cmp::Gt, Val::Nat(1))]);
+
+const GLM_DCP_OFF_DEFAULT: Default = Default::Production {
     cases: &[DefaultCase {
-        when: F::And(&[
-            F::Target(T::Cap("packed_prefill_siblings")),
-            F::Target(T::Arch("gfx942")),
-        ]),
-        value: TRUE,
+        when: GLM_DCP_SHARDED,
+        value: FALSE,
     }],
+    otherwise: Val::Unset,
+};
+
+const PACKED_PREFILL_DEFAULT: Default = Default::Production {
+    cases: &[
+        DefaultCase {
+            when: GLM_DCP_SHARDED,
+            value: FALSE,
+        },
+        DefaultCase {
+            when: F::And(&[
+                F::Target(T::Cap("packed_prefill_siblings")),
+                F::Target(T::Arch("gfx942")),
+            ]),
+            value: TRUE,
+        },
+    ],
     otherwise: Val::Unset,
 };
 
@@ -720,6 +749,8 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.mx4_prefill", Some("PLOW_MX4_PREFILL"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.uniseg", Some("PLOW_UNISEG"), Layer::Emit, Domain::Bool, UNISEG_DEFAULT, UNISEG),
     KnobSpec::new("emit.seg_pure_gemm", Some("PLOW_SEG_PURE_GEMM"), Layer::Emit, Domain::Str, PURE_GEMM_DEFAULT, GEMMA_NATIVE_PURE_GEMM),
+    // Before the defaults that read it (`GLM_DCP_SHARDED`).
+    KnobSpec::new("emit.dcp", Some("PLOW_DCP"), Layer::Emit, U32, UNSET, OPT_IN).with(C_DCP),
     KnobSpec::new("emit.emit_packed_prefill", Some("PLOW_EMIT_PACKED_PREFILL"), Layer::Emit, Domain::Bool, PACKED_PREFILL_DEFAULT, PACKED_SIBLINGS),
     KnobSpec::new("emit.decode_mla_segments", Some("PLOW_SEG_DECODE_MLA"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.decode_grouped_moe_segments", Some("PLOW_SEG_DECODE_GROUPED_MOE"), Layer::Emit, Domain::Bool, UNSET, OPT_IN),
@@ -849,10 +880,9 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_xr_res", Some("PLOW_GLM_XR_RES"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_seq_par", Some("PLOW_GLM_SEQ_PAR"), Layer::Emit, Domain::Bool, GLM_SEQ_PAR_DEFAULT, GLM_RECIPE).with(C_SEQ_PAR),
     KnobSpec::new("emit.glm_seq_par_proj", Some("PLOW_GLM_SEQ_PAR_PROJ"), Layer::Emit, Domain::Bool, GLM_SEQ_PAR_PROJ_DEFAULT, GLM_RECIPE).with(C_SEQ_PAR_PROJ),
-    KnobSpec::new("emit.glm_rowsplit_attn", Some("PLOW_GLM_ROWSPLIT_ATTN"), Layer::Emit, Domain::Bool, UNSET, OPT_IN).scoped(ROWSPLIT_ATTN_SCOPE),
-    KnobSpec::new("emit.dcp", Some("PLOW_DCP"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.glm_rowsplit_attn", Some("PLOW_GLM_ROWSPLIT_ATTN"), Layer::Emit, Domain::Bool, GLM_DCP_OFF_DEFAULT, OPT_IN).scoped(ROWSPLIT_ATTN_SCOPE),
     KnobSpec::new("emit.dcp_page", Some("PLOW_DCP_PAGE"), Layer::Emit, U32, UNSET, OPT_IN).with(C_DCP_PAGE),
-    KnobSpec::new("emit.glm_rowband_attn", Some("PLOW_GLM_ROWBAND_ATTN"), Layer::Emit, Domain::Bool, UNSET, OPT_IN).scoped(ROWBAND_ATTN_SCOPE).with(C_ROWBAND_ATTN),
+    KnobSpec::new("emit.glm_rowband_attn", Some("PLOW_GLM_ROWBAND_ATTN"), Layer::Emit, Domain::Bool, GLM_DCP_OFF_DEFAULT, OPT_IN).scoped(ROWBAND_ATTN_SCOPE).with(C_ROWBAND_ATTN),
     KnobSpec::new("emit.glm_decode_glue_cus", Some("PLOW_GLM_DECODE_GLUE_CUS"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_decode_gemm_group", Some("PLOW_GLM_DECODE_GEMM_GROUP"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_fuse_xrn", Some("GLM_FUSE_XRN"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

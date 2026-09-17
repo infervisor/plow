@@ -338,6 +338,9 @@ pub(super) const MOE_PF_ENC_SLOT: usize = 3;
 pub(super) const MOE_ENC_MXFP4: u32 = 2;
 
 pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
+    // DCP owner gather / owner-only write (ops 181-183): without the arm the prefix is never
+    // gathered and the chunk's rows are never written.
+    ("PLOW_DCP_GATHER", &["plow_dcp_gather_1"]),
     (
         "PLOW_HAS_NORM_RESIDUAL_NORM",
         &["plow_prefill_nrn_consumer_1"],
@@ -511,6 +514,8 @@ pub(super) const XR_TAGGED_SYM: &str = "plow_xr_tagged_1";
 
 pub(super) const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_DSA_SELECT_LOCAL", &["plow_dsa_select_local_arm"]),
+    // DCP owner gather (ops 181-183): without the arm the flash reads unwritten gather buffers.
+    ("PLOW_DCP_GATHER", &["plow_dcp_gather_1"]),
     // The gated split selection (op 59 i[4] = 2). An object without the arm runs every phase as
     // the serialized cooperative form on one row: wrong set, no trap. A BUILD axis
     // (`#if PLOW_DSA_SELECT_SPLIT`).

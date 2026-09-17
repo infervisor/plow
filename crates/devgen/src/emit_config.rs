@@ -1677,13 +1677,13 @@ impl EmitConfig {
         if let Err(e) = layout.validate(None) {
             panic!("--dcp {degree} with --tp {tp}: {e}");
         }
-        // The lowering (the two head collectives and the wide merge) is stage 2. Until it lands
-        // a degree above 1 would shrink the declared KV extent without shrinking the rows the
-        // flash reads, which is silent corruption rather than a crash.
-        panic!(
-            "--dcp {degree}: KV sharding is declared but its attention lowering is not emitted \
-             yet; only --dcp 1 is admissible"
+        // The owner gather (op_collective.h) addresses shards with shifts and a group base of
+        // `rank & !(degree - 1)`, and the GLM MLA emitter is the only lowering (ops 181-183).
+        assert!(
+            degree.is_power_of_two(),
+            "--dcp {degree}: the DCP owner gather needs a power-of-two degree"
         );
+        layout
     }
 
     /// The `(clap id, still unset, resolved value)` triples [`super::apply_production_defaults`]

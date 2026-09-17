@@ -522,6 +522,7 @@ impl AmdTpGroup {
         }
         let gate_expect = gate_expectations(&blob, n_gpu, n_xctr);
         let slots = check_rowsplit_attn(&blob, check_seq_par_seams(&blob, n_gpu)?)?;
+        let slots = check_dcp_gather(&blob, slots, tp.slot_bytes)?;
         let layout =
             PeerLayout::with_slots(tp.hidden, max_tokens, n_xctr, slots).ok_or_else(|| {
                 RuntimeError::Device(format!(
@@ -2347,6 +2348,43 @@ fn check_rowsplit_attn(blob: &DevBlob, seq_par_slots: u64) -> Result<u64> {
     Ok(PeerLayout::ROWSPLIT_SLOTS)
 }
 
+/// `PLOW_DCP` (ops 181/182): every `DcpKvPack`/`XDcpGather` names the record slot at `i5`, which
+/// must be the slot right after the partial slots already laid out, and one slot must hold the
+/// widest record set (`n_batch * K * 656` B).
+fn check_dcp_gather(blob: &DevBlob, slots: u64, slot_bytes: u64) -> Result<u64> {
+    use packet::dev::DevOp;
+    const REC_BYTES: u64 = 656;
+    let mut any = false;
+    for (pi, p) in blob.progs.iter().enumerate() {
+        for d in &p.insts {
+            if d.op != DevOp::DcpKvPack as u16 && d.op != DevOp::XDcpGather as u16 {
+                continue;
+            }
+            any = true;
+            if slots == PeerLayout::ROWSPLIT_SLOTS {
+                return Err(RuntimeError::Device(format!(
+                    "program {pi} carries DCP gather ops together with XAllToAllHeads"
+                )));
+            }
+            if u64::from(d.i[5]) != slots * slot_bytes {
+                return Err(RuntimeError::Device(format!(
+                    "program {pi}: DCP record slot at {} B, host lays it out at {} B",
+                    d.i[5],
+                    slots * slot_bytes
+                )));
+            }
+            let rec = u64::from(d.i[0]) * u64::from(d.i[1]) * REC_BYTES;
+            if rec > slot_bytes {
+                return Err(RuntimeError::Device(format!(
+                    "program {pi}: DCP records {}x{} need {rec} B, peer slot is {slot_bytes} B",
+                    d.i[0], d.i[1]
+                )));
+            }
+        }
+    }
+    Ok(if any { PeerLayout::dcp_slots(slots) } else { slots })
+}
+
 fn count_xgates(blob: &DevBlob) -> u32 {
     use packet::dev::DevOp;
     let mut top = 0u32;
@@ -2903,5 +2941,58 @@ mod tests {
             e[1].iter().all(|g| *g == Some(0)),
             "dense program (no XAllToAllHeads): every gate stays at the untouched default"
         );
+    }
+
+    /// The DCP record slot is the one after the laid-out partial slots, and it must hold the
+    /// widest record set; a blob without the ops keeps its slot count.
+    #[test]
+    fn dcp_gather_takes_the_slot_after_the_partials() {
+        use crate::asset::devblob::DevProg;
+        use packet::dev::{DevInst64, DevOp};
+        let slot = 8192u64 * 6144 * 2;
+        let blob = |i: [u32; 8]| DevBlob {
+            n_cu: 256,
+            flags: 0,
+            target: 0,
+            tensors: Vec::new(),
+            init: Vec::new(),
+            kvrow: Vec::new(),
+            progs: vec![DevProg {
+                t: 1,
+                role: packet::devbuild::ProgramRole::DecodeRung { rows: 32 },
+                n_counter: 0,
+                insts: vec![DevInst64 {
+                    op: DevOp::XDcpGather as u16,
+                    i,
+                    ..Default::default()
+                }],
+                stream: Vec::new(),
+                stream_ofs: Vec::new(),
+                stream_len: Vec::new(),
+                waits: Vec::new(),
+                succs: Vec::new(),
+                gq_stream: Vec::new(),
+                gq_seg_ofs: Vec::new(),
+                l2_domains: 0,
+            }],
+            sections: Vec::new(),
+            gen: Vec::new(),
+            tp: None,
+            parent: None,
+        };
+        let six = (6 * slot) as u32;
+        assert_eq!(
+            check_dcp_gather(&blob([32, 2048, 0, 6, 3, six, 7, 8]), 6, slot).unwrap(),
+            7
+        );
+        let three = (3 * slot) as u32;
+        assert!(check_dcp_gather(&blob([32, 2048, 0, 6, 3, three, 7, 8]), 6, slot).is_err());
+        assert!(check_dcp_gather(&blob([32, 8192, 0, 6, 3, six, 7, 8]), 6, slot).is_err());
+        assert!(check_dcp_gather(&blob([32, 2048, 0, 6, 3, six, 7, 8]), 9, slot).is_err());
+        let mut plain = blob([0; 8]);
+        plain.progs[0].insts.clear();
+        assert_eq!(check_dcp_gather(&plain, 6, slot).unwrap(), 6);
+        assert!(PeerLayout::with_slots(6144, 8192, 4, 7).is_some());
+        assert!(PeerLayout::with_slots(6144, 8192, 4, 10).is_none());
     }
 }

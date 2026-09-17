@@ -218,6 +218,12 @@ impl PeerLayout {
     /// `act.qa_tp`/`act.qr_tp`/`act.oat_rs_tp` (op 160's two all-to-alls).
     pub const ROWSPLIT_SLOTS: u64 = 9;
 
+    /// `PLOW_DCP`: one more slot after [`PARTIAL_SLOTS`] or [`Self::SEQ_PAR_SLOTS`] holds this
+    /// rank's owned KV records for `XDcpGather` (row-split is refused under DCP).
+    pub const fn dcp_slots(base: u64) -> u64 {
+        base + 1
+    }
+
     /// [`PeerLayout::new`] with an explicit partial-slot count (3, 6 under the
     /// sequence-parallel seams, or 9 under `PLOW_GLM_ROWSPLIT_ATTN`). The counter region moves
     /// with it, so every rank of one group — and every program of one blob — must be laid out
@@ -227,7 +233,14 @@ impl PeerLayout {
         if partial_bytes == 0 || partial_bytes % PEER_ALIGN != 0 {
             return None;
         }
-        if slots != PARTIAL_SLOTS && slots != Self::SEQ_PAR_SLOTS && slots != Self::ROWSPLIT_SLOTS
+        if ![
+            PARTIAL_SLOTS,
+            Self::SEQ_PAR_SLOTS,
+            Self::ROWSPLIT_SLOTS,
+            Self::dcp_slots(PARTIAL_SLOTS),
+            Self::dcp_slots(Self::SEQ_PAR_SLOTS),
+        ]
+        .contains(&slots)
         {
             return None;
         }

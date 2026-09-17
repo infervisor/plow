@@ -2770,7 +2770,7 @@ fn compact_audit_patches_only_tp_collectives() {
 /// instead of the program only if the table keeps all of those, unchanged and in order.
 #[test]
 fn xaudit_table_keeps_exactly_the_collectives() {
-    let kept: [u16; 7] = [24, 25, 26, 28, 29, 116, 160];
+    let kept: [u16; 8] = [24, 25, 26, 28, 29, 116, 160, 182];
     assert_eq!(
         [
             DevOp::XReduce,
@@ -2780,6 +2780,7 @@ fn xaudit_table_keeps_exactly_the_collectives() {
             DevOp::XReduceTwoShot,
             DevOp::XReduceAddNorm,
             DevOp::XAllToAllHeads,
+            DevOp::XDcpGather,
         ]
         .map(|op| op as u16),
         kept

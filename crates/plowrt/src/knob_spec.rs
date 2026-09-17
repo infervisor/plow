@@ -754,6 +754,11 @@ mod tests {
             Site::Encoded("dsa_pf_packet_requires_mla_pf_v2"),
         ),
         (
+            "mla.rs",
+            "PLOW_DCP requires PLOW_GLM_FP8_KV",
+            Site::Encoded("dcp_requires_glm_fp8_kv"),
+        ),
+        (
             "metal.rs",
             "requires PLOW_TEST_BLOB, PLOW_TEST_CHECKPOINT and PLOW_TEST_AUDIO_DIR",
             Site::NotAConstraint("an #[ignore] reason naming the Qwen3-ASR Metal test's fixture paths"),

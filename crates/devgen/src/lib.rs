@@ -7451,6 +7451,30 @@ fn apply_production_defaults(
                 emit_config::GLM_GEMM_LT_PF_EXT_QUALIFIED.to_string(),
             );
         }
+        // DCP shards the latent cache per rank. Token-batch bodies, packed prefill and the
+        // row-split/row-band arms read the local cache directly instead of the owner gather
+        // (`emit_glm_mla_prefill` asserts it), so under `--dcp > 1` the recipe FORCES them off,
+        // recorded like the seq-par force above.
+        if cfg.dcp.is_some_and(|d| d > 1) {
+            if cfg.token_batch_tp {
+                cfg.token_batch_tp = false;
+                emit_config::note_production_default("token_batch_tp", "false".into());
+            }
+            if cfg.packed_sparse_pf {
+                cfg.packed_sparse_pf = false;
+                emit_config::note_production_default("packed_sparse_pf", "false".into());
+            }
+            for (field, id) in [
+                (&mut cfg.emit_packed_prefill, "emit_packed_prefill"),
+                (&mut cfg.glm_rowband_attn, "glm_rowband_attn"),
+                (&mut cfg.glm_rowsplit_attn, "glm_rowsplit_attn"),
+            ] {
+                if *field != Some(false) {
+                    *field = Some(false);
+                    emit_config::note_production_default(id, "false".into());
+                }
+            }
+        }
     }
 }
 

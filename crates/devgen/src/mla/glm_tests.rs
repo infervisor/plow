@@ -1036,6 +1036,85 @@ fn glm_dsa_selector_is_bound_to_the_live_kv_length_and_declares_its_geometry() {
     );
 }
 
+/// DCP (`PLOW_DCP=8`, TP8): the cache is declared at the per-rank local capacity, the writers
+/// stage their rows, `DcpKvScatter` places them, and attention reads the owner gather — the
+/// decode flash turns DENSE over `[rows][2048]` gathered records with `kv_len = glen`, the
+/// prefill flash keeps its global selection and `kv_stride = ctx` over the gathered prefix.
+#[test]
+fn glm_dcp_stages_writes_and_reads_the_owner_gather() {
+    let _g = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_GLM_DSA", "1"),
+        ("PLOW_GLM_FUSE_ROPE", "0"),
+        ("PLOW_GLM_DSA_PF", "1"),
+        ("PLOW_DCP", "8"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    c.heads = 64;
+    c.indexer_full[3] = true;
+    let ctx = 81920;
+    let xr: Vec<u32> = (0..256).collect();
+    let mut declarations = Builder::new(256);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 16, MoeEnc::Fp8Blk);
+    let tensors = declarations.tensors();
+    let local = 10240u64; // ceil(81920 / 64 / 8) pages of 64
+    assert_eq!(n.kv_ctx as u64, local);
+    assert_eq!(tensors[n.ckv[0] as usize].bytes, 16 * local * 512);
+    assert_eq!(tensors[n.kv_scale[0] as usize].bytes, 16 * local * 4);
+    assert_eq!(tensors[n.dcp_gckv as usize].bytes, 16 * 2048 * 512);
+    assert_eq!(tensors[n.dcp_pckv as usize].bytes, u64::from(ctx) * 512);
+    for rows in [1, 8, 16] {
+        let mut b = Builder::new(256);
+        b.adopt_tensors(tensors.clone());
+        let mut xgate = 0;
+        emit_glm_mla(
+            &mut b, &c, &n, 0, ctx, rows, 16, MoeEnc::Fp8Blk, n.x, &[], false, &mut xgate, &xr,
+        );
+        let p = b.finish();
+        let at = |op: DevOp| p.insts.iter().position(|d| d.op == op as u16).unwrap();
+        let writer = p.insts.iter().find(|d| d.op == DevOp::HeadNormRopeFp8 as u16).unwrap();
+        assert_eq!(
+            (writer.t[0], writer.t[6], writer.i[6], writer.j[0]),
+            (n.dcp_ckv_st, n.dcp_scale_st, 0, 0)
+        );
+        assert!(p.insts.iter().all(|d| d.op != DevOp::HeadNormRopeFp8 as u16 || d.t[0] != n.ckv[0]));
+        let scatter = &p.insts[at(DevOp::DcpKvScatter)];
+        assert_eq!(
+            (scatter.t[4], scatter.i[0], scatter.i[1], scatter.i[2], scatter.i[3], scatter.i[5]),
+            (n.ckv[0], rows, 10240, 6, 3, 1)
+        );
+        let pack = &p.insts[at(DevOp::DcpKvPack)];
+        assert_eq!((pack.t[0], pack.i[0], pack.i[1], pack.i[5]), (n.iidx, rows, 2048, n.dcp_slot));
+        let gather = &p.insts[at(DevOp::XDcpGather)];
+        assert_eq!((gather.t[2], gather.t[5], gather.i[7]), (n.dcp_gckv, n.dcp_glen, 8));
+        let flash = &p.insts[at(DevOp::FlashMlaDecodeFp8)];
+        assert_eq!(
+            (flash.t[4], flash.t[5], flash.t[6], flash.t[7], flash.i[2], flash.j[0]),
+            (n.dcp_gckv, n.dcp_gkrot, n.dcp_glen, n.dcp_gscale, 2048, 0)
+        );
+        assert!(at(DevOp::DcpKvScatter) < at(DevOp::DcpKvPack));
+        assert!(at(DevOp::XDcpGather) < at(DevOp::FlashMlaDecodeFp8));
+    }
+    let mut b = Builder::new(256);
+    b.adopt_tensors(tensors);
+    let mut xgate = 0;
+    emit_glm_mla_prefill(
+        &mut b, &c, &n, 0, ctx, 8192, MoeEnc::Fp8Blk, n.x, &[], false, &mut xgate, &xr, None,
+    );
+    let p = b.finish();
+    let scatter = p.insts.iter().find(|d| d.op == DevOp::DcpKvScatter as u16).unwrap();
+    assert_eq!((scatter.i[0], scatter.i[5]), (8192, 0));
+    let pack = p.insts.iter().find(|d| d.op == DevOp::DcpKvPack as u16).unwrap();
+    assert_eq!((pack.t[0], pack.i[0], pack.i[1]), (TENSOR_NONE, 1, ctx));
+    let flash = p.insts.iter().find(|d| d.op == DevOp::FlashMlaPrefillFp8 as u16).unwrap();
+    assert_eq!(
+        (flash.t[4], flash.t[5], flash.t[7], flash.i[2], flash.j[0]),
+        (n.dcp_pckv, n.dcp_pkrot, n.dcp_pscale, ctx, n.iuni + 1)
+    );
+}
+
 #[test]
 fn glm_sparse_fp8_cache_writer_and_attention_operands() {
     let _g = crate::test_env::env_guard();
@@ -5366,27 +5445,21 @@ fn dcp_degree_one_emits_a_byte_identical_packet() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A degree above 1 declares a smaller KV extent than the flash reads until the stage-2
-/// lowering lands. That is silent corruption, not a crash, so the emitter must refuse it.
+/// A power-of-two degree resolves to the sharded layout the owner gather addresses; the local
+/// extent is what `emit_glm_mla` declares for `kv.*`.
 #[test]
-fn dcp_degree_above_one_is_refused_until_the_lowering_lands() {
+fn dcp_degree_resolves_to_the_sharded_layout() {
     use packet::dcp::DcpLayout;
-    // The refusal lives in `EmitConfig::dcp_layout`, reached through the emitter; check it
-    // directly so the test does not depend on a full emit.
     let _guard = crate::test_env::env_guard();
     let cfg = {
         let _env = crate::test_env::EnvScope::set(&[("PLOW_DCP", "8")]);
         crate::emit_config::EmitConfig::from_env()
     };
-    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cfg.dcp_layout(8)))
-        .expect_err("--dcp 8 must be refused");
-    let msg = err
-        .downcast_ref::<String>()
-        .cloned()
-        .unwrap_or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()).unwrap());
-    assert!(msg.contains("--dcp 8"), "{msg}");
+    let l = cfg.dcp_layout(8);
+    assert!(l.enabled());
+    assert_eq!(l.local_capacity(81_920), 10_240);
 
-    // An inadmissible degree is refused for its own reason, before the not-yet-lowered one.
+    // An inadmissible degree is refused for its own reason.
     let bad = {
         let _env = crate::test_env::EnvScope::set(&[("PLOW_DCP", "3")]);
         crate::emit_config::EmitConfig::from_env()

@@ -10495,7 +10495,10 @@ impl AmdEngine {
         // each sequence's frontier, so this is exactly the cost of letting every admitted
         // sequence run to the context it reserved. `free` is what the driver reports after the
         // load, so weights, workspaces and the prefix cache are already subtracted.
-        let kv_admission = free.and_then(|free| {
+        // Flat KV (no pool, no shared prefix: e.g. a DCP packet) is fully backed at load and
+        // already absent from `free`, so charging it again would halve the seats for nothing.
+        let flat_kv = vmm.is_none() && shared_prefix.is_none();
+        let kv_admission = free.filter(|_| !flat_kv).and_then(|free| {
             let kv_bytes: u64 = blob
                 .tensors
                 .iter()

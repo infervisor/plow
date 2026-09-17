@@ -1875,6 +1875,22 @@ pub(crate) struct GlmTn {
     ug_tp: u32,
     xe_tp: u32,
     rt_tp: u32,
+    /// Decode context parallelism (`PLOW_DCP`): the KV row layout, the per-rank cache stride
+    /// (`dcp.local_capacity(ctx)`, = ctx when replicated), the byte offset of the DCP record peer
+    /// slot, and the DCP staging/gathered activations (TENSOR_NONE unless `dcp.enabled()`).
+    dcp: packet::dcp::DcpLayout,
+    kv_ctx: u32,
+    dcp_slot: u32,
+    dcp_ckv_st: u32,   // u8 [rows][512] this step's latent rows, before the owner-only write
+    dcp_krot_st: u32,  // bf16 [rows][64] roped k rows
+    dcp_scale_st: u32, // f32 [rows] latent row scales
+    dcp_gckv: u32,     // u8 [dbatch][itk][512] decode owner gather of the DSA selection
+    dcp_gkrot: u32,    // bf16 [dbatch][itk][64]
+    dcp_gscale: u32,   // f32 [dbatch][itk]
+    dcp_glen: u32,     // i32 [dbatch] min(itk, kv_len): the dense flash's kv_len over the gather
+    dcp_pckv: u32,     // u8 [ctx][512] prefill owner gather of the prefix
+    dcp_pkrot: u32,    // bf16 [ctx][64]
+    dcp_pscale: u32,   // f32 [ctx]
     // DSA indexer (TENSOR_NONE when the DSA gate is off). qidx/kidx_raw/kidx_normed/widx are per-step
     // scratch; iscore/iidx/ighist/igctl are the score+select scratch (shared across layers, sequential);
     // icos/isin are the [ctx][DI/2] identity-tail interleaved-RoPE tables (first qk_rope/2 real, rest 1/0).
@@ -2527,12 +2543,37 @@ fn declare_glm_rows_batched_for_prefill(
     // Rows of the shared latent KV cache THIS RANK holds. `local_capacity` is the identity at
     // DCP degree 1, so the replicated packet does not change by a byte. The indexer's `kidx`
     // cache stays replicated: its cross-rank combine is a distributed top-k, not an LSE merge.
-    let kv_ctx = u32::try_from(
-        emit_config::active()
-            .dcp_layout(c.tp)
-            .local_capacity(u64::from(ctx)),
-    )
-    .expect("DCP local capacity fits u32");
+    let dcp = emit_config::active().dcp_layout(c.tp);
+    let kv_ctx = u32::try_from(dcp.local_capacity(u64::from(ctx))).expect("DCP local capacity fits u32");
+    // DCP (`PLOW_DCP`): the owner-only write stages this step's rows, the owner gather assembles
+    // the rows attention reads. Decode gathers the `[dbatch][itk]` DSA selection, prefill the
+    // prefix `[ctx]` of the one prefilling sequence. See `emit_glm_dcp_*` and op_collective.h.
+    let dcp_itk = c.index_topk.min(ctx) as u64;
+    let dcp_t = |b: &mut Builder, n: &str, sz: u64| {
+        if dcp.enabled() {
+            b.tensor(&format!("act.dcp_{n}"), sz)
+        } else {
+            TENSOR_NONE
+        }
+    };
+    let dcp_ckv_st = dcp_t(b, "ckv_st", rows * dk as u64);
+    let dcp_krot_st = dcp_t(b, "krot_st", rows * dr as u64 * BF16);
+    let dcp_scale_st = dcp_t(b, "scale_st", rows * 4);
+    let dcp_gckv = dcp_t(b, "gckv", dbatch as u64 * dcp_itk * dk as u64);
+    let dcp_gkrot = dcp_t(b, "gkrot", dbatch as u64 * dcp_itk * dr as u64 * BF16);
+    let dcp_gscale = dcp_t(b, "gscale", dbatch as u64 * dcp_itk * 4);
+    let dcp_glen = dcp_t(b, "glen", dbatch as u64 * I32);
+    let has_prefill = prefill_rows.iter().any(|&t| t > 1) || rows > u64::from(dbatch);
+    let dcp_pf = |b: &mut Builder, n: &str, sz: u64| {
+        if has_prefill {
+            dcp_t(b, n, sz)
+        } else {
+            TENSOR_NONE
+        }
+    };
+    let dcp_pckv = dcp_pf(b, "pckv", ctx as u64 * dk as u64);
+    let dcp_pkrot = dcp_pf(b, "pkrot", ctx as u64 * dr as u64 * BF16);
+    let dcp_pscale = dcp_pf(b, "pscale", ctx as u64 * 4);
     for &l in layer_ids {
         let mla = c.is_softmax(l);
         // fp8 latent ([`glm_fp8_kv`]): 1 B/elt e4m3 plus one f32 scale per cached row, the K3
@@ -3206,6 +3247,21 @@ fn declare_glm_rows_batched_for_prefill(
         ug_tp,
         xe_tp,
         rt_tp,
+        dcp,
+        kv_ctx,
+        // The DCP record slot follows every partial slot the host lays out for this packet:
+        // 3 (`PARTIAL_SLOTS`) or 6 under the sequence-parallel seams (row-split is refused).
+        dcp_slot: if sp_seams { 6 } else { 3 } * (rows as u32 * h * BF16 as u32),
+        dcp_ckv_st,
+        dcp_krot_st,
+        dcp_scale_st,
+        dcp_gckv,
+        dcp_gkrot,
+        dcp_gscale,
+        dcp_glen,
+        dcp_pckv,
+        dcp_pkrot,
+        dcp_pscale,
         meta,
         row_token,
         row_partidx,
@@ -4081,6 +4137,8 @@ pub(crate) fn emit_glm_mla(
     } else {
         one.clone()
     };
+    let dcp = n.dcp.enabled();
+    assert!(!dcp || fp8kv, "PLOW_DCP requires PLOW_GLM_FP8_KV");
     let c_rnkv = if fp8kv {
         b.emit(DevOp::HeadNormRopeFp8, kvw_cus, &[c_ckvd], |d| {
             d.t[0] = n.ckv[slot];
@@ -4099,6 +4157,14 @@ pub(crate) fn emit_glm_mla(
                 d.j[0] = ctx;
             }
             d.j[1] = KV_MASK_NONE;
+            if dcp {
+                // Staged at row t (`act.*`, so the host's kvrow patching skips it); the
+                // owner-only write below places it.
+                d.t[0] = n.dcp_ckv_st;
+                d.t[6] = n.dcp_scale_st;
+                d.i[6] = 0;
+                d.j[0] = 0;
+            }
         })
     } else if rows > 1 || dbatch > 1 {
         // BATCHED latent writer. The single-row form is a plain RmsNorm whose write row is a
@@ -4173,7 +4239,19 @@ pub(crate) fn emit_glm_mla(
             }
             d.f[0] = eps;
             d.j[1] = KV_MASK_NONE;
+            if dcp {
+                // Rope angle stays on the global pos[t]; the write lands at staging row t.
+                d.t[0] = n.dcp_krot_st;
+                d.i[6] = 0;
+                d.j[0] = 0;
+            }
         })
+    };
+    let (c_rnkv, c_krd) = if dcp {
+        let c_sc = emit_glm_dcp_scatter(b, n, slot, rows, true, &[c_rnkv, c_krd]);
+        (c_sc, c_sc)
+    } else {
+        (c_rnkv, c_krd)
     };
     // --- DSA lightning indexer (G2/G5): ctx>2048 => project q_idx/k_idx/w, score, top-k select ->
     //     idx table, then FLASH_GATHER over the top_k selected latent rows. ctx<=2048 => dense flash
@@ -4232,6 +4310,23 @@ pub(crate) fn emit_glm_mla(
             "sparse FP8 decode requires qualified QH8 latent512/rope64 GF4 geometry"
         );
     }
+    assert!(
+        !dcp || (sparse && !emit_config::active().glm_mla_dec_aiter),
+        "PLOW_DCP decode requires the interpreter sparse DSA flash (ctx > the DSA gate, no \
+         PLOW_GLM_DECODE_DENSE_EXACT, no PLOW_GLM_MLA_DEC_AITER)"
+    );
+    if dcp {
+        fl_deps.push(emit_glm_dcp_gather(
+            b,
+            xgate,
+            n,
+            slot,
+            true,
+            rows,
+            glm_dsa_select_width(c, ctx),
+            &fl_deps.clone(),
+        ));
+    }
     let c_fl = b.emit(
         match (dsa, fp8kv) {
             (_, true) => DevOp::FlashMlaDecodeFp8,
@@ -4288,6 +4383,18 @@ pub(crate) fn emit_glm_mla(
                     d.t[7] = n.iidx;
                 }
                 d.i[6] = glm_dsa_select_width(c, ctx); // fixed selection-row width
+            }
+            if dcp {
+                // DENSE fp8 flash over the owner gather: `kv_len = glen = min(itk, len)` walks
+                // exactly the selected rows, in selection order, every row kept — the rows and
+                // accumulation order of the GATHER arm above, so bit-identical to it.
+                d.t[4] = n.dcp_gckv;
+                d.t[5] = n.dcp_gkrot;
+                d.t[6] = n.dcp_glen;
+                d.t[7] = n.dcp_gscale;
+                d.i[2] = glm_dsa_select_width(c, ctx);
+                d.i[6] = 0;
+                d.j[0] = 0;
             }
         },
     );
@@ -4854,6 +4961,99 @@ fn emit_glm_dsa_select_split(
 
 /// The DSA top-k SELECT over `rows` scored rows -> `n.iidx`, shared by the decode chain and the
 /// token-batch band. Byte-identical to the decode emit it was lifted from.
+/// DCP owner-only KV write (op 183): the latent/rope writers staged this step's `rows` at row t;
+/// place row t in the local cache iff this rank's shard owns `pos[t]`. `batched`: row t is decode
+/// slot t; otherwise every row belongs to the one prefilling sequence.
+fn emit_glm_dcp_scatter(
+    b: &mut Builder,
+    n: &GlmTn,
+    slot: usize,
+    rows: u32,
+    batched: bool,
+    deps: &[u32],
+) -> u32 {
+    let cus: Vec<u32> = (0..rows.div_ceil(512).clamp(1, 48).min(b.n_cu())).collect();
+    b.emit(DevOp::DcpKvScatter, cus, deps, |d| {
+        d.t[0] = n.pos;
+        d.t[1] = n.dcp_ckv_st;
+        d.t[2] = n.dcp_krot_st;
+        d.t[3] = n.dcp_scale_st;
+        d.t[4] = n.ckv[slot];
+        d.t[5] = n.krot[slot];
+        d.t[6] = n.kv_scale[slot];
+        d.i[0] = rows;
+        d.i[1] = n.kv_ctx;
+        d.i[2] = n.dcp.page_rows.trailing_zeros();
+        d.i[3] = n.dcp.degree.trailing_zeros();
+        d.i[5] = u32::from(batched);
+    })
+}
+
+/// DCP owner gather (ops 181 + 182): every rank packs the records its shard owns into the DCP peer
+/// slot, then pulls each from its owner. Decode gathers the `[rows][k]` DSA selection into
+/// `act.dcp_g*` and writes `glen`; prefill gathers the prefix rows `[0, kv_len)` of the one
+/// prefilling sequence (`k` = ctx) into `act.dcp_p*`. Workgroups per form are the measured
+/// optimum (op_collective.h): 152 decode, 96 prefill.
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_dcp_gather(
+    b: &mut Builder,
+    xgate: &mut u32,
+    n: &GlmTn,
+    slot: usize,
+    decode: bool,
+    rows: u32,
+    k: u32,
+    deps: &[u32],
+) -> u32 {
+    let n_batch = if decode { rows } else { 1 };
+    let rec_bytes = u64::from(n_batch) * u64::from(k) * 656;
+    let slot_b = n.dcp_slot / if n.h2_tp != TENSOR_NONE { 6 } else { 3 };
+    assert!(
+        rec_bytes <= u64::from(slot_b),
+        "DCP record slot needs {rec_bytes} B but a peer slot is {slot_b} B (rows_max * hidden * 2)"
+    );
+    let cus: Vec<u32> = (0..(if decode { 152 } else { 96 }).min(b.n_cu())).collect();
+    let (ps, ds) = (n.dcp.page_rows.trailing_zeros(), n.dcp.degree.trailing_zeros());
+    let idx = if decode { n.iidx } else { TENSOR_NONE };
+    let pack = b.emit(DevOp::DcpKvPack, cus.clone(), deps, |d| {
+        d.t[0] = idx;
+        d.t[1] = n.kvlen;
+        d.t[2] = n.ckv[slot];
+        d.t[3] = n.krot[slot];
+        d.t[4] = n.kv_scale[slot];
+        d.i[0] = n_batch;
+        d.i[1] = k;
+        d.i[2] = n.kv_ctx;
+        d.i[3] = ps;
+        d.i[4] = ds;
+        d.i[5] = n.dcp_slot;
+    });
+    let gate = *xgate;
+    *xgate += 1;
+    b.emit(DevOp::XDcpGather, cus, &[pack], |d| {
+        d.t[0] = idx;
+        d.t[1] = n.kvlen;
+        if decode {
+            d.t[2] = n.dcp_gckv;
+            d.t[3] = n.dcp_gkrot;
+            d.t[4] = n.dcp_gscale;
+            d.t[5] = n.dcp_glen;
+        } else {
+            d.t[2] = n.dcp_pckv;
+            d.t[3] = n.dcp_pkrot;
+            d.t[4] = n.dcp_pscale;
+            d.t[5] = TENSOR_NONE;
+        }
+        d.i[0] = n_batch;
+        d.i[1] = k;
+        d.i[3] = ps;
+        d.i[4] = ds;
+        d.i[5] = n.dcp_slot;
+        d.i[6] = gate;
+        d.i[7] = n.dcp.world_size;
+    })
+}
+
 fn emit_glm_dsa_select_rows(
     b: &mut Builder,
     c: &GlmCfg,
@@ -6749,6 +6949,12 @@ pub(crate) fn emit_glm_mla_prefill(
     //   Under [`glm_fp8_kv`]: HeadNormRopeFp8 with no trig (the K3 form) — RMSNorm + quantize +
     //   per-row scale in one pass, T rows; the chunk rebase patches its i[3] (kv_write_row_field).
     let fp8kv = glm_fp8_kv();
+    let dcp = n.dcp.enabled();
+    assert!(
+        !dcp || (fp8kv && band.is_none() && !use_rowsplit && !b.packed_prefill_segments()),
+        "PLOW_DCP prefill (t={t}) requires FP8 KV and no token-batch body, row-split or packed \
+         prefill: those read the local cache directly"
+    );
     let c_rnkv = if fp8kv {
         b.emit(
             DevOp::HeadNormRopeFp8,
@@ -6768,6 +6974,11 @@ pub(crate) fn emit_glm_mla_prefill(
                 d.i[7] = ctx; // packed-prefill per-slot cache row stride
                 d.f[0] = eps;
                 d.j[1] = KV_MASK_NONE;
+                if dcp {
+                    // Staged at row t; not `kv.*`, so the chunk rebase leaves i[3] at 0.
+                    d.t[0] = n.dcp_ckv_st;
+                    d.t[6] = n.dcp_scale_st;
+                }
             },
         )
     } else {
@@ -6801,7 +7012,16 @@ pub(crate) fn emit_glm_mla_prefill(
             d.f[0] = eps;
             d.j[0] = 0;
             d.j[1] = KV_MASK_NONE;
+            if dcp {
+                d.t[0] = n.dcp_krot_st;
+            }
         })
+    };
+    let (c_rnkv, c_krd) = if dcp {
+        let c_sc = emit_glm_dcp_scatter(b, n, slot, t, false, &[c_rnkv, c_krd]);
+        (c_sc, c_sc)
+    } else {
+        (c_rnkv, c_krd)
     };
     // 9 FLASH_MLA_PREFILL. Operands are the decode twin's, with ONE reinterpretation: i[4] carried
     //   `nsplit` and now carries `n_tok`. That is forced, not opportunistic — nsplit MUST be 1 here,
@@ -6901,6 +7121,10 @@ pub(crate) fn emit_glm_mla_prefill(
     } else {
         glm_pf_ns()
     };
+    if dcp {
+        let g = emit_glm_dcp_gather(b, xgate, n, slot, false, t, ctx, &fl_deps.clone());
+        fl_deps.push(g);
+    }
     let c_uv = if use_rowsplit {
         emit_glm_rowsplit_attn(
             b, c, n, w, rb.as_ref(), t, ctx, slot, fp8kv, sparse_sel, &fl_deps, xgate, xr_cus,
@@ -6955,6 +7179,14 @@ pub(crate) fn emit_glm_mla_prefill(
             d.i[5] = KV_MASK_NONE;
             d.i[7] = glm_gf_prefill(ctx, nh_l);
             d.f[0] = c.attn_scale;
+            if dcp {
+                // The owner gather assembled the prefix at its global rows, so every flash arm
+                // (dense small buckets, the interpreter and native sparse routes) reads it at the
+                // same `kv_stride = ctx` and global selection it read the replicated cache at.
+                d.t[4] = n.dcp_pckv;
+                d.t[5] = n.dcp_pkrot;
+                d.t[7] = n.dcp_pscale;
+            }
         },
     );
     // 10 FUSED MLA MERGE+FOLD, nsplit=1. The partials are [b][t][head][nsplit][DK] and the fold

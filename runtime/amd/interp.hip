@@ -772,6 +772,9 @@ extern "C" __device__ unsigned plow_prefill_nrn_consumer_1 = 1;
 #if PLOW_GATE_HIER
 extern "C" __device__ unsigned plow_gate_hier_1 = 1;
 #endif
+#if PLOW_DCP_GATHER
+extern "C" __device__ unsigned plow_dcp_gather_1 = 1;
+#endif
 #ifndef PLOW_GQ_BATCH
 #define PLOW_GQ_BATCH 1
 #endif
