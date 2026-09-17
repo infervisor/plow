@@ -132,6 +132,8 @@ template <class F> __device__ __forceinline__ void gemv_walk(unsigned M, F f) {
     else f(gv_mm<GV_MM_MAX>{}, m0, rem);
 }
 
+#include "op_gemv_mma.cuh"
+
 /* C[m][n] = dot(x[m][:], W[n][:]). W is [N, K] — HF nn.Linear layout, row n is output n. */
 template <int MM, int UN = gv_un<MM>::v, bool BIAS = false>
 __device__ __forceinline__ void gemv_rows(__nv_bfloat16* __restrict__ C,
@@ -139,6 +141,15 @@ __device__ __forceinline__ void gemv_rows(__nv_bfloat16* __restrict__ C,
                                           const __nv_bfloat16* __restrict__ W, unsigned M,
                                           unsigned N, unsigned K, unsigned slice, unsigned nblk,
                                           const __nv_bfloat16* __restrict__ bias = nullptr) {
+#if PLOW_NV_GEMV_MMA
+    /* BATCH>=8 rungs on the tensor cores (op_gemv_mma.cuh); the dot8 walk stays for K % 32 != 0. */
+    if constexpr (MM >= 8) {
+        if ((K & 31u) == 0u) {
+            gemv_rows_mma<BIAS>(C, x, W, M, N, K, slice, nblk, bias);
+            return;
+        }
+    }
+#endif
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned nchunk = (K + GV_STEP - 1) / GV_STEP;
@@ -545,6 +556,14 @@ __device__ __forceinline__ void gemv_qkv_rows(__nv_bfloat16* Cq, __nv_bfloat16* 
                            const __nv_bfloat16* bq = nullptr,
                            const __nv_bfloat16* bk = nullptr,
                            const __nv_bfloat16* bv = nullptr) {
+#if PLOW_NV_GEMV_MMA
+    if constexpr (MM >= 8) {
+        if ((K & 31u) == 0u && ((Nq | Nk) & 7u) == 0u) {
+            gemv_qkv_rows_mma<BIAS>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, slice, nblk, bq, bk, bv);
+            return;
+        }
+    }
+#endif
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned nchunk = (K + GV_STEP - 1) / GV_STEP;
@@ -2303,6 +2322,14 @@ template <int MM, int UN = gv_un_glu<MM>::v>
 __device__ __forceinline__ void gemv_glu_rows(__nv_bfloat16* C, const __nv_bfloat16* x,
                            const __nv_bfloat16* Wg, const __nv_bfloat16* Wu, unsigned M, unsigned N,
                            unsigned K, unsigned act, unsigned slice, unsigned nblk) {
+#if PLOW_NV_GEMV_MMA
+    if constexpr (MM >= 8) {
+        if ((K & 31u) == 0u) {
+            gemv_glu_rows_mma(C, x, Wg, Wu, M, N, K, act, slice, nblk);
+            return;
+        }
+    }
+#endif
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned nchunk = (K + GV_STEP - 1) / GV_STEP;

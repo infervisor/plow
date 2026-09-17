@@ -1,0 +1,212 @@
+/* op_gemv_mma.cuh — tensor-core row-block walk for BATCH>=8 decode GEMV (PLOW_NV_GEMV_MMA=1).
+ *
+ * WHY. gemv_rows<MM> streams each weight vector once, then dots it against MM activation rows
+ * with dot8 on the CUDA cores: at MM=16 that is 16 activation loads and 128 FMAs per 16-byte
+ * weight chunk, ~400 GFLOP of f32 FMA and ~25 G L1 loads per Gemma-4-12B step. Measured on
+ * H100 (cell campaign-bf16-ladder, GV_MM_MAX=16, in128 so prefill is negligible): TPOT 12.7 ms
+ * at B=1, 18.1 at B=4, 44.6 at B=16 — decode scales ~linearly with the batch instead of staying
+ * at the weight-streaming floor (~7.4 ms for 24.8 GB at 3.35 TB/s). mma.sync m16n8k16 does the
+ * same 16-row dot in one instruction per k16, so the walk goes back to being bandwidth-bound.
+ *
+ * SHAPE. One warp owns 8 consecutive output rows n (the mma N) and all 16 activation rows (the
+ * mma M) for the whole K walk; K advances 32 per step (two k16 mmas). Fragment loads come
+ * straight from global memory with a VIRTUAL K ORDER: lane (g = lane>>2, t = lane&3) loads the
+ * 8 contiguous bf16 W[nb+g][kb+8t .. +8) as one 16-byte vector and treats them as the mma's
+ * k positions {2t,2t+1,2t+8,2t+9} of step 0 and step 1. The A fragments (x rows g and g+8) use
+ * the same mapping, and a dot product is invariant to a K permutation applied to both operands,
+ * so the result is exact w.r.t. the true k order (f32 accumulation order differs from dot8's,
+ * so outputs are NOT bit-identical to gemv_rows — same class of difference as any tile change).
+ *
+ * MASKING. Activation rows >= `rows` and weight rows >= N read from a clamped valid row and are
+ * simply not stored (a garbage A row only pollutes its own C row, a garbage B column only its
+ * own C column). No zeroing, no per-lane branch in the K loop.
+ *
+ * CONTRACT. K % 32 == 0 (every Gemma-4 K: 3840/4096/15360). Callers fall back to the dot8 walk
+ * otherwise, and the QKV variant additionally needs Nq % 8 == Nk % 8 == 0 so an 8-row block never
+ * straddles two weight matrices. */
+#pragma once
+
+#ifndef PLOW_NV_GEMV_MMA
+#define PLOW_NV_GEMV_MMA 0
+#endif
+/* k32 steps in flight per lane: UNB x (NW x 16 B) of weight loads before the first mma. */
+#ifndef PLOW_NV_GEMV_MMA_UNB
+#define PLOW_NV_GEMV_MMA_UNB 4
+#endif
+
+static __device__ __forceinline__ __nv_bfloat16 gemma_glu_epilogue(float gate, float up,
+                                                                 unsigned act);
+
+__device__ __forceinline__ void gvmma_mma16816(float (&d)[4], unsigned a0, unsigned a1,
+                                               unsigned a2, unsigned a3, unsigned b0,
+                                               unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+/* acc[i] is the mma C fragment of x[0..16) x W[i][nb..nb+8)^T: lane (g,t) holds
+ * C[g][2t], C[g][2t+1], C[g+8][2t], C[g+8][2t+1]. */
+template <int NW>
+__device__ __forceinline__ void gvmma_tile(float (&acc)[NW][4], const __nv_bfloat16* __restrict__ x,
+                                           const __nv_bfloat16* const (&W)[NW], unsigned nb,
+                                           unsigned rows, unsigned N, unsigned K) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned g = lane >> 2, t = lane & 3;
+    const __nv_bfloat16* x0 = x + (size_t)(g < rows ? g : 0u) * K;
+    const __nv_bfloat16* x1 = x + (size_t)(g + 8u < rows ? g + 8u : 0u) * K;
+    const unsigned n = nb + g;
+    const __nv_bfloat16* w[NW];
+#pragma unroll
+    for (int i = 0; i < NW; i++) w[i] = W[i] + (size_t)(n < N ? n : 0u) * K + t * 8u;
+    x0 += t * 8u;
+    x1 += t * 8u;
+#pragma unroll
+    for (int i = 0; i < NW; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    constexpr unsigned UNB = PLOW_NV_GEMV_MMA_UNB;
+    const unsigned nkb = K >> 5;
+    unsigned kb = 0;
+    for (; kb + UNB <= nkb; kb += UNB) {
+        uint4 wv[NW][UNB];
+#pragma unroll
+        for (unsigned u = 0; u < UNB; u++)
+#pragma unroll
+            for (int i = 0; i < NW; i++) wv[i][u] = *(const uint4*)(w[i] + (kb + u) * 32u);
+#pragma unroll
+        for (unsigned u = 0; u < UNB; u++) {
+            const uint4 a0 = *(const uint4*)(x0 + (kb + u) * 32u);
+            const uint4 a1 = *(const uint4*)(x1 + (kb + u) * 32u);
+#pragma unroll
+            for (int i = 0; i < NW; i++) {
+                gvmma_mma16816(acc[i], a0.x, a1.x, a0.y, a1.y, wv[i][u].x, wv[i][u].y);
+                gvmma_mma16816(acc[i], a0.z, a1.z, a0.w, a1.w, wv[i][u].z, wv[i][u].w);
+            }
+        }
+    }
+    for (; kb < nkb; kb++) {
+        const uint4 a0 = *(const uint4*)(x0 + kb * 32u);
+        const uint4 a1 = *(const uint4*)(x1 + kb * 32u);
+#pragma unroll
+        for (int i = 0; i < NW; i++) {
+            const uint4 wv = *(const uint4*)(w[i] + kb * 32u);
+            gvmma_mma16816(acc[i], a0.x, a1.x, a0.y, a1.y, wv.x, wv.y);
+            gvmma_mma16816(acc[i], a0.z, a1.z, a0.w, a1.w, wv.z, wv.w);
+        }
+    }
+}
+
+/* Row-block partition shared by the three walks: block `slice` owns 8-row blocks
+ * [rb0, rb1) of the N (or concatenated N) range; warps stride through them. */
+struct gvmma_range { unsigned rb0, rb1; };
+__device__ __forceinline__ gvmma_range gvmma_partition(unsigned N, unsigned slice, unsigned nblk) {
+    const unsigned nrb = (N + 7u) >> 3;
+    const unsigned per = (nrb + nblk - 1u) / nblk;
+    const unsigned rb0 = slice * per;
+    const unsigned rb1 = (rb0 + per < nrb) ? (rb0 + per) : nrb;
+    return {rb0, rb1};
+}
+
+/* Two adjacent bf16 of one C row as a 4-byte store: n is even and N is even (N % 8 == 0). */
+__device__ __forceinline__ void gvmma_store2(__nv_bfloat16* C, unsigned N, unsigned m, unsigned n,
+                                             float c0, float c1) {
+    if (n + 1u < N) {
+        *(__nv_bfloat162*)(C + (size_t)m * N + n) = __floats2bfloat162_rn(c0, c1);
+    } else if (n < N) {
+        C[(size_t)m * N + n] = __float2bfloat16(c0);
+    }
+}
+
+template <bool BIAS>
+__device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
+                                              const __nv_bfloat16* __restrict__ x,
+                                              const __nv_bfloat16* __restrict__ W, unsigned rows,
+                                              unsigned N, unsigned K, unsigned slice,
+                                              unsigned nblk,
+                                              const __nv_bfloat16* __restrict__ bias = nullptr) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned g = lane >> 2, t = lane & 3;
+    const gvmma_range r = gvmma_partition(N, slice, nblk);
+    const __nv_bfloat16* const W1[1] = {W};
+    for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
+        float acc[1][4];
+        gvmma_tile<1>(acc, x, W1, rb << 3, rows, N, K);
+        const unsigned n = (rb << 3) + 2u * t;
+        float c0 = acc[0][0], c1 = acc[0][1], c2 = acc[0][2], c3 = acc[0][3];
+        if constexpr (BIAS) {
+            const float b0 = (n < N) ? __bfloat162float(bias[n]) : 0.0f;
+            const float b1 = (n + 1u < N) ? __bfloat162float(bias[n + 1u]) : 0.0f;
+            c0 += b0; c1 += b1; c2 += b0; c3 += b1;
+        }
+        if (g < rows) gvmma_store2(C, N, g, n, c0, c1);
+        if (g + 8u < rows) gvmma_store2(C, N, g + 8u, n, c2, c3);
+    }
+}
+
+__device__ __forceinline__ void gemv_glu_rows_mma(__nv_bfloat16* __restrict__ C,
+                                                  const __nv_bfloat16* __restrict__ x,
+                                                  const __nv_bfloat16* __restrict__ Wg,
+                                                  const __nv_bfloat16* __restrict__ Wu,
+                                                  unsigned rows, unsigned N, unsigned K,
+                                                  unsigned act, unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned g = lane >> 2, t = lane & 3;
+    const gvmma_range r = gvmma_partition(N, slice, nblk);
+    const __nv_bfloat16* const W2[2] = {Wg, Wu};
+    for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
+        float acc[2][4];
+        gvmma_tile<2>(acc, x, W2, rb << 3, rows, N, K);
+        const unsigned n = (rb << 3) + 2u * t;
+        if (g < rows) {
+            if (n < N) C[(size_t)g * N + n] = gemma_glu_epilogue(acc[0][0], acc[1][0], act);
+            if (n + 1u < N) C[(size_t)g * N + n + 1u] = gemma_glu_epilogue(acc[0][1], acc[1][1], act);
+        }
+        if (g + 8u < rows) {
+            if (n < N) C[(size_t)(g + 8u) * N + n] = gemma_glu_epilogue(acc[0][2], acc[1][2], act);
+            if (n + 1u < N)
+                C[(size_t)(g + 8u) * N + n + 1u] = gemma_glu_epilogue(acc[0][3], acc[1][3], act);
+        }
+    }
+}
+
+/* Fused q|k|v: row blocks over the concatenated [0, Nq+Nk+Nv); Nq % 8 == Nk % 8 == 0 (caller
+ * checks) so a block lies inside one matrix. */
+template <bool BIAS>
+__device__ __forceinline__ void gemv_qkv_rows_mma(
+    __nv_bfloat16* Cq, __nv_bfloat16* Ck, __nv_bfloat16* Cv, const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ Wq, const __nv_bfloat16* __restrict__ Wk,
+    const __nv_bfloat16* __restrict__ Wv, unsigned rows, unsigned Nq, unsigned Nk, unsigned Nv,
+    unsigned K, unsigned slice, unsigned nblk, const __nv_bfloat16* __restrict__ bq = nullptr,
+    const __nv_bfloat16* __restrict__ bk = nullptr, const __nv_bfloat16* __restrict__ bv = nullptr) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned g = lane >> 2, t = lane & 3;
+    const gvmma_range r = gvmma_partition(Nq + Nk + Nv, slice, nblk);
+    for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
+        const unsigned gn = rb << 3;
+        const __nv_bfloat16* W;
+        __nv_bfloat16* C;
+        const __nv_bfloat16* bias;
+        unsigned Nx, n0;
+        if (gn < Nq) { W = Wq; C = Cq; Nx = Nq; n0 = 0u; bias = bq; }
+        else if (gn < Nq + Nk) { W = Wk; C = Ck; Nx = Nk; n0 = Nq; bias = bk; }
+        else { W = Wv; C = Cv; Nx = Nv; n0 = Nq + Nk; bias = bv; }
+        const __nv_bfloat16* const W1[1] = {W};
+        float acc[1][4];
+        gvmma_tile<1>(acc, x, W1, gn - n0, rows, Nx, K);
+        const unsigned n = (gn - n0) + 2u * t;
+        float c0 = acc[0][0], c1 = acc[0][1], c2 = acc[0][2], c3 = acc[0][3];
+        if constexpr (BIAS) {
+            const float b0 = (n < Nx) ? __bfloat162float(bias[n]) : 0.0f;
+            const float b1 = (n + 1u < Nx) ? __bfloat162float(bias[n + 1u]) : 0.0f;
+            c0 += b0; c1 += b1; c2 += b0; c3 += b1;
+        }
+        if (g < rows) gvmma_store2(C, Nx, g, n, c0, c1);
+        if (g + 8u < rows) gvmma_store2(C, Nx, g + 8u, n, c2, c3);
+    }
+}

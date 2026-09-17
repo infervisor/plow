@@ -807,6 +807,9 @@ packet carries packed-prefill metadata.
 | `PLOW_NV_GATE_SLEEP` | 64 | backoff (ns) inside the counter-gate poll; `0` spins flat out. |
 | `PLOW_NV_LEAN_DECODE` | 0 | drop arms owning the decode object's 208-reg / 1-blk-SM ceiling so ptxas + `PLOW_NV_FORCE_MINBLK` can reach 2–3 blk/SM. |
 | `PLOW_NV_FORCE_MINBLK` | off | force a `__launch_bounds__` min-blocks-per-SM. |
+| `PLOW_NV_GEMV_MMA` | 0 (plow_config.h sets 1 on sm_90a when the decode ladder reaches 8) | BATCH>=8 decode GEMV rungs (`gemv_rows`/`gemv_glu_rows`/`gemv_qkv_rows`, K % 32 == 0) walk the weights with `mma.sync m16n8k16` (op_gemv_mma.cuh) instead of the dot8 row walk, which is compute-bound above MM=4 (100–366 GB/s at M=16 on H100 vs 1.4–2.6 TB/s). |
+| `PLOW_NV_GEMV_MMA_UNB` | 4 | k32 steps of weight loads in flight per lane in the MMA walk. |
+| `PLOW_NV_ROW_NB` | 4 | whole-chunk batch width of the warp-per-row norm walk (op_norm.cuh); a register budget, not a bandwidth choice. |
 | `PLOW_NV_THREADS` | 256 | NVIDIA block size (`op_attention.cuh`). Raising it is the precondition for BQ=64 flash tiling. Distinct from the AMD `PLOW_THREADS` (512 = 8 waves × 64); not a rename. |
 | `PLOW_NV_EMBED_SMEM` | 0 | embed the object's smem requirement so `serve` reads it instead of guessing the GF=2 default. |
 | `PLOW_L2_PLACE_DISPATCH` | off | L2 placement dispatch. Vendor-neutral — GPC on NVIDIA, XCD on AMD. |

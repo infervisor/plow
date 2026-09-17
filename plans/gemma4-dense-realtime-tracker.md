@@ -583,6 +583,21 @@ separate tail. Compile gate (ptxas, same defines as the cell build):
 Cell `campaign-bf16-ladder` (full decode ladder 1,2,4,8,16 so the same packet
 serves the C4/C16 throughput profile) is the measurement.
 
+**Landed (v3, cell `campaign-bf16-ladder3`, realtime profile, cache off, GPU
+free).** Norm batching kept; rope restructure reverted (it measured 186 → 202
+µs); GeGLU rewritten as load-first pipelining (the unroll alone was null because
+the uint4-punned store keeps the next loads behind it).
+
+| family @4096 | baseline µs | v3 µs |
+|---|---:|---:|
+| NormResidual+RmsNorm | 153 | 119 |
+| Glu | 291 | 210 |
+| HeadNormRope | 186 | 187 |
+| non-Lt per chunk | 73.4 ms | 65.8 ms |
+
+TTFT 42.20 / 53.64 / 196.19 vs control 42.27 / 54.63 / 201.83; TPOT unchanged.
+Decode object 194 regs / 0 stack (unchanged), pfpackedseg spills 5716 → 3492 B.
+
 Harness debt (not fixed today): a cell build compiles the interpreter object
 set twice (once inside the base emit, again in `build_sm90a_gemma4_segments.sh`
 with the segment/role defines) and the second pass runs one nvcc at a time;
@@ -635,6 +650,33 @@ prefill reaches ~40K tok/s (424 ms for 16K tokens). Plow's 4096-row chunk is
 prefill chunks (no prefill/decode mixing beyond the unified token batch's
 2048-row budget); the in128 C4/C16 probe (`tp128`) separates batched-decode
 efficiency from prefill stalls.
+
+### Batched decode: the dot8 GEMV walk is compute-bound at B≥8 (2026-09-17)
+
+`gemv_rows<MM>` streams each weight vector once, then issues MM activation loads
+and 8·MM FMAs per 16-byte chunk on the CUDA cores. Standalone at the
+interpreter's geometry (132×256, `experiments/gemv_mma_batch_h100.cu`, f32 CPU
+reference), M=16: o_proj 221 GB/s, down 100 GB/s, gate|up 366 GB/s, fused qkv
+282 GB/s. The tensor-core row-block walk (`op_gemv_mma.cuh`: one warp = 8 output
+rows × 16 activation rows, mma.sync m16n8k16 with a virtual K order so fragments
+load straight from global as 16-byte vectors) runs the same shapes at
+1.4–2.6 TB/s: 6.6–14.2× at M=16, 4.1–8.8× at M=8, relL2 unchanged (1.7e-3).
+Per layer at B=16: 2.18 ms → 0.22 ms; per step ~105 → ~11 ms of GEMV. This is
+the throughput lever: TPOT at C16 should fall from 44.6 to ~14 ms (vLLM 13.8),
+i.e. ~1100 tok/s vs vLLM's 940. Gate: `PLOW_NV_GEMV_MMA=1` (hooks in
+`gemv_rows`/`gemv_glu_rows`/`gemv_qkv_rows` for MM≥8, K%32==0). Integration:
+the manifest now emits it into plow_config.h whenever gv_mm_max ≥ 8 on sm_90a
+(devgen manifest.rs; registered `def.PLOW_NV_GEMV_MMA[_UNB]`). Cell
+`campaign-bf16-ladder4`: decode object 216 regs / 0 stack (was 226), 570
+HMMA.16816 in its SASS. A/B: in128 C4/C16 (decode-only) and the throughput
+profile at 1024/4096 C4/C16 against `campaign-bf16-ladder`.
+
+**Measured (in128, throughput profile, GPU free):** C16 TPOT 44.64 → 16.20 ms,
+937 tok/s (vLLM 11.0 ms; its 1024/16 aggregate is 940 tok/s); C4 unchanged at
+18.0 ms because the hook covers MM ≥ 8 only and the B=4 rung still walks dot8.
+Next: extend the hook to the 4- and 2-row rungs (harness at M=4/M=2 first), and
+split K across warps for the small-N/large-K `down` shape (1.4 TB/s: only 480
+of 1056 warps get a row block).
 
 ### plowrt VMM prefix review (merged 2026-09-17, branch `gemma4-plowrt-vmm-fixes`)
 
