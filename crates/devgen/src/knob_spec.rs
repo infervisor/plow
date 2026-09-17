@@ -627,6 +627,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.max_chunk", Some("PLOW_MAX_CHUNK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.max_request_chunk", Some("PLOW_MAX_REQUEST_CHUNK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.gemv_split", Some("PLOW_GEMV_SPLIT"), Layer::Emit, U32, Default::Static(Val::Nat(1)), OPT_IN),
+    KnobSpec::new("emit.mla_gather_split", Some("PLOW_MLA_GATHER_SPLIT"), Layer::Emit, U32, Default::Static(Val::Nat(2)), OPT_IN),
     KnobSpec::new("emit.decode_tiled", Some("PLOW_DECODE_TILED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.l2_place_prefill", Some("PLOW_L2_PLACE_PREFILL"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.fuse_argmax", Some("PLOW_FUSE_ARGMAX"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

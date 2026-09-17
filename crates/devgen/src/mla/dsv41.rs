@@ -1716,7 +1716,12 @@ pub(crate) fn emit_dsv41_attn_core(
     // compress_kv])` with the sink added once at the end (model.py:775-779); a two-partial merge
     // is that same expression, and it avoids copying the SHARED cache into a per-layer buffer
     // and re-basing the index table by the window length.
-    let nsplit = if compressed.is_some() { 2u64 } else { 1u64 };
+    // The gathered pass then splits ITS partial further: 1024 query packs over 304 workgroups is
+    // 3.37 rounds, so the packet pays 4, and the last round is the expensive one because a pack's
+    // union grows with its position until top-k caps it. `gsplit` items per pack make the
+    // quantization finer -- the same lever the dense arm's causal KV-split already pulls.
+    let gsplit = crate::emit_config::active().mla_gather_split.max(1).min(8);
+    let nsplit = if compressed.is_some() { 1 + gsplit as u64 } else { 1u64 };
     let act = Dsv41CoreAct {
         qr: b.tensor(
             &format!("act.l{l}.qr"),
@@ -1785,7 +1790,7 @@ pub(crate) fn emit_dsv41_attn_core(
         d.i[5] = KV_MASK_NONE;
         // Write-only output split: this is partial 0 of `nsplit`. Zero when there is one partial,
         // which is the layout every other emitter in the tree produces.
-        d.i[7] = if nsplit == 2 { (2u32 << 8) | 0 } else { 0 };
+        d.i[7] = if nsplit > 1 { ((nsplit as u32) << 8) | 0 } else { 0 };
         d.f[0] = scale;
     });
     // THE COMPRESSED READ. `compress_ratios[l] != 0` on 38 of 40 layers and every one of them
@@ -1822,7 +1827,8 @@ pub(crate) fn emit_dsv41_attn_core(
             d.i[4] = t;
             d.i[5] = KV_MASK_NONE;
             d.i[6] = dsv41_union_cap(topk, ctx);
-            d.i[7] = (2u32 << 8) | 1; // partial 1 of 2
+            // Partials 1..gsplit of nsplit; the body adds its split index to `out_sp0`.
+            d.i[7] = (gsplit << 16) | ((nsplit as u32) << 8) | 1;
             d.f[0] = scale;
         }),
     };

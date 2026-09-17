@@ -358,6 +358,9 @@ pub struct EmitConfig {
     /// default; this is the sweep handle for a re-measurement.
     #[arg(long, env = "PLOW_MLA_NS")]
     pub mla_ns: Option<u32>,
+    /// Items per gathered query pack in the V4.1 sparse prefill (1 = the un-split arm).
+    #[arg(long, env = "PLOW_MLA_GATHER_SPLIT", default_value_t = 2)]
+    pub mla_gather_split: u32,
 
     #[arg(long = "k3-ns", env = "PLOW_K3_NS", hide = true)]
     legacy_k3_ns: Option<u32>,
@@ -1197,6 +1200,7 @@ impl EmitConfig {
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
             max_request_chunk: env_u32("PLOW_MAX_REQUEST_CHUNK"),
             gemv_split: env_u32("PLOW_GEMV_SPLIT").unwrap_or(1),
+            mla_gather_split: env_u32("PLOW_MLA_GATHER_SPLIT").unwrap_or(2),
             decode_tiled: env_bool("PLOW_DECODE_TILED"),
             l2_place_prefill: env_bool_opt("PLOW_L2_PLACE_PREFILL").unwrap_or(true),
             fuse_argmax: env_bool("PLOW_FUSE_ARGMAX"),

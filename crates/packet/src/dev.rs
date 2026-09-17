@@ -576,6 +576,11 @@ pub enum DevOp {
     ///
     /// `i7 = out_split`, as on [`DevOp::FlashGatherPrefill`] and for the same reason: the two ops
     /// are the two halves of one V4.1 attention. Default 0 keeps the shipped layout.
+    ///
+    /// Low two bytes are `(out_nsplit << 8) | out_sp0`. Byte 2 is the GATHERED arm's own split:
+    /// that half occupies partials `out_sp0 ..= out_sp0 + gather_split - 1`, each walking a
+    /// ceil-equal share of its query pack's union, so `out_nsplit == 1 + gather_split`. It is a
+    /// SCHEDULING split only — every share folds back at the merge and the result is unchanged.
     FlashMlaPrefill = 51,
     /// Per-head `W_uv` fold (`sparse-attn-design.md §2.5`): `o[b][h][v] =
     /// Σ_l O_latent[b][h][l]·W_uv[h][l][v]` — the O(n_q) query-side epilogue that folds

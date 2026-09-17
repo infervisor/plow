@@ -1510,8 +1510,16 @@ fn a_compressed_layer_merges_two_partials_with_the_sink_folded_once() {
         .iter()
         .find(|d| d.op == DevOp::FlashMlaPrefill as u16 && d.t[7] != TENSOR_NONE)
         .expect("the compressed flash -- 38 of 40 layers need it");
-    assert_eq!(win.i[7], (2 << 8) | 0, "window is partial 0 of 2");
-    assert_eq!(gat.i[7], (2 << 8) | 1, "compressed is partial 1 of 2");
+    // The gathered pass splits its own partial `gsplit` ways, so there are 1 + gsplit partials:
+    // the window is 0, and the gathered items are 1..=gsplit.
+    let gsplit = crate::emit_config::active().mla_gather_split.max(1).min(8);
+    let nsplit = 1 + gsplit;
+    assert_eq!(win.i[7], (nsplit << 8) | 0, "window is partial 0 of nsplit");
+    assert_eq!(
+        gat.i[7],
+        (gsplit << 16) | (nsplit << 8) | 1,
+        "compressed starts at partial 1 and carries its split count"
+    );
     assert_eq!(win.t[0], gat.t[0], "ONE Opart, filled in disjoint halves");
     assert_eq!(win.t[1], gat.t[1], "ONE mlpart");
     assert_ne!(win.t[4], gat.t[4], "and two DIFFERENT caches: the window K and the CSA2 cache");
@@ -1528,7 +1536,7 @@ fn a_compressed_layer_merges_two_partials_with_the_sink_folded_once() {
         .filter(|d| d.op == DevOp::FlashMerge as u16)
         .collect();
     assert_eq!(merges.len(), 1, "ONE merge: the sink joins one denominator, not two");
-    assert_eq!(merges[0].i[2], 2, "nsplit 2");
+    assert_eq!(merges[0].i[2], nsplit, "the merge folds every partial");
     assert_eq!(
         merges[0].t[3],
         m.progs[0].insts.iter().find(|d| d.op == DevOp::FlashMerge as u16).unwrap().t[3],
