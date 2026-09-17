@@ -5566,3 +5566,52 @@ shippable form computes the assignment from the router's own histogram; that is 
 
 Honest position against the goal: 607 ms at 40 layers, against 200 ms. Attention is now the largest
 single op at ~2.0 ms/layer and was under-measured 2.6x until this section.
+
+## 12.75 The gathered attention was giving away a third of the machine to its own load balancer
+
+With the entry restored (12.73) attention is the second-largest op, and two thirds of its packet was
+straggler: per-workgroup durations on the gathered packet ran min 554 / median 1357 / max 1866 us.
+
+`mla_pf_fold` pairs the causal ends -- 0, NQ-1, 1, NQ-2 -- so that a worker walking the range
+SEQUENTIALLY averages cheap and expensive tiles. It sends even indices to the front half and odd to
+the back. But the work assignment is a stride of `nblk`, and **nblk = 304 is even**, so every item
+one workgroup draws has the same parity. Half the workgroups got none but front packs, half none but
+back packs. The mean duration by CU octile showed it as a step, not a ramp: CUs 0-114 at 1330 us,
+CUs 115-303 at 1030 us.
+
+The plain index already interleaves under a stride -- workgroup s draws s, s+304, s+608, s+912, one
+from each quarter -- so the fold was the opposite of an improvement. The dense arm keeps it: its
+tiles are window-bounded and equal-cost, so it is inert there.
+
+Second, the rounds are coarse: 1024 packs over 304 workgroups is 3.37 rounds and the packet pays 4.
+The dense arm already had a causal KV-split for exactly this; the gather arm now splits its union
+walk the same way (`PLOW_MLA_GATHER_SPLIT`, default 2).
+
+| arm                | FLASH_MLA_PREFILL | straggler | FLASH_MERGE |    layer |
+|--------------------|------------------:|----------:|------------:|---------:|
+| fold, no split     |           2053 us |    682 us |      141 us | 15043 us |
+| no fold, no split  |           1571    |    294    |      164    | 14653    |
+| no fold, split 2   |           1441    |    179    |      216    | 14540    |
+
+Three interleaved pairs each; exits identical to the digit throughout (min -1.36719, max 3.67188,
+mean -0.000643), as they must be -- both changes move which workgroup does which work and nothing
+else. Split 4 is a wash: the partials are `[T][nh_l][512]` f32, so each extra split writes and reads
+another 134 MB and the merge gives back what the straggler saves.
+
+Layer 14540 us, so 582 ms at 40 layers against the 200 ms goal.
+
+Where the remaining 14.5 ms sits, on the real entry, EP with balanced cuts:
+
+| op                                   |    us | share |
+|--------------------------------------|------:|------:|
+| GEMM_FP8_MX                          |  2805 |   19% |
+| MoE (GLU+DOWN+combine+router+align)  |  2812 |   19% |
+| XREDUCE2                             |  2066 |   14% |
+| mHC (GEMV_F32 + HYPER_CONN pre/post) |  2169 |   15% |
+| FLASH_MLA_PREFILL                    |  1441 |   10% |
+| everything else                      |  3247 |   23% |
+
+Two things stand out for the next pass. GEMM_FP8_MX still carries a 48% straggler, which is the same
+class of bug just found here and has not been looked at. And mHC costs as much as attention: the
+`GEMV_F32` alone is 1060 us for a `[8192, hc_mult*5120] x [.., 15]` reduction, which is bandwidth on
+the f32 residual, not arithmetic.
