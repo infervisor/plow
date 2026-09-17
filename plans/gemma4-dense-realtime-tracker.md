@@ -470,6 +470,26 @@ set it; cache-off control and Lt runs are in flight and the certificate is
 regenerated from cache-off arms. A realtime-chat profile may turn the cache
 on, but only against a reference that also has it on.
 
+### The ≤1K gap, resolved: re-tokenized random prompts cross bucket boundaries
+
+Cache-off, same Lt packet, plain client, first streamed chunk:
+
+| prompt | client tokens | first chunk |
+|---|---:|---:|
+| English, 128 tokens | 128 | **22.0 ms** (vLLM BF16 in128: 28.2) |
+| vLLM-style random ids "128" | 142–150 | 29.8–30.0 ms |
+| English, 744 tokens | 744 | 48.6 ms |
+| vLLM-style random ids "1024" | 1176–1199 | 82.5 ms |
+
+vLLM-bench decodes random token ids to text; that text re-tokenizes 12–17 %
+longer, so the bench's "128" runs Plow's 512 bucket and its "1024" runs
+1024 + a 128-token tail chunk, while vLLM pads nothing. On exact-length
+prompts Plow's in128 prefill is already faster than vLLM's. Cache-off Lt
+cells: 42.27 / 54.63 / 201.83 ms (ledger `bf16-ltglu-ms0-nocache`).
+
+Fix under test: `PLOW_PF_LADDER_APPEND=256,1280,4608` (T32 pattern — a rung
+that swallows the inflated length in one chunk), emit-only.
+
 ### Next pipeline step — ctx-keyed attention selection at emit
 
 The attention roles are one object across all live-KV histories (tracker:
