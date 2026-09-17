@@ -80,7 +80,7 @@ serve_env = { PLOW_MULTISTEP = "0" }
 [bench.profiles.throughput]
 in_lens = "8192 15000"
 concs = "4 16"
-serve_env = { PLOW_MULTISTEP = "8" }
+serve_env = { PLOW_MULTISTEP = "8", PLOW_QUEUE_TTL_MS = "0" }  # never shed: a throughput cell measures throughput, not the slot-wait TTL (15000/16 shed 22 of 32 at the 10 s default)
 
 [reference]
 csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.csv"

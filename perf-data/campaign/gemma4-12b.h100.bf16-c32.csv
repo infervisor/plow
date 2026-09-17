@@ -1,0 +1,2 @@
+utc,commit,label,provisional,pkt_sha,note,input_len,concurrency,ttft_ms,ttft_med,tpot_ms,tpot_med,itl_ms,itl_med,itl_p99,out_tok_s,req_per_s,ok_reqs,gen_toks
+2026-09-17T18:57:18Z,d7a6b129cf8b,c32-throughput,0,cd60ccd58552d60d,"C32 packet: chunk 2048, ladder 32 (GV_MM_MAX 32, multi-tile tensor-core walk), both attention roles OFF, GPU free; vLLM 852 / 17.5 / 1322",1024,32,1590.01,1639.39,27.320,27.040,27.110,27.070,28.040,806.6,6.300,32,4096

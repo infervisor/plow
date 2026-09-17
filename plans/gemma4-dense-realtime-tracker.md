@@ -691,6 +691,30 @@ is 16.2 ms but 21.2 with prefill, and TTFT queues behind ~20K tok/s prefill
 Harness debt: the low-memory guard kills tracked background benches while a
 server pages in weights — launch benches detached (job tmp `launch_tp_c4.sh`).
 
+### Long context and higher concurrency (2026-09-17, first cells)
+
+New cells and matched vLLM references (same client, max-model-len 16384 /
+max-num-seqs 16 for ctx16k; 8192 / 32 for C32; prefix caching off):
+
+| cell | packet | TTFT Plow / vLLM | TPOT Plow / vLLM | tok/s Plow / vLLM |
+|---|---|---:|---:|---:|
+| 8192/4 | ctx16k, chunk 4096, ladder 16 | 1924 / 994 | 24.9 / 13.9 | 100 / 186 |
+| 8192/16 | same | 8460 / 2300 | 73.2 / 35.7 | 114 / 298 |
+| 15000/4 | same | 3904 / 1653 | 35.2 / 18.5 | 61 / 128 |
+| 15000/16 | same | shed: 22 of 32 requests 429'd (mean TTFT 7.4 s vs the default 10 s slot-wait TTL) | – / 61.8 | – / 172 |
+| 1024/32 | c32, chunk 2048, ladder 32, roles OFF | 1590 / 852 | 27.3 / 17.5 | 807 / 1322 |
+
+Long context is ~2× behind on every axis: prefill throughput is flat (~20K
+tok/s, the C1 items) and long-context decode attention scales with KV.
+Concurrency above 16 is gated by packet memory, not kernels: the sliding ring
+is `next_pow2(window + chunk − 1)` (chunk 4096 → 8192 rows → ~3 GiB/slot), and
+the HD512/HD256 roles need the 4096/8192 prefill rungs, so a 32-slot packet
+had to drop to chunk 2048 with both roles off. Unblocking C32+ with roles
+means either roles qualified at the 2048 rung or a ring decoupled from the
+chunk. The 32-row rung itself is fine: checkpoint G now takes rows = 1 for
+the NVIDIA staged arms (they stage only at M=1), and the multi-tile walk
+holds 1.2–2.5 TB/s at M=32.
+
 ### plowrt VMM prefix review (merged 2026-09-17, branch `gemma4-plowrt-vmm-fixes`)
 
 Reviewed the four reported issues; merged as 50f89816.
