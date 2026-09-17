@@ -4,7 +4,7 @@ DCP shards the MLA latent KV cache across ranks instead of replicating it, so lo
 concurrency stops being bounded by how much KV one rank can hold. It is a **capacity** lever, not
 a latency one.
 
-The full design — merge algebra, per-file work plan, staged rollout — is `/workspace/dcp-design/DCP.md`.
+The full design — merge algebra, per-file work plan, staged rollout — is `/workspace/plow-glm53/archive/dcp-design/DCP.md`.
 This chapter is the architectural summary: what DCP is, why the packet already contained the
 primitive, and what it changes across the compiler, the runtime and admission.
 

@@ -27,7 +27,7 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LEDGER = os.environ.get("LEDGER_PATH", "/workspace/plow-ledger/ledger.jsonl")
+LEDGER = os.environ.get("LEDGER_PATH", "/workspace/plow-glm53/plow-ledger/ledger.jsonl")
 
 
 def verifier():

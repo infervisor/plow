@@ -9,7 +9,7 @@ docs/schemas/perf-ledger-entry-v1.schema.json.
     ... | scripts/ledger_append.py -                      # the same on stdin
     scripts/ledger_append.py --self-test
 
-Default ledger: $LEDGER_PATH, else /workspace/plow-ledger/ledger.jsonl.
+Default ledger: $LEDGER_PATH, else /workspace/plow-glm53/plow-ledger/ledger.jsonl.
 
 What the writer enforces, so checkpoint P can compute a floor instead of guessing one:
 * `samples` (preferred) or `stats` {n, median, mad}; with samples, stats are computed here and
@@ -40,7 +40,7 @@ import statistics
 import sys
 import tempfile
 
-DEFAULT = "/workspace/plow-ledger/ledger.jsonl"
+DEFAULT = "/workspace/plow-glm53/plow-ledger/ledger.jsonl"
 HARNESSES = {"proto", "attrib", "bench", "serve-ab"}
 REQUIRED = ["id", "job", "harness", "hardware", "rung", "recipe_digest", "knob_delta", "metric",
             "better"]
