@@ -274,6 +274,38 @@ The recipe reproduces the campaign's recorded 221.6 ms at 4K. Prefill is now
 audit shows 15–60 GEMM tiles over 132 SMs at M≤1024). Decode is unchanged —
 the roles are prefill-only — and remains the realtime gap.
 
+### C1 result, FP8 PTPC weights — provisional, compared to vLLM FP8 only
+
+Plow packet: `PLOW_FP8=1 PLOW_W8A8=1` with the same role recipe
+(`PLOW_SEG_PURE_GEMM=fp8`, explicit `PLOW_EMIT_PACKED_PREFILL=1`, W8A8 GemmGlu
+role), composed checkpoint = BF16 shards + the campaign's `fp8/`-keyed PTPC
+twins (`plow-h100-campaign/gemma12b-w8a16/checkpoint-mixed`, 656 tensors).
+Per the 31B bring-up doc this packet is **W8A8 prefill, W8A16 decode, BF16 KV,
+BF16 lm_head**; vLLM's FP8 is W8A8 in both phases. Same weight bytes per decode
+step, not the same arithmetic. Never table this row against a BF16 engine.
+
+| in | Plow TTFT | vLLM FP8 | × | Plow TPOT | vLLM FP8 | × | Plow tok/s | vLLM FP8 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 42.11 | 28.15 | 1.50 | 9.18 | 7.15 | 1.28 | 106.0 | 136.7 |
+| 1024 | 70.38 | 37.83 | 1.86 | 9.81 | 7.23 | 1.36 | 97.2 | 133.9 |
+| 4096 | 174.69 | 134.34 | 1.30 | 10.40 | 7.25 | 1.43 | 85.6 | 121.3 |
+
+Read plainly: halving the weight stream took Plow's decode from 12.0 to 9.2
+ms at in128, but vLLM's FP8 runs at 7.2, so **relative to its own reference the
+FP8 packet is further behind (1.28–1.43×) than the BF16 packet is behind vLLM
+BF16 (1.14–1.24×)**. The BF16-activation decode arm (W8A16) does more work per
+step than a W8A8 arm for the same bytes, and TPOT grows with context (9.18 →
+10.40 across 128 → 4096 tokens of KV) where vLLM FP8 is flat (7.15 → 7.25):
+the decode attention over BF16 KV is a visible second term. The like-for-like
+FP8 comparison needs Plow's W8A8 decode arm, which is not enabled.
+
+Same-precision scoreboard (C1, TPOT):
+
+| Pair | in128 | in1024 | in4096 |
+|---|---:|---:|---:|
+| Plow BF16 / vLLM BF16 | 1.14 | 1.19 | 1.24 |
+| Plow FP8-weight / vLLM FP8 | 1.28 | 1.36 | 1.43 |
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
