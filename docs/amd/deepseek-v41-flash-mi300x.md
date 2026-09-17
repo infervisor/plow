@@ -5615,3 +5615,30 @@ Two things stand out for the next pass. GEMM_FP8_MX still carries a 48% straggle
 class of bug just found here and has not been looked at. And mHC costs as much as attention: the
 `GEMV_F32` alone is 1060 us for a `[8192, hc_mult*5120] x [.., 15]` reduction, which is bandwidth on
 the f32 residual, not arithmetic.
+
+## 12.76 Pipeline parallelism does not buy single-request prefill latency here
+
+`Parallel::Pp`/`Dp`/`Ep` are rejected in `crates/plowc/src/lib.rs:2601` with a test asserting the
+rejection, so none of this is wired. Before wiring it, the arithmetic, from 12.75's measured layer:
+
+TP8 costs 14.54 ms/layer, of which XREDUCE2 is 2.07 ms. The other 12.47 ms is compute on a machine
+split eight ways, so one GPU at FULL width is ~8x that, ~100 ms/layer. Under PP8 each GPU owns 5 of
+the 40 layers, pays no per-layer collective, and runs full width: ~499 ms per stage.
+
+For ONE request that is strictly worse, because only one stage is live at a time -- 8 x 499 ms. The
+fix is micro-batching, and it does not recover the gap: splitting 8192 tokens into 8 chunks of 1024
+gives ~62 ms per (stage, chunk) and a filled pipeline of 8 + 8 - 1 = 15 slots, so ~936 ms against
+TP8's 582 ms. PP trades 83 ms of whole-model collective for a pipeline bubble and the loss of
+parallel width, and the trade is bad at this shape.
+
+PP is a THROUGHPUT structure: it raises tokens/s at fixed memory by keeping every stage busy with
+DIFFERENT requests. It does not shorten one prefill. The same is already on record for context
+parallelism -- the 2026-09-12 CP study finds CP does not beat TP8 at C20 -- and DCP in this tree is
+decode-side KV sharding, which a prefill does not exercise.
+
+So the 200 ms target is not reachable by changing the parallelism. At 14.54 ms/layer it needs
+5.0 ms/layer, and the whole identified op-level backlog -- GEMM_FP8_MX's 48% straggler (~390 us),
+`GEMV_F32`'s L2 wall (~600 us if it reached its own floor), the MoE's 6x-off-roofline grouped GEMM,
+and the 2.07 ms collective -- comes to about 7.5 ms even if every item went to zero. The remaining
+gap is arithmetic efficiency, not partitioning: the MoE pair alone bills 2154 us against a ~335 us
+fp8 roofline for the same MACs.
