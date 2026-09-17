@@ -689,9 +689,9 @@ profile at 1024/4096 C4/C16 against `campaign-bf16-ladder`.
 | 128/4 (decode-only) | 18.1 → 13.8 | 218 → 284 | 10.6 / – |
 | 128/16 (decode-only) | 44.6 → 16.2 | 350 → 935 | 11.0 / – |
 | 1024/4 | 19.8 → 15.4 | 187 → 238 | 11.2 / 331 |
-| 1024/16 | 49.7 → 21.2 | 273 → 540 | 13.8 / 940 |
+| 1024/16 | 49.7 → 21.2 → 19.7 (split-K) | 273 → 540 → 570 | 13.8 / 940 |
 | 4096/4 | 23.3 → 19.1 | 130 → 154 | 12.2 / 254 |
-| 4096/16 | 57.9 → 38.8 | 164 → 249 | 21.9 / 499 |
+| 4096/16 | 57.9 → 38.8 → 37.3 (split-K) | 164 → 249 → 255 | 21.9 / 499 |
 
 Remaining throughput gap, in order: (1) prefill interleaving — decode-only C16
 is 16.2 ms but 21.2 with prefill, and TTFT queues behind ~20K tok/s prefill
