@@ -30,8 +30,10 @@
 
 #define NR 8
 #define XCTR_BYTES (128u * 64u)
-#define T 8192u
-#define RPR 1024u
+/* TP_ROWS (default 8192, a multiple of 8): the global row count. Decode-sized values price the
+ * collective's fixed cost, which is what a per-layer decode collective pays. */
+static uint32_t T = 8192u;
+static uint32_t RPR = 1024u;
 #define NHL 8u
 #define NHT 64u
 #define DQ 576u
@@ -60,13 +62,15 @@ static int cmpd(const void* a, const void* b) { double x = *(const double*)a, y 
 
 /* Q source per rank: [T][NHL][DQ]; O source per rank: [RPR][NHT][DO]. Same peer-visible
  * region layout as tp_alltoall_bench.c: Q source at offset 0, O source at offset S1. */
-static const size_t S1 = (size_t)T * NHL * DQ * 2u;
-static const size_t S2 = (size_t)RPR * NHT * DO * 2u;
-static const size_t DSTQ = (size_t)RPR * NHT * DQ * 2u;  /* == S1 */
-static const size_t DSTO = (size_t)T * NHL * DO * 2u;    /* == S2 */
-
 int main(int argc, char** argv) {
     if (argc != NR + 1) { fprintf(stderr, "usage: %s gpu0 ... gpu7\n", argv[0]); return 2; }
+    T = envu("TP_ROWS", 8192u);
+    if (T == 0 || T % NR) { fprintf(stderr, "TP_ROWS must be a positive multiple of %d\n", NR); return 2; }
+    RPR = T / NR;
+    const size_t S1 = (size_t)T * NHL * DQ * 2u;
+    const size_t S2 = (size_t)RPR * NHT * DO * 2u;
+    const size_t DSTQ = (size_t)RPR * NHT * DQ * 2u;  /* == S1 */
+    const size_t DSTO = (size_t)T * NHL * DO * 2u;    /* == S2 */
     const char* mode = getenv("TP_MODE") ? getenv("TP_MODE") : "q";
     const uint32_t nwg = envu("TP_NWG", 48), reps = envu("TP_REPS", 5);
     const int is_og = !strcmp(mode, "og");
