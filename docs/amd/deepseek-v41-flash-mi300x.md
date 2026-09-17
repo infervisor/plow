@@ -6043,3 +6043,50 @@ disturbed run. The rule this yields: when an A/B produces BOTH a surprising time
 numeric difference, re-run the CONTROL against itself before believing either. On this machine
 multi-second and multi-SECOND-per-iteration outliers appear in every arm (12.82), so `min` over an
 interleaved, repeated pair is the only statistic worth quoting.
+
+## 12.86 The real end-to-end number is 540 ms, and a 40-layer residual compare proves nothing
+
+Every number in 12.80-12.85 is a layer-2 rung measured in isolation and multiplied by 40.
+`rung_run` prints a warning on that line for a reason -- a whole-model emit overlaps seams the rung
+measures alone -- and the warning is right. Measured end to end, all 40 layers, 8k, TP8, five
+iterations each and stable inside 0.4%:
+
+    no SP, no EPI_SIB hoist   599.1 ms   (median 600.4)
+    SP + EPI_SIB              540.3 ms   (median 541.8)
+
+**-58.8 ms, -9.8%**, and the true ladder position is **540 ms, not the 605 ms** the layer-2
+extrapolation gave. The extrapolation over-counted by 11%, consistently in both arms, so the
+RELATIVE conclusions of 12.82-12.85 survive unchanged; only the absolute ladder moves.
+
+**A correctness scare, and what it actually showed.** Comparing rank 0's band of
+`act.hc_residual_a` after all 40 layers, SP differs from the non-SP reference by
+`mean|d| / RMS = 0.299` -- 30% relative, `max|d| = 2348` against an RMS of 8.0. Against the 2-ULP
+agreement 12.82 measured on a single layer that reads as a bug that only a multi-layer chain
+exposes, and the natural suspect was the Engram layers (1 and 14), which the layer-2 rung never
+exercises.
+
+It is not a bug. Run to partial segment counts the deviation is 0 at segs 1 and 2, `1.05e-5` at
+segs 3, `2.8e-3` at segs 10 and `0.299` at 40: smooth geometric growth of about 1.3x per layer, not
+a step at any one layer. The decisive test is a CONTROL that contains no sequence parallelism at
+all -- the same non-SP program emitted with `PLOW_MLA_GATHER_SPLIT=1` instead of the default 2,
+which is a pure reassociation of the attention gather (12.75 records it as not bit-identical):
+
+    non-SP, gather_split 1 vs 2   mean|d|/RMS 0.324     <- legal reassociation, no SP
+    SP vs non-SP                  mean|d|/RMS 0.299
+
+**A known-good reassociation of the reference path diverges MORE than SP does.** So 40 V4.1 layers
+amplify any bf16 rounding difference to order 30% relative in the residual, and 0.299 carries no
+evidence about SP at all.
+
+**The method rule this yields, and it invalidates an obvious test.** A whole-model residual compare
+cannot validate ANY V4.1 change that is not bit-identical: every legal one lands at ~0.3. Changes
+must be validated either per-layer, where the reassociation is still small enough to read (SP is
+2 ULP among elements of magnitude > 1, 12.82), or on a task metric. This is the third instrument
+in this campaign that returned a confident number about the wrong thing -- after the `exit:`
+fingerprint under SP (12.83) and `strag/pk` on narrow GEMMs (12.84) -- and the pattern is the same
+each time: the instrument answered a question, just not the one being asked. The cheap defence is
+always a control that should move and one that should not.
+
+**Ladder, on the end-to-end basis.** 599.1 ms -> 540.3 ms. Against 200 ms that is 2.7x, and 12.84's
+arithmetic is unchanged by the rebasing: the seam collectives are at link rate, every parallelism
+option is closed, and the remaining gap is a uniform ~3.4x on every compute kernel in the layer.
