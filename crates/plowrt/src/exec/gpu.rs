@@ -2037,6 +2037,11 @@ pub struct GpuEngine {
     /// `View`'s Drop is a no-op, so field drop order cannot matter. The Vmm
     /// arm's Drop unmaps and releases its physical chunks.
     _weight_slab: WeightSlab,
+    /// TEMPORARY DIAGNOSTIC (PLOW_DEBUG_TRACE env var): pinned host ring the decode cubin
+    /// writes `(blockIdx.x, e.inst)` claims into, so a poisoned-context crash can still be
+    /// read back with no CUDA API call. `None` unless the env var is set AND the loaded
+    /// cubin was built with `PLOW_DEBUG_TRACE=1` (the symbol lookup no-ops otherwise).
+    debug_ring: Option<PinnedHost>,
     d_inst: DeviceMem,
     /// Owner of the decode counter+cursor allocation. `d_ctr` and the decode
     /// GQ cursor are aliased **views** into it (never freed by their own
@@ -3320,6 +3325,31 @@ impl GpuEngine {
                 (module, f, kname, smem, grid, dec_source, image_len)
             }
         };
+        // TEMPORARY DIAGNOSTIC (PLOW_DEBUG_TRACE): install a pinned host ring the decode
+        // cubin's dispatch loop writes claims into, readable after a poisoned-context crash
+        // with no further CUDA call. No-op unless both the env var and the cubin's symbol
+        // are present. See runtime/nvidia/interp_sm120.cu's PLOW_DEBUG_TRACE block.
+        let debug_ring: Option<PinnedHost> = if std::env::var_os("PLOW_DEBUG_TRACE").is_some() {
+            const PLOW_DEBUG_TRACE_N: usize = 8192; // must match -DPLOW_DEBUG_TRACE_N on the cubin
+            let pinned = be.host_alloc_pinned(PLOW_DEBUG_TRACE_N * 8)?;
+            let ptr_bytes = (pinned.as_ptr() as u64).to_ne_bytes();
+            if be.module_global_write(&module, "plow_debug_ring", &ptr_bytes)? {
+                tracing::warn!(
+                    ptr = format!("{:#x}", pinned.as_ptr() as u64).as_str(),
+                    n = PLOW_DEBUG_TRACE_N,
+                    "PLOW_DEBUG_TRACE ring installed on decode module"
+                );
+                Some(pinned)
+            } else {
+                tracing::warn!(
+                    "PLOW_DEBUG_TRACE requested but decode cubin has no plow_debug_ring \
+                     symbol (rebuild with PLOW_DEBUG_TRACE=1)"
+                );
+                None
+            }
+        } else {
+            None
+        };
         check_dsa_decode_batch_arm(
             dsa_decode_batch_required(blob.decode_phase()),
             be.module_global_u32(&module, "plow_dsa_decode_batch_arm")?,
@@ -4183,6 +4213,24 @@ impl GpuEngine {
         let d_slen = upload_pod(pod_bytes(&g.stream_len))?;
         let d_waits = upload_pod(pod_bytes(ordered_waits.as_deref().unwrap_or(&g.waits)))?;
         let d_succs = upload_pod(pod_bytes(&g.succs))?;
+        // TEMPORARY DIAGNOSTIC: verify the uploaded gq_stream is actually as long as the
+        // segment table (gq_seg_ofs) claims, and that instruction 11's entries genuinely
+        // sit where op-major order predicts (right after instruction 10's).
+        if std::env::var_os("PLOW_DEBUG_TRACE").is_some() {
+            let inst11 = g
+                .gq_stream
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.inst == 11)
+                .map(|(i, e)| (i, e.slice))
+                .collect::<Vec<_>>();
+            tracing::warn!(
+                gq_stream_len = g.gq_stream.len(),
+                gq_seg_ofs = ?g.gq_seg_ofs,
+                inst11_positions = ?inst11,
+                "PLOW_DEBUG_TRACE: gq_stream size/placement check"
+            );
+        }
         let d_gq_stream = upload_pod(pod_bytes(&g.gq_stream))?;
         let d_gq_seg = upload_pod(pod_bytes(&g.gq_seg_ofs))?;
         // The decode counter block and the GQ cursor share a lifecycle (both
@@ -5116,6 +5164,7 @@ impl GpuEngine {
             cursor_bytes,
             devp,
             _weight_slab: weight_slab,
+            debug_ring,
             d_inst,
             _ctr_block: ctr_block,
             d_ctr,
@@ -5860,6 +5909,7 @@ impl GpuEngine {
                 smem = self.smem,
                 "decode step: stream sync failed"
             );
+            self.dump_debug_ring();
             return Err(e);
         }
         let t_sync = timed.then(now);
@@ -6094,6 +6144,44 @@ impl GpuEngine {
         } else {
             self.launch_decode()
         }
+    }
+
+    /// TEMPORARY DIAGNOSTIC (PLOW_DEBUG_TRACE): log a histogram of which packet instruction
+    /// indices appear in the pinned claim ring, read with no CUDA API call (safe on a poisoned
+    /// context). A no-op unless `debug_ring` was installed at load. See the field doc and
+    /// runtime/nvidia/interp_sm120.cu's PLOW_DEBUG_TRACE block.
+    fn dump_debug_ring(&self) {
+        let Some(ring) = &self.debug_ring else {
+            return;
+        };
+        let words: &[u64] = bytemuck::cast_slice(ring.as_slice());
+        // (claimed, gate_cleared) per instruction. Phase tag is bit 63; inst is the low 32 bits.
+        let mut hist: std::collections::HashMap<u32, (u32, u32)> = std::collections::HashMap::new();
+        for &w in words {
+            if w == 0 {
+                continue;
+            }
+            let inst = (w & 0xFFFF_FFFF) as u32;
+            let gate_cleared = (w >> 63) != 0;
+            let entry = hist.entry(inst).or_insert((0, 0));
+            if gate_cleared {
+                entry.1 += 1;
+            } else {
+                entry.0 += 1;
+            }
+        }
+        let mut counts: Vec<(u32, (u32, u32))> = hist.into_iter().collect();
+        counts.sort_by_key(|&(inst, _)| inst);
+        tracing::warn!(
+            // (instruction, (claimed, gate_cleared)) -- a claimed count with no matching
+            // gate_cleared count means blocks are stuck spinning on that instruction's wait
+            // gate; equal counts mean every claim reached plow_exec and the fault (if any)
+            // is inside that op's own body, not in dispatch/waiting.
+            per_instruction_claimed_vs_gate_cleared = ?counts,
+            total_nonzero_entries = words.iter().filter(|&&w| w != 0).count(),
+            ring_len = words.len(),
+            "PLOW_DEBUG_TRACE ring snapshot"
+        );
     }
 
     fn reset_decode_counters(&self) -> Result<()> {

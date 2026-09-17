@@ -21,15 +21,19 @@ def main():
     ap.add_argument("--runtime", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--evidence", action="append", default=[], type=Path)
-    ap.add_argument("--profile", choices=["bf16-fp8kv", "bf16-unified", "fp8-unified"], default="bf16-fp8kv")
+    ap.add_argument("--profile", choices=["bf16-fp8kv", "bf16-unified", "fp8-unified", "fp8-fp8kv"], default="bf16-fp8kv")
+    ap.add_argument("--max-ctx", type=int, default=32768,
+                     help="Context length the assets were compiled for (devgen's --max-ctx). "
+                          "Only used to cross-check the packet's in.pos tensor size and to label the manifest/README.")
     ap.add_argument("--runtime-source-commit")
     ap.add_argument("--runtime-source-note", default="")
     ap.add_argument("--model-source-revision")
     args = ap.parse_args()
     build = json.loads((args.assets / "build.json").read_text())
+    weights = json.loads((args.assets / "weights.json").read_text())
     assert build["arch"] == "sm_90a" and build["n_cu"] == 132
-    unified = args.profile != "bf16-fp8kv"
-    assert build["precision"]["weight_enc"] == ("fp8" if args.profile == "fp8-unified" else "bf16")
+    unified = args.profile in ("bf16-unified", "fp8-unified")
+    assert build["precision"]["weight_enc"] == ("fp8" if args.profile in ("fp8-unified", "fp8-fp8kv") else "bf16")
     assert set(build["shapes"]["kv_dtype"].values()) == ({"bf16"} if unified else {"e4m3"})
     if unified:
         assert build["objects"]["packed_prefill"]["required"]
@@ -42,7 +46,7 @@ def main():
          "--format", "json", "--tensors", "--no-analysis", "--range", "0..0"],
         env={**os.environ, "RUST_LOG": "off"}))
     assert [p["t"] for p in packet["programs"]] == prefill + decode
-    assert [t["bytes"] for t in packet["tensors"] if t["name"] == "in.pos"] == [32768 * 4]
+    assert [t["bytes"] for t in packet["tensors"] if t["name"] == "in.pos"] == [args.max_ctx * 4]
     args.out.mkdir(parents=True, exist_ok=False)
     for name in ["bin", "lib", "assets", "evidence"]:
         (args.out / name).mkdir()
@@ -123,12 +127,13 @@ assert sorted({p["batch"] for p in build["programs"] if p["kind"] == "decode"}) 
 assert sorted({p["bucket"] for p in build["programs"] if p["kind"] == "prefill"}) == manifest["prefill_buckets"]
 print("Verified", len(manifest["files"]), "files; decode", manifest["decode_rungs"], "prefill", manifest["prefill_buckets"])
 ''')
-    readme = '''# Gemma 4 31B IT / plowrt checkpoint
+    readme = f'''# {weights["network"]} / plowrt checkpoint
 
 BF16 weights and activations; E4M3 FP8 KV with FP32 per-row scales.
-Target: one H100 SXM5 80GB, sm_90a, 132 SMs. Context limit: 32768 tokens
+Target: one H100 SXM5 80GB, sm_90a, 132 SMs. Context limit: {args.max_ctx} tokens
 including output. Physical slots: 16. Decode rungs: 1, 2, 4, 8, 16.
-Prefill buckets: 128, 512, 1024. All emitted programs and cubins are retained.
+Prefill buckets: 128, 512, 1024. All emitted programs and cubins are retained.'''
+    readme += '''
 
 ```sh
 python3 verify.py
@@ -161,6 +166,11 @@ it is not an off-instance backup. Preserve the whole directory when copying.
 `manifest.json` records source, precision, rungs, and SHA-256 hashes.
 `evidence/` contains the validation logs supplied during packaging.
 '''
+    if args.profile == "fp8-fp8kv":
+        readme = readme.replace(
+            "BF16 weights and activations; E4M3 FP8 KV with FP32 per-row scales.",
+            f"{build['precision']['weight_enc'].upper()} weights; {build['precision']['act_enc']} activations; "
+            "E4M3 FP8 KV with FP32 per-row scales.")
     if unified:
         readme = readme.replace(
             "BF16 weights and activations; E4M3 FP8 KV with FP32 per-row scales.",
@@ -180,7 +190,7 @@ No vLLM performance win is claimed. See `evidence/` for the exact test scope.
     (args.out / "README.md").write_text(readme)
     repo = scripts.parent
     manifest = {
-        "schema": 1, "model": "google/gemma-4-31B-it",
+        "schema": 1, "model": weights["network"],
         "profile": args.profile,
         "source_revision": args.model_source_revision or (args.assets / "checkpoint").resolve().name,
         "runtime_source_commit": subprocess.check_output(
@@ -190,7 +200,7 @@ No vLLM performance win is claimed. See `evidence/` for the exact test scope.
             ["git", "diff", "HEAD", "--", "crates/plowrt"], cwd=repo, text=True),
         "precision": build["precision"], "arch": build["arch"],
         "decode_rungs": decode, "prefill_buckets": prefill,
-        "max_context": 32768, "physical_slots": decode[-1], "unified_execution_validated": unified,
+        "max_context": args.max_ctx, "physical_slots": decode[-1], "unified_execution_validated": unified,
         "qualification": "functional; sustained production SLO and application quality pending", "files": {},
     }
     for path in sorted(args.out.rglob("*")):

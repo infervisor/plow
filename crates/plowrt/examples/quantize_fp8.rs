@@ -9,6 +9,12 @@
 //! [N,K]) + `fp8/<name>_scale` (F32, [N]) for the 7 dense projections of every layer that
 //! exists in the source (Gemma full layers have no v_proj). Prefix default
 //! `model.language_model.` (Gemma-4 multimodal re-export); Llama/Qwen use `model.`.
+//!
+//! MoE experts (`experts.gate_up_proj` [E,2I,H], `experts.down_proj` [E,H,I], stacked over all
+//! E experts) are quantized the same row-wise way after flattening their leading two dims to one
+//! N axis — devgen declares their `fp8/…_scale` twin as exactly `E * out_rows` f32 values (one
+//! per expert per output channel, see `crates/devgen/src/lib.rs`'s `experts.gate_up_proj_scale` /
+//! `down_proj_scale` tensor sizes), which is precisely a per-row scale over that flattened view.
 
 #[cfg(feature = "cpu")]
 fn main() {
@@ -26,6 +32,8 @@ fn main() {
         "mlp.up_proj.weight",
         "mlp.down_proj.weight",
     ];
+    // Stacked MoE expert weights: 3-D [E, out, in], flattened to N=E*out rows of K=in below.
+    const MOE_PROJS: [&str; 2] = ["experts.gate_up_proj", "experts.down_proj"];
 
     /// f32 -> e4m3fn, RNE, saturating (torch.float8_e4m3fn semantics for finite inputs).
     fn to_e4m3(v: f32) -> u8 {
@@ -153,6 +161,14 @@ fn main() {
                     assert_eq!(info.dtype, safetensors::Dtype::BF16, "{name}: not bf16");
                     assert_eq!(info.shape.len(), 2, "{name}: not 2-D");
                     plan.push((name, info.shape[0], info.shape[1]));
+                }
+            }
+            for p in MOE_PROJS {
+                let name = format!("{prefix}layers.{l}.{p}");
+                if let Some((_, info)) = index.get(&name) {
+                    assert_eq!(info.dtype, safetensors::Dtype::BF16, "{name}: not bf16");
+                    assert_eq!(info.shape.len(), 3, "{name}: not 3-D [experts,out,in]");
+                    plan.push((name, info.shape[0] * info.shape[1], info.shape[2]));
                 }
             }
         }

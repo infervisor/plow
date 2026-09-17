@@ -2662,6 +2662,23 @@ extern "C" __device__ unsigned PLOW_SYM(plow_segment_gq_abi) = 1;
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_segment_gq_abi) = 0;
 #endif
+
+/* ===== TEMPORARY DIAGNOSTIC (PLOW_DEBUG_TRACE) =====
+ * Ring of the last PLOW_DEBUG_TRACE_N global-queue claims (e.inst, the packet-wide instruction
+ * index), written into a HOST-PINNED buffer so it survives a poisoned CUDA context: the host
+ * sets `plow_debug_ring` via cuMemcpyHtoD before the launch and reads the SAME pointer directly
+ * from host memory afterward, no CUDA API call needed. Null when the diagnostic is off (the
+ * default) -- the check is one predicted branch on the claim path. Never ship enabled. */
+#ifndef PLOW_DEBUG_TRACE
+#define PLOW_DEBUG_TRACE 0
+#endif
+#if PLOW_DEBUG_TRACE
+#ifndef PLOW_DEBUG_TRACE_N
+#define PLOW_DEBUG_TRACE_N 512
+#endif
+extern "C" __device__ unsigned long long* PLOW_SYM(plow_debug_ring) = nullptr;
+extern "C" __device__ unsigned PLOW_SYM(plow_debug_cursor) = 0;
+#endif
 /* Whole-object dense BF16 contract. These constants describe compiled branches, not
  * a packet-supplied inventory. Adding an opcode requires extending the shared validator. */
 #if !PLOW_NV_PREFILL && PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SEGMENTS && !PLOW_NV_GEMV512_ROLE && !PLOW_NV_TRACE && !PLOW_NV_SKELETON && !PLOW_NV_PLACE_DISPATCH && PLOW_NV_SCHED == 1 && PLOW_NV_THREADS == 256 && !defined(PLOW_NV_ABLATE_LO) && !defined(PLOW_NV_ABLATE_HI) && !defined(FA_NV_WAVE64_NEGCTRL)
@@ -2866,6 +2883,21 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         const PlowDevInst* in = prog.insts + e.inst;
 #endif
 
+#if PLOW_DEBUG_TRACE
+        /* threadIdx.x == 0 ONLY: one real claim must produce one ring entry. Without this
+         * gate every thread in the block (up to 256) writes the same claim independently,
+         * so a 512-slot ring fills from as few as 2 real claims -- looking exactly like a
+         * stuck/looping instruction when it is not. (Cost a wrong conclusion once already.)
+         * Bit 63 tags the phase: 0 = claimed (about to enter the wait-gate), 1 = gate cleared
+         * (about to call plow_exec). A claim with no matching gate-cleared entry means the
+         * block is stuck spinning on a dependency; a gate-cleared entry with no next op's
+         * claim means the fault is inside that op's own execution. */
+        if (threadIdx.x == 0 && PLOW_SYM(plow_debug_ring)) {
+            const unsigned slot = atomicAdd(&PLOW_SYM(plow_debug_cursor), 1u) % PLOW_DEBUG_TRACE_N;
+            PLOW_SYM(plow_debug_ring)[slot] = ((unsigned long long)blockIdx.x << 32) | e.inst;
+        }
+#endif
+
         /* GATES live on the STREAM ENTRY, always — the 64-byte PlowDevInst carries no
          * wait/succ metadata. Coarse entries point at the op's coarse lists (all slices
          * share them); a PLOW_SE_FINE entry carries per-slice lists so slice s blocks only
@@ -2899,6 +2931,14 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         if (wait_len) asm volatile("fence.acquire.gpu;" ::: "memory");
 #endif
         __syncthreads(); /* every counter in the list is now satisfied */
+#if PLOW_DEBUG_TRACE
+        /* Phase-2 marker: this block's gate cleared and it is about to call plow_exec. */
+        if (threadIdx.x == 0 && PLOW_SYM(plow_debug_ring)) {
+            const unsigned slot = atomicAdd(&PLOW_SYM(plow_debug_cursor), 1u) % PLOW_DEBUG_TRACE_N;
+            PLOW_SYM(plow_debug_ring)[slot] =
+                (1ull << 63) | ((unsigned long long)blockIdx.x << 32) | e.inst;
+        }
+#endif
 #if PLOW_NV_TRACE
         if (tr) t_gate1 = clock64();
 #endif

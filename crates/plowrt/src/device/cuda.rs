@@ -1081,6 +1081,38 @@ impl CudaBackend {
         Ok(true)
     }
 
+    /// Write `bytes` into a module global by name (e.g. a `__device__ T*` pointer symbol).
+    /// `Ok(false)` when the symbol is absent. TEMPORARY DIAGNOSTIC support for
+    /// PLOW_DEBUG_TRACE (crates/plowrt/src/exec/gpu.rs); not used on the serving path.
+    pub fn module_global_write(&self, module: &Module, name: &str, bytes: &[u8]) -> Result<bool> {
+        self.bind()?;
+        let raw = *self.modules.lock().get(&module.id).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "module_global_write: module {} not loaded",
+                module.id
+            ))
+        })?;
+        let cname = std::ffi::CString::new(name)
+            .map_err(|_| RuntimeError::Device("global name contains NUL".into()))?;
+        let mut ptr: CUdeviceptr = 0;
+        let mut sym_bytes: usize = 0;
+        // SAFETY: module handle from cuModuleLoadData; name is NUL-terminated.
+        let rc = unsafe {
+            (self.api.cuModuleGetGlobal_v2)(&mut ptr, &mut sym_bytes, raw as CUmodule, cname.as_ptr())
+        };
+        if rc != 0 {
+            return Ok(false); // symbol absent from this object
+        }
+        if sym_bytes != bytes.len() {
+            return Err(RuntimeError::Device(format!(
+                "module global {name} is {sym_bytes} B, want {}",
+                bytes.len()
+            )));
+        }
+        self.memcpy_htod(ptr, bytes)?;
+        Ok(true)
+    }
+
     /// Zero the first `n` bytes of a module global by name. `Ok(false)` when
     /// the symbol is absent. Used to reset the PLOW_NV_TRACE counter between
     /// warmup and the measured window (stage-7 profiling); off the hot path.
