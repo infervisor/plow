@@ -347,6 +347,26 @@ version bump, `gpu.rs` launch/grid checks keyed per program, AMD reader kept
 on the header value; gain per the plan −1.0…−1.6 ms/step, against a 176-byte
 stack frame at 128 registers that must be priced on hardware.
 
+### P2 — cuBLASLt prefill for the small-M projections (harness A/B)
+
+`build --env PLOW_EMIT_PREFILL_CUBLASLT=1` on the BF16-roles recipe (808
+projection segments routed; serve needs `LD_LIBRARY_PATH=/usr/local/cuda/lib64`
+for `libcublasLt.so.13`). Control: `bf16-roles-ms0`.
+
+| in | TTFT control | TTFT Lt | Δ | TPOT control | TPOT Lt |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 42.12 | 42.03 | −0.2 % | 12.06 | 12.03 |
+| 1024 | 89.70 | 88.05 | −1.8 % | 12.69 | 12.69 |
+| 4096 | 213.20 | 205.22 | −3.7 % | 13.28 | 13.29 |
+
+This is the library ceiling for those shapes, and it moves ≤1K by almost
+nothing: **the ≤1K TTFT gap (42 vs 28 ms at in128) is not GEMM math.** At
+in128 the prefill is a few ms; the rest is fixed per-request cost. The serve
+log shows `max_hold_ms=8.0` (muxer batch-formation hold); `PLOW_IDLE_DISPATCH`
+skips it when nothing else is queued — next A/B. P1 (native split-K) can at
+best match these Lt numbers at ≤512 and is deprioritized below the fixed-cost
+work.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
