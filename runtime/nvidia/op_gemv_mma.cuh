@@ -52,7 +52,8 @@ __device__ __forceinline__ void gvmma_mma16816(float (&d)[4], unsigned a0, unsig
 template <int NW, int MT>
 __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_bfloat16* __restrict__ x,
                                            const __nv_bfloat16* const (&W)[NW], unsigned nb,
-                                           unsigned rows, unsigned N, unsigned K) {
+                                           unsigned rows, unsigned N, unsigned K,
+                                           unsigned kb_begin = 0u, unsigned kb_end = 0xffffffffu) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned g = lane >> 2, t = lane & 3;
     const __nv_bfloat16* xr[MT][2];
@@ -76,8 +77,8 @@ __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_b
     /* Loads in flight scale down with the tile count: MT=4 (the 64-row rung) at the full depth
      * pushed the sm_90a decode object to 255 regs + 3.7 KB spills; depth 8/MT keeps it clean. */
     constexpr unsigned UNB = (PLOW_NV_GEMV_MMA_UNB / MT) < 2u ? 2u : (PLOW_NV_GEMV_MMA_UNB / MT);
-    const unsigned nkb = K >> 5;
-    unsigned kb = 0;
+    const unsigned nkb = (kb_end < (K >> 5)) ? kb_end : (K >> 5);
+    unsigned kb = kb_begin;
     for (; kb + UNB <= nkb; kb += UNB) {
         uint4 wv[NW][UNB];
 #pragma unroll
@@ -121,7 +122,9 @@ struct gvmma_range { unsigned rb0, rb1; };
 __device__ __forceinline__ gvmma_range gvmma_partition(unsigned N, unsigned slice, unsigned nblk) {
     const unsigned nrb = (N + 7u) >> 3;
     const unsigned per = (nrb + nblk - 1u) / nblk;
-    const unsigned rb0 = slice * per;
+    /* Trailing blocks can start past nrb (480 row blocks over 132 blocks: block 131 starts at
+     * 524); clamp so rb1 - rb0 is 0 there, never an unsigned underflow. */
+    const unsigned rb0 = (slice * per < nrb) ? slice * per : nrb;
     const unsigned rb1 = (rb0 + per < nrb) ? (rb0 + per) : nrb;
     return {rb0, rb1};
 }
@@ -136,6 +139,31 @@ __device__ __forceinline__ void gvmma_store2(__nv_bfloat16* C, unsigned N, unsig
     }
 }
 
+/* Split-K reduction slots: partial warps (part > 0) park their C fragments here, part 0 sums.
+ * Sized for the widest tile; static so the arms need no arena hand-off. */
+template <int MT>
+struct gvmma_red_t { float v[PLOW_NV_WARPS - 1][32][MT * 4]; };
+
+template <bool BIAS, int MT>
+__device__ __forceinline__ void gvmma_store_tile(__nv_bfloat16* __restrict__ C, const float (&acc)[MT][4],
+                                                 unsigned nb, unsigned rows, unsigned N,
+                                                 const __nv_bfloat16* __restrict__ bias) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned g = lane >> 2, t = lane & 3;
+    const unsigned n = nb + 2u * t;
+    float b0 = 0.0f, b1 = 0.0f;
+    if constexpr (BIAS) {
+        b0 = (n < N) ? __bfloat162float(bias[n]) : 0.0f;
+        b1 = (n + 1u < N) ? __bfloat162float(bias[n + 1u]) : 0.0f;
+    }
+#pragma unroll
+    for (int mt = 0; mt < MT; mt++) {
+        const unsigned m0 = 16u * mt + g;
+        if (m0 < rows) gvmma_store2(C, N, m0, n, acc[mt][0] + b0, acc[mt][1] + b1);
+        if (m0 + 8u < rows) gvmma_store2(C, N, m0 + 8u, n, acc[mt][2] + b0, acc[mt][3] + b1);
+    }
+}
+
 template <bool BIAS, int MT = 1>
 __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
                                               const __nv_bfloat16* __restrict__ x,
@@ -145,24 +173,51 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
                                               const __nv_bfloat16* __restrict__ bias = nullptr) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
-    const unsigned g = lane >> 2, t = lane & 3;
     const gvmma_range r = gvmma_partition(N, slice, nblk);
     const __nv_bfloat16* const W1[1] = {W};
+    const unsigned per = r.rb1 - r.rb0;
+    const unsigned nkb = K >> 5;
+    /* SPLIT-K. A narrow N (down: 3840 -> 480 row blocks over 132 blocks = 4 per block) leaves
+     * half the warps idle and the walk at 1.4 TB/s vs 2.2-2.6 for wide shapes. When the block
+     * has at most WARPS/2 row blocks, S = WARPS/next_pow2(per) warps share one row block and
+     * each walks 1/S of K; parts > 0 park their fragments in smem and part 0 sums them in a
+     * fixed order (bit-stable across runs). One tile per warp, so the block barrier is uniform. */
+    unsigned per_pow = 1u;
+    while (per_pow < per) per_pow <<= 1;
+    if (per != 0u && per_pow <= PLOW_NV_WARPS / 2u && (nkb % (PLOW_NV_WARPS / per_pow)) == 0u) {
+        __shared__ gvmma_red_t<MT> red;
+        const unsigned S = PLOW_NV_WARPS / per_pow;
+        const unsigned grp = warp / S, part = warp % S;
+        const unsigned rb = r.rb0 + grp;
+        const bool live = grp < per;
+        float acc[1][MT][4];
+        const unsigned span = nkb / S;
+        gvmma_tile<1, MT>(acc, x, W1, live ? (rb << 3) : (r.rb0 << 3), rows, N, K, part * span,
+                          (part + 1u) * span);
+        if (part != 0u) {
+#pragma unroll
+            for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) red.v[warp - 1u - grp][lane][mt * 4 + j] = acc[0][mt][j];
+        }
+        __syncthreads();
+        if (part == 0u && live) {
+            for (unsigned p = 1u; p < S; p++) {
+                const unsigned slot = (grp * S + p) - 1u - grp;
+#pragma unroll
+                for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                    for (int j = 0; j < 4; j++) acc[0][mt][j] += red.v[slot][lane][mt * 4 + j];
+            }
+            gvmma_store_tile<BIAS, MT>(C, acc[0], rb << 3, rows, N, bias);
+        }
+        __syncthreads(); /* red is reused by the next call on this block */
+        return;
+    }
     for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
         float acc[1][MT][4];
         gvmma_tile<1, MT>(acc, x, W1, rb << 3, rows, N, K);
-        const unsigned n = (rb << 3) + 2u * t;
-        float b0 = 0.0f, b1 = 0.0f;
-        if constexpr (BIAS) {
-            b0 = (n < N) ? __bfloat162float(bias[n]) : 0.0f;
-            b1 = (n + 1u < N) ? __bfloat162float(bias[n + 1u]) : 0.0f;
-        }
-#pragma unroll
-        for (int mt = 0; mt < MT; mt++) {
-            const unsigned m0 = 16u * mt + g;
-            if (m0 < rows) gvmma_store2(C, N, m0, n, acc[0][mt][0] + b0, acc[0][mt][1] + b1);
-            if (m0 + 8u < rows) gvmma_store2(C, N, m0 + 8u, n, acc[0][mt][2] + b0, acc[0][mt][3] + b1);
-        }
+        gvmma_store_tile<BIAS, MT>(C, acc[0], rb << 3, rows, N, bias);
     }
 }
 
