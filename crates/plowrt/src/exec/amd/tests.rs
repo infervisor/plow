@@ -1591,6 +1591,7 @@ fn lean_moe_stage1_a4_reuse_is_geometry_gated_and_scratch_bounded() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         None,
+        true,
     )
     .unwrap();
     let PrefillSegmentRoute::MoeStage1A4Reuse(route) = routes[1] else {
@@ -1614,6 +1615,7 @@ fn lean_moe_stage1_a4_reuse_is_geometry_gated_and_scratch_bounded() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         None,
+        true,
     )
     .unwrap();
     assert!(matches!(
@@ -1671,6 +1673,7 @@ fn replicated_prefill_ep_routes_full_i_and_balanced_whole_experts() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         Some((3, 8)),
+        true,
     )
     .unwrap();
     let PrefillSegmentRoute::MoeEpAlign(align) = routes[0] else {
@@ -1708,6 +1711,7 @@ fn replicated_prefill_ep_routes_full_i_and_balanced_whole_experts() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         None,
+        true,
     )
     .unwrap_err();
     assert!(err.to_string().contains("without a TP binding"));
@@ -1717,6 +1721,7 @@ fn replicated_prefill_ep_routes_full_i_and_balanced_whole_experts() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         Some((0, 4)),
+        true,
     )
     .unwrap_err();
     assert!(err.to_string().contains("topology-mismatched"));

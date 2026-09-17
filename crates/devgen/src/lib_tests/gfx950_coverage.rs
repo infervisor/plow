@@ -285,6 +285,39 @@ const GFX950_UNEMITTED: &[(&str, &str)] = &[
     // The prefill twin (`emit_glm_dsa_prefill_select`) and `glm53.rs` itself are still
     // pending; HyperConnPre/HyperConnPost below remain unrouted until glm53.rs exists.
     (
+        "PLOW_DOP_ENGRAM_EMBED",
+        "DeepSeek-V4.1 Engram's gathered table read (op 183), the sibling of ENGRAM_GATE below \
+          and unemitted for the same reason. Both arrive with the `deepseek_v41` arm, which also \
+          owns the one stage that is NOT an opcode: the host-side n-gram hash.",
+    ),
+    (
+        "PLOW_DOP_ENGRAM_GATE",
+        "DeepSeek-V4.1 Engram's gate + mix (op 182). The kernel and its gfx942 test landed with \
+          the opcode; the emit side arrives with the `deepseek_v41` arm, which also has to build \
+          the two stages that are NOT opcodes -- the host-side n-gram hash and the gathered fp8 \
+          table read. Nothing else emits it: only V4.1 has Engram.",
+    ),
+    (
+        "PLOW_DOP_COMPRESS_POOL",
+        "DeepSeek-V4 CSA2's learned-pooling KV compressor (op 180). The kernel and its gfx942 \
+          test predate the opcode; the opcode exists so a packet CAN reach it, and the emit side \
+          arrives with the `deepseek_v41` arm. Nothing else emits it: CSA2 is V4-only, and the \
+          GLM/Kimi DSA chain uses DSA_POOL_COMPRESS (op 130), a different computation.",
+    ),
+    (
+        "PLOW_DOP_COMPRESS_ROPE_QUANT",
+        "DeepSeek-V4.1's compressed-row tail (op 185): the rope and the fake quant that V4 fused \
+          into op 180 and V4.1 runs after the indexer has read the pre-rope latent. Same axis as \
+          op 180 -- PLOW_DSV4_CSA2 -- and it is dispatched on both arches for the same reason.",
+    ),
+    (
+        "PLOW_DOP_ROPE_INVERSE_O",
+        "DeepSeek-V4 CSA2's conjugate rotation on the attention output (op 181). Same standing as \
+          COMPRESS_POOL above, and the same emit site will claim both -- they are a pair, since \
+          the de-rotation is what makes the compressor's pooled output consumable by a fixed \
+          `wo_a`. No other family applies an inverse rotation to an attention output.",
+    ),
+    (
         "PLOW_DOP_FLASH_GATHER_PREFILL",
         "Sparse MLA prefill needs one causal top-k index row per query token. IndexScore and \
           IndexSelect currently produce only a single-query index, so mla.rs deliberately emits \

@@ -1,0 +1,17 @@
+plow dev shell — cargo 1.95.0 (f2d3ce0bd 2026-03-21)
+lean toolchain: leanprover/lean4:v4.15.0
+amd gpu: 64 render node(s), ROCm 7.14.0 (nix)
+DeepSeek-V4.1 block-fp8 [32,32] ue8m0 GEMM vs a host reference
+  wq_a  5120->1280           M=  512 N= 1280 K= 5120  PASS  worst rel 3.5713e-03
+  wq_b  1280->4096 tp8       M=  512 N= 4096 K= 1280  PASS  worst rel 3.3963e-03
+  wkv   5120->512 thin       M=  512 N=  512 K= 5120  PASS  worst rel 3.6875e-03
+  wo_a  4096->1024 grp       M=  512 N= 1024 K= 4096  PASS  worst rel 3.6687e-03
+  wo_b  1024->5120 tp8       M=  512 N= 5120 K= 1024  PASS  worst rel 3.8272e-03
+  shared g/u 5120->576       M=  512 N=  576 K= 5120  PASS  worst rel 3.7410e-03
+  shared down 288->5120      M=  512 N= 5120 K=  288  PASS  worst rel 3.4011e-03
+  indexer wq_b 1280->4096    M=  512 N= 4096 K= 1280  PASS  worst rel 3.6650e-03
+  engram wkv 6144->25600     M=   64 N=25600 K= 6144  PASS  worst rel 3.5636e-03
+  wo_b M=2048                M= 2048 N= 5120 K= 1024  PASS  worst rel 3.5768e-03
+  ragged M,N tails           M=  100 N=  130 K=  256  PASS  worst rel 3.6399e-03
+  ragged N=33 (blk+1)        M=   64 N=   33 K=  128  PASS  worst rel 3.6151e-03
+PASS (0 failures)

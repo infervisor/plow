@@ -177,6 +177,15 @@ PLOW_GEOM_MARK(GM_MD_BM)
 #ifdef GM_MD_BN
 PLOW_GEOM_MARK(GM_MD_BN)
 #endif
+#ifdef GM_MX_BM
+PLOW_GEOM_MARK(GM_MX_BM)
+#endif
+#ifdef GM_MX_BN
+PLOW_GEOM_MARK(GM_MX_BN)
+#endif
+#ifdef GM_MX_BK
+PLOW_GEOM_MARK(GM_MX_BK)
+#endif
 #ifdef GM_PGR2
 PLOW_GEOM_MARK(GM_PGR2)
 #endif

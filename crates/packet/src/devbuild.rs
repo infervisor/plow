@@ -970,6 +970,16 @@ impl Builder {
         &self.tensors[h as usize].name
     }
 
+    /// The declared size of handle `h`, in bytes.
+    ///
+    /// For emitters that want to check an operand against the shape they are about to pass in
+    /// `i[]`. A weight declared at one size and read at another is the silent-wrongness case: the
+    /// kernel reads whatever is at the handle, so a full-size tensor read with a per-rank N gives
+    /// every rank the FIRST shard of the weight instead of its own, with no fault anywhere.
+    pub fn tensor_bytes(&self, h: u32) -> u64 {
+        self.tensors[h as usize].bytes
+    }
+
     /// Declare a tensor whose contents the compiler already knows (e.g. RoPE tables).
     pub fn tensor_init(&mut self, name: &str, init: Vec<u8>) -> u32 {
         self.tensors.push(TensorDecl {
@@ -1679,6 +1689,36 @@ impl Builder {
         i as u32
     }
 
+    /// Why no chain qualified. The bare assert named the shape it wanted and nothing about what
+    /// the graph actually had, which is the difference between a five-minute answer and a bisect.
+    fn ep_ineligibility_report(&self, degree: u32) -> String {
+        let mut out = String::new();
+        for op in self.ops.iter() {
+            let g = &op.inst;
+            if g.op != DevOp::MoeGroupGluPf as u16 {
+                continue;
+            }
+            let full_i = g.i[0].checked_mul(degree);
+            out.push_str(&format!(
+                "\n  MoeGroupGluPf enc=i[3]={} (EP needs 2=MXFP4), ep=i[6]={} (needs 0), \
+                 imoe=i[0]={} hidden=i[1]={} n_exp=i[2]={}; full_i={:?} (needs %128==0), \
+                 hidden%128={}, n_exp>=degree: {}",
+                g.i[3],
+                g.i[6],
+                g.i[0],
+                g.i[1],
+                g.i[2],
+                full_i,
+                g.i[1] % 128,
+                g.i[2] >= degree,
+            ));
+        }
+        if out.is_empty() {
+            out.push_str("\n  the graph emits no MoeGroupGluPf at all");
+        }
+        out
+    }
+
     fn rewrite_replicated_moe_prefill_ep(&mut self, degree: u32) -> usize {
         assert!(degree > 1, "EP degree must exceed one");
         let mut chains = Vec::new();
@@ -1708,7 +1748,11 @@ impl Builder {
                 c.op == DevOp::MoeCombinePf as u16
                     && c.t[3] == d.t[0]
                     && c.i[0] == d.i[0]
-                    && c.i[1] == 16
+                    // i[1] is the combine's top_k. This used to require == 16, which is Kimi-K3's
+                    // top_k and not a property of the rewrite: DeepSeek-V4.1 routes top-6 and was
+                    // silently ineligible. What the rewrite actually needs is a real per-slot
+                    // combine (k > 1) whose k agrees with the align's, which is checked below.
+                    && c.i[1] > 1
                     && c.i[2] != 0
                     && c.i[3..].iter().all(|&v| v == 0)
             }) else {
@@ -1736,7 +1780,9 @@ impl Builder {
                         && a.t[0] == g.t[4]
                         && a.i[0] == self.ops[combine].inst.i[2]
                         && a.i[1] == g.i[2]
-                        && a.i[2] == 16)
+                        // ...and the align's top_k must be the combine's, rather than both being
+                        // required to be the literal 16.
+                        && a.i[2] == self.ops[combine].inst.i[1])
                         .then_some(i)
                 })
                 .collect();
@@ -1828,13 +1874,31 @@ impl Builder {
         chains.len()
     }
 
+    /// Drop every op after the first `n`, for BISECTION.
+    ///
+    /// A diagnostic, and the only sound direction to cut: dependencies point BACKWARDS, so no
+    /// surviving op can reference one this drops, and `finish` then computes waits and successors
+    /// over the remaining prefix exactly as if the emitter had stopped there. Cutting anywhere
+    /// but the tail would leave a dangling counter.
+    ///
+    /// Exists because a per-op cost on real hardware cannot be had any other way on this stack:
+    /// the interpreter is a MEGAKERNEL, so one launch covers the whole layer and a kernel-level
+    /// profiler reports one number for 34 ops. Emitting prefixes and differencing their run times
+    /// is the profiler.
+    pub fn truncate_ops(&mut self, n: usize) {
+        if n < self.ops.len() {
+            self.ops.truncate(n);
+        }
+    }
+
     pub fn finish(mut self) -> Program {
         let knobs = knobs();
         if let Some(degree) = self.moe_prefill_ep_degree {
             let rewritten = self.rewrite_replicated_moe_prefill_ep(degree);
             assert!(
                 rewritten != 0,
-                "replicated MoE EP requested at degree {degree}, but the complete graph has no eligible MXFP4 align/GLU/down/combine -> TP-reduction boundary"
+                "replicated MoE EP requested at degree {degree}, but the complete graph has no eligible MXFP4 align/GLU/down/combine -> TP-reduction boundary.{}",
+                self.ep_ineligibility_report(degree)
             );
             eprintln!("  whole-graph placement: {rewritten} routed-MoE boundaries use EP{degree}");
         }
@@ -2105,8 +2169,18 @@ impl Builder {
             .ops
             .iter()
             .any(|op| op.inst.op == DevOp::FlashMlaPrefillFp8 as u16 && op.inst.j[1] != 0);
+        // A GATHERED op 51 -- t[7] = the per-pack union table -- has an arm on the FOUR-WAVE
+        // object only; the 8-wave interpreter traps on it by design rather than attend the full
+        // causal range of a model trained sparse. So the routing is a property of the PACKET and
+        // not of a knob: emitting one of these without V2 segmentation cannot produce a program
+        // that runs at all.
+        let mla_gather_union = self
+            .ops
+            .iter()
+            .any(|op| op.inst.op == DevOp::FlashMlaPrefill as u16 && op.inst.t[7] != TENSOR_NONE);
         let mla_v2 = !uniseg
             && (split_mla
+                || mla_gather_union
                 || match knobs.mla_pf_v2 {
                     Some(explicit) => explicit,
                     // A placed packet is an AMD production artifact. Isolating a pure MLA flash
