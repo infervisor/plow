@@ -11,6 +11,16 @@
  *   nvcc -gencode arch=compute_90a,code=sm_90a -O3 -std=c++17 -DPLOW_NV_GEMV_MMA=1 -DGV_MM_MAX=16 \
  *        -Iruntime/common -Iruntime/nvidia runtime/nvidia/experiments/gemv_mma_batch_h100.cu -o gemv_mma_ab
  * Run: ./gemv_mma_ab [M=16]
+ *
+ * Build the REFERENCE side with -DPLOW_NV_GEMV_MMA=0: with the define on, gemv_rows<16> itself
+ * dispatches to the MMA walk and the A/B compares the MMA walk with itself. The reference kernels
+ * instantiate the 16-row rung for every M; the interpreter's walk picks the smallest rung that
+ * covers M (gv_mm<2/4/8/16>), so at M<16 the shipped dot8 cost is somewhat lower than reported.
+ *
+ * RESULTS (H100 SXM5, 132x256, min of 20, 2026-09-17):
+ *   M=16: o_proj 221 -> 2156 GB/s (9.8x), down 100 -> 1424 (14.2x), qkv 282 -> 1871 (6.6x),
+ *         gate|up 366 -> 2571 (7.0x); relL2 1.7e-3 both sides.
+ *   M=8:  4.1-8.8x.  M=4: 3.1-5.8x.  M=2: 2.5-5.2x (16-row reference, see above).
  */
 #include <cstdio>
 #include <cstdlib>

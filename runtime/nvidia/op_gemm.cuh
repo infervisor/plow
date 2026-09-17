@@ -142,8 +142,9 @@ __device__ __forceinline__ void gemv_rows(__nv_bfloat16* __restrict__ C,
                                           unsigned N, unsigned K, unsigned slice, unsigned nblk,
                                           const __nv_bfloat16* __restrict__ bias = nullptr) {
 #if PLOW_NV_GEMV_MMA
-    /* BATCH>=8 rungs on the tensor cores (op_gemv_mma.cuh); the dot8 walk stays for K % 32 != 0. */
-    if constexpr (MM >= 8) {
+    /* BATCH>=4 rungs on the tensor cores (op_gemv_mma.cuh); the dot8 walk stays for K % 32 != 0
+     * and for the 2-row rung (unmeasured there). */
+    if constexpr (MM >= 4) {
         if ((K & 31u) == 0u) {
             gemv_rows_mma<BIAS>(C, x, W, M, N, K, slice, nblk, bias);
             return;
@@ -557,7 +558,7 @@ __device__ __forceinline__ void gemv_qkv_rows(__nv_bfloat16* Cq, __nv_bfloat16* 
                            const __nv_bfloat16* bk = nullptr,
                            const __nv_bfloat16* bv = nullptr) {
 #if PLOW_NV_GEMV_MMA
-    if constexpr (MM >= 8) {
+    if constexpr (MM >= 4) {
         if ((K & 31u) == 0u && ((Nq | Nk) & 7u) == 0u) {
             gemv_qkv_rows_mma<BIAS>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, slice, nblk, bq, bk, bv);
             return;
@@ -2323,7 +2324,7 @@ __device__ __forceinline__ void gemv_glu_rows(__nv_bfloat16* C, const __nv_bfloa
                            const __nv_bfloat16* Wg, const __nv_bfloat16* Wu, unsigned M, unsigned N,
                            unsigned K, unsigned act, unsigned slice, unsigned nblk) {
 #if PLOW_NV_GEMV_MMA
-    if constexpr (MM >= 8) {
+    if constexpr (MM >= 4) {
         if ((K & 31u) == 0u) {
             gemv_glu_rows_mma(C, x, Wg, Wu, M, N, K, act, slice, nblk);
             return;
