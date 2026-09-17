@@ -701,7 +701,15 @@ max-num-seqs 16 for ctx16k; 8192 / 32 for C32; prefix caching off):
 | 8192/4 | ctx16k, chunk 4096, ladder 16 | 1924 / 994 | 24.9 / 13.9 | 100 / 186 |
 | 8192/16 | same | 8460 / 2300 | 73.2 / 35.7 | 114 / 298 |
 | 15000/4 | same | 3904 / 1653 | 35.2 / 18.5 | 61 / 128 |
-| 15000/16 | same | shed: 22 of 32 requests 429'd (mean TTFT 7.4 s vs the default 10 s slot-wait TTL) | – / 61.8 | – / 172 |
+| 15000/16 | same | rejected: 22–23 of 32 requests ("packed prefill: padding exceeds every request's physical context") | – / 61.8 | – / 172 |
+
+The 15000/16 failure is an admission rule, not shedding (re-run with
+`PLOW_QUEUE_TTL_MS=0` failed identically): a packed launch pads its bucket and
+charges the pad rows to one request's KV positions, and at 15000 + 128 of
+16384 no request can absorb a multi-thousand-row pad, so the planner rejects
+the request outright (`plow-asset packed_prefill.rs`). Masked padding (pad
+rows carry slot −1, objects built with `PLOW_NV_MASKED_PADDING=1`) avoids it:
+emit with `PLOW_MAX_REQUEST_CHUNK=4096` → cell `campaign-bf16-ctx16k-mp`.
 | 1024/32 | c32, chunk 2048, ladder 32, roles OFF | 1590 / 852 | 27.3 / 17.5 | 807 / 1322 |
 
 Long context is ~2× behind on every axis: prefill throughput is flat (~20K
