@@ -9277,6 +9277,21 @@ fn emit_dense_gqa(
             .expect("dense prefill projection segments");
         assert!(selected > 0, "no eligible dense prefill projections");
         eprintln!("  cuBLASLt prefill: {selected} projection segments");
+        // Packetize the exact-shape algorithm selection from the tune store when one exists;
+        // a host with the GPU refreshes it through the campaign probe, and the runtime
+        // re-validates every entry with AlgoCheck before use.
+        if let Some(root) = ecfg.tunedb_root() {
+            match dense_cublaslt::packetize_algo_table(
+                &m,
+                &arch,
+                std::path::Path::new(&root),
+                std::path::Path::new(&out),
+            ) {
+                Ok(0) => eprintln!("  cuBLASLt algorithms: no tune-store rows for this target; the runtime selects at load"),
+                Ok(n) => eprintln!("  cuBLASLt algorithms: {n} shape(s) packetized from the tune store"),
+                Err(error) => eprintln!("  cuBLASLt algorithms: not packetized: {error}"),
+            }
+        }
     }
     // BLOCK MODE: embed the block.json descriptor
     // as SECT_METADATA — this also forces the to_blob_v6 path — and drop a

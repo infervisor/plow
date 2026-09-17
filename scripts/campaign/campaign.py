@@ -154,6 +154,30 @@ def cmd_build(a: argparse.Namespace) -> None:
     }
     (out / "build-record.json").write_text(json.dumps(rec, indent=1))
     print(f"built {assets}\nrecord {out / 'build-record.json'}", file=sys.stderr)
+    # With the GPU on this box, select the exact-shape cuBLASLt algorithms now and packetize
+    # them (leased); without it, plowc has already packetized the tune store's rows.
+    if not a.no_probe and (assets / "build.json").exists() and gpu_matches(cell.get("gpu", "")):
+        if (assets / "cublaslt_algos.jsonl").exists():
+            print("probe: table already packetized from the tune store; skipping", file=sys.stderr)
+        else:
+            a.assets = str(assets)
+            a.store_cell = a.store_cell or "h100"
+            a.force = False
+            a.label = None
+            cmd_probe(a)
+
+
+def gpu_matches(recipe_gpu: str) -> bool:
+    """Whether nvidia-smi reports a GPU of the recipe's family (first word, e.g. `H100`)."""
+    family = recipe_gpu.split()[0].upper() if recipe_gpu else ""
+    if not family:
+        return False
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return False
+    return any(family in ln.upper() for ln in out.splitlines())
 
 
 # ---------------------------------------------------------------- bench
@@ -203,6 +227,11 @@ def cmd_bench(a: argparse.Namespace) -> None:
     objects = assets.parent / "objects"
     if "objects" in r and "PLOW_PF_SEG_DIR" not in env and objects.is_dir():
         env["PLOW_PF_SEG_DIR"] = str(objects)
+    # A `probe` (or a prior write) leaves the exact-shape cuBLASLt algorithm table beside the
+    # packet; serving with it pins every Lt shape after AlgoCheck instead of re-timing at load.
+    lt_table = assets / "cublaslt_algos.jsonl"
+    if lt_table.is_file() and "PLOW_LT_ALGOS" not in env and "PLOW_LT_ALGOS_WRITE" not in env:
+        env["PLOW_LT_ALGOS"] = str(lt_table)
     env.update({
         "VLLM_VENV": bench.get("vllm_venv", "/opt/pytorch"),
         "HF_HOME": str(out / "hf-home"),
@@ -270,6 +299,81 @@ def cmd_bench(a: argparse.Namespace) -> None:
         compare(out / "results.csv", Path(a.reference or REPO / r["reference"]["csv"]))
 
 
+# ---------------------------------------------------------------- probe
+def cmd_probe(a: argparse.Namespace) -> None:
+    """Serve the packet once under the lease with `--lt-algos-write`, answer the coherence
+    gate, and stop. Leaves `<assets>/cublaslt_algos.jsonl` (consumed by `bench`) and copies it
+    into the tune store, so an emit on a GPU-less host can packetize the same selection."""
+    r = load(a.recipe)
+    cell, bench, serve = r["cell"], r["bench"], dict(r.get("serve", {}))
+    assets = Path(a.assets).resolve()
+    if not (assets / "model.pkt").exists():
+        die(f"{assets}/model.pkt missing")
+    out = assets.parent / "probe"
+    out.mkdir(exist_ok=True)
+    table = assets / "cublaslt_algos.jsonl"
+    if table.exists() and not a.force:
+        die(f"{table} exists; pass --force to re-probe")
+    plowrt = Path(serve.get("plowrt", str(REPO / "target" / "release" / "plowrt"))).resolve()
+    private = out / "plowrt"
+    private.write_bytes(plowrt.read_bytes())
+    private.chmod(0o755)
+    env = env_with(os.environ, serve.get("env", {}))
+    objects = assets.parent / "objects"
+    if "objects" in r and "PLOW_LT_ALGOS_WRITE" not in env and objects.is_dir():
+        env.setdefault("PLOW_PF_SEG_DIR", str(objects))
+    env.update(dict(kv.split("=", 1) for kv in (a.env or [])))
+    env["PLOW_LT_ALGOS_WRITE"] = str(table)
+    env.pop("PLOW_LT_ALGOS", None)
+    port = str(bench.get("port", 8765))
+    model_id = bench.get("model_id") or cell["revision"]
+    gate = json.dumps({"model": model_id, "prompt": bench["gate_prompt"], "max_tokens": 16, "temperature": 0})
+    script = out / "probe.sh"
+    lines = ["#!/usr/bin/env bash", "set -uo pipefail"]
+    for k, v in sorted(env.items()):
+        if k in os.environ and os.environ[k] == v:
+            continue
+        lines.append(f"export {k}={shlex.quote(v)}")
+    lines += [
+        f"setsid {shlex.quote(str(private))} serve --assets {shlex.quote(str(assets))} --port {port} >{shlex.quote(str(out / 'server.log'))} 2>&1 &",
+        "SRV=$!",
+        "trap 'kill -TERM -\"$SRV\" 2>/dev/null; sleep 2; kill -KILL -\"$SRV\" 2>/dev/null' EXIT",
+        f"for i in $(seq 1 {bench.get('ready_s', 1200)}); do kill -0 $SRV 2>/dev/null || {{ echo 'server died'; tail -20 {shlex.quote(str(out / 'server.log'))}; exit 1; }}; "
+        f"curl -sf --max-time 2 http://127.0.0.1:{port}/v1/models >/dev/null 2>&1 && break; sleep 1; done",
+        f"curl -s --max-time 300 http://127.0.0.1:{port}/v1/completions -H 'Content-Type: application/json' --data-binary {shlex.quote(gate)} | grep -qi paris || {{ echo 'gate FAIL'; exit 1; }}",
+        "echo 'gate PASS'",
+    ]
+    script.write_text("\n".join(lines) + "\n")
+    script.chmod(0o755)
+    log = out / "probe.log"
+    log.write_bytes(b"")
+    label = a.label or f"{cell['name']}-probe"
+    rc = run([str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label, str(script)], dict(os.environ), log)
+    text = log.read_text(errors="replace")
+    if rc != 0 or "gate PASS" not in text or not table.is_file():
+        die("probe failed; see probe/probe.log and probe/server.log")
+    rows = [ln for ln in table.read_text().splitlines() if ln.strip()]
+    store = REPO / "tuning" / "nvidia" / cell["arch"].replace("_", "") / a.store_cell / "cublaslt_algos.jsonl"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    seen = set()
+    if store.exists():
+        for ln in store.read_text().splitlines():
+            if ln.strip():
+                d = json.loads(ln)
+                seen.add((d["m"], d["n"], d["k"], d["dtype"], d["gpu"]))
+    added = 0
+    with open(store, "a") as f:
+        for ln in rows:
+            d = json.loads(ln)
+            key = (d["m"], d["n"], d["k"], d["dtype"], d["gpu"])
+            if key in seen:
+                continue
+            seen.add(key)
+            f.write(ln + "\n")
+            added += 1
+    print(f"probe: {len(rows)} shape(s) selected -> {table}\n       {added} new row(s) -> {store}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------- compare
 def read_rows(p: Path) -> dict:
     with open(p) as f:
@@ -323,12 +427,18 @@ def main() -> None:
     sp = p.add_subparsers(dest="cmd", required=True)
     b = sp.add_parser("build"); b.add_argument("recipe"); b.add_argument("--out", required=True)
     b.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the emit env; recorded")
+    b.add_argument("--no-probe", action="store_true", help="skip the leased cuBLASLt algorithm probe even with the GPU present")
+    b.add_argument("--store-cell", help="tune-store cell for the probe (default h100)")
     b.set_defaults(f=cmd_build)
     n = sp.add_parser("bench"); n.add_argument("recipe"); n.add_argument("--assets", required=True); n.add_argument("--out", required=True)
     n.add_argument("--concs"); n.add_argument("--in-lens"); n.add_argument("--label"); n.add_argument("--reference")
     n.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the server env; recorded")
     n.add_argument("--profile", help="named workload from [bench.profiles.*] (e.g. realtime, throughput)")
     n.set_defaults(f=cmd_bench)
+    pr = sp.add_parser("probe"); pr.add_argument("recipe"); pr.add_argument("--assets", required=True)
+    pr.add_argument("--store-cell", default="h100", help="tune-store cell under tuning/nvidia/<arch>/")
+    pr.add_argument("--label"); pr.add_argument("--force", action="store_true")
+    pr.add_argument("--env", action="append", metavar="K=V"); pr.set_defaults(f=cmd_probe)
     c = sp.add_parser("compare"); c.add_argument("results"); c.add_argument("reference"); c.set_defaults(f=cmd_compare)
     l = sp.add_parser("ledger"); l.add_argument("results"); l.add_argument("--cell", required=True); l.add_argument("--note", required=True)
     l.add_argument("--provisional", action="store_true"); l.set_defaults(f=cmd_ledger)
