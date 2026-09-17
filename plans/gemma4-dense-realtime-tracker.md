@@ -104,13 +104,50 @@ checkpoint config, B=1 S=8192.
    (gelu_tanh), not SwiGLU". The unverified Tensile `activationType` integer to
    settle is the **gelu_tanh** one for this model.
 
+## B0 — result
+
+The "ALL dense-GEMM tile(s) chosen by the ANALYTICAL MODEL" state had two
+causes, neither of them a missing campaign:
+
+1. **The probe could not find `hipcc`.** `kernelcaps/src/probe.rs` cleared the
+   environment and set `PATH=/usr/local/cuda/bin:/opt/rocm/bin:/usr/bin:/bin`,
+   which predates the flake shipping ROCm from the nix store. On a nix-only
+   host every AMD probe failed, no digest could be computed, and zero records
+   loaded — reported as tier `portable`, byte-identical to "never measured".
+   `plowc tune status --gpu MI300X` could not derive an inventory at all.
+   Fixed: the compiler is resolved on the inherited PATH before the env is
+   cleared; `HIP_DEVICE_LIB_PATH` is forwarded.
+2. **Every one of the 8007 records is stale against the current source.**
+   With the probe working, the store keys to `gfx942-437e258b24c15856` and
+   all 18 measured digests differ in `implementation`+`interpreter` (14 of
+   them also in `oracle`, 4 also in `toolchain`). The strict rule dropped all
+   of them. `PLOW_TUNE_IGNORE_DIGEST` (default on) parks digest-mismatched
+   records and fills only op cases with no current-digest record; exact
+   records are never displaced and a parked case is taken whole.
+
+Gemma-4-12B gfx942 emit, `wide` profile, same source, CPU-only:
+
+| Knob | Tunedb verdict | Packet |
+|---|---|---|
+| `PLOW_TUNE_IGNORE_DIGEST=0` (strict) | ALL 3552 tile(s) ANALYTICAL | `9e1ce3b1…` |
+| default (relaxed) | **275 op cases filled; all 3936 tile(s) BY MEASUREMENT** | `17b942dd…` |
+
+Caveats, stated plainly: this is a structural result with **no hardware
+certificate** — no MI300X was reachable. The relaxed path also ignores the
+`oracle` digest, so 14 of 18 measured builds were certified by a weaker
+correctness oracle than the current one; the T2 numerics gate on hardware is
+not optional before any serving promotion. Re-running the campaign against
+the current family (`scripts/rebench_tune_gemm_gfx942.sh`) retires both
+caveats and is still the B0 deliverable.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
 |---|---|---|
 | Merge `glm53-8k-ttft` | **done** | `044ee494`; 593 + 534 tests pass |
 | A0 audit | **done** | table above |
-| B0 tile tuning | **blocked** | needs an MI300X; `scripts/rebench_tune_gemm_gfx942.sh` present |
+| Probe PATH fix | **done** | `kernelcaps/src/probe.rs`; `tune status` sees 8007 records; 73 tests pass |
+| B0 tile tuning | **structurally unblocked; hardware gate pending** | 275 cases / 3936 lookups by measurement; campaign re-run needs an MI300X |
 | A1 GEMM epilogue | **ready to author, gate blocked** | premise verified: `amd_gemm_lt.rs:347` `epilogue: [u32; 14]`, only `[9]/[10]` (dstD) written; 12 words zero. Bias-capable specs already pinned (`gemma_lt_bias_gfx942.json` 5, `gemma_lt_nobias_gfx942.json` 3). `activationType` value needs a 1-GPU gfx942 T2 (`scripts/tensile_args.py`) |
 | A2 glue fusions | **re-scope** | see finding 3 |
 | B3 fused GLU/QKV | **partly already shipped** | `GemmGlu`/`GemvGlu` fuse gate+up+act today |
@@ -120,12 +157,22 @@ checkpoint config, B=1 S=8192.
 
 ## Next actions
 
-1. Resolve the hardware decision above. It gates B0 and every gfx942 gate.
+1. Resolve the hardware decision above. It gates the B0 campaign re-run and
+   every gfx942 T2/T3/T4.
 2. Independent of that: record a Plow C1/C4 TTFT+TPOT baseline for 12B against
    the vLLM table, so realtime has a control. Run under `gpulease -n 1`.
 3. A1: author the epilogue fields behind `PLOW_GEMM_EPILOGUE_ACT`, defaulted
    off, with the gelu_tanh `activationType` left as the one unresolved constant;
    gate on an MI300X host.
+4. On the first MI300X session: `plowc tune status --gpu MI300X`, then the B0
+   campaign, then a T2 numerics pass on the relaxed-tile packet before anything
+   is served from it.
+
+## Mergeability
+
+Checked against `origin/main` after every commit: `git merge-tree` is clean,
+the branch is ahead only (fast-forward). The probe fix and the tuner knob are
+each self-contained and mergeable on their own.
 
 ## Protocol
 
