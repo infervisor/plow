@@ -671,12 +671,25 @@ the manifest now emits it into plow_config.h whenever gv_mm_max ≥ 8 on sm_90a
 HMMA.16816 in its SASS. A/B: in128 C4/C16 (decode-only) and the throughput
 profile at 1024/4096 C4/C16 against `campaign-bf16-ladder`.
 
-**Measured (in128, throughput profile, GPU free):** C16 TPOT 44.64 → 16.20 ms,
-937 tok/s (vLLM 11.0 ms; its 1024/16 aggregate is 940 tok/s); C4 unchanged at
-18.0 ms because the hook covers MM ≥ 8 only and the B=4 rung still walks dot8.
-Next: extend the hook to the 4- and 2-row rungs (harness at M=4/M=2 first), and
-split K across warps for the small-N/large-K `down` shape (1.4 TB/s: only 480
-of 1056 warps get a row block).
+**Measured (GPU free, cache off, throughput profile).** Hooks now cover the
+4/8/16-row rungs (commits 0c46ee46, 8dfbaacd); the 2-row rung stays on dot8.
+
+| cell | TPOT before → after | tok/s before → after | vLLM TPOT / tok/s |
+|---|---:|---:|---:|
+| 128/4 (decode-only) | 18.1 → 13.8 | 218 → 284 | 10.6 / – |
+| 128/16 (decode-only) | 44.6 → 16.2 | 350 → 935 | 11.0 / – |
+| 1024/4 | 19.8 → 15.4 | 187 → 238 | 11.2 / 331 |
+| 1024/16 | 49.7 → 21.2 | 273 → 540 | 13.8 / 940 |
+| 4096/4 | 23.3 → 19.1 | 130 → 154 | 12.2 / 254 |
+| 4096/16 | 57.9 → 38.8 | 164 → 249 | 21.9 / 499 |
+
+Remaining throughput gap, in order: (1) prefill interleaving — decode-only C16
+is 16.2 ms but 21.2 with prefill, and TTFT queues behind ~20K tok/s prefill
+(the C1 prefill items: hd512 attention, light bodies, launch count); (2) the
+`down` shape at 1.4 TB/s (480 of 1056 warps busy: split K across warps);
+(3) long-context decode attention (4096/16: 38.8 ms); (4) the 2-row rung.
+Harness debt: the low-memory guard kills tracked background benches while a
+server pages in weights — launch benches detached (job tmp `launch_tp_c4.sh`).
 
 ### plowrt VMM prefix review (merged 2026-09-17, branch `gemma4-plowrt-vmm-fixes`)
 
