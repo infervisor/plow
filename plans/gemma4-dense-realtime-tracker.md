@@ -487,8 +487,20 @@ longer, so the bench's "128" runs Plow's 512 bucket and its "1024" runs
 prompts Plow's in128 prefill is already faster than vLLM's. Cache-off Lt
 cells: 42.27 / 54.63 / 201.83 ms (ledger `bf16-ltglu-ms0-nocache`).
 
-Fix under test: `PLOW_PF_LADDER_APPEND=256,1280,4608` (T32 pattern — a rung
-that swallows the inflated length in one chunk), emit-only.
+`PLOW_PF_LADDER_APPEND=256,1280` was **null** (42.22 / 54.54 / 201.09; `4608`
+with `PLOW_MAX_CHUNK=8192` is refused by the packed-prefill ring rule), so the
+bench's prompts are not bucket-quantized either. A request-field probe (same
+128-token prompt with the bench's `repetition_penalty: 1.0`, `logprobs: null`,
+`stream_options.include_usage`) is also null: 22.1 ms first chunk on every
+variant, and **server-side TPOT 10.7 ms** — at vLLM BF16's 10.55 — where the
+bench reports 12.0.
+
+What remains is the vLLM bench client itself: its random-text prompts (≈30 ms
+with a plain client) and its own per-request/per-chunk overhead account for
+the 42 ms it reports, and vLLM pays the same client overhead under the shared
+protocol. The bench stays the yardstick; the server-side numbers are the ones
+kernel work should be priced against: **in128 TTFT 22 ms and TPOT 10.7 ms
+(BF16, exact-length, cache off) vs vLLM's client-measured 28.2 / 10.55.**
 
 ### Next pipeline step — ctx-keyed attention selection at emit
 
