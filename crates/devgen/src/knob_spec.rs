@@ -630,6 +630,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.mla_gather_split", Some("PLOW_MLA_GATHER_SPLIT"), Layer::Emit, U32, Default::Static(Val::Nat(2)), OPT_IN),
     KnobSpec::new("emit.dsv41_xr_band", Some("PLOW_DSV41_XR_BAND"), Layer::Emit, U32, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("emit.dsv41_xr_band_cus", Some("PLOW_DSV41_XR_BAND_CUS"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.dsv41_sp_abl", Some("PLOW_DSV41_SP_ABL"), Layer::Emit, Domain::Bool, OFF, DIAG),
     KnobSpec::new("emit.decode_tiled", Some("PLOW_DECODE_TILED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.l2_place_prefill", Some("PLOW_L2_PLACE_PREFILL"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.fuse_argmax", Some("PLOW_FUSE_ARGMAX"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

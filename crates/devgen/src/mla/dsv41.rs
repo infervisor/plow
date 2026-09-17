@@ -1421,6 +1421,25 @@ pub(crate) fn emit_dsv41_engram(
 /// layer 0 that IS the model; for a rung starting elsewhere it is the rung's synthetic entry, of
 /// a piece with the synthetic residual stream the harness uploads into `act.hc_residual_a`.
 #[allow(clippy::too_many_arguments)]
+/// CEILING INSTRUMENT ONLY (`PLOW_DSV41_SP_ABL=1`): run the per-token mHC and norm packets over
+/// `t/tp` rows instead of `t`.
+///
+/// The ANSWER IS WRONG -- 7/8 of the rows are never written, so the residual stream is garbage
+/// from the first layer on. What it measures is right: these packets are replicated across the
+/// ranks today (every rank computes all `t` rows of work that depends only on its own token), and
+/// sequence parallelism would leave each rank exactly this band. So the run time of this emit is
+/// the run time SP would reach, without building SP's reduce-scatter/all-gather plumbing or the
+/// third peer-slot region the dsv41 layout would need for it.
+///
+/// Read it against the unablated control and the difference is the SP budget, nothing more.
+fn sp_abl_rows(t: u32, tp: u32) -> u32 {
+    if crate::emit_config::active().dsv41_sp_abl && tp > 1 {
+        t / tp
+    } else {
+        t
+    }
+}
+
 pub(crate) fn emit_dsv41_mhc_pre(
     b: &mut Builder,
     c: &Dsv41Cfg,
@@ -1431,6 +1450,7 @@ pub(crate) fn emit_dsv41_mhc_pre(
     ri: usize,
     pi: usize,
     t: u32,
+    tp: u32,
     deps: &[u32],
 ) -> u32 {
     let side = if ffn { "ffn" } else { "attn" };
@@ -1460,7 +1480,7 @@ pub(crate) fn emit_dsv41_mhc_pre(
         c.hc_sinkhorn_iters,
         c.eps,
         c.raw.hc_eps,
-        t,
+        sp_abl_rows(t, tp),
         deps,
     )
 }
@@ -1474,6 +1494,7 @@ pub(crate) fn emit_dsv41_mhc_post(
     raw: u32,
     ri: usize,
     t: u32,
+    tp: u32,
     deps: &[u32],
 ) -> u32 {
     super::emit_mhc_post(
@@ -1485,7 +1506,7 @@ pub(crate) fn emit_dsv41_mhc_post(
         m.comb_mix,
         c.hidden,
         c.hc_mult,
-        t,
+        sp_abl_rows(t, tp),
         deps,
     )
 }
@@ -2560,7 +2581,7 @@ pub(crate) fn emit_dsv41_block(
                 &deps,
             )];
         }
-        let c_pre = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, false, ri, pi, t, &deps);
+        let c_pre = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, false, ri, pi, t, tp, &deps);
         pi += 1;
         let (proj, c_proj) =
             emit_dsv41_attn_proj(&mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre]);
@@ -2631,10 +2652,10 @@ pub(crate) fn emit_dsv41_block(
         );
         let (_out, c_out) =
             emit_dsv41_attn_out(&mut b, c, &w, &all, l, tp, core.o, t, &mut xgate, &[c_core]);
-        let c_post = emit_dsv41_mhc_post(&mut b, c, &mhc, _out.o, ri, t, &c_out);
+        let c_post = emit_dsv41_mhc_post(&mut b, c, &mhc, _out.o, ri, t, tp, &c_out);
         ri ^= 1;
 
-        let c_pre2 = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, true, ri, pi, t, &[c_post]);
+        let c_pre2 = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, true, ri, pi, t, tp, &[c_post]);
         pi += 1;
         let (ffn, c_sh) = emit_dsv41_ffn_shared(
             &mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre2],
@@ -2645,7 +2666,7 @@ pub(crate) fn emit_dsv41_block(
         );
         // CAPTURED, not discarded: it is the next layer's only dependency, and the thing that
         // makes the chain a chain rather than 40 layers racing on one residual buffer.
-        let c_layer = emit_dsv41_mhc_post(&mut b, c, &mhc, xnext, ri, t, &[c_moe]);
+        let c_layer = emit_dsv41_mhc_post(&mut b, c, &mhc, xnext, ri, t, tp, &[c_moe]);
         ri ^= 1;
         deps = vec![c_layer];
     }
