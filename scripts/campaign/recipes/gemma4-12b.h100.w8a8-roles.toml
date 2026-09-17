@@ -48,6 +48,9 @@ PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
 
 [serve.env]
+# vLLM 0.28 reference ran with prefix caching disabled; match it. A realtime-chat profile may
+# turn it on, but then the reference must too.
+PLOW_PREFIX_CACHE = "0"
 PLOW_PF_SEG_PURE = "fp8"
 PLOW_PF_SEG_FA512 = "1"
 

@@ -78,6 +78,10 @@ row against a different precision.
   flash segment" warning is an AMD relaunch concern.
 - Packed prefill is default-on only for BF16 Hopper packets; W8A8 needs
   `PLOW_EMIT_PACKED_PREFILL=1` explicitly or the roles have no metadata.
+- **Prefix cache.** plowrt serves with the prefix cache ON by default; vLLM-bench's random
+  prompts share long prefixes, so cells silently become cache-hit suffixes (a 128-token
+  request ran as a 39-row token batch after a 96-row hit). The vLLM references ran with
+  prefix caching disabled: every vLLM-matched recipe sets `PLOW_PREFIX_CACHE=0`.
 - A W8A8 packet loads `fp8/…` twins from any safetensors in `checkpoint/`;
   compose a directory (BF16 shards + `fp8-model.safetensors`) and point
   `checkpoint_dir` at it.

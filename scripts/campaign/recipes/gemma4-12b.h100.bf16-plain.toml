@@ -18,6 +18,9 @@ args = []
 PLOW_DECODE_BATCH_LADDER = "1"
 PLOW_MAX_CHUNK = "4096"
 
+[serve.env]
+PLOW_PREFIX_CACHE = "0"   # vLLM reference ran with prefix caching disabled
+
 [bench]
 backend = "openai"
 in_lens = "128 1024 4096"
