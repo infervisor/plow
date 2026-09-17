@@ -852,7 +852,7 @@ fn the_mhc_pair_is_glm53s_hyper_connection_at_v41s_own_constants() {
     let mut b = Builder::new(304);
     let w = super::dsv41::declare_dsv41_weights(&mut b, &cfg, &[0], cfg.o_groups);
     let t = 512u32;
-    let m = super::dsv41::declare_dsv41_mhc(&mut b, &cfg, t);
+    let m = super::dsv41::declare_dsv41_mhc(&mut b, &cfg, t, 1);
     let c_pre = super::dsv41::emit_dsv41_mhc_pre(&mut b, &cfg, &w, &m, 0, false, 0, 0, t, 1, &[]);
     let raw = b.tensor("act.raw", (t as u64) * (cfg.hidden as u64) * 2);
     super::dsv41::emit_dsv41_mhc_post(&mut b, &cfg, &m, raw, 0, t, 1, &[c_pre]);

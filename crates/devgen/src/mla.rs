@@ -8033,7 +8033,11 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
         let rows = t / kb;
         // Sequence-parallel FFN seam: reduce-scatter, then the residual on the owned band only;
         // the next layer's input norm (or the tail's final norm) gathers.
-        let sp = !raw_output && glm_sp(c, n, b, t);
+        // RAW + SP is a legal combination and V4.1 is why: an mHC caller does its own residual
+        // (`HyperConnPost`), so the seam stops at the reduce-scatter and hands back the owned
+        // band. GLM is unaffected -- it passes `raw_output = false`, where this is what it always
+        // was -- and a raw caller that has not declared `h2_tp` still gets `sp == false`.
+        let sp = glm_sp(c, n, b, t);
         assert!(!sp || kb == 1, "PLOW_GLM_SEQ_PAR cannot combine with PLOW_GLM_XR_BAND");
         // CU-SUBSET SCHEDULING — see `xr_band_cus` and the attn seam's twin. Gated on kb>1
         // so `PLOW_GLM_XR_BAND_CUS` never narrows the UNBANDED collective (that is
@@ -8093,7 +8097,11 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
                 )
             })
             .collect();
-        if sp {
+        if sp && raw_output {
+            // The reduced band sits in `n.dg_tp`; the caller reads it through a band view. kb == 1
+            // under sp (asserted above), so there is exactly one dep to hand back.
+            xr_deps[0]
+        } else if sp {
             glm_sp_residual(b, t, tp, h, x_out, n.xmid, n.dg_tp, &xr_deps)
         } else if raw_output {
             // Mirrors emit_glm_mla_prefill's own raw_output tail exactly: n.attn already holds

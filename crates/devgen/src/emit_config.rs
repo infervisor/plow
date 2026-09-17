@@ -370,6 +370,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_DSV41_XR_BAND_CUS")]
     pub dsv41_xr_band_cus: Option<u32>,
 
+    /// Sequence-parallel V4.1 seams: the mHC and norms run on this rank's `t/tp` band.
+    #[arg(long, env = "PLOW_DSV41_SEQ_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub dsv41_seq_par: bool,
+
     /// Ceiling instrument: run the V4.1 mHC and norm packets over `t/tp` rows. WRONG ANSWER by
     /// construction -- it prices sequence parallelism, it does not implement it.
     #[arg(long, env = "PLOW_DSV41_SP_ABL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1216,6 +1220,7 @@ impl EmitConfig {
             mla_gather_split: env_u32("PLOW_MLA_GATHER_SPLIT").unwrap_or(2),
             dsv41_xr_band: env_u32("PLOW_DSV41_XR_BAND").unwrap_or(1),
             dsv41_xr_band_cus: env_u32("PLOW_DSV41_XR_BAND_CUS"),
+            dsv41_seq_par: env_bool("PLOW_DSV41_SEQ_PAR"),
             dsv41_sp_abl: env_bool("PLOW_DSV41_SP_ABL"),
             decode_tiled: env_bool("PLOW_DECODE_TILED"),
             l2_place_prefill: env_bool_opt("PLOW_L2_PLACE_PREFILL").unwrap_or(true),

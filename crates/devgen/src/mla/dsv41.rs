@@ -1191,19 +1191,26 @@ pub(crate) struct Dsv41Mhc {
 /// Declare the mHC stream for `t` rows. `mix` is `(2 + hc_mult) * hc_mult`, the same derivation
 /// `dsv41_layer_tensors` sizes `hc_*_fn` with -- one formula, so the weight and the scratch cannot
 /// disagree about how many mix rows there are.
-pub(crate) fn declare_dsv41_mhc(b: &mut Builder, c: &Dsv41Cfg, t: u32) -> Dsv41Mhc {
+pub(crate) fn declare_dsv41_mhc(b: &mut Builder, c: &Dsv41Cfg, t: u32, tp: u32) -> Dsv41Mhc {
     let (r, n, w) = (t as u64, c.hc_mult as u64, c.hidden as u64);
     let mix = (2 + n) * n;
+    // Under sequence parallelism the mixes and the cross-sublayer gates are PURE SCRATCH between
+    // one `pre` and its `post`: no collective reads them and nothing outside the band does. So
+    // they shrink to the band and are indexed densely, rows `[0, t/tp)`. The residual cannot --
+    // it is the block's entry AND its exit, so it stays full size and is addressed through
+    // `dsv41_band` views, which is also why `pre_pair` could not simply be viewed: it is
+    // `[2][t][hc_mult]`, half-major, and one `@band` offset cannot slice both halves.
+    let sr = if dsv41_sp(t, tp) { (t / tp) as u64 } else { r };
     Dsv41Mhc {
         residual: [
             b.tensor("act.hc_residual_a", r * n * w * 2),
             b.tensor("act.hc_residual_b", r * n * w * 2),
         ],
         layer_input: b.tensor("act.hc_layer_input", r * w * 2),
-        mixes: b.tensor("act.hc_mixes", r * mix * 4),
-        post_mix: b.tensor("act.hc_post_mix", r * n * 4),
-        comb_mix: b.tensor("act.hc_comb_mix", r * n * n * 4),
-        pre_pair: b.tensor("act.hc_pre_pair", 2 * r * n * 4),
+        mixes: b.tensor("act.hc_mixes", sr * mix * 4),
+        post_mix: b.tensor("act.hc_post_mix", sr * n * 4),
+        comb_mix: b.tensor("act.hc_comb_mix", sr * n * n * 4),
+        pre_pair: b.tensor("act.hc_pre_pair", 2 * sr * n * 4),
     }
 }
 
@@ -1421,6 +1428,42 @@ pub(crate) fn emit_dsv41_engram(
 /// layer 0 that IS the model; for a rung starting elsewhere it is the rung's synthetic entry, of
 /// a piece with the synthetic residual stream the harness uploads into `act.hc_residual_a`.
 #[allow(clippy::too_many_arguments)]
+/// Rank-relative band view `<base>@band<t>`: rows `[rank*t/tp, (rank+1)*t/tp)` of a `[t][row]`
+/// tensor. The host binds every `<base>@band...` at `base + rank * bytes` (`exec/amd.rs`'s
+/// `is_band_view`), so the view is pure addressing -- storage belongs to the base.
+pub(crate) fn dsv41_band(b: &mut Builder, base: u32, t: u32, tp: u32, row_bytes: u64) -> u32 {
+    let name = format!("{}@band{t}", b.tensor_name(base));
+    match (0..b.n_tensors() as u32).find(|&h| b.tensor_name(h) == name) {
+        Some(h) => h,
+        None => b.tensor(&name, (t / tp) as u64 * row_bytes),
+    }
+}
+
+/// `PLOW_DSV41_SEQ_PAR`: the layer's per-token work runs on this rank's `t/tp` band.
+///
+/// The mHC stream and the norms depend only on their own token, so eight ranks running all `t`
+/// rows of them is eight times the work for one answer (12.81 prices it at 2.55 ms/layer). Under
+/// this the two TP seams become reduce-scatter instead of all-reduce, the mHC runs on the owned
+/// band, and the GEMM blocks -- which DO need every token, being head- and expert-parallel -- take
+/// an all-gather of `layer_input` in front of them. A two-shot all-reduce is already a
+/// reduce-scatter plus an all-gather, so the fabric moves the same bytes either way.
+///
+/// The floor is the runtime's: `check_seq_par_seams` refuses a decode rung or a `t` that is not a
+/// multiple of `tp`, and grows the peer region to `SEQ_PAR_SLOTS` when it sees the collectives.
+/// Find-or-create a peer RESULT slot by name. Both the block emit and the MoE emit need the same
+/// handle and `Builder::tensor` does not deduplicate, so a second plain declaration would publish
+/// two tensors with one name and the runtime would bind whichever it found first.
+pub(crate) fn dsv41_sp_slot(b: &mut Builder, name: &str, bytes: u64) -> u32 {
+    match (0..b.n_tensors() as u32).find(|&h| b.tensor_name(h) == name) {
+        Some(h) => h,
+        None => b.tensor(name, bytes),
+    }
+}
+
+pub(crate) fn dsv41_sp(t: u32, tp: u32) -> bool {
+    crate::emit_config::active().dsv41_seq_par && tp > 1 && t > 1 && t % tp == 0
+}
+
 /// CEILING INSTRUMENT ONLY (`PLOW_DSV41_SP_ABL=1`): run the per-token mHC and norm packets over
 /// `t/tp` rows instead of `t`.
 ///
@@ -1433,7 +1476,9 @@ pub(crate) fn emit_dsv41_engram(
 ///
 /// Read it against the unablated control and the difference is the SP budget, nothing more.
 fn sp_abl_rows(t: u32, tp: u32) -> u32 {
-    if crate::emit_config::active().dsv41_sp_abl && tp > 1 {
+    // The real thing and the instrument that prices it land on the same row count; only the real
+    // one also moves the addresses, which is the whole difference between a band and a wrong answer.
+    if dsv41_sp(t, tp) || (crate::emit_config::active().dsv41_sp_abl && tp > 1) {
         t / tp
     } else {
         t
@@ -1454,15 +1499,30 @@ pub(crate) fn emit_dsv41_mhc_pre(
     deps: &[u32],
 ) -> u32 {
     let side = if ffn { "ffn" } else { "attn" };
+    let sp = dsv41_sp(t, tp);
+    // Under SP the residual is addressed through its band view and `layer_input` is PUBLISHED into
+    // peer result slot 3 rather than written whole: the GEMM block that consumes it is head- and
+    // expert-parallel, so it needs every token, and the all-gather in front of it is what turns
+    // these bands back into `m.layer_input`.
+    let (res, li) = if sp {
+        let hb = (t as u64) * (c.hidden as u64) * 2;
+        let h2 = dsv41_sp_slot(b, "act.h2_tp", hb);
+        (
+            dsv41_band(b, m.residual[ri], t, tp, c.hc_mult as u64 * c.hidden as u64 * 2),
+            dsv41_band(b, h2, t, tp, c.hidden as u64 * 2),
+        )
+    } else {
+        (m.residual[ri], m.layer_input)
+    };
     let h = super::MhcHandles {
         fn_w: w.get(l, &format!("hc_{side}_fn")),
         base: w.get(l, &format!("hc_{side}_base")),
         scale: w.get(l, &format!("hc_{side}_scale")),
-        residual: m.residual[ri],
+        residual: res,
         mixes: m.mixes,
         post_mix: m.post_mix,
         comb_mix: m.comb_mix,
-        layer_input: m.layer_input,
+        layer_input: li,
         pre: {
             let (pair, in_half) = (m.pre_pair, (pi % 2) as u32);
             if pi == 0 {
@@ -1497,16 +1557,26 @@ pub(crate) fn emit_dsv41_mhc_post(
     tp: u32,
     deps: &[u32],
 ) -> u32 {
+    let (out, rin, rw) = if dsv41_sp(t, tp) {
+        let rb = c.hc_mult as u64 * c.hidden as u64 * 2;
+        (
+            dsv41_band(b, m.residual[ri ^ 1], t, tp, rb),
+            dsv41_band(b, m.residual[ri], t, tp, rb),
+            t / tp,
+        )
+    } else {
+        (m.residual[ri ^ 1], m.residual[ri], sp_abl_rows(t, tp))
+    };
     super::emit_mhc_post(
         b,
-        m.residual[ri ^ 1],
+        out,
         raw,
-        m.residual[ri],
+        rin,
         m.post_mix,
         m.comb_mix,
         c.hidden,
         c.hc_mult,
-        sp_abl_rows(t, tp),
+        rw,
         deps,
     )
 }
@@ -1618,6 +1688,16 @@ pub(crate) fn emit_dsv41_moe(
         // unconditionally at tp>1 (`emit_glm_moe_ffn_prefill`: `d.t[0] = n.dg_tp`), so leaving it
         // unset would aim every rank's routed output at the null handle.
         n.dg_tp = b.tensor(PEER_SLOT_MOE, (t as u64) * (c.hidden as u64) * 2);
+    }
+    if dsv41_sp(t, tp) {
+        // The three peer RESULT slots the sequence-parallel seams publish bands into. The runtime
+        // binds them by NAME (`exec/amd.rs`'s `is_peer_slot`: h2 = slot 3, xe = 4, rt = 5) and
+        // `check_seq_par_seams` refuses a blob that carries XReduceScatter/XAllGather without all
+        // three, so they are declared together whether or not each seam uses one.
+        let hb = (t as u64) * (c.hidden as u64) * 2;
+        n.h2_tp = dsv41_sp_slot(b, "act.h2_tp", hb);
+        n.xe_tp = dsv41_sp_slot(b, "act.xe_tp", hb);
+        n.rt_tp = dsv41_sp_slot(b, "act.rt_tp", hb);
     }
     // `fold` is false for V4.1 (it requires Fp8Blk experts), so e_all/tk_all are the plain counts.
     let sc = super::declare_moe_pf_scratch(
@@ -1996,7 +2076,35 @@ pub(crate) fn emit_dsv41_attn_out(
     // This rank's SLICE of wo_b: [T, orow] x [hidden, orow]^T -> a [T, hidden] PARTIAL.
     let xr = super::xr_cus_capped(b.n_cu(), cus);
     let kb = dsv41_xr_band(t);
-    let c_xr = if tp > 1 && kb > 1 {
+    let c_xr = if dsv41_sp(t, tp) {
+        // Sequence-parallel attention seam: the o_proj partial is reduce-SCATTERED, so this rank
+        // keeps its own band of the attention output in `act.og_tp` and the mHC post reads it
+        // there. No all-gather here -- the next one that matters is in front of the FFN's GEMM.
+        let c_ob = emit_pf_gemm_fp8_mx(
+            b,
+            cus,
+            act.o_part,
+            act.o_a,
+            w.get(l, "attn.wo_b.weight"),
+            w.get(l, "attn.wo_b.scale"),
+            t,
+            c.hidden,
+            orow,
+            &[c_oa],
+        );
+        vec![crate::emit_xreduce_scatter(
+            b,
+            xgate,
+            &xr,
+            &[c_ob],
+            act.o_part,
+            t * c.hidden,
+            tp,
+            early_reduce_slot(t, c.hidden),
+            None,
+            None,
+        )]
+    } else if tp > 1 && kb > 1 {
         // BANDED TP SEAM: K row-band wo_b GEMMs, each feeding its own two-shot, so band 0's
         // fabric transfer overlaps bands 1..K-1's compute. The bands are disjoint rows of the
         // same tiles, so the sums are bit-identical to the unbanded emit.
@@ -2471,7 +2579,7 @@ pub(crate) fn emit_dsv41_block(
     } else {
         (cos, sin)
     };
-    let mhc = declare_dsv41_mhc(&mut tb, c, t);
+    let mhc = declare_dsv41_mhc(&mut tb, c, t, tp);
     let engram = declare_dsv41_engram(&mut tb, c, layers, t);
     let compress = declare_dsv41_compress(&mut tb, c, layers, t, ctx);
     let index = declare_dsv41_index(&mut tb, c, layers, t, ctx);
@@ -2581,8 +2689,29 @@ pub(crate) fn emit_dsv41_block(
                 &deps,
             )];
         }
+        let sp = dsv41_sp(t, tp);
+        let xr_sp = super::xr_cus_capped(b.n_cu(), &all);
+        let slot3 = 3 * (t as u64 * peer_w as u64 * 2) as u32;
+        // Gather this rank's `layer_input` band out of peer slot 3 into the whole `[t, hidden]`
+        // the GEMM blocks read. Attention is head-parallel and the MoE is expert-parallel, so
+        // both need EVERY token; the mHC either side of them does not.
+        let sp_gather = |b: &mut Builder, xg: &mut u32, dep: u32| -> u32 {
+            crate::emit_xall_gather(
+                b,
+                xg,
+                &xr_sp,
+                &[dep],
+                &[(mhc.layer_input, t * c.hidden, slot3)],
+                tp,
+            )
+        };
         let c_pre = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, false, ri, pi, t, tp, &deps);
         pi += 1;
+        let c_pre = if sp {
+            sp_gather(&mut b, &mut xgate, c_pre)
+        } else {
+            c_pre
+        };
         let (proj, c_proj) =
             emit_dsv41_attn_proj(&mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre]);
         // Every rope in a layer reads that layer's ONE `freqs_cis`, and which table that is comes
@@ -2652,11 +2781,23 @@ pub(crate) fn emit_dsv41_block(
         );
         let (_out, c_out) =
             emit_dsv41_attn_out(&mut b, c, &w, &all, l, tp, core.o, t, &mut xgate, &[c_core]);
-        let c_post = emit_dsv41_mhc_post(&mut b, c, &mhc, _out.o, ri, t, tp, &c_out);
+        // Under SP the attention answer never becomes `_out.o`: the seam reduce-SCATTERED it, so
+        // this rank's rows are the band of the `act.og_tp` partial and the mHC reads them there.
+        let attn_out = if sp {
+            dsv41_band(&mut b, _out.o_part, t, tp, c.hidden as u64 * 2)
+        } else {
+            _out.o
+        };
+        let c_post = emit_dsv41_mhc_post(&mut b, c, &mhc, attn_out, ri, t, tp, &c_out);
         ri ^= 1;
 
         let c_pre2 = emit_dsv41_mhc_pre(&mut b, c, &w, &mhc, l, true, ri, pi, t, tp, &[c_post]);
         pi += 1;
+        let c_pre2 = if sp {
+            sp_gather(&mut b, &mut xgate, c_pre2)
+        } else {
+            c_pre2
+        };
         let (ffn, c_sh) = emit_dsv41_ffn_shared(
             &mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre2],
         );
@@ -2666,7 +2807,15 @@ pub(crate) fn emit_dsv41_block(
         );
         // CAPTURED, not discarded: it is the next layer's only dependency, and the thing that
         // makes the chain a chain rather than 40 layers racing on one residual buffer.
-        let c_layer = emit_dsv41_mhc_post(&mut b, c, &mhc, xnext, ri, t, tp, &[c_moe]);
+        // Same for the FFN seam: `emit_dsv41_moe` returns the reduce-scatter under SP and leaves
+        // this rank's rows in `act.dg_tp`, so `xnext` is never written and never read.
+        let moe_out = if sp {
+            let dg = dsv41_sp_slot(&mut b, PEER_SLOT_MOE, (t as u64) * (c.hidden as u64) * 2);
+            dsv41_band(&mut b, dg, t, tp, c.hidden as u64 * 2)
+        } else {
+            xnext
+        };
+        let c_layer = emit_dsv41_mhc_post(&mut b, c, &mhc, moe_out, ri, t, tp, &[c_moe]);
         ri ^= 1;
         deps = vec![c_layer];
     }
