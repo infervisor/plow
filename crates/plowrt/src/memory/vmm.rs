@@ -904,6 +904,8 @@ struct Shared {
     /// How long [`VmmKv::begin_seq`] waits for a queued copy-out of its seq before swapping row 0
     /// inline ([`VmmKv::enable_release_retire`]).
     admission_wait_us: AtomicU64,
+    /// Signalled by [`copy_out`] whenever `copying[seq]` or `copy_reading[seq]` clears.
+    copy_cv: parking_lot::Condvar,
     /// Max handles the reuse pool may hold (0 = pooling off, the default).
     /// Set once by [`VmmKv::enable_block_pool`]; atomic only so `deref_block`
     /// can read it without threading a config borrow through `Inner`.
@@ -1028,6 +1030,7 @@ impl VmmKv {
             cache_cap,
             cache_min_free: AtomicU64::new(0),
             admission_wait_us: AtomicU64::new(5_000),
+            copy_cv: parking_lot::Condvar::new(),
             pool_cap: AtomicU32::new(0),
             inner: Mutex::new(Inner {
                 tracks,
@@ -1324,10 +1327,9 @@ impl VmmKv {
             // serialized ioctls. Outside the engine section, so the job's own driver calls run.
             let wait = std::time::Duration::from_micros(s.admission_wait_us.load(Ordering::Relaxed));
             let deadline = std::time::Instant::now() + wait;
-            while s.inner.lock().copying[seq] && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_micros(50));
-            }
-            copy_pending = s.inner.lock().copying[seq];
+            let mut inner = s.inner.lock();
+            while inner.copying[seq] && !s.copy_cv.wait_until(&mut inner, deadline).timed_out() {}
+            copy_pending = inner.copying[seq];
         }
         let copy_wait = t_wait.elapsed();
         let _section = EngineSection::enter();
@@ -1337,9 +1339,7 @@ impl VmmKv {
         // inline swap below may unmap.
         let t_chunk = std::time::Instant::now();
         while inner.copy_reading[seq] {
-            drop(inner);
-            std::thread::sleep(std::time::Duration::from_micros(20));
-            inner = s.inner.lock();
+            s.copy_cv.wait(&mut inner);
         }
         let chunk_wait = t_chunk.elapsed();
         release_prefix_hold(&mut inner, seq);
@@ -2881,6 +2881,7 @@ fn copy_out(s: &Shared, seq: usize, generation: u64) {
         }
         if entries.is_empty() {
             inner.copying[seq] = false;
+            s.copy_cv.notify_all();
             return;
         }
     }
@@ -2929,6 +2930,7 @@ fn copy_out(s: &Shared, seq: usize, generation: u64) {
             }
             ok = s.ops.copy_dtod_batch(&pairs).is_ok();
             s.inner.lock().copy_reading[seq] = false;
+            s.copy_cv.notify_all();
             if !ok {
                 break;
             }
@@ -3000,6 +3002,7 @@ fn copy_out(s: &Shared, seq: usize, generation: u64) {
             }
         }
         inner.copying[seq] = false;
+        s.copy_cv.notify_all();
         if let Some(tx) = &inner.jobs {
             let _ = tx.send(Job::Refill);
         }

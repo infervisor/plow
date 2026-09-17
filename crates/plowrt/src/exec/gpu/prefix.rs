@@ -330,6 +330,9 @@ impl GpuEngine {
                 cache_tensors: Vec::new(),
                 kv: {
                     kv.enable_block_pool(crate::memory::vmm::kv_pool_cap());
+                    if rt.vmm_deferred_reclaim() {
+                        kv.enable_deferred_reclaim();
+                    }
                     kv
                 },
                 slide,
