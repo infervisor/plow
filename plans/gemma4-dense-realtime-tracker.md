@@ -701,6 +701,24 @@ is 16.2 ms but 21.2 with prefill, and TTFT queues behind ~20K tok/s prefill
 Harness debt: the low-memory guard kills tracked background benches while a
 server pages in weights — launch benches detached (job tmp `launch_tp_c4.sh`).
 
+### Fused prefill norm pair (`PLOW_PF_GFUSE=1`, 2026-09-17, late)
+
+Prefill emitted every sandwich norm as NormResidual + RmsNorm (96 launches per
+chunk at 97–119 µs each) while decode already uses the fused
+`NormResidualNorm`, whose rounding reproduces the split pair exactly (op_norm.cuh
+"fused N1"). The emitter gates prefill fusion behind `PLOW_PF_GFUSE` (registered,
+documented, off; `seam_fused` defaults to true when the rewrite graph has no
+opinion). With it, every prefill program carries 44 `NormResidualNorm` sites and
+the instruction count drops 766 → 670 (−96 launches per chunk). **As built,
+refuted:** with the light object's default `PLOW_NV_NRN_WPR=0` the fused op
+takes the block-per-row path (one row per block, two block barriers per row),
+which is latency-bound at prefill row counts and rounds differently from the
+split pair — 42.09 / 64.12 / 207.07 vs the fat-lite control 42.05 / 51.15 /
+191.77, and 1 of 5 greedy continuations differs. The header says `NRN_WPR=1`
+(warp-per-row) matches the prefill pair's reduction order; the same packet with
+that object (`campaign-bf16-gfusewpr`, 128 regs / 24 B stack) is the fair test,
+pending.
+
 ### Fat-lite light object at two blocks per SM (2026-09-17, late)
 
 The light ops ride the packed seg object at the 255-register ceiling set by
