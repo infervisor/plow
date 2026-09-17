@@ -6090,3 +6090,48 @@ always a control that should move and one that should not.
 **Ladder, on the end-to-end basis.** 599.1 ms -> 540.3 ms. Against 200 ms that is 2.7x, and 12.84's
 arithmetic is unchanged by the rebasing: the seam collectives are at link rate, every parallelism
 option is closed, and the remaining gap is a uniform ~3.4x on every compute kernel in the layer.
+
+## 12.87 The fp4 dequant is a SOFTWARE sequence on gfx942, and an instrument for it (unrun)
+
+12.86 leaves the MoE's inner GEMM as the campaign's largest single item: the GLU k-loop is ~1.5
+ms/layer against a ~500 us traffic bound and a ~222 us MFMA bound. Neither bound contains the term
+that most likely explains the gap, and `PLOW_MOE_PF_ABL` cannot see it either -- capping the k-loop
+removes the loads and the conversion together.
+
+**gfx942 has no fp4 MFMA and no fp4 convert instruction.** `cvt_scalef32_pk_bf16_fp4` appears
+ZERO times in `interp_prefill_mla_moe.elf`; it is the gfx950 spelling. On gfx942
+`fp4_to_bf16v8x4` lowers to a software bit-manipulation sequence, and `PLOW_MOE_PF_A4W4_DQABL=1`
+-- which keeps the 16-byte fp4 load, the E8M0 scale byte and the four swizzled LDS stores, and
+drops ONLY the conversion arithmetic -- removes 1,018 instructions from the megakernel, dominated
+by:
+
+    v_and_b32      -144      v_lshrrev_b32   -144      v_lshl_or_b32   -96
+    v_and_or_b32   -144      v_lshlrev_b32   -120      v_pk_mul_f32    -96
+
+That is ~750 ALU operations of unpacking and scaling per instance, paid on EVERY B element, and
+re-paid once per m-tile because B is re-staged per m-tile. It is invisible to a FLOP roofline
+(it is not MFMA) and to a bandwidth roofline (it moves no bytes), which is why the MoE has read
+as "7x off roofline" with no mechanism attached.
+
+**The instrument, and its state.** `PLOW_MOE_PF_A4W4_DQABL` is default off, rides `AX_PREFILL`
+(which is what carries `$AX_A4W4` to the DSV41 rows), and is WRONG OUTPUT by construction --
+never a serve asset. Verified without running anything: with the knob OFF the object is
+146,253 instructions, byte-for-byte the same count as the shipped `obj-bk64`, so the patch is a
+true no-op on the serve path; with it ON, 145,235.
+
+**IT HAS NOT BEEN MEASURED.** It was landed unrun, on an explicit instruction to stop GPU work.
+The run that completes it is one build and one rung, against the layer-2 SP packet:
+
+    PLOW_MOE_PF_A4W4_DQABL=1  ... scripts/build_gfx942.sh
+    rung_run pkt-sp/blk2.pkt obj-<tag>/hsaco --tp 8 --iters 12 --trace ...
+
+and ablated-minus-full on `MOE_GROUP_GLU_PF` / `MOE_GROUP_DOWN_PF` is the dequant's own share.
+Two controls are mandatory, both learned the hard way in this campaign: the band compare of
+`act.hc_residual_a` must be NONZERO (an ablation that is wrong-output-by-construction and returns
+`max|d| == 0` is not executing, 12.83), and the knob-off arm must reproduce the baseline body.
+
+**If it is large, the fix has a shape.** The dequant is re-paid per m-tile because B is staged per
+m-tile, and V4.1 gives each expert only ~128 gathered rows = 2 m-tiles at MPF4_BM = 64. Converting
+each expert's B ONCE and reusing it across its m-tiles halves the term. That is a scheduling
+change inside the tile loop, not a new numeric format, and it is the first thing to try. If it is
+small, the gap is LDS/occupancy and the next instrument is the MFMA block itself.

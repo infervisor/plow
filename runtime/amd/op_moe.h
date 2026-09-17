@@ -2157,6 +2157,26 @@ __device__ __forceinline__ double mpf_det_q(float v) {
 #ifndef PLOW_MOE_PF_EPIABL
 #define PLOW_MOE_PF_EPIABL 0
 #endif
+
+/* CEILING INSTRUMENT ONLY (-DPLOW_MOE_PF_A4W4_DQABL=1): the a4w4 k-loop with the fp4 -> bf16
+ * DEQUANT removed and nothing else. WRONG OUTPUT by construction, never a serve asset.
+ *
+ * WHAT IT ASKS. 12.83 measured the a4w4 k-loop's own share (GLU 84%, DOWN 24%); 12.84/12.86
+ * leave the GLU k-loop at ~1.5 ms/layer against a ~500 us traffic bound and a ~222 us MFMA
+ * bound. gfx942 has NO fp4 MFMA, so every B element is converted in ALU by
+ * `fp4_to_bf16v8x4` -- 16 `cvt_scalef32_pk_bf16_fp4` per 32 elements -- and that conversion
+ * appears in NEITHER roofline. This is the term PLOW_MOE_PF_ABL cannot see, because capping
+ * the k-loop removes the loads and the dequant together.
+ *
+ * THE ABLATION KEEPS THE TRAFFIC. The 16-byte fp4 load and the four swizzled LDS stores are
+ * unchanged and `q_` is still consumed (bit-cast straight into the four output vectors), so
+ * nothing is dead-code eliminated; the E8M0 scale byte stays live for the same reason. Only
+ * the conversion arithmetic is gone. Ablated minus full is the dequant's own share.
+ *
+ * NOT YET MEASURED -- landed unrun. */
+#ifndef PLOW_MOE_PF_A4W4_DQABL
+#define PLOW_MOE_PF_A4W4_DQABL 0
+#endif
 #if PLOW_MOE_PF_EPIABL
 #define MPF_EPIABL_KEEP(el_) if ((el_) & 15) continue;
 #else
@@ -4594,6 +4614,23 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
             }                                                                                  \
         }                                                                                      \
     }
+/* PLOW_MOE_PF_A4W4_DQABL: the ablated spelling keeps the fp4 quad and the scale byte live --
+ * so the loads and the LDS stores it is being compared against are untouched -- and drops only
+ * the 16 convert instructions. See the knob's note above. */
+#if PLOW_MOE_PF_A4W4_DQABL
+#define PLOW_MPF4_DQ(d0_, d1_, d2_, d3_, q_, sc_)                                              \
+    do {                                                                                       \
+        (d0_) = __builtin_bit_cast(bf16v8, (q_));                                               \
+        (d1_) = (d0_);                                                                          \
+        (d2_) = (d0_);                                                                          \
+        (d3_) = (d0_);                                                                          \
+        (d0_)[0] = (bf16)e8m0_to_f32(sc_);                                                       \
+    } while (0)
+#else
+#define PLOW_MPF4_DQ(d0_, d1_, d2_, d3_, q_, sc_)                                              \
+    fp4_to_bf16v8x4(__builtin_bit_cast(fp4v32, (q_)), e8m0_to_f32(sc_), d0_, d1_, d2_, d3_)
+#endif
+
 /* Dequant an MX block (16 fp4 bytes + scale) to 32 bf16 and write its four 16-B chunks through
  * the swizzle. Zero fill for pads — bf16 zero needs no neutral-scale bookkeeping. */
 #define C3_BLK_COMMIT(dst_row_base, r_, blk_, q_, sc_, live_)                                  \
@@ -4601,8 +4638,7 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
         const unsigned off0 = (blk_)*64u;                                                      \
         if (live_) {                                                                           \
             bf16v8 d0, d1, d2, d3;                                                             \
-            fp4_to_bf16v8x4(__builtin_bit_cast(fp4v32, (q_)), e8m0_to_f32(sc_), d0, d1, d2,    \
-                            d3);                                                               \
+            PLOW_MPF4_DQ(d0, d1, d2, d3, (q_), (sc_));                                         \
             *(bf16v8*)((dst_row_base) + MPF4_C3_SWZ(r_, off0)) = d0;                           \
             *(bf16v8*)((dst_row_base) + MPF4_C3_SWZ(r_, off0 + 16u)) = d1;                     \
             *(bf16v8*)((dst_row_base) + MPF4_C3_SWZ(r_, off0 + 32u)) = d2;                     \

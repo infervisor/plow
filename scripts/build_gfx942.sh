@@ -1099,6 +1099,14 @@ if [ "${PLOW_MOE_PF_EPIABL:-0}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_EPIABL=${PLOW_MOE_PF_EPIABL}"
 fi
 
+# CEILING INSTRUMENT ONLY (PLOW_MOE_PF_A4W4_DQABL=1): the a4w4 grouped MoE k-loop with the
+# fp4 -> bf16 dequant removed and its loads and LDS stores kept (op_moe.h
+# PLOW_MOE_PF_A4W4_DQABL). WRONG OUTPUT by construction, never a serve asset. Rides AX_PREFILL,
+# which is what carries $AX_A4W4 to the DSV41 rows. NOT YET MEASURED.
+if [ "${PLOW_MOE_PF_A4W4_DQABL:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_A4W4_DQABL=${PLOW_MOE_PF_A4W4_DQABL}"
+fi
+
 # CEILING INSTRUMENT ONLY (PLOW_FA_GATHER_ABL=1): the gathered flash reading a FIXED 64-row window
 # instead of its top_k scattered cache rows. Same loads, same scores, same softmax, same PV --
 # only the addresses are tamed, so ablated minus full prices the gather's RANDOM ACCESS alone.
