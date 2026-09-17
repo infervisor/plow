@@ -261,6 +261,22 @@ const _: () = assert!(std::mem::size_of::<ScoreArgs2>() == 64);
 const _: () = assert!(std::mem::size_of::<SelectArgs2>() == 88);
 const _: () = assert!(std::mem::size_of::<GatherArgs>() == 64);
 
+/// `PLOW_DSA_SELECT_THRESHOLD`: the threshold selection takes the ABI-2 select kernargs and is
+/// exported only by an adapter built with `-DPLOW_DSA_TP_SELECT_THR=1`.
+fn select_kernel(abi: u8, threshold: bool, syms: &[&str]) -> Result<&'static str> {
+    if !threshold {
+        return Ok("plow_dsa_tp_select");
+    }
+    if abi >= 2 && syms.contains(&"plow_dsa_tp_select_thr") {
+        return Ok("plow_dsa_tp_select_thr");
+    }
+    Err(RuntimeError::Device(
+        "PLOW_DSA_SELECT_THRESHOLD needs dsa_tp_adapter_gfx942.elf built with \
+         -DPLOW_DSA_TP_SELECT_THR=1 (plow_dsa_tp_select_thr, ABI 2)"
+            .into(),
+    ))
+}
+
 pub(super) struct IndexTp {
     kernels: [HsaKernel; 4],
     /// `plow_dsa_tp_local`, the row-split sibling's band copy; absent on older adapters.
@@ -270,7 +286,12 @@ pub(super) struct IndexTp {
 }
 
 impl IndexTp {
-    pub fn load(be: &HsaBackend, dir: &Path, modules: &mut Vec<Module>) -> Result<Self> {
+    pub fn load(
+        be: &HsaBackend,
+        dir: &Path,
+        modules: &mut Vec<Module>,
+        select_threshold: bool,
+    ) -> Result<Self> {
         let path = dir.join("dsa_tp_adapter_gfx942.elf");
         let image = std::fs::read(&path)
             .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
@@ -285,11 +306,12 @@ impl IndexTp {
             ));
         };
         let (score_bytes, select_bytes) = if abi == 2 { (64, 88) } else { (56, 72) };
+        let select = select_kernel(abi, select_threshold, &syms)?;
         let module = EngineDevice::module_load(be, &image)?;
         let mut kernels = Vec::new();
         for (name, bytes) in [
             ("plow_dsa_tp_score", score_bytes),
-            ("plow_dsa_tp_select", select_bytes),
+            (select, select_bytes),
             ("plow_dsa_tp_gather", 64),
             ("plow_dsa_tp_complete", 64),
         ] {
@@ -315,7 +337,7 @@ impl IndexTp {
             Err(_) => None,
         };
         modules.push(module);
-        tracing::info!(abi, object = %path.display(), "TP indexer adapter loaded");
+        tracing::info!(abi, select, object = %path.display(), "TP indexer adapter loaded");
         Ok(Self {
             kernels: kernels.try_into().ok().unwrap(),
             local,
@@ -498,8 +520,31 @@ mod tests {
         let dir = std::env::var("PLOW_TEST_DSA_DIR").unwrap();
         let be = HsaBackend::new(0).unwrap();
         let mut modules = Vec::new();
-        let kernel = IndexTp::load(&be, Path::new(&dir), &mut modules).unwrap();
+        let kernel = IndexTp::load(&be, Path::new(&dir), &mut modules, false).unwrap();
         assert!(kernel.span_aware());
+    }
+
+    /// The same resource ABI checks for an adapter built with `-DPLOW_DSA_TP_SELECT_THR=1`,
+    /// loaded with the threshold selection.
+    #[test]
+    #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_DSA_DIR built with -DPLOW_DSA_TP_SELECT_THR=1"]
+    fn index_tp_threshold_adapter_loads_hsa() {
+        let dir = std::env::var("PLOW_TEST_DSA_DIR").unwrap();
+        let be = HsaBackend::new(0).unwrap();
+        let mut modules = Vec::new();
+        let kernel = IndexTp::load(&be, Path::new(&dir), &mut modules, true).unwrap();
+        assert!(kernel.span_aware());
+    }
+
+    #[test]
+    fn select_threshold_requires_the_abi2_symbol() {
+        let with = ["plow_dsa_tp_abi_2", "plow_dsa_tp_select", "plow_dsa_tp_select_thr"];
+        let without = ["plow_dsa_tp_abi_2", "plow_dsa_tp_select"];
+        assert_eq!(select_kernel(2, false, &without).unwrap(), "plow_dsa_tp_select");
+        assert_eq!(select_kernel(1, false, &[]).unwrap(), "plow_dsa_tp_select");
+        assert_eq!(select_kernel(2, true, &with).unwrap(), "plow_dsa_tp_select_thr");
+        assert!(select_kernel(2, true, &without).is_err());
+        assert!(select_kernel(1, true, &with).is_err());
     }
 
     /// `plow_dsa_tp_gather` gives workgroup `w` the band of peer `rank + 1 + w % 7` (and the

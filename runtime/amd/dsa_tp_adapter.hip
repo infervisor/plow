@@ -109,6 +109,39 @@ extern "C" __global__ __launch_bounds__(512, 1) void plow_dsa_tp_select(DsaTpSel
 #endif
 }
 
+#if PLOW_DSA_TP_SELECT_THR
+/* plow_dsa_tp_select with the threshold selection (d_index_select_pf_thr): same kernargs, rendezvous
+ * and set. Built only with -DPLOW_DSA_TP_SELECT_THR=1; plowrt launches it under
+ * PLOW_DSA_SELECT_THRESHOLD and refuses that knob on an object without it. */
+extern "C" __global__ __launch_bounds__(512, 1) void plow_dsa_tp_select_thr(DsaTpSelectArgs a) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    __shared__ unsigned hf[4096], hc[256], red[8];
+    __shared__ unsigned long long cand[2048];
+    __shared__ int bailed;
+    if (!xr_rendezvous_one_wg(a.peers, 8, a.rank, a.xctr_offset, a.gate,
+                              a.deadline, a.status, blockIdx.x, &bailed))
+        return;
+    const unsigned band = (a.rows + 7u) / 8u;
+    const unsigned lo = a.rank * band, hi = (a.rank + 1u) * band;
+    if (!a.spans) {
+        d_index_select_pf_thr<2048u>(a.idx, a.score, a.len, a.rows, 2048, a.stride,
+            blockIdx.x, gridDim.x, hf, hc, cand, red, lo, hi);
+        return;
+    }
+    const PlowKvSpan* spans = (const PlowKvSpan*)a.spans;
+    for (unsigned s = 0; s < a.n_spans; ++s) {
+        const PlowKvSpan sp = spans[s];
+        const unsigned rb = lo > sp.row0 ? lo : sp.row0;
+        const unsigned re = sp.row0 + sp.n_rows;
+        const unsigned rl = hi < re ? hi : re;
+        if (rb >= rl) continue;
+        d_index_select_pf_thr<2048u>(a.idx, a.score, (const int*)&spans[s].kv_len, re, 2048,
+            a.stride, blockIdx.x, gridDim.x, hf, hc, cand, red, rb, rl);
+    }
+#endif
+}
+#endif
+
 struct DsaTpGatherArgs {
     uint4* out;
     const void* const* peers;

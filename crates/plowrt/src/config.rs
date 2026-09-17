@@ -930,6 +930,12 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-union-skip", env = "PLOW_AMD_UNION_SKIP", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub union_skip: bool,
 
+    /// Launch the TP indexer's threshold selection (`plow_dsa_tp_select_thr`: the same top-k set in
+    /// two row scans instead of five). Needs `dsa_tp_adapter_gfx942.elf` built with
+    /// `-DPLOW_DSA_TP_SELECT_THR=1`; the load fails by name otherwise. Off by default.
+    #[arg(long = "amd-dsa-select-threshold", env = "PLOW_DSA_SELECT_THRESHOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub dsa_select_threshold: bool,
+
     /// Directory to write token-batch device-state dumps into (body step and the ordinary
     /// prefill chunk, for row-by-row comparison). Diagnostic; unset = no dumps.
     #[arg(long = "amd-tb-dump", env = "PLOW_TB_DUMP", hide = true, global = true)]

@@ -8757,7 +8757,12 @@ impl AmdEngine {
             None
         };
         let index_tp = if use_index_tp {
-            Some(amd_index_tp::IndexTp::load(&be, &hsaco_dir, &mut modules)?)
+            Some(amd_index_tp::IndexTp::load(
+                &be,
+                &hsaco_dir,
+                &mut modules,
+                crate::config::RuntimeConfig::get().amd.dsa_select_threshold,
+            )?)
         } else {
             None
         };
