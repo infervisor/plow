@@ -5934,3 +5934,67 @@ worth attacking and it is a kernel rewrite, not a knob.
 to zero -- leaves ~10.6 ms/layer, 424 ms. The 200 ms target is not reachable by removing the MoE
 alone; it needs the MoE, `GEMM_FP8_MX` (2.83 ms across 9 calls) and `FLASH_MLA_PREFILL` (1.51 ms)
 all to come down together, and no single lever in this campaign has been worth more than 1.1 ms.
+
+## 12.84 op 184's "48% straggler" is narrow GEMMs, not stragglers -- 505 us/layer, and the floor
+
+`GEMM_FP8_MX` is the largest single op left (2.83 ms/layer over 9 calls) and `k3_trace_report.py`
+reports `strag/pk = 150 us` against `body/pk = 309 us` for it. Read as a straggler that is a
+1.35 ms/layer lever. It is not a straggler and it is not 1.35 ms.
+
+**The column is the wrong instrument.** `strag/pk` is max-min across workgroups. It cannot tell a
+SLOW workgroup from an ABSENT one, and when a call's tile count is under the 304-CU grid the idle
+workgroups sit at the min and inflate the spread while nothing is straggling. `scripts/k3_occupancy.py`
+prints the question a narrow GEMM actually poses -- how many workgroups did real work, and what
+perfect spread would have cost:
+
+      inst  wgs  span_us  busy  idle  maxbody  meanbody  wasted_us
+         4  304    599.1   304     0    597.4     451.3      146.1
+         6  304    405.7   304     0    404.6     385.3       19.3
+         7  304    266.3   256    48    208.6     165.2       43.5
+        15  304    398.4   304     0    363.2     333.3       29.9
+        27  304    326.4   304     0    325.5     266.7       58.8
+        28  304    360.8   304     0    359.0     330.5       28.5
+        35  304    194.6   192   112    193.4     112.7       80.7
+        36  304    371.6   192   112    194.8     109.3       85.5
+        38  304    159.9   304     0    158.1     144.9       13.2
+      per-layer cost of imperfect spread: 505.5 us
+
+**The idle counts are predicted exactly by the shapes.** A 128x128 tile over M = 8192 is 64 m-tiles,
+so a call is `64 * ceil(N_rank/128)` tiles:
+
+  * insts 35/36 -- the shared expert's gate and up. `moe_intermediate/TP = 2304/8 = 288`, which is
+    3 tiles wide: **192 tiles on 304 CUs, so 112 sit out.** Measured: 112 idle, twice.
+  * inst 7 -- the indexer's `wq_b`. `index_n_heads * index_head_dim / TP = 32*128/8 = 512`, 4 wide:
+    **256 tiles, 48 idle.** Measured: 48 idle.
+
+So the loss is not tail latency inside a call, it is calls too narrow to fill the machine. That is
+also why the 128x128-vs-64x128 sweep in `op_gemm_common.h` could not fix it and read as a loss:
+it shrank the tile *within* a call, which helps a call that has too FEW tiles per CU only by
+making each cheaper -- and on the wide calls (inst 4, 6, 15, 27, 28) it just halved the MFMA work
+each B pass amortises, which is the 28 ms of body it gave back.
+
+**Sanity check on the same tool:** op 86 (MoE DOWN) reads 304 busy, 0 idle, 52.3 us wasted on a
+2267 us packet -- 2.3%. The MoE is well spread; it is the DENSE projections that under-fill.
+
+**The named fix, and its size.** insts 35 and 36 are the gate and up halves of one GLU, same M,
+same K, independent, 192 tiles each. Fused over the concatenated N they are 576 wide -- 5 tiles,
+320 tiles total -- which fills 304 and collapses two packets into one, dropping the `gt`/`ut`
+round trip to HBM as well. `d_gemm_glu` already does exactly this for bf16 B and
+`d_gemm_glu_mxfp4` for fp4; there is no fp8-mx arm, and that is the whole gap. Worth roughly
+180 us/layer, about 7 ms over the model. Not attempted here: it is a new kernel arm with its own
+numerics, and it wants to land with its own byte-identity argument rather than at the end of a
+session.
+
+**The floor, stated honestly.** Per layer the model now costs 14.81 ms, of which the two seam
+collectives are 1.52 ms. Those move 336 MB per rank per layer and are running at ~221 GB/s, which
+is link-rate; no parallelism change is left to spend (12.76, 12.77, 12.79, 12.82 close EP, PP, CP,
+the banded seam and SP, and DCP in this tree is decode-side KV sharding a prefill never touches).
+So 200 ms = 5.0 ms/layer means the remaining 13.3 ms of COMPUTE has to become 3.5 ms: a uniform
+**3.8x on every compute kernel in the layer**, with the collective left untouched.
+
+That is the shape of the remaining work, and it is worth being plain that it is not a lever hunt
+any more. The identified, mechanism-understood backlog -- this section's 505 us, the MoE's
+~2.2 ms of inner MXFP4 GEMM at ~7x off roofline (12.83), `GEMV_F32`'s L2 wall, `FLASH_MLA_PREFILL`
+-- sums to a few ms/layer even if every item went to zero, and every large item in it is an
+arithmetic-efficiency problem on kernels that currently run at 7-15% of peak. 200 ms is reachable
+only by a kernel suite at roughly half of peak, which is a rewrite programme, not a knob.
