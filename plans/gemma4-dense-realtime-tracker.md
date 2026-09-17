@@ -222,6 +222,34 @@ a 31B item until 12B projections are re-routed to `GemmLtPf`.
   audit's "impure flash segment" warning is an AMD relaunch concern and does
   not affect the NVIDIA cooperative launch. Both packets serve correctly.
 
+### C1 result — provisional (run `20260917T114127Z`, commit `99508b16`)
+
+Plow BF16 sm90a, ladder 1, chunk 4096, qualified H100 roles **off**, single-object
+prefill (`segmented=false`), co-tenant idle. vLLM 0.28 same box, same client
+protocol. 32 requests + 16 warmups per cell, out 128.
+
+| in | Plow TTFT | vLLM BF16 | vLLM FP8 | Plow TPOT | vLLM BF16 | vLLM FP8 | Plow tok/s | vLLM BF16 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 46.98 | 28.19 | 28.15 | 12.07 | 10.55 | 7.15 | 81.0 | 94.8 |
+| 1024 | 164.72 | 46.71 | 37.83 | 12.62 | 10.62 | 7.23 | 72.4 | 94.1 |
+| 4096 | 654.74 | 170.17 | 134.34 | 13.19 | 10.64 | 7.25 | 54.9 | 94.0 |
+
+Read plainly:
+
+- **Decode is 1.14–1.24× behind vLLM BF16** (12.1–13.2 vs 10.6 ms/tok) and
+  1.7–1.8× behind vLLM FP8. The BF16 weight stream is ~22 GiB/step, a ~7 ms
+  floor at 3.35 TB/s; vLLM BF16 sits at ~67% of it, this packet at ~55%.
+- **Prefill is the large gap**: ~6.3k tok/s vs vLLM's ~24k, and 655 ms at 4K is
+  ~3× the branch's own recorded 221.6 ms. This packet lacks the H100 production
+  recipe (segmented native prefill objects, `--tma-gemm`, the qualified
+  `PLOW_GEMMA4_SM90_*_ROLE` roles). The recipe, not a kernel, is the first
+  lever; re-run with it before any prefill kernel work.
+- ITL median 0.0 / p99 ≈ 4 × TPOT: multistep delivers tokens in quanta of 4 at
+  C1–C2. Throughput-neutral, but a 4-token stutter for streaming; price
+  `--multistep` for the realtime profile.
+- Provisional: gpulease stamped the run contended (idle co-tenant), ladder-1
+  packet. C4/C16 need the co-tenant gone.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
