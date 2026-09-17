@@ -781,6 +781,17 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-trace-log", env = "PLOW_PF_TRACE_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_trace_log: bool,
 
+    /// Per-shape cuBLASLt algorithm table (JSONL, see `device::cuda::lt::StoredAlgo`): each
+    /// `(m, n, k)` BF16 shape uses the pinned algorithm after `cublasLtMatmulAlgoCheck` accepts
+    /// it; a rejected entry falls back to the heuristic plus load-time timing.
+    #[arg(long = "lt-algos", env = "PLOW_LT_ALGOS", global = true)]
+    pub lt_algos: Option<String>,
+
+    /// Append every load-time cuBLASLt algorithm selection to this JSONL file — the producer of
+    /// a `--lt-algos` table (a build stage with the GPU, or a first serve).
+    #[arg(long = "lt-algos-write", env = "PLOW_LT_ALGOS_WRITE", global = true)]
+    pub lt_algos_write: Option<String>,
+
     /// Equalize the seg pair's dynamic smem (occ-1 fat object A/B).
     #[arg(long = "pf-seg-eqsmem", env = "PLOW_PF_SEG_EQSMEM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_eqsmem: bool,

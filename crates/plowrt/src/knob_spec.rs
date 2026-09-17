@@ -388,6 +388,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.cubin_sample", Some("PLOW_NV_CUBIN_SAMPLE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.kernel_sample", Some("PLOW_NV_KERNEL_SAMPLE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.libcuda", Some("PLOW_LIBCUDA"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.lt_algos", Some("PLOW_LT_ALGOS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.lt_algos_write", Some("PLOW_LT_ALGOS_WRITE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.vram_budget_mib", Some("PLOW_VRAM_BUDGET_MIB"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.step_time", Some("PLOW_STEP_TIME"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.l2_place_dispatch", Some("PLOW_L2_PLACE_DISPATCH"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
