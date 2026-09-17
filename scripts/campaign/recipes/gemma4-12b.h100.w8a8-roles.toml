@@ -1,0 +1,67 @@
+# Gemma-4-12B-it, H100 SXM5, FP8 (PTPC) weights: W8A8 prefill, W8A16 decode, BF16 KV and lm_head.
+# Not bit-comparable to vLLM's FP8 recipe (dynamic per-token activations, BF16 lm_head): report both.
+
+[cell]
+name = "gemma4-12b.h100.w8a8"
+model = "google/gemma-4-12B-it"
+revision = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+hf_dir = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+# BF16 shards + fp8/-keyed PTPC twins (656 tensors) in one directory; plowrt scans every safetensors.
+checkpoint_dir = "/opt/dlami/nvme/tmp/plow-h100-campaign/gemma12b-w8a16/checkpoint-mixed"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 8192
+precision = "w8a8"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_FP8 = "1"
+PLOW_W8A8 = "1"
+PLOW_EMIT_PACKED_PREFILL = "1"     # default-on only for BF16 Hopper; the roles need the metadata
+PLOW_SEG_PURE_GEMM = "fp8"
+PLOW_SEG_FA512 = "1"
+PLOW_SEG_FA256_GQA2 = "1"
+PLOW_TMA_GEMM = "1"
+PLOW_DECODE_BATCH_LADDER = "1"
+PLOW_MAX_CHUNK = "4096"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = [
+  "interp_sm90a_pfattn_hd512_px4_bq64.cubin",
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+  "interp_sm90a_pfgemm_glu_w8a8_gemma4.cubin",
+]
+[objects.env]
+PLOW_BUILD_W8A8 = "1"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "1"
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
+
+[serve.env]
+PLOW_PF_SEG_PURE = "fp8"
+PLOW_PF_SEG_FA512 = "1"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 16
+seed = 42
+tokenizer = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+model_id = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer in one short sentence.<end_of_turn>\n<start_of_turn>model\n"
+
+[reference]
+csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-fp8.csv"
