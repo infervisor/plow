@@ -563,8 +563,32 @@ TTFT 42.2 / 59.5 / 214.0 vs control 42.3 / 54.6 / 201.8; TPOT +0.4–0.9 ms.
 Seg-time at 4096: NormResidual+RmsNorm 153 → 227 µs, HeadNormRope 186 → 242,
 Glu 291 → 293 (unroll changed nothing). So the per-lane load-latency chain is
 NOT what bounds these bodies at 1 block/SM, and any extra register pressure in
-a light arm is paid by the whole megakernel. Next: ncu on the live fat
-launches (SOL, memory, warp-stall sections) before touching the bodies again.
+a light arm is paid by the whole megakernel. ncu cannot profile the cooperative
+megakernel at all (fails to prepare the kernel even with counter-only
+sections; see memory `ncu-on-nix-plowrt`).
+
+Second attempt, guard-free (experiments/h100_elementwise_ab.cu already recorded
+that a per-chunk guard on the load loops stops ptxas register-promoting the
+bf16v8 arrays): batches cover whole 256-element chunks only (4 per pass), the
+remainder takes the original loop; rope issues every item's loads from a valid
+row and masks only the stores; GeGLU's vector loop is branch-free with a
+separate tail. Compile gate (ptxas, same defines as the cell build):
+
+| object | baseline | guarded 8-chunk | guard-free 4-chunk |
+|---|---|---|---|
+| decode | 194 regs, 0 stack | 255 regs, 416 B | 217 regs, 0 stack, 0 STL/LDL |
+| fat prefill | 255, 1176 B, 1570 STL/LDL | 255, 2016 B | 255, 1568 B, 1736 STL/LDL |
+| pfpackedseg (runs the light ops here) | 255, 1872 B, 5716 B spill st, 3539 STL/LDL | 255, 2648 B, 6990 B | 255, 1856 B, 3760 B, 2266 STL/LDL |
+
+Cell `campaign-bf16-ladder` (full decode ladder 1,2,4,8,16 so the same packet
+serves the C4/C16 throughput profile) is the measurement.
+
+Harness debt (not fixed today): a cell build compiles the interpreter object
+set twice (once inside the base emit, again in `build_sm90a_gemma4_segments.sh`
+with the segment/role defines) and the second pass runs one nvcc at a time;
+ptxas at the 255-register ceiling takes 1.5–3 min per object × 16 objects, so
+the objects stage alone is ~25 min on one core. Parallelising the script and
+skipping the duplicate base set would cut a build to under 10 min.
 
 ### The 128-token cell is launch-count bound (seg-time, 128 rows, one chunk)
 
@@ -588,6 +612,29 @@ folding light ops into GEMM epilogues needs Plow's own small-M GEMM), (2) a
 cheaper per-launch floor (light-only object: small smem, low regs), (3) the
 ~8 ms of host gaps (graph capture INCLUDING the Lt calls — seg-graph alone was
 null; check whether the capture spans them).
+
+### First throughput cells (2026-09-17, cell `campaign-bf16-ladder`, GPU free)
+
+Full decode ladder 1,2,4,8,16 (`GV_MM_MAX 16` in plow_config.h), cache off,
+profile `throughput` (multistep 8), vs vLLM 0.28 BF16:
+
+| in | C | TTFT | vLLM | TPOT | vLLM | tok/s | vLLM |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1024 | 4 | 224 | 128 | 19.8 | 11.2 | 187 | 331 |
+| 1024 | 16 | 1089 | 424 | 49.7 | 13.8 | 273 | 940 |
+| 4096 | 4 | 932 | 468 | 23.3 | 12.2 | 130 | 254 |
+| 4096 | 16 | 4883 | 1301 | 57.9 | 21.9 | 164 | 499 |
+
+Reading: TTFT at C16/1024 (1089 ms ≈ 16 × 55 ms) says prefill throughput is
+flat at ~19–20K tok/s whatever the packing (a 4096-row packed chunk costs 200 ms
+= the same per-token rate as a single 1024 request), while vLLM's batched
+prefill reaches ~40K tok/s (424 ms for 16K tokens). Plow's 4096-row chunk is
+105 ms of Lt GEMM at the ceiling plus ~97 ms of attention (36), light bodies
+(37) and gaps (24) — the same items as the C1 gap, amplified. TPOT growing
+~linearly with C is at least partly decode stalling behind other requests'
+prefill chunks (no prefill/decode mixing beyond the unified token batch's
+2048-row budget); the in128 C4/C16 probe (`tp128`) separates batched-decode
+efficiency from prefill stalls.
 
 ### plowrt VMM prefix review (merged 2026-09-17, branch `gemma4-plowrt-vmm-fixes`)
 
