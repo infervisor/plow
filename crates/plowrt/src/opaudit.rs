@@ -527,6 +527,9 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::XReduce => a_elem("i0=H (host sets the live element count)"),
         DevOp::XAllGather => a_elem("i0/i1/i2 = per-array element counts"),
         DevOp::XAllToAllHeads => a_elem("i0=rpr, i1=nh_l, i2=d, i3=nh_total"),
+        DevOp::DcpKvPack => a_rows("i0=n_batch"),
+        DevOp::XDcpGather => a_rows("i0=n_batch"),
+        DevOp::DcpKvScatter => a_rows("i0=rows"),
         DevOp::XReduceTwoShot => a_elem("i0=n (= t*hidden)"),
         DevOp::XReduceAddNorm => a_one("i0=feat, one row, must fit one workgroup"),
         // interp.hip:5421 documents i0=nparts i1=n_batch i2=vocab_l i3=gate

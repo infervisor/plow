@@ -2362,6 +2362,8 @@ fn count_xgates(blob: &DevBlob) -> u32 {
             } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
                 // split seams: one gate each (i3)
                 top = top.max(d.i[3] + 1);
+            } else if d.op == DevOp::XDcpGather as u16 {
+                top = top.max(d.i[6] + 1);
             } else if d.op == DevOp::XArgmaxFin as u16 {
                 // sharded-head fold: arrival gate (i3), then consecutive value lines at i4
                 top = top
@@ -2444,6 +2446,10 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
                     // blind to this op entirely -- every rank's real n_gpu arrivals read as
                     // "MORE than the program can produce" against a silent default of 0.
                     set(d.i[4], Some(n_gpu));
+                } else if d.op == DevOp::XDcpGather as u16 {
+                    // DCP owner gather: the pack packets published first, so one workgroup
+                    // per rank announces (`xr_rendezvous_one_wg`, i[6]=gate).
+                    set(d.i[6], Some(n_gpu));
                 } else if d.op == DevOp::XArgmaxFin as u16 {
                     set(d.i[3], Some(n_gpu));
                     for line in 0..xargmax_value_lines(d.i[1]) {

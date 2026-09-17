@@ -5186,6 +5186,7 @@ fn is_tp_collective(op: u16) -> bool {
                 | DevOp::XReduceScatter
                 | DevOp::XAllGather
                 | DevOp::XAllToAllHeads
+                | DevOp::XDcpGather
         )
     )
 }

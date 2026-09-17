@@ -112,7 +112,11 @@ pub fn class_of(op: DevOp) -> RowClass {
         // Collectives reduce whole tensors at live row extents identical on every rank; the
         // element count is an input, the row identity is not.
         XReduce | XReduceScatter | XAllGather | XFlashMerge | XArgmaxFin | XReduceTwoShot
-        | XReduceAddNorm | XAllToAllHeads => RowClass::A,
+        | XReduceAddNorm | XAllToAllHeads | XDcpGather => RowClass::A,
+        // DCP pack: records are `b*K + j`, the batch row is an input like the flash's.
+        DcpKvPack => RowClass::A,
+        // DCP write: row t is decode slot t, or a row of the one prefilling sequence at pos[t].
+        DcpKvScatter => RowClass::A,
         // MoE. Routing, grouping, scatter and combine are the row-grouping contract shared
         // across families: each expert receives its rows from any request or phase, and the
         // maps are built from the batch. `MoeCombinePf`'s `i3 = t_row0` is a band OFFSET into

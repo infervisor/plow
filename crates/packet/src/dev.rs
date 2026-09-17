@@ -1998,6 +1998,31 @@ pub enum DevOp {
     /// BF16 projection with an FP32 accumulator/output, used for GLM router logits.
     /// `t0=C(f32[M,N]) t1=A(bf16[M,K]) t2=W(bf16[N,K])` · `i0=M i1=N i2=K`.
     GemmF32 = 180,
+    /// Decode context parallelism, pack half: this rank copies the latent KV records its DCP
+    /// shard OWNS into its peer slot, record-major at 656 B (`[512 e4m3 ckv][64 bf16 krot][f32
+    /// scale][pad]`). Record `r = b*K + j` is selected slot `j` of batch row `b`; its global row is
+    /// `idx[r]`, or `j` when `idx` is absent (the prefill prefix form). Live iff
+    /// `j < min(K, kv_len[b])`. Owned iff `(g >> page_shift) & (2^degree_shift - 1) == shard`;
+    /// read at local row `((g >> (page_shift + degree_shift)) << page_shift) | (g & (page - 1))`.
+    /// Slot bytes: `n_batch*K*656`.
+    /// `t0=idx? t1=kv_len t2=ckv(u8 local) t3=krot(bf16 local) t4=kv_scale(f32 local)` ·
+    /// `i0=n_batch i1=K i2=local_stride i3=page_shift i4=degree_shift i5=slot_bytes i6=shard`.
+    DcpKvPack = 181,
+    /// Decode context parallelism, gather half: rendezvous on `gate`, then pull every live record
+    /// from its owner's slot (owner rank = this rank's group base + shard) into dense gathered
+    /// buffers the unchanged flash reads with `kv_stride = K`. `glen[b] = min(K, kv_len[b])` when
+    /// present (the decode form, read by the flash as its kv_len).
+    /// `t0=idx? t1=kv_len t2=gckv(u8[B][K][512]) t3=gkrot(bf16[B][K][64]) t4=gscale(f32[B][K])
+    /// t5=glen?` · `i0=n_batch i1=K i3=page_shift i4=degree_shift i5=slot_bytes i6=gate i7=n_gpu`.
+    XDcpGather = 182,
+    /// Decode context parallelism, write half: the unchanged latent/rope writers wrote this step's
+    /// `rows` into staging buffers at row `t`; this copies row `t` into the local cache iff this
+    /// shard owns global row `pos[t]`, at the local row (`batched`: plus `t * local_stride`, row
+    /// `t` being decode slot `t`). Ownership reads the replicated `pos`, so nothing is staged per
+    /// rank. `t0=pos t1=ckv_stage(u8[rows][512]) t2=krot_stage(bf16[rows][64])
+    /// t3=scale_stage(f32[rows]) t4=ckv t5=krot t6=kv_scale` ·
+    /// `i0=rows i1=local_stride i2=page_shift i3=degree_shift i4=shard i5=batched`.
+    DcpKvScatter = 183,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2194,6 +2219,9 @@ impl DevOp {
         DevOp::GroupedAttentionF32,
         DevOp::EmbedOverlayBf16,
         DevOp::GemmF32,
+        DevOp::DcpKvPack,
+        DevOp::XDcpGather,
+        DevOp::DcpKvScatter,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2395,6 +2423,9 @@ impl DevOp {
             DevOp::GroupedAttentionF32 => "PLOW_DOP_GROUPED_ATTENTION_F32",
             DevOp::EmbedOverlayBf16 => "PLOW_DOP_EMBED_OVERLAY_BF16",
             DevOp::GemmF32 => "PLOW_DOP_GEMM_F32",
+            DevOp::DcpKvPack => "PLOW_DOP_DCP_KV_PACK",
+            DevOp::XDcpGather => "PLOW_DOP_XDCP_GATHER",
+            DevOp::DcpKvScatter => "PLOW_DOP_DCP_KV_SCATTER",
         }
     }
 
@@ -2443,7 +2474,9 @@ impl DevOp {
     /// 178 -> 179 for backend-neutral grouped FP32 attention.
     /// 179 -> 180 for backend-neutral multimodal embedding overlay.
     /// 180 -> 181 for GLM's BF16-input/FP32-weight/FP32-output router GEMM.
-    pub const COUNT: u16 = 181;
+    /// 181 -> 184 for `DcpKvPack = 181` / `XDcpGather = 182` / `DcpKvScatter = 183` (decode
+    /// context parallelism).
+    pub const COUNT: u16 = 184;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

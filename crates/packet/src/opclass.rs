@@ -27,7 +27,8 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
     use DevOp::*;
     match op {
         XReduce | XReduceScatter | XAllGather | XArgmaxFin | XReduceTwoShot | XReduceAddNorm
-        | XAllToAllHeads => &["collective"],
+        | XAllToAllHeads | XDcpGather => &["collective"],
+        DcpKvPack | DcpKvScatter => &["attention"],
         XFlashMerge => &["attention"],
 
         FlashPrefill
@@ -141,13 +142,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_collective_class_is_the_tp_audit_set_plus_all_to_all() {
+    fn the_collective_class_is_the_tp_audit_set_plus_all_to_all_and_dcp_gather() {
         let collectives: Vec<u16> = class_table()
             .into_iter()
             .filter(|(_, cs)| cs.contains(&"collective"))
             .map(|(op, _)| op)
             .collect();
-        assert_eq!(collectives, [24, 25, 26, 28, 29, 116, 160]);
+        assert_eq!(collectives, [24, 25, 26, 28, 29, 116, 160, 182]);
     }
 
     #[test]

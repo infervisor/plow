@@ -1295,6 +1295,10 @@ fn backend_amd(
     if has("XAllToAllHeads") {
         req.push("PLOW_ROWSPLIT_A2A=1".into());
     }
+    // Decode context parallelism's owner gather (ops 181/182): same silent-no-op hazard.
+    if has("DcpKvPack") || has("XDcpGather") || has("DcpKvScatter") {
+        req.push("PLOW_DCP_GATHER=1".into());
+    }
     if union.iter().any(|a| {
         matches!(a.op.as_str(), "KdaChunkWu" | "KdaChunkCarry")
             && a.variant.as_deref().is_some_and(|v| v.ends_with("_qpre"))
