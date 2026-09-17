@@ -400,6 +400,27 @@ Findings:
 4. Non-GPU overhead is ~2.5 ms per request. Decode at C1 is unaffected by any
    of this.
 
+### Lt gate/up instead of the fused GLU role — first attribution-driven win
+
+Emit A/B on the BF16-roles recipe: `PLOW_NO_GLU_FUSE=1` (gate/up as two
+N=15360 GEMMs) + `PLOW_EMIT_PREFILL_CUBLASLT=1` + `PLOW_GEMMA4_SM90_GEMM_GLU_ROLE=0`
+→ 1096 Lt segments (288 more than P2: 48 layers × gate/up × the 3 wide
+buckets). Control: `bf16-roles-ms0`.
+
+| in | TTFT control | TTFT Lt-GLU | Δ | × vLLM BF16 (was) | TPOT |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 42.10 | 42.19 | 0 | 1.50 (1.50) | 12.03 |
+| 1024 | 89.90 | **56.39** | **−37 %** | **1.21** (1.92) | 12.71 |
+| 4096 | 213.63 | 204.48 | −4.3 % | 1.20 (1.26) | 13.32 |
+
+The fused GLU role (≈20 % of tensor-core peak) is beaten by cuBLASLt plus a
+separate GeGLU pass at every bucket Lt covers, including 4096 where the role
+had been qualified at −3.3 %. in128 is unchanged only because
+`cublaslt_prefill_bf16` admits just `(N,K) ∈ {(3840,15360),(3840,8192)}` at
+M ∈ {128,256,512}; admitting `(15360,3840)` there is the next one-line A/B.
+The native fused-GLU body is now a **T2 target against cuBLASLt on its own
+shape**, not a promoted role.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
