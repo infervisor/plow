@@ -709,15 +709,26 @@ chunk at 97–119 µs each) while decode already uses the fused
 "fused N1"). The emitter gates prefill fusion behind `PLOW_PF_GFUSE` (registered,
 documented, off; `seam_fused` defaults to true when the rewrite graph has no
 opinion). With it, every prefill program carries 44 `NormResidualNorm` sites and
-the instruction count drops 766 → 670 (−96 launches per chunk). **As built,
-refuted:** with the light object's default `PLOW_NV_NRN_WPR=0` the fused op
-takes the block-per-row path (one row per block, two block barriers per row),
-which is latency-bound at prefill row counts and rounds differently from the
-split pair — 42.09 / 64.12 / 207.07 vs the fat-lite control 42.05 / 51.15 /
-191.77, and 1 of 5 greedy continuations differs. The header says `NRN_WPR=1`
-(warp-per-row) matches the prefill pair's reduction order; the same packet with
-that object (`campaign-bf16-gfusewpr`, 128 regs / 24 B stack) is the fair test,
-pending.
+the instruction count drops 766 → 670. **REFUTED, both reduction orders:**
+
+| cell | TTFT 128 / 1024 / 4096 | greedy vs control | non-Lt seg total |
+|---|---|---|---|
+| fat-lite control | 42.05 / 51.15 / 191.77 | 5/5 identical | 61.0 ms |
+| gfuse, `NRN_WPR=0` | 42.09 / 64.12 / 207.07 | 4/5 | 65.0 ms |
+| gfuse, `NRN_WPR=1` | 42.18 / 63.22 / 205.31 | 4/5 | 61.6 ms |
+
+Two lessons, both worth more than the experiment. **(1) The premise was wrong:
+the split pair was ALREADY one launch.** The seg-time site label
+`NormResidual+RmsNorm` means both ops share one segment, so op-level fusion
+removed instructions, not launches (96 segments before and after). Read the
+site labels before counting launches. **(2) The cost is outside the timed
+segments.** At `NRN_WPR=1` the fused op is even marginally cheaper per launch
+(92 vs 97 µs) and the non-Lt total is within noise, yet TTFT is 12 ms worse at
+1024 and 13 ms at 4096. So something in the Lt path or the gaps regressed —
+most likely the fused op changes which tensor feeds the next projection
+(`d.t[1]/t[2] = n.xr` instead of `n.x`), making some projections miss the
+pinned cuBLASLt algorithm. Worth one `PLOW_LT_ALGOS` hit-rate check before any
+future emitter change that re-points projection inputs.
 
 ### Fat-lite light object at two blocks per SM (2026-09-17, late)
 
