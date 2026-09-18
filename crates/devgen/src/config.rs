@@ -221,6 +221,8 @@ pub(crate) struct Cfg {
     // non-shared layer of their type; 0 = none). See `dev_isa.h` op 155.
     pub(crate) ple: u32,
     pub(crate) kv_shared: u32,
+    // Gemma-4 E2B doubles the dense MLP width on the trailing KV-shared layers (`use_double_wide_mlp`).
+    pub(crate) double_wide_mlp: bool,
 }
 
 impl Cfg {
@@ -238,6 +240,22 @@ impl Cfg {
     }
     pub(crate) fn kv_is_shared(&self, l: usize) -> bool {
         self.kv_source(l) != l
+    }
+    /// Per-layer dense-MLP intermediate width. E2B doubles it on the trailing KV-shared layers.
+    pub(crate) fn inter_for_layer(&self, l: usize) -> u32 {
+        if self.double_wide_mlp && self.kv_is_shared(l) {
+            self.inter * 2
+        } else {
+            self.inter
+        }
+    }
+    /// Widest dense-MLP intermediate across all layers (scratch/activation sizing).
+    pub(crate) fn max_inter(&self) -> u32 {
+        if self.double_wide_mlp {
+            self.inter * 2
+        } else {
+            self.inter
+        }
     }
 }
 
@@ -366,6 +384,7 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         moe_inter: t["moe_intermediate_size"].as_u64().unwrap_or(0) as u32,
         ple: t["hidden_size_per_layer_input"].as_u64().unwrap_or(0) as u32,
         kv_shared: t["num_kv_shared_layers"].as_u64().unwrap_or(0) as u32,
+        double_wide_mlp: t["use_double_wide_mlp"].as_bool().unwrap_or(false),
     };
     if c.moe {
         crate::require_moe_topk(c.top_k, "gemma4 (enable_moe_block)");
@@ -469,6 +488,7 @@ fn cfg_gemma3(v: &Value) -> Cfg {
         moe_inter: 0,
         ple: 0,
         kv_shared: 0,
+        double_wide_mlp: false,
     }
 }
 
@@ -547,6 +567,7 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         moe_inter: 0,
         ple: 0,
         kv_shared: 0,
+        double_wide_mlp: false,
     }
 }
 

@@ -275,6 +275,20 @@ impl MetalEngine {
             .glu_pair
             .then(|| format!("#define PLOW_GLU_PAIR 1\n{source}"));
         let source = glu_source.as_deref().unwrap_or(source);
+        // Multi-row weight-reuse decode kernels: reuse one bf16 weight load across N decode rows
+        // (the batched-decode throughput win). Off by default; enabled per-serve via PLOW_METAL_BF16_M*.
+        let bf16_m2_source = apple_config
+            .bf16_m2
+            .then(|| format!("#define PLOW_BF16_M2 1\n{source}"));
+        let source = bf16_m2_source.as_deref().unwrap_or(source);
+        let bf16_m4_source = apple_config
+            .bf16_m4
+            .then(|| format!("#define PLOW_BF16_M4 1\n{source}"));
+        let source = bf16_m4_source.as_deref().unwrap_or(source);
+        let bf16_m8_source = apple_config
+            .bf16_m8
+            .then(|| format!("#define PLOW_BF16_M8 1\n{source}"));
+        let source = bf16_m8_source.as_deref().unwrap_or(source);
         let four_rows = model.batch == 4
             && model
                 .blob
