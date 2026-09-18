@@ -505,12 +505,39 @@ kernel work should be priced against: **in128 TTFT 22 ms and TPOT 10.7 ms
 ### Full attribution of the Lt packet (cache off, C1) — where the 1024/4096 gap is
 
 Lt GEMM time from the pinned algorithm table (per layer q+k+v+o+gate+up+down),
-non-Lt segments from `PLOW_PF_SEG_TIME=1`, gaps = TTFT − both.
+non-Lt segments from `PLOW_PF_SEG_TIME=1`.
 
-| cell | Lt GEMM | attention | norm+resid | GeGLU | rope | gaps | TTFT | vLLM |
+| cell | Lt GEMM | attention | norm+resid | GeGLU | rope | residual | TTFT | vLLM |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | 1024 | 26.5 | 7.2 | 4.2 | 4.0 | 2.8 | ~10 | 54.5 | 46.7 |
 | 4096 | 105.0 | 34.8 | 14.7 | 13.8 | 8.9 | ~24 | 201 | 170 |
+
+> **The residual column is NOT idle time — corrected 2026-09-18.** It was read
+> as launch gap for most of this campaign and that was an accounting error:
+> **TTFT is not prefill.** It includes the first decode step and the client's
+> own overhead, neither of which belongs in a kernel-time column. Subtract them
+> and the accounting closes:
+>
+> ```
+> 4096:  kernels 167.6  +  first decode 13.3 (= measured TPOT)  +  client ~11
+>        = 191.9   vs   measured TTFT 191.8
+> ```
+>
+> A second, independent check agrees: a 2940-token prompt traced end to end took
+> 145 ms, i.e. 44 µs/row against the bench cell's 41 µs/row — pure kernel
+> scaling, no fixed idle term.
+>
+> Two predictions follow, and both hold. `PLOW_PF_SEG_GRAPH=1` must be null,
+> because there is nothing to collapse: re-tested on the current fat-lite packet
+> (1640 Lt segments, graph confirmed built) it measured 50.64 / 191.44 against
+> the control's 51.15 / 191.77. And nsys shows the VMM driver calls on the
+> request path are microseconds, so mapping is not hiding in there either.
+>
+> **Consequence for the goal.** There is no host-side slack left at 1024 or
+> 4096. Every remaining millisecond of the gap to vLLM is kernel time, and the
+> attention row is where it sits: 34.8 ms at 4096 against an ~8 ms roofline.
+> That is the whole remaining realtime story, and it is why the hd512 WGMMA role
+> (34.8 → 29.9) and cuDNN for the 40 sliding layers are the ranked levers.
 
 - GEMM: cuBLASLt at 850 TFLOP/s at M=1024 — at the ceiling. Done.
 - Attention: ≈8 ms floor at 4096 (2.2 TFLOP global hd512 + 2.7 TFLOP sliding
