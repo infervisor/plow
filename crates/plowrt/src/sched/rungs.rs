@@ -304,6 +304,7 @@ impl RungController {
         // Cold start seats the penultimate rung, then probes the widest: a rung only gains samples
         // by running, so holding the widest back until it has samples would cap it forever.
         if demand_seat == widest
+            && self.rungs.width(widest) > 4
             && self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES
             && self.stats[demand_seat - 1].samples < MIN_THROUGHPUT_SAMPLES
         {
@@ -640,5 +641,13 @@ mod tests {
             c.decide(load(4, 0));
         }
         assert_eq!(c.admission_limit(), 4, "fully occupied target rung must not narrow");
+    }
+
+    #[test]
+    fn small_batch_ladder_cold_start_does_not_throttle() {
+        let mut c = controller(&[1, 2, 4]);
+        let d = c.decide(load(1, 3));
+        assert_eq!(c.width(d.admission), 4, "cold start on width 4 ladder must admit width 4 directly");
+        assert_eq!(d.reason, RungReason::Backlog);
     }
 }

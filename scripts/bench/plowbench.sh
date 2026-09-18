@@ -65,12 +65,91 @@ PLOW_AMD_DECODE_MIN_RUNG:changes which decode program runs; default 8 is the mea
 PLOW_GLM_ROWBAND:the row-band serve gate; arms must agree on it
 PLOW_TICK_LOG:adds per-tick logging; fine for instrumented arms, not for a clean number"
 
+# ---------------------------------------------------------------- architecture detection
+
+pb_detect_arch() {
+    local hint="${1:-${TARGET_ARCH:-${PLOW_ARCH:-${ARCH:-}}}}"
+    if [ -n "$hint" ]; then
+        echo "$hint"
+        return 0
+    fi
+    local assets="${2:-}"
+    if [ -n "$assets" ] && [ -f "$assets/build.json" ]; then
+        local a
+        a=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("arch",""))' "$assets/build.json" 2>/dev/null || true)
+        if [ -n "$a" ]; then
+            echo "$a"
+            return 0
+        fi
+    fi
+    local obj="${3:-}"
+    if [ -n "$obj" ] && [ -d "$obj" ]; then
+        if compgen -G "$obj/*sm90*.cubin" >/dev/null 2>&1 || compgen -G "$obj/*sm_90*.cubin" >/dev/null 2>&1; then
+            echo "sm_90a"; return 0
+        elif compgen -G "$obj/*sm120*.cubin" >/dev/null 2>&1 || compgen -G "$obj/*sm_120*.cubin" >/dev/null 2>&1; then
+            echo "sm_120"; return 0
+        elif compgen -G "$obj/*sm89*.cubin" >/dev/null 2>&1 || compgen -G "$obj/*sm_89*.cubin" >/dev/null 2>&1; then
+            echo "sm_89"; return 0
+        elif compgen -G "$obj/*.cubin" >/dev/null 2>&1; then
+            echo "sm_90a"; return 0
+        elif compgen -G "$obj/*gfx942*" >/dev/null 2>&1; then
+            echo "gfx942"; return 0
+        elif compgen -G "$obj/*gfx950*" >/dev/null 2>&1; then
+            echo "gfx950"; return 0
+        fi
+    fi
+    # Hardware device probe
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local cap
+        cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)
+        case "$cap" in
+            9.0*) echo "sm_90a"; return 0 ;;
+            12.0*) echo "sm_120"; return 0 ;;
+            8.9*) echo "sm_89"; return 0 ;;
+            8.0*) echo "sm_80"; return 0 ;;
+            "") ;;
+            *) echo "sm_${cap//./}"; return 0 ;;
+        esac
+    fi
+    if command -v rocminfo >/dev/null 2>&1; then
+        local gfx
+        gfx=$(rocminfo 2>/dev/null | grep -o 'gfx942\|gfx950' | head -1 || true)
+        if [ -n "$gfx" ]; then
+            echo "$gfx"; return 0
+        fi
+    fi
+    if command -v rocm-smi >/dev/null 2>&1 && ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "gfx942"
+    else
+        echo "sm_90a"
+    fi
+}
+
+pb_is_nvidia() {
+    local arch="${1:-}"
+    case "$arch" in
+        sm_*|sm90*|sm120*|sm89*|nvidia*|NVIDIA*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+pb_is_amd() {
+    local arch="${1:-}"
+    case "$arch" in
+        gfx*|amd*|AMD*|cdna*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 pb_require_nix() {
-    if [ -z "${ROCM_PATH:-}" ]; then
-        pb_bad "not inside 'nix develop' (ROCM_PATH unset) — build and serve tasks need it"
+    if [ -z "${ROCM_PATH:-}" ] && [ -z "${CUDA_PATH:-}" ]; then
+        pb_bad "not inside 'nix develop' (neither ROCM_PATH nor CUDA_PATH set) — build and serve tasks need it"
         return 1
     fi
-    pb_ok "nix dev shell, ROCM_PATH=$ROCM_PATH"
+    local info=""
+    [ -n "${ROCM_PATH:-}" ] && info="ROCM_PATH=$ROCM_PATH "
+    [ -n "${CUDA_PATH:-}" ] && info="${info}CUDA_PATH=$CUDA_PATH"
+    pb_ok "nix dev shell ($info)"
 }
 
 # Refuse a run whose environment silently redefines the measurement.
@@ -91,15 +170,29 @@ pb_hazard_env() {
 
 pb_check_plowrt() {
     local rt="${1:?plowrt path}"
+    local arch="${2:-}"
+    [ -n "$arch" ] || arch=$(pb_detect_arch)
     [ -x "$rt" ] || { pb_bad "no plowrt at $rt"; return 1; }
-    # A binary without the hsa feature serves from the CPU interpreter and never says so.
-    if ! grep -aq 'dec_inflight_enq' "$rt"; then
-        pb_warn "$rt has no TICK instrument — probably an old or feature-less build"
+
+    if pb_is_nvidia "$arch"; then
+        if ! (set +o pipefail; strings "$rt" 2>/dev/null | grep -Eq 'cuModuleLoad|cuInit|PlowProgram|cublasLt'); then
+            pb_warn "$rt lacks CUDA runtime symbols — ensure plowrt was built with --features cuda"
+        fi
+    elif pb_is_amd "$arch"; then
+        # A binary without the hsa feature serves from the CPU interpreter and never says so.
+        if ! grep -aq 'dec_inflight_enq' "$rt"; then
+            pb_warn "$rt has no TICK instrument — probably an old or feature-less build (--features hsa)"
+        fi
     fi
+
     case "$rt" in
         */target/release/plowrt)
             pb_warn "using the SHARED target/release/plowrt — a concurrent 'cargo build -p plowrt'"
-            pb_info "can replace it mid-run with a no-hsa binary that serves fluent garbage."
+            if pb_is_nvidia "$arch"; then
+                pb_info "can replace it mid-run with a non-cuda binary that falls back to CPU."
+            else
+                pb_info "can replace it mid-run with a no-hsa binary that serves fluent garbage."
+            fi
             pb_info "For anything you will publish a number from, copy it first:"
             pb_info "  cp $rt /workspace/\$USER-plowrt && export PLOWRT_BIN=/workspace/\$USER-plowrt" ;;
     esac
@@ -118,10 +211,50 @@ pb_check_assets() {
     pb_ok "packet $assets/model.pkt sha=$got"
 }
 
-# The check that pays for this whole file.
+# Checks objects for target architecture (NVIDIA .cubin vs AMD .co/.elf).
 pb_check_objects() {
-    local dir="${1:?object dir}" miss=0 f
+    local dir="${1:?object dir}"
+    local arch="${2:-}"
+    [ -n "$arch" ] || arch=$(pb_detect_arch "" "" "$dir")
     [ -d "$dir" ] || { pb_bad "no object dir $dir"; return 1; }
+
+    if pb_is_nvidia "$arch"; then
+        local cubins
+        cubins=$(find "$dir" -maxdepth 1 -name "*.cubin" 2>/dev/null)
+        if [ -z "$cubins" ]; then
+            pb_bad "NVIDIA object dir lacks .cubin objects in $dir (arch=$arch)"
+            return 1
+        fi
+        local bad_elf=0 f
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            # Verify valid ELF magic \x7fELF
+            if ! head -c 4 "$f" | grep -q 'ELF'; then
+                pb_bad "object $f is not a valid ELF/cubin file"
+                bad_elf=$((bad_elf + 1))
+            fi
+        done <<< "$cubins"
+        if [ "$bad_elf" -gt 0 ]; then
+            return 1
+        fi
+        local ncubins; ncubins=$(echo "$cubins" | wc -l)
+        if [ -e "$dir/MANIFEST.sha256" ]; then
+            local bad
+            bad=$( cd "$dir" && sha256sum -c --ignore-missing --quiet MANIFEST.sha256 2>&1 | head -3 )
+            if [ -n "$bad" ]; then
+                pb_bad "object hashes disagree with MANIFEST.sha256:"
+                printf '        %s\n' "$bad"
+                return 1
+            fi
+            pb_ok "objects in $dir ($ncubins cubin(s), arch=$arch, manifest verified)"
+        else
+            pb_ok "objects in $dir ($ncubins cubin(s), arch=$arch)"
+        fi
+        return 0
+    fi
+
+    # AMD target check
+    local miss=0 f
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         [ -e "$dir/$f" ] || { pb_bad "object dir lacks pinned vendor kernel $f"; miss=$((miss + 1)); }
@@ -151,7 +284,37 @@ pb_check_objects() {
 }
 
 pb_check_vllm() {
-    local v="${PB_VLLM:-/app/plow/build-gemma31/vllm-python}"
+    local arch="${1:-}"
+    [ -n "$arch" ] || arch=$(pb_detect_arch)
+    local v="${PB_VLLM:-}"
+    if [ -z "$v" ]; then
+        if [ -x "/opt/pytorch/bin/vllm" ]; then
+            v="/opt/pytorch/bin/vllm"
+        elif command -v vllm >/dev/null 2>&1; then
+            v="$(command -v vllm)"
+        elif [ -x "/app/plow/build-gemma31/vllm-python" ]; then
+            v="/app/plow/build-gemma31/vllm-python"
+        elif [ -n "${VLLM_VENV:-}" ] && [ -x "$VLLM_VENV/bin/vllm" ]; then
+            v="$VLLM_VENV/bin/vllm"
+        fi
+    fi
+
+    if pb_is_nvidia "$arch"; then
+        if [ -z "$v" ] || [ ! -x "$v" ]; then
+            # Test python module
+            if python3 -c 'import vllm' >/dev/null 2>&1; then
+                pb_ok "vLLM available via python3 -m vllm (CUDA)"
+                return 0
+            fi
+            pb_bad "no vLLM client found (checked PB_VLLM, /opt/pytorch/bin/vllm, and PATH)"
+            return 1
+        fi
+        pb_ok "vLLM client $v (CUDA)"
+        return 0
+    fi
+
+    # AMD target
+    v="${v:-/app/plow/build-gemma31/vllm-python}"
     [ -x "$v" ] || { pb_bad "no vLLM client at $v (set PB_VLLM)"; return 1; }
     local lib="${PB_VLLM_ROCM_LIB:-/opt/rocm/core-7.14/lib}"
     [ -d "$lib" ] || { pb_bad "VLLM_ROCM_LIB dir missing: $lib"; return 1; }

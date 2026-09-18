@@ -227,11 +227,11 @@ pub struct EmitConfig {
     // Fusion (generic, cross-model)
     // ──────────────────────────────────────────────────────────────────────────
     /// Fold greedy argmax into the lm_head GEMV epilogue.
-    #[arg(long, env = "PLOW_FUSE_ARGMAX", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, env = "PLOW_FUSE_ARGMAX", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fuse_argmax: bool,
 
     /// Cap sliding-window decode nsplit to (win / 64) to prevent over-splitting.
-    #[arg(long, env = "PLOW_SLIDING_NS_CAP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, env = "PLOW_SLIDING_NS_CAP", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub sliding_ns_cap: bool,
 
     /// Revert fused QKV to split-3 path (A/B control).
@@ -299,6 +299,18 @@ pub struct EmitConfig {
     /// Force prefill lm_head onto M=1 GEMV arm vs tiled. "1"/"0" to force.
     #[arg(long, env = "PLOW_PF_GEMV_HEAD")]
     pub pf_gemv_head: Option<String>,
+
+    /// Emit modular building-block packets (EmbeddingBlock, DenseAttentionBlock, DenseFfnBlock, FinalNormVocabBlock).
+    #[arg(long, env = "PLOW_BLOCK_PACKETS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub block_packets: bool,
+
+    /// Opt-in knob for modular block prefill pipeline and fine-grained ladder decomposition.
+    #[arg(long, env = "PLOW_PF_MODULAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub pf_modular: bool,
+
+    /// Single block stage to emit in isolation: "attn", "ffn", "embed", "vocab", or "all".
+    #[arg(long, env = "PLOW_BLOCK_STAGE")]
+    pub block_stage: Option<String>,
 
     // ──────────────────────────────────────────────────────────────────────────
     // Placement / L2 / counters
@@ -1249,8 +1261,8 @@ impl EmitConfig {
             gemv_split: env_u32("PLOW_GEMV_SPLIT").unwrap_or(1),
             decode_tiled: env_bool("PLOW_DECODE_TILED"),
             l2_place_prefill: env_bool_opt("PLOW_L2_PLACE_PREFILL").unwrap_or(true),
-            fuse_argmax: env_bool("PLOW_FUSE_ARGMAX"),
-            sliding_ns_cap: env_bool("PLOW_SLIDING_NS_CAP"),
+            fuse_argmax: env_bool_opt("PLOW_FUSE_ARGMAX").unwrap_or(true),
+            sliding_ns_cap: env_bool_opt("PLOW_SLIDING_NS_CAP").unwrap_or(true),
             no_fuse_qkv: env_bool("PLOW_NO_FUSE_QKV"),
             fuse_qkv_fp8: env_bool("PLOW_FUSE_QKV_FP8"),
             no_fuse_nrn: env_bool("PLOW_NO_FUSE_NRN"),
@@ -1266,6 +1278,9 @@ impl EmitConfig {
             pf_ladder: env_str("PLOW_PF_LADDER"),
             pf_ladder_append: env_str("PLOW_PF_LADDER_APPEND"),
             pf_gemv_head: env_str("PLOW_PF_GEMV_HEAD"),
+            block_packets: env_bool("PLOW_BLOCK_PACKETS"),
+            pf_modular: env_bool("PLOW_PF_MODULAR"),
+            block_stage: env_str("PLOW_BLOCK_STAGE"),
             xr_cus: env_u32("PLOW_XR_CUS"),
             glm_pf_small_cus: env_str("PLOW_GLM_PF_SMALL_CUS"),
             xr_dec_cus: env_u32("PLOW_XR_DEC_CUS"),

@@ -142,9 +142,9 @@ __device__ __forceinline__ void gemv_rows(__nv_bfloat16* __restrict__ C,
                                           unsigned N, unsigned K, unsigned slice, unsigned nblk,
                                           const __nv_bfloat16* __restrict__ bias = nullptr) {
 #if PLOW_NV_GEMV_MMA
-    /* BATCH>=2 rungs on the tensor cores (op_gemv_mma.cuh); MM=2 and MM=4+ are both
+    /* Decode rungs on the tensor cores (op_gemv_mma.cuh); MM=1, 2, 4+ are all
      * faster than dot8 (measured in experiments/gemv_mma_batch_h100.cu). */
-    if constexpr (MM >= 2) {
+    if constexpr (MM >= 1) {
         if ((K & 31u) == 0u) {
             gemv_rows_mma<BIAS, (MM + 15) / 16>(C, x, W, M, N, K, slice, nblk, bias);
         } else {
@@ -564,7 +564,7 @@ __device__ __forceinline__ void gemv_qkv_rows(__nv_bfloat16* Cq, __nv_bfloat16* 
                            const __nv_bfloat16* bk = nullptr,
                            const __nv_bfloat16* bv = nullptr) {
 #if PLOW_NV_GEMV_MMA
-    if constexpr (MM >= 2) {
+    if constexpr (MM >= 1) {
         if ((K & 31u) == 0u && ((Nq | Nk) & 7u) == 0u) {
             gemv_qkv_rows_mma<BIAS, (MM + 15) / 16>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, slice, nblk, bq, bk, bv);
         } else {
@@ -2337,7 +2337,7 @@ __device__ __forceinline__ void gemv_glu_rows(__nv_bfloat16* C, const __nv_bfloa
                            const __nv_bfloat16* Wg, const __nv_bfloat16* Wu, unsigned M, unsigned N,
                            unsigned K, unsigned act, unsigned slice, unsigned nblk) {
 #if PLOW_NV_GEMV_MMA
-    if constexpr (MM >= 2) {
+    if constexpr (MM >= 1) {
         if ((K & 31u) == 0u) {
             gemv_glu_rows_mma<(MM + 15) / 16>(C, x, Wg, Wu, M, N, K, act, slice, nblk);
         } else {

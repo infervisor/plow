@@ -297,38 +297,44 @@ N_K(n_gemv_qkv) {
  * GEMV -> bf16 -> SOFTCAP -> bf16 -> ARGMAX partial; 4 columns per epilogue. */
 N_K(n_gemv_argmax) {
     (void)ctx;
+    const uint32_t M = in->i[0] ? in->i[0] : 1u;
     const uint32_t N = in->i[1], K = in->i[2];
-    plow_bf16* C = PLOW_CPU_TEN(in, T, 0);
-    const plow_bf16* x = (const plow_bf16*)PLOW_CPU_TEN(in, T, 1) + (size_t)in->i[4] * K;
+    plow_bf16* C_base = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* x_base = (const plow_bf16*)PLOW_CPU_TEN(in, T, 1) + (size_t)in->i[4] * K;
     const plow_bf16* W = PLOW_CPU_TEN(in, T, 2);
-    uint64_t* part = PLOW_CPU_TEN(in, T, 3);
+    uint64_t* part_base = PLOW_CPU_TEN(in, T, 3);
     const float cap = in->fj[0].f;
     const float32x4_t vcap = vdupq_n_f32(cap), vinv = vdupq_n_f32(cap > 0.0f ? 1.0f / cap : 0.0f);
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
-    uint64_t best = 0;
-    float acc[4];
-    uint32_t n = n0;
-    for (; n + 4 <= n1; n += 4) {
-        dot_m1_r4(W + (size_t)n * K, K, x, K, acc);
-        float32x4_t lg = n_round4(vld1q_f32(acc));
-        if (cap > 0.0f) lg = vmulq_f32(vcap, n_tanh(vmulq_f32(lg, vinv)));
-        n_store4(C + n, lg);
-        for (uint32_t j = 0; j < 4; j++) {
-            const uint64_t key = g_amax_pack(C[n + j], n + j);
+    for (uint32_t m = 0; m < M; m++) {
+        plow_bf16* C = C_base + (size_t)m * N;
+        const plow_bf16* x = x_base + (size_t)m * K;
+        uint64_t* part = part_base + (size_t)m * nblk;
+        uint64_t best = 0;
+        float acc[4];
+        uint32_t n = n0;
+        for (; n + 4 <= n1; n += 4) {
+            dot_m1_r4(W + (size_t)n * K, K, x, K, acc);
+            float32x4_t lg = n_round4(vld1q_f32(acc));
+            if (cap > 0.0f) lg = vmulq_f32(vcap, n_tanh(vmulq_f32(lg, vinv)));
+            n_store4(C + n, lg);
+            for (uint32_t j = 0; j < 4; j++) {
+                const uint64_t key = g_amax_pack(C[n + j], n + j);
+                best = key > best ? key : best;
+            }
+        }
+        for (; n < n1; n++) {
+            float o;
+            gemv_rows(W + (size_t)n * K, K, x, K, K, 1, 1, &o);
+            const plow_bf16 lg = plow_f2bf(o);
+            const plow_bf16 sc = cap > 0.0f ? plow_f2bf(cap * tanhf(plow_bf2f(lg) / cap)) : lg;
+            C[n] = sc;
+            const uint64_t key = g_amax_pack(sc, n);
             best = key > best ? key : best;
         }
+        part[slice] = best;
     }
-    for (; n < n1; n++) {
-        float o;
-        gemv_rows(W + (size_t)n * K, K, x, K, K, 1, 1, &o);
-        const plow_bf16 lg = plow_f2bf(o);
-        const plow_bf16 sc = cap > 0.0f ? plow_f2bf(cap * tanhf(plow_bf2f(lg) / cap)) : lg;
-        C[n] = sc;
-        const uint64_t key = g_amax_pack(sc, n);
-        best = key > best ? key : best;
-    }
-    part[slice] = best;
 }
 
 /* Registrar lives in this translation unit (see avx512/gemv.c for why: a standalone

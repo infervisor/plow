@@ -423,7 +423,12 @@ pub(crate) fn packetize_algo_table(
     if rows.is_empty() {
         return Ok(0);
     }
-    let path = out.join("cublaslt_algos.jsonl");
+    let dir = if out.is_dir() {
+        out
+    } else {
+        out.parent().unwrap_or(out)
+    };
+    let path = dir.join("cublaslt_algos.jsonl");
     let text: String = rows.values().map(|l| format!("{l}\n")).collect();
     std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(rows.len())

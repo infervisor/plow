@@ -3,7 +3,10 @@
 
     campaign.py build   <recipe.toml> --out DIR        # base emit -> objects -> role emit
     campaign.py bench   <recipe.toml> --assets DIR --out DIR [--concs "1 4"] [--in-lens ...]
-    campaign.py compare <results.csv> [reference.csv]   # ratio table, cell by cell
+    campaign.py compare <results.csv> <reference.csv> [--roofline] [--recipe <recipe.toml>]
+    campaign.py roofline <recipe.toml> [--results results.csv]
+    campaign.py loop    <recipe.toml> [--out DIR] [--profile realtime]
+    campaign.py sweep   <recipe.toml> --param KNOB --values V1,V2 [--out DIR]
     campaign.py ledger  <results.csv> --cell NAME --note TEXT [--provisional]
 
 The recipe pins everything that decides a number: checkpoint revision, precision, emit
@@ -24,6 +27,10 @@ import sys
 import time
 import tomllib
 from pathlib import Path
+
+# Add scripts/campaign to path for roofline module
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from roofline import generate_roofline_report, lookup_gpu, lookup_model
 
 REPO = Path(__file__).resolve().parents[2]
 GPULEASE = REPO / "perf-data" / "tools" / "gpulease"
@@ -302,6 +309,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         print("campaign: GPU was contended -- recorded as provisional", file=sys.stderr)
     if a.reference or r.get("reference"):
         compare(out / "results.csv", Path(a.reference or REPO / r["reference"]["csv"]))
+    print("\n" + generate_roofline_report(Path(a.recipe), out / "results.csv"))
 
 
 # ---------------------------------------------------------------- probe
@@ -489,6 +497,173 @@ def compare(res: Path, ref: Path) -> None:
 
 def cmd_compare(a: argparse.Namespace) -> None:
     compare(Path(a.results), Path(a.reference))
+    if getattr(a, "roofline", False):
+        recipe_path = None
+        if getattr(a, "recipe", None):
+            recipe_path = Path(a.recipe)
+        else:
+            rec_file = Path(a.results).parent / "run-record.json"
+            if rec_file.is_file():
+                try:
+                    rec = json.loads(rec_file.read_text())
+                    if "recipe" in rec:
+                        recipe_path = Path(rec["recipe"])
+                except Exception:
+                    pass
+        if recipe_path and recipe_path.is_file():
+            print("\n" + generate_roofline_report(recipe_path, Path(a.results)))
+        else:
+            print("\n(roofline report: pass --recipe <recipe.toml> or place run-record.json beside results to calculate % roofline achieved)")
+
+
+def cmd_roofline(a: argparse.Namespace) -> None:
+    print(generate_roofline_report(Path(a.recipe), Path(a.results) if a.results else None))
+
+
+# ---------------------------------------------------------------- loop (closed-loop bring-up)
+def cmd_loop(a: argparse.Namespace) -> None:
+    """Closed-loop bring-up and optimization:
+    Doctor check -> Build/Emit -> Probe BLAS -> Lease & Bench -> Roofline & Baseline Compare -> Bottleneck Identification.
+    """
+    r = load(a.recipe)
+    cell = r["cell"]
+    recipe_path = Path(a.recipe).resolve()
+    base_out = Path(a.out or f"/tmp/plow-campaign/{cell['name']}").resolve()
+    base_out.mkdir(parents=True, exist_ok=True)
+    build_dir = base_out / "build"
+    bench_dir = base_out / "bench"
+
+    print(f"=== Starting Optimization Loop: {cell['name']} ===", file=sys.stderr)
+
+    # 1. Pre-flight doctor check
+    if not a.skip_doctor:
+        print("[1/5] Pre-flight doctor check...", file=sys.stderr)
+        doc_cmd = ["bash", str(REPO / "scripts" / "bench" / "plowbench-doctor.sh"), "", "", "", cell.get("arch", "")]
+        rc = subprocess.run(nix(doc_cmd), cwd=REPO).returncode
+        if rc == 1:
+            die("pre-flight doctor check FAILED. Fix environment or artifacts before continuing.")
+        print("  Doctor check passed.", file=sys.stderr)
+
+    # 2. Build
+    print(f"[2/5] Building {cell['name']}...", file=sys.stderr)
+    build_args = argparse.Namespace(
+        recipe=str(recipe_path),
+        out=str(build_dir),
+        env=a.env or [],
+        no_probe=a.no_probe,
+        store_cell=getattr(a, "store_cell", None),
+    )
+    if not (build_dir / "assets" / "model.pkt").exists():
+        cmd_build(build_args)
+    else:
+        print(f"  Reusing existing build at {build_dir}", file=sys.stderr)
+
+    assets_dir = build_dir / "assets"
+
+    # 3. Probe (if applicable and not skipped)
+    if not a.no_probe and not (assets_dir / "cublaslt_algos.jsonl").exists():
+        print("[3/5] Probing cuBLASLt algorithms...", file=sys.stderr)
+        probe_args = argparse.Namespace(
+            recipe=str(recipe_path),
+            assets=str(assets_dir),
+            store_cell=getattr(a, "store_cell", "h100") or "h100",
+            label=f"{cell['name']}-probe",
+            force=False,
+            env=a.env or [],
+        )
+        try:
+            cmd_probe(probe_args)
+        except Exception as e:
+            print(f"  Probe skipped / failed: {e}", file=sys.stderr)
+    else:
+        print("[3/5] Probe step skipped or already present.", file=sys.stderr)
+
+    # 4. Bench
+    print("[4/5] Leasing GPU & running benchmark...", file=sys.stderr)
+    bench_args = argparse.Namespace(
+        recipe=str(recipe_path),
+        assets=str(assets_dir),
+        out=str(bench_dir),
+        concs=a.concs,
+        in_lens=a.in_lens,
+        label=a.label,
+        reference=a.reference,
+        env=a.env or [],
+        profile=a.profile,
+    )
+    cmd_bench(bench_args)
+
+    # 5. Roofline & Bottleneck Diagnosis
+    print("\n[5/5] Roofline Analysis & Bottleneck Identification:", file=sys.stderr)
+    results_csv = bench_dir / "results.csv"
+    if results_csv.is_file():
+        print(generate_roofline_report(recipe_path, results_csv))
+    print(f"\nOptimization loop complete. Artifacts in: {base_out}")
+
+
+# ---------------------------------------------------------------- sweep
+def cmd_sweep(a: argparse.Namespace) -> None:
+    """Sweep a parameter across candidate values, benchmark each, compare against baseline, and rank."""
+    r = load(a.recipe)
+    cell = r["cell"]
+    recipe_path = Path(a.recipe).resolve()
+    base_out = Path(a.out or f"/tmp/plow-campaign/sweep-{cell['name']}-{a.param}").resolve()
+    base_out.mkdir(parents=True, exist_ok=True)
+    values = [v.strip() for v in a.values.split(",") if v.strip()]
+    if not values:
+        die("no values specified for sweep")
+
+    print(f"=== Parameter Sweep: {a.param} across {values} ===", file=sys.stderr)
+    sweep_results = {}
+    for val in values:
+        run_label = f"{a.param}_{val}"
+        run_out = base_out / run_label
+        print(f"\n--- Arm: {a.param}={val} ---", file=sys.stderr)
+        build_dir = run_out / "build"
+        bench_dir = run_out / "bench"
+        env_override = [f"{a.param}={val}", *(a.env or [])]
+
+        build_args = argparse.Namespace(
+            recipe=str(recipe_path),
+            out=str(build_dir),
+            env=env_override,
+            no_probe=True,
+            store_cell=None,
+        )
+        if not (build_dir / "assets" / "model.pkt").exists():
+            cmd_build(build_args)
+
+        bench_args = argparse.Namespace(
+            recipe=str(recipe_path),
+            assets=str(build_dir / "assets"),
+            out=str(bench_dir),
+            concs=a.concs,
+            in_lens=a.in_lens,
+            label=f"{cell['name']}-{run_label}",
+            reference=a.reference,
+            env=env_override,
+            profile=a.profile,
+        )
+        cmd_bench(bench_args)
+        if (bench_dir / "results.csv").is_file():
+            sweep_results[val] = read_rows(bench_dir / "results.csv")
+
+    # Summary table across sweep values
+    print(f"\n=== Sweep Summary: {a.param} ===")
+    ref_rows = read_rows(Path(a.reference or REPO / r["reference"]["csv"])) if (a.reference or r.get("reference")) else {}
+    for val, rows in sweep_results.items():
+        print(f"\nConfiguration: {a.param}={val}")
+        for k in sorted(rows):
+            cur = rows[k]
+            ref = ref_rows.get(k)
+            tpot_s = f"{float(cur['tpot_ms']):.2f} ms"
+            ttft_s = f"{float(cur['ttft_ms']):.2f} ms"
+            vs_ref = ""
+            if ref:
+                ratio_tpot = float(cur['tpot_ms']) / float(ref['tpot_ms'])
+                ratio_ttft = float(cur['ttft_ms']) / float(ref['ttft_ms'])
+                vs_ref = f"(vs ref: TTFT {ratio_ttft:.2f}x, TPOT {ratio_tpot:.2f}x)"
+            print(f"  in={k[0]:<5} C={k[1]:<2} | TTFT: {ttft_s:>9} | TPOT: {tpot_s:>8} | {vs_ref}")
 
 
 # ---------------------------------------------------------------- ledger
@@ -540,7 +715,20 @@ def main() -> None:
     ce.add_argument("--neutral", action="append", metavar="METRIC", help="metric expected unchanged (e.g. tpot_ms)")
     ce.add_argument("--neutral-evidence"); ce.add_argument("--fact", action="append")
     ce.add_argument("--out", required=True, help="work dir for ledger.jsonl and request.json"); ce.set_defaults(f=cmd_cert)
-    c = sp.add_parser("compare"); c.add_argument("results"); c.add_argument("reference"); c.set_defaults(f=cmd_compare)
+    c = sp.add_parser("compare"); c.add_argument("results"); c.add_argument("reference")
+    c.add_argument("--roofline", action="store_true", help="display roofline analysis alongside comparison")
+    c.add_argument("--recipe", help="optional recipe path to use for roofline geometry")
+    c.set_defaults(f=cmd_compare)
+    rf = sp.add_parser("roofline"); rf.add_argument("recipe"); rf.add_argument("--results"); rf.set_defaults(f=cmd_roofline)
+    lp = sp.add_parser("loop"); lp.add_argument("recipe"); lp.add_argument("--out"); lp.add_argument("--profile")
+    lp.add_argument("--concs"); lp.add_argument("--in-lens"); lp.add_argument("--label"); lp.add_argument("--reference")
+    lp.add_argument("--env", action="append", metavar="K=V"); lp.add_argument("--no-probe", action="store_true")
+    lp.add_argument("--skip-doctor", action="store_true"); lp.set_defaults(f=cmd_loop)
+    sw = sp.add_parser("sweep"); sw.add_argument("recipe"); sw.add_argument("--param", required=True)
+    sw.add_argument("--values", required=True, help="comma-separated list of parameter values")
+    sw.add_argument("--out"); sw.add_argument("--profile"); sw.add_argument("--concs"); sw.add_argument("--in-lens")
+    sw.add_argument("--reference"); sw.add_argument("--env", action="append", metavar="K=V")
+    sw.set_defaults(f=cmd_sweep)
     l = sp.add_parser("ledger"); l.add_argument("results"); l.add_argument("--cell", required=True); l.add_argument("--note", required=True)
     l.add_argument("--provisional", action="store_true"); l.set_defaults(f=cmd_ledger)
     a = p.parse_args()

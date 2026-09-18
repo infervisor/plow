@@ -778,6 +778,11 @@ impl DevBlob {
         self.prefill_phase().collect()
     }
 
+    /// Every modular block program in table order.
+    pub fn modular_block_progs(&self) -> Vec<&DevProg> {
+        self.progs.iter().filter(|p| p.role.is_modular_block()).collect()
+    }
+
     /// Decode rung programs in ascending width order; dense-exact rungs are not ladder rungs.
     pub fn decode_progs(&self) -> Vec<&DevProg> {
         let mut out: Vec<&DevProg> = self

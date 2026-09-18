@@ -452,10 +452,53 @@ The model completes bringup when **all** hold:
 
 ---
 
+## Modern Campaign Driver, Roofline Modeling, and Closed Loop Workflow
+
+The unified campaign driver in `scripts/campaign/campaign.py` orchestrates the complete bring-up and verification cycle across hardware targets (NVIDIA `sm_90a`, `sm_120`, `sm_89` and AMD `gfx942`, `gfx950`):
+
+1. **Pre-flight Check (`scripts/bench/plowbench-doctor.sh`)**:
+   Automatically identifies the active target architecture (e.g. `sm_90a` vs `gfx942`), checks the shell environment (`ROCM_PATH` / `CUDA_PATH`), hazardous `PLOW_*` leftovers, compiler binaries, vendor artifacts (`.cubin` objects for NVIDIA vs `.co`/`.elf` kernels for AMD), and `gpulease` availability before touching a leased GPU.
+
+2. **Automated Closed Loop (`campaign.py loop <recipe.toml>`)**:
+   Executes the full bring-up cycle in one command:
+   ```bash
+   nix develop --command python3 scripts/campaign/campaign.py loop \
+       scripts/campaign/recipes/gemma4-12b.h100.bf16-roles.toml \
+       --out /tmp/campaign/gemma4-12b --profile realtime
+   ```
+   Cycle steps:
+   - Doctor check (halts early on missing vendor artifacts or hazardous environment)
+   - Emit & object build (`cmd_build`)
+   - Algorithm tuning probe (`cmd_probe`)
+   - Leased execution & benchmarking (`cmd_bench` under `gpulease`)
+   - Roofline evaluation & baseline comparison (`compare --roofline`)
+   - Bottleneck diagnosis
+
+3. **Theoretical & Empirical Roofline Modeling (`scripts/campaign/roofline.py` & `crates/costmodel/src/roofline.rs`)**:
+   Computes theoretical hardware limits and evaluates achieved efficiency:
+   - **Decode TPOT**: calculates total weight + KV bytes moved per step, compares against measured/datasheet memory bandwidth (`GB/s`), and outputs `% of memory roofline`.
+   - **Prefill TTFT**: calculates GEMM + causal attention FLOPs, computes arithmetic intensity vs hardware ridge point, compares against peak matrix compute (`TFLOP/s`), and outputs `% of compute roofline`.
+   - **Bottleneck Diagnosis**: automatically identifies whether the model is memory-bandwidth saturated, compute-bound, or limited by dispatch/launch overhead.
+
+4. **Multi-Parameter Optimization Sweeps (`campaign.py sweep`)**:
+   Explores parameter spaces (e.g. chunk sizes, multistep decode, batch ladders) to converge on optimal configurations:
+   ```bash
+   python3 scripts/campaign/campaign.py sweep \
+       scripts/campaign/recipes/gemma4-12b.h100.bf16-plain.toml \
+       --param PLOW_MAX_CHUNK --values 2048,4096,8192
+   ```
+
+---
+
 ## Code / harness pointers
 
 | path | role |
 |---|---|
+| `scripts/bench/plowbench-doctor.sh` | pre-flight environment & artifact verification (target-aware sm_90a/120/89 vs gfx942/950) |
+| `scripts/bench/plowbench.sh` | canonical bench library: port allocation, server lifecycle, arch detection, artifact checks |
+| `scripts/campaign/campaign.py` | unified campaign driver: `build`, `bench`, `probe`, `cert`, `compare`, `roofline`, `loop`, `sweep`, `ledger` |
+| `scripts/campaign/roofline.py` | roofline analysis, memory bandwidth/compute ceilings, and bottleneck diagnostics |
+| `crates/costmodel/src/roofline.rs` | in-tree Rust cost model roofline analysis module |
 | `perf-data/tools/gpulease` | advisory lease + contention audit (rc=76 = contended) |
 | `perf-data/tools/bringup_gate.sh` | token-identity correctness gate |
 | `perf-data/tools/bringup_bench.sh` | one client pass (`vllm bench serve`), appends `cells.tsv` |

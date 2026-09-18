@@ -604,6 +604,7 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::GemmGlu
                 | DevOp::GemvGlu
                 | DevOp::GemvQkv
+                | DevOp::GemvArgmax
                 | DevOp::Embed
                 | DevOp::Argmax
                 | DevOp::ArgmaxFin

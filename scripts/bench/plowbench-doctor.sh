@@ -17,9 +17,17 @@ source "$HERE/plowbench.sh"
 ASSETS="${1:-${PB_ASSETS:-}}"
 OBJDIR="${2:-${PLOW_HSACO:-}}"
 PLOWRT="${3:-${PLOWRT_BIN:-$WT/target/release/plowrt}}"
+ARCH=$(pb_detect_arch "${4:-${PB_ARCH:-${TARGET_ARCH:-}}}" "$ASSETS" "$OBJDIR")
 
 echo "plowbench-doctor  $(date -u +%FT%TZ)"
-echo "  worktree: $WT"
+echo "  worktree:    $WT"
+echo "  target arch: $ARCH"
+if command -v nvidia-smi >/dev/null 2>&1; then
+    gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^[ \t]*//')
+    [ -n "$gpu_name" ] && echo "  device:      $gpu_name (NVIDIA)"
+elif command -v rocm-smi >/dev/null 2>&1; then
+    echo "  device:      ROCm device"
+fi
 echo
 
 echo "[1] environment"
@@ -35,8 +43,8 @@ pb_hazard_env
 
 echo
 echo "[3] binaries"
-pb_check_plowrt "$PLOWRT"
-pb_check_vllm
+pb_check_plowrt "$PLOWRT" "$ARCH"
+pb_check_vllm "$ARCH"
 # plowc is needed only for emit, and lives in a per-campaign target dir more often than not.
 for c in "$WT/target/release/plowc" "$WT/target-glm53/release/plowc"; do
     [ -x "$c" ] && { pb_ok "plowc $c"; break; }
@@ -50,14 +58,20 @@ else
     pb_warn "no assets dir given — pass one, or set PB_ASSETS, to check the packet"
 fi
 if [ -n "$OBJDIR" ]; then
-    pb_check_objects "$OBJDIR"
+    pb_check_objects "$OBJDIR" "$ARCH"
 else
     pb_warn "no object dir given — pass one, or set PLOW_HSACO, to check the object set"
 fi
 
 echo
 echo "[5] GPUs and the queue"
-LEASE=/app/plow/perf-data/tools/gpulease
+LEASE=""
+for l in "$WT/perf-data/tools/gpulease" /app/plow/perf-data/tools/gpulease; do
+    if [ -x "$l" ]; then LEASE="$l"; break; fi
+done
+if [ -z "$LEASE" ] && command -v gpulease >/dev/null 2>&1; then
+    LEASE="$(command -v gpulease)"
+fi
 if [ -x "$LEASE" ]; then
     pb_ok "gpulease at $LEASE"
     # Print its own words; do not invent a card count from them.

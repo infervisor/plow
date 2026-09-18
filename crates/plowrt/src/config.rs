@@ -93,11 +93,11 @@ pub struct RuntimeConfig {
     pub prefix_cache: bool,
 
     /// Skip the cold-start batch-formation hold when no other request is queued or tokenizing.
-    #[arg(long = "idle-dispatch", env = "PLOW_IDLE_DISPATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "idle-dispatch", env = "PLOW_IDLE_DISPATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub idle_dispatch: bool,
 
     /// Tokenize prompts without computing offsets (same ids).
-    #[arg(long = "encode-fast", env = "PLOW_ENCODE_FAST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "encode-fast", env = "PLOW_ENCODE_FAST", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub encode_fast: bool,
 
     /// Tokenize long prompts in pieces on a pool of this many threads, for tokenizers whose
@@ -198,8 +198,16 @@ pub struct RuntimeConfig {
 
     /// Throughput mode: run prefill chains to completion, skip decode until all
     /// prompts are resident. Trades streaming latency for aggregate tok/s.
-    #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_defer_decode: bool,
+
+    /// Modular block packet execution mode (reusable layer blocks, decoupled attention/FFN).
+    #[arg(long = "block-packets", env = "PLOW_BLOCK_PACKETS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub block_packets: bool,
+
+    /// Modular block prefill pipeline and fine-grained ladder execution.
+    #[arg(long = "pf-modular", env = "PLOW_PF_MODULAR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_modular: bool,
 
     /// AMD inter-token (TBT) target, ms. While requests decode, each tick takes the largest
     /// prefill it can while the predicted tick stays at or under this value; decode rows always
@@ -719,7 +727,7 @@ pub struct NvidiaRuntimeConfig {
     pub l2_place_dispatch: bool,
 
     /// Restore covering bucket-pick policy for prefill chunking.
-    #[arg(long = "pf-cover", env = "PLOW_PF_COVER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "pf-cover", env = "PLOW_PF_COVER", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_cover: bool,
 
     /// Fixed cost of ONE prefill launch, in padded-row equivalents. 0 = old
@@ -766,7 +774,7 @@ pub struct NvidiaRuntimeConfig {
     pub pf_seg_fa256_gqa2: bool,
 
     /// T35: submit each prefill chunk's segment chain as ONE CUDA graph.
-    #[arg(long = "pf-seg-graph", env = "PLOW_PF_SEG_GRAPH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "pf-seg-graph", env = "PLOW_PF_SEG_GRAPH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_graph: bool,
 
     /// Segment-classing v2 ("1") / q8 variant ("q8").
@@ -1878,7 +1886,7 @@ mod tests {
         assert!(defaults.prefix_cache && defaults.token_batch && defaults.pf_batch_amd());
         assert!(!defaults.fusion);
         assert!(
-            !defaults.pf_no_chunk && !defaults.pf_no_interleave && !defaults.pf_defer_decode
+            !defaults.pf_no_chunk && !defaults.pf_no_interleave && defaults.pf_defer_decode
         );
         assert!(!defaults.pf_rotate());
         assert_eq!(defaults.amd.packed_prefill_route, None);

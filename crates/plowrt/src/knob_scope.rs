@@ -77,6 +77,7 @@ fn role_key(role: ProgramRole, insts: &[DevInst64]) -> Key {
         ProgramRole::TokenBatchBody { .. } => ("token_batch", "ordinary"),
         ProgramRole::DenseExactRung { .. } => ("decode", "dense_exact"),
         ProgramRole::RowSplitSibling { .. } => ("prefill", "rowsplit"),
+        ProgramRole::ModularBlock { .. } => ("modular", "block"),
     };
     Key {
         kind,

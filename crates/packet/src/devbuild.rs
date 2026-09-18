@@ -3293,14 +3293,29 @@ pub enum RowSplitArm {
 /// Bit 28 is [`DENSE_EXACT_PROG`].
 pub const ROWSPLIT_PREFILL_PROG: u32 = 1 << 27;
 
+/// [`BlobProgHeader::t`] bit marking a modular building-block program
+/// (e.g. `DenseAttentionBlock`, `DenseFfnBlock`, `EmbeddingBlock`, `FinalNormVocabBlock`).
+/// Allows decoupled, layer-reusable block execution and fine-grained rungs.
+pub const MODULAR_BLOCK_PROG: u32 = 1 << 26;
+
 const PROGRAM_ROLE_BITS: u32 = PACKED_PREFILL_PROG
     | TOKEN_BATCH_PROG
     | DECODE_RUNG_PROG
     | DENSE_EXACT_PROG
-    | ROWSPLIT_PREFILL_PROG;
+    | ROWSPLIT_PREFILL_PROG
+    | MODULAR_BLOCK_PROG;
 
 pub fn program_rows(t: u32) -> u32 {
     t & !PROGRAM_ROLE_BITS
+}
+
+pub fn is_modular_block_program(t: u32) -> bool {
+    t & MODULAR_BLOCK_PROG != 0
+}
+
+pub fn modular_block_program_t(rows: u32) -> u32 {
+    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 26 bits");
+    rows | MODULAR_BLOCK_PROG
 }
 
 pub fn is_dense_exact_program(t: u32) -> bool {
@@ -3411,6 +3426,8 @@ pub enum ProgramRole {
     /// The row-split attention topology of the prefill bucket of the same width
     /// ([`ROWSPLIT_PREFILL_PROG`]). Never selected as a rung of its own.
     RowSplitSibling { of_rows: u32 },
+    /// A modular building-block program ([`MODULAR_BLOCK_PROG`]) for fine-grained rungs or single-block execution.
+    ModularBlock { rows: u32 },
 }
 
 impl ProgramRole {
@@ -3422,8 +3439,13 @@ impl ProgramRole {
             | Self::PackedSibling { of_rows: rows }
             | Self::TokenBatchBody { rows, .. }
             | Self::DenseExactRung { rows }
-            | Self::RowSplitSibling { of_rows: rows } => rows,
+            | Self::RowSplitSibling { of_rows: rows }
+            | Self::ModularBlock { rows } => rows,
         }
+    }
+
+    pub fn is_modular_block(self) -> bool {
+        matches!(self, Self::ModularBlock { .. })
     }
 
     pub fn is_prefill_bucket(self) -> bool {
@@ -3462,7 +3484,7 @@ impl ProgramRole {
     /// Prefill-side: exactly the programs the positional code found below `decode_rung_lo` —
     /// buckets, their packed siblings and the token-batch bodies.
     pub fn is_prefill_side(self) -> bool {
-        !self.is_decode_rung()
+        !self.is_decode_rung() && !self.is_modular_block()
     }
 
     /// The role's name, for a refusal message.
@@ -3474,6 +3496,7 @@ impl ProgramRole {
             Self::TokenBatchBody { .. } => "token-batch body",
             Self::DenseExactRung { .. } => "dense-exact decode rung",
             Self::RowSplitSibling { .. } => "row-split sibling",
+            Self::ModularBlock { .. } => "modular block",
         }
     }
 }
@@ -3539,6 +3562,8 @@ pub fn derive_roles(
                 ProgramRole::RowSplitSibling { of_rows: rows }
             } else if is_dense_exact_program(t) {
                 ProgramRole::DenseExactRung { rows }
+            } else if is_modular_block_program(t) {
+                ProgramRole::ModularBlock { rows }
             } else if is_decode_rung_program(t) || i >= lo {
                 ProgramRole::DecodeRung { rows }
             } else {
