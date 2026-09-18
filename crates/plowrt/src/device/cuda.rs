@@ -1802,6 +1802,13 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
     }
 
     fn set_access(&self, va: u64, bytes: u64) -> Result<()> {
+        self.set_access_batch(&[(va, bytes)])
+    }
+
+    fn set_access_batch(&self, ranges: &[(u64, u64)]) -> Result<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
         self.bind()?;
         let desc = CUmemAccessDesc {
             location: CUmemLocation {
@@ -1810,11 +1817,14 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
             },
             flags: MEM_ACCESS_FLAGS_PROT_READWRITE,
         };
-        // SAFETY: range fully mapped (pool maps before granting access).
-        self.check(
-            unsafe { (self.api.cuMemSetAccess)(va, bytes as usize, &desc, 1) },
-            "cuMemSetAccess",
-        )
+        for &(va, bytes) in ranges {
+            // SAFETY: range fully mapped (pool maps before granting access).
+            self.check(
+                unsafe { (self.api.cuMemSetAccess)(va, bytes as usize, &desc, 1) },
+                "cuMemSetAccess",
+            )?;
+        }
+        Ok(())
     }
 
     fn alloc(&self, bytes: u64) -> Result<u64> {

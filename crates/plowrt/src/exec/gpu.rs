@@ -8539,6 +8539,45 @@ impl GpuEngine {
         Ok(out)
     }
 
+    /// Move planned head KV rows from a source buffer into this engine's device slots.
+    pub(crate) fn write_kv_rows<'a>(
+        &self,
+        plan: &[crate::exec::kv_handoff::CopySpan],
+        src: impl Fn(&crate::exec::kv_handoff::CopySpan) -> Result<&'a [u8]>,
+    ) -> Result<u64> {
+        let mut moved = 0u64;
+        for span in plan {
+            let dst = self.devp.get(span.handle).ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "head handoff names tensor {}, past this packet's {}",
+                    span.handle,
+                    self.devp.len()
+                ))
+            })?;
+            let end = span.dst_off.checked_add(span.bytes).ok_or_else(|| {
+                RuntimeError::Device("head handoff span overflows".into())
+            })?;
+            if end > dst.len {
+                return Err(RuntimeError::Device(format!(
+                    "head handoff writes {}+{} of `{}`, which holds {} bytes",
+                    span.dst_off, span.bytes, self.tensor_names[span.handle], dst.len
+                )));
+            }
+            let bytes = src(span)?;
+            if bytes.len() as u64 != span.bytes {
+                return Err(RuntimeError::Device(format!(
+                    "head handoff source for `{}` is {} bytes, plan says {}",
+                    self.tensor_names[span.handle],
+                    bytes.len(),
+                    span.bytes
+                )));
+            }
+            crate::exec::device_api::EngineDevice::upload(&*self.be, dst, span.dst_off, bytes)?;
+            moved += span.bytes;
+        }
+        Ok(moved)
+    }
+
     /// Upload an f32 slice into a bf16 activation tensor by name (f32 → bf16 by
     /// truncating the low 16 mantissa bits, `(bits >> 16) as u16`). Used by the
     /// block harness to feed `act.x` in. Not a hot path.

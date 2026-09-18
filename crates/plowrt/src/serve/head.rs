@@ -105,6 +105,7 @@ pub struct HeadPool {
     contract: Vec<KvSlotTensor>,
     digest: String,
     pools: Vec<(String, u32)>,
+    head_majors: Vec<(String, kv_handoff::HeadMajorLayout)>,
     rows_per_slot: u32,
     /// Compiled prefill buckets `(program, rows)` — the abandon granularity.
     buckets: Vec<(usize, u32)>,
@@ -142,8 +143,14 @@ impl HeadPool {
         let blob = crate::asset::devblob::DevBlob::parse(&bytes)?;
         let names: Vec<String> = blob.tensors.iter().map(|t| t.name.clone()).collect();
         let mut pools = Vec::new();
+        let mut head_majors = Vec::new();
         for p in &blob.progs {
-            kv_handoff::check_seq_major(&p.insts, &names)?;
+            kv_handoff::check_transferable(&p.insts, &names)?;
+            for entry in kv_handoff::head_major_caches(&p.insts, &names) {
+                if !head_majors.iter().any(|(n, _)| n == &entry.0) {
+                    head_majors.push(entry);
+                }
+            }
             for entry in kv_handoff::pooled_caches(&p.insts, &names) {
                 if !pools.contains(&entry) {
                     pools.push(entry);
@@ -181,6 +188,7 @@ impl HeadPool {
             rows_per_slot,
             caches = contract.len(),
             pooled = pools.len(),
+            head_major = head_majors.len(),
             kv_contract = %digest,
             "CPU prefill head pool ready"
         );
@@ -189,6 +197,7 @@ impl HeadPool {
             contract,
             digest,
             pools,
+            head_majors,
             rows_per_slot,
             buckets,
             slots,
@@ -253,10 +262,11 @@ impl HeadPool {
 
     /// Plan the copies handing `rows` of head slot `src` to device slot `dst`.
     pub(crate) fn plan(&self, src: u32, dst: u32, rows: u32) -> Result<Vec<CopySpan>> {
-        kv_handoff::plan(
+        kv_handoff::plan_with_layout(
             &self.contract,
             self.rows_per_slot,
             &self.pools,
+            &self.head_majors,
             src,
             dst,
             rows,

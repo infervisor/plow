@@ -387,6 +387,9 @@ impl GpuEngine {
                     (base + span.start * hd_b, off, span.first),
                     (base, off + span.first * hd_b, w - span.first),
                 ] {
+                    if rows == 0 {
+                        continue;
+                    }
                     let ring = (dev, v.ring * hd_b);
                     let snapshot = (snap, w * hd_b);
                     let (dst, src) = if to_snap {

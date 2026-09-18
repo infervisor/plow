@@ -68,6 +68,13 @@ pub trait VmmOps: Send + Sync {
     fn unmap(&self, va: u64, bytes: u64);
     /// Grant RW device access to a fully-mapped range.
     fn set_access(&self, va: u64, bytes: u64) -> Result<()>;
+    /// Grant RW device access to multiple mapped ranges in one batch.
+    fn set_access_batch(&self, ranges: &[(u64, u64)]) -> Result<()> {
+        for &(va, bytes) in ranges {
+            self.set_access(va, bytes)?;
+        }
+        Ok(())
+    }
     /// Plain device allocation (sliding-window snapshots).
     fn alloc(&self, bytes: u64) -> Result<u64>;
     fn free(&self, va: u64);
