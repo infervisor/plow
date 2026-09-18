@@ -235,6 +235,7 @@ impl RungController {
             reason = RungReason::Utilization;
         } else if load.queued == 0
             && self.target > 0
+            && load.occupied_extent < self.rungs.width(self.target)
             && self.utilization(self.target - 1, load) <= NARROW_UTIL
         {
             self.low_load_ticks = self.low_load_ticks.saturating_add(1);
@@ -628,5 +629,16 @@ mod tests {
         assert_eq!(c.stats[0].samples, 0);
         assert_eq!(c.service_ms(0), 0.0);
         assert_eq!(c.step_ms(0), 0.0);
+    }
+
+    #[test]
+    fn fully_occupied_target_rung_does_not_narrow() {
+        let mut c = controller(&[1, 2, 4, 8, 16]);
+        c.target = 2; // width 4
+        assert_eq!(c.admission_limit(), 4);
+        for _ in 0..128 {
+            c.decide(load(4, 0));
+        }
+        assert_eq!(c.admission_limit(), 4, "fully occupied target rung must not narrow");
     }
 }

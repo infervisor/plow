@@ -353,6 +353,9 @@ pub struct RuntimeConfig {
     /// carries the siblings costs only their program records.
     #[arg(long = "glm-rowband", env = "PLOW_GLM_ROWBAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub glm_rowband: bool,
+    /// Widest decode rung a serving engine admits (`PLOW_DECODE_MAX_RUNG`); unset = no ceiling.
+    #[arg(long = "decode-max-rung", env = "PLOW_DECODE_MAX_RUNG", global = true)]
+    pub decode_max_rung: Option<u32>,
 
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / observability (shared, off by default)

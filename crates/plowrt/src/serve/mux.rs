@@ -454,6 +454,20 @@ pub fn spawn(
     let rung_widths = gpu_shape.map(|x| x.1);
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let rung_widths: Option<Box<[u32]>> = None;
+    let (capacity, rung_widths) = if let Some(max_rung) = crate::config::RuntimeConfig::get().decode_max_rung {
+        if let Some(widths) = rung_widths {
+            let filtered: Box<[u32]> = widths.iter().copied().filter(|&w| w <= max_rung).collect();
+            if let Some(&widest) = filtered.last() {
+                (capacity.min(widest as usize), Some(filtered))
+            } else {
+                (capacity, Some(widths))
+            }
+        } else {
+            (capacity.min(max_rung as usize), None)
+        }
+    } else {
+        (capacity, rung_widths)
+    };
     let mut rung_controller =
         rung_widths
             .as_deref()

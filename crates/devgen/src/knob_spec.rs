@@ -803,6 +803,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.decode_tiled", Some("PLOW_DECODE_TILED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.l2_place_prefill", Some("PLOW_L2_PLACE_PREFILL"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.fuse_argmax", Some("PLOW_FUSE_ARGMAX"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.sliding_ns_cap", Some("PLOW_SLIDING_NS_CAP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.no_fuse_qkv", Some("PLOW_NO_FUSE_QKV"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fuse_qkv_fp8", Some("PLOW_FUSE_QKV_FP8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.no_fuse_nrn", Some("PLOW_NO_FUSE_NRN"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

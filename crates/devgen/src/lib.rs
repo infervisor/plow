@@ -4581,7 +4581,8 @@ fn emit_phase(
         // byte-identical (the dense goldens pin this); extend the key when the cap is
         // re-measured on those parts — the fp8-KV sweep above picks the same value, so the
         // extension is expected to hold.
-        let cap_bf16_kv = amd && amd_target::active().1 == hwspec::IsaLevel::Gfx942;
+        let cap_bf16_kv = (amd && amd_target::active().1 == hwspec::IsaLevel::Gfx942)
+            || emit_config::active().sliding_ns_cap;
         let ns = if gemv_family && !full && win > 0 && (fp8_kv || cap_bf16_kv) {
             ns.min((win / 64).max(1))
         } else {
