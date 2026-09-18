@@ -212,6 +212,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     | DevOp::Gemm
                     | DevOp::GemmNorm
                     | DevOp::Gemv
+                    | DevOp::GemvArgmax
                     | DevOp::GemvFp8
                     | DevOp::GemvQkv
                     | DevOp::GemvGlu

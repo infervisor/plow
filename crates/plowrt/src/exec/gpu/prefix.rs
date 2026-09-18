@@ -55,11 +55,18 @@ impl GpuEngine {
         live_rings: bool,
         manifest: Option<&plow_asset::live_kv::Manifest>,
     ) -> Result<VmmServe> {
-        let layout = match manifest {
+        let mut layout = match manifest {
             Some(m) => crate::memory::vmm::LiveKvLayout::from_manifest(blob, m)?,
             None => crate::memory::vmm::LiveKvLayout::from_blob(blob)?,
         };
         let config = RuntimeConfig::get();
+        if let Some(rt_ctx) = config.rt_max_ctx {
+            let row_bytes = layout.geometry.row_bytes().max(1);
+            let gran = (config.vmm_block_mib() as u64) << 20;
+            let rows_per_block = ((gran / row_bytes) as u32).max(1);
+            let aligned_ctx = ((rt_ctx as u32 + rows_per_block - 1) / rows_per_block) * rows_per_block;
+            layout.geometry.max_ctx = aligned_ctx;
+        }
         let block_hint = (config.vmm_block_mib() as u64) << 20;
         let rings = if live_rings && !layout.ring_tensors.is_empty() {
             Some(crate::memory::vmm::VmmRings::new(

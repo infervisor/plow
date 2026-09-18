@@ -28,6 +28,7 @@ PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
 PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
 PLOW_SLIDING_NS_CAP = "1"
 PLOW_MAX_CHUNK = "4096"
+PLOW_FUSE_ARGMAX = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
@@ -58,6 +59,7 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 PLOW_PREFIX_CACHE = "0"
 PLOW_PF_SEG_PURE = "1"
 PLOW_PF_SEG_FA512 = "1"
+PLOW_PF_INTERLEAVE = "0"
 PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
 LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
 

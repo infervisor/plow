@@ -3472,12 +3472,24 @@ impl GpuEngine {
                 v.rings.as_ref().and_then(|rings| rings.tensor_va(id))
             }
         };
+        let config = RuntimeConfig::get();
         let slab_bytes: u64 = blob
             .tensors
             .iter()
             .enumerate()
             .filter(|(id, _)| vmm_va_of(*id).is_none())
-            .map(|(_, td)| carve_bytes(td.bytes))
+            .map(|(_, td)| {
+                let bytes = if td.name == "in.pos" {
+                    if let Some(rt_ctx) = config.rt_max_ctx {
+                        td.bytes.max((rt_ctx * 4) as u64)
+                    } else {
+                        td.bytes
+                    }
+                } else {
+                    td.bytes
+                };
+                carve_bytes(bytes)
+            })
             .sum();
         // Brought up BEFORE the checkpoint opens: the VMM reserve returns in
         // µs and its mapper then commits pages concurrently with the open,
@@ -3644,19 +3656,28 @@ impl GpuEngine {
                 let t_alloc =
                     (load_prof && vmm_va.is_none() && matches!(weight_slab, WeightSlab::PerTensor))
                         .then(std::time::Instant::now);
+                let tensor_bytes = if td.name == "in.pos" {
+                    if let Some(rt_ctx) = config.rt_max_ctx {
+                        td.bytes.max((rt_ctx * 4) as u64)
+                    } else {
+                        td.bytes
+                    }
+                } else {
+                    td.bytes
+                };
                 let mem = match (vmm_va, &weight_slab) {
                     (Some(va), _) => DeviceMem::view(va, td.bytes),
                     (None, WeightSlab::Vmm(slab)) => {
-                        let m = DeviceMem::view(slab.base() + slab_off, td.bytes);
-                        slab_off += carve_bytes(td.bytes);
+                        let m = DeviceMem::view(slab.base() + slab_off, tensor_bytes);
+                        slab_off += carve_bytes(tensor_bytes);
                         m
                     }
                     (None, WeightSlab::Flat(slab)) => {
-                        let m = DeviceMem::view(slab.base + slab_off, td.bytes);
-                        slab_off += carve_bytes(td.bytes);
+                        let m = DeviceMem::view(slab.base + slab_off, tensor_bytes);
+                        slab_off += carve_bytes(tensor_bytes);
                         m
                     }
-                    (None, WeightSlab::PerTensor) => be.alloc(0, td.bytes)?,
+                    (None, WeightSlab::PerTensor) => be.alloc(0, tensor_bytes)?,
                 };
                 if let (Some(t), Some(tm)) = (t_alloc, load_tim.as_mut()) {
                     tm.note_alloc(td.bytes, t.elapsed().as_secs_f64() * 1e3, true);
@@ -4316,7 +4337,7 @@ impl GpuEngine {
         // prefill chunk positions and the B decode positions).
         let vocab = (blob.tensors[t_logits].bytes / 2) as usize / batch;
         let packet_max_ctx = (blob.tensors[t_pos].bytes / 4) as usize;
-        let max_ctx = config.rt_max_ctx.unwrap_or(packet_max_ctx).min(packet_max_ctx);
+        let max_ctx = config.rt_max_ctx.unwrap_or(packet_max_ctx);
 
         // Per-slot stride of every batch-major KV or recurrent-state tensor (slot b of
         // tensor i lives at base + b*stride). B==1: strides never used.
