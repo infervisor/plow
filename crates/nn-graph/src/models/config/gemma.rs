@@ -2,6 +2,19 @@
 
 use serde::Deserialize;
 
+/// Deserialize a field that may be present-as-`null` (e.g. Gemma-4-E2B writes
+/// `num_global_key_value_heads: null`, `global_head_dim: null` for its dense/no-global
+/// config). `#[serde(default)]` only covers ABSENT keys, so an explicit null still errors on a
+/// non-`Option` field; this maps null → the type's default (0 here, which every reader treats as
+/// "absent"). Applied only to the "0 ⇒ same/absent" Gemma-4 numeric fields.
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct GemmaConfig {
@@ -37,9 +50,11 @@ pub struct GemmaConfig {
     /// `sliding_window_pattern`).
     pub layer_types: Vec<String>,
     /// Head dim used by full-attention (global) layers; 0 ⇒ same as `head_dim`.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub global_head_dim: u32,
     /// KV heads used by full-attention (global) layers; 0 ⇒ same as
     /// `num_key_value_heads`.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub num_global_key_value_heads: u32,
     /// Gemma4 full-attention layers derive V from K; sliding layers keep V.
     pub attention_k_eq_v: bool,

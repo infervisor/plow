@@ -25,7 +25,11 @@ import shlex
 import subprocess
 import sys
 import time
-import tomllib
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # Apple dev box ships 3.9
+    import tomli as tomllib  # type: ignore
 from pathlib import Path
 
 # Add scripts/campaign to path for roofline module

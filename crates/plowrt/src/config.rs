@@ -459,6 +459,15 @@ pub struct AppleRuntimeConfig {
     /// Use the dedicated MXFP4 Metal pipeline.
     #[arg(long = "metal-mx4-dedicated", env = "PLOW_METAL_MX4_DEDICATED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mx4_dedicated: bool,
+    /// Reuse one plain-BF16 projection weight load across two decode rows (batched-decode kernels).
+    #[arg(long = "metal-bf16-m2", env = "PLOW_METAL_BF16_M2", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub bf16_m2: bool,
+    /// Reuse one plain-BF16 projection weight load across four decode rows.
+    #[arg(long = "metal-bf16-m4", env = "PLOW_METAL_BF16_M4", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub bf16_m4: bool,
+    /// Reuse one plain-BF16 projection weight load across eight decode rows.
+    #[arg(long = "metal-bf16-m8", env = "PLOW_METAL_BF16_M8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub bf16_m8: bool,
     /// CPU decode column share: percent[:instruction count].
     #[arg(long = "apple-cpu-share", env = "PLOW_CPU_SHARE", global = true)]
     pub cpu_share: Option<String>,
@@ -1580,7 +1589,10 @@ impl RuntimeConfig {
     /// has always called it `rt.multistep`, and both the NVIDIA device-multistep object and the
     /// AMD deferred-read quantum are driven by it. Read it through here — the AMD tick used to
     /// reach into `self.nv.multistep` directly and so missed the env-compat path entirely.
-    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    ///
+    /// Gated to match its `run_one_tick` caller (`cfg(any(cuda, hsa, cpu))`): the CPU/Metal
+    /// tick reads the same nominal quantum, so the `cpu` build needs this method too.
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub(crate) fn multistep(&self) -> u32 {
         select_compat(
             self.nv.multistep,

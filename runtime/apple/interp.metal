@@ -303,6 +303,154 @@ inline float row_ss(device const ushort* x, uint K, uint lane) {
 
 // ---- GEMV family ---------------------------------------------------------------------------------
 // t0=C t1=x t2=W t3=rms? t4=gamma? t7=bias?  i0=M i1=N i2=K i3=norm i4=a_row0  f0=eps
+#ifdef PLOW_BF16_M2
+inline float4 dot_glu_bf16_pair(device const ushort* Wg, device const ushort* Wu,
+                               device const ushort* x, uint K, uint lane) {
+    float4 acc = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 x0 = bf4(*(device const ushort4*)(x + k));
+        float4 x1 = bf4(*(device const ushort4*)(x + k + 4u));
+        float4 y0 = bf4(*(device const ushort4*)(x + K + k));
+        float4 y1 = bf4(*(device const ushort4*)(x + K + k + 4u));
+        float4 g0 = bf4(*(device const ushort4*)(Wg + k));
+        float4 g1 = bf4(*(device const ushort4*)(Wg + k + 4u));
+        float4 u0 = bf4(*(device const ushort4*)(Wu + k));
+        float4 u1 = bf4(*(device const ushort4*)(Wu + k + 4u));
+        acc.x += dot(g0, x0) + dot(g1, x1);
+        acc.y += dot(u0, x0) + dot(u1, x1);
+        acc.z += dot(g0, y0) + dot(g1, y1);
+        acc.w += dot(u0, y0) + dot(u1, y1);
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float xv = bf2f(x[k]), yv = bf2f(x[K + k]);
+        float gv = bf2f(Wg[k]), uv = bf2f(Wu[k]);
+        acc.x += gv * xv;
+        acc.y += uv * xv;
+        acc.z += gv * yv;
+        acc.w += uv * yv;
+    }
+    return float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w));
+}
+inline void dot4_bf16_pair(device const ushort* W, uint ldw, device const ushort* x,
+                          uint K, uint lane, thread float4& a0, thread float4& a1) {
+    float4 acc0 = 0.0f, acc1 = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 x0 = bf4(*(device const ushort4*)(x + k));
+        float4 x1 = bf4(*(device const ushort4*)(x + k + 4u));
+        float4 y0 = bf4(*(device const ushort4*)(x + K + k));
+        float4 y1 = bf4(*(device const ushort4*)(x + K + k + 4u));
+        for (uint r = 0; r < 4u; r++) {
+            device const ushort* w = W + r * ldw + k;
+            float4 w0 = bf4(*(device const ushort4*)w);
+            float4 w1 = bf4(*(device const ushort4*)(w + 4u));
+            acc0[r] += dot(w0, x0) + dot(w1, x1);
+            acc1[r] += dot(w0, y0) + dot(w1, y1);
+        }
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float xv = bf2f(x[k]), yv = bf2f(x[K + k]);
+        for (uint r = 0; r < 4u; r++) {
+            float wv = bf2f(W[r * ldw + k]);
+            acc0[r] += wv * xv;
+            acc1[r] += wv * yv;
+        }
+    }
+    a0 = float4(simd_sum(acc0.x), simd_sum(acc0.y), simd_sum(acc0.z), simd_sum(acc0.w));
+    a1 = float4(simd_sum(acc1.x), simd_sum(acc1.y), simd_sum(acc1.z), simd_sum(acc1.w));
+}
+#endif
+#ifdef PLOW_BF16_M4
+inline float4 dot_bf16_quad(device const ushort* W, device const ushort* x,
+                           uint K, uint lane) {
+    float4 acc = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 w0 = bf4(*(device const ushort4*)(W + k));
+        float4 w1 = bf4(*(device const ushort4*)(W + k + 4u));
+        for (uint m = 0; m < 4u; m++) {
+            device const ushort* xm = x + m * K + k;
+            float4 x0 = bf4(*(device const ushort4*)xm);
+            float4 x1 = bf4(*(device const ushort4*)(xm + 4u));
+            acc[m] += dot(w0, x0) + dot(w1, x1);
+        }
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float wv = bf2f(W[k]);
+        for (uint m = 0; m < 4u; m++) acc[m] += wv * bf2f(x[m * K + k]);
+    }
+    return float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w));
+}
+inline void dot4_bf16_quad(device const ushort* W, uint ldw, device const ushort* x,
+                          uint K, uint lane, thread float4& a0, thread float4& a1,
+                          thread float4& a2, thread float4& a3) {
+    float4 acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 x0 = bf4(*(device const ushort4*)(x + k));
+        float4 x1 = bf4(*(device const ushort4*)(x + k + 4u));
+        float4 y0 = bf4(*(device const ushort4*)(x + K + k));
+        float4 y1 = bf4(*(device const ushort4*)(x + K + k + 4u));
+        float4 z0 = bf4(*(device const ushort4*)(x + 2u * K + k));
+        float4 z1 = bf4(*(device const ushort4*)(x + 2u * K + k + 4u));
+        float4 t0 = bf4(*(device const ushort4*)(x + 3u * K + k));
+        float4 t1 = bf4(*(device const ushort4*)(x + 3u * K + k + 4u));
+        for (uint r = 0; r < 4u; r++) {
+            device const ushort* w = W + r * ldw + k;
+            float4 w0 = bf4(*(device const ushort4*)w);
+            float4 w1 = bf4(*(device const ushort4*)(w + 4u));
+            acc0[r] += dot(w0, x0) + dot(w1, x1);
+            acc1[r] += dot(w0, y0) + dot(w1, y1);
+            acc2[r] += dot(w0, z0) + dot(w1, z1);
+            acc3[r] += dot(w0, t0) + dot(w1, t1);
+        }
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float xv = bf2f(x[k]), yv = bf2f(x[K + k]);
+        float zv = bf2f(x[2u * K + k]), tv = bf2f(x[3u * K + k]);
+        for (uint r = 0; r < 4u; r++) {
+            float wv = bf2f(W[r * ldw + k]);
+            acc0[r] += wv * xv;
+            acc1[r] += wv * yv;
+            acc2[r] += wv * zv;
+            acc3[r] += wv * tv;
+        }
+    }
+    a0 = float4(simd_sum(acc0.x), simd_sum(acc0.y), simd_sum(acc0.z), simd_sum(acc0.w));
+    a1 = float4(simd_sum(acc1.x), simd_sum(acc1.y), simd_sum(acc1.z), simd_sum(acc1.w));
+    a2 = float4(simd_sum(acc2.x), simd_sum(acc2.y), simd_sum(acc2.z), simd_sum(acc2.w));
+    a3 = float4(simd_sum(acc3.x), simd_sum(acc3.y), simd_sum(acc3.z), simd_sum(acc3.w));
+}
+#endif
+#ifdef PLOW_BF16_M8
+inline void dot_bf16_octet(device const ushort* W, device const ushort* x, uint K, uint lane,
+                          thread float4& a0, thread float4& a1) {
+    float4 acc0 = 0.0f, acc1 = 0.0f;
+    uint k = lane * 8u;
+    for (; k + 8u <= K; k += 256u) {
+        float4 w0 = bf4(*(device const ushort4*)(W + k));
+        float4 w1 = bf4(*(device const ushort4*)(W + k + 4u));
+        for (uint m = 0; m < 4u; m++) {
+            device const ushort* xm = x + m * K + k;
+            device const ushort* ym = xm + 4u * K;
+            acc0[m] += dot(w0, bf4(*(device const ushort4*)xm))
+                + dot(w1, bf4(*(device const ushort4*)(xm + 4u)));
+            acc1[m] += dot(w0, bf4(*(device const ushort4*)ym))
+                + dot(w1, bf4(*(device const ushort4*)(ym + 4u)));
+        }
+    }
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
+        float wv = bf2f(W[k]);
+        for (uint m = 0; m < 4u; m++) {
+            acc0[m] += wv * bf2f(x[m * K + k]);
+            acc1[m] += wv * bf2f(x[(m + 4u) * K + k]);
+        }
+    }
+    a0 = float4(simd_sum(acc0.x), simd_sum(acc0.y), simd_sum(acc0.z), simd_sum(acc0.w));
+    a1 = float4(simd_sum(acc1.x), simd_sum(acc1.y), simd_sum(acc1.z), simd_sum(acc1.w));
+}
+#endif
 void op_gemv(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint sg, uint lane) {
     uint M = in.i[0], N = in.i[1], K = in.i[2], norm = in.i[3];
     device ushort* C = ten<ushort>(tab, in, 0);
@@ -314,6 +462,118 @@ void op_gemv(const thread Inst& in, device const ulong* tab, uint slice, uint nb
     float eps = as_type<float>(in.fj[0]);
     uint n0, n1;
     range(N, slice, nblk, n0, n1);
+#ifdef PLOW_BF16_M8
+    if (M == 8u && norm == 0u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float4 a0, a1;
+            dot_bf16_octet(W + n * K, x, K, lane, a0, a1);
+            if (bias) {
+                float b = bf2f(bias[n]);
+                a0 += b;
+                a1 += b;
+            }
+            if (lane == 0) {
+                C[n] = f2bf(a0.x);
+                C[N + n] = f2bf(a0.y);
+                C[2u * N + n] = f2bf(a0.z);
+                C[3u * N + n] = f2bf(a0.w);
+                C[4u * N + n] = f2bf(a1.x);
+                C[5u * N + n] = f2bf(a1.y);
+                C[6u * N + n] = f2bf(a1.z);
+                C[7u * N + n] = f2bf(a1.w);
+            }
+        }
+        return;
+    }
+#endif
+#ifdef PLOW_BF16_M4
+    if (M == 8u && norm == 0u && (n0 % 4u) == 0u && (n1 % 4u) == 0u) {
+        for (uint n = n0 + sg * 4u; n + 4u <= n1; n += NSG * 4u) {
+            {
+                float4 a0, a1, a2, a3;
+                dot4_bf16_quad(W + n * K, K, x, K, lane, a0, a1, a2, a3);
+                if (bias) {
+                    float4 b = float4(bf2f(bias[n]), bf2f(bias[n + 1u]),
+                                      bf2f(bias[n + 2u]), bf2f(bias[n + 3u]));
+                    a0 += b; a1 += b; a2 += b; a3 += b;
+                }
+                if (lane == 0) {
+                    C[n] = f2bf(a0.x); C[n + 1u] = f2bf(a0.y);
+                    C[n + 2u] = f2bf(a0.z); C[n + 3u] = f2bf(a0.w);
+                    C[N + n] = f2bf(a1.x); C[N + n + 1u] = f2bf(a1.y);
+                    C[N + n + 2u] = f2bf(a1.z); C[N + n + 3u] = f2bf(a1.w);
+                    C[2u * N + n] = f2bf(a2.x); C[2u * N + n + 1u] = f2bf(a2.y);
+                    C[2u * N + n + 2u] = f2bf(a2.z); C[2u * N + n + 3u] = f2bf(a2.w);
+                    C[3u * N + n] = f2bf(a3.x); C[3u * N + n + 1u] = f2bf(a3.y);
+                    C[3u * N + n + 2u] = f2bf(a3.z); C[3u * N + n + 3u] = f2bf(a3.w);
+                }
+            }
+            {
+                float4 a0, a1, a2, a3;
+                dot4_bf16_quad(W + n * K, K, x + 4u * K, K, lane, a0, a1, a2, a3);
+                if (bias) {
+                    float4 b = float4(bf2f(bias[n]), bf2f(bias[n + 1u]),
+                                      bf2f(bias[n + 2u]), bf2f(bias[n + 3u]));
+                    a0 += b; a1 += b; a2 += b; a3 += b;
+                }
+                if (lane == 0) {
+                    C[4u * N + n] = f2bf(a0.x); C[4u * N + n + 1u] = f2bf(a0.y);
+                    C[4u * N + n + 2u] = f2bf(a0.z); C[4u * N + n + 3u] = f2bf(a0.w);
+                    C[5u * N + n] = f2bf(a1.x); C[5u * N + n + 1u] = f2bf(a1.y);
+                    C[5u * N + n + 2u] = f2bf(a1.z); C[5u * N + n + 3u] = f2bf(a1.w);
+                    C[6u * N + n] = f2bf(a2.x); C[6u * N + n + 1u] = f2bf(a2.y);
+                    C[6u * N + n + 2u] = f2bf(a2.z); C[6u * N + n + 3u] = f2bf(a2.w);
+                    C[7u * N + n] = f2bf(a3.x); C[7u * N + n + 1u] = f2bf(a3.y);
+                    C[7u * N + n + 2u] = f2bf(a3.z); C[7u * N + n + 3u] = f2bf(a3.w);
+                }
+            }
+        }
+        return;
+    }
+    if (M == 4u && norm == 0u && (n0 % 4u) == 0u && (n1 % 4u) == 0u) {
+        for (uint n = n0 + sg * 4u; n + 4u <= n1; n += NSG * 4u) {
+            float4 a0, a1, a2, a3;
+            dot4_bf16_quad(W + n * K, K, x, K, lane, a0, a1, a2, a3);
+            if (bias) {
+                float4 b = float4(bf2f(bias[n]), bf2f(bias[n + 1u]),
+                                  bf2f(bias[n + 2u]), bf2f(bias[n + 3u]));
+                a0 += b; a1 += b; a2 += b; a3 += b;
+            }
+            if (lane == 0) {
+                C[n] = f2bf(a0.x); C[n + 1u] = f2bf(a0.y);
+                C[n + 2u] = f2bf(a0.z); C[n + 3u] = f2bf(a0.w);
+                C[N + n] = f2bf(a1.x); C[N + n + 1u] = f2bf(a1.y);
+                C[N + n + 2u] = f2bf(a1.z); C[N + n + 3u] = f2bf(a1.w);
+                C[2u * N + n] = f2bf(a2.x); C[2u * N + n + 1u] = f2bf(a2.y);
+                C[2u * N + n + 2u] = f2bf(a2.z); C[2u * N + n + 3u] = f2bf(a2.w);
+                C[3u * N + n] = f2bf(a3.x); C[3u * N + n + 1u] = f2bf(a3.y);
+                C[3u * N + n + 2u] = f2bf(a3.z); C[3u * N + n + 3u] = f2bf(a3.w);
+            }
+        }
+        return;
+    }
+#endif
+#ifdef PLOW_BF16_M2
+    if (M == 2u && norm == 0u && (n0 % 4u) == 0u && (n1 % 4u) == 0u) {
+        for (uint n = n0 + sg * 4u; n + 4u <= n1; n += NSG * 4u) {
+            float4 a0, a1;
+            dot4_bf16_pair(W + n * K, K, x, K, lane, a0, a1);
+            if (bias) {
+                float4 b = float4(bf2f(bias[n]), bf2f(bias[n + 1u]),
+                                  bf2f(bias[n + 2u]), bf2f(bias[n + 3u]));
+                a0 += b;
+                a1 += b;
+            }
+            if (lane == 0) {
+                C[n] = f2bf(a0.x); C[n + 1u] = f2bf(a0.y);
+                C[n + 2u] = f2bf(a0.z); C[n + 3u] = f2bf(a0.w);
+                C[N + n] = f2bf(a1.x); C[N + n + 1u] = f2bf(a1.y);
+                C[N + n + 2u] = f2bf(a1.z); C[N + n + 3u] = f2bf(a1.w);
+            }
+        }
+        return;
+    }
+#endif
     for (uint m = 0; m < M; m++) {
         device const ushort* xm = x + m * K;
         float inv = norm == 2u ? rsqrt(row_ss(xm, K, lane) / float(K) + eps) : 1.0f;
@@ -354,6 +614,96 @@ void op_gemv_glu(const thread Inst& in, device const ulong* tab, uint slice, uin
     float f0 = as_type<float>(in.fj[0]), f1 = as_type<float>(in.fj[1]);
     uint n0, n1;
     range(N, slice, nblk, n0, n1);
+#ifdef PLOW_BF16_M8
+    if (M == 8u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float4 g0, g1, u0, u1;
+            dot_bf16_octet(Wg + n * K, x, K, lane, g0, g1);
+            dot_bf16_octet(Wu + n * K, x, K, lane, u0, u1);
+            if (bg) {
+                float b = bf2f(bg[n]);
+                g0 += b;
+                g1 += b;
+            }
+            if (bu) {
+                float b = bf2f(bu[n]);
+                u0 += b;
+                u1 += b;
+            }
+            if (lane == 0) {
+                C[n] = f2bf(glu_pair(g0.x, u0.x, act, f0, f1));
+                C[N + n] = f2bf(glu_pair(g0.y, u0.y, act, f0, f1));
+                C[2u * N + n] = f2bf(glu_pair(g0.z, u0.z, act, f0, f1));
+                C[3u * N + n] = f2bf(glu_pair(g0.w, u0.w, act, f0, f1));
+                C[4u * N + n] = f2bf(glu_pair(g1.x, u1.x, act, f0, f1));
+                C[5u * N + n] = f2bf(glu_pair(g1.y, u1.y, act, f0, f1));
+                C[6u * N + n] = f2bf(glu_pair(g1.z, u1.z, act, f0, f1));
+                C[7u * N + n] = f2bf(glu_pair(g1.w, u1.w, act, f0, f1));
+            }
+        }
+        return;
+    }
+#endif
+#ifdef PLOW_BF16_M4
+    if (M == 8u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            {
+                float4 g = dot_bf16_quad(Wg + n * K, x, K, lane);
+                float4 u = dot_bf16_quad(Wu + n * K, x, K, lane);
+                if (bg) g += bf2f(bg[n]);
+                if (bu) u += bf2f(bu[n]);
+                if (lane == 0) {
+                    C[n] = f2bf(glu_pair(g.x, u.x, act, f0, f1));
+                    C[N + n] = f2bf(glu_pair(g.y, u.y, act, f0, f1));
+                    C[2u * N + n] = f2bf(glu_pair(g.z, u.z, act, f0, f1));
+                    C[3u * N + n] = f2bf(glu_pair(g.w, u.w, act, f0, f1));
+                }
+            }
+            {
+                float4 g = dot_bf16_quad(Wg + n * K, x + 4u * K, K, lane);
+                float4 u = dot_bf16_quad(Wu + n * K, x + 4u * K, K, lane);
+                if (bg) g += bf2f(bg[n]);
+                if (bu) u += bf2f(bu[n]);
+                if (lane == 0) {
+                    C[4u * N + n] = f2bf(glu_pair(g.x, u.x, act, f0, f1));
+                    C[5u * N + n] = f2bf(glu_pair(g.y, u.y, act, f0, f1));
+                    C[6u * N + n] = f2bf(glu_pair(g.z, u.z, act, f0, f1));
+                    C[7u * N + n] = f2bf(glu_pair(g.w, u.w, act, f0, f1));
+                }
+            }
+        }
+        return;
+    }
+    if (M == 4u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float4 g = dot_bf16_quad(Wg + n * K, x, K, lane);
+            float4 u = dot_bf16_quad(Wu + n * K, x, K, lane);
+            if (bg) g += bf2f(bg[n]);
+            if (bu) u += bf2f(bu[n]);
+            if (lane == 0) {
+                C[n] = f2bf(glu_pair(g.x, u.x, act, f0, f1));
+                C[N + n] = f2bf(glu_pair(g.y, u.y, act, f0, f1));
+                C[2u * N + n] = f2bf(glu_pair(g.z, u.z, act, f0, f1));
+                C[3u * N + n] = f2bf(glu_pair(g.w, u.w, act, f0, f1));
+            }
+        }
+        return;
+    }
+#endif
+#ifdef PLOW_BF16_M2
+    if (M == 2u) {
+        for (uint n = n0 + sg; n < n1; n += NSG) {
+            float4 a = dot_glu_bf16_pair(Wg + n * K, Wu + n * K, x, K, lane);
+            if (bg) { float b = bf2f(bg[n]); a.x += b; a.z += b; }
+            if (bu) { float b = bf2f(bu[n]); a.y += b; a.w += b; }
+            if (lane == 0) {
+                C[n] = f2bf(glu_pair(a.x, a.y, act, f0, f1));
+                C[N + n] = f2bf(glu_pair(a.z, a.w, act, f0, f1));
+            }
+        }
+        return;
+    }
+#endif
     for (uint n = n0 + sg; n < n1; n += NSG)
         for (uint m = 0; m < M; m++) {
 #ifdef PLOW_GLU_PAIR
