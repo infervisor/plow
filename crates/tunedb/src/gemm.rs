@@ -81,6 +81,14 @@ pub fn amd_tuning_cell(spec: &hwspec::GpuSpec) -> String {
 /// Part of the staleness key, so a record checked by a weaker oracle cannot be served to a
 /// caller expecting this one.
 pub const GEMM_ORACLE: &str = "gemm-f64-dot-spotcheck-v1";
+pub const GFX942_GEMM_ORACLE: &str = "gemm-f64-dot-spotcheck-runtime-tile-v2";
+
+pub fn gemm_oracle(isa: hwspec::IsaLevel) -> &'static str {
+    match isa {
+        hwspec::IsaLevel::Gfx942 => GFX942_GEMM_ORACLE,
+        _ => GEMM_ORACLE,
+    }
+}
 
 /// The op-case key a GEMM measurement is filed and looked up under.
 ///
@@ -218,6 +226,13 @@ mod tests {
         assert_eq!(a, "gemm/128x576x6144/None");
     }
 
+    #[test]
+    fn runtime_tile_oracle_is_scoped_to_gfx942() {
+        assert_eq!(gemm_oracle(hwspec::IsaLevel::Gfx942), GFX942_GEMM_ORACLE);
+        assert_eq!(gemm_oracle(hwspec::IsaLevel::Gfx950), GEMM_ORACLE);
+        assert_eq!(gemm_oracle(hwspec::IsaLevel::Sm90a), GEMM_ORACLE);
+    }
+
     /// Every ordinary rung resolves to a distinct opcode in every encoding. Tagged c8 resolves
     /// only through the richer emit-plan mapping.
     #[test]
@@ -260,5 +275,33 @@ mod tests {
                 "no GEMM_VARIANT(..., {want} in test_kernels.hip — rung {tile} cannot be measured"
             );
         }
+    }
+
+    #[test]
+    fn sweep_rungs_force_body_inlining() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../runtime/amd/test_kernels.hip");
+        let src = std::fs::read_to_string(&p).expect("test_kernels.hip");
+        for macro_name in ["GEMM_VARIANT", "GEMM_FP8_VARIANT", "GEMM_MXFP4_VARIANT"] {
+            let start = src
+                .find(&format!("#define {macro_name}"))
+                .unwrap_or_else(|| panic!("missing {macro_name}"));
+            let body = &src[start..src[start..].find("\n#if").map_or(src.len(), |n| start + n)];
+            assert!(
+                body.contains("__attribute__((flatten))"),
+                "{macro_name} may outline a rung and benchmark call-boundary scratch"
+            );
+        }
+        let glu = src
+            .find("void gemma_gemm_glu_bf16(")
+            .expect("direct GEMM+GLU wrapper");
+        assert!(
+            src[glu.saturating_sub(160)..glu].contains("__attribute__((flatten))"),
+            "direct GEMM+GLU wrapper must expose its own register budget"
+        );
+        assert!(src.contains("void gemma_gemm_glu_bf16_outlined("));
+        assert!(src.contains("__attribute__((noinline)) void d_gemm_glu_outlined_probe("));
+        assert!(src.contains("GEMM_GLU_VARIANT(gemma_gemm_glu_bf16_c2"));
+        assert!(!src.contains("GEMM_GLU_VARIANT(gemma_gemm_glu_bf16_c5"));
     }
 }

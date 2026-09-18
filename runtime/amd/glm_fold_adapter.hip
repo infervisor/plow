@@ -22,6 +22,30 @@ extern "C" __global__ void plow_glm_fold_normalize(float* out, const float* part
 #endif
 }
 
+/* Row-band fold (PLOW_GLM_ROWBAND_ATTN): the partials of `group`-head attention launches are
+ * group-major ([launch][rows][group][*]); head `h` of the band reads launch h/group's block.
+ * Everything else is plow_glm_fold_normalize. */
+extern "C" __global__ void plow_glm_fold_normalize_grouped(float* out, const float* partial, const float* ml,
+                                              unsigned rows, unsigned heads, unsigned splits,
+                                              unsigned group) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    const unsigned d = threadIdx.x + (blockIdx.x % 2) * 256;
+    const unsigned row = blockIdx.x / 2;
+    const unsigned head = row % heads, token = row / heads;
+    const size_t src = ((size_t)(head / group) * rows + token) * group + head % group;
+    const float* m = ml + src * splits * 2;
+    float gm;
+    const float gl = fa_merge_ml(m, splits, gm);
+    const float inv = gl > 0.0f ? FA_RECIP(gl) : 0.0f;
+    float acc = 0.0f;
+    for (unsigned s = 0; s < splits; ++s) {
+        const float pv = partial[(src * splits + s) * 512 + d];
+        acc += m[s * 2] == FA_NEG_INF ? 0.0f : pv * FA_EXP(m[s * 2] - gm);
+    }
+    out[((size_t)head * rows + token) * 512 + d] = acc * inv;
+#endif
+}
+
 extern "C" __global__ void plow_glm_fold_convert(unsigned short* out, const float* in,
                                     unsigned rows, unsigned heads) {
 #if defined(__HIP_DEVICE_COMPILE__)
@@ -40,4 +64,5 @@ extern "C" __global__ void plow_glm_fold_weight(float* out, const unsigned short
 }
 #if defined(__HIP_DEVICE_COMPILE__)
 extern "C" __device__ unsigned plow_glm_fold_adapter_abi_1 = 1;
+extern "C" __device__ unsigned plow_glm_fold_grouped_abi_1 = 1;
 #endif

@@ -215,23 +215,29 @@ G_K(g_gemv_qkv) {
  * GEMV -> SOFTCAP -> ARGMAX partial, bit for bit (runtime/nvidia/op_gemm.cuh d_gemv_argmax). */
 G_K(g_gemv_argmax) {
     (void)ctx;
+    const uint32_t M = in->i[0] ? in->i[0] : 1u;
     const uint32_t N = in->i[1], K = in->i[2];
-    plow_bf16* C = PLOW_CPU_TEN(in, T, 0);
-    const plow_bf16* x = (const plow_bf16*)PLOW_CPU_TEN(in, T, 1) + (size_t)in->i[4] * K;
+    plow_bf16* C_base = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* x_base = (const plow_bf16*)PLOW_CPU_TEN(in, T, 1) + (size_t)in->i[4] * K;
     const plow_bf16* W = PLOW_CPU_TEN(in, T, 2);
-    uint64_t* part = PLOW_CPU_TEN(in, T, 3);
+    uint64_t* part_base = PLOW_CPU_TEN(in, T, 3);
     const float cap = in->fj[0].f, inv = cap > 0.0f ? 1.0f / cap : 0.0f;
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
-    uint64_t best = 0;
-    for (uint32_t n = n0; n < n1; n++) {
-        const plow_bf16 lg = plow_f2bf(dot_bf16(W + (size_t)n * K, x, K));
-        const plow_bf16 sc = cap > 0.0f ? plow_f2bf(cap * tanhf(plow_bf2f(lg) * inv)) : lg;
-        C[n] = sc;
-        const uint64_t key = g_amax_pack(sc, n);
-        best = key > best ? key : best;
+    for (uint32_t m = 0; m < M; m++) {
+        plow_bf16* C = C_base + (size_t)m * N;
+        const plow_bf16* x = x_base + (size_t)m * K;
+        uint64_t* part = part_base + (size_t)m * nblk;
+        uint64_t best = 0;
+        for (uint32_t n = n0; n < n1; n++) {
+            const plow_bf16 lg = plow_f2bf(dot_bf16(W + (size_t)n * K, x, K));
+            const plow_bf16 sc = cap > 0.0f ? plow_f2bf(cap * tanhf(plow_bf2f(lg) * inv)) : lg;
+            C[n] = sc;
+            const uint64_t key = g_amax_pack(sc, n);
+            best = key > best ? key : best;
+        }
+        part[slice] = best;
     }
-    part[slice] = best;
 }
 
 /* t0=dst(f32); i0*i1 = element count. Clears the split-K accumulator. */

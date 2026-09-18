@@ -68,6 +68,13 @@ pub trait VmmOps: Send + Sync {
     fn unmap(&self, va: u64, bytes: u64);
     /// Grant RW device access to a fully-mapped range.
     fn set_access(&self, va: u64, bytes: u64) -> Result<()>;
+    /// Grant RW device access to multiple mapped ranges in one batch.
+    fn set_access_batch(&self, ranges: &[(u64, u64)]) -> Result<()> {
+        for &(va, bytes) in ranges {
+            self.set_access(va, bytes)?;
+        }
+        Ok(())
+    }
     /// Plain device allocation (sliding-window snapshots).
     fn alloc(&self, bytes: u64) -> Result<u64>;
     fn free(&self, va: u64);
@@ -653,6 +660,9 @@ pub struct VmmStats {
     pub blocks_copied_out: u64,
     /// Spare copy targets unmapped and released because the pool held more than its spare cap.
     pub spares_dropped: u64,
+    /// Publishes [`VmmKv::enable_shared_publish`] skipped because the sequence's lead was
+    /// seen on no other sequence (no snapshot copy, allocation or radix insert happened).
+    pub publishes_skipped: u64,
 }
 
 /// One physical sharing block: driver handle + mapping/cache refcount.
@@ -878,6 +888,10 @@ struct Inner {
     /// freshly produced by whichever publish call is running, never re-copying rows already
     /// covered by pre-existing (possibly differently-valued) whole blocks.
     strict_publish: bool,
+    /// [`VmmKv::enable_shared_publish`]: the hash of each slot's current sequence's leading
+    /// [`LEAD_ROWS`] tokens once recorded, and how many sequences recorded each hash.
+    lead: Vec<Option<u64>>,
+    lead_seen: FxHashMap<u64, u32>,
 }
 
 enum PublishLocked {
@@ -904,6 +918,8 @@ struct Shared {
     /// How long [`VmmKv::begin_seq`] waits for a queued copy-out of its seq before swapping row 0
     /// inline ([`VmmKv::enable_release_retire`]).
     admission_wait_us: AtomicU64,
+    /// Signalled by [`copy_out`] whenever `copying[seq]` or `copy_reading[seq]` clears.
+    copy_cv: parking_lot::Condvar,
     /// Max handles the reuse pool may hold (0 = pooling off, the default).
     /// Set once by [`VmmKv::enable_block_pool`]; atomic only so `deref_block`
     /// can read it without threading a config borrow through `Inner`.
@@ -921,6 +937,8 @@ pub struct VmmKv {
     prefix_reuse: bool,
     /// [`Self::enable_release_retire`].
     release_retire: bool,
+    /// [`Self::enable_shared_publish`].
+    shared_publish: bool,
     shared: Arc<Shared>,
     premap_tx: Option<std::sync::mpsc::Sender<Job>>,
     premap_join: Option<std::thread::JoinHandle<()>>,
@@ -1028,6 +1046,7 @@ impl VmmKv {
             cache_cap,
             cache_min_free: AtomicU64::new(0),
             admission_wait_us: AtomicU64::new(5_000),
+            copy_cv: parking_lot::Condvar::new(),
             pool_cap: AtomicU32::new(0),
             inner: Mutex::new(Inner {
                 tracks,
@@ -1052,6 +1071,8 @@ impl VmmKv {
                 fine_published: FxHashMap::default(),
                 fine_next_pub: 0,
                 strict_publish: false,
+                lead: vec![None; batch],
+                lead_seen: FxHashMap::default(),
             }),
             frontier: (0..batch).map(|_| AtomicU32::new(0)).collect(),
             generation: (0..batch).map(|_| AtomicU64::new(0)).collect(),
@@ -1059,6 +1080,7 @@ impl VmmKv {
         let mut pool = VmmKv {
             prefix_reuse,
             release_retire: false,
+            shared_publish: false,
             shared: Arc::clone(&shared),
             premap_tx: None,
             premap_join: None,
@@ -1122,7 +1144,14 @@ impl VmmKv {
             .map_err(|e| RuntimeError::Device(format!("vmm premap thread: {e}")))?;
         pool.premap_join = Some(join);
 
+        // The VA window, so a device fault address can be attributed to the KV pool (or ruled out).
+        let (va_lo, va_hi) = {
+            let inner = shared.inner.lock();
+            inner.tracks.iter().fold((u64::MAX, 0u64), |(lo, hi), t| (lo.min(t.va), hi.max(t.va + span)))
+        };
         tracing::info!(
+            va_lo = format_args!("{va_lo:#x}"),
+            va_hi = format_args!("{va_hi:#x}"),
             full_layers = shared.geo.full_layers.len(),
             kv_elem = shared.geo.elem,
             kv_elem_slide = shared.geo.elem_slide,
@@ -1234,6 +1263,16 @@ impl VmmKv {
         }
     }
 
+    /// Publish a boundary only once the sequence's leading [`LEAD_ROWS`] tokens were recorded
+    /// by another sequence ([`Self::try_attach`] or an earlier publish). A workload of unique
+    /// prompts then pays no snapshot copies, allocations or radix inserts; a shared prefix
+    /// (system prompt, replayed prompt, multi-turn continuation) publishes from its second
+    /// sighting on, so the first reuse of a fresh prefix misses. Off by default; the CUDA
+    /// engine enables it from `PLOW_VMM_PUBLISH_SHARED`.
+    pub fn enable_shared_publish(&mut self) {
+        self.shared_publish = true;
+    }
+
     /// The request in `seq` finished: queue its [`Job::CopyOut`] ([`Self::enable_release_retire`]).
     pub fn retire_released(&self, seq: usize) {
         if !self.release_retire {
@@ -1324,10 +1363,9 @@ impl VmmKv {
             // serialized ioctls. Outside the engine section, so the job's own driver calls run.
             let wait = std::time::Duration::from_micros(s.admission_wait_us.load(Ordering::Relaxed));
             let deadline = std::time::Instant::now() + wait;
-            while s.inner.lock().copying[seq] && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_micros(50));
-            }
-            copy_pending = s.inner.lock().copying[seq];
+            let mut inner = s.inner.lock();
+            while inner.copying[seq] && !s.copy_cv.wait_until(&mut inner, deadline).timed_out() {}
+            copy_pending = inner.copying[seq];
         }
         let copy_wait = t_wait.elapsed();
         let _section = EngineSection::enter();
@@ -1337,12 +1375,11 @@ impl VmmKv {
         // inline swap below may unmap.
         let t_chunk = std::time::Instant::now();
         while inner.copy_reading[seq] {
-            drop(inner);
-            std::thread::sleep(std::time::Duration::from_micros(20));
-            inner = s.inner.lock();
+            s.copy_cv.wait(&mut inner);
         }
         let chunk_wait = t_chunk.elapsed();
         release_prefix_hold(&mut inner, seq);
+        inner.lead[seq] = None;
         let before = inner.stats;
         let t0 = std::time::Instant::now();
         let unmapped = if inner.jobs.is_some() {
@@ -1403,6 +1440,7 @@ impl VmmKv {
         if inner.fine_rows > 0 && (prompt.len() as u64) < u64::from(inner.fine_ceiling) {
             return try_attach_fine(&mut inner, seq, prompt);
         }
+        note_lead(&mut inner, seq, prompt);
         let hashes = hash_blocks(prompt, s.block_rows);
         let aligned = &prompt[..hashes.len() * s.block_rows as usize];
 
@@ -1665,6 +1703,13 @@ impl VmmKv {
         let s = &self.shared;
         if rows == 0 {
             return Ok(());
+        }
+        if self.shared_publish {
+            let mut inner = s.inner.lock();
+            if !note_lead(&mut inner, seq, tokens) {
+                inner.stats.publishes_skipped += 1;
+                return Ok(());
+            }
         }
         let generation = s.generation[seq].load(Ordering::Acquire);
         {
@@ -1945,6 +1990,30 @@ impl VmmStatsHandle {
     pub fn stats(&self) -> VmmStats {
         stats_of(&self.0)
     }
+}
+
+/// Lead length for [`VmmKv::enable_shared_publish`]: the snapshot-boundary quantum, so every
+/// publishable sequence has one.
+const LEAD_ROWS: usize = 32;
+const LEAD_SEEN_CAP: usize = 1 << 20;
+
+/// Record `seq`'s lead once per sequence; `true` when another sequence recorded the same lead.
+fn note_lead(inner: &mut Inner, seq: usize, tokens: &[u32]) -> bool {
+    use std::hash::{Hash, Hasher};
+    let Some(lead) = tokens.get(..LEAD_ROWS) else {
+        return false;
+    };
+    let mut hasher = rustc_hash::FxHasher::default();
+    lead.hash(&mut hasher);
+    let key = hasher.finish();
+    if inner.lead[seq] != Some(key) {
+        if inner.lead_seen.len() >= LEAD_SEEN_CAP {
+            inner.lead_seen.clear();
+        }
+        *inner.lead_seen.entry(key).or_insert(0) += 1;
+        inner.lead[seq] = Some(key);
+    }
+    inner.lead_seen.get(&key).is_some_and(|&n| n > 1)
 }
 
 fn alloc_snapshot(s: &Shared, bytes: u64) -> Result<u64> {
@@ -2881,6 +2950,7 @@ fn copy_out(s: &Shared, seq: usize, generation: u64) {
         }
         if entries.is_empty() {
             inner.copying[seq] = false;
+            s.copy_cv.notify_all();
             return;
         }
     }
@@ -2929,6 +2999,7 @@ fn copy_out(s: &Shared, seq: usize, generation: u64) {
             }
             ok = s.ops.copy_dtod_batch(&pairs).is_ok();
             s.inner.lock().copy_reading[seq] = false;
+            s.copy_cv.notify_all();
             if !ok {
                 break;
             }
@@ -3000,6 +3071,7 @@ fn copy_out(s: &Shared, seq: usize, generation: u64) {
             }
         }
         inner.copying[seq] = false;
+        s.copy_cv.notify_all();
         if let Some(tx) = &inner.jobs {
             let _ = tx.send(Job::Refill);
         }
@@ -4122,6 +4194,38 @@ mod tests {
         let a = p.try_attach(1, &pr).unwrap().expect("published boundary");
         assert_eq!(a.rows, 16);
         assert_eq!(a.snap_bytes, 4);
+    }
+
+    /// `enable_shared_publish`: a lead seen on one sequence only never snapshots; the
+    /// second sequence with that lead publishes and the third attaches. Another lead
+    /// stays unpublished.
+    #[test]
+    fn shared_publish_skips_first_sighting_and_publishes_the_second() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        p.enable_shared_publish();
+        let pr = prompt(32);
+        assert!(p.try_attach(0, &pr).unwrap().is_none());
+        p.ensure_rows(0, 32).unwrap();
+        p.publish_at(0, &pr, 24, 4, |_| panic!("first sighting must not snapshot")).unwrap();
+        assert_eq!(p.stats().publishes_skipped, 1);
+        assert_eq!(p.stats().cache_blocks, 0);
+        p.begin_seq(0);
+        p.ensure_rows(1, 1).unwrap();
+        assert!(p.try_attach(1, &pr).unwrap().is_none(), "nothing published on first sighting");
+        p.ensure_rows(1, 32).unwrap();
+        p.publish_at(1, &pr, 24, 4, |_| Ok(())).unwrap();
+        assert_eq!(p.stats().publishes_skipped, 1);
+        p.ensure_rows(0, 1).unwrap();
+        let a = p.try_attach(0, &pr).unwrap().expect("second sighting published");
+        assert_eq!(a.rows, 24);
+        p.begin_seq(0);
+        let other: Vec<u32> = pr.iter().map(|t| t + 1).collect();
+        p.ensure_rows(0, 1).unwrap();
+        assert!(p.try_attach(0, &other).unwrap().is_none());
+        p.ensure_rows(0, 32).unwrap();
+        p.publish_at(0, &other, 24, 4, |_| panic!("unseen lead must not snapshot")).unwrap();
+        assert_eq!(p.stats().publishes_skipped, 2);
     }
 
     /// Attach-then-abort cycles (client disconnects mid-prefill) must return

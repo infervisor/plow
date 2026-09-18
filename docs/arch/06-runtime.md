@@ -327,40 +327,31 @@ emits a `PlowMemMap` of slot→offset entries and the runtime resolves each to
 **Deviation from implementation:** The single contiguous-arena diagram describes
 the compiler-computed static layout resolved by `memmap.c`. The Rust host
 (`crates/plowrt/src/memory/`) does not manage KV/prefix as a slice of that one
-arena — it adds dedicated allocators on top: `BlockAllocator` (paged KV blocks),
-`GrowablePool` (per-`(kv,head)` growable KV slabs), the RadixAttention
-`PrefixCache`, and the VMM-backed prefix path (`vmm.rs`). The static regions
-(counters, packet stream, weights, activation scratch) follow the arena/offset
-model; dynamic KV does not.
+arena — it adds dedicated allocators on top: the CUDA VMM allocator for
+global-layer KV (`vmm.rs`), flat device rings for sliding layers, and the radix
+`PrefixCache` over published boundary snapshots. The static regions (counters,
+packet stream, weights, activation scratch) follow the arena/offset model;
+dynamic KV does not.
 
-### KV Cache Paging
+### KV Cache
 
-```mermaid
-flowchart TD
-    subgraph KV Page Pool
-        P0[Page 0: 128 tokens × head_dim]
-        P1[Page 1: 128 tokens × head_dim]
-        P2[Page 2: ...]
-        PN[Page N: ...]
-    end
+KV is **not paged**. Each layer holds a head-major ring —
+`[slot][kv_head][ring_row][head_dim]`, indexed `row & kv_mask` — written in
+place by the per-head norm op and sized by the prefill chunk rather than by the
+context. Global layers are backed by CUDA virtual memory so a shared prefix's
+physical blocks can be mapped into several sequences at once; sliding layers
+stay on flat allocations and are shared by copying a boundary snapshot.
 
-    subgraph Address Map
-        R0[Request 0: pages 3,7,12]
-        R1[Request 1: pages 1,4]
-        R2[Request 2: pages 0,5,8,9]
-    end
+See **[22 — KV Cache](22-kv-cache.md)** for the layout and its rationale, the
+ring invariant, the write and read paths, fp8 KV, the verified memory model, the
+slot and VMM allocator, and the prefix cache.
 
-    R0 --> P2
-    R0 --> P1
-    R1 --> P0
-```
-
-KV cache uses **page-table indirection** (à la vLLM/PagedAttention). In the host
-(`crates/plowrt/src/memory/kv.rs`):
-- A `BlockAllocator` carves the KV region into fixed-size blocks (`KvPaging::block_bytes`) and hands out `BlockId`s from a LIFO free list
-- Each sequence owns a `PageTable` (logical token window → physical `BlockId`s), appended to as it grows and **never reallocated**
-- Growth for decode is applied via an `UPDATE_INDIRECTION` OOB message that writes the new block's physical address into an indirection slot (there is no `inject_kv_growable_entry` symbol)
-- Prefix sharing is a separate `PrefixCache` (RadixAttention / automatic prefix caching) over a `GrowablePool`, in `memory/prefix.rs` — a shared prefix resolves to a strided set of per-`(layer,kv,head)` runs, not one block
+> [!NOTE]
+> `crates/plowrt/src/memory/kv.rs` still contains a `BlockAllocator` /
+> `PageTable` pair implementing vLLM-style paged KV. It is **retained but
+> unused** (`memory/streamer.rs:212`); no shipping GPU packet reaches it, and a
+> paged repack of the head-major cache measured as a null
+> (`crates/devgen/src/lib.rs:2377`).
 
 ### Design Decision: Arena (not per-tensor malloc)
 

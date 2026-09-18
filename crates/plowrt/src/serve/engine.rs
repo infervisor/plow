@@ -288,6 +288,19 @@ impl ServeEngine {
         }
     }
 
+    /// What the device can back, so the mux admits on KV bytes instead of free slots alone.
+    /// `None` = admit on slots, the behaviour every non-AMD engine keeps.
+    pub fn kv_admission_budget(&self) -> Option<crate::sched::admission::KvBudget> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => None,
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => e.kv_admission_budget(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => None,
+        }
+    }
+
     pub fn prefix_cache_enabled(&self) -> bool {
         match self {
             #[cfg(feature = "cuda")]
@@ -381,6 +394,11 @@ mod amd_serve {
         Tp(AmdTpGroup),
     }
 
+    /// Re-runs of a decode dispatch whose collective missed its deadline. A peer queue stalled
+    /// by the driver (KFD eviction) recovers within one deadline; two stalls in a row on the
+    /// same step are treated as a real fault and fail the fed requests.
+    const COLLECTIVE_BAIL_RETRIES: usize = 2;
+
     const DEFAULT_SNAPSHOT_TENSORS: &str = "act.qa,act.oat,act.attn,act.xn";
     const MAX_SNAPSHOT_TENSORS: usize = 16;
     const MAX_SNAPSHOT_TENSOR_NAME: usize = 128;
@@ -461,10 +479,10 @@ mod amd_serve {
             e.chunk_steps_from(&chunks, from, to)
         }
 
-        fn restore_carried(&mut self, slot: usize) -> Result<()> {
+        fn restore_carried_since(&mut self, slot: usize, dirty_until: u32) -> Result<()> {
             match self {
-                Self::One(e) => e.restore_carried(slot),
-                Self::Tp(g) => g.restore_carried(slot),
+                Self::One(e) => e.restore_carried_since(slot, dirty_until),
+                Self::Tp(g) => g.restore_carried_since(slot, dirty_until),
             }
         }
 
@@ -1207,6 +1225,17 @@ mod amd_serve {
         }
     }
 
+    /// On a step the dense-exact twin serves, a parked row attends one key instead of its whole
+    /// window. Its output is discarded, the twin reads `kv_len` only in its flash, and every KV
+    /// and indexer-key writer takes its row from `pos`, so the row's writes are unchanged.
+    fn park_kvlen(kvlen: &mut [u32], parked: &[u32]) {
+        for (k, &p) in kvlen.iter_mut().zip(parked) {
+            if p != 0 {
+                *k = 1;
+            }
+        }
+    }
+
     fn invalidate_prefix_metadata(
         enabled: bool,
         cached_prompt: &mut [Vec<u32>],
@@ -1476,6 +1505,12 @@ mod amd_serve {
 
         pub fn decode_rungs(&self) -> &[u32] {
             &self.decode_rungs
+        }
+
+        /// Rank 0's budget. The ranks are symmetric — the same packet, the same shard shape and
+        /// the same KV geometry on every one — so one rank's figure is the group's.
+        pub fn kv_admission_budget(&self) -> Option<crate::sched::admission::KvBudget> {
+            self.ranks.rank0().kv_admission()
         }
 
         pub fn overlap_evidence(&self) -> Vec<AmdOverlapRankEvidence> {
@@ -1764,6 +1799,7 @@ mod amd_serve {
                         self.max_ctx
                     )));
                 }
+                let dirty_until = self.pos[slot];
                 let t_clear = std::time::Instant::now();
                 crate::obs::ttft::timed(&crate::obs::ttft::PF_STATE_CLEAR, || {
                     match &mut self.ranks {
@@ -1804,7 +1840,7 @@ mod amd_serve {
                 let resume = resume.max(head);
                 let max_bucket = self.prefill_chunk_rows.min(tick_max_bucket);
                 if resume > 0 && !shared && !head_wins {
-                    self.ranks.restore_carried(slot)?;
+                    self.ranks.restore_carried_since(slot, dirty_until)?;
                 }
                 // With bodies armed, a middle chunk must fit its bucket's body to ride it.
                 let (g, tb) = (&self.ranks, self.token_batch_tp.as_ref());
@@ -1928,7 +1964,14 @@ mod amd_serve {
             g.kv_rebase_all(slot)?;
             let rebase_ns = t.elapsed().as_nanos() as u64;
             let t = std::time::Instant::now();
-            let r = g.prefill_chunk(prompt, step, cur.steps.get(cur.next + 1).copied());
+            let next = cur.steps.get(cur.next + 1).copied();
+            // The cursor moves only on success, so a re-run rewrites the same rows.
+            let mut r = g.prefill_chunk(prompt, step, next);
+            for retry in 1..=COLLECTIVE_BAIL_RETRIES {
+                let Err(err @ RuntimeError::CollectiveBail(_)) = &r else { break };
+                tracing::warn!(slot, c0 = step.c0, error = %err, retry, "amd: prefill collective missed its deadline; re-running the chunk");
+                r = g.prefill_chunk(prompt, step, next);
+            }
             let chunk_ns = t.elapsed().as_nanos() as u64;
             let t = std::time::Instant::now();
             let restore = g.kv_rebase_all(0);
@@ -2890,11 +2933,11 @@ mod amd_serve {
                 Ranks::Tp(g) => g.deferred_token_capture_available(),
             };
             if !available
-                || feeds.iter().enumerate().any(|(i, &(slot, _))| {
-                    self.live.get(slot).copied() != Some(true)
-                        || self.pf.get(slot).is_none_or(Option::is_some)
-                        || feeds[..i].iter().any(|&(previous, _)| previous == slot)
-                })
+                || !multistep_feeds_armable(
+                    feeds,
+                    |slot| self.live.get(slot).copied() == Some(true),
+                    |slot| self.pf.get(slot).is_none_or(Option::is_some),
+                )
                 || crate::config::RuntimeConfig::get().amd.ctr_snap.is_some()
                 || crate::config::RuntimeConfig::get().amd.tens_snap.is_some()
             {
@@ -2943,7 +2986,15 @@ mod amd_serve {
                 )));
             }
 
-            let result = (|| -> Result<()> {
+            // Rows the quantum has advanced so far. A bail discards the whole quantum — nothing
+            // has been read back — so a retry rewinds them and re-runs from the host seeds,
+            // rewriting the same KV rows.
+            let mut done = 0u32;
+            let mut run = || -> Result<()> {
+                for &slot in &advance {
+                    self.pos[slot] -= done;
+                }
+                done = 0;
                 let dp = self.ranks.rank0().decode_prog_for(rows);
                 let width = self.ranks.rank0().prog_t(dp);
                 if width != self.last_rung {
@@ -2980,13 +3031,18 @@ mod amd_serve {
                                 quantum,
                             )?,
                             Ranks::Tp(g) => {
-                                g.submit_decode_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
+                                let run = g.decode_prog_advancing(dp, &self.kvlen_stage, &self.parked_stage);
+                                if g.rank(0).prog_dense_exact(run) {
+                                    park_kvlen(&mut self.kvlen_stage, &self.parked_stage);
+                                }
+                                g.submit_decode_batched_at(&self.pos_stage, &self.kvlen_stage, run)?;
                                 g.complete_decode_batched_deferred(self.batch, step, quantum)?;
                             }
                         }
                         for &slot in &advance {
                             self.pos[slot] += 1;
                         }
+                        done += 1;
                     }
                     match &mut self.ranks {
                         Ranks::One(e) => e.read_token_capture(width as usize, quantum, out),
@@ -3006,7 +3062,13 @@ mod amd_serve {
                         });
                 }
                 dispatch
-            })();
+            };
+            let mut result = run();
+            for retry in 1..=COLLECTIVE_BAIL_RETRIES {
+                let Err(err @ RuntimeError::CollectiveBail(_)) = &result else { break };
+                tracing::warn!(error = %err, retry, quantum, "amd: decode collective missed its deadline; re-running the quantum");
+                result = run();
+            }
             self.advance_stage = advance;
             result?;
             Ok(quantum)
@@ -3031,7 +3093,13 @@ mod amd_serve {
             let mut advance = std::mem::take(&mut self.advance_stage);
             advance.clear();
             advance.extend(feeds.iter().map(|&(s, _)| s));
-            let result = self.dispatch_all(&advance);
+            // A failed dispatch advanced no position, so a re-run rewrites the same KV rows.
+            let mut result = self.dispatch_all(&advance);
+            for retry in 1..=COLLECTIVE_BAIL_RETRIES {
+                let Err(err @ RuntimeError::CollectiveBail(_)) = &result else { break };
+                tracing::warn!(error = %err, retry, "amd: decode collective missed its deadline; re-running the step");
+                result = self.dispatch_all(&advance);
+            }
             self.advance_stage = advance;
             let out = result?;
             Ok(feeds.iter().map(|&(s, _)| (s, out[s])).collect())
@@ -3301,6 +3369,10 @@ mod amd_serve {
                         tracing::info!(rung = w, occupied = rows, "decode ladder rung");
                         self.last_rung = w;
                     }
+                    let run = g.decode_prog_advancing(dp, &self.kvlen_stage, &self.parked_stage);
+                    if g.rank(0).prog_dense_exact(run) {
+                        park_kvlen(&mut self.kvlen_stage, &self.parked_stage);
+                    }
                     tracing::debug!(
                         rung = w,
                         pos = ?&self.pos_stage[..(w as usize).min(self.pos_stage.len())],
@@ -3312,7 +3384,7 @@ mod amd_serve {
                     g.upload_parked(&self.parked_stage)?;
                     g.seed_ids(&self.next_id)?;
                     let started = measure_dispatch.then(std::time::Instant::now);
-                    let out = g.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
+                    let out = g.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, run)?;
                     (
                         out,
                         dp,
@@ -3342,12 +3414,38 @@ mod amd_serve {
         }
     }
 
+    /// Whether a deferred-read quantum may cover `feeds`.
+    ///
+    /// Every fed slot must be live, must carry no prefill cursor of its OWN, and must appear
+    /// once. Note what is deliberately absent: any condition on a slot that is not fed. A
+    /// slot still mid-prefill has produced no token, so the mux never feeds it, and
+    /// `multi_step` advances nothing but the slots it is handed — a prefill cursor moves
+    /// only when the host calls `prefill_chunk_rows` on a later tick. So a finished sequence
+    /// may take a full quantum while a neighbour is still prefilling; the only thing the
+    /// quantum changes for that neighbour is WHEN its next chunk is issued.
+    ///
+    /// `pf_pending` reports true for an out-of-range slot as well, which `live` already
+    /// refuses — both are kept so neither can be the only bound.
+    #[inline]
+    fn multistep_feeds_armable(
+        feeds: &[(usize, u32)],
+        live: impl Fn(usize) -> bool,
+        pf_pending: impl Fn(usize) -> bool,
+    ) -> bool {
+        !feeds.iter().enumerate().any(|(i, &(slot, _))| {
+            !live(slot)
+                || pf_pending(slot)
+                || feeds[..i].iter().any(|&(previous, _)| previous == slot)
+        })
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{
             commit_mixed_prefill, commit_packed_prefill, invalidate_prefix_metadata,
             mixed_cursor_rows, mixed_prefill_continuation_fits, mixed_prefill_padding_fits,
             packable_prefill_step, parse_snapshot_tensors, snapshot_file_component,
+            multistep_feeds_armable,
             slot_decode_position, split_pending_prefill, split_terminal_prefill, stage_parked,
             body_respects_plan, cap_chunks_to_bodies, terminal_prefill_cursor,
             token_batch_host_step, token_batch_prefill_continuation_fits,
@@ -3440,6 +3538,29 @@ mod amd_serve {
                     assert_eq!(last.c0 + last.clen, n);
                 }
             }
+        }
+
+        /// §B1. The quantum is gated on the FED slots only. A slot that is still prefilling is
+        /// never in the feed set (it has produced no token), and nothing about it may stop a
+        /// finished sequence from taking a quantum — that refusal is what made decode pay a full
+        /// host turnaround per token under continuous batching.
+        #[test]
+        fn a_neighbours_prefill_does_not_disarm_a_finished_slots_quantum() {
+            // Slot 2 is mid-prefill: not live, cursor pending. Slots 0 and 1 are decoding.
+            let live = |slot: usize| matches!(slot, 0 | 1);
+            let pf_pending = |slot: usize| slot == 2;
+
+            assert!(multistep_feeds_armable(&[(0, 7), (1, 9)], live, pf_pending));
+            assert!(multistep_feeds_armable(&[(1, 9)], live, pf_pending));
+
+            // The guards that DO apply, each on its own.
+            assert!(!multistep_feeds_armable(&[(0, 7), (2, 1)], live, pf_pending));
+            assert!(!multistep_feeds_armable(&[(0, 7), (0, 7)], live, pf_pending));
+            assert!(!multistep_feeds_armable(&[(5, 7)], live, pf_pending));
+            // A live slot whose own cursor is somehow still pending is refused.
+            assert!(!multistep_feeds_armable(&[(0, 7)], live, |_| true));
+            // An empty feed set arms vacuously; `decode_quantum` returns 0 for it.
+            assert!(multistep_feeds_armable(&[], live, pf_pending));
         }
 
         #[test]
@@ -4013,6 +4134,27 @@ mod amd_serve {
 
             stage_parked(&mut parked, &[]);
             assert_eq!(parked, [1, 1, 1, 1]);
+        }
+
+        #[test]
+        fn dense_exact_twin_counts_and_parks_only_rows_outside_advance() {
+            use crate::exec::kvrow::decode_dense_exact;
+            // Slot 0 decodes at 2047 keys, slot 1 is mid-chunked-prefill at frontier 4096, slot 2
+            // retains a 3000-row prefix, slot 3 is idle.
+            let mut kvlen = vec![
+                slot_decode_position(2046, true, None, true) + 1,
+                4097,
+                slot_decode_position(3000, false, None, true) + 1,
+                slot_decode_position(0, false, None, true) + 1,
+            ];
+            let mut parked = vec![0; 4];
+            stage_parked(&mut parked, &[0]);
+            assert!(!decode_dense_exact(&kvlen, &[], 2048));
+            assert!(decode_dense_exact(&kvlen, &parked, 2048));
+            super::park_kvlen(&mut kvlen, &parked);
+            assert_eq!(kvlen, [2047, 1, 1, 1]);
+            kvlen[0] = 2049;
+            assert!(!decode_dense_exact(&kvlen, &parked, 2048));
         }
 
         #[test]

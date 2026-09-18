@@ -16,13 +16,61 @@ pub(crate) enum Lowering {
     AddNorm,
     /// `NormResidualNorm`, with or without the layer scalar.
     NormResidualNorm,
+    /// `NormLinear`: fusion of preceding RMSNorm or LayerNorm into linear projections (Q/K/V/gate/up/lm_head).
+    NormLinear,
+    /// `GatedMlp`: activation(gate) * up fused into SwiGLU / GeGLU.
+    GatedMlp,
+    /// `NormRope`: Q/K norm fused into RoPE or RoPE + Head scale.
+    NormRope,
+    /// `Residual3Norm`: 3-way residual combine + norm (MoE block boundary).
+    Residual3Norm,
 }
 
 impl Lowering {
-    fn kinds(self) -> &'static [&'static str] {
+    pub(crate) fn kinds(self) -> &'static [&'static str] {
         match self {
             Lowering::AddNorm => &["FusedResidualNorm", "FusedResidual3Norm"],
             Lowering::NormResidualNorm => &["FusedNormResidualNorm", "FusedNormResidualScaleNorm"],
+            Lowering::NormLinear => &[
+                "FusedNormLinear",
+                "FusedZeroCenteredNormLinear",
+                "FusedNormLinearBias",
+                "FusedLayerNormLinear",
+            ],
+            Lowering::GatedMlp => &["SwiGLU"],
+            Lowering::NormRope => &[
+                "FusedNormRope",
+                "FusedZeroCenteredNormRope",
+                "FusedNormRopeScale",
+            ],
+            Lowering::Residual3Norm => &["FusedResidual3Norm"],
+        }
+    }
+
+    pub(crate) fn egg_rules(self) -> &'static [&'static str] {
+        match self {
+            Lowering::AddNorm => &[
+                "residual-rmsnorm-fuse",
+                "residual-zero-centered-rmsnorm-fuse",
+                "residual-layernorm-fuse",
+            ],
+            Lowering::NormResidualNorm => &[
+                "norm-residual-rmsnorm-fuse",
+                "norm-residual-scale-rmsnorm-fuse",
+            ],
+            Lowering::NormLinear => &[
+                "rmsnorm-linear-fuse",
+                "zero-centered-rmsnorm-linear-fuse",
+                "rmsnorm-linearbias-fuse",
+                "layernorm-linear-fuse",
+            ],
+            Lowering::GatedMlp => &["gated-mlp-fuse"],
+            Lowering::NormRope => &[
+                "rmsnorm-rope-fuse",
+                "zero-centered-rmsnorm-rope-fuse",
+                "rmsnorm-rope-scale-fuse",
+            ],
+            Lowering::Residual3Norm => &["residual3-rmsnorm-fuse"],
         }
     }
 }
@@ -67,6 +115,32 @@ fn lowered(sites: &RewriteSites, lowering: Lowering, weight: &str) -> bool {
         .any(|kind| sites.get(*kind).is_some_and(|w| w.contains(weight)))
 }
 
+/// Check if any rewrite sites were installed.
+#[allow(dead_code)]
+pub(crate) fn has_sites() -> bool {
+    !SITES.load(Ordering::Acquire).is_null()
+}
+
+/// Retrieve the active rewrite sites if installed.
+pub(crate) fn active_sites() -> Option<RewriteSites> {
+    let ptr = SITES.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        unsafe { Some((*ptr).clone()) }
+    }
+}
+
+/// Query which egglog rules corresponding to `lowering` were matched for `anchor`.
+#[allow(dead_code)]
+pub(crate) fn query_lowering_rules(b: &Builder, lowering: Lowering, anchor: u32) -> Vec<String> {
+    if let Some(true) = fused(b, lowering, anchor) {
+        lowering.egg_rules().iter().map(|&s| s.to_string()).collect()
+    } else {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,7 +155,14 @@ mod tests {
 
     #[test]
     fn every_lowered_kind_is_a_rule_target() {
-        for lowering in [Lowering::AddNorm, Lowering::NormResidualNorm] {
+        for lowering in [
+            Lowering::AddNorm,
+            Lowering::NormResidualNorm,
+            Lowering::NormLinear,
+            Lowering::GatedMlp,
+            Lowering::NormRope,
+            Lowering::Residual3Norm,
+        ] {
             for kind in lowering.kinds() {
                 assert!(
                     RULES.contains(&format!("\n         ({kind} ")),

@@ -218,6 +218,19 @@
 #ifndef FA_DBUF
 #define FA_DBUF 0
 #endif
+/* The smaller HD512 Q-fragment live range wins every 2K/4K/8K metric for packet-stamped FP8
+ * bundles, but regresses BF16 at 2K. Keep generic/test and BF16 objects on the original chunk. */
+#ifndef FA_QCH_D512
+#if defined(PLOW_PACKET_HAS_GEMM_FP8) && PLOW_PACKET_HAS_GEMM_FP8
+#define FA_QCH_D512 8
+#else
+#define FA_QCH_D512 16
+#endif
+#endif
+/* A flat token-batch span walk keeps additional per-request bounds live. */
+#ifndef FA_QCH_D256_TB
+#define FA_QCH_D256_TB 16
+#endif
 /* Direct-to-LDS K/V staging (see [LDS-DMA-4B]). Default OFF: the register path is what every
  * shipped object is measured on. */
 #ifndef FA_LDS_DMA
@@ -444,8 +457,13 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
          *     the co-resident GEMM+flash interpreter to 260 regs -> 1 wave/SIMD -> INVALID_ISA under
          *     waves_per_eu(2,2). QCH=2 (still | 8) trims 8 VGPR to land at occ=2; the only cost is
          *     re-reading the L2-resident Q tile twice as often, negligible at D=128. D>=256 keeps 4. */
-        constexpr int QCH = (PLOW_WAVES <= 4) ? (FA_DBUF ? (NK < 16 ? NK : 16) : NK)
-                                              : (NK <= 8 ? 2 : 4);
+        constexpr int QCH = (PLOW_WAVES <= 4)
+                                ? (FA_DBUF
+                                       ? (D == 512 ? FA_QCH_D512
+                                                   : (D == 256 && TB ? FA_QCH_D256_TB
+                                                                    : (NK < 16 ? NK : 16)))
+                                       : NK)
+                                : (NK <= 8 ? 2 : 4);
         constexpr bool QHOIST = (QCH == NK);
         static_assert(NK % QCH == 0, "Q fragment chunk must divide the k-steps");
 
@@ -5653,6 +5671,198 @@ __device__ void d_index_select_pf(int* __restrict__ idx, const float* __restrict
     }
 }
 
+#ifndef PLOW_DSA_TP_SELECT_THR
+#define PLOW_DSA_TP_SELECT_THR 0
+#endif
+#if PLOW_DSA_TP_SELECT_THR
+/* op 118, threshold form (the TP adapter's `plow_dsa_tp_select_thr`, PLOW_DSA_SELECT_THRESHOLD).
+ * The same dsa_pack_key_a key and therefore the same selected set as d_index_select_pf<true>, in
+ * two row scans where that kernel takes five (4 radix passes + emit):
+ *   1. 12-bit MSB digits histogram the row (hf, coarse sums in hc for the serial walk) until the
+ *      boundary bin holds <= CAP keys; one scan per digit, the first usually suffices.
+ *   2. One collect scan emits every key above the boundary and copies the boundary keys to LDS.
+ *   3. A byte radix over those <= CAP keys picks the k_rem still needed.
+ * A boundary group needed whole ends the digits early and is emitted by the collect scan.
+ * LDS: hf[4096] u32, hc[256] u32, cand[CAP] u64, red[8] u32. Row order is unspecified. */
+template <unsigned CAP>
+__device__ void d_index_select_pf_thr(int* __restrict__ idx, const float* __restrict__ Score,
+                                      const int* __restrict__ kv_len, unsigned n_tok, unsigned top_k,
+                                      unsigned kv_stride, unsigned slice, unsigned nblk,
+                                      unsigned* hf, unsigned* hc, unsigned long long* cand,
+                                      unsigned* red, unsigned row_begin = 0u,
+                                      unsigned row_limit = ~0u) {
+    static_assert(CAP >= 1u && CAP * 8u <= 16384u, "boundary candidates live in LDS");
+    const auto* const Sc = as_glob(Score);
+    int* const ib = as_glob(idx);
+    const unsigned tid = threadIdx.x;
+    const unsigned len = (unsigned)as_glob(kv_len)[0];
+    const unsigned q_pos0 = len - n_tok;
+    const unsigned end = row_limit < n_tok ? row_limit : n_tok;
+    for (unsigned t = row_begin + slice; t < end; t += nblk) {
+        const unsigned row_len = q_pos0 + t + 1u;
+        int* const row = ib + (size_t)t * top_k;
+        if (row_len <= top_k) {
+            for (unsigned s = tid; s < top_k; s += PLOW_THREADS)
+                st_act<int>(&row[s], s < row_len ? (int)s : -1);
+            __syncthreads();
+            continue;
+        }
+        const float* const sr = Sc + (size_t)t * kv_stride;
+        unsigned long long prefix = 0ull, himask = 0ull;
+        unsigned k_rem = top_k, sh = 56u;
+        bool decided = false;
+        for (;;) {
+            const unsigned nbits = sh >= 12u ? 12u : sh;
+            sh -= nbits;
+            const unsigned nb = 1u << nbits;
+            for (unsigned i = tid; i < nb; i += PLOW_THREADS) hf[i] = 0u;
+            __syncthreads();
+            unsigned s = tid;
+            for (; s + 7u * PLOW_THREADS < row_len; s += 8u * PLOW_THREADS) {
+                float v[8];
+#pragma unroll
+                for (int u = 0; u < 8; u++) v[u] = sr[s + (unsigned)u * PLOW_THREADS];
+#pragma unroll
+                for (int u = 0; u < 8; u++) {
+                    const unsigned long long key =
+                        dsa_pack_key_a(v[u], s + (unsigned)u * PLOW_THREADS, row_len);
+                    if ((key & himask) == prefix)
+                        atomicAdd(&hf[(unsigned)((key >> sh) & (nb - 1u))], 1u);
+                }
+            }
+            for (; s < row_len; s += PLOW_THREADS) {
+                const unsigned long long key = dsa_pack_key_a(sr[s], s, row_len);
+                if ((key & himask) == prefix) atomicAdd(&hf[(unsigned)((key >> sh) & (nb - 1u))], 1u);
+            }
+            __syncthreads();
+            const unsigned cw = nb >= 256u ? nb / 256u : 1u, nc = nb / cw;
+            for (unsigned i = tid; i < nc; i += PLOW_THREADS) {
+                unsigned a = 0u;
+                for (unsigned j = 0; j < cw; j++) a += hf[i * cw + j];
+                hc[i] = a;
+            }
+            __syncthreads();
+            if (tid == 0) {
+                unsigned acc = 0, c = 0;
+                for (int d = (int)nc - 1; d >= 0; d--) {
+                    if (acc + hc[d] >= k_rem) {
+                        c = (unsigned)d;
+                        break;
+                    }
+                    acc += hc[d];
+                }
+                unsigned dsel = c * cw, bnd = 0;
+                for (int d = (int)((c + 1u) * cw) - 1; d >= (int)(c * cw); d--) {
+                    const unsigned hd = hf[d];
+                    if (acc + hd >= k_rem) {
+                        dsel = (unsigned)d;
+                        bnd = hd;
+                        break;
+                    }
+                    acc += hd;
+                }
+                red[0] = dsel;
+                red[1] = acc;
+                red[2] = bnd;
+            }
+            __syncthreads();
+            prefix |= (unsigned long long)red[0] << sh;
+            himask |= (unsigned long long)(nb - 1u) << sh;
+            k_rem -= red[1];
+            const unsigned bnd = red[2];
+            __syncthreads();
+            if (bnd == k_rem || sh == 0u) {
+                decided = true;
+                break;
+            }
+            if (bnd <= CAP) break;
+        }
+        if (tid == 0) {
+            red[3] = 0u;
+            red[4] = 0u;
+        }
+        __syncthreads();
+        unsigned s = tid;
+        for (; s + 7u * PLOW_THREADS < row_len; s += 8u * PLOW_THREADS) {
+            float v[8];
+#pragma unroll
+            for (int u = 0; u < 8; u++) v[u] = sr[s + (unsigned)u * PLOW_THREADS];
+#pragma unroll
+            for (int u = 0; u < 8; u++) {
+                const unsigned pos = s + (unsigned)u * PLOW_THREADS;
+                const unsigned long long key = dsa_pack_key_a(v[u], pos, row_len);
+                const unsigned long long m = key & himask;
+                if (m > prefix || (decided && m == prefix)) {
+                    const unsigned slot = atomicAdd(&red[3], 1u);
+                    if (slot < top_k) st_act<int>(&row[slot], (int)pos);
+                } else if (m == prefix) {
+                    const unsigned c = atomicAdd(&red[4], 1u);
+                    if (c < CAP) cand[c] = key;
+                }
+            }
+        }
+        for (; s < row_len; s += PLOW_THREADS) {
+            const unsigned long long key = dsa_pack_key_a(sr[s], s, row_len);
+            const unsigned long long m = key & himask;
+            if (m > prefix || (decided && m == prefix)) {
+                const unsigned slot = atomicAdd(&red[3], 1u);
+                if (slot < top_k) st_act<int>(&row[slot], (int)s);
+            } else if (m == prefix) {
+                const unsigned c = atomicAdd(&red[4], 1u);
+                if (c < CAP) cand[c] = key;
+            }
+        }
+        __syncthreads();
+        const unsigned n_cand = red[4];
+        __syncthreads();
+        if (decided) continue;
+        while (sh > 0u) {
+            const unsigned nbits = sh >= 8u ? 8u : sh;
+            sh -= nbits;
+            const unsigned nb = 1u << nbits;
+            for (unsigned i = tid; i < nb; i += PLOW_THREADS) hc[i] = 0u;
+            __syncthreads();
+            for (unsigned i = tid; i < n_cand; i += PLOW_THREADS) {
+                const unsigned long long k = cand[i];
+                if ((k & himask) == prefix) atomicAdd(&hc[(unsigned)((k >> sh) & (nb - 1u))], 1u);
+            }
+            __syncthreads();
+            if (tid == 0) {
+                unsigned acc = 0, dsel = 0, bnd = 0;
+                for (int d = (int)nb - 1; d >= 0; d--) {
+                    const unsigned hd = hc[d];
+                    if (acc + hd >= k_rem) {
+                        dsel = (unsigned)d;
+                        bnd = hd;
+                        break;
+                    }
+                    acc += hd;
+                }
+                red[0] = dsel;
+                red[1] = acc;
+                red[2] = bnd;
+            }
+            __syncthreads();
+            prefix |= (unsigned long long)red[0] << sh;
+            himask |= (unsigned long long)(nb - 1u) << sh;
+            k_rem -= red[1];
+            const unsigned bnd = red[2];
+            __syncthreads();
+            if (bnd == k_rem) break;
+        }
+        for (unsigned i = tid; i < n_cand; i += PLOW_THREADS) {
+            const unsigned long long k = cand[i];
+            if ((k & himask) >= prefix) {
+                const unsigned slot = atomicAdd(&red[3], 1u);
+                if (slot < top_k)
+                    st_act<int>(&row[slot], (int)(row_len - 1u - (unsigned)(k & 0xFFFFFFull)));
+            }
+        }
+        __syncthreads();
+    }
+}
+#endif
+
 #ifndef PLOW_DSA_SELECT_SPLIT
 #define PLOW_DSA_SELECT_SPLIT 0
 #endif
@@ -5951,7 +6161,12 @@ __device__ void d_index_union_pf(unsigned char* __restrict__ uni,
             const unsigned qi = qt * P + ql;
             if (qi >= n_tok) continue;
             const int s = as_glob(idx)[(size_t)qi * top_k + (e % top_k)];
-            if (s >= 0) atomicOr(&mrow[s], 1ull << ql);
+            /* Upper bound too, not just the -1 pad: `idx` is device data, and a position at or
+             * past tile_end is both out of causal range for every query in this tile and, past
+             * kv_stride, a write outside `umask` (measured: garbage from a bailed TP select
+             * faulted here, "Write access to a read-only page"). Below kv_stride but past
+             * tile_end it would also leave a bit the zeroing and compaction above never visit. */
+            if (s >= 0 && (unsigned)s < tile_end) atomicOr(&mrow[s], 1ull << ql);
         }
         __syncthreads();
         /* ordered compaction: chunked block scan over [0, tile_end). */

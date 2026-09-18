@@ -103,6 +103,9 @@ int main(int argc, char** argv){
 
     // final precise measure of best algo
     LCHK(gemm.initialize(algos[bestIdx].algo, ws));
+    int algoIdx = hipblaslt_ext::getIndexFromAlgo(algos[bestIdx].algo);
+    std::string solution = hipblaslt_ext::getSolutionNameFromAlgo(handle, algos[bestIdx].algo);
+    std::string kernel = hipblaslt_ext::getKernelNameFromAlgo(handle, algos[bestIdx].algo);
     for(int r=0;r<10;++r) gemm.run(stream); CHK(hipStreamSynchronize(stream));
     int iters = (M==1)?300:80;
     CHK(hipEventRecord(ev0,stream));
@@ -114,8 +117,9 @@ int main(int argc, char** argv){
     double tflops = flops/ (us*1e-6) /1e12;
     double bytes = (double)szA + szB + szC;
     double tbs = bytes/(us*1e-6)/1e12;
-    printf("%-9s %6ld %6ld %6ld | %10.2f %8.1f | %9.3f %8.4f  [%d/%zu algos]\n",
-           sh.name,M,N,K,us,tflops,tbs,bytes/1e9,supported,algos.size());
+    printf("%-9s %6ld %6ld %6ld | %10.2f %8.1f | %9.3f %8.4f  [algo=%d supported=%d/%zu]\n",
+           sh.name,M,N,K,us,tflops,tbs,bytes/1e9,algoIdx,supported,algos.size());
+    printf("# selected algo=%d solution=%s kernel=%s\n", algoIdx, solution.c_str(), kernel.c_str());
     fflush(stdout);
     hipFree(dA);hipFree(dB);hipFree(dC);
    }

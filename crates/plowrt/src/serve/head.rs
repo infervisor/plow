@@ -105,6 +105,7 @@ pub struct HeadPool {
     contract: Vec<KvSlotTensor>,
     digest: String,
     pools: Vec<(String, u32)>,
+    head_majors: Vec<(String, kv_handoff::HeadMajorLayout)>,
     rows_per_slot: u32,
     /// Compiled prefill buckets `(program, rows)` — the abandon granularity.
     buckets: Vec<(usize, u32)>,
@@ -142,8 +143,14 @@ impl HeadPool {
         let blob = crate::asset::devblob::DevBlob::parse(&bytes)?;
         let names: Vec<String> = blob.tensors.iter().map(|t| t.name.clone()).collect();
         let mut pools = Vec::new();
+        let mut head_majors = Vec::new();
         for p in &blob.progs {
-            kv_handoff::check_seq_major(&p.insts, &names)?;
+            kv_handoff::check_transferable(&p.insts, &names)?;
+            for entry in kv_handoff::head_major_caches(&p.insts, &names) {
+                if !head_majors.iter().any(|(n, _)| n == &entry.0) {
+                    head_majors.push(entry);
+                }
+            }
             for entry in kv_handoff::pooled_caches(&p.insts, &names) {
                 if !pools.contains(&entry) {
                     pools.push(entry);
@@ -165,6 +172,26 @@ impl HeadPool {
                 "CPU twin declares no transferable KV cache; nothing to hand over".into(),
             ));
         }
+        for (hm_name, _) in &head_majors {
+            if hm_name.ends_with(".k") || hm_name.ends_with(".v") {
+                let scale_k = format!("{hm_name}_scale");
+                let scale_dot = format!("{hm_name}.scale");
+                if contract.iter().any(|t| t.name == scale_k)
+                    && !head_majors.iter().any(|(n, _)| n == &scale_k)
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "head-major cache `{hm_name}` scale tensor `{scale_k}` is not registered"
+                    )));
+                }
+                if contract.iter().any(|t| t.name == scale_dot)
+                    && !head_majors.iter().any(|(n, _)| n == &scale_dot)
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "head-major cache `{hm_name}` scale tensor `{scale_dot}` is not registered"
+                    )));
+                }
+            }
+        }
         let digest = kvrow::kv_contract_digest(&contract);
 
         let buckets = eng.prefill_buckets();
@@ -181,6 +208,7 @@ impl HeadPool {
             rows_per_slot,
             caches = contract.len(),
             pooled = pools.len(),
+            head_major = head_majors.len(),
             kv_contract = %digest,
             "CPU prefill head pool ready"
         );
@@ -189,6 +217,7 @@ impl HeadPool {
             contract,
             digest,
             pools,
+            head_majors,
             rows_per_slot,
             buckets,
             slots,
@@ -257,6 +286,7 @@ impl HeadPool {
             &self.contract,
             self.rows_per_slot,
             &self.pools,
+            &self.head_majors,
             src,
             dst,
             rows,

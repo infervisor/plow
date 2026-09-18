@@ -16,7 +16,7 @@ impl Region {
         if self.ring == 0 {
             1
         } else {
-            self.heads as usize * 2
+            self.heads as usize * 4
         }
     }
     pub fn bytes(&self) -> u64 {
@@ -44,6 +44,38 @@ impl Region {
                     head * self.ring as u64 * self.row_bytes,
                     (span.rows - span.first) * self.row_bytes,
                 );
+            }
+        }
+    }
+
+    pub fn restore_spans(&self, rows: u32, dirty_rows: u32, mut copy: impl FnMut(u64, u64, u64)) {
+        if self.ring == 0 || dirty_rows >= self.ring {
+            self.copy_spans(rows, copy);
+            return;
+        }
+        let span = RingWindow::new(rows.into(), self.window.into(), self.ring.into());
+        let ring = u64::from(self.ring);
+        let parts = |start: u64, len: u64| {
+            let first = len.min(ring - start);
+            [(start, first, 0), (0, len - first, first)]
+        };
+        let saved = parts(span.start, span.rows);
+        let dirty = parts(u64::from(rows) & (ring - 1), u64::from(dirty_rows));
+        for head in 0..self.heads as u64 {
+            let snapshot = head * self.window as u64 * self.row_bytes;
+            let live = head * self.ring as u64 * self.row_bytes;
+            for &(saved_start, saved_len, saved_offset) in &saved {
+                for &(dirty_start, dirty_len, _) in &dirty {
+                    let start = saved_start.max(dirty_start);
+                    let end = (saved_start + saved_len).min(dirty_start + dirty_len);
+                    if start < end {
+                        copy(
+                            snapshot + (saved_offset + start - saved_start) * self.row_bytes,
+                            live + start * self.row_bytes,
+                            (end - start) * self.row_bytes,
+                        );
+                    }
+                }
             }
         }
     }
@@ -173,6 +205,56 @@ pub(super) fn snapshot_regions<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_restore_copies_only_ring_rows_overwritten_after_snapshot() {
+        let region = Region {
+            tensor: 0,
+            slot_bytes: 4096,
+            heads: 2,
+            ring: 1024,
+            window: 1024,
+            row_bytes: 2,
+        };
+        let mut spans = Vec::new();
+        region.restore_spans(1536, 128, |dst, src, bytes| spans.push((dst, src, bytes)));
+        assert_eq!(spans, [(0, 1024, 256), (2048, 3072, 256)]);
+
+        spans.clear();
+        region.restore_spans(1984, 128, |dst, src, bytes| spans.push((dst, src, bytes)));
+        assert_eq!(
+            spans,
+            [
+                (0, 1920, 128),
+                (128, 0, 128),
+                (2048, 3968, 128),
+                (2176, 2048, 128),
+            ]
+        );
+    }
+
+    #[test]
+    fn delta_restore_skips_unoverwritten_rows_when_ring_exceeds_window() {
+        let region = Region {
+            tensor: 0,
+            slot_bytes: 4096,
+            heads: 1,
+            ring: 2048,
+            window: 1024,
+            row_bytes: 2,
+        };
+        let mut spans = Vec::new();
+        region.restore_spans(1536, 1024, |dst, src, bytes| spans.push((dst, src, bytes)));
+        assert!(spans.is_empty());
+
+        region.restore_spans(1536, 1152, |dst, src, bytes| spans.push((dst, src, bytes)));
+        assert_eq!(spans, [(0, 1024, 256)]);
+
+        spans.clear();
+        region.restore_spans(3000, 1152, |dst, src, bytes| spans.push((dst, src, bytes)));
+        assert_eq!(spans, [(0, 3952, 144), (144, 0, 112)]);
+    }
+
     #[test]
     fn emitted_gemma_bf16_and_fp8_kv_keep_window_sized_snapshots_and_all_rungs() {
         if std::env::var_os("PLOW_PREFIX_EMIT_CHILD").is_none() {
@@ -230,7 +312,19 @@ mod tests {
                 [1, 2, 4]
             );
             assert_eq!(
-                blob.prefill_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+                blob.prefill_progs()
+                    .iter()
+                    .filter(|p| !packet::devbuild::is_packed_prefill_program(p.t))
+                    .map(|p| p.t)
+                    .collect::<Vec<_>>(),
+                [128, 512, 1024]
+            );
+            assert_eq!(
+                blob.prefill_progs()
+                    .iter()
+                    .filter(|p| packet::devbuild::is_packed_prefill_program(p.t))
+                    .map(|p| packet::devbuild::program_rows(p.t))
+                    .collect::<Vec<_>>(),
                 [128, 512, 1024]
             );
             let regions = snapshot_regions(

@@ -368,6 +368,72 @@ fn apply_program(model: &mut Model, index: usize, head: bool) -> Result<Vec<u8>,
     Ok(roles)
 }
 
+/// Copy the tune store's exact-shape cuBLASLt algorithm rows for every prefill projection this
+/// packet routes to Lt into `<out>/cublaslt_algos.jsonl`, the table `plowrt --lt-algos` pins.
+///
+/// The store is `<tunedb_root>/nvidia/<profile without '_'>/<cell>/cublaslt_algos.jsonl`, the
+/// JSONL `plowrt --lt-algos-write` produces (`device::cuda::lt::StoredAlgo`); rows are matched on
+/// `(m, n, k, dtype)` only. Over-inclusion is safe: the runtime re-validates each entry with
+/// `cublasLtMatmulAlgoCheck` and falls back to its heuristic, so a row from another cell of the
+/// same architecture can at worst cost the load-time re-selection it would have paid anyway.
+/// Returns how many shapes were packetized; `Ok(0)` when the store has nothing for the target.
+pub(crate) fn packetize_algo_table(
+    model: &Model,
+    profile: &str,
+    tune_root: &std::path::Path,
+    out: &std::path::Path,
+) -> Result<usize, String> {
+    let mut shapes = std::collections::BTreeSet::new();
+    for index in 0..packet::devbuild::decode_rung_lo(&model.prog_t) {
+        let rows = model.prog_t[index];
+        for op in &model.progs[index].insts {
+            if prefill_eligible(model, op, rows, profile) {
+                shapes.insert((op.i[0], op.i[1], op.i[2]));
+            }
+        }
+    }
+    if shapes.is_empty() {
+        return Ok(0);
+    }
+    let arch_dir = tune_root.join("nvidia").join(profile.replace('_', ""));
+    let Ok(cells) = std::fs::read_dir(&arch_dir) else {
+        return Ok(0);
+    };
+    let mut rows: std::collections::BTreeMap<(u32, u32, u32), String> = Default::default();
+    for cell in cells.flatten() {
+        let table = cell.path().join("cublaslt_algos.jsonl");
+        let Ok(text) = std::fs::read_to_string(&table) else {
+            continue;
+        };
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .map_err(|e| format!("{}: {e}", table.display()))?;
+            let key = (
+                value["m"].as_u64().unwrap_or(0) as u32,
+                value["n"].as_u64().unwrap_or(0) as u32,
+                value["k"].as_u64().unwrap_or(0) as u32,
+            );
+            if value["dtype"] == "bf16" && shapes.contains(&key) {
+                // Later cells override earlier ones for the same shape; the runtime's
+                // AlgoCheck decides whether the row applies to the GPU it runs on.
+                rows.insert(key, line.to_string());
+            }
+        }
+    }
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let dir = if out.is_dir() {
+        out
+    } else {
+        out.parent().unwrap_or(out)
+    };
+    let path = dir.join("cublaslt_algos.jsonl");
+    let text: String = rows.values().map(|l| format!("{l}\n")).collect();
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(rows.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

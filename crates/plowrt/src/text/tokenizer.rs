@@ -104,7 +104,9 @@ const SPLIT_SAFE_PATTERNS: &[&str] = &[
 #[cfg(feature = "hf-tokenizer")]
 const QWEN2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-/// Smallest piece a split encode hands a thread.
+/// Smallest piece a split encode hands a thread, unless `PLOW_ENCODE_SPLIT_MIN` overrides it.
+/// This is the real cap on a prompt's encode parallelism, not the pool size: an 8192-token prompt
+/// is about 32 KB, so at 4096 it splits 8 ways however many threads the pool has.
 #[cfg(feature = "hf-tokenizer")]
 const SPLIT_MIN_BYTES: usize = 4096;
 
@@ -171,7 +173,10 @@ fn encode_split(
     add_special_tokens: bool,
 ) -> Option<Vec<u32>> {
     use rayon::prelude::*;
-    let parts = (text.len() / SPLIT_MIN_BYTES).min(pool.current_num_threads());
+    let floor = crate::config::RuntimeConfig::get()
+        .encode_split_min
+        .map_or(SPLIT_MIN_BYTES, |n| (n as usize).max(1));
+    let parts = (text.len() / floor).min(pool.current_num_threads());
     if parts < 2 {
         return None;
     }

@@ -18,18 +18,23 @@ static void run_op(plow_cpu_kernel_fn f, PlowDevInst* in, void** T, uint32_t nbl
     for (uint32_t s = 0; s < nblk; s++) f(in, s, nblk, T, ctx);
 }
 
+static float route_logit_at(const void* logit, size_t i, uint32_t flags) {
+    return (flags & 8u) ? ((const float*)logit)[i] : plow_bf2f(((const plow_bf16*)logit)[i]);
+}
+
 /* `ties`: snap the logits to a few levels (or one) so that many packed selection keys are EXACTLY
  * equal — the case where a rank computed another way silently picks a different expert. */
 static void test_route(uint32_t E, uint32_t k, uint32_t T, uint32_t flags, int with_bias, uint32_t nblk, PlowCpuCtx* ctx,
                        int ties) {
-    plow_bf16* logit = malloc((size_t)T * E * 2);
+    void* logit = malloc((size_t)T * E * ((flags & 8u) ? 4u : 2u));
     float* bias = malloc(E * 4);
     plow_moe_route* tab = calloc((size_t)T * k, sizeof(plow_moe_route));
     for (size_t i = 0; i < (size_t)T * E; i++) {
         double v = nr() * 2.0;
         if (ties == 1) v = (double)(int)v;
         if (ties == 2) v = 0.5;
-        logit[i] = plow_f2bf((float)v);
+        if (flags & 8u) ((float*)logit)[i] = (float)v;
+        else ((plow_bf16*)logit)[i] = plow_f2bf((float)v);
     }
     for (uint32_t e = 0; e < E; e++) bias[e] = ties ? 0.0f : (float)(nr() * 0.05);
     void* Tt[4] = {tab, logit, NULL, with_bias ? bias : NULL};
@@ -48,9 +53,9 @@ static void test_route(uint32_t E, uint32_t k, uint32_t T, uint32_t flags, int w
     free(gtab);
     double* sc = malloc(E * 8);
     for (uint32_t t = 0; t < T; t++) {
-        const plow_bf16* lg = logit + (size_t)t * E;
-        if (flags & 1) { for (uint32_t e = 0; e < E; e++) sc[e] = 1.0 / (1.0 + exp(-(double)plow_bf2f(lg[e]))); }
-        else { double m = -1e300, s = 0; for (uint32_t e = 0; e < E; e++) { sc[e] = plow_bf2f(lg[e]); if (sc[e] > m) m = sc[e]; }
+        const size_t logit_row = (size_t)t * E;
+        if (flags & 1) { for (uint32_t e = 0; e < E; e++) sc[e] = 1.0 / (1.0 + exp(-(double)route_logit_at(logit, logit_row + e, flags))); }
+        else { double m = -1e300, s = 0; for (uint32_t e = 0; e < E; e++) { sc[e] = route_logit_at(logit, logit_row + e, flags); if (sc[e] > m) m = sc[e]; }
                for (uint32_t e = 0; e < E; e++) { sc[e] = exp(sc[e] - m); s += sc[e]; } for (uint32_t e = 0; e < E; e++) sc[e] /= s; }
         /* reference top-k by biased score, lower id wins ties */
         uint32_t used[256] = {0}; double gsum = 0; uint32_t win[16];
@@ -129,6 +134,7 @@ int main(void) {
         test_route(32, 4, 1, 2, 0, nblk, &ctx, 0);      /* GPT-OSS decode: softmax + norm_topk */
         test_route(32, 4, 37, 2, 0, nblk, &ctx, 0);     /* GPT-OSS prefill */
         test_route(256, 8, 5, 1, 1, nblk, &ctx, 0);     /* GLM-style: sigmoid + selection bias */
+        test_route(256, 8, 5, 1 | 4 | 8, 1, nblk, &ctx, 0); /* GLM f32 router logits */
         test_route(64, 2, 129, 0, 0, nblk, &ctx, 0);    /* plain softmax, unnormalised */
         test_route(32, 4, 37, 2, 0, nblk, &ctx, 1);     /* few distinct logits: heavy ties */
         test_route(128, 8, 9, 1, 1, nblk, &ctx, 1);     /* ties + sigmoid + bias */

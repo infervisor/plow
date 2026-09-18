@@ -502,6 +502,11 @@ class Gemma4LadderCampaignTests(unittest.TestCase):
             '\x1b[3mcalls\x1b[0m=\x1b[0m2\n'
         )
         prefix_gate.validate(report, ansi_log, rows)
+        with self.assertRaisesRegex(ValueError, "VMM KV route"):
+            prefix_gate.validate(report, log, rows, require_vmm=True)
+        prefix_gate.validate(
+            report, 'AMD engine ready vmm=true\n' + log, rows, require_vmm=True
+        )
         with self.assertRaisesRegex(ValueError, "two-suffix co-pack"):
             prefix_gate.validate(report, log.replace("rows=1024", "rows=512"), rows)
 

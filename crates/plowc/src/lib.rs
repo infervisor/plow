@@ -2162,7 +2162,7 @@ fn verify_A(bucket: &str) -> Result<bool, PlowcError> {
 /// an annotation dangles without a rewrite, so the catalog submitted to
 /// checkpoint A is exactly the set of rules the engine may fire.
 #[cfg(feature = "lean-verify")]
-fn parse_rule_catalog(src: &str) -> Result<Vec<String>, PlowcError> {
+pub fn parse_rule_catalog(src: &str) -> Result<Vec<String>, PlowcError> {
     let mut names: Vec<String> = Vec::new();
     let mut pending: Option<String> = None;
     for (i, line) in src.lines().enumerate() {

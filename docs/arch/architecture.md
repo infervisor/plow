@@ -36,6 +36,7 @@ duplicate them and is now an index only.
 | [18](18-serving-metrics.md) | **Serving Metrics** | Model-scoped Prometheus metrics, vLLM compatibility, request/tick accounting and lifecycle |
 | [19](19-packet-extensions.md) | **Packet Extensions** | Adding prefill buckets, decode rungs, packed siblings and token-batch bodies to a packet that is already compiled, without re-emitting it |
 | [20](20-asr-pipelines.md) | **ASR Packet Pipelines** | Qwen causal and Nemotron RNNT compilation, runtime, batching and serving |
+| [22](22-kv-cache.md) | **KV Cache** | Head-major ring layout, chunk-sized rings, the write and read paths, fp8 KV, slots, the VMM allocator and the prefix cache |
 
 ---
 

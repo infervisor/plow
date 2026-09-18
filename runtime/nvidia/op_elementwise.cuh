@@ -116,21 +116,40 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
                       const __nv_bfloat16* __restrict__ up, unsigned n, unsigned act,
                       unsigned slice, unsigned nblk) {
     const unsigned stride = nblk * PLOW_NV_THREADS * 8;
-    for (unsigned i = (slice * PLOW_NV_THREADS + threadIdx.x) * 8; i < n; i += stride) {
-        if (i + 8 <= n) {
-            const bf16v8 vg = ld_glob8(gate + i), vu = ld_glob8(up + i);
-            bf16v8 vo;
+    const unsigned i0 = (slice * PLOW_NV_THREADS + threadIdx.x) * 8;
+    const unsigned nfull = n & ~7u;
+    /* Four gate/up pairs (128 B per thread) are LOADED before any is consumed. `#pragma unroll`
+     * alone changed nothing (h100 seg-time 291 -> 293 us at 4096 rows): ld_glob8/st_glob8 are
+     * uint4 punning, so the compiler keeps each iteration's loads behind the previous store.
+     * The n % 8 tail is its own loop below. */
+    auto glu8 = [&](const bf16v8& vg, const bf16v8& vu) {
+        bf16v8 vo;
 #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                const float g = __bfloat162float(vg.x[j]);
-                float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+        for (int j = 0; j < 8; j++) {
+            const float g = __bfloat162float(vg.x[j]);
+            float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
 #if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
-                if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
+            if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
 #endif
-                vo.x[j] = __float2bfloat16(a * __bfloat162float(vu.x[j]));
-            }
-            st_glob8(out + i, vo);
-        } else {
+            vo.x[j] = __float2bfloat16(a * __bfloat162float(vu.x[j]));
+        }
+        return vo;
+    };
+    unsigned i = i0;
+    for (; i + 3u * stride < nfull; i += 4u * stride) {
+        bf16v8 vg[4], vu[4];
+#pragma unroll
+        for (int u = 0; u < 4; u++) {
+            vg[u] = ld_glob8(gate + i + (unsigned)u * stride);
+            vu[u] = ld_glob8(up + i + (unsigned)u * stride);
+        }
+#pragma unroll
+        for (int u = 0; u < 4; u++) st_glob8(out + i + (unsigned)u * stride, glu8(vg[u], vu[u]));
+    }
+    for (; i < nfull; i += stride) st_glob8(out + i, glu8(ld_glob8(gate + i), ld_glob8(up + i)));
+    if (nfull < n) {
+        for (unsigned i = i0; i < n; i += stride) {
+            if (i < nfull) continue;
             for (unsigned j = i; j < n; j++) {
                 const float g = __bfloat162float(gate[j]);
                 float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);

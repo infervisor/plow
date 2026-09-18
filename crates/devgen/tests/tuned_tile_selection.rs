@@ -354,11 +354,11 @@ fn gfx942_measurements_reach_the_compiler() {
     assert!(
         usable > 0,
         "the gfx942 cell holds {on_disk} record(s) and the compiler can use NONE of them for \
-         GLM's own measured shapes: every record is STALE against the current build digest, so \
+         GLM's own measured shapes: their records are stale or absent from the current build, so \
          tile selection silently fell back to the analytical model and reports tier `portable` \
          -- which is byte-identical to what it reports when nothing was ever measured. The \
-         staleness key is defines + toolchain + preprocessed-source digest, so ONE edit under \
-         runtime/amd/ re-stales the whole store. Re-run the campaign AGAINST THE SHIPPING \
+         staleness key is defines + toolchain + the preprocessed dense-GEMM source digest. \
+         Re-run the campaign AGAINST THE SHIPPING \
          OBJECT RECIPE (the defines participate in the digest, so a campaign run against a \
          different -D set is stale on arrival), then plowc tune ingest. \
          `plowc tune status --gpu MI300X` prints the digest census."

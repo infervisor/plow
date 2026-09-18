@@ -363,6 +363,7 @@ pub fn classify(op: DevOp) -> OpClass {
         ),
         DevOp::GemmBlkPf => a_rows("i0=T; native FP8 projection has no per-sequence state"),
         DevOp::Gemm | DevOp::GemmSmall | DevOp::GemmMed | DevOp::GemmWide | DevOp::GemmC5
+        | DevOp::GemmF32
         | DevOp::GemvAffineQ4 | DevOp::GemmAffineQ4 => {
             a_rows("i0=M")
         }
@@ -526,6 +527,9 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::XReduce => a_elem("i0=H (host sets the live element count)"),
         DevOp::XAllGather => a_elem("i0/i1/i2 = per-array element counts"),
         DevOp::XAllToAllHeads => a_elem("i0=rpr, i1=nh_l, i2=d, i3=nh_total"),
+        DevOp::DcpKvPack => a_rows("i0=n_batch"),
+        DevOp::XDcpGather => a_rows("i0=n_batch"),
+        DevOp::DcpKvScatter => a_rows("i0=rows"),
         DevOp::XReduceTwoShot => a_elem("i0=n (= t*hidden)"),
         DevOp::XReduceAddNorm => a_one("i0=feat, one row, must fit one workgroup"),
         // interp.hip:5421 documents i0=nparts i1=n_batch i2=vocab_l i3=gate
@@ -537,10 +541,23 @@ pub fn classify(op: DevOp) -> OpClass {
              i0=nparts i1=n_batch i2=vocab_l i3=gate i4=val_slot and takes n_gpu from the \
              kernarg. Classified from the interpreter",
         ),
-        DevOp::XReduceScatter => no_body(
-            "i0=n",
-            "class A by operand shape, but op_collective.h has no arm; a packet carrying one \
-             must be refused at load (PLOW_SEQ_PAR_SEAMS)",
+        // WAS `no_body`, and that was stale: interp.hip:5832 dispatches
+        // `d_xreduce_scatter_mega` under PLOW_SEQ_PAR_SEAMS, and the shipping GLM TP8 packet
+        // carries 78-156 of these per prefill rung and runs them correctly. The old entry made
+        // op-audit report the one blocker it named as unfixable-from-here, when the arm had
+        // already landed.
+        //
+        // Class A by operand shape AND by body: the reduce-scatter is elementwise over the flat
+        // [n] partial, where rank r owns [n*r/N, n*(r+1)/N). Nothing in it is per-sequence —
+        // no position, no kv_len, no per-row table — so a packed launch whose `n` covers two
+        // requests' rows reduces them exactly as it reduces one's. `gcols`'s row arithmetic
+        // (row_w = nranks*gcols) is a fixed layout independent of which sequence a row is.
+        // The emitter's `rows % N != 0` refusal is an emit-time constraint on the band, not a
+        // packing one.
+        DevOp::XReduceScatter => note(
+            a_elem("i0=n"),
+            "host sets the live element count; op_collective.h:1668 d_xreduce_scatter_mega, \
+             dispatched at interp.hip:5832 under PLOW_SEQ_PAR_SEAMS",
         ),
         DevOp::XFlashMerge => no_body(
             "mirrors FlashMerge",

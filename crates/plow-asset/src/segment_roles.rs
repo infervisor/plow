@@ -38,11 +38,16 @@ pub const CUBLASLT_PREFILL_GEMMA4_SHAPES: [(u32, u32); 8] = [
 ];
 
 pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
+    // At M <= 512 the small set is the down projection (3840, 15360), the o projection
+    // (3840, 8192) and the unfused gate/up (15360, 3840): measured on H100 2026-09-17, Lt
+    // gate/up + a separate GeGLU pass beat the fused GLU role at every bucket Lt covered
+    // (TTFT@1024 89.9 -> 56.4 ms), so the shape is admitted at the small rows too.
+    // Every Gemma-4 projection at every rung: at 128 rows the native GEMM object still cost
+    // ~50 us per launch for the q/k/v and sliding-o shapes (~176 launches per chunk) while the
+    // cuBLASLt calls at the same M run 10-45 us (H100 2026-09-17, campaign tracker).
     matches!(profile, "sm90a" | "sm_90a")
-        && ((CUBLASLT_PREFILL_ROWS.contains(&m)
-            && matches!((n, k), (3840, 15360) | (3840, 8192)))
-            || (CUBLASLT_PREFILL_WIDE_ROWS.contains(&m)
-                && CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))))
+        && (CUBLASLT_PREFILL_ROWS.contains(&m) || CUBLASLT_PREFILL_WIDE_ROWS.contains(&m))
+        && CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
 }
 
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";
@@ -320,8 +325,9 @@ mod tests {
     fn cublaslt_prefill_policy_is_exactly_the_measured_sm90_bf16_cells() {
         for profile in ["sm90a", "sm_90a"] {
             for m in CUBLASLT_PREFILL_ROWS {
-                assert!(cublaslt_prefill_bf16(profile, m, 3840, 15360));
-                assert!(cublaslt_prefill_bf16(profile, m, 3840, 8192));
+                for (n, k) in CUBLASLT_PREFILL_GEMMA4_SHAPES {
+                    assert!(cublaslt_prefill_bf16(profile, m, n, k));
+                }
             }
             for m in CUBLASLT_PREFILL_WIDE_ROWS {
                 for (n, k) in CUBLASLT_PREFILL_GEMMA4_SHAPES {
@@ -337,8 +343,7 @@ mod tests {
             ("sm90a", 1024, 3840, 3840),
             ("sm90a", 1024, 15360, 8192),
             ("sm90a", 16384, 3840, 15360),
-            ("sm90a", 128, 15360, 3840),
-            ("sm90a", 128, 3840, 4096),
+            ("sm90a", 128, 3840, 3840),
         ] {
             assert!(!cublaslt_prefill_bf16(profile, m, n, k));
         }

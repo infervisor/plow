@@ -109,6 +109,12 @@ fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout(
     assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
     cfg.nv.vmm_prefix = Some(true);
     assert!(selected(&blob, &cfg, (12, 0), 2 << 20));
+    cfg.prefix_cache = false;
+    assert!(
+        !selected(&blob, &cfg, (9, 0), 2 << 20),
+        "PLOW_PREFIX_CACHE=0 wins over PLOW_VMM_PREFIX=1 and the auto heuristic"
+    );
+    cfg.prefix_cache = true;
     cfg.nv.vmm_prefix = None;
     for name in [
         plow_asset::mixed_step::SECTION,

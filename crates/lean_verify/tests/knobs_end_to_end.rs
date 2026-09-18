@@ -72,10 +72,6 @@ fn negative_fixtures_are_rejected() {
             &[("emit.glm_ofold", TRUE)],
             "ofold_excludes_dsa_pf_and_fp8_kv",
         ),
-        (
-            &[("emit.token_batch_tp", TRUE)],
-            "token_batch_tp_excludes_seq_par",
-        ),
     ];
     for (extra, id) in cases {
         let cert = check_knobs(&request(&glm, &glm_with(extra))).unwrap();

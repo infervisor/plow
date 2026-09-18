@@ -1859,14 +1859,27 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 
 #if PLOW_NV_GEMMA
-    /* E5 (rtx-19): fused lm_head GEMV + greedy-argmax epilogue (PLOW_FUSE_ARGMAX). M is always 1
-     * (greedy decode); x is offset by a_row0 (i4) exactly as GEMV. t3=part(u64[nblk]); f0=cap. */
-    case PLOW_DOP_GEMV_ARGMAX:
-        d_gemv_argmax((__nv_bfloat16*)TEN(0),
-                      (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
-                      (const __nv_bfloat16*)TEN(2), (unsigned long long*)TEN(3), in->i[1],
-                      in->i[2], in->fj[0].f, slice, nblk, (__nv_bfloat16*)arena);
+    /* E5 (rtx-19): fused lm_head GEMV + greedy-argmax epilogue (PLOW_FUSE_ARGMAX).
+     * M sequences (M in i0): x is offset by a_row0 (i4), part is [M][nblk]; f0=cap. */
+    case PLOW_DOP_GEMV_ARGMAX: {
+        const unsigned M = in->i[0] ? in->i[0] : 1u;
+        const unsigned N = in->i[1];
+        const unsigned K = in->i[2];
+        const float cap = in->fj[0].f;
+        const __nv_bfloat16* x_base = (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * K;
+        __nv_bfloat16* c_base = (__nv_bfloat16*)TEN(0);
+        unsigned long long* part_base = (unsigned long long*)TEN(3);
+        const __nv_bfloat16* W = (const __nv_bfloat16*)TEN(2);
+        for (unsigned m = 0; m < M; m++) {
+            d_gemv_argmax(c_base + (size_t)m * N,
+                          x_base + (size_t)m * K,
+                          W,
+                          part_base + (size_t)m * nblk,
+                          N, K, cap, slice, nblk, (__nv_bfloat16*)arena);
+            __syncthreads();
+        }
         break;
+    }
 #endif
 
     /* Kernel arg order is (Nq, Nk, Nv, K): K lives in i2 but is passed LAST. */

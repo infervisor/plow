@@ -4,6 +4,14 @@ use crate::exec::kvrow::KDA_ROW_COUNT_OPS;
 use packet::dev::PREFILL_SPAN_RESET_STATE;
 
 #[test]
+fn vmm_kv_is_automatic_only_for_an_impossible_flat_slab() {
+    assert!(!select_vmm_kv(None, false));
+    assert!(select_vmm_kv(None, true));
+    assert!(select_vmm_kv(Some(true), false));
+    assert!(!select_vmm_kv(Some(false), true));
+}
+
+#[test]
 fn map_ahead_rows_covers_the_decode_row_and_the_next_chunk() {
     let max = 202_752;
     assert_eq!(map_ahead_rows(8192, true, None, max), Some(8193));
@@ -1165,10 +1173,12 @@ fn packed_prefill_requires_abi_on_every_routed_object() {
 }
 
 #[test]
-fn hierarchical_gate_marker_requires_decode_gq_and_l2_capability() {
+fn hierarchical_gate_marker_requires_gq_and_l2_capability() {
     let object = Path::new("interp_decode_gq.elf");
     let valid = [GATE_HIER_SYM, L2_DISPATCH_SYM];
     assert!(check_gate_hier_object(&valid, object, Phase::Decode, Sched::GlobalQueue).is_ok());
+    assert!(check_gate_hier_object(&valid, object, Phase::Prefill, Sched::GlobalQueue).is_ok());
+    assert!(check_gate_hier_object(&valid, object, Phase::Flash, Sched::GlobalQueue).is_ok());
     assert!(
         check_gate_hier_object(&[L2_DISPATCH_SYM], object, Phase::Prefill, Sched::Static).is_ok()
     );
@@ -1180,11 +1190,7 @@ fn hierarchical_gate_marker_requires_decode_gq_and_l2_capability() {
             Phase::Decode,
             Sched::Static,
         ),
-        (
-            &[GATE_HIER_SYM, L2_DISPATCH_SYM][..],
-            Phase::Prefill,
-            Sched::GlobalQueue,
-        ),
+        (&[GATE_HIER_SYM][..], Phase::Prefill, Sched::GlobalQueue),
     ] {
         let message = check_gate_hier_object(syms, object, phase, sched)
             .expect_err("invalid hierarchical-gate object must be refused")
@@ -1258,6 +1264,17 @@ fn gate_hier_status_separates_armed_from_firing() {
     assert!(!GateHierStatus::of(&unplaced, false).firing);
 }
 
+#[test]
+fn token_batch_body_keeps_xcd_placement_without_static_hierarchy_count() {
+    let mut placed = gate_hier_probe(8, 38);
+    placed.n_counter = 1000;
+    assert_eq!(program_hier_base(&placed), 976);
+
+    placed.role = packet::devbuild::ProgramRole::TokenBatchBody { band: 32, rows: 128 };
+    assert_eq!(placed.l2_domains, 8);
+    assert_eq!(program_hier_base(&placed), 0);
+}
+
 /// The refusal has to name BOTH halves and the two ways out — the emit-side flag and the
 /// object-side flag are different names in different files.
 #[test]
@@ -1275,7 +1292,7 @@ fn l2_pairing_refusal_names_both_halves_and_the_fix() {
         // The prefill half has its OWN two flags; naming the decode ones would send the
         // reader to a build that does not move this object.
         assert!(prefill.contains("PLOW_L2HIER_PF=1"));
-        assert!(prefill.contains("PLOW_L2_PLACE_PREFILL=1"));
+        assert!(prefill.contains("PLOW_L2_PLACE_PREFILL=0"));
     }
 }
 
@@ -1386,6 +1403,29 @@ fn packed_dense_contract_accepts_split_attention_and_refuses_other_state() {
         p.insts[3].op = op as u16;
         assert!(super::check_packed_dense_program(&p.insts).is_err());
     }
+}
+
+#[test]
+fn packed_dense_contract_accepts_fp8_weight_and_activation_ops() {
+    let mut p = segmented_prog(
+        &[
+            DevOp::RmsNorm,
+            DevOp::QuantFp8,
+            DevOp::GemmFp8,
+            DevOp::GemmSmallFp8,
+            DevOp::GemmMedFp8,
+            DevOp::GemmWideFp8,
+            DevOp::GemmC5Fp8,
+            DevOp::GemmGluFp8,
+            DevOp::HeadNormRope,
+            DevOp::FlashPrefill,
+            DevOp::FlashMerge,
+        ],
+        &[0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2],
+    );
+    p.insts[9].i[6] = 512;
+    p.insts[9].i[7] = 4;
+    assert!(super::check_packed_dense_program(&p.insts).is_ok());
 }
 
 #[test]
@@ -2761,7 +2801,7 @@ fn compact_audit_patches_only_tp_collectives() {
 /// instead of the program only if the table keeps all of those, unchanged and in order.
 #[test]
 fn xaudit_table_keeps_exactly_the_collectives() {
-    let kept: [u16; 7] = [24, 25, 26, 28, 29, 116, 160];
+    let kept: [u16; 8] = [24, 25, 26, 28, 29, 116, 160, 182];
     assert_eq!(
         [
             DevOp::XReduce,
@@ -2771,6 +2811,7 @@ fn xaudit_table_keeps_exactly_the_collectives() {
             DevOp::XReduceTwoShot,
             DevOp::XReduceAddNorm,
             DevOp::XAllToAllHeads,
+            DevOp::XDcpGather,
         ]
         .map(|op| op as u16),
         kept
@@ -3270,8 +3311,8 @@ fn sparse_fp8_rejects_stale_objects_and_invalid_handles() {
         bytes: 16 * 81920 * 512,
         init: None,
     }];
-    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942").is_ok());
-    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950").is_err());
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_ok());
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950", false).is_err());
     assert!(
         check_sparse_fp8_object(&[], Path::new("old"), std::slice::from_ref(&p), true).is_err()
     );
@@ -3283,9 +3324,38 @@ fn sparse_fp8_rejects_stale_objects_and_invalid_handles() {
     )
     .is_ok());
     p.insts[0].fj[1] = u32::MAX;
-    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942").is_err());
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_err());
     p.insts[0].fj[1] = 0;
     assert!(check_sparse_fp8_object(&[], Path::new("old"), &[p], true).is_ok());
+}
+
+#[test]
+fn sparse_fp8_qh8_gate_widens_to_row_split_only_with_object_and_alltoall() {
+    let mut p = segmented_prog(&[DevOp::FlashMlaPrefillFp8, DevOp::XAllToAllHeads], &[0, 0]);
+    p.t = 8192;
+    p.insts[0].i = [1, 64, 2048, 0, 1024, u32::MAX, 2048, 0];
+    p.insts[0].t = [0; 8];
+    p.insts[0].fj = [0.0625f32.to_bits(), 1, 0];
+    let tensors = vec![crate::asset::devblob::DevTensor {
+        name: "large".into(),
+        bytes: 16 * 81920 * 512,
+        init: None,
+    }];
+    // Knob-off byte-identity: even with the a2a op present, `row_split_ready=false` (no 16-head
+    // object installed) must still reject nh=64 exactly as before this change.
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_err());
+    // The object alone, without a genuine row-split program (no XAllToAllHeads), does not widen
+    // the gate either -- an nh=64 instruction elsewhere is not proof of row-split geometry.
+    let solo = segmented_prog(&[DevOp::FlashMlaPrefillFp8], &[0]);
+    let mut solo = solo;
+    solo.t = 8192;
+    solo.insts[0] = p.insts[0];
+    assert!(check_sparse_fp8_packet(&[solo], &tensors, "gfx942", true).is_err());
+    // Both present: qualifies.
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", true).is_ok());
+    // The row count must still be exactly this program's T/8, not any nh=64 value.
+    p.insts[0].i[4] = 1023;
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", true).is_err());
 }
 
 #[test]
@@ -3294,17 +3364,17 @@ fn split_dsa_selection_checks_phases_operands_and_object() {
         check_dsa_select_local(std::slice::from_ref(p), t, "gfx942", true).is_ok()
     }
     let mut prog = segmented_prog(&[DevOp::IndexSelect], &[0]);
-    prog.t = 20;
-    prog.role = packet::devbuild::ProgramRole::DecodeRung { rows: 20 };
+    prog.t = 16;
+    prog.role = packet::devbuild::ProgramRole::DecodeRung { rows: 16 };
     prog.insts[0].t = [0, 1, 3, 4, 2, 5, 6, 65535];
     let mut tensors: Vec<_> = [
-        20 * 2048 * 4,
-        20 * 81920 * 4,
-        20 * 4,
-        20 * 4096 * 4,
-        20 * 16 * 4,
-        20 * 2560 * 4,
-        20 * 81920 * 8,
+        16 * 2048 * 4,
+        16 * 81920 * 4,
+        16 * 4,
+        16 * 4096 * 4,
+        16 * 16 * 4,
+        16 * 2560 * 4,
+        16 * 81920 * 8,
     ]
     .into_iter()
     .enumerate()
@@ -3316,19 +3386,19 @@ fn split_dsa_selection_checks_phases_operands_and_object() {
     .collect();
     // Phases 1-2 run g workgroups per row, phase 3 one.
     for (phase, blocks, want) in [
-        (1, 300, true),
-        (2, 300, true),
-        (3, 20, true),
-        (3, 300, false),
-        (1, 20, false),
-        (0, 300, false),
-        (4, 20, false),
+        (1, 240, true),
+        (2, 240, true),
+        (3, 16, true),
+        (3, 240, false),
+        (1, 16, false),
+        (0, 240, false),
+        (4, 16, false),
     ] {
         prog.insts[0].blocks = blocks;
         prog.insts[0].i = [81920, 2048, 0, 0, 2, 15, phase, 0];
         assert_eq!(ok(&prog, &tensors), want, "phase {phase} blocks {blocks}");
     }
-    prog.insts[0].blocks = 300;
+    prog.insts[0].blocks = 240;
     prog.insts[0].i = [81920, 2048, 0, 0, 2, 15, 2, 0];
     // Every operand, strips included, covers all rows; the strips are their own tensors.
     for operand in 0..7 {
@@ -3343,9 +3413,9 @@ fn split_dsa_selection_checks_phases_operands_and_object() {
     assert!(!ok(&prog, &tensors));
     prog.insts[0].i[5] = 15;
     // Decode rungs only.
-    prog.role = packet::devbuild::ProgramRole::PrefillBucket { rows: 20 };
+    prog.role = packet::devbuild::ProgramRole::PrefillBucket { rows: 16 };
     assert!(!ok(&prog, &tensors));
-    prog.role = packet::devbuild::ProgramRole::DecodeRung { rows: 20 };
+    prog.role = packet::devbuild::ProgramRole::DecodeRung { rows: 16 };
     let requires = packet_decode_arm_requirements(std::slice::from_ref(&prog));
     assert_eq!(requires, ["PLOW_DSA_SELECT_SPLIT=1"]);
     assert!(check_decode_object(
@@ -3410,7 +3480,7 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
             matches!(rows, 2 | 4 | 8)
         );
     }
-    let mut wide: Vec<_> = [20 * 2048 * 4, 20 * 81920 * 4, 20 * 4]
+    let mut wide: Vec<_> = [32 * 2048 * 4, 32 * 81920 * 4, 32 * 4]
         .into_iter()
         .enumerate()
         .map(|(i, bytes)| crate::asset::devblob::DevTensor {
@@ -3425,11 +3495,11 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
         prog.insts[0].blocks = rows as u16;
         assert_eq!(
             check_dsa_select_local(std::slice::from_ref(&prog), &wide, "gfx942", true).is_ok(),
-            matches!(rows, 16 | 20)
+            matches!(rows, 16 | 32)
         );
     }
-    prog.t = 20;
-    prog.insts[0].blocks = 20;
+    prog.t = 32;
+    prog.insts[0].blocks = 32;
     for operand in 0..3 {
         wide[operand].bytes -= 1;
         assert!(
@@ -3477,6 +3547,7 @@ fn xalltoall_heads_geometry_checks_shape_object_and_arch() {
     inst.t[0] = 0;
     // i0=rpr i1=nh_l i2=d i3=nh_total i4=gate i5=n_gpu i6=slot_bytes i7=dir
     inst.i = [1024, 8, 576, 64, 5, 8, 0, 0];
+    inst.fj[1] = 64; // j0=heads_per_group: one interleaved group
     let tensors = vec![crate::asset::devblob::DevTensor {
         name: "act.q_a2a".into(),
         bytes: 1024u64 * 64 * 576 * 2,
@@ -3505,6 +3576,18 @@ fn xalltoall_heads_geometry_checks_shape_object_and_arch() {
     prog.insts[0].i[5] = 4;
     assert!(!ok(&prog, &tensors, "gfx942"));
     prog.insts[0].i[5] = 8;
+
+    // heads_per_group must divide nh_total and be a multiple of nh_l; the row-split O side
+    // (4 groups of 16) is exactly as valid as the degenerate one-group case.
+    prog.insts[0].fj[1] = 16;
+    assert!(ok(&prog, &tensors, "gfx942"), "group-major O source, 4 groups of 16");
+    prog.insts[0].fj[1] = 0;
+    assert!(!ok(&prog, &tensors, "gfx942"), "heads_per_group must be nonzero");
+    prog.insts[0].fj[1] = 24;
+    assert!(!ok(&prog, &tensors, "gfx942"), "24 does not divide nh_total=64");
+    prog.insts[0].fj[1] = 12;
+    assert!(!ok(&prog, &tensors, "gfx942"), "12 is not a multiple of nh_l=8");
+    prog.insts[0].fj[1] = 64;
 
     // The destination tensor must be bound and large enough.
     prog.insts[0].t[0] = packet::dev::TENSOR_NONE16;
@@ -4265,13 +4348,16 @@ fn live_nsplit_walks_the_measured_ladder_and_never_grows() {
 #[test]
 fn dense_exact_only_while_every_row_selects_all_keys() {
     use crate::exec::kvrow::decode_dense_exact;
-    assert!(decode_dense_exact(&[2047], 2048));
-    assert!(decode_dense_exact(&[2048], 2048));
-    assert!(!decode_dense_exact(&[2049], 2048));
-    assert!(decode_dense_exact(&[1, 2048, 17, 1], 2048));
-    assert!(!decode_dense_exact(&[1, 2048, 2049, 1], 2048));
-    assert!(!decode_dense_exact(&[2049, 1], 2048));
-    assert!(!decode_dense_exact(&[], 2048));
+    assert!(decode_dense_exact(&[2047], &[], 2048));
+    assert!(decode_dense_exact(&[2048], &[], 2048));
+    assert!(!decode_dense_exact(&[2049], &[], 2048));
+    assert!(decode_dense_exact(&[1, 2048, 17, 1], &[], 2048));
+    assert!(!decode_dense_exact(&[1, 2048, 2049, 1], &[], 2048));
+    assert!(!decode_dense_exact(&[2049, 1], &[], 2048));
+    assert!(!decode_dense_exact(&[], &[], 2048));
+    assert!(decode_dense_exact(&[2049, 1], &[1, 0], 2048));
+    assert!(!decode_dense_exact(&[2049, 1], &[0, 1], 2048));
+    assert!(!decode_dense_exact(&[2049, 1], &[1, 1], 2048));
 }
 
 /// The flash and its merge move together, and anything that is not a plain
@@ -4569,6 +4655,69 @@ fn ragged_seams_rebind_band_views_to_the_live_band() {
             }
         }
     }
+}
+
+/// The `@band{t}` views are ONE global family shared by every program at that `t` -- the
+/// row-split sibling included -- so the "already bound" memo must be keyed by `t`, not by
+/// program.
+///
+/// This is the row-band wrong-answer defect. A ragged ordinary chunk (clen 4096 in the 8192
+/// bucket) rebinds the shared views to 512 rows per rank. The row-split sibling then runs a
+/// FULL 8192 chunk, which is never ragged, so it asks for the load-time 1024. Keyed by program
+/// it found no entry of its own, took the `unwrap_or(loaded)` default, concluded it was already
+/// bound and skipped the restore -- leaving all eight bands reading the ragged chunk's base
+/// addresses. In bounds, no fault, and wrong for the life of the server. Keyed by `t` the
+/// mismatch is visible and the restore is issued.
+#[test]
+fn ragged_seams_band_view_memo_is_keyed_by_band_family_not_program() {
+    const T: u32 = 8192;
+    const TP: u32 = 8;
+    const LOADED: u32 = T / TP; // 1024
+    const RAGGED: u32 = 512; // ragged_band_rows(4096, 8192, 8)
+    let names: Vec<String> = ["act.xmid", "act.xmid@band8192"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let bases = [0x1000_0000u64, 0];
+    let row = 6144u64 * 2;
+    let lens = [T as u64 * row, LOADED as u64 * row];
+
+    assert_eq!(ragged_band_rows(4096, T, TP), RAGGED);
+
+    // Skipping the restore is not benign: on every rank but 0 the ragged views address a
+    // different row than the load-time ones, and they are the SAME tensor slot, so whichever
+    // binding was uploaded last is what every program at this `t` reads.
+    for rank in 1..TP {
+        let ragged = ragged_band_views(&names, &bases, &lens, T, TP, rank, RAGGED);
+        let loaded = ragged_band_views(&names, &bases, &lens, T, TP, rank, LOADED);
+        assert_ne!(ragged[0].1, loaded[0].1, "rank {rank}");
+        assert_eq!(ragged[0].0, loaded[0].0, "one tensor slot, so one overwrites the other");
+    }
+
+    // `rebind_band_views`'s decision, over the sequence that poisons: the ordinary program binds
+    // the ragged band, then the row-split sibling asks for the load-time band at the same `t`.
+    fn rebind(bound: &mut std::collections::HashMap<u32, u32>, t: u32, b: u32) -> bool {
+        let needed = bound.get(&t).copied().unwrap_or(t / TP) != b;
+        if needed {
+            bound.insert(t, b);
+        }
+        needed
+    }
+    let mut bound = std::collections::HashMap::new();
+    assert!(rebind(&mut bound, T, RAGGED), "the ragged ordinary chunk binds the shared views");
+    assert!(
+        rebind(&mut bound, T, LOADED),
+        "the sibling MUST restore them, though it wants the load-time band"
+    );
+    assert!(
+        !rebind(&mut bound, T, LOADED),
+        "and must not upload again while they already hold it"
+    );
+
+    // A different bucket is a different `@band{t}` family and is unaffected either way.
+    assert!(!rebind(&mut bound, 2048, 2048 / TP), "an exact 2048 rung never rebinds");
+    assert!(rebind(&mut bound, 2048, 64), "a ragged 2048 chunk binds its own family");
+    assert_eq!(bound.get(&T).copied(), Some(LOADED), "the 8192 family is untouched by it");
 }
 
 #[test]
@@ -5262,7 +5411,7 @@ fn decode_tier_discovery_matches_variant_scheduler_and_orders_all_widths() {
     ));
     std::fs::create_dir_all(&root).unwrap();
     for (dir, file) in [
-        ("lowrung20", "interp_decode_fp8kv_gq.elf"),
+        ("lowrung32", "interp_decode_fp8kv_gq.elf"),
         ("lowrung16", "interp_decode_fp8kv_gq.elf"),
         ("lowrung1", "interp_decode_fp8kv_gq.elf"),
         ("lowrung2", "interp_decode_gq.elf"),
@@ -5275,7 +5424,7 @@ fn decode_tier_discovery_matches_variant_scheduler_and_orders_all_widths() {
         std::fs::write(root.join(dir).join(file), []).unwrap();
     }
     for (variant, sched, widths) in [
-        (Variant::Fp8Kv, Sched::GlobalQueue, vec![1, 16, 20]),
+        (Variant::Fp8Kv, Sched::GlobalQueue, vec![1, 16, 32]),
         (Variant::Fp8Kv, Sched::Static, vec![4]),
         (Variant::Bf16, Sched::GlobalQueue, vec![2]),
         (Variant::Fp8, Sched::GlobalQueue, vec![]),
@@ -5520,11 +5669,148 @@ fn token_batch_body_refuses_a_native_only_packet_without_its_route() {
 
 #[test]
 fn decode_upload_rows_must_cover_the_batch() {
-    assert!(check_decode_rows(20, &[5; 20], &[6; 20]).is_ok());
+    assert!(check_decode_rows(32, &[5; 32], &[6; 32]).is_ok());
     assert!(check_decode_rows(1, &[0], &[1]).is_ok());
-    // The single-sequence TP call used to hand a batch-20 rung one row; the other 19 positions
+    // A single-sequence TP call must not hand a batch-32 rung only one initialized row.
     // came from stale staging bytes.
-    assert!(check_decode_rows(20, &[5], &[6]).is_err());
-    assert!(check_decode_rows(20, &[5; 20], &[6; 19]).is_err());
+    assert!(check_decode_rows(32, &[5], &[6]).is_err());
+    assert!(check_decode_rows(32, &[5; 32], &[6; 31]).is_err());
     assert!(check_decode_rows(1, &[], &[]).is_err());
+}
+
+#[test]
+fn token_batch_seam_norms_stay_on_the_primary_object() {
+    use packet::dev::{DevInst64, DevOp, StreamEnt};
+    use packet::devbuild::ProgramRole;
+    let inst = |op: DevOp, rows: u32| DevInst64 {
+        op: op as u16,
+        i: [rows, 0, 0, 0, 0, 0, 0, 0],
+        ..Default::default()
+    };
+    let prog = |role, insts: Vec<DevInst64>, segs: &[u16]| DevProg {
+        t: 8192,
+        role,
+        n_counter: 0,
+        stream: segs.iter().enumerate().map(|(i, &seg)| StreamEnt {
+            inst: i as u32,
+            seg,
+            ..Default::default()
+        }).collect(),
+        insts,
+        stream_ofs: vec![],
+        stream_len: vec![],
+        waits: vec![],
+        succs: vec![],
+        gq_stream: vec![],
+        gq_seg_ofs: vec![],
+        l2_domains: 0,
+    };
+    let insts = || vec![
+        inst(DevOp::RmsNorm, 8192),
+        inst(DevOp::HeadNormRope, 32),
+        inst(DevOp::RmsNorm, 1024),
+        inst(DevOp::FlashMlaPrefillFp8, 8192),
+    ];
+    let body = ProgramRole::TokenBatchBody { band: 32, rows: 8192 };
+    let body_prog = prog(body, insts(), &[0, 1, 2, 3]);
+    let body_families = derive_packed_segment_families(&body_prog).unwrap();
+    assert_eq!(
+        body_families,
+        [5, 5, 0, 6]
+    );
+    assert_eq!(
+        derive_packed_plain_segments(&body_prog).unwrap(),
+        [false, false, true, false]
+    );
+    assert!(packed_family_segments_cover(&body_prog, &body_families, &[5, 6]));
+    let mixed = prog(
+        body,
+        vec![inst(DevOp::RmsNorm, 1024), inst(DevOp::HeadNormRope, 8192)],
+        &[0, 0],
+    );
+    assert!(derive_packed_segment_families(&mixed).is_err());
+    assert_eq!(derive_packed_plain_segments(&mixed).unwrap(), [false]);
+    let plain = ProgramRole::PrefillBucket { rows: 8192 };
+    let plain_prog = prog(plain, insts(), &[0, 1, 2, 3]);
+    assert_eq!(derive_packed_segment_families(&plain_prog).unwrap(), [5, 5, 5, 6]);
+    assert_eq!(derive_packed_plain_segments(&plain_prog).unwrap(), [false; 4]);
+}
+
+#[test]
+fn rowsplit_sibling_runs_only_full_chunks_with_every_key() {
+    let at = |c0, clen| ChunkStep { prog: 3, c0, clen };
+    for (step, sibling, want) in [
+        (at(0, 8192), Some(7), 3),
+        (at(2046, 8192), Some(7), 3),
+        (at(2047, 8192), Some(7), 7),
+        (at(65536, 8192), Some(7), 7),
+        (at(65536, 4096), Some(7), 3),
+        (at(65536, 8192), None, 3),
+    ] {
+        assert_eq!(rowsplit_chunk_prog(step, 8192, sibling, false), want, "{step:?} {sibling:?}");
+    }
+}
+
+#[test]
+fn rowband_sibling_also_runs_full_chunks_whose_low_bands_read_every_key() {
+    let at = |c0, clen| ChunkStep { prog: 3, c0, clen };
+    for (step, want) in [
+        (at(0, 8192), 7),
+        (at(1, 8192), 3),
+        (at(1023, 8192), 7),
+        (at(1024, 8192), 7),
+        (at(1025, 8192), 3),
+        (at(2046, 8192), 3),
+        (at(2047, 8192), 7),
+        (at(65536, 8192), 7),
+        (at(0, 4096), 3),
+    ] {
+        assert_eq!(rowsplit_chunk_prog(step, 8192, Some(7), true), want, "{step:?}");
+    }
+}
+
+#[test]
+fn column_shards_bind_as_views_of_their_full_twin() {
+    let t = |name: &str, bytes| crate::asset::devblob::DevTensor { name: name.into(), bytes, init: None };
+    let qa = "model.layers.3.self_attn.derived.q_absorb.weight";
+    let o = "model.layers.3.self_attn.o_proj.weight";
+    let uv = "model.layers.3.self_attn.derived.v_absorb.weight";
+    let tensors = [t(qa, 100), t(o, 50), t(uv, 30), t("act.qa", 100), t(qa, 800), t(o, 400), t(uv, 240)];
+    assert_eq!(
+        column_twins(&tensors, 8),
+        [Some(4), None, Some(6), None, None, None, None],
+        "column shards view their full twin wherever it is declared; row shards and activations copy"
+    );
+    assert_eq!(column_twins(&tensors, 1), [None; 7], "tp=1 binds whole");
+    assert_eq!(column_twins(&tensors[..4], 8), [None; 4], "no twin, no view");
+    assert_eq!(rowband_replicated_bytes(&tensors, 8), 800 + 400 + 3 * 240);
+    assert_eq!(rowband_replicated_bytes(&tensors[..4], 8), 0);
+}
+
+/// The property `--glm-rowband=false` rests on: the packet may declare the full-width twins, but
+/// with the arm off they must be identifiable so the loader can skip carving and uploading them.
+/// Only the FULL-width declaration is a twin — the shard it shadows still needs its own storage.
+#[test]
+fn rowband_twins_are_the_full_width_declarations_only() {
+    let t = |name: &str, bytes| crate::asset::devblob::DevTensor { name: name.into(), bytes, init: None };
+    let qa = "model.layers.3.self_attn.derived.q_absorb.weight";
+    let o = "model.layers.3.self_attn.o_proj.weight";
+    let uv = "model.layers.3.self_attn.derived.v_absorb.weight";
+    let tensors = [t(qa, 100), t(o, 50), t(uv, 30), t("act.qa", 100), t(qa, 800), t(o, 400), t(uv, 240)];
+    assert_eq!(
+        rowband_twin_ids(&tensors, 8),
+        [false, false, false, false, true, true, true],
+        "the 1/n_gpu shards and activations are bound as usual; only the full twins are skippable"
+    );
+    assert_eq!(rowband_twin_ids(&tensors, 1), [false; 7], "tp=1 declares no twins");
+    assert_eq!(rowband_twin_ids(&tensors[..4], 8), [false; 4], "no full declaration, nothing to skip");
+    // The skippable bytes are exactly what the load-time refusal prices, minus the fold's FP32 copy
+    // (made at run time, not declared), so the two views of the cost cannot drift apart.
+    let skipped: u64 = tensors
+        .iter()
+        .zip(rowband_twin_ids(&tensors, 8))
+        .filter(|(_, twin)| *twin)
+        .map(|(td, _)| td.bytes)
+        .sum();
+    assert_eq!(skipped, 800 + 400 + 240);
 }

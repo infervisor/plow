@@ -163,7 +163,7 @@ pub fn run(root: &Path, c: &Campaign, isa: hwspec::IsaLevel, cell: &str) -> Resu
             .samples
             .with_extension(format!("part.{}", std::process::id()));
         let _ = std::fs::remove_file(&scratch);
-        match measure(root, &harness, &c.obj, s, &scratch, c.lease) {
+        match measure(root, &harness.0, &c.obj, s, &scratch, c.lease) {
             Ok(()) => {
                 if let Ok(part) = std::fs::read_to_string(&scratch) {
                     rows += part.lines().filter(|l| !l.trim().is_empty()).count();
@@ -392,7 +392,19 @@ fn rocm_lib() -> String {
 ///
 /// Campaigns run inside `nix develop`, so `CC`, `ROCM_PATH`, and the active Nix paths must stay
 /// intact. Clearing them silently swaps the measured toolchain back to the host system.
-fn build_harness(root: &Path, obj: &Path) -> Result<PathBuf, Err> {
+struct Harness(PathBuf);
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn harness_path(obj: &Path, pid: u32) -> PathBuf {
+    obj.join(format!("gemm_tile_sweep.{pid}"))
+}
+
+fn build_harness(root: &Path, obj: &Path) -> Result<Harness, Err> {
     // The sweep source MOVED to runtime/bench/gemm/ and this path did not follow it, so every
     // campaign died in gcc with "No such file or directory" -- i.e. `plowc tune gemm` could not
     // measure anything at all, which is exactly how a target ends up with no tuning cell and
@@ -414,13 +426,17 @@ fn build_harness(root: &Path, obj: &Path) -> Result<PathBuf, Err> {
             )
             .into()
         })?;
+    // One executable per process: parallel shards may intentionally share a packet-stamped
+    // object directory. Replacing a sibling's running executable fails with ETXTBSY on Linux.
+    let harness = harness_path(obj, std::process::id());
     let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
     let st = Command::new(cc)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", std::env::var("HOME").unwrap_or_default())
         .current_dir(obj)
-        .args(["-O2", "-std=gnu11", "-o", "gemm_tile_sweep"])
+        .args(["-O2", "-std=gnu11", "-o"])
+        .arg(&harness)
         .arg(&src)
         .arg(root.join("runtime/amd/hsa_backend.c"))
         // `-I<root>/runtime/bench` is what makes the sweep's own `#include "../amd/hsa_backend.h"`
@@ -439,7 +455,7 @@ fn build_harness(root: &Path, obj: &Path) -> Result<PathBuf, Err> {
     if !st.success() {
         return Err(format!("building gemm_tile_sweep failed: {st}").into());
     }
-    Ok(obj.join("gemm_tile_sweep"))
+    Ok(Harness(harness))
 }
 
 enum Contention {
@@ -565,5 +581,12 @@ mod tests {
             tunedb::gemm_op_case(a[0].m, a[0].n, a[0].k, a[0].quant),
             tunedb::gemm_op_case(a[1].m, a[1].n, a[1].k, a[1].quant),
         );
+    }
+
+    #[test]
+    fn parallel_harnesses_do_not_share_an_executable() {
+        let obj = Path::new("objects");
+        assert_ne!(harness_path(obj, 41), harness_path(obj, 42));
+        assert_eq!(harness_path(obj, 41), obj.join("gemm_tile_sweep.41"));
     }
 }

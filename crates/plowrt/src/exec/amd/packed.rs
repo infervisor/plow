@@ -1,4 +1,7 @@
-use packet::dev::{DevOp, PrefillSpan, PREFILL_SPAN_RESET_STATE};
+use packet::dev::{
+    DevOp, PrefillSpan, PREFILL_SPAN_DECODE, PREFILL_SPAN_RESET_STATE,
+    PREFILL_SPAN_SAMPLE,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PackedRows {
@@ -99,10 +102,8 @@ pub(super) fn recurrent_span_limit(ops: impl IntoIterator<Item = u16>) -> Result
 /// (`plans/unified-token-batch.md` §4.3, §4.4):
 ///
 /// * **There is no decode prefix.** The spans cover exactly `[0, real_rows)` from zero.
-/// * **A completing prompt owns two spans on one slot** — its terminal token as a leading
-///   length-one span, its body as an ordinary span — so "one slot, one span" is replaced by
-///   the stronger statement that the pair must be contiguous in KV: the terminal span starts
-///   exactly where the body span ends.
+/// * **Sampled rows are explicit.** Decode spans sample their only row; a completing prefill
+///   span samples its final row without moving it ahead of the span body.
 ///
 /// The device traps on a violation and AMD's dispatch `default:` neither writes nor traps, so
 /// the point of doing it here is to refuse by name instead of trapping a wavefront.
@@ -111,27 +112,46 @@ pub(super) fn validate_token_batch_rows(
     row_capacity: u32,
     slot_capacity: usize,
     leading: usize,
+    sample_input_rows: &[u32],
     spans: &[PrefillSpan],
     parked: &[u32],
 ) -> Result<PackedRows, String> {
     if spans.is_empty() {
         return Err("token batch has no spans; the descriptor must cover [0, M)".into());
     }
-    // `plow_tb_decode_spans` defines the attention partition — and, through
-    // `PLOW_SAMPLE_ROWS`, the selection stage's row count — as the LEADING RUN of length-one
-    // spans. The host decides which rows it will deliver; if the device would count a
-    // different number the two disagree about who owns a sampled id, so the disagreement is
-    // refused here rather than discovered as an off-by-one token.
-    //
-    // The case that reaches this is a body span of length one directly behind the leading run,
-    // which happens when a two-token prompt is completed in one step. Refusing leaves it to
-    // the ordinary route, which is a scheduling limit and not a wrong answer.
-    let device_leading = spans.iter().take_while(|s| s.n_rows == 1).count();
+    let device_leading = spans
+        .iter()
+        .filter(|s| s.flags & PREFILL_SPAN_SAMPLE != 0)
+        .count();
     if device_leading != leading {
         return Err(format!(
             "token batch would sample {device_leading} leading row(s) but the host planned \
-             {leading}: a body span of length one sits directly behind the leading run"
+             {leading}"
         ));
+    }
+    let sample_rows_match = sample_input_rows.len() == device_leading
+        && spans
+            .iter()
+            .filter(|span| span.flags & PREFILL_SPAN_SAMPLE != 0)
+            .zip(sample_input_rows)
+            .all(|(span, &row)| {
+                span.n_rows
+                    .checked_sub(1)
+                    .and_then(|last| span.row0.checked_add(last))
+                    == Some(row)
+            });
+    if !sample_rows_match {
+        return Err("token-batch sample-row table disagrees with sampled span terminals".into());
+    }
+    let device_decode = spans
+        .iter()
+        .take_while(|s| s.flags & PREFILL_SPAN_DECODE != 0)
+        .count();
+    if spans[device_decode..]
+        .iter()
+        .any(|s| s.flags & PREFILL_SPAN_DECODE != 0)
+    {
+        return Err("token-batch decode spans are not a prefix".into());
     }
     let mut row = 0u32;
     for (index, span) in spans.iter().enumerate() {
@@ -141,10 +161,19 @@ pub(super) fn validate_token_batch_rows(
                 span.row0, span.n_rows
             ));
         }
-        if span.flags & !PREFILL_SPAN_RESET_STATE != 0 {
+        let allowed = PREFILL_SPAN_RESET_STATE | PREFILL_SPAN_DECODE | PREFILL_SPAN_SAMPLE;
+        if span.flags & !allowed != 0 {
             return Err(format!(
                 "token-batch span {index} has unknown flags {:#x}",
                 span.flags
+            ));
+        }
+        let decode = span.flags & PREFILL_SPAN_DECODE != 0;
+        let sample = span.flags & PREFILL_SPAN_SAMPLE != 0;
+        if decode && (!sample || span.n_rows != 1) {
+            return Err(format!(
+                "token-batch span {index} has incompatible phase flags {:#x} and {} rows",
+                span.flags, span.n_rows
             ));
         }
         if (span.flags & PREFILL_SPAN_RESET_STATE != 0) != (span.kv_row0 == 0) {
@@ -179,30 +208,11 @@ pub(super) fn validate_token_batch_rows(
                 span.program
             ));
         }
-        let siblings: Vec<&PrefillSpan> = spans[..index]
-            .iter()
-            .filter(|prior| prior.slot == span.slot)
-            .collect();
-        match siblings.as_slice() {
-            [] => {}
-            // The terminal/body pair. The terminal span leads, so the earlier one is it, and
-            // this one must resume exactly where the terminal token does NOT overlap: the body
-            // ends where the terminal begins.
-            [terminal] => {
-                if terminal.n_rows != 1 || terminal.kv_row0 != kv_end {
-                    return Err(format!(
-                        "token-batch slot {} owns two spans that are not a terminal/body pair: \
-                         terminal kv[{}, {}) body kv[{}, {})",
-                        span.slot, terminal.kv_row0, terminal.kv_len, span.kv_row0, kv_end
-                    ));
-                }
-            }
-            _ => {
-                return Err(format!(
-                    "token-batch slot {} appears in more than two spans",
-                    span.slot
-                ))
-            }
+        if spans[..index].iter().any(|prior| prior.slot == span.slot) {
+            return Err(format!(
+                "token-batch slot {} appears in more than one span",
+                span.slot
+            ));
         }
         row = row
             .checked_add(span.n_rows)
@@ -399,25 +409,40 @@ mod tests {
         }
     }
 
+    fn tb_sample_span(
+        row0: u32,
+        slot: u32,
+        kv_row0: u32,
+        decode: bool,
+    ) -> PrefillSpan {
+        let mut span = tb_span(row0, 1, slot, kv_row0);
+        span.flags |= PREFILL_SPAN_SAMPLE | u32::from(decode) * PREFILL_SPAN_DECODE;
+        span
+    }
+
     fn parked(real: usize, capacity: usize) -> Vec<u32> {
         let mut mask = vec![0u32; capacity];
         mask[real..].fill(1);
         mask
     }
 
-    /// The shape the route actually stages: decode spans of length one, then the terminal row
-    /// of a completing prompt, then that prompt's body — two spans on one slot, contiguous in
-    /// KV, covering `[0, M)` from zero.
+    /// Decode rows lead, while a completing prefill remains one natural-order sampled span.
     #[test]
-    fn a_terminal_and_body_pair_on_one_slot_is_the_legal_prefix_free_shape() {
-        let spans = [
-            tb_span(0, 1, 0, 100),
-            tb_span(1, 1, 2, 119),
-            tb_span(2, 49, 2, 70),
-            tb_span(51, 80, 3, 0),
-        ];
-        let rows = validate_token_batch_rows(3, 256, 4, 2, &spans, &parked(131, 256)).unwrap();
-        assert_eq!((rows.n_spans, rows.real_rows), (4, 131));
+    fn sampled_prefill_terminal_preserves_natural_row_order() {
+        let mut prefill = tb_span(1, 50, 2, 70);
+        prefill.flags |= PREFILL_SPAN_SAMPLE;
+        let spans = [tb_sample_span(0, 0, 100, true), prefill, tb_span(51, 80, 3, 0)];
+        let rows = validate_token_batch_rows(
+            3,
+            256,
+            4,
+            2,
+            &[0, 50],
+            &spans,
+            &parked(131, 256),
+        )
+        .unwrap();
+        assert_eq!((rows.n_spans, rows.real_rows), (3, 131));
     }
 
     /// `validate_rows` — the decode-band validator — must keep REFUSING that shape, or the two
@@ -426,51 +451,78 @@ mod tests {
     #[test]
     fn the_decode_band_validator_still_refuses_a_prefix_free_table() {
         let spans = [
-            tb_span(0, 1, 0, 100),
-            tb_span(1, 1, 2, 119),
-            tb_span(2, 49, 2, 70),
+            tb_sample_span(0, 0, 100, true),
+            tb_sample_span(1, 2, 119, false),
+            tb_span(2, 49, 3, 70),
         ];
-        let err = validate_rows(3, 0, 256, 4, &spans, &parked(51, 256)).unwrap_err();
-        assert!(err.contains("more than one span"), "{err}");
+        assert!(validate_rows(3, 0, 256, 4, &spans, &parked(51, 256)).is_err());
     }
 
-    /// The device counts the leading run of length-one spans; the host counts the rows it will
-    /// deliver. A two-token prompt completed in one step makes those disagree, and a
-    /// disagreement about who owns a sampled id is refused rather than delivered.
+    /// Explicit sample flags distinguish a one-row completing prefill from an intermediate one.
     #[test]
-    fn a_length_one_body_behind_the_leading_run_is_refused_by_name() {
-        let spans = [tb_span(0, 1, 1, 1), tb_span(1, 1, 1, 0)];
-        let err = validate_token_batch_rows(3, 64, 4, 1, &spans, &parked(2, 64)).unwrap_err();
-        assert!(err.contains("leading row"), "{err}");
+    fn a_length_one_body_behind_a_terminal_sample_is_unambiguous() {
+        let spans = [tb_sample_span(0, 1, 1, false), tb_span(1, 1, 2, 0)];
+        assert!(validate_token_batch_rows(3, 64, 4, 1, &[0], &spans, &parked(2, 64)).is_ok());
     }
 
     #[test]
-    fn a_gap_an_overlap_and_a_third_span_on_one_slot_all_refuse() {
+    fn decode_phase_must_be_a_sampled_prefix() {
+        let decode_after_terminal = [
+            tb_sample_span(0, 0, 7, false),
+            tb_sample_span(1, 1, 9, true),
+        ];
+        assert!(validate_token_batch_rows(
+            3,
+            64,
+            4,
+            2,
+            &[0, 1],
+            &decode_after_terminal,
+            &parked(2, 64)
+        )
+        .is_err());
+
+        let mut missing_sample = tb_span(0, 1, 0, 7);
+        missing_sample.flags |= PREFILL_SPAN_DECODE;
+        assert!(validate_token_batch_rows(
+            3,
+            64,
+            4,
+            0,
+            &[],
+            &[missing_sample],
+            &parked(1, 64)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_gap_bad_kv_extent_and_duplicate_slot_all_refuse() {
         // Gap: the second span does not start where the first ended.
-        let gap = [tb_span(0, 1, 0, 5), tb_span(2, 3, 1, 0)];
-        assert!(validate_token_batch_rows(3, 64, 4, 1, &gap, &parked(4, 64)).is_err());
+        let gap = [tb_sample_span(0, 0, 5, true), tb_span(2, 3, 1, 0)];
+        assert!(validate_token_batch_rows(3, 64, 4, 1, &[0], &gap, &parked(4, 64)).is_err());
         // kv_row0 + n_rows != kv_len.
         let mut bad = tb_span(0, 4, 0, 0);
         bad.kv_len = 9;
-        assert!(validate_token_batch_rows(3, 64, 4, 0, &[bad], &parked(4, 64)).is_err());
-        // Three spans on one slot is never a terminal/body pair.
+        assert!(validate_token_batch_rows(3, 64, 4, 0, &[], &[bad], &parked(4, 64)).is_err());
+        // A request owns exactly one span.
         let three = [
-            tb_span(0, 1, 1, 9),
+            tb_sample_span(0, 1, 9, false),
             tb_span(1, 1, 1, 8),
             tb_span(2, 1, 1, 7),
         ];
-        assert!(validate_token_batch_rows(3, 64, 4, 3, &three, &parked(3, 64)).is_err());
+        assert!(validate_token_batch_rows(3, 64, 4, 1, &[0], &three, &parked(3, 64)).is_err());
     }
 
     /// Padding is inert and outside every span; an unparked pad row would be a live row nobody
     /// planned.
     #[test]
     fn the_parked_mask_must_be_exactly_the_padded_suffix() {
-        let spans = [tb_span(0, 1, 0, 100), tb_span(1, 3, 1, 0)];
-        assert!(validate_token_batch_rows(3, 64, 4, 1, &spans, &parked(4, 64)).is_ok());
+        let spans = [tb_sample_span(0, 0, 100, true), tb_span(1, 3, 1, 0)];
+        assert!(validate_token_batch_rows(3, 64, 4, 1, &[0], &spans, &parked(4, 64)).is_ok());
         let mut wrong = parked(4, 64);
         wrong[10] = 0;
-        assert!(validate_token_batch_rows(3, 64, 4, 1, &spans, &wrong).is_err());
+        assert!(validate_token_batch_rows(3, 64, 4, 1, &[0], &spans, &wrong).is_err());
     }
 
     #[test]

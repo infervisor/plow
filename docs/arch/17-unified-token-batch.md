@@ -68,7 +68,8 @@ decode spans included. One row source, one binary search, no second table to kee
 
 A decode request is a span of length one. **The converse is not true**: a final prefill chunk
 can also have length one, so length never decides a span's phase. The planner carries an
-explicit `Phase`, and `Phase::Prefill` with `end == prompt_len` is what makes a span sample.
+explicit `Phase` and lowers it into `PREFILL_SPAN_DECODE`; sampled decode and terminal-prefill
+spans independently carry `PREFILL_SPAN_SAMPLE`.
 
 **Padding belongs to nobody.** `mixed_step` extends the last owner's positions across the pad
 and then has to bound that against `max_ctx` ("padding exceeds physical context"). Here padding
@@ -306,9 +307,9 @@ Everything past the shared foundation. In particular:
   `mixed_step::SpanCover::PrefixFree` gives it a span table covering `[0, M)`. Measurement,
   limits and the identity result are in
   [docs/amd/gemma4-31b-mi300x.md Appendix A](../amd/gemma4-31b-mi300x.md).
-  Still absent there: the compact terminal segment. `RowGather` has an arm and is unused — the
-  route samples rows of the BODY, which works only because the planner puts every sampled row at
-  the front of the batch.
+  The compact terminal segment now uses `RowGather(sample_input_rows)` before final norm and LM
+  head. Completing-prefill spans remain in natural token order; only their terminal hidden rows
+  are gathered.
 * **No blob/manifest section.** `ProgramRole` and the capability check exist; a `token_batch`
   asset section binding body and output payloads does not.
 * **NVIDIA and CPU objects are not rebuilt** against the new `PlowProgram` here — no `nvcc` on
@@ -409,7 +410,7 @@ now resolves the same `PlowPrefillSpan[]` three different ways:
 |---|---|---|
 | `runtime/amd/packed_prefill.h` | `spans[0].row0 == 0` | none — prefill only |
 | `runtime/common/mixed_step.h` | `spans[0].row0 != 0` (**traps** otherwise) | a band ahead of the spans, resolved from `decode_slots[]`/`positions[]` |
-| `runtime/amd/token_batch.h` | `spans[0].row0 == 0`, dense cover of `[0, M)` | spans of length one, first in order |
+| `runtime/amd/token_batch.h` | `spans[0].row0 == 0`, dense cover of `[0, M)` | leading spans carrying `PREFILL_SPAN_DECODE` |
 
 The first two are mutually exclusive on the same table. The third is what the plan specifies and
 is the only one of the three that can express a pure-prefill step. Collapsing all three onto the
@@ -474,14 +475,11 @@ coexist. Sourcing the slot from the descriptor frees the operand.
 
 ### Where the attention partition comes from
 
-`plow_tb_decode_spans()` — the count of leading spans of length one — is defined exactly once and
-called by both the prefill and decode arms, so they cannot disagree about who owns a span.
-
-§4.1 forbids the **host plan** from calling a span "decode" because its length is one (a final
-prefill chunk can also have length one). It explicitly permits the other thing: "Kernel selection
-derives query geometry from span lengths." This is that, and only that. A one-row span at
-frontier `p` attends over `[0, p+1)` with its query at `p` under either kernel, so a final chunk
-of length one landing on `FlashDecode` is correct, not merely tolerated.
+`plow_tb_decode_spans()` counts the leading `PREFILL_SPAN_DECODE` spans and is called by both
+attention arms, so they cannot disagree about who owns a span. `plow_tb_sample_spans()` counts
+`PREFILL_SPAN_SAMPLE` across the complete span table. Decode spans carry both flags. Completing
+terminal-prefill spans carry only `SAMPLE`, remain in natural prefill order, and execute through
+`FlashPrefill`. The terminal segment gathers each sampled span's final row.
 
 `ndec == 0` and `ndec == n_spans` are both legal; the other side simply has no work. That is how
 this route serves an intermediate pure-prefill step, which the mixed-step resolver refuses.

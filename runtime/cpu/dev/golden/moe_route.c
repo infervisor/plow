@@ -19,6 +19,10 @@ static inline uint32_t f32_key(float v) {
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u); /* monotone f32 -> u32 */
 }
 
+static inline float route_logit(const plow_bf16* logit, uint32_t e, uint32_t flags) {
+    return (flags & 8u) ? ((const float*)logit)[e] : plow_bf2f(logit[e]);
+}
+
 /* One token: logit[n_exp] -> table[k]. */
 static void route_token(plow_moe_route* tab, const plow_bf16* logit, const float* bias,
                         uint32_t n_exp, uint32_t k, uint32_t flags, float route_scale,
@@ -27,10 +31,10 @@ static void route_token(plow_moe_route* tab, const plow_bf16* logit, const float
     for (uint32_t j = ROUTE_MAX_TOPK; j < k; j++) { tab[j].eid = PLOW_EXPERT_UNUSED; tab[j].gate = 0.0f; }
     if (k > ROUTE_MAX_TOPK) k = ROUTE_MAX_TOPK;
     if (sigmoid) {
-        for (uint32_t e = 0; e < n_exp; e++) score[e] = 1.0f / (1.0f + expf(-plow_bf2f(logit[e])));
+        for (uint32_t e = 0; e < n_exp; e++) score[e] = 1.0f / (1.0f + expf(-route_logit(logit, e, flags)));
     } else {
         float m = -1e30f, s = 0.0f;
-        for (uint32_t e = 0; e < n_exp; e++) { score[e] = plow_bf2f(logit[e]); if (score[e] > m) m = score[e]; }
+        for (uint32_t e = 0; e < n_exp; e++) { score[e] = route_logit(logit, e, flags); if (score[e] > m) m = score[e]; }
         for (uint32_t e = 0; e < n_exp; e++) { score[e] = expf(score[e] - m); s += score[e]; }
         for (uint32_t e = 0; e < n_exp; e++) score[e] /= s;
     }
@@ -58,7 +62,8 @@ static void route_token(plow_moe_route* tab, const plow_bf16* logit, const float
     }
 }
 
-/* t0=table([T*k]) t1=logit([T,n_exp] bf16) t3=bias?  i1=n_exp i2=k i3=flags i4=T i6=n_group
+/* t0=table([T*k]) t1=logit([T,n_exp] bf16, or f32 when flags&8) t3=bias?
+ * i1=n_exp i2=k i3=flags i4=T i6=n_group
  * i7=topk_group  f0=route_scale. Token t is owned by slice t % nblk (op_moe.h token loop). */
 G_K(g_moe_router_topk_pf) {
     plow_moe_route* table = PLOW_CPU_TEN(in, T, 0);
@@ -72,9 +77,12 @@ G_K(g_moe_router_topk_pf) {
         return;
     }
     float* score = (float*)ctx->scratch; /* n_exp f32: <= 1 KiB for every shipping model */
-    for (uint32_t tok = slice; tok < nt; tok += nblk)
-        route_token(table + (size_t)tok * k, logit + (size_t)tok * n_exp, bias, n_exp, k, flags,
-                    route_scale, score);
+    for (uint32_t tok = slice; tok < nt; tok += nblk) {
+        const plow_bf16* row = (flags & 8u)
+            ? (const plow_bf16*)((const float*)logit + (size_t)tok * n_exp)
+            : logit + (size_t)tok * n_exp;
+        route_token(table + (size_t)tok * k, row, bias, n_exp, k, flags, route_scale, score);
+    }
 }
 
 /* t0=meta(i32 [3*n_exp+1]) t1=table t2=row_token(u32) t3=row_partidx(u32) t4=row_gate(f32)

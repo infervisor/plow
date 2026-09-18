@@ -45,7 +45,7 @@ def write_diagnostics(output, stdout, stderr):
     output.with_suffix(output.suffix + ".stderr").write_text(stderr)
 
 
-def validate(report, log, rows):
+def validate(report, log, rows, require_vmm=False):
     if report.get("schema") != "plowrt.bench.v1" or report.get("vendor") != "Some(Amd)":
         raise ValueError("not an AMD production bench report")
     if report.get("num_gpus") != 1:
@@ -66,6 +66,10 @@ def validate(report, log, rows):
     if len(outputs) != 2 or any(len(output) != 8 for output in outputs):
         raise ValueError("token audit does not contain two eight-token outputs")
     log = ANSI_ESCAPE.sub("", log)
+    if require_vmm:
+        ready = [line for line in log.splitlines() if "AMD engine ready" in line]
+        if len(ready) != 1 or not re.search(r"\bvmm=\"?true\"?\b", ready[0]):
+            raise ValueError("AMD VMM KV route was not active")
     copacks = [
         line for line in log.splitlines()
         if "AMD token batch" in line
@@ -89,6 +93,9 @@ def main():
     parser.add_argument("--fp8-dir")
     parser.add_argument("--packet-sha256", required=True)
     parser.add_argument("--output", required=True)
+    vmm = parser.add_mutually_exclusive_group()
+    vmm.add_argument("--vmm-kv", action="store_true")
+    vmm.add_argument("--vmm-kv-auto", action="store_true")
     args = parser.parse_args()
 
     assets = Path(args.assets).resolve()
@@ -117,9 +124,12 @@ def main():
             "RUST_LOG": "plowrt::serve::mux=debug,plowrt::obs::pfx=info,plowrt=info",
             "PLOW_PFX_LOG": "1",
             "PLOW_AMD_SHARED_PREFIX": "0",
-            "PLOW_VMM_KV": "0",
             "HSA_DISABLE_COREDUMP_ON_EXCEPTION": "1",
         })
+        if args.vmm_kv_auto:
+            env.pop("PLOW_VMM_KV", None)
+        else:
+            env["PLOW_VMM_KV"] = "1" if args.vmm_kv else "0"
         result = subprocess.run(
             bench_command(
                 args.plowrt, assets, row_file, args.checkpoint, args.fp8_dir
@@ -134,11 +144,12 @@ def main():
         if result.returncode:
             raise SystemExit(result.stderr.strip().splitlines()[-1])
         report = json.loads(result.stdout)
-        validate(report, result.stderr, rows)
+        validate(report, result.stderr, rows, require_vmm=args.vmm_kv or args.vmm_kv_auto)
 
     record = {
         "schema": "plowrt.production-gate.v1",
         "packet_sha256": packet_sha256,
+        "plowrt_sha256": hashlib.sha256(Path(args.plowrt).read_bytes()).hexdigest(),
         "features": {
             "prefix_cache": True,
             "continuous_batching": True,
@@ -154,6 +165,9 @@ def main():
         "prefill_requests": 2,
         "restore_calls": 2,
     }
+    if args.vmm_kv or args.vmm_kv_auto:
+        record["features"]["vmm_kv"] = True
+        record["vmm_kv_mode"] = "auto" if args.vmm_kv_auto else "forced"
     output.write_text(json.dumps(record, separators=(",", ":")) + "\n")
 
 

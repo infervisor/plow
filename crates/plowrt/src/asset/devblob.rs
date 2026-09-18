@@ -721,6 +721,9 @@ impl DevBlob {
                 }
                 ProgramRole::TokenBatchBody { .. } => packet::devbuild::token_batch_program_t(p.t),
                 ProgramRole::DenseExactRung { .. } => packet::devbuild::dense_exact_program_t(p.t),
+                ProgramRole::RowSplitSibling { .. } => {
+                    packet::devbuild::rowsplit_prefill_program_t(p.t)
+                }
                 ProgramRole::DecodeRung { .. } if self.parent.is_some() => {
                     packet::devbuild::decode_rung_program_t(p.t)
                 }
@@ -773,6 +776,11 @@ impl DevBlob {
     /// `exec::amd::AmdEngine::prefill_rungs`.
     pub fn prefill_progs(&self) -> Vec<&DevProg> {
         self.prefill_phase().collect()
+    }
+
+    /// Every modular block program in table order.
+    pub fn modular_block_progs(&self) -> Vec<&DevProg> {
+        self.progs.iter().filter(|p| p.role.is_modular_block()).collect()
     }
 
     /// Decode rung programs in ascending width order; dense-exact rungs are not ladder rungs.
@@ -1792,6 +1800,9 @@ mod tests {
                 }
                 packet::devbuild::ProgramRole::DenseExactRung { .. } => {
                     packet::devbuild::dense_exact_program_t(p.t)
+                }
+                packet::devbuild::ProgramRole::RowSplitSibling { .. } => {
+                    packet::devbuild::rowsplit_prefill_program_t(p.t)
                 }
                 _ => p.t,
             })

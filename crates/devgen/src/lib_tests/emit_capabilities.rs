@@ -303,6 +303,30 @@ fn glm_production_recipe_defaults_on_only_for_the_qualified_target() {
     }
 }
 
+#[test]
+fn glm_token_batch_production_recipe_disables_replayed_sequence_parallel_arms() {
+    let _guard = crate::test_env::env_guard();
+    let mut cfg = EmitArgsForTest::try_parse_from([
+        "test",
+        "--glm-seq-par=true",
+        "--glm-seq-par-proj=true",
+        "--glm-rowband-attn=true",
+    ])
+    .unwrap()
+    .emit;
+    apply_production_defaults(
+        &mut cfg,
+        emit_capabilities("glm_moe_dsa"),
+        "gfx942",
+        8,
+        304,
+    );
+    assert!(cfg.token_batch_tp);
+    assert!(!cfg.glm_seq_par());
+    assert!(!cfg.glm_seq_par_proj());
+    assert_eq!(cfg.glm_rowsplit_arm(), None);
+}
+
 /// Build one `EmitConfig` the way `plowc` does — clap parse, knob record, production defaults —
 /// and hand back the resolved config plus a `build.json`-style `id -> (value, source)` lookup.
 fn resolve_like_plowc(
@@ -367,12 +391,16 @@ fn glm_recipe_precedence_is_cli_then_env_then_production_default() {
         "glm_gemm_lt_decode",
         "glm_gemm_lt_decode_ext",
         "glm_fold_lt",
-        "glm_seq_par",
-        "glm_seq_par_proj",
     ] {
         assert_eq!(rec[id], ("true".into(), "production_default"), "{id}");
     }
-    assert!(cfg.glm_fold_lt() && cfg.glm_seq_par() && cfg.glm_seq_par_proj());
+    // Off, not absent: the recipe's `token_batch_tp` cascades both through GLM_SEQ_PAR_DEFAULT,
+    // so the resolved value is still a production default and still recorded as one.
+    for id in ["glm_seq_par", "glm_seq_par_proj"] {
+        assert_eq!(rec[id], ("false".into(), "production_default"), "{id}");
+    }
+    assert!(cfg.glm_fold_lt());
+    assert!(!cfg.glm_seq_par() && !cfg.glm_seq_par_proj());
     assert!(
         cfg.glm_fp8_kv()
             && cfg.glm_moe_aiter()
@@ -417,10 +445,11 @@ fn non_qualified_targets_record_no_glm_production_default() {
     assert!(!cfg.glm_fold_lt() && !cfg.glm_seq_par() && !cfg.glm_seq_par_proj());
 }
 
-/// The three tier-4 knobs (`PLOW_GLM_SEQ_PAR`, `_PROJ`, `PLOW_GLM_FOLD_LT`): each rolls back on
-/// its own flag; `_PROJ`'s default follows `SEQ_PAR`, so rolling back the seams alone takes it
-/// along; the seams' default stands aside for the two-shot seam knobs it replaces; and nothing
-/// turns on for a non-GLM gfx942 TP8 emit.
+/// The production recipe ships `token_batch_tp`, and `GLM_SEQ_PAR_DEFAULT` resolves `glm_seq_par`
+/// (and through it `glm_seq_par_proj`) to false under it — the two do NOT compose, because the
+/// seams-aware body corrupted long-context prefill with sequence parallelism on (review log #63,
+/// retrieval 9/18 base, 0/21 tail; `token_batch_tp_excludes_seq_par` refuses the pair at load).
+/// Fold is independent. Explicit rollbacks plus non-qualified targets keep their precedence.
 #[test]
 fn glm_seq_par_and_fold_defaults_roll_back_per_knob() {
     let _guard = crate::test_env::env_guard();
@@ -439,14 +468,17 @@ fn glm_seq_par_and_fold_defaults_roll_back_per_knob() {
     };
     let glm = |argv: &[&str]| resolve(argv, "glm_moe_dsa");
 
-    assert_eq!(glm(&["test"]).0, (true, true, true));
+    // The recipe's `token_batch_tp` cascades both sequence-parallel knobs off; fold survives.
+    assert_eq!(glm(&["test"]).0, (false, false, true));
 
     let (on, rec) = glm(&["test", "--glm-fold-lt=false"]);
-    assert_eq!(on, (true, true, false));
+    assert_eq!(on, (false, false, false));
     assert_eq!(rec["glm_fold_lt"], ("false".into(), "cli"));
 
+    // An explicit rollback of either sequence-parallel knob is redundant but must still record as
+    // the winner, so a packet emitted this way is traceable to the flag and not to the cascade.
     let (on, rec) = glm(&["test", "--glm-seq-par-proj=false"]);
-    assert_eq!(on, (true, false, true));
+    assert_eq!(on, (false, false, true));
     assert_eq!(rec["glm_seq_par_proj"], ("false".into(), "cli"));
 
     let (on, rec) = glm(&["test", "--glm-seq-par=false"]);

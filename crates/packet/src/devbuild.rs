@@ -433,6 +433,9 @@ pub struct Builder {
     /// Split descriptor-consuming prefill families into independent wave classes.
     /// Callers must enable this only for prefill programs.
     packed_prefill_segments: bool,
+    /// The row-split sibling's attention arm (`PLOW_GLM_ROWSPLIT_ATTN` / `PLOW_GLM_ROWBAND_ATTN`);
+    /// `None` for every other program.
+    rowsplit_arm: Option<RowSplitArm>,
     /// Token-batch body: the slot band's width. The band's decode-attention packets get their
     /// own segment class so the runtime can route them to an object that carries those arms.
     token_batch_band: Option<u32>,
@@ -463,6 +466,8 @@ pub struct Builder {
     fuse_materialized_residual_inputs: bool,
     /// Isolate f32-mix AttnRes packets (`f[1]` = output-norm epsilon) for the gfx950 object.
     attn_res_f32mix_segments: bool,
+    /// Isolate exact gfx942 Gemma-4 BF16 gate/up packets for the raw C2/C5 object.
+    native_gemma4_glu_segments: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
     /// byte-identical. See [`Builder::set_gemv_split`].
     gemv_split: u32,
@@ -692,6 +697,7 @@ impl Builder {
             gq_order_asap: knobs.gq_order.as_deref() != Some("emit"),
             gq_order_seg: !matches!(knobs.gq_order.as_deref(), Some("emit") | Some("asap")),
             packed_prefill_segments: false,
+            rowsplit_arm: None,
             token_batch_band: None,
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
@@ -707,6 +713,7 @@ impl Builder {
             xreduce_wave_rs_segments: false,
             fuse_materialized_residual_inputs: true,
             attn_res_f32mix_segments: false,
+            native_gemma4_glu_segments: false,
             gemv_split: 1,
             tensor_dedup: false,
             cu_cap: None,
@@ -733,6 +740,10 @@ impl Builder {
     /// and L2 domains are independent fields, so segmented programs remain placeable.
     pub fn set_l2_placement(&mut self, layout: Option<L2Layout>) {
         self.place_l2 = layout;
+    }
+
+    pub fn set_native_gemma4_glu_segments(&mut self, enabled: bool) {
+        self.native_gemma4_glu_segments = enabled;
     }
 
     /// Refuse to honour `PLOW_UNISEG` for this program, whatever the environment says.
@@ -812,8 +823,9 @@ impl Builder {
     /// T18: force this program to ONE segment regardless of `PLOW_UNISEG`. Set by devgen on
     /// SMALL prefill buckets (`PLOW_UNISEG_MAX_T`): a tail chunk of ~50 tokens pays ~480
     /// segment launches (~40 ms measured) for ~5 ms of work — one launch on the full fat
-    /// object wins outright. No-op if `deny_uniseg` was called (the AMD target reads `seg`).
+    /// object wins outright.
     pub fn force_uniseg(&mut self) {
+        self.uniseg_denied = false;
         self.uniseg_forced = true;
     }
 
@@ -825,6 +837,18 @@ impl Builder {
     /// token-batch body), i.e. its cache writers will resolve rows through span metadata.
     pub fn packed_prefill_segments(&self) -> bool {
         self.packed_prefill_segments
+    }
+
+    pub fn set_rowsplit_arm(&mut self, arm: Option<RowSplitArm>) {
+        self.rowsplit_arm = arm;
+    }
+
+    pub fn rowsplit_attn(&self) -> bool {
+        self.rowsplit_arm.is_some()
+    }
+
+    pub fn rowsplit_arm(&self) -> Option<RowSplitArm> {
+        self.rowsplit_arm
     }
 
     /// Mark this program as a token-batch BODY with a slot band of `band` rows.
@@ -968,6 +992,11 @@ impl Builder {
     /// The declared name of handle `h`.
     pub fn tensor_name(&self, h: u32) -> &str {
         &self.tensors[h as usize].name
+    }
+
+    /// The declared byte size of handle `h`.
+    pub fn tensor_bytes(&self, h: u32) -> u64 {
+        self.tensors[h as usize].bytes
     }
 
     /// Declare a tensor whose contents the compiler already knows (e.g. RoPE tables).
@@ -1883,6 +1912,67 @@ impl Builder {
                 Some(l)
             }
         });
+        let mut native_gemma4_glu = false;
+        if self.native_gemma4_glu_segments && l2_place.is_none() {
+            for op in &mut self.ops {
+                let inst = &op.inst;
+                let rows = matches!(inst.i[0], 1024 | 2048 | 4096 | 8192);
+                let glu_shape = rows
+                    && matches!((inst.i[1], inst.i[2]), (15_360, 3_840) | (21_504, 5_376));
+                let down_shape = rows
+                    && matches!((inst.i[1], inst.i[2]), (3_840, 15_360) | (5_376, 21_504));
+                let output12_shape =
+                    rows && matches!((inst.i[1], inst.i[2]), (3_840, 4_096) | (3_840, 8_192));
+                let output31_shape = matches!(inst.i[0], 4096 | 8192)
+                    && matches!((inst.i[1], inst.i[2]), (5_376, 8_192) | (5_376, 16_384));
+                let common = inst.i[4] == 0
+                    && inst.i[5] == 0
+                    && inst.f.iter().all(|value| value.to_bits() == 0)
+                    && inst.j == [0; 2];
+                let bf16_glu = inst.op == DevOp::GemmGlu as u16
+                    && inst.i[3] == 0
+                    && inst.i[6..] == [0; 2]
+                    && inst.t[3..5] == [TENSOR_NONE; 2]
+                    && inst.t[6..] == [TENSOR_NONE; 2];
+                let fp8_glu = inst.op == DevOp::GemmGluFp8 as u16
+                    && inst.i[3] == 0
+                    && inst.i[6..] == [0; 2]
+                    && inst.t[..7].iter().all(|&tensor| tensor != TENSOR_NONE)
+                    && inst.t[7] == TENSOR_NONE;
+                let bf16_linear = matches!(
+                    DevOp::from_u16(inst.op),
+                    Some(
+                        DevOp::Gemm
+                            | DevOp::GemmMed
+                            | DevOp::GemmSmall
+                            | DevOp::GemmWide
+                            | DevOp::GemmC5
+                    )
+                ) && inst.i[3..] == [0; 5]
+                    && inst.t[..3].iter().all(|&tensor| tensor != TENSOR_NONE)
+                    && inst.t[3..] == [TENSOR_NONE; 5];
+                let fp8_down = matches!(
+                    DevOp::from_u16(inst.op),
+                    Some(
+                        DevOp::GemmFp8
+                            | DevOp::GemmMedFp8
+                            | DevOp::GemmSmallFp8
+                            | DevOp::GemmWideFp8
+                            | DevOp::GemmC5Fp8
+                    )
+                ) && inst.i[3..] == [0; 5]
+                    && inst.t[..5].iter().all(|&tensor| tensor != TENSOR_NONE)
+                    && inst.t[5..] == [TENSOR_NONE; 3];
+                let glu = glu_shape && common && (bf16_glu || fp8_glu);
+                let down = down_shape && (bf16_linear || fp8_down);
+                let output = (output12_shape && bf16_linear)
+                    || (output31_shape && (bf16_linear || fp8_down));
+                if (glu || down || output) && op.cus.len() == n_cu {
+                    op.isolated = true;
+                    native_gemma4_glu = true;
+                }
+            }
+        }
 
         // Coarse or fine, decided from the dataflow — not from a flag. See the doc comment on
         // `select_granularity`, and the `collapse` theorem it implements.
@@ -2097,7 +2187,8 @@ impl Builder {
         // the segment boundary is spurious there and would otherwise force a segmented relaunch path.
         // `deny_uniseg` wins over the environment: a target that cannot express one segment must
         // not be given one because a variable said so. See that method for the failure it prevents.
-        let uniseg = !self.uniseg_denied && (self.uniseg_forced || knobs.uniseg);
+        // `force_uniseg` overrides both to enforce single-segment prefill.
+        let uniseg = self.uniseg_forced || (!self.uniseg_denied && knobs.uniseg);
         // Isolate MLA at every query rung: a small chunk can still have a long KV cache.
         // Class 26 separates small MLA from GEMM. The host selects four-wave split
         // or eight-wave unsplit objects from the instruction's validated layout.
@@ -2427,10 +2518,14 @@ impl Builder {
                 seg_of[i] = cur_seg;
                 continue;
             }
+            let is_flash = |op: u16| {
+                op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16
+            };
             if i > 0
                 && (wave_class(i) != wave_class(i - 1)
                     || self.ops[i].inst.op == DevOp::QwenGdnPrefill as u16
                     || self.ops[i - 1].inst.op == DevOp::QwenGdnPrefill as u16
+                    || (!uniseg && (is_flash(self.ops[i].inst.op) || is_flash(self.ops[i - 1].inst.op)))
                     || self.ops[i].isolated
                     || self.ops[i - 1].isolated
                     || self.ops[i].join != self.ops[i - 1].join)
@@ -2451,7 +2546,8 @@ impl Builder {
                 || op.inst.op == DevOp::GemmBlkPf as u16
                 || (op.inst.op == DevOp::MlaMergeFold as u16 && op.inst.i[5] == 1)
                 || (op.inst.op == DevOp::FlashMlaDecodeFp8 as u16 && op.isolated)
-        }) || lean_moe_stage2
+        }) || native_gemma4_glu
+            || lean_moe_stage2
             || lean_moe_stage1
             || lean_moe_combine
             || lean_attn_res_f32mix
@@ -3185,11 +3281,47 @@ pub const DECODE_RUNG_PROG: u32 = 1 << 29;
 /// it. Selected only by the runtime's dense-exact rule, never by width.
 pub const DENSE_EXACT_PROG: u32 = 1 << 28;
 
-const PROGRAM_ROLE_BITS: u32 =
-    PACKED_PREFILL_PROG | TOKEN_BATCH_PROG | DECODE_RUNG_PROG | DENSE_EXACT_PROG;
+/// How a row-split sibling runs its 64-head row-band attention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowSplitArm {
+    /// `PLOW_GLM_ROWSPLIT_ATTN`: head all-to-alls around the band attention; o_proj and its
+    /// reduce-scatter stay head-sharded.
+    AllToAll,
+    /// `PLOW_GLM_ROWBAND_ATTN`: q_absorb/q_rope/o_proj at full width on the band; no all-to-all
+    /// and no attention reduce-scatter.
+    Replicated,
+}
+
+/// [`BlobProgHeader::t`] bit marking a prefill bucket's ROW-SPLIT sibling
+/// (`PLOW_GLM_ROWSPLIT_ATTN`): the same bucket with its sparse attention on the 64-head
+/// row-split arm. Not a rung; the runtime runs it only for a full chunk whose every row owns
+/// the 2048 causal keys the native route needs, and the bucket itself for every other chunk.
+/// Bit 28 is [`DENSE_EXACT_PROG`].
+pub const ROWSPLIT_PREFILL_PROG: u32 = 1 << 27;
+
+/// [`BlobProgHeader::t`] bit marking a modular building-block program
+/// (e.g. `DenseAttentionBlock`, `DenseFfnBlock`, `EmbeddingBlock`, `FinalNormVocabBlock`).
+/// Allows decoupled, layer-reusable block execution and fine-grained rungs.
+pub const MODULAR_BLOCK_PROG: u32 = 1 << 26;
+
+const PROGRAM_ROLE_BITS: u32 = PACKED_PREFILL_PROG
+    | TOKEN_BATCH_PROG
+    | DECODE_RUNG_PROG
+    | DENSE_EXACT_PROG
+    | ROWSPLIT_PREFILL_PROG
+    | MODULAR_BLOCK_PROG;
 
 pub fn program_rows(t: u32) -> u32 {
     t & !PROGRAM_ROLE_BITS
+}
+
+pub fn is_modular_block_program(t: u32) -> bool {
+    t & MODULAR_BLOCK_PROG != 0
+}
+
+pub fn modular_block_program_t(rows: u32) -> u32 {
+    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 26 bits");
+    rows | MODULAR_BLOCK_PROG
 }
 
 pub fn is_dense_exact_program(t: u32) -> bool {
@@ -3197,7 +3329,7 @@ pub fn is_dense_exact_program(t: u32) -> bool {
 }
 
 pub fn dense_exact_program_t(rows: u32) -> u32 {
-    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 28 bits");
+    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 26 bits");
     rows | DENSE_EXACT_PROG
 }
 
@@ -3213,11 +3345,20 @@ pub fn is_decode_rung_program(t: u32) -> bool {
     t & DECODE_RUNG_PROG != 0
 }
 
+pub fn is_rowsplit_prefill_program(t: u32) -> bool {
+    t & ROWSPLIT_PREFILL_PROG != 0
+}
+
+pub fn rowsplit_prefill_program_t(rows: u32) -> u32 {
+    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 26 bits");
+    rows | ROWSPLIT_PREFILL_PROG
+}
+
 pub fn decode_rung_program_t(rows: u32) -> u32 {
     assert_eq!(
         rows & PROGRAM_ROLE_BITS,
         0,
-        "program row count exceeds 29 bits"
+        "program row count exceeds 26 bits"
     );
     rows | DECODE_RUNG_PROG
 }
@@ -3226,7 +3367,7 @@ pub fn token_batch_program_t(rows: u32) -> u32 {
     assert_eq!(
         rows & PROGRAM_ROLE_BITS,
         0,
-        "program row count exceeds 29 bits"
+        "program row count exceeds 26 bits"
     );
     rows | TOKEN_BATCH_PROG
 }
@@ -3235,7 +3376,7 @@ pub fn packed_prefill_program_t(rows: u32) -> u32 {
     assert_eq!(
         rows & PROGRAM_ROLE_BITS,
         0,
-        "program row count exceeds 29 bits"
+        "program row count exceeds 26 bits"
     );
     rows | PACKED_PREFILL_PROG
 }
@@ -3288,6 +3429,11 @@ pub enum ProgramRole {
     /// A dense-exact decode rung ([`DENSE_EXACT_PROG`]): the decode rung of the same width
     /// without top-k selection. Decode-side, but not a rung of the width ladder.
     DenseExactRung { rows: u32 },
+    /// The row-split attention topology of the prefill bucket of the same width
+    /// ([`ROWSPLIT_PREFILL_PROG`]). Never selected as a rung of its own.
+    RowSplitSibling { of_rows: u32 },
+    /// A modular building-block program ([`MODULAR_BLOCK_PROG`]) for fine-grained rungs or single-block execution.
+    ModularBlock { rows: u32 },
 }
 
 impl ProgramRole {
@@ -3298,8 +3444,14 @@ impl ProgramRole {
             | Self::DecodeRung { rows }
             | Self::PackedSibling { of_rows: rows }
             | Self::TokenBatchBody { rows, .. }
-            | Self::DenseExactRung { rows } => rows,
+            | Self::DenseExactRung { rows }
+            | Self::RowSplitSibling { of_rows: rows }
+            | Self::ModularBlock { rows } => rows,
         }
+    }
+
+    pub fn is_modular_block(self) -> bool {
+        matches!(self, Self::ModularBlock { .. })
     }
 
     pub fn is_prefill_bucket(self) -> bool {
@@ -3323,6 +3475,10 @@ impl ProgramRole {
         matches!(self, Self::TokenBatchBody { .. })
     }
 
+    pub fn is_rowsplit_sibling(self) -> bool {
+        matches!(self, Self::RowSplitSibling { .. })
+    }
+
     /// The band a token-batch body samples, or `None` for every other role.
     pub fn token_batch_band(self) -> Option<u32> {
         match self {
@@ -3334,7 +3490,7 @@ impl ProgramRole {
     /// Prefill-side: exactly the programs the positional code found below `decode_rung_lo` —
     /// buckets, their packed siblings and the token-batch bodies.
     pub fn is_prefill_side(self) -> bool {
-        !self.is_decode_rung()
+        !self.is_decode_rung() && !self.is_modular_block()
     }
 
     /// The role's name, for a refusal message.
@@ -3345,6 +3501,8 @@ impl ProgramRole {
             Self::PackedSibling { .. } => "packed sibling",
             Self::TokenBatchBody { .. } => "token-batch body",
             Self::DenseExactRung { .. } => "dense-exact decode rung",
+            Self::RowSplitSibling { .. } => "row-split sibling",
+            Self::ModularBlock { .. } => "modular block",
         }
     }
 }
@@ -3406,8 +3564,12 @@ pub fn derive_roles(
                 }
             } else if is_packed_prefill_program(t) {
                 ProgramRole::PackedSibling { of_rows: rows }
+            } else if is_rowsplit_prefill_program(t) {
+                ProgramRole::RowSplitSibling { of_rows: rows }
             } else if is_dense_exact_program(t) {
                 ProgramRole::DenseExactRung { rows }
+            } else if is_modular_block_program(t) {
+                ProgramRole::ModularBlock { rows }
             } else if is_decode_rung_program(t) || i >= lo {
                 ProgramRole::DecodeRung { rows }
             } else {
@@ -5188,6 +5350,122 @@ mod xreduce_wave_rs_segment_tests {
 }
 
 #[cfg(test)]
+mod gemma4_glu_segment_tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Glu,
+        Down,
+        Output12,
+        Output31,
+    }
+
+    fn program(l2: bool, rows: u32, fp8: bool, kind: Kind) -> Program {
+        let mut b = Builder::new(8);
+        b.deny_uniseg();
+        b.set_native_gemma4_glu_segments(true);
+        if l2 {
+            b.set_l2_placement(Some(L2Layout {
+                sms: 1,
+                domains: 8,
+                map: L2Map::RoundRobin,
+            }));
+        }
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let glu = b.emit(
+            match (fp8, kind) {
+                (true, Kind::Down | Kind::Output31) => DevOp::GemmFp8,
+                (true, Kind::Glu) => DevOp::GemmGluFp8,
+                (false, Kind::Down | Kind::Output12 | Kind::Output31) => DevOp::Gemm,
+                (false, Kind::Glu) => DevOp::GemmGlu,
+                (true, Kind::Output12) => unreachable!(),
+            },
+            all.clone(),
+            &[before],
+            |d| {
+                if matches!(kind, Kind::Down | Kind::Output31) && fp8 {
+                    d.t = [0, 1, 2, 3, 4, TENSOR_NONE, TENSOR_NONE, TENSOR_NONE];
+                } else if matches!(kind, Kind::Down | Kind::Output12 | Kind::Output31) {
+                    d.t = [
+                        0,
+                        1,
+                        2,
+                        TENSOR_NONE,
+                        TENSOR_NONE,
+                        TENSOR_NONE,
+                        TENSOR_NONE,
+                        TENSOR_NONE,
+                    ];
+                } else if fp8 {
+                    d.t = [0, 1, 2, 3, 4, 5, 6, TENSOR_NONE];
+                } else {
+                    d.t = [
+                        0,
+                        1,
+                        2,
+                        TENSOR_NONE,
+                        TENSOR_NONE,
+                        3,
+                        TENSOR_NONE,
+                        TENSOR_NONE,
+                    ];
+                }
+                d.i = match kind {
+                    Kind::Down => [rows, 3_840, 15_360, 0, 0, 0, 0, 0],
+                    Kind::Output12 => [rows, 3_840, 4_096, 0, 0, 0, 0, 0],
+                    Kind::Output31 => [rows, 5_376, 8_192, 0, 0, 0, 0, 0],
+                    Kind::Glu => [rows, 15_360, 3_840, 0, 0, 0, 0, 0],
+                };
+            },
+        );
+        b.emit(DevOp::Nop, all, &[glu], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn exact_gfx942_glu_is_a_counter_free_raw_segment() {
+        for kind in [Kind::Glu, Kind::Down, Kind::Output12, Kind::Output31] {
+            for fp8 in [false, true] {
+                if fp8 && matches!(kind, Kind::Output12) {
+                    continue;
+                }
+                for rows in [1024, 2048, 4096, 8192] {
+                    let p = program(false, rows, fp8, kind);
+                    if matches!(kind, Kind::Output31) && rows < 4096 {
+                        assert_ne!(p.insts[1].wait_len, 0);
+                        assert_ne!(p.insts[1].succ_len, 0);
+                        continue;
+                    }
+                    let segment = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
+                    assert!(p
+                        .stream
+                        .iter()
+                        .filter(|e| e.seg == segment)
+                        .all(|e| e.inst == 1 && e.wait_len == 0 && e.succ_len == 0));
+                    assert!(p.insts.iter().all(|d| d.wait_len == 0 && d.succ_len == 0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn l2_placement_keeps_the_interpreter_counter_protocol() {
+        for kind in [Kind::Glu, Kind::Down, Kind::Output12, Kind::Output31] {
+            for fp8 in [false, true] {
+                if fp8 && matches!(kind, Kind::Output12) {
+                    continue;
+                }
+                let p = program(true, 1024, fp8, kind);
+                assert_ne!(p.insts[1].wait_len, 0);
+                assert_ne!(p.insts[1].succ_len, 0);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod decode_grouped_moe_segment_tests {
     use super::*;
 
@@ -6138,6 +6416,17 @@ mod v6_tests {
         // Width 128 is legal for decode. The equal-width prefill bucket remains outside the
         // trailing ladder because the scan is strict.
         assert_eq!(decode_rung_lo(&[128, 512, 1, 16, 32, 64, 128]), 2);
+        let rs = [128, 8192, rowsplit_prefill_program_t(8192), 1, 4, 8];
+        assert_eq!(decode_rung_lo(&rs), 3);
+        assert_eq!(
+            derive_roles(&rs, RoleSource::Positional, |_| 0)[..3],
+            [
+                ProgramRole::PrefillBucket { rows: 128 },
+                ProgramRole::PrefillBucket { rows: 8192 },
+                ProgramRole::RowSplitSibling { of_rows: 8192 },
+            ]
+        );
+        assert_eq!(program_rows(rowsplit_prefill_program_t(8192)), 8192);
         assert_eq!(decode_rung_lo(&[128, 128]), 1);
         // A packed-only copy of each prefill rung sits between the ordinary
         // ladder and decode. Its tag cannot be mistaken for a decode width.
@@ -6289,6 +6578,22 @@ mod v6_tests {
             derive_roles(&table, RoleSource::Stated, |_| 0)[side..lo],
             roles[side..lo]
         );
+    }
+
+    /// A modular block word placed before the decode ladder carries bit 26, which exceeds
+    /// DECODE_RUNG_MAX (256); the backward scan in decode_rung_lo terminates at the ladder boundary.
+    #[test]
+    fn modular_block_programs_keep_the_decode_boundary() {
+        let pf = [128u32, 512, 2048];
+        let dec = [1u32, 2, 4, 8, 16];
+        let mut table: Vec<u32> = pf.to_vec();
+        table.push(modular_block_program_t(128));
+        let lo = table.len();
+        table.extend(&dec);
+        assert_eq!(decode_rung_lo(&table), lo);
+        let roles = derive_roles(&table, RoleSource::Positional, |_| 0);
+        assert_eq!(roles[lo - 1], ProgramRole::ModularBlock { rows: 128 });
+        assert_eq!(roles[lo], ProgramRole::DecodeRung { rows: 1 });
     }
 
     #[test]

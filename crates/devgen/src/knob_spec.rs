@@ -29,6 +29,15 @@ const REMOVED: Status = Status::Removed;
 const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=0` is the rollback"],
 };
+/// Digest-relaxed dense-GEMM tuner reads. Default on WITHOUT a hardware certificate: no MI300X
+/// was reachable when it was flipped, so the argument below is structural, not measured.
+const TUNE_IGNORE_DIGEST: Status = Status::Candidate {
+    evidence: &[
+        "devgen/src/lib.rs gfx950_gemm_measurements: current-digest records are loaded first and are never displaced; relaxed records fill only op cases that have none",
+        "for those cases the alternative is the ANALYTICAL MODEL, not a different measurement, so the comparison is measured-but-older vs never-measured",
+        "docs/flags-reference.md: `PLOW_TUNE_IGNORE_DIGEST=0` restores strict staleness",
+    ],
+};
 const GLM_RECIPE: Status = Status::Qualified {
     evidence: &[
         "crates/devgen/src/lib.rs apply_production_defaults: 47-50 out tok/s on 8x MI300X, retrieval 18/18",
@@ -56,10 +65,9 @@ const GEMMA_NATIVE_PURE_GEMM: Status = Status::Qualified {
 const UNISEG: Status = Status::Qualified {
     evidence: &["crates/plowc/src/main.rs effective_uniseg: the sm_120 interpreter implements the single-segment path only"],
 };
-const TOKEN_BATCH_TP_PARKED: Status = Status::Parked {
-    reason: "the seams-aware body corrupted long-context prefill (retrieval 9/18 base, 0/21 tail)",
+const TOKEN_BATCH_TP_CANDIDATE: Status = Status::Candidate {
     evidence: &[
-        "review log #63",
+        "review log #63 follow-up: bodies carry sequence-parallel seams, gathered indexer weights, and primary-routed seam norms",
         "docs/flags-reference.md: PLOW_TOKEN_BATCH_TP",
     ],
 };
@@ -70,6 +78,29 @@ const SEG_EXPERIMENT_PARKED: Status = Status::Parked {
     reason: "rejected segmentation experiment (+91.7 / +3.6 / +22.6 ms TTFT)",
     evidence: &["docs/flags-reference.md: Emit-side knobs that are NOT EmitConfig fields"],
 };
+
+/// The DCP page is meaningless without a DCP degree to cycle over, and a page silently ignored
+/// is a KV map nobody can reproduce from the recorded knobs.
+const C_DCP_PAGE: &[Constraint] = &[Constraint {
+    id: "dcp_page_needs_dcp",
+    formula: F::Implies(
+        &F::Atom("emit.dcp_page", Cmp::Ne, Val::Unset),
+        &F::Atom("emit.dcp", Cmp::Ne, Val::Unset),
+    ),
+    site: "crates/devgen/src/emit_config.rs dcp_layout: the page only shapes a sharded layout",
+    check: Check::Site,
+}];
+
+/// The DCP gather ships 656-B fp8 records; a bf16 cache has no record layout to shard.
+const C_DCP: &[Constraint] = &[Constraint {
+    id: "dcp_requires_glm_fp8_kv",
+    formula: F::Implies(
+        &F::Atom("emit.dcp", Cmp::Gt, Val::Nat(1)),
+        &F::Atom("emit.glm_fp8_kv", Cmp::Eq, TRUE),
+    ),
+    site: "crates/devgen/src/mla.rs emit_glm_mla: PLOW_DCP requires PLOW_GLM_FP8_KV",
+    check: Check::Site,
+}];
 
 /// `apply_production_defaults`'s gate for the qualified GLM recipe.
 const GLM_TARGET: F = F::And(&[
@@ -95,6 +126,7 @@ const GLM_SEQ_PAR_DEFAULT: Default = Default::Production {
         DefaultCase {
             when: F::And(&[
                 GLM_TARGET,
+                F::Not(&F::Atom("emit.token_batch_tp", Cmp::Eq, TRUE)),
                 F::Not(&F::Atom("emit.glm_xr_res", Cmp::Eq, TRUE)),
                 F::Not(&F::Atom("emit.glm_xr_band", Cmp::Gt, Val::Nat(1))),
             ]),
@@ -175,14 +207,62 @@ const PURE_GEMM_DEFAULT: Default = Default::Production {
     otherwise: Val::Unset,
 };
 
-const PACKED_PREFILL_DEFAULT: Default = Default::Production {
+/// Gemma-4 BF16 on sm_90a TP1: gate/up as two cuBLASLt GEMMs plus the GeGLU pass instead of the
+/// fused GLU role. Measured on H100 (perf-data/campaign/gemma4-12b.h100.bf16.csv): the fused
+/// role ran at ~20% of tensor-core peak at every bucket; Lt takes C1 TTFT@1024 from 89.9 to
+/// 56.4 ms and @4096 from 213.6 to 204.2 ms, in128 neutral, TPOT unchanged (decode is not
+/// touched). W8A8 is not covered: its GLU role has no Lt A/B.
+const LT_GLU_TARGET: F = F::And(&[
+    F::Target(T::Cap("gemma")),
+    F::Target(T::Arch("sm_90a")),
+    F::Target(T::Tp(1)),
+    F::Atom("emit.fp8", Cmp::Eq, FALSE),
+    F::Atom("emit.w8a8", Cmp::Eq, FALSE),
+    F::Atom("emit.w8a16", Cmp::Eq, FALSE),
+    F::Atom("emit.mxfp4", Cmp::Eq, FALSE),
+]);
+const LT_GLU_DEFAULT: Default = Default::Production {
     cases: &[DefaultCase {
-        when: F::And(&[
-            F::Target(T::Cap("packed_prefill_siblings")),
-            F::Target(T::Arch("gfx942")),
-        ]),
+        when: LT_GLU_TARGET,
         value: TRUE,
     }],
+    // clap `bool` fields: off-target the knob is plainly false, not unset.
+    otherwise: FALSE,
+};
+const LT_GLU_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "perf-data/campaign/gemma4-12b.h100.bf16.csv: Lt gate/up vs fused GLU role, C1 TTFT@1024 89.9 -> 56.4 ms, @4096 -4%, in128 and TPOT neutral",
+        "perf-certs/emit.prefill_cublaslt.json and perf-certs/emit.no_glu_fuse.json: checkpoint P over ctrl/ctrl2/treat/treat2",
+        "plans/gemma4-dense-realtime-tracker.md: attribution (PLOW_PF_SEG_TIME) that ranked the GLU role first",
+    ],
+};
+
+/// `apply_production_defaults` forces the arms that read the local cache directly off under
+/// `--dcp > 1`: they bypass the owner gather.
+const GLM_DCP_SHARDED: F = F::And(&[GLM_TARGET, F::Atom("emit.dcp", Cmp::Gt, Val::Nat(1))]);
+
+const GLM_DCP_OFF_DEFAULT: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: GLM_DCP_SHARDED,
+        value: FALSE,
+    }],
+    otherwise: Val::Unset,
+};
+
+const PACKED_PREFILL_DEFAULT: Default = Default::Production {
+    cases: &[
+        DefaultCase {
+            when: GLM_DCP_SHARDED,
+            value: FALSE,
+        },
+        DefaultCase {
+            when: F::And(&[
+                F::Target(T::Cap("packed_prefill_siblings")),
+                F::Target(T::Arch("gfx942")),
+            ]),
+            value: TRUE,
+        },
+    ],
     otherwise: Val::Unset,
 };
 
@@ -212,6 +292,23 @@ const C_W8A8: &[Constraint] = &[Constraint {
         F::Atom("emit.w8a16", Cmp::Eq, TRUE),
     ])),
     site: "crates/devgen/src/lib.rs: PLOW_W8A8=1 and PLOW_W8A16=1 name two activation profiles",
+    check: Check::Load,
+}];
+
+/// Restored after `6058cb29` removed it. The narrow-seam fix moved seam norms back onto the
+/// primary object, which is why `token_batch_tp` was re-rated Candidate — but the measured
+/// failure (review log #63: retrieval 9/18 base, 0/21 tail) was never re-run with both arms on,
+/// and a deleted `Check::Load` cannot protect a packet emitted before that fix. The production
+/// default already resolves `glm_seq_par` to off under `token_batch_tp`; this catches the
+/// explicitly-flagged emit that walks around the default.
+const C_TOKEN_BATCH_TP: &[Constraint] = &[Constraint {
+    id: "token_batch_tp_excludes_seq_par",
+    formula: F::Not(&F::And(&[
+        F::Atom("emit.token_batch_tp", Cmp::Eq, TRUE),
+        F::Atom("emit.glm_seq_par", Cmp::Eq, TRUE),
+    ])),
+    site: "review log #63: the seams-aware token-batch body corrupted long-context prefill \
+           (retrieval 9/18 base, 0/21 tail) with sequence parallelism on",
     check: Check::Load,
 }];
 
@@ -308,16 +405,6 @@ const C_SEQ_PAR_PROJ: &[Constraint] = &[Constraint {
     check: Check::Load,
 }];
 
-const C_TOKEN_BATCH_TP: &[Constraint] = &[Constraint {
-    id: "token_batch_tp_excludes_seq_par",
-    formula: F::Not(&F::And(&[
-        F::Atom("emit.token_batch_tp", Cmp::Eq, TRUE),
-        F::Atom("emit.glm_seq_par", Cmp::Eq, TRUE),
-    ])),
-    site: "review log #63: token-batch bodies with seams corrupted long-context prefill",
-    check: Check::Load,
-}];
-
 const C_K3_WALK: &[Constraint] = &[Constraint {
     id: "k3_wide_decode_requires_walk",
     formula: F::Implies(
@@ -336,10 +423,10 @@ const C_K3_WALK: &[Constraint] = &[Constraint {
 /// environment).
 const GLM53_RECIPE: &[(&str, Val)] = &[
     ("emit.fp8", TRUE),
-    ("emit.decode_ladder", Val::Str("1,2,4,8,16,20")),
-    ("emit.emit_packed_prefill", FALSE),
+    ("emit.decode_ladder", Val::Str("1,2,4,8,16,32")),
+    ("emit.emit_packed_prefill", TRUE),
     ("emit.uniseg", FALSE),
-    ("emit.mla_prefill", Val::Str("full:128,512,2048,8192")),
+    ("emit.mla_prefill", Val::Str(crate::emit_config::GLM53_MLA_PREFILL)),
     ("emit.moe_pf_det", TRUE),
     ("emit.glm_dsa", Val::Str("1")),
     ("emit.glm_shard_head", TRUE),
@@ -353,17 +440,49 @@ const GLM53_RECIPE: &[(&str, Val)] = &[
     ("emit.glm_moe_aiter", TRUE),
     ("emit.glm_moe_flat_decode", FALSE),
     ("emit.glm_moe_resident", TRUE),
+    ("emit.token_batch_tp", TRUE),
+    ("emit.packed_sparse_pf", TRUE),
     ("emit.glm_index_tp", TRUE),
     ("emit.glm_select_local", TRUE),
     ("emit.glm_decode_norm_rows", TRUE),
     ("emit.glm_gemm_lt", TRUE),
     ("emit.glm_gemm_lt_decode", TRUE),
     ("emit.glm_dsa_pf_span", Val::Nat(3)),
-    ("emit.glm_place_pf", FALSE),
+    ("emit.glm_place_pf", TRUE),
     ("env.PLOW_UNISEG", Val::Str("0")),
     ("env.PLOW_MLA_PF_V2", Val::Str("1")),
     ("env.PLOW_MLA_PF_AITER", Val::Str("1")),
 ];
+
+/// The GLM-5.3 TP8 recipe as `(env var, value)` pairs.
+///
+/// Exists for the gate that asserts an unflagged production emit already produces EVERY recipe
+/// entry. `the_qualified_glm_recipe_is_what_an_unflagged_gfx942_tp8_emit_produces` compares a
+/// hand-written list of 12 and hardcodes five more into both of its arms, so it stayed green
+/// while `glm_dsa_pf`, `glm_dsa_pf_span` and `PLOW_MLA_PF_AITER` had no applier at all. Driving
+/// the gate off this table means a knob cannot join the recipe without joining the check.
+///
+/// `env.*` entries name their variable directly; `emit.*` entries resolve theirs through `EMIT`.
+/// A knob with no env var cannot be named on a command line, so it is not comparable this way.
+#[cfg(test)]
+pub(crate) fn glm53_recipe_env() -> Vec<(&'static str, String)> {
+    GLM53_RECIPE
+        .iter()
+        .filter_map(|(id, v)| {
+            let env = match id.strip_prefix("env.") {
+                Some(name) => name,
+                None => EMIT.iter().find(|k| k.id == *id)?.env?,
+            };
+            let val = match v {
+                Val::Bool(b) => u8::from(*b).to_string(),
+                Val::Nat(n) => n.to_string(),
+                Val::Str(s) => (*s).to_string(),
+                Val::Unset => return None,
+            };
+            Some((env, val))
+        })
+        .collect()
+}
 
 const DENSE_CAPS: &[&str] = &["dense_packet_contracts", "decode_objects", "decode_ladder"];
 const GEMMA4_W8A8_RECIPE: &[(&str, Val)] = &[("emit.w8a8", TRUE)];
@@ -391,6 +510,24 @@ const MOE_SHARED_SEED_SCOPE: &[Allow] = &[
         kinds: &["global"],
         fields: &[ScopeField::ObjectFacts],
         facts: &["moe_aiter"],
+        ..Allow::ANY
+    },
+];
+
+/// The band router score reads slot 3's band behind the norm; score, top-k (and at 2 the route
+/// gather and the align) move ahead of the shared gate/up `GemmLtPf` in the 2048..8192 buckets.
+const ROUTER_OVERLAP_SCOPE: &[Allow] = &[
+    Allow {
+        kinds: &["prefill"],
+        rows: (2048, 8192),
+        ops: OpSel::In(&["gemm", "moe", "collective"]),
+        fields: &[ScopeField::Op, ScopeField::Operands, ScopeField::Segments],
+        ..Allow::ANY
+    },
+    // The unread `act.xn2@band<t>` views are no longer declared.
+    Allow {
+        kinds: &["global"],
+        fields: &[ScopeField::TensorBytes],
         ..Allow::ANY
     },
 ];
@@ -504,6 +641,40 @@ const DENSE_EXACT_SCOPE: &[Allow] = &[Allow {
 
 /// The row-split attention arm: attention and the all-to-all in the 2048..8192 prefill buckets,
 /// and the packet-wide object facts its arm adds.
+const ROWBAND_ATTN_SCOPE: &[Allow] = &[
+    Allow {
+        kinds: &["prefill"],
+        rows: (8192, 8192),
+        topology: Some("rowsplit"),
+        fields: &[
+            ScopeField::ProgramSet,
+            ScopeField::Op,
+            ScopeField::Operands,
+            ScopeField::Shape,
+            ScopeField::Cus,
+            ScopeField::Segments,
+            ScopeField::TensorBytes,
+            ScopeField::ObjectFacts,
+        ],
+        ..Allow::ANY
+    },
+    Allow {
+        kinds: &["global"],
+        fields: &[ScopeField::ObjectFacts, ScopeField::TensorBytes],
+        ..Allow::ANY
+    },
+];
+
+const C_ROWBAND_ATTN: &[Constraint] = &[Constraint {
+    id: "rowband_attn_excludes_rowsplit_attn",
+    formula: F::Implies(
+        &F::Atom("emit.glm_rowband_attn", Cmp::Eq, TRUE),
+        &F::Not(&F::Atom("emit.glm_rowsplit_attn", Cmp::Eq, TRUE)),
+    ),
+    site: "crates/devgen/src/emit_config.rs: PLOW_GLM_ROWBAND_ATTN and PLOW_GLM_ROWSPLIT_ATTN are two arms of one row-split sibling",
+    check: Check::Load,
+}];
+
 const ROWSPLIT_ATTN_SCOPE: &[Allow] = &[
     Allow {
         kinds: &["prefill"],
@@ -617,6 +788,8 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.mx4_prefill", Some("PLOW_MX4_PREFILL"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.uniseg", Some("PLOW_UNISEG"), Layer::Emit, Domain::Bool, UNISEG_DEFAULT, UNISEG),
     KnobSpec::new("emit.seg_pure_gemm", Some("PLOW_SEG_PURE_GEMM"), Layer::Emit, Domain::Str, PURE_GEMM_DEFAULT, GEMMA_NATIVE_PURE_GEMM),
+    // Before the defaults that read it (`GLM_DCP_SHARDED`).
+    KnobSpec::new("emit.dcp", Some("PLOW_DCP"), Layer::Emit, U32, UNSET, OPT_IN).with(C_DCP),
     KnobSpec::new("emit.emit_packed_prefill", Some("PLOW_EMIT_PACKED_PREFILL"), Layer::Emit, Domain::Bool, PACKED_PREFILL_DEFAULT, PACKED_SIBLINGS),
     KnobSpec::new("emit.decode_mla_segments", Some("PLOW_SEG_DECODE_MLA"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.decode_grouped_moe_segments", Some("PLOW_SEG_DECODE_GROUPED_MOE"), Layer::Emit, Domain::Bool, UNSET, OPT_IN),
@@ -630,6 +803,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.decode_tiled", Some("PLOW_DECODE_TILED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.l2_place_prefill", Some("PLOW_L2_PLACE_PREFILL"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.fuse_argmax", Some("PLOW_FUSE_ARGMAX"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.sliding_ns_cap", Some("PLOW_SLIDING_NS_CAP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.no_fuse_qkv", Some("PLOW_NO_FUSE_QKV"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fuse_qkv_fp8", Some("PLOW_FUSE_QKV_FP8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.no_fuse_nrn", Some("PLOW_NO_FUSE_NRN"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -645,6 +819,9 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.pf_ladder", Some("PLOW_PF_LADDER"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.pf_ladder_append", Some("PLOW_PF_LADDER_APPEND"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.pf_gemv_head", Some("PLOW_PF_GEMV_HEAD"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("emit.block_packets", Some("PLOW_BLOCK_PACKETS"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.pf_modular", Some("PLOW_PF_MODULAR"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.block_stage", Some("PLOW_BLOCK_STAGE"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.xr_cus", Some("PLOW_XR_CUS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_pf_small_cus", Some("PLOW_GLM_PF_SMALL_CUS"), Layer::Emit, Domain::Str, UNSET, OPT_IN).scoped(SMALL_CUS_SCOPE),
     KnobSpec::new("emit.xr_dec_cus", Some("PLOW_XR_DEC_CUS"), Layer::Emit, U32, UNSET, OPT_IN),
@@ -683,6 +860,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_moe_native_align", Some("PLOW_GLM_MOE_NATIVE_ALIGN"), Layer::Emit, Domain::Bool, OFF, OPT_IN).scoped(NATIVE_ALIGN_SCOPE),
     KnobSpec::new("emit.glm_fuse_seam_rn", Some("PLOW_GLM_FUSE_SEAM_RN"), Layer::Emit, Domain::Bool, OFF, OPT_IN).scoped(FUSE_SEAM_RN_SCOPE),
     KnobSpec::new("emit.emit_rewrite", Some("PLOW_EMIT_REWRITE"), Layer::Emit, Domain::Bool, ON, PROMOTED).scoped(EMIT_REWRITE_SCOPE),
+    KnobSpec::new("emit.tune_ignore_digest", Some("PLOW_TUNE_IGNORE_DIGEST"), Layer::Emit, Domain::Bool, ON, TUNE_IGNORE_DIGEST),
     KnobSpec::new("emit.glm_router_off_shared", Some("GLM_ROUTER_OFF_SHARED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_router_old", Some("GLM_ROUTER_OLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.k3_fuse_ngemv", Some("PLOW_K3_FUSE_NGEMV"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
@@ -717,7 +895,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_moe_resident", Some("PLOW_GLM_MOE_RESIDENT"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_moe_shared_fold", Some("PLOW_GLM_MOE_SHARED_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_moe_shared_seed", Some("PLOW_GLM_MOE_SHARED_SEED"), Layer::Emit, Domain::Bool, OFF, MOE_SHARED_SEED_CANDIDATE).scoped(MOE_SHARED_SEED_SCOPE),
-    KnobSpec::new("emit.token_batch_tp", Some("PLOW_TOKEN_BATCH_TP"), Layer::Emit, Domain::Bool, OFF, TOKEN_BATCH_TP_PARKED).with(C_TOKEN_BATCH_TP),
+    KnobSpec::new("emit.token_batch_tp", Some("PLOW_TOKEN_BATCH_TP"), Layer::Emit, Domain::Bool, OFF, TOKEN_BATCH_TP_CANDIDATE).with(C_TOKEN_BATCH_TP),
     KnobSpec::new("emit.packed_sparse_pf", Some("PLOW_PACKED_SPARSE_PF"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_PACKED_SPARSE_PF),
     KnobSpec::new("emit.glm_index_tp", Some("PLOW_GLM_INDEX_TP"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_select_local", Some("PLOW_GLM_SELECT_LOCAL"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
@@ -732,12 +910,13 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_gemv_wg", Some("PLOW_GLM_GEMV_WG"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_ofold", Some("PLOW_GLM_OFOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_OFOLD),
     KnobSpec::new("emit.glm_pf_ns", Some("PLOW_GLM_PF_NS"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.glm_router_overlap", Some("PLOW_GLM_ROUTER_OVERLAP"), Layer::Emit, U32, UNSET, OPT_IN).scoped(ROUTER_OVERLAP_SCOPE),
     KnobSpec::new("emit.glm_dsa_pf_span", Some("PLOW_GLM_DSA_PF_SPAN"), Layer::Emit, U32, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("emit.glm_dsa_pf_dexact", Some("PLOW_GLM_DSA_PF_DEXACT"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.pf_floor", Some("PLOW_PF_FLOOR"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.dense_pf_ns", Some("PLOW_DENSE_PF_NS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_pf_wide", Some("PLOW_GLM_PF_WIDE"), Layer::Emit, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("emit.glm_place_pf", Some("PLOW_GLM_PLACE_PF"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_place_pf", Some("PLOW_GLM_PLACE_PF"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.glm_xr_band", Some("PLOW_GLM_XR_BAND"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_xr_band_cus", Some("PLOW_GLM_XR_BAND_CUS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.attnres_decode_mwg", Some("PLOW_ATTNRES_DECODE_MWG"), Layer::Emit, U32, UNSET, OPT_IN),
@@ -745,7 +924,9 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_xr_res", Some("PLOW_GLM_XR_RES"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_seq_par", Some("PLOW_GLM_SEQ_PAR"), Layer::Emit, Domain::Bool, GLM_SEQ_PAR_DEFAULT, GLM_RECIPE).with(C_SEQ_PAR),
     KnobSpec::new("emit.glm_seq_par_proj", Some("PLOW_GLM_SEQ_PAR_PROJ"), Layer::Emit, Domain::Bool, GLM_SEQ_PAR_PROJ_DEFAULT, GLM_RECIPE).with(C_SEQ_PAR_PROJ),
-    KnobSpec::new("emit.glm_rowsplit_attn", Some("PLOW_GLM_ROWSPLIT_ATTN"), Layer::Emit, Domain::Bool, UNSET, OPT_IN).scoped(ROWSPLIT_ATTN_SCOPE),
+    KnobSpec::new("emit.glm_rowsplit_attn", Some("PLOW_GLM_ROWSPLIT_ATTN"), Layer::Emit, Domain::Bool, GLM_DCP_OFF_DEFAULT, OPT_IN).scoped(ROWSPLIT_ATTN_SCOPE),
+    KnobSpec::new("emit.dcp_page", Some("PLOW_DCP_PAGE"), Layer::Emit, U32, UNSET, OPT_IN).with(C_DCP_PAGE),
+    KnobSpec::new("emit.glm_rowband_attn", Some("PLOW_GLM_ROWBAND_ATTN"), Layer::Emit, Domain::Bool, GLM_DCP_OFF_DEFAULT, OPT_IN).scoped(ROWBAND_ATTN_SCOPE).with(C_ROWBAND_ATTN),
     KnobSpec::new("emit.glm_decode_glue_cus", Some("PLOW_GLM_DECODE_GLUE_CUS"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_decode_gemm_group", Some("PLOW_GLM_DECODE_GEMM_GROUP"), Layer::Emit, Domain::Bool, GLM_RECIPE_ON, GLM_RECIPE),
     KnobSpec::new("emit.glm_fuse_xrn", Some("GLM_FUSE_XRN"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -763,7 +944,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.moe_pf_det", Some("PLOW_MOE_PF_DET"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_stage1_body", Some("PLOW_MOE_STAGE1_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_stage2_body", Some("PLOW_MOE_STAGE2_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.no_glu_fuse", Some("PLOW_NO_GLU_FUSE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.no_glu_fuse", Some("PLOW_NO_GLU_FUSE"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED),
     KnobSpec::new("emit.tma_gemm", Some("PLOW_TMA_GEMM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_gemm_glu_role", Some("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_w8a8_gemm_glu_role", Some("PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -777,7 +958,8 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.qwen_fp8_m1_tma", Some("PLOW_QWEN_FP8_M1_TMA"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_w8a8_prefill", Some("PLOW_QWEN_W8A8_PREFILL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_cublaslt", Some("PLOW_EMIT_DECODE_CUBLASLT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.prefill_cublaslt", Some("PLOW_EMIT_PREFILL_CUBLASLT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.prefill_cublaslt", Some("PLOW_EMIT_PREFILL_CUBLASLT"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED),
+    KnobSpec::new("emit.gemma_gemm_lt", Some("PLOW_GEMMA_GEMM_LT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_native_tc", Some("PLOW_EMIT_DECODE_NATIVE_TC"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_fuse_ab", Some("PLOW_QWEN_FUSE_AB"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_fuse_mlp", Some("PLOW_QWEN_FUSE_MLP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -859,6 +1041,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_SEG_PURE_GEMM", Some("PLOW_SEG_PURE_GEMM"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_SEG_SLICE_ALL", Some("PLOW_SEG_SLICE_ALL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_SEG_V2", Some("PLOW_SEG_V2"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_SKIP_ASM_AUDIT", Some("PLOW_SKIP_ASM_AUDIT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_SOURCE_ROOT", Some("PLOW_SOURCE_ROOT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_TOKEN_BATCH_TP_OBJECTS", Some("PLOW_TOKEN_BATCH_TP_OBJECTS"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_TOOLCHAIN_LABEL", Some("PLOW_TOOLCHAIN_LABEL"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
@@ -917,6 +1100,8 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_CUBIN_DIR", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_GEMMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_PACKED_PREFILL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_DCP_GATHER", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_DCP_NWG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_DECODE_HEADS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_DECODE_INVENTORY_PRUNE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_DEC_ARENA_HALVES", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -929,6 +1114,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_EXPERIMENT_PX4_BQ64", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_GLM_OFOLD", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_DSA_SELECT_SPLIT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_DSA_TP_SELECT_THR", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_DSA_TP_TILE_N", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_EXPERIMENT_HD512_PC_CUH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_EXPERIMENT_LAUNCH_SMEM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -968,6 +1154,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_GATE_RELAXSIG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_GATE_SC1", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_GATE_SC1_KEEPREL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_GEMMA4_QO_EXACT_BENCH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_GEMM_ABL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_GEMV_LG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_GEMV_LG_RG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1001,6 +1188,8 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_HAS_ARGMAX_FIN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_ATTN_RES", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_ATTN_SELECT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_DCP_KV_PACK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_DCP_KV_SCATTER", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_DENSE_GLU_FP8_BLK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_EMBED", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_FLASH_DECODE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1016,6 +1205,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_HAS_FLASH_PREFILL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_FLASH_PREFILL_FP8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_GEMM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_GEMM_F32", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_GEMM_C5", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_GEMM_C5_FP8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_GEMM_C5_MXFP4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1099,6 +1289,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_HAS_SOFTCAP", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_XALLGATHER", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_XALLTOALL_HEADS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_XDCP_GATHER", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_XREDUCESCATTER", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HC_SINKHORN_RCP", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HSACO_CONFIG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1244,6 +1435,11 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_FA_ONLY_HD256_ONLY", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_FA_PIPE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_FA_PX4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    // Tensor-core row-block walk for BATCH>=8 decode GEMV (op_gemv_mma.cuh); UNB = k32 steps in flight.
+    KnobSpec::new("def.PLOW_NV_GEMV_MMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_GEMV_MMA_UNB", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    // Whole-chunk batch width of the warp-per-row norm walk (op_norm.cuh T17 path); default 4.
+    KnobSpec::new("def.PLOW_NV_ROW_NB", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_FA_QGLOB", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_FA_QK_UNROLL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_FA_QREG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1374,6 +1570,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HASH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_PACKET_HAS_GEMM_FP8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_LINEAR_BIAS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_QKV_DOT4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1925,6 +2122,7 @@ mod tests {
         let cases: &[(&[(&str, Val)], &str)] = &[
             (
                 &[
+                    ("emit.token_batch_tp", FALSE),
                     ("emit.glm_seq_par", TRUE),
                     ("emit.glm_xr_band", Val::Nat(2)),
                 ],
@@ -1935,11 +2133,11 @@ mod tests {
                 "ofold_excludes_dsa_pf_and_fp8_kv",
             ),
             (
-                &[("emit.token_batch_tp", TRUE)],
-                "token_batch_tp_excludes_seq_par",
-            ),
-            (
-                &[("emit.glm_seq_par_proj", TRUE), ("emit.glm_seq_par", FALSE)],
+                &[
+                    ("emit.token_batch_tp", FALSE),
+                    ("emit.glm_seq_par_proj", TRUE),
+                    ("emit.glm_seq_par", FALSE),
+                ],
                 "seq_par_proj_requires_seq_par",
             ),
         ];
@@ -2030,7 +2228,7 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "{mismatches:#?}");
-        assert_eq!(lookup(&resolved, "emit.glm_seq_par"), TRUE);
+        assert_eq!(lookup(&resolved, "emit.glm_seq_par"), FALSE);
         assert_eq!(
             lookup(&resolved, "emit.glm_gemm_lt_pf_ext").to_json(),
             json!("o_proj,band,shared")

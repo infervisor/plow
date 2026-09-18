@@ -31,11 +31,26 @@ use kernelcaps::QuantScheme;
 use packet::dev::DevOp;
 use tunedb::gemm::parse_quant;
 use tunedb::{
-    gemm_op_case, gemm_rung_emit_plan, gemm_rung_opcode, Correctness, Digests, KernelMeasurement,
-    RecordState, Stats, TuneStore, GEMM_ORACLE,
+    gemm_op_case, gemm_oracle, gemm_rung_emit_plan, Correctness, Digests, KernelMeasurement,
+    RecordState, Stats, TuneStore,
 };
 
 type Err = Box<dyn std::error::Error>;
+
+fn inventory_ops(
+    tile_ops: &[(String, QuantScheme, DevOp)],
+    tile: &str,
+    quant: QuantScheme,
+) -> Vec<DevOp> {
+    let mut ops: Vec<_> = tile_ops
+        .iter()
+        .filter(|(t, q, _)| t == tile && *q == quant)
+        .map(|(_, _, op)| *op)
+        .collect();
+    ops.sort_unstable_by_key(|op| *op as u16);
+    ops.dedup();
+    ops
+}
 
 /// One row as `runtime/ubench/gemm_tile_sweep.c` writes it.
 #[derive(serde::Deserialize)]
@@ -79,7 +94,7 @@ fn probe_inventory(
         implementation: build.label(),
         interpreter: build.label(),
         toolchain: build.toolchain.clone(),
-        oracle: GEMM_ORACLE.to_string(),
+        oracle: gemm_oracle(isa).to_string(),
     };
     Ok((inv, want))
 }
@@ -128,23 +143,13 @@ pub fn ingest(
         let r: Row = serde_json::from_str(line)?;
         let quant = parse_quant(&r.quant).ok_or_else(|| format!("unknown quant {:?}", r.quant))?;
         // A tile with no dispatch representation is a legitimate measurement of a kernel BODY
-        // and not a selectable fact. The richer emit-plan map covers tagged bodies that share an
-        // opcode; the static opcode map remains the fallback for ordinary rungs.
-        let mut ops: Vec<DevOp> = tile_ops
-            .iter()
-            .filter(|(t, q, _)| *t == r.tile && *q == quant)
-            .map(|(_, _, op)| *op)
-            .collect();
-        ops.sort_unstable_by_key(|op| *op as u16);
-        ops.dedup();
+        // and not a selectable fact. The emit-plan map only covers explicitly tagged bodies;
+        // ordinary rungs must match this build's probed inventory exactly.
+        let ops = inventory_ops(&tile_ops, &r.tile, quant);
         let tagged_plan = gemm_rung_emit_plan(&r.tile, quant).filter(|p| p.packet_tag != 0);
         if ops.is_empty() && tagged_plan.is_none() {
-            if let Some(op) = gemm_rung_opcode(&r.tile, quant) {
-                ops.push(op);
-            } else {
-                *skipped_no_opcode.entry(r.tile.clone()).or_default() += 1;
-                continue;
-            }
+            *skipped_no_opcode.entry(r.tile.clone()).or_default() += 1;
+            continue;
         }
         let stats = Stats::from_samples(r.samples_ns.clone())
             .map_err(|e| format!("{} {}x{}x{}: {e}", r.sym, r.m, r.n, r.k))?;
@@ -227,6 +232,26 @@ pub fn ingest(
         db.display()
     );
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_rung_identity_requires_the_live_tile() {
+        let gfx942 = vec![(
+            "64x128x128".to_string(),
+            QuantScheme::W8A8,
+            DevOp::GemmSmallFp8,
+        )];
+
+        assert!(inventory_ops(&gfx942, "64x128x64", QuantScheme::W8A8).is_empty());
+        assert_eq!(
+            inventory_ops(&gfx942, "64x128x128", QuantScheme::W8A8),
+            [DevOp::GemmSmallFp8]
+        );
+    }
 }
 
 /// What the store would serve the compiler right now, for the probed build.

@@ -21,10 +21,10 @@
 //!
 //! The discriminator is already in the tree and already load-bearing:
 //! `rebase_chunk_rows` separates the two by `HeadNormRope`'s `fj[1]`, the KV
-//! ring stride, which dense GQA sets and MLA's k_rope leaves at zero. So the
-//! head-major case is REFUSED BY NAME here rather than addressed by a guess.
-//! Supporting it is a scatter plus the head count, which the packet also
-//! carries; it is not in this path yet.
+//! ring stride, which dense GQA sets; MLA's `k_rope` leaves it at zero when
+//! `dbatch == 1`, but sets it to `ctx` when `rows > 1 || dbatch > 1`. In both
+//! MLA cases, `heads = 1` so the head-major slice degenerates to a single
+//! contiguous span identical to sequence-major.
 
 use packet::dev::{DevInst64, DevOp};
 
@@ -43,11 +43,61 @@ pub(crate) struct CopySpan {
     pub bytes: u64,
 }
 
-/// Refuse a prefill program whose KV caches are not addressable as row ranges.
+/// Layout metadata for a cache written with a head-major ring layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeadMajorLayout {
+    pub heads: u32,
+    pub stride: u32,
+}
+
+/// Validate that all KV cache writes in `insts` use layouts that `plan` can execute.
 ///
-/// Called at load, so a model that cannot hand off says so once rather than
-/// producing a wrong answer per request.
-pub(crate) fn check_seq_major(insts: &[DevInst64], names: &[String]) -> Result<()> {
+/// Seq-major and head-major caches are supported. Refuses unsupported layouts:
+/// - `QwenHeadNormRope` (op 142), whose layout cannot be executed by `plan`.
+/// - Head-major writes with zero heads (`i[1] == 0`).
+/// - Head-major fp8 caches without a registered per-row scale tensor (`t[6]`).
+pub(crate) fn check_transferable(insts: &[DevInst64], names: &[String]) -> Result<()> {
+    for d in insts {
+        if d.op == DevOp::QwenHeadNormRope as u16 {
+            let dst = names.get(d.t[0] as usize).map(String::as_str).unwrap_or("?");
+            return Err(RuntimeError::Device(format!(
+                "QwenHeadNormRope KV cache `{dst}` is not supported by KV handoff"
+            )));
+        }
+        let is_hn = d.op == DevOp::HeadNormRope as u16 || d.op == DevOp::HeadNormRopeFp8 as u16;
+        if is_hn && d.fj[1] != 0 {
+            if d.i[1] == 0 {
+                let dst = names.get(d.t[0] as usize).map(String::as_str).unwrap_or("?");
+                return Err(RuntimeError::Device(format!(
+                    "head-major KV cache `{dst}` has zero heads in instruction"
+                )));
+            }
+            if d.op == DevOp::HeadNormRopeFp8 as u16 {
+                let scale_handle = d.t[6] as usize;
+                if d.t[6] == packet::dev::TENSOR_NONE16 || scale_handle >= names.len() {
+                    let dst = names.get(d.t[0] as usize).map(String::as_str).unwrap_or("?");
+                    return Err(RuntimeError::Device(format!(
+                        "head-major fp8 KV cache `{dst}` missing valid scale tensor in t[6]"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Head-major KV cache tensors and their layout (head count and ring stride).
+///
+/// Dense GQA declares `kv.{l}.k` as `[slot][head][seq][dim]` where `HeadNormRope`
+/// or `HeadNormRopeFp8` writes with a non-zero ring stride (`fj[1] != 0`).
+/// `d.i[1]` carries `heads` and `d.fj[1]` carries `stride`.
+/// For fp8 caches (`HeadNormRopeFp8`), `d.t[6]` carries the corresponding scale tensor,
+/// which shares the head count and ring stride and is also registered.
+pub(crate) fn head_major_caches(
+    insts: &[DevInst64],
+    names: &[String],
+) -> Vec<(String, HeadMajorLayout)> {
+    let mut out: Vec<(String, HeadMajorLayout)> = Vec::new();
     for d in insts {
         let head_major = (d.op == DevOp::HeadNormRope as u16
             || d.op == DevOp::HeadNormRopeFp8 as u16)
@@ -55,14 +105,23 @@ pub(crate) fn check_seq_major(insts: &[DevInst64], names: &[String]) -> Result<(
         if !head_major {
             continue;
         }
-        let dst = names.get(d.t[0] as usize).map(String::as_str).unwrap_or("?");
-        return Err(RuntimeError::Device(format!(
-            "CPU head prefill needs seq-major KV caches; `{dst}` is written with a KV ring \
-             stride (head-major `[slot][head][seq][dim]`), so its rows are a strided scatter \
-             rather than one run. Head-major handoff is not implemented."
-        )));
+        let Some(name) = names.get(d.t[0] as usize) else {
+            continue;
+        };
+        let heads = d.i[1].max(1);
+        let stride = d.fj[1];
+        if stride > 0 && !out.iter().any(|(n, _)| n == name) {
+            out.push((name.clone(), HeadMajorLayout { heads, stride }));
+        }
+        if d.op == DevOp::HeadNormRopeFp8 as u16 && d.t[6] != packet::dev::TENSOR_NONE16 {
+            if let Some(scale_name) = names.get(d.t[6] as usize) {
+                if stride > 0 && !out.iter().any(|(n, _)| n == scale_name) {
+                    out.push((scale_name.clone(), HeadMajorLayout { heads, stride }));
+                }
+            }
+        }
     }
-    Ok(())
+    out
 }
 
 /// How many prompt rows one entry of each cache covers, for the caches where
@@ -97,16 +156,12 @@ pub(crate) fn pooled_caches(insts: &[DevInst64], names: &[String]) -> Vec<(Strin
 }
 
 /// Plan the copies moving `rows` prompt rows from `src_slot` of the head engine
-/// into `dst_slot` of the device engine.
-///
-/// `rows_per_slot` is the compiled context. `pools` is [`pooled_caches`]; a
-/// cache named there advances one entry per `pool` prompt rows, so a head must
-/// end on a pool boundary — a head stopping mid-group would hand over an entry
-/// pooled from only part of its tokens, and the device would not recompute it.
+/// into `dst_slot` of the device engine, supporting both seq-major and head-major layouts.
 pub(crate) fn plan(
     tensors: &[KvSlotTensor],
     rows_per_slot: u32,
     pools: &[(String, u32)],
+    head_majors: &[(String, HeadMajorLayout)],
     src_slot: u32,
     dst_slot: u32,
     rows: u32,
@@ -121,6 +176,46 @@ pub(crate) fn plan(
     }
     let mut plan = Vec::with_capacity(tensors.len());
     for t in tensors {
+        if let Some((_, hm)) = head_majors.iter().find(|(n, _)| *n == t.name) {
+            if hm.heads == 0 || hm.stride == 0 {
+                return Err(RuntimeError::Device(format!(
+                    "head-major cache `{}` has invalid heads {} stride {}",
+                    t.name, hm.heads, hm.stride
+                )));
+            }
+            let heads = u64::from(hm.heads);
+            if !t.per_slot_bytes.is_multiple_of(heads) {
+                return Err(RuntimeError::Device(format!(
+                    "head-major KV cache `{}` holds {} bytes per slot, not divisible by {heads} heads",
+                    t.name, t.per_slot_bytes
+                )));
+            }
+            let head_bytes = t.per_slot_bytes / heads;
+            let stride = u64::from(hm.stride);
+            if !head_bytes.is_multiple_of(stride) {
+                return Err(RuntimeError::Device(format!(
+                    "head-major KV cache `{}` holds {head_bytes} bytes per head, not divisible by stride {stride}",
+                    t.name
+                )));
+            }
+            let row_bytes = head_bytes / stride;
+            if row_bytes == 0 {
+                continue;
+            }
+            let copy_rows = u64::from(rows.min(hm.stride));
+            let bytes_per_head = copy_rows * row_bytes;
+            for h in 0..heads {
+                let head_off = h * head_bytes;
+                plan.push(CopySpan {
+                    handle: t.handle,
+                    src_off: u64::from(src_slot) * t.per_slot_bytes + head_off,
+                    dst_off: u64::from(dst_slot) * t.per_slot_bytes + head_off,
+                    bytes: bytes_per_head,
+                });
+            }
+            continue;
+        }
+
         let pool = pools
             .iter()
             .find(|(n, _)| *n == t.name)
@@ -163,6 +258,8 @@ pub(crate) fn plan(
     Ok(plan)
 }
 
+pub(crate) use plan as plan_with_layout;
+
 /// Total bytes a plan moves — the transfer term the head budget prices.
 pub(crate) fn plan_bytes(plan: &[CopySpan]) -> u64 {
     plan.iter().map(|c| c.bytes).sum()
@@ -180,6 +277,17 @@ mod tests {
         }
     }
 
+    fn plan_seq(
+        tensors: &[KvSlotTensor],
+        rows_per_slot: u32,
+        pools: &[(String, u32)],
+        src_slot: u32,
+        dst_slot: u32,
+        rows: u32,
+    ) -> Result<Vec<CopySpan>> {
+        plan(tensors, rows_per_slot, pools, &[], src_slot, dst_slot, rows)
+    }
+
     /// GLM MLA at ctx 8: `ckv` is 512 wide bf16, `krot` 64 wide bf16.
     fn mla() -> Vec<KvSlotTensor> {
         vec![t(3, "kv.0.ckv", 8 * 512 * 2), t(4, "kv.0.krot", 8 * 64 * 2)]
@@ -187,7 +295,7 @@ mod tests {
 
     #[test]
     fn a_head_is_one_run_per_cache_at_the_front_of_each_slot() {
-        let p = plan(&mla(), 8, &[], 0, 0, 3).unwrap();
+        let p = plan_seq(&mla(), 8, &[], 0, 0, 3).unwrap();
         assert_eq!(
             p,
             vec![
@@ -201,7 +309,7 @@ mod tests {
     fn the_head_slot_and_the_device_slot_are_independent() {
         // The head pool's slot count has nothing to do with the GPU batch, so
         // the two indices must be applied to their own sides and not swapped.
-        let p = plan(&mla(), 8, &[], 1, 5, 2).unwrap();
+        let p = plan_seq(&mla(), 8, &[], 1, 5, 2).unwrap();
         assert_eq!(p[0].src_off, 8 * 512 * 2);
         assert_eq!(p[0].dst_off, 5 * 8 * 512 * 2);
         assert_eq!(p[0].bytes, 2 * 512 * 2);
@@ -209,15 +317,15 @@ mod tests {
 
     #[test]
     fn a_zero_row_head_moves_nothing() {
-        assert!(plan(&mla(), 8, &[], 0, 0, 0).unwrap().is_empty());
+        assert!(plan_seq(&mla(), 8, &[], 0, 0, 0).unwrap().is_empty());
     }
 
     #[test]
     fn a_head_cannot_run_past_the_compiled_context() {
-        let err = plan(&mla(), 8, &[], 0, 0, 9).unwrap_err().to_string();
+        let err = plan_seq(&mla(), 8, &[], 0, 0, 9).unwrap_err().to_string();
         assert!(err.contains("past the compiled context 8"), "{err}");
         // The whole context is legal: that is the whole-request case.
-        assert!(plan(&mla(), 8, &[], 0, 0, 8).is_ok());
+        assert!(plan_seq(&mla(), 8, &[], 0, 0, 8).is_ok());
     }
 
     /// The defect a divisibility check does NOT catch, pinned: `kv.0.kidx` at
@@ -228,17 +336,17 @@ mod tests {
     fn a_pooled_cache_is_copied_by_entries_not_rows() {
         let pooled = vec![t(7, "kv.0.kidx", 2 * 64)];
         let pools = [("kv.0.kidx".to_string(), 4u32)];
-        let p = plan(&pooled, 8, &pools, 0, 0, 4).unwrap();
+        let p = plan_seq(&pooled, 8, &pools, 0, 0, 4).unwrap();
         assert_eq!(p[0].bytes, 64, "one pooled entry, not four rows of 16");
         // Unpooled, the same tensor would have been read as 8 rows of 16.
-        assert_eq!(plan(&pooled, 8, &[], 0, 0, 4).unwrap()[0].bytes, 4 * 16);
+        assert_eq!(plan_seq(&pooled, 8, &[], 0, 0, 4).unwrap()[0].bytes, 4 * 16);
     }
 
     #[test]
     fn a_head_must_end_on_a_pool_boundary() {
         let pooled = vec![t(7, "kv.0.kidx", 2 * 64)];
         let pools = [("kv.0.kidx".to_string(), 4u32)];
-        let err = plan(&pooled, 8, &pools, 0, 0, 6).unwrap_err().to_string();
+        let err = plan_seq(&pooled, 8, &pools, 0, 0, 6).unwrap_err().to_string();
         assert!(err.contains("pool boundary"), "{err}");
         assert!(err.contains("kv.0.kidx"), "{err}");
     }
@@ -260,13 +368,14 @@ mod tests {
 
     #[test]
     fn plan_bytes_is_what_the_budget_prices() {
-        let p = plan(&mla(), 8, &[], 0, 0, 3).unwrap();
+        let p = plan_seq(&mla(), 8, &[], 0, 0, 3).unwrap();
         assert_eq!(plan_bytes(&p), 3 * (512 + 64) * 2);
     }
 
     fn inst(op: DevOp, dst: u16, ring_stride: u32) -> DevInst64 {
         let mut d = DevInst64 {
             op: op as u16,
+            t: [packet::dev::TENSOR_NONE16; 8],
             ..Default::default()
         };
         d.t[0] = dst;
@@ -275,27 +384,127 @@ mod tests {
     }
 
     #[test]
-    fn a_ring_strided_cache_write_refuses_the_head_path() {
+    fn qwen_head_norm_rope_is_refused() {
         let names = vec!["x".to_string(), "kv.0.k".to_string()];
-        let insts = [inst(DevOp::HeadNormRope, 1, 4096)];
-        let err = check_seq_major(&insts, &names).unwrap_err().to_string();
+        let insts = [inst(DevOp::QwenHeadNormRope, 1, 0)];
+        let err = check_transferable(&insts, &names).unwrap_err().to_string();
+        assert!(err.contains("QwenHeadNormRope"), "{err}");
         assert!(err.contains("kv.0.k"), "{err}");
-        assert!(err.contains("head-major"), "{err}");
+    }
+
+    #[test]
+    fn head_major_zero_heads_is_refused() {
+        let names = vec!["x".to_string(), "kv.0.k".to_string()];
+        let mut d = inst(DevOp::HeadNormRope, 1, 4096);
+        d.i[1] = 0;
+        let err = check_transferable(&[d], &names).unwrap_err().to_string();
+        assert!(err.contains("zero heads"), "{err}");
+    }
+
+    #[test]
+    fn head_major_fp8_without_scale_tensor_is_refused() {
+        let names = vec!["x".to_string(), "kv.0.k".to_string()];
+        let mut d = inst(DevOp::HeadNormRopeFp8, 1, 4096);
+        d.i[1] = 8;
+        d.t[6] = packet::dev::TENSOR_NONE as u16;
+        let err = check_transferable(&[d], &names).unwrap_err().to_string();
+        assert!(err.contains("missing valid scale tensor"), "{err}");
     }
 
     #[test]
     fn mla_k_rope_leaves_the_ring_stride_at_zero_and_is_accepted() {
         let names = vec!["x".to_string(), "kv.0.krot".to_string()];
-        // Same opcode as the dense-GQA write; `fj[1]` is the whole difference.
-        let insts = [inst(DevOp::HeadNormRope, 1, 0)];
-        assert!(check_seq_major(&insts, &names).is_ok());
+        // Single sequence dbatch == 1: ring stride is 0.
+        let mut d_single = inst(DevOp::HeadNormRope, 1, 0);
+        d_single.i[1] = 1;
+        assert!(check_transferable(&[d_single], &names).is_ok());
+
+        // Batched dbatch > 1: ring stride is non-zero (ctx), heads is 1.
+        let mut d_batched = inst(DevOp::HeadNormRope, 1, 4096);
+        d_batched.i[1] = 1;
+        assert!(check_transferable(&[d_batched], &names).is_ok());
     }
 
     #[test]
-    fn the_fp8_twin_is_checked_too() {
-        // A bf16-only test silently matches nothing on an fp8-KV packet.
-        let names = vec!["x".to_string(), "kv.0.k".to_string()];
-        let insts = [inst(DevOp::HeadNormRopeFp8, 1, 4096)];
-        assert!(check_seq_major(&insts, &names).is_err());
+    fn head_major_fp8_registers_cache_and_scale() {
+        let names = vec![
+            "x".to_string(),
+            "kv.0.k".to_string(),
+            "kv.0.v".to_string(),
+            "kv.0.k_scale".to_string(),
+            "kv.0.v_scale".to_string(),
+        ];
+        let mut d_k = inst(DevOp::HeadNormRopeFp8, 1, 4096);
+        d_k.i[1] = 8;
+        d_k.t[6] = 3;
+        let mut d_v = inst(DevOp::HeadNormRopeFp8, 2, 4096);
+        d_v.i[1] = 8;
+        d_v.t[6] = 4;
+        let hm = head_major_caches(&[d_k, d_v], &names);
+        assert_eq!(
+            hm,
+            vec![
+                ("kv.0.k".to_string(), HeadMajorLayout { heads: 8, stride: 4096 }),
+                ("kv.0.k_scale".to_string(), HeadMajorLayout { heads: 8, stride: 4096 }),
+                ("kv.0.v".to_string(), HeadMajorLayout { heads: 8, stride: 4096 }),
+                ("kv.0.v_scale".to_string(), HeadMajorLayout { heads: 8, stride: 4096 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn head_major_caches_reads_heads_and_ring_stride() {
+        let names = vec!["x".to_string(), "kv.0.k".to_string(), "kv.0.v".to_string()];
+        let mut d_k = inst(DevOp::HeadNormRope, 1, 4096);
+        d_k.i[1] = 8;
+        let mut d_v = inst(DevOp::HeadNormRopeFp8, 2, 4096);
+        d_v.i[1] = 8;
+        let hm = head_major_caches(&[d_k, d_v], &names);
+        assert_eq!(
+            hm,
+            vec![
+                ("kv.0.k".to_string(), HeadMajorLayout { heads: 8, stride: 4096 }),
+                ("kv.0.v".to_string(), HeadMajorLayout { heads: 8, stride: 4096 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn head_major_gqa_generates_strided_spans_per_head() {
+        let heads = 4u32;
+        let stride = 1024u32;
+        let hd = 128u32;
+        let elem = 2u64;
+        let per_slot_bytes = u64::from(heads) * u64::from(stride) * u64::from(hd) * elem;
+        let gqa = [
+            KvSlotTensor {
+                handle: 10,
+                name: "kv.0.k".to_string(),
+                per_slot_bytes,
+            },
+            KvSlotTensor {
+                handle: 11,
+                name: "kv.0.v".to_string(),
+                per_slot_bytes,
+            },
+        ];
+        let layouts = [
+            ("kv.0.k".to_string(), HeadMajorLayout { heads, stride }),
+            ("kv.0.v".to_string(), HeadMajorLayout { heads, stride }),
+        ];
+        let rows = 128u32;
+        let p = plan_with_layout(&gqa, stride, &[], &layouts, 1, 2, rows).unwrap();
+        // 2 tensors * 4 heads = 8 spans
+        assert_eq!(p.len(), 8);
+        let head_bytes = per_slot_bytes / u64::from(heads);
+        let row_bytes = u64::from(hd) * elem;
+        for (i, span) in p.iter().enumerate() {
+            let t_idx = i / 4;
+            let h = (i % 4) as u64;
+            assert_eq!(span.handle, if t_idx == 0 { 10 } else { 11 });
+            assert_eq!(span.src_off, 1 * per_slot_bytes + h * head_bytes);
+            assert_eq!(span.dst_off, 2 * per_slot_bytes + h * head_bytes);
+            assert_eq!(span.bytes, u64::from(rows) * row_bytes);
+        }
     }
 }

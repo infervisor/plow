@@ -701,3 +701,9 @@ pub mod packet_pipeline;
 pub mod hetero;
 pub mod hetero_channel;
 pub mod token_batch;
+pub mod modular;
+pub use modular::{
+    ModularBlockKind, ModularBlockProg, ModularLeanCorrectness, ModularLeanPerformance,
+    ModularLeanSummary, ModularPhase, ModularPipelineManifest, MODULAR_MANIFEST_SECTION,
+    MODULAR_MANIFEST_VERSION,
+};

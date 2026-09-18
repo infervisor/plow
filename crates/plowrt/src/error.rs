@@ -56,6 +56,12 @@ pub enum RuntimeError {
     #[error("device error: {0}")]
     Device(String),
 
+    /// A cross-GPU collective hit its rendezvous deadline and returned without reducing: some
+    /// rank's queue stalled past `PLOW_XCTR_DEADLINE_TICKS`. Per dispatch and transient, so a
+    /// step that wrote only rows a re-run rewrites may be re-run. Displays as a device error.
+    #[error("device error: {0}")]
+    CollectiveBail(String),
+
     /// A driver call failed with a status code. [`Device`](Self::Device) stays
     /// for validation/non-driver errors; this variant carries the numeric code
     /// so logs and HTTP mapping can act on it.

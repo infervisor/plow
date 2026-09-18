@@ -3090,11 +3090,27 @@ impl GpuEngine {
         tracing::info!(
             requested = ?config.nv_vmm_prefix(),
             selected = prefix_layout.is_some(),
+            mode = match (config.nv_vmm_prefix(), prefix_layout.is_some()) {
+                (Some(true), _) => "explicit",
+                (None, true) => "auto",
+                _ => "off",
+            },
+            packed_prefix,
             "VMM prefix cache selection"
         );
         let packed_prefill = if prefix_requested && !packed_prefix {
             if packed_prefill_metadata.is_some() {
-                tracing::info!("packed prefill disabled because prefix reuse is active");
+                // A packed launch writes several slots' KV rows at once, so every
+                // row must be VMM-mapped before launch; only the unified token-batch
+                // route (PLOW_TOKEN_BATCH=1, PLOW_FUSION=0) or explicit PLOW_PF_BATCH=1
+                // plans that admission from the packed metadata.
+                tracing::info!(
+                    token_batch = config.token_batch,
+                    fusion = config.fusion,
+                    pf_batch = config.pf_batch_cuda(),
+                    "packed prefill disabled: prefix reuse needs pre-launch KV admission, \
+                     which only unified token batching or PLOW_PF_BATCH=1 provides"
+                );
             }
             None
         } else {
@@ -3146,7 +3162,7 @@ impl GpuEngine {
             .unwrap_or_default();
         let kv_maps = kv_tensor_maps(&blob.tensors, &blob.gen, blob.decode_prog()?.t as usize)?;
         let recurrent = recurrent_state_layout(&blob.tensors, blob.decode_prog()?.t as usize)?;
-        let configured_multistep = RuntimeConfig::get().nv_multistep();
+        let configured_multistep = RuntimeConfig::get().multistep();
         let multistep_disabled_by_decode = decode_objects.is_some()
             || prepared_contexts.is_some()
             || !decode_packet_roles.is_empty()
@@ -4299,7 +4315,8 @@ impl GpuEngine {
         // act.logits is [B][vocab] bf16; in.pos is [ctx] i32 (shared by the
         // prefill chunk positions and the B decode positions).
         let vocab = (blob.tensors[t_logits].bytes / 2) as usize / batch;
-        let max_ctx = (blob.tensors[t_pos].bytes / 4) as usize;
+        let packet_max_ctx = (blob.tensors[t_pos].bytes / 4) as usize;
+        let max_ctx = config.rt_max_ctx.unwrap_or(packet_max_ctx).min(packet_max_ctx);
 
         // Per-slot stride of every batch-major KV or recurrent-state tensor (slot b of
         // tensor i lives at base + b*stride). B==1: strides never used.
@@ -8521,6 +8538,45 @@ impl GpuEngine {
         let mut out = vec![0.0f32; bytes / 2];
         bf16_to_f32_slice(&raw, &mut out);
         Ok(out)
+    }
+
+    /// Move planned head KV rows from a source buffer into this engine's device slots.
+    pub(crate) fn write_kv_rows<'a>(
+        &self,
+        plan: &[crate::exec::kv_handoff::CopySpan],
+        src: impl Fn(&crate::exec::kv_handoff::CopySpan) -> Result<&'a [u8]>,
+    ) -> Result<u64> {
+        let mut moved = 0u64;
+        for span in plan {
+            let dst = self.devp.get(span.handle).ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "head handoff names tensor {}, past this packet's {}",
+                    span.handle,
+                    self.devp.len()
+                ))
+            })?;
+            let end = span.dst_off.checked_add(span.bytes).ok_or_else(|| {
+                RuntimeError::Device("head handoff span overflows".into())
+            })?;
+            if end > dst.len {
+                return Err(RuntimeError::Device(format!(
+                    "head handoff writes {}+{} of `{}`, which holds {} bytes",
+                    span.dst_off, span.bytes, self.tensor_names[span.handle], dst.len
+                )));
+            }
+            let bytes = src(span)?;
+            if bytes.len() as u64 != span.bytes {
+                return Err(RuntimeError::Device(format!(
+                    "head handoff source for `{}` is {} bytes, plan says {}",
+                    self.tensor_names[span.handle],
+                    bytes.len(),
+                    span.bytes
+                )));
+            }
+            crate::exec::device_api::EngineDevice::upload(&*self.be, dst, span.dst_off, bytes)?;
+            moved += span.bytes;
+        }
+        Ok(moved)
     }
 
     /// Upload an f32 slice into a bf16 activation tensor by name (f32 → bf16 by

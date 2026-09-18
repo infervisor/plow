@@ -5443,6 +5443,7 @@ mod tests {
 
     #[test]
     fn c8_is_measurement_derived_and_opts_out_in_the_packet() {
+        let _strict = crate::test_env::EnvScope::set(&[("PLOW_TUNE_IGNORE_DIGEST", "0")]);
         let _guard = crate::test_env::env_guard();
         crate::set_amd_target("MI350X");
         let emit = |m: u32, n: u32, k: u32| {
@@ -5455,7 +5456,7 @@ mod tests {
         };
 
         {
-            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8", "0")]);
+            let _scope = crate::test_env::EnvScope::set(&[("PLOW_TUNE_IGNORE_DIGEST", "0"), ("PLOW_GEMM_WIDE_C8","0")]);
             let inst = emit(8192, 1536, 7168);
             let selected =
                 crate::gfx950_prefill_tile(8192, 1536, 7168, 256, kernelcaps::QuantScheme::None);
@@ -5478,7 +5479,7 @@ mod tests {
             assert_eq!(inst.blocks, 256);
         }
         {
-            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8", "1")]);
+            let _scope = crate::test_env::EnvScope::set(&[("PLOW_TUNE_IGNORE_DIGEST", "0"), ("PLOW_GEMM_WIDE_C8","1")]);
             let inst = emit(8192, 1536, 7168);
             if crate::gfx950_c8_is_measured_winner(8192, 1536, 7168) {
                 assert_eq!(inst.op, DevOp::GemmWide as u16);
@@ -5498,11 +5499,14 @@ mod tests {
 
     #[test]
     fn c8_full_graph_preserves_the_measured_tune_census() {
+        // Digest-strict for the whole test: the manifest census and the winner check must see
+        // the same rule, and this test is about records keyed to THIS build.
+        let _strict = crate::test_env::EnvScope::set(&[("PLOW_TUNE_IGNORE_DIGEST", "0")]);
         let _guard = crate::test_env::env_guard();
         crate::set_amd_target("MI350X");
         let buckets = [128, 512, 1024, 2048, 4096, 8192];
         let emit = |c8: &str| {
-            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8", c8)]);
+            let _scope = crate::test_env::EnvScope::set(&[("PLOW_TUNE_IGNORE_DIGEST", "0"), ("PLOW_GEMM_WIDE_C8",c8)]);
             crate::tune_demand::reset_tally();
             crate::tune_demand::start_recording();
             let programs: Vec<_> = buckets.iter().map(|&t| build_full_t(8, t)).collect();

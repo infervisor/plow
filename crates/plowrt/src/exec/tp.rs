@@ -88,6 +88,21 @@ pub const XCTR_STRIDE: usize = 128;
 /// Alignment of every sub-region inside the peer scratch.
 const PEER_ALIGN: u64 = XCTR_STRIDE as u64;
 
+/// A collective's deadline bail writes `0xDEAD0000 | rank` (`op_collective.h`).
+pub(crate) fn is_deadline_status(status: u32) -> bool {
+    status & 0xFFFF_FF00 == 0xDEAD_0000
+}
+
+/// A gate short of its arrivals is a peer that missed the deadline; an over-count is a stale
+/// counter from an earlier dispatch, which a re-run would repeat.
+pub(crate) fn gate_error(v: u32, want: u32, msg: String) -> RuntimeError {
+    if v < want {
+        RuntimeError::CollectiveBail(msg)
+    } else {
+        RuntimeError::Device(msg)
+    }
+}
+
 /// COARSE peer-scratch layout — one peer-mapped
 /// region per GPU, laid out identically on every rank.
 ///
@@ -199,15 +214,34 @@ impl PeerLayout {
     /// Slots per rank for a packet that declares the sequence-parallel result slots.
     pub const SEQ_PAR_SLOTS: u64 = 6;
 
-    /// [`PeerLayout::new`] with an explicit partial-slot count (3, or 6 under the
-    /// sequence-parallel seams). The counter region moves with it, so every rank of one
-    /// group — and every program of one blob — must be laid out with the same count.
+    /// Slots per rank under `PLOW_GLM_ROWSPLIT_ATTN`: `SEQ_PAR_SLOTS` plus
+    /// `act.qa_tp`/`act.qr_tp`/`act.oat_rs_tp` (op 160's two all-to-alls).
+    pub const ROWSPLIT_SLOTS: u64 = 9;
+
+    /// `PLOW_DCP`: one more slot after [`PARTIAL_SLOTS`] or [`Self::SEQ_PAR_SLOTS`] holds this
+    /// rank's owned KV records for `XDcpGather` (row-split is refused under DCP).
+    pub const fn dcp_slots(base: u64) -> u64 {
+        base + 1
+    }
+
+    /// [`PeerLayout::new`] with an explicit partial-slot count (3, 6 under the
+    /// sequence-parallel seams, or 9 under `PLOW_GLM_ROWSPLIT_ATTN`). The counter region moves
+    /// with it, so every rank of one group — and every program of one blob — must be laid out
+    /// with the same count.
     pub fn with_slots(hidden: u32, max_tokens: u32, n_xctr: u32, slots: u64) -> Option<Self> {
         let partial_bytes = max_tokens as u64 * hidden as u64 * 2;
         if partial_bytes == 0 || partial_bytes % PEER_ALIGN != 0 {
             return None;
         }
-        if slots != PARTIAL_SLOTS && slots != Self::SEQ_PAR_SLOTS {
+        if ![
+            PARTIAL_SLOTS,
+            Self::SEQ_PAR_SLOTS,
+            Self::ROWSPLIT_SLOTS,
+            Self::dcp_slots(PARTIAL_SLOTS),
+            Self::dcp_slots(Self::SEQ_PAR_SLOTS),
+        ]
+        .contains(&slots)
+        {
             return None;
         }
         let xctr_off = partial_bytes * slots;
@@ -652,7 +686,7 @@ impl TpGroup {
                 let at = gate * XCTR_STRIDE;
                 let v = u32::from_le_bytes(buf[at..at + 4].try_into().expect("4 B"));
                 if v != want {
-                    return Err(RuntimeError::Device(format!(
+                    let msg = format!(
                         "cross-GPU gate {gate} on rank {} reads {v}, expected {want}. \
                          {} The reduction did not complete as compiled, so a layer's \
                          output is not the sum of the ranks' partials and the token is \
@@ -666,7 +700,8 @@ impl TpGroup {
                              survived from a previous dispatch (xctr must be zeroed on \
                              every rank before any rank launches)."
                         }
-                    )));
+                    );
+                    return Err(gate_error(v, want, msg));
                 }
             }
         }
@@ -691,11 +726,12 @@ impl TpGroup {
                 // 128-byte slot within the allocation, and the dispatch drained.
                 let v = unsafe { std::ptr::read_volatile(ptr) };
                 if v != *want {
-                    return Err(RuntimeError::Device(format!(
+                    let msg = format!(
                         "cross-GPU gate {gate} on rank {} reads {v}, expected {want}. \
                          Direct audit found an incomplete or stale collective.",
                         r.rank
-                    )));
+                    );
+                    return Err(gate_error(v, *want, msg));
                 }
             }
         }
@@ -716,10 +752,15 @@ impl TpGroup {
             // and all interpreter and audit dispatches have drained.
             let status = unsafe { std::ptr::read_volatile(r.xstatus as *const u32) };
             if status != 0 {
-                return Err(RuntimeError::Device(format!(
+                let msg = format!(
                     "compact cross-GPU audit failed on rank {} (status {status:#010x})",
                     r.rank
-                )));
+                );
+                return Err(if is_deadline_status(status) {
+                    RuntimeError::CollectiveBail(msg)
+                } else {
+                    RuntimeError::Device(msg)
+                });
             }
         }
         Ok(())

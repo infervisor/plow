@@ -79,11 +79,45 @@ fn check(status: Status, op: &str) -> Result<()> {
     }
 }
 
+/// One line of the per-shape algorithm table (`PLOW_LT_ALGOS`, JSONL). The algorithm is the
+/// opaque 64-byte `cublasLtMatmulAlgo_t` the load-time selection picked for exactly this
+/// `(m, n, k)` BF16 shape on this GPU; the runtime re-validates it with `cublasLtMatmulAlgoCheck`
+/// before use, so a table from another GPU or library version degrades to the heuristic path,
+/// never to a wrong launch. Written by the same runtime under `PLOW_LT_ALGOS_WRITE`, so a
+/// build stage with a GPU can produce it once and every later load (or a GPU-less emit through
+/// tunedb) reuses it instead of re-timing eight candidates per shape at serve start.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub(crate) struct StoredAlgo {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub dtype: String,
+    pub gpu: String,
+    /// The eight 64-bit words of `cublasLtMatmulAlgo_t`, hex.
+    pub algo: [String; 8],
+    pub workspace: usize,
+    pub matmul_us: f32,
+}
+
+impl StoredAlgo {
+    fn to_algo(&self) -> Option<Algo> {
+        let mut data = [0u64; 8];
+        for (dst, src) in data.iter_mut().zip(&self.algo) {
+            *dst = u64::from_str_radix(src, 16).ok()?;
+        }
+        Some(Algo { data })
+    }
+}
+
 pub(crate) struct Lt {
     be: Arc<CudaBackend>,
     api: Api,
     handle: usize,
     workspace: DeviceMem,
+    /// `PLOW_LT_ALGOS`: shapes whose algorithm is pinned by the table.
+    stored: std::collections::HashMap<(u32, u32, u32), Algo>,
+    /// `PLOW_LT_ALGOS_WRITE`: append every load-time selection here.
+    write: Option<std::path::PathBuf>,
 }
 
 impl Lt {
@@ -96,12 +130,68 @@ impl Lt {
         unsafe {
             check((api.cublasLtCreate)(&mut handle), "cublasLtCreate")?;
         }
+        let nv = &crate::config::RuntimeConfig::get().nv;
+        let mut stored = std::collections::HashMap::new();
+        if let Some(path) = nv.lt_algos.as_deref().map(std::path::PathBuf::from) {
+            let text = std::fs::read_to_string(&path).map_err(|e| {
+                RuntimeError::Device(format!("PLOW_LT_ALGOS {}: {e}", path.display()))
+            })?;
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                let rec: StoredAlgo = serde_json::from_str(line).map_err(|e| {
+                    RuntimeError::Device(format!("PLOW_LT_ALGOS: bad record: {e}"))
+                })?;
+                if rec.dtype != "bf16" {
+                    continue;
+                }
+                if let Some(algo) = rec.to_algo() {
+                    stored.insert((rec.m, rec.n, rec.k), algo);
+                }
+            }
+            tracing::info!(
+                path = %path.display(),
+                shapes = stored.len(),
+                "cuBLASLt algorithm table loaded"
+            );
+        }
+        let write = nv.lt_algos_write.as_deref().map(std::path::PathBuf::from);
         Ok(Arc::new(Self {
             be: be.clone(),
             api,
             handle: handle as usize,
             workspace,
+            stored,
+            write,
         }))
+    }
+
+    fn record(&self, m: u32, n: u32, k: u32, algo: &Algo, workspace: usize, matmul_us: f32) {
+        let Some(path) = &self.write else { return };
+        let rec = StoredAlgo {
+            m,
+            n,
+            k,
+            dtype: "bf16".into(),
+            gpu: self.be.device_name().to_string(),
+            algo: std::array::from_fn(|i| format!("{:016x}", algo.data[i])),
+            workspace,
+            matmul_us,
+        };
+        let line = match serde_json::to_string(&rec) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "cuBLASLt algorithm record not serialized");
+                return;
+            }
+        };
+        use std::io::Write as _;
+        let result = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| writeln!(f, "{line}"));
+        if let Err(e) = result {
+            tracing::warn!(error = %e, path = %path.display(), "cuBLASLt algorithm record not written");
+        }
     }
 
     pub(crate) fn plan(
@@ -160,8 +250,13 @@ impl Lt {
                 )?;
                 *dst = raw as usize;
             }
-            if let Some(template) = template {
-                plan.algo = template.algo;
+            // A rung template pins the widest rung's algorithm; a stored table pins the shape's.
+            // Both go through AlgoCheck, so a stale or foreign entry is refused here rather
+            // than at launch.
+            let stored = self.stored.get(&(m, n, k)).copied();
+            let pinned = template.map(|t| t.algo).or(stored);
+            if let Some(algo) = pinned {
+                plan.algo = algo;
                 let mut result = Heuristic::default();
                 check(
                     (self.api.cublasLtMatmulAlgoCheck)(
@@ -176,12 +271,22 @@ impl Lt {
                     ),
                     "Lt rung algorithm",
                 )?;
-                if result.state != 0 || result.workspace > self.workspace.len as usize {
+                let fits = result.state == 0 && result.workspace <= self.workspace.len as usize;
+                if fits {
+                    if template.is_none() {
+                        tracing::info!(m, n, k, workspace = result.workspace, "cuBLASLt stored algorithm pinned");
+                    }
+                    return Ok(Arc::new(plan));
+                }
+                if template.is_some() {
                     return Err(RuntimeError::Rejected(
                         "cuBLASLt widest algorithm cannot serve narrower rung".into(),
                     ));
                 }
-                return Ok(Arc::new(plan));
+                // A stored entry from another GPU or library version: fall through to the
+                // heuristic + load-time timing, which is exactly what produced the table.
+                tracing::warn!(m, n, k, "cuBLASLt stored algorithm rejected by AlgoCheck; re-selecting");
+                plan.algo = Algo::default();
             }
             let mut pref = std::ptr::null_mut();
             check(
@@ -332,6 +437,7 @@ impl Plan {
         let index = selected
             .ok_or_else(|| RuntimeError::Device("no runnable cuBLASLt candidate".into()))?;
         self.algo = candidates[index].algo;
+        let matmul_ms = best / (repeats * 2) as f32;
         tracing::info!(
             m,
             n,
@@ -340,9 +446,11 @@ impl Plan {
             candidates = candidates.len(),
             workspace = candidates[index].workspace,
             cold_bytes = copies.len,
-            matmul_ms = best / (repeats * 2) as f32,
+            matmul_ms,
             "cuBLASLt load-time algorithm selected"
         );
+        self.lt
+            .record(m, n, k, &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
         Ok(())
     }
 

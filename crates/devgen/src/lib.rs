@@ -78,6 +78,7 @@ pub mod dispatch_audit;
 pub mod conformer;
 mod gemv_decode_role;
 pub mod manifest;
+pub mod modular;
 mod mxfp4_moe_role;
 pub mod pipeline;
 mod projection_rewrite;
@@ -675,8 +676,7 @@ pub fn gfx950_prefill_tile_tier(
 /// record went stale — looks identical from the outside otherwise.
 pub fn gfx950_measured_rungs(m: i64, n: i64, k: i64, quant: kernelcaps::QuantScheme) -> usize {
     gfx950_gemm_measurements()
-        .by_case
-        .get(&tunedb::gemm_op_case(m, n, k, quant))
+        .lookup(&tunedb::gemm_op_case(m, n, k, quant))
         .map(|t| t.len())
         .unwrap_or(0)
 }
@@ -886,8 +886,24 @@ fn glu_era_inventory() -> &'static kernelcaps::Inventory {
 /// live). A missing store is not an error: it is the cold-start case, and the
 /// analytical model is the declared fallback tier.
 struct GemmMeasurements {
-    /// `op_case -> (opcode -> median ns)`.
+    /// `op_case -> (opcode -> median ns)`, records whose digests match the probed build.
     by_case: std::collections::HashMap<String, std::collections::HashMap<u16, f64>>,
+    /// The same for records whose digests have moved. Consulted only for op cases absent from
+    /// `by_case`, and only when `PLOW_TUNE_IGNORE_DIGEST` is on — decided per lookup, not when
+    /// this cache is built, so the first emit in a process does not fix the rule for every
+    /// later one (tests install their own config).
+    parked: std::collections::HashMap<String, std::collections::HashMap<u16, f64>>,
+}
+
+impl GemmMeasurements {
+    fn lookup(&self, case: &str) -> Option<&std::collections::HashMap<u16, f64>> {
+        self.by_case.get(case).or_else(|| {
+            emit_config::active()
+                .tune_ignore_digest
+                .then(|| self.parked.get(case))
+                .flatten()
+        })
+    }
 }
 
 /// The measured costs that apply to ONE shape. `select_kernel` asks per kernel,
@@ -912,7 +928,7 @@ impl GemmMeasurements {
         // without threading a lifetime through `pick_tile`; there is one per
         // distinct shape in a compile, and a compile is a process.
         let case = tunedb::gemm_op_case(m, n, k, quant);
-        let hit = self.by_case.get(&case);
+        let hit = self.lookup(&case);
         // THE ONE PLACE the compiler asks the store about a dense GEMM, and therefore the one
         // place its demand can be observed. `tune_demand` both prints the `PLOW_TUNE_DUMP=1`
         // line (unchanged) and records the lookup as typed data for `plowc tune gemm
@@ -937,7 +953,7 @@ impl GemmMeasurements {
         quant: kernelcaps::QuantScheme,
         measurement_id: u16,
     ) -> bool {
-        let Some(costs) = self.by_case.get(&tunedb::gemm_op_case(m, n, k, quant)) else {
+        let Some(costs) = self.lookup(&tunedb::gemm_op_case(m, n, k, quant)) else {
             return false;
         };
         let Some(candidate) = costs.get(&measurement_id) else {
@@ -987,14 +1003,14 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
         // about tuning should still get the calibrated answer, and one that explicitly asked
         // for the analytical model must get it.
         let root = match emit_config::active().tunedb_root() {
-            None => return GemmMeasurements { by_case },
+            None => return GemmMeasurements { by_case, parked: Default::default() },
             Some(s) => s,
         };
         let store = tunedb::TuneStore::new(std::path::PathBuf::from(root.clone()));
         let source_root = kernelcaps::source_root();
         let Ok(build) = kernelcaps::dense_gemm_tuning_build(&source_root, amd_target::active().1)
         else {
-            return GemmMeasurements { by_case };
+            return GemmMeasurements { by_case, parked: Default::default() };
         };
         // The sweep launches standalone GEMM kernels. Its key covers the
         // preprocessed dense family across all supported encodings, not
@@ -1003,26 +1019,43 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
             implementation: build.label(),
             interpreter: build.label(),
             toolchain: build.toolchain.clone(),
-            oracle: tunedb::GEMM_ORACLE.to_string(),
+            oracle: tunedb::gemm_oracle(amd_target::active().1).to_string(),
         };
         let cell = amd_tuning_cell();
         let Ok(records) = store.load_kernels(&cell) else {
-            return GemmMeasurements { by_case };
+            return GemmMeasurements { by_case, parked: Default::default() };
         };
         let mut stale = 0usize;
+        // `PLOW_TUNE_IGNORE_DIGEST` (default on): records whose digests have moved are parked
+        // here rather than dropped, and fill only the op cases that end with NO current-digest
+        // record. The strict rule -- "a stale record is more dangerous than none" -- is right
+        // when the choice is between two measurements, but the digest covers the whole
+        // preprocessed dense family, so ANY kernel edit invalidates the entire campaign at
+        // once and every tile silently degrades to the analytical model. For a case with no
+        // current record the real comparison is measured-but-older against never-measured.
+        let mut parked: std::collections::HashMap<String, std::collections::HashMap<u16, f64>> =
+            Default::default();
         for r in records {
             if !r.state.is_selectable() {
                 continue;
             }
-            if !r.digests.stale_against(&want).is_empty() {
+            let target = if r.digests.stale_against(&want).is_empty() {
+                &mut by_case
+            } else {
                 stale += 1;
-                continue;
-            }
-            let e = by_case.entry(r.op_case.clone()).or_default();
+                &mut parked
+            };
+            let e = target.entry(r.op_case.clone()).or_default();
             // Best-of, so a re-measured campaign does not depend on file order.
             let cur = e.entry(r.kernel_id).or_insert(f64::INFINITY);
             *cur = cur.min(r.stats.median_ns);
         }
+        // Current-digest records are never displaced: `lookup` takes a parked case whole, and
+        // only when the case is absent from `by_case` entirely. Mixing kernel ids from two
+        // builds within one case would rank medians that were never measured against each
+        // other. Counted here for the staleness line; applied per lookup.
+        parked.retain(|case, _| !by_case.contains_key(case));
+        let relaxed_cases = parked.len();
         // TOTAL staleness must be LOUDER than partial staleness, not silent.
         //
         // This was gated on `!by_case.is_empty()`, so the one case that actually matters --
@@ -1045,14 +1078,22 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
                 if by_case.is_empty() {
                     " -- NO usable records remain, so tile selection fell back to the \
                      analytical model. Re-run the campaign or this compile is unmeasured."
+                        .to_string()
+                } else if relaxed_cases > 0 {
+                    format!(
+                        " -- PLOW_TUNE_IGNORE_DIGEST is on: {relaxed_cases} op case(s) with no \
+                         current-digest record were filled from those measurements instead of \
+                         the analytical model. Re-run the campaign to make this build's own \
+                         numbers decide."
+                    )
                 } else {
-                    ""
+                    String::new()
                 },
                 source_root.display(),
                 root,
             );
         }
-        GemmMeasurements { by_case }
+        GemmMeasurements { by_case, parked }
     })
 }
 
@@ -3426,6 +3467,7 @@ pub(crate) fn emit_xall_gather(
 /// written into this rank's own peer slot at `slot_bytes` by an earlier packet (the `deps`).
 /// One xctr gate, one-workgroup rendezvous. TP8 only.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_xalltoall_heads(
     b: &mut Builder,
     xgate: &mut u32,
@@ -3439,6 +3481,7 @@ pub(crate) fn emit_xalltoall_heads(
     tp: u32,
     slot_bytes: u32,
     dir: u32,
+    heads_per_group: u32,
 ) -> u32 {
     assert_eq!(
         nh_total,
@@ -3446,6 +3489,12 @@ pub(crate) fn emit_xalltoall_heads(
         "XAllToAllHeads: nh_total must be nh_l * tp"
     );
     assert!(dir <= 1, "XAllToAllHeads: dir must be 0 (Q) or 1 (O)");
+    assert!(
+        heads_per_group > 0
+            && heads_per_group % nh_l == 0
+            && nh_total % heads_per_group == 0,
+        "XAllToAllHeads: heads_per_group must divide nh_total and be a multiple of nh_l"
+    );
     let elems = rpr * nh_total * d;
     let need = (elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
     let xr_cus = &xr_cus[..need];
@@ -3461,6 +3510,7 @@ pub(crate) fn emit_xalltoall_heads(
         inst.i[5] = tp;
         inst.i[6] = slot_bytes;
         inst.i[7] = dir;
+        inst.j[0] = heads_per_group;
     })
 }
 
@@ -4105,6 +4155,35 @@ fn emit_phase(
                 }
             });
         }
+        if !gemv_family
+            && !fp8
+            && !mx4_pf
+            && emit_config::active().gemma_gemm_lt
+            && amd
+            && amd_target::active().1 == hwspec::IsaLevel::Gfx942
+            && c.arch == config::Arch::Gemma4
+            && c.tp == 1
+            && c.hidden == 5376
+            && c.inter == 21504
+            && n_cu == 304
+            && matches!(m, 2048 | 4096 | 8192)
+            && matches!(
+                (m, nn, k),
+                (2048, 5376, 8192 | 21504) | (4096 | 8192, 5376, 8192 | 16384 | 21504)
+            )
+        {
+            let counter = b.emit(DevOp::GemmLtPf, vec![0], deps, |d| {
+                d.t[0] = out;
+                d.t[1] = a;
+                d.t[2] = w;
+                d.i[0] = m;
+                d.i[1] = nn;
+                d.i[2] = k;
+                d.i[3] = 3;
+            });
+            b.isolate(counter);
+            return counter;
+        }
         let fold = gemv_family && gamma != TENSOR_NONE;
         let op = if gemv_family {
             DevOp::Gemv
@@ -4503,7 +4582,8 @@ fn emit_phase(
         // byte-identical (the dense goldens pin this); extend the key when the cap is
         // re-measured on those parts — the fp8-KV sweep above picks the same value, so the
         // extension is expected to hold.
-        let cap_bf16_kv = amd && amd_target::active().1 == hwspec::IsaLevel::Gfx942;
+        let cap_bf16_kv = (amd && amd_target::active().1 == hwspec::IsaLevel::Gfx942)
+            || emit_config::active().sliding_ns_cap;
         let ns = if gemv_family && !full && win > 0 && (fp8_kv || cap_bf16_kv) {
             ns.min((win / 64).max(1))
         } else {
@@ -5245,7 +5325,7 @@ fn emit_phase(
                 d.j[1] = kvm; // head-major; RING on a sliding layer
             })
         };
-        if !gemv_family && emit_config::active().packed_prefill_on() {
+        if !gemv_family && b.packed_prefill_segments() {
             b.isolate(c_fa);
         }
         // When fused, flash_prefill already wrote the normalized bf16 to n.at, so there is no
@@ -6739,18 +6819,24 @@ pub(crate) fn whole_graph_parallel_linear2(n0: u32, n1_local: u32, k: u32) -> bo
 /// meaningless for a long time before anyone noticed. A warning line in a build
 /// log is not a defence: the log is gone by the time someone asks "was this
 /// blob verified?". The blob's own manifest has to answer.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LeanReport {
     /// A Lean ordering certificate was obtained for EVERY program in the blob.
     pub verified: bool,
     /// The Lean lower-bound oracle ran and reported.
     pub oracle: bool,
-    /// Why `verified`/`oracle` are false. `None` only when both are true.
+    /// Checkpoint A: rewrite rule soundness verified in Lean.
+    pub rewrite_verified: bool,
+    /// Why `verified`/`oracle`/`rewrite_verified` are false. `None` only when all are true.
     ///
     /// Never `Some` because verification FAILED — a rejection aborts emission,
     /// so no blob with a rejected program is ever written and no manifest for
     /// one can exist.
     pub reason: Option<String>,
+    /// Modular block lean summary if modular blocks are present.
+    pub modular_summary: Option<plow_asset::ModularLeanSummary>,
+    /// Modular blocks detailed certificates if present.
+    pub modular_blocks: Vec<plow_asset::ModularBlockProg>,
 }
 
 impl LeanReport {
@@ -6759,7 +6845,10 @@ impl LeanReport {
         LeanReport {
             verified: false,
             oracle: false,
+            rewrite_verified: false,
             reason: Some(reason.into()),
+            modular_summary: None,
+            modular_blocks: Vec::new(),
         }
     }
 }
@@ -7295,6 +7384,19 @@ fn apply_production_defaults(
         cfg.seg_pure_gemm = Some("1".into());
         emit_config::note_production_default("seg_pure_gemm", "1".into());
     }
+    // Gemma-4 BF16 on sm_90a TP1: gate/up as two cuBLASLt GEMMs + the GeGLU pass beat the fused
+    // GLU role at every bucket Lt covers (`knob_spec::LT_GLU_QUALIFIED`). Both knobs stay
+    // explicit rollbacks (`=0`); the fused-GLU role knob is opt-in and is not touched here.
+    if bf16 && capabilities.gemma && arch == "sm_90a" && tp == 1 {
+        if !emit_config::explicitly_set("prefill_cublaslt") {
+            cfg.prefill_cublaslt = true;
+            emit_config::note_production_default("prefill_cublaslt", "true".into());
+        }
+        if !emit_config::explicitly_set("no_glu_fuse") {
+            cfg.no_glu_fuse = true;
+            emit_config::note_production_default("no_glu_fuse", "true".into());
+        }
+    }
     // gfx942 STOPS AT 8, sm_90a KEEPS 16 — and the reason is the OBJECT, not the rung.
     //
     // The fusion argument that stood here was wrong twice, and [`gemv_staged_rows`] now
@@ -7362,6 +7464,73 @@ fn apply_production_defaults(
     // tree's defaults rather than pinning today's.
     if capabilities.glm && arch == "gfx942" && tp == 8 && n_cu == 304 && !cfg.mxfp4 {
         cfg.glm_production_defaults = true;
+        if cfg.decode_ladder.is_none() {
+            cfg.decode_ladder = Some("1,2,4,8,16,32".into());
+            cfg.decode_ladder_default = true;
+            emit_config::note_production_default("decode_ladder", "1,2,4,8,16,32".into());
+        }
+        // "if nothing asked", not "always": both knobs are plain `bool`, so an explicit
+        // `PLOW_TOKEN_BATCH_TP=0` is indistinguishable from unset at the field, and turning them
+        // on unconditionally made the recipe UNTESTABLE — the control arm of any A/B emitted the
+        // treatment. `*_explicit` records that the environment named the knob, which is the same
+        // provenance `decode_ladder_default` already keeps, not a new knob.
+        // Read the variable, not a field: `EmitConfig` is built by clap on the plowc path and by
+        // `from_env` elsewhere, so a field set in one constructor is silently `false` in the other.
+        // Both knobs are already registered, so this adds no unregistered env read.
+        let named = |k: &str| std::env::var(k).is_ok();
+        if !cfg.token_batch_tp && !named("PLOW_TOKEN_BATCH_TP") {
+            cfg.token_batch_tp = true;
+            emit_config::note_production_default("token_batch_tp", "true".into());
+        }
+        // Neither row-band attention nor the sequence-parallel seams compose with token-batch
+        // bodies. The seams were re-rated composable on a source reading (narrow seam norms moved
+        // back to the primary object), but the measured failure behind
+        // `token_batch_tp_excludes_seq_par` — review log #63, retrieval 9/18 base, 0/21 tail —
+        // was never re-run with both arms on. Until it is, the recipe FORCES both off rather than
+        // defaulting them off: a default yields to an explicit `--glm-seq-par=true`, and the
+        // resulting packet is silent long-context corruption, not a fault. Every force is recorded,
+        // so `build.json` still names what the flag asked for and what the recipe did.
+        if cfg.token_batch_tp {
+            if cfg.glm_rowband_attn == Some(true) {
+                cfg.glm_rowband_attn = Some(false);
+                emit_config::note_production_default("glm_rowband_attn", "false".into());
+            }
+            for (field, id) in [
+                (&mut cfg.glm_seq_par, "glm_seq_par"),
+                (&mut cfg.glm_seq_par_proj, "glm_seq_par_proj"),
+            ] {
+                if *field != Some(false) {
+                    *field = Some(false);
+                    emit_config::note_production_default(id, "false".into());
+                }
+            }
+        }
+        if !cfg.packed_sparse_pf && !named("PLOW_PACKED_SPARSE_PF") {
+            cfg.packed_sparse_pf = true;
+            emit_config::note_production_default("packed_sparse_pf", "true".into());
+        }
+        // Declared qualified in GLM53_RECIPE and applied by NOTHING until now: an unflagged emit
+        // produced a different packet from the recipe for each of these, and only the driver
+        // script typing them out kept production right.
+        // `every_glm_recipe_entry_holds_without_being_named` is the gate that found them and is
+        // what stops the next one. Same `named()` shape as token_batch_tp above, for the same
+        // reason: a plain `bool` cannot tell `=0` from unset, so the rollback has to read the
+        // variable.
+        for (field, env, id) in [
+            (&mut cfg.glm_shard_head, "GLM_SHARD_HEAD", "glm_shard_head"),
+            (&mut cfg.glm_fuse_b1, "PLOW_GLM_FUSE_B1", "glm_fuse_b1"),
+            (&mut cfg.glm_fuse_seam, "PLOW_GLM_FUSE_SEAM", "glm_fuse_seam"),
+        ] {
+            if !*field && !named(env) {
+                *field = true;
+                emit_config::note_production_default(id, "true".into());
+            }
+        }
+        // The prefill bucket set. `Option`, so unset is unambiguous and no `named()` is needed.
+        if cfg.mla_prefill.is_none() {
+            cfg.mla_prefill = Some(emit_config::GLM53_MLA_PREFILL.into());
+            emit_config::note_production_default("mla_prefill", emit_config::GLM53_MLA_PREFILL.into());
+        }
         for (id, unset, value) in cfg.glm_recipe_unset() {
             if unset {
                 emit_config::note_production_default(id, value.to_string());
@@ -7374,6 +7543,30 @@ fn apply_production_defaults(
                 "glm_gemm_lt_pf_ext",
                 emit_config::GLM_GEMM_LT_PF_EXT_QUALIFIED.to_string(),
             );
+        }
+        // DCP shards the latent cache per rank. Token-batch bodies, packed prefill and the
+        // row-split/row-band arms read the local cache directly instead of the owner gather
+        // (`emit_glm_mla_prefill` asserts it), so under `--dcp > 1` the recipe FORCES them off,
+        // recorded like the seq-par force above.
+        if cfg.dcp.is_some_and(|d| d > 1) {
+            if cfg.token_batch_tp {
+                cfg.token_batch_tp = false;
+                emit_config::note_production_default("token_batch_tp", "false".into());
+            }
+            if cfg.packed_sparse_pf {
+                cfg.packed_sparse_pf = false;
+                emit_config::note_production_default("packed_sparse_pf", "false".into());
+            }
+            for (field, id) in [
+                (&mut cfg.emit_packed_prefill, "emit_packed_prefill"),
+                (&mut cfg.glm_rowband_attn, "glm_rowband_attn"),
+                (&mut cfg.glm_rowsplit_attn, "glm_rowsplit_attn"),
+            ] {
+                if *field != Some(false) {
+                    *field = Some(false);
+                    emit_config::note_production_default(id, "false".into());
+                }
+            }
         }
     }
 }
@@ -8061,6 +8254,8 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_ARGMAX_FIN",
     "PLOW_DOP_ATTN_RES",
     "PLOW_DOP_ATTN_SELECT",
+    "PLOW_DOP_DCP_KV_PACK",
+    "PLOW_DOP_DCP_KV_SCATTER",
     "PLOW_DOP_DENSE_GLU_FP8_BLK",
     "PLOW_DOP_DSA_POOL_COMPRESS",
     "PLOW_DOP_DSA_POOL_EXPAND",
@@ -8082,6 +8277,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMM_C5",
     "PLOW_DOP_GEMM_C5_FP8",
     "PLOW_DOP_GEMM_C5_MXFP4",
+    "PLOW_DOP_GEMM_F32",
     "PLOW_DOP_GEMM_FP8",
     "PLOW_DOP_GEMM_FP8_BLK",
     "PLOW_DOP_GEMM_GLU",
@@ -8190,11 +8386,19 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_XALLGATHER",
     "PLOW_DOP_XALLTOALL_HEADS",
     "PLOW_DOP_XARGMAX_FIN",
+    "PLOW_DOP_XDCP_GATHER",
     "PLOW_DOP_XFLASHMERGE",
     "PLOW_DOP_XREDUCE",
     "PLOW_DOP_XREDUCE2",
     "PLOW_DOP_XREDUCESCATTER",
     "PLOW_DOP_XREDUCE_ADD_NORM",
+];
+
+/// Opcodes executed by isolated `AmdEngine` segments instead of `interp.hip`.
+const AMD_HOST_DISPATCHED: &[&str] = &[
+    "PLOW_DOP_GEMM_BLK_PF",
+    "PLOW_DOP_GEMM_LT_PF",
+    "PLOW_DOP_MOE_AITER_FP8_PF",
 ];
 
 /// Refuse a packet carrying an opcode the gfx950 interpreter has no arm for.
@@ -8266,7 +8470,10 @@ fn check_gfx950_opcode_coverage(m: &Model, amd: bool) {
                 continue;
             };
             let c = op.c_name();
-            if !GFX950_DISPATCHED.contains(&c) && !missing.contains(&c) {
+            if !GFX950_DISPATCHED.contains(&c)
+                && !AMD_HOST_DISPATCHED.contains(&c)
+                && !missing.contains(&c)
+            {
                 missing.push(c);
             }
         }
@@ -8842,31 +9049,42 @@ fn emit_dense_gqa(
         }
     }
 
-    // PREFILL PLACEMENT IS OFF BY DEFAULT ON AMD, and that is what makes the DECODE placement
-    // usable at all. `PLOW_L2_PLACE` already defaults ON for gfx942/gfx950, but
-    // `scripts/build_gfx942.sh` gates `-DPLOW_L2_PLACE_DISPATCH` on the PREFILL objects behind
-    // `PLOW_L2HIER_PF`, which is off — so `plowrt` REFUSES a blob whose prefill programs are
-    // placed, and the only way past that was `PLOW_L2_PLACE=0`, which throws away the decode
-    // half too. That is how the shipped Gemma-4-31B blob came to be unplaced (`PLOWDEV\x09`,
-    // not `\x0b`) with `PLOW_GATE_HIER` compiled into the decode object and INERT at run time:
-    // the hierarchy's precondition is `prog.l2_domains != 0`. Measured cost of that accident,
-    // Gemma-4-31B BF16 TP1 MI300X, served, medians of six: TPOT +4.7% to +8.0%.
-    // An explicit `PLOW_L2_PLACE_PREFILL=1` still asks for it (pair it with `PLOW_L2HIER_PF=1`
-    // objects); NVIDIA is unchanged, where one cooperative launch reads no wave class.
+    // Dense-GQA AMD prefill placement remains explicit until that path is separately qualified.
+    // GLM has its own placed builder and default below in `mla.rs`.
     let l2_place_prefill = ecfg.l2_place_prefill
         && (!amd || std::env::var_os("PLOW_L2_PLACE_PREFILL").is_some());
     let mut progs = Vec::new();
     let mut tlist = Vec::new();
     let mut hetero_progs: Vec<hetero::ProgPlan> = Vec::new();
     let mut channel_progs = Vec::new();
-    for &t in &buckets {
+    let packed_prefill = amd
+        && matches!(c.arch, Arch::Gemma3 | Arch::Gemma4)
+        && ecfg.packed_prefill_on();
+    let prefill_plan: Vec<(u32, bool)> = buckets
+        .iter()
+        .copied()
+        .map(|t| (t, false))
+        .chain(
+            packed_prefill
+                .then_some(&buckets)
+                .into_iter()
+                .flatten()
+                .copied()
+                .map(|t| (t, true)),
+        )
+        .collect();
+    for (t, packed) in prefill_plan {
         if c.moe && !moe_pf {
             break;
         } // MoE without prefill: decode-only blob
         let mut b = Builder::new(n_cu);
+        b.set_packed_prefill_segments(packed);
         b.set_fuse_materialized_residual_inputs(ecfg.fuse_residual_input);
         b.adopt_tensors(tensors.clone());
         b.set_l2_placement(l2_layout.filter(|_| l2_place_prefill));
+        b.set_native_gemma4_glu_segments(
+            amd && amd_target::active().1 == hwspec::IsaLevel::Gfx942,
+        );
         b.set_lean_moe_stage2_segments(amd && emit_config::active().moe_stage2_lean);
         b.set_lean_moe_stage1_segments(amd && emit_config::active().moe_stage1_lean);
         b.set_lean_moe_combine_segments(amd && emit_config::active().moe_combine_lean);
@@ -8931,7 +9149,11 @@ fn emit_dense_gqa(
             });
         }
         progs.push(b.finish());
-        tlist.push(t);
+        tlist.push(if packed {
+            packet::devbuild::packed_prefill_program_t(t)
+        } else {
+            t
+        });
     }
     let mut kv_rows = Vec::new();
     // `dbatch` is the SAME clamped(1,32) value used by declare() above — emission and
@@ -9084,8 +9306,27 @@ fn emit_dense_gqa(
     if ecfg.prefill_cublaslt {
         let selected = dense_cublaslt::apply_prefill(&mut m, &mut sections, &arch)
             .expect("dense prefill projection segments");
-        assert!(selected > 0, "no eligible dense prefill projections");
-        eprintln!("  cuBLASLt prefill: {selected} projection segments");
+        if emit_config::explicitly_set("prefill_cublaslt") {
+            assert!(selected > 0, "no eligible dense prefill projections");
+        }
+        if selected > 0 {
+            eprintln!("  cuBLASLt prefill: {selected} projection segments");
+        }
+        // Packetize the exact-shape algorithm selection from the tune store when one exists;
+        // a host with the GPU refreshes it through the campaign probe, and the runtime
+        // re-validates every entry with AlgoCheck before use.
+        if let Some(root) = ecfg.tunedb_root() {
+            match dense_cublaslt::packetize_algo_table(
+                &m,
+                &arch,
+                std::path::Path::new(&root),
+                std::path::Path::new(&out),
+            ) {
+                Ok(0) => eprintln!("  cuBLASLt algorithms: no tune-store rows for this target; the runtime selects at load"),
+                Ok(n) => eprintln!("  cuBLASLt algorithms: {n} shape(s) packetized from the tune store"),
+                Err(error) => eprintln!("  cuBLASLt algorithms: not packetized: {error}"),
+            }
+        }
     }
     // BLOCK MODE: embed the block.json descriptor
     // as SECT_METADATA — this also forces the to_blob_v6 path — and drop a
@@ -9148,6 +9389,54 @@ fn emit_dense_gqa(
         };
         sections.push(write_block_descriptor(&out, &desc));
         eprintln!("  block mode: layers {block:?}");
+    }
+    if block_mode || ecfg.block_packets || ecfg.pf_modular {
+        let is_sandwich = c.arch.is_gemma();
+        let mut modular_progs = Vec::new();
+        for (i, &t) in buckets.iter().enumerate() {
+            modular_progs.push(modular::create_modular_block_prog(
+                plow_asset::ModularBlockKind::DenseAttention,
+                plow_asset::ModularPhase::Prefill,
+                i as u32,
+                t,
+                None,
+                c.has_qk_norm,
+                is_sandwich,
+                false,
+            ));
+            modular_progs.push(modular::create_modular_block_prog(
+                plow_asset::ModularBlockKind::DenseFfn,
+                plow_asset::ModularPhase::Prefill,
+                i as u32,
+                t,
+                None,
+                false,
+                is_sandwich,
+                false,
+            ));
+        }
+        modular_progs.push(modular::create_modular_block_prog(
+            plow_asset::ModularBlockKind::DenseAttention,
+            plow_asset::ModularPhase::Decode,
+            buckets.len() as u32,
+            dbatch,
+            None,
+            c.has_qk_norm,
+            is_sandwich,
+            false,
+        ));
+        modular_progs.push(modular::create_modular_block_prog(
+            plow_asset::ModularBlockKind::DenseFfn,
+            plow_asset::ModularPhase::Decode,
+            buckets.len() as u32,
+            dbatch,
+            None,
+            false,
+            is_sandwich,
+            false,
+        ));
+        let manifest = modular::build_modular_manifest(c.layers, modular_progs, &buckets, &[dbatch]);
+        sections.push(modular::modular_pipeline_section(&manifest));
     }
     if let Some(ref path) = embed_cubin {
         sections.push(packet::devbuild::SectionData {
@@ -9349,6 +9638,7 @@ fn emit_dense_gqa(
         }
     }
     let lean = apply_verify_gate(&m, verify.as_ref());
+    modular::update_section_with_lean(&mut sections, &lean);
     let blob = if sections.is_empty() {
         m.to_blob()
     } else {

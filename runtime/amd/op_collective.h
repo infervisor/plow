@@ -1614,7 +1614,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
 /* `xr_rendezvous_one_wg` is shared by the sequence-parallel seams (ops 25/26) and the
  * row-split sparse attention's head/row transpose (op 160, PLOW_ROWSPLIT_A2A below): both are
  * self-contained one-gate rendezvous over data an EARLIER packet already published. */
-#if PLOW_SEQ_PAR_SEAMS || PLOW_ROWSPLIT_A2A
+#if PLOW_SEQ_PAR_SEAMS || PLOW_ROWSPLIT_A2A || PLOW_DCP_GATHER
 /* One-workgroup announcement + N-arrival wait on `gate`, the two-shot's RENDEZVOUS 1 verbatim.
  * Legal for both ops here because what is being published was written by EARLIER packets
  * (the partial by the producer GEMM, the band results by the band packets), whose completion
@@ -1650,7 +1650,7 @@ __device__ __forceinline__ bool xr_rendezvous_one_wg(const void* const* peer_scr
     __syncthreads();
     return !*bailed;
 }
-#endif /* PLOW_SEQ_PAR_SEAMS || PLOW_ROWSPLIT_A2A */
+#endif /* PLOW_SEQ_PAR_SEAMS || PLOW_ROWSPLIT_A2A || PLOW_DCP_GATHER */
 
 #if PLOW_SEQ_PAR_SEAMS
 /* op 25 — REDUCE-SCATTER ONLY. Rendezvous on `gate_rs`, then this rank's owned slice
@@ -1802,10 +1802,15 @@ __device__ __forceinline__ void d_xall_gather_mega(
  * [rank*rpr, (rank+1)*rpr) — a CONTIGUOUS run in p's source — into the LOCAL
  * dst = [rpr][nh_total][d] at head offset p*nh_l (strided across rows).
  *
- * dir=1 (O form): this rank's own peer-visible source is [rpr][nh_total][d] (this rank's row
- * band, every head). Rank `rank` pulls, from every peer p, p's head slice
- * [rank*nh_l, (rank+1)*nh_l) at each of p's rpr rows — STRIDED in p's source — into the LOCAL
- * dst = [T][nh_l][d] at row band [p*rpr, (p+1)*rpr) (contiguous).
+ * dir=1 (O form): this rank's own peer-visible source is GROUP-MAJOR — `groups` dense blocks
+ * of [rpr][heads_per_group][d] back to back (heads_per_group == nh_total, groups == 1
+ * reproduces the plain interleaved [rpr][nh_total][d] source byte for byte: the row-split
+ * attention kernel writes each of its head-groups to its OWN dense block, with no independent
+ * row stride to interleave them — see amd_sparse_mla.rs's `rowsplit_launch_args`). Rank `rank`
+ * pulls, from every peer p, the group g = rank / (heads_per_group / nh_l) and the
+ * (rank % (heads_per_group / nh_l)) * nh_l head offset within it, at each of p's rpr rows —
+ * STRIDED in p's source — into the LOCAL dst = [T][nh_l][d] at row band [p*rpr, (p+1)*rpr)
+ * (contiguous).
  *
  * Both are pure permutations (no arithmetic): a copied element is byte-exact against the
  * source word. `row_elems (= nh_l * d)` is a multiple of 8 by construction on the shapes this
@@ -1815,7 +1820,7 @@ __device__ __forceinline__ void d_xalltoall_heads_mega(
     const void* const* peer_scratch, uint32_t nranks, uint32_t rank, size_t xctr_byte_off,
     uint32_t gate, uint64_t deadline_ticks, uint32_t* status, unsigned slice, unsigned nblk,
     bf16* __restrict__ dst, uint32_t rpr, uint32_t nh_l, uint32_t d, uint32_t nh_total,
-    uint32_t slot_bytes, uint32_t dir) {
+    uint32_t slot_bytes, uint32_t dir, uint32_t heads_per_group) {
     __shared__ int bailed;
     if (slice >= PLOW_XA2A_NWG) return;
     const unsigned dnblk = nblk < PLOW_XA2A_NWG ? nblk : PLOW_XA2A_NWG;
@@ -1838,9 +1843,14 @@ __device__ __forceinline__ void d_xalltoall_heads_mega(
                     ld_glob8(src + (size_t)v * 8u));
         }
     } else {
-        const uint32_t src_row_vecs = (nh_total * d) >> 3u;
-        const bf16* src = (const bf16*)((const char*)peer_scratch[p] + slot_bytes);
-        const uint32_t src_head_vecs = rank * vrow;
+        const uint32_t ranks_per_group = heads_per_group / nh_l;
+        const uint32_t g = rank / ranks_per_group;
+        const uint32_t local_head_off = (rank % ranks_per_group) * nh_l;
+        const uint32_t src_row_vecs = (heads_per_group * d) >> 3u;
+        const uint32_t group_base_vecs = g * rpr * src_row_vecs;
+        const bf16* src =
+            (const bf16*)((const char*)peer_scratch[p] + slot_bytes) + (size_t)group_base_vecs * 8u;
+        const uint32_t src_head_vecs = (local_head_off * d) >> 3u;
         bf16* dp = dst + (size_t)p * chunk_vecs * 8u;
         for (uint32_t v = t0; v < chunk_vecs; v += tstep) {
             const uint32_t row = v / vrow, r_in_row = v % vrow;
@@ -1850,5 +1860,156 @@ __device__ __forceinline__ void d_xalltoall_heads_mega(
     }
 }
 #endif /* PLOW_ROWSPLIT_A2A */
+
+/* ---- DECODE CONTEXT PARALLELISM: owner gather of MLA latent KV records (ops 181/182) -------
+ *
+ * `-DPLOW_DCP_GATHER=1` (plow_config.h sets it when the packet carries the ops). Under DCP each
+ * rank holds only the KV rows its shard owns (`packet::dcp`: block-cyclic pages, shard =
+ * (row >> page_shift) & (degree - 1), local row = ((row >> (page_shift + degree_shift)) <<
+ * page_shift) | (row & (page - 1))). Attention needs every row it reads on every rank, so:
+ *
+ *   op 181 DCP_KV_PACK   (local)       each rank copies the records it OWNS into its peer slot;
+ *   op 182 XDCP_GATHER   (collective)  every rank pulls each record from its owner's slot into
+ *                                      the dense gathered buffers the unchanged flash reads;
+ *   op 183 DCP_KV_SCATTER (local)      the write side: staged new rows land in the local cache
+ *                                      only on the rank that owns them.
+ *
+ * A record is `[512 B e4m3 ckv][64 bf16 krot][f32 ckv scale]` padded to 656 B (328 bf16 words, so
+ * every 8-wide access stays 16-aligned), stored record-major at its gathered position: record
+ * `r = b * K + j` is selected slot `j` of batch row `b`, global KV row `idx[r]`, or `j` itself
+ * when `idx` is null (the prefix form prefill uses, `K` = the packet context). Only
+ * `j < min(K, kv_len[b])` is live.
+ *
+ * MEASURED (tp_dcp_gather_bench.c, 8 GPUs, byte-exact at every cap), gather us by workgroups
+ * 48 / 96 / 152 / 208 / 256 / 304:
+ *   decode 32 x 2048 at 60-70k   594 / 454 / 362 / 374 / 386 / 374   (pack 27-53 us)
+ *   prefix 70,001 rows           572 / 479 / 557 / 548 / 574 / 534   (pack 30-39 us)
+ * so decode emits on 152 workgroups (~389 us per layer, ~30 ms per 78-layer step) and prefix on
+ * 96. The pull is random across peers, well under op 160's 216 GB/s wave-per-peer stream. An
+ * owner-compacted slot that streams per peer was tried and is WORSE: its decode pack must walk
+ * each row serially to assign compacted positions (13.2 ms), and its gather still measured
+ * 1.49 ms decode / 543 us prefix. Do not re-try it without a parallel compaction.
+ *
+ * The selection must be identical on every rank — it is: the DSA indexer is replicated (all 32
+ * index heads, replicated `kidx`, replicated hidden state). A rank whose selection diverged would
+ * pull a record its owner never packed; nothing here can detect that. */
+#if PLOW_DCP_GATHER
+/* Workgroup cap for the gather; the emitter picks the count per form (see MEASURED above). */
+#ifndef PLOW_DCP_NWG
+#define PLOW_DCP_NWG 304
+#endif
+constexpr uint32_t PLOW_DCP_REC_WORDS = 328u; /* 256 ckv + 64 krot + 2 scale + 6 pad */
+
+__device__ __forceinline__ uint32_t dcp_live(const int* kv_len, uint32_t b, uint32_t K) {
+    const uint32_t len = (uint32_t)as_glob(kv_len)[b];
+    return len < K ? len : K;
+}
+
+/* op 181 — pack this rank's owned records. `shard` is this rank's shard within its DCP group. */
+__device__ __forceinline__ void d_dcp_kv_pack(
+    bf16* __restrict__ slot, const int* __restrict__ idx, const int* __restrict__ kv_len,
+    const unsigned char* __restrict__ ckv, const bf16* __restrict__ krot,
+    const float* __restrict__ kv_scale, uint32_t n_batch, uint32_t K, uint32_t local_stride,
+    uint32_t page_shift, uint32_t degree_shift, uint32_t shard, unsigned slice, unsigned nblk) {
+    const uint32_t tid = slice * PLOW_THREADS + threadIdx.x;
+    const uint32_t stride = nblk * PLOW_THREADS;
+    const uint32_t n = n_batch * K;
+    const uint32_t pmask = (1u << page_shift) - 1u, dmask = (1u << degree_shift) - 1u;
+    for (uint32_t r = tid; r < n; r += stride) {
+        const uint32_t b = r / K, j = r % K;
+        if (j >= dcp_live(kv_len, b, K)) continue;
+        const uint32_t g = idx ? (uint32_t)as_glob(idx)[r] : j;
+        if (((g >> page_shift) & dmask) != shard) continue;
+        const uint32_t l = ((g >> (page_shift + degree_shift)) << page_shift) | (g & pmask);
+        const size_t lrow = (size_t)b * local_stride + l;
+        const bf16* cs = (const bf16*)(const void*)ckv + lrow * 256u;
+        const bf16* ks = krot + lrow * 64u;
+        bf16* d = slot + (size_t)r * PLOW_DCP_REC_WORDS;
+#pragma unroll
+        for (uint32_t v = 0; v < 32u; v++) st_glob8(d + v * 8u, ld_glob8(cs + v * 8u));
+#pragma unroll
+        for (uint32_t v = 0; v < 8u; v++) st_glob8(d + 256u + v * 8u, ld_glob8(ks + v * 8u));
+        const bf16* ss = (const bf16*)(const void*)kv_scale + lrow * 2u;
+        st_act1(&as_glob(d)[320], as_glob(ss)[0]);
+        st_act1(&as_glob(d)[321], as_glob(ss)[1]);
+    }
+}
+
+/* op 183 — owner-only KV write. The unchanged writers (HeadNormRopeFp8 for ckv + scale,
+ * HeadNormRope for the roped krot) write this step's `rows` into staging buffers at row `t`; this
+ * copies row `t` into the local cache iff this shard owns global row `pos[t]`. Ownership comes
+ * from the replicated `pos`, so no per-rank host staging exists. `batched`: row `t` is decode
+ * slot `t` (local base `t * local_stride`); otherwise every row belongs to the one prefilling
+ * sequence at local base 0. The rope angle stayed on the global `pos[t]` inside the writers. */
+__device__ __forceinline__ void d_dcp_kv_scatter(
+    const int* __restrict__ pos, const unsigned char* __restrict__ ckv_st,
+    const bf16* __restrict__ krot_st, const float* __restrict__ scale_st,
+    unsigned char* __restrict__ ckv, bf16* __restrict__ krot, float* __restrict__ kv_scale,
+    uint32_t rows, uint32_t local_stride, uint32_t page_shift, uint32_t degree_shift,
+    uint32_t shard, uint32_t batched, unsigned slice, unsigned nblk) {
+    const uint32_t tid = slice * PLOW_THREADS + threadIdx.x;
+    const uint32_t stride = nblk * PLOW_THREADS;
+    const uint32_t pmask = (1u << page_shift) - 1u, dmask = (1u << degree_shift) - 1u;
+    for (uint32_t t = tid; t < rows; t += stride) {
+        const uint32_t g = (uint32_t)as_glob(pos)[t];
+        if (((g >> page_shift) & dmask) != shard) continue;
+        const uint32_t l = ((g >> (page_shift + degree_shift)) << page_shift) | (g & pmask);
+        const size_t lrow = (batched ? (size_t)t * local_stride : 0u) + l;
+        bf16* cd = (bf16*)(void*)ckv + lrow * 256u;
+        const bf16* cs = (const bf16*)(const void*)ckv_st + (size_t)t * 256u;
+#pragma unroll
+        for (uint32_t v = 0; v < 32u; v++) st_glob8(cd + v * 8u, ld_glob8(cs + v * 8u));
+        bf16* kd = krot + lrow * 64u;
+        const bf16* ks = krot_st + (size_t)t * 64u;
+#pragma unroll
+        for (uint32_t v = 0; v < 8u; v++) st_glob8(kd + v * 8u, ld_glob8(ks + v * 8u));
+        as_glob(kv_scale)[lrow] = as_glob(scale_st)[t];
+    }
+}
+
+/* op 182 — rendezvous, then pull every live record from its owner into `gckv [B][K][512]`,
+ * `gkrot [B][K][64]`, `gscale [B][K]`, and write `glen[b] = min(K, kv_len[b])` when `glen` is
+ * non-null (the decode form; the flash reads it as its kv_len so its dense walk covers exactly
+ * the live records). Groups are `degree` consecutive ranks, so the owner of shard `s` is
+ * `(rank & ~(degree - 1)) + s`. */
+__device__ __forceinline__ void d_xdcp_gather_mega(
+    const void* const* peer_scratch, uint32_t nranks, uint32_t rank, size_t xctr_byte_off,
+    uint32_t gate, uint64_t deadline_ticks, uint32_t* status, unsigned slice, unsigned nblk,
+    uint32_t slot_bytes, const int* __restrict__ idx, const int* __restrict__ kv_len,
+    unsigned char* __restrict__ gckv, bf16* __restrict__ gkrot, float* __restrict__ gscale,
+    int* __restrict__ glen, uint32_t n_batch, uint32_t K, uint32_t page_shift,
+    uint32_t degree_shift) {
+    __shared__ int bailed;
+    if (slice >= PLOW_DCP_NWG) return;
+    const unsigned dnblk = nblk < PLOW_DCP_NWG ? nblk : PLOW_DCP_NWG;
+    if (!xr_rendezvous_one_wg(peer_scratch, nranks, rank, xctr_byte_off, gate, deadline_ticks,
+                              status, slice, &bailed))
+        return;
+    const uint32_t tid = slice * PLOW_THREADS + threadIdx.x;
+    const uint32_t stride = dnblk * PLOW_THREADS;
+    const uint32_t n = n_batch * K;
+    const uint32_t dmask = (1u << degree_shift) - 1u;
+    const uint32_t base = rank & ~dmask;
+    if (glen)
+        for (uint32_t b = tid; b < n_batch; b += stride) as_glob(glen)[b] = (int)dcp_live(kv_len, b, K);
+    for (uint32_t r = tid; r < n; r += stride) {
+        const uint32_t b = r / K, j = r % K;
+        if (j >= dcp_live(kv_len, b, K)) continue;
+        const uint32_t g = idx ? (uint32_t)as_glob(idx)[r] : j;
+        const uint32_t p = base + ((g >> page_shift) & dmask);
+        const bf16* s = (const bf16*)((const char*)peer_scratch[p] + slot_bytes) +
+                        (size_t)r * PLOW_DCP_REC_WORDS;
+        bf16* cd = (bf16*)(void*)gckv + (size_t)r * 256u;
+        bf16* kd = gkrot + (size_t)r * 64u;
+#pragma unroll
+        for (uint32_t v = 0; v < 32u; v++) st_glob8(cd + v * 8u, ld_glob8(s + v * 8u));
+#pragma unroll
+        for (uint32_t v = 0; v < 8u; v++) st_glob8(kd + v * 8u, ld_glob8(s + 256u + v * 8u));
+        bf16* sd = (bf16*)(void*)gscale + (size_t)r * 2u;
+        st_act1(&as_glob(sd)[0], as_glob(s)[320]);
+        st_act1(&as_glob(sd)[1], as_glob(s)[321]);
+    }
+}
+#endif /* PLOW_DCP_GATHER */
 
 #endif /* PLOW_OP_COLLECTIVE_H */

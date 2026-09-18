@@ -22,6 +22,7 @@ fn q_form_shape() {
         8,
         0,
         0,
+        64,
     );
     let p = b.finish();
     let inst = &p.insts[c as usize];
@@ -29,6 +30,7 @@ fn q_form_shape() {
     assert_eq!(inst.t[0], dst);
     // i0=rpr i1=nh_l i2=d i3=nh_total i4=gate i5=n_gpu i6=slot_bytes i7=dir
     assert_eq!(inst.i, [1024, 8, 576, 64, 5, 8, 0, 0]);
+    assert_eq!(inst.j[0], 64, "one interleaved group");
     assert_eq!(xgate, 6, "gate id consumed exactly once");
 }
 
@@ -50,10 +52,28 @@ fn o_form_carries_slot_bytes_and_dir() {
         8,
         75_497_472,
         1,
+        64,
     );
     let p = b.finish();
     let inst = &p.insts[c as usize];
     assert_eq!(inst.i, [1024, 8, 512, 64, 0, 8, 75_497_472, 1]);
+    assert_eq!(inst.j[0], 64);
+}
+
+/// The row-split arm's O side: 4 groups of 16 heads (`heads_per_group != nh_total`) instead of
+/// one interleaved group. Only `j0` differs from `o_form_carries_slot_bytes_and_dir`.
+#[test]
+fn o_form_group_major_carries_heads_per_group() {
+    let mut b = Builder::new(8);
+    let dst = b.tensor("act.oat", 8192 * 8 * 512 * 2);
+    let mut xgate = 0;
+    let c = emit_xalltoall_heads(
+        &mut b, &mut xgate, &[0, 1, 2, 3], &[], dst, 1024, 8, 512, 64, 8, 33_554_432, 1, 16,
+    );
+    let p = b.finish();
+    let inst = &p.insts[c as usize];
+    assert_eq!(inst.i, [1024, 8, 512, 64, 0, 8, 33_554_432, 1]);
+    assert_eq!(inst.j[0], 16, "4 groups of 16 heads");
 }
 
 #[test]
@@ -62,7 +82,7 @@ fn rejects_inconsistent_head_count() {
     let mut b = Builder::new(8);
     let dst = b.tensor("act.bad", 4);
     let mut xgate = 0;
-    emit_xalltoall_heads(&mut b, &mut xgate, &[0], &[], dst, 1024, 8, 576, 63, 8, 0, 0);
+    emit_xalltoall_heads(&mut b, &mut xgate, &[0], &[], dst, 1024, 8, 576, 63, 8, 0, 0, 63);
 }
 
 #[test]
@@ -71,5 +91,23 @@ fn rejects_bad_dir() {
     let mut b = Builder::new(8);
     let dst = b.tensor("act.bad", 4);
     let mut xgate = 0;
-    emit_xalltoall_heads(&mut b, &mut xgate, &[0], &[], dst, 1024, 8, 576, 64, 8, 0, 2);
+    emit_xalltoall_heads(&mut b, &mut xgate, &[0], &[], dst, 1024, 8, 576, 64, 8, 0, 2, 64);
+}
+
+#[test]
+#[should_panic(expected = "heads_per_group must divide nh_total and be a multiple of nh_l")]
+fn rejects_heads_per_group_not_dividing_nh_total() {
+    let mut b = Builder::new(8);
+    let dst = b.tensor("act.bad", 4);
+    let mut xgate = 0;
+    emit_xalltoall_heads(&mut b, &mut xgate, &[0], &[], dst, 1024, 8, 512, 64, 8, 0, 1, 24);
+}
+
+#[test]
+#[should_panic(expected = "heads_per_group must divide nh_total and be a multiple of nh_l")]
+fn rejects_heads_per_group_not_a_multiple_of_nh_l() {
+    let mut b = Builder::new(8);
+    let dst = b.tensor("act.bad", 4);
+    let mut xgate = 0;
+    emit_xalltoall_heads(&mut b, &mut xgate, &[0], &[], dst, 1024, 8, 512, 64, 8, 0, 1, 12);
 }

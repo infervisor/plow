@@ -33,6 +33,7 @@ G_K(g_per_layer_input);
 G_K(g_zero_f32);
 G_K(g_gemm_splitk);
 G_K(g_gemm);
+G_K(g_gemm_f32);
 G_K(g_gemm_small);
 G_K(g_gemm_med);
 G_K(g_gemm_wide);

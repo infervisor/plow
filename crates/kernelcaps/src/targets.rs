@@ -324,7 +324,7 @@ pub fn dense_gemm_inventory(root: &Path, isa: IsaLevel) -> Result<Inventory, Pro
 
 /// Build identity for dense-GEMM timing records.
 ///
-/// The gfx950 tile sweep launches separate kernels from `test_kernels.hip`, not the
+/// The AMD tile sweep launches separate kernels from `test_kernels.hip`, not the
 /// persistent interpreter. Keying those measurements to the entire interpreter
 /// made queue, collective, and attention edits invalidate every GEMM timing,
 /// even though none of the measured code changed. This identity hashes the
@@ -339,7 +339,7 @@ pub fn dense_gemm_tuning_build(root: &Path, isa: IsaLevel) -> Result<crate::Buil
     let target = recipe.target(root);
     let toolchain = toolchain_label(recipe.isa);
 
-    if isa != IsaLevel::Gfx950 {
+    if !matches!(isa, IsaLevel::Gfx942 | IsaLevel::Gfx950) {
         let text = target.preprocess()?;
         return Ok(target.build_id_from(isa, &toolchain, &text));
     }

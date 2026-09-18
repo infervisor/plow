@@ -277,6 +277,7 @@ fn the_verification_gate_does_not_change_a_single_emitted_byte() {
                 verified: true,
                 oracle: true,
                 reason: None,
+                ..Default::default()
             })
         })),
     );
@@ -361,6 +362,70 @@ fn gemma_dense_blob_is_stable() {
         blob.len(),
         fnv1a(&blob)
     );
+}
+
+#[test]
+fn gemma_gfx942_emits_distinct_packed_prefill_siblings() {
+    let _g = emit_guard();
+    for fp8 in [false, true] {
+        let root = tempdir(&format!("gemma_gfx942_packed_siblings_{fp8}"));
+        write_gemma_config(&root);
+        let mut cfg = devgen::emit_config::EmitConfig::from_env();
+        cfg.emit_packed_prefill = Some(true);
+        cfg.fp8 = fp8;
+        cfg.w8a8 = fp8;
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_seen = seen.clone();
+        devgen::run_verified(
+            devgen::EmitArgs {
+                dir: root.clone(),
+                ctx: 512,
+                out: root.join("model.pkt").to_str().unwrap().into(),
+                n_cu: 304,
+                tp: 1,
+                block_spec: None,
+                embed_cubin: None,
+                embed_hsaco: None,
+                rope_gen: true,
+                l2_layout: None,
+                gpu: "MI300X".into(),
+                arch: "gfx942".into(),
+                emit_cfg: Some(cfg),
+                whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+            },
+            Some(Box::new(move |model| {
+                use packet::devbuild::packed_prefill_program_t;
+                assert_eq!(
+                    model.prog_t,
+                    [
+                        128,
+                        512,
+                        packed_prefill_program_t(128),
+                        packed_prefill_program_t(512),
+                        1,
+                        2,
+                        4,
+                        8,
+                    ]
+                );
+                hook_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(devgen::LeanReport {
+                    verified: false,
+                    oracle: false,
+                    reason: Some("structural test only".into()),
+                    ..Default::default()
+                })
+            })),
+        );
+        assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("build.json")).unwrap()).unwrap();
+        assert_eq!(manifest["objects"]["packed_prefill"]["required"], true);
+        assert_eq!(
+            manifest["shapes"]["prefill_buckets"],
+            serde_json::json!([128, 512])
+        );
+    }
 }
 
 /// Byte-golden for the dense **Llama** path.
@@ -540,6 +605,7 @@ fn affine_q4_emits_complete_triplets_and_separate_glu() {
                 verified: false,
                 oracle: false,
                 reason: Some("structural test only".into()),
+                ..Default::default()
             })
         })),
     );
@@ -997,6 +1063,7 @@ fn an_fp8_tied_head_can_share_an_mxfp4_body() {
                 verified: false,
                 oracle: false,
                 reason: Some("structural test only".into()),
+                ..Default::default()
             })
         })),
     );

@@ -57,6 +57,10 @@ use clap::Args;
 /// (review log #65), worth about -6.5 ms of the -35 ms per chunk all four groups would give.
 pub const GLM_GEMM_LT_PF_EXT_QUALIFIED: &str = "o_proj,band,shared";
 
+/// The qualified GLM-5.3 gfx942 TP8 prefill bucket set. Shared by `GLM53_RECIPE` and
+/// `apply_production_defaults` so the declared recipe and the applied default are one string.
+pub const GLM53_MLA_PREFILL: &str = "full:128,512,2048,8192";
+
 #[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Emit knobs")]
 pub struct EmitConfig {
@@ -226,6 +230,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FUSE_ARGMAX", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fuse_argmax: bool,
 
+    /// Cap sliding-window decode nsplit to (win / 64) to prevent over-splitting.
+    #[arg(long, env = "PLOW_SLIDING_NS_CAP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub sliding_ns_cap: bool,
+
     /// Revert fused QKV to split-3 path (A/B control).
     #[arg(long, env = "PLOW_NO_FUSE_QKV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub no_fuse_qkv: bool,
@@ -291,6 +299,18 @@ pub struct EmitConfig {
     /// Force prefill lm_head onto M=1 GEMV arm vs tiled. "1"/"0" to force.
     #[arg(long, env = "PLOW_PF_GEMV_HEAD")]
     pub pf_gemv_head: Option<String>,
+
+    /// Emit modular building-block packets (EmbeddingBlock, DenseAttentionBlock, DenseFfnBlock, FinalNormVocabBlock).
+    #[arg(long, env = "PLOW_BLOCK_PACKETS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub block_packets: bool,
+
+    /// Opt-in knob for modular block prefill pipeline and fine-grained ladder decomposition.
+    #[arg(long, env = "PLOW_PF_MODULAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub pf_modular: bool,
+
+    /// Single block stage to emit in isolation: "attn", "ffn", "embed", "vocab", or "all".
+    #[arg(long, env = "PLOW_BLOCK_STAGE", value_parser = clap::builder::PossibleValuesParser::new(["attn", "ffn", "embed", "vocab", "all"]))]
+    pub block_stage: Option<String>,
 
     // ──────────────────────────────────────────────────────────────────────────
     // Placement / L2 / counters
@@ -469,6 +489,18 @@ pub struct EmitConfig {
     /// refuses. `=0` is the rollback.
     #[arg(long, env = "PLOW_EMIT_REWRITE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub emit_rewrite: bool,
+
+    /// Use dense-GEMM tuner records whose build digests have since moved, for the op cases
+    /// that have NO current-digest record. Exact-digest records still win every case they
+    /// cover: this only replaces an ANALYTICAL-model fallback with a measured tile, never a
+    /// current measurement with an older one.
+    ///
+    /// The strict rule ("a stale record is more dangerous than none") costs the whole campaign
+    /// on any kernel edit, since the digest covers the preprocessed dense family: every tile
+    /// then degrades to the analytical model and the build reports tier `portable`. Default on;
+    /// `=0` restores strict staleness.
+    #[arg(long, env = "PLOW_TUNE_IGNORE_DIGEST", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub tune_ignore_digest: bool,
 
     /// GLM router off-shared dispatch (co-resident mode 2 only).
     #[arg(long, env = "GLM_ROUTER_OFF_SHARED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -756,6 +788,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_PF_NS")]
     pub glm_pf_ns: Option<u32>,
 
+    /// GLM TP8 sequence-parallel prefill: the band router reads the post-attention norm's band in
+    /// peer slot 3 and runs while the hidden all-gather is in flight (1 = score + top-k, 2 = also
+    /// the route-table gather and the align). Unset/0 = byte-identical blob.
+    #[arg(long, env = "PLOW_GLM_ROUTER_OVERLAP")]
+    pub glm_router_overlap: Option<u32>,
+
     /// Sparse-prefill selection reuse span: layers after an indexer layer that gather against
     /// its union (0 = indexer layers only, 3 = every GLM-5.3 layer).
     #[arg(long, env = "PLOW_GLM_DSA_PF_SPAN", default_value_t = 1)]
@@ -813,8 +851,8 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_PF_WIDE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_pf_wide: bool,
 
-    /// Per-XCD CU placement for the GLM prefill chain.
-    #[arg(long, env = "PLOW_GLM_PLACE_PF", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Per-XCD CU placement for the GLM prefill chain. Default on; pass `=0` for rollback.
+    #[arg(long, env = "PLOW_GLM_PLACE_PF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_place_pf: bool,
 
     /// Band count for a prefill TP seam (2..=8; unset/1 = the unbanded emit).
@@ -863,6 +901,29 @@ pub struct EmitConfig {
     /// order). `=true` to enable.
     #[arg(long, env = "PLOW_GLM_ROWSPLIT_ATTN", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_rowsplit_attn: Option<bool>,
+
+    /// Row-band sparse attention with replicated projections for the GLM 8192 prefill rung
+    /// (`PLOW_GLM_ROWBAND_ATTN`), the row-split sibling's other arm: each rank runs its `T/8`
+    /// rows with every head, q_absorb/q_rope/o_proj at full width on that band and one native
+    /// 64-head fold, with no head all-to-all and no attention reduce-scatter. Opt-in, OFF by
+    /// default; the full-width projections cost ~16.9 GiB per rank on GLM-5.3 TP8. Excludes
+    /// `PLOW_GLM_ROWSPLIT_ATTN`.
+    #[arg(long, env = "PLOW_GLM_ROWBAND_ATTN", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_rowband_attn: Option<bool>,
+
+    /// Decode context parallelism: shard the shared-latent KV cache over this many ranks instead
+    /// of replicating it on all of them, so each rank holds `1/DCP` of the KV rows and one
+    /// collective folds the per-rank softmax partials back into the head-sharded layout
+    /// everything downstream already expects. Must divide `--tp`. Unset or 1 is the replicated
+    /// layout and emits a byte-identical packet.
+    #[arg(long, env = "PLOW_DCP")]
+    pub dcp: Option<u32>,
+
+    /// Rows per DCP page — the granularity ownership cycles at. Must be a power of two, at least
+    /// the flash KV tile (32), and must divide the KV pool's block rows. Unset = 64. Larger
+    /// pages coalesce better and balance worse for short sequences.
+    #[arg(long, env = "PLOW_DCP_PAGE")]
+    pub dcp_page: Option<u32>,
 
     /// Size the batched-decode glue packets to their work items: the FP8 latent KV writer at one
     /// wave per row instead of one workgroup, the router top-k at one workgroup per token, the
@@ -1039,6 +1100,10 @@ pub struct EmitConfig {
     #[arg(long = "emit-prefill-cublaslt", env = "PLOW_EMIT_PREFILL_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub prefill_cublaslt: bool,
 
+    /// Emit qualified Gemma-31B gfx942 BF16 o/down projections as pinned assembly segments.
+    #[arg(long = "emit-gemma-gemm-lt", env = "PLOW_GEMMA_GEMM_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub gemma_gemm_lt: bool,
+
     #[arg(
         long = "emit-decode-native-tc",
         env = "PLOW_EMIT_DECODE_NATIVE_TC",
@@ -1197,6 +1262,7 @@ impl EmitConfig {
             decode_tiled: env_bool("PLOW_DECODE_TILED"),
             l2_place_prefill: env_bool_opt("PLOW_L2_PLACE_PREFILL").unwrap_or(true),
             fuse_argmax: env_bool("PLOW_FUSE_ARGMAX"),
+            sliding_ns_cap: env_bool("PLOW_SLIDING_NS_CAP"),
             no_fuse_qkv: env_bool("PLOW_NO_FUSE_QKV"),
             fuse_qkv_fp8: env_bool("PLOW_FUSE_QKV_FP8"),
             no_fuse_nrn: env_bool("PLOW_NO_FUSE_NRN"),
@@ -1212,6 +1278,9 @@ impl EmitConfig {
             pf_ladder: env_str("PLOW_PF_LADDER"),
             pf_ladder_append: env_str("PLOW_PF_LADDER_APPEND"),
             pf_gemv_head: env_str("PLOW_PF_GEMV_HEAD"),
+            block_packets: env_bool("PLOW_BLOCK_PACKETS"),
+            pf_modular: env_bool("PLOW_PF_MODULAR"),
+            block_stage: env_str("PLOW_BLOCK_STAGE"),
             xr_cus: env_u32("PLOW_XR_CUS"),
             glm_pf_small_cus: env_str("PLOW_GLM_PF_SMALL_CUS"),
             xr_dec_cus: env_u32("PLOW_XR_DEC_CUS"),
@@ -1270,6 +1339,7 @@ impl EmitConfig {
             glm_moe_native_align: env_bool("PLOW_GLM_MOE_NATIVE_ALIGN"),
             glm_fuse_seam_rn: env_bool("PLOW_GLM_FUSE_SEAM_RN"),
             emit_rewrite: env_opt_out("PLOW_EMIT_REWRITE"),
+            tune_ignore_digest: env_opt_out("PLOW_TUNE_IGNORE_DIGEST"),
             glm_router_off_shared: env_bool("GLM_ROUTER_OFF_SHARED"),
             glm_router_old: env_bool("GLM_ROUTER_OLD"),
             k3_fuse_ngemv: env_str("PLOW_K3_FUSE_NGEMV"),
@@ -1322,12 +1392,13 @@ impl EmitConfig {
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
+            glm_router_overlap: env_u32("PLOW_GLM_ROUTER_OVERLAP"),
             glm_dsa_pf_span: env_u32("PLOW_GLM_DSA_PF_SPAN").unwrap_or(1),
             glm_dsa_pf_dexact: env_u32("PLOW_GLM_DSA_PF_DEXACT"),
             dense_pf_ns: env_u32("PLOW_DENSE_PF_NS"),
             pf_floor: env_bool("PLOW_PF_FLOOR"),
             glm_pf_wide: env_opt_out("PLOW_GLM_PF_WIDE"),
-            glm_place_pf: env_bool("PLOW_GLM_PLACE_PF"),
+            glm_place_pf: env_opt_out("PLOW_GLM_PLACE_PF"),
             glm_xr_band: env_u32("PLOW_GLM_XR_BAND"),
             glm_xr_band_cus: env_u32("PLOW_GLM_XR_BAND_CUS"),
             attnres_decode_mwg: env_u32("PLOW_ATTNRES_DECODE_MWG"),
@@ -1336,6 +1407,9 @@ impl EmitConfig {
             glm_seq_par: env_bool_opt("PLOW_GLM_SEQ_PAR"),
             glm_seq_par_proj: env_bool_opt("PLOW_GLM_SEQ_PAR_PROJ"),
             glm_rowsplit_attn: env_bool_opt("PLOW_GLM_ROWSPLIT_ATTN"),
+            dcp: env_u32("PLOW_DCP"),
+            dcp_page: env_u32("PLOW_DCP_PAGE"),
+            glm_rowband_attn: env_bool_opt("PLOW_GLM_ROWBAND_ATTN"),
             glm_decode_glue_cus: env_bool("PLOW_GLM_DECODE_GLUE_CUS"),
             glm_decode_gemm_group: env_bool_opt("PLOW_GLM_DECODE_GEMM_GROUP"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
@@ -1371,6 +1445,7 @@ impl EmitConfig {
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
             decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),
             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
+            gemma_gemm_lt: env_bool("PLOW_GEMMA_GEMM_LT"),
             decode_native_tc: env_bool("PLOW_EMIT_DECODE_NATIVE_TC"),
             qwen_fuse_ab: env_bool("PLOW_QWEN_FUSE_AB"),
             qwen_fuse_mlp: env_bool("PLOW_QWEN_FUSE_MLP"),
@@ -1578,8 +1653,15 @@ impl EmitConfig {
     /// The default stands aside for the two-shot seam knobs it replaces, so an explicit
     /// `PLOW_GLM_XR_RES` / `PLOW_GLM_XR_BAND` emit keeps working without naming this one.
     pub fn glm_seq_par(&self) -> bool {
+        // `!token_batch_tp` mirrors GLM_SEQ_PAR_DEFAULT in knob_spec.rs. Without it the registry
+        // record and the emitter disagree, and the production recipe (token_batch_tp = TRUE)
+        // emits the pair `token_batch_tp_excludes_seq_par` refuses at load — the combination
+        // measured at retrieval 9/18 base, 0/21 tail in review log #63.
         self.glm_seq_par.unwrap_or(
-            self.glm_production_defaults && !self.glm_xr_res && self.glm_xr_band.unwrap_or(1) <= 1,
+            self.glm_production_defaults
+                && !self.token_batch_tp
+                && !self.glm_xr_res
+                && self.glm_xr_band.unwrap_or(1) <= 1,
         )
     }
 
@@ -1595,6 +1677,51 @@ impl EmitConfig {
     /// produced before the arm existed.
     pub fn glm_rowsplit_attn(&self) -> bool {
         self.glm_rowsplit_attn.unwrap_or(false)
+    }
+
+    /// OFF by default, like [`Self::glm_rowsplit_attn`].
+    pub fn glm_rowband_attn(&self) -> bool {
+        self.glm_rowband_attn.unwrap_or(false)
+    }
+
+    /// The row-split sibling's arm, or `None` when neither knob is on. Checkpoint K refuses
+    /// both (`rowband_attn_excludes_rowsplit_attn`); this is the backstop.
+    pub fn glm_rowsplit_arm(&self) -> Option<packet::devbuild::RowSplitArm> {
+        use packet::devbuild::RowSplitArm;
+        match (self.glm_rowsplit_attn(), self.glm_rowband_attn()) {
+            (true, true) => panic!(
+                "PLOW_GLM_ROWSPLIT_ATTN and PLOW_GLM_ROWBAND_ATTN are two arms of one row-split sibling; set one"
+            ),
+            (true, false) => Some(RowSplitArm::AllToAll),
+            (false, true) => Some(RowSplitArm::Replicated),
+            (false, false) => None,
+        }
+    }
+
+    /// This emit's KV row layout over `tp` ranks. Unset resolves to the replicated layout, whose
+    /// every map is the identity — so a caller threads this through unconditionally and the
+    /// non-DCP packet does not change by a byte.
+    ///
+    /// Panics on an inadmissible layout rather than silently rounding: a wrong KV stride is a
+    /// silently wrong token with no host-side signal, exactly the failure mode
+    /// `crates/plowrt/src/asset/shard.rs` exists to avoid.
+    pub fn dcp_layout(&self, tp: u32) -> packet::dcp::DcpLayout {
+        use packet::dcp::{DcpLayout, DCP_PAGE_ROWS_DEFAULT};
+        let tp = tp.max(1);
+        let Some(degree) = self.dcp.filter(|&d| d > 1) else {
+            return DcpLayout::new(tp, 1, self.dcp_page.unwrap_or(DCP_PAGE_ROWS_DEFAULT));
+        };
+        let layout = DcpLayout::new(tp, degree, self.dcp_page.unwrap_or(DCP_PAGE_ROWS_DEFAULT));
+        if let Err(e) = layout.validate(None) {
+            panic!("--dcp {degree} with --tp {tp}: {e}");
+        }
+        // The owner gather (op_collective.h) addresses shards with shifts and a group base of
+        // `rank & !(degree - 1)`, and the GLM MLA emitter is the only lowering (ops 181-183).
+        assert!(
+            degree.is_power_of_two(),
+            "--dcp {degree}: the DCP owner gather needs a power-of-two degree"
+        );
+        layout
     }
 
     /// The `(clap id, still unset, resolved value)` triples [`super::apply_production_defaults`]
@@ -2004,6 +2131,21 @@ mod tests {
             .unwrap()
             .emit
             .prefill_cublaslt);
+    }
+
+    #[test]
+    fn gemma_gemm_lt_is_explicit_and_default_off() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMMA_GEMM_LT", "0")]);
+        assert!(!EmitConfig::from_env().gemma_gemm_lt);
+        assert!(!TestArgs::try_parse_from(["test"])
+            .unwrap()
+            .emit
+            .gemma_gemm_lt);
+        assert!(TestArgs::try_parse_from(["test", "--emit-gemma-gemm-lt"])
+            .unwrap()
+            .emit
+            .gemma_gemm_lt);
     }
 
     #[test]

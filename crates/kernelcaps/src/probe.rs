@@ -104,10 +104,29 @@ pub struct ProbeTarget {
     pub dispatch_fn: String,
 }
 
+/// A bare compiler name is resolved on the INHERITED path before the child's environment is
+/// cleared. The hermetic PATH in `preprocess` predates the flake shipping ROCm from the nix
+/// store, where `hipcc` is on none of those directories; a probe that cannot find its compiler
+/// reports every AMD emit as unmeasured (tier `portable`) with no stale record in sight.
+/// Unresolved names are passed through, so the hermetic lookup behaves as before.
+fn resolve_on_inherited_path(program: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(program);
+    if p.components().count() > 1 {
+        return p.to_path_buf();
+    }
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(program))
+                .find(|candidate| candidate.is_file())
+        })
+        .unwrap_or_else(|| p.to_path_buf())
+}
+
 impl ProbeTarget {
     /// Run the preprocessor and return its output.
     pub fn preprocess(&self) -> Result<String, ProbeError> {
-        let mut cmd = Command::new(&self.compiler);
+        let mut cmd = Command::new(resolve_on_inherited_path(&self.compiler));
         // A clean environment: under `nix develop`, CPATH points nvcc's host
         // pass at headers that conflict with the CUDA ones. The build scripts
         // use `env -i` for the same reason.
@@ -115,6 +134,10 @@ impl ProbeTarget {
             .env("PATH", "/usr/local/cuda/bin:/opt/rocm/bin:/usr/bin:/bin")
             .arg("-E")
             .arg(&self.arch_flag);
+        // The flake's hipcc finds its bitcode through this and nothing else.
+        if let Some(v) = std::env::var_os("HIP_DEVICE_LIB_PATH") {
+            cmd.env("HIP_DEVICE_LIB_PATH", v);
+        }
         for i in &self.includes {
             cmd.arg("-I").arg(i);
         }

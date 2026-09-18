@@ -317,41 +317,47 @@ V_K(v_gemv_qkv) {
  * GEMV -> bf16 -> SOFTCAP -> bf16 -> ARGMAX partial; 16 columns per epilogue. */
 V_K(v_gemv_argmax) {
     (void)ctx;
+    const uint32_t M = in->i[0] ? in->i[0] : 1u;
     const uint32_t N = in->i[1], K = in->i[2];
-    plow_bf16* C = PLOW_CPU_TEN(in, T, 0);
-    const plow_bf16* x = (const plow_bf16*)PLOW_CPU_TEN(in, T, 1) + (size_t)in->i[4] * K;
+    plow_bf16* C_base = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* x_base = (const plow_bf16*)PLOW_CPU_TEN(in, T, 1) + (size_t)in->i[4] * K;
     const plow_bf16* W = PLOW_CPU_TEN(in, T, 2);
-    uint64_t* part = PLOW_CPU_TEN(in, T, 3);
+    uint64_t* part_base = PLOW_CPU_TEN(in, T, 3);
     const float cap = in->fj[0].f;
     const __m512 vcap = _mm512_set1_ps(cap), vinv = _mm512_set1_ps(cap > 0.0f ? 1.0f / cap : 0.0f);
     const __m512i lane = _mm512_set_epi32(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
-    __m512i bk = _mm512_setzero_si512(), bi = _mm512_setzero_si512();
-    float acc[16];
-    uint32_t n = n0;
-    for (; n + 16 <= n1; n += 16) {
-        for (uint32_t r = 0; r < 16; r += 4) dot_m1_r4(W + (size_t)(n + r) * K, K, x, K, acc + r);
-        __m512 lg = v_round_bf16(_mm512_loadu_ps(acc));
-        if (cap > 0.0f) lg = _mm512_mul_ps(vcap, v_tanh(_mm512_mul_ps(lg, vinv)));
-        const __m256bh sc = _mm512_cvtneps_pbh(lg);
-        _mm256_storeu_si256((__m256i*)(C + n), (__m256i)sc);
-        const __m512i k = v_amax_key(_mm512_cvtepu16_epi32((__m256i)sc));
-        const __mmask16 gt = _mm512_cmpgt_epu32_mask(k, bk);
-        bk = _mm512_mask_mov_epi32(bk, gt, k);
-        bi = _mm512_mask_mov_epi32(bi, gt, _mm512_add_epi32(_mm512_set1_epi32((int)n), lane));
+    for (uint32_t m = 0; m < M; m++) {
+        plow_bf16* C = C_base + (size_t)m * N;
+        const plow_bf16* x = x_base + (size_t)m * K;
+        uint64_t* part = part_base + (size_t)m * nblk;
+        __m512i bk = _mm512_setzero_si512(), bi = _mm512_setzero_si512();
+        float acc[16];
+        uint32_t n = n0;
+        for (; n + 16 <= n1; n += 16) {
+            for (uint32_t r = 0; r < 16; r += 4) dot_m1_r4(W + (size_t)(n + r) * K, K, x, K, acc + r);
+            __m512 lg = v_round_bf16(_mm512_loadu_ps(acc));
+            if (cap > 0.0f) lg = _mm512_mul_ps(vcap, v_tanh(_mm512_mul_ps(lg, vinv)));
+            const __m256bh sc = _mm512_cvtneps_pbh(lg);
+            _mm256_storeu_si256((__m256i*)(C + n), (__m256i)sc);
+            const __m512i k = v_amax_key(_mm512_cvtepu16_epi32((__m256i)sc));
+            const __mmask16 gt = _mm512_cmpgt_epu32_mask(k, bk);
+            bk = _mm512_mask_mov_epi32(bk, gt, k);
+            bi = _mm512_mask_mov_epi32(bi, gt, _mm512_add_epi32(_mm512_set1_epi32((int)n), lane));
+        }
+        uint64_t best = v_amax_fold(bk, bi, 0);
+        for (; n < n1; n++) {
+            float o;
+            gemv_rows(W + (size_t)n * K, K, x, K, K, 1, 1, &o);
+            const plow_bf16 lg = plow_f2bf(o);
+            const plow_bf16 sc = cap > 0.0f ? plow_f2bf(cap * tanhf(plow_bf2f(lg) / cap)) : lg;
+            C[n] = sc;
+            const uint64_t key = g_amax_pack(sc, n);
+            best = key > best ? key : best;
+        }
+        part[slice] = best;
     }
-    uint64_t best = v_amax_fold(bk, bi, 0);
-    for (; n < n1; n++) {
-        float o;
-        gemv_rows(W + (size_t)n * K, K, x, K, K, 1, 1, &o);
-        const plow_bf16 lg = plow_f2bf(o);
-        const plow_bf16 sc = cap > 0.0f ? plow_f2bf(cap * tanhf(plow_bf2f(lg) / cap)) : lg;
-        C[n] = sc;
-        const uint64_t key = g_amax_pack(sc, n);
-        best = key > best ? key : best;
-    }
-    part[slice] = best;
 }
 
 /* Registrar lives in this translation unit (not its own file) so that any reference to a
