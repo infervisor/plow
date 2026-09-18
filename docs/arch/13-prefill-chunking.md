@@ -266,6 +266,7 @@ tuning it is work on a path ragged-M deletes.
 - [05 — Counter Coordination](05-counter-system.md) — the gate protocol §4.1 relies on
 - [07 — Cost Model](07-cost-model.md) — where launch pricing belongs
 - [14 — AMD Arch Divergence](14-amd-arch-divergence.md) — why a duplicated constant is the recurring defect here
+- [22 — KV Cache](22-kv-cache.md) — what the chunk buys and costs on the other side: the sliding ring it sizes, and the per-request cap that can shrink the ring without shrinking the ladder
 
 **Measurement record** (numbers, arms, spreads, and the corrections they force):
 
