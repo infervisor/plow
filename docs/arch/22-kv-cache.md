@@ -270,13 +270,30 @@ different directions:
    so dropping it disables them.
 
 That third constraint is why the 32-slot packet above runs with both attention
-roles off. **There is a lever that has not been pulled:** `kv_ring` is sized by
-`request_chunk`, and `PLOW_MAX_REQUEST_CHUNK` lowers that independently of
-`PLOW_MAX_CHUNK` while the packed planner enforces the same cap per request
-(`crates/plow-asset/src/packed_prefill.rs:384`). A packet with aggregate chunk
-4096 and request chunk 1024 should keep the 4096-row rungs and their roles while
-ringing the sliding layers at 2048 rows, i.e. 0.75 GiB per slot instead of
-2.625 GiB. Derived from the code, not yet measured.
+roles off — and it is avoidable. `kv_ring` is sized by `request_chunk`, and
+`PLOW_MAX_REQUEST_CHUNK` lowers that independently of `PLOW_MAX_CHUNK`, while
+the packed planner enforces the same cap per request
+(`crates/plow-asset/src/packed_prefill.rs:384`). The two knobs therefore
+separate the ladder from the ring.
+
+**Verified at emit.** A packet emitted with `PLOW_MAX_CHUNK=4096` and
+`PLOW_MAX_REQUEST_CHUNK=1024` declares, in its own `HeadNormRope` operands:
+
+| Layer | `j0` ring | `j1` mask | vs chunk 4096 |
+|---|---|---|---|
+| global `hd` 512 | 8192 | `0xFFFFFFFF` | unchanged, it is `ctx` |
+| sliding `hd` 256 | **2048** | **2047** | 8192 → 2048 |
+
+with `prefill_buckets` still `[128, 512, 1024, 2048, 4096]`, so the M4096 rungs
+the attention roles require survive, and `max_request_rows = 1024` recorded for
+masked padding. Per slot that is 640 MiB sliding plus 128 MiB global = **0.75
+GiB**, so 32 slots need **24 GiB** of KV rather than the 84 GiB a chunk-4096
+ring would demand — with both roles eligible, which the shipped 32-slot packet
+had to give up.
+
+What this does not yet show is the serving cost: a 1024-row request cap makes
+long prompts arrive as more, smaller packed chunks. Emit-verified, not yet
+benchmarked.
 
 ---
 
