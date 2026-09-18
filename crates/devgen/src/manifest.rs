@@ -167,7 +167,9 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
     for (pi, p) in m.progs.iter().enumerate() {
         let encoded_t = m.prog_t.get(pi).copied().unwrap_or(0);
         let dense_exact = packet::devbuild::is_dense_exact_program(encoded_t);
-        let kind = if pi >= dec_lo || dense_exact {
+        let kind = if packet::devbuild::is_modular_block_program(encoded_t) {
+            "modular"
+        } else if pi >= dec_lo || dense_exact {
             "decode"
         } else if packet::devbuild::is_token_batch_program(encoded_t) {
             "token_batch"
@@ -239,7 +241,9 @@ fn kernel_cases(m: &Model) -> Value {
             let encoded = m.prog_t.get(index).copied().unwrap_or(0);
             json!({
                 "program": index,
-                "kind": if index >= decode || packet::devbuild::is_dense_exact_program(encoded) {
+                "kind": if packet::devbuild::is_modular_block_program(encoded) {
+                    "modular"
+                } else if index >= decode || packet::devbuild::is_dense_exact_program(encoded) {
                     "decode"
                 } else if packet::devbuild::is_token_batch_program(encoded) {
                     "token_batch"
@@ -450,6 +454,7 @@ fn shapes(m: &Model) -> Shapes {
         let encoded = m.prog_t.get(pi).copied().unwrap_or(0);
         let decode = pi >= dec_lo || packet::devbuild::is_dense_exact_program(encoded);
         if !decode
+            && !packet::devbuild::is_modular_block_program(encoded)
             && !packet::devbuild::is_packed_prefill_program(encoded)
             && !packet::devbuild::is_token_batch_program(encoded)
             && !packet::devbuild::is_rowsplit_prefill_program(encoded)
@@ -1560,6 +1565,16 @@ pub fn build_for_packet(
             manifest["pairing"]["hash"] = json!(format!("0x{:016x}", pairing_hash(&manifest)));
         }
     }
+    let modular_section = sections.iter().find(|section| {
+        section.kind == packet::devbuild::SECT_METADATA
+            && section.name == plow_asset::MODULAR_MANIFEST_SECTION
+    });
+    if let Some(section) = modular_section {
+        if let Ok(mod_manifest) = serde_json::from_slice::<serde_json::Value>(&section.data) {
+            manifest["modular_pipeline"] = mod_manifest;
+            manifest["pairing"]["hash"] = json!(format!("0x{:016x}", pairing_hash(&manifest)));
+        }
+    }
     manifest
 }
 
@@ -1600,16 +1615,22 @@ fn build_with_packed_prefill(
 /// `verified: false` NEVER means "rejected": a rejection panics before the blob
 /// is written, so no manifest can describe a rejected program.
 fn lean_block(lean: &crate::LeanReport) -> Value {
-    json!({
+    let mut v = json!({
         "verified": lean.verified,
         "oracle": lean.oracle,
+        "rewrite_verified": lean.rewrite_verified,
         "reason": lean.reason,
         "note": "`verified` = a Lean ordering certificate (plow_verify checkpoint D) was \
-                 obtained for EVERY program in this blob; `oracle` = the Lean decode \
+                 obtained for EVERY program in this blob; `rewrite_verified` = egglog rewrite \
+                 rule soundness (checkpoint A) verified; `oracle` = the Lean decode \
                  lower-bound query ran. false means NOT CHECKED (see `reason`), never \
                  `checked and rejected` — a rejection aborts emission, so a blob with a \
                  rejected program never reaches disk and has no manifest.",
-    })
+    });
+    if let Some(ref modular) = lean.modular_summary {
+        v["modular_summary"] = serde_json::to_value(modular).unwrap_or(Value::Null);
+    }
+    v
 }
 
 fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) -> Value {
@@ -2601,9 +2622,11 @@ pub fn config_header(manifest: &Value) -> String {
             out.push_str(&format!(
                 "#ifndef GV_MM_MAX\n#define GV_MM_MAX {v}\n#endif\n"
             ));
-            // sm_90a: decode rungs walk the weights on the tensor cores
-            // (op_gemv_mma.cuh). All MM>=1 are faster than dot8 (experiments/gemv_mma_batch_h100.cu).
-            if v >= 1 && manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
+            // sm_90a: BATCH>=2 decode rungs walk the weights on the tensor cores
+            // (op_gemv_mma.cuh). The dot8 walk is compute-bound above MM=1 — 100–366 GB/s at
+            // M=16 vs 1.4–2.6 TB/s (experiments/gemv_mma_batch_h100.cu) — and the B=1 rung is
+            // untouched, so a packet whose ladder reaches 2 turns it on for its objects.
+            if v >= 2 && manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
                 out.push_str("#ifndef PLOW_NV_GEMV_MMA\n#define PLOW_NV_GEMV_MMA 1\n#endif\n");
             }
         }
@@ -4300,6 +4323,7 @@ mod tests {
             verified: true,
             oracle: true,
             reason: None,
+            ..Default::default()
         };
         let man = super::build(&model(), "gfx950", &ok);
         assert_eq!(man["lean"]["verified"], json!(true));
@@ -4316,6 +4340,7 @@ mod tests {
             verified: false,
             oracle: true,
             reason: Some("ordering certificate disabled on the command line".into()),
+            ..Default::default()
         };
         let man = super::build(&model(), "gfx950", &oracle_only);
         assert_eq!(man["lean"]["verified"], json!(false));
@@ -4340,6 +4365,7 @@ mod tests {
                 verified: true,
                 oracle: true,
                 reason: None,
+                ..Default::default()
             },
         );
         assert_ne!(a["lean"], b["lean"], "the test would be vacuous otherwise");

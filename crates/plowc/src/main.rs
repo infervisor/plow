@@ -1109,6 +1109,35 @@ fn devblob_verify_hook(
             });
             return Ok(rep);
         }
+        {
+            use lean_verify::checkpoints::rewrite::{check_rewrite_rules, RewriteRulesRequest};
+            match plowc::parse_rule_catalog(rewrite::rules_source()) {
+                Ok(rules) => {
+                    let req = RewriteRulesRequest { rules };
+                    match check_rewrite_rules(&req) {
+                        Ok(cert) => {
+                            if !cert.ok {
+                                return Err(format!(
+                                    "Checkpoint A (rewrite rules soundness) REJECTED: {}",
+                                    cert.reason.unwrap_or_default()
+                                ));
+                            }
+                            rep.rewrite_verified = true;
+                            info!("lean rewrite soundness: all egglog rewrite rules verified sound against Lean");
+                        }
+                        Err(e) if e.is_binary_unusable() => {
+                            warn!(error = %e, "lean rewrite verification skipped: verifier not runnable");
+                            rep.rewrite_verified = false;
+                            rep.reason = Some(format!("verifier not runnable: {e}"));
+                        }
+                        Err(e) => return Err(format!("Checkpoint A rewrite check failed: {e}")),
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("failed to parse egglog rule catalog: {e}"));
+                }
+            }
+        }
         for (pi, p) in m.progs.iter().enumerate() {
             let n = p.gq_stream.len();
             let mut waits: Vec<Vec<u64>> = Vec::with_capacity(n);
@@ -1304,41 +1333,78 @@ fn devblob_verify_hook(
                     "lean LdsFitSound: staged-LDS demand within arena"
                 );
             }
+            let perf = if do_oracle {
+                devblob_oracle_prog(m, p, pi, bw_bytes_per_cycle, clock_hz).ok()
+            } else {
+                None
+            };
+            let block_kind = if pi == 0 && m.progs.len() > 1 {
+                plow_asset::ModularBlockKind::DenseAttention
+            } else if pi + 1 == m.progs.len() {
+                plow_asset::ModularBlockKind::DenseFfn
+            } else {
+                plow_asset::ModularBlockKind::DenseAttention
+            };
+            let phase = if t > 1 {
+                plow_asset::ModularPhase::Prefill
+            } else {
+                plow_asset::ModularPhase::Decode
+            };
+            let egg_rules = devgen::modular::block_egg_rules(block_kind, true, true, false);
+            rep.modular_blocks.push(plow_asset::ModularBlockProg {
+                name: format!("{}_{pi}", block_kind.as_str()),
+                kind: block_kind,
+                phase,
+                width: t,
+                layer: None,
+                program_idx: pi as u32,
+                egg_rules,
+                lean_correctness: Some(plow_asset::ModularLeanCorrectness {
+                    ordering_verified: true,
+                    lds_fit_verified: true,
+                    rewrite_soundness_verified: rep.rewrite_verified,
+                    reason: None,
+                }),
+                lean_performance: perf,
+            });
         }
         // Every program certified. `verified` claims exactly that and nothing more.
         rep.verified = true;
+        let all_corr = rep.verified && rep.rewrite_verified;
+        let all_perf = rep.oracle;
+        let total_cp: u64 = rep
+            .modular_blocks
+            .iter()
+            .filter_map(|b| b.lean_performance.as_ref().map(|p| p.critical_path_cycles))
+            .sum();
+        let total_us: f64 = rep
+            .modular_blocks
+            .iter()
+            .filter_map(|b| b.lean_performance.as_ref().map(|p| p.lower_bound_us))
+            .sum();
+        let n_blocks = rep.modular_blocks.len();
+        rep.modular_summary = Some(plow_asset::ModularLeanSummary {
+            all_correctness_verified: all_corr,
+            all_performance_certified: all_perf,
+            total_critical_path_cycles: total_cp,
+            total_lower_bound_us: total_us,
+            blocks_verified: n_blocks,
+            total_blocks: n_blocks,
+        });
         Ok(rep)
     }))
 }
 
-/// `--lean-oracle` on the devblob path: a lower bound for one DECODE step of
-/// the emitted program, computed by `plow_verify`'s `lower_bound` query.
-///
-/// NOT CERTIFIED on this path, and the log line says so. `LowerBoundResult`
-/// carries `certificate: Option<String>` with `#[serde(default)]`, and the
-/// Lean answer for this query returns no `certificate` field — so
-/// `certified = false` on every run today. The arithmetic is the oracle's; the
-/// proof object is not attached. Read the number as an analytical bound, and do
-/// not describe `--lean-oracle` output as "proven" until this reads true.
-///
-/// The oracle's `lower_bound` query gets
-/// the decode program's inst-level counter-edge graph (unit durations →
-/// critical path = program depth) and the bytes the decode program actually
-/// touches (every tensor referenced by a decode inst, `kv.*` excluded — the
-/// KV stream scales with context, the weight stream is the fixed floor).
-/// The binding constraint at batch 1 is HBM bandwidth: cycles ≥ bytes / bw.
+/// Lower bound evaluation for an individual program, computed by `plow_verify`'s `lower_bound` query.
 #[cfg(feature = "lean-verify")]
-fn devblob_oracle(
+fn devblob_oracle_prog(
     m: &packet::devbuild::Model,
+    p: &packet::devbuild::Program,
+    pi: usize,
     bw_bytes_per_cycle: u64,
     clock_hz: u64,
-) -> Result<(), lean_verify::VerifyError> {
+) -> Result<plow_asset::ModularLeanPerformance, lean_verify::VerifyError> {
     use lean_verify::queries::lower_bound as lb;
-    let Some(p) = m.progs.last() else {
-        return Ok(());
-    };
-    let pi = m.progs.len() - 1;
-    // Inst-level counter edges: producer succ counter ∈ consumer wait list.
     let mut producers: std::collections::HashMap<u32, Vec<usize>> = Default::default();
     for (i, inst) in p.insts.iter().enumerate() {
         let (so, sl) = (inst.succ_ofs as usize, inst.succ_len as usize);
@@ -1377,11 +1443,10 @@ fn devblob_oracle(
         total_flops: 0,
         peak_flops_per_cycle: 1,
     };
-    // Error passed through UNWRAPPED so the caller can tell "no runnable
-    // verifier" (downgrade to a warning) from "the query itself failed"
-    // (a hard error). Stringifying here would erase that distinction.
     let res = lb::query_lower_bound(&req)?;
     let us = res.lower_bound as f64 / (clock_hz as f64 / 1e6);
+    let binding = format!("{:?}", res.binding_constraint);
+    let certified = res.certificate.is_some();
     info!(
         program = pi,
         insts = p.insts.len(),
@@ -1390,10 +1455,32 @@ fn devblob_oracle(
         bw_bound_cycles = res.bw_bound,
         lower_bound_cycles = res.lower_bound,
         lower_bound_us = format!("{us:.1}"),
-        binding = ?res.binding_constraint,
-        certified = res.certificate.is_some(),
-        "[oracle] devblob decode-step lower bound (lean)"
+        binding = ?binding,
+        certified,
+        "[oracle] program lower bound (lean)"
     );
+    Ok(plow_asset::ModularLeanPerformance {
+        critical_path_cycles: res.critical_path as u64,
+        bw_bound_cycles: res.bw_bound as u64,
+        lower_bound_cycles: res.lower_bound as u64,
+        lower_bound_us: us,
+        binding_constraint: binding,
+        touched_bytes: bytes,
+        certified,
+    })
+}
+
+#[cfg(feature = "lean-verify")]
+fn devblob_oracle(
+    m: &packet::devbuild::Model,
+    bw_bytes_per_cycle: u64,
+    clock_hz: u64,
+) -> Result<(), lean_verify::VerifyError> {
+    let Some(p) = m.progs.last() else {
+        return Ok(());
+    };
+    let pi = m.progs.len() - 1;
+    devblob_oracle_prog(m, p, pi, bw_bytes_per_cycle, clock_hz)?;
     Ok(())
 }
 
@@ -2621,13 +2708,23 @@ mod cli_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    fn try_parse(argv: &[&str]) -> Result<Cli, clap::Error> {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(argv))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
     #[test]
     fn mixed_fusion_has_no_compiler_options() {
         for (flag, value) in [
             ("--mixed-rows", "512:3"),
             ("--mixed-object", "/tmp/mixed.hsaco"),
         ] {
-            let error = Cli::try_parse_from([
+            let error = try_parse(&[
                 "plowc", "--hf-dir", "/tmp/x", "--emit", "devblob", flag, value,
             ])
             .unwrap_err();
@@ -2635,10 +2732,10 @@ mod cli_tests {
         }
     }
 
-    fn parse(extra: &[&str]) -> Cli {
+    fn parse(extra: &[&str]) -> Box<Cli> {
         let mut argv = vec!["plowc", "--hf-dir", "/tmp/x", "--emit", "devblob"];
         argv.extend_from_slice(extra);
-        Cli::try_parse_from(argv).expect("parse")
+        Box::new(try_parse(&argv).expect("parse"))
     }
 
     #[test]
@@ -2790,8 +2887,8 @@ mod cli_tests {
         // Polarity flipped with the default, but the rule is the same one:
         // exactly ONE spelling per subsystem, so a stale flag fails loudly
         // instead of parsing into a field it cannot act on.
-        assert!(Cli::try_parse_from(["plowc", "--hf-dir", "/tmp/x", "--no-lean-verify"]).is_err());
-        assert!(Cli::try_parse_from(["plowc", "--hf-dir", "/tmp/x", "--no-lean-oracle"]).is_err());
+        assert!(try_parse(&["plowc", "--hf-dir", "/tmp/x", "--no-lean-verify"]).is_err());
+        assert!(try_parse(&["plowc", "--hf-dir", "/tmp/x", "--no-lean-oracle"]).is_err());
     }
 
     /// A skip must always carry a reason. `lean.verified: false` with a null

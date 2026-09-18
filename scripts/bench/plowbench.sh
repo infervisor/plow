@@ -84,7 +84,11 @@ pb_detect_arch() {
     fi
     local obj="${3:-}"
     if [ -n "$obj" ] && [ -d "$obj" ]; then
-        if compgen -G "$obj/*sm90*.cubin" >/dev/null 2>&1 || compgen -G "$obj/*sm_90*.cubin" >/dev/null 2>&1; then
+        if compgen -G "$obj/*gfx942*" >/dev/null 2>&1; then
+            echo "gfx942"; return 0
+        elif compgen -G "$obj/*gfx950*" >/dev/null 2>&1; then
+            echo "gfx950"; return 0
+        elif compgen -G "$obj/*sm90*.cubin" >/dev/null 2>&1 || compgen -G "$obj/*sm_90*.cubin" >/dev/null 2>&1; then
             echo "sm_90a"; return 0
         elif compgen -G "$obj/*sm120*.cubin" >/dev/null 2>&1 || compgen -G "$obj/*sm_120*.cubin" >/dev/null 2>&1; then
             echo "sm_120"; return 0
@@ -92,10 +96,6 @@ pb_detect_arch() {
             echo "sm_89"; return 0
         elif compgen -G "$obj/*.cubin" >/dev/null 2>&1; then
             echo "sm_90a"; return 0
-        elif compgen -G "$obj/*gfx942*" >/dev/null 2>&1; then
-            echo "gfx942"; return 0
-        elif compgen -G "$obj/*gfx950*" >/dev/null 2>&1; then
-            echo "gfx950"; return 0
         fi
     fi
     # Hardware device probe
@@ -120,9 +120,10 @@ pb_detect_arch() {
     fi
     if command -v rocm-smi >/dev/null 2>&1 && ! command -v nvidia-smi >/dev/null 2>&1; then
         echo "gfx942"
-    else
-        echo "sm_90a"
+        return 0
     fi
+    echo "ERROR: could not detect target architecture from hint, assets, objdir, or hardware probe" >&2
+    return 1
 }
 
 pb_is_nvidia() {
@@ -142,13 +143,12 @@ pb_is_amd() {
 }
 
 pb_require_nix() {
-    if [ -z "${ROCM_PATH:-}" ] && [ -z "${CUDA_PATH:-}" ]; then
-        pb_bad "not inside 'nix develop' (neither ROCM_PATH nor CUDA_PATH set) — build and serve tasks need it"
+    if [ -z "${ROCM_PATH:-}" ]; then
+        pb_bad "not inside 'nix develop' (ROCM_PATH unset) — build and serve tasks need it"
         return 1
     fi
-    local info=""
-    [ -n "${ROCM_PATH:-}" ] && info="ROCM_PATH=$ROCM_PATH "
-    [ -n "${CUDA_PATH:-}" ] && info="${info}CUDA_PATH=$CUDA_PATH"
+    local info="ROCM_PATH=$ROCM_PATH"
+    [ -n "${CUDA_PATH:-}" ] && info="$info CUDA_PATH=$CUDA_PATH"
     pb_ok "nix dev shell ($info)"
 }
 
@@ -285,15 +285,15 @@ pb_check_objects() {
 
 pb_check_vllm() {
     local arch="${1:-}"
-    [ -n "$arch" ] || arch=$(pb_detect_arch)
+    [ -n "$arch" ] || arch=$(pb_detect_arch) || return 1
     local v="${PB_VLLM:-}"
     if [ -z "$v" ]; then
-        if [ -x "/opt/pytorch/bin/vllm" ]; then
+        if [ -x "/app/plow/build-gemma31/vllm-python" ]; then
+            v="/app/plow/build-gemma31/vllm-python"
+        elif [ -x "/opt/pytorch/bin/vllm" ]; then
             v="/opt/pytorch/bin/vllm"
         elif command -v vllm >/dev/null 2>&1; then
             v="$(command -v vllm)"
-        elif [ -x "/app/plow/build-gemma31/vllm-python" ]; then
-            v="/app/plow/build-gemma31/vllm-python"
         elif [ -n "${VLLM_VENV:-}" ] && [ -x "$VLLM_VENV/bin/vllm" ]; then
             v="$VLLM_VENV/bin/vllm"
         fi

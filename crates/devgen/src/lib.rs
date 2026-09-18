@@ -78,6 +78,7 @@ pub mod dispatch_audit;
 pub mod conformer;
 mod gemv_decode_role;
 pub mod manifest;
+pub mod modular;
 mod mxfp4_moe_role;
 pub mod pipeline;
 mod projection_rewrite;
@@ -6818,18 +6819,24 @@ pub(crate) fn whole_graph_parallel_linear2(n0: u32, n1_local: u32, k: u32) -> bo
 /// meaningless for a long time before anyone noticed. A warning line in a build
 /// log is not a defence: the log is gone by the time someone asks "was this
 /// blob verified?". The blob's own manifest has to answer.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LeanReport {
     /// A Lean ordering certificate was obtained for EVERY program in the blob.
     pub verified: bool,
     /// The Lean lower-bound oracle ran and reported.
     pub oracle: bool,
-    /// Why `verified`/`oracle` are false. `None` only when both are true.
+    /// Checkpoint A: rewrite rule soundness verified in Lean.
+    pub rewrite_verified: bool,
+    /// Why `verified`/`oracle`/`rewrite_verified` are false. `None` only when all are true.
     ///
     /// Never `Some` because verification FAILED — a rejection aborts emission,
     /// so no blob with a rejected program is ever written and no manifest for
     /// one can exist.
     pub reason: Option<String>,
+    /// Modular block lean summary if modular blocks are present.
+    pub modular_summary: Option<plow_asset::ModularLeanSummary>,
+    /// Modular blocks detailed certificates if present.
+    pub modular_blocks: Vec<plow_asset::ModularBlockProg>,
 }
 
 impl LeanReport {
@@ -6838,7 +6845,10 @@ impl LeanReport {
         LeanReport {
             verified: false,
             oracle: false,
+            rewrite_verified: false,
             reason: Some(reason.into()),
+            modular_summary: None,
+            modular_blocks: Vec::new(),
         }
     }
 }
@@ -9296,8 +9306,12 @@ fn emit_dense_gqa(
     if ecfg.prefill_cublaslt {
         let selected = dense_cublaslt::apply_prefill(&mut m, &mut sections, &arch)
             .expect("dense prefill projection segments");
-        assert!(selected > 0, "no eligible dense prefill projections");
-        eprintln!("  cuBLASLt prefill: {selected} projection segments");
+        if emit_config::explicitly_set("prefill_cublaslt") {
+            assert!(selected > 0, "no eligible dense prefill projections");
+        }
+        if selected > 0 {
+            eprintln!("  cuBLASLt prefill: {selected} projection segments");
+        }
         // Packetize the exact-shape algorithm selection from the tune store when one exists;
         // a host with the GPU refreshes it through the campaign probe, and the runtime
         // re-validates every entry with AlgoCheck before use.
@@ -9375,6 +9389,54 @@ fn emit_dense_gqa(
         };
         sections.push(write_block_descriptor(&out, &desc));
         eprintln!("  block mode: layers {block:?}");
+    }
+    if block_mode || ecfg.block_packets || ecfg.pf_modular {
+        let is_sandwich = c.arch.is_gemma();
+        let mut modular_progs = Vec::new();
+        for (i, &t) in buckets.iter().enumerate() {
+            modular_progs.push(modular::create_modular_block_prog(
+                plow_asset::ModularBlockKind::DenseAttention,
+                plow_asset::ModularPhase::Prefill,
+                i as u32,
+                t,
+                None,
+                c.has_qk_norm,
+                is_sandwich,
+                false,
+            ));
+            modular_progs.push(modular::create_modular_block_prog(
+                plow_asset::ModularBlockKind::DenseFfn,
+                plow_asset::ModularPhase::Prefill,
+                i as u32,
+                t,
+                None,
+                false,
+                is_sandwich,
+                false,
+            ));
+        }
+        modular_progs.push(modular::create_modular_block_prog(
+            plow_asset::ModularBlockKind::DenseAttention,
+            plow_asset::ModularPhase::Decode,
+            buckets.len() as u32,
+            dbatch,
+            None,
+            c.has_qk_norm,
+            is_sandwich,
+            false,
+        ));
+        modular_progs.push(modular::create_modular_block_prog(
+            plow_asset::ModularBlockKind::DenseFfn,
+            plow_asset::ModularPhase::Decode,
+            buckets.len() as u32,
+            dbatch,
+            None,
+            false,
+            is_sandwich,
+            false,
+        ));
+        let manifest = modular::build_modular_manifest(c.layers, modular_progs, &buckets, &[dbatch]);
+        sections.push(modular::modular_pipeline_section(&manifest));
     }
     if let Some(ref path) = embed_cubin {
         sections.push(packet::devbuild::SectionData {
@@ -9576,6 +9638,7 @@ fn emit_dense_gqa(
         }
     }
     let lean = apply_verify_gate(&m, verify.as_ref());
+    modular::update_section_with_lean(&mut sections, &lean);
     let blob = if sections.is_empty() {
         m.to_blob()
     } else {

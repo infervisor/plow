@@ -6371,7 +6371,12 @@ impl AmdEngine {
         let ckpt = checkpoint?;
         let find = |name: &str| blob.tensors.iter().position(|t| t.name == name);
         let bytes_of = |name: &str| find(name).map(|i| blob.tensors[i].bytes);
-        let max_ctx = (bytes_of("in.pos")? / 4) as u32;
+        let packet_max_ctx = (bytes_of("in.pos")? / 4) as u32;
+        let max_ctx = crate::config::RuntimeConfig::get()
+            .rt_max_ctx
+            .map(|c| c as u32)
+            .unwrap_or(packet_max_ctx)
+            .min(packet_max_ctx);
         let batch = u32::try_from(batch).ok()?;
 
         let mut geo = match VmmGeometry::from_config(ckpt, max_ctx, batch) {
@@ -9658,7 +9663,11 @@ impl AmdEngine {
         let t_active = find("in.parked");
         let t_logits = find("act.logits");
         // The context bound is carried by in.pos, not by any prefill bucket.
-        let max_ctx = t_pos.map_or(0, |t| (blob.tensors[t].bytes / 4) as usize);
+        let packet_max_ctx = t_pos.map_or(0, |t| (blob.tensors[t].bytes / 4) as usize);
+        let max_ctx = crate::config::RuntimeConfig::get()
+            .rt_max_ctx
+            .unwrap_or(packet_max_ctx)
+            .min(packet_max_ctx);
 
         // --- per-program tables ---------------------------------------------
         let ctr_banks: u64 = if ctr_dbuf() { 2 } else { 1 };

@@ -823,8 +823,9 @@ impl Builder {
     /// T18: force this program to ONE segment regardless of `PLOW_UNISEG`. Set by devgen on
     /// SMALL prefill buckets (`PLOW_UNISEG_MAX_T`): a tail chunk of ~50 tokens pays ~480
     /// segment launches (~40 ms measured) for ~5 ms of work — one launch on the full fat
-    /// object wins outright. No-op if `deny_uniseg` was called (the AMD target reads `seg`).
+    /// object wins outright.
     pub fn force_uniseg(&mut self) {
+        self.uniseg_denied = false;
         self.uniseg_forced = true;
     }
 
@@ -2186,7 +2187,8 @@ impl Builder {
         // the segment boundary is spurious there and would otherwise force a segmented relaunch path.
         // `deny_uniseg` wins over the environment: a target that cannot express one segment must
         // not be given one because a variable said so. See that method for the failure it prevents.
-        let uniseg = !self.uniseg_denied && (self.uniseg_forced || knobs.uniseg);
+        // `force_uniseg` overrides both to enforce single-segment prefill.
+        let uniseg = self.uniseg_forced || (!self.uniseg_denied && knobs.uniseg);
         // Isolate MLA at every query rung: a small chunk can still have a long KV cache.
         // Class 26 separates small MLA from GEMM. The host selects four-wave split
         // or eight-wave unsplit objects from the instruction's validated layout.
@@ -2516,10 +2518,14 @@ impl Builder {
                 seg_of[i] = cur_seg;
                 continue;
             }
+            let is_flash = |op: u16| {
+                op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16
+            };
             if i > 0
                 && (wave_class(i) != wave_class(i - 1)
                     || self.ops[i].inst.op == DevOp::QwenGdnPrefill as u16
                     || self.ops[i - 1].inst.op == DevOp::QwenGdnPrefill as u16
+                    || (!uniseg && (is_flash(self.ops[i].inst.op) || is_flash(self.ops[i - 1].inst.op)))
                     || self.ops[i].isolated
                     || self.ops[i - 1].isolated
                     || self.ops[i].join != self.ops[i - 1].join)
@@ -3323,7 +3329,7 @@ pub fn is_dense_exact_program(t: u32) -> bool {
 }
 
 pub fn dense_exact_program_t(rows: u32) -> u32 {
-    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 28 bits");
+    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 26 bits");
     rows | DENSE_EXACT_PROG
 }
 
@@ -3344,7 +3350,7 @@ pub fn is_rowsplit_prefill_program(t: u32) -> bool {
 }
 
 pub fn rowsplit_prefill_program_t(rows: u32) -> u32 {
-    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 28 bits");
+    assert_eq!(rows & PROGRAM_ROLE_BITS, 0, "program row count exceeds 26 bits");
     rows | ROWSPLIT_PREFILL_PROG
 }
 
@@ -3352,7 +3358,7 @@ pub fn decode_rung_program_t(rows: u32) -> u32 {
     assert_eq!(
         rows & PROGRAM_ROLE_BITS,
         0,
-        "program row count exceeds 28 bits"
+        "program row count exceeds 26 bits"
     );
     rows | DECODE_RUNG_PROG
 }
@@ -3361,7 +3367,7 @@ pub fn token_batch_program_t(rows: u32) -> u32 {
     assert_eq!(
         rows & PROGRAM_ROLE_BITS,
         0,
-        "program row count exceeds 28 bits"
+        "program row count exceeds 26 bits"
     );
     rows | TOKEN_BATCH_PROG
 }
@@ -3370,7 +3376,7 @@ pub fn packed_prefill_program_t(rows: u32) -> u32 {
     assert_eq!(
         rows & PROGRAM_ROLE_BITS,
         0,
-        "program row count exceeds 28 bits"
+        "program row count exceeds 26 bits"
     );
     rows | PACKED_PREFILL_PROG
 }
@@ -6572,6 +6578,22 @@ mod v6_tests {
             derive_roles(&table, RoleSource::Stated, |_| 0)[side..lo],
             roles[side..lo]
         );
+    }
+
+    /// A modular block word placed before the decode ladder carries bit 26, which exceeds
+    /// DECODE_RUNG_MAX (256); the backward scan in decode_rung_lo terminates at the ladder boundary.
+    #[test]
+    fn modular_block_programs_keep_the_decode_boundary() {
+        let pf = [128u32, 512, 2048];
+        let dec = [1u32, 2, 4, 8, 16];
+        let mut table: Vec<u32> = pf.to_vec();
+        table.push(modular_block_program_t(128));
+        let lo = table.len();
+        table.extend(&dec);
+        assert_eq!(decode_rung_lo(&table), lo);
+        let roles = derive_roles(&table, RoleSource::Positional, |_| 0);
+        assert_eq!(roles[lo - 1], ProgramRole::ModularBlock { rows: 128 });
+        assert_eq!(roles[lo], ProgramRole::DecodeRung { rows: 1 });
     }
 
     #[test]

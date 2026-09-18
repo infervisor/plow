@@ -277,6 +277,7 @@ fn the_verification_gate_does_not_change_a_single_emitted_byte() {
                 verified: true,
                 oracle: true,
                 reason: None,
+                ..Default::default()
             })
         })),
     );
@@ -412,6 +413,7 @@ fn gemma_gfx942_emits_distinct_packed_prefill_siblings() {
                     verified: false,
                     oracle: false,
                     reason: Some("structural test only".into()),
+                    ..Default::default()
                 })
             })),
         );
@@ -603,6 +605,7 @@ fn affine_q4_emits_complete_triplets_and_separate_glu() {
                 verified: false,
                 oracle: false,
                 reason: Some("structural test only".into()),
+                ..Default::default()
             })
         })),
     );
@@ -1060,6 +1063,7 @@ fn an_fp8_tied_head_can_share_an_mxfp4_body() {
                 verified: false,
                 oracle: false,
                 reason: Some("structural test only".into()),
+                ..Default::default()
             })
         })),
     );

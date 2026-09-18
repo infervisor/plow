@@ -30,7 +30,10 @@ from pathlib import Path
 
 # Add scripts/campaign to path for roofline module
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from roofline import generate_roofline_report, lookup_gpu, lookup_model
+try:
+    from roofline import generate_roofline_report
+except Exception:
+    generate_roofline_report = None
 
 REPO = Path(__file__).resolve().parents[2]
 GPULEASE = REPO / "perf-data" / "tools" / "gpulease"
@@ -102,10 +105,11 @@ def cmd_build(a: argparse.Namespace) -> None:
         str(plowc),
         "--hf-dir", cell["hf_dir"],
         "--gpu", cell["gpu"], "--arch", cell["arch"], "--n-cu", str(cell["n_cu"]),
-        "--max-ctx", str(cell["max_ctx"]),
         "--emit", emit.get("emit", "devblob+cubin"),
         *emit.get("args", []),
     ]
+    if "max_ctx" in cell and cell["max_ctx"]:
+        base_args.extend(["--max-ctx", str(cell["max_ctx"])])
     common = env_with(os.environ, emit.get("env", {}))
     # The one emit-side variable of an A/B, named on the command line so build-record carries it.
     overrides = dict(kv.split("=", 1) for kv in (a.env or []))
@@ -309,7 +313,11 @@ def cmd_bench(a: argparse.Namespace) -> None:
         print("campaign: GPU was contended -- recorded as provisional", file=sys.stderr)
     if a.reference or r.get("reference"):
         compare(out / "results.csv", Path(a.reference or REPO / r["reference"]["csv"]))
-    print("\n" + generate_roofline_report(Path(a.recipe), out / "results.csv"))
+    if generate_roofline_report is not None:
+        try:
+            print("\n" + generate_roofline_report(Path(a.recipe), out / "results.csv"))
+        except Exception as e:
+            print(f"campaign: roofline report skipped: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- probe
@@ -535,17 +543,8 @@ def cmd_loop(a: argparse.Namespace) -> None:
 
     print(f"=== Starting Optimization Loop: {cell['name']} ===", file=sys.stderr)
 
-    # 1. Pre-flight doctor check
-    if not a.skip_doctor:
-        print("[1/5] Pre-flight doctor check...", file=sys.stderr)
-        doc_cmd = ["bash", str(REPO / "scripts" / "bench" / "plowbench-doctor.sh"), "", "", "", cell.get("arch", "")]
-        rc = subprocess.run(nix(doc_cmd), cwd=REPO).returncode
-        if rc == 1:
-            die("pre-flight doctor check FAILED. Fix environment or artifacts before continuing.")
-        print("  Doctor check passed.", file=sys.stderr)
-
-    # 2. Build
-    print(f"[2/5] Building {cell['name']}...", file=sys.stderr)
+    # 1. Build
+    print(f"[1/5] Building {cell['name']}...", file=sys.stderr)
     build_args = argparse.Namespace(
         recipe=str(recipe_path),
         out=str(build_dir),
@@ -559,6 +558,23 @@ def cmd_loop(a: argparse.Namespace) -> None:
         print(f"  Reusing existing build at {build_dir}", file=sys.stderr)
 
     assets_dir = build_dir / "assets"
+    objects_dir = build_dir / "objects"
+
+    # 2. Pre-flight doctor check
+    if not a.skip_doctor:
+        print("[2/5] Pre-flight doctor check...", file=sys.stderr)
+        doc_cmd = [
+            "bash",
+            str(REPO / "scripts" / "bench" / "plowbench-doctor.sh"),
+            str(assets_dir),
+            str(objects_dir) if objects_dir.is_dir() else "",
+            "",
+            cell.get("arch", ""),
+        ]
+        rc = subprocess.run(nix(doc_cmd), cwd=REPO).returncode
+        if rc != 0:
+            die("pre-flight doctor check FAILED. Fix environment or artifacts before continuing.")
+        print("  Doctor check passed.", file=sys.stderr)
 
     # 3. Probe (if applicable and not skipped)
     if not a.no_probe and not (assets_dir / "cublaslt_algos.jsonl").exists():
@@ -596,8 +612,11 @@ def cmd_loop(a: argparse.Namespace) -> None:
     # 5. Roofline & Bottleneck Diagnosis
     print("\n[5/5] Roofline Analysis & Bottleneck Identification:", file=sys.stderr)
     results_csv = bench_dir / "results.csv"
-    if results_csv.is_file():
-        print(generate_roofline_report(recipe_path, results_csv))
+    if results_csv.is_file() and generate_roofline_report is not None:
+        try:
+            print(generate_roofline_report(recipe_path, results_csv))
+        except Exception as e:
+            print(f"campaign: roofline report skipped: {e}", file=sys.stderr)
     print(f"\nOptimization loop complete. Artifacts in: {base_out}")
 
 

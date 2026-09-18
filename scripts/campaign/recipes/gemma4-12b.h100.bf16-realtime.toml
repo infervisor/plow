@@ -12,7 +12,6 @@ hf_dir = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/
 gpu = "H100 SXM5"
 arch = "sm_90a"
 n_cu = 132
-max_ctx = 8192
 precision = "bf16"
 
 [emit]
@@ -24,7 +23,7 @@ PLOW_SEG_FA256_GQA2 = "1"
 PLOW_TMA_GEMM = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
-PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
 PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
 PLOW_MAX_CHUNK = "4096"
 PLOW_PF_LADDER_APPEND = "192,256,1280"
@@ -77,6 +76,21 @@ gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer i
 in_lens = "128 1024 4096"
 concs = "1 4"
 serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0" }
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096"
+concs = "16 32"
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "32", PLOW_PF_INTERLEAVE = "0" }
+
+[bench.profiles.long_context]
+in_lens = "8192 15000"
+concs = "4 16"
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0" }
+
+[bench.profiles.comprehensive]
+in_lens = "128 1024 4096 8192 15000"
+concs = "1 4 16 32"
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "32", PLOW_PF_INTERLEAVE = "0" }
 
 [reference]
 csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.csv"

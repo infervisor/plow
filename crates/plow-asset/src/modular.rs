@@ -46,8 +46,58 @@ impl ModularPhase {
     }
 }
 
+/// Formal Lean verification certificate for correctness of a modular block program.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModularLeanCorrectness {
+    /// Checkpoint D: GQ stream order is topological over counter edges (deadlock-free).
+    pub ordering_verified: bool,
+    /// Checkpoint G: Staged LDS arena bounds verified (all staged GEMV/GEMM fits in arena).
+    pub lds_fit_verified: bool,
+    /// Checkpoint A: Soundness of all fired egglog rewrite rules verified against Lean definitional theorems.
+    pub rewrite_soundness_verified: bool,
+    /// Optional failure or skip diagnostic reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Formal Lean verification certificate for performance lower bounds of a modular block program.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModularLeanPerformance {
+    /// Critical path depth in cycles.
+    pub critical_path_cycles: u64,
+    /// Memory/HBM bandwidth lower bound in cycles.
+    pub bw_bound_cycles: u64,
+    /// Certified cycle lower bound (max of critical path and memory bandwidth bound).
+    pub lower_bound_cycles: u64,
+    /// Certified lower bound latency in microseconds at target hardware clock.
+    pub lower_bound_us: f64,
+    /// Hardware binding bottleneck ("bandwidth" vs "latency").
+    pub binding_constraint: String,
+    /// Total bytes touched / streamed by this modular block program.
+    pub touched_bytes: u64,
+    /// Whether this lower bound carries a formal Lean certificate.
+    pub certified: bool,
+}
+
+/// Summary of Lean formal verification and performance certificates across all modular blocks.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModularLeanSummary {
+    /// True if all modular blocks passed Checkpoint D (ordering), Checkpoint G (LDS fit), and Checkpoint A (rewrites).
+    pub all_correctness_verified: bool,
+    /// True if all modular blocks have certified Lean performance bounds.
+    pub all_performance_certified: bool,
+    /// Sum of critical path cycles across all primary blocks in a forward pass.
+    pub total_critical_path_cycles: u64,
+    /// Sum of certified microsecond lower bounds across all primary blocks in a forward pass.
+    pub total_lower_bound_us: f64,
+    /// Number of modular blocks verified.
+    pub blocks_verified: usize,
+    /// Total number of modular blocks in the manifest.
+    pub total_blocks: usize,
+}
+
 /// Descriptor of a single modular block program inside the packet.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModularBlockProg {
     /// Symbolic name (e.g. "embed_pf", "attn_t128", "ffn_t128", "attn_b1_decode", "ffn_b1_decode", "vocab_pf").
     pub name: String,
@@ -63,10 +113,19 @@ pub struct ModularBlockProg {
     pub layer: Option<u32>,
     /// Index in the DevBlob / Model program table.
     pub program_idx: u32,
+    /// Egglog equality saturation rules applied within this modular block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egg_rules: Vec<String>,
+    /// Lean correctness verification certificates (ordering, LDS fit, rewrite soundness).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lean_correctness: Option<ModularLeanCorrectness>,
+    /// Lean performance verification certificates (critical path, memory bandwidth bound, cycle floor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lean_performance: Option<ModularLeanPerformance>,
 }
 
 /// Full modular pipeline manifest describing how modular blocks are chained to form full forward passes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModularPipelineManifest {
     pub version: u32,
     pub num_layers: u32,
@@ -80,6 +139,12 @@ pub struct ModularPipelineManifest {
     /// Mapping of (phase, kind, width) -> program_idx for fast runtime dispatch.
     #[serde(default)]
     pub dispatch_table: BTreeMap<String, u32>,
+    /// All egglog equality saturation rules applied across the modular pipeline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egg_rules_applied: Vec<String>,
+    /// Overall Lean verification summary across all modular blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lean_summary: Option<ModularLeanSummary>,
 }
 
 pub const MODULAR_MANIFEST_SECTION: &str = "modular_pipeline.json";
@@ -95,12 +160,19 @@ impl ModularPipelineManifest {
             decode_rungs: Vec::new(),
             isolated_execution: true,
             dispatch_table: BTreeMap::new(),
+            egg_rules_applied: Vec::new(),
+            lean_summary: None,
         }
     }
 
     pub fn add_block(&mut self, block: ModularBlockProg) {
         let key = Self::dispatch_key(block.phase, block.kind, block.width, block.layer);
         self.dispatch_table.insert(key, block.program_idx);
+        for rule in &block.egg_rules {
+            if !self.egg_rules_applied.contains(rule) {
+                self.egg_rules_applied.push(rule.clone());
+            }
+        }
         self.blocks.push(block);
     }
 

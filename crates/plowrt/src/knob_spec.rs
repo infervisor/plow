@@ -350,9 +350,11 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_chunk", Some("PLOW_PF_CHUNK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.pf_no_chunk", Some("PLOW_PF_NO_CHUNK"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_no_interleave", Some("PLOW_PF_NO_INTERLEAVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.pf_defer_decode", Some("PLOW_PF_DEFER_DECODE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.pf_defer_decode", Some("PLOW_PF_DEFER_DECODE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.block_packets", Some("PLOW_BLOCK_PACKETS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.pf_modular", Some("PLOW_PF_MODULAR"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.pf_modular", Some("PLOW_PF_MODULAR"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.block_stage", Some("PLOW_BLOCK_STAGE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.rt_max_ctx", Some("PLOW_RT_MAX_CTX"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.tbt_slo_ms", Some("PLOW_TBT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.queue_ttl_ms", Some("PLOW_QUEUE_TTL_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.ttft_slo_ms", Some("PLOW_TTFT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -1088,7 +1090,7 @@ mod tests {
 
     #[test]
     fn declared_scopes_name_known_kinds_and_classes() {
-        const KINDS: &[&str] = &["prefill", "decode", "packed", "token_batch", "global"];
+        const KINDS: &[&str] = &["prefill", "decode", "packed", "token_batch", "modular", "global"];
         let known = |c: &str| {
             packet::opclass::CLASSES.contains(&c)
                 || c.strip_prefix("op:")

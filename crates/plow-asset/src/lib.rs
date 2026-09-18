@@ -703,6 +703,7 @@ pub mod hetero_channel;
 pub mod token_batch;
 pub mod modular;
 pub use modular::{
-    ModularBlockKind, ModularBlockProg, ModularPhase, ModularPipelineManifest,
-    MODULAR_MANIFEST_SECTION, MODULAR_MANIFEST_VERSION,
+    ModularBlockKind, ModularBlockProg, ModularLeanCorrectness, ModularLeanPerformance,
+    ModularLeanSummary, ModularPhase, ModularPipelineManifest, MODULAR_MANIFEST_SECTION,
+    MODULAR_MANIFEST_VERSION,
 };

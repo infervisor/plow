@@ -15,9 +15,9 @@ fn packed_defaults_preserve_backend_contracts_and_ladders() {
     std::fs::write(
         root.join("config.json"),
         r#"{
-        "model_type":"gemma4_text", "hidden_size":5376, "intermediate_size":21504,
-        "num_hidden_layers":2, "num_attention_heads":32, "head_dim":256,
-        "global_head_dim":512, "num_key_value_heads":16, "num_global_key_value_heads":4,
+        "model_type":"gemma4_text", "hidden_size":3840, "intermediate_size":15360,
+        "num_hidden_layers":2, "num_attention_heads":16, "head_dim":256,
+        "global_head_dim":512, "num_key_value_heads":8, "num_global_key_value_heads":1,
         "attention_k_eq_v":true, "sliding_window":1024, "rms_norm_eps":1e-6,
         "vocab_size":262144, "final_logit_softcapping":30.0, "tie_word_embeddings":true,
         "layer_types":["sliding_attention","full_attention"],
@@ -87,6 +87,7 @@ fn packed_defaults_preserve_backend_contracts_and_ladders() {
                             verified: false,
                             oracle: false,
                             reason: Some("structural contract test".into()),
+                            ..Default::default()
                         })
                     })),
                 );

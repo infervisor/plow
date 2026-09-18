@@ -4315,7 +4315,8 @@ impl GpuEngine {
         // act.logits is [B][vocab] bf16; in.pos is [ctx] i32 (shared by the
         // prefill chunk positions and the B decode positions).
         let vocab = (blob.tensors[t_logits].bytes / 2) as usize / batch;
-        let max_ctx = (blob.tensors[t_pos].bytes / 4) as usize;
+        let packet_max_ctx = (blob.tensors[t_pos].bytes / 4) as usize;
+        let max_ctx = config.rt_max_ctx.unwrap_or(packet_max_ctx).min(packet_max_ctx);
 
         // Per-slot stride of every batch-major KV or recurrent-state tensor (slot b of
         // tensor i lives at base + b*stride). B==1: strides never used.

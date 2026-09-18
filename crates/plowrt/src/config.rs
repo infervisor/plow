@@ -198,7 +198,7 @@ pub struct RuntimeConfig {
 
     /// Throughput mode: run prefill chains to completion, skip decode until all
     /// prompts are resident. Trades streaming latency for aggregate tok/s.
-    #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_defer_decode: bool,
 
     /// Modular block packet execution mode (reusable layer blocks, decoupled attention/FFN).
@@ -206,8 +206,17 @@ pub struct RuntimeConfig {
     pub block_packets: bool,
 
     /// Modular block prefill pipeline and fine-grained ladder execution.
-    #[arg(long = "pf-modular", env = "PLOW_PF_MODULAR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "pf-modular", env = "PLOW_PF_MODULAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_modular: bool,
+
+    /// Single block stage to execute: "attn", "ffn", "embed", "vocab", or "all".
+    #[arg(long = "block-stage", env = "PLOW_BLOCK_STAGE", value_parser = clap::builder::PossibleValuesParser::new(["attn", "ffn", "embed", "vocab", "all"]), global = true)]
+    pub block_stage: Option<String>,
+
+    /// Runtime max context override. If set, limits or configures the maximum sequence length at runtime.
+    /// If unset, defaults to the context length declared by the packet.
+    #[arg(long = "rt-max-ctx", env = "PLOW_RT_MAX_CTX", global = true)]
+    pub rt_max_ctx: Option<usize>,
 
     /// AMD inter-token (TBT) target, ms. While requests decode, each tick takes the largest
     /// prefill it can while the predicted tick stays at or under this value; decode rows always
@@ -1886,7 +1895,7 @@ mod tests {
         assert!(defaults.prefix_cache && defaults.token_batch && defaults.pf_batch_amd());
         assert!(!defaults.fusion);
         assert!(
-            !defaults.pf_no_chunk && !defaults.pf_no_interleave && defaults.pf_defer_decode
+            !defaults.pf_no_chunk && !defaults.pf_no_interleave && !defaults.pf_defer_decode
         );
         assert!(!defaults.pf_rotate());
         assert_eq!(defaults.amd.packed_prefill_route, None);

@@ -172,6 +172,26 @@ impl HeadPool {
                 "CPU twin declares no transferable KV cache; nothing to hand over".into(),
             ));
         }
+        for (hm_name, _) in &head_majors {
+            if hm_name.ends_with(".k") || hm_name.ends_with(".v") {
+                let scale_k = format!("{hm_name}_scale");
+                let scale_dot = format!("{hm_name}.scale");
+                if contract.iter().any(|t| t.name == scale_k)
+                    && !head_majors.iter().any(|(n, _)| n == &scale_k)
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "head-major cache `{hm_name}` scale tensor `{scale_k}` is not registered"
+                    )));
+                }
+                if contract.iter().any(|t| t.name == scale_dot)
+                    && !head_majors.iter().any(|(n, _)| n == &scale_dot)
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "head-major cache `{hm_name}` scale tensor `{scale_dot}` is not registered"
+                    )));
+                }
+            }
+        }
         let digest = kvrow::kv_contract_digest(&contract);
 
         let buckets = eng.prefill_buckets();
@@ -262,7 +282,7 @@ impl HeadPool {
 
     /// Plan the copies handing `rows` of head slot `src` to device slot `dst`.
     pub(crate) fn plan(&self, src: u32, dst: u32, rows: u32) -> Result<Vec<CopySpan>> {
-        kv_handoff::plan_with_layout(
+        kv_handoff::plan(
             &self.contract,
             self.rows_per_slot,
             &self.pools,

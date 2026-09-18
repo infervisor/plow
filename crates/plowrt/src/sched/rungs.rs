@@ -303,6 +303,8 @@ impl RungController {
         let widest = self.rungs.len() - 1;
         // Cold start seats the penultimate rung, then probes the widest: a rung only gains samples
         // by running, so holding the widest back until it has samples would cap it forever.
+        // `width(widest) > 4`: don't hold back ladders capped at small widths (e.g. realtime
+        // profiles with PLOW_DECODE_MAX_RUNG <= 4) where all rungs fit within the latency budget.
         if demand_seat == widest
             && self.rungs.width(widest) > 4
             && self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES

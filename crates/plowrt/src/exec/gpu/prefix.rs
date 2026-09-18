@@ -169,11 +169,16 @@ impl GpuEngine {
         checkpoint_dir: &Path,
     ) -> Option<VmmPrefixLayout> {
         let batch = blob.decode_prog().ok()?.t;
-        let max_ctx = blob
+        let packet_max_ctx = blob
             .tensors
             .iter()
             .find(|t| t.name == "in.pos")
             .map(|t| (t.bytes / 4) as u32)?;
+        let max_ctx = crate::config::RuntimeConfig::get()
+            .rt_max_ctx
+            .map(|c| c as u32)
+            .unwrap_or(packet_max_ctx)
+            .min(packet_max_ctx);
         let Some(mut geo) =
             crate::memory::vmm::VmmGeometry::from_config(checkpoint_dir, max_ctx, batch)
         else {
