@@ -430,14 +430,44 @@ the corrected roofline model is right.
 
 ## Levers, in priority order (evidence, not guesses)
 
-1. **MoE decode tensor-core walk — the big one.** `op_moe.cuh`'s Gemma expert GLU and
-   DOWN decode bodies carry ONLY the dot8 CUDA-core walk. `op_gemv_mma.cuh`'s
-   `mma.sync m16n8k16` row-block walk is wired into the three DENSE walks behind
-   `PLOW_NV_GEMV_MMA` but never into the MoE ones. Decode runs at 4.6 % of the memory
-   roof with TPOT flat across batch — compute-bound, the exact condition the dense
-   conversion fixed on 12B (C16 44.6 -> 16.2 ms). Attribute with decode step timing
-   before authoring: the dense hook only engages at `MM >= 4`, so at C1 the win may
-   instead be in the ~150 extra serialized MoE stages per step (5 MoE ops x 30 layers).
+1. **~~MoE decode tensor-core walk~~ — RETRACTED, MEASURED WRONG.** This was the
+   stated priority-1 item, inferred from end-to-end effective bandwidth (48.8 ms for
+   7.64 GB = ~156 GB/s, 4.6 % of roof) plus the fact that `op_moe.cuh`'s expert walks
+   have no tensor-core path. `runtime/tests/moe_decode_gemma26b_bench.cu` measured the
+   ops directly and the inference was wrong:
+
+   | B | score ms | topk ms | glu ms | down ms | MoE/token | GB/s glu |
+   |---:|---:|---:|---:|---:|---:|---:|
+   | 1 | 0.0461 | 0.0082 | 0.0336 | 0.0154 | **3.10 ms** | **1890** |
+   | 4 | 0.0558 | 0.0241 | 0.1162 | 0.1952 | 2.93 ms | 2183 |
+   | 16 | 0.0969 | 0.0865 | 0.4818 | 0.7444 | 2.64 ms | 2107 |
+
+   The expert GLU runs at 1890-2239 GB/s — 56-67 % of the card's 3352. It is not
+   bandwidth-starved, a tensor-core rewrite buys little, and the ENTIRE MoE share of a
+   decode token is 3.10 ms of 48.8 (6 %). Adding dense traffic (~4.8 GB at ~2 TB/s
+   ~ 2.4 ms) the kernels total ~5.5 ms — and vLLM's measured TPOT is 5.03 ms. **plow's
+   decode kernels are already competitive; ~43 ms (88 %) is overhead on top of them.**
+
+   Caveat on the bench, stated so nobody over-trusts it: it allocates ONE layer's fused
+   expert tensors (1.5 GB working set); the served model has 30 layers (~45 GB), so
+   TLB/page behaviour at full scale could be worse than measured. The conclusion
+   "kernels are not the bottleneck" is strongly indicated, not proven at scale.
+
+1b. **THE OPEN QUESTION: where the other ~43 ms goes.** Not yet attributed.
+   `PLOW_STEP_TIME=1` exists and reports gap/submit/sync/upload/kernel/download, but
+   its `log_every` sits on the `step_slots` path and this model decodes through the
+   **token-batch route** (`route="unified-token-batch" ... fires=true`), which is not
+   instrumented — nothing is emitted with `PLOW_STEP_TIME=1` and `PLOW_MULTISTEP=0`.
+   Wiring StepTiming into the token-batch route, or adding an equivalent event pair
+   there, is the single highest-value next step in the whole campaign: it decides
+   whether the 43 ms is host gap, submission, sync, or inside the cooperative launch.
+
+   What is already excluded as the explanation, each by measurement against the 12B
+   control or a standalone bench:
+   * not weight bytes — 26B streams 7.64 GB/token vs 12B's 23.8 and is 3.8x slower per stage;
+   * not stage count — 519 decode stages vs 12B's 540;
+   * not low-block starvation — 12B has the same distribution (55 % vs 59 % of stages on <=16 of 132 blocks);
+   * not the MoE kernels — measured above at 3.10 ms of 48.8.
 2. **cuBLASLt algorithm table — DONE, and it is a NULL. Do not re-run it.** The store
    had 48 entries for 12B's 3840-keyed shapes and 0 for 26B's 2816-keyed ones;
    `campaign.py probe` wrote 40 measured entries and the server confirms it loaded
