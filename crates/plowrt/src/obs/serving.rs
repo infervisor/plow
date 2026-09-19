@@ -160,6 +160,15 @@ impl ServingMetrics {
             "Requests terminated by model residency preemption.",
             |m: &Metrics, _| m.serving.preempted.load(Relaxed)
         );
+        // The same count under vLLM's name. A vLLM dashboard's preemption panel
+        // is one of the few that reads as a hard incident, and it matched
+        // nothing here.
+        scalar!(
+            "vllm:num_preemptions_total",
+            "counter",
+            "Requests terminated by model residency preemption.",
+            |m: &Metrics, _| m.serving.preempted.load(Relaxed)
+        );
         scalar!(
             "plowrt_tick_errors_total",
             "counter",

@@ -369,6 +369,13 @@ pub struct AppState {
     /// Only the control plane writes here; the manager and the request path read it.
     residency: RwLock<FxHashMap<String, Residency>>,
     control: Mutex<FxHashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// Unix seconds at which this process began offering models. Stamped ONCE:
+    /// `GET /v1/models` used to call `now_secs()` per card, so `created`
+    /// changed on every scrape and no client could treat it as an identity.
+    started: u64,
+    /// slug -> compiled context length, captured when the engine is installed
+    /// so a model card never has to take the engine mutex behind a live tick.
+    max_ctx: RwLock<FxHashMap<String, usize>>,
     /// When set, each run records a timeline dumpable at `GET /trace`.
     record_trace: bool,
     trace: Mutex<Timeline>,
@@ -425,6 +432,8 @@ impl AppState {
             models_roots: std::sync::OnceLock::new(),
             residency: RwLock::new(FxHashMap::default()),
             control: Mutex::new(FxHashMap::default()),
+            started: openai::now_secs(),
+            max_ctx: RwLock::new(FxHashMap::default()),
             record_trace,
             trace: Mutex::new(Timeline::new()),
         }
@@ -437,7 +446,18 @@ impl AppState {
         if let Some(h) = engine.vmm_stats_handle() {
             self.vmm_stats.write().insert(slug.clone(), h);
         }
+        self.max_ctx.write().insert(slug.clone(), engine.max_ctx());
         self.gpu.write().insert(slug, Arc::new(Mutex::new(engine)));
+    }
+
+    /// Unix seconds this process started offering models.
+    pub fn started(&self) -> u64 {
+        self.started
+    }
+
+    /// The compiled context length for `slug`, when an engine reported one.
+    pub fn max_ctx(&self, slug: &str) -> Option<usize> {
+        self.max_ctx.read().get(slug).copied()
     }
 
     /// The GPU engine serving `slug`, when one was installed.
@@ -843,6 +863,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize))
         .route("/v1/models", get(models::list_models))
+        .route("/v1/models/{id}", get(models::get_model))
         // BOTH spellings. vLLM serves `/health`, and every k8s probe and
         // benchmark harness copied from vLLM asks for it; plowrt served only
         // `/healthz`, so all of them got a 404 from a healthy server.
@@ -933,6 +954,29 @@ async fn metrics_handler(
     ] {
         crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
     }
+    // The same prefix-cache signal under vLLM's names and label.
+    //
+    // COUNTED IN ATTACH REQUESTS, NOT TOKENS, and the HELP says so: vLLM's two
+    // series count tokens queried and tokens hit, and this server tracks hit
+    // tokens (`tokens_attached`) but never counts the tokens it MISSED, so a
+    // token-denominated ratio cannot be computed from what exists. A request
+    // ratio is a real number about a real thing; a token ratio here would be
+    // fabricated.
+    #[cfg(feature = "cuda")]
+    {
+        crate::obs::serving::family(
+            &mut out,
+            "vllm:prefix_cache_queries_total",
+            "counter",
+            "Prefix cache lookups (ATTACH REQUESTS, not tokens - see plowrt_prefix_* for token counts).",
+        );
+        crate::obs::serving::family(
+            &mut out,
+            "vllm:prefix_cache_hits_total",
+            "counter",
+            "Prefix cache lookups that found a reusable prefix (attach requests, not tokens).",
+        );
+    }
     #[cfg(feature = "cuda")]
     for (slug, h) in state.vmm_stats.read().iter() {
         let s = h.stats();
@@ -962,6 +1006,13 @@ async fn metrics_handler(
             s.cache_bytes,
             s.snapshot_bytes,
             s.snapshots_evicted,
+        );
+        let _ = write!(
+            out,
+            "vllm:prefix_cache_queries_total{{model_name=\"{slug}\",engine=\"0\"}} {}\n\
+             vllm:prefix_cache_hits_total{{model_name=\"{slug}\",engine=\"0\"}} {}\n",
+            s.attach_hits + s.attach_misses,
+            s.attach_hits,
         );
     }
     ([("content-type", "text/plain; version=0.0.4; charset=utf-8")], out).into_response()

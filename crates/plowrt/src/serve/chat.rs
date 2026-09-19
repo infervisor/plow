@@ -621,6 +621,12 @@ async fn buffer_and_reply(
     reasoning_open: bool,
 ) -> Response {
     let mut text = String::new();
+    // Tokens that fell inside the trace, for `completion_tokens_details`.
+    // Counted from CHUNKS (one per generated token) rather than derived from
+    // the split text — the split is over characters and cannot be converted
+    // back into a token count.
+    let mut reasoning_tokens: u64 = 0;
+    let mut trace_open = reasoning_open && reasoning_mode.close_marker().is_some();
     // `None` until a terminal chunk arrives. It must NOT default to "stop": the
     // mux frees a slot on ANY `try_send` failure, and a bounded-channel `Full`
     // (serve/stream.rs caps the stream at 32 chunks) drops the sender without
@@ -628,10 +634,21 @@ async fn buffer_and_reply(
     // a fluent, truncated answer that claimed to be complete — invisible to a
     // benchmark client, which counts it as a successful request.
     let mut finish: Option<stream_mod::FinishReason> = None;
-    let mut usage = None;
+    let mut usage: Option<Usage> = None;
     while let Some(chunk) = rx.recv().await {
         match chunk {
-            StreamChunk::Token { text: delta, .. } => text.push_str(&delta),
+            StreamChunk::Token { text: delta, .. } => {
+                text.push_str(&delta);
+                if trace_open {
+                    reasoning_tokens += 1;
+                    if reasoning_mode
+                        .close_marker()
+                        .is_some_and(|c| text.contains(c))
+                    {
+                        trace_open = false;
+                    }
+                }
+            }
             StreamChunk::Done {
                 reason, usage: u, ..
             } => {
@@ -674,6 +691,11 @@ async fn buffer_and_reply(
     // model's clients look for it. A model that never opened a trace is
     // unaffected — `split_reasoning` returns the whole string as the answer.
     let (reasoning, answer) = split_reasoning(reasoning_mode, reasoning_open, &text);
+    if reasoning_open && reasoning_mode.close_marker().is_some() {
+        if let Some(u) = usage.as_mut() {
+            u.completion_tokens_details = Some(CompletionTokensDetails { reasoning_tokens });
+        }
+    }
     Json(ChatResponse {
         id: request_id.clone(),
         object: "chat.completion",
@@ -747,6 +769,8 @@ fn sse_response(
         /// split across token boundaries, so a small tail is held back.
         in_reasoning: bool,
         hold: String,
+        /// Tokens seen while `in_reasoning`, reported on the usage chunk.
+        reasoning_tokens: u64,
         pending: std::collections::VecDeque<Event>,
     }
     let body = stream::unfold(
@@ -756,6 +780,7 @@ fn sse_response(
             role_pending: true,
             in_reasoning: reasoning_open && close_marker.is_some(),
             hold: String::new(),
+            reasoning_tokens: 0,
             pending: std::collections::VecDeque::new(),
         },
         move |mut st| {
@@ -805,6 +830,7 @@ fn sse_response(
                         // land in the user-visible `content`.
                         let close = close_marker.unwrap_or("</think>");
                         let (reasoning, content) = if st.in_reasoning {
+                            st.reasoning_tokens += 1;
                             st.hold.push_str(&text);
                             match st.hold.find(close) {
                                 Some(i) => {
@@ -886,7 +912,16 @@ fn sse_response(
                                 created,
                                 model,
                                 choices: Vec::new(),
-                                usage: Some(usage.into()),
+                                usage: Some({
+                                    let mut u: Usage = usage.into();
+                                    if close_marker.is_some() && reasoning_open {
+                                        u.completion_tokens_details =
+                                            Some(CompletionTokensDetails {
+                                                reasoning_tokens: st.reasoning_tokens,
+                                            });
+                                    }
+                                    u
+                                }),
                             };
                             st.pending
                                 .push_back(Event::default().data(stream_mod::chunk_data(&uch)));

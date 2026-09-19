@@ -411,11 +411,21 @@ pub struct Usage {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub prompt_tokens_details: PromptTokensDetails,
+    /// Present only for a model that frames a reasoning trace. Without it a
+    /// client cannot tell how much of `completion_tokens` was the trace rather
+    /// than the answer, which is what it is billed and budgeted on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct PromptTokensDetails {
     pub cached_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct CompletionTokensDetails {
+    pub reasoning_tokens: u64,
 }
 
 impl From<crate::serve::stream::TokenUsage> for Usage {
@@ -427,6 +437,7 @@ impl From<crate::serve::stream::TokenUsage> for Usage {
             prompt_tokens_details: PromptTokensDetails {
                 cached_tokens: u.cached_tokens as u64,
             },
+            completion_tokens_details: None,
         }
     }
 }
@@ -525,6 +536,18 @@ pub struct ModelCard {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+    /// `root` is the id a derived model was served from; with no adapters or
+    /// aliases it is the model's own id, which is what vLLM reports too.
+    pub root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// The compiled context length. LiteLLM, OpenWebUI and vLLM's own clients
+    /// read this to size a request; a card without it makes them guess.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_model_len: Option<usize>,
+    /// Empty, but PRESENT: the OpenAI schema declares it and typed clients
+    /// index into it.
+    pub permission: Vec<serde_json::Value>,
 }
 
 /// Unix seconds, for the `created` field every OpenAI object carries.
