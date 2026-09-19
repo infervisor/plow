@@ -163,6 +163,94 @@ batch's expert choices: expected `n*(1-(1-k/n)^B)` experts.
 TPOT floors out near 13-15 ms while per-token cost keeps falling — the opposite
 shape from 12B, and it is where the throughput work has to aim.
 
+## BLOCKER: 26B sm90a prefill faults on GPU (pre-existing, not root-caused)
+
+A packet emits cleanly and loads (47.0 GiB weights + 8.75 GiB KV, 54.7 GiB total,
+24.8 GiB free), then the FIRST prefill chunk faults:
+
+```
+prefill chunk (seg graph): stream sync failed  slot=0 bucket=0 bucket_t=128
+  chunk_start=0 prompt_len=39
+CUDA_ERROR_ILLEGAL_ADDRESS (700)   [CUDA_ERROR_LAUNCH_FAILED (719) with roles on]
+```
+
+**This is not caused by the campaign changes.** A vanilla packet — emitted with no
+recipe env at all (no cuBLASLt, no seg roles, no FA512, no masked padding) — faults
+identically. On unmodified `main` the packed-prefill gate rejected this model before
+it got this far, so the object build failed first and 26B never produced a serving
+packet on sm90a. Fixing that gate surfaced the bug underneath it.
+
+### Ruled OUT (each checked, do not re-suspect)
+
+| hypothesis | how it was ruled out |
+|---|---|
+| Segment roles / hd512 / GQA2 | fault persists with every role off |
+| cuBLASLt admission | the vanilla emit does not use it and still faults |
+| Opcode wiring | all five grouped ops dispatch in `interp_sm120.cu` |
+| `I_moe=704` N-tile remainder | `moe90_stage_b` guards `nn < n`; repro passes |
+| smem arena undersize | `PGM_ARENA_BF16` raise propagates (op_moe.cuh included at interp_sm120.cu:191, after op_gemm.cuh:177, before PLOW_NV_PRE_B at :729); host gave 103424 B vs 99328 B needed |
+| `PLOW_MOE_MAXE` too small | 256 >= 128 experts |
+| Compile-time GQA mismatch | prefill/decode attention take `n_head`/`n_kv_head` at runtime; 26B's 2 global KV heads are not static |
+| Wrong packet geometry | `plowrt disasm` confirms sliding nhead=8 hd=256 n_kv_head=8 kv_stride=2048, full nhead=2 hd=512 window=0, V from `act.kg` (k_eq_v). All correct |
+| Memory pressure | 24.8 GiB free after load |
+| Grouped MoE bodies themselves | `runtime/tests/moe_group_gemma26b_repro.cu` runs align+GLU+DOWN clean on sm_90a at exact geometry |
+| Wrong MoE arm compiled | `interp_sm90a.cu:16` defines `PLOW_NV_HOPPER`, so the wgmma fork IS used — same arm the repro forced |
+| Missing dependency edge | `devgen lib.rs:6105+` declares router -> align -> glu; `--counters` reports 840 edges, 0 redundant, 0 removable polls |
+
+### The live lead
+
+The repro passes because it `cudaDeviceSynchronize()`s between align and GLU. In the
+real megakernel `MoeAlignGemmaPf` runs on **one** block (`b=1`) and
+`MoeGroupGluGemmaPf` on **132**, ordered only by a counter. If GLU reads `meta`
+before align has published it, `total_tiles` is garbage, `ntiles` explodes, and
+`rowbase = rowoff[e] + (mtile - tilep[e])*128` indexes `fu` far out of bounds —
+which is exactly an illegal address. The expert index itself is clamped by
+`pgm_moe_expert_of_mtile`, so a bad `e` is NOT the mechanism; `rowbase` is.
+
+The edge is declared, so the question is whether the 1-block producer's bump count
+matches what the 132-block consumer waits for. Next step: `plowrt disasm --stream`
+on program T=128 and read the actual wait/bump counts for instructions 19 and 20.
+A cheap confirmation is to have GLU clamp `mtile` to `total_tiles` and see whether
+the fault moves — as a DIAGNOSTIC only; clamping would mask a race, not fix it.
+
+Tooling note: compute-sanitizer cannot attach to plowrt (consistent with
+[[ncu-on-nix-plowrt]] — profilers do not work against the cooperative megakernel),
+so attribution has to come from the packet and from isolated harnesses.
+
+## vLLM 0.28 reference, Gemma-4-26B-A4B BF16, this H100
+
+Same client and flags as the plow side, prefix caching off, greedy, 32 prompts,
+128 output tokens. `perf-data/campaign/gemma4-26b-a4b.h100.reference-vllm028-bf16.csv`.
+
+| cell | TTFT ms | TPOT ms | out tok/s | TTFT vs roofline | TPOT vs roofline |
+|---|---:|---:|---:|---:|---:|
+| 128 / C1 | 39.52 | 5.030 | 188.5 | 17.3x | 2.20x |
+| 1024 / C1 | 44.11 | 5.080 | 185.7 | 5.2x | 2.16x |
+| 4096 / C1 | 93.71 | 5.090 | 172.8 | 2.7x | 2.15x |
+| 8192 / C1 | 181.10 | 5.090 | 154.7 | 2.5x | 2.13x |
+| 128 / C4 | 73.31 | 7.240 | 515.6 | — | 1.60x |
+| 1024 / C4 | 93.46 | 7.570 | 485.1 | — | 1.58x |
+| 4096 / C4 | 227.59 | 7.920 | 414.8 | — | 1.62x |
+| 8192 / C4 | 458.74 | 8.530 | 331.7 | — | 1.74x |
+
+Three things this table says about where a win is available:
+
+1. **TPOT is flat at ~5.08 ms across every context length at C1.** The 1024 sliding
+   window caps decode KV growth, exactly as the corrected roofline predicts (floor
+   moves only 2.29 -> 2.39 ms from 128 to 8192). Decode sits ~2.2x above its floor
+   at C1 — this is the largest single pool of headroom.
+2. **Long-context prefill is already efficient for vLLM** — 2.5x off roofline at
+   8192. TTFT wins there have to come from real kernel work, and the dims audit
+   already names the candidate (an hd512 px4 GQA-8 role, which 26B currently cannot
+   use at all).
+3. **Short-context prefill is soft**: 17.3x off floor at in128, i.e. launch and
+   host overhead, not math. The 12B campaign found the same shape and the lever
+   there was launch COUNT, not backend.
+
+vLLM's 26B TPOT (5.03 ms) is about half its 12B TPOT (10.55 ms), which is what the
+active-parameter difference predicts (3.82B vs 11.91B) — independent evidence that
+the corrected roofline model is right.
+
 ## Status
 
 | step | state |
@@ -171,11 +259,25 @@ shape from 12B, and it is where the throughput work has to aim.
 | plowc/plowrt release build | done |
 | Emit + objects + role emit | **done** (`045a38e3`) |
 | Roofline model corrected + validated on 12B | **done** |
-| cuBLASLt probe (leased) | pending plowrt rebuild |
-| vLLM 0.28 26B reference (gpulease) | script written, not run |
-| Rung ladder 128/1024/4096/8192 | not started |
-| Roofline compare + kernel push | not started |
-| High concurrency / throughput | not started |
+| vLLM 26B reference harness | **done** (`91fd8c51`) |
+| vLLM 26B reference ladder | **partly measured** (128, 1024; 4096/8192 running) |
+| Isolated grouped-MoE repro | **done, passes** (`91fd8c51`) |
+| **Plow 26B serving** | **BLOCKED — prefill faults, see above** |
+| Rung ladder 128/1024/4096/8192 | blocked on the fault |
+| Roofline compare + kernel push | blocked |
+| High concurrency / throughput | blocked |
+
+## Next actions, in order
+
+1. Root-cause the prefill fault: `disasm --stream` wait/bump counts for inst 19/20
+   of program T=128. This is the whole critical path — no plow number exists until
+   it is fixed.
+2. Finish the vLLM reference ladder at 4096 and 8192, and add C16/C32 for the
+   serving cells.
+3. Only then: rung ladder, roofline attribution (`PLOW_PF_SEG_TIME=1`, attribution
+   only), and the kernel work the dims audit already identified
+   (hd512 px4 GQA-8 variant, `PLOW_NV_FA_GF_FULL=8`, `PLOW_NV_FA_TC_GQA8_HD512`,
+   tensor-core MoE decode GLU for high concurrency).
 
 ## Protocol
 
