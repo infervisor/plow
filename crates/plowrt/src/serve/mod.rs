@@ -263,15 +263,13 @@ pub(crate) fn bucket_has_sample_batch(bucket: &Bucket) -> bool {
     })
 }
 
-/// A deterministic `[0,1)` draw seeded by the request state (for stochastic
-/// sampling in the reference path — reproducible, no wall-clock entropy).
-pub(crate) fn seeded_unit(prompt: &[u32], out: &[u32], step: usize) -> f32 {
-    seeded_unit_with(prompt, out, step, None)
-}
-
-/// The same draw, with an optional caller-supplied OpenAI `seed` mixed in.
-/// Without it the draw is derived from the token stream alone — deterministic,
-/// but not something a client can choose, which is what `seed` is for.
+/// A deterministic `[0,1)` draw seeded by the request state, with the caller's
+/// OpenAI `seed` mixed in when it set one.
+///
+/// THERE IS DELIBERATELY NO SEEDLESS VARIANT. There used to be, and every
+/// sampling site on a real backend called it, so `seed` was honoured only on
+/// the reference path that has no model. Taking `Option<u64>` makes forgetting
+/// the seed a thing you have to type.
 pub(crate) fn seeded_unit_with(prompt: &[u32], out: &[u32], step: usize, seed: Option<u64>) -> f32 {
     (fnv_seed(prompt, out, step, seed) % 10_000) as f32 / 10_000.0
 }

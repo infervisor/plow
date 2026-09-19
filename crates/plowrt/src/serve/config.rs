@@ -28,55 +28,44 @@ pub enum ReasoningMode {
     /// The generation prompt leaves `<think>` OPEN and the model closes it.
     /// GLM-5.2/5.3, Qwen3 and DeepSeek-R1 all frame it this way.
     ThinkTag,
-    /// OpenAI harmony channels (gpt-oss): the trace is whatever precedes the
-    /// final channel's `<|message|>`.
-    Harmony,
 }
 
 impl ReasoningMode {
-    /// The marker that ENDS the trace, for the modes that have one.
+    /// The marker that ENDS the trace.
     pub fn close_marker(self) -> Option<&'static str> {
         match self {
             ReasoningMode::None => None,
             ReasoningMode::ThinkTag => Some("</think>"),
-            ReasoningMode::Harmony => Some("<|channel|>final<|message|>"),
         }
     }
 
-    /// Does `prompt` hand generation an OPEN trace?
+    /// The framing implied by a rendered prompt — i.e. does generation begin
+    /// INSIDE a trace, and if so which marker closes it.
     ///
-    /// Checked as a SUFFIX, never as a search. `add_generation_prompt` means
-    /// the template's generation prompt is the LAST thing in the string, so
-    /// only a marker at the very end is the model's own. The previous probe
-    /// was `prompt.rfind("<think>")` over the whole rendered prompt — which
-    /// includes user content — so a user message carrying `<think>` with no
-    /// later `</think>` routed the entire answer into `reasoning_content` and
+    /// Decided from the prompt's SUFFIX, never a search of it.
+    /// `add_generation_prompt` puts the generation prompt last, so only a
+    /// marker at the very end is the model's own. The previous probe was
+    /// `prompt.rfind("<think>")` over the whole rendered prompt — which
+    /// contains USER TEXT — so a user message carrying `<think>` with no later
+    /// `</think>` routed the entire answer into `reasoning_content` and
     /// returned an EMPTY `content`, on any model, reasoning or not.
     ///
-    /// `Harmony` is always open at the start: gpt-oss emits its analysis
-    /// channel first and switches to the final channel itself, so the trace
-    /// begins with the generation rather than with the prompt.
-    pub fn opens(self, prompt: &str) -> bool {
-        match self {
-            ReasoningMode::ThinkTag => prompt.ends_with("<think>"),
-            ReasoningMode::Harmony => true,
-            ReasoningMode::None => false,
-        }
-    }
-
-    /// Pick the mode from the checkpoint's own rendered generation prompt.
-    ///
-    /// Driven by what the template EMITS, so it needs no family table: a
-    /// checkpoint whose generation prompt ends with an open `<think>` is a
-    /// think-tag model whatever it is called.
-    pub fn detect(generation_prompt: &str) -> Self {
-        if generation_prompt.ends_with("<think>") {
+    /// Per REQUEST, not per model, and deliberately: it is the rendered prompt
+    /// that decides, so this is right for the checkpoint's own template, for
+    /// the built-in builders when a checkpoint ships none, and for a request
+    /// that turned thinking off with `chat_template_kwargs` (which renders the
+    /// pair CLOSED, `<think></think>`, and so reads as `None` here).
+    pub fn detect(prompt: &str) -> Self {
+        if prompt.ends_with("<think>") {
             ReasoningMode::ThinkTag
-        } else if generation_prompt.contains("<|channel|>") {
-            ReasoningMode::Harmony
         } else {
             ReasoningMode::None
         }
+    }
+
+    /// Whether generation begins inside a trace.
+    pub fn opens(self) -> bool {
+        self != ReasoningMode::None
     }
 }
 
@@ -87,14 +76,12 @@ pub struct ServingConfig {
     /// these; a request that omits it gets the checkpoint's value, NOT the
     /// process-wide default.
     pub default_sampling: SamplingParams,
-    pub reasoning: ReasoningMode,
 }
 
 impl Default for ServingConfig {
     fn default() -> Self {
         ServingConfig {
             default_sampling: SamplingParams::default(),
-            reasoning: ReasoningMode::None,
         }
     }
 }
@@ -143,37 +130,46 @@ impl ServingConfig {
 mod tests {
     use super::*;
 
-    /// THE BUG THIS MODE EXISTS TO KILL. A user message mentioning `<think>`
-    /// used to make the server treat the model's whole answer as a reasoning
-    /// trace and return an empty `content`.
+    /// THE BUG THIS EXISTS TO KILL. A user message mentioning `<think>` used to
+    /// make the server treat the model's whole answer as a reasoning trace and
+    /// return an empty `content`.
     #[test]
     fn user_text_carrying_the_marker_cannot_open_a_trace() {
         let prompt = "<|user|>what does <think> do?<|assistant|>";
-        assert!(!ReasoningMode::ThinkTag.opens(prompt));
-        assert!(!ReasoningMode::None.opens(prompt));
+        assert_eq!(ReasoningMode::detect(prompt), ReasoningMode::None);
+        assert!(!ReasoningMode::detect(prompt).opens());
     }
 
     /// GLM's real generation prompt leaves the block open and must still be
     /// recognised — the fix must not trade one silent failure for another.
     #[test]
     fn a_generation_prompt_that_really_opens_one_is_recognised() {
-        assert!(ReasoningMode::ThinkTag.opens("<|user|>hi<|assistant|><think>"));
-        // `enable_thinking: false` renders the pair closed.
-        assert!(!ReasoningMode::ThinkTag.opens("<|user|>hi<|assistant|><think></think>"));
+        let p = "<|user|>hi<|assistant|><think>";
+        assert_eq!(ReasoningMode::detect(p), ReasoningMode::ThinkTag);
+        assert_eq!(ReasoningMode::detect(p).close_marker(), Some("</think>"));
     }
 
+    /// `enable_thinking: false` renders the pair CLOSED, and that is the whole
+    /// reason the mode is decided per request rather than per model.
     #[test]
-    fn the_mode_is_detected_from_what_the_template_emits() {
+    fn thinking_turned_off_renders_as_no_trace() {
         assert_eq!(
-            ReasoningMode::detect("<|assistant|><think>"),
-            ReasoningMode::ThinkTag
+            ReasoningMode::detect("<|user|>hi<|assistant|><think></think>"),
+            ReasoningMode::None
         );
-        assert_eq!(
-            ReasoningMode::detect("<|start|>assistant<|channel|>analysis<|message|>"),
-            ReasoningMode::Harmony
-        );
+    }
+
+    /// Non-reasoning families end on an ordinary assistant turn.
+    #[test]
+    fn ordinary_generation_prompts_have_no_trace() {
         assert_eq!(
             ReasoningMode::detect("<start_of_turn>model\n"),
+            ReasoningMode::None
+        );
+        // gpt-oss's built-in builder pins the FINAL channel: reasoning is off,
+        // and nothing here may claim otherwise.
+        assert_eq!(
+            ReasoningMode::detect("<|start|>assistant<|channel|>final<|message|>"),
             ReasoningMode::None
         );
     }

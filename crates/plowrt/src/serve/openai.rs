@@ -360,6 +360,92 @@ pub enum ContentPart {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// THE POINT OF `SamplingFields`, asserted end to end: the wire form has to
+    /// DESERIALIZE and then actually reach `SamplingParams`. A test that only
+    /// checks the request is accepted passes just as happily when every value
+    /// is thrown away, which is the bug this replaced.
+    #[test]
+    fn every_sampling_knob_survives_the_wire_and_reaches_the_sampler() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{
+                "model": "m",
+                "messages": [],
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "top_k": 20,
+                "min_p": 0.05,
+                "repetition_penalty": 1.1,
+                "presence_penalty": 0.25,
+                "frequency_penalty": 0.5,
+                "logit_bias": {"7": -3.5},
+                "min_tokens": 3,
+                "stop_token_ids": [11, 22]
+            }"#,
+        )
+        .expect("the flattened sampling block deserializes");
+
+        let mut p = crate::text::sample::SamplingParams::default();
+        req.sampling.apply(&mut p);
+        assert_eq!(p.temperature, 0.6);
+        assert_eq!(p.top_p, 0.95);
+        assert_eq!(p.top_k, 20);
+        assert_eq!(p.min_p, 0.05);
+        assert_eq!(p.repetition_penalty, 1.1);
+        assert_eq!(p.presence_penalty, 0.25);
+        assert_eq!(p.frequency_penalty, 0.5);
+        assert_eq!(p.logit_bias, vec![(7u32, -3.5f32)]);
+        assert_eq!(req.sampling.min_tokens, Some(3));
+        assert_eq!(req.sampling.stop_token_ids.as_deref(), Some(&[11u32, 22][..]));
+    }
+
+    /// `flatten` changes how serde drives the WHOLE struct, so the fields that
+    /// are not part of the flattened block have to keep working — `seed` is a
+    /// u64 and `max_completion_tokens` is an alias, both easy to lose.
+    #[test]
+    fn flattening_the_sampling_block_does_not_break_the_other_fields() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[],"seed":18446744073709551615,
+                "max_completion_tokens":128,"stream":true,
+                "stream_options":{"include_usage":true}}"#,
+        )
+        .expect("deserializes");
+        assert_eq!(req.seed, Some(u64::MAX), "a full-width u64 seed survived");
+        assert_eq!(req.max_tokens, Some(128), "the OpenAI alias still applies");
+        assert!(req.stream);
+        assert!(req.stream_options.expect("present").include_usage);
+    }
+
+    /// A request that sets nothing must leave the MODEL's defaults untouched —
+    /// that is what makes `request > model default > server default` work.
+    #[test]
+    fn an_empty_sampling_block_overrides_nothing() {
+        let req: ChatRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[]}"#).expect("deserializes");
+        let mut p = crate::text::sample::SamplingParams {
+            temperature: 0.6,
+            top_p: 0.95,
+            top_k: 20,
+            ..Default::default()
+        };
+        req.sampling.apply(&mut p);
+        assert_eq!((p.temperature, p.top_p, p.top_k), (0.6, 0.95, 20));
+    }
+
+    /// vLLM spells "no top-k" as -1; this sampler spells it 0.
+    #[test]
+    fn vllms_disabled_top_k_maps_to_this_samplers_spelling() {
+        let f = SamplingFields {
+            top_k: Some(-1),
+            ..Default::default()
+        };
+        let mut p = crate::text::sample::SamplingParams::default();
+        f.apply(&mut p);
+        assert_eq!(p.top_k, 0);
+        assert!(f.validate().is_ok());
+    }
+
     use super::{Content, ContentPart, ImageUrl};
 
     #[test]

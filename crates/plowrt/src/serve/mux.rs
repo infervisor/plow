@@ -4278,7 +4278,7 @@ fn gpu_prefill_advance(
 /// mixed in.
 ///
 /// EVERY sampling site goes through this. The three that mattered each called
-/// the seedless `seeded_unit` directly, so `seed` was honoured only on the
+/// a seedless draw helper directly, so `seed` was honoured only on the
 /// no-bucket reference path — i.e. only where there is no model to sample from.
 fn slot_rng01(slot: &Slot) -> f32 {
     crate::serve::seeded_unit_with(&slot.prompt_ids, &slot.out_ids, slot.step, slot.gen.seed)

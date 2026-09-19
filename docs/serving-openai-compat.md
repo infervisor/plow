@@ -193,12 +193,22 @@ model at load, and resolution is now **request > model default > server default*
 
 **`opens_reasoning` searched the whole rendered prompt for `<think>`** — and the rendered prompt
 contains user text. Asking "what does the `<think>` tag do?" routed the entire answer into
-`reasoning_content` and returned an **empty `content`**, on any model, reasoning or not. The
-framing is now a per-model `ReasoningMode`, detected once from what the checkpoint's own
-template emits and matched as a SUFFIX of the generation prompt. Being mode-driven also gives
-gpt-oss's harmony channels a parser instead of leaking the trace into `content`, and makes the
-buffered path agree with the streamed one on a trace that opened and never closed (all of it is
-the trace; the buffered path used to call it the answer).
+`reasoning_content` and returned an **empty `content`**, on any model, reasoning or not.
+
+The framing is now a `ReasoningMode` decided from the rendered prompt's **suffix**, never a
+search of it: `add_generation_prompt` puts the generation prompt last, so only a marker at the
+very end is the model's own, and user text can no longer reach it. It is decided PER REQUEST
+rather than per model, deliberately — it is the rendered prompt that decides, so one rule covers
+the checkpoint's own template, the built-in builders for checkpoints that ship none, and a
+request that turned thinking off with `chat_template_kwargs` (which renders the pair CLOSED and
+so correctly reads as no trace).
+
+The mode also fixes two disagreements between the two response paths: a trace that opened and
+never closed is now reported as all-trace on both (the buffered path used to call it the
+answer), and the streamed path FLUSHES its held tail on the terminal chunk. While inside a trace
+the router withholds the last few bytes in case they begin the close marker; when generation
+ended first those bytes were simply dropped, so streamed `reasoning_content` came back up to
+`len("</think>")-1` bytes shorter than what the model produced.
 
 ## 5. The catalogue, usage and metrics
 
@@ -248,6 +258,14 @@ refused explicitly rather than answered with bytes that do not match the request
   see it before it sends a request whose sampling will be discarded.
 - **Tool calling is refused, not implemented.** The templates can render tool blocks; nothing
   parses a tool call back out of the generation.
+- **Only think-tag reasoning is parsed.** `ReasoningMode` covers `<think>`/`</think>`, which is
+  how GLM, Qwen3 and DeepSeek-R1 frame a trace. gpt-oss's harmony channels are NOT parsed and
+  its trace still reaches `content`. A harmony arm was written and then removed rather than
+  shipped: the built-in `harmony_chat_prompt` pins the FINAL channel (reasoning off), so a mode
+  that assumes a trace is open from token zero would route the whole answer into
+  `reasoning_content` and return an empty `content` — the exact failure this section exists to
+  remove — and there is no gpt-oss checkpoint on this host to settle what the real template
+  renders. The mode enum is the seam: a verified harmony arm is a variant and a close marker.
 - **The handler projects each message to `{role, content}` before rendering**, so a template
   never sees `tool_calls`, `name` or `reasoning_content`, and `tools` is passed as none. Kimi's
   template keys the speaker off `message.get('name')`, and every family renders an assistant

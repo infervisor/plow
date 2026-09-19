@@ -2877,7 +2877,7 @@ struct PackedTokenReq<'a> {
 /// Per-row device sampling request (plan stage 4). `temp <= 0` is greedy
 /// (the device sampler writes the argmax, identical to `ARGMAX_FIN`), so a
 /// spec array can carry greedy and stochastic rows together. `rng01` is the
-/// request's per-step uniform draw (`seeded_unit`), so a fixed seed is
+/// request's per-step uniform draw (`serve::seeded_unit_with`), so a fixed seed is
 /// reproducible.
 #[derive(Clone, Copy)]
 pub struct DevSample {

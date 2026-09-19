@@ -299,8 +299,11 @@ pub async fn chat_completions(
     let ingress = mux.ingress();
     // Tokenize HERE, on the handler task — the dispatcher loop is the
     // serialized decode critical path and must never encode a long prompt.
-    let reasoning_mode = bundle.serving().reasoning;
-    let reasoning_open = reasoning_mode.opens(&prompt);
+    // Decided from the prompt that was actually rendered, so it is right for
+    // the checkpoint's template, for the built-in builders, and for a request
+    // that turned thinking off.
+    let reasoning_mode = crate::serve::config::ReasoningMode::detect(&prompt);
+    let reasoning_open = reasoning_mode.opens();
     let prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
         bundle.tokenizer().encode(&prompt)
     });
@@ -891,6 +894,16 @@ fn sse_response(
                         (Event::default().data(stream_mod::chunk_data(&ch)), false)
                     }
                     StreamChunk::Done { reason, usage, .. } => {
+                        // FLUSH THE HELD TAIL. While inside a trace the router
+                        // withholds the last few bytes in case they are the
+                        // start of the close marker; if the generation ends
+                        // first — `max_tokens` inside the trace, a shed, a
+                        // disconnect — those bytes were simply dropped, so the
+                        // streamed `reasoning_content` ended up to
+                        // `close.len()-1` bytes shorter than what the model
+                        // actually produced, and shorter than the buffered path
+                        // reports for the same generation.
+                        let flushed = (!st.hold.is_empty()).then(|| std::mem::take(&mut st.hold));
                         let ch = ChatChunk {
                             id: request_id.clone(),
                             object: "chat.completion.chunk",
@@ -901,7 +914,7 @@ fn sse_response(
                                 delta: Delta {
                                     role: None,
                                     content: None,
-                                    reasoning_content: None,
+                                    reasoning_content: flushed,
                                 },
                                 // The wire value: "preempted" is not an OpenAI
                                 // finish_reason and a typed client rejects it.
@@ -1160,18 +1173,6 @@ mod tests {
         assert_eq!(a, "");
     }
 
-    /// gpt-oss frames its trace as harmony channels, not a think tag; the
-    /// trace used to land in `content` verbatim for that family.
-    #[test]
-    fn harmony_splits_at_the_final_channel() {
-        let (r, a) = super::split_reasoning(
-            ReasoningMode::Harmony,
-            true,
-            "deliberating<|channel|>final<|message|>Paris.",
-        );
-        assert_eq!(r.as_deref(), Some("deliberating"));
-        assert_eq!(a, "Paris.");
-    }
 
     /// Pinned against `encoding_k3.py::build_chat_segments` RUN on the real
     /// moonshotai/Kimi-K3 snapshot with `thinking=False, add_generation_prompt=True`,

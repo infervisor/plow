@@ -80,18 +80,8 @@ impl ModelBundle {
         // absent / feature off). Loaded once at startup, shared per request.
         let tokenizer = load_tokenizer(&dir);
         let chat_template = crate::serve::template::ChatTemplate::load(&dir);
-        let mut serving = crate::serve::config::ServingConfig::load(&dir);
-        // Decide the reasoning framing ONCE, from what this checkpoint's own
-        // template emits for a trivial conversation. Doing it here rather than
-        // per request is what stops user text from deciding it.
-        if let Some(t) = &chat_template {
-            let probe = [serde_json::json!({"role": "user", "content": "x"})];
-            if let Ok(rendered) = t.render(&probe) {
-                serving.reasoning = crate::serve::config::ReasoningMode::detect(&rendered);
-            }
-        }
+        let serving = crate::serve::config::ServingConfig::load(&dir);
         tracing::info!(
-            reasoning = ?serving.reasoning,
             temperature = serving.default_sampling.temperature,
             top_p = serving.default_sampling.top_p,
             top_k = serving.default_sampling.top_k,
