@@ -3424,11 +3424,7 @@ fn run_one_tick(
                 for (row, &slot_idx) in owner_of_row.iter().enumerate() {
                     let slot = slots[slot_idx].as_ref().expect("owner is Some");
                     obs.host.slot_params.push(slot.gen.params.clone());
-                    obs.host.slot_rng01.push(seeded_unit(
-                        &slot.prompt_ids,
-                        &slot.out_ids,
-                        slot.step,
-                    ));
+                    obs.host.slot_rng01.push(slot_rng01(slot));
                     let row_slice = &mut obs.host.logits[row * v..(row + 1) * v];
                     reference_logits_row(&slot.prompt_ids, &slot.out_ids, row_slice);
                 }
@@ -3513,6 +3509,7 @@ fn run_one_tick(
                         &slot.out_ids,
                         slot.step,
                         bufs.vocab,
+                        slot.gen.seed,
                     )
                 } else {
                     // No bucket in the bundle — direct-sample against reference
@@ -4277,17 +4274,27 @@ fn gpu_prefill_advance(
     gpu_finish_token(e, 0, slot, tok).map(Some)
 }
 
+/// The per-step stochastic draw for one slot, with the request's OpenAI `seed`
+/// mixed in.
+///
+/// EVERY sampling site goes through this. The three that mattered each called
+/// the seedless `seeded_unit` directly, so `seed` was honoured only on the
+/// no-bucket reference path — i.e. only where there is no model to sample from.
+fn slot_rng01(slot: &Slot) -> f32 {
+    crate::serve::seeded_unit_with(&slot.prompt_ids, &slot.out_ids, slot.step, slot.gen.seed)
+}
+
 /// Device-sampling eligibility for a slot (plan stage 4). `Some(spec)` when the
-/// row is `temperature>0` with NO repetition penalty and NO logit bias — the
-/// device sampler handles temperature/top_k/top_p/min_p but not penalties or
-/// bias (those need per-row history the device doesn't own yet), so those rows
-/// keep the host path. `rng01` is the same per-step seeded draw the host uses,
-/// so a fixed seed stays reproducible. Greedy rows return `None` (the device
-/// argmax already equals `ARGMAX_FIN`).
+/// row is `temperature>0` and needs no per-row token history — the device
+/// sampler handles temperature/top_k/top_p/min_p but not the penalties or the
+/// logit bias, so those rows keep the host path (see
+/// [`SamplingParams::needs_host_logits`]). `rng01` is the same per-step seeded
+/// draw the host uses, so a fixed seed stays reproducible. Greedy rows return
+/// `None` (the device argmax already equals `ARGMAX_FIN`).
 #[cfg(feature = "cuda")]
 fn dev_sample_spec(slot: &Slot) -> Option<crate::exec::gpu::DevSample> {
     let p = &slot.gen.params;
-    if p.temperature <= 0.0 || p.repetition_penalty != 1.0 || !p.logit_bias.is_empty() {
+    if p.temperature <= 0.0 || p.needs_host_logits() {
         return None;
     }
     Some(crate::exec::gpu::DevSample {
@@ -4295,7 +4302,7 @@ fn dev_sample_spec(slot: &Slot) -> Option<crate::exec::gpu::DevSample> {
         top_k: p.top_k as i32,
         top_p: p.top_p,
         min_p: p.min_p,
-        rng01: seeded_unit(&slot.prompt_ids, &slot.out_ids, slot.step),
+        rng01: slot_rng01(slot),
     })
 }
 
@@ -4313,7 +4320,7 @@ fn gpu_finish_token(
         logits.clear();
         e.logits_row(row, &mut logits)?;
         crate::text::sample::apply_penalties(&mut logits, &slot.out_ids, &slot.gen.params);
-        let rng = seeded_unit(&slot.prompt_ids, &slot.out_ids, slot.step);
+        let rng = slot_rng01(slot);
         let tok = crate::text::sample::sample(&logits, &slot.gen.params, None, rng);
         e.return_logits_buf(logits);
         return Ok(tok);
@@ -4323,7 +4330,7 @@ fn gpu_finish_token(
 
 #[cfg(feature = "cuda")]
 fn gpu_argmax_eligible(params: &crate::text::sample::SamplingParams) -> bool {
-    params.temperature <= 0.0 && params.repetition_penalty == 1.0 && params.logit_bias.is_empty()
+    params.temperature <= 0.0 && !params.needs_host_logits()
 }
 
 /// Incremental detokenize over a bounded window (TGI scheme): decode only
@@ -4400,11 +4407,17 @@ fn handle_produced_token(
     // `special`. Kimi-K3's turn ends at `<|close|>`, which its own
     // `added_tokens_decoder` flags `"special": false`, so it renders literally and the
     // answer came back as `The capital of France is Paris.<|close|>`.
+    // `min_tokens` holds EVERY stop condition off, not just the eos set: a
+    // request that asks for at least N tokens and is cut short by a `stop`
+    // string at token 3 has had the parameter ignored just as surely.
+    let below_min = slot.out_ids.len() < slot.gen.min_tokens;
     let stop_token = !slot.gen.ignore_eos
-        && match stop_ids {
-            Some(ids) => ids.contains(&token),
-            None => token % 256 == u32::from(b'\n'),
-        };
+        && !below_min
+        && (slot.gen.stop_token_ids.contains(&token)
+            || match stop_ids {
+                Some(ids) => ids.contains(&token),
+                None => token % 256 == u32::from(b'\n'),
+            });
 
     // OPENAI `stop` STRINGS. The request field was not parsed at all before, so
     // a client that relied on `stop` to end a step — every LangChain ReAct or
@@ -4415,7 +4428,7 @@ fn handle_produced_token(
     // `ignore_eos` suppresses this too: a benchmark that asks for exactly
     // `--random-output-len` tokens must not be cut short by an accidental match.
     let mut stop_str_cut: Option<usize> = None;
-    if !slot.gen.ignore_eos && !slot.gen.stop.is_empty() && !delta.is_empty() {
+    if !slot.gen.ignore_eos && !below_min && !slot.gen.stop.is_empty() && !delta.is_empty() {
         let keep = slot
             .gen
             .stop
@@ -4446,6 +4459,7 @@ fn handle_produced_token(
     let mut delta = delta;
     if stop_str_cut.is_none()
         && !slot.gen.ignore_eos
+        && !below_min
         && !slot.gen.stop.is_empty()
         && !delta.is_empty()
     {

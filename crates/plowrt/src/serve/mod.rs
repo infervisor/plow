@@ -4,6 +4,7 @@ pub mod admin;
 pub mod bench;
 pub mod chat;
 pub mod completion;
+pub mod config;
 pub mod cosched;
 #[cfg(feature = "cpu")]
 pub mod cpu_serve;
@@ -67,6 +68,12 @@ pub struct GenParams {
     pub stop: Vec<String>,
     /// OpenAI `seed`, mixed into the sampling draw for reproducibility.
     pub seed: Option<u64>,
+    /// vLLM `min_tokens`: neither the eos set nor a `stop` string may end this
+    /// request before it has produced this many tokens.
+    pub min_tokens: usize,
+    /// vLLM `stop_token_ids`: request-supplied ids that end generation, on top
+    /// of the checkpoint's own eos set.
+    pub stop_token_ids: Vec<u32>,
 }
 
 impl Default for GenParams {
@@ -77,6 +84,8 @@ impl Default for GenParams {
             ignore_eos: false,
             stop: Vec::new(),
             seed: None,
+            min_tokens: 0,
+            stop_token_ids: Vec::new(),
         }
     }
 }
@@ -707,7 +716,7 @@ impl AppState {
 
         for step in 0..gen.max_tokens.max(1) {
             obs.host.tokens.clear();
-            obs.host.rng01 = seeded_unit(&prompt_ids, &out_ids, step);
+            obs.host.rng01 = seeded_unit_with(&prompt_ids, &out_ids, step, gen.seed);
             reference_logits(&prompt_ids, &out_ids, vocab, &mut obs.host.logits);
 
             let token = if let Some((bucket, pool, streams)) = run.as_mut() {
@@ -798,9 +807,10 @@ impl AppState {
         out_ids: &[u32],
         step: usize,
         vocab: usize,
+        seed: Option<u64>,
     ) -> Result<(u32, usize)> {
         obs.host.tokens.clear();
-        obs.host.rng01 = seeded_unit(prompt_ids, out_ids, step);
+        obs.host.rng01 = seeded_unit_with(prompt_ids, out_ids, step, seed);
         reference_logits(prompt_ids, out_ids, vocab, &mut obs.host.logits);
 
         let stats = self

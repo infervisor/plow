@@ -16,10 +16,24 @@
 //! class. The hardcoded builders stay as the fallback for checkpoints that ship
 //! no template (Kimi-K3 ships none).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use minijinja::{Environment, Value};
+
+/// Per-request template variables.
+#[derive(Clone, Debug, Default)]
+pub struct RenderOpts {
+    /// vLLM `chat_template_kwargs`, bound as top-level template variables —
+    /// which is what `transformers` does with `apply_chat_template(**kwargs)`.
+    pub kwargs: BTreeMap<String, serde_json::Value>,
+    /// OpenAI `reasoning_effort`.
+    pub reasoning_effort: Option<String>,
+    /// vLLM `continue_final_message`: render the last assistant turn as a
+    /// prefix to continue instead of opening a fresh one.
+    pub continue_final_message: bool,
+}
 
 /// A checkpoint's chat template, compiled once at load.
 pub struct ChatTemplate {
@@ -252,23 +266,53 @@ impl ChatTemplate {
         }))
     }
 
-    /// Render `messages` with `add_generation_prompt=true`.
+    /// Render `messages` with `add_generation_prompt=true` and no extra
+    /// template variables.
+    pub fn render(&self, messages: &[serde_json::Value]) -> Result<String, String> {
+        self.render_with(messages, &RenderOpts::default())
+    }
+
+    /// Render `messages` under `opts`.
     ///
     /// Returns `Err` with the template's own message when the conversation is
     /// one the template refuses (`raise_exception`), so the caller can answer
     /// 400 instead of serving a malformed prompt.
-    pub fn render(&self, messages: &[serde_json::Value]) -> Result<String, String> {
+    pub fn render_with(
+        &self,
+        messages: &[serde_json::Value],
+        opts: &RenderOpts,
+    ) -> Result<String, String> {
         let tmpl = self
             .env
             .get_template("chat")
             .map_err(|e| e.to_string())?;
-        tmpl.render(minijinja::context! {
-            messages => Value::from_serialize(messages),
-            add_generation_prompt => true,
-            bos_token => self.bos_token.clone(),
-            eos_token => self.eos_token.clone(),
-            tools => Value::from(()),
-        })
+
+        // The base variables `transformers` always binds, then the caller's
+        // `chat_template_kwargs` on top. Merged rather than fixed because
+        // `enable_thinking` — the flag every Qwen3/GLM client uses to turn
+        // reasoning off — is just one of an open set a template may read, and
+        // a fixed context silently drops all of them.
+        let mut ctx: BTreeMap<String, Value> = BTreeMap::new();
+        ctx.insert("messages".into(), Value::from_serialize(messages));
+        ctx.insert(
+            "add_generation_prompt".into(),
+            Value::from(!opts.continue_final_message),
+        );
+        ctx.insert(
+            "continue_final_message".into(),
+            Value::from(opts.continue_final_message),
+        );
+        ctx.insert("bos_token".into(), Value::from(self.bos_token.clone()));
+        ctx.insert("eos_token".into(), Value::from(self.eos_token.clone()));
+        ctx.insert("tools".into(), Value::from(()));
+        if let Some(effort) = &opts.reasoning_effort {
+            ctx.insert("reasoning_effort".into(), Value::from(effort.clone()));
+        }
+        for (k, v) in &opts.kwargs {
+            ctx.insert(k.clone(), Value::from_serialize(v));
+        }
+
+        tmpl.render(Value::from_serialize(&ctx))
         .map_err(|e| {
             // minijinja chains the cause; the innermost is the template's own
             // `raise_exception` message, which is the useful half.

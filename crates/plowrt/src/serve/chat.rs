@@ -128,6 +128,16 @@ pub async fn chat_completions(
         }
     }
 
+    if let Err(e) = req.sampling.validate() {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            e.message,
+            "invalid_request_error",
+            Some("invalid_value"),
+            Some(e.field.into()),
+        );
+    }
+
     // §TTFT: the clock the breakdown is measured against starts HERE, at the
     // first line of the handler that has the request body — everything before
     // it (accept, read, JSON decode) is axum's and shows up as UNACCOUNTED.
@@ -139,6 +149,11 @@ pub async fn chat_completions(
     // reference path keeps the simple role-prefix flatten — its logits are a
     // stand-in, so a template would be costume jewelry there.
     let mut template_error: Option<String> = None;
+    let render_opts = crate::serve::template::RenderOpts {
+        kwargs: req.chat_template_kwargs.clone().unwrap_or_default(),
+        reasoning_effort: req.reasoning_effort.clone(),
+        continue_final_message: req.continue_final_message.unwrap_or(false),
+    };
     let prompt = crate::obs::ttft::timed(&crate::obs::ttft::TEMPLATE, || {
         if state.has_gpu_engine(&req.model) {
             let tok = state.registry.get(&req.model).ok();
@@ -157,7 +172,7 @@ pub async fn chat_completions(
                         })
                     })
                     .collect();
-                match t.render(&msgs) {
+                match t.render_with(&msgs, &render_opts) {
                     Ok(p) => return p,
                     Err(e) => {
                         // The template REFUSED this conversation (HF templates
@@ -194,17 +209,23 @@ pub async fn chat_completions(
         );
     }
 
-    // Build generation controls from the request.
-    let mut gen = crate::serve::GenParams::default();
+    // Build generation controls: the CHECKPOINT's defaults first, then the
+    // request's own fields on top. Resolution order is
+    // `request > model default > server default` — before this, the model
+    // default step did not exist and every checkpoint was served at the stock
+    // temperature 1.0 / top_p 1.0 whatever its `generation_config.json` said.
+    let mut gen = crate::serve::GenParams {
+        params: state
+            .registry
+            .get(&req.model)
+            .map(|b| b.serving().default_sampling.clone())
+            .unwrap_or_default(),
+        ..Default::default()
+    };
     if let Some(m) = req.max_tokens {
         gen.max_tokens = m as usize;
     }
-    if let Some(t) = req.temperature {
-        gen.params.temperature = t;
-    }
-    if let Some(p) = req.top_p {
-        gen.params.top_p = p;
-    }
+    req.sampling.apply(&mut gen.params);
     if let Some(ignore) = req.ignore_eos {
         gen.ignore_eos = ignore;
     }
@@ -212,6 +233,20 @@ pub async fn chat_completions(
         gen.stop = stop.list();
     }
     gen.seed = req.seed;
+    gen.min_tokens = req.sampling.min_tokens.unwrap_or(0) as usize;
+    gen.stop_token_ids = req.sampling.stop_token_ids.clone().unwrap_or_default();
+    if gen.min_tokens > gen.max_tokens {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "`min_tokens` ({}) exceeds `max_tokens` ({}); the request could never finish",
+                gen.min_tokens, gen.max_tokens
+            ),
+            "invalid_request_error",
+            Some("invalid_value"),
+            Some("min_tokens".into()),
+        );
+    }
 
     // NO VISION PATH EXISTS. `Content::as_text()` flattens a multipart message by
     // keeping the `Text` parts and dropping everything else, so an `image_url`
@@ -253,7 +288,8 @@ pub async fn chat_completions(
     let ingress = mux.ingress();
     // Tokenize HERE, on the handler task — the dispatcher loop is the
     // serialized decode critical path and must never encode a long prompt.
-    let reasoning_open = opens_reasoning(&prompt);
+    let reasoning_mode = bundle.serving().reasoning;
+    let reasoning_open = reasoning_mode.opens(&prompt);
     let prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
         bundle.tokenizer().encode(&prompt)
     });
@@ -299,11 +335,20 @@ pub async fn chat_completions(
             t_arrive,
             n_prompt,
             created,
+            reasoning_mode,
             reasoning_open,
         )
         .into_response()
     } else {
-        buffer_and_reply(request_id, req.model, rx, created).await
+        buffer_and_reply(
+            request_id,
+            req.model,
+            rx,
+            created,
+            reasoning_mode,
+            reasoning_open,
+        )
+        .await
     }
 }
 
@@ -512,18 +557,29 @@ fn glm_chat_prompt(messages: &[Message]) -> String {
 /// user-visible `content` as literal text along with the whole trace. Returns
 /// `(None, whole)` until the marker is seen, which is also the correct answer
 /// for a model that never opened a trace.
-pub fn split_reasoning(text: &str) -> (Option<String>, String) {
-    const CLOSE: &str = "</think>";
-    match text.find(CLOSE) {
+pub fn split_reasoning(
+    mode: crate::serve::config::ReasoningMode,
+    active: bool,
+    text: &str,
+) -> (Option<String>, String) {
+    let Some(close) = mode.close_marker().filter(|_| active) else {
+        return (None, text.to_string());
+    };
+    match text.find(close) {
         Some(i) => {
             let reasoning = text[..i].trim().to_string();
-            let answer = text[i + CLOSE.len()..].trim_start().to_string();
-            (
-                (!reasoning.is_empty()).then_some(reasoning),
-                answer,
-            )
+            let answer = text[i + close.len()..].trim_start().to_string();
+            ((!reasoning.is_empty()).then_some(reasoning), answer)
         }
-        None => (None, text.to_string()),
+        // Opened and never closed — the model ran out of `max_tokens` inside
+        // its own trace. ALL of it is the trace: there is no answer yet. The
+        // streamed path has always reported it that way (every delta went to
+        // `reasoning_content`), so returning it as `content` here made the two
+        // paths disagree about the same generation.
+        None => {
+            let trace = text.trim();
+            ((!trace.is_empty()).then(|| trace.to_string()), String::new())
+        }
     }
 }
 
@@ -561,6 +617,8 @@ async fn buffer_and_reply(
     model: String,
     mut rx: stream_mod::ChunkReceiver,
     created: u64,
+    reasoning_mode: crate::serve::config::ReasoningMode,
+    reasoning_open: bool,
 ) -> Response {
     let mut text = String::new();
     // `None` until a terminal chunk arrives. It must NOT default to "stop": the
@@ -615,7 +673,7 @@ async fn buffer_and_reply(
     // and the trace goes to `reasoning_content`, which is where a reasoning
     // model's clients look for it. A model that never opened a trace is
     // unaffected — `split_reasoning` returns the whole string as the answer.
-    let (reasoning, answer) = split_reasoning(&text);
+    let (reasoning, answer) = split_reasoning(reasoning_mode, reasoning_open, &text);
     Json(ChatResponse {
         id: request_id.clone(),
         object: "chat.completion",
@@ -640,22 +698,6 @@ async fn buffer_and_reply(
         usage,
     })
     .into_response()
-}
-
-/// Does the prompt hand generation an OPEN `<think>` block?
-///
-/// Only then do the first tokens belong in `reasoning_content`. The GLM
-/// template ends its generation prompt with `<|assistant|><think>`; Gemma,
-/// Llama and Qwen templates end with an ordinary assistant turn. Assuming
-/// reasoning unconditionally routed the first token of EVERY model into
-/// `reasoning_content` and left `delta.content` absent on the chunk that
-/// stamps the client's TTFT — the same measurement hazard the role delta
-/// documents below, reached by a different path.
-fn opens_reasoning(prompt: &str) -> bool {
-    match prompt.rfind("<think>") {
-        None => false,
-        Some(open) => prompt.rfind("</think>").is_none_or(|close| close < open),
-    }
 }
 
 /// Streaming path: one SSE `chat.completion.chunk` frame per produced token,
@@ -686,8 +728,13 @@ fn sse_response(
     t_arrive: std::time::Instant,
     n_prompt: usize,
     created: u64,
+    reasoning_mode: crate::serve::config::ReasoningMode,
     reasoning_open: bool,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    // The close marker for THIS model's framing. `None` means the model has no
+    // separable trace, in which case every delta is content and the hold buffer
+    // is never used.
+    let close_marker = reasoning_mode.close_marker();
     // State threaded through the unfold: the receiver, and the tail frames
     // (optional usage-only chunk, then [DONE]) drained one per poll.
     struct SseState {
@@ -707,7 +754,7 @@ fn sse_response(
             rx,
             done: false,
             role_pending: true,
-            in_reasoning: reasoning_open,
+            in_reasoning: reasoning_open && close_marker.is_some(),
             hold: String::new(),
             pending: std::collections::VecDeque::new(),
         },
@@ -756,13 +803,13 @@ fn sse_response(
                         // trace closes. `</think>` is NOT a special token, so
                         // without this the whole trace and the literal marker
                         // land in the user-visible `content`.
-                        const CLOSE: &str = "</think>";
+                        let close = close_marker.unwrap_or("</think>");
                         let (reasoning, content) = if st.in_reasoning {
                             st.hold.push_str(&text);
-                            match st.hold.find(CLOSE) {
+                            match st.hold.find(close) {
                                 Some(i) => {
                                     let before = st.hold[..i].to_string();
-                                    let after = st.hold[i + CLOSE.len()..].to_string();
+                                    let after = st.hold[i + close.len()..].to_string();
                                     st.hold.clear();
                                     st.in_reasoning = false;
                                     (
@@ -773,7 +820,7 @@ fn sse_response(
                                 None => {
                                     // Hold back only as much as could still be
                                     // a prefix of the marker; emit the rest.
-                                    let keep = CLOSE.len().min(st.hold.len());
+                                    let keep = close.len().min(st.hold.len());
                                     let cut = (0..=keep)
                                         .rev()
                                         .map(|k| st.hold.len() - k)
@@ -895,6 +942,7 @@ fn sse_response(
 #[cfg(test)]
 mod tests {
     use super::{gemma_chat_prompt, k3_chat_prompt, request_id, Message};
+    use crate::serve::config::ReasoningMode;
 
     #[test]
     fn request_ids_are_unique() {
@@ -1014,7 +1062,11 @@ mod tests {
     /// text along with the whole trace.
     #[test]
     fn the_reasoning_trace_is_split_out_of_the_answer() {
-        let (r, a) = super::split_reasoning("weighing it up</think>The answer is 4.");
+        let (r, a) = super::split_reasoning(
+            ReasoningMode::ThinkTag,
+            true,
+            "weighing it up</think>The answer is 4.",
+        );
         assert_eq!(r.as_deref(), Some("weighing it up"));
         assert_eq!(a, "The answer is 4.");
     }
@@ -1022,23 +1074,57 @@ mod tests {
     /// A model that never opened a trace must come back unchanged, not empty.
     #[test]
     fn text_without_a_think_marker_is_all_answer() {
-        let (r, a) = super::split_reasoning("just an answer");
+        let (r, a) = super::split_reasoning(ReasoningMode::ThinkTag, false, "just an answer");
         assert!(r.is_none());
         assert_eq!(a, "just an answer");
     }
 
+    /// THE REGRESSION. A NON-reasoning model whose answer happens to contain
+    /// `</think>` — because the user asked about the tag — must not have that
+    /// treated as a trace boundary. Under the old probe the answer text was
+    /// searched and everything before the marker vanished from `content`.
     #[test]
-    fn only_an_open_think_block_starts_the_reasoning_router() {
-        // GLM's generation prompt hands generation an open trace.
-        assert!(super::opens_reasoning("<|assistant|><think>"));
-        // A closed trace in the HISTORY does not.
-        assert!(!super::opens_reasoning(
-            "<|assistant|><think></think>hi<|user|>again<|assistant|>"
-        ));
-        // Gemma, Llama and Qwen never mention it.
-        assert!(!super::opens_reasoning("<start_of_turn>model\n"));
-        // `</think>` must not read as an opening marker.
-        assert!(!super::opens_reasoning("done</think>"));
+    fn a_non_reasoning_model_never_splits_on_the_marker() {
+        let (r, a) = super::split_reasoning(
+            ReasoningMode::None,
+            false,
+            "the </think> tag closes a thinking block",
+        );
+        assert!(r.is_none());
+        assert_eq!(a, "the </think> tag closes a thinking block");
+    }
+
+    /// A think-tag model served with thinking DISABLED (`enable_thinking:
+    /// false` renders `<think></think>`) is not inside a trace either.
+    #[test]
+    fn thinking_disabled_leaves_the_whole_generation_as_content() {
+        let (r, a) =
+            super::split_reasoning(ReasoningMode::ThinkTag, false, "plain answer</think>x");
+        assert!(r.is_none());
+        assert_eq!(a, "plain answer</think>x");
+    }
+
+    /// Opened and never closed: the model spent its whole budget thinking.
+    /// The STREAMED path reports that as all-reasoning, so the buffered path
+    /// must agree — it used to return the trace as `content`.
+    #[test]
+    fn an_unclosed_trace_is_all_reasoning_on_both_paths() {
+        let (r, a) = super::split_reasoning(ReasoningMode::ThinkTag, true, "still thinking");
+        assert_eq!(r.as_deref(), Some("still thinking"));
+        assert_eq!(a, "");
+    }
+
+    /// gpt-oss frames its trace as harmony channels, not a think tag; the
+    /// trace used to land in `content` verbatim for that family.
+    #[test]
+    fn harmony_splits_at_the_final_channel() {
+        let (r, a) = super::split_reasoning(
+            ReasoningMode::Harmony,
+            true,
+            "deliberating<|channel|>final<|message|>Paris.",
+        );
+        assert_eq!(r.as_deref(), Some("deliberating"));
+        assert_eq!(a, "Paris.");
     }
 
     /// Pinned against `encoding_k3.py::build_chat_segments` RUN on the real
