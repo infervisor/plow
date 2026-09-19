@@ -453,14 +453,29 @@ the corrected roofline model is right.
    TLB/page behaviour at full scale could be worse than measured. The conclusion
    "kernels are not the bottleneck" is strongly indicated, not proven at scale.
 
-1b. **THE OPEN QUESTION: where the other ~43 ms goes.** Not yet attributed.
-   `PLOW_STEP_TIME=1` exists and reports gap/submit/sync/upload/kernel/download, but
-   its `log_every` sits on the `step_slots` path and this model decodes through the
-   **token-batch route** (`route="unified-token-batch" ... fires=true`), which is not
-   instrumented — nothing is emitted with `PLOW_STEP_TIME=1` and `PLOW_MULTISTEP=0`.
-   Wiring StepTiming into the token-batch route, or adding an equivalent event pair
-   there, is the single highest-value next step in the whole campaign: it decides
-   whether the 43 ms is host gap, submission, sync, or inside the cooperative launch.
+1b. **THE OPEN QUESTION: where the other ~43 ms goes.** Still not attributed, and the
+   attempt taught something worth recording so the next session starts ahead.
+
+   `PLOW_STEP_TIME=1` reports gap/submit/sync/upload/kernel/download but its
+   `StepTiming::log_every(128)` (gpu.rs:6228) sits inside `step_slots_sampled`.
+   Instrumentation was added to the GPU engine's `token_batch_step`
+   (`exec/gpu/token_batch.rs`, same `PLOW_STEP_TIME` knob, splitting host-side
+   `enqueue` from `terminal` which carries the device wait). It is correct and
+   committed — but it did not answer the question, because:
+
+   * `token_batch_step` fires **once per request**, at prefill (`rows=16` for a
+     39-token prompt), not per decode step: a 64-token generation produced exactly
+     ONE `unified token batch committed`.
+   * `step_slots_sampled`'s own timer also produced nothing across a 300-token
+     generation with `PLOW_MULTISTEP=0`, so C1 decode is not going through that
+     function either.
+
+   So the C1 decode step traverses a THIRD path, reached via the serve layer's own
+   `token_batch_step` (`serve/engine.rs:4361` -> `AmdServe::token_batch_step`), and
+   finding it is the prerequisite for attributing the 43 ms. Start there, not at
+   `PLOW_STEP_TIME`. The added instrumentation is still worth keeping: it will report
+   as soon as the GPU token-batch route drives decode, which is what happens at higher
+   concurrency, exactly where the serving-throughput cells live.
 
    What is already excluded as the explanation, each by measurement against the 12B
    control or a standalone bench:
