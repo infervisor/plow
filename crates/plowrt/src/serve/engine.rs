@@ -293,7 +293,7 @@ impl ServeEngine {
     pub fn kv_admission_budget(&self) -> Option<crate::sched::admission::KvBudget> {
         match self {
             #[cfg(feature = "cuda")]
-            ServeEngine::Cuda(_) => None,
+            ServeEngine::Cuda(e) => e.kv_admission(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.kv_admission_budget(),
             #[cfg(feature = "cpu")]

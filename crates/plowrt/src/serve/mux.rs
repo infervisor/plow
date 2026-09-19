@@ -3956,7 +3956,7 @@ fn gpu_prefill_batched_pass(
     if budget_max == 0 {
         return tick_fault;
     }
-    let per_launch = (if cold && !bounded_tick {
+    let per_launch = (if cold && !bounded_tick && pf_interleave_rows() == usize::MAX {
         budget_max
     } else {
         pf_interleave_rows().min(budget_max)
@@ -4055,11 +4055,15 @@ fn gpu_prefill_batched_pass(
                 planned: true,
             })
             .collect();
+        let pf_batch_cfg = crate::config::RuntimeConfig::get().pf_batch;
+        let packing_enabled = pf_batch_cfg.unwrap_or_else(|| {
+            candidates.first().map(|c| c.span.n_rows < 1024).unwrap_or(true)
+        });
         let step = crate::sched::step::plan(
             e.step_backend(),
             crate::sched::step::Tick {
                 cap_rows: u32::try_from(per_launch).unwrap_or(u32::MAX),
-                packing: true,
+                packing: packing_enabled,
                 rotate: false,
                 turn: e.prefill_turn(),
                 slots: cap.min(slots.len()),
