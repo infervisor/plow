@@ -18,11 +18,20 @@ hf_dir = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
 gpu = "H100 SXM5"
 arch = "sm_90a"
 n_cu = 132
-# The 8K rung needs 8192 input + 128 output = 8320 live positions, so a packet compiled
-# at exactly 8192 rejects every 8192-token request with "context length exceeded:
-# prompt + max_tokens = 8320 exceeds the compiled context 8192" and the top rung of the
-# ladder silently produces no cell. (The 12B recipe sidesteps this with max_ctx 16384.)
-max_ctx = 8704
+# TWO constraints pin this, and 8192 satisfies neither for the 8K rung:
+#
+#  1. The 8K rung needs 8192 input + 128 output = 8320 live positions. A packet compiled
+#     at exactly 8192 rejects every 8192-token request ("context length exceeded:
+#     prompt + max_tokens = 8320 exceeds the compiled context 8192") and the top rung of
+#     the ladder silently produces no cell.
+#  2. max_ctx must be a MULTIPLE OF 2048. The full-attention KV head window is
+#     max_ctx * global_head_dim(512) * 2 B, and the VMM pool requires it to be a
+#     multiple of the 2 MiB allocation granularity. 8704 loads and then dies with
+#     "vmm: head window 8912896 B not a multiple of granularity 2097152"
+#     (8704*512*2 = 4.25 granules). 8192 happens to work (exactly 4).
+#
+# 10240 is the smallest value satisfying both (5 granules). The 12B recipe's 16384 is 8.
+max_ctx = 10240
 precision = "bf16"
 
 [emit]
