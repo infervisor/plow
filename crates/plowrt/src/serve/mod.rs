@@ -376,6 +376,9 @@ pub struct AppState {
     /// slug -> compiled context length, captured when the engine is installed
     /// so a model card never has to take the engine mutex behind a live tick.
     max_ctx: RwLock<FxHashMap<String, usize>>,
+    /// slug -> whether its backend applies the request's sampling parameters.
+    /// Captured at install for the same reason as `max_ctx`.
+    sampling_honoured: RwLock<FxHashMap<String, bool>>,
     /// When set, each run records a timeline dumpable at `GET /trace`.
     record_trace: bool,
     trace: Mutex<Timeline>,
@@ -434,6 +437,7 @@ impl AppState {
             control: Mutex::new(FxHashMap::default()),
             started: openai::now_secs(),
             max_ctx: RwLock::new(FxHashMap::default()),
+            sampling_honoured: RwLock::new(FxHashMap::default()),
             record_trace,
             trace: Mutex::new(Timeline::new()),
         }
@@ -447,6 +451,9 @@ impl AppState {
             self.vmm_stats.write().insert(slug.clone(), h);
         }
         self.max_ctx.write().insert(slug.clone(), engine.max_ctx());
+        self.sampling_honoured
+            .write()
+            .insert(slug.clone(), engine.honours_sampling());
         self.gpu.write().insert(slug, Arc::new(Mutex::new(engine)));
     }
 
@@ -458,6 +465,13 @@ impl AppState {
     /// The compiled context length for `slug`, when an engine reported one.
     pub fn max_ctx(&self, slug: &str) -> Option<usize> {
         self.max_ctx.read().get(slug).copied()
+    }
+
+    /// Whether `slug`'s backend applies the request's sampling parameters.
+    /// `true` when no engine is installed — the CPU reference path samples on
+    /// the host, so there is nothing to warn about.
+    pub fn sampling_honoured(&self, slug: &str) -> bool {
+        self.sampling_honoured.read().get(slug).copied().unwrap_or(true)
     }
 
     /// The GPU engine serving `slug`, when one was installed.
@@ -863,7 +877,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize))
         .route("/v1/models", get(models::list_models))
-        .route("/v1/models/{id}", get(models::get_model))
+        .route("/v1/models/:id", get(models::get_model))
         // BOTH spellings. vLLM serves `/health`, and every k8s probe and
         // benchmark harness copied from vLLM asks for it; plowrt served only
         // `/healthz`, so all of them got a 404 from a healthy server.

@@ -59,10 +59,13 @@ fn read_to_string(p: &Path) -> Option<String> {
 
 /// The template text plus the special tokens, from `dir` or `dir/checkpoint`.
 ///
-/// HF puts the template in one of two places and BOTH are in the wild:
-/// a standalone `chat_template.jinja`, or a `chat_template` string inside
-/// `tokenizer_config.json`. The standalone file wins when both exist, which is
-/// what `transformers` does.
+/// HF puts the template in FOUR places and all four are in the wild: a
+/// standalone `chat_template.jinja`, a `chat_template.json`, a `chat_template`
+/// key inside `tokenizer_config.json` (as a string OR as a list of named
+/// templates), and a `chat_templates/` directory. Reading only some of them
+/// means a checkpoint that uses another one falls silently through to the
+/// hand-written builders — an approximation of a file the weights already
+/// carry. Ordered as `transformers` orders them; the standalone file wins.
 fn find(dir: &Path) -> Option<(String, String, Option<String>, Option<String>)> {
     for base in [dir.to_path_buf(), dir.join("checkpoint")] {
         let jinja = base.join("chat_template.jinja");
@@ -107,6 +110,56 @@ fn find(dir: &Path) -> Option<(String, String, Option<String>, Option<String>)> 
             return Some((
                 text,
                 format!("{}#chat_template", cfg_path.display()),
+                tok("bos_token"),
+                tok("eos_token"),
+            ));
+        }
+        // The LIST form: `"chat_template": [{"name": "default", "template": ...}]`.
+        // Prefer the entry named `default`, as `transformers` does, else the
+        // first one — a checkpoint shipping only a named variant still renders.
+        if let Some((name, text)) = cfg
+            .as_ref()
+            .and_then(|c| c.get("chat_template"))
+            .and_then(|v| v.as_array())
+            .and_then(|entries| {
+                let pick = entries
+                    .iter()
+                    .find(|e| e.get("name").and_then(|n| n.as_str()) == Some("default"))
+                    .or_else(|| entries.first())?;
+                let text = pick.get("template")?.as_str()?.to_owned();
+                let name = pick
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("default")
+                    .to_owned();
+                (!text.trim().is_empty()).then_some((name, text))
+            })
+        {
+            return Some((
+                text,
+                format!("{}#chat_template[{name}]", cfg_path.display()),
+                tok("bos_token"),
+                tok("eos_token"),
+            ));
+        }
+        // The DIRECTORY form: `chat_templates/default.jinja`, else any single
+        // `.jinja` in there.
+        let tdir = base.join("chat_templates");
+        let named = tdir.join("default.jinja");
+        let from_dir = read_to_string(&named).map(|t| (named.clone(), t)).or_else(|| {
+            let mut entries: Vec<_> = std::fs::read_dir(&tdir)
+                .ok()?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "jinja"))
+                .collect();
+            entries.sort();
+            let p = entries.into_iter().next()?;
+            read_to_string(&p).map(|t| (p, t))
+        });
+        if let Some((path, text)) = from_dir {
+            return Some((
+                text,
+                path.display().to_string(),
                 tok("bos_token"),
                 tok("eos_token"),
             ));
@@ -248,10 +301,47 @@ impl ChatTemplate {
                 .to_string())
         });
         // `tojson` under a different spelling, used by tool-calling templates.
-        env.add_filter("tojson", |v: Value| -> Result<String, minijinja::Error> {
-            serde_json::to_string(&v)
-                .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
-        });
+        //
+        // ACCEPTS KEYWORD ARGUMENTS. Python's `json.dumps` takes them and HF
+        // templates pass them through — GLM's tool path calls
+        // `tojson(ensure_ascii=False)`. minijinja rejected the extra argument
+        // outright ("too many arguments"), failing the whole render. The kwargs
+        // are accepted and, where they do not change this serializer's output,
+        // ignored: `serde_json` never escapes non-ASCII, so `ensure_ascii=False`
+        // is already what it does, and `ensure_ascii=True` is the case worth
+        // refusing rather than answering with the wrong bytes.
+        env.add_filter(
+            "tojson",
+            |v: Value, kwargs: minijinja::value::Kwargs| -> Result<String, minijinja::Error> {
+                if let Some(true) = kwargs.get::<Option<bool>>("ensure_ascii")? {
+                    return Err(minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidOperation,
+                        "tojson(ensure_ascii=True) is not supported: this server's JSON                          serializer emits non-ASCII characters literally",
+                    ));
+                }
+                let indent = kwargs.get::<Option<usize>>("indent")?;
+                kwargs.assert_all_used()?;
+                let out = match indent {
+                    Some(n) => {
+                        let pad = vec![b' '; n];
+                        let mut buf = Vec::new();
+                        let fmt = serde_json::ser::PrettyFormatter::with_indent(&pad);
+                        let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+                        serde::Serialize::serialize(&v, &mut ser).map_err(|e| {
+                            minijinja::Error::new(
+                                minijinja::ErrorKind::InvalidOperation,
+                                e.to_string(),
+                            )
+                        })?;
+                        String::from_utf8(buf).unwrap_or_default()
+                    }
+                    None => serde_json::to_string(&v).map_err(|e| {
+                        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+                    })?,
+                };
+                Ok(out)
+            },
+        );
         if let Err(e) = env.add_template_owned("chat", text) {
             // A template that will not COMPILE is a defect in the assets, and
             // falling back silently is how a wrong prompt ships. Say which file.

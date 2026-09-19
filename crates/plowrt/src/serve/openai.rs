@@ -548,6 +548,13 @@ pub struct ModelCard {
     /// Empty, but PRESENT: the OpenAI schema declares it and typed clients
     /// index into it.
     pub permission: Vec<serde_json::Value>,
+    /// `"device_argmax"` when this model's backend IGNORES the request's
+    /// sampling parameters (the gfx950 engine samples greedily on device).
+    /// Absent when sampling is applied normally. A vendor-prefixed field, so a
+    /// typed OpenAI client ignores it and a plow-aware one can check it before
+    /// sending a request whose `temperature` would be discarded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_plow_sampling: Option<&'static str>,
 }
 
 /// Unix seconds, for the `created` field every OpenAI object carries.

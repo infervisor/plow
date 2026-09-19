@@ -18,6 +18,7 @@ fn card(state: &AppState, slug: String) -> ModelCard {
         root: slug.clone(),
         parent: None,
         permission: Vec::new(),
+        x_plow_sampling: (!state.sampling_honoured(&slug)).then_some("device_argmax"),
         id: slug,
         object: "model",
         created: state.started(),

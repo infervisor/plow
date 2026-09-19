@@ -36,6 +36,26 @@ pub enum ServeEngine {
     Cpu(CpuServe),
 }
 
+impl ServeEngine {
+    /// Whether this backend applies the request's sampling parameters.
+    ///
+    /// The gfx950 engine samples on device and never hands the host a logit
+    /// row, so every token is the device argmax whatever `temperature`,
+    /// `top_p`, `top_k` or the penalties said. That was a one-shot log line
+    /// nobody reads; reporting it on the model card lets a client discover it
+    /// before it sends a request whose sampling will be discarded.
+    pub fn honours_sampling(&self) -> bool {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => true,
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(_) => false,
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => true,
+        }
+    }
+}
+
 #[cfg(feature = "cpu")]
 pub use super::cpu_serve::CpuServe;
 
