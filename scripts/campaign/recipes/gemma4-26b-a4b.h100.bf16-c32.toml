@@ -1,0 +1,113 @@
+# Gemma-4-26B-A4B-it, H100 SXM5, BF16, TP1 — the SERVING cell (C16/C32).
+#
+# Why this is a separate recipe from the realtime one, and not a profile on it:
+# concurrency above 16 is gated by PACKET MEMORY, not by kernels, and the knob that
+# frees it (PLOW_MAX_CHUNK) also changes prefill shape — so the two cells cannot share
+# a packet. Same split the 12B campaign made (gemma4-12b.h100.bf16-c32.toml).
+#
+# THE ARITHMETIC THIS RECIPE EXISTS FOR. Per-slot KV is dominated by the SLIDING ring,
+# whose depth is next_pow2(window + chunk - 1) — set by the CHUNK, not by max_ctx:
+#
+#   chunk 4096 -> ring 8192 rows -> 1.76 GiB/slot -> batch 32 needs 103.2 GiB  DOES NOT FIT
+#   chunk 2048 -> ring 4096 rows -> 0.98 GiB/slot -> batch 32 needs  78.2 GiB  marginal
+#   chunk 1024 -> ring 2048 rows -> 0.59 GiB/slot -> batch 32 needs  65.8 GiB  fits
+#
+# (47.0 GiB of weights + KV, on a 79.6 GiB card.) The realtime recipe's chunk 4096 is
+# why its decode ladder stops at 16 and why measured serving throughput SATURATES at
+# C16: 196.7 -> 197.4 tok/s from C16 to C32 at 1024, and 83.8 -> 83.8 at 4096. The
+# extra concurrency had nowhere to go. Adding a 32 rung to THAT packet would not have
+# helped — it would not have fit.
+#
+# Expected payoff: plow's TPOT is batch-insensitive (~76 ms at both C16 and C32), so
+# throughput is ~batch/TPOT and a 32-wide decode should roughly double it. To be
+# MEASURED, not assumed — this campaign has had five inferred levers refuted already.
+
+[cell]
+name = "gemma4-26b-a4b.h100.bf16-c32"
+model = "google/gemma-4-26b-a4b-it"
+revision = "local"
+hf_dir = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+# 4096 input + 128 output = 4224 live positions, and max_ctx must be a multiple of 2048
+# (the full-attn KV head window max_ctx*512*2 must be a multiple of the VMM 2 MiB
+# granularity — 8704 fails this, see the realtime recipe). 6144 = 3 granules.
+max_ctx = 6144
+precision = "bf16"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_SEG_PURE_GEMM = "1"
+PLOW_SEG_FA512 = "1"
+PLOW_SEG_FA256_GQA2 = "1"
+PLOW_TMA_GEMM = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+PLOW_SLIDING_NS_CAP = "1"
+# The lever. 1024 keeps the sliding ring at 2048 rows so 32 slots fit with room to
+# spare; it costs prefill chunking at the long rungs, which is why the realtime cell
+# keeps 4096 and this one does not serve the 8K rung.
+PLOW_MAX_CHUNK = "1024"
+PLOW_FUSE_ARGMAX = "1"
+PLOW_GEMMA_MOE_ROUTER_EXACT = "1"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = [
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+]
+[objects.env]
+# MUST stay 0 for a MoE model: PLOW_NV_FATLITE compiles the Gemma MoE PREFILL opcodes
+# out of the fat object, and they are already absent from the GEMM (SEG_GEMM) and
+# attention (FA_ONLY) objects — leaving no object that implements them. See the
+# realtime recipe and interp_sm120.cu's `#if !PLOW_NV_SEG_GEMM && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE`.
+PLOW_BUILD_FATLITE = "0"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
+PLOW_BUILD_MASKED_PADDING = "1"
+PLOW_BUILD_PFATTN_WG = "1"
+PLOW_BUILD_PFATTN_KV16 = "0"
+PLOW_BUILD_PFATTN_KV64 = "0"
+PLOW_BUILD_PFATTN_QK_UNROLL = "4"
+
+[emit_roles.env]
+# The hd512 roles need the 4096/8192 prefill rungs, which chunk 1024 does not emit, so
+# the full-attention layers fall back to the in-megakernel body. Same trade the 12B C32
+# recipe makes.
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "0"
+PLOW_PF_SEG_PURE = "1"
+PLOW_PF_INTERLEAVE = "0"
+PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
+LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
+
+[bench]
+backend = "openai"
+in_lens = "1024 4096"
+concs = "16 32"
+nprompt = 64
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
+model_id = "gemma-4-26b-a4b-it"
+gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer in one short sentence.<end_of_turn>\n<start_of_turn>model\n"
+
+[bench.profiles.high_concurrency]
+in_lens = "1024 4096"
+concs = "16 32"
+nprompt = 64
+serve_env = { PLOW_MULTISTEP = "8", PLOW_DECODE_MAX_RUNG = "32", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
+
+[reference]
+csv = "perf-data/campaign/gemma4-26b-a4b.h100.reference-vllm028-bf16-high-concurrency.csv"
