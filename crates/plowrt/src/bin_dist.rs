@@ -1,10 +1,11 @@
 //! The `plowrt` distribution subcommands: `pull`, `load`, `show`, `ls`,
-//! `upgrade`, `prepare`, `rm`.
+//! `upgrade`, `prepare`, `rm`, `pack`.
 //!
 //! These run the network; `serve` does not. `resolve_local` is the one entry
 //! point `serve` uses, and it reads only the local store — an unpulled model is
 //! an error naming the `load` that fixes it, never a silent fetch.
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use plowrt::config::RuntimeConfig;
@@ -290,6 +291,93 @@ pub fn cmd_upgrade(model: Option<&str>, all: bool, dry_run: bool) -> Result<(), 
         st.pin(&pin, &resolved.variant.variant_id)?;
         println!("{pin}: → g{} ({t})", resolved.variant.generation);
     }
+    Ok(())
+}
+
+/// Package a built variant into one `.zip`: `bundle.json`, `objset.json`,
+/// and every file they reference, under `assets/` and `objects/`
+/// respectively so a bundle file and an objset object can never collide on
+/// name. Does not build the manifests — `pack_bundle.py`/`pack_objset.py`
+/// still do that; this only packages what they already produced.
+#[cfg(feature = "dist")]
+pub fn cmd_pack(
+    bundle_path: &std::path::Path,
+    objset_path: &std::path::Path,
+    assets: &std::path::Path,
+    objects: &std::path::Path,
+    out: &std::path::Path,
+) -> Result<(), Err> {
+    use plow_asset::dist::{Bundle, ObjSet};
+
+    let bundle_bytes = std::fs::read(bundle_path)?;
+    let bundle: Bundle = serde_json::from_slice(&bundle_bytes)
+        .map_err(|e| format!("{}: {e}", bundle_path.display()))?;
+    bundle.validate().map_err(|e| format!("{}: {e}", bundle_path.display()))?;
+
+    let objset_bytes = std::fs::read(objset_path)?;
+    let objset: ObjSet = serde_json::from_slice(&objset_bytes)
+        .map_err(|e| format!("{}: {e}", objset_path.display()))?;
+    objset.validate().map_err(|e| format!("{}: {e}", objset_path.display()))?;
+    objset
+        .pairs_with(bundle.pairing_hash.as_deref())
+        .map_err(|e| format!("{}: {e}", objset_path.display()))?;
+
+    let file = std::fs::File::create(out)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    zip.start_file("bundle.json", options)?;
+    zip.write_all(&bundle_bytes)?;
+    zip.start_file("objset.json", options)?;
+    zip.write_all(&objset_bytes)?;
+
+    let mut total_bytes: u64 = (bundle_bytes.len() + objset_bytes.len()) as u64;
+    let mut total_files: usize = 2;
+
+    for f in &bundle.files {
+        let path = assets.join(&f.name);
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let got = dist::Digest::of(&bytes);
+        if got.as_str() != f.sha256 {
+            return Err(format!(
+                "{}: hashes to {got}, bundle.json says {}",
+                path.display(),
+                f.sha256
+            )
+            .into());
+        }
+        zip.start_file(format!("assets/{}", f.name), options)?;
+        zip.write_all(&bytes)?;
+        total_bytes += bytes.len() as u64;
+        total_files += 1;
+    }
+
+    for o in &objset.objects {
+        let path = objects.join(&o.name);
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let got = dist::Digest::of(&bytes);
+        if got.as_str() != o.sha256 {
+            return Err(format!(
+                "{}: hashes to {got}, objset.json says {}",
+                path.display(),
+                o.sha256
+            )
+            .into());
+        }
+        zip.start_file(format!("objects/{}", o.name), options)?;
+        zip.write_all(&bytes)?;
+        total_bytes += bytes.len() as u64;
+        total_files += 1;
+    }
+
+    zip.finish()?;
+    println!(
+        "{}: {} file(s), {} packaged",
+        out.display(),
+        total_files,
+        pull::human(total_bytes)
+    );
     Ok(())
 }
 
