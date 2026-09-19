@@ -194,12 +194,47 @@ wasted. There is NO regression on main: 12B through the full recipe serves corre
 The only meaningful comparison is recipe-vs-recipe, and on that basis the 26B fault
 IS specific to the 26B configuration.
 
-**Most likely cause, being tested: a self-inflicted recipe error.** The 26B recipe
-set `PLOW_BUILD_PFATTN_WG=0`, but the role file `interp_sm90a_pfattn_hd512.cubin`
-carries the ABI `attention_sm90_hd512_wg32_v1` — the WGMMA BQ64 body. With `WG=0`
-the script emits the mma.sync BQ32 body instead, so the object's block/warp geometry
-does not match what the role dispatch assumes. The 12B recipe sets `WG=1`. Corrected;
-rebuild in progress. If this is it, the fault was never a 26B kernel problem at all.
+### Recipe-level bisect against the working 12B configuration
+
+With 12B-full-recipe as a known-good control, the 26B recipe was bisected toward it.
+Each row is a full rebuild (~2 h each for 26B) plus a leased smoke test:
+
+| 26B variant | result |
+|---|---|
+| recipe as first written (`PLOW_BUILD_PFATTN_WG=0`) | faults 719 |
+| `PLOW_BUILD_PFATTN_WG=1` (matches 12B; the role ABI is `..._wg32_v1`, so this was a real recipe bug worth fixing regardless) | faults 719 |
+| `PLOW_EMIT_PREFILL_CUBLASLT=0` (removes the campaign's own shape-list change and all 1025 Lt segments) | faults 719 |
+
+So neither the hd512 role geometry nor the cuBLASLt admission is the cause, and the
+campaign's own changes are cleared: the fault survives with the shape list unused.
+
+### Where that leaves it
+
+12B works through the same pipeline, the same binaries, the same serve env. The MoE
+opcodes are the only 26B-unique ops, and they are clean in isolation across 16
+input shapes. The fault therefore lives in something the isolated harness cannot
+see — the most likely candidates, in order:
+
+1. **MoE ops inside the cooperative megakernel**, not standalone: the shared smem
+   arena (`op_moe_sm90.cuh` raises `PGM_ARENA_BF16` to 99328 B and other ops in the
+   same launch share that allocation), or counter ordering between the 1-block align
+   and the 132-block consumers. The repro sidesteps both by launching separately.
+2. **`act.moe.*` scratch aliasing** with other activations in the packet's tensor
+   arena — sizes were checked and are individually correct, but overlap was not.
+3. The hybrid structure itself: every 26B layer runs the dense MLP AND the MoE,
+   which no other model in the tree does.
+
+Hypothesis 2 was checked and is CLEAN — `plowrt disasm --tensors` gives every MoE
+scratch extent exactly as the emitter intends: `act.moe.part` 369098752 B
+(4096·8·2816·4), `act.moe.fug` 69206016 (49152·704·2), `act.moe.table` 262144
+(4096·8·8), `act.moe.meta` 1544 ((3·128+2)·4), `moe.ewt.<l>` 2048 (128·2·8).
+No sizing or aliasing bug in the packet.
+
+That leaves hypothesis 1 — the MoE ops *inside* the cooperative megakernel — as the
+live one, and it is the one the isolated repro structurally cannot test. The way to
+settle it is to extend the repro to launch the chain COOPERATIVELY with the packet's
+own counter semantics and a shared arena, rather than as separate kernels with
+`cudaDeviceSynchronize` between them.
 
 ### Ruled OUT (each checked, do not re-suspect)
 
