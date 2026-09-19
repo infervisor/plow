@@ -1580,7 +1580,10 @@ impl RuntimeConfig {
     /// has always called it `rt.multistep`, and both the NVIDIA device-multistep object and the
     /// AMD deferred-read quantum are driven by it. Read it through here — the AMD tick used to
     /// reach into `self.nv.multistep` directly and so missed the env-compat path entirely.
-    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    // `cpu` too: `serve::mux`'s single-sequence tick is shared by the AMD and
+    // CPU engines and reads the quantum through here, so a cpu-only build did
+    // not compile at all without this arm.
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub(crate) fn multistep(&self) -> u32 {
         select_compat(
             self.nv.multistep,

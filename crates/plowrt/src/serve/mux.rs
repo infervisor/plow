@@ -4428,6 +4428,9 @@ fn handle_produced_token(
     // `ignore_eos` suppresses this too: a benchmark that asks for exactly
     // `--random-output-len` tokens must not be cut short by an accidental match.
     let mut stop_str_cut: Option<usize> = None;
+    // This token's own contribution, before any carried bytes are prepended below.
+    // `earliest_stop_cut` returns an index relative to it.
+    let delta_len = delta.len();
     if !slot.gen.ignore_eos && !below_min && !slot.gen.stop.is_empty() && !delta.is_empty() {
         let keep = slot
             .gen
@@ -4456,7 +4459,27 @@ fn handle_produced_token(
     // so the client saw the stop string's own prefix in its answer. Hold back the longest
     // suffix of the accumulated text that is a proper prefix of some stop string, and release
     // it on a later token once it is known not to begin a match.
-    let mut delta = delta;
+    //
+    // `stop_pending` is the run of bytes GENERATED BUT NOT YET EMITTED. This token's text
+    // belongs on the END of that run, and every decision below is taken over the combined
+    // run, in stream order.
+    //
+    // Doing it in one place is the fix for two ordering bugs. Holding and releasing used to
+    // be separate blocks in that order, so a token that withheld a tail immediately met the
+    // release block, which prepended those same bytes to the front of what remained: stop
+    // "three" against "Count: " withheld the final "t" and then emitted "tCoun". And the cut
+    // index from `earliest_stop_cut` is relative to THIS token's delta, so applying it after
+    // a prepend dropped `carried.len()` bytes off the end of the last emitted text.
+    let carried = std::mem::take(&mut slot.stop_pending);
+    let mut delta = if carried.is_empty() {
+        delta
+    } else {
+        let mut combined = carried;
+        combined.push_str(&delta);
+        combined
+    };
+    // Re-base the cut onto the combined run.
+    let stop_str_cut = stop_str_cut.map(|cut| cut + (delta.len() - delta_len));
     if stop_str_cut.is_none()
         && !slot.gen.ignore_eos
         && !below_min
@@ -4469,16 +4492,9 @@ fn handle_produced_token(
                 .rev()
                 .find(|&c| delta.is_char_boundary(c))
                 .unwrap_or(0);
-            slot.stop_pending.insert_str(0, &delta[keep_to..]);
+            slot.stop_pending = delta[keep_to..].to_string();
             delta.truncate(keep_to);
         }
-    }
-    if !slot.stop_pending.is_empty() && (stop_str_cut.is_some() || !delta.is_empty()) {
-        // The held bytes did not begin a match after all: they belong in front of whatever
-        // this token contributes.
-        let mut released = std::mem::take(&mut slot.stop_pending);
-        released.push_str(&delta);
-        delta = released;
     }
     let (delta, stop_string) = match stop_str_cut {
         Some(cut) => {

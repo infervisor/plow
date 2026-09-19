@@ -299,11 +299,13 @@ pub async fn chat_completions(
     let ingress = mux.ingress();
     // Tokenize HERE, on the handler task — the dispatcher loop is the
     // serialized decode critical path and must never encode a long prompt.
-    // Decided from the prompt that was actually rendered, so it is right for
-    // the checkpoint's template, for the built-in builders, and for a request
-    // that turned thinking off.
-    let reasoning_mode = crate::serve::config::ReasoningMode::detect(&prompt);
-    let reasoning_open = reasoning_mode.opens();
+    // `ThinkTag` unconditionally: the splitter's own `Deciding` state settles
+    // after the first few bytes of generation, so a model that never reasons
+    // costs at most a 7-byte delay on its first chunk and nothing after. What
+    // the PROMPT decides is only whether the trace is already open (GLM leaves
+    // it dangling; Qwen3 and DeepSeek-R1 emit the marker themselves).
+    let reasoning_mode = crate::serve::reasoning::ReasoningMode::ThinkTag;
+    let reasoning_open = crate::serve::reasoning::ReasoningMode::prompt_opens(&prompt);
     let prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
         bundle.tokenizer().encode(&prompt)
     });
@@ -563,39 +565,6 @@ fn glm_chat_prompt(messages: &[Message]) -> String {
     p
 }
 
-/// Split a GLM answer into (reasoning, answer) at the first `</think>`.
-///
-/// The generation prompt leaves `<think>` open, so the model emits its trace
-/// and then closes it. `</think>` is `special: false` in GLM's added tokens, so
-/// `skip_special_tokens` does NOT remove it and it would otherwise land in the
-/// user-visible `content` as literal text along with the whole trace. Returns
-/// `(None, whole)` until the marker is seen, which is also the correct answer
-/// for a model that never opened a trace.
-pub fn split_reasoning(
-    mode: crate::serve::config::ReasoningMode,
-    active: bool,
-    text: &str,
-) -> (Option<String>, String) {
-    let Some(close) = mode.close_marker().filter(|_| active) else {
-        return (None, text.to_string());
-    };
-    match text.find(close) {
-        Some(i) => {
-            let reasoning = text[..i].trim().to_string();
-            let answer = text[i + close.len()..].trim_start().to_string();
-            ((!reasoning.is_empty()).then_some(reasoning), answer)
-        }
-        // Opened and never closed — the model ran out of `max_tokens` inside
-        // its own trace. ALL of it is the trace: there is no answer yet. The
-        // streamed path has always reported it that way (every delta went to
-        // `reasoning_content`), so returning it as `content` here made the two
-        // paths disagree about the same generation.
-        None => {
-            let trace = text.trim();
-            ((!trace.is_empty()).then(|| trace.to_string()), String::new())
-        }
-    }
-}
 
 /// The Gemma-4 canonical chat format (the checkpoint's
 /// `chat_template.jinja`, text-only subset): `<bos>`, one
@@ -631,16 +600,19 @@ async fn buffer_and_reply(
     model: String,
     mut rx: stream_mod::ChunkReceiver,
     created: u64,
-    reasoning_mode: crate::serve::config::ReasoningMode,
+    reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
 ) -> Response {
     let mut text = String::new();
+    // Driven PER TOKEN, exactly as the streamed path drives it — same type,
+    // same order — so the two cannot disagree, and `trace_tokens` is a real
+    // token count rather than a count of calls.
+    let mut split = crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open);
+    let (mut reasoning_buf, mut answer_buf) = (String::new(), String::new());
     // Tokens that fell inside the trace, for `completion_tokens_details`.
     // Counted from CHUNKS (one per generated token) rather than derived from
     // the split text — the split is over characters and cannot be converted
     // back into a token count.
-    let mut reasoning_tokens: u64 = 0;
-    let mut trace_open = reasoning_open && reasoning_mode.close_marker().is_some();
     // `None` until a terminal chunk arrives. It must NOT default to "stop": the
     // mux frees a slot on ANY `try_send` failure, and a bounded-channel `Full`
     // (serve/stream.rs caps the stream at 32 chunks) drops the sender without
@@ -653,15 +625,9 @@ async fn buffer_and_reply(
         match chunk {
             StreamChunk::Token { text: delta, .. } => {
                 text.push_str(&delta);
-                if trace_open {
-                    reasoning_tokens += 1;
-                    if reasoning_mode
-                        .close_marker()
-                        .is_some_and(|c| text.contains(c))
-                    {
-                        trace_open = false;
-                    }
-                }
+                let (r, c) = split.push(&delta);
+                reasoning_buf.push_str(&r.unwrap_or_default());
+                answer_buf.push_str(&c.unwrap_or_default());
             }
             StreamChunk::Done {
                 reason, usage: u, ..
@@ -704,10 +670,19 @@ async fn buffer_and_reply(
     // and the trace goes to `reasoning_content`, which is where a reasoning
     // model's clients look for it. A model that never opened a trace is
     // unaffected — `split_reasoning` returns the whole string as the answer.
-    let (reasoning, answer) = split_reasoning(reasoning_mode, reasoning_open, &text);
-    if reasoning_open && reasoning_mode.close_marker().is_some() {
+    let (r, c) = split.finish();
+    reasoning_buf.push_str(&r.unwrap_or_default());
+    answer_buf.push_str(&c.unwrap_or_default());
+    let reasoning = {
+        let t = reasoning_buf.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    let answer = answer_buf;
+    if split.trace_tokens > 0 {
         if let Some(u) = usage.as_mut() {
-            u.completion_tokens_details = Some(CompletionTokensDetails { reasoning_tokens });
+            u.completion_tokens_details = Some(CompletionTokensDetails {
+                reasoning_tokens: split.trace_tokens,
+            });
         }
     }
     Json(ChatResponse {
@@ -764,13 +739,10 @@ fn sse_response(
     t_arrive: std::time::Instant,
     n_prompt: usize,
     created: u64,
-    reasoning_mode: crate::serve::config::ReasoningMode,
+    reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
-    // The close marker for THIS model's framing. `None` means the model has no
-    // separable trace, in which case every delta is content and the hold buffer
-    // is never used.
-    let close_marker = reasoning_mode.close_marker();
+
     // State threaded through the unfold: the receiver, and the tail frames
     // (optional usage-only chunk, then [DONE]) drained one per poll.
     struct SseState {
@@ -778,13 +750,10 @@ fn sse_response(
         done: bool,
         /// The `role` delta has not been sent yet — it rides the FIRST token.
         role_pending: bool,
-        /// Still inside the model's `<think>` trace: deltas route to
-        /// `reasoning_content` until `</think>` arrives. The marker can be
-        /// split across token boundaries, so a small tail is held back.
-        in_reasoning: bool,
-        hold: String,
-        /// Tokens seen while `in_reasoning`, reported on the usage chunk.
-        reasoning_tokens: u64,
+        /// Routes each delta to `reasoning_content` or `content`. The SAME
+        /// type the buffered path uses, so the two cannot disagree about one
+        /// generation.
+        split: crate::serve::reasoning::ReasoningSplit,
         pending: std::collections::VecDeque<Event>,
     }
     let body = stream::unfold(
@@ -792,9 +761,7 @@ fn sse_response(
             rx,
             done: false,
             role_pending: true,
-            in_reasoning: reasoning_open && close_marker.is_some(),
-            hold: String::new(),
-            reasoning_tokens: 0,
+            split: crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open),
             pending: std::collections::VecDeque::new(),
         },
         move |mut st| {
@@ -838,42 +805,7 @@ fn sse_response(
                             crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, n_prompt);
                             crate::obs::pfx::report();
                         }
-                        // Route the delta to `reasoning_content` until the
-                        // trace closes. `</think>` is NOT a special token, so
-                        // without this the whole trace and the literal marker
-                        // land in the user-visible `content`.
-                        let close = close_marker.unwrap_or("</think>");
-                        let (reasoning, content) = if st.in_reasoning {
-                            st.reasoning_tokens += 1;
-                            st.hold.push_str(&text);
-                            match st.hold.find(close) {
-                                Some(i) => {
-                                    let before = st.hold[..i].to_string();
-                                    let after = st.hold[i + close.len()..].to_string();
-                                    st.hold.clear();
-                                    st.in_reasoning = false;
-                                    (
-                                        (!before.is_empty()).then_some(before),
-                                        Some(after),
-                                    )
-                                }
-                                None => {
-                                    // Hold back only as much as could still be
-                                    // a prefix of the marker; emit the rest.
-                                    let keep = close.len().min(st.hold.len());
-                                    let cut = (0..=keep)
-                                        .rev()
-                                        .map(|k| st.hold.len() - k)
-                                        .find(|&c| st.hold.is_char_boundary(c))
-                                        .unwrap_or(st.hold.len());
-                                    let emit = st.hold[..cut].to_string();
-                                    st.hold = st.hold[cut..].to_string();
-                                    ((!emit.is_empty()).then_some(emit), None)
-                                }
-                            }
-                        } else {
-                            (None, Some(text))
-                        };
+                        let (reasoning, content) = st.split.push(&text);
                         let ch = ChatChunk {
                             id: request_id.clone(),
                             object: "chat.completion.chunk",
@@ -894,16 +826,10 @@ fn sse_response(
                         (Event::default().data(stream_mod::chunk_data(&ch)), false)
                     }
                     StreamChunk::Done { reason, usage, .. } => {
-                        // FLUSH THE HELD TAIL. While inside a trace the router
-                        // withholds the last few bytes in case they are the
-                        // start of the close marker; if the generation ends
-                        // first — `max_tokens` inside the trace, a shed, a
-                        // disconnect — those bytes were simply dropped, so the
-                        // streamed `reasoning_content` ended up to
-                        // `close.len()-1` bytes shorter than what the model
-                        // actually produced, and shorter than the buffered path
-                        // reports for the same generation.
-                        let flushed = (!st.hold.is_empty()).then(|| std::mem::take(&mut st.hold));
+                        // FLUSH. Whatever the splitter still holds belongs to
+                        // this generation; abandoning it truncated the streamed
+                        // `reasoning_content` against the buffered path.
+                        let (flushed_r, flushed_c) = st.split.finish();
                         let ch = ChatChunk {
                             id: request_id.clone(),
                             object: "chat.completion.chunk",
@@ -913,8 +839,8 @@ fn sse_response(
                                 index: 0,
                                 delta: Delta {
                                     role: None,
-                                    content: None,
-                                    reasoning_content: flushed,
+                                    content: flushed_c,
+                                    reasoning_content: flushed_r,
                                 },
                                 // The wire value: "preempted" is not an OpenAI
                                 // finish_reason and a typed client rejects it.
@@ -938,10 +864,10 @@ fn sse_response(
                                 choices: Vec::new(),
                                 usage: Some({
                                     let mut u: Usage = usage.into();
-                                    if close_marker.is_some() && reasoning_open {
+                                    if st.split.trace_tokens > 0 {
                                         u.completion_tokens_details =
                                             Some(CompletionTokensDetails {
-                                                reasoning_tokens: st.reasoning_tokens,
+                                                reasoning_tokens: st.split.trace_tokens,
                                             });
                                     }
                                     u
@@ -1001,7 +927,6 @@ fn sse_response(
 #[cfg(test)]
 mod tests {
     use super::{gemma_chat_prompt, k3_chat_prompt, request_id, Message};
-    use crate::serve::config::ReasoningMode;
 
     #[test]
     fn request_ids_are_unique() {
@@ -1116,62 +1041,10 @@ mod tests {
         assert!(!p.contains("<|user|>"));
     }
 
-    /// `</think>` is `special: false` in GLM's added tokens, so it survives
-    /// `skip_special_tokens` and would otherwise reach the user as literal
-    /// text along with the whole trace.
-    #[test]
-    fn the_reasoning_trace_is_split_out_of_the_answer() {
-        let (r, a) = super::split_reasoning(
-            ReasoningMode::ThinkTag,
-            true,
-            "weighing it up</think>The answer is 4.",
-        );
-        assert_eq!(r.as_deref(), Some("weighing it up"));
-        assert_eq!(a, "The answer is 4.");
-    }
 
-    /// A model that never opened a trace must come back unchanged, not empty.
-    #[test]
-    fn text_without_a_think_marker_is_all_answer() {
-        let (r, a) = super::split_reasoning(ReasoningMode::ThinkTag, false, "just an answer");
-        assert!(r.is_none());
-        assert_eq!(a, "just an answer");
-    }
 
-    /// THE REGRESSION. A NON-reasoning model whose answer happens to contain
-    /// `</think>` — because the user asked about the tag — must not have that
-    /// treated as a trace boundary. Under the old probe the answer text was
-    /// searched and everything before the marker vanished from `content`.
-    #[test]
-    fn a_non_reasoning_model_never_splits_on_the_marker() {
-        let (r, a) = super::split_reasoning(
-            ReasoningMode::None,
-            false,
-            "the </think> tag closes a thinking block",
-        );
-        assert!(r.is_none());
-        assert_eq!(a, "the </think> tag closes a thinking block");
-    }
 
-    /// A think-tag model served with thinking DISABLED (`enable_thinking:
-    /// false` renders `<think></think>`) is not inside a trace either.
-    #[test]
-    fn thinking_disabled_leaves_the_whole_generation_as_content() {
-        let (r, a) =
-            super::split_reasoning(ReasoningMode::ThinkTag, false, "plain answer</think>x");
-        assert!(r.is_none());
-        assert_eq!(a, "plain answer</think>x");
-    }
 
-    /// Opened and never closed: the model spent its whole budget thinking.
-    /// The STREAMED path reports that as all-reasoning, so the buffered path
-    /// must agree — it used to return the trace as `content`.
-    #[test]
-    fn an_unclosed_trace_is_all_reasoning_on_both_paths() {
-        let (r, a) = super::split_reasoning(ReasoningMode::ThinkTag, true, "still thinking");
-        assert_eq!(r.as_deref(), Some("still thinking"));
-        assert_eq!(a, "");
-    }
 
 
     /// Pinned against `encoding_k3.py::build_chat_segments` RUN on the real

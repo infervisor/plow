@@ -249,13 +249,23 @@ refused explicitly rather than answered with bytes that do not match the request
 
 ## 7. Known gaps, not fixed
 
-- **Sampling is ignored on the AMD backend.** The gfx950 engine samples on device and the host
-  never sees the logit row, so every token is the argmax whatever the request asked for. Still
-  true, and still deliberate — refusing `temperature > 0` would break every existing client and
-  benchmark, and the real fix is to wire the host resample path into the AMD arm. It is no
-  longer only a once-per-process log line: `ServeEngine::honours_sampling` is captured at
-  install and reported as `x_plow_sampling: "device_argmax"` on the model card, so a client can
-  see it before it sends a request whose sampling will be discarded.
+- **Sampling is applied on CUDA ONLY.** The gfx950 engine and the CPU/Metal engine both sample
+  on device and never hand the host a logit row, so every token is the argmax whatever
+  `temperature`, `top_p`, `top_k`, the penalties or `seed` asked for. The host resample
+  (`gpu_finish_token`) is reached only from `cfg(cuda)` call sites, and neither
+  `serve::cpu_serve` nor the Apple engine contains a sampler.
+
+  The AMD half was already documented. The CPU/Metal half was not, and was found by serving a
+  real Qwen3-0.6B on an M4 Pro: five different `seed`s, and `temperature` 0, 0.7 and 2.0, all
+  returned byte-identical text. Still deliberate — refusing `temperature > 0` would break every
+  existing client and benchmark, and the real fix is to wire the host resample path into the
+  shared single-sequence tick. It is no longer only a once-per-process log line:
+  `ServeEngine::honours_sampling` is captured at install and reported as
+  `x_plow_sampling: "device_argmax"` on the model card, so a client can see it before it sends a
+  request whose sampling will be discarded.
+
+  The per-model sampling DEFAULTS above are still read and still plumbed; they simply have no
+  effect on these two backends yet, and the card says so.
 - **Tool calling is refused, not implemented.** The templates can render tool blocks; nothing
   parses a tool call back out of the generation.
 - **Only think-tag reasoning is parsed.** `ReasoningMode` covers `<think>`/`</think>`, which is
