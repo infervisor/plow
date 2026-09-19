@@ -481,17 +481,26 @@ the corrected roofline model is right.
    and it dumps a per-phase table every 64 tokens ending in
    "HOST TOTAL (everything but the drain)" — the exact number this campaign needs.
 
-   It is **AMD-only**. `obs::dstep` is referenced from `exec/amd_tp.rs`, `exec/amd.rs`,
-   `serve/mux.rs` (one `STREAM` call) and `main.rs`, and every `dstep::token()` window
-   tick sits in an `AmdTpGroup` CLI path. On a CUDA serve the counters never accumulate,
-   the window never reaches 64, and `PLOW_DSTEP_LOG=1` prints nothing — which is what
-   happened across a 300-token generation here.
+   It does not report on the CUDA serve decode path. Measured, not assumed:
+   `PLOW_DSTEP_LOG=1 PLOW_DSTEP_EVERY=4` over a 40-token generation produced **zero**
+   dumps (`dstep_log: true` confirmed in the serve config line), and a 300-token run
+   produced none either.
 
-   **So the highest-value next task is: port the `dstep` phases to the CUDA serve decode
-   tick** (mux tick -> engine step -> drain -> detok/stream), mirroring `amd_tp.rs`.
-   Until that exists, every statement about where 26B decode time goes is a guess, and
-   this campaign has already had four guesses refuted by measurement. Do not author a
-   kernel before this instrument reports.
+   Be precise about WHY, because the first write-up of this said "dstep is AMD-only"
+   and that is not accurate: `serve/mux.rs` brackets its decode tick with
+   `dstep::begin_token()` (3281) and `dstep::finish_token()` (3386), unconditionally
+   and engine-agnostically, and already times `STREAM` around `handle_produced_token`.
+   That bracket is fine. The finding is that **the CUDA serve decode does not traverse
+   that mux tick** — some other decode loop drives it. The phase set is separately
+   AMD-shaped (`seed_ids x ranks`, `zero_xctr` cross-GPU, `AQL launch`, `TP safety
+   audit`, `agree` cross-rank), so a CUDA port also needs phases that mean something
+   on one GPU: submit, drain, sample D2H, detok/stream, idle.
+
+   **So the highest-value next task is: find the decode loop the CUDA serve actually
+   uses and bracket it with `dstep`** — the mux tick at 3281/3386 is the model to copy,
+   not the site to fix. Until that instrument reports, every statement about where 26B
+   decode time goes is a guess, and this campaign has already had four guesses refuted
+   by measurement. Do not author a kernel before it reports.
 
    What is already excluded as the explanation, each by measurement against the 12B
    control or a standalone bench:
