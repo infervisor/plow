@@ -428,11 +428,41 @@ vLLM's 26B TPOT (5.03 ms) is about half its 12B TPOT (10.55 ms), which is what t
 active-parameter difference predicts (3.82B vs 11.91B) — independent evidence that
 the corrected roofline model is right.
 
+## Levers, in priority order (evidence, not guesses)
+
+1. **MoE decode tensor-core walk — the big one.** `op_moe.cuh`'s Gemma expert GLU and
+   DOWN decode bodies carry ONLY the dot8 CUDA-core walk. `op_gemv_mma.cuh`'s
+   `mma.sync m16n8k16` row-block walk is wired into the three DENSE walks behind
+   `PLOW_NV_GEMV_MMA` but never into the MoE ones. Decode runs at 4.6 % of the memory
+   roof with TPOT flat across batch — compute-bound, the exact condition the dense
+   conversion fixed on 12B (C16 44.6 -> 16.2 ms). Attribute with decode step timing
+   before authoring: the dense hook only engages at `MM >= 4`, so at C1 the win may
+   instead be in the ~150 extra serialized MoE stages per step (5 MoE ops x 30 layers).
+2. **cuBLASLt algorithm table — DONE, and it was a null at in128.** The store had 48
+   entries for 12B's 3840-keyed shapes and 0 for 26B's 2816-keyed ones; `campaign.py
+   probe` wrote 40 measured entries. First A/B cell (128/C1) came back 42.24 vs 42.21 ms
+   — noise, as expected where prefill is negligible. The 1024/4096 cells are the real
+   test. Record the verdict here either way; a null at every rung would mean the
+   prefill inefficiency is in the native GEMM path or the attention role, not the
+   backend — which is exactly what the 12B campaign found ("the lever for 128 tokens is
+   launch COUNT, not the backend").
+3. **fatlite, recovered properly.** `PLOW_BUILD_FATLITE=0` is currently forced to make
+   MoE prefill exist at all, surrendering the occupancy win (12B: -2.8 ms @1024,
+   -4.8 ms @4096). The fix is to widen the MoE prefill guard so the ops survive
+   fatlite, not to flip the knob back.
+4. **hd512 GQA-8 role.** 26B runs the generic hd512 body because the px4 BQ64 object
+   hardcodes `n_kv_head=1`. A GQA-8 variant is the long-context prefill lever.
+
 ## Status
 
 | step | state |
 |---|---|
 | Kernel-dims audit | **done** |
+| 26B serves on H100 | **done** — both root causes fixed |
+| vLLM 26B reference ladder | **done** (8 cells) |
+| Plow 26B rung ladder | **done** (6 cells; 8K rung blocked by max_ctx, now fixed to 8704, needs rebuild) |
+| cuBLASLt probe + A/B | probe done (40 entries); A/B in flight |
+| Beat vLLM | **NOT achieved** — decode 7-10x behind, prefill 2.8-4.6x |
 | plowc/plowrt release build | done |
 | Emit + objects + role emit | **done** (`045a38e3`) |
 | Roofline model corrected + validated on 12B | **done** |
