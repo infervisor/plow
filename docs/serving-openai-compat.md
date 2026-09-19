@@ -247,6 +247,41 @@ minijinja rejected as too many arguments, failing the whole render. `ensure_asci
 refused explicitly rather than answered with bytes that do not match the request, because
 `serde_json` never escapes non-ASCII.
 
+## 6b. Stop strings, reasoning framing and empty conversations
+
+Found by serving real checkpoints (Qwen3-0.6B, SmolLM2-360M, Gemma-4-E2B on an M4 Pro) rather
+than by a test.
+
+**`stop` corrupted its own output, two ways.** The hold, the release and the cut were three
+steps in a row over different strings:
+
+- a token that withheld a tail met the release block in the SAME call and got those bytes
+  prepended back in front of what remained, so `stop: ["three"]` over `"Count: "` emitted
+  **`"tCoun"`**;
+- and the cut is an index into THIS token's delta while it was being applied to the combined
+  run, so a match that STARTS inside the withheld bytes re-emitted them — `stop: ["France is"]`
+  over a generation of `" France is …"` returned **`" France"`** instead of `" "`.
+
+`apply_stop_strings` now owns all three steps over one ordered run of generated-but-unemitted
+bytes, and is a free function precisely so the SEQUENCING can be driven token by token in a
+test. Both helpers it calls were already unit-tested and were already correct; nothing exercised
+the order they were called in.
+
+**A reasoning trace whose opening marker is not in the first token.** The splitter settled on
+leading whitespace, so a model emitting `"\n"` then `"<think>"` never opened a trace at all and
+the whole thing — marker included — reached `content`. Qwen3 happens to emit `<think>` as one
+whole first token; nothing guarantees that tokenization. The splitter now waits while the
+generation is still all whitespace.
+
+**An empty conversation was answered.** `messages: []` rendered a bare generation prompt and the
+model invented a question and answered it, with a 200. OpenAI's schema requires at least one
+message; `/v1/completions` already refused its empty-prompt equivalent. Now a 400.
+
+**Template rendering was verified, not assumed.** `scripts/chat_template_check.py` against
+Qwen3-0.6B, SmolLM2-360M and Gemma-4-E2B: 18/18 conversation shapes byte-identical to
+`transformers`' own Jinja2, including the `developer` role, a tool result and a null-content
+assistant turn.
+
 ## 7. Known gaps, not fixed
 
 - **Sampling is applied on CUDA ONLY.** The gfx950 engine and the CPU/Metal engine both sample

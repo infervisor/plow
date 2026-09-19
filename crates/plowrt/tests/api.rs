@@ -718,3 +718,17 @@ async fn a_single_card_is_fetchable_by_alias() {
     let text = body_string(resp).await;
     assert!(text.contains("\"root\":\"api-model\""), "{text}");
 }
+
+/// An empty conversation used to be answered with a 200: the template renders
+/// a bare generation prompt and the model invents a question and answers it.
+#[tokio::test]
+async fn an_empty_messages_array_is_a_400() {
+    let (status, text) = chat(serde_json::json!({
+        "model": "api-model",
+        "messages": [],
+        "max_tokens": 8
+    }))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("messages"), "{text}");
+}

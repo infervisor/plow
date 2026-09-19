@@ -139,6 +139,19 @@ pub async fn chat_completions(
         }
     }
 
+    // OpenAI's schema requires at least one message, and answering an empty
+    // conversation means generating from a bare generation prompt: the model
+    // invents a question and answers it, with a 200 and a plausible body.
+    // `/v1/completions` already refuses its empty-prompt equivalent.
+    if req.messages.is_empty() {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "`messages` must contain at least one message",
+            "invalid_request_error",
+            Some("invalid_prompt"),
+            Some("messages".into()),
+        );
+    }
     if let Err(e) = req.sampling.validate() {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,

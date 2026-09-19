@@ -4427,84 +4427,19 @@ fn handle_produced_token(
     //
     // `ignore_eos` suppresses this too: a benchmark that asks for exactly
     // `--random-output-len` tokens must not be cut short by an accidental match.
-    let mut stop_str_cut: Option<usize> = None;
-    // This token's own contribution, before any carried bytes are prepended below.
-    // `earliest_stop_cut` returns an index relative to it.
-    let delta_len = delta.len();
-    if !slot.gen.ignore_eos && !below_min && !slot.gen.stop.is_empty() && !delta.is_empty() {
-        let keep = slot
-            .gen
-            .stop
-            .iter()
-            .map(|s| s.len())
-            .max()
-            .unwrap_or(0)
-            .saturating_sub(1);
-        let base = slot.stop_tail.len();
-        slot.stop_tail.push_str(&delta);
-        stop_str_cut = earliest_stop_cut(&slot.stop_tail, base, delta.len(), &slot.gen.stop);
-        if stop_str_cut.is_none() && slot.stop_tail.len() > keep {
-            let cut = slot.stop_tail.len() - keep;
-            let cut = (0..=cut)
-                .rev()
-                .find(|&c| slot.stop_tail.is_char_boundary(c))
-                .unwrap_or(0);
-            slot.stop_tail.drain(..cut);
-        }
-    }
-    // WITHHOLD A TRAILING STOP PREFIX. Matching alone is not enough: the tail of THIS delta
-    // may be the start of a stop string whose remainder has not been generated yet, and once
-    // those bytes are sent they cannot be recalled. With stop "STOP", deltas "abcST" then
-    // "OPdef" matched correctly on the second — but the first had already emitted "abcST",
-    // so the client saw the stop string's own prefix in its answer. Hold back the longest
-    // suffix of the accumulated text that is a proper prefix of some stop string, and release
-    // it on a later token once it is known not to begin a match.
-    //
-    // `stop_pending` is the run of bytes GENERATED BUT NOT YET EMITTED. This token's text
-    // belongs on the END of that run, and every decision below is taken over the combined
-    // run, in stream order.
-    //
-    // Doing it in one place is the fix for two ordering bugs. Holding and releasing used to
-    // be separate blocks in that order, so a token that withheld a tail immediately met the
-    // release block, which prepended those same bytes to the front of what remained: stop
-    // "three" against "Count: " withheld the final "t" and then emitted "tCoun". And the cut
-    // index from `earliest_stop_cut` is relative to THIS token's delta, so applying it after
-    // a prepend dropped `carried.len()` bytes off the end of the last emitted text.
-    let carried = std::mem::take(&mut slot.stop_pending);
-    let mut delta = if carried.is_empty() {
-        delta
-    } else {
-        let mut combined = carried;
-        combined.push_str(&delta);
-        combined
-    };
-    // Re-base the cut onto the combined run.
-    let stop_str_cut = stop_str_cut.map(|cut| cut + (delta.len() - delta_len));
-    if stop_str_cut.is_none()
-        && !slot.gen.ignore_eos
-        && !below_min
-        && !slot.gen.stop.is_empty()
-        && !delta.is_empty()
+    // Stop-string bookkeeping over the run of generated-but-unemitted bytes. Extracted so it
+    // can be driven token by token in a test: both bugs it has carried lived in the SEQUENCING
+    // of hold, release and cut, not in either helper, and nothing exercised that.
+    let (delta, stop_string) = if !slot.gen.ignore_eos && !below_min && !slot.gen.stop.is_empty()
     {
-        let held = stop_prefix_held(&slot.stop_tail, &slot.gen.stop, delta.len());
-        if held > 0 {
-            let keep_to = (0..=delta.len() - held)
-                .rev()
-                .find(|&c| delta.is_char_boundary(c))
-                .unwrap_or(0);
-            slot.stop_pending = delta[keep_to..].to_string();
-            delta.truncate(keep_to);
-        }
-    }
-    let (delta, stop_string) = match stop_str_cut {
-        Some(cut) => {
-            let cut = (0..=cut)
-                .rev()
-                .find(|&c| delta.is_char_boundary(c))
-                .unwrap_or(0);
-            (delta[..cut].to_string(), true)
-        }
-        None => (delta, false),
+        apply_stop_strings(
+            &mut slot.stop_tail,
+            &mut slot.stop_pending,
+            delta,
+            &slot.gen.stop,
+        )
+    } else {
+        (delta, false)
     };
     if !stop_token && slot.respond.capacity() <= 1 {
         let _ = slot
@@ -4556,6 +4491,80 @@ fn handle_produced_token(
         return disconnected;
     }
     false
+}
+
+/// One token's worth of stop-string bookkeeping.
+///
+/// `pending` is the run of bytes GENERATED BUT NOT YET EMITTED: whatever an earlier token
+/// withheld because it could still begin a stop string. This token's `delta` goes on the END of
+/// that run, and every decision is taken over the whole run, in stream order. Returns the text
+/// to emit and whether a stop string ended generation.
+///
+/// ONE FUNCTION, because two ordering bugs lived in the seam between the steps:
+///
+///   * holding and releasing used to be separate blocks in that order, so a token that withheld
+///     a tail met the release block in the SAME call and got those bytes prepended back in
+///     front of what remained — stop "three" against "Count: " withheld the final "t" and
+///     emitted "tCoun";
+///   * and the cut was an index into THIS token's delta while it was applied to the run, which
+///     is a different string.
+///
+/// The cut is computed against the run directly. `earliest_stop_cut` clamps a match that STARTS
+/// before the run to 0, which is the right answer and the subtle half: those bytes are the
+/// beginning of the stop string itself, so the run is dropped rather than emitted. Adding the
+/// carried length back to that 0 re-emitted them — stop "France is" over " France is" returned
+/// " France" instead of " ".
+fn apply_stop_strings(
+    tail: &mut String,
+    pending: &mut String,
+    delta: String,
+    stops: &[String],
+) -> (String, bool) {
+    let carried = std::mem::take(pending);
+    let carried_len = carried.len();
+    let mut run = if carried.is_empty() {
+        delta
+    } else {
+        let mut run = carried;
+        run.push_str(&delta);
+        run
+    };
+    if run.is_empty() {
+        return (run, false);
+    }
+    let keep = stops.iter().map(|s| s.len()).max().unwrap_or(0).saturating_sub(1);
+    // Only this token's own bytes are new to the match window; the carried ones entered it when
+    // they first arrived.
+    tail.push_str(&run[carried_len..]);
+    // The run is a suffix of the tail (the tail keeps at least `keep` bytes and a hold never
+    // exceeds `keep`), so this maps a tail offset onto a run offset.
+    let run_start = tail.len().saturating_sub(run.len());
+    if let Some(cut) = earliest_stop_cut(tail, run_start, run.len(), stops) {
+        let cut = (0..=cut)
+            .rev()
+            .find(|&c| run.is_char_boundary(c))
+            .unwrap_or(0);
+        run.truncate(cut);
+        return (run, true);
+    }
+    if tail.len() > keep {
+        let cut = tail.len() - keep;
+        let cut = (0..=cut).rev().find(|&c| tail.is_char_boundary(c)).unwrap_or(0);
+        tail.drain(..cut);
+    }
+    // WITHHOLD A TRAILING STOP PREFIX. Matching alone is not enough: the tail of the run may be
+    // the start of a stop string whose remainder has not been generated yet, and sent bytes
+    // cannot be recalled.
+    let held = stop_prefix_held(tail, stops, run.len());
+    if held > 0 {
+        let keep_to = (0..=run.len() - held)
+            .rev()
+            .find(|&c| run.is_char_boundary(c))
+            .unwrap_or(0);
+        *pending = run[keep_to..].to_string();
+        run.truncate(keep_to);
+    }
+    (run, false)
 }
 
 /// Byte offset within THIS delta at which output must stop, or `None` for no match.
@@ -4639,6 +4648,73 @@ mod tests {
         // "ST" is released ahead of this delta by the caller.
         assert_eq!(super::stop_prefix_held("abcSTx", &stops, 1), 0);
         assert_eq!(super::earliest_stop_cut("abcSTx", 5, 1, &stops), None);
+    }
+
+    /// Drive the whole hold/release/cut sequence over a token stream, which is where both of
+    /// this function's bugs lived — each helper was already unit-tested and still correct.
+    fn run_stops(stops: &[&str], tokens: &[&str]) -> (String, bool) {
+        let stops: Vec<String> = stops.iter().map(|s| s.to_string()).collect();
+        let (mut tail, mut pending, mut out) = (String::new(), String::new(), String::new());
+        for t in tokens {
+            let (emit, stopped) =
+                super::apply_stop_strings(&mut tail, &mut pending, t.to_string(), &stops);
+            out.push_str(&emit);
+            if stopped {
+                return (out, true);
+            }
+        }
+        (out, false)
+    }
+
+    /// A hold must not be released by the very call that created it. Stop "three" over
+    /// "Count: " withholds the final "t" (a live prefix) and used to emit "tCoun".
+    #[test]
+    fn a_hold_is_not_released_into_its_own_token() {
+        let (out, stopped) = run_stops(&["three"], &["Count", ":", " one", " two"]);
+        assert_eq!(out, "Count: one two");
+        assert!(!stopped);
+    }
+
+    /// The same stream, now actually reaching the stop string.
+    #[test]
+    fn the_held_prefix_is_dropped_when_the_match_completes() {
+        let (out, stopped) = run_stops(&["three"], &["Count", ":", " one", " two", " three", "!"]);
+        assert_eq!(out, "Count: one two ");
+        assert!(stopped);
+    }
+
+    /// A match that STARTS inside the held bytes must drop them, not re-emit them. Stop
+    /// "France is" over tokens " France" + " is" returned " France" once the cut was rebased
+    /// onto the run by adding the carried length to a clamped 0.
+    #[test]
+    fn a_match_starting_inside_the_held_bytes_drops_them() {
+        let (out, stopped) = run_stops(&["France is"], &[" France", " is", " Paris"]);
+        assert_eq!(out, " ");
+        assert!(stopped);
+    }
+
+    /// A stop string spanning two tokens, cutting mid-token.
+    #[test]
+    fn a_stop_spanning_several_tokens_cuts_at_its_start() {
+        let (out, stopped) = run_stops(&["STOP"], &["abcST", "OPdef"]);
+        assert_eq!(out, "abc");
+        assert!(stopped);
+    }
+
+    /// Nothing is lost when no stop ever matches.
+    #[test]
+    fn a_stream_with_no_match_emits_every_byte() {
+        let (out, stopped) = run_stops(&["zzz"], &["hello", " wor", "ld", "!"]);
+        assert_eq!(out, "hello world!");
+        assert!(!stopped);
+    }
+
+    /// Multibyte text must not be split inside a character.
+    #[test]
+    fn multibyte_text_survives_the_hold() {
+        let (out, stopped) = run_stops(&["END"], &["\u{65e5}\u{672c}\u{8a9e}", "E", "ND", "x"]);
+        assert_eq!(out, "\u{65e5}\u{672c}\u{8a9e}");
+        assert!(stopped);
     }
 
     /// `stop` is a set: the cut is the earliest match in the TEXT, not the first pattern listed.

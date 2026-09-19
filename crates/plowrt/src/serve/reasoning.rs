@@ -161,8 +161,15 @@ impl ReasoningSplit {
                 self.hold.drain(..consumed);
                 self.state = State::Open;
                 self.had_trace = true;
-            } else if OPEN.starts_with(trimmed) && !trimmed.is_empty() {
-                // Still a possible prefix of `<think>` — wait for more.
+            } else if trimmed.is_empty() || OPEN.starts_with(trimmed) {
+                // Nothing but whitespace yet, or still a possible prefix of
+                // `<think>` — wait for more.
+                //
+                // The whitespace case is load-bearing: settling on it would
+                // mean a model whose FIRST token is a newline and whose second
+                // is `<think>` never opens a trace at all, and the whole thing
+                // leaks into `content`. Qwen3 happens to emit `<think>` as one
+                // whole first token; nothing guarantees that tokenization.
                 return (None, None);
             } else {
                 // Settled: this generation has no trace. Everything held is
@@ -347,6 +354,35 @@ mod tests {
             );
             assert_eq!(got_c.trim(), want_c.trim(), "content differs for {text:?}");
         }
+    }
+
+    /// A trace whose opening marker does not land in the FIRST token. Settling
+    /// on the leading whitespace would leak the whole trace into `content`.
+    #[test]
+    fn a_trace_opened_after_leading_whitespace_is_still_found() {
+        let mut s = ReasoningSplit::new(ReasoningMode::ThinkTag, false);
+        let (mut r, mut c) = (String::new(), String::new());
+        for t in ["\n", "<think>", "abc", "</think>", "ans"] {
+            let (rr, cc) = s.push(t);
+            r.push_str(&rr.unwrap_or_default());
+            c.push_str(&cc.unwrap_or_default());
+        }
+        let (rr, cc) = s.finish();
+        r.push_str(&rr.unwrap_or_default());
+        c.push_str(&cc.unwrap_or_default());
+        assert_eq!(r.trim(), "abc");
+        assert_eq!(c.trim(), "ans");
+    }
+
+    /// A generation that is ONLY whitespace must still come back as content.
+    #[test]
+    fn an_all_whitespace_generation_is_content() {
+        let mut s = ReasoningSplit::new(ReasoningMode::ThinkTag, false);
+        let (r, c) = s.push("   ");
+        assert!(r.is_none() && c.is_none(), "held while undecided");
+        let (r, c) = s.finish();
+        assert!(r.is_none());
+        assert_eq!(c.as_deref(), Some("   "));
     }
 
     /// THE EATEN SPACE. When the close marker lands in its own token the trace
