@@ -49,7 +49,17 @@ role_files = [
   "interp_sm90a_pfattn_hd256_bkv32.cubin",
 ]
 [objects.env]
-PLOW_BUILD_FATLITE = "1"
+# MUST be 0 for a MoE model. The segments script passes this straight into
+# -DPLOW_NV_FATLITE when it builds interp_sm90a_pfpackedseg.cubin, and every Gemma-4
+# MoE prefill opcode is guarded by
+#   #if !PLOW_NV_SEG_GEMM && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE
+# (interp_sm120.cu). With FATLITE=1 the MoE cases are compiled out of the fat object,
+# and they are already absent from the GEMM object (SEG_GEMM=1) and the FA object
+# (FA_ONLY=1) -- so there is NO object left that implements them, and a MoE prefill
+# segment dispatches into a switch that does not handle it. 12B never hit this because
+# it emits no MoE opcodes. Costs the fatlite occupancy win (12B measured -2.8 ms @1024,
+# -4.8 ms @4096); recovering it for 26B means widening that guard, not setting this to 1.
+PLOW_BUILD_FATLITE = "0"
 PLOW_BUILD_FA_GQA2_PAIR = "1"
 PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"

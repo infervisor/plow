@@ -124,10 +124,21 @@ extern "C" __device__ unsigned plow_row_gather_1 = 1;
 #define PLOW_PACKET_GQA 1
 #endif
 /* The Gemma decode MoE family is all-or-nothing per model: a dense checkpoint emits none of
- * the router/expert/combine ops, a sparse one emits the whole family. Deriving the block gate
- * from two members rather than adding a fourteenth macro keeps the header honest — every
- * macro in it names a real opcode. */
-#define PLOW_HAS_MOE_GEMMA (PLOW_HAS_MOE_ROUTER_GEMMA || PLOW_HAS_MOE_EXPERT_GLU_GEMMA)
+ * the router/expert/combine ops, a sparse one emits the family. It is NOT true, however, that
+ * a sparse one emits these two particular members. The emitter picks among VARIANTS: the
+ * router is emitted either as MoeRouterGemma or as the split MoeRouterGemmaScore(Fast) +
+ * MoeRouterGemmaTopk pair, and the expert gate/up as either MoeExpertGluGemma or the
+ * norm-fused MoeExpertGluNormGemma. Gating on the two base opcodes alone therefore compiled
+ * the WHOLE decode MoE block out of a Gemma-4-26B-A4B packet whose config reported
+ * HAS_MOE_ROUTER_GEMMA_SCORE / _TOPK / _EXPERT_GLU_NORM_GEMMA = 1 and the two bases = 0 —
+ * decode then dispatched opcodes the object did not implement and faulted with
+ * CUDA_ERROR_LAUNCH_FAILED on the first multi-step. Name every member. */
+#define PLOW_HAS_MOE_GEMMA                                                                   \
+    (PLOW_HAS_MOE_ROUTER_GEMMA || PLOW_HAS_MOE_ROUTER_GEMMA_SCORE ||                         \
+     PLOW_HAS_MOE_ROUTER_GEMMA_SCORE_FAST || PLOW_HAS_MOE_ROUTER_GEMMA_TOPK ||               \
+     PLOW_HAS_MOE_EXPERT_GLU_GEMMA || PLOW_HAS_MOE_EXPERT_GLU_NORM_GEMMA ||                  \
+     PLOW_HAS_MOE_EXPERT_DOWN_GEMMA || PLOW_HAS_MOE_COMBINE_GEMMA ||                         \
+     PLOW_HAS_MOE_COMBINE_NORM_GEMMA || PLOW_HAS_MOE_COMBINE_RESID_NORM_GEMMA)
 
 /* T10 occ-2 arena trim. The lean GEMM segment object must fit 2 blocks/SM under the 100 KiB
  * dynamic-smem cap. The default GEMM arena is 60 KiB (PGM_STAGES=3 plain / GLU_STAGES=2), so 2x =
