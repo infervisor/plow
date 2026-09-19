@@ -97,14 +97,82 @@ B~16 nearly all 128 experts are touched and the per-step expert traffic saturate
 Decode TPOT therefore floors out while throughput keeps scaling — the opposite shape
 of the 12B curve, and it sets where the high-concurrency work has to aim.
 
+## What the emit actually hit (2026-09-19)
+
+Three blockers, none of them visible by reading — each found by running the emit.
+All three are fixed in `045a38e3`.
+
+1. **cuBLASLt prefill admitted nothing.** `CUBLASLT_PREFILL_GEMMA4_SHAPES` is a
+   hardcoded 8-entry list of 12B projections, every one keyed on hidden 3840.
+   26B is 2816-keyed, so zero segments qualified and the emit tripped
+   `assert!(selected > 0, "no eligible dense prefill projections")`. Added the
+   parallel 26B list; the emit now admits **1025 projection segments**.
+2. **Packed prefill was silently dropped**, which left
+   `interp_sm90a_pfpackedseg.cubin` unbuilt and failed the object step with no
+   error text (the script's `test -f` precondition under `set -e`). Cause: the
+   live-KV manifest's direct-operand audit did not name the Gemma MoE opcodes.
+   They already existed and were already implemented — they had simply never
+   been emitted through this path. Audited and added; see the commit.
+3. **The emit default router is not bit-identical.** `gemma_moe_router_exact`
+   defaults false, so `MoeRouterGemmaScoreFast` is emitted, although its own
+   opcode doc says the changed reduction association is not bit-identical and
+   that packets should opt in only for experiments. The recipe now pins
+   `PLOW_GEMMA_MOE_ROUTER_EXACT=1`; the whole router is ~0.5 ms of a ~7.9 ms
+   decode step, so this costs nothing worth defending against.
+
+Not a blocker but worth recording: the rewrite/egglog path refuses this model
+("Gemma 4 MoE routing and exhaustive expert checkpoint binding are not
+implemented; refusing dense or representative-expert fallback"), so the emit
+falls back to the hand fusions. That refusal is the right behaviour — a
+representative-expert fallback would produce a fast, wrong packet.
+
+## Corrected roofline, and why the old one could not be trusted
+
+`roofline.py` keyed off a hand-maintained table that listed 26B-A4B as 26B
+dense / 46 layers / hidden 5120. Against an actual 3.82B active / 30 / 2816
+that is a 6.8x error in the decode ceiling — every "% of roofline" computed
+from it was fiction. It now derives the spec from the checkpoint's config.json,
+counts MoE active params at top-k, caps sliding-layer KV at the window rather
+than the context, and bands the sliding attention FLOPs.
+
+Cross-check on the 12B, whose measurements are already recorded: derived 11.91B
+active; decode floor 7.12 ms vs vLLM's measured 10.55 ms TPOT (1.48x); 4K
+prefill floor 103.6 ms vs its 170.2 ms TTFT (1.64x). Both ratios are plausible,
+and the old table (40 layers, 30 heads, 10 kv) could not have produced them.
+
+| ctx | 26B-A4B decode floor | 26B-A4B prefill floor | 12B decode | 12B prefill |
+|---:|---:|---:|---:|---:|
+| 128 | 2.29 ms | 2.29 ms | 7.12 | 7.13 |
+| 1024 | 2.35 | 8.44 | 7.21 | 25.5 |
+| 4096 | 2.37 | 34.8 | 7.22 | 103.6 |
+| 8192 | 2.39 | 72.4 | 7.24 | 211.7 |
+
+### The MoE serving curve
+
+Routing decorrelates across a batch, so a decode step streams the UNION of the
+batch's expert choices: expected `n*(1-(1-k/n)^B)` experts.
+
+| B | experts touched | weight bytes | step floor | per-token |
+|---:|---:|---:|---:|---:|
+| 1 | 8.0 / 128 | 7.64 GB | 2.28 ms | 2.28 ms |
+| 4 | 29.1 | 15.18 | 4.53 | 1.13 |
+| 16 | 82.4 | 34.20 | 10.20 | 0.64 |
+| 32 | 111.8 | 44.67 | 13.33 | 0.42 |
+| 64 | 125.9 | 49.73 | 14.84 | 0.23 |
+
+TPOT floors out near 13-15 ms while per-token cost keeps falling — the opposite
+shape from 12B, and it is where the throughput work has to aim.
+
 ## Status
 
 | step | state |
 |---|---|
-| Kernel-dims audit | **done** (this section) |
-| plowc/plowrt release build | in progress |
-| CPU-only emit feasibility | not started |
-| vLLM 0.28 26B reference (gpulease) | not started |
+| Kernel-dims audit | **done** |
+| plowc/plowrt release build | done |
+| Emit + objects + role emit | **done** (`045a38e3`) |
+| Roofline model corrected + validated on 12B | **done** |
+| cuBLASLt probe (leased) | pending plowrt rebuild |
+| vLLM 0.28 26B reference (gpulease) | script written, not run |
 | Rung ladder 128/1024/4096/8192 | not started |
 | Roofline compare + kernel push | not started |
 | High concurrency / throughput | not started |
