@@ -69,7 +69,7 @@ in_lens = "128 1024 4096"
 concs = "1 4"
 nprompt = 32
 outlen = 128
-warmups = 16
+warmups = 4
 seed = 42
 tokenizer = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
 model_id = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
@@ -78,12 +78,27 @@ gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer i
 [bench.profiles.realtime]
 in_lens = "128 1024 4096"
 concs = "1 4"
-serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "4" }
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0" }
 
 [bench.profiles.high_concurrency]
 in_lens = "128 1024 4096"
 concs = "16 32"
 serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "32", PLOW_PF_INTERLEAVE = "0" }
+
+[bench.profiles.throughput]
+in_lens = "128 1024 4096"
+concs = "4 16"
+serve_env = { PLOW_MULTISTEP = "8", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0" }
+
+[bench.profiles.rung4]
+in_lens = "128 1024 4096"
+concs = "4"
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0" }
+
+[bench.profiles.rung16]
+in_lens = "128 1024 4096"
+concs = "16"
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0" }
 
 [bench.profiles.long_context]
 in_lens = "8192 15000"

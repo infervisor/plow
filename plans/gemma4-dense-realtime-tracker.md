@@ -900,3 +900,173 @@ Unchanged from `plans/gemma4-4k-8k-campaign-tracker.md`: one variable per
 candidate, `gpulease -n 1` on every GPU run (the box is shared by several
 agents), T1 emit byte-identity + checkpoint S, T2 numerics, T3 rung, T4 served,
 `perf-certs/<id>.json` before any default flip. No cross-architecture transfer.
+
+## Rung-by-rung high-concurrency campaign (2026-09-19)
+
+Goal restated by the owner: beat vLLM 0.28 on **all** metrics for high-concurrency
+serving and throughput, rung by rung, on modular-block packets, using single-block
+assets as the fast inner loop and the campaign harness as the promotion gate.
+Every GPU stage under `gpulease`; `warmups` cut 16 → 4 after a paired control showed
+it reproduces (1024/16 TPOT 28.28 vs 28.22; 4096/16 31.89 vs 31.85).
+
+### The instruments (all three were needed)
+
+| tool | what it answers | cost |
+|---|---|---|
+| `runtime/nvidia/experiments/gemv_mma_batch_h100.cu` | achieved weight bandwidth per decode shape per rung | seconds |
+| `plowc --block l..r` + `examples/block_run bench` | marginal per-layer decode/prefill cost per rung | ~2 min |
+| `examples/step_bench <assets> <slots> <ctx> <steps>` | kernel-only decode step on the **shipping packet**; `served TPOT − this` = serving layer | ~2 min |
+| `campaign.py bench --profile high_concurrency` | the promotion gate | ~12 min |
+
+Single-block assets need a **general** interpreter object: a packet-specialised
+cubin refuses any other packet ("packet/interpreter MISMATCH … 12 arms"). Build one
+with `scripts/build_sm90a_cubin.sh` and no `PLOW_CUBIN_CONFIG`, then symlink it into
+each block asset. `--block-stage vocab` did **not** isolate the lm_head — it emitted
+the same layer program — so the lm_head was priced from the full packet instead.
+
+### Decode GEMV bandwidth by rung (H100, 132×256, min of 20)
+
+| shape | M=1 | M=4 | M=8 | M=16 | M=32 |
+|---|---:|---:|---:|---:|---:|
+| qkv (N=8192,K=3840) | 2121 | 2096 | 2072 | 1896 | 1549 |
+| o_proj (3840,4096) | 2785 | 2679 | 2608 | 2398 | 1765 |
+| gate\|up (15360,3840) | 2659 | 2640 | 2642 | 2570 | 2492 |
+| down (3840,15360) | 2209 | 2186 | 2136 | 1980 | 1701 |
+
+GB/s against a 3.35 TB/s HBM3 peak. Per-layer weight bytes are 448.7 MB, so the
+48-layer weight stream costs 8.80 ms at rung 1, 9.49 at rung 16, 10.69 at rung 32.
+**Head-room, not a defect: everything is at 55–80 % of peak.** Worth ~2.4 ms/step
+at rung 16 if the walk reached 3.0 TB/s.
+
+### Per-LAYER decode cost is flat to rung 16 (single block, T=128)
+
+`block_run bench`, layer 0 (sliding hd256 GQA2) and layer 5 (global hd512):
+
+| kind | B=1 | B=4 | B=16 | B=32 |
+|---|---:|---:|---:|---:|
+| sliding | 292.7 | 303.1 | 295.8 | 372.6 |
+| global | 335.7 | 332.7 | 320.6 | 396.9 |
+
+µs per step for a 1-layer asset (carries a fixed per-step overhead; the N-layer fit
+below removes it). Confirmed by the N-layer fit at T=128: marginal per-layer cost is
+**256.7 µs at rung 1 and 255.1 µs at rung 16** — identical. Only rung 32 pays (+26 %).
+So the layer bodies do **not** degrade with batch up to 16, and any batch penalty
+lives outside them. KV cost at rung 16 shows up only in the fit at T=1024
+(336.9 µs/layer, +81.8 over T=128 → 3.93 ms/step; at rung 1 it is 0.47 ms).
+
+### The rung-16 defect: the lm_head was streamed once PER SEQUENCE
+
+`PLOW_DOP_GEMV_ARGMAX` (`interp_sm120.cu`) ran
+
+```c
+for (unsigned m = 0; m < M; m++) d_gemv_argmax(c_base + m*N, …);
+```
+
+and `d_gemv_argmax` has **no M parameter** — each iteration re-streams the whole
+2.01 GB `embed_tokens` matrix. At rung 16 that is **32.2 GB of redundant weight
+traffic per decode step**. The classic path (`d_gemv` → `gemv_walk` → `gemv_rows<MM>`)
+streams it **once** for all M rows, so restricting the fused epilogue to `t == 1`
+(commit `f313089a`) is the fix; every packet on this branch built before it pays the
+penalty. Measured with `step_bench` on the shipping packet, kernel-only:
+
+| slots | ctx 128 before → after | ctx 1024 before → after |
+|---|---|---|
+| 1 | 11.88 → 13.71 | 12.32 → 14.10 |
+| 4 | 14.31 → 14.00 | 15.54 → 15.19 |
+| 16 | **19.03 → 14.93** | **22.73 → 18.59** |
+
+Kernel-only aggregate throughput at rung 16: 841 → 1072 tok/s (ctx128),
+704 → 861 (ctx1024). The rung-1 row regressed for an unrelated reason (below).
+
+### Served result — cell `campaign-rung-base`, profile high_concurrency
+
+Same recipe, `warmups=4`, cache off, GPU free, one variable (the devgen revert).
+
+| cell | rung3-opt | **rung-base** | vLLM 0.28 |
+|---|---|---|---|
+| 128/16 TTFT / TPOT / tok·s | 127.0 / 19.73 / 767 | **117.1 / 15.18 / 1000** | 101.1 / 11.01 / 1364 |
+| 1024/16 | 425.4 / 28.28 / 498 | **426.4 / 24.39 / 570** | 423.9 / 13.76 / 940 |
+| 1024/32 | 2638 / 28.43 / 501 | **2417 / 24.67 / 571** | 852 / 17.52 / 1322 |
+| 4096/16 | 2808 / 31.89 / 253 | **2529 / 27.22 / 284** | 1300 / 21.94 / 498 |
+
+### Rejected this session (kept in the ledger so they are not re-run)
+
+1. **The uncommitted devgen hunks** (ladder-wide fused argmax + `nsplit /= t`).
+   Paired at `warmups=4` they lose at every high-concurrency cell: 128/16 TPOT
+   19.73 → 20.98, 1024/16 28.28 → 29.42, 4096/16 31.89 → 35.10. Cause: `nsplit /= t`
+   drops the **global** layers' decode `nsplit` from 33 to 2 (disasm, program T=16).
+   Reverted; the batched `d_gemv_argmax_batch` kernel is kept in the tree but unused.
+2. **`PLOW_MULTISTEP=8` at C16/C32 — NULL.** 128/16 TPOT 19.64 vs 19.73, 1024/16
+   28.16 vs 28.28. Host per-step work is not the batch penalty. Consistent with
+   `served − kernel` = 0.7 ms at 128/16 and with a tight ITL there (med 19.29,
+   p99 22.05).
+
+### Open, in priority order
+
+1. **Decode object is spilling.** The WIP decode-arm defines
+   (`PLOW_NV_RB_GEMV/RB_QKV/RB_LMHEAD/GEMV_XREG/GEMV_KPANEL`, added to
+   `build_sm90a_cubin.sh` and `runtime/CMakeLists.txt`) compile the decode
+   megakernel to **REG 255 / STACK 576 B**; with them off it is **REG 248 / STACK 40 B**
+   (`cuobjdump -res-usage`). The shipped `rung-base` object is 255/384 — a local-memory
+   spill in the hot loop, and the likely cause of rung 1 going 11.88 → 13.71 ms.
+   A/B via `PLOW_NV_CUBIN` against one packet. `PLOW_NV_GEMV_MMA` / `GV_MM_MAX`
+   are NOT part of this set and must stay.
+2. **Prefill is what inflates TPOT at ctx ≥ 1024.** At 1024/16, served 24.39 vs
+   kernel-only 18.59 = 5.8 ms/step of interference, and the arithmetic closes:
+   32 prefills of 1024 tokens at ~20K tok/s = 1.64 s against 256 decode steps ×
+   18.59 ms = 4.76 s, i.e. +34 % — exactly the observed inflation. So prefill
+   THROUGHPUT, not the interleave policy, owns both the 4096/16 TTFT gap
+   (2529 vs 1300) and a third of the rung-16 TPOT gap.
+3. **Prefill roofline.** One 4096-row chunk is 88.1 TFLOP of GEMM; at the measured
+   cuBLASLt 839 TFLOP/s that is 105 ms = ~39K tok/s, which is where vLLM sits.
+   Plow spends +96 ms of non-GEMM (attention 34.8 — of which hd512 global is 20.7 —,
+   light bodies ~30, gaps ~24) and lands at ~20K. The non-GEMM 96 ms is the target.
+4. **C32 needs a 32-slot packet** — this packet is `batch=16` (server log), so C32
+   runs two waves of 16 and 1024/32 tok/s is pinned at the C16 value. KV is 42 GiB
+   at (16 slots, ctx 8192, chunk 4096); the sliding ring is `next_pow2(window+chunk-1)`
+   and is what dominates, so 32 slots needs chunk 2048 (recipe
+   `gemma4-12b.h100.bf16-c32.toml`). NOTE: 16 slots can still beat vLLM at C32 on
+   TTFT (two waves × 426 ms ≈ 852 = vLLM's) if rung-16 TPOT reaches ~12 ms.
+5. `PLOW_PF_BATCH`: the uncommitted `mux.rs` hunk disables prefill packing for
+   prompts ≥ 1024 rows (`candidates.first().span.n_rows < 1024`). Serve-side
+   `PLOW_PF_BATCH=1` forces it back on — untested at C16/C32.
+
+### Decode-object A/B — the WIP decode arms cost 0.84 ms at EVERY rung (confirmed)
+
+Two GENERAL sm90a objects, identical except the five WIP decode-arm defines, A/B'd
+against the same `campaign-rung-base` packet via `PLOW_NV_CUBIN` / `PLOW_NV_CUBIN_PF`
+(`step_bench`, ctx 128, n=40, sd ≤ 0.04 ms):
+
+| slots | genA (arms on, REG255/STACK576) | genB (arms off, REG248/STACK40) | Δ |
+|---|---:|---:|---:|
+| 1 | 13.978 | 13.152 | −0.83 |
+| 4 | 14.270 | 13.409 | −0.86 |
+| 16 | 15.218 | 14.380 | −0.84 |
+
+Kernel-only aggregate at rung 16: 1051 → 1113 tok/s. A general object is slower in
+absolute terms than the packet-specialised one, so only the delta transfers — but it
+is flat across rungs, which is the signature of a spill in the shared hot path rather
+than an arm-selection effect. `PLOW_NV_RB_GEMV`, `PLOW_NV_RB_QKV`, `PLOW_NV_RB_LMHEAD`,
+`PLOW_NV_GEMV_XREG` and `PLOW_NV_GEMV_KPANEL` are therefore dropped from
+`build_sm90a_cubin.sh` and `runtime/CMakeLists.txt`. **`PLOW_NV_GEMV_MMA` and
+`GV_MM_MAX=16` are NOT in that set and are kept** — they are the tensor-core batched
+GEMV win. Cell: `campaign-rung2-noarms`.
+
+The rung-1 serving regression was larger than this (11.74 → 13.60 ms TPOT), so ~1 ms
+of it has a second cause not yet isolated; the object A/B accounts for 0.84 of it.
+
+### GV_UNROLL — NULL (2026-09-19)
+
+Memory-level parallelism is not what caps the decode GEMV walk. Standalone harness,
+`GV_UNROLL = GV_UNROLL_GLU ∈ {4, 6, 8}`, MMA arm, GB/s:
+
+| shape | M=1 (4/6/8) | M=16 (4/6/8) | M=32 (4/6/8) |
+|---|---|---|---|
+| gate\|up | 2675 / 2631 / 2665 | 2558 / 2565 / 2577 | 2458 / 2501 / 2460 |
+| down | 2200 / 2185 / 2190 | 1948 / 1969 / 1975 | 1711 / 1698 / 1697 |
+| qkv | 2107 / 2112 / 2114 | 1918 / 1890 / 1892 | 1562 / 1584 / 1584 |
+| o_proj | 2785 / 2769 / 2761 | 2439 / 2369 / 2415 | 1743 / 1749 / 1765 |
+
+Every column is within run-to-run noise. Deeper unrolling already had enough loads in
+flight at U=4, so closing the 55–80 %-of-peak gap needs a different mechanism (TMA /
+`cp.async` staging, or an L2 residency policy), not more registers in the walk.

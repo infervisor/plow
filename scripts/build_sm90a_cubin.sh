@@ -129,7 +129,7 @@ GEMMA_GATE="-DPLOW_NV_MLA=0 -DPLOW_NV_MAMBA=0 -DPLOW_NV_DSA=0"
 # wins instead. That inversion is why these belong in the tuner (tuning/README-decode-tuner.md)
 # rather than as one hand-set constant -- GV_MOE_UN and PLOW_NS_ABS both went stale mid-campaign
 # exactly this way.
-GEMV_RB="-DPLOW_NV_GEMV_RB=1 -DPLOW_MOE_DOWN_LANESPLIT=1 -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FP8_RB=4"
+GEMV_RB="-DPLOW_NV_GEMV_RB=1 -DPLOW_MOE_DOWN_LANESPLIT=1 -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FP8_RB=4 -DPLOW_NV_GEMV_MMA=1 -DGV_MM_MAX=16"
 
 # TUNER HOOK. scripts/tune_decode_sweep.sh appends knob overrides here
 # (-DPLOW_NV_FORCE_MINBLK=2 -DGV_UNROLL=4 …) so the sweep builds the SHIPPED
