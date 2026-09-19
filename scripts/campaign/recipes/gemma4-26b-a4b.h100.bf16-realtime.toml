@@ -55,9 +55,14 @@ PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
 PLOW_BUILD_MASKED_PADDING = "1"
-PLOW_BUILD_PFATTN_WG = "0"
+# MUST be 1: the role file interp_sm90a_pfattn_hd512.cubin carries the ABI
+# `attention_sm90_hd512_wg32_v1`, i.e. the WGMMA BQ64 body. Building it with WG=0
+# emits the mma.sync BQ32 body instead, so the object's block/warp geometry does not
+# match what the role dispatch assumes. The 12B recipe sets 1 for the same reason.
+PLOW_BUILD_PFATTN_WG = "1"
 PLOW_BUILD_PFATTN_KV16 = "0"
 PLOW_BUILD_PFATTN_KV64 = "0"
+PLOW_BUILD_PFATTN_QK_UNROLL = "4"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"

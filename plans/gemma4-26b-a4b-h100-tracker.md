@@ -174,11 +174,32 @@ prefill chunk (seg graph): stream sync failed  slot=0 bucket=0 bucket_t=128
 CUDA_ERROR_ILLEGAL_ADDRESS (700)   [CUDA_ERROR_LAUNCH_FAILED (719) with roles on]
 ```
 
-**This is not caused by the campaign changes.** A vanilla packet — emitted with no
-recipe env at all (no cuBLASLt, no seg roles, no FA512, no masked padding) — faults
-identically. On unmodified `main` the packed-prefill gate rejected this model before
-it got this far, so the object build failed first and 26B never produced a serving
-packet on sm90a. Fixing that gate surfaced the bug underneath it.
+**CORRECTION (do not repeat the mistake below).** The first version of this section
+argued "a vanilla packet faults too, therefore the bug is pre-existing and not the
+campaign's fault". That reasoning was WRONG and cost hours. The controls that settle
+it, run afterwards:
+
+| packet | 12B | 26B |
+|---|---|---|
+| bare `plowc --emit devblob+cubin` | faults 700 | faults 700 |
+| bare + `--segmented` | faults 700 | — |
+| full recipe (role objects + production knobs + matching serve env) | **WORKS** | faults 719 |
+
+A bare emit is not a serving configuration for ANY Gemma-4 model — it faults on 12B
+too, and 12B is the model this repo already beats vLLM with. So the vanilla-packet
+evidence proved nothing, and time spent hunting a 26B/MoE-specific cause for it was
+wasted. There is NO regression on main: 12B through the full recipe serves correctly
+("The capital of France is Paris.").
+
+The only meaningful comparison is recipe-vs-recipe, and on that basis the 26B fault
+IS specific to the 26B configuration.
+
+**Most likely cause, being tested: a self-inflicted recipe error.** The 26B recipe
+set `PLOW_BUILD_PFATTN_WG=0`, but the role file `interp_sm90a_pfattn_hd512.cubin`
+carries the ABI `attention_sm90_hd512_wg32_v1` — the WGMMA BQ64 body. With `WG=0`
+the script emits the mma.sync BQ32 body instead, so the object's block/warp geometry
+does not match what the role dispatch assumes. The 12B recipe sets `WG=1`. Corrected;
+rebuild in progress. If this is it, the fault was never a 26B kernel problem at all.
 
 ### Ruled OUT (each checked, do not re-suspect)
 
