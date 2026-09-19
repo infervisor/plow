@@ -57,6 +57,8 @@ pub struct ModelBundle {
     /// the assets ship no template, in which case the built-in per-family
     /// prompt builders serve instead.
     chat_template: Option<Arc<crate::serve::template::ChatTemplate>>,
+    /// What the CHECKPOINT says about sampling defaults and reasoning framing.
+    serving: crate::serve::config::ServingConfig,
 }
 
 impl ModelBundle {
@@ -78,6 +80,13 @@ impl ModelBundle {
         // absent / feature off). Loaded once at startup, shared per request.
         let tokenizer = load_tokenizer(&dir);
         let chat_template = crate::serve::template::ChatTemplate::load(&dir);
+        let serving = crate::serve::config::ServingConfig::load(&dir);
+        tracing::info!(
+            temperature = serving.default_sampling.temperature,
+            top_p = serving.default_sampling.top_p,
+            top_k = serving.default_sampling.top_k,
+            "serving config resolved from the checkpoint"
+        );
         match &chat_template {
             Some(t) => tracing::info!(source = %t.source, "chat template loaded from the assets"),
             None => tracing::info!(
@@ -92,7 +101,13 @@ impl ModelBundle {
             buckets,
             tokenizer,
             chat_template,
+            serving,
         })
+    }
+
+    /// The checkpoint's serving config (sampling defaults + reasoning framing).
+    pub fn serving(&self) -> &crate::serve::config::ServingConfig {
+        &self.serving
     }
 
     /// The model's advertised name (its API slug source).

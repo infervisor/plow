@@ -4,6 +4,7 @@ pub mod admin;
 pub mod bench;
 pub mod chat;
 pub mod completion;
+pub mod config;
 pub mod cosched;
 #[cfg(feature = "cpu")]
 pub mod cpu_serve;
@@ -22,6 +23,7 @@ pub mod models;
 pub mod mux;
 pub mod openai;
 pub mod placement;
+pub mod reasoning;
 pub mod stream;
 #[cfg(all(test, any(feature = "hsa", feature = "cpu")))]
 mod step_lowering_tests;
@@ -67,6 +69,12 @@ pub struct GenParams {
     pub stop: Vec<String>,
     /// OpenAI `seed`, mixed into the sampling draw for reproducibility.
     pub seed: Option<u64>,
+    /// vLLM `min_tokens`: neither the eos set nor a `stop` string may end this
+    /// request before it has produced this many tokens.
+    pub min_tokens: usize,
+    /// vLLM `stop_token_ids`: request-supplied ids that end generation, on top
+    /// of the checkpoint's own eos set.
+    pub stop_token_ids: Vec<u32>,
 }
 
 impl Default for GenParams {
@@ -77,6 +85,8 @@ impl Default for GenParams {
             ignore_eos: false,
             stop: Vec::new(),
             seed: None,
+            min_tokens: 0,
+            stop_token_ids: Vec::new(),
         }
     }
 }
@@ -254,15 +264,13 @@ pub(crate) fn bucket_has_sample_batch(bucket: &Bucket) -> bool {
     })
 }
 
-/// A deterministic `[0,1)` draw seeded by the request state (for stochastic
-/// sampling in the reference path — reproducible, no wall-clock entropy).
-pub(crate) fn seeded_unit(prompt: &[u32], out: &[u32], step: usize) -> f32 {
-    seeded_unit_with(prompt, out, step, None)
-}
-
-/// The same draw, with an optional caller-supplied OpenAI `seed` mixed in.
-/// Without it the draw is derived from the token stream alone — deterministic,
-/// but not something a client can choose, which is what `seed` is for.
+/// A deterministic `[0,1)` draw seeded by the request state, with the caller's
+/// OpenAI `seed` mixed in when it set one.
+///
+/// THERE IS DELIBERATELY NO SEEDLESS VARIANT. There used to be, and every
+/// sampling site on a real backend called it, so `seed` was honoured only on
+/// the reference path that has no model. Taking `Option<u64>` makes forgetting
+/// the seed a thing you have to type.
 pub(crate) fn seeded_unit_with(prompt: &[u32], out: &[u32], step: usize, seed: Option<u64>) -> f32 {
     (fnv_seed(prompt, out, step, seed) % 10_000) as f32 / 10_000.0
 }
@@ -360,6 +368,16 @@ pub struct AppState {
     /// Only the control plane writes here; the manager and the request path read it.
     residency: RwLock<FxHashMap<String, Residency>>,
     control: Mutex<FxHashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// Unix seconds at which this process began offering models. Stamped ONCE:
+    /// `GET /v1/models` used to call `now_secs()` per card, so `created`
+    /// changed on every scrape and no client could treat it as an identity.
+    started: u64,
+    /// slug -> compiled context length, captured when the engine is installed
+    /// so a model card never has to take the engine mutex behind a live tick.
+    max_ctx: RwLock<FxHashMap<String, usize>>,
+    /// slug -> whether its backend applies the request's sampling parameters.
+    /// Captured at install for the same reason as `max_ctx`.
+    sampling_honoured: RwLock<FxHashMap<String, bool>>,
     /// When set, each run records a timeline dumpable at `GET /trace`.
     record_trace: bool,
     trace: Mutex<Timeline>,
@@ -390,6 +408,15 @@ impl Residency {
     pub fn admits(self) -> bool {
         matches!(self, Residency::Auto)
     }
+
+    /// The wire spelling, shared by the admin status and the model card.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Residency::Auto => "auto",
+            Residency::Unloading => "unloading",
+            Residency::Unloaded => "unloaded",
+        }
+    }
 }
 
 impl AppState {
@@ -416,6 +443,9 @@ impl AppState {
             models_roots: std::sync::OnceLock::new(),
             residency: RwLock::new(FxHashMap::default()),
             control: Mutex::new(FxHashMap::default()),
+            started: openai::now_secs(),
+            max_ctx: RwLock::new(FxHashMap::default()),
+            sampling_honoured: RwLock::new(FxHashMap::default()),
             record_trace,
             trace: Mutex::new(Timeline::new()),
         }
@@ -428,7 +458,28 @@ impl AppState {
         if let Some(h) = engine.vmm_stats_handle() {
             self.vmm_stats.write().insert(slug.clone(), h);
         }
+        self.max_ctx.write().insert(slug.clone(), engine.max_ctx());
+        self.sampling_honoured
+            .write()
+            .insert(slug.clone(), engine.honours_sampling());
         self.gpu.write().insert(slug, Arc::new(Mutex::new(engine)));
+    }
+
+    /// Unix seconds this process started offering models.
+    pub fn started(&self) -> u64 {
+        self.started
+    }
+
+    /// The compiled context length for `slug`, when an engine reported one.
+    pub fn max_ctx(&self, slug: &str) -> Option<usize> {
+        self.max_ctx.read().get(slug).copied()
+    }
+
+    /// Whether `slug`'s backend applies the request's sampling parameters.
+    /// `true` when no engine is installed — the CPU reference path samples on
+    /// the host, so there is nothing to warn about.
+    pub fn sampling_honoured(&self, slug: &str) -> bool {
+        self.sampling_honoured.read().get(slug).copied().unwrap_or(true)
     }
 
     /// The GPU engine serving `slug`, when one was installed.
@@ -707,7 +758,7 @@ impl AppState {
 
         for step in 0..gen.max_tokens.max(1) {
             obs.host.tokens.clear();
-            obs.host.rng01 = seeded_unit(&prompt_ids, &out_ids, step);
+            obs.host.rng01 = seeded_unit_with(&prompt_ids, &out_ids, step, gen.seed);
             reference_logits(&prompt_ids, &out_ids, vocab, &mut obs.host.logits);
 
             let token = if let Some((bucket, pool, streams)) = run.as_mut() {
@@ -798,9 +849,10 @@ impl AppState {
         out_ids: &[u32],
         step: usize,
         vocab: usize,
+        seed: Option<u64>,
     ) -> Result<(u32, usize)> {
         obs.host.tokens.clear();
-        obs.host.rng01 = seeded_unit(prompt_ids, out_ids, step);
+        obs.host.rng01 = seeded_unit_with(prompt_ids, out_ids, step, seed);
         reference_logits(prompt_ids, out_ids, vocab, &mut obs.host.logits);
 
         let stats = self
@@ -825,6 +877,15 @@ impl AppState {
     }
 }
 
+/// Maximum request body this server accepts.
+///
+/// axum's default is 2 MiB, chosen for ordinary web forms, and it is applied by
+/// the `Json` extractor BEFORE any handler runs — so a long-context chat
+/// request was refused with a bare 413 and no error envelope. A million-token
+/// conversation is several MiB of JSON; the cap belongs at a size that reflects
+/// what this server is for.
+pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Build the axum app.
 pub fn app(state: Arc<AppState>) -> Router {
     Router::new()
@@ -833,6 +894,16 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize))
         .route("/v1/models", get(models::list_models))
+        // GET only, with a 404 fallback for every other method. The admin
+        // routes live at `/v1/models/load|unload|status`, and a bare
+        // `get(...)` here answered a POST to one of those with 405 on the
+        // PUBLIC router — announcing that the control plane exists on a
+        // listener that does not serve it. Static paths still win on the
+        // merged router, so admin keeps working where it is mounted.
+        .route(
+            "/v1/models/:id",
+            get(models::get_model).fallback(models::model_route_fallback),
+        )
         // BOTH spellings. vLLM serves `/health`, and every k8s probe and
         // benchmark harness copied from vLLM asks for it; plowrt served only
         // `/healthz`, so all of them got a 404 from a healthy server.
@@ -840,6 +911,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
         .route("/trace", get(trace_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
@@ -923,6 +995,29 @@ async fn metrics_handler(
     ] {
         crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
     }
+    // The same prefix-cache signal under vLLM's names and label.
+    //
+    // COUNTED IN ATTACH REQUESTS, NOT TOKENS, and the HELP says so: vLLM's two
+    // series count tokens queried and tokens hit, and this server tracks hit
+    // tokens (`tokens_attached`) but never counts the tokens it MISSED, so a
+    // token-denominated ratio cannot be computed from what exists. A request
+    // ratio is a real number about a real thing; a token ratio here would be
+    // fabricated.
+    #[cfg(feature = "cuda")]
+    {
+        crate::obs::serving::family(
+            &mut out,
+            "vllm:prefix_cache_queries_total",
+            "counter",
+            "Prefix cache lookups (ATTACH REQUESTS, not tokens - see plowrt_prefix_* for token counts).",
+        );
+        crate::obs::serving::family(
+            &mut out,
+            "vllm:prefix_cache_hits_total",
+            "counter",
+            "Prefix cache lookups that found a reusable prefix (attach requests, not tokens).",
+        );
+    }
     #[cfg(feature = "cuda")]
     for (slug, h) in state.vmm_stats.read().iter() {
         let s = h.stats();
@@ -952,6 +1047,13 @@ async fn metrics_handler(
             s.cache_bytes,
             s.snapshot_bytes,
             s.snapshots_evicted,
+        );
+        let _ = write!(
+            out,
+            "vllm:prefix_cache_queries_total{{model_name=\"{slug}\",engine=\"0\"}} {}\n\
+             vllm:prefix_cache_hits_total{{model_name=\"{slug}\",engine=\"0\"}} {}\n",
+            s.attach_hits + s.attach_misses,
+            s.attach_hits,
         );
     }
     ([("content-type", "text/plain; version=0.0.4; charset=utf-8")], out).into_response()

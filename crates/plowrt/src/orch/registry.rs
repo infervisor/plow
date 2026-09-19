@@ -20,6 +20,11 @@ use crate::{Result, RuntimeError};
 #[derive(Default)]
 pub struct Registry {
     models: RwLock<FxHashMap<String, Arc<ModelBundle>>>,
+    /// Extra names a registered model answers to (vLLM's `--served-model-name`),
+    /// alias -> canonical slug. Clients routinely hardcode a model name they
+    /// cannot change; without this the only way to serve them was to rename the
+    /// bundle, which changes every metric label and dashboard along with it.
+    aliases: RwLock<FxHashMap<String, String>>,
 }
 
 impl Registry {
@@ -48,6 +53,52 @@ impl Registry {
         Ok(slug)
     }
 
+    /// Register `alias` as another name for `canonical`.
+    ///
+    /// Refuses an alias that collides with a registered slug or another alias:
+    /// silently shadowing one model with another is the failure `load` already
+    /// refuses for duplicate slugs, reached by a different route.
+    pub fn add_alias(&self, alias: String, canonical: &str) -> Result<()> {
+        if !self.contains(canonical) {
+            return Err(RuntimeError::UnknownModel(canonical.to_string()));
+        }
+        if self.contains(&alias) {
+            return Err(RuntimeError::Msg(format!(
+                "alias {alias:?} is already a registered model slug"
+            )));
+        }
+        let mut aliases = self.aliases.write();
+        if let Some(existing) = aliases.get(&alias) {
+            if existing != canonical {
+                return Err(RuntimeError::Msg(format!(
+                    "alias {alias:?} already points at {existing:?}"
+                )));
+            }
+            return Ok(());
+        }
+        aliases.insert(alias, canonical.to_string());
+        Ok(())
+    }
+
+    /// The canonical slug `name` refers to, when it is an ALIAS. `None` when
+    /// `name` is already a slug (or is unknown) — the caller then uses it
+    /// unchanged, so the common path costs one lookup and no allocation.
+    pub fn resolve(&self, name: &str) -> Option<String> {
+        self.aliases.read().get(name).cloned()
+    }
+
+    /// Every (alias, canonical) pair, sorted by alias.
+    pub fn alias_pairs(&self) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = self
+            .aliases
+            .read()
+            .iter()
+            .map(|(a, c)| (a.clone(), c.clone()))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
     /// Resolve a request `model` slug to its bundle.
     pub fn get(&self, slug: &str) -> Result<Arc<ModelBundle>> {
         self.models
@@ -67,10 +118,16 @@ impl Registry {
     /// drop, the bundle's device memory is released. Returns the bundle for
     /// the caller to orchestrate drain if needed.
     pub fn unload(&self, slug: &str) -> Result<Arc<ModelBundle>> {
-        self.models
+        let bundle = self
+            .models
             .write()
             .remove(slug)
-            .ok_or_else(|| RuntimeError::UnknownModel(slug.to_string()))
+            .ok_or_else(|| RuntimeError::UnknownModel(slug.to_string()))?;
+        // Otherwise the alias outlives its target and resolves to a slug that
+        // is no longer registered — a 404 naming a model the client never asked
+        // for.
+        self.aliases.write().retain(|_, canonical| canonical != slug);
+        Ok(bundle)
     }
 
     /// Registered slugs — backs `GET /v1/models`. Sorted, so the listing is

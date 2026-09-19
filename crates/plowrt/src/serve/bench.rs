@@ -862,6 +862,7 @@ fn submit(
         ignore_eos: true,
         stop: Vec::new(),
         seed: None,
+        ..Default::default()
     };
     let job = Job {
         prompt_ids,

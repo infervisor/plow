@@ -36,6 +36,47 @@ pub enum ServeEngine {
     Cpu(CpuServe),
 }
 
+impl ServeEngine {
+    /// Whether this backend applies the request's sampling parameters.
+    ///
+    /// ONLY THE CUDA ENGINE DOES. The gfx950 engine and the CPU/Metal engine
+    /// both sample on device and never hand the host a logit row, so every
+    /// token is the argmax whatever `temperature`, `top_p`, `top_k`, the
+    /// penalties or `seed` said. The host resample (`gpu_finish_token`) is
+    /// reached only from `cfg(cuda)` call sites, and neither `serve::cpu_serve`
+    /// nor the Apple engine contains a sampler at all.
+    ///
+    /// The AMD half of that was documented; the CPU/Metal half was not, and
+    /// this method first claimed `true` for it. A live Qwen3-0.6B on Metal
+    /// settled it: five seeds and `temperature` 0, 0.7 and 2.0 all returned
+    /// byte-identical text. Reporting it on the model card lets a client
+    /// discover this before it sends a request whose sampling will be
+    /// discarded.
+    pub fn honours_sampling(&self) -> bool {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => true,
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(_) => false,
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => false,
+        }
+    }
+
+    /// The compiled context length, for the model card's `max_model_len`.
+    /// Captured at install so a card never takes the engine mutex.
+    pub fn max_ctx(&self) -> usize {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.max_ctx(),
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => e.max_ctx(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(e) => e.max_ctx(),
+        }
+    }
+}
+
 #[cfg(feature = "cpu")]
 pub use super::cpu_serve::CpuServe;
 

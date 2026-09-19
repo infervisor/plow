@@ -1,6 +1,144 @@
 //! §G OpenAI-compatible request/response DTOs.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+/// The sampling knobs both endpoints accept, in their OpenAI/vLLM wire form.
+///
+/// These are `flatten`ed into both request bodies rather than declared twice.
+/// Every one of them was previously dropped by serde as an unknown field: the
+/// host sampler has implemented `top_k`/`min_p`/`repetition_penalty`/
+/// `logit_bias` all along, and a request asking for them was answered under
+/// different sampling than it requested, with a 200 and no warning. That is the
+/// same silent-wrong-answer class the `tools`/`n` refusals already guard.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SamplingFields {
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// vLLM spells "disabled" as `-1`; this server's sampler spells it `0`.
+    #[serde(default)]
+    pub top_k: Option<i32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    /// OpenAI `logit_bias`: token id (as a STRING key, per the schema) -> bias.
+    #[serde(default)]
+    pub logit_bias: Option<BTreeMap<String, f32>>,
+    /// vLLM extension: refuse to stop before this many tokens.
+    #[serde(default)]
+    pub min_tokens: Option<u32>,
+    /// vLLM extension: extra ids that end generation.
+    #[serde(default)]
+    pub stop_token_ids: Option<Vec<u32>>,
+}
+
+/// A rejected parameter: the field name and why.
+pub struct ParamError {
+    pub field: &'static str,
+    pub message: String,
+}
+
+fn range(
+    v: Option<f32>,
+    field: &'static str,
+    lo: f32,
+    hi: f32,
+    lo_open: bool,
+) -> Result<(), ParamError> {
+    let Some(v) = v else { return Ok(()) };
+    let low_ok = if lo_open { v > lo } else { v >= lo };
+    if !v.is_finite() || !low_ok || v > hi {
+        return Err(ParamError {
+            field,
+            message: format!(
+                "`{field}` must be in {}{lo}, {hi}]; got {v}",
+                if lo_open { "(" } else { "[" }
+            ),
+        });
+    }
+    Ok(())
+}
+
+impl SamplingFields {
+    /// Range-check every field. OpenAI answers 400 for an out-of-range value;
+    /// this server used to accept them and sample from the result — `top_p: 0`
+    /// truncates the candidate set to nothing, and a negative `temperature`
+    /// falls through the greedy branch into a scaled softmax with an inverted
+    /// sign.
+    pub fn validate(&self) -> Result<(), ParamError> {
+        range(self.temperature, "temperature", 0.0, 2.0, false)?;
+        range(self.top_p, "top_p", 0.0, 1.0, true)?;
+        range(self.min_p, "min_p", 0.0, 1.0, false)?;
+        range(self.repetition_penalty, "repetition_penalty", 0.0, 2.0, true)?;
+        range(self.presence_penalty, "presence_penalty", -2.0, 2.0, false)?;
+        range(self.frequency_penalty, "frequency_penalty", -2.0, 2.0, false)?;
+        if let Some(k) = self.top_k {
+            if k < -1 {
+                return Err(ParamError {
+                    field: "top_k",
+                    message: format!("`top_k` must be -1 (disabled) or >= 0; got {k}"),
+                });
+            }
+        }
+        for (k, v) in self.logit_bias.iter().flatten() {
+            if k.parse::<u32>().is_err() {
+                return Err(ParamError {
+                    field: "logit_bias",
+                    message: format!("`logit_bias` keys are token ids; `{k}` is not one"),
+                });
+            }
+            if !v.is_finite() || !(-100.0..=100.0).contains(v) {
+                return Err(ParamError {
+                    field: "logit_bias",
+                    message: format!("`logit_bias` values must be in [-100, 100]; got {v}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Overlay the request's knobs onto `params`, which arrives carrying the
+    /// MODEL's defaults. A field the request omits keeps the model default —
+    /// that ordering is the whole point, and is why this takes `&mut` rather
+    /// than building a fresh `SamplingParams`.
+    pub fn apply(&self, params: &mut crate::text::sample::SamplingParams) {
+        if let Some(v) = self.temperature {
+            params.temperature = v;
+        }
+        if let Some(v) = self.top_p {
+            params.top_p = v;
+        }
+        if let Some(v) = self.top_k {
+            params.top_k = v.max(0) as usize;
+        }
+        if let Some(v) = self.min_p {
+            params.min_p = v;
+        }
+        if let Some(v) = self.repetition_penalty {
+            params.repetition_penalty = v;
+        }
+        if let Some(v) = self.presence_penalty {
+            params.presence_penalty = v;
+        }
+        if let Some(v) = self.frequency_penalty {
+            params.frequency_penalty = v;
+        }
+        if let Some(b) = &self.logit_bias {
+            params.logit_bias = b
+                .iter()
+                .filter_map(|(k, v)| k.parse::<u32>().ok().map(|t| (t, *v)))
+                .collect();
+        }
+    }
+}
 
 /// `POST /v1/chat/completions` request body (subset).
 #[derive(Clone, Debug, Deserialize)]
@@ -15,10 +153,8 @@ pub struct ChatRequest {
     /// Accept both, or the cap is silently ignored and generation runs to EOS.
     #[serde(default, alias = "max_completion_tokens")]
     pub max_tokens: Option<u32>,
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    #[serde(default)]
-    pub top_p: Option<f32>,
+    #[serde(flatten)]
+    pub sampling: SamplingFields,
     /// vLLM extension: run to `max_tokens` instead of stopping at eos. Sent by
     /// `vllm bench serve` for the synthetic datasets; ignoring it makes every
     /// benchmark against plowrt under-report throughput. See `GenParams`.
@@ -33,6 +169,24 @@ pub struct ChatRequest {
     /// Mixed into the sampling RNG so a run is reproducible on request.
     #[serde(default)]
     pub seed: Option<u64>,
+    /// vLLM's escape hatch into the checkpoint's own template. `{"enable_thinking":
+    /// false}` is how every Qwen3/GLM client turns reasoning off; dropping it
+    /// meant plowrt served a thinking trace where the same request to vLLM did
+    /// not — which is exactly how `scripts/bench_vllm_rocm.sh` drives vLLM, so
+    /// the two sides of that A/B were not running the same prompt.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<BTreeMap<String, serde_json::Value>>,
+    /// OpenAI's reasoning knob. Passed into the template as `reasoning_effort`,
+    /// which is the name the checkpoints that read it use.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// vLLM extension: render the final assistant turn as a prefix to continue
+    /// rather than closing it and opening a new one.
+    #[serde(default)]
+    pub continue_final_message: Option<bool>,
+    /// Per-request template override, for checkpoints that ship none.
+    #[serde(default)]
+    pub chat_template: Option<String>,
     // The rest are parsed ONLY so the handler can REFUSE them. Serde drops
     // unknown fields silently, and a silently dropped `tools` or `n` is a
     // wrong answer that scores as a successful request — the failure mode the
@@ -90,10 +244,8 @@ pub struct CompletionRequest {
     pub stream: bool,
     #[serde(default)]
     pub max_tokens: Option<u32>,
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    #[serde(default)]
-    pub top_p: Option<f32>,
+    #[serde(flatten)]
+    pub sampling: SamplingFields,
     #[serde(default)]
     pub ignore_eos: Option<bool>,
     #[serde(default)]
@@ -208,6 +360,92 @@ pub enum ContentPart {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// THE POINT OF `SamplingFields`, asserted end to end: the wire form has to
+    /// DESERIALIZE and then actually reach `SamplingParams`. A test that only
+    /// checks the request is accepted passes just as happily when every value
+    /// is thrown away, which is the bug this replaced.
+    #[test]
+    fn every_sampling_knob_survives_the_wire_and_reaches_the_sampler() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{
+                "model": "m",
+                "messages": [],
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "top_k": 20,
+                "min_p": 0.05,
+                "repetition_penalty": 1.1,
+                "presence_penalty": 0.25,
+                "frequency_penalty": 0.5,
+                "logit_bias": {"7": -3.5},
+                "min_tokens": 3,
+                "stop_token_ids": [11, 22]
+            }"#,
+        )
+        .expect("the flattened sampling block deserializes");
+
+        let mut p = crate::text::sample::SamplingParams::default();
+        req.sampling.apply(&mut p);
+        assert_eq!(p.temperature, 0.6);
+        assert_eq!(p.top_p, 0.95);
+        assert_eq!(p.top_k, 20);
+        assert_eq!(p.min_p, 0.05);
+        assert_eq!(p.repetition_penalty, 1.1);
+        assert_eq!(p.presence_penalty, 0.25);
+        assert_eq!(p.frequency_penalty, 0.5);
+        assert_eq!(p.logit_bias, vec![(7u32, -3.5f32)]);
+        assert_eq!(req.sampling.min_tokens, Some(3));
+        assert_eq!(req.sampling.stop_token_ids.as_deref(), Some(&[11u32, 22][..]));
+    }
+
+    /// `flatten` changes how serde drives the WHOLE struct, so the fields that
+    /// are not part of the flattened block have to keep working — `seed` is a
+    /// u64 and `max_completion_tokens` is an alias, both easy to lose.
+    #[test]
+    fn flattening_the_sampling_block_does_not_break_the_other_fields() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[],"seed":18446744073709551615,
+                "max_completion_tokens":128,"stream":true,
+                "stream_options":{"include_usage":true}}"#,
+        )
+        .expect("deserializes");
+        assert_eq!(req.seed, Some(u64::MAX), "a full-width u64 seed survived");
+        assert_eq!(req.max_tokens, Some(128), "the OpenAI alias still applies");
+        assert!(req.stream);
+        assert!(req.stream_options.expect("present").include_usage);
+    }
+
+    /// A request that sets nothing must leave the MODEL's defaults untouched —
+    /// that is what makes `request > model default > server default` work.
+    #[test]
+    fn an_empty_sampling_block_overrides_nothing() {
+        let req: ChatRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[]}"#).expect("deserializes");
+        let mut p = crate::text::sample::SamplingParams {
+            temperature: 0.6,
+            top_p: 0.95,
+            top_k: 20,
+            ..Default::default()
+        };
+        req.sampling.apply(&mut p);
+        assert_eq!((p.temperature, p.top_p, p.top_k), (0.6, 0.95, 20));
+    }
+
+    /// vLLM spells "no top-k" as -1; this sampler spells it 0.
+    #[test]
+    fn vllms_disabled_top_k_maps_to_this_samplers_spelling() {
+        let f = SamplingFields {
+            top_k: Some(-1),
+            ..Default::default()
+        };
+        let mut p = crate::text::sample::SamplingParams::default();
+        f.apply(&mut p);
+        assert_eq!(p.top_k, 0);
+        assert!(f.validate().is_ok());
+    }
+
     use super::{Content, ContentPart, ImageUrl};
 
     #[test]
@@ -259,11 +497,21 @@ pub struct Usage {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub prompt_tokens_details: PromptTokensDetails,
+    /// Present only for a model that frames a reasoning trace. Without it a
+    /// client cannot tell how much of `completion_tokens` was the trace rather
+    /// than the answer, which is what it is billed and budgeted on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct PromptTokensDetails {
     pub cached_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct CompletionTokensDetails {
+    pub reasoning_tokens: u64,
 }
 
 impl From<crate::serve::stream::TokenUsage> for Usage {
@@ -275,6 +523,7 @@ impl From<crate::serve::stream::TokenUsage> for Usage {
             prompt_tokens_details: PromptTokensDetails {
                 cached_tokens: u.cached_tokens as u64,
             },
+            completion_tokens_details: None,
         }
     }
 }
@@ -373,6 +622,25 @@ pub struct ModelCard {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+    /// `root` is the id a derived model was served from; with no adapters or
+    /// aliases it is the model's own id, which is what vLLM reports too.
+    pub root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// The compiled context length. LiteLLM, OpenWebUI and vLLM's own clients
+    /// read this to size a request; a card without it makes them guess.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_model_len: Option<usize>,
+    /// Empty, but PRESENT: the OpenAI schema declares it and typed clients
+    /// index into it.
+    pub permission: Vec<serde_json::Value>,
+    /// `"device_argmax"` when this model's backend IGNORES the request's
+    /// sampling parameters (the gfx950 engine samples greedily on device).
+    /// Absent when sampling is applied normally. A vendor-prefixed field, so a
+    /// typed OpenAI client ignores it and a plow-aware one can check it before
+    /// sending a request whose `temperature` would be discarded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_plow_sampling: Option<&'static str>,
 }
 
 /// Unix seconds, for the `created` field every OpenAI object carries.

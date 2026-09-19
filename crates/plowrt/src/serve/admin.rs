@@ -21,7 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::serve::{AppState, Residency};
+use crate::serve::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct LoadRequest {
@@ -43,6 +43,11 @@ pub struct LoadRequest {
     /// default — an admin load must not silently take down another model.
     #[serde(default)]
     pub evict: bool,
+    /// Extra names this model answers to (vLLM's `--served-model-name`).
+    /// Registered after the model itself, so a rejected alias never leaves a
+    /// half-loaded model behind.
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,6 +252,11 @@ pub async fn load(State(state): State<Arc<AppState>>, Json(req): Json<LoadReques
                 }
                 return err(StatusCode::BAD_REQUEST, e);
             }
+            for alias in &req.aliases {
+                if let Err(e) = state.registry.add_alias(alias.clone(), &req.model) {
+                    return err(StatusCode::BAD_REQUEST, e);
+                }
+            }
             state.set_slug_group(&req.model, group);
         }
 
@@ -338,11 +348,7 @@ pub async fn unload(
 pub async fn status(State(state): State<Arc<AppState>>) -> Response {
     let mut models = Vec::new();
     for slug in state.registry.slugs() {
-        let residency = match state.residency(&slug) {
-            Residency::Auto => "auto",
-            Residency::Unloading => "unloading",
-            Residency::Unloaded => "unloaded",
-        };
+        let residency = state.residency(&slug).as_str();
         #[allow(unused_mut)]
         let mut entry = ModelStatus {
             resident: state.has_gpu_engine(&slug),
