@@ -470,12 +470,28 @@ the corrected roofline model is right.
      generation with `PLOW_MULTISTEP=0`, so C1 decode is not going through that
      function either.
 
-   So the C1 decode step traverses a THIRD path, reached via the serve layer's own
-   `token_batch_step` (`serve/engine.rs:4361` -> `AmdServe::token_batch_step`), and
-   finding it is the prerequisite for attributing the 43 ms. Start there, not at
-   `PLOW_STEP_TIME`. The added instrumentation is still worth keeping: it will report
-   as soon as the GPU token-batch route drives decode, which is what happens at higher
-   concurrency, exactly where the serving-throughput cells live.
+   So the C1 decode step traverses a THIRD path. The added instrumentation is still
+   worth keeping — it reports as soon as the GPU token-batch route drives decode, which
+   is what happens at higher concurrency, exactly where the serving cells live.
+
+   **ROOT REASON THE 43 ms IS UNATTRIBUTABLE — the tool does not exist for this path.**
+   `crates/plowrt/src/obs/dstep.rs` is exactly the right instrument: its own header is
+   "§DSTEP — where a DECODE token's wall clock goes, host phase by host phase", it
+   splits each phase into `pre ` / `GPU ` / `post` by whether pipelining could hide it,
+   and it dumps a per-phase table every 64 tokens ending in
+   "HOST TOTAL (everything but the drain)" — the exact number this campaign needs.
+
+   It is **AMD-only**. `obs::dstep` is referenced from `exec/amd_tp.rs`, `exec/amd.rs`,
+   `serve/mux.rs` (one `STREAM` call) and `main.rs`, and every `dstep::token()` window
+   tick sits in an `AmdTpGroup` CLI path. On a CUDA serve the counters never accumulate,
+   the window never reaches 64, and `PLOW_DSTEP_LOG=1` prints nothing — which is what
+   happened across a 300-token generation here.
+
+   **So the highest-value next task is: port the `dstep` phases to the CUDA serve decode
+   tick** (mux tick -> engine step -> drain -> detok/stream), mirroring `amd_tp.rs`.
+   Until that exists, every statement about where 26B decode time goes is a guess, and
+   this campaign has already had four guesses refuted by measurement. Do not author a
+   kernel before this instrument reports.
 
    What is already excluded as the explanation, each by measurement against the 12B
    control or a standalone bench:
