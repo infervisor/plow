@@ -163,7 +163,56 @@ batch's expert choices: expected `n*(1-(1-k/n)^B)` experts.
 TPOT floors out near 13-15 ms while per-token cost keeps falling — the opposite
 shape from 12B, and it is where the throughput work has to aim.
 
-## BLOCKER: 26B sm90a prefill faults on GPU (pre-existing, not root-caused)
+## RESOLVED — 26B serves on H100 (2026-09-19)
+
+Gemma-4-26B-A4B now answers correctly through the OpenAI endpoint and passes the
+bench client's coherence gate. 47.0 GiB weights + 27.5 GiB KV, `grid_flash=132`,
+`fa512=true`, `fa256_gqa2=true`, `bytes_per_token=225280` (the correct hybrid KV
+figure: 5 full x 2 x 512 + 25 sliding x 8 x 256, x2 for K/V, x2 bytes).
+
+TWO bugs, both the same shape — **an opcode the packet uses is compiled out of the
+object that must run it**, and neither reachable from a dense checkpoint, which is
+why 12B was never affected:
+
+1. **Prefill (recipe error).** The five MoE prefill opcodes are guarded by
+   `#if !PLOW_NV_SEG_GEMM && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE`. The build makes
+   exactly three object flavours and each sets one of those flags: the GEMM object
+   (`SEG_GEMM=1`), the attention object (`FA_ONLY=1`) and — with
+   `PLOW_BUILD_FATLITE=1`, which `build_sm90a_gemma4_segments.sh:75` feeds into
+   `-DPLOW_NV_FATLITE` — the fat packed-seg object too. No object implemented MoE
+   prefill. Recipe now sets `PLOW_BUILD_FATLITE=0`.
+2. **Decode (upstream bug, `interp_sm120.cu`).** `PLOW_HAS_MOE_GEMMA` ORed only the
+   two BASE opcodes, with a comment asserting the family is all-or-nothing. The
+   emitter actually picks VARIANTS — the split `MoeRouterGemmaScore`+`Topk` router
+   and the norm-fused `MoeExpertGluNormGemma`. Evaluated against the real config with
+   the decode object's defines (`-DPLOW_BUCKET_DECODE=1`): `..._SCORE 1`,
+   `..._TOPK 1`, `..._EXPERT_GLU_NORM_GEMMA 1`, old gate `(0 || 0) = 0`. Fixed by
+   naming every member; verified 1 for the decode object and still 0 for prefill
+   objects, so no prefill object grows.
+
+Diagnostic note worth keeping: comparing compiled object SIZE to test the decode gate
+was misleading — the probe was built with `PLOW_BUCKET_DECODE=0`, which is a PREFILL
+object, where the gate is correctly 0 either way. Evaluate `PLOW_HAS_*` macros with
+the target object's own defines (`cpp -I <assets> -DPLOW_BUCKET_DECODE=1`).
+
+## First measured 26B numbers, and the gap
+
+Coherence gate PASS. First light is SLOW: in128/C1 warmup ran 6.24 s per 128-token
+request, i.e. **~48.8 ms/token against vLLM's 5.03 ms** — roughly 10x behind, and
+~21x above the 2.29 ms roofline floor. That is an unoptimised packet and the reasons
+are known and enumerable:
+
+* `PLOW_BUILD_FATLITE=0` is now forced, which surrenders the occupancy win fatlite
+  exists for (12B measured -2.8 ms @1024, -4.8 ms @4096). Recovering it for 26B means
+  widening the MoE prefill guard so the ops survive fatlite, not flipping the knob.
+* No tuned cuBLASLt algorithm table for the 26B shapes (the 12B assets ship one;
+  26B picks algorithms at load). `campaign.py probe` fills this.
+* No hd512 px4 role — that object hardcodes `n_kv_head=1` and 26B has 2, so 26B runs
+  the generic hd512 body.
+* The decode MoE GLU is the dot8 CUDA-core walk, the exact shape of bug that made 12B
+  decode compute-bound before `PLOW_NV_GEMV_MMA`.
+
+## Superseded: the prefill fault investigation
 
 A packet emits cleanly and loads (47.0 GiB weights + 8.75 GiB KV, 54.7 GiB total,
 24.8 GiB free), then the FIRST prefill chunk faults:
