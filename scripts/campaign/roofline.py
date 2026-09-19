@@ -195,6 +195,36 @@ class ModelSpec:
     num_kv_heads: int
     head_dim: int
     precision: str = "bf16"
+    # Hybrid sliding/full attention (Gemma-4). `full_layers` of `layers` grow their KV
+    # with the context; the rest are capped at `sliding_window` rows. Left at 0/None the
+    # model is treated as uniformly full-attention, which is what every non-Gemma entry is.
+    full_layers: int = 0
+    sliding_window: int = 0
+    full_kv_heads: int = 0
+    full_head_dim: int = 0
+    # Routed-expert accounting. `moe_expert_params` is the share of `active_params`
+    # that ONE token's top-k experts contribute, summed over layers.
+    moe_experts: int = 0
+    moe_top_k: int = 0
+    moe_expert_params: int = 0
+
+    def decode_weight_bytes(self, batch_size: int) -> int:
+        """Weight bytes read for ONE decode step at `batch_size`.
+
+        For a dense model this is just the weights. For an MoE model it is not:
+        each token picks its own top-k experts, so a batch touches the union of
+        their choices, and the step streams that union once. Under uniform routing
+        the expected union is n*(1-(1-k/n)^B) experts. At 128/top-8 that is 8 at
+        B=1 but 82 at B=16, so charging the B=1 expert traffic at every batch size
+        understates the ceiling ~10x exactly where the serving cells live.
+        """
+        if not self.moe_experts or not self.moe_top_k or batch_size <= 1:
+            return self.weight_bytes
+        dense = self.active_params - self.moe_expert_params
+        miss = 1.0 - self.moe_top_k / self.moe_experts
+        expected = self.moe_experts * (1.0 - miss ** batch_size)
+        experts = self.moe_expert_params * (expected / self.moe_top_k)
+        return int((dense + experts) * self.elem_bytes)
 
     @property
     def elem_bytes(self) -> float:
@@ -212,6 +242,21 @@ class ModelSpec:
     @property
     def kv_bytes_per_token(self) -> int:
         return int(2 * self.layers * self.num_kv_heads * self.head_dim * self.elem_bytes)
+
+    def kv_bytes(self, ctx_len: int) -> int:
+        """KV bytes for ONE sequence at `ctx_len`.
+
+        A sliding layer never holds more than `sliding_window` rows however long the
+        prompt is, so charging every layer `ctx_len` rows overstates Gemma-4's decode
+        traffic several-fold at 8K and makes the achieved-bandwidth number meaningless.
+        """
+        if not self.full_layers or not self.sliding_window:
+            return self.kv_bytes_per_token * ctx_len
+        sliding = self.layers - self.full_layers
+        rows_sliding = min(ctx_len, self.sliding_window)
+        per_row_sliding = 2 * self.num_kv_heads * self.head_dim * self.elem_bytes
+        per_row_full = 2 * self.full_kv_heads * self.full_head_dim * self.elem_bytes
+        return int(sliding * rows_sliding * per_row_sliding + self.full_layers * ctx_len * per_row_full)
 
 
 KNOWN_MODELS: Dict[str, ModelSpec] = {
@@ -254,11 +299,90 @@ KNOWN_MODELS: Dict[str, ModelSpec] = {
 }
 
 
+def spec_from_hf_config(hf_dir: str, precision: str) -> Optional[ModelSpec]:
+    """Derive the spec from the checkpoint's own config.json.
+
+    The KNOWN_MODELS table below is hand-maintained and was wrong for both Gemma-4
+    entries (it listed 26B-A4B as 26B dense / 46 layers / hidden 5120 against an
+    actual 3.8B active / 30 layers / hidden 2816). A ceiling built from a guess makes
+    every `% of roofline` number fiction, so prefer the checkpoint whenever it is
+    reachable and fall back to the table only when it is not.
+    """
+    try:
+        cfg = json.loads((Path(hf_dir) / "config.json").read_text())
+    except Exception:
+        return None
+    t = cfg.get("text_config", cfg)
+    try:
+        layers = int(t["num_hidden_layers"])
+        hidden = int(t["hidden_size"])
+        heads = int(t["num_attention_heads"])
+        inter = int(t["intermediate_size"])
+        vocab = int(t["vocab_size"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    hd = int(t.get("head_dim", hidden // heads))
+    hd_full = int(t.get("global_head_dim", hd))
+    kvh = int(t.get("num_key_value_heads", heads))
+    kvh_full = int(t.get("num_global_key_value_heads", kvh))
+    types = t.get("layer_types") or []
+    full_layers = sum(1 for x in types if "full" in str(x)) if types else 0
+    sliding = len(types) - full_layers if types else 0
+
+    # Per-token ACTIVE parameters, counted from the shapes the checkpoint actually holds.
+    # Full-attention layers carry no v_proj (attention_k_eq_v).
+    k_eq_v = bool(t.get("attention_k_eq_v", False))
+    attn_slide = hidden * (heads * hd + 2 * kvh * hd + heads * hd)
+    attn_full = hidden * (heads * hd_full + (1 if k_eq_v else 2) * kvh_full * hd_full + heads * hd_full)
+    dense_mlp = 3 * inter * hidden
+    per_sliding = attn_slide + dense_mlp
+    per_full = attn_full + dense_mlp
+    n_exp = top_k = 0
+    expert_params = 0
+    if t.get("enable_moe_block"):
+        n_exp = int(t["num_experts"])
+        top_k = int(t["top_k_experts"])
+        i_moe = int(t["moe_intermediate_size"])
+        per_layer_experts = top_k * 3 * i_moe * hidden
+        moe_active = per_layer_experts + n_exp * hidden  # experts + router
+        per_sliding += moe_active
+        per_full += moe_active
+        expert_params = per_layer_experts * layers
+    if types:
+        active = sliding * per_sliding + full_layers * per_full
+    else:
+        active = layers * per_sliding
+    active += vocab * hidden  # lm_head, tied or not, is read every step
+
+    return ModelSpec(
+        name=Path(hf_dir).name,
+        active_params=int(active),
+        layers=layers,
+        hidden_size=hidden,
+        num_heads=heads,
+        num_kv_heads=kvh,
+        head_dim=hd,
+        precision=precision,
+        full_layers=full_layers,
+        sliding_window=int(t.get("sliding_window", 0) or 0),
+        full_kv_heads=kvh_full,
+        full_head_dim=hd_full,
+        moe_experts=n_exp,
+        moe_top_k=top_k,
+        moe_expert_params=expert_params,
+    )
+
+
 def lookup_model(recipe_data: dict) -> ModelSpec:
     cell = recipe_data.get("cell", {})
     name = cell.get("name", "")
     model_str = cell.get("model", "")
     precision = cell.get("precision", "bf16")
+
+    if cell.get("hf_dir"):
+        spec = spec_from_hf_config(cell["hf_dir"], precision)
+        if spec is not None:
+            return spec
 
     # Match by known model substrings
     for key, spec in KNOWN_MODELS.items():
@@ -334,8 +458,8 @@ def analyze_decode(
     ctx_len: int,
     measured_tpot_ms: Optional[float] = None,
 ) -> DecodeAnalysis:
-    weight_bytes = model.weight_bytes
-    kv_bytes = model.kv_bytes_per_token * batch_size * ctx_len
+    weight_bytes = model.decode_weight_bytes(batch_size)
+    kv_bytes = model.kv_bytes(ctx_len) * batch_size
     total_bytes = weight_bytes + kv_bytes
     flops = 2 * model.active_params * batch_size
     ai = flops / total_bytes if total_bytes > 0 else 0.0
@@ -381,8 +505,18 @@ def analyze_prefill(
     measured_ttft_ms: Optional[float] = None,
 ) -> PrefillAnalysis:
     gemm_flops = 2 * model.active_params * prompt_tokens
-    # Causal attention FLOPs: 2 * layers * heads * head_dim * T^2
-    attn_flops = 2 * model.layers * model.num_heads * model.head_dim * (prompt_tokens * prompt_tokens)
+    # Causal attention FLOPs. A sliding layer's score matrix is banded, not triangular:
+    # each query attends to at most `sliding_window` keys, so its cost is linear in T
+    # once T exceeds the window, not quadratic. Charging T^2 to all 30 layers overstates
+    # an 8K Gemma-4 prefill's attention FLOPs by ~4x.
+    if model.full_layers and model.sliding_window:
+        sliding = model.layers - model.full_layers
+        band = min(prompt_tokens, model.sliding_window)
+        pairs = model.full_layers * prompt_tokens * prompt_tokens + sliding * prompt_tokens * band
+    else:
+        pairs = model.layers * prompt_tokens * prompt_tokens
+    # 2 GEMMs (QK^T and PV), 2 FLOP each, per (query, key) pair per head-feature.
+    attn_flops = 4 * model.num_heads * model.head_dim * pairs
     total_flops = gemm_flops + attn_flops
 
     weight_bytes = model.weight_bytes

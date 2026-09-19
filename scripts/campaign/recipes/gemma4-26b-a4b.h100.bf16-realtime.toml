@@ -1,0 +1,100 @@
+# Gemma-4-26B-A4B-it, H100 SXM5, BF16 weights + BF16 KV, TP1.
+# Hybrid dense+MoE: every layer runs a dense MLP (inter 2112) AND a 128-expert
+# top-8 MoE (I_moe 704). 30 layers, hidden 2816, sliding hd256/GQA2, full hd512/GQA8.
+#
+# Deliberate differences from the 12B recipe, each one forced by a shape check
+# (see plans/gemma4-26b-a4b-h100-tracker.md "Kernel dims"):
+#  - HD512 px4 BQ64 role is OFF: that object hardcodes n_kv_head=1 and 26B has 2.
+#  - The fused GLU role is NOT in role_files: it pins N=15360/K=3840 (12B only).
+#    NO_GLU_FUSE + PREFILL_CUBLASLT is the shape-agnostic production path anyway.
+#  - HD256 GQA2 role IS reused: 26B's sliding geometry (16 heads / 8 kv) is
+#    byte-for-byte the 12B one.
+
+[cell]
+name = "gemma4-26b-a4b.h100.bf16-realtime"
+model = "google/gemma-4-26b-a4b-it"
+revision = "local"
+hf_dir = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 8192
+precision = "bf16"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_SEG_PURE_GEMM = "1"
+PLOW_SEG_FA512 = "1"
+PLOW_SEG_FA256_GQA2 = "1"
+PLOW_TMA_GEMM = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+PLOW_SLIDING_NS_CAP = "1"
+PLOW_MAX_CHUNK = "4096"
+PLOW_FUSE_ARGMAX = "1"
+# The emit default is MoeRouterGemmaScoreFast, whose own opcode doc says the changed
+# reduction association is NOT bit-identical and that packets should opt in only for
+# experiments. A vLLM comparison has to be defensible, and the whole router is ~0.5 ms
+# of a ~7.9 ms decode step, so take the exact scorer.
+PLOW_GEMMA_MOE_ROUTER_EXACT = "1"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = [
+  "interp_sm90a_pfattn_hd512.cubin",
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+]
+[objects.env]
+PLOW_BUILD_FATLITE = "1"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
+PLOW_BUILD_MASKED_PADDING = "1"
+PLOW_BUILD_PFATTN_WG = "0"
+PLOW_BUILD_PFATTN_KV16 = "0"
+PLOW_BUILD_PFATTN_KV64 = "0"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "0"
+PLOW_PF_SEG_PURE = "1"
+PLOW_PF_SEG_FA512 = "1"
+PLOW_PF_INTERLEAVE = "0"
+PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
+LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096 8192"
+concs = "1 4"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
+model_id = "gemma-4-26b-a4b-it"
+gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer in one short sentence.<end_of_turn>\n<start_of_turn>model\n"
+
+# Rung ladder to 8K, C1 and C4. This is the primary latency cell.
+[bench.profiles.realtime]
+in_lens = "128 1024 4096 8192"
+concs = "1 4"
+serve_env = { PLOW_MULTISTEP = "4", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0" }
+
+# Serving cell: where the MoE expert-traffic ceiling shows up.
+[bench.profiles.high_concurrency]
+in_lens = "1024 4096"
+concs = "16 32"
+nprompt = 64
+serve_env = { PLOW_MULTISTEP = "8", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
+
+[reference]
+csv = "perf-data/campaign/gemma4-26b-a4b.h100.reference-vllm028-bf16.csv"
