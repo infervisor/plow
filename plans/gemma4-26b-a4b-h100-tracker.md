@@ -438,14 +438,33 @@ the corrected roofline model is right.
    conversion fixed on 12B (C16 44.6 -> 16.2 ms). Attribute with decode step timing
    before authoring: the dense hook only engages at `MM >= 4`, so at C1 the win may
    instead be in the ~150 extra serialized MoE stages per step (5 MoE ops x 30 layers).
-2. **cuBLASLt algorithm table — DONE, and it was a null at in128.** The store had 48
-   entries for 12B's 3840-keyed shapes and 0 for 26B's 2816-keyed ones; `campaign.py
-   probe` wrote 40 measured entries. First A/B cell (128/C1) came back 42.24 vs 42.21 ms
-   — noise, as expected where prefill is negligible. The 1024/4096 cells are the real
-   test. Record the verdict here either way; a null at every rung would mean the
-   prefill inefficiency is in the native GEMM path or the attention role, not the
-   backend — which is exactly what the 12B campaign found ("the lever for 128 tokens is
-   launch COUNT, not the backend").
+2. **cuBLASLt algorithm table — DONE, and it is a NULL. Do not re-run it.** The store
+   had 48 entries for 12B's 3840-keyed shapes and 0 for 26B's 2816-keyed ones;
+   `campaign.py probe` wrote 40 measured entries and the server confirms it loaded
+   (`cuBLASLt algorithm table loaded ... shapes=40`, then `stored algorithm pinned`
+   per shape). Paired A/B on identical assets and cells:
+
+   | cell | baseline TTFT | with Lt table |
+   |---|---:|---:|
+   | 128 / C1 | 42.21 | 42.24 |
+   | 128 / C4 | 84.75 | 84.83 |
+   | 1024 / C1 | 125.02 | 125.02 |
+
+   Flat at every rung, including the one where prefill dominates. The GEMM backend is
+   NOT the prefill lever for 26B — the same result the 12B campaign recorded
+   ("cuBLASLt at every rung — NULL ... the lever for 128 tokens is launch COUNT
+   (fused QKV / gate|up) or a cheaper launch, not the backend"). Keep the table (it
+   pins shapes and is not slower), but spend effort elsewhere.
+
+2b. **Launch count / per-launch floor — the real prefill lever.** The 1024 prefill
+   program is **691 launches**: 206 Gemm, 121 RmsNorm, 90 HeadNormRope, 60
+   NormResidual, **150 MoE** (5 ops x 30 layers), 30 Glu, 30 FlashPrefill, 1 SoftCap.
+   TTFT 125 ms over 691 launches is ~181 us average against the 12B campaign's measured
+   ~52 us projection-GEMM floor, so both the count AND the per-launch cost are in play.
+   MoE adds 22 % more launches than a dense model of the same depth. Fusing the MoE
+   tail (`MoeCombineResidNormGemma` already exists as a 3-op fusion and is NOT being
+   selected — `PLOW_PACKET_HAS_MOE_COMBINE_RESID_NORM_GEMMA 0`) and the router
+   score/topk pair are the obvious candidates.
 3. **fatlite, recovered properly.** `PLOW_BUILD_FATLITE=0` is currently forced to make
    MoE prefill exist at all, surrendering the occupancy win (12B: -2.8 ms @1024,
    -4.8 ms @4096). The fix is to widen the MoE prefill guard so the ops survive
