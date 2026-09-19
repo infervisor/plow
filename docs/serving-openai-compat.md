@@ -155,12 +155,97 @@ backend and answered "The capital of France is Paris." at fictional speed. A bun
 compiled device blob with no matching driver is now a hard refusal at startup. A bundle with no
 blob is a genuine CPU-reference asset and still only warns.
 
-## 4. Known gaps, not fixed
+## 4. Sampling, per-model config and reasoning framing
 
-- **Sampling is ignored on the AMD backend.** `temperature`/`top_p` are applied on CUDA only;
-  the AMD engine samples the device argmax and logs one warning. Left as-is deliberately:
-  refusing `temperature > 0` would break every existing client and benchmark, and the right fix
-  is to wire the host resample path into the AMD arm.
+Audited 2026-09-19. Six defects of one shape: a request field parsed away, or probed for in the
+wrong place, and answered with a 200 under different behaviour than it asked for.
+
+**`seed` reached only the path with no model.** `GenParams.seed` was plumbed to the slot, and
+exactly one call site passed it on — the no-bucket reference fallback. The CUDA device sampler,
+the host resample after a logits download, the batched CPU step and `step_token` all called the
+seedless `seeded_unit`, so a fixed `seed` changed nothing on any real serve. One `slot_rng01`
+helper owns the draw now and every sampling site goes through it.
+
+**The sampler had six knobs; the API parsed two.** `top_k`, `min_p`, `repetition_penalty` and
+`logit_bias` were implemented in `text::sample` and dropped by serde as unknown fields.
+`presence_penalty` and `frequency_penalty` are OpenAI-standard, were also dropped, and were not
+implemented either — they are additive and count-weighted, not the multiplicative
+`repetition_penalty`, so they are their own pass over the row's history. All six are parsed and
+applied, along with vLLM's `min_tokens` and `stop_token_ids`.
+`SamplingParams::needs_host_logits` is now the single predicate deciding device vs host
+sampling, so the eligibility checks cannot drift from the knob set again.
+
+**Nothing was range-checked.** `top_p: 0` truncates the candidate set to nothing and a negative
+`temperature` falls through the `<= EPSILON` greedy branch into an inverted softmax. Every field
+is validated and an out-of-range value is a 400 naming it, as OpenAI answers.
+
+**`chat_template_kwargs` did not exist here.** `{"enable_thinking": false}` is how every
+Qwen3/GLM client turns reasoning off, and `scripts/bench_vllm_rocm.sh` sends exactly that to
+vLLM — so both sides of that A/B were rendering different prompts, and plowrt's numbers carried
+a thinking trace vLLM's did not. The render context is merged now rather than fixed, so any
+variable a template reads can be supplied; `reasoning_effort`, `continue_final_message` and a
+per-request `chat_template` ride the same `RenderOpts`.
+
+**The checkpoint's sampling defaults were never read.** `generation_config.json` was parsed for
+the eos set only, so every model was served at the stock temperature 1.0 / top_p 1.0 whatever
+its authors chose (Qwen3 ships 0.6/0.95/20). `serve::config::ServingConfig` resolves it per
+model at load, and resolution is now **request > model default > server default**.
+
+**`opens_reasoning` searched the whole rendered prompt for `<think>`** — and the rendered prompt
+contains user text. Asking "what does the `<think>` tag do?" routed the entire answer into
+`reasoning_content` and returned an **empty `content`**, on any model, reasoning or not. The
+framing is now a per-model `ReasoningMode`, detected once from what the checkpoint's own
+template emits and matched as a SUFFIX of the generation prompt. Being mode-driven also gives
+gpt-oss's harmony channels a parser instead of leaking the trace into `content`, and makes the
+buffered path agree with the streamed one on a trace that opened and never closed (all of it is
+the trace; the buffered path used to call it the answer).
+
+## 5. The catalogue, usage and metrics
+
+- **`GET /v1/models` stamped `created` with `now_secs()` per card**, so it changed on every
+  scrape and no client could treat it as an identity. It is the process start, stamped once.
+- Cards carry **`max_model_len`** (captured at engine install, so a card never takes the engine
+  mutex behind a live tick), `root`, `parent` and `permission`, and **`GET /v1/models/:id`**
+  exists. That route is GET-only with a 404 fallback: the admin routes live under
+  `/v1/models/`, and a bare `get(...)` answered a POST to `/v1/models/load` with 405 on the
+  PUBLIC router, announcing a control plane that listener does not serve.
+- **Model aliases** (`--served-model-name ALIAS[=SLUG]`, and `aliases` on the admin `load`).
+  Resolved once at the top of each handler so every slug-keyed map — metrics, residency, mux —
+  keeps one key per model; the response echoes the name the client sent, as vLLM does. Aliases
+  appear in the catalogue with `parent`/`root` naming their target, and are dropped when their
+  target unloads.
+- **`usage.completion_tokens_details.reasoning_tokens`** is reported for models that frame a
+  trace, counted from chunks on both paths — a character split cannot be converted back into a
+  token count.
+- **`vllm:num_preemptions_total`** and the **`vllm:` prefix-cache pair** join the existing
+  `vllm:` block. The prefix pair counts attach REQUESTS and its HELP says so: vLLM counts tokens
+  queried and tokens hit, this server never counts the tokens it MISSED, and a token ratio here
+  would be fabricated.
+- **The request body limit is explicit** (64 MiB). axum's default is 2 MiB, applied by the
+  `Json` extractor before any handler runs, so a long-context conversation was refused with a
+  bare 413 and no error envelope.
+
+## 6. Template loading
+
+All **four** places HF puts a template are read now: `chat_template.jinja`, `chat_template.json`,
+the `chat_template` key in `tokenizer_config.json` **as a string or as the list form**
+(`[{"name": "default", …}]`), and the **`chat_templates/` directory**. A checkpoint using one of
+the last two used to fall silently through to the hand-written builders.
+
+`tojson` **takes keyword arguments**. GLM's tool path calls `tojson(ensure_ascii=False)`, which
+minijinja rejected as too many arguments, failing the whole render. `ensure_ascii=True` is
+refused explicitly rather than answered with bytes that do not match the request, because
+`serde_json` never escapes non-ASCII.
+
+## 7. Known gaps, not fixed
+
+- **Sampling is ignored on the AMD backend.** The gfx950 engine samples on device and the host
+  never sees the logit row, so every token is the argmax whatever the request asked for. Still
+  true, and still deliberate — refusing `temperature > 0` would break every existing client and
+  benchmark, and the real fix is to wire the host resample path into the AMD arm. It is no
+  longer only a once-per-process log line: `ServeEngine::honours_sampling` is captured at
+  install and reported as `x_plow_sampling: "device_argmax"` on the model card, so a client can
+  see it before it sends a request whose sampling will be discarded.
 - **Tool calling is refused, not implemented.** The templates can render tool blocks; nothing
   parses a tool call back out of the generation.
 - **The handler projects each message to `{role, content}` before rendering**, so a template
@@ -168,14 +253,21 @@ blob is a genuine CPU-reference asset and still only warns.
   template keys the speaker off `message.get('name')`, and every family renders an assistant
   turn that carried a tool call as an empty one. Latent while `tools` is refused at the API
   boundary; it is the thing to fix first when tool calling lands.
-- **Only two of the four places HF puts a template are read.** `ChatTemplate::load` reads
-  `chat_template.jinja` and the `chat_template` string in `tokenizer_config.json`. It does not
-  read `chat_template.json`, the `chat_templates/*.jinja` directory, or the list form of
-  `chat_template` (`[{"name": "default", …}]`) — even though `nn-graph`'s `METADATA_FILES`
-  stages the first two into the bundle. No checkpoint on this host uses them, so the gap is
-  latent, but a checkpoint that does would fall through to the built-in builders.
-- **`tojson` takes no keyword arguments.** GLM's template calls
-  `tojson(ensure_ascii=False)` on the tool path, which minijinja rejects as too many arguments.
-  Unreachable while tool calls are stripped before rendering.
-- **No `/v1/embeddings`, no `/v1/models/{id}`.**
-- **No auth, CORS, body-size limit or request timeout** on the router.
+- **`logprobs` is refused, not served.** vLLM serves it and lm-eval-harness needs it; this is
+  the blocker for evaluation parity.
+- **No `/v1/embeddings`.**
+- **No auth and no CORS** on the router. The body-size limit and the admin listener's 0600 UDS
+  are the only access controls; a request timeout is deliberately absent, because a blanket one
+  would cut legitimate long generations.
+- **Reasoning traces spend `max_tokens`.** There is no separate budget for the trace, so a
+  reasoning model with a small cap can be truncated before its answer. `chat_template_kwargs`
+  now gives clients the same escape hatch they use against vLLM, but a real reasoning budget is
+  a scheduler feature, not an API one.
+- **No per-model fairness.** Co-tenants on a device group take turns through
+  `cosched::DeviceTurn` with no weight or priority.
+
+## 8. Unrelated, found while doing the above
+
+`cargo check -p plowrt --features cpu` does not compile on `main`, independent of any of this:
+`serve/mux.rs` calls `RuntimeConfig::get().multistep()`, which is `#[cfg(any(cuda, hsa))]`, from
+an AMD multistep block that is not itself hsa-gated. Not touched here.

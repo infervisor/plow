@@ -54,7 +54,7 @@ use crate::sched::multistep::MultiStep;
 use crate::sched::rungs::{DecodeRungs, RungController, RungLoad};
 use crate::serve::stream::{ChunkSender, FinishReason, StreamChunk};
 use crate::serve::{
-    bucket_has_sample_batch, reference_logits_row, sample_vocab, seeded_unit, AppState, GenParams,
+    bucket_has_sample_batch, reference_logits_row, sample_vocab, AppState, GenParams,
     RunObserver,
 };
 use crate::Result;

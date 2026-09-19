@@ -631,3 +631,90 @@ async fn the_completions_endpoint_validates_the_same_way() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+/// Same shape as `make_app`, plus an extra served name for the one model.
+fn make_app_with_alias(alias: &str) -> axum::Router {
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("plowrt_api_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    common::write_bundle(&dir, "api-model");
+
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(4));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let registry = Registry::new();
+    registry.load(&dir, None).unwrap();
+    registry.add_alias(alias.to_string(), "api-model").unwrap();
+    let state = Arc::new(AppState::new(registry, execset));
+    for slug in state.registry.slugs() {
+        let bundle = state.registry.get(&slug).unwrap();
+        let m = mux::spawn(
+            slug.clone(),
+            bundle,
+            Arc::clone(&state),
+            MuxConfig::default(),
+        );
+        state.install_mux(slug, m);
+    }
+    app(state)
+}
+
+/// A client that hardcodes a model name it cannot change must be servable
+/// without renaming the bundle (which would change every metric label with it).
+#[tokio::test]
+async fn a_request_for_an_alias_is_served_and_echoes_the_requested_name() {
+    let body = serde_json::json!({
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4
+    });
+    let resp = make_app_with_alias("gpt-3.5-turbo")
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = body_string(resp).await;
+    // The RESPONSE echoes what the client asked for, as vLLM does — not the
+    // canonical slug it was resolved to.
+    assert!(text.contains("\"model\":\"gpt-3.5-turbo\""), "{text}");
+}
+
+/// An alias must be discoverable, or a client cannot learn the name works.
+#[tokio::test]
+async fn aliases_appear_in_the_catalogue_pointing_at_their_target() {
+    let resp = make_app_with_alias("gpt-3.5-turbo")
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let text = body_string(resp).await;
+    assert!(text.contains("\"id\":\"api-model\""), "{text}");
+    assert!(text.contains("\"id\":\"gpt-3.5-turbo\""), "{text}");
+    assert!(text.contains("\"parent\":\"api-model\""), "{text}");
+}
+
+#[tokio::test]
+async fn a_single_card_is_fetchable_by_alias() {
+    let resp = make_app_with_alias("gpt-3.5-turbo")
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/gpt-3.5-turbo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = body_string(resp).await;
+    assert!(text.contains("\"root\":\"api-model\""), "{text}");
+}

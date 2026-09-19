@@ -39,7 +39,7 @@ pub async fn chat_completions(
     // instead of showing the user what was wrong with their request.
     req: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let Json(req) = match req {
+    let Json(mut req) = match req {
         Ok(r) => r,
         Err(e) => {
             return crate::serve::api_error(
@@ -51,6 +51,17 @@ pub async fn chat_completions(
             )
         }
     };
+
+    // ALIASES. `model` may be a name this bundle merely answers to (vLLM's
+    // `--served-model-name`). Resolve it ONCE, here, before anything keyed by
+    // slug runs — residency, the manager, the mux, the metrics map — so an
+    // alias never grows a second key for the same model. The response still
+    // echoes the name the client sent, as vLLM does.
+    let requested_model = req.model.clone();
+    if let Some(canonical) = state.registry.resolve(&req.model) {
+        req.model = canonical;
+    }
+
     // S1 multi-model: a request for a managed, non-resident model triggers
     // the switch HERE (evict LRU + load), before the prompt is built — so the
     // template choice below sees the engine. Resident models pass through on
@@ -329,7 +340,7 @@ pub async fn chat_completions(
         let include_usage = req.stream_options.map(|o| o.include_usage).unwrap_or(false);
         sse_response(
             request_id,
-            req.model,
+            requested_model,
             rx,
             include_usage,
             t_arrive,
@@ -342,7 +353,7 @@ pub async fn chat_completions(
     } else {
         buffer_and_reply(
             request_id,
-            req.model,
+            requested_model,
             rx,
             created,
             reasoning_mode,

@@ -409,6 +409,15 @@ impl Residency {
     pub fn admits(self) -> bool {
         matches!(self, Residency::Auto)
     }
+
+    /// The wire spelling, shared by the admin status and the model card.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Residency::Auto => "auto",
+            Residency::Unloading => "unloading",
+            Residency::Unloaded => "unloaded",
+        }
+    }
 }
 
 impl AppState {
@@ -869,6 +878,15 @@ impl AppState {
     }
 }
 
+/// Maximum request body this server accepts.
+///
+/// axum's default is 2 MiB, chosen for ordinary web forms, and it is applied by
+/// the `Json` extractor BEFORE any handler runs — so a long-context chat
+/// request was refused with a bare 413 and no error envelope. A million-token
+/// conversation is several MiB of JSON; the cap belongs at a size that reflects
+/// what this server is for.
+pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Build the axum app.
 pub fn app(state: Arc<AppState>) -> Router {
     Router::new()
@@ -877,7 +895,16 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize))
         .route("/v1/models", get(models::list_models))
-        .route("/v1/models/:id", get(models::get_model))
+        // GET only, with a 404 fallback for every other method. The admin
+        // routes live at `/v1/models/load|unload|status`, and a bare
+        // `get(...)` here answered a POST to one of those with 405 on the
+        // PUBLIC router — announcing that the control plane exists on a
+        // listener that does not serve it. Static paths still win on the
+        // merged router, so admin keeps working where it is mounted.
+        .route(
+            "/v1/models/:id",
+            get(models::get_model).fallback(models::model_route_fallback),
+        )
         // BOTH spellings. vLLM serves `/health`, and every k8s probe and
         // benchmark harness copied from vLLM asks for it; plowrt served only
         // `/healthz`, so all of them got a 404 from a healthy server.
@@ -885,6 +912,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
         .route("/trace", get(trace_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 

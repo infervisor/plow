@@ -54,6 +54,19 @@ impl ServeEngine {
             ServeEngine::Cpu(_) => true,
         }
     }
+
+    /// The compiled context length, for the model card's `max_model_len`.
+    /// Captured at install so a card never takes the engine mutex.
+    pub fn max_ctx(&self) -> usize {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.max_ctx(),
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => e.max_ctx(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(e) => e.max_ctx(),
+        }
+    }
 }
 
 #[cfg(feature = "cpu")]

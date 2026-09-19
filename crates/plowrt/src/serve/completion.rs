@@ -46,7 +46,7 @@ pub async fn completions(
     // instead of showing the user what was wrong with their request.
     req: Result<Json<CompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let Json(req) = match req {
+    let Json(mut req) = match req {
         Ok(r) => r,
         Err(e) => {
             return crate::serve::api_error(
@@ -58,6 +58,13 @@ pub async fn completions(
             )
         }
     };
+
+    // Aliases, resolved once before any slug-keyed lookup — see `chat`.
+    let requested_model = req.model.clone();
+    if let Some(canonical) = state.registry.resolve(&req.model) {
+        req.model = canonical;
+    }
+
     if let Err(error) = validate_return_token_ids(req.stream, req.return_token_ids) {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
@@ -274,7 +281,7 @@ pub async fn completions(
         let include_usage = req.stream_options.map(|o| o.include_usage).unwrap_or(false);
         sse_response(
             id,
-            req.model,
+            requested_model.clone(),
             rx,
             include_usage,
             t_arrive,
@@ -283,7 +290,7 @@ pub async fn completions(
         )
         .into_response()
     } else {
-        buffer_and_reply(id, req.model, rx, response_prompt_ids, created).await
+        buffer_and_reply(id, requested_model, rx, response_prompt_ids, created).await
     }
 }
 
