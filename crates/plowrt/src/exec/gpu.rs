@@ -2142,6 +2142,7 @@ pub struct GpuEngine {
     packed_terminal: Option<packed_terminal::PackedTerminal>,
     mixed_step: Option<mixed_step::MixedCudaStep>,
     token_batch: Option<token_batch::CudaTokenBatch>,
+    kv_admission: Option<crate::sched::admission::KvBudget>,
     slot_generations: Vec<u32>,
 }
 
@@ -5123,6 +5124,33 @@ impl GpuEngine {
             tm.print_flame(total);
         }
 
+        let flat_kv = vmm.is_none();
+        let kv_admission = be
+            .mem_info()
+            .ok()
+            .map(|(free, _total)| free)
+            .filter(|_| !flat_kv)
+            .and_then(|free| {
+                let kv_bytes: u64 = blob
+                    .tensors
+                    .iter()
+                    .filter(|t| t.name.starts_with("kv."))
+                    .map(|t| t.bytes)
+                    .sum();
+                let rows = (max_ctx as u64).checked_mul(batch as u64)?;
+                let per_token = kv_bytes.checked_div(rows).filter(|&b| b > 0)?;
+                let budget = (free as f64 * crate::config::RuntimeConfig::get().kv_admit_headroom())
+                    as u64;
+                tracing::info!(
+                    per_token,
+                    free_gib = free as f64 / (1u64 << 30) as f64,
+                    budget_gib = budget as f64 / (1u64 << 30) as f64,
+                    max_rows = budget / per_token,
+                    "CUDA KV admission budget"
+                );
+                Some(crate::sched::admission::KvBudget::linear(per_token, budget))
+            });
+
         let mut engine = GpuEngine {
             be,
             f,
@@ -5201,6 +5229,7 @@ impl GpuEngine {
             packed_terminal: None,
             mixed_step,
             token_batch: None,
+            kv_admission,
             slot_generations: vec![0; batch],
         };
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
@@ -5466,6 +5495,10 @@ impl GpuEngine {
     /// drives (the compiled `PLOW_DECODE_BATCH`).
     pub fn batch(&self) -> usize {
         self.batch
+    }
+
+    pub fn kv_admission(&self) -> Option<crate::sched::admission::KvBudget> {
+        self.kv_admission
     }
 
     /// Decode widths this loaded engine can execute, in ascending order.
