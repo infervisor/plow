@@ -18,7 +18,11 @@ hf_dir = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
 gpu = "H100 SXM5"
 arch = "sm_90a"
 n_cu = 132
-max_ctx = 8192
+# The 8K rung needs 8192 input + 128 output = 8320 live positions, so a packet compiled
+# at exactly 8192 rejects every 8192-token request with "context length exceeded:
+# prompt + max_tokens = 8320 exceeds the compiled context 8192" and the top rung of the
+# ladder silently produces no cell. (The 12B recipe sidesteps this with max_ctx 16384.)
+max_ctx = 8704
 precision = "bf16"
 
 [emit]
