@@ -195,7 +195,46 @@ was misleading — the probe was built with `PLOW_BUCKET_DECODE=0`, which is a P
 object, where the gate is correctly 0 either way. Evaluate `PLOW_HAS_*` macros with
 the target object's own defines (`cpp -I <assets> -DPLOW_BUCKET_DECODE=1`).
 
-## First measured 26B numbers, and the gap
+## First measured 26B rung ladder vs vLLM
+
+Same client, same flags, prefix caching off both sides. vLLM column from
+`perf-data/campaign/gemma4-26b-a4b.h100.reference-vllm028-bf16.csv`.
+
+| cell | TTFT plow / vLLM | TPOT plow / vLLM | tok/s plow / vLLM |
+|---|---:|---:|---:|
+| 128 / C1 | 42.21 / 39.52 (**1.07x**) | 48.81 / 5.03 (9.7x) | 20.5 / 188.5 |
+| 128 / C4 | 84.75 / 73.31 (**1.16x**) | 50.66 / 7.24 (7.0x) | 78.5 / 515.6 |
+
+**TTFT is already at 1.07-1.16x of vLLM on an unoptimised packet** — with no tuned
+Lt table, no GQA-8 hd512 role, and fatlite surrendered. That is the encouraging half.
+
+**Decode is the whole gap**, and the shape of it names the cause:
+
+* TPOT is essentially flat from C1 to C4 (48.81 -> 50.66, +3.8%) while throughput
+  scales 3.8x. A per-step cost that does not grow with the batch is compute-bound,
+  not bandwidth-bound.
+* 48.8 ms/token against 7.64 GB of weight traffic is ~156 GB/s effective on a
+  3352 GB/s card — 4.6 % of bandwidth. A memory-bound GEMV would be near 1-2 TB/s.
+* `runtime/nvidia/op_moe.cuh` confirms it: the Gemma MoE expert GLU and DOWN decode
+  bodies have ONLY the dot8 CUDA-core walk (`GV_MOE_RB` row-blocking, one warp per
+  output channel). There is no tensor-core path. `op_gemv_mma.cuh` exists and is
+  wired into the three DENSE walks (`gemv_rows`, `gemv_glu_rows`, `gemv_qkv_rows`)
+  behind `PLOW_NV_GEMV_MMA`, but not into the MoE expert walks.
+
+This is the same bug shape the 12B campaign already paid for once: the dense dot8
+walk was compute-bound at B>=4 until `PLOW_NV_GEMV_MMA` replaced it with the
+`mma.sync m16n8k16` row-block walk (C16 TPOT 44.6 -> 16.2 ms). The MoE expert
+GLU/DOWN need the same treatment, and that is the single largest item on the board.
+
+Caveat worth stating: at B=1 a tensor-core walk is not automatically the answer —
+the dense hook only engages at `MM >= 4`. At C1 the expert GEMV is one row per
+expert, so the win has to come from either the walk's load efficiency or from the
+~150 extra serialized MoE stages per decode step (5 MoE ops x 30 layers) on top of
+the dense ones. ATTRIBUTE FIRST (the 12B lesson: three knob A/Bs came back null
+before one attribution run found the real cost) — use the decode step timing
+(`PLOW_DSTEP_LOG` / `step_time`), not a guess.
+
+## First light notes
 
 Coherence gate PASS. First light is SLOW: in128/C1 warmup ran 6.24 s per 128-token
 request, i.e. **~48.8 ms/token against vLLM's 5.03 ms** — roughly 10x behind, and
