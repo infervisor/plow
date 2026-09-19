@@ -983,6 +983,7 @@ async fn metrics_handler(
     for (name, kind, help) in [
         ("attach_hits_total", "counter", "Successful prefix attach requests."),
         ("attach_misses_total", "counter", "Prefix attach requests without a reusable prefix."),
+        ("tokens_queried_total", "counter", "Prompt tokens queried for prefix cache reuse."),
         ("tokens_attached_total", "counter", "Tokens attached from reusable prefix blocks."),
         ("hash_collisions_total", "counter", "Prefix hash collisions detected."),
         ("blocks_shared_mapped_total", "counter", "Shared prefix blocks mapped."),
@@ -995,29 +996,6 @@ async fn metrics_handler(
     ] {
         crate::obs::serving::family(&mut out, &format!("plowrt_prefix_{name}"), kind, help);
     }
-    // The same prefix-cache signal under vLLM's names and label.
-    //
-    // COUNTED IN ATTACH REQUESTS, NOT TOKENS, and the HELP says so: vLLM's two
-    // series count tokens queried and tokens hit, and this server tracks hit
-    // tokens (`tokens_attached`) but never counts the tokens it MISSED, so a
-    // token-denominated ratio cannot be computed from what exists. A request
-    // ratio is a real number about a real thing; a token ratio here would be
-    // fabricated.
-    #[cfg(feature = "cuda")]
-    {
-        crate::obs::serving::family(
-            &mut out,
-            "vllm:prefix_cache_queries_total",
-            "counter",
-            "Prefix cache lookups (ATTACH REQUESTS, not tokens - see plowrt_prefix_* for token counts).",
-        );
-        crate::obs::serving::family(
-            &mut out,
-            "vllm:prefix_cache_hits_total",
-            "counter",
-            "Prefix cache lookups that found a reusable prefix (attach requests, not tokens).",
-        );
-    }
     #[cfg(feature = "cuda")]
     for (slug, h) in state.vmm_stats.read().iter() {
         let s = h.stats();
@@ -1027,6 +1005,7 @@ async fn metrics_handler(
             out,
             "plowrt_prefix_attach_hits_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_attach_misses_total{{model=\"{slug}\"}} {}\n\
+             plowrt_prefix_tokens_queried_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_tokens_attached_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_hash_collisions_total{{model=\"{slug}\"}} {}\n\
              plowrt_prefix_blocks_shared_mapped_total{{model=\"{slug}\"}} {}\n\
@@ -1038,6 +1017,7 @@ async fn metrics_handler(
              plowrt_prefix_snapshots_evicted_total{{model=\"{slug}\"}} {}\n",
             s.attach_hits,
             s.attach_misses,
+            s.tokens_queried,
             s.tokens_attached,
             s.hash_collisions,
             s.blocks_shared_mapped,
@@ -1047,13 +1027,6 @@ async fn metrics_handler(
             s.cache_bytes,
             s.snapshot_bytes,
             s.snapshots_evicted,
-        );
-        let _ = write!(
-            out,
-            "vllm:prefix_cache_queries_total{{model_name=\"{slug}\",engine=\"0\"}} {}\n\
-             vllm:prefix_cache_hits_total{{model_name=\"{slug}\",engine=\"0\"}} {}\n",
-            s.attach_hits + s.attach_misses,
-            s.attach_hits,
         );
     }
     ([("content-type", "text/plain; version=0.0.4; charset=utf-8")], out).into_response()

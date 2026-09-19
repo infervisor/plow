@@ -36,6 +36,7 @@
 use crate::asset::devblob::DevBlob;
 use crate::{Result, RuntimeError};
 use packet::ctx_bound::{self, Scaling};
+use packet::dev::DevOp;
 
 /// Below this the emitter's `min(_, ctx)` policy terms stop saturating fast
 /// enough to mean anything: `glm_dsa_select_width` is `min(index_topk, ctx)` and
@@ -49,48 +50,151 @@ const POLICY_SATURATION_CTX: u32 = 16384;
 
 /// The context a packet was emitted at, from the only tensor whose extent is
 /// unambiguously it. This is the same derivation `AmdEngine::max_ctx` uses, and
-/// it must stay that way: the whole point is that narrowing `in.pos` is what
+/// it must stay that way: the whole point is that narrowing/widening `in.pos` is what
 /// moves the engine's bound.
-fn declared_ctx(blob: &DevBlob) -> Option<u32> {
+pub fn declared_ctx(blob: &DevBlob) -> Option<u32> {
     let t = blob.tensors.iter().find(|t| t.name == "in.pos")?;
     u32::try_from(t.bytes / 4).ok()
 }
 
 /// Re-declare `blob` at the live bound `want`, returning the bound in force.
 ///
-/// A no-op (and `Ok(ceiling)`) when `want` is at or above what the packet was
-/// emitted at: the ceiling is a ceiling, not a target.
-pub(crate) fn narrow(blob: &mut DevBlob, want: u32) -> Result<u32> {
+/// If `want == ceiling`, returns `Ok(ceiling)`.
+/// If `want < ceiling`, narrows the packet.
+/// If `want > ceiling`, widens the packet.
+pub fn rescale(
+    blob: &mut DevBlob,
+    want: u32,
+    manifest: Option<&plow_asset::live_kv::Manifest>,
+) -> Result<u32> {
     let err = |s: String| RuntimeError::Device(s);
     let ceiling = declared_ctx(blob).ok_or_else(|| {
         err("PLOW_LIVE_CTX: this packet declares no `in.pos`, so it carries no context to \
-             narrow".into())
+             rescale".into())
     })?;
-    if want >= ceiling {
+    if want == ceiling {
         return Ok(ceiling);
     }
-    if want < MIN_LIVE_CTX {
-        return Err(err(format!(
-            "PLOW_LIVE_CTX={want} is below the {MIN_LIVE_CTX}-token floor: the emitter's \
-             selection width is min(index_topk, ctx) and index_topk is 2048, so a narrower \
-             bound leaves the packet selecting more rows than its cache holds"
-        )));
-    }
-    let widest = blob.progs.iter().map(|p| p.t).max().unwrap_or(1);
-    if want < widest {
-        return Err(err(format!(
-            "PLOW_LIVE_CTX={want} is narrower than this packet's widest prefill bucket \
-             ({widest} rows). `in.ids`/`in.pos` are staged a whole chunk at a time, so the \
-             bound cannot be below the largest chunk the packet can run"
-        )));
+
+    let derived_manifest = if manifest.is_none() {
+        blob.with_packet_view(plow_asset::live_kv::emit).ok()
+    } else {
+        None
+    };
+    let active_manifest = manifest.or(derived_manifest.as_ref());
+
+    if want < ceiling {
+        // Narrowing checks
+        if want < MIN_LIVE_CTX {
+            return Err(err(format!(
+                "PLOW_LIVE_CTX={want} is below the {MIN_LIVE_CTX}-token floor: the emitter's \
+                 selection width is min(index_topk, ctx) and index_topk is 2048, so a narrower \
+                 bound leaves the packet selecting more rows than its cache holds"
+            )));
+        }
+        let widest = blob.progs.iter().map(|p| p.t).max().unwrap_or(1);
+        if want < widest {
+            return Err(err(format!(
+                "PLOW_LIVE_CTX={want} is narrower than this packet's widest prefill bucket \
+                 ({widest} rows). `in.ids`/`in.pos` are staged a whole chunk at a time, so the \
+                 bound cannot be below the largest chunk the packet can run"
+            )));
+        }
+    } else {
+        // Widening checks
+        // 2.3 Refuse DSA/indexer: NV dense only in v1
+        let has_indexer_tensors = blob
+            .tensors
+            .iter()
+            .any(|t| t.name.contains("kidx") || t.name.contains("index"));
+        let has_indexer_ops = blob.progs.iter().any(|p| {
+            p.insts.iter().any(|d| {
+                matches!(
+                    DevOp::from_u16(d.op),
+                    Some(
+                        DevOp::IndexScore
+                            | DevOp::IndexSelect
+                            | DevOp::IndexScorePf
+                            | DevOp::IndexSelectPf
+                            | DevOp::IndexUnionPf
+                            | DevOp::IndexTpPf
+                    )
+                )
+            })
+        });
+        if has_indexer_tensors || has_indexer_ops {
+            return Err(err(
+                "PLOW_LIVE_CTX: widening DSA/indexer packets is unsupported in v1 (NV dense only)"
+                    .into(),
+            ));
+        }
+
+        // 2.2 Prefill chunk ladder
+        let max_chunk = blob
+            .progs
+            .iter()
+            .filter(|p| !p.role.is_decode_rung())
+            .map(|p| p.t)
+            .max()
+            .unwrap_or(1);
+        if max_chunk == ceiling {
+            return Err(err(format!(
+                "PLOW_LIVE_CTX={want}: this packet's widest prefill bucket ({max_chunk} rows) \
+                 equals its emitted ctx, so the emitter's `ctx.min(max_chunk)` clamped the bucket \
+                 ladder. Widening would keep prefilling in {max_chunk}-row chunks; re-emit at the \
+                 wider ctx instead"
+            )));
+        }
+
+        // 1c Ring/mask invariant
+        if let Some(m) = active_manifest {
+            for c in &m.caches {
+                if c.window > 0 {
+                    let ring_threshold = plow_asset::extension::kv_ring_rows(c.window, max_chunk);
+                    if ceiling < ring_threshold {
+                        return Err(err(format!(
+                            "PLOW_LIVE_CTX={want}: widen is ring-unsafe because packet ctx_old {ceiling} < \
+                             kv_ring_rows(window={}, chunk={max_chunk}) = {ring_threshold}: sliding ring would alias on wrap",
+                            c.window
+                        )));
+                    }
+                }
+            }
+        }
+
+        // 1d RoPE warning
+        tracing::warn!(
+            live = want,
+            ceiling,
+            "PLOW_LIVE_CTX widened context past emitted ceiling"
+        );
     }
 
     // Which tensors move, and can they. A `kv.` cache with no rule is the hard
     // stop: it is a per-sequence buffer whose layout is not `[slot][ctx][d]`, so
     // neither leaving it nor scaling it is known to be right.
+    // 1b: Classify caches from the manifest, not the name.
     let mut plan: Vec<(usize, u64)> = Vec::new();
+    let mut rewritten_caches: std::collections::HashSet<u16> = std::collections::HashSet::new();
+
     for (h, t) in blob.tensors.iter().enumerate() {
-        let scaling = ctx_bound::tensor_scaling(&t.name);
+        let h16 = u16::try_from(h).ok();
+        let cache_entry = active_manifest.and_then(|m| {
+            m.caches.iter().find(|c| {
+                h16.is_some_and(|h| c.pair.contains(&h) || c.scales.is_some_and(|s| s.contains(&h)))
+            })
+        });
+
+        let scaling = if let Some(c) = cache_entry {
+            if c.window == 0 {
+                Scaling::Linear
+            } else {
+                Scaling::Inert
+            }
+        } else {
+            ctx_bound::tensor_scaling(&t.name)
+        };
+
         if scaling == Scaling::Inert {
             continue;
         }
@@ -98,7 +202,7 @@ pub(crate) fn narrow(blob: &mut DevBlob, want: u32) -> Result<u32> {
             return Err(err(format!(
                 "PLOW_LIVE_CTX: `{}` is a per-sequence cache `packet::ctx_bound` has no \
                  rule for (the pooled indexer's caches are one; so is every sliding-window \
-                 ring). Narrowing it would be a guess at its layout — serve this packet at \
+                 ring). Rescaling it would be a guess at its layout — serve this packet at \
                  its emitted ceiling",
                 t.name
             )));
@@ -112,9 +216,6 @@ pub(crate) fn narrow(blob: &mut DevBlob, want: u32) -> Result<u32> {
             )));
         }
         if scaling == Scaling::Rope {
-            // A table whose recipe is missing is one this pass cannot re-cut,
-            // and leaving it at the ceiling would leave the engine's bind-time
-            // length check disagreeing with the declaration.
             if !blob
                 .gen
                 .iter()
@@ -136,36 +237,51 @@ pub(crate) fn narrow(blob: &mut DevBlob, want: u32) -> Result<u32> {
             ))
         })?;
         plan.push((h, bytes));
+        if let Some(h16) = h16 {
+            if ctx_bound::is_narrowed_cache(&t.name)
+                || cache_entry.is_some_and(|c| c.window == 0)
+                || t.name.starts_with("kv.")
+            {
+                rewritten_caches.insert(h16);
+            }
+        }
     }
+
     for g in &blob.gen {
         let name = &blob.tensors[g.tensor as usize].name;
         if ctx_bound::is_rope_recipe(g) && ctx_bound::tensor_scaling(name) != Scaling::Rope {
             return Err(err(format!(
                 "PLOW_LIVE_CTX: `{name}` carries a RoPE recipe but is not one of the tables \
-                 `packet::ctx_bound` narrows, so its rows would stay sized for the ceiling"
+                 `packet::ctx_bound` rescales, so its rows would stay sized for the ceiling"
             )));
         }
     }
 
     // Nothing may keep the ceiling in an operand the rewrite does not reach.
-    let narrowed: std::collections::HashSet<u16> = blob
-        .tensors
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| ctx_bound::is_narrowed_cache(&t.name))
-        .filter_map(|(h, _)| u16::try_from(h).ok())
-        .collect();
     for p in &blob.progs {
         if let Some((k, op, slot)) =
-            ctx_bound::residual_ceiling(&p.insts, ceiling, |h| narrowed.contains(&h))
+            ctx_bound::residual_ceiling(&p.insts, ceiling, |h| rewritten_caches.contains(&h))
         {
             return Err(err(format!(
-                "PLOW_LIVE_CTX: program T={} instruction {k} (op {op}) addresses a narrowed \
+                "PLOW_LIVE_CTX: program T={} instruction {k} (op {op}) addresses a rewritten \
                  cache and holds the emitted ctx {ceiling} in {slot:?}, which is not a \
-                 stride site `packet::ctx_bound` rewrites. Narrowing would leave it striding \
+                 stride site `packet::ctx_bound` rewrites. Rescaling would leave it striding \
                  past the end of the cache",
                 p.t
             )));
+        }
+        // 1c Mask-companion backstop (widening only)
+        if want > ceiling {
+            if let Some((k, op, slot)) =
+                ctx_bound::residual_mask(&p.insts, ceiling, |h| rewritten_caches.contains(&h))
+            {
+                return Err(err(format!(
+                    "PLOW_LIVE_CTX: program T={} instruction {k} (op {op}) addresses a rewritten \
+                     cache and holds stale mask {} (emitted ctx - 1) in {slot:?}. \
+                     Widening would leave it masking or wrapping with the un-widened bound",
+                    p.t, ceiling - 1
+                )));
+            }
         }
     }
 
@@ -174,6 +290,14 @@ pub(crate) fn narrow(blob: &mut DevBlob, want: u32) -> Result<u32> {
     for g in &mut blob.gen {
         if ctx_bound::is_rope_recipe(g) {
             g.ctx = want;
+        } else if g.kind == packet::rope::GEN_TMAP_KV_PAIR {
+            let pair = [g.aux as u16, g.scale as u16];
+            let is_full = active_manifest.map_or(g.ctx == ceiling, |m| {
+                m.caches.iter().any(|c| c.pair == pair && c.window == 0)
+            });
+            if is_full && g.ctx == ceiling {
+                g.ctx = want;
+            }
         }
     }
     for g in &blob.gen {
@@ -184,13 +308,14 @@ pub(crate) fn narrow(blob: &mut DevBlob, want: u32) -> Result<u32> {
     for (h, bytes) in plan {
         blob.tensors[h].bytes = bytes;
     }
+    let matches_cache = |h| rewritten_caches.is_empty() || rewritten_caches.contains(&h);
     let mut sites = 0;
     for p in &mut blob.progs {
-        sites += ctx_bound::restride(&mut p.insts, ceiling, want);
+        sites += ctx_bound::restride_matching(&mut p.insts, ceiling, want, matches_cache);
     }
     debug_assert_eq!(declared_ctx(blob), Some(want));
 
-    if want < POLICY_SATURATION_CTX {
+    if want < ceiling && want < POLICY_SATURATION_CTX {
         tracing::warn!(
             live = want, ceiling,
             "PLOW_LIVE_CTX below {POLICY_SATURATION_CTX}: the packet keeps the MLA split \
@@ -204,6 +329,32 @@ pub(crate) fn narrow(blob: &mut DevBlob, want: u32) -> Result<u32> {
         "PLOW_LIVE_CTX: packet re-declared at the live context bound"
     );
     Ok(want)
+}
+
+/// Re-declare `blob` at the live bound `want` (narrowing), returning the bound in force.
+pub fn narrow(blob: &mut DevBlob, want: u32) -> Result<u32> {
+    let ceiling = declared_ctx(blob).ok_or_else(|| {
+        RuntimeError::Device("PLOW_LIVE_CTX: this packet declares no `in.pos`".into())
+    })?;
+    if want >= ceiling {
+        return Ok(ceiling);
+    }
+    rescale(blob, want, None)
+}
+
+/// Re-declare `blob` at the live bound `want` (widening), returning the bound in force.
+pub fn widen(
+    blob: &mut DevBlob,
+    want: u32,
+    manifest: Option<&plow_asset::live_kv::Manifest>,
+) -> Result<u32> {
+    let ceiling = declared_ctx(blob).ok_or_else(|| {
+        RuntimeError::Device("PLOW_LIVE_CTX: this packet declares no `in.pos`".into())
+    })?;
+    if want <= ceiling {
+        return Ok(ceiling);
+    }
+    rescale(blob, want, manifest)
 }
 
 #[cfg(test)]
@@ -400,5 +551,186 @@ mod tests {
         b.tensors[2].name = "rope.cos".into();
         let e = narrow(&mut b, 2048).unwrap_err().to_string();
         assert!(e.contains("rope.cos"), "{e}");
+    }
+
+    fn nv_dense_blob(ctx: u32) -> (DevBlob, plow_asset::live_kv::Manifest) {
+        let [cos, _] = GenTensor::rope_pair(ctx, 64, 10000.0, 1.0, RopeScale::None);
+        let t = |name: &str, bytes: u64| DevTensor {
+            name: name.into(),
+            bytes,
+            init: None,
+        };
+        // 0: in.ids, 1: in.pos, 2: in.cos, 3: kv.0.k, 4: kv.0.v, 5: kv.1.k, 6: kv.1.v
+        let tensors = vec![
+            t("in.ids", ctx as u64 * 4),
+            t("in.pos", ctx as u64 * 4),
+            t("in.cos", cos.byte_len()),
+            t("kv.0.k", ctx as u64 * 128),
+            t("kv.0.v", ctx as u64 * 128),
+            t("kv.1.k", 8192 * 128),
+            t("kv.1.v", 8192 * 128),
+        ];
+        let none = TENSOR_NONE16;
+        let inst = |op: DevOp, t0: u16, i: [u32; 8], fj: [u32; 3]| DevInst64 {
+            op: op as u16,
+            blocks: 1,
+            fj,
+            t: [t0, none, none, none, 3, 4, none, none],
+            i,
+        };
+        let insts = vec![
+            // Flash decode: kv_stride in i[3]
+            inst(
+                DevOp::FlashDecode,
+                0,
+                [1, 8, 0, ctx, 64, 0, 0, u32::MAX],
+                [0, 0, 0],
+            ),
+            // Flash prefill: kv_stride in j[0] (= fj[1])
+            inst(
+                DevOp::FlashPrefill,
+                0,
+                [0; 8],
+                [0, ctx, u32::MAX],
+            ),
+            // HeadNormRope: out_stride in j[0] (= fj[1])
+            inst(
+                DevOp::HeadNormRope,
+                3,
+                [0; 8],
+                [0, ctx, u32::MAX],
+            ),
+        ];
+        let blob = DevBlob {
+            n_cu: 1,
+            flags: 0,
+            target: 0,
+            tensors,
+            init: Vec::new(),
+            kvrow: Vec::new(),
+            progs: vec![
+                DevProg {
+                    t: 1,
+                    role: packet::devbuild::ProgramRole::DecodeRung { rows: 1 },
+                    n_counter: 0,
+                    insts,
+                    stream: Vec::new(),
+                    stream_ofs: Vec::new(),
+                    stream_len: Vec::new(),
+                    waits: Vec::new(),
+                    succs: Vec::new(),
+                    gq_stream: Vec::new(),
+                    gq_seg_ofs: Vec::new(),
+                    l2_domains: 0,
+                },
+                DevProg {
+                    t: 4096,
+                    role: packet::devbuild::ProgramRole::PrefillBucket { rows: 4096 },
+                    n_counter: 0,
+                    insts: Vec::new(),
+                    stream: Vec::new(),
+                    stream_ofs: Vec::new(),
+                    stream_len: Vec::new(),
+                    waits: Vec::new(),
+                    succs: Vec::new(),
+                    gq_stream: Vec::new(),
+                    gq_seg_ofs: Vec::new(),
+                    l2_domains: 0,
+                },
+            ],
+            sections: Vec::new(),
+            gen: vec![GenTensor { tensor: 2, ..cos }],
+            tp: None,
+            parent: None,
+        };
+        let manifest = plow_asset::live_kv::Manifest {
+            version: 1,
+            n_cu: 1,
+            batch: 1,
+            max_ctx: ctx,
+            position: 1,
+            kv_length: 0,
+            caches: vec![
+                plow_asset::live_kv::Cache {
+                    pair: [3, 4],
+                    scales: None,
+                    heads: 1,
+                    hd: 128,
+                    stride: ctx,
+                    window: 0,
+                    mask: u32::MAX,
+                },
+                plow_asset::live_kv::Cache {
+                    pair: [5, 6],
+                    scales: None,
+                    heads: 1,
+                    hd: 128,
+                    stride: 8192,
+                    window: 1024,
+                    mask: 8191,
+                },
+            ],
+            maps: Vec::new(),
+            programs: Vec::new(),
+            splitk: Vec::new(),
+        };
+        (blob, manifest)
+    }
+
+    #[test]
+    fn widening_rescales_nv_dense_blob_with_manifest() {
+        let (mut b, m) = nv_dense_blob(16384);
+        assert_eq!(widen(&mut b, 32768, Some(&m)).unwrap(), 32768);
+        assert_eq!(bytes_of(&b, "in.pos"), 32768 * 4);
+        assert_eq!(bytes_of(&b, "in.ids"), 32768 * 4);
+        assert_eq!(bytes_of(&b, "kv.0.k"), 32768 * 128);
+        assert_eq!(bytes_of(&b, "kv.0.v"), 32768 * 128);
+        assert_eq!(bytes_of(&b, "kv.1.k"), 8192 * 128, "sliding ring is inert");
+        assert_eq!(bytes_of(&b, "kv.1.v"), 8192 * 128, "sliding ring is inert");
+        assert_eq!(b.gen[0].ctx, 32768);
+        assert_eq!(bytes_of(&b, "in.cos"), b.gen[0].byte_len());
+
+        let insts = &b.progs[0].insts;
+        assert_eq!(insts[0].i[3], 32768, "FlashDecode kv_stride");
+        assert_eq!(insts[1].fj[1], 32768, "FlashPrefill kv_stride");
+        assert_eq!(insts[2].fj[1], 32768, "HeadNormRope out_stride");
+    }
+
+    #[test]
+    fn widen_refuses_ring_unsafe_packet() {
+        let (mut b, mut m) = nv_dense_blob(4096);
+        b.progs[1].t = 2048;
+        m.caches[1].window = 4096;
+        let e = widen(&mut b, 16384, Some(&m)).unwrap_err().to_string();
+        assert!(e.contains("ring-unsafe"), "{e}");
+    }
+
+    #[test]
+    fn widen_refuses_residual_mask() {
+        let (mut b, m) = nv_dense_blob(16384);
+        b.progs[0].insts[0].i[7] = 16383;
+        let e = widen(&mut b, 32768, Some(&m)).unwrap_err().to_string();
+        assert!(e.contains("stale mask"), "{e}");
+    }
+
+    #[test]
+    fn widen_refuses_dsa_indexer_packet() {
+        let (mut b, m) = nv_dense_blob(16384);
+        b.tensors[3].name = "kv.0.kidx".into();
+        let e = widen(&mut b, 32768, Some(&m)).unwrap_err().to_string();
+        assert!(e.contains("DSA/indexer"), "{e}");
+    }
+
+    #[test]
+    fn widen_refuses_small_prefill_chunk_ladder() {
+        let (mut b, m) = nv_dense_blob(4096);
+        let e = widen(&mut b, 16384, Some(&m)).unwrap_err().to_string();
+        assert!(e.contains("clamped the bucket ladder"), "{e}");
+    }
+
+    #[test]
+    fn widen_accepts_unclamped_prefill_ladder() {
+        let (mut b, m) = nv_dense_blob(16384);
+        assert_eq!(widen(&mut b, 32768, Some(&m)).unwrap(), 32768);
     }
 }

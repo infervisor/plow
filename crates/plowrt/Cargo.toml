@@ -299,3 +299,8 @@ required-features = ["gguf"]
 name = "asr_nemotron_pipeline_compile"
 path = "examples/asr/nemotron_pipeline_compile.rs"
 required-features = ["gguf"]
+
+[[example]]
+name = "step_bench"
+path = "examples/step_bench.rs"
+required-features = ["cuda"]

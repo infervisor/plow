@@ -454,19 +454,28 @@ pub fn spawn(
     let rung_widths = gpu_shape.map(|x| x.1);
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let rung_widths: Option<Box<[u32]>> = None;
-    let (capacity, rung_widths) = if let Some(max_rung) = crate::config::RuntimeConfig::get().decode_max_rung {
-        if let Some(widths) = rung_widths {
-            let filtered: Box<[u32]> = widths.iter().copied().filter(|&w| w <= max_rung).collect();
-            if let Some(&widest) = filtered.last() {
-                (capacity.min(widest as usize), Some(filtered))
+    let (capacity, rung_widths) = {
+        let max_rung = crate::config::RuntimeConfig::get().decode_max_rung;
+        let min_rung = crate::config::RuntimeConfig::get().amd.decode_min_rung;
+        if max_rung.is_some() || min_rung.is_some() {
+            if let Some(widths) = rung_widths {
+                let filtered: Box<[u32]> = widths
+                    .iter()
+                    .copied()
+                    .filter(|&w| max_rung.map_or(true, |max| w <= max) && min_rung.map_or(true, |min| w >= min))
+                    .collect();
+                if let Some(&widest) = filtered.last() {
+                    (capacity.min(widest as usize), Some(filtered))
+                } else {
+                    (capacity, Some(widths))
+                }
             } else {
-                (capacity, Some(widths))
+                let cap = max_rung.map_or(capacity, |m| capacity.min(m as usize));
+                (cap, None)
             }
         } else {
-            (capacity.min(max_rung as usize), None)
+            (capacity, rung_widths)
         }
-    } else {
-        (capacity, rung_widths)
     };
     let mut rung_controller =
         rung_widths
@@ -950,7 +959,16 @@ pub fn spawn(
             // Handed to the blocking pool so the dispatcher task stays hot
             // for arrivals.
             let steps = if cfg.multi_step {
-                MultiStep::for_batch(live as i64).steps
+                #[cfg(feature = "cuda")]
+                let cuda_quantum = crate::config::RuntimeConfig::get().multistep();
+                #[cfg(not(feature = "cuda"))]
+                let cuda_quantum = 0;
+
+                if cuda_quantum > 1 {
+                    cuda_quantum.max(MultiStep::for_batch(live as i64).steps)
+                } else {
+                    MultiStep::for_batch(live as i64).steps
+                }
             } else {
                 1
             };

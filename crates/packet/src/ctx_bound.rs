@@ -85,6 +85,10 @@ pub const STRIDE_SITES: &[(DevOp, Slot)] = &[
     (DevOp::FlashGatherDecode, Slot::I(2)),
     (DevOp::FlashMlaDecodeFp8, Slot::I(2)),
     (DevOp::FlashMlaPrefillFp8, Slot::I(2)),
+    (DevOp::FlashDecode, Slot::I(3)),
+    (DevOp::FlashDecodeFp8, Slot::I(3)),
+    (DevOp::FlashPrefill, Slot::J(0)),
+    (DevOp::FlashPrefillFp8, Slot::J(0)),
     (DevOp::IndexScore, Slot::I(2)),
     (DevOp::IndexSelect, Slot::I(0)),
     (DevOp::IndexScorePf, Slot::I(2)),
@@ -137,7 +141,16 @@ const KV_INERT: [&str; 2] = ["kidx_ring", "kidx_ring_score"];
 const ACT_LINEAR: [&str; 5] = ["iscore", "iscore_pf", "iumask", "ibits", "icand"];
 
 const IN_LINEAR: [&str; 2] = ["in.ids", "in.pos"];
-const IN_ROPE: [&str; 4] = ["in.cos", "in.sin", "in.icos", "in.isin"];
+const IN_ROPE: [&str; 8] = [
+    "in.cos",
+    "in.sin",
+    "in.icos",
+    "in.isin",
+    "in.cos_full",
+    "in.sin_full",
+    "in.cos_slide",
+    "in.sin_slide",
+];
 
 /// How `name`'s declared bytes move with the emit-time `ctx`.
 ///
@@ -208,21 +221,44 @@ pub fn is_rope_recipe(g: &GenTensor) -> bool {
     )
 }
 
+/// Rewrite the stride sites of `insts` from `from` to `to` for instructions
+/// whose referenced tensors match `matches_target`, returning how many moved.
+pub fn restride_matching(
+    insts: &mut [DevInst64],
+    from: u32,
+    to: u32,
+    matches_target: impl Fn(u16) -> bool,
+) -> usize {
+    let mut n = 0;
+    for d in insts.iter_mut() {
+        if !d.t.iter().any(|&h| h != TENSOR_NONE16 && matches_target(h)) {
+            continue;
+        }
+        for slot in sites_for(d.op) {
+            if slot.get64(d) == from {
+                slot.set64(d, to);
+                n += 1;
+                if matches!(
+                    DevOp::from_u16(d.op),
+                    Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
+                ) && d.fj[1] != 0
+                    && from > 0
+                    && d.fj[1] % from == 0
+                {
+                    d.fj[1] = (d.fj[1] / from) * to;
+                }
+            }
+        }
+    }
+    n
+}
+
 /// Rewrite the stride sites of `insts` from `from` to `to`, returning how many
 /// moved. A listed slot holding anything but `from` is left alone: the same
 /// opcodes carry a WINDOW there on a sliding-attention packet, and a ring is not
 /// a context.
 pub fn restride(insts: &mut [DevInst64], from: u32, to: u32) -> usize {
-    let mut n = 0;
-    for d in insts.iter_mut() {
-        for slot in sites_for(d.op) {
-            if slot.get64(d) == from {
-                slot.set64(d, to);
-                n += 1;
-            }
-        }
-    }
-    n
+    restride_matching(insts, from, to, |_| true)
 }
 
 /// [`restride`] on the builder-side instruction, where `j` is not yet packed
@@ -234,6 +270,15 @@ pub fn restride_builder(insts: &mut [DevInst], from: u32, to: u32) -> usize {
             if slot.get(d) == from {
                 slot.set(d, to);
                 n += 1;
+                if matches!(
+                    DevOp::from_u16(d.op),
+                    Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
+                ) && d.j[0] != 0
+                    && from > 0
+                    && d.j[0] % from == 0
+                {
+                    d.j[0] = (d.j[0] / from) * to;
+                }
             }
         }
     }
@@ -291,3 +336,55 @@ pub fn residual_ceiling_builder(
             .next()
     })
 }
+
+/// Backstop for cache rewrites: any op addressing a rewritten cache that still
+/// holds `from - 1` (a stale mask companion) in ANY operand slot is flagged.
+///
+/// On full layers, masks are emitted as `u32::MAX`. On context-clamped rings or
+/// un-widened masks, slots like `FlashDecode I(7)`, `FlashPrefill J(1)`, or
+/// `HeadNormRope J(1)` hold `from - 1`. If any op addressing a rewritten cache
+/// still holds `from - 1`, it was sized for the old bound and widening would
+/// wrap or mask incorrectly.
+pub fn residual_mask(
+    insts: &[DevInst64],
+    from: u32,
+    rewritten: impl Fn(u16) -> bool,
+) -> Option<(usize, u16, Slot)> {
+    if from == 0 {
+        return None;
+    }
+    let stale = from - 1;
+    insts.iter().enumerate().find_map(|(k, d)| {
+        if !d.t.iter().any(|&h| h != TENSOR_NONE16 && rewritten(h)) {
+            return None;
+        }
+        let slots = (0..8).map(Slot::I).chain((0..2).map(Slot::J));
+        slots
+            .filter(|s| s.get64(d) == stale)
+            .map(|s| (k, d.op, s))
+            .next()
+    })
+}
+
+/// [`residual_mask`] in the builder-side form.
+pub fn residual_mask_builder(
+    insts: &[DevInst],
+    from: u32,
+    rewritten: impl Fn(u32) -> bool,
+) -> Option<(usize, u16, Slot)> {
+    if from == 0 {
+        return None;
+    }
+    let stale = from - 1;
+    insts.iter().enumerate().find_map(|(k, d)| {
+        if !d.t.iter().any(|&h| h != TENSOR_NONE && rewritten(h)) {
+            return None;
+        }
+        let slots = (0..8).map(Slot::I).chain((0..2).map(Slot::J));
+        slots
+            .filter(|s| s.get(d) == stale)
+            .map(|s| (k, d.op, s))
+            .next()
+    })
+}
+

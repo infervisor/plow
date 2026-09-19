@@ -570,6 +570,7 @@ pub struct CudaBackend {
     /// handed out for an empty image so `ExecutorSet::bringup` works before
     /// any real cubin exists — the engine loads its module explicitly).
     modules: Mutex<FxHashMap<u64, usize>>,
+    module_images: Mutex<FxHashMap<u64, Vec<u8>>>,
     next_module: AtomicU64,
     /// Physical slab chunks kept across loads (`PLOW_SLAB_KEEP=1`,
     /// `VmmOps::pool_put`/`pool_take`). Device-local by construction (one
@@ -767,6 +768,7 @@ impl CudaBackend {
                 smem_optin,
                 coherent_host_dma,
                 modules: Mutex::new(FxHashMap::default()),
+                module_images: Mutex::new(FxHashMap::default()),
                 next_module: AtomicU64::new(1),
                 slab_pool: Mutex::new(Vec::new()),
                 poisoned,
@@ -1024,6 +1026,11 @@ impl CudaBackend {
             (self.api.cuModuleGetGlobal_v2)(&mut ptr, &mut bytes, raw as CUmodule, cname.as_ptr())
         };
         if rc != 0 {
+            if let Some(image) = self.module_images.lock().get(&module.id) {
+                if let Some(val) = plow_asset::cubin::global_u32(image, name) {
+                    return Ok(Some(val));
+                }
+            }
             return Ok(None); // CUDA_ERROR_NOT_FOUND: symbol absent from this object
         }
         if bytes != 4 {
@@ -1650,6 +1657,7 @@ impl CudaBackend {
         let Some(raw) = self.modules.lock().remove(&module.id) else {
             return Ok(()); // already unloaded
         };
+        self.module_images.lock().remove(&module.id);
         self.bind()?;
         // SAFETY: handle came from cuModuleLoadData and was removed from the
         // map above, so it is unloaded exactly once.
@@ -2040,6 +2048,7 @@ impl Backend for CudaBackend {
         })?;
         let id = self.next_module.fetch_add(1, Ordering::Relaxed);
         self.modules.lock().insert(id, m as usize);
+        self.module_images.lock().insert(id, image.to_vec());
         Ok(Module { id })
     }
     fn launch_persistent(&self, module: &Module, _cfg: LaunchCfg) -> Result<()> {

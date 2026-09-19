@@ -153,6 +153,18 @@ impl ServingMetrics {
             "Generated tokens including terminal tokens.",
             |m: &Metrics, _| m.serving.generation.load(Relaxed)
         );
+        scalar!(
+            "vllm:prefix_cache_queries_total",
+            "counter",
+            "Prefix cache queries, in terms of number of queried tokens.",
+            |m: &Metrics, _| m.serving.prompt_computed.load(Relaxed) + m.serving.prompt_cached.load(Relaxed)
+        );
+        scalar!(
+            "vllm:prefix_cache_hits_total",
+            "counter",
+            "Prefix cache hits, in terms of number of cached tokens.",
+            |m: &Metrics, _| m.serving.prompt_cached.load(Relaxed)
+        );
         scalar!("plowrt_requests_aborted_total", "counter", "Admitted requests dropped without normal completion or preemption; includes errors and disconnects.", |m: &Metrics, _| m.serving.aborted.load(Relaxed));
         scalar!(
             "plowrt_requests_preempted_total",

@@ -635,6 +635,8 @@ pub struct VmmStats {
     pub attach_hits: u64,
     /// Fresh sequences that found no attachable prefix.
     pub attach_misses: u64,
+    /// Prompt rows queried for prefix caching across all attaches.
+    pub tokens_queried: u64,
     /// Prompt rows served from the cache across all attaches (KV never
     /// recomputed) — the numerator of the fleet hit-rate.
     pub tokens_attached: u64,
@@ -1437,6 +1439,7 @@ impl VmmKv {
         let _section = EngineSection::enter();
         let s = &self.shared;
         let mut inner = s.inner.lock();
+        inner.stats.tokens_queried += prompt.len() as u64;
         if inner.fine_rows > 0 && (prompt.len() as u64) < u64::from(inner.fine_ceiling) {
             return try_attach_fine(&mut inner, seq, prompt);
         }

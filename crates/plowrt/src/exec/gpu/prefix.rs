@@ -61,11 +61,19 @@ impl GpuEngine {
         };
         let config = RuntimeConfig::get();
         if let Some(rt_ctx) = config.rt_max_ctx {
+            if rt_ctx as u32 > layout.geometry.max_ctx {
+                return Err(RuntimeError::Rejected(format!(
+                    "PLOW_RT_MAX_CTX {} exceeds VMM geometry max_ctx {}",
+                    rt_ctx, layout.geometry.max_ctx
+                )));
+            }
             let row_bytes = layout.geometry.row_bytes().max(1);
             let gran = (config.vmm_block_mib() as u64) << 20;
             let rows_per_block = ((gran / row_bytes) as u32).max(1);
-            let aligned_ctx = ((rt_ctx as u32 + rows_per_block - 1) / rows_per_block) * rows_per_block;
-            layout.geometry.max_ctx = aligned_ctx;
+            let aligned_ctx = ((rt_ctx as u32).min(layout.geometry.max_ctx) + rows_per_block - 1)
+                / rows_per_block
+                * rows_per_block;
+            layout.geometry.max_ctx = aligned_ctx.min(layout.geometry.max_ctx);
         }
         let block_hint = (config.vmm_block_mib() as u64) << 20;
         let rings = if live_rings && !layout.ring_tensors.is_empty() {
@@ -300,6 +308,17 @@ impl GpuEngine {
             } else {
                 0
             };
+
+        tracing::info!(
+            ring,
+            window = geo.window,
+            max_ctx = geo.max_ctx,
+            batch,
+            snap_row_bytes,
+            slide_layers = geo.slide_layers.len(),
+            full_layers = geo.full_layers.len(),
+            "VMM prefix layout resolved"
+        );
 
         Some(VmmPrefixLayout {
             geo,
@@ -555,7 +574,11 @@ impl GpuEngine {
         let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
             return Ok(());
         };
-        let Some(a) = v.kv.try_attach(b, prompt)? else {
+        let att = v.kv.try_attach(b, prompt)?;
+        let attached = att.is_some();
+        let att_rows = att.as_ref().map(|a| a.rows).unwrap_or(0);
+        tracing::info!(slot = b, prompt = prompt.len(), attached, att_rows, "vmm_attach query");
+        let Some(a) = att else {
             return Ok(());
         };
         let expected_snap_bytes = self.vmm_snap_bytes(a.rows);
@@ -615,9 +638,10 @@ impl GpuEngine {
         self.vmm_attached.get(b).copied().unwrap_or(0)
     }
 
-    /// Prefix-cache attach for a fresh slot. The attached rows' KV is already
-    /// mapped, so decode-only and mixed-prefill callers feed only the tail. A
-    /// no-op (returns 0) with VMM off or on a warm slot.
+    /// Look up a prompt prefix against the radix tree and boundary cache. On
+    /// a hit, maps the shared physical blocks, restores the boundary sliding
+    /// ring and full scales, and sets `pos[b]` to the matched rows. Returns
+    /// the new position (`> 0` on attach, `0` on miss).
     pub fn attach_prompt(&mut self, b: usize, prompt: &[u32]) -> Result<usize> {
         if self.pos[b] == 0 && self.vmm_prefix_enabled() {
             self.vmm_attach(b, prompt)?;
@@ -625,34 +649,78 @@ impl GpuEngine {
         Ok(self.pos[b] as usize)
     }
 
-    /// Publish slot `b` up to a computed 32-token boundary. Prompt publication
-    /// limits rows to prompt_len - 1 so an identical prompt can replay its tail.
-    /// Skips without failing serving when the row-token record is inconsistent, the
-    /// sequence is shorter than 32 tokens, or the sliding rings no longer
-    /// hold the boundary's window rows (`rows - p_a > ring - window`:
-    /// wrapped past, unrecoverable).
-    pub(super) fn vmm_publish(&self, b: usize, max_rows: u32) {
+    fn publish_boundary(&self, b: usize, p_a: u32) {
         let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
             return;
         };
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
-        if rows == 0 || toks.len() != rows as usize {
-            return;
-        }
         let g = v.kv.geometry();
-        let p_a = (rows.min(max_rows) / 32) * 32;
-        if p_a == 0 {
+        if rows == 0 || toks.len() != rows as usize || p_a == 0 {
             return;
         }
         if !v.slide.is_empty() && rows - p_a > v.ring as u32 - g.window {
+            tracing::info!(
+                slot = b,
+                rows,
+                p_a,
+                ring = v.ring,
+                window = g.window,
+                slack = v.ring as u32 - g.window,
+                diff = rows - p_a,
+                "vmm: publish_boundary skipped: ring overflow"
+            );
             return;
         }
         let snap_bytes = self.vmm_snap_bytes(p_a);
         if let Err(e) = v.kv.publish_at(b, toks, p_a, snap_bytes, |dst| {
             self.vmm_snap_copy(b, p_a, dst, true)
         }) {
-            tracing::debug!(error = %e, slot = b, "vmm: tail publish skipped");
+            tracing::info!(error = %e, slot = b, p_a, "vmm: publish_boundary skipped");
+        } else {
+            tracing::info!(slot = b, p_a, snap_bytes, "vmm: published successfully");
         }
+    }
+
+    /// Publish slot `b` up to a computed 32-token boundary. Prompt publication
+    /// limits rows to prompt_len - 1 so an identical prompt can replay its tail.
+    /// Also publishes regular intermediate checkpoints (every 256 tokens) so that
+    /// prompts sharing common prefixes hit the prefix cache even when suffixes differ.
+    pub(super) fn vmm_publish(&self, b: usize, max_rows: u32) {
+        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
+            return;
+        };
+        let rows = self.pos[b];
+        let toks = &self.seq_tokens[b];
+        let g = v.kv.geometry();
+        let p_a = (rows.min(max_rows) / 32) * 32;
+        tracing::info!(
+            slot = b,
+            rows,
+            toks_len = toks.len(),
+            max_rows,
+            p_a,
+            ring = v.ring,
+            window = g.window,
+            "vmm_publish entered"
+        );
+        if rows == 0 || toks.len() != rows as usize {
+            tracing::info!(slot = b, rows, toks_len = toks.len(), "vmm_publish skipped: rows/toks mismatch");
+            return;
+        }
+        if p_a == 0 {
+            tracing::info!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
+            return;
+        }
+        let step = crate::config::RuntimeConfig::get()
+            .amd_prefix_fine_rows()
+            .unwrap_or(256)
+            .max(32);
+        let mut p = step;
+        while p < p_a {
+            self.publish_boundary(b, p);
+            p += step;
+        }
+        self.publish_boundary(b, p_a);
     }
 }

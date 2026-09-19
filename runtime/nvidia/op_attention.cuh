@@ -83,7 +83,7 @@ __device__ __forceinline__ float __fa_ex2(float x) {
  * while the arm is latency-bound rather than bandwidth-bound. Batching them puts RB independent
  * row loads in flight for one warp reduction each. 1 = the original sequential sweep. */
 #ifndef PLOW_NV_FA_WPR_RB
-#define PLOW_NV_FA_WPR_RB 1
+#define PLOW_NV_FA_WPR_RB 2
 #endif
 /* Bound the two softmax reductions to the tile's LIVE rows. Entries past rmax_t are NEG_INF in
  * both score bodies, so scanning them is pure waste -- and at nsplit=32 a work item owns ~32 of
@@ -695,7 +695,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #if PLOW_NV_FA_WPR && PLOW_NV_FA_QREG
         /* Hoist invariant Q fragments across KV rows; GF>4 keeps the lower-register path. */
         bf16v8 qreg[GF][D >= 256 ? D / 256 : 1];
-        if constexpr (!SZKV && !FP8KV && D == 512 && GF <= 4) {
+        if constexpr (!SZKV && !FP8KV && D >= 256 && GF <= 4) {
 #pragma unroll
             for (int g = 0; g < GF; g++)
 #pragma unroll
@@ -802,7 +802,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #pragma unroll
                             for (int g = 0; g < GF; g++)
 #if PLOW_NV_FA_QREG
-                                if constexpr (D == 512 && GF <= 4)
+                                if constexpr (D >= 256 && GF <= 4)
                                     dt[g] = dot8(k8[t][c], qreg[g][c], dt[g]);
                                 else
 #endif

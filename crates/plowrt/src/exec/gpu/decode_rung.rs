@@ -2,6 +2,7 @@ use super::*;
 use packet::dev::ROPE_PAIR_HALF;
 
 pub(super) struct DecodeRung {
+    pub(super) host_insts: Vec<DevInst64>,
     pub(super) library: Option<super::cublaslt::CublasLtDecodeGraph>,
     pub(super) rows: usize,
     pub(super) object: Option<Arc<BoundDecodeObject>>,
@@ -534,6 +535,7 @@ impl DecodeRung {
             ..base
         };
         Ok(Self {
+            host_insts: insts.to_vec(),
             library: None,
             rows: g.t as usize,
             object: None,

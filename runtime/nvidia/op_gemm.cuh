@@ -2553,7 +2553,8 @@ __device__ __forceinline__ void d_gemv_qkv_sm90_xreg(
     const __nv_bfloat16* x,
     const __nv_bfloat16* Wq, const __nv_bfloat16* Wk, const __nv_bfloat16* Wv,
     unsigned Nq, unsigned Nk, unsigned Nv, unsigned slice, unsigned nblk) {
-    static_assert(K == 3840 || K == 4096 || K == 5120 || K == 6144);
+    static_assert(K == 2048 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
+                  K == 3840 || K == 4096 || K == 5120 || K == 5376 || K == 6144);
     constexpr unsigned chunks = K / GV_STEP;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned N = Nq + Nk + Nv;
@@ -2596,7 +2597,8 @@ template <unsigned K>
 __device__ __forceinline__ void d_gemv_glu_sm90_xreg(__nv_bfloat16* C,
     const __nv_bfloat16* x, const __nv_bfloat16* Wg, const __nv_bfloat16* Wu,
     unsigned N, unsigned act, unsigned slice, unsigned nblk) {
-    static_assert(K == 3840 || K == 4096 || K == 5120 || K == 6144);
+    static_assert(K == 2048 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
+                  K == 3840 || K == 4096 || K == 5120 || K == 5376 || K == 6144);
     constexpr unsigned chunks = K / GV_STEP;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned per = (N + nblk - 1u) / nblk;
