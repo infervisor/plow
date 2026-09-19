@@ -81,6 +81,14 @@ enum Cmd {
         /// composes with `--assets`.
         #[arg(long = "model")]
         model: Vec<String>,
+        /// Extra name a served model answers to, as vLLM's
+        /// `--served-model-name`. Repeatable.
+        ///
+        /// `ALIAS=SLUG` names the target explicitly; a bare `ALIAS` is allowed
+        /// only when exactly one model is registered, because with several
+        /// there is no defensible guess about which one it meant.
+        #[arg(long = "served-model-name")]
+        served_model_name: Vec<String>,
         #[arg(long, default_value_t = 8080)]
         port: u16,
         /// Optional Unix domain socket to also listen on (opt-in). Serves the
@@ -743,6 +751,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Serve {
             assets,
             model,
+            served_model_name,
             port,
             socket,
             executors,
@@ -779,6 +788,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             serve(
                 assets,
+                served_model_name,
                 port,
                 socket,
                 executors,
@@ -2979,6 +2989,7 @@ async fn bringup_runtime(
     executors: u32,
     trace: bool,
     mux_cfg: MuxConfig,
+    served_model_name: Vec<String>,
 ) -> Result<Arc<AppState>, Box<dyn std::error::Error>> {
     // One binary, CPU or GPU: the vendor drivers are `dlopen`ed, so this probes
     // CUDA then HSA (AMD) and falls back to the CPU reference backend when neither
@@ -3095,7 +3106,35 @@ async fn bringup_runtime(
             );
         }
     }
-    tracing::info!(models = registry.len(), trace, "registry ready");
+
+    // `--served-model-name`. Registered AFTER every bundle so `ALIAS=SLUG` can
+    // name any of them regardless of load order, and so a bare `ALIAS` sees the
+    // final model count.
+    for spec in &served_model_name {
+        let (alias, canonical) = match spec.split_once('=') {
+            Some((a, c)) => (a.trim().to_string(), c.trim().to_string()),
+            None => {
+                let slugs = registry.slugs();
+                if slugs.len() != 1 {
+                    return Err(format!(
+                        "--served-model-name {spec:?}: {} models are registered, so a bare                          alias is ambiguous — write it as ALIAS=SLUG (slugs: {})",
+                        slugs.len(),
+                        slugs.join(", ")
+                    )
+                    .into());
+                }
+                (spec.trim().to_string(), slugs[0].clone())
+            }
+        };
+        registry.add_alias(alias.clone(), &canonical)?;
+        tracing::info!(%alias, model = %canonical, "serving model under an extra name");
+    }
+    tracing::info!(
+        models = registry.len(),
+        aliases = served_model_name.len(),
+        trace,
+        "registry ready"
+    );
 
     let state = Arc::new(AppState::with_trace(registry, execset, trace));
 
@@ -3548,7 +3587,7 @@ async fn bench(
     )?;
     plowrt::serve::bench::validate_request_layout(&input, warmup_requests, requests)?;
     validate_token_audit_options(token_audit, &input, warmup_requests, requests, output_len)?;
-    let state = bringup_runtime(vec![assets], executors, false, mux_cfg).await?;
+    let state = bringup_runtime(vec![assets], executors, false, mux_cfg, Vec::new()).await?;
     let models = state.registry.slugs();
     let [model] = models.as_slice() else {
         return Err(format!("bench requires exactly one model, loaded {}", models.len()).into());
@@ -3727,13 +3766,14 @@ fn parse_prefill_lengths(raw: &str) -> Result<Vec<usize>, Box<dyn std::error::Er
 
 async fn serve(
     assets: Vec<PathBuf>,
+    served_model_name: Vec<String>,
     port: u16,
     socket: Option<PathBuf>,
     executors: u32,
     trace: bool,
     mux_cfg: MuxConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = bringup_runtime(assets, executors, trace, mux_cfg).await?;
+    let state = bringup_runtime(assets, executors, trace, mux_cfg, served_model_name).await?;
 
     let router = app(Arc::clone(&state));
 

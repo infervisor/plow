@@ -433,6 +433,7 @@
               pkgs.rustfmt
               pkgs.clippy
               pkgs.rust-analyzer
+              pkgs.sccache
               # The C runtime (runtime/) builds with CMake.
               pkgs.cmake
               # Lean 4 toolchain manager — installs the version pinned by
@@ -472,6 +473,12 @@
               if command -v elan >/dev/null && [ -f lean-plow/lean-toolchain ]; then
                 echo "lean toolchain: $(cat lean-plow/lean-toolchain)"
               fi
+
+              export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
+              if [ -d /opt/dlami/nvme/tmp ]; then
+                export SCCACHE_DIR="''${SCCACHE_DIR:-/opt/dlami/nvme/tmp/sccache}"
+              fi
+              echo "sccache enabled: $(${pkgs.sccache}/bin/sccache --version 2>/dev/null || echo 'active')"
 
             '' + pkgs.lib.optionalString isGpuHost ''
               # The GPU toolchains, from nix (ROCm ${rocmVersion},

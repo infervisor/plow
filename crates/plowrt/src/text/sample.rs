@@ -7,6 +7,8 @@
 
 use std::cell::RefCell;
 
+use rustc_hash::FxHashMap;
+
 /// Sampling parameters from the request.
 #[derive(Clone, Debug)]
 pub struct SamplingParams {
@@ -15,8 +17,32 @@ pub struct SamplingParams {
     pub top_p: f32,
     pub min_p: f32,
     pub repetition_penalty: f32,
+    /// OpenAI `presence_penalty`: a flat subtraction applied once to any token
+    /// that has already been produced. DISTINCT from `repetition_penalty`,
+    /// which is multiplicative and sign-dependent — a client setting one does
+    /// not get the other.
+    pub presence_penalty: f32,
+    /// OpenAI `frequency_penalty`: subtracted once per prior occurrence, so it
+    /// scales with how often the token has been used.
+    pub frequency_penalty: f32,
     /// (token, bias) additive logit adjustments.
     pub logit_bias: Vec<(u32, f32)>,
+}
+
+impl SamplingParams {
+    /// Whether this row must be sampled on the HOST.
+    ///
+    /// The device sampler covers temperature/top_k/top_p/min_p but owns no
+    /// per-row token history, so anything derived from what the row has already
+    /// emitted — the three penalties — and any logit bias needs the full logits
+    /// row downloaded. One predicate so the eligibility checks in `serve::mux`
+    /// cannot drift apart from the set of knobs this struct carries.
+    pub fn needs_host_logits(&self) -> bool {
+        self.repetition_penalty != 1.0
+            || self.presence_penalty != 0.0
+            || self.frequency_penalty != 0.0
+            || !self.logit_bias.is_empty()
+    }
 }
 
 impl Default for SamplingParams {
@@ -27,6 +53,8 @@ impl Default for SamplingParams {
             top_p: 1.0,
             min_p: 0.0,
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             logit_bias: Vec::new(),
         }
     }
@@ -68,7 +96,16 @@ pub fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
-/// Apply repetition penalty and logit bias in place (pre-softmax).
+thread_local! {
+    /// Token -> occurrences in `prior`, reused across calls so the presence /
+    /// frequency pass allocates nothing after the first row it runs on.
+    static PENALTY_COUNTS: RefCell<FxHashMap<u32, u32>> = RefCell::new(FxHashMap::default());
+}
+
+/// Apply the three penalties and logit bias in place (pre-softmax).
+///
+/// `prior` is the row's own generated history, which is what OpenAI's
+/// presence/frequency penalties are defined over.
 pub fn apply_penalties(logits: &mut [f32], prior: &[u32], params: &SamplingParams) {
     if params.repetition_penalty != 1.0 {
         for &t in prior {
@@ -80,6 +117,20 @@ pub fn apply_penalties(logits: &mut [f32], prior: &[u32], params: &SamplingParam
                 };
             }
         }
+    }
+    if params.presence_penalty != 0.0 || params.frequency_penalty != 0.0 {
+        PENALTY_COUNTS.with(|c| {
+            let mut counts = c.borrow_mut();
+            counts.clear();
+            for &t in prior {
+                *counts.entry(t).or_insert(0) += 1;
+            }
+            for (&t, &n) in counts.iter() {
+                if let Some(l) = logits.get_mut(t as usize) {
+                    *l -= params.presence_penalty + params.frequency_penalty * n as f32;
+                }
+            }
+        });
     }
     for &(t, b) in &params.logit_bias {
         if let Some(l) = logits.get_mut(t as usize) {

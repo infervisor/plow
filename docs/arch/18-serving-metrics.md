@@ -68,6 +68,8 @@ boundaries need not match vLLM's to use the same dashboard queries.
 | `request_prompt_tokens`, `request_prefill_kv_computed_tokens` | Histogram | Completed request's total and uncached prompt length |
 | `request_generation_tokens` | Histogram | Completed request's generated length |
 | `request_params_max_tokens` | Histogram | Requested output limit at mux submission, including refused submissions |
+| `prefix_cache_queries_total` | Counter | Prompt tokens queried for prefix cache reuse |
+| `prefix_cache_hits_total` | Counter | Prompt tokens attached from prefix cache |
 
 All names in the table carry the `vllm:` prefix. Token counters record prompt
 accounting at the first output because that is when all prefix attachment and
@@ -90,10 +92,6 @@ latencies consequently have different boundaries.
 * `kv_cache_usage_perc`: no uniform physical used/capacity snapshot across flat
   MLA allocations, shared prefix pools, CPU, CUDA VMM, and TP. Slot occupancy is
   not a valid substitute for memory occupancy.
-* `prefix_cache_queries_total`, `prefix_cache_hits_total`: completed request
-  usage is not the number of tokens queried by the cache lookup algorithm.
-  Cached prompt accounting is exported separately; CUDA's existing VMM attach
-  counters also remain available.
 * `iteration_tokens_total`: Plow's mux tick can contain several engine steps
   and prefill chunks. A generated-output-only count would misrepresent vLLM's
   engine-step input-plus-output measure.

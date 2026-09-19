@@ -1824,17 +1824,41 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (const __nv_bfloat16*)TEN(2), slice, nblk);
             break;
         }
+        if (in->i[0] == 1 && in->i[1] == 3840 && in->i[2] == 15360 &&
+            blockDim.x == 256 && (3840u + nblk - 1u) / nblk <= 40u) {
+            d_gemv_sm90_kpanel<3840, 15360, 5, 8>((__nv_bfloat16*)TEN(0),
+                (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                (const __nv_bfloat16*)TEN(2), slice, nblk);
+            break;
+        }
+        if (in->i[0] == 1 && in->i[1] == 2816 && in->i[2] == 15360 &&
+            blockDim.x == 256 && (2816u + nblk - 1u) / nblk <= 40u) {
+            d_gemv_sm90_kpanel<2816, 15360, 5, 8>((__nv_bfloat16*)TEN(0),
+                (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                (const __nv_bfloat16*)TEN(2), slice, nblk);
+            break;
+        }
 #endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
         if (in->i[0] == 1 && in->i[1] >= 1024 &&
-            (in->i[2] == 5120 || in->i[2] == 6144)) {
+            (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
+             in->i[2] == 3584 || in->i[2] == 3840 || in->i[2] == 4096 || in->i[2] == 5120 ||
+             in->i[2] == 5376 || in->i[2] == 6144 || in->i[2] == 8192)) {
             auto* x = (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2];
-            if (in->i[2] == 5120)
-                d_gemv_sm90_xreg<5120>((__nv_bfloat16*)TEN(0), x,
-                    (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk);
-            else
-                d_gemv_sm90_xreg<6144>((__nv_bfloat16*)TEN(0), x,
-                    (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk);
+            switch (in->i[2]) {
+            case 2048: d_gemv_sm90_xreg<2048>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 2560: d_gemv_sm90_xreg<2560>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 2816: d_gemv_sm90_xreg<2816>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 3072: d_gemv_sm90_xreg<3072>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 3584: d_gemv_sm90_xreg<3584>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 3840: d_gemv_sm90_xreg<3840>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 4096: d_gemv_sm90_xreg<4096>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 5120: d_gemv_sm90_xreg<5120>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 5376: d_gemv_sm90_xreg<5376>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 6144: d_gemv_sm90_xreg<6144>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 8192: d_gemv_sm90_xreg<8192>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            default: break;
+            }
             break;
         }
 #endif
@@ -1870,30 +1894,81 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         __nv_bfloat16* c_base = (__nv_bfloat16*)TEN(0);
         unsigned long long* part_base = (unsigned long long*)TEN(3);
         const __nv_bfloat16* W = (const __nv_bfloat16*)TEN(2);
-        for (unsigned m = 0; m < M; m++) {
-            d_gemv_argmax(c_base + (size_t)m * N,
-                          x_base + (size_t)m * K,
-                          W,
-                          part_base + (size_t)m * nblk,
-                          N, K, cap, slice, nblk, (__nv_bfloat16*)arena);
-            __syncthreads();
-        }
+        d_gemv_argmax_batch(c_base, x_base, W, part_base, M, N, K, cap, slice, nblk, (__nv_bfloat16*)arena);
         break;
     }
 #endif
 
     /* Kernel arg order is (Nq, Nk, Nv, K): K lives in i2 but is passed LAST. */
     case PLOW_DOP_GEMV_QKV:
-#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG && \
-    defined(PLOW_NV_GEMV_QKV_XREG) && PLOW_NV_GEMV_QKV_XREG
-        if (in->i[0] == 1 && in->i[1] == 17408 && in->i[2] == 5120 &&
-            in->i[3] == 17408 && in->i[4] == 0) {
-            d_gemv_sm90_xreg<5120>((__nv_bfloat16*)TEN(0),
-                (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
-                17408, slice, nblk);
-            d_gemv_sm90_xreg<5120>((__nv_bfloat16*)TEN(3),
-                (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(4),
-                17408, slice, nblk);
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
+        if (in->i[0] == 1 &&
+            (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
+             in->i[2] == 3584 || in->i[2] == 3840 || in->i[2] == 4096 || in->i[2] == 5120 ||
+             in->i[2] == 5376 || in->i[2] == 6144)) {
+            switch (in->i[2]) {
+            case 2048:
+                d_gemv_qkv_sm90_xreg<2048>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                    (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
+                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
+                    (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
+                break;
+            case 2560:
+                d_gemv_qkv_sm90_xreg<2560>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                    (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
+                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
+                    (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
+                break;
+            case 2816:
+                d_gemv_qkv_sm90_xreg<2816>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                    (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
+                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
+                    (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
+                break;
+            case 3072:
+                d_gemv_qkv_sm90_xreg<3072>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                    (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
+                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
+                    (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
+                break;
+            case 3584:
+                d_gemv_qkv_sm90_xreg<3584>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                    (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
+                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
+                    (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
+                break;
+            case 3840:
+                d_gemv_qkv_sm90_xreg<3840>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                    (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
+                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
+                    (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
+                break;
+            case 4096:
+                d_gemv_qkv_sm90_xreg<4096>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                    (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
+                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
+                    (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
+                break;
+            case 5120:
+                d_gemv_qkv_sm90_xreg<5120>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                    (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
+                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
+                    (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
+                break;
+            case 5376:
+                d_gemv_qkv_sm90_xreg<5376>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                    (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
+                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
+                    (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
+                break;
+            case 6144:
+                d_gemv_qkv_sm90_xreg<6144>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                    (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
+                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
+                    (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
+                break;
+            default: break;
+            }
             break;
         }
 #endif
@@ -1924,6 +1999,27 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
 
     case PLOW_DOP_GEMV_GLU:
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
+        if (in->i[0] == 1 &&
+            (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
+             in->i[2] == 3584 || in->i[2] == 3840 || in->i[2] == 4096 || in->i[2] == 5120 ||
+             in->i[2] == 5376 || in->i[2] == 6144)) {
+            switch (in->i[2]) {
+            case 2048: d_gemv_glu_sm90_xreg<2048>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 2560: d_gemv_glu_sm90_xreg<2560>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 2816: d_gemv_glu_sm90_xreg<2816>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 3072: d_gemv_glu_sm90_xreg<3072>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 3584: d_gemv_glu_sm90_xreg<3584>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 3840: d_gemv_glu_sm90_xreg<3840>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 4096: d_gemv_glu_sm90_xreg<4096>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 5120: d_gemv_glu_sm90_xreg<5120>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 5376: d_gemv_glu_sm90_xreg<5376>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 6144: d_gemv_glu_sm90_xreg<6144>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            default: break;
+            }
+            break;
+        }
+#endif
         d_gemv_glu((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[0], in->i[1],
                    in->i[2], in->i[5], slice, nblk, (__nv_bfloat16*)arena);

@@ -301,11 +301,11 @@ pub struct EmitConfig {
     pub pf_gemv_head: Option<String>,
 
     /// Emit modular building-block packets (EmbeddingBlock, DenseAttentionBlock, DenseFfnBlock, FinalNormVocabBlock).
-    #[arg(long, env = "PLOW_BLOCK_PACKETS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, env = "PLOW_BLOCK_PACKETS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub block_packets: bool,
 
     /// Opt-in knob for modular block prefill pipeline and fine-grained ladder decomposition.
-    #[arg(long, env = "PLOW_PF_MODULAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, env = "PLOW_PF_MODULAR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub pf_modular: bool,
 
     /// Single block stage to emit in isolation: "attn", "ffn", "embed", "vocab", or "all".
@@ -1278,8 +1278,8 @@ impl EmitConfig {
             pf_ladder: env_str("PLOW_PF_LADDER"),
             pf_ladder_append: env_str("PLOW_PF_LADDER_APPEND"),
             pf_gemv_head: env_str("PLOW_PF_GEMV_HEAD"),
-            block_packets: env_bool("PLOW_BLOCK_PACKETS"),
-            pf_modular: env_bool("PLOW_PF_MODULAR"),
+            block_packets: env_bool_default_true("PLOW_BLOCK_PACKETS"),
+            pf_modular: env_bool_default_true("PLOW_PF_MODULAR"),
             block_stage: env_str("PLOW_BLOCK_STAGE"),
             xr_cus: env_u32("PLOW_XR_CUS"),
             glm_pf_small_cus: env_str("PLOW_GLM_PF_SMALL_CUS"),

@@ -1898,6 +1898,20 @@ struct RecurrentState {
     tensors: Vec<(usize, u64)>,
 }
 
+struct NvDenseNsplitProg {
+    d_inst: u64,
+    sites: Vec<crate::exec::kvrow::NvSplitSite>,
+    lo: usize,
+    _hi: usize,
+    image: Option<Vec<DevInst64>>,
+}
+
+struct NvDenseNsplit {
+    progs: Vec<NvDenseNsplitProg>,
+    baked: u32,
+    cur: u32,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PackedAdmission {
     Pending,
@@ -2072,6 +2086,7 @@ pub struct GpuEngine {
     /// Contiguous instruction range covering every kv-row patch site.
     kvrow_lo: usize,
     kvrow_hi: usize,
+    nv_nsplit: Option<NvDenseNsplit>,
     ctr_bytes: usize,
     /// Bytes of GQ cursor lines at the counter slab's tail — one PLOW_CTR line
     /// per gq segment (P lines for an L2-placed blob, 1 otherwise).
@@ -2142,6 +2157,7 @@ pub struct GpuEngine {
     packed_terminal: Option<packed_terminal::PackedTerminal>,
     mixed_step: Option<mixed_step::MixedCudaStep>,
     token_batch: Option<token_batch::CudaTokenBatch>,
+    kv_admission: Option<crate::sched::admission::KvBudget>,
     slot_generations: Vec<u32>,
 }
 
@@ -2877,7 +2893,7 @@ struct PackedTokenReq<'a> {
 /// Per-row device sampling request (plan stage 4). `temp <= 0` is greedy
 /// (the device sampler writes the argmax, identical to `ARGMAX_FIN`), so a
 /// spec array can carry greedy and stochastic rows together. `rng01` is the
-/// request's per-step uniform draw (`seeded_unit`), so a fixed seed is
+/// request's per-step uniform draw (`serve::seeded_unit_with`), so a fixed seed is
 /// reproducible.
 #[derive(Clone, Copy)]
 pub struct DevSample {
@@ -2984,7 +3000,7 @@ impl GpuEngine {
         );
 
         // ---- blob ----
-        let (pkt, raw, blob) = {
+        let (pkt, raw, mut blob) = {
             let run = || -> Result<_> {
                 let pkt = DevBlob::find_in_dir(assets_dir)?.ok_or_else(|| {
                     RuntimeError::Device(format!("no PLOWDEV blob in {}", assets_dir.display()))
@@ -3034,14 +3050,86 @@ impl GpuEngine {
             programs = blob.progs.len(),
             "parsed PLOWDEV blob"
         );
-        let live_kv_manifest = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?;
-        let packed_prefill_metadata = blob
+        let mut live_kv_manifest = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?;
+        let mut packed_prefill_metadata = blob
             .reserved_metadata(&raw, plow_asset::packed_prefill::SECTION)?
             .map(|bytes| {
                 serde_json::from_slice::<plow_asset::packed_prefill::Manifest>(bytes)
                     .map_err(|e| RuntimeError::Rejected(format!("packed prefill metadata: {e}")))
             })
             .transpose()?;
+        let config = RuntimeConfig::get();
+        let mut packet_max_ctx = blob
+            .tensors
+            .iter()
+            .find(|t| t.name == "in.pos")
+            .map(|t| (t.bytes / 4) as usize)
+            .unwrap_or(0);
+        if let Some(want) = config.live_ctx() {
+            if want as usize > packet_max_ctx {
+                if !config.nv_vmm_live() && config.nv_vmm_prefix() != Some(true) {
+                    return Err(RuntimeError::Rejected(
+                        "widening context via PLOW_LIVE_CTX requires PLOW_VMM_LIVE=1 or PLOW_VMM_PREFIX=1".into(),
+                    ));
+                }
+                crate::exec::ctx_bound::widen(&mut blob, want, live_kv_manifest.as_ref())?;
+                if let Some(m) = live_kv_manifest.as_mut() {
+                    m.max_ctx = want;
+                    for c in &mut m.caches {
+                        if c.window == 0 {
+                            c.stride = want;
+                        }
+                    }
+                    m.programs = blob.with_packet_view(|p| {
+                        p.programs.iter().map(plow_asset::live_kv::program_digest).collect()
+                    });
+                }
+                if let Some(pack) = packed_prefill_metadata.as_mut() {
+                    blob.with_packet_view(|p| {
+                        for (pi, g) in p.programs.iter().enumerate().take(p.prefill_count) {
+                            if pi < pack.programs.len() {
+                                pack.programs[pi] = plow_asset::live_kv::program_digest(g);
+                            }
+                        }
+                    });
+                }
+                if let Some(m) = &live_kv_manifest {
+                    let layout = crate::memory::vmm::LiveKvLayout::from_manifest(&blob, m)?;
+                    let full_bytes = layout.geometry.full_tensor_bytes();
+                    for pair in &layout.full_tensors {
+                        for &t in pair {
+                            if blob.tensors[t].bytes != full_bytes {
+                                return Err(RuntimeError::Rejected(format!(
+                                    "rewritten KV cache {} bytes {} disagree with manifest geometry {full_bytes}",
+                                    blob.tensors[t].name, blob.tensors[t].bytes
+                                )));
+                            }
+                        }
+                    }
+                }
+                packet_max_ctx = want as usize;
+            } else if (want as usize) < packet_max_ctx {
+                crate::exec::ctx_bound::narrow(&mut blob, want)?;
+                live_kv_manifest = blob.with_packet_view(plow_asset::live_kv::emit).ok();
+                if let Some(pack) = packed_prefill_metadata.as_mut() {
+                    blob.with_packet_view(|p| {
+                        for (pi, g) in p.programs.iter().enumerate().take(p.prefill_count) {
+                            if pi < pack.programs.len() {
+                                pack.programs[pi] = plow_asset::live_kv::program_digest(g);
+                            }
+                        }
+                    });
+                }
+                packet_max_ctx = want as usize;
+            }
+        }
+        if let Some(rt_ctx) = config.rt_max_ctx {
+            if rt_ctx > packet_max_ctx {
+                return Err(RuntimeError::Rejected(format!(
+                    "PLOW_RT_MAX_CTX {rt_ctx} exceeds packet compiled max_ctx {packet_max_ctx}; use PLOW_LIVE_CTX to widen"
+                )));
+            }
+        }
         let mixed_packet = if blob
             .sections
             .iter()
@@ -3063,7 +3151,6 @@ impl GpuEngine {
             blob.with_packet_view(|p| pack.validate(p, live))
                 .map_err(RuntimeError::Rejected)?;
         }
-        let config = RuntimeConfig::get();
         let prefix_layout = crate::memory::vmm::VmmOps::granularity(be.as_ref())
             .ok()
             .and_then(|granularity| {
@@ -3472,12 +3559,15 @@ impl GpuEngine {
                 v.rings.as_ref().and_then(|rings| rings.tensor_va(id))
             }
         };
+        let config = RuntimeConfig::get();
         let slab_bytes: u64 = blob
             .tensors
             .iter()
             .enumerate()
             .filter(|(id, _)| vmm_va_of(*id).is_none())
-            .map(|(_, td)| carve_bytes(td.bytes))
+            .map(|(_, td)| {
+                carve_bytes(td.bytes)
+            })
             .sum();
         // Brought up BEFORE the checkpoint opens: the VMM reserve returns in
         // µs and its mapper then commits pages concurrently with the open,
@@ -3644,19 +3734,20 @@ impl GpuEngine {
                 let t_alloc =
                     (load_prof && vmm_va.is_none() && matches!(weight_slab, WeightSlab::PerTensor))
                         .then(std::time::Instant::now);
+                let tensor_bytes = td.bytes;
                 let mem = match (vmm_va, &weight_slab) {
                     (Some(va), _) => DeviceMem::view(va, td.bytes),
                     (None, WeightSlab::Vmm(slab)) => {
-                        let m = DeviceMem::view(slab.base() + slab_off, td.bytes);
-                        slab_off += carve_bytes(td.bytes);
+                        let m = DeviceMem::view(slab.base() + slab_off, tensor_bytes);
+                        slab_off += carve_bytes(tensor_bytes);
                         m
                     }
                     (None, WeightSlab::Flat(slab)) => {
-                        let m = DeviceMem::view(slab.base + slab_off, td.bytes);
-                        slab_off += carve_bytes(td.bytes);
+                        let m = DeviceMem::view(slab.base + slab_off, tensor_bytes);
+                        slab_off += carve_bytes(tensor_bytes);
                         m
                     }
-                    (None, WeightSlab::PerTensor) => be.alloc(0, td.bytes)?,
+                    (None, WeightSlab::PerTensor) => be.alloc(0, tensor_bytes)?,
                 };
                 if let (Some(t), Some(tm)) = (t_alloc, load_tim.as_mut()) {
                     tm.note_alloc(td.bytes, t.elapsed().as_secs_f64() * 1e3, true);
@@ -4302,6 +4393,85 @@ impl GpuEngine {
                 rungs = decode_rungs.len() + 1,
                 "packet decode rung selection enabled"
             );
+        }
+
+        let mut nv_nsplit = None;
+        if config.nv_ns_live() {
+            if decode_contexts.is_some() {
+                tracing::warn!(
+                    "PLOW_NV_NS_LIVE ignored: this packet carries a decode context table, whose band programs keep their baked split count"
+                );
+            } else {
+                let full_kv: rustc_hash::FxHashSet<u16> = live_kv_manifest
+                    .as_ref()
+                    .map(|m| {
+                        m.caches
+                            .iter()
+                            .filter(|c| c.window == 0)
+                            .flat_map(|c| c.pair)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if full_kv.is_empty() {
+                    tracing::warn!(
+                        "PLOW_NV_NS_LIVE ignored: no full-attention KV caches found in live manifest"
+                    );
+                } else {
+                    let mut progs = Vec::new();
+                    let mut baked = None;
+                    if let Some((sites, b)) =
+                        crate::exec::kvrow::derive_nv_nsplit(&insts, |h| full_kv.contains(&h))
+                    {
+                        baked = Some(b);
+                        if let Some((lo, hi)) = crate::exec::kvrow::nv_split_span(&sites) {
+                            progs.push(NvDenseNsplitProg {
+                                d_inst: d_inst.base,
+                                sites,
+                                lo,
+                                _hi: hi,
+                                image: None,
+                            });
+                        }
+                    }
+                    for rung in decode_rungs.iter() {
+                        let Some((sites, b)) = crate::exec::kvrow::derive_nv_nsplit(
+                            &rung.host_insts,
+                            |h| full_kv.contains(&h),
+                        ) else {
+                            continue;
+                        };
+                        if baked != Some(b) {
+                            continue;
+                        }
+                        let Some((lo, hi)) = crate::exec::kvrow::nv_split_span(&sites) else {
+                            continue;
+                        };
+                        progs.push(NvDenseNsplitProg {
+                            d_inst: rung.kernarg.insts,
+                            sites,
+                            lo,
+                            _hi: hi,
+                            image: Some(rung.host_insts[lo..=hi].to_vec()),
+                        });
+                    }
+                    if let Some(baked) = baked {
+                        if !progs.is_empty() {
+                            let total_sites: usize = progs.iter().map(|p| p.sites.len()).sum();
+                            tracing::info!(
+                                rungs = progs.len(),
+                                baked,
+                                sites = total_sites,
+                                "PLOW_NV_NS_LIVE: NV dense decode split count tracks the live kv_len"
+                            );
+                            nv_nsplit = Some(NvDenseNsplit {
+                                progs,
+                                baked,
+                                cur: baked,
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         // kv-row patch range: the contiguous [lo..hi] instruction window the
@@ -5102,6 +5272,33 @@ impl GpuEngine {
             tm.print_flame(total);
         }
 
+        let flat_kv = vmm.is_none();
+        let kv_admission = be
+            .mem_info()
+            .ok()
+            .map(|(free, _total)| free)
+            .filter(|_| !flat_kv)
+            .and_then(|free| {
+                let kv_bytes: u64 = blob
+                    .tensors
+                    .iter()
+                    .filter(|t| t.name.starts_with("kv."))
+                    .map(|t| t.bytes)
+                    .sum();
+                let rows = (max_ctx as u64).checked_mul(batch as u64)?;
+                let per_token = kv_bytes.checked_div(rows).filter(|&b| b > 0)?;
+                let budget = (free as f64 * crate::config::RuntimeConfig::get().kv_admit_headroom())
+                    as u64;
+                tracing::info!(
+                    per_token,
+                    free_gib = free as f64 / (1u64 << 30) as f64,
+                    budget_gib = budget as f64 / (1u64 << 30) as f64,
+                    max_rows = budget / per_token,
+                    "CUDA KV admission budget"
+                );
+                Some(crate::sched::admission::KvBudget::linear(per_token, budget))
+            });
+
         let mut engine = GpuEngine {
             be,
             f,
@@ -5129,6 +5326,7 @@ impl GpuEngine {
             kvrow,
             kvrow_lo: lo,
             kvrow_hi: hi,
+            nv_nsplit,
             ctr_bytes,
             cursor_bytes,
             devp,
@@ -5180,6 +5378,7 @@ impl GpuEngine {
             packed_terminal: None,
             mixed_step,
             token_batch: None,
+            kv_admission,
             slot_generations: vec![0; batch],
         };
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
@@ -5200,6 +5399,43 @@ impl GpuEngine {
         }
         if engine.cublaslt_decode_capture {
             engine.capture_decode_graph()?;
+        }
+        if !engine.prefill.is_empty()
+            && config.nv.pf_seg_graph
+            && !config.nv.pf_seg_time
+            && !config.nv.pf_seg_fatonly
+        {
+            let warmup_slots = engine.batch.min(4);
+            let t_warmup = std::time::Instant::now();
+            for bi in 0..engine.prefill.len() {
+                if uses_segmented_prefill(
+                    engine.seg_pf.is_some(),
+                    false,
+                    engine.prefill[bi].seg_class.len(),
+                    &engine.prefill[bi].packet_segment_roles,
+                ) {
+                    for b in 0..warmup_slots {
+                        let mut arg = engine.prefill[bi].kernarg;
+                        arg.tensors = engine.tens_slot_base(b);
+                        if let Err(e) = engine.ensure_seg_graph(bi, &arg) {
+                            tracing::warn!(
+                                error = %e,
+                                bucket = bi,
+                                slot = b,
+                                "prefill seg graph warmup failed"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            tracing::info!(
+                buckets = engine.prefill.len(),
+                slots = warmup_slots,
+                graphs = engine.seg_graphs.len(),
+                elapsed_ms = t_warmup.elapsed().as_millis(),
+                "prefill seg graphs warmed up"
+            );
         }
         Ok(engine)
     }
@@ -5447,6 +5683,10 @@ impl GpuEngine {
         self.batch
     }
 
+    pub fn kv_admission(&self) -> Option<crate::sched::admission::KvBudget> {
+        self.kv_admission
+    }
+
     /// Decode widths this loaded engine can execute, in ascending order.
     ///
     /// `decode_rungs` contains only the narrow programs; the main program is
@@ -5643,6 +5883,71 @@ impl GpuEngine {
         Ok(())
     }
 
+    fn patch_nv_nsplit(&mut self, kvlen: u32) -> Result<()> {
+        let Some(ns) = &mut self.nv_nsplit else {
+            return Ok(());
+        };
+        let (baked, from) = (ns.baked, ns.cur);
+        let want = crate::exec::kvrow::nv_dense_live_nsplit(baked, kvlen);
+        if want == from {
+            return Ok(());
+        }
+        let sz = std::mem::size_of::<DevInst64>();
+        for prog in &mut ns.progs {
+            match &mut prog.image {
+                Some(image) => {
+                    for site in &prog.sites {
+                        let off = site.inst_idx as usize - prog.lo;
+                        if site.is_merge {
+                            image[off].i[2] = want;
+                        } else {
+                            image[off].i[5] = want;
+                        }
+                    }
+                    unsafe {
+                        let bytes = std::slice::from_raw_parts(
+                            image.as_ptr() as *const u8,
+                            image.len() * sz,
+                        );
+                        self.be.memcpy_htod_async(
+                            prog.d_inst + (prog.lo * sz) as u64,
+                            bytes,
+                            &self.stream,
+                        )?;
+                    }
+                }
+                None => {
+                    for site in &prog.sites {
+                        let idx = site.inst_idx as usize;
+                        if site.is_merge {
+                            self.h_inst[idx].i[2] = want;
+                        } else {
+                            self.h_inst[idx].i[5] = want;
+                        }
+                    }
+                    unsafe {
+                        let slice = &self.h_inst[prog.lo..=prog._hi];
+                        let bytes = std::slice::from_raw_parts(
+                            slice.as_ptr() as *const u8,
+                            slice.len() * sz,
+                        );
+                        self.be.memcpy_htod_async(
+                            prog.d_inst + (prog.lo * sz) as u64,
+                            bytes,
+                            &self.stream,
+                        )?;
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            baked, from, to = want, kvlen,
+            "NV dense split count re-pointed at the live kv_len"
+        );
+        ns.cur = want;
+        Ok(())
+    }
+
     /// One batched decode step: feed `(slot, token)` for every live slot,
     /// advance each fed slot's KV cache by one row, and write the
     /// device-argmax next token per feed (same order) into `toks` — cleared
@@ -5717,6 +6022,13 @@ impl GpuEngine {
         if let Some(t) = &self.timing {
             self.be.event_record(&t.ev[0], &self.stream)?;
         }
+
+        let max_kvlen = feeds
+            .iter()
+            .map(|&(b, _)| self.pos[b] + 1)
+            .max()
+            .unwrap_or(1);
+        self.patch_nv_nsplit(max_kvlen)?;
 
         // B == 1 program: the KV write row is the host-patched `i[3]` (the
         // legacy single-ring formula). B > 1 programs ignore `i[3]` — the
@@ -5997,6 +6309,8 @@ impl GpuEngine {
     fn enqueue_prompt_token(&mut self, slot: usize, token: u32) -> Result<()> {
         let bsz = self.batch;
         let rung = self.select_decode(std::iter::once(slot))?;
+        let kvlen = self.pos[slot] + 1;
+        self.patch_nv_nsplit(kvlen)?;
         if bsz == 1 && !self.kvrow.is_empty() {
             let pos = self.pos[slot];
             for &ix in &self.kvrow {
@@ -7688,6 +8002,92 @@ impl GpuEngine {
         Ok(None)
     }
 
+    fn ensure_seg_graph(&mut self, bi: usize, arg: &DevProgram) -> Result<()> {
+        let key = (bi, arg.tensors as u64);
+        if self.seg_graphs.contains_key(&key) {
+            return Ok(());
+        }
+        let seg_class = self.prefill[bi].seg_class.clone();
+        let has_external = self.prefill[bi].cublaslt_segments.iter().any(Option::is_some)
+            || self.prefill[bi]
+                .packet_segment_roles
+                .iter()
+                .any(|&role| {
+                    matches!(
+                        role,
+                        plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
+                            | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
+                            | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
+                    )
+                });
+        let g = if has_external {
+            let capture_stream = self.be.stream_create()?;
+            self.be.graph_capture(&capture_stream, || {
+                for (seg, &class) in seg_class.iter().enumerate() {
+                    if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
+                        route.run(&capture_stream)?;
+                        continue;
+                    }
+                    let (function, grid, block, smem) =
+                        self.prefill_segment_kernel(bi, seg, class, false)?;
+                    if let Some((direct, mut direct_arg)) =
+                        self.direct_packet_segment(bi, seg, arg)?
+                    {
+                        let mut params = [direct_arg.kernel_param()];
+                        self.be.launch_cooperative(
+                            direct,
+                            grid,
+                            block,
+                            smem,
+                            &mut params,
+                            Some(&capture_stream),
+                        )?;
+                        continue;
+                    }
+                    let mut node_arg = *arg;
+                    node_arg.cur_seg = seg as u32;
+                    let mut params =
+                        [&mut node_arg as *mut DevProgram as *mut std::ffi::c_void];
+                    self.be.launch_cooperative(
+                        function,
+                        grid,
+                        block,
+                        smem,
+                        &mut params,
+                        Some(&capture_stream),
+                    )?;
+                }
+                Ok(())
+            })?
+        } else {
+            let mut blobs: Vec<DevProgram> = (0..seg_class.len())
+                .map(|i| {
+                    let mut node_arg = *arg;
+                    node_arg.cur_seg = i as u32;
+                    node_arg
+                })
+                .collect();
+            let nodes: Vec<_> = seg_class
+                .iter()
+                .enumerate()
+                .map(|(seg, &class)| self.prefill_segment_kernel(bi, seg, class, false))
+                .collect::<Result<Vec<_>>>()?;
+            let mut ptrs: Vec<*mut std::ffi::c_void> = blobs
+                .iter_mut()
+                .map(|bb| bb as *mut DevProgram as *mut std::ffi::c_void)
+                .collect();
+            self.be.graph_build_chain(&nodes, &mut ptrs)?
+        };
+        self.seg_graphs.insert(key, g);
+        tracing::info!(
+            nodes = seg_class.len(),
+            external = has_external,
+            bucket = bi,
+            "seg graph built"
+        );
+        Ok(())
+    }
+
     fn launch_prefill_chain(
         &mut self,
         bi: usize,
@@ -7770,89 +8170,7 @@ impl GpuEngine {
             let fat_only_probe = rt.nv.pf_seg_fatonly;
             if !seg_time_probe && !fat_only_probe && rt.nv.pf_seg_graph {
                 let key = (bi, arg.tensors as u64);
-                if !self.seg_graphs.contains_key(&key) {
-                    let has_external = self.prefill[bi].cublaslt_segments.iter().any(Option::is_some)
-                        || self.prefill[bi]
-                            .packet_segment_roles
-                            .iter()
-                            .any(|&role| {
-                                matches!(
-                                    role,
-                                    plow_asset::segment_roles::PREFILL_ATTENTION_HD512_PX4_BQ64
-                                        | plow_asset::segment_roles::PREFILL_ATTENTION_HD256_GQA2_BKV32
-                                        | plow_asset::segment_roles::W8A8_PREFILL_GEMM_GLU_GEMMA4
-                                )
-                            });
-                    let g = if has_external {
-                        let capture_stream = self.be.stream_create()?;
-                        self.be.graph_capture(&capture_stream, || {
-                            for (seg, &class) in seg_class.iter().enumerate() {
-                                if let Some(Some(route)) =
-                                    self.prefill[bi].cublaslt_segments.get(seg)
-                                {
-                                    route.run(&capture_stream)?;
-                                    continue;
-                                }
-                                let (function, grid, block, smem) =
-                                    self.prefill_segment_kernel(bi, seg, class, false)?;
-                                if let Some((direct, mut direct_arg)) =
-                                    self.direct_packet_segment(bi, seg, &arg)?
-                                {
-                                    let mut params = [direct_arg.kernel_param()];
-                                    self.be.launch_cooperative(
-                                        direct,
-                                        grid,
-                                        block,
-                                        smem,
-                                        &mut params,
-                                        Some(&capture_stream),
-                                    )?;
-                                    continue;
-                                }
-                                let mut node_arg = arg;
-                                node_arg.cur_seg = seg as u32;
-                                let mut params = [&mut node_arg as *mut DevProgram
-                                    as *mut std::ffi::c_void];
-                                self.be.launch_cooperative(
-                                    function,
-                                    grid,
-                                    block,
-                                    smem,
-                                    &mut params,
-                                    Some(&capture_stream),
-                                )?;
-                            }
-                            Ok(())
-                        })?
-                    } else {
-                    let mut blobs: Vec<DevProgram> = (0..seg_class.len())
-                        .map(|i| {
-                                let mut node_arg = arg;
-                                node_arg.cur_seg = i as u32;
-                                node_arg
-                        })
-                        .collect();
-                        let nodes: Vec<_> = seg_class
-                        .iter()
-                        .enumerate()
-                            .map(|(seg, &class)| {
-                                self.prefill_segment_kernel(bi, seg, class, false)
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let mut ptrs: Vec<*mut std::ffi::c_void> = blobs
-                        .iter_mut()
-                        .map(|bb| bb as *mut DevProgram as *mut std::ffi::c_void)
-                        .collect();
-                        self.be.graph_build_chain(&nodes, &mut ptrs)?
-                    };
-                    self.seg_graphs.insert(key, g);
-                    tracing::info!(
-                        nodes = seg_class.len(),
-                        external = has_external,
-                        bucket = bi,
-                        "seg graph built"
-                    );
-                }
+                self.ensure_seg_graph(bi, &arg)?;
                 self.be
                     .graph_launch(self.seg_graphs.get(&key).expect("just built"), &self.stream)?;
                 if synchronize {
@@ -8223,7 +8541,8 @@ impl GpuEngine {
                     self.max_ctx,
                     self.packed_prefill
                         .as_ref()
-                        .and_then(|p| p.max_request_rows),
+                        .and_then(|p| p.max_request_rows)
+                        .or(Some(self.pf_max_rows() as u32)),
                 )
                 .map_err(RuntimeError::Rejected)?,
             )

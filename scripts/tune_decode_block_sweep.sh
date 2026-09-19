@@ -165,7 +165,7 @@ for arm in $ARMS; do
   # changes between arms, which is the whole point — anything else varying would
   # make the ranking attribute a packet difference to a define.
   adir="$WORK/asset/$arm"; mkdir -p "$adir"
-  for f in block.json model.pkt weights.json tokenizer.json checkpoint; do
+  for f in build.json block.json model.pkt weights.json tokenizer.json checkpoint; do
     [ -e "$ASSET/$f" ] && ln -sfn "$(readlink -f "$ASSET/$f")" "$adir/$f"
   done
   # Decode sweeps must retain the packet-paired prefill and role objects. A
@@ -195,7 +195,9 @@ for arm in $ARMS; do
       fi;;
   esac
   ln -sfn "$cdir/$CUBIN" "$adir/$CUBIN"
-  run_env=()
+  run_env=(
+    "LD_LIBRARY_PATH=/usr/local/cuda-13.2/targets/x86_64-linux/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+  )
   if [ -e "$adir/${CUBIN%.cubin}_pfseg.cubin" ] &&
      [ -e "$adir/${CUBIN%.cubin}_pfgemm.cubin" ]; then
     run_env+=(
