@@ -461,10 +461,23 @@ the corrected roofline model is right.
    NormResidual, **150 MoE** (5 ops x 30 layers), 30 Glu, 30 FlashPrefill, 1 SoftCap.
    TTFT 125 ms over 691 launches is ~181 us average against the 12B campaign's measured
    ~52 us projection-GEMM floor, so both the count AND the per-launch cost are in play.
-   MoE adds 22 % more launches than a dense model of the same depth. Fusing the MoE
-   tail (`MoeCombineResidNormGemma` already exists as a 3-op fusion and is NOT being
-   selected — `PLOW_PACKET_HAS_MOE_COMBINE_RESID_NORM_GEMMA 0`) and the router
-   score/topk pair are the obvious candidates.
+   MoE adds 22 % more launches than a dense model of the same depth.
+
+   **Do NOT reach for `PLOW_GEMMA_MOE_TAIL_FUSE` (op72 `MoeCombineResidNormGemma`).**
+   It looks like the obvious launch-count win — it is the one fusion the packet
+   reports as absent (`PLOW_PACKET_HAS_MOE_COMBINE_RESID_NORM_GEMMA 0`) — but it is
+   default-OFF because it was MEASURED NEGATIVE (devgen `lib.rs:6033`, P9 2026-07-20):
+   +0.18 ms/token on both bf16 and fp8 at 40 ctx, because the 1-block 4-pass SCALAR
+   body costs more than the packet boundary it removes, and its reduction order
+   differs from the vectorized `NormResidualNorm` (last-ulp bf16 flips). It is also
+   B=1 only and the emitter asserts loudly if combined with t > 1. The source names
+   the only version worth building: a register-cached VECTORIZED body that replicates
+   NRN's summation order.
+
+   So the launch-count lever has to come from somewhere else — the router
+   score/topk pair, or fusing across the dense-MLP/MoE seam that only this hybrid
+   architecture has. Attribute per-op first (`PLOW_PF_SEG_TIME=1`, attribution only,
+   never a number) rather than guessing which of the 691 launches is the cost.
 3. **fatlite, recovered properly.** `PLOW_BUILD_FATLITE=0` is currently forced to make
    MoE prefill exist at all, surrendering the occupancy win (12B: -2.8 ms @1024,
    -4.8 ms @4096). The fix is to widen the MoE prefill guard so the ops survive
