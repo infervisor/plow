@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
+#include <cmath>
 
 #include "sm120_common.cuh"
 #include "op_norm.cuh"
@@ -57,6 +58,22 @@ __global__ void k_down(float* part, const bf16* fu, const unsigned long long* ew
                               blockIdx.x, gridDim.x, g_arena);
 }
 
+/* op 73: the T-token router. Runs FIRST and, in a real bucket, over rows of
+ * uninitialised padding — so it is fed deliberately hostile activations below. */
+__global__ void k_router(unsigned char* table, const bf16* resid, const bf16* proj,
+                         const bf16* scale, const bf16* pes, unsigned H, unsigned n_exp,
+                         unsigned k, unsigned T, float root, float eps) {
+    d_moe_router_gemma_pf(table, resid, proj, scale, pes, H, n_exp, k, T, root, eps,
+                          blockIdx.x, gridDim.x, (float*)g_arena);
+}
+
+/* op 77: T-row combine + sandwich norm. */
+__global__ void k_comb(bf16* out, const float* part, const bf16* h1, const bf16* gamma,
+                       unsigned H, unsigned k, unsigned T, float eps) {
+    d_moe_combine_norm_gemma_pf(out, part, h1, gamma, H, k, T, eps, blockIdx.x, gridDim.x,
+                                (float*)g_arena);
+}
+
 int main(int argc, char** argv) {
     const unsigned T      = argc > 1 ? (unsigned)atoi(argv[1]) : 128u;
     const unsigned H      = 2816u;
@@ -70,16 +87,26 @@ int main(int argc, char** argv) {
     printf("T=%u H=%u I_moe=%u E=%u k=%u grid=%u total_pad=%zu  (I_moe/BN = %.2f tiles)\n",
            T, H, I_moe, n_exp, k, grid, total_pad, (double)I_moe / 128.0);
 
-    /* Routing table: [T*k] of {u32 eid, f32 gate}. Spread over all 128 experts so that MANY
-     * experts get a non-multiple-of-128 row count and some get ZERO -- the real distribution. */
+    /* Routing table: [T*k] of {u32 eid, f32 gate}.
+     * dist 0 = even spread (every expert gets the same count).
+     * dist 1 = ALL slots to expert 0: 127 empty experts, one segment many tiles deep.
+     * dist 2 = two hot experts + a long tail, the shape a real prompt produces when most
+     *          of the bucket is uninitialised padding and routing degenerates.
+     * The even case is NOT representative: a real 128-row bucket holding a 39-token prompt
+     * runs the router over ~89 rows of garbage. */
+    const unsigned dist = argc > 3 ? (unsigned)atoi(argv[3]) : 0u;
     const size_t nslot = (size_t)T * k;
     std::vector<unsigned char> tab(nslot * 8);
     for (size_t s = 0; s < nslot; s++) {
-        unsigned eid = (unsigned)((s * 37u + (s >> 3)) % n_exp);
+        unsigned eid;
+        if (dist == 1) eid = 0u;
+        else if (dist == 2) eid = (s % 16u < 14u) ? (unsigned)(s & 1u) : (unsigned)(2u + (s % 61u));
+        else eid = (unsigned)((s * 37u + (s >> 3)) % n_exp);
         float gate = 0.125f;
         memcpy(&tab[s*8+0], &eid, 4);
         memcpy(&tab[s*8+4], &gate, 4);
     }
+    printf("routing dist=%u\n", dist);
 
     std::vector<float> hx((size_t)T * H);
     for (auto& v : hx) v = rnd() * 0.05f;
@@ -126,6 +153,33 @@ int main(int argc, char** argv) {
     CK(cudaFuncSetAttribute(k_glu,  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)arena_bytes));
     CK(cudaFuncSetAttribute(k_down, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)arena_bytes));
 
+    /* op 73 first, on the WORST input a real bucket can present: `garbage` fills the
+     * rows a short prompt leaves uninitialised with NaN/Inf/huge values, which is what
+     * the router actually sees for rows 39..127 of a 128-row bucket. */
+    if (dist == 3) {
+        bf16 *d_proj = nullptr, *d_sc = nullptr, *d_pes = nullptr;
+        std::vector<bf16> proj((size_t)n_exp * H), sc(H), pes(n_exp);
+        for (auto& v : proj) v = __float2bfloat16(rnd() * 0.05f);
+        for (auto& v : sc) v = __float2bfloat16(1.0f);
+        for (auto& v : pes) v = __float2bfloat16(1.0f);
+        CK(cudaMalloc(&d_proj, proj.size()*sizeof(bf16)));
+        CK(cudaMemcpy(d_proj, proj.data(), proj.size()*sizeof(bf16), cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&d_sc, sc.size()*sizeof(bf16)));
+        CK(cudaMemcpy(d_sc, sc.data(), sc.size()*sizeof(bf16), cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&d_pes, pes.size()*sizeof(bf16)));
+        CK(cudaMemcpy(d_pes, pes.data(), pes.size()*sizeof(bf16), cudaMemcpyHostToDevice));
+        /* real rows 0..38, then garbage: 0xFF bytes = NaN in bf16. */
+        bf16* d_resid = nullptr;
+        CK(cudaMalloc(&d_resid, (size_t)T * H * sizeof(bf16)));
+        CK(cudaMemset(d_resid, 0xFF, (size_t)T * H * sizeof(bf16)));
+        CK(cudaMemcpy(d_resid, xn2.data(), (size_t)39 * H * sizeof(bf16), cudaMemcpyHostToDevice));
+        CK(cudaFuncSetAttribute(k_router, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)arena_bytes));
+        k_router<<<grid, 256, arena_bytes>>>(d_tab, d_resid, d_proj, d_sc, d_pes, H, n_exp, k, T,
+                                             1.0f / sqrtf((float)H), 1e-6f);
+        CK(cudaDeviceSynchronize());
+        printf("router(NaN-padded): ok\n");
+    }
+
     k_align<<<1, 256>>>(d_meta, d_tab, d_rt, d_rp, d_rg, T, n_exp, k);
     CK(cudaDeviceSynchronize());
     printf("align: ok\n");
@@ -148,6 +202,23 @@ int main(int argc, char** argv) {
     k_down<<<grid, 256, arena_bytes>>>(d_part, d_fu, d_ewt, d_meta, d_rp, d_rg, H, I_moe, n_exp);
     CK(cudaDeviceSynchronize());
     printf("group_down: ok\n");
+
+    /* op 77: combine + sandwich norm over the scattered partials. */
+    {
+        bf16 *d_h1 = nullptr, *d_g = nullptr, *d_out = nullptr;
+        std::vector<bf16> h1((size_t)T * H), g(H);
+        for (auto& v : h1) v = __float2bfloat16(rnd() * 0.05f);
+        for (auto& v : g) v = __float2bfloat16(1.0f);
+        CK(cudaMalloc(&d_h1, h1.size()*sizeof(bf16)));
+        CK(cudaMemcpy(d_h1, h1.data(), h1.size()*sizeof(bf16), cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&d_g, g.size()*sizeof(bf16)));
+        CK(cudaMemcpy(d_g, g.data(), g.size()*sizeof(bf16), cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&d_out, (size_t)T * H * sizeof(bf16)));
+        CK(cudaFuncSetAttribute(k_comb, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)arena_bytes));
+        k_comb<<<grid, 256, arena_bytes>>>(d_out, d_part, d_h1, d_g, H, k, T, 1e-6f);
+        CK(cudaDeviceSynchronize());
+        printf("combine_norm: ok\n");
+    }
 
     printf("ALL OK\n");
     return 0;

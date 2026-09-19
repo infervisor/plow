@@ -197,6 +197,21 @@ packet on sm90a. Fixing that gate surfaced the bug underneath it.
 | Wrong MoE arm compiled | `interp_sm90a.cu:16` defines `PLOW_NV_HOPPER`, so the wgmma fork IS used — same arm the repro forced |
 | Missing dependency edge | `devgen lib.rs:6105+` declares router -> align -> glu; `--counters` reports 840 edges, 0 redundant, 0 removable polls |
 
+Also ruled out after the first write-up:
+
+* **Counter pattern.** The 1-block-producer -> N-block-consumer shape is not novel:
+  gpt-oss emits `MoeAlignPf` with `vec![0]` feeding 132-block consumers through the
+  same `Dep::Coarse` edge, and it works. So the shape itself is proven; only a
+  Gemma-specific mismatch could still be at fault.
+* **MoE scratch sizing.** `moe_part` is `moe_rows * top_k * hidden * f32` and
+  `moe_fug` is `total_pad * moe_inter * bf16`, with
+  `total_pad = moe_rows*top_k + n_exp*128` — the exact bound the repro used and
+  passed. (`moe_mfu` is sized by `dbatch`, but that is decode-only scratch and the
+  prefill path does not touch it.)
+* **Decode-only bisect is not available.** `PLOW_MOE_PREFILL=0` produces a
+  decode-only blob and the emit then panics at `lib.rs:9482 "prefill buckets"`, so
+  there is no way to serve this model without the grouped prefill path.
+
 ### The live lead
 
 The repro passes because it `cudaDeviceSynchronize()`s between align and GLU. In the
@@ -207,11 +222,29 @@ before align has published it, `total_tiles` is garbage, `ntiles` explodes, and
 which is exactly an illegal address. The expert index itself is clamped by
 `pgm_moe_expert_of_mtile`, so a bad `e` is NOT the mechanism; `rowbase` is.
 
-The edge is declared, so the question is whether the 1-block producer's bump count
-matches what the 132-block consumer waits for. Next step: `plowrt disasm --stream`
-on program T=128 and read the actual wait/bump counts for instructions 19 and 20.
-A cheap confirmation is to have GLU clamp `mtile` to `total_tiles` and see whether
-the fault moves — as a DIAGNOSTIC only; clamping would mask a race, not fix it.
+`disasm --stream` confirms the SHAPE is right — inst 19 has 1 slice (wait_len 1,
+succ_len 1) and inst 20 has 132 slices (wait_len 2, succ_len 1) — but the dump does
+not expose the wait THRESHOLDS, which is the one number that would settle it. Read
+those from the packet bytes rather than the disasm.
+
+**The whole MoE prefill chain is now exonerated, not just the GEMMs.** The repro was
+extended to cover ops 73 (router) and 77 (combine+norm) as well as 74/75/76, and to
+sweep routing distributions — including running the REAL router over NaN-filled
+padding rows, which is what a 39-token prompt in a 128-row bucket actually presents.
+16 of 16 cases pass:
+
+| T | even | all-to-one (127 empty) | concentrated (65 empty) | router over NaN padding |
+|---:|---|---|---|---|
+| 128 | ok | ok | ok | ok (11 empty, max_cnt 93) |
+| 512 | ok | ok | ok | ok |
+| 1024 | ok | ok | ok | ok |
+| 4096 | ok | ok | ok | ok (363 tiles, 46464 of 49152 rows) |
+
+So the fault is NOT in ops 73-77 at any bucket width or routing shape. It is either
+in a non-MoE op of the prefill program, or in an interaction the isolated harness
+cannot see — the cooperative launch, the shared arena, or counter ordering. Attention
+and the dense MLP are the untested remainder, and the 26B-specific thing about them
+is that every layer runs the dense MLP AND the MoE (12B runs only the dense MLP).
 
 Tooling note: compute-sanitizer cannot attach to plowrt (consistent with
 [[ncu-on-nix-plowrt]] — profilers do not work against the cooperative megakernel),
