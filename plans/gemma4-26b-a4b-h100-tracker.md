@@ -1091,6 +1091,51 @@ NEXT, by value:
      grouped GEMM is worth ~-18 ms at 4k (torch._grouped_mm ceiling) and needs a host sync or
      CUTLASS. hd512 long-KV attention (GQA-8 KV re-staged per head) is the 8k/16k item.
 
+## TTFT is not only kernels: tokenizer, pack composition, serving profile (2026-09-20, late)
+
+BENCH-LIKE PROMPTS MATTER. `" hello"*N` routes every row to the same 8 experts and is ~11 ms
+cheaper at 1k than what `vllm bench --dataset-name random` sends. $T/mk_rand_prompts.py decodes
+random ids the way the bench does; served with PLOW_PF_SEG_TIME on those prompts:
+  ~1k tokens: GPU chunk 41.7 ms (MoE 29.1 = 70%, Lt GEMM 5.7, FlashPrefill 4.0, HNR 1.5), wall 46.3
+  ~4k tokens: GPU chunk 117.8 ms (MoE 73.7 = 63%, Lt GEMM 18.0, FlashPrefill 17.4, HNR 5.6), wall 131.5
+so 4.5 / 13.7 ms sat OUTSIDE the GPU and scaled with prompt length.
+
+TOKENIZER (commit 1fb10ecc). Gemma's tokenizer normalizes every space to U+2581, its Split-on-space
+pre-tokenizer therefore never fires, and BPE encodes the whole prompt as ONE word: 1.55 ms at 1k,
+8.87 ms at 4k, serial, inside TTFT. PLOW_ENCODE_THREADS existed but only recognized regex-Split +
+ByteLevel tokenizers. New split-safe class: a cut before a space between two ASCII letters is exact
+iff no vocabulary token has an ASCII letter directly before U+2581 (the first merge to cross the cut
+would be such a token; Gemma-4's only word->space token is `>_</`). Checked at load, unit-tested
+both ways. Recipes: PLOW_ENCODE_THREADS=16, PLOW_ENCODE_SPLIT_MIN=512 (a 1k prompt is ~5 KB, under
+the 4096-byte default floor). Served wall 46.0 -> 43.7 ms (1k), 131.6 -> 122.4 (4k). Full ladder:
+1024/C1 46.76 -> 43.90 (vLLM 44.11: FIRST WIN AT 1k), 4096/C1 134.5 -> 123.5, 8192/C1 288.7 -> 267.9.
+
+C4 CELLS ARE RUNG CELLS. PLOW_PF_PACKLOG now prints arrival gaps and every prefill launch's
+composition. The bench's "simultaneous" C4 requests arrive 0.2-2 ms apart, 7 of 8 bursts still
+pack into ONE 4x1024-row launch, and 1024/C4 (~121 ms) is simply the 4k-rung chunk time — exactly
+as vLLM's 1024/C4 (93.5) equals its 4096/C1 (93.7). A three-arm test (split / PLOW_IDLE_DISPATCH=0
+/ serial encode) showed no dispatcher effect; the earlier "95.8" readings were 2+2 packs. No
+scheduler change: 128/C4 <-> 512 rung, 1024/C4 <-> 4k rung.
+
+COMBINE, take 2 (commit 98993a39). PLOW_MOE_COMBINE_PF_V4=2: the eight float4 slot loads are issued
+before the first add (the adds were serializing the loads), and pass 2 uses 8-byte gamma/residual
+loads and one 8-byte store per 4-wide group. Bit-identical. Harness 0.099 -> 0.057 (1k) and 0.372
+-> 0.211 (4k) ms/layer; IN SITU 0.966 -> 0.956 and 2.381 -> 2.292. (Harness-to-block shrinkage
+again: always quote the block.)
+
+HIGH-CONCURRENCY TTFT IS 8-11x BEHIND (4096/C16 4488 vs 525 ms, 4096/C32 9763 vs 903) while the
+kernel gaps are 1.3-1.5x: the serving profile runs PLOW_MULTISTEP=8, so a tick is ~8 decode steps
+(~170 ms at B=16) + at most one 4096-row prefill span (~130 ms) and a burst of 16 new 4k prompts
+needs ~16 x 300 ms. scripts/campaign/ladder_compare.py prints the cell-by-cell table. Pack-log
+attribution of that cell is the next measurement.
+
+TWO-MODEL CAMPAIGN (user direction): gemma-12b-perf merged twice (0eb5c2e6, c1f1ac38); common
+ladder for 26B and 12B = random prompts 128 / 1024 / 4096 / 8192 / 15000 x C 1 / 4 / 16 / 32, 32
+prompts at C<=4 and 64 above (campaign.py bench --nprompt). New recipe
+gemma4-26b-a4b.h100.bf16-ctx16k.toml (max_ctx 16384). vLLM 0.28 26B at 15000: TTFT 360 / 819 ms
+(C1/C4), TPOT 5.04 / 10.87; serving 340-366 tok/s at 15000, 525-620 at 8192. vLLM needs
+/opt/pytorch/bin on PATH (its JIT shells out to ninja).
+
 ## Status
 
 | step | state |
