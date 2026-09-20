@@ -29,9 +29,12 @@
 #ifndef PLOW_NV_GEMV_MMA
 #define PLOW_NV_GEMV_MMA 0
 #endif
-/* k32 steps in flight per lane: UNB x (NW x 16 B) of weight loads before the first mma. */
+/* k32 steps in flight per lane: UNB x (NW x 16 B) of weight loads before the first mma.
+ * 12, measured on h100-sxm5 (step_bench ms at B=1/4/16): Gemma-4-12B 11.93/13.16/16.03 at 8,
+ * 11.18/12.58/15.25 at 12, 11.52/12.93/15.77 at 16; 26B 5.79/10.06/15.89, 5.80/9.93/15.62,
+ * 5.82/10.00/15.70. A 4-wide tail group for the leftover steps did not rescue 16. */
 #ifndef PLOW_NV_GEMV_MMA_UNB
-#define PLOW_NV_GEMV_MMA_UNB 8
+#define PLOW_NV_GEMV_MMA_UNB 12
 #endif
 
 static __device__ __forceinline__ __nv_bfloat16 gemma_glu_epilogue(float gate, float up,

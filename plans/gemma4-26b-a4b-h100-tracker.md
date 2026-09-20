@@ -1311,6 +1311,27 @@ Serving A/B, negative: `PLOW_PF_INTERLEAVE=2048` (cap the mixed tick) vs 0 at C1
 TPOT 21.80 -> 22.23, 667 -> 648 tok/s; 8192 in: TPOT 44.12 -> 49.56, 298 -> 260 tok/s; only p99
 ITL improves (150 -> 100 ms). Smaller chunks prefill less efficiently; stay uncapped.
 
+### Tensor-core GEMV walk depth, prefill split at 4096, more negatives (2026-09-20, late)
+
+* **`PLOW_NV_GEMV_MMA_UNB` 8 -> 12 (landed as the default).** Weight loads in flight per lane in the
+  B>=2 GEMV walk (and the 12B's B=1 walk). step_bench ms at B=1/4/16: 12B 11.93/13.16/16.03 ->
+  **11.18/12.58/15.25** (16: 11.52/12.93/15.77); 26B 5.79/10.06/15.89 -> 5.80/9.93/15.62. A 4-wide
+  tail group for the leftover k-steps did not rescue depth 16 (not landed).
+* Negatives, not landed: decode-attention row batching `PLOW_NV_FA_WPR_RB` 4 / 8 on the 12B
+  (B=16 -2% / -0.6%, B=1 +0.8% / +3.6%); `PLOW_PF_INTERLEAVE` 2048 / 1024 (above; 1024: TPOT 51.0 ms,
+  241 tok/s at 8192/C16).
+* One 26B decode layer is 18 ops, 7 of them narrow (FlashMerge 16 CUs, NormResidualNorm x2, router
+  score 16, top-k 1, MoE combine-norm 1, RoPE 2) on the chain every 132-block op waits behind:
+  that is the ~25% gate share at B=1 AND B=4. The fusions that would shorten it measured null
+  earlier (FUSE_MERGE / FUSE_HNR / tail fuse in scalar form).
+* **Prefill at ~4096 rows, `p26l`** (`PLOW_PF_SEG_TIME=1`, last chunk, 105 ms of segments, wall
+  121): MoE segment 61.7 ms (59%, 2.05 ms/layer), Lt GEMMs 17.4, FlashPrefill 17.2 (25 sliding x
+  0.345 + 5 full x 1.73), RoPE 5.6, norms+GLU 3.1. `plowrt bench --prefill-sweep` (no HTTP, no
+  tokenizer): 22.9 / 46.4 / 123.5 / 256.2 ms at 129 / 1025 / 4097 / 8193 rows = the served TTFT,
+  so the host path is not the gap; ~16 ms sits between the segment sum and the wall (358 segment
+  launches per chunk) — open. The MoE GEMMs run ~190 TFLOPS against a staging roof of ~286 (85
+  MACs per element staged through smem); the vendor grouped route remains the -18 ms/chunk item.
+
 ## Status
 
 | step | state |
