@@ -1981,6 +1981,9 @@ pub struct GpuEngine {
     f: KernelFn,
     grid: u32,
     smem: u32,
+    /// Launch claim of a rung that does not run the grouped-MoE arm (`DecodeRung::group_arena`):
+    /// the 164 KB ring costs 0.1 / 0.5 / 1.1 ms per step at B=1/2/4 when every rung carries it.
+    smem_narrow: u32,
     /// The engine's single ordered device queue: every decode/prefill copy,
     /// memset, and launch is enqueued here. Decode retires with ONE
     /// `cuStreamSynchronize` per step; decode-loop prompt consumption
@@ -5342,11 +5345,19 @@ impl GpuEngine {
                 })
             });
 
+        // An explicit --nv-smem speaks for every rung; an object without the symbol has one claim.
+        let smem_narrow = match crate::config::RuntimeConfig::get().nv.smem {
+            Some(_) => smem,
+            None => be
+                .module_global_u32(&module, "plow_arena_bytes_narrow")?
+                .map_or(smem, |narrow| narrow.min(smem)),
+        };
         let mut engine = GpuEngine {
             be,
             f,
             grid,
             smem,
+            smem_narrow,
             stream,
             module,
             f_pf,
@@ -6462,7 +6473,10 @@ impl GpuEngine {
                 object.map_or(self.f, |o| o.function),
                 object.map_or(self.grid, |o| o.grid),
                 object.map_or(BLOCK, |o| o.block),
-                object.map_or(self.smem, |o| o.smem),
+                object.map_or(
+                    if r.group_arena { self.smem } else { self.smem_narrow },
+                    |o| o.smem,
+                ),
                 &mut params,
                 Some(&self.stream),
             )

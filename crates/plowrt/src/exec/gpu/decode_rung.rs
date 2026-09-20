@@ -5,6 +5,9 @@ pub(super) struct DecodeRung {
     pub(super) host_insts: Vec<DevInst64>,
     pub(super) library: Option<super::cublaslt::CublasLtDecodeGraph>,
     pub(super) rows: usize,
+    /// This rung runs the grouped-MoE arm (align rows >= its threshold), so its launch needs the
+    /// object's full arena; the other rungs launch with `plow_arena_bytes_narrow`.
+    pub(super) group_arena: bool,
     pub(super) object: Option<Arc<BoundDecodeObject>>,
     pub(super) kernarg: DevProgram,
     pub(super) counters: DeviceMem,
@@ -204,6 +207,13 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                         return Err(reject("MoE combine rows disagree with rung width"));
                     }
                     d.i[2] = 1;
+                }
+                // Grouped-decode align (PLOW_GEMMA_MOE_DEC_GROUP): rows ride i0, like prefill.
+                Some(DevOp::MoeAlignGemmaPf) => {
+                    if d.i[0] != g.t {
+                        return Err(reject("MoE align rows disagree with rung width"));
+                    }
+                    d.i[0] = 1;
                 }
                 // Gemma MoE decode carries B in a spare immediate, 0 at B=1 (devgen `nb`).
                 Some(
@@ -559,6 +569,9 @@ impl DecodeRung {
             host_insts: insts.to_vec(),
             library: None,
             rows: g.t as usize,
+            group_arena: insts.iter().any(|d| {
+                DevOp::from_u16(d.op) == Some(DevOp::MoeAlignGemmaPf) && d.i[3] != 0 && d.i[0] >= d.i[3]
+            }),
             object: None,
             kernarg,
             counters,

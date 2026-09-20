@@ -891,8 +891,17 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #define PLOW_NV_ARENA_FLOATS \
     (PLOW_NV_NON_FP8_ARENA_FLOATS > PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS ? PLOW_NV_NON_FP8_ARENA_FLOATS : PLOW_NV_FP8_DECODE_WGMMA_ARENA_FLOATS)
 #else
-#define PLOW_NV_ARENA_FLOATS                                                                  \
+/* The grouped-MoE ring joins the LAUNCH claim only. Folded into the base arena it would also
+ * raise PLOW_NV_GEMV_STAGING_BYTES, which moves the wide rungs' GEMVs onto the staged arm. */
+#if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && !PLOW_NV_PREFILL
+#define PLOW_NV_MOE_GROUP_ARENA ((PGM_MOE_ARENA_SM90 + 1) / 2) /* bf16 ring, in floats */
+#else
+#define PLOW_NV_MOE_GROUP_ARENA 0
+#endif
+#define PLOW_NV_ARENA_FLOATS0                                                                 \
     (PLOW_NV_BASE_ARENA_FLOATS > PLOW_NV_M16_ARENA_FLOATS ? PLOW_NV_BASE_ARENA_FLOATS : PLOW_NV_M16_ARENA_FLOATS)
+#define PLOW_NV_ARENA_FLOATS                                                                  \
+    (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)
 #endif
 #if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
 static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES,
@@ -913,6 +922,13 @@ static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_FP8_DECODE_WGMMA_A
 #ifndef PLOW_NV_EMBED_SMEM
 #define PLOW_NV_EMBED_SMEM 0
 #endif
+/* The B=1 xreg kernels are instantiated per K; the packet config names the K sizes its decode
+ * program has (manifest `xreg_k`), and only those are compiled into the entry. The decode entry
+ * is one function at the register cap: ten sizes where two are used cost every rung
+ * (26B step_bench ms at B=1/4/16: 5.98/10.41/26.31 -> 5.66/10.31/25.94). */
+#ifndef PLOW_NV_XREG_K
+#define PLOW_NV_XREG_K(k) 1
+#endif
 #if defined(PLOW_NV_GEMM_SPLITK) && PLOW_NV_GEMM_SPLITK
 #if !defined(PLOW_NV_HOPPER) || PLOW_NV_PREFILL || !PLOW_NV_EMBED_SMEM
 #error Split-K capability requires Hopper decode with an embedded arena
@@ -923,6 +939,10 @@ extern "C" __device__ unsigned PLOW_SYM(plow_gemm_splitk_abi) = 1;
 #endif
 #if PLOW_NV_EMBED_SMEM
 extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes) = PLOW_NV_ARENA_FLOATS * sizeof(float);
+#if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && !PLOW_NV_PREFILL
+/* The claim of a rung that never runs the grouped-MoE arm; the loader launches those with it. */
+extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes_narrow) = PLOW_NV_ARENA_FLOATS0 * sizeof(float);
+#endif
 extern "C" __device__ unsigned PLOW_SYM(plow_debug_max_inst) = 999999u;
 
 
@@ -1849,21 +1869,21 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         }
 #endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_KPANEL
-        if (in->i[0] == 1 && in->i[1] == 5120 && in->i[2] == 17408 &&
+        if (!PLOW_NV_GEMV_MMA_B1 && in->i[0] == 1 && in->i[1] == 5120 && in->i[2] == 17408 &&
             blockDim.x == 256 && (5120u + nblk - 1u) / nblk <= 40u) {
             d_gemv_sm90_kpanel((__nv_bfloat16*)TEN(0),
                 (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                 (const __nv_bfloat16*)TEN(2), slice, nblk);
             break;
         }
-        if (in->i[0] == 1 && in->i[1] == 3840 && in->i[2] == 15360 &&
+        if (!PLOW_NV_GEMV_MMA_B1 && in->i[0] == 1 && in->i[1] == 3840 && in->i[2] == 15360 &&
             blockDim.x == 256 && (3840u + nblk - 1u) / nblk <= 40u) {
             d_gemv_sm90_kpanel<3840, 15360, 5, 8>((__nv_bfloat16*)TEN(0),
                 (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                 (const __nv_bfloat16*)TEN(2), slice, nblk);
             break;
         }
-        if (in->i[0] == 1 && in->i[1] == 2816 && in->i[2] == 15360 &&
+        if (!PLOW_NV_GEMV_MMA_B1 && in->i[0] == 1 && in->i[1] == 2816 && in->i[2] == 15360 &&
             blockDim.x == 256 && (2816u + nblk - 1u) / nblk <= 40u) {
             d_gemv_sm90_kpanel<2816, 15360, 5, 8>((__nv_bfloat16*)TEN(0),
                 (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
@@ -1872,23 +1892,23 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         }
 #endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
-        if (in->i[0] == 1 && in->i[1] >= 1024 &&
+        if (!PLOW_NV_GEMV_MMA_B1 && in->i[0] == 1 && PLOW_NV_XREG_K(in->i[2]) && in->i[1] >= 1024 &&
             (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
              in->i[2] == 3584 || in->i[2] == 3840 || in->i[2] == 4096 || in->i[2] == 5120 ||
              in->i[2] == 5376 || in->i[2] == 6144 || in->i[2] == 8192)) {
             auto* x = (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2];
             switch (in->i[2]) {
-            case 2048: d_gemv_sm90_xreg<2048>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
-            case 2560: d_gemv_sm90_xreg<2560>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
-            case 2816: d_gemv_sm90_xreg<2816>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
-            case 3072: d_gemv_sm90_xreg<3072>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
-            case 3584: d_gemv_sm90_xreg<3584>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
-            case 3840: d_gemv_sm90_xreg<3840>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
-            case 4096: d_gemv_sm90_xreg<4096>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
-            case 5120: d_gemv_sm90_xreg<5120>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
-            case 5376: d_gemv_sm90_xreg<5376>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
-            case 6144: d_gemv_sm90_xreg<6144>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
-            case 8192: d_gemv_sm90_xreg<8192>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 2048: if (PLOW_NV_XREG_K(2048)) d_gemv_sm90_xreg<2048>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 2560: if (PLOW_NV_XREG_K(2560)) d_gemv_sm90_xreg<2560>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 2816: if (PLOW_NV_XREG_K(2816)) d_gemv_sm90_xreg<2816>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 3072: if (PLOW_NV_XREG_K(3072)) d_gemv_sm90_xreg<3072>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 3584: if (PLOW_NV_XREG_K(3584)) d_gemv_sm90_xreg<3584>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 3840: if (PLOW_NV_XREG_K(3840)) d_gemv_sm90_xreg<3840>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 4096: if (PLOW_NV_XREG_K(4096)) d_gemv_sm90_xreg<4096>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 5120: if (PLOW_NV_XREG_K(5120)) d_gemv_sm90_xreg<5120>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 5376: if (PLOW_NV_XREG_K(5376)) d_gemv_sm90_xreg<5376>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 6144: if (PLOW_NV_XREG_K(6144)) d_gemv_sm90_xreg<6144>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 8192: if (PLOW_NV_XREG_K(8192)) d_gemv_sm90_xreg<8192>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
             default: break;
             }
             break;
@@ -1934,67 +1954,67 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     /* Kernel arg order is (Nq, Nk, Nv, K): K lives in i2 but is passed LAST. */
     case PLOW_DOP_GEMV_QKV:
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
-        if (in->i[0] == 1 &&
+        if (!PLOW_NV_GEMV_MMA_B1 && in->i[0] == 1 && PLOW_NV_XREG_K(in->i[2]) &&
             (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
              in->i[2] == 3584 || in->i[2] == 3840 || in->i[2] == 4096 || in->i[2] == 5120 ||
              in->i[2] == 5376 || in->i[2] == 6144)) {
             switch (in->i[2]) {
             case 2048:
-                d_gemv_qkv_sm90_xreg<2048>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                if (PLOW_NV_XREG_K(2048)) d_gemv_qkv_sm90_xreg<2048>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
                     (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
                     (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
                     (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
                 break;
             case 2560:
-                d_gemv_qkv_sm90_xreg<2560>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                if (PLOW_NV_XREG_K(2560)) d_gemv_qkv_sm90_xreg<2560>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
                     (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
                     (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
                     (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
                 break;
             case 2816:
-                d_gemv_qkv_sm90_xreg<2816>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                if (PLOW_NV_XREG_K(2816)) d_gemv_qkv_sm90_xreg<2816>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
                     (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
                     (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
                     (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
                 break;
             case 3072:
-                d_gemv_qkv_sm90_xreg<3072>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                if (PLOW_NV_XREG_K(3072)) d_gemv_qkv_sm90_xreg<3072>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
                     (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
                     (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
                     (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
                 break;
             case 3584:
-                d_gemv_qkv_sm90_xreg<3584>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                if (PLOW_NV_XREG_K(3584)) d_gemv_qkv_sm90_xreg<3584>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
                     (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
                     (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
                     (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
                 break;
             case 3840:
-                d_gemv_qkv_sm90_xreg<3840>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                if (PLOW_NV_XREG_K(3840)) d_gemv_qkv_sm90_xreg<3840>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
                     (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
                     (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
                     (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
                 break;
             case 4096:
-                d_gemv_qkv_sm90_xreg<4096>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                if (PLOW_NV_XREG_K(4096)) d_gemv_qkv_sm90_xreg<4096>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
                     (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
                     (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
                     (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
                 break;
             case 5120:
-                d_gemv_qkv_sm90_xreg<5120>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                if (PLOW_NV_XREG_K(5120)) d_gemv_qkv_sm90_xreg<5120>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
                     (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
                     (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
                     (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
                 break;
             case 5376:
-                d_gemv_qkv_sm90_xreg<5376>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                if (PLOW_NV_XREG_K(5376)) d_gemv_qkv_sm90_xreg<5376>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
                     (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
                     (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
                     (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
                 break;
             case 6144:
-                d_gemv_qkv_sm90_xreg<6144>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                if (PLOW_NV_XREG_K(6144)) d_gemv_qkv_sm90_xreg<6144>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
                     (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
                     (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
                     (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
@@ -2041,21 +2061,21 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             break;
         }
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
-        if (in->i[0] == 1 &&
+        if (!PLOW_NV_GEMV_MMA_B1 && in->i[0] == 1 && PLOW_NV_XREG_K(in->i[2]) &&
             (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
              in->i[2] == 3584 || in->i[2] == 3840 || in->i[2] == 4096 || in->i[2] == 5120 ||
              in->i[2] == 5376 || in->i[2] == 6144)) {
             switch (in->i[2]) {
-            case 2048: d_gemv_glu_sm90_xreg<2048>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
-            case 2560: d_gemv_glu_sm90_xreg<2560>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
-            case 2816: d_gemv_glu_sm90_xreg<2816>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
-            case 3072: d_gemv_glu_sm90_xreg<3072>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
-            case 3584: d_gemv_glu_sm90_xreg<3584>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
-            case 3840: d_gemv_glu_sm90_xreg<3840>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
-            case 4096: d_gemv_glu_sm90_xreg<4096>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
-            case 5120: d_gemv_glu_sm90_xreg<5120>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
-            case 5376: d_gemv_glu_sm90_xreg<5376>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
-            case 6144: d_gemv_glu_sm90_xreg<6144>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 2048: if (PLOW_NV_XREG_K(2048)) d_gemv_glu_sm90_xreg<2048>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 2560: if (PLOW_NV_XREG_K(2560)) d_gemv_glu_sm90_xreg<2560>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 2816: if (PLOW_NV_XREG_K(2816)) d_gemv_glu_sm90_xreg<2816>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 3072: if (PLOW_NV_XREG_K(3072)) d_gemv_glu_sm90_xreg<3072>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 3584: if (PLOW_NV_XREG_K(3584)) d_gemv_glu_sm90_xreg<3584>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 3840: if (PLOW_NV_XREG_K(3840)) d_gemv_glu_sm90_xreg<3840>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 4096: if (PLOW_NV_XREG_K(4096)) d_gemv_glu_sm90_xreg<4096>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 5120: if (PLOW_NV_XREG_K(5120)) d_gemv_glu_sm90_xreg<5120>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 5376: if (PLOW_NV_XREG_K(5376)) d_gemv_glu_sm90_xreg<5376>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 6144: if (PLOW_NV_XREG_K(6144)) d_gemv_glu_sm90_xreg<6144>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
             default: break;
             }
             break;
@@ -2463,6 +2483,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     }
 
     case PLOW_DOP_MOE_EXPERT_DOWN_GEMMA: {
+#if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && PLOW_NV_GEMV_RB
+        if (in->i[6] && PLOW_NROW(in->i[5]) >= in->i[6]) {
+            d_moe_group_down_gemma_pf((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                                      (const unsigned long long*)TEN(3), (const int*)TEN(5),
+                                      (const unsigned*)TEN(6), (const float*)TEN(7), in->i[1],
+                                      in->i[2], in->i[3], slice, nblk, (__nv_bfloat16*)arena);
+            break;
+        }
+#endif
         const unsigned soff = in->i[4];
         d_moe_expert_down_gemma((float*)TEN(0) + (size_t)soff * in->i[1],
                                 (const __nv_bfloat16*)TEN(1) + (size_t)soff * in->i[2],
@@ -2516,7 +2545,28 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                        in->fj[0].f, in->fj[1].f, slice, arena);
         break;
 
+#if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && PLOW_NV_GEMV_RB
+    /* Rides EVERY rung (the ladder validator wants one op list); below i3 rows it returns. */
+    case PLOW_DOP_MOE_ALIGN_GEMMA_PF:
+        if (in->i[0] >= in->i[3])
+            d_moe_align_gemma_pf((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
+                                 (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2],
+                                 slice);
+        break;
+#endif
+
     case PLOW_DOP_MOE_EXPERT_GLU_NORM_GEMMA:
+#if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && PLOW_NV_GEMV_RB
+        if (in->i[6] && PLOW_NROW(in->i[5]) >= in->i[6]) {
+            d_moe_dec_group_glu_gemma((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                                      (const __nv_bfloat16*)TEN(4),
+                                      (const unsigned long long*)TEN(3), (const int*)TEN(6),
+                                      (const unsigned*)TEN(7), in->i[1], in->i[2], in->i[3],
+                                      in->i[4], in->fj[0].f, slice, nblk, PLOW_NROW(in->i[5]),
+                                      arena, (__nv_bfloat16*)TEN(5));
+            break;
+        }
+#endif
         d_moe_expert_glu_norm_gemma((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                                     (const __nv_bfloat16*)TEN(4),
                                     (const unsigned char*)TEN(2),

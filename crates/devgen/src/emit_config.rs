@@ -354,6 +354,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMMA_MOE_ROUTER_BLOCKS")]
     pub gemma_moe_router_blocks: Option<u32>,
 
+    /// Decode rungs with at least this many rows run the routed experts through the GROUPED
+    /// tensor-core GEMMs (the prefill bodies) instead of the per-slot GEMV walk. Unset = off.
+    /// Needs a decode object built with `PLOW_MOE_DEC_GROUP=1`.
+    #[arg(long, env = "PLOW_GEMMA_MOE_DEC_GROUP")]
+    pub gemma_moe_dec_group: Option<u32>,
+
     /// Exact MoeRouterGemmaScore op instead of ScoreFast.
     #[arg(long, env = "PLOW_GEMMA_MOE_ROUTER_EXACT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemma_moe_router_exact: bool,
@@ -1289,6 +1295,7 @@ impl EmitConfig {
             moe_prefill: env_str("PLOW_MOE_PREFILL"),
             gemma_moe_router_fused: env_bool("PLOW_GEMMA_MOE_ROUTER_FUSED"),
             gemma_moe_router_blocks: env_u32("PLOW_GEMMA_MOE_ROUTER_BLOCKS"),
+            gemma_moe_dec_group: env_u32("PLOW_GEMMA_MOE_DEC_GROUP"),
             gemma_moe_router_exact: env_bool("PLOW_GEMMA_MOE_ROUTER_EXACT"),
             gemma_moe_tail_fuse: env_bool("PLOW_GEMMA_MOE_TAIL_FUSE"),
             k3_full: env_bool_default_true("K3_FULL"),

@@ -5990,6 +5990,7 @@ fn emit_phase(
                 // Falls back to separate norm + GLU when fp8 (no fused fp8 variant yet).
                 let glu_cus: Vec<u32> = (0..n_cu).collect();
                 let down_cus: Vec<u32> = (0..n_cu).collect();
+                let mut moe_dec_group: Option<u32> = None;
                 let _glu_op = if fp8 {
                     DevOp::MoeExpertGluGemmaFp8
                 } else {
@@ -6061,9 +6062,34 @@ fn emit_phase(
                             },
                         )
                     } else {
+                        // GROUPED DECODE (PLOW_GEMMA_MOE_DEC_GROUP=min rows). A rung with >= min
+                        // rows sorts its B*k slots by expert and runs the routed experts through
+                        // the prefill grouped tensor-core GEMMs: each touched expert's weights
+                        // stream ONCE per step instead of once per slot-dot. The align op and the
+                        // extra operands ride EVERY rung (the decode-ladder validator compares op
+                        // lists and operands across rungs); below `min` the align returns at once
+                        // and GLU/down keep the per-slot walk. Needs the grouped-prefill scratch.
+                        let grp = emit_config::active()
+                            .gemma_moe_dec_group
+                            .filter(|_| n.moe_meta != TENSOR_NONE && n.moe_fug != TENSOR_NONE);
+                        let c_sel = match grp {
+                            Some(min) => b.emit(DevOp::MoeAlignGemmaPf, vec![0], &[c_rt], |d| {
+                                d.t[0] = n.moe_meta;
+                                d.t[1] = n.moe_tab;
+                                d.t[2] = n.moe_rowtok;
+                                d.t[3] = n.moe_rowpart;
+                                d.t[4] = n.moe_rowgate;
+                                d.i[0] = t;
+                                d.i[1] = c.n_exp;
+                                d.i[2] = c.top_k;
+                                d.i[3] = min;
+                            }),
+                            None => c_rt,
+                        };
+                        moe_dec_group = grp;
                         // bf16 path: fused norm + expert GLU (one fewer gate)
-                        b.emit(DevOp::MoeExpertGluNormGemma, glu_cus, &[c_rt, c_pf], |d| {
-                            d.t[0] = n.moe_mfu;
+                        b.emit(DevOp::MoeExpertGluNormGemma, glu_cus, &[c_sel, c_pf], |d| {
+                            d.t[0] = if grp.is_some() { n.moe_fug } else { n.moe_mfu };
                             d.t[1] = n.x;
                             d.t[2] = n.moe_tab;
                             d.t[3] = w.ewt;
@@ -6078,6 +6104,12 @@ fn emit_phase(
                             d.i[3] = c.n_exp;
                             d.i[5] = nb; // BATCH B (0 at B=1)
                             d.f[0] = c.eps;
+                            if let Some(min) = grp {
+                                d.t[6] = n.moe_meta;
+                                d.t[7] = n.moe_rowtok;
+                                d.i[4] = c.mlp_act;
+                                d.i[6] = min;
+                            }
                         })
                     };
                     let down_op = if fp8 {
@@ -6087,7 +6119,7 @@ fn emit_phase(
                     };
                     vec![b.emit(down_op, down_cus, &[c_glu], |d| {
                         d.t[0] = n.moe_part;
-                        d.t[1] = n.moe_mfu;
+                        d.t[1] = if moe_dec_group.is_some() { n.moe_fug } else { n.moe_mfu };
                         d.t[2] = n.moe_tab;
                         d.t[3] = w.ewt;
                         d.t[4] = w.est;
@@ -6096,6 +6128,12 @@ fn emit_phase(
                         d.i[2] = c.moe_inter;
                         d.i[3] = c.n_exp;
                         d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
+                        if let Some(min) = moe_dec_group {
+                            d.t[5] = n.moe_meta;
+                            d.t[6] = n.moe_rowpart;
+                            d.t[7] = n.moe_rowgate;
+                            d.i[6] = min;
+                        }
                     })]
                 };
                 // fused combine + rmsnorm + residual: saves 2 counter gates per layer.

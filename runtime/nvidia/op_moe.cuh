@@ -1950,6 +1950,26 @@ static __device__ void d_moe_expert_glu_norm_gemma_rb(
 }
 #endif /* PLOW_NV_GEMV_RB */
 
+#if PLOW_NV_GEMV_RB
+/* xn[row] = rmsnorm(resid[row]) * gamma into the packet's B*H bf16 scratch; every block writes
+ * all of it (identical values) before the barrier. */
+__device__ __forceinline__ void plow_moe_stage_xn(bf16* __restrict__ xn,
+                                                  const bf16* __restrict__ resid,
+                                                  const bf16* __restrict__ gamma, unsigned H,
+                                                  unsigned nrow, float eps) {
+    __shared__ float rms_red_b[32];
+    __shared__ float invs_b[PLOW_MOE_MAXB];
+    plow_moe_row_rms(invs_b, rms_red_b, resid, H, nrow, eps);
+    const unsigned tot = nrow * H;
+    for (unsigned i = threadIdx.x; i < tot; i += blockDim.x) {
+        const unsigned row = i / H;
+        xn[i] = __float2bfloat16(__bfloat162float(resid[i]) * invs_b[row] *
+                                 __bfloat162float(gamma[i - row * H]));
+    }
+    __syncthreads();
+}
+#endif
+
 /* ---- FUSED NORM + EXPERT GLU (PLOW_DOP_MOE_EXPERT_GLU_NORM_GEMMA) -----
  * Same as d_moe_expert_glu_gemma but takes the RAW residual + gamma and computes
  * RMS normalization inline, eliminating a separate RmsNorm packet + counter gate.
@@ -1979,16 +1999,7 @@ static __device__ void d_moe_expert_glu_norm_gemma(bf16* __restrict__ fu,
      * op, and concurrent writers store identical values. bf16 xn is what the dense GEMV arms
      * and vLLM feed their weights; outputs are numerically equivalent, not bit-equal. */
     if (xn_scratch != nullptr) {
-        __shared__ float rms_red_b[32];
-        __shared__ float invs_b[PLOW_MOE_MAXB];
-        plow_moe_row_rms(invs_b, rms_red_b, resid, H, nrow, eps);
-        const unsigned tot = nrow * H;
-        for (unsigned i = threadIdx.x; i < tot; i += blockDim.x) {
-            const unsigned row = i / H;
-            xn_scratch[i] = __float2bfloat16(__bfloat162float(resid[i]) * invs_b[row] *
-                                             __bfloat162float(gamma[i - row * H]));
-        }
-        __syncthreads();
+        plow_moe_stage_xn(xn_scratch, resid, gamma, H, nrow, eps);
         d_moe_expert_glu_gemma(fu, xn_scratch, table, ewt, k, I_moe, H, n_exp, slice, nblk, nrow);
         return;
     }
@@ -2257,6 +2268,9 @@ static __device__ void d_moe_align_gemma_pf(int* __restrict__ meta, const unsign
 /* ---- T-ROW COMBINE + SANDWICH (PLOW_DOP_MOE_COMBINE_NORM_GEMMA_PF) ----------------------
  * Block-per-token loop of d_moe_combine_norm_gemma. */
 /* 0 = scalar, 1 = float4 slot reads, 2 = + pre-issued slot loads and a vector pass 2. */
+#ifndef PLOW_MOE_DEC_GROUP
+#define PLOW_MOE_DEC_GROUP 0 /* decode object carries the grouped MoE arm (manifest-set) */
+#endif
 #ifndef PLOW_MOE_COMBINE_PF_V4
 #define PLOW_MOE_COMBINE_PF_V4 2
 #endif
@@ -2768,6 +2782,27 @@ static __device__ void d_moe_group_down_gemma_pf_w8a8(
 }
 #endif /* PLOW_NV_W8A8 */
 #endif /* PLOW_NV_HOPPER fork */
+
+#if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && PLOW_NV_GEMV_RB
+/* ---- GROUPED DECODE (PLOW_MOE_DEC_GROUP) -------------------------------------------------
+ * A wide decode rung routes its B*k slots to fewer experts than slots, and the per-slot walk
+ * streams an expert's weights once PER SLOT (66% of a B=16 step). From `min` rows up the align
+ * op has sorted the slots by expert and ops 71/63 run the prefill grouped GEMMs, so a touched
+ * expert streams once per step. `part` keeps the decode contract (gate-scaled, row
+ * token*k+slot): the combine does not change. */
+static __device__ void d_moe_dec_group_glu_gemma(bf16* __restrict__ fug, const bf16* __restrict__ resid,
+                                          const bf16* __restrict__ gamma,
+                                          const unsigned long long* __restrict__ ewt,
+                                          const int* __restrict__ meta,
+                                          const unsigned* __restrict__ row_token, unsigned I_moe,
+                                          unsigned H, unsigned n_exp, unsigned act, float eps,
+                                          unsigned slice, unsigned nblk, unsigned nrow,
+                                          float* __restrict__ arena, bf16* __restrict__ xn) {
+    plow_moe_stage_xn(xn, resid, gamma, H, nrow, eps);
+    d_moe_group_glu_gemma_pf(fug, xn, ewt, meta, row_token, I_moe, H, n_exp, act, slice, nblk,
+                             (bf16*)arena);
+}
+#endif
 #endif /* PGM_BM */
 
 #if PLOW_NV_MXFP4_MOE

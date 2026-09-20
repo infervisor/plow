@@ -34,6 +34,18 @@
 
 #include "sm90_wgmma.cuh"
 
+/* A decode object calls the grouped bodies OUT OF LINE: inlined, they grow the monolithic decode
+ * entry (stack 544 -> 784 B, 4x the spill loads) and every rung pays, the narrow ones for an arm
+ * they never run. The prefill objects keep them inline. */
+#ifndef MOE90_NOINLINE
+#define MOE90_NOINLINE (PLOW_MOE_DEC_GROUP && !PLOW_NV_PREFILL)
+#endif
+#if MOE90_NOINLINE
+#define MOE90_FN static __device__ __noinline__
+#else
+#define MOE90_FN static __device__
+#endif
+
 /* ---- tile geometry ---------------------------------------------------------------------- */
 #define MOE90_BM PGM_BM /* 128 — MUST equal the align op's tile height (meta contract) */
 #define MOE90_BN PGM_BN /* 128 — one wgmma n-block */
@@ -187,7 +199,7 @@ __device__ __forceinline__ int moe90_tile_rows(const int* meta, int n_exp, int e
 /* ==========================================================================================
  * GROUPED GATE/UP GEMM + GLU  (PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF)
  * ========================================================================================== */
-static __device__ void d_moe_group_glu_gemma_pf(__nv_bfloat16* __restrict__ fu,
+MOE90_FN void d_moe_group_glu_gemma_pf(__nv_bfloat16* __restrict__ fu,
                                                 const __nv_bfloat16* __restrict__ xn2,
                                                 const unsigned long long* __restrict__ ewt,
                                                 const int* __restrict__ meta,
@@ -319,7 +331,7 @@ static __device__ void d_moe_group_glu_gemma_pf(__nv_bfloat16* __restrict__ fu,
 /* ==========================================================================================
  * GROUPED DOWN GEMM + gate-scale + scatter  (PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF)
  * ========================================================================================== */
-static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
+MOE90_FN void d_moe_group_down_gemma_pf(float* __restrict__ part,
                                                  const __nv_bfloat16* __restrict__ fu,
                                                  const unsigned long long* __restrict__ ewt,
                                                  const int* __restrict__ meta,

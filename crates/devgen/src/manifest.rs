@@ -336,6 +336,10 @@ struct Shapes {
     decode_batch: u32,
     /// `I_moe` on the Gemma decode expert-down sites (`i[2]`); 0 when the packet has none.
     moe_down_inter: u32,
+    /// The decode program carries the grouped-MoE align op (`PLOW_GEMMA_MOE_DEC_GROUP`).
+    moe_dec_group: bool,
+    /// `K` (`i[2]`) of every dense decode GEMV site: the row kernels the decode object needs.
+    decode_gemv_k: BTreeSet<u32>,
     /// hd → "bf16" | "e4m3", from which flash opcode reads that hd.
     kv_dtype: BTreeMap<u32, &'static str>,
     /// Largest prefill bucket = the largest chunk the runtime can submit.
@@ -468,6 +472,14 @@ fn shapes(m: &Model) -> Shapes {
         for inst in &p.insts {
             let Some(op) = op_of(inst.op) else { continue };
             s.ops_present.insert(op_name(op));
+            if decode
+                && matches!(
+                    op,
+                    DevOp::Gemv | DevOp::GemvQkv | DevOp::GemvGlu | DevOp::GemvArgmax
+                )
+            {
+                s.decode_gemv_k.insert(inst.i[2]);
+            }
             match op {
                 DevOp::XReduce if inst.i[7] != 0 => s.xr_combine_fold = true,
                 DevOp::KdaStateStepG if inst.i[4] & 12 != 0 => {
@@ -654,6 +666,7 @@ fn shapes(m: &Model) -> Shapes {
                     s.moe_enc.insert(inst.i[6]);
                 }
                 DevOp::MoeExpertDownGemma if decode => s.moe_down_inter = inst.i[2],
+                DevOp::MoeAlignGemmaPf if decode => s.moe_dec_group = true,
                 // EVERY mxfp4 tile rung, not just the 256x256 one. This classifier decides
                 // `mxfp4_weights`, which decides which OBJECT the host loads
                 // (`scripts/gfx950_objects.py:150`). Before the prefill GEMM became
@@ -1003,6 +1016,24 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
     }
     if s.moe_down_inter > 0 && s.moe_down_inter % 32 == 0 {
         t.insert("moe_down_sg".into(), json!(8));
+    }
+    // The decode object compiles the grouped MoE arm (and claims its ring) only for a packet
+    // whose decode program asks for it.
+    if s.moe_dec_group {
+        t.insert("moe_dec_group".into(), json!(1));
+    }
+    // The decode entry is ONE function at the 255-register cap, so every kernel compiled into it
+    // taxes every rung. Measured on h100-sxm5 (step_bench ms at B=1/2/4/8/16):
+    // * `xreg_k`: the B=1 xreg kernels exist for ten K sizes and a packet uses two. Compiling only
+    //   its own: 26B 5.98/8.07/10.41/16.13/26.31 -> 5.66/8.01/10.31/15.94/25.94, 12B B=1 13.12 -> 12.60.
+    // * `gemv_mma_b1`: a DENSE packet also walks its B=1 GEMVs on the tensor cores, which drops the
+    //   classic B=1 kernels altogether: 12B 12.60/13.01/13.59 -> 11.93/12.60/13.16. The MoE 26B
+    //   keeps its xreg kernels (B=1 5.66 vs 6.10 on the walk: its dense GEMVs are small).
+    if !s.decode_gemv_k.is_empty() {
+        t.insert("xreg_k".into(), json!(s.decode_gemv_k.iter().collect::<Vec<_>>()));
+        if s.moe_down_inter == 0 && s.decode_batch >= 2 && s.decode_gemv_k.iter().all(|k| k % 32 == 0) {
+            t.insert("gemv_mma_b1".into(), json!(1));
+        }
     }
     if s.full_kv_heads == 1 && s.gqa > 0 {
         // The template is instantiated at 1|2|4|8 only.
@@ -2651,6 +2682,25 @@ pub fn config_header(manifest: &Value) -> String {
                 out.push_str(&format!(
                     "#ifndef PLOW_MOE_DOWN_SG\n#define PLOW_MOE_DOWN_SG {v}u\n#endif\n"
                 ));
+            }
+        }
+        if t.get("moe_dec_group").is_some() {
+            out.push_str("#ifndef PLOW_MOE_DEC_GROUP\n#define PLOW_MOE_DEC_GROUP 1\n#endif\n");
+        }
+        if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
+            if let Some(ks) = t.get("xreg_k").and_then(Value::as_array) {
+                let any = ks
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .map(|k| format!("(k) == {k}u"))
+                    .collect::<Vec<_>>()
+                    .join(" || ");
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_XREG_K\n#define PLOW_NV_XREG_K(k) ({any})\n#endif\n"
+                ));
+            }
+            if t.get("gemv_mma_b1").is_some() {
+                out.push_str("#ifndef PLOW_NV_GEMV_MMA_B1\n#define PLOW_NV_GEMV_MMA_B1 1\n#endif\n");
             }
         }
     }
