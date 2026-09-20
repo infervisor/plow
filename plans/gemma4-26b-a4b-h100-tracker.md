@@ -1245,15 +1245,47 @@ tile-times while half the blocks idle in the second), FlashDecode 15%, router sc
 dense GEMVs 12%.
 
 **Next levers, in measured order:**
-1. **Batched FlashDecode at long context.** C16 TPOT grows 19 -> 71 ms from 128 -> 15000 in
-   while B=1 grows 5.95 -> 6.35: per row per 1k context the batched body costs ~8x the B=1
-   one (0.22 vs 0.027 ms), and 983 MB of KV per full layer at 3.35 TB/s is 0.3 ms, not 10.
-   Owns every 8192/15000 cell at C4/C16 (vLLM: 34.8 ms at 15000/C16).
+1. ~~Batched FlashDecode at long context~~ — **WRONG, corrected the same night.** step_bench at
+   B=16 goes 17.97 -> 20.28 ms from a 1k to an 8k context; decode attention is not the long-context
+   cost. The served TPOT growth (19 -> 45 -> 71 ms at 128 / 8192 / 15000 in, C16) is PREFILL
+   STALL: tick timeline at 8192/C16 = 13.9 s of prefill passes vs 8.7 s of decode launches; a
+   16-row decode tick is 43.3 ms per 2 steps = 21.6 ms/step, the rest of the 43.5 ms TPOT is
+   other streams' 4096-row chunks (~140 ms each, ~15 of them inside one request's 128 tokens).
+   Long-context serving is a prefill-throughput and interleaving problem.
 2. Router score at wide rungs (11% = 2.0 ms at B=16): 1408 serial load+FMA per lane per row;
    spread a row's 128 experts over blocks.
 3. GLU tile balance (range-partition the channels so every block streams the same bytes).
 4. Per-rung decode objects under multistep (B=1 and B>=2 want different objects: 0.3–0.7 ms).
 5. C32: chunk-local KV scratch so the per-slot sliding ring is the window only.
+
+### step_bench was feeding every slot the same prompt (fixed) + the per-row RMS barriers
+
+* **Harness.** `step_bench` prefilled all B slots with ONE prompt, so every row routed to the same 8
+  experts: B>1 numbers for this MoE model were optimistic for both the per-slot walk and the grouped
+  path, and the grouped GLU showed "a few busy blocks, the rest parked at the next gate". Each slot
+  now gets its own prompt (slot 0 unchanged). Numbers above this line at B>1 are the old harness.
+* **Per-row RMS.** `plow_moe_row_rms` cost 11 dependent 2-byte loads and TWO thread barriers per
+  row, and every block of the router-score and expert-GLU ops ran it for all B rows; the GLU's xn
+  staging was 176 scalar load/store rounds per thread. For B>1 the rows now share one barrier pair
+  with 16 B loads, staging moves 8 elements per load/store (same per-element product), and the
+  batched router-score pair loop is vectorized (that part alone: 17.95 -> 17.80). B=1 keeps the
+  scalar RMS and its bit-identity.
+
+step_bench ms/step, ctx 1024, DISTINCT prompts per slot:
+
+| 26B | B=1 | B=2 | B=4 | B=8 | B=16 |
+|---|---:|---:|---:|---:|---:|
+| `p26k` (start of the night) | 6.01 | 8.37 | 11.16 | 16.69 | 28.05 |
+| `p26j` grouped + lean entry | 5.91 | 8.44 | 10.71 | 14.85 | 19.19 |
+| + batched RMS / 8-wide staging / vector router score | **5.83** | **8.00** | **10.06** | **13.31** | **15.89** |
+
+B=16 at 19.19 reproduces the served C16 TPOT (19.06), so this harness is now the right proxy.
+Traced B=16 step at 15.9 ms: MoE GLU 22% + 12% waiting on it, MoE down 10%, FlashDecode 16%,
+dense GEMVs 24%, router 5%. By bytes (~60 experts x 11.9 MB x 30 layers = 21 GB at 3.35 TB/s =
+6.4 ms) the MoE part (6.9 ms) is near its roof; vLLM's 8.9 ms is ~90% of the whole step's roof.
+What is left is spread thin: attention 2.4x and the dense GEMVs ~4x off their own roofs.
+Decode attention in-flight depth (`PLOW_NV_FA_WPR_RB` 2 -> 8, V rows x4): 20.28 -> 19.34 at
+B=16 / 8k context, B=1 +0.1 — not landed yet.
 
 ## Status
 

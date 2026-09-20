@@ -934,6 +934,26 @@ step_bench ms/step, ctx 1024 (production `p12q` object -> each step):
 | + xreg K set (classic B=1) | 12.60 | 13.01 | 13.59 | – | – |
 | + dense B=1 on the walk (`gemv_mma_b1`) | **11.93** | **12.60** | **13.16** | **14.35** | **16.03** |
 
+### 12B ladder on the final packet `p12s` (2026-09-20, late)
+
+Same ladder, packet rebuilt with the decode-object fixes (manifest: `gemv_mma_b1`, `xreg_k`):
+
+| cell | TPOT before -> after (vLLM) | tok/s before -> after (vLLM) | TTFT after (vLLM) |
+|---|---:|---:|---:|
+| 128/C1 | 14.38 -> **11.75** (10.55) | 69 -> 85 (95) | **18.6** (28.2) |
+| 4096/C1 | 14.78 -> 12.10 (10.64) | 62 -> 74 (94) | 187 (170) |
+| 15000/C1 | 15.32 -> 12.58 (10.62) | 46 -> 52 (63) | 865 (675) |
+| 128/C4 | 14.79 -> 12.17 (10.58) | 266 -> 322 (367) | **40.2** (52.2) |
+| 4096/C4 | 19.46 -> 16.66 (12.16) | 181 -> 207 (254) | **360** (468) |
+| 128/C16 | 20.49 -> **13.46** (11.01) | 713 -> **1075** (1364) | 136 (101) |
+| 1024/C16 | 26.46 -> 19.47 (13.76) | 542 -> 720 (940) | **347** (424) |
+| 4096/C16 | 42.98 -> 36.09 (21.94) | 330 -> 384 (499) | **702** (1300) |
+| 15000/C16 | 105.7 -> 100.0 (61.80) | 118 -> 124 (172) | **3528** (3948) |
+
+Ahead on 12 of 60 metric-cells (was 10). TPOT is 1.11–1.18x vLLM at C1 (was 1.36–1.44x),
+1.15–1.52x at C4, 1.22–1.64x at C16; tok/s 1.12–1.39x through C16 (was 1.4–1.9x). The long-input
+C16 TPOT is prefill stall, not decode (26B tracker, tick timeline): a 4096-row chunk is ~186 ms here.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
