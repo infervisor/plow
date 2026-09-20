@@ -141,7 +141,9 @@ serve_env = { PLOW_MULTISTEP = "4", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEA
 in_lens = "1024 4096"
 concs = "16 32"
 nprompt = 64
-serve_env = { PLOW_MULTISTEP = "8", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
+# MULTISTEP 2, not 8: measured at C16 (64 prompts) 1024-token TTFT 375 -> 249 ms, p99 ITL 228 ->
+# 106 ms, tok/s 464 -> 488; 4096-token cells are unchanged (the CUDA quantum is already 1 above B=8).
+serve_env = { PLOW_MULTISTEP = "2", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
 
 [reference]
 csv = "perf-data/campaign/gemma4-26b-a4b.h100.reference-vllm028-bf16.csv"

@@ -79,6 +79,22 @@ mod packlog {
     static DECODE_ROWS: AtomicU64 = AtomicU64::new(0);
     static TICKS: AtomicU64 = AtomicU64::new(0);
 
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    /// One line per mux tick: when it ended, what its prefill pass and decode launch cost, and
+    /// how many rows decoded. The cumulative summary below hides WHICH ticks carried prefill.
+    pub(crate) fn tick(prefill_ns: u64, decode_ns: u64, did_prefill: bool, rows: usize) {
+        let t = START.get_or_init(std::time::Instant::now).elapsed();
+        eprintln!(
+            "PACKLOG TICK t_ms={:.1} prefill_ms={:.2} decode_ms={:.2} did_prefill={} decode_rows={}",
+            t.as_secs_f64() * 1e3,
+            prefill_ns as f64 / 1e6,
+            decode_ns as f64 / 1e6,
+            did_prefill as u8,
+            rows
+        );
+    }
+
     /// Whether pack-log is active (`--pf-packlog` / `PLOW_PF_PACKLOG=1`).
     /// Reads from `RuntimeConfig::get()` — one atomic load, hot-path safe.
     pub(crate) fn on() -> bool {
@@ -2272,9 +2288,11 @@ fn run_one_tick(
             obs.host.slot_tokens = toks;
         }
             if let Some(dt) = dec_t {
+                let decode_ns = dt.elapsed().as_nanos() as u64;
+                packlog::tick(pack_prefill_ns, decode_ns, did_prefill, feeds.len());
                 packlog::record(
                     pack_prefill_ns,
-                    dt.elapsed().as_nanos() as u64,
+                    decode_ns,
                     did_prefill,
                     pack_had_feeds,
                     feeds.len(),

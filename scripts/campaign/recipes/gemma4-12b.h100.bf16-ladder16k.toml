@@ -1,0 +1,97 @@
+# Gemma-4-12B-it, H100 SXM5, BF16 weights + BF16 KV, TP1:
+# Realtime campaign recipe targeting C1 and C4 across in128, in1024, in4096.
+# - Fast Prefill: cuBLASLt gate/up + Lt GEMMs, fatlite light ops, WGMMA BQ64/BKV32 hd512, GQA2 paired hd256.
+# - Fast Decode: Full ladder (1, 2, 4, 8, 16) with tensor-core GEMV MMA and split-K for B>=4.
+# - Grid-aligned global attention decode: PLOW_ATTENTION_DECODE_BALANCE_GF = 4 -> ns=33 on H100 (132 SMs).
+
+[cell]
+name = "gemma4-12b.h100.bf16-ladder16k"
+model = "google/gemma-4-12B-it"
+revision = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+hf_dir = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "bf16"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_SEG_PURE_GEMM = "1"
+PLOW_SEG_FA512 = "1"
+PLOW_SEG_FA256_GQA2 = "1"
+PLOW_TMA_GEMM = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+PLOW_SLIDING_NS_CAP = "1"
+PLOW_MAX_CHUNK = "4096"
+PLOW_PF_LADDER_APPEND = "4224"
+PLOW_FUSE_ARGMAX = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = [
+  "interp_sm90a_pfattn_hd512_px4_bq64.cubin",
+  "interp_sm90a_pfattn_hd512.cubin",
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+  "interp_sm90a_pfgemm_glu_gemma4.cubin",
+]
+[objects.env]
+PLOW_BUILD_FATLITE = "1"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
+PLOW_BUILD_MASKED_PADDING = "1"
+PLOW_BUILD_PFATTN_WG = "1"
+PLOW_BUILD_PFATTN_KV16 = "0"
+PLOW_BUILD_PFATTN_KV64 = "0"
+PLOW_BUILD_PFATTN_QK_UNROLL = "4"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "0"
+PLOW_PF_SEG_PURE = "1"
+PLOW_PF_SEG_FA512 = "1"
+PLOW_PF_INTERLEAVE = "0"
+PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
+LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096 8192"
+concs = "1 4 8"
+nprompt = 10
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+model_id = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer in one short sentence.<end_of_turn>\n<start_of_turn>model\n"
+
+# The common ladder both Gemma-4 campaigns run (26B: gemma4-26b-a4b.h100.bf16-ctx16k.toml). The
+# realtime recipe's MAX_CHUNK=16384 / 32-slot ladder needs 110 GiB on this 80 GiB card (sliding ring
+# = next_pow2(window + chunk - 1) rows per slot); chunk 4096 and 16 slots is the shape that fits at
+# a 16k context. C32 cells therefore queue on 16 slots.
+[bench.profiles.realtime]
+in_lens = "128 1024 4096 8192 15000"
+concs = "1 4"
+nprompt = 32
+serve_env = { PLOW_MULTISTEP = "4", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0" }
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096 8192 15000"
+concs = "16 32"
+nprompt = 64
+serve_env = { PLOW_MULTISTEP = "8", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
+
+[reference]
+csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.csv"
