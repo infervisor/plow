@@ -417,13 +417,15 @@ extra_json() {
 # $1 defines, $2 "" | "abl"  -> echoes dir
 build_cubin() {
   local defs="$1" kind="${2:-}"
+  # The mask must be IN the key. It used to be appended after the hash, so every ablation
+  # mask shared one twin and a second op silently re-measured the first one's object.
+  if [ "$kind" = "abl" ]; then
+    defs="$defs -DPLOW_NV_ABLATE_LO=${ABLATE_LO}ull -DPLOW_NV_ABLATE_HI=${ABLATE_HI}ull"
+  fi
   local key; key="$(printf '%s|%s|%s' "$defs" "$kind" "$IMPL" | sha256sum | cut -c1-16)"
   local dir="$WORK/cubin/$key"
   if [ -f "$dir/$CUBIN" ] && [ -f "$dir/$CUBIN_PF" ]; then
     echo "$dir"; return 0
-  fi
-  if [ "$kind" = "abl" ]; then
-    defs="$defs -DPLOW_NV_ABLATE_LO=${ABLATE_LO}ull -DPLOW_NV_ABLATE_HI=${ABLATE_HI}ull"
   fi
   mkdir -p "$dir"
   printf '%s\n' "$defs" > "$dir/defines"

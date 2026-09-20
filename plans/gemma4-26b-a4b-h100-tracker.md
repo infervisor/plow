@@ -746,6 +746,39 @@ TPOT, `--ablate-lo` twins for per-op decode cost, `--block L` for single-layer p
 lever: 26B B=1 5.52 ms at 132 blocks vs 4.77 at 264 (2 blocks/SM). Stage A on this board:
 occ {1:132, 2:264} x batch {1,4,16}, bf16. Needs ripgrep on PATH (nix shell nixpkgs#ripgrep).
 
+## Measured decode tune on THIS board (tune_decode_sweep.sh -> tunedb-decode), 2026-09-20
+
+Setup that was missing here: ripgrep (nix shell nixpkgs#ripgrep), LD_LIBRARY_PATH=
+/usr/local/cuda/lib64 for step_bench's libcublasLt, `--base-defines` takes the full -D form.
+step_bench TPOT, bf16, ctx 1024, 5 reps, <=0.4% spread, vram_before 0 MiB:
+
+  occ (FORCE_MINBLK:n_cu)   knobs            B=1     B=4      B=16
+  1:132                     un8              5.922   14.069   34.193
+  2:264 (MOE90_HALF=0)      un8              6.866   16.129   34.602
+  2:264 (MOE90_HALF=0)      un4 glu2         6.720   -        36.306
+OCC-2 LOSES on this board in bf16 (it won 14% in the fp8/h100-nvl records) -> 132 stays. Note
+occ-2 cannot even load with MOE90_HALF: the pf object must share the decode grid and its arena
+(165 KB) no longer fits 2/SM of the 232 KB opt-in; irrelevant while occ-1 wins.
+Served vs pure: C1 6.47 vs 5.92 (0.55 ms serving loop); C16 50.5 vs 34.2 (16 ms is serving
+interference — prefill interleave / admission — not kernels).
+Rows are in tuning/nvidia/sm_90a/h100-sxm5 as PROVISIONAL ("correctness not checked");
+qualify with gpu_lifecycle on the winning asset dir, then ingest --correctness pass.
+
+TUNER BUG FIXED: build_cubin hashed the cache key BEFORE appending the ablation mask, so every
+mask shared one twin — 13 ops all "cost" 0.044 ms (HeadNormRope's). Mask is now in the key.
+
+PER-OP DECODE COST, ablation twins, B=1 (clean; sums to 87% of 5.917 ms):
+  Gemv (o_proj + dense down, 60 ops) 1.346 22.7% | MoeExpertGluNorm 1.002 16.9%
+  MoeExpertDown 0.657 11.1% | GemvQkv 0.585 9.9% | FlashDecode 0.476 8.0%
+  NormResidualNorm 0.323 5.5% | MoeCombineNorm 0.263 4.4% | GemvGlu 0.190 3.2%
+  FlashMerge 0.135 | MoeScoreFast 0.122 | HeadNormRope 0.039 | MoeTopk 0.028 | GemvArgmax ~0
+  -> the plain dense GEMV arm is the top cost: ~22 us/op for 12-23 MB while the fused GemvGlu
+     arm moves 24 MB in ~6 us (3.5x). MoE total is 2.07 ms (35%).
+B=16 rows are CONFOUNDED except for ops whose output no router reads before their cost is
+paid: skipping a body feeds garbage downstream and moves the expert union (negative "costs").
+Clean: MoeExpertGluNorm = 19.7 ms of the 34.2 ms step (58%) — the batch-serving target;
+FlashDecode 3.4 ms. CSV: perf-data/campaign/gemma4-26b-a4b.h100.bf16-decode-ablation.csv
+
 ## Status
 
 | step | state |
