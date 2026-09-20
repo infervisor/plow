@@ -992,6 +992,10 @@ Three more TTFT cells flip (128/C16, 128/C32, 1024/C32). At 4096 the 16-slot chu
 keeps the better throughput (1024-row chunks, no attention roles). With the serving packet
 chosen by input length (32-slot for <= 1024): **14 of 60 metric-cells ahead**.
 
+Negatives on `p12u` (2026-09-20): walk depth 10 / 15 (B=1 11.58 / 11.70 vs 11.18 at 12);
+`PLOW_MULTISTEP` 4 / 8 / 16 at C1 (TPOT 10.96 / 10.95 / 10.94, p99 ITL 44 / 88 / 175 ms) — the host
+is already out of the C1 step.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
