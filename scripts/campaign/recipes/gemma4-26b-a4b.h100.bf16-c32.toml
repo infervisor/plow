@@ -71,11 +71,10 @@ script = "scripts/build_sm90a_gemma4_segments.sh"
 # Full-attention and sliding layers both fall back to the in-megakernel bodies here.
 role_files = []
 [objects.env]
-# MUST stay 0 for a MoE model: PLOW_NV_FATLITE compiles the Gemma MoE PREFILL opcodes
-# out of the fat object, and they are already absent from the GEMM (SEG_GEMM) and
-# attention (FA_ONLY) objects — leaving no object that implements them. See the
-# realtime recipe and interp_sm120.cu's `#if !PLOW_NV_SEG_GEMM && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE`.
-PLOW_BUILD_FATLITE = "0"
+# Stripped fat object that KEEPS the Gemma MoE prefill opcodes (plain FATLITE=1 compiles them
+# out and no other object implements them). See the realtime recipe.
+PLOW_BUILD_FATLITE = "1"
+PLOW_BUILD_FATLITE_MOE = "1"
 PLOW_BUILD_FA_GQA2_PAIR = "1"
 PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"

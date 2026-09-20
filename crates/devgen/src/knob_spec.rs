@@ -1419,6 +1419,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_FA512_QK_HALVES", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_FA512_WG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_FATLITE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_FATLITE_MOE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_FA_CORRSKIP", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_FA_CTA_SNAKE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_FA_FP8ABL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

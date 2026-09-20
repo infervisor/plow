@@ -673,6 +673,17 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #ifndef PLOW_NV_FATLITE
 #define PLOW_NV_FATLITE 0
 #endif
+/* FATLITE_MOE: FATLITE's stripping for a Gemma MoE packet. The grouped-MoE prefill bodies stay
+ * in (they have no other home) and need their 128 accumulators, so the entry keeps occ-1 and the
+ * full register budget. What goes is the native GEMM / GLU / flash arms the fat object never runs
+ * once Lt, the GEMM object and the FA objects own them: the 255-reg fat build spills (1.9 KB of
+ * stack) and a body added to it slows its neighbours — n256 DOWN doubled GLU's in-situ body. */
+#ifndef PLOW_NV_FATLITE_MOE
+#define PLOW_NV_FATLITE_MOE 0
+#endif
+#if PLOW_NV_FATLITE_MOE && !PLOW_NV_FATLITE
+#error "PLOW_NV_FATLITE_MOE is a flavor of PLOW_NV_FATLITE"
+#endif
 #if PLOW_NV_FATLITE && (PLOW_NV_SEG_GEMM || PLOW_NV_FA_ONLY || !PLOW_NV_SEGMENTS)
 #error "PLOW_NV_FATLITE is a build of the fat segmented object (SEGMENTS=1, not SEG_GEMM/FA_ONLY)"
 #endif
@@ -719,7 +730,7 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
  * PLOW_NV_SEG_OCC1 (T20): same exemption for the bf16 lean object — its uniform TMA body
  * spills at the 128-reg cap (the measured 30% loss); occ-1 at 255 regs is the healthy shape. */
 #define PLOW_NV_MINBLK 1
-#elif PLOW_NV_SEG_GEMM || PLOW_NV_FATLITE
+#elif PLOW_NV_SEG_GEMM || (PLOW_NV_FATLITE && !PLOW_NV_FATLITE_MOE)
 #define PLOW_NV_MINBLK 2
 #else
 #define PLOW_NV_MINBLK 1
@@ -1339,7 +1350,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * DEAD in a dense (12B/31B) GEMM segment; compiled OUT of the lean occ-2 object to relieve
      * register pressure toward 0 spill. A 26B MoE program would run its expert GEMV/GLU segments on
      * the occ-1 _pfseg object instead. Case gating only — op_moe.cuh (T9a) is untouched. */
-#if !PLOW_NV_SEG_GEMM && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE
+#if !PLOW_NV_SEG_GEMM && !PLOW_NV_FA_ONLY && (!PLOW_NV_FATLITE || PLOW_NV_FATLITE_MOE)
     case PLOW_DOP_MOE_ROUTER_GEMMA_PF:
         d_moe_router_gemma_pf((unsigned char*)TEN(0), (const __nv_bfloat16*)TEN(1),
                               (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
@@ -2865,7 +2876,8 @@ extern "C" __device__ unsigned plow_fp8_m1_arm = 0;
 __global__ __maxnreg__(160) void PLOW_SYM(interp_sm120)(PlowProgram prog) {
 #elif PLOW_NV_SEG_M64N64 || PLOW_NV_SEG_M64N128
 __global__ __maxnreg__(128) void PLOW_SYM(interp_sm120)(PlowProgram prog) {
-#elif (PLOW_NV_SEG_GEMM && !PGM90_UNI_BN256 && !PLOW_NV_SEG_OCC1) || PLOW_NV_FATLITE
+#elif (PLOW_NV_SEG_GEMM && !PGM90_UNI_BN256 && !PLOW_NV_SEG_OCC1) ||                               \
+    (PLOW_NV_FATLITE && !PLOW_NV_FATLITE_MOE)
 /* The lean object's warp-spec GEMM uses in-body setmaxnreg; every probe that got the
  * donation to WORK used the __maxnreg__ attribute (experiments/README.md: launch_bounds
  * alone makes ptxas treat the entry cap differently). 128 = the occ-2 entry.

@@ -40,6 +40,11 @@ if [ "${PLOW_BUILD_W8A8:-0}" = 1 ] ||
     -DPGM90_FP8_PROMOTE="${PLOW_W8A8_PROMOTE:-1}"
   )
 fi
+# Raw extra nvcc flags for every segment object: the A/B arm of a kernel default on a block packet.
+if [ -n "${PLOW_BUILD_SEG_EXTRA_DEFINES:-}" ]; then
+  read -r -a gemma_extra_flags <<<"$PLOW_BUILD_SEG_EXTRA_DEFINES"
+  gemma_flags+=("${gemma_extra_flags[@]}")
+fi
 for gemma_packed in 0 1; do
   gemma_prefix=pf
   if [ "$gemma_packed" = 1 ]; then gemma_prefix=pfpacked; fi
@@ -72,7 +77,8 @@ for gemma_packed in 0 1; do
   if [ "$gemma_packed" = 1 ] && { [ -n "${PLOW_CUBIN_CONFIG:-}" ] || [ "${PLOW_BUILD_FATLITE:-0}" = 1 ] || [ "${PLOW_BUILD_MASKED_PADDING:-0}" = 1 ]; }; then
     env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
       "${gemma_flags[@]}" "${gemma_config_flags[@]}" "${gemma_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST=1 \
-      -DPLOW_NV_FATLITE="${PLOW_BUILD_FATLITE:-0}" -DPGM90_TMA_STAGES=3 \
+      -DPLOW_NV_FATLITE="${PLOW_BUILD_FATLITE:-0}" \
+      -DPLOW_NV_FATLITE_MOE="${PLOW_BUILD_FATLITE_MOE:-0}" -DPGM90_TMA_STAGES=3 \
       -o "$gemma_out/interp_sm90a_pfpackedseg.cubin" runtime/nvidia/interp_sm90a.cu
   fi
 done

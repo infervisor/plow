@@ -962,6 +962,44 @@ routing — earlier "real routing" labels in this file mean dist 3. On dist 4:
     (cublasGemmGroupedBatchedEx takes host size arrays; plowrt binds neither libcublas nor the Lt
     batch attributes) or a CUTLASS dependency. NOT the 1k gap.
 
+## HARNESS WINS DID NOT CARRY: the fat prefill object was the problem (2026-09-20)
+
+Served packet with router spread + float4 combine + n256 DOWN REGRESSED (TTFT 128/C1 31.67 -> 33.79,
+1024/C1 66.80 -> 68.71, 4096/C1 174.71 -> 192.26) although every change won in the harness.
+
+HOW IT WAS FOUND (keep this method):
+  * Blocks are a faithful in-situ proxy: `block_run check --in <real embeddings>.npy` with
+    PLOW_PF_SEG_TIME=1 reproduced the served MoE segment EXACTLY (3.37 ms/layer, hot-expert 4k).
+    Inputs: rtin/embed_rand_{1024,4096}.npy (random ids x sqrt(H)), embed_same_4096.npy (one row
+    repeated = the " hello"*N prompt: 8 experts x 4096 rows).
+  * New `PLOW_BUILD_SEG_EXTRA_DEFINES` (segments script) = A/B arms of a kernel default per block
+    recipe; five blocks build in parallel in ~10 min. `PLOW_BUILD_SEG_EXTRA_DEFINES=-DPLOW_NV_TRACE=1`
+    + PLOW_PF_TRACE_LOG=1 gives block 0's per-opcode gate/body cycles IN SITU.
+  * PLOW_SEG_PER_OP is NOT usable for this: it also segments the decode programs and the CUDA
+    runtime rejects them.
+BISECT, MoE segment ms/layer (rand-1k / rand-4k / hot-4k):
+  fat object, all old                1.660 / 3.698 / 3.356
+  fat, all new                       1.731 / 4.286 / 3.801
+  fat, router reverted               2.026 / 4.661 / 4.153   -> router spread is a real win (-0.3..-0.4)
+  fat, n256 DOWN reverted            1.276 / 3.281 / 2.927   -> n256 is a big in-situ LOSS
+  fat, float4 combine reverted       1.731 / 4.311 / 3.841   -> float4 is a small win
+TRACE: with n256 compiled in, GLU's body on block 0 DOUBLED (1851 -> 3614 kcyc) while DOWN's own
+body improved (1674 -> 1340). GLU runs before DOWN ever executes, so it is CODEGEN: the fat
+`pfpackedseg` object sits at the 255-register cap with 1.9 KB of spill stack, and a body added to it
+degrades its neighbours. (The C7519 "wgmma.mma_async serialized" warning is the ROUTER's alone —
+present before this work, GLU-only / DOWN-only objects assemble clean; __noinline__ changes nothing.)
+The harness kernels are lean (163-194 registers, no spills), which is why the harness lied: in situ
+the MoE stages ran 0.6-0.7 ms/layer above their harness sum at 4k.
+
+FIX — PLOW_NV_FATLITE_MOE (recipe: PLOW_BUILD_FATLITE=1 + PLOW_BUILD_FATLITE_MOE=1): FATLITE's
+stripping (native GEMM / GLU / flash arms the fat object never runs once Lt, the GEMM object and
+the FA objects own them) but the Gemma MoE prefill opcodes stay in, at occ-1 with the full
+register budget. 0 bytes of spill stack. Block outputs BIT-IDENTICAL to the unstripped object.
+  stripped, n128 DOWN                1.004 / 2.541 / 2.253
+  stripped, n256 DOWN                0.964 / 2.381 / 2.133   -> n256 wins again; in situ == harness sum
+= -0.70 ms/layer at 1k and -1.3 ms/layer at 4k against the original packet.
+RULE: a harness win is a hypothesis. Confirm on a block with real inputs before a served build.
+
 ## Status
 
 | step | state |
