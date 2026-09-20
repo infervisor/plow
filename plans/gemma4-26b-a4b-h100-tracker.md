@@ -1287,38 +1287,54 @@ What is left is spread thin: attention 2.4x and the dense GEMVs ~4x off their ow
 Decode attention in-flight depth (`PLOW_NV_FA_WPR_RB` 2 -> 8, V rows x4): 20.28 -> 19.34 at
 B=16 / 8k context, B=1 +0.1 — not landed yet.
 
+### Final ladder of the night, packet `p26l` (2026-09-20)
+
+| cell | TTFT plow / vLLM | TPOT start -> now / vLLM | tok/s start -> now / vLLM |
+|---|---:|---:|---:|
+| 128/C1 | **23.1** / 39.5 | 5.88 -> 5.66 / 5.03 | 166 -> 173 / 189 |
+| 1024/C1 | **43.0** / 44.1 | 6.01 -> 5.80 / 5.08 | 159 -> 164 / 186 |
+| 4096/C1 | 120.8 / 93.7 | 6.08 -> 5.86 / 5.09 | 143 -> 148 / 173 |
+| 15000/C1 | 534 / 360 | 6.29 -> 6.06 / 5.04 | 96 -> 98 / 128 |
+| 128/C4 | **38.7** / 73.3 | 10.73 -> 9.66 / 7.24 | 365 -> 405 / 516 |
+| 4096/C4 | 234 / 228 | 13.49 -> 12.44 / 7.92 | 262 -> 282 / 415 |
+| 128/C16 | **90** / 413 | 26.74 -> **15.52** / 8.93 | 570 -> **981** / 1322 |
+| 1024/C16 | **187** / 215 | 30.49 -> **19.18** / 9.97 | 494 -> **772** / 1380 |
+| 4096/C16 | **469** / 525 | 39.44 -> 28.34 / 14.03 | 369 -> 499 / 885 |
+| 15000/C16 | 2442 / 1570 | 75.52 -> 67.96 / 34.84 | 164 -> 180 / 340 |
+| 128/C32 (16 slots) | 1622 / 130 | 26.80 -> 15.17 / 11.12 | 585 -> 1012 / 2648 |
+
+Ahead on 6 of 60 metric-cells (the TTFT cells in bold). Gaps: C1 TPOT 1.13–1.20x (was
+1.17–1.25x), C4 1.33–1.78x (1.48–1.88x), C16 TPOT 1.74–2.02x (2.17–3.06x), C16 tok/s
+1.35–1.89x (1.99–2.79x), C32 tok/s 2.0–2.6x (2.2–4.5x).
+
+Serving A/B, negative: `PLOW_PF_INTERLEAVE=2048` (cap the mixed tick) vs 0 at C16 — 1024 in:
+TPOT 21.80 -> 22.23, 667 -> 648 tok/s; 8192 in: TPOT 44.12 -> 49.56, 298 -> 260 tok/s; only p99
+ITL improves (150 -> 100 ms). Smaller chunks prefill less efficiently; stay uncapped.
+
 ## Status
 
 | step | state |
 |---|---|
-| Kernel-dims audit | **done** |
-| 26B serves on H100 | **done** — both root causes fixed |
-| vLLM 26B reference ladder | **done** (8 cells) |
-| Plow 26B rung ladder | **done** (6 cells; 8K rung blocked by max_ctx, now fixed to 8704, needs rebuild) |
-| cuBLASLt probe + A/B | probe done (40 entries); A/B in flight |
-| Beat vLLM | **PARTIAL** — TTFT wins at 128/C1 (31.9 vs 39.5) and 128/C4 (56.7 vs 73.3); C1 TPOT 1.3x, TTFT >=1024 1.5-2.1x, C4 TPOT 1.6-2.0x, serving tok/s 3.7-4.9x behind |
-| plowc/plowrt release build | done |
-| Emit + objects + role emit | **done** (`045a38e3`) |
-| Roofline model corrected + validated on 12B | **done** |
-| vLLM 26B reference harness | **done** (`91fd8c51`) |
-| vLLM 26B reference ladder | **partly measured** (128, 1024; 4096/8192 running) |
-| Isolated grouped-MoE repro | **done, passes** (`91fd8c51`) |
-| **Plow 26B serving** | **BLOCKED — prefill faults, see above** |
-| Rung ladder 128/1024/4096/8192 | blocked on the fault |
-| Roofline compare + kernel push | blocked |
-| High concurrency / throughput | blocked |
+| 26B + 12B serve on H100 from the merged tree | **done** (12B needed the chunk-4096 recipe, the NO_GLU_FUSE fix, NRN fold off) |
+| vLLM 0.28 reference ladder, both models | **done** — in 128..15000 x C1/4/16/32 |
+| Common ladder, both models | **done** — ledgers `*-ctx16k.csv`, `*-ladder16k.csv`; `ladder_compare.py` |
+| Beat vLLM, 26B | **PARTIAL 6/60** — TTFT at 128 and 1024 (C1), 128 (C4), 128/1024/4096 (C16) |
+| Beat vLLM, 12B | **PARTIAL 12/60** — TTFT at 128 (C1/C4), 4096..15000 (C4), 1024..15000 (C16) |
+| Decode batch scaling | B=16 step 28.05 -> 15.88 ms (26B), 23.35 -> 16.05 (12B); still 1.7–2.0x vLLM at C16 |
+| C32 | queues on 16 slots (sliding ring = pow2(window + chunk - 1) rows per slot) — not started |
 
 ## Next actions, in order
 
-1. Root-cause the prefill fault: `disasm --stream` wait/bump counts for inst 19/20
-   of program T=128. This is the whole critical path — no plow number exists until
-   it is fixed.
-2. Finish the vLLM reference ladder at 4096 and 8192, and add C16/C32 for the
-   serving cells.
-3. Only then: rung ladder, roofline attribution (`PLOW_PF_SEG_TIME=1`, attribution
-   only), and the kernel work the dims audit already identified
-   (hd512 px4 GQA-8 variant, `PLOW_NV_FA_GF_FULL=8`, `PLOW_NV_FA_TC_GQA8_HD512`,
-   tensor-core MoE decode GLU for high concurrency).
+1. **Prefill chunk time at 4096 rows** (26B ~120–140 ms, 12B ~186 ms; vLLM ~90 / ~170 per 4k).
+   It owns TTFT at >= 4096 (1.3–1.5x) AND the long-input TPOT at C4/C16, which is prefill
+   stall: decode rows already ride in the prefill launch, one token per ~140 ms tick.
+2. Decode at B=4..16: the MoE part is near its byte roof; attention is ~2.4x and the dense
+   GEMVs ~4x off theirs (per-op latency: K/32 k-steps at 8 loads in flight). Sweep in flight:
+   `PLOW_NV_GEMV_MMA_UNB` 12/16.
+3. Per-rung decode objects under multistep: B=1 wants the xreg kernels, B>=2 wants an entry
+   without them (0.3–0.7 ms per step at B>=2).
+4. C32: chunk-local KV scratch so a slot's sliding ring is the window only (32+ slots at 16k).
+5. 12B: root-cause the BF16 NRN fold (`c1f1ac38`) — 96 fewer serial packets per token.
 
 ## Protocol
 
