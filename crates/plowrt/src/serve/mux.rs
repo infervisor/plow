@@ -1189,6 +1189,11 @@ fn reject_pending_after_drain(rx: &mut mpsc::Receiver<MuxMsg>, metrics: &Metrics
 }
 
 fn note_arrival(now: Instant, load: &mut LoadEstimator, metrics: &Metrics) {
+    if packlog::on() {
+        if let Some(gap) = load.lambda.since_last(now) {
+            eprintln!("PACKLOG ARRIVE gap_us={}", gap.as_micros());
+        }
+    }
     let lambda = load.lambda.observe(now);
     metrics
         .lambda_milli
@@ -4037,6 +4042,15 @@ fn gpu_prefill_batched_pass(
             .collect();
         if pack.is_empty() {
             return tick_fault;
+        }
+        if packlog::on() {
+            eprintln!(
+                "PACKLOG PACK reqs={} rows={} decode_feeds={} unified={}",
+                pack.len(),
+                pack.iter().map(|p| p.2).sum::<usize>(),
+                feeds.len(),
+                unified
+            );
         }
         let res = if unified {
             use plow_asset::token_batch::{Phase, Request, Selection};

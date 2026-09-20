@@ -2256,8 +2256,9 @@ static __device__ void d_moe_align_gemma_pf(int* __restrict__ meta, const unsign
 
 /* ---- T-ROW COMBINE + SANDWICH (PLOW_DOP_MOE_COMBINE_NORM_GEMMA_PF) ----------------------
  * Block-per-token loop of d_moe_combine_norm_gemma. */
+/* 0 = scalar, 1 = float4 slot reads, 2 = + pre-issued slot loads and a vector pass 2. */
 #ifndef PLOW_MOE_COMBINE_PF_V4
-#define PLOW_MOE_COMBINE_PF_V4 1
+#define PLOW_MOE_COMBINE_PF_V4 2
 #endif
 static __device__ void d_moe_combine_norm_gemma_pf(bf16* __restrict__ out, const float* __restrict__ part,
                                             const bf16* __restrict__ h1, const bf16* __restrict__ gamma,
@@ -2275,10 +2276,24 @@ static __device__ void d_moe_combine_norm_gemma_pf(bf16* __restrict__ out, const
         float ss = 0.0f;
 #if PLOW_NV_GEMV_RB && PLOW_MOE_COMBINE_PF_V4
         /* float4 reads, as d_moe_combine_norm_gemma: the pass is one strided scalar load per
-         * (h, slot) otherwise — 88 per thread per token against 24 here. Same ss regrouping. */
+         * (h, slot) otherwise — 88 per thread per token against 24 here. Same ss regrouping.
+         * At k == 8 all eight slot loads are ISSUED before the first add (same slot order, so the
+         * sum is bit-identical): the adds no longer serialize the loads. 0.099 -> 0.081 ms/layer
+         * at T=1024, 0.372 -> 0.298 at T=4096. */
         if ((H & 3u) == 0u) {
             for (unsigned h = tid * 4u; h < H; h += nth * 4u) {
                 float4 acc4 = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (PLOW_MOE_COMBINE_PF_V4 >= 2 && k == 8u) {
+                    float4 v[8];
+#pragma unroll
+                    for (int slot = 0; slot < 8; slot++)
+                        v[slot] = *(const float4*)(pt + (size_t)slot * H + h);
+#pragma unroll
+                    for (int slot = 0; slot < 8; slot++) {
+                        acc4.x += v[slot].x; acc4.y += v[slot].y;
+                        acc4.z += v[slot].z; acc4.w += v[slot].w;
+                    }
+                } else
                 for (unsigned slot = 0; slot < k; slot++) {
                     const float4 v = *(const float4*)(pt + (size_t)slot * H + h);
                     acc4.x += v.x; acc4.y += v.y; acc4.z += v.z; acc4.w += v.w;
@@ -2305,6 +2320,24 @@ static __device__ void d_moe_combine_norm_gemma_pf(bf16* __restrict__ out, const
         }
         __syncthreads();
         const float inv = red[0];
+#if PLOW_NV_GEMV_RB && PLOW_MOE_COMBINE_PF_V4 >= 2
+        /* Pass 2 on the same 4-wide groups: 8-byte gamma / residual loads and one 8-byte store per
+         * group instead of 11 strided scalar round trips. Same per-element math, bit-identical.
+         * With the pre-issue above: 0.099 -> 0.057 ms/layer at T=1024, 0.372 -> 0.211 at T=4096. */
+        if ((H & 3u) == 0u) {
+            for (unsigned h = tid * 4u; h < H; h += nth * 4u) {
+                const float4 a4 = *(const float4*)(arena + h);
+                alignas(8) bf16 g[4], r[4], ov[4];
+                *(uint2*)g = *(const uint2*)(gamma + h);
+                *(uint2*)r = *(const uint2*)(res + h);
+                ov[0] = __float2bfloat16(a4.x * inv * __bfloat162float(g[0]) + __bfloat162float(r[0]));
+                ov[1] = __float2bfloat16(a4.y * inv * __bfloat162float(g[1]) + __bfloat162float(r[1]));
+                ov[2] = __float2bfloat16(a4.z * inv * __bfloat162float(g[2]) + __bfloat162float(r[2]));
+                ov[3] = __float2bfloat16(a4.w * inv * __bfloat162float(g[3]) + __bfloat162float(r[3]));
+                *(uint2*)(o + h) = *(const uint2*)ov;
+            }
+        } else
+#endif
         for (unsigned h = tid; h < H; h += nth) {
             const float v = arena[h] * inv * __bfloat162float(gamma[h]);
             o[h] = __float2bfloat16(v + __bfloat162float(res[h]));

@@ -91,6 +91,11 @@ impl ArrivalRate {
         self.value * (-dt / self.tau_s).exp()
     }
 
+    /// Time since the previous arrival, if there was one.
+    pub fn since_last(&self, now: Instant) -> Option<std::time::Duration> {
+        self.last.map(|last| now.saturating_duration_since(last))
+    }
+
     /// Record one arrival at `now`.
     #[inline]
     pub fn observe(&mut self, now: Instant) -> f64 {
