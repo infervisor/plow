@@ -1065,6 +1065,32 @@ Lt GEMM merges above (~3% at T=128, ~1% at 1k).
 ALSO MEASURED TODAY (null): MoE half vs full tiles on the stripped object, in situ — 0.965 / 2.386
 / 2.132 vs 0.980 / 2.442 / 2.121 ms (rand-1k / rand-4k / hot-4k). Half stays.
 
+## STANDING vs vLLM 0.28 after this round (packet b26u, commit 6a3b1cfa + CSVs), 2026-09-20
+
+Realtime ladder, mean TTFT ms (start of day -> now | vLLM):
+  128/C1     31.67 ->   23.29 |  39.52  WIN        128/C4     56.59 ->   40.54 |  73.31  WIN
+  1024/C1    66.80 ->   46.76 |  44.11  1.06x      1024/C4   133.63 ->   95.77 |  93.46  1.02x
+  4096/C1   174.71 ->  134.48 |  93.71  1.44x      4096/C4   323.86 ->  265.81 | 227.59  1.17x
+  8192/C1   370.37 ->  288.73 | 181.10  1.59x      8192/C4  1194.36 -> 1010.26 | 458.74  2.20x
+TPOT ms:  C1 5.83 / 5.99 / 6.06 / 6.13 (was 5.91-6.19) | vLLM 5.03-5.09   1.16-1.20x
+          C4 10.72 / 11.99 / 13.49 / 15.11 (was 10.99-16.67) | vLLM 7.24 / 7.57 / 7.92 / 8.53
+Serving tok/s: 1024/C16 421 -> 456 | 1380, 1024/C32 454 -> 499 | 1736, 4096/C16 237 -> 263 | 885,
+               4096/C32 237 -> 263 | 1081.   Still 3.0-4.1x behind: decode batch scaling.
+What moved it: row-spread router + warp top-k, float4 prefill combine, n256 DOWN, and above all
+the stripped fat prefill object (FATLITE_MOE); sg8 finally reaching the decode object.
+
+NEXT, by value:
+  1. Serving/decode batch scaling (3-4x gap): MoE GLU+DOWN are 42% of the B=4 step body and more at
+     B=16; the per-slot walk streams B*8 expert weight sets per layer. Parked grouped-decode patch
+     (plans/gemma4-26b-decode-grouped-moe.wip.patch) needs an IN-SITU block verdict, not the
+     harness one (0.557 vs 0.868 ms/layer at B=16 was harness-vs-harness).
+  2. 1024/C1 and 1024/C4 are 2-6% from flipping: attribute the ~9 ms between served TTFT and
+     30 x block with BENCH-LIKE prompts ($T/mk_rand_prompts.py; " hello"*N routes to 8 experts and
+     is ~11 ms cheaper at 1k than random-token prompts), then the two Lt GEMM merges (~1%).
+  3. 4k/8k: MoE segment is still 65% of a layer and at the tile design's bandwidth roof; a vendor
+     grouped GEMM is worth ~-18 ms at 4k (torch._grouped_mm ceiling) and needs a host sync or
+     CUTLASS. hd512 long-KV attention (GQA-8 KV re-staged per head) is the 8k/16k item.
+
 ## Status
 
 | step | state |
