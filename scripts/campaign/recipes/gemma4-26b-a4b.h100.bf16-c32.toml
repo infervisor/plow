@@ -98,6 +98,12 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 PLOW_PREFIX_CACHE = "0"
 PLOW_PF_SEG_PURE = "1"
 PLOW_PF_INTERLEAVE = "0"
+# Gemma's tokenizer is one-word BPE (space -> "▁" normalizer): 1.6 ms for a 1k-token prompt and
+# 8.9 ms for 4k, serial, inside TTFT. Split encode is exact for it (tokenizer.rs); a 1k prompt is
+# only ~5 KB, so the 4096-byte default floor would not split it. Served wall, bench-like prompts:
+# 46.0 -> 43.7 ms at 1k, 131.6 -> 122.4 at 4k.
+PLOW_ENCODE_THREADS = "16"
+PLOW_ENCODE_SPLIT_MIN = "512"
 PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
 LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
 

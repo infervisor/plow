@@ -113,6 +113,30 @@ const SPLIT_MIN_BYTES: usize = 4096;
 #[cfg(feature = "hf-tokenizer")]
 static ENCODE_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
 
+/// Gemma-class tokenizers: the normalizer turns every space into `▁`, so the Split-on-space
+/// pre-tokenizer never fires and BPE sees ONE word — 8.9 ms for a 4k-token prompt, inside TTFT.
+/// A cut before a space that sits between two ASCII letters is exact iff no vocabulary token has
+/// an ASCII letter directly before `▁`: every merge result is a vocabulary token, so the first
+/// merge to cross the cut would have to be one. (Gemma-4's only word->space token is `>▁</`.)
+#[cfg(feature = "hf-tokenizer")]
+fn metaspace_bpe_split_safe(t: &tokenizers::Tokenizer) -> bool {
+    let json = |v: Option<serde_json::Value>| v.unwrap_or_default();
+    let norm = json(t.get_normalizer().and_then(|n| serde_json::to_value(n).ok()));
+    let pre = json(t.get_pre_tokenizer().and_then(|p| serde_json::to_value(p).ok()));
+    norm["type"] == "Replace"
+        && norm["pattern"]["String"] == " "
+        && norm["content"] == "\u{2581}"
+        && pre["type"] == "Split"
+        && pre["pattern"]["String"] == " "
+        && pre["behavior"] == "MergedWithPrevious"
+        && pre["invert"] == false
+        && !t.get_vocab(false).keys().any(|k| {
+            k.as_bytes()
+                .windows(4)
+                .any(|w| w[0].is_ascii_alphabetic() && w[1..] == *"\u{2581}".as_bytes())
+        })
+}
+
 #[cfg(feature = "hf-tokenizer")]
 fn split_safe(t: &tokenizers::Tokenizer) -> bool {
     use tokenizers::PostProcessor;
@@ -130,8 +154,7 @@ fn split_safe(t: &tokenizers::Tokenizer) -> bool {
                 && byte_level["type"] == "ByteLevel"
                 && byte_level["add_prefix_space"] == false
                 && byte_level["use_regex"] == false);
-    pre_ok
-        && t.get_normalizer().is_none()
+    ((pre_ok && t.get_normalizer().is_none()) || metaspace_bpe_split_safe(t))
         && t.get_truncation().is_none()
         && t.get_padding().is_none()
         && t.get_post_processor().map_or(true, |p| p.added_tokens(false) == 0)
@@ -430,6 +453,59 @@ mod tests {
             }
         }
         assert!(encode_split(&t, &pool, "hello world", false).is_none());
+    }
+
+    /// Gemma's shape: space -> `▁` normalizer, a Split-on-space that never fires, one-word BPE.
+    /// `letter_space` adds the token that makes a letter-space-letter cut unsafe.
+    fn gemma_like(letter_space: bool) -> tokenizers::Tokenizer {
+        let mut alphabet: Vec<char> = texts().concat().chars().filter(|&c| c != ' ').collect();
+        alphabet.push('\u{2581}');
+        alphabet.sort_unstable();
+        alphabet.dedup();
+        let mut vocab: serde_json::Map<String, serde_json::Value> = alphabet
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.to_string(), i.into()))
+            .collect();
+        let mut merges = vec![
+            "h e", "l l", "he ll", "\u{2581} w", "\u{2581}w o", "o r", "\u{2581} a", "i t",
+            "\u{2581} \u{2581}", "1 2",
+        ];
+        if letter_space {
+            merges.push("o \u{2581}");
+        }
+        for m in &merges {
+            let n = vocab.len();
+            vocab.insert(m.replace(' ', ""), n.into());
+        }
+        let n = vocab.len();
+        vocab.insert("<unk>".into(), n.into());
+        let json = serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"},
+            "added_tokens": [{"id": n + 1, "content": "<|user|>", "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true}],
+            "pre_tokenizer": {"type": "Split", "pattern": {"String": " "},
+                "behavior": "MergedWithPrevious", "invert": false},
+            "post_processor": null, "decoder": null,
+            "model": {"type": "BPE", "dropout": null, "unk_token": "<unk>",
+                "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": true,
+                "byte_fallback": false, "ignore_merges": false, "vocab": vocab, "merges": merges}
+        });
+        tokenizers::Tokenizer::from_str(&json.to_string()).unwrap()
+    }
+
+    #[test]
+    fn metaspace_bpe_split_encode_matches_whole_text_encode() {
+        let t = gemma_like(false);
+        assert!(split_safe(&t));
+        assert!(!split_safe(&gemma_like(true)));
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        for text in texts() {
+            let whole = t.encode(text.as_str(), false).unwrap().get_ids().to_vec();
+            let split = encode_split(&t, &pool, &text, false).expect("long text splits");
+            assert_eq!(split, whole);
+        }
     }
 
     #[test]
