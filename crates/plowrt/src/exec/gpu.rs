@@ -8214,7 +8214,21 @@ impl GpuEngine {
             let mut evs: Vec<(usize, u8, CudaEvent, CudaEvent)> = Vec::new();
             for (seg, &cls) in seg_class.iter().enumerate() {
                 if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
-                    route.run(&self.stream)?;
+                    // Time the Lt route too under PLOW_PF_SEG_TIME. Skipping it made the
+                    // per-site report silently exclude EVERY cuBLASLt projection — on
+                    // Gemma-4-26B that is 1025 of the segments, so the report read
+                    // "MoE is 93 % of prefill" when it only meant 93 % of what was
+                    // measured. Class 0 is the GEMM bucket these shapes belong to.
+                    if seg_time {
+                        let e0 = self.be.event_create(true)?;
+                        let e1 = self.be.event_create(true)?;
+                        self.be.event_record(&e0, &self.stream)?;
+                        route.run(&self.stream)?;
+                        self.be.event_record(&e1, &self.stream)?;
+                        evs.push((seg, 0, e0, e1));
+                    } else {
+                        route.run(&self.stream)?;
+                    }
                     continue;
                 }
                 arg.cur_seg = seg as u32;

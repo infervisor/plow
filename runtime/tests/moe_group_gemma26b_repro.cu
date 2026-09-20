@@ -218,6 +218,44 @@ int main(int argc, char** argv) {
         k_comb<<<grid, 256, arena_bytes>>>(d_out, d_part, d_h1, d_g, H, k, T, 1e-6f);
         CK(cudaDeviceSynchronize());
         printf("combine_norm: ok\n");
+
+        /* ---- TIMING vs ROOFLINE (argv[4] = iterations; 0 = correctness only) ----
+         * Served attribution (PLOW_PF_SEG_TIME) put this chain at ~89 % of prefill at
+         * every rung, while the cuBLASLt dense projections — about the same FLOPs per
+         * layer — take ~1/20th the time. This prices each op against its ceiling so the
+         * kernel work has a number to move. FLOPs: a routed pair costs 2*(2I*H) for
+         * gate|up and 2*(H*I) for down; T*k pairs per layer. */
+        const int iters = argc > 4 ? atoi(argv[4]) : 0;
+        if (iters > 0) {
+            auto time_ms = [&](auto&& launch) {
+                cudaEvent_t a, b;
+                CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
+                launch(); CK(cudaDeviceSynchronize());
+                CK(cudaEventRecord(a));
+                for (int i = 0; i < iters; i++) launch();
+                CK(cudaEventRecord(b)); CK(cudaEventSynchronize(b));
+                float ms = 0; CK(cudaEventElapsedTime(&ms, a, b));
+                return (double)ms / iters;
+            };
+            const double t_al = time_ms([&]{ k_align<<<1, 256>>>(d_meta, d_tab, d_rt, d_rp, d_rg, T, n_exp, k); });
+            const double t_gl = time_ms([&]{ k_glu<<<grid, 256, arena_bytes>>>(d_fu, d_x, d_ewt, d_meta, d_rt, I_moe, H, n_exp, 0u); });
+            const double t_dn = time_ms([&]{ k_down<<<grid, 256, arena_bytes>>>(d_part, d_fu, d_ewt, d_meta, d_rp, d_rg, H, I_moe, n_exp); });
+            const double t_cb = time_ms([&]{ k_comb<<<grid, 256, arena_bytes>>>(d_out, d_part, d_h1, d_g, H, k, T, 1e-6f); });
+            const double pairs = (double)T * k;
+            const double f_gl = pairs * 2.0 * (2.0 * I_moe) * H;   /* gate|up GEMM */
+            const double f_dn = pairs * 2.0 * (double)H * I_moe;   /* down GEMM    */
+            const double peak = 989e12;                            /* H100 BF16 TFLOP/s */
+            const double tot = t_al + t_gl + t_dn + t_cb;
+            printf("\nTIMING T=%u dist=%u (per layer, %d iters)\n", T, dist, iters);
+            printf("  align    %8.3f ms  %5.1f%%   (1 block; histogram+scatter of %0.f slots)\n", t_al, 100*t_al/tot, pairs);
+            printf("  glu      %8.3f ms  %5.1f%%   %6.1f TFLOP/s = %4.1f%% of peak   roof %.3f ms\n",
+                   t_gl, 100*t_gl/tot, f_gl/(t_gl*1e-3)/1e12, 100*f_gl/(t_gl*1e-3)/peak, f_gl/peak*1e3);
+            printf("  down     %8.3f ms  %5.1f%%   %6.1f TFLOP/s = %4.1f%% of peak   roof %.3f ms\n",
+                   t_dn, 100*t_dn/tot, f_dn/(t_dn*1e-3)/1e12, 100*f_dn/(t_dn*1e-3)/peak, f_dn/peak*1e3);
+            printf("  combine  %8.3f ms  %5.1f%%\n", t_cb, 100*t_cb/tot);
+            printf("  TOTAL    %8.3f ms/layer  -> x30 = %.1f ms/chunk   (GEMM roof x30 = %.1f ms)\n",
+                   tot, tot*30, (f_gl+f_dn)/peak*1e3*30);
+        }
     }
 
     printf("ALL OK\n");

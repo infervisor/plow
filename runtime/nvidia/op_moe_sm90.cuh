@@ -119,13 +119,26 @@ __device__ __forceinline__ void moe90_stage_b(__nv_bfloat16* Bd,
 /* ---- the mainloop, shared by every arm ---------------------------------------------------
  * `Ad`/`Bd` are the LANDED stage buffers; wg selects the 64-row A sub-tile. A k16 (bf16) or
  * k32 (e4m3) substep advances the descriptor START ADDRESS by +32 B only. */
+/* `live` rides the instruction's own predicate (setp.ne on the last operand): a warpgroup
+ * whose 64 rows are ALL padding issues a predicated-off mma, so the commit/wait/sync
+ * structure is byte-identical across warpgroups and only the tensor-core work is elided. */
 template <int NACC>
 __device__ __forceinline__ void moe90_wgmma_k(float (&d)[NACC], const __nv_bfloat16* Ad,
-                                              const __nv_bfloat16* Bd, int wg) {
+                                              const __nv_bfloat16* Bd, int wg, int live = 1) {
     const __nv_bfloat16* Aw = Ad + wg * 64 * MOE90_BK;
 #pragma unroll
     for (int kk = 0; kk < MOE90_BK; kk += 16)
-        wgmma_m64n128k16(d, sm90_desc(Aw + kk), sm90_desc(Bd + kk), 1);
+        wgmma_m64n128k16(d, sm90_desc(Aw + kk), sm90_desc(Bd + kk), live);
+}
+
+/* Valid rows in m-tile `mtile` of expert `e`: the align op pads each expert's segment to
+ * BM, so only the LAST tile of a segment is partial. With 128 experts and a short chunk
+ * every tile is that last tile — 8 valid rows of 128 at T=128, 64 at T=1024. */
+__device__ __forceinline__ int moe90_tile_rows(const int* meta, int n_exp, int e, int mtile) {
+    const int cnt = meta[n_exp + e];
+    const int done = (mtile - meta[2 * n_exp + e]) * MOE90_BM;
+    const int left = cnt - done;
+    return left < MOE90_BM ? left : MOE90_BM;
 }
 
 /* ==========================================================================================
@@ -160,6 +173,11 @@ static __device__ void d_moe_group_glu_gemma_pf(__nv_bfloat16* __restrict__ fu,
         const int tn = ntile * MOE90_BN;
         const __nv_bfloat16* Wg = (const __nv_bfloat16*)(size_t)ewt[(size_t)e * 2 + 0];
         const __nv_bfloat16* Wu = Wg + (size_t)I_moe * H;
+#if defined(MOE90_DBG_NOMMA)
+        const int live = 0; /* harness attribution: k-step cost with the tensor core OFF */
+#else
+        const int live = moe90_tile_rows(meta, (int)n_exp, e, mtile) > wg * 64;
+#endif
         /* ---- from here down the mainloop is dense; nothing is MoE-aware ---- */
 
         float accg[64], accu[64];
@@ -167,6 +185,9 @@ static __device__ void d_moe_group_glu_gemma_pf(__nv_bfloat16* __restrict__ fu,
         for (int i = 0; i < 64; i++) { accg[i] = 0.f; accu[i] = 0.f; }
 
         auto stage = [&](int ks, int buf) {
+#if defined(MOE90_DBG_NOSTAGE)
+            if (ks > 0) return; /* harness attribution: k-step cost with staging OFF */
+#endif
             moe90_stage_a_gather(As + buf * MOE90_ABUF, xn2, row_token, tid, rowbase,
                                  ks * MOE90_BK, K);
             moe90_stage_b(Bgs0 + buf * MOE90_BBUF, Wg, tid, tn, ks * MOE90_BK, I_moe, K);
@@ -186,8 +207,8 @@ static __device__ void d_moe_group_glu_gemma_pf(__nv_bfloat16* __restrict__ fu,
             sm90_cp_wait<MOE90_GLU_STAGES - 1>();
             __syncthreads();
             const int cb = ks % MOE90_GLU_STAGES;
-            moe90_wgmma_k(accg, As + cb * MOE90_ABUF, Bgs0 + cb * MOE90_BBUF, wg);
-            moe90_wgmma_k(accu, As + cb * MOE90_ABUF, Bus0 + cb * MOE90_BBUF, wg);
+            moe90_wgmma_k(accg, As + cb * MOE90_ABUF, Bgs0 + cb * MOE90_BBUF, wg, live);
+            moe90_wgmma_k(accu, As + cb * MOE90_ABUF, Bus0 + cb * MOE90_BBUF, wg, live);
             sm90_wg_commit();
             /* wait<0>: the next iteration refills THIS buffer (ring depth == prefetch+1). */
             sm90_wg_wait<0>();
@@ -245,6 +266,7 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
         const int rowbase = rowoff[e] + (mtile - tilep[e]) * MOE90_BM;
         const int tn = ntile * MOE90_BN;
         const __nv_bfloat16* Wd = (const __nv_bfloat16*)(size_t)ewt[(size_t)e * 2 + 1];
+        const int live = moe90_tile_rows(meta, (int)n_exp, e, mtile) > wg * 64;
 
         float acc[64];
 #pragma unroll
@@ -268,7 +290,7 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
             sm90_cp_wait<MOE90_STAGES - 1>();
             __syncthreads();
             const int cb = ks % MOE90_STAGES;
-            moe90_wgmma_k(acc, As + cb * MOE90_ABUF, Bs + cb * MOE90_BBUF, wg);
+            moe90_wgmma_k(acc, As + cb * MOE90_ABUF, Bs + cb * MOE90_BBUF, wg, live);
             sm90_wg_commit();
             sm90_wg_wait<0>();
             __syncthreads();
