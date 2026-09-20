@@ -1000,6 +1000,71 @@ register budget. 0 bytes of spill stack. Block outputs BIT-IDENTICAL to the unst
 = -0.70 ms/layer at 1k and -1.3 ms/layer at 4k against the original packet.
 RULE: a harness win is a hypothesis. Confirm on a block with real inputs before a served build.
 
+## Op-fusion audit (2026-09-20) — user direction: "make sure we fuse ops properly"
+
+METHOD: `plowrt disasm <assets> --program 1|<T> --format json` -> per-layer op chain
+($T/opseq.py); fusion knobs from emit_config.rs vs the recipe (12B and 26B recipes agree on every
+fusion knob); unverified knobs A/B'd on stripped-fat sliding blocks; decode gate/body profile from
+a -DPLOW_NV_TRACE=1 decode object in step_bench ($T/cc_dec.sh, $T/dec_trace.sh).
+
+DECODE, 17 ops/layer (521/step): FlashDecode, FlashMerge(16 blk), Gemv(o), NormResidualNorm(1 blk),
+ScoreFast(16), Topk(1), GemvGlu, Gemv(down), RmsNorm h1 (1), MoeExpertGluNorm, MoeExpertDown,
+MoeCombineNorm(1), NormResidualNorm(1), GemvQkv, HeadNormRope x3 (2 blk each).
+  fused already: sandwich NRN (x2), QKV (25 sliding layers), dense gate|up + GLU, pre-norm + MoE GLU.
+  NOT fused, and why:
+    fused lm_head+argmax (PLOW_FUSE_ARGMAX)      measured SLOWER here, 6.501 vs 5.837 ms
+    MoE tail op72 (PLOW_GEMMA_MOE_TAIL_FUSE)     documented negative (+0.18 ms/token), B=1 only
+    fused router (PLOW_GEMMA_MOE_ROUTER_FUSED)   142 ms/step
+    PLOW_FUSE_HNR, PLOW_FUSE_MERGE               null in decode AND prefill (re-measured today)
+    q|k on the 5 k_eq_v full layers              no fused arm exists; bounded by the NO_FUSE_QKV A/B below
+  IN-SITU PROFILE (block 0, B=1): gate 24% / body 73% / signal 3%. The gate time sits in GemvQkv
+  (gate ~= body: it waits on the single-block MoeCombineNorm -> NormResidualNorm tail, ~14 us/layer),
+  Gemv(o) (FlashDecode stragglers + FlashMerge) and GemvGlu (the post-attention NRN). A packet
+  boundary itself is ~1.4 us (0.75 ms over 521 packets), and the norm bodies are already
+  register-cached with the 2-barrier block_sum — so a fused tail is worth ~1%, which is why op72
+  lost. The tail's real cost is CombineNorm's 90 KB f32 `part` read on ONE block (bf16 partials
+  would halve it). At B=4 the profile is MoE GLU 25% + DOWN 17% body, gate 19.5%.
+
+PREFILL, 23 ops / 13 segments per layer: FlashPrefill | Gemm o | NormResidual+RmsNorm | Gemm gate |
+Gemm up | Glu | Gemm down | RmsNorm h1 + RmsNorm xn2 + 73 74 75 76 77 + NormResidual | RmsNorm |
+Gemm q | Gemm k | Gemm v | HeadNormRope x3.
+  PLOW_PF_GFUSE=1 (sandwich fusion in prefill)   MEASURED NEGATIVE: 1.24 -> 1.27 ms/layer at 1k,
+                                                  3.64 -> 3.72 at 4k, equal at 128. Stays off.
+  segment floor at T=128: Lt GEMM ~11 us, tiny native segments 10-17 us -> the 12 non-MoE segments
+  are 0.19 ms/layer; the MoE segment is 0.49 ms (72%) and is weight-streaming-bound (every touched
+  expert streams once), not launch-bound. Segment-level fusion has ~nothing left.
+  Structural candidates NOT built (value estimated from the segment table): one Lt GEMM for q|k|v
+  and one for gate|up (weights are 4096-multiples, so they can be carved contiguously; HNR / Glu
+  would need packed-input variants): -2 / -1 Lt calls per layer = ~-0.7 ms/chunk at T=128 (3%),
+  ~1% at 1k, nothing at 4k.
+
+BUG FOUND BY THE AUDIT — a recipe knob that never reached its object: `[objects.env]
+PLOW_EXTRA_DEFINES="-DPLOW_MOE_DOWN_SG=8u"` only reaches the segments script; the decode object is
+built by plowc from the manifest, so every served packet ran sg4 (served C4 TPOT 10.99 == the
+sweep's sg4 11.03, not sg8's 10.65). Now a manifest rule: shapes.moe_down_inter (from the decode
+MoeExpertDownGemma sites) -> tuning.moe_down_sg=8 when I_moe % 32 == 0 -> `#define
+PLOW_MOE_DOWN_SG 8u` in plow_config.h on sm_90a. Block decode us/layer: B=4 413.6 -> 400.4,
+B=16 982.7 -> 958.3, B=1 flat.
+
+FUSIONS PROTOTYPED / A-B'D IN THIS AUDIT (all measured, none shipped):
+  * decode QKV fusion is worth NOTHING here: PLOW_NO_FUSE_QKV=1 on a sliding block 216.9 / 398.3 /
+    955.5 us vs fused 216.3 / 400.4 / 959.6 (B=1/4/16). So a q|k arm for the k_eq_v layers is moot.
+  * prefill DOWN -> combine fusion (the AMD PLOW_MOE_PF_ATOMIC shape: DOWN atomicAdds gate*y into
+    ONE [T,H] f32 row per token, combine runs unchanged with k=1), harness, replayed real routing:
+      T=1024  down 0.242 -> 0.277, combine 0.098 -> 0.030, clear +0.005  = -0.03 ms/layer
+      T=4096  down 0.654 -> 0.795, combine 0.372 -> 0.226, clear +0.017  = wash
+    The atomic RMW in DOWN eats the combine saving, and the k-way sum becomes arrival-order
+    (99.995% of outputs equal, relL2 1e-5, run-to-run nondeterministic). Dropped. (AMD measured
+    bf16 partials at ~0% and top-1 flips; its deterministic f64 form costs more than the atomic.)
+  * decode DOWN -> combine: not viable deterministically — DOWN spreads 22528 (slot, channel) dots
+    over ~8.4k sub-groups at ~2.7 rounds per block; one owner summing all 8 slots of a channel is
+    8 rounds (3x DOWN's latency).
+VERDICT: every fusion that pays is already on; the only structural candidates left are the two
+Lt GEMM merges above (~3% at T=128, ~1% at 1k).
+
+ALSO MEASURED TODAY (null): MoE half vs full tiles on the stripped object, in situ — 0.965 / 2.386
+/ 2.132 vs 0.980 / 2.442 / 2.121 ms (rand-1k / rand-4k / hot-4k). Half stays.
+
 ## Status
 
 | step | state |

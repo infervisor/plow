@@ -334,6 +334,8 @@ struct Shapes {
     full_kv_heads: u32,
     /// Decode batch: `n_batch` on the decode program's flash sites.
     decode_batch: u32,
+    /// `I_moe` on the Gemma decode expert-down sites (`i[2]`); 0 when the packet has none.
+    moe_down_inter: u32,
     /// hd → "bf16" | "e4m3", from which flash opcode reads that hd.
     kv_dtype: BTreeMap<u32, &'static str>,
     /// Largest prefill bucket = the largest chunk the runtime can submit.
@@ -651,6 +653,7 @@ fn shapes(m: &Model) -> Shapes {
                 | DevOp::MoeGroupDownFp8Blk => {
                     s.moe_enc.insert(inst.i[6]);
                 }
+                DevOp::MoeExpertDownGemma if decode => s.moe_down_inter = inst.i[2],
                 // EVERY mxfp4 tile rung, not just the 256x256 one. This classifier decides
                 // `mxfp4_weights`, which decides which OBJECT the host loads
                 // (`scripts/gfx950_objects.py:150`). Before the prefill GEMM became
@@ -970,6 +973,9 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
 ///   1.48x (perf-data/px11-flash-decode.md). `GF_FULL` must also divide `gqa`
 ///   or the interpreter traps (`interp_sm120.cu`: `if ((gqa % GF_FULL) != 0)
 ///   __trap()`), which the `1|2|4|8` clamp below keeps true.
+/// * `moe_down_sg = 8` — the Gemma decode expert-down lane split. Measured on h100-sxm5
+///   (step_bench, ms at B=1/4/16): sg4 5.905 / 11.034 / 26.786, sg8 5.833 / 10.648 / 26.387. The
+///   arm needs `I_moe % (32 / sg * 8) == 0` and silently falls back otherwise, hence the guard.
 fn tuning(s: &Shapes) -> Map<String, Value> {
     let mut t = Map::new();
     t.insert("gv_mm_max".into(), json!(next_pow2(s.decode_batch.max(1))));
@@ -994,6 +1000,9 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
                 "mixed"
             }),
         );
+    }
+    if s.moe_down_inter > 0 && s.moe_down_inter % 32 == 0 {
+        t.insert("moe_down_sg".into(), json!(8));
     }
     if s.full_kv_heads == 1 && s.gqa > 0 {
         // The template is instantiated at 1|2|4|8 only.
@@ -2635,6 +2644,14 @@ pub fn config_header(manifest: &Value) -> String {
                 "#ifndef PLOW_NV_FA_GF_FULL\n#define PLOW_NV_FA_GF_FULL {v}\n#endif\n\
                  #ifndef PLOW_FA_GF_FULL\n#define PLOW_FA_GF_FULL {v}\n#endif\n"
             ));
+        }
+        // Measured on sm_90a only; every other target keeps the kernel's own default.
+        if let Some(v) = t.get("moe_down_sg").and_then(Value::as_u64) {
+            if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
+                out.push_str(&format!(
+                    "#ifndef PLOW_MOE_DOWN_SG\n#define PLOW_MOE_DOWN_SG {v}u\n#endif\n"
+                ));
+            }
         }
     }
     if let Some(gqa) = manifest.pointer("/shapes/gqa").and_then(Value::as_u64) {

@@ -83,10 +83,9 @@ role_files = [
 # ms per layer slower in it at 1k / 4k (in-situ block bisect, 2026-09-20).
 PLOW_BUILD_FATLITE = "1"
 PLOW_BUILD_FATLITE_MOE = "1"
-# Measured on this board (tune_decode_sweep.sh, step_bench TPOT, occ 1:132): the MoE-down
-# lane-split at 8 sub-groups beats the source default 4 — B=1 5.905 -> 5.833 ms, B=4 11.034 ->
-# 10.648. (2 is not an option at I_moe=704: 704 % 128 != 0 drops it off the lane-split arm.)
-PLOW_EXTRA_DEFINES = "-DPLOW_MOE_DOWN_SG=8u"
+# The MoE-down lane split (PLOW_MOE_DOWN_SG=8, measured on this board) is NOT set here: this env
+# only reaches the segments script, and the decode object is built from the manifest. It is a
+# manifest rule now (tuning.moe_down_sg -> plow_config.h), which every object of the packet sees.
 PLOW_BUILD_FA_GQA2_PAIR = "1"
 PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
