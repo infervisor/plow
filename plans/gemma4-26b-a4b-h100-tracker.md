@@ -633,6 +633,29 @@ expert's weights (1.02 GB + 0.51 GB per layer). The roof is BANDWIDTH (0.30 + 0.
 FLOPs; glu is at 59% and down at 41% of it. Tile padding is not the waste — the lever is
 faster B staging (TMA load engine, tma_ws_moe_group.cu), most of all for down (22 n-tiles).
 
+## DECODE ROOT CAUSE (2026-09-20): every step ran the B=16 program
+
+The ~43 ms of "unattributed decode overhead" was not overhead. Server log, every run:
+`WARN decode ladder retains widest execution: narrower addressing is not qualified`.
+`validate_decode_ladder` (plowrt exec/gpu/decode_rung.rs) normalises each op's row field
+against an allowlist; any other op hits `_ => compatible = false` and the engine keeps ONLY
+the widest rung. None of the Gemma MoE decode ops were listed, so C1 decode executed the
+16-row program: 16 rows x top-8 -> up to ~80 experts streamed per layer instead of 8.
+That is also why TPOT was flat from C1 to C16, and why the c32 packet's TPOT looked
+"saturated". Same class of gap as the live-KV allowlist that dropped packed prefill.
+
+FIX: arms for MoeRouterGemmaScore/ScoreFast (i2), MoeRouterGemmaTopk (i3),
+MoeExpertGluNormGemma / MoeExpertDownGemma (i5), MoeCombineNormGemma (i2) — devgen's `nb`
+immediate, 0 at B=1 else B. Greedy output byte-identical before/after; 19/19 decode_rung tests.
+
+TPOT ms (before -> after | vLLM), tok/s after | vLLM:
+  128/C1   48.76 ->  8.15 | 5.03    118.7 | 188.5      128/C4   50.65 -> 19.70 | 7.24   197.4 | 515.6
+  1024/C1  49.69 ->  8.29 | 5.08    113.8 | 185.7      1024/C4  52.00 -> 21.15 | 7.57   178.2 | 485.1
+  4096/C1  50.69 ->  8.35 | 5.09    103.1 | 172.8      4096/C4  53.51 -> 21.81 | 7.92   158.6 | 414.8
+  8192/C1  51.97 ->  8.43 | 5.09     88.7 | 154.7      8192/C4  56.37 -> 24.21 | 8.53   106.6 | 331.7
+C1 gap 9.7x -> 1.6x. Next decode target is B=4: 19.7 ms is 2.4x the B=1 step while vLLM's
+B=4 costs 1.44x its B=1 — the MoE decode kernels' batch scaling, not dispatch.
+
 ## Status
 
 | step | state |
@@ -642,7 +665,7 @@ faster B staging (TMA load engine, tma_ws_moe_group.cu), most of all for down (2
 | vLLM 26B reference ladder | **done** (8 cells) |
 | Plow 26B rung ladder | **done** (6 cells; 8K rung blocked by max_ctx, now fixed to 8704, needs rebuild) |
 | cuBLASLt probe + A/B | probe done (40 entries); A/B in flight |
-| Beat vLLM | **NOT achieved** — decode 7-10x behind, prefill 1.07-2.06x at C1 after the router fix; 128/C4 TTFT ahead |
+| Beat vLLM | **NOT achieved** — C1: TPOT 1.6x, TTFT 1.08-2.06x behind; C4: TPOT 2.7-2.8x behind |
 | plowc/plowrt release build | done |
 | Emit + objects + role emit | **done** (`045a38e3`) |
 | Roofline model corrected + validated on 12B | **done** |
