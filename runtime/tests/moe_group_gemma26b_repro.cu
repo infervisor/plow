@@ -237,6 +237,34 @@ int main(int argc, char** argv) {
                 float ms = 0; CK(cudaEventElapsedTime(&ms, a, b));
                 return (double)ms / iters;
             };
+            /* op 73 on REAL activations. It was missing from the first timing pass, and the
+             * served MoE segment (~11.5 ms/layer at T=4096) is ~4.7x the sum of the other
+             * four ops — the prefill router is a block-per-token loop of the decode router. */
+            bf16 *rp_proj = nullptr, *rp_sc = nullptr, *rp_pes = nullptr;
+            unsigned char* rp_tab = nullptr;
+            {
+                std::vector<bf16> proj((size_t)n_exp * H), sc(H), pes(n_exp);
+                for (auto& v : proj) v = __float2bfloat16(rnd() * 0.05f);
+                for (auto& v : sc) v = __float2bfloat16(1.0f);
+                for (auto& v : pes) v = __float2bfloat16(1.0f);
+                CK(cudaMalloc(&rp_proj, proj.size()*sizeof(bf16)));
+                CK(cudaMemcpy(rp_proj, proj.data(), proj.size()*sizeof(bf16), cudaMemcpyHostToDevice));
+                CK(cudaMalloc(&rp_sc, sc.size()*sizeof(bf16)));
+                CK(cudaMemcpy(rp_sc, sc.data(), sc.size()*sizeof(bf16), cudaMemcpyHostToDevice));
+                CK(cudaMalloc(&rp_pes, pes.size()*sizeof(bf16)));
+                CK(cudaMemcpy(rp_pes, pes.data(), pes.size()*sizeof(bf16), cudaMemcpyHostToDevice));
+                CK(cudaMalloc(&rp_tab, (size_t)T * k * 8));
+                CK(cudaFuncSetAttribute(k_router, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)arena_bytes));
+            }
+            const double t_rt = time_ms([&]{ k_router<<<grid, 256, arena_bytes>>>(rp_tab, d_x, rp_proj, rp_sc, rp_pes, H, n_exp, k, T, 1.0f / sqrtf((float)H), 1e-6f); });
+            if (const char* dump = getenv("MOE_RT_DUMP")) { /* bit-exactness: cmp two builds' tables */
+                std::vector<unsigned char> ht((size_t)T * k * 8);
+                CK(cudaMemcpy(ht.data(), rp_tab, ht.size(), cudaMemcpyDeviceToHost));
+                FILE* fp = fopen(dump, "wb"); fwrite(ht.data(), 1, ht.size(), fp); fclose(fp);
+            }
+            const double f_rt = (double)T * 2.0 * n_exp * H; /* the [T,E,H] score GEMM */
+            printf("\n  router   %8.3f ms            %6.2f TFLOP/s = %4.2f%% of peak   roof %.4f ms\n",
+                   t_rt, f_rt/(t_rt*1e-3)/1e12, 100*f_rt/(t_rt*1e-3)/989e12, f_rt/989e12*1e3);
             const double t_al = time_ms([&]{ k_align<<<1, 256>>>(d_meta, d_tab, d_rt, d_rp, d_rg, T, n_exp, k); });
             const double t_gl = time_ms([&]{ k_glu<<<grid, 256, arena_bytes>>>(d_fu, d_x, d_ewt, d_meta, d_rt, I_moe, H, n_exp, 0u); });
             const double t_dn = time_ms([&]{ k_down<<<grid, 256, arena_bytes>>>(d_part, d_fu, d_ewt, d_meta, d_rp, d_rg, H, I_moe, n_exp); });

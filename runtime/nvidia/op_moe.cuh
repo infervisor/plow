@@ -1999,6 +1999,59 @@ static __device__ void d_moe_expert_glu_norm_gemma(bf16* __restrict__ fu,
  * compile only where op_gemm.cuh was included first (interp_sm120.cu and the oracle TU both do).
  * ================================================================================ */
 
+/* softmax + top-k (lowest-id tie) + norm_topk + per-expert scale over one token's logits. */
+static __device__ __forceinline__ void plow_moe_gemma_softmax_topk(unsigned char* tab, float* sc,
+                                                                const bf16* pes, unsigned n_exp,
+                                                                unsigned k) {
+    float m = -1e30f;
+    for (unsigned e = 0; e < n_exp; e++) m = fmaxf(m, sc[e]);
+    float s = 0.0f;
+    for (unsigned e = 0; e < n_exp; e++) { sc[e] = __expf(sc[e] - m); s += sc[e]; }
+    for (unsigned e = 0; e < n_exp; e++) sc[e] /= s;
+    for (unsigned j = 0; j < k; j++) {
+        unsigned long long best = 0ull;
+        unsigned bid = 0;
+        for (unsigned e = 0; e < n_exp; e++) {
+            unsigned sb;
+            float scv = sc[e];
+            __builtin_memcpy(&sb, &scv, 4);
+            sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
+            const unsigned long long key =
+                ((unsigned long long)sb << 20) |
+                (unsigned long long)((n_exp - 1u - e) & 0xFFFFFu);
+            if (key > best) { best = key; bid = e; }
+        }
+        *(unsigned*)(tab + (size_t)j * 8) = bid;
+        *(float*)(tab + (size_t)j * 8 + 4) = sc[bid];
+        sc[bid] = -1e30f;
+    }
+    float gs = 0.0f;
+    for (unsigned j = 0; j < k; j++) gs += *(float*)(tab + (size_t)j * 8 + 4);
+    for (unsigned j = 0; j < k; j++) {
+        const unsigned win = *(unsigned*)(tab + (size_t)j * 8);
+        float gate = *(float*)(tab + (size_t)j * 8 + 4);
+        if (gs != 0.0f) gate /= gs;
+        gate *= __bfloat162float(pes[win]);
+        *(float*)(tab + (size_t)j * 8 + 4) = gate;
+    }
+}
+
+#if defined(PLOW_NV_HOPPER)
+/* Tensor-core twin (op_moe_sm90.cuh). The scalar body below runs the [T,E,H] score GEMM as
+ * fmaf dots at 0.09% of peak: 3.4 ms per layer at T=4096, more than both grouped GEMMs. */
+#ifndef MOE90_RT_MIN_T
+#define MOE90_RT_MIN_T 512u
+#endif
+static __device__ void moe90_router_gemma_pf(unsigned char* __restrict__ table,
+                                             const bf16* __restrict__ resid,
+                                             const bf16* __restrict__ proj,
+                                             const bf16* __restrict__ scale,
+                                             const bf16* __restrict__ pes, unsigned H,
+                                             unsigned n_exp, unsigned k, unsigned T, float root,
+                                             float eps, unsigned slice, unsigned nblk,
+                                             float* __restrict__ arena);
+#endif
+
 /* ---- T-TOKEN ROUTER (PLOW_DOP_MOE_ROUTER_GEMMA_PF) --------------------------------------
  * Block-per-token loop of the exact decode router. For token t, the block runs the identical
  * weightless-RMS -> h2 -> logits -> softmax -> top-k (lowest-id tie) -> norm_topk -> per-expert
@@ -2009,10 +2062,17 @@ static __device__ void d_moe_router_gemma_pf(unsigned char* __restrict__ table,
                                       unsigned H, unsigned n_exp, unsigned k, unsigned T, float root,
                                       float eps, unsigned slice, unsigned nblk,
                                       float* __restrict__ arena) {
-    float* h2 = arena;      /* [H]     */
-    float* sc = arena + H;  /* [n_exp] */
     const unsigned tid = threadIdx.x, nth = blockDim.x;
     const unsigned lane = tid & 31u, warp = tid >> 5;
+#if defined(PLOW_NV_HOPPER)
+    if (T >= MOE90_RT_MIN_T && n_exp <= 128u) {
+        moe90_router_gemma_pf(table, resid, proj, scale, pes, H, n_exp, k, T, root, eps, slice,
+                              nblk, arena);
+        return;
+    }
+#endif
+    float* h2 = arena;      /* [H]     */
+    float* sc = arena + H;  /* [n_exp] */
     __shared__ float red[32];
 
     for (unsigned tok = slice; tok < T; tok += nblk) {
@@ -2058,40 +2118,8 @@ static __device__ void d_moe_router_gemma_pf(unsigned char* __restrict__ table,
         }
         __syncthreads();
 
-        /* 4. softmax + top-k (lowest-id tie) + norm_topk + per-expert scale, serial on thread 0. */
-        if (tid == 0) {
-            float m = -1e30f;
-            for (unsigned e = 0; e < n_exp; e++) m = fmaxf(m, sc[e]);
-            float s = 0.0f;
-            for (unsigned e = 0; e < n_exp; e++) { sc[e] = __expf(sc[e] - m); s += sc[e]; }
-            for (unsigned e = 0; e < n_exp; e++) sc[e] /= s;
-            for (unsigned j = 0; j < k; j++) {
-                unsigned long long best = 0ull;
-                unsigned bid = 0;
-                for (unsigned e = 0; e < n_exp; e++) {
-                    unsigned sb;
-                    float scv = sc[e];
-                    __builtin_memcpy(&sb, &scv, 4);
-                    sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
-                    const unsigned long long key =
-                        ((unsigned long long)sb << 20) |
-                        (unsigned long long)((n_exp - 1u - e) & 0xFFFFFu);
-                    if (key > best) { best = key; bid = e; }
-                }
-                *(unsigned*)(tab + (size_t)j * 8) = bid;
-                *(float*)(tab + (size_t)j * 8 + 4) = sc[bid];
-                sc[bid] = -1e30f;
-            }
-            float gs = 0.0f;
-            for (unsigned j = 0; j < k; j++) gs += *(float*)(tab + (size_t)j * 8 + 4);
-            for (unsigned j = 0; j < k; j++) {
-                const unsigned win = *(unsigned*)(tab + (size_t)j * 8);
-                float gate = *(float*)(tab + (size_t)j * 8 + 4);
-                if (gs != 0.0f) gate /= gs;
-                gate *= __bfloat162float(pes[win]);
-                *(float*)(tab + (size_t)j * 8 + 4) = gate;
-            }
-        }
+        /* 4. serial on thread 0. */
+        if (tid == 0) plow_moe_gemma_softmax_topk(tab, sc, pes, n_exp, k);
         __syncthreads(); /* arena reused next token */
     }
 }

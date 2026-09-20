@@ -595,6 +595,44 @@ the corrected roofline model is right.
 4. **hd512 GQA-8 role.** 26B runs the generic hd512 body because the px4 BQ64 object
    hardcodes `n_kv_head=1`. A GQA-8 variant is the long-context prefill lever.
 
+## Per-rung kernel pass (2026-09-20): the prefill router was the top kernel
+
+Standalone harness `runtime/tests/moe_group_gemma26b_repro.cu` now times all five MoE prefill
+ops (73-77). Per layer, ms:
+
+| T | router 73 | align | glu | down | combine |
+|---|---|---|---|---|---|
+| 128 | 0.112 | 0.013 | 0.517 | 0.372 | 0.009 |
+| 1024 | 0.881 | 0.042 | 0.519 | 0.414 | 0.110 |
+| 4096 | 3.410 | 0.146 | 1.016 | 0.867 | 0.419 |
+
+* Op 73 ran the [T,E,H] score GEMM as scalar fmaf dots: 0.09% of peak, linear in T,
+  larger than both grouped GEMMs from T=1024 up. It was missing from the first timing pass.
+* FIX `moe90_router_gemma_pf` (op_moe_sm90.cuh): one m128n128 wgmma tile per 128 tokens,
+  h2 computed by the threads straight into the swizzled A stage as bf16 (what vLLM feeds
+  its GateLinear), f32 accumulators = the fp32 logits vLLM asks for, logits parked in the
+  dead stage ring, thread-per-token softmax/top-k. Flat 0.31 ms at every T (10.5x at 4096).
+  Scalar body kept for T < MOE90_RT_MIN_T (512); crossover ~T=400.
+* Selection vs scalar on synthetic near-uniform logits (worst case): 98.5-99.2% identical
+  top-k sets, gates within 2e-4. Served: 1456-token needle prompt answered identically.
+
+Served TTFT ms, C1 / C4 (before -> after | vLLM):
+  128   42.15 -> 42.32 | 39.52      84.97 -> 63.26 | 73.31  (first metric ahead of vLLM)
+  1024  124.96 -> 71.85 | 44.11     392.60 -> 190.06 | 93.46
+  4096  408.93 -> 181.91 | 93.71    1046.59 -> 463.20 | 227.59
+  8192  828.78 -> 373.66 | 181.10   3869.51 -> 2861.86 | 458.74
+Served gain (-227 ms at 4096/C1) is 2.5x the standalone estimate (-92 ms). TPOT unchanged.
+
+NULLS, do not retry:
+* warp-per-token router (bit-exact, no barriers): 1.25x at 4096, slower at <=512. The scalar
+  body was work-bound, not barrier-bound — all 8 warps were already busy.
+* warp-per-token combine (bit-exact): slower at every T (0.419 -> 0.500 at 4096). Reverted.
+
+LOW-RUNG ROOF CORRECTION: at T=128 all 128 experts are hit, so glu/down must stream every
+expert's weights (1.02 GB + 0.51 GB per layer). The roof is BANDWIDTH (0.30 + 0.15 ms), not
+FLOPs; glu is at 59% and down at 41% of it. Tile padding is not the waste — the lever is
+faster B staging (TMA load engine, tma_ws_moe_group.cu), most of all for down (22 n-tiles).
+
 ## Status
 
 | step | state |
@@ -604,7 +642,7 @@ the corrected roofline model is right.
 | vLLM 26B reference ladder | **done** (8 cells) |
 | Plow 26B rung ladder | **done** (6 cells; 8K rung blocked by max_ctx, now fixed to 8704, needs rebuild) |
 | cuBLASLt probe + A/B | probe done (40 entries); A/B in flight |
-| Beat vLLM | **NOT achieved** — decode 7-10x behind, prefill 2.8-4.6x |
+| Beat vLLM | **NOT achieved** — decode 7-10x behind, prefill 1.07-2.06x at C1 after the router fix; 128/C4 TTFT ahead |
 | plowc/plowrt release build | done |
 | Emit + objects + role emit | **done** (`045a38e3`) |
 | Roofline model corrected + validated on 12B | **done** |

@@ -315,6 +315,121 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
     }
 }
 
+/* ==========================================================================================
+ * T-TOKEN ROUTER through the tensor core  (PLOW_DOP_MOE_ROUTER_GEMMA_PF, T >= MOE90_RT_MIN_T)
+ *
+ * One m-tile = 128 tokens; logits = h2 [128,H] x proj^T [n_exp<=128,H] is ONE m128n128 wgmma
+ * tile swept over K=H. h2 = resid*invrms*scale*root is computed by the threads straight into
+ * the swizzled A stage as bf16 — the dtype vLLM's router feeds its GateLinear — and the f32
+ * accumulators are the fp32 logits that layer asks for. proj stages by cp.async like any B.
+ * After the k sweep the ring is dead, so it holds the [128][128] f32 logits for the
+ * thread-per-token softmax/top-k (the scalar body's exact selection code).
+ * NOT bit-identical to the scalar body: bf16 h2 and the core's K association. Selection is
+ * checked against it in runtime/tests/moe_group_gemma26b_repro.cu.
+ * ========================================================================================== */
+static_assert(MOE90_STAGES * (MOE90_ABUF + MOE90_BBUF) * sizeof(__nv_bfloat16) >=
+                  (size_t)MOE90_BM * MOE90_BN * sizeof(float),
+              "router logits reuse the dead stage ring");
+static __device__ void moe90_router_gemma_pf(unsigned char* __restrict__ table,
+                                             const bf16* __restrict__ resid,
+                                             const bf16* __restrict__ proj,
+                                             const bf16* __restrict__ scale,
+                                             const bf16* __restrict__ pes, unsigned H,
+                                             unsigned n_exp, unsigned k, unsigned T, float root,
+                                             float eps, unsigned slice, unsigned nblk,
+                                             float* __restrict__ arena) {
+    const int mtiles = ((int)T + MOE90_BM - 1) / MOE90_BM;
+    const int ksteps = ((int)H + MOE90_BK - 1) / MOE90_BK;
+    __nv_bfloat16* As = (__nv_bfloat16*)sm90_align1024(arena);
+    __nv_bfloat16* Bs = As + MOE90_STAGES * MOE90_ABUF;
+    float* logit = (float*)As;
+    const int tid = threadIdx.x, wg = tid >> 7, wiw = (tid >> 5) & 3, lane = tid & 31;
+    const int warp = tid >> 5;
+    __shared__ float inv[MOE90_BM];
+
+    for (int tile = (int)slice; tile < mtiles; tile += (int)nblk) {
+        const int rowbase = tile * MOE90_BM;
+
+        /* weightless RMS: warp-per-row, 16 rounds x 8 warps = the 128 rows of the tile. */
+        for (int i = 0; i < MOE90_BM / 8; i++) {
+            const int row = warp * (MOE90_BM / 8) + i;
+            const bool in = rowbase + row < (int)T;
+            const bf16* r = resid + (size_t)(in ? rowbase + row : 0) * H;
+            float part = 0.0f;
+            for (unsigned h = (unsigned)lane; h < H; h += 32u) {
+                const float v = __bfloat162float(r[h]);
+                part += v * v;
+            }
+            part = plow_warp_sum(part);
+            if (lane == 0) inv[row] = rsqrtf(part / (float)H + eps);
+        }
+        __syncthreads();
+
+        float acc[64];
+#pragma unroll
+        for (int i = 0; i < 64; i++) acc[i] = 0.f;
+
+        auto stage = [&](int ks, int buf) {
+            __nv_bfloat16* Ad = As + buf * MOE90_ABUF;
+            for (int L = tid; L < MOE90_BM * MOE90_CH; L += (int)PLOW_NV_THREADS) {
+                const int row = L / MOE90_CH, c = L % MOE90_CH;
+                const int kk = ks * MOE90_BK + c * 8;
+                const bool in = rowbase + row < (int)T;
+                const bf16* r = resid + (size_t)(in ? rowbase + row : 0) * H;
+                const float iv = inv[row];
+                alignas(16) __nv_bfloat16 v[8];
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const bool ok = in && kk + j < (int)H;
+                    const int h = ok ? kk + j : 0;
+                    const float x = __bfloat162float(r[h]) * iv * __bfloat162float(scale[h]) * root;
+                    v[j] = __float2bfloat16(ok ? x : 0.0f);
+                }
+                *(uint4*)(Ad + sm90_swz_off<MOE90_BK, 8>(row, c)) = *(const uint4*)v;
+            }
+            /* Generic shared stores must be visible to WGMMA's async proxy. */
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            moe90_stage_b(Bs + buf * MOE90_BBUF, proj, tid, 0, ks * MOE90_BK, n_exp, H);
+        };
+#pragma unroll
+        for (int s = 0; s < MOE90_STAGES - 1; s++) {
+            if (s < ksteps) stage(s, s);
+            sm90_cp_commit();
+        }
+        sm90_wg_fence();
+
+        for (int ks = 0; ks < ksteps; ks++) {
+            const int fetch = ks + MOE90_STAGES - 1;
+            if (fetch < ksteps) stage(fetch, fetch % MOE90_STAGES);
+            sm90_cp_commit();
+            sm90_cp_wait<MOE90_STAGES - 1>();
+            __syncthreads();
+            const int cb = ks % MOE90_STAGES;
+            moe90_wgmma_k(acc, As + cb * MOE90_ABUF, Bs + cb * MOE90_BBUF, wg);
+            sm90_wg_commit();
+            sm90_wg_wait<0>();
+            __syncthreads();
+        }
+
+#pragma unroll
+        for (int g = 0; g < MOE90_NBLK; g++)
+#pragma unroll
+            for (int hi = 0; hi < 2; hi++) {
+                const int rr = wg * 64 + sm90_acc_row(wiw, lane, hi);
+#pragma unroll
+                for (int lo = 0; lo < 2; lo++)
+                    logit[rr * MOE90_BN + sm90_acc_col(g, lane, lo)] =
+                        acc[sm90_acc_reg(g, hi, lo)];
+            }
+        __syncthreads();
+
+        if (tid < MOE90_BM && rowbase + tid < (int)T)
+            plow_moe_gemma_softmax_topk(table + (size_t)(rowbase + tid) * k * 8,
+                                        logit + tid * MOE90_BN, pes, n_exp, k);
+        __syncthreads();
+    }
+}
+
 #if PLOW_NV_W8A8
 /* ==========================================================================================
  * w8a8 (e4m3) twins. Hopper has NO native fp8 mma.sync, so wgmma.m64n128k32.f32.e4m3.e4m3 is
