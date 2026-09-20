@@ -1132,12 +1132,16 @@ static __device__ void d_moe_expert_down_gemma(float* __restrict__ part, const b
     constexpr unsigned LSG = PLOW_MOE_DOWN_SG;       /* sub-groups (channels) per warp */
     constexpr unsigned LSL = 32u / LSG;               /* lanes per sub-group */
     constexpr unsigned LCH = LSL * 8u;                /* elems a sub-group covers per chunk */
-    if (nrow == 1u && (I_moe % LCH) == 0u) {
+    /* B>1 too: each sub-group resolves its own (slot, h), so the channel-major batch order
+     * needs nothing but the batch-aware unflat. Gating this on nrow==1 sent every B>=2 step
+     * to the unblocked body below: 651 GB/s against 2058 at B=1. */
+    if ((I_moe % LCH) == 0u) {
         const unsigned lane = threadIdx.x & 31u;
         const unsigned sg = lane / LSL;
         const unsigned sl = lane % LSL;
         const unsigned nw = blockDim.x >> 5;
-        const unsigned total = k * H;
+        const unsigned nslot = nrow * k;
+        const unsigned total = nslot * H;
         const unsigned per = (total + nblk - 1u) / nblk;
         const unsigned f0 = slice * per;
         const unsigned f1 = (f0 + per < total) ? (f0 + per) : total;
@@ -1152,7 +1156,7 @@ static __device__ void d_moe_expert_down_gemma(float* __restrict__ part, const b
             if (f < f1) {
                 valid = true;
                 unsigned slot, h;
-                plow_moe_unflat(f, k, H, 1u, &slot, &h);
+                plow_moe_unflat(f, nslot, H, nrow, &slot, &h);
                 dst = part + (size_t)slot * H + h;
                 const unsigned eid = plow_moe_slot_expert(table, slot);
                 const unsigned long long db = (eid < n_exp) ? ewt[(size_t)eid * 2 + 1] : 0ull;

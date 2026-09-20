@@ -49,6 +49,13 @@ __global__ void k_score(float* score, const bf16* resid, const bf16* proj, const
                              blockIdx.x, gridDim.x, nrow);
 }
 
+/* The emit default (ScoreFast); the recipe's PLOW_GEMMA_MOE_ROUTER_EXACT=1 selects k_score. */
+__global__ void k_score_fast(float* score, const bf16* resid, const bf16* proj, const bf16* scale,
+                             unsigned H, unsigned n_exp, float root, float eps, unsigned nrow) {
+    d_moe_router_gemma_score_fast(score, resid, proj, scale, H, n_exp, root, eps,
+                                  blockIdx.x, gridDim.x, nrow, (float*)g_arena);
+}
+
 __global__ void k_topk(unsigned char* table, const float* score, const bf16* pes,
                        unsigned n_exp, unsigned k, unsigned nrow) {
     d_moe_router_gemma_topk(table, score, pes, n_exp, k, blockIdx.x, gridDim.x, nrow,
@@ -145,11 +152,21 @@ int main(int argc, char** argv) {
         /* score CTA count mirrors the packet: 8 experts per CTA over the (row,expert) pairs. */
         const unsigned gscore = (B*n_exp + 7u)/8u;
         double t_sc = time_ms([&]{ k_score<<<gscore,256,arena_bytes>>>(d_score,d_x,d_proj,d_scale,H,n_exp,root,1e-6f,B); }, iters);
+        CK(cudaFuncSetAttribute(k_score_fast,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)arena_bytes));
+        double t_sf = time_ms([&]{ k_score_fast<<<gscore,256,arena_bytes>>>(d_score,d_x,d_proj,d_scale,H,n_exp,root,1e-6f,B); }, iters);
+        printf("         score_fast %.4f ms (exact %.4f)\n", t_sf, t_sc);
         double t_tk = time_ms([&]{ k_topk<<<1,256,arena_bytes>>>(d_tab,d_score,d_pes,n_exp,k,B); }, iters);
         CK(cudaDeviceSynchronize());
         double t_gl = time_ms([&]{ k_glu<<<grid,256,arena_bytes>>>(d_fu,d_x,d_tab,d_ewt,k,I_moe,H,n_exp,B); }, iters);
         double t_dn = time_ms([&]{ k_down<<<grid,256,arena_bytes>>>(d_part,d_fu,d_tab,d_ewt,k,H,I_moe,n_exp,B); }, iters);
         CK(cudaDeviceSynchronize());
+        if (const char* dump = getenv("MOE_DN_DUMP")) { /* numeric compare across two builds */
+            std::vector<float> hp((size_t)B * k * H);
+            CK(cudaMemcpy(hp.data(), d_part, hp.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            char path[512];
+            snprintf(path, sizeof path, "%s.B%u", dump, B);
+            FILE* fp = fopen(path, "wb"); fwrite(hp.data(), sizeof(float), hp.size(), fp); fclose(fp);
+        }
 
         /* Bytes the GLU must read at this batch: union of experts picked, x 2I x H x 2B.
          * Upper bound = min(B*k, n_exp) distinct experts. */
