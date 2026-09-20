@@ -497,6 +497,39 @@ __device__ __forceinline__ void plow_moe_row_rms(float* __restrict__ inv, float*
     const unsigned tid = threadIdx.x, nth = blockDim.x;
     const unsigned lane = tid & 31u, warp = tid >> 5;
     const unsigned nw = (nth + 31u) >> 5;
+    /* BATCH>1. The loop below costs 11 dependent 2-byte loads and TWO barriers per row, and every
+     * block of the router-score and expert-GLU ops runs it for all B rows. Here a thread owns
+     * 8-element vectors (H % 8 == 0), the rows' loads do not depend on each other, and the whole
+     * batch shares one barrier pair. The per-thread partition changes, so inv differs from the
+     * scalar body in the last ulp; B=1 keeps the scalar body and its bit-identity. */
+    if (nrow > 1u && (H & 7u) == 0u) {
+        __shared__ float rms_w[PLOW_MOE_MAXB * PLOW_NV_WARPS];
+        const unsigned nvec = H >> 3;
+        for (unsigned r = 0; r < nrow; r++) {
+            const bf16* rr = resid + (size_t)r * H;
+            float part = 0.0f;
+            for (unsigned c = tid; c < nvec; c += nth) {
+                const bf16v8 x = ld_glob8(rr + c * 8u);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float v = __bfloat162float(x.x[j]);
+                    part += v * v;
+                }
+            }
+            part = plow_warp_sum(part);
+            if (lane == 0) rms_w[r * PLOW_NV_WARPS + warp] = part;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            for (unsigned r = 0; r < nrow; r++) {
+                float t = 0.0f;
+                for (unsigned i = 0; i < nw; i++) t += rms_w[r * PLOW_NV_WARPS + i];
+                inv[r] = rsqrtf(t / (float)H + eps);
+            }
+        }
+        __syncthreads();
+        return;
+    }
     for (unsigned r = 0; r < nrow; r++) {
         const bf16* rr = resid + (size_t)r * H;
         float part = 0.0f;
@@ -828,6 +861,48 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
             }
             acc = plow_warp_sum(acc);
             if (lane == 0) score[e] = acc;
+        }
+        return;
+    }
+    /* BATCH>1, vectorized. The body below walks each (row, expert) pair with 88 DEPENDENT
+     * rounds of three 2-byte global loads: 11% of a 26B B=16 step (2.0 ms) to produce 2048
+     * logits. Here `scale*root` is staged once per CTA (it is the same for every pair), and the
+     * residual and the expert row stream as 16 B loads with GV_MOE_UN chunks in flight, so a
+     * pair is ~3 rounds. Same per-element product as the scalar body; the lane partition (and
+     * so the warp-sum rounding of a logit) changes, as it already does on the B=1 arm. */
+    if (H <= PLOW_MOE_XN_MAX) {
+        float* sr = arena;
+        for (unsigned h = tid; h < H; h += blockDim.x) sr[h] = __bfloat162float(scale[h]) * root;
+        __syncthreads();
+        const unsigned nchunk = (H + GV_STEP - 1u) / GV_STEP;
+        const unsigned npair_v = nrow * n_exp;
+        for (unsigned idx = slice * 8u + warp; idx < npair_v; idx += nblk * 8u) {
+            const unsigned row = idx / n_exp;
+            const unsigned e = idx - row * n_exp;
+            const bf16* rr = resid + (size_t)row * H;
+            const float invrms = invs[row];
+            const bf16* pr = proj + (size_t)e * H;
+            float acc = 0.0f;
+            for (unsigned c = 0; c < nchunk; c += GV_MOE_UN) {
+                bf16v8 wv[GV_MOE_UN], xv[GV_MOE_UN];
+                unsigned kk[GV_MOE_UN];
+#pragma unroll
+                for (int u = 0; u < GV_MOE_UN; u++) {
+                    kk[u] = (c + (unsigned)u) * GV_STEP + lane * 8u;
+                    wv[u] = (kk[u] < H) ? ld_glob8(pr + kk[u]) : bf16v8_zero();
+                    xv[u] = (kk[u] < H) ? ld_glob8(rr + kk[u]) : bf16v8_zero();
+                }
+#pragma unroll
+                for (int u = 0; u < GV_MOE_UN; u++) {
+                    if (kk[u] >= H) continue;
+#pragma unroll
+                    for (int j = 0; j < 8; j++)
+                        acc = fmaf(__bfloat162float(xv[u].x[j]) * invrms * sr[kk[u] + (unsigned)j],
+                                   __bfloat162float(wv[u].x[j]), acc);
+                }
+            }
+            acc = plow_warp_sum(acc);
+            if (lane == 0) score[(size_t)row * n_exp + e] = acc;
         }
         return;
     }
@@ -1961,6 +2036,23 @@ __device__ __forceinline__ void plow_moe_stage_xn(bf16* __restrict__ xn,
     __shared__ float invs_b[PLOW_MOE_MAXB];
     plow_moe_row_rms(invs_b, rms_red_b, resid, H, nrow, eps);
     const unsigned tot = nrow * H;
+    if ((H & 7u) == 0u) {
+        /* 8 elements per load/store (a vector never straddles rows): 22 rounds per thread at
+         * B=16 instead of 176, same per-element product. */
+        const unsigned nvec = tot >> 3;
+        for (unsigned c = threadIdx.x; c < nvec; c += blockDim.x) {
+            const unsigned i = c * 8u, row = i / H;
+            const bf16v8 x = ld_glob8(resid + i), g = ld_glob8(gamma + (i - row * H));
+            bf16v8 o;
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                o.x[j] = __float2bfloat16(__bfloat162float(x.x[j]) * invs_b[row] *
+                                          __bfloat162float(g.x[j]));
+            st_glob8(xn + i, o);
+        }
+        __syncthreads();
+        return;
+    }
     for (unsigned i = threadIdx.x; i < tot; i += blockDim.x) {
         const unsigned row = i / H;
         xn[i] = __float2bfloat16(__bfloat162float(resid[i]) * invs_b[row] *

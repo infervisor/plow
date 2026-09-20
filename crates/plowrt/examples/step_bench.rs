@@ -49,10 +49,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         e.has_prefill()
     );
 
-    // Synthetic prompt (numerics are irrelevant to step time; ids in-vocab).
-    let prompt: Vec<u32> = (0..ctx as u32).map(|i| 100 + (i % 1000)).collect();
+    // Synthetic prompts, ids in-vocab. One PER SLOT: identical rows route to the same top-k
+    // experts, so a MoE model's B>1 step touched 8 experts where serving touches ~60 (slot 0
+    // keeps the historical prompt, so B=1 numbers are unchanged).
     let mut last = vec![0u32; slots];
     for b in 0..slots {
+        let prompt: Vec<u32> = (0..ctx as u32)
+            .map(|i| 100 + ((i + 131 * b as u32) % 1000))
+            .collect();
         e.begin_slot(b, ctx + steps + 1)?;
         let t0 = Instant::now();
         last[b] = if e.has_prefill() {

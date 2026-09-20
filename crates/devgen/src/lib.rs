@@ -6088,7 +6088,11 @@ fn emit_phase(
                         };
                         moe_dec_group = grp;
                         // bf16 path: fused norm + expert GLU (one fewer gate)
-                        b.emit(DevOp::MoeExpertGluNormGemma, glu_cus, &[c_sel, c_pf], |d| {
+                        // A rung below the threshold still carries the align op, but nothing waits
+                        // on it: on the router -> GLU chain its 30 no-op packets cost 0.27 ms of a
+                        // 5.9 ms B=1 step. Dependencies are not part of what the validator compares.
+                        let c_tab = if grp.is_some_and(|min| t >= min) { c_sel } else { c_rt };
+                        b.emit(DevOp::MoeExpertGluNormGemma, glu_cus, &[c_tab, c_pf], |d| {
                             d.t[0] = if grp.is_some() { n.moe_fug } else { n.moe_mfu };
                             d.t[1] = n.x;
                             d.t[2] = n.moe_tab;
