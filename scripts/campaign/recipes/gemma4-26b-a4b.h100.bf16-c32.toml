@@ -57,10 +57,14 @@ PLOW_GEMMA_MOE_ROUTER_EXACT = "1"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
-role_files = [
-  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
-  "interp_sm90a_pfattn_hd256_bkv32.cubin",
-]
+# EMPTY, like the 12B C32 recipe. BOTH attention roles need the M4096/M8192 prefill
+# rungs and chunk 1024 emits neither, so shipping their objects only makes the role
+# emit refuse:
+#   panicked at devgen/src/lib.rs:9594: prefill attention object: packet has no
+#   M4096/M8192 paired HD256/GQA2 attention rungs
+# The hd512 requirement was obvious and handled; the HD256/GQA2 role has the SAME one.
+# Full-attention and sliding layers both fall back to the in-megakernel bodies here.
+role_files = []
 [objects.env]
 # MUST stay 0 for a MoE model: PLOW_NV_FATLITE compiles the Gemma MoE PREFILL opcodes
 # out of the fat object, and they are already absent from the GEMM (SEG_GEMM) and
@@ -78,10 +82,12 @@ PLOW_BUILD_PFATTN_KV64 = "0"
 PLOW_BUILD_PFATTN_QK_UNROLL = "4"
 
 [emit_roles.env]
-# The hd512 roles need the 4096/8192 prefill rungs, which chunk 1024 does not emit, so
-# the full-attention layers fall back to the in-megakernel body. Same trade the 12B C32
-# recipe makes.
-PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+# BOTH off: every attention role needs the M4096/M8192 prefill rungs and chunk 1024
+# emits neither, so both fall back to the in-megakernel bodies. Same trade the 12B C32
+# recipe makes (its emit_roles has both at 0 and role_files empty). This is the cost of
+# buying concurrency: the serving cell gives up the attention roles that the realtime
+# cell keeps.
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 
 [serve.env]
