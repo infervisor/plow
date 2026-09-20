@@ -5611,8 +5611,14 @@ fn emit_phase(
             && !gemv_family
             && gemma4_w8a8_gemm_glu_role::select_fused(
                 gemma4_gemm_glu_role::select_fused(
-                    rewrite_lower::fused(b, rewrite_lower::Lowering::GatedMlp, w.wg)
-                        .unwrap_or_else(|| glu_fusion_wins(tg, inter_l, c.hidden, n_cu)),
+                    // PLOW_NO_GLU_FUSE is an OBJECT constraint, so it outranks what the rewrite
+                    // extracted: the fused body's 128 accumulators do not fit the 128-register
+                    // FATLITE launch, FATLITE compiles the GemmGlu arm out, and the GLU role object
+                    // covers only its own rungs. Asking the rewrite first emitted GemmGlu at every
+                    // rung and the 12B's 128-row prefill trapped on its first launch.
+                    !(!emit_is_amd() && emit_config::active().no_glu_fuse)
+                        && rewrite_lower::fused(b, rewrite_lower::Lowering::GatedMlp, w.wg)
+                            .unwrap_or_else(|| glu_fusion_wins(tg, inter_l, c.hidden, n_cu)),
                     gemma4_glu_role,
                     tg,
                     inter_l,
