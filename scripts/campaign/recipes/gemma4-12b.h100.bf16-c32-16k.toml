@@ -1,0 +1,82 @@
+# Gemma-4-12B-it, H100 SXM5, BF16, TP1 — the SERVING cell (C16/C32) at a 16k context.
+# ladder16k with 32 slots: chunk 1024 keeps a slot's sliding ring at 2048 rows, so 32 slots
+# and the on-demand full-attention KV of the long inputs fit beside 22 GiB of weights. Both
+# attention roles need the 4096 rung and are off (same trade as gemma4-12b.h100.bf16-c32.toml).
+
+[cell]
+name = "gemma4-12b.h100.bf16-c32-16k"
+model = "google/gemma-4-12B-it"
+revision = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+hf_dir = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "bf16"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_SEG_PURE_GEMM = "1"
+PLOW_SEG_FA512 = "1"
+PLOW_SEG_FA256_GQA2 = "1"
+PLOW_TMA_GEMM = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+# The BF16 NRN2 -> q/k/v fold (c1f1ac38) decodes garbage on the H100, and not the same garbage
+# twice: first token right, the rest noise. Off until the fold arm is qualified here.
+PLOW_NO_FUSE_NRN = "1"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+PLOW_SLIDING_NS_CAP = "1"
+PLOW_MAX_CHUNK = "1024"
+PLOW_FUSE_ARGMAX = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = []
+[objects.env]
+PLOW_BUILD_FATLITE = "1"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
+PLOW_BUILD_MASKED_PADDING = "1"
+PLOW_BUILD_PFATTN_WG = "1"
+PLOW_BUILD_PFATTN_KV16 = "0"
+PLOW_BUILD_PFATTN_KV64 = "0"
+PLOW_BUILD_PFATTN_QK_UNROLL = "4"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "0"
+PLOW_PF_SEG_PURE = "1"
+PLOW_PF_SEG_FA512 = "1"
+PLOW_PF_INTERLEAVE = "0"
+PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
+LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096 8192"
+concs = "1 4 8"
+nprompt = 10
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+model_id = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer in one short sentence.<end_of_turn>\n<start_of_turn>model\n"
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096 8192 15000"
+concs = "16 32"
+nprompt = 64
+serve_env = { PLOW_MULTISTEP = "8", PLOW_DECODE_MAX_RUNG = "32", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
+
+[reference]
+csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.csv"

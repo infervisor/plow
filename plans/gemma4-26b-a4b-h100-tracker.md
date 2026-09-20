@@ -1332,6 +1332,29 @@ ITL improves (150 -> 100 ms). Smaller chunks prefill less efficiently; stay unca
   launches per chunk) — open. The MoE GEMMs run ~190 TFLOPS against a staging roof of ~286 (85
   MACs per element staged through smem); the vendor grouped route remains the -18 ms/chunk item.
 
+### 32 slots at a 16k context: `gemma4-26b-a4b.h100.bf16-c32-16k` (2026-09-20, night)
+
+The `-c32` recipe at `max_ctx = 16384` (chunk 1024 -> 2048-row sliding ring = 0.42 GB per slot,
+13.4 GB for 32; full-attention KV is VMM-mapped on demand), grouped decode on, attention roles
+off (they need the 4096 rung). Coherence gate passes; packet `p26c32`. Same serving cells:
+
+| cell | 16-slot ctx16k `p26l` | 32-slot c32-16k `p26c32` | vLLM |
+|---|---:|---:|---:|
+| 128/C32 TTFT / tok/s | 1622 ms / 1012 | **119 ms** / **1435** | 130 / 2648 |
+| 1024/C32 TTFT / tok/s | 2135 / 799 | 502 / **964** | 417 / 1736 |
+| 4096/C32 TTFT / tok/s | 3628 / **501** | 2003 / 443 | 903 / 1081 |
+| 8192/C32 TTFT / tok/s | 6023 / **319** | 8181 / 235 | 1692 / 620 |
+| 128/C16 TTFT / tok/s | 90 / 981 | **70** / 999 | 413 / 1322 |
+| 4096/C16 TTFT / tok/s | **469** / **499** | 702 / 422 | 525 / 885 |
+| 15000/C16 TTFT / tok/s | **2442** / **180** | 7990 / 121 | 1570 / 340 |
+
+It removes the C32 queueing at short inputs (one new win: 128/C32 TTFT) and loses from 4096 up:
+1024-row chunks without the attention roles prefill much less efficiently, and long inputs are
+prefill-bound. So the serving packet is an input-length choice — 32-slot for <= 1024, the
+16-slot chunk-4096 packet for >= 4096 — until the sliding ring stops scaling with the chunk
+(chunk-local KV scratch) or the attention roles learn the 1024 / 2048 rungs. Note
+`next_pow2(window + chunk - 1)`: chunk 3072 needs the same 4096-row ring as chunk 2048.
+
 ## Status
 
 | step | state |

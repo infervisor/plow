@@ -954,6 +954,27 @@ Ahead on 12 of 60 metric-cells (was 10). TPOT is 1.11–1.18x vLLM at C1 (was 1.
 1.15–1.52x at C4, 1.22–1.64x at C16; tok/s 1.12–1.39x through C16 (was 1.4–1.9x). The long-input
 C16 TPOT is prefill stall, not decode (26B tracker, tick timeline): a 4096-row chunk is ~186 ms here.
 
+### GEMV walk depth 12, packet `p12u` (2026-09-20, night)
+
+`PLOW_NV_GEMV_MMA_UNB` 8 -> 12 (now the default): step_bench 11.93/13.16/16.03 -> 11.18/12.58/15.25
+ms at B=1/4/16 (16: 11.52/12.93/15.77; K=3840 is 120 k32 steps, 12 divides it). Ladder:
+
+| cell | TPOT p12s -> p12u (vLLM) | tok/s (vLLM) |
+|---|---:|---:|
+| 128/C1 | 11.75 -> **10.96** (10.55) | 90.7 (94.8) |
+| 1024/C1 | 11.96 -> 11.20 (10.62) | 86.9 (94.1) |
+| 15000/C1 | 12.58 -> 11.82 (10.62) | 53.9 (63.3) |
+| 128/C4 | 12.17 -> 11.61 (10.58) | 337 (367) |
+| 128/C16 | 13.46 -> 12.68 (11.01) | 1138 (1364) |
+| 1024/C16 | 19.47 -> 18.82 (13.76) | 741 (940) |
+
+TPOT is 1.04–1.11x vLLM at C1 (night start: 1.36–1.44x), 1.10–1.50x at C4, 1.15–1.61x at C16.
+By bytes the B=1 step is ~85% bandwidth-efficient now (GemvGlu at ~89% of its roof); what is
+left at C1 is the serial chain (540 ops, gate 19%). The NRN fold would shorten it but its arm is
+in the staged dot8 path the 12B no longer takes (`gemv_mma_b1`), so it needs a walk-compatible
+form as well as the H100 garbage root-caused. Negatives: attention row batching
+`PLOW_NV_FA_WPR_RB` 4 / 8 (B=16 -2% / -0.6%, B=1 +0.8% / +3.6%).
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
