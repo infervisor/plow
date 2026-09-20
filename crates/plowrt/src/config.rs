@@ -1218,6 +1218,11 @@ pub struct AmdRuntimeConfig {
     /// The engine REFUSES to serve a packet whose prefill collectives are
     /// row-banded (`PLOW_GLM_XR_BAND`) under this flag rather than half-applying
     /// the shrink.
+    ///
+    /// On the CUDA engine the same flag drives the MoE RAGGED TAIL only
+    /// (`GpuEngine::patch_moe_rows`): the Gemma MoE prefill row operands follow the
+    /// launch's real rows while the dense ops keep the bucket width, because their
+    /// cuBLASLt plans are shape-static. Bucket choice is unchanged there.
     #[arg(long = "amd-ragged-chunk", env = "PLOW_RAGGED_CHUNK", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub ragged_chunk: bool,
 

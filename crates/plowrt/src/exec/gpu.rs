@@ -1728,6 +1728,14 @@ struct PrefillBucket {
     flash_sites: Vec<usize>,
     /// lm_head GEMM sites (`M == 1`): patch `i[4] = real-1`.
     lmhead_sites: Vec<usize>,
+    /// MoE RAGGED TAIL: `(inst, i-field)` of the Gemma MoE prefill ops that carry the row count
+    /// (`kvrow::PREFILL_ROW_FIELDS`). Rewritten to the launch's REAL rows so padding is never
+    /// routed: the grouped GEMMs take their work from `MoeAlignGemmaPf`'s table, and a
+    /// 129-row chunk in the 512 bucket otherwise spends ~3/4 of its MoE time on pad rows.
+    /// MoE rows are independent, so real rows compute exactly what they did.
+    moe_row_sites: Vec<(usize, usize)>,
+    /// Row count `moe_row_sites` currently hold on the device.
+    moe_rows: u32,
     /// `FlashMerge` sites — neutered (`i[0] = 0`) in PX-1 batched mode, where
     /// the flash op runs the fused (`nsplit=1`, `t5=at`) epilogue per request.
     merge_sites: Vec<usize>,
@@ -7421,7 +7429,25 @@ impl GpuEngine {
             // that also LOOKS 1.75x faster because the flash never grows past
             // the first chunk's keys (PX-17 measured exactly that on main).
             let mut fp8_kv = false;
+            let mut moe_rows = Vec::new();
             for (ix, inst) in g.insts.iter().enumerate() {
+                if matches!(
+                    DevOp::from_u16(inst.op),
+                    Some(
+                        DevOp::MoeRouterGemmaPf
+                            | DevOp::MoeAlignGemmaPf
+                            | DevOp::MoeCombineNormGemmaPf
+                    )
+                ) {
+                    if let Some(crate::exec::kvrow::RowField::Rows(f)) =
+                        crate::exec::kvrow::prefill_row_field(inst.op)
+                    {
+                        // Same guard as `rebase_chunk_rows`: only a field that IS the bucket width.
+                        if inst.i[f] == g.t {
+                            moe_rows.push((ix, f));
+                        }
+                    }
+                }
                 if (inst.op == DevOp::HeadNormRope as u16
                     || inst.op == DevOp::HeadNormRopeFp8 as u16)
                     && inst.fj[1] != 0
@@ -7467,6 +7493,8 @@ impl GpuEngine {
                 flash_sites: flash,
                 lmhead_sites: lmhead,
                 merge_sites: merge,
+                moe_row_sites: moe_rows,
+                moe_rows: g.t,
                 fp8_kv,
                 batch_patched: false,
                 d_ctr,
@@ -7541,6 +7569,36 @@ impl GpuEngine {
     /// chunks without corrupting the partially-built cache. On the final chunk
     /// the first generated token is read back (`PrefillStep::Done`), the exact
     /// postcondition of the whole-prompt [`Self::prefill_slot`].
+    /// MoE ragged tail (see `PrefillBucket::moe_row_sites`): point the bucket's MoE row operands
+    /// at `rows` real rows and enqueue that window on the engine stream, ahead of the launch.
+    /// `PLOW_RAGGED_CHUNK=0` keeps the padded bucket width (the control arm).
+    fn patch_moe_rows(&mut self, bi: usize, rows: u32) -> Result<()> {
+        let sz = std::mem::size_of::<DevInst64>();
+        let b = &mut self.prefill[bi];
+        let rows = if RuntimeConfig::get().amd.ragged_chunk {
+            rows
+        } else {
+            b.t
+        };
+        if b.moe_row_sites.is_empty() || b.moe_rows == rows {
+            return Ok(());
+        }
+        for &(ix, f) in &b.moe_row_sites {
+            b.h_inst[ix].i[f] = rows;
+        }
+        b.moe_rows = rows;
+        let lo = b.moe_row_sites.first().expect("non-empty").0;
+        let hi = b.moe_row_sites.last().expect("non-empty").0 + 1;
+        // SAFETY: h_inst lives on self past the launch's stream synchronize.
+        unsafe {
+            self.be.memcpy_htod_async(
+                b.d_inst.base + (lo * sz) as u64,
+                pod_bytes(&b.h_inst[lo..hi]),
+                &self.stream,
+            )
+        }
+    }
+
     pub fn prefill_chunk(&mut self, b: usize, prompt: &[u32], cap: usize) -> Result<PrefillStep> {
         let cap = cap.min(self.pf_request_max_rows());
         let Some(f_pf) = self.f_pf else {
@@ -7814,6 +7872,8 @@ impl GpuEngine {
                 }
             }
         }
+
+        self.patch_moe_rows(bi, real as u32)?;
 
         // ids (real tokens + zero pad) and absolute positions for the chunk.
         // Reuse pre-allocated buffers (sized to max prefill bucket t).
@@ -8630,6 +8690,8 @@ impl GpuEngine {
             }
         }
         self.ensure_batch_patch(bi)?;
+        // Packed rows are contiguous from row 0, so the first `total` rows are the real ones.
+        self.patch_moe_rows(bi, total as u32)?;
         let tc = self.prefill[bi].t as usize;
 
         // Stage ids/pos/slot rows + the request table, then upload. `pf_batch`
