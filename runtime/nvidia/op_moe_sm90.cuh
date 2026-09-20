@@ -451,7 +451,17 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
  * thread-per-token softmax/top-k (the scalar body's exact selection code).
  * NOT bit-identical to the scalar body: bf16 h2 and the core's K association. Selection is
  * checked against it in runtime/tests/moe_group_gemma26b_repro.cu.
+ *
+ * ROW SPREAD (MOE90_RT_SPREAD): the k sweep is LATENCY-bound, not work-bound — the mma is ~0 of
+ * it, the threads' h2 staging math is the step time, and a 128-row tile left 124 of 132 blocks
+ * idle at T=1024. A tile holds ceil(T/nblk) rows instead (8 at T=1024, 32 at T=4096); rows past
+ * that are never staged and their accumulators never read. A row's K association does not depend
+ * on its tile, so the logits are unchanged. Few rows per block is also what makes the bit-exact
+ * warp-parallel top-k pay: R/8 rounds of it instead of one 1400-iteration serial scan per token.
  * ========================================================================================== */
+#ifndef MOE90_RT_SPREAD
+#define MOE90_RT_SPREAD 1
+#endif
 static_assert(MOE90_STAGES * (MOE90_ABUF + MOE90_BBUF) * sizeof(__nv_bfloat16) >=
                   (size_t)MOE90_BM * MOE90_BN * sizeof(float),
               "router logits reuse the dead stage ring");
@@ -463,7 +473,14 @@ static __device__ void moe90_router_gemma_pf(unsigned char* __restrict__ table,
                                              unsigned n_exp, unsigned k, unsigned T, float root,
                                              float eps, unsigned slice, unsigned nblk,
                                              float* __restrict__ arena) {
-    const int mtiles = ((int)T + MOE90_BM - 1) / MOE90_BM;
+#if MOE90_RT_SPREAD
+    int R = (((int)T + (int)nblk - 1) / (int)nblk + 7) & ~7; /* rows per tile, whole warps */
+    if (R > MOE90_BM) R = MOE90_BM;
+#else
+    const int R = MOE90_BM;
+#endif
+    const int rper = R / 8; /* rows per warp */
+    const int mtiles = ((int)T + R - 1) / R;
     const int ksteps = ((int)H + MOE90_BK - 1) / MOE90_BK;
     __nv_bfloat16* As = (__nv_bfloat16*)sm90_align1024(arena);
     __nv_bfloat16* Bs = As + MOE90_STAGES * MOE90_ABUF;
@@ -473,11 +490,11 @@ static __device__ void moe90_router_gemma_pf(unsigned char* __restrict__ table,
     __shared__ float inv[MOE90_BM];
 
     for (int tile = (int)slice; tile < mtiles; tile += (int)nblk) {
-        const int rowbase = tile * MOE90_BM;
+        const int rowbase = tile * R;
 
-        /* weightless RMS: warp-per-row, 16 rounds x 8 warps = the 128 rows of the tile. */
-        for (int i = 0; i < MOE90_BM / 8; i++) {
-            const int row = warp * (MOE90_BM / 8) + i;
+        /* weightless RMS: warp-per-row, rper rounds x 8 warps = the R rows of the tile. */
+        for (int i = 0; i < rper; i++) {
+            const int row = warp * rper + i;
             const bool in = rowbase + row < (int)T;
             const bf16* r = resid + (size_t)(in ? rowbase + row : 0) * H;
             float part = 0.0f;
@@ -496,7 +513,7 @@ static __device__ void moe90_router_gemma_pf(unsigned char* __restrict__ table,
 
         auto stage = [&](int ks, int buf) {
             __nv_bfloat16* Ad = As + buf * MOE90_ABUF;
-            for (int L = tid; L < MOE90_BM * MOE90_CH; L += (int)PLOW_NV_THREADS) {
+            for (int L = tid; L < R * MOE90_CH; L += (int)PLOW_NV_THREADS) {
                 const int row = L / MOE90_CH, c = L % MOE90_CH;
                 const int kk = ks * MOE90_BK + c * 8;
                 const bool in = rowbase + row < (int)T;
@@ -548,9 +565,19 @@ static __device__ void moe90_router_gemma_pf(unsigned char* __restrict__ table,
             }
         __syncthreads();
 
-        if (tid < MOE90_BM && rowbase + tid < (int)T)
+#if defined(MOE90_DBG_RT_NOTOPK)
+#elif PLOW_NV_GEMV_RB && MOE90_RT_SPREAD
+        for (int i = 0; i < rper; i++) {
+            const int row = warp * rper + i;
+            if (rowbase + row < (int)T)
+                plow_moe_gemma_topk_warp(table + (size_t)(rowbase + row) * k * 8,
+                                         logit + row * MOE90_BN, pes, n_exp, k, (unsigned)lane);
+        }
+#else
+        if (tid < R && rowbase + tid < (int)T)
             plow_moe_gemma_softmax_topk(table + (size_t)(rowbase + tid) * k * 8,
                                         logit + tid * MOE90_BN, pes, n_exp, k);
+#endif
         __syncthreads();
     }
 }

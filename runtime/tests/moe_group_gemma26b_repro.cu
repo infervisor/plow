@@ -106,6 +106,18 @@ int main(int argc, char** argv) {
         memcpy(&tab[s*8+0], &eid, 4);
         memcpy(&tab[s*8+4], &gate, 4);
     }
+    /* dist 4 = REPLAY a routing table dumped from the model (block_run check --dump-tensors
+     * act.moe.table): real routing is ~30 hot experts + a long tail + ~33 empty, which none of
+     * the synthetic shapes above has. */
+    if (dist == 4) {
+        const char* path = getenv("MOE_RT_LOAD");
+        FILE* f = path ? fopen(path, "rb") : nullptr;
+        if (!f || fread(tab.data(), 1, tab.size(), f) != tab.size()) {
+            fprintf(stderr, "dist 4 needs MOE_RT_LOAD=<table dump of >= T*k*8 bytes>\n");
+            return 2;
+        }
+        fclose(f);
+    }
     printf("routing dist=%u\n", dist);
 
     std::vector<float> hx((size_t)T * H);

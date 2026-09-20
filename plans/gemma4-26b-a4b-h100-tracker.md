@@ -900,6 +900,68 @@ DECODE, from the fusion-knob sweep (stage E, step_bench B=1): PLOW_FUSE_ARGMAX=1
 recipe set — is SLOWER, 6.501 vs 5.837 ms; recipe now 0. FUSE_MERGE / FUSE_HNR: no effect.
 PLOW_GEMMA_MOE_ROUTER_FUSED: 142.7 ms/step (legacy one-block router) — never.
 
+## Single-block roofline pass at 1k/4k/8k/16k + latency-bound MoE stages (2026-09-20)
+
+User direction: check the kernels at the 1k/4k/8k/16k rungs on single modular blocks, compare to
+roofline, improve the kernels.
+
+TOOLING. `scripts/campaign/block_roofline.py <hf> --kind sliding|full --plow sweep.json --vllm
+layer.json`: FLOP/byte roof per layer vs plow `block_run` and vLLM's own `Gemma4DecoderLayer`
+(`scripts/block_layer_bench.py`, fixed for vLLM 0.28). Block recipes = the realtime recipe +
+`--block L` (L0 sliding, L5 full; the full block needs PLOW_GEMMA4_SM90_HD256_GQA2_ROLE=0),
+max_ctx 18432; emit <1 min, objects ~6 min. block_run needs `--pf-chunk 4096` past 4k.
+
+BLOCK TABLE, prefill ms/layer B=1 (plow | % of roof | vLLM layer harness):
+  sliding  1k 1.92 | 29.7% | 3.10   4k 5.01 | 19.0% | 4.58   8k 10.51 | 17.1% | 8.52   16k 20.56 | 17.5% | 16.37
+  full     1k 2.00 | 30.5% | 3.17   4k 6.80 | 19.0% | 5.76   8k 17.17 | 17.6% | 12.54  16k 46.99 | 17.6% | 31.08
+The vLLM layer harness UNDER-represents served vLLM (30 x 0.34 ms decode = 10 ms vs served 5.03), so
+the target stays served TTFT/30 = 1.47 / 3.12 / 6.04 ms at 1k / 4k / 8k. Short rungs, sliding block:
+0.96 / 1.16 / 1.48 / 1.91 ms at T=128/256/512/1024 -> a ~0.9 ms LATENCY FLOOR per layer, then
+~1.0 us/token/layer marginal; vLLM's ladder is the opposite shape (~39 ms fixed, ~0.5 us/token/layer).
+Served TTFT minus 30 x block = 2.9 / 9.5 / ~15 ms at 128 / 1k / 4k: non-layer time that GROWS with T
+and is not the lm_head (last row only) — unattributed, next.
+
+OP ATTRIBUTION (PLOW_PF_SEG_TIME on the block): the MoE segment (2 norms + ops 73..77 + NormResidual)
+is 1.47 of 1.92 ms at 1k and 3.68 of 5.01 at 4k (it also absorbs the wait on the async Lt GEMMs
+queued before it). Full layer: hd512 FlashPrefill 1.76 ms at 4k and 10.76 ms for the chunk that
+attends 16k keys (70.8% of that chunk, ~18% of its roof) = ~25 ms/layer over a 16k prefill.
+hd512 KERNEL CHOICE IS ALREADY RIGHT: the 26B runs the WGMMA BQ64/BKV32 role (1.76 ms at 4k); the
+px4/BQ64 role that hard-codes n_kv_head=1 measured SLOWER on the 12B (2.45-2.65 vs 1.73-1.95), so a
+2-KV-head px4 variant is not worth building. Long-KV hd512 still needs a redesigned kernel.
+
+THE LENS THAT PAID: latency-bound vs work-bound, per stage (harness, T=1024 / T=4096, ms/layer):
+  router   0.309 / 0.309  FLAT in T -> latency-bound. Split: top-k 0.125, k-sweep 0.18 of which the
+           mma is ~0: the step time was the threads' scalar h2 staging (128 rows/block) while 124
+           of 132 blocks idled at T=1024, and the top-k was a 1400-iteration serial scan per token.
+           FIX (MOE90_RT_SPREAD, default on): a tile holds ceil(T/nblk) rows (8 at 1k, 32 at 4k),
+           rows past that are never staged; with <=32 rows/block the bit-exact warp-parallel top-k
+           takes R/8 rounds. Routing tables BYTE-IDENTICAL at T=512/1024/1152/4096/4224.
+           0.309 -> 0.064 (1k), 0.309 -> 0.101 (4k). It also beats the scalar block-per-token router
+           at the short rungs (0.086 / 0.170 / 0.253 at T=128/256/384 vs 0.063 flat), so
+           MOE90_RT_MIN_T 512 -> 128.
+  combine  0.112 / 0.421  13.6 us/token/block at both rungs. NOT barrier-bound (dropping all three
+           barriers + the warp reduce: -4%); it is the read of `part`: 8 f32 slot rows per token,
+           369 MB at 4k at ~2.4 TB/s. float4 reads (PLOW_MOE_COMBINE_PF_V4, as the decode twin):
+           0.100 / 0.374. Structural fix left: bf16 partials (halves DOWN's write and this read,
+           and is what vLLM sums) — a numerics-policy change, not done.
+  glu/down all 132 blocks busy, ~3.5 GB/layer staged at ~3.1 TB/s: at the design's bandwidth roof
+           (max intensity with m64x2 / n128-n256 tiles is ~85 FLOP/B = ~26% of peak; we are at 20-23%).
+
+REAL ROUTING (harness `dist 4` = replay of act.moe.table dumped by `block_run check --in
+<embeddings.npy> --dump-tensors act.moe.table`, layer 0, random token ids like the bench):
+HEAVILY SKEWED — T=4096: ~30 hot experts with 1000-2300 rows, median expert 25 rows, 33 empty;
+T=1024: max 556, median 7, 36 empty. `dist 3` is the NaN-padded worst case (8 hot experts), NOT real
+routing — earlier "real routing" labels in this file mean dist 3. On dist 4:
+  * n256 DOWN confirmed: 0.267 -> 0.244 (1k), 0.719 -> 0.652 (4k), bit-exact. Default on.
+  * HALF tiles: GLU 0.501 vs 0.458 full-tile at 1k (mixed pairs stage 4 B tiles), equal at 4k; DOWN
+    better with half. Net equal (0.876 vs 0.897 total at 1k) — left on.
+  * THE FIXED-CAPACITY BATCHED VENDOR PLAN ABOVE IS DEAD: C=256 covers 37% of rows at 4k.
+  * Vendor-class ceiling on this routing (torch._grouped_mm, device offsets, gate_up+act+down):
+    0.608 ms (1k), 1.065 ms (4k) + gather 0.02 / 0.11, vs plow 0.745 / 1.781. So a grouped vendor
+    route is worth ~-3 ms/chunk at 1k and ~-18 ms at 4k, and needs either a host sync per layer
+    (cublasGemmGroupedBatchedEx takes host size arrays; plowrt binds neither libcublas nor the Lt
+    batch attributes) or a CUTLASS dependency. NOT the 1k gap.
+
 ## Status
 
 | step | state |

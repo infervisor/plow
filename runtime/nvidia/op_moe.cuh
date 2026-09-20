@@ -2079,9 +2079,11 @@ static __device__ __forceinline__ void plow_moe_gemma_softmax_topk(unsigned char
 
 #if defined(PLOW_NV_HOPPER)
 /* Tensor-core twin (op_moe_sm90.cuh). The scalar body below runs the [T,E,H] score GEMM as
- * fmaf dots at 0.09% of peak: 3.4 ms per layer at T=4096, more than both grouped GEMMs. */
+ * fmaf dots at 0.09% of peak: 3.4 ms per layer at T=4096, more than both grouped GEMMs.
+ * With the twin's row spread it is one 8-row tile per block, 0.063 ms flat up to T=1024, against
+ * the scalar body's 0.086 / 0.170 / 0.253 ms at T=128 / 256 / 384. */
 #ifndef MOE90_RT_MIN_T
-#define MOE90_RT_MIN_T 512u
+#define MOE90_RT_MIN_T 128u
 #endif
 /* HALF-TILES: align pads each expert to 64 rows, not 128, and a block's two warpgroups each
  * take one half-tile — of DIFFERENT experts when they differ. With 128 experts every segment
@@ -2252,6 +2254,9 @@ static __device__ void d_moe_align_gemma_pf(int* __restrict__ meta, const unsign
 
 /* ---- T-ROW COMBINE + SANDWICH (PLOW_DOP_MOE_COMBINE_NORM_GEMMA_PF) ----------------------
  * Block-per-token loop of d_moe_combine_norm_gemma. */
+#ifndef PLOW_MOE_COMBINE_PF_V4
+#define PLOW_MOE_COMBINE_PF_V4 1
+#endif
 static __device__ void d_moe_combine_norm_gemma_pf(bf16* __restrict__ out, const float* __restrict__ part,
                                             const bf16* __restrict__ h1, const bf16* __restrict__ gamma,
                                             unsigned H, unsigned k, unsigned T, float eps,
@@ -2266,6 +2271,21 @@ static __device__ void d_moe_combine_norm_gemma_pf(bf16* __restrict__ out, const
         bf16* o = out + (size_t)tok * H;
 
         float ss = 0.0f;
+#if PLOW_NV_GEMV_RB && PLOW_MOE_COMBINE_PF_V4
+        /* float4 reads, as d_moe_combine_norm_gemma: the pass is one strided scalar load per
+         * (h, slot) otherwise — 88 per thread per token against 24 here. Same ss regrouping. */
+        if ((H & 3u) == 0u) {
+            for (unsigned h = tid * 4u; h < H; h += nth * 4u) {
+                float4 acc4 = make_float4(0.f, 0.f, 0.f, 0.f);
+                for (unsigned slot = 0; slot < k; slot++) {
+                    const float4 v = *(const float4*)(pt + (size_t)slot * H + h);
+                    acc4.x += v.x; acc4.y += v.y; acc4.z += v.z; acc4.w += v.w;
+                }
+                *(float4*)(arena + h) = acc4;
+                ss += acc4.x * acc4.x + acc4.y * acc4.y + acc4.z * acc4.z + acc4.w * acc4.w;
+            }
+        } else
+#endif
         for (unsigned h = tid; h < H; h += nth) {
             float acc = 0.0f;
             for (unsigned slot = 0; slot < k; slot++) acc += pt[(size_t)slot * H + h];
