@@ -1,0 +1,180 @@
+diff --git a/crates/devgen/src/emit_config.rs b/crates/devgen/src/emit_config.rs
+index 744faac2..50a673fd 100644
+--- a/crates/devgen/src/emit_config.rs
++++ b/crates/devgen/src/emit_config.rs
+@@ -354,6 +354,12 @@ pub struct EmitConfig {
+     #[arg(long, env = "PLOW_GEMMA_MOE_ROUTER_BLOCKS")]
+     pub gemma_moe_router_blocks: Option<u32>,
+ 
++    /// Decode rungs with at least this many rows run the routed experts through the GROUPED
++    /// tensor-core GEMMs (the prefill bodies) instead of the per-slot GEMV walk. Unset = off.
++    /// Needs a decode object built with `PLOW_MOE_DEC_GROUP=1`.
++    #[arg(long, env = "PLOW_GEMMA_MOE_DEC_GROUP")]
++    pub gemma_moe_dec_group: Option<u32>,
++
+     /// Exact MoeRouterGemmaScore op instead of ScoreFast.
+     #[arg(long, env = "PLOW_GEMMA_MOE_ROUTER_EXACT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+     pub gemma_moe_router_exact: bool,
+@@ -1289,6 +1295,7 @@ impl EmitConfig {
+             moe_prefill: env_str("PLOW_MOE_PREFILL"),
+             gemma_moe_router_fused: env_bool("PLOW_GEMMA_MOE_ROUTER_FUSED"),
+             gemma_moe_router_blocks: env_u32("PLOW_GEMMA_MOE_ROUTER_BLOCKS"),
++            gemma_moe_dec_group: env_u32("PLOW_GEMMA_MOE_DEC_GROUP"),
+             gemma_moe_router_exact: env_bool("PLOW_GEMMA_MOE_ROUTER_EXACT"),
+             gemma_moe_tail_fuse: env_bool("PLOW_GEMMA_MOE_TAIL_FUSE"),
+             k3_full: env_bool_default_true("K3_FULL"),
+diff --git a/crates/devgen/src/knob_spec.rs b/crates/devgen/src/knob_spec.rs
+index 0173b6c6..c0e69518 100644
+--- a/crates/devgen/src/knob_spec.rs
++++ b/crates/devgen/src/knob_spec.rs
+@@ -830,6 +830,7 @@ pub const EMIT: &[KnobSpec] = &[
+     KnobSpec::new("emit.moe_prefill", Some("PLOW_MOE_PREFILL"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("emit.gemma_moe_router_fused", Some("PLOW_GEMMA_MOE_ROUTER_FUSED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+     KnobSpec::new("emit.gemma_moe_router_blocks", Some("PLOW_GEMMA_MOE_ROUTER_BLOCKS"), Layer::Emit, U32, UNSET, OPT_IN),
++    KnobSpec::new("emit.gemma_moe_dec_group", Some("PLOW_GEMMA_MOE_DEC_GROUP"), Layer::Emit, U32, UNSET, OPT_IN),
+     KnobSpec::new("emit.gemma_moe_router_exact", Some("PLOW_GEMMA_MOE_ROUTER_EXACT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+     KnobSpec::new("emit.gemma_moe_tail_fuse", Some("PLOW_GEMMA_MOE_TAIL_FUSE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+     KnobSpec::new("emit.k3_full", Some("K3_FULL"), Layer::Emit, Domain::Bool, ON, DIAG),
+@@ -1352,6 +1353,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
+     KnobSpec::new("def.PLOW_MOE_BAD_SCALE_EPILOGUE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_MOE_BENCH_DECODE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_MOE_COMBINE_ALLBLK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
++    KnobSpec::new("def.PLOW_MOE_DEC_GROUP", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_MOE_DEC_ABL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_MOE_DEC_LG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_MOE_DEC_LG_RG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+diff --git a/crates/devgen/src/lib.rs b/crates/devgen/src/lib.rs
+index 0600f2a9..a191e79c 100644
+--- a/crates/devgen/src/lib.rs
++++ b/crates/devgen/src/lib.rs
+@@ -5953,6 +5953,7 @@ fn emit_phase(
+                 // Falls back to separate norm + GLU when fp8 (no fused fp8 variant yet).
+                 let glu_cus: Vec<u32> = (0..n_cu).collect();
+                 let down_cus: Vec<u32> = (0..n_cu).collect();
++                let mut moe_dec_group: Option<u32> = None;
+                 let _glu_op = if fp8 {
+                     DevOp::MoeExpertGluGemmaFp8
+                 } else {
+@@ -6024,9 +6025,34 @@ fn emit_phase(
+                             },
+                         )
+                     } else {
++                        // GROUPED DECODE (PLOW_GEMMA_MOE_DEC_GROUP=min rows). A rung with >= min
++                        // rows sorts its B*k slots by expert and runs the routed experts through
++                        // the prefill grouped tensor-core GEMMs: each touched expert's weights
++                        // stream ONCE per step instead of once per slot-dot. The align op and the
++                        // extra operands ride EVERY rung (the decode-ladder validator compares op
++                        // lists and operands across rungs); below `min` the align returns at once
++                        // and GLU/down keep the per-slot walk. Needs the grouped-prefill scratch.
++                        let grp = emit_config::active()
++                            .gemma_moe_dec_group
++                            .filter(|_| n.moe_meta != TENSOR_NONE && n.moe_fug != TENSOR_NONE);
++                        let c_sel = match grp {
++                            Some(min) => b.emit(DevOp::MoeAlignGemmaPf, vec![0], &[c_rt], |d| {
++                                d.t[0] = n.moe_meta;
++                                d.t[1] = n.moe_tab;
++                                d.t[2] = n.moe_rowtok;
++                                d.t[3] = n.moe_rowpart;
++                                d.t[4] = n.moe_rowgate;
++                                d.i[0] = t;
++                                d.i[1] = c.n_exp;
++                                d.i[2] = c.top_k;
++                                d.i[3] = min;
++                            }),
++                            None => c_rt,
++                        };
++                        moe_dec_group = grp;
+                         // bf16 path: fused norm + expert GLU (one fewer gate)
+-                        b.emit(DevOp::MoeExpertGluNormGemma, glu_cus, &[c_rt, c_pf], |d| {
+-                            d.t[0] = n.moe_mfu;
++                        b.emit(DevOp::MoeExpertGluNormGemma, glu_cus, &[c_sel, c_pf], |d| {
++                            d.t[0] = if grp.is_some() { n.moe_fug } else { n.moe_mfu };
+                             d.t[1] = n.x;
+                             d.t[2] = n.moe_tab;
+                             d.t[3] = w.ewt;
+@@ -6041,6 +6067,12 @@ fn emit_phase(
+                             d.i[3] = c.n_exp;
+                             d.i[5] = nb; // BATCH B (0 at B=1)
+                             d.f[0] = c.eps;
++                            if let Some(min) = grp {
++                                d.t[6] = n.moe_meta;
++                                d.t[7] = n.moe_rowtok;
++                                d.i[4] = c.mlp_act;
++                                d.i[6] = min;
++                            }
+                         })
+                     };
+                     let down_op = if fp8 {
+@@ -6050,7 +6082,7 @@ fn emit_phase(
+                     };
+                     vec![b.emit(down_op, down_cus, &[c_glu], |d| {
+                         d.t[0] = n.moe_part;
+-                        d.t[1] = n.moe_mfu;
++                        d.t[1] = if moe_dec_group.is_some() { n.moe_fug } else { n.moe_mfu };
+                         d.t[2] = n.moe_tab;
+                         d.t[3] = w.ewt;
+                         d.t[4] = w.est;
+@@ -6059,6 +6091,12 @@ fn emit_phase(
+                         d.i[2] = c.moe_inter;
+                         d.i[3] = c.n_exp;
+                         d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
++                        if let Some(min) = moe_dec_group {
++                            d.t[5] = n.moe_meta;
++                            d.t[6] = n.moe_rowpart;
++                            d.t[7] = n.moe_rowgate;
++                            d.i[6] = min;
++                        }
+                     })]
+                 };
+                 // fused combine + rmsnorm + residual: saves 2 counter gates per layer.
+diff --git a/crates/packet/src/dev.rs b/crates/packet/src/dev.rs
+index d55ba52d..2900622b 100644
+--- a/crates/packet/src/dev.rs
++++ b/crates/packet/src/dev.rs
+@@ -667,6 +667,9 @@ pub enum DevOp {
+     /// Gemma-4 expert down (`d_moe_expert_down_gemma`): `part[slot][h] = gate·(down_e[h]·fu)`,
+     /// f32, one warp per output. `t0=part([k,H],f32) t1=fu t2=table t3=ewt` · `i0=k i1=H
+     /// i2=I_moe i3=n_exp`.
++    /// Grouped decode (PLOW_GEMMA_MOE_DEC_GROUP): slots 5, 6, 7 carry the align op's meta,
++    /// row_partidx and row_gate, fu is the gathered tensor, and immediate 6 is the row threshold
++    /// at or above which the grouped tensor-core DOWN body runs instead of the per-slot walk.
+     MoeExpertDownGemma = 63,
+     /// Gemma-4 combine (`d_moe_combine_gemma`): `moe[h] = Σ_slot part[slot][h]` (f32, fixed
+     /// slot order) → bf16. `t0=moe t1=part([k,H])` · `i0=H i1=k`.
+@@ -705,6 +708,9 @@ pub enum DevOp {
+     /// RmsNorm packet. `t0=fu t1=resid t2=table t3=ewt t4=gamma t5=xn_scratch` ·
+     /// `i0=k i1=I i2=H i3=n_exp` · `f0=eps`. `t5` (B*H bf16) stages the normed rows for the
+     /// B>1 vector body; it rides every rung because the decode-ladder validator compares operands.
++    /// Grouped decode (PLOW_GEMMA_MOE_DEC_GROUP): slots 6, 7 carry the align op's meta and
++    /// row_token, fu is the gathered tensor, immediate 4 is the activation and immediate 6 the row
++    /// threshold at or above which the grouped tensor-core GLU body runs.
+     MoeExpertGluNormGemma = 71,
+     /// Fused MoE layer tail: ([`DevOp::MoeCombineNormGemma`] → NormResidualNorm) in one
+     /// counter-gated packet — combine + post_ffn norm, sandwich residual, and the NEXT
+@@ -729,6 +735,8 @@ pub enum DevOp {
+     /// (destination row in part[T*k,H]; UNUSED for pad); `row_gate` = the slot gate.
+     /// `t0=meta(i32) t1=table t2=row_token(u32) t3=row_partidx(u32) t4=row_gate(f32)` ·
+     /// `i0=T i1=n_exp i2=k`.
++    /// In a DECODE program (grouped decode) immediate 3 is a row threshold: below it the op
++    /// returns at once. Prefill leaves it 0.
+     MoeAlignGemmaPf = 74,
+     /// Grouped gate/up GEMM + GeGLU. Flat tile list over (workitem→(expert,m_tile))×n_tiles; A
+     /// gathered from `xn2` via `row_token`; B = fused `ewt[e*2+0]` (`[2*I,H]`); GeGLU epilogue to
+diff --git a/crates/plowrt/src/exec/gpu/decode_rung.rs b/crates/plowrt/src/exec/gpu/decode_rung.rs
+index 9812d2c9..d45e2074 100644
+--- a/crates/plowrt/src/exec/gpu/decode_rung.rs
++++ b/crates/plowrt/src/exec/gpu/decode_rung.rs
+@@ -205,6 +205,13 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool>
+                     }
+                     d.i[2] = 1;
+                 }
++                // Grouped-decode align (PLOW_GEMMA_MOE_DEC_GROUP): rows ride i0, like prefill.
++                Some(DevOp::MoeAlignGemmaPf) => {
++                    if d.i[0] != g.t {
++                        return Err(reject("MoE align rows disagree with rung width"));
++                    }
++                    d.i[0] = 1;
++                }
+                 // Gemma MoE decode carries B in a spare immediate, 0 at B=1 (devgen `nb`).
+                 Some(
+                     op @ (DevOp::MoeRouterGemmaScore

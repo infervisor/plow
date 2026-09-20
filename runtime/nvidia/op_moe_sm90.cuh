@@ -43,6 +43,17 @@
 #ifndef MOE90_DOWN_PIPE
 #define MOE90_DOWN_PIPE 1 /* overlap the mma with the next stage: bit-exact, -10% down */
 #endif
+/* DOWN on the m64n256 tile. DOWN's N is H (2816 = 22 n128 tiles) and its K only I_moe (11
+ * k-steps), so the gathered A rows are RE-READ once per n-tile: 22x. One n256 stream holds 128
+ * accumulators — the register footprint GLU's two n128 streams already have — and halves the
+ * n-tiles, the A re-reads and the tile count. The B tile doubles (32 KiB), so the ring goes
+ * 2-deep to stay inside GLU's arena claim, which gives up MOE90_DOWN_PIPE (needs 3). */
+#ifndef MOE90_DOWN_N256
+#define MOE90_DOWN_N256 1
+#endif
+#define MOE90_DN_BN (MOE90_DOWN_N256 ? 256 : MOE90_BN)
+#define MOE90_DN_BBUF (MOE90_DN_BN * MOE90_BK)
+#define MOE90_DN_STAGES (MOE90_DOWN_N256 ? 2 : MOE90_STAGES)
 #define MOE90_GLU_STAGES 2 /* gate/up ring depth (3 tiles per stage) */
 #define MOE90_ABUF (MOE90_BM * MOE90_BK)   /* bf16 elems per staged A tile */
 #define MOE90_BBUF (MOE90_BN * MOE90_BK)   /* bf16 elems per staged B tile */
@@ -73,6 +84,8 @@
           ? MOE90_GLU_STAGES * (MOE90_ABUF + 2 * MOE90_NB * MOE90_BBUF)                            \
           : MOE90_STAGES * (MOE90_ABUF + MOE90_NB * MOE90_BBUF)) +                                 \
      512)
+static_assert(MOE90_DN_STAGES * (MOE90_ABUF + MOE90_NB * MOE90_DN_BBUF) + 512 <= PGM_MOE_ARENA_SM90,
+              "the n256 DOWN ring must fit the existing MoE arena claim");
 /* GROW-ONLY: never shrink whatever op_gemm.cuh (a sibling-owned file) already claims. */
 #if PGM_ARENA_BF16 < PGM_MOE_ARENA_SM90
 #undef PGM_ARENA_BF16
@@ -119,11 +132,13 @@ __device__ __forceinline__ void moe90_stage_a(__nv_bfloat16* Ad,
         sm90_cp16(&Ad[sm90_swz_off<MOE90_BK, 8>(row, c)], g, in ? 16 : 0);
     }
 }
-/* B: weight [n][k], tile row = output channel tn+row. */
+/* B: weight [n][k], tile row = output channel tn+row. ROWS = the mma's N (128, or 256 for the
+ * n256 DOWN tile). */
+template <int ROWS = MOE90_BN>
 __device__ __forceinline__ void moe90_stage_b(__nv_bfloat16* Bd,
                                               const __nv_bfloat16* __restrict__ B, int tid, int tn,
                                               int kbase, unsigned n, unsigned k) {
-    for (int L = tid; L < MOE90_BN * MOE90_CH; L += (int)PLOW_NV_THREADS) {
+    for (int L = tid; L < ROWS * MOE90_CH; L += (int)PLOW_NV_THREADS) {
         const int row = L / MOE90_CH, c = L % MOE90_CH;
         const int nn = tn + row, kk = kbase + c * 8;
         const bool in = (nn < (int)n) && (kk + 8 <= (int)k);
@@ -303,12 +318,12 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
     const int* rowoff = meta;
     const int* tilep = meta + 2 * (int)n_exp;
     const int total_tiles = tilep[n_exp];
-    const int tiles_n = ((int)H + MOE90_BN - 1) / MOE90_BN;
+    const int tiles_n = ((int)H + MOE90_DN_BN - 1) / MOE90_DN_BN;
     const unsigned K = I_moe;
     const int ksteps = ((int)K + MOE90_BK - 1) / MOE90_BK;
 
     __nv_bfloat16* As = (__nv_bfloat16*)sm90_align1024(arena);
-    __nv_bfloat16* Bs = As + MOE90_STAGES * MOE90_ABUF;
+    __nv_bfloat16* Bs = As + MOE90_DN_STAGES * MOE90_ABUF;
     const int tid = threadIdx.x, wg = tid >> 7, wiw = (tid >> 5) & 3, lane = tid & 31;
 
 #if MOE90_HALF
@@ -319,7 +334,7 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
     for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
         const int mtile = tile / tiles_n;
         const int ntile = tile % tiles_n;
-        const int tn = ntile * MOE90_BN;
+        const int tn = ntile * MOE90_DN_BN;
 #if MOE90_HALF
         const int rowbase = mtile * MOE90_BM;
         const int e = pgm_moe_expert_of_mtile(tilep, 2 * mtile, (int)n_exp);
@@ -338,20 +353,20 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
 #endif
         const __nv_bfloat16* Wd = (const __nv_bfloat16*)(size_t)ewt[(size_t)e * 2 + 1];
 
-        float acc[64];
+        float acc[MOE90_DN_BN / 2];
 #pragma unroll
-        for (int i = 0; i < 64; i++) acc[i] = 0.f;
+        for (int i = 0; i < MOE90_DN_BN / 2; i++) acc[i] = 0.f;
 
         auto stage = [&](int ks, int buf) {
             moe90_stage_a(As + buf * MOE90_ABUF, fu, tid, rowbase, ks * MOE90_BK, K);
-            moe90_stage_b(Bs + buf * MOE90_BBUF, Wd, tid, tn, ks * MOE90_BK, H, K);
+            moe90_stage_b<MOE90_DN_BN>(Bs + buf * MOE90_DN_BBUF, Wd, tid, tn, ks * MOE90_BK, H, K);
 #if MOE90_HALF
             if (mixed)
-                moe90_stage_b(Bs + (MOE90_STAGES + buf) * MOE90_BBUF, Wd1, tid, tn,
-                              ks * MOE90_BK, H, K);
+                moe90_stage_b<MOE90_DN_BN>(Bs + (MOE90_DN_STAGES + buf) * MOE90_DN_BBUF, Wd1, tid,
+                                           tn, ks * MOE90_BK, H, K);
 #endif
         };
-#if MOE90_DOWN_PIPE
+#if MOE90_DOWN_PIPE && !MOE90_DOWN_N256
         /* PIPELINED: prefetch ONE stage and wait only on the PREVIOUS mma group, so group ks
          * runs while stage ks+1 lands. Safe on the 3-deep ring: iteration ks stages buffer
          * (ks+1)%3 and computes on ks%3, and the buffer it will restage next, (ks+2)%3, is
@@ -375,21 +390,31 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
         sm90_wg_wait<0>();
 #else
 #pragma unroll
-        for (int s = 0; s < MOE90_STAGES - 1; s++) {
+        for (int s = 0; s < MOE90_DN_STAGES - 1; s++) {
             if (s < ksteps) stage(s, s);
             sm90_cp_commit();
         }
         sm90_wg_fence();
 
         for (int ks = 0; ks < ksteps; ks++) {
-            const int fetch = ks + MOE90_STAGES - 1;
-            if (fetch < ksteps) stage(fetch, fetch % MOE90_STAGES);
+            const int fetch = ks + MOE90_DN_STAGES - 1;
+            if (fetch < ksteps) stage(fetch, fetch % MOE90_DN_STAGES);
             sm90_cp_commit();
-            sm90_cp_wait<MOE90_STAGES - 1>();
+            sm90_cp_wait<MOE90_DN_STAGES - 1>();
             __syncthreads();
-            const int cb = ks % MOE90_STAGES;
+            const int cb = ks % MOE90_DN_STAGES;
+#if MOE90_DOWN_N256
+            {
+                const __nv_bfloat16* Aw = As + cb * MOE90_ABUF + wg * 64 * MOE90_BK;
+                const __nv_bfloat16* Bw = Bs + (bsel * MOE90_DN_STAGES + cb) * MOE90_DN_BBUF;
+#pragma unroll
+                for (int kk = 0; kk < MOE90_BK; kk += 16)
+                    wgmma_m64n256k16(acc, sm90_desc(Aw + kk), sm90_desc(Bw + kk), live);
+            }
+#else
             moe90_wgmma_k(acc, As + cb * MOE90_ABUF,
                           Bs + (bsel * MOE90_STAGES + cb) * MOE90_BBUF, wg, live);
+#endif
             sm90_wg_commit();
             sm90_wg_wait<0>();
             __syncthreads();
@@ -397,7 +422,7 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
 #endif
 
 #pragma unroll
-        for (int g = 0; g < MOE90_NBLK; g++)
+        for (int g = 0; g < MOE90_DN_BN / 8; g++)
 #pragma unroll
             for (int hi = 0; hi < 2; hi++) {
                 const int rr = wg * 64 + sm90_acc_row(wiw, lane, hi);
