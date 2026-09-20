@@ -1065,6 +1065,12 @@ static __device__ void d_moe_expert_glu_gemma(bf16* __restrict__ fu, const bf16*
 }
 
 /* Non-arena overload for standalone test kernels (reads x from L1/global) and the B>1 path. */
+/* Its own unroll: the dense GLU's GV_UNROLL_GLU (10 in the sm_90a build) is tuned for ONE
+ * long-K row stream per warp; here consecutive work items hop experts, and 10 measured slower
+ * than 4 (0.618 vs 0.48 ms/layer at B=16). */
+#ifndef GV_MOE_GLU_UN_B
+#define GV_MOE_GLU_UN_B 4
+#endif
 static __device__ void d_moe_expert_glu_gemma(bf16* __restrict__ fu, const bf16* __restrict__ x,
                                        const unsigned char* __restrict__ table,
                                        const unsigned long long* __restrict__ ewt, unsigned k,
@@ -1090,21 +1096,21 @@ static __device__ void d_moe_expert_glu_gemma(bf16* __restrict__ fu, const bf16*
         const bf16* grow = (const bf16*)(size_t)gub + (size_t)n * H;
         const bf16* urow = (const bf16*)(size_t)gub + (size_t)(I_moe + n) * H;
         float ag = 0.0f, au = 0.0f;
-        for (unsigned c = 0; c < nchunk; c += GV_UNROLL_GLU) {
-            bf16v8 gv[GV_UNROLL_GLU], uv[GV_UNROLL_GLU];
-            unsigned kk[GV_UNROLL_GLU];
+        for (unsigned c = 0; c < nchunk; c += GV_MOE_GLU_UN_B) {
+            bf16v8 gv[GV_MOE_GLU_UN_B], uv[GV_MOE_GLU_UN_B];
+            unsigned kk[GV_MOE_GLU_UN_B];
 #pragma unroll
-            for (int i = 0; i < GV_UNROLL_GLU; i++) {
+            for (int i = 0; i < GV_MOE_GLU_UN_B; i++) {
                 const unsigned k_ = (c + (unsigned)i) * GV_STEP + lane * 8u;
                 kk[i] = k_;
                 gv[i] = (k_ < H) ? ld_glob8(grow + k_) : bf16v8_zero();
             }
 #pragma unroll
-            for (int i = 0; i < GV_UNROLL_GLU; i++) {
+            for (int i = 0; i < GV_MOE_GLU_UN_B; i++) {
                 uv[i] = (kk[i] < H) ? ld_glob8(urow + kk[i]) : bf16v8_zero();
             }
 #pragma unroll
-            for (int i = 0; i < GV_UNROLL_GLU; i++) {
+            for (int i = 0; i < GV_MOE_GLU_UN_B; i++) {
                 if (kk[i] >= H) continue;
                 const bf16v8 xv = ld_glob8(xr + kk[i]);
                 ag = dot8(gv[i], xv, ag);
@@ -1954,12 +1960,34 @@ static __device__ void d_moe_expert_glu_norm_gemma(bf16* __restrict__ fu,
                                             const unsigned long long* __restrict__ ewt, unsigned k,
                                             unsigned I_moe, unsigned H, unsigned n_exp, float eps,
                                             unsigned slice, unsigned nblk, unsigned nrow,
-                                            float* __restrict__ arena) {
+                                            float* __restrict__ arena,
+                                            bf16* __restrict__ xn_scratch = nullptr) {
 #if PLOW_NV_GEMV_RB
     /* B=1 decode on a stageable H takes the vectorized row-blocked twin. */
     if (nrow == 1u && H <= PLOW_MOE_XN_MAX) {
         d_moe_expert_glu_norm_gemma_rb(fu, resid, gamma, table, ewt, k, I_moe, H, n_exp, eps,
                                        slice, nblk, arena);
+        return;
+    }
+    /* B>1 WITH A GLOBAL SCRATCH: the body below is the scalar one — 2 B loads, no unroll, xn
+     * recomputed from global for every output channel — and measured 19.7 ms of a 34.2 ms B=16
+     * step (58%). B rows of xn do not fit the decode arena, so they are staged in the packet's
+     * moe.xn2 tensor (B*H bf16, L2-resident) and the vector body reads them with ld_glob8.
+     * Every block writes ALL of xn before its barrier: there is no cross-block gate inside one
+     * op, and concurrent writers store identical values. bf16 xn is what the dense GEMV arms
+     * and vLLM feed their weights; outputs are numerically equivalent, not bit-equal. */
+    if (xn_scratch != nullptr) {
+        __shared__ float rms_red_b[32];
+        __shared__ float invs_b[PLOW_MOE_MAXB];
+        plow_moe_row_rms(invs_b, rms_red_b, resid, H, nrow, eps);
+        const unsigned tot = nrow * H;
+        for (unsigned i = threadIdx.x; i < tot; i += blockDim.x) {
+            const unsigned row = i / H;
+            xn_scratch[i] = __float2bfloat16(__bfloat162float(resid[i]) * invs_b[row] *
+                                             __bfloat162float(gamma[i - row * H]));
+        }
+        __syncthreads();
+        d_moe_expert_glu_gemma(fu, xn_scratch, table, ewt, k, I_moe, H, n_exp, slice, nblk, nrow);
         return;
     }
 #endif

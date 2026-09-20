@@ -69,6 +69,15 @@ __global__ void k_glu(bf16* fu, const bf16* x, const unsigned char* table,
                            g_arena);
 }
 
+/* The op the bf16 packet actually emits (fused norm + GLU). xn == nullptr takes its scalar
+ * batch body; a scratch takes the staged vector body. */
+__global__ void k_glu_norm(bf16* fu, const bf16* resid, const bf16* gamma,
+                           const unsigned char* table, const unsigned long long* ewt, unsigned k,
+                           unsigned I_moe, unsigned H, unsigned n_exp, unsigned nrow, bf16* xn) {
+    d_moe_expert_glu_norm_gemma(fu, resid, gamma, table, ewt, k, I_moe, H, n_exp, 1e-6f,
+                                blockIdx.x, gridDim.x, nrow, (float*)g_arena, xn);
+}
+
 __global__ void k_down(float* part, const bf16* fu, const unsigned char* table,
                        const unsigned long long* ewt, unsigned k, unsigned H, unsigned I_moe,
                        unsigned n_exp, unsigned nrow) {
@@ -158,6 +167,32 @@ int main(int argc, char** argv) {
         double t_tk = time_ms([&]{ k_topk<<<1,256,arena_bytes>>>(d_tab,d_score,d_pes,n_exp,k,B); }, iters);
         CK(cudaDeviceSynchronize());
         double t_gl = time_ms([&]{ k_glu<<<grid,256,arena_bytes>>>(d_fu,d_x,d_tab,d_ewt,k,I_moe,H,n_exp,B); }, iters);
+        /* served op: fused norm+GLU, scalar batch body vs the moe.xn2-staged vector body. */
+        bf16 *d_gam = nullptr, *d_xn = nullptr, *d_fu2 = nullptr;
+        {
+            std::vector<bf16> gam(H);
+            for (auto& v : gam) v = __float2bfloat16(1.0f + rnd() * 0.1f);
+            CK(cudaMalloc(&d_gam, H * sizeof(bf16)));
+            CK(cudaMemcpy(d_gam, gam.data(), H * sizeof(bf16), cudaMemcpyHostToDevice));
+            CK(cudaMalloc(&d_xn, (size_t)B * H * sizeof(bf16)));
+            CK(cudaMalloc(&d_fu2, (size_t)B * k * I_moe * sizeof(bf16)));
+        }
+        CK(cudaFuncSetAttribute(k_glu_norm,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)arena_bytes));
+        double t_gn0 = time_ms([&]{ k_glu_norm<<<grid,256,arena_bytes>>>(d_fu,d_x,d_gam,d_tab,d_ewt,k,I_moe,H,n_exp,B,nullptr); }, iters);
+        double t_gn1 = time_ms([&]{ k_glu_norm<<<grid,256,arena_bytes>>>(d_fu2,d_x,d_gam,d_tab,d_ewt,k,I_moe,H,n_exp,B,d_xn); }, iters);
+        {
+            std::vector<bf16> a((size_t)B * k * I_moe), c(a.size());
+            CK(cudaMemcpy(a.data(), d_fu, a.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(c.data(), d_fu2, c.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
+            double num = 0, den = 0;
+            for (size_t i = 0; i < a.size(); i++) {
+                const double x = __bfloat162float(a[i]), y = __bfloat162float(c[i]);
+                num += (x - y) * (x - y); den += x * x;
+            }
+            printf("         glu_norm scalar %.4f ms -> staged-vector %.4f ms   relL2 %.2e\n",
+                   t_gn0, t_gn1, den > 0 ? sqrt(num / den) : 0.0);
+        }
+        cudaFree(d_gam); cudaFree(d_xn); cudaFree(d_fu2);
         double t_dn = time_ms([&]{ k_down<<<grid,256,arena_bytes>>>(d_part,d_fu,d_tab,d_ewt,k,H,I_moe,n_exp,B); }, iters);
         CK(cudaDeviceSynchronize());
         if (const char* dump = getenv("MOE_DN_DUMP")) { /* numeric compare across two builds */

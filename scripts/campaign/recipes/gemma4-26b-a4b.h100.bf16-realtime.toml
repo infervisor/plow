@@ -46,6 +46,15 @@ PLOW_NO_GLU_FUSE = "1"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
 PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
 PLOW_SLIDING_NS_CAP = "1"
+# FINE-GRAINED RUNGS. The server re-tokenises and prepends BOS, so an N-token bench prompt is
+# N+1 rows and crosses its rung: measured 25 -> 42 ms at 128|129 rows, 62 -> 91 at 1024|1025,
+# 177 -> 202 at 4096|4097, 368 -> 394 at 8192|8193 (one more token, +17..29 ms: either the next
+# bucket's padding or a second full-model launch for a 1-row tail). Each appended rung is the
+# shipped rung + 128, which swallows that tail in one launch; the runtime's chunk-cost model
+# picks it on its own. 4224 exceeds MAX_CHUNK but fits the sliding ring that MAX_CHUNK=4096
+# already sizes (next_pow2(1024 + 4096 - 1) = 8192 rows >= 1024 + 4224 - 1), which is the
+# condition the emitter admits an appended rung on; per-slot KV is unchanged.
+PLOW_PF_LADDER_APPEND = "256,1152,4224"
 PLOW_MAX_CHUNK = "4096"
 PLOW_FUSE_ARGMAX = "1"
 # The exact scorer replays the legacy scalar fmaf order on ONE lane per expert: measured
@@ -74,6 +83,10 @@ role_files = [
 # it emits no MoE opcodes. Costs the fatlite occupancy win (12B measured -2.8 ms @1024,
 # -4.8 ms @4096); recovering it for 26B means widening that guard, not setting this to 1.
 PLOW_BUILD_FATLITE = "0"
+# Measured on this board (tune_decode_sweep.sh, step_bench TPOT, occ 1:132): the MoE-down
+# lane-split at 8 sub-groups beats the source default 4 — B=1 5.905 -> 5.833 ms, B=4 11.034 ->
+# 10.648. (2 is not an option at I_moe=704: 704 % 128 != 0 drops it off the lane-split arm.)
+PLOW_EXTRA_DEFINES = "-DPLOW_MOE_DOWN_SG=8u"
 PLOW_BUILD_FA_GQA2_PAIR = "1"
 PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"

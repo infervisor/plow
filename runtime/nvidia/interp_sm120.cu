@@ -2492,7 +2492,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                     (const unsigned char*)TEN(2),
                                     (const unsigned long long*)TEN(3), in->i[0], in->i[1],
                                     in->i[2], in->i[3], in->fj[0].f, slice, nblk,
-                                    PLOW_NROW(in->i[5]), arena);
+                                    PLOW_NROW(in->i[5]), arena, (__nv_bfloat16*)TEN(5));
         break;
 #undef PLOW_NROW
 #endif

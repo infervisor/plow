@@ -1947,7 +1947,7 @@ fn declare(
     //
     // Only `ids`/`pos` and the KV cache legitimately span the context: the cache IS the context,
     // and ids/pos are i32 (a rounding error). Everything else holds the CURRENT chunk.
-    let rows = ctx.min(max_chunk(c.window));
+    let rows = chunk_rows(c.window, ctx);
     // TP head split: each rank owns heads/N q-heads and kvh/N kv-heads,
     // so every head-dimensioned activation and the KV cache shrink by N. Column/row-parallel
     // weights and the inter/vocab-dimensioned activations shrink by N too. tp==1 => /1, identical.
@@ -3088,6 +3088,36 @@ fn request_chunk(window: u32) -> u32 {
 fn kv_ring_rows(window: u32, chunk: u32) -> u32 {
     (window + chunk - 1).next_power_of_two()
 }
+
+/// The `PLOW_PF_LADDER_APPEND` rungs this compile admits.
+///
+/// A rung may exceed MAX_CHUNK when the sliding KV ring ALREADY holds it. The ring is
+/// `next_pow2(window + chunk - 1)`, so it usually has slack: window 1024, chunk 4096 rings 8192
+/// rows and a 4224 rung needs 5247. MAX_CHUNK must stay a power of two, and the next one would
+/// double every slot's sliding KV just to admit 128 more rows.
+fn appended_rungs(window: u32, ctx: u32) -> Vec<u32> {
+    let cap = ctx.min(max_chunk(window));
+    let ring = kv_ring_rows(window, request_chunk(window));
+    emit_config::active()
+        .pf_ladder_append
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|x| x.trim().parse::<u32>().ok())
+                .filter(|&x| x <= cap || (window > 0 && x <= ctx && window + x - 1 <= ring))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Rows every chunk-sized activation must hold: the WIDEST prefill rung, which an appended rung
+/// can push past MAX_CHUNK. Sizing these from MAX_CHUNK alone lets a 4224-row launch overrun
+/// tensors built for 4096 — the packed-prefill extent check is what caught it.
+fn chunk_rows(window: u32, ctx: u32) -> u32 {
+    appended_rungs(window, ctx)
+        .into_iter()
+        .fold(ctx.min(max_chunk(window)), u32::max)
+}
 const KV_MASK_NONE: u32 = 0xFFFF_FFFF;
 
 /// How many rows a layer's KV cache actually needs, and the mask its row index is ANDed with.
@@ -3813,7 +3843,7 @@ fn emit_phase(
     // declared row count in declare()), so the slot is IDENTICAL across every prefill bucket AND
     // the decode program — the host binds dg_tp at that one fixed offset for all of them. For
     // decode t==1 so xr_elems==hidden and the layout is a superset of the old decode path.
-    let rows_max = ctx.min(max_chunk(c.window));
+    let rows_max = chunk_rows(c.window, ctx);
     let xr_elems = t * c.hidden;
     let slot_b = rows_max * c.hidden * BF16 as u32;
     let rows: Vec<u32> = (0..t.min(n_cu).max(1)).collect();
@@ -6001,11 +6031,15 @@ fn emit_phase(
                             d.t[2] = n.moe_tab;
                             d.t[3] = w.ewt;
                             d.t[4] = w.g_pre2;
+                            // B>1 stages the normed rows here so the vector GLU body can run.
+                            // On EVERY rung: the decode-ladder validator requires identical
+                            // operands across rungs, else it keeps widest-only execution.
+                            d.t[5] = n.moe_xn2;
                             d.i[0] = c.top_k;
                             d.i[1] = c.moe_inter;
                             d.i[2] = c.hidden;
                             d.i[3] = c.n_exp;
-                            d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
+                            d.i[5] = nb; // BATCH B (0 at B=1)
                             d.f[0] = c.eps;
                         })
                     };
@@ -8927,16 +8961,7 @@ fn emit_dense_gqa(
     // A 4096+128 rung swallows it in one chunk for 114 pad rows; the runtime chunk-cost
     // model picks it automatically (fewer launches at equal padding). Needs PLOW_MAX_CHUNK
     // >= the rung (the cap below filters otherwise).
-    let append: Vec<u32> = ecfg
-        .pf_ladder_append
-        .as_deref()
-        .map(|s| {
-            s.split(',')
-                .filter_map(|x| x.trim().parse::<u32>().ok())
-                .filter(|&x| x <= cap)
-                .collect()
-        })
-        .unwrap_or_default();
+    let append: Vec<u32> = appended_rungs(c.window, ctx);
     let buckets: Vec<u32> = if ladder_wave {
         let ops = ladder::ladder_ops(&c, LADDER_BN);
         let max_tm = cap.div_ceil(LADDER_BM).max(1);
@@ -8964,12 +8989,13 @@ fn emit_dense_gqa(
     // rows wrap onto their history: a silent wrong answer, not a crash.
     let chunk = request_chunk(c.window);
     let ring = kv_ring_rows(c.window, chunk);
+    let widest = buckets.iter().copied().max().unwrap_or(chunk).max(chunk);
     assert!(
-        ring >= c.window + chunk - 1,
-        "KV ring {ring} too small for window {} + chunk {chunk}",
+        ring >= c.window + widest - 1,
+        "KV ring {ring} too small for window {} + widest rung {widest}",
         c.window
     );
-    let arows = ctx.min(max_chunk(c.window));
+    let arows = chunk_rows(c.window, ctx);
     // opart/mlpart (the flash_prefill partials) are sized in declare() as arows*heads_sharded*ns_pre.
     // The flash writes t*heads_sharded*ns(t) row-splits for a bucket t, where emit_phase derives
     // ns(t) from the SHARDED head count (heads/tp) — so ns_pre must be the worst-case over buckets

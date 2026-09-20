@@ -779,6 +779,86 @@ paid: skipping a body feeds garbage downstream and moves the expert union (negat
 Clean: MoeExpertGluNorm = 19.7 ms of the 34.2 ms step (58%) — the batch-serving target;
 FlashDecode 3.4 ms. CSV: perf-data/campaign/gemma4-26b-a4b.h100.bf16-decode-ablation.csv
 
+## MoE ragged tail on the CUDA engine + decode knob result (2026-09-20)
+
+KNOBS ARE FLAT (stage C, step_bench, occ 1:132; B=1 / B=16 ms): un4 5.906/34.72, un8 5.919/
+34.19 (shipped), un12 5.948/33.94, un16 5.959/34.30, glu2 6.067/34.91, glu8 6.089/35.06, mun4
+5.971/34.21. Everything within ~1%; every object sits at the 255-register cap. Knob tuning
+cannot close C1 5.92 vs vLLM 5.03 — that takes kernel work.
+CORRECTION to the ablation read: the sweep's packets are emitted WITHOUT the recipe's
+PLOW_FUSE_ARGMAX=1, so the lm_head is a plain Gemv there (61 Gemv, no GemvArgmax). "Gemv 1.35
+ms" includes the lm_head (~0.5-0.8); o_proj/dense-down are ~10 us each, not 22.
+
+MoE RAGGED TAIL (user direction: fine-grained rungs / ragged tail). kvrow::rebase_chunk_rows
+existed but only the AMD/Apple engines applied it. The CUDA engine now rewrites the three Gemma
+MoE pf row operands (router i3, align i0, combine i2 — located via PREFILL_ROW_FIELDS, same
+"field == bucket width" guard) to the launch's REAL rows, in both the chunk path and the packed
+path, under the existing PLOW_RAGGED_CHUNK (=0 is the control). Dense ops keep the bucket
+width: their cuBLASLt plans are shape-static. MoE rows are independent, so real rows compute
+exactly what they did — greedy text identical 10/10 across the A/B.
+  request wall ms, padded -> ragged: 173 rows 44.7 -> 36.8 | 1093 rows 88.7 -> 70.1 |
+  893 rows 61.8 -> 58.1 | 8893 rows 405.8 -> 398.6 | 11 rows 25.6 -> 24.0
+  served: 1024/C4 TTFT 172.4 -> 137.8, 1024/C16 268.8 -> 280.4 tok/s, 1024/C32 285.3 -> 302.8
+  C1 cells barely move (128/C1 42.24): the bench prompt is RANDOM tokens, and 129 random rows
+  already route across all 128 experts, so every expert's weights are streamed with or without
+  the padding. Natural text touches fewer experts, hence the 8 ms the probe saw.
+
+## MoE decode batch GLU + sg8 + fine-grained rungs (2026-09-20)
+
+MoE DECODE GLU (user direction). The SERVED op is the fused norm+GLU (op 71); its B>1 path was
+the scalar body (2 B loads, no unroll, xn recomputed per output channel) — the standalone bench
+had been timing the NON-fused op and under-reported it. B rows of xn do not fit the decode
+arena, so the op now stages them in the packet's moe.xn2 tensor (t5, B*H bf16) and runs the
+existing vector body. t5 rides EVERY rung: validate_decode_ladder compares operands across
+rungs and a B>1-only operand would put decode back on widest-only execution. The batch body
+has its own unroll (GV_MOE_GLU_UN_B=4): the dense GLU's 10 from the build flags was slower.
+  per layer ms, scalar -> staged: B=2 0.145 -> 0.073, B=4 0.292 -> 0.139, B=8 0.549 -> 0.269,
+  B=16 1.091 -> 0.647. relL2 ~3e-3 (bf16 xn, as the dense arms and vLLM round it).
+MoE DOWN: PLOW_MOE_DOWN_SG=8 beats 4 by 11-15% standalone; sg2 silently leaves the lane-split
+arm at I_moe=704 (704 % 128 != 0).
+END TO END (tune_decode_sweep.sh, step_bench, occ 1:132, packets re-emitted with t5), ms:
+                        B=1     B=4      B=16
+  before                5.922   14.069   34.193
+  batch GLU, sg4        5.905   11.034   26.786
+  batch GLU, sg8        5.833   10.648   26.387     -> sg8 into the recipe via PLOW_EXTRA_DEFINES
+
+FINE-GRAINED RUNGS (user direction): PLOW_PF_LADDER_APPEND=256,1152,4224. Two emitter issues:
+* MAX_CHUNK must be a power of two and 8192 doubles every slot's sliding KV. The real
+  constraint is the ring: next_pow2(1024+4096-1) = 8192 rows >= 1024+4224-1. appended_rungs()
+  admits a rung on `window + rung - 1 <= ring`; the ring assert now checks the WIDEST rung.
+* chunk activations (main, TP partial slot, flash partials) were sized ctx.min(MAX_CHUNK), so a
+  4224-row launch would have overrun 4096-row tensors. Caught by packed prefill's "attention
+  tensor extent" check, which silently dropped packed prefill (the segments script then failed
+  on the missing pfpackedseg cubin). chunk_rows() sizes all three from the widest rung.
+Ladder: [128, 256, 512, 1024, 1152, 2048, 4096, 4224]. Natural-text request wall, before ->
+after: 129 rows 41.8 -> 24.5 | 1025 91.1 -> 61.9 | 4097 202.4 -> 169.1 | 8193 394.1 -> 340.5.
+Greedy answers identical solo vs 4-concurrent (4/4), same text as every earlier packet.
+
+## The 128/C1 TTFT was a socket, not a kernel: TCP_NODELAY (2026-09-20) — FIRST WINS vs vLLM
+
+CORRECTION: the bench's N-token cells do NOT cross their rungs. For vllm-bench random prompts
+the server sees exactly N rows on /v1/completions (no BOS row); measured via PLOW_STEP_TIME
+rows_total. The 42-vs-24 ms split seen earlier was prompt CONTENT (random tokens touch every
+expert; natural text touches few). The fine-grained rungs still remove the 17-29 ms cliff for
+arbitrary-length traffic; they just do not move these cells.
+
+128/C1 TTFT sat at 42.2-42.6 ms through every kernel change of the day. Device prefill for those
+128 rows is 28.7 ms; a fresh connection sees the first chunk at 32.5 ms; vllm bench reports 42.3.
+Ruled out one variable at a time with the real client: --max-hold-ms 0 (42.21), PLOW_MULTISTEP=1
+(42.55), and every bench payload field (repetition_penalty / logprobs / include_usage /
+ignore_eos: all 32 ms). CAUSE: plowrt never set TCP_NODELAY. A streamed response is headers
+then the first token as a second small write; on the bench's pooled keep-alive connection Nagle
+holds that write until the client's ~40 ms delayed ACK, so any TTFT under 40 ms reads as ~42.
+(At 1024 rows the first chunk lands after the ACK timer, hence no stall there.) Fix:
+axum::serve(..).tcp_nodelay(true) on the OpenAI listener.
+
+SERVED, b26q + nodelay (plow | vLLM 0.28):
+  TTFT ms   128/C1 31.85 | 39.52 *WIN*   128/C4 56.74 | 73.31 *WIN*   1024/C1 67.39 | 44.11
+            1024/C4 134.4 | 93.46        4096/C1 175.7 | 93.71        4096/C4 339.0 | 227.6
+            8192/C1 371.6 | 181.1        8192/C4 1228 | 458.7
+  TPOT ms   C1 6.58-6.85 | 5.03-5.09     C4 11.75 / 13.40 / 15.33 / 17.41 | 7.24 / 7.57 / 7.92 / 8.53
+  tok/s     1024/C16 371 | 1380   1024/C32 405 | 1736   4096/C16 222 | 885   4096/C32 222 | 1081
+
 ## Status
 
 | step | state |
@@ -788,7 +868,7 @@ FlashDecode 3.4 ms. CSV: perf-data/campaign/gemma4-26b-a4b.h100.bf16-decode-abla
 | vLLM 26B reference ladder | **done** (8 cells) |
 | Plow 26B rung ladder | **done** (6 cells; 8K rung blocked by max_ctx, now fixed to 8704, needs rebuild) |
 | cuBLASLt probe + A/B | probe done (40 entries); A/B in flight |
-| Beat vLLM | **NOT achieved** — C1: TPOT 1.6x, TTFT 1.08-2.06x behind; C4: TPOT 2.7-2.8x behind |
+| Beat vLLM | **PARTIAL** — TTFT wins at 128/C1 (31.9 vs 39.5) and 128/C4 (56.7 vs 73.3); C1 TPOT 1.3x, TTFT >=1024 1.5-2.1x, C4 TPOT 1.6-2.0x, serving tok/s 3.7-4.9x behind |
 | plowc/plowrt release build | done |
 | Emit + objects + role emit | **done** (`045a38e3`) |
 | Roofline model corrected + validated on 12B | **done** |
