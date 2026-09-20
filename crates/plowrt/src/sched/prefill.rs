@@ -10,6 +10,10 @@ pub enum SpanPolicy {
     /// Divide the row budget across the rotated candidates. Short requests
     /// return unused rows to other candidates in the same launch.
     FairSplit,
+    /// Fulfill the earliest candidate up to its remaining rows before
+    /// splitting across subsequent candidates. Minimizes TTFT and allows
+    /// earlier requests to begin decoding immediately.
+    Greedy,
 }
 
 const MAX_SLOTS: usize = u128::BITS as usize;
@@ -88,7 +92,7 @@ pub fn admit(
             && occupied & bit == 0
             && span.state_slot == span.slot
             && span.kv_row0.checked_add(span.n_rows) == Some(span.kv_len)
-            && (policy == SpanPolicy::FairSplit || span.n_rows <= row_limit);
+            && (policy != SpanPolicy::Whole || span.n_rows <= row_limit);
         if valid {
             by_slot[slot] = Some(span);
             occupied |= bit;
@@ -134,6 +138,7 @@ pub fn admit(
                 let candidates_left = u32::try_from(count - index).unwrap_or(u32::MAX);
                 span.n_rows.min(remaining.div_ceil(candidates_left))
             }
+            SpanPolicy::Greedy => span.n_rows.min(remaining),
         };
         span.row0 = rows;
         span.n_rows = take;
@@ -413,5 +418,31 @@ mod tests {
         );
         assert_eq!(pack.spans().len(), 3);
         assert!(pack.spans().iter().all(|span| span.n_rows == 1));
+    }
+
+    #[test]
+    fn greedy_allocates_full_capacity_to_first_candidate() {
+        let candidates = [
+            span(0, 0, 4096, 0),
+            span(1, 0, 4096, 0),
+        ];
+        let pack = admit(candidates, 4096, 0, 2, SpanPolicy::Greedy, |_| Some(4096));
+        assert_eq!(pack.spans().len(), 1);
+        assert_eq!(pack.spans()[0].slot, 0);
+        assert_eq!(pack.spans()[0].n_rows, 4096);
+    }
+
+    #[test]
+    fn greedy_spills_leftover_to_next_candidate() {
+        let candidates = [
+            span(0, 0, 1500, 0),
+            span(1, 0, 4096, 0),
+        ];
+        let pack = admit(candidates, 4096, 0, 2, SpanPolicy::Greedy, |_| Some(4096));
+        assert_eq!(pack.spans().len(), 2);
+        assert_eq!(pack.spans()[0].slot, 0);
+        assert_eq!(pack.spans()[0].n_rows, 1500);
+        assert_eq!(pack.spans()[1].slot, 1);
+        assert_eq!(pack.spans()[1].n_rows, 4096 - 1500);
     }
 }

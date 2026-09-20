@@ -240,9 +240,9 @@ impl PackedTerminal {
         insts[3].i[0] = elements;
         insts[4].i[1] = capacity as u32;
         insts[5].i[1] = capacity as u32;
-        let program = chain(insts, e.grid, capacity as u32);
+        let program = chain(insts, e.grid_pf, capacity as u32);
         plow_asset::aux_program::Section {
-            n_cu: e.grid,
+            n_cu: e.grid_pf,
             programs: vec![program.clone()],
         }
         .validate(pointers.len())
@@ -300,7 +300,7 @@ impl PackedTerminal {
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
             e.be.launch_cooperative(
                 e.f_pf.unwrap(),
-                e.grid,
+                e.grid_pf,
                 BLOCK,
                 e.smem_pf,
                 &mut params,

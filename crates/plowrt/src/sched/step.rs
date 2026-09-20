@@ -29,6 +29,8 @@ pub struct Backend {
     pub split_spans: bool,
     /// Decode rows ride in the prefill launch and are charged to the same budget.
     pub decode_rows_join_prefill: bool,
+    /// Cross-request span policy override. When None, defaults to FairSplit if split_spans, else Whole.
+    pub span_policy: Option<SpanPolicy>,
 }
 
 impl Default for Backend {
@@ -38,6 +40,7 @@ impl Default for Backend {
             packing: false,
             split_spans: false,
             decode_rows_join_prefill: false,
+            span_policy: None,
         }
     }
 }
@@ -138,11 +141,11 @@ pub fn plan(
     let mut launches: Vec<Launch> = Vec::new();
     while budget > 0 && launches.len() < max_launches {
         if backend.packing && tick.packing {
-            let policy = if backend.split_spans {
+            let policy = backend.span_policy.unwrap_or(if backend.split_spans {
                 SpanPolicy::FairSplit
             } else {
                 SpanPolicy::Whole
-            };
+            });
             let mut pack = admit(
                 candidates
                     .iter()
@@ -237,6 +240,7 @@ mod tests {
             packing: true,
             split_spans: false,
             decode_rows_join_prefill: false,
+            span_policy: None,
         }
     }
 
@@ -272,6 +276,7 @@ mod tests {
             packing: true,
             split_spans: true,
             decode_rows_join_prefill: true,
+            span_policy: None,
         };
         let got = plan(backend, tick(true), 0..20, &[cand(0, 0, 0, 100_000, true, true)], |_| Some(2048), |_| u32::MAX);
         assert_eq!(got.decodes.len(), 20);
@@ -394,6 +399,7 @@ mod tests {
             packing: true,
             split_spans: true,
             decode_rows_join_prefill: true,
+            span_policy: None,
         };
         let candidates = vec![cand(0, 0, 0, 100_000, true, true), cand(1, 1, 0, 100, true, true)];
         let got = plan(backend, tick(true), 0..4, &candidates, |_| Some(4096), |_| u32::MAX);
@@ -403,6 +409,25 @@ mod tests {
         let lone = plan(backend, tick(true), [], &candidates[..1], |_| Some(4096), |_| u32::MAX);
         assert_eq!(lone.launches.len(), 1);
         assert_eq!(lone.launches[0].spans.len(), 1);
+    }
+
+    #[test]
+    fn greedy_span_policy_prefers_first_candidate() {
+        let backend = Backend {
+            step_budget: 4096,
+            packing: true,
+            split_spans: true,
+            decode_rows_join_prefill: true,
+            span_policy: Some(crate::sched::prefill::SpanPolicy::Greedy),
+        };
+        let candidates = vec![cand(0, 0, 0, 100_000, true, true), cand(1, 1, 0, 100, true, true)];
+        let got = plan(backend, tick(true), 0..4, &candidates, |_| Some(4096), |_| u32::MAX);
+        assert_eq!(got.launches.len(), 1);
+        assert_eq!(got.launches[0].rows(), 4096 - 4);
+        assert_eq!(
+            got.launches[0].spans.iter().map(|s| (s.slot, s.n_rows)).collect::<Vec<_>>(),
+            [(0, 4096 - 4)]
+        );
     }
 
     #[test]

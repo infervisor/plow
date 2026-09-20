@@ -2659,6 +2659,7 @@ mod amd_serve {
                 packing: true,
                 split_spans: false,
                 decode_rows_join_prefill: false,
+                span_policy: None,
             }
         }
 

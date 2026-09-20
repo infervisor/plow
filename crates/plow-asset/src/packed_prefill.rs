@@ -145,6 +145,7 @@ impl Manifest {
         for cache in &live.caches {
             need(
                 cache.window == 0
+                    || u64::from(cache.stride) >= u64::from(live.max_ctx)
                     || u64::from(cache.stride)
                         >= u64::from(cache.window) + u64::from(write_rows) - 1,
                 "ring must retain the attention window across all padded KV writes",

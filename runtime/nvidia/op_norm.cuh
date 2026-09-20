@@ -889,56 +889,56 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
                 }
                 *(ushort4*)(out + obase + 4u * (lane + 32u * c)) = o;
             }
-            continue;
-        }
-        /* PRODUCE: the head AND its weight, all E of each, before anything is waited on. */
-        float v[E], g[E];
+        } else {
+            /* PRODUCE: the head AND its weight, all E of each, before anything is waited on. */
+            float v[E], g[E];
 #pragma unroll
-        for (unsigned e = 0; e < E; e++) {
-            v[e] = __bfloat162float(x[ibase + lane + e * 32]);
-            g[e] = gamma ? norm_weight(__bfloat162float(gamma[lane + e * 32])) : 1.0f;
-        }
-        float inv = 1.0f;
-        if (!skip_norm) {
-            float ss = 0.0f;
+            for (unsigned e = 0; e < E; e++) {
+                v[e] = __bfloat162float(x[ibase + lane + e * 32]);
+                g[e] = gamma ? norm_weight(__bfloat162float(gamma[lane + e * 32])) : 1.0f;
+            }
+            float inv = 1.0f;
+            if (!skip_norm) {
+                float ss = 0.0f;
 #pragma unroll
-            for (unsigned e = 0; e < E; e++) ss += v[e] * v[e];
-            inv = rsqrtf(warp_sum32(ss) * __fdividef(1.0f, (float)hd) + eps);
-        }
-#pragma unroll
-        for (unsigned e = 0; e < E; e++) v[e] = gemma3_bf16_round(v[e] * inv * g[e]);
-
-        if (cosb) {
-            constexpr unsigned H2 = HD / 2;
-            const size_t p = (size_t)pos[t] * H2;
-            float r[E];
-            if constexpr (!INTERLEAVE) {
-                constexpr unsigned EH = H2 / 32; /* lane-local stride to the half-split partner */
-#pragma unroll
-                for (unsigned e = 0; e < E; e++) {
-                    const unsigned i = lane + e * 32;
-                    const unsigned j = (i < H2) ? i : (i - H2);
-                    const float c = gemma3_bf16_round(cosb[p + j]), s = gemma3_bf16_round(sinb[p + j]);
-                    r[e] = (e < EH) ? (v[e] * c - v[e + EH] * s)  /* i in [0, H2)  */
-                                    : (v[e] * c + v[e - EH] * s); /* i in [H2, hd) */
-                }
-            } else {
-#pragma unroll
-                for (unsigned e = 0; e < E; e++) {
-                    const unsigned i = lane + e * 32;
-                    const float c = gemma3_bf16_round(cosb[p + (i >> 1)]), s = gemma3_bf16_round(sinb[p + (i >> 1)]);
-                    const float partner = __shfl_xor_sync(0xffffffffu, v[e], 1, 32);
-                    r[e] = ((i & 1u) == 0u) ? (v[e] * c - partner * s)
-                                            : (v[e] * c + partner * s);
-                }
+                for (unsigned e = 0; e < E; e++) ss += v[e] * v[e];
+                inv = rsqrtf(warp_sum32(ss) * __fdividef(1.0f, (float)hd) + eps);
             }
 #pragma unroll
-            for (unsigned e = 0; e < E; e++) v[e] = r[e];
-        }
+            for (unsigned e = 0; e < E; e++) v[e] = gemma3_bf16_round(v[e] * inv * g[e]);
+
+            if (cosb) {
+                constexpr unsigned H2 = HD / 2;
+                const size_t p = (size_t)pos[t] * H2;
+                float r[E];
+                if constexpr (!INTERLEAVE) {
+                    constexpr unsigned EH = H2 / 32; /* lane-local stride to the half-split partner */
+#pragma unroll
+                    for (unsigned e = 0; e < E; e++) {
+                        const unsigned i = lane + e * 32;
+                        const unsigned j = (i < H2) ? i : (i - H2);
+                        const float c = gemma3_bf16_round(cosb[p + j]), s = gemma3_bf16_round(sinb[p + j]);
+                        r[e] = (e < EH) ? (v[e] * c - v[e + EH] * s)  /* i in [0, H2)  */
+                                        : (v[e] * c + v[e - EH] * s); /* i in [H2, hd) */
+                    }
+                } else {
+#pragma unroll
+                    for (unsigned e = 0; e < E; e++) {
+                        const unsigned i = lane + e * 32;
+                        const float c = gemma3_bf16_round(cosb[p + (i >> 1)]), s = gemma3_bf16_round(sinb[p + (i >> 1)]);
+                        const float partner = __shfl_xor_sync(0xffffffffu, v[e], 1, 32);
+                        r[e] = ((i & 1u) == 0u) ? (v[e] * c - partner * s)
+                                                : (v[e] * c + partner * s);
+                    }
+                }
+#pragma unroll
+                for (unsigned e = 0; e < E; e++) v[e] = r[e];
+            }
 
 #pragma unroll
-        for (unsigned e = 0; e < E; e++)
-            out[obase + lane + e * 32] = __float2bfloat16(v[e]);
+            for (unsigned e = 0; e < E; e++)
+                out[obase + lane + e * 32] = __float2bfloat16(v[e]);
+        }
     }
 }
 

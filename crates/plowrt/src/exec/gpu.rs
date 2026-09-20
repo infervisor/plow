@@ -2005,6 +2005,7 @@ pub struct GpuEngine {
     /// (bucket, slot-tensor-base) — one cuGraphLaunch replaces ~480 kernel submits.
     seg_graphs: std::collections::HashMap<(usize, u64), crate::device::cuda::GraphExec>,
     smem_pf: u32,
+    grid_pf: u32,
     prefill: Vec<PrefillBucket>,
     /// Read in `Drop` (unloaded separately from [`Self::module`]), so not
     /// underscore-prefixed either.
@@ -3423,6 +3424,13 @@ impl GpuEngine {
                 (module, f, kname, smem, grid, dec_source, image_len)
             }
         };
+        if let Ok(val) = std::env::var("PLOW_DEBUG_MAX_INST") {
+            if let Ok(limit) = val.parse::<u32>() {
+                if be.module_global_set_u32(&module, "plow_debug_max_inst", limit)? {
+                    tracing::warn!("SET plow_debug_max_inst = {}", limit);
+                }
+            }
+        }
         check_dsa_decode_batch_arm(
             dsa_decode_batch_required(blob.decode_phase()),
             be.module_global_u32(&module, "plow_dsa_decode_batch_arm")?,
@@ -4595,7 +4603,7 @@ impl GpuEngine {
         // swapped on disk no longer costs the prefill path (it used to load the
         // DECODE image here and fail on the missing `_pf` symbol).
         let pf = resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
-        let (f_pf, smem_pf, module_pf, prefill, seg_pf) = if let Some(pf) = pf {
+        let (f_pf, smem_pf, module_pf, prefill, seg_pf, grid_pf) = if let Some(pf) = pf {
             let pf_src = pf.source.clone();
             match Self::load_prefill(
                 &be,
@@ -4610,15 +4618,16 @@ impl GpuEngine {
                 packed_prefill.as_ref(),
                 cublaslt_prefill.as_ref(),
             ) {
-                Ok((f_pf, smem_pf, module_pf, buckets, seg_pf)) => {
+                Ok((f_pf, smem_pf, module_pf, buckets, seg_pf, grid_pf)) => {
                     tracing::info!(
                         pf_cubin = %pf_src,
                         buckets = buckets.len(),
                         smem_pf,
+                        grid_pf,
                         segmented = seg_pf.is_some(),
                         "prefill object loaded"
                     );
-                    (Some(f_pf), smem_pf, Some(module_pf), buckets, seg_pf)
+                    (Some(f_pf), smem_pf, Some(module_pf), buckets, seg_pf, grid_pf)
                 }
                 // HARD ERROR, not a fallback. The cubin is PRESENT and failed to
                 // load — a broken deployment, not a configuration. Falling back
@@ -4648,7 +4657,7 @@ impl GpuEngine {
                 expected = profile.prefill_file,
                 "no prefill object for sm_{want_sm} — decode-only prompt consumption"
             );
-            (None, SMEM_PF, None, Vec::new(), None)
+            (None, SMEM_PF, None, Vec::new(), None, grid)
         };
 
         let mut packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize] =
@@ -4994,7 +5003,7 @@ impl GpuEngine {
                 be.set_max_dynamic_smem(direct, smem)?;
                 let direct_capacity = be.occupancy_blocks_per_sm(direct, block, smem as usize)?
                     * be.sm_count();
-                if direct_capacity != grid {
+                if direct_capacity != blob.n_cu {
                     return Err(RuntimeError::Rejected(
                         "HD512 px4 direct role occupancy must equal packet grid".into(),
                     ));
@@ -5011,7 +5020,7 @@ impl GpuEngine {
                 be.set_max_dynamic_smem(direct, smem)?;
                 let direct_capacity = be.occupancy_blocks_per_sm(direct, block, smem as usize)?
                     * be.sm_count();
-                if direct_capacity != grid {
+                if direct_capacity != blob.n_cu {
                     return Err(RuntimeError::Rejected(
                         "paired-GQA2 HD256 direct role occupancy must equal packet grid".into(),
                     ));
@@ -5030,7 +5039,7 @@ impl GpuEngine {
                 be.set_max_dynamic_smem(direct, smem)?;
                 let direct_capacity =
                     be.occupancy_blocks_per_sm(direct, block, smem as usize)? * be.sm_count();
-                if direct_capacity != grid {
+                if direct_capacity != blob.n_cu {
                     return Err(RuntimeError::Rejected(
                         "Gemma-4 W8A8 GLU direct role occupancy must equal packet grid".into(),
                     ));
@@ -5055,8 +5064,10 @@ impl GpuEngine {
                     })?;
                 grid.checked_mul(multiplier)
                     .ok_or_else(|| RuntimeError::Rejected("MXFP4 MoE role grid overflows".into()))?
-            } else {
+            } else if id == plow_asset::segment_roles::GEMV_CTA512 || plow_asset::segment_roles::is_projection(id) {
                 grid
+            } else {
+                blob.n_cu
             };
             if (id == plow_asset::segment_roles::GEMV_CTA512 && capacity < grid)
                 || (id == plow_asset::segment_roles::MXFP4_MOE && capacity < role_grid)
@@ -5065,8 +5076,8 @@ impl GpuEngine {
                     plow_asset::segment_roles::GEMV_CTA512
                         | plow_asset::segment_roles::MXFP4_MOE
                         | plow_asset::segment_roles::W8A16_PREFILL_M1
-                ) && capacity != grid)
-                || (id == plow_asset::segment_roles::W8A16_PREFILL_M1 && capacity < grid)
+                ) && capacity != role_grid)
+                || (id == plow_asset::segment_roles::W8A16_PREFILL_M1 && capacity < role_grid)
             {
                 return Err(RuntimeError::Rejected(
                     "packet role occupancy must equal packet grid".into(),
@@ -5316,6 +5327,7 @@ impl GpuEngine {
             decode_packet_roles,
             seg_graphs: std::collections::HashMap::new(),
             smem_pf,
+            grid_pf,
             prefill,
             module_pf,
             sampler,
@@ -6718,11 +6730,16 @@ impl GpuEngine {
     /// is a bucket-cost decision this engine keeps, so it is handed to the planner as the
     /// tick cap rather than re-derived there.
     pub fn step_backend(&self) -> crate::sched::step::Backend {
+        let policy = match crate::config::RuntimeConfig::get().pf_span_policy.as_deref() {
+            Some("fair") => crate::sched::prefill::SpanPolicy::FairSplit,
+            _ => crate::sched::prefill::SpanPolicy::Greedy,
+        };
         crate::sched::step::Backend {
             step_budget: u32::try_from(self.pf_max_rows()).unwrap_or(u32::MAX),
             packing: true,
             split_spans: true,
             decode_rows_join_prefill: false,
+            span_policy: Some(policy),
         }
     }
 
@@ -6744,7 +6761,7 @@ impl GpuEngine {
         segment_roles: Option<&SegmentRoles>,
         packed: Option<&plow_asset::packed_prefill::Manifest>,
         cublaslt_backend: Option<&cublaslt::ProjectionBackend>,
-    ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>)> {
+    ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>, u32)> {
         let packed_requests = packed.is_some();
         let mut inferred_policy = crate::asset::devblob::SegmentClassPolicy::default();
         for program in blob.prefill_progs() {
@@ -7261,13 +7278,13 @@ impl GpuEngine {
                 let lo = g.gq_seg_ofs[seg] as usize;
                 let hi = g.gq_seg_ofs[seg + 1] as usize;
                 let entries = &g.gq_stream[lo..hi];
-                if entries.len() != grid as usize
+                if entries.len() != grid_pf as usize
                     || entries.iter().enumerate().any(|(slice, entry)| {
                         entry.inst as usize != site.0
                             || entry.slice as usize != slice
                             || entry.flags & packet::dev::SE_XCTR != 0
                     })
-                    || inst.blocks != grid as u16
+                    || inst.blocks != grid_pf as u16
                 {
                     return Err(RuntimeError::Rejected(
                         "direct packet role requires an exact ordered grid".into(),
@@ -7489,6 +7506,7 @@ impl GpuEngine {
         }
         // Only complete segmented chains avoid launching f_pf at the decode grid.
         if grid_pf != grid
+            && grid != 2 * grid_pf
             && !buckets.iter().all(|b| {
                 uses_segmented_prefill(
                     seg_mode,
@@ -7506,7 +7524,7 @@ impl GpuEngine {
             )));
         }
         buckets.sort_by_key(|b| b.t);
-        Ok((f_pf, smem_pf, module, buckets, seg_pf))
+        Ok((f_pf, smem_pf, module, buckets, seg_pf, grid_pf))
     }
 
     /// Consume the whole prompt for slot `b` through the prefill bucket chain
@@ -8148,7 +8166,7 @@ impl GpuEngine {
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
                 self.be.launch_cooperative(
                     role.map_or(f_pf, |r| r.function),
-                    self.grid,
+                    role.map_or(self.grid_pf, |r| r.grid),
                     BLOCK,
                     role.map_or(self.smem_pf, |r| r.smem),
                     &mut params,
@@ -8328,7 +8346,7 @@ impl GpuEngine {
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
             self.be.launch_cooperative(
                 f_pf,
-                self.grid,
+                self.grid_pf,
                 BLOCK,
                 self.smem_pf,
                 &mut params,
@@ -8724,7 +8742,7 @@ impl GpuEngine {
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
                 self.be.launch_cooperative(
                     f_pf,
-                    self.grid,
+                    self.grid_pf,
                     BLOCK,
                     self.smem_pf,
                     &mut params,
@@ -8745,7 +8763,7 @@ impl GpuEngine {
                 requests = reqs.len(),
                 bucket = bi,
                 rows = total,
-                grid = self.grid,
+                grid = self.grid_pf,
                 block = BLOCK,
                 smem = self.smem_pf,
                 "batched prefill: stream sync failed"

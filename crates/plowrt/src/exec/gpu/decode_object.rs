@@ -172,18 +172,18 @@ pub(super) fn initial_grid(
         let object =
             &metadata.objects[&metadata.programs.last().expect("validated coverage").object];
         capacity(object, sms, occupancy)?;
-        if object.grid != packet_grid {
+        if object.grid != packet_grid && object.grid != occupancy * sms {
             return Err(reject("bound main object differs from packet grid"));
         }
         Ok(object.grid)
     } else {
         let grid = occupancy * sms;
-        if grid != packet_grid {
+        if grid != packet_grid && grid != 2 * packet_grid {
             return Err(RuntimeError::Device(format!(
                 "interpreter grid {grid} ({occupancy}/SM × {sms} SMs) != packet n_cu {packet_grid} — recompile \
                  the packet with n_cu={grid}")));
         }
-        Ok(grid)
+        Ok(packet_grid)
     }
 }
 pub(super) fn check_loaded(

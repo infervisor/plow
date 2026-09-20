@@ -213,6 +213,11 @@ pub struct RuntimeConfig {
     #[arg(long = "block-stage", env = "PLOW_BLOCK_STAGE", value_parser = clap::builder::PossibleValuesParser::new(["attn", "ffn", "embed", "vocab", "all"]), global = true)]
     pub block_stage: Option<String>,
 
+    /// Prefill cross-request span allocation policy: "greedy" (completion priority, lowest TTFT)
+    /// or "fair" (fair-split rows across all concurrent requests).
+    #[arg(long = "pf-span-policy", env = "PLOW_PF_SPAN_POLICY", value_parser = clap::builder::PossibleValuesParser::new(["greedy", "fair"]), global = true)]
+    pub pf_span_policy: Option<String>,
+
     /// Runtime max context override. If set, limits or configures the maximum sequence length at runtime.
     /// If unset, defaults to the context length declared by the packet.
     #[arg(long = "rt-max-ctx", env = "PLOW_RT_MAX_CTX", global = true)]
