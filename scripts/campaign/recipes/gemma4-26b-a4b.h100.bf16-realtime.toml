@@ -56,7 +56,10 @@ PLOW_SLIDING_NS_CAP = "1"
 # condition the emitter admits an appended rung on; per-slot KV is unchanged.
 PLOW_PF_LADDER_APPEND = "256,1152,4224"
 PLOW_MAX_CHUNK = "4096"
-PLOW_FUSE_ARGMAX = "1"
+# Measured on this board (tune_decode_sweep.sh, step_bench, B=1, occ 1:132): folding the greedy
+# argmax into the lm_head GEMV epilogue is SLOWER here — 6.501 ms/step vs 5.837 without it.
+# (PLOW_FUSE_MERGE / PLOW_FUSE_HNR: no effect; PLOW_GEMMA_MOE_ROUTER_FUSED: 142 ms/step.)
+PLOW_FUSE_ARGMAX = "0"
 # The exact scorer replays the legacy scalar fmaf order on ONE lane per expert: measured
 # 0.0460 ms/layer at B=1 vs 0.0085 for ScoreFast (moe_decode_gemma26b_bench.cu) — 1.1 ms of
 # an 8.15 ms C1 decode step. ScoreFast is f32 end to end with a tree reduction, which is

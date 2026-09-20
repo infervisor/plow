@@ -859,6 +859,47 @@ SERVED, b26q + nodelay (plow | vLLM 0.28):
   TPOT ms   C1 6.58-6.85 | 5.03-5.09     C4 11.75 / 13.40 / 15.33 / 17.41 | 7.24 / 7.57 / 7.92 / 8.53
   tok/s     1024/C16 371 | 1380   1024/C32 405 | 1736   4096/C16 222 | 885   4096/C32 222 | 1081
 
+## Grouped GEMM at 1024/4096: it is at the HBM roof; the fix is a vendor batched route (2026-09-20)
+
+User direction: fix the prefill MoE grouped GEMM for the 1024 / 4096 rungs.
+
+GLU k-step anatomy, real routing (harness switches MOE90_DBG_NOSTAGE_B / NOSTAGE / NOMMA), ms/layer:
+             full    B-staging off   all staging off   tensor core off
+  T=1024     0.601   0.347           0.245             0.508
+  T=4096     1.304   0.844           0.595             1.008
+B-tile staging is 35-42% of GLU. WHY A NEW LOAD ENGINE CANNOT HELP: bytes. Each expert's 7.9 MB
+gate_up is re-streamed for EVERY row-tile pair of that expert and each 128-row A tile is re-read
+for all 6 column tiles: ~2.5 GB of B + 1.3 GB of A per layer in 1.3 ms = ~3.0 TB/s against a
+3.35 TB/s HBM peak. The kernel is BANDWIDTH-bound at the roof (minimum would be 1.0 + 0.22 GB).
+L2 is 64 MB device-wide and one round's B working set is ~185 MB, so reordering for reuse does
+not work; holding two row-tiles' accumulators hits the 255-register cap.
+
+Measured, in order:
+* TMA load engine for DOWN (d_moe_group_down_gemma_pf_tma, mbarrier ring, 2-D maps over the
+  fused down tensor + gathered fu): BYTE-IDENTICAL first try, and a WASH — 0.843 vs 0.789 ms at
+  T=4096, +-4% elsewhere. Both engines sit at ~1.4 us per k-step. Removed (nothing dispatched it).
+  tma_ws_moe_group.cu's 1.6-1.75x was K=3840 / E=8, where the body was issue-bound, not roof-bound.
+* Pipelined DOWN k-loop (prefetch one stage, wait<1> on the previous mma group; safe on the 3-deep
+  ring): bit-exact, down 0.377 -> 0.340 (T=1024), 0.880 -> 0.783 (T=4096). ON by default. GLU cannot
+  take it: a 3-deep ring with two B sets exceeds the 232 KB smem budget.
+* PROXY for a vendor route, per-EXPERT batches (torch.bmm [E][C][*], C = fixed capacity), ms/layer
+  gate_up+down vs plow wgmma:  T=1024 C=128 0.62 vs 0.945 (1.5x) | T=4096 C=256 0.70, C=384 0.90 vs
+  2.087 (2.3-3x).  (The earlier 128-row-TILE bmm proxy was no faster — shape matters.)
+
+PLAN — sync-free batched expert route (the dense projections already escape via cuBLASLt):
+  1. align: capacity layout rows[e*C + i] for the first C rows of each expert; rows past C go to the
+     existing tile meta as OVERFLOW, served by ops 75/76 unchanged (zero tiles when none).
+  2. device ops: gather xn2 -> [E*C, H]; existing Glu over the two batched outputs; gate-scale +
+     scatter into part. 3. a batched GEMM instruction (batch E, stride; gate and up are strided views
+     of the fused gate_up) routed to cuBLASLt strided-batched plans in plowrt (segment = one op).
+  4. every gate this campaign tripped: slots + dev.rs/dev_isa.h docs, opclass, rowclass, opaudit,
+     live_kv direct_operands, kvrow PREFILL_ROW_FIELDS (ragged), segment_roles Lt shapes, packed
+     prefill audit. Expected: -36 ms TTFT at 4096, -10 ms at 1024, -70 ms at 8192.
+
+DECODE, from the fusion-knob sweep (stage E, step_bench B=1): PLOW_FUSE_ARGMAX=1 — which the
+recipe set — is SLOWER, 6.501 vs 5.837 ms; recipe now 0. FUSE_MERGE / FUSE_HNR: no effect.
+PLOW_GEMMA_MOE_ROUTER_FUSED: 142.7 ms/step (legacy one-block router) — never.
+
 ## Status
 
 | step | state |

@@ -40,6 +40,9 @@
 #define MOE90_BK 64     /* bf16 elems/row = 128 B = one 128B-swizzle atom row */
 #define MOE90_BK8 128   /* e4m3 elems/row = 128 B */
 #define MOE90_STAGES 3     /* plain (down) ring depth */
+#ifndef MOE90_DOWN_PIPE
+#define MOE90_DOWN_PIPE 1 /* overlap the mma with the next stage: bit-exact, -10% down */
+#endif
 #define MOE90_GLU_STAGES 2 /* gate/up ring depth (3 tiles per stage) */
 #define MOE90_ABUF (MOE90_BM * MOE90_BK)   /* bf16 elems per staged A tile */
 #define MOE90_BBUF (MOE90_BN * MOE90_BK)   /* bf16 elems per staged B tile */
@@ -227,6 +230,9 @@ static __device__ void d_moe_group_glu_gemma_pf(__nv_bfloat16* __restrict__ fu,
 #endif
             moe90_stage_a_gather(As + buf * MOE90_ABUF, xn2, row_token, tid, rowbase,
                                  ks * MOE90_BK, K);
+#if defined(MOE90_DBG_NOSTAGE_B)
+            if (ks > 0) return; /* harness attribution: the bound on a free B load engine */
+#endif
             moe90_stage_b(Bgs0 + buf * MOE90_BBUF, Wg, tid, tn, ks * MOE90_BK, I_moe, K);
             moe90_stage_b(Bus0 + buf * MOE90_BBUF, Wu, tid, tn, ks * MOE90_BK, I_moe, K);
 #if MOE90_HALF
@@ -345,6 +351,29 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
                               ks * MOE90_BK, H, K);
 #endif
         };
+#if MOE90_DOWN_PIPE
+        /* PIPELINED: prefetch ONE stage and wait only on the PREVIOUS mma group, so group ks
+         * runs while stage ks+1 lands. Safe on the 3-deep ring: iteration ks stages buffer
+         * (ks+1)%3 and computes on ks%3, and the buffer it will restage next, (ks+2)%3, is
+         * group ks-1's, which wait<1> has just retired. */
+        if (0 < ksteps) stage(0, 0);
+        sm90_cp_commit();
+        sm90_wg_fence();
+
+        for (int ks = 0; ks < ksteps; ks++) {
+            if (ks + 1 < ksteps) stage(ks + 1, (ks + 1) % MOE90_STAGES);
+            sm90_cp_commit();
+            sm90_cp_wait<1>();
+            __syncthreads();
+            const int cb = ks % MOE90_STAGES;
+            moe90_wgmma_k(acc, As + cb * MOE90_ABUF,
+                          Bs + (bsel * MOE90_STAGES + cb) * MOE90_BBUF, wg, live);
+            sm90_wg_commit();
+            sm90_wg_wait<1>();
+            __syncthreads();
+        }
+        sm90_wg_wait<0>();
+#else
 #pragma unroll
         for (int s = 0; s < MOE90_STAGES - 1; s++) {
             if (s < ksteps) stage(s, s);
@@ -365,6 +394,7 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
             sm90_wg_wait<0>();
             __syncthreads();
         }
+#endif
 
 #pragma unroll
         for (int g = 0; g < MOE90_NBLK; g++)
