@@ -86,7 +86,18 @@
      512)
 static_assert(MOE90_DN_STAGES * (MOE90_ABUF + MOE90_NB * MOE90_DN_BBUF) + 512 <= PGM_MOE_ARENA_SM90,
               "the n256 DOWN ring must fit the existing MoE arena claim");
-/* GROW-ONLY: never shrink whatever op_gemm.cuh (a sibling-owned file) already claims. */
+/* GROW-ONLY: never shrink whatever op_gemm.cuh (a sibling-owned file) already claims.
+ * ONLY for a packet that has these ops. The claim reaches every object that includes this header,
+ * and a dense Gemma packet builds its fat object as FATLITE at TWO blocks per SM: 2 x 161 KiB is
+ * past the 232448 B per-SM limit and the 12B's first prefill launch faulted (the half-tile B sets
+ * grew the ring from 96 KiB). A packet config that reports no Gemma MoE prefill keeps the sibling
+ * claim; without a config (the harnesses, the legacy objects) the claim stands. */
+#if defined(PLOW_PACKET_HAS_MOE_ROUTER_GEMMA_PF) && !PLOW_PACKET_HAS_MOE_ROUTER_GEMMA_PF
+#define MOE90_CLAIM_ARENA 0
+#else
+#define MOE90_CLAIM_ARENA 1
+#endif
+#if MOE90_CLAIM_ARENA
 #if PGM_ARENA_BF16 < PGM_MOE_ARENA_SM90
 #undef PGM_ARENA_BF16
 #define PGM_ARENA_BF16 PGM_MOE_ARENA_SM90
@@ -99,6 +110,7 @@ static_assert(MOE90_STAGES * (MOE90_A8BUF + MOE90_B8BUF) + 1024 <= 2 * PGM_ARENA
               "sm90 MoE w8a8 plain ring must fit the bf16 arena claim");
 static_assert(MOE90_GLU_STAGES * (MOE90_A8BUF + 2 * MOE90_B8BUF) + 1024 <= 2 * PGM_ARENA_BF16,
               "sm90 MoE w8a8 GLU ring must fit the bf16 arena claim");
+#endif
 static_assert(MOE90_BM == 128 && MOE90_BN == 128, "sm90 MoE tile assumes 2 warpgroups x m64n128");
 static_assert(PLOW_NV_THREADS == 256u, "sm90 MoE mainloop is exactly 2 warpgroups");
 
