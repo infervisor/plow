@@ -28,6 +28,9 @@
 __device__ __forceinline__ void st_glob8(__nv_bfloat16* p, const bf16v8& v) {
     *(uint4*)p = *(const uint4*)&v;
 }
+__device__ __forceinline__ void st_smem8(__nv_bfloat16* p, const bf16v8& v) {
+    *(uint4*)p = *(const uint4*)&v;
+}
 __device__ __forceinline__ bf16v8 bf16v8_zero() {
     bf16v8 r;
     *(uint4*)&r = make_uint4(0u, 0u, 0u, 0u);

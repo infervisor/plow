@@ -22,6 +22,7 @@
  */
 #pragma once
 #include "sm120_common.cuh"
+#include "op_norm.cuh"
 #include <cuda_fp8.h>
 
 /* One pass over K per warp: 32 lanes x 8 halves. */
@@ -353,26 +354,12 @@ __device__ __forceinline__ void gv_rb_smemx(float* __restrict__ acc,
 }
 #endif
 
-/* Arena-aware M=1 decode GEMV: x staged into smem, weights stream from GDDR exclusively. */
-static __device__ void d_gemv(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
-                       const __nv_bfloat16* __restrict__ W, unsigned M, unsigned N, unsigned K,
-                       unsigned slice, unsigned nblk, __nv_bfloat16* __restrict__ arena) {
-    if (M > 1) { d_gemv(C, x, W, M, N, K, slice, nblk); return; }
-#if PLOW_NV_GEMV_NOSTAGE
-    /* Staging x costs K element-copies + a __syncthreads PER BLOCK, and it only pays if the
-     * block then reads many weight rows against it. o_proj/down are N=2816, so at nblk=264 a
-     * block owns per=ceil(N/nblk)=11 rows and the staging is no longer amortised -- while QKV
-     * (N=8192, per=63) is at 91% of the pure-read ceiling with the same arm. Below the
-     * threshold, read x straight from global (it is a few KiB and L2-resident). */
-    if ((N + nblk - 1u) / nblk < PLOW_NV_GEMV_STAGE_MINROWS) {
-        d_gemv(C, x, W, M, N, K, slice, nblk);
-        return;
-    }
-#endif
-    __nv_bfloat16* xs = arena;
-    for (unsigned i = threadIdx.x; i < K; i += blockDim.x) xs[i] = x[i];
-    __syncthreads();
-
+static __device__ __forceinline__ void d_gemv_staged_compute(
+    __nv_bfloat16* __restrict__ C,
+    const __nv_bfloat16* __restrict__ xs,
+    const __nv_bfloat16* __restrict__ W,
+    unsigned M, unsigned N, unsigned K,
+    unsigned slice, unsigned nblk) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned nchunk = (K + GV_STEP - 1) / GV_STEP;
@@ -459,6 +446,133 @@ static __device__ void d_gemv(__nv_bfloat16* __restrict__ C, const __nv_bfloat16
         }
         const float t = warp_sum32(acc);
         if (lane == 0 && M) C[n] = __float2bfloat16(t);
+    }
+}
+
+/* Arena-aware M=1 decode GEMV: x staged into smem, weights stream from GDDR exclusively. */
+static __device__ void d_gemv(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+                       const __nv_bfloat16* __restrict__ W, unsigned M, unsigned N, unsigned K,
+                       unsigned slice, unsigned nblk, __nv_bfloat16* __restrict__ arena) {
+    if (M > 1) { d_gemv(C, x, W, M, N, K, slice, nblk); return; }
+#if PLOW_NV_GEMV_NOSTAGE
+    /* Staging x costs K element-copies + a __syncthreads PER BLOCK, and it only pays if the
+     * block then reads many weight rows against it. o_proj/down are N=2816, so at nblk=264 a
+     * block owns per=ceil(N/nblk)=11 rows and the staging is no longer amortised -- while QKV
+     * (N=8192, per=63) is at 91% of the pure-read ceiling with the same arm. Below the
+     * threshold, read x straight from global (it is a few KiB and L2-resident). */
+    if ((N + nblk - 1u) / nblk < PLOW_NV_GEMV_STAGE_MINROWS) {
+        d_gemv(C, x, W, M, N, K, slice, nblk);
+        return;
+    }
+#endif
+    __nv_bfloat16* xs = arena;
+    for (unsigned i = threadIdx.x; i < K; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+
+    d_gemv_staged_compute(C, xs, W, M, N, K, slice, nblk);
+}
+
+/* NormResidualNorm folded directly into smem staging:
+ * Computes:
+ *   invb = rsqrt(mean(b^2) + eps)
+ *   resid = (a + norm(b)*gb) * scale, rounded to bf16
+ *   invr = rsqrt(mean(resid^2) + eps)
+ *   no = resid * invr * gn -> written to xs (smem)
+ *   if store: resid -> resid_out (global)
+ */
+static __device__ __forceinline__ void gemv_nrn_smem(
+    __nv_bfloat16* __restrict__ resid_out,
+    __nv_bfloat16* __restrict__ xs,
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    const __nv_bfloat16* __restrict__ gb,
+    const __nv_bfloat16* __restrict__ gn,
+    unsigned K,
+    float eps, float scale, bool store,
+    float* __restrict__ part)
+{
+    bf16v8 av[RN_VEC], bv[RN_VEC], wb[RN_VEC], wn[RN_VEC];
+#pragma unroll
+    for (int c = 0; c < RN_VEC; c++) {
+        const unsigned i = (threadIdx.x + (unsigned)c * PLOW_NV_THREADS) * 8;
+        av[c] = bf16v8_zero();
+        bv[c] = bf16v8_zero();
+        wb[c] = bf16v8_zero();
+        wn[c] = bf16v8_zero();
+        if (i < K) {
+            av[c] = ld_glob8(a + i);
+            bv[c] = ld_glob8(b + i);
+            if (gb) wb[c] = ld_glob8(gb + i);
+            if (gn) wn[c] = ld_glob8(gn + i);
+        }
+    }
+    float ssb = 0.0f;
+#pragma unroll
+    for (int c = 0; c < RN_VEC; c++)
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const float f = __bfloat162float(bv[c].x[j]);
+            ssb += f * f;
+        }
+    const float invb = rsqrtf(block_sum(ssb, part) / (float)K + eps);
+    bf16v8 rv[RN_VEC];
+    float ssr = 0.0f;
+#pragma unroll
+    for (int c = 0; c < RN_VEC; c++) {
+        bf16v8 r;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const float g = gb ? norm_weight(__bfloat162float(wb[c].x[j])) : 1.0f;
+            const float f =
+                (__bfloat162float(av[c].x[j]) + gemma_postnorm_round(__bfloat162float(bv[c].x[j]) * invb * g)) *
+                scale;
+            r.x[j] = __float2bfloat16(f);
+            const float rf = __bfloat162float(r.x[j]);
+            ssr += rf * rf;
+        }
+        rv[c] = r;
+    }
+    const float invr = rsqrtf(block_sum(ssr, part) / (float)K + eps);
+#pragma unroll
+    for (int c = 0; c < RN_VEC; c++) {
+        const unsigned i = (threadIdx.x + (unsigned)c * PLOW_NV_THREADS) * 8;
+        if (i < K) {
+            bf16v8 no;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float g = gn ? norm_weight(__bfloat162float(wn[c].x[j])) : 1.0f;
+                no.x[j] = __float2bfloat16(__bfloat162float(rv[c].x[j]) * invr * g);
+            }
+            st_smem8(xs + i, no);
+            if (store) st_glob8(resid_out + i, rv[c]);
+        }
+    }
+    __syncthreads();
+}
+
+/* Fused decode GEMV with NRN staging */
+static __device__ void d_gemv_nrn(
+    __nv_bfloat16* __restrict__ C,
+    __nv_bfloat16* __restrict__ resid_out,
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    const __nv_bfloat16* __restrict__ gb,
+    const __nv_bfloat16* __restrict__ gn,
+    const __nv_bfloat16* __restrict__ W,
+    unsigned M, unsigned N, unsigned K,
+    float eps, float scale, bool store,
+    unsigned slice, unsigned nblk,
+    __nv_bfloat16* __restrict__ arena)
+{
+    if (K > RN_REG * PLOW_NV_THREADS || (K & 7u) != 0) { __trap(); return; }
+    __nv_bfloat16* xs = arena;
+    float* const nscratch = (float*)(arena + ((K + 15u) & ~15u));
+    for (unsigned m = 0; m < M; m++) {
+        const size_t off_k = (size_t)m * K;
+        const size_t off_n = (size_t)m * N;
+        gemv_nrn_smem(resid_out + off_k, xs, a + off_k, b + off_k, gb, gn, K, eps, scale, store && slice == 0, nscratch);
+        d_gemv_staged_compute(C + off_n, xs, W, 1, N, K, slice, nblk);
+        if (M > 1) __syncthreads();
     }
 }
 
@@ -2499,17 +2613,13 @@ static __device__ void d_gemv_glu(__nv_bfloat16* __restrict__ C, const __nv_bflo
     });
 }
 
-/* Arena-aware M=1 decode GLU GEMV: x staged into smem. */
-static __device__ void d_gemv_glu(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
-                           const __nv_bfloat16* __restrict__ Wg,
-                           const __nv_bfloat16* __restrict__ Wu, unsigned M, unsigned N,
-                           unsigned K, unsigned act, unsigned slice, unsigned nblk,
-                           __nv_bfloat16* __restrict__ arena) {
-    if (M > 1) { d_gemv_glu(C, x, Wg, Wu, M, N, K, act, slice, nblk); return; }
-    __nv_bfloat16* xs = arena;
-    for (unsigned i = threadIdx.x; i < K; i += blockDim.x) xs[i] = x[i];
-    __syncthreads();
-
+static __device__ __forceinline__ void d_gemv_glu_staged_compute(
+    __nv_bfloat16* __restrict__ C,
+    const __nv_bfloat16* __restrict__ xs,
+    const __nv_bfloat16* __restrict__ Wg,
+    const __nv_bfloat16* __restrict__ Wu,
+    unsigned M, unsigned N, unsigned K,
+    unsigned act, unsigned slice, unsigned nblk) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned nchunk = (K + GV_STEP - 1) / GV_STEP;
@@ -2543,6 +2653,47 @@ static __device__ void d_gemv_glu(__nv_bfloat16* __restrict__ C, const __nv_bflo
         if (lane == 0 && M) {
             C[n] = gemma_glu_epilogue(tg, tu, act);
         }
+    }
+}
+
+/* Arena-aware M=1 decode GLU GEMV: x staged into smem. */
+static __device__ void d_gemv_glu(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+                           const __nv_bfloat16* __restrict__ Wg,
+                           const __nv_bfloat16* __restrict__ Wu, unsigned M, unsigned N,
+                           unsigned K, unsigned act, unsigned slice, unsigned nblk,
+                           __nv_bfloat16* __restrict__ arena) {
+    if (M > 1) { d_gemv_glu(C, x, Wg, Wu, M, N, K, act, slice, nblk); return; }
+    __nv_bfloat16* xs = arena;
+    for (unsigned i = threadIdx.x; i < K; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+
+    d_gemv_glu_staged_compute(C, xs, Wg, Wu, M, N, K, act, slice, nblk);
+}
+
+/* Fused decode GLU GEMV with NRN staging */
+static __device__ void d_gemv_glu_nrn(
+    __nv_bfloat16* __restrict__ C,
+    __nv_bfloat16* __restrict__ resid_out,
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    const __nv_bfloat16* __restrict__ gb,
+    const __nv_bfloat16* __restrict__ gn,
+    const __nv_bfloat16* __restrict__ Wg,
+    const __nv_bfloat16* __restrict__ Wu,
+    unsigned M, unsigned N, unsigned K,
+    float eps, float scale, bool store,
+    unsigned act, unsigned slice, unsigned nblk,
+    __nv_bfloat16* __restrict__ arena)
+{
+    if (K > RN_REG * PLOW_NV_THREADS || (K & 7u) != 0) { __trap(); return; }
+    __nv_bfloat16* xs = arena;
+    float* const nscratch = (float*)(arena + ((K + 15u) & ~15u));
+    for (unsigned m = 0; m < M; m++) {
+        const size_t off_k = (size_t)m * K;
+        const size_t off_n = (size_t)m * N;
+        gemv_nrn_smem(resid_out + off_k, xs, a + off_k, b + off_k, gb, gn, K, eps, scale, store && slice == 0, nscratch);
+        d_gemv_glu_staged_compute(C + off_n, xs, Wg, Wu, 1, N, K, act, slice, nblk);
+        if (M > 1) __syncthreads();
     }
 }
 

@@ -4317,7 +4317,8 @@ fn emit_phase(
     // norm" rationale addressed serialization, but the GH200 per-op trace showed the real
     // cost is the extra HBM round trip + packet per pair, which holds at any T (norms ~9%
     // of a 4k chunk). Opt-in until token-gated on hardware.
-    let gfuse = c.arch.is_gemma() && (gemv_family || emit_config::active().pf_gfuse);
+    let gfuse = c.arch.is_gemma()
+        && (gemv_family || emit_config::active().pf_gfuse);
     // Is the seam whose norm uses `gamma` fused? The family flags are the structural gate; under
     // PLOW_EMIT_REWRITE the rewrite's extracted fused graph decides each seam. Producer and
     // consumer of a seam ask with the same gamma, so they agree.
@@ -4326,7 +4327,7 @@ fn emit_phase(
             rewrite_lower::fused(b, rewrite_lower::Lowering::AddNorm, gamma).unwrap_or(true)
         } else if gfuse {
             rewrite_lower::fused(b, rewrite_lower::Lowering::NormResidualNorm, gamma)
-                .unwrap_or(true)
+                .unwrap_or(gemv_family || emit_config::active().pf_gfuse)
         } else {
             false
         }
@@ -4341,15 +4342,15 @@ fn emit_phase(
     // t slots against the four operands. `n.xr` is TENSOR_NONE unless declare() enabled the
     // fold (AMD + fp8 + dense Gemma + env), and the shape bounds mirror the kernel's `fits`
     // preconditions, which the kernel re-checks and TRAPS on rather than staging garbage.
-    let fuse_nrn = gfuse
-        && fp8
-        && amd
+    let fuse_nrn = gemv_family
+        && gfuse
+        && (if amd { fp8 } else { true })
         && c.ple == 0
         && !block_mode
         && n.xr != TENSOR_NONE
         && (c.hidden & 7) == 0
-        && c.hidden <= 16 * 512 /* RN_REG * PLOW_THREADS */
-        && (gemv_staged_rows(t) as u64 * c.hidden as u64 + 16) <= gm_lds_halves()
+        && c.hidden <= if amd { 16 * 512 } else { 24 * 256 } /* RN_REG * PLOW_NV_THREADS */
+        && (if amd { (gemv_staged_rows(t) as u64 * c.hidden as u64 + 16) <= gm_lds_halves() } else { true })
         // The fold's two halves cross layers, so it needs every sandwich seam of the block.
         && block.clone().all(|l| {
             let next = if l + 1 < block.end { n.lw[l + 1].g_in } else { n.fin };
@@ -4414,7 +4415,8 @@ fn emit_phase(
             && !emit_config::active().decode_native_tc
             && !affine_q4
             && gemv_fused_input_fits(amd, t, c.hidden)
-            && !emit_config::active().no_fuse_qkv;
+            && !emit_config::active().no_fuse_qkv
+            && !fuse_nrn;
         // FUSED Q|K|V, per-channel fp8 (DevOp::GemvQkvFp8, op 115) — the arm the comment above
         // called "opcode 26 deferred", landed but OFF BY DEFAULT, because it MEASURES SLOWER.
         // Same output-axis merge and same LDS precondition as the bf16 form; the three f32
@@ -4761,6 +4763,7 @@ fn emit_phase(
             let nrn = nrn_pending.take();
             let fold_proj = |b: &mut Builder,
                              out: u32,
+                             w_bf16: u32,
                              w8: u32,
                              sc: u32,
                              nn: u32,
@@ -4768,25 +4771,43 @@ fn emit_phase(
                              store: bool,
                              f: &(u32, u32, u32, f32)|
              -> u32 {
-                b.emit(DevOp::GemvFp8, cus, &[dq], |d| {
-                    d.t[0] = out;
-                    d.t[1] = n.xr; // a: the residual NRN1 wrote (no normed hn exists to read)
-                    d.t[2] = w8;
-                    d.t[3] = n.x; // resid_out: the ping-pong twin
-                    d.t[4] = f.0; // b: the down/ffn output
-                    d.t[5] = sc;
-                    d.t[6] = f.1; // gamma_b (post-FFN norm)
-                    d.t[7] = f.2; // gamma_n (next input norm)
-                    d.i[0] = t;
-                    d.i[1] = nn;
-                    d.i[2] = c.hidden;
-                    d.i[3] = if store { 3 } else { 1 };
-                    d.f[0] = eps;
-                    d.f[1] = f.3; // layer_scalar
-                })
+                if fp8 {
+                    b.emit(DevOp::GemvFp8, cus, &[dq], |d| {
+                        d.t[0] = out;
+                        d.t[1] = n.xr; // a: the residual NRN1 wrote (no normed hn exists to read)
+                        d.t[2] = w8;
+                        d.t[3] = n.x; // resid_out: the ping-pong twin
+                        d.t[4] = f.0; // b: the down/ffn output
+                        d.t[5] = sc;
+                        d.t[6] = f.1; // gamma_b (post-FFN norm)
+                        d.t[7] = f.2; // gamma_n (next input norm)
+                        d.i[0] = t;
+                        d.i[1] = nn;
+                        d.i[2] = c.hidden;
+                        d.i[3] = if store { 3 } else { 1 };
+                        d.f[0] = eps;
+                        d.f[1] = f.3; // layer_scalar
+                    })
+                } else {
+                    b.emit(DevOp::Gemv, cus, &[dq], |d| {
+                        d.t[0] = out;
+                        d.t[1] = n.xr; // a: the residual NRN1 wrote (no normed hn exists to read)
+                        d.t[2] = w_bf16;
+                        d.t[3] = n.x; // resid_out: the ping-pong twin
+                        d.t[4] = f.0; // b: the down/ffn output
+                        d.t[6] = f.1; // gamma_b (post-FFN norm)
+                        d.t[7] = f.2; // gamma_n (next input norm)
+                        d.i[0] = t;
+                        d.i[1] = nn;
+                        d.i[2] = c.hidden;
+                        d.i[3] = if store { 3 } else { 1 };
+                        d.f[0] = eps;
+                        d.f[1] = f.3; // layer_scalar
+                    })
+                }
             };
             let cqc = if let Some(f) = &nrn {
-                fold_proj(b, n.qg, w.wq8, w.sq, qd, cq, true, f)
+                fold_proj(b, n.qg, w.wq, w.wq8, w.sq, qd, cq, true, f)
             } else {
                 proj(
                     b,
@@ -4810,7 +4831,7 @@ fn emit_phase(
             let ckc = if shared {
                 cqc
             } else if let Some(f) = &nrn {
-                fold_proj(b, n.kg, w.wk8, w.sk, kd, ck, false, f)
+                fold_proj(b, n.kg, w.wk, w.wk8, w.sk, kd, ck, false, f)
             } else {
                 proj(
                     b,
@@ -4838,7 +4859,7 @@ fn emit_phase(
             } else if keqv {
                 (n.kg, ckc) // k_eq_v: V is the RAW k_proj output
             } else if let Some(f) = &nrn {
-                (n.vg, fold_proj(b, n.vg, w.wv8, w.sv, kd, cv, false, f))
+                (n.vg, fold_proj(b, n.vg, w.wv, w.wv8, w.sv, kd, cv, false, f))
             } else {
                 (
                     n.vg,
@@ -5590,7 +5611,8 @@ fn emit_phase(
             && !gemv_family
             && gemma4_w8a8_gemm_glu_role::select_fused(
                 gemma4_gemm_glu_role::select_fused(
-                    glu_fusion_wins(tg, inter_l, c.hidden, n_cu),
+                    rewrite_lower::fused(b, rewrite_lower::Lowering::GatedMlp, w.wg)
+                        .unwrap_or_else(|| glu_fusion_wins(tg, inter_l, c.hidden, n_cu)),
                     gemma4_glu_role,
                     tg,
                     inter_l,
@@ -5686,13 +5708,22 @@ fn emit_phase(
             } else {
                 b.emit(DevOp::GemvGlu, all.clone(), &[c_pf], |d| {
                     d.t[0] = n.fu;
-                    d.t[1] = mlp_src;
+                    d.t[1] = if nrn1_fold { n.x } else { mlp_src };
                     d.t[2] = w.wg;
                     d.t[5] = w.wu;
                     d.i[0] = t;
                     d.i[1] = inter_l;
                     d.i[2] = c.hidden;
                     d.i[5] = c.mlp_act; // 0 GeGLU (Gemma), 1 SwiGLU (Llama/Qwen)
+                    if nrn1_fold {
+                        d.i[3] = n.xr; // resid_out: the ping-pong twin NRN2's fold reads
+                        d.i[4] = n.og; // b: the attention output
+                        d.i[6] = w.g_pa; // gamma_b (post-attention norm)
+                        d.i[7] = w.g_pf; // gamma_n (pre-feedforward norm)
+                        d.f[0] = c.eps;
+                        d.f[1] = 1.0; // NRN1's layer scale is always 1
+                        d.j[1] = 1;
+                    }
                 })
             }
         } else if gemm_glu && fp8 {
@@ -7134,14 +7165,15 @@ impl<'a> DenseGqaEmitter<'a> {
         // NRN2 -> q/k/v fold (op 30 i3, gemv_nrn_lds): Gemma dense fp8 decode, AMD arm only.
         // The env kill-switch mirrors PLOW_NO_FUSE_QKV; the op-115 opt-in disables it because
         // the fused QKV packet has no free slots to carry the fold.
-        let nrn_fold = amd
+        let nrn_fold = ((amd
             // gfx942 only: the op-30 fold arm (gemv_nrn_lds) is new in this branch's
             // op_gemm.h, and there is no marker-symbol check to refuse a pre-fold gfx950
             // object served against a folded blob (an old object reads t1=xr — the raw
             // un-normed residual — and decodes fluent garbage). gfx950 keeps main's
             // emission until the fold is measured there and a marker check lands.
             && amd_target::active().1 == hwspec::IsaLevel::Gfx942
-            && fp8
+            && fp8)
+            || (!amd))
             && c.arch.is_gemma()
             && !c.moe
             && !emit_config::active().no_fuse_nrn

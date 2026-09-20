@@ -185,14 +185,14 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #include "op_mla.cuh"        /* MLA (DeepSeek/GLM/Kimi) latent decode + fused merge-fold (P1) */
 #include "op_dsa.cuh"        /* GLM DSA indexer: score (mma.sync) + top-k select (P3) */
 #include "op_elementwise.cuh"
-#include "op_gemm.cuh"
-#if defined(PLOW_NV_GEMM_SPLITK) && PLOW_NV_GEMM_SPLITK
-#include "op_gemm_splitk.cuh"
-#endif
 #ifndef PLOW_NV_PREFILL
 #define PLOW_NV_PREFILL 0
 #endif
 #include "op_norm.cuh"
+#include "op_gemm.cuh"
+#if defined(PLOW_NV_GEMM_SPLITK) && PLOW_NV_GEMM_SPLITK
+#include "op_gemm_splitk.cuh"
+#endif
 #ifndef PLOW_NV_QWEN_GDN
 #define PLOW_NV_QWEN_GDN 0
 #endif
@@ -994,6 +994,7 @@ extern "C" __device__ unsigned PLOW_SYM(plow_packet_hash_hi) =
  * dev_isa.h). k is always a literal, so tw_[k>>1] resolves to a register. */
 #define PLOW_T(k) ((tw_[(k) >> 1] >> (((k) & 1) * 16)) & 0xFFFFu)
 #define TEN(k) (PLOW_T(k) == PLOW_TENSOR_NONE ? nullptr : T[PLOW_T(k)])
+#define TEN_I(k) ((in->i[k] == PLOW_TENSOR_NONE || in->i[k] == 0) ? nullptr : T[in->i[k]])
 
 __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T, unsigned slice,
                                           unsigned nblk, float* arena
@@ -1817,7 +1818,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * every Qwen packet). i3=norm_flag selects the fused-norm GEMV, which this build does
      * NOT carry — trapped rather than silently skipping the norm. */
     case PLOW_DOP_GEMV:
-        if (in->i[3] != 0) { __trap(); break; }
+        if (in->i[3] != 0) {
+            d_gemv_nrn((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                       (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(4),
+                       (const __nv_bfloat16*)TEN(6), (const __nv_bfloat16*)TEN(7),
+                       (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1], in->i[2],
+                       in->fj[0].f, in->fj[1].f, (in->i[3] & 2u) != 0, slice, nblk,
+                       (__nv_bfloat16*)arena);
+            break;
+        }
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_M16_MMA
         static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_GEMV_M16_ARENA_BYTES);
         if (in->i[0] == 16 && in->i[1] >= 1024 && in->i[2] && !(in->i[2] % 64)) {
@@ -2011,6 +2020,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
 
     case PLOW_DOP_GEMV_GLU:
+        if (in->fj[2].u != 0) {
+            d_gemv_glu_nrn((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN_I(3),
+                           (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN_I(4),
+                           (const __nv_bfloat16*)TEN_I(6), (const __nv_bfloat16*)TEN_I(7),
+                           (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5),
+                           in->i[0], in->i[1], in->i[2], in->fj[0].f, in->fj[1].f,
+                           /*store=*/true, in->i[5], slice, nblk, (__nv_bfloat16*)arena);
+            break;
+        }
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
         if (in->i[0] == 1 &&
             (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
