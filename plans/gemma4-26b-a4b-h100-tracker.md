@@ -1136,6 +1136,125 @@ gemma4-26b-a4b.h100.bf16-ctx16k.toml (max_ctx 16384). vLLM 0.28 26B at 15000: TT
 (C1/C4), TPOT 5.04 / 10.87; serving 340-366 tok/s at 15000, 525-620 at 8192. vLLM needs
 /opt/pytorch/bin on PATH (its JIT shells out to ninja).
 
+## Common ladder to 16k / C32 (both Gemma-4 models) and the decode-object round (2026-09-20, night)
+
+User direction: merge `gemma-12b-perf`, run BOTH models against vLLM with `vllm bench serve`
+random prompts to a 16k context and high concurrency. Recipes `gemma4-26b-a4b.h100.bf16-ctx16k`
+and `gemma4-12b.h100.bf16-ladder16k` share one ladder: in 128/1024/4096/8192/15000, C1/C4
+(32 prompts) and C16/C32 (64 prompts). vLLM 0.28 references extended to the same cells.
+`scripts/campaign/ladder_compare.py` scores it (ratio > 1.00 = plow behind). 12B side:
+`plans/gemma4-dense-realtime-tracker.md`.
+
+### Serving fixes that came first
+
+* **CUDA KV admission charged every row the sliding rings too** (`77b737ef`): per-token cost is
+  the full-attention layers only when the rings are preallocated. 4096/C16: TTFT 2947 -> 574 ms
+  (vLLM 525), 257 -> 360 tok/s.
+* **Serving MULTISTEP 8 -> 2**: 1024/C16 TTFT 375 -> 249 ms, p99 ITL 228 -> 106, tok/s 464 -> 488.
+* **`PLOW_NO_GLU_FUSE` outranks the rewrite lowering** (`0fa9b7e4`) and **the MoE arena claim no
+  longer reaches dense packets** (`6284c800`): both only bit the 12B, both came from merging.
+
+### 26B ladder, packet `p26k` (before the decode round): ahead on 6 of 60 metric-cells
+
+TTFT wins: 128/C1 23.1 vs 39.5, 1024/C1 43.0 vs 44.1, 128/C4 38.6 vs 73.3, and C16 at
+128/1024/4096 (114 vs 413, 214 vs 215, 465 vs 525). Everything else trails, and two causes
+explain nearly all of it:
+
+1. **Decode batch scaling.** TPOT 5.9 / 10.7 / 26.7 ms at C1/C4/C16 vs vLLM 5.0 / 7.2 / 8.9.
+2. **C32 queues on 16 slots** (TTFT 2.7–12 s): the sliding ring is `next_pow2(window + chunk - 1)`
+   = 8192 rows = 1.7 GB per slot at chunk 4096, ~8x a bare 1024-row window. The `-c32` recipe
+   buys 32 slots with chunk 1024 and gives up the 8k/16k rungs. The real fix is a chunk-local
+   KV scratch so the per-slot ring is the window only — NOT started.
+
+### Where a B=16 step goes (`PLOW_NV_TRACE`, block 0, `p26k`, 27.0 ms)
+
+MoE expert GLU (op 71) 45%, MoE down (op 63) 21% -> **MoE = 66% = 17.8 ms**; FlashDecode 9.5%,
+router 6%, every dense GEMV together 9%. The per-slot walk streams an expert's weights once
+PER SLOT; B*k = 128 slots land on ~60 experts.
+
+### Grouped (expert-union) decode MoE — `PLOW_GEMMA_MOE_DEC_GROUP=8`
+
+* Emit: `MoeAlignGemmaPf` after top-k on EVERY rung (the ladder validator wants one op list;
+  below `i3 = 8` rows it returns), ops 71/63 carry meta/row tables and the threshold, `fu` is
+  the grouped prefill scratch. Runtime validator arm normalises the align rows.
+* Object: manifest rule stamps `PLOW_MOE_DEC_GROUP 1` for a packet whose decode program has the
+  op; ops 71/63 branch to the prefill grouped GEMMs (`d_moe_group_{glu,down}_gemma_pf`), same
+  gate-scaled `part[token*k+slot]` contract so the combine is untouched.
+* In situ it needed three more things, each measured:
+  1. **Out of line** (`MOE90_NOINLINE` in decode objects): inlined, the bodies grew the entry
+     frame 544 -> 784 B and every rung paid (6.22 / 8.84 / 11.81 -> 6.08 / 8.17 / 10.58).
+  2. **Per-rung launch claim**: the 164 KB ring cost 0.1 / 0.5 / 1.1 ms at B=1/2/4 on rungs
+     that never run the arm. Object exports `plow_arena_bytes_narrow`; `DecodeRung::group_arena`
+     picks the claim per launch. (This is the "arena tax" seen earlier; pinning
+     `PLOW_NV_GEMV_STAGING_BYTES` to the base arena was necessary but not the cause.)
+  3. **Rung 4 faulted** — see below; it was latent in every object.
+* Served greedy consistency (solo vs 4-wide vs 16-wide, 16 prompts): 14/16 and 15/16 identical,
+  diffs late in coherent text; zero faults.
+
+### Rung 4 was one function call from a fault (latent, both models)
+
+The `MM=4` GEMV templates (`gemv_rows/glu_rows/qkv_rows<4>`) called THEMSELVES in their
+misaligned-K fallback, so they could not inline: rung 4 alone ran as a real call with a 352 B
+frame. Entry frame + 352 > 1 KiB device stack -> `CUDA_ERROR_ILLEGAL_ADDRESS` on the first
+`GemvQkv`. Production objects sat at 592+352 and 624+352; the traced object (696), the first
+lm_head patch (768) and the grouped object (848) all faulted, on rung 4 only, including with
+`PLOW_DEBUG_MAX_INST=3`. Fix: a `TC` template flag breaks the recursion and the dead dot8
+fallbacks are out of line (`gemv_*_rows_dot4`). Rung 4 now inlines like the others and the fix
+alone is a small win on every rung (26B 6.12/8.13/11.02/16.32/27.02 -> 5.98/8.07/10.41/16.13/26.31).
+
+### The decode entry's size taxes every rung
+
+One function at the 255-register cap. Compiling out what a packet cannot use is a lever by itself:
+
+| 26B object (ungrouped `p26k`), step_bench ms | B=1 | B=2 | B=4 | B=8 | B=16 |
+|---|---:|---:|---:|---:|---:|
+| production | 6.12 | 8.13 | 11.02 | 16.32 | 27.02 |
+| recursion fix | 5.98 | 8.07 | 10.41 | 16.13 | 26.31 |
+| + xreg kernels for the packet's K only (`xreg_k`) | **5.66** | 8.01 | 10.31 | 15.94 | 25.94 |
+| B=1 on the tensor-core walk instead (`gemv_mma_b1`) | 6.10 | **7.67** | **9.90** | **15.47** | **25.21** |
+| hybrid (xreg for K set, walk for the rest) | 5.86 | 8.00 | 10.30 | 16.11 | 26.09 |
+
+The 26B keeps its xreg kernels (manifest `xreg_k`); a dense packet takes `gemv_mma_b1` (12B
+B=1 12.60 -> 11.93). The last two rows say B=1 and B>=2 want DIFFERENT objects (0.3–0.7 ms per
+step at B>=2) — per-rung decode objects exist but are refused under multistep. Open lever.
+
+| 26B grouped packet, step_bench ms | B=1 | B=2 | B=4 | B=8 | B=16 |
+|---|---:|---:|---:|---:|---:|
+| production `p26k` | 6.12 | 8.13 | 11.02 | 16.32 | 27.02 |
+| grouped >= 8 rows, out of line, per-rung claim, recursion fix | 6.08 | 8.17 | 10.58 | **14.34** | **17.98** |
+
+### 26B ladder on the grouped packet `p26i` (2026-09-20, late)
+
+| cell | TPOT before -> after (vLLM) | tok/s before -> after (vLLM) | TTFT before -> after (vLLM) |
+|---|---:|---:|---:|
+| 128/C4 | 10.73 -> 10.21 (7.24) | 365 -> 383 (516) | 38.6 -> 38.6 (73.3) |
+| 4096/C4 | 13.49 -> 12.99 (7.92) | 262 -> 271 (415) | 235 -> 234 (228) |
+| 128/C16 | 26.74 -> **19.06** (8.93) | 570 -> **805** (1322) | 114 -> 92 (413) |
+| 1024/C16 | 30.49 -> **22.12** (9.97) | 494 -> **674** (1380) | 214 -> 201 (215) |
+| 4096/C16 | 39.44 -> **31.41** (14.03) | 369 -> **455** (885) | 465 -> 470 (525) |
+| 8192/C16 | 52.01 -> 44.95 (23.01) | 264 -> 300 (525) | 1047 -> 1047 (964) |
+| 15000/C16 | 75.52 -> 71.17 (34.84) | 164 -> 175 (340) | 2525 -> 2268 (1570) |
+| 128/C32 (16 slots) | 26.80 -> 18.79 (11.12) | 585 -> 825 (2648) | 2721 -> 1966 (130) |
+
+Still 6 of 60 metric-cells ahead (the same TTFT cells): the serving gap closed from 2.3–2.8x to
+1.6–2.0x at C16 but no cell flipped. C1 TPOT is flat in served mode (5.95 vs 5.88).
+
+Traced B=16 step on the grouped object (18.1 ms, block 0): MoE GLU body 21% + an EQUAL 21%
+waiting at op 63's gate (~210 GLU tiles over 132 blocks = 1 or 2 each: the step takes two
+tile-times while half the blocks idle in the second), FlashDecode 15%, router score 11%,
+dense GEMVs 12%.
+
+**Next levers, in measured order:**
+1. **Batched FlashDecode at long context.** C16 TPOT grows 19 -> 71 ms from 128 -> 15000 in
+   while B=1 grows 5.95 -> 6.35: per row per 1k context the batched body costs ~8x the B=1
+   one (0.22 vs 0.027 ms), and 983 MB of KV per full layer at 3.35 TB/s is 0.3 ms, not 10.
+   Owns every 8192/15000 cell at C4/C16 (vLLM: 34.8 ms at 15000/C16).
+2. Router score at wide rungs (11% = 2.0 ms at B=16): 1408 serial load+FMA per lane per row;
+   spread a row's 128 experts over blocks.
+3. GLU tile balance (range-partition the channels so every block streams the same bytes).
+4. Per-rung decode objects under multistep (B=1 and B>=2 want different objects: 0.3–0.7 ms).
+5. C32: chunk-local KV scratch so the per-slot sliding ring is the window only.
+
 ## Status
 
 | step | state |

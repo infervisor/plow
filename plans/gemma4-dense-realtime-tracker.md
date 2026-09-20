@@ -860,6 +860,80 @@ and `nsplit`, record to tunedb (`attention_role` kind), packetize a
 by live KV (packed metadata carries `kvlen`; prefix hits change the effective
 bucket). T2 sweep is the selection gate; served C1/C4 remains promotion.
 
+### Common ladder to 16k / C32 vs vLLM 0.28, and what the merged tree needed (2026-09-20)
+
+Run from `worktree-gemma4-26b-beat-vllm` (this branch merged in). Recipe
+`gemma4-12b.h100.bf16-ladder16k.toml`, packet `p12q`, `vllm bench serve` random,
+32 prompts (C1/C4) and 64 (C16/C32), prefix cache off, same client both sides.
+Ledger: `perf-data/campaign/gemma4-12b.h100.bf16-ladder16k.csv`.
+
+Three things stood between the merged tree and a number:
+
+1. **The realtime recipe does not load on this card.** `MAX_CHUNK=16384` with the 32-slot
+   ladder needs 109,929 MiB: a sliding ring is `next_pow2(window + chunk - 1)` rows per slot.
+   `ladder16k` keeps the realtime settings at chunk 4096 / 16 slots. C32 cells queue on 16 slots.
+2. **`c1f1ac38` made GLU fusion ignore `PLOW_NO_GLU_FUSE`** (the rewrite lowering was asked
+   first): `GemmGlu` at every rung, no object implements it under FATLITE, first prefill launch
+   traps (`CUDA_ERROR_LAUNCH_FAILED`). Fixed in devgen (`0fa9b7e4`): the knob outranks the rewrite.
+3. **`c1f1ac38`'s BF16 NRN fold decodes garbage on the H100**, and not the same garbage twice
+   (first token right, then noise; greedy output differs between identical requests). It is
+   dense-only (`!c.moe`), so the 26B never saw it. `PLOW_NO_FUSE_NRN=1` in the recipe; with it
+   the gate prompt answers "The capital of France is Paris." The fold removes 96 serial NRN
+   packets per token (540 -> 525 ops with QKV unfused), so it is worth root-causing — not done.
+
+| in | C | TTFT plow / vLLM | TPOT plow / vLLM | tok/s plow / vLLM |
+|---:|---:|---:|---:|---:|
+| 128 | 1 | **18.7** / 28.2 | 14.38 / 10.55 | 69 / 95 |
+| 1024 | 1 | 49.7 / 46.7 | 14.61 / 10.62 | 67 / 94 |
+| 4096 | 1 | 185 / 170 | 14.78 / 10.64 | 62 / 94 |
+| 8192 | 1 | 406 / 350 | 14.98 / 10.61 | 55 / 75 |
+| 15000 | 1 | 870 / 675 | 15.32 / 10.62 | 46 / 63 |
+| 128 | 4 | **46.0** / 52.2 | 14.79 / 10.58 | 266 / 367 |
+| 1024 | 4 | 168 / 128 | 16.17 / 11.16 | 230 / 331 |
+| 4096 | 4 | **349** / 468 | 19.46 / 12.16 | 181 / 254 |
+| 8192 | 4 | **773** / 994 | 23.82 / 13.85 | 135 / 186 |
+| 15000 | 4 | 1661 / 1653 | 31.03 / 18.51 | 91 / 128 |
+| 128 | 16 | 166 / 101 | 20.49 / 11.01 | 713 / 1364 |
+| 1024 | 16 | **362** / 424 | 26.46 / 13.76 | 542 / 940 |
+| 4096 | 16 | **702** / 1300 | 42.98 / 21.94 | 330 / 499 |
+| 8192 | 16 | **1696** / 2300 | 64.79 / 35.67 | 203 / 298 |
+| 15000 | 16 | **3556** / 3948 | 105.7 / 61.80 | 118 / 172 |
+| 128..15000 | 32 | 2.1–16.6 s / 0.2–6.4 s (queued on 16 slots) | 20.7–111.8 / 11.6–123.1 | 120–746 / 184–2442 |
+
+Ahead on 10 of 60 metric-cells, every one a TTFT (plus two C32 TPOTs that are the 16-slot
+cap, not a win). TPOT trails 1.36–1.96x everywhere — and 14.38 at C1 is itself a regression
+from this branch's own 12.72 (`b4fix-v2-realtime`), which the decode work below more than recovers.
+
+### Decode object: what a traced step showed, and three fixes (2026-09-20)
+
+`PLOW_NV_TRACE` on `p12q` (block 0): B=1 is 83% GEMV body; the fused lm_head `GemvArgmax` is
+10% of a B=1 step and **31% of a B=16 step (7.3 of 23.5 ms)** — `d_gemv_argmax_batch_inner`
+is a dot8 walk, compute-bound past one row, on a 2 GB head.
+
+* **Batched GemvArgmax on the tensor-core walk.** Logits come from `d_gemv` (the walk the
+  other B>=2 GEMVs already take); softcap + argmax fold over the columns the same block wrote
+  (`gvmma_partition`), after its barrier. Served greedy consistency solo vs 4- vs 16-wide is
+  identical to the production object (14/16, same two near-tie flips).
+* **Rung 4 was one real function call from a fault.** The `MM=4` GEMV templates called
+  THEMSELVES in their misaligned-K fallback, so they could not inline and rung 4 alone ran as
+  a call (352 B frame). Entry frame + 352 > 1 KiB device stack -> `ILLEGAL_ADDRESS`: production
+  ran at 592+352, any object whose entry frame grew past ~670 B faulted on rung 4 only (the
+  traced 26B object, the first version of this patch, the grouped-MoE 26B object). A `TC`
+  template flag breaks the recursion; the dead dot8 fallbacks are out of line (`*_dot4`).
+* **The decode entry's size taxes every rung.** It is one function at the 255-register cap.
+  Manifest rules now keep out what the packet cannot use: `xreg_k` (B=1 xreg kernels only for
+  the packet's K sizes) and, for a dense packet, `gemv_mma_b1` (B=1 GEMVs on the tensor-core
+  walk too, which drops the classic B=1 kernels altogether).
+
+step_bench ms/step, ctx 1024 (production `p12q` object -> each step):
+
+| object | B=1 | B=2 | B=4 | B=8 | B=16 |
+|---|---:|---:|---:|---:|---:|
+| production | 14.46 | 13.55 | 15.80 | 17.24 | 23.35 |
+| + argmax walk, recursion fix (fallbacks out of line) | 13.12 | 12.96 | 13.55 | 14.77 | 16.59 |
+| + xreg K set (classic B=1) | 12.60 | 13.01 | 13.59 | – | – |
+| + dense B=1 on the walk (`gemv_mma_b1`) | **11.93** | **12.60** | **13.16** | **14.35** | **16.03** |
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
