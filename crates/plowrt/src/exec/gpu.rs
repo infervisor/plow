@@ -5305,17 +5305,41 @@ impl GpuEngine {
                     .map(|t| t.bytes)
                     .sum();
                 let rows = (max_ctx as u64).checked_mul(batch as u64)?;
-                let per_token = kv_bytes.checked_div(rows).filter(|&b| b > 0)?;
                 let budget = (free as f64 * crate::config::RuntimeConfig::get().kv_admit_headroom())
                     as u64;
+                // `free` is what is left AFTER the sliding rings were cudaMalloc'd, so a row may only
+                // be charged for what will still be MAPPED for it: the full-attention head windows,
+                // a block at a time. Charging every row the ring bytes as well (total KV / rows) cost
+                // Gemma-4-26B 122880 B/token against a real 20480, admitted ~10 of 16 requests at
+                // 4096 tokens, and the other 6 waited out a whole generation: TTFT 3-4.5 s at C16.
+                // With live rings every cache maps lazily and the average stays the honest bound.
+                let live = vmm.as_ref().filter(|v| v.rings.is_none()).map(|v| {
+                    let geo = v.kv.geometry();
+                    let per_token =
+                        geo.full_layers.len() as u64 * 2 * geo.kvh_full as u64 * geo.row_bytes();
+                    (per_token, v.kv.block_rows() as u64)
+                });
+                let (per_token, block_rows) = match live {
+                    Some((per_token, block_rows)) if per_token > 0 && block_rows > 0 => {
+                        (per_token, Some(block_rows))
+                    }
+                    _ => (kv_bytes.checked_div(rows).filter(|&b| b > 0)?, None),
+                };
                 tracing::info!(
                     per_token,
+                    block_rows,
                     free_gib = free as f64 / (1u64 << 30) as f64,
                     budget_gib = budget as f64 / (1u64 << 30) as f64,
                     max_rows = budget / per_token,
                     "CUDA KV admission budget"
                 );
-                Some(crate::sched::admission::KvBudget::linear(per_token, budget))
+                let linear = crate::sched::admission::KvBudget::linear(per_token, budget);
+                Some(match block_rows {
+                    Some(block_rows) => linear
+                        .with_block_groups(&[(block_rows, block_rows.saturating_mul(per_token))])
+                        .unwrap_or(linear),
+                    None => linear,
+                })
             });
 
         let mut engine = GpuEngine {
