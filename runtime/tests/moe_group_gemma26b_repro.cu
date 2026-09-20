@@ -122,8 +122,19 @@ int main(int argc, char** argv) {
     bf16 *d_gu = nullptr, *d_dn = nullptr, *d_x = nullptr, *d_fu = nullptr;
     CK(cudaMalloc(&d_gu, gu_elems * sizeof(bf16)));
     CK(cudaMalloc(&d_dn, dn_elems * sizeof(bf16)));
-    CK(cudaMemset(d_gu, 0x3c, gu_elems * sizeof(bf16)));
-    CK(cudaMemset(d_dn, 0x3c, dn_elems * sizeof(bf16)));
+    /* Expert-distinct, row-distinct weights: 4 random base matrices dealt round-robin, so a
+     * wrong-expert or wrong-n-tile read changes `part` instead of hiding in a constant fill. */
+    {
+        const size_t gu1 = (size_t)2u * I_moe * H, dn1 = (size_t)H * I_moe;
+        std::vector<bf16> bgu(4 * gu1), bdn(4 * dn1);
+        for (auto& v : bgu) v = __float2bfloat16(rnd() * 0.02f);
+        for (auto& v : bdn) v = __float2bfloat16(rnd() * 0.02f);
+        for (unsigned e = 0; e < n_exp; e++) {
+            const unsigned b = (e * 7u + (e >> 3)) & 3u;
+            CK(cudaMemcpy(d_gu + (size_t)e * gu1, bgu.data() + b * gu1, gu1 * sizeof(bf16), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(d_dn + (size_t)e * dn1, bdn.data() + b * dn1, dn1 * sizeof(bf16), cudaMemcpyHostToDevice));
+        }
+    }
     CK(cudaMalloc(&d_x, xn2.size() * sizeof(bf16)));
     CK(cudaMemcpy(d_x, xn2.data(), xn2.size() * sizeof(bf16), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_fu, total_pad * I_moe * sizeof(bf16)));
@@ -189,9 +200,10 @@ int main(int argc, char** argv) {
     int total_tiles = meta[2*n_exp + n_exp];
     int empty = 0, maxcnt = 0;
     for (unsigned e = 0; e < n_exp; e++) { int c = meta[n_exp + e]; if (!c) empty++; if (c > maxcnt) maxcnt = c; }
+    const int tile_rows = MOE90_HALF ? 64 : 128; /* meta counts half-tiles under MOE90_HALF */
     printf("align: total_tiles=%d padded_rows=%d (bound %zu)  empty_experts=%d max_cnt=%d\n",
-           total_tiles, total_tiles * 128, total_pad, empty, maxcnt);
-    if ((size_t)total_tiles * 128 > total_pad) {
+           total_tiles, total_tiles * tile_rows, total_pad, empty, maxcnt);
+    if ((size_t)(total_tiles * tile_rows + 127) / 128 * 128 > total_pad) {
         printf("*** ALIGN OVERFLOWS the emitter's scratch bound ***\n");
     }
 
@@ -202,6 +214,11 @@ int main(int argc, char** argv) {
     k_down<<<grid, 256, arena_bytes>>>(d_part, d_fu, d_ewt, d_meta, d_rp, d_rg, H, I_moe, n_exp);
     CK(cudaDeviceSynchronize());
     printf("group_down: ok\n");
+    if (const char* dump = getenv("MOE_PART_DUMP")) { /* part is [T*k][H] by (token,slot): layout-free */
+        std::vector<float> hp(nslot * H);
+        CK(cudaMemcpy(hp.data(), d_part, hp.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        FILE* fp = fopen(dump, "wb"); fwrite(hp.data(), sizeof(float), hp.size(), fp); fclose(fp);
+    }
 
     /* op 77: combine + sandwich norm over the scattered partials. */
     {

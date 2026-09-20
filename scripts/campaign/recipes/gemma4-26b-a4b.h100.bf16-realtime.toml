@@ -48,11 +48,12 @@ PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
 PLOW_SLIDING_NS_CAP = "1"
 PLOW_MAX_CHUNK = "4096"
 PLOW_FUSE_ARGMAX = "1"
-# The emit default is MoeRouterGemmaScoreFast, whose own opcode doc says the changed
-# reduction association is NOT bit-identical and that packets should opt in only for
-# experiments. A vLLM comparison has to be defensible, and the whole router is ~0.5 ms
-# of a ~7.9 ms decode step, so take the exact scorer.
-PLOW_GEMMA_MOE_ROUTER_EXACT = "1"
+# The exact scorer replays the legacy scalar fmaf order on ONE lane per expert: measured
+# 0.0460 ms/layer at B=1 vs 0.0085 for ScoreFast (moe_decode_gemma26b_bench.cu) — 1.1 ms of
+# an 8.15 ms C1 decode step. ScoreFast is f32 end to end with a tree reduction, which is
+# already tighter than the reference: vLLM's Gemma4Router feeds bf16 h2 into its GateLinear.
+# The prefill router (moe90_router_gemma_pf) makes the same bf16-h2 / f32-logit choice.
+PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"

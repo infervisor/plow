@@ -56,15 +56,28 @@
  * op_gemm.cuh is owned elsewhere, so the claim is raised HERE. op_moe.cuh is included after
  * op_gemm.cuh and before interp_sm120.cu's PLOW_NV_PRE_B / the op-test's `smg` are *used*, so
  * the override propagates to both. HOPPER-ONLY: sm_120a never sees it. */
-#define PGM_MOE_ARENA_SM90 (MOE90_STAGES * (MOE90_ABUF + MOE90_BBUF) + 512)
+#ifndef MOE90_NB
+#if MOE90_HALF
+/* a mixed pair stages one B set per warpgroup: down A+2B, gate/up A+4B per ring slot. */
+#define MOE90_NB 2
+#else
+#define MOE90_NB 1
+#endif
+#endif
+#define PGM_MOE_ARENA_SM90                                                                         \
+    ((MOE90_GLU_STAGES * (MOE90_ABUF + 2 * MOE90_NB * MOE90_BBUF) >                                \
+              MOE90_STAGES * (MOE90_ABUF + MOE90_NB * MOE90_BBUF)                                  \
+          ? MOE90_GLU_STAGES * (MOE90_ABUF + 2 * MOE90_NB * MOE90_BBUF)                            \
+          : MOE90_STAGES * (MOE90_ABUF + MOE90_NB * MOE90_BBUF)) +                                 \
+     512)
 /* GROW-ONLY: never shrink whatever op_gemm.cuh (a sibling-owned file) already claims. */
 #if PGM_ARENA_BF16 < PGM_MOE_ARENA_SM90
 #undef PGM_ARENA_BF16
 #define PGM_ARENA_BF16 PGM_MOE_ARENA_SM90
 #endif
-static_assert(MOE90_STAGES * (MOE90_ABUF + MOE90_BBUF) + 512 <= PGM_ARENA_BF16,
+static_assert(MOE90_STAGES * (MOE90_ABUF + MOE90_NB * MOE90_BBUF) + 512 <= PGM_ARENA_BF16,
               "sm90 MoE plain ring must fit the bf16 arena claim");
-static_assert(MOE90_GLU_STAGES * (MOE90_ABUF + 2 * MOE90_BBUF) + 512 <= PGM_ARENA_BF16,
+static_assert(MOE90_GLU_STAGES * (MOE90_ABUF + 2 * MOE90_NB * MOE90_BBUF) + 512 <= PGM_ARENA_BF16,
               "sm90 MoE GLU ring must fit the bf16 arena claim");
 static_assert(MOE90_STAGES * (MOE90_A8BUF + MOE90_B8BUF) + 1024 <= 2 * PGM_ARENA_BF16,
               "sm90 MoE w8a8 plain ring must fit the bf16 arena claim");
@@ -156,25 +169,49 @@ static __device__ void d_moe_group_glu_gemma_pf(__nv_bfloat16* __restrict__ fu,
     const int* tilep = meta + 2 * (int)n_exp;
     const int total_tiles = tilep[n_exp];
     const int tiles_n = ((int)I_moe + MOE90_BN - 1) / MOE90_BN;
-    const int ntiles = total_tiles * tiles_n;
     const unsigned K = H;
     const int ksteps = ((int)K + MOE90_BK - 1) / MOE90_BK;
 
     __nv_bfloat16* As = (__nv_bfloat16*)sm90_align1024(arena);
     __nv_bfloat16* Bgs0 = As + MOE90_GLU_STAGES * MOE90_ABUF;
     __nv_bfloat16* Bus0 = Bgs0 + MOE90_GLU_STAGES * MOE90_BBUF;
+    /* second B set (mixed pairs) sits AFTER the first, so a same-expert pair keeps the
+     * original ring spacing — interleaving the sets cost 19% on all-full-tile routing. */
+    const int bset = 2 * MOE90_GLU_STAGES * MOE90_BBUF;
     const int tid = threadIdx.x, wg = tid >> 7, wiw = (tid >> 5) & 3, lane = tid & 31;
 
+#if MOE90_HALF
+    const int ntiles = (total_tiles + 1) / 2 * tiles_n; /* meta counts 64-row half-tiles */
+#else
+    const int ntiles = total_tiles * tiles_n;
+#endif
     for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
         const int mtile = tile / tiles_n;
         const int ntile = tile % tiles_n;
+        const int tn = ntile * MOE90_BN;
+#if MOE90_HALF
+        /* half-tiles 2*mtile (warpgroup 0) and 2*mtile+1 (warpgroup 1) are row-contiguous, so A
+         * stages exactly as before; only B is per warpgroup, and only when the experts differ. */
+        const int rowbase = mtile * MOE90_BM;
+        const int e = pgm_moe_expert_of_mtile(tilep, 2 * mtile, (int)n_exp);
+        const int h1 = 2 * mtile + 1;
+        int e1 = e; /* the next half-tile is this expert's or a later one's: step, don't search */
+        while (h1 < total_tiles && e1 + 1 < (int)n_exp && tilep[e1 + 1] <= h1) e1++;
+        const int mixed = e1 != e;
+        const __nv_bfloat16* Wg1 = (const __nv_bfloat16*)(size_t)ewt[(size_t)e1 * 2 + 0];
+        const __nv_bfloat16* Wu1 = Wg1 + (size_t)I_moe * H;
+        const int bsel = mixed ? wg : 0; /* which staged B set this thread's warpgroup reads */
+#else
         const int e = pgm_moe_expert_of_mtile(tilep, mtile, (int)n_exp);
         const int rowbase = rowoff[e] + (mtile - tilep[e]) * MOE90_BM;
-        const int tn = ntile * MOE90_BN;
+        const int bsel = 0;
+#endif
         const __nv_bfloat16* Wg = (const __nv_bfloat16*)(size_t)ewt[(size_t)e * 2 + 0];
         const __nv_bfloat16* Wu = Wg + (size_t)I_moe * H;
 #if defined(MOE90_DBG_NOMMA)
         const int live = 0; /* harness attribution: k-step cost with the tensor core OFF */
+#elif MOE90_HALF
+        const int live = 2 * mtile + wg < total_tiles;
 #else
         const int live = moe90_tile_rows(meta, (int)n_exp, e, mtile) > wg * 64;
 #endif
@@ -192,6 +229,14 @@ static __device__ void d_moe_group_glu_gemma_pf(__nv_bfloat16* __restrict__ fu,
                                  ks * MOE90_BK, K);
             moe90_stage_b(Bgs0 + buf * MOE90_BBUF, Wg, tid, tn, ks * MOE90_BK, I_moe, K);
             moe90_stage_b(Bus0 + buf * MOE90_BBUF, Wu, tid, tn, ks * MOE90_BK, I_moe, K);
+#if MOE90_HALF
+            if (mixed) {
+                moe90_stage_b(Bgs0 + bset + buf * MOE90_BBUF, Wg1, tid, tn, ks * MOE90_BK,
+                              I_moe, K);
+                moe90_stage_b(Bus0 + bset + buf * MOE90_BBUF, Wu1, tid, tn, ks * MOE90_BK,
+                              I_moe, K);
+            }
+#endif
         };
 #pragma unroll
         for (int s = 0; s < MOE90_GLU_STAGES - 1; s++) {
@@ -207,8 +252,10 @@ static __device__ void d_moe_group_glu_gemma_pf(__nv_bfloat16* __restrict__ fu,
             sm90_cp_wait<MOE90_GLU_STAGES - 1>();
             __syncthreads();
             const int cb = ks % MOE90_GLU_STAGES;
-            moe90_wgmma_k(accg, As + cb * MOE90_ABUF, Bgs0 + cb * MOE90_BBUF, wg, live);
-            moe90_wgmma_k(accu, As + cb * MOE90_ABUF, Bus0 + cb * MOE90_BBUF, wg, live);
+            moe90_wgmma_k(accg, As + cb * MOE90_ABUF, Bgs0 + bsel * bset + cb * MOE90_BBUF, wg,
+                          live);
+            moe90_wgmma_k(accu, As + cb * MOE90_ABUF, Bus0 + bsel * bset + cb * MOE90_BBUF, wg,
+                          live);
             sm90_wg_commit();
             /* wait<0>: the next iteration refills THIS buffer (ring depth == prefetch+1). */
             sm90_wg_wait<0>();
@@ -251,7 +298,6 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
     const int* tilep = meta + 2 * (int)n_exp;
     const int total_tiles = tilep[n_exp];
     const int tiles_n = ((int)H + MOE90_BN - 1) / MOE90_BN;
-    const int ntiles = total_tiles * tiles_n;
     const unsigned K = I_moe;
     const int ksteps = ((int)K + MOE90_BK - 1) / MOE90_BK;
 
@@ -259,14 +305,32 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
     __nv_bfloat16* Bs = As + MOE90_STAGES * MOE90_ABUF;
     const int tid = threadIdx.x, wg = tid >> 7, wiw = (tid >> 5) & 3, lane = tid & 31;
 
+#if MOE90_HALF
+    const int ntiles = (total_tiles + 1) / 2 * tiles_n; /* see d_moe_group_glu_gemma_pf */
+#else
+    const int ntiles = total_tiles * tiles_n;
+#endif
     for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
         const int mtile = tile / tiles_n;
         const int ntile = tile % tiles_n;
+        const int tn = ntile * MOE90_BN;
+#if MOE90_HALF
+        const int rowbase = mtile * MOE90_BM;
+        const int e = pgm_moe_expert_of_mtile(tilep, 2 * mtile, (int)n_exp);
+        const int h1 = 2 * mtile + 1;
+        int e1 = e; /* the next half-tile is this expert's or a later one's: step, don't search */
+        while (h1 < total_tiles && e1 + 1 < (int)n_exp && tilep[e1 + 1] <= h1) e1++;
+        const int mixed = e1 != e;
+        const __nv_bfloat16* Wd1 = (const __nv_bfloat16*)(size_t)ewt[(size_t)e1 * 2 + 1];
+        const int bsel = mixed ? wg : 0;
+        const int live = 2 * mtile + wg < total_tiles;
+#else
         const int e = pgm_moe_expert_of_mtile(tilep, mtile, (int)n_exp);
         const int rowbase = rowoff[e] + (mtile - tilep[e]) * MOE90_BM;
-        const int tn = ntile * MOE90_BN;
-        const __nv_bfloat16* Wd = (const __nv_bfloat16*)(size_t)ewt[(size_t)e * 2 + 1];
+        const int bsel = 0;
         const int live = moe90_tile_rows(meta, (int)n_exp, e, mtile) > wg * 64;
+#endif
+        const __nv_bfloat16* Wd = (const __nv_bfloat16*)(size_t)ewt[(size_t)e * 2 + 1];
 
         float acc[64];
 #pragma unroll
@@ -275,6 +339,11 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
         auto stage = [&](int ks, int buf) {
             moe90_stage_a(As + buf * MOE90_ABUF, fu, tid, rowbase, ks * MOE90_BK, K);
             moe90_stage_b(Bs + buf * MOE90_BBUF, Wd, tid, tn, ks * MOE90_BK, H, K);
+#if MOE90_HALF
+            if (mixed)
+                moe90_stage_b(Bs + (MOE90_STAGES + buf) * MOE90_BBUF, Wd1, tid, tn,
+                              ks * MOE90_BK, H, K);
+#endif
         };
 #pragma unroll
         for (int s = 0; s < MOE90_STAGES - 1; s++) {
@@ -290,7 +359,8 @@ static __device__ void d_moe_group_down_gemma_pf(float* __restrict__ part,
             sm90_cp_wait<MOE90_STAGES - 1>();
             __syncthreads();
             const int cb = ks % MOE90_STAGES;
-            moe90_wgmma_k(acc, As + cb * MOE90_ABUF, Bs + cb * MOE90_BBUF, wg, live);
+            moe90_wgmma_k(acc, As + cb * MOE90_ABUF,
+                          Bs + (bsel * MOE90_STAGES + cb) * MOE90_BBUF, wg, live);
             sm90_wg_commit();
             sm90_wg_wait<0>();
             __syncthreads();

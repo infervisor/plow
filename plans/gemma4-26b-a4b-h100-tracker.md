@@ -656,6 +656,96 @@ TPOT ms (before -> after | vLLM), tok/s after | vLLM:
 C1 gap 9.7x -> 1.6x. Next decode target is B=4: 19.7 ms is 2.4x the B=1 step while vLLM's
 B=4 costs 1.44x its B=1 — the MoE decode kernels' batch scaling, not dispatch.
 
+## Decode batch scaling + post-router prefill attribution (2026-09-20)
+
+DECODE-ONLY LADDER (in128/out512, PLOW_DECODE_MAX_RUNG=16, so TPOT = the rung's step):
+  B      1      2      4      8      16
+  ms     8.20   12.26  18.00  28.08  50.69     ~ 5.4 + 2.8*B
+  tok/s  121    162    221    284    315
+Batching buys almost nothing: every added row streams ~8 more experts and the MoE decode ops
+run at ~2000 GB/s (60% of peak). vLLM's B=16 step is ~10 ms. Standalone MoE at B=16 is
+~26 ms/step (glu 0.48 + down 0.26 + score + topk per layer), so ~25 ms of the 50.7 is NOT in
+the four MoE ops — unattributed, the CUDA decode path still has no per-op timing.
+
+Fixes landed from the standalone decode bench:
+* expert DOWN lane-split arm was gated `nrow == 1` -> B>=2 fell to the unblocked body
+  (651 vs 2058 GB/s). Generalised: 2.5-2.8x at B>=2. Served C4 TPOT 19.7 -> 18.2,
+  1024/C16 218.9 -> 253.4 tok/s.
+* exact scorer 0.0460 ms/layer vs ScoreFast 0.0085 at B=1 = 1.1 ms of the 8.15 ms C1 step.
+  Recipes switched to ScoreFast (f32 end to end; vLLM's router input is bf16).
+* scalar prefill router (T<512) now uses the decode path's bit-exact warp-parallel top-k:
+  0.112 -> 0.087 ms/layer at T=128, table byte-identical.
+
+PREFILL ATTRIBUTION, b26j packet, T=4096 chunk (157.6 ms attributed vs 181 ms real TTFT —
+SEG_TIME inflation is now small): MoE segment 75.2% (3.95 ms/layer), dense GEMMs 11.2%,
+FlashPrefill 7.6%, HeadNormRope 3.4%. Standalone MoE ops sum to 2.77 ms/layer
+(router 0.32, align 0.15, glu 1.02, down 0.87, combine 0.42). The 206 dense GEMMs do the
+same FLOPs as the routed experts in 0.59 ms/layer vs ~1.9 for glu+down: the grouped GEMM's
+cp.async staging (51% of its k-step) is the remaining prefill target -> TMA load engine.
+
+## Fast scorer served + the grouped GEMM's real waste is partial tiles (2026-09-20)
+
+SERVED b26k (ScoreFast + warp top-k in the scalar prefill router), before -> after | vLLM:
+  C1 TPOT  8.15 -> 6.50 | 5.03   (1024: 6.68, 4096: 6.76, 8192: 6.83)   C1 tok/s 118.7 -> 147.5 | 188.5
+  C4 TPOT 18.18 -> 16.87 | 7.24   1024/C16 253.4 -> 266.5 tok/s | 1379.7
+  TTFT unchanged (the 0.75 ms top-k saving at T=128 is inside noise).
+
+A cuBLAS ROUTE IS A NULL BY PROXY. torch.bmm over the same fixed-count 128-row expert tiles
+(the only sync-free shape): gate_up+down 0.646 / 0.924 / 1.815 ms at T=128/1024/4096 vs plow
+wgmma 0.889 / 0.933 / 1.883. The kernel is not slow for the tiles it is given.
+
+THE WASTE IS THE TILE COUNT. Real routing (harness dist 3) ends every expert's segment in a
+partial tile: 364 tiles where 256 would do at T=4096, 175 for 64 at T=1024. The earlier
+even-routing (dist 0) timings hid it — dist 0 has zero partial tiles at 4096 — and it is why
+the served MoE segment (3.95 ms/layer) exceeded the standalone sum (2.77).
+
+FIX: MOE90_HALF — align pads to 64 rows; a block's two warpgroups each take one half-tile,
+of different experts when they differ (then B is staged once per warpgroup; arena 99 -> 165
+KB, smem_optin is 232 KB so still 1 block/SM). `part` is BYTE-IDENTICAL on 12/12 cases
+(harness now has expert-distinct random weights; part is (token,slot)-indexed = layout-free).
+  real routing, ms/layer    glu             down
+  T=128                     0.521 -> 0.381  0.362 -> 0.284
+  T=1024                    0.679 -> 0.627  0.508 -> 0.421
+  T=4096                    1.395 -> 1.333  1.023 -> 0.921
+  even routing T=4096       1.017 -> 1.049  0.868 -> 1.045   <- and SERVED it regressed:
+                            TTFT 182 -> 197 at 4096 (b26m). Not the B-ring layout, not the arena
+                            (128-row kernel with the 165 KB claim times identically). CAUSE: the
+                            per-tile expert lookup, a linear scan of ~64 GLOBAL loads per thread
+                            (~3 us); half mode did it twice. A DOWN tile is only 11 k-steps
+                            (~20 us), so that is +15-20% there, +3% on GLU. Bisected (7 loads) and
+                            the second expert stepped forward from the first:
+  128-row path, bisect only 1.021 -> 0.910  0.869 -> 0.739   (-11% / -15%, free)
+  half + bisect, T=4096 even         0.960           0.713
+  half + bisect, real T=128   0.518 -> 0.362  0.363 -> 0.226
+                       T=1024 0.682 -> 0.605  0.511 -> 0.377
+                       T=4096 1.394 -> 1.304  1.026 -> 0.883   all 12 cases BYTE-IDENTICAL
+SERVED b26n vs b26k, TTFT ms: 1024/C1 71.96 -> 67.12, 4096/C1 182.4 -> 176.1, 8192/C1
+374.7 -> 363.1, 128/C4 61.4 -> 57.6, 1024/C4 181 -> 172, 4096/C4 452 -> 438.
+Off when PLOW_NV_W8A8 is compiled in: the e4m3 twins still walk 128-row tiles.
+
+## The bench "128" cell is a 512-bucket measurement; rung crossings cost 17-29 ms (2026-09-20)
+
+Request wall (max_tokens=1) vs server-side prompt_tokens, b26m:
+  8..128 tok  24.2-25.2 ms  | 129..510   41.8-44.2 | 1020..1023  62.2 | 1025..1100   91.1-91.5
+  4090..4095  177-178       | 4097..4200 202-203   | 8190        368  | 8193         394
+vLLM's 128 cell is 39.5 ms; plow at <=128 rows is 24 ms. The client sends exactly N tokens but
+the server re-tokenises and adds BOS, so the 128 cell is 129 rows -> the 512 bucket, where 383
+of 512 rows are padding that the MoE router still routes (~75% of that bucket's MoE work).
+This is why 128/C1 TTFT sat at 42.2-42.6 through EVERY kernel change this session.
+Levers: PLOW_PF_LADDER_APPEND rungs that swallow the +1 (256 / 1152 / 4224), and the ragged-M
+row shrink (kvrow.rs PREFILL_ROW_FIELDS — already lists the Gemma MoE pf ops, but only the
+AMD and Apple engines apply it; the CUDA engine runs the padded bucket).
+
+## Tune store: this board has NO kernel measurements (2026-09-20)
+
+`plowc tune status --gpu h100`: cell nvidia/sm_90a/h100-sxm5 is empty (store holds AMD cells
+only) -> every emit here used the analytical model. On NVIDIA the tile is object-wide, so the
+measured flow is scripts/tune_decode_sweep.sh (object x packet knobs, scored by step_bench
+TPOT, `--ablate-lo` twins for per-op decode cost, `--block L` for single-layer packets) ->
+`tunedb-decode ingest|best`. Prior fp8 records under h100-nvl show occupancy is the big decode
+lever: 26B B=1 5.52 ms at 132 blocks vs 4.77 at 264 (2 blocks/SM). Stage A on this board:
+occ {1:132, 2:264} x batch {1,4,16}, bf16. Needs ripgrep on PATH (nix shell nixpkgs#ripgrep).
+
 ## Status
 
 | step | state |
