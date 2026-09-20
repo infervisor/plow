@@ -975,6 +975,23 @@ in the staged dot8 path the 12B no longer takes (`gemv_mma_b1`), so it needs a w
 form as well as the H100 garbage root-caused. Negatives: attention row batching
 `PLOW_NV_FA_WPR_RB` 4 / 8 (B=16 -2% / -0.6%, B=1 +0.8% / +3.6%).
 
+### 32 slots at a 16k context: `gemma4-12b.h100.bf16-c32-16k`, packet `p12c32` (2026-09-20, night)
+
+ladder16k with chunk 1024 (2048-row sliding ring), decode ladder to 32, attention roles off.
+
+| cell | 16-slot `p12u` TTFT / tok/s | 32-slot `p12c32` TTFT / tok/s | vLLM |
+|---|---:|---:|---:|
+| 128/C16 | 137 / 1138 | **67** / 1199 | 101 / 1364 |
+| 128/C32 | 1384 / 1187 | **113** / **1887** | 202 / 2442 |
+| 1024/C16 | 349 / 741 | **244** / 757 | 424 / 940 |
+| 1024/C32 | 2322 / 762 | **571** / 947 | 852 / 1322 |
+| 4096/C16 | **706** / 390 | 947 / 362 | 1300 / 499 |
+| 4096/C32 | 4792 / 392 | 2540 / 363 | 2007 / 598 |
+
+Three more TTFT cells flip (128/C16, 128/C32, 1024/C32). At 4096 the 16-slot chunk-4096 packet
+keeps the better throughput (1024-row chunks, no attention roles). With the serving packet
+chosen by input length (32-slot for <= 1024): **14 of 60 metric-cells ahead**.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |

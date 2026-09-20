@@ -1362,8 +1362,8 @@ prefill-bound. So the serving packet is an input-length choice — 32-slot for <
 | 26B + 12B serve on H100 from the merged tree | **done** (12B needed the chunk-4096 recipe, the NO_GLU_FUSE fix, NRN fold off) |
 | vLLM 0.28 reference ladder, both models | **done** — in 128..15000 x C1/4/16/32 |
 | Common ladder, both models | **done** — ledgers `*-ctx16k.csv`, `*-ladder16k.csv`; `ladder_compare.py` |
-| Beat vLLM, 26B | **PARTIAL 6/60** — TTFT at 128 and 1024 (C1), 128 (C4), 128/1024/4096 (C16) |
-| Beat vLLM, 12B | **PARTIAL 12/60** — TTFT at 128 (C1/C4), 4096..15000 (C4), 1024..15000 (C16) |
+| Beat vLLM, 26B | **PARTIAL 7/60** — TTFT at 128 and 1024 (C1), 128 (C4), 128/1024/4096 (C16), 128 (C32, 32-slot packet) |
+| Beat vLLM, 12B | **PARTIAL 14/60** (serving packet by input length) — every TTFT cell except 1024..15000 at C1, 1024/15000 at C4 and the >= 4096 C32 cells; TPOT 1.04–1.11x at C1 |
 | Decode batch scaling | B=16 step 28.05 -> 15.88 ms (26B), 23.35 -> 16.05 (12B); still 1.7–2.0x vLLM at C16 |
 | C32 | queues on 16 slots (sliding ring = pow2(window + chunk - 1) rows per slot) — not started |
 
