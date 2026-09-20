@@ -248,7 +248,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "HF_HOME": str(out / "hf-home"),
         "IN_LENS": a.in_lens or bench.get("in_lens", "128 1024 4096"),
         "CONCS": a.concs or bench.get("concs", "1"),
-        "NPROMPT": str(bench.get("nprompt", 32)),
+        "NPROMPT": str(getattr(a, "nprompt", None) or bench.get("nprompt", 32)),
         "OUTLEN": str(bench.get("outlen", 128)),
         "BENCH_BACKEND": bench.get("backend", "openai"),
         "BENCH_EXTRA_ARGS": f"--num-warmups {bench.get('warmups', 16)} --seed {bench.get('seed', 42)}",
@@ -719,6 +719,7 @@ def main() -> None:
     b.set_defaults(f=cmd_build)
     n = sp.add_parser("bench"); n.add_argument("recipe"); n.add_argument("--assets", required=True); n.add_argument("--out", required=True)
     n.add_argument("--concs"); n.add_argument("--in-lens"); n.add_argument("--label"); n.add_argument("--reference")
+    n.add_argument("--nprompt", type=int, help="prompts per cell, overriding the recipe/profile")
     n.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the server env; recorded")
     n.add_argument("--profile", help="named workload from [bench.profiles.*] (e.g. realtime, throughput)")
     n.set_defaults(f=cmd_bench)
