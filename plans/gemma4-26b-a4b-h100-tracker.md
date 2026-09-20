@@ -85,6 +85,46 @@ Weight shapes, all confirmed from the checkpoint header:
 * `PLOW_NV_FA_TC_GQA8_HD512` — an opt-in tensor-core hd512 decode candidate that is
   `static_assert`ed to `D == 512 && GF == 8`. It is unusable on 12B and native on 26B.
 
+## Is plow's architecture actually used for MoE routing / expert selection?
+
+Partly. Measured, per layer at B=1 (`runtime/tests/moe_decode_gemma26b_bench.cu`):
+
+| | ms/layer | share of MoE | achieved BW |
+|---|---:|---:|---:|
+| router score | 0.0461 | 45 % | **15.6 GB/s (0.47 % of peak)** |
+| router topk | 0.0082 | 8 % | — (1 CTA) |
+| expert GLU | 0.0336 | 33 % | 1888 GB/s (56 %) |
+| expert DOWN | 0.0154 | 15 % | ~2059 GB/s |
+
+**The ROUTER is 53 % of MoE decode time and the expert GEMMs are 47 %.** The GEMMs are
+in good shape; the SELECTION is where the architecture is left on the table.
+
+USED:
+* Split router is default-on — the score GEMV runs on 16 CTAs instead of serializing on
+  one. (`PLOW_GEMMA_MOE_ROUTER_FUSED` is the escape hatch BACK to one CTA, not an
+  improvement — read the knob name carefully.)
+* Fusion is selected where it pays: `MoeExpertGluNormGemma` folds the pre-FFN norm into
+  the expert GLU, removing a packet boundary.
+* Counter-gated overlap is real: decode is 519 ops / 608 edges, critical path 364, so
+  ~30 % of ops are off the critical path (p50 = 2 concurrent, peak 3).
+
+NOT USED:
+* **No compile-time specialisation of MoE geometry.** The packet bakes 208
+  `PLOW_PACKET_*` constants including `PLOW_PACKET_GQA 8` for attention, and NOT ONE
+  MoE constant: `n_exp=128`, `top_k=8`, `I_moe=704` arrive as runtime `unsigned` args,
+  so the top-k loop, the score reduction and the expert-table indexing cannot be
+  unrolled or specialised. This is exactly the "compile a packet for this model"
+  advantage, unused on the most shape-dependent op family in the model.
+* **The router cannot fill the grid at low batch.** `max_useful = (nrow*n_exp)/8`
+  capped at `n_cu` (devgen `lib.rs` `gemma_moe_router_split_plan`) gives 16 CTAs at
+  B=1 and only reaches 132 from B ~ 12; `PLOW_GEMMA_MOE_ROUTER_BLOCKS` is clamped to
+  it. NOT an oversight — going wider means splitting each expert's H=2816 reduction
+  across CTAs, which breaks the "exact fmaf association" the body deliberately keeps.
+
+CALIBRATION, so nobody over-invests: MoE is only ~6 % of the decode step (3.10 ms of
+48.8 ms). A PERFECT router saves ~1.3 ms, i.e. **~2.7 % of TPOT**. The unattributed
+~43 ms dominates everything. Instrument the CUDA decode tick first.
+
 ## Roofline (H100 SXM5, 3.35 TB/s datasheet, 989 BF16 TFLOP/s)
 
 Active params per decoded token: 3.08B in the layers + 0.74B lm_head = 3.82B
