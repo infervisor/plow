@@ -684,7 +684,7 @@ mod tests {
     }
 
     fn amd() -> Backend {
-        Backend { step_budget: 8192, packing: true, split_spans: false, decode_rows_join_prefill: false }
+        Backend { step_budget: 8192, packing: true, split_spans: false, decode_rows_join_prefill: false, span_policy: None }
     }
 
     fn tick() -> Tick {

@@ -712,14 +712,13 @@ impl GpuEngine {
             tracing::info!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
             return;
         }
-        let step = crate::config::RuntimeConfig::get()
-            .amd_prefix_fine_rows()
-            .unwrap_or(256)
-            .max(32);
-        let mut p = step;
-        while p < p_a {
-            self.publish_boundary(b, p);
-            p += step;
+        if let Some(step) = crate::config::RuntimeConfig::get().amd_prefix_fine_rows() {
+            let step = step.max(32);
+            let mut p = step;
+            while p < p_a {
+                self.publish_boundary(b, p);
+                p += step;
+            }
         }
         self.publish_boundary(b, p_a);
     }

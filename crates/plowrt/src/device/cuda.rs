@@ -1047,6 +1047,36 @@ impl CudaBackend {
         Ok(Some(v))
     }
 
+    pub fn module_global_set_u32(&self, module: &Module, name: &str, val: u32) -> Result<bool> {
+        self.bind()?;
+        let raw = *self.modules.lock().get(&module.id).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "module_global_set_u32: module {} not loaded",
+                module.id
+            ))
+        })?;
+        let cname = std::ffi::CString::new(name)
+            .map_err(|_| RuntimeError::Device("global name contains NUL".into()))?;
+        let mut ptr: CUdeviceptr = 0;
+        let mut bytes: usize = 0;
+        let rc = unsafe {
+            (self.api.cuModuleGetGlobal_v2)(&mut ptr, &mut bytes, raw as CUmodule, cname.as_ptr())
+        };
+        if rc != 0 {
+            return Ok(false);
+        }
+        if bytes != 4 {
+            return Err(RuntimeError::Device(format!(
+                "module global {name} is {bytes} B, want 4"
+            )));
+        }
+        self.check(
+            unsafe { (self.api.cuMemcpyHtoD_v2)(ptr, &val as *const u32 as *const c_void, 4) },
+            &format!("cuMemcpyHtoD({name})"),
+        )?;
+        Ok(true)
+    }
+
     /// Read up to `max` bytes of a module-scope global (`__device__`/
     /// `__constant__`) by name into `out` (cleared first). `Ok(false)` when
     /// the symbol is absent — the caller keeps its fallback. Copies

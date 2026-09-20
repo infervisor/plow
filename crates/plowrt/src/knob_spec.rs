@@ -354,6 +354,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.block_packets", Some("PLOW_BLOCK_PACKETS"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.pf_modular", Some("PLOW_PF_MODULAR"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.block_stage", Some("PLOW_BLOCK_STAGE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.pf_span_policy", Some("PLOW_PF_SPAN_POLICY"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.rt_max_ctx", Some("PLOW_RT_MAX_CTX"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.tbt_slo_ms", Some("PLOW_TBT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.queue_ttl_ms", Some("PLOW_QUEUE_TTL_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -511,6 +512,7 @@ pub const RUNTIME: &[KnobSpec] = &[
 
 #[rustfmt::skip]
 pub const RAW_ENV: &[KnobSpec] = &[
+    KnobSpec::new("env.PLOW_DEBUG_MAX_INST", Some("PLOW_DEBUG_MAX_INST"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DEV_SAMPLE", Some("PLOW_DEV_SAMPLE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DSA_VERIFY_CKPT", Some("PLOW_DSA_VERIFY_CKPT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DSA_VERIFY_OUT", Some("PLOW_DSA_VERIFY_OUT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),

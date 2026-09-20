@@ -923,6 +923,7 @@ extern "C" __device__ unsigned PLOW_SYM(plow_gemm_splitk_abi) = 1;
 #endif
 #if PLOW_NV_EMBED_SMEM
 extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes) = PLOW_NV_ARENA_FLOATS * sizeof(float);
+extern "C" __device__ unsigned PLOW_SYM(plow_debug_max_inst) = 999999u;
 
 
 /* Widest row block instantiated by gemv_walk. This is a throughput capacity, not a
@@ -3058,11 +3059,13 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
          * on the REAL 401-packet / 32493-entry decode program. Output is garbage. */
         (void)nblk_grid;
 #else
-        plow_exec(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid, arena
+        if (e.inst < PLOW_SYM(plow_debug_max_inst)) {
+            plow_exec(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid, arena
 #if PLOW_MIXED_STEP
-                  , &prog
+                      , &prog
 #endif
-                  );
+                      );
+        }
 #endif
 
         __syncthreads(); /* retire this block's stores before the release */

@@ -1298,7 +1298,9 @@ static __device__ void d_moe_expert_down_gemma(float* __restrict__ part, const b
         }
         return;
     }
+#if PLOW_MOE_DOWN_STAGE_FU
 down_scalar:
+#endif
 #endif
     {
     const unsigned lane = threadIdx.x & (PLOW_NV_WARP - 1u);

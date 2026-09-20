@@ -558,7 +558,7 @@ pub(crate) fn pick_gemm_emit_plan(
         emit_is_amd()
             && amd_target::active().1 == hwspec::IsaLevel::Gfx950
             && quant == kernelcaps::QuantScheme::None
-            && m == MAX_CHUNK_MAX
+            && m == 8192
             && m.is_multiple_of(plan.bm)
             && n.is_multiple_of(plan.bn)
             && k.is_multiple_of(plan.bk)
@@ -3008,7 +3008,7 @@ pub(crate) fn dec_stage_halves() -> u64 {
 /// chunk bigger than this, and decode is one row. So it caps BOTH the bucket ladder (a program
 /// for T > MAX_CHUNK can never be invoked) and every ACTIVATION tensor (they hold the current
 /// chunk, not the context -- only the KV cache spans the context).
-const MAX_CHUNK_MAX: u32 = 8192;
+const MAX_CHUNK_MAX: u32 = 16384;
 
 /// Smallest chunk the window-derived default will pick (the bucket ladder's floor).
 const MAX_CHUNK_MIN: u32 = 128;
@@ -4566,7 +4566,7 @@ fn emit_phase(
         // prefers ns23; microbench 0.436 vs 0.497) — with PLOW_FP8_KV unset the packet stays
         // byte-identical. Same <=128 sanity cap idea as the 31B block; PLOW_NS_ABS/PLOW_NS_FULL_ABS
         // still override below.
-        let ns = if gemv_family && full && ctx > 8192 && c.kvh_full == 1 && fp8_kv {
+        let ns = if gemv_family && full && ctx >= 4096 && (c.kvh_full == 1 || c.kvh_full == 2 || fp8_kv) {
             let n_grp = (heads / fa_gf_full()).max(1);
             let aligned = n_cu / gcd(n_grp, n_cu);
             let cand = ns.div_ceil(aligned) * aligned;
@@ -8945,7 +8945,7 @@ fn emit_dense_gqa(
     let shipped: Vec<u32> = floor
         .iter()
         .copied()
-        .chain([128u32, 512, 1024, 2048, 4096, 8192])
+        .chain([128u32, 512, 1024, 2048, 4096, 8192, 16384])
         .filter(|&x| x <= cap)
         .collect();
     // PLOW_PF_LADDER is sm_120-only, and its own comment above says why: the rungs are derived from

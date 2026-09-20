@@ -23,9 +23,9 @@ pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)
 }
 
-pub const CUBLASLT_PREFILL_MAX_ROWS: u32 = 8192;
+pub const CUBLASLT_PREFILL_MAX_ROWS: u32 = 16384;
 pub const CUBLASLT_PREFILL_ROWS: [u32; 3] = [128, 256, 512];
-pub const CUBLASLT_PREFILL_WIDE_ROWS: [u32; 4] = [1024, 2048, 4096, 8192];
+pub const CUBLASLT_PREFILL_WIDE_ROWS: [u32; 9] = [1024, 2048, 4096, 4224, 8192, 8320, 12288, 12416, 16384];
 pub const CUBLASLT_PREFILL_GEMMA4_SHAPES: [(u32, u32); 8] = [
     (15360, 3840),
     (2048, 3840),
@@ -371,7 +371,7 @@ mod tests {
             ("sm90a", 64, 3840, 15360),
             ("sm90a", 1024, 3840, 3840),
             ("sm90a", 1024, 15360, 8192),
-            ("sm90a", 16384, 3840, 15360),
+            ("sm90a", 32768, 3840, 15360),
             ("sm90a", 128, 3840, 3840),
         ] {
             assert!(!cublaslt_prefill_bf16(profile, m, n, k));
