@@ -205,6 +205,27 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     }
                     d.i[2] = 1;
                 }
+                // Gemma MoE decode carries B in a spare immediate, 0 at B=1 (devgen `nb`).
+                Some(
+                    op @ (DevOp::MoeRouterGemmaScore
+                    | DevOp::MoeRouterGemmaScoreFast
+                    | DevOp::MoeRouterGemmaTopk
+                    | DevOp::MoeExpertGluNormGemma
+                    | DevOp::MoeExpertDownGemma
+                    | DevOp::MoeCombineNormGemma),
+                ) => {
+                    let field = match op {
+                        DevOp::MoeRouterGemmaScore
+                        | DevOp::MoeRouterGemmaScoreFast
+                        | DevOp::MoeCombineNormGemma => 2,
+                        DevOp::MoeRouterGemmaTopk => 3,
+                        _ => 5,
+                    };
+                    if d.i[field] != if g.t > 1 { g.t } else { 0 } {
+                        return Err(reject("Gemma MoE rows disagree with rung width"));
+                    }
+                    d.i[field] = 0;
+                }
                 Some(
                     DevOp::RmsNorm
                     | DevOp::RowRms

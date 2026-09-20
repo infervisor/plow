@@ -37,6 +37,24 @@ pub const CUBLASLT_PREFILL_GEMMA4_SHAPES: [(u32, u32); 8] = [
     (3840, 8192),
 ];
 
+/// The same projection set for Gemma-4-26B-A4B (hidden 2816, dense inter 2112).
+/// Kept as its own list rather than folded into the 12B one so each shape's
+/// provenance stays readable; the two are disjoint (3840- vs 2816-keyed).
+/// Sliding layers: q (4096), k/v (2048), o (2816 x 4096). Full layers: q (8192),
+/// k (1024), o (2816 x 8192) — no v_proj, V is the raw k_proj (attention_k_eq_v).
+/// Dense MLP: gate/up (2112), down (2816 x 2112). The 128-wide router and the
+/// routed-expert GEMMs are NOT here: they are MoE ops, not dense projections.
+pub const CUBLASLT_PREFILL_GEMMA4_26B_SHAPES: [(u32, u32); 8] = [
+    (4096, 2816),
+    (2048, 2816),
+    (2816, 4096),
+    (8192, 2816),
+    (1024, 2816),
+    (2816, 8192),
+    (2112, 2816),
+    (2816, 2112),
+];
+
 pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
     // At M <= 512 the small set is the down projection (3840, 15360), the o projection
     // (3840, 8192) and the unfused gate/up (15360, 3840): measured on H100 2026-09-17, Lt
@@ -47,7 +65,8 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
     // cuBLASLt calls at the same M run 10-45 us (H100 2026-09-17, campaign tracker).
     matches!(profile, "sm90a" | "sm_90a")
         && (CUBLASLT_PREFILL_ROWS.contains(&m) || CUBLASLT_PREFILL_WIDE_ROWS.contains(&m))
-        && CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
+        && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
+            || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k)))
 }
 
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";
@@ -334,6 +353,16 @@ mod tests {
                     assert!(cublaslt_prefill_bf16(profile, m, n, k));
                 }
             }
+            for m in CUBLASLT_PREFILL_ROWS.iter().chain(&CUBLASLT_PREFILL_WIDE_ROWS) {
+                for (n, k) in CUBLASLT_PREFILL_GEMMA4_26B_SHAPES {
+                    assert!(cublaslt_prefill_bf16(profile, *m, n, k));
+                }
+            }
+        }
+        // The two model shape sets must stay disjoint, or a 12B admission silently
+        // starts depending on a 26B entry (and the reverse) when either is edited.
+        for shape in CUBLASLT_PREFILL_GEMMA4_26B_SHAPES {
+            assert!(!CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&shape));
         }
         for (profile, m, n, k) in [
             ("sm120", 128, 3840, 15360),

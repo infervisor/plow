@@ -619,6 +619,28 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::MoeDownMx
                 | DevOp::MoeGluMxPf
                 | DevOp::MoeDownMxPf
+                // Gemma-4 26B-A4B MoE, decode (61-72) and grouped prefill (73-77).
+                // Audited against the operand contracts in packet::dev: every one of these
+                // reads and writes only hidden-state activations, routing metadata
+                // (table/meta/row_token/row_partidx/row_gate/score) and expert weights
+                // (`ewt`/`proj`/`est`). None names a KV cache pair, and none takes a
+                // generated tensor map, so none can reach the cache the manifest guards.
+                // Same class as the mxfp4 MoE ops listed above.
+                | DevOp::MoeRouterGemma
+                | DevOp::MoeExpertGluGemma
+                | DevOp::MoeExpertDownGemma
+                | DevOp::MoeCombineGemma
+                | DevOp::MoeRouterGemmaScore
+                | DevOp::MoeRouterGemmaScoreFast
+                | DevOp::MoeRouterGemmaTopk
+                | DevOp::MoeCombineNormGemma
+                | DevOp::MoeExpertGluNormGemma
+                | DevOp::MoeCombineResidNormGemma
+                | DevOp::MoeRouterGemmaPf
+                | DevOp::MoeAlignGemmaPf
+                | DevOp::MoeGroupGluGemmaPf
+                | DevOp::MoeGroupDownGemmaPf
+                | DevOp::MoeCombineNormGemmaPf
         ),
         "opcode has no audited direct-operand access contract",
     )

@@ -1,0 +1,142 @@
+# Gemma-4-26B-A4B-it, H100 SXM5, BF16 weights + BF16 KV, TP1.
+# Hybrid dense+MoE: every layer runs a dense MLP (inter 2112) AND a 128-expert
+# top-8 MoE (I_moe 704). 30 layers, hidden 2816, sliding hd256/GQA2, full hd512/GQA8.
+#
+# Deliberate differences from the 12B recipe, each one forced by a shape check
+# (see plans/gemma4-26b-a4b-h100-tracker.md "Kernel dims"):
+#  - HD512 px4 BQ64 role is OFF: that object hardcodes n_kv_head=1 and 26B has 2.
+#  - The fused GLU role is NOT in role_files: it pins N=15360/K=3840 (12B only).
+#    NO_GLU_FUSE + PREFILL_CUBLASLT is the shape-agnostic production path anyway.
+#  - HD256 GQA2 role IS reused: 26B's sliding geometry (16 heads / 8 kv) is
+#    byte-for-byte the 12B one.
+
+[cell]
+name = "gemma4-26b-a4b.h100.bf16-realtime"
+model = "google/gemma-4-26b-a4b-it"
+revision = "local"
+hf_dir = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+# TWO constraints pin this, and 8192 satisfies neither for the 8K rung:
+#
+#  1. The 8K rung needs 8192 input + 128 output = 8320 live positions. A packet compiled
+#     at exactly 8192 rejects every 8192-token request ("context length exceeded:
+#     prompt + max_tokens = 8320 exceeds the compiled context 8192") and the top rung of
+#     the ladder silently produces no cell.
+#  2. max_ctx must be a MULTIPLE OF 2048. The full-attention KV head window is
+#     max_ctx * global_head_dim(512) * 2 B, and the VMM pool requires it to be a
+#     multiple of the 2 MiB allocation granularity. 8704 loads and then dies with
+#     "vmm: head window 8912896 B not a multiple of granularity 2097152"
+#     (8704*512*2 = 4.25 granules). 8192 happens to work (exactly 4).
+#
+# 10240 is the smallest value satisfying both (5 granules). The 12B recipe's 16384 is 8.
+max_ctx = 10240
+precision = "bf16"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_SEG_PURE_GEMM = "1"
+PLOW_SEG_FA512 = "1"
+PLOW_SEG_FA256_GQA2 = "1"
+PLOW_TMA_GEMM = "1"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+PLOW_SLIDING_NS_CAP = "1"
+# FINE-GRAINED RUNGS. The server re-tokenises and prepends BOS, so an N-token bench prompt is
+# N+1 rows and crosses its rung: measured 25 -> 42 ms at 128|129 rows, 62 -> 91 at 1024|1025,
+# 177 -> 202 at 4096|4097, 368 -> 394 at 8192|8193 (one more token, +17..29 ms: either the next
+# bucket's padding or a second full-model launch for a 1-row tail). Each appended rung is the
+# shipped rung + 128, which swallows that tail in one launch; the runtime's chunk-cost model
+# picks it on its own. 4224 exceeds MAX_CHUNK but fits the sliding ring that MAX_CHUNK=4096
+# already sizes (next_pow2(1024 + 4096 - 1) = 8192 rows >= 1024 + 4224 - 1), which is the
+# condition the emitter admits an appended rung on; per-slot KV is unchanged.
+PLOW_PF_LADDER_APPEND = "256,1152,4224"
+PLOW_MAX_CHUNK = "4096"
+PLOW_FUSE_ARGMAX = "1"
+# The exact scorer replays the legacy scalar fmaf order on ONE lane per expert: measured
+# 0.0460 ms/layer at B=1 vs 0.0085 for ScoreFast (moe_decode_gemma26b_bench.cu) — 1.1 ms of
+# an 8.15 ms C1 decode step. ScoreFast is f32 end to end with a tree reduction, which is
+# already tighter than the reference: vLLM's Gemma4Router feeds bf16 h2 into its GateLinear.
+# The prefill router (moe90_router_gemma_pf) makes the same bf16-h2 / f32-logit choice.
+PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = [
+  "interp_sm90a_pfattn_hd512.cubin",
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+]
+[objects.env]
+# MUST be 0 for a MoE model. The segments script passes this straight into
+# -DPLOW_NV_FATLITE when it builds interp_sm90a_pfpackedseg.cubin, and every Gemma-4
+# MoE prefill opcode is guarded by
+#   #if !PLOW_NV_SEG_GEMM && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE
+# (interp_sm120.cu). With FATLITE=1 the MoE cases are compiled out of the fat object,
+# and they are already absent from the GEMM object (SEG_GEMM=1) and the FA object
+# (FA_ONLY=1) -- so there is NO object left that implements them, and a MoE prefill
+# segment dispatches into a switch that does not handle it. 12B never hit this because
+# it emits no MoE opcodes. Costs the fatlite occupancy win (12B measured -2.8 ms @1024,
+# -4.8 ms @4096); recovering it for 26B means widening that guard, not setting this to 1.
+PLOW_BUILD_FATLITE = "0"
+# Measured on this board (tune_decode_sweep.sh, step_bench TPOT, occ 1:132): the MoE-down
+# lane-split at 8 sub-groups beats the source default 4 — B=1 5.905 -> 5.833 ms, B=4 11.034 ->
+# 10.648. (2 is not an option at I_moe=704: 704 % 128 != 0 drops it off the lane-split arm.)
+PLOW_EXTRA_DEFINES = "-DPLOW_MOE_DOWN_SG=8u"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
+PLOW_BUILD_MASKED_PADDING = "1"
+# MUST be 1: the role file interp_sm90a_pfattn_hd512.cubin carries the ABI
+# `attention_sm90_hd512_wg32_v1`, i.e. the WGMMA BQ64 body. Building it with WG=0
+# emits the mma.sync BQ32 body instead, so the object's block/warp geometry does not
+# match what the role dispatch assumes. The 12B recipe sets 1 for the same reason.
+PLOW_BUILD_PFATTN_WG = "1"
+PLOW_BUILD_PFATTN_KV16 = "0"
+PLOW_BUILD_PFATTN_KV64 = "0"
+PLOW_BUILD_PFATTN_QK_UNROLL = "4"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "0"
+PLOW_PF_SEG_PURE = "1"
+PLOW_PF_SEG_FA512 = "1"
+PLOW_PF_INTERLEAVE = "0"
+PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
+LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096 8192"
+concs = "1 4"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
+model_id = "gemma-4-26b-a4b-it"
+gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer in one short sentence.<end_of_turn>\n<start_of_turn>model\n"
+
+# Rung ladder to 8K, C1 and C4. This is the primary latency cell.
+[bench.profiles.realtime]
+in_lens = "128 1024 4096 8192"
+concs = "1 4"
+serve_env = { PLOW_MULTISTEP = "4", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0" }
+
+# Serving cell: where the MoE expert-traffic ceiling shows up.
+[bench.profiles.high_concurrency]
+in_lens = "1024 4096"
+concs = "16 32"
+nprompt = 64
+serve_env = { PLOW_MULTISTEP = "8", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
+
+[reference]
+csv = "perf-data/campaign/gemma4-26b-a4b.h100.reference-vllm028-bf16.csv"

@@ -2,6 +2,53 @@ use super::*;
 use crate::exec::mixed_step_staging::TokenBatchStaging;
 use plow_asset::token_batch::{Phase, Request, Selection};
 
+/// `PLOW_STEP_TIME=1` attribution for the UNIFIED TOKEN-BATCH route.
+///
+/// `StepTiming` (gpu.rs) instruments the `step_slots` path only, so a model that decodes
+/// through this route — Gemma-4-26B-A4B does; the log says
+/// `route="unified-token-batch" ... fires=true` — produces no timing at all under
+/// `PLOW_STEP_TIME=1`, and the 26B campaign could not say whether its 48.8 ms TPOT was
+/// host gap, submission, or device time. (Standalone benches put the MoE kernels at
+/// 3.1 ms and all decode kernels at ~5.5 ms, so ~88 % was unattributed.)
+///
+/// Split reported: `enqueue` is `packed_token_body_enqueue` (host-side submission of the
+/// interpreter launch, async) and `terminal` is `run_rows`, which must wait on the device
+/// for the sampled ids — so `terminal` carries the device time the enqueue deferred.
+mod steptime {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub(super) static STEPS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static ENQUEUE_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static TERMINAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static ROWS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn add(enqueue_ns: u64, terminal_ns: u64, rows: u64) {
+        STEPS.fetch_add(1, Ordering::Relaxed);
+        ENQUEUE_NS.fetch_add(enqueue_ns, Ordering::Relaxed);
+        TERMINAL_NS.fetch_add(terminal_ns, Ordering::Relaxed);
+        ROWS.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// Log a rolling mean every `n` steps. Means, not last-step values: a single decode
+    /// step is noisy and the campaign protocol compares medians of many.
+    pub(super) fn log_every(n: u64) {
+        let steps = STEPS.load(Ordering::Relaxed);
+        if steps == 0 || steps % n != 0 {
+            return;
+        }
+        let per = |v: u64| v as f64 / steps as f64 / 1e6; // ns total -> ms mean
+        let enq = per(ENQUEUE_NS.load(Ordering::Relaxed));
+        let term = per(TERMINAL_NS.load(Ordering::Relaxed));
+        tracing::info!(
+            steps,
+            rows_total = ROWS.load(Ordering::Relaxed),
+            enqueue_ms = enq,
+            terminal_ms = term,
+            step_ms = enq + term,
+            "token-batch step means (host clocks; terminal includes the device wait)"
+        );
+    }
+}
+
 pub(super) struct CudaTokenBatch {
     staging: TokenBatchStaging,
     fired: bool,
@@ -117,12 +164,18 @@ impl GpuEngine {
                     "CUDA token-batch prefix history frontier mismatch".into(),
                 ));
             }
+            // PLOW_STEP_TIME=1 only: `Instant::now` is a syscall-class read, so it stays
+            // behind the flag rather than running on every decode step.
+            let timed = RuntimeConfig::get().nv.step_time;
+            let t_enq = timed.then(std::time::Instant::now);
             self.packed_token_body_enqueue(&chunks)?;
             body_enqueued = true;
+            let enqueue_ns = t_enq.map_or(0, |t| t.elapsed().as_nanos() as u64);
             let mut terminal = self
                 .packed_terminal
                 .take()
                 .expect("capability checked at load");
+            let t_term = timed.then(std::time::Instant::now);
             let sampled = terminal
                 .run_rows(self, &plan.sample_input_rows, plan.real_rows as usize)
                 .and_then(|ids| {
@@ -131,8 +184,13 @@ impl GpuEngine {
                         .deliver(ids, output)
                         .map_err(|error| RuntimeError::Rejected(error.to_string()))
                 });
+            let terminal_ns = t_term.map_or(0, |t| t.elapsed().as_nanos() as u64);
             self.packed_terminal = Some(terminal);
             sampled?;
+            if timed {
+                steptime::add(enqueue_ns, terminal_ns, rows as u64);
+                steptime::log_every(8);
+            }
             state
                 .staging
                 .commit_after_device_success(&mut self.pos, &self.slot_generations)

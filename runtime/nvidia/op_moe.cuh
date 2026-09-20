@@ -855,6 +855,65 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
  * the win/gate scratch, avoiding the legacy thread-local win[8]/gate[8] arrays and their local
  * stack traffic. */
 /* One row: the historical serial softmax/top-k/norm_topk/per-expert-scale ordering, verbatim. */
+#if PLOW_NV_GEMV_RB
+/* Warp-parallel softmax + top-k over one row's logits `sc` (smem, overwritten). Called by ALL
+ * 32 lanes of ONE warp with identical arguments. Bit-exact with the serial tail: see the
+ * note in d_moe_router_gemma_topk_row. */
+static __device__ __forceinline__ void plow_moe_gemma_topk_warp(unsigned char* table, float* sc,
+                                                             const bf16* pes, unsigned n_exp,
+                                                             unsigned k, unsigned lane) {
+    float m = -1e30f;
+    for (unsigned e = lane; e < n_exp; e += 32u) m = fmaxf(m, sc[e]);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
+    for (unsigned e = lane; e < n_exp; e += 32u) sc[e] = __expf(sc[e] - m);
+    __syncwarp();
+    float s = 0.0f;
+    if (lane == 0)
+        for (unsigned e = 0; e < n_exp; e++) s += sc[e]; /* original order, exact */
+    s = __shfl_sync(~0u, s, 0);
+    for (unsigned e = lane; e < n_exp; e += 32u) sc[e] /= s;
+    __syncwarp();
+
+    for (unsigned j = 0; j < k; j++) {
+        unsigned long long best = 0ull;
+        for (unsigned e = lane; e < n_exp; e += 32u) {
+            unsigned sb;
+            const float scv = sc[e];
+            __builtin_memcpy(&sb, &scv, 4);
+            sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
+            const unsigned long long key =
+                ((unsigned long long)sb << 20) |
+                (unsigned long long)((n_exp - 1u - e) & 0xFFFFFu);
+            if (key > best) best = key;
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const unsigned long long t = __shfl_xor_sync(~0u, best, o);
+            if (t > best) best = t;
+        }
+        const unsigned bid = n_exp - 1u - (unsigned)(best & 0xFFFFFull);
+        if (lane == 0) {
+            *(unsigned*)(table + (size_t)j * 8) = bid;
+            *(float*)(table + (size_t)j * 8 + 4) = sc[bid];
+            sc[bid] = -1e30f;
+        }
+        __syncwarp();
+    }
+    if (lane == 0) {
+        float gs = 0.0f;
+        for (unsigned j = 0; j < k; j++) gs += *(float*)(table + (size_t)j * 8 + 4);
+        for (unsigned j = 0; j < k; j++) {
+            const unsigned win = *(unsigned*)(table + (size_t)j * 8);
+            float gate = *(float*)(table + (size_t)j * 8 + 4);
+            if (gs != 0.0f) gate /= gs;
+            gate *= __bfloat162float(pes[win]);
+            *(float*)(table + (size_t)j * 8 + 4) = gate;
+        }
+    }
+}
+#endif
+
 static __device__ void d_moe_router_gemma_topk_row(unsigned char* __restrict__ table,
                                          const float* __restrict__ score,
                                          const bf16* __restrict__ pes,
@@ -876,57 +935,7 @@ static __device__ void d_moe_router_gemma_topk_row(unsigned char* __restrict__ t
      * principle move a gate. Same writes, same values. */
     {
         const unsigned lane = threadIdx.x & 31u;
-        if (threadIdx.x < 32u) {
-            float m = -1e30f;
-            for (unsigned e = lane; e < n_exp; e += 32u) m = fmaxf(m, sc[e]);
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(~0u, m, o));
-            for (unsigned e = lane; e < n_exp; e += 32u) sc[e] = __expf(sc[e] - m);
-            __syncwarp();
-            float s = 0.0f;
-            if (lane == 0)
-                for (unsigned e = 0; e < n_exp; e++) s += sc[e]; /* original order, exact */
-            s = __shfl_sync(~0u, s, 0);
-            for (unsigned e = lane; e < n_exp; e += 32u) sc[e] /= s;
-            __syncwarp();
-
-            for (unsigned j = 0; j < k; j++) {
-                unsigned long long best = 0ull;
-                for (unsigned e = lane; e < n_exp; e += 32u) {
-                    unsigned sb;
-                    const float scv = sc[e];
-                    __builtin_memcpy(&sb, &scv, 4);
-                    sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
-                    const unsigned long long key =
-                        ((unsigned long long)sb << 20) |
-                        (unsigned long long)((n_exp - 1u - e) & 0xFFFFFu);
-                    if (key > best) best = key;
-                }
-#pragma unroll
-                for (int o = 16; o > 0; o >>= 1) {
-                    const unsigned long long t = __shfl_xor_sync(~0u, best, o);
-                    if (t > best) best = t;
-                }
-                const unsigned bid = n_exp - 1u - (unsigned)(best & 0xFFFFFull);
-                if (lane == 0) {
-                    *(unsigned*)(table + (size_t)j * 8) = bid;
-                    *(float*)(table + (size_t)j * 8 + 4) = sc[bid];
-                    sc[bid] = -1e30f;
-                }
-                __syncwarp();
-            }
-            if (lane == 0) {
-                float gs = 0.0f;
-                for (unsigned j = 0; j < k; j++) gs += *(float*)(table + (size_t)j * 8 + 4);
-                for (unsigned j = 0; j < k; j++) {
-                    const unsigned win = *(unsigned*)(table + (size_t)j * 8);
-                    float gate = *(float*)(table + (size_t)j * 8 + 4);
-                    if (gs != 0.0f) gate /= gs;
-                    gate *= __bfloat162float(pes[win]);
-                    *(float*)(table + (size_t)j * 8 + 4) = gate;
-                }
-            }
-        }
+        if (threadIdx.x < 32u) plow_moe_gemma_topk_warp(table, sc, pes, n_exp, k, lane);
         __syncthreads(); /* arena is reused by the next row */
         return;
     }
@@ -1056,6 +1065,12 @@ static __device__ void d_moe_expert_glu_gemma(bf16* __restrict__ fu, const bf16*
 }
 
 /* Non-arena overload for standalone test kernels (reads x from L1/global) and the B>1 path. */
+/* Its own unroll: the dense GLU's GV_UNROLL_GLU (10 in the sm_90a build) is tuned for ONE
+ * long-K row stream per warp; here consecutive work items hop experts, and 10 measured slower
+ * than 4 (0.618 vs 0.48 ms/layer at B=16). */
+#ifndef GV_MOE_GLU_UN_B
+#define GV_MOE_GLU_UN_B 4
+#endif
 static __device__ void d_moe_expert_glu_gemma(bf16* __restrict__ fu, const bf16* __restrict__ x,
                                        const unsigned char* __restrict__ table,
                                        const unsigned long long* __restrict__ ewt, unsigned k,
@@ -1081,21 +1096,21 @@ static __device__ void d_moe_expert_glu_gemma(bf16* __restrict__ fu, const bf16*
         const bf16* grow = (const bf16*)(size_t)gub + (size_t)n * H;
         const bf16* urow = (const bf16*)(size_t)gub + (size_t)(I_moe + n) * H;
         float ag = 0.0f, au = 0.0f;
-        for (unsigned c = 0; c < nchunk; c += GV_UNROLL_GLU) {
-            bf16v8 gv[GV_UNROLL_GLU], uv[GV_UNROLL_GLU];
-            unsigned kk[GV_UNROLL_GLU];
+        for (unsigned c = 0; c < nchunk; c += GV_MOE_GLU_UN_B) {
+            bf16v8 gv[GV_MOE_GLU_UN_B], uv[GV_MOE_GLU_UN_B];
+            unsigned kk[GV_MOE_GLU_UN_B];
 #pragma unroll
-            for (int i = 0; i < GV_UNROLL_GLU; i++) {
+            for (int i = 0; i < GV_MOE_GLU_UN_B; i++) {
                 const unsigned k_ = (c + (unsigned)i) * GV_STEP + lane * 8u;
                 kk[i] = k_;
                 gv[i] = (k_ < H) ? ld_glob8(grow + k_) : bf16v8_zero();
             }
 #pragma unroll
-            for (int i = 0; i < GV_UNROLL_GLU; i++) {
+            for (int i = 0; i < GV_MOE_GLU_UN_B; i++) {
                 uv[i] = (kk[i] < H) ? ld_glob8(urow + kk[i]) : bf16v8_zero();
             }
 #pragma unroll
-            for (int i = 0; i < GV_UNROLL_GLU; i++) {
+            for (int i = 0; i < GV_MOE_GLU_UN_B; i++) {
                 if (kk[i] >= H) continue;
                 const bf16v8 xv = ld_glob8(xr + kk[i]);
                 ag = dot8(gv[i], xv, ag);
@@ -1132,12 +1147,16 @@ static __device__ void d_moe_expert_down_gemma(float* __restrict__ part, const b
     constexpr unsigned LSG = PLOW_MOE_DOWN_SG;       /* sub-groups (channels) per warp */
     constexpr unsigned LSL = 32u / LSG;               /* lanes per sub-group */
     constexpr unsigned LCH = LSL * 8u;                /* elems a sub-group covers per chunk */
-    if (nrow == 1u && (I_moe % LCH) == 0u) {
+    /* B>1 too: each sub-group resolves its own (slot, h), so the channel-major batch order
+     * needs nothing but the batch-aware unflat. Gating this on nrow==1 sent every B>=2 step
+     * to the unblocked body below: 651 GB/s against 2058 at B=1. */
+    if ((I_moe % LCH) == 0u) {
         const unsigned lane = threadIdx.x & 31u;
         const unsigned sg = lane / LSL;
         const unsigned sl = lane % LSL;
         const unsigned nw = blockDim.x >> 5;
-        const unsigned total = k * H;
+        const unsigned nslot = nrow * k;
+        const unsigned total = nslot * H;
         const unsigned per = (total + nblk - 1u) / nblk;
         const unsigned f0 = slice * per;
         const unsigned f1 = (f0 + per < total) ? (f0 + per) : total;
@@ -1152,7 +1171,7 @@ static __device__ void d_moe_expert_down_gemma(float* __restrict__ part, const b
             if (f < f1) {
                 valid = true;
                 unsigned slot, h;
-                plow_moe_unflat(f, k, H, 1u, &slot, &h);
+                plow_moe_unflat(f, nslot, H, nrow, &slot, &h);
                 dst = part + (size_t)slot * H + h;
                 const unsigned eid = plow_moe_slot_expert(table, slot);
                 const unsigned long long db = (eid < n_exp) ? ewt[(size_t)eid * 2 + 1] : 0ull;
@@ -1943,12 +1962,34 @@ static __device__ void d_moe_expert_glu_norm_gemma(bf16* __restrict__ fu,
                                             const unsigned long long* __restrict__ ewt, unsigned k,
                                             unsigned I_moe, unsigned H, unsigned n_exp, float eps,
                                             unsigned slice, unsigned nblk, unsigned nrow,
-                                            float* __restrict__ arena) {
+                                            float* __restrict__ arena,
+                                            bf16* __restrict__ xn_scratch = nullptr) {
 #if PLOW_NV_GEMV_RB
     /* B=1 decode on a stageable H takes the vectorized row-blocked twin. */
     if (nrow == 1u && H <= PLOW_MOE_XN_MAX) {
         d_moe_expert_glu_norm_gemma_rb(fu, resid, gamma, table, ewt, k, I_moe, H, n_exp, eps,
                                        slice, nblk, arena);
+        return;
+    }
+    /* B>1 WITH A GLOBAL SCRATCH: the body below is the scalar one — 2 B loads, no unroll, xn
+     * recomputed from global for every output channel — and measured 19.7 ms of a 34.2 ms B=16
+     * step (58%). B rows of xn do not fit the decode arena, so they are staged in the packet's
+     * moe.xn2 tensor (B*H bf16, L2-resident) and the vector body reads them with ld_glob8.
+     * Every block writes ALL of xn before its barrier: there is no cross-block gate inside one
+     * op, and concurrent writers store identical values. bf16 xn is what the dense GEMV arms
+     * and vLLM feed their weights; outputs are numerically equivalent, not bit-equal. */
+    if (xn_scratch != nullptr) {
+        __shared__ float rms_red_b[32];
+        __shared__ float invs_b[PLOW_MOE_MAXB];
+        plow_moe_row_rms(invs_b, rms_red_b, resid, H, nrow, eps);
+        const unsigned tot = nrow * H;
+        for (unsigned i = threadIdx.x; i < tot; i += blockDim.x) {
+            const unsigned row = i / H;
+            xn_scratch[i] = __float2bfloat16(__bfloat162float(resid[i]) * invs_b[row] *
+                                             __bfloat162float(gamma[i - row * H]));
+        }
+        __syncthreads();
+        d_moe_expert_glu_gemma(fu, xn_scratch, table, ewt, k, I_moe, H, n_exp, slice, nblk, nrow);
         return;
     }
 #endif
@@ -2001,6 +2042,71 @@ static __device__ void d_moe_expert_glu_norm_gemma(bf16* __restrict__ fu,
  * compile only where op_gemm.cuh was included first (interp_sm120.cu and the oracle TU both do).
  * ================================================================================ */
 
+/* softmax + top-k (lowest-id tie) + norm_topk + per-expert scale over one token's logits. */
+static __device__ __forceinline__ void plow_moe_gemma_softmax_topk(unsigned char* tab, float* sc,
+                                                                const bf16* pes, unsigned n_exp,
+                                                                unsigned k) {
+    float m = -1e30f;
+    for (unsigned e = 0; e < n_exp; e++) m = fmaxf(m, sc[e]);
+    float s = 0.0f;
+    for (unsigned e = 0; e < n_exp; e++) { sc[e] = __expf(sc[e] - m); s += sc[e]; }
+    for (unsigned e = 0; e < n_exp; e++) sc[e] /= s;
+    for (unsigned j = 0; j < k; j++) {
+        unsigned long long best = 0ull;
+        unsigned bid = 0;
+        for (unsigned e = 0; e < n_exp; e++) {
+            unsigned sb;
+            float scv = sc[e];
+            __builtin_memcpy(&sb, &scv, 4);
+            sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
+            const unsigned long long key =
+                ((unsigned long long)sb << 20) |
+                (unsigned long long)((n_exp - 1u - e) & 0xFFFFFu);
+            if (key > best) { best = key; bid = e; }
+        }
+        *(unsigned*)(tab + (size_t)j * 8) = bid;
+        *(float*)(tab + (size_t)j * 8 + 4) = sc[bid];
+        sc[bid] = -1e30f;
+    }
+    float gs = 0.0f;
+    for (unsigned j = 0; j < k; j++) gs += *(float*)(tab + (size_t)j * 8 + 4);
+    for (unsigned j = 0; j < k; j++) {
+        const unsigned win = *(unsigned*)(tab + (size_t)j * 8);
+        float gate = *(float*)(tab + (size_t)j * 8 + 4);
+        if (gs != 0.0f) gate /= gs;
+        gate *= __bfloat162float(pes[win]);
+        *(float*)(tab + (size_t)j * 8 + 4) = gate;
+    }
+}
+
+#if defined(PLOW_NV_HOPPER)
+/* Tensor-core twin (op_moe_sm90.cuh). The scalar body below runs the [T,E,H] score GEMM as
+ * fmaf dots at 0.09% of peak: 3.4 ms per layer at T=4096, more than both grouped GEMMs. */
+#ifndef MOE90_RT_MIN_T
+#define MOE90_RT_MIN_T 512u
+#endif
+/* HALF-TILES: align pads each expert to 64 rows, not 128, and a block's two warpgroups each
+ * take one half-tile — of DIFFERENT experts when they differ. With 128 experts every segment
+ * ends in a partial tile, so 128-row padding costs 364 tiles where 256 would do at T=4096 and
+ * 174 for 64 at T=1024; the grouped GEMM is staging-bound, so a tile is paid for in full
+ * however few rows it holds. meta[2E..] then counts half-tiles. */
+#ifndef MOE90_HALF
+#if defined(PLOW_NV_W8A8) && PLOW_NV_W8A8
+#define MOE90_HALF 0 /* the e4m3 twins still walk 128-row tiles */
+#else
+#define MOE90_HALF 1
+#endif
+#endif
+static __device__ void moe90_router_gemma_pf(unsigned char* __restrict__ table,
+                                             const bf16* __restrict__ resid,
+                                             const bf16* __restrict__ proj,
+                                             const bf16* __restrict__ scale,
+                                             const bf16* __restrict__ pes, unsigned H,
+                                             unsigned n_exp, unsigned k, unsigned T, float root,
+                                             float eps, unsigned slice, unsigned nblk,
+                                             float* __restrict__ arena);
+#endif
+
 /* ---- T-TOKEN ROUTER (PLOW_DOP_MOE_ROUTER_GEMMA_PF) --------------------------------------
  * Block-per-token loop of the exact decode router. For token t, the block runs the identical
  * weightless-RMS -> h2 -> logits -> softmax -> top-k (lowest-id tie) -> norm_topk -> per-expert
@@ -2011,10 +2117,17 @@ static __device__ void d_moe_router_gemma_pf(unsigned char* __restrict__ table,
                                       unsigned H, unsigned n_exp, unsigned k, unsigned T, float root,
                                       float eps, unsigned slice, unsigned nblk,
                                       float* __restrict__ arena) {
-    float* h2 = arena;      /* [H]     */
-    float* sc = arena + H;  /* [n_exp] */
     const unsigned tid = threadIdx.x, nth = blockDim.x;
     const unsigned lane = tid & 31u, warp = tid >> 5;
+#if defined(PLOW_NV_HOPPER)
+    if (T >= MOE90_RT_MIN_T && n_exp <= 128u) {
+        moe90_router_gemma_pf(table, resid, proj, scale, pes, H, n_exp, k, T, root, eps, slice,
+                              nblk, arena);
+        return;
+    }
+#endif
+    float* h2 = arena;      /* [H]     */
+    float* sc = arena + H;  /* [n_exp] */
     __shared__ float red[32];
 
     for (unsigned tok = slice; tok < T; tok += nblk) {
@@ -2060,40 +2173,12 @@ static __device__ void d_moe_router_gemma_pf(unsigned char* __restrict__ table,
         }
         __syncthreads();
 
-        /* 4. softmax + top-k (lowest-id tie) + norm_topk + per-expert scale, serial on thread 0. */
-        if (tid == 0) {
-            float m = -1e30f;
-            for (unsigned e = 0; e < n_exp; e++) m = fmaxf(m, sc[e]);
-            float s = 0.0f;
-            for (unsigned e = 0; e < n_exp; e++) { sc[e] = __expf(sc[e] - m); s += sc[e]; }
-            for (unsigned e = 0; e < n_exp; e++) sc[e] /= s;
-            for (unsigned j = 0; j < k; j++) {
-                unsigned long long best = 0ull;
-                unsigned bid = 0;
-                for (unsigned e = 0; e < n_exp; e++) {
-                    unsigned sb;
-                    float scv = sc[e];
-                    __builtin_memcpy(&sb, &scv, 4);
-                    sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
-                    const unsigned long long key =
-                        ((unsigned long long)sb << 20) |
-                        (unsigned long long)((n_exp - 1u - e) & 0xFFFFFu);
-                    if (key > best) { best = key; bid = e; }
-                }
-                *(unsigned*)(tab + (size_t)j * 8) = bid;
-                *(float*)(tab + (size_t)j * 8 + 4) = sc[bid];
-                sc[bid] = -1e30f;
-            }
-            float gs = 0.0f;
-            for (unsigned j = 0; j < k; j++) gs += *(float*)(tab + (size_t)j * 8 + 4);
-            for (unsigned j = 0; j < k; j++) {
-                const unsigned win = *(unsigned*)(tab + (size_t)j * 8);
-                float gate = *(float*)(tab + (size_t)j * 8 + 4);
-                if (gs != 0.0f) gate /= gs;
-                gate *= __bfloat162float(pes[win]);
-                *(float*)(tab + (size_t)j * 8 + 4) = gate;
-            }
-        }
+        /* 4. softmax + top-k: warp 0 in parallel where the object has it, else thread 0. */
+#if PLOW_NV_GEMV_RB
+        if (warp == 0) plow_moe_gemma_topk_warp(tab, sc, pes, n_exp, k, lane);
+#else
+        if (tid == 0) plow_moe_gemma_softmax_topk(tab, sc, pes, n_exp, k);
+#endif
         __syncthreads(); /* arena reused next token */
     }
 }
@@ -2109,7 +2194,11 @@ static __device__ void d_moe_align_gemma_pf(int* __restrict__ meta, const unsign
                                      unsigned k, unsigned slice) {
     if (slice != 0) return; /* single block */
     const unsigned tid = threadIdx.x, nth = blockDim.x;
+#if defined(PLOW_NV_HOPPER) && MOE90_HALF
+    const unsigned BM = (unsigned)PGM_BM / 2u; /* half-tile unit, see MOE90_HALF */
+#else
     const unsigned BM = (unsigned)PGM_BM;
+#endif
     __shared__ unsigned cnt[PLOW_MOE_MAXE];
     __shared__ unsigned cur[PLOW_MOE_MAXE];
     __shared__ unsigned s_total_pad;
@@ -2139,7 +2228,7 @@ static __device__ void d_moe_align_gemma_pf(int* __restrict__ meta, const unsign
             tp += tiles;
         }
         tilep[n_exp] = (int)tp;          /* total_tiles */
-        s_total_pad = tp * BM;
+        s_total_pad = (tp * BM + (unsigned)PGM_BM - 1u) / (unsigned)PGM_BM * (unsigned)PGM_BM;
     }
     __syncthreads();
 
@@ -2222,12 +2311,18 @@ __device__ __forceinline__ void pgm_stage_a_gather(__nv_bfloat16* Ad,
     }
 }
 
-/* find expert e s.t. tilep[e] <= mtile < tilep[e+1] (n_exp<=128, linear scan is cheap). */
+/* find expert e s.t. tilep[e] <= mtile < tilep[e+1]: the LAST e with tilep[e] <= mtile, which
+ * skips empty experts exactly as the linear scan did. Bisected: the scan was ~64 global loads
+ * per thread per tile (~3 us), 15% of a DOWN tile, whose K is only 11 k-steps. */
 __device__ __forceinline__ int pgm_moe_expert_of_mtile(const int* __restrict__ tilep, int mtile,
                                                        int n_exp) {
-    int e = 0;
-    while (e + 1 < n_exp && tilep[e + 1] <= mtile) e++;
-    return e;
+    int lo = 0, hi = n_exp - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (tilep[mid] <= mtile) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo;
 }
 
 #if defined(PLOW_NV_HOPPER)

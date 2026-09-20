@@ -3783,7 +3783,12 @@ async fn serve(
     tracing::info!(%tcp_addr, "plowrt serving OpenAI API over TCP");
     let tcp_router = router.clone();
     let tcp_task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(tcp_listener, tcp_router).await {
+        // TCP_NODELAY: a streamed response is headers, then the first token as a SECOND small
+        // write. With Nagle on, that write waits for the client's delayed ACK of the headers
+        // (~40 ms) on a reused keep-alive connection, so any TTFT under 40 ms reads as ~42 ms no
+        // matter how fast prefill is. Measured: 128-row prefill 28.7 ms on device, first chunk
+        // 32.5 ms on a fresh connection, 42.3 ms from `vllm bench`'s pooled one.
+        if let Err(e) = axum::serve(tcp_listener, tcp_router).tcp_nodelay(true).await {
             tracing::error!(error = %e, "TCP listener error");
         }
     });

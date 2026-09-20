@@ -212,7 +212,7 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeRouterGemmaScore, t: &["score", "resid", "proj", "scale"], i: &["H", "n_exp"], f: &["root", "eps"], j: &[] },
     S { op: DevOp::MoeRouterGemmaTopk, t: &["table", "score", "per_expert_scale"], i: &["", "n_exp", "k"], f: &[], j: &[] },
     S { op: DevOp::MoeCombineNormGemma, t: &["out", "part", "resid", "gamma"], i: &["H", "k"], f: &["eps"], j: &[] },
-    S { op: DevOp::MoeExpertGluNormGemma, t: &["fu", "resid", "table", "ewt", "gamma"], i: &["k", "I", "H", "n_exp"], f: &["eps"], j: &[] },
+    S { op: DevOp::MoeExpertGluNormGemma, t: &["fu", "resid", "table", "ewt", "gamma", "xn_scratch"], i: &["k", "I", "H", "n_exp"], f: &["eps"], j: &[] },
     S { op: DevOp::MoeCombineResidNormGemma, t: &["hn", "x", "part", "h1", "g_pf2", "g_po", "gn"], i: &["H", "k"], f: &["eps", "layer_scalar"], j: &[] },
     S { op: DevOp::MoeRouterGemmaPf, t: &["table", "resid", "proj", "scale", "per_expert_scale"], i: &["H", "n_exp", "k", "T"], f: &["root", "eps"], j: &[] },
     S { op: DevOp::MoeAlignGemmaPf, t: &["meta", "table", "row_token", "row_partidx", "row_gate"], i: &["T", "n_exp", "k"], f: &[], j: &[] },

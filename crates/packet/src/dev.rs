@@ -702,8 +702,9 @@ pub enum DevOp {
     MoeCombineNormGemma = 70,
     /// Fused pre-FFN-norm-2 + expert GLU. Same as [`DevOp::MoeExpertGluGemma`] but
     /// takes raw residual + gamma and computes RMSNorm inline, eliminating a separate
-    /// RmsNorm packet. `t0=fu t1=resid t2=table t3=ewt t4=gamma` ·
-    /// `i0=k i1=I i2=H i3=n_exp` · `f0=eps`.
+    /// RmsNorm packet. `t0=fu t1=resid t2=table t3=ewt t4=gamma t5=xn_scratch` ·
+    /// `i0=k i1=I i2=H i3=n_exp` · `f0=eps`. `t5` (B*H bf16) stages the normed rows for the
+    /// B>1 vector body; it rides every rung because the decode-ladder validator compares operands.
     MoeExpertGluNormGemma = 71,
     /// Fused MoE layer tail: ([`DevOp::MoeCombineNormGemma`] → NormResidualNorm) in one
     /// counter-gated packet — combine + post_ffn norm, sandwich residual, and the NEXT
