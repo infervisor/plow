@@ -1,7 +1,10 @@
 # Gemma-4-12B-it, H100 SXM5, BF16, TP1 — the SERVING cell (C16/C32) at a 16k context.
 # ladder16k with 32 slots: chunk 1024 keeps a slot's sliding ring at 2048 rows, so 32 slots
-# and the on-demand full-attention KV of the long inputs fit beside 22 GiB of weights. Both
-# attention roles need the 4096 rung and are off (same trade as gemma4-12b.h100.bf16-c32.toml).
+# and the on-demand full-attention KV of the long inputs fit beside 22 GiB of weights (peak
+# 45.5-48.5 GiB over the C16/C32 ladder). Chunk 2048 (ring 4096, p12c32c, 2026-09-21) fits too
+# and halves long-prompt C32 TTFT (8192/C32 10314 -> 4695 ms) but the doubled ring slows every
+# decode step (128/C16 TPOT 13.05 -> 17.97 ms, 1179 -> 856 tok/s), so 1024 stays. Both attention
+# roles need the 4096 rung and are off (same trade as gemma4-12b.h100.bf16-c32.toml).
 
 [cell]
 name = "gemma4-12b.h100.bf16-c32-16k"
@@ -81,7 +84,7 @@ gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer i
 in_lens = "128 1024 4096 8192 15000"
 concs = "16 32"
 nprompt = 64
-serve_env = { PLOW_MULTISTEP = "8", PLOW_DECODE_MAX_RUNG = "32", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "32", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
 
 [reference]
 csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.csv"
