@@ -1035,6 +1035,17 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
             t.insert("gemv_mma_b1".into(), json!(1));
         }
     }
+    // * `fa_spart`: decode attention parks its score partials in smem (op_attention.cuh,
+    //   PLOW_NV_FA_SPART) and holds 8 hd256 rows in flight. 12B 11.03/11.45/11.98/13.04/15.24 ->
+    //   10.99/11.30/11.67/12.59/14.35. DENSE only: the extra 64 KiB smem claim costs the 26B's
+    //   per-slot MoE rung more than attention gains (B=4 9.57 -> 9.93; B=16 15.46 -> 15.11).
+    // * `fa_tc_hd512`: the hd512/GQA8 layers score and accumulate on the tensor cores
+    //   (PLOW_NV_FA_TC_GQA8_HD512). Neutral at ctx 1024 (10.99/11.67/14.35 -> 11.02/11.66/14.29),
+    //   and the long-context term: ctx 8192 B=1/4 11.30/12.99 -> 11.14/12.19.
+    if s.moe_down_inter == 0 && s.decode_batch >= 2 {
+        t.insert("fa_spart".into(), json!(8));
+        t.insert("fa_tc_hd512".into(), json!(1));
+    }
     if s.full_kv_heads == 1 && s.gqa > 0 {
         // The template is instantiated at 1|2|4|8 only.
         let gf = next_pow2(s.gqa).min(8);
@@ -2701,6 +2712,17 @@ pub fn config_header(manifest: &Value) -> String {
             }
             if t.get("gemv_mma_b1").is_some() {
                 out.push_str("#ifndef PLOW_NV_GEMV_MMA_B1\n#define PLOW_NV_GEMV_MMA_B1 1\n#endif\n");
+            }
+            if t.get("fa_tc_hd512").is_some() {
+                out.push_str(
+                    "#ifndef PLOW_NV_FA_TC_GQA8_HD512\n#define PLOW_NV_FA_TC_GQA8_HD512 1\n#endif\n",
+                );
+            }
+            if let Some(v) = t.get("fa_spart").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_FA_SPART\n#define PLOW_NV_FA_SPART 1\n#endif\n\
+                     #ifndef PLOW_NV_FA_WPR_RB256\n#define PLOW_NV_FA_WPR_RB256 {v}\n#endif\n"
+                ));
             }
         }
     }

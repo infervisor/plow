@@ -113,9 +113,32 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #define FA_DEC_TC_GQA8(HD, GF) (PLOW_NV_FA_TC_GQA8_HD512 && (HD) == 512 && (GF) == 8)
 #define FA_DEC_BASE_SMEM_FLOATS(D, GF)                                                         \
     ((GF) * FA_DEC_TILE + 2 * FA_DEC_REDUCTION_HEADS(GF) + (GF) * ((D) / 2) + FA_DEC_NG(D) * (D))
+/* SCORE PARTIALS IN SMEM (the WPR path, GF 2/4/8). The warp-per-row dot ends in a 5-round lane
+ * reduction per (row, head), which also serializes the K loads: only PLOW_NV_FA_WPR_RB rows are
+ * ever in flight, against 8 V rows in the P.V loop that moves the same bytes 2.3x faster. Here
+ * log2(GF/2) rounds leave 64/GF lane-group partials per (row, head); the lanes park them in smem
+ * and each thread folds its own row after the barrier (16 four-float loads whatever GF is).
+ * At GF=2 that is NO sync point in the score loop, so hd256 can hold PLOW_NV_FA_WPR_RB256 rows in
+ * flight: hd512/GF8 owns the decode entry's register peak and keeps PLOW_NV_FA_WPR_RB, hd256/GF2
+ * fits 8 rows at the same 239 registers.
+ * MEASURED h100-sxm5, Gemma-4-12B step_bench ctx 1024, B=1/4/16: 11.03/11.99/15.24 ->
+ * 11.01/11.71/14.36 ms at hd256 depth 8 (4: 10.94/11.71/14.63, 16: 11.09/11.85/14.45). Body
+ * ablation of the B=16 step: score 2.71 ms (shuffles 0.56), P.V 1.16, rest of FlashDecode ~0.5.
+ * Costs TILE*64 floats (64 KiB) of arena. Score sums change order: not bit-identical. */
+#ifndef PLOW_NV_FA_SPART
+#define PLOW_NV_FA_SPART 0
+#endif
+#ifndef PLOW_NV_FA_WPR_RB256
+#define PLOW_NV_FA_WPR_RB256 PLOW_NV_FA_WPR_RB
+#endif
+#define FA_DEC_SPART(D, GF)                                                                    \
+    (PLOW_NV_FA_SPART && (D) >= 256 && ((GF) == 2 || (GF) == 4 || (GF) == 8) &&               \
+     !FA_DEC_TC_GQA8(D, GF))
+#define FA_DEC_SPART_NP(GF) (64 / (GF))
 #define FA_DEC_SMEM_FLOATS(D, GF)                                                              \
     (FA_DEC_BASE_SMEM_FLOATS(D, GF) +                                                         \
-     (FA_DEC_TC_GQA8(D, GF) ? (16 + 2 * 64) * ((D) + 8) / 2 : 0))
+     (FA_DEC_TC_GQA8(D, GF) ? (16 + 2 * 64) * ((D) + 8) / 2 : 0) +                            \
+     (FA_DEC_SPART(D, GF) ? FA_DEC_TILE * 64 : 0))
 
 /* V rows in flight per thread. A fused row feeds GF accumulators, so arithmetic per load
  * grows with GF and the unroll can shrink before the 255-register cliff. */
@@ -762,11 +785,14 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
              * against a 256-row tile, so half the sweep was pure loop+store overhead. Fill the
              * dead tail with NEG_INF in one cheap strided pass instead of iterating it. */
             const unsigned rmax = rmax_t;
+            float* Psm = lds + FA_DEC_BASE_SMEM_FLOATS(D, GF);
+            if constexpr (!FA_DEC_SPART(D, GF)) {
             for (unsigned i = tid + rmax; i < (unsigned)FA_DEC_TILE; i += PLOW_NV_THREADS) {
 #pragma unroll
                 for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + i] = FA_NEG_INF;
             }
-            constexpr int WRB = PLOW_NV_FA_WPR_RB;
+            }
+            constexpr int WRB = (D == 256) ? PLOW_NV_FA_WPR_RB256 : PLOW_NV_FA_WPR_RB;
             for (unsigned rb = warp; rb < rmax; rb += PLOW_NV_WARPS * WRB) {
                 /* WRB rows, strided by the warp count so each warp's batch stays disjoint. */
                 bf16v8 k8[WRB][NC];
@@ -792,10 +818,10 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                     float sr[GF];
 #pragma unroll
                     for (int g = 0; g < GF; g++) sr[g] = FA_NEG_INF;
-                    if (live[t]) {
-                        float dt[GF];
+                    float dt[GF];
 #pragma unroll
-                        for (int g = 0; g < GF; g++) dt[g] = 0.0f;
+                    for (int g = 0; g < GF; g++) dt[g] = 0.0f;
+                    if (FA_DEC_SPART(D, GF) || live[t]) {
 #pragma unroll
                         for (int c = 0; c < NC; c++) {
                             const unsigned off = (unsigned)c * 256u + lane * 8u;
@@ -814,9 +840,26 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                 dt[g] = dot8(k8[t][c], ld_smem8(qsm + g * D + off), dt[g]);
 #endif
                         }
+                        if constexpr (!FA_DEC_SPART(D, GF)) {
 #pragma unroll
                         for (int g = 0; g < GF; g++) sr[g] = warp_sum32(dt[g]) * FA_SCALE(scale);
+                        }
                     }
+                    if constexpr (FA_DEC_SPART(D, GF)) {
+                        /* r depends on (warp, t) only, so the rounds below are lane-uniform. */
+                        if (r < rmax) {
+                            constexpr unsigned NP = FA_DEC_SPART_NP(GF);
+                            float* pp = Psm + ((size_t)r * NP + lane) * GF;
+#pragma unroll
+                            for (int g = 0; g < GF; g++) {
+                                float pv = dt[g];
+#pragma unroll
+                                for (int off = 16; off >= (int)NP; off >>= 1)
+                                    pv += __shfl_xor_sync(0xffffffffu, pv, off, 32);
+                                if (lane < NP) pp[g] = pv;
+                            }
+                        }
+                    } else
                     if (lane == 0 && r < rmax) {
 #pragma unroll
                         for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + r] = sr[g];
@@ -824,8 +867,34 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 }
             }
             __syncthreads();
+            if constexpr (FA_DEC_SPART(D, GF)) {
+                /* Every row of [lo, hi) is live at decode (causal + window hold by construction),
+                 * so a thread's row is either live or past the tile's last row. */
+                float f[GF];
+#pragma unroll
+                for (int g = 0; g < GF; g++) f[g] = 0.0f;
+                if (tid < rmax) {
+                    /* [lane-group][head] row-major: element e of the row belongs to head e % GF. */
+                    const float* pp = Psm + (size_t)tid * 64u;
+#pragma unroll
+                    for (int j = 0; j < 16; j++) {
+                        const float4 v = *(const float4*)(pp + j * 4);
+                        f[(4 * j) % GF] += v.x;
+                        f[(4 * j + 1) % GF] += v.y;
+                        f[(4 * j + 2) % GF] += v.z;
+                        f[(4 * j + 3) % GF] += v.w;
+                    }
+                }
+#pragma unroll
+                for (int g = 0; g < GF; g++) {
+                    s[g] = (tid < rmax) ? f[g] * FA_SCALE(scale) : FA_NEG_INF;
+                    Ssm[g * FA_DEC_TILE + tid] = s[g];
+                }
+                __syncthreads();
+            } else {
 #pragma unroll
             for (int g = 0; g < GF; g++) s[g] = Ssm[g * FA_DEC_TILE + tid];
+            }
           } else
 #endif
           {

@@ -1043,6 +1043,59 @@ barriers): ~1%; tensor-core QK for the hd512 full layers (`PLOW_NV_FA_TC_GQA8_HD
 So the cost is per ROW (score: one 5-round lane reduction per (row, head); P.V: one V load per
 row-group), not per tile.
 
+### FlashDecode by sub-phase, and the score partials in smem (2026-09-21)
+
+Timing-only builds of the B=16 step (15.24 ms, attention 4.4): **score phase 2.71 ms** (K loads +
+dots 2.15, the per-(row, head) shuffle reductions 0.56), **P.V 1.16**, everything else (barriers,
+softmax reductions, Q staging, fold) ~0.5. At B=1 the split is 0.19 / 0.09 / 0.43 of 0.71: fixed
+cost. At ctx 8192 / B=4 (13.34): score 1.47, P.V 0.92 — the hd512/GF8 layers. P.V moves the same
+bytes 2.3x faster than score because it holds 8 V rows in flight and score only 2 (`WPR_RB`),
+and the shuffles serialize the loop.
+
+Landed: **`PLOW_NV_FA_SPART`** (+ `PLOW_NV_FA_WPR_RB256`), stamped by the manifest (`fa_spart`)
+for DENSE sm_90a packets. Lanes park 64/GF lane-group partials per (row, head) in smem, threads
+fold their own row after the barrier; hd256/GF2 then has no sync point in the score loop and
+holds 8 rows in flight at the same 239 registers. step_bench B=1/2/4/8/16: 11.03/11.45/11.98/
+13.04/15.24 -> **10.99/11.30/11.67/12.59/14.35**; ctx 8192 B=1/4 11.36/13.34 -> 11.30/12.99.
+Numerics: f32 CPU oracle, 10 cases (GF 2/4/8, multi-tile, window, odd tail) relL2 0.0016-0.0017 =
+baseline; served greedy consistency 14/16 + 16/16, no faults.
+NOTE `runtime/tests/sm120_interp_op_test.cu` no longer compiles against the op headers (4 stale
+call sites, none in the flash section); the oracle run used its helpers + flash section only, and
+a launch asking > 48 KiB of dynamic smem needs `cudaFuncSetAttribute(...MaxDynamicSharedMemorySize)`
+— without it the kernel silently does not run (all-zero output).
+
+Also stamped for dense packets: **`PLOW_NV_FA_TC_GQA8_HD512`** (the existing tensor-core QK + P.V
+for hd512/GQA8). It was ~1.5% at ctx 1024 and is the long-context term: ctx 8192 B=1/4
+11.30/12.99 -> 11.14/12.19 on top of the partials (control 11.36/13.34); oracle PASS. Full build
+`p12j` (partials + TC), step_bench B=1/2/4/8/16: **11.00/11.32/11.65/12.53/14.30** (was
+11.03/11.45/11.98/13.04/15.24); served greedy consistency 14/16 + 15/16, no faults.
+
+Negatives: 8 rows in flight without the per-head-dim split (255 registers, spills, every rung
+slower: 11.54/12.50/15.24); depth 16 (14.45 at B=16 vs 14.36); thread-per-row (`WPR=0`:
+12.09/12.84/15.81); P.V numerators stored group-contiguous for vector loads (neutral);
+out-of-line `d_flash_decode` (callees share the entry's register file: 233 registers but
+15.47 at B=16); NRN's block-wide sums without their barriers / cross-warp fold (11.02-11.03 vs
+11.03: barriers and the smem round trip are free, NRN's 5.9 us is its global loads and stores).
+26B: every partials form costs its per-slot MoE rung (B=4 9.57 -> 9.93, the extra 64 KiB smem
+claim) for -0.14 / -0.35 at B=8 / 16, so MoE packets keep the old score loop.
+
+### Sized, not started: vendor (cuBLASLt) attention for the hd512 global prefill layers
+
+Why: the px4 role runs at ~15% of peak and grows with KV (2.6 / 7.3 / ~15 / ~25 ms per launch at
+4K / 8K / 12K / 15K KV, x8 layers): ~400 ms of the 830 ms 15000/C1 TTFT, ~78 of 386 at 8192,
+~21 of 177 at 4096. QK^T + P.V as batched GEMMs are 0.134 TFLOP per 1K KV per 4096-row chunk
+(~2.4 ms at 15K at the measured 850 TFLOP/s) plus a masked softmax over the score tensor (2 GB
+bf16 at 15K -> must be tiled by query rows). Estimate: 15000/C1 830 -> ~550 (vLLM 675), 8192/C1
+386 -> ~340 (350), 4096/C1 177 -> ~168 (170).
+What it takes (survey 2026-09-21): no batched GEMM FFI exists (`device/cuda/lt.rs` binds
+`cublasLtMatmul` only, 2-D layouts, `StoredAlgo` keyed (m,n,k)); new role id + `MAX_ROLE` bump;
+emit pass isolating the hd512 FlashPrefill (already isolated under packed prefill) and nopping it;
+an `AttentionRoute` (2 Lt plans + softmax launch) next to `CublasLtDecodeRoute`; a masked-softmax
+kernel as a role cubin (ABI/sha gate) or host .so; packed requests become per-request calls (px4 is
+already serial per request); the fused epilogue into `at` must be replicated; not bit-identical to
+px4, so new exactness evidence. Global-layer K/V are linear ([slot][kvh][row][hd], mask = ~0), Q is
+[row][head][hd] — both usable as strided operands without a permute.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
