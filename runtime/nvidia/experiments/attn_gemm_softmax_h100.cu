@@ -47,6 +47,10 @@
 static const unsigned HEADS = 16, HD = 512;
 /* ATTN_S32=1: the score GEMM widens to f32 (bf16 x bf16 -> f32), P stays bf16. */
 static bool S32 = false;
+/* ATTN_PITCH_PAD: extra score columns per row beyond the 64-multiple (breaks power-of-two strides). */
+static unsigned PITCH_PAD = 0;
+/* ATTN_SM_WARP=1: the warp-per-row softmax entries. */
+static bool WARP = false;
 static const float LOG2E = 1.4426950408889634f;
 
 static uint16_t f2bf(float f) {
@@ -128,13 +132,17 @@ static void route(Lt& lt, const Bufs& d, unsigned q_rows, unsigned kv0, unsigned
         const unsigned qn = std::min(tile, q_rows - q0);
         const unsigned m = qn * HEADS;
         const unsigned n = kv0 + q0 + qn;
-        const unsigned ld = (n + 63u) & ~63u;
+        const unsigned ld = ((n + 63u) & ~63u) + PITCH_PAD;
         const uint16_t* q = d.q + (size_t)q0 * HEADS * HD;
         if (ev) cudaEventRecord(ev[0]);
         lt.run(0, m, n, ld, LOG2E, d.k, q, d.s);
         if (ev) cudaEventRecord(ev[1]);
         PlowAttnSoftmax a{d.s, m, n, ld, HEADS, kv0 + q0 + 1, 0};
-        if (S32)
+        if (WARP && S32)
+            plow_attn_softmax_w_f32<<<grid, 256>>>(a);
+        else if (WARP)
+            plow_attn_softmax_w<<<grid, 256>>>(a);
+        else if (S32)
             plow_attn_softmax_f32<<<grid, 256>>>(a);
         else
             plow_attn_softmax<<<grid, 256>>>(a);
@@ -206,7 +214,7 @@ static int check(Lt& lt) {
                 }
             }
         const double rel = std::sqrt(err2 / ref2);
-        printf("check %s q=%u kv0=%u tile=%u: relL2 vs f64 = %.3e\n", S32 ? "s32" : "s16", qr,
+        printf("check %s%s q=%u kv0=%u tile=%u: relL2 vs f64 = %.3e\n", S32 ? "s32" : "s16", WARP ? "w" : "", qr,
                kv0, tile, rel);
         bad += !(rel < 2e-2);
         cudaFree(d.q), cudaFree(d.k), cudaFree(d.v), cudaFree(d.o), cudaFree(d.s);
@@ -216,6 +224,8 @@ static int check(Lt& lt) {
 
 int main(int argc, char** argv) {
     S32 = getenv("ATTN_S32") && atoi(getenv("ATTN_S32"));
+    PITCH_PAD = getenv("ATTN_PITCH_PAD") ? atoi(getenv("ATTN_PITCH_PAD")) : 0;
+    WARP = getenv("ATTN_SM_WARP") && atoi(getenv("ATTN_SM_WARP"));
     Lt lt{};
     LK(cublasLtCreate(&lt.h));
     lt.ws_bytes = 256u << 20;
@@ -228,7 +238,9 @@ int main(int argc, char** argv) {
     const unsigned qr = atoi(argv[2]), kv0 = atoi(argv[3]), tile = atoi(argv[4]),
                    grid = atoi(argv[5]);
     const int reps = argc > 6 ? atoi(argv[6]) : 8;
-    const unsigned kv = kv0 + qr, ldmax = (kv + 63u) & ~63u;
+    const unsigned kv = kv0 + qr;
+    /* ATTN_SCRATCH_ROWS: size the scratch for this many KV columns (the engine sizes it for max_ctx). */
+    const unsigned ldmax = std::max((kv + 63u) & ~63u, (unsigned)atoi(getenv("ATTN_SCRATCH_ROWS") ? getenv("ATTN_SCRATCH_ROWS") : "0")) + PITCH_PAD;
     std::vector<uint16_t> q((size_t)qr * HEADS * HD), k((size_t)kv * HD), v((size_t)kv * HD);
     fill(q, 0.5f, 1);
     fill(k, 0.5f, 2);
@@ -279,9 +291,9 @@ int main(int argc, char** argv) {
             ph[i] = std::min(ph[i], ms);
         }
     }
-    printf("%s q=%u kv0=%u tile=%u grid=%u scratch=%.1f MiB | chunk-layer min %.3f med %.3f ms | "
+    printf("%s%s q=%u kv0=%u tile=%u grid=%u scratch=%.1f MiB | chunk-layer min %.3f med %.3f ms | "
            "last tile (%u x %u): qk %.3f softmax %.3f pv %.3f ms\n",
-           S32 ? "s32" : "s16", qr, kv0, tile, grid, sbytes / 1048576.0, total.front(),
+           S32 ? "s32" : "s16", WARP ? "w" : "", qr, kv0, tile, grid, sbytes / 1048576.0, total.front(),
            total[total.size() / 2],
            (qr - q0) * HEADS, kv, ph[0], ph[1], ph[2]);
     return 0;

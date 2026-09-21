@@ -11,12 +11,18 @@ use crate::asset::devblob::{DevProg, DevTensor};
 use crate::device::cuda::lt::{AttentionGemm as Gemm, Lt, Plan};
 
 pub(super) const SOFTMAX_OBJECT: &str = "attn_softmax_sm90a.cubin";
-const SOFTMAX_ENTRY: &str = "plow_attn_softmax";
-const SOFTMAX_ENTRY_F32: &str = "plow_attn_softmax_f32";
+/// The warp-per-row entries (coalesced); the thread-per-row ones stay in the object for A/Bs.
+const SOFTMAX_ENTRY: &str = "plow_attn_softmax_w";
+const SOFTMAX_ENTRY_F32: &str = "plow_attn_softmax_w_f32";
 /// Scores are produced in the log2 domain so the kernel's exp is the hardware exp2.
 const LOG2_E: f32 = std::f32::consts::LOG2_E;
-/// Score rows are padded to this many columns (the kernel loads whole 8-element vectors).
-const PITCH: u32 = 64;
+/// Score rows are padded to this many columns: the tail GEMM below reads P in 128-column
+/// pieces, and the kernel loads whole 8-element vectors.
+const PITCH: u32 = 128;
+/// cuBLASLt's BF16 kernels want the KV extent 8-aligned (measured 2.6x slower otherwise). V
+/// rows past a request's `kvlen` may hold anything, so the last tile's `P.V` stops at a
+/// 128-aligned column and finishes on a zero-padded copy of the remaining rows, this many.
+const TAIL_ROWS: u32 = 128;
 const PLAN_CACHE: usize = 4096;
 
 /// One `FlashPrefill` site served by the route. Addresses are the slot-0 tensor bases.
@@ -28,7 +34,7 @@ pub(super) struct Site {
     v: u64,
     output: u64,
     pub(super) heads: u32,
-    head_dim: u32,
+    pub(super) head_dim: u32,
     slot_bytes: u64,
     scale: f32,
 }
@@ -77,6 +83,7 @@ pub(super) fn sites(
             || head_dim == 0
             || head_dim % 8 != 0
             || kv_stride == 0
+            || kv_stride % 8 != 0
             || op.fj[2] != u32::MAX
             || op.t[..6].contains(&TENSOR_NONE16)
             || entries.iter().any(|e| e.inst as usize != instruction)
@@ -127,7 +134,9 @@ pub(super) struct AttentionGemm {
     /// Scores land in f32 (P stays bf16, at the start of each f32 score row).
     scores_f32: bool,
     scratch: DeviceMem,
-    plans: std::collections::HashMap<(Gemm, u32, u32, u32), Plan>,
+    /// `TAIL_ROWS` KV rows for the last tile's remainder GEMM.
+    vtail: DeviceMem,
+    plans: std::collections::HashMap<(Gemm, u32, u32, u32, u32), Plan>,
 }
 
 impl AttentionGemm {
@@ -136,6 +145,7 @@ impl AttentionGemm {
         lt: Arc<Lt>,
         object: &Path,
         max_heads: u32,
+        max_head_dim: u32,
         max_ctx: usize,
     ) -> Result<Self> {
         let config = &crate::config::RuntimeConfig::get().nv;
@@ -162,6 +172,7 @@ impl AttentionGemm {
         let pitch = (max_ctx as u64).next_multiple_of(u64::from(PITCH));
         let element = if scores_f32 { 4 } else { 2 };
         let scratch = be.alloc(0, u64::from(tile_rows) * u64::from(max_heads) * pitch * element)?;
+        let vtail = be.alloc(0, u64::from(TAIL_ROWS) * u64::from(max_head_dim) * 2)?;
         tracing::info!(
             object = %object.display(),
             tile_rows,
@@ -178,6 +189,7 @@ impl AttentionGemm {
             tile_rows,
             scores_f32,
             scratch,
+            vtail,
             plans: std::collections::HashMap::new(),
         })
     }
@@ -192,7 +204,7 @@ impl AttentionGemm {
         }
         // P is bf16 at the start of each score row: its pitch counts the f32 row in bf16 units.
         let pitch = if self.scores_f32 && kind == Gemm::Values { 2 * pitch } else { pitch };
-        match self.plans.entry((kind, m, n, head_dim)) {
+        match self.plans.entry((kind, m, n, pitch, head_dim)) {
             std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
             std::collections::hash_map::Entry::Vacant(e) => Ok(e.insert(self.lt.attention_plan(
                 kind,
@@ -214,12 +226,16 @@ impl AttentionGemm {
         stream: &CudaStream,
     ) -> Result<()> {
         let row_bytes = u64::from(site.heads) * u64::from(site.head_dim) * 2;
+        let kv_row_bytes = u64::from(site.head_dim) * 2;
+        let slot_rows = (site.slot_bytes / kv_row_bytes) as u32;
+        let element = if self.scores_f32 { 4 } else { 2 };
         let mut real = 0;
         for &[q0, qlen, slot, kvlen] in requests {
             let past = kvlen.checked_sub(qlen).ok_or_else(|| {
                 RuntimeError::Rejected("attention request is longer than its KV".into())
             })?;
-            if u64::from(kvlen) * u64::from(site.head_dim) * 2 > site.slot_bytes
+            if kvlen > slot_rows
+                || u64::from(TAIL_ROWS) * kv_row_bytes > self.vtail.len
                 || q0.checked_add(qlen).is_none_or(|end| end > rows)
             {
                 return Err(RuntimeError::Rejected(
@@ -233,8 +249,11 @@ impl AttentionGemm {
                 let tile = self.tile_rows.min(qlen - done);
                 let m = tile * site.heads;
                 let n = past + done + tile;
-                let pitch = n.next_multiple_of(PITCH);
-                let element = if self.scores_f32 { 4 } else { 2 };
+                // The padded score columns are masked: their K rows are either the request's own
+                // rows below kvlen or whatever lies past it (slot_rows is 8-aligned), never read
+                // back. P is zero from each row's causal limit to the pitch.
+                let n8 = n.next_multiple_of(8);
+                let pitch = n8.next_multiple_of(PITCH);
                 if u64::from(m) * u64::from(pitch) * element > self.scratch.len {
                     return Err(RuntimeError::Rejected(
                         "attention score tile exceeds its scratch".into(),
@@ -242,7 +261,7 @@ impl AttentionGemm {
                 }
                 let offset = u64::from(q0 + done) * row_bytes;
                 let scratch = self.scratch.base;
-                self.plan(Gemm::Scores, m, n, pitch, site.head_dim)?.matmul(
+                self.plan(Gemm::Scores, m, n8, pitch, site.head_dim)?.matmul(
                     site.scale * LOG2_E,
                     k,
                     site.q + offset,
@@ -252,7 +271,7 @@ impl AttentionGemm {
                 let mut args = SoftmaxArgs {
                     scores: scratch,
                     rows: m,
-                    cols: n,
+                    cols: pitch,
                     pitch,
                     heads: site.heads,
                     first: past + done + 1,
@@ -261,13 +280,43 @@ impl AttentionGemm {
                 let mut params = [&mut args as *mut SoftmaxArgs as *mut std::ffi::c_void];
                 self.be
                     .launch_kernel(self.softmax, self.grid, BLOCK, 0, &mut params, Some(stream))?;
-                self.plan(Gemm::Values, m, n, pitch, site.head_dim)?.matmul(
-                    1.0,
-                    v,
-                    scratch,
-                    site.output + offset,
-                    stream,
-                )?;
+                let out = site.output + offset;
+                // V rows below kvlen are the request's own; past it they may hold anything.
+                let aligned = if n8 > kvlen { n & !(TAIL_ROWS - 1) } else { n8 };
+                if aligned > 0 {
+                    self.plan(Gemm::Values, m, aligned, pitch, site.head_dim)?.matmul(
+                        1.0,
+                        v,
+                        scratch,
+                        out,
+                        stream,
+                    )?;
+                }
+                if aligned < n8 {
+                    let rem = kvlen - aligned;
+                    let vtail = self.vtail.base;
+                    self.be.memset_d8_async(
+                        vtail + u64::from(rem) * kv_row_bytes,
+                        0,
+                        (u64::from(TAIL_ROWS - rem) * kv_row_bytes) as usize,
+                        stream,
+                    )?;
+                    self.be.memcpy_dtod_async(
+                        vtail,
+                        v + u64::from(aligned) * kv_row_bytes,
+                        u64::from(rem) * kv_row_bytes,
+                        stream,
+                    )?;
+                    // P is bf16 whatever the score type: column `aligned` sits 2*aligned bytes in.
+                    self.plan(Gemm::Values, m, TAIL_ROWS, pitch, site.head_dim)?.matmul_beta(
+                        1.0,
+                        if aligned > 0 { 1.0 } else { 0.0 },
+                        vtail,
+                        scratch + u64::from(aligned) * 2,
+                        out,
+                        stream,
+                    )?;
+                }
                 done += tile;
             }
             real = real.max(q0 + qlen);
