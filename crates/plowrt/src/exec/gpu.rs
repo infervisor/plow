@@ -5533,17 +5533,17 @@ impl GpuEngine {
         {
             let warmup_slots = engine.batch.min(4);
             let t_warmup = std::time::Instant::now();
+            // Routed buckets (attention-GEMM segments) are warmed too: the route only fires
+            // for a slice >= pf_attn_gemm_min_rows, so a pack of short slices in a >= 1024-row
+            // bucket takes the graph, and capturing it on first use cost 23 ms each on the
+            // first C16 burst (12B 128/C16: buckets 1024 and 1088 inside the P99 wave).
             for bi in 0..engine.prefill.len() {
                 if uses_segmented_prefill(
                     engine.seg_pf.is_some(),
                     false,
                     engine.prefill[bi].seg_class.len(),
                     &engine.prefill[bi].packet_segment_roles,
-                ) && engine.prefill[bi]
-                    .attention_gemm_segments
-                    .iter()
-                    .all(Option::is_none)
-                {
+                ) {
                     for b in 0..warmup_slots {
                         let mut arg = engine.prefill[bi].kernarg;
                         arg.tensors = engine.tens_slot_base(b);

@@ -500,7 +500,7 @@ pub fn spawn(
             .and_then(|widths| match DecodeRungs::new(widths, capacity) {
                 Ok(rungs) if rungs.len() > 1 => Some(
                     RungController::new(rungs)
-                        .with_cold_demand(crate::config::RuntimeConfig::get().rung_cold_demand),
+                        .with_fast_probe(crate::config::RuntimeConfig::get().rung_fast_probe),
                 ),
                 Ok(_) => None,
                 Err(err) => {
