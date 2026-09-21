@@ -1232,6 +1232,19 @@ px4, so new exactness evidence. Global-layer K/V are linear ([slot][kvh][row][hd
   aligned (same-prefix prompts share exactly 2048 leading tokens incl. BOS, verified with the
   tokenizer). Re-run with 1024-row checkpoints (`cache2_12b_*`) pending; the default should change.
 
+* Prefix cache-on follow-up (`cache2_12b_*`, `cache3_12b_*`): 1024-row checkpoints
+  (`PLOW_AMD_PREFIX_FINE_ROWS=1024`) attach 15 of 35 / 29 of 67 lookups, C4 TTFT 291 -> 217 ms, C16
+  541 -> 376. The rest miss on the caps, not the match: `PLOW_VMM_CACHE_MEMORY_UTILIZATION` defaults
+  to 0.05 (~4 GiB = twelve 320 MiB sliding-window snapshots) and `PLOW_KV_POOL_MIB` to 512 (three of
+  the eight 134 MB 2048-row prefix blocks), while every request publishes its own end-of-prompt AND
+  end-of-generation boundary (2272 / 2400 rows, 320 MiB each) and evicts the shared checkpoints.
+  `FINE_ROWS=2048 PLOW_VMM_CACHE_MIB=9216 PLOW_KV_POOL_MIB=2048`: 17 of 35 / 39 of 67 attached, C4
+  TTFT 177 ms (vLLM 121), C16 343 (vLLM 283), TPOT 13.0 / 19.2 (vLLM 11.1 / 12.4), peak 75.4-76.3
+  GiB, 0 faults. Remaining misses: first occurrence of each prefix, and same-prefix requests that
+  arrive while the first one is still in prefill (publish happens at prefill end). Next: make the
+  checkpoint publish and larger caps the defaults (knob defaults only), and consider skipping the
+  end-of-generation boundary when the sequence will not be continued.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |

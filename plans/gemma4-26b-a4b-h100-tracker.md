@@ -1452,3 +1452,13 @@ column"). 26B-specific numbers, packet `p26i`, 16 prompts:
   `cuMemAlloc(vmm snapshot): CUDA_ERROR_OUT_OF_MEMORY` publish failures, peak 79.0 GiB, TTFT
   stalls to 3.1 s. No valid cache-on figure for the 26B until the KV budget yields room for the
   pool.
+* p26lt FINAL ladder (`beb22229`, quiet host, 0 faults, MOE_PREFILL route confirmed in the serve
+  log): TTFT -8 to -11% vs p26i at every prompt length. Now ahead of vLLM at 128/C1 0.57x, 1024/C1
+  0.92x, 128/C4 0.53x, 1024/C4 0.90x, 4096/C4 0.93x, 128/C16 0.82x, 1024/C16 0.90x, 4096/C16 0.80x,
+  8192/C16 0.88x; parity 8192/C4 (457.9 vs 456.3); behind 4096-15000/C1 (1.16-1.39x), 15000/C4
+  1.24x, 15000/C16 1.62x. TPOT unchanged (C1 5.60-5.98, C16 15.3-61.1); tok/s C16 1015 / 835 / 529 /
+  343 / 192. Standing 10/60 (was 7/60). P99 TTFT is behind at C4/C16 in every cell where the mean is
+  ahead (1.35-1.62x): the pack policy serves the queue front early and the tail late.
+* Prefix cache-on: not re-run; the 12B follow-up (dense tracker, report day) shows the cap defaults
+  are the limiter, but the 26B has no room for a 9 GiB snapshot cache beside 47 GiB weights + 30 GiB
+  KV at this packet's ring; needs a smaller-ring cache packet or a KV budget trade.
