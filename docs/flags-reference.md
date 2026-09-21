@@ -245,7 +245,7 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | — | `--emit-decode-objects DIR` | unset | Bind packet-selected CUDA objects from `DIR` to every decode program, including a single-program B1 packet. Packet metadata selects them at load; there is no runtime route flag. |
 | — | `--emit-decode-projection-tuning` | false | Apply measured per-projection bindings. Requires decode objects, SM90a, TP1, and a supported dense emitter. |
 | `PLOW_MAX_CHUNK` | `--emit-max-chunk` | unset | Largest prefill chunk rows (power of two, ≤ 8192). Caps the bucket ladder and the runtime PLOW_PF_INTERLEAVE ceiling. |
-| `PLOW_MAX_REQUEST_CHUNK` | `--emit-max-request-chunk` | unset | Maximum real rows one request contributes to a packed prefill launch. |
+| `PLOW_MAX_REQUEST_CHUNK` | `--emit-max-request-chunk` | unset | Maximum real rows one request contributes to a packed prefill launch (must be a prefill rung). Below `PLOW_MAX_CHUNK` it also sizes the sliding-window KV ring: `next_pow2(window + request_chunk - 1)` rows per slot instead of `window + max_chunk - 1`, so a 4096-row launch packs 1024-row slices onto 2048-row rings. |
 | `PLOW_GEMV_SPLIT` | `--gemv-split` | 1 | Emit S·n_cu decode slices for Gemv packets (finer work-stealing). |
 | `PLOW_GEMV_DECODE_ROLE` | `--gemv-decode-role` | false | Select the isolated BF16 M1 GEMV role with 512 threads. Requires plain BF16 SM90a and one B1 decode rung. |
 | `PLOW_DECODE_TILED` | `--decode-tiled` | false | AMD: emit prefill (tiled) opcodes into the decode bucket. |
