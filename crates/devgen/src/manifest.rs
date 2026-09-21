@@ -1044,9 +1044,14 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
     // * `fa_tc_hd512`: the hd512/GQA8 layers score and accumulate on the tensor cores
     //   (PLOW_NV_FA_TC_GQA8_HD512). Neutral at ctx 1024 (10.99/11.67/14.35 -> 11.02/11.66/14.29),
     //   and the long-context term: ctx 8192 B=1/4 11.30/12.99 -> 11.14/12.19.
+    // * A MoE packet takes the hd256 depth alone (chosen per tile, no partials, no extra claim):
+    //   26B B=8/16 12.76/15.52 -> 12.69/15.29 at depth 4 with B<=4 unchanged (depth 8: 15.24, but
+    //   +0.06 at B=2/4).
     if s.moe_down_inter == 0 && s.decode_batch >= 2 {
         t.insert("fa_spart".into(), json!(8));
         t.insert("fa_tc_hd512".into(), json!(1));
+    } else if s.moe_down_inter > 0 && s.decode_batch >= 8 {
+        t.insert("fa_rb256".into(), json!(4));
     }
     if s.full_kv_heads == 1 && s.gqa > 0 {
         // The template is instantiated at 1|2|4|8 only.
@@ -2724,6 +2729,11 @@ pub fn config_header(manifest: &Value) -> String {
                 out.push_str(&format!(
                     "#ifndef PLOW_NV_FA_SPART\n#define PLOW_NV_FA_SPART 1\n#endif\n\
                      #ifndef PLOW_NV_FA_WPR_RB256\n#define PLOW_NV_FA_WPR_RB256 {v}\n#endif\n"
+                ));
+            }
+            if let Some(v) = t.get("fa_rb256").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_FA_WPR_RB256\n#define PLOW_NV_FA_WPR_RB256 {v}\n#endif\n"
                 ));
             }
         }
