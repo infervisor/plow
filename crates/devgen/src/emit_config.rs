@@ -1087,6 +1087,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMMA4_SM90_HD256_GQA2_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemma4_sm90_hd256_gqa2_role: bool,
 
+    /// With the paired-GQA2 role, also route the appended prefill rungs above 4096 (4160, 4224).
+    #[arg(long, env = "PLOW_GEMMA4_SM90_HD256_GQA2_WIDE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub gemma4_sm90_hd256_gqa2_wide: bool,
+
     /// Route Gemma-4 M4096/M8192 global attention through the 512-thread px4 Hopper object.
     #[arg(long, env = "PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemma4_sm90_hd512_px4_bq64_role: bool,
@@ -1476,6 +1480,7 @@ impl EmitConfig {
             gemma4_sm90_gemm_glu_role: env_bool("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"),
             gemma4_sm90_w8a8_gemm_glu_role: env_bool("PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE"),
             gemma4_sm90_hd256_gqa2_role: env_bool("PLOW_GEMMA4_SM90_HD256_GQA2_ROLE"),
+            gemma4_sm90_hd256_gqa2_wide: env_bool("PLOW_GEMMA4_SM90_HD256_GQA2_WIDE"),
             gemma4_sm90_hd512_px4_bq64_role: env_bool("PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE"),
             fp8_pf_gemm_role: env_bool("PLOW_FP8_PF_GEMM_ROLE"),
             fp8_pf_isolate: env_bool("PLOW_QWEN_FP8_PF_ISOLATE"),

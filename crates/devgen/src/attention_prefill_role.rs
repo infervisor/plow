@@ -436,8 +436,18 @@ fn eligible_for(op: &packet::dev::DevInst, n_cu: u16, selection: &Selection) -> 
                 && op.t[6] == TENSOR_NONE
                 && op.t[7] != TENSOR_NONE
                 && op.f[0].is_finite()
+                // the paired object traps on any split count but one
+                && (selection.kind != Kind::Hd256Gqa2Bkv32 || op.i[7] == 1)
         }
     }
+}
+
+/// Prefill rungs the paired-GQA2 object takes: exact M4096/M8192, where it was qualified, and with
+/// `wide` (`PLOW_GEMMA4_SM90_HD256_GQA2_WIDE`) also the appended rungs above 4096 (4160, 4224).
+/// Those run the same one-split geometry over whole 64-row query tiles; without them a 4096-token
+/// prompt plus BOS, and every pack filling a 4224-row launch, falls back to the generic flash.
+pub(crate) fn gqa2_rung(rows: u32, wide: bool) -> bool {
+    matches!(rows, 4096 | 8192) || (wide && rows > 4096 && rows % 64 == 0)
 }
 
 fn is_hd512_attention(op: &packet::dev::DevInst) -> bool {
@@ -552,11 +562,13 @@ pub(crate) fn apply_output_object(
             .iter()
             .enumerate()
             .filter(|(index, program)| {
-                matches!(model.prog_t[*index], 4096 | 8192)
-                    && program
-                        .insts
-                        .iter()
-                        .any(packet::dev::DevInst::is_hd256_gqa2_sliding_prefill)
+                gqa2_rung(
+                    model.prog_t[*index],
+                    crate::emit_config::active().gemma4_sm90_hd256_gqa2_wide,
+                ) && program
+                    .insts
+                    .iter()
+                    .any(packet::dev::DevInst::is_hd256_gqa2_sliding_prefill)
             })
             .map(|(index, _)| index)
             .collect::<BTreeSet<_>>();
