@@ -29,7 +29,7 @@ Gemma-4-12B (`config.json`): 48 layers, 40 sliding (hd 256, 8 KV heads, window 1
 | ladder16k / p12mq: chunk 4096 | 8192 | 2.5 GiB | 16 | 40 GiB | 65.7-67.7 GiB |
 | c32-16k / p12c32b: chunk 1024, roles off | 2048 | 640 MiB | 32 | 20 GiB | 45.5-48.5 GiB |
 | p12c32c: chunk 2048, roles off | 4096 | 1.25 GiB | 32 | 40 GiB | 66-71 GiB |
-| **c32-req1k-16k (this work): chunk 4096, request 1024, roles on** | 2048 | 640 MiB | 32 | 20 GiB | expected ~52-56 GiB |
+| **c32-req1k-16k (this work): chunk 4096, request 1024, roles on** | 2048 | 640 MiB | 32 | 20 GiB | **45.1-53.0 GiB measured** |
 
 Ring rule (`kv_ring_rows`): `next_pow2(window + chunk - 1)`; the kernels index `row & (ring-1)`.
 The invariant (dev_isa.h "SLIDING-WINDOW KV RING"): a launch writes ALL its K/V rows before any
@@ -207,3 +207,53 @@ Validation plan: (1) ring A/B on the c32c null (step_bench B=16, same tree/objec
   Caveat: the A/B ran without the exclusive CPU-quiet lock (a shared-lock `cargo build` from
   another agent was idling the leased GPU behind `quietx.sh`); the arms are GPU-bound kernel
   steps, interleaved, sd 0.05 ms.
+
+#### Served `high_concurrency` (p12rq, 10 cells; TTFT ms / TPOT ms / tok/s; peak GiB in the last column)
+
+| in / C | **p12rq req1k (32 slots, chunk 4096)** | p12r (16 slots, chunk 4096) | p12c32b (32 slots, chunk 1024) | vLLM 0.28 e2e | p12rq peak |
+|---|---|---|---|---|---:|
+| 128 / 16 | **108 / 11.83 / 1271** | 78 / 11.85 / 1286 | 68 / 13.05 / 1179 | 101 / 10.96 / 1370 | 46.0 |
+| 128 / 32 | **199 / 14.56 / 1996** | 1292 / 11.59 / 1297 | 114 / 16.63 / 1808 | 154 / 11.71 / 2487 | 47.0 |
+| 1024 / 16 | **336 / 16.79 / 826** | 323 / 16.94 / 824 | 240 / 18.46 / 783 | 408 / 13.79 / 946 | 47.0 |
+| 1024 / 32 | **591 / 23.99 / 1110** | 2081 / 16.79 / 860 | 568 / 27.01 / 986 | 693 / 18.31 / 1351 | 47.0 |
+| 4096 / 16 | **1126 / 30.22 / 410** | 678 / 30.84 / 443 | 806 / 35.61 / 376 | 1164 / 22.79 / 503 | 47.5 |
+| 4096 / 32 | **2142 / 48.51 / 484** | 4311 / 31.82 / 444 | 2420 / 62.34 / 372 | 1991 / 37.88 / 598 | 49.0 |
+| 8192 / 16 | **2168 / 45.84 / 254** | 1265 / 50.39 / 265 | 1790 / 67.87 / 192 | 1955 / 38.04 / 301 | 48.5 |
+| 8192 / 32 | **4291 / 79.00 / 280** | 7552 / 51.44 / 265 | 10314 / 71.71 / 190 | 3648 / 67.18 / 334 | 51.0 |
+| 15000 / 16 | **4063 / 83.01 / 139** | 2449 / 86.47 / 151 | 10443 / 86.28 / 93 | 3086 / 67.79 / 174 | 49.5 |
+| 15000 / 32 | **8271 / 143.88 / 151** | 13646 / 87.34 / 152 | 27062 / 88.62 / 90 | 6440 / 123.45 / 184 | 53.0 |
+
+#### Served `realtime` (p12rq, 10 cells; TTFT ms / TPOT ms / tok/s; peak GiB in the last column)
+
+| in / C | **p12rq req1k (32 slots, chunk 4096)** | p12r (16 slots, chunk 4096) | p12c32b (32 slots, chunk 1024) | vLLM 0.28 e2e | p12rq peak |
+|---|---|---|---|---|---:|
+| 128 / 1 | **19 / 10.79 / 92** | 18 / 10.53 / 94 | - | 31 / 10.54 / 94 | 45.1 |
+| 128 / 4 | **38 / 11.08 / 354** | 39 / 10.80 / 362 | - | 56 / 10.56 / 366 | 45.3 |
+| 1024 / 1 | **47 / 10.86 / 90** | 47 / 10.61 / 92 | - | 47 / 10.61 / 92 | 45.3 |
+| 1024 / 4 | **103 / 12.11 / 312** | 103 / 11.83 / 318 | - | 131 / 11.14 / 331 | 45.3 |
+| 4096 / 1 | **188 / 10.90 / 81** | 170 / 10.64 / 84 | - | 171 / 10.62 / 84 | 45.3 |
+| 4096 / 4 | **418 / 14.53 / 225** | 332 / 14.10 / 241 | - | 468 / 12.14 / 255 | 45.5 |
+| 8192 / 1 | **387 / 10.93 / 72** | 360 / 10.67 / 75 | - | 348 / 10.62 / 75 | 45.5 |
+| 8192 / 4 | **706 / 18.85 / 164** | 718 / 17.50 / 174 | - | 995 / 13.60 / 188 | 45.8 |
+| 15000 / 1 | **774 / 10.99 / 59** | 750 / 10.74 / 60 | - | 673 / 10.63 / 63 | 45.8 |
+| 15000 / 4 | **1329 / 26.26 / 109** | 1478 / 22.72 / 117 | - | 1667 / 18.13 / 129 | 46.0 |
+
+#### Reading (both profiles, 17:01-17:38 UTC, quiet host, 0 faults)
+
+* Memory: 45-53 GiB at 32 slots with the attention roles on (p12r 65-69 GiB at 16 slots).
+* C32: the best plow packet in every cell but 128/1024 TTFT (p12c32b 114/568 vs 199/591): 8192/C32
+  7552 -> 4291 ms, 15000/C32 13646 -> 8271 (p12c32b 10314/27062); decode 1996 tok/s at 128/C32 vs
+  p12c32b's 1808. Still behind vLLM at 4096+/C32 (1991/3648/6441) — the adoption gate (8192/C32 <
+  3648) is NOT met. Beats vLLM at 1024/C16 (336 vs 408) and 1024/C32 (591 vs 693).
+* C16: +66-72% TTFT vs p12r at 4096/8192/15000 (1126/2168/4063 vs 678/1265/2449); TPOT level or
+  better. A 4096-row launch carries four requests' 1024-row slices (Greedy; the turn is held until the
+  pack's last request finishes, `mux.rs last_finished`), so four requests finish together after four
+  launches instead of one per launch. The 128/C16 +30 ms (108 vs 78) with identical launch shapes is
+  NOT explained by the cap — unattributed (PACKLOG diag prepared, `diag.sh`).
+* C1/C4: 128/1024 level; C1 4096/8192/15000 +11/+7/+3% (188/387/774 vs 170/360/750: 1024-row
+  launches per request, as the cost model predicted); C4 4096 +26% (418 vs 332), 8192/15000 -2/-10%
+  (706/1329 vs 718/1478). TPOT +0.2-0.4 ms everywhere (the 32-slot decode object).
+* Verdict: req1k REPLACES p12c32b as the 32-slot / C32 serving packet; it does NOT replace p12r for
+  C1/C4/C16. One packet winning both needs item 3 (in-program sub-chunk pipeline: a single request
+  keeps 4096-row launches on a 2048-row ring). The live-rings A/B (Q2) was gated on adoption and not
+  run. Ledger: cell `gemma4-12b.h100.bf16-c32-16k` (both sessions).

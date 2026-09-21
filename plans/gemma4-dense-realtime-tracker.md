@@ -1267,7 +1267,11 @@ px4, so new exactness evidence. Global-layer K/V are linear ([slot][kvh][row][hd
   2.16 MB), not the ring. The runtime already caps request slices (`packed_prefill.rs
   Manifest::validate`); only devgen's bucket-ladder assert measured the launch chunk. New recipe
   `gemma4-12b.h100.bf16-c32-req1k-16k.toml`: 4096-row launches, 1024-row request slices, ring 2048
-  (640 MiB/slot), 32 slots, roles on; ladder pending. Dynamic slots exist (`PLOW_VMM_LIVE=1
+  (640 MiB/slot), 32 slots, roles on. MEASURED (17:01-17:38 UTC, both profiles, 0 faults, peak 45-53
+  GiB): C32 TTFT 199/591/2142/4291/8271 (p12c32b 114/568/2420/10314/27062; vLLM 154/693/1991/3648/
+  6441), 1996 tok/s at 128/C32; C16 long prompts +66-72% vs p12r (four 1024-row slices per launch
+  finish together); C1 4096+ +3-11%, C4 mixed (4096 +26%, 15000 -10%). Verdict: replaces p12c32b as
+  the 32-slot packet, not p12r; 8192/C32 gate vs vLLM (3648) not met. Dynamic slots exist (`PLOW_VMM_LIVE=1
   PLOW_VMM_LIVE_RINGS=1`, unmeasured). plowc-as-JIT not needed: a geometry change is a 4-9 s devblob
   re-emit against existing objects.
 
