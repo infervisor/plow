@@ -67,6 +67,7 @@ api! {
     cublasLtMatmulDescSetAttribute: fn(Handle, i32, *const c_void, usize) -> Status,
     cublasLtMatrixLayoutCreate: fn(*mut Handle, i32, u64, u64, i64) -> Status,
     cublasLtMatrixLayoutDestroy: fn(Handle) -> Status,
+    cublasLtMatrixLayoutSetAttribute: fn(Handle, i32, *const c_void, usize) -> Status,
     cublasLtMatmulPreferenceCreate: fn(*mut Handle) -> Status,
     cublasLtMatmulPreferenceDestroy: fn(Handle) -> Status,
     cublasLtMatmulPreferenceSetAttribute: fn(Handle, i32, *const c_void, usize) -> Status,
@@ -358,6 +359,11 @@ impl Lt {
     /// scores when `scores_f32` (bf16 x bf16 -> f32), `Values` always reads bf16 probabilities.
     /// The shape is only known at launch, so the algorithm is the first heuristic result: no
     /// load-time timing, no stored table.
+    ///
+    /// `group > 1` is the GQA form: a strided batch of `group` query heads sharing one K/V
+    /// head (batch stride 0). Q, S and O rows then interleave `heads` heads: row `r` of batch
+    /// `b` is `r * heads + b` in head units, so the score tile keeps the one-KV-head layout.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn attention_plan(
         self: &Arc<Self>,
         kind: AttentionGemm,
@@ -366,6 +372,8 @@ impl Lt {
         n: u32,
         ld: u32,
         hd: u32,
+        group: u32,
+        heads: u32,
     ) -> Result<Plan> {
         self.be.bind()?;
         let mut plan = Plan {
@@ -378,17 +386,18 @@ impl Lt {
             algo: Algo::default(),
         };
         let (m, n, ld, hd) = (m as u64, n as u64, ld as i64, hd as u64);
-        // CUDA header dtypes: BF16 = 14, FP32 = 0.
+        let (batch, rows) = if group > 1 { (group as i32, heads as i64) } else { (1, 1) };
+        // (dtype, rows, cols, ld, batch stride); CUDA header dtypes: BF16 = 14, FP32 = 0.
         let layouts = match kind {
             AttentionGemm::Scores => [
-                (14, hd, n, hd as i64),
-                (14, hd, m, hd as i64),
-                (if scores_f32 { 0 } else { 14 }, n, m, ld),
+                (14, hd, n, hd as i64, 0),
+                (14, hd, m, rows * hd as i64, hd as i64),
+                (if scores_f32 { 0 } else { 14 }, n, m, rows * ld, ld),
             ],
             AttentionGemm::Values => [
-                (14, hd, n, hd as i64),
-                (14, n, m, ld),
-                (14, hd, m, hd as i64),
+                (14, hd, n, hd as i64, 0),
+                (14, n, m, rows * ld, ld),
+                (14, hd, m, rows * hd as i64, hd as i64),
             ],
         };
         let mut raw = std::ptr::null_mut();
@@ -411,7 +420,7 @@ impl Lt {
                     "Lt attention transpose",
                 )?;
             }
-            for (dst, (dtype, rows, cols, pitch)) in
+            for (dst, (dtype, rows, cols, pitch, stride)) in
                 [&mut plan.w, &mut plan.a, &mut plan.c].into_iter().zip(layouts)
             {
                 raw = std::ptr::null_mut();
@@ -420,6 +429,27 @@ impl Lt {
                     "Lt attention layout",
                 )?;
                 *dst = raw as usize;
+                if batch > 1 {
+                    // Layout attributes: BATCH_COUNT = 5 (i32), STRIDED_BATCH_OFFSET = 6 (i64).
+                    check(
+                        (self.api.cublasLtMatrixLayoutSetAttribute)(
+                            raw,
+                            5,
+                            &batch as *const _ as *const c_void,
+                            size_of::<i32>(),
+                        ),
+                        "Lt attention batch",
+                    )?;
+                    check(
+                        (self.api.cublasLtMatrixLayoutSetAttribute)(
+                            raw,
+                            6,
+                            &stride as *const i64 as *const c_void,
+                            size_of::<i64>(),
+                        ),
+                        "Lt attention batch stride",
+                    )?;
+                }
             }
             let mut pref = std::ptr::null_mut();
             check(
