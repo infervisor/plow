@@ -1271,6 +1271,38 @@ px4, so new exactness evidence. Global-layer K/V are linear ([slot][kvh][row][hd
   PLOW_VMM_LIVE_RINGS=1`, unmeasured). plowc-as-JIT not needed: a geometry change is a 4-9 s devblob
   re-emit against existing objects.
 
+### Batched decode step, attributed (2026-09-21 evening, agent/dense-batched-decode, packet p12r object)
+
+step_bench ms (96 timed steps, sd 0.01-0.08), p12r decode object: B=1 10.55 / 10.60 / 10.66 (ctx 192 /
+1024 / 8192); B=4 10.73 / 11.07 / 11.36; B=16 11.46 / 12.90 / 13.36 / 13.95 (192 / 1024 / 4096 / 8192).
+ctx 15000 faults in step_bench's single-call 15000-row `prefill_slot` (`prefill chunk (seg graph)`,
+unmodified object; served 15000 cells pass) -- harness, not decode.
+
+* **Attention bodies out** (`PLOW_NV_ABLATE_LO` FlashDecode+FlashMerge): B=1 9.90, B=4 10.07 (every ctx),
+  B=16 10.48 (every ctx). So attention = 0.97 / 2.42 / 3.46 ms at B=16 (ctx 192 / 1024 / 8192), 0.67 /
+  1.00 / 1.29 at B=4, 0.70 at B=1; everything else scales only +0.58 ms from B=1 to B=16.
+* **Sub-phase (B=16, phase skipped in the kernel)**: score walk 0.32 / 1.00 / 1.40, P.V 0.37 / 0.98 /
+  1.59, softmax reductions 0.02 / 0.04 (free); rest (Q staging, barriers, fold, merge) 0.28 / 0.44 / 0.47.
+  KV bytes at B=16 ctx 1024 are 5.7 GB = 1.7 ms at 3.35 TB/s: score+P.V (1.98) run at ~85% of the HBM
+  floor, so the sliding-layer kernel is NOT the lever at ctx >= 1024. At ctx 192 attention runs at 3x its
+  0.33 ms byte floor: fixed per-item latency (block-0 trace: FlashDecode body 12.6 us/item, FlashMerge
+  gate 2.4 + body 2.8 us, 48 layers).
+* **Trace (block 0, B=16 ctx 192)**: Gemv gate 34.0M / body 55.7M kcyc, GemvGlu 2.9 / 54.1, GemvQkv
+  5.6 / 19.9, FlashDecode 2.5 / 12.9, GemvArgmax 0.15 / 15.6, NRN 11.9 / 2.6, FlashMerge 2.5 / 2.9,
+  HNR 2.4 / 0.9. Gate share 26%; NRN's gate (1 block/row waiting on the o_proj/down fan-in) and the
+  Gemv gates behind FlashMerge are the serialized stages.
+* **Warp-autonomous hd256/GF2 item** (`PLOW_NV_FA_WAUTO`, emit knob `PLOW_FA_WAUTO`, opt-in, off):
+  each warp streams 16-row chunks with K fragments and V rows in flight together and folds 8 online
+  softmax states once per item. Oracle 10/10 PASS (relL2 0.00164-0.00174, = baseline); step_bench
+  B=16 11.39 / 12.81 / 13.85 (-0.07 / -0.09 / -0.10), B=4 11.07 (0), B=1 10.55 / 10.61 (0); 0 faults;
+  `PLOW_NV_FA_WAUTO_VR=8` identical. Small because the phased body already sits near the byte floor.
+  Not served-validated; not in the recipe.
+* **Where the served C16 gap actually is**: step 12.9 (ctx 1024) vs served 16.94 TPOT at 1024/C16 and
+  step 13.95 vs 50.39 at 8192/C16 -- the long-context C16 TPOT is prefill interference (serial prefill
+  launches between decode steps), not the step. 128/C16: served 11.85 vs step 11.46; vLLM 10.96.
+  Levers left for the step: FlashMerge elision at ns=1 (B=16 sliding layers: ~5 us x 40 layers = 0.2 ms,
+  needs the ladder validator to accept a rung without the merge op), and the NRN/Gemv gate chain.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |

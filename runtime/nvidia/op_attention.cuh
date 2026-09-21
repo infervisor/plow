@@ -178,10 +178,27 @@ template <int V> struct fa_depth { static constexpr int v = V; };
     (PLOW_NV_FA_SPART && (D) >= 256 && ((GF) == 2 || (GF) == 4 || (GF) == 8) &&               \
      !FA_DEC_TC_GQA8(D, GF) && !FA_DEC_MMAQK(D, GF))
 #define FA_DEC_SPART_NP(GF) (64 / (GF))
-#define FA_DEC_SMEM_FLOATS(D, GF)                                                              \
+#define FA_DEC_SMEM_FLOATS_PHASED(D, GF)                                                       \
     (FA_DEC_BASE_SMEM_FLOATS(D, GF) +                                                         \
      (FA_DEC_TC_GQA8(D, GF) ? ((FA_DEC_MMAQK(D, GF) ? 0 : 16) + 2 * PLOW_NV_FA_TC_RING_ROWS) * ((D) + 8) / 2 : 0) +   \
      (FA_DEC_SPART(D, GF) ? FA_DEC_TILE * 64 : 0))
+/* WARP-AUTONOMOUS hd256/GF2 item: each warp streams 16-row chunks with the K fragments and the V
+ * rows of a chunk in flight together, keeps its own online-softmax state (m, l, O) in registers
+ * and never meets the block until the item's end, where the 8 warp states fold through smem in a
+ * fixed order. The phased body above serializes a K phase, three block reductions and a V phase
+ * per 256-row tile, so the memory pipe drains at every barrier; here warps drift across phases.
+ * Needs the mma score (PLOW_NV_FA_MMAQK bit 0). Same partial contract (Opart, mlpart) as the
+ * phased body; the online order differs, so not bit-identical. */
+#ifndef PLOW_NV_FA_WAUTO
+#define PLOW_NV_FA_WAUTO 0
+#endif
+#define FA_DEC_WAUTO(D, GF) (PLOW_NV_FA_WAUTO && (D) == 256 && (GF) == 2 && FA_DEC_MMAQK(D, GF))
+/* fold slots [WARPS][GF*D] + (m, l) per (warp, head); the P broadcast slots alias Ssm. */
+#define FA_DEC_WAUTO_FLOATS(D, GF) (PLOW_NV_WARPS * (GF) * (D) + 4 * PLOW_NV_WARPS)
+#define FA_DEC_SMEM_FLOATS(D, GF)                                                              \
+    ((FA_DEC_WAUTO(D, GF) && FA_DEC_WAUTO_FLOATS(D, GF) > FA_DEC_SMEM_FLOATS_PHASED(D, GF))    \
+         ? FA_DEC_WAUTO_FLOATS(D, GF)                                                          \
+         : FA_DEC_SMEM_FLOATS_PHASED(D, GF))
 
 /* V rows in flight per thread. A fused row feeds GF accumulators, so arithmetic per load
  * grows with GF and the unroll can shrink before the 255-register cliff. */
@@ -708,6 +725,179 @@ __device__ __forceinline__ void fa_decode_qk_mma(float* scores, const __nv_bfloa
             }
     }
 }
+
+#if PLOW_NV_FA_WAUTO
+/* V rows a lane holds in flight per chunk (each 16 B: dims 8*lane..+8). */
+#ifndef PLOW_NV_FA_WAUTO_VR
+#define PLOW_NV_FA_WAUTO_VR 16
+#endif
+template <int D, int GF>
+__device__ __forceinline__ void fa_decode_wauto(float* __restrict__ Opart,
+                                                float* __restrict__ mlpart,
+                                                __nv_bfloat16* __restrict__ O,
+                                                const __nv_bfloat16* qsm,
+                                                const __nv_bfloat16* __restrict__ kbase,
+                                                const __nv_bfloat16* __restrict__ vbase,
+                                                unsigned lo, unsigned hi, unsigned kv_mask,
+                                                float scale, float* lds, size_t bh0,
+                                                unsigned nsplit, unsigned sp) {
+    static_assert(D == 256 && GF == 2, "wauto is the hd256/GF2 sliding-layer item");
+    constexpr unsigned NKB = D / 32, CH = 16, VR = PLOW_NV_FA_WAUTO_VR;
+    static_assert(CH % VR == 0, "V batches tile the chunk");
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned g = lane >> 2, t = lane & 3u;
+    const float sc = FA_SCALE(scale);
+    float* pw = lds + warp * (CH * GF); /* P broadcast, per warp, aliases Ssm */
+    float* fold = lds;                  /* [WARPS][GF*D], written after the block barrier */
+    float* mls = lds + PLOW_NV_WARPS * GF * D; /* [WARPS][GF][2] */
+    const __nv_bfloat16* qf = qsm + (g < (unsigned)GF ? g : 0u) * D + t * 8u;
+
+    float m0 = FA_NEG_INF, m1 = FA_NEG_INF, l0 = 0.0f, l1 = 0.0f;
+    float oacc[GF][8];
+#pragma unroll
+    for (int h = 0; h < GF; h++)
+#pragma unroll
+        for (int u = 0; u < 8; u++) oacc[h][u] = 0.0f;
+    const unsigned span = hi > lo ? hi - lo : 0u;
+    const unsigned nch = (span + CH - 1u) / CH;
+    for (unsigned c = warp; c < nch; c += PLOW_NV_WARPS) {
+        const unsigned r0 = lo + c * CH;
+        const unsigned nl = (hi - r0 < CH) ? (hi - r0) : CH;
+        /* Dead rows alias row 0 of the chunk: in-bounds, finite, masked below. */
+        const unsigned ra = g < nl ? g : 0u;
+        const unsigned rb = (g + 8u) < nl ? (g + 8u) : ra;
+        const __nv_bfloat16* k0 = kbase + (size_t)((r0 + ra) & kv_mask) * D + t * 8u;
+        const __nv_bfloat16* k1 = kbase + (size_t)((r0 + rb) & kv_mask) * D + t * 8u;
+        uint4 ka[NKB], kb[NKB];
+#pragma unroll
+        for (unsigned u = 0; u < NKB; u++) {
+            ka[u] = __ldcs((const uint4*)(k0 + u * 32u));
+            kb[u] = __ldcs((const uint4*)(k1 + u * 32u));
+        }
+        uint4 vv[VR];
+#pragma unroll
+        for (unsigned r = 0; r < VR; r++) {
+            const unsigned rr = r < nl ? r : 0u;
+            vv[r] = __ldcs((const uint4*)(vbase + (size_t)((r0 + rr) & kv_mask) * D + lane * 8u));
+        }
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (unsigned u = 0; u < NKB; u++) {
+            const uint4 q = *(const uint4*)(qf + u * 32u);
+            fa_mma16816_acc(acc, ka[u].x, kb[u].x, ka[u].y, kb[u].y, q.x, q.y);
+            fa_mma16816_acc(acc, ka[u].z, kb[u].z, ka[u].w, kb[u].w, q.z, q.w);
+        }
+        /* Lane (g, t): rows g, g+8 x heads 2t, 2t+1; the item's two heads live in lanes t == 0
+         * (heads >= GF read head 0's Q, so the other lane groups carry head-0 copies). */
+        const float s0 = g < nl ? acc[0] * sc : FA_NEG_INF;
+        const float s1 = g < nl ? acc[1] * sc : FA_NEG_INF;
+        const float s2 = (g + 8u) < nl ? acc[2] * sc : FA_NEG_INF;
+        const float s3 = (g + 8u) < nl ? acc[3] * sc : FA_NEG_INF;
+        float mx0 = fmaxf(s0, s2), mx1 = fmaxf(s1, s3);
+#pragma unroll
+        for (int off = 4; off <= 16; off <<= 1) {
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, off, 32));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, off, 32));
+        }
+        const float mn0 = fmaxf(m0, __shfl_sync(0xffffffffu, mx0, 0, 32));
+        const float mn1 = fmaxf(m1, __shfl_sync(0xffffffffu, mx1, 0, 32));
+        const float p0 = FA_EXP(s0 - mn0), p1 = FA_EXP(s1 - mn1);
+        const float p2 = FA_EXP(s2 - mn0), p3 = FA_EXP(s3 - mn1);
+        float ls0 = p0 + p2, ls1 = p1 + p3;
+#pragma unroll
+        for (int off = 4; off <= 16; off <<= 1) {
+            ls0 += __shfl_xor_sync(0xffffffffu, ls0, off, 32);
+            ls1 += __shfl_xor_sync(0xffffffffu, ls1, off, 32);
+        }
+        ls0 = __shfl_sync(0xffffffffu, ls0, 0, 32);
+        ls1 = __shfl_sync(0xffffffffu, ls1, 0, 32);
+        const float corr0 = FA_EXP(m0 - mn0), corr1 = FA_EXP(m1 - mn1);
+        l0 = l0 * corr0 + ls0;
+        l1 = l1 * corr1 + ls1;
+        m0 = mn0;
+        m1 = mn1;
+        __syncwarp(); /* the previous chunk's pw reads */
+        if (t == 0) {
+            *(float2*)(pw + g * GF) = make_float2(p0, p1);
+            *(float2*)(pw + (g + 8u) * GF) = make_float2(p2, p3);
+        }
+        __syncwarp();
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            oacc[0][u] *= corr0;
+            oacc[1][u] *= corr1;
+        }
+#pragma unroll
+        for (unsigned r = 0; r < CH; r++) {
+            if (VR < CH && r >= VR && (r % VR) == 0u) {
+#pragma unroll
+                for (unsigned i = 0; i < VR; i++) {
+                    const unsigned rr = (r + i) < nl ? (r + i) : 0u;
+                    vv[i] = __ldcs((const uint4*)(vbase + (size_t)((r0 + rr) & kv_mask) * D + lane * 8u));
+                }
+            }
+            const float2 p = *(const float2*)(pw + r * GF);
+            const bf16v8 v = *(const bf16v8*)&vv[r % VR];
+#pragma unroll
+            for (int u = 0; u < 8; u++) {
+                const float f = __bfloat162float(v.x[u]);
+                oacc[0][u] = fmaf(p.x, f, oacc[0][u]);
+                oacc[1][u] = fmaf(p.y, f, oacc[1][u]);
+            }
+        }
+    }
+    /* Fold the warps: global m, then every warp's O scaled to it, summed in warp order. */
+    __syncthreads(); /* all chunk loops done: qsm / pw are dead, fold may overwrite them */
+    if (lane == 0) {
+        mls[warp * 4 + 0] = m0;
+        mls[warp * 4 + 1] = l0;
+        mls[warp * 4 + 2] = m1;
+        mls[warp * 4 + 3] = l1;
+    }
+    __syncthreads();
+    float mg0 = FA_NEG_INF, mg1 = FA_NEG_INF;
+#pragma unroll
+    for (unsigned w = 0; w < PLOW_NV_WARPS; w++) {
+        mg0 = fmaxf(mg0, mls[w * 4 + 0]);
+        mg1 = fmaxf(mg1, mls[w * 4 + 2]);
+    }
+    float lg0 = 0.0f, lg1 = 0.0f;
+#pragma unroll
+    for (unsigned w = 0; w < PLOW_NV_WARPS; w++) {
+        lg0 += mls[w * 4 + 1] * FA_EXP(mls[w * 4 + 0] - mg0);
+        lg1 += mls[w * 4 + 3] * FA_EXP(mls[w * 4 + 2] - mg1);
+    }
+    {
+        const float sw0 = FA_EXP(m0 - mg0), sw1 = FA_EXP(m1 - mg1);
+        float* fo = fold + warp * (GF * D) + lane * 8u;
+#pragma unroll
+        for (int u = 0; u < 8; u += 4) {
+            *(float4*)(fo + u) = make_float4(oacc[0][u] * sw0, oacc[0][u + 1] * sw0,
+                                             oacc[0][u + 2] * sw0, oacc[0][u + 3] * sw0);
+            *(float4*)(fo + D + u) = make_float4(oacc[1][u] * sw1, oacc[1][u + 1] * sw1,
+                                                 oacc[1][u + 2] * sw1, oacc[1][u + 3] * sw1);
+        }
+    }
+    __syncthreads();
+    const float inv0 = lg0 > 0.0f ? 1.0f / lg0 : 0.0f, inv1 = lg1 > 0.0f ? 1.0f / lg1 : 0.0f;
+    for (unsigned i = tid; i < (unsigned)(GF * D); i += PLOW_NV_THREADS) {
+        float sum = 0.0f;
+#pragma unroll
+        for (unsigned w = 0; w < PLOW_NV_WARPS; w++) sum += fold[w * (GF * D) + i];
+        const unsigned h = i / D, d = i % D;
+        if (O) {
+            O[(bh0 + h) * D + d] = __float2bfloat16(sum * (h ? inv1 : inv0));
+        } else {
+            Opart[((bh0 + h) * nsplit + sp) * D + d] = sum;
+        }
+    }
+    if (!O && tid < (unsigned)GF) {
+        float* ml = mlpart + ((bh0 + tid) * nsplit + sp) * 2;
+        ml[0] = tid ? mg1 : mg0;
+        ml[1] = tid ? lg1 : lg0;
+    }
+}
+#endif /* PLOW_NV_FA_WAUTO */
 #endif
 
 
@@ -817,6 +1007,13 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         for (unsigned i = tid; i < GF * D; i += PLOW_NV_THREADS)
             qsm[i] = Q[((size_t)b * n_head + h0 + i / D) * D + i % D];
         __syncthreads();
+#endif
+#if PLOW_NV_FA_WAUTO
+        if constexpr (FA_DEC_WAUTO(D, GF) && !FP8KV && !SZKV) {
+            fa_decode_wauto<D, GF>(Opart, mlpart, nullptr, qsm, kbase, vbase, lo, hi, kv_mask,
+                                   scale, lds, (size_t)b * n_head + h0, nsplit, sp);
+            continue;
+        }
 #endif
 
 #if PLOW_NV_FA_TC_GQA8_HD512
