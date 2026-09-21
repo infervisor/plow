@@ -257,3 +257,20 @@ Validation plan: (1) ring A/B on the c32c null (step_bench B=16, same tree/objec
   C1/C4/C16. One packet winning both needs item 3 (in-program sub-chunk pipeline: a single request
   keeps 4096-row launches on a 2048-row ring). The live-rings A/B (Q2) was gated on adoption and not
   run. Ledger: cell `gemma4-12b.h100.bf16-c32-16k` (both sessions).
+
+#### C16 attribution from the client per-request data (no PACKLOG session: queue had 5-6 waiters)
+
+* 4096/8192/15000 C16: steady-state per-request TTFT p50 888 ms (req1k) vs 379 (p12r); first wave
+  1779 vs 1696. Each request's prefill is four 1024-row slices in four consecutive shared launches, so
+  a request finishes after ~4 launches instead of 1 — the request cap's packing, TPOT unchanged.
+* 1024/C16: steady p50 331 vs 320, first ITL 162 vs 160 on both — level.
+* 128/C16: a CONSTANT +42-44 ms on every staggered arrival (steady p50 102.3 sd ~1 vs 58.0), all of
+  it before the first token (first ITL 11.7 vs 11.4, TPOT 11.83 vs 11.85). Not the admission rung
+  (both sat at rung 16, no transitions), not launch shape (129-row prompt, bucket 256, token-batch
+  route firing on both). Candidates: the unified launch's decode-row staging sized by the packet
+  batch (`TokenBatchStaging::with_capacity(pf_max_rows, batch)` = 32 vs 16), the per-row quota
+  `pf_max_rows / active`, or the seg-graph warm state (`buckets=8` vs `10`). `diag.sh` (two
+  `PLOW_PF_PACKLOG=1` sessions) decides it; not run.
+* Admission-rung flapping on the 32-rung packet at C16 for prompts >= 1024: with 16 live and 1-3
+  queued the controller widens 16 -> 32 (Backlog) and narrows back (LowLoad) every 2-15 s. Not the
+  128/C16 gap, but serve C16 on a 32-rung packet with `PLOW_DECODE_MAX_RUNG` capped at the profile's C.
