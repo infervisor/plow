@@ -155,6 +155,26 @@ impl GpuEngine {
                 .filter(|(pending, phase)| pending.completes_prompt && **phase == Phase::Prefill)
                 .map(|(pending, _)| pending.slot as usize)
                 .collect();
+            // A request waiting on this prompt's shared blocks attaches as soon as the chunk
+            // that computed them lands, not after the owner's whole prompt.
+            let chunk_ends: smallvec::SmallVec<[(usize, u32); 16]> = match RuntimeConfig::get()
+                .prefix_chunk_publish()
+                .then(|| self.vmm.as_ref().map(|v| v.kv.block_rows()))
+                .flatten()
+            {
+                Some(br) => plan
+                    .pending
+                    .iter()
+                    .zip(&plan.phases)
+                    .filter(|(pending, phase)| {
+                        **phase == Phase::Prefill
+                            && !pending.completes_prompt
+                            && pending.new_frontier / br > pending.expected_frontier / br
+                    })
+                    .map(|(pending, _)| (pending.slot as usize, pending.new_frontier / br * br))
+                    .collect(),
+                None => smallvec::SmallVec::new(),
+            };
             if self.vmm_prefix_enabled()
                 && chunks
                     .iter()
@@ -202,6 +222,9 @@ impl GpuEngine {
                 for slot in completed {
                     self.vmm_publish(slot, self.pos[slot].saturating_sub(1));
                     self.vmm_prefill_done(slot);
+                }
+                for (slot, rows) in chunk_ends {
+                    self.vmm_publish(slot, rows);
                 }
             }
             if !state.fired {
