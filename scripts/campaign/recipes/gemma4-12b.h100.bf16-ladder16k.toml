@@ -74,15 +74,11 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 
 [serve.env]
 # The matched ladder runs cache-off (vLLM --no-enable-prefix-caching; vllm-bench random prompts
-# share a leading prefix). Production serving is cache-on: the three knobs below are what the
-# shared-system-prompt scenario needs (prefix_repetition 8 x 2048 + 256: C4 TTFT 291 -> 177 ms,
-# C16 541 -> 343). Whole-prompt publish alone never matches a shared prefix; the default caps
-# (5% of device memory, 512 MiB block pool) evict the shared checkpoints behind each request's
-# own end-of-prompt / end-of-generation boundaries (320 MiB each on this model).
+# share a leading prefix). Production serving is cache-on with PLOW_PREFIX_CACHE=1 and nothing
+# else: whole-block (2048-row) checkpoints, pressure eviction and the in-flight prefix wait are
+# the defaults (bd317b28; shared-system-prompt scenario 8 x 2048 + 256: C4 TTFT 291 -> 113 ms,
+# C16 541 -> 281, vLLM 121 / 283). Beside co-tenants raise PLOW_VMM_CACHE_MIN_FREE_MIB.
 PLOW_PREFIX_CACHE = "0"
-PLOW_AMD_PREFIX_FINE_ROWS = "2048"
-PLOW_VMM_CACHE_MIB = "9216"
-PLOW_KV_POOL_MIB = "2048"
 # Vendor cuBLASLt Q.K^T / causal softmax / P.V for the hd512 full-attention prefill segments
 # (attn_softmax_sm90a.cubin from the objects script; agent/pf-attn-batched-gemm, e8227eed..):
 # served C1 TTFT 4096 176.7 -> 170.6, 8192 386 -> 360, 15000 832 -> 750 ms; C4/C16 8192-15000
