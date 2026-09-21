@@ -9459,6 +9459,15 @@ fn emit_dense_gqa(
         assert!(selected > 0, "no grouped MoE prefill GLU/DOWN pair to isolate");
         eprintln!("  cuBLASLt MoE prefill: {selected} grouped expert segments");
     }
+    if ecfg.moe_dec_lt {
+        let min_rows = ecfg
+            .gemma_moe_dec_group
+            .expect("PLOW_EMIT_MOE_DEC_LT needs the grouped decode arm (PLOW_GEMMA_MOE_DEC_GROUP)");
+        let selected = dense_cublaslt::apply_moe_decode(&mut m, &mut sections, &arch, min_rows)
+            .expect("MoE decode library segments");
+        assert!(selected > 0, "no grouped MoE decode GLU/DOWN pair to isolate");
+        eprintln!("  cuBLASLt MoE decode: {selected} grouped expert segments");
+    }
     // BLOCK MODE: embed the block.json descriptor
     // as SECT_METADATA — this also forces the to_blob_v6 path — and drop a
     // sibling block.json next to the blob for the record / the harness loader.

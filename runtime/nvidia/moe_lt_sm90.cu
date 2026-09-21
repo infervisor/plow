@@ -1,4 +1,5 @@
-/* moe_lt_sm90.cu — device glue of the cuBLASLt GROUPED-GEMM MoE prefill route (PLOW_MOE_PF_LT).
+/* moe_lt_sm90.cu — device glue of the cuBLASLt GROUPED-GEMM MoE routes (PLOW_MOE_PF_LT prefill,
+ * PLOW_MOE_DEC_LT decode).
  *
  * The route replaces MoeGroupGluGemmaPf + MoeGroupDownGemmaPf with two cuBLASLt grouped matmuls
  * (CUBLASLT_BATCH_MODE_GROUPED: per-expert row counts and matrix pointers live ON THE DEVICE, so
@@ -21,7 +22,8 @@
 #endif
 
 extern "C" {
-__device__ unsigned plow_moe_lt_abi = 1;
+/* ABI 2 adds plow_moe_lt_norm; a decode route needs it, the prefill route accepts ABI 1. */
+__device__ unsigned plow_moe_lt_abi = 2;
 }
 
 __device__ __forceinline__ unsigned moe_lt_extent(const int* meta, unsigned n_exp) {
@@ -44,6 +46,46 @@ struct MoeLtCursor {
         }
     }
 };
+
+/* Decode route only: xn2[r] = bf16(x[r] * rsqrt(mean(x[r]^2) + eps) * gamma), the norm that
+ * MoeExpertGluNormGemma fuses (plow_moe_stage_xn). One block per row (grid = rows), H % 8 == 0.
+ * The reduction partition differs from the interpreter's, so inv may differ in the last ulp. */
+extern "C" __global__ void plow_moe_lt_norm(__nv_bfloat16* xn2, const __nv_bfloat16* x,
+                                            const __nv_bfloat16* gamma, unsigned H, float eps) {
+    __shared__ float red[PLOW_NV_THREADS / 32u];
+    __shared__ float inv_s;
+    const __nv_bfloat16* row = x + (size_t)blockIdx.x * H;
+    const unsigned nvec = H / 8u;
+    float part = 0.0f;
+    for (unsigned c = threadIdx.x; c < nvec; c += blockDim.x) {
+        const bf16v8 v = ld_glob8(row + c * 8u);
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const float f = __bfloat162float(v.x[j]);
+            part += f * f;
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) part += __shfl_xor_sync(0xffffffffu, part, o);
+    if ((threadIdx.x & 31u) == 0u) red[threadIdx.x >> 5] = part;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (unsigned w = 0; w < blockDim.x / 32u; w++) s += red[w];
+        inv_s = rsqrtf(s / (float)H + eps);
+    }
+    __syncthreads();
+    const float inv = inv_s;
+    __nv_bfloat16* out = xn2 + (size_t)blockIdx.x * H;
+    for (unsigned c = threadIdx.x; c < nvec; c += blockDim.x) {
+        const bf16v8 v = ld_glob8(row + c * 8u), g = ld_glob8(gamma + c * 8u);
+        bf16v8 o;
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+            o.x[j] = __float2bfloat16(__bfloat162float(v.x[j]) * inv * __bfloat162float(g.x[j]));
+        st_glob8(out + c * 8u, o);
+    }
+}
 
 /* Per-expert group shapes and matrix pointers for both grouped matmuls.
  * rows[e] = cnt[e]; ptrs = [xs | gu | fu | dn] x E, each base + rowoff[e] * width * 2. */

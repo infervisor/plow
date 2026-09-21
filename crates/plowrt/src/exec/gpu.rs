@@ -83,10 +83,10 @@ mod moe_lt;
 mod native_decode;
 mod packed_terminal;
 mod token_batch;
-use cublaslt::CublasLtDecodeRoute;
+use cublaslt::{CublasLtDecodeRoute, LibraryRoute};
 use decode_rung::{
     decode_rung_index, decode_selection, effective_decode_widths, validate_cublaslt_ladder,
-    validate_decode_ladder, DecodeRung, DecodeSelection,
+    validate_decode_ladder, validate_moe_lt_ladder, DecodeRung, DecodeSelection,
 };
 
 pub(crate) fn live_rings_for_capacity(
@@ -643,7 +643,10 @@ impl SegmentRoleValidation for SegmentRoles {
                 .iter()
                 .copied()
                 .any(plow_asset::segment_roles::is_projection);
-            let library_decode = decode && projection_roles;
+            let moe_decode = decode
+                && p.roles
+                    .contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT);
+            let library_decode = decode && (projection_roles || moe_decode);
             let library_prefill = !decode
                 && p
                     .roles
@@ -652,6 +655,7 @@ impl SegmentRoleValidation for SegmentRoles {
                 || (p.roles.contains(&plow_asset::segment_roles::FP8_M1)
                     && p.roles.contains(&plow_asset::segment_roles::GEMV_CTA512))
                 || (object_decode && library_decode)
+                || (moe_decode && projection_roles)
                 || (decode
                     && ((!library_decode
                         && (p.index + 1 != programs.len() || programs.len() != prefill.len() + 1))
@@ -666,6 +670,7 @@ impl SegmentRoleValidation for SegmentRoles {
                                     | plow_asset::segment_roles::MXFP4_MOE
                                     | plow_asset::segment_roles::CUBLASLT
                                     | plow_asset::segment_roles::NATIVE_DECODE_TC
+                                    | plow_asset::segment_roles::MOE_DECODE_CUBLASLT
                             )
                         })))
                 || (!decode
@@ -675,6 +680,7 @@ impl SegmentRoleValidation for SegmentRoles {
                             plow_asset::segment_roles::GEMV_CTA512
                                 | plow_asset::segment_roles::FP8_M1
                                 | plow_asset::segment_roles::NATIVE_DECODE_TC
+                                | plow_asset::segment_roles::MOE_DECODE_CUBLASLT
                         )
                     }) || (projection_roles && !library_prefill)))
             {
@@ -694,8 +700,11 @@ impl SegmentRoleValidation for SegmentRoles {
                 ));
             }
             packet_role_segments(g, &p.roles, tensors)?;
-            if library_decode {
+            if decode && projection_roles {
                 cublaslt::decode_segments(g, tensors, &p.roles)?;
+            }
+            if moe_decode {
+                moe_lt::decode_segments(g, tensors, &p.roles)?;
             }
             used.extend(
                 p.roles
@@ -1325,7 +1334,11 @@ fn packet_role_segments(
         }
         let role = roles[seg];
         if role != plow_asset::segment_roles::INTERPRETER {
-            if role == plow_asset::segment_roles::MOE_PREFILL_CUBLASLT {
+            if matches!(
+                role,
+                plow_asset::segment_roles::MOE_PREFILL_CUBLASLT
+                    | plow_asset::segment_roles::MOE_DECODE_CUBLASLT
+            ) {
                 // A library segment of two complete instructions (grouped GLU + DOWN); the
                 // route itself (`moe_lt::segments`) checks the pair when it is switched on.
                 let pcs: std::collections::BTreeSet<_> = entries.iter().map(|e| e.inst).collect();
@@ -2037,9 +2050,11 @@ pub struct GpuEngine {
     qwen_prefill: Option<crate::device::cuda::qwen_gdn::NativeGdn>,
     packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize],
     decode_packet_roles: Vec<u8>,
-    cublaslt_decode: Vec<Option<CublasLtDecodeRoute>>,
+    cublaslt_decode: Vec<Option<LibraryRoute>>,
     cublaslt_decode_graph: Option<crate::device::cuda::GraphExec>,
     cublaslt_decode_capture: bool,
+    /// The widest decode program's MoE experts run through `moe_lt` (`PLOW_MOE_DEC_LT`).
+    moe_lt_decode: bool,
     /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
     /// (bucket, slot-tensor-base) — one cuGraphLaunch replaces ~480 kernel submits.
     seg_graphs: std::collections::HashMap<(usize, u64), crate::device::cuda::GraphExec>,
@@ -3290,6 +3305,21 @@ impl GpuEngine {
             })
             .then(|| decode_roles.clone())
             .unwrap_or_default();
+        let moe_lt_decode_roles = segment_roles.as_ref().is_some_and(|roles| {
+            roles.programs.iter().any(|program| {
+                program.index >= blob.prefill_progs().len()
+                    && program
+                        .roles
+                        .contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT)
+            })
+        });
+        if moe_lt_decode_roles && (cublaslt_enabled || !decode_packet_roles.is_empty()) {
+            return Err(RuntimeError::Rejected(
+                "MoE decode cuBLASLt segments cannot mix with other decode roles".into(),
+            ));
+        }
+        // Rungs of at least this many rows route; the rest run their program as one launch.
+        let moe_lt_decode_min = nv_config.moe_dec_lt.filter(|_| moe_lt_decode_roles);
         let kv_maps = kv_tensor_maps(&blob.tensors, &blob.gen, blob.decode_prog()?.t as usize)?;
         let recurrent = recurrent_state_layout(&blob.tensors, blob.decode_prog()?.t as usize)?;
         let configured_multistep = RuntimeConfig::get().multistep();
@@ -3297,6 +3327,7 @@ impl GpuEngine {
             || prepared_contexts.is_some()
             || !decode_packet_roles.is_empty()
             || cublaslt_enabled
+            || moe_lt_decode_min.is_some()
             || recurrent.is_some();
         let effective_multistep = if multistep_disabled_by_decode {
             if configured_multistep > 1 {
@@ -3334,6 +3365,8 @@ impl GpuEngine {
                 ));
             }
             validate_cublaslt_ladder(&blob, segment_roles.as_ref().expect("library roles"))?
+        } else if moe_lt_decode_roles {
+            validate_moe_lt_ladder(&blob, segment_roles.as_ref().expect("MoE decode roles"))?
         } else {
             single_bound_decode || validate_decode_ladder(&blob)?
         };
@@ -4235,6 +4268,7 @@ impl GpuEngine {
                 "native GEMV decode roles require a dynamic-row GQ interpreter".into(),
             ));
         }
+        let widest_moe = decode_roles.contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT);
         let cublaslt_segments = if cublaslt_enabled {
             if be.module_global_u32(&module, "plow_cublaslt_decode_abi")? != Some(1) {
                 return Err(RuntimeError::Rejected(
@@ -4243,17 +4277,26 @@ impl GpuEngine {
             }
             cublaslt::decode_segments(g, &blob.tensors, &decode_roles)?
         } else {
-            if decode_packet_roles.is_empty() {
+            if decode_packet_roles.is_empty() && !widest_moe {
                 g.check_coarse_single_segment()?;
             }
             Vec::new()
         };
+        let moe_lt_segments = if widest_moe {
+            moe_lt::decode_segments(g, &blob.tensors, &decode_roles)?
+        } else {
+            Vec::new()
+        };
+        let moe_lt_routed = widest_moe
+            && moe_lt_decode_min.is_some_and(|min| packet::devbuild::program_rows(g.t) >= min);
         // Single segment normally; an L2-PLACED program (l2_domains != 0) carries one
         // window per domain and the placed interpreter picks its window by physical SM.
         let want_seg = if !decode_packet_roles.is_empty() {
             decode_packet_roles.len() + 1
         } else if !cublaslt_segments.is_empty() {
             cublaslt_segments.len() + 1
+        } else if widest_moe {
+            moe_lt_segments.len() + 1
         } else if g.l2_domains != 0 {
             g.l2_domains as usize + 1
         } else {
@@ -4324,13 +4367,61 @@ impl GpuEngine {
         } else {
             None
         };
+        // The MoE decode route shares whichever Lt handle is already up.
+        let moe_lt_decode_lt = if moe_lt_decode_min.is_some() {
+            Some(match (&cublaslt, &cublaslt_prefill) {
+                (Some(cublaslt::ProjectionBackend::Lt(lt)), _)
+                | (_, Some(cublaslt::ProjectionBackend::Lt(lt))) => Arc::clone(lt),
+                _ => crate::device::cuda::lt::Lt::load(&be)?,
+            })
+        } else {
+            None
+        };
+        let moe_lt_dirs: Vec<&Path> = nv_config
+            .pf_seg_dir
+            .as_deref()
+            .map(Path::new)
+            .into_iter()
+            .chain([assets_dir])
+            .collect();
+        let mut moe_lt_decode: Option<Arc<moe_lt::MoeLt>> = None;
         let ordered_waits = if cublaslt_enabled {
             Some(cublaslt::ordered_waits(g, &cublaslt_segments, &[])?)
+        } else if moe_lt_routed {
+            let none = vec![None; moe_lt_segments.len()];
+            Some(cublaslt::ordered_waits_for(
+                g,
+                &none,
+                &moe_lt::instructions(&moe_lt_segments),
+            )?)
         } else {
             None
         };
         let cublaslt_decode = if let Some(lt) = &cublaslt {
-            cublaslt::prepare_routes(lt, cublaslt_segments, &mut insts, &devp, None)?
+            cublaslt::library_routes(cublaslt::prepare_routes(
+                lt,
+                cublaslt_segments,
+                &mut insts,
+                &devp,
+                None,
+            )?)
+        } else if moe_lt_routed {
+            let routes = moe_lt::decode_routes(
+                &be,
+                &mut moe_lt_decode,
+                moe_lt_decode_lt.as_ref().expect("routed only with the knob"),
+                &moe_lt_dirs,
+                profile.tag,
+                &moe_lt_segments,
+                &mut insts,
+                &devp,
+            )?;
+            tracing::info!(
+                rows = g.t,
+                layers = routes.iter().flatten().count(),
+                "MoE decode experts routed to cuBLASLt grouped matmuls"
+            );
+            routes
         } else {
             Vec::new()
         };
@@ -4341,7 +4432,13 @@ impl GpuEngine {
         let d_waits = upload_pod(pod_bytes(ordered_waits.as_deref().unwrap_or(&g.waits)))?;
         let d_succs = upload_pod(pod_bytes(&g.succs))?;
         let d_gq_stream = upload_pod(pod_bytes(&g.gq_stream))?;
-        let d_gq_seg = upload_pod(pod_bytes(&g.gq_seg_ofs))?;
+        // Declared but unrouted MoE segments run as one launch over the merged window.
+        let merged_window = [0u32, g.gq_stream.len() as u32];
+        let d_gq_seg = upload_pod(pod_bytes(if widest_moe && !moe_lt_routed {
+            &merged_window[..]
+        } else {
+            &g.gq_seg_ofs[..]
+        }))?;
         // The decode counter block and the GQ cursor share a lifecycle (both
         // re-zeroed before every launch), so they share one allocation: the
         // cursor sits at the counter block's tail and ONE memset re-arms both.
@@ -4384,6 +4481,13 @@ impl GpuEngine {
         };
 
         let stream = be.stream_create()?;
+        // An explicit --nv-smem speaks for every rung; an object without the symbol has one claim.
+        let smem_narrow = match crate::config::RuntimeConfig::get().nv.smem {
+            Some(_) => smem,
+            None => be
+                .module_global_u32(&module, "plow_arena_bytes_narrow")?
+                .map_or(smem, |narrow| narrow.min(smem)),
+        };
         let decode_rungs = if select_decode_rungs {
             blob.decode_progs()[..blob.decode_progs().len() - 1]
                 .iter()
@@ -4406,8 +4510,14 @@ impl GpuEngine {
                             &devp,
                             Some(&cublaslt_decode),
                         )?;
-                        let mut rung =
-                            DecodeRung::upload_with_insts(&be, g, kernarg, &insts, &waits)?;
+                        let mut rung = DecodeRung::upload_with_insts(
+                            &be,
+                            g,
+                            kernarg,
+                            &insts,
+                            &waits,
+                            &g.gq_seg_ofs,
+                        )?;
                         rung.library = Some(cublaslt::CublasLtDecodeGraph::capture(
                             &be,
                             &stream,
@@ -4415,9 +4525,70 @@ impl GpuEngine {
                             f,
                             grid,
                             smem,
-                            routes,
+                            cublaslt::library_routes(routes),
                         )?);
                         rung
+                    } else if let Some(roles) = segment_roles
+                        .as_ref()
+                        .and_then(|r| {
+                            r.program(blob.progs.len() - blob.decode_progs().len() + index)
+                        })
+                        .map(|p| &p.roles)
+                        .filter(|roles| {
+                            roles.contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT)
+                        })
+                    {
+                        let segments = moe_lt::decode_segments(g, &blob.tensors, roles)?;
+                        let routed = moe_lt_decode_min
+                            .is_some_and(|min| packet::devbuild::program_rows(g.t) >= min);
+                        if routed {
+                            let none = vec![None; segments.len()];
+                            let waits = cublaslt::ordered_waits_for(
+                                g,
+                                &none,
+                                &moe_lt::instructions(&segments),
+                            )?;
+                            let mut insts = g.insts.clone();
+                            let routes = moe_lt::decode_routes(
+                                &be,
+                                &mut moe_lt_decode,
+                                moe_lt_decode_lt.as_ref().expect("routed only with the knob"),
+                                &moe_lt_dirs,
+                                profile.tag,
+                                &segments,
+                                &mut insts,
+                                &devp,
+                            )?;
+                            tracing::info!(
+                                rows = g.t,
+                                layers = routes.iter().flatten().count(),
+                                "MoE decode experts routed to cuBLASLt grouped matmuls"
+                            );
+                            let mut rung = DecodeRung::upload_with_insts(
+                                &be,
+                                g,
+                                kernarg,
+                                &insts,
+                                &waits,
+                                &g.gq_seg_ofs,
+                            )?;
+                            // No grouped-arm body runs on a routed rung: the narrow arena.
+                            rung.library = Some(cublaslt::CublasLtDecodeGraph::capture(
+                                &be,
+                                &stream,
+                                rung.kernarg,
+                                f,
+                                grid,
+                                smem_narrow,
+                                routes,
+                            )?);
+                            rung
+                        } else {
+                            let merged = [0u32, g.gq_stream.len() as u32];
+                            DecodeRung::upload_with_insts(
+                                &be, g, kernarg, &g.insts, &g.waits, &merged,
+                            )?
+                        }
                     } else {
                         DecodeRung::upload(&be, g, kernarg)?
                     };
@@ -5414,13 +5585,6 @@ impl GpuEngine {
                 })
             });
 
-        // An explicit --nv-smem speaks for every rung; an object without the symbol has one claim.
-        let smem_narrow = match crate::config::RuntimeConfig::get().nv.smem {
-            Some(_) => smem,
-            None => be
-                .module_global_u32(&module, "plow_arena_bytes_narrow")?
-                .map_or(smem, |narrow| narrow.min(smem)),
-        };
         let mut engine = GpuEngine {
             be,
             f,
@@ -5435,7 +5599,10 @@ impl GpuEngine {
             packet_roles,
             cublaslt_decode,
             cublaslt_decode_graph: None,
-            cublaslt_decode_capture: !decode_packet_roles.is_empty() || cublaslt_enabled,
+            cublaslt_decode_capture: !decode_packet_roles.is_empty()
+                || cublaslt_enabled
+                || moe_lt_routed,
+            moe_lt_decode: moe_lt_routed,
             decode_packet_roles,
             seg_graphs: std::collections::HashMap::new(),
             smem_pf,
@@ -7477,12 +7644,7 @@ impl GpuEngine {
                 }
                 _ => Vec::new(),
             };
-            let moe_instructions: Vec<(usize, usize)> = moe_segments
-                .iter()
-                .enumerate()
-                .filter_map(|(seg, route)| route.map(|route| [(seg, route.glu), (seg, route.down)]))
-                .flatten()
-                .collect();
+            let moe_instructions = moe_lt::instructions(&moe_segments);
             // Only buckets that run the per-segment launch loop: the route replaces a launch.
             let attention_gemm_segments = if config.nv.pf_attn_gemm
                 && g.t >= config.nv.pf_attn_gemm_min_rows

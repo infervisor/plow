@@ -21,7 +21,12 @@ pub const PREFILL_ATTENTION_HD512_PX4_BQ64: u8 = 15;
 /// `MoeGroupDownGemmaPf` pair, which the CUDA runtime may serve with cuBLASLt grouped matmuls
 /// (`PLOW_MOE_PF_LT`). Without the runtime knob the segment runs in the interpreter unchanged.
 pub const MOE_PREFILL_CUBLASLT: u8 = 16;
-pub const MAX_ROLE: u8 = MOE_PREFILL_CUBLASLT;
+/// Library role for a DECODE rung, like [`MOE_PREFILL_CUBLASLT`]: one segment holding a layer's
+/// `MoeExpertGluNormGemma` + `MoeExpertDownGemma` pair on a rung that runs the grouped-MoE arm
+/// (`PLOW_GEMMA_MOE_DEC_GROUP`), which the CUDA runtime may serve with cuBLASLt grouped matmuls
+/// (`PLOW_MOE_DEC_LT`). Without the runtime knob the rung runs in the interpreter unchanged.
+pub const MOE_DECODE_CUBLASLT: u8 = 17;
+pub const MAX_ROLE: u8 = MOE_DECODE_CUBLASLT;
 
 pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)
