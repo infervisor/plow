@@ -141,6 +141,7 @@ pub struct RungController {
     target: usize,
     dwell_ticks: u32,
     low_load_ticks: u32,
+    cold_demand: bool,
 }
 
 impl RungController {
@@ -152,7 +153,15 @@ impl RungController {
             target: 0,
             dwell_ticks: 0,
             low_load_ticks: 0,
+            cold_demand: false,
         }
+    }
+
+    /// Seat a cold backlog on the rung it demands instead of the penultimate probe
+    /// (`PLOW_RUNG_COLD_DEMAND`).
+    pub fn with_cold_demand(mut self, on: bool) -> Self {
+        self.cold_demand = on;
+        self
     }
 
     #[inline]
@@ -305,7 +314,11 @@ impl RungController {
         // by running, so holding the widest back until it has samples would cap it forever.
         // `width(widest) > 4`: don't hold back ladders capped at small widths (e.g. realtime
         // profiles with PLOW_DECODE_MAX_RUNG <= 4) where all rungs fit within the latency budget.
-        if demand_seat == widest
+        // The probe costs the first burst one tick at the narrower window: 16 x 128-row prompts
+        // on a fresh server prefilled as 1 + 7 + 8 (P99 TTFT 202 ms) where one pack of 15 fits
+        // the launch bound; `cold_demand` seats the demanded rung outright.
+        if !self.cold_demand
+            && demand_seat == widest
             && self.rungs.width(widest) > 4
             && self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES
             && self.stats[demand_seat - 1].samples < MIN_THROUGHPUT_SAMPLES
@@ -523,6 +536,18 @@ mod tests {
         let d = c.decide(load(1, 99));
         assert_eq!(c.width(d.admission), 16);
         assert_eq!(d.reason, RungReason::Backlog);
+    }
+
+    #[test]
+    fn cold_demand_seats_the_demanded_rung_without_the_penultimate_probe() {
+        let mut c = controller(&[1, 2, 4, 8, 16]).with_cold_demand(true);
+        let d = c.decide(load(1, 15));
+        assert_eq!(c.width(d.admission), 16);
+        assert_eq!(d.reason, RungReason::Backlog);
+        // Demand below the widest rung is unchanged: it seats what it asks for.
+        let mut c = controller(&[1, 2, 4, 8, 16]).with_cold_demand(true);
+        let admission = c.decide(load(1, 5)).admission;
+        assert_eq!(c.width(admission), 8);
     }
 
     #[test]

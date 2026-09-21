@@ -498,7 +498,10 @@ pub fn spawn(
         rung_widths
             .as_deref()
             .and_then(|widths| match DecodeRungs::new(widths, capacity) {
-                Ok(rungs) if rungs.len() > 1 => Some(RungController::new(rungs)),
+                Ok(rungs) if rungs.len() > 1 => Some(
+                    RungController::new(rungs)
+                        .with_cold_demand(crate::config::RuntimeConfig::get().rung_cold_demand),
+                ),
                 Ok(_) => None,
                 Err(err) => {
                     tracing::warn!(?err, ?widths, capacity, "decode rung policy disabled");
