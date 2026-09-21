@@ -1355,6 +1355,24 @@ prefill-bound. So the serving packet is an input-length choice — 32-slot for <
 (chunk-local KV scratch) or the attention roles learn the 1024 / 2048 rungs. Note
 `next_pow2(window + chunk - 1)`: chunk 3072 needs the same 4096-row ring as chunk 2048.
 
+### The smem claim is a tax, and what that rules in and out (2026-09-21)
+
+Control decode objects with only the arena floor raised (`PLOW_NV_ARENA_MIN_BYTES`), step_bench ms:
+B=4 9.57 -> 10.22 (96 KiB) -> 10.71 (160 KiB); grouped rungs (161 KiB ring today) at 208 KiB:
+B=8 12.72 -> 13.02, B=16 15.46 -> 16.20. Roughly 0.65 ms per 64 KiB at B=4 and 1 ms at B=16
+(smem and the L1 carve-out share hardware). Consequences:
+* Decode-attention score partials (`PLOW_NV_FA_SPART`, +64 KiB, a clean win on the dense 12B):
+  B=4 9.57 -> 9.93 for -0.14 / -0.35 at B=8 / 16 in every form tried (all layers or hd256 only,
+  depth 4 or 8). Dense packets only (manifest `fa_spart`).
+* A 1-deep grouped-MoE staging ring (claim 161 -> 81 KiB): B=8 13.78, B=16 16.78 — the staging
+  overlap is worth more than the tax. Negative.
+* `PLOW_SLIDING_NS_GRID` (landed, 9bf12059): B=2/4/8 7.90/9.94/13.13 -> 7.57/9.57/12.72.
+* B=1: the MoE ops' RMS and the expert GLU's xn staging were scalar (11 dependent 2-byte loads per
+  thread) on the B=1 arm only; 8-wide on the sm_90a build: 5.80 -> 5.70. Vectorizing the
+  combine+norm passes on top: nothing (5.70).
+Ladder on `p26g` (UNB 12 + NS_GRID): 6 of 60; C1 TPOT 5.65-6.07 vs 5.03-5.09, C4 9.41-18.94 vs
+7.24-10.87, C16 15.16-68.65 vs 8.93-34.84.
+
 ## Status
 
 | step | state |

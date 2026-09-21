@@ -1070,6 +1070,22 @@ for hd512/GQA8). It was ~1.5% at ctx 1024 and is the long-context term: ctx 8192
 `p12j` (partials + TC), step_bench B=1/2/4/8/16: **11.00/11.32/11.65/12.53/14.30** (was
 11.03/11.45/11.98/13.04/15.24); served greedy consistency 14/16 + 15/16, no faults.
 
+**CORRECTION — what each part is actually worth (same day).** The `p12j` ladder showed 128/C1 TPOT
+10.82 -> 10.93, which step_bench at ctx 1024 had hidden. Control objects with ONLY the arena floor
+raised (`PLOW_NV_ARENA_MIN_BYTES`) are faster on this packet: a step, not a slope — any 40-128 KiB
+claim gives B=1/4/16 10.72/11.11/12.13 at ctx 192 (25 KiB: 10.82/11.28/12.24) and
+10.93/11.81/15.14 at ctx 1024 (11.03/11.98/15.24); 160 KiB starts losing, 208 KiB is a cliff
+(11.79/12.78/18.0). The partials' 64 KiB scratch put the object in that band, so part of the
+"kernel" gain above was the claim. Against the same claim, at ctx 1024 B=1/4/16:
+hd256 depth 8 alone 11.03/11.82/14.57 (the B=16 win; B=1 +0.10), + partials -0.14 more at B=16,
+TC alone 10.99/11.79/15.04 and 11.11/12.30 at ctx 8192 (11.25/13.18). The B=1 costs were wide
+paths run on tiny items (a B=1 sliding item is <= 64 rows). Landed: the deep hd256 loop is chosen
+PER TILE (`PLOW_NV_FA_WPR_RB256_MINROWS` = 128 live rows). With it, all-on is B=1/2/4/16
+**10.98/11.35/11.70/14.26** at ctx 1024 and 10.85/11.19 at ctx 192 (lean = floor + gated depth
+only: 10.97/11.37/11.80/14.54 and 10.76/11.16). One dense rule (partials + depth + TC); an
+opt-in "serving" knob was written and dropped — all-on wins every cell direction except B=1 at
+<= ~200 tokens of context (+0.09 ms). A row-count gate on the partials themselves: no gain.
+
 Negatives: 8 rows in flight without the per-head-dim split (255 registers, spills, every rung
 slower: 11.54/12.50/15.24); depth 16 (14.45 at B=16 vs 14.36); thread-per-row (`WPR=0`:
 12.09/12.84/15.81); P.V numerators stored group-contiguous for vector loads (neutral);
@@ -1078,6 +1094,19 @@ out-of-line `d_flash_decode` (callees share the entry's register file: 233 regis
 11.03: barriers and the smem round trip are free, NRN's 5.9 us is its global loads and stores).
 26B: every partials form costs its per-slot MoE rung (B=4 9.57 -> 9.93, the extra 64 KiB smem
 claim) for -0.14 / -0.35 at B=8 / 16, so MoE packets keep the old score loop.
+
+### The BF16 NRN fold (`c1f1ac38`) on H100: off, and why it should stay off here
+
+With the fold on (emit default for non-AMD Gemma dense) the 12B serves fluent garbage on H100;
+`PLOW_NO_FUSE_NRN=1` in the ladder recipes is the fix that was bisected. Reading the two halves:
+NRN2 turns the fused `GemvQkv` into THREE `Gemv` packets with `i3` set -> `d_gemv_nrn`, and NRN1
+rides `GemvGlu` `j1` -> `d_gemv_glu_nrn`. Both stage x + the norm into smem and then run the
+STAGED DOT8 compute, one row at a time (`for m < M`) — not the tensor-core walk. On this host the
+walk is what B=1 and every batched rung run on (12.60 -> 11.93 at B=1 when it replaced dot8), so
+the fold trades 96 packets (~0.57 ms of NRN bodies + gates) for the slow GEMV arm on QKV and GLU
+of all 48 layers. Even once its numerics are fixed it is a loss here; a fold worth having would
+compute the NRN inside the walk ops. Garbage root cause not isolated (needs a fold-on build and a
+per-layer diff); open upstream question for `gemma-12b-perf`.
 
 ### Sized, not started: vendor (cuBLASLt) attention for the hd512 global prefill layers
 

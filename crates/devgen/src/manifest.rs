@@ -1037,8 +1037,10 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
     }
     // * `fa_spart`: decode attention parks its score partials in smem (op_attention.cuh,
     //   PLOW_NV_FA_SPART) and holds 8 hd256 rows in flight. 12B 11.03/11.45/11.98/13.04/15.24 ->
-    //   10.99/11.30/11.67/12.59/14.35. DENSE only: the extra 64 KiB smem claim costs the 26B's
-    //   per-slot MoE rung more than attention gains (B=4 9.57 -> 9.93; B=16 15.46 -> 15.11).
+    //   10.99/11.30/11.67/12.59/14.35. Of that, 0.10/0.17/0.10 ms at B=1/4/16 is the larger smem
+    //   claim by itself (same kernels with a 40-128 KiB arena floor: 10.93/11.81/15.14; cliff at
+    //   208 KiB). DENSE only: on the 26B every extra KiB of claim costs the per-slot MoE rung
+    //   (B=4 9.55 -> 9.71 at 24-40 KiB, 9.99 at 57) more than attention gains.
     // * `fa_tc_hd512`: the hd512/GQA8 layers score and accumulate on the tensor cores
     //   (PLOW_NV_FA_TC_GQA8_HD512). Neutral at ctx 1024 (10.99/11.67/14.35 -> 11.02/11.66/14.29),
     //   and the long-context term: ctx 8192 B=1/4 11.30/12.99 -> 11.14/12.19.

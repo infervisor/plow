@@ -121,9 +121,11 @@ __device__ __forceinline__ float __fa_ex2(float x) {
  * At GF=2 that is NO sync point in the score loop, so hd256 can hold PLOW_NV_FA_WPR_RB256 rows in
  * flight: hd512/GF8 owns the decode entry's register peak and keeps PLOW_NV_FA_WPR_RB, hd256/GF2
  * fits 8 rows at the same 239 registers.
- * MEASURED h100-sxm5, Gemma-4-12B step_bench ctx 1024, B=1/4/16: 11.03/11.99/15.24 ->
- * 11.01/11.71/14.36 ms at hd256 depth 8 (4: 10.94/11.71/14.63, 16: 11.09/11.85/14.45). Body
- * ablation of the B=16 step: score 2.71 ms (shuffles 0.56), P.V 1.16, rest of FlashDecode ~0.5.
+ * MEASURED h100-sxm5, Gemma-4-12B step_bench ctx 1024, B=1/4/16, against a control with the
+ * same smem claim (10.93/11.81/15.14; the claim alone is worth 0.10/0.17/0.10 on this packet):
+ * depth 8 alone 10.97/11.80/14.54, + partials 11.00/11.66/14.34, + tensor-core hd512
+ * 10.98/11.70/14.26 (and ctx 8192 B=1/4 11.25/13.18 -> 11.21/12.29). Body ablation of the B=16
+ * step: score 2.71 ms (shuffles 0.56), P.V 1.16, rest of FlashDecode ~0.5.
  * Costs TILE*64 floats (64 KiB) of arena. Score sums change order: not bit-identical. */
 #ifndef PLOW_NV_FA_SPART
 #define PLOW_NV_FA_SPART 0
@@ -131,6 +133,13 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #ifndef PLOW_NV_FA_WPR_RB256
 #define PLOW_NV_FA_WPR_RB256 PLOW_NV_FA_WPR_RB
 #endif
+/* The deep hd256 loop only for tiles with this many live rows: at B=1 a sliding item is <= 64
+ * rows (8 per warp), where depth 8 is one iteration of mostly dead loads and costs the step
+ * 0.10 ms at ctx 1024, 0.16 at ctx 192 (12B, measured with everything else equal). */
+#ifndef PLOW_NV_FA_WPR_RB256_MINROWS
+#define PLOW_NV_FA_WPR_RB256_MINROWS 128
+#endif
+template <int V> struct fa_depth { static constexpr int v = V; };
 #define FA_DEC_SPART(D, GF)                                                                    \
     (PLOW_NV_FA_SPART && (D) >= 256 && ((GF) == 2 || (GF) == 4 || (GF) == 8) &&               \
      !FA_DEC_TC_GQA8(D, GF))
@@ -792,7 +801,8 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + i] = FA_NEG_INF;
             }
             }
-            constexpr int WRB = (D == 256) ? PLOW_NV_FA_WPR_RB256 : PLOW_NV_FA_WPR_RB;
+            auto score_rows = [&](auto depth) {
+            constexpr int WRB = decltype(depth)::v;
             for (unsigned rb = warp; rb < rmax; rb += PLOW_NV_WARPS * WRB) {
                 /* WRB rows, strided by the warp count so each warp's batch stays disjoint. */
                 bf16v8 k8[WRB][NC];
@@ -865,6 +875,13 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                         for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + r] = sr[g];
                     }
                 }
+            }
+            };
+            if constexpr (D == 256 && PLOW_NV_FA_WPR_RB256 != PLOW_NV_FA_WPR_RB) {
+                if (rmax >= PLOW_NV_FA_WPR_RB256_MINROWS) score_rows(fa_depth<PLOW_NV_FA_WPR_RB256>{});
+                else score_rows(fa_depth<PLOW_NV_FA_WPR_RB>{});
+            } else {
+                score_rows(fa_depth<PLOW_NV_FA_WPR_RB>{});
             }
             __syncthreads();
             if constexpr (FA_DEC_SPART(D, GF)) {

@@ -501,8 +501,10 @@ __device__ __forceinline__ void plow_moe_row_rms(float* __restrict__ inv, float*
      * block of the router-score and expert-GLU ops runs it for all B rows. Here a thread owns
      * 8-element vectors (H % 8 == 0), the rows' loads do not depend on each other, and the whole
      * batch shares one barrier pair. The per-thread partition changes, so inv differs from the
-     * scalar body in the last ulp; B=1 keeps the scalar body and its bit-identity. */
-    if (nrow > 1u && (H & 7u) == 0u) {
+     * scalar body in the last ulp. B=1 takes it too on the row-blocked (sm_90a) build, together
+     * with the 8-wide xn staging of the B=1 expert GLU: 26B step 5.80 -> 5.70 ms; elsewhere B=1
+     * keeps the scalar body and its bit-identity. */
+    if ((nrow > 1u || PLOW_NV_GEMV_RB) && (H & 7u) == 0u) {
         __shared__ float rms_w[PLOW_MOE_MAXB * PLOW_NV_WARPS];
         const unsigned nvec = H >> 3;
         for (unsigned r = 0; r < nrow; r++) {
@@ -1930,7 +1932,21 @@ static __device__ void d_moe_expert_glu_norm_gemma_rb(
     float* xn_s = arena;
 #endif
     plow_moe_row_rms(invs, rms_red, resid, H, 1u, eps);
-    {
+    if ((H & 7u) == 0u) {
+        const float inv = invs[0];
+        for (unsigned c = threadIdx.x; c < (H >> 3); c += blockDim.x) {
+            const bf16v8 xv = ld_glob8(resid + c * 8u), gv8 = ld_glob8(gamma + c * 8u);
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float v = __bfloat162float(xv.x[j]) * inv * __bfloat162float(gv8.x[j]);
+#if PLOW_MOE_XN_BF16
+                xn_s[c * 8u + j] = __float2bfloat16(v);
+#else
+                xn_s[c * 8u + j] = v;
+#endif
+            }
+        }
+    } else {
         const float inv = invs[0];
         for (unsigned h = threadIdx.x; h < H; h += blockDim.x) {
             const float v = __bfloat162float(resid[h]) * inv * __bfloat162float(gamma[h]);
