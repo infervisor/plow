@@ -1271,6 +1271,50 @@ px4, so new exactness evidence. Global-layer K/V are linear ([slot][kvh][row][hd
   PLOW_VMM_LIVE_RINGS=1`, unmeasured). plowc-as-JIT not needed: a geometry change is a 4-9 s devblob
   re-emit against existing objects.
 
+* Prefill attention route for packs (agent/pf-attn-packs, `317be5e7`). Three changes: (1) routed
+  launches keep the segment graph for the ranges between their attention segments (graph pieces,
+  keyed `(bucket, slot table, first, end)`), and the load-time warmup now builds routed buckets'
+  whole chains and pieces (it skipped every bucket with a route site); (2) opt-in grouped route
+  `PLOW_PF_ATTN_GEMM_GROUPED=1`: one launch table per launch (tiles of every request, shapes in
+  device arrays), one grouped cuBLASLt Q.K^T / grouped softmax (`plow_attn_softmax_gw`, cubin ABI
+  2) / grouped P.V per routed segment and scratch wave, each shape bucket's algorithm timed on
+  first use (the heuristic's first pick was 5-18% slower than the per-request exact-shape plan);
+  (3) `PLOW_PF_SEG_TIME` prints the route's qk / softmax / pv split.
+  * Block (L5, B=1, chunk 4096): act.at relL2 vs native 3.4e-3 (1024) / 2.9e-3 (4096), grouped
+    identical to per-request; packed-check parity PASS with the route forced. hd512 segment per
+    chunk (steady) native 1.74 / 4.75 / 7.77 / 10.47 -> per-request 0.91 / 2.19 / 3.41 / 2.70 ->
+    grouped 0.91 / 2.14 / 3.35 / 2.69 ms. Phases at 15000 (last pass): qk / softmax / pv =
+    0.34 / 0.33 / 0.29, 0.76 / 0.93 / 0.64, 1.19 / 1.54 / 1.04 (2 waves), 0.84 / 1.10 / 0.75 ms:
+    the softmax is the largest phase past 8K KV. First use of a shape key costs 70-78 ms (8
+    candidates x 2 GEMMs), once per (wave, m bucket, n bucket).
+  * Served, same hour, per-request vs grouped (both with graph pieces): C4 4096/8192/15000 TTFT
+    329.1/712.9/1472.7 vs 329.0/714.6/1471.1 (identical); C16 671.8/1259.9/2442.1 vs
+    664.6/1256.2/2414.2, TPOT 30.81/50.48/86.06 vs 30.58/49.97/85.04, tok/s 443/265/152 vs
+    447/267/154 (all six C16 metrics 0.3-1.1% in grouped's favour, single runs: not convictable).
+    Per-request launches were not the pack cost; the attention GEMM work is. vs the end-to-end
+    reference (old binary): C16 TTFT -2.0/-0.7/-1.4%, C4 -0.9/-0.5/-0.5%.
+  * +5 ms at 128/C16 (route loaded, nothing routed) ROOT CAUSE: the load-time graph warmup skipped
+    every bucket with a route site (all buckets >= 1024 rows), so the 1024 / 1088 / 2048 buckets'
+    graphs were captured on first use inside the timed cell (e2e log: buckets 3 and 4 built at
+    15:32:38, mid-cell). The whole excess sits in ONE 16-request pack: TTFT by rank quartile e2e
+    minus new = -0.6 / -0.7 / -0.5 / +19.6 ms. Fixed by warming routed buckets (graphs 40 -> 292,
+    load +173 ms). Same session: 128/C16 route on 73.36 vs off 73.06 ms (e2e: 77.79), 1024/C16
+    TTFT 319.4 vs 323.6, TPOT 16.74 vs 16.76 (e2e on: 16.94). Bisect arms (new binary, 128/C16):
+    off 73.11, loaded with no site (MIN_ROWS 1e6) 72.95, scratch 528 KiB (TILE 1) 72.93: the
+    scratch, the module and the threshold-0 waits cost nothing.
+  * 15000/C1 tail: 750.0 -> 747.3 ms (grouped + graph pieces); target 690 NOT met. Served SEG_TIME attribution of the 15000 prefill on the route (4 chunks,
+    shares): Gemm 63%, FlashPrefill 22% (the 40 sliding hd256 layers ~83 ms of 154; the 8 hd512
+    route segments ~71), Glu 6%, norms 6%. The 2712-row tail chunk runs the full 4096 bucket
+    (its Gemm time equals a full chunk's): 1384 padded rows. Next: a 2816 / 3072 rung
+    (`PLOW_PF_LADDER_APPEND`, re-emit only) for the tail, and the sliding-window attention.
+  * Non-last-chunk slowdown: NOT the route. Every segment of a non-last chunk (QKV / MLP GEMMs
+    too, native too) is 3-9% slower than the same shape in the last chunk (native T=15000 pc1
+    0.342 vs 0.316, pc10 0.620 vs 0.603 ms); attention shows the same ratio.
+  * Numerics / serving: gate OK, needle 1026/4104/8200/15000 OK, greedy consistency 15/16 (x4) +
+    14/16 (x16) (the production near-tie flips), 0 fault lines in every served run.
+  * Nulls: grouped packs (above); grouped route with the heuristic's first algorithm (+5-18% per
+    segment). Not run: the full two-profile ladder on the final binary.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
