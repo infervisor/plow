@@ -996,6 +996,35 @@ Negatives on `p12u` (2026-09-20): walk depth 10 / 15 (B=1 11.58 / 11.70 vs 11.18
 `PLOW_MULTISTEP` 4 / 8 / 16 at C1 (TPOT 10.96 / 10.95 / 10.94, p99 ITL 44 / 88 / 175 ms) — the host
 is already out of the C1 step.
 
+### C1 pass: where the last few percent are (2026-09-21)
+
+Body ablation on the B=1 step (10.94 ms; gates and signals intact, `PLOW_NV_ABLATE_LO`):
+NormResidualNorm 0.57 ms (96 x 5.9 us), FlashDecode 0.71 (48 x 14.9 us), FlashMerge 0.28, RoPE
+0.10; ALL bodies off = 0.74 ms, so the 25% gate share is waiting on narrow-op bodies and
+stragglers, not packet machinery. By bytes GLU and QKV walk at ~3.2 TB/s (the HBM roof), the
+single-stream GEMVs (down, o_proj) at ~2.4, the lm_head at 2.8.
+
+Landed (`7cd6cd47`):
+* **One activation load per k-step on the B=1 walk** (`ONE`): rows 0-7 and 8-15 of the mma both
+  clamp to row 0 at B=1, so the second load was a duplicate. step_bench B=1 11.17 -> 11.04.
+* **Recipe: threaded split tokenizer** (16 / 512, what the 26B recipes had): C1 TTFT 50.1 -> 47.3
+  at 1024 in, 186.3 -> 176.7 at 4096, 863 -> 830 at 15000. Finer splits no better.
+* **Recipe: BOS rungs** `256,1088,1152,4160,4224` + the Lt policy rows for them: 1088 is worth
+  47.22 -> 46.82 at 1024 in (the 1152 bucket cost as much as 1024 + a 1-row tail launch); the
+  others neutral. An appended rung NOT in `CUBLASLT_PREFILL_WIDE_ROWS` runs every projection on
+  the native GEMM object — the 26B's 1152 rung had been doing that (neutral there).
+
+Negatives: walk depth per stream count (NW=1 at 16/20/24: all worse than uniform 12); two row
+blocks per k-step (B=1 -0.1 ms on the K=15360 walk, neutral-to-worse on the 26B); attention
+`QGLOB` / `QREG` / `REDBOUND` (<= 0.4%); probing Lt algorithms for the appended rungs (default
+heuristics were already as fast); `PLOW_MULTISTEP` 8 / 16.
+
+Ladder on `p12y` (all of the above), vs vLLM 0.28, with the 32-slot packet for the <= 1024 C16/C32
+cells: **16 of 60 metric-cells ahead**. New: 1024/C1 TTFT 46.70 vs 46.7 (level), 15000/C4 TTFT
+1652 vs 1653. C1 TPOT 10.82 / 11.05 / 11.19 / 11.37 / 11.68 vs 10.55–10.62 (1.03–1.10x), C4
+11.50–27.5 (1.09–1.49x), 128/C16 12.83 vs 11.01. NOTE three of the sixteen are the >= 4096 C32
+TPOT cells, which "win" only because the 16-slot packet queues half the requests.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
