@@ -1462,3 +1462,10 @@ column"). 26B-specific numbers, packet `p26i`, 16 prompts:
 * Prefix cache-on: not re-run; the 12B follow-up (dense tracker, report day) shows the cap defaults
   are the limiter, but the 26B has no room for a 9 GiB snapshot cache beside 47 GiB weights + 30 GiB
   KV at this packet's ring; needs a smaller-ring cache packet or a KV budget trade.
+* END-TO-END set (`c446ea59`, `c0c824a1`): p26lt on the final binary `16501159` reproduces the
+  p26lt FINAL within 1% in every cell (1024/C16 TTFT 171 vs 182); vLLM re-run in the same hour is
+  the new reference (within 2% of the morning run except 1024/C32 411 -> 334: the morning run had a
+  slow first wave). Standing 10 of 60 ahead. GSM8K 191/200 (was 190).
+* 26B twin of the request-chunk geometry recipe `gemma4-26b-a4b.h100.bf16-c32-req1k-16k.toml`
+  (`f56e32e5`): emit checks pass, unmeasured. MoE decode grouped-GEMM agent and prefix-cache
+  defaults agent still running at the time of this note.
