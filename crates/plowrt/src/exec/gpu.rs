@@ -7815,7 +7815,9 @@ impl GpuEngine {
         let mut best = vec![(usize::MAX, smallest); goal + 1];
         best[0] = (0, smallest);
         for s in 1..=goal {
-            let left = s * unit;
+            // The goal state plans the TRUE remainder: an appended rung that is not a multiple of
+            // the unit (1088 on a 128-row unit) covers a 1030-row prompt, the rounded-up 1152 do not.
+            let left = (s * unit).min(rem);
             for (i, bkt) in self.prefill.iter().take(n_allowed).enumerate() {
                 let t = bkt.t as usize;
                 // `t >= unit` ⇒ `next < s`, so the table fills in one pass.
