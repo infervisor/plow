@@ -44,9 +44,12 @@ PLOW_TMA_GEMM = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
-# Rungs of >= 8 rows sort their B*k slots by expert and run the routed experts through the
-# grouped tensor-core GEMMs (step_bench ms/step at B=8/16: 16.3 -> 14.3, 27.0 -> 18.0).
-PLOW_GEMMA_MOE_DEC_GROUP = "8"
+# Rungs of >= 4 rows sort their B*k slots by expert; EMIT_MOE_DEC_LT marks each layer's expert
+# pair so the runtime serves it with cuBLASLt grouped matmuls (PLOW_MOE_DEC_LT=4 in serve.env).
+# step_bench ctx 1024 B=4/8/16 ms: 9.61 / 12.75 / 15.28 (GROUP 8, in-tree) -> 8.73 / 10.15 / 12.57.
+# Without the serve knob this emit is +1.65 ms at B=4 (in-tree grouped arm from 4 rows).
+PLOW_GEMMA_MOE_DEC_GROUP = "4"
+PLOW_EMIT_MOE_DEC_LT = "1"
 PLOW_SLIDING_NS_GRID = "1"
 PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
 PLOW_SLIDING_NS_CAP = "1"
@@ -115,6 +118,11 @@ PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 
 [serve.env]
+# cuBLASLt grouped expert GEMMs on decode rungs >= 4 (needs the emit above; turns multistep off).
+# Served (e2e2) vs the GROUP 8 packet: C16 TPOT 15.26 / 17.84 / 26.87 -> 12.41 / 15.10 / 24.51 ms at
+# 128 / 1024 / 4096 in, tok/s +22 / +16 / +8% (vs the e2e run); same-session realtime A/B: C4 TPOT
+# 9.43 -> 8.77 at 128, 15000/C4 TTFT 998 -> 695 but TPOT 18.12 -> 19.89; C1 TPOT +0.06 ms.
+PLOW_MOE_DEC_LT = "4"
 PLOW_PREFIX_CACHE = "0"
 PLOW_MOE_PF_LT = "1"
 PLOW_PF_SEG_PURE = "1"
