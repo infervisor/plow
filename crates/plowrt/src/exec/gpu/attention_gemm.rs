@@ -5,15 +5,28 @@
 //!
 //! One KV head makes both products plain 2-D GEMMs over the packet's own layouts: Q and the
 //! output are `[row][head][hd]`, a slot's K/V are `[row][hd]`.
+//!
+//! A launch's tiles (every request of the pack, every tile of each) form GROUPS. The grouped
+//! path (`begin_launch` / `run_site`) uploads one table per launch — the groups' shapes, the
+//! per-site matrix pointers, and the byte ranges to zero — and serves each routed segment with
+//! one grouped `Q.K^T`, one grouped softmax and one grouped `P.V` per wave (a wave is the
+//! prefix of groups whose score tiles fit the scratch together). The shapes live in device
+//! arrays a grouped layout binds at creation, so the plans never depend on the launch.
+//! `run` is the per-request form, kept for launches the grouped path cannot take.
 
 use super::*;
 use crate::asset::devblob::{DevProg, DevTensor};
-use crate::device::cuda::lt::{AttentionGemm as Gemm, Lt, Plan};
+use crate::device::cuda::lt::{AttentionGemm as Gemm, GroupedAttention, GroupedPlan, Lt, Plan};
 
 pub(super) const SOFTMAX_OBJECT: &str = "attn_softmax_sm90a.cubin";
+/// ABI 2 adds the grouped entries; an ABI-1 object serves the per-request route only.
+const SOFTMAX_ABI: u32 = 2;
 /// The warp-per-row entries (coalesced); the thread-per-row ones stay in the object for A/Bs.
 const SOFTMAX_ENTRY: &str = "plow_attn_softmax_w";
 const SOFTMAX_ENTRY_F32: &str = "plow_attn_softmax_w_f32";
+const SOFTMAX_GROUPED_ENTRY: &str = "plow_attn_softmax_gw";
+const SOFTMAX_GROUPED_ENTRY_F32: &str = "plow_attn_softmax_gw_f32";
+const ZERO_ENTRY: &str = "plow_attn_zero";
 /// Scores are produced in the log2 domain so the kernel's exp is the hardware exp2.
 const LOG2_E: f32 = std::f32::consts::LOG2_E;
 /// Score rows are padded to this many columns: the tail GEMM below reads P in 128-column
@@ -22,8 +35,16 @@ const PITCH: u32 = 128;
 /// cuBLASLt's BF16 kernels want the KV extent 8-aligned (measured 2.6x slower otherwise). V
 /// rows past a request's `kvlen` may hold anything, so the last tile's `P.V` stops at a
 /// 128-aligned column and finishes on a zero-padded copy of the remaining rows, this many.
+/// (The grouped path zeroes those V rows instead.)
 const TAIL_ROWS: u32 = 128;
 const PLAN_CACHE: usize = 4096;
+/// A grouped layout binds its shape arrays at creation, so each wave index owns a fixed
+/// block of the launch table; a launch needing more waves takes the per-request path.
+const WAVES: usize = 8;
+/// Pinned staging buffers a launch table upload rotates through.
+const STAGING: usize = 4;
+/// Shape arrays per wave block: hd, m, n8, ld_s, ld_p.
+const DIMS: usize = 5;
 
 /// One `FlashPrefill` site served by the route. Addresses are the slot-0 tensor bases.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -39,6 +60,20 @@ pub(super) struct Site {
     scale: f32,
 }
 
+impl Site {
+    fn row_bytes(&self) -> u64 {
+        u64::from(self.heads) * u64::from(self.head_dim) * 2
+    }
+
+    fn kv_row_bytes(&self) -> u64 {
+        u64::from(self.head_dim) * 2
+    }
+
+    fn slot_rows(&self) -> u32 {
+        (self.slot_bytes / self.kv_row_bytes()) as u32
+    }
+}
+
 /// `[q0, qlen, slot, kvlen]`: the packed request table's row, also built for a serialized chunk.
 pub(super) type Request = [u32; 4];
 
@@ -50,6 +85,28 @@ struct SoftmaxArgs {
     pitch: u32,
     heads: u32,
     first: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+struct SoftmaxGroupedArgs {
+    scores: u64,
+    rows: u64,
+    cols: u64,
+    ld: u64,
+    first: u64,
+    row_start: u64,
+    groups: u32,
+    total_rows: u32,
+    heads: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+struct ZeroArgs {
+    ptr: u64,
+    bytes: u64,
+    count: u32,
     pad: u32,
 }
 
@@ -124,6 +181,76 @@ pub(super) fn sites(
     out
 }
 
+/// One score tile of one request: query rows `[row0, row0 + tile)` of the launch.
+#[derive(Clone, Copy)]
+struct Group {
+    row0: u32,
+    slot: u32,
+    m: u32,
+    n8: u32,
+    pitch: u32,
+    first: u32,
+    scratch: u64,
+}
+
+struct Wave {
+    groups: std::ops::Range<usize>,
+    rows: u32,
+    m_bucket: u32,
+    n_bucket: u32,
+    /// Table offsets of the wave's score pointers, causal starts and row prefix sums.
+    s_off: u64,
+    first_off: u64,
+    row_start_off: u64,
+}
+
+struct Launch {
+    sites: Vec<Site>,
+    waves: Vec<Wave>,
+    /// Table offset of each site's per-wave `[q | k | v | o]` pointer arrays.
+    site_off: Vec<Vec<u64>>,
+}
+
+struct Staging {
+    host: PinnedHost,
+    done: CudaEvent,
+    pending: bool,
+}
+
+/// Little-endian writer over the pinned staging buffer, mirroring the device table.
+struct Table<'a> {
+    bytes: &'a mut [u8],
+    end: usize,
+}
+
+impl Table<'_> {
+    fn put_i32(&mut self, at: usize, values: impl IntoIterator<Item = i32>) -> Result<usize> {
+        let mut at = at;
+        for v in values {
+            self.bytes
+                .get_mut(at..at + 4)
+                .ok_or_else(|| RuntimeError::Rejected("attention launch table overflow".into()))?
+                .copy_from_slice(&v.to_le_bytes());
+            at += 4;
+        }
+        self.end = self.end.max(at);
+        Ok(at)
+    }
+
+    fn put_u64(&mut self, at: usize, values: impl IntoIterator<Item = u64>) -> Result<usize> {
+        let mut at = at;
+        for v in values {
+            self.bytes
+                .get_mut(at..at + 8)
+                .ok_or_else(|| RuntimeError::Rejected("attention launch table overflow".into()))?
+                .copy_from_slice(&v.to_le_bytes());
+            at += 8;
+        }
+        self.end = self.end.max(at);
+        Ok(at)
+    }
+}
+
 pub(super) struct AttentionGemm {
     be: Arc<CudaBackend>,
     lt: Arc<Lt>,
@@ -137,9 +264,29 @@ pub(super) struct AttentionGemm {
     /// `TAIL_ROWS` KV rows for the last tile's remainder GEMM.
     vtail: DeviceMem,
     plans: std::collections::HashMap<(Gemm, u32, u32, u32, u32), Plan>,
+    /// Grouped path (`PLOW_PF_ATTN_GEMM_GROUPED`, grouped cuBLASLt matmuls, an ABI-2 object):
+    /// its softmax and zero entries.
+    grouped: Option<[KernelFn; 2]>,
+    max_groups: usize,
+    /// `[WAVES x DIMS x max_groups] i32` shape blocks, then the per-launch pointer tables.
+    table: DeviceMem,
+    dims_bytes: usize,
+    staging: Vec<Staging>,
+    staging_next: usize,
+    grouped_plans: std::collections::HashMap<GroupedKey, GroupedPlan>,
+    launch: Option<Launch>,
+    /// `PLOW_PF_SEG_TIME`: one event per phase boundary of every grouped wave run.
+    seg_time: bool,
+    phases: Vec<[CudaEvent; 4]>,
 }
 
+/// (kind, wave, m bucket, n bucket, head dim, alpha bits): the wave fixes the shape arrays,
+/// the buckets steer the heuristic.
+type GroupedKey = (Gemm, usize, u32, u32, u32, u32);
+
 impl AttentionGemm {
+    /// `max_sites` routed segments per launch, `batch` slots, `max_rows` the largest bucket.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn load(
         be: &Arc<CudaBackend>,
         lt: Arc<Lt>,
@@ -147,6 +294,9 @@ impl AttentionGemm {
         max_heads: u32,
         max_head_dim: u32,
         max_ctx: usize,
+        max_sites: usize,
+        batch: usize,
+        max_rows: u32,
     ) -> Result<Self> {
         let config = &crate::config::RuntimeConfig::get().nv;
         let image = std::fs::read(object).map_err(|e| {
@@ -156,13 +306,17 @@ impl AttentionGemm {
             ))
         })?;
         let module = be.module_load(&image)?;
-        if be.module_global_u32(&module, "plow_attn_softmax_abi")? != Some(1)
+        let abi = be.module_global_u32(&module, "plow_attn_softmax_abi")?;
+        if !matches!(abi, Some(1) | Some(SOFTMAX_ABI))
             || be.module_global_u32(&module, "plow_block_attn_softmax")? != Some(BLOCK)
         {
-            return Err(RuntimeError::Rejected(
-                "incompatible attention softmax object".into(),
-            ));
+            return Err(RuntimeError::Rejected(format!(
+                "incompatible attention softmax object (ABI {SOFTMAX_ABI} expected)"
+            )));
         }
+        let kernel_groups = be
+            .module_global_u32(&module, "plow_attn_softmax_max_groups")?
+            .unwrap_or(0) as usize;
         let scores_f32 = config.pf_attn_gemm_s32;
         let softmax = be.get_function(
             &module,
@@ -173,10 +327,45 @@ impl AttentionGemm {
         let element = if scores_f32 { 4 } else { 2 };
         let scratch = be.alloc(0, u64::from(tile_rows) * u64::from(max_heads) * pitch * element)?;
         let vtail = be.alloc(0, u64::from(TAIL_ROWS) * u64::from(max_head_dim) * 2)?;
+        let grouped = if config.pf_attn_gemm_grouped && lt.has_grouped() && kernel_groups > 0 {
+            let entry = if scores_f32 {
+                SOFTMAX_GROUPED_ENTRY_F32
+            } else {
+                SOFTMAX_GROUPED_ENTRY
+            };
+            Some([be.get_function(&module, entry)?, be.get_function(&module, ZERO_ENTRY)?])
+        } else {
+            None
+        };
+        if config.pf_attn_gemm_grouped && grouped.is_none() {
+            tracing::warn!(
+                "PLOW_PF_ATTN_GEMM_GROUPED needs grouped cuBLASLt matmuls and softmax object ABI \
+                 {SOFTMAX_ABI}; per-request launches"
+            );
+        }
+        // Every request adds at most one partial tile to the launch's whole tiles.
+        let max_groups = (batch + max_rows.div_ceil(tile_rows) as usize)
+            .clamp(1, kernel_groups.max(1));
+        let dims_bytes = WAVES * DIMS * max_groups * 4;
+        let pointer_bytes = WAVES * (max_groups * 16 + 16)
+            + max_sites * WAVES * max_groups * 32
+            + max_sites * (batch + 1) * 16;
+        let table = be.alloc(0, (dims_bytes + pointer_bytes) as u64)?;
+        let mut staging = Vec::with_capacity(STAGING);
+        for _ in 0..STAGING {
+            staging.push(Staging {
+                host: be.host_alloc_pinned(dims_bytes + pointer_bytes)?,
+                done: be.event_create(false)?,
+                pending: false,
+            });
+        }
         tracing::info!(
             object = %object.display(),
             tile_rows,
             scores_f32,
+            grouped = grouped.is_some(),
+            max_groups,
+            table_kib = (dims_bytes + pointer_bytes) >> 10,
             scratch_mib = scratch.len >> 20,
             "vendor-GEMM prefill attention loaded"
         );
@@ -191,6 +380,16 @@ impl AttentionGemm {
             scratch,
             vtail,
             plans: std::collections::HashMap::new(),
+            grouped,
+            max_groups,
+            table,
+            dims_bytes,
+            staging,
+            staging_next: 0,
+            grouped_plans: std::collections::HashMap::new(),
+            launch: None,
+            seg_time: config.pf_seg_time,
+            phases: Vec::new(),
         })
     }
 
@@ -225,9 +424,9 @@ impl AttentionGemm {
         rows: u32,
         stream: &CudaStream,
     ) -> Result<()> {
-        let row_bytes = u64::from(site.heads) * u64::from(site.head_dim) * 2;
-        let kv_row_bytes = u64::from(site.head_dim) * 2;
-        let slot_rows = (site.slot_bytes / kv_row_bytes) as u32;
+        let row_bytes = site.row_bytes();
+        let kv_row_bytes = site.kv_row_bytes();
+        let slot_rows = site.slot_rows();
         let element = if self.scores_f32 { 4 } else { 2 };
         let mut real = 0;
         for &[q0, qlen, slot, kvlen] in requests {
@@ -331,6 +530,464 @@ impl AttentionGemm {
         }
         Ok(())
     }
+
+    /// The launch's tiles in request order, and the tensor rows every request must fit.
+    fn groups(
+        &self,
+        site: &Site,
+        requests: &[Request],
+        rows: u32,
+    ) -> Result<Option<(Vec<Group>, u32)>> {
+        let element = if self.scores_f32 { 4 } else { 2 };
+        let slot_rows = site.slot_rows();
+        let mut groups = Vec::new();
+        let mut real = 0;
+        for &[q0, qlen, slot, kvlen] in requests {
+            let past = kvlen.checked_sub(qlen).ok_or_else(|| {
+                RuntimeError::Rejected("attention request is longer than its KV".into())
+            })?;
+            if kvlen > slot_rows || q0.checked_add(qlen).is_none_or(|end| end > rows) {
+                return Err(RuntimeError::Rejected(
+                    "attention request exceeds its tensors".into(),
+                ));
+            }
+            let mut done = 0;
+            while done < qlen {
+                let tile = self.tile_rows.min(qlen - done);
+                let m = tile * site.heads;
+                let n8 = (past + done + tile).next_multiple_of(8);
+                let pitch = n8.next_multiple_of(PITCH);
+                if u64::from(m) * u64::from(pitch) * element > self.scratch.len {
+                    return Err(RuntimeError::Rejected(
+                        "attention score tile exceeds its scratch".into(),
+                    ));
+                }
+                if groups.len() == self.max_groups {
+                    return Ok(None);
+                }
+                groups.push(Group {
+                    row0: q0 + done,
+                    slot,
+                    m,
+                    n8,
+                    pitch,
+                    first: past + done + 1,
+                    scratch: 0,
+                });
+                done += tile;
+            }
+            real = real.max(q0 + qlen);
+        }
+        Ok(Some((groups, real)))
+    }
+
+    /// Stage the launch table for `sites` (in segment order) and zero the KV rows every
+    /// group's `P.V` reads past its request, then the output rows past the last request.
+    /// `false` = the launch is not groupable; `run` serves its sites instead.
+    pub(super) fn begin_launch(
+        &mut self,
+        sites: &[Site],
+        requests: &[Request],
+        rows: u32,
+        stream: &CudaStream,
+    ) -> Result<bool> {
+        self.launch = None;
+        let Some(first) = sites.first() else {
+            return Ok(false);
+        };
+        let geometry = |s: &Site| (s.heads, s.head_dim, s.slot_bytes);
+        let Some([_, zero]) = self.grouped else {
+            return Ok(false);
+        };
+        if requests.is_empty()
+            || sites.iter().any(|s| geometry(s) != geometry(first))
+        {
+            return Ok(false);
+        }
+        let Some((mut groups, real)) = self.groups(first, requests, rows)? else {
+            return Ok(false);
+        };
+        let element = if self.scores_f32 { 4 } else { 2 };
+        // Waves: prefixes of groups whose score tiles fit the scratch together.
+        let mut waves: Vec<Wave> = Vec::new();
+        let mut start = 0;
+        let mut used = 0u64;
+        for index in 0..groups.len() {
+            let bytes = u64::from(groups[index].m) * u64::from(groups[index].pitch) * element;
+            if used + bytes > self.scratch.len {
+                waves.push(Wave {
+                    groups: start..index,
+                    rows: 0,
+                    m_bucket: 0,
+                    n_bucket: 0,
+                    s_off: 0,
+                    first_off: 0,
+                    row_start_off: 0,
+                });
+                start = index;
+                used = 0;
+            }
+            groups[index].scratch = self.scratch.base + used;
+            used += bytes;
+        }
+        waves.push(Wave {
+            groups: start..groups.len(),
+            rows: 0,
+            m_bucket: 0,
+            n_bucket: 0,
+            s_off: 0,
+            first_off: 0,
+            row_start_off: 0,
+        });
+        if waves.len() > WAVES {
+            return Ok(false);
+        }
+
+        let slot = self.staging_next;
+        self.staging_next = (slot + 1) % STAGING;
+        let staging = &mut self.staging[slot];
+        if std::mem::take(&mut staging.pending) {
+            self.be.event_synchronize(&staging.done)?;
+        }
+        let mut table = Table {
+            bytes: staging.host.as_mut_slice(),
+            end: 0,
+        };
+        let head_dim = first.head_dim as i32;
+        // P is bf16 at the start of each score row: its pitch counts an f32 row in bf16 units.
+        let ld_scale: u32 = if self.scores_f32 { 2 } else { 1 };
+        let maxg = self.max_groups;
+        for (w, wave) in waves.iter_mut().enumerate() {
+            let block = w * DIMS * maxg * 4;
+            let members = &groups[wave.groups.clone()];
+            let column = |f: &dyn Fn(&Group) -> i32, pad: i32| {
+                members
+                    .iter()
+                    .map(f)
+                    .chain(std::iter::repeat(pad))
+                    .take(maxg)
+                    .collect::<Vec<_>>()
+            };
+            // Groups past the launch's are empty (m = 0) with valid, 8-row operands.
+            table.put_i32(block, std::iter::repeat_n(head_dim, maxg))?;
+            table.put_i32(block + maxg * 4, column(&|g| g.m as i32, 0))?;
+            table.put_i32(block + 2 * maxg * 4, column(&|g| g.n8 as i32, 8))?;
+            table.put_i32(block + 3 * maxg * 4, column(&|g| g.pitch as i32, 8))?;
+            table.put_i32(
+                block + 4 * maxg * 4,
+                column(&|g| (g.pitch * ld_scale) as i32, 8),
+            )?;
+            wave.rows = members.iter().map(|g| g.m).sum();
+            wave.m_bucket = (wave.rows / members.len().max(1) as u32).next_power_of_two();
+            wave.n_bucket = members
+                .iter()
+                .map(|g| g.n8)
+                .max()
+                .unwrap_or(8)
+                .next_power_of_two();
+        }
+        let mut at = self.dims_bytes;
+        let spare = self.scratch.base;
+        // Every pointer array has `max_groups` entries: the empty groups point at the scratch.
+        let padded = |values: Vec<u64>| {
+            values
+                .into_iter()
+                .chain(std::iter::repeat(spare))
+                .take(maxg)
+        };
+        for wave in &mut waves {
+            let members = &groups[wave.groups.clone()];
+            wave.s_off = at as u64;
+            at = table.put_u64(at, padded(members.iter().map(|g| g.scratch).collect()))?;
+            wave.first_off = at as u64;
+            at = table.put_i32(at, members.iter().map(|g| g.first as i32))?;
+            wave.row_start_off = at as u64;
+            let mut sum = 0i32;
+            at = table.put_i32(
+                at,
+                std::iter::once(0).chain(members.iter().map(|g| {
+                    sum += g.m as i32;
+                    sum
+                })),
+            )?;
+            at = at.next_multiple_of(8);
+        }
+        let mut site_off = Vec::with_capacity(sites.len());
+        for site in sites {
+            let mut offsets = Vec::with_capacity(waves.len());
+            for wave in &waves {
+                let members = &groups[wave.groups.clone()];
+                offsets.push(at as u64);
+                let pointers: [Vec<u64>; 4] = [
+                    members.iter().map(|g| site.q + u64::from(g.row0) * site.row_bytes()).collect(),
+                    members.iter().map(|g| site.k + u64::from(g.slot) * site.slot_bytes).collect(),
+                    members.iter().map(|g| site.v + u64::from(g.slot) * site.slot_bytes).collect(),
+                    members
+                        .iter()
+                        .map(|g| site.output + u64::from(g.row0) * site.row_bytes())
+                        .collect(),
+                ];
+                for values in pointers {
+                    at = table.put_u64(at, padded(values))?;
+                }
+            }
+            site_off.push(offsets);
+        }
+        // Byte ranges to zero: V rows [kvlen, kvlen8) of every request (read by the last tile's
+        // P.V against P = 0; the pad rows of a launch overwrite the last request's with finite
+        // values before its attention runs), and the output rows past the last request.
+        let mut ranges: Vec<(u64, i32)> = Vec::new();
+        for site in sites {
+            let kv_row_bytes = site.kv_row_bytes();
+            let slot_rows = site.slot_rows();
+            for &[_, _, slot, kvlen] in requests {
+                let kvlen8 = kvlen.next_multiple_of(8).min(slot_rows);
+                if kvlen8 > kvlen {
+                    let v = site.v + u64::from(slot) * site.slot_bytes;
+                    ranges.push((
+                        v + u64::from(kvlen) * kv_row_bytes,
+                        (u64::from(kvlen8 - kvlen) * kv_row_bytes) as i32,
+                    ));
+                }
+            }
+            if real < rows {
+                ranges.push((
+                    site.output + u64::from(real) * site.row_bytes(),
+                    (u64::from(rows - real) * site.row_bytes()) as i32,
+                ));
+            }
+        }
+        let zero_ptr = at as u64;
+        at = table.put_u64(at, ranges.iter().map(|r| r.0))?;
+        let zero_bytes = at as u64;
+        at = table.put_i32(at, ranges.iter().map(|r| r.1))?;
+        let end = at.next_multiple_of(8);
+        table.end = table.end.max(end);
+        let bytes = table.end;
+
+        // SAFETY: the pinned buffer stays allocated for the engine's lifetime and is not
+        // rewritten before `done` (recorded below) has completed.
+        unsafe {
+            self.be.memcpy_htod_async(
+                self.table.base,
+                &staging.host.as_slice()[..bytes],
+                stream,
+            )?;
+        }
+        self.be.event_record(&staging.done, stream)?;
+        staging.pending = true;
+        if !ranges.is_empty() {
+            let mut args = ZeroArgs {
+                ptr: self.table.base + zero_ptr,
+                bytes: self.table.base + zero_bytes,
+                count: ranges.len() as u32,
+                pad: 0,
+            };
+            let mut params = [&mut args as *mut ZeroArgs as *mut std::ffi::c_void];
+            self.be.launch_kernel(
+                zero,
+                self.be.sm_count() * 2,
+                BLOCK,
+                0,
+                &mut params,
+                Some(stream),
+            )?;
+        }
+        self.launch = Some(Launch {
+            sites: sites.to_vec(),
+            waves,
+            site_off,
+        });
+        Ok(true)
+    }
+
+    fn grouped_plan(&mut self, key: GroupedKey) -> Result<()> {
+        if self.grouped_plans.len() >= PLAN_CACHE {
+            self.grouped_plans.clear();
+        }
+        if self.grouped_plans.contains_key(&key) {
+            return Ok(());
+        }
+        let (kind, wave, m_bucket, n_bucket, head_dim, alpha) = key;
+        let maxg = self.max_groups as u64;
+        let block = self.table.base + (wave * DIMS * self.max_groups * 4) as u64;
+        let plan = self.lt.grouped_attention_plan(
+            kind,
+            self.scores_f32,
+            f32::from_bits(alpha),
+            &GroupedAttention {
+                groups: self.max_groups as u32,
+                head_dim,
+                hd: block,
+                m: block + maxg * 4,
+                n: block + 2 * maxg * 4,
+                ld_s: block + 3 * maxg * 4,
+                ld_p: block + 4 * maxg * 4,
+                average_m: m_bucket,
+                average_n: n_bucket,
+            },
+        )?;
+        self.grouped_plans.insert(key, plan);
+        Ok(())
+    }
+
+    /// The grouped GEMM of `key` on the staged wave. Its first run times every heuristic
+    /// candidate on the real operands (the shapes are a bucket, not an exact size, so the
+    /// heuristic's first pick is a guess: measured 15-20% slower than the exact-shape kernel)
+    /// and keeps the fastest; the buffers then hold that kernel's result.
+    fn grouped_run(
+        &mut self,
+        key: GroupedKey,
+        a: u64,
+        w: u64,
+        c: u64,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.grouped_plan(key)?;
+        let plan = self.grouped_plans.get_mut(&key).expect("cached above");
+        if plan.candidates() == 0 {
+            return plan.run(a, w, c, stream);
+        }
+        let start = self.be.event_create(true)?;
+        let end = self.be.event_create(true)?;
+        let mut times = Vec::with_capacity(plan.candidates());
+        let mut best: Option<(f32, usize)> = None;
+        for index in 0..plan.candidates() {
+            let mut ms = f32::INFINITY;
+            for _ in 0..2 {
+                self.be.event_record(&start, stream)?;
+                if let Err(e) = plan.run_candidate(index, a, w, c, stream) {
+                    self.be.stream_synchronize(stream)?;
+                    if e.is_fatal() {
+                        return Err(e);
+                    }
+                    tracing::warn!(error = %e, index, "grouped attention candidate rejected");
+                    break;
+                }
+                self.be.event_record(&end, stream)?;
+                self.be.event_synchronize(&end)?;
+                ms = ms.min(self.be.event_elapsed_ms(&start, &end)?);
+            }
+            times.push(ms);
+            if best.is_none_or(|(b, _)| ms < b) {
+                best = Some((ms, index));
+            }
+        }
+        let (ms, index) = best.filter(|(ms, _)| ms.is_finite()).ok_or_else(|| {
+            RuntimeError::Device("no runnable grouped attention candidate".into())
+        })?;
+        plan.select(index);
+        tracing::info!(
+            ?key,
+            index,
+            ms = format!("{ms:.3}").as_str(),
+            candidates = ?times,
+            "grouped attention algorithm measured"
+        );
+        plan.run(a, w, c, stream)
+    }
+
+    /// Phase times `[qk, softmax, pv]` ms of every wave run since the last call (the caller
+    /// has synchronized the stream).
+    pub(super) fn phase_report(&mut self) -> Result<Vec<[f32; 3]>> {
+        let mut out = Vec::with_capacity(self.phases.len());
+        for events in self.phases.drain(..) {
+            out.push([
+                self.be.event_elapsed_ms(&events[0], &events[1])?,
+                self.be.event_elapsed_ms(&events[1], &events[2])?,
+                self.be.event_elapsed_ms(&events[2], &events[3])?,
+            ]);
+        }
+        Ok(out)
+    }
+
+    /// Routed segment `index` (the order `begin_launch` saw its sites) of the staged launch.
+    pub(super) fn run_site(&mut self, index: usize, stream: &CudaStream) -> Result<()> {
+        let launch = self.launch.take().ok_or_else(|| {
+            RuntimeError::Rejected("attention route: no staged launch".into())
+        })?;
+        let result = self.run_site_of(&launch, index, stream);
+        self.launch = Some(launch);
+        result
+    }
+
+    fn run_site_of(&mut self, launch: &Launch, index: usize, stream: &CudaStream) -> Result<()> {
+        let [softmax_grouped, _] = self.grouped.expect("a staged launch is grouped");
+        let site = launch.sites[index];
+        let maxg = self.max_groups as u64;
+        let table = self.table.base;
+        for (w, wave) in launch.waves.iter().enumerate() {
+            let groups = wave.groups.len() as u64;
+            let scores = (
+                Gemm::Scores,
+                w,
+                wave.m_bucket,
+                wave.n_bucket,
+                site.head_dim,
+                (site.scale * LOG2_E).to_bits(),
+            );
+            let values = (
+                Gemm::Values,
+                w,
+                wave.m_bucket,
+                wave.n_bucket,
+                site.head_dim,
+                1.0f32.to_bits(),
+            );
+            let block = table + (w * DIMS * self.max_groups * 4) as u64;
+            let q = table + launch.site_off[index][w];
+            let k = q + maxg * 8;
+            let v = k + maxg * 8;
+            let o = v + maxg * 8;
+            let s = table + wave.s_off;
+            let timed = if self.seg_time {
+                let events = [
+                    self.be.event_create(true)?,
+                    self.be.event_create(true)?,
+                    self.be.event_create(true)?,
+                    self.be.event_create(true)?,
+                ];
+                self.be.event_record(&events[0], stream)?;
+                Some(events)
+            } else {
+                None
+            };
+            self.grouped_run(scores, q, k, s, stream)?;
+            if let Some(events) = &timed {
+                self.be.event_record(&events[1], stream)?;
+            }
+            let mut args = SoftmaxGroupedArgs {
+                scores: s,
+                rows: block + maxg * 4,
+                cols: block + 2 * maxg * 4,
+                ld: block + 3 * maxg * 4,
+                first: table + wave.first_off,
+                row_start: table + wave.row_start_off,
+                groups: groups as u32,
+                total_rows: wave.rows,
+                heads: site.heads,
+                pad: 0,
+            };
+            let mut params = [&mut args as *mut SoftmaxGroupedArgs as *mut std::ffi::c_void];
+            self.be.launch_kernel(
+                softmax_grouped,
+                self.grid,
+                BLOCK,
+                0,
+                &mut params,
+                Some(stream),
+            )?;
+            if let Some(events) = &timed {
+                self.be.event_record(&events[2], stream)?;
+            }
+            self.grouped_run(values, s, v, o, stream)?;
+            if let Some(events) = timed {
+                self.be.event_record(&events[3], stream)?;
+                self.phases.push(events);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -405,6 +1062,7 @@ mod tests {
         let site = found[1].expect("global attention site");
         assert_eq!((site.instruction, site.heads, site.head_dim), (1, 16, 512));
         assert_eq!(site.slot_bytes, 1024 * 512 * 2);
+        assert_eq!((site.row_bytes(), site.kv_row_bytes(), site.slot_rows()), (16384, 1024, 1024));
 
         for patch in [
             (|op: &mut DevInst64| op.i[3] = 2) as fn(&mut DevInst64),
@@ -420,5 +1078,19 @@ mod tests {
         }
         // A KV tensor whose slot pitch is not the instruction's stride is not a linear cache.
         assert!(sites(&program, &tensors, &devp, 2)[1].is_none());
+    }
+
+    #[test]
+    fn launch_table_writer_is_bounded() {
+        let mut bytes = [0u8; 32];
+        let mut table = Table {
+            bytes: &mut bytes,
+            end: 0,
+        };
+        assert_eq!(table.put_i32(0, [1, -2]).unwrap(), 8);
+        assert_eq!(table.put_u64(8, [3]).unwrap(), 16);
+        assert_eq!(table.end, 16);
+        assert!(table.put_u64(24, [1, 2]).is_err());
+        assert_eq!(&bytes[..16], &[1, 0, 0, 0, 254, 255, 255, 255, 3, 0, 0, 0, 0, 0, 0, 0]);
     }
 }

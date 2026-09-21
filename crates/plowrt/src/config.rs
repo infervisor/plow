@@ -851,6 +851,13 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-attn-gemm-grid", env = "PLOW_PF_ATTN_GEMM_GRID", default_value_t = 8, global = true)]
     pub pf_attn_gemm_grid: u32,
 
+    /// `--pf-attn-gemm` serves every request of a launch with one grouped cuBLASLt call per
+    /// GEMM (device-side shapes, one table upload per launch, each shape bucket's algorithm
+    /// timed on first use) instead of per-request launches. Served C16 4096-15000 within 1% of
+    /// the per-request form, C4 identical: opt-in.
+    #[arg(long = "pf-attn-gemm-grouped", env = "PLOW_PF_ATTN_GEMM_GROUPED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_attn_gemm_grouped: bool,
+
     /// Diagnostic: per-class wall attribution via one event pair per segment.
     #[arg(long = "pf-seg-time", env = "PLOW_PF_SEG_TIME", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_time: bool,
