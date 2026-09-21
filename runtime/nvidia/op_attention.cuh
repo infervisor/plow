@@ -110,7 +110,7 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #define PLOW_NV_FA_TC_GQA8_HD512 0
 #endif
 /* Opt-in HD512/GQA8 decode candidate: 16 padded Q rows and a two-stage 64-row K/V ring. */
-#define FA_DEC_TC_GQA8(HD, GF) (PLOW_NV_FA_TC_GQA8_HD512 && (HD) == 512 && (GF) == 8)
+#define FA_DEC_TC_GQA8(HD, GF) (PLOW_NV_FA_TC_GQA8_HD512 && (HD) == 512 && ((GF) == 8 || (GF) == 16))
 #define FA_DEC_BASE_SMEM_FLOATS(D, GF)                                                         \
     ((GF) * FA_DEC_TILE + 2 * FA_DEC_REDUCTION_HEADS(GF) + (GF) * ((D) / 2) + FA_DEC_NG(D) * (D))
 /* SCORE PARTIALS IN SMEM (the WPR path, GF 2/4/8). The warp-per-row dot ends in a 5-round lane
@@ -139,19 +139,63 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #ifndef PLOW_NV_FA_WPR_RB256_MINROWS
 #define PLOW_NV_FA_WPR_RB256_MINROWS 128
 #endif
+/* SCORE ON THE TENSOR CORES, K STRAIGHT FROM GLOBAL: the decode GEMV walk's form
+ * (op_gemv_mma.cuh) with the roles swapped -- the mma's 16 A rows are 16 KV rows, its 8 B rows
+ * the item's GF query heads. A warp scores 16 of its tile rows per walk: lane (g = lane>>2,
+ * t = lane&3) streams the 16-byte K fragments of rows g and g+8 for all D/32 k-steps, loads the
+ * matching Q fragment of head g from smem, and after 2*D/32 mmas holds the FINISHED scores of
+ * rows g, g+8 x heads 2t, 2t+1: no FMA chain, no widening, no lane reduction, and no partials in
+ * smem (a shape that scores here does not claim PLOW_NV_FA_SPART's 64 KiB). Heads >= GF and rows
+ * past the tile read a clamped valid fragment and are not stored. Both operands take the same
+ * virtual K order, so a score is exact w.r.t. the true dot; the f32 sum order differs from
+ * dot8's: not bit-identical. */
+#ifndef PLOW_NV_FA_MMAQK
+#define PLOW_NV_FA_MMAQK 0
+#endif
+#if PLOW_NV_FA_MMAQK && PLOW_NV_FA_QGLOB
+#error PLOW_NV_FA_MMAQK reads the staged Q (qsm); PLOW_NV_FA_QGLOB skips that staging
+#endif
+#ifndef PLOW_NV_FA_MMAQK_DEPTH
+#define PLOW_NV_FA_MMAQK_DEPTH 8
+#endif
+/* Bit 0: hd256. Bit 1: hd512, where it replaces the staged-K score of PLOW_NV_FA_TC_GQA8_HD512
+ * (whose P.V stays). */
+#define FA_DEC_MMAQK(D, GF)                                                                    \
+    (((((PLOW_NV_FA_MMAQK) & 1) && (D) == 256) || (((PLOW_NV_FA_MMAQK) & 2) && (D) == 512)) && \
+     ((GF) == 2 || (GF) == 4 || (GF) == 8 || (GF) == 16))
 template <int V> struct fa_depth { static constexpr int v = V; };
+/* P.V ON THE TENSOR CORES for hd256 (the prefill's form, op_attention.cuh d_flash_prefill): V
+ * rows stream gmem->smem through a two-stage 64-row cp.async ring and feed the m16n8k16 mma as
+ * ldmatrix.trans B fragments; the A operand is P, built in registers from Ssm as a bf16 hi/lo pair
+ * (two mmas per fragment, ~16 mantissa bits, so the oracle stays at its bf16-input floor). Each
+ * warp owns D/8 head-dims for every row of the tile: no row-group partials, no osm fold. */
+#ifndef PLOW_NV_FA_MMAPV
+#define PLOW_NV_FA_MMAPV 0
+#endif
+#define FA_DEC_MMAPV(D, GF)                                                                    \
+    (PLOW_NV_FA_MMAPV && (D) == 256 && ((GF) == 2 || (GF) == 4 || (GF) == 8))
+/* L2 PREFETCH ACROSS THE PHASE BARRIERS: one block per SM runs a tile's score, softmax and P.V
+ * back to back, so the memory pipe drains at every phase boundary. Bit 0: the tile's V rows are
+ * asked into L2 before its score walk; bit 1: the next tile's K rows before this tile's P.V. */
+#ifndef PLOW_NV_FA_L2PF
+#define PLOW_NV_FA_L2PF 0
+#endif
 #define FA_DEC_SPART(D, GF)                                                                    \
     (PLOW_NV_FA_SPART && (D) >= 256 && ((GF) == 2 || (GF) == 4 || (GF) == 8) &&               \
-     !FA_DEC_TC_GQA8(D, GF))
+     !FA_DEC_TC_GQA8(D, GF) && !FA_DEC_MMAQK(D, GF))
 #define FA_DEC_SPART_NP(GF) (64 / (GF))
 #define FA_DEC_SMEM_FLOATS(D, GF)                                                              \
     (FA_DEC_BASE_SMEM_FLOATS(D, GF) +                                                         \
-     (FA_DEC_TC_GQA8(D, GF) ? (16 + 2 * 64) * ((D) + 8) / 2 : 0) +                            \
+     (FA_DEC_TC_GQA8(D, GF) ? ((FA_DEC_MMAQK(D, GF) ? 0 : 16) + 2 * 64) * ((D) + 8) / 2 : 0) +   \
+     (FA_DEC_MMAPV(D, GF) ? 2 * 64 * ((D) + 8) / 2 : 0) +                                     \
      (FA_DEC_SPART(D, GF) ? FA_DEC_TILE * 64 : 0))
 
 /* V rows in flight per thread. A fused row feeds GF accumulators, so arithmetic per load
  * grows with GF and the unroll can shrink before the 255-register cliff. */
-#define FA_DEC_VU(GF) ((GF) >= 8 ? 2 : ((GF) >= 4 ? 4 : 8))
+#ifndef PLOW_NV_FA_VU2
+#define PLOW_NV_FA_VU2 8
+#endif
+#define FA_DEC_VU(GF) ((GF) >= 8 ? 2 : ((GF) >= 4 ? 4 : PLOW_NV_FA_VU2))
 
 struct bf16v8 {
     __nv_bfloat16 x[8];
@@ -460,7 +504,7 @@ __device__ __forceinline__ void fa_decode_qk_tc_gqa8(
     float* scores, const __nv_bfloat16* qtile, __nv_bfloat16* ktile,
     const __nv_bfloat16* kbase, unsigned kv0, unsigned live_rows, unsigned kv_mask,
     float scale) {
-    static_assert(D == 512 && GF == 8, "tensor-core decode is HD512/GQA8 only");
+    static_assert(D == 512 && (GF == 8 || GF == 16), "tensor-core decode is HD512, GQA8 or GQA16");
     constexpr unsigned STRIDE = D + 8;
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     for (unsigned r = live_rows + tid; r < FA_DEC_TILE; r += PLOW_NV_THREADS)
@@ -531,7 +575,7 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
     float (&acc)[D / 64][4], const float* scores, __nv_bfloat16* vtile,
     const __nv_bfloat16* vbase, unsigned kv0, unsigned live_rows, unsigned kv_mask,
     const float* corr_shared) {
-    static_assert(D == 512 && GF == 8, "tensor-core decode is HD512/GQA8 only");
+    static_assert(D == 512 && (GF == 8 || GF == 16), "tensor-core decode is HD512, GQA8 or GQA16");
     constexpr unsigned STRIDE = D + 8, NJ = D / 64;
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     const float resc[2] = {lane / 4 < GF ? corr_shared[lane / 4] : 0.0f,
@@ -600,6 +644,199 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
             }
         }
         __syncthreads();
+    }
+}
+#endif
+
+#if PLOW_NV_FA_MMAQK
+__device__ __forceinline__ void fa_mma16816_acc(float (&d)[4], unsigned a0, unsigned a1,
+                                                unsigned a2, unsigned a3, unsigned b0,
+                                                unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+/* One tile's scores into scores[head][row]. Warp w owns tile rows w, w+8, ... (the P.V row
+ * groups); walk j takes 16 of them. */
+template <int D, int GF>
+__device__ __forceinline__ void fa_decode_qk_mma(float* scores, const __nv_bfloat16* qsm,
+                                                 const __nv_bfloat16* kbase, unsigned kv0,
+                                                 unsigned rmax, unsigned kv_mask, float scale) {
+    static_assert(D % 32 == 0 && (GF <= 8 || GF == 16), "mma score walk shape");
+    constexpr unsigned NKB = D / 32;
+    /* k-steps in flight per row pair: 2 * NFL 16-byte K loads ahead of the first mma. */
+    constexpr unsigned NFL = NKB < (unsigned)PLOW_NV_FA_MMAQK_DEPTH ? NKB : (unsigned)PLOW_NV_FA_MMAQK_DEPTH;
+    static_assert(NKB % NFL == 0, "PLOW_NV_FA_MMAQK_DEPTH must divide D/32");
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned g = lane >> 2, t = lane & 3u;
+    const __nv_bfloat16* qf = qsm + (g < (unsigned)GF ? g : 0u) * D + t * 8u;
+    const float sc = FA_SCALE(scale);
+    for (unsigned i = tid + rmax; i < (unsigned)FA_DEC_TILE; i += PLOW_NV_THREADS)
+#pragma unroll
+        for (int h = 0; h < GF; h++) scores[h * FA_DEC_TILE + i] = FA_NEG_INF;
+    for (unsigned j = 0; warp + 16u * j * PLOW_NV_WARPS < rmax; j++) {
+        const unsigned r0 = warp + (16u * j + g) * PLOW_NV_WARPS;
+        const unsigned r1 = r0 + 8u * PLOW_NV_WARPS;
+        /* A dead row aliases a live one's fragment: a B=1 sliding item is <= 64 rows, 8 per warp,
+         * and a second stream of dead loads would double its K traffic. */
+        const unsigned a0 = r0 < rmax ? r0 : 0u, a1 = r1 < rmax ? r1 : a0;
+        const __nv_bfloat16* k0 = kbase + (size_t)((kv0 + a0) & kv_mask) * D + t * 8u;
+        const __nv_bfloat16* k1 = kbase + (size_t)((kv0 + a1) & kv_mask) * D + t * 8u;
+        /* GF = 16: heads 8..15 are a second B operand against the same K fragments. */
+        float acc[GF > 8 ? 2 : 1][4];
+#pragma unroll
+        for (int hs = 0; hs < (GF > 8 ? 2 : 1); hs++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) acc[hs][e] = 0.0f;
+#pragma unroll
+        for (unsigned c = 0; c < NKB; c += NFL) {
+            uint4 ka[NFL], kb[NFL];
+#pragma unroll
+            for (unsigned u = 0; u < NFL; u++) {
+                ka[u] = __ldcs((const uint4*)(k0 + (c + u) * 32u));
+                kb[u] = __ldcs((const uint4*)(k1 + (c + u) * 32u));
+            }
+#pragma unroll
+            for (unsigned u = 0; u < NFL; u++)
+#pragma unroll
+                for (int hs = 0; hs < (GF > 8 ? 2 : 1); hs++) {
+                    const uint4 q = *(const uint4*)(qf + (size_t)hs * 8u * D + (c + u) * 32u);
+                    fa_mma16816_acc(acc[hs], ka[u].x, kb[u].x, ka[u].y, kb[u].y, q.x, q.y);
+                    fa_mma16816_acc(acc[hs], ka[u].z, kb[u].z, ka[u].w, kb[u].w, q.z, q.w);
+                }
+        }
+#pragma unroll
+        for (int hs = 0; hs < (GF > 8 ? 2 : 1); hs++)
+            if (8u * hs + 2u * t < (unsigned)GF) {
+                float* s0 = scores + (8u * hs + 2u * t) * FA_DEC_TILE;
+                float* s1 = s0 + FA_DEC_TILE;
+                if (r0 < rmax) { s0[r0] = acc[hs][0] * sc; s1[r0] = acc[hs][1] * sc; }
+                if (r1 < rmax) { s0[r1] = acc[hs][2] * sc; s1[r1] = acc[hs][3] * sc; }
+            }
+    }
+}
+#endif
+
+#if PLOW_NV_FA_L2PF
+template <int D>
+__device__ __forceinline__ void fa_l2_prefetch_rows(const __nv_bfloat16* base, unsigned kv0,
+                                                    unsigned nrows, unsigned kv_mask) {
+    for (unsigned r = threadIdx.x; r < nrows; r += PLOW_NV_THREADS) {
+        const char* p = (const char*)(base + (size_t)((kv0 + r) & kv_mask) * D);
+#pragma unroll
+        for (unsigned c = 0; c < D * 2u; c += 128u)
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(p + c));
+    }
+}
+#endif
+
+#if PLOW_NV_FA_MMAPV
+__device__ __forceinline__ unsigned fa_pack_bf16x2(float lo, float hi) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<const unsigned*>(&v);
+}
+
+/* Stage 64 V rows (from tile row `first`) into one ring slot; dead rows zero-fill. */
+template <int D>
+__device__ __forceinline__ void fa_pv_stage(__nv_bfloat16* dst, const __nv_bfloat16* vbase,
+                                            unsigned kv0, unsigned first, unsigned live_rows,
+                                            unsigned kv_mask) {
+    constexpr unsigned STRIDE = D + 8;
+    const unsigned nr = live_rows - first < 64u ? live_rows - first : 64u;
+    for (unsigned i = threadIdx.x; i < 64u * (D / 8); i += PLOW_NV_THREADS) {
+        const unsigned r = i / (D / 8), c = (i % (D / 8)) * 8u;
+        const bool live = r < nr;
+        const __nv_bfloat16* in =
+            live ? vbase + (size_t)((kv0 + first + r) & kv_mask) * D + c : vbase;
+        fa_cp_async_cg16(dst + r * STRIDE + c, in, live ? 16 : 0);
+    }
+    fa_cp_commit();
+}
+template <int D>
+__device__ __forceinline__ void fa_pv_prefetch(__nv_bfloat16* vring, const __nv_bfloat16* vbase,
+                                               unsigned kv0, unsigned live_rows,
+                                               unsigned kv_mask) {
+    fa_pv_stage<D>(vring, vbase, kv0, 0u, live_rows, kv_mask);
+    if (live_rows > 64u) fa_pv_stage<D>(vring + 64u * (D + 8), vbase, kv0, 64u, live_rows, kv_mask);
+}
+
+/* One tile of P.V into acc[j] (mma C fragments: lane (g, t) holds heads g / g+8 at head-dims
+ * warp*(D/8) + 8j + 2t + {0, 1}). pe[head][row] are this tile's softmax numerators in Ssm. */
+template <int D, int GF>
+__device__ __forceinline__ void fa_decode_pv_mma(float (&acc)[D / 64][4], const float* pe,
+                                                 __nv_bfloat16* vring,
+                                                 const __nv_bfloat16* vbase, unsigned kv0,
+                                                 unsigned live_rows, unsigned kv_mask,
+                                                 const float (&corr)[GF]) {
+    static_assert(D % 64 == 0 && GF <= 8, "mma P.V shape");
+    constexpr unsigned STRIDE = D + 8, NJ = D / 64, STAGE = 64 * STRIDE;
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned g = lane >> 2, t = lane & 3u;
+    float c0 = 0.0f, c1 = 0.0f;
+#pragma unroll
+    for (int h = 0; h < GF; h++) {
+        if (g == (unsigned)h) c0 = corr[h];
+        if (g + 8u == (unsigned)h) c1 = corr[h];
+    }
+#pragma unroll
+    for (unsigned j = 0; j < NJ; j++) {
+        acc[j][0] *= c0;
+        acc[j][1] *= c0;
+        acc[j][2] *= c1;
+        acc[j][3] *= c1;
+    }
+    /* PLOW_NV_FA_MMAPV >= 2: stages 0 and 1 were issued by fa_pv_prefetch before the score phase
+     * (the ring is idle until here), so a chunk's successor-but-one is issued once its slot is
+     * consumed; 1: the classic one-ahead ring. Either way at most one group stays pending when a
+     * chunk is waited for. */
+    if constexpr (PLOW_NV_FA_MMAPV < 2) fa_pv_stage<D>(vring, vbase, kv0, 0u, live_rows, kv_mask);
+    for (unsigned first = 0; first < live_rows; first += 64u) {
+        const unsigned nr = live_rows - first < 64u ? live_rows - first : 64u;
+        if (first + 64u < live_rows) {
+            if constexpr (PLOW_NV_FA_MMAPV < 2)
+                fa_pv_stage<D>(vring + (((first >> 6) + 1u) & 1u) * STAGE, vbase, kv0, first + 64u,
+                               live_rows, kv_mask);
+            fa_cp_wait<1>();
+        } else {
+            fa_cp_wait<0>();
+        }
+        __syncthreads();
+        const __nv_bfloat16* cur = vring + ((first >> 6) & 1u) * STAGE;
+#pragma unroll
+        for (unsigned k = 0; k < 64u; k += 16u) {
+            /* A = P[head][row], canonical m16n8k16 layout: a0 = (g; 2t, 2t+1), a1 = (g+8; same),
+             * a2 = (g; 2t+8, 2t+9), a3 = (g+8; same). */
+            float p[4][2];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const unsigned h = g + 8u * (unsigned)(i & 1);
+                const unsigned r = k + 2u * t + 8u * (unsigned)(i >> 1);
+                const bool ok = h < (unsigned)GF && r < nr;
+                p[i][0] = ok ? pe[h * FA_DEC_TILE + first + r] : 0.0f;
+                p[i][1] = ok && r + 1u < nr ? pe[h * FA_DEC_TILE + first + r + 1u] : 0.0f;
+            }
+            unsigned ahi[4], alo[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const __nv_bfloat16 h0 = __float2bfloat16(p[i][0]), h1 = __float2bfloat16(p[i][1]);
+                ahi[i] = fa_pack_bf16x2(p[i][0], p[i][1]);
+                alo[i] = fa_pack_bf16x2(p[i][0] - __bfloat162float(h0), p[i][1] - __bfloat162float(h1));
+            }
+#pragma unroll
+            for (unsigned j = 0; j < NJ; j++) {
+                unsigned bf[2];
+                fa_ldmatrix_x2_trans(bf, cur + (k + (lane & 15u)) * STRIDE + warp * (D / 8) + j * 8u);
+                fa_mma(acc[j], ahi, bf, acc[j]);
+                fa_mma(acc[j], alo, bf, acc[j]);
+            }
+        }
+        __syncthreads();
+        if constexpr (PLOW_NV_FA_MMAPV >= 2) {
+            if (first + 128u < live_rows)
+                fa_pv_stage<D>(vring + ((first >> 6) & 1u) * STAGE, vbase, kv0, first + 128u, live_rows, kv_mask);
+        }
     }
 }
 #endif
@@ -713,8 +950,9 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 
 #if PLOW_NV_FA_TC_GQA8_HD512
         __nv_bfloat16* tc_q = (__nv_bfloat16*)(lds + FA_DEC_BASE_SMEM_FLOATS(D, GF));
-        __nv_bfloat16* tc_kv = tc_q + 16 * (D + 8);
-        if constexpr (FA_DEC_TC_GQA8(D, GF) && !FP8KV && !SZKV) {
+        /* The padded Q tile only feeds the staged-K score; the mma score reads qsm. */
+        __nv_bfloat16* tc_kv = tc_q + (FA_DEC_MMAQK(D, GF) ? 0 : 16 * (D + 8));
+        if constexpr (FA_DEC_TC_GQA8(D, GF) && !FA_DEC_MMAQK(D, GF) && !FP8KV && !SZKV) {
             for (unsigned i = tid; i < 16u * D; i += PLOW_NV_THREADS) {
                 const unsigned g = i / D, c = i % D;
                 tc_q[g * (D + 8) + c] =
@@ -759,6 +997,16 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 for (int e = 0; e < 4; ++e) tc_oacc[j][e] = 0.0f;
         }
 #endif
+#if PLOW_NV_FA_MMAPV
+        float pv_acc[D / 64][4];
+        __nv_bfloat16* pv_ring = (__nv_bfloat16*)(lds + FA_DEC_BASE_SMEM_FLOATS(D, GF));
+        if constexpr (FA_DEC_MMAPV(D, GF) && !FP8KV && !SZKV) {
+#pragma unroll
+            for (int j = 0; j < D / 64; ++j)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) pv_acc[j][e] = 0.0f;
+        }
+#endif
 
         for (unsigned kv0 = lo; kv0 < hi; kv0 += FA_DEC_TILE) {
             /* Live rows in this tile. Entries [rmax_t, FA_DEC_TILE) are NEG_INF in BOTH bodies
@@ -768,6 +1016,21 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             const unsigned rmax_t = (hi - kv0 < (unsigned)FA_DEC_TILE) ? (hi - kv0)
                                                                        : (unsigned)FA_DEC_TILE;
             float s[GF];
+#if PLOW_NV_FA_L2PF & 1
+            if constexpr (!FP8KV && !SZKV) fa_l2_prefetch_rows<D>(vbase, kv0, rmax_t, kv_mask);
+#endif
+#if PLOW_NV_FA_MMAPV >= 2
+            if constexpr (FA_DEC_MMAPV(D, GF) && !FP8KV && !SZKV)
+                fa_pv_prefetch<D>(pv_ring, vbase, kv0, rmax_t, kv_mask);
+#endif
+#if PLOW_NV_FA_MMAQK
+            if constexpr (FA_DEC_MMAQK(D, GF) && !FP8KV && !SZKV) {
+                fa_decode_qk_mma<D, GF>(Ssm, qsm, kbase, kv0, rmax_t, kv_mask, scale);
+                __syncthreads();
+#pragma unroll
+                for (int g = 0; g < GF; ++g) s[g] = Ssm[g * FA_DEC_TILE + tid];
+            } else
+#endif
 #if PLOW_NV_FA_TC_GQA8_HD512
             if constexpr (FA_DEC_TC_GQA8(D, GF) && !FP8KV && !SZKV) {
                 fa_decode_qk_tc_gqa8<D, GF>(Ssm, tc_q, tc_kv, kbase, kv0, rmax_t,
@@ -1109,6 +1372,21 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 l_st[g] = l_st[g] * corr[g] + hsum[g];
                 m_st[g] = mnew[g];
             }
+#if PLOW_NV_FA_L2PF & 2
+            if constexpr (!FP8KV && !SZKV) {
+                const unsigned kvn = kv0 + (unsigned)FA_DEC_TILE;
+                if (kvn < hi)
+                    fa_l2_prefetch_rows<D>(kbase, kvn,
+                                           hi - kvn < (unsigned)FA_DEC_TILE ? hi - kvn
+                                                                            : (unsigned)FA_DEC_TILE,
+                                           kv_mask);
+            }
+#endif
+#if PLOW_NV_FA_MMAPV
+            if constexpr (FA_DEC_MMAPV(D, GF) && !FP8KV && !SZKV) {
+                fa_decode_pv_mma<D, GF>(pv_acc, Ssm, pv_ring, vbase, kv0, rmax_t, kv_mask, corr);
+            } else
+#endif
 #if PLOW_NV_FA_TC_GQA8_HD512
             if constexpr (FA_DEC_TC_GQA8(D, GF) && !FP8KV && !SZKV) {
                 fa_decode_pv_tc_gqa8<D, GF>(tc_oacc, Ssm, tc_kv, vbase, kv0,
@@ -1207,6 +1485,25 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             }
         }
 
+#if PLOW_NV_FA_MMAPV
+        if constexpr (FA_DEC_MMAPV(D, GF) && !FP8KV && !SZKV) {
+#pragma unroll
+            for (unsigned j = 0; j < D / 64; ++j)
+#pragma unroll
+                for (unsigned e = 0; e < 4; ++e) {
+                    const unsigned g = lane / 4 + (e / 2) * 8;
+                    const unsigned d = warp * (D / 8) + j * 8 + (lane % 4) * 2 + (e % 2);
+                    if (g < GF)
+                        Opart[((size_t)(b * n_head + h0 + g) * nsplit + sp) * D + d] =
+                            pv_acc[j][e];
+                }
+            if (tid < GF) {
+                float* ml = mlpart + ((size_t)(b * n_head + h0 + tid) * nsplit + sp) * 2;
+                ml[0] = m_st[tid];
+                ml[1] = l_st[tid];
+            }
+        } else
+#endif
 #if PLOW_NV_FA_TC_GQA8_HD512
         if constexpr (FA_DEC_TC_GQA8(D, GF) && !FP8KV && !SZKV) {
 #pragma unroll

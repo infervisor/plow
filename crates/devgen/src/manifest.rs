@@ -1057,10 +1057,21 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
         t.insert("fa_rb256".into(), json!(4));
     }
     if s.full_kv_heads == 1 && s.gqa > 0 {
-        // The template is instantiated at 1|2|4|8 only.
+        // The template is instantiated at 1|2|4|8; 16 (the whole Gemma-4-12B group, one K/V
+        // stream for all 16 heads) only when the emit asks for it, on the wide-reduction arm.
         let gf = next_pow2(s.gqa).min(8);
         let gf = if s.gqa % gf == 0 { gf } else { 1 };
+        let gf = if crate::emit_config::active().fa_gf_full == Some(16) && s.gqa == 16 {
+            16
+        } else {
+            gf
+        };
         t.insert("gf_full".into(), json!(gf));
+    }
+    // * `fa_mmaqk`: the emit's PLOW_FA_MMAQK, opt-in. Object-paired (the score arm and its smem
+    //   claim change), so it rides in `tuning` and the pairing hash.
+    if let Some(v) = crate::emit_config::active().fa_mmaqk.filter(|v| *v != 0) {
+        t.insert("fa_mmaqk".into(), json!(v));
     }
     t
 }
@@ -2741,6 +2752,14 @@ pub fn config_header(manifest: &Value) -> String {
                 out.push_str(&format!(
                     "#ifndef PLOW_NV_FA_WPR_RB256\n#define PLOW_NV_FA_WPR_RB256 {v}\n#endif\n"
                 ));
+            }
+            if let Some(v) = t.get("fa_mmaqk").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_FA_MMAQK\n#define PLOW_NV_FA_MMAQK {v}\n#endif\n"
+                ));
+            }
+            if t.get("gf_full").and_then(Value::as_u64) == Some(16) {
+                out.push_str("#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n");
             }
         }
     }

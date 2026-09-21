@@ -273,6 +273,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_ATTENTION_DECODE_BALANCE_GF")]
     pub attention_decode_balance_gf: Option<u32>,
 
+    /// sm_90a decode attention scores on the tensor cores with K straight from global
+    /// (op_attention.cuh PLOW_NV_FA_MMAQK): bit 0 = hd256 layers, bit 1 = hd512 layers.
+    #[arg(long, env = "PLOW_FA_MMAQK")]
+    pub fa_mmaqk: Option<u32>,
+
     /// Widen the flash-merge dispatch by this factor (diagnostic; measured no effect).
     #[arg(long, env = "PLOW_FLASH_MERGE_DSPLIT", hide = true)]
     pub flash_merge_dsplit: Option<u32>,
@@ -1282,6 +1287,7 @@ impl EmitConfig {
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
+            fa_mmaqk: env_u32("PLOW_FA_MMAQK"),
             flash_merge_dsplit: env_u32("PLOW_FLASH_MERGE_DSPLIT"),
             ns_mul: env_u32("PLOW_NS_MUL"),
             ns_abs: env_u32("PLOW_NS_ABS"),
