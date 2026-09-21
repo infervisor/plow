@@ -278,6 +278,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FA_MMAQK")]
     pub fa_mmaqk: Option<u32>,
 
+    /// sm_90a hd256 decode attention as warp-autonomous online-softmax streams
+    /// (op_attention.cuh PLOW_NV_FA_WAUTO); needs PLOW_FA_MMAQK bit 0.
+    #[arg(long, env = "PLOW_FA_WAUTO", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub fa_wauto: bool,
+
     /// Widen the flash-merge dispatch by this factor (diagnostic; measured no effect).
     #[arg(long, env = "PLOW_FLASH_MERGE_DSPLIT", hide = true)]
     pub flash_merge_dsplit: Option<u32>,
@@ -1301,6 +1306,7 @@ impl EmitConfig {
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
             fa_mmaqk: env_u32("PLOW_FA_MMAQK"),
+            fa_wauto: env_bool("PLOW_FA_WAUTO"),
             flash_merge_dsplit: env_u32("PLOW_FLASH_MERGE_DSPLIT"),
             ns_mul: env_u32("PLOW_NS_MUL"),
             ns_abs: env_u32("PLOW_NS_ABS"),

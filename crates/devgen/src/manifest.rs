@@ -1073,6 +1073,10 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
     if let Some(v) = crate::emit_config::active().fa_mmaqk.filter(|v| *v != 0) {
         t.insert("fa_mmaqk".into(), json!(v));
     }
+    // * `fa_wauto`: the emit's PLOW_FA_WAUTO (warp-autonomous hd256 decode item), object-paired.
+    if crate::emit_config::active().fa_wauto {
+        t.insert("fa_wauto".into(), json!(1));
+    }
     t
 }
 
@@ -2757,6 +2761,9 @@ pub fn config_header(manifest: &Value) -> String {
                 out.push_str(&format!(
                     "#ifndef PLOW_NV_FA_MMAQK\n#define PLOW_NV_FA_MMAQK {v}\n#endif\n"
                 ));
+            }
+            if t.get("fa_wauto").is_some() {
+                out.push_str("#ifndef PLOW_NV_FA_WAUTO\n#define PLOW_NV_FA_WAUTO 1\n#endif\n");
             }
             if t.get("gf_full").and_then(Value::as_u64) == Some(16) {
                 out.push_str("#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n");
