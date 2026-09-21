@@ -8,7 +8,7 @@ campaign ledgers and the JIT emit-timing review (`/home/lava/.claude/jobs/ef9d0e
 
 | # | Item | Verdict | Cost | What it buys |
 |---|---|---|---|---|
-| 1 | **Ring sized by the per-request chunk, not the launch** (`PLOW_MAX_REQUEST_CHUNK` below `PLOW_MAX_CHUNK`) | **implemented, emit-side only** (`crates/devgen/src/lib.rs`), runtime already enforces it | 1 assert + recipe | 32 slots at chunk 4096 with the attention roles on; ring 2.5 GiB -> 640 MiB per slot; C32 long-prompt TTFT no longer queues on 16 slots |
+| 1 | **Ring sized by the per-request chunk, not the launch** (`PLOW_MAX_REQUEST_CHUNK` below `PLOW_MAX_CHUNK`) | **implemented + served** (`crates/devgen/src/lib.rs`; packet p12rq): peak 46-53 GiB at 32 slots with roles on; 8192/C32 TTFT 7552 -> 4291 ms, 15000/C32 13646 -> 8271 (vLLM 3648 / 6441); C16 long prompts +66% vs the 16-slot packet (the per-request cap serializes four requests per launch) | 1 assert + recipe | 32 slots at chunk 4096 with the attention roles on; ring 2.5 GiB -> 640 MiB per slot; the serving cell for C32, not yet for C16 |
 | 2 | Dynamic slot count at serve time | **already exists**: `PLOW_VMM_LIVE=1 PLOW_VMM_LIVE_RINGS=1` maps each slot's sliding rings on admission (`memory/vmm.rs::VmmRings::ensure_slot`), full layers are VMM-live already | 0 code; a served A/B | emit once at 32-64 slots, memory follows load. Unmeasured on the 12B: the auto rule (`live_rings_for_capacity`) only fires at B >= 64 or ctx >= 128k |
 | 3 | In-program sub-chunk pipeline (HNR_i -> FP_i per 1024 rows inside a 4096-row launch) | designed, not built | kernel row-offset field on `HeadNormRope` + q-row window on 4 flash objects, devgen emit loop | single request keeps 4096-row launches on a 2048-row ring (C1 8192/15000 TTFT at the chunk-4096 number with 32 slots) |
 | 4 | plowc as a JIT (per-rung compile on demand) | **not worth it as a JIT**; worth it as a 9-second re-emit | — | a devblob re-emit against existing cubins is 3.5-9 s CPU; the 20 min "packet build" is the nvcc object build, which geometry does not change |
@@ -207,6 +207,34 @@ Validation plan: (1) ring A/B on the c32c null (step_bench B=16, same tree/objec
   Caveat: the A/B ran without the exclusive CPU-quiet lock (a shared-lock `cargo build` from
   another agent was idling the leased GPU behind `quietx.sh`); the arms are GPU-bound kernel
   steps, interleaved, sd 0.05 ms.
+
+
+**Reading the served `high_concurrency` session (17:01-17:13 UTC, gate PASS, 64/64 per cell, not
+contended, peak 46-53 GiB vs p12r's 66-69):**
+
+* Memory: the ring shrink is real in situ — the 32-slot packet with chunk 4096 and the roles on peaks
+  at 46.0 GiB (128/C16) to 53.0 GiB (15000/C32); p12r (16 slots) 66-69, p12c32b (32 slots, chunk
+  1024) 44.5-47.4. Server: `kv_gib=28.0`, KV admission `per_token=16384` (full layers only).
+* C32, the cells the geometry was for: 8192/C32 TTFT 4291 ms (p12r 7552, p12c32b 10314; vLLM 3648),
+  15000/C32 8271 (13646 / 27062; vLLM 6441), 4096/C32 2142 (4311 / 2420; vLLM 1991), 1024/C32 591
+  (2081 / 568; vLLM 693 — WIN), 128/C32 199 (1292 / 114; vLLM 154). Decode at C32 improves on
+  p12c32b everywhere (roles + tensor-core attention: 128/C32 TPOT 14.56 vs 16.63, 1996 vs 1808 tok/s;
+  8192/C32 79.0 vs 117.2) but stays above vLLM's (67.2 at 8192/C32).
+* C16, the regression: 4096/C16 1126 vs p12r 678 (+66%), 8192/C16 2168 vs 1264 (+72%), 15000/C16
+  4063 vs 2450 (+66%), 128/C16 107.5 vs 77.8 (+38%); 1024/C16 336 vs 323 (+4%). TPOT is level or
+  better (8192/C16 45.8 vs 50.4). The loss is confined to prompts longer than the 1024-row request
+  cap, so it is the cap's scheduling: with the cap a 4096-row launch carries four requests' slices
+  (Greedy, turn held until the pack's last request finishes: `mux.rs` `last_finished`), so four
+  requests finish together after four launches instead of one request per launch — mean TTFT of a
+  wave of 16 goes from 8.5 to ~10 launch-times by ordering alone, and the per-launch cost of four
+  1024-row slices at different positions vs one 4096-row slice accounts for the rest (to be
+  attributed with `PLOW_PF_PACKLOG=1`, see the diagnostic below). 128/C16 (+30 ms with identical
+  launch shapes: 16 x 129 rows in one launch) is NOT explained by the cap.
+* Verdict on the adoption gate (128/C16 TPOT >= 11.85: 11.83, level; 8192/C32 TTFT < 3648: 4291,
+  **not met**): req1k is not the 12B serving cell as-is. It is the better 32-slot packet (beats
+  p12c32b on every cell but 128/C32 and 1024/C32 TTFT) and the better packet for C32 long prompts
+  overall, but p12r keeps C16. Removing the per-request cap for a single request (item 3, the
+  in-program sub-chunk pipeline) is what would make one packet win both.
 
 #### Served `high_concurrency` (p12rq, 10 cells; TTFT ms / TPOT ms / tok/s; peak GiB in the last column)
 
