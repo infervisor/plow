@@ -260,6 +260,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "OUTDIR": str(out / "client"),
         "LOG": str(out / "server.log"),
         "SERVE_EXTRA_ARGS": serve.get("extra_args", ""),
+        "DATASET_ARGS": getattr(a, "dataset_args", None) or bench.get("dataset_args", ""),
     })
     (out / "hf-home").mkdir(exist_ok=True)
     model_id = bench.get("model_id") or json.loads((assets / "build.json").read_text()).get("slug") or cell["revision"]
@@ -301,7 +302,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "gpu": gpu_header(),
         "contended": "CONTENDED" in text,
         "gate": "coherence gate: PASS" in text,
-        "protocol": {k: env[k] for k in ("IN_LENS", "CONCS", "NPROMPT", "OUTLEN", "BENCH_BACKEND", "BENCH_EXTRA_ARGS")},
+        "protocol": {k: env[k] for k in ("IN_LENS", "CONCS", "NPROMPT", "OUTLEN", "BENCH_BACKEND", "BENCH_EXTRA_ARGS", "DATASET_ARGS")},
         "serve_env": serve.get("env", {}),
         "overrides": overrides,
         "lt_algos": {
@@ -737,6 +738,7 @@ def main() -> None:
     n = sp.add_parser("bench"); n.add_argument("recipe"); n.add_argument("--assets", required=True); n.add_argument("--out", required=True)
     n.add_argument("--concs"); n.add_argument("--in-lens"); n.add_argument("--label"); n.add_argument("--reference")
     n.add_argument("--nprompt", type=int, help="prompts per cell, overriding the recipe/profile")
+    n.add_argument("--dataset-args", help="replaces the client's random-dataset block (see bench_plowrt_serve.sh DATASET_ARGS); recorded")
     n.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the server env; recorded")
     n.add_argument("--profile", help="named workload from [bench.profiles.*] (e.g. realtime, throughput)")
     n.set_defaults(f=cmd_bench)

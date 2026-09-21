@@ -23,6 +23,9 @@
 #   OUTDIR   raw client logs and JSON results (default /tmp/plowrt_bench_<port>)
 #   GATE_PROMPT  raw-completion coherence prompt, including any required special tokens
 #   SERVE_EXTRA_ARGS  additional plowrt serve arguments (for example queue capacity)
+#   DATASET_ARGS  replaces the client's dataset block (`--dataset-name random --random-input-len $L
+#                --random-output-len $OUTLEN --random-range-ratio 0`), e.g. a prefix_repetition workload;
+#                the IN_LENS loop value then only labels the row
 #   MEM_SAMPLE_MS  GPU memory sampling period per cell, printed as `peak_mem_mib,<in>,<c>,<MiB>`
 #                  lines (default 1000; 0 = off)
 set -euo pipefail
@@ -163,6 +166,8 @@ for L in $IN_LENS; do
     WARM="${BENCH_EXTRA_ARGS:-}"; [ -n "$NW" ] && WARM="--num-warmups $NW"
     read -r -a WARM_ARGS <<< "$WARM"
     blog="$OUTDIR/in${L}_c${C}.log"
+    if [ -n "${DATASET_ARGS:-}" ]; then read -r -a DATASET_ARGV <<< "$DATASET_ARGS"; else
+      DATASET_ARGV=(--dataset-name random --random-input-len "$L" --random-output-len "$OUTLEN" --random-range-ratio 0); fi
     # Peak GPU memory of the server's processes over this cell (NVIDIA only). Both engines
     # preallocate their pools, so this is the configured footprint plus any transient workspace.
     memlog="$OUTDIR/in${L}_c${C}.mem"; mempid=
@@ -175,8 +180,7 @@ for L in $IN_LENS; do
       bench serve --backend "$BENCH_BACKEND" \
       --base-url "http://127.0.0.1:$PORT" --endpoint "$ENDPOINT" \
       --model "$MODEL" --tokenizer "$TOKZ" "${TRUST_ARGS[@]}" \
-      --dataset-name random --random-input-len "$L" --random-output-len "$OUTLEN" \
-      --random-range-ratio 0 --request-rate inf --ignore-eos --temperature 0 \
+      "${DATASET_ARGV[@]}" --request-rate inf --ignore-eos --temperature 0 \
       --max-concurrency "$C" --num-prompts "$NP" "${WARM_ARGS[@]}" \
       --save-result --save-detailed --result-dir "$RESULT_DIR" --result-filename "in${L}_c${C}.json" \
       > "$blog" 2>&1

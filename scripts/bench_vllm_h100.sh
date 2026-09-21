@@ -15,6 +15,8 @@
 #   VLLM_VENV     default /opt/pytorch
 #   OUTDIR        raw client logs + JSON (default /tmp/vllm_bench_<port>)
 #   MEM_SAMPLE_MS GPU memory sampling period per cell, as in bench_plowrt_serve.sh (default 1000; 0 = off)
+#   DATASET_ARGS  as in bench_plowrt_serve.sh (the two sides must be given the same string)
+#   PREFIX_CACHE=1 serve WITH prefix caching (vLLM's default); unset keeps --no-enable-prefix-caching
 #
 # Prefix caching is DISABLED. vllm-bench's random prompts share a leading prefix, so a
 # cache-on server silently benches cache-hit suffixes; the plow side sets
@@ -37,12 +39,13 @@ MAXLEN="${MAXLEN:-$(( $(maxof "$IN_LENS") + OUTLEN + 512 ))}"
 MAXSEQS="${MAXSEQS:-$(maxof "$CONCS")}"
 ENDPOINT="/v1/completions"; [ "$BENCH_BACKEND" = "openai-chat" ] && ENDPOINT="/v1/chat/completions"
 
+PC_FLAG="--no-enable-prefix-caching"; if [ -n "${PREFIX_CACHE:-}" ]; then PC_FLAG=""; fi
 # setsid + process-group teardown: `vllm serve` forks engine workers that outlive a plain
 # kill of the pid we waited on, and a survivor holds the card past the lease.
 setsid "$VLLM" serve "$MODEL_DIR" \
   --port "$PORT" --dtype bfloat16 --tensor-parallel-size 1 \
   --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" \
-  --no-enable-prefix-caching \
+  $PC_FLAG \
   ${VLLM_SERVE_EXTRA_ARGS:-} > "$OUTDIR/server.log" 2>&1 &
 SRV=$!
 cleanup () { [ -z "${mempid:-}" ] || kill "$mempid" 2>/dev/null || true; kill -TERM -"$SRV" 2>/dev/null || true; sleep 5; kill -KILL -"$SRV" 2>/dev/null || true; }
@@ -61,6 +64,8 @@ echo "input_len,concurrency,ttft_ms,ttft_med,tpot_ms,tpot_med,itl_ms,itl_med,itl
 for L in $IN_LENS; do
   for C in $CONCS; do
     blog="$OUTDIR/in${L}_c${C}.log"
+    if [ -n "${DATASET_ARGS:-}" ]; then read -r -a DATASET_ARGV <<< "$DATASET_ARGS"; else
+      DATASET_ARGV=(--dataset-name random --random-input-len "$L" --random-output-len "$OUTLEN" --random-range-ratio 0); fi
     # Peak GPU memory of the server's processes over this cell (NVIDIA only). Both engines
     # preallocate their pools, so this is the configured footprint plus any transient workspace.
     memlog="$OUTDIR/in${L}_c${C}.mem"; mempid=
@@ -72,8 +77,7 @@ for L in $IN_LENS; do
     "$VLLM" bench serve --backend "$BENCH_BACKEND" \
       --base-url "http://127.0.0.1:$PORT" --endpoint "$ENDPOINT" \
       --model "$MODEL_DIR" --tokenizer "$MODEL_DIR" \
-      --dataset-name random --random-input-len "$L" --random-output-len "$OUTLEN" \
-      --random-range-ratio 0 --request-rate inf --ignore-eos --temperature 0 \
+      "${DATASET_ARGV[@]}" --request-rate inf --ignore-eos --temperature 0 \
       --max-concurrency "$C" --num-prompts "$NPROMPT" ${BENCH_EXTRA_ARGS:-} \
       --save-result --save-detailed --result-dir "$RESULT_DIR" --result-filename "in${L}_c${C}.json" \
       > "$blog" 2>&1 || true
