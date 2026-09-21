@@ -1275,6 +1275,27 @@ px4, so new exactness evidence. Global-layer K/V are linear ([slot][kvh][row][hd
   PLOW_VMM_LIVE_RINGS=1`, unmeasured). plowc-as-JIT not needed: a geometry change is a 4-9 s devblob
   re-emit against existing objects.
 
+* Batched decode step ATTRIBUTED (agent/dense-batched-decode `f61390ba`, not cherry-picked): step_bench
+  on the p12r decode object B=16 11.46 / 12.90 / 13.95 ms at ctx 192 / 1024 / 8192; attention bodies
+  compiled out -> 10.48 flat, so attention = 0.97 / 2.42 / 3.46 ms and everything else grows only
+  +0.58 ms from B=1 to B=16. Score walk + P.V at ctx 1024 (1.98 ms) sit at ~85% of the HBM byte floor;
+  at ctx 192 attention is 3x its floor from per-item fixed latency (FlashDecode 12.6 us/item, FlashMerge
+  5.2 us, x48 layers). Softmax reductions cost 0.02-0.04 ms (not a lever). Served vs step: 128/C16
+  11.85 vs 11.46; 8192/C16 50.39 vs 13.95 -> the long-context C16 TPOT gap is prefill interference
+  (serial prefill launches between decode steps), not the decode kernel. Implemented + oracle-clean
+  (10/10, relL2 0.0017) `PLOW_NV_FA_WAUTO` warp-autonomous hd256 item: -0.07/-0.09/-0.10 ms at B=16,
+  default OFF, not in any recipe — needs a decode-object rebuild, left for after the report. Next
+  lever there: FlashMerge elision at ns=1 (~0.2 ms/step at 128/C16).
+* Prefix cache ADOPTED (agent/prefix-cache `27080d9d` -> `bd317b28`; recipe `8b586ee1`): whole-block
+  checkpoints at every 2048-row boundary, pressure eviction (the 26B OOM storm was a cuMemAlloc OOM
+  mapped to `Device`, never evicting), `PLOW_PREFIX_INFLIGHT_WAIT` (packed admission holds a request
+  whose blocks another slot is prefilling), `PLOW_PREFIX_CACHE_OUTPUT` (unmeasured). Serve with
+  `PLOW_PREFIX_CACHE=1` alone. prefix_repetition 8 x 2048 + 256, defaults: 12B C4 113.0 ms (26/35
+  hits) / C16 281.2 (57/67) vs vLLM 120.8 / 282.6; 26B C4 90.7 / C16 171.4 vs 98.3 / 204.7; 0 faults;
+  peak 79-80 GiB (the cache fills free memory; `PLOW_VMM_CACHE_MIN_FREE_MIB` beside co-tenants).
+  Caveat: every prompt still publishes on its first prefill (`PLOW_VMM_PUBLISH_SHARED=1` gates nothing
+  on the packed path); numbers include it.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
