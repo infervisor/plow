@@ -894,7 +894,8 @@ pub struct NvidiaRuntimeConfig {
 
     /// Serve a packet's `MOE_DECODE_CUBLASLT` segments (emit `PLOW_EMIT_MOE_DEC_LT`) with
     /// cuBLASLt grouped matmuls on every decode rung of at least this many rows. Unset = the
-    /// rungs run in the interpreter. Disables multistep, like the dense cuBLASLt decode route.
+    /// rungs run in the interpreter. A routed rung is a captured graph, so multistep still
+    /// enqueues it K times per quantum.
     #[arg(long = "moe-dec-lt", env = "PLOW_MOE_DEC_LT", global = true)]
     pub moe_dec_lt: Option<u32>,
 

@@ -5,12 +5,14 @@
 //! (`prefill_slot` to build ctx, then one `step_slots` per token).
 //!
 //! Usage:
-//!   step_bench <assets_dir> [slots] [ctx] [steps] [--same] [--warmup N]
+//!   step_bench <assets_dir> [slots] [ctx] [steps] [--same] [--warmup N] [--multistep]
 //!              [--dump-tensors name,name --dump-dir dir]
 //! `--same` feeds every slot the SAME prompt and reports how many slots' greedy
 //! streams agree with slot 0 (a within-batch consistency check). `--dump-tensors`
 //! writes the named tensors raw after the last step (block_run's format), which
-//! with `PLOW_DEBUG_MAX_INST` truncation gives per-layer activations.
+//! with `PLOW_DEBUG_MAX_INST` truncation gives per-layer activations. `--multistep` times the
+//! engine's device multi-step quanta (`PLOW_MULTISTEP=K`) instead of single steps; the digest
+//! covers the same tokens in the same order, so it compares directly with a single-step run.
 //! Env: PLOW_CHECKPOINT (default <assets>/checkpoint), PLOW_STEP_TIME=1 for
 //! the engine's host-op breakdown.
 
@@ -34,17 +36,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let assets = std::path::PathBuf::from(
         args.next()
-            .ok_or("usage: step_bench <assets> [slots] [ctx] [steps] [--same] [--warmup N] [--dump-tensors a,b --dump-dir d]")?,
+            .ok_or("usage: step_bench <assets> [slots] [ctx] [steps] [--same] [--warmup N] [--multistep] [--dump-tensors a,b --dump-dir d]")?,
     );
     let want_slots: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(1);
     let ctx: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(4137);
     let steps: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(128);
     let mut same = false;
+    let mut multistep = false;
     let mut warmup = 16usize;
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--same" => same = true,
+            "--multistep" => multistep = true,
             "--warmup" => warmup = args.next().ok_or("--warmup N")?.parse()?,
             "--dump-tensors" => dump_names = Some(args.next().ok_or("--dump-tensors a,b")?),
             "--dump-dir" => dump_dir = Some(args.next().ok_or("--dump-dir d")?),
@@ -111,8 +115,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // can be compared for token agreement without a server.
     let mut digest: u64 = 0xcbf29ce484222325;
     let mut streams: Vec<Vec<u32>> = vec![Vec::with_capacity(steps); slots];
-    for _ in 0..steps {
+    if multistep && e.multistep_quantum().is_none() {
+        return Err("--multistep needs an engine with PLOW_MULTISTEP >= 2".into());
+    }
+    let mut done = 0;
+    while done < steps {
         let t0 = Instant::now();
+        if multistep {
+            // Fed row r is slot r; `toks` is row-major, K tokens per row.
+            let k = e.multi_step_at_most(&feeds_of(&last), steps - done, &mut toks)?;
+            let per = t0.elapsed().as_secs_f64() * 1e3 / k as f64;
+            for step in 0..k {
+                ms.push(per);
+                for (b, stream) in streams.iter_mut().enumerate() {
+                    let t = toks[b * k + step];
+                    digest = (digest ^ t as u64).wrapping_mul(0x100000001b3);
+                    stream.push(t);
+                }
+            }
+            for (b, l) in last.iter_mut().enumerate() {
+                *l = toks[b * k + k - 1];
+            }
+            done += k;
+            continue;
+        }
         e.step_slots(&feeds_of(&last), &mut toks)?;
         ms.push(t0.elapsed().as_secs_f64() * 1e3);
         last.copy_from_slice(&toks);
@@ -120,6 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             digest = (digest ^ t as u64).wrapping_mul(0x100000001b3);
             streams[b].push(t);
         }
+        done += 1;
     }
     println!("TOK_STREAM slots={slots} ctx={ctx} fnv={digest:016x} slot0={:?}", streams[0]);
     if same {
