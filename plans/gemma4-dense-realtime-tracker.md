@@ -1245,6 +1245,32 @@ px4, so new exactness evidence. Global-layer K/V are linear ([slot][kvh][row][hd
   checkpoint publish and larger caps the defaults (knob defaults only), and consider skipping the
   end-of-generation boundary when the sequence will not be continued.
 
+* Vendor-GEMM prefill attention ADOPTED (agent/pf-attn-batched-gemm, cherry-picked `e8227eed`
+  `cb7992f0`; gate `4438f02a` + `16501159`; recipe serves `PLOW_PF_ATTN_GEMM=1`). cuBLASLt Q.K^T /
+  causal softmax cubin / P.V per request/tile for the hd512 one-KV-head segments. Gating history:
+  every bucket routed -> 128-token cells +0.8/1.6/4.3 ms (C1/C4/C16); bucket-rows gate -> 128/C16
+  still +8% (16 x 129-row packs route per request and lose the segment graph); "every slice >=
+  1024" -> route off in nearly every C4/C16 launch (a tail slice rides in most packs); shipped:
+  "some slice >= 1024". Unexplained: 128/C16 78 vs 73 ms with the route loaded but nothing routed.
+* END-TO-END set (`c446ea59`, `c0c824a1`; 14:22-15:50 UTC, one session after another, vLLM re-run
+  in the same hour = the new reference CSVs): 12B p12r (recipe-built at HEAD, model.pkt identical
+  to p12mq) C1 TTFT 18.35 / 46.65 / 170.0 / 360.3 / 750.0 (vLLM 30.7 / 47.3 / 171.4 / 348.4 /
+  673.0); C4 39.5 / 102.9 / 331.9 / 718.2 / 1478 (vLLM 55.9 / 130.7 / 468.3 / 995.5 / 1667); C16
+  77.8 / 322.7 / 678.2 / 1264.5 / 2449.5 (vLLM 100.9 / 408.2 / 1164.3 / 1955.4 / 3086.4), C16 TPOT
+  11.85 / 16.94 / 30.84 / 50.39 / 86.47 (vLLM 10.96 / 13.79 / 22.79 / 38.04 / 67.79), tok/s 1286 /
+  824 / 443 / 265 / 151. TTFT ahead 11 of 20, 15 of 60 comparisons ahead + 13 parity. GSM8K 193/200.
+  Cache-on (2048-row checkpoints, 9 GiB snapshot cache, 2 GiB pool, on p12r): C4 187.1 ms / 12.35
+  / 291 tok/s, C16 349.4 / 16.73 / 820, 17/35 and 42/67 attached (vLLM 120.8 / 282.6).
+* Packet geometry (agent/packet-geometry `ed01b72f`, memo `plans/gemma4-packet-geometry.md`): ring
+  depth costs 0.0 ms per decode step (step_bench B=16, ring 4096 vs 2048: 17.80 vs 17.79) — the
+  chunk-2048 32-slot "null" was that build's decode object (FA_MMAQK unset, interp cubin 1.49 ->
+  2.16 MB), not the ring. The runtime already caps request slices (`packed_prefill.rs
+  Manifest::validate`); only devgen's bucket-ladder assert measured the launch chunk. New recipe
+  `gemma4-12b.h100.bf16-c32-req1k-16k.toml`: 4096-row launches, 1024-row request slices, ring 2048
+  (640 MiB/slot), 32 slots, roles on; ladder pending. Dynamic slots exist (`PLOW_VMM_LIVE=1
+  PLOW_VMM_LIVE_RINGS=1`, unmeasured). plowc-as-JIT not needed: a geometry change is a 4-9 s devblob
+  re-emit against existing objects.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
