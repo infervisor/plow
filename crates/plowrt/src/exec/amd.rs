@@ -8957,7 +8957,7 @@ impl AmdEngine {
             shared_prefix::SharedPrefix::new(be.clone(), layout,
                 config.prefix_cache_cap_bytes(be.vram_bytes()),
                 crate::memory::vmm::kv_pool_cap(),
-                config.vmm_cache_min_free_bytes(be.vram_bytes()))
+                config.vmm_cache_min_free_bytes(be.vram_bytes(), None))
         }).transpose()?;
         let vmm = if shared_prefix.is_none() {
             Self::vmm_bringup(

@@ -366,6 +366,19 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-publish-shared", env = "PLOW_VMM_PUBLISH_SHARED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_publish_shared: bool,
 
+    /// CUDA VMM prefix cache: publish a finished sequence's end-of-generation boundary (prompt
+    /// + generated rows), so a follow-up turn that embeds this turn's output attaches to it.
+    /// `0` skips it for single-turn traffic (one sliding-window snapshot buffer and copy less
+    /// per request); the prompt-end boundary and whole-block checkpoints still publish.
+    #[arg(long = "prefix-cache-output", env = "PLOW_PREFIX_CACHE_OUTPUT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefix_cache_output: bool,
+
+    /// CUDA packed prefill: a request whose prompt shares whole KV blocks with a prompt another
+    /// slot is still prefilling waits (bounded) for that slot's checkpoint and attaches to it
+    /// instead of recomputing the shared rows beside it. `0` admits it at once.
+    #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefix_inflight_wait: bool,
+
     /// AMD shared-prefix VMM KV: when a request finishes, settle its slot's cache-shared row-0
     /// block on the pool's background thread, so the next admission finds row 0 private instead
     /// of paying the unmap/map inline in `begin_slot`. Needs `--vmm-deferred-reclaim`.
@@ -1595,11 +1608,18 @@ impl RuntimeConfig {
     ///
     /// An explicit `--vmm-cache-min-free-mib` wins; `=0` is the rollback to the static-budget
     /// behaviour. Unset derives [`Self::VMM_CACHE_MIN_FREE_FRACTION`] of the device, because a
-    /// fixed MiB figure that is right on a 192 GiB MI300X is a third of a small card. A
-    /// backend that cannot report free bytes degrades to the static budget on its own
+    /// fixed MiB figure that is right on a 192 GiB MI300X is a third of a small card, capped
+    /// at an eighth of `free_after_load` when the caller knows it: a card whose KV rings leave
+    /// 5 GiB free (Gemma-4-26B on an 80 GiB H100) would otherwise reserve most of that for
+    /// headroom and hold no working set of checkpoints. A backend that cannot report free
+    /// bytes degrades to the static budget on its own
     /// ([`crate::memory::vmm::VmmKv::enable_pressure_eviction`]), so arming this is safe
     /// everywhere.
-    pub(crate) fn vmm_cache_min_free_bytes(&self, device_bytes: u64) -> Option<u64> {
+    pub(crate) fn vmm_cache_min_free_bytes(
+        &self,
+        device_bytes: u64,
+        free_after_load: Option<u64>,
+    ) -> Option<u64> {
         let allow_env = !Self::is_initialized();
         let mib: Option<u32> = if allow_env {
             Self::env_parse("PLOW_VMM_CACHE_MIN_FREE_MIB").or(self.vmm_cache_min_free_mib)
@@ -1611,9 +1631,11 @@ impl RuntimeConfig {
             Some(mib) => Some((mib as u64) << 20),
             None if device_bytes == 0 => Some(4096u64 << 20),
             // Whole MiB, so the figure in logs reads like the knob.
-            None => Some(
-                ((device_bytes as f64 * Self::VMM_CACHE_MIN_FREE_FRACTION) as u64) >> 20 << 20,
-            ),
+            None => {
+                let derived = (device_bytes as f64 * Self::VMM_CACHE_MIN_FREE_FRACTION) as u64;
+                let derived = free_after_load.map_or(derived, |free| derived.min(free / 8));
+                Some(derived >> 20 << 20)
+            }
         }
     }
 
@@ -1707,6 +1729,22 @@ impl RuntimeConfig {
         select_compat(
             self.vmm_publish_shared,
             Self::env_bool("PLOW_VMM_PUBLISH_SHARED"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn prefix_cache_output(&self) -> bool {
+        select_compat(
+            self.prefix_cache_output,
+            Self::env_bool("PLOW_PREFIX_CACHE_OUTPUT"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn prefix_inflight_wait(&self) -> bool {
+        select_compat(
+            self.prefix_inflight_wait,
+            Self::env_bool("PLOW_PREFIX_INFLIGHT_WAIT"),
             !Self::is_initialized(),
         )
     }
@@ -2052,6 +2090,31 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn vmm_cache_min_free_derives_from_the_device_and_free_after_load() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        let config = super::RuntimeConfig::from_arg_matches(
+            &command.clone().try_get_matches_from(["test"]).unwrap(),
+        )
+        .unwrap();
+        let four_pct = ((80u64 << 30) as f64 * 0.04) as u64 >> 20 << 20;
+        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, None), Some(four_pct));
+        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(60 << 30)), Some(four_pct));
+        // A card whose rings leave 5 GiB free keeps an eighth of it, not 4% of the device.
+        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)), Some(640 << 20));
+        let config = super::RuntimeConfig::from_arg_matches(
+            &command.clone().try_get_matches_from(["test", "--vmm-cache-min-free-mib=100"]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)), Some(100 << 20));
+        let config = super::RuntimeConfig::from_arg_matches(
+            &command.try_get_matches_from(["test", "--vmm-cache-min-free-mib=0"]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)), None);
     }
 
     #[test]

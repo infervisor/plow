@@ -201,6 +201,7 @@ impl GpuEngine {
                 }
                 for slot in completed {
                     self.vmm_publish(slot, self.pos[slot].saturating_sub(1));
+                    self.vmm_prefill_done(slot);
                 }
             }
             if !state.fired {

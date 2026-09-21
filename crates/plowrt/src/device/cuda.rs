@@ -1872,8 +1872,18 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         self.check(
             unsafe { (self.api.cuMemAlloc_v2)(&mut dptr, bytes as usize) },
             "cuMemAlloc(vmm snapshot)",
-        )?;
+        )
+        // CUDA_ERROR_OUT_OF_MEMORY is memory pressure, not a fault: the pool evicts
+        // and retries on `Oom` only.
+        .map_err(|e| match e.device_code() {
+            Some(2) => RuntimeError::Oom(e.to_string()),
+            _ => e,
+        })?;
         Ok(dptr)
+    }
+
+    fn free_bytes(&self) -> Option<u64> {
+        self.mem_info().ok().map(|(free, _)| free)
     }
 
     fn free(&self, va: u64) {

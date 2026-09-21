@@ -894,6 +894,13 @@ struct Inner {
     /// [`LEAD_ROWS`] tokens once recorded, and how many sequences recorded each hash.
     lead: Vec<Option<u64>>,
     lead_seen: FxHashMap<u64, u32>,
+    /// Slots between [`VmmKv::try_attach`] and [`VmmKv::prefill_done`]: their recorded prompt
+    /// is being prefilled and its whole-block boundaries are about to be published
+    /// ([`VmmKv::inflight_prefix`]).
+    prefilling: Vec<bool>,
+    /// Bytes of zero-ref blocks handed to the reclaimer thread ([`Job::Release`]) so far:
+    /// released, but not yet visible to [`VmmOps::free_bytes`] (`trim_cache`).
+    release_queued: u64,
 }
 
 enum PublishLocked {
@@ -1075,6 +1082,8 @@ impl VmmKv {
                 strict_publish: false,
                 lead: vec![None; batch],
                 lead_seen: FxHashMap::default(),
+                prefilling: vec![false; batch],
+                release_queued: 0,
             }),
             frontier: (0..batch).map(|_| AtomicU32::new(0)).collect(),
             generation: (0..batch).map(|_| AtomicU64::new(0)).collect(),
@@ -1382,6 +1391,7 @@ impl VmmKv {
         let chunk_wait = t_chunk.elapsed();
         release_prefix_hold(&mut inner, seq);
         inner.lead[seq] = None;
+        inner.prefilling[seq] = false;
         let before = inner.stats;
         let t0 = std::time::Instant::now();
         let unmapped = if inner.jobs.is_some() {
@@ -1440,6 +1450,7 @@ impl VmmKv {
         let s = &self.shared;
         let mut inner = s.inner.lock();
         inner.stats.tokens_queried += prompt.len() as u64;
+        inner.prefilling[seq] = true;
         if inner.fine_rows > 0 && (prompt.len() as u64) < u64::from(inner.fine_ceiling) {
             return try_attach_fine(&mut inner, seq, prompt);
         }
@@ -1666,6 +1677,77 @@ impl VmmKv {
             return Err(e);
         }
         Ok(Some(attach))
+    }
+
+    /// `seq`'s prompt is fully prefilled and its prompt-end publish has run (or was skipped):
+    /// nothing more of it is in flight for [`Self::inflight_prefix`] to wait on.
+    pub fn prefill_done(&self, seq: usize) {
+        if !self.prefix_reuse {
+            return;
+        }
+        self.shared.inner.lock().prefilling[seq] = false;
+    }
+
+    /// A sequence still prefilling a prompt that shares whole blocks with `prompt`, when its
+    /// prompt-end publish will make a longer prefix attachable than the cache offers now:
+    /// `(owner seq, rows)`. The owner publishes every block boundary at most `lookback` rows
+    /// below its prompt end (the engine's `vmm_publish`; the sliding rings hold that many
+    /// rows behind the frontier), so a request sharing those blocks can wait for the
+    /// checkpoint instead of recomputing them beside the owner. Records `seq`'s lead like an
+    /// attach would, so the owner's publish counts as a second sighting
+    /// ([`Self::enable_shared_publish`]); commits nothing else for `seq`.
+    pub fn inflight_prefix(&self, seq: usize, prompt: &[u32], lookback: u32) -> Option<(usize, u32)> {
+        if !self.prefix_reuse {
+            return None;
+        }
+        let s = &self.shared;
+        let mut inner = s.inner.lock();
+        let br = s.block_rows as usize;
+        if prompt.len() <= br
+            || (inner.fine_rows > 0 && (prompt.len() as u64) < u64::from(inner.fine_ceiling))
+        {
+            return None;
+        }
+        note_lead(&mut inner, seq, prompt);
+        let hashes = hash_blocks(prompt, s.block_rows);
+        let aligned = &prompt[..hashes.len() * br];
+        let m = inner.cache.lookup(&hashes, aligned);
+        let mut cached = 0u32;
+        for blocks in 0..=m.blocks {
+            let node = blocks.checked_sub(1).map(|i| m.placed[i]);
+            if let Some(snapshots) = inner.published.get(&node) {
+                let start = blocks * br;
+                for snap in snapshots {
+                    if (snap.rows as usize) < prompt.len()
+                        && prompt.get(start..snap.rows as usize) == Some(snap.tail.as_slice())
+                    {
+                        cached = cached.max(snap.rows);
+                    }
+                }
+            }
+        }
+        inner.cache.release(&hashes, m.blocks);
+        let mut best: Option<(usize, u32)> = None;
+        for (owner, other) in inner.seqs.iter().enumerate() {
+            if owner == seq || !inner.prefilling[owner] {
+                continue;
+            }
+            // Whole blocks both prompts share, verified on the tokens; the owner publishes the
+            // boundaries below its own last prompt row and within `lookback` of it, and this
+            // prompt must keep a row to recompute after the attach.
+            let limit = (prompt.len() - 1).min(other.prompt_rows.saturating_sub(1)) / br;
+            let shared = (0..limit)
+                .take_while(|&k| {
+                    other.tokens.get(k * br..(k + 1) * br) == prompt.get(k * br..(k + 1) * br)
+                })
+                .count();
+            let reachable = other.prompt_rows.saturating_sub(lookback as usize).div_ceil(br);
+            let rows = (shared * br) as u32;
+            if shared >= reachable && rows > cached && best.is_none_or(|(_, r)| rows > r) {
+                best = Some((owner, rows));
+            }
+        }
+        best
     }
 
     /// Publish `seq`'s computed rows: insert `tokens`' whole blocks into
@@ -2439,8 +2521,12 @@ fn trim_cache(s: &Shared, inner: &mut Inner) {
         if let Some(mut free) = s.ops.free_bytes() {
             // Real pressure only: a backend that can answer this is authoritative, so
             // `cache_cap` is not consulted at all while this branch runs — that is the
-            // point (evict on demand, not on a fixed count of cached bytes).
-            while free < min_free {
+            // point (evict on demand, not on a fixed count of cached bytes). Blocks an
+            // eviction hands to the reclaimer thread are released but not free yet: credit
+            // them, or one floor flushes every prefix the thread has not caught up with.
+            // (Pooled blocks are not free and not credited; the pool cap bounds them.)
+            let queued = inner.release_queued;
+            while free + (inner.release_queued - queued) < min_free {
                 if !evict_one(s, inner, true) {
                     break;
                 }
@@ -2537,14 +2623,28 @@ fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
         remove_snapshot(s, inner, node, index);
         return true;
     }
+    // A radix lease protects shared KV, but snapshots are only needed while
+    // restoring an attachment. Protect the most recently reused snapshot
+    // against unique-tail bursts; the rest remain LRU so new prefixes fit.
+    let protected = inner.published.values().flatten()
+        .filter(|snap| snap.users == 0 && snap.referenced)
+        .max_by_key(|snap| snap.last_used)
+        .map(|snap| snap.va);
+    // A boundary inside a block (a prompt's end) matches only its own tail; the whole-block
+    // checkpoint published under the same node matches every continuation. Where both
+    // exist, reclaim the former LRU-first, before a radix leaf takes the whole prefix and
+    // every boundary published under it with it.
+    if let Some((node, index)) = inner.published.iter()
+        .filter(|(node, snaps)| node.is_some() && snaps.iter().any(|snap| snap.tail.is_empty()))
+        .flat_map(|(&node, snaps)| snaps.iter().enumerate().map(move |(i, snap)| (node, i, snap)))
+        .filter(|(_, _, snap)| snap.users == 0 && !snap.tail.is_empty() && Some(snap.va) != protected)
+        .min_by_key(|(_, _, snap)| snap.last_used)
+        .map(|(node, index, _)| (node, index))
+    {
+        remove_snapshot(s, inner, node, index);
+        return true;
+    }
     let Some(key) = inner.cache.evict_lru() else {
-        // A radix lease protects shared KV, but snapshots are only needed while
-        // restoring an attachment. Protect the most recently reused snapshot
-        // against unique-tail bursts; the rest remain LRU so new prefixes fit.
-        let protected = inner.published.values().flatten()
-            .filter(|snap| snap.users == 0 && snap.referenced)
-            .max_by_key(|snap| snap.last_used)
-            .map(|snap| snap.va);
         let Some((node, index)) = inner.published.iter()
                 .flat_map(|(&node, snaps)| snaps.iter().enumerate().map(move |(i, snap)| (node, i, snap)))
                 .filter(|(_, _, snap)| snap.users == 0)
@@ -2591,7 +2691,7 @@ fn remove_snapshot(s: &Shared, inner: &mut Inner, node: Option<(u32, u32)>, inde
 fn deref_block(s: &Shared, inner: &mut Inner, id: u32) {
     if let Some(h) = unref_block(s, inner, id) {
         match &inner.jobs {
-            Some(tx) if tx.send(Job::Release(h)).is_ok() => {}
+            Some(tx) if tx.send(Job::Release(h)).is_ok() => inner.release_queued += s.block_bytes,
             _ => s.ops.release(h),
         }
     }
@@ -4330,6 +4430,130 @@ mod tests {
             .unwrap()
             .expect("generated blocks attach");
         assert_eq!(a.rows, 24);
+    }
+
+    #[test]
+    fn inflight_prefix_names_the_prefilling_owner_until_its_publish_lands() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops);
+        let a = prompt(17); // two whole blocks and a tail
+        assert!(p.try_attach(0, &a).unwrap().is_none());
+        let mut b = prompt(16);
+        b.extend([901, 902]);
+        assert_eq!(p.inflight_prefix(1, &b, u32::MAX), Some((0, 16)));
+        let mut c = prompt(8);
+        c.extend((0..9).map(|i| 700 + i));
+        assert_eq!(p.inflight_prefix(1, &c, u32::MAX), Some((0, 8)), "shares the first block only");
+        let d: Vec<u32> = (0..17).map(|i| 100_000 + i).collect();
+        assert_eq!(p.inflight_prefix(1, &d, u32::MAX), None, "nothing shared");
+        assert_eq!(p.inflight_prefix(1, &prompt(8), u32::MAX), None, "no row left to recompute");
+        assert_eq!(p.inflight_prefix(0, &b, u32::MAX), None, "never waits on itself");
+        // The owner's rings keep 4 rows behind its 17-row prompt end: it can publish the
+        // boundary at 16 but not the one at 8.
+        assert_eq!(p.inflight_prefix(1, &b, 4), Some((0, 16)));
+        assert_eq!(p.inflight_prefix(1, &c, 4), None, "the shared boundary is unpublishable");
+
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &a, 128, |_| Ok(())).unwrap();
+        p.prefill_done(0);
+        assert_eq!(p.inflight_prefix(1, &b, u32::MAX), None, "the checkpoint is attachable now");
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 16);
+    }
+
+    #[test]
+    fn inflight_prefix_clears_when_the_owner_retires_without_publishing() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops);
+        let a = prompt(17);
+        assert!(p.try_attach(0, &a).unwrap().is_none());
+        let mut b = prompt(16);
+        b.push(901);
+        assert_eq!(p.inflight_prefix(1, &b, u32::MAX), Some((0, 16)));
+        p.begin_seq(0); // cancelled mid-prefill
+        assert_eq!(p.inflight_prefix(1, &b, u32::MAX), None);
+    }
+
+    #[test]
+    fn inflight_wait_counts_as_a_sighting_for_shared_publish() {
+        let ops = Arc::new(MockVmm::default());
+        // The uniform pool's geometry with room past one 32-token lead.
+        let geo = VmmGeometry {
+            full_layers: vec![0, 1],
+            kvh_full: 1,
+            hd_full: 4,
+            slide_layers: vec![],
+            kvh_slide: 1,
+            hd_slide: 4,
+            window: 0,
+            elem: 2,
+            elem_slide: 2,
+            max_ctx: 64,
+            batch: 2,
+        };
+        let mut p = VmmKv::new(ops, geo, 64, 0).expect("pool");
+        p.enable_shared_publish();
+        let a = prompt(41); // five whole blocks and a tail
+        assert!(p.try_attach(0, &a).unwrap().is_none());
+        let mut b = prompt(32);
+        b.push(901);
+        assert_eq!(p.inflight_prefix(1, &b, u32::MAX), Some((0, 32)));
+        p.ensure_rows(0, 41).unwrap();
+        // The engine publishes every whole-block boundary below the prompt end, then the end.
+        p.publish_at(0, &a, 32, 4, |_| Ok(())).unwrap();
+        p.publish(0, &a, 4, |_| Ok(())).unwrap();
+        assert_eq!(p.stats().publishes_skipped, 0, "the waiter's sighting makes it publish");
+        p.prefill_done(0);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 32);
+    }
+
+    /// A boundary inside a block serves only its exact tail; the whole-block checkpoint under
+    /// the same node serves every continuation. Eviction takes the former first instead of
+    /// the LRU leaf, which would drop the checkpoint and its blocks with it.
+    #[test]
+    fn tailed_boundaries_are_reclaimed_before_the_whole_block_checkpoint() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops);
+        let a = prompt(21);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 21).unwrap();
+        p.publish_at(0, &a, 16, 48, |_| Ok(())).unwrap();
+        p.publish_at(0, &a, 20, 48, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        assert_eq!(p.stats().snapshot_bytes, 96);
+        {
+            let mut inner = p.shared.inner.lock();
+            assert!(evict_one(&p.shared, &mut inner, true));
+            assert_eq!(inner.stats.snapshot_bytes, 48);
+            assert_eq!(inner.stats.cache_blocks, 4);
+            assert_eq!(inner.stats.nodes_evicted, 0);
+        }
+        let mut b = prompt(16);
+        b.push(901);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 16);
+    }
+
+    /// The mock never changes `free_bytes`, like a real backend whose evicted blocks sit on
+    /// the reclaimer's queue: one floor must not flush the whole cache.
+    #[test]
+    fn pressure_trim_credits_bytes_the_driver_has_not_freed_yet() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool_with_cap(ops.clone(), 1 << 20);
+        p.enable_deferred_reclaim();
+        let a = prompt(17);
+        p.try_attach(0, &a).unwrap();
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &a, 48, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        p.sync_reclaim(); // the slot's stale columns are unmapped: the cache holds the only refs
+        assert_eq!(p.stats().cache_blocks, 4);
+        *ops.free_bytes.lock().unwrap() = Some(200);
+        p.enable_pressure_eviction(300);
+        p.release_prefix(1); // a trim: the leaf's 2 blocks (128) queued for release + 200 free
+        assert_eq!(p.stats().nodes_evicted, 1);
+        assert_eq!(p.stats().cache_blocks, 2, "the parent block stays cached");
     }
 
     #[test]

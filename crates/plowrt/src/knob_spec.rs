@@ -373,6 +373,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.kv_pool_mib", Some("PLOW_KV_POOL_MIB"), Layer::Runtime, USIZE, Default::Static(Val::Nat(512)), OPT_IN),
     KnobSpec::new("rt.vmm_deferred_reclaim", Some("PLOW_VMM_DEFERRED_RECLAIM"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.vmm_publish_shared", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
+    KnobSpec::new("rt.prefix_cache_output", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
+    KnobSpec::new("rt.prefix_inflight_wait", Some("PLOW_PREFIX_INFLIGHT_WAIT"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("rt.vmm_release_retire", Some("PLOW_VMM_RELEASE_RETIRE"), Layer::Runtime, Domain::Bool, ON, RELEASE_RETIRE_QUALIFIED),
     KnobSpec::new("rt.ttft_log", Some("PLOW_TTFT_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pfx_log", Some("PLOW_PFX_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),

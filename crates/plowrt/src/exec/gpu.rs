@@ -1952,8 +1952,15 @@ struct NvDenseNsplit {
 enum PackedAdmission {
     Pending,
     Waiting(u64),
+    /// Another slot is prefilling this prompt's shared prefix; admit once its checkpoint is
+    /// published (`vmm_inflight_prefix`), or after [`INFLIGHT_WAIT_LIMIT`] regardless.
+    WaitingPrefix(std::time::Instant),
     Ready,
 }
+
+/// Longest a request waits on another slot's prefill before it prefills the shared rows
+/// itself — a safety valve; the owner's prompt-end publish or retirement releases it first.
+const INFLIGHT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn recurrent_state_layout(
     tensors: &[crate::asset::devblob::DevTensor],
@@ -3546,7 +3553,7 @@ impl GpuEngine {
         }
 
         // ---- VMM allocation and prefix sharing ----
-        let vmm = {
+        let mut vmm = {
             let run = || {
                 let config = RuntimeConfig::get();
                 let live = config.nv_live_kv_enabled(
@@ -5363,6 +5370,24 @@ impl GpuEngine {
             tm.print_flame(total);
         }
 
+        // Prefix cache: evict on real device pressure (`cuMemGetInfo`), not the static budget.
+        // The floor is headroom for the admissions the next trim has not seen yet: the knob's
+        // fraction of the device, capped at an eighth of what is free after load so a card the
+        // rings nearly fill (26B: 5 GiB) still keeps a working set of checkpoints.
+        if let Some(v) = vmm.as_mut().filter(|v| v.kv.prefix_reuse()) {
+            if let Ok((free, total)) = be.mem_info() {
+                let config = crate::config::RuntimeConfig::get();
+                if let Some(floor) = config.vmm_cache_min_free_bytes(total, Some(free)) {
+                    v.kv.enable_pressure_eviction(floor);
+                    tracing::info!(
+                        floor_mib = floor >> 20,
+                        free_mib = free >> 20,
+                        cache_cap_mib = config.prefix_cache_cap_bytes(total) >> 20,
+                        "vmm prefix cache: pressure eviction armed (static cap is the fallback)"
+                    );
+                }
+            }
+        }
         let flat_kv = vmm.is_none();
         let kv_admission = be
             .mem_info()
@@ -5883,7 +5908,9 @@ impl GpuEngine {
         // of re-prefilling it — then drop the previous sequence's mappings/
         // cache references. Prefix admission maps after lookup; every execution
         // path maps the rows it writes, including inactive decode rows.
-        self.vmm_publish(b, self.pos[b]);
+        if crate::config::RuntimeConfig::get().prefix_cache_output() {
+            self.vmm_publish(b, self.pos[b]);
+        }
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
         if let Some(v) = &self.vmm {
@@ -5907,7 +5934,7 @@ impl GpuEngine {
             }
             return;
         }
-        if cache_output {
+        if cache_output && crate::config::RuntimeConfig::get().prefix_cache_output() {
             self.vmm_publish(b, self.pos[b]);
         }
         self.pos[b] = 0;
@@ -5953,6 +5980,32 @@ impl GpuEngine {
             }
             None => return Err(RuntimeError::Rejected(format!("slot {b} out of range"))),
             _ => {}
+        }
+        // In-flight sharing: another slot is prefilling this prompt's shared prefix. Wait
+        // for its whole-block checkpoint (one attach + the tail) instead of recomputing the
+        // shared rows beside it; bounded, and released when the owner publishes or retires.
+        if self.vmm_prefix_enabled()
+            && crate::config::RuntimeConfig::get().prefix_inflight_wait()
+        {
+            let since = match self.packed_admission[b] {
+                PackedAdmission::WaitingPrefix(since) => since,
+                _ => std::time::Instant::now(),
+            };
+            if since.elapsed() < INFLIGHT_WAIT_LIMIT {
+                if let Some((owner, rows)) = self.vmm_inflight_prefix(b, prompt) {
+                    if self.packed_admission[b] != PackedAdmission::WaitingPrefix(since) {
+                        tracing::info!(
+                            slot = b,
+                            owner,
+                            rows,
+                            prompt = prompt.len(),
+                            "gpu: packed admission waiting on in-flight prefix"
+                        );
+                    }
+                    self.packed_admission[b] = PackedAdmission::WaitingPrefix(since);
+                    return Ok(None);
+                }
+            }
         }
         let started = (|| {
             self.begin_slot(b, total)?;
@@ -7887,17 +7940,8 @@ impl GpuEngine {
         if self.vmm_prefix_enabled() {
             self.seq_tokens[b].clear();
             self.seq_tokens[b].extend_from_slice(prompt);
-        }
-        if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
-            let p_a = (n.saturating_sub(1) as u32 / 32) * 32;
-            if p_a > 0 {
-                let snap_bytes = self.vmm_snap_bytes(p_a);
-                if let Err(e) = v.kv.publish_at(b, prompt, p_a, snap_bytes, |dst| {
-                    self.vmm_snap_copy(b, p_a, dst, true)
-                }) {
-                    tracing::warn!(error = %e, slot = b, "vmm: publish failed (serving continues)");
-                }
-            }
+            self.vmm_publish(b, n.saturating_sub(1) as u32);
+            self.vmm_prefill_done(b);
         }
         // in.ids[0] now holds the first generated token (argmax over the last
         // real prompt row) — identical to decode-only step n_prompt-1.
@@ -8833,6 +8877,7 @@ impl GpuEngine {
                 self.seq_tokens[r.slot].clear();
                 self.seq_tokens[r.slot].extend_from_slice(&r.prompt[..end]);
                 self.vmm_publish(r.slot, r.prompt.len().saturating_sub(1) as u32);
+                self.vmm_prefill_done(r.slot);
             }
         }
         Ok(())
