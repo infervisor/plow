@@ -532,7 +532,11 @@ static __device__ __forceinline__ void gemv_nrn_smem(
     const __nv_bfloat16* __restrict__ gn,
     unsigned K,
     float eps, float scale, bool store,
-    float* __restrict__ part)
+    /* NOT __restrict__ (nor the callers' arena it points into): both block_sums reuse part[],
+     * and with a noalias pointer nvcc treats __syncthreads as not writing it. The second sum then
+     * reused the first sum's partials (lanes != 0) and lane 0 reloaded them above the barriers,
+     * so the staged row was resid * invb * gn, not resid * invr * gn (the fold's H100 garbage). */
+    float* part)
 {
     bf16v8 av[RN_VEC], bv[RN_VEC], wb[RN_VEC], wn[RN_VEC];
 #pragma unroll
@@ -611,7 +615,7 @@ static __device__ void d_gemv_nrn(
     unsigned M, unsigned N, unsigned K,
     float eps, float scale, bool store,
     unsigned slice, unsigned nblk,
-    __nv_bfloat16* __restrict__ arena)
+    __nv_bfloat16* arena) /* not __restrict__: see gemv_nrn_smem */
 {
     if (K > RN_REG * PLOW_NV_THREADS || (K & 7u) != 0) { __trap(); return; }
     __nv_bfloat16* xs = arena;
@@ -2810,7 +2814,7 @@ static __device__ void d_gemv_glu_nrn(
     unsigned M, unsigned N, unsigned K,
     float eps, float scale, bool store,
     unsigned act, unsigned slice, unsigned nblk,
-    __nv_bfloat16* __restrict__ arena)
+    __nv_bfloat16* arena) /* not __restrict__: see gemv_nrn_smem */
 {
     if (K > RN_REG * PLOW_NV_THREADS || (K & 7u) != 0) { __trap(); return; }
     __nv_bfloat16* xs = arena;
