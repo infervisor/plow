@@ -495,8 +495,99 @@ pub(crate) struct GroupedDims {
     pub average_rows: u32,
 }
 
+/// Device `i32[groups]` arrays of a grouped attention GEMM's per-group shapes (see
+/// [`AttentionGemm`]): `hd` every entry the head dim, `m` score rows, `n` the 8-aligned KV
+/// extent, `ld_s` / `ld_p` the score row pitch in S / P elements. Rewritten on the device
+/// before each launch; a group with `m = 0` does nothing.
+pub(crate) struct GroupedAttention {
+    pub groups: u32,
+    pub head_dim: u32,
+    pub hd: u64,
+    pub m: u64,
+    pub n: u64,
+    pub ld_s: u64,
+    pub ld_p: u64,
+    /// Expected shapes; only steer the heuristic.
+    pub average_m: u32,
+    pub average_n: u32,
+}
+
+/// One column-major grouped layout: `(dtype, rows, cols, ld)` device `i32` arrays.
+type GroupedLayout = (i32, u64, u64, u64);
+
 impl Lt {
+    pub(crate) fn has_grouped(&self) -> bool {
+        self.api.cublasLtGroupedMatrixLayoutCreate.is_some()
+    }
+
     pub(crate) fn grouped_plan(self: &Arc<Self>, dims: &GroupedDims) -> Result<Arc<GroupedPlan>> {
+        // Column-major views of the row-major operands: W is k x n, A is k x m_g, C is n x m_g.
+        let mut plan = self.grouped_plan_raw(
+            true,
+            1.0,
+            dims.groups,
+            [
+                (14, dims.k_array, dims.n_array, dims.k_array),
+                (14, dims.k_array, dims.rows, dims.k_array),
+                (14, dims.n_array, dims.rows, dims.n_array),
+            ],
+            [
+                u64::from(dims.k),
+                u64::from(dims.n),
+                u64::from(dims.average_rows.max(1)),
+            ],
+        )?;
+        plan.select(0);
+        tracing::info!(
+            groups = dims.groups,
+            n = dims.n,
+            k = dims.k,
+            "cuBLASLt grouped algorithm selected"
+        );
+        Ok(Arc::new(plan))
+    }
+
+    /// The grouped form of [`Self::attention_plan`]: `alpha` scales the scores. The plan comes
+    /// back unselected: every heuristic candidate is a [`GroupedPlan::candidates`] entry.
+    pub(crate) fn grouped_attention_plan(
+        self: &Arc<Self>,
+        kind: AttentionGemm,
+        scores_f32: bool,
+        alpha: f32,
+        dims: &GroupedAttention,
+    ) -> Result<GroupedPlan> {
+        let hd = u64::from(dims.head_dim);
+        let (layouts, averages) = match kind {
+            AttentionGemm::Scores => (
+                [
+                    (14, dims.hd, dims.n, dims.hd),
+                    (14, dims.hd, dims.m, dims.hd),
+                    (if scores_f32 { 0 } else { 14 }, dims.n, dims.m, dims.ld_s),
+                ],
+                [hd, u64::from(dims.average_n), u64::from(dims.average_m)],
+            ),
+            AttentionGemm::Values => (
+                [
+                    (14, dims.hd, dims.n, dims.hd),
+                    (14, dims.n, dims.m, dims.ld_p),
+                    (14, dims.hd, dims.m, dims.hd),
+                ],
+                [u64::from(dims.average_n), hd, u64::from(dims.average_m)],
+            ),
+        };
+        self.grouped_plan_raw(kind == AttentionGemm::Scores, alpha, dims.groups, layouts, averages)
+    }
+
+    /// `layouts` = `[W, A, C]`; `averages` = `[reduction dim, D rows, D cols]` for the heuristic.
+    /// The plan's `candidates` are every runnable heuristic result, best-first by the heuristic.
+    fn grouped_plan_raw(
+        self: &Arc<Self>,
+        transpose_w: bool,
+        alpha: f32,
+        groups: u32,
+        layouts: [GroupedLayout; 3],
+        averages: [u64; 3],
+    ) -> Result<GroupedPlan> {
         let create = self.api.cublasLtGroupedMatrixLayoutCreate.ok_or_else(|| {
             RuntimeError::Rejected(
                 "cuBLASLt has no grouped matmul (Hopper needs cuBLAS 13.4 or newer)".into(),
@@ -504,7 +595,7 @@ impl Lt {
         })?;
         self.be.bind()?;
         let scalars = self.be.alloc(0, 8)?;
-        let host: [f32; 2] = [1.0, 0.0];
+        let host: [f32; 2] = [alpha, 0.0];
         self.be.upload(&scalars, 0, bytemuck::cast_slice(&host))?;
         let mut plan = GroupedPlan {
             lt: self.clone(),
@@ -513,10 +604,11 @@ impl Lt {
             a: 0,
             c: 0,
             algo: Algo::default(),
+            candidates: Vec::new(),
             scalars,
         };
         let mut raw = std::ptr::null_mut();
-        // CUDA headers: BF16=14, COMPUTE_32F=68, scale FP32=0, POINTER_MODE attribute=2
+        // CUDA headers: BF16=14, FP32=0, COMPUTE_32F=68, scale FP32=0, POINTER_MODE attribute=2
         // (DEVICE=1), TRANSA attribute=3 (OP_T=1), preference MAX_WORKSPACE=1,
         // GROUPED_AVERAGE_REDUCTION_DIM=13, GROUPED_DESC_D_AVERAGE_ROWS=14 / _COLS=15.
         // SAFETY: exact CUDA 13 C ABI; GroupedPlan drops any descriptors created before an error.
@@ -526,7 +618,12 @@ impl Lt {
                 "Lt grouped descriptor",
             )?;
             plan.desc = raw as usize;
-            for (attribute, value) in [(3, 1i32), (2, 1i32)] {
+            let attributes: &[(i32, i32)] = if transpose_w {
+                &[(3, 1), (2, 1)]
+            } else {
+                &[(2, 1)]
+            };
+            for &(attribute, value) in attributes {
                 check(
                     (self.api.cublasLtMatmulDescSetAttribute)(
                         raw,
@@ -537,18 +634,15 @@ impl Lt {
                     "Lt grouped descriptor attribute",
                 )?;
             }
-            // Column-major views of the row-major operands: W is k x n, A is k x m_g, C is n x m_g.
-            for (dst, rows, cols, ld) in [
-                (&mut plan.w, dims.k_array, dims.n_array, dims.k_array),
-                (&mut plan.a, dims.k_array, dims.rows, dims.k_array),
-                (&mut plan.c, dims.n_array, dims.rows, dims.n_array),
-            ] {
+            for (dst, (dtype, rows, cols, ld)) in
+                [&mut plan.w, &mut plan.a, &mut plan.c].into_iter().zip(layouts)
+            {
                 raw = std::ptr::null_mut();
                 check(
                     create(
                         &mut raw,
-                        14,
-                        dims.groups as i32,
+                        dtype,
+                        groups as i32,
                         rows as *const c_void,
                         cols as *const c_void,
                         ld as *const c_void,
@@ -575,16 +669,12 @@ impl Lt {
                 )?;
                 // The 13.4 header declares these `uint32_t`; the library's storage is 8 bytes
                 // and a 4-byte write is rejected with CUBLAS_STATUS_INVALID_VALUE.
-                for (attribute, value) in [
-                    (13, u64::from(dims.k)),
-                    (14, u64::from(dims.n)),
-                    (15, u64::from(dims.average_rows.max(1))),
-                ] {
+                for (attribute, value) in [13, 14, 15].into_iter().zip(averages) {
                     check(
                         (self.api.cublasLtMatmulPreferenceSetAttribute)(
                             pref,
                             attribute,
-                            &value as *const _ as *const c_void,
+                            &value.max(1) as *const _ as *const c_void,
                             size_of::<u64>(),
                         ),
                         "Lt grouped average shape",
@@ -607,29 +697,30 @@ impl Lt {
                     ),
                     "Lt grouped heuristic",
                 )?;
-                let winner = results
+                plan.candidates = results
                     .get(..count as usize)
                     .unwrap_or(&[])
                     .iter()
-                    .find(|r| r.state == 0 && r.workspace <= bytes)
-                    .ok_or_else(|| {
-                        RuntimeError::Device("no supported BF16 cuBLASLt grouped algorithm".into())
-                    })?;
-                plan.algo = winner.algo;
-                tracing::info!(
-                    groups = dims.groups,
-                    n = dims.n,
-                    k = dims.k,
-                    candidates = count,
-                    workspace = winner.workspace,
-                    "cuBLASLt grouped algorithm selected"
+                    .filter(|r| r.state == 0 && r.workspace <= bytes)
+                    .map(|r| r.algo)
+                    .collect();
+                if plan.candidates.is_empty() {
+                    return Err(RuntimeError::Device(
+                        "no supported BF16 cuBLASLt grouped algorithm".into(),
+                    ));
+                }
+                tracing::debug!(
+                    groups,
+                    ?averages,
+                    candidates = plan.candidates.len(),
+                    "cuBLASLt grouped algorithms found"
                 );
                 Ok(())
             })();
             (self.api.cublasLtMatmulPreferenceDestroy)(pref);
             result?;
         }
-        Ok(Arc::new(plan))
+        Ok(plan)
     }
 }
 
@@ -803,13 +894,39 @@ pub(crate) struct GroupedPlan {
     a: usize,
     c: usize,
     algo: Algo,
+    /// Heuristic results still to choose from (`select` empties it into `algo`).
+    candidates: Vec<Algo>,
     /// Device `[alpha, beta]`: a grouped matmul runs in device pointer mode.
     scalars: DeviceMem,
 }
 
 impl GroupedPlan {
+    pub(crate) fn candidates(&self) -> usize {
+        self.candidates.len()
+    }
+
+    pub(crate) fn select(&mut self, index: usize) {
+        self.algo = self.candidates[index];
+        self.candidates.clear();
+    }
+
     /// `a`, `w`, `c` are device arrays of `groups` matrix pointers.
     pub(crate) fn run(&self, a: u64, w: u64, c: u64, stream: &CudaStream) -> Result<()> {
+        self.run_algo(&self.algo, a, w, c, stream)
+    }
+
+    pub(crate) fn run_candidate(
+        &self,
+        index: usize,
+        a: u64,
+        w: u64,
+        c: u64,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.run_algo(&self.candidates[index], a, w, c, stream)
+    }
+
+    fn run_algo(&self, algo: &Algo, a: u64, w: u64, c: u64, stream: &CudaStream) -> Result<()> {
         self.lt.be.bind()?;
         // SAFETY: the route validated the pointer arrays' extents at load; the group shapes
         // are read on the device. All work is serialized on the engine stream.
@@ -828,7 +945,7 @@ impl GroupedPlan {
                     self.c as Handle,
                     c as *mut c_void,
                     self.c as Handle,
-                    &self.algo,
+                    algo,
                     self.lt.workspace.base as *mut c_void,
                     self.lt.workspace.len as usize,
                     stream.raw as Handle,

@@ -2041,8 +2041,10 @@ pub struct GpuEngine {
     cublaslt_decode_graph: Option<crate::device::cuda::GraphExec>,
     cublaslt_decode_capture: bool,
     /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
-    /// (bucket, slot-tensor-base) — one cuGraphLaunch replaces ~480 kernel submits.
-    seg_graphs: std::collections::HashMap<(usize, u64), crate::device::cuda::GraphExec>,
+    /// (bucket, slot-tensor-base, segment range) — one cuGraphLaunch replaces ~480 kernel
+    /// submits. A routed bucket's launches run the ranges between its attention segments.
+    seg_graphs:
+        std::collections::HashMap<(usize, u64, usize, usize), crate::device::cuda::GraphExec>,
     smem_pf: u32,
     grid_pf: u32,
     prefill: Vec<PrefillBucket>,
@@ -4732,6 +4734,13 @@ impl GpuEngine {
                 sites.clone().map(|site| site.heads).max().unwrap_or(1),
                 sites.map(|site| site.head_dim).max().unwrap_or(8),
                 max_ctx,
+                prefill
+                    .iter()
+                    .map(|b| b.attention_gemm_segments.iter().flatten().count())
+                    .max()
+                    .unwrap_or(0),
+                batch,
+                prefill.iter().map(|b| b.t).max().unwrap_or(0),
             )?)
         } else {
             if config.nv.pf_attn_gemm {
@@ -5539,15 +5548,11 @@ impl GpuEngine {
                     false,
                     engine.prefill[bi].seg_class.len(),
                     &engine.prefill[bi].packet_segment_roles,
-                ) && engine.prefill[bi]
-                    .attention_gemm_segments
-                    .iter()
-                    .all(Option::is_none)
-                {
+                ) {
                     for b in 0..warmup_slots {
                         let mut arg = engine.prefill[bi].kernarg;
                         arg.tensors = engine.tens_slot_base(b);
-                        if let Err(e) = engine.ensure_seg_graph(bi, &arg) {
+                        if let Err(e) = engine.warm_seg_graphs(bi, &arg) {
                             tracing::warn!(
                                 error = %e,
                                 bucket = bi,
@@ -8285,12 +8290,74 @@ impl GpuEngine {
         Ok(None)
     }
 
-    fn ensure_seg_graph(&mut self, bi: usize, arg: &DevProgram) -> Result<()> {
-        let key = (bi, arg.tensors as u64);
+    /// The whole chain, and for a bucket with routed attention segments the ranges between
+    /// them (what a routed launch runs).
+    fn warm_seg_graphs(&mut self, bi: usize, arg: &DevProgram) -> Result<()> {
+        let segments = self.prefill[bi].seg_class.len();
+        self.ensure_seg_graph(bi, arg, 0..segments)?;
+        if self.attention_gemm.is_some() {
+            for (start, end) in self.seg_graph_pieces(bi) {
+                self.ensure_seg_graph(bi, arg, start..end)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The non-empty segment ranges between bucket `bi`'s routed attention segments.
+    fn seg_graph_pieces(&self, bi: usize) -> Vec<(usize, usize)> {
+        let bucket = &self.prefill[bi];
+        let mut pieces = Vec::new();
+        let mut start = 0;
+        for seg in 0..bucket.seg_class.len() {
+            if bucket.attention_gemm_segments.get(seg).is_some_and(Option::is_some) {
+                if start < seg {
+                    pieces.push((start, seg));
+                }
+                start = seg + 1;
+            }
+        }
+        if start < bucket.seg_class.len() {
+            pieces.push((start, bucket.seg_class.len()));
+        }
+        pieces
+    }
+
+    /// The routed attention segments in `range`, on the staged grouped launch or per request.
+    fn run_routed_segments(
+        &mut self,
+        bi: usize,
+        range: std::ops::Range<usize>,
+        grouped: bool,
+        rows: u32,
+        index: &mut usize,
+    ) -> Result<()> {
+        for seg in range {
+            if let (Some(Some(site)), Some(route)) = (
+                self.prefill[bi].attention_gemm_segments.get(seg),
+                self.attention_gemm.as_mut(),
+            ) {
+                if grouped {
+                    route.run_site(*index, &self.stream)?;
+                } else {
+                    route.run(site, &self.attention_requests, rows, &self.stream)?;
+                }
+                *index += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_seg_graph(
+        &mut self,
+        bi: usize,
+        arg: &DevProgram,
+        range: std::ops::Range<usize>,
+    ) -> Result<()> {
+        let key = (bi, arg.tensors as u64, range.start, range.end);
         if self.seg_graphs.contains_key(&key) {
             return Ok(());
         }
-        let seg_class = self.prefill[bi].seg_class.clone();
+        let seg_class = self.prefill[bi].seg_class[range.clone()].to_vec();
         let has_external = self.prefill[bi].cublaslt_segments.iter().any(Option::is_some)
             || self.prefill[bi].moe_lt_segments.iter().any(Option::is_some)
             || self.prefill[bi]
@@ -8308,6 +8375,7 @@ impl GpuEngine {
             let capture_stream = self.be.stream_create()?;
             self.be.graph_capture(&capture_stream, || {
                 for (seg, &class) in seg_class.iter().enumerate() {
+                    let seg = seg + range.start;
                     if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
                         route.run(&capture_stream)?;
                         continue;
@@ -8348,7 +8416,8 @@ impl GpuEngine {
                 Ok(())
             })?
         } else {
-            let mut blobs: Vec<DevProgram> = (0..seg_class.len())
+            let mut blobs: Vec<DevProgram> = range
+                .clone()
                 .map(|i| {
                     let mut node_arg = *arg;
                     node_arg.cur_seg = i as u32;
@@ -8358,7 +8427,9 @@ impl GpuEngine {
             let nodes: Vec<_> = seg_class
                 .iter()
                 .enumerate()
-                .map(|(seg, &class)| self.prefill_segment_kernel(bi, seg, class, false))
+                .map(|(seg, &class)| {
+                    self.prefill_segment_kernel(bi, seg + range.start, class, false)
+                })
                 .collect::<Result<Vec<_>>>()?;
             let mut ptrs: Vec<*mut std::ffi::c_void> = blobs
                 .iter_mut()
@@ -8369,6 +8440,7 @@ impl GpuEngine {
         self.seg_graphs.insert(key, g);
         tracing::info!(
             nodes = seg_class.len(),
+            first = range.start,
             external = has_external,
             bucket = bi,
             "seg graph built"
@@ -8456,10 +8528,9 @@ impl GpuEngine {
             let rt = crate::config::RuntimeConfig::get();
             let seg_time_probe = rt.nv.pf_seg_time;
             let fat_only_probe = rt.nv.pf_seg_fatonly;
-            // The route's GEMM shapes follow each launch's KV lengths: not capturable. A pack of
-            // short slices only keeps the graph: routing runs per request and costs the bucket its
-            // graph (16 x 129-row packs: 128/C16 TTFT +8%). One long slice pays for that; a short
-            // tail slice beside it costs three small launches.
+            // The route's GEMM shapes follow each launch's KV lengths: not capturable. A routed
+            // launch runs the graph pieces between its attention segments; a pack of short
+            // slices keeps the whole graph and the native kernel.
             let min_rows = rt.nv.pf_attn_gemm_min_rows;
             let routed = self.attention_gemm.is_some()
                 && self.prefill[bi]
@@ -8467,11 +8538,39 @@ impl GpuEngine {
                     .iter()
                     .any(Option::is_some)
                 && self.attention_requests.iter().any(|r| r[1] >= min_rows);
-            if !seg_time_probe && !fat_only_probe && rt.nv.pf_seg_graph && !routed {
-                let key = (bi, arg.tensors as u64);
-                self.ensure_seg_graph(bi, &arg)?;
-                self.be
-                    .graph_launch(self.seg_graphs.get(&key).expect("just built"), &self.stream)?;
+            // One table upload per launch serves every routed segment; `false` = shapes the
+            // grouped path cannot take, served per request instead.
+            let grouped = if routed {
+                let sites: Vec<attention_gemm::Site> = self.prefill[bi]
+                    .attention_gemm_segments
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect();
+                let route = self.attention_gemm.as_mut().expect("routed");
+                route.begin_launch(&sites, &self.attention_requests, tc as u32, &self.stream)?
+            } else {
+                false
+            };
+            let mut routed_index = 0;
+            if !seg_time_probe && !fat_only_probe && rt.nv.pf_seg_graph {
+                let tensors = arg.tensors as u64;
+                let pieces = if routed {
+                    self.seg_graph_pieces(bi)
+                } else {
+                    vec![(0, seg_class.len())]
+                };
+                let mut next = 0;
+                let rows = tc as u32;
+                for (start, end) in pieces {
+                    self.run_routed_segments(bi, next..start, grouped, rows, &mut routed_index)?;
+                    self.ensure_seg_graph(bi, &arg, start..end)?;
+                    let graph = self.seg_graphs.get(&(bi, tensors, start, end)).expect("built");
+                    self.be.graph_launch(graph, &self.stream)?;
+                    next = end;
+                }
+                let rest = next..seg_class.len();
+                self.run_routed_segments(bi, rest, grouped, rows, &mut routed_index)?;
                 if synchronize {
                 if let Err(e) = self.be.stream_synchronize(&self.stream) {
                     tracing::warn!(
@@ -8524,7 +8623,12 @@ impl GpuEngine {
                     } else {
                         None
                     };
-                    route.run(site, &self.attention_requests, tc as u32, &self.stream)?;
+                    if grouped {
+                        route.run_site(routed_index, &self.stream)?;
+                    } else {
+                        route.run(site, &self.attention_requests, tc as u32, &self.stream)?;
+                    }
+                    routed_index += 1;
                     if let Some(e0) = timed {
                         let e1 = self.be.event_create(true)?;
                         self.be.event_record(&e1, &self.stream)?;
@@ -8616,6 +8720,21 @@ impl GpuEngine {
             }
             if seg_time {
                 self.be.stream_synchronize(&self.stream)?;
+                if let Some(route) = self.attention_gemm.as_mut() {
+                    let phases = route.phase_report()?;
+                    if !phases.is_empty() {
+                        let sum = phases.iter().fold([0f32; 3], |acc, p| {
+                            [acc[0] + p[0], acc[1] + p[1], acc[2] + p[2]]
+                        });
+                        tracing::info!(
+                            waves = phases.len(),
+                            qk_ms = format!("{:.3}", sum[0]).as_str(),
+                            softmax_ms = format!("{:.3}", sum[1]).as_str(),
+                            pv_ms = format!("{:.3}", sum[2]).as_str(),
+                            "attention route phases (chunk)"
+                        );
+                    }
+                }
                 let mut by_class = [0f64; 3]; // [gemm(8), flash-fat(4), fa512(2)]
                 let mut n_by = [0u32; 3];
                 for (_, cls, e0, e1) in &evs {

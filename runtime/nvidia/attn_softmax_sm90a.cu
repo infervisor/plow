@@ -6,19 +6,25 @@
  * i / heads). Query row q of the tile sees columns [0, first + q); everything from there to
  * `cols` is written as 0 so the P.V GEMM can run over the whole tile.
  *
- * Four entries, same argument block:
+ * Entries, two argument blocks:
  *   plow_attn_softmax_w      S is bf16, P overwrites it (row pitch ld bf16 elements); one score
- *                            row per WARP, coalesced. The runtime's entry.
+ *                            row per WARP, coalesced. The runtime's single-tile entry.
  *   plow_attn_softmax_w_f32  S is f32 (the GEMM widens), P is bf16 at the START of each f32 row,
  *                            i.e. row pitch 2*ld bf16 elements. The bf16 store at element j sits
  *                            at byte 2j, never ahead of the f32 load at byte 4j.
- *   plow_attn_softmax / _f32 the same with one row per thread (strided across the warp; kept
- *                            for the harness A/B: 0.46 vs 0.34 ms on a 32768 x 4096 tile).
+ *   plow_attn_softmax_gw / _gw_f32
+ *                            the same over a GROUP of tiles (one grouped cuBLASLt call's worth):
+ *                            per-group base, rows, cols, ld and first, rows concatenated.
+ *   plow_attn_softmax / _f32 one row per thread (strided across the warp; kept for the harness
+ *                            A/B: 0.46 vs 0.34 ms on a 32768 x 4096 tile).
+ *   plow_attn_zero           zero a table of 16-byte-aligned byte ranges (KV rows past a
+ *                            request's length that a P.V GEMM reads against P = 0, and the
+ *                            output rows past a launch's last request).
  *
  * Scores arrive in the LOG2 domain (the GEMM's alpha carries scale * log2(e)), so every exp
  * is the hardware exp2 the native flash bodies use (op_attention.cuh FA_EXP).
  *
- * Grid-strided plain launches, no counters, no smem. `ld` must be a multiple of 8 so every row
+ * Grid-strided plain launches, no counters. `ld` must be a multiple of 8 so every row
  * starts on a 32-byte boundary and whole-vector loads/stores of a row's last partial vector
  * stay inside the row.
  */
@@ -28,12 +34,15 @@
 #define PLOW_ATTN_SM_UN 4
 #endif
 #define PLOW_ATTN_SM_NEG_INF (-3.0e38f)
+/* Grouped entries keep this many groups' row offsets in shared memory. */
+#define PLOW_ATTN_SM_MAX_GROUPS 256
 
 /* The harness (experiments/attn_gemm_softmax_h100.cu) includes this file into an executable,
  * where device globals do not link. */
 #ifndef PLOW_ATTN_SM_HARNESS
-extern "C" __device__ unsigned plow_attn_softmax_abi = 1;
+extern "C" __device__ unsigned plow_attn_softmax_abi = 2;
 extern "C" __device__ unsigned plow_block_attn_softmax = 256;
+extern "C" __device__ unsigned plow_attn_softmax_max_groups = PLOW_ATTN_SM_MAX_GROUPS;
 #endif
 
 struct asm_bf16v8 {
@@ -78,6 +87,31 @@ typedef struct {
     unsigned pad;
 } PlowAttnSoftmax;
 static_assert(sizeof(PlowAttnSoftmax) == 32, "attention softmax ABI");
+
+/* One grouped call: group g's scores start at s[g] ([rows[g]][ld[g]] row-major), its query
+ * row q sees columns [0, first[g] + q), P is written over [0, cols[g]) (cols 8-aligned).
+ * row_start has groups + 1 entries (prefix sums of rows, row_start[groups] = total_rows). */
+typedef struct {
+    const unsigned long long* s;
+    const int* rows;
+    const int* cols;
+    const int* ld;
+    const int* first;
+    const int* row_start;
+    unsigned groups;
+    unsigned total_rows;
+    unsigned heads;
+    unsigned pad;
+} PlowAttnSoftmaxG;
+static_assert(sizeof(PlowAttnSoftmaxG) == 64, "grouped attention softmax ABI");
+
+typedef struct {
+    const unsigned long long* ptr;
+    const int* bytes;
+    unsigned count;
+    unsigned pad;
+} PlowAttnZero;
+static_assert(sizeof(PlowAttnZero) == 24, "attention zero ABI");
 
 template <bool F32>
 __device__ __forceinline__ void asm_rows(const PlowAttnSoftmax& a) {
@@ -169,9 +203,56 @@ __device__ __forceinline__ void asm_rows(const PlowAttnSoftmax& a) {
 
 /* One score row per WARP: lane l owns columns [l*8 + 256*k, +8), so every warp-level load and
  * store touches 512 contiguous bytes. Pass A keeps a per-lane online (max, sum) that the warp
- * merges once; pass B writes P (and the zero tail) with the same striding. With f32 scores the
- * bf16 stores of an iteration land below that iteration's loads (bytes [2j, 2j+512) vs
- * [4j, 4j+1024)), and the syncwarp orders the lanes' loads before any lane's store. */
+ * merges once; pass B writes P (and the zero tail to end8) with the same striding. With f32
+ * scores the bf16 stores of an iteration land below that iteration's loads (bytes [2j, 2j+512)
+ * vs [4j, 4j+1024)), and the syncwarp orders the lanes' loads before any lane's store. */
+template <bool F32>
+__device__ __forceinline__ void asm_row_warp(const void* s, __nv_bfloat16* p, unsigned lim,
+                                             unsigned end8, unsigned lane) {
+    asm_bf16v8 zero;
+    *(uint4*)&zero = make_uint4(0u, 0u, 0u, 0u);
+    float m = PLOW_ATTN_SM_NEG_INF, l = 0.0f;
+    for (unsigned j = lane * 8u; j < lim; j += 256u) {
+        asm_f32v8 v = asm_ld8<F32>(s, j);
+        const unsigned live = lim - j;
+        float bm = PLOW_ATTN_SM_NEG_INF;
+#pragma unroll
+        for (unsigned e = 0; e < 8u; e++) {
+            v.x[e] = e < live ? v.x[e] : PLOW_ATTN_SM_NEG_INF;
+            bm = v.x[e] > bm ? v.x[e] : bm;
+        }
+        const float nm = bm > m ? bm : m;
+        float acc = l * asm_ex2(m - nm);
+#pragma unroll
+        for (unsigned e = 0; e < 8u; e++) acc += asm_ex2(v.x[e] - nm);
+        l = acc;
+        m = nm;
+    }
+    float M = m;
+#pragma unroll
+    for (int o = 16; o; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+    l *= asm_ex2(m - M);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
+    const float inv = 1.0f / l;
+
+    /* Uniform trip count: every lane reaches the syncwarp. */
+    for (unsigned j0 = 0; j0 < end8; j0 += 256u) {
+        const unsigned j = j0 + lane * 8u;
+        asm_bf16v8 o = zero;
+        if (j < lim) {
+            const asm_f32v8 v = asm_ld8<F32>(s, j);
+            const unsigned live = lim - j;
+#pragma unroll
+            for (unsigned e = 0; e < 8u; e++)
+                o.x[e] = e < live ? __float2bfloat16(asm_ex2(v.x[e] - M) * inv)
+                                  : __float2bfloat16(0.0f);
+        }
+        if (F32) __syncwarp();
+        if (j < end8) asm_st8(p + j, o);
+    }
+}
+
 template <bool F32>
 __device__ __forceinline__ void asm_rows_warp(const PlowAttnSoftmax& a) {
     const unsigned lane = threadIdx.x & 31u;
@@ -179,54 +260,35 @@ __device__ __forceinline__ void asm_rows_warp(const PlowAttnSoftmax& a) {
     const unsigned nwarps = (gridDim.x * blockDim.x) >> 5;
     const unsigned end8 = (a.cols + 7u) & ~7u;
     const size_t row_bytes = (size_t)a.ld * (F32 ? 4u : 2u);
-    asm_bf16v8 zero;
-    *(uint4*)&zero = make_uint4(0u, 0u, 0u, 0u);
     for (unsigned row = warp; row < a.rows; row += nwarps) {
         const void* const s = (const char*)a.s + (size_t)row * row_bytes;
         __nv_bfloat16* const p = (__nv_bfloat16*)((char*)a.s + (size_t)row * row_bytes);
         unsigned lim = a.first + row / a.heads;
         if (lim > a.cols) lim = a.cols;
+        asm_row_warp<F32>(s, p, lim, end8, lane);
+    }
+}
 
-        float m = PLOW_ATTN_SM_NEG_INF, l = 0.0f;
-        for (unsigned j = lane * 8u; j < lim; j += 256u) {
-            asm_f32v8 v = asm_ld8<F32>(s, j);
-            const unsigned live = lim - j;
-            float bm = PLOW_ATTN_SM_NEG_INF;
-#pragma unroll
-            for (unsigned e = 0; e < 8u; e++) {
-                v.x[e] = e < live ? v.x[e] : PLOW_ATTN_SM_NEG_INF;
-                bm = v.x[e] > bm ? v.x[e] : bm;
-            }
-            const float nm = bm > m ? bm : m;
-            float acc = l * asm_ex2(m - nm);
-#pragma unroll
-            for (unsigned e = 0; e < 8u; e++) acc += asm_ex2(v.x[e] - nm);
-            l = acc;
-            m = nm;
-        }
-        float M = m;
-#pragma unroll
-        for (int o = 16; o; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
-        l *= asm_ex2(m - M);
-#pragma unroll
-        for (int o = 16; o; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
-        const float inv = 1.0f / l;
-
-        /* Uniform trip count: every lane reaches the syncwarp. */
-        for (unsigned j0 = 0; j0 < end8; j0 += 256u) {
-            const unsigned j = j0 + lane * 8u;
-            asm_bf16v8 o = zero;
-            if (j < lim) {
-                const asm_f32v8 v = asm_ld8<F32>(s, j);
-                const unsigned live = lim - j;
-#pragma unroll
-                for (unsigned e = 0; e < 8u; e++)
-                    o.x[e] = e < live ? __float2bfloat16(asm_ex2(v.x[e] - M) * inv)
-                                      : __float2bfloat16(0.0f);
-            }
-            if (F32) __syncwarp();
-            if (j < end8) asm_st8(p + j, o);
-        }
+/* A warp's rows are increasing, so its group cursor only moves forward: the row_start scan is
+ * amortized over the whole row range. */
+template <bool F32>
+__device__ __forceinline__ void asm_rows_warp_g(const PlowAttnSoftmaxG& a) {
+    __shared__ int starts[PLOW_ATTN_SM_MAX_GROUPS + 1];
+    for (unsigned i = threadIdx.x; i <= a.groups; i += blockDim.x) starts[i] = a.row_start[i];
+    __syncthreads();
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const unsigned nwarps = (gridDim.x * blockDim.x) >> 5;
+    unsigned g = 0;
+    for (unsigned row = warp; row < a.total_rows; row += nwarps) {
+        while (row >= (unsigned)starts[g + 1]) g++;
+        const unsigned local = row - (unsigned)starts[g];
+        const unsigned cols = (unsigned)a.cols[g];
+        const size_t row_bytes = (size_t)a.ld[g] * (F32 ? 4u : 2u);
+        char* const base = (char*)a.s[g] + (size_t)local * row_bytes;
+        unsigned lim = (unsigned)a.first[g] + local / a.heads;
+        if (lim > cols) lim = cols;
+        asm_row_warp<F32>(base, (__nv_bfloat16*)base, lim, cols, lane);
     }
 }
 
@@ -248,4 +310,27 @@ void plow_attn_softmax_w_f32(PlowAttnSoftmax a) {
 extern "C" __global__ __launch_bounds__(256)
 void plow_attn_softmax_f32(PlowAttnSoftmax a) {
     asm_rows<true>(a);
+}
+
+extern "C" __global__ __launch_bounds__(256)
+void plow_attn_softmax_gw(PlowAttnSoftmaxG a) {
+    asm_rows_warp_g<false>(a);
+}
+
+extern "C" __global__ __launch_bounds__(256)
+void plow_attn_softmax_gw_f32(PlowAttnSoftmaxG a) {
+    asm_rows_warp_g<true>(a);
+}
+
+/* Every block walks every range (few ranges, most tiny; the big ones get the whole grid). */
+extern "C" __global__ __launch_bounds__(256)
+void plow_attn_zero(PlowAttnZero a) {
+    const unsigned tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned stride = gridDim.x * blockDim.x;
+    const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+    for (unsigned r = 0; r < a.count; r++) {
+        uint4* const p = (uint4*)a.ptr[r];
+        const unsigned n = (unsigned)a.bytes[r] >> 4;
+        for (unsigned i = tid; i < n; i += stride) p[i] = z;
+    }
 }

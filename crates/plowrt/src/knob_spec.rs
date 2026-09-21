@@ -415,6 +415,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_attn_gemm_min_rows", Some("PLOW_PF_ATTN_GEMM_MIN_ROWS"), Layer::Runtime, U32, Default::Static(Val::Nat(1024)), OPT_IN),
     KnobSpec::new("rt.pf_attn_gemm_grid", Some("PLOW_PF_ATTN_GEMM_GRID"), Layer::Runtime, U32, Default::Static(Val::Nat(8)), OPT_IN),
     KnobSpec::new("rt.pf_attn_gemm_s32", Some("PLOW_PF_ATTN_GEMM_S32"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.pf_attn_gemm_grouped", Some("PLOW_PF_ATTN_GEMM_GROUPED"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_time", Some("PLOW_PF_SEG_TIME"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_fatonly", Some("PLOW_PF_SEG_FATONLY"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_noncoop", Some("PLOW_PF_SEG_NONCOOP"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
