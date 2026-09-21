@@ -25,11 +25,13 @@ struct Heuristic {
 }
 
 macro_rules! api {
-    ($($name:ident: fn($($arg:ty),*) -> Status),+ $(,)?) => {
+    ($($name:ident: fn($($arg:ty),*) -> Status),+ ;
+     optional $($oname:ident: fn($($oarg:ty),*) -> Status),+ $(,)?) => {
         #[allow(non_snake_case)]
         struct Api {
             _lib: libloading::Library,
             $($name: unsafe extern "C" fn($($arg),*) -> Status,)+
+            $($oname: Option<unsafe extern "C" fn($($oarg),*) -> Status>,)+
         }
         impl Api {
             #[allow(non_snake_case)]
@@ -45,7 +47,11 @@ macro_rules! api {
                         lib.get::<unsafe extern "C" fn($($arg),*) -> Status>(
                             concat!(stringify!($name), "\0").as_bytes())
                     }.map_err(|e| RuntimeError::Device(format!("resolve {}: {e}", stringify!($name))))?;)+
-                    return Ok(Self { _lib: lib, $($name,)+ });
+                    $(let $oname = unsafe {
+                        lib.get::<unsafe extern "C" fn($($oarg),*) -> Status>(
+                            concat!(stringify!($oname), "\0").as_bytes())
+                    }.ok().map(|symbol| *symbol);)+
+                    return Ok(Self { _lib: lib, $($name,)+ $($oname,)+ });
                 }
                 Err(RuntimeError::Device(format!("load cuBLASLt: {last}")))
             }
@@ -66,7 +72,10 @@ api! {
     cublasLtMatmulPreferenceSetAttribute: fn(Handle, i32, *const c_void, usize) -> Status,
     cublasLtMatmulAlgoGetHeuristic: fn(Handle, Handle, Handle, Handle, Handle, Handle, Handle, i32, *mut Heuristic, *mut i32) -> Status,
     cublasLtMatmulAlgoCheck: fn(Handle, Handle, Handle, Handle, Handle, Handle, *const Algo, *mut Heuristic) -> Status,
-    cublasLtMatmul: fn(Handle, Handle, *const c_void, *const c_void, Handle, *const c_void, Handle, *const c_void, *const c_void, Handle, *mut c_void, Handle, *const Algo, *mut c_void, usize, Handle) -> Status,
+    cublasLtMatmul: fn(Handle, Handle, *const c_void, *const c_void, Handle, *const c_void, Handle, *const c_void, *const c_void, Handle, *mut c_void, Handle, *const Algo, *mut c_void, usize, Handle) -> Status;
+    // Experimental in cuBLASLt 13.x (Hopper from 13.4): group shapes and matrix pointers are
+    // DEVICE arrays, so a grouped matmul needs no host-side sizes.
+    optional cublasLtGroupedMatrixLayoutCreate: fn(*mut Handle, i32, i32, *const c_void, *const c_void, *const c_void) -> Status,
 }
 
 fn check(status: Status, op: &str) -> Result<()> {
@@ -346,6 +355,159 @@ impl Lt {
     }
 }
 
+/// Device-side operands of a grouped matmul `C_g[m_g, n] = A_g[m_g, k] * W_g[n, k]^T` (row-major).
+/// Every array has `groups` entries and lives on the device for the plan's lifetime.
+pub(crate) struct GroupedDims {
+    pub groups: u32,
+    pub n: u32,
+    pub k: u32,
+    /// `i32`: `m_g`, rewritten on the device before each launch.
+    pub rows: u64,
+    /// `i32` constants: every entry `n`, every entry `k`.
+    pub n_array: u64,
+    pub k_array: u64,
+    /// Expected `m_g`; only steers the heuristic.
+    pub average_rows: u32,
+}
+
+impl Lt {
+    pub(crate) fn grouped_plan(self: &Arc<Self>, dims: &GroupedDims) -> Result<Arc<GroupedPlan>> {
+        let create = self.api.cublasLtGroupedMatrixLayoutCreate.ok_or_else(|| {
+            RuntimeError::Rejected(
+                "cuBLASLt has no grouped matmul (Hopper needs cuBLAS 13.4 or newer)".into(),
+            )
+        })?;
+        self.be.bind()?;
+        let scalars = self.be.alloc(0, 8)?;
+        let host: [f32; 2] = [1.0, 0.0];
+        self.be.upload(&scalars, 0, bytemuck::cast_slice(&host))?;
+        let mut plan = GroupedPlan {
+            lt: self.clone(),
+            desc: 0,
+            w: 0,
+            a: 0,
+            c: 0,
+            algo: Algo::default(),
+            scalars,
+        };
+        let mut raw = std::ptr::null_mut();
+        // CUDA headers: BF16=14, COMPUTE_32F=68, scale FP32=0, POINTER_MODE attribute=2
+        // (DEVICE=1), TRANSA attribute=3 (OP_T=1), preference MAX_WORKSPACE=1,
+        // GROUPED_AVERAGE_REDUCTION_DIM=13, GROUPED_DESC_D_AVERAGE_ROWS=14 / _COLS=15.
+        // SAFETY: exact CUDA 13 C ABI; GroupedPlan drops any descriptors created before an error.
+        unsafe {
+            check(
+                (self.api.cublasLtMatmulDescCreate)(&mut raw, 68, 0),
+                "Lt grouped descriptor",
+            )?;
+            plan.desc = raw as usize;
+            for (attribute, value) in [(3, 1i32), (2, 1i32)] {
+                check(
+                    (self.api.cublasLtMatmulDescSetAttribute)(
+                        raw,
+                        attribute,
+                        &value as *const _ as *const c_void,
+                        size_of::<i32>(),
+                    ),
+                    "Lt grouped descriptor attribute",
+                )?;
+            }
+            // Column-major views of the row-major operands: W is k x n, A is k x m_g, C is n x m_g.
+            for (dst, rows, cols, ld) in [
+                (&mut plan.w, dims.k_array, dims.n_array, dims.k_array),
+                (&mut plan.a, dims.k_array, dims.rows, dims.k_array),
+                (&mut plan.c, dims.n_array, dims.rows, dims.n_array),
+            ] {
+                raw = std::ptr::null_mut();
+                check(
+                    create(
+                        &mut raw,
+                        14,
+                        dims.groups as i32,
+                        rows as *const c_void,
+                        cols as *const c_void,
+                        ld as *const c_void,
+                    ),
+                    "Lt grouped layout",
+                )?;
+                *dst = raw as usize;
+            }
+            let mut pref = std::ptr::null_mut();
+            check(
+                (self.api.cublasLtMatmulPreferenceCreate)(&mut pref),
+                "Lt preference",
+            )?;
+            let result = (|| {
+                let bytes = self.workspace.len as usize;
+                check(
+                    (self.api.cublasLtMatmulPreferenceSetAttribute)(
+                        pref,
+                        1,
+                        &bytes as *const _ as *const c_void,
+                        size_of::<usize>(),
+                    ),
+                    "Lt workspace",
+                )?;
+                // The 13.4 header declares these `uint32_t`; the library's storage is 8 bytes
+                // and a 4-byte write is rejected with CUBLAS_STATUS_INVALID_VALUE.
+                for (attribute, value) in [
+                    (13, u64::from(dims.k)),
+                    (14, u64::from(dims.n)),
+                    (15, u64::from(dims.average_rows.max(1))),
+                ] {
+                    check(
+                        (self.api.cublasLtMatmulPreferenceSetAttribute)(
+                            pref,
+                            attribute,
+                            &value as *const _ as *const c_void,
+                            size_of::<u64>(),
+                        ),
+                        "Lt grouped average shape",
+                    )?;
+                }
+                let mut results = [Heuristic::default(); 8];
+                let mut count = 0;
+                check(
+                    (self.api.cublasLtMatmulAlgoGetHeuristic)(
+                        self.handle as Handle,
+                        plan.desc as Handle,
+                        plan.w as Handle,
+                        plan.a as Handle,
+                        plan.c as Handle,
+                        plan.c as Handle,
+                        pref,
+                        results.len() as i32,
+                        results.as_mut_ptr(),
+                        &mut count,
+                    ),
+                    "Lt grouped heuristic",
+                )?;
+                let winner = results
+                    .get(..count as usize)
+                    .unwrap_or(&[])
+                    .iter()
+                    .find(|r| r.state == 0 && r.workspace <= bytes)
+                    .ok_or_else(|| {
+                        RuntimeError::Device("no supported BF16 cuBLASLt grouped algorithm".into())
+                    })?;
+                plan.algo = winner.algo;
+                tracing::info!(
+                    groups = dims.groups,
+                    n = dims.n,
+                    k = dims.k,
+                    candidates = count,
+                    workspace = winner.workspace,
+                    "cuBLASLt grouped algorithm selected"
+                );
+                Ok(())
+            })();
+            (self.api.cublasLtMatmulPreferenceDestroy)(pref);
+            result?;
+        }
+        Ok(Arc::new(plan))
+    }
+}
+
 impl Drop for Lt {
     fn drop(&mut self) {
         if self.be.bind().is_ok() {
@@ -482,6 +644,67 @@ impl Plan {
                 ),
                 "cublasLtMatmul",
             )
+        }
+    }
+}
+
+pub(crate) struct GroupedPlan {
+    lt: Arc<Lt>,
+    desc: usize,
+    w: usize,
+    a: usize,
+    c: usize,
+    algo: Algo,
+    /// Device `[alpha, beta]`: a grouped matmul runs in device pointer mode.
+    scalars: DeviceMem,
+}
+
+impl GroupedPlan {
+    /// `a`, `w`, `c` are device arrays of `groups` matrix pointers.
+    pub(crate) fn run(&self, a: u64, w: u64, c: u64, stream: &CudaStream) -> Result<()> {
+        self.lt.be.bind()?;
+        // SAFETY: the route validated the pointer arrays' extents at load; the group shapes
+        // are read on the device. All work is serialized on the engine stream.
+        unsafe {
+            check(
+                (self.lt.api.cublasLtMatmul)(
+                    self.lt.handle as Handle,
+                    self.desc as Handle,
+                    self.scalars.base as *const c_void,
+                    w as *const c_void,
+                    self.w as Handle,
+                    a as *const c_void,
+                    self.a as Handle,
+                    (self.scalars.base + 4) as *const c_void,
+                    c as *const c_void,
+                    self.c as Handle,
+                    c as *mut c_void,
+                    self.c as Handle,
+                    &self.algo,
+                    self.lt.workspace.base as *mut c_void,
+                    self.lt.workspace.len as usize,
+                    stream.raw as Handle,
+                ),
+                "cublasLtMatmul (grouped)",
+            )
+        }
+    }
+}
+
+impl Drop for GroupedPlan {
+    fn drop(&mut self) {
+        if self.lt.be.bind().is_ok() {
+            // SAFETY: each nonzero handle was created once and belongs to this plan.
+            unsafe {
+                for layout in [self.w, self.a, self.c] {
+                    if layout != 0 {
+                        (self.lt.api.cublasLtMatrixLayoutDestroy)(layout as Handle);
+                    }
+                }
+                if self.desc != 0 {
+                    (self.lt.api.cublasLtMatmulDescDestroy)(self.desc as Handle);
+                }
+            }
         }
     }
 }

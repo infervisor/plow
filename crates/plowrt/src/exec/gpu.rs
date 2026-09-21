@@ -79,6 +79,7 @@ mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
 mod decode_rung;
 mod mixed_step;
+mod moe_lt;
 mod native_decode;
 mod packed_terminal;
 mod token_batch;
@@ -1324,6 +1325,29 @@ fn packet_role_segments(
         }
         let role = roles[seg];
         if role != plow_asset::segment_roles::INTERPRETER {
+            if role == plow_asset::segment_roles::MOE_PREFILL_CUBLASLT {
+                // A library segment of two complete instructions (grouped GLU + DOWN); the
+                // route itself (`moe_lt::segments`) checks the pair when it is switched on.
+                let pcs: std::collections::BTreeSet<_> = entries.iter().map(|e| e.inst).collect();
+                let complete = pcs.iter().all(|&pc| {
+                    let mut slices: Vec<_> =
+                        entries.iter().filter(|e| e.inst == pc).map(|e| e.slice).collect();
+                    slices.sort_unstable();
+                    slices == (0..u32::from(g.insts[pc as usize].blocks)).collect::<Vec<_>>()
+                        && !g
+                            .gq_stream
+                            .iter()
+                            .chain(&g.stream)
+                            .any(|e| e.inst == pc && e.seg as usize != seg)
+                });
+                if pcs.len() != 2 || !complete {
+                    return Err(RuntimeError::Rejected(
+                        "MoE cuBLASLt segment requires two complete instructions".into(),
+                    ));
+                }
+                selected.push(role);
+                continue;
+            }
             if role == plow_asset::segment_roles::W8A16_PREFILL_M1 {
                 let pcs: std::collections::BTreeSet<_> = entries.iter().map(|e| e.inst).collect();
                 for &pc in &pcs {
@@ -1714,6 +1738,8 @@ struct PrefillBucket {
     qwen_segments: Vec<Option<DevInst64>>,
     packet_segment_roles: Vec<u8>,
     cublaslt_segments: Vec<Option<CublasLtDecodeRoute>>,
+    /// `PLOW_MOE_PF_LT`: grouped-expert segments served by cuBLASLt grouped matmuls.
+    moe_lt_segments: Vec<Option<moe_lt::MoeLtRoute>>,
     /// `PlowProgram` kernarg (shares `tensors` + `gq_cursor` with the decode path).
     kernarg: DevProgram,
     /// Device instruction stream (patched per chunk over `inst_range`).
@@ -4294,7 +4320,7 @@ impl GpuEngine {
             None
         };
         let ordered_waits = if cublaslt_enabled {
-            Some(cublaslt::ordered_waits(g, &cublaslt_segments)?)
+            Some(cublaslt::ordered_waits(g, &cublaslt_segments, &[])?)
         } else {
             None
         };
@@ -4366,7 +4392,7 @@ impl GpuEngine {
                             .unwrap()
                             .roles;
                         let segments = cublaslt::decode_segments(g, &blob.tensors, roles)?;
-                        let waits = cublaslt::ordered_waits(g, &segments)?;
+                        let waits = cublaslt::ordered_waits(g, &segments, &[])?;
                         let mut insts = g.insts.clone();
                         let routes = cublaslt::prepare_routes(
                             lt,
@@ -7210,6 +7236,7 @@ impl GpuEngine {
             Ok(mem)
         };
         let mut buckets = Vec::new();
+        let mut moe_lt: Option<Arc<moe_lt::MoeLt>> = None;
         for g in blob.prefill_progs() {
             // Wave-class segmented programs are legal exactly when the SegPf pair is
             // loaded: segments launch per class in order. Otherwise the coarse
@@ -7391,10 +7418,29 @@ impl GpuEngine {
                     inst.op = DevOp::Nop as u16;
                 }
             }
-            let cublaslt_waits = if projection_segments.is_empty() {
+            let moe_segments = match config.nv.moe_pf_lt {
+                Some(min_rows)
+                    if g.t >= min_rows
+                        && packet_segment_roles
+                            .contains(&plow_asset::segment_roles::MOE_PREFILL_CUBLASLT) =>
+                {
+                    moe_lt::segments(g, &blob.tensors, &packet_segment_roles)?
+                }
+                _ => Vec::new(),
+            };
+            let moe_instructions: Vec<(usize, usize)> = moe_segments
+                .iter()
+                .enumerate()
+                .filter_map(|(seg, route)| route.map(|route| [(seg, route.glu), (seg, route.down)]))
+                .flatten()
+                .collect();
+            let cublaslt_waits = if projection_segments.is_empty() && moe_instructions.is_empty() {
                 None
+            } else if projection_segments.is_empty() {
+                let none = vec![None; g.gq_seg_ofs.len().saturating_sub(1)];
+                Some(cublaslt::ordered_waits(g, &none, &moe_instructions)?)
             } else {
-                Some(cublaslt::ordered_waits(g, &projection_segments)?)
+                Some(cublaslt::ordered_waits(g, &projection_segments, &moe_instructions)?)
             };
             let cublaslt_segments = if projection_segments.is_empty() {
                 Vec::new()
@@ -7411,6 +7457,40 @@ impl GpuEngine {
                     None,
                 )?
             };
+            let mut moe_lt_segments = Vec::new();
+            for segment in &moe_segments {
+                let route = match segment {
+                    Some(segment) => {
+                        if moe_lt.is_none() {
+                            let lt = match cublaslt_backend {
+                                Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
+                                _ => crate::device::cuda::lt::Lt::load(be)?,
+                            };
+                            let seg_dir = config.nv.pf_seg_dir.as_deref().map(Path::new);
+                            let directories: Vec<&Path> =
+                                seg_dir.into_iter().chain([assets_dir]).collect();
+                            moe_lt = Some(moe_lt::MoeLt::load(
+                                be,
+                                &lt,
+                                &directories,
+                                interp_tag,
+                                segment,
+                            )?);
+                        }
+                        let owner = moe_lt.as_ref().expect("loaded above");
+                        Some(owner.route(segment, &mut h_inst, devp)?)
+                    }
+                    None => None,
+                };
+                moe_lt_segments.push(route);
+            }
+            if !moe_instructions.is_empty() {
+                tracing::info!(
+                    bucket = g.t,
+                    layers = moe_instructions.len() / 2,
+                    "MoE prefill experts routed to cuBLASLt grouped matmuls"
+                );
+            }
             let d_inst = upload_pod(pod_bytes(&h_inst))?;
             let d_stream = upload_pod(pod_bytes(&g.stream))?;
             let d_sofs = upload_pod(pod_bytes(&g.stream_ofs))?;
@@ -7534,6 +7614,7 @@ impl GpuEngine {
                 qwen_segments,
                 packet_segment_roles,
                 cublaslt_segments,
+                moe_lt_segments,
                 kernarg,
                 d_inst,
                 h_inst,
@@ -8127,6 +8208,7 @@ impl GpuEngine {
         }
         let seg_class = self.prefill[bi].seg_class.clone();
         let has_external = self.prefill[bi].cublaslt_segments.iter().any(Option::is_some)
+            || self.prefill[bi].moe_lt_segments.iter().any(Option::is_some)
             || self.prefill[bi]
                 .packet_segment_roles
                 .iter()
@@ -8143,6 +8225,10 @@ impl GpuEngine {
             self.be.graph_capture(&capture_stream, || {
                 for (seg, &class) in seg_class.iter().enumerate() {
                     if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
+                        route.run(&capture_stream)?;
+                        continue;
+                    }
+                    if let Some(Some(route)) = self.prefill[bi].moe_lt_segments.get(seg) {
                         route.run(&capture_stream)?;
                         continue;
                     }
@@ -8344,6 +8430,19 @@ impl GpuEngine {
                         route.run(&self.stream)?;
                         self.be.event_record(&e1, &self.stream)?;
                         evs.push((seg, 0, e0, e1));
+                    } else {
+                        route.run(&self.stream)?;
+                    }
+                    continue;
+                }
+                if let Some(Some(route)) = self.prefill[bi].moe_lt_segments.get(seg) {
+                    if seg_time {
+                        let e0 = self.be.event_create(true)?;
+                        let e1 = self.be.event_create(true)?;
+                        self.be.event_record(&e0, &self.stream)?;
+                        route.run(&self.stream)?;
+                        self.be.event_record(&e1, &self.stream)?;
+                        evs.push((seg, cls, e0, e1));
                     } else {
                         route.run(&self.stream)?;
                     }

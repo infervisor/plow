@@ -44,9 +44,11 @@ impl ProjectionPlan {
     }
 }
 
+/// `extra` names further `(segment, instruction)` pairs a library route executes.
 pub(super) fn ordered_waits(
     g: &DevProg,
     segments: &[Option<DecodeSegment>],
+    extra: &[(usize, usize)],
 ) -> Result<Vec<packet::dev::Wait>> {
     validate_segment_windows(g)?;
     let reject = || RuntimeError::Rejected("cuBLASLt requires ordered coarse dependencies".into());
@@ -90,13 +92,15 @@ pub(super) fn ordered_waits(
         }
     }
     let mut library = vec![false; g.insts.len()];
-    for (seg, route) in segments.iter().enumerate() {
-        if let Some(route) = route {
-            if placement.get(route.instruction) != Some(&Some(seg as u16)) {
-                return Err(reject());
-            }
-            library[route.instruction] = true;
+    let routed = segments
+        .iter()
+        .enumerate()
+        .filter_map(|(seg, route)| route.map(|route| (seg, route.instruction)));
+    for (seg, instruction) in routed.chain(extra.iter().copied()) {
+        if placement.get(instruction) != Some(&Some(seg as u16)) {
+            return Err(reject());
         }
+        library[instruction] = true;
     }
     let mut waits = g.waits.clone();
     for w in &mut waits {
@@ -583,7 +587,7 @@ mod tests {
         }
         g.gq_stream = g.stream.clone();
         let routes = decode_segments(&g, &tensors, &roles()).unwrap();
-        let waits = ordered_waits(&g, &routes).unwrap();
+        let waits = ordered_waits(&g, &routes, &[]).unwrap();
         assert_eq!(waits[0], g.waits[0]);
         assert_eq!(
             waits[1],
@@ -595,20 +599,20 @@ mod tests {
         assert_eq!(g.waits[1].threshold, 1);
 
         g.succs[0] = 1;
-        assert!(ordered_waits(&g, &routes).is_err());
+        assert!(ordered_waits(&g, &routes, &[]).is_err());
         g.succs[0] = 0;
         g.waits[0].id = 2;
-        assert!(ordered_waits(&g, &routes).is_err());
+        assert!(ordered_waits(&g, &routes, &[]).is_err());
         g.waits[0].id = 0;
         g.waits[1].id = 3;
-        assert!(ordered_waits(&g, &routes).is_err());
+        assert!(ordered_waits(&g, &routes, &[]).is_err());
         g.waits[1].id = 1;
         g.waits[1].threshold = 2;
-        assert!(ordered_waits(&g, &routes).is_err());
+        assert!(ordered_waits(&g, &routes, &[]).is_err());
         g.waits[1].threshold = 1;
         g.stream[1].flags = packet::dev::SE_FINE;
         g.gq_stream = g.stream.clone();
-        assert!(ordered_waits(&g, &routes).is_err());
+        assert!(ordered_waits(&g, &routes, &[]).is_err());
     }
 
     #[test]
