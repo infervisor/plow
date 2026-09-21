@@ -92,7 +92,7 @@ ring; nothing in the step scales with ring rows. What differed: p12c32b's decode
 at 04:45 from `3851e88a` (1.49 MB), p12c32c's at 10:57 from a DIRTY `4af4c85f` (2.16 MB; p12mq's
 from the same day is 1.83 MB). `plow_config.h` differs only by `PLOW_NV_GEMV_MMA_PAIR 1`. The A/B
 below re-emits both chunks from the same tree against the same objects so that only the ring
-differs. RESULT: see §6.
+differs. RESULT (§6): **the ring is not the cause** — 17.8 ms at both ring sizes.
 
 ### Item 3 (designed): sub-chunk pipeline inside one launch
 
@@ -191,3 +191,19 @@ Validation plan: (1) ring A/B on the c32c null (step_bench B=16, same tree/objec
   LIVE-KV manifest carries 40 sliding caches at `stride 2048, window 1024` and 8 full caches at
   `stride 16384`, packed-prefill `max_request_rows 1024`; the same `Manifest::validate` the runtime
   runs at load passed at emit. Before the change this emit panicked at the ladder assert.
+* **26B emit check (CPU)**: the 26B recipe emits too — 25 sliding caches at `stride 2048`, 5 full at
+  `stride 16384`, `max_request_rows 1024`, rungs `128 256 512 1024 1152 2048 4096` / decode `1..32`.
+* **Ring A/B (GPU, 15:30 UTC, `step_bench` B=16 ctx 128, 64 steps, arms interleaved r4096 r2048
+  r4096 r2048)**: the c32-16k recipe re-emitted from the campaign tree (`16501159`) against
+  p12c32c's objects, `PLOW_MAX_CHUNK=2048` (ring 4096) vs `1024` (ring 2048), decode object built
+  by the same emit: **17.824 / 17.778 ms vs 17.803 / 17.793 ms** (sd 0.04-0.05). Ring depth is
+  worth 0.0 ms per decode step. Both arms sit at p12c32c's served 17.97, not p12c32b's 13.05: the
+  regression the ledger charged to "the doubled ring" is in the decode OBJECT/tree of the 09-21
+  ~11:00 build (1.49 -> 2.16 MB `interp_sm90a.cubin`, `PLOW_FA_MMAQK` unset). p12mq (same tree,
+  `PLOW_FA_MMAQK=3`) serves 11.83 at 128/C16, so the tensor-core attention path is unaffected; the
+  legacy FA path in the fat decode object is what got slower. Not root-caused here (out of scope);
+  it means a chunk-2048 / ring-4096 32-slot packet was never actually refuted, and any packet
+  emitted today should carry `PLOW_FA_MMAQK=3` (the req1k recipes do).
+  Caveat: the A/B ran without the exclusive CPU-quiet lock (a shared-lock `cargo build` from
+  another agent was idling the leased GPU behind `quietx.sh`); the arms are GPU-bound kernel
+  steps, interleaved, sd 0.05 ms.
