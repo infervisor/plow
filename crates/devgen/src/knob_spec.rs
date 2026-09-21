@@ -1445,6 +1445,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_GEMV_MMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GEMV_MMA_B1", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GEMV_MMA_PAIR", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_NRN_MMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GEMV_MMA_UNB", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     // Whole-chunk batch width of the warp-per-row norm walk (op_norm.cuh T17 path); default 4.
     KnobSpec::new("def.PLOW_NV_ROW_NB", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

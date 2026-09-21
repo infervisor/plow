@@ -593,6 +593,12 @@ static __device__ __forceinline__ void gemv_nrn_smem(
     __syncthreads();
 }
 
+/* NRN-fold arms on the tensor-core walk (sm_90a, opt-in): the folded NormResidualNorm stages
+ * the normed activation in smem exactly as before, then the row walk is gemv_rows_mma /
+ * gemv_glu_rows_mma instead of the staged dot8 compute. */
+#ifndef PLOW_NV_NRN_MMA
+#define PLOW_NV_NRN_MMA 0
+#endif
 /* Fused decode GEMV with NRN staging */
 static __device__ void d_gemv_nrn(
     __nv_bfloat16* __restrict__ C,
@@ -614,6 +620,13 @@ static __device__ void d_gemv_nrn(
         const size_t off_k = (size_t)m * K;
         const size_t off_n = (size_t)m * N;
         gemv_nrn_smem(resid_out + off_k, xs, a + off_k, b + off_k, gb, gn, K, eps, scale, store && slice == 0, nscratch);
+#if PLOW_NV_GEMV_MMA && PLOW_NV_NRN_MMA
+        /* The tensor-core walk reads its activation fragments through a generic pointer, so the
+         * staged (normed) row feeds it straight from smem: the fold no longer pays the dot8 arm. */
+        if ((K & 31u) == 0u)
+            gemv_rows_mma<false, 1, true>(C + off_n, xs, W, 1, N, K, slice, nblk, nullptr);
+        else
+#endif
         d_gemv_staged_compute(C + off_n, xs, W, 1, N, K, slice, nblk);
         if (M > 1) __syncthreads();
     }
@@ -2806,6 +2819,11 @@ static __device__ void d_gemv_glu_nrn(
         const size_t off_k = (size_t)m * K;
         const size_t off_n = (size_t)m * N;
         gemv_nrn_smem(resid_out + off_k, xs, a + off_k, b + off_k, gb, gn, K, eps, scale, store && slice == 0, nscratch);
+#if PLOW_NV_GEMV_MMA && PLOW_NV_NRN_MMA
+        if ((K & 31u) == 0u)
+            gemv_glu_rows_mma<1, true>(C + off_n, xs, Wg, Wu, 1, N, K, act, slice, nblk);
+        else
+#endif
         d_gemv_glu_staged_compute(C + off_n, xs, Wg, Wu, 1, N, K, act, slice, nblk);
         if (M > 1) __syncthreads();
     }
