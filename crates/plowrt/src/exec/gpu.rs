@@ -4924,7 +4924,7 @@ impl GpuEngine {
             )?)
         } else {
             if config.nv.pf_attn_gemm {
-                tracing::warn!("PLOW_PF_ATTN_GEMM: no one-KV-head full-attention prefill segment");
+                tracing::warn!("PLOW_PF_ATTN_GEMM: no full-attention prefill segment");
             }
             None
         };
