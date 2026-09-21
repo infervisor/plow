@@ -885,6 +885,12 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "moe-pf-lt", env = "PLOW_MOE_PF_LT", global = true)]
     pub moe_pf_lt: Option<u32>,
 
+    /// Serve a packet's `MOE_DECODE_CUBLASLT` segments (emit `PLOW_EMIT_MOE_DEC_LT`) with
+    /// cuBLASLt grouped matmuls on every decode rung of at least this many rows. Unset = the
+    /// rungs run in the interpreter. Disables multistep, like the dense cuBLASLt decode route.
+    #[arg(long = "moe-dec-lt", env = "PLOW_MOE_DEC_LT", global = true)]
+    pub moe_dec_lt: Option<u32>,
+
     /// Equalize the seg pair's dynamic smem (occ-1 fat object A/B).
     #[arg(long = "pf-seg-eqsmem", env = "PLOW_PF_SEG_EQSMEM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_eqsmem: bool,

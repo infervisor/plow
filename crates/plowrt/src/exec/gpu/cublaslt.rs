@@ -25,6 +25,28 @@ impl CublasLtDecodeRoute {
     }
 }
 
+/// A host library call that replaces one decode segment.
+pub(super) enum LibraryRoute {
+    Projection(CublasLtDecodeRoute),
+    Moe(moe_lt::MoeLtRoute),
+}
+
+impl LibraryRoute {
+    pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
+        match self {
+            Self::Projection(route) => route.run(stream),
+            Self::Moe(route) => route.run(stream),
+        }
+    }
+}
+
+pub(super) fn library_routes(routes: Vec<Option<CublasLtDecodeRoute>>) -> Vec<Option<LibraryRoute>> {
+    routes
+        .into_iter()
+        .map(|route| route.map(LibraryRoute::Projection))
+        .collect()
+}
+
 pub(super) enum ProjectionBackend {
     Lt(Arc<crate::device::cuda::lt::Lt>),
     Native(Arc<native_decode::Native>),
@@ -130,7 +152,7 @@ pub(super) fn prepare_routes(
     segments: Vec<Option<DecodeSegment>>,
     insts: &mut [DevInst64],
     devp: &[DeviceMem],
-    templates: Option<&[Option<CublasLtDecodeRoute>]>,
+    templates: Option<&[Option<LibraryRoute>]>,
 ) -> Result<Vec<Option<CublasLtDecodeRoute>>> {
     let mut routes = Vec::new();
     if segments.is_empty() {
@@ -165,12 +187,11 @@ pub(super) fn prepare_routes(
                 std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.get()),
                 std::collections::hash_map::Entry::Vacant(e) => {
                     let template = templates
-                        .map(|routes| {
-                            routes.get(index).and_then(Option::as_ref).ok_or_else(|| {
-                                RuntimeError::Rejected(
-                                    "cuBLASLt rung template route missing".into(),
-                                )
-                            })
+                        .map(|routes| match routes.get(index) {
+                            Some(Some(LibraryRoute::Projection(route))) => Ok(route),
+                            _ => Err(RuntimeError::Rejected(
+                                "cuBLASLt rung template route missing".into(),
+                            )),
                         })
                         .transpose()?;
                     let plan = match backend {
@@ -225,7 +246,7 @@ pub(super) fn prepare_routes(
 pub(super) struct CublasLtDecodeGraph {
     be: Arc<CudaBackend>,
     graph: Option<crate::device::cuda::GraphExec>,
-    _routes: Vec<Option<CublasLtDecodeRoute>>,
+    _routes: Vec<Option<LibraryRoute>>,
 }
 
 impl CublasLtDecodeGraph {
@@ -236,14 +257,12 @@ impl CublasLtDecodeGraph {
         function: KernelFn,
         grid: u32,
         smem: u32,
-        routes: Vec<Option<CublasLtDecodeRoute>>,
+        routes: Vec<Option<LibraryRoute>>,
     ) -> Result<Self> {
         let graph = be.graph_capture(stream, || {
             for (seg, route) in routes.iter().enumerate() {
                 if let Some(route) = route {
-                    route
-                        .plan
-                        .run(route.input, route.weight, route.output, stream)?;
+                    route.run(stream)?;
                     continue;
                 }
                 let mut arg = base;
@@ -283,9 +302,7 @@ impl GpuEngine {
         self.be.graph_capture(&self.stream, || {
             for (seg, route) in self.cublaslt_decode.iter().enumerate() {
                 if let Some(route) = route {
-                    route
-                        .plan
-                        .run(route.input, route.weight, route.output, &self.stream)?;
+                    route.run(&self.stream)?;
                 }
                 let mut arg = self.kernarg;
                 arg.waits = waits;
@@ -319,9 +336,7 @@ impl GpuEngine {
             .max(1);
         for seg in 0..segments {
             if let Some(Some(route)) = self.cublaslt_decode.get(seg) {
-                route
-                    .plan
-                    .run(route.input, route.weight, route.output, &self.stream)?;
+                route.run(&self.stream)?;
                 continue;
             }
             let mut arg = self.kernarg;
@@ -339,11 +354,13 @@ impl GpuEngine {
                 arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
             }
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+            // A MoE-routed chain runs no grouped-arm body: its launches take the narrow arena.
+            let smem = if self.moe_lt_decode { self.smem_narrow } else { self.smem };
             self.be.launch_cooperative(
                 role.map_or(self.f, |r| r.function),
                 role.map_or(self.grid, |r| r.grid),
                 role.map_or(BLOCK, |r| r.block),
-                role.map_or(self.smem, |r| r.smem),
+                role.map_or(smem, |r| r.smem),
                 &mut params,
                 Some(&self.stream),
             )?;

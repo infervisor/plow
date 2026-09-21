@@ -106,6 +106,23 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
     validate_decode_ladder_impl(blob, true)
 }
 
+/// A ladder whose grouped-arm rungs declare `MOE_DECODE_CUBLASLT` segments. Every rung is
+/// served on its own (routed, or run as one merged window), so unlike the dense library ladder
+/// the rungs' dependencies may differ: a rung below the grouped threshold does not wait on the
+/// align op.
+pub(super) fn validate_moe_lt_ladder(blob: &DevBlob, metadata: &SegmentRoles) -> Result<bool> {
+    let start = blob.progs.len() - blob.decode_progs().len();
+    for (index, program) in blob.progs.iter().enumerate().skip(start) {
+        match metadata.program(index) {
+            Some(roles) => {
+                moe_lt::decode_segments(program, &blob.tensors, &roles.roles)?;
+            }
+            None => program.check_coarse_single_segment()?,
+        }
+    }
+    validate_decode_ladder_impl(blob, true)
+}
+
 fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> {
     let splitk = blob
         .with_packet_view(plow_asset::splitk::validate)
@@ -518,15 +535,18 @@ impl DecodeRung {
         g: &crate::asset::devblob::DevProg,
         base: DevProgram,
     ) -> Result<Self> {
-        Self::upload_with_insts(be, g, base, &g.insts, &g.waits)
+        Self::upload_with_insts(be, g, base, &g.insts, &g.waits, &g.gq_seg_ofs)
     }
 
+    /// `gq_seg_ofs` is the queue window set this rung launches with: the program's own, or the
+    /// merged `[0, len]` window that runs a segmented program as one launch.
     pub(super) fn upload_with_insts(
         be: &CudaBackend,
         g: &crate::asset::devblob::DevProg,
         base: DevProgram,
         insts: &[DevInst64],
         waits: &[packet::dev::Wait],
+        gq_seg_ofs: &[u32],
     ) -> Result<Self> {
         let upload = |bytes: &[u8]| -> Result<DeviceMem> {
             let mem = be.alloc(0, bytes.len().max(4) as u64)?;
@@ -543,12 +563,10 @@ impl DecodeRung {
             upload(pod_bytes(waits))?,
             upload(pod_bytes(&g.succs))?,
             upload(pod_bytes(&g.gq_stream))?,
-            upload(pod_bytes(&g.gq_seg_ofs))?,
+            upload(pod_bytes(gq_seg_ofs))?,
         ];
         let cursor_offset = (g.n_counter as usize * CTR_STRIDE as usize * 4).max(4);
-        let cursor_bytes = g.gq_seg_ofs.len().saturating_sub(1).max(1)
-            * CTR_STRIDE as usize
-            * 4;
+        let cursor_bytes = gq_seg_ofs.len().saturating_sub(1).max(1) * CTR_STRIDE as usize * 4;
         let counter_bytes = cursor_offset + cursor_bytes;
         let (counters, [counter_view, cursor_view]) =
             slab_carve(be, [cursor_offset, cursor_bytes])?;

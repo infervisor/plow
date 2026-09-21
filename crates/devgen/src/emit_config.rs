@@ -1121,6 +1121,13 @@ pub struct EmitConfig {
     #[arg(long = "emit-moe-pf-lt", env = "PLOW_EMIT_MOE_PF_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_pf_lt: bool,
 
+    /// Isolate each layer's fused expert GLU + DOWN pair on every decode rung that runs the
+    /// grouped-MoE arm (`PLOW_GEMMA_MOE_DEC_GROUP`) as a packet-declared library segment, which
+    /// the CUDA runtime serves with cuBLASLt grouped matmuls under `PLOW_MOE_DEC_LT`. A runtime
+    /// that leaves that knob unset runs the packet unchanged.
+    #[arg(long = "emit-moe-dec-lt", env = "PLOW_EMIT_MOE_DEC_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_dec_lt: bool,
+
     /// Emit qualified Gemma-31B gfx942 BF16 o/down projections as pinned assembly segments.
     #[arg(long = "emit-gemma-gemm-lt", env = "PLOW_GEMMA_GEMM_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemma_gemm_lt: bool,
@@ -1470,6 +1477,7 @@ impl EmitConfig {
             decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),
             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
             moe_pf_lt: env_bool("PLOW_EMIT_MOE_PF_LT"),
+            moe_dec_lt: env_bool("PLOW_EMIT_MOE_DEC_LT"),
             gemma_gemm_lt: env_bool("PLOW_GEMMA_GEMM_LT"),
             decode_native_tc: env_bool("PLOW_EMIT_DECODE_NATIVE_TC"),
             qwen_fuse_ab: env_bool("PLOW_QWEN_FUSE_AB"),
