@@ -593,9 +593,21 @@ pub fn spawn(
         }
     });
 
-    tokio::spawn(async move {
+    // `PLOW_MUX_INLINE_TICK`: a GPU model's dispatcher gets its own OS thread and runs each tick
+    // inline, so a tick costs no engine-thread wake and no tokio-worker wake on return. Nothing
+    // else changes: the loop below already waits for every tick before touching the queue.
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    let inline_tick = crate::config::RuntimeConfig::get().mux_inline_tick
+        && state.gpu_engine(&slug).is_some();
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+    let inline_tick = false;
+    let dispatcher_name = format!("plow-mux-{slug}");
+
+    let dispatcher = async move {
         let mut slots: Vec<Option<Slot>> = (0..capacity).map(|_| None).collect();
         let mut load = LoadEstimator::default();
+        let mut host_window = crate::obs::host::Window::default();
+        let mut host_last_return: Option<Instant> = None;
         // Cache one BucketBufs per BucketKey — rung swaps are a swap-in, not
         // a rebuild. The dispatcher owns the map; each tick takes the entry
         // out, hands it to the tick thread, and puts it back on return.
@@ -637,7 +649,8 @@ pub fn spawn(
         // Dedicated engine/submission thread for GPU models: every tick runs
         // on ONE persistent OS thread (CUDA context bound once, no
         // blocking-pool dispatch). CPU-reference models keep spawn_blocking.
-        let engine_thread = has_gpu
+        // An inline dispatcher already is that thread.
+        let engine_thread = (has_gpu && !inline_tick)
             .then(|| crate::exec::engine_thread::EngineThread::spawn(format!("plow-eng-{slug}")));
 
         loop {
@@ -1032,8 +1045,10 @@ pub fn spawn(
 
             metrics.serving.tick_batch.tokens(live);
             let t_service_start = Instant::now();
+            let host_timed = crate::obs::host::on();
             let tick = move || {
-                run_one_tick(
+                let t_body = host_timed.then(Instant::now);
+                let out = run_one_tick(
                     &state_ref,
                     &slug_for_tick,
                     &bundle_ref,
@@ -1047,29 +1062,52 @@ pub fn spawn(
                     steps,
                     cfg.multi_step,
                     co_scheduled,
-                )
+                );
+                (out, t_body.map_or(0, |t| t.elapsed().as_nanos() as u64))
             };
-            // GPU models tick on the dedicated engine thread; the dispatcher
-            // task stays hot for arrivals/cancellation either way.
+            // GPU models tick on the dedicated engine thread (or inline on
+            // this dispatcher's own thread); the dispatcher task stays hot for
+            // arrivals/cancellation either way.
             let joined = match &engine_thread {
                 Some(t) => t.run(tick).await,
+                None if inline_tick => crate::exec::engine_thread::run_inline(tick),
                 None => tokio::task::spawn_blocking(tick)
                     .await
                     .map_err(|e| e.to_string()),
             };
 
-            let ms = t_service_start.elapsed().as_secs_f64() * 1e3;
+            let t_returned = Instant::now();
+            let service = t_returned - t_service_start;
+            let ms = service.as_secs_f64() * 1e3;
+            let host_disp_ns = host_last_return
+                .replace(t_returned)
+                .map_or(0, |t| (t_service_start - t).as_nanos() as u64);
 
             match joined {
                 Ok((
-                    returned_slots,
-                    returned_bufs,
-                    returned_obs,
-                    tokens_produced,
-                    did_prefill,
-                    tick_fault,
-                    decode_progress,
+                    (
+                        returned_slots,
+                        returned_bufs,
+                        returned_obs,
+                        tokens_produced,
+                        did_prefill,
+                        tick_fault,
+                        decode_progress,
+                    ),
+                    tick_body_ns,
                 )) => {
+                    if host_timed {
+                        let times = crate::obs::host::TickTimes {
+                            tick_ns: tick_body_ns,
+                            handoff_ns: (service.as_nanos() as u64).saturating_sub(tick_body_ns),
+                            disp_ns: host_disp_ns,
+                        };
+                        if let Some(line) =
+                            host_window.tick(times, !did_prefill && decode_progress.is_some())
+                        {
+                            tracing::info!(%slug, "{line}");
+                        }
+                    }
                     // Decode-service EWMA: prefill ticks are excluded — see
                     // `service_sample`. Updating on them poisons the admission
                     // predictor and sheds live decode streams.
@@ -1171,7 +1209,22 @@ pub fn spawn(
         metrics.decode_rung_actual.store(0, Ordering::Relaxed);
         metrics.decode_rung_admission.store(0, Ordering::Relaxed);
         metrics.decode_occupied_extent.store(0, Ordering::Relaxed);
-    });
+    };
+    if inline_tick {
+        std::thread::Builder::new()
+            .name(dispatcher_name)
+            .spawn(move || {
+                crate::exec::engine_thread::pin_serving();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("inline mux dispatcher runtime")
+                    .block_on(dispatcher)
+            })
+            .expect("spawn inline mux dispatcher");
+    } else {
+        tokio::spawn(dispatcher);
+    }
 
     ModelMux {
         tx,
@@ -2191,8 +2244,10 @@ fn run_one_tick(
                         steps as usize,
                         e.multistep_quantum().unwrap_or(1),
                     );
+                    let t_call = crate::obs::host::on().then(Instant::now);
                     match e.multi_step_at_most(&feeds, requested, &mut toks) {
                         Ok(k) => {
+                            let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                             decode_progress = completed_decode(&feeds, k);
                             for (ri, &(i, _)) in feeds.iter().enumerate() {
                                 for s in 0..k {
@@ -2211,6 +2266,7 @@ fn run_one_tick(
                                     );
                                 }
                             }
+                            host_emit_done(t_emit, tokens_this_tick);
                         }
                         Err(err) => {
                             tracing::warn!(
@@ -2247,9 +2303,11 @@ fn run_one_tick(
                 } else {
                     None
                 };
+                let t_call = crate::obs::host::on().then(Instant::now);
                 let step_res = e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks);
                 match step_res {
                     Ok(()) => {
+                        let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                         decode_progress = completed_decode(&feeds, 1);
                         for (&(i, _), &argmax_tok) in feeds.iter().zip(toks.iter()) {
                             let slot_opt = &mut slots[i];
@@ -2272,6 +2330,7 @@ fn run_one_tick(
                                 &mut disconnected,
                             );
                         }
+                        host_emit_done(t_emit, tokens_this_tick);
                     }
                     Err(err) => {
                         // The batched launch failed — every fed slot loses.
@@ -4393,6 +4452,22 @@ fn gpu_argmax_eligible(params: &crate::text::sample::SamplingParams) -> bool {
     params.temperature <= 0.0 && !params.needs_host_logits()
 }
 
+/// §HOSTT: close a timed decode engine call and open its emit loop (`tokens` = the tick's count
+/// so far).
+#[cfg(feature = "cuda")]
+fn host_engine_call(t_call: Option<Instant>, rows: usize, tokens: usize) -> Option<(Instant, usize)> {
+    let t = t_call?;
+    crate::obs::host::engine_call(t.elapsed().as_nanos() as u64, rows);
+    Some((Instant::now(), tokens))
+}
+
+#[cfg(feature = "cuda")]
+fn host_emit_done(t_emit: Option<(Instant, usize)>, tokens: usize) {
+    if let Some((t, before)) = t_emit {
+        crate::obs::host::emit(t.elapsed().as_nanos() as u64, tokens - before);
+    }
+}
+
 #[cfg(feature = "cuda")]
 fn gpu_emit_slot_token(
     slot_opt: &mut Option<Slot>,
@@ -4598,6 +4673,9 @@ fn handle_produced_token(
             release_kv(arena, taken.kv);
         }
         return true;
+    }
+    if slot.step == 1 && crate::obs::host::on() {
+        crate::obs::host::first_token(slot.prompt_ids.len(), slot.arrived.elapsed());
     }
     let stop_max = slot.step >= slot.gen.max_tokens.max(1);
     if stop_token || stop_max || stop_string {
@@ -6068,5 +6146,211 @@ mod tests {
         execset.run_reference_traced_reuse(&program, &pool, &mut obs, &mut streams);
 
         assert!(obs.kv_writes.is_empty());
+    }
+}
+
+/// Host-path microbenchmarks, CPU only. Inputs by path: `HOSTBENCH_TOKENIZER` (a
+/// `tokenizer.json`), `HOSTBENCH_PROMPTS` (a directory of `prompts-<L>.json`, JSON string arrays
+/// of `vllm bench serve --dataset-name random` prompts) and `HOSTBENCH_TEXTS` (a JSON string array
+/// of generated outputs to replay through the detokenizer). Encode splitting follows the serve
+/// env (`PLOW_ENCODE_THREADS`, `PLOW_ENCODE_SPLIT_MIN`).
+#[cfg(all(test, feature = "hf-tokenizer"))]
+mod host_bench {
+    use super::*;
+    use crate::serve::openai::{CompletionChoice, CompletionRequest, CompletionResponse};
+    use crate::text::tokenizer::{HfTokenizer, Tokenize};
+    use std::time::Duration;
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    }
+
+    fn p90(mut v: Vec<f64>) -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() * 9 / 10]
+    }
+
+    fn spin(d: Duration) -> Duration {
+        let t = Instant::now();
+        while t.elapsed() < d {
+            std::hint::spin_loop();
+        }
+        t.elapsed()
+    }
+
+    fn strings(path: &std::path::Path) -> Vec<String> {
+        serde_json::from_slice(&std::fs::read(path).expect("read input")).expect("string array")
+    }
+
+    #[test]
+    #[ignore]
+    fn host_path_microbench() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
+        let tok = HfTokenizer::from_file(std::path::Path::new(&var("HOSTBENCH_TOKENIZER")))
+            .expect("tokenizer");
+        let prompts_dir = std::path::PathBuf::from(var("HOSTBENCH_PROMPTS"));
+
+        println!("HOSTBENCH request path (median of 8 prompts x 5 runs)");
+        for len in [128usize, 1024, 4096, 8192, 15000] {
+            let prompts = strings(&prompts_dir.join(format!("prompts-{len}.json")));
+            let (mut enc, mut parse, mut ids_n) = (Vec::new(), Vec::new(), 0);
+            for p in prompts.iter().take(8) {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "model": "m", "prompt": p, "max_tokens": 128, "stream": true,
+                    "ignore_eos": true, "temperature": 0.0,
+                    "stream_options": {"include_usage": true},
+                }))
+                .unwrap();
+                for _ in 0..5 {
+                    let t = Instant::now();
+                    let req: CompletionRequest = serde_json::from_slice(&body).unwrap();
+                    parse.push(t.elapsed().as_secs_f64() * 1e3);
+                    drop(req);
+                    let t = Instant::now();
+                    ids_n = tok.encode_with_special_tokens(p, true).len();
+                    enc.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            println!(
+                "  L={len:>5} ids={ids_n:>6} json_parse_ms={:.3} encode_ms={:.3} (p90 {:.3})",
+                median(parse),
+                median(enc.clone()),
+                p90(enc)
+            );
+            // The chat path's extra step: the checkpoint template over one user turn.
+            if let Some(t) = std::env::var("HOSTBENCH_ASSETS")
+                .ok()
+                .and_then(|d| crate::serve::template::ChatTemplate::load(std::path::Path::new(&d)))
+            {
+                let msgs = vec![serde_json::json!({"role": "user", "content": prompts[0]})];
+                let render: Vec<f64> = (0..20)
+                    .map(|_| {
+                        let t0 = Instant::now();
+                        std::hint::black_box(t.render(&msgs).unwrap());
+                        t0.elapsed().as_secs_f64() * 1e3
+                    })
+                    .collect();
+                println!("  L={len:>5} chat_template_render_ms={:.3}", median(render));
+            }
+        }
+
+        // Per-token detokenize over real generations, and the SSE frame the handler builds.
+        let texts = strings(std::path::Path::new(&var("HOSTBENCH_TEXTS")));
+        let (mut detok_ns, mut n_tok) = (0u128, 0usize);
+        for text in &texts {
+            let ids: Vec<u32> = tok.encode(text).into_iter().take(128).collect();
+            let (mut prefix, mut read) = (0usize, 0usize);
+            let mut fed = Vec::with_capacity(ids.len());
+            let t = Instant::now();
+            for &id in &ids {
+                fed.push(id);
+                std::hint::black_box(incremental_delta(&tok, &fed, &mut prefix, &mut read));
+            }
+            detok_ns += t.elapsed().as_nanos();
+            n_tok += ids.len();
+        }
+        let (model, id) = ("gemma-4-26b-a4b-it".to_string(), "cmpl-0123456789abcdef".to_string());
+        let frames = 20_000;
+        let t = Instant::now();
+        for i in 0..frames {
+            let frame = CompletionResponse {
+                id: id.clone(),
+                object: "text_completion",
+                created: 1_789_920_673,
+                model: model.clone(),
+                choices: vec![CompletionChoice {
+                    index: 0,
+                    text: if i % 2 == 0 { " the".into() } else { ".".into() },
+                    logprobs: None,
+                    finish_reason: None,
+                    x_plow_finish_reason: None,
+                }],
+                usage: None,
+                token_ids: None,
+            };
+            let _ = std::hint::black_box(
+                axum::response::sse::Event::default()
+                    .data(crate::serve::stream::chunk_data(&frame)),
+            );
+        }
+        println!(
+            "HOSTBENCH per token: detok_us={:.2} ({n_tok} tokens) sse_frame_us={:.2}",
+            detok_ns as f64 / 1e3 / n_tok.max(1) as f64,
+            t.elapsed().as_secs_f64() * 1e6 / frames as f64
+        );
+
+        // Per-tick dispatcher <-> engine handoff around a 2 ms tick body, the mux's own shape.
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let tick = Duration::from_millis(2);
+        let handoff: Vec<f64> = rt.block_on(async {
+            let eng = crate::exec::engine_thread::EngineThread::spawn("hostbench-eng".into());
+            let mut v = Vec::new();
+            for _ in 0..300 {
+                let t = Instant::now();
+                let body = eng.run(move || spin(tick)).await.unwrap();
+                v.push((t.elapsed() - body).as_secs_f64() * 1e6);
+            }
+            v
+        });
+        let inline: Vec<f64> = (0..300)
+            .map(|_| {
+                let t = Instant::now();
+                let body = crate::exec::engine_thread::run_inline(|| spin(tick)).unwrap();
+                (t.elapsed() - body).as_secs_f64() * 1e6
+            })
+            .collect();
+        println!(
+            "HOSTBENCH per tick: engine_thread_handoff_us={:.1} (p90 {:.1}) inline_us={:.2}",
+            median(handoff.clone()),
+            p90(handoff),
+            median(inline)
+        );
+
+        // Engine-thread emit: one try_send per live stream to a parked handler task.
+        for streams in [1usize, 16] {
+            let (lat_tx, mut lat_rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+            let mut txs = Vec::new();
+            for _ in 0..streams {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<(Instant, String)>(33);
+                let lat_tx = lat_tx.clone();
+                rt.spawn(async move {
+                    while let Some((sent, text)) = rx.recv().await {
+                        std::hint::black_box(text);
+                        let _ = lat_tx.send(sent.elapsed().as_secs_f64() * 1e6);
+                    }
+                });
+                txs.push(tx);
+            }
+            drop(lat_tx);
+            let send_us: Vec<f64> = std::thread::spawn(move || {
+                let mut v = Vec::new();
+                for _ in 0..200 {
+                    spin(tick);
+                    let t = Instant::now();
+                    for tx in &txs {
+                        tx.try_send((Instant::now(), " the".to_string())).unwrap();
+                    }
+                    v.push(t.elapsed().as_secs_f64() * 1e6 / txs.len() as f64);
+                }
+                v
+            })
+            .join()
+            .unwrap();
+            let wake: Vec<f64> = rt.block_on(async {
+                let mut v = Vec::new();
+                while let Some(x) = lat_rx.recv().await {
+                    v.push(x);
+                }
+                v
+            });
+            println!(
+                "HOSTBENCH emit streams={streams}: try_send_us/token={:.2} (p90 {:.2}) handler_wake_us={:.1} (p90 {:.1})",
+                median(send_us.clone()),
+                p90(send_us),
+                median(wake.clone()),
+                p90(wake)
+            );
+        }
     }
 }

@@ -34,13 +34,7 @@ impl EngineThread {
         std::thread::Builder::new()
             .name(name)
             .spawn(move || {
-                #[cfg(feature = "cpu")]
-                {
-                    let serving = &crate::exec::affinity::plan().serving;
-                    if !serving.is_empty() {
-                        crate::exec::affinity::pin(serving);
-                    }
-                }
+                pin_serving();
                 while let Ok(job) = rx.recv() {
                     job();
                 }
@@ -74,6 +68,24 @@ impl EngineThread {
     }
 }
 
+/// Pin the calling thread to the serving reservation (heterogeneous prefill); a no-op when the
+/// reservation is empty or the `cpu` feature is off.
+pub(crate) fn pin_serving() {
+    #[cfg(feature = "cpu")]
+    {
+        let serving = &crate::exec::affinity::plan().serving;
+        if !serving.is_empty() {
+            crate::exec::affinity::pin(serving);
+        }
+    }
+}
+
+/// Run `f` on the calling thread with [`EngineThread::run`]'s panic contract. The caller is a
+/// dispatcher that owns its OS thread (`PLOW_MUX_INLINE_TICK`), so the tick needs no hop.
+pub fn run_inline<T>(f: impl FnOnce() -> T) -> std::result::Result<T, String> {
+    std::panic::catch_unwind(AssertUnwindSafe(f)).map_err(|p| panic_message(p.as_ref()))
+}
+
 /// Best-effort panic payload → text (panics carry `&str` or `String`).
 fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = p.downcast_ref::<&str>() {
@@ -101,6 +113,13 @@ mod tests {
             assert_eq!(id.0, first, "every tick runs on the same thread");
             assert_eq!(id.1, i);
         }
+    }
+
+    #[test]
+    fn inline_run_reports_a_panic_like_the_engine_thread() {
+        assert_eq!(run_inline(|| 7u32), Ok(7));
+        let err = run_inline(|| -> u32 { panic!("boom") }).unwrap_err();
+        assert_eq!(err, "tick panicked: boom");
     }
 
     #[tokio::test]
