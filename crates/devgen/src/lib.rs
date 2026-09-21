@@ -3069,9 +3069,12 @@ fn max_chunk(window: u32) -> u32 {
 fn request_chunk(window: u32) -> u32 {
     let aggregate = max_chunk(window);
     let rows = emit_config::active().max_request_chunk.unwrap_or(aggregate);
+    // Not necessarily a power of two: the ring rounds `window + rows - 1` up itself, and the
+    // bucket-ladder check below requires the cap to be a prefill rung (e.g. 4224, the rung that
+    // takes a 4096-token prompt plus BOS in one launch, rings the same 8192 rows as 4096).
     assert!(
-        rows.is_power_of_two() && rows <= aggregate,
-        "PLOW_MAX_REQUEST_CHUNK must be a power of two <= PLOW_MAX_CHUNK"
+        rows > 0 && rows <= aggregate,
+        "PLOW_MAX_REQUEST_CHUNK must be in 1..=PLOW_MAX_CHUNK"
     );
     rows
 }

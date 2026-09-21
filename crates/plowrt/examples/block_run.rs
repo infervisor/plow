@@ -7,7 +7,7 @@
 //!                              [--dump-tensors name,name --dump-dir dir]
 //!   block_run <asset-dir> bench --batch 1,2,4,8 --ctx 128,512,1024,4096
 //!                              [--iters 100] [--warmup 10] [--prefill-iters 10]
-//!                              [--pf-chunk N]
+//!                              [--pf-chunk N] [--pf-cap ROWS]
 //!   block_run <asset-dir> mixed-check --rows 128 --decode 1
 //!   block_run <asset-dir> packed-check
 //!
@@ -732,6 +732,11 @@ mod cuda {
         // sweep metric valid. It is still a hard rule that NOTHING numeric may
         // be read out of a run using this.
         let pf_chunk: Option<usize> = flag("--pf-chunk").and_then(|s| s.parse().ok());
+        // Rows one prefill launch may take (the serve layer's per-launch cap), so one packet
+        // A/Bs its launch geometry: `--pf-cap 4224` vs `8192` on an 8192-bucket block.
+        let pf_cap: usize = flag("--pf-cap")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(usize::MAX);
         let cap = e.batch();
 
         let mut rows = Vec::new();
@@ -767,7 +772,13 @@ mod cuda {
                         e.begin_slot(b, need)?;
                         e.upload_activation("act.x", &xin)?;
                         let t0 = Instant::now();
-                        last[b] = e.prefill_slot(b, &prompt)?;
+                        last[b] = loop {
+                            if let plowrt::exec::gpu::PrefillStep::Done(tok) =
+                                e.prefill_chunk(b, &prompt, pf_cap)?
+                            {
+                                break tok;
+                            }
+                        };
                         acc_us += t0.elapsed().as_secs_f64() * 1e6;
                     }
                     if pass >= PF_WARMUP {
