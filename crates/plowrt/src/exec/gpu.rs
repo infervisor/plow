@@ -4729,7 +4729,8 @@ impl GpuEngine {
                 &be,
                 lt,
                 &object,
-                sites.map(|site| site.heads).max().unwrap_or(1),
+                sites.clone().map(|site| site.heads).max().unwrap_or(1),
+                sites.map(|site| site.head_dim).max().unwrap_or(8),
                 max_ctx,
             )?)
         } else {

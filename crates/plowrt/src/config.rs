@@ -821,8 +821,9 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-attn-gemm-s32", env = "PLOW_PF_ATTN_GEMM_S32", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_attn_gemm_s32: bool,
 
-    /// Softmax launch grid of `--pf-attn-gemm`, in blocks per SM.
-    #[arg(long = "pf-attn-gemm-grid", env = "PLOW_PF_ATTN_GEMM_GRID", default_value_t = 1, global = true)]
+    /// Softmax launch grid of `--pf-attn-gemm`, in blocks per SM (8 fills the SM: one score row
+    /// per warp, latency-bound below that; measured 1.33 -> 0.83 ms at 12K KV from 1 to 4).
+    #[arg(long = "pf-attn-gemm-grid", env = "PLOW_PF_ATTN_GEMM_GRID", default_value_t = 8, global = true)]
     pub pf_attn_gemm_grid: u32,
 
     /// Diagnostic: per-class wall attribution via one event pair per segment.

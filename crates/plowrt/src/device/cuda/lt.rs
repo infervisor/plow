@@ -754,8 +754,20 @@ impl Plan {
         c: u64,
         stream: &CudaStream,
     ) -> Result<()> {
+        self.matmul_beta(alpha, 0.0, w, a, c, stream)
+    }
+
+    /// `beta = 1` accumulates into `c` (C and D alias, same layout).
+    pub(crate) fn matmul_beta(
+        &self,
+        alpha: f32,
+        beta: f32,
+        w: u64,
+        a: u64,
+        c: u64,
+        stream: &CudaStream,
+    ) -> Result<()> {
         self.lt.be.bind()?;
-        let beta = 0f32;
         // SAFETY: route validation established BF16 extents and nonaliasing at load.
         // All work is serialized on the engine stream, including shared workspace use.
         unsafe {
