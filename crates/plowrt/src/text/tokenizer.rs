@@ -251,7 +251,7 @@ impl HfTokenizer {
         tokens.sort_by_key(|(id, _)| *id);
         for (id, token) in tokens {
             let content = token.content.clone();
-            inner.add_tokens(&[token]);
+            inner.add_tokens([token]).map_err(|e| fail(e.to_string()))?;
             if inner.token_to_id(&content) != Some(id) {
                 return Err(fail(format!("token {content:?} must have id {id}")));
             }

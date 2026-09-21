@@ -63,7 +63,7 @@ rustfft = "6"
 
 # Optional: real tokenizer + checkpoint reader. Off by default so the skeleton
 # builds fast and offline; a byte-fallback tokenizer stands in when absent.
-tokenizers = { version = "0.20", optional = true }
+tokenizers = { version = "0.23", optional = true }
 rayon = { version = "1", optional = true }
 safetensors = { version = "0.4", optional = true }
 hf-hub = { workspace = true, optional = true }
