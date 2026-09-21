@@ -353,6 +353,131 @@ impl Lt {
         }
         Ok(Arc::new(plan))
     }
+
+    /// `ld >= n` is the row pitch of the score matrix in ITS element type: `Scores` writes f32
+    /// scores when `scores_f32` (bf16 x bf16 -> f32), `Values` always reads bf16 probabilities.
+    /// The shape is only known at launch, so the algorithm is the first heuristic result: no
+    /// load-time timing, no stored table.
+    pub(crate) fn attention_plan(
+        self: &Arc<Self>,
+        kind: AttentionGemm,
+        scores_f32: bool,
+        m: u32,
+        n: u32,
+        ld: u32,
+        hd: u32,
+    ) -> Result<Plan> {
+        self.be.bind()?;
+        let mut plan = Plan {
+            lt: self.clone(),
+            shape: (m, n, hd),
+            desc: 0,
+            w: 0,
+            a: 0,
+            c: 0,
+            algo: Algo::default(),
+        };
+        let (m, n, ld, hd) = (m as u64, n as u64, ld as i64, hd as u64);
+        // CUDA header dtypes: BF16 = 14, FP32 = 0.
+        let layouts = match kind {
+            AttentionGemm::Scores => [
+                (14, hd, n, hd as i64),
+                (14, hd, m, hd as i64),
+                (if scores_f32 { 0 } else { 14 }, n, m, ld),
+            ],
+            AttentionGemm::Values => [
+                (14, hd, n, hd as i64),
+                (14, n, m, ld),
+                (14, hd, m, hd as i64),
+            ],
+        };
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: same CUDA C ABI constants as `plan`; Plan drops what was created on error.
+        unsafe {
+            check(
+                (self.api.cublasLtMatmulDescCreate)(&mut raw, 68, 0),
+                "Lt attention descriptor",
+            )?;
+            plan.desc = raw as usize;
+            if kind == AttentionGemm::Scores {
+                let trans = 1i32;
+                check(
+                    (self.api.cublasLtMatmulDescSetAttribute)(
+                        raw,
+                        3,
+                        &trans as *const _ as *const c_void,
+                        size_of::<i32>(),
+                    ),
+                    "Lt attention transpose",
+                )?;
+            }
+            for (dst, (dtype, rows, cols, pitch)) in
+                [&mut plan.w, &mut plan.a, &mut plan.c].into_iter().zip(layouts)
+            {
+                raw = std::ptr::null_mut();
+                check(
+                    (self.api.cublasLtMatrixLayoutCreate)(&mut raw, dtype, rows, cols, pitch),
+                    "Lt attention layout",
+                )?;
+                *dst = raw as usize;
+            }
+            let mut pref = std::ptr::null_mut();
+            check(
+                (self.api.cublasLtMatmulPreferenceCreate)(&mut pref),
+                "Lt preference",
+            )?;
+            let bytes = self.workspace.len as usize;
+            let mut results = [Heuristic::default(); 4];
+            let mut count = 0;
+            let status = check(
+                (self.api.cublasLtMatmulPreferenceSetAttribute)(
+                    pref,
+                    1,
+                    &bytes as *const _ as *const c_void,
+                    size_of::<usize>(),
+                ),
+                "Lt workspace",
+            )
+            .and_then(|()| {
+                check(
+                    (self.api.cublasLtMatmulAlgoGetHeuristic)(
+                        self.handle as Handle,
+                        plan.desc as Handle,
+                        plan.w as Handle,
+                        plan.a as Handle,
+                        plan.c as Handle,
+                        plan.c as Handle,
+                        pref,
+                        results.len() as i32,
+                        results.as_mut_ptr(),
+                        &mut count,
+                    ),
+                    "Lt attention heuristic",
+                )
+            });
+            (self.api.cublasLtMatmulPreferenceDestroy)(pref);
+            status?;
+            plan.algo = results
+                .get(..count as usize)
+                .unwrap_or(&[])
+                .iter()
+                .find(|r| r.state == 0 && r.workspace <= bytes)
+                .ok_or_else(|| {
+                    RuntimeError::Device("no supported BF16 cuBLASLt attention algorithm".into())
+                })?
+                .algo;
+        }
+        Ok(plan)
+    }
+}
+
+/// The two GEMMs of dense attention over row-major BF16 operands with one KV head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AttentionGemm {
+    /// `S[m][ld] = alpha * Q[m][hd] . K[n][hd]^T`; `matmul` operands `(K, Q, S)`.
+    Scores,
+    /// `O[m][hd] = P[m][ld] . V[n][hd]`; `matmul` operands `(V, P, O)`.
+    Values,
 }
 
 /// Device-side operands of a grouped matmul `C_g[m_g, n] = A_g[m_g, k] * W_g[n, k]^T` (row-major).
@@ -617,8 +742,19 @@ impl Plan {
     }
 
     pub(crate) fn run(&self, a: u64, w: u64, c: u64, stream: &CudaStream) -> Result<()> {
+        self.matmul(1.0, w, a, c, stream)
+    }
+
+    /// `c = alpha * op(w) * a` in the plan's layouts (cuBLAS operand order).
+    pub(crate) fn matmul(
+        &self,
+        alpha: f32,
+        w: u64,
+        a: u64,
+        c: u64,
+        stream: &CudaStream,
+    ) -> Result<()> {
         self.lt.be.bind()?;
-        let alpha = 1f32;
         let beta = 0f32;
         // SAFETY: route validation established BF16 extents and nonaliasing at load.
         // All work is serialized on the engine stream, including shared workspace use.

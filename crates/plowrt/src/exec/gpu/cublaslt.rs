@@ -50,6 +50,19 @@ pub(super) fn ordered_waits(
     segments: &[Option<DecodeSegment>],
     extra: &[(usize, usize)],
 ) -> Result<Vec<packet::dev::Wait>> {
+    let library: Vec<_> = segments
+        .iter()
+        .map(|segment| segment.map(|s| s.instruction))
+        .collect();
+    ordered_waits_for(g, &library, extra)
+}
+
+/// `segments[seg]` names the one instruction of a segment that a host library call replaces.
+pub(super) fn ordered_waits_for(
+    g: &DevProg,
+    segments: &[Option<usize>],
+    extra: &[(usize, usize)],
+) -> Result<Vec<packet::dev::Wait>> {
     validate_segment_windows(g)?;
     let reject = || RuntimeError::Rejected("cuBLASLt requires ordered coarse dependencies".into());
     if g.n_counter as usize != g.insts.len() || segments.len() + 1 != g.gq_seg_ofs.len() {
@@ -95,7 +108,7 @@ pub(super) fn ordered_waits(
     let routed = segments
         .iter()
         .enumerate()
-        .filter_map(|(seg, route)| route.map(|route| (seg, route.instruction)));
+        .filter_map(|(seg, instruction)| instruction.map(|i| (seg, i)));
     for (seg, instruction) in routed.chain(extra.iter().copied()) {
         if placement.get(instruction) != Some(&Some(seg as u16)) {
             return Err(reject());

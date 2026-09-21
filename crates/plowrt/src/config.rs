@@ -806,6 +806,25 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-seg-v2", env = "PLOW_PF_SEG_V2", global = true)]
     pub pf_seg_v2: Option<String>,
 
+    /// Vendor-GEMM attention for the one-KV-head full-attention prefill segments: cuBLASLt
+    /// `Q.K^T` and `P.V` around `attn_softmax_sm90a.cubin` (looked up in `--pf-seg-dir`, then the
+    /// asset dir). Those buckets run the per-segment launch loop, not the segment graph.
+    #[arg(long = "pf-attn-gemm", env = "PLOW_PF_ATTN_GEMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_attn_gemm: bool,
+
+    /// Query rows per score tile of `--pf-attn-gemm`. Scratch = rows x heads x max_ctx x 2 B.
+    #[arg(long = "pf-attn-gemm-tile", env = "PLOW_PF_ATTN_GEMM_TILE", default_value_t = 2048, global = true)]
+    pub pf_attn_gemm_tile: u32,
+
+    /// `--pf-attn-gemm` keeps the scores in f32 between the GEMM and the softmax (twice the
+    /// scratch and score traffic; the bf16 score rounding is what limits the route's numerics).
+    #[arg(long = "pf-attn-gemm-s32", env = "PLOW_PF_ATTN_GEMM_S32", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_attn_gemm_s32: bool,
+
+    /// Softmax launch grid of `--pf-attn-gemm`, in blocks per SM.
+    #[arg(long = "pf-attn-gemm-grid", env = "PLOW_PF_ATTN_GEMM_GRID", default_value_t = 1, global = true)]
+    pub pf_attn_gemm_grid: u32,
+
     /// Diagnostic: per-class wall attribution via one event pair per segment.
     #[arg(long = "pf-seg-time", env = "PLOW_PF_SEG_TIME", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_time: bool,
