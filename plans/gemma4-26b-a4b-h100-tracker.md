@@ -1422,3 +1422,33 @@ column"). 26B-specific numbers, packet `p26i`, 16 prompts:
 * Peak GPU memory 76.1-77.1 GiB by cell (76096-77056 MiB) on the 16-slot ctx16k packet.
 * Rung-controller EWMA fix (`7f9ec6a1`) applies here too (serving profile MULTISTEP=2; A/B vs 0
   pending).
+
+## Report day (2026-09-21): uniform baseline, p26i final, grouped-GEMM MoE prefill, cache OOM
+
+* Uniform vLLM 0.28 baseline (same protocol as the 12B, `fa12adcc`): 128/C1 37.60, 128/C4 69.21,
+  128/C16 83.23 (the 413 ms cold wave of the old reference is gone), 1024/C4 88.46, 15000/C1
+  349.73 ms; TPOT 4.94 at C1, 8.86-34.82 at C16; 2640 tok/s at 128/C32.
+* p26i FINAL (`52ab8f0e`, quiet host, MULTISTEP 0 serving): TTFT ahead at 128/C1 0.61x, 128/C4
+  0.56x, 128/C16 0.89x, 4096/C16 0.89x; parity at 1024/C4 (88.45 vs 88.46: the queue-driven pack
+  policy), 1024/C16 (0.97), 8192/C16 (0.97); behind at 4096-15000 single-stream (1.30-1.53x) and
+  15000/C16 (1.42x). TPOT 1.13-1.20x behind at C1, 1.72-2.01x at C16; tok/s 1.10-2.56x behind.
+* p26c32 re-measured on the report binary (`d3db313e`, MULTISTEP 0): 128/C32 117.6 ms, 1416 tok/s
+  (16-slot: 1599 ms, 1029 tok/s; vLLM 126.2 ms, 2640); 1024/C32 500 ms / 962 tok/s; peak 63-67 GiB.
+* Grouped-GEMM MoE prefill (agent/moe-grouped-gemm `bb2c5c14`, cherry-picked `f0451aa4`; recipe
+  `5bdb8db6`: `PLOW_EMIT_MOE_PF_LT=1` emit, `PLOW_MOE_PF_LT=1` serve): each layer's GLU + down
+  pair as a MOE_PREFILL_CUBLASLT segment served by two cuBLASLt 13.4 grouped matmuls with
+  device-side shapes (graph-safe); glue gather / GLU / gated scatter (`moe_lt_sm90.cu`). Block
+  segment 0.744 -> 0.569 ms at 1024 rows, 1.777 -> 1.352 at 4096 (-24%); block wall -13%; MoE
+  relL2 3.6e-3 (BF16 rounding of gate|up). Served by the agent (16 prompts, C1, quiet lock):
+  TTFT 1024 43.0 -> 38.7, 4096 120.9 -> 107.2, 8192 257.7 -> 231.0 ms; TPOT unchanged; gate,
+  needle, consistency pass. cublasLt.h 13.4.1 declares the GROUPED_* preference attributes as
+  u32 but the library wants 8 bytes (status 7) -> the plan passes u64. Full report ladder on
+  `p26lt` pending the rebuilt plowrt. Remaining glue traffic ~0.35 of 1.35 ms at 4096 rows; next
+  step is op 77 reading the BF16 down output directly (drop the f32 part scatter).
+* GSM8K 8-shot greedy, N=200: vLLM 191/200, plow 190/200, same final answer 196/200, 113
+  byte-identical.
+* Prefix cache-on scenario: the VMM boundary snapshots (400 MiB each at ring 8192 / window 1024,
+  `snap_row_bytes=204800`) do not fit beside 47 GiB of weights + 30 GiB of KV: 27
+  `cuMemAlloc(vmm snapshot): CUDA_ERROR_OUT_OF_MEMORY` publish failures, peak 79.0 GiB, TTFT
+  stalls to 3.1 s. No valid cache-on figure for the 26B until the KV budget yields room for the
+  pool.

@@ -1191,6 +1191,47 @@ px4, so new exactness evidence. Global-layer K/V are linear ([slot][kvh][row][hd
   token prompt 404 ms cold -> 33.6 ms on the third request, shared-prefix question 33.2; the second
   identical request still missed (insert after slot release). Default-mode check pending.
 
+### Report day (2026-09-21): uniform baseline, p12mq, 32-slot nulls, prefix cache
+
+* Uniform vLLM 0.28 baseline (`fa12adcc`): one server config for all 20 cells (16384 / 32,
+  `--no-enable-prefix-caching`), client `--num-warmups 2 --seed 42`, 32 requests at C1/C4 and 64
+  at C16/C32, each session alone on the host. 128/C1 TTFT 30.90 ms (spread 29-32); C16 at 64
+  requests 101.7 / 415.7 / 1163 / 2024 / 3302 ms for 128 / 1024 / 4096 / 8192 / 15000 in.
+* Quiet host: concurrent compiles (even `nice 19`) inflated vLLM's CPU-bound 128-token TTFT to
+  45.1 ms in a discarded run. `campaign.py bench --quiet-lock FILE` (`753193f0`) holds the lock
+  exclusively INSIDE the lease (lock-before-lease deadlocked against the baseline run);
+  `scripts/bench/quietx.sh` / `quiets.sh` (`b3e79a2c`) add a writer-preferring gate and close the
+  fd before exec: an sccache daemon had inherited the shared lock and idled a leased GPU 10 min,
+  and flock lets new shared holders pass a waiting exclusive one.
+* p12p FINAL (`ea5dfc5f`): TTFT ahead in 10 of 20 cells (all five C16 cells: 73 / 315 / 699 / 1366
+  / 2775 ms vs 102 / 416 / 1163 / 2024 / 3302), parity at 1024/C1 and 15000/C4; C1 TPOT 1.02-1.05x.
+* Tensor-core decode attention (agent/dec-batched-attn, cherry-picked `8cf90585..e672f22d`; recipe
+  `a44776ae`: `PLOW_FA_MMAQK=3`, `PLOW_NS_FULL_ABS=66`). Scores as m16n8k16 mma with K streamed
+  from global, 32-row TC P.V ring (claim 154 -> 91 KiB), full layers grid-filled. step_bench
+  -0.30 / -0.51 / -1.02 ms at B=1/4/16 (ctx 1024), -0.36 / -0.75 / -1.99 (ctx 8192); the
+  same-claim control proves the win is the kernel, not the claim. Served p12mq FINAL (`1d64894f`,
+  0 faults): C1 TPOT 10.53-10.73 vs vLLM 10.56-10.66 (parity), 128/C1 94.4 vs 93.3 tok/s; C16 TPOT
+  11.83 / 16.37 / 31.53 / 53.55 / 97.99 (p12p 12.34 / 17.79 / 32.86 / 55.51 / 99.95), tok/s 1292 /
+  849 / 433 / 249 / 134; TTFT unchanged. Numerics: f32 oracle relL2 0.0016-0.0017, greedy digests
+  identical, served consistency 15/16 + 16/16, needles OK. Agent nulls: TC P.V for hd256 (+0.06),
+  L2 prefetch across barriers, GF=2 V rows in flight, depth 4, 16-row ring (worse at ctx 8192),
+  GF16 full layers (+0.15 ms at B=1). NRN fold on the tensor-core walk (`PLOW_NV_NRN_MMA`, opt-in):
+  -0.255 ms at B=1 on a fold-on packet, but the fold still serves garbage (c1f1ac38) -> blocked;
+  next step is a per-layer act dump fold-on vs fold-off.
+* 32-slot packet p12c32b re-measured on the report binary (`4af4c85f`, MULTISTEP 0): 128/C32
+  113.7 ms and 1808 tok/s vs vLLM 160.8 / 2503 (16-slot: 1283 ms / 1301 tok/s); peak 45.5-48.5
+  GiB. Chunk 2048 (p12c32c, `4f406e90`) is a NULL: long-prompt C32 TTFT halves (8192/C32 10314 ->
+  4695 ms) but the doubled sliding ring slows every decode step (128/C16 TPOT 13.05 -> 17.97 ms,
+  1179 -> 856 tok/s). Next: ring depth decoupled from the prefill chunk.
+* GSM8K 8-shot greedy, N=200, CONC 8, same prompt bytes: vLLM 194/200, plow 193/200, same final
+  answer 198/200, 147 byte-identical outputs (`$T/quality/12b-{plow,vllm}.jsonl`).
+* Prefix cache-on scenario (`prefix_repetition`, 8 x 2048-token prefixes + 256-token suffixes,
+  C4/C16, both stacks cache on): vLLM 12B C4 TTFT 120.8 ms; plow 291 ms with 1 of 35 lookups
+  attached (70 published). Cause: `vmm_publish` records only the whole-prompt boundary unless
+  `PLOW_AMD_PREFIX_FINE_ROWS` (the intermediate-checkpoint step, AMD-named) is set; the dataset is
+  aligned (same-prefix prompts share exactly 2048 leading tokens incl. BOS, verified with the
+  tokenizer). Re-run with 1024-row checkpoints (`cache2_12b_*`) pending; the default should change.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
