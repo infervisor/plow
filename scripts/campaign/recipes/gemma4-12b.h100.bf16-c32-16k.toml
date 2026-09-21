@@ -57,6 +57,10 @@ PLOW_PREFIX_CACHE = "0"
 PLOW_PF_SEG_PURE = "1"
 PLOW_PF_SEG_FA512 = "1"
 PLOW_PF_INTERLEAVE = "0"
+# Threaded split encode (exact for Gemma's one-word BPE, tokenizer.rs): C1 TTFT 50.1 -> 47.3 ms
+# at 1024 in, 186.3 -> 176.7 at 4096, 863 -> 830 at 15000 (the 26B recipes already carry it).
+PLOW_ENCODE_THREADS = "16"
+PLOW_ENCODE_SPLIT_MIN = "512"
 PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
 LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
 

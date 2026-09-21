@@ -31,7 +31,12 @@ PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
 PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
 PLOW_SLIDING_NS_CAP = "1"
 PLOW_MAX_CHUNK = "4096"
-PLOW_PF_LADDER_APPEND = "4224"
+# FINE-GRAINED RUNGS, as in the 26B recipes: the server prepends BOS, so an N-token bench prompt
+# is N+1 rows and crosses its rung — without these a 129-row prompt runs the 512 bucket and a
+# 1025-row one the 2048 bucket (or pays a second launch for a 1-row tail).
+# 1088 / 4160 are the tight ones (N+1 rows in the smallest multiple of 64): C1 TTFT at 1024 in
+# 47.22 -> 46.82 ms with 1088; 256 / 1152 / 4160 measured neutral and stay for the C4/C16 packs.
+PLOW_PF_LADDER_APPEND = "256,1088,1152,4160,4224"
 PLOW_FUSE_ARGMAX = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 
@@ -65,6 +70,10 @@ PLOW_PREFIX_CACHE = "0"
 PLOW_PF_SEG_PURE = "1"
 PLOW_PF_SEG_FA512 = "1"
 PLOW_PF_INTERLEAVE = "0"
+# Threaded split encode (exact for Gemma's one-word BPE, tokenizer.rs): C1 TTFT 50.1 -> 47.3 ms
+# at 1024 in, 186.3 -> 176.7 at 4096, 863 -> 830 at 15000 (the 26B recipes already carry it).
+PLOW_ENCODE_THREADS = "16"
+PLOW_ENCODE_SPLIT_MIN = "512"
 PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
 LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
 

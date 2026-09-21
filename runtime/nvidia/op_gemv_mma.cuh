@@ -52,7 +52,10 @@ __device__ __forceinline__ void gvmma_mma16816(float (&d)[4], unsigned a0, unsig
 /* acc[i][mt] is the mma C fragment of x[16mt..16mt+16) x W[i][nb..nb+8)^T: lane (g,t) holds
  * C[g][2t], C[g][2t+1], C[g+8][2t], C[g+8][2t+1]. MT m-tiles share one weight pass, so a 32- or
  * 64-row rung still streams the weights once. */
-template <int NW, int MT>
+/* ONE: the caller has exactly one activation row (the B=1 rung of a dense packet). Rows 0-7 and
+ * 8-15 of the mma then clamp to the same row 0, so the second activation load of every k-step
+ * is a duplicate: a third of the single-stream walk's loads. */
+template <int NW, int MT, bool ONE = false>
 __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_bfloat16* __restrict__ x,
                                            const __nv_bfloat16* const (&W)[NW], unsigned nb,
                                            unsigned rows, unsigned N, unsigned K,
@@ -93,7 +96,7 @@ __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_b
 #pragma unroll
             for (int mt = 0; mt < MT; mt++) {
                 const uint4 a0 = *(const uint4*)(xr[mt][0] + (kb + u) * 32u);
-                const uint4 a1 = *(const uint4*)(xr[mt][1] + (kb + u) * 32u);
+                const uint4 a1 = ONE ? a0 : *(const uint4*)(xr[mt][1] + (kb + u) * 32u);
 #pragma unroll
                 for (int i = 0; i < NW; i++) {
                     gvmma_mma16816(acc[i][mt], a0.x, a1.x, a0.y, a1.y, wv[i][u].x, wv[i][u].y);
@@ -109,7 +112,7 @@ __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_b
 #pragma unroll
         for (int mt = 0; mt < MT; mt++) {
             const uint4 a0 = *(const uint4*)(xr[mt][0] + kb * 32u);
-            const uint4 a1 = *(const uint4*)(xr[mt][1] + kb * 32u);
+            const uint4 a1 = ONE ? a0 : *(const uint4*)(xr[mt][1] + kb * 32u);
 #pragma unroll
             for (int i = 0; i < NW; i++) {
                 gvmma_mma16816(acc[i][mt], a0.x, a1.x, a0.y, a1.y, wv[i].x, wv[i].y);
@@ -167,7 +170,7 @@ __device__ __forceinline__ void gvmma_store_tile(__nv_bfloat16* __restrict__ C, 
     }
 }
 
-template <bool BIAS, int MT = 1>
+template <bool BIAS, int MT = 1, bool ONE = false>
 __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
                                               const __nv_bfloat16* __restrict__ x,
                                               const __nv_bfloat16* __restrict__ W, unsigned rows,
@@ -195,7 +198,7 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
         const bool live = grp < per;
         float acc[1][MT][4];
         const unsigned span = nkb / S;
-        gvmma_tile<1, MT>(acc, x, W1, live ? (rb << 3) : (r.rb0 << 3), rows, N, K, part * span,
+        gvmma_tile<1, MT, ONE>(acc, x, W1, live ? (rb << 3) : (r.rb0 << 3), rows, N, K, part * span,
                           (part + 1u) * span);
         if (part != 0u) {
 #pragma unroll
@@ -219,12 +222,12 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
     }
     for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
         float acc[1][MT][4];
-        gvmma_tile<1, MT>(acc, x, W1, rb << 3, rows, N, K);
+        gvmma_tile<1, MT, ONE>(acc, x, W1, rb << 3, rows, N, K);
         gvmma_store_tile<BIAS, MT>(C, acc[0], rb << 3, rows, N, bias);
     }
 }
 
-template <int MT = 1>
+template <int MT = 1, bool ONE = false>
 __device__ __forceinline__ void gemv_glu_rows_mma(__nv_bfloat16* __restrict__ C,
                                                   const __nv_bfloat16* __restrict__ x,
                                                   const __nv_bfloat16* __restrict__ Wg,
@@ -238,7 +241,7 @@ __device__ __forceinline__ void gemv_glu_rows_mma(__nv_bfloat16* __restrict__ C,
     const __nv_bfloat16* const W2[2] = {Wg, Wu};
     for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
         float acc[2][MT][4];
-        gvmma_tile<2, MT>(acc, x, W2, rb << 3, rows, N, K);
+        gvmma_tile<2, MT, ONE>(acc, x, W2, rb << 3, rows, N, K);
         const unsigned n = (rb << 3) + 2u * t;
 #pragma unroll
         for (int mt = 0; mt < MT; mt++) {
@@ -257,7 +260,7 @@ __device__ __forceinline__ void gemv_glu_rows_mma(__nv_bfloat16* __restrict__ C,
 
 /* Fused q|k|v: row blocks over the concatenated [0, Nq+Nk+Nv); Nq % 8 == Nk % 8 == 0 (caller
  * checks) so a block lies inside one matrix. */
-template <bool BIAS, int MT = 1>
+template <bool BIAS, int MT = 1, bool ONE = false>
 __device__ __forceinline__ void gemv_qkv_rows_mma(
     __nv_bfloat16* Cq, __nv_bfloat16* Ck, __nv_bfloat16* Cv, const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ Wq, const __nv_bfloat16* __restrict__ Wk,
@@ -279,7 +282,7 @@ __device__ __forceinline__ void gemv_qkv_rows_mma(
         else { W = Wv; C = Cv; Nx = Nv; n0 = Nq + Nk; bias = bv; }
         const __nv_bfloat16* const W1[1] = {W};
         float acc[1][MT][4];
-        gvmma_tile<1, MT>(acc, x, W1, gn - n0, rows, Nx, K);
+        gvmma_tile<1, MT, ONE>(acc, x, W1, gn - n0, rows, Nx, K);
         const unsigned n = (gn - n0) + 2u * t;
         float b0 = 0.0f, b1 = 0.0f;
         if constexpr (BIAS) {
