@@ -69,6 +69,10 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 
 [serve.env]
 PLOW_PREFIX_CACHE = "0"
+# Cache-on production knobs, as in ladder16k (inert while the matched ladder runs cache-off).
+PLOW_AMD_PREFIX_FINE_ROWS = "2048"
+PLOW_VMM_CACHE_MIB = "9216"
+PLOW_KV_POOL_MIB = "2048"
 PLOW_PF_ATTN_GEMM = "1"
 PLOW_PF_SEG_PURE = "1"
 PLOW_PF_SEG_FA512 = "1"
