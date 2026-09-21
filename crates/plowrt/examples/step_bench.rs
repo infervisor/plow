@@ -83,12 +83,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Drop prefill + warmup from the trace so the profile is timed-decode only.
     e.trace_reset()?;
     let mut ms: Vec<f64> = Vec::with_capacity(steps);
+    // Greedy stream digest (FNV-1a over every slot's tokens): two decode objects on one packet
+    // can be compared for token agreement without a server.
+    let mut digest: u64 = 0xcbf29ce484222325;
+    let mut stream0 = Vec::with_capacity(steps);
     for _ in 0..steps {
         let t0 = Instant::now();
         e.step_slots(&feeds_of(&last), &mut toks)?;
         ms.push(t0.elapsed().as_secs_f64() * 1e3);
         last.copy_from_slice(&toks);
+        for &t in &toks {
+            digest = (digest ^ t as u64).wrapping_mul(0x100000001b3);
+        }
+        stream0.push(toks[0]);
     }
+    println!("TOK_STREAM slots={slots} ctx={ctx} fnv={digest:016x} slot0={stream0:?}");
     ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mean = ms.iter().sum::<f64>() / ms.len() as f64;
     let median = ms[ms.len() / 2];
