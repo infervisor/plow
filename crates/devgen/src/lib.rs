@@ -9078,13 +9078,25 @@ fn emit_dense_gqa(
     };
     // The invariant that ties MAX_CHUNK to KV_RING (see dev_isa.h). Break it and a chunk's own
     // rows wrap onto their history: a silent wrong answer, not a crash.
+    //
+    // RING DECOUPLED FROM THE LAUNCH (PLOW_MAX_REQUEST_CHUNK below the widest rung): the ring only
+    // has to hold `window + rows_one_request_writes_per_launch - 1`. With the packed contract the
+    // runtime caps every request at `max_request_rows` per launch (`plan_with_limit`,
+    // `pf_request_max_rows`) and the packet's LIVE-KV manifest re-checks the ring against that cap
+    // at load, so a 4096-row launch may pack four 1024-row slices onto 2048-row rings. Without the
+    // cap a request may fill the widest rung alone, and the ring must hold it.
     let chunk = request_chunk(c.window);
     let ring = kv_ring_rows(c.window, chunk);
     let widest = buckets.iter().copied().max().unwrap_or(chunk).max(chunk);
+    let capped = emit_config::active().max_request_chunk.is_some();
     assert!(
-        ring >= c.window + widest - 1,
+        ring >= c.window + (if capped { chunk } else { widest }) - 1,
         "KV ring {ring} too small for window {} + widest rung {widest}",
         c.window
+    );
+    assert!(
+        !capped || buckets.contains(&chunk),
+        "PLOW_MAX_REQUEST_CHUNK {chunk} must be a prefill rung of {buckets:?}"
     );
     let arows = chunk_rows(c.window, ctx);
     // opart/mlpart (the flash_prefill partials) are sized in declare() as arows*heads_sharded*ns_pre.
