@@ -163,6 +163,16 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #define FA_DEC_MMAQK(D, GF)                                                                    \
     (((((PLOW_NV_FA_MMAQK) & 1) && (D) == 256) || (((PLOW_NV_FA_MMAQK) & 2) && (D) == 512)) && \
      ((GF) == 2 || (GF) == 4 || (GF) == 8 || (GF) == 16))
+/* Rows per stage of the TC P.V ring. The staged-K score walks 64-row stages, so 64 there; with
+ * the mma score (bit 1) the ring only feeds P.V and 32 halves the claim (hd512/GF8 154 -> 91 KiB),
+ * which the dense 12B pays for in L1: p12m B=1/4/16 ctx 1024 10.663/11.204/13.384 -> 10.591/
+ * 11.088/13.011, ctx 8192 10.765/11.665/15.137 -> 10.676/11.570/14.880. */
+#ifndef PLOW_NV_FA_TC_RING_ROWS
+#define PLOW_NV_FA_TC_RING_ROWS (((PLOW_NV_FA_MMAQK) & 2) ? 32 : 64)
+#endif
+#if !((PLOW_NV_FA_MMAQK) & 2) && PLOW_NV_FA_TC_RING_ROWS != 64
+#error the staged-K TC score walks 64-row stages; PLOW_NV_FA_TC_RING_ROWS != 64 needs PLOW_NV_FA_MMAQK bit 1
+#endif
 template <int V> struct fa_depth { static constexpr int v = V; };
 /* P.V ON THE TENSOR CORES for hd256 (the prefill's form, op_attention.cuh d_flash_prefill): V
  * rows stream gmem->smem through a two-stage 64-row cp.async ring and feed the m16n8k16 mma as
@@ -186,7 +196,7 @@ template <int V> struct fa_depth { static constexpr int v = V; };
 #define FA_DEC_SPART_NP(GF) (64 / (GF))
 #define FA_DEC_SMEM_FLOATS(D, GF)                                                              \
     (FA_DEC_BASE_SMEM_FLOATS(D, GF) +                                                         \
-     (FA_DEC_TC_GQA8(D, GF) ? ((FA_DEC_MMAQK(D, GF) ? 0 : 16) + 2 * 64) * ((D) + 8) / 2 : 0) +   \
+     (FA_DEC_TC_GQA8(D, GF) ? ((FA_DEC_MMAQK(D, GF) ? 0 : 16) + 2 * PLOW_NV_FA_TC_RING_ROWS) * ((D) + 8) / 2 : 0) +   \
      (FA_DEC_MMAPV(D, GF) ? 2 * 64 * ((D) + 8) / 2 : 0) +                                     \
      (FA_DEC_SPART(D, GF) ? FA_DEC_TILE * 64 : 0))
 
@@ -576,7 +586,8 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
     const __nv_bfloat16* vbase, unsigned kv0, unsigned live_rows, unsigned kv_mask,
     const float* corr_shared) {
     static_assert(D == 512 && (GF == 8 || GF == 16), "tensor-core decode is HD512, GQA8 or GQA16");
-    constexpr unsigned STRIDE = D + 8, NJ = D / 64;
+    constexpr unsigned STRIDE = D + 8, NJ = D / 64, SR = PLOW_NV_FA_TC_RING_ROWS;
+    static_assert(SR == 64 || SR == 32 || SR == 16, "TC P.V ring stage rows");
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     const float resc[2] = {lane / 4 < GF ? corr_shared[lane / 4] : 0.0f,
                            lane / 4 + 8 < GF ? corr_shared[lane / 4 + 8] : 0.0f};
@@ -584,10 +595,10 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
     for (unsigned j = 0; j < NJ; ++j)
 #pragma unroll
         for (unsigned e = 0; e < 4; ++e) acc[j][e] *= resc[e / 2];
-    constexpr unsigned TILE_ELEMS = 64 * STRIDE;
+    constexpr unsigned TILE_ELEMS = SR * STRIDE;
     {
-        const unsigned nr = live_rows < 64 ? live_rows : 64;
-        for (unsigned i = tid; i < 64u * (D / 8); i += PLOW_NV_THREADS) {
+        const unsigned nr = live_rows < SR ? live_rows : SR;
+        for (unsigned i = tid; i < SR * (D / 8); i += PLOW_NV_THREADS) {
             const unsigned r = i / (D / 8), c = (i % (D / 8)) * 8;
             const bool live = r < nr;
             const __nv_bfloat16* in = live
@@ -597,13 +608,13 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
         }
         fa_cp_commit();
     }
-    for (unsigned first = 0; first < live_rows; first += 64) {
-        const unsigned nr = live_rows - first < 64 ? live_rows - first : 64;
-        const unsigned next = first + 64;
+    for (unsigned first = 0; first < live_rows; first += SR) {
+        const unsigned nr = live_rows - first < SR ? live_rows - first : SR;
+        const unsigned next = first + SR;
         if (next < live_rows) {
-            const unsigned next_nr = live_rows - next < 64 ? live_rows - next : 64;
-            __nv_bfloat16* next_tile = vtile + (((first / 64) + 1) & 1) * TILE_ELEMS;
-            for (unsigned i = tid; i < 64u * (D / 8); i += PLOW_NV_THREADS) {
+            const unsigned next_nr = live_rows - next < SR ? live_rows - next : SR;
+            __nv_bfloat16* next_tile = vtile + (((first / SR) + 1) & 1) * TILE_ELEMS;
+            for (unsigned i = tid; i < SR * (D / 8); i += PLOW_NV_THREADS) {
                 const unsigned r = i / (D / 8), c = (i % (D / 8)) * 8;
                 const bool live = r < next_nr;
                 const __nv_bfloat16* in = live
@@ -617,9 +628,9 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
             fa_cp_wait<0>();
         }
         __syncthreads();
-        const __nv_bfloat16* current_tile = vtile + ((first / 64) & 1) * TILE_ELEMS;
+        const __nv_bfloat16* current_tile = vtile + ((first / SR) & 1) * TILE_ELEMS;
 #pragma unroll
-        for (unsigned k = 0; k < 64; k += 8) {
+        for (unsigned k = 0; k < SR; k += 8) {
             unsigned hi[4], lo[4];
 #pragma unroll
             for (unsigned e = 0; e < 4; ++e) {
