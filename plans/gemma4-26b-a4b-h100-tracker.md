@@ -1469,3 +1469,15 @@ column"). 26B-specific numbers, packet `p26i`, 16 prompts:
 * 26B twin of the request-chunk geometry recipe `gemma4-26b-a4b.h100.bf16-c32-req1k-16k.toml`
   (`f56e32e5`): emit checks pass, unmeasured. MoE decode grouped-GEMM agent and prefix-cache
   defaults agent still running at the time of this note.
+* MoE decode grouped GEMM ADOPTED for e2e2 (agent/moe-decode-grouped `eb304c37` `b02db5ce` ->
+  `bd236a13` `07453942`): `PLOW_EMIT_MOE_DEC_LT=1` + `PLOW_GEMMA_MOE_DEC_GROUP=4` at emit (packet
+  p26dl), `PLOW_MOE_DEC_LT=4` at serve: expert gate|up and DOWN of the grouped decode rungs as cuBLASLt
+  grouped matmuls (2.7-3.0 TB/s vs 1.7-2.6 in tree). step_bench ctx 1024: B=1 5.72 -> 5.70, B=4 9.61
+  -> 8.73, B=8 12.75 -> 10.15, B=16 15.28 -> 12.57 ms. Greedy tokens identical at B=1/4, 7/8 and 13/16
+  slots at B=8/16 (flips between continuations the baseline already alternates between); expert
+  relL2 3.6e-3. Routing turns multistep off for all rungs -> e2e2 runs realtime on both p26dl-route
+  and p26lt (MULTISTEP 4) to pick the C1/C4 config. p26dl without the knob is +1.65 ms at B=4 (in-tree
+  grouped arm from 4 rows): always serve it with the knob. Phase breakdown p26lt B=16 15.30 ms: expert
+  GLU 3.49+0.25, DOWN 1.48+1.79 wait, attention 2.38+0.31, router 0.75+0.13, dense ~2.8.
+* Pack fairness on the 26B: first-wave per-row cost 28 vs vLLM 18 us/row (MoE gains most from
+  8192-token steps); FAST_PROBE held off on the 26B (-1.5% tok/s single run).

@@ -1296,6 +1296,27 @@ px4, so new exactness evidence. Global-layer K/V are linear ([slot][kvh][row][hd
   Caveat: every prompt still publishes on its first prefill (`PLOW_VMM_PUBLISH_SHARED=1` gates nothing
   on the packed path); numbers include it.
 
+* Round 3 integrated for the e2e2 set (19:30-19:45 UTC):
+  - Pack fairness (agent/pack-fairness `f5fa92ea` `c54a4382` -> `19b3f926` `dc676c99`; recipe `02daac0d`):
+    P99 TTFT at C4/C16 is the cold first wave's makespan in every cell (later waves already beat
+    vLLM's P99). Per-row first-wave cost 12B 43-52 us/row vs vLLM 36-40 (vLLM 8192-token steps, plow
+    4224-row launch cap); no reorder policy closes it -> lever is 8192-row launches for packs of short
+    slices (geometry re-emit). 128/C16 was scheduling: routed buckets built their seg graph on first
+    use (23 ms) + the rung controller held 8 back for 4 ticks -> warm-up + `PLOW_RUNG_FAST_PROBE=1`
+    (high_concurrency): P99 199 -> 150 ms, mean / tok/s level. COLD_DEMAND and adaptive interleave v3
+    at C16 are nulls.
+  - Prefill route (agent/pf-attn-packs `317be5e7` -> `3a1415f8`): the +5 ms at 128/C16 was the warmup
+    skipping buckets >= 1024 rows (graphs built mid-cell); routed launches now run cached graph pieces
+    around the library calls; C16 TTFT -0.7..-2% (single runs). Grouped route for packs =
+    `PLOW_PF_ATTN_GEMM_GROUPED`, within 1% -> opt-in off. 15000/C1 747 ms: 63% projection GEMMs, the
+    2712-row tail runs the 4096 bucket (next: 2816/3072 rung via PLOW_PF_LADDER_APPEND).
+  - NRN fold (agent/nrn-fold-fix `830a8898` `1ed43611` -> `15521f54` `8057c9bc`): root cause =
+    `__restrict__` arena on the fold arms let nvcc hoist the second RMS reduction above
+    `__syncthreads` (lanes 1-31 reuse invb; ~8x row at layer 0; nondeterministic). Fixed: deterministic,
+    4/4 and 16/16 slot agreement, layer-0 relL2 3.07e-3 (fold-off 3.17e-3), needles pass. Still off in
+    every recipe: fold B=4/16 step 31/109 ms vs 10.7/11.3 (full weight pass per row), dot8 fold +1.2
+    ms at B=1.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
