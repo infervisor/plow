@@ -4621,6 +4621,17 @@ fn emit_phase(
         } else {
             ns
         };
+        // BATCHED RUNGS, sliding layers (PLOW_SLIDING_NS_GRID). The CU-fill above is a CEIL, and at
+        // t >= 2 it overshoots the grid: t = 2/4/8/16 -> ns 9/5/3/2 -> 144/160/192/256 items on 132
+        // blocks, so some blocks run TWO items and FLASH_MERGE waits for them. The full layers are
+        // grid-aligned below; this floors the sliding ones to one item per block (ns 8/4/2/1 = 128
+        // items). MEASURED h100-sxm5, step at ctx 1024, B=2/4/8: Gemma-4-12B 11.92/12.55/13.71 ->
+        // 11.45/11.98/13.04 ms, 26B-A4B 7.90/9.94/13.13 -> 7.57/9.57/12.72 ms; B=1 and B=16 unchanged.
+        let ns = if gemv_family && !full && win > 0 && t > 1 && emit_config::active().sliding_ns_grid {
+            ns.min(((n_cu * mul) / (t * c.heads)).max(1))
+        } else {
+            ns
+        };
         // DECODE nsplit ABSOLUTE OVERRIDE (occupancy tuning). PLOW_NS_MUL scales the CU-fill target;
         let ns = if gemv_family && full {
             let base_ns = attention_decode_ns(t, heads, kvh, n_cu, ns);
