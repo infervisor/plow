@@ -1316,6 +1316,20 @@ px4, so new exactness evidence. Global-layer K/V are linear ([slot][kvh][row][hd
     4/4 and 16/16 slot agreement, layer-0 relL2 3.07e-3 (fold-off 3.17e-3), needles pass. Still off in
     every recipe: fold B=4/16 step 31/109 ms vs 10.7/11.3 (full weight pass per row), dot8 fold +1.2
     ms at B=1.
+* Long-context TPOT under concurrency (agent/decode-interference `cf040e77`). Decode already rides
+  every prefill launch (unified token batch: one launch per tick while prefill is pending, all live
+  decode rows in it); TPOT is the prefill work it rides behind. 12B 8192/C16 per request: 102 decode
+  gaps x 14.1 ms + 25.5 prefill stalls x 194 ms (vLLM 117 x 13.0 + 10.5 x 316); 26B 102 x 15.6 +
+  25.5 x 126 (vLLM 117 x 10.2 + 10.4 x 144). Riding rows cost 0.35-0.45 ms each (a decode tick is 13),
+  every extra launch 5-8 ms at C1 (8192 prompt as 2/4/8 launches: 345/362/377 ms) and ~12-16 at C16,
+  so per-tick caps trade TTFT for ITL at flat-or-lower tok/s: cap 2032 ITL P99 -46% (205 -> 110),
+  tok/s -1% (12B) / -5% (26B); cap 1008 12B 8192/C16 TPOT 50.5 -> 58.4. Bug: the pack bucket was
+  picked for the prefill rows alone, so riding rows spilled a full pack into the next rung (2 x 1024
+  + 12 decode ran the 4096 bucket, 148 vs 87 ms): `PLOW_PF_DECODE_FIT` (opt-in). Fit + cap 4080 (4096
+  bucket), 4096/8192/15000 x C16/C32 x 2 repeats, both models: TPOT -1.0..-5.1%, tok/s +0.4..+1.7%,
+  TTFT C16 +8..+23% at 4096/8192 (-2..-3% at 15000), C32 +-2%; 128 level, 1024/C16 TTFT +7/+12%.
+  Not adopted (TPOT gain small against the C16 TTFT). The gap is per-row prefill at depth (12B
+  46-47 us/row served vs vLLM 38.6; 26B 27-30 vs 17.6) and the 26B decode step (15.6 vs 10.2 ms).
 
 ## Workstream status
 
