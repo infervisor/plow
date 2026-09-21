@@ -381,6 +381,12 @@ pub struct RuntimeConfig {
     #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_inflight_wait: bool,
 
+    /// CUDA token-batch prefill: publish the whole-block checkpoints a prompt chunk completed
+    /// when the chunk lands, not only at the prompt's end, so a request waiting on a long
+    /// prompt's shared blocks attaches after the first chunk that covers them.
+    #[arg(long = "prefix-chunk-publish", env = "PLOW_PREFIX_CHUNK_PUBLISH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefix_chunk_publish: bool,
+
     /// AMD shared-prefix VMM KV: when a request finishes, settle its slot's cache-shared row-0
     /// block on the pool's background thread, so the next admission finds row 0 private instead
     /// of paying the unmap/map inline in `begin_slot`. Needs `--vmm-deferred-reclaim`.
@@ -1683,10 +1689,12 @@ impl RuntimeConfig {
     ///
     /// An explicit `--vmm-cache-min-free-mib` wins; `=0` is the rollback to the static-budget
     /// behaviour. Unset derives [`Self::VMM_CACHE_MIN_FREE_FRACTION`] of the device, because a
-    /// fixed MiB figure that is right on a 192 GiB MI300X is a third of a small card, capped
-    /// at an eighth of `free_after_load` when the caller knows it: a card whose KV rings leave
-    /// 5 GiB free (Gemma-4-26B on an 80 GiB H100) would otherwise reserve most of that for
-    /// headroom and hold no working set of checkpoints. A backend that cannot report free
+    /// fixed MiB figure that is right on a 192 GiB MI300X is a third of a small card. A caller
+    /// that knows `free_after_load` (the CUDA engine) gets
+    /// [`Self::VMM_CACHE_MIN_FREE_FRACTION_LOADED`] instead, so a cache-on server peaks where
+    /// vLLM at its default utilization does, capped at half of `free_after_load`: a card whose
+    /// KV rings leave 5 GiB free (Gemma-4-26B on an 80 GiB H100) still keeps a working set of
+    /// checkpoints. A backend that cannot report free
     /// bytes degrades to the static budget on its own
     /// ([`crate::memory::vmm::VmmKv::enable_pressure_eviction`]), so arming this is safe
     /// everywhere.
@@ -1707,8 +1715,12 @@ impl RuntimeConfig {
             None if device_bytes == 0 => Some(4096u64 << 20),
             // Whole MiB, so the figure in logs reads like the knob.
             None => {
-                let derived = (device_bytes as f64 * Self::VMM_CACHE_MIN_FREE_FRACTION) as u64;
-                let derived = free_after_load.map_or(derived, |free| derived.min(free / 8));
+                let derived = match free_after_load {
+                    Some(free) => ((device_bytes as f64 * Self::VMM_CACHE_MIN_FREE_FRACTION_LOADED)
+                        as u64)
+                        .min(free / 2),
+                    None => (device_bytes as f64 * Self::VMM_CACHE_MIN_FREE_FRACTION) as u64,
+                };
                 Some(derived >> 20 << 20)
             }
         }
@@ -1728,6 +1740,10 @@ impl RuntimeConfig {
     /// 192 GiB MI300X: above the largest transient the 8192 prefill rung takes, and small
     /// enough that the cache is not evicting on an idle device.
     const VMM_CACHE_MIN_FREE_FRACTION: f64 = 0.04;
+
+    /// vLLM's headroom at its default `--gpu-memory-utilization` 0.9: on an 80 GiB H100 it
+    /// peaks at 73.5 GiB, and a floor of 10% keeps a cache-on plow server there too.
+    const VMM_CACHE_MIN_FREE_FRACTION_LOADED: f64 = 0.10;
 
     /// `--amd-prefix-fine-rows` / `PLOW_AMD_PREFIX_FINE_ROWS`, or `None` when unset (fine
     /// matching off, the default). See [`crate::memory::vmm::VmmKv::enable_fine_matching`].
@@ -1820,6 +1836,14 @@ impl RuntimeConfig {
         select_compat(
             self.prefix_inflight_wait,
             Self::env_bool("PLOW_PREFIX_INFLIGHT_WAIT"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn prefix_chunk_publish(&self) -> bool {
+        select_compat(
+            self.prefix_chunk_publish,
+            Self::env_bool("PLOW_PREFIX_CHUNK_PUBLISH"),
             !Self::is_initialized(),
         )
     }
@@ -2206,9 +2230,9 @@ mod tests {
         .unwrap();
         let four_pct = ((80u64 << 30) as f64 * 0.04) as u64 >> 20 << 20;
         assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, None), Some(four_pct));
-        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(60 << 30)), Some(four_pct));
-        // A card whose rings leave 5 GiB free keeps an eighth of it, not 4% of the device.
-        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)), Some(640 << 20));
+        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(60 << 30)), Some(8192 << 20));
+        // A card whose rings leave 5 GiB free keeps half of it, not 10% of the device.
+        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)), Some(2560 << 20));
         let config = super::RuntimeConfig::from_arg_matches(
             &command.clone().try_get_matches_from(["test", "--vmm-cache-min-free-mib=100"]).unwrap(),
         )

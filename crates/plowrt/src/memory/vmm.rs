@@ -1274,12 +1274,15 @@ impl VmmKv {
         }
     }
 
-    /// Publish a boundary only once the sequence's leading [`LEAD_ROWS`] tokens were recorded
-    /// by another sequence ([`Self::try_attach`] or an earlier publish). A workload of unique
-    /// prompts then pays no snapshot copies, allocations or radix inserts; a shared prefix
-    /// (system prompt, replayed prompt, multi-turn continuation) publishes from its second
-    /// sighting on, so the first reuse of a fresh prefix misses. Off by default; the CUDA
-    /// engine enables it from `PLOW_VMM_PUBLISH_SHARED`.
+    /// Publish a boundary inside a block (a prompt's or a generation's end) only once the
+    /// sequence's leading [`LEAD_ROWS`] tokens were recorded by another sequence
+    /// ([`Self::try_attach`], an in-flight wait, or an earlier publish): those match only their
+    /// own tail, so a workload of unique prompts pays no snapshot copies for them; a replayed
+    /// prompt or a multi-turn continuation publishes them from its second sighting on.
+    /// Whole-block boundaries publish on the first sighting: they have no tail, so they are
+    /// what a later request sharing the prefix (a system prompt) attaches to, and a prompt
+    /// shorter than one block has none. Off by default; the CUDA engine enables it from
+    /// `PLOW_VMM_PUBLISH_SHARED`.
     pub fn enable_shared_publish(&mut self) {
         self.shared_publish = true;
     }
@@ -1693,9 +1696,10 @@ impl VmmKv {
     /// `(owner seq, rows)`. The owner publishes every block boundary at most `lookback` rows
     /// below its prompt end (the engine's `vmm_publish`; the sliding rings hold that many
     /// rows behind the frontier), so a request sharing those blocks can wait for the
-    /// checkpoint instead of recomputing them beside the owner. Records `seq`'s lead like an
-    /// attach would, so the owner's publish counts as a second sighting
-    /// ([`Self::enable_shared_publish`]); commits nothing else for `seq`.
+    /// checkpoint instead of recomputing them beside the owner. When it names an owner it
+    /// records `seq`'s lead like an attach would, so the owner's publish counts it as a second
+    /// sighting ([`Self::enable_shared_publish`]); a prompt that does not wait is recorded
+    /// once, by its own attach. Commits nothing else for `seq`.
     pub fn inflight_prefix(&self, seq: usize, prompt: &[u32], lookback: u32) -> Option<(usize, u32)> {
         if !self.prefix_reuse {
             return None;
@@ -1708,7 +1712,6 @@ impl VmmKv {
         {
             return None;
         }
-        note_lead(&mut inner, seq, prompt);
         let hashes = hash_blocks(prompt, s.block_rows);
         let aligned = &prompt[..hashes.len() * br];
         let m = inner.cache.lookup(&hashes, aligned);
@@ -1746,6 +1749,9 @@ impl VmmKv {
             if shared >= reachable && rows > cached && best.is_none_or(|(_, r)| rows > r) {
                 best = Some((owner, rows));
             }
+        }
+        if best.is_some() {
+            note_lead(&mut inner, seq, prompt);
         }
         best
     }
@@ -1789,7 +1795,7 @@ impl VmmKv {
         if rows == 0 {
             return Ok(());
         }
-        if self.shared_publish {
+        if self.shared_publish && rows % s.block_rows != 0 {
             let mut inner = s.inner.lock();
             if !note_lead(&mut inner, seq, tokens) {
                 inner.stats.publishes_skipped += 1;
@@ -4310,25 +4316,61 @@ mod tests {
         let pr = prompt(32);
         assert!(p.try_attach(0, &pr).unwrap().is_none());
         p.ensure_rows(0, 32).unwrap();
-        p.publish_at(0, &pr, 24, 4, |_| panic!("first sighting must not snapshot")).unwrap();
+        p.publish_at(0, &pr, 20, 4, |_| panic!("first sighting must not snapshot")).unwrap();
         assert_eq!(p.stats().publishes_skipped, 1);
         assert_eq!(p.stats().cache_blocks, 0);
         p.begin_seq(0);
         p.ensure_rows(1, 1).unwrap();
         assert!(p.try_attach(1, &pr).unwrap().is_none(), "nothing published on first sighting");
         p.ensure_rows(1, 32).unwrap();
-        p.publish_at(1, &pr, 24, 4, |_| Ok(())).unwrap();
+        p.publish_at(1, &pr, 20, 4, |_| Ok(())).unwrap();
         assert_eq!(p.stats().publishes_skipped, 1);
         p.ensure_rows(0, 1).unwrap();
         let a = p.try_attach(0, &pr).unwrap().expect("second sighting published");
-        assert_eq!(a.rows, 24);
+        assert_eq!(a.rows, 20);
         p.begin_seq(0);
         let other: Vec<u32> = pr.iter().map(|t| t + 1).collect();
         p.ensure_rows(0, 1).unwrap();
         assert!(p.try_attach(0, &other).unwrap().is_none());
         p.ensure_rows(0, 32).unwrap();
-        p.publish_at(0, &other, 24, 4, |_| panic!("unseen lead must not snapshot")).unwrap();
+        p.publish_at(0, &other, 20, 4, |_| panic!("unseen lead must not snapshot")).unwrap();
         assert_eq!(p.stats().publishes_skipped, 2);
+    }
+
+    /// A whole-block boundary has no tail: it is what the second request sharing a prefix
+    /// attaches to, so it publishes on the first sighting while the tailed end still waits.
+    #[test]
+    fn shared_publish_keeps_whole_block_checkpoints_on_the_first_sighting() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        p.enable_shared_publish();
+        let pr = prompt(21);
+        assert!(p.try_attach(0, &pr).unwrap().is_none());
+        p.ensure_rows(0, 21).unwrap();
+        p.publish_at(0, &pr, 16, 4, |_| Ok(())).unwrap();
+        p.publish_at(0, &pr, 20, 4, |_| panic!("tailed end of a first sighting")).unwrap();
+        assert_eq!(p.stats().publishes_skipped, 1);
+        p.begin_seq(0);
+        let mut next = prompt(16);
+        next.extend([901, 902]);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &next).unwrap().expect("second sighting hits").rows, 16);
+    }
+
+    /// An admission check that finds no owner to wait on must not count the prompt: its own
+    /// attach does, and a double count let every prompt pass the gate on its first sighting.
+    #[test]
+    fn inflight_check_without_an_owner_leaves_the_sighting_to_the_attach() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = pool(ops);
+        p.enable_shared_publish();
+        let pr = prompt(21);
+        assert_eq!(p.inflight_prefix(0, &pr, u32::MAX), None);
+        p.begin_seq(0);
+        assert!(p.try_attach(0, &pr).unwrap().is_none());
+        p.ensure_rows(0, 21).unwrap();
+        p.publish_at(0, &pr, 20, 4, |_| panic!("counted twice")).unwrap();
+        assert_eq!(p.stats().publishes_skipped, 1);
     }
 
     /// Attach-then-abort cycles (client disconnects mid-prefill) must return
@@ -4501,8 +4543,9 @@ mod tests {
         p.ensure_rows(0, 41).unwrap();
         // The engine publishes every whole-block boundary below the prompt end, then the end.
         p.publish_at(0, &a, 32, 4, |_| Ok(())).unwrap();
-        p.publish(0, &a, 4, |_| Ok(())).unwrap();
-        assert_eq!(p.stats().publishes_skipped, 0, "the waiter's sighting makes it publish");
+        p.publish_at(0, &a, 40, 4, |_| Ok(())).unwrap();
+        p.publish_at(0, &a, 36, 4, |_| Ok(())).unwrap();
+        assert_eq!(p.stats().publishes_skipped, 0, "the waiter's sighting publishes the tailed end");
         p.prefill_done(0);
         p.ensure_rows(1, 1).unwrap();
         assert_eq!(p.try_attach(1, &b).unwrap().unwrap().rows, 32);
