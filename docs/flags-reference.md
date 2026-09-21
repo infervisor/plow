@@ -1108,6 +1108,7 @@ A mismatch is a wrong-object launch, i.e. a device trap, not a slowdown.
 | `--pf-seg-graph` (`PLOW_PF_SEG_GRAPH`) | off | submit each chunk's whole segment chain as ONE CUDA graph (T35). |
 | `--pf-seg-eqsmem` (`PLOW_PF_SEG_EQSMEM`) | off | launch every object with the same dynamic-smem request (avoids per-launch carveout reconfig). |
 | `--pf-seg-v2` (`PLOW_PF_SEG_V2`) | unset | classing v2 (`1`) / q8 variant (`q8`). |
+| `--pf-attn-gemm` (`PLOW_PF_ATTN_GEMM`) | off | vendor-GEMM attention for the one-KV-head full-attention prefill segments (Gemma-4-12B global hd512): cuBLASLt `Q.K^T` and `P.V` around the causal softmax of `attn_softmax_sm90a.cubin` (looked up in `--pf-seg-dir`, then the asset dir). No packet change; those buckets run the per-segment loop instead of the segment graph. `--pf-attn-gemm-tile` (`PLOW_PF_ATTN_GEMM_TILE`, 2048) = query rows per score tile, scratch = rows x heads x max_ctx x 2 B; `--pf-attn-gemm-grid` (`PLOW_PF_ATTN_GEMM_GRID`, 1) = softmax blocks per SM; `--pf-attn-gemm-s32` (`PLOW_PF_ATTN_GEMM_S32`) keeps the scores in f32 between the GEMM and the softmax (2x scratch). |
 | `--pf-seg-time`, `--pf-seg-fatonly`, `--pf-seg-noncoop` | off | diagnostics: per-class event timing / every segment on the fat object / plain (non-cooperative) launches. |
 
 The canonical serving configuration measured in the campaign:

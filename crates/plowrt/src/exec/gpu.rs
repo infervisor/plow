@@ -1714,6 +1714,8 @@ struct PrefillBucket {
     qwen_segments: Vec<Option<DevInst64>>,
     packet_segment_roles: Vec<u8>,
     cublaslt_segments: Vec<Option<CublasLtDecodeRoute>>,
+    /// `PLOW_PF_ATTN_GEMM`: `FlashPrefill` segments served by the vendor-GEMM route.
+    attention_gemm_segments: Vec<Option<attention_gemm::Site>>,
     /// `PlowProgram` kernarg (shares `tensors` + `gq_cursor` with the decode path).
     kernarg: DevProgram,
     /// Device instruction stream (patched per chunk over `inst_range`).
@@ -2167,6 +2169,9 @@ pub struct GpuEngine {
     prefill_turn: usize,
     packed_prefill: Option<plow_asset::packed_prefill::Manifest>,
     packed_terminal: Option<packed_terminal::PackedTerminal>,
+    attention_gemm: Option<attention_gemm::AttentionGemm>,
+    /// Request table of the prefill launch being enqueued, for `attention_gemm`.
+    attention_requests: Vec<attention_gemm::Request>,
     mixed_step: Option<mixed_step::MixedCudaStep>,
     token_batch: Option<token_batch::CudaTokenBatch>,
     kv_admission: Option<crate::sched::admission::KvBudget>,
@@ -4671,6 +4676,43 @@ impl GpuEngine {
             (None, SMEM_PF, None, Vec::new(), None, grid)
         };
 
+        let attention_gemm = if prefill
+            .iter()
+            .any(|b| b.attention_gemm_segments.iter().any(Option::is_some))
+        {
+            let lt = match &cublaslt_prefill {
+                Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
+                _ => crate::device::cuda::lt::Lt::load(&be)?,
+            };
+            let object = config
+                .nv
+                .pf_seg_dir
+                .as_deref()
+                .filter(|dir| !dir.is_empty())
+                .map(|dir| Path::new(dir).join(attention_gemm::SOFTMAX_OBJECT))
+                .filter(|path| path.exists())
+                .unwrap_or_else(|| assets_dir.join(attention_gemm::SOFTMAX_OBJECT));
+            let sites = prefill
+                .iter()
+                .flat_map(|b| b.attention_gemm_segments.iter().flatten());
+            tracing::info!(
+                launches = sites.clone().count(),
+                "PLOW_PF_ATTN_GEMM: FlashPrefill segments routed to cuBLASLt"
+            );
+            Some(attention_gemm::AttentionGemm::load(
+                &be,
+                lt,
+                &object,
+                sites.map(|site| site.heads).max().unwrap_or(1),
+                max_ctx,
+            )?)
+        } else {
+            if config.nv.pf_attn_gemm {
+                tracing::warn!("PLOW_PF_ATTN_GEMM: no one-KV-head full-attention prefill segment");
+            }
+            None
+        };
+
         let mut packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize] =
             std::array::from_fn(|_| None);
         for (&id, object) in segment_roles.iter().flat_map(|r| &r.objects) {
@@ -5431,6 +5473,8 @@ impl GpuEngine {
             prefill_turn: 0,
             packed_prefill,
             packed_terminal: None,
+            attention_gemm,
+            attention_requests: Vec::new(),
             mixed_step,
             token_batch: None,
             kv_admission,
@@ -5468,7 +5512,11 @@ impl GpuEngine {
                     false,
                     engine.prefill[bi].seg_class.len(),
                     &engine.prefill[bi].packet_segment_roles,
-                ) {
+                ) && engine.prefill[bi]
+                    .attention_gemm_segments
+                    .iter()
+                    .all(Option::is_none)
+                {
                     for b in 0..warmup_slots {
                         let mut arg = engine.prefill[bi].kernarg;
                         arg.tensors = engine.tens_slot_base(b);
@@ -7391,10 +7439,37 @@ impl GpuEngine {
                     inst.op = DevOp::Nop as u16;
                 }
             }
-            let cublaslt_waits = if projection_segments.is_empty() {
+            // Only buckets that run the per-segment launch loop: the route replaces a launch.
+            let attention_gemm_segments = if config.nv.pf_attn_gemm
+                && seg_mode
+                && seg_class.len() > 1
+                && qwen_segments.is_empty()
+            {
+                attention_gemm::sites(g, &blob.tensors, devp, blob.decode_prog()?.t as usize)
+            } else {
+                Vec::new()
+            };
+            let cublaslt_waits = if projection_segments.is_empty()
+                && attention_gemm_segments.iter().all(Option::is_none)
+            {
                 None
             } else {
-                Some(cublaslt::ordered_waits(g, &projection_segments)?)
+                // Library launches do not signal counters: their consumers rely on stream order.
+                let library: Vec<Option<usize>> = (0..g.gq_seg_ofs.len().saturating_sub(1))
+                    .map(|seg| {
+                        projection_segments
+                            .get(seg)
+                            .copied()
+                            .flatten()
+                            .map(|p| p.instruction)
+                            .or(attention_gemm_segments
+                                .get(seg)
+                                .copied()
+                                .flatten()
+                                .map(|site| site.instruction))
+                    })
+                    .collect();
+                Some(cublaslt::ordered_waits_for(g, &library)?)
             };
             let cublaslt_segments = if projection_segments.is_empty() {
                 Vec::new()
@@ -7534,6 +7609,7 @@ impl GpuEngine {
                 qwen_segments,
                 packet_segment_roles,
                 cublaslt_segments,
+                attention_gemm_segments,
                 kernarg,
                 d_inst,
                 h_inst,
@@ -7971,6 +8047,11 @@ impl GpuEngine {
         self.be
             .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
 
+        if self.attention_gemm.is_some() {
+            self.attention_requests.clear();
+            self.attention_requests
+                .push([0, real as u32, b as u32, (c0 + real) as u32]);
+        }
         // All uploads/memsets are enqueued on the engine stream — the launch
         // follows them in stream order (no context sync needed).
         self.launch_prefill_chain(bi, arg, f_pf, b, c0, n, tc, true)?;
@@ -8286,7 +8367,13 @@ impl GpuEngine {
             let rt = crate::config::RuntimeConfig::get();
             let seg_time_probe = rt.nv.pf_seg_time;
             let fat_only_probe = rt.nv.pf_seg_fatonly;
-            if !seg_time_probe && !fat_only_probe && rt.nv.pf_seg_graph {
+            // The route's GEMM shapes follow each launch's KV lengths: not capturable.
+            let routed = self.attention_gemm.is_some()
+                && self.prefill[bi]
+                    .attention_gemm_segments
+                    .iter()
+                    .any(Option::is_some);
+            if !seg_time_probe && !fat_only_probe && rt.nv.pf_seg_graph && !routed {
                 let key = (bi, arg.tensors as u64);
                 self.ensure_seg_graph(bi, &arg)?;
                 self.be
@@ -8331,6 +8418,25 @@ impl GpuEngine {
             let noncoop = rt.nv.pf_seg_noncoop;
             let mut evs: Vec<(usize, u8, CudaEvent, CudaEvent)> = Vec::new();
             for (seg, &cls) in seg_class.iter().enumerate() {
+                if let (Some(Some(site)), Some(route)) = (
+                    self.prefill[bi].attention_gemm_segments.get(seg),
+                    self.attention_gemm.as_mut(),
+                ) {
+                    let timed = if seg_time {
+                        let e0 = self.be.event_create(true)?;
+                        self.be.event_record(&e0, &self.stream)?;
+                        Some(e0)
+                    } else {
+                        None
+                    };
+                    route.run(site, &self.attention_requests, tc as u32, &self.stream)?;
+                    if let Some(e0) = timed {
+                        let e1 = self.be.event_create(true)?;
+                        self.be.event_record(&e1, &self.stream)?;
+                        evs.push((seg, cls, e0, e1));
+                    }
+                    continue;
+                }
                 if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
                     // Time the Lt route too under PLOW_PF_SEG_TIME. Skipping it made the
                     // per-site report silently exclude EVERY cuBLASLt projection — on
@@ -8839,6 +8945,16 @@ impl GpuEngine {
             let b = &self.prefill[bi];
             (b.d_ctr.base, b.ctr_bytes, b.kernarg)
         };
+        if self.attention_gemm.is_some() {
+            self.attention_requests.clear();
+            let mut q0 = 0u32;
+            for r in reqs {
+                let len = r.tokens.len() as u32;
+                self.attention_requests
+                    .push([q0, len, r.slot as u32, r.c0 as u32 + len]);
+                q0 += len;
+            }
+        }
         // One async fill re-arms the bucket's counters AND its tail GQ cursor.
         let launched = (|| -> Result<()> {
             self.be
@@ -9312,6 +9428,11 @@ impl Drop for GpuEngine {
             self.be.graph_destroy(g);
         }
         self.cublaslt_decode.clear();
+        if let Some(route) = self.attention_gemm.take() {
+            if let Err(e) = route.unload() {
+                report(&e, "unload attention softmax object");
+            }
+        }
         for (_, g) in self.seg_graphs.drain() {
             self.be.graph_destroy(g);
         }
@@ -9590,4 +9711,5 @@ fn gemma4_glu_role_validates_exact_shapes_maps_and_operands() {
 mod fp8_m1_role;
 use fp8_m1_role::{load_fp8_m1_role, validate_fp8_role_checkpoint};
 
+mod attention_gemm;
 mod cublaslt;
