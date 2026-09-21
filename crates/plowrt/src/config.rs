@@ -402,6 +402,11 @@ pub struct RuntimeConfig {
     /// out four decode-only ticks before it is admitted.
     #[arg(long = "rung-fast-probe", env = "PLOW_RUNG_FAST_PROBE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub rung_fast_probe: bool,
+    /// Run a GPU model's mux dispatcher on its own OS thread and execute each tick inline
+    /// (`PLOW_MUX_INLINE_TICK`), instead of handing every tick to the engine thread and awaiting
+    /// it from a tokio worker. Removes two cross-thread wakes from every decode tick.
+    #[arg(long = "mux-inline-tick", env = "PLOW_MUX_INLINE_TICK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mux_inline_tick: bool,
 
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / observability (shared, off by default)
@@ -409,6 +414,11 @@ pub struct RuntimeConfig {
     /// TTFT timeline breakdown (`PLOW_TTFT_LOG=1`).
     #[arg(long = "ttft-log", env = "PLOW_TTFT_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub ttft_log: bool,
+
+    /// Serving host-path timing (`PLOW_HOST_TIMING=1`): per-request first-token phases and a
+    /// per-window decode-tick split (engine call, token emit, handoff, dispatcher).
+    #[arg(long = "host-timing", env = "PLOW_HOST_TIMING", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub host_timing: bool,
 
     /// Prefix-cache timing (`PLOW_PFX_LOG=1`).
     #[arg(long = "pfx-log", env = "PLOW_PFX_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
