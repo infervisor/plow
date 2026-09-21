@@ -45,6 +45,11 @@ python3 scripts/campaign/campaign.py ledger  /nvme/run/<id>/c1/results.csv --cel
    in place). Both engines preallocate weights + KV pools, so the number is the configured
    footprint plus transient workspace: compare it at equal `max_ctx` / slot count, and quote the
    KV budget beside it.
+9. **Quiet box for report-grade cells.** `bench --quiet-lock FILE` holds `FILE` with `flock -x`
+   for the whole session, taken INSIDE the GPU lease; builds and other CPU-heavy work take it with
+   `flock -s ... nice -n 19`. Concurrent compiles inflated a CPU-bound 128-token vLLM TTFT 31 -> 45
+   ms while leaving GPU-bound TPOT alone. Lease first, then lock, everywhere: a run holding the lock
+   while queued for the GPU deadlocks against a run that holds the GPU and wants the lock.
 
 ## Profiles: realtime and throughput are both first-class
 

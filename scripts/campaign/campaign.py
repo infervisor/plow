@@ -274,7 +274,11 @@ def cmd_bench(a: argparse.Namespace) -> None:
         if k in os.environ and os.environ[k] == v and k not in overrides:
             continue  # inherited, unchanged
         lines.append(f"export {k}={shlex.quote(v)}")
-    lines.append("exec " + " ".join(shlex.quote(x) for x in [
+    # `--quiet-lock`: the bench holds this file lock exclusively for its whole session, INSIDE the
+    # GPU lease (lease first, then lock, everywhere — the other order deadlocks against a run that
+    # already holds the GPU). Builds take the same lock shared, so no compile overlaps a measurement.
+    quiet = ["flock", "-x", a.quiet_lock] if getattr(a, "quiet_lock", None) else []
+    lines.append("exec " + " ".join(shlex.quote(x) for x in [*quiet,
         str(BENCH), str(assets), str(bench.get("port", 8765)), model_id, bench["tokenizer"], str(bench.get("ready_s", 1200))]))
     wrapper.write_text("\n".join(lines) + "\n")
     wrapper.chmod(0o755)
@@ -303,6 +307,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "contended": "CONTENDED" in text,
         "gate": "coherence gate: PASS" in text,
         "protocol": {k: env[k] for k in ("IN_LENS", "CONCS", "NPROMPT", "OUTLEN", "BENCH_BACKEND", "BENCH_EXTRA_ARGS", "DATASET_ARGS")},
+        "quiet_lock": getattr(a, "quiet_lock", None),
         "serve_env": serve.get("env", {}),
         "overrides": overrides,
         "lt_algos": {
@@ -739,6 +744,7 @@ def main() -> None:
     n.add_argument("--concs"); n.add_argument("--in-lens"); n.add_argument("--label"); n.add_argument("--reference")
     n.add_argument("--nprompt", type=int, help="prompts per cell, overriding the recipe/profile")
     n.add_argument("--dataset-args", help="replaces the client's random-dataset block (see bench_plowrt_serve.sh DATASET_ARGS); recorded")
+    n.add_argument("--quiet-lock", metavar="FILE", help="hold this flock exclusively for the bench session, inside the GPU lease (builds take it shared)")
     n.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the server env; recorded")
     n.add_argument("--profile", help="named workload from [bench.profiles.*] (e.g. realtime, throughput)")
     n.set_defaults(f=cmd_bench)
