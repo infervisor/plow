@@ -354,6 +354,27 @@ mod tests {
         }
     }
 
+    /// A rung with few samples must not win the throughput seat on a half-converged average.
+    ///
+    /// The defect this guards (h100-sxm5, Gemma-4-12B at C16): rung 8 only ran during ramps, so
+    /// its zero-seeded EWMA read ~7.4 ms for a 12.5 ms step, its capacity beat rung 16's
+    /// 16 / 14.3 ms, and admission narrowed to 8 with 8 requests queued for up to 18 s.
+    #[test]
+    fn a_sparsely_sampled_rung_does_not_steal_the_throughput_seat() {
+        let mut c = controller(&[1, 2, 4, 8, 16]);
+        let one = NonZeroUsize::new(1).unwrap();
+        for _ in 0..MIN_THROUGHPUT_SAMPLES {
+            c.observe_decode(3, 12.5, one);
+        }
+        for _ in 0..200 {
+            c.observe_decode(4, 14.3, one);
+        }
+        assert_eq!(c.step_ms(3), 12.5);
+        c.target = 4;
+        let decision = c.decide(load(16, 8));
+        assert_eq!(c.admission_limit(), 16, "{decision:?}");
+    }
+
     /// A burst must widen the admission window and a QUIET PERIOD must narrow it back.
     ///
     /// The defect this guards: λ was an EWMA updated only on an arrival, so once a burst ended

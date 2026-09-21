@@ -40,9 +40,17 @@ impl Ewma {
         Ewma { value: 0.0, alpha }
     }
 
+    /// The first sample seeds the average. Starting from zero reads low by `(1 - alpha)^n` over
+    /// the first n samples (59% of the truth after four at alpha 0.2), and the rung controller
+    /// compares rungs whose sample counts differ by orders of magnitude: a rung with a handful
+    /// of samples looked 1.7x faster than it was and won the throughput seat from the widest.
     #[inline]
     pub fn update(&mut self, sample: f64) -> f64 {
-        self.value = self.alpha * sample + (1.0 - self.alpha) * self.value;
+        self.value = if self.value == 0.0 {
+            sample
+        } else {
+            self.alpha * sample + (1.0 - self.alpha) * self.value
+        };
         self.value
     }
 
