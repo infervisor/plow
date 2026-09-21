@@ -688,12 +688,14 @@ impl SegmentRoleValidation for SegmentRoles {
                     "invalid packet role program or decode rung".into(),
                 ));
             }
+            // The MoE library segments are contiguous queue windows gated by counters, so the
+            // queue need not be instruction-major (the native decode objects need it).
             if decode
                 && (g
                     .stream
                     .iter()
                     .any(|e| e.flags & (packet::dev::SE_FINE | packet::dev::SE_XCTR) != 0)
-                    || !g.gq_stream.windows(2).all(|w| w[0].inst <= w[1].inst))
+                    || (!moe_decode && !g.gq_stream.windows(2).all(|w| w[0].inst <= w[1].inst)))
             {
                 return Err(RuntimeError::Rejected(
                     "decode segment roles require coarse local counters".into(),
