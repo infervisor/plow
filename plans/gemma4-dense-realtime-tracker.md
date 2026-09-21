@@ -1025,6 +1025,24 @@ cells: **16 of 60 metric-cells ahead**. New: 1024/C1 TTFT 46.70 vs 46.7 (level),
 11.50–27.5 (1.09–1.49x), 128/C16 12.83 vs 11.01. NOTE three of the sixteen are the >= 4096 C32
 TPOT cells, which "win" only because the 16-slot packet queues half the requests.
 
+### Batched rungs: decode attention is the batch-scaling cost (2026-09-21)
+
+Body ablation of FlashDecode on `p12y` (step_bench, distinct prompts, ctx 1024): B=4 12.58 ->
+10.53 ms, B=16 15.22 -> 10.80 (body = 2.05 / 4.4 ms vs 0.71 at B=1). At ctx 192 the step is
+10.82 / 11.50 / 12.40 (B=1/4/16) and 10.52 / 10.79 with attention free — BELOW vLLM's 10.58 /
+11.01 TPOT, so the short-input C4/C16 gap is attention fixed latency, not the GEMV walk.
+
+Landed (`9bf12059`): **`PLOW_SLIDING_NS_GRID`**. The sliding-layer nsplit was a ceil: t=2/4/8/16
+-> ns 9/5/3/2 = 144/160/192/256 work items on 132 blocks, so some blocks ran two items and
+FLASH_MERGE waited. Floored to 8/4/2/1: B=2/4/8 11.92/12.55/13.71 -> 11.45/11.98/13.04 (26B
+7.90/9.94/13.13 -> 7.57/9.57/12.72); B=1, B=16 unchanged; ctx 192 B=4 11.50 -> 11.30, B=16
+12.40 -> 12.24. Served greedy consistency unchanged.
+
+Negatives: multi-row attention tiles (`FA_DEC_TILE_R` 2 / 4 KV rows per thread per tile, fewer
+barriers): ~1%; tensor-core QK for the hd512 full layers (`PLOW_NV_FA_TC_GQA8_HD512`): ~1.5%.
+So the cost is per ROW (score: one 5-round lane reduction per (row, head); P.V: one V load per
+row-group), not per tile.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
