@@ -3575,10 +3575,50 @@ fn service_sample(ms: f64, did_prefill: bool) -> Option<f64> {
 /// The serve-layer interleave bound: max prefill-chunk rows per tick while
 /// other slots are mid-decode. `PLOW_PF_INTERLEAVE` overrides (rows; `0` =
 /// whole prompt in one tick, the pre-interleave behavior). Read once.
+/// Reads `RuntimeConfig::get().nv.pf_chunk_cost`: a launch's fixed cost, in rows.
+#[cfg(feature = "cuda")]
+fn pf_chunk_cost_rows() -> usize {
+    crate::config::RuntimeConfig::get().nv.pf_chunk_cost
+}
+
 /// Reads `RuntimeConfig::get().pf_interleave_rows()`.
 #[cfg(feature = "cuda")]
 fn pf_interleave_rows() -> usize {
     crate::config::RuntimeConfig::get().pf_interleave_rows()
+}
+
+/// Prefill rows for one launch, from the queue (`PLOW_PF_INTERLEAVE_ADAPTIVE`).
+///
+/// `rows` are the waiting prompts' offered rows, oldest first. A launch costs a fixed
+/// `chunk_cost` rows of time plus its rows, and every prompt packed into it finishes when the
+/// launch does. So packing prompt `j + 1` (r rows) delays the `j` prompts already in by r rows and
+/// saves the `n - j` prompts not yet in one fixed cost each: it joins while
+/// `j * r < (n - j) * chunk_cost`. Short prompts share a launch, long ones run alone and oldest
+/// first, and a deeper queue packs more. Measured on h100-sxm5, Gemma-4-12B launch ms at
+/// 128/512/1024/2048/4096 rows 16.8/26.6/45.2/86.6/172.3: four 1024-row prompts packed all finish
+/// at 172 ms, alone they finish at 45/90/135/180.
+///
+/// A prompt no launch can hold whole (`r >= bound`) still FILLS this one, as the static bound
+/// does: stopping short there ran a long prompt's tail as two padded launches instead of one full
+/// one (12B 15000 in, C4: TPOT 25.1 -> 26.6 ms, 105.8 -> 102.0 tok/s). A shorter prompt that does
+/// not fit waits for the next launch: splitting it costs it a launch.
+#[cfg(feature = "cuda")]
+fn queue_pack_rows(rows: &[usize], chunk_cost: usize, bound: usize) -> usize {
+    let Some((&first, rest)) = rows.split_first() else {
+        return bound;
+    };
+    let mut total = first.min(bound);
+    for (j, &r) in rest.iter().enumerate() {
+        let (packed, waiting) = (j + 1, rows.len() - (j + 1));
+        if total + r > bound {
+            return if r >= bound { bound } else { total };
+        }
+        if packed * r >= waiting * chunk_cost {
+            break;
+        }
+        total += r;
+    }
+    total
 }
 
 /// Prompt rows one model may consume while holding its device turn, when there
@@ -3949,6 +3989,7 @@ fn gpu_prefill_batched_pass(
     // Bound each candidate before fair sharing. Short requests return unused
     // rows to later candidates in the same launch.
     let chunk_cap = pf_chunk_rows().min(e.pf_request_max_rows());
+    let adaptive = crate::config::RuntimeConfig::get().pf_interleave_adaptive;
     loop {
         for (i, slot) in slots.iter_mut().enumerate().take(cap) {
             let Some(request) = slot.as_mut().filter(|s| s.step == 0) else {
@@ -4025,6 +4066,15 @@ fn gpu_prefill_batched_pass(
             return tick_fault;
         }
         let avail: usize = candidates.iter().map(|c| c.span.n_rows as usize).sum();
+        let per_launch = if adaptive {
+            let mut queue: Vec<(u64, usize)> =
+                candidates.iter().map(|c| (c.arrival, c.span.n_rows as usize)).collect();
+            queue.sort_unstable_by_key(|&(arrival, _)| arrival);
+            let rows: Vec<usize> = queue.into_iter().map(|(_, rows)| rows).collect();
+            queue_pack_rows(&rows, pf_chunk_cost_rows(), per_launch)
+        } else {
+            per_launch
+        };
         let per_launch = e.pf_pack_budget(avail.min(per_launch)).min(per_launch);
         let pf_batch_cfg = crate::config::RuntimeConfig::get().pf_batch;
         let is_fair =
@@ -4701,6 +4751,27 @@ mod tests {
         assert_eq!(super::co_sched_prefill_rows(8192, 512), 512);
         // Never zero: the caller uses this as a chunk width.
         assert_eq!(super::co_sched_prefill_rows(0, 0), 1);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn queue_pack_rows_pack_short_prompts_and_run_long_ones_alone() {
+        // An empty queue leaves the static bound; a lone prompt takes its rows.
+        assert_eq!(super::queue_pack_rows(&[], 256, 4224), 4224);
+        assert_eq!(super::queue_pack_rows(&[1024], 256, 4224), 1024);
+        // Long prompts run alone: packing a second delays the first by more than it saves.
+        assert_eq!(super::queue_pack_rows(&[1024; 4], 256, 4224), 1024);
+        // Short prompts share a launch, more of them the deeper the queue.
+        assert_eq!(super::queue_pack_rows(&[128; 4], 256, 4224), 384);
+        assert_eq!(super::queue_pack_rows(&[128; 16], 256, 4224), 1408);
+        // Never past the bound, and the oldest prompt is cut to it rather than dropped.
+        assert_eq!(super::queue_pack_rows(&[128; 16], 256, 512), 512);
+        assert_eq!(super::queue_pack_rows(&[8192, 128], 256, 4224), 4224);
+        // A long prompt's tail is topped up by the next long prompt: neither finishes sooner alone.
+        assert_eq!(super::queue_pack_rows(&[2328, 4224], 256, 4221), 4221);
+        // A prompt that a later launch holds whole is not split to top this one up.
+        assert_eq!(super::queue_pack_rows(&[1024; 16], 512, 4224), 4096);
+        assert_eq!(super::queue_pack_rows(&[4096, 4096], 512, 4224), 4096);
     }
 
     /// A held prefix that turns out not to begin a match is released, not dropped.

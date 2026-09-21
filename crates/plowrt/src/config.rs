@@ -179,6 +179,12 @@ pub struct RuntimeConfig {
     #[arg(long = "pf-interleave", env = "PLOW_PF_INTERLEAVE", global = true)]
     pub pf_interleave: Option<u32>,
 
+    /// Size each prefill launch from the queue: the oldest prompt whole, and later prompts join
+    /// only while the delay to those already packed is under the launches the rest save
+    /// (`PLOW_PF_CHUNK_COST` rows each). CUDA packed prefill only.
+    #[arg(long = "pf-interleave-adaptive", env = "PLOW_PF_INTERLEAVE_ADAPTIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_interleave_adaptive: bool,
+
     /// Per-request prefill chunk-row cap. 0 = off.
     #[arg(
         long = "pf-chunk",

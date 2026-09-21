@@ -98,7 +98,11 @@ gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer i
 in_lens = "128 1024 4096 8192 15000"
 concs = "1 4"
 nprompt = 32
-serve_env = { PLOW_MULTISTEP = "4", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0" }
+# Queue-driven prefill packing (PLOW_PF_INTERLEAVE_ADAPTIVE): four 1024-row prompts arriving together no
+# longer share one 172 ms launch; the oldest runs whole and later ones join only while that is cheaper.
+# Measured p12p, 16 prompts, off -> on: 1024 in TTFT 167.0 -> 107.7 ms (vLLM 0.28: 130.6), TPOT 11.93 -> 12.32;
+# 128 / 4096 / 15000 in level (40.5 / 363 / 1712 -> 40.1 / 359 / 1711).
+serve_env = { PLOW_MULTISTEP = "4", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0", PLOW_PF_INTERLEAVE_ADAPTIVE = "1" }
 
 [bench.profiles.high_concurrency]
 in_lens = "128 1024 4096 8192 15000"
