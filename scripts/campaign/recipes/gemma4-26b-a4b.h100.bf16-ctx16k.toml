@@ -64,6 +64,12 @@ PLOW_MAX_CHUNK = "4096"
 # argmax into the lm_head GEMV epilogue is SLOWER here — 6.501 ms/step vs 5.837 without it.
 # (PLOW_FUSE_MERGE / PLOW_FUSE_HNR: no effect; PLOW_GEMMA_MOE_ROUTER_FUSED: 142 ms/step.)
 PLOW_FUSE_ARGMAX = "0"
+# Each layer's grouped MoE prefill pair (GLU + down) isolated as a MOE_PREFILL_CUBLASLT segment;
+# served by two cuBLASLt grouped matmuls when PLOW_MOE_PF_LT is set: segment 0.744 -> 0.569 ms at
+# 1024 rows, 1.777 -> 1.352 at 4096; TTFT 1024/C1 43.0 -> 38.7 ms, 4096 120.9 -> 107.2, 8192
+# 257.7 -> 231.0; MoE relL2 3.6e-3 (BF16 rounding of gate|up), gate + needle + consistency pass
+# (agent/moe-grouped-gemm, bb2c5c14).
+PLOW_EMIT_MOE_PF_LT = "1"
 # The exact scorer replays the legacy scalar fmaf order on ONE lane per expert: measured
 # 0.0460 ms/layer at B=1 vs 0.0085 for ScoreFast (moe_decode_gemma26b_bench.cu) — 1.1 ms of
 # an 8.15 ms C1 decode step. ScoreFast is f32 end to end with a tree reduction, which is
@@ -110,6 +116,7 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 
 [serve.env]
 PLOW_PREFIX_CACHE = "0"
+PLOW_MOE_PF_LT = "1"
 PLOW_PF_SEG_PURE = "1"
 PLOW_PF_SEG_FA512 = "1"
 PLOW_PF_INTERLEAVE = "0"
