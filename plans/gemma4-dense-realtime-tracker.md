@@ -1270,6 +1270,20 @@ px4, so new exactness evidence. Global-layer K/V are linear ([slot][kvh][row][hd
   (640 MiB/slot), 32 slots, roles on; ladder pending. Dynamic slots exist (`PLOW_VMM_LIVE=1
   PLOW_VMM_LIVE_RINGS=1`, unmeasured). plowc-as-JIT not needed: a geometry change is a 4-9 s devblob
   re-emit against existing objects.
+* P99 TTFT under concurrency (agent/pack-fairness `f5fa92ea` `c54a4382`). In every C4/C16 cell of
+  the end-to-end set the P99 IS the cold first wave's makespan (C requests arriving together);
+  plow's later-wave P99 already beats vLLM everywhere (12B 4096/C16 394 vs 1275 ms). The wave is
+  prefill-throughput bound: plow 43-52 us/row (12B) / 27-28 (26B) vs vLLM 36-40 / 17.5-18.4, whose
+  8192-token chunked-prefill steps (`max_num_batched_tokens=8192`) beat plow's 4224-row launch cap;
+  even plow's pure C1 rate (41.5 us/row) would not reach vLLM's 1024/4096 P99. Pack reordering
+  cannot move a makespan: `PLOW_PF_INTERLEAVE_ADAPTIVE` at C16 NULL (1024 in mean 332 -> 380, P99
+  755 -> 785). 128/C16 is the one scheduling-bound cell: the rung controller's penultimate probe
+  held 8 of the cold 16 for four decode-only ticks, and the routed 1024/1088 buckets captured
+  their seg graph on first use (23 ms). Fixes: routed buckets warmed at load (12B 128/C16 77.8 /
+  199 -> 73.2 / 171, tok/s 1286 -> 1291); `PLOW_RUNG_FAST_PROBE=1` probes the widest after one
+  sample: 12B 73.8 / 150 (x2), 26B 68.8 / 167 -> 69.1 / 145, 1024 / 4096 level; 26B tok/s 1016 ->
+  1001 (one run). Seating the widest outright (`COLD_DEMAND`, replaced) P99 133 but mean 107: the
+  cohort syncs into 16-bursts. Next: 8192-row launches for packs of short slices (geometry).
 
 ## Workstream status
 
