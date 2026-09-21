@@ -40,6 +40,12 @@ PLOW_MAX_CHUNK = "4096"
 PLOW_PF_LADDER_APPEND = "256,1088,1152,4160,4224"
 PLOW_FUSE_ARGMAX = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+# Decode attention scores on the tensor cores with K streamed from global (bit 0 hd256, bit 1
+# hd512), 32-row TC P.V ring (claim 154 -> 91 KiB), full-attention layers grid-filled: step
+# -0.30/-0.51/-1.02 ms at B=1/4/16 (ctx 1024), served 128/C16 TPOT 12.68 -> 11.80 ms, 1024/C16
+# 17.55 -> 15.82; f32 oracle relL2 0.0016-0.0017, greedy digests identical (agent/dec-batched-attn).
+PLOW_FA_MMAQK = "3"
+PLOW_NS_FULL_ABS = "66"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
