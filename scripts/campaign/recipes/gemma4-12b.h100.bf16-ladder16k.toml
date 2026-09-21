@@ -104,7 +104,10 @@ serve_env = { PLOW_MULTISTEP = "4", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEA
 in_lens = "128 1024 4096 8192 15000"
 concs = "16 32"
 nprompt = 64
-serve_env = { PLOW_MULTISTEP = "8", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
+# MULTISTEP 0, not 8: an arrival waits out the running decode block (8 x ~14 ms at B=16) and
+# completions quantize into waves. Measured C16, p12m, 64 prompts, 8 -> 0: 128 in TTFT 112.8 ->
+# 74.9 ms, p99 ITL 98.5 -> 14.4, 1164 -> 1204 tok/s, TPOT 12.55 -> 12.71; 1024 / 4096 in level.
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
 
 [reference]
 csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.csv"
