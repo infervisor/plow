@@ -7485,6 +7485,7 @@ impl GpuEngine {
                 .collect();
             // Only buckets that run the per-segment launch loop: the route replaces a launch.
             let attention_gemm_segments = if config.nv.pf_attn_gemm
+                && g.t >= config.nv.pf_attn_gemm_min_rows
                 && seg_mode
                 && seg_class.len() > 1
                 && qwen_segments.is_empty()

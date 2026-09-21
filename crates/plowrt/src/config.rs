@@ -816,6 +816,11 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-attn-gemm-tile", env = "PLOW_PF_ATTN_GEMM_TILE", default_value_t = 2048, global = true)]
     pub pf_attn_gemm_tile: u32,
 
+    /// Smallest prefill bucket (rows) that `--pf-attn-gemm` routes. Below it the fused kernel
+    /// inside the segment graph beats three library launches (128-token cells +0.8-4 ms routed).
+    #[arg(long = "pf-attn-gemm-min-rows", env = "PLOW_PF_ATTN_GEMM_MIN_ROWS", default_value_t = 1024, global = true)]
+    pub pf_attn_gemm_min_rows: u32,
+
     /// `--pf-attn-gemm` keeps the scores in f32 between the GEMM and the softmax (twice the
     /// scratch and score traffic; the bf16 score rounding is what limits the route's numerics).
     #[arg(long = "pf-attn-gemm-s32", env = "PLOW_PF_ATTN_GEMM_S32", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
