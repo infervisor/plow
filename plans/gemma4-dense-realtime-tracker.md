@@ -1317,6 +1317,15 @@ px4, so new exactness evidence. Global-layer K/V are linear ([slot][kvh][row][hd
     every recipe: fold B=4/16 step 31/109 ms vs 10.7/11.3 (full weight pass per row), dot8 fold +1.2
     ms at B=1.
 
+* E2E2 set (19:43-22:05 UTC, `339e6be8`; report regenerated + sent 22:10): 12B p12r on the round-3 binary
+  (d0859681). TTFT ahead 12/20 (1 parity), 16/60 ahead + 12 parity. C1 TTFT 18.38/45.94/170.31/360.46/
+  748.56 vs vLLM 30.31/47.55/170.51/349.21/672.28; C16 TTFT 73.3/312.0/678.0/1261.3/2453.2 vs 102.5/
+  408.7/1164.4/2025.7/3084.4; C16 TPOT 11.86/16.54/30.83/50.27/86.40 vs 10.98/13.81/22.79/37.55/67.79.
+  GSM8K 194/200 (vLLM 194). Cache-on (PLOW_PREFIX_CACHE=1 only): C4 122.3 ms (26/35 hits) vs vLLM 120.8,
+  C16 314.7 (57/67) vs 282.6; peak 77 GiB. vLLM e2e2 within 1-2% of e2e (new reference CSVs).
+  Serving front end (agent/serve-frontend `aadf88ed` `0b88ef14`, not yet integrated): host path <1-2% of
+  every metric; `PLOW_MUX_INLINE_TICK=1` -1.0% TPOT C1/C16 (26B A/B); tokenizers 0.23 encode -24-36%.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |

@@ -1481,3 +1481,11 @@ column"). 26B-specific numbers, packet `p26i`, 16 prompts:
   GLU 3.49+0.25, DOWN 1.48+1.79 wait, attention 2.38+0.31, router 0.75+0.13, dense ~2.8.
 * Pack fairness on the 26B: first-wave per-row cost 28 vs vLLM 18 us/row (MoE gains most from
   8192-token steps); FAST_PROBE held off on the 26B (-1.5% tok/s single run).
+* E2E2 set (`339e6be8`): 26B p26dl + PLOW_MOE_DEC_LT=4 (recipe now emits GROUP 4 + EMIT_MOE_DEC_LT and serves
+  the knob). C16 TPOT 12.41/15.10/24.51/37.95/56.14 (e2e p26lt 15.26/17.84/26.87/40.06/61.07; vLLM 8.85/10.10/
+  14.07/21.22/35.09), tok/s 1238/969/574/359/197 (was 1015/835/529/342/192). 15000/C16 TTFT regressed 2556 ->
+  3015 (vLLM 1545). Same-session realtime A/B vs p26lt: C4 TPOT better 128-8192 (8.77 vs 9.43 at 128), 15000/C4
+  TTFT 998 -> 695 but TPOT 18.12 -> 19.89; C1 TPOT +0.06 ms (multistep off). TTFT ahead 11/20; 12/60 ahead.
+  GSM8K 192/200 (vLLM 191). Cache-on: C4 87.1 ms vs vLLM 98.3, C16 205.1 vs 204.7 (26/35, 57/67 hits); peak
+  78.6 GiB. Decode interference (agent/decode-interference): decode rows already ride every prefill launch;
+  stall total = prefill per-row cost (26B 27-30 vs vLLM 17.6 us/row); decode step B=16 15.6 vs 10.2 ms.
