@@ -236,6 +236,38 @@ contended, peak 46-53 GiB vs p12r's 66-69):**
   overall, but p12r keeps C16. Removing the per-request cap for a single request (item 3, the
   in-program sub-chunk pipeline) is what would make one packet win both.
 
+
+**C16 attribution from the client's per-request records (`client/in*_c16.json`, `ttfts`/`itls`) and
+the server logs — the `PLOW_PF_PACKLOG=1` diagnostic pair (`diag.sh`) was NOT run: 5 lease waiters
+were ahead of it (coordinator rule: skip above two).**
+
+* 4096/C16 (+66%) and 8192/15000: steady-state per-request TTFT (after the first wave of 16) p50
+  888 ms on req1k vs 379 on p12r; first wave 1779 vs 1696. A request's prefill is four 1024-row
+  slices in four consecutive 4096-row launches shared with three other requests (Greedy packing,
+  turn held until the pack's last request finishes), so every request finishes after ~4 launches
+  instead of 1 — the per-request cap's scheduling, exactly as predicted. TPOT unchanged.
+* 1024/C16 (+4%): steady p50 331 vs 320, first-ITL median 162 vs 160 (the second token waits for
+  the other arrivals' 1024-row launches on both packets). Level.
+* 128/C16 (+38%, the unexplained one): steady-state per-request TTFT is a tight **100-102 ms on
+  req1k (p10 100.4, p50 102.3) vs 58 ms on p12r (p25-p50 57.9-58.2)** — a constant +42-44 ms on
+  EVERY staggered arrival, not a queueing wave; first wave 130 ms (all 16 in one launch) vs p12r's
+  80/200 split (p12r's cold-start probe seats 2->8->16, req1k's ladder to 32 seats 2->16 in one
+  step, `throughput_seat`'s penultimate-rung rule). Decode is identical (TPOT 11.83 vs 11.85, ITL
+  p99 12.2 vs 12.5; first ITL after the first token 11.7 vs 11.4 ms, so the whole gap is before the
+  first token), the admission-rung controller logged no transition during the cell on either
+  packet, and the launch shapes are the same (129-row prompt, unified token-batch route ready and
+  firing on both, bucket 256). So the +42 ms sits in the prefill path of a lone 129-row arrival on
+  the 32-slot packet — packet-dependent candidates: the unified launch's decode-row staging sized
+  by `e.batch` (32 vs 16: `TokenBatchStaging::with_capacity(pf_max_rows, batch)`, the compact
+  terminal's row quota), or the bucket pick/segment-graph warm state (`buckets=8` vs `10`). It
+  is worth the two `PLOW_PF_PACKLOG=1` sessions in `/opt/dlami/nvme/tmp/agent-geom/diag.sh`
+  (per-launch `PACKLOG R= rows= bucket=` and per-tick `prefill_ms/decode_ms`), ~4 min each.
+* Admission-rung flapping is real on the 32-slot packet at C16 for prompts >= 1024: with 16 live
+  and 1-3 queued the controller widens 16 -> 32 (Backlog) and narrows back (LowLoad) every 2-15 s
+  (`decode admission rung` lines, 17:07:31-17:12:11), which p12r's ladder (top 16) cannot do. It
+  did not fire in the 7-second 128/C16 cell, so it is not the 128/C16 gap; it may cost the long
+  cells a little and is another reason to cap `PLOW_DECODE_MAX_RUNG` at the profile's C.
+
 #### Served `high_concurrency` (p12rq, 10 cells; TTFT ms / TPOT ms / tok/s; peak GiB in the last column)
 
 | in / C | **p12rq req1k (32 slots, chunk 4096)** | p12r (16 slots, chunk 4096) | p12c32b (32 slots, chunk 1024) | vLLM 0.28 e2e | p12rq peak |
