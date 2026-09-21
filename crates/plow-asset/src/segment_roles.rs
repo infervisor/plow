@@ -17,7 +17,11 @@ pub const BF16_PREFILL_GEMM_GLU_GEMMA4: u8 = 12;
 pub const W8A8_PREFILL_GEMM_GLU_GEMMA4: u8 = 13;
 pub const PREFILL_ATTENTION_HD256_GQA2_BKV32: u8 = 14;
 pub const PREFILL_ATTENTION_HD512_PX4_BQ64: u8 = 15;
-pub const MAX_ROLE: u8 = PREFILL_ATTENTION_HD512_PX4_BQ64;
+/// Library role, like [`CUBLASLT`]: one segment holding a layer's `MoeGroupGluGemmaPf` +
+/// `MoeGroupDownGemmaPf` pair, which the CUDA runtime may serve with cuBLASLt grouped matmuls
+/// (`PLOW_MOE_PF_LT`). Without the runtime knob the segment runs in the interpreter unchanged.
+pub const MOE_PREFILL_CUBLASLT: u8 = 16;
+pub const MAX_ROLE: u8 = MOE_PREFILL_CUBLASLT;
 
 pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)

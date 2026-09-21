@@ -1,6 +1,8 @@
 use packet::dev::DevOp;
 use packet::devbuild::{Builder, Model, SectionData, SECT_METADATA};
-use plow_asset::segment_roles::{ProgramRoles, SegmentRoles, CUBLASLT, INTERPRETER, SECTION};
+use plow_asset::segment_roles::{
+    ProgramRoles, SegmentRoles, CUBLASLT, INTERPRETER, MOE_PREFILL_CUBLASLT, SECTION,
+};
 
 pub(crate) fn apply(model: &mut Model) -> Result<SectionData, String> {
     apply_projections(model, false)
@@ -10,6 +12,58 @@ pub(crate) fn apply_prefill(
     model: &mut Model,
     sections: &mut Vec<SectionData>,
     profile: &str,
+) -> Result<usize, String> {
+    isolate_prefill(model, sections, CUBLASLT, |model, index| {
+        let rows = model.prog_t[index];
+        model.progs[index]
+            .insts
+            .iter()
+            .enumerate()
+            .map(|(inst, op)| prefill_eligible(model, op, rows, profile).then_some(inst))
+            .collect()
+    })
+}
+
+/// One `MOE_PREFILL_CUBLASLT` segment per layer: the grouped expert GLU and DOWN GEMMs, which
+/// the CUDA runtime can serve with cuBLASLt grouped matmuls. Align, router and combine stay in
+/// their interpreter segment, so a runtime without the route runs the packet unchanged.
+pub(crate) fn apply_moe_prefill(
+    model: &mut Model,
+    sections: &mut Vec<SectionData>,
+    profile: &str,
+) -> Result<usize, String> {
+    isolate_prefill(model, sections, MOE_PREFILL_CUBLASLT, |model, index| {
+        let insts = &model.progs[index].insts;
+        let mut groups = vec![None; insts.len()];
+        if !matches!(profile, "sm90a" | "sm_90a") {
+            return groups;
+        }
+        for (head, pair) in insts.windows(2).enumerate() {
+            let (glu, down) = (&pair[0], &pair[1]);
+            if glu.op == DevOp::MoeGroupGluGemmaPf as u16
+                && down.op == DevOp::MoeGroupDownGemmaPf as u16
+                && u32::from(glu.blocks) == model.n_cu
+                && down.blocks == glu.blocks
+                && [glu.t[0], glu.t[2], glu.t[3]] == [down.t[1], down.t[2], down.t[3]]
+                && [glu.i[0], glu.i[1], glu.i[2]] == [down.i[1], down.i[0], down.i[2]]
+                && glu.i[0] % 8 == 0
+                && glu.i[1] % 8 == 0
+            {
+                groups[head] = Some(head);
+                groups[head + 1] = Some(head);
+            }
+        }
+        groups
+    })
+}
+
+/// Re-segment every prefill program so that each instruction group `select` names (by a shared
+/// key) becomes its own segment with `library_role`; everything else keeps its segment and role.
+fn isolate_prefill(
+    model: &mut Model,
+    sections: &mut Vec<SectionData>,
+    library_role: u8,
+    select: impl Fn(&Model, usize) -> Vec<Option<usize>>,
 ) -> Result<usize, String> {
     let positions: Vec<_> = sections
         .iter()
@@ -45,14 +99,9 @@ pub(crate) fn apply_prefill(
     let mut selected = 0usize;
     let prefill_count = packet::devbuild::decode_rung_lo(&model.prog_t);
     for index in 0..prefill_count {
-        let rows = model.prog_t[index];
         let program = &model.progs[index];
-        let eligible: Vec<_> = program
-            .insts
-            .iter()
-            .map(|op| prefill_eligible(model, op, rows, profile))
-            .collect();
-        if !eligible.iter().any(|&yes| yes) {
+        let eligible = select(model, index);
+        if !eligible.iter().any(Option::is_some) {
             continue;
         }
         if program.l2_domains != 0 || program.hier_base != 0 {
@@ -87,7 +136,7 @@ pub(crate) fn apply_prefill(
         if !eligible
             .iter()
             .enumerate()
-            .any(|(inst, &yes)| yes && instruction_roles[inst] == Some(INTERPRETER))
+            .any(|(inst, group)| group.is_some() && instruction_roles[inst] == Some(INTERPRETER))
         {
             continue;
         }
@@ -102,12 +151,11 @@ pub(crate) fn apply_prefill(
                 .get(inst)
                 .and_then(|&role| role)
                 .ok_or("prefill instruction absent from stream")?;
-            let route = eligible[inst] && prior_role == INTERPRETER;
-            let role = if route { CUBLASLT } else { prior_role };
-            let key = if route {
-                (u32::MAX, role, inst)
-            } else {
-                (u32::from(entry.seg), role, usize::MAX)
+            let group = eligible[inst].filter(|_| prior_role == INTERPRETER);
+            let role = if group.is_some() { library_role } else { prior_role };
+            let key = match group {
+                Some(group) => (u32::MAX, role, group),
+                None => (u32::from(entry.seg), role, usize::MAX),
             };
             if last_key != Some(key) {
                 if !roles.is_empty() {
@@ -124,7 +172,7 @@ pub(crate) fn apply_prefill(
             last_key = Some(key);
         }
         bounds.push(program.gq_stream.len() as u32);
-        selected += roles.iter().filter(|&&role| role == CUBLASLT).count();
+        selected += roles.iter().filter(|&&role| role == library_role).count();
         updates.push(Update {
             index,
             roles,
@@ -653,6 +701,57 @@ mod tests {
                 assert_eq!(role == CUBLASLT, pc == 1 || pc == 2);
             }
         }
+    }
+
+    #[test]
+    fn moe_prefill_isolates_each_grouped_glu_down_pair_as_one_segment() {
+        let mut b = Builder::new(2);
+        b.force_uniseg();
+        let [fug, xn2, ewt, meta, rowtok, part, rowpart, rowgate] =
+            ["fug", "xn2", "ewt", "meta", "rowtok", "part", "rowpart", "rowgate"]
+                .map(|name| b.tensor(name, 1 << 20));
+        let align = b.emit(DevOp::MoeAlignGemmaPf, vec![0], &[], |_| {});
+        let glu = b.emit(DevOp::MoeGroupGluGemmaPf, vec![0, 1], &[align], |d| {
+            d.t[..5].copy_from_slice(&[fug, xn2, ewt, meta, rowtok]);
+            d.i[..3].copy_from_slice(&[704, 2816, 128]);
+        });
+        let down = b.emit(DevOp::MoeGroupDownGemmaPf, vec![0, 1], &[glu, align], |d| {
+            d.t[..6].copy_from_slice(&[part, fug, ewt, meta, rowpart, rowgate]);
+            d.i[..3].copy_from_slice(&[2816, 704, 128]);
+        });
+        b.emit(DevOp::Nop, vec![0, 1], &[down], |_| {});
+        let tensors = b.tensors();
+        let mut model = Model {
+            n_cu: 2,
+            target: 0,
+            tensors,
+            progs: vec![b.finish()],
+            prog_t: vec![1024, 1],
+            gen: Vec::new(),
+            kv_row_insts: Vec::new(),
+        };
+        let packed: Vec<_> = model.progs[0].insts.iter().map(|op| op.pack()).collect();
+        let mut sections = Vec::new();
+        assert_eq!(apply_moe_prefill(&mut model, &mut sections, "gfx942").unwrap(), 0);
+        assert!(sections.is_empty());
+        assert_eq!(apply_moe_prefill(&mut model, &mut sections, "sm_90a").unwrap(), 1);
+        let metadata = SegmentRoles::from_bytes(&sections[0].data).unwrap();
+        assert_eq!(metadata.programs[0].roles, [INTERPRETER, MOE_PREFILL_CUBLASLT, INTERPRETER]);
+        let program = &model.progs[0];
+        assert_eq!(program.gq_seg_ofs, [0, 1, 5, 7]);
+        for (pc, op) in program.insts.iter().enumerate() {
+            assert_eq!(op.pack(), packed[pc]);
+            let expected = [0, 1, 1, 2][pc];
+            assert!(program
+                .stream
+                .iter()
+                .chain(&program.gq_stream)
+                .filter(|entry| entry.inst as usize == pc)
+                .all(|entry| entry.seg == expected));
+        }
+        // A pair whose operands disagree is left to the interpreter.
+        model.progs[0].insts[2].t[1] = xn2;
+        assert_eq!(apply_moe_prefill(&mut model, &mut Vec::new(), "sm_90a").unwrap(), 0);
     }
 
     #[test]

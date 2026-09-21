@@ -828,6 +828,12 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "lt-algos-write", env = "PLOW_LT_ALGOS_WRITE", global = true)]
     pub lt_algos_write: Option<String>,
 
+    /// Serve a packet's `MOE_PREFILL_CUBLASLT` segments (emit `PLOW_EMIT_MOE_PF_LT`) with
+    /// cuBLASLt grouped matmuls in every prefill bucket of at least this many rows. Unset = the
+    /// segments run in the interpreter.
+    #[arg(long = "moe-pf-lt", env = "PLOW_MOE_PF_LT", global = true)]
+    pub moe_pf_lt: Option<u32>,
+
     /// Equalize the seg pair's dynamic smem (occ-1 fat object A/B).
     #[arg(long = "pf-seg-eqsmem", env = "PLOW_PF_SEG_EQSMEM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_eqsmem: bool,

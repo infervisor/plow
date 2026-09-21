@@ -3,7 +3,7 @@
 //! descriptor, and a checkpoint) and drives just that block on the real GPU
 //! through two verbs on ONE loaded engine:
 //!
-//!   block_run <asset-dir> check [--in x.npy] [--out y.npy] [--ctx T]
+//!   block_run <asset-dir> check [--in x.npy] [--out y.npy] [--ctx T] [--repeat N]
 //!                              [--dump-tensors name,name --dump-dir dir]
 //!   block_run <asset-dir> bench --batch 1,2,4,8 --ctx 128,512,1024,4096
 //!                              [--iters 100] [--warmup 10] [--prefill-iters 10]
@@ -595,15 +595,20 @@ mod cuda {
         //    emit path has prefill_buckets=[]): drive ONE decode step (M=1) on a
         //    single row, mirroring step_bench's no-prefill branch.
         let t = if e.has_prefill() {
-            e.begin_slot(0, t + 1)?;
-            e.upload_activation("act.x", &xin)?;
             let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
-            let t0 = Instant::now();
-            e.prefill_slot(0, &prompt)?;
-            println!(
-                "  launched prefill(T={t}) in {:.3} ms",
-                t0.elapsed().as_secs_f64() * 1e3
-            );
+            // `--repeat N`: the same real input N times, so a timing read (PLOW_PF_SEG_TIME)
+            // can skip the cold first launch.
+            let repeat: usize = flag("--repeat").and_then(|s| s.parse().ok()).unwrap_or(1);
+            for _ in 0..repeat.max(1) {
+                e.begin_slot(0, t + 1)?;
+                e.upload_activation("act.x", &xin)?;
+                let t0 = Instant::now();
+                e.prefill_slot(0, &prompt)?;
+                println!(
+                    "  launched prefill(T={t}) in {:.3} ms",
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
             t
         } else {
             // Decode processes one row; feed row 0 of the input.
