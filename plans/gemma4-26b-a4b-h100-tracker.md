@@ -1412,3 +1412,13 @@ Same as the 12B campaign: `scripts/campaign/campaign.py` (build/bench/compare/le
 one TOML recipe per cell, every GPU run under `perf-data/tools/gpulease -n 1`,
 `--profile realtime|throughput` always passed, same precision on both sides,
 `PLOW_PREFIX_CACHE=0` for any vLLM-matched cell.
+
+## Serving-layer round shared with the 12B (2026-09-21, afternoon)
+
+Details in `plans/gemma4-dense-realtime-tracker.md` ("Serving fixes, measured with the memory
+column"). 26B-specific numbers, packet `p26i`, 16 prompts:
+* Queue-driven prefill packing (`7a6ff51b`, realtime profile on): 1024/C4 TTFT 114.5 -> 94.4 ms,
+  TPOT 10.03 -> 10.32; 128 / 4096 / 15000 in level (40.1 / 247.5 / 1140.8 -> 40.5 / 246.3 / 1141.7).
+* Peak GPU memory 76.1-77.1 GiB by cell (76096-77056 MiB) on the 16-slot ctx16k packet.
+* Rung-controller EWMA fix (`7f9ec6a1`) applies here too (serving profile MULTISTEP=2; A/B vs 0
+  pending).

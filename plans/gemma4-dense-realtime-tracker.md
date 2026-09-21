@@ -1125,6 +1125,72 @@ already serial per request); the fused epilogue into `at` must be replicated; no
 px4, so new exactness evidence. Global-layer K/V are linear ([slot][kvh][row][hd], mask = ~0), Q is
 [row][head][hd] — both usable as strided operands without a permute.
 
+### Serving-tick and prefill-launch findings (2026-09-21, packet `p12m`)
+
+* **Chunk planner bug (fixed, `f27e8d17`)**: `pick_prefill_bucket` planned `s * unit` rows at the goal
+  state, so an appended rung that is not a unit multiple (1088 on a 128-row unit) never covered a
+  1030-row prompt. The goal state now plans the true remainder. No bench cell moved: `vllm bench
+  serve random` prompts launch exactly `rows=1024` / `rows=4096` (`PLOW_PF_PACKLOG`), so the tight
+  BOS rungs 1026/4104 (packet `p12t`) are irrelevant to the ladder and were dropped.
+* **vLLM reference rows re-measured (`e42e9c9e`)**: the 12B C1 rows at 128/1024/4096 were derived,
+  now measured: TTFT 30.74 / 47.49 / 169.76, TPOT 10.57 / 10.64 / 10.65.
+* **Prefill launch cost per rung (ms)**: 128 -> 16.8, 256 -> 19.4, 512 -> 26.6, 1024 -> 45.2,
+  2048 -> 86.6, 4096 -> 172.3. Linear from 1024 up (~42 us/row), ~11 ms fixed at the small end.
+  The 4096-row pass is 168-172 ms in-mux vs vLLM's 169.8 ms TTFT: the 4096+/C1 TTFT gap is prefill
+  compute (non-GEMM segments ~52 ms of 172), not scheduling.
+* **Static `PLOW_PF_INTERLEAVE` caps 2048/1024/512 — NULL**: splitting a >=4096-row prompt across
+  launches loses on TTFT, TPOT and tok/s at 4096/8192-in, C4 and C16. Baseline (0 = unbounded):
+  1024/C4 170.2/12.25/296.4, 1024/C16 377.7/17.99/746.7, 4096/C4 336.4/14.99/228.4,
+  4096/C16 699/33.02/415.4, 8192/C4 762/18.84/162.1, 8192/C16 1516/55.29/237.4.
+* **Fair-share adaptive interleave (launch rows by head count) — NULL**, same reason; removed.
+* **Pair walk (`e7502569`, `PLOW_NV_GEMV_MMA_PAIR`, manifest stamps 1 on the dense B=1 walk)**:
+  step_bench B=1/4/16 under the real packet flags 10.97/11.70/14.27 -> 10.92/11.60/13.94 (ctx 1024),
+  11.10/12.22/16.32 -> 11.03/12.10/15.96 (ctx 8192). Off for the 26B. Needs a full packet build
+  + ladder before the ledger moves.
+* **Decode build-flag A/B — NULL**: `FA_GF_FULL=4` (hand `cc_dec.sh`) loses at ctx 8192 vs the
+  packet's 8 + TC hd512; `GV_UNROLL_GLU=10` spills past the 255-register cap; KUN / PTXSYNC /
+  NOSTAGE no effect. Packet flags stay.
+* **Where the C16 TPOT gap is**: vLLM's B=16 step is ~11.4 ms (barely above its B=1); plow's is
+  14.3 (ctx 1k) / ~16 (ctx 4k). Batch-step scaling, not the tick.
+* **32-slot packet `p12c32b` (TTFT/TPOT/tok-s)**: 128/C16 67.8/12.93/1189, 128/C32 114.5/16.49/1821,
+  1024/C16 244/18.30/788, 1024/C32 571/26.93/987, 4096/C16 947/34.69/374, 4096/C32 2541/61.63/372,
+  8192/C16 2167/65.58/190, 8192/C32 10333/71.84/189, 15000/C16 10405/86.43/92.7,
+  15000/C32 27065/88.66/90.5. TTFT ahead of vLLM at 128/C16, 128/C32, 1024/C32 (101/202/852).
+
+### Serving fixes, measured with the memory column (2026-09-21, afternoon)
+
+* **Peak GPU memory is a column** (`cb11570e`): both bench scripts sample the server's process
+  tree with nvidia-smi; `peak_mem_mib` in results.csv / ledgers. 12B p12m 65.7-67.7 GiB by cell;
+  vLLM 0.28 at 16384/32: 72.7-74.0 GiB (74442-75800 MiB). Sampler on/off/on at C1: no effect.
+* **CPU-quiet lock**: concurrent compiles (even nice 19) inflated vLLM's 128-token TTFT 30.9 -> 45.1
+  ms (spread 29-32 vs 34-55). Builds now `flock -s /tmp/plow-cpu-quiet.lock`, final sessions
+  `flock -x`; the uniform vLLM re-measure under the lock matches the clean references.
+* **Uniform vLLM 0.28 baseline** (16384 / 32, `--num-warmups 2 --seed 42`, 32 / 64 prompts, memory
+  sampled): the old reference CSVs mixed five sessions (max-model-len 4736-16384, max-num-seqs
+  4-32, 32 vs 64 requests at C16, 0 / 2 / 16 warm-ups) — the investor-report audit found four of
+  the C16 "wins" were 64-vs-32-request comparisons. 12B C1/C4 rows re-measured: TTFT 30.90 / 47.46 /
+  170.92 / 347.80 / 673.49 (C1), 55.05 / 130.57 / 467.37 / 996.38 / 1668.12 (C4).
+* **Rung controller narrowed 16 -> 8 on a zero-seeded EWMA** (`7f9ec6a1`): `Ewma` started at 0.0,
+  so rung 8 (samples only during ramps) read ~59% of its step time, won `throughput_seat` and
+  admission dropped to 8 with 8 requests queued (0.1-0.4 s at MULTISTEP=0, 7.6-18 s at 8; seen in
+  the p12m ladder run). Fixed; no Throughput narrowing left in the C16/C32 timelines; means unchanged
+  at MULTISTEP=0 (rung fix is robustness, not speed).
+* **Serving profile MULTISTEP 8 -> 0** (`ae86a1b8`): 128/C16 TTFT 112.8 -> 74.9 ms (vLLM 101.1),
+  p99 ITL 98.5 -> 14.4, 1164 -> 1204 tok/s, TPOT 12.55 -> 12.71; 1024/4096 in level (1024/C16 is
+  bimodal 255-378 ms run to run: arrivals sync into waves). MULTISTEP 2 = same means, p99 ITL 25.6.
+* **Queue-driven prefill packing** (`7a6ff51b`, `PLOW_PF_INTERLEAVE_ADAPTIVE`, realtime profiles):
+  v1 "never split" regressed 15000/C4 (a long tail ran as two padded launches); v2 "always fill"
+  split short prompts at C16 (1024/C16 325 -> 380, 4096/C16 701 -> 769); v3 fills only with a
+  prompt no launch holds whole. p12p C4 off -> on: 1024 in 167.0 -> 107.7 ms (vLLM 130.6), TPOT
+  11.93 -> 12.32; 128 / 4096 / 15000 level. 26B 1024/C4 114.5 -> 94.4, TPOT 10.03 -> 10.32.
+* **Packet `p12p`** = current tree with the pair walk stamped (`PLOW_NV_GEMV_MMA_PAIR 1`; decode object
+  1.88 MB vs 1.34): step_bench ctx 1024 B=1/4/16 10.99 / 11.72 / 14.27 -> 10.90 / 11.58 / 13.95;
+  served greedy consistency 15/16 + 15/16, needles 1025-8199 OK, 0 faults.
+* **Prefix cache**: `--prefix-cache` defaults ON but `select_vmm_prefix_layout` auto-selection is off
+  under packed prefill / live VMM (the serving configs). Explicit `PLOW_VMM_PREFIX=1` engages: 7230-
+  token prompt 404 ms cold -> 33.6 ms on the third request, shared-prefix question 33.2; the second
+  identical request still missed (insert after slot release). Default-mode check pending.
+
 ## Workstream status
 
 | Item | State | Evidence / blocker |
