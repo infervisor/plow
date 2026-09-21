@@ -397,11 +397,11 @@ pub struct RuntimeConfig {
     /// Widest decode rung a serving engine admits (`PLOW_DECODE_MAX_RUNG`); unset = no ceiling.
     #[arg(long = "decode-max-rung", env = "PLOW_DECODE_MAX_RUNG", global = true)]
     pub decode_max_rung: Option<u32>,
-    /// A cold backlog seats the rung it demands at once (`PLOW_RUNG_COLD_DEMAND`) instead of
-    /// bootstrapping on the penultimate rung for one tick: the first burst on a fresh server
-    /// then prefills in one pack, not two.
-    #[arg(long = "rung-cold-demand", env = "PLOW_RUNG_COLD_DEMAND", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub rung_cold_demand: bool,
+    /// A cold backlog probes the widest decode rung after one penultimate sample instead of
+    /// four (`PLOW_RUNG_FAST_PROBE`): the rest of a fresh server's first burst no longer waits
+    /// out four decode-only ticks before it is admitted.
+    #[arg(long = "rung-fast-probe", env = "PLOW_RUNG_FAST_PROBE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub rung_fast_probe: bool,
 
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / observability (shared, off by default)
