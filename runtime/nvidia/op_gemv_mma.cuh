@@ -29,6 +29,15 @@
 #ifndef PLOW_NV_GEMV_MMA
 #define PLOW_NV_GEMV_MMA 0
 #endif
+/* A single-stream GEMV walks two row blocks per k-step (manifest-set, dense packets). h100-sxm5
+ * step_bench ms at B=1/4/16, Gemma-4-12B packet object: 10.99/11.70/14.25 -> 10.92/11.60/13.94 at
+ * ctx 1024, 11.10/12.22/16.32 -> 11.03/12.10/15.96 at ctx 8192. That entry sits at the
+ * 255-register cap (12 B of spills with the pair in); 18 registers under it the same change is
+ * worth 0.27 ms at every rung (10.91/11.61/13.97 -> 10.64/11.33/13.76). Off for the MoE 26B:
+ * 5.80/9.94/15.61 -> 5.83/10.15/15.69, its dense GEMVs are short walks. +14 KiB static smem. */
+#ifndef PLOW_NV_GEMV_MMA_PAIR
+#define PLOW_NV_GEMV_MMA_PAIR 0
+#endif
 /* k32 steps in flight per lane: UNB x (NW x 16 B) of weight loads before the first mma.
  * 12, measured on h100-sxm5 (step_bench ms at B=1/4/16): Gemma-4-12B 11.93/13.16/16.03 at 8,
  * 11.18/12.58/15.25 at 12, 11.52/12.93/15.77 at 16; 26B 5.79/10.06/15.89, 5.80/9.93/15.62,
@@ -183,6 +192,71 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
     const __nv_bfloat16* const W1[1] = {W};
     const unsigned per = r.rb1 - r.rb0;
     const unsigned nkb = K >> 5;
+#if PLOW_NV_GEMV_MMA_PAIR
+    /* TWO ROW BLOCKS PER K-STEP. A k-step's cost is mostly its round trip, not its bytes: the
+     * two-stream GLU step measured 1.56x a one-stream step while moving 2x the weights (GLU walks
+     * at ~3.2 TB/s, down / o_proj / lm_head at ~2.4). So a single-stream GEMV walks row blocks rb
+     * and rb+1 as two streams of one tile. The second stream of an odd tail re-reads the first's
+     * rows and is not stored. */
+    {
+        const unsigned ngrp = (per + 1u) >> 1;
+        unsigned gpow = 1u;
+        while (gpow < ngrp) gpow <<= 1;
+        /* Narrow N: the pairs of this block split K over S warps each, as the unpaired split-K
+         * below does per row block — taken only when S divides the k-steps, else that one runs. */
+        if (per != 0u && gpow <= PLOW_NV_WARPS / 2u && (nkb % (PLOW_NV_WARPS / gpow)) == 0u) {
+            __shared__ gvmma_red_t<MT> red2[2];
+            const unsigned S = PLOW_NV_WARPS / gpow;
+            const unsigned grp = warp / S, part = warp % S;
+            const unsigned rb = r.rb0 + 2u * grp;
+            const bool live = grp < ngrp;
+            const bool two = live && rb + 1u < r.rb1 && ((rb + 2u) << 3) <= N;
+            const __nv_bfloat16* const W2[2] = {W, two ? W + (size_t)8u * K : W};
+            float acc[2][MT][4];
+            const unsigned span = nkb / S;
+            gvmma_tile<2, MT, ONE>(acc, x, W2, live ? (rb << 3) : (r.rb0 << 3), rows, N, K,
+                                   part * span, (part + 1u) * span);
+            if (part != 0u) {
+#pragma unroll
+                for (int i = 0; i < 2; i++)
+#pragma unroll
+                    for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                        for (int j = 0; j < 4; j++)
+                            red2[i].v[warp - 1u - grp][lane][mt * 4 + j] = acc[i][mt][j];
+            }
+            __syncthreads();
+            if (part == 0u && live) {
+                for (unsigned q = 1u; q < S; q++) {
+                    const unsigned slot = (grp * S + q) - 1u - grp;
+#pragma unroll
+                    for (int i = 0; i < 2; i++)
+#pragma unroll
+                        for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                            for (int j = 0; j < 4; j++)
+                                acc[i][mt][j] += red2[i].v[slot][lane][mt * 4 + j];
+                }
+                gvmma_store_tile<BIAS, MT>(C, acc[0], rb << 3, rows, N, bias);
+                if (two) gvmma_store_tile<BIAS, MT>(C, acc[1], (rb + 1u) << 3, rows, N, bias);
+            }
+            __syncthreads(); /* red2 is reused by the next call on this block */
+            return;
+        }
+        /* Wide N: every warp has at least two row blocks of its own. */
+        if (per >= 2u * PLOW_NV_WARPS) {
+            for (unsigned rb = r.rb0 + 2u * warp; rb < r.rb1; rb += 2u * PLOW_NV_WARPS) {
+                const bool two = rb + 1u < r.rb1 && ((rb + 2u) << 3) <= N;
+                const __nv_bfloat16* const W2[2] = {W, two ? W + (size_t)8u * K : W};
+                float acc[2][MT][4];
+                gvmma_tile<2, MT, ONE>(acc, x, W2, rb << 3, rows, N, K);
+                gvmma_store_tile<BIAS, MT>(C, acc[0], rb << 3, rows, N, bias);
+                if (two) gvmma_store_tile<BIAS, MT>(C, acc[1], (rb + 1u) << 3, rows, N, bias);
+            }
+            return;
+        }
+    }
+#endif
     /* SPLIT-K. A narrow N (down: 3840 -> 480 row blocks over 132 blocks = 4 per block) leaves
      * half the warps idle and the walk at 1.4 TB/s vs 2.2-2.6 for wide shapes. When the block
      * has at most WARPS/2 row blocks, S = WARPS/next_pow2(per) warps share one row block and

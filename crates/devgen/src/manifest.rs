@@ -1033,6 +1033,9 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
         t.insert("xreg_k".into(), json!(s.decode_gemv_k.iter().collect::<Vec<_>>()));
         if s.moe_down_inter == 0 && s.decode_batch >= 2 && s.decode_gemv_k.iter().all(|k| k % 32 == 0) {
             t.insert("gemv_mma_b1".into(), json!(1));
+            // * `gemv_mma_pair`: its single-stream walks (down, o_proj, lm_head) take two row blocks
+            //   per k-step (op_gemv_mma.cuh): 12B B=1/4/16 10.99/11.70/14.25 -> 10.92/11.60/13.94.
+            t.insert("gemv_mma_pair".into(), json!(1));
         }
     }
     // * `fa_spart`: decode attention parks its score partials in smem (op_attention.cuh,
@@ -2719,6 +2722,9 @@ pub fn config_header(manifest: &Value) -> String {
             }
             if t.get("gemv_mma_b1").is_some() {
                 out.push_str("#ifndef PLOW_NV_GEMV_MMA_B1\n#define PLOW_NV_GEMV_MMA_B1 1\n#endif\n");
+            }
+            if t.get("gemv_mma_pair").is_some() {
+                out.push_str("#ifndef PLOW_NV_GEMV_MMA_PAIR\n#define PLOW_NV_GEMV_MMA_PAIR 1\n#endif\n");
             }
             if t.get("fa_tc_hd512").is_some() {
                 out.push_str(
