@@ -816,8 +816,10 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-attn-gemm-tile", env = "PLOW_PF_ATTN_GEMM_TILE", default_value_t = 2048, global = true)]
     pub pf_attn_gemm_tile: u32,
 
-    /// Smallest prefill bucket (rows) that `--pf-attn-gemm` routes. Below it the fused kernel
-    /// inside the segment graph beats three library launches (128-token cells +0.8-4 ms routed).
+    /// `--pf-attn-gemm` routes a bucket of at least this many rows, and a launch only when some
+    /// request in its pack has at least this many query rows; a pack of short slices keeps its
+    /// segment graph, which beats three library launches per request at short lengths
+    /// (128-token cells +0.8-4 ms at C1/C4 and +8% at C16 when routed).
     #[arg(long = "pf-attn-gemm-min-rows", env = "PLOW_PF_ATTN_GEMM_MIN_ROWS", default_value_t = 1024, global = true)]
     pub pf_attn_gemm_min_rows: u32,
 

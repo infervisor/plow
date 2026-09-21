@@ -8456,12 +8456,17 @@ impl GpuEngine {
             let rt = crate::config::RuntimeConfig::get();
             let seg_time_probe = rt.nv.pf_seg_time;
             let fat_only_probe = rt.nv.pf_seg_fatonly;
-            // The route's GEMM shapes follow each launch's KV lengths: not capturable.
+            // The route's GEMM shapes follow each launch's KV lengths: not capturable. A pack of
+            // short slices only keeps the graph: routing runs per request and costs the bucket its
+            // graph (16 x 129-row packs: 128/C16 TTFT +8%). One long slice pays for that; a short
+            // tail slice beside it costs three small launches.
+            let min_rows = rt.nv.pf_attn_gemm_min_rows;
             let routed = self.attention_gemm.is_some()
                 && self.prefill[bi]
                     .attention_gemm_segments
                     .iter()
-                    .any(Option::is_some);
+                    .any(Option::is_some)
+                && self.attention_requests.iter().any(|r| r[1] >= min_rows);
             if !seg_time_probe && !fat_only_probe && rt.nv.pf_seg_graph && !routed {
                 let key = (bi, arg.tensors as u64);
                 self.ensure_seg_graph(bi, &arg)?;
@@ -8507,7 +8512,8 @@ impl GpuEngine {
             let noncoop = rt.nv.pf_seg_noncoop;
             let mut evs: Vec<(usize, u8, CudaEvent, CudaEvent)> = Vec::new();
             for (seg, &cls) in seg_class.iter().enumerate() {
-                if let (Some(Some(site)), Some(route)) = (
+                if let (true, Some(Some(site)), Some(route)) = (
+                    routed,
                     self.prefill[bi].attention_gemm_segments.get(seg),
                     self.attention_gemm.as_mut(),
                 ) {
