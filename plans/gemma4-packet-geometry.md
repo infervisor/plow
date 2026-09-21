@@ -177,6 +177,8 @@ Commits on `agent/packet-geometry`:
   behaviour byte-identical (no packet today sets the knob below `PLOW_MAX_CHUNK`; it panicked).
 * recipe `scripts/campaign/recipes/gemma4-12b.h100.bf16-c32-req1k-16k.toml`: ladder16k + ladder
   to 32 + `PLOW_MAX_REQUEST_CHUNK=1024`, both profiles.
+* recipe `scripts/campaign/recipes/gemma4-26b-a4b.h100.bf16-c32-req1k-16k.toml`: the same lever on
+  the 26B (ctx16k + ladder to 32 + request 1024; 1.76 -> 0.59 GiB per slot). Unmeasured.
 
 Validation plan: (1) ring A/B on the c32c null (step_bench B=16, same tree/objects, chunk 2048 vs
 1024); (2) packet build after 16:45 UTC; (3) served `high_concurrency` (C16/C32) then `realtime`
@@ -184,4 +186,8 @@ Validation plan: (1) ring A/B on the c32c null (step_bench B=16, same tree/objec
 
 ### Results
 
-(filled in below as they land)
+* **Emit check (CPU, 15:09 UTC)**: the recipe's base packet emits with my plowc (`--emit devblob`):
+  prefill rungs `128 256 512 1024 1088 1152 2048 4096`, decode `1 2 4 8 16 32`; the packet's
+  LIVE-KV manifest carries 40 sliding caches at `stride 2048, window 1024` and 8 full caches at
+  `stride 16384`, packed-prefill `max_request_rows 1024`; the same `Manifest::validate` the runtime
+  runs at load passed at emit. Before the change this emit panicked at the ladder assert.
