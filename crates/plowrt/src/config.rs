@@ -846,7 +846,7 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-seg-v2", env = "PLOW_PF_SEG_V2", global = true)]
     pub pf_seg_v2: Option<String>,
 
-    /// Vendor-GEMM attention for the one-KV-head full-attention prefill segments: cuBLASLt
+    /// Vendor-GEMM attention for the full-attention prefill segments: cuBLASLt
     /// `Q.K^T` and `P.V` around `attn_softmax_sm90a.cubin` (looked up in `--pf-seg-dir`, then the
     /// asset dir). Those buckets run the per-segment launch loop, not the segment graph.
     #[arg(long = "pf-attn-gemm", env = "PLOW_PF_ATTN_GEMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
