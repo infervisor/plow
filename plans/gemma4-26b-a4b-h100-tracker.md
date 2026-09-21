@@ -1377,26 +1377,34 @@ Ladder on `p26g` (UNB 12 + NS_GRID): 6 of 60; C1 TPOT 5.65-6.07 vs 5.03-5.09, C4
 
 | step | state |
 |---|---|
-| 26B + 12B serve on H100 from the merged tree | **done** (12B needed the chunk-4096 recipe, the NO_GLU_FUSE fix, NRN fold off) |
+| 26B + 12B serve on H100 from the merged tree | **done** (12B: chunk-4096 recipe, NO_GLU_FUSE fix, NRN fold off — analysed in the 12B tracker: its arms run the staged dot8 GEMV, a loss here even once correct) |
 | vLLM 0.28 reference ladder, both models | **done** — in 128..15000 x C1/4/16/32 |
-| Common ladder, both models | **done** — ledgers `*-ctx16k.csv`, `*-ladder16k.csv`; `ladder_compare.py` |
-| Beat vLLM, 26B | **PARTIAL 7/60** — TTFT at 128 and 1024 (C1), 128 (C4), 128/1024/4096 (C16), 128 (C32, 32-slot packet) |
-| Beat vLLM, 12B | **PARTIAL 14/60** (serving packet by input length) — every TTFT cell except 1024..15000 at C1, 1024/15000 at C4 and the >= 4096 C32 cells; TPOT 1.04–1.11x at C1 |
-| Decode batch scaling | B=16 step 28.05 -> 15.88 ms (26B), 23.35 -> 16.05 (12B); still 1.7–2.0x vLLM at C16 |
-| C32 | queues on 16 slots (sliding ring = pow2(window + chunk - 1) rows per slot) — not started |
+| Common ladder, both models | **done** — ledgers `*-ctx16k.csv`, `*-ladder16k.csv`, `*-c32-16k.csv`; `ladder_compare.py` |
+| Beat vLLM, 26B (`p26i`, 655e4a72) | **PARTIAL 6/60** (7 with the 32-slot packet at 128/C32): TTFT at 128/1024 (C1), 128 (C4), 128/1024/4096 (C16). TPOT C1 5.60-5.98 vs 5.03-5.09 (1.11-1.19x), C4 1.29-1.74x, C16 1.69-2.00x |
+| Beat vLLM, 12B (`p12m`, d4258ab0) | **PARTIAL 12/60** (15 with the 32-slot packet for <= 1024 at C16/C32). TPOT C1 10.85-11.25 vs 10.55-10.64 (1.03-1.06x), C4 1.06-1.36x, C16 1.14-1.54x; 1024/C1 TTFT 46.7 = 46.7 |
+| Decode batch scaling | step_bench B=1/2/4/8/16: 26B 5.71/7.57/9.55/12.69/15.29 (night before: 6.01/8.37/11.16/16.69/28.05), 12B 10.97/11.35/11.70/12.52/14.27 (14.46/13.55/15.80/17.24/23.35) |
+| C32 | 32-slot packets need chunk 1024 (sliding ring = pow2(window + chunk - 1) rows per slot): they win the <= 1024 TTFT cells and lose the long-input ones |
 
 ## Next actions, in order
 
-1. **Prefill chunk time at 4096 rows** (26B ~120–140 ms, 12B ~186 ms; vLLM ~90 / ~170 per 4k).
-   It owns TTFT at >= 4096 (1.3–1.5x) AND the long-input TPOT at C4/C16, which is prefill
-   stall: decode rows already ride in the prefill launch, one token per ~140 ms tick.
-2. Decode at B=4..16: the MoE part is near its byte roof; attention is ~2.4x and the dense
-   GEMVs ~4x off theirs (per-op latency: K/32 k-steps at 8 loads in flight). Sweep in flight:
-   `PLOW_NV_GEMV_MMA_UNB` 12/16.
-3. Per-rung decode objects under multistep: B=1 wants the xreg kernels, B>=2 wants an entry
-   without them (0.3–0.7 ms per step at B>=2).
-4. C32: chunk-local KV scratch so a slot's sliding ring is the window only (32+ slots at 16k).
-5. 12B: root-cause the BF16 NRN fold (`c1f1ac38`) — 96 fewer serial packets per token.
+1. **12B tight BOS rungs** (in flight): cuBLAS is cheap right next to a power of two (12B layer
+   GEMMs m=1024 610 us, 1025/1026 640, 1088 733; m=4096 2532, 4097-4104 2555, 4160 2873), so the
+   1088 / 4160 rungs cost ~4 ms at 1024 in and ~15 ms per 4k chunk. Expected to flip 12B 4096/C1
+   TTFT (176.5 vs 170.2) and make 1024/C1 robust. 26B dense GEMMs are small (-1.4 ms per chunk).
+2. **Prefill, 26B**: MoE segment is 59% of a 4096 chunk (2.05 ms/layer); the measured lever is the
+   vendor grouped GEMM (~-18 ms/chunk; needs a cuBLAS grouped binding + one host sync per layer).
+   **Prefill, 12B long context**: the hd512 global attention role is ~400 of the 830 ms 15000/C1
+   TTFT; a cuBLASLt attention role is sized in the 12B tracker (batched GEMM FFI missing).
+3. **26B decode, B=16** (trace, 15.56 ms): grouped expert GLU 22.5% body + 11.5% gate wait at the
+   next op — ~60 live experts become 180 (m-tile, n-tile) items on 132 blocks, so some blocks run
+   two; FlashDecode 16%; dense GEMVs 16%. The smem claim is a tax on this packet (~1 ms per 64 KiB
+   at B=16, 0.65 at B=4) but the 2-deep staging ring is worth more than it costs.
+4. C1 TPOT, both: the remaining narrow-op fixed costs (12B: NRN 0.57 ms = global loads/stores,
+   FlashDecode fixed 0.43, FlashMerge 0.28, skeleton 0.74; 26B: MoE op fixed costs ~1.2 ms/step).
+   Per-rung decode objects (B=1 vs B>=2 entries) are refused under multistep AND cuBLASLt by
+   `decode_object::check_options` — a supported-envelope guard, not touched.
+5. Scheduler option, not built: a prefill pack-size cap would lower MEAN TTFT at C4 (1024/C4 12B
+   174 vs vLLM 128: vLLM staggers, plow packs 4x1025 rows into one launch) at the cost of TPOT.
 
 ## Protocol
 
