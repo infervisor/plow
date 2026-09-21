@@ -39,6 +39,12 @@ python3 scripts/campaign/campaign.py ledger  /nvme/run/<id>/c1/results.csv --cel
    `(arch, dtype, M, N, K, head geometry, KV bucket)` through tunedb, never by a
    model name or a literal `hidden == N`. A new variant re-tunes by running the
    campaign, not by editing the emitter.
+8. **Memory is a column.** Both bench scripts sample the server's process tree with
+   `nvidia-smi` (`MEM_SAMPLE_MS`, default 1000, `0` = off) and `bench` writes the per-cell peak
+   as `peak_mem_mib` in `results.csv` and the ledger (a ledger from before the column is widened
+   in place). Both engines preallocate weights + KV pools, so the number is the configured
+   footprint plus transient workspace: compare it at equal `max_ctx` / slot count, and quote the
+   KV budget beside it.
 
 ## Profiles: realtime and throughput are both first-class
 

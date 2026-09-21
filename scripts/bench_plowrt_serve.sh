@@ -23,6 +23,8 @@
 #   OUTDIR   raw client logs and JSON results (default /tmp/plowrt_bench_<port>)
 #   GATE_PROMPT  raw-completion coherence prompt, including any required special tokens
 #   SERVE_EXTRA_ARGS  additional plowrt serve arguments (for example queue capacity)
+#   MEM_SAMPLE_MS  GPU memory sampling period per cell, printed as `peak_mem_mib,<in>,<c>,<MiB>`
+#                  lines (default 1000; 0 = off)
 set -euo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ASSETS="${1:?assets}"; PORT="${2:?port}"; MODEL="${3:?model}"; TOKZ="${4:?tokenizer}"
@@ -87,6 +89,7 @@ setsid nix develop -c "$PLOWRT_BIN" serve --assets "$ASSETS" --port "$PORT" "${S
   >"$LOG" 2>&1 &
 SRV=$!
 cleanup() {
+  [ -z "${mempid:-}" ] || kill "$mempid" 2>/dev/null || true
   # Whole process group — see the header.
   kill -TERM -"$SRV" 2>/dev/null || kill -TERM "$SRV" 2>/dev/null || true
   sleep 2
@@ -160,6 +163,14 @@ for L in $IN_LENS; do
     WARM="${BENCH_EXTRA_ARGS:-}"; [ -n "$NW" ] && WARM="--num-warmups $NW"
     read -r -a WARM_ARGS <<< "$WARM"
     blog="$OUTDIR/in${L}_c${C}.log"
+    # Peak GPU memory of the server's processes over this cell (NVIDIA only). Both engines
+    # preallocate their pools, so this is the configured footprint plus any transient workspace.
+    memlog="$OUTDIR/in${L}_c${C}.mem"; mempid=
+    if [ "${MEM_SAMPLE_MS:-1000}" != 0 ] && command -v nvidia-smi >/dev/null 2>&1; then
+      nvidia-smi --query-compute-apps=timestamp,pid,used_memory --format=csv,noheader,nounits \
+        -lms "${MEM_SAMPLE_MS:-1000}" > "$memlog" 2>/dev/null &
+      mempid=$!
+    fi
     "${CLIENT[@]}" \
       bench serve --backend "$BENCH_BACKEND" \
       --base-url "http://127.0.0.1:$PORT" --endpoint "$ENDPOINT" \
@@ -169,6 +180,14 @@ for L in $IN_LENS; do
       --max-concurrency "$C" --num-prompts "$NP" "${WARM_ARGS[@]}" \
       --save-result --save-detailed --result-dir "$RESULT_DIR" --result-filename "in${L}_c${C}.json" \
       > "$blog" 2>&1
+    if [ -n "$mempid" ]; then
+      kill "$mempid" 2>/dev/null || true; wait "$mempid" 2>/dev/null || true; mempid=
+      # The server was `setsid`'d: its session is exactly its process tree.
+      # shellcheck disable=SC2046
+      peak="$(python3 "$WT/scripts/bench/gpu_peak_mem.py" "$memlog" $(ps -o pid= -s "$SRV") || true)"
+      # Its own line, not a 14th column: other sweeps parse the 13-column row.
+      if [ -n "$peak" ]; then echo "peak_mem_mib,$L,$C,$peak"; fi
+    fi
     python3 - "$L" "$C" "$blog" "$NP" "$OUTLEN" <<'PY'
 import math,re,sys
 L,C,p,expected,outlen=int(sys.argv[1]),int(sys.argv[2]),sys.argv[3],int(sys.argv[4]),int(sys.argv[5])

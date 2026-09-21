@@ -14,11 +14,13 @@
 #   MAXSEQS       vLLM --max-num-seqs (default: max CONCS)
 #   VLLM_VENV     default /opt/pytorch
 #   OUTDIR        raw client logs + JSON (default /tmp/vllm_bench_<port>)
+#   MEM_SAMPLE_MS GPU memory sampling period per cell, as in bench_plowrt_serve.sh (default 1000; 0 = off)
 #
 # Prefix caching is DISABLED. vllm-bench's random prompts share a leading prefix, so a
 # cache-on server silently benches cache-hit suffixes; the plow side sets
 # PLOW_PREFIX_CACHE=0 for the same reason. Both halves must agree or the comparison is void.
 set -euo pipefail
+WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL_DIR="${1:?model-dir}"; PORT="${2:-8600}"; READY="${3:-1800}"
 IN_LENS="${IN_LENS:-1024}"; CONCS="${CONCS:-1}"; NPROMPT="${NPROMPT:-32}"
 OUTLEN="${OUTLEN:-128}"
@@ -43,7 +45,7 @@ setsid "$VLLM" serve "$MODEL_DIR" \
   --no-enable-prefix-caching \
   ${VLLM_SERVE_EXTRA_ARGS:-} > "$OUTDIR/server.log" 2>&1 &
 SRV=$!
-cleanup () { kill -TERM -"$SRV" 2>/dev/null || true; sleep 5; kill -KILL -"$SRV" 2>/dev/null || true; }
+cleanup () { [ -z "${mempid:-}" ] || kill "$mempid" 2>/dev/null || true; kill -TERM -"$SRV" 2>/dev/null || true; sleep 5; kill -KILL -"$SRV" 2>/dev/null || true; }
 trap cleanup EXIT
 
 t=0
@@ -59,6 +61,14 @@ echo "input_len,concurrency,ttft_ms,ttft_med,tpot_ms,tpot_med,itl_ms,itl_med,itl
 for L in $IN_LENS; do
   for C in $CONCS; do
     blog="$OUTDIR/in${L}_c${C}.log"
+    # Peak GPU memory of the server's processes over this cell (NVIDIA only). Both engines
+    # preallocate their pools, so this is the configured footprint plus any transient workspace.
+    memlog="$OUTDIR/in${L}_c${C}.mem"; mempid=
+    if [ "${MEM_SAMPLE_MS:-1000}" != 0 ] && command -v nvidia-smi >/dev/null 2>&1; then
+      nvidia-smi --query-compute-apps=timestamp,pid,used_memory --format=csv,noheader,nounits \
+        -lms "${MEM_SAMPLE_MS:-1000}" > "$memlog" 2>/dev/null &
+      mempid=$!
+    fi
     "$VLLM" bench serve --backend "$BENCH_BACKEND" \
       --base-url "http://127.0.0.1:$PORT" --endpoint "$ENDPOINT" \
       --model "$MODEL_DIR" --tokenizer "$MODEL_DIR" \
@@ -67,6 +77,14 @@ for L in $IN_LENS; do
       --max-concurrency "$C" --num-prompts "$NPROMPT" ${BENCH_EXTRA_ARGS:-} \
       --save-result --save-detailed --result-dir "$RESULT_DIR" --result-filename "in${L}_c${C}.json" \
       > "$blog" 2>&1 || true
+    if [ -n "$mempid" ]; then
+      kill "$mempid" 2>/dev/null || true; wait "$mempid" 2>/dev/null || true; mempid=
+      # The server was `setsid`'d: its session is exactly its process tree.
+      # shellcheck disable=SC2046
+      peak="$(python3 "$WT/scripts/bench/gpu_peak_mem.py" "$memlog" $(ps -o pid= -s "$SRV") || true)"
+      # Its own line, not a 14th column: other sweeps parse the 13-column row.
+      if [ -n "$peak" ]; then echo "peak_mem_mib,$L,$C,$peak"; fi
+    fi
     python3 - "$L" "$C" "$blog" <<'PY'
 import math, re, sys
 L, C, p = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]

@@ -42,6 +42,9 @@ CSV_HEADER = (
     "input_len,concurrency,ttft_ms,ttft_med,tpot_ms,tpot_med,itl_ms,itl_med,itl_p99,"
     "out_tok_s,req_per_s,ok_reqs,gen_toks"
 )
+# Appended by `bench` from the bench script's `peak_mem_mib,<in>,<c>,<MiB>` lines; empty when the
+# cell was not sampled (no nvidia-smi, or a results.csv from before the column existed).
+MEM_COL = "peak_mem_mib"
 
 
 def die(msg: str) -> None:
@@ -279,8 +282,14 @@ def cmd_bench(a: argparse.Namespace) -> None:
     log.write_bytes(b"")
     rc = run(cmd, dict(os.environ), log)
     text = log.read_text(errors="replace")
+    peak = {}
+    for ln in text.splitlines():
+        f = ln.split(",")
+        if f[0] == MEM_COL and len(f) == 4:
+            peak[(f[1], f[2])] = f[3]
     rows = [ln for ln in text.splitlines() if ln[:1].isdigit() and ln.count(",") == 12]
-    (out / "results.csv").write_text(CSV_HEADER + "\n" + "\n".join(rows) + ("\n" if rows else ""))
+    rows = [ln + "," + peak.get(tuple(ln.split(",")[:2]), "") for ln in rows]
+    (out / "results.csv").write_text(f"{CSV_HEADER},{MEM_COL}\n" + "\n".join(rows) + ("\n" if rows else ""))
     rec = {
         "recipe": str(Path(a.recipe).resolve()),
         "cell": cell,
@@ -305,7 +314,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "bench_rc": rc,
     }
     (out / "run-record.json").write_text(json.dumps(rec, indent=1))
-    print(CSV_HEADER)
+    print(f"{CSV_HEADER},{MEM_COL}")
     print("\n".join(rows))
     if not rec["gate"]:
         die("coherence gate did not pass; numbers above are not evidence")
@@ -698,14 +707,22 @@ def cmd_ledger(a: argparse.Namespace) -> None:
         die("run did not pass the coherence gate")
     ledger = REPO / "perf-data" / "campaign" / f"{a.cell}.csv"
     ledger.parent.mkdir(parents=True, exist_ok=True)
+    cols = [*CSV_HEADER.split(","), MEM_COL]
     new = not ledger.exists()
+    if not new:
+        # A ledger from before the memory column: widen it in place, old rows get an empty field.
+        with open(ledger, newline="") as f:
+            old_rows = list(csv.reader(f))
+        if old_rows and MEM_COL not in old_rows[0]:
+            with open(ledger, "w", newline="") as f:
+                csv.writer(f).writerows([old_rows[0] + [MEM_COL], *[r + [""] for r in old_rows[1:]]])
     with open(ledger, "a", newline="") as f:
         w = csv.writer(f)
         if new:
-            w.writerow(["utc", "commit", "label", "provisional", "pkt_sha", "note", *CSV_HEADER.split(",")])
+            w.writerow(["utc", "commit", "label", "provisional", "pkt_sha", "note", *cols])
         for row in read_rows(res).values():
             w.writerow([rec["utc"], rec["commit"][:12], rec["label"], int(bool(rec.get("contended"))),
-                        rec["hashes"].get("model.pkt", "")[:16], a.note, *[row[c] for c in CSV_HEADER.split(",")]])
+                        rec["hashes"].get("model.pkt", "")[:16], a.note, *[row.get(c) or "" for c in cols]])
     print(f"appended {len(read_rows(res))} row(s) to {ledger}")
 
 
