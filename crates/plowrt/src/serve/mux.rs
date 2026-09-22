@@ -605,6 +605,7 @@ pub fn spawn(
 
     let dispatcher = async move {
         let mut slots: Vec<Option<Slot>> = (0..capacity).map(|_| None).collect();
+        let mut freed_last_tick = false;
         let mut load = LoadEstimator::default();
         let mut host_window = crate::obs::host::Window::default();
         let mut host_last_return: Option<Instant> = None;
@@ -996,8 +997,23 @@ pub fn spawn(
                 let cuda_quantum = crate::config::RuntimeConfig::get().multistep();
                 #[cfg(not(feature = "cuda"))]
                 let cuda_quantum = 0;
+                #[cfg(feature = "cuda")]
+                let adaptive = crate::config::RuntimeConfig::get().nv.multistep_adaptive;
+                #[cfg(not(feature = "cuda"))]
+                let adaptive = false;
 
-                if cuda_quantum > 1 {
+                if cuda_quantum > 1
+                    && adaptive
+                    && (freed_last_tick
+                        || !waiting.is_empty()
+                        || slots.iter().flatten().any(|s| s.step == 0))
+                {
+                    // PLOW_MULTISTEP_ADAPTIVE: prefill is pending, so the next chunk must not
+                    // wait behind a K-step quantum. A slot freed last tick counts: its
+                    // successor is usually a round trip away, and a K-step quantum here lets
+                    // the next completion land in the same wave (two prefills back to back).
+                    1
+                } else if cuda_quantum > 1 {
                     cuda_quantum.max(MultiStep::for_batch(live as i64).steps)
                 } else {
                     MultiStep::for_batch(live as i64).steps
@@ -1136,6 +1152,7 @@ pub fn spawn(
                     } else if rung_controller.is_some() {
                         metrics.decode_rung_actual.store(0, Ordering::Relaxed);
                     }
+                    freed_last_tick = returned_slots.iter().flatten().count() < live;
                     slots = returned_slots;
                     if let Some(b) = returned_bufs {
                         bufs_cache.insert(b.key, b);

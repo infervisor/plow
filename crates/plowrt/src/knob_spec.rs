@@ -387,6 +387,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_packlog", Some("PLOW_PF_PACKLOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.load_profile", Some("PLOW_LOAD_PROFILE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.multistep", Some("PLOW_MULTISTEP"), Layer::Runtime, U32, Default::Static(Val::Nat(8)), OPT_IN),
+    KnobSpec::new("rt.multistep_adaptive", Some("PLOW_MULTISTEP_ADAPTIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.vmm_prefix", Some("PLOW_VMM_PREFIX"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_live", Some("PLOW_VMM_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.vmm_live_rings", Some("PLOW_VMM_LIVE_RINGS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
