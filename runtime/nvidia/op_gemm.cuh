@@ -181,7 +181,7 @@ __device__ __forceinline__ void gemv_rows(__nv_bfloat16* __restrict__ C,
      * the 1 KiB device stack (ILLEGAL_ADDRESS) as soon as the entry frame grew past ~670 B. */
     if constexpr (TC && (MM >= 2 || PLOW_NV_GEMV_MMA_B1)) {
         if ((K & 31u) == 0u) {
-            gemv_rows_mma<BIAS, (MM + 15) / 16, (MM == 1)>(C, x, W, M, N, K, slice, nblk, bias);
+            gemv_rows_mma<BIAS, (MM + 15) / 16, (MM <= 8)>(C, x, W, M, N, K, slice, nblk, bias);
         } else {
             gemv_rows_dot4<BIAS>(C, x, W, M, N, K, slice, nblk, bias);
         }
@@ -880,7 +880,7 @@ __device__ __forceinline__ void gemv_qkv_rows(__nv_bfloat16* Cq, __nv_bfloat16* 
 #if PLOW_NV_GEMV_MMA
     if constexpr (TC && (MM >= 2 || PLOW_NV_GEMV_MMA_B1)) {
         if ((K & 31u) == 0u && ((Nq | Nk) & 7u) == 0u) {
-            gemv_qkv_rows_mma<BIAS, (MM + 15) / 16, (MM == 1)>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, slice, nblk, bq, bk, bv);
+            gemv_qkv_rows_mma<BIAS, (MM + 15) / 16, (MM <= 8)>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, slice, nblk, bq, bk, bv);
         } else {
             gemv_qkv_rows_dot4<BIAS>(Cq, Ck, Cv, x, Wq, Wk, Wv, M, Nq, Nk, Nv, K, slice, nblk,
                                      bq, bk, bv);
@@ -2668,7 +2668,7 @@ __device__ __forceinline__ void gemv_glu_rows(__nv_bfloat16* C, const __nv_bfloa
 #if PLOW_NV_GEMV_MMA
     if constexpr (TC && (MM >= 2 || PLOW_NV_GEMV_MMA_B1)) {
         if ((K & 31u) == 0u) {
-            gemv_glu_rows_mma<(MM + 15) / 16, (MM == 1)>(C, x, Wg, Wu, M, N, K, act, slice, nblk);
+            gemv_glu_rows_mma<(MM + 15) / 16, (MM <= 8)>(C, x, Wg, Wu, M, N, K, act, slice, nblk);
         } else {
             gemv_glu_rows_dot4(C, x, Wg, Wu, M, N, K, act, slice, nblk);
         }

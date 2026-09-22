@@ -61,9 +61,9 @@ __device__ __forceinline__ void gvmma_mma16816(float (&d)[4], unsigned a0, unsig
 /* acc[i][mt] is the mma C fragment of x[16mt..16mt+16) x W[i][nb..nb+8)^T: lane (g,t) holds
  * C[g][2t], C[g][2t+1], C[g+8][2t], C[g+8][2t+1]. MT m-tiles share one weight pass, so a 32- or
  * 64-row rung still streams the weights once. */
-/* ONE: the caller has exactly one activation row (the B=1 rung of a dense packet). Rows 0-7 and
- * 8-15 of the mma then clamp to the same row 0, so the second activation load of every k-step
- * is a duplicate: a third of the single-stream walk's loads. */
+/* ONE: the caller has at most 8 activation rows (rungs 1-8). Rows 8-15 of the mma are then never
+ * stored, so the second activation load of every k-step can alias the first: a third of the
+ * walk's loads. */
 template <int NW, int MT, bool ONE = false>
 __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_bfloat16* __restrict__ x,
                                            const __nv_bfloat16* const (&W)[NW], unsigned nb,
