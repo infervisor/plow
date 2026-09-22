@@ -240,6 +240,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
     overrides = dict(kv.split("=", 1) for kv in (a.env or []))
     env.update(overrides)
     packet_env(r, assets, env)
+    lt_table = assets / "cublaslt_algos.jsonl"
     env.update({
         "VLLM_VENV": bench.get("vllm_venv", "/opt/pytorch"),
         "HF_HOME": str(out / "hf-home"),
