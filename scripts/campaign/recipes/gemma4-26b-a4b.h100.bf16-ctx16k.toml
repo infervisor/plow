@@ -134,6 +134,9 @@ PLOW_PF_INTERLEAVE = "0"
 # 46.0 -> 43.7 ms at 1k, 131.6 -> 122.4 at 4k.
 PLOW_ENCODE_THREADS = "16"
 PLOW_ENCODE_SPLIT_MIN = "512"
+# Dispatcher on its own thread, tick inline (0b88ef14): engine handoff 50-87 -> 0.3 us per tick;
+# 26B 128/C1 TPOT 5.66 -> 5.61 ms, C16 15.53 -> 15.42 ms, TTFT unchanged.
+PLOW_MUX_INLINE_TICK = "1"
 PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
 LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
 
