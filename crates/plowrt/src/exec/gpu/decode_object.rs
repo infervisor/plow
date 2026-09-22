@@ -466,7 +466,11 @@ mod tests {
             assert!(initial_grid(Some(&metadata), 7, sms, occ).is_err());
         }
         assert_eq!(initial_grid(None, 7, 7, 1).unwrap(), 7);
-        assert!(initial_grid(None, 7, 7, 2).is_err());
+        // An occupancy-2 interpreter runs a packet emitted at n_cu = SMs on the packet grid.
+        assert_eq!(initial_grid(None, 7, 7, 2).unwrap(), 7);
+        for (packet_grid, occ) in [(7, 3), (14, 1), (7, 4)] {
+            assert!(initial_grid(None, packet_grid, 7, occ).is_err());
+        }
     }
     #[test]
     fn incompatible_launch_modes_are_rejected() {
