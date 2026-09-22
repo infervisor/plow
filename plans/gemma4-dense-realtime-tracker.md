@@ -1392,3 +1392,61 @@ agents), T1 emit byte-identity + checkpoint S, T2 numerics, T3 rung, T4 served,
 * C32 on the request-sliced packet p12rq4: TTFT 146.75/597.10/2082.35/4215.96/8154.66 ms.
 * Cache-on (prefix_repetition): C4 128.1 vs 120.8 ms, C16 297.6 vs 282.6 ms; peak 71.8-72.0 vs 73.5-73.9.
 * `PLOW_FA_MMAQK=3` promoted to a GEMMA4_HOPPER emit default; recipes no longer name it.
+
+### Scheduler anatomy vs vLLM 0.28, and the streaming quantum (2026-09-22)
+
+vLLM's V1 scheduler (`v1/core/sched/scheduler.py`, the reference config's own log): one forward per
+step over a flat token budget `max_num_batched_tokens=8192` (H100 default), `max_num_seqs=32`;
+running requests first (a decode row costs 1 token, a partly prefilled prompt continues its chunk),
+then waiting prompts FCFS, the last one cut to fill the budget (`long_prefill_token_threshold=0`, no
+per-request cap). Async scheduling is on: step n+1's input ids are copied on the GPU from step n's
+`prev_sampled_token_ids`, step n's ids go D2H on a side stream behind an event, and the CPU schedules
+and detokenizes step n while the GPU runs n+1 — a one-step lookahead, every token streamed.
+
+plow: one tick = decode feeds -> batched prefill pass -> decode launch. The unified token batch rides
+decode rows inside the prefill launch (vLLM's mixed step). The launch budget is the packet's widest
+prefill rung (4224 rows here; `PLOW_MAX_CHUNK=4096`), not 8192, because the sliding ring is
+`next_pow2(window + chunk - 1)` rows per slot. Realtime packs oldest-first (`PF_INTERLEAVE_ADAPTIVE`),
+high_concurrency fills FCFS.
+
+Per-request ITL traces, e2e3 vs the vLLM reference (a stall = ITL > 60 ms):
+
+| cell | stack | stalls/req | ms per stall | stall ms/req | ITL outside stalls | wave spread |
+|---|---|---:|---:|---:|---:|---:|
+| 4096/C4 | plow | 2.16 | 175 | 378 | 10.95 | 315 ms |
+| | vLLM | 0.75 | 203 | 152 | 10.93 | 19 ms |
+| 15000/C4 | plow | 7.69 | 191 | 1471 | 11.34 | 1271 ms |
+| | vLLM | 3.00 | 304 | 912 | 11.15 | 72 ms |
+| 4096/C16 | plow | 12.4 | 186 | 2304 | 13.32 | 1957 ms |
+| | vLLM | 4.97 | 268 | 1333 | 12.72 | 1079 ms |
+| 15000/C16 | plow | 46.7 | 205 | 9556 | 14.87 | 8221 ms |
+| | vLLM | 21.1 | 340 | 7185 | 13.52 | 6027 ms |
+
+Decode itself is level at C4 and 3-10 % behind at C16; the long-input TPOT gap is stall time. plow
+takes 2-3x more stalls (4096-row cap vs an 8192-token budget) and oldest-first packing staggers each
+wave, so prefill keeps landing on running decoders; vLLM's FCFS fill prefills a wave together, which
+puts the same time in TTFT instead. **A scheduler only moves time between TTFT and TPOT**: mean E2E =
+TTFT + 127 x TPOT exactly at 128 out, and plow's E2E ratio to vLLM is C1 0.99-1.04, C4 1.00-1.08, C16
+1.05-1.12 — the same deficit its output tok/s shows. Winning both metrics at a cell needs E2E, i.e.
+per-row prefill cost in mixed launches (45-50 vs 33-42 us/row at C16) and the batched decode step.
+
+**Arms on p12r4, one session, same binary** (TTFT / TPOT / p99 ITL, ms):
+
+| cell | ctl (MULTISTEP 4, adaptive) | MULTISTEP 0 | MULTISTEP 0 + FCFS | vLLM 0.28 |
+|---|---|---|---|---|
+| 128/C1 | 18.3 / 10.42 / 41.8 | 18.3 / 10.45 / 10.5 | 18.2 / 10.45 / 10.5 | 30.0 / 10.46 / 11.3 |
+| 4096/C1 | 169.6 / 10.53 / 42.3 | 169.8 / 10.56 / 10.8 | 169.8 / 10.56 / 10.8 | 170.1 / 10.55 / 11.4 |
+| 15000/C1 | 736.1 / 10.63 / 42.7 | 736.4 / 10.65 / 10.8 | 736.8 / 10.65 / 10.8 | 671.8 / 10.56 / 11.5 |
+| 128/C4 | 34.4 / 10.58 / 42.4 | 39.1 / 10.66 / 13.9 | 34.2 / 10.60 / 10.9 | 55.3 / 10.49 / 11.3 |
+| 1024/C4 | 101.4 / 11.61 / 53.7 | 101.6 / 11.63 / 53.5 | 123.3 / 11.46 / 53.2 | 129.6 / 11.07 / 11.8 |
+| 8192/C4 | 701.3 / 17.18 / 190.0 | 566.2 / 18.03 / 187.9 | 567.5 / 18.04 / 187.3 | 995.8 / 13.53 / 13.6 |
+| 15000/C4 | 1437.8 / 22.29 / 210.5 | 1041.6 / 26.53 / 211.7 | 1042.3 / 26.54 / 211.9 | 1665.4 / 18.06 / 326.0 |
+
+* Per-token streaming costs 0.03 ms/token at C1 and cuts p99 ITL 4x, to **below vLLM on both TPOT and
+  p99 ITL at every C1 rung**. The realtime profile should serve `PLOW_MULTISTEP=0`.
+* At C4 the quantum was delaying prefill: TTFT -20 to -28 % at 8192/15000 in, TPOT +5 to +19 %, E2E
+  4269 -> 4411 at 15000. A shift, not a win — the pipeline (below) is what should recover the TPOT.
+* vLLM-style FCFS filling is a wash at a 4096-row budget: identical everywhere but 1024/C4 (adaptive
+  keeps TTFT 101 vs 123 ms for +0.17 ms TPOT) and 128/C4 (FCFS 34.2 vs 39.1 ms TTFT).
+* Next: `PLOW_DECODE_PIPELINE` (lookahead-1, per-token streaming, device-resident inputs) and an
+  8192-row launch rung with `PLOW_MAX_REQUEST_CHUNK=4224` so the sliding ring stays at 8192 rows.
