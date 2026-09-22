@@ -35,6 +35,8 @@ precision = "bf16"
 [emit]
 args = ["--segmented"]
 [emit.env]
+# The HD256-GQA2 / HD512 prefill role objects bind the TMA map; opt-in (its P certificate was rejected).
+PLOW_TMA_GEMM = "1"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
 # Rungs of >= 8 rows sort their B*k slots by expert and run the routed experts through the
 # grouped tensor-core GEMMs (step_bench ms/step at B=8/16: 16.3 -> 14.3, 27.0 -> 18.0).

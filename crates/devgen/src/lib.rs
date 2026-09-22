@@ -7568,7 +7568,6 @@ fn apply_production_defaults(
     // (sliding hd256 + full hd512) on sm_90a TP1. Each stays an explicit rollback.
     if bf16 && capabilities.gemma && capabilities.full_attn_hd512 && arch == "sm_90a" && tp == 1 {
         let mut flags = vec![
-            (&mut cfg.tma_gemm, "tma_gemm"),
             (&mut cfg.sliding_ns_grid, "sliding_ns_grid"),
             (&mut cfg.sliding_ns_cap, "sliding_ns_cap"),
         ];

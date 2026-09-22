@@ -38,7 +38,7 @@ max_ctx = 16384
 precision = "bf16"
 
 # Production defaults for BF16 Gemma-4 on sm_90a TP1 (knob_spec GEMMA4_HOPPER, LT_GLU_TARGET):
-# pure-GEMM segments + TMA maps, cuBLASLt gate/up, hd512 / HD256-GQA2 attention segments,
+# pure-GEMM segments, cuBLASLt gate/up, hd512 / HD256-GQA2 attention segments,
 # sliding decode nsplit cap + grid floor, full-attention decode GF 4, and (moe) the grouped expert
 # GEMMs on cuBLASLt: MOE_PREFILL_CUBLASLT segments, and MOE_DECODE_CUBLASLT on rungs of >= 4 rows
 # (PLOW_GEMMA_MOE_DEC_GROUP 4), which plowrt serves by default. Only geometry and per-model tuning
@@ -46,6 +46,8 @@ precision = "bf16"
 [emit]
 args = ["--segmented"]
 [emit.env]
+# The HD256-GQA2 / HD512 prefill role objects bind the TMA map; opt-in (its P certificate was rejected).
+PLOW_TMA_GEMM = "1"
 # The ladder is deployment geometry: unset, plowc sizes the rungs to full-context memory, which
 # stops at 8 on the 26B-A4B.
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"

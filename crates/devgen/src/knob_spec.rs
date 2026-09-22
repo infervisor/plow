@@ -310,15 +310,6 @@ const GEMMA4_RECIPE: &[&str] = &[
 const GEMMA4_RECIPE_QUALIFIED: Status = Status::Qualified {
     evidence: GEMMA4_RECIPE,
 };
-/// TMA maps are what lets a pure-GEMM segment reach the lean sm_90a GEMM object at all: class 8
-/// admits only mapped GEMMs (devbuild.rs T37).
-const TMA_GEMM_QUALIFIED: Status = Status::Qualified {
-    evidence: &[
-        "crates/packet/src/devbuild.rs T37: pure-GEMM mode 1 classes only TMA-mapped GEMMs as GEMM-class; without maps the PURE_GEMM_DEFAULT segments stay on the fat object",
-        "plans/gemma4-4k-8k-native-block.md: exact SM90a BF16 4K/8K pure-GEMM packet A/B (the mapped topology)",
-        "docs/flags-reference.md: `=0` is the rollback",
-    ],
-};
 const SLIDING_NS_GRID_QUALIFIED: Status = Status::Qualified {
     evidence: &[
         "crates/devgen/src/lib.rs PLOW_SLIDING_NS_GRID: h100-sxm5 step at ctx 1024, B=2/4/8, Gemma-4-12B 11.92/12.55/13.71 -> 11.45/11.98/13.04 ms, 26B-A4B 7.90/9.94/13.13 -> 7.57/9.57/12.72 ms; B=1 and B=16 unchanged",
@@ -1121,7 +1112,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.moe_stage1_body", Some("PLOW_MOE_STAGE1_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_stage2_body", Some("PLOW_MOE_STAGE2_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.no_glu_fuse", Some("PLOW_NO_GLU_FUSE"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED),
-    KnobSpec::new("emit.tma_gemm", Some("PLOW_TMA_GEMM"), Layer::Emit, Domain::Bool, GEMMA4_HOPPER_ON, TMA_GEMM_QUALIFIED),
+    KnobSpec::new("emit.tma_gemm", Some("PLOW_TMA_GEMM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_gemm_glu_role", Some("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_w8a8_gemm_glu_role", Some("PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_hd256_gqa2_role", Some("PLOW_GEMMA4_SM90_HD256_GQA2_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

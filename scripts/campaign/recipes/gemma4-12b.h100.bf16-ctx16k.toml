@@ -18,6 +18,8 @@ precision = "bf16"
 [emit]
 args = ["--segmented"]
 [emit.env]
+# The HD256-GQA2 / HD512 prefill role objects bind the TMA map; opt-in (its P certificate was rejected).
+PLOW_TMA_GEMM = "1"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"  # 32 is refused by LdsFitSound: the QKV arm stages rows x k in the 73728-half arena
 PLOW_MAX_CHUNK = "4096"     # the HD512 role needs the 4096/8192-row rungs; sliding ring 8192 rows -> ~3 GiB per slot at ctx 16384, 16 slots
 

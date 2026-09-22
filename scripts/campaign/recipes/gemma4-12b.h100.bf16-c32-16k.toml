@@ -20,6 +20,8 @@ precision = "bf16"
 [emit]
 args = ["--segmented"]
 [emit.env]
+# The HD256-GQA2 / HD512 prefill role objects bind the TMA map; opt-in (its P certificate was rejected).
+PLOW_TMA_GEMM = "1"
 # The BF16 NRN2 -> q/k/v fold (c1f1ac38) decodes garbage on the H100, and not the same garbage
 # twice: first token right, the rest noise. Off until the fold arm is qualified here.
 PLOW_NO_FUSE_NRN = "1"

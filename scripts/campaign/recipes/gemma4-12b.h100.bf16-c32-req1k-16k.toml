@@ -22,6 +22,8 @@ precision = "bf16"
 [emit]
 args = ["--segmented"]
 [emit.env]
+# The HD256-GQA2 / HD512 prefill role objects bind the TMA map; opt-in (its P certificate was rejected).
+PLOW_TMA_GEMM = "1"
 PLOW_NO_FUSE_NRN = "1"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
 PLOW_MAX_CHUNK = "4096"

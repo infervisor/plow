@@ -18,6 +18,8 @@ precision = "bf16"
 [emit]
 args = ["--segmented"]
 [emit.env]
+# The HD256-GQA2 / HD512 prefill role objects bind the TMA map; opt-in (its P certificate was rejected).
+PLOW_TMA_GEMM = "1"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"  # 32 slots; with chunk 2048 the sliding ring is 4096 rows -> ~1.5 GiB per slot at ctx 8192
 PLOW_MAX_CHUNK = "2048"     # the attention roles need the 4096/8192 rungs, so BOTH roles are off here (fallback FA objects)
 

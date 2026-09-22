@@ -515,7 +515,7 @@ fn gemma4_hopper_defaults_follow_config_caps() {
     };
 
     let cfg = defaults(dense, &["test"], "sm_90a", 1);
-    assert!(cfg.tma_gemm && cfg.sliding_ns_grid && cfg.sliding_ns_cap && cfg.gemv_prefetch);
+    assert!(!cfg.tma_gemm && cfg.sliding_ns_grid && cfg.sliding_ns_cap && cfg.gemv_prefetch);
     assert_eq!(cfg.attention_decode_balance_gf, Some(4));
     assert_eq!(cfg.seg_fa512.as_deref(), Some("1"));
     assert_eq!(cfg.seg_fa256_gqa2, Some(true));
@@ -523,7 +523,7 @@ fn gemma4_hopper_defaults_follow_config_caps() {
     assert_eq!(cfg.gemma_moe_dec_group, None);
 
     let cfg = defaults(moe, &["test"], "sm_90a", 1);
-    assert!(cfg.tma_gemm && cfg.moe_pf_lt && cfg.moe_dec_lt && !cfg.gemv_prefetch);
+    assert!(!cfg.tma_gemm && cfg.moe_pf_lt && cfg.moe_dec_lt && !cfg.gemv_prefetch);
     assert_eq!(cfg.gemma_moe_dec_group, Some(4));
 
     let cfg = defaults(moe, &["test", "--gemma-moe-dec-group=8", "--emit-seg-fa512=0"], "sm_90a", 1);
