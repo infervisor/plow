@@ -192,6 +192,11 @@ template <int V> struct fa_depth { static constexpr int v = V; };
 #ifndef PLOW_NV_FA_WAUTO
 #define PLOW_NV_FA_WAUTO 0
 #endif
+/* A one-split item (FlashDecode t[7] = the bf16 attention output, emitted under
+ * PLOW_FA_ELIDE_MERGE) normalizes in its own epilogue and the FlashMerge packet is gone. */
+#ifndef PLOW_NV_FA_DIRECT_O
+#define PLOW_NV_FA_DIRECT_O 0
+#endif
 #define FA_DEC_WAUTO(D, GF) (PLOW_NV_FA_WAUTO && (D) == 256 && (GF) == 2 && FA_DEC_MMAQK(D, GF))
 /* fold slots [WARPS][GF*D] + (m, l) per (warp, head); the P broadcast slots alias Ssm. */
 #define FA_DEC_WAUTO_FLOATS(D, GF) (PLOW_NV_WARPS * (GF) * (D) + 4 * PLOW_NV_WARPS)
@@ -925,7 +930,8 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                unsigned nblk, float* lds, unsigned kv_cap = 0,
                                const float* __restrict__ k_scale = nullptr,
                                const float* __restrict__ v_scale = nullptr,
-                               const int* __restrict__ decode_slot = nullptr) {
+                               const int* __restrict__ decode_slot = nullptr,
+                               __nv_bfloat16* __restrict__ O = nullptr) {
     /* A work item carries GF CONSECUTIVE query heads sharing one KV head (needs GF | gqa).
      * Indexing by head-GROUP, not by kv_head, is what makes GF < gqa correct. */
     static_assert(GF <= (int)PLOW_NV_WARPS || (PLOW_NV_FA_GF16_BENCH && GF == 16), "unsupported decode GQA grouping");
@@ -1010,7 +1016,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #endif
 #if PLOW_NV_FA_WAUTO
         if constexpr (FA_DEC_WAUTO(D, GF) && !FP8KV && !SZKV) {
-            fa_decode_wauto<D, GF>(Opart, mlpart, nullptr, qsm, kbase, vbase, lo, hi, kv_mask,
+            fa_decode_wauto<D, GF>(Opart, mlpart, O, qsm, kbase, vbase, lo, hi, kv_mask,
                                    scale, lds, (size_t)b * n_head + h0, nsplit, sp);
             continue;
         }
@@ -1557,6 +1563,19 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 
             const unsigned h = h0 + (unsigned)g;
             float* op = Opart + ((size_t)(b * n_head + h) * nsplit + sp) * D;
+#if PLOW_NV_FA_DIRECT_O
+            if (O) {
+                /* d_flash_merge at nsplit == 1 multiplies by exp2(m - m) == 1: the same bits. */
+                const float inv = (l_st[g] > 0.0f) ? (1.0f / l_st[g]) : 0.0f;
+                for (unsigned d = tid; d < D; d += PLOW_NV_THREADS) {
+                    float acc = 0.0f;
+#pragma unroll
+                    for (int gg = 0; gg < NG; gg++) acc += osm[gg * D + d];
+                    O[((size_t)b * n_head + h) * D + d] = __float2bfloat16(acc * inv);
+                }
+                continue;
+            }
+#endif
             for (unsigned d = tid; d < D; d += PLOW_NV_THREADS) {
                 float acc = 0.0f;
 #pragma unroll
@@ -1579,10 +1598,10 @@ __device__ __noinline__ void d_flash_decode_slots(
     const __nv_bfloat16* V, const int* kv_len, unsigned n_batch, unsigned n_head,
     unsigned n_kv_head, unsigned kv_stride, unsigned window, float scale, unsigned nsplit,
     unsigned kv_mask, unsigned slice, unsigned nblk, float* lds, unsigned kv_cap,
-    const int* decode_slot) {
+    const int* decode_slot, __nv_bfloat16* O = nullptr) {
     d_flash_decode<D, GF, false, false, true>(
         Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
-        nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot);
+        nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot, O);
 }
 
 /* Combine the split partials: standard online-softmax merge, work unit = (batch, head).

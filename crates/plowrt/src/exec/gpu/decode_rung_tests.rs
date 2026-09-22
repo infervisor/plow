@@ -254,6 +254,88 @@ fn validates_direct_kv_ladder_and_rejects_stale_slot_addressing() {
     }
 }
 
+/// Rungs 8 and 16 run one split and write the attention output from FlashDecode t[7]; the
+/// narrower rungs keep their merge into the same tensor.
+fn direct_output_fixture(out_bytes: u64) -> DevBlob {
+    let mut blob = fixture();
+    blob.tensors.push(DevTensor {
+        name: "attn".into(),
+        bytes: out_bytes,
+        init: None,
+    });
+    let out = (blob.tensors.len() - 1) as u16;
+    for g in blob.progs.iter_mut() {
+        g.insts[3].t[0] = out;
+        if g.t >= 8 {
+            g.insts[2].i[5] = 1;
+            g.insts[2].t[7] = out;
+            g.insts.truncate(3);
+            g.stream.truncate(3);
+            g.gq_stream.truncate(3);
+            g.stream_len[0] = 3;
+            g.gq_seg_ofs[1] = 3;
+        }
+    }
+    blob
+}
+
+#[test]
+fn validates_one_split_rungs_that_write_attention_directly() {
+    assert!(validate_decode_ladder(&direct_output_fixture(16 * 8 * 256 * 2)).unwrap());
+    assert!(validate_decode_ladder(&direct_output_fixture(16 * 8 * 256)).is_err());
+    let errors: &[fn(&mut DevBlob)] = &[
+        |b| b.progs[4].insts[2].i[5] = 2,
+        |b| b.progs[4].insts[2].t[7] = 5,
+        |b| {
+            let mut merge = b.progs[2].insts[3];
+            merge.i[0] = 16;
+            merge.i[2] = 1;
+            b.progs[4].insts.push(merge);
+        },
+    ];
+    for (case, mutate) in errors.iter().enumerate() {
+        let mut blob = direct_output_fixture(16 * 8 * 256 * 2);
+        mutate(&mut blob);
+        assert!(validate_decode_ladder(&blob).is_err(), "case={case}");
+    }
+    // A direct output that is not the narrower rungs' merge output is a different program.
+    let mut blob = direct_output_fixture(16 * 8 * 256 * 2);
+    blob.tensors.push(DevTensor {
+        name: "other".into(),
+        bytes: 16 * 8 * 256 * 2,
+        init: None,
+    });
+    blob.progs[4].insts[2].t[7] = (blob.tensors.len() - 1) as u16;
+    assert!(!validate_decode_ladder(&blob).unwrap_or(false));
+    // Partials reused by a later split layer and its merge do not make that merge this layer's.
+    let mut blob = direct_output_fixture(16 * 8 * 256 * 2);
+    for g in blob.progs.iter_mut() {
+        let mut flash = g.insts[2];
+        flash.i[5] = 2;
+        flash.t[7] = TENSOR_NONE16;
+        let mut merge = DevInst64 {
+            op: DevOp::FlashMerge as u16,
+            blocks: 1,
+            t: [TENSOR_NONE16; 8],
+            ..Default::default()
+        };
+        merge.t[..3].copy_from_slice(&[7, 5, 6]);
+        merge.i[..4].copy_from_slice(&[g.t, 8, 2, 256]);
+        g.insts.extend([flash, merge]);
+        let n = g.insts.len();
+        g.stream = (0..n)
+            .map(|ix| StreamEnt {
+                inst: ix as u32,
+                ..Default::default()
+            })
+            .collect();
+        g.gq_stream = g.stream.clone();
+        g.stream_len[0] = n as u32;
+        g.gq_seg_ofs[1] = n as u32;
+    }
+    assert!(validate_decode_ladder(&blob).unwrap());
+}
+
 #[test]
 fn validates_channel_fp8_rows_and_preserves_projection_and_kv_checks() {
     for op in [DevOp::GemvFp8, DevOp::GemvGluFp8] {

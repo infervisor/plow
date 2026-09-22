@@ -1077,6 +1077,10 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
     if crate::emit_config::active().fa_wauto {
         t.insert("fa_wauto".into(), json!(1));
     }
+    // * `fa_direct_o`: the emit's PLOW_FA_ELIDE_MERGE; FlashDecode's t[7] output needs the arm.
+    if crate::emit_config::active().fa_elide_merge {
+        t.insert("fa_direct_o".into(), json!(1));
+    }
     t
 }
 
@@ -2764,6 +2768,9 @@ pub fn config_header(manifest: &Value) -> String {
             }
             if t.get("fa_wauto").is_some() {
                 out.push_str("#ifndef PLOW_NV_FA_WAUTO\n#define PLOW_NV_FA_WAUTO 1\n#endif\n");
+            }
+            if t.get("fa_direct_o").is_some() {
+                out.push_str("#ifndef PLOW_NV_FA_DIRECT_O\n#define PLOW_NV_FA_DIRECT_O 1\n#endif\n");
             }
             if t.get("gf_full").and_then(Value::as_u64) == Some(16) {
                 out.push_str("#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n");

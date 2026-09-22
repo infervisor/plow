@@ -388,7 +388,9 @@ impl Manifest {
                             && match c.scales {
                                 Some(scales) => d.t[6..8] == scales,
                                 None => {
-                                    d.t[7] == TENSOR_NONE16
+                                    // t7 of a one-split bf16 decode is its direct output
+                                    // (PLOW_FA_ELIDE_MERGE); map operands stay rejected below.
+                                    (d.t[7] == TENSOR_NONE16 || d.i[5] == 1)
                                         && crate::mixed_step::validate_decode_slot_tensor(
                                             d.t[6],
                                             p.rows,

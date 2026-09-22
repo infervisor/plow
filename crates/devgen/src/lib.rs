@@ -5197,6 +5197,17 @@ fn emit_phase(
         // epilogue and the packet's own coarse completion signal covers the merge, so o_proj
         // just re-points its dep at the flash op with no threshold change.
         let fuse_merge = fuse_hnr && n.mrgc != TENSOR_NONE;
+        // A one-split sliding item (ns == 1: the B >= 8 rungs) writes the normalized bf16 itself
+        // (t[7] = n.at) and its FlashMerge is not emitted; the object must carry
+        // PLOW_NV_FA_DIRECT_O (stamped through the manifest).
+        let elide_merge = gemv_family
+            && decode
+            && !fuse_hnr
+            && !fp8_kv
+            && ns == 1
+            && hd == 256
+            && win > 0
+            && emit_config::active().fa_elide_merge;
         let c_fa = if fuse_hnr {
             // NRF fold packet: flash depends on the three RAW projections directly (the hnr
             // level is gone). Operands per the exec's unpacking map; kv_rows gets nothing —
@@ -5329,6 +5340,9 @@ fn emit_phase(
                 if t > 1 {
                     d.j[0] = t * kvh * kvr;
                 }
+                if elide_merge {
+                    d.t[7] = n.at;
+                }
             })
         } else {
             let fa_op = if fp8_kv {
@@ -5395,7 +5409,7 @@ fn emit_phase(
         // When fused, flash_prefill already wrote the normalized bf16 to n.at, so there is no
         // FlashMerge op and o_proj depends on the flash op directly. Coarse: n.at row r needs
         // every head of its q-tile, which is spread across the flash workgroups.
-        let attn_deps = if fused || fuse_merge {
+        let attn_deps = if fused || fuse_merge || elide_merge {
             vec![c_fa]
         } else {
             // L1: fold a D-chunk axis into the merge's work id so it can occupy more than

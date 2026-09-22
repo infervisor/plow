@@ -280,6 +280,11 @@ pub struct EmitConfig {
 
     /// sm_90a hd256 decode attention as warp-autonomous online-softmax streams
     /// (op_attention.cuh PLOW_NV_FA_WAUTO); needs PLOW_FA_MMAQK bit 0.
+    /// sm_90a decode: a one-split hd256 attention item writes its bf16 output directly and the
+    /// FlashMerge packet is not emitted (op_attention.cuh PLOW_NV_FA_DIRECT_O).
+    #[arg(long, env = "PLOW_FA_ELIDE_MERGE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub fa_elide_merge: bool,
+
     #[arg(long, env = "PLOW_FA_WAUTO", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fa_wauto: bool,
 
@@ -1307,6 +1312,7 @@ impl EmitConfig {
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
             fa_mmaqk: env_u32("PLOW_FA_MMAQK"),
             fa_wauto: env_bool("PLOW_FA_WAUTO"),
+            fa_elide_merge: env_bool("PLOW_FA_ELIDE_MERGE"),
             flash_merge_dsplit: env_u32("PLOW_FLASH_MERGE_DSPLIT"),
             ns_mul: env_u32("PLOW_NS_MUL"),
             ns_abs: env_u32("PLOW_NS_ABS"),

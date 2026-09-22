@@ -190,11 +190,20 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
             }
         }
         let mut insts = Vec::new();
-        for d in logical.map_or(g.insts.as_slice(), |p| p.instructions.as_slice()) {
+        let src = logical.map_or(g.insts.as_slice(), |p| p.instructions.as_slice());
+        for (ix, d) in src.iter().enumerate() {
             let mut d = *d;
             d.blocks = 0;
             match DevOp::from_u16(d.op) {
                 Some(DevOp::Nop) => {}
+                // A merge is part of its attention's normalized form below: a one-split rung may
+                // write the attention output directly (FlashDecode t[7]) and carry no merge.
+                Some(DevOp::FlashMerge) => {
+                    if d.i[0] != g.t {
+                        return Err(reject("instruction rows disagree with rung width"));
+                    }
+                    continue;
+                }
                 Some(DevOp::Residual | DevOp::Glu | DevOp::SoftCap) => {
                     if d.i[0] == 0 || d.i[0] % g.t != 0 {
                         return Err(reject("invalid elementwise row extent"));
@@ -272,8 +281,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     | DevOp::AddNorm
                     | DevOp::Embed
                     | DevOp::FlashDecode
-                    | DevOp::FlashDecodeFp8
-                    | DevOp::FlashMerge,
+                    | DevOp::FlashDecodeFp8,
                 ) => {
                     if d.i[0] != g.t {
                         return Err(reject("instruction rows disagree with rung width"));
@@ -295,8 +303,14 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     ) {
                         d.i[5] = 0;
                         d.fj[1] = 0;
-                    } else if d.op == DevOp::FlashMerge as u16 {
-                        d.i[2] = 0;
+                        if d.op == DevOp::FlashDecode as u16 && d.t[7] == TENSOR_NONE16 {
+                            d.t[7] = src[ix + 1..]
+                                .iter()
+                                .find(|m| {
+                                    m.op == DevOp::FlashMerge as u16 && m.t[1..3] == d.t[..2]
+                                })
+                                .map_or(TENSOR_NONE16, |m| m.t[0]);
+                        }
                     }
                 }
                 _ => {
@@ -336,7 +350,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
         let fp8 = d.op == DevOp::FlashDecodeFp8 as u16;
         if !matches!(d.i[6], 64 | 256 | 512)
             || (fp8 && d.i[6] == 64)
-            || (!fp8 && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16))
+            || (!fp8 && d.t[6] != TENSOR_NONE16)
         {
             return Ok(false);
         }
@@ -435,6 +449,12 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                 extent(d.t[0], partials, u64::from(d.i[6]) * 4)?;
                 extent(d.t[1], partials, 8)?;
                 extent(d.t[2], row_heads, u64::from(d.i[6]) * 2)?;
+                if d.op == DevOp::FlashDecode as u16 && d.t[7] != TENSOR_NONE16 {
+                    if d.i[5] != 1 || d.i[6] != 256 || d.t[..7].contains(&d.t[7]) {
+                        return Err(reject("direct attention output needs one hd256 split and no merge"));
+                    }
+                    extent(d.t[7], row_heads, u64::from(d.i[6]) * 2)?;
+                }
                 if d.fj[1] != 0 && u64::from(d.fj[1]) != bound {
                     return Err(reject("KV bounds disagree with physical slot geometry"));
                 }
@@ -451,6 +471,9 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                             && a.t[1] == d.t[2]
                     })
                     .ok_or_else(|| reject("merge has no matching attention producer"))?;
+                if producer.op == DevOp::FlashDecode as u16 && producer.t[7] != TENSOR_NONE16 {
+                    return Err(reject("direct attention output needs one hd256 split and no merge"));
+                }
                 if [d.i[1], d.i[2], d.i[3]] != [producer.i[1], producer.i[5], producer.i[6]] {
                     return Err(reject("merge geometry disagrees with attention"));
                 }

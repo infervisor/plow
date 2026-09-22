@@ -2165,6 +2165,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #else
     case PLOW_DOP_FLASH_DECODE: {
         const unsigned gqa = in->i[1] / in->i[2];
+#if PLOW_NV_FA_DIRECT_O
+#define PLOW_NV_FA_O_ARG , nullptr, nullptr, nullptr, (__nv_bfloat16*)TEN(7)
+#define PLOW_NV_FA_O_ARG_SLOTS , (__nv_bfloat16*)TEN(7)
+#else
+#define PLOW_NV_FA_O_ARG
+#define PLOW_NV_FA_O_ARG_SLOTS
+#endif
 #define PLOW_NV_FLASH_DECODE(DD, GG)                                                            \
     do {                                                                                       \
         if (TEN(6))                                                                            \
@@ -2173,13 +2180,14 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
                 (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
                 in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,              \
-                (const int*)TEN(6));                                                            \
+                (const int*)TEN(6) PLOW_NV_FA_O_ARG_SLOTS);                                     \
         else                                                                                   \
             d_flash_decode<DD, GG>(                                                            \
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
                 (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
-                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u);              \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u              \
+                PLOW_NV_FA_O_ARG);                                                              \
     } while (0)
 #if PLOW_HAS_FLASH_HD64
         if (in->i[6] == 64 && PLOW_HAS_FLASH_HD64) {
@@ -2215,6 +2223,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         }
 #endif
 #undef PLOW_NV_FLASH_DECODE
+#undef PLOW_NV_FA_O_ARG
+#undef PLOW_NV_FA_O_ARG_SLOTS
         break;
     }
 #endif /* PLOW_NV_LEAN_DECODE (FLASH_DECODE) */
