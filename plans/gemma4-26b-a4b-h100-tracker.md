@@ -1550,3 +1550,13 @@ column"). 26B-specific numbers, packet `p26i`, 16 prompts:
   11.416/8.178/5.524 -> 11.235/8.033/5.526, digests identical.
 * NULL cp.async GEMV ring (8/16 stages in dynamic smem, oracle ALL OK): 12B B=16/4/1
   13.19/11.12/10.67 -> 16.59/14.28/13.65 (ring8); 26B 11.43/8.17/5.53 -> 12.39/9.13/5.54.
+* Landed `a9b8714b` (fused glue). Attribution: memset hoist alone -0.041/-0.055 (B=16/4); nsys decode
+  glue 16.1 -> ~13 us/layer. Landed `6b12a05a`: same hoist in the prefill segment graphs (stream
+  capture path), prefill span 654.5/654.7 -> 653.1/651.9 ms (16 x 1024), digests identical.
+* Unexecuted-code tax, MoE family: `PLOW_HAS_MOE_GEMMA` compiled all 13 Gemma MoE member cases; the
+  26B uses 6. Per-member `PLOW_HAS_*` gates: decode object -145 KB, stack 576 -> 528, spill st/ld
+  992/2628 -> 920/2468; 12B SASS identical. First A/B 11.427/8.169/5.527 -> 11.397/8.179/5.471
+  (B=4 within noise) - confirmation pending.
+* Lean Lt-rung object probe (expert GEMV arms removed; routed rungs never run them): 1.70 MB, stack
+  432, spills 588/1824, still 255 regs. Needs a second decode module at the routed-rung captures
+  (decode_objects binds single-segment programs only).
