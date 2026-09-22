@@ -383,8 +383,9 @@ pub struct RuntimeConfig {
 
     /// CUDA token-batch prefill: publish the whole-block checkpoints a prompt chunk completed
     /// when the chunk lands, not only at the prompt's end, so a request waiting on a long
-    /// prompt's shared blocks attaches after the first chunk that covers them.
-    #[arg(long = "prefix-chunk-publish", env = "PLOW_PREFIX_CHUNK_PUBLISH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// prompt's shared blocks attaches after the first chunk that covers them. `0` publishes
+    /// them at the prompt's end only.
+    #[arg(long = "prefix-chunk-publish", env = "PLOW_PREFIX_CHUNK_PUBLISH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_chunk_publish: bool,
 
     /// AMD shared-prefix VMM KV: when a request finishes, settle its slot's cache-shared row-0
@@ -1692,10 +1693,12 @@ impl RuntimeConfig {
     /// fixed MiB figure that is right on a 192 GiB MI300X is a third of a small card. A caller
     /// that knows `free_after_load` (the CUDA engine) gets
     /// [`Self::VMM_CACHE_MIN_FREE_FRACTION_LOADED`] instead, so a cache-on server peaks where
-    /// vLLM at its default utilization does, capped at half of `free_after_load`: a card whose
-    /// KV rings leave 5 GiB free (Gemma-4-26B on an 80 GiB H100) still keeps a working set of
-    /// checkpoints. A backend that cannot report free
-    /// bytes degrades to the static budget on its own
+    /// vLLM at its default utilization does, capped at half of `free_after_load`. That needs
+    /// room for the cache's static budget beside the 10%; a card whose KV rings leave less
+    /// (Gemma-4-26B on an 80 GiB H100: 4.8 GiB free, already at vLLM's peak) keeps an eighth
+    /// of `free_after_load` instead, because a larger floor evicts its shared checkpoints
+    /// (57/67 prefix-repetition hits at 602 MiB, 52 at 764, 8 at 2409). A backend that cannot
+    /// report free bytes degrades to the static budget on its own
     /// ([`crate::memory::vmm::VmmKv::enable_pressure_eviction`]), so arming this is safe
     /// everywhere.
     pub(crate) fn vmm_cache_min_free_bytes(
@@ -1716,9 +1719,15 @@ impl RuntimeConfig {
             // Whole MiB, so the figure in logs reads like the knob.
             None => {
                 let derived = match free_after_load {
-                    Some(free) => ((device_bytes as f64 * Self::VMM_CACHE_MIN_FREE_FRACTION_LOADED)
-                        as u64)
-                        .min(free / 2),
+                    Some(free) => {
+                        let vllm =
+                            (device_bytes as f64 * Self::VMM_CACHE_MIN_FREE_FRACTION_LOADED) as u64;
+                        if free.saturating_sub(vllm) >= self.prefix_cache_cap_bytes(device_bytes) {
+                            vllm.min(free / 2)
+                        } else {
+                            free / 8
+                        }
+                    }
                     None => (device_bytes as f64 * Self::VMM_CACHE_MIN_FREE_FRACTION) as u64,
                 };
                 Some(derived >> 20 << 20)
@@ -2231,8 +2240,9 @@ mod tests {
         let four_pct = ((80u64 << 30) as f64 * 0.04) as u64 >> 20 << 20;
         assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, None), Some(four_pct));
         assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(60 << 30)), Some(8192 << 20));
-        // A card whose rings leave 5 GiB free keeps half of it, not 10% of the device.
-        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)), Some(2560 << 20));
+        // A card whose rings leave 5 GiB free keeps an eighth of it, not 10% of the device.
+        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(5 << 30)), Some(640 << 20));
+        assert_eq!(config.vmm_cache_min_free_bytes(80 << 30, Some(14546 << 20)), Some(7273 << 20));
         let config = super::RuntimeConfig::from_arg_matches(
             &command.clone().try_get_matches_from(["test", "--vmm-cache-min-free-mib=100"]).unwrap(),
         )
