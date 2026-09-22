@@ -1450,3 +1450,211 @@ per-row prefill cost in mixed launches (45-50 vs 33-42 us/row at C16) and the ba
   keeps TTFT 101 vs 123 ms for +0.17 ms TPOT) and 128/C4 (FCFS 34.2 vs 39.1 ms TTFT).
 * Next: `PLOW_DECODE_PIPELINE` (lookahead-1, per-token streaming, device-resident inputs) and an
   8192-row launch rung with `PLOW_MAX_REQUEST_CHUNK=4224` so the sliding ring stays at 8192 rows.
+
+### Lookahead-1 decode pipeline, measured (PLOW_DECODE_PIPELINE, 2026-09-22)
+
+p12r4, one session, one binary, `PLOW_MULTISTEP=0` in both arms, realtime profile, 128 out.
+Arms repeated (`ms0`/`ms0b`, `pipe`/`pipe2`): within-arm spread is <=0.07 ms TPOT and <=3 ms p99 ITL,
+so every delta below is outside the floor. Greedy equivalence: **12/12 byte-identical** completions
+with the pipeline off vs on.
+
+| cell | vLLM 0.28 | ms0 | pipe | E2E / vLLM |
+|---|---|---|---|---|
+| 128/C1 | 30.0 / 10.46 / 11.3 | 18.2 / 10.44 / 10.5 | 18.3 / 10.42 / 10.5 | 0.990 -> 0.987 |
+| 1024/C1 | 47.2 / 10.54 / 11.4 | 46.1 / 10.52 / 10.6 | 45.9 / 10.50 / 10.6 | 0.998 -> 0.995 |
+| 4096/C1 | 170.1 / 10.55 / 11.4 | 169.8 / 10.56 / 10.8 | 169.4 / 10.53 / 10.7 | 1.000 -> 0.998 |
+| 15000/C1 | 671.8 / 10.56 / 11.5 | 736.1 / 10.65 / 10.8 | 737.0 / 10.62 / 10.8 | 1.038 -> 1.036 |
+| 128/C4 | 55.3 / 10.49 / 11.3 | 32.0 / 10.57 / 10.7 | 36.0 / 10.60 / 12.2 | 0.990 -> 0.996 |
+| 1024/C4 | 129.6 / 11.07 / 11.8 | 101.6 / 11.64 / 53.6 | 101.3 / 11.60 / 53.6 | 1.029 -> 1.026 |
+| 4096/C4 | 465.8 / 12.07 / 11.9 | 324.8 / 13.85 / 175.0 | 324.5 / 13.81 / 175.0 | 1.043 -> 1.040 |
+| 15000/C4 | 1665.4 / 18.06 / 326.0 | 1039.2 / 26.40 / 212.7 | 1184.8 / 24.21 / 212.2 | 1.109 -> 1.076 |
+
+(TTFT / TPOT / p99 ITL in ms. E2E = TTFT + 127 x TPOT.)
+
+* Every C1 rung gains 0.02-0.03 ms TPOT for no TTFT: the host turnaround was already small there,
+  and what the pipeline removes is exactly that.
+* **15000/C4 is the win**: TPOT -8.3 %, and E2E falls 1.109 -> 1.076 of vLLM, so it is not the
+  TTFT/TPOT shuffle the MULTISTEP arms were.
+* **128/C4 regresses** (TTFT 32 -> 36, p99 ITL 10.7 -> 12.2). Structural: with a 128-row prompt the
+  in-flight lookahead step must be drained before a prefill launch, and at that size the drain is
+  most of the tick. The prefill overlap below is what removes the drain.
+* Against vLLM after this round: plow wins TTFT at 7 of 8 cells and p99 ITL across all of C1, and
+  still trails on TPOT/E2E at C4 with long inputs and on p99 ITL at 1024-4096/C4 (53.6 / 175.0 vs
+  ~11.8 — the cost of packing prefill into running decoders instead of prefilling a wave together).
+
+### Prefill overlap (PLOW_PIPE_PREFILL) — implemented, measurement queued
+
+The mixed prefill/decode launch is enqueued behind the step in flight instead of draining it:
+
+* `d_last` `[batch]` device buffer holds every slot's newest sampled token. A decode step copies
+  `in.ids` into it; a mixed step scatters its compact terminal block into it.
+* `PackedTerminal` splits into `launch` (no sync) and `run`; the pipelined path submits body +
+  terminal, records a D2H of the sample block and an event, and returns. Frontiers and `pos` commit
+  at enqueue, which single-stream program order makes safe.
+* Decode rows that ride the launch take their input from `d_last` (4-byte D2D after the staged
+  upload) -- but only rows the pipe still owes a token; for any other row the host token is
+  authoritative and `d_last` is stale.
+* A prompt that completes in launch n joins launch n+1 as a decode row reading its first token off
+  the device, so it does not idle a whole launch waiting for the host to read that token.
+* `pipe_reap`/`pipe_full` hold the queue at lookahead-1 across consecutive prefill ticks; without
+  them a run of prefill ticks overflows the two pinned readback buffers.
+
+### Prefill overlap: first run faulted, and why (2026-09-22)
+
+`PLOW_PIPE_PREFILL=1` on p12r4 died ~40 tokens into the greedy probe:
+
+```
+CUDA_ERROR_ILLEGAL_ADDRESS (700) at cuCtxSynchronize
+gpu: batched prefill failed ... packed=1, fatal=true
+```
+
+Deterministic: both overlap arms of the ladder (`pf`, `pf2`) exited rc=28 with 0 cells, while every
+pipeline-only arm ran all 8 cells.
+
+**Cause.** `packed_token_body_inner`'s own SAFETY comments state the invariant: `pf_ids`, `pf_pos`,
+`slot_buf`, `req_buf` "live on self past the stream_synchronize". Every packed launch drained the
+stream before returning, so the host was free to rewrite them next tick. The pipelined path removed
+that drain and kept the vectors, so the host restaged launch n+1 while launch n's async H2D copies
+were still queued behind the running kernel; the copies then read the new contents. The terminal's
+`host_rows` and patched instruction block have the same exposure. Corrupt row/program metadata is
+exactly an illegal address, and the timing fits: correct until the host runs ahead of the device.
+
+**Fix, per buffer's exposure window.**
+
+* Body staging (`pf_ids`, `pf_pos`, `slot_buf`, `req_buf`, `kvlen_buf`): a `body_ev` event recorded
+  right after those copies and waited on before the next staging. Those copies precede their own
+  launch's kernel, so in the steady state the device is already past them and the wait returns at
+  once; a host that runs ahead is throttled, which is the part that was missing.
+* Terminal staging (`host_rows`, instructions): its copies sit AFTER the body kernel, so an event
+  there would wait out the whole 170 ms launch and serialise what the pipeline exists to overlap.
+  Those two small arrays are double-buffered instead (`stage_rows`, alternating per launch).
+
+`PLOW_PIPE_PREFILL` became a level so the two new behaviours can be separated: `1` parks the mixed
+launch and sources its decode rows from `d_last`, `2` additionally admits a just-prefilled row to
+the next launch on its device-resident first token.
+
+**What the overlap can be worth, measured.** `PLOW_PF_PACKLOG` over 659 ticks (idle outliers
+trimmed): host gap is **1.67 ms against a 172.7 ms prefill tick (1.0 %)** and **0.052 ms against an
+11.0 ms decode tick (0.5 %)**. So closing the gap is not where the value is — it has to come from
+removing the drain (which costs 128/C4 its TTFT, 32.0 -> 36.0 ms under the pipeline) and from
+decode rows not losing a launch after their prompt completes.
+
+### 8192-row launch rung: null (2026-09-22)
+
+p12r8 (`PLOW_MAX_CHUNK=8192`, `PLOW_MAX_REQUEST_CHUNK=4224`) against p12r4, same binary, arms
+repeated: every cell within the repeat spread (E2E / vLLM 0.998 / 1.000 / 1.038 / 1.029 / 1.042 /
+1.11x, identical either way). The rung is built but not chosen: a request is still capped at 4224
+rows per launch, so filling 8192 needs two requests' chunks in one launch, which oldest-first
+adaptive packing avoids and `pf_pack_budget`'s cost model rejects (a ~45 %-padded 8192 loses to
+`[4096, tail]`). Testing the wider launch for real would need FCFS fill as well; not pursued.
+
+### Checkpoint P gate: 20/20 accepted (2026-09-22)
+
+`scripts/perf_gate_ci.sh 91f03b9c` -> rc=0, every flipped default certified. Two of the twenty
+needed work beyond re-running the campaign:
+
+**`emit.gemma4_sm90_hd256_gqa2_wide` — accepted after citing the right neutral metric.** TTFT is
+better at all four cells of its group (8192/C1 359.6 -> 355.5, 8192/C4 763.8 -> 749.7, 15000/C1
+748.0 -> 736.3, 15000/C4 1607.2 -> 1519.3 ms) but clears its floor only at 15000/C1. The first
+cert cited only TPOT as neutral, so the three within-floor TTFT rungs had no accept path. The flip
+widens the row range of an attention role that is already the default at <=4096 rows to the
+4160/4224-row whole-tile launches -- same object, same math, no work added -- which is the
+physical argument `rungVerdict` wants for "not worse"; with TTFT cited too it accepts.
+
+**`emit.fa_mmaqk` — rejected on the merits, returned to opt-in.** 26B 128/C1 TPOT 5.400 -> 5.418 ms
+against a 0.002 floor, reproducible across both treatment runs. That is a `servingVerdict`
+rejection, and unlike `rungVerdict` the serving check has no neutral escape hatch by design: a
+serving metric may not get worse, whatever the reason. The knob still wins where its evidence was
+taken (26B 1024/C1 TPOT 5.551 -> 5.484 beyond floor, 128/C4 and 1024/C4 within it; 12B 128/C16
+12.68 -> 11.80), so this is the `ccd36c59` situation exactly: the default returns to UNSET/OPT_IN,
+`apply_production_defaults` drops its case, and the 16 BF16 Gemma-4 H100 recipes set
+`PLOW_FA_MMAQK=3` themselves. Every campaign packet keeps the flag; only the uncertified default
+goes away. `gemma4-12b.h100.bf16-plain` is deliberately left without it -- it is the
+default-knobs control.
+
+Floors are tight because `floorOf` is |median(ctrl) - median(ctrl2)| + k*max(MAD): when the two
+control runs agree to 0.04% on a 5.4 ms TPOT, a 0.33% regression is outside the floor.
+
+### Stage 1 after the frontier rework: re-measured, and the 128/C4 TTFT regression is gone
+
+p12r4, `PLOW_MULTISTEP=0`, 32 prompts, 128 out. TTFT ms / TPOT ms / p99 ITL ms.
+
+| cell | vLLM 0.28 | base | pipe (stage 1) | E2E / vLLM |
+|---|---|---|---|---|
+| 128/C1 | 30.0 / 10.46 / 11.3 | 18.3 / 10.44 / 10.5 | 18.3 / 10.42 / 10.5 | 0.990 -> 0.987 |
+| 15000/C1 | 671.8 / 10.56 / 11.5 | 737.0 / 10.65 / 10.9 | 736.5 / 10.62 / 10.8 | 1.038 -> 1.036 |
+| 128/C4 | 55.3 / 10.49 / 11.3 | 32.3 / 10.58 / 10.9 | 32.0 / 10.53 / 10.7 | 0.992 -> 0.987 |
+| 15000/C4 | 1665.4 / 18.06 / 326.0 | 1039.8 / 26.43 / 212.4 | 1184.7 / 24.13 / 212.1 | 1.110 -> 1.073 |
+
+The 15000/C4 win reproduces (TPOT 26.43 -> 24.13, -8.7%; E2E 1.110 -> 1.073) and it is a trade,
+not a free win: TTFT goes 1039.8 -> 1184.7 there. No cell regresses on E2E.
+
+**The regression that motivated the overlap is gone.** Before the rework, stage 1 cost 128/C4 its
+TTFT (32.0 -> 36.0 ms); measured again on the reworked core it is 32.3 -> 32.0. The `ahead` lag
+compensation was the cost, not the missing overlap. With the host gap already measured at 1.0 % of
+a prefill tick and 0.5 % of a decode tick, stage 2's remaining upside is that gap alone.
+
+### Prefill overlap, second attempt: replay at level 1, fault at level 2
+
+The frontier rework removed the illegal address at level 1, and left a subtler bug: level 1 emitted
+one token twice. `p1`'s completion is `p0`'s with a token duplicated and the tail one token short
+("These are daily daily maritime...", "dereferferencing") -- the device stream was right and the
+host fed a row twice.
+
+Cause, in two parts:
+
+* `pipe_step`'s internal drain re-enqueued from the mux's pre-drain `feeds`. The mux's own drain
+  path re-gathers (`feeds = gpu_decode_feeds(...)`, right after it drains) and says so in its
+  comment; `pipe_step` cannot re-gather from inside the engine, so a row the drain had just
+  produced a token for was fed its previous token and resampled it.
+* `carry` was set from `device_ids` -- whether the row's input came from the device -- rather than
+  from its KIND. A mixed step whose decode rows the host staged therefore had no carry rows at
+  all, which is what made `pipe_covers` fail and that drain reachable. It also dropped those rows
+  from the prefix-cache history.
+
+Both fixed. A third defect found by construction while reading: `gpu_decode_feeds` gathers only
+`step > 0` rows and `use_pipe` requires a non-empty feed set, so a row whose first token is still
+inside a parked step is invisible to the decode path; while it also held `did_prefill` true, the
+mux's drain was suppressed and nothing could ever complete that step. `did_prefill` now excludes
+rows the pipe owes a token, which are waiting on a readback, not on prefill.
+
+Level 2 (`PLOW_PIPE_PREFILL=2`, a prompt decoding from its device-resident first token) still
+faults: `CUDA_ERROR_ILLEGAL_ADDRESS` at `cuEventSynchronize`, batched prefill, `packed=1`. That is
+a memory bug of its own and is not the liveness hole above.
+
+### Prefill overlap: three bugs fixed, one left, and the verdict
+
+The three defects found by reading, all fixed in the tree:
+
+1. `pipe_step`'s internal drain re-enqueued from the mux's pre-drain `feeds`, so a row the drain
+   had just produced a token for was fed its previous token and resampled it. The mux's own drain
+   path re-gathers (`feeds = gpu_decode_feeds(...)`); `pipe_step` cannot, so it now refreshes the
+   fed tokens from what the drain returned.
+2. `carry` was set from `device_ids` (whether the input came from the device) instead of the row's
+   KIND. A mixed step whose decode rows the host staged had no carry rows at all, which is what
+   made `pipe_covers` fail and defect 1 reachable; it also dropped those rows from the
+   prefix-cache history.
+3. `did_prefill` counted a row whose prompt was consumed but whose first token was still inside a
+   parked step. `gpu_decode_feeds` gathers only `step > 0` rows and `use_pipe` needs a non-empty
+   feed set, so such a row is invisible to the decode path while it suppresses the mux's drain --
+   nothing could complete the step holding its token. It now excludes rows the pipe owes.
+
+Verified on plowrt_pipe5 (`pf_noise.sh`, `dupscan.py`): level 1 clean, 0 corruption hits, down
+from 2. The noise floor matters here -- `off` vs `off2` is 8/10 identical at conc 4, so the
+earlier "p0 8/10" reading of stage 1 was the floor, not a regression; `p0` vs `p0b` is 10/10.
+
+**What is still broken.** Level 1 deadlocks when requests retire while a mixed launch is parked.
+At 15000/C4 the ladder arm pinned the GPU for an hour with no token; the minimal repro (4 x 14k
+prompts, 32 out) froze after `decode_ms=172.21 did_prefill=0 decode_rows=2` -- a decode tick
+paying a parked-launch wait, immediately after two requests retired -- and the mux stopped
+ticking with the GPU idle. So the host blocks on a step nothing completes. The lead is the
+interaction of the deferred `retire_slot` (held until `pipe.queue.is_empty()`) with a parked step
+whose rows are retired. Level 2 additionally faults (`CUDA_ERROR_ILLEGAL_ADDRESS` at
+`cuEventSynchronize`, batched prefill) and is a separate bug.
+
+**Verdict: not shipped.** `PLOW_PIPE_PREFILL` stays opt-in at 0 and is documented as experimental
+with both failure modes named. The case for finishing it is weak on the measurements: the host gap
+it closes is 1.0 % of a prefill tick and 0.5 % of a decode tick, and the 128/C4 TTFT regression
+that originally motivated it turned out to be the `ahead` lag compensation, which the frontier
+rework already removed. Stage 1 (`PLOW_DECODE_PIPELINE`) is the part that pays, and it is correct
+and measured.

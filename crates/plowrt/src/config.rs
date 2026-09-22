@@ -223,6 +223,12 @@ pub struct RuntimeConfig {
 
     /// Prefill cross-request span allocation policy: "greedy" (completion priority, lowest TTFT)
     /// or "fair" (fair-split rows across all concurrent requests).
+    /// Serving profile selection. `auto` picks the campaign's realtime/high_concurrency knob
+    /// set per tick from live decode width and queue depth (hysteresis band + dwell, one log line
+    /// per switch); unset pins whatever the flags say, which is what certs and campaign cells run.
+    #[arg(long = "serve-policy", env = "PLOW_SERVE_POLICY", value_parser = clap::builder::PossibleValuesParser::new(["pinned", "auto"]), global = true)]
+    pub serve_policy: Option<String>,
+
     #[arg(long = "pf-span-policy", env = "PLOW_PF_SPAN_POLICY", value_parser = clap::builder::PossibleValuesParser::new(["greedy", "fair"]), global = true)]
     pub pf_span_policy: Option<String>,
 
@@ -709,6 +715,22 @@ pub struct NvidiaRuntimeConfig {
     /// are not delayed behind K-step quanta and completions do not batch into arrival waves.
     #[arg(long = "multistep-adaptive", env = "PLOW_MULTISTEP_ADAPTIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub multistep_adaptive: bool,
+
+    /// Lookahead-1 decode pipeline (CUDA): the next decode step is enqueued before the host waits
+    /// on the current one, so streaming, stop checks and scheduling overlap the device step and
+    /// every token streams as it is produced. Takes over from the K-step `--multistep` quantum
+    /// where that could run (greedy rows, device-owned positions).
+    #[arg(long = "decode-pipeline", env = "PLOW_DECODE_PIPELINE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_pipeline: bool,
+
+    /// With the decode pipeline on, enqueue the mixed prefill/decode launch behind the
+    /// in-flight step instead of reading that step out first: its decode rows take their input
+    /// tokens from the device, and its own samples — a prompt's first token included — are read
+    /// back a tick later, so the host never waits between launches.
+    /// `0` off, `1` park the mixed launch and source its decode rows from the device, `2` also
+    /// admit a just-prefilled row to the next launch on its device-resident first token.
+    #[arg(long = "pipe-prefill", env = "PLOW_PIPE_PREFILL", default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=2), global = true)]
+    pub pipe_prefill: u32,
 
     /// VMM prefix reuse. Automatically enabled for eligible Hopper hybrid BF16-KV packets.
     #[arg(long = "vmm-prefix", env = "PLOW_VMM_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
