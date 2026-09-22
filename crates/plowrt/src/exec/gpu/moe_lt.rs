@@ -284,6 +284,7 @@ impl MoeLt {
         directories: &[&Path],
         profile: &str,
         shape: &MoeLtSegment,
+        min_capacity: u32,
     ) -> Result<Arc<Self>> {
         let image = directories
             .iter()
@@ -305,7 +306,7 @@ impl MoeLt {
         let module = DecodeModule::load(be, &image)?;
         let function = |name: &str| be.get_function(&module, name);
         let (hidden, inter, experts) = (shape.hidden, shape.inter, shape.experts);
-        let capacity = u64::from(shape.capacity);
+        let capacity = u64::from(shape.capacity.max(min_capacity));
         let xs = be.alloc(0, capacity * u64::from(hidden) * 2)?;
         let gu = be.alloc(0, capacity * u64::from(inter) * 4)?;
         let tables = be.alloc(0, u64::from(experts) * (4 * 4 + 4 * 8))?;
@@ -403,16 +404,19 @@ impl MoeLt {
         Ok(device)
     }
 
+    /// Same expert geometry, and the scratch holds the segment's gathered rows.
+    pub(super) fn fits(&self, segment: &MoeLtSegment) -> bool {
+        [segment.hidden, segment.inter, segment.experts] == [self.hidden, self.inter, self.experts]
+            && u64::from(segment.capacity) * u64::from(self.hidden) * 2 <= self.xs.len
+    }
+
     pub(super) fn route(
         self: &Arc<Self>,
         segment: &MoeLtSegment,
         insts: &mut [DevInst64],
         devp: &[DeviceMem],
     ) -> Result<MoeLtRoute> {
-        if [segment.hidden, segment.inter, segment.experts]
-            != [self.hidden, self.inter, self.experts]
-            || u64::from(segment.capacity) * u64::from(self.hidden) * 2 > self.xs.len
-        {
+        if !self.fits(segment) {
             return Err(RuntimeError::Rejected(
                 "MoE cuBLASLt segments disagree on the expert geometry".into(),
             ));
@@ -526,7 +530,13 @@ impl MoeLtRoute {
     }
 }
 
-/// Route every segment of one decode program, loading the shared glue once.
+/// The widest gathered-row capacity among `segments` (0 when none routes).
+pub(super) fn max_capacity(segments: &[Option<MoeLtSegment>]) -> u32 {
+    segments.iter().flatten().map(|s| s.capacity).max().unwrap_or(0)
+}
+
+/// Route every segment of one decode program, loading the shared glue once with a scratch of at
+/// least `min_capacity` gathered rows.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn decode_routes(
     be: &Arc<CudaBackend>,
@@ -535,6 +545,7 @@ pub(super) fn decode_routes(
     directories: &[&Path],
     profile: &str,
     segments: &[Option<MoeLtSegment>],
+    min_capacity: u32,
     insts: &mut [DevInst64],
     devp: &[DeviceMem],
 ) -> Result<Vec<Option<super::cublaslt::LibraryRoute>>> {
@@ -543,7 +554,14 @@ pub(super) fn decode_routes(
         let route = match segment {
             Some(segment) => {
                 if owner.is_none() {
-                    *owner = Some(MoeLt::load(be, lt, directories, profile, segment)?);
+                    *owner = Some(MoeLt::load(
+                        be,
+                        lt,
+                        directories,
+                        profile,
+                        segment,
+                        min_capacity,
+                    )?);
                 }
                 let moe = owner.as_ref().expect("loaded above");
                 Some(super::cublaslt::LibraryRoute::Moe(moe.route(segment, insts, devp)?))

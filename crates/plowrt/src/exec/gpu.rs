@@ -554,6 +554,30 @@ fn prefill_can_use_segment_pair(blob: &DevBlob, roles: Option<&SegmentRoles>) ->
     })
 }
 
+/// The widest gathered-row capacity `load_prefill` routes through the MoE cuBLASLt glue (its
+/// bucket and role selection), so the decode route can size the scratch both share. 0 when no
+/// bucket routes or a program does not parse — `load_prefill` reports the latter itself.
+fn prefill_moe_lt_capacity(blob: &DevBlob, roles: Option<&SegmentRoles>) -> u32 {
+    let Some(min_rows) = RuntimeConfig::get().nv.moe_pf_lt else {
+        return 0;
+    };
+    blob.prefill_progs()
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.t >= min_rows)
+        .filter_map(|(index, g)| {
+            let program = roles?.program(index)?;
+            let selected = packet_role_segments(g, &program.roles, &blob.tensors).ok()?;
+            if !selected.contains(&plow_asset::segment_roles::MOE_PREFILL_CUBLASLT) {
+                return None;
+            }
+            moe_lt::segments(g, &blob.tensors, &selected).ok()
+        })
+        .map(|segments| moe_lt::max_capacity(&segments))
+        .max()
+        .unwrap_or(0)
+}
+
 trait SegmentRoleValidation: Sized {
     fn parse(bytes: &[u8], blob: &DevBlob) -> Result<Self>;
     fn validate(
@@ -4392,7 +4416,17 @@ impl GpuEngine {
             .into_iter()
             .chain([assets_dir])
             .collect();
+        // ONE MoE cuBLASLt glue + scratch for the decode and the prefill routes (`load_prefill`
+        // takes this owner), sized for the wider of the two: a second scratch cost the 26B 133 MiB
+        // of KV budget, one 15000-token slot at C16. Sound only because both launch on the
+        // engine's single ordered `stream`, so a routed decode step and a routed prefill bucket
+        // never overlap on the shared `xs`/`gu`/group tables.
         let mut moe_lt_decode: Option<Arc<moe_lt::MoeLt>> = None;
+        let moe_lt_scratch = if moe_lt_decode_min.is_some() {
+            prefill_moe_lt_capacity(&blob, segment_roles.as_ref())
+        } else {
+            0
+        };
         let ordered_waits = if cublaslt_enabled {
             Some(cublaslt::ordered_waits(g, &cublaslt_segments, &[])?)
         } else if moe_lt_routed {
@@ -4421,6 +4455,7 @@ impl GpuEngine {
                 &moe_lt_dirs,
                 profile.tag,
                 &moe_lt_segments,
+                moe_lt_scratch,
                 &mut insts,
                 &devp,
             )?;
@@ -4564,6 +4599,7 @@ impl GpuEngine {
                                 &moe_lt_dirs,
                                 profile.tag,
                                 &segments,
+                                moe_lt_scratch,
                                 &mut insts,
                                 &devp,
                             )?;
@@ -4838,6 +4874,7 @@ impl GpuEngine {
                 segment_roles.as_ref(),
                 packed_prefill.as_ref(),
                 cublaslt_prefill.as_ref(),
+                moe_lt_decode.clone(),
             ) {
                 Ok((f_pf, smem_pf, module_pf, buckets, seg_pf, grid_pf)) => {
                     tracing::info!(
@@ -7110,6 +7147,7 @@ impl GpuEngine {
         segment_roles: Option<&SegmentRoles>,
         packed: Option<&plow_asset::packed_prefill::Manifest>,
         cublaslt_backend: Option<&cublaslt::ProjectionBackend>,
+        moe_lt_shared: Option<Arc<moe_lt::MoeLt>>,
     ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>, u32)> {
         let packed_requests = packed.is_some();
         let mut inferred_policy = crate::asset::devblob::SegmentClassPolicy::default();
@@ -7513,7 +7551,8 @@ impl GpuEngine {
             Ok(mem)
         };
         let mut buckets = Vec::new();
-        let mut moe_lt: Option<Arc<moe_lt::MoeLt>> = None;
+        // The decode route's owner when it has one (same stream; see its load).
+        let mut moe_lt = moe_lt_shared;
         for g in blob.prefill_progs() {
             // Wave-class segmented programs are legal exactly when the SegPf pair is
             // loaded: segments launch per class in order. Otherwise the coarse
@@ -7762,7 +7801,7 @@ impl GpuEngine {
             for segment in &moe_segments {
                 let route = match segment {
                     Some(segment) => {
-                        if moe_lt.is_none() {
+                        if moe_lt.as_ref().is_none_or(|owner| !owner.fits(segment)) {
                             let lt = match cublaslt_backend {
                                 Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
                                 _ => crate::device::cuda::lt::Lt::load(be)?,
@@ -7776,6 +7815,7 @@ impl GpuEngine {
                                 &directories,
                                 interp_tag,
                                 segment,
+                                0,
                             )?);
                         }
                         let owner = moe_lt.as_ref().expect("loaded above");
