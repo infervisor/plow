@@ -78,6 +78,7 @@ const INFLIGHT_WAIT_QUALIFIED: Status = Status::Qualified {
 const CHUNK_PUBLISH_QUALIFIED: Status = Status::Qualified {
     evidence: &[
         "agent/prefix-cache v2, 12B H100 prefix-repetition 2048 shared + 6144 unique, C16, default vs =0: TTFT mean/median 1097.6/405.1 vs 1123.5/609.4 ms, TPOT 48.2 vs 47.6, tok/s 281.0 vs 283.3",
+        "agent/prefix-cache v5 ABAB, prefix-repetition 2048 + 256, C16, default vs =0: 12B TTFT mean 318.9/327.3 vs 311.2/280.2 ms, median 239.6/235.7 vs 250.9/241.0; 26B mean 200.5/214.5 vs 182.5/220.6; hits, TPOT, tok/s equal (neutral within session spread)",
         "docs/flags-reference.md: `=0` is the rollback",
     ],
 };
