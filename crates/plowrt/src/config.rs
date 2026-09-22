@@ -187,11 +187,6 @@ pub struct RuntimeConfig {
     #[arg(long = "pf-interleave-adaptive", env = "PLOW_PF_INTERLEAVE_ADAPTIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_interleave_adaptive: bool,
 
-    /// Size a prefill pack's rows so the decode rows riding its launch (unified token batch)
-    /// fit the same bucket instead of spilling it into the next rung. CUDA packed prefill only.
-    #[arg(long = "pf-decode-fit", env = "PLOW_PF_DECODE_FIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_decode_fit: bool,
-
     /// Per-request prefill chunk-row cap. 0 = off.
     #[arg(
         long = "pf-chunk",

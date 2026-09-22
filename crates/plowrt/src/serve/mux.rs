@@ -3701,16 +3701,6 @@ fn queue_pack_rows(rows: &[usize], chunk_cost: usize, bound: usize) -> usize {
     total
 }
 
-/// Prefill rows for a launch when `decode_rows` ride it (unified token batch, `PLOW_PF_DECODE_FIT`):
-/// `bucket` is the cost-aware pick for prefill AND decode rows, and the prefill share is what the
-/// decode rows leave of it. Picking the bucket for the prefill rows alone spilled a full pack into
-/// the next rung: 2 x 1024-row prompts + 12 decode rows ran the 4096 bucket (148 ms, vs 87 ms for
-/// the 2048 bucket), and so did every `PLOW_PF_INTERLEAVE=2048` launch.
-#[cfg(feature = "cuda")]
-fn fit_decode_rows(want: usize, bucket: usize, decode_rows: usize) -> usize {
-    want.min(bucket.saturating_sub(decode_rows)).max(1)
-}
-
 /// Prompt rows one model may consume while holding its device turn, when there
 /// is no prefill object and the prompt is fed token by token. A bound on
 /// launches per turn rather than on a bucket's rows: ~256 decode-shaped
@@ -4873,19 +4863,6 @@ mod tests {
         assert_eq!(super::co_sched_prefill_rows(8192, 512), 512);
         // Never zero: the caller uses this as a chunk width.
         assert_eq!(super::co_sched_prefill_rows(0, 0), 1);
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn fitted_decode_rows_never_spill_the_pack_into_the_next_bucket() {
-        // A full pack gives the decode rows their share of the bucket.
-        assert_eq!(super::fit_decode_rows(2048, 2048, 12), 2036);
-        assert_eq!(super::fit_decode_rows(4208, 4224, 16), 4208);
-        // A pack with headroom in its bucket keeps every row it wanted.
-        assert_eq!(super::fit_decode_rows(1024, 1088, 16), 1024);
-        assert_eq!(super::fit_decode_rows(4096, 4160, 14), 4096);
-        // Never an empty launch.
-        assert_eq!(super::fit_decode_rows(64, 16, 16), 1);
     }
 
     #[cfg(feature = "cuda")]

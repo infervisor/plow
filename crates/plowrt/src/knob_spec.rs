@@ -383,7 +383,6 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_batch", Some("PLOW_PF_BATCH"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_interleave", Some("PLOW_PF_INTERLEAVE"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_interleave_adaptive", Some("PLOW_PF_INTERLEAVE_ADAPTIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.pf_decode_fit", Some("PLOW_PF_DECODE_FIT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.rung_fast_probe", Some("PLOW_RUNG_FAST_PROBE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.mux_inline_tick", Some("PLOW_MUX_INLINE_TICK"), Layer::Runtime, Domain::Bool, UNSET, INLINE_TICK_QUALIFIED),
     KnobSpec::new("rt.pf_chunk", Some("PLOW_PF_CHUNK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
