@@ -4568,7 +4568,14 @@ fn emit_phase(
         // prefers ns23; microbench 0.436 vs 0.497) — with PLOW_FP8_KV unset the packet stays
         // byte-identical. Same <=128 sanity cap idea as the 31B block; PLOW_NS_ABS/PLOW_NS_FULL_ABS
         // still override below.
-        let ns = if gemv_family && full && ctx >= 4096 && (c.kvh_full == 1 || c.kvh_full == 2 || fp8_kv) {
+        // The Gemma-4 H100 packets widen this to bf16 KV, kvh_full 1/2 and ctx >= 4096. AMD keeps
+        // the measured signature above, so its packets are unchanged.
+        let aligned_full = if amd {
+            ctx > 8192 && c.kvh_full == 1 && fp8_kv
+        } else {
+            ctx >= 4096 && (c.kvh_full == 1 || c.kvh_full == 2 || fp8_kv)
+        };
+        let ns = if gemv_family && full && aligned_full {
             let n_grp = (heads / fa_gf_full()).max(1);
             let aligned = n_cu / gcd(n_grp, n_cu);
             let cand = ns.div_ceil(aligned) * aligned;
