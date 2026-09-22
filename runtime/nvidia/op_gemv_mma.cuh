@@ -371,3 +371,100 @@ __device__ __forceinline__ void gemv_qkv_rows_mma(
         }
     }
 }
+
+/* CLAIM-AHEAD L2 PREFETCH (PLOW_GEMV_PREFETCH, the AMD L8 knob). The interpreter calls these
+ * between a packet's claim and its gate: the block asks L2 for the head of every stream its walk
+ * starts with, so the slice's first k-steps come from L2 once the gate opens and HBM works through
+ * the narrow producers (NRN, attention, the previous walk's tail) instead of idling. The budget is
+ * split evenly over the heads because the block finishes with its slowest warp. The shapes mirror
+ * the walks above; a mismatch costs bandwidth, never correctness (hints only). Gemma-4-12B
+ * step_bench ms at B=1/4/16, ctx 192 (control 10.55/10.75/11.44): 16 KiB 10.48/10.65/11.47,
+ * 32 KiB 10.44/10.60/11.43, 48 KiB 10.43/10.58/11.44, 64 KiB 10.44/10.57/11.41, 128 KiB
+ * 10.48/10.66/11.48, 256 KiB 10.49/10.76/11.64 — past ~64 KiB the prefetch competes with the
+ * walks still in flight. */
+#if PLOW_GEMV_PREFETCH
+#ifndef PLOW_NV_GEMV_PF_BYTES
+#define PLOW_NV_GEMV_PF_BYTES 65536u
+#endif
+__device__ __forceinline__ void gvmma_pf_l2(const __nv_bfloat16* p, unsigned bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
+}
+/* Bytes per head: the budget over `heads`, at most one span, whole 128 B lines. */
+__device__ __forceinline__ unsigned gvmma_pf_bytes(unsigned heads, unsigned span_cols) {
+    unsigned b = PLOW_NV_GEMV_PF_BYTES / heads;
+    if (b > span_cols * 2u) b = span_cols * 2u;
+    return b & ~127u;
+}
+/* Rows [row0, row0 + nrow) of W, each as S heads at columns 0, K/S, 2K/S, ... */
+__device__ __forceinline__ void gvmma_pf_heads(const __nv_bfloat16* W, unsigned row0, unsigned nrow,
+                                               unsigned K, unsigned S, unsigned bytes) {
+    const unsigned span = K / S;
+    for (unsigned p = threadIdx.x; p < nrow * S; p += blockDim.x)
+        gvmma_pf_l2(W + (size_t)(row0 + p / S) * K + (p % S) * span, bytes);
+}
+/* gemv_rows_mma: R row blocks in the first wave, S K-spans each. */
+__device__ __forceinline__ void gvmma_pf_rows(const __nv_bfloat16* W, unsigned N, unsigned K,
+                                              unsigned slice, unsigned nblk) {
+    const gvmma_range r = gvmma_partition(N, slice, nblk);
+    const unsigned per = r.rb1 - r.rb0, nkb = K >> 5;
+    if (per == 0u || (K & 31u)) return;
+    unsigned R = per < PLOW_NV_WARPS ? per : PLOW_NV_WARPS, S = 1u;
+    bool paired = false;
+#if PLOW_NV_GEMV_MMA_PAIR
+    const unsigned ngrp = (per + 1u) >> 1;
+    unsigned gpow = 1u;
+    while (gpow < ngrp) gpow <<= 1;
+    if (gpow <= PLOW_NV_WARPS / 2u && (nkb % (PLOW_NV_WARPS / gpow)) == 0u) {
+        R = per; S = PLOW_NV_WARPS / gpow; paired = true;
+    } else if (per >= 2u * PLOW_NV_WARPS) {
+        R = 2u * PLOW_NV_WARPS; paired = true;
+    }
+#endif
+    if (!paired) {
+        unsigned per_pow = 1u;
+        while (per_pow < per) per_pow <<= 1;
+        if (per_pow <= PLOW_NV_WARPS / 2u && (nkb % (PLOW_NV_WARPS / per_pow)) == 0u) {
+            R = per; S = PLOW_NV_WARPS / per_pow;
+        }
+    }
+    const unsigned row0 = r.rb0 << 3;
+    const unsigned nrow = (R << 3) < N - row0 ? (R << 3) : N - row0;
+    const unsigned bytes = gvmma_pf_bytes(nrow * S, K / S);
+    if (bytes) gvmma_pf_heads(W, row0, nrow, K, S, bytes);
+}
+/* gemv_glu_rows_mma: one row block per warp, gate and up. */
+__device__ __forceinline__ void gvmma_pf_glu(const __nv_bfloat16* Wg, const __nv_bfloat16* Wu,
+                                             unsigned N, unsigned K, unsigned slice, unsigned nblk) {
+    const gvmma_range r = gvmma_partition(N, slice, nblk);
+    const unsigned per = r.rb1 - r.rb0;
+    if (per == 0u || (K & 31u)) return;
+    const unsigned row0 = r.rb0 << 3;
+    const unsigned R = per < PLOW_NV_WARPS ? per : PLOW_NV_WARPS;
+    const unsigned nrow = (R << 3) < N - row0 ? (R << 3) : N - row0;
+    const unsigned bytes = gvmma_pf_bytes(2u * nrow, K);
+    if (!bytes) return;
+    gvmma_pf_heads(Wg, row0, nrow, K, 1u, bytes);
+    gvmma_pf_heads(Wu, row0, nrow, K, 1u, bytes);
+}
+/* gemv_qkv_rows_mma: one row block per warp over the concatenated [q; k; v] rows. */
+__device__ __forceinline__ void gvmma_pf_qkv(const __nv_bfloat16* Wq, const __nv_bfloat16* Wk,
+                                             const __nv_bfloat16* Wv, unsigned Nq, unsigned Nk,
+                                             unsigned Nv, unsigned K, unsigned slice, unsigned nblk) {
+    const unsigned Nx = Nq + Nk + Nv;
+    const gvmma_range r = gvmma_partition(Nx, slice, nblk);
+    const unsigned per = r.rb1 - r.rb0;
+    if (per == 0u || (K & 31u)) return;
+    const unsigned row0 = r.rb0 << 3;
+    const unsigned R = per < PLOW_NV_WARPS ? per : PLOW_NV_WARPS;
+    const unsigned nrow = (R << 3) < Nx - row0 ? (R << 3) : Nx - row0;
+    const unsigned bytes = gvmma_pf_bytes(nrow, K);
+    if (!bytes) return;
+    for (unsigned p = threadIdx.x; p < nrow; p += blockDim.x) {
+        const unsigned g = row0 + p;
+        const __nv_bfloat16* w = g < Nq ? Wq + (size_t)g * K
+                               : g < Nq + Nk ? Wk + (size_t)(g - Nq) * K
+                                             : Wv + (size_t)(g - Nq - Nk) * K;
+        gvmma_pf_l2(w, bytes);
+    }
+}
+#endif
