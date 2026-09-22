@@ -37,19 +37,10 @@ precision = "bf16"
 [emit]
 args = ["--segmented"]
 [emit.env]
-PLOW_SEG_PURE_GEMM = "1"
-PLOW_SEG_FA512 = "1"
-PLOW_SEG_FA256_GQA2 = "1"
-PLOW_TMA_GEMM = "1"
-PLOW_EMIT_PREFILL_CUBLASLT = "1"
-PLOW_NO_GLU_FUSE = "1"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
 # Rungs of >= 8 rows sort their B*k slots by expert and run the routed experts through the
 # grouped tensor-core GEMMs (step_bench ms/step at B=8/16: 16.3 -> 14.3, 27.0 -> 18.0).
 PLOW_GEMMA_MOE_DEC_GROUP = "8"
-PLOW_SLIDING_NS_GRID = "1"
-PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
-PLOW_SLIDING_NS_CAP = "1"
 # FINE-GRAINED RUNGS. The server re-tokenises and prepends BOS, so an N-token bench prompt is
 # N+1 rows and crosses its rung: measured 25 -> 42 ms at 128|129 rows, 62 -> 91 at 1024|1025,
 # 177 -> 202 at 4096|4097, 368 -> 394 at 8192|8193 (one more token, +17..29 ms: either the next
@@ -79,30 +70,9 @@ role_files = [
   "interp_sm90a_pfattn_hd256_bkv32.cubin",
 ]
 [objects.env]
-# FATLITE strips the native GEMM / GLU / flash arms the fat object never runs here (Lt, the GEMM
-# object and the FA objects own them); FATLITE_MOE keeps the Gemma MoE prefill opcodes in it, at
-# occ-1 with the full register budget their 128 accumulators need. Plain FATLITE=1 compiles the
-# MoE cases OUT and no other object implements them. Block outputs are bit-identical to the
-# unstripped object; the unstripped 255-register build spills, and the MoE segment ran 0.3 / 0.9
-# ms per layer slower in it at 1k / 4k (in-situ block bisect, 2026-09-20).
-PLOW_BUILD_FATLITE = "1"
-PLOW_BUILD_FATLITE_MOE = "1"
 # The MoE-down lane split (PLOW_MOE_DOWN_SG=8, measured on this board) is NOT set here: this env
 # only reaches the segments script, and the decode object is built from the manifest. It is a
 # manifest rule now (tuning.moe_down_sg -> plow_config.h), which every object of the packet sees.
-PLOW_BUILD_FA_GQA2_PAIR = "1"
-PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
-PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
-PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
-PLOW_BUILD_MASKED_PADDING = "1"
-# MUST be 1: the role file interp_sm90a_pfattn_hd512.cubin carries the ABI
-# `attention_sm90_hd512_wg32_v1`, i.e. the WGMMA BQ64 body. Building it with WG=0
-# emits the mma.sync BQ32 body instead, so the object's block/warp geometry does not
-# match what the role dispatch assumes. The 12B recipe sets 1 for the same reason.
-PLOW_BUILD_PFATTN_WG = "1"
-PLOW_BUILD_PFATTN_KV16 = "0"
-PLOW_BUILD_PFATTN_KV64 = "0"
-PLOW_BUILD_PFATTN_QK_UNROLL = "4"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"

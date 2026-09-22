@@ -33,13 +33,29 @@ gemma_flags=(
   -DPLOW_NV_GEMV_RB=1 -DPLOW_MOE_DOWN_LANESPLIT=1 -DPLOW_NV_FA_WPR=1
   -DPLOW_NV_FP8_RB=4 -DPLOW_NV_TMA_GEMM=1 -DPLOW_NV_QUANT_WPR=1
 )
+gemma_w8a8=0
 if [ "${PLOW_BUILD_W8A8:-0}" = 1 ] ||
    { [ -n "${PLOW_CUBIN_CONFIG:-}" ] && grep -qx '#define PLOW_HAS_QUANT_FP8 1' "$PLOW_CUBIN_CONFIG"; }; then
+  gemma_w8a8=1
   gemma_flags+=(
     -DPLOW_NV_W8A8=1
     -DPGM90_FP8_PROMOTE="${PLOW_W8A8_PROMOTE:-1}"
   )
 fi
+# BF16 packets default to the H100 recipe's object set; each PLOW_BUILD_* below still overrides.
+# FATLITE: the light-op object (flash arms out, 128-reg cap, 2 blocks/SM; 12B -2.8 ms @1024,
+# -4.8 ms @4096, bit-identical). A Gemma MoE packet keeps its grouped prefill bodies in it
+# (FATLITE_MOE): no other object implements them. MASKED_PADDING also builds the WGMMA BQ64 hd512
+# role object (interp_sm90a_pfattn_hd512.cubin).
+gemma_bf16=$((1 - gemma_w8a8))
+gemma_moe_pf=0
+if [ -n "${PLOW_CUBIN_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_HAS_MOE_GROUP_GLU_GEMMA_PF 1' "$PLOW_CUBIN_CONFIG"; then
+  gemma_moe_pf=1
+fi
+gemma_fatlite=${PLOW_BUILD_FATLITE:-$gemma_bf16}
+gemma_fatlite_moe=${PLOW_BUILD_FATLITE_MOE:-$((gemma_fatlite == 1 ? gemma_moe_pf : 0))}
+gemma_masked=${PLOW_BUILD_MASKED_PADDING:-$gemma_bf16}
 # Raw extra nvcc flags for every segment object: the A/B arm of a kernel default on a block packet.
 if [ -n "${PLOW_BUILD_SEG_EXTRA_DEFINES:-}" ]; then
   read -r -a gemma_extra_flags <<<"$PLOW_BUILD_SEG_EXTRA_DEFINES"
@@ -49,7 +65,7 @@ for gemma_packed in 0 1; do
   gemma_prefix=pf
   if [ "$gemma_packed" = 1 ]; then gemma_prefix=pfpacked; fi
   gemma_padding_flags=()
-  if [ "$gemma_packed" = 1 ] && [ "${PLOW_BUILD_MASKED_PADDING:-0}" = 1 ]; then
+  if [ "$gemma_packed" = 1 ] && [ "$gemma_masked" = 1 ]; then
     gemma_padding_flags=(-DPLOW_NV_MASKED_PADDING=1)
   fi
   for gemma_role in gemm fa; do
@@ -74,17 +90,17 @@ for gemma_packed in 0 1; do
   done
   # A packet config binds the packed light object to that packet even when its
   # implementation flags are unchanged.
-  if [ "$gemma_packed" = 1 ] && { [ -n "${PLOW_CUBIN_CONFIG:-}" ] || [ "${PLOW_BUILD_FATLITE:-0}" = 1 ] || [ "${PLOW_BUILD_MASKED_PADDING:-0}" = 1 ]; }; then
+  if [ "$gemma_packed" = 1 ] && { [ -n "${PLOW_CUBIN_CONFIG:-}" ] || [ "$gemma_fatlite" = 1 ] || [ "$gemma_masked" = 1 ]; }; then
     env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
       "${gemma_flags[@]}" "${gemma_config_flags[@]}" "${gemma_padding_flags[@]}" -DPLOW_NV_PACKED_REQUEST=1 \
-      -DPLOW_NV_FATLITE="${PLOW_BUILD_FATLITE:-0}" \
-      -DPLOW_NV_FATLITE_MOE="${PLOW_BUILD_FATLITE_MOE:-0}" -DPGM90_TMA_STAGES=3 \
+      -DPLOW_NV_FATLITE="$gemma_fatlite" \
+      -DPLOW_NV_FATLITE_MOE="$gemma_fatlite_moe" -DPGM90_TMA_STAGES=3 \
       -o "$gemma_out/interp_sm90a_pfpackedseg.cubin" runtime/nvidia/interp_sm90a.cu
   fi
 done
-if [ "${PLOW_BUILD_FA_GQA2_PAIR:-0}" = 1 ]; then
+if [ "${PLOW_BUILD_FA_GQA2_PAIR:-$gemma_bf16}" = 1 ]; then
   gemma_gqa2_padding_flags=()
-  if [ "${PLOW_BUILD_MASKED_PADDING:-0}" = 1 ]; then
+  if [ "$gemma_masked" = 1 ]; then
     gemma_gqa2_padding_flags=(-DPLOW_NV_MASKED_PADDING=1)
   fi
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
@@ -201,13 +217,13 @@ if [ "${PLOW_BUILD_PFATTN_HD256_BKV64:-0}" = 1 ]; then
     -o "$gemma_out/interp_sm90a_pfattn_hd256_bkv64.cubin" \
     runtime/nvidia/interp_sm90a_pfattn_hd256_bkv64.cu
 fi
-if [ "${PLOW_BUILD_PFATTN_HD256_BKV32:-0}" = 1 ]; then
+if [ "${PLOW_BUILD_PFATTN_HD256_BKV32:-$gemma_bf16}" = 1 ]; then
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \
     -o "$gemma_out/interp_sm90a_pfattn_hd256_bkv32.cubin" \
     runtime/nvidia/interp_sm90a_pfattn_hd256_bkv32.cu
 fi
-if [ "${PLOW_BUILD_PFATTN_HD256_GQA2_BKV32:-0}" = 1 ]; then
+if [ "${PLOW_BUILD_PFATTN_HD256_GQA2_BKV32:-$gemma_bf16}" = 1 ]; then
   gemma_gqa2_log=$(mktemp)
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \
@@ -232,11 +248,11 @@ if [ "${PLOW_BUILD_PFATTN_HD256_GQA2_BKV32:-0}" = 1 ]; then
     }
   done
 fi
-if [ "${PLOW_BUILD_MASKED_PADDING:-0}" = 1 ]; then
+if [ "$gemma_masked" = 1 ]; then
   pfattn_wg=${PLOW_BUILD_PFATTN_WG:-1}
   pfattn_kv16=${PLOW_BUILD_PFATTN_KV16:-0}
-  pfattn_kv64=${PLOW_BUILD_PFATTN_KV64:-$((pfattn_wg ? 1 - pfattn_kv16 : 0))}
-  pfattn_qk_unroll=${PLOW_BUILD_PFATTN_QK_UNROLL:-$((pfattn_kv16 ? 4 : 32))}
+  pfattn_kv64=${PLOW_BUILD_PFATTN_KV64:-0}
+  pfattn_qk_unroll=${PLOW_BUILD_PFATTN_QK_UNROLL:-4}
   pfattn_tma=${PLOW_BUILD_PFATTN_TMA:-$pfattn_wg}
   if [ "$pfattn_wg" = 0 ] && { [ "$pfattn_kv16" != 0 ] || [ "$pfattn_kv64" != 0 ]; }; then
     echo 'BQ32/BKV16 px4 requires PLOW_BUILD_PFATTN_KV16=0 and PLOW_BUILD_PFATTN_KV64=0.' >&2

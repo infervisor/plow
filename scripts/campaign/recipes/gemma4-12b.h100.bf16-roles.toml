@@ -18,12 +18,6 @@ precision = "bf16"
 [emit]
 args = ["--segmented"]
 [emit.env]
-PLOW_SEG_PURE_GEMM = "1"
-PLOW_SEG_FA512 = "1"
-PLOW_SEG_FA256_GQA2 = "1"
-PLOW_TMA_GEMM = "1"
-PLOW_EMIT_PREFILL_CUBLASLT = "1"   # projections and gate/up on cuBLASLt (policy: plow-asset segment_roles)
-PLOW_NO_GLU_FUSE = "1"             # gate/up as two GEMMs + GeGLU pass; the fused role is off
 PLOW_DECODE_BATCH_LADDER = "1"     # C1 cell; widen to 1,2,4,8,16 for C4/C16 (41 GiB KV at ctx 8192)
 PLOW_MAX_CHUNK = "4096"
 
@@ -36,10 +30,6 @@ role_files = [
   "interp_sm90a_pfgemm_glu_gemma4.cubin",
 ]
 [objects.env]
-PLOW_BUILD_FATLITE = "1"           # light-op object: flash arms out, 128-reg cap, launches at 2 blocks/SM (2026-09-17: -2.8 ms @1024, -4.8 ms @4096, bit-identical)
-PLOW_BUILD_FA_GQA2_PAIR = "1"
-PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
-PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
 
 [emit_roles.env]

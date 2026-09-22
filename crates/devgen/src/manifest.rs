@@ -1125,11 +1125,11 @@ pub(crate) const UNRECORDED_ENV: &[&str] = &[
     "PLOW_MOE_DECODE_STANDALONE",
     "PLOW_PHASE_OBJECTS",
     "PLOW_SEG_CLASS_SLICE",
+    // SEG_FA256_GQA2, SEG_FA512 and SEG_PURE_GEMM: the packet crate retains an env fallback for
+    // direct callers, while plowc carries the resolved EmitConfig field into its SegKnobs snapshot.
     "PLOW_SEG_FA256_GQA2",
     "PLOW_SEG_FA512",
     "PLOW_SEG_PER_OP",
-    // The packet crate retains an env fallback for direct callers, while plowc
-    // carries the resolved EmitConfig field into its SegKnobs snapshot.
     "PLOW_SEG_PURE_GEMM",
     "PLOW_SEG_SLICE_ALL",
     "PLOW_SEG_V2",

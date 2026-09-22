@@ -15,22 +15,17 @@ n_cu = 132
 max_ctx = 16384
 precision = "bf16"
 
+# Production defaults for BF16 Gemma-4 on sm_90a TP1 (knob_spec GEMMA4_HOPPER, LT_GLU_TARGET):
+# pure-GEMM segments + TMA maps, cuBLASLt gate/up, hd512 / HD256-GQA2 attention segments,
+# sliding decode nsplit cap + grid floor, full-attention decode GF 4, and (dense) the decode GEMV
+# L2 prefetch. Only geometry and per-model tuning stay here.
 [emit]
 args = ["--segmented"]
 [emit.env]
-PLOW_SEG_PURE_GEMM = "1"
-PLOW_SEG_FA512 = "1"
-PLOW_SEG_FA256_GQA2 = "1"
-PLOW_TMA_GEMM = "1"
-PLOW_EMIT_PREFILL_CUBLASLT = "1"
-PLOW_NO_GLU_FUSE = "1"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
 # The BF16 NRN2 -> q/k/v fold (c1f1ac38) decodes garbage on the H100, and not the same garbage
 # twice: first token right, the rest noise. Off until the fold arm is qualified here.
 PLOW_NO_FUSE_NRN = "1"
-PLOW_SLIDING_NS_GRID = "1"
-PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
-PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
-PLOW_SLIDING_NS_CAP = "1"
 PLOW_MAX_CHUNK = "4096"
 # FINE-GRAINED RUNGS, as in the 26B recipes: the server prepends BOS, so an N-token bench prompt
 # is N+1 rows and crosses its rung — without these a 129-row prompt runs the 512 bucket and a
@@ -45,9 +40,6 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 # -0.30/-0.51/-1.02 ms at B=1/4/16 (ctx 1024), served 128/C16 TPOT 12.68 -> 11.80 ms, 1024/C16
 # 17.55 -> 15.82; f32 oracle relL2 0.0016-0.0017, greedy digests identical (agent/dec-batched-attn).
 PLOW_FA_MMAQK = "3"
-# Claim-ahead L2 prefetch of each decode GEMV walk's first 64 KiB (1b0eb435; objects from the same
-# tree). step_bench p12r ctx 192: B=1 10.55 -> 10.44, B=4 10.75 -> 10.57, B=16 11.44 -> 11.41 ms.
-PLOW_GEMV_PREFETCH = "1"
 PLOW_NS_FULL_ABS = "66"
 
 [objects]
@@ -60,16 +52,9 @@ role_files = [
   "interp_sm90a_pfgemm_glu_gemma4.cubin",
 ]
 [objects.env]
-PLOW_BUILD_FATLITE = "1"
-PLOW_BUILD_FA_GQA2_PAIR = "1"
-PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
-PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+# The px4 BQ64 hd512 object hardcodes n_kv_head=1 (the 12B's full-attention geometry). The rest
+# of the BF16 object set is the script's default.
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
-PLOW_BUILD_MASKED_PADDING = "1"
-PLOW_BUILD_PFATTN_WG = "1"
-PLOW_BUILD_PFATTN_KV16 = "0"
-PLOW_BUILD_PFATTN_KV64 = "0"
-PLOW_BUILD_PFATTN_QK_UNROLL = "4"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"

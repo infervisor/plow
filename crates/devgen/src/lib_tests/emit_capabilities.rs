@@ -498,3 +498,53 @@ fn glm_seq_par_and_fold_defaults_roll_back_per_knob() {
         assert_eq!(rec[id].1, "default", "{id}");
     }
 }
+
+/// `knob_spec::GEMMA4_HOPPER`: the H100 Gemma-4 recipe's generic arms follow the config-derived
+/// caps (`full_attn_hd512`, `moe`), the BF16 sm_90a TP1 target, and yield to an explicit value.
+#[test]
+fn gemma4_hopper_defaults_follow_config_caps() {
+    let caps = |cfg: Value| emit_capabilities("gemma4").with_config(Some(&cfg));
+    let dense = caps(serde_json::json!({"text_config": {"global_head_dim": 512}}));
+    let moe = caps(serde_json::json!({"text_config": {"global_head_dim": 512, "num_experts": 128}}));
+    assert_eq!(dense.caps().last(), Some(&"full_attn_hd512"));
+    assert!(moe.caps().contains(&"moe"));
+    let defaults = |caps: EmitCapabilities, argv: &[&str], arch: &str, tp: u32| {
+        let mut cfg = EmitArgsForTest::try_parse_from(argv).unwrap().emit;
+        apply_production_defaults(&mut cfg, caps, arch, tp, 132);
+        cfg
+    };
+
+    let cfg = defaults(dense, &["test"], "sm_90a", 1);
+    assert!(cfg.tma_gemm && cfg.sliding_ns_grid && cfg.sliding_ns_cap && cfg.gemv_prefetch);
+    assert_eq!(cfg.attention_decode_balance_gf, Some(4));
+    assert_eq!(cfg.seg_fa512.as_deref(), Some("1"));
+    assert_eq!(cfg.seg_fa256_gqa2, Some(true));
+    assert!(!cfg.moe_pf_lt && !cfg.moe_dec_lt);
+    assert_eq!(cfg.gemma_moe_dec_group, None);
+
+    let cfg = defaults(moe, &["test"], "sm_90a", 1);
+    assert!(cfg.tma_gemm && cfg.moe_pf_lt && cfg.moe_dec_lt && !cfg.gemv_prefetch);
+    assert_eq!(cfg.gemma_moe_dec_group, Some(4));
+
+    let cfg = defaults(moe, &["test", "--gemma-moe-dec-group=8", "--emit-seg-fa512=0"], "sm_90a", 1);
+    assert_eq!(cfg.gemma_moe_dec_group, Some(8));
+    assert_eq!(cfg.seg_fa512.as_deref(), Some("0"));
+
+    for (caps, argv, arch, tp) in [
+        (emit_capabilities("gemma4"), &["test"][..], "sm_90a", 1),
+        (dense, &["test", "--fp8"][..], "sm_90a", 1),
+        (dense, &["test", "--w8a8"][..], "sm_90a", 1),
+        (dense, &["test"][..], "gfx942", 1),
+        (dense, &["test"][..], "sm_90a", 2),
+        (moe, &["test"][..], "sm_120a", 1),
+    ] {
+        let cfg = defaults(caps, argv, arch, tp);
+        assert!(
+            !cfg.tma_gemm && !cfg.sliding_ns_grid && !cfg.gemv_prefetch && !cfg.moe_pf_lt,
+            "{argv:?} {arch} tp={tp}"
+        );
+        assert_eq!(cfg.attention_decode_balance_gf, None);
+        assert_eq!(cfg.seg_fa512, None);
+        assert_eq!(cfg.seg_fa256_gqa2, None);
+    }
+}

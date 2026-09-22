@@ -21,17 +21,8 @@ precision = "bf16"
 [emit]
 args = ["--segmented"]
 [emit.env]
-PLOW_SEG_PURE_GEMM = "1"
-PLOW_SEG_FA512 = "1"
-PLOW_SEG_FA256_GQA2 = "1"
-PLOW_TMA_GEMM = "1"
-PLOW_EMIT_PREFILL_CUBLASLT = "1"
-PLOW_NO_GLU_FUSE = "1"
 PLOW_NO_FUSE_NRN = "1"
-PLOW_SLIDING_NS_GRID = "1"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
-PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
-PLOW_SLIDING_NS_CAP = "1"
 PLOW_MAX_CHUNK = "4096"
 # Per-request rows per launch; sizes the sliding ring (see the header). Must be a prefill rung.
 PLOW_MAX_REQUEST_CHUNK = "1024"
@@ -52,16 +43,7 @@ role_files = [
   "interp_sm90a_pfgemm_glu_gemma4.cubin",
 ]
 [objects.env]
-PLOW_BUILD_FATLITE = "1"
-PLOW_BUILD_FA_GQA2_PAIR = "1"
-PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
-PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
-PLOW_BUILD_MASKED_PADDING = "1"
-PLOW_BUILD_PFATTN_WG = "1"
-PLOW_BUILD_PFATTN_KV16 = "0"
-PLOW_BUILD_PFATTN_KV64 = "0"
-PLOW_BUILD_PFATTN_QK_UNROLL = "4"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"

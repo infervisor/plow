@@ -20,19 +20,10 @@ precision = "bf16"
 [emit]
 args = ["--segmented"]
 [emit.env]
-PLOW_SEG_PURE_GEMM = "1"
-PLOW_SEG_FA512 = "1"
-PLOW_SEG_FA256_GQA2 = "1"
-PLOW_TMA_GEMM = "1"
-PLOW_EMIT_PREFILL_CUBLASLT = "1"
-PLOW_NO_GLU_FUSE = "1"
 # The BF16 NRN2 -> q/k/v fold (c1f1ac38) decodes garbage on the H100, and not the same garbage
 # twice: first token right, the rest noise. Off until the fold arm is qualified here.
 PLOW_NO_FUSE_NRN = "1"
-PLOW_SLIDING_NS_GRID = "1"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
-PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
-PLOW_SLIDING_NS_CAP = "1"
 PLOW_MAX_CHUNK = "1024"
 PLOW_FUSE_ARGMAX = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
@@ -41,16 +32,7 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 script = "scripts/build_sm90a_gemma4_segments.sh"
 role_files = []
 [objects.env]
-PLOW_BUILD_FATLITE = "1"
-PLOW_BUILD_FA_GQA2_PAIR = "1"
-PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
-PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
-PLOW_BUILD_MASKED_PADDING = "1"
-PLOW_BUILD_PFATTN_WG = "1"
-PLOW_BUILD_PFATTN_KV16 = "0"
-PLOW_BUILD_PFATTN_KV64 = "0"
-PLOW_BUILD_PFATTN_QK_UNROLL = "4"
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
