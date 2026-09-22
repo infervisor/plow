@@ -1017,43 +1017,37 @@ static __device__ __forceinline__ void plow_moe_gemma_topk_warp(unsigned char* t
         for (unsigned e = 0; e < n_exp; e++) s += sc[e]; /* original order, exact */
     s = __shfl_sync(~0u, s, 0);
     for (unsigned e = lane; e < n_exp; e += 32u) sc[e] /= s;
-    __syncwarp();
 
+    /* Lane j owns slot j (k <= PLOW_MOE_MAX_TOPK = 16, devgen::require_moe_topk) and each lane only touches its own experts
+     * e = lane + 32i, so the rounds need no warp barrier. The winner is the max ordered score,
+     * lowest id on ties (the old packed 64-bit key), found with two 32-bit redux ops. The pes
+     * loads issue per round instead of as a serial table read-back chain after the scan; gs sums
+     * the slot gates in slot order, so every stored value is unchanged. */
+    unsigned win = 0u;
+    float gate = 0.0f, pe = 0.0f;
     for (unsigned j = 0; j < k; j++) {
-        unsigned long long best = 0ull;
+        unsigned best = 0u, bid = ~0u;
+        float bval = 0.0f;
         for (unsigned e = lane; e < n_exp; e += 32u) {
             unsigned sb;
             const float scv = sc[e];
             __builtin_memcpy(&sb, &scv, 4);
             sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
-            const unsigned long long key =
-                ((unsigned long long)sb << 20) |
-                (unsigned long long)((n_exp - 1u - e) & 0xFFFFFu);
-            if (key > best) best = key;
+            if (bid == ~0u || sb > best) { best = sb; bid = e; bval = scv; }
         }
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            const unsigned long long t = __shfl_xor_sync(~0u, best, o);
-            if (t > best) best = t;
-        }
-        const unsigned bid = n_exp - 1u - (unsigned)(best & 0xFFFFFull);
-        if (lane == 0) {
-            *(unsigned*)(table + (size_t)j * 8) = bid;
-            *(float*)(table + (size_t)j * 8 + 4) = sc[bid];
-            sc[bid] = -1e30f;
-        }
-        __syncwarp();
+        const unsigned top = __reduce_max_sync(~0u, best);
+        const unsigned w = __reduce_min_sync(~0u, (bid != ~0u && best == top) ? bid : ~0u);
+        const float wval = __shfl_sync(~0u, bval, w & 31u);
+        if (lane == j) { win = w; gate = wval; pe = __bfloat162float(pes[w]); }
+        if (lane == (w & 31u)) sc[w] = -1e30f;
     }
-    if (lane == 0) {
-        float gs = 0.0f;
-        for (unsigned j = 0; j < k; j++) gs += *(float*)(table + (size_t)j * 8 + 4);
-        for (unsigned j = 0; j < k; j++) {
-            const unsigned win = *(unsigned*)(table + (size_t)j * 8);
-            float gate = *(float*)(table + (size_t)j * 8 + 4);
-            if (gs != 0.0f) gate /= gs;
-            gate *= __bfloat162float(pes[win]);
-            *(float*)(table + (size_t)j * 8 + 4) = gate;
-        }
+    float gs = 0.0f;
+    for (unsigned j = 0; j < k; j++) gs += __shfl_sync(~0u, gate, j);
+    if (lane < k) {
+        if (gs != 0.0f) gate /= gs;
+        gate *= pe;
+        *(unsigned*)(table + (size_t)lane * 8) = win;
+        *(float*)(table + (size_t)lane * 8 + 4) = gate;
     }
 }
 #endif
