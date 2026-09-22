@@ -683,6 +683,13 @@ pub struct NvidiaRuntimeConfig {
     )]
     pub multistep: u32,
 
+    /// Adaptive multistep (CUDA): a tick runs single-step while an admitted request still has
+    /// prefill left, one waits for admission, or a slot was freed by the previous tick, and the
+    /// full `--multistep` quantum once every live request is in pure decode — so prefill chunks
+    /// are not delayed behind K-step quanta and completions do not batch into arrival waves.
+    #[arg(long = "multistep-adaptive", env = "PLOW_MULTISTEP_ADAPTIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub multistep_adaptive: bool,
+
     /// VMM prefix reuse. Automatically enabled for eligible Hopper hybrid BF16-KV packets.
     #[arg(long = "vmm-prefix", env = "PLOW_VMM_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_prefix: Option<bool>,
