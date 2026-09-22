@@ -5686,8 +5686,8 @@ impl GpuEngine {
         }
 
         // Prefix cache: evict on real device pressure (`cuMemGetInfo`), not the static budget.
-        // The floor is vLLM's headroom (10% of the device), capped at half of what is free after
-        // load so a card the rings nearly fill (26B: 5 GiB) still keeps a working set.
+        // The floor is vLLM's headroom (10% of the device), at most half of what is free after
+        // load; a card the rings nearly fill (26B: 5 GiB) keeps an eighth of it instead.
         if let Some(v) = vmm.as_mut().filter(|v| v.kv.prefix_reuse()) {
             if let Ok((free, total)) = be.mem_info() {
                 let config = crate::config::RuntimeConfig::get();
