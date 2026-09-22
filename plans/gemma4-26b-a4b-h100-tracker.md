@@ -1510,3 +1510,13 @@ column"). 26B-specific numbers, packet `p26i`, 16 prompts:
   15000/C16 2205 ms) at +5-17% C1 TTFT. Wide GQA2 role (4160/4224) is a default; unmeasured on the 26B
   served before e2e3.
 * Generic knobs promoted to defaults (agent/knob-defaults-r2): recipes carry geometry + policy only.
+
+### e2e3 result (p26r4q, same session as vllmuni-e2e3, ledger `a3ea207e`, 0 faults)
+
+* 60 comparisons: 12 ahead. TTFT ahead 11/20. GSM8K 192 vs 191.
+* C1 TTFT 128..15000: 21.44/38.22/102.60/211.28/422.69 vs 38.32/41.88/92.52/178.52/350.38.
+* C1 TPOT 5.46-5.69 vs 5.04-5.10; C16 TPOT 12.04/14.18/22.81/35.98/55.90 vs 8.84/10.08/14.05/21.21/34.92.
+* 15000/C16 TTFT 2430 vs 1574. Peak 75.5-78.9 vs 72.9-73.6 GiB (r3072 is the parity option).
+* Cache-on (prefix_repetition): C4 91.9 vs 98.3 ms, C16 175.7 vs 204.7 ms (both ahead); peak 78.5-78.7
+  vs 73.2-73.5 GiB.
+* `PLOW_FA_MMAQK=3` promoted to a GEMMA4_HOPPER emit default; recipes no longer name it.

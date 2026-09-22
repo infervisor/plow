@@ -1382,3 +1382,13 @@ agents), T1 emit byte-identity + checkpoint S, T2 numerics, T3 rung, T4 served,
   hits 26/35 and 57/67 unchanged; 4096/C16 still +2.7% TTFT cache-on (cause not isolated).
 * Test hygiene: 3 plowrt lib tests fixed (2 also failed on main); AMD gfx942 full-layer nsplit drift from
   `639d1507` gated back to main's rule (`dce1fe05`).
+
+### e2e3 result (p12r4, same session as vllmuni-e2e3, ledger `a3ea207e`, 0 faults)
+
+* 60 comparisons: 16 ahead, 13 parity. TTFT ahead 12/20. C1 TPOT parity (10.42-10.62 vs 10.46-10.56).
+* C1 TTFT 128..15000: 18.26/45.92/169.66/356.52/736.51 vs 30.04/47.24/170.08/348.92/671.77.
+* C16 TPOT still behind: 11.68/16.18/30.27/49.62/84.77 vs 10.90/13.73/22.72/37.45/67.82.
+* Peak memory below vLLM in all 20 cells (65.2-69.1 vs 72.7-74.0 GiB). GSM8K 193 vs 194.
+* C32 on the request-sliced packet p12rq4: TTFT 146.75/597.10/2082.35/4215.96/8154.66 ms.
+* Cache-on (prefix_repetition): C4 128.1 vs 120.8 ms, C16 297.6 vs 282.6 ms; peak 71.8-72.0 vs 73.5-73.9.
+* `PLOW_FA_MMAQK=3` promoted to a GEMMA4_HOPPER emit default; recipes no longer name it.
