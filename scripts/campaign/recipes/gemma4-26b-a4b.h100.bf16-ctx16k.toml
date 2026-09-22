@@ -2,6 +2,9 @@
 # Hybrid dense+MoE: every layer runs a dense MLP (inter 2112) AND a 128-expert
 # top-8 MoE (I_moe 704). 30 layers, hidden 2816, sliding hd256/GQA2, full hd512/GQA8.
 #
+# Production (16 slots), inside `nix develop`: build and serve exactly as in
+# gemma4-12b.h100.bf16-ladder16k.toml's header, with this recipe.
+#
 # Deliberate differences from the 12B recipe, each one forced by a shape check
 # (see plans/gemma4-26b-a4b-h100-tracker.md "Kernel dims"):
 #  - HD512 px4 BQ64 role is OFF: that object hardcodes n_kv_head=1 and 26B has 2.
@@ -66,10 +69,6 @@ PLOW_FUSE_ARGMAX = "0"
 # already tighter than the reference: vLLM's Gemma4Router feeds bf16 h2 into its GateLinear.
 # The prefill router (moe90_router_gemma_pf) makes the same bf16-h2 / f32-logit choice.
 PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
-# Tensor-core Q.K^T in the decode attention (the 12B recipe's setting). step_bench ctx 1024, two
-# interleaved reps: B=1/4/16 5.61/8.51/12.44 -> 5.54/8.34/11.75 ms; GSM8K 8-shot n=200 192/200,
-# same as without it (vLLM 191).
-PLOW_FA_MMAQK = "3"
 
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"

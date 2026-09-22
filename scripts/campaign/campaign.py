@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Perf-campaign driver: one recipe file per measured cell, one command per stage.
 
-    campaign.py build   <recipe.toml> --out DIR        # base emit -> objects -> role emit
+    campaign.py build   <recipe.toml> --out DIR [--hf-dir SNAPSHOT]  # base emit -> objects -> role emit
+    campaign.py serve   <recipe.toml> --assets DIR --profile P [--port N]  # production plowrt serve
     campaign.py bench   <recipe.toml> --assets DIR --out DIR [--concs "1 4"] [--in-lens ...]
     campaign.py compare <results.csv> <reference.csv> [--roofline] [--recipe <recipe.toml>]
     campaign.py roofline <recipe.toml> [--results results.csv]
@@ -95,6 +96,8 @@ def env_with(base: dict, extra: dict) -> dict:
 def cmd_build(a: argparse.Namespace) -> None:
     r = load(a.recipe)
     cell, emit = r["cell"], r["emit"]
+    if getattr(a, "hf_dir", None):
+        cell["hf_dir"] = a.hf_dir
     out = Path(a.out).resolve()
     if out.exists() and any(out.iterdir()):
         die(f"{out} exists and is not empty; a build is reproducible only into a fresh dir")
@@ -236,16 +239,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
     # The one variable of an A/B, named on the command line so the record carries it.
     overrides = dict(kv.split("=", 1) for kv in (a.env or []))
     env.update(overrides)
-    # A `build` places the segment/role objects beside the assets; the serve-side mirror of
-    # the emit classing needs that directory and must not be typed by hand.
-    objects = assets.parent / "objects"
-    if "objects" in r and "PLOW_PF_SEG_DIR" not in env and objects.is_dir():
-        env["PLOW_PF_SEG_DIR"] = str(objects)
-    # A `probe` (or a prior write) leaves the exact-shape cuBLASLt algorithm table beside the
-    # packet; serving with it pins every Lt shape after AlgoCheck instead of re-timing at load.
-    lt_table = assets / "cublaslt_algos.jsonl"
-    if lt_table.is_file() and "PLOW_LT_ALGOS" not in env and "PLOW_LT_ALGOS_WRITE" not in env:
-        env["PLOW_LT_ALGOS"] = str(lt_table)
+    packet_env(r, assets, env)
     env.update({
         "VLLM_VENV": bench.get("vllm_venv", "/opt/pytorch"),
         "HF_HOME": str(out / "hf-home"),
@@ -334,6 +328,46 @@ def cmd_bench(a: argparse.Namespace) -> None:
             print("\n" + generate_roofline_report(Path(a.recipe), out / "results.csv"))
         except Exception as e:
             print(f"campaign: roofline report skipped: {e}", file=sys.stderr)
+
+
+def packet_env(r: dict, assets: Path, env: dict) -> None:
+    # A `build` places the segment/role objects beside the assets; the serve-side mirror of
+    # the emit classing needs that directory and must not be typed by hand.
+    objects = assets.parent / "objects"
+    if "objects" in r and "PLOW_PF_SEG_DIR" not in env and objects.is_dir():
+        env["PLOW_PF_SEG_DIR"] = str(objects)
+    # A `probe` (or a prior write) leaves the exact-shape cuBLASLt algorithm table beside the
+    # packet; serving with it pins every Lt shape after AlgoCheck instead of re-timing at load.
+    lt_table = assets / "cublaslt_algos.jsonl"
+    if lt_table.is_file() and "PLOW_LT_ALGOS" not in env and "PLOW_LT_ALGOS_WRITE" not in env:
+        env["PLOW_LT_ALGOS"] = str(lt_table)
+
+
+# ---------------------------------------------------------------- serve
+def cmd_serve(a: argparse.Namespace) -> None:
+    """Production `plowrt serve` of a recipe-built packet, in the foreground: the env `bench`
+    serves the profile with, minus the matched ladder's prefix-cache pin. No lease, no client."""
+    r = load(a.recipe)
+    serve = dict(r.get("serve", {}))
+    profiles = r.get("bench", {}).get("profiles", {})
+    if a.profile not in profiles:
+        die(f"recipe has no [bench.profiles.{a.profile}]; have {sorted(profiles)}")
+    env = {k: str(v) for k, v in serve.get("env", {}).items()}
+    # [serve.env] pins the cache off so the ladder matches vLLM's --no-enable-prefix-caching;
+    # production takes plowrt's default (on) unless --env sets it.
+    env.pop("PLOW_PREFIX_CACHE", None)
+    env.update({k: str(v) for k, v in profiles[a.profile].get("serve_env", {}).items()})
+    env.update(dict(kv.split("=", 1) for kv in (a.env or [])))
+    assets = Path(a.assets).resolve()
+    if not (assets / "model.pkt").exists():
+        die(f"{assets}/model.pkt missing")
+    packet_env(r, assets, env)
+    plowrt = Path(a.plowrt or serve.get("plowrt", str(REPO / "target" / "release" / "plowrt"))).resolve()
+    cmd = [str(plowrt), "serve", "--assets", str(assets), "--port", str(a.port), *shlex.split(serve.get("extra_args", ""))]
+    print(" ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(env.items())) + " " + shlex.join(cmd), file=sys.stderr)
+    if a.dry_run:
+        return
+    os.execvpe(cmd[0], cmd, env_with(os.environ, env))
 
 
 # ---------------------------------------------------------------- probe
@@ -740,7 +774,14 @@ def main() -> None:
     b.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the emit env; recorded")
     b.add_argument("--no-probe", action="store_true", help="skip the leased cuBLASLt algorithm probe even with the GPU present")
     b.add_argument("--store-cell", help="tune-store cell for the probe (default h100)")
+    b.add_argument("--hf-dir", help="checkpoint snapshot on this host, replacing [cell].hf_dir; recorded")
     b.set_defaults(f=cmd_build)
+    s = sp.add_parser("serve"); s.add_argument("recipe"); s.add_argument("--assets", required=True)
+    s.add_argument("--profile", required=True, help="serving policy from [bench.profiles.*] (e.g. realtime, high_concurrency)")
+    s.add_argument("--port", type=int, default=8080); s.add_argument("--plowrt", help="plowrt binary (default target/release/plowrt)")
+    s.add_argument("--env", action="append", metavar="K=V", help="host-specific or policy override, e.g. PLOW_LIBCUDA=...")
+    s.add_argument("--dry-run", action="store_true", help="print the env and command, do not start")
+    s.set_defaults(f=cmd_serve)
     n = sp.add_parser("bench"); n.add_argument("recipe"); n.add_argument("--assets", required=True); n.add_argument("--out", required=True)
     n.add_argument("--concs"); n.add_argument("--in-lens"); n.add_argument("--label"); n.add_argument("--reference")
     n.add_argument("--nprompt", type=int, help="prompts per cell, overriding the recipe/profile")

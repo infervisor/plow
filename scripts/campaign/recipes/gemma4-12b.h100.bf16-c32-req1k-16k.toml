@@ -6,6 +6,7 @@
 # still runs 1024 rows per launch (8192 in = 8 launches), which is the price of the small ring.
 # Compare: gemma4-12b.h100.bf16-c32-16k.toml (chunk 1024, roles off, 1024-row launches) and
 # gemma4-12b.h100.bf16-ladder16k.toml (16 slots, chunk 4096).
+# Production (C32 traffic, --profile high_concurrency): build and serve as in ladder16k's header.
 
 [cell]
 name = "gemma4-12b.h100.bf16-c32-req1k-16k"
@@ -30,7 +31,6 @@ PLOW_MAX_REQUEST_CHUNK = "1024"
 PLOW_PF_LADDER_APPEND = "256,1088,1152"
 PLOW_FUSE_ARGMAX = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
-PLOW_FA_MMAQK = "3"
 PLOW_NS_FULL_ABS = "66"
 
 [objects]
