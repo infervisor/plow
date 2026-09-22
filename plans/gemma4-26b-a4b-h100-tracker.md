@@ -1561,3 +1561,14 @@ column"). 26B-specific numbers, packet `p26i`, 16 prompts:
 * Lean Lt-rung object probe (expert GEMV arms removed; routed rungs never run them): 1.70 MB, stack
   432, spills 588/1824, still 255 regs. Needs a second decode module at the routed-rung captures
   (decode_objects binds single-segment programs only).
+* **All-block layer timeline** (scratch `PLOW_NV_TRACE=2`: every block records insts 180-200 with a
+  globaltimer claim stamp + clock64 gate/body; SM clock 1.755 GHz fits the claim stamps; the trace
+  object's tokens are garbage, so routing/MoE time is not representative, dense/norm time is).
+  B=16, one layer (us from segment start): combine 0.9-7.2 | NRN 8.3-16.8 | QKV 17.8-45.2 | HNR -48.1 |
+  FD -107.8 | FM -112.9 | O 113.3-133.3 | NRN -139.4 | router 140-156.7 (holds all 132 blocks) | GLU
+  157.5-175.3 | topk (16 blk) 176.8-187.6 | down 177.1-188.4, its last 16 slices 188.7-200.0 (on the
+  topk blocks) | RmsNorm h1 -206.4 | align (1 blk) 189.6-196.2 | Lt route 206.4-352.2.
+  Per step: Lt 4.4 ms; GEMV+attention ~4.1 ms (floor ~2.2); serial small ops ~2.05 ms. B=4 has the same
+  ~18 us segment-start latency: the small-op cost is per layer, not per row.
+  Targets: (1) one fused segment-start op combine + NRN, with RmsNorm(h1) moved into it (~15 us/layer);
+  (2) topk + align off the segment tail (into the Lt glue) or reordered (~10-18 us/layer); (3) router.
