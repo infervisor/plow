@@ -45,6 +45,9 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 # -0.30/-0.51/-1.02 ms at B=1/4/16 (ctx 1024), served 128/C16 TPOT 12.68 -> 11.80 ms, 1024/C16
 # 17.55 -> 15.82; f32 oracle relL2 0.0016-0.0017, greedy digests identical (agent/dec-batched-attn).
 PLOW_FA_MMAQK = "3"
+# Claim-ahead L2 prefetch of each decode GEMV walk's first 64 KiB (1b0eb435; objects from the same
+# tree). step_bench p12r ctx 192: B=1 10.55 -> 10.44, B=4 10.75 -> 10.57, B=16 11.44 -> 11.41 ms.
+PLOW_GEMV_PREFETCH = "1"
 PLOW_NS_FULL_ABS = "66"
 
 [objects]
