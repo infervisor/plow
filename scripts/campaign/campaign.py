@@ -361,13 +361,16 @@ def cmd_serve(a: argparse.Namespace) -> None:
     assets = Path(a.assets).resolve()
     if not (assets / "model.pkt").exists():
         die(f"{assets}/model.pkt missing")
+    # As in `bench`: the shell's exports are visible to packet_env's guards.
+    env = env_with(os.environ, env)
     packet_env(r, assets, env)
     plowrt = Path(a.plowrt or serve.get("plowrt", str(REPO / "target" / "release" / "plowrt"))).resolve()
     cmd = [str(plowrt), "serve", "--assets", str(assets), "--port", str(a.port), *shlex.split(serve.get("extra_args", ""))]
-    print(" ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(env.items())) + " " + shlex.join(cmd), file=sys.stderr)
+    shown = sorted((k, v) for k, v in env.items() if os.environ.get(k) != v)
+    print(" ".join(f"{k}={shlex.quote(v)}" for k, v in shown) + " " + shlex.join(cmd), file=sys.stderr)
     if a.dry_run:
         return
-    os.execvpe(cmd[0], cmd, env_with(os.environ, env))
+    os.execvpe(cmd[0], cmd, env)
 
 
 # ---------------------------------------------------------------- probe
