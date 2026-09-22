@@ -1643,14 +1643,35 @@ Verified on plowrt_pipe5 (`pf_noise.sh`, `dupscan.py`): level 1 clean, 0 corrupt
 from 2. The noise floor matters here -- `off` vs `off2` is 8/10 identical at conc 4, so the
 earlier "p0 8/10" reading of stage 1 was the floor, not a regression; `p0` vs `p0b` is 10/10.
 
-**What is still broken.** Level 1 deadlocks when requests retire while a mixed launch is parked.
-At 15000/C4 the ladder arm pinned the GPU for an hour with no token; the minimal repro (4 x 14k
-prompts, 32 out) froze after `decode_ms=172.21 did_prefill=0 decode_rows=2` -- a decode tick
-paying a parked-launch wait, immediately after two requests retired -- and the mux stopped
-ticking with the GPU idle. So the host blocks on a step nothing completes. The lead is the
-interaction of the deferred `retire_slot` (held until `pipe.queue.is_empty()`) with a parked step
-whose rows are retired. Level 2 additionally faults (`CUDA_ERROR_ILLEGAL_ADDRESS` at
-`cuEventSynchronize`, batched prefill) and is a separate bug.
+**What is still broken.** Level 1 FAULTS when rows retire while a mixed launch is parked -- not a
+deadlock, which is what the tick trace looked like before the fault lines were read:
+
+```
+PACKLOG TICK t_ms=1233.3 decode_ms=11.75  did_prefill=0 decode_rows=2   <- two requests retired
+PACKLOG TICK t_ms=1408.1 decode_ms=172.21 did_prefill=0 decode_rows=2   <- parked-launch wait
+decode pipeline: step failed ... fed=2 ... CUDA_ERROR_ILLEGAL_ADDRESS at cuEventSynchronize
+```
+
+Ticks stop there because the context is poisoned, not because the host is waiting; at 15000/C4 of
+the ladder the same fault left the client waiting with the GPU pinned, which is why it first read
+as a livelock. The repro is 4 x 14k-token prompts at 32 out.
+
+The open lead is the retired-row frontier rollback added by the frontier rework:
+
+```rust
+if pipe.retire[b].is_some() {
+    self.pos[b] = self.pos[b].saturating_sub(1);
+    continue;
+}
+```
+
+It is the only `pos` bookkeeping that fires exactly on retirement, which is exactly the trigger.
+A mixed launch commits its rows' frontiers through the token-batch staging rather than through
+`pipe_enqueue`, so a row retired while both a mixed step and a decode step hold it is rolled back
+once for a frontier that moved twice -- and the next launch then maps and writes past what
+`ensure_rows` reserved. Not yet confirmed.
+
+Level 2 faults as well, in the batched prefill, and is a separate bug.
 
 **Verdict: not shipped.** `PLOW_PIPE_PREFILL` stays opt-in at 0 and is documented as experimental
 with both failure modes named. The case for finishing it is weak on the measurements: the host gap
