@@ -7604,6 +7604,9 @@ fn apply_production_defaults(
         if cfg.attention_decode_balance_gf.is_none() {
             cfg.attention_decode_balance_gf = Some(4);
             emit_config::note_production_default("attention_decode_balance_gf", "4".into());
+        } else if cfg.attention_decode_balance_gf == Some(0) {
+            // `=0` is the rollback: the unbalanced split and PLOW_FA_GF_FULL's own GF.
+            cfg.attention_decode_balance_gf = None;
         }
         if cfg.seg_fa512.is_none() {
             cfg.seg_fa512 = Some("1".into());
