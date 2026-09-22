@@ -328,6 +328,23 @@ const MOE_LT_EMIT_QUALIFIED: Status = Status::Qualified {
     ],
 };
 
+/// Wherever the paired-GQA2 HD256 role is on, it also binds the whole-tile prefill rungs above
+/// 4096 (4160, 4224): the object and the runtime check are row-generic, only the emit rule was
+/// exact. Without it a 4096-token prompt plus BOS, and every pack filling a 4224-row launch, runs
+/// the generic flash.
+const GQA2_WIDE_DEFAULT: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: F::Atom("emit.gemma4_sm90_hd256_gqa2_role", Cmp::Eq, TRUE),
+        value: TRUE,
+    }],
+    otherwise: FALSE,
+};
+const GQA2_WIDE_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "plans/gemma4-packet-geometry.md §7: H100 Gemma-4-12B sliding block, one 4224-row launch 3.45 -> 3.32 ms; 8192 rows in 4224-row launches 6.67 -> 6.53; 16000 rows 13.46 -> 13.08",
+    ],
+};
+
 /// `apply_production_defaults` forces the arms that read the local cache directly off under
 /// `--dcp > 1`: they bypass the owner gather.
 const GLM_DCP_SHARDED: F = F::And(&[GLM_TARGET, F::Atom("emit.dcp", Cmp::Gt, Val::Nat(1))]);
@@ -1079,7 +1096,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.gemma4_sm90_gemm_glu_role", Some("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_w8a8_gemm_glu_role", Some("PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_hd256_gqa2_role", Some("PLOW_GEMMA4_SM90_HD256_GQA2_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.gemma4_sm90_hd256_gqa2_wide", Some("PLOW_GEMMA4_SM90_HD256_GQA2_WIDE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.gemma4_sm90_hd256_gqa2_wide", Some("PLOW_GEMMA4_SM90_HD256_GQA2_WIDE"), Layer::Emit, Domain::Bool, GQA2_WIDE_DEFAULT, GQA2_WIDE_QUALIFIED),
     KnobSpec::new("emit.gemma4_sm90_hd512_px4_bq64_role", Some("PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fp8_pf_gemm_role", Some("PLOW_FP8_PF_GEMM_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fp8_pf_isolate", Some("PLOW_QWEN_FP8_PF_ISOLATE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

@@ -1088,6 +1088,7 @@ pub struct EmitConfig {
     pub gemma4_sm90_hd256_gqa2_role: bool,
 
     /// With the paired-GQA2 role, also route the appended prefill rungs above 4096 (4160, 4224).
+    /// DEFAULT ON wherever that role is on (`apply_production_defaults`); `=0` rolls back.
     #[arg(long, env = "PLOW_GEMMA4_SM90_HD256_GQA2_WIDE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemma4_sm90_hd256_gqa2_wide: bool,
 

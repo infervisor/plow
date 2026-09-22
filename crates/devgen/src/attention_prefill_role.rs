@@ -443,7 +443,8 @@ fn eligible_for(op: &packet::dev::DevInst, n_cu: u16, selection: &Selection) -> 
 }
 
 /// Prefill rungs the paired-GQA2 object takes: exact M4096/M8192, where it was qualified, and with
-/// `wide` (`PLOW_GEMMA4_SM90_HD256_GQA2_WIDE`) also the appended rungs above 4096 (4160, 4224).
+/// `wide` (`PLOW_GEMMA4_SM90_HD256_GQA2_WIDE`, a production default) also the appended rungs above
+/// 4096 (4160, 4224).
 /// Those run the same one-split geometry over whole 64-row query tiles; without them a 4096-token
 /// prompt plus BOS, and every pack filling a 4224-row launch, falls back to the generic flash.
 pub(crate) fn gqa2_rung(rows: u32, wide: bool) -> bool {

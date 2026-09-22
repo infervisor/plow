@@ -7591,6 +7591,12 @@ fn apply_production_defaults(
             emit_config::note_production_default("seg_fa256_gqa2", "true".into());
         }
     }
+    // The paired-GQA2 role also takes the whole-tile rungs above 4096 wherever it is on
+    // (`knob_spec::GQA2_WIDE_QUALIFIED`); `PLOW_GEMMA4_SM90_HD256_GQA2_WIDE=0` is the rollback.
+    if cfg.gemma4_sm90_hd256_gqa2_role && !emit_config::explicitly_set("gemma4_sm90_hd256_gqa2_wide") {
+        cfg.gemma4_sm90_hd256_gqa2_wide = true;
+        emit_config::note_production_default("gemma4_sm90_hd256_gqa2_wide", "true".into());
+    }
     // gfx942 STOPS AT 8, sm_90a KEEPS 16 — and the reason is the OBJECT, not the rung.
     //
     // The fusion argument that stood here was wrong twice, and [`gemv_staged_rows`] now
