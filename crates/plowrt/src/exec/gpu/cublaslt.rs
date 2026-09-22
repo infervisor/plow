@@ -670,19 +670,18 @@ mod tests {
 
     #[test]
     fn accepts_only_measured_sm90_bf16_prefill_cells() {
-        for rows in plow_asset::segment_roles::CUBLASLT_PREFILL_ROWS {
-            for k in [8192, 15360] {
-                let (program, tensors) = prefill_fixture(rows, 3840, k);
-                let routes = prefill_segments(&program, &tensors, &roles(), "sm90a").unwrap();
-                let route = routes[1].expect("measured projection route");
-                assert_eq!((route.m, route.n, route.k), (rows, 3840, k));
-            }
-        }
-        for rows in plow_asset::segment_roles::CUBLASLT_PREFILL_WIDE_ROWS {
-            for (n, k) in plow_asset::segment_roles::CUBLASLT_PREFILL_GEMMA4_SHAPES {
+        use plow_asset::segment_roles::{
+            CUBLASLT_PREFILL_GEMMA4_26B_SHAPES, CUBLASLT_PREFILL_GEMMA4_SHAPES,
+            CUBLASLT_PREFILL_ROWS, CUBLASLT_PREFILL_WIDE_ROWS,
+        };
+        for &rows in CUBLASLT_PREFILL_ROWS.iter().chain(&CUBLASLT_PREFILL_WIDE_ROWS) {
+            for &(n, k) in CUBLASLT_PREFILL_GEMMA4_SHAPES
+                .iter()
+                .chain(&CUBLASLT_PREFILL_GEMMA4_26B_SHAPES)
+            {
                 let (program, tensors) = prefill_fixture(rows, n, k);
                 let routes = prefill_segments(&program, &tensors, &roles(), "sm90a").unwrap();
-                let route = routes[1].expect("measured wide projection route");
+                let route = routes[1].expect("measured projection route");
                 assert_eq!((route.m, route.n, route.k), (rows, n, k));
             }
         }
@@ -690,9 +689,10 @@ mod tests {
         for (profile, rows, n, k) in [
             ("sm120", 128, 3840, 15360),
             ("sm90a", 64, 3840, 15360),
-            ("sm90a", 16384, 3840, 15360),
-            ("sm90a", 128, 4096, 3840),
-            ("sm90a", 128, 3840, 4096),
+            ("sm90a", 1000, 3840, 15360),
+            ("sm90a", 32768, 3840, 15360),
+            ("sm90a", 128, 3840, 3840),
+            ("sm90a", 128, 2816, 3840),
             ("sm90a", 1024, 3840, 3840),
         ] {
             let (program, tensors) = prefill_fixture(rows, n, k);
