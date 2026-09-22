@@ -1,0 +1,50 @@
+{
+ "schema": 1,
+ "knob": "emit.seg_fa512",
+ "request": {
+  "ledger": [],
+  "touched": [],
+  "untouched": [
+   {
+    "rung": "gemma4-12b.h100.bf16/packet",
+    "base": "55be57915c298f46",
+    "variant": "55be57915c298f46"
+   },
+   {
+    "rung": "gemma4-26b-a4b.h100.bf16/packet",
+    "base": "d012a700ff4c9bb5",
+    "variant": "d012a700ff4c9bb5"
+   }
+  ],
+  "tier4": false,
+  "serving": [],
+  "numeric": false,
+  "facts": [
+   {
+    "kind": "note",
+    "pass": true,
+    "evidence": "campaign.py build at d33c4296, default packet vs `--env PLOW_SEG_FA512=0` packet, both Gemma-4 H100 production recipes: every served file (model.pkt, plow_config.h, each cubin and role object) is byte-identical; only build.json's knob record and the .cubin-build CMake cache (build paths) differ"
+   },
+   {
+    "kind": "note",
+    "pass": true,
+    "evidence": "gemma4-12b.h100.bf16 (ladder16k recipe): 18 served files, default 55be57915c298f46 vs PLOW_SEG_FA512=0 55be57915c298f46 (18 files)"
+   },
+   {
+    "kind": "note",
+    "pass": true,
+    "evidence": "gemma4-26b-a4b.h100.bf16 (ctx16k recipe): 16 served files, default d012a700ff4c9bb5 vs PLOW_SEG_FA512=0 d012a700ff4c9bb5 (16 files)"
+   },
+   {
+    "kind": "note",
+    "pass": true,
+    "evidence": "plowrt reads no emit.seg_fa512 value (no runtime knob, loader or evaluator path references it), so serving cannot change on these packets and tier 4 is not required"
+   }
+  ]
+ },
+ "certificate": {
+  "ok": true,
+  "notes": "flip accepted: accept: gemma4-12b.h100.bf16/packet: digest unchanged | accept: gemma4-26b-a4b.h100.bf16/packet: digest unchanged | accept: tier 4 not required | accept: no numeric-changing field in scope",
+  "checkpoint": "P"
+ }
+}

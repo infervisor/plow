@@ -4,7 +4,9 @@
 # instead of 8192 (1.76 GiB / 103 GiB at 32 slots) and 32 slots fit with the attention roles on.
 # A 4096-row launch packs four requests' 1024-row slices; a single request runs 1024 rows per launch.
 # Compare: gemma4-26b-a4b.h100.bf16-c32-16k.toml (chunk 1024, roles off) and the ctx16k recipe.
-# UNMEASURED: derived from the 12B c32-req1k-16k recipe; see plans/gemma4-packet-geometry.md.
+# Measured (e2e3, p26rq4): C32 TTFT 172/368/1284/2603/5145 ms, 1858/1295/694/410/232 tok/s at
+# 128/1024/4096/8192/15000 in, 128 out.
+# Production (C32 traffic, --profile high_concurrency): build and serve as in the 12B ladder16k header.
 
 [cell]
 name = "gemma4-26b-a4b.h100.bf16-c32-req1k-16k"
