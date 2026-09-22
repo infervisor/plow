@@ -4165,14 +4165,20 @@ fn gpu_prefill_batched_pass(
         } else {
             per_launch
         };
-        // Under the unified token batch the decode rows ride in this launch: keep prefill + decode
-        // inside the bucket the prefill rows chose, or a 4224-row slice plus 3 decode rows runs
-        // the 8192 rung (the token batch takes the smallest bucket that holds every row).
-        let per_launch = e
-            .pf_pack_budget(avail.min(per_launch))
-            .saturating_sub(decode_rows)
-            .max(1)
-            .min(per_launch);
+        let rows = avail.min(per_launch);
+        let bucket = e.pf_pack_budget(rows);
+        // Under the unified token batch the decode rows ride in this launch, and the batch takes the
+        // smallest bucket holding every row. When that spills past `bucket` by more than a launch
+        // costs (a 4224-row slice + 3 decode rows on the 8192 rung), trim the prefill to fit; a small
+        // spill (1024 + 1 into 1088) is cheaper than the tail launch a trim would leave.
+        let trim = decode_rows > 0
+            && e.pf_pack_budget(rows.min(bucket) + decode_rows) > bucket + pf_chunk_cost_rows();
+        let per_launch = if trim {
+            bucket.saturating_sub(decode_rows).max(1)
+        } else {
+            bucket
+        }
+        .min(per_launch);
         let pf_batch_cfg = crate::config::RuntimeConfig::get().pf_batch;
         let is_fair =
             crate::config::RuntimeConfig::get().pf_span_policy.as_deref() == Some("fair");
