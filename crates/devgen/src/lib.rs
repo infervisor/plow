@@ -7589,10 +7589,6 @@ fn apply_production_defaults(
                 emit_config::note_production_default(id, "true".into());
             }
         }
-        if cfg.fa_mmaqk.is_none() {
-            cfg.fa_mmaqk = Some(3);
-            emit_config::note_production_default("fa_mmaqk", "3".into());
-        }
         if capabilities.moe && cfg.gemma_moe_dec_group.is_none() {
             cfg.gemma_moe_dec_group = Some(4);
             emit_config::note_production_default("gemma_moe_dec_group", "4".into());
