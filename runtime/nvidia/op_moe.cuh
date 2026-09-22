@@ -440,6 +440,12 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
 #ifndef PLOW_MOE_COMBINE_ALLBLK
 #define PLOW_MOE_COMBINE_ALLBLK 0
 #endif
+/* Decode combine+norm with the k=8 slot loads in flight and an 8-wide pass 2. Bit-exact on the
+ * 26B; step_bench (p26dl, ctx 1024) 5.705 -> 5.579 / 8.744 -> 8.615 / 12.590 -> 12.441 ms at
+ * B=1/4/16. */
+#ifndef PLOW_MOE_COMBINE_V8
+#define PLOW_MOE_COMBINE_V8 1
+#endif
 #ifndef PLOW_MOE_DOWN_LANESPLIT
 #define PLOW_MOE_DOWN_LANESPLIT 0
 #endif
@@ -1741,6 +1747,54 @@ static __device__ void d_moe_combine_norm_gemma(bf16* __restrict__ out,
 
         /* Pass 1: combine (Σ slots) and accumulate sum-of-squares for RMS. */
         float ss = 0.0f;
+#if PLOW_NV_GEMV_RB && PLOW_MOE_COMBINE_V8
+        /* k=8, H % 8 == 0, H <= 3*4*blockDim: the slot loop is compile-time, so a thread's 8
+         * partial loads per h are in flight together instead of one dependent round trip per
+         * slot (the runtime-k loop measured ~10 us of the 26B's B=1 layer tail on ONE block),
+         * and pass 2 moves 8 elements per load. Same slot order, same ss order, same
+         * per-element arithmetic: bit-identical. */
+        if (k == 8u && (H & 7u) == 0u && H <= 12u * nth) {
+#pragma unroll
+            for (unsigned it = 0; it < 3u; it++) {
+                const unsigned h = tid * 4u + it * nth * 4u;
+                if (h >= H) continue;
+                float4 v[8];
+#pragma unroll
+                for (unsigned slot = 0; slot < 8u; slot++)
+                    v[slot] = *(const float4*)(pt + (size_t)slot * H + h);
+                float4 acc4 = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+                for (unsigned slot = 0; slot < 8u; slot++) {
+                    acc4.x += v[slot].x; acc4.y += v[slot].y; acc4.z += v[slot].z; acc4.w += v[slot].w;
+                }
+                *(float4*)(arena + h) = acc4;
+                ss += acc4.x * acc4.x + acc4.y * acc4.y + acc4.z * acc4.z + acc4.w * acc4.w;
+            }
+            ss = plow_warp_sum(ss);
+            if (lane == 0) red[warp] = ss;
+            __syncthreads();
+            if (tid == 0) {
+                float t = 0.0f;
+                const unsigned nw = (nth + 31u) >> 5;
+                for (unsigned i = 0; i < nw; i++) t += red[i];
+                red[0] = rsqrtf(t / (float)H + eps);
+            }
+            __syncthreads();
+            const float inv = red[0];
+            for (unsigned c = tid; c < (H >> 3); c += nth) {
+                const bf16v8 g = ld_glob8(gamma + c * 8u), r = ld_glob8(res + c * 8u);
+                bf16v8 ov;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float v = arena[c * 8u + j] * inv * __bfloat162float(g.x[j]);
+                    ov.x[j] = __float2bfloat16(v + __bfloat162float(r.x[j]));
+                }
+                st_glob8(o + c * 8u, ov);
+            }
+            __syncthreads(); /* arena/red reused by the next row */
+            continue;
+        }
+#endif
 #if PLOW_NV_GEMV_RB
         /* This op runs on ONE block (the row loop is strided by `slice`, and decode has
          * nrow==1), so its 90 KB of f32 partials are moved by 256 threads alone -- measured
