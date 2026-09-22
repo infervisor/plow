@@ -1520,3 +1520,33 @@ column"). 26B-specific numbers, packet `p26i`, 16 prompts:
 * Cache-on (prefix_repetition): C4 91.9 vs 98.3 ms, C16 175.7 vs 204.7 ms (both ahead); peak 78.5-78.7
   vs 73.2-73.5 GiB.
 * `PLOW_FA_MMAQK=3` promoted to a GEMMA4_HOPPER emit default; recipes no longer name it.
+
+## Round 5 (2026-09-22 afternoon): B=16 decode anatomy, router/GLU/glue
+
+* Anatomy (nsys node trace + CUDA PLOW_TRACE_RAW block-0 seq, B=16): 31 megakernel segments +
+  cuBLASLt grouped MoE (nvjet, at the HBM floor for the live-expert union) + 5 glue kernels + 2 Lt
+  memset nodes per layer. MoE time follows the token stream: ctx 256 vs 1024 = same step, megakernel
+  -0.94 ms / nvjet +0.91. Served 128/C16 ITL median 11.66 == step_bench: the short-input gap to vLLM
+  is device time in the megakernel; the long-input TPOT gap is prefill stalls (no CUDA token batch).
+* Landed `2b730261`: exact row-selective router RMS + GLU split-K: 11.756/8.340/5.541 ->
+  11.420/8.175/5.524 (B=16/4/1, ctx 1024), digests unchanged. Split-K gated `!PLOW_NV_GEMV_MMA_PAIR`
+  (unexecuted arm cost the 12B 0.09-0.12 ms; SASS identical after gating).
+* Nulls: guarded K-walk tail round (+0.20 at B=16), L2 GEMV prefetch on the 26B (mixed), dense-MLP
+  skip probe (-1.32 ms, but only -0.85 megakernel: the rest was a smaller expert union).
+* Glue per layer at B=16 (nsys): norm 3.1 + setup 1.1 + gather 3.8 + memset/gap 3.9 + glu 7.0 +
+  memset/gap 5.5 + scatter 3.9 us ~ 31 us = ~0.95 ms/step. glu walks the 64-row-padded extent
+  (~40x the live rows). Round-5 attempts: live-row glue, one-launch norm+setup+gather (ABI 3),
+  post-capture memset hoist beside the glue kernel.
+* Block-0 per-layer bodies at B=16 ctx 1024 (kcyc): router 39.5 (isolated harness: rms 6.7 + scale
+  stage 6.5 + pairs 9.6), GemvGlu 40 (~1.0 TB/s), down 18 (~1.2 TB/s), QKV 46 (~1.8 TB/s),
+  FlashDecode 100. Segment-start gate (combine -> NRN -> QKV) 32 kcyc; NRN-after-O gate 22.6.
+* NULL router V2 (whole x row + expert row in registers, in-warp exact RMS replay; logits hash
+  identical): isolated 16.4 -> 14.5 us cold, but in the megakernel 11.423/8.178/5.524 ->
+  11.523/8.205/5.599 (spill loads 2628 -> 3296 B; B=1 never runs the arm). In the 255-cap
+  megakernel a register-heavy arm taxes every rung; the isolated router is 23 kcyc vs 39.5 in situ.
+* Live-row glue (compact index -> padded row via a per-block prefix of cnt; bit-exact):
+  11.422/8.177/5.526 -> 11.399/8.213/5.525. Far below the pad-walk estimate; nsys pending.
+* Fused glue (memset hoist + live rows + ABI 3 norm_gather, 60 memsets hoisted, 241 graph nodes):
+  11.416/8.178/5.524 -> 11.235/8.033/5.526, digests identical.
+* NULL cp.async GEMV ring (8/16 stages in dynamic smem, oracle ALL OK): 12B B=16/4/1
+  13.19/11.12/10.67 -> 16.59/14.28/13.65 (ring8); 26B 11.43/8.17/5.53 -> 12.39/9.13/5.54.

@@ -11,7 +11,8 @@
 //! `PLOW_EMIT_MOE_DEC_LT` does the same on the decode rungs that run the grouped arm
 //! (`MoeExpertGluNormGemma` + `MoeExpertDownGemma` with the align tables, role
 //! `MOE_DECODE_CUBLASLT`). That GLU fuses the RMS norm, so the decode route first stages
-//! `xn2 = norm(x) * gamma` with a fifth glue kernel and then runs the prefill chain unchanged.
+//! `xn2 = norm(x) * gamma` with a fifth glue kernel and then runs the prefill chain unchanged;
+//! an ABI 3 object does setup + norm + gather in one launch (`plow_moe_lt_norm_gather`).
 
 use super::*;
 use crate::asset::devblob::DevTensor;
@@ -247,6 +248,8 @@ pub(super) struct MoeLt {
     scatter: KernelFn,
     /// ABI 2 objects only; the decode route needs it.
     norm: Option<KernelFn>,
+    /// ABI 3: the decode route's setup + norm + gather in one launch.
+    norm_gather: Option<KernelFn>,
     blocks: u32,
     hidden: u32,
     inter: u32,
@@ -297,10 +300,10 @@ impl MoeLt {
         let abi = plow_asset::cubin::global_u32(&image, "plow_moe_lt_abi");
         if profile != "sm90a"
             || plow_asset::cubin::inspect(&image).is_none_or(|i| i.sm != 90)
-            || !matches!(abi, Some(1 | 2))
+            || !matches!(abi, Some(1..=3))
         {
             return Err(RuntimeError::Rejected(format!(
-                "{OBJECT_FILE}: not an sm90a MoE cuBLASLt glue object of ABI 1 or 2"
+                "{OBJECT_FILE}: not an sm90a MoE cuBLASLt glue object of ABI 1 to 3"
             )));
         }
         let module = DecodeModule::load(be, &image)?;
@@ -331,8 +334,11 @@ impl MoeLt {
             gather,
             glu: function("plow_moe_lt_glu")?,
             scatter: function("plow_moe_lt_scatter")?,
-            norm: (abi == Some(2))
+            norm: (abi >= Some(2))
                 .then(|| function("plow_moe_lt_norm"))
+                .transpose()?,
+            norm_gather: (abi >= Some(3))
+                .then(|| function("plow_moe_lt_norm_gather"))
                 .transpose()?,
             _module: module,
             blocks,
@@ -451,6 +457,15 @@ impl MoeLt {
 }
 
 impl MoeLtRoute {
+    /// The glue kernels; none touches cuBLASLt's workspace.
+    pub(super) fn glue(&self) -> impl Iterator<Item = KernelFn> + '_ {
+        let o = &*self.owner;
+        [o.setup, o.gather, o.glu, o.scatter]
+            .into_iter()
+            .chain(o.norm)
+            .chain(o.norm_gather)
+    }
+
     pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
         let o = &*self.owner;
         let arg = |value: &mut u64| (value as *mut u64).cast::<std::ffi::c_void>();
@@ -464,41 +479,63 @@ impl MoeLtRoute {
         let (mut act, mut blocks) = (self.act, o.blocks);
         let mut dn = xs;
 
-        if let Some((x, gamma, norm_rows, eps)) = self.norm {
+        if let (Some((x, gamma, _, eps)), Some(fused)) = (self.norm, o.norm_gather) {
             let (mut x, mut gamma, mut eps) = (x, gamma, eps);
             let mut params = [
-                arg(&mut xn2),
+                arg(&mut xs),
                 arg(&mut x),
                 arg(&mut gamma),
+                arg(&mut row_token),
+                arg(&mut rows),
+                arg(&mut pointers),
+                arg(&mut meta),
+                arg(&mut gu),
+                arg(&mut fu),
+                arg(&mut dn),
+                arg32(&mut experts),
                 arg32(&mut hidden),
+                arg32(&mut inter),
                 (&mut eps as *mut f32).cast::<std::ffi::c_void>(),
+                arg32(&mut blocks),
             ];
-            let norm = o.norm.expect("checked by route()");
-            o.be.launch_kernel(norm, norm_rows, GLUE_THREADS, 0, &mut params, Some(stream))?;
+            o.be.launch_kernel(fused, o.blocks, GLUE_THREADS, 0, &mut params, Some(stream))?;
+        } else {
+            if let Some((x, gamma, norm_rows, eps)) = self.norm {
+                let (mut x, mut gamma, mut eps) = (x, gamma, eps);
+                let mut params = [
+                    arg(&mut xn2),
+                    arg(&mut x),
+                    arg(&mut gamma),
+                    arg32(&mut hidden),
+                    (&mut eps as *mut f32).cast::<std::ffi::c_void>(),
+                ];
+                let norm = o.norm.expect("checked by route()");
+                o.be.launch_kernel(norm, norm_rows, GLUE_THREADS, 0, &mut params, Some(stream))?;
+            }
+            let mut params = [
+                arg(&mut rows),
+                arg(&mut pointers),
+                arg(&mut meta),
+                arg(&mut xs),
+                arg(&mut gu),
+                arg(&mut fu),
+                arg(&mut dn),
+                arg32(&mut experts),
+                arg32(&mut hidden),
+                arg32(&mut inter),
+            ];
+            o.be.launch_kernel(o.setup, 1, GLUE_THREADS, 0, &mut params, Some(stream))?;
+            let mut params = [
+                arg(&mut xs),
+                arg(&mut xn2),
+                arg(&mut row_token),
+                arg(&mut meta),
+                arg32(&mut experts),
+                arg32(&mut hidden),
+                arg32(&mut blocks),
+            ];
+            o.be.launch_kernel(o.gather, o.blocks, GLUE_THREADS, 0, &mut params, Some(stream))?;
         }
-        let mut params = [
-            arg(&mut rows),
-            arg(&mut pointers),
-            arg(&mut meta),
-            arg(&mut xs),
-            arg(&mut gu),
-            arg(&mut fu),
-            arg(&mut dn),
-            arg32(&mut experts),
-            arg32(&mut hidden),
-            arg32(&mut inter),
-        ];
-        o.be.launch_kernel(o.setup, 1, GLUE_THREADS, 0, &mut params, Some(stream))?;
-        let mut params = [
-            arg(&mut xs),
-            arg(&mut xn2),
-            arg(&mut row_token),
-            arg(&mut meta),
-            arg32(&mut experts),
-            arg32(&mut hidden),
-            arg32(&mut blocks),
-        ];
-        o.be.launch_kernel(o.gather, o.blocks, GLUE_THREADS, 0, &mut params, Some(stream))?;
         self.plans[0].run(o.pointers(0), self.weights.base, o.pointers(1), stream)?;
         let mut params = [
             arg(&mut fu),

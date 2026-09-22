@@ -40,6 +40,17 @@ impl LibraryRoute {
     }
 }
 
+/// Every host-launched kernel of `routes` that leaves cuBLASLt's workspace alone.
+fn glue_kernels<'a>(routes: impl Iterator<Item = &'a LibraryRoute>) -> Vec<KernelFn> {
+    routes
+        .filter_map(|route| match route {
+            LibraryRoute::Moe(route) => Some(route.glue()),
+            LibraryRoute::Projection(_) => None,
+        })
+        .flatten()
+        .collect()
+}
+
 pub(super) fn library_routes(routes: Vec<Option<CublasLtDecodeRoute>>) -> Vec<Option<LibraryRoute>> {
     routes
         .into_iter()
@@ -259,7 +270,8 @@ impl CublasLtDecodeGraph {
         smem: u32,
         routes: Vec<Option<LibraryRoute>>,
     ) -> Result<Self> {
-        let graph = be.graph_capture(stream, || {
+        let untouched = glue_kernels(routes.iter().flatten());
+        let graph = be.graph_capture_hoisting(stream, &untouched, || {
             for (seg, route) in routes.iter().enumerate() {
                 if let Some(route) = route {
                     route.run(stream)?;
@@ -323,8 +335,11 @@ impl GpuEngine {
 
     pub(super) fn capture_decode_graph(&mut self) -> Result<()> {
         let be = Arc::clone(&self.be);
+        let untouched = glue_kernels(self.cublaslt_decode.iter().flatten());
         self.cublaslt_decode_graph =
-            Some(be.graph_capture(&self.stream, || self.enqueue_decode_chain())?);
+            Some(be.graph_capture_hoisting(&self.stream, &untouched, || {
+                self.enqueue_decode_chain()
+            })?);
         Ok(())
     }
 
