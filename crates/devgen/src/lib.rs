@@ -7454,6 +7454,11 @@ struct EmitCapabilities {
     /// next family to grow it must not silently inherit a recipe qualified on GLM's weights,
     /// geometry and kernels.
     glm: bool,
+    /// Routed experts in `config.json` (`num_experts`, `num_local_experts`, `n_routed_experts`).
+    moe: bool,
+    /// Full-attention layers at head dim 512 (`config.json` `global_head_dim`): the hybrid
+    /// geometry the sm_90a hd512 segment objects and the balanced decode split are built for.
+    full_attn_hd512: bool,
 }
 
 impl EmitCapabilities {
@@ -7467,10 +7472,23 @@ impl EmitCapabilities {
             ("decode_ladder", self.decode_ladder),
             ("packed_prefill_siblings", self.packed_prefill_siblings),
             ("glm", self.glm),
+            ("moe", self.moe),
+            ("full_attn_hd512", self.full_attn_hd512),
         ]
         .into_iter()
         .filter_map(|(name, on)| on.then_some(name))
         .collect()
+    }
+
+    /// The geometry capabilities a model type does not name, read from `config.json`.
+    fn with_config(mut self, config: Option<&Value>) -> Self {
+        let text = config.map(|c| c.get("text_config").unwrap_or(c));
+        let field = |k: &str| text.and_then(|t| t.get(k)?.as_u64());
+        self.moe = ["num_experts", "num_local_experts", "n_routed_experts"]
+            .into_iter()
+            .any(|k| field(k).is_some_and(|n| n > 0));
+        self.full_attn_hd512 = field("global_head_dim") == Some(512);
+        self
     }
 }
 
@@ -7493,6 +7511,8 @@ fn emit_capabilities(model_type: &str) -> EmitCapabilities {
         decode_ladder: dense || model_type == "gpt_oss",
         packed_prefill_siblings: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
         glm: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
+        moe: false,
+        full_attn_hd512: false,
     }
 }
 
@@ -7528,6 +7548,44 @@ fn apply_production_defaults(
         if !emit_config::explicitly_set("no_glu_fuse") {
             cfg.no_glu_fuse = true;
             emit_config::note_production_default("no_glu_fuse", "true".into());
+        }
+    }
+    // The H100 Gemma-4 recipe's generic arms (`knob_spec::GEMMA4_HOPPER`): BF16 hybrid attention
+    // (sliding hd256 + full hd512) on sm_90a TP1. Each stays an explicit rollback.
+    if bf16 && capabilities.gemma && capabilities.full_attn_hd512 && arch == "sm_90a" && tp == 1 {
+        let mut flags = vec![
+            (&mut cfg.tma_gemm, "tma_gemm"),
+            (&mut cfg.sliding_ns_grid, "sliding_ns_grid"),
+            (&mut cfg.sliding_ns_cap, "sliding_ns_cap"),
+        ];
+        // MoE: the grouped expert GEMMs go to cuBLASLt (prefill, and decode rungs >= 4 rows).
+        // Dense: the decode GEMV L2 prefetch, measured on the dense 12B only.
+        if capabilities.moe {
+            flags.extend([(&mut cfg.moe_pf_lt, "moe_pf_lt"), (&mut cfg.moe_dec_lt, "moe_dec_lt")]);
+        } else {
+            flags.push((&mut cfg.gemv_prefetch, "gemv_prefetch"));
+        }
+        for (field, id) in flags {
+            if !emit_config::explicitly_set(id) {
+                *field = true;
+                emit_config::note_production_default(id, "true".into());
+            }
+        }
+        if capabilities.moe && cfg.gemma_moe_dec_group.is_none() {
+            cfg.gemma_moe_dec_group = Some(4);
+            emit_config::note_production_default("gemma_moe_dec_group", "4".into());
+        }
+        if cfg.attention_decode_balance_gf.is_none() {
+            cfg.attention_decode_balance_gf = Some(4);
+            emit_config::note_production_default("attention_decode_balance_gf", "4".into());
+        }
+        if cfg.seg_fa512.is_none() {
+            cfg.seg_fa512 = Some("1".into());
+            emit_config::note_production_default("seg_fa512", "1".into());
+        }
+        if cfg.seg_fa256_gqa2.is_none() {
+            cfg.seg_fa256_gqa2 = Some(true);
+            emit_config::note_production_default("seg_fa256_gqa2", "true".into());
         }
     }
     // gfx942 STOPS AT 8, sm_90a KEEPS 16 — and the reason is the OBJECT, not the rung.
@@ -7743,7 +7801,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    let capabilities = emit_capabilities(&model_type);
+    let capabilities = emit_capabilities(&model_type).with_config(model_config.as_ref());
     let mut emit_cfg = _emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env);
     apply_production_defaults(&mut emit_cfg, capabilities, &arch, tp, n_cu);
     let mut knob_caps = capabilities.caps();
