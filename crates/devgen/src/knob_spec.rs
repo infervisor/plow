@@ -1170,6 +1170,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_BUILD_PFATTN_HD512_PX4_BQ64", Some("PLOW_BUILD_PFATTN_HD512_PX4_BQ64"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_PFATTN_KV64", Some("PLOW_BUILD_PFATTN_KV64"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_PFATTN_QK_UNROLL", Some("PLOW_BUILD_PFATTN_QK_UNROLL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_SEG_EXTRA_DEFINES", Some("PLOW_BUILD_SEG_EXTRA_DEFINES"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_BUILD_FA_HD256", Some("PLOW_BUILD_FA_HD256"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FA_HD256_ONLY", Some("PLOW_BUILD_FA_HD256_ONLY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FA_WG", Some("PLOW_BUILD_FA_WG"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),

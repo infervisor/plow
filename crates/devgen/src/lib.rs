@@ -3010,6 +3010,9 @@ pub(crate) fn dec_stage_halves() -> u64 {
 /// chunk, not the context -- only the KV cache spans the context).
 const MAX_CHUNK_MAX: u32 = 16384;
 
+/// Largest chunk the defaults pick (the runtime's `PLOW_MAX_CHUNK`); 16384 is explicit-only.
+const DEFAULT_CHUNK_MAX: u32 = 8192;
+
 /// Smallest chunk the window-derived default will pick (the bucket ladder's floor).
 const MAX_CHUNK_MIN: u32 = 128;
 
@@ -3031,17 +3034,17 @@ const MAX_CHUNK_MIN: u32 = 128;
 /// 3.5x less KV and 6x less activation for 2% on a deliberately prefill-dominated shape
 /// (4096 in / 32 out), which is the worst case since it is what pays the extra launches.
 ///
-/// **`window == 0` (all-global, e.g. Llama-style) keeps [`MAX_CHUNK_MAX`].** `kv_ring` returns
-/// `(ctx, MASK_NONE)` for full-attention layers, so the chunk does not size their cache at all
-/// — lowering it there would buy no KV and only cost prefill launches. This is why the default
-/// is a function of the model rather than the flat 1024 that Gemma alone would suggest.
+/// **`window == 0` (all-global, e.g. Llama-style) keeps [`DEFAULT_CHUNK_MAX`].** `kv_ring`
+/// returns `(ctx, MASK_NONE)` for full-attention layers, so the chunk does not size their cache
+/// at all — lowering it there would buy no KV and only cost prefill launches. This is why the
+/// default is a function of the model rather than the flat 1024 that Gemma alone would suggest.
 fn default_chunk(window: u32) -> u32 {
     if window == 0 {
-        MAX_CHUNK_MAX
+        DEFAULT_CHUNK_MAX
     } else {
         window
             .next_power_of_two()
-            .clamp(MAX_CHUNK_MIN, MAX_CHUNK_MAX)
+            .clamp(MAX_CHUNK_MIN, DEFAULT_CHUNK_MAX)
     }
 }
 
@@ -7234,15 +7237,16 @@ impl<'a> DenseGqaEmitter<'a> {
         // NRN2 -> q/k/v fold (op 30 i3, gemv_nrn_lds): Gemma dense fp8 decode, AMD arm only.
         // The env kill-switch mirrors PLOW_NO_FUSE_QKV; the op-115 opt-in disables it because
         // the fused QKV packet has no free slots to carry the fold.
-        let nrn_fold = ((amd
+        // Not on NVIDIA: the bf16 fold arms decode garbage on the H100 (nvcc hoists a barrier
+        // across the __restrict__ arena), and the CPU / Metal / fp8 Gemv arms do not read it.
+        let nrn_fold = amd
             // gfx942 only: the op-30 fold arm (gemv_nrn_lds) is new in this branch's
             // op_gemm.h, and there is no marker-symbol check to refuse a pre-fold gfx950
             // object served against a folded blob (an old object reads t1=xr — the raw
             // un-normed residual — and decodes fluent garbage). gfx950 keeps main's
             // emission until the fold is measured there and a marker check lands.
             && amd_target::active().1 == hwspec::IsaLevel::Gfx942
-            && fp8)
-            || (!amd))
+            && fp8
             && c.arch.is_gemma()
             && !c.moe
             && !emit_config::active().no_fuse_nrn
@@ -7570,8 +7574,13 @@ fn apply_production_defaults(
         ];
         // MoE: the grouped expert GEMMs go to cuBLASLt (prefill, and decode rungs >= 4 rows).
         // Dense: the decode GEMV L2 prefetch, measured on the dense 12B only.
+        // `PLOW_GEMMA_MOE_DEC_GROUP=0` rolls the grouped decode arm back, and its Lt route with it.
+        let dec_group_off = cfg.gemma_moe_dec_group == Some(0);
         if capabilities.moe {
-            flags.extend([(&mut cfg.moe_pf_lt, "moe_pf_lt"), (&mut cfg.moe_dec_lt, "moe_dec_lt")]);
+            flags.push((&mut cfg.moe_pf_lt, "moe_pf_lt"));
+            if !dec_group_off {
+                flags.push((&mut cfg.moe_dec_lt, "moe_dec_lt"));
+            }
         } else {
             flags.push((&mut cfg.gemv_prefetch, "gemv_prefetch"));
         }
@@ -7588,6 +7597,9 @@ fn apply_production_defaults(
         if capabilities.moe && cfg.gemma_moe_dec_group.is_none() {
             cfg.gemma_moe_dec_group = Some(4);
             emit_config::note_production_default("gemma_moe_dec_group", "4".into());
+        }
+        if dec_group_off {
+            cfg.gemma_moe_dec_group = None;
         }
         if cfg.attention_decode_balance_gf.is_none() {
             cfg.attention_decode_balance_gf = Some(4);

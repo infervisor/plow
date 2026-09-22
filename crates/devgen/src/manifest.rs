@@ -989,7 +989,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
 /// * `moe_down_sg = 8` — the Gemma decode expert-down lane split. Measured on h100-sxm5
 ///   (step_bench, ms at B=1/4/16): sg4 5.905 / 11.034 / 26.786, sg8 5.833 / 10.648 / 26.387. The
 ///   arm needs `I_moe % (32 / sg * 8) == 0` and silently falls back otherwise, hence the guard.
-fn tuning(s: &Shapes) -> Map<String, Value> {
+fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     let mut t = Map::new();
     t.insert("gv_mm_max".into(), json!(next_pow2(s.decode_batch.max(1))));
     // TILE PROVENANCE. Written because its absence made a real regression unauditable: for
@@ -1014,12 +1014,15 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
             }),
         );
     }
-    if s.moe_down_inter > 0 && s.moe_down_inter % 32 == 0 {
+    // The keys below drive NVIDIA-only defines (config_header), so other targets keep main's
+    // pairing hash.
+    let sm90a = arch == "sm_90a";
+    if sm90a && s.moe_down_inter > 0 && s.moe_down_inter % 32 == 0 {
         t.insert("moe_down_sg".into(), json!(8));
     }
     // The decode object compiles the grouped MoE arm (and claims its ring) only for a packet
     // whose decode program asks for it.
-    if s.moe_dec_group {
+    if arch.starts_with("sm_") && s.moe_dec_group {
         t.insert("moe_dec_group".into(), json!(1));
     }
     // The decode entry is ONE function at the 255-register cap, so every kernel compiled into it
@@ -1029,7 +1032,7 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
     // * `gemv_mma_b1`: a DENSE packet also walks its B=1 GEMVs on the tensor cores, which drops the
     //   classic B=1 kernels altogether: 12B 12.60/13.01/13.59 -> 11.93/12.60/13.16. The MoE 26B
     //   keeps its xreg kernels (B=1 5.66 vs 6.10 on the walk: its dense GEMVs are small).
-    if !s.decode_gemv_k.is_empty() {
+    if sm90a && !s.decode_gemv_k.is_empty() {
         t.insert("xreg_k".into(), json!(s.decode_gemv_k.iter().collect::<Vec<_>>()));
         if s.moe_down_inter == 0 && s.decode_batch >= 2 && s.decode_gemv_k.iter().all(|k| k % 32 == 0) {
             t.insert("gemv_mma_b1".into(), json!(1));
@@ -1050,10 +1053,10 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
     // * A MoE packet takes the hd256 depth alone (chosen per tile, no partials, no extra claim):
     //   26B B=8/16 12.76/15.52 -> 12.69/15.29 at depth 4 with B<=4 unchanged (depth 8: 15.24, but
     //   +0.06 at B=2/4).
-    if s.moe_down_inter == 0 && s.decode_batch >= 2 {
+    if sm90a && s.moe_down_inter == 0 && s.decode_batch >= 2 {
         t.insert("fa_spart".into(), json!(8));
         t.insert("fa_tc_hd512".into(), json!(1));
-    } else if s.moe_down_inter > 0 && s.decode_batch >= 8 {
+    } else if sm90a && s.moe_down_inter > 0 && s.decode_batch >= 8 {
         t.insert("fa_rb256".into(), json!(4));
     }
     if s.full_kv_heads == 1 && s.gqa > 0 {
@@ -2168,7 +2171,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
     f.insert("rope_half_hd64".into(), json!(s.rope_half_hd64));
     f.insert("attention_sinks".into(), json!(s.attention_sinks));
     let axes = precision_axes(&mut f, &s, &union, &progs);
-    let t = tuning(&s);
+    let t = tuning(&s, arch);
     let attention: Vec<Value> = crate::attention_decisions()
         .into_iter()
         .map(|d| {
