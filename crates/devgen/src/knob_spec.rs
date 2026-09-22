@@ -237,6 +237,97 @@ const LT_GLU_QUALIFIED: Status = Status::Qualified {
     ],
 };
 
+/// The H100 Gemma-4 recipe's generic arms: [`LT_GLU_TARGET`] plus hybrid attention with hd512
+/// full-attention layers, the geometry the sm_90a hd512 segment objects, the paired HD256/GQA2
+/// object and the balanced decode split (it asserts `GQA % 4 == 0`) are built for.
+/// `apply_production_defaults` mirrors these defaults; `=0` rolls each one back.
+const GEMMA4_HOPPER: F = F::And(&[LT_GLU_TARGET, F::Target(T::Cap("full_attn_hd512"))]);
+const GEMMA4_HOPPER_ON: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: GEMMA4_HOPPER,
+        value: TRUE,
+    }],
+    otherwise: FALSE,
+};
+const GEMMA4_HOPPER_MOE_ON: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: F::And(&[GEMMA4_HOPPER, F::Target(T::Cap("moe"))]),
+        value: TRUE,
+    }],
+    otherwise: FALSE,
+};
+const GEMMA4_HOPPER_DENSE_ON: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: F::And(&[GEMMA4_HOPPER, F::Not(&F::Target(T::Cap("moe")))]),
+        value: TRUE,
+    }],
+    otherwise: FALSE,
+};
+const GEMMA4_BALANCE_GF_DEFAULT: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: GEMMA4_HOPPER,
+        value: Val::Nat(4),
+    }],
+    otherwise: Val::Unset,
+};
+const GEMMA4_SEG_FA512_DEFAULT: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: GEMMA4_HOPPER,
+        value: Val::Str("1"),
+    }],
+    otherwise: Val::Unset,
+};
+const GEMMA4_SEG_FA256_GQA2_DEFAULT: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: GEMMA4_HOPPER,
+        value: TRUE,
+    }],
+    otherwise: Val::Unset,
+};
+const GEMMA4_MOE_DEC_GROUP_DEFAULT: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: F::And(&[GEMMA4_HOPPER, F::Target(T::Cap("moe"))]),
+        value: Val::Nat(4),
+    }],
+    otherwise: Val::Unset,
+};
+const GEMMA4_RECIPE: &[&str] = &[
+    "scripts/campaign/recipes/gemma4-12b.h100.bf16-ladder16k.toml and gemma4-26b-a4b.h100.bf16-ctx16k.toml, the H100 BF16 cells measured against vLLM 0.28 (perf-data/campaign/gemma4-*.h100.reference-vllm028-bf16.csv), set it",
+    "docs/flags-reference.md: `=0` is the rollback",
+];
+const GEMMA4_RECIPE_QUALIFIED: Status = Status::Qualified {
+    evidence: GEMMA4_RECIPE,
+};
+/// TMA maps are what lets a pure-GEMM segment reach the lean sm_90a GEMM object at all: class 8
+/// admits only mapped GEMMs (devbuild.rs T37).
+const TMA_GEMM_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "crates/packet/src/devbuild.rs T37: pure-GEMM mode 1 classes only TMA-mapped GEMMs as GEMM-class; without maps the PURE_GEMM_DEFAULT segments stay on the fat object",
+        "plans/gemma4-4k-8k-native-block.md: exact SM90a BF16 4K/8K pure-GEMM packet A/B (the mapped topology)",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
+const SLIDING_NS_GRID_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "crates/devgen/src/lib.rs PLOW_SLIDING_NS_GRID: h100-sxm5 step at ctx 1024, B=2/4/8, Gemma-4-12B 11.92/12.55/13.71 -> 11.45/11.98/13.04 ms, 26B-A4B 7.90/9.94/13.13 -> 7.57/9.57/12.72 ms; B=1 and B=16 unchanged",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
+const GEMV_PREFETCH_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "32688ffb: Gemma-4-12B step_bench p12r, ctx 192 B=1/4/16 10.55/10.75/11.44 -> 10.44/10.57/11.41 ms, ctx 1024 10.60/11.09/12.91 -> 10.51/10.88/12.86; greedy digests identical at B=1/4/8/16",
+        "dense only: the 26B-A4B (moe) was not measured",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
+const MOE_LT_EMIT_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "agent/moe-grouped-gemm bb2c5c14 (26B-A4B H100): MoE prefill segment 0.744 -> 0.569 ms at 1024 rows, 1.777 -> 1.352 at 4096; TTFT 1024/C1 43.0 -> 38.7 ms, 4096 120.9 -> 107.2, 8192 257.7 -> 231.0; MoE relL2 3.6e-3, gate + needle + consistency pass",
+        "26B-A4B step_bench ctx 1024 B=4/8/16: 9.61 / 12.75 / 15.28 ms (GROUP 8, in-tree) -> 8.73 / 10.15 / 12.57 (GROUP 4 + cuBLASLt); served C16 TPOT 15.26 / 17.84 / 26.87 -> 12.41 / 15.10 / 24.51 ms at 128 / 1024 / 4096 in",
+        "plowrt serves the segments by default (rt.moe_pf_lt / rt.moe_dec_lt); docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
+
 /// `apply_production_defaults` forces the arms that read the local cache directly off under
 /// `--dcp > 1`: they bypass the owner gather.
 const GLM_DCP_SHARDED: F = F::And(&[GLM_TARGET, F::Atom("emit.dcp", Cmp::Gt, Val::Nat(1))]);
@@ -739,6 +830,40 @@ pub const TARGETS: &[TargetSpec] = &[
         ],
         recipe: GEMMA4_W8A8_RECIPE,
     },
+    // The H100 campaign checkpoints (`GEMMA4_HOPPER`): Gemma-4-12B (dense) and 26B-A4B (moe).
+    TargetSpec {
+        name: "gemma4_hd512_sm90a_tp1",
+        arch: "sm_90a",
+        tp: 1,
+        n_cu: 132,
+        model: "gemma4",
+        caps: &[
+            "gemma",
+            "dense_packet_contracts",
+            "decode_objects",
+            "cublaslt_decode",
+            "decode_ladder",
+            "full_attn_hd512",
+        ],
+        recipe: &[],
+    },
+    TargetSpec {
+        name: "gemma4_moe_hd512_sm90a_tp1",
+        arch: "sm_90a",
+        tp: 1,
+        n_cu: 132,
+        model: "gemma4",
+        caps: &[
+            "gemma",
+            "dense_packet_contracts",
+            "decode_objects",
+            "cublaslt_decode",
+            "decode_ladder",
+            "moe",
+            "full_attn_hd512",
+        ],
+        recipe: &[],
+    },
     TargetSpec {
         name: "gemma4_gfx942_tp1",
         arch: "gfx942",
@@ -788,6 +913,8 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.mx4_prefill", Some("PLOW_MX4_PREFILL"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.uniseg", Some("PLOW_UNISEG"), Layer::Emit, Domain::Bool, UNISEG_DEFAULT, UNISEG),
     KnobSpec::new("emit.seg_pure_gemm", Some("PLOW_SEG_PURE_GEMM"), Layer::Emit, Domain::Str, PURE_GEMM_DEFAULT, GEMMA_NATIVE_PURE_GEMM),
+    KnobSpec::new("emit.seg_fa512", Some("PLOW_SEG_FA512"), Layer::Emit, Domain::Str, GEMMA4_SEG_FA512_DEFAULT, GEMMA4_RECIPE_QUALIFIED),
+    KnobSpec::new("emit.seg_fa256_gqa2", Some("PLOW_SEG_FA256_GQA2"), Layer::Emit, Domain::Bool, GEMMA4_SEG_FA256_GQA2_DEFAULT, GEMMA4_RECIPE_QUALIFIED),
     // Before the defaults that read it (`GLM_DCP_SHARDED`).
     KnobSpec::new("emit.dcp", Some("PLOW_DCP"), Layer::Emit, U32, UNSET, OPT_IN).with(C_DCP),
     KnobSpec::new("emit.emit_packed_prefill", Some("PLOW_EMIT_PACKED_PREFILL"), Layer::Emit, Domain::Bool, PACKED_PREFILL_DEFAULT, PACKED_SIBLINGS),
@@ -803,8 +930,8 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.decode_tiled", Some("PLOW_DECODE_TILED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.l2_place_prefill", Some("PLOW_L2_PLACE_PREFILL"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.fuse_argmax", Some("PLOW_FUSE_ARGMAX"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.sliding_ns_cap", Some("PLOW_SLIDING_NS_CAP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.sliding_ns_grid", Some("PLOW_SLIDING_NS_GRID"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.sliding_ns_cap", Some("PLOW_SLIDING_NS_CAP"), Layer::Emit, Domain::Bool, GEMMA4_HOPPER_ON, GEMMA4_RECIPE_QUALIFIED),
+    KnobSpec::new("emit.sliding_ns_grid", Some("PLOW_SLIDING_NS_GRID"), Layer::Emit, Domain::Bool, GEMMA4_HOPPER_ON, SLIDING_NS_GRID_QUALIFIED),
     KnobSpec::new("emit.no_fuse_qkv", Some("PLOW_NO_FUSE_QKV"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fuse_qkv_fp8", Some("PLOW_FUSE_QKV_FP8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.no_fuse_nrn", Some("PLOW_NO_FUSE_NRN"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -812,7 +939,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.fuse_merge", Some("PLOW_FUSE_MERGE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.hn_split", Some("PLOW_HN_SPLIT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fa_gf_full", Some("PLOW_FA_GF_FULL"), Layer::Emit, U32, UNSET, OPT_IN),
-    KnobSpec::new("emit.attention_decode_balance_gf", Some("PLOW_ATTENTION_DECODE_BALANCE_GF"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.attention_decode_balance_gf", Some("PLOW_ATTENTION_DECODE_BALANCE_GF"), Layer::Emit, U32, GEMMA4_BALANCE_GF_DEFAULT, GEMMA4_RECIPE_QUALIFIED),
     KnobSpec::new("emit.fa_mmaqk", Some("PLOW_FA_MMAQK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.flash_merge_dsplit", Some("PLOW_FLASH_MERGE_DSPLIT"), Layer::Emit, U32, UNSET, DIAG),
     KnobSpec::new("emit.ns_mul", Some("PLOW_NS_MUL"), Layer::Emit, U32, UNSET, OPT_IN),
@@ -832,7 +959,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.moe_prefill", Some("PLOW_MOE_PREFILL"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.gemma_moe_router_fused", Some("PLOW_GEMMA_MOE_ROUTER_FUSED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma_moe_router_blocks", Some("PLOW_GEMMA_MOE_ROUTER_BLOCKS"), Layer::Emit, U32, UNSET, OPT_IN),
-    KnobSpec::new("emit.gemma_moe_dec_group", Some("PLOW_GEMMA_MOE_DEC_GROUP"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.gemma_moe_dec_group", Some("PLOW_GEMMA_MOE_DEC_GROUP"), Layer::Emit, U32, GEMMA4_MOE_DEC_GROUP_DEFAULT, MOE_LT_EMIT_QUALIFIED),
     KnobSpec::new("emit.gemma_moe_router_exact", Some("PLOW_GEMMA_MOE_ROUTER_EXACT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma_moe_tail_fuse", Some("PLOW_GEMMA_MOE_TAIL_FUSE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.k3_full", Some("K3_FULL"), Layer::Emit, Domain::Bool, ON, DIAG),
@@ -936,7 +1063,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.xr_combine_fold", Some("PLOW_XR_COMBINE_FOLD"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.kda_fb_fold", Some("PLOW_KDA_FB_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.kda_decode_fused_arm", Some("PLOW_KDA_DECODE_FUSED_ARM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.gemv_prefetch", Some("PLOW_GEMV_PREFETCH"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.gemv_prefetch", Some("PLOW_GEMV_PREFETCH"), Layer::Emit, Domain::Bool, GEMMA4_HOPPER_DENSE_ON, GEMV_PREFETCH_QUALIFIED),
     KnobSpec::new("emit.moe_stage2_lean", Some("PLOW_MOE_STAGE2_LEAN"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.moe_stage1_lean", Some("PLOW_MOE_STAGE1_LEAN"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.moe_combine_lean", Some("PLOW_MOE_COMBINE_LEAN"), Layer::Emit, Domain::Bool, ON, PROMOTED),
@@ -948,7 +1075,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.moe_stage1_body", Some("PLOW_MOE_STAGE1_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_stage2_body", Some("PLOW_MOE_STAGE2_BODY"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.no_glu_fuse", Some("PLOW_NO_GLU_FUSE"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED),
-    KnobSpec::new("emit.tma_gemm", Some("PLOW_TMA_GEMM"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.tma_gemm", Some("PLOW_TMA_GEMM"), Layer::Emit, Domain::Bool, GEMMA4_HOPPER_ON, TMA_GEMM_QUALIFIED),
     KnobSpec::new("emit.gemma4_sm90_gemm_glu_role", Some("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_w8a8_gemm_glu_role", Some("PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.gemma4_sm90_hd256_gqa2_role", Some("PLOW_GEMMA4_SM90_HD256_GQA2_ROLE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -962,8 +1089,8 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.qwen_w8a8_prefill", Some("PLOW_QWEN_W8A8_PREFILL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_cublaslt", Some("PLOW_EMIT_DECODE_CUBLASLT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.prefill_cublaslt", Some("PLOW_EMIT_PREFILL_CUBLASLT"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED),
-    KnobSpec::new("emit.moe_pf_lt", Some("PLOW_EMIT_MOE_PF_LT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("emit.moe_dec_lt", Some("PLOW_EMIT_MOE_DEC_LT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.moe_pf_lt", Some("PLOW_EMIT_MOE_PF_LT"), Layer::Emit, Domain::Bool, GEMMA4_HOPPER_MOE_ON, MOE_LT_EMIT_QUALIFIED),
+    KnobSpec::new("emit.moe_dec_lt", Some("PLOW_EMIT_MOE_DEC_LT"), Layer::Emit, Domain::Bool, GEMMA4_HOPPER_MOE_ON, MOE_LT_EMIT_QUALIFIED),
     KnobSpec::new("emit.gemma_gemm_lt", Some("PLOW_GEMMA_GEMM_LT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_native_tc", Some("PLOW_EMIT_DECODE_NATIVE_TC"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_fuse_ab", Some("PLOW_QWEN_FUSE_AB"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -998,7 +1125,16 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_BLOB_F_L2DOM", Some("PLOW_BLOB_F_L2DOM"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
     KnobSpec::new("env.PLOW_BLOCK", Some("PLOW_BLOCK"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FA512", Some("PLOW_BUILD_FA512"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    // `scripts/build_sm90a_gemma4_segments.sh`: a BF16 packet defaults the recipe object set on.
+    KnobSpec::new("env.PLOW_BUILD_FA_GQA2_PAIR", Some("PLOW_BUILD_FA_GQA2_PAIR"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FATLITE", Some("PLOW_BUILD_FATLITE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_FATLITE_MOE", Some("PLOW_BUILD_FATLITE_MOE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_MASKED_PADDING", Some("PLOW_BUILD_MASKED_PADDING"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_PFATTN_HD256_BKV32", Some("PLOW_BUILD_PFATTN_HD256_BKV32"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_PFATTN_HD256_GQA2_BKV32", Some("PLOW_BUILD_PFATTN_HD256_GQA2_BKV32"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_PFATTN_HD512_PX4_BQ64", Some("PLOW_BUILD_PFATTN_HD512_PX4_BQ64"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_PFATTN_KV64", Some("PLOW_BUILD_PFATTN_KV64"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_BUILD_PFATTN_QK_UNROLL", Some("PLOW_BUILD_PFATTN_QK_UNROLL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FA_HD256", Some("PLOW_BUILD_FA_HD256"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FA_HD256_ONLY", Some("PLOW_BUILD_FA_HD256_ONLY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_BUILD_FA_WG", Some("PLOW_BUILD_FA_WG"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),

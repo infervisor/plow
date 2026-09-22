@@ -153,6 +153,16 @@ pub struct EmitConfig {
     #[arg(long = "emit-pure-gemm-segments", env = "PLOW_SEG_PURE_GEMM")]
     pub seg_pure_gemm: Option<String>,
 
+    /// Give hd512 FlashPrefill its own segment class, launched on the `*_pffa` object: `1` =
+    /// hd512 only, `all` = every head dim. Unset lets plowc select a qualified target default.
+    #[arg(long = "emit-seg-fa512", env = "PLOW_SEG_FA512")]
+    pub seg_fa512: Option<String>,
+
+    /// Isolate exact HD256/GQA2 sliding FlashPrefill in segments of their own, for the paired
+    /// object. Unset lets plowc select a qualified target default.
+    #[arg(long = "emit-seg-fa256-gqa2", env = "PLOW_SEG_FA256_GQA2", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), num_args = 0..=1, default_missing_value = "true")]
+    pub seg_fa256_gqa2: Option<bool>,
+
     /// Emit the packet ABI for packed cross-request prefill. Unset lets plowc
     /// select it from the target and packet capabilities.
     #[arg(long = "emit-packed-prefill", env = "PLOW_EMIT_PACKED_PREFILL", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), num_args = 0..=1, default_missing_value = "true")]
@@ -1275,6 +1285,8 @@ impl EmitConfig {
             mx4_prefill: env_str("PLOW_MX4_PREFILL"),
             uniseg: env_bool("PLOW_UNISEG"),
             seg_pure_gemm: env_str("PLOW_SEG_PURE_GEMM"),
+            seg_fa512: env_str("PLOW_SEG_FA512"),
+            seg_fa256_gqa2: env_bool_opt("PLOW_SEG_FA256_GQA2"),
             emit_packed_prefill: env_bool_opt("PLOW_EMIT_PACKED_PREFILL"),
             packed_prefill_default: false,
             // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on
@@ -1873,6 +1885,8 @@ pub fn install(mut cfg: EmitConfig) {
     // production default and a replay behave like the equivalent explicit env
     // setting instead of silently falling back to mixed segments.
     seg_knobs.seg_pure_gemm = cfg.seg_pure_gemm.clone();
+    seg_knobs.seg_fa512 = cfg.seg_fa512.clone();
+    seg_knobs.seg_fa256_gqa2 = cfg.seg_fa256_gqa2.unwrap_or(false);
     let ptr = Box::into_raw(Box::new(cfg));
     // In production there is only one call; in tests the last call wins (matches env-var
     // semantics where `set_var` before `run()` is the intent). We intentionally leak the

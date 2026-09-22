@@ -41,19 +41,10 @@ precision = "bf16"
 [emit]
 args = ["--segmented"]
 [emit.env]
-PLOW_SEG_PURE_GEMM = "1"
-PLOW_SEG_FA512 = "1"
-PLOW_SEG_FA256_GQA2 = "1"
-PLOW_TMA_GEMM = "1"
-PLOW_EMIT_PREFILL_CUBLASLT = "1"
-PLOW_NO_GLU_FUSE = "1"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
 # Rungs of >= 8 rows sort their B*k slots by expert and run the routed experts through the
 # grouped tensor-core GEMMs (step_bench ms/step at B=8/16: 16.3 -> 14.3, 27.0 -> 18.0).
 PLOW_GEMMA_MOE_DEC_GROUP = "8"
-PLOW_SLIDING_NS_GRID = "1"
-PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
-PLOW_SLIDING_NS_CAP = "1"
 # The lever. 1024 keeps the sliding ring at 2048 rows so 32 slots fit with room to
 # spare; it costs prefill chunking at the long rungs, which is why the realtime cell
 # keeps 4096 and this one does not serve the 8K rung.
@@ -78,19 +69,6 @@ script = "scripts/build_sm90a_gemma4_segments.sh"
 # Full-attention and sliding layers both fall back to the in-megakernel bodies here.
 role_files = []
 [objects.env]
-# Stripped fat object that KEEPS the Gemma MoE prefill opcodes (plain FATLITE=1 compiles them
-# out and no other object implements them). See the realtime recipe.
-PLOW_BUILD_FATLITE = "1"
-PLOW_BUILD_FATLITE_MOE = "1"
-PLOW_BUILD_FA_GQA2_PAIR = "1"
-PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
-PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
-PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
-PLOW_BUILD_MASKED_PADDING = "1"
-PLOW_BUILD_PFATTN_WG = "1"
-PLOW_BUILD_PFATTN_KV16 = "0"
-PLOW_BUILD_PFATTN_KV64 = "0"
-PLOW_BUILD_PFATTN_QK_UNROLL = "4"
 
 [emit_roles.env]
 # BOTH off: every attention role needs the M4096/M8192 prefill rungs and chunk 1024

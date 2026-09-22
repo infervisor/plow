@@ -34,25 +34,18 @@ n_cu = 132
 max_ctx = 16384
 precision = "bf16"
 
+# Production defaults for BF16 Gemma-4 on sm_90a TP1 (knob_spec GEMMA4_HOPPER, LT_GLU_TARGET):
+# pure-GEMM segments + TMA maps, cuBLASLt gate/up, hd512 / HD256-GQA2 attention segments,
+# sliding decode nsplit cap + grid floor, full-attention decode GF 4, and (moe) the grouped expert
+# GEMMs on cuBLASLt: MOE_PREFILL_CUBLASLT segments, and MOE_DECODE_CUBLASLT on rungs of >= 4 rows
+# (PLOW_GEMMA_MOE_DEC_GROUP 4), which plowrt serves by default. Only geometry and per-model tuning
+# stay here.
 [emit]
 args = ["--segmented"]
 [emit.env]
-PLOW_SEG_PURE_GEMM = "1"
-PLOW_SEG_FA512 = "1"
-PLOW_SEG_FA256_GQA2 = "1"
-PLOW_TMA_GEMM = "1"
-PLOW_EMIT_PREFILL_CUBLASLT = "1"
-PLOW_NO_GLU_FUSE = "1"
+# The ladder is deployment geometry: unset, plowc sizes the rungs to full-context memory, which
+# stops at 8 on the 26B-A4B.
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
-# Rungs of >= 4 rows sort their B*k slots by expert; EMIT_MOE_DEC_LT marks each layer's expert
-# pair so the runtime serves it with cuBLASLt grouped matmuls (PLOW_MOE_DEC_LT=4 in serve.env).
-# step_bench ctx 1024 B=4/8/16 ms: 9.61 / 12.75 / 15.28 (GROUP 8, in-tree) -> 8.73 / 10.15 / 12.57.
-# Without the serve knob this emit is +1.65 ms at B=4 (in-tree grouped arm from 4 rows).
-PLOW_GEMMA_MOE_DEC_GROUP = "4"
-PLOW_EMIT_MOE_DEC_LT = "1"
-PLOW_SLIDING_NS_GRID = "1"
-PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
-PLOW_SLIDING_NS_CAP = "1"
 # FINE-GRAINED RUNGS. The server re-tokenises and prepends BOS, so an N-token bench prompt is
 # N+1 rows and crosses its rung: measured 25 -> 42 ms at 128|129 rows, 62 -> 91 at 1024|1025,
 # 177 -> 202 at 4096|4097, 368 -> 394 at 8192|8193 (one more token, +17..29 ms: either the next
@@ -67,12 +60,6 @@ PLOW_MAX_CHUNK = "4096"
 # argmax into the lm_head GEMV epilogue is SLOWER here — 6.501 ms/step vs 5.837 without it.
 # (PLOW_FUSE_MERGE / PLOW_FUSE_HNR: no effect; PLOW_GEMMA_MOE_ROUTER_FUSED: 142 ms/step.)
 PLOW_FUSE_ARGMAX = "0"
-# Each layer's grouped MoE prefill pair (GLU + down) isolated as a MOE_PREFILL_CUBLASLT segment;
-# served by two cuBLASLt grouped matmuls when PLOW_MOE_PF_LT is set: segment 0.744 -> 0.569 ms at
-# 1024 rows, 1.777 -> 1.352 at 4096; TTFT 1024/C1 43.0 -> 38.7 ms, 4096 120.9 -> 107.2, 8192
-# 257.7 -> 231.0; MoE relL2 3.6e-3 (BF16 rounding of gate|up), gate + needle + consistency pass
-# (agent/moe-grouped-gemm, bb2c5c14).
-PLOW_EMIT_MOE_PF_LT = "1"
 # The exact scorer replays the legacy scalar fmaf order on ONE lane per expert: measured
 # 0.0460 ms/layer at B=1 vs 0.0085 for ScoreFast (moe_decode_gemma26b_bench.cu) — 1.1 ms of
 # an 8.15 ms C1 decode step. ScoreFast is f32 end to end with a tree reduction, which is
@@ -87,31 +74,16 @@ role_files = [
   "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
   "interp_sm90a_pfattn_hd256_bkv32.cubin",
 ]
-[objects.env]
-# FATLITE strips the native GEMM / GLU / flash arms the fat object never runs here (Lt, the GEMM
-# object and the FA objects own them); FATLITE_MOE keeps the Gemma MoE prefill opcodes in it, at
-# occ-1 with the full register budget their 128 accumulators need. Plain FATLITE=1 compiles the
-# MoE cases OUT and no other object implements them. Block outputs are bit-identical to the
-# unstripped object; the unstripped 255-register build spills, and the MoE segment ran 0.3 / 0.9
-# ms per layer slower in it at 1k / 4k (in-situ block bisect, 2026-09-20).
-PLOW_BUILD_FATLITE = "1"
-PLOW_BUILD_FATLITE_MOE = "1"
-# The MoE-down lane split (PLOW_MOE_DOWN_SG=8, measured on this board) is NOT set here: this env
-# only reaches the segments script, and the decode object is built from the manifest. It is a
-# manifest rule now (tuning.moe_down_sg -> plow_config.h), which every object of the packet sees.
-PLOW_BUILD_FA_GQA2_PAIR = "1"
-PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
-PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
-PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
-PLOW_BUILD_MASKED_PADDING = "1"
-# MUST be 1: the role file interp_sm90a_pfattn_hd512.cubin carries the ABI
-# `attention_sm90_hd512_wg32_v1`, i.e. the WGMMA BQ64 body. Building it with WG=0
-# emits the mma.sync BQ32 body instead, so the object's block/warp geometry does not
-# match what the role dispatch assumes. The 12B recipe sets 1 for the same reason.
-PLOW_BUILD_PFATTN_WG = "1"
-PLOW_BUILD_PFATTN_KV16 = "0"
-PLOW_BUILD_PFATTN_KV64 = "0"
-PLOW_BUILD_PFATTN_QK_UNROLL = "4"
+# No [objects.env]: the script's BF16 defaults are this packet's object set. FATLITE strips the
+# native GEMM / GLU / flash arms the fat object never runs here; the script turns on FATLITE_MOE
+# for a packet with grouped Gemma MoE prefill bodies (plow_config.h), which keeps them at occ-1
+# with the full register budget their 128 accumulators need — plain FATLITE compiles them OUT and
+# no other object implements them (in-situ block bisect, 2026-09-20: bit-identical, 0.3 / 0.9 ms
+# per layer faster than the unstripped build at 1k / 4k). The px4 BQ64 hd512 object stays unbuilt
+# (default): it hardcodes n_kv_head=1 and this checkpoint has 2. PLOW_BUILD_PFATTN_WG must stay 1
+# (default): the role file interp_sm90a_pfattn_hd512.cubin carries the WGMMA BQ64 ABI
+# `attention_sm90_hd512_wg32_v1`. The MoE-down lane split (PLOW_MOE_DOWN_SG=8) is a manifest rule
+# (tuning.moe_down_sg -> plow_config.h), which every object of the packet sees.
 
 [emit_roles.env]
 PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
