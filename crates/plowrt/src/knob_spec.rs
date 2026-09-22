@@ -56,6 +56,31 @@ const RELEASE_RETIRE_QUALIFIED: Status = Status::Qualified {
         "docs/flags-reference.md: `=0` is the rollback",
     ],
 };
+const PUBLISH_SHARED_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "agent/prefix-cache v2, 12B H100 random unique prompts, cache on vs off: 1024 C4/C16 TTFT 101.9/101.4, 306.8/307.3 ms, peak +1.2 GiB (v1 published two tailed windows per request); prefix-repetition hits 26/35, 57/67 as v1",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
+const CACHE_OUTPUT_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "agent/prefix-cache v1: a 7230-token follow-up turn 404 -> 32 ms TTFT",
+        "agent/prefix-cache v2, 12B H100 prefix-repetition, =0 vs default: C4 144.4/144.7, C16 258.4/259.4 ms TTFT, hits equal (neutral on single-turn)",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
+const INFLIGHT_WAIT_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "agent/prefix-cache v2, 12B H100 prefix-repetition C16, default vs =0: hits 57/67 vs 53/67, TTFT 259.4 vs 295.7 ms, tok/s 915 vs 889; C4 hits 26 vs 25, TTFT 144.7 vs 123.3 (v1 default 122.3, same hits)",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
+const CHUNK_PUBLISH_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "agent/prefix-cache v2, 12B H100 prefix-repetition 2048 shared + 6144 unique, C16, default vs =0: TTFT mean/median 1097.6/405.1 vs 1123.5/609.4 ms, TPOT 48.2 vs 47.6, tok/s 281.0 vs 283.3",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
 const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
 };
@@ -373,10 +398,10 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.preload", Some("PLOW_PRELOAD"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.kv_pool_mib", Some("PLOW_KV_POOL_MIB"), Layer::Runtime, USIZE, Default::Static(Val::Nat(512)), OPT_IN),
     KnobSpec::new("rt.vmm_deferred_reclaim", Some("PLOW_VMM_DEFERRED_RECLAIM"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.vmm_publish_shared", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
-    KnobSpec::new("rt.prefix_cache_output", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
-    KnobSpec::new("rt.prefix_inflight_wait", Some("PLOW_PREFIX_INFLIGHT_WAIT"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
-    KnobSpec::new("rt.prefix_chunk_publish", Some("PLOW_PREFIX_CHUNK_PUBLISH"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.vmm_publish_shared", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::Runtime, Domain::Bool, ON, PUBLISH_SHARED_QUALIFIED),
+    KnobSpec::new("rt.prefix_cache_output", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::Runtime, Domain::Bool, ON, CACHE_OUTPUT_QUALIFIED),
+    KnobSpec::new("rt.prefix_inflight_wait", Some("PLOW_PREFIX_INFLIGHT_WAIT"), Layer::Runtime, Domain::Bool, ON, INFLIGHT_WAIT_QUALIFIED),
+    KnobSpec::new("rt.prefix_chunk_publish", Some("PLOW_PREFIX_CHUNK_PUBLISH"), Layer::Runtime, Domain::Bool, ON, CHUNK_PUBLISH_QUALIFIED),
     KnobSpec::new("rt.vmm_release_retire", Some("PLOW_VMM_RELEASE_RETIRE"), Layer::Runtime, Domain::Bool, ON, RELEASE_RETIRE_QUALIFIED),
     KnobSpec::new("rt.ttft_log", Some("PLOW_TTFT_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pfx_log", Some("PLOW_PFX_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
