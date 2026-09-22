@@ -49,6 +49,38 @@ const STAGING: usize = 4;
 /// Shape arrays per wave block: hd, m, n8, ld_s, ld_p.
 const DIMS: usize = 5;
 
+/// The softmax object the route loads (`--pf-seg-dir`, then the asset dir), or `None` when the
+/// route is off: `PLOW_PF_ATTN_GEMM=0`, or unset and the packet carries no object. `=1` names
+/// the object whether or not it exists, so a missing one fails the load.
+pub(super) fn object(assets_dir: &Path) -> Option<std::path::PathBuf> {
+    let config = &crate::config::RuntimeConfig::get().nv;
+    let path = config
+        .pf_seg_dir
+        .as_deref()
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| Path::new(dir).join(SOFTMAX_OBJECT))
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| assets_dir.join(SOFTMAX_OBJECT));
+    match config.pf_attn_gemm {
+        Some(false) => None,
+        Some(true) => Some(path),
+        None => path.exists().then_some(path),
+    }
+}
+
+/// Query rows per score tile: the knob, capped at the widest routed bucket (no tile is longer
+/// than its request).
+fn tile_rows(max_rows: u32) -> u32 {
+    crate::config::RuntimeConfig::get().nv.pf_attn_gemm_tile.clamp(1, max_rows.max(1))
+}
+
+/// The score scratch `load` allocates: one tile of every head at the widest KV pitch.
+pub(super) fn scratch_bytes(max_heads: u32, max_ctx: usize, max_rows: u32) -> u64 {
+    let element = if crate::config::RuntimeConfig::get().nv.pf_attn_gemm_s32 { 4 } else { 2 };
+    let pitch = (max_ctx as u64).next_multiple_of(u64::from(PITCH));
+    u64::from(tile_rows(max_rows)) * u64::from(max_heads) * pitch * element
+}
+
 /// One `FlashPrefill` site served by the route. Addresses are the slot-0 tensor bases.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Site {
@@ -301,7 +333,8 @@ pub(super) struct AttentionGemm {
 type GroupedKey = (Gemm, usize, u32, u32, u32, u32);
 
 impl AttentionGemm {
-    /// `max_sites` routed segments per launch, `batch` slots, `max_rows` the largest bucket.
+    /// `max_sites` routed segments per launch, `batch` slots, `max_rows` the largest routed
+    /// bucket.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load(
         be: &Arc<CudaBackend>,
@@ -338,10 +371,8 @@ impl AttentionGemm {
             &module,
             if scores_f32 { SOFTMAX_ENTRY_F32 } else { SOFTMAX_ENTRY },
         )?;
-        let tile_rows = config.pf_attn_gemm_tile.max(1);
-        let pitch = (max_ctx as u64).next_multiple_of(u64::from(PITCH));
-        let element = if scores_f32 { 4 } else { 2 };
-        let scratch = be.alloc(0, u64::from(tile_rows) * u64::from(max_heads) * pitch * element)?;
+        let tile_rows = tile_rows(max_rows);
+        let scratch = be.alloc(0, scratch_bytes(max_heads, max_ctx, max_rows))?;
         let vtail = be.alloc(0, u64::from(TAIL_ROWS) * u64::from(max_head_dim) * 2)?;
         let grouped = if config.pf_attn_gemm_grouped && lt.has_grouped() && kernel_groups > 0 {
             let entry = if scores_f32 {
@@ -1131,6 +1162,14 @@ mod tests {
         }
         // A KV tensor whose slot pitch is not the instruction's stride is not a linear cache.
         assert!(sites(&program, &tensors, &devp, 2)[1].is_none());
+    }
+
+    #[test]
+    fn scratch_is_one_tile_of_the_widest_routed_bucket() {
+        // Default 2048-row tile, bf16 scores: the 26B's 16-head full layers at a 16k context.
+        assert_eq!(scratch_bytes(16, 16384, 4224), 1 << 30);
+        // No request of a 1024-row bucket runs a longer tile.
+        assert_eq!(scratch_bytes(16, 15000, 1024), 1024 * 16 * 15104 * 2);
     }
 
     #[test]
