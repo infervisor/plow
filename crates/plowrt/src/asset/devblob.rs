@@ -1295,6 +1295,30 @@ mod tests {
         assert_eq!(program.seg_classes_with(policy).unwrap(), [4, 8]);
     }
 
+    /// `PLOW_TEST_BLOB=<model.pkt>` of a Gemma-4 H100 BF16 recipe: the classing the recipes used
+    /// to pin serve-side (`PLOW_PF_SEG_PURE=1`, `PLOW_PF_SEG_FA512=1`) is the one the CUDA loader
+    /// infers from the packet (`exec/gpu.rs` `load_prefill`).
+    #[test]
+    #[ignore = "set PLOW_TEST_BLOB"]
+    fn recipe_segment_classing_is_the_packet_inferred_one() {
+        let path = std::env::var("PLOW_TEST_BLOB").unwrap();
+        let blob = DevBlob::parse(&std::fs::read(&path).unwrap()).unwrap();
+        let mut inferred = SegmentClassPolicy::default();
+        for program in blob.prefill_progs() {
+            let policy = program.inferred_segment_policy();
+            inferred.pure_mode = inferred.pure_mode.max(policy.pure_mode);
+            inferred.fa512_mode = inferred.fa512_mode.max(policy.fa512_mode);
+            inferred.fa256_gqa2 |= policy.fa256_gqa2;
+        }
+        let pinned = SegmentClassPolicy {
+            pure_mode: 1,
+            fa512_mode: 1,
+            ..inferred
+        };
+        assert_eq!(inferred, pinned, "{path}");
+        assert!(inferred.fa256_gqa2, "{path}");
+    }
+
     /// `hidden` is a ROW width, and a one-shot collective in a PREFILL program says
     /// `t * hidden`. This used to read `i[0]` outright, which was right only while the
     /// one-shot belonged to decode alone. Kimi-K3's shared-expert reduce carries a folded

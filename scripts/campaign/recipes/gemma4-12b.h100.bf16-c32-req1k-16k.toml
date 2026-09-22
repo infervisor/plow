@@ -69,12 +69,10 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 
 [serve.env]
 PLOW_PREFIX_CACHE = "0"
+# Forced past the KV-budget gate, as measured: the unset rule is unchecked at rung 32 on this
+# 32-slot packet.
 PLOW_PF_ATTN_GEMM = "1"
-PLOW_PF_SEG_PURE = "1"
-PLOW_PF_SEG_FA512 = "1"
 PLOW_PF_INTERLEAVE = "0"
-PLOW_ENCODE_THREADS = "16"
-PLOW_ENCODE_SPLIT_MIN = "512"
 PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
 LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
 

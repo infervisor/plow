@@ -89,7 +89,8 @@ pub struct HfTokenizer {
     /// the vocabulary never changes after load.
     vocab_size: usize,
     fast: bool,
-    split: bool,
+    /// Smallest split-encode piece in bytes; `None` encodes serially.
+    split_min: Option<usize>,
 }
 
 /// Pre-tokenizer patterns under which a single ASCII space between two ASCII letters always ends
@@ -109,6 +110,15 @@ const QWEN2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{
 /// is about 32 KB, so at 4096 it splits 8 ways however many threads the pool has.
 #[cfg(feature = "hf-tokenizer")]
 const SPLIT_MIN_BYTES: usize = 4096;
+
+/// Split-encode defaults for a metaspace one-word BPE, which otherwise encodes a whole prompt as
+/// ONE word, serially, inside TTFT. Gemma-4 served wall (bench-like prompts, 16 threads, 512 B):
+/// 46.0 -> 43.7 ms at 1k, 131.6 -> 122.4 at 4k (26B); C1 TTFT 50.1 -> 47.3 ms at 1k (12B). A 1k
+/// prompt is ~5 KB, so the 4096-byte floor would not split it.
+#[cfg(feature = "hf-tokenizer")]
+const ONE_WORD_THREADS: u32 = 16;
+#[cfg(feature = "hf-tokenizer")]
+const ONE_WORD_SPLIT_MIN_BYTES: usize = 512;
 
 #[cfg(feature = "hf-tokenizer")]
 static ENCODE_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
@@ -194,11 +204,9 @@ fn encode_split(
     pool: &rayon::ThreadPool,
     text: &str,
     add_special_tokens: bool,
+    floor: usize,
 ) -> Option<Vec<u32>> {
     use rayon::prelude::*;
-    let floor = crate::config::RuntimeConfig::get()
-        .encode_split_min
-        .map_or(SPLIT_MIN_BYTES, |n| (n as usize).max(1));
     let parts = (text.len() / floor).min(pool.current_num_threads());
     if parts < 2 {
         return None;
@@ -262,7 +270,14 @@ impl HfTokenizer {
 
     fn loaded(inner: tokenizers::Tokenizer) -> Self {
         let rt = crate::config::RuntimeConfig::get();
-        let split = match rt.encode_threads.filter(|&n| n >= 2) {
+        let one_word = (rt.encode_threads.is_none() || rt.encode_split_min.is_none())
+            && metaspace_bpe_split_safe(&inner);
+        let threads = rt.encode_threads.or(one_word.then_some(ONE_WORD_THREADS));
+        let floor = rt.encode_split_min.map_or(
+            if one_word { ONE_WORD_SPLIT_MIN_BYTES } else { SPLIT_MIN_BYTES },
+            |n| (n as usize).max(1),
+        );
+        let split = match threads.filter(|&n| n >= 2) {
             Some(_) if !split_safe(&inner) => {
                 tracing::warn!("PLOW_ENCODE_THREADS: tokenizer is not split-safe; encoding serially");
                 false
@@ -283,7 +298,7 @@ impl HfTokenizer {
             vocab_size: inner.get_vocab_size(true),
             inner,
             fast: rt.encode_fast,
-            split,
+            split_min: split.then_some(floor),
         }
     }
 
@@ -343,8 +358,8 @@ impl Tokenize for HfTokenizer {
     }
 
     fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> Vec<u32> {
-        if let Some(Some(pool)) = self.split.then(|| ENCODE_POOL.get()).flatten() {
-            if let Some(ids) = encode_split(&self.inner, pool, text, add_special_tokens) {
+        if let (Some(floor), Some(Some(pool))) = (self.split_min, ENCODE_POOL.get()) {
+            if let Some(ids) = encode_split(&self.inner, pool, text, add_special_tokens, floor) {
                 return ids;
             }
         }
@@ -448,11 +463,12 @@ mod tests {
         for text in texts() {
             for special in [false, true] {
                 let whole = t.encode(text.as_str(), special).unwrap().get_ids().to_vec();
-                let split = encode_split(&t, &pool, &text, special).expect("long text splits");
+                let split = encode_split(&t, &pool, &text, special, SPLIT_MIN_BYTES)
+                    .expect("long text splits");
                 assert_eq!(split, whole);
             }
         }
-        assert!(encode_split(&t, &pool, "hello world", false).is_none());
+        assert!(encode_split(&t, &pool, "hello world", false, SPLIT_MIN_BYTES).is_none());
     }
 
     /// Gemma's shape: space -> `▁` normalizer, a Split-on-space that never fires, one-word BPE.
@@ -503,9 +519,39 @@ mod tests {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
         for text in texts() {
             let whole = t.encode(text.as_str(), false).unwrap().get_ids().to_vec();
-            let split = encode_split(&t, &pool, &text, false).expect("long text splits");
+            let split = encode_split(&t, &pool, &text, false, SPLIT_MIN_BYTES)
+                .expect("long text splits");
             assert_eq!(split, whole);
         }
+    }
+
+    /// `PLOW_TEST_BLOB=<model.pkt>` of a Gemma-4 recipe: its `tokenizer.json` splits at the
+    /// `PLOW_ENCODE_THREADS=16` / `PLOW_ENCODE_SPLIT_MIN=512` the recipes used to pin.
+    #[test]
+    #[ignore = "set PLOW_TEST_BLOB"]
+    fn gemma_tokenizer_splits_like_the_recipe() {
+        let rt = crate::config::RuntimeConfig::get();
+        assert!(rt.encode_threads.is_none() && rt.encode_split_min.is_none());
+        let blob = std::path::PathBuf::from(std::env::var("PLOW_TEST_BLOB").unwrap());
+        let t = HfTokenizer::from_file(&blob.with_file_name("tokenizer.json")).unwrap();
+        assert_eq!(t.split_min, Some(512));
+        let pool = ENCODE_POOL.get().and_then(Option::as_ref).unwrap();
+        assert_eq!(pool.current_num_threads(), 16);
+    }
+
+    /// Unset `PLOW_ENCODE_THREADS` / `PLOW_ENCODE_SPLIT_MIN`: only a metaspace one-word BPE splits.
+    #[test]
+    fn split_encode_defaults_follow_the_tokenizer() {
+        let rt = crate::config::RuntimeConfig::get();
+        if rt.encode_threads.is_some() || rt.encode_split_min.is_some() {
+            return;
+        }
+        assert_eq!(
+            HfTokenizer::loaded(gemma_like(false)).split_min,
+            Some(ONE_WORD_SPLIT_MIN_BYTES)
+        );
+        assert_eq!(HfTokenizer::loaded(gemma_like(true)).split_min, None);
+        assert_eq!(HfTokenizer::loaded(glm_like(false)).split_min, None);
     }
 
     #[test]

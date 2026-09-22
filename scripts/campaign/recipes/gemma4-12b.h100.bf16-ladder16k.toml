@@ -82,21 +82,13 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 # the defaults (bd317b28; shared-system-prompt scenario 8 x 2048 + 256: C4 TTFT 291 -> 113 ms,
 # C16 541 -> 281, vLLM 121 / 283). Beside co-tenants raise PLOW_VMM_CACHE_MIN_FREE_MIB.
 PLOW_PREFIX_CACHE = "0"
-# Vendor cuBLASLt Q.K^T / causal softmax / P.V for the hd512 full-attention prefill segments
-# (attn_softmax_sm90a.cubin from the objects script; agent/pf-attn-batched-gemm, e8227eed..):
-# served C1 TTFT 4096 176.7 -> 170.6, 8192 386 -> 360, 15000 832 -> 750 ms; C4/C16 8192-15000
-# TTFT -7..-12%, TPOT -6..-12%; packs of short slices keep the segment graph (MIN_ROWS 1024).
-PLOW_PF_ATTN_GEMM = "1"
-PLOW_PF_SEG_PURE = "1"
-PLOW_PF_SEG_FA512 = "1"
+# Serve defaults this recipe used to name: segment classing read from the packet
+# (PLOW_PF_SEG_PURE / PLOW_PF_SEG_FA512), split encode for the one-word BPE tokenizer
+# (PLOW_ENCODE_THREADS 16 / PLOW_ENCODE_SPLIT_MIN 512), the inline mux tick on CUDA, and the
+# vendor-GEMM hd512 prefill attention (PLOW_PF_ATTN_GEMM: on when attn_softmax_sm90a.cubin is
+# found and the KV budget after its scratch admits a full rung at full context, 841k rows here;
+# e8227eed: C1 TTFT 4096 176.7 -> 170.6, 8192 386 -> 360, 15000 832 -> 750 ms).
 PLOW_PF_INTERLEAVE = "0"
-# Threaded split encode (exact for Gemma's one-word BPE, tokenizer.rs): C1 TTFT 50.1 -> 47.3 ms
-# at 1024 in, 186.3 -> 176.7 at 4096, 863 -> 830 at 15000 (the 26B recipes already carry it).
-PLOW_ENCODE_THREADS = "16"
-PLOW_ENCODE_SPLIT_MIN = "512"
-# Dispatcher on its own thread, tick inline (0b88ef14): engine handoff 50-87 -> 0.3 us per tick;
-# 26B 128/C1 TPOT 5.66 -> 5.61 ms, C16 15.53 -> 15.42 ms, TTFT unchanged.
-PLOW_MUX_INLINE_TICK = "1"
 PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
 LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
 

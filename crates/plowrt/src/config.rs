@@ -102,10 +102,12 @@ pub struct RuntimeConfig {
 
     /// Tokenize long prompts in pieces on a pool of this many threads, for tokenizers whose
     /// pre-tokenizer makes the pieces' ids identical to a whole-text encode; others stay serial.
+    /// Unset: 16 for a metaspace one-word BPE (Gemma-class), serial otherwise; `0` = serial.
     #[arg(long = "encode-threads", env = "PLOW_ENCODE_THREADS", global = true)]
     pub encode_threads: Option<u32>,
 
-    /// Smallest piece a split encode hands a thread, in bytes (default 4096). This, not the
+    /// Smallest piece a split encode hands a thread, in bytes (unset: 512 for a metaspace one-word
+    /// BPE, 4096 otherwise). This, not the
     /// thread count, is what caps the parallelism of a given prompt: the split encode takes
     /// `min(len / this, threads)` pieces, so an 8192-token prompt (~32 KB) uses at most 8 threads
     /// at the default no matter how large the pool is.
@@ -409,9 +411,10 @@ pub struct RuntimeConfig {
     pub rung_fast_probe: bool,
     /// Run a GPU model's mux dispatcher on its own OS thread and execute each tick inline
     /// (`PLOW_MUX_INLINE_TICK`), instead of handing every tick to the engine thread and awaiting
-    /// it from a tokio worker. Removes two cross-thread wakes from every decode tick.
-    #[arg(long = "mux-inline-tick", env = "PLOW_MUX_INLINE_TICK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub mux_inline_tick: bool,
+    /// it from a tokio worker. Removes two cross-thread wakes from every decode tick. Unset: on
+    /// for a CUDA engine, off for the others; `=0` is the rollback.
+    #[arg(long = "mux-inline-tick", env = "PLOW_MUX_INLINE_TICK", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mux_inline_tick: Option<bool>,
 
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / observability (shared, off by default)
@@ -912,21 +915,43 @@ pub struct NvidiaRuntimeConfig {
     pub lt_algos_write: Option<String>,
 
     /// Serve a packet's `MOE_PREFILL_CUBLASLT` segments (emit `PLOW_EMIT_MOE_PF_LT`) with
-    /// cuBLASLt grouped matmuls in every prefill bucket of at least this many rows. Unset = the
-    /// segments run in the interpreter.
+    /// cuBLASLt grouped matmuls in every prefill bucket of at least this many rows. Unset = every
+    /// bucket that carries them; `0` = the segments run in the interpreter.
     #[arg(long = "moe-pf-lt", env = "PLOW_MOE_PF_LT", global = true)]
     pub moe_pf_lt: Option<u32>,
 
     /// Serve a packet's `MOE_DECODE_CUBLASLT` segments (emit `PLOW_EMIT_MOE_DEC_LT`) with
-    /// cuBLASLt grouped matmuls on every decode rung of at least this many rows. Unset = the
-    /// rungs run in the interpreter. A routed rung is a captured graph, so multistep still
-    /// enqueues it K times per quantum.
+    /// cuBLASLt grouped matmuls on every decode rung of at least this many rows. Unset = every
+    /// rung that carries them; `0` = the rungs run in the interpreter. A routed rung is a
+    /// captured graph, so multistep still enqueues it K times per quantum.
     #[arg(long = "moe-dec-lt", env = "PLOW_MOE_DEC_LT", global = true)]
     pub moe_dec_lt: Option<u32>,
 
     /// Equalize the seg pair's dynamic smem (occ-1 fat object A/B).
     #[arg(long = "pf-seg-eqsmem", env = "PLOW_PF_SEG_EQSMEM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_eqsmem: bool,
+}
+
+impl NvidiaRuntimeConfig {
+    /// Smallest prefill bucket `PLOW_MOE_PF_LT` routes, `None` when off. Unset routes every
+    /// bucket: only the buckets whose packet declares the segments can be routed at all.
+    pub fn moe_pf_lt_min_rows(&self) -> Option<u32> {
+        match self.moe_pf_lt {
+            Some(0) => None,
+            Some(rows) => Some(rows),
+            None => Some(1),
+        }
+    }
+
+    /// Smallest decode rung `PLOW_MOE_DEC_LT` routes, `None` when off. Unset follows the packet:
+    /// `packet_min` is the narrowest rung that declares the segments.
+    pub fn moe_dec_lt_min_rows(&self, packet_min: Option<u32>) -> Option<u32> {
+        match self.moe_dec_lt {
+            Some(0) => None,
+            Some(rows) => Some(rows),
+            None => packet_min,
+        }
+    }
 }
 
 impl RuntimeConfig {
@@ -937,6 +962,11 @@ impl RuntimeConfig {
             0 => usize::MAX,
             rows => rows as usize,
         }
+    }
+
+    /// Inline mux tick (`PLOW_MUX_INLINE_TICK`) for an engine of this backend.
+    pub fn mux_inline_tick(&self, cuda: bool) -> bool {
+        self.mux_inline_tick.unwrap_or(cuda)
     }
 
     /// AMD per-tick prefill row cap. Unset → 0, which `serve::mux::amd_prefill_tick_cap`
@@ -1897,6 +1927,35 @@ pub fn serve_replay(m: &clap::ArgMatches) -> std::collections::BTreeMap<String, 
 
 #[cfg(test)]
 mod tests {
+    /// Serve knobs the Gemma-4 H100 recipes used to pin: unset follows the engine or the packet,
+    /// an explicit value wins, `0` rolls back.
+    #[test]
+    fn recipe_serve_knobs_default_from_engine_and_packet() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        let parse = |argv: &[&str]| {
+            let matches = command.clone().try_get_matches_from(argv).unwrap();
+            super::RuntimeConfig::from_arg_matches(&matches).unwrap()
+        };
+        let unset = parse(&["test"]);
+        assert!(unset.mux_inline_tick(true) && !unset.mux_inline_tick(false));
+        assert_eq!(unset.nv.pf_attn_gemm, None);
+        assert_eq!(unset.nv.moe_pf_lt_min_rows(), Some(1));
+        assert_eq!(unset.nv.moe_dec_lt_min_rows(Some(4)), Some(4));
+        assert_eq!(unset.nv.moe_dec_lt_min_rows(None), None);
+        let pinned = parse(&["test", "--mux-inline-tick", "--moe-pf-lt=1", "--moe-dec-lt=4"]);
+        assert!(pinned.mux_inline_tick(true));
+        assert_eq!(pinned.nv.moe_pf_lt_min_rows(), unset.nv.moe_pf_lt_min_rows());
+        assert_eq!(
+            pinned.nv.moe_dec_lt_min_rows(Some(4)),
+            unset.nv.moe_dec_lt_min_rows(Some(4))
+        );
+        let off = parse(&["test", "--mux-inline-tick=0", "--moe-pf-lt=0", "--moe-dec-lt=0"]);
+        assert!(!off.mux_inline_tick(true));
+        assert_eq!(off.nv.moe_pf_lt_min_rows(), None);
+        assert_eq!(off.nv.moe_dec_lt_min_rows(Some(4)), None);
+    }
+
     #[test]
     fn token_batch_defaults_on_with_explicit_rollback() {
         use clap::{Args, FromArgMatches};
@@ -2511,7 +2570,9 @@ mod tests {
             let cut = lines
                 .windows(2)
                 .position(|w| {
-                    w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests")
+                    let attr = w[0].trim();
+                    (attr == "#[cfg(test)]" || attr.starts_with("#[cfg(all(test, "))
+                        && w[1].trim_start().starts_with("mod tests")
                 })
                 .unwrap_or(lines.len());
             for (i, line) in lines[..cut].iter().enumerate() {
