@@ -72,6 +72,12 @@ extern "C" __device__ unsigned plow_row_gather_1 = 1;
  * packet whose hash differs. Without that check, specialisation would convert today's loud
  * first-launch `default: __trap()` into a trap MID-SERVE on whichever bucket needs the arm
  * that was dropped, which is strictly worse than the problem it solves. */
+/* The routed decode object serves only the rungs whose MoE experts run in cuBLASLt: the route
+ * rewrites every expert GLU/down instruction to Nop, and the loader checks each rung it binds. */
+#if PLOW_NV_DECODE_ROUTED
+#define PLOW_HAS_MOE_EXPERT_GLU_NORM_GEMMA 0
+#define PLOW_HAS_MOE_EXPERT_DOWN_GEMMA 0
+#endif
 #ifdef PLOW_CONFIG
 #include PLOW_CONFIG
 #endif
@@ -101,6 +107,38 @@ extern "C" __device__ unsigned plow_row_gather_1 = 1;
 #endif
 #ifndef PLOW_HAS_MOE_EXPERT_GLU_GEMMA
 #define PLOW_HAS_MOE_EXPERT_GLU_GEMMA 1
+#endif
+/* The other Gemma decode MoE members: each case compiles only when the packet emits it. An
+ * unexecuted member is not free: the 26B decode object sits at the 255-register cap and spills. */
+#ifndef PLOW_HAS_MOE_ROUTER_GEMMA_SCORE
+#define PLOW_HAS_MOE_ROUTER_GEMMA_SCORE 1
+#endif
+#ifndef PLOW_HAS_MOE_ROUTER_GEMMA_SCORE_FAST
+#define PLOW_HAS_MOE_ROUTER_GEMMA_SCORE_FAST 1
+#endif
+#ifndef PLOW_HAS_MOE_ROUTER_GEMMA_TOPK
+#define PLOW_HAS_MOE_ROUTER_GEMMA_TOPK 1
+#endif
+#ifndef PLOW_HAS_MOE_EXPERT_GLU_NORM_GEMMA
+#define PLOW_HAS_MOE_EXPERT_GLU_NORM_GEMMA 1
+#endif
+#ifndef PLOW_HAS_MOE_EXPERT_DOWN_GEMMA
+#define PLOW_HAS_MOE_EXPERT_DOWN_GEMMA 1
+#endif
+#ifndef PLOW_HAS_MOE_EXPERT_GLU_GEMMA_FP8
+#define PLOW_HAS_MOE_EXPERT_GLU_GEMMA_FP8 1
+#endif
+#ifndef PLOW_HAS_MOE_EXPERT_DOWN_GEMMA_FP8
+#define PLOW_HAS_MOE_EXPERT_DOWN_GEMMA_FP8 1
+#endif
+#ifndef PLOW_HAS_MOE_COMBINE_GEMMA
+#define PLOW_HAS_MOE_COMBINE_GEMMA 1
+#endif
+#ifndef PLOW_HAS_MOE_COMBINE_NORM_GEMMA
+#define PLOW_HAS_MOE_COMBINE_NORM_GEMMA 1
+#endif
+#ifndef PLOW_HAS_MOE_COMBINE_RESID_NORM_GEMMA
+#define PLOW_HAS_MOE_COMBINE_RESID_NORM_GEMMA 1
 #endif
 
 /* Flat MXFP4 projections and experts are compiled only into a packet-specialized object. The
@@ -712,6 +750,8 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _pf)
 #elif PLOW_NV_GF8_TWIN
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _gf8)
+#elif PLOW_NV_DECODE_ROUTED
+#define PLOW_SYM(n) PLOW_NV_CAT(n, _routed)
 #else
 #define PLOW_SYM(n) n
 #endif
@@ -2443,20 +2483,25 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * to the pre-batch blob; 0 and 1 both mean "one row" here. */
 #define PLOW_NROW(v) ((v) ? (v) : 1u)
     /* i[5] (router: i[3]) = BATCH B, 0/1 => single row and byte-identical to the pre-batch blob. */
+#if PLOW_HAS_MOE_ROUTER_GEMMA
     case PLOW_DOP_MOE_ROUTER_GEMMA:
         d_moe_router_gemma((unsigned char*)TEN(0), (const __nv_bfloat16*)TEN(1),
                            (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
                            (const __nv_bfloat16*)TEN(4), in->i[0], in->i[1], in->i[2],
                            in->fj[0].f, in->fj[1].f, slice, nblk, PLOW_NROW(in->i[3]), arena);
         break;
+#endif
 
+#if PLOW_HAS_MOE_ROUTER_GEMMA_SCORE
     case PLOW_DOP_MOE_ROUTER_GEMMA_SCORE:
         d_moe_router_gemma_score((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
                                  (const __nv_bfloat16*)TEN(2),
                                  (const __nv_bfloat16*)TEN(3), in->i[0], in->i[1],
                                  in->fj[0].f, in->fj[1].f, slice, nblk, PLOW_NROW(in->i[2]));
         break;
+#endif
 
+#if PLOW_HAS_MOE_ROUTER_GEMMA_SCORE_FAST
     case PLOW_DOP_MOE_ROUTER_GEMMA_SCORE_FAST:
         d_moe_router_gemma_score_fast((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
                                       (const __nv_bfloat16*)TEN(2),
@@ -2464,13 +2509,17 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                       in->fj[0].f, in->fj[1].f, slice, nblk, PLOW_NROW(in->i[2]),
                                       arena);
         break;
+#endif
 
+#if PLOW_HAS_MOE_ROUTER_GEMMA_TOPK
     case PLOW_DOP_MOE_ROUTER_GEMMA_TOPK:
         d_moe_router_gemma_topk((unsigned char*)TEN(0), (const float*)TEN(1),
                                 (const __nv_bfloat16*)TEN(2), in->i[1], in->i[2],
                                 slice, nblk, PLOW_NROW(in->i[3]), arena);
         break;
+#endif
 
+#if PLOW_HAS_MOE_EXPERT_GLU_GEMMA
     case PLOW_DOP_MOE_EXPERT_GLU_GEMMA: {
         const unsigned soff = in->i[4];
         d_moe_expert_glu_gemma((__nv_bfloat16*)TEN(0) + (size_t)soff * in->i[1],
@@ -2481,7 +2530,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                (__nv_bfloat16*)arena);
         break;
     }
+#endif
 
+#if PLOW_HAS_MOE_EXPERT_DOWN_GEMMA
     case PLOW_DOP_MOE_EXPERT_DOWN_GEMMA: {
 #if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && PLOW_NV_GEMV_RB
         if (in->i[6] && PLOW_NROW(in->i[5]) >= in->i[6]) {
@@ -2500,7 +2551,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                 in->i[3], slice, nblk, PLOW_NROW(in->i[5]), arena);
         break;
     }
+#endif
 
+#if PLOW_HAS_MOE_EXPERT_GLU_GEMMA_FP8
     case PLOW_DOP_MOE_EXPERT_GLU_GEMMA_FP8: {
         const unsigned soff = in->i[4];
         d_moe_expert_glu_gemma_fp8((__nv_bfloat16*)TEN(0) + (size_t)soff * in->i[1],
@@ -2512,7 +2565,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                    (__nv_bfloat16*)arena);
         break;
     }
+#endif
 
+#if PLOW_HAS_MOE_EXPERT_DOWN_GEMMA_FP8
     case PLOW_DOP_MOE_EXPERT_DOWN_GEMMA_FP8: {
         const unsigned soff = in->i[4];
         d_moe_expert_down_gemma_fp8((float*)TEN(0) + (size_t)soff * in->i[1],
@@ -2523,19 +2578,25 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                     in->i[2], in->i[3], slice, nblk, PLOW_NROW(in->i[5]));
         break;
     }
+#endif
 
+#if PLOW_HAS_MOE_COMBINE_GEMMA
     case PLOW_DOP_MOE_COMBINE_GEMMA:
         d_moe_combine_gemma((__nv_bfloat16*)TEN(0), (const float*)TEN(1), in->i[0], in->i[1],
                             slice, nblk);
         break;
+#endif
 
+#if PLOW_HAS_MOE_COMBINE_NORM_GEMMA
     case PLOW_DOP_MOE_COMBINE_NORM_GEMMA:
         d_moe_combine_norm_gemma((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                   (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
                                   in->i[0], in->i[1], in->fj[0].f, slice, nblk,
                                   PLOW_NROW(in->i[2]), arena);
         break;
+#endif
 
+#if PLOW_HAS_MOE_COMBINE_RESID_NORM_GEMMA
     /* Fused MoE layer tail: combine + post_ffn norm + sandwich residual + next input norm. */
     case PLOW_DOP_MOE_COMBINE_RESID_NORM_GEMMA:
         d_moe_combine_resid_norm_gemma((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
@@ -2544,6 +2605,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                        (const __nv_bfloat16*)TEN(6), in->i[0], in->i[1],
                                        in->fj[0].f, in->fj[1].f, slice, arena);
         break;
+#endif
 
 #if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && PLOW_NV_GEMV_RB
     /* Rides EVERY rung (the ladder validator wants one op list); below i3 rows it returns. */
@@ -2555,6 +2617,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 #endif
 
+#if PLOW_HAS_MOE_EXPERT_GLU_NORM_GEMMA
     case PLOW_DOP_MOE_EXPERT_GLU_NORM_GEMMA:
 #if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && PLOW_NV_GEMV_RB
         if (in->i[6] && PLOW_NROW(in->i[5]) >= in->i[6]) {
@@ -2574,6 +2637,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                     in->i[2], in->i[3], in->fj[0].f, slice, nblk,
                                     PLOW_NROW(in->i[5]), arena, (__nv_bfloat16*)TEN(5));
         break;
+#endif
 #undef PLOW_NROW
 #endif
 

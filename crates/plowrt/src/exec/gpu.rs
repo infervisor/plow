@@ -2176,6 +2176,10 @@ pub struct GpuEngine {
     cublaslt_decode_capture: bool,
     /// The widest decode program's MoE experts run through `moe_lt` (`PLOW_MOE_DEC_LT`).
     moe_lt_decode: bool,
+    /// The routed decode object the widest chain launches instead of `f`.
+    routed_decode: Option<Arc<moe_lt::RoutedDecode>>,
+    /// Keeps the routed decode object loaded for the rung graphs that captured it.
+    _routed_object: Option<Arc<moe_lt::RoutedDecode>>,
     /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
     /// (bucket, slot-tensor-base, segment range) — one cuGraphLaunch replaces ~480 kernel
     /// submits. A routed bucket's launches run the ranges between its attention segments.
@@ -4506,6 +4510,20 @@ impl GpuEngine {
             .into_iter()
             .chain([assets_dir])
             .collect();
+        let routed_decode = if moe_lt_decode_min.is_some()
+            && nv_config.cubin.is_none()
+            && nv_config.kernel.is_none()
+        {
+            moe_lt::RoutedDecode::load(
+                &be,
+                assets_dir,
+                profile.decode_file.trim_end_matches(".cubin"),
+                &module,
+                grid,
+            )?
+        } else {
+            None
+        };
         // ONE MoE cuBLASLt glue + scratch for the decode and the prefill routes (`load_prefill`
         // takes this owner), sized for the wider of the two: a second scratch cost the 26B 133 MiB
         // of KV budget, one 15000-token slot at C16. Sound only because both launch on the
@@ -4558,6 +4576,10 @@ impl GpuEngine {
         } else {
             Vec::new()
         };
+        let routed_widest = routed_decode
+            .as_ref()
+            .filter(|routed| moe_lt_routed && routed.serves(&insts))
+            .cloned();
         let d_inst = upload_pod(pod_bytes(&insts))?;
         let d_stream = upload_pod(pod_bytes(&g.stream))?;
         let d_sofs = upload_pod(pod_bytes(&g.stream_ofs))?;
@@ -4707,13 +4729,19 @@ impl GpuEngine {
                                 &g.gq_seg_ofs,
                             )?;
                             // No grouped-arm body runs on a routed rung: the narrow arena.
+                            let (function, smem) = routed_decode
+                                .as_ref()
+                                .filter(|routed| routed.serves(&insts))
+                                .map_or((f, smem_narrow), |routed| {
+                                    (routed.function, routed.smem)
+                                });
                             rung.library = Some(cublaslt::CublasLtDecodeGraph::capture(
                                 &be,
                                 &stream,
                                 rung.kernarg,
-                                f,
+                                function,
                                 grid,
-                                smem_narrow,
+                                smem,
                                 routes,
                             )?);
                             rung
@@ -5746,6 +5774,8 @@ impl GpuEngine {
                 || cublaslt_enabled
                 || moe_lt_routed,
             moe_lt_decode: moe_lt_routed,
+            routed_decode: routed_widest,
+            _routed_object: routed_decode,
             decode_packet_roles,
             seg_graphs: std::collections::HashMap::new(),
             smem_pf,

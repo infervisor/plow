@@ -575,6 +575,78 @@ pub(super) fn max_capacity(segments: &[Option<MoeLtSegment>]) -> u32 {
 /// Route every segment of one decode program, loading the shared glue once with a scratch of at
 /// least `min_capacity` gathered rows.
 #[allow(clippy::too_many_arguments)]
+/// The routed decode object (`<decode stem>_routed.cubin`, `PLOW_NV_DECODE_ROUTED`): the decode
+/// megakernel without the expert GEMV arms that a routed rung never dispatches.
+pub(super) struct RoutedDecode {
+    pub(super) function: KernelFn,
+    pub(super) smem: u32,
+    _module: Arc<DecodeModule>,
+}
+
+impl RoutedDecode {
+    const DROPPED: [DevOp; 2] = [DevOp::MoeExpertGluNormGemma, DevOp::MoeExpertDownGemma];
+
+    /// `None` when the packet ships no routed object. One whose ABI or pairing differs from
+    /// the main decode object is refused.
+    pub(super) fn load(
+        be: &Arc<CudaBackend>,
+        assets: &Path,
+        stem: &str,
+        main: &Module,
+        grid: u32,
+    ) -> Result<Option<Arc<Self>>> {
+        let file = format!("{stem}_routed.cubin");
+        let Ok(image) = std::fs::read(assets.join(&file)) else {
+            return Ok(None);
+        };
+        let module = DecodeModule::load(be, &image)?;
+        let function =
+            be.get_function(&module, &format!("_Z{}{stem}_routed11PlowProgram", stem.len() + 7))?;
+        GpuEngine::check_packet_pairing_suffix(be, &module, assets, "_routed")?;
+        for symbol in ["plow_block", "plow_dyn_kvrow", "plow_segment_gq_abi", "plow_gemv_mm_cap"] {
+            if be.module_global_u32(&module, &format!("{symbol}_routed"))?
+                != be.module_global_u32(main, symbol)?
+            {
+                return Err(RuntimeError::Rejected(format!(
+                    "{file}: {symbol} differs from the decode object"
+                )));
+            }
+        }
+        let smem = match crate::config::RuntimeConfig::get().nv.smem {
+            Some(smem) => smem,
+            None => {
+                let full = be
+                    .module_global_u32(&module, "plow_arena_bytes_routed")?
+                    .unwrap_or(12352);
+                be.module_global_u32(&module, "plow_arena_bytes_narrow_routed")?
+                    .map_or(full, |narrow| narrow.min(full))
+            }
+        };
+        if smem > 48 * 1024 {
+            be.set_max_dynamic_smem(function, smem)?;
+        }
+        let resident = be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count();
+        if resident < grid {
+            return Err(RuntimeError::Rejected(format!(
+                "{file}: {resident} resident blocks cannot hold the decode grid {grid}"
+            )));
+        }
+        tracing::info!(smem, "routed decode object loaded");
+        Ok(Some(Arc::new(Self {
+            function,
+            smem,
+            _module: module,
+        })))
+    }
+
+    /// The routed rung's instructions reach none of the dropped arms.
+    pub(super) fn serves(&self, insts: &[DevInst64]) -> bool {
+        !insts
+            .iter()
+            .any(|d| Self::DROPPED.iter().any(|&op| d.op == op as u16))
+    }
+}
+
 pub(super) fn decode_routes(
     be: &Arc<CudaBackend>,
     owner: &mut Option<Arc<MoeLt>>,

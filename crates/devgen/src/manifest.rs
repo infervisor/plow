@@ -1640,6 +1640,27 @@ pub fn build_for_packet(
             manifest["pairing"]["hash"] = json!(format!("0x{:016x}", pairing_hash(&manifest)));
         }
     }
+    // cuBLASLt-routed MoE decode rungs run a second decode object without the expert GEMV arms.
+    let routed_decode = sections
+        .iter()
+        .filter(|section| {
+            section.kind == packet::devbuild::SECT_METADATA
+                && section.name == plow_asset::segment_roles::SECTION
+        })
+        .filter_map(|section| {
+            plow_asset::segment_roles::SegmentRoles::from_bytes(&section.data).ok()
+        })
+        .any(|roles| {
+            roles.programs.iter().any(|program| {
+                program
+                    .roles
+                    .contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT)
+            })
+        });
+    if routed_decode {
+        manifest["objects"]["routed_decode"] = json!({ "required": true });
+        manifest["pairing"]["hash"] = json!(format!("0x{:016x}", pairing_hash(&manifest)));
+    }
     let modular_section = sections.iter().find(|section| {
         section.kind == packet::devbuild::SECT_METADATA
             && section.name == plow_asset::MODULAR_MANIFEST_SECTION
@@ -3253,6 +3274,40 @@ mod tests {
         assert_eq!(
             dense["objects"]["packed_prefill"]["arms"],
             dense["objects"]["ordinary"]["prefill"]["arms"]
+        );
+    }
+
+    /// cuBLASLt-routed decode rungs ask the object build for the routed decode object, and the
+    /// request is part of the pairing.
+    #[test]
+    fn routed_decode_object_follows_the_decode_lt_roles() {
+        let lean = crate::LeanReport::skipped("test: gate not run");
+        let roles = |role: u8| packet::devbuild::SectionData {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::segment_roles::SECTION.into(),
+            data: format!(r#"{{"version":1,"objects":{{}},"programs":[{{"index":0,"roles":[0,{role},0]}}]}}"#)
+                .into_bytes(),
+        };
+        let plain = build_for_packet(&model(), "sm_90a", &lean, &[]);
+        assert!(plain["objects"].get("routed_decode").is_none());
+        let prefill = build_for_packet(
+            &model(),
+            "sm_90a",
+            &lean,
+            &[roles(plow_asset::segment_roles::MOE_PREFILL_CUBLASLT)],
+        );
+        assert!(prefill["objects"].get("routed_decode").is_none());
+        let routed = build_for_packet(
+            &model(),
+            "sm_90a",
+            &lean,
+            &[roles(plow_asset::segment_roles::MOE_DECODE_CUBLASLT)],
+        );
+        assert_eq!(routed["objects"]["routed_decode"]["required"], true);
+        assert_ne!(routed["pairing"]["hash"], plain["pairing"]["hash"]);
+        assert_eq!(
+            routed["pairing"]["hash"],
+            json!(format!("0x{:016x}", pairing_hash(&routed)))
         );
     }
 

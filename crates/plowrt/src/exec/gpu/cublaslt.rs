@@ -370,9 +370,13 @@ impl GpuEngine {
             }
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
             // A MoE-routed chain runs no grouped-arm body: its launches take the narrow arena.
-            let smem = if self.moe_lt_decode { self.smem_narrow } else { self.smem };
+            let (function, smem) = match &self.routed_decode {
+                Some(routed) => (routed.function, routed.smem),
+                None if self.moe_lt_decode => (self.f, self.smem_narrow),
+                None => (self.f, self.smem),
+            };
             self.be.launch_cooperative(
-                role.map_or(self.f, |r| r.function),
+                role.map_or(function, |r| r.function),
                 role.map_or(self.grid, |r| r.grid),
                 role.map_or(BLOCK, |r| r.block),
                 role.map_or(smem, |r| r.smem),
