@@ -534,6 +534,24 @@ fn segment_role_metadata(blob: &DevBlob, raw: &[u8]) -> Result<Option<SegmentRol
     SegmentRoles::parse(bytes, blob).map(Some)
 }
 
+/// The narrowest decode rung whose program declares `MOE_DECODE_CUBLASLT` segments: where an
+/// unset `PLOW_MOE_DEC_LT` starts routing.
+fn moe_lt_decode_packet_min(blob: &DevBlob, roles: Option<&SegmentRoles>) -> Option<u32> {
+    let prefill = blob.prefill_progs().len();
+    roles?
+        .programs
+        .iter()
+        .filter(|program| {
+            program.index >= prefill
+                && program
+                    .roles
+                    .contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT)
+        })
+        .filter_map(|program| blob.progs.get(program.index))
+        .map(|g| packet::devbuild::program_rows(g.t))
+        .min()
+}
+
 fn prefill_needs_segment_pair(blob: &DevBlob, roles: Option<&SegmentRoles>) -> bool {
     blob.prefill_progs().iter().enumerate().any(|(index, g)| {
         g.check_coarse_single_segment().is_err()
@@ -558,7 +576,7 @@ fn prefill_can_use_segment_pair(blob: &DevBlob, roles: Option<&SegmentRoles>) ->
 /// bucket and role selection), so the decode route can size the scratch both share. 0 when no
 /// bucket routes or a program does not parse — `load_prefill` reports the latter itself.
 fn prefill_moe_lt_capacity(blob: &DevBlob, roles: Option<&SegmentRoles>) -> u32 {
-    let Some(min_rows) = RuntimeConfig::get().nv.moe_pf_lt else {
+    let Some(min_rows) = RuntimeConfig::get().nv.moe_pf_lt_min_rows() else {
         return 0;
     };
     blob.prefill_progs()
@@ -3354,7 +3372,9 @@ impl GpuEngine {
             ));
         }
         // Rungs of at least this many rows route; the rest run their program as one launch.
-        let moe_lt_decode_min = nv_config.moe_dec_lt.filter(|_| moe_lt_decode_roles);
+        let moe_lt_decode_min = nv_config
+            .moe_dec_lt_min_rows(moe_lt_decode_packet_min(&blob, segment_roles.as_ref()))
+            .filter(|_| moe_lt_decode_roles);
         let kv_maps = kv_tensor_maps(&blob.tensors, &blob.gen, blob.decode_prog()?.t as usize)?;
         let recurrent = recurrent_state_layout(&blob.tensors, blob.decode_prog()?.t as usize)?;
         let configured_multistep = RuntimeConfig::get().multistep();
@@ -4926,14 +4946,7 @@ impl GpuEngine {
                 Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
                 _ => crate::device::cuda::lt::Lt::load(&be)?,
             };
-            let object = config
-                .nv
-                .pf_seg_dir
-                .as_deref()
-                .filter(|dir| !dir.is_empty())
-                .map(|dir| Path::new(dir).join(attention_gemm::SOFTMAX_OBJECT))
-                .filter(|path| path.exists())
-                .unwrap_or_else(|| assets_dir.join(attention_gemm::SOFTMAX_OBJECT));
+            let object = attention_gemm::softmax_object(config.nv.pf_seg_dir.as_deref(), assets_dir);
             let sites = prefill
                 .iter()
                 .flat_map(|b| b.attention_gemm_segments.iter().flatten());
@@ -4957,7 +4970,7 @@ impl GpuEngine {
                 prefill.iter().map(|b| b.t).max().unwrap_or(0),
             )?)
         } else {
-            if config.nv.pf_attn_gemm {
+            if config.nv.pf_attn_gemm == Some(true) {
                 tracing::warn!("PLOW_PF_ATTN_GEMM: no one-KV-head full-attention prefill segment");
             }
             None
@@ -7158,6 +7171,12 @@ impl GpuEngine {
             inferred_policy.fa256_gqa2 |= policy.fa256_gqa2;
         }
         let config = crate::config::RuntimeConfig::get();
+        let attention_gemm_on = attention_gemm::enabled(
+            config.nv.pf_attn_gemm,
+            interp_tag,
+            config.nv.pf_seg_dir.as_deref(),
+            assets_dir,
+        );
         if let Some(mode) = config.nv.pf_seg_pure.as_deref() {
             inferred_policy.pure_mode = match mode {
                 "1" => 1,
@@ -7357,8 +7376,10 @@ impl GpuEngine {
                     None
                 };
                 // Optional third object (T12): dedicated hd512 flash. Only loaded when the
-                // file exists — the classing env (PLOW_PF_SEG_FA512) decides whether class-2
-                // segments are emitted at all.
+                // file exists. Class 2 follows the packet (hd512 flash isolated -> mode 1);
+                // `PLOW_PF_SEG_FA512=all` is the explicit hd256 extension. An hd256-capable object
+                // no longer upgrades an unset knob to `all`, which re-classed a packet emitted for
+                // `PLOW_SEG_FA512=1`.
                 let fa_file = format!("interp_{interp_tag}_{suffix}fa{kv_suffix}.cubin");
                 let fa = if dir.join(&fa_file).exists() {
                     let fa_sym_name = format!("interp_{interp_tag}_{suffix}fa");
@@ -7383,16 +7404,6 @@ impl GpuEngine {
                              it would trap on the first hd256 segment. Rebuild the object or set \
                              PLOW_PF_SEG_FA512=1."
                         )));
-                    }
-                    if config.nv.pf_seg_fa512.is_none()
-                        && hd256_capability == Some(1)
-                        && blob.prefill_progs().iter().any(|program| {
-                            program.insts.iter().any(|inst| {
-                                inst.op == DevOp::FlashPrefill as u16 && inst.i[6] == 256
-                            })
-                        })
-                    {
-                        inferred_policy.fa512_mode = 2;
                     }
                     Some((m3, f3, s3, g3))
                 } else {
@@ -7734,7 +7745,7 @@ impl GpuEngine {
                     inst.op = DevOp::Nop as u16;
                 }
             }
-            let moe_segments = match config.nv.moe_pf_lt {
+            let moe_segments = match config.nv.moe_pf_lt_min_rows() {
                 Some(min_rows)
                     if g.t >= min_rows
                         && packet_segment_roles
@@ -7746,7 +7757,7 @@ impl GpuEngine {
             };
             let moe_instructions = moe_lt::instructions(&moe_segments);
             // Only buckets that run the per-segment launch loop: the route replaces a launch.
-            let attention_gemm_segments = if config.nv.pf_attn_gemm
+            let attention_gemm_segments = if attention_gemm_on
                 && g.t >= config.nv.pf_attn_gemm_min_rows
                 && seg_mode
                 && seg_class.len() > 1
@@ -9939,6 +9950,9 @@ impl Drop for GpuEngine {
 
 #[cfg(test)]
 mod kv_tmap_tests;
+
+#[cfg(test)]
+mod recipe_packet_tests;
 
 #[cfg(test)]
 mod attention_role_tests;

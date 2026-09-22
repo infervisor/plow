@@ -597,8 +597,9 @@ pub fn spawn(
     // inline, so a tick costs no engine-thread wake and no tokio-worker wake on return. Nothing
     // else changes: the loop below already waits for every tick before touching the queue.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
-    let inline_tick = crate::config::RuntimeConfig::get().mux_inline_tick
-        && state.gpu_engine(&slug).is_some();
+    let inline_tick = state.gpu_engine(&slug).is_some_and(|engine| {
+        crate::config::RuntimeConfig::get().mux_inline_tick(engine.lock().is_cuda())
+    });
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let inline_tick = false;
     let dispatcher_name = format!("plow-mux-{slug}");

@@ -46,6 +46,29 @@ const STAGING: usize = 4;
 /// Shape arrays per wave block: hd, m, n8, ld_s, ld_p.
 const DIMS: usize = 5;
 
+/// The softmax object: `--pf-seg-dir` first, then the asset dir.
+pub(super) fn softmax_object(seg_dir: Option<&str>, assets_dir: &Path) -> PathBuf {
+    seg_dir
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| Path::new(dir).join(SOFTMAX_OBJECT))
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| assets_dir.join(SOFTMAX_OBJECT))
+}
+
+/// `PLOW_PF_ATTN_GEMM`: unset serves an sm90a packet whose softmax object is present. Only
+/// one-KV-head full-attention segments ([`sites`]) are ever routed, so a packet without them
+/// runs unchanged either way.
+pub(super) fn enabled(
+    explicit: Option<bool>,
+    interp_tag: &str,
+    seg_dir: Option<&str>,
+    assets_dir: &Path,
+) -> bool {
+    explicit.unwrap_or_else(|| {
+        interp_tag == "sm90a" && softmax_object(seg_dir, assets_dir).is_file()
+    })
+}
+
 /// One `FlashPrefill` site served by the route. Addresses are the slot-0 tensor bases.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Site {
@@ -994,6 +1017,25 @@ impl AttentionGemm {
 mod tests {
     use super::*;
     use packet::dev::{DevInst64, StreamEnt};
+
+    #[test]
+    fn unset_follows_the_softmax_object() {
+        let root = std::env::temp_dir().join(format!("plowrt-attn-gemm-{}", std::process::id()));
+        let (assets, objects) = (root.join("assets"), root.join("objects"));
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::create_dir_all(&objects).unwrap();
+        let seg = objects.to_str();
+        assert!(!enabled(None, "sm90a", seg, &assets));
+        std::fs::write(objects.join(SOFTMAX_OBJECT), b"cubin").unwrap();
+        assert!(enabled(None, "sm90a", seg, &assets));
+        assert!(!enabled(None, "sm120", seg, &assets));
+        assert!(!enabled(Some(false), "sm90a", seg, &assets));
+        assert!(!enabled(None, "sm90a", None, &assets));
+        std::fs::write(assets.join(SOFTMAX_OBJECT), b"cubin").unwrap();
+        assert!(enabled(None, "sm90a", None, &assets));
+        assert!(enabled(Some(true), "sm120", None, &root));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     fn fixture() -> (DevProg, Vec<DevTensor>, Vec<DeviceMem>) {
         let mut flash = DevInst64 {
