@@ -594,6 +594,9 @@ pub(crate) fn glm53_recipe_env() -> Vec<(&'static str, String)> {
 
 const DENSE_CAPS: &[&str] = &["dense_packet_contracts", "decode_objects", "decode_ladder"];
 const GEMMA4_W8A8_RECIPE: &[(&str, Val)] = &[("emit.w8a8", TRUE)];
+/// The H100 campaign recipes turn the paired HD256/GQA2 role on (`[emit_roles.env]`), which is
+/// what `GQA2_WIDE_DEFAULT` keys on.
+const GEMMA4_HOPPER_RECIPE: &[(&str, Val)] = &[("emit.gemma4_sm90_hd256_gqa2_role", TRUE)];
 
 /// G4 (review log #86): the AITER MoE call accumulates onto the shared partial, so the combine pass
 /// leaves the 2048..8192 prefill buckets, and the adapter object is the only object that changes.
@@ -862,7 +865,7 @@ pub const TARGETS: &[TargetSpec] = &[
             "decode_ladder",
             "full_attn_hd512",
         ],
-        recipe: &[],
+        recipe: GEMMA4_HOPPER_RECIPE,
     },
     TargetSpec {
         name: "gemma4_moe_hd512_sm90a_tp1",
@@ -879,7 +882,7 @@ pub const TARGETS: &[TargetSpec] = &[
             "moe",
             "full_attn_hd512",
         ],
-        recipe: &[],
+        recipe: GEMMA4_HOPPER_RECIPE,
     },
     TargetSpec {
         name: "gemma4_gfx942_tp1",
