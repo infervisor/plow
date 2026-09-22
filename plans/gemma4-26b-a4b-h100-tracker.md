@@ -1527,7 +1527,8 @@ column"). 26B-specific numbers, packet `p26i`, 16 prompts:
   cuBLASLt grouped MoE (nvjet, at the HBM floor for the live-expert union) + 5 glue kernels + 2 Lt
   memset nodes per layer. MoE time follows the token stream: ctx 256 vs 1024 = same step, megakernel
   -0.94 ms / nvjet +0.91. Served 128/C16 ITL median 11.66 == step_bench: the short-input gap to vLLM
-  is device time in the megakernel; the long-input TPOT gap is prefill stalls (no CUDA token batch).
+  is device time in the megakernel; the long-input TPOT gap is prefill stalls: decode rows already
+  ride every packed prefill launch (unified token batch), so the stall is the prefill per-row cost.
 * Landed `2b730261`: exact row-selective router RMS + GLU split-K: 11.756/8.340/5.541 ->
   11.420/8.175/5.524 (B=16/4/1, ctx 1024), digests unchanged. Split-K gated `!PLOW_NV_GEMV_MMA_PAIR`
   (unexecuted arm cost the 12B 0.09-0.12 ms; SASS identical after gating).
