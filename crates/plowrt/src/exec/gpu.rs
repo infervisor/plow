@@ -3509,11 +3509,9 @@ impl GpuEngine {
                 (module, f, kname, smem, grid, dec_source, image_len)
             }
         };
-        if let Ok(val) = std::env::var("PLOW_DEBUG_MAX_INST") {
-            if let Ok(limit) = val.parse::<u32>() {
-                if be.module_global_set_u32(&module, "plow_debug_max_inst", limit)? {
-                    tracing::warn!("SET plow_debug_max_inst = {}", limit);
-                }
+        if let Some(limit) = RuntimeConfig::debug_max_inst() {
+            if be.module_global_set_u32(&module, "plow_debug_max_inst", limit)? {
+                tracing::warn!("SET plow_debug_max_inst = {}", limit);
             }
         }
         check_dsa_decode_batch_arm(

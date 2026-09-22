@@ -1532,6 +1532,12 @@ impl RuntimeConfig {
         std::env::var(var).ok().filter(|value| !value.is_empty())
     }
 
+    /// `PLOW_DEBUG_MAX_INST`: decode interpreter instruction cap, a fault-bisect aid.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn debug_max_inst() -> Option<u32> {
+        Self::env_parse("PLOW_DEBUG_MAX_INST")
+    }
+
     #[cfg(feature = "cuda")]
     pub(crate) fn nv_vmm_live(&self) -> bool {
         select_compat(
