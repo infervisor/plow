@@ -158,6 +158,12 @@ __device__ __forceinline__ void gvmma_store2(__nv_bfloat16* C, unsigned N, unsig
  * Sized for the widest tile; static so the arms need no arena hand-off. */
 template <int MT>
 struct gvmma_red_t { float v[PLOW_NV_WARPS - 1][32][MT * 4]; };
+/* One slot set per MT, shared by the GEMV and GLU split-K walks. */
+template <int MT>
+__device__ __forceinline__ gvmma_red_t<MT>& gvmma_red() {
+    __shared__ gvmma_red_t<MT> red;
+    return red;
+}
 
 template <bool BIAS, int MT>
 __device__ __forceinline__ void gvmma_store_tile(__nv_bfloat16* __restrict__ C, const float (&acc)[MT][4],
@@ -265,7 +271,7 @@ __device__ __forceinline__ void gemv_rows_mma(__nv_bfloat16* __restrict__ C,
     unsigned per_pow = 1u;
     while (per_pow < per) per_pow <<= 1;
     if (per != 0u && per_pow <= PLOW_NV_WARPS / 2u && (nkb % (PLOW_NV_WARPS / per_pow)) == 0u) {
-        __shared__ gvmma_red_t<MT> red;
+        gvmma_red_t<MT>& red = gvmma_red<MT>();
         const unsigned S = PLOW_NV_WARPS / per_pow;
         const unsigned grp = warp / S, part = warp % S;
         const unsigned rb = r.rb0 + grp;
@@ -313,9 +319,7 @@ __device__ __forceinline__ void gemv_glu_rows_mma(__nv_bfloat16* __restrict__ C,
     const unsigned g = lane >> 2, t = lane & 3;
     const gvmma_range r = gvmma_partition(N, slice, nblk);
     const __nv_bfloat16* const W2[2] = {Wg, Wu};
-    for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
-        float acc[2][MT][4];
-        gvmma_tile<2, MT, ONE>(acc, x, W2, rb << 3, rows, N, K);
+    auto store = [&](const float (&acc)[2][MT][4], unsigned rb) {
         const unsigned n = (rb << 3) + 2u * t;
 #pragma unroll
         for (int mt = 0; mt < MT; mt++) {
@@ -329,6 +333,53 @@ __device__ __forceinline__ void gemv_glu_rows_mma(__nv_bfloat16* __restrict__ C,
                 if (n + 1u < N) C[(size_t)m1 * N + n + 1u] = gemma_glu_epilogue(acc[0][mt][3], acc[1][mt][3], act);
             }
         }
+    };
+#if !PLOW_NV_GEMV_MMA_PAIR
+    /* SPLIT-K, as gemv_rows_mma's: the 26B's N=2112 is 2 row blocks per block, so 6 of 8 warps sat
+     * idle. gate and up reduce one after the other through the one-stream slots. 26B step_bench
+     * ms at B=16/4/1, ctx 1024: 11.64/8.37/5.55 -> 11.51/8.17/5.50. Packets that stamp the pair
+     * walk have wide N and never split; the arm's code alone cost the 12B 0.09-0.12 ms. */
+    const unsigned per = r.rb1 - r.rb0, nkb = K >> 5;
+    unsigned per_pow = 1u;
+    while (per_pow < per) per_pow <<= 1;
+    if (per != 0u && per_pow <= PLOW_NV_WARPS / 2u && (nkb % (PLOW_NV_WARPS / per_pow)) == 0u) {
+        gvmma_red_t<MT>& red = gvmma_red<MT>();
+        const unsigned S = PLOW_NV_WARPS / per_pow;
+        const unsigned grp = warp / S, part = warp % S;
+        const unsigned rb = r.rb0 + grp;
+        const bool live = grp < per;
+        float acc[2][MT][4];
+        const unsigned span = nkb / S;
+        gvmma_tile<2, MT, ONE>(acc, x, W2, live ? (rb << 3) : (r.rb0 << 3), rows, N, K, part * span,
+                               (part + 1u) * span);
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            if (part != 0u) {
+#pragma unroll
+                for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                    for (int j = 0; j < 4; j++) red.v[warp - 1u - grp][lane][mt * 4 + j] = acc[i][mt][j];
+            }
+            __syncthreads();
+            if (part == 0u && live) {
+                for (unsigned p = 1u; p < S; p++) {
+                    const unsigned slot = (grp * S + p) - 1u - grp;
+#pragma unroll
+                    for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+                        for (int j = 0; j < 4; j++) acc[i][mt][j] += red.v[slot][lane][mt * 4 + j];
+                }
+            }
+            __syncthreads(); /* red is reused by the up stream / the next call on this block */
+        }
+        if (part == 0u && live) store(acc, rb);
+        return;
+    }
+#endif
+    for (unsigned rb = r.rb0 + warp; rb < r.rb1; rb += PLOW_NV_WARPS) {
+        float acc[2][MT][4];
+        gvmma_tile<2, MT, ONE>(acc, x, W2, rb << 3, rows, N, K);
+        store(acc, rb);
     }
 }
 

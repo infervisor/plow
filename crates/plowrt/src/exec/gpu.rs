@@ -9794,6 +9794,22 @@ impl GpuEngine {
         read_u64("g_tr_gate", &mut gate)?;
         read_u64("g_tr_body", &mut body)?;
         read_u64("g_tr_sig", &mut sig)?;
+        // The ordered packet records, for the questions the per-op sums cannot answer (what a
+        // gate waits behind).
+        if let Some(path) = crate::config::RuntimeConfig::get().amd.trace_raw.as_ref() {
+            let mut raw = String::new();
+            for i in 0..cap {
+                raw += &format!(
+                    "{i} {} wait={} gate={} body={} sig={}\n",
+                    devop_name(op[i]),
+                    wait[i],
+                    gate[i],
+                    body[i],
+                    sig[i]
+                );
+            }
+            std::fs::write(path, raw).map_err(|e| RuntimeError::Device(format!("{path}: {e}")))?;
+        }
 
         // Per-opcode accumulation: (count, Σgate, Σbody, Σsig, Σwait_edges).
         let mut acc: rustc_hash::FxHashMap<u32, (u64, u64, u64, u64, u64)> =

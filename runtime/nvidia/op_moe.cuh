@@ -463,6 +463,7 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
 #ifndef GV_MOE_UN
 #define GV_MOE_UN 2
 #endif
+#define GV_ROUTER_UN 4
 #ifndef PLOW_MOE_XN_MAX
 #define PLOW_MOE_XN_MAX 2816u /* f32 staging capacity for the normalized x (11 KiB). Two arms
                                * stage (expert GLU + router score); their STATIC smem adds to the
@@ -494,6 +495,38 @@ __device__ __forceinline__ void plow_moe_unflat(unsigned f, unsigned S, unsigned
 #endif
 }
 
+/* One row's inv RMS by ONE warp (H % 8 == 0), replaying plow_moe_row_rms's PLOW_NV_GEMV_RB block
+ * partition -- warp w's per-thread partials, its butterfly sum, the in-order sum over w -- so it
+ * is bit-identical to it. Partition w's chunk k is c0 + 32w: all partitions' loads issue
+ * together, each part[w] still accumulates in its own k order. Every lane returns the value. */
+__device__ __forceinline__ float plow_moe_rms_warp(const bf16* __restrict__ rr, unsigned H, float eps) {
+    const unsigned nth = blockDim.x, lane = threadIdx.x & 31u;
+    const unsigned nw = (nth + 31u) >> 5, nvec = H >> 3;
+    float part[PLOW_NV_WARPS];
+#pragma unroll
+    for (unsigned w = 0; w < PLOW_NV_WARPS; w++) part[w] = 0.0f;
+    for (unsigned c0 = lane; c0 < nvec; c0 += nth) {
+        bf16v8 x[PLOW_NV_WARPS];
+#pragma unroll
+        for (unsigned w = 0; w < PLOW_NV_WARPS; w++)
+            x[w] = (w < nw && c0 + w * 32u < nvec) ? ld_glob8(rr + (c0 + w * 32u) * 8u) : bf16v8_zero();
+#pragma unroll
+        for (unsigned w = 0; w < PLOW_NV_WARPS; w++) {
+            if (w >= nw || c0 + w * 32u >= nvec) continue;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float v = __bfloat162float(x[w].x[j]);
+                part[w] += v * v;
+            }
+        }
+    }
+    float t = 0.0f;
+#pragma unroll
+    for (unsigned w = 0; w < PLOW_NV_WARPS; w++)
+        if (w < nw) t += plow_warp_sum(part[w]);
+    return rsqrtf(t / (float)H + eps);
+}
+
 /* Per-row weightless/plain RMS scalars for a batch of rows, computed once per CTA into smem.
  * inv[r] = rsqrt(mean(resid[r]^2) + eps). Identical reduction shape (and thus identical result)
  * to the single-row bodies it replaces. `red` is the caller's 32-float warp-partial scratch. */
@@ -510,7 +543,18 @@ __device__ __forceinline__ void plow_moe_row_rms(float* __restrict__ inv, float*
      * scalar body in the last ulp. B=1 takes it too on the row-blocked (sm_90a) build, together
      * with the 8-wide xn staging of the B=1 expert GLU: 26B step 5.80 -> 5.70 ms; elsewhere B=1
      * keeps the scalar body and its bit-identity. */
-    if ((nrow > 1u || PLOW_NV_GEMV_RB) && (H & 7u) == 0u) {
+    /* BATCH>1: one warp per row (plow_moe_rms_warp, bit-identical), so the rows' loads are in
+     * flight together; the block-wide partition below serializes one L2 round trip + reduction
+     * per row. */
+    if (nrow > 1u && (H & 7u) == 0u) {
+        for (unsigned r = warp; r < nrow; r += nw) {
+            const float v = plow_moe_rms_warp(resid + (size_t)r * H, H, eps);
+            if (lane == 0) inv[r] = v;
+        }
+        __syncthreads();
+        return;
+    }
+    if (PLOW_NV_GEMV_RB && (H & 7u) == 0u) {
         __shared__ float rms_w[PLOW_MOE_MAXB * PLOW_NV_WARPS];
         const unsigned nvec = H >> 3;
         for (unsigned r = 0; r < nrow; r++) {
@@ -778,7 +822,22 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
     const unsigned warp = tid >> 5;
     __shared__ float red[32];
     __shared__ float invs[PLOW_MOE_MAXB];
-    plow_moe_row_rms(invs, red, resid, H, nrow, eps);
+#if PLOW_NV_GEMV_RB
+    /* BATCH>1: only the rows this CTA scores. Round j's 8 pairs start at slice*8 + j*nblk*8, a
+     * multiple of 8, so with 8 | n_exp they lie in one row: 2 rows per CTA at B=16, not 16.
+     * With the 4-deep pair loop, 26B step_bench ms at B=16/4/1, ctx 1024: 11.76/8.34/5.54 ->
+     * 11.52/8.33/5.56, token digests unchanged. */
+    if (nrow > 1u && (H & 7u) == 0u && (n_exp & 7u) == 0u && blockDim.x == 256u) {
+        const unsigned nw = blockDim.x >> 5;
+        for (unsigned j = warp; slice * 8u + j * nblk * 8u < nrow * n_exp; j += nw) {
+            const unsigned row = (slice * 8u + j * nblk * 8u) / n_exp;
+            const float v = plow_moe_rms_warp(resid + (size_t)row * H, H, eps);
+            if (lane == 0) invs[row] = v;
+        }
+        __syncthreads();
+    } else
+#endif
+        plow_moe_row_rms(invs, red, resid, H, nrow, eps);
 
 #if PLOW_NV_GEMV_RB
     /* Vectorized twin (H100 campaign round 3). The body below reads resid/scale/proj with
@@ -891,17 +950,19 @@ static __device__ void d_moe_router_gemma_score_fast(float* __restrict__ score,
             const float invrms = invs[row];
             const bf16* pr = proj + (size_t)e * H;
             float acc = 0.0f;
-            for (unsigned c = 0; c < nchunk; c += GV_MOE_UN) {
-                bf16v8 wv[GV_MOE_UN], xv[GV_MOE_UN];
-                unsigned kk[GV_MOE_UN];
+            /* 4 chunks in flight (GV_MOE_UN is 2): a pair is 11 chunks at H=2816, so 3 dependent
+             * rounds instead of 6. Two pairs in flight per warp measured slower (a bigger arm). */
+            for (unsigned c = 0; c < nchunk; c += GV_ROUTER_UN) {
+                bf16v8 wv[GV_ROUTER_UN], xv[GV_ROUTER_UN];
+                unsigned kk[GV_ROUTER_UN];
 #pragma unroll
-                for (int u = 0; u < GV_MOE_UN; u++) {
+                for (int u = 0; u < GV_ROUTER_UN; u++) {
                     kk[u] = (c + (unsigned)u) * GV_STEP + lane * 8u;
                     wv[u] = (kk[u] < H) ? ld_glob8(pr + kk[u]) : bf16v8_zero();
                     xv[u] = (kk[u] < H) ? ld_glob8(rr + kk[u]) : bf16v8_zero();
                 }
 #pragma unroll
-                for (int u = 0; u < GV_MOE_UN; u++) {
+                for (int u = 0; u < GV_ROUTER_UN; u++) {
                     if (kk[u] >= H) continue;
 #pragma unroll
                     for (int j = 0; j < 8; j++)
