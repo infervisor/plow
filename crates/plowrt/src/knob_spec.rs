@@ -59,6 +59,30 @@ const RELEASE_RETIRE_QUALIFIED: Status = Status::Qualified {
 const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
 };
+/// Unset = on for a CUDA engine; AMD and CPU engines keep the engine thread.
+const INLINE_TICK_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "0b88ef14 (26B-A4B H100, ctl/inline/ctl2/inline2): dispatcher-engine handoff 50-87 -> 0.3 us per tick, 128/C1 TPOT 5.66 -> 5.61 ms, C16 15.53 -> 15.42 ms, TTFT unchanged, coherence gate PASS every arm",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
+/// Unset = split encode for a metaspace one-word BPE only (`text/tokenizer.rs`
+/// `metaspace_bpe_split_safe`), where it is exact; every other tokenizer stays serial.
+const ONE_WORD_ENCODE_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "scripts/campaign/recipes gemma4 H100 serve.env history: 26B served wall 46.0 -> 43.7 ms at 1k, 131.6 -> 122.4 at 4k; 12B C1 TTFT 50.1 -> 47.3 ms at 1024 in, 186.3 -> 176.7 at 4096",
+        "text/tokenizer.rs metaspace_bpe_split_encode_matches_whole_text_encode: ids identical to the whole-text encode",
+        "docs/flags-reference.md: `PLOW_ENCODE_THREADS=0` is the rollback",
+    ],
+};
+/// Unset = route the packet's own `MOE_*_CUBLASLT` segments; a packet without them is unchanged.
+const MOE_LT_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "agent/moe-grouped-gemm bb2c5c14 (26B-A4B H100): MoE prefill segment 0.744 -> 0.569 ms at 1024 rows, TTFT 1024/C1 43.0 -> 38.7 ms, 8192 257.7 -> 231.0; MoE relL2 3.6e-3, gate + needle + consistency pass",
+        "26B-A4B H100 served vs the GROUP 8 packet: C16 TPOT 15.26 / 17.84 / 26.87 -> 12.41 / 15.10 / 24.51 ms at 128 / 1024 / 4096 in; the MOE_DEC_LT emit without the route is +1.65 ms at B=4",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
 
 /// Unset = on when the packet carries `attn_softmax_sm90a.cubin` and the KV admission budget left
 /// after the route's scratch still admits every live request at full context.
@@ -344,8 +368,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.prefix_cache", Some("PLOW_PREFIX_CACHE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.idle_dispatch", Some("PLOW_IDLE_DISPATCH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.encode_fast", Some("PLOW_ENCODE_FAST"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.encode_threads", Some("PLOW_ENCODE_THREADS"), Layer::Runtime, U32, UNSET, OPT_IN),
-    KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, OPT_IN),
+    KnobSpec::new("rt.encode_threads", Some("PLOW_ENCODE_THREADS"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
+    KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
     KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.05")), OPT_IN),
     KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PRESSURE_EVICTION_DEFAULT),
     KnobSpec::new("rt.kv_admit_headroom", Some("PLOW_KV_ADMIT_HEADROOM"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.9")), KV_ADMIT_DEFAULT),
@@ -361,7 +385,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_interleave_adaptive", Some("PLOW_PF_INTERLEAVE_ADAPTIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_decode_fit", Some("PLOW_PF_DECODE_FIT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.rung_fast_probe", Some("PLOW_RUNG_FAST_PROBE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.mux_inline_tick", Some("PLOW_MUX_INLINE_TICK"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.mux_inline_tick", Some("PLOW_MUX_INLINE_TICK"), Layer::Runtime, Domain::Bool, UNSET, INLINE_TICK_QUALIFIED),
     KnobSpec::new("rt.pf_chunk", Some("PLOW_PF_CHUNK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.pf_no_chunk", Some("PLOW_PF_NO_CHUNK"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_no_interleave", Some("PLOW_PF_NO_INTERLEAVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
@@ -415,8 +439,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.libcuda", Some("PLOW_LIBCUDA"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.lt_algos", Some("PLOW_LT_ALGOS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.lt_algos_write", Some("PLOW_LT_ALGOS_WRITE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("rt.moe_pf_lt", Some("PLOW_MOE_PF_LT"), Layer::Runtime, U32, UNSET, OPT_IN),
-    KnobSpec::new("rt.moe_dec_lt", Some("PLOW_MOE_DEC_LT"), Layer::Runtime, U32, UNSET, OPT_IN),
+    KnobSpec::new("rt.moe_pf_lt", Some("PLOW_MOE_PF_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
+    KnobSpec::new("rt.moe_dec_lt", Some("PLOW_MOE_DEC_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
     KnobSpec::new("rt.vram_budget_mib", Some("PLOW_VRAM_BUDGET_MIB"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.step_time", Some("PLOW_STEP_TIME"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.l2_place_dispatch", Some("PLOW_L2_PLACE_DISPATCH"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),

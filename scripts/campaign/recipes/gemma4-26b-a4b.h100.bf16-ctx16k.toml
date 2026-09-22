@@ -118,25 +118,16 @@ PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
 PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 
 [serve.env]
-# cuBLASLt grouped expert GEMMs on decode rungs >= 4 (needs the emit above; turns multistep off).
-# Served (e2e2) vs the GROUP 8 packet: C16 TPOT 15.26 / 17.84 / 26.87 -> 12.41 / 15.10 / 24.51 ms at
-# 128 / 1024 / 4096 in, tok/s +22 / +16 / +8% (vs the e2e run); same-session realtime A/B: C4 TPOT
-# 9.43 -> 8.77 at 128, 15000/C4 TTFT 998 -> 695 but TPOT 18.12 -> 19.89; C1 TPOT +0.06 ms.
-PLOW_MOE_DEC_LT = "4"
+# Serve defaults this recipe used to name: the packet's MoE cuBLASLt segments are routed
+# (PLOW_MOE_PF_LT / PLOW_MOE_DEC_LT; decode from the narrowest rung that carries them, 4 here —
+# a routed rung turns multistep off: C16 TPOT 15.26 / 17.84 / 26.87 -> 12.41 / 15.10 / 24.51 ms at
+# 128 / 1024 / 4096 in vs the GROUP 8 packet; 15000/C4 TTFT 998 -> 695 but TPOT 18.12 -> 19.89),
+# segment classing read from the packet (PLOW_PF_SEG_PURE / PLOW_PF_SEG_FA512), split encode for
+# the one-word BPE tokenizer (PLOW_ENCODE_THREADS 16 / PLOW_ENCODE_SPLIT_MIN 512) and the inline
+# mux tick on CUDA. PLOW_PF_ATTN_GEMM follows the KV budget: realtime (rung 4) routes,
+# high_concurrency (rung 16) stays native.
 PLOW_PREFIX_CACHE = "0"
-PLOW_MOE_PF_LT = "1"
-PLOW_PF_SEG_PURE = "1"
-PLOW_PF_SEG_FA512 = "1"
 PLOW_PF_INTERLEAVE = "0"
-# Gemma's tokenizer is one-word BPE (space -> "▁" normalizer): 1.6 ms for a 1k-token prompt and
-# 8.9 ms for 4k, serial, inside TTFT. Split encode is exact for it (tokenizer.rs); a 1k prompt is
-# only ~5 KB, so the 4096-byte default floor would not split it. Served wall, bench-like prompts:
-# 46.0 -> 43.7 ms at 1k, 131.6 -> 122.4 at 4k.
-PLOW_ENCODE_THREADS = "16"
-PLOW_ENCODE_SPLIT_MIN = "512"
-# Dispatcher on its own thread, tick inline (0b88ef14): engine handoff 50-87 -> 0.3 us per tick;
-# 26B 128/C1 TPOT 5.66 -> 5.61 ms, C16 15.53 -> 15.42 ms, TTFT unchanged.
-PLOW_MUX_INLINE_TICK = "1"
 PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
 LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
 

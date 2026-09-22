@@ -37,6 +37,15 @@ pub enum ServeEngine {
 }
 
 impl ServeEngine {
+    /// Whether this is the CUDA engine.
+    pub fn is_cuda(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        if matches!(self, ServeEngine::Cuda(_)) {
+            return true;
+        }
+        false
+    }
+
     /// Whether this backend applies the request's sampling parameters.
     ///
     /// ONLY THE CUDA ENGINE DOES. The gfx950 engine and the CPU/Metal engine

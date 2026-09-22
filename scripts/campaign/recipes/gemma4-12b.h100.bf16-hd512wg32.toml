@@ -61,9 +61,6 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"  # px4 off -> the WGMMA BQ64/BKV32 hd
 # vLLM 0.28 reference ran with prefix caching disabled; match it. A realtime-chat profile may
 # turn it on, but then the reference must too.
 PLOW_PREFIX_CACHE = "0"
-# Mirrors of the emit-side classing; a mismatch is a wrong-object launch.
-PLOW_PF_SEG_PURE = "1"
-PLOW_PF_SEG_FA512 = "1"
 # plowrt dlopens libcublasLt by soname; the host toolkit is not on the nix loader path.
 LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
 # PLOW_PF_SEG_DIR is the build's objects/ dir; set it at bench time:
