@@ -4165,13 +4165,14 @@ fn gpu_prefill_batched_pass(
         } else {
             per_launch
         };
-        let want = avail.min(per_launch);
-        let per_launch = if crate::config::RuntimeConfig::get().pf_decode_fit && decode_rows > 0 {
-            fit_decode_rows(want, e.pf_pack_budget(want + decode_rows), decode_rows)
-        } else {
-            e.pf_pack_budget(want)
-        }
-        .min(per_launch);
+        // Under the unified token batch the decode rows ride in this launch: keep prefill + decode
+        // inside the bucket the prefill rows chose, or a 4224-row slice plus 3 decode rows runs
+        // the 8192 rung (the token batch takes the smallest bucket that holds every row).
+        let per_launch = e
+            .pf_pack_budget(avail.min(per_launch))
+            .saturating_sub(decode_rows)
+            .max(1)
+            .min(per_launch);
         let pf_batch_cfg = crate::config::RuntimeConfig::get().pf_batch;
         let is_fair =
             crate::config::RuntimeConfig::get().pf_span_policy.as_deref() == Some("fair");
