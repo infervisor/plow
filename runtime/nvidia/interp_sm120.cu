@@ -2931,6 +2931,30 @@ extern "C" __device__ unsigned plow_fp8_m1_arm = 1;
 #else
 extern "C" __device__ unsigned plow_fp8_m1_arm = 0;
 #endif
+#if PLOW_GEMV_PREFETCH && !PLOW_NV_PREFILL && PLOW_NV_GEMV_MMA
+/* Claim-ahead weight prefetch (op_gemv_mma.cuh): the walks the decode object runs for these
+ * packets, fold arms excluded. PLOW_NV_GEMV_PF_OPS selects Gemv (1), GemvGlu (2), GemvQkv (4). */
+#ifndef PLOW_NV_GEMV_PF_OPS
+#define PLOW_NV_GEMV_PF_OPS 7u
+#endif
+__device__ __forceinline__ void plow_gemv_prefetch(const PlowDevInst* in, void* const* T,
+                                                   unsigned slice, unsigned nblk) {
+    auto W = [&](int k) { return (const __nv_bfloat16*)T[in->t[k]]; };
+    switch (in->op) {
+    case PLOW_DOP_GEMV:
+        if ((PLOW_NV_GEMV_PF_OPS & 1u) && in->i[3] == 0u) gvmma_pf_rows(W(2), in->i[1], in->i[2], slice, nblk);
+        break;
+    case PLOW_DOP_GEMV_GLU:
+        if ((PLOW_NV_GEMV_PF_OPS & 2u) && in->fj[2].u == 0u) gvmma_pf_glu(W(2), W(5), in->i[1], in->i[2], slice, nblk);
+        break;
+    case PLOW_DOP_GEMV_QKV:
+        if (PLOW_NV_GEMV_PF_OPS & 4u) gvmma_pf_qkv(W(2), W(4), W(6), in->i[1], in->i[3], in->i[4], in->i[2], slice, nblk);
+        break;
+    default:
+        break;
+    }
+}
+#endif
 /* Backoff inside the counter-gate poll. 64 ns is the shipped value; 0 spins flat out. */
 #ifndef PLOW_NV_GATE_SLEEP
 #define PLOW_NV_GATE_SLEEP 64
@@ -3081,6 +3105,9 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         const unsigned succ_len = e.succ_len;
         const unsigned succ_ofs = e.succ_ofs;
 
+#if PLOW_GEMV_PREFETCH && !PLOW_NV_PREFILL && PLOW_NV_GEMV_MMA
+        if (wait_len) plow_gemv_prefetch(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
+#endif
 #if PLOW_NV_TRACE
         const bool tr = (blockIdx.x == 0 && threadIdx.x == 0 && g_tr_n < PLOW_TRACE_MAX);
         long long t_gate0 = 0, t_gate1 = 0, t_body1 = 0;
