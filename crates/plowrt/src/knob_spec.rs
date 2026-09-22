@@ -60,6 +60,17 @@ const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
 };
 
+/// Unset = on when the packet carries `attn_softmax_sm90a.cubin` and the KV admission budget left
+/// after the route's scratch still admits every live request at full context.
+const PF_ATTN_GEMM_AUTO: Status = Status::Qualified {
+    evidence: &[
+        "839911e9 (GQA sites): Gemma-4-26B C1 TTFT 1024 / 4096 / 8192 / 15000 in 38.66 / 107.29 / 230.96 / 484.72 -> 38.27 / 103.30 / 214.73 / 431.77 ms, TPOT unchanged; the 12B recipes serve it (=1)",
+        "its 1 GiB score scratch comes out of the 26B KV admission budget, where 133 MiB already cost one 15000-token request at C16 (dc3f5ee4): unset keeps it off unless the budget still admits PLOW_DECODE_MAX_RUNG full-context requests",
+        "26B p26dl, one session, unset: realtime (rung 4) routes, C1 TTFT 4096 / 8192 / 15000 106.64 / 230.06 / 483.12 (=0) -> 102.92 / 214.14 / 430.50 ms; high_concurrency (rung 16) stays native, 15000/C16 KV max_rows 231424, 14 live, TTFT 2515 ms as the unrouted control; forced (=1) there: 184320 rows, 11 live, TTFT 3686 ms (tok/s 198.7 -> 207.6)",
+        "docs/flags-reference.md: `=0` is the rollback, `=1` forces it past the budget gate",
+    ],
+};
+
 /// KV-capacity admission. The mux admitted on free SLOTS alone, so a device that can back
 /// ~15 concurrent 70k sequences was handed 20 and faulted instead of applying backpressure.
 const KV_ADMIT_DEFAULT: Status = Status::Candidate {
@@ -418,7 +429,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_seg_fa256_gqa2", Some("PLOW_PF_SEG_FA256_GQA2"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_graph", Some("PLOW_PF_SEG_GRAPH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.pf_seg_v2", Some("PLOW_PF_SEG_V2"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("rt.pf_attn_gemm", Some("PLOW_PF_ATTN_GEMM"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.pf_attn_gemm", Some("PLOW_PF_ATTN_GEMM"), Layer::Runtime, Domain::Bool, UNSET, PF_ATTN_GEMM_AUTO),
     KnobSpec::new("rt.pf_attn_gemm_tile", Some("PLOW_PF_ATTN_GEMM_TILE"), Layer::Runtime, U32, Default::Static(Val::Nat(2048)), OPT_IN),
     KnobSpec::new("rt.pf_attn_gemm_min_rows", Some("PLOW_PF_ATTN_GEMM_MIN_ROWS"), Layer::Runtime, U32, Default::Static(Val::Nat(1024)), OPT_IN),
     KnobSpec::new("rt.pf_attn_gemm_grid", Some("PLOW_PF_ATTN_GEMM_GRID"), Layer::Runtime, U32, Default::Static(Val::Nat(8)), OPT_IN),

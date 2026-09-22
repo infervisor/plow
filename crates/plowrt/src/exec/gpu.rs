@@ -578,6 +578,76 @@ fn prefill_moe_lt_capacity(blob: &DevBlob, roles: Option<&SegmentRoles>) -> u32 
         .unwrap_or(0)
 }
 
+/// Bytes the KV admission budget charges one row, and the block a request's rows round up to
+/// (`None`: linear). `None` for flat KV, which backs every slot at load and has no budget.
+fn kv_row_charge(
+    vmm: Option<&VmmServe>,
+    blob: &DevBlob,
+    max_ctx: usize,
+    batch: usize,
+) -> Option<(u64, Option<u64>)> {
+    let vmm = vmm?;
+    // The budget is what is free AFTER the sliding rings were cudaMalloc'd, so a row may only be
+    // charged for what will still be MAPPED for it: the full-attention head windows, a block at a
+    // time. Charging every row the ring bytes as well (total KV / rows) cost Gemma-4-26B 122880
+    // B/token against a real 20480, admitted ~10 of 16 requests at 4096 tokens, and the other 6
+    // waited out a whole generation: TTFT 3-4.5 s at C16. With live rings every cache maps
+    // lazily and the average stays the honest bound.
+    if vmm.rings.is_none() {
+        let geo = vmm.kv.geometry();
+        let per_token = geo.full_layers.len() as u64 * 2 * geo.kvh_full as u64 * geo.row_bytes();
+        let block_rows = vmm.kv.block_rows() as u64;
+        if per_token > 0 && block_rows > 0 {
+            return Some((per_token, Some(block_rows)));
+        }
+    }
+    let kv_bytes: u64 = blob
+        .tensors
+        .iter()
+        .filter(|t| t.name.starts_with("kv."))
+        .map(|t| t.bytes)
+        .sum();
+    let rows = (max_ctx as u64).checked_mul(batch as u64)?;
+    Some((kv_bytes.checked_div(rows).filter(|&b| b > 0)?, None))
+}
+
+/// `PLOW_PF_ATTN_GEMM` unset: the route's scratch comes out of the KV admission budget (sampled
+/// after load; 1 GiB on Gemma-4-26B, where 133 MiB already cost one 15000-token request at C16),
+/// so it loads only while that budget still admits every live request (`PLOW_DECODE_MAX_RUNG`,
+/// else the batch) at full context.
+fn attention_route_fits_kv(
+    be: &CudaBackend,
+    vmm: Option<&VmmServe>,
+    blob: &DevBlob,
+    max_ctx: usize,
+    batch: usize,
+    scratch: u64,
+) -> bool {
+    let Some((per_token, block_rows)) = kv_row_charge(vmm, blob, max_ctx, batch) else {
+        return true;
+    };
+    let Ok((free, _)) = be.mem_info() else {
+        return false;
+    };
+    let config = RuntimeConfig::get();
+    let live = config.decode_max_rung.map_or(batch, |rung| batch.min(rung as usize)) as u64;
+    let request = (max_ctx as u64).next_multiple_of(block_rows.unwrap_or(1));
+    let need = live * request * per_token;
+    let budget = (free.saturating_sub(scratch) as f64 * config.kv_admit_headroom()) as u64;
+    let fits = budget >= need;
+    tracing::info!(
+        fits,
+        scratch_mib = scratch >> 20,
+        free_mib = free >> 20,
+        budget_rows = budget / per_token,
+        need_rows = live * request,
+        live,
+        "PLOW_PF_ATTN_GEMM: KV admission after the route's scratch{}",
+        if fits { "" } else { " is short; FlashPrefill stays native" }
+    );
+    fits
+}
+
 trait SegmentRoleValidation: Sized {
     fn parse(bytes: &[u8], blob: &DevBlob) -> Result<Self>;
     fn validate(
@@ -4860,7 +4930,7 @@ impl GpuEngine {
         // swapped on disk no longer costs the prefill path (it used to load the
         // DECODE image here and fail on the missing `_pf` symbol).
         let pf = resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
-        let (f_pf, smem_pf, module_pf, prefill, seg_pf, grid_pf) = if let Some(pf) = pf {
+        let (f_pf, smem_pf, module_pf, mut prefill, seg_pf, grid_pf) = if let Some(pf) = pf {
             let pf_src = pf.source.clone();
             match Self::load_prefill(
                 &be,
@@ -4918,46 +4988,55 @@ impl GpuEngine {
             (None, SMEM_PF, None, Vec::new(), None, grid)
         };
 
-        let attention_gemm = if prefill
-            .iter()
-            .any(|b| b.attention_gemm_segments.iter().any(Option::is_some))
-        {
-            let lt = match &cublaslt_prefill {
-                Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
-                _ => crate::device::cuda::lt::Lt::load(&be)?,
-            };
-            let object = config
-                .nv
-                .pf_seg_dir
-                .as_deref()
-                .filter(|dir| !dir.is_empty())
-                .map(|dir| Path::new(dir).join(attention_gemm::SOFTMAX_OBJECT))
-                .filter(|path| path.exists())
-                .unwrap_or_else(|| assets_dir.join(attention_gemm::SOFTMAX_OBJECT));
+        let routed = |b: &PrefillBucket| b.attention_gemm_segments.iter().any(Option::is_some);
+        let attention_gemm = if prefill.iter().any(routed) {
             let sites = prefill
                 .iter()
                 .flat_map(|b| b.attention_gemm_segments.iter().flatten());
-            tracing::info!(
-                launches = sites.clone().count(),
-                "PLOW_PF_ATTN_GEMM: FlashPrefill segments routed to cuBLASLt"
-            );
-            Some(attention_gemm::AttentionGemm::load(
-                &be,
-                lt,
-                &object,
-                sites.clone().map(|site| site.heads).max().unwrap_or(1),
-                sites.map(|site| site.head_dim).max().unwrap_or(8),
-                max_ctx,
-                prefill
-                    .iter()
-                    .map(|b| b.attention_gemm_segments.iter().flatten().count())
-                    .max()
-                    .unwrap_or(0),
-                batch,
-                prefill.iter().map(|b| b.t).max().unwrap_or(0),
-            )?)
+            let max_heads = sites.clone().map(|site| site.heads).max().unwrap_or(1);
+            let max_head_dim = sites.clone().map(|site| site.head_dim).max().unwrap_or(8);
+            let launches = sites.count();
+            let max_rows = prefill.iter().filter(|b| routed(b)).map(|b| b.t).max().unwrap_or(0);
+            let scratch = attention_gemm::scratch_bytes(max_heads, max_ctx, max_rows);
+            if config.nv.pf_attn_gemm.is_none()
+                && !attention_route_fits_kv(&be, vmm.as_ref(), &blob, max_ctx, batch, scratch)
+            {
+                // Consumers of the unrouted sites keep the stream-order waits the route set up:
+                // each site is alone in its segment, so the next launch still follows it.
+                for bucket in &mut prefill {
+                    bucket.attention_gemm_segments.clear();
+                }
+                None
+            } else {
+                let lt = match &cublaslt_prefill {
+                    Some(cublaslt::ProjectionBackend::Lt(lt)) => Arc::clone(lt),
+                    _ => crate::device::cuda::lt::Lt::load(&be)?,
+                };
+                let object = attention_gemm::object(assets_dir).ok_or_else(|| {
+                    RuntimeError::Rejected("PLOW_PF_ATTN_GEMM: softmax object vanished".into())
+                })?;
+                tracing::info!(
+                    launches,
+                    "PLOW_PF_ATTN_GEMM: FlashPrefill segments routed to cuBLASLt"
+                );
+                Some(attention_gemm::AttentionGemm::load(
+                    &be,
+                    lt,
+                    &object,
+                    max_heads,
+                    max_head_dim,
+                    max_ctx,
+                    prefill
+                        .iter()
+                        .map(|b| b.attention_gemm_segments.iter().flatten().count())
+                        .max()
+                        .unwrap_or(0),
+                    batch,
+                    max_rows,
+                )?)
+            }
         } else {
-            if config.nv.pf_attn_gemm {
+            if config.nv.pf_attn_gemm == Some(true) {
                 tracing::warn!("PLOW_PF_ATTN_GEMM: no full-attention prefill segment");
             }
             None
@@ -5604,40 +5683,15 @@ impl GpuEngine {
                 }
             }
         }
-        let flat_kv = vmm.is_none();
         let kv_admission = be
             .mem_info()
             .ok()
             .map(|(free, _total)| free)
-            .filter(|_| !flat_kv)
             .and_then(|free| {
-                let kv_bytes: u64 = blob
-                    .tensors
-                    .iter()
-                    .filter(|t| t.name.starts_with("kv."))
-                    .map(|t| t.bytes)
-                    .sum();
-                let rows = (max_ctx as u64).checked_mul(batch as u64)?;
+                let (per_token, block_rows) =
+                    kv_row_charge(vmm.as_ref(), &blob, max_ctx, batch)?;
                 let budget = (free as f64 * crate::config::RuntimeConfig::get().kv_admit_headroom())
                     as u64;
-                // `free` is what is left AFTER the sliding rings were cudaMalloc'd, so a row may only
-                // be charged for what will still be MAPPED for it: the full-attention head windows,
-                // a block at a time. Charging every row the ring bytes as well (total KV / rows) cost
-                // Gemma-4-26B 122880 B/token against a real 20480, admitted ~10 of 16 requests at
-                // 4096 tokens, and the other 6 waited out a whole generation: TTFT 3-4.5 s at C16.
-                // With live rings every cache maps lazily and the average stays the honest bound.
-                let live = vmm.as_ref().filter(|v| v.rings.is_none()).map(|v| {
-                    let geo = v.kv.geometry();
-                    let per_token =
-                        geo.full_layers.len() as u64 * 2 * geo.kvh_full as u64 * geo.row_bytes();
-                    (per_token, v.kv.block_rows() as u64)
-                });
-                let (per_token, block_rows) = match live {
-                    Some((per_token, block_rows)) if per_token > 0 && block_rows > 0 => {
-                        (per_token, Some(block_rows))
-                    }
-                    _ => (kv_bytes.checked_div(rows).filter(|&b| b > 0)?, None),
-                };
                 tracing::info!(
                     per_token,
                     block_rows,
@@ -7553,6 +7607,7 @@ impl GpuEngine {
         let mut buckets = Vec::new();
         // The decode route's owner when it has one (same stream; see its load).
         let mut moe_lt = moe_lt_shared;
+        let attention_route = attention_gemm::object(assets_dir).is_some();
         for g in blob.prefill_progs() {
             // Wave-class segmented programs are legal exactly when the SegPf pair is
             // loaded: segments launch per class in order. Otherwise the coarse
@@ -7746,7 +7801,7 @@ impl GpuEngine {
             };
             let moe_instructions = moe_lt::instructions(&moe_segments);
             // Only buckets that run the per-segment launch loop: the route replaces a launch.
-            let attention_gemm_segments = if config.nv.pf_attn_gemm
+            let attention_gemm_segments = if attention_route
                 && g.t >= config.nv.pf_attn_gemm_min_rows
                 && seg_mode
                 && seg_class.len() > 1

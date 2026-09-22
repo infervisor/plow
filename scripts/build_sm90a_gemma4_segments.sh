@@ -106,7 +106,7 @@ env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
   runtime/nvidia/interp_sm90a_pfgemm_w8a16_m1.cu
 /usr/local/cuda/bin/cuobjdump -symbols "$gemma_out/interp_sm90a_pfgemm_w8a16_m1.cubin" | \
   grep -q plow_sm90a_pfgemm_w8a16_m1
-# Causal softmax of the vendor-GEMM attention route (PLOW_PF_ATTN_GEMM); unused unless the knob is on.
+# Causal softmax of the vendor-GEMM attention route (PLOW_PF_ATTN_GEMM): its presence turns the route on, KV budget permitting.
 env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
   -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v \
   -I runtime/common -I runtime/nvidia \

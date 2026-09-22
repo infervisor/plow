@@ -848,11 +848,14 @@ pub struct NvidiaRuntimeConfig {
 
     /// Vendor-GEMM attention for the full-attention prefill segments: cuBLASLt
     /// `Q.K^T` and `P.V` around `attn_softmax_sm90a.cubin` (looked up in `--pf-seg-dir`, then the
-    /// asset dir). Those buckets run the per-segment launch loop, not the segment graph.
-    #[arg(long = "pf-attn-gemm", env = "PLOW_PF_ATTN_GEMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_attn_gemm: bool,
+    /// asset dir). Routed launches run the segment graph pieces around those segments. Unset = on
+    /// when that object exists and the KV admission budget left after the route's scratch still
+    /// admits every live request at full context; `=1` forces it on, `=0` is the rollback.
+    #[arg(long = "pf-attn-gemm", env = "PLOW_PF_ATTN_GEMM", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_attn_gemm: Option<bool>,
 
-    /// Query rows per score tile of `--pf-attn-gemm`. Scratch = rows x heads x max_ctx x 2 B.
+    /// Query rows per score tile of `--pf-attn-gemm` (capped at the widest routed bucket).
+    /// Scratch = rows x heads x max_ctx x 2 B.
     #[arg(long = "pf-attn-gemm-tile", env = "PLOW_PF_ATTN_GEMM_TILE", default_value_t = 2048, global = true)]
     pub pf_attn_gemm_tile: u32,
 
