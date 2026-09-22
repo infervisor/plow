@@ -8688,7 +8688,13 @@ impl GpuEngine {
                 });
         let g = if has_external {
             let capture_stream = self.be.stream_create()?;
-            self.be.graph_capture(&capture_stream, || {
+            let untouched: Vec<_> = self.prefill[bi]
+                .moe_lt_segments
+                .iter()
+                .flatten()
+                .flat_map(moe_lt::MoeLtRoute::glue)
+                .collect();
+            self.be.graph_capture_hoisting(&capture_stream, &untouched, || {
                 for (seg, &class) in seg_class.iter().enumerate() {
                     let seg = seg + range.start;
                     if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
