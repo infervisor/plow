@@ -1366,3 +1366,19 @@ Unchanged from `plans/gemma4-4k-8k-campaign-tracker.md`: one variable per
 candidate, `gpulease -n 1` on every GPU run (the box is shared by several
 agents), T1 emit byte-identity + checkpoint S, T2 numerics, T3 rung, T4 served,
 `perf-certs/<id>.json` before any default flip. No cross-architecture transfer.
+
+## Round 4 (2026-09-22): integrated set for e2e3 (`3a7a5a3b`, packet p12r4)
+
+* Decode GEMV (agent/dense-dec-r4): ONE (one activation load per k-step, rungs 2-8) + claim-ahead L2
+  prefetch of each walk's first 64 KiB (`PLOW_GEMV_PREFETCH`, now a GEMMA4_HOPPER dense default).
+  step_bench p12r ctx 192 B=1/4/16 10.55/10.75/11.44 -> 10.44/10.57/11.41; 128/256 KiB budgets worse
+  (compete with walks in flight). FlashMerge elision parked unmeasured (`d147d65d`). NS_LIVE: no effect.
+* Wide GQA2 role on 4160/4224 (default): hc mean TTFT -2..-4%, realtime 4096/C4 -3%; 12B l8192
+  launches NOT adopted (mean TTFT +19..44% at C16 from 8192-row packs, +0.9 GiB).
+* Serve front end: tokenizers 0.23 (encode -25..-30%), inline mux tick (default on for CUDA).
+* `PLOW_PF_DECODE_FIT` removed: served neutral (C16 1024/4096 359.7/980.1 -> 359.9/979.6 ms); the default
+  mux trim (`ec1f4a76`) covers the spill case.
+* Prefix cache v2 (defaults only in production): unique-prompt 12B peak 79.2 -> 73.7 GiB (vLLM 75.3),
+  hits 26/35 and 57/67 unchanged; 4096/C16 still +2.7% TTFT cache-on (cause not isolated).
+* Test hygiene: 3 plowrt lib tests fixed (2 also failed on main); AMD gfx942 full-layer nsplit drift from
+  `639d1507` gated back to main's rule (`dce1fe05`).

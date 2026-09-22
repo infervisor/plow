@@ -274,3 +274,15 @@ Validation plan: (1) ring A/B on the c32c null (step_bench B=16, same tree/objec
 * Admission-rung flapping on the 32-rung packet at C16 for prompts >= 1024: with 16 live and 1-3
   queued the controller widens 16 -> 32 (Backlog) and narrows back (LowLoad) every 2-15 s. Not the
   128/C16 gap, but serve C16 on a 32-rung packet with `PLOW_DECODE_MAX_RUNG` capped at the profile's C.
+
+## §7 l8192 verdict (2026-09-22, agent/packet-geometry-l8192, integrated in `75ce0d26`..`27d35315`)
+
+* Block, one packet, `--pf-cap` 4224 vs 8192: 12B sliding -6%, full -4%; 26B sliding -10%, full -7%.
+  Dense GEMM per-row cost does not improve at M=8192; the 12B gain is attention-role coverage + launch
+  glue, the 26B gain is the MoE grouped GEMM (2.48 -> 2.16 ms, 512 vs 264 tokens/expert).
+* Served: 12B l8192 not adopted (P99 -3..-7% but mean TTFT +19..44% at C16). 26B 4224-slice arm OOMs at
+  8192/C16 (free at load 4.78 -> 3.63 GiB, MoE Lt prefill scratch 404 -> 660 MiB; admission blind to it).
+  26B r3072 (4096 ring): peak 64.5-68.2 GiB, 15000/C16 TTFT 3015 -> 2205, but C1 TTFT +5..17%.
+* Adopted: GQA2 role on the 4160/4224 rungs (block 3.45 -> 3.32 ms per 4224-row launch).
+* Mux: unified prefill + decode rows stay in the prefill's bucket; trim only when the spill exceeds
+  PLOW_PF_CHUNK_COST (4224+3 on an 8192 rung), never 1024+1.

@@ -1489,3 +1489,24 @@ column"). 26B-specific numbers, packet `p26i`, 16 prompts:
   GSM8K 192/200 (vLLM 191). Cache-on: C4 87.1 ms vs vLLM 98.3, C16 205.1 vs 204.7 (26/35, 57/67 hits); peak
   78.6 GiB. Decode interference (agent/decode-interference): decode rows already ride every prefill launch;
   stall total = prefill per-row cost (26B 27-30 vs vLLM 17.6 us/row); decode step B=16 15.6 vs 10.2 ms.
+
+## Round 4 (2026-09-22): integrated set for e2e3 (`3a7a5a3b`, packet p26r4q)
+
+* MoE decode (agent/moe-decode-r3): `PLOW_MULTISTEP_ADAPTIVE` (K=1 while prefill, an arrival or a
+  just-freed slot is pending; 26B realtime only) — C1 TPOT back to multistep level (5.59-5.97), 15000/C4
+  TTFT 700 vs 993 with plain multistep. `PLOW_MOE_COMBINE_V8` (default on): B=1/4/16 5.705/8.755/12.590 ->
+  5.58/8.62/12.44, bit-identical. Dropped (worse or noise): TOPK_REG, ROUTER_B1_V8, GV_MOE_UN, RMS_ROWS,
+  ROUTER_EMAJOR, DOWN_PRE, GATE_PF.
+* 15000/C16 TTFT regression ROOT CAUSE: the decode route's own 133 MiB Lt scratch cost one 15k slot
+  (KV max_rows 231424 -> 225280, 14 -> 13 live). One shared MoE Lt scratch (`dc3f5ee4`): 2519 ms mean
+  vs 3005, 14 live, peak 80.8 GiB. Lesson: on the 26B ~56 MiB of slack separates 14 from 13 slots.
+* Prefill attention route on the GQA full layers (`e78278d4`) + default-on gated by KV admission
+  (`0b267c95`): C1 TTFT 4096/8192/15000 106.6/230.1/483.1 -> 102.9/214.1/430.5; off automatically at
+  rung 16 (forcing it at C16: 11 slots, +46% TTFT). Scratch sharing with the MoE arena not done.
+* `PLOW_FA_MMAQK=3` on the 26B (recipe): step ctx 1024 B=1/4/16 5.61/8.51/12.44 -> 5.54/8.34/11.75;
+  GSM8K 192/200 (control 192, vLLM 191). Candidate for a GEMMA4_HOPPER default (both models).
+* Geometry: 8192-row launches not adopted (26B 4224-slice arm OOMs at 8192/C16: admission does not see
+  the prefill scratch growth). r3072 memory arm = memory parity option (peak 64.5-68.2 GiB vs vLLM 73.5;
+  15000/C16 2205 ms) at +5-17% C1 TTFT. Wide GQA2 role (4160/4224) is a default; unmeasured on the 26B
+  served before e2e3.
+* Generic knobs promoted to defaults (agent/knob-defaults-r2): recipes carry geometry + policy only.
