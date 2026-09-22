@@ -1453,8 +1453,9 @@ fn packet_role_segments(
                 plow_asset::segment_roles::MOE_PREFILL_CUBLASLT
                     | plow_asset::segment_roles::MOE_DECODE_CUBLASLT
             ) {
-                // A library segment of two complete instructions (grouped GLU + DOWN); the
-                // route itself (`moe_lt::segments`) checks the pair when it is switched on.
+                // A library segment of two complete instructions (grouped GLU + DOWN), or on
+                // decode four (+ the combine/NRN layer tail); the route itself
+                // (`moe_lt::segments`, `moe_lt::decode_segments`) checks them when switched on.
                 let pcs: std::collections::BTreeSet<_> = entries.iter().map(|e| e.inst).collect();
                 let complete = pcs.iter().all(|&pc| {
                     let mut slices: Vec<_> =
@@ -1467,9 +1468,11 @@ fn packet_role_segments(
                             .chain(&g.stream)
                             .any(|e| e.inst == pc && e.seg as usize != seg)
                 });
-                if pcs.len() != 2 || !complete {
+                let tail = role == plow_asset::segment_roles::MOE_DECODE_CUBLASLT && pcs.len() == 4;
+                if !(pcs.len() == 2 || tail) || !complete {
                     return Err(RuntimeError::Rejected(
-                        "MoE cuBLASLt segment requires two complete instructions".into(),
+                        "MoE cuBLASLt segment requires two (decode: or four) complete instructions"
+                            .into(),
                     ));
                 }
                 selected.push(role);

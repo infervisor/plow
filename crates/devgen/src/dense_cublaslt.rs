@@ -1,4 +1,4 @@
-use packet::dev::DevOp;
+use packet::dev::{DevInst, DevOp};
 use packet::devbuild::{Builder, Model, SectionData, SECT_METADATA};
 use plow_asset::segment_roles::{
     ProgramRoles, SegmentRoles, CUBLASLT, INTERPRETER, MOE_DECODE_CUBLASLT, MOE_PREFILL_CUBLASLT,
@@ -95,10 +95,30 @@ pub(crate) fn apply_moe_decode(
             {
                 groups[head] = Some(head);
                 groups[head + 1] = Some(head);
+                if let [comb, nrn] = insts.get(head + 2..head + 4).unwrap_or_default() {
+                    if is_decode_tail(glu, down, comb, nrn) {
+                        groups[head + 2] = Some(head);
+                        groups[head + 3] = Some(head);
+                    }
+                }
             }
         }
         groups
     })
+}
+
+/// The layer tail right after a routed decode pair, which the route's glue runs from the down
+/// rows (`plow_moe_lt_combine_nrn`): `MoeCombineNormGemma` on the pair's `part` at k = 8 and
+/// hidden <= 3072 (op70's k = 8 body), then `NormResidualNorm` in place on the GLU's residual
+/// stream. plowrt's `moe_lt::decode_tail` checks the same shape.
+fn is_decode_tail(glu: &DevInst, down: &DevInst, comb: &DevInst, nrn: &DevInst) -> bool {
+    comb.op == DevOp::MoeCombineNormGemma as u16
+        && nrn.op == DevOp::NormResidualNorm as u16
+        && comb.t[1] == down.t[0]
+        && [comb.i[0], comb.i[1], comb.i[2]] == [glu.i[2], 8, glu.i[5]]
+        && glu.i[2] <= 12 * 256
+        && [nrn.t[1], nrn.t[2], nrn.t[3]] == [glu.t[1], glu.t[1], comb.t[0]]
+        && nrn.i[1] == glu.i[2]
 }
 
 /// Re-segment every program in `programs` so that each instruction group `select` names (by a
@@ -797,6 +817,72 @@ mod tests {
         // A pair whose operands disagree is left to the interpreter.
         model.progs[0].insts[2].t[1] = xn2;
         assert_eq!(apply_moe_prefill(&mut model, &mut Vec::new(), "sm_90a").unwrap(), 0);
+    }
+
+    #[test]
+    fn moe_decode_takes_the_layer_tail_into_the_routed_segment() {
+        // A prefill bucket and one 8-row decode rung: router | align | glu, down, comb, nrn | nop.
+        let tail_model = |k: u32| {
+            let mut programs = Vec::new();
+            let mut tensors = Vec::new();
+            for rows in [128u32, 8] {
+                let mut b = Builder::new(2);
+                b.force_uniseg();
+                let [fug, x, tab, ewt, gamma, xn2, meta, rowtok, part, est, rowpart, rowgate] = [
+                    "fug", "x", "tab", "ewt", "gamma", "xn2", "meta", "rowtok", "part", "est",
+                    "rowpart", "rowgate",
+                ]
+                .map(|name| b.tensor(name, 1 << 20));
+                let [comb, h1, g_pf2, hn, g_po, g_in] =
+                    ["comb", "h1", "g_pf2", "hn", "g_po", "g_in"].map(|name| b.tensor(name, 1 << 20));
+                let router = b.emit(DevOp::Nop, vec![0, 1], &[], |_| {});
+                let align = b.emit(DevOp::MoeAlignGemmaPf, vec![0], &[router], |d| {
+                    d.t[..5].copy_from_slice(&[meta, tab, rowtok, rowpart, rowgate]);
+                    d.i[..4].copy_from_slice(&[rows, 128, 8, 8]);
+                });
+                let glu = b.emit(DevOp::MoeExpertGluNormGemma, vec![0, 1], &[align], |d| {
+                    d.t.copy_from_slice(&[fug, x, tab, ewt, gamma, xn2, meta, rowtok]);
+                    d.i.copy_from_slice(&[8, 704, 2816, 128, 0, rows, 8, 0]);
+                });
+                let down = b.emit(DevOp::MoeExpertDownGemma, vec![0, 1], &[glu], |d| {
+                    d.t.copy_from_slice(&[part, fug, tab, ewt, est, meta, rowpart, rowgate]);
+                    d.i.copy_from_slice(&[8, 2816, 704, 128, 0, rows, 8, 0]);
+                });
+                let c = b.emit(DevOp::MoeCombineNormGemma, vec![0, 1], &[down], |d| {
+                    d.t[..4].copy_from_slice(&[comb, part, h1, g_pf2]);
+                    d.i[..3].copy_from_slice(&[2816, k, rows]);
+                });
+                let n = b.emit(DevOp::NormResidualNorm, vec![0, 1], &[c], |d| {
+                    d.t[..6].copy_from_slice(&[hn, x, x, comb, g_po, g_in]);
+                    d.i[..2].copy_from_slice(&[rows, 2816]);
+                });
+                b.emit(DevOp::Nop, vec![0, 1], &[n], |_| {});
+                tensors = b.tensors();
+                programs.push(b.finish());
+            }
+            Model {
+                n_cu: 2,
+                target: 0,
+                tensors,
+                progs: programs,
+                prog_t: vec![128, 8],
+                gen: Vec::new(),
+                kv_row_insts: Vec::new(),
+            }
+        };
+        for (k, segs) in [(8, [0, 0, 1, 1, 1, 1, 2]), (4, [0, 0, 1, 1, 2, 2, 2])] {
+            let mut model = tail_model(k);
+            assert_eq!(apply_moe_decode(&mut model, &mut Vec::new(), "sm_90a", 8).unwrap(), 1);
+            let program = &model.progs[1];
+            for (pc, expected) in segs.into_iter().enumerate() {
+                assert!(program
+                    .stream
+                    .iter()
+                    .chain(&program.gq_stream)
+                    .filter(|entry| entry.inst as usize == pc)
+                    .all(|entry| entry.seg == expected));
+            }
+        }
     }
 
     #[test]

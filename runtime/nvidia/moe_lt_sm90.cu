@@ -17,6 +17,7 @@
  */
 #include "dev_isa.h"
 #include "sm120_common.cuh"
+#include "op_norm.cuh"
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 900
 #error "MoE cuBLASLt glue object requires sm_90a"
@@ -24,8 +25,9 @@
 
 extern "C" {
 /* ABI 2 adds plow_moe_lt_norm; a decode route needs it, the prefill route accepts ABI 1.
- * ABI 3 adds plow_moe_lt_norm_gather (the decode route's setup + norm + gather). */
-__device__ unsigned plow_moe_lt_abi = 3;
+ * ABI 3 adds plow_moe_lt_norm_gather (the decode route's setup + norm + gather).
+ * ABI 4 adds plow_moe_lt_combine_nrn (a decode segment that carries the layer tail). */
+__device__ unsigned plow_moe_lt_abi = 4;
 }
 
 /* pre[0..n_exp] = exclusive prefix of cnt; returns the live row count. n_exp <= 256 (align's
@@ -193,6 +195,84 @@ extern "C" __global__ void plow_moe_lt_glu(__nv_bfloat16* fu, const __nv_bfloat1
         }
         st_glob8(fu + r * I + k.c * 8u, vo);
     }
+}
+
+/* Decode route, ABI 4: the layer tail the interpreter would run next, MoeCombineNormGemma then
+ * NormResidualNorm, straight from the down matmul's rows, so part[] is never written. One block
+ * per token row. Bit-exact to scatter + both ops: each slot product is rounded (__fmul_rn) as
+ * scatter stores it, the combine is op70's k = 8 body (slot order, float4 partition, warp sums
+ * folded by thread 0), and the NRN is the interpreter's d_norm_residual_norm.
+ * k == 8, H % 8 == 0 and H <= 12 * 256 are checked on the host. */
+extern "C" __global__ void plow_moe_lt_combine_nrn(
+    __nv_bfloat16* hn, __nv_bfloat16* x, __nv_bfloat16* comb, const __nv_bfloat16* dn,
+    const unsigned* row_partidx, const float* row_gate, const int* meta,
+    const __nv_bfloat16* h1, const __nv_bfloat16* g_pf2, const __nv_bfloat16* g_po,
+    const __nv_bfloat16* gn, unsigned n_exp, unsigned H, float eps_comb, float eps, float scale) {
+    constexpr unsigned K = 8u;
+    __shared__ unsigned pre[PLOW_NV_THREADS + 1u];
+    __shared__ unsigned slot_row[K];
+    __shared__ float slot_gate[K];
+    __shared__ __align__(16) float acc[12u * PLOW_NV_THREADS];
+    __shared__ float red[PLOW_NV_THREADS / 32u];
+    const unsigned t = blockIdx.x, tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned live = moe_lt_live_prefix(pre, meta, n_exp);
+    for (unsigned i = tid; i < live; i += PLOW_NV_THREADS) {
+        const unsigned r = moe_lt_live_row(pre, meta, n_exp, i);
+        const unsigned p = row_partidx[r];
+        if (p / K == t) {
+            slot_row[p % K] = r;
+            slot_gate[p % K] = row_gate[r];
+        }
+    }
+    __syncthreads();
+
+    const size_t base = (size_t)t * H;
+    float ss = 0.0f;
+#pragma unroll
+    for (unsigned it = 0; it < 3u; it++) {
+        const unsigned h = tid * 4u + it * PLOW_NV_THREADS * 4u;
+        if (h >= H) continue;
+        float4 v[K];
+#pragma unroll
+        for (unsigned s = 0; s < K; s++) {
+            const uint2 raw = *(const uint2*)(dn + (size_t)slot_row[s] * H + h);
+            const __nv_bfloat162 lo = *(const __nv_bfloat162*)&raw.x, hi = *(const __nv_bfloat162*)&raw.y;
+            const float g = slot_gate[s];
+            v[s] = make_float4(__fmul_rn(__low2float(lo), g), __fmul_rn(__high2float(lo), g),
+                               __fmul_rn(__low2float(hi), g), __fmul_rn(__high2float(hi), g));
+        }
+        float4 acc4 = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (unsigned s = 0; s < K; s++) {
+            acc4.x += v[s].x; acc4.y += v[s].y; acc4.z += v[s].z; acc4.w += v[s].w;
+        }
+        *(float4*)(acc + h) = acc4;
+        ss += acc4.x * acc4.x + acc4.y * acc4.y + acc4.z * acc4.z + acc4.w * acc4.w;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o, 32);
+    if (lane == 0) red[warp] = ss;
+    __syncthreads();
+    if (tid == 0) {
+        float s = 0.0f;
+        for (unsigned i = 0; i < PLOW_NV_THREADS / 32u; i++) s += red[i];
+        red[0] = rsqrtf(s / (float)H + eps_comb);
+    }
+    __syncthreads();
+    const float inv = red[0];
+    for (unsigned c = tid; c < (H >> 3); c += PLOW_NV_THREADS) {
+        const bf16v8 g = ld_glob8(g_pf2 + c * 8u), r = ld_glob8(h1 + base + c * 8u);
+        bf16v8 ov;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const float v = acc[c * 8u + j] * inv * __bfloat162float(g.x[j]);
+            ov.x[j] = __float2bfloat16(v + __bfloat162float(r.x[j]));
+        }
+        st_glob8(comb + base + c * 8u, ov);
+    }
+    __syncthreads();
+    d_norm_residual_norm(hn + base, x + base, x + base, comb + base, g_po, gn, 1u, H, eps, scale,
+                         0u, 1u, red);
 }
 
 /* part[row_partidx[r]] = f32(dn[r]) * row_gate[r] for every live gathered row. H % 8 == 0. */

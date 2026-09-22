@@ -37,6 +37,9 @@ pub(super) struct MoeLtSegment {
     handles: [u16; 8],
     /// Decode only: the fused norm the route stages before the gather.
     norm: Option<Norm>,
+    /// Decode only: the layer tail (`MoeCombineNormGemma` + `NormResidualNorm`) the segment
+    /// carries after the pair; the route runs it from the down rows instead of scattering `part`.
+    tail: Option<Tail>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +50,21 @@ struct Norm {
     eps_bits: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Tail {
+    combine: usize,
+    nrn: usize,
+    /// hn, comb, h1, g_pf2, g_po, gn (the NRN weights may be TENSOR_NONE: weightless).
+    handles: [u16; 6],
+    eps_comb_bits: u32,
+    eps_bits: u32,
+    scale_bits: u32,
+}
+
+/// `plow_moe_lt_combine_nrn` is op70's k = 8 body: its float4 partition covers H <= 12 * 256.
+const TAIL_TOP_K: u32 = 8;
+const TAIL_MAX_HIDDEN: u32 = 12 * GLUE_THREADS;
+
 /// The align op pads each expert's row segment to a tile multiple (at most `PGM_BM` = 128 rows),
 /// which bounds a decode rung's gathered-row extent by `rows * k + experts * ALIGN_PAD`.
 const ALIGN_PAD: u64 = 128;
@@ -56,7 +74,12 @@ pub(super) fn instructions(segments: &[Option<MoeLtSegment>]) -> Vec<(usize, usi
     segments
         .iter()
         .enumerate()
-        .filter_map(|(seg, route)| route.map(|route| [(seg, route.glu), (seg, route.down)]))
+        .filter_map(|(seg, route)| {
+            route.map(|route| {
+                let tail = route.tail.map(|t| [(seg, t.combine), (seg, t.nrn)]);
+                [(seg, route.glu), (seg, route.down)].into_iter().chain(tail.into_iter().flatten())
+            })
+        })
         .flatten()
         .collect()
 }
@@ -134,6 +157,7 @@ pub(super) fn segments(
                 as u32,
             handles: [g.t[2], g.t[3], g.t[4], d.t[4], d.t[5], g.t[1], g.t[0], d.t[0]],
             norm: None,
+            tail: None,
         });
     }
     Ok(routes)
@@ -178,14 +202,24 @@ pub(super) fn decode_segments(
             .min(u64::from(rows) * u64::from(k) + u64::from(experts) * ALIGN_PAD);
         let none = packet::dev::TENSOR_NONE16;
         let row_bytes = u64::from(rows) * u64::from(hidden) * 2;
+        let last = entries.iter().map(|e| e.inst as usize).max().ok_or_else(fail)?;
+        let members = glu..=last;
+        let tail = match last - down {
+            0 => None,
+            2 => Some(decode_tail(program, tensors, down, rows, hidden).ok_or_else(fail)?),
+            _ => return Err(fail()),
+        };
         if align.op != DevOp::MoeAlignGemmaPf as u16
             || g.op != DevOp::MoeExpertGluNormGemma as u16
             || d.op != DevOp::MoeExpertDownGemma as u16
-            || entries
+            || entries.iter().any(|e| !members.contains(&(e.inst as usize)))
+            || program
+                .stream
                 .iter()
-                .any(|e| e.inst as usize != glu && e.inst as usize != down)
-            || program.stream.iter().any(|e| {
-                (e.inst as usize == glu || e.inst as usize == down) != (e.seg as usize == segment)
+                .any(|e| members.contains(&(e.inst as usize)) != (e.seg as usize == segment))
+            || tail.is_some_and(|t| {
+                let c = &program.insts[t.combine];
+                c.t[1] != d.t[0] || [c.i[1], c.i[2]] != [k, g.i[5]] || k != TAIL_TOP_K
             })
             || [g.t[0], g.t[1], g.t[3], g.t[4], g.t[5], g.t[6], g.t[7], d.t[0], d.t[6], d.t[7]]
                 .contains(&none)
@@ -232,9 +266,46 @@ pub(super) fn decode_segments(
                 rows,
                 eps_bits: g.fj[0],
             }),
+            tail,
         });
     }
     Ok(routes)
+}
+
+/// The `MoeCombineNormGemma` + in-place `NormResidualNorm` pair right after a decode down op,
+/// on the residual stream `x` the GLU read (checked by the caller through the combine's `part`).
+fn decode_tail(
+    program: &DevProg,
+    tensors: &[DevTensor],
+    down: usize,
+    rows: u32,
+    hidden: u32,
+) -> Option<Tail> {
+    let (c, n) = (program.insts.get(down + 1)?, program.insts.get(down + 2)?);
+    let x = program.insts[down - 1].t[1];
+    let none = packet::dev::TENSOR_NONE16;
+    let bytes = |handle: u16| tensors.get(handle as usize).map_or(0, |t| t.bytes);
+    let row_bytes = u64::from(rows) * u64::from(hidden) * 2;
+    let weight = |handle: u16| handle == none || bytes(handle) >= u64::from(hidden) * 2;
+    (c.op == DevOp::MoeCombineNormGemma as u16
+        && n.op == DevOp::NormResidualNorm as u16
+        && c.i[0] == hidden
+        && hidden <= TAIL_MAX_HIDDEN
+        && [n.i[0], n.i[1]] == [rows, hidden]
+        && [n.t[1], n.t[2], n.t[3]] == [x, x, c.t[0]]
+        && ![c.t[0], c.t[2], c.t[3], n.t[0]].contains(&none)
+        && [c.t[0], c.t[2], n.t[0], x].iter().all(|&t| bytes(t) >= row_bytes)
+        && bytes(c.t[3]) >= u64::from(hidden) * 2
+        && weight(n.t[4])
+        && weight(n.t[5]))
+    .then(|| Tail {
+        combine: down + 1,
+        nrn: down + 2,
+        handles: [n.t[0], c.t[0], c.t[2], c.t[3], n.t[4], n.t[5]],
+        eps_comb_bits: c.fj[0],
+        eps_bits: n.fj[0],
+        scale_bits: n.fj[1],
+    })
 }
 
 /// Glue kernels, scratch and device-side group tables shared by every route of an engine.
@@ -250,6 +321,8 @@ pub(super) struct MoeLt {
     norm: Option<KernelFn>,
     /// ABI 3: the decode route's setup + norm + gather in one launch.
     norm_gather: Option<KernelFn>,
+    /// ABI 4: a decode segment's layer tail in place of the scatter.
+    combine_nrn: Option<KernelFn>,
     blocks: u32,
     hidden: u32,
     inter: u32,
@@ -270,6 +343,8 @@ pub(super) struct MoeLtRoute {
     weights: Arc<DeviceMem>,
     /// Decode: `(x, gamma, rows, eps)` of the staged norm.
     norm: Option<(u64, u64, u32, f32)>,
+    /// Decode: the layer tail's `[hn, comb, h1, g_pf2, g_po, gn]` and `(eps_comb, eps, scale)`.
+    tail: Option<([u64; 6], [f32; 3])>,
     meta: u64,
     row_token: u64,
     row_partidx: u64,
@@ -300,10 +375,10 @@ impl MoeLt {
         let abi = plow_asset::cubin::global_u32(&image, "plow_moe_lt_abi");
         if profile != "sm90a"
             || plow_asset::cubin::inspect(&image).is_none_or(|i| i.sm != 90)
-            || !matches!(abi, Some(1..=3))
+            || !matches!(abi, Some(1..=4))
         {
             return Err(RuntimeError::Rejected(format!(
-                "{OBJECT_FILE}: not an sm90a MoE cuBLASLt glue object of ABI 1 to 3"
+                "{OBJECT_FILE}: not an sm90a MoE cuBLASLt glue object of ABI 1 to 4"
             )));
         }
         let module = DecodeModule::load(be, &image)?;
@@ -339,6 +414,9 @@ impl MoeLt {
                 .transpose()?,
             norm_gather: (abi >= Some(3))
                 .then(|| function("plow_moe_lt_norm_gather"))
+                .transpose()?,
+            combine_nrn: (abi >= Some(4))
+                .then(|| function("plow_moe_lt_combine_nrn"))
                 .transpose()?,
             _module: module,
             blocks,
@@ -432,7 +510,15 @@ impl MoeLt {
                 "PLOW_MOE_DEC_LT needs an ABI 2 {OBJECT_FILE} (plow_moe_lt_norm)"
             )));
         }
+        if segment.tail.is_some() && self.combine_nrn.is_none() {
+            return Err(RuntimeError::Rejected(format!(
+                "a decode segment with the layer tail needs an ABI 4 {OBJECT_FILE}"
+            )));
+        }
         let base = |handle: u16| devp[handle as usize].base;
+        let weight = |handle: u16| {
+            if handle == packet::dev::TENSOR_NONE16 { 0 } else { base(handle) }
+        };
         let [ewt, meta, row_token, row_partidx, row_gate, xn2, fu, part] = segment.handles;
         let route = MoeLtRoute {
             owner: Arc::clone(self),
@@ -441,6 +527,13 @@ impl MoeLt {
             norm: segment
                 .norm
                 .map(|n| (base(n.x), base(n.gamma), n.rows, f32::from_bits(n.eps_bits))),
+            tail: segment.tail.map(|t| {
+                let [hn, comb, h1, g_pf2, g_po, gn] = t.handles;
+                (
+                    [base(hn), base(comb), base(h1), base(g_pf2), weight(g_po), weight(gn)],
+                    [t.eps_comb_bits, t.eps_bits, t.scale_bits].map(f32::from_bits),
+                )
+            }),
             meta: base(meta),
             row_token: base(row_token),
             row_partidx: base(row_partidx),
@@ -452,6 +545,10 @@ impl MoeLt {
         };
         insts[segment.glu].op = DevOp::Nop as u16;
         insts[segment.down].op = DevOp::Nop as u16;
+        if let Some(tail) = segment.tail {
+            insts[tail.combine].op = DevOp::Nop as u16;
+            insts[tail.nrn].op = DevOp::Nop as u16;
+        }
         Ok(route)
     }
 }
@@ -464,6 +561,7 @@ impl MoeLtRoute {
             .into_iter()
             .chain(o.norm)
             .chain(o.norm_gather)
+            .chain(o.combine_nrn)
     }
 
     pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
@@ -553,6 +651,33 @@ impl MoeLtRoute {
             o.pointers(3),
             stream,
         )?;
+        if let (Some(([hn, comb, h1, g_pf2, g_po, gn], [eps_comb, eps, scale])), Some(tail)) =
+            (self.tail, o.combine_nrn)
+        {
+            let (mut x, _, rows, _) = self.norm.expect("a decode tail rides a decode route");
+            let (mut hn, mut comb, mut h1, mut g_pf2, mut g_po, mut gn) = (hn, comb, h1, g_pf2, g_po, gn);
+            let (mut eps_comb, mut eps, mut scale) = (eps_comb, eps, scale);
+            let argf = |value: &mut f32| (value as *mut f32).cast::<std::ffi::c_void>();
+            let mut params = [
+                arg(&mut hn),
+                arg(&mut x),
+                arg(&mut comb),
+                arg(&mut dn),
+                arg(&mut row_partidx),
+                arg(&mut row_gate),
+                arg(&mut meta),
+                arg(&mut h1),
+                arg(&mut g_pf2),
+                arg(&mut g_po),
+                arg(&mut gn),
+                arg32(&mut experts),
+                arg32(&mut hidden),
+                argf(&mut eps_comb),
+                argf(&mut eps),
+                argf(&mut scale),
+            ];
+            return o.be.launch_kernel(tail, rows, GLUE_THREADS, 0, &mut params, Some(stream));
+        }
         let mut params = [
             arg(&mut part),
             arg(&mut dn),
@@ -572,9 +697,6 @@ pub(super) fn max_capacity(segments: &[Option<MoeLtSegment>]) -> u32 {
     segments.iter().flatten().map(|s| s.capacity).max().unwrap_or(0)
 }
 
-/// Route every segment of one decode program, loading the shared glue once with a scratch of at
-/// least `min_capacity` gathered rows.
-#[allow(clippy::too_many_arguments)]
 /// The routed decode object (`<decode stem>_routed.cubin`, `PLOW_NV_DECODE_ROUTED`): the decode
 /// megakernel without the expert GEMV arms that a routed rung never dispatches.
 pub(super) struct RoutedDecode {
@@ -647,6 +769,9 @@ impl RoutedDecode {
     }
 }
 
+/// Route every segment of one decode program, loading the shared glue once with a scratch of at
+/// least `min_capacity` gathered rows.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn decode_routes(
     be: &Arc<CudaBackend>,
     owner: &mut Option<Arc<MoeLt>>,
@@ -881,6 +1006,88 @@ mod tests {
             packet_role_segments(&program, &[0, DECODE_ROLE, 0], &tensors).unwrap(),
             [0, DECODE_ROLE, 0]
         );
+    }
+
+    /// `decode_fixture` with the layer tail in the routed segment: align | glu, down, comb, nrn | nop.
+    fn decode_tail_fixture() -> (DevProg, Vec<DevTensor>) {
+        let (mut program, mut tensors) = decode_fixture();
+        // Handles: 11 comb, 12 h1, 13 g_pf2, 14 hn, 15 g_po, 16 gn.
+        let row = 16 * 2816 * 2;
+        tensors.extend([row, row, 2816 * 2, row, 2816 * 2, 2816 * 2].map(|bytes| DevTensor {
+            name: "act".into(),
+            bytes,
+            init: None,
+        }));
+        let nop = program.insts[3];
+        program.insts.splice(3..3, [nop, nop]);
+        let comb = &mut program.insts[3];
+        comb.op = DevOp::MoeCombineNormGemma as u16;
+        comb.t[..4].copy_from_slice(&[11, 5, 12, 13]);
+        comb.i[..3].copy_from_slice(&[2816, 8, 16]);
+        comb.fj[0] = 1e-6f32.to_bits();
+        let nrn = &mut program.insts[4];
+        nrn.op = DevOp::NormResidualNorm as u16;
+        nrn.t[..6].copy_from_slice(&[14, 9, 9, 11, 15, 16]);
+        nrn.i[..2].copy_from_slice(&[16, 2816]);
+        nrn.fj[..2].copy_from_slice(&[1e-6f32.to_bits(), 0.5f32.to_bits()]);
+        let stream: Vec<_> = [(0, 0), (1, 1), (2, 1), (3, 1), (4, 1), (5, 2)]
+            .into_iter()
+            .map(|(inst, seg)| StreamEnt {
+                inst,
+                seg,
+                ..Default::default()
+            })
+            .collect();
+        program.stream = stream.clone();
+        program.gq_stream = stream;
+        program.stream_len = vec![6];
+        program.gq_seg_ofs = vec![0, 1, 5, 6];
+        (program, tensors)
+    }
+
+    #[test]
+    fn accepts_the_decode_pair_with_the_layer_tail() {
+        let (program, tensors) = decode_tail_fixture();
+        let roles = [0, DECODE_ROLE, 0];
+        let routes = decode_segments(&program, &tensors, &roles).unwrap();
+        let route = routes[1].expect("routed pair");
+        assert_eq!(
+            route.tail,
+            Some(Tail {
+                combine: 3,
+                nrn: 4,
+                handles: [14, 11, 12, 13, 15, 16],
+                eps_comb_bits: 1e-6f32.to_bits(),
+                eps_bits: 1e-6f32.to_bits(),
+                scale_bits: 0.5f32.to_bits(),
+            })
+        );
+        assert_eq!(instructions(&routes), [(1, 1), (1, 2), (1, 3), (1, 4)]);
+        assert_eq!(packet_role_segments(&program, &roles, &tensors).unwrap(), roles);
+        // A prefill segment never carries the tail.
+        assert!(packet_role_segments(&program, &[0, ROLE, 0], &tensors).is_err());
+
+        let edits: [fn(&mut DevProg, &mut Vec<DevTensor>); 7] = [
+            |p, _| p.insts[3].t[1] = 7,
+            |p, _| p.insts[3].i[1] = 4,
+            |p, _| p.insts[4].t[2] = 14,
+            |p, _| p.insts[4].t[3] = 12,
+            |p, _| p.insts[4].i[0] = 8,
+            |p, _| p.insts[4].op = DevOp::RmsNorm as u16,
+            |_, t| t[12].bytes -= 2,
+        ];
+        for edit in edits {
+            let (mut program, mut tensors) = decode_tail_fixture();
+            edit(&mut program, &mut tensors);
+            assert!(decode_segments(&program, &tensors, &roles).is_err());
+        }
+        // Three instructions: the tail is all or nothing.
+        let (mut program, tensors) = decode_tail_fixture();
+        program.gq_seg_ofs = vec![0, 1, 4, 6];
+        for entry in program.stream.iter_mut().chain(&mut program.gq_stream) {
+            entry.seg = [0, 1, 1, 1, 2, 2][entry.inst as usize];
+        }
+        assert!(decode_segments(&program, &tensors, &roles).is_err());
     }
 
     #[test]

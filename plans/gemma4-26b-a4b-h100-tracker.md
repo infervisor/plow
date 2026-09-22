@@ -1572,3 +1572,18 @@ column"). 26B-specific numbers, packet `p26i`, 16 prompts:
   ~18 us segment-start latency: the small-op cost is per layer, not per row.
   Targets: (1) one fused segment-start op combine + NRN, with RmsNorm(h1) moved into it (~15 us/layer);
   (2) topk + align off the segment tail (into the Lt glue) or reordered (~10-18 us/layer); (3) router.
+* Landed `d0149eb0` (per-member gates + routed decode object, plowc/CMake emit it when a program has
+  a MOE_DECODE_CUBLASLT segment). Clean A/B REPS=5 (ms): B=16 11.371 -> 11.369, B=8 9.443 -> 9.399,
+  B=4 8.127 -> 8.090, B=2 7.123 -> 7.091, B=1 5.525 -> 5.471; no rung slower. Gates alone: B=16 11.340
+  (the routed object gives 0.03 back at B=16; B=4 gates alone 8.139).
+* Landed `5a3c0900` (top-k tail: lane per slot, redux winner, pes per round, gs via shuffles; bit-exact,
+  also in both prefill routers): 11.362/9.396/8.098/7.091/5.470 -> 11.346/9.387/8.074/7.062/5.469
+  (B=16/8/4/2/1). Far below the ~5 us/layer read-back estimate: the table read-back was not the cost.
+* Lt tail fusion (ready to land). Decode rungs order `RmsNorm(h1), align, GLU, down, combine, NRN, QKV`, so
+  devgen extends the MOE_DECODE_CUBLASLT segment to [GLU, down, combine, NRN] (k = 8, H <= 3072) and the
+  route replaces the scatter with `plow_moe_lt_combine_nrn` (glue ABI 4: op70 k=8 body from the down rows
+  with __fmul_rn slot products, then the interpreter NRN; part[] never written). Target: the 16.8 us
+  combine -> NRN segment start per layer.
+  A/B p26ctl vs p26tl, same binary, REPS=5 (ms): B=16 11.207 -> 10.902, B=8 9.273 -> 8.989, B=4 8.003 ->
+  7.700, B=2 7.062 -> 7.061, B=1 5.469 -> 5.469; greedy digests identical at every rung. The first run
+  faulted (misaligned float4 stores into an unaligned `__shared__ float acc[]`; `__align__(16)` fixes it).
