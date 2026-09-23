@@ -2217,3 +2217,40 @@ Proposal, NOT implemented: `cmd_build` should either pass the ROLE emit's `plow_
 objects step, or refuse when the base and assets packet hashes differ. Today it silently produces
 an unservable set. Not changed here — shared tooling, three jobs using it live, and a guard there
 needs its own GPU test pass.
+
+### CORRECTION to the 2560 root cause: not a tail truncation, a constant 136-program Gemm deficit
+
+The earlier entry said the missing segments were "the contiguous tail 435..570". That was CIRCULAR.
+Segment ids are assigned per bucket, 0..n-1: every bucket in the packet is contiguous from 0, so a
+bucket with 435 programs trivially has ids 0..434 and the "missing tail" is just the id-range
+difference. Verified with `$CLAUDE_JOB_DIR/tmp/sched/seg_ids.py` — `contiguous_0..n-1=True` for all
+fourteen buckets.
+
+The corrected reading is cleaner and is stronger evidence of a real defect:
+
+| bucket | non-Gemm programs | Gemm programs |
+|--------|-------------------|---------------|
+| 128, 256, 512, 1024, 1088, 1152, 2048, 4096, 4160, 4224 | 242 | 329 |
+| 1536, 2560, 3072, 3584 | 242 | **193** |
+
+The non-Gemm program set is IDENTICAL (242) at every rung. Only the Gemm set differs, and it differs
+by a CONSTANT 136 — the same deficit at 1536 as at 3584, independent of rung width. So these shapes
+do not "run out" of emission partway; they take a different Gemm segmentation path that produces 136
+fewer programs, and the packet then wedges executing one.
+
+What this changes: the guard I proposed (per-rung segment-count parity) still works as a detector,
+because the parity is exact for every healthy rung. But the FIX is not "emit the rest" — it is
+finding why the Gemm segmenter takes a different path for row counts that are not pow2 or
+pow2+{64,128}. That mechanism is still unidentified; it needs the segment emitter source, not
+arithmetic on build.json. 329 - 193 = 136, and 193 = 48*4 + 1 is suggestive of four Gemm per layer
+plus lm_head, but 329 does not divide as cleanly, so do not build on that guess.
+
+This matters more than it did this morning: `appended_rungs` admits any rung with
+`window + x - 1 <= ring`, which at ring 8192 and window 1024 means rungs up to **7169** are free at
+the CURRENT KV footprint. That is the lever for the remaining 15000 TTFT gap, since the isolated
+PF_COVER A/B showed the leftover 4.29% is launch count rather than padding. But there is no
+pow2-or-pow2+{64,128} value between 4224 and 7169 (the next power of two, 8192, needs
+`next_pow2(1024+8192-1) = 16384` ring rows = 5.0 GiB/slot sliding KV = 80 GiB at 16 slots, which does
+not fit alongside 23.8 GiB of weights). So every usable wide rung lands in the broken shape class,
+and this defect is now what blocks the prefill lever — and makes pending task #45 (the 8192-row
+launch rung A/B) unrunnable as specified.
