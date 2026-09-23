@@ -2299,3 +2299,66 @@ Build one packet with a rung that is NOT in the whitelist but IS the "safe" shap
 Either answer is worth one build and one 15000/C1 cell, and it decides whether widening the ladder
 (the lever for the remaining prefill gap, rungs up to 7169 being free at the current ring) needs a
 whitelist entry, a tuner run, or a kernel fix.
+
+## cuBLASLt FP8 IS reachable for plow's W8A8 scheme, as-is
+
+Phase 0 of the kernel-route work, 2026-09-23, CPU only. This overturns the assumption the FP8 arm
+was built on.
+
+CUDA in this shell: nvcc 12.9.86, libcublasLt.so.12.9.1.4. `cublasLt.h:926` defines
+`CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F = 3` — "vectors are expected to have M and N elements
+respectively, and each (i,j)-th element of product of A and B is multiplied by i-th element of A
+scale and j-th element of B scale" — selected via `CUBLASLT_MATMUL_DESC_A_SCALE_MODE` (31) /
+`_B_SCALE_MODE` (32). The enum exists only from CUDA 12.8, and cuBLAS 12.9 enables outer-vector
+(channel-wide) FP8 scaling **on Hopper**.
+
+That is exactly plow's scheme. `packet/src/dev.rs:326` documents `GemmFp8` as
+`t3=a_scale(f32[M])`, `t4=w_scale(f32[N])`, dequantised `acc*a_scale[m]*w_scale[n]` in the epilogue —
+per-token activation scale, per-output-channel weight scale. And the existing BF16 Lt plan
+(`plowrt/src/device/cuda/lt.rs:207-260`) already passes the WEIGHT as Lt's A with `TRANSA=OP_T` and
+the ACTIVATION as Lt's B, so in Lt's terms `M_Lt = n` and `N_Lt = m`. OUTER_VEC therefore wants an
+A-scale of n elements and a B-scale of m elements — `w_scale[N]` and `a_scale[M]`, bit for bit, in
+the layout the packet already carries. **Zero re-quantization, no checkpoint change, no scale-layout
+change.** FP8 on Hopper requires TN, which the Lt plan already sets, and every 12B/26B K is a
+multiple of 16.
+
+Per shape: qkv/o_proj and unfused gate/up/down are EXPRESSIBLE AS-IS. The fused `GemmGluFp8` is not
+expressible as one Lt call (Lt has no GLU epilogue) but is expressible as two Lt calls plus a Glu
+pass — which is precisely the arrangement `LT_GLU_QUALIFIED` already measured as the BF16 winner.
+The 26B grouped expert GEMMs are NOT expressible today: the grouped path uses an optionally-loaded
+`cublasLtGroupedMatrixLayoutCreate` and plow's expert scales are per-expert `[128,N,1]`. Decode at
+M=1 is expressible in principle but Hopper FP8 Lt kernels are tile-shaped for N>=8, so the heuristic
+may return no algo — that one must be measured.
+
+### There is already an in-tree measurement, and it points the same way
+
+`runtime/nvidia/op_gemm_sm90.cuh:1303`: "cuBLASLt fp8 measures **1324-1468 TF/s** at the 12B shapes
+on this box vs the 256-thread uniform body's **950-1170**: the missing structure is a DEDICATED
+producer warpgroup." `docs/bringup/07-perf-campaign.md:221` records fp8 1324-1468 vs bf16 804-861.
+So Lt FP8 was benchmarked on these exact shapes on this box and beat plow's then-current W8A8 body
+by ~35% — that measurement is what motivated building WS384. **Whether WS384 closed the gap is
+unmeasured**, and that is now the pivotal Phase 1 question rather than a speculative one.
+
+Stale comment worth fixing: `runtime/bench/nvidia/px9_gemm_body_bench.cu:499` says "Per-tensor
+scales (cuBLASLt has no per-row scale)". True when written, false under 12.9, and probably why
+nobody revisited this.
+
+### Correction: the FP8 deficit is the missing Lt route, NOT fusion
+
+I told both agents "FP8 necessarily runs the fused-GLU arm that LT_GLU_QUALIFIED measured as
+slower". That is wrong except at one bucket. Verified independently
+(`$CLAUDE_JOB_DIR/tmp/sched/glu_by_bucket.py`): `GemmGluFp8` = 48 at bucket **4096 only**, and 0 at
+every other bucket, in BOTH p12fp8a and p12fp8b; every other bucket runs `GemmFp8` x192 plus a
+separate `Glu` x48. The role object is `gemm_glu_w8a8_sm90_gemma4_4k8k_v2` — "4k8k" is literal.
+
+So at almost every rung FP8 ALREADY runs the split structure BF16 prefers; it just runs it on
+plow-native kernels instead of Lt. The accurate statement is that BF16 sends all 336 projection
+GEMMs per chunk to Lt at every shipped rung and FP8 sends zero.
+
+### A decode route gap nobody had written down
+
+FP8 has no `GemvQkvFp8` arm. BF16 decode fuses q+k+v into one `GemvQkv` launch per sliding layer
+(i=(1,4096,3840,2048) x40 on the 12B); FP8 issues three separate `GemvFp8` launches —
+`(4096,3840)` x40 plus `(2048,3840)` x80. That is **+80 GEMV launches per token** on the 12B,
+entirely independent of any Lt question, and it may be a large part of whatever FP8 decode deficit
+gets measured. The 26B is the same (BF16 l26 has `GemvQkv` x77).
