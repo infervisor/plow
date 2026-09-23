@@ -4714,3 +4714,40 @@ already lost a day to a cross-session artifact; see [[greedy-equivalence-needs-a
 **Decision: leave the shipped `PLOW_PF_INTERLEAVE = "0"` alone.** It does not win a cell, and
 moving it trades three metrics for one. Revisit only if TPOT at C4 comes down enough that p99
 stops being gated by it.
+
+## 12B C16 serving column, paired (2026-09-23T22) — and the unified verdict
+
+high_concurrency profile (MULTISTEP 0, DECODE_MAX_RUNG 16, TOKEN_BATCH 1), 64 prompts, p12rw.
+
+| cell | TTFT p/v | TPOT p/v | p99 ITL p/v | tok/s p/v | win |
+|------|----------|----------|-------------|-----------|-----|
+| 128/C16   | **73.39**/100.06    | 11.74/11.04 | 12.41/12.23 | 1304.9/1361.8 | 1/4 |
+| 1024/C16  | **312.74**/412.86   | 16.26/13.84 | 166.21/28.69 | 857.3/941.5  | 1/4 |
+| 4096/C16  | **656.23**/1165.22  | 30.27/22.84 | **194.03**/329.20 | 451.7/502.3 | 2/4 |
+| 8192/C16  | **1268.96**/2025.04 | 49.73/37.59 | **204.52**/344.69 | 267.9/300.2 | 2/4 |
+| 15000/C16 | **2919.36**/3095.20 | 83.24/68.06 | **225.52**/377.06 | 150.3/173.8 | 2/4 |
+
+### THE SCOREBOARD across all 20 cells paired in one session
+
+| metric | cells won |
+|--------|-----------|
+| TTFT   | **15 / 20** |
+| p99 ITL| **14 / 20** |
+| TPOT   | 3 / 20 |
+| out_tok_s | 3 / 20 |
+| **all four (4/4)** | **3 / 20** — 12B 128/C1, 1024/C1, 4096/C1 |
+
+**One conclusion, and it is the same in every column: TTFT is won comprehensively and decode is
+the entire remaining problem.** plow leads TTFT by 30-44% at C4 and C16 (656 vs 1165 ms at
+4096/C16) while losing TPOT at 17 of 20 cells. And because at every concurrency
+`out_tok_s ~ N*outlen*1000/(TTFT + (outlen-1)*TPOT)`, the 127x weight on TPOT means tok/s simply
+follows TPOT down — tok/s is not an independent target, it is a TPOT readout.
+
+So the campaign does not need more scheduling knobs or prefill work. It needs decode:
+* 12B C1 8192/15000 — TPOT slope vs context ~13x vLLM's, crossing at ~6-7k.
+* 12B C4/C16 — batched decode. plow's pure B=4 batching penalty is ~7x vLLM's (+0.27 vs +0.04).
+* 26B everywhere — decode at 41% of the memory roof vs the 12B's ~70% (vLLM ~45%).
+
+The prefill levers are now exhausted at the config level: PF_INTERLEAVE is a confirmed null,
+the rung planner is fixed, and MULTISTEP staleness is fixed. What remains on prefill is kernel
+work (#66, #67) which buys TTFT we already win.
