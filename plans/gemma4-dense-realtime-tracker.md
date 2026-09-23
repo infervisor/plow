@@ -2937,3 +2937,39 @@ step, not a kernel. Ranked by how much of the remaining gap each would close:
 Note the flattering C32 TPOT numbers (plow 50.7 vs vLLM 67.5 at 8192) are a SYMPTOM of this:
 plow's decode runs uncontended in its own slice of the timeline, so each step is fast while
 fewer steps happen. Judge throughput by out_tok_s and effective streams, never by TPOT alone.
+
+
+### Correction: the CUDA token-batch route DOES exist and DOES fire
+
+The section above cited `docs/arch/17-unified-token-batch.md:20` ("CUDA has no token-batch
+executor yet") to conclude plow cannot mix prefill and decode on H100. **That doc line is stale.**
+`crates/plowrt/src/exec/gpu/token_batch.rs` (572 lines) is a CUDA unified-token-batch route, and
+the C32 serve log shows it loading and firing:
+
+```
+token-batch route status route="unified-token-batch" backend="cuda" ready=true fires=false
+      reason="packed-prefill and compact-output capabilities loaded"
+token-batch route fired  route="unified-token-batch" backend="cuda" ready=true fires=true
+      requests=1 rows=39
+```
+
+`CudaTokenBatch::load` gates on `token_batch && !fusion && cc == (9,0) && packed_prefill &&
+has_packed_terminal && recurrent.is_none() && mixed_step.is_none()`, and the c32-16k recipe sets
+`PLOW_TOKEN_BATCH = "1"`. So the capability is present and engaged; it is `exec::mixed_program`
+(the AMD v1 path) that is `#[cfg(feature = "hsa")]`, not the CUDA route.
+
+**So the measured 55-58% vs 90-97% prefill share is NOT "plow cannot mix".** Both stacks batch
+decode and both can carry prefill and decode in one pass. The open question is why plow's mix
+degrades with input length while vLLM's tightens. What the data pins down:
+
+* effective streams plateau at ~13 at 8192 whether C16 or C32 is requested, but reach 23.3 at
+  4096 on the same packet;
+* memory allows 32 live slots at 8192 (58.4 GiB of 80);
+* the KV admission budget allows it (`max_rows=794890` against 262144 needed);
+* `mux capacity resolved ... capacity=32`.
+
+None of the static gates explain it, so it is a per-step selection effect. The route already
+carries the instrumentation for exactly this: `PLOW_STEP_TIME=1` makes `token_batch.rs`'s
+`steptime` module log `steps`, `rows_total`, `enqueue_ms` and `terminal_ms` as rolling means.
+The "token-batch route fired" line is one-shot, so batch sizes cannot be recovered from existing
+logs — this needs a fresh instrumented run at 8192/C32 on a 32-slot 16k packet.
