@@ -3175,3 +3175,74 @@ for the concurrent-prefill count rather than the slot count would buy a 4x large
 chunk at today's 20 GiB. That is a real design lever and the measured number to size it with is
 3.14, but it is an allocator change, not a knob, and nothing in the current packet format
 expresses it.
+
+
+### Adaptive interleave loses at C32; serve-policy auto wins slightly; the ~13 plateau is undersized launches
+
+Two runtime knobs measured on p12rq at C32, one variable each, `high_concurrency` profile
+otherwise unchanged.
+
+**`PLOW_PF_INTERLEAVE_ADAPTIVE=1`.** The `high_concurrency` profile has never set it (only
+`realtime` does), so this is its first C32 measurement.
+
+```
+  in      TTFT ms          TPOT ms        p99 ITL          tok/s          eff
+          adapt / off      adapt / off    adapt / off      adapt / off    adapt / off
+  1024    590.8 /  587.8   25.92 / 24.27   76.7 / 179.0   1016.4 / 1093.3  26.3 / 26.5
+  4096   2139.9 /    --    53.84 /  --    163.1 /  --      430.6 /  --     23.2 /  --
+  8192   7913.7 / 4425.3   57.80 / 82.06  164.1 / 206.3    240.4 /  269.1  13.9 / 22.1
+ 15000  18356.0 /    --    66.18 /  --    178.6 /  --      131.7 /  --      8.7 /  --
+```
+
+It loses, and `policy.rs:91` says why in its own doc comment: "the oldest prompt runs whole and
+later ones join only while that is cheaper. It wins when a few prompts arrive together and **loses
+when the queue is deep enough that filling the launch matters more**." At C32 with 64 prompts the
+queue is never shallow. TTFT nearly doubles at 8192 and effective streams fall 22.1 -> 13.9.
+Under `PLOW_SERVE_POLICY=auto` the runtime already deselects it at this width
+(`adaptive_packing` = `class() == Realtime`), which is the correct behaviour and is now measured
+rather than assumed.
+
+What it does buy is interval smoothness: p99 ITL 76.7 vs 179.0 at 1024 (2.3x better) and 164.1 vs
+206.3 at 8192. So it is a real latency/throughput trade, not a bad knob — but the campaign goal is
+scored on all four metrics, and it loses two of them badly.
+
+**`PLOW_SERVE_POLICY=auto`** (default `pinned`) picks the class per tick from decode width and
+queue depth. It beats the pinned baseline on ALL FOUR at 8192, narrowly:
+
+```
+            TTFT ms   TPOT ms   p99 ITL    tok/s   peak GiB
+  pinned    4425.32    82.060    206.28    269.1     51.11
+  auto      4362.25    81.060    203.87    272.4     51.11
+```
+
+and the log shows it working rather than sitting on a default:
+
+```
+  serve policy: profile switched from=HighConcurrency to=Realtime      width=1  queued=0
+  serve policy: profile switched from=Realtime to=HighConcurrency      width=32 queued=0
+```
+
+Against vLLM 0.28 at C32 it stands:
+
+```
+  in       TTFT ms         TPOT ms        p99 ITL          tok/s         eff
+           auto / vLLM     auto / vLLM    auto / vLLM      auto / vLLM
+  8192    4362 / 3658     81.1 / 67.5    203.9 / 353.9   272.4 / 332.2  22.1 / 22.4
+ 15000    8741 / 6434    140.6 / 123.3   218.2 / 383.8   149.8 / 183.9  21.1 / 22.7
+```
+
+Still behind on TTFT/TPOT/throughput by 14-36% and ahead on p99 ITL by 43%.
+
+**The unifying observation.** `base_ad` at 8192 lands at effective streams **13.9**. The
+chunk-1024 32-slot packet landed at **13.6** at the same cell. Those are different causes —
+adaptive shrinks a launch by heuristic, the chunk-1024 packet shrinks it by construction — with
+the same effect: prefill launches too small for the standing queue. The ~13 plateau recorded
+earlier as evidence of a per-step row-selection defect is nothing of the kind; it is the
+signature of undersized prefill launches, and it reproduces on demand by shrinking them. That
+retires the "per-step selection" hypothesis for good.
+
+**Harness note.** The first rc2048 bench produced an empty results CSV: the packet had been built
+with the job killed mid role-emit, so `assets/build.json` existed while `weights.json` did not and
+the serve died with `Io { path: ".../weights.json", NotFound }`. `build.json` is written early and
+is NOT sufficient evidence that an emit finished — check the file set. The campaign's coherence
+gate caught it ("numbers above are not evidence"), so nothing false was recorded.
