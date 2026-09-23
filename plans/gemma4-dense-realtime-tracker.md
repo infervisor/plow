@@ -1947,3 +1947,67 @@ of 0 vs 2048 is a wash on 40 cells, so neither value is clearly right.
 Each flip needs a checkpoint-P certificate or the merge gate fails, and a knob the verifier rejects
 goes back to opt-in. Certificates are measured with the arm value pinned explicitly, so they stay
 valid whichever way the registry points; the registry is only flipped for knobs that pass.
+
+## FP8 campaign: the dtype gate silently drops production defaults
+
+Verified in code, 2026-09-23, while briefing the FP8 agents.
+
+`apply_production_defaults` (`crates/devgen/src/lib.rs:7568`) gates the entire GEMMA4_HOPPER
+block on `bf16 && capabilities.gemma && capabilities.full_attn_hd512 && arch == "sm_90a" && tp == 1`.
+Any FP8/W8A8/W8A16/MXFP4 emit therefore ships WITHOUT `sliding_ns_grid`, `sliding_ns_cap`,
+`gemv_prefetch` (dense) / `moe_pf_lt` + `moe_dec_lt` + `gemma_moe_dec_group=4` (MoE),
+`attention_decode_balance_gf=4`, `seg_fa512`, `seg_fa256_gqa2` — with no assert and no warning.
+The `prefill_cublaslt` / `no_glu_fuse` pair at :7557 is gated the same way, but those two have no
+FP8 equivalent (`lib.rs:7956` hard-asserts cuBLASLt prefill off the BF16 path), so their absence is
+correct; W8A8 uses the fused GLU role instead.
+
+Three of the dropped knobs are genuinely dtype-irrelevant — attention runs BF16 either way because
+`kv_cache_scheme` is null in both FP8 checkpoints. `gemv_prefetch` is NOT: it is the decode GEMV L2
+prefetch, its comment records it as measured on the dense 12B in BF16, and under W8A16 decode the
+GEMV reads FP8 weight bytes, i.e. half the footprint the prefetch distance was tuned against. It
+must be A/B'd on an FP8 packet, not restored on the assumption that dtype does not reach it.
+
+The same silent-gate shape appears in the decode emitter: the grouped MoE decode arm
+(`gemma_moe_dec_group` / `moe_dec_lt`, `lib.rs:6083-6100`) exists only in the bf16 branch, so a 26B
+FP8 packet falls back to per-slot `MoeExpertGluGemmaFp8` GEMV with no `MoeAlignGemmaPf` and no
+diagnostic.
+
+Fixed for the campaign at the RECIPE level, not in the gate: flipping a production default needs a
+checkpoint-P certificate, and it would have to be certified on an FP8 cell that does not exist yet.
+Whether the gate should key on family+arch rather than dtype for the attention-only knobs is a
+follow-up for the user, with the above as evidence.
+
+### FP8 emit limits found (26B-A4B)
+
+* W8A8 emit succeeds: 2.5 min CPU, 24.8 MB packet, 610+610 `MoeGroupGluGemmaPfW8a8` /
+  `MoeGroupDownGemmaPfW8a8` prefill ops. `perf-data/tools/quantize_fp8.py` already handles the
+  fused `experts.gate_up_proj` / `down_proj`.
+* It only emits with `PLOW_EMIT_PACKED_PREFILL` UNSET. With it on, emit panics two ways at
+  `lib.rs:9774`: with `TMA_GEMM=1`, "FP8 GEMM tensor-map operands disagree with direct operands:
+  GemmFp8"; with `TMA_GEMM=0`, "opcode has no audited direct-operand access contract:
+  MoeGroupGluGemmaPfW8a8". So a 26B FP8 packet cannot carry packed prefill today.
+
+### max_ctx is a ceiling, not a bind
+
+`plowc --max-ctx` still sizes `in.pos` (which IS the runtime's bound, `gpu.rs:4955`), the
+full-attention KV caches (`kv_ring` returns `(ctx, MASK_NONE)` only for `window == 0`; sliding
+layers ring at `next_pow2(window + chunk - 1)`, ctx-independent — so on Gemma-4's 5:1 pattern ctx
+sizes one layer in six), and clamps the rung ladder (`appended_rungs` caps at
+`ctx.min(max_chunk(window))`).
+
+But the runtime re-declares it at load (`crates/plowrt/src/exec/ctx_bound.rs`, entered at
+`gpu.rs:3337-3392`). `PLOW_LIVE_CTX` narrows (mature; `devgen::mla::ctx_bound_tests` asserts a
+narrowed 1M-ceiling GLM emit equals a native one) or widens (v1, NV-dense only, requires
+`PLOW_VMM_LIVE=1` or `PLOW_VMM_PREFIX=1`; `crates/plowrt/tests/differential_widen.rs` widens 12B
+8k->32k and asserts instruction-level equality with a native 32k emit). Widen refuses on DSA/indexer
+ops, on `widest prefill bucket == ceiling` (the ladder was ctx-clamped), on
+`ceiling < kv_ring_rows(window, chunk)`, on baked (non-recipe) RoPE, and on any cache with no
+scaling rule.
+
+`PLOW_RT_MAX_CTX` only LOWERS: `gpu.rs:3395` rejects `rt_ctx > packet_max_ctx` outright, and
+`gpu.rs:4956` clamps with `.min(packet_max_ctx)`.
+
+Neither `rt.live_ctx` nor `rt.vmm_live` is set by any recipe, and the widen test skips unless local
+packets or the hf-cache are present — so this campaign has never exercised widening. For the FP8
+arm we re-emit at `max_ctx = 16384` instead, because widening swaps the KV allocator to VMM and
+would break apples-to-apples against a BF16 arm on contiguous rings.
