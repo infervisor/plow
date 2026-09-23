@@ -1,0 +1,233 @@
+{
+  "label": "p12rq",
+  "preserved_at": "2026-09-23T12:44:00+00:00",
+  "preserved_from": "/opt/dlami/nvme/tmp/agent-geom/p12rq",
+  "preserved_at_commit": "1cca8979934bb2039374090d86190f47c1a8d00d",
+  "preserved_at_commit_is_build_commit": false,
+  "tree_dirty_at_preservation": true,
+  "build_mtime": "2026-09-21T16:49:54+00:00",
+  "recipe": "scripts/campaign/recipes/gemma4-12b.h100.bf16-l8192-16k.toml",
+  "recipe_match": {
+    "agreeing_keys": 12,
+    "recipe_keys_absent_from_packet": [
+      "PLOW_SEG_FA512",
+      "PLOW_SEG_FA256_GQA2"
+    ],
+    "packet_keys_absent_from_recipe": [
+      "PLOW_GEMMA4_SM90_HD256_GQA2_ROLE"
+    ]
+  },
+  "recipe_overrides": {
+    "PLOW_DECODE_BATCH_LADDER": "1,2,4,8,16,32",
+    "PLOW_GEMMA4_SM90_HD256_GQA2_ROLE": "1",
+    "PLOW_MAX_CHUNK": "4096",
+    "PLOW_MAX_REQUEST_CHUNK": "1024",
+    "PLOW_PF_LADDER_APPEND": "256,1088,1152"
+  },
+  "cell": {
+    "name": "gemma4-12b.h100.bf16-l8192-16k",
+    "model": "google/gemma-4-12B-it",
+    "revision": "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+    "gpu": "H100 SXM5",
+    "arch": "sm_90a",
+    "n_cu": 132,
+    "max_ctx": 16384,
+    "precision": "bf16"
+  },
+  "arch": "sm_90a",
+  "n_cu": 132,
+  "shapes": {
+    "hd": [
+      256,
+      512
+    ],
+    "kv_heads": [
+      1,
+      8
+    ],
+    "gqa": 16,
+    "decode_batch": 32,
+    "kv_dtype": {
+      "hd256": "bf16",
+      "hd512": "bf16"
+    },
+    "max_chunk": 4096,
+    "prefill_buckets": [
+      128,
+      256,
+      512,
+      1024,
+      1088,
+      1152,
+      2048,
+      4096
+    ],
+    "moe_enc": [],
+    "moe_prefill_ep": []
+  },
+  "precision": {
+    "weight_enc": "bf16",
+    "act_enc": "bf16",
+    "kv_enc": "bf16",
+    "expert_enc": "none"
+  },
+  "features": {
+    "prefill": true
+  },
+  "emit_env_replay": {
+    "PLOW_ATTENTION_DECODE_BALANCE_GF": "4",
+    "PLOW_DECODE_BATCH_LADDER": "1,2,4,8,16,32",
+    "PLOW_EMIT_PREFILL_CUBLASLT": "1",
+    "PLOW_FA_MMAQK": "3",
+    "PLOW_FUSE_ARGMAX": "1",
+    "PLOW_GEMMA4_SM90_HD256_GQA2_ROLE": "1",
+    "PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE": "0",
+    "PLOW_MAX_CHUNK": "4096",
+    "PLOW_MAX_REQUEST_CHUNK": "1024",
+    "PLOW_NO_FUSE_NRN": "1",
+    "PLOW_NO_GLU_FUSE": "1",
+    "PLOW_NS_FULL_ABS": "66",
+    "PLOW_PF_LADDER_APPEND": "256,1088,1152",
+    "PLOW_SEG_PURE_GEMM": "1",
+    "PLOW_SLIDING_NS_CAP": "1",
+    "PLOW_SLIDING_NS_GRID": "1",
+    "PLOW_TMA_GEMM": "1"
+  },
+  "unrecorded_env": {
+    "PLOW_UNISEG": "0",
+    "PLOW_SEG_FA256_GQA2": "1",
+    "PLOW_SEG_FA512": "1",
+    "PLOW_SEG_PURE_GEMM": "1"
+  },
+  "tuning": {
+    "gv_mm_max": 32,
+    "xreg_k": [
+      3840,
+      4096,
+      8192,
+      15360
+    ],
+    "gemv_mma_b1": 1,
+    "gemv_mma_pair": 1,
+    "fa_spart": 8,
+    "fa_tc_hd512": 1,
+    "gf_full": 8,
+    "fa_mmaqk": 3
+  },
+  "registry_digest": "29252ee3cf8c4e7158f87b3746ebcce15946f2744845b4d6c981d8b946ef6939",
+  "knobs_K": "verified",
+  "lean": {
+    "verified": true,
+    "oracle": true,
+    "rewrite_verified": true,
+    "reason": null,
+    "note": "`verified` = a Lean ordering certificate (plow_verify checkpoint D) was obtained for EVERY program in this blob; `rewrite_verified` = egglog rewrite rule soundness (checkpoint A) verified; `oracle` = the Lean decode lower-bound query ran. false means NOT CHECKED (see `reason`), never `checked and rejected` \u2014 a rejection aborts emission, so a blob with a rejected program never reaches disk and has no manifest.",
+    "modular_summary": {
+      "all_correctness_verified": true,
+      "all_performance_certified": true,
+      "total_critical_path_cycles": 6888,
+      "total_lower_bound_us": 102997.75151515157,
+      "blocks_verified": 14,
+      "total_blocks": 14
+    }
+  },
+  "artifacts": [
+    {
+      "name": "attn_softmax_sm90a.cubin",
+      "bytes": 57816,
+      "sha256": "f75c3849f69891a48fd20366fcf80316d2e18dad3088f143ce5cd1ddc3981aae"
+    },
+    {
+      "name": "build.json",
+      "bytes": 7667713,
+      "sha256": "49c8c434dbe47e91ded7aff01aba44eef3bef40e3f53342d489c6c8a7327e7d4"
+    },
+    {
+      "name": "cublaslt_algos.jsonl",
+      "bytes": 17237,
+      "sha256": "4b4a984dcccd5aaa9cbdc0eda75efbf2edcec6dde0246f41fa2f622350ed7d02"
+    },
+    {
+      "name": "interp_sm90a.cubin",
+      "bytes": 2067848,
+      "sha256": "7ae4a809dc38fc15859505366e0a86ab8bfd05b4290e1611edbb5823736e92aa"
+    },
+    {
+      "name": "interp_sm90a_pf.cubin",
+      "bytes": 875896,
+      "sha256": "0f9ec858e7b3e39098c45ed4567b982a856b02b99e7c621ba3517f5aec930c58"
+    },
+    {
+      "name": "interp_sm90a_pfattn_hd256_bkv32.cubin",
+      "bytes": 95600,
+      "sha256": "05d8a9fe951933068cabe9b6c93b51d048e38ccab0b5676a4985990b58fe6905"
+    },
+    {
+      "name": "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+      "bytes": 212304,
+      "sha256": "0a456fcb0c95f67812a740580bd17ce560aabe3e9bb0c8f90f30feae991ae971"
+    },
+    {
+      "name": "interp_sm90a_pfattn_hd512.cubin",
+      "bytes": 91632,
+      "sha256": "132dfbb827105d0ba638f292ba912801e9be8d2fbd69286b972db8f95b726919"
+    },
+    {
+      "name": "interp_sm90a_pfattn_hd512_px4_bq64.cubin",
+      "bytes": 113616,
+      "sha256": "604699f84fc3bd775654c10044b580198a7fea90f16e56c1aaa62d2588f61d3e"
+    },
+    {
+      "name": "interp_sm90a_pfgemm.cubin",
+      "bytes": 472312,
+      "sha256": "42aa58e0a70e638065e93678b54bf1353f4d91e6e401c1d90511421a64a436cb"
+    },
+    {
+      "name": "interp_sm90a_pfgemm_glu_gemma4.cubin",
+      "bytes": 52608,
+      "sha256": "b878067e8267d13dd173f0654e0bc5e833535e3f4d2568565d8e131551f7bf6d"
+    },
+    {
+      "name": "interp_sm90a_pfgemm_w8a16_m1.cubin",
+      "bytes": 220648,
+      "sha256": "c20cfcb39fbe12594c6b777c25092e503d2d0761dccf32bb9a37b36f18555098"
+    },
+    {
+      "name": "interp_sm90a_pfpackedgemm.cubin",
+      "bytes": 423224,
+      "sha256": "ba2161218779f3f4e12b993eb4455e3926e0eed69d8d91f89fdccf538b4e516e"
+    },
+    {
+      "name": "interp_sm90a_pfpackedseg.cubin",
+      "bytes": 1024696,
+      "sha256": "8524f9aa0e72854caf00cd65e0e60ecc71f1de4f6a5d8fa38ea630487276a4f0"
+    },
+    {
+      "name": "interp_sm90a_pfseg.cubin",
+      "bytes": 876152,
+      "sha256": "b269b1b795197b858bc32328910ed877d381e9492fed4083c7549d09cc33afe8"
+    },
+    {
+      "name": "model.pkt",
+      "bytes": 44222188,
+      "sha256": "ccefa77e47652179b983759e2da6692eb5b27f83cb56c33e5525759ae9dd11fa"
+    },
+    {
+      "name": "plow_config.h",
+      "bytes": 74325,
+      "sha256": "5962c276b4c912cddf497814dc37b5e30c2dbd9aa87096b8c2238abb6da7f551"
+    },
+    {
+      "name": "sample_sm120.cubin",
+      "bytes": 26680,
+      "sha256": "539269c9bd6d9747e3a6653bfe66395134c2e8bb59bbe859e351512c90269b48"
+    },
+    {
+      "name": "weights.json",
+      "bytes": 300,
+      "sha256": "e3f14d9636f013860763698497d8119561d05c4ded882f5c90d25b6ac78e9638"
+    }
+  ],
+  "rebuild_command": "nix develop --command python3 scripts/campaign/campaign.py build scripts/campaign/recipes/gemma4-12b.h100.bf16-l8192-16k.toml --out <dir> --no-probe --env PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32 --env PLOW_GEMMA4_SM90_HD256_GQA2_ROLE=1 --env PLOW_MAX_CHUNK=4096 --env PLOW_MAX_REQUEST_CHUNK=1024 --env PLOW_PF_LADDER_APPEND=256,1088,1152",
+  "note": "Recreate: run rebuild_command, then verify registry_digest, tuning and shapes match this record -- a mismatch means the tree moved under you, which is the signal to check out a commit near build_mtime and retry. tuning/ in the repo supplies the shape constants; cublaslt_algos.jsonl beside this file is the packet's own probe result, which --no-probe reuses. recipe/recipe_overrides are DERIVED by matching emit_env_replay against the recipes present today, so recipe_match.agreeing_keys and the *_absent_from_* lists say how much to trust them; emit_env_replay + unrecorded_env are the ground truth."
+}

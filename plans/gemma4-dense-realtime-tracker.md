@@ -3304,3 +3304,54 @@ which is the KV-traversal gap already characterised in the metric-fingerprints n
 That also means the prefill levers are close to exhausted on this model: decode rows already ride
 at ~20/pack, launches already fill their bucket 109/177, the ring is free, and the chunk has now
 been raised as far as memory allows. What is left is the decode kernel.
+
+
+### RETRACTION: the req_chunk 2048 result is a cross-packet delta, not a chunk effect
+
+The section above reports "req_chunk 2048 lands" with 8192/C32 TTFT -13.6% and effective streams
+22.1 -> 23.2, on the stated basis that rc2048 is "one variable off" req1024. **It is not.** The
+baseline those deltas are taken against is packet `p12rq`, and a `build.json` env diff
+(`replay` + `unrecorded_env`) puts the two **ten keys apart**:
+
+```
+  (unrec)PLOW_SEG_FA256_GQA2          1  ->  —
+  (unrec)PLOW_SEG_FA512               1  ->  —
+  (unrec)PLOW_SEG_PURE_GEMM           1  ->  —
+  PLOW_ATTENTION_DECODE_BALANCE_GF    4  ->  —
+  PLOW_EMIT_PREFILL_CUBLASLT          1  ->  —
+  PLOW_NO_GLU_FUSE                    1  ->  —
+  PLOW_SEG_PURE_GEMM                  1  ->  —
+  PLOW_SLIDING_NS_CAP                 1  ->  —
+  PLOW_SLIDING_NS_GRID                1  ->  —
+  PLOW_MAX_REQUEST_CHUNK           1024  ->  2048
+```
+
+`p12rq` predates the current `c32-req1k-16k` recipe and carries six recorded knobs and three
+unrecorded `PLOW_SEG_*` flags that rc2048 does not. `PLOW_SLIDING_NS_GRID` and
+`PLOW_EMIT_PREFILL_CUBLASLT` are both known perf levers with their own certificates. So the
+-13.6% cannot be assigned to the chunk.
+
+**What survives:** rc2048's absolute cells are valid measurements of rc2048 (8192/C32 TTFT
+3822.43, TPOT 84.120, p99 ITL 205.22, tok/s 276.0, peak 71.10 GiB; 15000/C32 7254.35 / 147.610 /
+228.01 / 153.8 / 73.10 GiB). In particular **ring 4096 x 32 slots FITS at 15000** — 73.10 GiB of
+80 — which refutes this document's own ~92 GiB estimate independently of any A/B, because it is a
+single measured number, not a difference. The residency-bound correction stands.
+
+**What does not:** every delta quoted against req1024, and the claim that the chunk is worth ~8%.
+
+The control arm is now building: `rc1024`, the same recipe with NO override, so rc1024 vs rc2048
+differs in exactly `PLOW_MAX_REQUEST_CHUNK`. The script asserts that before benching.
+
+**This is the third time this session that a cross-packet delta was reported as a single-variable
+result** — first `GV_MM_MAX` (0.23-0.37 ms "tax" that a real A/B put at 0.7%), then the ring tax
+in two recipe headers, now this one, and this one is mine. The ring A/B itself was re-verified by
+the same method and IS clean: `ab_r2048` vs `ab_r4096` differ in exactly one key
+(`PLOW_MAX_CHUNK`), identical `tuning` block, identical `registry_digest` — so the ring refutation
+above is unaffected.
+
+**Process fix, not a resolution to be more careful.** `build.json` already carries everything
+needed to catch this: `emit_config.replay` (the env that reproduces the build) plus
+`emit_config.unrecorded_env` (env read outside `EmitConfig`). Diffing those two between the arms
+takes a second and is now a preserved tool rather than an intention — see the packet preservation
+record below. No A/B in this campaign should be quoted again without that diff printed alongside
+it.

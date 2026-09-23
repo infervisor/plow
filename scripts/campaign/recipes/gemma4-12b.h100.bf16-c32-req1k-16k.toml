@@ -6,16 +6,20 @@
 # still runs 1024 rows per launch (8192 in = 8 launches), which is the price of the small ring.
 #
 # CORRECTION (2026-09-23): "the price of the small ring" was believed to be decode time. It is not
-# — a single-variable ring A/B is flat to 0.6% (op_attention.cuh:772-779 walks min(kv_len, window);
-# kv_stride is only a base address at :795). The ring costs RESIDENCY. Measured at C32 with
-# PLOW_MAX_REQUEST_CHUNK=2048 (ring 4096, packet rc2048), one variable off this recipe:
-#   8192:  TTFT 4425 -> 3822 ms (-13.6%), tok/s 269.1 -> 276.0, eff streams 22.1 -> 23.2
-#   15000: TTFT 7254 ms, eff 22.7, peak 73.1 GiB of 80 — it FITS, contrary to the ring arithmetic's
-#          ~92 GiB estimate, which bounds reserved rows rather than resident pages
-#   1024:  indistinguishable from req 1024
-# Cost is +20 GiB peak (51 -> 71 at 8192). 2048 is the better default here on three of four metrics;
-# it is not adopted in this file only because the recipe is named for req1k and the change wants its
-# own packet + perf cert. See plans/gemma4-dense-realtime-tracker.md.
+# — a single-variable ring A/B (ab_r2048 vs ab_r4096, verified 1 differing build key, identical
+# registry digest) is flat to 0.6%, and op_attention.cuh:772-779 walks min(kv_len, window) while
+# kv_stride is only a base address at :795. No loop bound reads the ring. The ring costs RESIDENCY,
+# not decode time.
+#
+# What raising the per-request chunk is worth here is NOT yet established. A packet built from this
+# recipe with PLOW_MAX_REQUEST_CHUNK=2048 measured 8192/C32 TTFT 3822 ms / tok/s 276.0 / eff 23.2
+# and 15000/C32 at peak 73.1 GiB (so ring 4096 x 32 slots FITS, contrary to the ~92 GiB estimate —
+# that sum bounds reserved rows, not resident pages). But the 4425 ms it was compared against came
+# from packet p12rq, which a build.json env diff shows differs in TEN keys, not one:
+# PLOW_SLIDING_NS_GRID, PLOW_SLIDING_NS_CAP, PLOW_EMIT_PREFILL_CUBLASLT, PLOW_NO_GLU_FUSE,
+# PLOW_ATTENTION_DECODE_BALANCE_GF, PLOW_SEG_PURE_GEMM and three unrecorded PLOW_SEG_* flags are all
+# on p12rq and absent here. p12rq predates this recipe. The control arm is a build of THIS recipe
+# with no override; see plans/gemma4-dense-realtime-tracker.md for the resolved A/B.
 # Compare: gemma4-12b.h100.bf16-c32-16k.toml (chunk 1024, roles off, 1024-row launches) and
 # gemma4-12b.h100.bf16-ladder16k.toml (16 slots, chunk 4096).
 # Production (C32 traffic, --profile high_concurrency): build and serve as in ladder16k's header.

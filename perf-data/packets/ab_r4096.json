@@ -1,0 +1,196 @@
+{
+  "label": "ab_r4096",
+  "preserved_at": "2026-09-23T12:44:11+00:00",
+  "preserved_from": "/opt/dlami/nvme/tmp/agent-geom/ab_r4096",
+  "preserved_at_commit": "1cca8979934bb2039374090d86190f47c1a8d00d",
+  "preserved_at_commit_is_build_commit": false,
+  "tree_dirty_at_preservation": true,
+  "build_mtime": "2026-09-21T15:01:14+00:00",
+  "recipe": "scripts/campaign/recipes/gemma4-12b.h100.bf16-l8192-16k.toml",
+  "recipe_match": {
+    "agreeing_keys": 10,
+    "recipe_keys_absent_from_packet": [
+      "PLOW_SEG_FA512",
+      "PLOW_SEG_FA256_GQA2",
+      "PLOW_FA_MMAQK",
+      "PLOW_MAX_REQUEST_CHUNK",
+      "PLOW_PF_LADDER_APPEND",
+      "PLOW_NS_FULL_ABS"
+    ],
+    "packet_keys_absent_from_recipe": [
+      "PLOW_GEMMA4_SM90_HD256_GQA2_ROLE"
+    ]
+  },
+  "recipe_overrides": {
+    "PLOW_DECODE_BATCH_LADDER": "1,2,4,8,16,32",
+    "PLOW_GEMMA4_SM90_HD256_GQA2_ROLE": "0",
+    "PLOW_MAX_CHUNK": "2048"
+  },
+  "cell": {
+    "name": "gemma4-12b.h100.bf16-l8192-16k",
+    "model": "google/gemma-4-12B-it",
+    "revision": "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+    "gpu": "H100 SXM5",
+    "arch": "sm_90a",
+    "n_cu": 132,
+    "max_ctx": 16384,
+    "precision": "bf16"
+  },
+  "arch": "sm_90a",
+  "n_cu": 132,
+  "shapes": {
+    "hd": [
+      256,
+      512
+    ],
+    "kv_heads": [
+      1,
+      8
+    ],
+    "gqa": 16,
+    "decode_batch": 32,
+    "kv_dtype": {
+      "hd256": "bf16",
+      "hd512": "bf16"
+    },
+    "max_chunk": 2048,
+    "prefill_buckets": [
+      128,
+      512,
+      1024,
+      2048
+    ],
+    "moe_enc": [],
+    "moe_prefill_ep": []
+  },
+  "precision": {
+    "weight_enc": "bf16",
+    "act_enc": "bf16",
+    "kv_enc": "bf16",
+    "expert_enc": "none"
+  },
+  "features": {
+    "prefill": true
+  },
+  "emit_env_replay": {
+    "PLOW_ATTENTION_DECODE_BALANCE_GF": "4",
+    "PLOW_DECODE_BATCH_LADDER": "1,2,4,8,16,32",
+    "PLOW_EMIT_PREFILL_CUBLASLT": "1",
+    "PLOW_FUSE_ARGMAX": "1",
+    "PLOW_GEMMA4_SM90_HD256_GQA2_ROLE": "0",
+    "PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE": "0",
+    "PLOW_MAX_CHUNK": "2048",
+    "PLOW_NO_FUSE_NRN": "1",
+    "PLOW_NO_GLU_FUSE": "1",
+    "PLOW_SEG_PURE_GEMM": "1",
+    "PLOW_SLIDING_NS_CAP": "1",
+    "PLOW_SLIDING_NS_GRID": "1",
+    "PLOW_TMA_GEMM": "1"
+  },
+  "unrecorded_env": {
+    "PLOW_UNISEG": "0",
+    "PLOW_SEG_FA256_GQA2": "1",
+    "PLOW_SEG_FA512": "1",
+    "PLOW_SEG_PURE_GEMM": "1"
+  },
+  "tuning": {
+    "gv_mm_max": 32,
+    "xreg_k": [
+      3840,
+      4096,
+      8192,
+      15360
+    ],
+    "gemv_mma_b1": 1,
+    "gemv_mma_pair": 1,
+    "fa_spart": 8,
+    "fa_tc_hd512": 1,
+    "gf_full": 8
+  },
+  "registry_digest": "29252ee3cf8c4e7158f87b3746ebcce15946f2744845b4d6c981d8b946ef6939",
+  "knobs_K": "verified",
+  "lean": {
+    "verified": true,
+    "oracle": true,
+    "rewrite_verified": true,
+    "reason": null,
+    "note": "`verified` = a Lean ordering certificate (plow_verify checkpoint D) was obtained for EVERY program in this blob; `rewrite_verified` = egglog rewrite rule soundness (checkpoint A) verified; `oracle` = the Lean decode lower-bound query ran. false means NOT CHECKED (see `reason`), never `checked and rejected` \u2014 a rejection aborts emission, so a blob with a rejected program never reaches disk and has no manifest.",
+    "modular_summary": {
+      "all_correctness_verified": true,
+      "all_performance_certified": true,
+      "total_critical_path_cycles": 4752,
+      "total_lower_bound_us": 72564.66464646465,
+      "blocks_verified": 10,
+      "total_blocks": 10
+    }
+  },
+  "artifacts": [
+    {
+      "name": "build.json",
+      "bytes": 4095967,
+      "sha256": "64e78b2108d4844e9d862854b3c817e2849d746506bfb036860522a6f302dbce"
+    },
+    {
+      "name": "cublaslt_algos.jsonl",
+      "bytes": 8610,
+      "sha256": "26cf5b5532dd0629392f923ea930bb65b802cfcc6bf87a185c200a10da4e0d56"
+    },
+    {
+      "name": "interp_sm90a.cubin",
+      "bytes": 2157576,
+      "sha256": "23da3a1703d7f914b76dab829e9f53502044014f021141270271b690fe66f009"
+    },
+    {
+      "name": "interp_sm90a_pf.cubin",
+      "bytes": 875384,
+      "sha256": "b9f94675b763a74ef3d0d4f7c5529a832e15ff68075686dabb33d077c3f7e9e5"
+    },
+    {
+      "name": "interp_sm90a_pfgemm.cubin",
+      "bytes": 471800,
+      "sha256": "3747afaf4f27590768f8f95aba31d91093526a3df52d8e41f4c74db36da2e55f"
+    },
+    {
+      "name": "interp_sm90a_pfgemm_w8a16_m1.cubin",
+      "bytes": 220648,
+      "sha256": "c20cfcb39fbe12594c6b777c25092e503d2d0761dccf32bb9a37b36f18555098"
+    },
+    {
+      "name": "interp_sm90a_pfpackedgemm.cubin",
+      "bytes": 422456,
+      "sha256": "be5f4292c7dec3a5b539d9ac13d657c397211e787634f0ca70e796154439f27f"
+    },
+    {
+      "name": "interp_sm90a_pfpackedseg.cubin",
+      "bytes": 1024184,
+      "sha256": "2f08f0a5e335ac7c702ab6107de1cb801572463031c506e16fd4591bdc8d777a"
+    },
+    {
+      "name": "interp_sm90a_pfseg.cubin",
+      "bytes": 875640,
+      "sha256": "ed398868f092583939e41d78207a6f0f4fdc2b51bc5fc4d06389baaa3bbb6a7b"
+    },
+    {
+      "name": "model.pkt",
+      "bytes": 28040944,
+      "sha256": "e70f6e38c8e9f72360ecafb60caa6deb99b5340f5948b42c98017819efcde53d"
+    },
+    {
+      "name": "plow_config.h",
+      "bytes": 74195,
+      "sha256": "4c3872c0c334700eddc58f2731d07d107eb2eeb74ec198c4367d33459d5a2157"
+    },
+    {
+      "name": "sample_sm120.cubin",
+      "bytes": 26680,
+      "sha256": "539269c9bd6d9747e3a6653bfe66395134c2e8bb59bbe859e351512c90269b48"
+    },
+    {
+      "name": "weights.json",
+      "bytes": 300,
+      "sha256": "e3f14d9636f013860763698497d8119561d05c4ded882f5c90d25b6ac78e9638"
+    }
+  ],
+  "rebuild_command": "nix develop --command python3 scripts/campaign/campaign.py build scripts/campaign/recipes/gemma4-12b.h100.bf16-l8192-16k.toml --out <dir> --no-probe --env PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32 --env PLOW_GEMMA4_SM90_HD256_GQA2_ROLE=0 --env PLOW_MAX_CHUNK=2048",
+  "note": "Recreate: run rebuild_command, then verify registry_digest, tuning and shapes match this record -- a mismatch means the tree moved under you, which is the signal to check out a commit near build_mtime and retry. tuning/ in the repo supplies the shape constants; cublaslt_algos.jsonl beside this file is the packet's own probe result, which --no-probe reuses. recipe/recipe_overrides are DERIVED by matching emit_env_replay against the recipes present today, so recipe_match.agreeing_keys and the *_absent_from_* lists say how much to trust them; emit_env_replay + unrecorded_env are the ground truth."
+}
