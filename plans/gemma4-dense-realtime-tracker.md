@@ -2254,3 +2254,48 @@ pow2-or-pow2+{64,128} value between 4224 and 7169 (the next power of two, 8192, 
 not fit alongside 23.8 GiB of weights). So every usable wide rung lands in the broken shape class,
 and this defect is now what blocks the prefill lever — and makes pending task #45 (the 8192-row
 launch rung A/B) unrunnable as specified.
+
+### SECOND CORRECTION: the Gemm program deficit is INTENDED fallback, not the defect
+
+The 329 -> 193 Gemm-program split is fully explained, and it is not a bug. `cublaslt_prefill_bf16`
+(`crates/plow-asset/src/segment_roles.rs:71`) admits a shape only if its row count is in a hardcoded
+whitelist:
+
+    CUBLASLT_PREFILL_ROWS      = [128, 256, 512]
+    CUBLASLT_PREFILL_WIDE_ROWS = [1024, 1088, 1152, 2048, 4096, 4160, 4224, 8192, 8320, 12288, 12416, 16384]
+
+The union is EXACTLY the ten healthy rungs of the l12r packet; 1536/2560/3072/3584 are absent. A
+non-whitelisted rung is not Lt-eligible, so `dense_cublaslt::isolate_segments` never splits its
+projections into their own Lt segments — hence 193 rather than 329 — and it runs them on the native
+GEMM object instead. The constant 136 is simply the Lt-eligible projection count, which is why it
+does not vary with rung width.
+
+**That path is supported and known to work.** The comment at `segment_roles.rs:37-40` documents
+exactly this case: "1088 / 1152 / 4160 are fine-grained rungs (`PLOW_PF_LADDER_APPEND`) ... Left
+out, such a rung ran every projection on the native GEMM object. Measured on h100-sxm5 2026-09-21:
+12B C1 TTFT at 1024 in 47.22 -> 46.82 ms on the 1088 rung". So before 1088 was whitelisted it RAN,
+at 47.22 ms. Non-whitelisted means slower, not hung.
+
+So the segment-count difference is a red herring and the earlier entries over-claimed it twice
+(first as a "contiguous tail truncation", then as "a different segmentation path" implying fault).
+**The wedge mechanism remains unidentified.** What is established: an un-whitelisted rung falls back
+to the native GEMM object, and something in that configuration at 2560 rows spins the host at 99.6%
+CPU, where the same fallback at 1088 rows was fine.
+
+Note also that the whitelist ALREADY anticipates wide rungs — 8192, 8320, 12288, 12416, 16384 are in
+it. So Lt policy is not what blocks a wide rung; the KV ring is (a 8192 chunk needs a 16384-row ring
+= 5.0 GiB/slot sliding KV = 80 GiB at 16 slots).
+
+### The discriminating experiment, cheap and not yet run
+
+Build one packet with a rung that is NOT in the whitelist but IS the "safe" shape class — 2112
+(= 2048+64) or 4288 (= 4096+192, if the ring admits it). Then:
+
+* 2112 runs -> "not whitelisted" is NOT sufficient to wedge, and the row count itself is what
+  matters. The native GEMM object has a shape constraint and the fix is in that object.
+* 2112 wedges -> "not whitelisted" IS the trigger, the native-GEMM fallback is broken generally,
+  and the 1088 evidence above means it regressed since 2026-09-21.
+
+Either answer is worth one build and one 15000/C1 cell, and it decides whether widening the ladder
+(the lever for the remaining prefill gap, rungs up to 7169 being free at the current ring) needs a
+whitelist entry, a tuner run, or a kernel fix.
