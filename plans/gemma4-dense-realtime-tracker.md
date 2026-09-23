@@ -3027,3 +3027,82 @@ Consequences, in order of cheapness:
 This is the eighth refuted lever in this campaign and the third that was refuted by making the
 A/B single-variable. The pattern is consistent enough to be a rule: **a number measured across
 two packets is a hypothesis, not a result.**
+
+
+### Decode rows already ride. The C32 deficit is prefill throughput, not packing.
+
+`PLOW_PF_PACKLOG=1` on p12rq (32 slots, `max_chunk` 4096, `max_request_chunk` 1024), two cells on
+one packet, one binary, one lease. 1024/C32 is a cell plow leads on effective streams; 8192/C32
+is the one that was written up as a collapse.
+
+```
+                          1024/C32    8192/C32
+  decode_feeds riding      18.56       19.95     mean per pack
+    median / max           24 / 31     26 / 31
+    packs with zero        3 / 27      17 / 177
+  prefill reqs per launch   3.11        3.14
+  prefill rows per launch  2504.6      3054.9    (max 4095)
+  bucket padding            4.7%        6.9%
+  cumulative prefill        3.18 s     27.40 s
+  cumulative decode         5.86 s      5.01 s
+  PREFILL SHARE            35.2%       84.5%
+  decode batch width       32 median   12 median (mean 20.45 -> 15.19)
+  ticks doing prefill      27 (6.5%)   163 (33.7%)
+  mean prefill tick        117.9 ms    168.1 ms
+```
+
+`unified=true` on all 177 packs at 8192 and the route logs `token-batch route fired`, so these
+decode rows are genuinely carried inside the prefill pass, not counted and dropped.
+
+**Three things this settles.**
+
+1. **Packing is at its ceiling, not below it.** ~20 decode rows ride every launch, and 109 of the
+   177 launches at 8192 run a FULL 4096-row bucket (`rows->bucket 4096->4096 x109`). Padding is
+   6.9%. There is no room to pack decode into, because the launches are already full. This also
+   answers whether `sched::step::Backend::decode_rows_join_prefill` should default true: it must
+   not. Its only effect is `budget -= decodes.len()` (`sched/step.rs:130-132`), and the CUDA arm
+   already subtracts decode rows twice before calling the planner — `per_launch = ... .min(
+   budget_max - decode_rows)` (`mux.rs:4234`) and the `trim` rule (`mux.rs:4333`). Flipping it
+   would charge a third time and SHRINK the prefill slice. `gpu.rs:7726` says as much. It is
+   false on AMD for the different reason that decode there is a separate dispatch.
+
+2. **The mechanism is prefill work, not scheduling.** Decode wall time is flat between the two
+   cells (5.86 -> 5.01 s) while prefill goes 3.18 -> 27.40 s. Slots mid-prefill contribute no
+   decode row, so the decode batch halves (median 32 -> 12) as a CONSEQUENCE of prefill
+   occupancy. The earlier framing — "effective streams plateau at ~13, so per-step row selection
+   is at fault" — had the causality backwards.
+
+3. **8192/C32 on this packet is not a collapse.** Effective streams (`out_tok_s * TPOT`) are
+   22.1 for plow against 22.4 for vLLM — a tie. The 13.6 recorded earlier was the chunk-1024
+   32-slot packet; p12rq keeps `max_chunk` 4096 and caps only the per-request slice, and that
+   repairs most of it. What remains at 8192/C32:
+
+   ```
+                 plow      vLLM 0.28
+     TTFT ms    4425.32    3657.96     -21%
+     TPOT ms      82.06      67.49     -22%
+     p99 ITL     206.28     353.90     +42%  (plow better)
+     out_tok_s    269.1      332.2     -19%
+     peak MiB     52334      75824
+   ```
+
+**The lever this points at.** 64 requests of 8192 tokens currently cost 584,768 bucket rows across
+177 launches, because `max_request_chunk` 1024 caps each request to 1024 rows per launch and three
+of them share a 4096-row bucket. At 4096 rows per request the same work is 524,288 rows in 128
+launches: 10% fewer rows, 28% fewer launches, and each request leaves prefill after 2 launches
+instead of 8, which returns it to the decode batch sooner. With prefill at 84.5% of the timeline,
+10% off prefill is ~8% off the cell — roughly half the remaining throughput gap.
+
+That cap existed only to hold the ring at 2048, and the ring A/B above shows the small ring is
+worth 0.0-0.6% at decode. What the bigger ring does cost is residency, since a sliding layer
+touches every ring row once the prompt passes the stride:
+
+```
+  req_chunk   ring rows   per slot   x32 slots   + 22 GiB weights
+     1024        2048      640 MiB     20 GiB      measured peak 52.3 GiB at 8192/C32
+     2048        4096      1.25 GiB    40 GiB      ~72 GiB of 80 -- tight, plausible
+     4096        8192      2.5 GiB     80 GiB      rings alone exceed the card
+```
+
+So `rc2048` is the arm expected to land and `rc4096` is built to locate the wall rather than argue
+about it. Both are one-variable overrides of the unchanged req1k recipe.
