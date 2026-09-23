@@ -2404,3 +2404,28 @@ does not also take that generic arm below 4096 is unanswered; an arena or tile c
 N=15360 K=3840 is the obvious suspect but is unverified. Consequence that matters now: "fused vs
 split" means different things per model, so the two models' FP8 prefill results are not directly
 comparable on that axis.
+
+### CORRECTION: the 1324-1468 vs 950-1170 TF/s pair is from a GH200, not this H100
+
+Recorded above as "already measured in-tree ... on this box", and repeated to the user twice. Wrong,
+and the error is worth understanding because the source comment causes it.
+
+`runtime/nvidia/op_gemm_sm90.cuh:1303` reads: "cuBLASLt fp8 measures 1324-1468 TF/s at the 12B
+shapes **on this box** vs the 256-thread uniform body's 950-1170". The only other occurrence of that
+pair, `docs/bringup/07-perf-campaign.md:221`, attributes it explicitly and warns against exactly the
+use I made of it: "one recorded run on **GH200**/12B measured fp8 1324-1468 / bf16 804-861 TF/s,
+`perf-data/gemma12b-gh200-prefill-campaign.md`; that is *that* box's ceiling, **not a target for
+yours**." That perf-data file does not exist in this tree, and `nvidia-smi` here reports
+`NVIDIA H100 80GB HBM3`.
+
+So "did WS384 close the ~35% gap" is NOT answerable by comparing H100 numbers against 1324-1468.
+GH200 and H100-SXM5 differ in clock and memory system and absolute TF/s does not transfer.
+
+The answerable question, and the one P1a actually measures, is the RATIO on one box on one day:
+plow-WS384-fp8 against cuBLASLt-fp8 at matched shapes. Ratio >= 1.0 kills the FP8-Lt thread on this
+hardware whatever a GH200 once read; ratio ~0.7 (the shape of the historical gap) makes it live.
+Absolute TF/s to be reported alongside, labelled H100 80GB HBM3.
+
+**The comment at `op_gemm_sm90.cuh:1303` should say GH200, not "this box".** It is a one-word source
+fix, it is not in this campaign's scope, and it will mislead the next reader the same way until
+someone makes it. Added to the proposals list.
