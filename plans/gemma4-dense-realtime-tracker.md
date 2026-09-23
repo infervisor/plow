@@ -2849,3 +2849,45 @@ This does not retire item 3 -- if the TPOT cost is real, staging is still the on
 chunk-4096 prefill with a 2048-row ring, and the memory table above shows chunk 4096 needs it.
 But the justification is now explicitly UNVERIFIED, and the cheaper experiment (single-variable
 ring A/B on one packet) comes first.
+
+
+## Glossary: row, slot, chunk, ring, window, ctx
+
+These have been used loosely in this file. Each is pinned to the identifier that defines it.
+
+| term | code identifier | what it counts | 12B value |
+|---|---|---|---|
+| **row** | `row_bytes` | one token x one layer, K AND V | 8 KiB (kv width 2048 x 2 B x 2) |
+| **slot** | kernel `i0 = n_batch`, engine `batch`, mux `capacity` | one concurrent sequence's seat | 32 on the c32 packet |
+| **window** | kernel `i4`, `cache.window` | how far back a query reads | 1024 sliding; **0** on the 8 full layers |
+| **chunk** | `PLOW_MAX_CHUNK` | prompt tokens per PREFILL LAUNCH | 1024 |
+| **ring** | kernel `i3 = kv_stride`, `cache.stride` | rows reserved per (slot, kv_head) on a sliding layer | `next_pow2(window+chunk-1)` = 2048 |
+| `kv_mask` | kernel `i7` | ring - 1, for `(kv0 + r) & kv_mask` | 2047 |
+| **write_rows** | `Manifest::write_rows` | rows one request may WRITE per launch | = chunk, or = `stage_rows` when staged |
+| **ctx** | `max_ctx`; `kv_len` = kernel `t5` | whole-sequence capacity; sizes the FULL layers | 16384 capacity, `kv_len` live |
+
+The ring rule (`packed_prefill.rs:222-229`) is a three-way OR, not the single clause quoted
+earlier in this file:
+
+```
+cache.window == 0 || cache.stride >= max_ctx || cache.stride >= cache.window + write_rows - 1
+```
+
+i.e. legal if the cache is not sliding at all, OR its ring already spans the whole context, OR it
+retains the window across everything one launch writes.
+
+### The three quantities are independent, and chunk touches only two
+
+Worked at 8192 in, chunk 1024, ring 2048, 32 slots:
+
+* **decode work per step, one sliding layer** = `min(kv_len, window)` = min(8320, 1024) = **1024
+  rows**. The ring does NOT enter -- `kv_stride` appears only in the base address
+  (`op_attention.cuh:795`), while the walk is `span = len - first`, `first = len - window`
+  (`:777-779`).
+* **memory per slot** = `min(tokens touched, ring)` x 40 sliding + `kv_len` x 8 full
+  = 0.62 + 0.51 = **1.13 GiB** -> x32 slots + 22.2 GiB weights = **58.4 GiB**.
+* **prefill launches** = `ceil(prompt / chunk)` = **8**.
+
+So `chunk` couples LAUNCH COUNT and RING MEMORY, and nothing else; `window` sets decode work and
+the ring's floor; `ctx` sets full-layer memory only. There is no path from ring size to decode
+work, which is why "the doubled ring slows every decode step" needs a single-variable re-test.
