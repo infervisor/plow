@@ -4404,3 +4404,191 @@ Still 1/4 and genuinely behind, now on trustworthy numbers:
 
 p99 ITL is won at every C1 cell by 0.7-0.9 ms, which is the MULTISTEP=0 + DECODE_PIPELINE=1
 profile doing its job.
+
+## Branch review: the rung-selection and knob defects, found by dedicated review passes
+
+### Rung / slice selection — my earlier retraction was HALF wrong
+
+I retracted the `pick_prefill_bucket` diagnosis after gating its greedy shortcut measured as a
+no-op. The measurement was right; the inference went one step too far. The review shows why:
+
+`serve/mux.rs:4292` pre-clamps the span to `chunk_cap` BEFORE the planner is called:
+
+    let chunk_cap = pf_chunk_rows().min(e.pf_request_max_rows());      // 4224
+    let remaining = (n - withheld - s.pf_pos).min(chunk_cap);          // 8192 -> 4224
+
+so `pick_prefill_bucket` never sees 8192 and cannot tile it. The shortcut is NECESSARY but not
+SUFFICIENT: "do (a) without (b) and nothing changes", and equally (b) without (a) -- which is
+exactly what I measured. The complete fix is both:
+
+    (a) mux.rs:4292  hand the planner the UNCAPPED length plus the cap
+    (b) gpu.rs:8833  drop the greedy top-rung shortcut (or gate on rem % top == 0)
+
+Hand-evaluated, that yields [4096,4096] at 8192 (zero padding, 9216 vs 9344) AND leaves 15000's
+5-launch tail plan intact (17792 vs 17920). It is therefore STRICTLY BETTER than the
+`PLOW_PF_CHUNK=4096` knob, which buys the same 8192 win but regresses 15000 padding 232 -> 360.
+
+**Root cause chain, closed.** The "+1 row for BOS" premise is FALSE on `/v1/completions` (already
+measured twice: gemma4-26b tracker:838-842 and this file:216). The rungs 1088/1152/4160/4224 were
+appended to swallow a +1 that never occurs on the bench path. And because `ladder16k` sets no
+`PLOW_MAX_REQUEST_CHUNK`, `pf_request_max_rows()` falls back to `pf_max_rows()` = the ladder top =
+**4224 -- the appended rung itself**. A rung added for a phantom BOS row is what sets the slice.
+
+**Second P0: the `trim` guard is dead code.** mux.rs:4333 calls `pf_pack_budget`, which returns the
+FIRST RUNG OF A PLAN, where the COVERING bucket was meant (`token_batch.rs:135` /
+`gpu.rs:9884` both inline `find(|b| b.t >= rows)`). The threshold needs a +512 jump that a
++1..32-row decode bump can never produce, so the branch never fires. On the l8192 packets
+(`pf_max_rows` 8192 > `pf_request_max_rows` 4224) a 4224-row slice + 3 decode rows takes the 8192
+rung: ~3965 padded rows, ~158 ms. Enabling it can only remove padding.
+
+**`pf_chunk_cost` = 512: do NOT move the shared default.** My "512 is 4x too high" note was too
+confident. The DP is insensitive here ([4096,4096] wins at 512 AND at 131), while
+`queue_pack_rows` is linear in it and carries the measured PF_INTERLEAVE_ADAPTIVE certificate
+(1024 in: TTFT 167.0 -> 107.7). The per-row price is also rung-dependent -- the two-cell solve
+gives 0.033 ms/row at the 4096/4224 step but 0.017 at 512/1024 -- so one scalar cannot serve both
+readers. Split the knob or leave it.
+
+### Knobs — the "looks real, compiles nothing" class
+
+    knob_gen.rs STALE, and NOT benign     the regen adds a Check::Load constraint
+                                          (stage_rows_requires_max_request_chunk) that plowrt
+                                          currently CANNOT enforce, plus 2 KNOBS entries that
+                                          shift every later index in holds(). Blocks the merge
+                                          gate. One command: KNOB_GEN_WRITE=1.
+    PLOW_STAGE_ROWS                       parsed, then lib.rs:9754 hardcodes stage_rows: None
+    rt.block_packets, rt.pf_modular       PROMOTED with "=false is the rollback"; neither field
+                                          is read anywhere in plowrt
+    PLOW_BLOCK_STAGE                      2 specs, 2 validated clap flags, 0 consumers
+    PLOW_EXTRA_DEFINES                    confirmed: plowc builds -D only from the manifest's
+                                          `recommends`, never from the environment
+    27 PLOW_BUILD_* selectors             unregistered, so they change the served object set
+                                          without entering build.json or moving registry_digest;
+                                          docs list 11 of them with the PLOW_BUILD_ prefix
+                                          STRIPPED, the one form the gate cannot match
+    def.PLOW_BUILD_SEG                    wrong layer; survives the reverse check only via a
+                                          comment in runtime/CMakeLists.txt:504
+    PLOW_VERIFY_BIN                       unregistered, and selects the checkpoint-K verifier
+
+Root cause of the coverage hole: no registry test scans `scripts/`, and the plowrt/devgen scans
+cover 4 crates, not `lean_verify`.
+
+## PLOW_PF_CHUNK=4096 measured clean, and the rung fix that replaces it (2026-09-23T19)
+
+**The knob is real but insufficient, and it is the wrong shape of fix.** Re-measured without
+PACKLOG (which itself costs ~0.1 ms/step), same session, scored against the same-session vLLM
+reference:
+
+| cell | control TTFT | PF_CHUNK=4096 | delta | vLLM |
+|------|-------------|---------------|-------|------|
+| 128/C1   | 18.32  | 18.25  | -0.07 | 31.18 |
+| 1024/C1  | 45.93  | 46.33  | +0.40 | 47.51 |
+| 4096/C1  | 170.51 | 170.19 | -0.32 | 171.48 |
+| 8192/C1  | 355.60 | 351.14 | **-4.46** | 348.61 |
+| 15000/C1 | 703.25 | 699.81 | **-3.44** | 675.86 |
+
+Both arms score 3 cells at 4/4. The knob does NOT flip 8192/C1: it closes the per-request wall
+gap from +8.3 to +3.8 ms, no further.
+
+**Root cause, now actually confirmed from the packet rather than guessed.** `build.json` for
+p12rw gives `shapes.prefill_buckets = [128,256,512,1024,1088,1152,2048,4096,4160,4224]`,
+`max_chunk = 4224`. So `pf_request_max_rows()` = 4224 and an 8192-row prompt was sliced
+`[4224, 3968]`; 3968 has no rung and pads up to 4096. **128 padded rows**, which at the measured
+marginal r = 0.0398 ms/row is ~5.1 ms — matching the -4.46 ms the knob buys by forcing
+`[4096, 4096]` instead.
+
+This vindicates the earlier retraction: `pick_prefill_bucket` alone was never the bug. Its greedy
+shortcut and the mux's pre-clamp are *jointly* responsible, and fixing either alone is a no-op —
+which is exactly what the first (reverted) attempt measured.
+
+**The fix (two edits, only meaningful together):**
+* `exec/gpu.rs` — deleted the "largest allowed rung that still FILLS is optimal outright"
+  shortcut. It is not optimal: `[4224, 3968->4096]` and `[4096, 4096]` are the same two launches,
+  but the first strands 128 rows. The DP below already considers the top rung and picks it
+  whenever it genuinely wins, so the shortcut only ever overrode the DP with a worse answer.
+* `serve/mux.rs` — the per-request slice now goes through the new `pf_plan_slice(rem, cap)`,
+  which plans the **uncapped** remainder. Previously `remaining` was clamped to 4224 *before*
+  the planner ran, so the planner never saw that the request was 8192 long.
+
+Hand-traced: `pick_prefill_bucket(8192, 4224)` now costs `[4096,4096]` at 9216 vs `[4224,4096]`
+at 9344 and returns rung 4096. `pf_pack_budget` moves 4224 -> 4096 in step, so the slice and the
+per-launch budget stay coherent. 128/1024/4096 are single-launch exact fills either way and serve
+as the control.
+
+**Honest ceiling on 8192/C1.** Even a perfect prefill fix does not make this cell 4/4. The four
+metrics stand at TTFT 351.14/348.61, TPOT 10.66/10.65, p99 10.89/11.58, tok/s 75.1/75.2. TTFT,
+p99 and tok/s all flip on a ~4 ms prefill win, but **TPOT is a decode metric and prefill cannot
+touch it**. 10.66 vs 10.65 is a genuine 0.09% deficit in KV traversal at ctx 8192. So the
+expected outcome of the rung fix is 8192/C1 at **3/4**, not 4/4, and the last metric needs a
+decode-side win of ~0.01 ms/step.
+
+## Branch review: dead code and knob hygiene (2026-09-23T19, four agents)
+
+### Applied
+* **knob_gen.rs regenerated** (`KNOB_GEN_WRITE=1`). It was stale and failed
+  `generated_evaluator_is_current`, i.e. it blocked the merge gate. I had earlier waved this off
+  as benign — wrong. The regen adds two Emit knobs that were registered but never emitted
+  (`emit.max_request_chunk`, `emit.stage_rows`) plus the `stage_rows_requires_max_request_chunk`
+  load constraint. 20/20 knob tests pass.
+* **op_moe.cuh comment drift.** Two MEASURED results were parked above `PLOW_MOE_XN_BF16`, which
+  **no build path sets**. The lane-split number (bf16 7.060 -> 6.766 ms) belongs to
+  `PLOW_MOE_DOWN_LANESPLIT`, which both `build_sm90a_gemma4_segments.sh:49` and
+  `build_sm90a_cubin.sh:132` do set; the staging-fu negative belongs to `PLOW_MOE_DOWN_STAGE_FU`.
+* **Docs**: 10 files synced to the code. Load-bearing correction — `17-unified-token-batch.md`
+  claimed "CUDA has no token-batch executor yet". It has one (`exec/gpu/token_batch.rs`,
+  `CudaTokenBatch::load`, gated on compute capability exactly `(9,0)`), verified at
+  `token_batch.rs:61` plus a `token_batch` default-on test, so the default DOES enable token
+  batching on H100. Plus five inverted bool defaults and stale module paths.
+
+### A grep flaw worth keeping
+`grep -w MACRO` **cannot** match `-DMACRO=1` — the `D` is a word character, so the left word
+boundary never occurs. The error direction is toward a false "never built". Any build-flag audit
+must use plain substring grep. Verified live: `grep -cw PLOW_NV_PACKED_REQUEST
+runtime/CMakeLists.txt` = 0, plain grep = 2.
+
+Related: a bulk "registered but unreachable" sweep is invalid. `manifest.rs:2587` synthesizes
+capability defines via `op.c_name().replace("PLOW_DOP_", "PLOW_HAS_")`, so ~120 `PLOW_HAS_*`
+names appear in no builder yet are emitted on every build. The literal-name test only holds
+OUTSIDE the `PLOW_HAS_*` / `PLOW_DOP_*` family. Hand-check per macro.
+
+### Deferred deliberately (not applied)
+* **CUDA dead code** — `op_dsa.cuh:455 d_gather_attn_decode` and `:516 d_gather_merge` (two
+  `__global__` kernels, no callers, self-documented "NOT WIRED"), and `interp_sm120_poc.cu` (a
+  whole file no build produces). Deleting these changes the cubin and would force a packet
+  rebuild mid-campaign. Their comments are accurate, which is what makes them tolerable.
+* **`trim` guard, mux.rs:4333** — uses `pf_pack_budget` (a *plan* rung) where a *covering*
+  bucket was meant, so the branch is dead. Fixing it changes scheduling at C>1 only
+  (`decode_rows > 0`), which is unmeasured; it needs its own A/B, not a drive-by.
+* **~2,900 lines of staged dead code** (`het.rs`/`head.rs`/`kv_handoff.rs`, `orch/*`,
+  `memory/*`) carry "Allowed dead until the head pool drives it" notes. That is an owner
+  decision, not mine to take unilaterally.
+* **Four re-classifications rejected as KEEP**: `PLOW_NV_ABLATE_LO/HI` is a live instrument
+  (`tune_decode_sweep.sh:423` passes it unconditionally), `PLOW_NV_SKELETON` is a documented
+  cmake switch, `PLOW_NV_FA_FP8ABL` is *specified* never to ship, `PLOW_NV_GEMV_LS` is a
+  recorded negative. The useful test is not "is it built?" but "does a comment record why it
+  is off?".
+* Only `PLOW_NV_PLACE_DISPATCH` is a clean removal: genuinely unbuildable (its required
+  `PLOW_NV_L2_SMS` exists nowhere in the repo), self-admittedly unsound, and it taxes 11
+  unrelated `#if` guards.
+
+### Rung fix MEASURED and committed (7c217beb)
+
+| cell | control | PF_CHUNK=4096 | rung fix | fix vs control |
+|------|---------|---------------|----------|----------------|
+| 128/C1   | 18.32  | 18.25  | 18.31  | -0.01 |
+| 1024/C1  | 45.93  | 46.33  | 46.30  | +0.37 |
+| 4096/C1  | 170.51 | 170.19 | 170.07 | -0.44 |
+| 8192/C1  | 355.60 | 351.14 | 351.04 | **-4.56** |
+| 15000/C1 | 703.25 | 699.81 | 691.65 | **-11.60** |
+
+The fix is **3.4x better than the knob at 15000** (-11.60 vs -3.44) and equal at 8192: the
+planner optimizes the whole request, where the knob forces one slice size everywhere. So
+`PLOW_PF_CHUNK` is not needed for this and no new knob was added.
+
+All three arms score 3 cells at 4/4. **The fix flips nothing**, as predicted: 8192/C1 wall gap
+narrows +8.3 -> +3.7 ms but TTFT is still 351.04 vs 348.61 and TPOT 10.66 vs 10.65. My
+pre-registered prediction of "3/4 at 8192" was WRONG — I expected TTFT to flip on a ~4 ms win
+and it did not; 2.43 ms of TTFT remain. Only p99 ITL is won there.
+
+**Where 8192/C1 actually stands**: needs TTFT -2.43 AND TPOT -0.01 AND tok/s +0.1. The first is
+prefill (reachable: FlashPrefill #66 runs at 196/351 TFLOP/s vs the GEMM path's ~780); the
+second is decode KV traversal and no prefill work can touch it.
