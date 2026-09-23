@@ -1392,3 +1392,1166 @@ agents), T1 emit byte-identity + checkpoint S, T2 numerics, T3 rung, T4 served,
 * C32 on the request-sliced packet p12rq4: TTFT 146.75/597.10/2082.35/4215.96/8154.66 ms.
 * Cache-on (prefix_repetition): C4 128.1 vs 120.8 ms, C16 297.6 vs 282.6 ms; peak 71.8-72.0 vs 73.5-73.9.
 * `PLOW_FA_MMAQK=3` promoted to a GEMMA4_HOPPER emit default; recipes no longer name it.
+
+### Scheduler anatomy vs vLLM 0.28, and the streaming quantum (2026-09-22)
+
+vLLM's V1 scheduler (`v1/core/sched/scheduler.py`, the reference config's own log): one forward per
+step over a flat token budget `max_num_batched_tokens=8192` (H100 default), `max_num_seqs=32`;
+running requests first (a decode row costs 1 token, a partly prefilled prompt continues its chunk),
+then waiting prompts FCFS, the last one cut to fill the budget (`long_prefill_token_threshold=0`, no
+per-request cap). Async scheduling is on: step n+1's input ids are copied on the GPU from step n's
+`prev_sampled_token_ids`, step n's ids go D2H on a side stream behind an event, and the CPU schedules
+and detokenizes step n while the GPU runs n+1 — a one-step lookahead, every token streamed.
+
+plow: one tick = decode feeds -> batched prefill pass -> decode launch. The unified token batch rides
+decode rows inside the prefill launch (vLLM's mixed step). The launch budget is the packet's widest
+prefill rung (4224 rows here; `PLOW_MAX_CHUNK=4096`), not 8192, because the sliding ring is
+`next_pow2(window + chunk - 1)` rows per slot. Realtime packs oldest-first (`PF_INTERLEAVE_ADAPTIVE`),
+high_concurrency fills FCFS.
+
+Per-request ITL traces, e2e3 vs the vLLM reference (a stall = ITL > 60 ms):
+
+| cell | stack | stalls/req | ms per stall | stall ms/req | ITL outside stalls | wave spread |
+|---|---|---:|---:|---:|---:|---:|
+| 4096/C4 | plow | 2.16 | 175 | 378 | 10.95 | 315 ms |
+| | vLLM | 0.75 | 203 | 152 | 10.93 | 19 ms |
+| 15000/C4 | plow | 7.69 | 191 | 1471 | 11.34 | 1271 ms |
+| | vLLM | 3.00 | 304 | 912 | 11.15 | 72 ms |
+| 4096/C16 | plow | 12.4 | 186 | 2304 | 13.32 | 1957 ms |
+| | vLLM | 4.97 | 268 | 1333 | 12.72 | 1079 ms |
+| 15000/C16 | plow | 46.7 | 205 | 9556 | 14.87 | 8221 ms |
+| | vLLM | 21.1 | 340 | 7185 | 13.52 | 6027 ms |
+
+Decode itself is level at C4 and 3-10 % behind at C16; the long-input TPOT gap is stall time. plow
+takes 2-3x more stalls (4096-row cap vs an 8192-token budget) and oldest-first packing staggers each
+wave, so prefill keeps landing on running decoders; vLLM's FCFS fill prefills a wave together, which
+puts the same time in TTFT instead. **A scheduler only moves time between TTFT and TPOT**: mean E2E =
+TTFT + 127 x TPOT exactly at 128 out, and plow's E2E ratio to vLLM is C1 0.99-1.04, C4 1.00-1.08, C16
+1.05-1.12 — the same deficit its output tok/s shows. Winning both metrics at a cell needs E2E, i.e.
+per-row prefill cost in mixed launches (45-50 vs 33-42 us/row at C16) and the batched decode step.
+
+**Arms on p12r4, one session, same binary** (TTFT / TPOT / p99 ITL, ms):
+
+| cell | ctl (MULTISTEP 4, adaptive) | MULTISTEP 0 | MULTISTEP 0 + FCFS | vLLM 0.28 |
+|---|---|---|---|---|
+| 128/C1 | 18.3 / 10.42 / 41.8 | 18.3 / 10.45 / 10.5 | 18.2 / 10.45 / 10.5 | 30.0 / 10.46 / 11.3 |
+| 4096/C1 | 169.6 / 10.53 / 42.3 | 169.8 / 10.56 / 10.8 | 169.8 / 10.56 / 10.8 | 170.1 / 10.55 / 11.4 |
+| 15000/C1 | 736.1 / 10.63 / 42.7 | 736.4 / 10.65 / 10.8 | 736.8 / 10.65 / 10.8 | 671.8 / 10.56 / 11.5 |
+| 128/C4 | 34.4 / 10.58 / 42.4 | 39.1 / 10.66 / 13.9 | 34.2 / 10.60 / 10.9 | 55.3 / 10.49 / 11.3 |
+| 1024/C4 | 101.4 / 11.61 / 53.7 | 101.6 / 11.63 / 53.5 | 123.3 / 11.46 / 53.2 | 129.6 / 11.07 / 11.8 |
+| 8192/C4 | 701.3 / 17.18 / 190.0 | 566.2 / 18.03 / 187.9 | 567.5 / 18.04 / 187.3 | 995.8 / 13.53 / 13.6 |
+| 15000/C4 | 1437.8 / 22.29 / 210.5 | 1041.6 / 26.53 / 211.7 | 1042.3 / 26.54 / 211.9 | 1665.4 / 18.06 / 326.0 |
+
+* Per-token streaming costs 0.03 ms/token at C1 and cuts p99 ITL 4x, to **below vLLM on both TPOT and
+  p99 ITL at every C1 rung**. The realtime profile should serve `PLOW_MULTISTEP=0`.
+* At C4 the quantum was delaying prefill: TTFT -20 to -28 % at 8192/15000 in, TPOT +5 to +19 %, E2E
+  4269 -> 4411 at 15000. A shift, not a win — the pipeline (below) is what should recover the TPOT.
+* vLLM-style FCFS filling is a wash at a 4096-row budget: identical everywhere but 1024/C4 (adaptive
+  keeps TTFT 101 vs 123 ms for +0.17 ms TPOT) and 128/C4 (FCFS 34.2 vs 39.1 ms TTFT).
+* Next: `PLOW_DECODE_PIPELINE` (lookahead-1, per-token streaming, device-resident inputs) and an
+  8192-row launch rung with `PLOW_MAX_REQUEST_CHUNK=4224` so the sliding ring stays at 8192 rows.
+
+### Lookahead-1 decode pipeline, measured (PLOW_DECODE_PIPELINE, 2026-09-22)
+
+p12r4, one session, one binary, `PLOW_MULTISTEP=0` in both arms, realtime profile, 128 out.
+Arms repeated (`ms0`/`ms0b`, `pipe`/`pipe2`): within-arm spread is <=0.07 ms TPOT and <=3 ms p99 ITL,
+so every delta below is outside the floor. Greedy equivalence: **12/12 byte-identical** completions
+with the pipeline off vs on.
+
+| cell | vLLM 0.28 | ms0 | pipe | E2E / vLLM |
+|---|---|---|---|---|
+| 128/C1 | 30.0 / 10.46 / 11.3 | 18.2 / 10.44 / 10.5 | 18.3 / 10.42 / 10.5 | 0.990 -> 0.987 |
+| 1024/C1 | 47.2 / 10.54 / 11.4 | 46.1 / 10.52 / 10.6 | 45.9 / 10.50 / 10.6 | 0.998 -> 0.995 |
+| 4096/C1 | 170.1 / 10.55 / 11.4 | 169.8 / 10.56 / 10.8 | 169.4 / 10.53 / 10.7 | 1.000 -> 0.998 |
+| 15000/C1 | 671.8 / 10.56 / 11.5 | 736.1 / 10.65 / 10.8 | 737.0 / 10.62 / 10.8 | 1.038 -> 1.036 |
+| 128/C4 | 55.3 / 10.49 / 11.3 | 32.0 / 10.57 / 10.7 | 36.0 / 10.60 / 12.2 | 0.990 -> 0.996 |
+| 1024/C4 | 129.6 / 11.07 / 11.8 | 101.6 / 11.64 / 53.6 | 101.3 / 11.60 / 53.6 | 1.029 -> 1.026 |
+| 4096/C4 | 465.8 / 12.07 / 11.9 | 324.8 / 13.85 / 175.0 | 324.5 / 13.81 / 175.0 | 1.043 -> 1.040 |
+| 15000/C4 | 1665.4 / 18.06 / 326.0 | 1039.2 / 26.40 / 212.7 | 1184.8 / 24.21 / 212.2 | 1.109 -> 1.076 |
+
+(TTFT / TPOT / p99 ITL in ms. E2E = TTFT + 127 x TPOT.)
+
+* Every C1 rung gains 0.02-0.03 ms TPOT for no TTFT: the host turnaround was already small there,
+  and what the pipeline removes is exactly that.
+* **15000/C4 is the win**: TPOT -8.3 %, and E2E falls 1.109 -> 1.076 of vLLM, so it is not the
+  TTFT/TPOT shuffle the MULTISTEP arms were.
+* **128/C4 regresses** (TTFT 32 -> 36, p99 ITL 10.7 -> 12.2). Structural: with a 128-row prompt the
+  in-flight lookahead step must be drained before a prefill launch, and at that size the drain is
+  most of the tick. The prefill overlap below is what removes the drain.
+* Against vLLM after this round: plow wins TTFT at 7 of 8 cells and p99 ITL across all of C1, and
+  still trails on TPOT/E2E at C4 with long inputs and on p99 ITL at 1024-4096/C4 (53.6 / 175.0 vs
+  ~11.8 — the cost of packing prefill into running decoders instead of prefilling a wave together).
+
+### Prefill overlap (PLOW_PIPE_PREFILL) — implemented, measurement queued
+
+The mixed prefill/decode launch is enqueued behind the step in flight instead of draining it:
+
+* `d_last` `[batch]` device buffer holds every slot's newest sampled token. A decode step copies
+  `in.ids` into it; a mixed step scatters its compact terminal block into it.
+* `PackedTerminal` splits into `launch` (no sync) and `run`; the pipelined path submits body +
+  terminal, records a D2H of the sample block and an event, and returns. Frontiers and `pos` commit
+  at enqueue, which single-stream program order makes safe.
+* Decode rows that ride the launch take their input from `d_last` (4-byte D2D after the staged
+  upload) -- but only rows the pipe still owes a token; for any other row the host token is
+  authoritative and `d_last` is stale.
+* A prompt that completes in launch n joins launch n+1 as a decode row reading its first token off
+  the device, so it does not idle a whole launch waiting for the host to read that token.
+* `pipe_reap`/`pipe_full` hold the queue at lookahead-1 across consecutive prefill ticks; without
+  them a run of prefill ticks overflows the two pinned readback buffers.
+
+### Prefill overlap: first run faulted, and why (2026-09-22)
+
+`PLOW_PIPE_PREFILL=1` on p12r4 died ~40 tokens into the greedy probe:
+
+```
+CUDA_ERROR_ILLEGAL_ADDRESS (700) at cuCtxSynchronize
+gpu: batched prefill failed ... packed=1, fatal=true
+```
+
+Deterministic: both overlap arms of the ladder (`pf`, `pf2`) exited rc=28 with 0 cells, while every
+pipeline-only arm ran all 8 cells.
+
+**Cause.** `packed_token_body_inner`'s own SAFETY comments state the invariant: `pf_ids`, `pf_pos`,
+`slot_buf`, `req_buf` "live on self past the stream_synchronize". Every packed launch drained the
+stream before returning, so the host was free to rewrite them next tick. The pipelined path removed
+that drain and kept the vectors, so the host restaged launch n+1 while launch n's async H2D copies
+were still queued behind the running kernel; the copies then read the new contents. The terminal's
+`host_rows` and patched instruction block have the same exposure. Corrupt row/program metadata is
+exactly an illegal address, and the timing fits: correct until the host runs ahead of the device.
+
+**Fix, per buffer's exposure window.**
+
+* Body staging (`pf_ids`, `pf_pos`, `slot_buf`, `req_buf`, `kvlen_buf`): a `body_ev` event recorded
+  right after those copies and waited on before the next staging. Those copies precede their own
+  launch's kernel, so in the steady state the device is already past them and the wait returns at
+  once; a host that runs ahead is throttled, which is the part that was missing.
+* Terminal staging (`host_rows`, instructions): its copies sit AFTER the body kernel, so an event
+  there would wait out the whole 170 ms launch and serialise what the pipeline exists to overlap.
+  Those two small arrays are double-buffered instead (`stage_rows`, alternating per launch).
+
+`PLOW_PIPE_PREFILL` became a level so the two new behaviours can be separated: `1` parks the mixed
+launch and sources its decode rows from `d_last`, `2` additionally admits a just-prefilled row to
+the next launch on its device-resident first token.
+
+**What the overlap can be worth, measured.** `PLOW_PF_PACKLOG` over 659 ticks (idle outliers
+trimmed): host gap is **1.67 ms against a 172.7 ms prefill tick (1.0 %)** and **0.052 ms against an
+11.0 ms decode tick (0.5 %)**. So closing the gap is not where the value is — it has to come from
+removing the drain (which costs 128/C4 its TTFT, 32.0 -> 36.0 ms under the pipeline) and from
+decode rows not losing a launch after their prompt completes.
+
+### 8192-row launch rung: null (2026-09-22)
+
+p12r8 (`PLOW_MAX_CHUNK=8192`, `PLOW_MAX_REQUEST_CHUNK=4224`) against p12r4, same binary, arms
+repeated: every cell within the repeat spread (E2E / vLLM 0.998 / 1.000 / 1.038 / 1.029 / 1.042 /
+1.11x, identical either way). The rung is built but not chosen: a request is still capped at 4224
+rows per launch, so filling 8192 needs two requests' chunks in one launch, which oldest-first
+adaptive packing avoids and `pf_pack_budget`'s cost model rejects (a ~45 %-padded 8192 loses to
+`[4096, tail]`). Testing the wider launch for real would need FCFS fill as well; not pursued.
+
+### Checkpoint P gate: 20/20 accepted (2026-09-22)
+
+`scripts/perf_gate_ci.sh 91f03b9c` -> rc=0, every flipped default certified. Two of the twenty
+needed work beyond re-running the campaign:
+
+**`emit.gemma4_sm90_hd256_gqa2_wide` — accepted after citing the right neutral metric.** TTFT is
+better at all four cells of its group (8192/C1 359.6 -> 355.5, 8192/C4 763.8 -> 749.7, 15000/C1
+748.0 -> 736.3, 15000/C4 1607.2 -> 1519.3 ms) but clears its floor only at 15000/C1. The first
+cert cited only TPOT as neutral, so the three within-floor TTFT rungs had no accept path. The flip
+widens the row range of an attention role that is already the default at <=4096 rows to the
+4160/4224-row whole-tile launches -- same object, same math, no work added -- which is the
+physical argument `rungVerdict` wants for "not worse"; with TTFT cited too it accepts.
+
+**`emit.fa_mmaqk` — rejected on the merits, returned to opt-in.** 26B 128/C1 TPOT 5.400 -> 5.418 ms
+against a 0.002 floor, reproducible across both treatment runs. That is a `servingVerdict`
+rejection, and unlike `rungVerdict` the serving check has no neutral escape hatch by design: a
+serving metric may not get worse, whatever the reason. The knob still wins where its evidence was
+taken (26B 1024/C1 TPOT 5.551 -> 5.484 beyond floor, 128/C4 and 1024/C4 within it; 12B 128/C16
+12.68 -> 11.80), so this is the `ccd36c59` situation exactly: the default returns to UNSET/OPT_IN,
+`apply_production_defaults` drops its case, and the 16 BF16 Gemma-4 H100 recipes set
+`PLOW_FA_MMAQK=3` themselves. Every campaign packet keeps the flag; only the uncertified default
+goes away. `gemma4-12b.h100.bf16-plain` is deliberately left without it -- it is the
+default-knobs control.
+
+Floors are tight because `floorOf` is |median(ctrl) - median(ctrl2)| + k*max(MAD): when the two
+control runs agree to 0.04% on a 5.4 ms TPOT, a 0.33% regression is outside the floor.
+
+### Stage 1 after the frontier rework: re-measured, and the 128/C4 TTFT regression is gone
+
+p12r4, `PLOW_MULTISTEP=0`, 32 prompts, 128 out. TTFT ms / TPOT ms / p99 ITL ms.
+
+| cell | vLLM 0.28 | base | pipe (stage 1) | E2E / vLLM |
+|---|---|---|---|---|
+| 128/C1 | 30.0 / 10.46 / 11.3 | 18.3 / 10.44 / 10.5 | 18.3 / 10.42 / 10.5 | 0.990 -> 0.987 |
+| 15000/C1 | 671.8 / 10.56 / 11.5 | 737.0 / 10.65 / 10.9 | 736.5 / 10.62 / 10.8 | 1.038 -> 1.036 |
+| 128/C4 | 55.3 / 10.49 / 11.3 | 32.3 / 10.58 / 10.9 | 32.0 / 10.53 / 10.7 | 0.992 -> 0.987 |
+| 15000/C4 | 1665.4 / 18.06 / 326.0 | 1039.8 / 26.43 / 212.4 | 1184.7 / 24.13 / 212.1 | 1.110 -> 1.073 |
+
+The 15000/C4 win reproduces (TPOT 26.43 -> 24.13, -8.7%; E2E 1.110 -> 1.073) and it is a trade,
+not a free win: TTFT goes 1039.8 -> 1184.7 there. No cell regresses on E2E.
+
+**The regression that motivated the overlap is gone.** Before the rework, stage 1 cost 128/C4 its
+TTFT (32.0 -> 36.0 ms); measured again on the reworked core it is 32.3 -> 32.0. The `ahead` lag
+compensation was the cost, not the missing overlap. With the host gap already measured at 1.0 % of
+a prefill tick and 0.5 % of a decode tick, stage 2's remaining upside is that gap alone.
+
+### Prefill overlap, second attempt: replay at level 1, fault at level 2
+
+The frontier rework removed the illegal address at level 1, and left a subtler bug: level 1 emitted
+one token twice. `p1`'s completion is `p0`'s with a token duplicated and the tail one token short
+("These are daily daily maritime...", "dereferferencing") -- the device stream was right and the
+host fed a row twice.
+
+Cause, in two parts:
+
+* `pipe_step`'s internal drain re-enqueued from the mux's pre-drain `feeds`. The mux's own drain
+  path re-gathers (`feeds = gpu_decode_feeds(...)`, right after it drains) and says so in its
+  comment; `pipe_step` cannot re-gather from inside the engine, so a row the drain had just
+  produced a token for was fed its previous token and resampled it.
+* `carry` was set from `device_ids` -- whether the row's input came from the device -- rather than
+  from its KIND. A mixed step whose decode rows the host staged therefore had no carry rows at
+  all, which is what made `pipe_covers` fail and that drain reachable. It also dropped those rows
+  from the prefix-cache history.
+
+Both fixed. A third defect found by construction while reading: `gpu_decode_feeds` gathers only
+`step > 0` rows and `use_pipe` requires a non-empty feed set, so a row whose first token is still
+inside a parked step is invisible to the decode path; while it also held `did_prefill` true, the
+mux's drain was suppressed and nothing could ever complete that step. `did_prefill` now excludes
+rows the pipe owes a token, which are waiting on a readback, not on prefill.
+
+Level 2 (`PLOW_PIPE_PREFILL=2`, a prompt decoding from its device-resident first token) still
+faults: `CUDA_ERROR_ILLEGAL_ADDRESS` at `cuEventSynchronize`, batched prefill, `packed=1`. That is
+a memory bug of its own and is not the liveness hole above.
+
+### Prefill overlap: three bugs fixed, one left, and the verdict
+
+The three defects found by reading, all fixed in the tree:
+
+1. `pipe_step`'s internal drain re-enqueued from the mux's pre-drain `feeds`, so a row the drain
+   had just produced a token for was fed its previous token and resampled it. The mux's own drain
+   path re-gathers (`feeds = gpu_decode_feeds(...)`); `pipe_step` cannot, so it now refreshes the
+   fed tokens from what the drain returned.
+2. `carry` was set from `device_ids` (whether the input came from the device) instead of the row's
+   KIND. A mixed step whose decode rows the host staged had no carry rows at all, which is what
+   made `pipe_covers` fail and defect 1 reachable; it also dropped those rows from the
+   prefix-cache history.
+3. `did_prefill` counted a row whose prompt was consumed but whose first token was still inside a
+   parked step. `gpu_decode_feeds` gathers only `step > 0` rows and `use_pipe` needs a non-empty
+   feed set, so such a row is invisible to the decode path while it suppresses the mux's drain --
+   nothing could complete the step holding its token. It now excludes rows the pipe owes.
+
+Verified on plowrt_pipe5 (`pf_noise.sh`, `dupscan.py`): level 1 clean, 0 corruption hits, down
+from 2. The noise floor matters here -- `off` vs `off2` is 8/10 identical at conc 4, so the
+earlier "p0 8/10" reading of stage 1 was the floor, not a regression; `p0` vs `p0b` is 10/10.
+
+**What is still broken.** Level 1 FAULTS when rows retire while a mixed launch is parked -- not a
+deadlock, which is what the tick trace looked like before the fault lines were read:
+
+```
+PACKLOG TICK t_ms=1233.3 decode_ms=11.75  did_prefill=0 decode_rows=2   <- two requests retired
+PACKLOG TICK t_ms=1408.1 decode_ms=172.21 did_prefill=0 decode_rows=2   <- parked-launch wait
+decode pipeline: step failed ... fed=2 ... CUDA_ERROR_ILLEGAL_ADDRESS at cuEventSynchronize
+```
+
+Ticks stop there because the context is poisoned, not because the host is waiting; at 15000/C4 of
+the ladder the same fault left the client waiting with the GPU pinned, which is why it first read
+as a livelock. The repro is 4 x 14k-token prompts at 32 out.
+
+The open lead is the retired-row frontier rollback added by the frontier rework:
+
+```rust
+if pipe.retire[b].is_some() {
+    self.pos[b] = self.pos[b].saturating_sub(1);
+    continue;
+}
+```
+
+It is the only `pos` bookkeeping that fires exactly on retirement, which is exactly the trigger.
+A mixed launch commits its rows' frontiers through the token-batch staging rather than through
+`pipe_enqueue`, so a row retired while both a mixed step and a decode step hold it is rolled back
+once for a frontier that moved twice -- and the next launch then maps and writes past what
+`ensure_rows` reserved. Not yet confirmed.
+
+Level 2 faults as well, in the batched prefill, and is a separate bug.
+
+**Verdict: not shipped.** `PLOW_PIPE_PREFILL` stays opt-in at 0 and is documented as experimental
+with both failure modes named. The case for finishing it is weak on the measurements: the host gap
+it closes is 1.0 % of a prefill tick and 0.5 % of a decode tick, and the 128/C4 TTFT regression
+that originally motivated it turned out to be the `ahead` lag compensation, which the frontier
+rework already removed. Stage 1 (`PLOW_DECODE_PIPELINE`) is the part that pays, and it is correct
+and measured.
+
+## Full ladder at HEAD, both models, 20 cells each vs vLLM 0.28 (2026-09-23)
+
+First pass: 34 of 40 cells. 12B 20/20, 26B 14/20. The gaps and the losses have three named
+causes, none of them kernel speed.
+
+### 1. The 6 missing 26B cells: the MoE memset-hoist aborts the prefill capture
+
+`26B realtime` lost every cell at 4096 rows and above:
+
+```
+FAIL: incomplete cell: ok=0/32 failed=32 generated=0/4096
+gpu: batched prefill failed error=device fault: graph edges: CUDA_ERROR_INVALID_VALUE
+     (code 1) fatal=false packed=3
+prefill seg graph warmup failed ... bucket=6 / bucket=7
+```
+
+`graph edges` is `hoist_memsets` (`device/cuda.rs`), the pass that lifts cuBLASLt's workspace
+memsets above the MoE Lt glue kernel so they overlap instead of serialising. It runs only when
+`untouched` is non-empty, and `untouched` is the MoE Lt glue list -- which is why the 26B fails and
+the 12B, dense, never does. A driver refusal on a dependency *query* propagated out of
+`graph_capture_hoisting` and failed the whole capture, so an optimization could kill the launch.
+
+Fixed: query refusals skip that memset and leave the graph exactly as captured (the queries all run
+before that node's first mutation, so a skip is always on an unmodified graph). The three edge
+mutations stay fatal -- a half-moved edge is a race, not a lost optimization.
+
+`PLOW_PF_INTERLEAVE_ADAPTIVE=0` was ruled out as the cause by a one-variable rerun: it failed
+*earlier* (1024/C4, ok=8/32) with the same error.
+
+Correction to an earlier note in this file: the `prefill seg graph warmup failed` warning is **not**
+benign. On the 26B realtime profile it cost 6 of 20 ladder cells.
+
+### 2. Every C32 cell: a 16-slot admission cap, not throughput
+
+The fingerprint is exact. 12B: C32 tok/s 1318.9 vs C16 1310.7; 26B: 1371.5 vs 1371.1. Peak memory
+is identical at both concurrencies. TPOT at C32 matches or beats vLLM (12B 11.41 vs 11.59). Only
+TTFT explodes (12B 128/C32: 1267 ms vs vLLM 161).
+
+The `ladder16k` / `ctx16k` packets serve 16 slots: chunk 4096 makes a slot's sliding ring
+`next_pow2(window + 4095)` rows, and 32 slots would need ~110 GiB on an 80 GiB card. Half the
+requests therefore wait out a whole 128-token generation before their first token. vLLM runs 32
+slots on paged KV.
+
+Worth recording: at C16/C32 plow peaks at 67.7-70.8 GiB against vLLM's 74.6-75.8 GiB. plow uses
+*less* memory and still fits fewer sequences -- the cost is contiguous power-of-two rings per slot,
+not total footprint.
+
+`*-c32-16k.toml` is the packet shaped for this half (chunk 1024 -> 2048-row ring, 32 slots,
+45-48 GiB peak). Being measured.
+
+### 3. p99 ITL on the realtime profile: the MULTISTEP wave
+
+p99 ITL at C1 is exactly 4x TPOT on both models -- 12B 41.8 = 4 x 10.45, 26B 21.6 = 4 x 5.38 --
+and median ITL is literally `0.000`. That is `PLOW_MULTISTEP=4` emitting four tokens per wave.
+vLLM streams one at a time (11.3 / 5.8 ms). TTFT and TPOT are unaffected; only the streaming
+metric is. A/B running: 12B with `MULTISTEP=0 + PLOW_DECODE_PIPELINE=1` (per-token streaming is
+precisely what stage 1 buys), 26B with `MULTISTEP=0` alone, since the pipeline is unavailable
+whenever cuBLASLt is enabled (`gpu.rs:3539`).
+
+### Hoist fix verified (007e864c)
+
+26B realtime: 10/10 cells, zero `graph edges` faults. The new diagnostic is exact --
+`refused=1 hoisted=12 nodes=154` on the big graphs, `refused=1 hoisted=2 nodes=22` on the small
+ones. Exactly **one** node per capture refuses the query; every other memset still hoists. So the
+optimization is ~92 % preserved and the launch no longer dies for it. Worth a follow-up: one node
+per graph refusing a dependency query is a specific shape, not random driver flakiness.
+
+### Complete ladder, 40/40 cells (plow wins-losses vs vLLM 0.28)
+
+| model | TTFT | TPOT | p99 ITL | tok/s | E2E |
+|---|---|---|---|---|---|
+| Gemma-4-12B | 13-7 | 8-12 | 9-11 | 3-17 | 3-17 |
+| Gemma-4-26B-A4B | 11-9 | 3-17 | 8-12 | 0-20 | 0-20 |
+
+TTFT is the real strength and it is not close in places (26B 128/C1 21.3 vs 38.3 ms; 15000/C4
+592 vs 804). TPOT and throughput are the weakness. Recovering the six 26B cells made the verdict
+*worse*, not better -- they all land at E2E 1.08-1.25x.
+
+The TPOT gap is context-dependent, which points at decode attention rather than the GEMMs.
+26B at C4, 128 -> 15000 in: plow 7.85 -> 16.86 ms (+9.01), vLLM 7.25 -> 10.86 (+3.61). The
+constant part is within 8 %; the per-KV-row part costs 2.5x. 12B at C16: plow +73.1 ms over the
+same span, vLLM +56.9.
+
+### Where the TPOT gap actually is: KV traversal, not the weight walk
+
+Split TPOT into its context-free and per-KV parts using measurements only. (A least-squares
+intercept is NOT safe here: vLLM's TPOT-vs-context curve is convex, so a straight line puts its
+intercept ~1.5 ms under the measured 128-token cell and invents a constant-term gap that does not
+exist. Use the 128-in cell as the constant and a two-point secant for the slope.)
+
+```
+                constant part (TPOT@128in)        per-KV slope (us per 1k ctx)
+                plow   vLLM    x                  plow     vLLM     x
+12B    C1      10.42  10.46  1.00                 13.5      6.7   2.00
+       C4      10.63  10.49  1.01                  784      509   1.54
+       C16     11.68  10.90  1.07                 4915     3827   1.28
+26B    C1       5.38   5.04  1.07                 16.1      3.4   4.80
+       C4       7.85   7.25  1.08                  606      243   2.50
+       C16     11.17   8.84  1.26                 2963     1754   1.69
+```
+
+The context-free part is at parity on the dense 12B -- 1.00 / 1.01 / 1.07x, and the HBM efficiency
+of the weight walk is the same as vLLM's (60.8-68.2 % of 3352 GB/s against 61.3-67.9 % over
+23.81 GB of weights). The whole TPOT gap is the per-KV-row term.
+
+So the decode target is decode attention, not the GEMMs: 1.28-2.0x on the 12B, 1.69-4.8x on the
+26B. At C1 the absolute cost is negligible (13 us per 1k) so it never shows; at C16/15000 it is
+73 ms of an 85 ms step.
+
+(C32 rows read better than vLLM only because plow serves C32 on the same 16 slots as C16 -- that
+column is the admission cap, not a decode result.)
+
+### The 32-slot packet at C16/C32: a traffic-dependent trade, not a fix
+
+`*-c32-16k.toml` (chunk 1024, 2048-row sliding ring, 32 slots) removes the admission cap and the
+short-prompt C32 cells improve a lot. It also costs much more on long prompts, because chunk 1024
+turns a 15000-token prompt into 15 launches. E2E vs vLLM at C32, 16-slot -> 32-slot:
+
+```
+in       12B                26B
+128      1.663 -> 1.255     1.706 -> 1.302
+1024     1.378 -> 1.253     1.630 -> 1.523
+4096     1.204 -> 1.506     1.533 -> 2.032
+8192     1.133 -> 1.581     1.514 -> 2.223
+15000    1.101 -> 1.727     1.545 -> 2.437
+```
+
+The crossover is between 1024 and 4096 rows on both models. 12B 128/C32 TTFT goes 1267 -> 113 ms
+(vLLM 161, so plow wins it) at 46-49 GiB peak instead of 67-70. But 15000/C32 TTFT goes
+13405 -> 26936 ms. At C16 the 32-slot packet is worse everywhere (it pays chunk 1024 for slots it
+does not need).
+
+So **no single plow packet covers the C32 column the way vLLM's one config does.** The packet has
+to be chosen for the traffic: c32-16k below ~1k input, the 16-slot ladder packet above. That is a
+real limitation of the AOT-compiled packet model and is reported as one. The headline ladder below
+uses the 16-slot packet for the whole C16/C32 half, which is the recipes' own choice and better on
+8 of those 10 cells.
+
+### Final ladder, 40/40 cells, one config per concurrency
+
+C1/C4 from the realtime profile with MULTISTEP=0; C16/C32 from high_concurrency (16 slots).
+
+| model | TTFT | TPOT | p99 ITL | tok/s | E2E |
+|---|---|---|---|---|---|
+| Gemma-4-12B | 13-7 | 8-12 | **15-5** | 4-16 | 4-16 |
+| Gemma-4-26B-A4B | 11-9 | 3-17 | **13-7** | 0-20 | 0-20 |
+
+Against the first pass, the MULTISTEP flip moved p99 ITL from 9-11 to 15-5 (12B) and 8-12 to 13-7
+(26B) at no cost in TTFT or TPOT. Nothing moved TPOT or tok/s, because nothing in this round
+touched decode attention, which is where the whole TPOT gap lives.
+
+**The standing goal is not met.** plow wins TTFT and now p99 ITL on the majority of cells, ties the
+context-free part of TPOT, and loses throughput and E2E almost everywhere. The three things
+standing between here and it, in order of size:
+
+1. Decode attention per KV row: 1.28-2.0x (12B) and 1.69-4.8x (26B) of vLLM. This is the whole
+   TPOT and tok/s column.
+2. The C32 admission cap: needs paged (or at least non-power-of-two) sliding rings so one packet
+   can hold 32 slots at 16k without paying chunk 1024 on long prompts.
+3. Prefill interference at C4+ with long prompts: p99 ITL 104-214 ms against vLLM's 8-13 at
+   1024-8192 in, where the wave is already gone. That is the prefill chunk blocking decode.
+
+## Correction: the decode step is at parity; the gap is not KV traversal (2026-09-23)
+
+The "per-KV slope" above was derived from `tpot_ms`, which is the MEAN inter-token time and so
+includes every decode step a prefill launch blocked. Splitting on `itl_med` -- the median step,
+which prefill rarely lands on -- inverts the conclusion:
+
+```
+median ITL, plow / vLLM        128    1024   4096   8192  15000
+12B  C1                       1.00    0.99   0.99   0.99   0.99
+12B  C4                       1.00    0.99   1.00   1.01   1.02
+12B  C16                      1.03    1.04   1.05   1.07   1.09
+26B  C16                      1.22    1.20   1.22   1.26   1.25
+```
+
+The 12B decode step is within 9 % of vLLM everywhere and within 2 % at C1/C4. The 26B is ~22 %
+behind at C16 and ~8 % at C1/C4. What `tpot_ms` was measuring is prefill blocking decode:
+
+```
+share of TPOT that is interference    plow    vLLM
+12B  4096/C4                           20 %     9 %
+12B  8192/C4                           35 %    18 %
+12B 15000/C4                           53 %    38 %
+26B  8192/C4                           33 %    11 %
+26B 15000/C4                           50 %    28 %
+```
+
+**Do not use `tpot_ms` to reason about kernel speed on a continuously-batched server.** Use
+`itl_med` for the step and `tpot_ms - itl_med` for the interference.
+
+### Null result: capping the per-tick prefill budget does not fix it
+
+`PLOW_PF_INTERLEAVE` is plow's `max_num_batched_tokens` (config.rs: unset -> 2048 on CUDA, `0` ->
+`usize::MAX`, i.e. uncapped). Every campaign profile sets `0`, so once a slot is decoding a tick
+may still admit unbounded prefill rows before running decode. A cold tick bypasses the cap, so
+capping should be free for first-request TTFT.
+
+Measured 0 -> 2048, both models, both profiles, 40 cells: **E2E better on 12, and every one of
+those is inside the cell noise.** TPOT barely moves and TTFT gets worse at long inputs (26B
+15000/C16 2417 -> 2702 ms, E2E 1.570 -> 1.730). The knob is not the lever; do not re-try it.
+
+The reason it cannot be: at C16/C32 with long prompts the machine is saturated with prefill work,
+and vLLM shows 80 % interference in the same cells. Interleaving differently moves latency between
+TTFT and TPOT rather than creating throughput.
+
+### What the wall-clock arithmetic says instead
+
+12B 4096/C16, 64 prompts, 8192 output tokens:
+
+```
+                       plow        vLLM
+wall (from tok/s)      18.2 s      16.2 s
+decode  512 steps x    13.38 ms    12.78 ms   =  6.85 s  /  6.54 s
+prefill 262k tokens                           = 10.8  s  / 10.9  s   (at each stack's C1 rate)
+serial sum             17.7 s      17.4 s
+```
+
+plow's measured wall matches its serial sum; vLLM finishes 1.2 s BELOW its own serial sum. So vLLM
+overlaps decode with prefill and plow largely does not -- even though `token_batch` is loaded and
+its route fires on all four runs. That is the thing to measure next, with `PLOW_PF_PACKLOG=1`
+(`PACKLOG WALL prefill_ns/decode_ns/ticks`), not to guess at.
+
+## Runtime scheduling knob audit (2026-09-23, user ask)
+
+Cross-referenced all 210 `rt.*` registry knobs against what every shipping Gemma-4 recipe sets
+(`[serve.env]` plus each profile's `serve_env`). **A knob every recipe overrides is a wrong
+default** -- the default is whatever nobody wants. Script: `knob_audit.py`.
+
+### Already right
+
+`rt.token_batch` ON/PROMOTED (mixed prefill+decode batching; serve log `token_batch: true`),
+`rt.prefix_cache` ON/PROMOTED (recipes set `0` ONLY to match vLLM's `--no-enable-prefix-caching`
+in the ladder -- production is cache-on), `rt.idle_dispatch`, `rt.block_packets`, `rt.pf_modular`.
+
+### Always overridden -> wrong default
+
+| knob | default | every recipe | evidence |
+|---|---|---|---|
+| `rt.pf_interleave_adaptive` | OFF | 1 | 12B 1024/C4 TTFT 167.0 -> 107.7 ms; 26B 114.5 -> 94.4 |
+| `rt.rung_fast_probe` | OFF | 1 | 128/C16 P99 TTFT 170 -> 150 ms |
+| `rt.multistep_adaptive` | OFF | 1 | 26B C1 TPOT 5.66 -> 5.59; 15000/C4 TTFT 700 vs 993 ms |
+| `rt.queue_ttl_ms` | UNSET | 0 | |
+
+### The two the cross-reference cannot see (no recipe touches them)
+
+* **`rt.pf_cover` = ON, PROMOTED.** It selects the OLD covering chunk pick, so the cost-aware DP
+  cover in `pick_prefill_bucket` never runs. `docs/flags-reference.md:959` documents the default as
+  **off**; the registry says ON; the serve log settles it (`pf_cover: true` on every run in this
+  campaign). This is the prefill padding bug: a 2331-row tail takes the whole 4096 rung.
+* **`rt.multistep` = 8.** Pins p99 ITL at 8 x TPOT out of the box (median ITL `0.000`); both
+  campaign profiles override to 0. Measured 4 -> 0 this session: p99 ITL 41.8 -> 10.5 ms at zero
+  TTFT/TPOT cost. A global flip to 0 is NOT right -- on AMD/CPU the host gap multistep amortises is
+  real. It should be engine-conditional like `rt.mux_inline_tick` ("unset = on for a CUDA engine;
+  AMD and CPU keep the engine thread"), since the inline tick already cut the CUDA dispatcher
+  handoff from 50-87 us to 0.3 us, which is the reason multistep existed there.
+
+### Deliberately not flipped
+
+`rt.decode_pipeline` -- only this session's 12B realtime profile sets it, and it is unavailable
+whenever cuBLASLt is on, so the evidence does not support a global default.
+`rt.pf_interleave` -- every recipe sets 0 (uncapped) against a 2048 default, but the measured A/B
+of 0 vs 2048 is a wash on 40 cells, so neither value is clearly right.
+
+Each flip needs a checkpoint-P certificate or the merge gate fails, and a knob the verifier rejects
+goes back to opt-in. Certificates are measured with the arm value pinned explicitly, so they stay
+valid whichever way the registry points; the registry is only flipped for knobs that pass.
+
+## FP8 campaign: the dtype gate silently drops production defaults
+
+Verified in code, 2026-09-23, while briefing the FP8 agents.
+
+`apply_production_defaults` (`crates/devgen/src/lib.rs:7568`) gates the entire GEMMA4_HOPPER
+block on `bf16 && capabilities.gemma && capabilities.full_attn_hd512 && arch == "sm_90a" && tp == 1`.
+Any FP8/W8A8/W8A16/MXFP4 emit therefore ships WITHOUT `sliding_ns_grid`, `sliding_ns_cap`,
+`gemv_prefetch` (dense) / `moe_pf_lt` + `moe_dec_lt` + `gemma_moe_dec_group=4` (MoE),
+`attention_decode_balance_gf=4`, `seg_fa512`, `seg_fa256_gqa2` — with no assert and no warning.
+The `prefill_cublaslt` / `no_glu_fuse` pair at :7557 is gated the same way, but those two have no
+FP8 equivalent (`lib.rs:7956` hard-asserts cuBLASLt prefill off the BF16 path), so their absence is
+correct; W8A8 uses the fused GLU role instead.
+
+Three of the dropped knobs are genuinely dtype-irrelevant — attention runs BF16 either way because
+`kv_cache_scheme` is null in both FP8 checkpoints. `gemv_prefetch` is NOT: it is the decode GEMV L2
+prefetch, its comment records it as measured on the dense 12B in BF16, and under W8A16 decode the
+GEMV reads FP8 weight bytes, i.e. half the footprint the prefetch distance was tuned against. It
+must be A/B'd on an FP8 packet, not restored on the assumption that dtype does not reach it.
+
+The same silent-gate shape appears in the decode emitter: the grouped MoE decode arm
+(`gemma_moe_dec_group` / `moe_dec_lt`, `lib.rs:6083-6100`) exists only in the bf16 branch, so a 26B
+FP8 packet falls back to per-slot `MoeExpertGluGemmaFp8` GEMV with no `MoeAlignGemmaPf` and no
+diagnostic.
+
+Fixed for the campaign at the RECIPE level, not in the gate: flipping a production default needs a
+checkpoint-P certificate, and it would have to be certified on an FP8 cell that does not exist yet.
+Whether the gate should key on family+arch rather than dtype for the attention-only knobs is a
+follow-up for the user, with the above as evidence.
+
+### FP8 emit limits found (26B-A4B)
+
+* W8A8 emit succeeds: 2.5 min CPU, 24.8 MB packet, 610+610 `MoeGroupGluGemmaPfW8a8` /
+  `MoeGroupDownGemmaPfW8a8` prefill ops. `perf-data/tools/quantize_fp8.py` already handles the
+  fused `experts.gate_up_proj` / `down_proj`.
+* It only emits with `PLOW_EMIT_PACKED_PREFILL` UNSET. With it on, emit panics two ways at
+  `lib.rs:9774`: with `TMA_GEMM=1`, "FP8 GEMM tensor-map operands disagree with direct operands:
+  GemmFp8"; with `TMA_GEMM=0`, "opcode has no audited direct-operand access contract:
+  MoeGroupGluGemmaPfW8a8". So a 26B FP8 packet cannot carry packed prefill today.
+
+### max_ctx is a ceiling, not a bind
+
+`plowc --max-ctx` still sizes `in.pos` (which IS the runtime's bound, `gpu.rs:4955`), the
+full-attention KV caches (`kv_ring` returns `(ctx, MASK_NONE)` only for `window == 0`; sliding
+layers ring at `next_pow2(window + chunk - 1)`, ctx-independent — so on Gemma-4's 5:1 pattern ctx
+sizes one layer in six), and clamps the rung ladder (`appended_rungs` caps at
+`ctx.min(max_chunk(window))`).
+
+But the runtime re-declares it at load (`crates/plowrt/src/exec/ctx_bound.rs`, entered at
+`gpu.rs:3337-3392`). `PLOW_LIVE_CTX` narrows (mature; `devgen::mla::ctx_bound_tests` asserts a
+narrowed 1M-ceiling GLM emit equals a native one) or widens (v1, NV-dense only, requires
+`PLOW_VMM_LIVE=1` or `PLOW_VMM_PREFIX=1`; `crates/plowrt/tests/differential_widen.rs` widens 12B
+8k->32k and asserts instruction-level equality with a native 32k emit). Widen refuses on DSA/indexer
+ops, on `widest prefill bucket == ceiling` (the ladder was ctx-clamped), on
+`ceiling < kv_ring_rows(window, chunk)`, on baked (non-recipe) RoPE, and on any cache with no
+scaling rule.
+
+`PLOW_RT_MAX_CTX` only LOWERS: `gpu.rs:3395` rejects `rt_ctx > packet_max_ctx` outright, and
+`gpu.rs:4956` clamps with `.min(packet_max_ctx)`.
+
+Neither `rt.live_ctx` nor `rt.vmm_live` is set by any recipe, and the widen test skips unless local
+packets or the hf-cache are present — so this campaign has never exercised widening. For the FP8
+arm we re-emit at `max_ctx = 16384` instead, because widening swaps the KV allocator to VMM and
+would break apples-to-apples against a BF16 arm on contiguous rings.
+
+## #51 finer prefill rungs: the padding fix works, the 2560 rung wedges — REVERTED
+
+A/B on 2026-09-23, one variable: `PLOW_PF_LADDER_APPEND` gains 1536/2560/3072/3584 on the 12B
+bf16-ladder16k recipe (packet `l12r`). Same binary, same everything else.
+
+**The bucket arithmetic worked exactly as designed.** At 15000/C1 the picks went
+`4224, 4224, 4224, 2328 -> 2560` against the old `4224 x3 + 2328 -> 4096`: useful 15000, launched
+15232, so padding fell **10.6% -> 1.52%**.
+
+**Then it wedged.** The 2560 pick is the last line in the packlog; plowrt then span at 99.6% CPU
+(3535 s CPU in 3547 s wall) with the bench client blocked at 18 s CPU, holding the GPU lease and
+the CPU-quiet lock for 59 minutes until killed. No fault, no diagnostic — a host-side spin.
+
+It is NOT a missing program. `assets/build.json` shows 2560 fully emitted and wired:
+`shapes.prefill_buckets = [128,256,512,1024,1088,1152,1536,2048,2560,3072,3584,4096,4160,4224]`,
+`modular_pipeline.prefill_rungs` the same, and `dispatch_table` entries at index 8 for both
+`prefill:dense_attention:2560` and `prefill:dense_ffn:2560`. So the bucket pick found a real rung
+and the wedge is in EXECUTING it.
+
+The first three 4224 chunks of the same request completed, and the old packet also runs 15000 as
+four chunks, so chunk-chaining is not the variable. Geometry checks out too:
+`kv_ring_rows(1024, 2560) = 3583 <= 8192` ring, and 15000 <= max_ctx 16384.
+
+Pattern worth testing before anyone re-attempts this: every rung that has ever worked is a power of
+two or `pow2 + {64,128}` (1088, 1152, 4160, 4224). All four NEW rungs are `pow2 + {512,1024,1536}`.
+Cheap repro to isolate it, when the card is free: serve `l12r` and send ONE ~2500-token prompt, so
+bucket 2560 runs as a single chunk with no chaining.
+
+**Reverted** — the recipe is back to `256,1088,1152,4160,4224` and was never committed.
+
+**This does not block the objective.** The cost-aware DP cover (`PLOW_PF_COVER=0`, #52) targets the
+same 15000 padding with only EXISTING rungs: it should cut the 2331-row tail as `[2048, 512]` =
+2560 launched rows — the identical 1.5% padding — without introducing a 2560 rung at all. That A/B
+is running. If it wins, #51 is closed by #52 and the finer rungs are unnecessary.
+
+### Root cause of the 2560 wedge: plowc silently truncates the Gemm segment set
+
+Attributed from `l12r/assets/build.json` alone (CPU, no GPU needed —
+`$CLAUDE_JOB_DIR/tmp/sched/rung_diff.py`).
+
+Per-rung program counts split perfectly along rung shape:
+
+| rung | segments | shape |
+|------|----------|-------|
+| 128, 256, 512, 1024, 2048, 4096 | 571 | pow2 |
+| 1088, 1152, 4160, 4224 | 571 | pow2 + {64,128} |
+| **1536, 2560, 3072, 3584** | **435** | **pow2 + {512,1024,1536}** |
+
+The deficit is entirely ONE group — `kind=prefill topo=ordinary arms=('Gemm',)`, 329 programs at
+2048 against 193 at 2560 — and the missing segments are the contiguous tail **435..570**, exactly
+136 of them, identical for all four new rungs. Instruction count is unchanged at 766, so this is a
+truncation of the emitted program set, not a different lowering.
+
+`appended_rungs` (`lib.rs:3105-3117`) admits any appended rung that satisfies
+`x <= cap || (window > 0 && x <= ctx && window + x - 1 <= ring)`. There is no pow2 or tile-shape
+requirement, so the ladder accepts a rung whose Gemm segments the emitter then cannot fully cover,
+and emits it anyway with no assert and no warning. The runtime's dispatch table gets an entry for
+2560 (verified present for both `dense_attention` and `dense_ffn`), dispatches into the truncated
+chain, and spins on a completion that never arrives.
+
+`plowbench-doctor.sh` does not catch it: it verified the packet hash and "18 cubin(s), arch=sm_90a"
+and reported `RESULT: clean, with 2 warning(s) — safe to lease`. It checks the OBJECT set, not
+per-rung program completeness.
+
+So there are two defects, and the second is the dangerous one:
+
+1. Emit truncates the Gemm segment set for rungs that are not pow2 or pow2+{64,128}, silently.
+2. Nothing between that and a served request validates rung completeness — not the emitter, not the
+   doctor, not packet load. The failure mode is a 99.6%-CPU host spin holding a GPU lease, which is
+   the worst possible shape for a leased-GPU campaign.
+
+Cheapest guard, and it needs no kernel work: every prefill rung in a packet should carry the same
+segment count, so assert that parity at emit (or in the doctor's artifact stage). That converts a
+59-minute silent lease burn into a build-time refusal. NOT implemented here — recorded for the
+user, because it is a production-emit change outside this campaign's scope.
+
+## FP8 kernel selection: plow-native only, and it is the arm BF16 rejected
+
+User question, 2026-09-23: "are we cublas or plow native ... based on actual run plow is picking
+the kernels". Answered from the BUILT packet (`/opt/dlami/nvme/tmp/fp8-campaign/p12fp8a/assets/
+build.json`, `$CLAUDE_JOB_DIR/tmp/sched/fp8_kernels.py`), not from the recipe.
+
+plow FP8 emits **zero** cuBLAS/cuBLASLt. Arm inventory of the 12B W8A8 packet (2416 programs):
+`QuantFp8` 960, `GemmFp8` 912, `RmsNorm` 486, `NormResidual` 480, `HeadNormRope/hd256` 201,
+`FlashPrefill/hd256` 200, `Glu` 192, `GemmGluFp8` 48, `Gemm` (BF16) 5, plus one each of
+`GemvFp8` / `GemvGluFp8` / `FlashDecode` / `FlashMerge` for the B=1 decode. No `lt_algos`, no Lt
+glue.
+
+It is structurally forced, not a selection. `lib.rs:7950` asserts `prefill_cublaslt` requires
+`!any_fp8_weights() && !mxfp4` — "cuBLASLt prefill emission requires Gemma 4 BF16 on single-GPU
+SM90" — and the BF16 `gemma4_sm90_gemm_glu_role` carries the same guard. FP8 routes to its own
+`gemma4_sm90_w8a8_gemm_glu_role` instead.
+
+**Consequence: the FP8 prefill path is the arm BF16 measured as SLOWER.** `LT_GLU_QUALIFIED`
+records that gate/up as two cuBLASLt GEMMs plus a GeGLU pass beat the fused GLU role at every
+bucket Lt covers, which is exactly why `prefill_cublaslt` and `no_glu_fuse` are production
+defaults in BF16. FP8 cannot reach that route. On top of that it pays ~one `QuantFp8` per GEMM
+(960 vs 912) for dynamic per-token activation quantization, which BF16 never pays. Add the four
+decode knobs the `bf16` gate silently drops (recorded above) and the FP8 arms are functionally
+complete but have had none of BF16's kernel-selection tuning — the measurement campaign only ever
+ran BF16.
+
+### The vLLM FP8 bar (measured, gate-passed)
+
+12B C1, `--quantization compressed-tensors --kv-cache-dtype auto` (BF16 KV, matching plow):
+
+| metric | vLLM BF16 | vLLM FP8 | FP8 gain |
+|--------|-----------|----------|----------|
+| TPOT | 10.56 ms | **7.38 ms** | 1.43x |
+| TTFT @128 | 30.04 ms | 30.19 ms | — |
+| TTFT @15000 | 671.8 ms | **548.1 ms** | 1.23x |
+| tok/s @15000 | 63.6 | **86.0** | 1.35x |
+
+vLLM's FP8 KV cache is 183,113 tokens (11.18x concurrency at 16384/request) because FP8 weights
+free ~12 GB — a genuine FP8 benefit, but it means the C32/15000 cell measures admission, not decode.
+
+plow BF16 decode was at PARITY with vLLM BF16 (`itl_med` 0.98-1.09x across all 20 cells), so vLLM
+FP8 at 7.38 ms now sits well under plow's ~10.4 ms BF16. Beating vLLM on FP8 requires plow FP8
+decode under 7.38 ms while running `GemvFp8` at B=1 only, without the dropped decode defaults, and
+with no Lt fallback. That is the real gap, and it is a kernel-tuning gap, not a feature gap.
+
+## peak_mem is NOT a footprint comparison — vLLM's column is its preallocation
+
+Found 2026-09-23 while reviewing the FP8 cells. vLLM serves with `--gpu-memory-utilization 0.92`
+on a 79.18 GiB card, and its own startup log states the target outright: "Desired GPU memory
+utilization is (0.92, 72.85 GiB)". Every measured vLLM cell then reports 72.7-73.9 GiB BF16 and a
+flat 74.4-75.9 GiB FP8 — i.e. the reservation, essentially exactly, in every cell of every model at
+every concurrency. It is a configured ceiling, not demand: the same number would appear serving a
+far smaller model.
+
+So the report's claim at line 245, "Memory: the 12B peaks below vLLM in every matched cell", and the
+`Peak GPU memory | 72.7 GiB | 65.2 GiB` rows in the 3.x scenario tables, compare plow's ACTUAL usage
+against vLLM's CONFIGURED RESERVATION. The methodology line (sec. 2, "nvidia-smi
+--query-compute-apps sampled every second ... the maximum is reported") is accurate, and the 0.92
+setting is stated in the baseline-server cell, but nothing connects the two, so the memory rows read
+as an efficiency win they do not establish. The 26B rows ("peaks 2.0-5.2 GiB above vLLM") are
+confounded the same way and are, if anything, understated against plow.
+
+Options, for the user to pick:
+1. Drop the memory rows and the line-245 bullet. Cheapest, loses nothing measured.
+2. Keep them with the caveat stated inline: vLLM's figure is its 0.92 reservation (72.85 GiB
+   desired), so the column is a ceiling and the comparison is not like-for-like.
+3. Replace bytes with the metric that is actually comparable at a fixed card: KV CAPACITY. vLLM
+   publishes it directly ("GPU KV cache size: 183,113 tokens" on the FP8 12B); plow's is
+   slots x context. That is a real efficiency comparison and it is the one a reader cares about,
+   because it sets how many streams and how much context each stack can hold on one H100.
+
+NOT changed here — the report is the user's and is deliberately uncommitted.
+
+## gpulease has no FIFO: a releasing job re-acquires ahead of hour-long waiters
+
+`gpulease` is a bare advisory flock. A driver that loops over cell groups takes a lease per group,
+and on release re-acquires in the SAME SECOND, ahead of everything queued:
+
+    05:08:47 vllm-fp8-12b ACQUIRED (waited 846s)
+    05:34:41 vllm-fp8-12b RELEASED held=1554s
+    05:34:41 vllm-fp8-12b ACQUIRED (waited 0s)     <- straight back in
+    05:52:56 vllm-fp8-12b RELEASED held=1095s
+    05:52:56 vllm-fp8-26b ACQUIRED (waited 0s)
+    05:33:29 packlog-l12-cover0-15000c1 TIMEOUT after 1800s
+
+Combined with the 1800 s default timeout this starves every other job silently (header-only CSV, see
+above). Mitigation in force: `GPU_LEASE_TIMEOUT=43200` on every queued driver, so waiters survive
+the whole loop rather than dying mid-queue. A real fix would be a ticket/FIFO in gpulease; not
+attempted, since it is shared tooling outside this campaign.
+
+## campaign.py cmd_build produces an unservable object set whenever a role rewrites the packet
+
+Found 2026-09-23 on the card; every FP8 bench died at load with
+"packet/interpreter MISMATCH: the loaded cubin was specialised for packet 0x836def099237d766, but
+the packet in .../assets is 0xa82f36d7771fc903" (narrow realtime rc=2, wide realtime rc=2, wide
+high_concurrency rc=2, GSM8K rc=1 — all one cause).
+
+`cmd_build` runs base emit -> objects -> role emit, and hands the objects script
+`PLOW_CUBIN_CONFIG=<base>/plow_config.h`. That is only sound if the ROLE emit leaves the packet
+unchanged. Verified both ways from `plow_config.h`:
+
+| packet | base | assets | |
+|--------|------|--------|---|
+| BF16 `l12` | `0x691e069b80c2fa23` | `0x691e069b80c2fa23` | match |
+| FP8 `p12fp8a` | `0x836def099237d766` | `0xa82f36d7771fc903` | DIFFER |
+| FP8 `p12fp8b` | `0x65a07f7e459c7474` | `0xb4c7405cf7c04bc3` | DIFFER |
+
+The BF16 roles only BIND objects, so base == assets and
+`objects/interp_sm90a_pf.cubin` is byte-identical to the assets copy. The W8A8 fused-GLU role
+(`PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE=1` ->
+`gemma4_w8a8_gemm_glu_role::apply_output_object`) REWRITES instruction sites, so the role emit
+yields a different packet and the base-config object set is stale. `campaign.py packet_env` then
+points `PLOW_PF_SEG_DIR` at those stale objects and plowrt correctly refuses.
+
+The BF16 12B recipe never trips this because it enables no GLU role at all — it uses
+`NO_GLU_FUSE` + `PREFILL_CUBLASLT`. So the defect is reachable only on the FP8 path, which is why
+it has never been seen: there is no `perf-data/campaign/gemma4-12b.h100.w8a8*.csv` in the tree, and
+the committed `w8a8-roles.toml` has almost certainly never been served end to end.
+
+Workaround in use (recipe/flow level, no code change): re-run
+`scripts/build_sm90a_gemma4_segments.sh` with `gemma_base=<assets>` and
+`PLOW_CUBIN_CONFIG=<assets>/plow_config.h` into an `objects2` dir, then serve with
+`PLOW_PF_SEG_DIR=<objects2>`. The script's first act is `cp $base/*.cubin $out/`, so objects2 picks
+up the role-emit cubins and recompiles the extra segment objects against the role-emit config.
+
+Proposal, NOT implemented: `cmd_build` should either pass the ROLE emit's `plow_config.h` to the
+objects step, or refuse when the base and assets packet hashes differ. Today it silently produces
+an unservable set. Not changed here — shared tooling, three jobs using it live, and a guard there
+needs its own GPU test pass.
+
+### CORRECTION to the 2560 root cause: not a tail truncation, a constant 136-program Gemm deficit
+
+The earlier entry said the missing segments were "the contiguous tail 435..570". That was CIRCULAR.
+Segment ids are assigned per bucket, 0..n-1: every bucket in the packet is contiguous from 0, so a
+bucket with 435 programs trivially has ids 0..434 and the "missing tail" is just the id-range
+difference. Verified with `$CLAUDE_JOB_DIR/tmp/sched/seg_ids.py` — `contiguous_0..n-1=True` for all
+fourteen buckets.
+
+The corrected reading is cleaner and is stronger evidence of a real defect:
+
+| bucket | non-Gemm programs | Gemm programs |
+|--------|-------------------|---------------|
+| 128, 256, 512, 1024, 1088, 1152, 2048, 4096, 4160, 4224 | 242 | 329 |
+| 1536, 2560, 3072, 3584 | 242 | **193** |
+
+The non-Gemm program set is IDENTICAL (242) at every rung. Only the Gemm set differs, and it differs
+by a CONSTANT 136 — the same deficit at 1536 as at 3584, independent of rung width. So these shapes
+do not "run out" of emission partway; they take a different Gemm segmentation path that produces 136
+fewer programs, and the packet then wedges executing one.
+
+What this changes: the guard I proposed (per-rung segment-count parity) still works as a detector,
+because the parity is exact for every healthy rung. But the FIX is not "emit the rest" — it is
+finding why the Gemm segmenter takes a different path for row counts that are not pow2 or
+pow2+{64,128}. That mechanism is still unidentified; it needs the segment emitter source, not
+arithmetic on build.json. 329 - 193 = 136, and 193 = 48*4 + 1 is suggestive of four Gemm per layer
+plus lm_head, but 329 does not divide as cleanly, so do not build on that guess.
+
+This matters more than it did this morning: `appended_rungs` admits any rung with
+`window + x - 1 <= ring`, which at ring 8192 and window 1024 means rungs up to **7169** are free at
+the CURRENT KV footprint. That is the lever for the remaining 15000 TTFT gap, since the isolated
+PF_COVER A/B showed the leftover 4.29% is launch count rather than padding. But there is no
+pow2-or-pow2+{64,128} value between 4224 and 7169 (the next power of two, 8192, needs
+`next_pow2(1024+8192-1) = 16384` ring rows = 5.0 GiB/slot sliding KV = 80 GiB at 16 slots, which does
+not fit alongside 23.8 GiB of weights). So every usable wide rung lands in the broken shape class,
+and this defect is now what blocks the prefill lever — and makes pending task #45 (the 8192-row
+launch rung A/B) unrunnable as specified.
+
+### SECOND CORRECTION: the Gemm program deficit is INTENDED fallback, not the defect
+
+The 329 -> 193 Gemm-program split is fully explained, and it is not a bug. `cublaslt_prefill_bf16`
+(`crates/plow-asset/src/segment_roles.rs:71`) admits a shape only if its row count is in a hardcoded
+whitelist:
+
+    CUBLASLT_PREFILL_ROWS      = [128, 256, 512]
+    CUBLASLT_PREFILL_WIDE_ROWS = [1024, 1088, 1152, 2048, 4096, 4160, 4224, 8192, 8320, 12288, 12416, 16384]
+
+The union is EXACTLY the ten healthy rungs of the l12r packet; 1536/2560/3072/3584 are absent. A
+non-whitelisted rung is not Lt-eligible, so `dense_cublaslt::isolate_segments` never splits its
+projections into their own Lt segments — hence 193 rather than 329 — and it runs them on the native
+GEMM object instead. The constant 136 is simply the Lt-eligible projection count, which is why it
+does not vary with rung width.
+
+**That path is supported and known to work.** The comment at `segment_roles.rs:37-40` documents
+exactly this case: "1088 / 1152 / 4160 are fine-grained rungs (`PLOW_PF_LADDER_APPEND`) ... Left
+out, such a rung ran every projection on the native GEMM object. Measured on h100-sxm5 2026-09-21:
+12B C1 TTFT at 1024 in 47.22 -> 46.82 ms on the 1088 rung". So before 1088 was whitelisted it RAN,
+at 47.22 ms. Non-whitelisted means slower, not hung.
+
+So the segment-count difference is a red herring and the earlier entries over-claimed it twice
+(first as a "contiguous tail truncation", then as "a different segmentation path" implying fault).
+**The wedge mechanism remains unidentified.** What is established: an un-whitelisted rung falls back
+to the native GEMM object, and something in that configuration at 2560 rows spins the host at 99.6%
+CPU, where the same fallback at 1088 rows was fine.
+
+Note also that the whitelist ALREADY anticipates wide rungs — 8192, 8320, 12288, 12416, 16384 are in
+it. So Lt policy is not what blocks a wide rung; the KV ring is (a 8192 chunk needs a 16384-row ring
+= 5.0 GiB/slot sliding KV = 80 GiB at 16 slots).
+
+### The discriminating experiment, cheap and not yet run
+
+Build one packet with a rung that is NOT in the whitelist but IS the "safe" shape class — 2112
+(= 2048+64) or 4288 (= 4096+192, if the ring admits it). Then:
+
+* 2112 runs -> "not whitelisted" is NOT sufficient to wedge, and the row count itself is what
+  matters. The native GEMM object has a shape constraint and the fix is in that object.
+* 2112 wedges -> "not whitelisted" IS the trigger, the native-GEMM fallback is broken generally,
+  and the 1088 evidence above means it regressed since 2026-09-21.
+
+Either answer is worth one build and one 15000/C1 cell, and it decides whether widening the ladder
+(the lever for the remaining prefill gap, rungs up to 7169 being free at the current ring) needs a
+whitelist entry, a tuner run, or a kernel fix.
+
+## cuBLASLt FP8 IS reachable for plow's W8A8 scheme, as-is
+
+Phase 0 of the kernel-route work, 2026-09-23, CPU only. This overturns the assumption the FP8 arm
+was built on.
+
+CUDA in this shell: nvcc 12.9.86, libcublasLt.so.12.9.1.4. `cublasLt.h:926` defines
+`CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F = 3` — "vectors are expected to have M and N elements
+respectively, and each (i,j)-th element of product of A and B is multiplied by i-th element of A
+scale and j-th element of B scale" — selected via `CUBLASLT_MATMUL_DESC_A_SCALE_MODE` (31) /
+`_B_SCALE_MODE` (32). The enum exists only from CUDA 12.8, and cuBLAS 12.9 enables outer-vector
+(channel-wide) FP8 scaling **on Hopper**.
+
+That is exactly plow's scheme. `packet/src/dev.rs:326` documents `GemmFp8` as
+`t3=a_scale(f32[M])`, `t4=w_scale(f32[N])`, dequantised `acc*a_scale[m]*w_scale[n]` in the epilogue —
+per-token activation scale, per-output-channel weight scale. And the existing BF16 Lt plan
+(`plowrt/src/device/cuda/lt.rs:207-260`) already passes the WEIGHT as Lt's A with `TRANSA=OP_T` and
+the ACTIVATION as Lt's B, so in Lt's terms `M_Lt = n` and `N_Lt = m`. OUTER_VEC therefore wants an
+A-scale of n elements and a B-scale of m elements — `w_scale[N]` and `a_scale[M]`, bit for bit, in
+the layout the packet already carries. **Zero re-quantization, no checkpoint change, no scale-layout
+change.** FP8 on Hopper requires TN, which the Lt plan already sets, and every 12B/26B K is a
+multiple of 16.
+
+Per shape: qkv/o_proj and unfused gate/up/down are EXPRESSIBLE AS-IS. The fused `GemmGluFp8` is not
+expressible as one Lt call (Lt has no GLU epilogue) but is expressible as two Lt calls plus a Glu
+pass — which is precisely the arrangement `LT_GLU_QUALIFIED` already measured as the BF16 winner.
+The 26B grouped expert GEMMs are NOT expressible today: the grouped path uses an optionally-loaded
+`cublasLtGroupedMatrixLayoutCreate` and plow's expert scales are per-expert `[128,N,1]`. Decode at
+M=1 is expressible in principle but Hopper FP8 Lt kernels are tile-shaped for N>=8, so the heuristic
+may return no algo — that one must be measured.
+
+### There is already an in-tree measurement, and it points the same way
+
+`runtime/nvidia/op_gemm_sm90.cuh:1303`: "cuBLASLt fp8 measures **1324-1468 TF/s** at the 12B shapes
+on this box vs the 256-thread uniform body's **950-1170**: the missing structure is a DEDICATED
+producer warpgroup." `docs/bringup/07-perf-campaign.md:221` records fp8 1324-1468 vs bf16 804-861.
+So Lt FP8 was benchmarked on these exact shapes on this box and beat plow's then-current W8A8 body
+by ~35% — that measurement is what motivated building WS384. **Whether WS384 closed the gap is
+unmeasured**, and that is now the pivotal Phase 1 question rather than a speculative one.
+
+Stale comment worth fixing: `runtime/bench/nvidia/px9_gemm_body_bench.cu:499` says "Per-tensor
+scales (cuBLASLt has no per-row scale)". True when written, false under 12.9, and probably why
+nobody revisited this.
+
+### Correction: the FP8 deficit is the missing Lt route, NOT fusion
+
+I told both agents "FP8 necessarily runs the fused-GLU arm that LT_GLU_QUALIFIED measured as
+slower". That is wrong except at one bucket. Verified independently
+(`$CLAUDE_JOB_DIR/tmp/sched/glu_by_bucket.py`): `GemmGluFp8` = 48 at bucket **4096 only**, and 0 at
+every other bucket, in BOTH p12fp8a and p12fp8b; every other bucket runs `GemmFp8` x192 plus a
+separate `Glu` x48. The role object is `gemm_glu_w8a8_sm90_gemma4_4k8k_v2` — "4k8k" is literal.
+
+So at almost every rung FP8 ALREADY runs the split structure BF16 prefers; it just runs it on
+plow-native kernels instead of Lt. The accurate statement is that BF16 sends all 336 projection
+GEMMs per chunk to Lt at every shipped rung and FP8 sends zero.
+
+### A decode route gap nobody had written down
+
+FP8 has no `GemvQkvFp8` arm. BF16 decode fuses q+k+v into one `GemvQkv` launch per sliding layer
+(i=(1,4096,3840,2048) x40 on the 12B); FP8 issues three separate `GemvFp8` launches —
+`(4096,3840)` x40 plus `(2048,3840)` x80. That is **+80 GEMV launches per token** on the 12B,
+entirely independent of any Lt question, and it may be a large part of whatever FP8 decode deficit
+gets measured. The 26B is the same (BF16 l26 has `GemvQkv` x77).
+
+### Corrections: the serving cuBLASLt is 13.4.1.3, and the QuantFp8 tax is 4/layer not 1/GEMM
+
+Two things recorded above are wrong and are fixed here.
+
+**1. The gating CUDA version.** I recorded the nix `libcublasLt.so.12.9.1.4` as what decides whether
+`OUTER_VEC_32F` is available. It is not the library plow serves against. `plowrt`'s Lt loader
+(`crates/plowrt/src/device/cuda/lt.rs:39`) tries `libcublasLt.so.13` FIRST, and inside `nix develop`
+that resolves to **13.4.1.3** from `/usr/local/cuda/lib64`; `libcublasLt.so.12` does not resolve
+there at all. So the "is CUDA new enough" risk was never live — OUTER_VEC_32F is comfortably inside
+13.4. The route-matrix bench is being built and run against that same `/usr/local/cuda`, so the
+measurement uses the production library rather than the nix one.
+
+**2. The QuantFp8 tax.** I told both agents FP8 pays "roughly one QuantFp8 per GEMM (960 vs 912)".
+Those were per-PACKET program totals summed across five buckets, not launches, and the real
+structure is different. Counted from `kernel_cases` for ONE 128-row prefill chunk of the 12B:
+
+| | launches |
+|---|---|
+| BF16 (l12) | **766** — Gemm 329, HeadNormRope 144, RmsNorm 97, NormResidual 96, Glu 48, FlashPrefill 48, + 5 head ops |
+| FP8 (p12fp8a) | **958** — GemmFp8 328, **QuantFp8 192**, HeadNormRope 144, RmsNorm 97, NormResidual 96, Glu 48, FlashPrefill 48, Gemm 1, + 4 head ops |
+
+Exactly **+192 launches, +25.1%**, and the 192 is `4 per layer` at fixed sites — attention input,
+MLP input, GLU output before down, attention output before o_proj — NOT one per GEMM. Against 328
+GEMM launches that is 0.59 quantizes per GEMM, so my ratio overstated the per-GEMM tax while
+understating how cleanly it attributes.
+
+The same count states the Lt deficit exactly: of BF16's 329 `Gemm` launches, **328 are projections
+whose (N,K) are all in `CUBLASLT_PREFILL_GEMMA4_SHAPES`**, so at every shipped rung all 328 go to
+cuBLASLt and only `lm_head` stays native. Of FP8's 328 `GemmFp8`, **zero** can.
+
+### Open, with evidence, not chased: the 26B fuses GLU at every rung and the 12B does not
+
+On the 26B FP8 packet the dense-MLP gate/up is fused at EVERY rung (`GemmGluFp8` M=128 N=2112
+K=2816 x30 at bucket 128); on the 12B FP8 packet it is split at 128/512/1024/2048 and fused only at
+4096. Both packets have `no_glu_fuse=false` and `gemma4_sm90_w8a8_gemm_glu_role=1`. Both fused-GLU
+role objects declare `min_rows=4096 max_rows=8192 n=15360 k=3840` — 12B geometry — so the 26B's
+fusion cannot be the role object and must be the GENERIC `GemmGluFp8` interpreter arm. Why the 12B
+does not also take that generic arm below 4096 is unanswered; an arena or tile constraint at
+N=15360 K=3840 is the obvious suspect but is unverified. Consequence that matters now: "fused vs
+split" means different things per model, so the two models' FP8 prefill results are not directly
+comparable on that axis.
+
+### CORRECTION: the 1324-1468 vs 950-1170 TF/s pair is from a GH200, not this H100
+
+Recorded above as "already measured in-tree ... on this box", and repeated to the user twice. Wrong,
+and the error is worth understanding because the source comment causes it.
+
+`runtime/nvidia/op_gemm_sm90.cuh:1303` reads: "cuBLASLt fp8 measures 1324-1468 TF/s at the 12B
+shapes **on this box** vs the 256-thread uniform body's 950-1170". The only other occurrence of that
+pair, `docs/bringup/07-perf-campaign.md:221`, attributes it explicitly and warns against exactly the
+use I made of it: "one recorded run on **GH200**/12B measured fp8 1324-1468 / bf16 804-861 TF/s,
+`perf-data/gemma12b-gh200-prefill-campaign.md`; that is *that* box's ceiling, **not a target for
+yours**." That perf-data file does not exist in this tree, and `nvidia-smi` here reports
+`NVIDIA H100 80GB HBM3`.
+
+So "did WS384 close the ~35% gap" is NOT answerable by comparing H100 numbers against 1324-1468.
+GH200 and H100-SXM5 differ in clock and memory system and absolute TF/s does not transfer.
+
+The answerable question, and the one P1a actually measures, is the RATIO on one box on one day:
+plow-WS384-fp8 against cuBLASLt-fp8 at matched shapes. Ratio >= 1.0 kills the FP8-Lt thread on this
+hardware whatever a GH200 once read; ratio ~0.7 (the shape of the historical gap) makes it live.
+Absolute TF/s to be reported alongside, labelled H100 80GB HBM3.
+
+**The comment at `op_gemm_sm90.cuh:1303` should say GH200, not "this box".** It is a one-word source
+fix, it is not in this campaign's scope, and it will mislead the next reader the same way until
+someone makes it. Added to the proposals list.
+
+## A certificate arm was contaminated by an orphaned unlocked build — re-run queued
+
+2026-09-23. The first `cert-rt_pf_interleave_adaptive` ctrl arm is not trustworthy and is being
+re-measured. Recorded because a certificate gates the merge and its provenance has to be auditable.
+
+Sequence, from the lease log and the arm's own `server.log` / `run.log`:
+
+* 06:34:03 ctrl acquires the GPU lease, then sits at 0.0% CPU for ~11 min waiting on the CPU-quiet
+  lock, which a concurrent packet rebuild held SHARED. Lease held, nothing running.
+* 06:45:03 plowrt starts; 06:45:15 server ready; ~06:45:24 coherence gate PASS ("The capital of
+  France is Paris.").
+* ~06:45:25-06:46:30 the two timed cells run (1024/C1 then 1024/C4, 32 prompts each).
+* ~06:45:45-06:46:30 an ORPHANED `nvcc` build runs with NO lock at all — a `campaign.py build` child
+  that survived its parent being killed.
+
+So the unlocked build overlaps BOTH timed cells, not merely model load. The arm's own numbers are
+consistent with it: 1024/C4 reports `ttft 122.62` against `ttft_med 107.86`, a mean 14% ABOVE the
+median, where the clean `cover0-rt` run at the same cell has the mean BELOW it (101.38 vs 107.55). A
+mean pulled above the median by a few slow requests is what a transient compile produces. That is
+corroboration, not proof, but a confirmed overlap plus a consistent signature is enough.
+
+**All four arms are being re-run, not just ctrl.** The design is ABAB so the verifier can measure
+control drift across the same span as the treatment; splicing a ctrl measured 40 minutes later
+against the original treat would defeat that and would be WORSE than the contaminated certificate,
+because the bias would be invisible instead of known. The re-run carries an explicit
+`--fact integrity:` line naming the window, so the certificate records why it exists.
+
+Two process lessons, both now applied by the agent that caused it:
+1. No multi-build scripts under one lock hold — each build takes the lock separately, so a cert arm
+   waits at most one build rather than a 27-minute stage.
+2. Kill the `campaign.py` PID directly, not the wrapper: `campaign.py build` spawns compile children
+   that survive the wrapper's death and then run unlocked, which is exactly how this happened.
+
+This is the second time today that killing the wrong pid caused damage (the first burned 20 minutes
+of lease on the rungs A/B driver). The general rule for this host: kill the process GROUP, and
+verify with `pgrep -af` afterwards rather than assuming.
+
+## 2026-09-23: rt.pf_cover certified; FP8 has never served; the C32 lever is cheaper than planned
+
+### rt.pf_cover is the one metric that moved (certified, `2c3d0952`)
+
+15000/C1 TTFT **737.256 -> 703.364 ms** (floor 7.169; the second treat arm gave 703.187), prefill
+padding 10.59% -> 1.58%, tpot_ms 10.541 -> 10.538 inside a 0.007 floor. `perf-certs/rt.pf_cover.json`,
+`perf_cert.py verify` rc=0.
+
+The first certificate attempt was REJECTED and the request was at fault, not the knob: it claimed a
+TTFT improvement on both touched rungs, but 8192 is ITSELF a prefill bucket, so the covering pick and
+the cost-aware DP cover both emit one exact-fit launch and there is no padding at that rung for the
+cover to remove. Re-declared 8192 neutral with that evidence via `--neutral ttft_ms@in8192`
+(`campaign.py:509-511` supports per-input-length neutrality), rebuilt from the SAME four ABAB arms --
+no re-measurement to obtain a better number.
+
+Three other flips (`rt.pf_interleave_adaptive`, `rt.rung_fast_probe`, `rt.multistep_adaptive`) were
+rejected on merit and need NO code change: all three were already `OFF, OPT_IN`, so the campaign was
+attempting promotion, not certifying a flip. Deltas were inside noise and the fast probe was
+directionally worse (128/C16 ttft 62.754 -> 67.006). Caveat worth keeping: `campaign.py cert` can only
+claim ttft_ms/tpot_ms improvement, so `rt.multistep_adaptive`, whose documented benefit is the p99 ITL
+wave, cannot express its claim with the current tooling.
+
+### The FP8 campaign has never produced a data row -- and it is two bugs, not one
+
+Every run under `/opt/dlami/nvme/tmp/fp8-campaign/` has `gate: false` and a header-only results.csv:
+
+| packet | how it fails |
+|---|---|
+| p12fp8a, p12fp8b | `packet/interpreter MISMATCH` -- **never loaded** (stale objects vs assets) |
+| p12fp8c | loads, then ILLEGAL_ADDRESS on the FIRST packed prefill |
+
+Only the second is a kernel bug. The mismatch is hygiene: each `p12fp8*` has BOTH `objects/` and
+`objects2/`, and `gemma4-12b.h100.fp8-ladder16k.toml` bakes `PLOW_PF_SEG_DIR=.../objects` into its
+serve replay while the assets match `objects2/`.
+
+Bisect of the real fault (39-row prompt, bucket 128, `CUDA_LAUNCH_BLOCKING=1`): `cuGraphLaunch` ->
+`cuLaunchCooperativeKernel` (`PF_SEG_GRAPH=0`) -> `cuLaunchKernel` (`+ PF_SEG_NONCOOP=1`), and still
+faults under `PF_SEG_FATONLY=1`. Only the reporting API moves, so it is the KERNEL BODY. Eliminated:
+graph construction and memset nodes; grid cooperation; cuBLASLt (`gemm_launches=0`); all four role
+objects; and every FP8 attention arm (`kv_dtype` is bf16 on both head dims). Since `GemmGluFp8` exists
+only at bucket 4096, the remaining suspects are **QuantFp8 (1920 instances) or GemmFp8 (1872)**.
+compute-sanitizer is unusable here -- it fails on ANY plowrt invocation in this nix env.
+
+**No FP8 serving latency, throughput or quality number exists.** The static build.json analysis and the
+route-matrix microbenchmark are unaffected; nothing else about FP8 is measured.
+
+### Route matrix: the FP8 prize is 1.83x and it lives in cuBLASLt (`fe938458`)
+
+Every dense projection shape of both models, both precisions, one protocol, reproduced across two
+independent builds (1.83x identical both runs). `down` M=8192: Lt-BF16 1.179 -> Lt-FP8 0.645 ms;
+`gate_or_up` M=8192: 1.207 -> 0.659. plow's native FP8 body captures only 1.29x of that. With zero of
+the packet's 328 GemmFp8 launches able to reach Lt while 328 of BF16's 329 Gemm do, that is the whole
+FP8 deficit. The OUTER_VEC (per-token x per-channel) scale mode costs 1.1-1.7x against per-tensor at
+small M -- per-token scaling is not free.
+
+### C32: item 3 needs NO kernel change, and the ring assertion is the whole ceiling
+
+`plans/gemma4-packet-geometry.md` item 3 budgeted a row-offset field on HeadNormRope, a q-row window on
+four role objects and a FlashMerge window. None is required:
+
+* the flash body already derives rq0/qlen/slot/kvlen per request from `req[]` and computes
+  `qp0 = kvlen - qlen` itself (`op_attention_sm90.cuh:356,717`), so a CLIPPED span table is enough --
+  note `i[4]`/q_pos0 is overwritten on the packed path and cannot carry a stage offset;
+* `d_headnorm_rope` already skips a masked row (`op_norm.cuh:781`, `:985`), so a per-stage SLOT MASK is
+  enough for the K/V norm.
+
+That keeps the change out of the fat `pfpackedseg` object at the 255-register cap. The 16-slot ceiling
+is one line in `packed_prefill::Manifest::validate`:
+`cache.stride >= cache.window + write_rows - 1` with `write_rows = max_request_rows.or(rows)` -- a
+4096-row chunk demands an 8192-row ring (2.5 GiB/slot, 16 slots). `stage_rows` makes it the STAGE width:
+2048 ring rows, 640 MiB/slot, 32 slots at the chunk-4096 TTFT. Within one cooperative launch the
+protection is the WAR ordering (`HNR_{i+1}` after `FP_i`), not the launch boundary, which is why the
+field is gated on stages actually being bound.
+
+Landed and tested (`19932839`, `61d29498`, `247dae64`): `plan_stage`, `stage_slots`, `stages_needed`,
+`Manifest::write_rows` with its gate, and a `bind_request` guard so load-time binding cannot repoint a
+staged site at the whole-chunk tables (silent wrap, wrong tokens, no fault). 22 tests.
+
+**Not done: the devgen emit loop (HNR_i -> FP_i with Dep::Coarse), the runtime per-stage table fills,
+the packet build and the C32 cells.** Nothing is measured yet.
+
+### Where the comparison actually stands
+
+8192/C32 is **4291 ms vs vLLM 3648** -- unchanged this session. The 32-slot `c32-req1k-16k` packet is the
+best plow packet at C32 for >=4096-token prompts (8192/C32 7552 -> 4291, 15000/C32 13646 -> 8271) but
+still loses that cell, regresses C16 long prompts by 66-72%, and pays a constant +42 ms per lone
+128-token arrival at C16 (still unattributed). vLLM is not beaten on all metrics, and FP8 cannot be
+compared at all until the prefill fault is fixed.

@@ -7696,10 +7696,6 @@ fn apply_production_defaults(
                 emit_config::note_production_default(id, "true".into());
             }
         }
-        if cfg.fa_mmaqk.is_none() {
-            cfg.fa_mmaqk = Some(3);
-            emit_config::note_production_default("fa_mmaqk", "3".into());
-        }
         if capabilities.moe && cfg.gemma_moe_dec_group.is_none() {
             cfg.gemma_moe_dec_group = Some(4);
             emit_config::note_production_default("gemma_moe_dec_group", "4".into());
@@ -9858,6 +9854,12 @@ fn emit_dense_gqa(
             let request = plow_asset::packed_prefill::Manifest {
                 version: live.version,
                 max_request_rows: ecfg.max_request_chunk,
+                // Emitting a staged chunk is not wired yet: the per-stage tables exist
+                // (packed_prefill::plan_stage / stage_slots) but nothing emits the HNR_i -> FP_i
+                // chain or binds a stage, so declaring stage_rows here would shorten the ring
+                // while the launch still wrote the whole chunk. validate() refuses that pairing.
+                stage_rows: None,
+                stages: Vec::new(),
                 slot,
                 request,
                 maps,

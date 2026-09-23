@@ -286,3 +286,30 @@ Validation plan: (1) ring A/B on the c32c null (step_bench B=16, same tree/objec
 * Adopted: GQA2 role on the 4160/4224 rungs (block 3.45 -> 3.32 ms per 4224-row launch).
 * Mux: unified prefill + decode rows stay in the prefill's bucket; trim only when the spill exceeds
   PLOW_PF_CHUNK_COST (4224+3 on an 8192 rung), never 1024+1.
+
+### Item 3 revision (2026-09-23): no kernel changes, and the emit ordering is not a blocker
+
+Two corrections to the design above, both verified by reading the kernels and the emit path.
+
+* **No kernel touch points.** The memo asked for a row offset on `d_headnorm_rope` and a q-row
+  window on `d_flash_prefill_mux` plus the four role objects. Neither is needed:
+  * Flash already self-derives its q origin — `q_pos0` (`i[4]`) is OVERWRITTEN in the packed path
+    with `qp0 = kvlen - qlen` (`op_attention_sm90.cuh:356,717`). Handing it a span table clipped
+    to the stage (`plan_stage`: `rq0+taken`, `len`, `slot`, `start+taken+len`) therefore moves the
+    q window with no new operand. This is also why `q_pos0` cannot carry a stage offset itself.
+  * HNR already skips rows outside the stage — `d_headnorm_rope` drops any row with `pfslot[t] < 0`
+    (`op_norm.cuh:781`, fp8 arm `:985`), which is exactly what `stage_slots` writes.
+  This keeps the change out of the fat `pfpackedseg` object at the 255-register cap, so the
+  in-situ-vs-isolated hazard does not apply.
+
+* **Per-stage tensor declaration does not need hoisting.** `pf.request.slot` / `pf.request.table`
+  are declared AFTER the programs are emitted (`devgen/src/lib.rs:9717-9727`) and reach the
+  instructions by load-time operand patching (`packed_prefill::bind_request`), not by being in
+  scope at emit time. The per-stage tensors ride the same route: declare
+  `pf.request.slot.{i}` / `pf.request.table.{i}` in that same block, then have devgen rewrite the
+  stage-i sites to those handles and record `stages[i]`. `bind_request` already skips anything
+  `is_staged_site` matches (`247dae64`), so load time leaves them alone. The emit loop only has to
+  hand back which instruction indices belong to which stage — a side table, not a reordering.
+
+Remaining for item 3: the `HNR_i -> FP_i` emit loop with `Dep::Coarse`, the runtime per-stage
+table fills, the packet build, and the C32 ladder.

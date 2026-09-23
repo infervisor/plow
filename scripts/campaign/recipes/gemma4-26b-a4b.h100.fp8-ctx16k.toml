@@ -1,0 +1,169 @@
+# Gemma-4-26B-A4B-it, H100 SXM5, FP8 (PTPC) weights: W8A8 prefill, W8A16 decode, BF16 KV + lm_head.
+# The FP8 twin of gemma4-26b-a4b.h100.bf16-ctx16k.toml, same geometry, same ladder, same profiles.
+#
+# STATUS: the EMIT is proved (plowc, 2026-09-23, 2.5 min CPU: 24.8 MB packet carrying 610
+# MoeGroupGluGemmaPfW8a8 + 610 MoeGroupDownGemmaPfW8a8 grouped fp8 prefill GEMMs and the fp8 MoE
+# decode pair). The checkpoint is built and on disk. What is NOT yet measured on this recipe is a
+# served number; treat every claim below as emit-level until a bench row exists.
+#
+# WHY A 26B FP8 ARM IS WORTH BUILDING: the BF16 26B packet peaks at 77.4-80.8 GiB on an 80 GiB
+# card (perf-data/campaign/gemma4-26b-a4b.h100.bf16-ctx16k.csv, 2026-09-23) — it is out of room,
+# which is why it serves 16 slots and why C32 queues. FP8 weights return ~24.5 GiB. The prize here
+# is headroom (slots / context), and TPOT is a RISK, not an expected win — see the decode note.
+#
+# THREE THINGS THE 26B FP8 PATH CANNOT HAVE, each verified in the code:
+#
+#  1. PACKED PREFILL IS UNAVAILABLE, AND IT TAKES THE HD256/GQA2 ROLE WITH IT.
+#     PLOW_EMIT_PACKED_PREFILL=1 panics at devgen/src/lib.rs:9774, two different ways:
+#       with PLOW_TMA_GEMM=1 -> "FP8 GEMM tensor-map operands disagree with direct operands: GemmFp8"
+#       with PLOW_TMA_GEMM=0 -> "opcode has no audited direct-operand access contract:
+#                                MoeGroupGluGemmaPfW8a8"
+#     PROPOSAL, NOT A FIX -- do not apply without an audit. The second panic comes from the
+#     live-KV direct-operand allow-list in crates/plow-asset/src/live_kv.rs (the match arm ending
+#     at :645). It already lists the BF16 twins MoeGroupGluGemmaPf / MoeGroupDownGemmaPf under a
+#     comment asserting they read and write only activations, routing metadata and expert weights
+#     and never name a KV pair. MoeGroupGluGemmaPfW8a8 / MoeGroupDownGemmaPfW8a8 are absent. The
+#     symmetry argument says they belong there, but that is the hypothesis an audit OPENS with,
+#     not the evidence that closes one: listing an opcode here is an assertion that it can never
+#     reach the cache the manifest guards, and if it is wrong the failure is silent KV aliasing --
+#     a wrong answer, not a crash. The W8A8 arm also carries operands the BF16 arm does not (the
+#     e4m3 activation twin xqh and its per-row f32 a_scale ash; the down op additionally takes
+#     fscale[pad]), which is exactly the part the existing comment never covered. An auditor would
+#     have to confirm those three extra tensors, and the gathered fug/fuq scratch, are all
+#     activation-class and cannot alias a KV range under packed prefill. And it would not by
+#     itself give a testable path: the FIRST panic (TMA map operands disagreeing with the direct
+#     operands for GemmFp8) is a separate, unrelated defect and still blocks packed prefill.
+#     Consequence today: with packed prefill off, the paired sliding-attention role ALSO refuses --
+#     "prefill attention object: paired HD256/GQA2 role requires packed prefill metadata"
+#     (lib.rs:9826). The BF16 26B recipe reuses that role (26B sliding geometry is byte-for-byte
+#     the 12B's). The FP8 arm cannot. So this packet is NOT the same deployment as the BF16 26B
+#     packet on two axes -- no packed prefill, no HD256/GQA2 role -- and every cell must say so.
+#
+#  2. GROUPED MoE DECODE IS SILENTLY LOST. PLOW_GEMMA_MOE_DEC_GROUP and the Lt decode route are
+#     read only inside the bf16 branch of the decode emitter (lib.rs:6083-6100). Under any fp8 the
+#     26B falls back to per-slot MoeExpertGluGemmaFp8 / MoeExpertDownGemmaFp8 GEMV with no
+#     MoeAlignGemmaPf — no assert, no warning. The BF16 recipe's measured grouped-decode win is
+#     gone. This is the number to check FIRST on this packet: batched TPOT (C4/C16) against
+#     gemma4-26b-a4b.h100.bf16-ctx16k.csv at the same cells.
+#
+#  3. THE cuBLASLt ROUTES ARE REFUSED, NOT JUST OFF. PLOW_EMIT_PREFILL_CUBLASLT hard-asserts under
+#     any fp8 (lib.rs:7956) and PLOW_EMIT_MOE_PF_LT / _DEC_LT panic if set explicitly
+#     (lib.rs:9559 / :9570). The BF16 26B recipe calls MOE_PREFILL_CUBLASLT "the shape-agnostic
+#     production path"; the FP8 arm runs the native grouped fp8 wgmma bodies instead.
+#
+# Build, inside `nix develop`:
+#   python3 scripts/campaign/campaign.py build <this> --out DIR --no-probe
+
+[cell]
+name = "gemma4-26b-a4b.h100.fp8-ctx16k"
+model = "google/gemma-4-26b-a4b-it"
+revision = "local"
+hf_dir = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
+# Both BF16 shards + the fp8/-keyed PTPC twins, all named *.safetensors: Checkpoint::open globs
+# the directory (it does not read model.safetensors.index.json), so the index is deliberately
+# absent. Twins from perf-data/tools/quantize_fp8.py, 265 projections / 530 tensors / 24.55 GB,
+# including the fused experts.gate_up_proj [128,1408,2816] and experts.down_proj [128,2816,704]
+# with one f32 scale per output row.
+checkpoint_dir = "/opt/dlami/nvme/tmp/fp8-campaign/gemma26b-w8a8/checkpoint-mixed"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "w8a8"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_FP8 = "1"
+# PLOW_W8A8 is NOT optional on a MoE model. With PLOW_FP8 alone, `moe_pf` at lib.rs:9237 is false
+# and the emitter silently produces a DECODE-ONLY blob: `if c.moe && !moe_pf { break; }` skips the
+# whole prefill ladder, with no warning. W8A8 is what turns the grouped fp8 MoE prefill on.
+PLOW_W8A8 = "1"
+PLOW_SEG_PURE_GEMM = "fp8"
+PLOW_SEG_FA512 = "1"               # [FP8-TAX] GEMMA4_SEG_FA512_DEFAULT is bf16-gated
+PLOW_SEG_FA256_GQA2 = "1"          # [FP8-TAX] GEMMA4_SEG_FA256_GQA2_DEFAULT is bf16-gated
+# [FP8-TAX] attention-side Hopper defaults the bf16 gate withholds; BF16 KV either way, so the
+# weight encoding is irrelevant to them. gemv_prefetch is NOT restored (dense-only anyway, and
+# dtype-dependent: W8A16 decode streams half the bytes it was tuned against).
+PLOW_SLIDING_NS_CAP = "1"
+PLOW_SLIDING_NS_GRID = "1"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+# PLOW_EMIT_PACKED_PREFILL is intentionally ABSENT -- see note 1 in the header. It is default-off
+# off the BF16 Hopper path, so leaving it unset is what makes this packet emit at all.
+# TMA stays ON, as in the BF16 26B recipe. PLOW_TMA_GEMM=0 is NOT a rollback on Gemma-4 H100:
+# a mapless packet gets segment policy mode 0 from plowrt's DevProg::inferred_segment_policy, every
+# non-flash segment becomes class 8 -> the GEMM-only WS384 object, and the first prefill launch
+# faults (CUDA 719). A W8A8 object set already has FATLITE off (build_sm90a_gemma4_segments.sh:
+# gemma_fatlite defaults to gemma_bf16 = 0), which removes the second half of that coupling, and
+# [serve.env] forces PLOW_PF_SEG_PURE -- but do not reach for =0 as a safe knob here.
+PLOW_TMA_GEMM = "1"
+PLOW_FA_MMAQK = "3"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
+PLOW_PF_LADDER_APPEND = "256,1152,4224"
+PLOW_MAX_CHUNK = "4096"
+PLOW_FUSE_ARGMAX = "0"
+PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+# NO role_files and NO [emit_roles]: with packed prefill unavailable (note 1) the paired
+# HD256/GQA2 role refuses at lib.rs:9826, so there is no role object for the emit to bind. Sliding
+# attention runs the in-object arm instead. This is the biggest single difference from the BF16
+# 26B packet and the first thing to revisit once the live_kv allow-list is fixed.
+role_files = []
+[objects.env]
+# -DPLOW_NV_W8A8=1 on every segment object. Mandatory: the T6 (w8a16) body would misread the
+# e4m3 activation bytes as bf16, and it is also what compiles the grouped fp8 MoE prefill bodies
+# (runtime/nvidia/op_moe_sm90.cuh, `#if PLOW_NV_W8A8`, wgmma.m64n128k32.f32.e4m3.e4m3).
+PLOW_BUILD_W8A8 = "1"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+
+# [emit_roles] is present but turns every role OFF. It must exist: campaign.py only runs
+# base emit -> [objects] -> role emit when the recipe has an [emit_roles] table (cmd_build's
+# `if roles:`), and without it the W8A8 SEGMENT objects (-DPLOW_NV_W8A8, which PLOW_PF_SEG_DIR
+# serves from) would never be built. For the record, each role and why it is off:
+#  - HD256/GQA2 paired sliding role: refused, needs packed-prefill metadata (note 1). BF16 uses it.
+#  - HD512 px4 BQ64: hardcodes n_kv_head=1; this checkpoint has 2. Off in BF16 too.
+#  - W8A8 fused GLU role: 12B-PINNED. gemma4_w8a8_gemm_glu_role::exact_shape requires N=15360 /
+#    K=3840; the 26B dense fused GLU is N=4224 / K=2816, so enabling it panics at lib.rs:9838
+#    ("packet has no M4096/M8192 Gemma-4 W8A8 GemmGlu rungs"). Same 12B pinning as the BF16 role.
+[emit_roles.env]
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "0"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "0"
+PLOW_PF_SEG_PURE = "fp8"
+PLOW_PF_SEG_FA512 = "1"
+PLOW_PF_INTERLEAVE = "0"
+PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
+LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
+model_id = "gemma-4-26b-a4b-it"
+gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer in one short sentence.<end_of_turn>\n<start_of_turn>model\n"
+
+[bench.profiles.realtime]
+in_lens = "128 1024 4096 8192 15000"
+concs = "1 4"
+serve_env = { PLOW_MULTISTEP = "0", PLOW_MULTISTEP_ADAPTIVE = "1", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0", PLOW_PF_INTERLEAVE_ADAPTIVE = "1" }
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096 8192 15000"
+concs = "16 32"
+nprompt = 64
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
+
+[reference]
+csv = "perf-data/campaign/gemma4-26b-a4b.h100.reference-vllm028-bf16.csv"

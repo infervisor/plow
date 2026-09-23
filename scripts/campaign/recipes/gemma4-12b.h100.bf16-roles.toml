@@ -20,6 +20,9 @@ args = ["--segmented"]
 [emit.env]
 # The HD256-GQA2 / HD512 prefill role objects bind the TMA map; opt-in (its P certificate was rejected).
 PLOW_TMA_GEMM = "1"
+# Decode attention QK on the tensor cores; opt-in (its P certificate was rejected:
+# 26B 128/C1 TPOT 5.400 -> 5.418 ms, worse than its 0.002 floor, while longer contexts win).
+PLOW_FA_MMAQK = "3"
 PLOW_DECODE_BATCH_LADDER = "1"     # C1 cell; widen to 1,2,4,8,16 for C4/C16 (41 GiB KV at ctx 8192)
 PLOW_MAX_CHUNK = "4096"
 

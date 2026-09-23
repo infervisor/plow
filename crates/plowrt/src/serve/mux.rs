@@ -472,7 +472,8 @@ pub fn spawn(
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let rung_widths: Option<Box<[u32]>> = None;
     let (capacity, rung_widths) = {
-        let max_rung = crate::config::RuntimeConfig::get().decode_max_rung;
+        let honor = crate::serve::policy::honor_max_rung();
+        let max_rung = honor.then(|| crate::config::RuntimeConfig::get().decode_max_rung).flatten();
         let min_rung = crate::config::RuntimeConfig::get().amd.decode_min_rung;
         if max_rung.is_some() || min_rung.is_some() {
             if let Some(widths) = rung_widths {
@@ -794,6 +795,12 @@ pub fn spawn(
                 metrics
                     .decode_occupied_extent
                     .store(occupied_extent as u64, Ordering::Relaxed);
+                crate::serve::policy::observe(occupied_extent, waiting.len());
+                if let Some(rc) = rung_controller.as_mut() {
+                    rc.set_fast_probe(crate::serve::policy::fast_probe(
+                        crate::config::RuntimeConfig::get().rung_fast_probe,
+                    ));
+                }
                 if admission != before {
                     Metrics::inc(&metrics.decode_rung_switches);
                     tracing::info!(
@@ -1315,7 +1322,10 @@ fn queue_aging_ms(slo_ms: f64) -> f64 {
 /// Wait after which a queued request is shed: `PLOW_QUEUE_TTL_MS` when set, else derived.
 #[inline]
 fn queue_ttl_ms(slo_ms: f64) -> f64 {
-    queue_ttl_with(slo_ms, crate::config::RuntimeConfig::get().queue_ttl_ms)
+    queue_ttl_with(
+        slo_ms,
+        crate::serve::policy::queue_ttl_ms(crate::config::RuntimeConfig::get().queue_ttl_ms),
+    )
 }
 
 /// `Some(ms <= 0)` never sheds.
@@ -1840,22 +1850,19 @@ fn run_one_tick(
 
             // Whether this tick does any prefill work — reported to the dispatcher
             // so prefill tick durations never enter the decode-service EWMA.
-            let did_prefill = slots
-                .iter()
-                .take(cap)
-                .any(|s| s.as_ref().map(|s| s.step == 0).unwrap_or(false));
+            //
+            // A row the pipe owes a token has already sampled (only sampling rows are parked), so
+            // it is waiting for a readback, not for prefill. Counting it here would be a
+            // liveness hole: its `step` stays 0 until that token is read, `gpu_decode_feeds`
+            // gathers only `step > 0` rows, and with no other live row `feeds` is empty, so
+            // neither the decode path nor the drain below runs and nothing ever completes the
+            // step holding its token.
+            let did_prefill = (0..cap.min(slots.len()))
+                .any(|i| slots[i].as_ref().is_some_and(|s| s.step == 0) && !e.pipe_owes(i));
 
             // Decode feeds, gathered BEFORE the prefill pass so a slot prefilled
             // this tick (which just produced its first token) doesn't also step.
-            let mut feeds: Vec<(usize, u32)> = slots
-                .iter()
-                .enumerate()
-                .take(cap)
-                .filter_map(|(i, s)| {
-                    let s = s.as_ref()?;
-                    (s.step > 0).then(|| (i, *s.out_ids.last().expect("step > 0 implies output")))
-                })
-                .collect();
+            let mut feeds = gpu_decode_feeds(&slots, cap);
 
             // PX-17: throughput mode — while any slot is mid-prefill, drop the decode
             // feeds so the prefill chain runs uninterrupted and no decode launch pays
@@ -1864,6 +1871,48 @@ fn run_one_tick(
             let defer_decode = pf_defer_decode();
             if defer_decode && did_prefill {
                 feeds.clear();
+            }
+
+            // A pipelined mixed launch takes its decode rows' tokens from the device, so a
+            // prefill tick no longer has to read the in-flight step out first.
+            let pipe_prefill = e.pipe_prefill_enabled()
+                && e.pf_batch_enabled()
+                && !e.pipe_full()
+                && (feeds.is_empty() || gpu_pipe_rows(&feeds, &slots));
+            // A pipelined decode step may still be in flight from the previous tick. Anything
+            // but its exact continuation (prefill the pipe cannot carry, a changed row set, a row
+            // the device cannot sample) completes it first, streams its tokens, and re-gathers.
+            if e.pipe_busy()
+                && ((did_prefill && !pipe_prefill)
+                    || (!did_prefill
+                        && (!e.pipe_covers(&feeds) || !gpu_pipe_rows(&feeds, &slots))))
+            {
+                let mut done = std::mem::take(&mut obs.host.pipe_tokens);
+                match e.pipe_drain(&mut done) {
+                    Ok(()) => {
+                        for &(i, token) in &done {
+                            if slots[i].is_some() {
+                                disconnected[i] |= gpu_emit_slot_token(
+                                    &mut slots[i],
+                                    &arena,
+                                    bundle,
+                                    token,
+                                    &mut tokens_this_tick,
+                                    stop.as_slice(),
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        note_fault(&mut tick_fault, &err);
+                        fail_feeds(&mut slots, &feeds, &arena, &err);
+                    }
+                }
+                obs.host.pipe_tokens = done;
+                feeds = gpu_decode_feeds(&slots, cap);
+                if defer_decode && did_prefill {
+                    feeds.clear();
+                }
             }
 
             // A mixed packet variant executes existing decode rows and a
@@ -2060,7 +2109,7 @@ fn run_one_tick(
                 completed.clear();
                 if let Some(f) = gpu_prefill_batched_pass(
                     &mut *e, &mut slots, cap, &arena, feeds.is_empty(), co_scheduled, &mut completed,
-                    &mut feeds, &mut obs.host.token_batch_tokens,
+                    &mut feeds, &mut obs.host.token_batch_tokens, pipe_prefill,
                 ) {
                     if tick_fault.is_none() {
                         tick_fault = Some(f);
@@ -2090,6 +2139,37 @@ fn run_one_tick(
                     );
                 }
                 obs.host.prefill_tokens = completed;
+                // Pipelined, this tick's launch is parked behind the one before it: read that
+                // older step out now, so the host stays exactly one step behind the device.
+                if pipe_prefill {
+                    let mut done = std::mem::take(&mut obs.host.pipe_tokens);
+                    match e.pipe_reap(&mut done) {
+                        Ok(()) => {
+                            for &(i, token) in &done {
+                                if slots[i].is_some() {
+                                    disconnected[i] |= gpu_emit_slot_token(
+                                        &mut slots[i],
+                                        &arena,
+                                        bundle,
+                                        token,
+                                        &mut tokens_this_tick,
+                                        stop.as_slice(),
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                error_code = ?err.device_code(),
+                                fatal = err.is_fatal(),
+                                "gpu: pipelined mixed step failed"
+                            );
+                            note_fault(&mut tick_fault, &err);
+                        }
+                    }
+                    obs.host.pipe_tokens = done;
+                }
                 if !compact {
                     for i in 0..slots.len().min(cap) {
                         let Some(s) = slots[i].as_ref() else { continue };
@@ -2242,7 +2322,9 @@ fn run_one_tick(
                 // frees it (mid-quantum EOS — extra device tokens past the stop
                 // are discarded). Remaining output budgets cap K. Any sampling adjustment
                 // falls through to the per-token path below.
-                let use_multi = steps > 1
+                let use_pipe = e.pipe_enabled() && gpu_pipe_rows(&feeds, &slots);
+                let use_multi = !use_pipe
+                    && steps > 1
                     && e.multistep_quantum().is_some()
                     && feeds.iter().all(|&(i, _)| {
                         slots[i]
@@ -2250,7 +2332,51 @@ fn run_one_tick(
                             .map(|s| gpu_argmax_eligible(&s.gen.params))
                             .unwrap_or(true)
                     });
-                if use_multi {
+                if use_pipe {
+                    // Look ahead only while every row owes a token past the one this tick
+                    // completes; a stop the host cannot foresee costs one discarded step.
+                    let lookahead = feeds.iter().all(|&(i, _)| {
+                        slots[i].as_ref().is_some_and(|s| {
+                            s.gen.max_tokens.max(1).saturating_sub(s.step) >= 2
+                        })
+                    });
+                    let mut done = std::mem::take(&mut obs.host.pipe_tokens);
+                    let t_call = crate::obs::host::on().then(Instant::now);
+                    match e.pipe_step(&feeds, lookahead, &mut done) {
+                        Ok(()) => {
+                            let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
+                            decode_progress = completed_decode(&feeds, 1);
+                            for &(i, token) in &done {
+                                if slots[i].is_none() {
+                                    continue;
+                                }
+                                tracing::debug!(token, slot = i, "gpu: token (pipelined)");
+                                disconnected[i] |= gpu_emit_slot_token(
+                                    &mut slots[i],
+                                    &arena,
+                                    bundle,
+                                    token,
+                                    &mut tokens_this_tick,
+                                    stop.as_slice(),
+                                );
+                            }
+                            host_emit_done(t_emit, tokens_this_tick);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                error_code = ?err.device_code(),
+                                fatal = err.is_fatal(),
+                                fed = feeds.len(),
+                                model = bundle.network(),
+                                "gpu: pipelined decode failed"
+                            );
+                            note_fault(&mut tick_fault, &err);
+                            fail_feeds(&mut slots, &feeds, &arena, &err);
+                        }
+                    }
+                    obs.host.pipe_tokens = done;
+                } else if use_multi {
                     let remaining = feeds
                         .iter()
                         .filter_map(|&(i, _)| slots[i].as_ref())
@@ -3638,6 +3764,30 @@ fn run_one_tick(
 }
 
 #[cfg_attr(not(feature = "hsa"), allow(dead_code))]
+/// Decode feeds: every live slot past prefill, with its last token.
+#[cfg(feature = "cuda")]
+fn gpu_decode_feeds(slots: &[Option<Slot>], cap: usize) -> Vec<(usize, u32)> {
+    slots
+        .iter()
+        .enumerate()
+        .take(cap)
+        .filter_map(|(i, s)| {
+            let s = s.as_ref()?;
+            (s.step > 0).then(|| (i, *s.out_ids.last().expect("step > 0 implies output")))
+        })
+        .collect()
+}
+
+/// Whether every fed row can run in the decode pipeline: the device advance feeds the
+/// argmax token, so a row that needs host sampling cannot.
+#[cfg(feature = "cuda")]
+fn gpu_pipe_rows(feeds: &[(usize, u32)], slots: &[Option<Slot>]) -> bool {
+    !feeds.is_empty()
+        && feeds.iter().all(|&(i, _)| {
+            slots[i].as_ref().map(|s| gpu_argmax_eligible(&s.gen.params)).unwrap_or(true)
+        })
+}
+
 fn deferred_token(tokens: &[u32], slot: usize, step: usize, quantum: usize) -> Result<u32> {
     tokens
         .get(slot.saturating_mul(quantum).saturating_add(step))
@@ -4054,6 +4204,7 @@ fn gpu_prefill_batched_pass(
     completed: &mut Vec<(usize, u32)>,
     feeds: &mut Vec<(usize, u32)>,
     unified_output: &mut Vec<(u32, u32)>,
+    pipelined: bool,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
@@ -4061,8 +4212,24 @@ fn gpu_prefill_batched_pass(
     let compact = e.has_packed_terminal();
     let unified =
         e.token_batch_enabled() && !crate::config::RuntimeConfig::get().pf_no_interleave;
-    let decode_rows = if unified { feeds.len() } else { 0 };
     let withheld = usize::from(!compact);
+    // Pipelined, a prompt whose first token is still on the device can decode from it: the row
+    // joins the next launch instead of idling one while the host reads that token back.
+    let pending_first: smallvec::SmallVec<[usize; 8]> = if pipelined && e.pipe_first_token_rows() {
+        (0..cap.min(slots.len()))
+            .filter(|&i| {
+                e.pipe_owes(i)
+                    && slots[i].as_ref().is_some_and(|s| {
+                        s.step == 0
+                            && s.pf_pos + withheld >= s.prompt_ids.len()
+                            && !s.respond.is_closed()
+                    })
+            })
+            .collect()
+    } else {
+        Default::default()
+    };
+    let decode_rows = if unified { feeds.len() + pending_first.len() } else { 0 };
     let mut tick_fault: Option<crate::DeviceErrorInfo> = None;
     let budget_max = e.pf_max_rows();
     if budget_max == 0 {
@@ -4077,7 +4244,9 @@ fn gpu_prefill_batched_pass(
     // Bound each candidate before fair sharing. Short requests return unused
     // rows to later candidates in the same launch.
     let chunk_cap = pf_chunk_rows().min(e.pf_request_max_rows());
-    let adaptive = crate::config::RuntimeConfig::get().pf_interleave_adaptive;
+    let adaptive = crate::serve::policy::adaptive_packing(
+        crate::config::RuntimeConfig::get().pf_interleave_adaptive,
+    );
     loop {
         for (i, slot) in slots.iter_mut().enumerate().take(cap) {
             let Some(request) = slot.as_mut().filter(|s| s.step == 0) else {
@@ -4252,8 +4421,31 @@ fn gpu_prefill_batched_pass(
                     selection: Selection::default(),
                 })
             });
-            let requests: smallvec::SmallVec<[_; 16]> = decode.chain(prefill).collect();
-            let result = e.token_batch_step(&requests, unified_output);
+            // One placeholder token per device-sourced row: the launch overwrites it with the
+            // sample the previous launch left in `d_last`.
+            const DEVICE_TOKEN: [u32; 1] = [0];
+            let first = pending_first.iter().filter_map(|&i| {
+                let slot = slots[i].as_ref()?;
+                Some(Request {
+                    id: i as u32,
+                    slot: i as u32,
+                    state_slot: i as u32,
+                    generation: e.slot_generation(i)?,
+                    phase: Phase::Decode,
+                    tokens: &DEVICE_TOKEN,
+                    prompt_len: slot.prompt_ids.len() as u32,
+                    selection: Selection::default(),
+                })
+            });
+            let requests: smallvec::SmallVec<[_; 16]> =
+                decode.chain(first).chain(prefill).collect();
+            // Pipelined, this launch reports no token: its samples — including a prompt's first
+            // token — are read back on a later tick, and `completed` stays empty.
+            let result = if pipelined {
+                e.token_batch_step_pipelined(&requests, unified_output)
+            } else {
+                e.token_batch_step(&requests, unified_output)
+            };
             if result.is_ok() {
                 completed.extend(
                     unified_output.iter().map(|&(slot, token)| (slot as usize, token)),

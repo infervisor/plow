@@ -164,6 +164,11 @@ impl RungController {
         self
     }
 
+    /// Follow a serving-policy switch: the probe is a per-window choice, not a fixed property.
+    pub fn set_fast_probe(&mut self, on: bool) {
+        self.fast_probe = on;
+    }
+
     #[inline]
     pub fn is_legacy(&self) -> bool {
         self.rungs.len() == 1

@@ -16,6 +16,9 @@
 #   OUTDIR        raw client logs + JSON (default /tmp/vllm_bench_<port>)
 #   MEM_SAMPLE_MS GPU memory sampling period per cell, as in bench_plowrt_serve.sh (default 1000; 0 = off)
 #   DATASET_ARGS  as in bench_plowrt_serve.sh (the two sides must be given the same string)
+#   GATE_PROMPT   raw-completion coherence prompt, as in bench_plowrt_serve.sh; set => one greedy
+#                 completion is checked for GATE_EXPECT (default "paris") before any cell runs
+#   VLLM_SERVE_EXTRA_ARGS  extra `vllm serve` flags (quantization, kv-cache-dtype, ...)
 #   PREFIX_CACHE=1 serve WITH prefix caching (vLLM's default); unset keeps --no-enable-prefix-caching
 #
 # Prefix caching is DISABLED. vllm-bench's random prompts share a leading prefix, so a
@@ -59,6 +62,19 @@ while [ "$t" -lt "$READY" ]; do
 done
 [ "$t" -ge "$READY" ] && { echo "!! vllm never healthy"; tail -40 "$OUTDIR/server.log"; exit 1; }
 echo ">>> vllm healthy after ${t}s (max_model_len=$MAXLEN max_num_seqs=$MAXSEQS)" >&2
+
+# Coherence gate BEFORE any timing, as in bench_plowrt_serve.sh: a fast wrong server is not a
+# result, and a quantized checkpoint that loads is not yet a checkpoint that answers. Opt-in
+# (GATE_PROMPT unset = no gate) and entirely on stderr, because stdout here IS the reference CSV.
+if [ -n "${GATE_PROMPT:-}" ]; then
+  GATE_BODY=$(python3 -c 'import json,sys; print(json.dumps({"model":sys.argv[1], "prompt":sys.argv[2], "max_tokens":32, "temperature":0}))' \
+    "$MODEL_DIR" "$GATE_PROMPT")
+  GATE=$(curl -s --max-time 300 "http://127.0.0.1:$PORT$ENDPOINT" \
+    -H 'Content-Type: application/json' --data-binary "$GATE_BODY")
+  echo "== coherence gate ==" >&2; echo "$GATE" >&2
+  echo "$GATE" | grep -qi "${GATE_EXPECT:-paris}" && echo ">>> coherence gate: PASS" >&2 || {
+    echo ">>> coherence gate: FAIL — numbers below would be meaningless" >&2; exit 1; }
+fi
 
 echo "input_len,concurrency,ttft_ms,ttft_med,tpot_ms,tpot_med,itl_ms,itl_med,itl_p99,out_tok_s,req_per_s,ok_reqs,gen_toks"
 for L in $IN_LENS; do

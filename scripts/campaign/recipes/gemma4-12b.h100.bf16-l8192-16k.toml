@@ -24,6 +24,9 @@ PLOW_SEG_PURE_GEMM = "1"
 PLOW_SEG_FA512 = "1"
 PLOW_SEG_FA256_GQA2 = "1"
 PLOW_TMA_GEMM = "1"
+# Decode attention QK on the tensor cores; opt-in (its P certificate was rejected:
+# 26B 128/C1 TPOT 5.400 -> 5.418 ms, worse than its 0.002 floor, while longer contexts win).
+PLOW_FA_MMAQK = "3"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
 # The BF16 NRN2 -> q/k/v fold (c1f1ac38) decodes garbage on the H100, and not the same garbage

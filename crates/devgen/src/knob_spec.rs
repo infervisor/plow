@@ -381,20 +381,6 @@ const GEMV_PREFETCH_QUALIFIED: Status = Status::Qualified {
         "docs/flags-reference.md: `=0` is the rollback",
     ],
 };
-const FA_MMAQK_DEFAULT: Default = Default::Production {
-    cases: &[DefaultCase {
-        when: GEMMA4_HOPPER,
-        value: Val::Nat(3),
-    }],
-    otherwise: Val::Unset,
-};
-const FA_MMAQK_QUALIFIED: Status = Status::Qualified {
-    evidence: &[
-        "agent/dec-batched-attn: Gemma-4-12B step ctx 1024 -0.30/-0.51/-1.02 ms at B=1/4/16, served 128/C16 TPOT 12.68 -> 11.80 ms; f32 oracle relL2 0.0016-0.0017, greedy digests identical",
-        "3a7a5a3b: Gemma-4-26B-A4B step ctx 1024 B=1/4/16 5.61/8.51/12.44 -> 5.54/8.34/11.75 ms; GSM8K 8-shot n=200 192/200 unchanged (vLLM 191)",
-        "docs/flags-reference.md: `=0` is the rollback",
-    ],
-};
 const MOE_LT_EMIT_QUALIFIED: Status = Status::Qualified {
     evidence: &[
         "agent/moe-grouped-gemm bb2c5c14 (26B-A4B H100): MoE prefill segment 0.744 -> 0.569 ms at 1024 rows, 1.777 -> 1.352 at 4096; TTFT 1024/C1 43.0 -> 38.7 ms, 4096 120.9 -> 107.2, 8192 257.7 -> 231.0; MoE relL2 3.6e-3, gate + needle + consistency pass",
@@ -1035,7 +1021,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.hn_split", Some("PLOW_HN_SPLIT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fa_gf_full", Some("PLOW_FA_GF_FULL"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.attention_decode_balance_gf", Some("PLOW_ATTENTION_DECODE_BALANCE_GF"), Layer::Emit, U32, GEMMA4_BALANCE_GF_DEFAULT, GEMMA4_RECIPE_QUALIFIED),
-    KnobSpec::new("emit.fa_mmaqk", Some("PLOW_FA_MMAQK"), Layer::Emit, U32, FA_MMAQK_DEFAULT, FA_MMAQK_QUALIFIED),
+    KnobSpec::new("emit.fa_mmaqk", Some("PLOW_FA_MMAQK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.flash_merge_dsplit", Some("PLOW_FLASH_MERGE_DSPLIT"), Layer::Emit, U32, UNSET, DIAG),
     KnobSpec::new("emit.ns_mul", Some("PLOW_NS_MUL"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.ns_abs", Some("PLOW_NS_ABS"), Layer::Emit, U32, UNSET, OPT_IN),
@@ -1322,6 +1308,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_ATTNRES_RG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_ATTNRES_TOKENS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BENCH_FP8_ABI", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_BENCH_GEMMA4_26B", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BENCH_GEMMA4_ALL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BENCH_GEMMA_QGATE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BENCH_GEMM_ODOWN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1331,6 +1318,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_BENCH_M64N128", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BENCH_M64N64", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BENCH_QWEN_GEMV", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_BENCH_W8A8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BENCH_WS384", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BUCKET_DECODE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

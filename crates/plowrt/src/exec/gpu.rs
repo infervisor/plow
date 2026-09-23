@@ -2206,6 +2206,9 @@ pub struct GpuEngine {
     /// the per-token launch model. When present, [`Self::multi_step`] runs a
     /// K-token greedy quantum with one host sync.
     multistep: Option<MultiStep>,
+    /// Lookahead-1 decode pipeline (`PLOW_DECODE_PIPELINE`); reuses `multistep`'s advance
+    /// kernel and active-row flags.
+    pipe: Option<DecodePipe>,
 
     /// Per-tensor device buffers, indexed by blob tensor handle. Ordinarily
     /// **views** into `_weight_slab`, not owners — see it for why.
@@ -3177,12 +3180,90 @@ struct MultiStep {
     _module: Module,
     /// Token quantum K (steps per host round trip).
     quantum: usize,
+    /// Whether the K-step quantum serves decode. Off when only the lookahead pipeline
+    /// (`PLOW_DECODE_PIPELINE`) uses the advance kernel and its buffers.
+    k_step: bool,
     /// `[batch][K]` i32 token ring (device) + its pinned D2H staging.
     d_ring: DeviceMem,
     ring_host: PinnedHost,
     /// `[batch]` i32 active-row flags (device) + pinned staging.
     d_fed: DeviceMem,
     fed_host: PinnedHost,
+}
+
+/// Lookahead-1 decode pipeline (`PLOW_DECODE_PIPELINE`). A queued step is [counter reset ->
+/// decode -> `plow_advance` -> D2H of `in.ids` -> event]; its inputs stay on the device
+/// (`ARGMAX_FIN` leaves each row's token in `in.ids`, the advance moves `pos`/`kvlen`), so the
+/// host waits on the older step's event while the newer one runs.
+struct DecodePipe {
+    /// Queued steps, oldest first; at most two, and one between ticks.
+    queue: std::collections::VecDeque<PipeStep>,
+    /// Pinned `[batch]` i32 token readback and completion event, per buffer. A decode step reads
+    /// back `in.ids` whole (slot-indexed); a mixed step reads back its compact sample block.
+    ids_host: [PinnedHost; 2],
+    done: [CudaEvent; 2],
+    next: usize,
+    /// Recorded after a parked launch's body uploads: the host waits on it before rewriting
+    /// its staging vectors, which those uploads read asynchronously.
+    body_ev: CudaEvent,
+    /// Every slot's newest sampled token, device-resident. A launch enqueued before the host has
+    /// read that token feeds it back from here, which is what lets a mixed launch carry decode
+    /// rows whose tokens the previous launch sampled and nobody has seen yet.
+    d_last: DeviceMem,
+    /// Each fed row's input token for its oldest queued step (prefix-cache bookkeeping).
+    last_in: Vec<u32>,
+    /// Slots the mux retired while a queued step still covered them, with `retire_slot`'s
+    /// `cache_output`: their KV stays mapped until the queue empties.
+    retire: Vec<Option<bool>>,
+}
+
+/// One row of a queued step: which slot it belongs to, and whether its input token was the
+/// previous step's sample — the prefix-cache history gains that token when this step completes,
+/// because at enqueue nobody knew it.
+#[derive(Clone, Copy)]
+struct PipeRow {
+    slot: usize,
+    carry: bool,
+}
+
+struct PipeStep {
+    buf: usize,
+    rows: smallvec::SmallVec<[PipeRow; 32]>,
+    /// The readback holds this step's samples compacted in `rows` order (a mixed launch's
+    /// terminal) instead of indexed by slot (a decode launch's `ARGMAX_FIN`).
+    compact: bool,
+}
+
+/// What [`GpuEngine::pipe_enqueue`] uploads for the step it queues.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PipeUpload {
+    /// Every input from the host: the queue was empty.
+    All,
+    /// Nothing — the previous decode step's `ARGMAX_FIN` and `plow_advance` left ids, positions
+    /// and kv lengths where this step needs them.
+    None,
+    /// Positions and the fed mask from the host, ids from `d_last`: the shape after a mixed
+    /// launch, which leaves `in.ids`/`in.pos` holding packed rows, not slot rows.
+    State,
+}
+
+impl DecodePipe {
+    fn new(be: &CudaBackend, batch: usize) -> Result<Self> {
+        Ok(DecodePipe {
+            queue: std::collections::VecDeque::with_capacity(2),
+            ids_host: [be.host_alloc_pinned(batch * 4)?, be.host_alloc_pinned(batch * 4)?],
+            done: [be.event_create(false)?, be.event_create(false)?],
+            next: 0,
+            body_ev: be.event_create(false)?,
+            d_last: be.alloc(0, (batch * 4) as u64)?,
+            last_in: vec![0; batch],
+            retire: vec![None; batch],
+        })
+    }
+
+    fn holds(&self, slot: usize) -> bool {
+        self.queue.iter().any(|s| s.rows.iter().any(|r| r.slot == slot))
+    }
 }
 
 /// Outcome of one [`GpuEngine::prefill_chunk`] call.
@@ -5779,12 +5860,22 @@ impl GpuEngine {
         // dynamic-kvrow arm fired (the local `kvrow` was cleared above). A B==1
         // legacy cubin still host-patches i[3] each step, so multi-step is off.
         let dyn_kvrow = batch > 1 || kvrow.is_empty();
+        // The lookahead pipeline needs exactly what the K-step quantum needs, and replaces it.
+        let pipeline = RuntimeConfig::get().nv.decode_pipeline && !multistep_disabled_by_decode;
+        let multistep_k = if pipeline { effective_multistep.max(2) } else { effective_multistep };
         let multistep =
-            Self::multistep_bringup(&be, assets_dir, batch, dyn_kvrow, effective_multistep)
+            Self::multistep_bringup(&be, assets_dir, batch, dyn_kvrow, multistep_k, !pipeline)
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "multi-step disabled");
                     None
                 });
+        let pipe = match (&multistep, pipeline) {
+            (Some(_), true) => {
+                tracing::info!("lookahead decode pipeline enabled (PLOW_DECODE_PIPELINE)");
+                Some(DecodePipe::new(&be, batch)?)
+            }
+            _ => None,
+        };
 
         if let Some(tm) = load_tim.as_mut() {
             let ms = t_final.elapsed().as_secs_f64() * 1e3;
@@ -5868,6 +5959,7 @@ impl GpuEngine {
             module_pf,
             sampler,
             multistep,
+            pipe,
             h_inst: insts,
             decode_rungs,
             decode_contexts,
@@ -6165,6 +6257,7 @@ impl GpuEngine {
         batch: usize,
         dyn_kvrow: bool,
         k: u32,
+        k_step: bool,
     ) -> Result<Option<MultiStep>> {
         // DEFAULT ON at K=8 (`PLOW_MULTISTEP=0` or `=1` opts out). K=8 captures
         // nearly all of the win — measured 179.18 tok/s vs 185.60 at K=32, i.e.
@@ -6209,14 +6302,17 @@ impl GpuEngine {
         let ring_host = be.host_alloc_pinned(batch * k * 4)?;
         let d_fed = be.alloc(0, (batch * 4) as u64)?;
         let fed_host = be.host_alloc_pinned(batch * 4)?;
-        tracing::info!(
-            quantum = k,
-            "bounded device multi-step enabled (PLOW_MULTISTEP)"
-        );
+        if k_step {
+            tracing::info!(
+                quantum = k,
+                "bounded device multi-step enabled (PLOW_MULTISTEP)"
+            );
+        }
         Ok(Some(MultiStep {
             f_advance,
             _module: module,
             quantum: k,
+            k_step,
             d_ring,
             ring_host,
             d_fed,
@@ -6326,6 +6422,10 @@ impl GpuEngine {
     }
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
+        if let Some(pipe) = self.pipe.as_mut().filter(|p| p.holds(b)) {
+            pipe.retire[b] = Some(cache_output);
+            return;
+        }
         self.slot_generations[b] = self.slot_generations[b].wrapping_add(1);
         self.reset_packed_admission(b);
         if !self.vmm_active[b] {
@@ -7239,7 +7339,411 @@ impl GpuEngine {
 
     /// Whether bounded device multi-step is enabled, and its quantum K.
     pub fn multistep_quantum(&self) -> Option<usize> {
-        self.multistep.as_ref().map(|m| m.quantum)
+        self.multistep.as_ref().filter(|m| m.k_step).map(|m| m.quantum)
+    }
+
+    /// Whether the lookahead decode pipeline (`PLOW_DECODE_PIPELINE`) serves decode.
+    pub fn pipe_enabled(&self) -> bool {
+        self.pipe.is_some() && self.timing.is_none()
+    }
+
+    /// Whether a pipelined decode step is still in flight.
+    pub fn pipe_busy(&self) -> bool {
+        self.pipe.as_ref().is_some_and(|p| !p.queue.is_empty())
+    }
+
+    /// Whether the in-flight step feeds exactly `feeds`' rows, the only shape
+    /// [`Self::pipe_step`] continues without a drain. A mixed step is matched on its decode rows:
+    /// a prompt it finished has a token nobody has read, so the mux cannot be feeding that slot.
+    pub fn pipe_covers(&self, feeds: &[(usize, u32)]) -> bool {
+        self.pipe.as_ref().and_then(|p| p.queue.back()).is_some_and(|s| {
+            let mut rows = s.rows.iter().filter(|r| r.carry);
+            feeds.iter().all(|&(b, _)| rows.next().is_some_and(|r| r.slot == b))
+                && rows.next().is_none()
+        })
+    }
+
+    /// Whether a mixed launch may be enqueued behind the in-flight step (`PLOW_PIPE_PREFILL`).
+    /// The mixed launch takes its decode rows' tokens from `d_last`, so the host never waits for
+    /// the previous step before submitting the next one.
+    pub fn pipe_prefill_enabled(&self) -> bool {
+        self.pipe.is_some()
+            && self.timing.is_none()
+            && self.token_batch_enabled()
+            && RuntimeConfig::get().nv.pipe_prefill > 0
+    }
+
+    /// Whether a prompt whose first token is still on the device may decode from it
+    /// (`PLOW_PIPE_PREFILL=2`) instead of waiting a launch for the host to read that token.
+    pub fn pipe_first_token_rows(&self) -> bool {
+        self.pipe_prefill_enabled() && RuntimeConfig::get().nv.pipe_prefill >= 2
+    }
+
+    /// One pipelined decode tick: enqueue the next step, then wait for the one in flight.
+    /// With nothing in flight the first step starts from the host's `feeds`; otherwise `feeds`
+    /// must be the in-flight rows ([`Self::pipe_covers`]) and their tokens are already on the
+    /// device. `lookahead` is false when a row has no token to produce past the completed step.
+    /// `out` receives the completed step's `(slot, token)`.
+    pub fn pipe_step(
+        &mut self,
+        feeds: &[(usize, u32)],
+        lookahead: bool,
+        out: &mut Vec<(usize, u32)>,
+    ) -> Result<()> {
+        out.clear();
+        if feeds.is_empty() {
+            return Ok(());
+        }
+        let mut fed: smallvec::SmallVec<[(usize, u32); 32]> = feeds.iter().copied().collect();
+        if self.pipe_busy() && !self.pipe_covers(feeds) {
+            // A mixed launch can leave a step in flight whose rows are not these feeds: read it
+            // out first — its tokens belong to the same sink — then start a fresh step.
+            self.pipe_drain(out)?;
+            // The mux gathered `feeds` before this drain and cannot re-gather from in here (its
+            // own drain path does, at the call site). For a row the drain just produced a token
+            // for, the caller's token is one step stale, and feeding it back would resample the
+            // token that was already emitted.
+            for (b, token) in fed.iter_mut() {
+                if let Some(&(_, fresh)) = out.iter().rev().find(|&&(slot, _)| slot == *b) {
+                    *token = fresh;
+                }
+            }
+        }
+        let feeds: &[(usize, u32)] = &fed;
+        if !self.pipe_busy() {
+            self.pipe_enqueue(feeds, PipeUpload::All)?;
+        }
+        if lookahead {
+            // After a mixed launch the device's positions are the packed rows', so the
+            // continuation re-uploads them and takes only the tokens from the device.
+            let after_mixed =
+                self.pipe.as_ref().and_then(|p| p.queue.back()).is_some_and(|s| s.compact);
+            let upload = if after_mixed { PipeUpload::State } else { PipeUpload::None };
+            self.pipe_enqueue(feeds, upload)?;
+        }
+        self.pipe_complete(out)
+    }
+
+    /// Whether the pipe still owes `slot` a token, i.e. `d_last[slot]` holds a sample the host
+    /// has not read. Only such a row may take its next input from the device.
+    pub fn pipe_owes(&self, slot: usize) -> bool {
+        self.pipe.as_ref().is_some_and(|p| p.holds(slot))
+    }
+
+    /// Drop every queued step after a failed launch. Slots retired while the queue held them are
+    /// retired now: no device work will read them again.
+    pub(super) fn pipe_abandon(&mut self) {
+        let retired: smallvec::SmallVec<[(usize, bool); 8]> = match self.pipe.as_mut() {
+            Some(pipe) => {
+                pipe.queue.clear();
+                pipe.retire
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(b, r)| r.take().map(|c| (b, c)))
+                    .collect()
+            }
+            None => Default::default(),
+        };
+        for (b, cache_output) in retired {
+            self.retire_slot(b, cache_output);
+        }
+    }
+
+    /// Whether both pinned readback buffers are in flight, so nothing more may be enqueued
+    /// until the oldest step is read.
+    pub fn pipe_full(&self) -> bool {
+        self.pipe.as_ref().is_some_and(|p| p.queue.len() >= 2)
+    }
+
+    /// Read out the oldest queued step once a second one is in flight behind it: the lookahead-1
+    /// steady state a run of prefill ticks would otherwise grow past. `out` receives its tokens.
+    pub fn pipe_reap(&mut self, out: &mut Vec<(usize, u32)>) -> Result<()> {
+        out.clear();
+        if self.pipe_full() {
+            self.pipe_complete(out)?;
+        }
+        Ok(())
+    }
+
+    /// Complete every queued pipelined step; `out` receives their `(slot, token)` in order.
+    pub fn pipe_drain(&mut self, out: &mut Vec<(usize, u32)>) -> Result<()> {
+        out.clear();
+        while self.pipe_busy() {
+            self.pipe_complete(out)?;
+        }
+        Ok(())
+    }
+
+    fn pipe_enqueue(&mut self, feeds: &[(usize, u32)], upload: PipeUpload) -> Result<()> {
+        let bsz = self.batch;
+        for &(b, _) in feeds {
+            if b >= bsz {
+                return Err(RuntimeError::Rejected(format!(
+                    "slot {b} out of range (engine batch {bsz})"
+                )));
+            }
+            // `pos` already counts every queued step, so this row's next write is `pos`.
+            if self.pos[b] as usize >= self.max_ctx {
+                return Err(RuntimeError::Rejected(format!(
+                    "context exhausted at {} (compiled max {})",
+                    self.pos[b], self.max_ctx
+                )));
+            }
+        }
+        // Decode-context bands disable the pipeline (as they do multi-step), so the rung
+        // depends only on the fed slots, not on the positions queued steps have advanced.
+        let rung = self.select_decode(feeds.iter().map(|&(slot, _)| slot))?;
+        let launch_rows = self.selected_decode(rung).map_or(bsz, |r| r.rows);
+        if let Some(v) = &mut self.vmm {
+            if let Some(rings) = &mut v.rings {
+                rings.ensure_prefix(launch_rows)?;
+            }
+            for b in 0..launch_rows {
+                let need = self.pos[b] + 1;
+                if v.kv.mapped_rows(b) < need {
+                    v.kv.ensure_rows(b, need)?;
+                }
+            }
+        }
+        let max_kvlen = feeds.iter().map(|&(b, _)| self.pos[b] + 1).max().unwrap_or(1);
+        self.patch_nv_nsplit(max_kvlen)?;
+
+        let (f_adv, ring_base, fed_base, quantum) = {
+            let ms = self.multistep.as_ref().expect("the pipeline loads with multi-step");
+            (ms.f_advance, ms.d_ring.base, ms.d_fed.base, ms.quantum)
+        };
+        if upload != PipeUpload::None {
+            // A fresh start stages every row from the host, as `step_slots_sampled` does. After a
+            // mixed launch only positions and the fed mask come from the host: the tokens these
+            // rows feed back are the ones that launch sampled, which nobody has read yet.
+            {
+                let (ids, pos, kvlen) = self.stage.parts_mut();
+                for b in 0..bsz {
+                    ids[b] = 0;
+                    kvlen[b] = 1;
+                    pos[b] = self.pos[b] as i32;
+                }
+                for &(b, token) in feeds {
+                    ids[b] = token as i32;
+                    kvlen[b] = self.pos[b] as i32 + 1;
+                }
+            }
+            {
+                let fed: &mut [i32] = bytemuck::cast_slice_mut(self.mst_fed_host_mut());
+                fed[..bsz].fill(0);
+                for &(b, _) in feeds {
+                    fed[b] = 1;
+                }
+            }
+            {
+                // A row the pipe still owes a token consumes that token, not this one: its
+                // history entry is written when the owed step completes.
+                let pipe = self.pipe.as_mut().expect("pipe");
+                for &(b, token) in feeds {
+                    if !pipe.holds(b) {
+                        pipe.last_in[b] = token;
+                    }
+                }
+            }
+            // SAFETY: pinned slabs live on self past the step's event; sections match their
+            // [B]-sized i32 tensors.
+            unsafe {
+                let ms = self.multistep.as_ref().expect("checked");
+                self.be
+                    .memcpy_htod_async(fed_base, ms.fed_host.as_slice(), &self.stream)?;
+                self.be.memcpy_htod_async(
+                    self.devp[self.t_ids].base,
+                    self.stage.section(0),
+                    &self.stream,
+                )?;
+                self.be.memcpy_htod_async(
+                    self.devp[self.t_pos].base,
+                    self.stage.section(1),
+                    &self.stream,
+                )?;
+                self.be.memcpy_htod_async(
+                    self.devp[self.t_kvlen].base,
+                    self.stage.section(2),
+                    &self.stream,
+                )?;
+            }
+            if upload == PipeUpload::State {
+                let (d_last, held) = {
+                    let pipe = self.pipe.as_ref().expect("pipe");
+                    let held: smallvec::SmallVec<[usize; 32]> =
+                        feeds.iter().map(|&(b, _)| b).filter(|&b| pipe.holds(b)).collect();
+                    (pipe.d_last.base, held)
+                };
+                let ids_base = self.devp[self.t_ids].base;
+                for b in held {
+                    self.be.memcpy_dtod_async(
+                        ids_base + (b * 4) as u64,
+                        d_last + (b * 4) as u64,
+                        4,
+                        &self.stream,
+                    )?;
+                }
+            }
+        }
+        self.reset_selected_decode_counters(rung)?;
+        self.launch_selected_decode(rung)?;
+        let mut a_ids = self.devp[self.t_ids].base;
+        let mut a_pos = self.devp[self.t_pos].base;
+        let mut a_kvl = self.devp[self.t_kvlen].base;
+        let (mut a_ring, mut a_fed) = (ring_base, fed_base);
+        let (mut a_step, mut a_k, mut a_b) = (0u32, quantum as u32, bsz as u32);
+        let mut a = [
+            &mut a_ids as *mut u64 as *mut std::ffi::c_void,
+            &mut a_pos as *mut u64 as *mut std::ffi::c_void,
+            &mut a_kvl as *mut u64 as *mut std::ffi::c_void,
+            &mut a_ring as *mut u64 as *mut std::ffi::c_void,
+            &mut a_fed as *mut u64 as *mut std::ffi::c_void,
+            &mut a_step as *mut u32 as *mut std::ffi::c_void,
+            &mut a_k as *mut u32 as *mut std::ffi::c_void,
+            &mut a_b as *mut u32 as *mut std::ffi::c_void,
+        ];
+        self.be.launch_kernel(
+            f_adv,
+            (bsz as u32).div_ceil(256),
+            256,
+            0,
+            &mut a,
+            Some(&self.stream),
+        )?;
+        let ids_base = self.devp[self.t_ids].base;
+        // Publish this step's samples for whatever is enqueued next.
+        let d_last = self.pipe.as_ref().expect("pipe").d_last.base;
+        self.be
+            .memcpy_dtod_async(d_last, ids_base, (bsz * 4) as u64, &self.stream)?;
+        let pipe = self.pipe.as_mut().expect("pipe");
+        let buf = pipe.next;
+        pipe.next ^= 1;
+        // SAFETY: at most two steps are queued, so this buffer's previous step has completed
+        // and been read; the slab lives on self past this step's event.
+        unsafe {
+            self.be
+                .memcpy_dtoh_async(pipe.ids_host[buf].as_mut_slice(), ids_base, &self.stream)?;
+        }
+        self.be.event_record(&pipe.done[buf], &self.stream)?;
+        pipe.queue.push_back(PipeStep {
+            buf,
+            rows: feeds
+                .iter()
+                .map(|&(b, _)| PipeRow { slot: b, carry: true })
+                .collect(),
+            compact: false,
+        });
+        // This step is now in flight, so the frontier it writes belongs to it: every later
+        // launch — decode, mixed, or a fresh upload — stages from the advanced value.
+        for &(b, _) in feeds {
+            self.pos[b] += 1;
+            if let Some(v) = &self.vmm {
+                v.kv.advise(b, self.pos[b]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Park a mixed launch's samples: scatter them into `d_last` so the next launch feeds them
+    /// back without the host, copy the compact block into this buffer's pinned slab, and record
+    /// the event a later tick waits on. `rows` is the sample order the terminal wrote.
+    fn pipe_enqueue_mixed(&mut self, rows: &[PipeRow]) -> Result<()> {
+        let ids_base = self.devp[self.t_ids].base;
+        let (buf, d_last) = {
+            let pipe = self.pipe.as_mut().expect("pipe");
+            let buf = pipe.next;
+            pipe.next ^= 1;
+            (buf, pipe.d_last.base)
+        };
+        for (j, row) in rows.iter().enumerate() {
+            self.be.memcpy_dtod_async(
+                d_last + (row.slot * 4) as u64,
+                ids_base + (j * 4) as u64,
+                4,
+                &self.stream,
+            )?;
+        }
+        // SAFETY: at most two steps are queued, so this buffer's previous step has completed and
+        // been read; the slab lives on self past this step's event.
+        unsafe {
+            let bytes = rows.len() * 4;
+            let pipe = self.pipe.as_mut().expect("pipe");
+            self.be.memcpy_dtoh_async(
+                &mut pipe.ids_host[buf].as_mut_slice()[..bytes],
+                ids_base,
+                &self.stream,
+            )?;
+        }
+        let pipe = self.pipe.as_mut().expect("pipe");
+        self.be.event_record(&pipe.done[buf], &self.stream)?;
+        pipe.queue.push_back(PipeStep {
+            buf,
+            rows: rows.iter().copied().collect(),
+            compact: true,
+        });
+        Ok(())
+    }
+
+    /// Wait for the oldest queued step and account its tokens. Rows the mux retired while it
+    /// was queued get no token; their deferred retirement runs once the queue is empty.
+    fn pipe_complete(&mut self, out: &mut Vec<(usize, u32)>) -> Result<()> {
+        let Some(step) = self.pipe.as_mut().and_then(|p| p.queue.pop_front()) else {
+            return Ok(());
+        };
+        let synced = {
+            let pipe = self.pipe.as_ref().expect("pipe");
+            self.be.event_synchronize(&pipe.done[step.buf])
+        };
+        if let Err(e) = synced {
+            tracing::warn!(
+                error = %e,
+                error_code = ?e.device_code(),
+                fatal = e.is_fatal(),
+                fed = step.rows.len(),
+                grid = self.grid,
+                "decode pipeline: step failed"
+            );
+            self.pipe.as_mut().expect("pipe").queue.clear();
+            return Err(e);
+        }
+        let prefix = self.vmm_prefix_enabled();
+        let pipe = self.pipe.as_mut().expect("pipe");
+        let ids: &[i32] = bytemuck::cast_slice(pipe.ids_host[step.buf].as_slice());
+        let vocab = self.vocab;
+        for (j, row) in step.rows.iter().enumerate() {
+            let b = row.slot;
+            let token = ids[if step.compact { j } else { b }] as u32;
+            if token as usize >= vocab {
+                pipe.queue.clear();
+                return Err(RuntimeError::Device(
+                    "decode pipeline: step produced an invalid token".into(),
+                ));
+            }
+            if pipe.retire[b].is_some() {
+                // The mux retired this row while the step was queued, so its token is dropped.
+                // The frontier advanced when the step was enqueued, so take that back: the KV
+                // this step wrote is not part of the sequence any published prefix describes.
+                self.pos[b] = self.pos[b].saturating_sub(1);
+                continue;
+            }
+            out.push((b, token));
+            if prefix && row.carry {
+                self.seq_tokens[b].push(pipe.last_in[b]);
+            }
+            pipe.last_in[b] = token;
+        }
+        if pipe.queue.is_empty() {
+            let retired: smallvec::SmallVec<[(usize, bool); 8]> = pipe
+                .retire
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(b, r)| r.take().map(|c| (b, c)))
+                .collect();
+            for (b, cache_output) in retired {
+                self.retire_slot(b, cache_output);
+            }
+        }
+        Ok(())
     }
 
     /// Whether the prefill object + bucket programs are loaded.
@@ -7367,6 +7871,9 @@ impl GpuEngine {
         let module = be.module_load(&pf.image)?;
         check_norm_weight_offset(be, &module, blob)?;
         Self::check_packet_pairing_suffix(be, &module, assets_dir, "_pf")?;
+        if let Some(limit) = crate::config::RuntimeConfig::debug_max_inst() {
+            be.module_global_set_u32(&module, "plow_debug_max_inst_pf", limit)?;
+        }
         let kname = crate::config::RuntimeConfig::get()
             .nv
             .kernel_pf
@@ -7446,6 +7953,17 @@ impl GpuEngine {
                     let m = be.module_load(&img)?;
                     check_norm_weight_offset(be, &m, blob)?;
                     Self::check_packet_pairing_suffix(be, &m, assets_dir, suffix)?;
+                    // Every object built from interp_sm120.cu carries its own suffixed copy of
+                    // the instruction cap; only the decode module's copy was ever set, so a
+                    // prefill fault could not be bisected. `e.inst` indexes the whole program
+                    // and segments share it, so one N caps seg and gemm on the same scale.
+                    if let Some(limit) = crate::config::RuntimeConfig::debug_max_inst() {
+                        be.module_global_set_u32(
+                            &m,
+                            &format!("plow_debug_max_inst{suffix}"),
+                            limit,
+                        )?;
+                    }
                     let f = be.get_function(&m, sym)?;
                     let sm = be.module_global_u32(&m, arena)?.unwrap_or(smem_pf);
                     be.set_max_dynamic_smem(f, sm)?;
@@ -9395,18 +9913,39 @@ impl GpuEngine {
     }
 
     fn packed_token_body(&mut self, reqs: &[PackedTokenReq<'_>]) -> Result<()> {
-        self.packed_token_body_inner(reqs, true)
+        self.packed_token_body_inner(reqs, true, &[])
     }
 
     fn packed_token_body_enqueue(&mut self, reqs: &[PackedTokenReq<'_>]) -> Result<()> {
-        self.packed_token_body_inner(reqs, false)
+        self.packed_token_body_inner(reqs, false, &[])
+    }
+
+    /// As [`Self::packed_token_body_enqueue`], with `device_ids` rows taking their input token
+    /// from `d_last` instead of the host staging: the previous launch sampled those tokens and
+    /// the host has not read them yet.
+    fn packed_token_body_enqueue_device(
+        &mut self,
+        reqs: &[PackedTokenReq<'_>],
+        device_ids: &[(u32, u32)],
+    ) -> Result<()> {
+        self.packed_token_body_inner(reqs, false, device_ids)
     }
 
     fn packed_token_body_inner(
         &mut self,
         reqs: &[PackedTokenReq<'_>],
         synchronize: bool,
+        device_ids: &[(u32, u32)],
     ) -> Result<()> {
+        // A parked launch reads this staging asynchronously and nothing has drained the stream
+        // since. Waiting on its event costs nothing once the device is past those copies — in the
+        // steady state it is, they precede that launch's kernel — and throttles a host that runs
+        // ahead, which is what was missing.
+        if !synchronize {
+            if let Some(pipe) = self.pipe.as_ref() {
+                self.be.event_synchronize(&pipe.body_ev)?;
+            }
+        }
         let Some(f_pf) = self.f_pf else {
             return Err(RuntimeError::Rejected("prefill object not loaded".into()));
         };
@@ -9596,6 +10135,32 @@ impl GpuEngine {
                     bytemuck::cast_slice(&pb.kvlen_buf),
                     &self.stream,
                 )?;
+            }
+            // Rows whose token only the device knows, overwritten after the staged upload.
+            let parked = !synchronize;
+            if !device_ids.is_empty() {
+                let d_last = self
+                    .pipe
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RuntimeError::Rejected("device-sourced rows need the decode pipeline".into())
+                    })?
+                    .d_last
+                    .base;
+                let ids_base = self.devp[self.t_ids].base;
+                for &(row, slot) in device_ids {
+                    self.be.memcpy_dtod_async(
+                        ids_base + u64::from(row) * 4,
+                        d_last + u64::from(slot) * 4,
+                        4,
+                        &self.stream,
+                    )?;
+                }
+            }
+            if parked {
+                if let Some(pipe) = self.pipe.as_ref() {
+                    self.be.event_record(&pipe.body_ev, &self.stream)?;
+                }
             }
             Ok(())
         })();
