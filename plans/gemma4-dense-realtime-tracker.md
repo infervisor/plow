@@ -3480,3 +3480,81 @@ MMA GEMV walk's per-stream cost, and the one direction never tested is DEEPER pr
 recorded diagnosis "bandwidth latency hiding". Deeper costs registers on a walk already at 255
 with spill, so it may lose too; it is one build and one `step_bench` sweep to find out, and
 `preserve_packet.py diff --expect` can assert the arm is single-variable before the lease.
+
+---
+
+## Prefetch depth at MT=2: a real -3.64% on the decode step, and two wrong turns getting there
+
+`op_gemv_mma.cuh` sets loads in flight from `UNB = PLOW_NV_GEMV_MMA_UNB / MT`. At MT=2 (the 32-row
+rung) that halves the depth to 6. The change makes it per-MT — MT=1 keeps 12, MT=2 takes 2/3 (8),
+MT>=4 untouched.
+
+### The result that counts
+
+`step_bench` ctx 128, each packet's OWN decode object, no cubin override. `rc1024` and
+`rc1024permt` are built from the same recipe with the same emit env (`preserve_packet.py diff` = 0
+differing keys of 12 — correct, the variable is the SOURCE) and have identical resources
+(`REG:255 STACK:192 SHARED:40464`). 3 reps, spread <= 0.011 ms:
+
+| MT1/MT2 |    B=1 |   B=16 |   B=32 |
+|--------:|-------:|-------:|-------:|
+|  12 / 6 | 10.724 | 11.582 | 14.239 |
+|  12 / 8 | 10.766 | 11.586 | **13.720** |
+
+**B=32 -3.64%, B=16 +0.03%, B=1 +0.39%.**
+
+B=1 regresses although its MT=1 code is unchanged — the decode object is one kernel and the deeper
+MT=2 unroll adds 41.6 KB to it. Same class as the fat prefill object: codegen for every rung
+depends on what else is compiled in.
+
+### It does reach the served ladder — at the size the arithmetic predicts
+
+The GEMV step is a fixed ~14.2 ms of a TPOT that grows with context, so the served share falls:
+
+|    in | step / TPOT | predicted | measured (3 ladders/arm) |
+|------:|------------:|----------:|-------------------------:|
+|  1024 | 14.2 / 24.2 = 59% |    -2.1% | **-2.19%** |
+|  8192 | 14.2 / 82.1 = 17% |   -0.63% | **-0.63%** |
+
+Both resolvable rungs land on the prediction. 4096 (-0.36%) and 15000 (+0.51%) sit inside their
+own bands and carry no information either way.
+
+### Wrong turn 1 — the ladder cannot adjudicate a change this size
+
+TTFT moved across reps on **byte-identical prefill objects**, so its spread is a direct read of the
+noise floor: **6.63% at 1024, 1.37% at 4096, 0.21% at 8192, 3.32% at 15000**. Re-running `rc1024`
+against itself reproduced most of the apparent permt effect, sign flip at 15000 included (same-arm
+TPOT -1.58 / -0.83 / -1.09 / +1.54 % versus permt-vs-baseline -2.50 / -0.70 / -0.79 / +1.89 %).
+
+A pre-registered rule — a majority of rungs must beat their band — then returned "inside noise, do
+not land". That rule was **too blunt**: the expected effect varies 6x across rungs and the band is
+widest exactly where the effect is largest. The ladder is the right instrument for a scheduler or
+geometry change and the wrong one for a 0.5 ms kernel delta. Adjudicate kernel changes on the
+packet's own object and use the ladder only to confirm the sign and check nothing else moved.
+
+### Wrong turn 2 — PAIR, a real harness defect that was not the explanation
+
+The first A/B was built with `scripts/build_sm90a_cubin.sh` and reported B=32 -4.06%. That path
+never defines `PLOW_NV_GEMV_MMA_PAIR` or `_B1`, so both fall to their header default of 0
+(`SHARED:14480`), while `manifest.rs:2762` sets `PAIR 1` for every packet carrying `gemv_mma_pair`
+(`SHARED:40464`). With PAIR=1 the plain GEMV path stops calling `gvmma_tile<NW=1>` and calls
+`gvmma_tile<NW=2>` over two ROW BLOCKS (`W2[2] = {W, W + 8u*K}`); the prefetch buffer is
+`wv[NW][UNB]`, so **loads in flight are NW*UNB and PAIR doubles them** — 12 in the packet at MT=2
+against 6 in the generic object.
+
+From that I predicted the shipped packet was already at the knee and the change was worth nothing
+in situ. **That prediction was wrong** — measured -3.64% on the real object. The generic harness
+overstated the gap (-4.06% vs -3.64%) and got B=1 backwards (-0.47% vs +0.39%), but it ranked the
+two arms correctly. The defect is real and worth avoiding; it was not the reason the served ladder
+showed little.
+
+Also refuted on the way: register pressure. Both packets are `REG:255 STACK:192` — the edit costs
+nothing in registers or spill.
+
+**Rule for future UNB work:** build the A/B from the packet, or with
+`PLOW_CUBIN_CONFIG=<packet>/assets/plow_config.h`, and gate on reproducing the shipped object's
+`REG/STACK/SHARED` before believing a number. A `PLOW_CUBIN_CONFIG` rebuild alone is not enough —
+it reproduced `SHARED:40464` but `STACK:336` against the shipped `192`, because the decode object
+also carries tunedb defines (`PLOW_NV_FORCE_MINBLK`, `GV_UNROLL`, `GV_MOE_UN`, `PLOW_MOE_DOWN_SG`,
+`GV_UNROLL_GLU`, `GV_MM_MAX`, the FA set) that the script does not know about. Rebuilding the
+packet is the reliable route.

@@ -90,8 +90,45 @@ __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_b
             for (int j = 0; j < 4; j++) acc[i][mt][j] = 0.0f;
 
     /* Loads in flight scale down with the tile count: MT=4 (the 64-row rung) at the full depth
-     * pushed the sm_90a decode object to 255 regs + 3.7 KB spills; depth 8/MT keeps it clean. */
-    constexpr unsigned UNB = (PLOW_NV_GEMV_MMA_UNB / MT) < 2u ? 2u : (PLOW_NV_GEMV_MMA_UNB / MT);
+     * pushed the sm_90a decode object to 255 regs + 3.7 KB spills; depth 8/MT keeps it clean.
+     *
+     * But `UNB/MT` overshoots at MT=2. Loads in flight are what hides HBM latency, and halving
+     * them at the 32-row rung is where the batched-decode knee lives: marginal ms per added
+     * stream 0.037 (B4->8), 0.069 (B8->16), 0.163 (B16->32), and 2.20 TB/s at B=1 against 1.78 at
+     * B=32 over the same 23.8 GB weight stream. So MT=2 takes 2/3 of the depth rather than half,
+     * MT=1 keeps the full 12, and MT>=4 keeps `UNB/MT` exactly — no shipped decode ladder
+     * instantiates the 64-row rung, so it is unmeasured. A global knob cannot express that.
+     *
+     * MEASURED IN SITU: step_bench at ctx 128 against two Gemma-4-12B packets built from the same
+     * recipe and the same emit env, differing ONLY in this formula (both REG:255 STACK:192
+     * SHARED:40464; 3 reps, spread <= 0.011 ms):
+     *
+     *     UNB@MT1 / UNB@MT2      B=1      B=16      B=32
+     *          12 / 6         10.724    11.582    14.239     <- UNB/MT
+     *          12 / 8         10.766    11.586    13.720     <- this formula: B=32 -3.64%
+     *
+     * B=1 pays +0.39% although its MT=1 code is unchanged: the decode object is one kernel and
+     * the deeper MT=2 unroll adds 41.6 KB to it. Served C32 tracks the kernel once diluted by the
+     * rest of TPOT (3 ladders per arm) — at 1024 in the step is 14.2 of 24.2 ms, predicting
+     * -2.1% against -2.19% measured; at 8192 in, 14.2 of 82.1 ms, predicting and measuring
+     * -0.63%. Below 8192 the served ladder's own run-to-run band (TTFT spread on identical
+     * prefill objects: 6.63% at 1024, 1.37% at 4096, 0.21% at 8192, 3.32% at 15000) is wider
+     * than the effect, so the ladder cannot adjudicate this change — the packet-level step can.
+     *
+     * DO NOT re-tune this with scripts/build_sm90a_cubin.sh. That path never defines
+     * PLOW_NV_GEMV_MMA_PAIR or _B1 (decode object SHARED:14480), while every packet sets both to
+     * 1 from manifest.rs (SHARED:40464). With PAIR=1 the plain GEMV walks two ROW BLOCKS as NW=2,
+     * and the prefetch buffer is wv[NW][UNB] — so loads in flight are NW*UNB and the generic
+     * object runs half the depth of the shipped one. Its ladder (12/6 16.883, 16/8 16.423,
+     * 24/12 16.648 at B=32) happens to rank these two arms the same way, but it overstated the
+     * gap and is not the same kernel. Build the A/B from the packet, or with
+     * PLOW_CUBIN_CONFIG=<packet>/assets/plow_config.h, and gate on REG/STACK/SHARED matching the
+     * shipped object before believing a number.
+     */
+    constexpr unsigned UNB_MT = MT == 1   ? PLOW_NV_GEMV_MMA_UNB
+                                : MT == 2 ? (PLOW_NV_GEMV_MMA_UNB * 2u) / 3u
+                                          : PLOW_NV_GEMV_MMA_UNB / MT;
+    constexpr unsigned UNB = UNB_MT < 2u ? 2u : UNB_MT;
     const unsigned nkb = (kb_end < (K >> 5)) ? kb_end : (K >> 5);
     unsigned kb = kb_begin;
     for (; kb + UNB <= nkb; kb += UNB) {
