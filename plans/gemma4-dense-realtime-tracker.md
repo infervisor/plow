@@ -3355,3 +3355,58 @@ needed to catch this: `emit_config.replay` (the env that reproduces the build) p
 takes a second and is now a preserved tool rather than an intention — see the packet preservation
 record below. No A/B in this campaign should be quoted again without that diff printed alongside
 it.
+
+
+### RESOLVED: req_chunk 1024 vs 2048, one variable, and the verdict is DO NOT ADOPT
+
+`rc1024` is the same recipe as `rc2048` with no override. `preserve_packet.py diff rc1024 rc2048
+--expect PLOW_MAX_REQUEST_CHUNK` exits 0: **1 differing key of 12**, same registry digest, same
+tuning. The script asserted that before spending the lease. Both ladders, C32, `high_concurrency`,
+adaptive off:
+
+```
+    in    metric    req1024    req2048     delta       vLLM   verdict
+  1024      TTFT     577.51     586.36     +1.5%     704.43       WIN
+            TPOT      24.03      24.68     +2.7%      18.19      lose
+          p99ITL     177.84     180.59     +1.5%     250.55       WIN
+           tok/s    1104.80    1078.30     -2.4%    1351.90      lose
+         peakGiB      47.10      67.10
+  4096      TTFT    2138.73    1947.53     -8.9%    1990.36       WIN
+            TPOT      48.32      48.62     +0.6%      37.89      lose
+          p99ITL     193.90     193.19     -0.4%     325.35       WIN
+           tok/s     484.40     493.90     +2.0%     597.80      lose
+         peakGiB      49.10      69.10
+  8192      TTFT    4274.20    3822.43    -10.6%    3657.96      lose
+            TPOT      82.40      84.12     +2.1%      67.49      lose
+          p99ITL     205.78     205.22     -0.3%     353.90       WIN
+           tok/s     270.70     276.00     +2.0%     332.20      lose
+         peakGiB      51.10      71.10
+ 15000      TTFT    8593.90    7254.35    -15.6%    6433.81      lose
+            TPOT     140.31     147.61     +5.2%     123.28      lose
+          p99ITL     227.09     228.01     +0.4%     383.84       WIN
+           tok/s     150.90     153.80     +1.9%     183.90      lose
+         peakGiB      53.10      73.10
+```
+
+**The chunk is a real TTFT lever at long prompts** — -8.9 / -10.6 / -15.6% at 4096 / 8192 / 15000,
+with out_tok_s +2% — so the direction of the retracted claim was right.
+
+**But the magnitude was inflated and the cost was hidden.** The confounded comparison reported
+-13.6% at 8192; one variable gives -10.6%. The difference is that p12rq (4425 ms) is SLOWER than
+rc1024 (4274 ms) at that cell, so the extra knobs p12rq carries were padding the baseline. And the
+true A/B exposes a TPOT cost of +2.1 to +5.2% that the cross-packet delta had concealed entirely
+(it showed +2.5% at 8192 against a baseline that was itself slow).
+
+**Verdict: do not adopt.** The campaign is scored on all four metrics and the single remaining
+deficit is TPOT. Spending 2-5% of TPOT to buy TTFT is trading the metric plow already leads into
+the one it is stuck on, and it costs a flat +20 GiB of peak at every length. At 1024 it is worse
+on all four. `rc2048` stays a measured arm, not a default; the req1k recipe keeps 1024.
+
+What it does settle, independently of any A/B, is the residency question: **ring 4096 x 32 slots
+fits** — 73.10 GiB of 80 at 15000 — so this document's earlier ~92 GiB estimate was wrong, and the
+reserved-vs-resident correction stands.
+
+**Standing at C32 on the clean rc1024 packet, against vLLM 0.28:** p99 ITL WINS at all four
+lengths (177.8/193.9/205.8/227.1 vs 250.6/325.4/353.9/383.8, 29-41% better); TTFT WINS at 1024 and
+4096; TPOT and out_tok_s LOSE at all four. 0 of 4 cells clean. The deficit remains singular and is
+TPOT.
