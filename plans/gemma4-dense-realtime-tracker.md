@@ -2362,3 +2362,45 @@ FP8 has no `GemvQkvFp8` arm. BF16 decode fuses q+k+v into one `GemvQkv` launch p
 `(4096,3840)` x40 plus `(2048,3840)` x80. That is **+80 GEMV launches per token** on the 12B,
 entirely independent of any Lt question, and it may be a large part of whatever FP8 decode deficit
 gets measured. The 26B is the same (BF16 l26 has `GemvQkv` x77).
+
+### Corrections: the serving cuBLASLt is 13.4.1.3, and the QuantFp8 tax is 4/layer not 1/GEMM
+
+Two things recorded above are wrong and are fixed here.
+
+**1. The gating CUDA version.** I recorded the nix `libcublasLt.so.12.9.1.4` as what decides whether
+`OUTER_VEC_32F` is available. It is not the library plow serves against. `plowrt`'s Lt loader
+(`crates/plowrt/src/device/cuda/lt.rs:39`) tries `libcublasLt.so.13` FIRST, and inside `nix develop`
+that resolves to **13.4.1.3** from `/usr/local/cuda/lib64`; `libcublasLt.so.12` does not resolve
+there at all. So the "is CUDA new enough" risk was never live — OUTER_VEC_32F is comfortably inside
+13.4. The route-matrix bench is being built and run against that same `/usr/local/cuda`, so the
+measurement uses the production library rather than the nix one.
+
+**2. The QuantFp8 tax.** I told both agents FP8 pays "roughly one QuantFp8 per GEMM (960 vs 912)".
+Those were per-PACKET program totals summed across five buckets, not launches, and the real
+structure is different. Counted from `kernel_cases` for ONE 128-row prefill chunk of the 12B:
+
+| | launches |
+|---|---|
+| BF16 (l12) | **766** — Gemm 329, HeadNormRope 144, RmsNorm 97, NormResidual 96, Glu 48, FlashPrefill 48, + 5 head ops |
+| FP8 (p12fp8a) | **958** — GemmFp8 328, **QuantFp8 192**, HeadNormRope 144, RmsNorm 97, NormResidual 96, Glu 48, FlashPrefill 48, Gemm 1, + 4 head ops |
+
+Exactly **+192 launches, +25.1%**, and the 192 is `4 per layer` at fixed sites — attention input,
+MLP input, GLU output before down, attention output before o_proj — NOT one per GEMM. Against 328
+GEMM launches that is 0.59 quantizes per GEMM, so my ratio overstated the per-GEMM tax while
+understating how cleanly it attributes.
+
+The same count states the Lt deficit exactly: of BF16's 329 `Gemm` launches, **328 are projections
+whose (N,K) are all in `CUBLASLT_PREFILL_GEMMA4_SHAPES`**, so at every shipped rung all 328 go to
+cuBLASLt and only `lm_head` stays native. Of FP8's 328 `GemmFp8`, **zero** can.
+
+### Open, with evidence, not chased: the 26B fuses GLU at every rung and the 12B does not
+
+On the 26B FP8 packet the dense-MLP gate/up is fused at EVERY rung (`GemmGluFp8` M=128 N=2112
+K=2816 x30 at bucket 128); on the 12B FP8 packet it is split at 128/512/1024/2048 and fused only at
+4096. Both packets have `no_glu_fuse=false` and `gemma4_sm90_w8a8_gemm_glu_role=1`. Both fused-GLU
+role objects declare `min_rows=4096 max_rows=8192 n=15360 k=3840` — 12B geometry — so the 26B's
+fusion cannot be the role object and must be the GENERIC `GemmGluFp8` interpreter arm. Why the 12B
+does not also take that generic arm below 4096 is unanswered; an arena or tile constraint at
+N=15360 K=3840 is the obvious suspect but is unverified. Consequence that matters now: "fused vs
+split" means different things per model, so the two models' FP8 prefill results are not directly
+comparable on that axis.
