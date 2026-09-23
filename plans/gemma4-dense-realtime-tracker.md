@@ -2891,3 +2891,49 @@ Worked at 8192 in, chunk 1024, ring 2048, 32 slots:
 So `chunk` couples LAUNCH COUNT and RING MEMORY, and nothing else; `window` sets decode work and
 the ring's floor; `ctx` sets full-layer memory only. There is no path from ring size to decode
 work, which is why "the doubled ring slows every decode step" needs a single-variable re-test.
+
+
+## Why C32 loses at long input: plow serializes prefill and decode, vLLM shares a pass
+
+Prefill share of the timeline = (req/s x input_len) / that stack's own single-stream prefill rate,
+where the single-stream rate is taken from its OWN C1 TTFT at the same input length. It says what
+fraction of the achievable prefill throughput each stack is actually sustaining at C32.
+
+| in | plow rate | plow used | plow share | vLLM rate | vLLM used | vLLM share |
+|---|---|---|---|---|---|---|
+| 1024 | 22012 | 8366 | 38.0% | 21677 | 10813 | 49.9% |
+| 4096 | 21790 | 12083 | 55.5% | 24083 | 19128 | 79.4% |
+| 8192 | 21158 | 12206 | **57.7%** | 23478 | 21299 | **90.7%** |
+| 15000 | 19388 | 10650 | **54.9%** | 22329 | 21600 | **96.7%** |
+
+**vLLM sustains 90-97% of its single-stream prefill rate WHILE ALSO decoding ~22 streams.** That
+is impossible under serialization -- the only way is mixing prefill and decode tokens in the same
+forward pass, where the decode rows are nearly free because the weights are already streamed for
+the prefill rows.
+
+plow sustains 55-58% and decodes 8-14 streams in the remainder. It is NOT slower at either job in
+isolation: its single-stream prefill rate is within 10% of vLLM's at every length (21158 vs 23478
+at 8192), and its C1 TPOT is at parity at every context. It loses because the two phases take
+turns on the timeline instead of sharing it.
+
+This is the gap `docs/arch/17-unified-token-batch.md:20` already names: "CUDA has no token-batch
+executor yet, so the default does not enable token batching on H100." `exec::mixed_program` is
+`#[cfg(feature = "hsa")]`, i.e. AMD host-side only; the NVIDIA kernel arms exist behind
+`#if PLOW_MIXED_STEP`.
+
+### What this reprioritises
+
+The deficit that loses the most cells is out_tok_s at C>=4, and its cause is the missing mixed
+step, not a kernel. Ranked by how much of the remaining gap each would close:
+
+1. **CUDA token-batch executor (mixed prefill+decode step).** Directly attacks the 55% -> 90%+
+   timeline-sharing gap. Largest and hardest.
+2. **Fewer prefill launches at 32 slots** (item 3 / `stage_rows`): chunk 4096 with a 2048-row
+   ring. Helps the prefill half only, and its "protect the small ring" premise is still
+   UNVERIFIED (see the correction above).
+3. **Decode batched-KV traversal** (TPOT +25-33% at C16, parity at C1). Real but smaller, and the
+   occupancy route for it is closed by measurement.
+
+Note the flattering C32 TPOT numbers (plow 50.7 vs vLLM 67.5 at 8192) are a SYMPTOM of this:
+plow's decode runs uncontended in its own slice of the timeline, so each step is fast while
+fewer steps happen. Judge throughput by out_tok_s and effective streams, never by TPOT alone.
