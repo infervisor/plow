@@ -2781,3 +2781,35 @@ twice the slots. A memory constraint cannot produce that inversion; a per-chunk 
 So item 3 (staging) remains the right lever, but the justification changes: not "so 32 slots of
 KV fit" -- they already fit -- but "so a long prompt stops paying 15 launches". The thing to
 measure next is prefill launch cost against chunk count at fixed slots, not KV footprint.
+
+
+### The chunk/ring trade is already measured, and item 3 is what splits it
+
+`scripts/campaign/recipes/gemma4-12b.h100.bf16-c32-16k.toml` records the A/B in its own header:
+
+> Chunk 2048 (ring 4096, p12c32c, 2026-09-21) fits too and halves long-prompt C32 TTFT
+> (8192/C32 10314 -> 4695 ms) but the doubled ring slows every decode step (128/C16 TPOT
+> 13.05 -> 17.97 ms, 1179 -> 856 tok/s), so 1024 stays. Both attention roles need the 4096 rung
+> and are off.
+
+So the collapse at 8192/15000 IS the chunk count, confirmed: doubling the chunk halves the
+long-prompt C32 TTFT and brings 8192/C32 from 10314 to 4695 ms against vLLM's 3658. It is
+rejected only because the same knob doubles the RING, and the ring stride costs every decode step
+(+38% TPOT, -27% tok/s at 128/C16).
+
+`PLOW_MAX_CHUNK` is one knob driving two independent things:
+
+| | set by | wants |
+|---|---|---|
+| prefill launch count | chunk | LARGE (fewer launches on long prompts) |
+| sliding ring stride | `window + write_rows - 1` | SMALL (every decode step traverses it) |
+
+`stage_rows` is exactly the split: `Manifest::write_rows` (`packed_prefill.rs:174`) returns the
+STAGE width, so the ring is sized `window + stage - 1` while the launch still covers the whole
+chunk (tests at `:1065-1066`: unstaged `write_rows(4096) == 4096`, staged-at-1024 `== 1024`).
+Chunk 4096 with `stage_rows` 1024 should give the 4695-ms-and-better long-prompt TTFT at the
+ring-2048 decode cost, AND re-enable both attention role objects, which need the 4096 rung.
+
+That is now the measured case for item 3, and it replaces both earlier rationales (the memory one
+is wrong -- see the correction above -- and "fewer launches" alone did not explain why chunk 1024
+was chosen).
