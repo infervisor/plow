@@ -4751,3 +4751,45 @@ So the campaign does not need more scheduling knobs or prefill work. It needs de
 The prefill levers are now exhausted at the config level: PF_INTERLEAVE is a confirmed null,
 the rung planner is fixed, and MULTISTEP staleness is fixed. What remains on prefill is kernel
 work (#66, #67) which buys TTFT we already win.
+
+## 8192/C1 FLIPPED TO 4/4 (2026-09-23T23) — first new cell of the campaign
+
+Packet `p12rq8` from the new `gemma4-12b.h100.bf16-c1-rq8192.toml`. Two changes, each aimed at
+one of the two blocked metrics:
+
+* `PLOW_MAX_REQUEST_CHUNK` 4224 -> **8192** — an 8192-row prompt runs ONE `[8192]` launch
+  instead of `[4096, 4096]`, saving a ~5.2 ms fixed launch cost. (TTFT lever.)
+* `PLOW_DECODE_BATCH_LADDER` `1,2,4,8,16` -> **`1,2,4`** — the megakernel entry is the whole
+  ~1 ms fixed per-step cost and it taxes every compiled rung, so fewer rungs = smaller entry.
+  (TPOT lever.)
+
+| 8192/C1 | plow | vLLM | |
+|---------|------|------|---|
+| TTFT    | **347.26** | 348.61 | won |
+| TPOT    | **10.58**  | 10.65  | won |
+| p99 ITL | **10.83**  | 11.58  | won |
+| tok/s   | **75.7**   | 75.2   | won |
+
+**The TPOT lever is general, not specific to 8192** — it moved every C1 cell:
+
+    ctx      128    1024   4096   8192   15000
+    5 rungs  10.52  10.59  10.63  10.66  10.72
+    3 rungs  10.45  10.51  10.55  10.58  10.65
+
+That is the fingerprint of a fixed per-step cost, and it is the first thing to actually MOVE
+#71 rather than exclude a cause.
+
+**C1 column: 3 cells at 4/4 -> 4.**
+
+Margin discipline: TTFT's margin is 0.4%, so it rests on two runs of this packet (346.57 with
+MULTISTEP=4, 347.26 with 0; MULTISTEP does not touch TTFT), and TPOT was bit-identical at 10.58
+in both.
+
+**A third stale recipe found.** `gemma4-12b.h100.bf16-l8192-16k.toml` carried the same
+`PLOW_MULTISTEP="4"` as the 26B one, and the new recipe inherited it. Measured at exactly
+4.02 x TPOT with `itl_med` = 0.000 (p99 41.87/42.15/42.35/42.56/42.87 vs TPOT 10.45..10.65).
+Both fixed. **Always diff a derived recipe's `serve_env` against its sibling.**
+
+**15000/C1 is out of reach by rung shape and stays 1/4** (TTFT 694.51 vs 675.86). 15001 rows
+need 16384 padded rows under ANY split, because the ladder above 4224 admits only
+pow2(+64/+128) shapes; ~1383 padded rows is ~55 ms and inherent. It needs #66.
