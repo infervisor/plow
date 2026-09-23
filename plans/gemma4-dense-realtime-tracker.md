@@ -2011,3 +2011,38 @@ Neither `rt.live_ctx` nor `rt.vmm_live` is set by any recipe, and the widen test
 packets or the hf-cache are present — so this campaign has never exercised widening. For the FP8
 arm we re-emit at `max_ctx = 16384` instead, because widening swaps the KV allocator to VMM and
 would break apples-to-apples against a BF16 arm on contiguous rings.
+
+## #51 finer prefill rungs: the padding fix works, the 2560 rung wedges — REVERTED
+
+A/B on 2026-09-23, one variable: `PLOW_PF_LADDER_APPEND` gains 1536/2560/3072/3584 on the 12B
+bf16-ladder16k recipe (packet `l12r`). Same binary, same everything else.
+
+**The bucket arithmetic worked exactly as designed.** At 15000/C1 the picks went
+`4224, 4224, 4224, 2328 -> 2560` against the old `4224 x3 + 2328 -> 4096`: useful 15000, launched
+15232, so padding fell **10.6% -> 1.52%**.
+
+**Then it wedged.** The 2560 pick is the last line in the packlog; plowrt then span at 99.6% CPU
+(3535 s CPU in 3547 s wall) with the bench client blocked at 18 s CPU, holding the GPU lease and
+the CPU-quiet lock for 59 minutes until killed. No fault, no diagnostic — a host-side spin.
+
+It is NOT a missing program. `assets/build.json` shows 2560 fully emitted and wired:
+`shapes.prefill_buckets = [128,256,512,1024,1088,1152,1536,2048,2560,3072,3584,4096,4160,4224]`,
+`modular_pipeline.prefill_rungs` the same, and `dispatch_table` entries at index 8 for both
+`prefill:dense_attention:2560` and `prefill:dense_ffn:2560`. So the bucket pick found a real rung
+and the wedge is in EXECUTING it.
+
+The first three 4224 chunks of the same request completed, and the old packet also runs 15000 as
+four chunks, so chunk-chaining is not the variable. Geometry checks out too:
+`kv_ring_rows(1024, 2560) = 3583 <= 8192` ring, and 15000 <= max_ctx 16384.
+
+Pattern worth testing before anyone re-attempts this: every rung that has ever worked is a power of
+two or `pow2 + {64,128}` (1088, 1152, 4160, 4224). All four NEW rungs are `pow2 + {512,1024,1536}`.
+Cheap repro to isolate it, when the card is free: serve `l12r` and send ONE ~2500-token prompt, so
+bucket 2560 runs as a single chunk with no chaining.
+
+**Reverted** — the recipe is back to `256,1088,1152,4160,4224` and was never committed.
+
+**This does not block the objective.** The cost-aware DP cover (`PLOW_PF_COVER=0`, #52) targets the
+same 15000 padding with only EXISTING rungs: it should cut the 2331-row tail as `[2048, 512]` =
+2560 launched rows — the identical 1.5% padding — without introducing a 2560 rung at all. That A/B
+is running. If it wins, #51 is closed by #52 and the finer rungs are unnecessary.
