@@ -6,8 +6,24 @@ if [ "$gemma_base" = "$gemma_out" ]; then
   echo 'Use a separate output directory for the candidate objects.' >&2
   exit 2
 fi
-for gemma_file in interp_sm90a.cubin interp_sm90a_pf.cubin interp_sm90a_pfseg.cubin interp_sm90a_pfpackedseg.cubin; do
-  test -f "$gemma_base/$gemma_file"
+gemma_required=(interp_sm90a.cubin interp_sm90a_pf.cubin interp_sm90a_pfseg.cubin)
+# Packed-request objects exist only for a packet that HAS packed-prefill topology. A Gemma MoE FP8
+# packet legitimately has none (PLOW_EMIT_PACKED_PREFILL panics for it at devgen lib.rs:9774), so
+# the base emit produces no pfpacked* object and interp_sm120.cu:203 hard-#errors if one is built
+# anyway. Requiring it here unconditionally made `set -e` abort with no message at all.
+gemma_has_packed=1
+if [ -f "$gemma_base/plow_config.h" ] &&
+   ! grep -qx '#define PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY 1' "$gemma_base/plow_config.h"; then
+  gemma_has_packed=0
+fi
+if [ "$gemma_has_packed" = 1 ]; then
+  gemma_required+=(interp_sm90a_pfpackedseg.cubin)
+fi
+for gemma_file in "${gemma_required[@]}"; do
+  test -f "$gemma_base/$gemma_file" || {
+    echo "missing base object: $gemma_base/$gemma_file" >&2
+    exit 2
+  }
 done
 mkdir -p "$gemma_out"
 cp "$gemma_base"/*.cubin "$gemma_out/"
@@ -70,6 +86,8 @@ if [ -n "${PLOW_BUILD_SEG_EXTRA_DEFINES:-}" ]; then
   gemma_flags+=("${gemma_extra_flags[@]}")
 fi
 for gemma_packed in 0 1; do
+  # No packed-prefill topology -> no packed-request objects to build (interp_sm120.cu:203).
+  if [ "$gemma_packed" = 1 ] && [ "$gemma_has_packed" = 0 ]; then continue; fi
   gemma_prefix=pf
   if [ "$gemma_packed" = 1 ]; then gemma_prefix=pfpacked; fi
   gemma_padding_flags=()
@@ -106,7 +124,7 @@ for gemma_packed in 0 1; do
       -o "$gemma_out/interp_sm90a_pfpackedseg.cubin" runtime/nvidia/interp_sm90a.cu
   fi
 done
-if [ "${PLOW_BUILD_FA_GQA2_PAIR:-$gemma_bf16}" = 1 ]; then
+if [ "${PLOW_BUILD_FA_GQA2_PAIR:-$gemma_bf16}" = 1 ] && [ "$gemma_has_packed" = 1 ]; then
   gemma_gqa2_padding_flags=()
   if [ "$gemma_masked_def" = 1 ]; then
     gemma_gqa2_padding_flags=(-DPLOW_NV_MASKED_PADDING=1)
