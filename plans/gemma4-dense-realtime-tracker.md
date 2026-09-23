@@ -1738,3 +1738,56 @@ vLLM streams one at a time (11.3 / 5.8 ms). TTFT and TPOT are unaffected; only t
 metric is. A/B running: 12B with `MULTISTEP=0 + PLOW_DECODE_PIPELINE=1` (per-token streaming is
 precisely what stage 1 buys), 26B with `MULTISTEP=0` alone, since the pipeline is unavailable
 whenever cuBLASLt is enabled (`gpu.rs:3539`).
+
+### Hoist fix verified (007e864c)
+
+26B realtime: 10/10 cells, zero `graph edges` faults. The new diagnostic is exact --
+`refused=1 hoisted=12 nodes=154` on the big graphs, `refused=1 hoisted=2 nodes=22` on the small
+ones. Exactly **one** node per capture refuses the query; every other memset still hoists. So the
+optimization is ~92 % preserved and the launch no longer dies for it. Worth a follow-up: one node
+per graph refusing a dependency query is a specific shape, not random driver flakiness.
+
+### Complete ladder, 40/40 cells (plow wins-losses vs vLLM 0.28)
+
+| model | TTFT | TPOT | p99 ITL | tok/s | E2E |
+|---|---|---|---|---|---|
+| Gemma-4-12B | 13-7 | 8-12 | 9-11 | 3-17 | 3-17 |
+| Gemma-4-26B-A4B | 11-9 | 3-17 | 8-12 | 0-20 | 0-20 |
+
+TTFT is the real strength and it is not close in places (26B 128/C1 21.3 vs 38.3 ms; 15000/C4
+592 vs 804). TPOT and throughput are the weakness. Recovering the six 26B cells made the verdict
+*worse*, not better -- they all land at E2E 1.08-1.25x.
+
+The TPOT gap is context-dependent, which points at decode attention rather than the GEMMs.
+26B at C4, 128 -> 15000 in: plow 7.85 -> 16.86 ms (+9.01), vLLM 7.25 -> 10.86 (+3.61). The
+constant part is within 8 %; the per-KV-row part costs 2.5x. 12B at C16: plow +73.1 ms over the
+same span, vLLM +56.9.
+
+### Where the TPOT gap actually is: KV traversal, not the weight walk
+
+Split TPOT into its context-free and per-KV parts using measurements only. (A least-squares
+intercept is NOT safe here: vLLM's TPOT-vs-context curve is convex, so a straight line puts its
+intercept ~1.5 ms under the measured 128-token cell and invents a constant-term gap that does not
+exist. Use the 128-in cell as the constant and a two-point secant for the slope.)
+
+```
+                constant part (TPOT@128in)        per-KV slope (us per 1k ctx)
+                plow   vLLM    x                  plow     vLLM     x
+12B    C1      10.42  10.46  1.00                 13.5      6.7   2.00
+       C4      10.63  10.49  1.01                  784      509   1.54
+       C16     11.68  10.90  1.07                 4915     3827   1.28
+26B    C1       5.38   5.04  1.07                 16.1      3.4   4.80
+       C4       7.85   7.25  1.08                  606      243   2.50
+       C16     11.17   8.84  1.26                 2963     1754   1.69
+```
+
+The context-free part is at parity on the dense 12B -- 1.00 / 1.01 / 1.07x, and the HBM efficiency
+of the weight walk is the same as vLLM's (60.8-68.2 % of 3352 GB/s against 61.3-67.9 % over
+23.81 GB of weights). The whole TPOT gap is the per-KV-row term.
+
+So the decode target is decode attention, not the GEMMs: 1.28-2.0x on the 12B, 1.69-4.8x on the
+26B. At C1 the absolute cost is negligible (13 us per 1k) so it never shows; at C16/15000 it is
+73 ms of an 85 ms step.
+
+(C32 rows read better than vLLM only because plow serves C32 on the same 16 slots as C16 -- that
+column is the admission cap, not a decode result.)
