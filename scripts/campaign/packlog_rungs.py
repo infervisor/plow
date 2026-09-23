@@ -1,3 +1,16 @@
+#!/usr/bin/env python3
+"""Price riding decode and rung padding, from a PLOW_PF_PACKLOG=1 server log.
+
+    packlog_rungs.py <server.log>
+
+Joins each launch's three log lines -- `PACKLOG PACK` (prefill rows, decode_feeds),
+`PACKLOG R=` (total rows, bucket) and the following `PACKLOG TICK` (prefill_ms) -- and groups by
+(prefill rows -> bucket), so a launch that fits its rung can be compared against one that spills.
+
+This is what shows that riding decode is cheap in-rung (0.456 ms/row at 4068+28 -> 4096) and
+expensive across a rung hole (1.67 ms/row at 2048+30 -> 2078, which has no bucket below 4096).
+Aggregate prefill_ms cannot see that difference; only the per-launch join can.
+"""
 import re,sys,collections,statistics as st
 P=re.compile(r"PACKLOG PACK reqs=(\d+) rows=(\d+) decode_feeds=(\d+)")
 R=re.compile(r"PACKLOG R=(\d+) rows=(\d+) bucket=(\d+)")
