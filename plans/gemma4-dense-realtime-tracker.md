@@ -2177,3 +2177,43 @@ Combined with the 1800 s default timeout this starves every other job silently (
 above). Mitigation in force: `GPU_LEASE_TIMEOUT=43200` on every queued driver, so waiters survive
 the whole loop rather than dying mid-queue. A real fix would be a ticket/FIFO in gpulease; not
 attempted, since it is shared tooling outside this campaign.
+
+## campaign.py cmd_build produces an unservable object set whenever a role rewrites the packet
+
+Found 2026-09-23 on the card; every FP8 bench died at load with
+"packet/interpreter MISMATCH: the loaded cubin was specialised for packet 0x836def099237d766, but
+the packet in .../assets is 0xa82f36d7771fc903" (narrow realtime rc=2, wide realtime rc=2, wide
+high_concurrency rc=2, GSM8K rc=1 — all one cause).
+
+`cmd_build` runs base emit -> objects -> role emit, and hands the objects script
+`PLOW_CUBIN_CONFIG=<base>/plow_config.h`. That is only sound if the ROLE emit leaves the packet
+unchanged. Verified both ways from `plow_config.h`:
+
+| packet | base | assets | |
+|--------|------|--------|---|
+| BF16 `l12` | `0x691e069b80c2fa23` | `0x691e069b80c2fa23` | match |
+| FP8 `p12fp8a` | `0x836def099237d766` | `0xa82f36d7771fc903` | DIFFER |
+| FP8 `p12fp8b` | `0x65a07f7e459c7474` | `0xb4c7405cf7c04bc3` | DIFFER |
+
+The BF16 roles only BIND objects, so base == assets and
+`objects/interp_sm90a_pf.cubin` is byte-identical to the assets copy. The W8A8 fused-GLU role
+(`PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE=1` ->
+`gemma4_w8a8_gemm_glu_role::apply_output_object`) REWRITES instruction sites, so the role emit
+yields a different packet and the base-config object set is stale. `campaign.py packet_env` then
+points `PLOW_PF_SEG_DIR` at those stale objects and plowrt correctly refuses.
+
+The BF16 12B recipe never trips this because it enables no GLU role at all — it uses
+`NO_GLU_FUSE` + `PREFILL_CUBLASLT`. So the defect is reachable only on the FP8 path, which is why
+it has never been seen: there is no `perf-data/campaign/gemma4-12b.h100.w8a8*.csv` in the tree, and
+the committed `w8a8-roles.toml` has almost certainly never been served end to end.
+
+Workaround in use (recipe/flow level, no code change): re-run
+`scripts/build_sm90a_gemma4_segments.sh` with `gemma_base=<assets>` and
+`PLOW_CUBIN_CONFIG=<assets>/plow_config.h` into an `objects2` dir, then serve with
+`PLOW_PF_SEG_DIR=<objects2>`. The script's first act is `cp $base/*.cubin $out/`, so objects2 picks
+up the role-emit cubins and recompiles the extra segment objects against the role-emit config.
+
+Proposal, NOT implemented: `cmd_build` should either pass the ROLE emit's `plow_config.h` to the
+objects step, or refuse when the base and assets packet hashes differ. Today it silently produces
+an unservable set. Not changed here — shared tooling, three jobs using it live, and a guard there
+needs its own GPU test pass.
