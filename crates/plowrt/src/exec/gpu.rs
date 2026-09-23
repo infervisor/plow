@@ -7789,6 +7789,9 @@ impl GpuEngine {
         let module = be.module_load(&pf.image)?;
         check_norm_weight_offset(be, &module, blob)?;
         Self::check_packet_pairing_suffix(be, &module, assets_dir, "_pf")?;
+        if let Some(limit) = crate::config::RuntimeConfig::debug_max_inst() {
+            be.module_global_set_u32(&module, "plow_debug_max_inst_pf", limit)?;
+        }
         let kname = crate::config::RuntimeConfig::get()
             .nv
             .kernel_pf
@@ -7868,6 +7871,17 @@ impl GpuEngine {
                     let m = be.module_load(&img)?;
                     check_norm_weight_offset(be, &m, blob)?;
                     Self::check_packet_pairing_suffix(be, &m, assets_dir, suffix)?;
+                    // Every object built from interp_sm120.cu carries its own suffixed copy of
+                    // the instruction cap; only the decode module's copy was ever set, so a
+                    // prefill fault could not be bisected. `e.inst` indexes the whole program
+                    // and segments share it, so one N caps seg and gemm on the same scale.
+                    if let Some(limit) = crate::config::RuntimeConfig::debug_max_inst() {
+                        be.module_global_set_u32(
+                            &m,
+                            &format!("plow_debug_max_inst{suffix}"),
+                            limit,
+                        )?;
+                    }
                     let f = be.get_function(&m, sym)?;
                     let sm = be.module_global_u32(&m, arena)?.unwrap_or(smem_pf);
                     be.set_max_dynamic_smem(f, sm)?;

@@ -1608,7 +1608,8 @@ impl RuntimeConfig {
         std::env::var(var).ok().filter(|value| !value.is_empty())
     }
 
-    /// `PLOW_DEBUG_MAX_INST`: decode interpreter instruction cap, a fault-bisect aid.
+    /// `PLOW_DEBUG_MAX_INST`: interpreter instruction cap, a fault-bisect aid. Applied to
+    /// the decode module and to every prefill object, which share one `e.inst` scale.
     #[cfg(feature = "cuda")]
     pub(crate) fn debug_max_inst() -> Option<u32> {
         Self::env_parse("PLOW_DEBUG_MAX_INST")
