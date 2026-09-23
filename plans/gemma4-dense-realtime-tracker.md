@@ -2466,3 +2466,92 @@ Two process lessons, both now applied by the agent that caused it:
 This is the second time today that killing the wrong pid caused damage (the first burned 20 minutes
 of lease on the rungs A/B driver). The general rule for this host: kill the process GROUP, and
 verify with `pgrep -af` afterwards rather than assuming.
+
+## 2026-09-23: rt.pf_cover certified; FP8 has never served; the C32 lever is cheaper than planned
+
+### rt.pf_cover is the one metric that moved (certified, `2c3d0952`)
+
+15000/C1 TTFT **737.256 -> 703.364 ms** (floor 7.169; the second treat arm gave 703.187), prefill
+padding 10.59% -> 1.58%, tpot_ms 10.541 -> 10.538 inside a 0.007 floor. `perf-certs/rt.pf_cover.json`,
+`perf_cert.py verify` rc=0.
+
+The first certificate attempt was REJECTED and the request was at fault, not the knob: it claimed a
+TTFT improvement on both touched rungs, but 8192 is ITSELF a prefill bucket, so the covering pick and
+the cost-aware DP cover both emit one exact-fit launch and there is no padding at that rung for the
+cover to remove. Re-declared 8192 neutral with that evidence via `--neutral ttft_ms@in8192`
+(`campaign.py:509-511` supports per-input-length neutrality), rebuilt from the SAME four ABAB arms --
+no re-measurement to obtain a better number.
+
+Three other flips (`rt.pf_interleave_adaptive`, `rt.rung_fast_probe`, `rt.multistep_adaptive`) were
+rejected on merit and need NO code change: all three were already `OFF, OPT_IN`, so the campaign was
+attempting promotion, not certifying a flip. Deltas were inside noise and the fast probe was
+directionally worse (128/C16 ttft 62.754 -> 67.006). Caveat worth keeping: `campaign.py cert` can only
+claim ttft_ms/tpot_ms improvement, so `rt.multistep_adaptive`, whose documented benefit is the p99 ITL
+wave, cannot express its claim with the current tooling.
+
+### The FP8 campaign has never produced a data row -- and it is two bugs, not one
+
+Every run under `/opt/dlami/nvme/tmp/fp8-campaign/` has `gate: false` and a header-only results.csv:
+
+| packet | how it fails |
+|---|---|
+| p12fp8a, p12fp8b | `packet/interpreter MISMATCH` -- **never loaded** (stale objects vs assets) |
+| p12fp8c | loads, then ILLEGAL_ADDRESS on the FIRST packed prefill |
+
+Only the second is a kernel bug. The mismatch is hygiene: each `p12fp8*` has BOTH `objects/` and
+`objects2/`, and `gemma4-12b.h100.fp8-ladder16k.toml` bakes `PLOW_PF_SEG_DIR=.../objects` into its
+serve replay while the assets match `objects2/`.
+
+Bisect of the real fault (39-row prompt, bucket 128, `CUDA_LAUNCH_BLOCKING=1`): `cuGraphLaunch` ->
+`cuLaunchCooperativeKernel` (`PF_SEG_GRAPH=0`) -> `cuLaunchKernel` (`+ PF_SEG_NONCOOP=1`), and still
+faults under `PF_SEG_FATONLY=1`. Only the reporting API moves, so it is the KERNEL BODY. Eliminated:
+graph construction and memset nodes; grid cooperation; cuBLASLt (`gemm_launches=0`); all four role
+objects; and every FP8 attention arm (`kv_dtype` is bf16 on both head dims). Since `GemmGluFp8` exists
+only at bucket 4096, the remaining suspects are **QuantFp8 (1920 instances) or GemmFp8 (1872)**.
+compute-sanitizer is unusable here -- it fails on ANY plowrt invocation in this nix env.
+
+**No FP8 serving latency, throughput or quality number exists.** The static build.json analysis and the
+route-matrix microbenchmark are unaffected; nothing else about FP8 is measured.
+
+### Route matrix: the FP8 prize is 1.83x and it lives in cuBLASLt (`fe938458`)
+
+Every dense projection shape of both models, both precisions, one protocol, reproduced across two
+independent builds (1.83x identical both runs). `down` M=8192: Lt-BF16 1.179 -> Lt-FP8 0.645 ms;
+`gate_or_up` M=8192: 1.207 -> 0.659. plow's native FP8 body captures only 1.29x of that. With zero of
+the packet's 328 GemmFp8 launches able to reach Lt while 328 of BF16's 329 Gemm do, that is the whole
+FP8 deficit. The OUTER_VEC (per-token x per-channel) scale mode costs 1.1-1.7x against per-tensor at
+small M -- per-token scaling is not free.
+
+### C32: item 3 needs NO kernel change, and the ring assertion is the whole ceiling
+
+`plans/gemma4-packet-geometry.md` item 3 budgeted a row-offset field on HeadNormRope, a q-row window on
+four role objects and a FlashMerge window. None is required:
+
+* the flash body already derives rq0/qlen/slot/kvlen per request from `req[]` and computes
+  `qp0 = kvlen - qlen` itself (`op_attention_sm90.cuh:356,717`), so a CLIPPED span table is enough --
+  note `i[4]`/q_pos0 is overwritten on the packed path and cannot carry a stage offset;
+* `d_headnorm_rope` already skips a masked row (`op_norm.cuh:781`, `:985`), so a per-stage SLOT MASK is
+  enough for the K/V norm.
+
+That keeps the change out of the fat `pfpackedseg` object at the 255-register cap. The 16-slot ceiling
+is one line in `packed_prefill::Manifest::validate`:
+`cache.stride >= cache.window + write_rows - 1` with `write_rows = max_request_rows.or(rows)` -- a
+4096-row chunk demands an 8192-row ring (2.5 GiB/slot, 16 slots). `stage_rows` makes it the STAGE width:
+2048 ring rows, 640 MiB/slot, 32 slots at the chunk-4096 TTFT. Within one cooperative launch the
+protection is the WAR ordering (`HNR_{i+1}` after `FP_i`), not the launch boundary, which is why the
+field is gated on stages actually being bound.
+
+Landed and tested (`19932839`, `61d29498`, `247dae64`): `plan_stage`, `stage_slots`, `stages_needed`,
+`Manifest::write_rows` with its gate, and a `bind_request` guard so load-time binding cannot repoint a
+staged site at the whole-chunk tables (silent wrap, wrong tokens, no fault). 22 tests.
+
+**Not done: the devgen emit loop (HNR_i -> FP_i with Dep::Coarse), the runtime per-stage table fills,
+the packet build and the C32 cells.** Nothing is measured yet.
+
+### Where the comparison actually stands
+
+8192/C32 is **4291 ms vs vLLM 3648** -- unchanged this session. The 32-slot `c32-req1k-16k` packet is the
+best plow packet at C32 for >=4096-token prompts (8192/C32 7552 -> 4291, 15000/C32 13646 -> 8271) but
+still loses that cell, regresses C16 long prompts by 66-72%, and pays a constant +42 ms per lone
+128-token arrival at C16 (still unattributed). vLLM is not beaten on all metrics, and FP8 cannot be
+compared at all until the prefill fault is fixed.
