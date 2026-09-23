@@ -4793,3 +4793,62 @@ Both fixed. **Always diff a derived recipe's `serve_env` against its sibling.**
 **15000/C1 is out of reach by rung shape and stays 1/4** (TTFT 694.51 vs 675.86). 15001 rows
 need 16384 padded rows under ANY split, because the ladder above 4224 admits only
 pow2(+64/+128) shapes; ~1383 padded rows is ~55 ms and inherent. It needs #66.
+
+## 128/C4 FLIPPED TO 4/4 — the entry lever is not C1-specific
+
+The SAME `p12rq8` packet (4 slots, decode ladder 1,2,4) run at C4, vs the same-session vLLM C4
+reference. It needs no C4-specific build: 4 slots IS C4's size.
+
+| 128/C4 | control | rq8192 | vLLM | |
+|--------|---------|--------|------|---|
+| TTFT   | 38.63 | **35.83** | 55.60 | won |
+| TPOT   | 10.79 | **10.50** | 10.60 | won |
+| p99    | 14.00 | **10.96** | 11.63 | won |
+| tok/s  | 362.6 | **373.5** | 365.2 | won |
+
+TPOT fell **0.29 ms**, more than the 0.19 the cell needed. The lever is bigger at C4 than the
+0.07 it gave at C1 — consistent with a fixed per-step cost being amortised over fewer tokens
+per unit time as batch grows.
+
+**The large-input C4 cells got WORSE, as predicted**: request_chunk 8192 makes a prefill launch
+bigger, and C4's p99 is interference-bound — 8192/C4 TTFT 686 -> 927, p99 190 -> 343.
+
+**`PLOW_PF_CHUNK=4224` does NOT cleanly undo that.** It restored the prefill behaviour at
+8192/15000 but COST 128/C4 its p99 win (10.96 -> 14.89) and the cell dropped to 3/4. Cause: the
+knob also feeds a per-tick row budget (mux.rs:2002), not just the per-request slice cap, so it
+is not the single-variable dial I treated it as. Recorded as a second reason not to reach for
+this knob.
+
+**Best known C4 config = rq8192 uncapped: 1 cell at 4/4 (was 0).** One packet now serves both
+the C1 and C4 columns.
+
+| config | 4/4 cells at C4 | 15000/C4 |
+|--------|-----------------|----------|
+| control ladder16k | 0 | 2/4 |
+| rq8192 uncapped   | **1** | 1/4 |
+| rq8192 + PF_CHUNK=4224 | 0 | 2/4 |
+
+## C16 lean ladder (1,4,16) — MEASURED NULL, and it costs TTFT. Recipe not shipped.
+
+Single-variable vs the control: same max_chunk 4224, same 16 slots, same high_concurrency
+profile, same 64 prompts. Only the compiled decode rung count differs.
+
+| 128/C16 | control (1,2,4,8,16) | lean (1,4,16) | vLLM |
+|---------|----------------------|---------------|------|
+| TTFT    | **73.39** won | 108.73 lost | 100.06 |
+| TPOT    | 11.74 | 11.31 | 11.04 |
+| p99 ITL | 12.41 lost | **11.65** won | 12.23 |
+| tok/s   | 1304.9 | 1324.1 | 1361.8 |
+
+**The entry lever works but a coarse ladder costs more than it saves at C16.** TPOT did improve
+(-0.43 ms) and p99 flipped to a win, but TTFT regressed 48%. Cause: with rungs 1,4,16 a batch of
+2-3 rounds up to 4 and 5-15 to 16, so during the C16 ramp every decode step does extra work and
+delays prefill. 4096/8192/15000 are unchanged at 2/4.
+
+**128/C16 is unreachable with this lever even combining best-of-both**: TTFT 73.39 from the
+control plus TPOT 11.31 from lean still loses TPOT (needs 11.04, i.e. -0.70; the lever gave
+-0.43). C16 keeps ladder16k unchanged.
+
+**So the entry lever has a shape constraint**: it pays when the dropped rungs are ones the
+column does not use (C1 never needs 8 or 16; C4 never needs 8 or 16) and costs when they are
+(C16 uses 2 and 8 constantly during ramp/tail).
