@@ -2747,3 +2747,37 @@ roughly 455 against vLLM's 332, and TTFT falls with it because requests stop que
 
 So the collapse happens DURING the run, not at load. Next step is an instrumented 32-slot run at
 8192/C32 that records admitted-slot count over time against KV pressure and prefill occupancy.
+
+
+### Correction: C32 is NOT memory-gated (2026-09-23)
+
+The line above -- "Concurrency above 16 is gated by packet memory, not kernels" -- and the ring
+arithmetic that goes with it describe what a STATIC allocator would need. The runtime is not one:
+KV is VMM-backed, `ensure_rows` maps pages on demand, and `kv_row_charge`'s own comment says
+"with live rings every cache maps lazily". The `window + chunk - 1` ring is reserved ADDRESS
+SPACE, not resident memory.
+
+Measured peak memory per cell says so outright:
+
+| in | 32-slot pkt peak | eff streams | 16-slot pkt peak | vLLM peak |
+|---|---|---|---|---|
+| 128 | 46.0 GiB | 29.9 | 66.1 | 73.1 |
+| 1024 | 46.0 GiB | 26.4 | 66.1 | 74.0 |
+| 4096 | 47.9 GiB | 23.3 | 67.1 | 74.0 |
+| 8192 | 47.3 GiB | **13.6** | 68.1 | 74.0 |
+| 15000 | 47.3 GiB | **8.0** | 69.1 | 74.0 |
+
+Peak is FLAT at 46-48 GiB across every cell. It does not climb where effective concurrency
+collapses, and it leaves ~33 GiB of an 80 GiB card unused while vLLM uses 74. Nothing here is
+running out of memory.
+
+**What the same data does show.** The 32-slot packet runs chunk 1024, so a 15000-token prompt
+costs 15 chunk launches against 4 for the 16-slot chunk-4096 packet. At 128/1024/4096 that is
+1-4 chunks and the 32-slot packet BEATS vLLM on effective streams (29.9/26.4/23.3 vs
+29.0/24.6/22.7). At 8192/15000 it is 8-15 chunks and it collapses -- to the point that it is
+WORSE than the 16-slot packet at 15000 (eff 8.0 vs 13.3, TTFT 26936 ms vs 13405) despite having
+twice the slots. A memory constraint cannot produce that inversion; a per-chunk cost can.
+
+So item 3 (staging) remains the right lever, but the justification changes: not "so 32 slots of
+KV fit" -- they already fit -- but "so a long prompt stops paying 15 launches". The thing to
+measure next is prefill launch cost against chunk count at fixed slots, not KV footprint.

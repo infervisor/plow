@@ -357,3 +357,16 @@ objects off, which is why 8192/C32 is 4291 ms against vLLM's 3648 -- the only lo
 5. **Verify.** Per the fat-object memory note, validate on a block with real inputs before
    building a packet -- all non-GEMM prefill ops share `pfpackedseg` at the 255-register cap, so
    an isolated win can invert in situ. Then the 8192/C32 and 15000/C32 cells.
+
+
+### Correction to the seam map's rationale (2026-09-23)
+
+The seam map above justifies `stage_rows` with "32 slots needs 112 GiB against ~57 GiB free".
+That is the STATIC-allocator figure and it is not what the runtime does -- KV is VMM-backed and
+maps lazily, and measured peak memory for the 32-slot packet is FLAT at 46-48 GiB on an 80 GiB
+card at every input length, including the ones where concurrency collapses. C32 is not
+memory-gated.
+
+The seams themselves are unchanged. The reason to build them is the per-chunk cost: chunk 1024
+makes a 15000-token prompt 15 launches instead of 4, which is what actually collapses effective
+concurrency at 8192/15000. See the tracker's "C32 is NOT memory-gated" section.
