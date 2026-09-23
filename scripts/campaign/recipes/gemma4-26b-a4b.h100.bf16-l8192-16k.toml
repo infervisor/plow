@@ -154,7 +154,14 @@ concs = "1 4"
 # longer share one 172 ms launch; the oldest runs whole and later ones join only while that is cheaper.
 # Measured p26i, 16 prompts, off -> on: 1024 in TTFT 114.5 -> 94.4 ms, TPOT 10.03 -> 10.32;
 # 128 / 4096 / 15000 in level (40.1 / 247.5 / 1140.8 -> 40.5 / 246.3 / 1141.7).
-serve_env = { PLOW_MULTISTEP = "4", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0", PLOW_PF_INTERLEAVE_ADAPTIVE = "1" }
+# MULTISTEP 0, not 4: 4 emits four tokens per wave, which sets p99 ITL to exactly 4 x TPOT
+# (median ITL is literally 0.000) while TTFT and TPOT are untouched. Measured on p26l8, 32 prompts,
+# C1 over 128..15000: p99 ITL 22.38 / 22.88 / 23.17 / 23.43 / 23.93 ms against a 5.58..5.97 TPOT,
+# i.e. a pure wave artifact, versus vLLM 0.28 measured the same session at 5.68 / 5.86 / 5.97 /
+# 6.02 / 6.07. gemma4-26b-a4b.h100.bf16-ctx16k.toml already carries this and records 4 -> 0 taking
+# p99 ITL to 5.5 / 5.5 / 5.6 / 5.6 / 5.7 with TPOT +0.02-0.03; this recipe was simply stale.
+# PLOW_DECODE_PIPELINE is NOT the lever on the 26B -- it is disabled whenever cuBLASLt is on.
+serve_env = { PLOW_MULTISTEP = "0", PLOW_MULTISTEP_ADAPTIVE = "1", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0", PLOW_PF_INTERLEAVE_ADAPTIVE = "1" }
 
 [bench.profiles.high_concurrency]
 in_lens = "128 1024 4096 8192 15000"
