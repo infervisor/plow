@@ -16,6 +16,7 @@ mod extract;
 pub mod footprint;
 mod lower;
 pub mod oracle;
+pub mod rule_body;
 pub mod tile;
 pub mod tilegraph;
 

@@ -46,46 +46,53 @@ impl ModularPhase {
     }
 }
 
-/// Formal Lean verification certificate for correctness of a modular block program.
+/// Scoped abstract checks, not a floating-point or machine-code implementation proof.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModularLeanCorrectness {
     /// Checkpoint D: GQ stream order is topological over counter edges (deadlock-free).
     pub ordering_verified: bool,
     /// Checkpoint G: Staged LDS arena bounds verified (all staged GEMV/GEMM fits in arena).
     pub lds_fit_verified: bool,
-    /// Checkpoint A: Soundness of all fired egglog rewrite rules verified against Lean definitional theorems.
-    pub rewrite_soundness_verified: bool,
+    /// Checkpoint A: Rewrite-name catalog checked against Lean syntax theorems.
+    #[serde(alias = "rewrite_soundness_verified")]
+    pub rewrite_name_catalog_checked: bool,
     /// Optional failure or skip diagnostic reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
-/// Formal Lean verification certificate for performance lower bounds of a modular block program.
+/// Conditional structural estimate; never an empirical performance qualification.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModularLeanPerformance {
-    /// Critical path depth in cycles.
+    /// Calibrated critical path cycles; zero when inputs are unavailable.
     pub critical_path_cycles: u64,
     /// Memory/HBM bandwidth lower bound in cycles.
     pub bw_bound_cycles: u64,
-    /// Certified cycle lower bound (max of critical path and memory bandwidth bound).
+    /// Conditional cycle lower bound; zero when inputs are unavailable.
     pub lower_bound_cycles: u64,
-    /// Certified lower bound latency in microseconds at target hardware clock.
+    /// Conditional latency bound; zero when inputs are unavailable.
     pub lower_bound_us: f64,
     /// Hardware binding bottleneck ("bandwidth" vs "latency").
     pub binding_constraint: String,
-    /// Total bytes touched / streamed by this modular block program.
+    /// Referenced allocation capacity; not a measurement of streamed/HBM bytes.
     pub touched_bytes: u64,
+    /// Selected-op work and explicit missing inputs, kept separate from physical traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_inputs: Option<serde_json::Value>,
     /// Whether this lower bound carries a formal Lean certificate.
-    pub certified: bool,
+    #[serde(alias = "certified")]
+    pub structural_bound_certified: bool,
 }
 
 /// Summary of Lean formal verification and performance certificates across all modular blocks.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModularLeanSummary {
     /// True if all modular blocks passed Checkpoint D (ordering), Checkpoint G (LDS fit), and Checkpoint A (rewrites).
-    pub all_correctness_verified: bool,
+    #[serde(alias = "all_correctness_verified")]
+    pub all_abstract_checks_passed: bool,
     /// True if all modular blocks have certified Lean performance bounds.
-    pub all_performance_certified: bool,
+    #[serde(alias = "all_performance_certified")]
+    pub all_structural_bounds_certified: bool,
     /// Sum of critical path cycles across all primary blocks in a forward pass.
     pub total_critical_path_cycles: u64,
     /// Sum of certified microsecond lower bounds across all primary blocks in a forward pass.
@@ -205,5 +212,29 @@ impl ModularPipelineManifest {
         // Fall back to layer-agnostic key
         let key = Self::dispatch_key(phase, kind, width, None);
         self.dispatch_table.get(&key).copied()
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn abstract_and_structural_checks_do_not_serialize_as_full_qualification() {
+        let correctness = ModularLeanCorrectness {
+            ordering_verified: true, lds_fit_verified: true,
+            rewrite_name_catalog_checked: true, reason: None,
+        };
+        let value = serde_json::to_value(correctness).unwrap();
+        assert_eq!(value["rewrite_name_catalog_checked"], true);
+        assert!(value.get("rewrite_soundness_verified").is_none());
+        let summary = ModularLeanSummary { all_abstract_checks_passed: true,
+            all_structural_bounds_certified: true, ..Default::default() };
+        let value = serde_json::to_value(summary).unwrap();
+        assert!(value.get("all_correctness_verified").is_none());
+        assert!(value.get("all_performance_certified").is_none());
+        let value = serde_json::to_value(ModularLeanPerformance::default()).unwrap();
+        assert!(value.get("certified").is_none());
+        assert_eq!(value["structural_bound_certified"], false);
     }
 }

@@ -432,6 +432,20 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
 /// object would refuse every GLM asset in the tree. Each check therefore only looks at the flags
 /// ITS table names and leaves the rest to the other phase.
 pub(super) const COMPILED_OPCODE_MARKERS: &[(DevOp, &str)] = &[
+    (DevOp::MoeRouterTopkPf, "plow_cap_d_moe_router_topk_pf_1"),
+    (DevOp::MoeAlignPf, "plow_cap_d_moe_router_topk_pf_1"),
+    (DevOp::MoeGroupGluPf, "plow_cap_d_moe_router_topk_pf_1"),
+    (DevOp::MoeGroupDownPf, "plow_cap_d_moe_router_topk_pf_1"),
+    (DevOp::MoeCombinePf, "plow_cap_d_moe_router_topk_pf_1"),
+    (DevOp::QuantFp8Block128, "plow_opcode_quant_fp8_block128_1"),
+    (DevOp::GemmFp8Block128, "plow_opcode_gemm_fp8_block128_1"),
+    (DevOp::GemmFp8Block128Split4, "plow_opcode_gemm_fp8_block128_split4_1"),
+    (DevOp::Sum4Bf16, "plow_opcode_sum4_bf16_1"),
+    (DevOp::MoeGluFp8Block128, "plow_opcode_moe_glu_fp8_block128_1"),
+    (DevOp::MoeQuantFp8Block128, "plow_opcode_moe_quant_fp8_block128_1"),
+    (DevOp::MoeDownFp8Block128, "plow_opcode_moe_down_fp8_block128_1"),
+    (DevOp::MlaBmmFp8, "plow_opcode_mla_bmm_fp8_1"),
+    (DevOp::ZeroF32, "plow_opcode_zero_f32_1"),
     (DevOp::KdaConv, "plow_opcode_kda_conv_1"),
     (DevOp::KdaGate, "plow_opcode_kda_gate_1"),
     (DevOp::KdaStateStep, "plow_opcode_kda_state_step_1"),
@@ -478,11 +492,99 @@ pub(super) fn check_compiled_opcode_markers<'a>(
     path: &Path,
     progs: impl IntoIterator<Item = &'a DevProg>,
 ) -> Result<()> {
-    let required = progs
-        .into_iter()
-        .flat_map(|prog| &prog.insts)
-        .filter_map(|inst| DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op));
-    check_compiled_opcode_marker_set(syms, path, required)
+    for prog in progs {
+        for inst in &prog.insts {
+            if inst.op == DevOp::MlaBmmFp8 as u16 && inst.i[5] != 0 {
+                if !(1..32).contains(&inst.i[0])
+                    || inst.i[1..] != [8, 256, 512, 0, 1024, 0, 0]
+                    || !syms.contains(&"plow_mla_bmm_head_stride_1")
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "invalid strided WV contract or missing `plow_mla_bmm_head_stride_1` in {}",
+                        path.display()
+                    )));
+                }
+            }
+            let shape = match DevOp::from_u16(inst.op) {
+                Some(DevOp::MoeGluFp8Block128) => Some((inst.i[0], inst.i[1], inst.i[2], 1, inst.i[3], 7, 4)),
+                Some(DevOp::MoeQuantFp8Block128) => Some((inst.i[0], inst.i[4], inst.i[1], inst.i[2], inst.i[3], 6, 5)),
+                Some(DevOp::MoeDownFp8Block128) => Some((inst.i[0], inst.i[1], inst.i[2], inst.i[3], inst.i[4], 8, 5)),
+                _ => None,
+            };
+            if let Some((inter, h, experts, topk, rows, tensors, immediates)) = shape {
+                if inter == 0 || inter % 128 != 0 || h == 0 || h % 128 != 0
+                    || experts == 0 || experts > 1024 || topk == 0 || topk > 8 || rows == 0
+                    || rows.checked_mul(topk).and_then(|v| v.checked_mul(h.max(inter))).is_none()
+                    || inst.t[..tensors].contains(&packet::dev::TENSOR_NONE16)
+                    || inst.i[immediates..].iter().any(|&v| v != 0)
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "invalid routed block128 geometry or operands in {}", path.display()
+                    )));
+                }
+            }
+        }
+        for inst in prog.insts.iter().filter(|inst| inst.op == DevOp::GemmFp8Block128 as u16) {
+            if inst.i[6] != 0 || inst.i[7] != 0 {
+                let [m, n, k, mfma, n0, n1, qb, reserved] = inst.i;
+                if m == 0 || m.checked_mul(2048).is_none() || n != 2048 || k != 2048
+                    || mfma != 16 || n0 != 0 || n1 != 0 || qb != 1 || reserved != 0
+                    || inst.t[..5].contains(&packet::dev::TENSOR_NONE16)
+                    || !syms.contains(&"plow_gemm_fp8_block128_qb_1")
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "invalid block128 Q-B geometry/operands or missing `plow_gemm_fp8_block128_qb_1` in {}", path.display()
+                    )));
+                }
+            }
+            if inst.i[4] != 0 || inst.i[5] != 0 {
+                let [m, n, k, mfma, n0, n1, i6, i7] = inst.i;
+                if mfma != 16 || m == 0 || k == 0 || k % 128 != 0 || n0 == 0 || n1 == 0
+                    || n0.checked_add(n1).is_none_or(|s| s >= n)
+                    || m.checked_mul(n.max(k)).is_none() || i6 != 0 || i7 != 0
+                    || inst.t[..7].contains(&packet::dev::TENSOR_NONE16)
+                    || !syms.contains(&"plow_gemm_fp8_block128_split3_1")
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "invalid block128 split3 geometry/operands or missing `plow_gemm_fp8_block128_split3_1` in {}",
+                        path.display()
+                    )));
+                }
+            }
+            match inst.i[3] {
+                0 => (),
+                16 if syms.contains(&"plow_gemm_fp8_block128_m16_1") => (),
+                selector => return Err(RuntimeError::Device(format!(
+                    "packet/object MISMATCH: block128 MFMA selector {selector} requires a supported route and `plow_gemm_fp8_block128_m16_1` in {}",
+                    path.display()
+                ))),
+            }
+        }
+        for inst in prog.insts.iter().filter(|inst| inst.op == DevOp::MlaBmmFp8 as u16) {
+            let [m, heads, n, k, rope, i5, i6, i7] = inst.i;
+            if m == 0 || m.checked_mul(8 * 512).is_none() || heads != 8
+                || !matches!((n, k, rope), (512, 192, 1) | (256, 512, 0))
+                || (i5 != 0 && !(i5 == 1024 && rope == 0 && m < 32)) || i6 != 0 || i7 != 0
+                || inst.t[..if rope == 1 { 5 } else { 4 }].contains(&packet::dev::TENSOR_NONE16)
+            {
+                return Err(RuntimeError::Device(format!(
+                    "invalid MLA FP8 BMM geometry or operands in {}", path.display()
+                )));
+            }
+        }
+        if prog.insts.iter().any(|inst| inst.op == DevOp::Glu as u16 && inst.i[1] == 5)
+            && !syms.contains(&"plow_glu_silu_bf16_1")
+        {
+            return Err(RuntimeError::Device(format!(
+                "packet/object MISMATCH: BF16-rounded SiLU requires `plow_glu_silu_bf16_1` in {}",
+                path.display()
+            )));
+        }
+        let required = prog.insts.iter()
+            .filter_map(|inst| DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op));
+        check_compiled_opcode_marker_set(syms, path, required)?;
+    }
+    Ok(())
 }
 
 pub(super) const MATERIALIZED_RESIDUAL_INPUT_SYM: &str = "plow_materialized_residual_input_1";

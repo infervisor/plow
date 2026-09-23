@@ -47,6 +47,11 @@ use crate::device::{
 };
 use crate::{DeviceErrorInfo, Result, RuntimeError};
 
+#[path = "hsa_evidence.rs"]
+mod evidence;
+pub use evidence::{LoadedObjectEvidence, ResolvedKernelEvidence, SelectedKernelEvidence};
+use evidence::LoadedObjects;
+
 // ─── HSA ABI constants ───────────────────────────────────────────────────────
 
 const HSA_STATUS_SUCCESS: i32 = 0;
@@ -244,6 +249,12 @@ const QUEUE_SIZE: u32 = 4096;
 const KARG_SLOT: usize = 512;
 const CHAIN_IDLE: u64 = u64::MAX;
 const CHAIN_SETUP: u64 = u64::MAX - 1;
+
+fn kernarg_retirement_error(error: super::kernarg_retirement::Error) -> RuntimeError {
+    RuntimeError::Rejected(format!(
+        "kernarg retirement admission: {error:?}; complete all published rank queues before ring reuse; incomplete chains cannot be retired"
+    ))
+}
 
 // ─── HSA ABI types ───────────────────────────────────────────────────────────
 
@@ -879,11 +890,14 @@ pub struct HsaBackend {
     wave_width: u32,
     /// Monotonically increasing module ID.
     next_module_id: AtomicU64,
-    /// Exclusive single-producer AQL chain reservation. `chain_end != IDLE`
-    /// defers doorbells until every packet in the contiguous reservation is ready.
+    loaded_objects: parking_lot::Mutex<LoadedObjects>,
+    /// Exclusive single-producer reservation. Immediate batches retain one
+    /// doorbell per dispatch; deferred chains ring after every packet is ready.
     chain_base: AtomicU64,
     chain_next: AtomicU64,
     chain_end: AtomicU64,
+    chain_immediate: std::sync::atomic::AtomicBool,
+    kernarg_retirement: super::kernarg_retirement::KernargRetirement,
     /// Reusable zero source + completion signal for [`PeerMemory::zero_peer`].
     /// See `zero_peer` for why the per-token path cannot afford to build these
     /// per call.
@@ -899,6 +913,8 @@ pub struct HsaBackend {
     /// `CudaBackend::slab_pool`. Device-local by construction (one backend per
     /// agent, chunks created against this agent's `vram_pool`).
     slab_pool: parking_lot::Mutex<Vec<(u64, u64)>>,
+    // Serialize driver mutations with metadata so rebinding cannot revive stale evidence.
+    vmm_provenance: parking_lot::Mutex<super::provenance::VmmProvenance>,
     /// Set once, on the first fatal ROCr status ([`is_hsa_fatal`]): the fault
     /// that killed the agent/queue. When set, [`HsaBackend::guard`]
     /// short-circuits every driver-touching entry point with a clone BEFORE
@@ -929,8 +945,8 @@ struct ZeroStage {
 // SAFETY: all mutable state is either atomic or behind the AQL queue's own
 // memory-order protocol. The HSA runtime is thread-safe. The `dispatch` method
 // writes to the kernarg ring indexed by the queue's write-index (atomic), and
-// plowrt's engine-thread model guarantees at most one dispatch in flight per
-// device (the engine thread serialises ticks), so no concurrent ring writes.
+// plowrt's engine-thread model supplies one host producer per device, as
+// required by HSA_QUEUE_TYPE_SINGLE. Multiple GPU dispatches may be in flight.
 unsafe impl Send for HsaBackend {}
 unsafe impl Sync for HsaBackend {}
 
@@ -1023,7 +1039,9 @@ impl HsaBackend {
                 )));
             }
             crate::device::visibility::HsaVisibility::ApplyHip { mask } => {
-                let keep = mask.apply(enumerated).expect("indices checked by hsa_visibility");
+                let keep = mask
+                    .apply(enumerated)
+                    .expect("indices checked by hsa_visibility");
                 if keep.is_empty() {
                     return Err(RuntimeError::Device(format!(
                         "HIP_VISIBLE_DEVICES={} selects no device out of the {enumerated} ROCr \
@@ -1271,13 +1289,17 @@ impl HsaBackend {
             lds_bytes,
             wave_width,
             next_module_id: AtomicU64::new(1),
+            loaded_objects: parking_lot::Mutex::new(LoadedObjects::default()),
             chain_base: AtomicU64::new(0),
             chain_next: AtomicU64::new(0),
             chain_end: AtomicU64::new(CHAIN_IDLE),
+            chain_immediate: std::sync::atomic::AtomicBool::new(false),
+            kernarg_retirement: super::kernarg_retirement::KernargRetirement::new(),
             zero_stage: parking_lot::Mutex::new(None),
             peer_host_writable: std::sync::atomic::AtomicBool::new(false),
             fill_stage: parking_lot::Mutex::new(None),
             slab_pool: parking_lot::Mutex::new(Vec::new()),
+            vmm_provenance: parking_lot::Mutex::new(super::provenance::VmmProvenance::default()),
             poisoned: std::sync::OnceLock::new(),
         })
     }
@@ -1361,6 +1383,16 @@ impl HsaBackend {
 
 impl Drop for HsaBackend {
     fn drop(&mut self) {
+        let kernargs_retired = self.kernarg_retirement.completion_ticket().and_then(|ticket| {
+            let value = unsafe { (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal) };
+            self.kernarg_retirement.complete(ticket, value)
+        }).is_ok();
+        if !kernargs_retired {
+            // Fault/cancellation may leave packet consumers alive. Retain only
+            // this ring, its completion signal and runtime; not all kernel operands.
+            tracing::error!("retaining unretired HSA kernarg ring and completion signal");
+            std::mem::forget(self.shared.clone());
+        }
         // Pooled slab chunks (PLOW_SLAB_KEEP) are released here — the pool's
         // whole point is to outlive engines, so the backend is its terminal
         // owner (same contract as `CudaBackend::drop`).
@@ -1377,13 +1409,15 @@ impl Drop for HsaBackend {
             }
         }
         unsafe {
-            if !self.karg_ring.is_null() {
+            if kernargs_retired && !self.karg_ring.is_null() {
                 (self.shared.drv.hsa_amd_memory_pool_free)(self.karg_ring as *mut c_void);
             }
             if !self.queue.is_null() {
                 (self.shared.drv.hsa_queue_destroy)(self.queue);
             }
-            (self.shared.drv.hsa_signal_destroy)(self.done_signal);
+            if kernargs_retired {
+                (self.shared.drv.hsa_signal_destroy)(self.done_signal);
+            }
             // Note: we do NOT call hsa_shut_down here because other backends or
             // modules may still hold HSA references. The process-exit path is fine.
         }
@@ -1656,6 +1690,7 @@ impl Backend for HsaBackend {
         // We need to keep the executable alive. Store it in the Module's id field.
         // Since Module only has a u64 id, we use the exe.handle directly.
         let _ = mid;
+        self.loaded_objects.lock().loaded(id, image);
         Ok(Module { id })
     }
 
@@ -2225,27 +2260,27 @@ impl HsaBackend {
         let mut group_segment_size: u32 = 0;
         let mut private_segment_size: u32 = 0;
 
-        unsafe {
-            (self.shared.drv.hsa_executable_symbol_get_info)(
-                sym,
+        for (attribute, output) in [
+            (
                 HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT,
                 &mut kernel_object as *mut _ as *mut c_void,
-            );
-            (self.shared.drv.hsa_executable_symbol_get_info)(
-                sym,
+            ),
+            (
                 HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE,
                 &mut kernarg_size as *mut _ as *mut c_void,
-            );
-            (self.shared.drv.hsa_executable_symbol_get_info)(
-                sym,
+            ),
+            (
                 HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE,
                 &mut group_segment_size as *mut _ as *mut c_void,
-            );
-            (self.shared.drv.hsa_executable_symbol_get_info)(
-                sym,
+            ),
+            (
                 HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE,
                 &mut private_segment_size as *mut _ as *mut c_void,
-            );
+            ),
+        ] {
+            let rc =
+                unsafe { (self.shared.drv.hsa_executable_symbol_get_info)(sym, attribute, output) };
+            self.check(rc, "hsa_executable_symbol_get_info (kernel resources)")?;
         }
 
         // THE INVARIANT `dispatch` ALREADY CLAIMED. Its SAFETY comment asserted that
@@ -2309,7 +2344,11 @@ impl HsaBackend {
         let size = unsafe { (*q).size } as u64;
         let chain_end = self.chain_end.load(Ordering::Acquire);
         let idx = if chain_end == CHAIN_IDLE {
+            let expected = self.reserve_kernargs(1, size)?;
             let idx = unsafe { (self.shared.drv.hsa_queue_add_write_index_screlease)(q, 1) };
+            if idx != expected {
+                return Err(RuntimeError::Rejected("AQL/kernarg generation mismatch".into()));
+            }
             while idx
                 .wrapping_sub(unsafe { (self.shared.drv.hsa_queue_load_read_index_scacquire)(q) })
                 >= size
@@ -2323,6 +2362,7 @@ impl HsaBackend {
             let idx = self.chain_next.fetch_add(1, Ordering::Relaxed);
             if idx >= chain_end {
                 let chain_base = self.chain_base.load(Ordering::Relaxed);
+                self.cancel_dispatch_chain()?;
                 return Err(RuntimeError::Device(format!(
                     "AQL chain emitted more than its reserved {} packets",
                     chain_end.wrapping_sub(chain_base)
@@ -2334,8 +2374,8 @@ impl HsaBackend {
         let slot = (idx & (size - 1)) as u32;
         // SAFETY: `size` is the queue's power-of-two capacity, so `slot` is in
         // `0..size` and the kernarg ring was allocated as `size * KARG_SLOT`
-        // bytes — the offset is in bounds by construction. The spin above
-        // guarantees the previous user of this slot has retired.
+        // bytes. Completion-backed admission (for the whole chain, if active)
+        // retires previous kernarg readers; the read-index spin only frees AQL space.
         let karg = unsafe { self.karg_ring.add(slot as usize * KARG_SLOT) };
 
         // SAFETY: `karg` is this slot (`KARG_SLOT` bytes) and the stage is a `KARG_SLOT` stack
@@ -2431,12 +2471,15 @@ impl HsaBackend {
                 .store(header_setup, Ordering::Release);
         }
 
-        // A prepared chain publishes every header now but rings once after all
-        // TP ranks have been prepared. Ordinary dispatch retains one doorbell.
-        if chain_end == CHAIN_IDLE {
+        // Immediate batches retain ordinary per-dispatch doorbells. Deferred
+        // chains ring once after every TP rank has been prepared.
+        if super::kernarg_retirement::ring_on_dispatch(chain_end != CHAIN_IDLE, || self.chain_immediate.load(Ordering::Relaxed)) {
             unsafe {
                 (self.shared.drv.hsa_signal_store_screlease)((*q).doorbell_signal, idx as i64);
             }
+        }
+        if chain_end == CHAIN_IDLE {
+            self.kernarg_retirement.publish(idx + 1).map_err(kernarg_retirement_error)?;
         }
 
         Ok(())
@@ -2560,9 +2603,7 @@ fn scrub_fp8_neg0(dst: &mut [u8], src: &[u8]) {
 struct RingSlot {
     buf: HsaPinned,
     sig: HsaSignal,
-    /// Is a copy out of `buf` still in flight? Only a `true` slot may be waited
-    /// on — waiting on a signal no copy will ever decrement hangs forever.
-    busy: bool,
+    retirement: super::retirement::RetirementSlot,
 }
 
 /// Pipelined host→device staging for the weight load: N pinned slabs, N
@@ -2605,8 +2646,8 @@ struct RingSlot {
 ///
 /// # The correctness rule
 ///
-/// A slab may not be refilled until its copy has retired — that is what `busy`
-/// and the wait at the top of [`HsaUploadRing::push`] enforce, and getting it
+/// A slab may not be refilled until its copy has retired — the generation guard
+/// and the wait at the top of [`HsaUploadRing::push`] enforce that, and getting it
 /// wrong is silent: the DMA would read bytes belonging to a later chunk and the
 /// weight would be quietly wrong. [`HsaUploadRing::drain`] must be called before
 /// any of the uploaded memory is read, and `Drop` drains as a backstop so an
@@ -2648,7 +2689,7 @@ impl HsaUploadRing {
             ring.slots.push(RingSlot {
                 buf,
                 sig,
-                busy: false,
+                retirement: super::retirement::RetirementSlot::new(),
             });
         }
         Ok(ring)
@@ -2696,8 +2737,9 @@ impl HsaUploadRing {
                 self.slots[i].buf.len()
             )));
         }
-        self.wait_slot(i);
+        self.wait_slot(i)?;
         let slot = &mut self.slots[i];
+        let ticket = slot.retirement.begin().map_err(super::retirement_error)?;
         // Re-arm BEFORE the copy is submitted; the copy decrements to 0.
         unsafe { (self.shared.drv.hsa_signal_store_screlease)(slot.sig, 1) };
         if scrub {
@@ -2722,28 +2764,28 @@ impl HsaUploadRing {
             // the slot must NOT be marked busy — a later `drain` would hang on
             // it. Drain what really is in flight, then report.
             unsafe { (self.shared.drv.hsa_signal_store_screlease)(slot.sig, 0) };
+            slot.retirement.not_submitted(ticket).map_err(super::retirement_error)?;
             self.drain()?;
             return Err(hsa_fault(rc, "hsa_amd_memory_async_copy (upload ring)"));
         }
-        self.slots[i].busy = true;
+        self.slots[i].retirement.submitted(ticket).map_err(super::retirement_error)?;
         self.next += 1;
         Ok(())
     }
 
-    fn wait_slot(&mut self, i: usize) {
-        if !self.slots[i].busy {
-            return;
-        }
-        unsafe {
+    fn wait_slot(&mut self, i: usize) -> Result<()> {
+        let Some(ticket) = self.slots[i].retirement.event_ticket().map_err(super::retirement_error)? else { return Ok(()) };
+        let value = unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
                 self.slots[i].sig,
                 HSA_SIGNAL_CONDITION_LT,
                 1,
                 u64::MAX,
                 HSA_WAIT_STATE_BLOCKED,
-            );
-        }
-        self.slots[i].busy = false;
+            )
+        };
+        self.slots[i].retirement.complete_signal(ticket, value).map_err(super::retirement_error)?;
+        Ok(())
     }
 
     /// Block until every submitted copy has retired.
@@ -2752,10 +2794,11 @@ impl HsaUploadRing {
     /// weight is silent garbage — there is no fault and no wrong answer until
     /// the model speaks.
     pub fn drain(&mut self) -> Result<()> {
+        let mut error = None;
         for i in 0..self.slots.len() {
-            self.wait_slot(i);
+            if let Err(e) = self.wait_slot(i) { error.get_or_insert(e); }
         }
-        Ok(())
+        error.map_or(Ok(()), Err)
     }
 }
 
@@ -2764,9 +2807,15 @@ impl Drop for HsaUploadRing {
         // A copy still reading a slab we are about to free is a use-after-free
         // in the SDMA engine, so this drain is not tidiness — it is the reason
         // an error path can unwind safely.
-        let _ = self.drain();
-        for s in &self.slots {
-            unsafe { (self.shared.drv.hsa_signal_destroy)(s.sig) };
+        if let Err(error) = self.drain() {
+            tracing::error!(%error, "upload retirement failed; retaining unretired pinned slabs/signals");
+        }
+        for s in std::mem::take(&mut self.slots) {
+            if s.retirement.pending().is_some() {
+                std::mem::forget(s);
+            } else {
+                unsafe { (self.shared.drv.hsa_signal_destroy)(s.sig) };
+            }
         }
     }
 }
@@ -2891,12 +2940,25 @@ impl HsaBackend {
         let (mut bdf, mut domain) = (0u32, 0u32);
         // SAFETY: both attributes are documented as uint32_t; the agent is live for `self`.
         let ok = unsafe {
-            (self.shared.drv.hsa_agent_get_info)(self.agent, HSA_AMD_AGENT_INFO_BDFID, &mut bdf as *mut u32 as *mut c_void)
-                == HSA_STATUS_SUCCESS
-                && (self.shared.drv.hsa_agent_get_info)(self.agent, HSA_AMD_AGENT_INFO_DOMAIN, &mut domain as *mut u32 as *mut c_void)
-                    == HSA_STATUS_SUCCESS
+            (self.shared.drv.hsa_agent_get_info)(
+                self.agent,
+                HSA_AMD_AGENT_INFO_BDFID,
+                &mut bdf as *mut u32 as *mut c_void,
+            ) == HSA_STATUS_SUCCESS
+                && (self.shared.drv.hsa_agent_get_info)(
+                    self.agent,
+                    HSA_AMD_AGENT_INFO_DOMAIN,
+                    &mut domain as *mut u32 as *mut c_void,
+                ) == HSA_STATUS_SUCCESS
         };
-        ok.then(|| format!("{domain:04x}:{:02x}:{:02x}.{:x}", bdf >> 8, (bdf >> 3) & 0x1f, bdf & 0x7))
+        ok.then(|| {
+            format!(
+                "{domain:04x}:{:02x}:{:02x}.{:x}",
+                bdf >> 8,
+                (bdf >> 3) & 0x1f,
+                bdf & 0x7
+            )
+        })
     }
 
     /// Dispatches published on this queue that have not completed: the counting signal
@@ -2914,22 +2976,51 @@ impl HsaBackend {
         // counting signal before publication and the device decrements it on
         // completion, so zero is the exact queue-tail completion condition.
         self.guard()?;
+        let ticket = self.kernarg_retirement.completion_ticket().map_err(kernarg_retirement_error)?;
+        let value = self.wait_counting_signal()?;
+        self.kernarg_retirement.complete(ticket, value).map_err(kernarg_retirement_error)
+    }
+
+    pub(crate) fn require_quiescent(&self) -> Result<()> {
+        self.guard()?;
+        self.kernarg_retirement.quiescent().map_err(kernarg_retirement_error)
+    }
+
+    pub(crate) fn synchronize_native_lap(&self) -> Result<()> {
+        self.guard()?;
+        let end = self.chain_end.load(Ordering::Acquire);
+        if end == CHAIN_IDLE { return self.synchronize(); }
+        let ticket = self.kernarg_retirement.prefix(
+            self.chain_base.load(Ordering::Acquire),
+            self.chain_next.load(Ordering::Acquire),
+            end,
+            self.chain_immediate.load(Ordering::Relaxed),
+        ).map_err(kernarg_retirement_error)?;
+        let value = self.wait_counting_signal()?;
+        self.kernarg_retirement.complete_prefix(
+            ticket, self.chain_next.load(Ordering::Acquire), value,
+        ).map_err(kernarg_retirement_error)
+    }
+
+    fn wait_counting_signal(&self) -> Result<i64> {
         static BLOCKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let state = if *BLOCKED.get_or_init(|| crate::config::RuntimeConfig::get().amd.hsa_drain_blocked) {
-            HSA_WAIT_STATE_BLOCKED
-        } else {
-            HSA_WAIT_STATE_ACTIVE
-        };
-        unsafe {
+        let state =
+            if *BLOCKED.get_or_init(|| crate::config::RuntimeConfig::get().amd.hsa_drain_blocked) {
+                HSA_WAIT_STATE_BLOCKED
+            } else {
+                HSA_WAIT_STATE_ACTIVE
+            };
+        let value = unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
                 self.done_signal,
                 HSA_SIGNAL_CONDITION_LT,
                 1,
                 u64::MAX,
                 state,
-            );
-        }
-        self.guard()
+            )
+        };
+        self.guard()?;
+        Ok(value)
     }
 
     /// Create an event. `timing` selects whether the event carries a clock.
@@ -3117,7 +3208,10 @@ impl HsaBackend {
                 // destroying it or the runtime writes into freed memory.
                 unsafe {
                     // Rejected and unsubmitted copies will never decrement the signal.
-                    (self.shared.drv.hsa_signal_add_screlease)(sig, -((live.len() - issued) as i64));
+                    (self.shared.drv.hsa_signal_add_screlease)(
+                        sig,
+                        -((live.len() - issued) as i64),
+                    );
                     (self.shared.drv.hsa_signal_wait_scacquire)(
                         sig,
                         HSA_SIGNAL_CONDITION_LT,
@@ -3267,7 +3361,32 @@ impl HsaBackend {
 
     /// Resolve a kernel by name from a loaded module.
     pub fn get_function(&self, module: &Module, name: &str) -> Result<HsaKernel> {
-        self.resolve_kernel(HsaExecutable { handle: module.id }, name)
+        let kernel = self.resolve_kernel(HsaExecutable { handle: module.id }, name)?;
+        self.loaded_objects
+            .lock()
+            .resolved(
+                module.id,
+                kernel.kernel_object,
+                ResolvedKernelEvidence {
+                    entry: name.into(),
+                    kernarg_bytes: kernel.kernarg_size,
+                    static_lds_bytes: kernel.group_segment_size,
+                    private_bytes_per_workitem: kernel.private_segment_size,
+                },
+            )
+            .map_err(RuntimeError::Device)?;
+        Ok(kernel)
+    }
+
+    /// Loaded bytes and load-resolved symbols, not a record of executed dispatches.
+    pub fn loaded_object_evidence(&self) -> Vec<LoadedObjectEvidence> {
+        self.loaded_objects.lock().snapshot()
+    }
+
+    pub(crate) fn selected_kernel_evidence(&self, kernel: HsaKernel) -> Result<SelectedKernelEvidence> {
+        self.loaded_objects.lock().selected(
+            kernel.kernel_object, kernel.kernarg_size, kernel.group_segment_size, kernel.private_segment_size,
+        ).map_err(RuntimeError::Device)
     }
 
     /// Destroy a loaded executable.
@@ -3275,7 +3394,9 @@ impl HsaBackend {
         let rc = unsafe {
             (self.shared.drv.hsa_executable_destroy)(HsaExecutable { handle: module.id })
         };
-        self.check(rc, "hsa_executable_destroy")
+        self.check(rc, "hsa_executable_destroy")?;
+        self.loaded_objects.lock().unloaded(module.id);
+        Ok(())
     }
 
     /// Fill `n` bytes at `dptr` with `value`, through the copy engine.
@@ -3519,6 +3640,11 @@ impl HsaBackend {
     /// [`Self::commit_dispatch_chain`]. This is single-producer by HSA queue
     /// construction and is used only after every route has been preflighted.
     pub fn begin_dispatch_chain(&self, packets: usize) -> Result<()> {
+        let ticket = self.preflight_dispatch_chain(packets)?;
+        self.begin_dispatch_chain_admitted(ticket)
+    }
+
+    pub(crate) fn preflight_dispatch_chain(&self, packets: usize) -> Result<super::kernarg_retirement::Admission> {
         self.guard()?;
         if packets == 0 {
             return Err(RuntimeError::Device(
@@ -3531,25 +3657,73 @@ impl HsaBackend {
                 "AQL chain has {packets} packets but queue capacity is {size}"
             )));
         }
+        if self.chain_end.load(Ordering::Acquire) != CHAIN_IDLE {
+            return Err(RuntimeError::Rejected("an AQL chain is already active".into()));
+        }
+        self.kernarg_retirement.preflight(packets as u64, size as u64, || unsafe {
+            (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal)
+        }).map_err(kernarg_retirement_error)
+    }
+
+    pub(crate) fn begin_dispatch_chain_admitted(&self, ticket: super::kernarg_retirement::Admission) -> Result<()> {
+        self.begin_dispatch_reservation(ticket, false)
+    }
+
+    pub(crate) fn begin_dispatch_batch_admitted(&self, ticket: super::kernarg_retirement::Admission) -> Result<()> {
+        self.begin_dispatch_reservation(ticket, true)
+    }
+
+    fn begin_dispatch_reservation(&self, ticket: super::kernarg_retirement::Admission, immediate: bool) -> Result<()> {
+        self.guard()?;
+        let packets = ticket.count();
+        let size = unsafe { (*self.queue).size } as u64;
         self.chain_end
             .compare_exchange(CHAIN_IDLE, CHAIN_SETUP, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| RuntimeError::Device("an AQL chain is already active".into()))?;
-        let base = unsafe {
-            (self.shared.drv.hsa_queue_add_write_index_screlease)(self.queue, packets as u64)
+        let expected = match self.kernarg_retirement.reserve_admitted(ticket).map_err(kernarg_retirement_error) {
+            Ok(base) => base,
+            Err(error) => {
+                self.chain_end.store(CHAIN_IDLE, Ordering::Release);
+                return Err(error);
+            }
         };
-        let end = base + packets as u64;
+        let base = unsafe {
+            (self.shared.drv.hsa_queue_add_write_index_screlease)(self.queue, packets)
+        };
+        if base != expected {
+            return Err(RuntimeError::Rejected("AQL/kernarg generation mismatch".into()));
+        }
+        let end = base + packets;
         while (end - 1).wrapping_sub(unsafe {
             (self.shared.drv.hsa_queue_load_read_index_scacquire)(self.queue)
-        }) >= size as u64
+        }) >= size
         {}
         self.chain_base.store(base, Ordering::Release);
         self.chain_next.store(base, Ordering::Release);
+        self.chain_immediate.store(immediate, Ordering::Relaxed);
         self.chain_end.store(end, Ordering::Release);
         Ok(())
     }
 
-    /// Publish the tail of a fully prepared chain with one doorbell store.
+    /// Finish a prepared reservation, ringing once only for deferred chains.
     pub fn commit_dispatch_chain(&self) -> Result<()> {
+        if let Err(error) = self.preflight_dispatch_chain_commit() {
+            self.abort_dispatch_replay();
+            return Err(error);
+        }
+        let end = self.chain_end.load(Ordering::Acquire);
+        if super::kernarg_retirement::ring_on_commit(self.chain_immediate.load(Ordering::Relaxed)) {
+            unsafe {
+                (self.shared.drv.hsa_signal_store_screlease)((*self.queue).doorbell_signal, (end - 1) as i64);
+            }
+        }
+        self.kernarg_retirement.publish(end).map_err(kernarg_retirement_error)?;
+        self.chain_end.store(CHAIN_IDLE, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn preflight_dispatch_chain_commit(&self) -> Result<()> {
+        self.guard()?;
         let end = self.chain_end.load(Ordering::Acquire);
         if end == CHAIN_IDLE || end == CHAIN_SETUP {
             return Err(RuntimeError::Device(
@@ -3565,14 +3739,41 @@ impl HsaBackend {
                 next.wrapping_sub(base)
             )));
         }
-        self.chain_end.store(CHAIN_IDLE, Ordering::Release);
-        unsafe {
-            (self.shared.drv.hsa_signal_store_screlease)(
-                (*self.queue).doorbell_signal,
-                (end - 1) as i64,
-            );
-        }
         Ok(())
+    }
+
+    /// Reserved AQL positions cannot be rolled back; cancellation poisons this queue.
+    pub fn cancel_dispatch_chain(&self) -> Result<()> {
+        if self.chain_end.load(Ordering::Acquire) == CHAIN_IDLE {
+            return Err(RuntimeError::Rejected("no AQL chain to cancel".into()));
+        }
+        self.abort_dispatch_replay();
+        Ok(())
+    }
+
+    pub(crate) fn abort_dispatch_replay(&self) {
+        self.kernarg_retirement.cancel();
+        self.mark_poisoned(&DeviceErrorInfo {
+            operation: "AQL chain cancellation".into(),
+            code: -1,
+            name: "UNRETIRED_AQL_RESERVATION".into(),
+            fatal: true,
+        });
+    }
+
+    fn reserve_kernargs(&self, packets: u64, capacity: u64) -> Result<u64> {
+        match self.kernarg_retirement.reserve(packets, capacity) {
+            Ok(base) => return Ok(base),
+            Err(super::kernarg_retirement::Error::Capacity) => {},
+            Err(error) => return Err(kernarg_retirement_error(error)),
+        }
+        let ticket = self.kernarg_retirement.completion_ticket().map_err(kernarg_retirement_error)?;
+        let value = unsafe { (self.shared.drv.hsa_signal_load_scacquire)(self.done_signal) };
+        // Never block here: another TP rank may still need its chain published.
+        // Rejection precedes this queue's reservation. A TP caller must coordinate
+        // other ranks' reservations before attempting any retry.
+        self.kernarg_retirement.complete(ticket, value).map_err(kernarg_retirement_error)?;
+        self.kernarg_retirement.reserve(packets, capacity).map_err(kernarg_retirement_error)
     }
 
     /// Launch `f` over `grid` workgroups of `block` threads.
@@ -3615,6 +3816,17 @@ impl HsaBackend {
         block: u16,
         args: &[u8],
     ) -> Result<()> {
+        self.launch_3d_lds(f, grid, block, 0, args)
+    }
+
+    pub(crate) fn launch_3d_lds(
+        &self,
+        f: HsaKernel,
+        grid: [u32; 3],
+        block: u16,
+        smem_bytes: u32,
+        args: &[u8],
+    ) -> Result<()> {
         let grid_x = grid[0].checked_mul(u32::from(block)).filter(|&n| n != 0);
         if grid_x.is_none() || grid[1] == 0 || grid[2] == 0 || block > 1024 {
             return Err(RuntimeError::Device(format!(
@@ -3629,7 +3841,7 @@ impl HsaBackend {
             block,
             1,
             1,
-            0,
+            smem_bytes,
             args.as_ptr().cast(),
             args.len(),
         )
@@ -3689,6 +3901,10 @@ impl HsaBackend {
 ///   by construction; the CUDA path encodes the same intent in
 ///   `CUmemAllocationProp::location`.
 impl crate::memory::vmm::VmmOps for HsaBackend {
+    fn allocation_provenance(&self, va: u64, bytes: u64) -> Option<super::provenance::MemoryRegion> {
+        self.vmm_provenance.lock().region(va, bytes)
+    }
+
     fn granularity(&self) -> Result<u64> {
         let mut g: usize = 0;
         // SAFETY: out-pointer sized for a `size_t` attribute.
@@ -3760,6 +3976,7 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
     fn create(&self, bytes: u64) -> Result<u64> {
         self.guard()?;
         let f = self.vmem()?;
+        let mut provenance = self.vmm_provenance.lock();
         let mut h = HsaVmemHandle { handle: 0 };
         // SAFETY: out-pointer; bytes is a granule multiple (pool contract).
         let rc = unsafe {
@@ -3772,10 +3989,13 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
             )
         };
         self.check(rc, &format!("hsa_amd_vmem_handle_create({bytes} B)"))?;
+        provenance.created(h.handle, bytes);
         Ok(h.handle)
     }
 
     fn release(&self, handle: u64) {
+        let mut provenance = self.vmm_provenance.lock();
+        provenance.released(handle);
         let Ok(f) = self.vmem() else { return };
         // SAFETY: handle from create, released exactly once (pool refcount).
         let rc = unsafe { (f.handle_release)(HsaVmemHandle { handle }) };
@@ -3787,6 +4007,7 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
     fn map(&self, va: u64, bytes: u64, handle: u64) -> Result<()> {
         self.guard()?;
         let f = self.vmem()?;
+        let mut provenance = self.vmm_provenance.lock();
         // SAFETY: va range inside a reservation, handle live, in_offset 0 —
         // multi-map of one handle into several ranges is what prefix sharing is.
         let rc = unsafe {
@@ -3801,10 +4022,14 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
         self.check(
             rc,
             &format!("hsa_amd_vmem_map (va={va:#x} bytes={bytes} handle={handle:#x})"),
-        )
+        )?;
+        provenance.mapped(va, bytes, handle);
+        Ok(())
     }
 
     fn unmap(&self, va: u64, bytes: u64) {
+        let mut provenance = self.vmm_provenance.lock();
+        provenance.unmapped(va, bytes);
         let Ok(f) = self.vmem() else { return };
         // SAFETY: exactly the mapped range (pool contract).
         let rc = unsafe { (f.unmap)(va as *mut c_void, bytes as usize) };
@@ -3845,10 +4070,13 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
             rc,
             &format!("hsa_amd_memory_pool_allocate(vmm snapshot, {bytes} B)"),
         )?;
+        self.vmm_provenance.lock().allocated(ptr as u64, bytes);
         Ok(ptr as u64)
     }
 
     fn free(&self, va: u64) {
+        let mut provenance = self.vmm_provenance.lock();
+        provenance.freed(va);
         // SAFETY: va from VmmOps::alloc, freed exactly once (pool contract).
         let rc = unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(va as *mut c_void) };
         if rc != HSA_STATUS_SUCCESS {
@@ -3925,6 +4153,92 @@ mod scrub_tests {
 #[cfg(test)]
 mod tests {
     use super::{host_agent_for, page_node, publish_device_kernarg, write_kernarg, HsaAgent};
+
+    #[test]
+    #[ignore = "requires queued gfx950 and PLOW_TEST_AITER_DIR with frozen retirement test object"]
+    fn kernarg_admission_gpu_regression() {
+        use crate::exec::device_api::EngineDevice;
+        use super::{HsaBackend, QUEUE_SIZE, CHAIN_IDLE};
+        use std::sync::atomic::Ordering;
+        let dir = std::path::PathBuf::from(std::env::var("PLOW_TEST_AITER_DIR").unwrap());
+        let image = std::fs::read(dir.join("test_kernels.elf")).unwrap();
+        let be = HsaBackend::new(0).unwrap();
+        assert_eq!(be.device_name(), "gfx950");
+        let module = EngineDevice::module_load(&be, &image).unwrap();
+        let kernel = EngineDevice::get_function(&be, &module, "hsa_kernarg_retirement_test").unwrap();
+        let n = 2 + 2 * QUEUE_SIZE as usize;
+        let mut output = be.host_alloc_pinned(n * 8).unwrap();
+        output.as_mut_slice().fill(0);
+        let ptr = output.as_ptr() as u64;
+        let value = |index: usize| 0xdade_1357_cafe_0000u64 ^ index as u64;
+        let launch = |index: usize, delay| {
+            be.launch(kernel, 1, 256, 0, bytemuck::cast_slice(&[ptr, index as u64, value(index), delay])).unwrap();
+        };
+        let old = be.preflight_dispatch_chain(1).unwrap();
+        launch(0, 1_000_000_000);
+        let generation = be.kernarg_retirement.completion_ticket().unwrap();
+        let pending = be.in_flight();
+        assert!(pending > 0, "bounded delay completed before capacity test");
+        assert!(be.begin_dispatch_chain(QUEUE_SIZE as usize).is_err());
+        assert_eq!(be.chain_end.load(Ordering::Acquire), CHAIN_IDLE);
+        assert_eq!(be.kernarg_retirement.completion_ticket().unwrap(), generation);
+        be.synchronize().unwrap();
+        assert!(be.begin_dispatch_chain_admitted(old).is_err());
+        assert_eq!(be.chain_end.load(Ordering::Acquire), CHAIN_IDLE);
+        launch(1, 0);
+        be.synchronize().unwrap();
+
+        for (pass, immediate) in [false, true].into_iter().enumerate() {
+            let ticket = be.preflight_dispatch_chain(QUEUE_SIZE as usize).unwrap();
+            if immediate {
+                be.begin_dispatch_batch_admitted(ticket).unwrap();
+            } else {
+                be.begin_dispatch_chain_admitted(ticket).unwrap();
+            }
+            if immediate {
+                be.synchronize_native_lap().unwrap();
+            } else {
+                assert!(be.synchronize_native_lap().is_err());
+            }
+            assert!(be.require_quiescent().is_err());
+            for offset in 0..QUEUE_SIZE as usize {
+                launch(2 + pass * QUEUE_SIZE as usize + offset, 0);
+                if immediate && offset == QUEUE_SIZE as usize / 2 {
+                    be.synchronize_native_lap().unwrap();
+                    assert!(be.require_quiescent().is_err());
+                    assert!(be.preflight_dispatch_chain(1).is_err());
+                }
+            }
+            if immediate { be.synchronize_native_lap().unwrap(); }
+            // Even a zero signal cannot retire a reservation before its batch is published.
+            assert!(be.synchronize().is_err());
+            be.commit_dispatch_chain().unwrap();
+            be.synchronize().unwrap();
+            be.require_quiescent().unwrap();
+            eprintln!("HSA_RETIREMENT_WRAP immediate={immediate} packets={QUEUE_SIZE} pass");
+        }
+        for (index, bytes) in output.as_slice().chunks_exact(8).enumerate() {
+            assert_eq!(u64::from_ne_bytes(bytes.try_into().unwrap()), value(index), "index={index}");
+        }
+
+        // Trigger a real admission error only after all GPU work has completed.
+        // This checks refusal of the upload used for table rebinding, not fault teardown.
+        assert!(be.commit_dispatch_chain().is_err());
+        assert!(be.is_poisoned());
+        assert!(be.memcpy_htod(ptr, &[0u8; 8]).is_err());
+        assert!(be.launch(kernel, 1, 256, 0, bytemuck::cast_slice(&[ptr, 0, 0, 0u64])).is_err());
+        assert_eq!(u64::from_ne_bytes(output.as_slice()[..8].try_into().unwrap()), value(0));
+        eprintln!("HSA_RETIREMENT_RESULT {}", serde_json::json!({
+            "passed": true, "scope": "single-rank gfx950 HSA admission correctness",
+            "kernel_object_sha256": plow_asset::decode_objects::image_sha256(&image),
+            "checked_outputs": n, "ring_capacity": QUEUE_SIZE,
+            "capacity_pending_signal": pending, "stale_ticket_rejected": true,
+            "post_error_upload_rejected_after_quiescence": true,
+            "immediate_prefix_completion_without_retirement": true,
+            "deferred_prefix_refused": true,
+            "gpu_overhead_measured": false, "tp8_or_fault_teardown_qualified": false
+        }));
+    }
 
     #[test]
     fn kernarg_slot_holds_args_zero_tail_and_the_implicit_block() {

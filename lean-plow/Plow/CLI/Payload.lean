@@ -145,8 +145,12 @@ def parseEntry (tg : TaskGraph) (idx : Nat) (eJson : Json) :
     | other        => throw s!"{ctx}.cls: unknown value '{other}' (expected Persistent/RequestIo/Growable/Scratch)"
     : Except String BufClass)
   -- Readers / writers are optional (some entries have no readers, e.g. terminal outputs).
-  let rawWriters := ((eJson.getObjVal? "writers").toOption.map parseNatArray).getD []
-  let rawReaders := ((eJson.getObjVal? "readers").toOption.map parseNatArray).getD []
+  let rawWriters ← match eJson.getObjVal? "writers" with
+    | .ok j => parseNatArrayStrict s!"{ctx}.writers" j
+    | .error _ => pure []
+  let rawReaders ← match eJson.getObjVal? "readers" with
+    | .ok j => parseNatArrayStrict s!"{ctx}.readers" j
+    | .error _ => pure []
   let writers ← rawWriters.mapM (strictFin s!"{ctx}.writers" tg.n)
   let readers ← rawReaders.mapM (strictFin s!"{ctx}.readers" tg.n)
   return { name := name, offset := offset, size := size, cls := cls,

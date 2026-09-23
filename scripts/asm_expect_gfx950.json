@@ -130,7 +130,7 @@
    },
    "no_scratch": true
   },
-  "d_gemm_t": {
+  "gemm_c0": {
    "require_min": {
     "v_mfma_f32_32x32x16_bf16": 1
    }

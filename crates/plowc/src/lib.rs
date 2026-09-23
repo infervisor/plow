@@ -1203,6 +1203,20 @@ fn flash_ops(tasks: &schedule::TaskGraph, cons: &rewrite::ConstraintSet) -> Vec<
     out
 }
 
+fn flash_effects(
+    tasks: &schedule::TaskGraph,
+    cons: &rewrite::ConstraintSet,
+    map: &schedule::AddressMap,
+) -> schedule::memory::TensorTaskSets {
+    flash_ops(tasks, cons).into_iter().filter_map(|(op, layer)| {
+        let name = format!("kv_cache_L{layer}");
+        map.get(&name)?;
+        let ids: Vec<_> = tasks.tasks.iter().enumerate()
+            .filter(|(_, task)| task.op == op).map(|(id, _)| id).collect();
+        Some((name, (ids.clone(), ids)))
+    }).collect()
+}
+
 /// Build the decode-phase KV read address sidecar. Returns `None` for
 /// non-decode buckets. See the design notes.
 fn build_decode_kv_schema(
@@ -1787,19 +1801,7 @@ fn emit_streams(
         // Layer ids mirror `inject_kv_growable_entry` and preserve sparse
         // hybrid-model ids (Qwen full attention at layers 3, 7, ...).
         if kv_paging.is_some() {
-            for (op, layer_idx) in flash_ops(&bs.sched.tasks, &bs.cons) {
-                let ids: Vec<schedule::TaskId> = bs
-                    .sched
-                    .tasks
-                    .tasks
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| t.op == op)
-                    .map(|(tid, _)| tid)
-                    .collect();
-                // Flash both appends to and reads the layer's KV region.
-                task_sets.insert(format!("kv_cache_L{layer_idx}"), (ids.clone(), ids));
-            }
+            task_sets.extend(flash_effects(&bs.sched.tasks, &bs.cons, &amap));
         }
         // Collect weight name → (N, K) shape for every GEMM in this bucket.
         // Runtime pairs this with `weight_tiling` in `weights.json` to
@@ -2077,9 +2079,9 @@ fn run_lean_verify(
     // spawn and log another identical warning. `?` still propagates a REJECTION.
     Ok(verify_A(bucket)?
         && verify_B(bucket, graph, cons, sched)?
-        && verify_D(bucket, tasks, sched, amap, task_sets)?
+        && verify_D(bucket, tasks, sched, amap, task_sets, cons)?
         && verify_E(bucket)?
-        && verify_F(bucket, tasks, sched, amap, task_sets)?)
+        && verify_F(bucket, tasks, sched, amap, task_sets, cons)?)
 }
 
 #[cfg(feature = "lean-verify")]
@@ -2137,24 +2139,35 @@ fn dispatch_cert(
     }
 }
 
-/// Checkpoint A — rewrite rule soundness. Parses the `; rule: <name>`
-/// annotations out of the exact `rules.egg` source the engine runs
-/// (`rewrite::rules_source()`) and submits that live catalog; the verifier
-/// checks every entry against `Plow.Rewrite.soundRules`. A rewrite without an
-/// annotation is a hard [`PlowcError::RuleCatalog`] error, and an annotated
-/// rule whose name has no Lean `rule_*` theorem fails checkpoint A — so a
-/// rule added to `rules.egg` alone cannot slip through. (Rule *bodies* are
-/// not structurally checked; editing a rule's RHS under an existing proven
-/// name is outside this checkpoint's scope.)
+/// Checkpoint A binds the engine-parsed rule bodies to full-arity syntax
+/// expansion, including shape/scaling operands and nested residual nodes.
+/// Kernel arithmetic and floating-point materialization remain separate gates.
 #[cfg(feature = "lean-verify")]
 #[allow(non_snake_case)]
 fn verify_A(bucket: &str) -> Result<bool, PlowcError> {
-    use lean_verify::checkpoints::rewrite::{check_rewrite_rules, RewriteRulesRequest};
-    let req = RewriteRulesRequest {
-        rules: parse_rule_catalog(rewrite::rules_source())?,
-    };
+    let req = rewrite_body_request(rewrite::rules_source())?;
     let started = std::time::Instant::now();
-    dispatch_cert(bucket, "A", check_rewrite_rules(&req), started)
+    dispatch_cert(bucket, "A", lean_verify::call("A", req), started)
+}
+
+#[cfg(feature = "lean-verify")]
+pub fn rewrite_body_request(source: &str) -> Result<serde_json::Value, PlowcError> {
+    fn term(value: rewrite::rule_body::Term) -> serde_json::Value {
+        match value {
+            rewrite::rule_body::Term::Atom { kind, value } => serde_json::json!([kind,value,[]]),
+            rewrite::rule_body::Term::Call { head, args } =>
+                serde_json::json!(["call",head,args.into_iter().map(term).collect::<Vec<_>>()]),
+        }
+    }
+    let names = parse_rule_catalog(source)?;
+    let bodies = rewrite::rule_body::parse(source).map_err(PlowcError::RuleCatalog)?;
+    if names.len() != bodies.len() || names.is_empty() {
+        return Err(PlowcError::RuleCatalog("incomplete rewrite body catalog".into()));
+    }
+    let bodies: Vec<_> = names.iter().zip(bodies).map(|(name,(lhs,rhs))|
+        serde_json::json!({"name":name,"lhs":term(lhs),"rhs":term(rhs)})).collect();
+    Ok(serde_json::json!({"rules":names,"bodies":bodies,
+        "source_sha256":plow_asset::decode_objects::image_sha256(source.as_bytes())}))
 }
 
 /// Extract the `; rule: <name>` annotation preceding every `(rewrite ...)`
@@ -2276,8 +2289,11 @@ fn verify_D(
     sched: &schedule::Schedule,
     amap: &schedule::AddressMap,
     task_sets: &schedule::memory::TensorTaskSets,
+    cons: &rewrite::ConstraintSet,
 ) -> Result<bool, PlowcError> {
-    let request = schedule::lean_verify::build_schedule_request(tasks, sched, amap, task_sets);
+    let request = schedule::lean_verify::build_schedule_request_with_effects(
+        tasks, sched, amap, task_sets, &flash_effects(tasks, cons, amap))
+        .map_err(|reason| PlowcError::LeanVerify { bucket: bucket.into(), reason })?;
     debug!(
         "[lean-verify:D] {bucket}: submitting — {n_tasks} tasks, {n_counters} counters, {n_entries} entries",
         n_tasks = request.task_graph.n,
@@ -2338,8 +2354,11 @@ fn verify_F(
     sched: &schedule::Schedule,
     amap: &schedule::AddressMap,
     task_sets: &schedule::memory::TensorTaskSets,
+    cons: &rewrite::ConstraintSet,
 ) -> Result<bool, PlowcError> {
-    let request = schedule::lean_verify::build_schedule_request(tasks, sched, amap, task_sets);
+    let request = schedule::lean_verify::build_schedule_request_with_effects(
+        tasks, sched, amap, task_sets, &flash_effects(tasks, cons, amap))
+        .map_err(|reason| PlowcError::LeanVerify { bucket: bucket.into(), reason })?;
     let started = std::time::Instant::now();
     dispatch_cert(
         bucket,

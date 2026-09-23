@@ -37,8 +37,8 @@ def layer_components(text: dict, kind: str) -> dict:
     else:
         hd, kvh, n_kv_proj = text["head_dim"], text["num_key_value_heads"], 2
         window = text.get("sliding_window") or 0
-    inter = text["intermediate_size"]
-    n_exp = text.get("num_experts") or 0
+    inter = text.get("intermediate_size") or 0
+    n_exp = text.get("num_experts") or text.get("n_routed_experts") or 0
     top_k = text.get("top_k_experts") or text.get("num_experts_per_tok") or 0
     i_moe = text.get("moe_intermediate_size") or text.get("expert_intermediate_size") or 0
     return {

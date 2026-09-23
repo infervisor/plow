@@ -647,6 +647,7 @@ impl CpuModel {
         // domain window itself (`exec::cpu::interp`), so the mis-dispatch the
         // flag guards against cannot happen here.
         let blob = DevBlob::parse_l2(&raw, true)?;
+        crate::certificate_checks::check_packet(blob_path, &raw, &blob)?;
         let language_model = blob.tensors.iter().any(|tensor| tensor.name == "in.ids");
         validate_cpu_blob(&blob, language_model)?;
         // PLOW_FP8_DIR (the `--fp8-dir` runtime flag) names the fp8 weight-twin directory.

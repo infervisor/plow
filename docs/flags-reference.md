@@ -296,6 +296,8 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 |---|---|---|---|
 | `PLOW_GEMV_MM` | `--gemv-mm` | unset | AMD compile-time decode row-batch bucket. |
 | `PLOW_GEMV_WALK` | `--gemv-walk` | false | Wide-arm walk loop for AMD GEMV. |
+| `PLOW_GEMV_MFMA4` | object build only | 0 | Opt-in BF16 matrix-core GEMV body in gfx950 decode objects. Changes reduction order; qualify each rung with numerical and same-lease block gates. Does not cover fused QKV/GLU or qualify full-model serving. |
+| `PLOW_MOE_TILE_BINSEARCH` | object build only | 0 | gfx950 decode grouped-expert tile-owner binary search instead of a linear prefix scan. Opt-in; same arithmetic, but requires bitwise block and performance gates per rung. |
 | `PLOW_GEMV_WG` | `--gemv-wg` | unset | Cap the dispatch width of the fused prefill GEMV. |
 | `PLOW_GEMV_WG_TUNING` | `--gemv-wg-tuning` | unset | Shape-keyed workgroup caps for blocked decode GEMVs, `NxK=cap[,NxK=cap...]` (for example `896x7168=224,1536x7168=152`). An A/B override: there is no TuneDB record for GEMV width, so unset keeps the normal workgroup selection. |
 | `PLOW_GEMM_WIDE_C8` | `--gemm-wide-c8` | true | Allow the gfx950 128x384x64 `GemmWide` body on a dense BF16 GEMM. The shape is derived, not configured: the tile is taken only at the ladder-cap chunk where the exact MxNxK has a qualified TuneDB measurement naming it the winner and its grid fills every CU. Default on; `=0` is the rollback to the 128x256x64 body everywhere. |
@@ -373,6 +375,12 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `GLM_SHARED_CUS` | `--glm-shared-cus` | unset | CUs for shared expert. |
 | `GLM_SPINE_CUS` | `--glm-spine-cus` | unset | Spine CU allocation (comma-separated or expression). |
 | `GLM_LINEAR_FP8` | `--glm-linear-fp8` | false | fp8 shared-expert linear projections. |
+| `PLOW_GLM_OPROJ_W8A8` | `--glm-oproj-w8a8` | false | Experimental gfx950 output projection: dynamic per-128 activation FP8 quantization plus native block-scaled W8A8 GEMM, decode and prefill. Requires `GLM_LINEAR_FP8`. Other GLM paths remain unchanged; not full-model precision qualification. |
+| `PLOW_GLM_SHARED_W8A8` | `--glm-shared-w8a8` | false | Experimental gfx950 shared expert: per-128 activation FP8 quantization before gate/up and down, BF16 GEMM and SiLU outputs. Requires `GLM_LINEAR_FP8`; excludes shared-expert folding. Routed experts remain unchanged; not full-model precision qualification. |
+| `PLOW_GLM_QKVA_W8A8` | `--glm-qkva-w8a8` | false | Experimental gfx950 fused QKV-A: original FP8 weights/F32 block128 scales, dynamic group128 activation quantization, direct BF16 Q/KV/rotary-K outputs. Requires `GLM_LINEAR_FP8` and prep `--qkva`; excludes seam norm folding. Remaining MLA/indexer precision gaps are unchanged. |
+| `PLOW_GLM_MLA_W8A8` | `--glm-mla-w8a8` | false | Experimental gfx950 GLM TP8 attention: original block128 Q-B, live-row split-K BF16 atomics, fused group128 FP8 query/value BMM and BF16 latent merge. Requires `PLOW_GLM_QKVA_W8A8` and prep `--mla-tp 8`; excludes absorbed norm/value fusions and token/row bands. Opt-in correctness bring-up, not a performance promotion or full-model precision qualification. |
+| `PLOW_GLM_MLA_BF16_PS` | `--glm-mla-bf16-ps` | false | Experimental gfx950 TP8 BF16 attention segment for decode rungs below 32. Requires `PLOW_GLM_MLA_W8A8`, BF16 KV and hash-pinned adapter/metadata/stage/reducer objects. Five ordered HSA dispatches replace a pure flash/merge pair; live rows must be nonempty. Arms decode DSA above top2048 instead of the legacy 64K crossover. Dense context <=2048, no DCP or fused RoPE. Wider rungs and prefill retain interpreter attention and are unqualified by this route. No serving/performance promotion. |
+| `PLOW_GLM_ROUTED_W8A8` | `--glm-routed-w8a8` | false | Experimental gfx950 routed experts: block128 FP8 operands, FP32 fused SiLU product, BF16 hidden boundary, FP32 route weights and BF16 atomic reduction. Requires `GLM_LINEAR_FP8`; excludes EP, vendor MoE, shared folding and fixed-point reduction. Opt-in correctness bring-up, not full-model qualification or a performance promotion. |
 | `GLM_SHARED_GLU_SPLIT` | `--glm-shared-glu-split` | false | Split GLU path for fp8 linear. |
 | `PLOW_MLA_PREFILL` | `--mla-prefill` | unset | MLA prefill ladder (e.g. "full:512,2048,4096,8192"). |
 | `GLM_EP` | `--glm-ep` | false | GLM expert-parallel mode. |
@@ -735,6 +743,7 @@ the end, not tabled.
 | `PLOW_MLA_FOLD_MAP` / `_UN` / `_VEC` / `_VT` | 0 | fold the MLA up-projection map / output un-projection / V-cache load / V^T transpose into the adjacent kernel to save a launch + round-trip. |
 | `PLOW_MLA_FOLD_TB_FLASH` | 0 | build `interp_flash_*` with the token-blocked `MlaMergeFold` arm (`PLOW_MLA_FOLD_TB`, default 8 and already on for `interp_prefill_*`). GLM-5.3's sparse 8192 chunk dispatches its fold from the FLASH object, so without this the arm is unreachable on the shipped recipe. Opt-in until the retrieval screen runs on this object. |
 | `PLOW_MLA_PF_MFMA` | 0 | MLA prefill uses MFMA matrix-core instructions for QK/PV instead of the vector-FMA fallback. |
+| `PLOW_MLA_P_BF16` | 0 | Experimental AMD scalar MLA BF16-cache path: round softmax probabilities to BF16 only for PV; keep the softmax denominator FP32. Paired env/define in `build_gfx950.sh`, including golden wrappers. Does not change split/tile geometry or qualify reference parity by itself; not a serving default. |
 | `PLOW_MLA_PF_WPM` | numeric | MLA-prefill waves-per-M-tile, clamped by `min(PLOW_WAVES, PLOW_MLA_PF_WPM)`. |
 | `PLOW_XR_CUS` | 32 | **emit** — cap XReduce participant CUs (clamped 1..n_cu); a TP8 NUMA lever cutting L2 invalidates from idle WGs. |
 | `PLOW_XR2_GATHER` | 1 | **emit** — use the two-shot reduce-scatter/all-gather path for complete folded-gather collectives when `row_w = n_gpu*gcols`; set `0` for the one-shot rollback. |
@@ -1148,6 +1157,19 @@ plowrt serve --assets <dir> \
 Loader/asset overrides: `PLOW_NV_CUBIN[_PF]`, `PLOW_NV_KERNEL[_PF]`, `PLOW_NV_SMEM`
 / `PLOW_NV_SMEM_PF` (override decode/prefill dynamic-smem arena bytes), `PLOW_HSACO`
 (AMD `.hsaco` dir), `PLOW_CHECKPOINT`, `PLOW_LIBCUDA`.
+
+`PLOW_MLA_BF16_METADATA_HOIST=1` / `--mla-bf16-metadata-hoist` is an experimental,
+default-off AMD persistent BF16 attention optimization. Reuses only the work map
+across same-replay layers with identical selected-length vectors and workspace.
+The first layer builds metadata; subsequent matching layers omit that launch.
+Q/KV packing and selected indices remain layer-local. M<32 and positive live rows
+only. Requires exact GPU replay and matched four-arm qualification before promotion.
+
+`PLOW_GLM_MLA_STRIDED_WV=1` is an experimental emit-time candidate requiring
+`PLOW_GLM_MLA_BF16_PS=1`. M<32 attention writes padded BF16 heads directly into
+the activation buffer; the sole WV consumer reads even heads with stride 1024.
+This removes the unpad dispatch/copy, not the BF16 rounding boundary. Objects
+must carry `plow_mla_bmm_head_stride_1`. Default off; GPU qualification pending.
 
 ### What plow does and does not fuse
 

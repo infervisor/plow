@@ -91,6 +91,7 @@ fn probe_inventory(
         format!("cannot fingerprint the {arch} dense-GEMM family ({e})")
     })?;
     let want = Digests {
+        execution: None,
         implementation: build.label(),
         interpreter: build.label(),
         toolchain: build.toolchain.clone(),

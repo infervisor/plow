@@ -41,6 +41,7 @@
 #include "op_attention.h"
 #include "op_gemm.h"
 #include "op_moe.h"
+#include "op_moe_fp8_block128.h"
 #endif
 
 /* THE OBJECT STATES ITS OWN WORKGROUP WIDTH, so a harness cannot disagree with it.
@@ -102,6 +103,11 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void glm_r
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_residual_add_bf16(
     bf16* out, const bf16* a, const bf16* b, unsigned n, float scale) {
     d_residual(out, a, b, n, scale, blockIdx.x, gridDim.x);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void sum4_bf16(
+    bf16* out, const bf16* b, const bf16* c, const bf16* d, unsigned n) {
+    d_sum4_bf16(out, b, c, d, n, blockIdx.x, gridDim.x);
 }
 
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_geglu_bf16(
@@ -208,6 +214,136 @@ GEMM_VARIANT(gemm_e5, 128, 128, 128)
 
 /* FP8 (w8a8) GEMM variants — same tile family, fp8 operands, dequant epilogue. LDS is bytes, so
  * the tile fits in HALF the halves the bf16 arena reserves (rounded up to a whole bf16 count). */
+#if PLOW_CDNA4
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemm_a8w8_block128_m16(
+    bf16* C, const unsigned char* A, const unsigned char* B, const float* asc,
+    const float* wsc, unsigned M, unsigned N, unsigned K) {
+    d_gemm_fp8_block128_m16(C, A, B, asc, wsc, M, N, K, blockIdx.x, gridDim.x);
+}
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_bmm_fp8_m16(
+    bf16* C, const bf16* X, const unsigned char* W, const float* scale,
+    unsigned M, unsigned H, unsigned N, unsigned K) {
+    d_mla_bmm_fp8_m16(C, X, W, scale, M, H, N, K, blockIdx.x, gridDim.x);
+}
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_bmm_fp8_stride(
+    bf16* C, const bf16* X, const unsigned char* W, const float* scale,
+    unsigned M, unsigned H, unsigned N, unsigned K, unsigned stride) {
+    d_mla_bmm_fp8_m16(C, X, W, scale, M, H, N, K, blockIdx.x, gridDim.x, stride);
+}
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_bmm_fp8_qrope(
+    bf16* C, bf16* rope, const bf16* X, const unsigned char* W, const float* scale,
+    unsigned M, unsigned H, unsigned N, unsigned K) {
+    d_mla_bmm_fp8_m16<true>(C, X, W, scale, M, H, N, K, blockIdx.x, gridDim.x, K + 64, rope, 64);
+}
+#define QB_SPLIT_KERNEL(name, splits, atomic) \
+extern "C" __global__ __attribute__((flatten)) \
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void name( \
+    bf16* C, const unsigned char* A, const unsigned char* B, const float* asc, \
+    const float* wsc, unsigned M, unsigned N, unsigned K) { \
+    d_gemm_fp8_block128_m16<false, false, false, false, false, false, splits, atomic>( \
+        C, A, B, asc, wsc, M, N, K, blockIdx.x, gridDim.x); \
+}
+QB_SPLIT_KERNEL(gemm_qb_split4, 4, false)
+QB_SPLIT_KERNEL(gemm_qb_split8, 8, false)
+QB_SPLIT_KERNEL(gemm_qb_atomic4, 4, true)
+QB_SPLIT_KERNEL(gemm_qb_atomic8, 8, true)
+#undef QB_SPLIT_KERNEL
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemm_qkv_a8w8_block128_m16(
+    bf16* C, bf16* C1, bf16* C2, const unsigned char* A, const unsigned char* B,
+    const float* asc, const float* wsc, unsigned M, unsigned N, unsigned K,
+    unsigned n_first, unsigned n_second) {
+    d_gemm_fp8_block128_m16<false, false, false, false, false, true>(C, A, B, asc, wsc,
+        M, N, K, blockIdx.x, gridDim.x, nullptr, nullptr, nullptr, 0, nullptr, 0,
+        C1, C2, n_first, n_second);
+}
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemm_glu_a8w8_block128_m16(
+    bf16* C, const unsigned char* A, const unsigned char* B, const float* asc,
+    const float* wsc, unsigned M, unsigned N, unsigned K) {
+    d_gemm_fp8_block128_m16<true>(C, A, B, asc, wsc, M, N, K, blockIdx.x, gridDim.x);
+}
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_group_glu_a8w8_block128_m16(
+    bf16* fu, const unsigned char* xq, const float* xscale,
+    const unsigned long long* wtab, const unsigned long long* stab,
+    const int* meta, const unsigned* row_token, unsigned I, unsigned H,
+    unsigned n_exp, unsigned T) {
+    d_moe_group_glu_fp8_block128_m16(fu, xq, xscale, wtab, stab, meta, row_token,
+        I, H, n_exp, T, blockIdx.x, gridDim.x);
+}
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_group_down_a8w8_block128_m16(
+    bf16* parts, const unsigned char* xq, const float* xscale,
+    const unsigned long long* wtab, const unsigned long long* stab,
+    const int* meta, const unsigned* row_partidx, const float* row_gate,
+    unsigned I, unsigned H, unsigned n_exp, unsigned slots) {
+    d_moe_group_down_fp8_block128_m16(parts, xq, xscale, wtab, stab, meta,
+        row_partidx, row_gate, I, H, n_exp, slots, blockIdx.x, gridDim.x);
+}
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_group_down_atomic_a8w8_block128_m16(
+    bf16* out, const unsigned char* xq, const float* xscale,
+    const unsigned long long* wtab, const unsigned long long* stab,
+    const int* meta, const unsigned* row_partidx, const float* row_gate,
+    unsigned I, unsigned H, unsigned n_exp, unsigned slots, unsigned topk) {
+    d_moe_group_down_fp8_block128_m16<true>(out, xq, xscale, wtab, stab, meta,
+        row_partidx, row_gate, I, H, n_exp, slots, blockIdx.x, gridDim.x, topk);
+}
+extern "C" __global__ void bf16_atomic_ordered_add(
+    bf16* out, const bf16* parts, unsigned T, unsigned H, unsigned topk, unsigned slot) {
+    for (unsigned j = (blockIdx.x * blockDim.x + threadIdx.x) * 2; j < T * H;
+         j += gridDim.x * blockDim.x * 2) {
+        const size_t base = ((size_t)(j / H) * topk + slot) * H + j % H;
+        atomic_add_bf16_pair(out + j, (unsigned)parts[base] | ((unsigned)parts[base + 1] << 16));
+    }
+}
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_quant_fp8_block128(
+    unsigned char* xq, const bf16* fu, float* scale, const int* meta,
+    const unsigned* row_partidx, unsigned I, unsigned n_exp, unsigned slots) {
+    d_moe_quant_fp8_block128(xq, fu, scale, meta, row_partidx, I, n_exp, slots,
+        blockIdx.x, gridDim.x);
+}
+extern "C" __global__ void moe_group_fp8_geometry(unsigned* geometry) {
+    if (threadIdx.x == 0) {
+        geometry[0] = MPF_BM;
+        geometry[1] = PLOW_THREADS;
+    }
+}
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemm_weighted_a8w8_block128_m16(
+    bf16* C, const unsigned char* A, const unsigned char* B, const float* asc,
+    const float* wsc, const float* weights, unsigned M, unsigned N, unsigned K) {
+    d_gemm_fp8_block128_m16<false, false, true>(C, A, B, asc, wsc, M, N, K,
+        blockIdx.x, gridDim.x, nullptr, nullptr, nullptr, 0, weights);
+}
+#endif
+
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemm_a8w8_block128(
+    bf16* C, const unsigned char* A, const unsigned char* B, const float* asc,
+    const float* wsc, unsigned M, unsigned N, unsigned K) {
+    __shared__ bf16 lds[GM_LDS_HALVES_T(64, 128, 128)];
+    d_gemm_fp8_t<64, 128, 128, GM_WM, GM_WN, false, false, true>(
+        C, A, B, asc, wsc, M, N, K, blockIdx.x, gridDim.x, lds);
+}
+
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemm_a8w8_block128_split4(
+    bf16* C, const unsigned char* A, const unsigned char* B, const float* asc,
+    const float* wsc, unsigned M, unsigned N, unsigned K) {
+    __shared__ bf16 lds[GM_LDS_HALVES_T(64, 128, 128)];
+    const size_t plane = (size_t)M * N;
+    d_gemm_fp8_t<64, 128, 128, GM_WM, GM_WN, true, false, true, 4>(
+        C, A, B, asc, wsc, M, N, K, blockIdx.x, gridDim.x, lds,
+        nullptr, nullptr, 0, C + plane, C + 2 * plane, C + 3 * plane);
+}
+
 #define GEMM_FP8_VARIANT(NAME, BM, BN, BK)                                          \
     extern "C" __global__ __attribute__((flatten))                                 \
     __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                      \
@@ -455,6 +591,11 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_quant_fp8_k(
     unsigned char* xq, bf16* x, float* ascale, unsigned M, unsigned K, unsigned nblk) {
     d_quant_fp8(xq, x, ascale, M, K, blockIdx.x, nblk);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void quant_fp8_block128(
+    unsigned char* xq, const bf16* x, float* scale, unsigned M, unsigned K) {
+    d_quant_fp8_block128(xq, x, scale, M, K, blockIdx.x, gridDim.x);
 }
 
 /* MXFP4 (OCP microscaling e2m1 + one E8M0 scale per 32 K) decode GEMV, w4a16.
@@ -1444,3 +1585,16 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index
 #endif
 
 #endif /* !PLOW_TK_SAFE_ONLY */
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS) void hsa_kernarg_retirement_test(
+    unsigned long long* out, unsigned long long index,
+    unsigned long long value, unsigned long long delay_ticks) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const unsigned long long start = clock64();
+    // Both bounds are finite; this kernel never waits for a host release flag.
+    for (unsigned i = 0; i < (1u << 24) && clock64() - start < delay_ticks; ++i) {
+        __builtin_amdgcn_s_sleep(1);
+    }
+    out[index] = value;
+    __threadfence_system();
+}

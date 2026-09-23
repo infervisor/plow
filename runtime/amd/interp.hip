@@ -168,6 +168,17 @@ extern "C" __device__ unsigned plow_token_batch_fp8_gemm_1 = 1;
 #ifndef PLOW_DECODE_INVENTORY_PRUNE
 #define PLOW_DECODE_INVENTORY_PRUNE 0
 #endif
+/* Batched MLA decode uses the grouped expert family too. Arm it from the paired
+ * decode inventory before defining capability markers and the LDS union. */
+#ifndef PLOW_MOE_PREFILL
+#if PLOW_BUCKET_DECODE && PLOW_DECODE_INVENTORY_PRUNE && \
+    (PLOW_HAS_MOE_ROUTER_TOPK_PF || PLOW_HAS_MOE_ALIGN_PF || PLOW_HAS_MOE_GROUP_GLU_PF || \
+     PLOW_HAS_MOE_GROUP_DOWN_PF || PLOW_HAS_MOE_COMBINE_PF)
+#define PLOW_MOE_PREFILL 1
+#else
+#define PLOW_MOE_PREFILL 0
+#endif
+#endif
 #if defined(PLOW_BUCKET_DECODE_MLA)
 extern "C" __device__ unsigned plow_decode_mla_segment_object_1 = 1;
 #endif
@@ -257,6 +268,9 @@ extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
 #include "op_qwen_gdn.h"
 #endif
 #include "op_moe.h"
+#if PLOW_CDNA4 && (PLOW_HAS_MOE_GLU_FP8_BLOCK128 || PLOW_HAS_MOE_QUANT_FP8_BLOCK128 || PLOW_HAS_MOE_DOWN_FP8_BLOCK128)
+#include "op_moe_fp8_block128.h"
+#endif
 #if PLOW_TOKEN_BATCH
 /* Placed here, not at the axis definition: PLOW_FP8 and friends are resolved by the op headers
  * above, and `#if UNDEFINED` is 0 — a guard written before they exist reads as satisfied and
@@ -588,6 +602,38 @@ extern "C" __device__ unsigned plow_fp8_kv_1 = 1;
 #if PLOW_FP8
 extern "C" __device__ unsigned plow_fp8_weights_1 = 1;
 #endif
+#if PLOW_HAS_QUANT_FP8_BLOCK128
+extern "C" __device__ unsigned plow_opcode_quant_fp8_block128_1 = 1;
+#endif
+#if PLOW_HAS_GEMM_FP8_BLOCK128
+extern "C" __device__ unsigned plow_opcode_gemm_fp8_block128_1 = 1;
+#if PLOW_CDNA4
+extern "C" __device__ unsigned plow_gemm_fp8_block128_m16_1 = 1;
+extern "C" __device__ unsigned plow_gemm_fp8_block128_split3_1 = 1;
+extern "C" __device__ unsigned plow_gemm_fp8_block128_qb_1 = 1;
+#endif
+#endif
+#if PLOW_HAS_GEMM_FP8_BLOCK128_SPLIT4
+extern "C" __device__ unsigned plow_opcode_gemm_fp8_block128_split4_1 = 1;
+#endif
+#if PLOW_CDNA4 && PLOW_HAS_MLA_BMM_FP8
+extern "C" __device__ unsigned plow_opcode_mla_bmm_fp8_1 = 1;
+extern "C" __device__ unsigned plow_mla_bmm_head_stride_1 = 1;
+#endif
+#if PLOW_HAS_SUM4_BF16
+extern "C" __device__ unsigned plow_opcode_sum4_bf16_1 = 1;
+#endif
+extern "C" __device__ unsigned plow_glu_silu_bf16_1 = 1;
+extern "C" __device__ unsigned plow_opcode_zero_f32_1 = 1;
+#if PLOW_CDNA4 && PLOW_HAS_MOE_GLU_FP8_BLOCK128
+extern "C" __device__ unsigned plow_opcode_moe_glu_fp8_block128_1 = 1;
+#endif
+#if PLOW_CDNA4 && PLOW_HAS_MOE_QUANT_FP8_BLOCK128
+extern "C" __device__ unsigned plow_opcode_moe_quant_fp8_block128_1 = 1;
+#endif
+#if PLOW_CDNA4 && PLOW_HAS_MOE_DOWN_FP8_BLOCK128
+extern "C" __device__ unsigned plow_opcode_moe_down_fp8_block128_1 = 1;
+#endif
 
 /* The Gemma-4 MoE arms, made observable the same way and for the same reason. [GEMMA4-MOE-AMD]
  *
@@ -757,12 +803,6 @@ extern "C" __device__ unsigned plow_prefill_nrn_consumer_1 = 1;
  * PLOW_GQ_BATCH must stay 1: claiming >1 packet per fetch-add starves parallelism (a K-wide batch is
  * drained by only n_cu/K workgroups), measured 6-8x slower at K=8. The knob exists only to document
  * that dead end; do not raise it. */
-/* MoE PREFILL arms (ops 83-87). Own flag, like PLOW_MLA_PREFILL: only a Kimi/GLM/DeepSeek
- * prefill object needs the grouped-expert GEMM, and it is a second full MFMA body in a bucket
- * already at the 256/occ-2 cliff. Off => every existing object is byte-identical. */
-#ifndef PLOW_MOE_PREFILL
-#define PLOW_MOE_PREFILL 0
-#endif
 #ifndef PLOW_GLOBAL_QUEUE
 #define PLOW_GLOBAL_QUEUE 0
 #endif
@@ -3394,6 +3434,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                        in->fj[0].f, slice, nblk, (const bf16*)TEN(3));
             break;
 #endif
+#if PLOW_HAS_SUM4_BF16
+        case PLOW_DOP_SUM4_BF16:
+            d_sum4_bf16((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                        (const bf16*)TEN(3), in->i[0], slice, nblk);
+            break;
+#endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_ADD_NORM
         case PLOW_DOP_ADD_NORM:
 #if PLOW_GLM_FUSE_SEAM_RN
@@ -3882,6 +3928,128 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                          slice);
             break;
 #endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_F32
+#define PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS 32u
+        case PLOW_DOP_GEMM_F32:
+            /* Decode routers need FP32 logits too; keep the MFMA tile out of that bucket. */
+#if PLOW_BUCKET_PREFILL || PLOW_MIXED_STEP
+            if (PLOW_RUNTIME_ROWS(in->i[0]) > PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS)
+                d_gemm_f32((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                           PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk, sm->gm);
+            else
+#endif
+                d_gemv_bf16_f32((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                 PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk);
+            break;
+#undef PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS
+#endif
+#if PLOW_CDNA4 && PLOW_HAS_MOE_GLU_FP8_BLOCK128
+        case PLOW_DOP_MOE_GLU_FP8_BLOCK128:
+            d_moe_group_glu_fp8_block128_m16((bf16*)TEN(0), (const unsigned char*)TEN(1),
+                (const float*)TEN(2), (const unsigned long long*)TEN(3),
+                (const unsigned long long*)TEN(4), (const int*)TEN(5), (const unsigned*)TEN(6),
+                in->i[0], in->i[1], in->i[2], PLOW_RUNTIME_ROWS(in->i[3]), slice, nblk);
+            break;
+#endif
+#if PLOW_CDNA4 && PLOW_HAS_MOE_QUANT_FP8_BLOCK128
+        case PLOW_DOP_MOE_QUANT_FP8_BLOCK128: {
+            const unsigned rows = PLOW_RUNTIME_ROWS(in->i[3]);
+            d_moe_quant_fp8_block128((unsigned char*)TEN(0), (const bf16*)TEN(1), (float*)TEN(2),
+                (const int*)TEN(3), (const unsigned*)TEN(4), in->i[0], in->i[1],
+                rows * in->i[2], slice, nblk);
+            for (unsigned j = slice * PLOW_THREADS + threadIdx.x; j < rows * (in->i[4] / 2);
+                 j += nblk * PLOW_THREADS)
+                st_act<float>(as_glob((float*)TEN(5)) + j, 0.0f);
+            break;
+        }
+#endif
+#if PLOW_CDNA4 && PLOW_HAS_MOE_DOWN_FP8_BLOCK128
+        case PLOW_DOP_MOE_DOWN_FP8_BLOCK128:
+            d_moe_group_down_fp8_block128_m16<true>((bf16*)TEN(0), (const unsigned char*)TEN(1),
+                (const float*)TEN(2), (const unsigned long long*)TEN(3),
+                (const unsigned long long*)TEN(4), (const int*)TEN(5), (const unsigned*)TEN(6),
+                (const float*)TEN(7), in->i[0], in->i[1], in->i[2],
+                PLOW_RUNTIME_ROWS(in->i[4]) * in->i[3], slice, nblk, in->i[3]);
+            break;
+#endif
+#if PLOW_HAS_QUANT_FP8_BLOCK128
+        case PLOW_DOP_QUANT_FP8_BLOCK128:
+            d_quant_fp8_block128((unsigned char*)TEN(0), (const bf16*)TEN(1), (float*)TEN(2),
+                                PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], slice, nblk);
+            break;
+#endif
+        case PLOW_DOP_ZERO_F32: {
+            float* out = (float*)TEN(0);
+            const size_t count = (size_t)PLOW_RUNTIME_ROWS(in->i[0]) * in->i[1];
+            for (size_t j = (size_t)slice * PLOW_THREADS + threadIdx.x;
+                 j < count; j += (size_t)nblk * PLOW_THREADS)
+                st_act<float>(as_glob(out) + j, 0.0f);
+            break;
+        }
+#if PLOW_HAS_GEMM_FP8_BLOCK128
+        case PLOW_DOP_GEMM_FP8_BLOCK128: {
+#if PLOW_CDNA4
+            if (in->i[4]) {
+                d_gemm_fp8_block128_m16<false, false, false, false, false, true>(
+                    (bf16*)TEN(0), (const unsigned char*)TEN(1), (const unsigned char*)TEN(2),
+                    (const float*)TEN(3), (const float*)TEN(4), PLOW_RUNTIME_ROWS(in->i[0]),
+                    in->i[1], in->i[2], slice, nblk, nullptr, nullptr, nullptr, 0, nullptr, 0,
+                    (bf16*)TEN(5), (bf16*)TEN(6), in->i[4], in->i[5]);
+                break;
+            }
+            const unsigned qb_m = PLOW_RUNTIME_ROWS(in->i[0]);
+            // Pinned AITER gfx950 Q-B table: exact M first, then ceil(M/16)*16.
+            if (in->i[6] && (qb_m <= 64 || qb_m == 72 || qb_m == 88
+                || (qb_m > 224 && qb_m <= 240 && qb_m != 232))) {
+                const unsigned m = qb_m;
+                if (m <= 16)
+                    d_gemm_fp8_block128_m16<false, false, false, false, false, false, 8, true>(
+                        (bf16*)TEN(0), (const unsigned char*)TEN(1), (const unsigned char*)TEN(2),
+                        (const float*)TEN(3), (const float*)TEN(4), m, in->i[1], in->i[2], slice, nblk);
+                else
+                    d_gemm_fp8_block128_m16<false, false, false, false, false, false, 4, true>(
+                        (bf16*)TEN(0), (const unsigned char*)TEN(1), (const unsigned char*)TEN(2),
+                        (const float*)TEN(3), (const float*)TEN(4), m, in->i[1], in->i[2], slice, nblk);
+                break;
+            }
+            if (in->i[3] == 16) {
+                d_gemm_fp8_block128_m16(
+                    (bf16*)TEN(0), (const unsigned char*)TEN(1), (const unsigned char*)TEN(2),
+                    (const float*)TEN(3), (const float*)TEN(4), PLOW_RUNTIME_ROWS(in->i[0]),
+                    in->i[1], in->i[2], slice, nblk);
+                break;
+            }
+#endif
+            d_gemm_fp8_t<64, 128, 128, GM_WM, GM_WN, true, false, true>(
+                (bf16*)TEN(0), (const unsigned char*)TEN(1), (const unsigned char*)TEN(2),
+                (const float*)TEN(3), (const float*)TEN(4), PLOW_RUNTIME_ROWS(in->i[0]),
+                in->i[1], in->i[2], slice, nblk, sm->gm);
+            break;
+        }
+#endif
+#if PLOW_CDNA4 && PLOW_HAS_MLA_BMM_FP8
+        case PLOW_DOP_MLA_BMM_FP8:
+            if (in->i[4])
+                d_mla_bmm_fp8_m16<true>((bf16*)TEN(0), (const bf16*)TEN(1),
+                    (const unsigned char*)TEN(2), (const float*)TEN(3),
+                    PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], in->i[3], slice, nblk,
+                    in->i[3] + 64, (bf16*)TEN(4), 64);
+            else
+                d_mla_bmm_fp8_m16((bf16*)TEN(0), (const bf16*)TEN(1),
+                    (const unsigned char*)TEN(2), (const float*)TEN(3),
+                    PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], in->i[3], slice, nblk,
+                    in->i[5]);
+            break;
+#endif
+#if PLOW_HAS_GEMM_FP8_BLOCK128_SPLIT4
+        case PLOW_DOP_GEMM_FP8_BLOCK128_SPLIT4:
+            d_gemm_fp8_t<64, 128, 128, GM_WM, GM_WN, true, false, true, 4>(
+                (bf16*)TEN(0), (const unsigned char*)TEN(1), (const unsigned char*)TEN(2),
+                (const float*)TEN(3), (const float*)TEN(4), PLOW_RUNTIME_ROWS(in->i[0]),
+                in->i[1], in->i[2], slice, nblk, sm->gm, nullptr, nullptr, 0,
+                (bf16*)TEN(5), (bf16*)TEN(6), (bf16*)TEN(7));
+            break;
+#endif
 #if PLOW_BUCKET_PREFILL || PLOW_MIXED_STEP
 #if PLOW_FP8
         /* w8a8 PREFILL arms. ADDITIVE — they JOIN the bf16 GEMM arms below, they no longer
@@ -3997,18 +4165,6 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             exec_gemm(in, T, slice, nblk, sm->gm, PLOW_RUNTIME_ROWS(in->i[0]),
                        PLOW_RUNTIME_DECODE_ROWS);
             break;
-#endif
-#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_F32
-#define PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS 32u
-        case PLOW_DOP_GEMM_F32:
-            if (PLOW_RUNTIME_ROWS(in->i[0]) <= PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS)
-                d_gemv_bf16_f32((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
-                                 PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk);
-            else
-                d_gemm_f32((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
-                           PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk, sm->gm);
-            break;
-#undef PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_SMALL
         case PLOW_DOP_GEMM_SMALL:

@@ -57,6 +57,127 @@ python3 scripts/campaign/campaign.py ledger  /nvme/run/<id>/c1/results.csv --cel
 
 ## Profiles: realtime and throughput are both first-class
 
+### AMD modular blocks
+
+`serve-bench --quality-lens 8192,71680` runs the existing needle probe before
+timing, using exact token-ID prompt lengths and recording prompt hashes. Compare
+the achieved lengths and hashes across servers before interpreting paired retrieval
+results. Retrieval results do not replace the full-logit numerical gate.
+
+`block-roofline` reads one disassembled decode program, preserving its TP shapes,
+FP8 scale grids and sparse selection width. The result is an optimistic HBM/compute
+floor, with excluded operations listed; configured ceilings are not same-session
+bandwidth measurements.
+Add `--router-table /path/outputs/rank0.act.tab.bin` to charge the captured
+expert union instead of assuming every row shares the same top-k experts. The
+table's shape, IDs, gates and per-row uniqueness are checked and its hash recorded.
+This remains a one-stream traffic model, not measured HBM utilization.
+
+```
+python3 scripts/campaign/campaign.py block-roofline recipes/<block>.toml \
+  --packet /path/block.pkt --program 1 --ctx 8192 --out /path/roofline
+python3 scripts/campaign/campaign.py block-bench recipes/<block>.toml \
+  --packet /path/block.pkt --objects /path/objects --checkpoint /path/checkpoint \
+  --inputs /path/operands --ctx 512 --out /path/block-control
+```
+
+Run inside `nix develop`, with render-device access. `block-bench` freezes the
+packet, objects, input fixtures and runtime, runs the doctor, then submits to
+`scripts/bench/gpuq.py`. The FIFO worker waits for foreign GPU processes to exit
+before acquiring a lease. Inspect `gpuq.py status` and the job's log in
+`/tmp/plow-gpuq`; a queued job is not a measurement.
+
+Add `--dstep-log` for host preparation/submission/wait/audit timing windows.
+These are host-observed intervals: rearming can overlap execution, and drain is
+the remaining wait, not total GPU duration. `block-ab` rejects these diagnostic timings.
+
+Add `--trace` for a separate instrumented run with per-rank device traces; do not
+score its host timings against uninstrumented controls. Failed numerical gates
+leave intermediate dumps in `outputs/` but no timing report. Diagnose those with
+`glm52_real_oracle.py --candidate-dir DIR` (CPU, no fixture written).
+
+`build` also supports gfx recipes with `[objects].script = "scripts/build_gfx950.sh"`.
+It passes the freshly emitted `plow_config.h` to the object build and records
+packet, manifest, header and object hashes. `block-bench` preserves the matched
+manifest when its packet comes from such a campaign build, rejecting changed assets.
+Use `build --object-env K=V` for an object-only A/B; this is recorded separately
+from emit-side `--env` and does not change the packet configuration.
+
+Use `block-ab` to keep a rung's four arms in one queued lease (not four separate
+submissions). It freezes each arm, runs the doctor, takes the CPU-quiet lock inside
+the lease, and runs control/candidate/control/candidate. Builds must cooperate via
+`scripts/bench/quiets.sh /tmp/plow-campaign-quiet.lock` for CPU isolation.
+
+```
+python3 scripts/campaign/campaign.py block-ab recipes/<block>.toml \
+  --control-build /path/control --treatment-build /path/candidate \
+  --inputs /path/operands --checkpoint /path/checkpoint --ctx 512 \
+  --out /path/ab --note "one changed lever"
+```
+
+The frozen scorer refuses mismatched cells/inputs/runtime, instrumented timings,
+failed numerical gates and nonrepeatable same-variant outputs. A block `PASS`
+also requires identical control/candidate output files when `--require-bitwise`
+is set (use for scheduling-only levers). Otherwise the captured oracle gates apply.
+A performance `PASS`
+requires a median saving above `max(control drift, treatment spread) + 2*max(MAD)`
+and treatment spread at most three times control drift. Control/control therefore
+cannot pass as a performance improvement. Failure exits nonzero; results remain
+in `comparison.json`. This is a block-candidate gate, not serving/default qualification.
+For the experimental native routed W8A8 path, use `--routed-reference audit.json`
+instead of `--require-bitwise`. The audit must be a passed pinned connected
+`--block-routed --routed-w8a8 --routed-down-isolate` capture. The campaign freezes
+it and runs the CPU checker in the pinned Docker image after all four arms.
+It checks route coverage and gate bits, five bitwise stable boundaries, BF16
+atomic addition-order bounds, and exact shared/TP/residual rounding. Only those
+validated reordered/atomic-dependent outputs may differ; every other captured
+output must match across all arms. The certificate is bound to all output hashes.
+This does not establish full-model precision parity or relax the block oracle.
+Accept `PASS` only after the enclosing queue job finishes with return code zero;
+the lease's final contention audit can still invalidate an otherwise passing arm.
+
+The capture runner supports fixed-width decode blocks, with capture batch equal
+to the packet's allocated decode batch. Fixtures contain
+raw `act.x.bin`, the block's carried `kv.*.bin` / `act.iidx.bin`, and
+`reference.bf16` with `reference.json` specifying `batch` (default 1), `ctx`,
+`tolerance_rel_l2` and stage names. KV files pack `[batch, ctx, dimension]`;
+replay uploads each sequence at the packet's full-context stride.
+`runtime/tests/glm52_real_oracle.py --block-inputs DIR` exports the layer-3
+dense-context gate (context at most the DSA selection width). Add
+`--batch 8 --inputs-only` for distinct seeded sequences without duplicating the
+weight-bearing fixture. Every row, stage and rank must pass before timing;
+TP counter audits remain enabled. Measurements
+are explicitly host-clock dispatch/drain timings, not device kernel timings.
+For a shared-index block, `--block-context 71680` with `GLM_L=2048` places supplied
+keys across the logical context and uses the same positions in the HF reference.
+This checks sparse gathers and RoPE, not the learned indexer's choices. Prefill
+still requires its own captures and runner support. Block results are never served tok/s.
+
+### Matched ROCm serving
+
+`serve-bench` freezes a full-model serving set and queues either plow or the pinned
+vLLM 0.29 Docker image. Both use the same digest-pinned Docker client, tokenizer,
+random seed, raw-completion protocol, output length and concurrency grid.
+
+```
+python3 scripts/campaign/campaign.py serve-bench recipes/glm53.mi350x.fp8-full.toml \
+  --server plow --assets /path/assets --objects /path/objects --out /path/plow-run \
+  --in-lens 8192 --concs 8 --nprompt 16
+```
+
+Repeat with `--server vllm` and a fresh output directory. Run inside `nix develop`
+with render access and noninteractive Docker access. The host paths currently
+assume `/opt/models`. `--dry-run` prepares and checks the shell without queueing.
+Missing raw checkpoint shards are refused; verify download checksums and prepare
+every layer before running. Runtime and objects are private copies. Teardown
+signals only the owned timeout/server or stops the exact created container ID.
+
+Client results must contain every requested completion/output token and finite
+mean/median/P99 latency metrics. `run-record.json` deliberately leaves
+`numerics_qualified=false`: a coherence smoke is not full-model numerical or
+retrieval qualification. The initial full recipe uses B16 capacity; C32/C64 can
+queue and are not evidence that all requests reside in KV simultaneously.
+
 A cell carries named workloads under `[bench.profiles.<name>]`; `bench --profile
 <name>` applies its keys over `[bench]` and its `serve_env` over `[serve].env`.
 

@@ -235,6 +235,7 @@ pub(crate) mod tests {
                 },
             }],
             digests: Digests {
+                execution: None,
                 implementation: "body".into(),
                 interpreter: "b".repeat(64),
                 toolchain: "cuda".into(),

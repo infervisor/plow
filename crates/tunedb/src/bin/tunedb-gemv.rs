@@ -198,6 +198,7 @@ fn digests(root: &std::path::Path, isa: hwspec::IsaLevel) -> Result<Digests, Err
         )
     })?;
     Ok(Digests {
+        execution: None,
         implementation: inv.build().label(),
         interpreter: inv.build().label(),
         toolchain: inv.build().toolchain.clone(),
@@ -331,6 +332,7 @@ mod tests {
 
     fn digests() -> Digests {
         Digests {
+            execution: None,
             implementation: "build-a".into(),
             interpreter: "build-a".into(),
             toolchain: "rocm-a".into(),

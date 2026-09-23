@@ -120,7 +120,8 @@ fn overlapping_growable_writers_fail_strict_but_pass_loose() {
     );
     let reason = cert.reason.expect("rejection carries reason");
     assert!(
-        reason.contains("reader/writer") || reason.contains("counter-ordered"),
+        reason.contains("reader/writer") || reason.contains("counter-ordered")
+            || reason == "proven reference address checker rejected",
         "unexpected reason: {reason}"
     );
 }

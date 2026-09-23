@@ -2033,6 +2033,36 @@ pub enum DevOp {
     /// t2=krot_stage(bf16[rows][64]) t3=scale_stage(f32[rows]) t4=ckv t5=krot t6=kv_scale` ·
     /// `i0=rows i1=local_stride i2=page_shift i3=degree_shift i5=batched`.
     DcpKvScatter = 183,
+    /// BF16 to E4M3 FP8, dynamic groups of 128 along K; K must be divisible by 128.
+    /// `t0=xq t1=x t2=a_scale(f32[K/128,M])` · `i0=M i1=K`.
+    QuantFp8Block128 = 184,
+    /// W8A8 GEMM with FP32 accumulation and BF16 output; K must be divisible by 128.
+    /// `t0=C t1=A(fp8[M,K]) t2=W(fp8[N,K]) t3=a_scale(f32[K/128,M])
+    /// t4=w_scale(f32[ceil(N/128),K/128]) t5=C1 t6=C2` · `i0=M i1=N i2=K
+    /// i3=MFMA(0:32x32,16:16x16 CDNA4) i4=N0 i5=N1 i6=QB_live_split`.
+    /// Q-B selector 1 requires N=K=2048, MFMA16 and zeroed BF16 C; live M selects 8/4/1 K parts.
+    /// Optional CDNA4 split output: N0,N1 >0, t0/t5/t6 hold [M,N0/N1/N-N0-N1].
+    GemmFp8Block128 = 185,
+    /// Four contiguous K/4 partitions, each accumulated in FP32 and stored as BF16.
+    /// Same operands as GemmFp8Block128; t0/t5/t6/t7 are partial outputs. K divisible by 512.
+    /// `t0=C0 t1=A t2=W t3=a_scale t4=w_scale t5=C1 t6=C2 t7=C3` · `i0=M i1=N i2=K`.
+    GemmFp8Block128Split4 = 186,
+    /// In-place ordered sum of four BF16 tensors, rounding after EACH addition.
+    /// `t0=out_partial0 t1=partial1 t2=partial2 t3=partial3` · `i0=n`.
+    Sum4Bf16 = 187,
+    /// CDNA4 grouped gate/up: FP8 block128 operands, FP32 SiLU product, BF16 sorted rows.
+    /// `t0=fu t1=xq t2=xscale t3=wtab t4=stab t5=meta t6=row_token` · `i0=I i1=H i2=E i3=T`.
+    MoeGluFp8Block128 = 188,
+    /// Quantize sorted BF16 rows to slot-major FP8/F32 scales and zero routed BF16 output.
+    /// `t0=hq t1=fu t2=hscale t3=meta t4=row_partidx t5=out` · `i0=I i1=E i2=topk i3=T i4=H`.
+    MoeQuantFp8Block128 = 189,
+    /// CDNA4 grouped down: FP32 route weighting followed by native BF16 atomic reduction.
+    /// `t0=out t1=hq t2=hscale t3=wtab t4=stab t5=meta t6=row_partidx t7=row_gate` · `i0=I i1=H i2=E i3=topk i4=T`.
+    MoeDownFp8Block128 = 190,
+    /// CDNA4 MLA BMM with fused group128 input quantization and one scalar weight scale.
+    /// `t0=C t1=X t2=W t3=scale t4=raw_rope?` · `i0=M i1=heads i2=N i3=K i4=copy_rope64 i5=x_head_stride`.
+    /// x_head_stride=0 uses K (or K+64 with copy_rope64); 1024 selects even padded WV heads.
+    MlaBmmFp8 = 191,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2232,6 +2262,14 @@ impl DevOp {
         DevOp::DcpKvPack,
         DevOp::XDcpGather,
         DevOp::DcpKvScatter,
+        DevOp::QuantFp8Block128,
+        DevOp::GemmFp8Block128,
+        DevOp::GemmFp8Block128Split4,
+        DevOp::Sum4Bf16,
+        DevOp::MoeGluFp8Block128,
+        DevOp::MoeQuantFp8Block128,
+        DevOp::MoeDownFp8Block128,
+        DevOp::MlaBmmFp8,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2436,6 +2474,14 @@ impl DevOp {
             DevOp::DcpKvPack => "PLOW_DOP_DCP_KV_PACK",
             DevOp::XDcpGather => "PLOW_DOP_XDCP_GATHER",
             DevOp::DcpKvScatter => "PLOW_DOP_DCP_KV_SCATTER",
+            DevOp::QuantFp8Block128 => "PLOW_DOP_QUANT_FP8_BLOCK128",
+            DevOp::GemmFp8Block128 => "PLOW_DOP_GEMM_FP8_BLOCK128",
+            DevOp::GemmFp8Block128Split4 => "PLOW_DOP_GEMM_FP8_BLOCK128_SPLIT4",
+            DevOp::Sum4Bf16 => "PLOW_DOP_SUM4_BF16",
+            DevOp::MoeGluFp8Block128 => "PLOW_DOP_MOE_GLU_FP8_BLOCK128",
+            DevOp::MoeQuantFp8Block128 => "PLOW_DOP_MOE_QUANT_FP8_BLOCK128",
+            DevOp::MoeDownFp8Block128 => "PLOW_DOP_MOE_DOWN_FP8_BLOCK128",
+            DevOp::MlaBmmFp8 => "PLOW_DOP_MLA_BMM_FP8",
         }
     }
 
@@ -2486,7 +2532,7 @@ impl DevOp {
     /// 180 -> 181 for GLM's BF16-input/FP32-weight/FP32-output router GEMM.
     /// 181 -> 184 for `DcpKvPack = 181` / `XDcpGather = 182` / `DcpKvScatter = 183` (decode
     /// context parallelism).
-    pub const COUNT: u16 = 184;
+    pub const COUNT: u16 = 192;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

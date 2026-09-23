@@ -278,6 +278,7 @@ fn ingest(
             },
             ctx: r.ctx,
             digests: Digests {
+                execution: None,
                 implementation: r.implementation,
                 // The built object's own identity: two knob sets can share a
                 // source tree and still be different objects, which is exactly

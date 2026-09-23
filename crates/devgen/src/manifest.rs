@@ -555,6 +555,9 @@ fn shapes(m: &Model) -> Shapes {
                         s.moe_pf_det = true;
                     }
                 }
+                DevOp::MoeGluFp8Block128 | DevOp::MoeDownFp8Block128 => {
+                    s.moe_enc.insert(crate::mla::MoeEnc::Fp8Blk as u32);
+                }
                 DevOp::MoeAiterFp8Pf => {
                     s.moe_aiter_fp8 = true;
                     s.moe_aiter_flat |= inst.i[6] == 1;
@@ -707,6 +710,9 @@ fn shapes(m: &Model) -> Shapes {
 // That is the §4 shape reached by adding an arm; the single list is what makes the next
 // rung a one-line edit instead of two that can disagree.
 const FP8_WEIGHT_OPS: &[&str] = &[
+    "MlaBmmFp8",
+    "GemmFp8Block128",
+    "GemmFp8Block128Split4",
     "GemvFp8",
     "GemvQkvFp8",
     "GemvGluFp8",
@@ -766,6 +772,7 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
     );
     // w8a8 is the per-row ACTIVATION quant: `QuantFp8` exists only on that path.
     f.insert("w8a8".into(), json!(has("QuantFp8")));
+    f.insert("w8a8_block128".into(), json!(has("QuantFp8Block128")));
     f.insert(
         "qwen_gdn".into(),
         json!(union.iter().any(|a| a.op.starts_with("Qwen"))),
@@ -869,7 +876,9 @@ fn precision_axes(
             .any(|p| p.arms.iter().any(|a| a.op == "QuantFp8"))
     };
     let phase_present = |kind: &str| progs.iter().any(|p| p.kind == kind);
-    let act = if !has("QuantFp8") {
+    let act = if has("QuantFp8Block128") {
+        "mixed"
+    } else if !has("QuantFp8") {
         "bf16"
     } else if phase_present("prefill")
         && phase_present("decode")
@@ -1331,6 +1340,26 @@ fn backend_amd(
     if on("fp8_weights") {
         req.push("PLOW_FP8=1".into());
     }
+    if has("QuantFp8Block128") {
+        req.push("PLOW_HAS_QUANT_FP8_BLOCK128=1".into());
+    }
+    if has("GemmFp8Block128") {
+        req.push("PLOW_HAS_GEMM_FP8_BLOCK128=1".into());
+    }
+    if has("MlaBmmFp8") {
+        req.push("PLOW_HAS_MLA_BMM_FP8=1".into());
+    }
+    if has("GemmFp8Block128Split4") {
+        req.push("PLOW_HAS_GEMM_FP8_BLOCK128_SPLIT4=1".into());
+    }
+    if has("Sum4Bf16") {
+        req.push("PLOW_HAS_SUM4_BF16=1".into());
+    }
+    for (op, define) in [("MoeGluFp8Block128", "PLOW_HAS_MOE_GLU_FP8_BLOCK128=1"),
+        ("MoeQuantFp8Block128", "PLOW_HAS_MOE_QUANT_FP8_BLOCK128=1"),
+        ("MoeDownFp8Block128", "PLOW_HAS_MOE_DOWN_FP8_BLOCK128=1")] {
+        if has(op) { req.push(define.into()); }
+    }
     if on("w8a8") {
         req.push("PLOW_W8A8=1".into());
     }
@@ -1715,11 +1744,24 @@ fn lean_block(lean: &crate::LeanReport) -> Value {
         "verified": lean.verified,
         "oracle": lean.oracle,
         "rewrite_verified": lean.rewrite_verified,
+        "rewrite_scope": if !lean.rewrite_verified { "not_checked" }
+            else if lean.compile_checks.iter().any(|check|
+                check.scope == plow_asset::certificates::SemanticScope::RewriteBodyExpansion) {
+                "full_arity_rule_body_syntax_expansion"
+            } else { "name_catalog_only" },
+        "logical_effect_gaps": lean.logical_effect_gaps,
+        "dependency_binding_gaps": lean.dependency_binding_gaps,
+        "qualification": {
+            "floating_point_implementation": false,
+            "memory_effect_completeness": false,
+            "empirical_performance": false,
+        },
         "reason": lean.reason,
         "note": "`verified` = a Lean ordering certificate (plow_verify checkpoint D) was \
-                 obtained for EVERY program in this blob; `rewrite_verified` = egglog rewrite \
-                 rule soundness (checkpoint A) verified; `oracle` = the Lean decode \
-                 lower-bound query ran. false means NOT CHECKED (see `reason`), never \
+                 obtained for EVERY program in this blob; `rewrite_verified` = checkpoint A \
+                 checked at the stated `rewrite_scope`, not floating-point kernel implementation \
+                 correctness; `oracle` = a conditional Lean lower-bound query ran, not empirical \
+                 performance qualification. false means NOT CHECKED (see `reason`), never \
                  `checked and rejected` — a rejection aborts emission, so a blob with a \
                  rejected program never reaches disk and has no manifest.",
     });
@@ -2210,6 +2252,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
                     "persistent": d.compiled_persistent,
                 },
                 "qualified": d.selected_source == "qualified",
+                "measured_policy_obligation": d.measured_policy,
                 "selected": {
                     "algorithm": d.selected_algorithm,
                     "nsplit": d.selected_nsplit,
@@ -2283,6 +2326,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
         "n_cu": m.n_cu,
         // Before the large sections: plowrt's load check stops reading here.
         "knobs": crate::knob_spec::manifest_section(arch, m.n_cu, &backends),
+        "structural_cost_inputs": m.progs.iter().map(|p| crate::cost_inputs::program(m, p)).collect::<Vec<_>>(),
         "input_contract": {
             "kind": "token_ids",
             "modalities": ["text"],
@@ -2882,6 +2926,7 @@ mod tests {
             tensors: vec![],
             gq_stream: vec![],
             gq_seg_ofs: vec![],
+            reduction_witness: None,
             l2_sms: 0,
             l2_domains: 0,
         }
@@ -3457,6 +3502,29 @@ mod tests {
         assert_eq!(man2["features"]["w8a8"], true);
     }
 
+    #[test]
+    fn block128_projection_does_not_claim_whole_packet_w8a8() {
+        let m = Model {
+            n_cu: 256,
+            target: 0,
+            tensors: vec![],
+            progs: vec![prog(vec![
+                inst(DevOp::QuantFp8Block128, [0; 8]),
+                inst(DevOp::GemmFp8Block128, [0; 8]),
+            ])],
+            kv_row_insts: vec![],
+            prog_t: vec![16],
+            gen: vec![],
+        };
+        let man = build(&m, "gfx950");
+        assert_eq!(man["precision"]["weight_enc"], "fp8");
+        assert_eq!(man["precision"]["act_enc"], "mixed");
+        assert_eq!(man["features"]["w8a8"], false);
+        assert_eq!(man["features"]["w8a8_block128"], true);
+        assert!(man["backends"]["gfx950"]["requires"].as_array().unwrap()
+            .iter().any(|v| v == "PLOW_FP8=1"));
+    }
+
     /// The gfx950 backend renders the defines a covering object must carry. On AMD a missing arm
     /// does not trap — it writes nothing — so `requires` is the correctness half in a stronger
     /// sense than on NVIDIA.
@@ -3863,6 +3931,36 @@ mod tests {
                 op.c_name()
             );
         }
+    }
+
+    #[test]
+    fn fp32_router_dispatch_is_not_prefill_only() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("runtime/amd/interp.hip");
+        let src = std::fs::read_to_string(path).unwrap();
+        let case = src.find("        case PLOW_DOP_GEMM_F32:").unwrap();
+        let prefill = src.find("#if PLOW_BUCKET_PREFILL || PLOW_MIXED_STEP").unwrap();
+        assert!(
+            case < prefill,
+            "decode router must not silently leave zero logits"
+        );
+    }
+
+    #[test]
+    fn paired_batched_decode_arms_grouped_experts() {
+        let src = include_str!("../../../runtime/amd/interp.hip");
+        let guard = src.find("#if PLOW_BUCKET_DECODE && PLOW_DECODE_INVENTORY_PRUNE && \\\n").unwrap();
+        let enabled = src[guard..].find("\n#define PLOW_MOE_PREFILL 1").unwrap() + guard;
+        for op in ["MOE_ROUTER_TOPK_PF", "MOE_ALIGN_PF", "MOE_GROUP_GLU_PF",
+                   "MOE_GROUP_DOWN_PF", "MOE_COMBINE_PF"] {
+            assert!(src[guard..enabled].contains(&format!("PLOW_HAS_{op}")));
+        }
+        let capability = src.find("#if PLOW_MOE_PREFILL\nextern").unwrap();
+        assert!(guard < capability);
+        assert_eq!(src.matches("#ifndef PLOW_MOE_PREFILL\n").count(), 1);
     }
 
     #[test]
@@ -4513,6 +4611,11 @@ mod tests {
         assert_eq!(man["lean"]["verified"], json!(true));
         assert_eq!(man["lean"]["oracle"], json!(true));
         assert_eq!(man["lean"]["reason"], Value::Null);
+        assert_eq!(man["lean"]["qualification"], json!({
+            "floating_point_implementation": false,
+            "memory_effect_completeness": false,
+            "empirical_performance": false,
+        }));
     }
 
     /// The two subsystems are INDEPENDENT (Correction 1). Disabling the

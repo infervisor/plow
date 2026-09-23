@@ -33,6 +33,8 @@ def parse_args():
                    help="override only the RMSNorm IR provider; keep compilation defaults")
     p.add_argument("--language-model-only", action="store_true")
     p.add_argument("--quantization", choices=["fp8"])
+    p.add_argument("--precision-report", action="store_true",
+                   help="inventory loaded tensor dtypes and selected quantization paths on every rank")
     return p.parse_args()
 
 
@@ -43,7 +45,7 @@ def case_id(value):
     return value
 
 
-def engine_overrides(disable_cuda_graphs=False, rms_norm_provider=None):
+def engine_overrides(disable_cuda_graphs=False, rms_norm_provider=None, precision_inventory=False):
     overrides = {}
     if disable_cuda_graphs:
         overrides["compilation_config"] = {"cudagraph_mode": "NONE"}
@@ -53,6 +55,8 @@ def engine_overrides(disable_cuda_graphs=False, rms_norm_provider=None):
         overrides["kernel_config"] = {
             "ir_op_priority": {"rms_norm": [rms_norm_provider]},
         }
+    if precision_inventory:
+        overrides["worker_extension_cls"] = "vllm_logit_oracle.PrecisionInventoryWorker"
     return overrides
 
 
@@ -165,6 +169,90 @@ def generation_rows(cid, prompt_ids, generated_ids, output_tokens):
     return rows
 
 
+def model_precision_inventory(model):
+    import dataclasses
+    import enum
+    import hashlib
+    import inspect
+    from pathlib import Path
+
+    import torch
+
+    fields = (
+        "dtype", "out_dtype", "params_dtype", "kv_cache_dtype", "scale_fmt",
+        "quant_block_size", "weight_block_size", "weight_group_shape", "block_shape",
+        "activation_quant_key", "weight_quant_key", "quant_dtype", "weight_quant_dtype",
+        "apply_input_quant", "use_triton", "use_ue8m0", "static", "group_shape",
+        "num_fused_shared_experts", "num_experts", "num_local_experts", "top_k",
+        "is_aiter_triton_fp8_bmm_enabled", "is_aiter_triton_fp4_bmm_enabled",
+        "quant_method", "quant_config", "moe_quant_config", "fp8_backend",
+        "fp8_linear", "quant_fp8", "moe_kernel", "fused_experts", "impl", "config",
+    )
+    sources = {}
+
+    def class_name(value):
+        cls = type(value)
+        name = f"{cls.__module__}.{cls.__qualname__}"
+        if name not in sources:
+            try:
+                path = Path(inspect.getfile(cls))
+                sources[name] = dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            except (OSError, TypeError):
+                sources[name] = dict(source_unavailable=True)
+        return name
+
+    def tensor(value):
+        return dict(dtype=str(value.dtype), shape=list(value.shape), stride=list(value.stride()),
+                    device_type=value.device.type, bytes=value.numel() * value.element_size())
+
+    def describe(value, depth=0):
+        if isinstance(value, torch.Tensor):
+            return tensor(value)
+        if isinstance(value, torch.dtype):
+            return str(value)
+        if isinstance(value, enum.Enum):
+            return str(value)
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if depth >= 6:
+            return dict(class_name=class_name(value), truncated=True)
+        if isinstance(value, (list, tuple)):
+            return [describe(item, depth + 1) for item in value]
+        if isinstance(value, dict):
+            return {str(key): describe(item, depth + 1) for key, item in value.items()}
+        names = [f.name for f in dataclasses.fields(value)] if dataclasses.is_dataclass(value) else fields
+        return dict(class_name=class_name(value), fields={
+            name: describe(getattr(value, name), depth + 1) for name in names if hasattr(value, name)
+        })
+
+    modules = {}
+    for name, module in model.named_modules():
+        tensors = dict(module.named_parameters(recurse=False))
+        tensors.update(module.named_buffers(recurse=False))
+        # MLA derived weights and bound caches are not necessarily registered buffers.
+        tensors.update({key: value for key, value in vars(module).items() if isinstance(value, torch.Tensor)})
+        modules[name] = dict(class_name=class_name(module), tensors={
+            key: tensor(value) for key, value in sorted(tensors.items())
+        }, attributes={key: describe(getattr(module, key)) for key in fields if hasattr(module, key)})
+    return dict(rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+                modules=modules, sources=sources)
+
+
+def precision_report(ranks, expected_ranks):
+    if len(ranks) != expected_ranks or sorted(r["rank"] for r in ranks) != list(range(expected_ranks)):
+        raise ValueError("precision inventory requires exactly one report per rank")
+    if any(not r["modules"] for r in ranks):
+        raise ValueError("precision inventory contains an empty model")
+    return dict(schema=1, producer="vllm-loaded-model-inventory", precision_qualified=False,
+                scope="loaded tensor metadata and selected configuration; not a runtime arithmetic trace",
+                ranks=sorted(ranks, key=lambda r: r["rank"]))
+
+
+class PrecisionInventoryWorker:
+    def precision_inventory(self):
+        return model_precision_inventory(self.model_runner.model)
+
+
 def main():
     args = parse_args()
     request = json.loads(args.cases.read_text())
@@ -194,7 +282,7 @@ def main():
         logprobs_mode="raw_logits",
         language_model_only=args.language_model_only,
         quantization=args.quantization,
-        **engine_overrides(args.disable_cuda_graphs, args.rms_norm_provider),
+        **engine_overrides(args.disable_cuda_graphs, args.rms_norm_provider, args.precision_report),
     )
     effective_compile = llm.llm_engine.vllm_config.compilation_config
     effective_ir = llm.llm_engine.vllm_config.kernel_config.ir_op_priority
@@ -210,6 +298,9 @@ def main():
     )
 
     args.output.mkdir(parents=True, exist_ok=True)
+    if args.precision_report:
+        inventory = precision_report(llm.collective_rpc("precision_inventory"), args.tp)
+        (args.output / "precision.json").write_text(json.dumps(inventory, indent=2) + "\n")
     manifest = {
         "schema": 1,
         "producer": "vllm-public-raw-logits",
@@ -239,6 +330,7 @@ def main():
         },
         "language_model_only": args.language_model_only,
         "quantization": args.quantization,
+        "precision_report": "precision.json" if args.precision_report else None,
         "hf_vocab_size": llm.model_config.hf_text_config.vocab_size,
         "final_logit_softcapping": getattr(llm.model_config.hf_text_config, "final_logit_softcapping", None),
         "suppression": suppression,

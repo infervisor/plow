@@ -55,6 +55,11 @@ use crate::{Result, RuntimeError};
 /// mock in the unit tests. Teardown-side calls are infallible by design
 /// (Drop has no error channel; implementations log).
 pub trait VmmOps: Send + Sync {
+    fn allocation_provenance(
+        &self, _va: u64, _bytes: u64,
+    ) -> Option<crate::device::provenance::MemoryRegion> {
+        None
+    }
     /// Physical allocation granularity (recommended; 2 MiB measured).
     fn granularity(&self) -> Result<u64>;
     /// Reserve a VA range (no physical backing).
@@ -3442,6 +3447,17 @@ impl VmmSlab {
         self.bytes == 0
     }
 
+    pub fn view(&self, offset: u64, bytes: u64) -> Result<crate::device::DeviceMem> {
+        let end = offset.checked_add(bytes).filter(|end| *end <= self.bytes)
+            .ok_or_else(|| RuntimeError::Rejected("VMM slab view out of bounds".into()))?;
+        let va = self.va.checked_add(offset)
+            .ok_or_else(|| RuntimeError::Rejected("VMM slab view address overflow".into()))?;
+        self.wait_mapped(end)?;
+        Ok(crate::device::DeviceMem::mapped_view(
+            va, bytes, self.ops.allocation_provenance(va, bytes),
+        ))
+    }
+
     /// Block until `[base, base+upto)` is mapped and device-accessible.
     /// Propagates the mapper's commit error (OOM mid-slab is fatal to the
     /// load — views were already carved, there is nothing to fall back to).
@@ -3986,6 +4002,7 @@ mod tests {
     /// fail (the OOM path).
     #[derive(Default)]
     struct MockVmm {
+        provenance: Mutex<crate::device::provenance::VmmProvenance>,
         next: AtomicU64,
         granularity: AtomicU64,
         reserves: AtomicU64,
@@ -4035,6 +4052,9 @@ mod tests {
     }
 
     impl VmmOps for MockVmm {
+        fn allocation_provenance(&self, va: u64, bytes: u64) -> Option<crate::device::provenance::MemoryRegion> {
+            self.provenance.lock().region(va, bytes)
+        }
         fn granularity(&self) -> Result<u64> {
             Ok(self.granularity.load(Ordering::SeqCst).max(16))
         }
@@ -4051,20 +4071,23 @@ mod tests {
         fn address_free(&self, _va: u64, _bytes: u64) {
             self.address_frees.fetch_add(1, Ordering::SeqCst);
         }
-        fn create(&self, _bytes: u64) -> Result<u64> {
+        fn create(&self, bytes: u64) -> Result<u64> {
             self.lag(0);
             if self.fail_creates.fetch_sub(1, Ordering::SeqCst) > 0 {
                 return Err(RuntimeError::Oom("mock OOM".into()));
             }
             self.fail_creates.fetch_add(1, Ordering::SeqCst); // clamp at <=0
             self.creates.fetch_add(1, Ordering::SeqCst);
-            Ok(self.next.fetch_add(1, Ordering::SeqCst))
+            let handle = self.next.fetch_add(1, Ordering::SeqCst);
+            self.provenance.lock().created(handle, bytes);
+            Ok(handle)
         }
-        fn release(&self, _handle: u64) {
+        fn release(&self, handle: u64) {
             self.lag(0);
+            self.provenance.lock().released(handle);
             self.releases.fetch_add(1, Ordering::SeqCst);
         }
-        fn map(&self, va: u64, _bytes: u64, _handle: u64) -> Result<()> {
+        fn map(&self, va: u64, bytes: u64, handle: u64) -> Result<()> {
             let hook = self.map_hook.lock().unwrap().take();
             if let Some(hook) = hook {
                 hook();
@@ -4081,10 +4104,12 @@ mod tests {
             if self.strict.load(Ordering::SeqCst) && !self.mapped.lock().unwrap().insert(va) {
                 self.violations.fetch_add(1, Ordering::SeqCst);
             }
+            self.provenance.lock().mapped(va, bytes, handle);
             Ok(())
         }
-        fn unmap(&self, va: u64, _bytes: u64) {
+        fn unmap(&self, va: u64, bytes: u64) {
             self.lag(1);
+            self.provenance.lock().unmapped(va, bytes);
             self.unmaps.fetch_add(1, Ordering::SeqCst);
             if self.strict.load(Ordering::SeqCst) && !self.mapped.lock().unwrap().remove(&va) {
                 self.violations.fetch_add(1, Ordering::SeqCst);
@@ -5646,7 +5671,14 @@ mod tests {
         slab.wait_mapped(100).expect("mapped");
         assert_eq!(ops.creates.load(Ordering::SeqCst), 4);
         assert_eq!(ops.maps.load(Ordering::SeqCst), 4);
+        let view = slab.view(16, 64).unwrap();
+        let evidence = view.allocation_evidence().unwrap();
+        assert_eq!(evidence.len(), 3);
+        assert_eq!(evidence.iter().map(|r| r.bytes).sum::<u64>(), 64);
+        assert!(slab.view(96, 5).is_err());
+        assert!(slab.view(u64::MAX, 1).is_err());
         drop(slab);
+        assert!(view.allocation_evidence().is_none());
         assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4);
         assert_eq!(ops.releases.load(Ordering::SeqCst), 4);
     }
@@ -5689,6 +5721,45 @@ mod tests {
         assert!(ops.pool.lock().unwrap().is_empty(), "pool drained");
         drop(slab); // PLOW_SLAB_KEEP unset → all four released
         assert_eq!(ops.releases.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn slab_provenance_preserves_pooled_physical_identity_not_old_binding() {
+        let ops = Arc::new(MockVmm::default());
+        let handle = ops.create(64).unwrap();
+        let va = ops.reserve(64).unwrap();
+        ops.map(va, 64, handle).unwrap();
+        let old = ops.allocation_provenance(va, 64).unwrap();
+        let before = old.evidence(va, 64).unwrap();
+        ops.unmap(va, 64);
+        ops.address_free(va, 64);
+        ops.pool_put(vec![(handle, 64)]);
+        let slab = VmmSlab::new(ops.clone(), 64, 64).unwrap();
+        let view = slab.view(0, 64).unwrap();
+        let after = view.allocation_evidence().unwrap();
+        assert_eq!(before[0].physical_id, after[0].physical_id);
+        assert_ne!(before[0].binding_generation, after[0].binding_generation);
+        assert!(old.evidence(va, 64).is_none());
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 1);
+        drop(slab);
+        assert!(view.allocation_evidence().is_none());
+    }
+
+    #[test]
+    fn slab_provenance_driver_failures_never_publish_a_carve() {
+        for fail_access in [false, true] {
+            let ops = Arc::new(MockVmm::default());
+            if fail_access {
+                ops.fail_access.store(1, Ordering::SeqCst);
+            } else {
+                ops.fail_maps.store(1, Ordering::SeqCst);
+            }
+            let slab = VmmSlab::new(ops.clone(), 64, 16).unwrap();
+            assert!(slab.view(0, 16).is_err());
+            assert!(ops.allocation_provenance(slab.base(), 16).is_none());
+            drop(slab);
+            assert_eq!(ops.creates.load(Ordering::SeqCst), ops.releases.load(Ordering::SeqCst));
+        }
     }
 
     /// Spin until the pre-creator has parked `want` blocks (it runs on its
