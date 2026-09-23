@@ -125,6 +125,20 @@ __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_b
      * 19.029 -> 19.035 (+0.03%). Nothing. Whatever costs B=32 its bandwidth (1.74 TB/s against
      * 2.20 at B=1 on the same 23.8 GB) is not the activation re-read.
      *
+     * NOR IS IT TENSOR-CORE ISSUE — wgmma would buy nothing. Same method, same two-real-packet
+     * setup: skipping the .z/.w half of every k32 step halves the mma count (8 -> 4 per step per
+     * warp at MT=2/NW=2) with every global load unchanged. B=32 ctx 128 13.677 -> 13.689 ms
+     * (+0.09%), ctx 8192 19.036 -> 19.036 (0.00%).
+     *
+     * SO THE BATCHING COST IS NOT IN THIS WALK. The weight stream is byte-identical between B=1
+     * and B=32 (gvmma_partition depends on N and nblk, not on rows), and the only two things that
+     * do change here — activation loads and mma count — are both free. The ~3 ms that B=32 adds
+     * over B=1 is per-ROW work elsewhere in the decode step (attention, norms, KV writes,
+     * sampling), which is where a batched-decode optimisation has to go. Consistent with the
+     * rungs: B=1 -> B=16 costs 0.057 ms/row at constant MT=1, which extrapolates to 12.49 ms at
+     * 32 rows against 13.691 measured, leaving ~1.2 ms for the MT=1 -> MT=2 transition of which
+     * the prefetch-depth fix above already recovered ~0.5.
+     *
      * DO NOT re-tune this with scripts/build_sm90a_cubin.sh. That path never defines
      * PLOW_NV_GEMV_MMA_PAIR or _B1 (decode object SHARED:14480), while every packet sets both to
      * 1 from manifest.rs (SHARED:40464). With PAIR=1 the plain GEMV walks two ROW BLOCKS as NW=2,
