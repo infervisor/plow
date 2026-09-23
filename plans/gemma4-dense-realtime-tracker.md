@@ -2087,3 +2087,48 @@ Cheapest guard, and it needs no kernel work: every prefill rung in a packet shou
 segment count, so assert that parity at emit (or in the doctor's artifact stage). That converts a
 59-minute silent lease burn into a build-time refusal. NOT implemented here — recorded for the
 user, because it is a production-emit change outside this campaign's scope.
+
+## FP8 kernel selection: plow-native only, and it is the arm BF16 rejected
+
+User question, 2026-09-23: "are we cublas or plow native ... based on actual run plow is picking
+the kernels". Answered from the BUILT packet (`/opt/dlami/nvme/tmp/fp8-campaign/p12fp8a/assets/
+build.json`, `$CLAUDE_JOB_DIR/tmp/sched/fp8_kernels.py`), not from the recipe.
+
+plow FP8 emits **zero** cuBLAS/cuBLASLt. Arm inventory of the 12B W8A8 packet (2416 programs):
+`QuantFp8` 960, `GemmFp8` 912, `RmsNorm` 486, `NormResidual` 480, `HeadNormRope/hd256` 201,
+`FlashPrefill/hd256` 200, `Glu` 192, `GemmGluFp8` 48, `Gemm` (BF16) 5, plus one each of
+`GemvFp8` / `GemvGluFp8` / `FlashDecode` / `FlashMerge` for the B=1 decode. No `lt_algos`, no Lt
+glue.
+
+It is structurally forced, not a selection. `lib.rs:7950` asserts `prefill_cublaslt` requires
+`!any_fp8_weights() && !mxfp4` — "cuBLASLt prefill emission requires Gemma 4 BF16 on single-GPU
+SM90" — and the BF16 `gemma4_sm90_gemm_glu_role` carries the same guard. FP8 routes to its own
+`gemma4_sm90_w8a8_gemm_glu_role` instead.
+
+**Consequence: the FP8 prefill path is the arm BF16 measured as SLOWER.** `LT_GLU_QUALIFIED`
+records that gate/up as two cuBLASLt GEMMs plus a GeGLU pass beat the fused GLU role at every
+bucket Lt covers, which is exactly why `prefill_cublaslt` and `no_glu_fuse` are production
+defaults in BF16. FP8 cannot reach that route. On top of that it pays ~one `QuantFp8` per GEMM
+(960 vs 912) for dynamic per-token activation quantization, which BF16 never pays. Add the four
+decode knobs the `bf16` gate silently drops (recorded above) and the FP8 arms are functionally
+complete but have had none of BF16's kernel-selection tuning — the measurement campaign only ever
+ran BF16.
+
+### The vLLM FP8 bar (measured, gate-passed)
+
+12B C1, `--quantization compressed-tensors --kv-cache-dtype auto` (BF16 KV, matching plow):
+
+| metric | vLLM BF16 | vLLM FP8 | FP8 gain |
+|--------|-----------|----------|----------|
+| TPOT | 10.56 ms | **7.38 ms** | 1.43x |
+| TTFT @128 | 30.04 ms | 30.19 ms | — |
+| TTFT @15000 | 671.8 ms | **548.1 ms** | 1.23x |
+| tok/s @15000 | 63.6 | **86.0** | 1.35x |
+
+vLLM's FP8 KV cache is 183,113 tokens (11.18x concurrency at 16384/request) because FP8 weights
+free ~12 GB — a genuine FP8 benefit, but it means the C32/15000 cell measures admission, not decode.
+
+plow BF16 decode was at PARITY with vLLM BF16 (`itl_med` 0.98-1.09x across all 20 cells), so vLLM
+FP8 at 7.38 ms now sits well under plow's ~10.4 ms BF16. Beating vLLM on FP8 requires plow FP8
+decode under 7.38 ms while running `GemvFp8` at B=1 only, without the dropped decode defaults, and
+with no Lt fallback. That is the real gap, and it is a kernel-tuning gap, not a feature gap.
