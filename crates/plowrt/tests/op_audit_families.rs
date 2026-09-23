@@ -414,6 +414,36 @@ fn recurrent_gdn_decode_is_class_b_and_its_prefill_is_class_d() {
 }
 
 // ---------------------------------------------------------------------------
+// Encoders — BERT & ModernBERT
+// ---------------------------------------------------------------------------
+
+const BERT: &str = r#"{
+  "model_type": "bert",
+  "hidden_size": 512, "intermediate_size": 1024, "num_hidden_layers": 2,
+  "num_attention_heads": 8, "head_dim": 64,
+  "layer_norm_eps": 1e-12, "vocab_size": 4096, "tie_word_embeddings": true
+}"#;
+
+const MODERNBERT: &str = r#"{
+  "model_type": "modernbert",
+  "hidden_size": 512, "intermediate_size": 1024, "num_hidden_layers": 2,
+  "num_attention_heads": 8, "head_dim": 64, "num_key_value_heads": 8,
+  "norm_eps": 1e-5, "vocab_size": 4096, "sliding_window": 128,
+  "global_rope_theta": 160000.0, "tie_word_embeddings": true
+}"#;
+
+#[test]
+fn bert_and_modernbert_are_classified() {
+    let _g = emit_guard();
+    for (name, cfg) in [("bert", BERT), ("modernbert", MODERNBERT)] {
+        let blob = blob_for(name, cfg, 512);
+        let (pf, dec) = audits(&blob);
+        assert_everything_is_classified(&pf, name);
+        assert_everything_is_classified(&dec, name);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The shipped blobs on this host, when they are present. Opt-in because they are
 // 80 MB and 226 MB and are not in the repository.
 // ---------------------------------------------------------------------------

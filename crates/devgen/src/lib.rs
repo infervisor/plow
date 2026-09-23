@@ -1995,7 +1995,7 @@ fn declare(
     let kd_max =
         (kvh_local(c.kvh_slide, tp, 0) * c.hd_slide).max(kvh_local(c.kvh_full, tp, 0) * c.hd_full);
     let hd_max = c.hd_slide.max(c.hd_full);
-    let inter_sh = c.inter / tp;
+    let inter_sh = c.max_inter() / tp; // scratch/activation sized to the widest layer (E2B double-wide)
     // lm_head is REPLICATED under TP here, not vocab-sharded. ONE reason is left, and it is
     // specific to THIS emitter: Gemma TIES lm_head to embed_tokens, and the emitted lm_head Gemv
     // reads `emb` from offset 0 with no per-rank vocab offset, so a vocab shard would make every
@@ -2359,6 +2359,8 @@ fn declare(
         // indexes them by absolute `l`). Full model => in_block always true =>
         // byte-identical allocation.
         let in_block = block.contains(&(l as usize));
+        // Per-layer dense-MLP width: E2B doubles it on the trailing KV-shared layers.
+        let inter_l = c.inter_for_layer(l as usize) / tp;
         let full = c.is_full[l as usize];
         // MIXED fp8-KV (PLOW_FP8_KV_FULL=1, beat-fp8-mma): e4m3 cache on the hd512 FULL layers
         // only. Sliding rings are window-bounded (tiny), so fp8 buys them nothing; keeping them
@@ -2568,9 +2570,9 @@ fn declare(
             bk: bias(b, "self_attn.k_proj.weight", kd as u64 * c.hidden as u64),
             bv: bias(b, "self_attn.v_proj.weight", kd as u64 * c.hidden as u64),
             bo: bias(b, "self_attn.o_proj.weight", c.hidden as u64 * qd as u64),
-            bg: bias(b, "mlp.gate_proj.weight", inter_sh as u64 * c.hidden as u64),
-            bu: bias(b, "mlp.up_proj.weight", inter_sh as u64 * c.hidden as u64),
-            bd: bias(b, "mlp.down_proj.weight", c.hidden as u64 * inter_sh as u64),
+            bg: bias(b, "mlp.gate_proj.weight", inter_l as u64 * c.hidden as u64),
+            bu: bias(b, "mlp.up_proj.weight", inter_l as u64 * c.hidden as u64),
+            bd: bias(b, "mlp.down_proj.weight", c.hidden as u64 * inter_l as u64),
             wq: wproj(b, "self_attn.q_proj.weight", (qd * c.hidden) as u64 * BF16),
             wk: if shared {
                 TENSOR_NONE
@@ -2589,16 +2591,16 @@ fn declare(
             wg: wproj(
                 b,
                 "mlp.gate_proj.weight",
-                (inter_sh * c.hidden) as u64 * BF16,
+                (inter_l * c.hidden) as u64 * BF16,
             ),
-            wu: wproj(b, "mlp.up_proj.weight", (inter_sh * c.hidden) as u64 * BF16),
+            wu: wproj(b, "mlp.up_proj.weight", (inter_l * c.hidden) as u64 * BF16),
             wd: wproj(
                 b,
                 "mlp.down_proj.weight",
-                (c.hidden * inter_sh) as u64 * BF16,
+                (c.hidden * inter_l) as u64 * BF16,
             ),
             // fp8 twins (numel bytes) + scales ([out] f32). k_eq_v layers have no v_proj to quantize.
-            // Dims use the TP-sharded shard extents (qd/kd/inter_sh); at tp==1 these equal the full
+            // Dims use the TP-sharded shard extents (qd/kd/inter_l); at tp==1 these equal the full
             // extents, so the single-GPU fp8 pkt is unaffected by the TP structure.
             wq8: w8(b, "self_attn.q_proj.weight", (qd * c.hidden) as u64),
             wk8: if shared {
@@ -2612,9 +2614,9 @@ fn declare(
                 w8(b, "self_attn.v_proj.weight", (kd * c.hidden) as u64)
             },
             wo8: w8(b, "self_attn.o_proj.weight", (c.hidden * qd) as u64),
-            wg8: w8(b, "mlp.gate_proj.weight", (inter_sh * c.hidden) as u64),
-            wu8: w8(b, "mlp.up_proj.weight", (inter_sh * c.hidden) as u64),
-            wd8: w8(b, "mlp.down_proj.weight", (c.hidden * inter_sh) as u64),
+            wg8: w8(b, "mlp.gate_proj.weight", (inter_l * c.hidden) as u64),
+            wu8: w8(b, "mlp.up_proj.weight", (inter_l * c.hidden) as u64),
+            wd8: w8(b, "mlp.down_proj.weight", (c.hidden * inter_l) as u64),
             sq: sc(
                 b,
                 "self_attn.q_proj.weight",
@@ -2650,20 +2652,20 @@ fn declare(
             sg: sc(
                 b,
                 "mlp.gate_proj.weight",
-                inter_sh as u64,
-                (inter_sh * c.hidden) as u64,
+                inter_l as u64,
+                (inter_l * c.hidden) as u64,
             ),
             su: sc(
                 b,
                 "mlp.up_proj.weight",
-                inter_sh as u64,
-                (inter_sh * c.hidden) as u64,
+                inter_l as u64,
+                (inter_l * c.hidden) as u64,
             ),
             sd: sc(
                 b,
                 "mlp.down_proj.weight",
                 c.hidden as u64,
-                (c.hidden * inter_sh) as u64,
+                (c.hidden * inter_l) as u64,
             ),
             g_in: w(b, "input_layernorm.weight", c.hidden as u64 * BF16),
             g_pa: w(b, "post_attention_layernorm.weight", c.hidden as u64 * BF16),
@@ -3781,7 +3783,8 @@ fn emit_phase(
     // intermediate- and vocab-dimensioned op runs 1/N wide, and o_proj/down get an XReduce.
     let tp = c.tp;
     let heads = c.heads / tp; // this rank's q-heads
-    let inter_l = c.inter / tp; // this rank's gate/up/down intermediate lanes
+    // inter_l is per-layer (E2B doubles the dense MLP on trailing KV-shared layers); defined inside
+    // the layer loop below as `c.inter_for_layer(l) / tp`.
     let vocab_l = c.vocab; // lm_head REPLICATED under TP (Phase 2); see declare() note above
     let mut xgate: u32 = 0; // xctr gate-id allocator for XReduce (unique per collective)
                             // XReduce runs on a REDUCED CU set (F-lever). The all-reduce is a
@@ -4334,6 +4337,8 @@ fn emit_phase(
         // KV sharing (E-series): no k/v projection, norm or cache write; attention reads the
         // source layer's cache (`n.kc[l]` aliases it, see declare()).
         let shared = c.kv_is_shared(l);
+        // Per-layer dense-MLP width: E2B doubles it on the trailing KV-shared layers.
+        let inter_l = c.inter_for_layer(l) / tp;
         // MIXED fp8-KV (PLOW_FP8_KV_FULL=1): per-layer effective flag — see declare(). Ops keyed
         // on it (HeadNormRope[Fp8], FlashDecode[Fp8], FlashPrefill[Fp8], the fp8-tuned nsplit
         // gates) all follow the LAYER's cache dtype.
@@ -4427,7 +4432,14 @@ fn emit_phase(
         // kernel must agree (dev_isa.h). GF=2 fuses sliding layers fully (GQA 2) and full layers
         // partially (GQA 8 -> reads each row 4x). Under tp=8 shared-kv-head replication a full layer
         // is GQA 4 locally, still a clean multiple of GF=2. The binding invariant is gqa_local % GF.
-        let gf = if full { fa_gf_full() } else { 2 };
+        let gqa = heads / kvh;
+        let gf = if gqa < 2 {
+            1
+        } else if full {
+            fa_gf_full().min(gqa)
+        } else {
+            2.min(gqa)
+        };
         assert_eq!(
             (heads / kvh) % gf,
             0,
@@ -6649,8 +6661,12 @@ fn gemv_split() -> u32 {
 
 /// E5 (rtx-19): PLOW_FUSE_ARGMAX fuses the greedy-argmax epilogue into the lm_head GEMV
 /// (`DevOp::GemvArgmax`), replacing the `SoftCap` + `Argmax` packets. Default off → byte-identical.
+///
+/// The Apple/Metal interpreter has no `GemvArgmax` (op 80) arm, so a fused decode faults with
+/// `unimplemented op` (see runtime/apple/interp.metal). The knob defaulted on in the gemma4
+/// campaign merge; force it off for the Metal target so E2B decode keeps running there.
 fn fuse_argmax_on() -> bool {
-    emit_config::active().fuse_argmax
+    emit_config::active().fuse_argmax && !emit_is_apple()
 }
 
 /// MXFP4 tied lm_head (`PLOW_MX4_HEAD`). Default ON under `--mxfp4`: the mxfp4 twin already
@@ -9401,6 +9417,11 @@ fn emit_dense_gqa(
     if block_mode || ecfg.block_packets || ecfg.pf_modular {
         let is_sandwich = c.arch.is_gemma();
         let mut modular_progs = Vec::new();
+        let ffn_kind = if c.moe {
+            plow_asset::ModularBlockKind::Moe
+        } else {
+            plow_asset::ModularBlockKind::DenseFfn
+        };
         for (i, &t) in buckets.iter().enumerate() {
             modular_progs.push(modular::create_modular_block_prog(
                 plow_asset::ModularBlockKind::DenseAttention,
@@ -9413,14 +9434,14 @@ fn emit_dense_gqa(
                 false,
             ));
             modular_progs.push(modular::create_modular_block_prog(
-                plow_asset::ModularBlockKind::DenseFfn,
+                ffn_kind,
                 plow_asset::ModularPhase::Prefill,
                 i as u32,
                 t,
                 None,
                 false,
                 is_sandwich,
-                false,
+                c.moe,
             ));
         }
         modular_progs.push(modular::create_modular_block_prog(
@@ -9434,14 +9455,14 @@ fn emit_dense_gqa(
             false,
         ));
         modular_progs.push(modular::create_modular_block_prog(
-            plow_asset::ModularBlockKind::DenseFfn,
+            ffn_kind,
             plow_asset::ModularPhase::Decode,
             buckets.len() as u32,
             dbatch,
             None,
             false,
             is_sandwich,
-            false,
+            c.moe,
         ));
         let manifest = modular::build_modular_manifest(c.layers, modular_progs, &buckets, &[dbatch]);
         sections.push(modular::modular_pipeline_section(&manifest));

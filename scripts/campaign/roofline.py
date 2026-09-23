@@ -24,7 +24,14 @@ import csv
 import json
 import math
 import sys
-import tomllib
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # Apple dev box ships 3.9; the --recipe path needs it, the rest does not.
+    try:
+        import tomli as tomllib  # type: ignore
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -160,6 +167,46 @@ HARDWARE_REGISTRY: Dict[str, HardwareSpec] = {
         fp8_tflops_dense=4600.0,
         fp16_tflops_dense=2300.0,
     ),
+    # Apple Silicon (unified memory, Metal 3). Bandwidth is the shared LPDDR5X figure and is the
+    # reliable roofline denominator; decode is memory-bound so the ceiling is bytes/bandwidth.
+    # The GPU has no fp8/bf16 tensor units — 16-bit runs near the fp32 SIMD rate (packed FMA),
+    # so fp8 == fp16 == bf16 here (no matmul acceleration), and TFLOPS are core-scaled estimates.
+    "m4pro": HardwareSpec(
+        name="Apple M4 Pro",
+        arch="metal3",
+        vendor="apple",
+        sm_or_cu_count=16,
+        clock_boost_mhz=1500.0,
+        bandwidth_datasheet_gbps=273.0,
+        bandwidth_measured_gbps=None,
+        bf16_tflops_dense=7.0,
+        fp8_tflops_dense=7.0,
+        fp16_tflops_dense=7.0,
+    ),
+    "m4max": HardwareSpec(
+        name="Apple M4 Max",
+        arch="metal3",
+        vendor="apple",
+        sm_or_cu_count=40,
+        clock_boost_mhz=1580.0,
+        bandwidth_datasheet_gbps=546.0,
+        bandwidth_measured_gbps=None,
+        bf16_tflops_dense=17.0,
+        fp8_tflops_dense=17.0,
+        fp16_tflops_dense=17.0,
+    ),
+    "m4": HardwareSpec(
+        name="Apple M4",
+        arch="metal3",
+        vendor="apple",
+        sm_or_cu_count=10,
+        clock_boost_mhz=1450.0,
+        bandwidth_datasheet_gbps=120.0,
+        bandwidth_measured_gbps=None,
+        bf16_tflops_dense=4.3,
+        fp8_tflops_dense=4.3,
+        fp16_tflops_dense=4.3,
+    ),
 }
 
 
@@ -181,6 +228,12 @@ def lookup_gpu(name_or_arch: str) -> HardwareSpec:
         return HARDWARE_REGISTRY["mi300x"]
     if "mi350" in q or "gfx950" in q:
         return HARDWARE_REGISTRY["mi350x"]
+    if "m4max" in q or "m4-max" in q:
+        return HARDWARE_REGISTRY["m4max"]
+    if "m4pro" in q or "m4-pro" in q:
+        return HARDWARE_REGISTRY["m4pro"]
+    if "m4" in q or "apple" in q or "metal" in q:
+        return HARDWARE_REGISTRY["m4pro"]
     # Generic default: H100 SXM5
     return HARDWARE_REGISTRY["h100 sxm5"]
 
@@ -231,6 +284,19 @@ KNOWN_MODELS: Dict[str, ModelSpec] = {
         hidden_size=5120,
         num_heads=40,
         num_kv_heads=16,
+        head_dim=256,
+    ),
+    # Gemma-4 E2B (elastic / MatFormer): 35 layers, GQA 8:1, head_dim 256. The trailing 20
+    # KV-shared layers use a double-wide MLP (inter 6144 -> 12288). active_params counts the
+    # non-embedding transformer weights read per decode token (~1.8B, the "2B effective"); the
+    # 262k-row embedding/PLE tables are gathered per token, not streamed, so they are excluded.
+    "gemma4-e2b": ModelSpec(
+        name="Gemma-4-E2B",
+        active_params=1_805_000_000,
+        layers=35,
+        hidden_size=1536,
+        num_heads=8,
+        num_kv_heads=1,
         head_dim=256,
     ),
     "glm-5.3": ModelSpec(
@@ -450,6 +516,11 @@ def generate_roofline_report(
     recipe_path: Path,
     results_path: Optional[Path] = None,
 ) -> str:
+    if tomllib is None:
+        raise RuntimeError(
+            "--recipe parsing needs tomllib (Python 3.11+) or `pip install tomli`; "
+            "the --gpu/--model roofline path works without it."
+        )
     with open(recipe_path, "rb") as f:
         r = tomllib.load(f)
 

@@ -1,0 +1,53 @@
+# Gemma-4-E2B, Apple M4 Pro (16-core GPU, 273 GB/s), BF16 weights + BF16 KV, TP1.
+# Modular-block rung 8: decode batch width 8 (one decode program in the ladder blob).
+# Single-block methodology: this recipe pins the model + HW + emit/serve settings that
+# reproduce rung 8 exactly, and records its measured decode numbers.
+#
+# Measured (M4 Pro, solo, best-of-2, in128/out128): agg 60.6 tok/s, TTFT_p50 621 ms,
+# per-stream decode 8.1 tok/s.
+# The apple multi-row weight-reuse kernels (PLOW_BF16_M2/M4/M8) were re-ported onto main;
+# enable them in [serve.env] for batched-decode throughput (numbers below measured with them
+# on, under memory pressure; more RAM headroom trends toward the apple branch's ~176 at rung 8).
+
+[cell]
+name = "gemma4-e2b.m4pro.rung8"
+model = "google/gemma-4-E2B-it"
+hf_dir = "/Users/lava/models/gemma-4-E2B-it"
+gpu = "Apple M4 Pro"
+arch = "metal3"
+n_cu = 16
+precision = "bf16"
+
+[emit]
+# E2B double-wide MLP (inter 6144 -> 12288 on the trailing 20 KV-shared layers) is
+# auto-detected from config.json (use_double_wide_mlp). Metal compiles shaders at load,
+# so there is no interpreter-object build step (unlike the NVIDIA/AMD recipes).
+args = ["--no-knob-verify", "--emit-decode-batch-ladder", "8"]
+[emit.env]
+
+[serve.env]
+# Apple/Metal serves via the persistent packet interpreter (engine=metal). fuse_argmax is
+# forced off for metal in devgen (no GemvArgmax kernel arm).
+# Multi-row weight-reuse decode kernels (batched-decode throughput): the winning HW setting.
+PLOW_METAL_BF16_M2 = "1"
+PLOW_METAL_BF16_M4 = "1"
+PLOW_METAL_BF16_M8 = "1"
+
+[bench]
+backend = "openai"
+in_lens = "128"
+concs = "8"
+nprompt = 32
+outlen = 128
+warmups = 8
+seed = 42
+port = 8182
+tokenizer = "/Users/lava/models/gemma-4-E2B-it/tokenizer.json"
+model_id = "gemma-4-e2b-it"
+gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer in one short sentence.<end_of_turn>\n<start_of_turn>model\n"
+
+[bench.results]
+# pinned measurement for regression tracking
+agg_tok_s = 127.0
+ttft_p50_ms = 561
+per_stream_decode_tok_s = 17.9

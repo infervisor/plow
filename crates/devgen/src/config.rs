@@ -19,11 +19,17 @@ pub(crate) enum Arch {
     /// emitter (`gptoss.rs`); never reaches the dense-GQA `Cfg` path.
     #[allow(dead_code)]
     GptOss,
+    Bert,
+    ModernBert,
 }
 
 impl Arch {
     pub(crate) fn is_gemma(self) -> bool {
         matches!(self, Self::Gemma3 | Self::Gemma4)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn is_bert(self) -> bool {
+        matches!(self, Self::Bert | Self::ModernBert)
     }
 }
 
@@ -221,6 +227,8 @@ pub(crate) struct Cfg {
     // non-shared layer of their type; 0 = none). See `dev_isa.h` op 155.
     pub(crate) ple: u32,
     pub(crate) kv_shared: u32,
+    // Gemma-4 E2B doubles the dense MLP width on the trailing KV-shared layers (`use_double_wide_mlp`).
+    pub(crate) double_wide_mlp: bool,
 }
 
 impl Cfg {
@@ -238,6 +246,22 @@ impl Cfg {
     }
     pub(crate) fn kv_is_shared(&self, l: usize) -> bool {
         self.kv_source(l) != l
+    }
+    /// Per-layer dense-MLP intermediate width. E2B doubles it on the trailing KV-shared layers.
+    pub(crate) fn inter_for_layer(&self, l: usize) -> u32 {
+        if self.double_wide_mlp && self.kv_is_shared(l) {
+            self.inter * 2
+        } else {
+            self.inter
+        }
+    }
+    /// Widest dense-MLP intermediate across all layers (scratch/activation sizing).
+    pub(crate) fn max_inter(&self) -> u32 {
+        if self.double_wide_mlp {
+            self.inter * 2
+        } else {
+            self.inter
+        }
     }
 }
 
@@ -265,8 +289,16 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
     let arch = match mt {
         "qwen3" => Arch::Qwen3,
         "llama" => Arch::Llama,
+        "bert" => Arch::Bert,
+        "modernbert" => Arch::ModernBert,
         other => panic!("unsupported model_type {other:?}"),
     };
+    if arch == Arch::Bert {
+        return cfg_bert(&v);
+    }
+    if arch == Arch::ModernBert {
+        return cfg_modernbert(&v);
+    }
     cfg_llama_qwen(&v, arch)
 }
 
@@ -366,6 +398,7 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         moe_inter: t["moe_intermediate_size"].as_u64().unwrap_or(0) as u32,
         ple: t["hidden_size_per_layer_input"].as_u64().unwrap_or(0) as u32,
         kv_shared: t["num_kv_shared_layers"].as_u64().unwrap_or(0) as u32,
+        double_wide_mlp: t["use_double_wide_mlp"].as_bool().unwrap_or(false),
     };
     if c.moe {
         crate::require_moe_topk(c.top_k, "gemma4 (enable_moe_block)");
@@ -469,6 +502,7 @@ fn cfg_gemma3(v: &Value) -> Cfg {
         moe_inter: 0,
         ple: 0,
         kv_shared: 0,
+        double_wide_mlp: false,
     }
 }
 
@@ -547,6 +581,107 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         moe_inter: 0,
         ple: 0,
         kv_shared: 0,
+        double_wide_mlp: false,
+    }
+}
+
+fn cfg_bert(v: &Value) -> Cfg {
+    let g = |k: &str| v[k].as_u64().unwrap() as u32;
+    let hidden = g("hidden_size");
+    let heads = g("num_attention_heads");
+    let hd = v["head_dim"].as_u64().map(|x| x as u32).unwrap_or(hidden / heads);
+    let layers = g("num_hidden_layers");
+    let eps = v["layer_norm_eps"].as_f64().unwrap_or(1e-12) as f32;
+    let vocab = g("vocab_size");
+    let inter = g("intermediate_size");
+    Cfg {
+        arch: Arch::Bert,
+        hidden,
+        inter,
+        layers,
+        heads,
+        hd_slide: hd,
+        hd_full: hd,
+        kvh_slide: heads,
+        kvh_full: heads,
+        window: 0,
+        eps,
+        vocab,
+        softcap: 0.0,
+        is_full: vec![true; layers as usize],
+        theta_slide: 10000.0,
+        theta_full: 10000.0,
+        rope_frac_full: 0.0,
+        rope_scale: RopeScale::None,
+        attn_scale: 1.0 / (hd as f32).sqrt(),
+        emb_scale: 1.0,
+        mlp_act: 0,
+        has_qk_norm: false,
+        has_v_norm: false,
+        k_eq_v: false,
+        tied: v["tie_word_embeddings"].as_bool().unwrap_or(true),
+        prefix: if v.get("bert").is_some() { "bert.".into() } else { "model.".into() },
+        encoder_overlay_rows: 0,
+        tp: 1,
+        moe: false,
+        n_exp: 0,
+        top_k: 0,
+        moe_inter: 0,
+        ple: 0,
+        kv_shared: 0,
+        double_wide_mlp: false,
+    }
+}
+
+fn cfg_modernbert(v: &Value) -> Cfg {
+    let g = |k: &str| v[k].as_u64().unwrap() as u32;
+    let hidden = g("hidden_size");
+    let heads = g("num_attention_heads");
+    let hd = v["head_dim"].as_u64().map(|x| x as u32).unwrap_or(hidden / heads);
+    let layers = g("num_hidden_layers");
+    let kvh = v["num_key_value_heads"].as_u64().map(|x| x as u32).unwrap_or(heads);
+    let eps = v["norm_eps"].as_f64().or_else(|| v["layer_norm_eps"].as_f64()).unwrap_or(1e-5) as f32;
+    let vocab = g("vocab_size");
+    let inter = g("intermediate_size");
+    let window = v["sliding_window"].as_u64().map(|x| x as u32).unwrap_or(128);
+    let theta = v["global_rope_theta"].as_f64().or_else(|| v["rope_theta"].as_f64()).unwrap_or(160000.0);
+    let is_full: Vec<bool> = (0..layers).map(|l| (l + 1) % 3 == 0).collect();
+    Cfg {
+        arch: Arch::ModernBert,
+        hidden,
+        inter,
+        layers,
+        heads,
+        hd_slide: hd,
+        hd_full: hd,
+        kvh_slide: kvh,
+        kvh_full: kvh,
+        window,
+        eps,
+        vocab,
+        softcap: 0.0,
+        is_full,
+        theta_slide: theta,
+        theta_full: theta,
+        rope_frac_full: 1.0,
+        rope_scale: RopeScale::None,
+        attn_scale: 1.0 / (hd as f32).sqrt(),
+        emb_scale: 1.0,
+        mlp_act: 0,
+        has_qk_norm: false,
+        has_v_norm: false,
+        k_eq_v: false,
+        tied: v["tie_word_embeddings"].as_bool().unwrap_or(true),
+        prefix: "model.".to_string(),
+        encoder_overlay_rows: 0,
+        tp: 1,
+        moe: false,
+        n_exp: 0,
+        top_k: 0,
+        moe_inter: 0,
+        ple: 0,
+        kv_shared: 0,
+        double_wide_mlp: false,
     }
 }
 
@@ -638,5 +773,57 @@ mod asr_tests {
         let mut v = config();
         v["thinker_config"]["text_config"]["rope_scaling"]["rope_type"] = "yarn".into();
         cfg_qwen3_asr(&v);
+    }
+}
+
+#[cfg(test)]
+mod bert_tests {
+    use super::*;
+
+    #[test]
+    fn test_cfg_bert_structure() {
+        let v = serde_json::json!({
+            "model_type": "bert",
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 12,
+            "intermediate_size": 3072,
+            "layer_norm_eps": 1e-12,
+            "vocab_size": 30522,
+            "tie_word_embeddings": true
+        });
+        let c = cfg_bert(&v);
+        assert_eq!(c.arch, Arch::Bert);
+        assert_eq!(c.hidden, 768);
+        assert_eq!(c.layers, 12);
+        assert_eq!(c.heads, 12);
+        assert_eq!(c.hd_full, 64);
+        assert_eq!(c.kvh_full, 12);
+        assert_eq!(c.mlp_act, 0);
+        assert!(c.is_full.iter().all(|&f| f));
+    }
+
+    #[test]
+    fn test_cfg_modernbert_structure() {
+        let v = serde_json::json!({
+            "model_type": "modernbert",
+            "hidden_size": 768,
+            "num_hidden_layers": 22,
+            "num_attention_heads": 12,
+            "intermediate_size": 1152,
+            "norm_eps": 1e-5,
+            "vocab_size": 50368,
+            "sliding_window": 128,
+            "global_rope_theta": 160000.0,
+            "tie_word_embeddings": true
+        });
+        let c = cfg_modernbert(&v);
+        assert_eq!(c.arch, Arch::ModernBert);
+        assert_eq!(c.hidden, 768);
+        assert_eq!(c.layers, 22);
+        assert_eq!(c.heads, 12);
+        assert_eq!(c.hd_full, 64);
+        assert_eq!(c.window, 128);
+        assert_eq!(c.theta_full, 160000.0);
     }
 }

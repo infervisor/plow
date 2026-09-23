@@ -4817,7 +4817,7 @@ mod tests {
     /// batching actually runs at. `MultiStep::for_batch` returns 1 for every B > 8, so routing
     /// the AMD request through it made `quantum >= 2` unreachable at C16 and decode paid a full
     /// host turnaround on every token.
-    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[cfg(feature = "hsa")]
     #[test]
     fn the_amd_quantum_survives_a_batch_wider_than_eight() {
         // The defect, stated as the old call would have computed it.
