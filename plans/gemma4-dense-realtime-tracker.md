@@ -2555,3 +2555,68 @@ best plow packet at C32 for >=4096-token prompts (8192/C32 7552 -> 4291, 15000/C
 still loses that cell, regresses C16 long prompts by 66-72%, and pays a constant +42 ms per lone
 128-token arrival at C16 (still unattributed). vLLM is not beaten on all metrics, and FP8 cannot be
 compared at all until the prefill fault is fixed.
+
+
+## Decode rung 32: the occupancy route is closed by arithmetic
+
+The B=32 decode knee (kernel-only, p12rq, ctx=128: 11.659 ms at B=16 -> **14.261** at B=32, marginal
+0.069 -> 0.163 ms/row against vLLM's ~0.049) was attributed to warp occupancy. A megakernel unions every
+arm's register demand, the decode entry sits at REG 255, and `threads/SM = 65536/R` puts decode at ~8
+warps/SM -- 1.67 TB/s at B=32 against vLLM's 2.05 TB/s (50% vs 61% of the 3.35 TB/s peak). The remedy
+would be a GEMV under 128 registers. Both halves are now measured, and both fail.
+
+**Dropping arms does not lower registers.** `PLOW_NV_LEAN_DECODE=1` compiles the flash arms out:
+SHARED 44048 -> 14480 (3x), REG 255 -> **255**. The MM=32 GEMV walk owns the ceiling, not
+`d_flash_decode<512>`. The `PLOW_NV_LEAN_DECODE` contract at `interp_sm120.cu:594` promises "2-3
+blocks/SM" against a 208-reg ceiling it attributes to the flash arms; that attribution does not hold
+at MM=32.
+
+**Forcing the cap works, and costs more than it buys.** `PLOW_NV_FORCE_MINBLK=2` is the
+`__launch_bounds__(256, 2)` that makes ptxas target 2 blocks/SM. It lands exactly REG 128, and
+STACK 384 -> 1216. Both arms are decode cubins from identical source differing only in that define,
+run on p12rq via `PLOW_NV_CUBIN`; `PLOW_NV_MINBLK` appears only in `__launch_bounds__`
+(`interp_sm120.cu:3046`) and never feeds the arena, so the A/B is single-variable.
+
+| B | mm32 (255 reg, 8 warps/SM) | + MINBLK=2 (128 reg, 16 warps/SM) | speedup |
+|---|---|---|---|
+| 1 | 13.569 | 18.099 | 0.750x |
+| 8 | 11.697 | 19.027 | 0.615x |
+| 16 | 12.672 | 24.366 | 0.520x |
+| 32 | 16.820 | 28.609 | 0.588x |
+
+Doubling occupancy makes decode **1.3-1.9x slower at every batch**. The spill is +832 B/thread = 208
+registers, so the walk's live state is **~463 registers**: fitting 128 natively means cutting live
+state 3.6x, which is a different algorithm rather than a flag. And there is no intermediate --
+`threads/SM = 65536/R` is invariant to block size, so at 256 threads 2 blocks/SM requires R <= 128 and
+R=168 still yields 1 block/SM. The cliff is binary and the only available step loses.
+
+(The generic-build bench reproduces across sessions to three decimals -- mm32 B=16 12.674 then 12.672,
+B=32 16.825 then 16.820 -- so these deltas are real. Generic builds lack the packet-geometry defines
+and so are slower than the stock packet-paired cubin in absolute terms; only the ordering is valid.)
+
+### What role-segmenting decode would and would not buy
+
+Prefill is already role-segmented: `PLOW_NV_SEG_GEMM` is documented at `interp_sm120.cu:526` as
+"Design A: give the GEMM/tier-A segments their OWN kernel object, targeting occupancy 2 ...
+__launch_bounds__ caps registers at 128 ... Flash segments keep the occ-1 `_pfseg` object." Decode is
+the one path that never got the equivalent: one cubin carries gemv + flash-decode + norms + sampling
+for every rung 1..32, and the `seg` field is a single id across all 540 instructions of prog[13].
+
+The infrastructure is wired end to end. `DecodeProgramObject { index, rows, object }` in
+`plow_asset::decode_objects` maps each decode program to its own cubin, each `DecodeObject` carries its
+own `threads`/`arena_bytes`/`grid`, and `gpu.rs:3635-3723` selects and binds them. p12rq binds ONE
+object for all rungs; devgen never emits more than one.
+
+The launch cost is affordable. prog[13] (T=32, 540 insts) is 48 x (9-op GEMV run + 2-op flash run) =
+**97 contiguous role runs**, so segmenting by role costs 97 launches = 0.29-0.78 ms at 3-8 us each =
+2.0-5.4% of the 14.261 ms step, against a 23% gap.
+
+But segmenting **alone buys nothing**, because it does not lower R -- that is exactly what the lean
+build measured. It only pays combined with a GEMV that is natively low-register. The prefill precedent
+survives its 128-reg cap because the GEMM tile was designed for occupancy 2; the decode MMA walk was
+not, and squeezing it spills 208 registers.
+
+**Status: seven levers refuted** (GV_MM_MAX=16, MMA_UNB=6, NOSTAGE, the cuBLASLt route, register
+pipelining, arm-dropping, the MINBLK register cap). What remains is not a knob: either a decode GEMV
+whose live state is ~3.6x smaller, or per-op launches where each kernel carries only its own register
+budget. Both are projects to scope, and neither is measured.
