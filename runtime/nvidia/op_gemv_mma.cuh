@@ -115,29 +115,48 @@ __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_b
      * prefill objects: 6.63% at 1024, 1.37% at 4096, 0.21% at 8192, 3.32% at 15000) is wider
      * than the effect, so the ladder cannot adjudicate this change — the packet-level step can.
      *
-     * THE B=32 STEP IS NOT ACTIVATION-BOUND — do not build a 4-wide PAIR to "fix" it. The walk
-     * moves MT*2*512 B of activations per NW*512 B of weights, and at the packet's PAIR=1/MT=2
-     * that is 2048 B against 1024 B, with x (245 KB at K=3840) too big for the ~216 KB of L1 left
-     * beside the 40 KB smem claim — so the traffic argument looks compelling and is wrong.
-     * Measured by forcing a1 = a0 (half the activation loads, identical weight stream and mma
-     * count, numerics deliberately invalid) in TWO REAL PACKETS one source apart, both
-     * REG:255 STACK:192 SHARED:40464: B=32 ctx 128 13.691 -> 13.692 ms (+0.01%), ctx 8192
-     * 19.029 -> 19.035 (+0.03%). Nothing. Whatever costs B=32 its bandwidth (1.74 TB/s against
-     * 2.20 at B=1 on the same 23.8 GB) is not the activation re-read.
+     * RETRACTED: "NOT ACTIVATION-BOUND" AND "NOT TENSOR-CORE ISSUE". Both claims stood here on
+     * probes that measured nothing. Each injected an `#if`-guarded edit and enabled it with
+     * -DGVMMA_PROBE_* through PLOW_EXTRA_DEFINES. That variable is NOT plumbed into a
+     * `campaign.py build`: its knob is registered as
+     *     KnobSpec::new("def.PLOW_EXTRA_DEFINES", None, Layer::ObjectDefine, ...)
+     * whose second field -- the environment binding -- is None. Only build_sm90a_cubin.sh and the
+     * tune sweeps read it, and those build the GENERIC object, not the packet. The macro was
+     * never defined, the guard compiled to the original source, and each probe compared the
+     * shipped kernel against ITSELF. The deltas (activations +0.01%/+0.03%, mma +0.09%/0.00%)
+     * are run-to-run noise, which is why they looked so clean -- as did the identical
+     * REG:255 STACK:192 SHARED:40464 gate, which matched because it was the same object twice.
+     * A macro-gated probe cannot be trusted here: edit the source UNCONDITIONALLY and gate on
+     * the probe cubin's md5 DIFFERING from the control's before believing a number.
      *
-     * NOR IS IT TENSOR-CORE ISSUE — wgmma would buy nothing. Same method, same two-real-packet
-     * setup: skipping the .z/.w half of every k32 step halves the mma count (8 -> 4 per step per
-     * warp at MT=2/NW=2) with every global load unchanged. B=32 ctx 128 13.677 -> 13.689 ms
-     * (+0.09%), ctx 8192 19.036 -> 19.036 (0.00%).
+     * WHAT THE WALK ACTUALLY COSTS. Re-measured with an unconditional half-K edit (gvmma_tile
+     * walks half its k-block range, so every walk streams half its weights), two real packets,
+     * md5-gated. With step = F + W: W = 2*(step-half), F = 2*half - step.
      *
-     * SO THE BATCHING COST IS NOT IN THIS WALK. The weight stream is byte-identical between B=1
-     * and B=32 (gvmma_partition depends on N and nblk, not on rows), and the only two things that
-     * do change here — activation loads and mma count — are both free. The ~3 ms that B=32 adds
-     * over B=1 is per-ROW work elsewhere in the decode step (attention, norms, KV writes,
-     * sampling), which is where a batched-decode optimisation has to go. Consistent with the
-     * rungs: B=1 -> B=16 costs 0.057 ms/row at constant MT=1, which extrapolates to 12.49 ms at
-     * 32 rows against 13.691 measured, leaving ~1.2 ms for the MT=1 -> MT=2 transition of which
-     * the prefetch-depth fix above already recovered ~0.5.
+     *     B    ctx     step     half       W        F
+     *     1    128    10.765   6.683   8.164   2.601
+     *     32   128    13.690   8.932   9.516   4.174
+     *     32   8192   19.036  14.250   9.572   9.464
+     *
+     * Against ~22.3 GB of layer weights and the H100's 3.35 TB/s:
+     *   B=1  : 22.3/8.164 = 2.73 TB/s = 81.5% of roofline -- the walk is NOT the 67% case. That
+     *          earlier figure divided total weight bytes by the WHOLE step and was an artifact.
+     *   B=32 : 22.3/9.516 = 2.34 TB/s = 70%.
+     *
+     * So batching costs this walk +1.35 ms on a BYTE-IDENTICAL weight stream (gvmma_partition
+     * depends on N and nblk, not on rows). The retracted claim that the batching cost is not in
+     * this walk is therefore wrong in its own terms: about 1.35 ms of it is right here, and
+     * reaching 90% of roofline at B=32 would return ~2.1 ms of the 19.036 ms step.
+     *
+     * At B=32 ctx 8192 the step is almost exactly half walk (9.572) and half everything-else
+     * (9.464 = attention/KV traversal, norms, sampling, entry). F grows +5.29 ms from ctx 128 to
+     * 8192, which is the KV traversal, and carries 2.601 ms of fixed cost already present at
+     * B=1 ctx 128.
+     *
+     * Whether the remaining walk gap is activations or mma issue is OPEN -- neither was ever
+     * tested. What stands, being real source changes on genuinely different packets, is the
+     * per-MT prefetch depth above (-3.64% at B=32); and from PACKLOG, the served step matches the
+     * isolated one (19.100 vs 19.036 ms) at 0.268-0.269 ms/row over a 10.78 ms fixed pass.
      *
      * DO NOT re-tune this with scripts/build_sm90a_cubin.sh. That path never defines
      * PLOW_NV_GEMV_MMA_PAIR or _B1 (decode object SHARED:14480), while every packet sets both to

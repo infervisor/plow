@@ -3917,3 +3917,62 @@ or it needs to read fewer bytes (FP8 weights), which a bf16-vs-bf16 ladder forbi
 Also note the closed-batch tail, which is NOT the gap but is worth knowing: 142 decode ticks at
 <=2 rows burn 1.60 s producing 273 of 8393 token-steps (5.9 ms/token vs 0.614 at rows=32). vLLM
 pays the same tail in a 64-request closed batch.
+
+### Two refutations withdrawn: the probe mechanism measured nothing
+
+`PLOW_EXTRA_DEFINES` is NOT plumbed into `campaign.py build`. Its knob is registered as
+
+    KnobSpec::new("def.PLOW_EXTRA_DEFINES", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN)
+
+and the second field -- the environment binding -- is None. Only `build_sm90a_cubin.sh`,
+`build_sm120_cubin.sh` and the tune sweeps read it, and those build the GENERIC object, which is
+a different kernel anyway. So every probe that gated a source edit behind `#if defined(FOO)` and
+enabled it with `PLOW_EXTRA_DEFINES=-DFOO=1` compiled the ORIGINAL source and compared the
+shipped kernel against itself.
+
+Withdrawn on that basis:
+  * "the B=32 step is NOT activation-bound" (commit e0476839, +0.01% / +0.03%)
+  * "NOR IS IT TENSOR-CORE ISSUE" (commit 01983f92, +0.09% / 0.00%)
+
+Those deltas are run-to-run noise. The REG:255 STACK:192 SHARED:40464 gate passed because the two
+objects WERE the same object -- a resource-signature match is exactly what the broken path
+produces, so it was never a gate at all. Caught only when the same mechanism was used to halve
+the weight bytes the walk streams and returned 0.00% across three cells, which is physically
+impossible. `grep -c GVMMA_PROBE_HALF_K <out>.build.log` returns 0.
+
+Rule going forward: edit the source UNCONDITIONALLY and gate on the probe cubin's md5 DIFFERING
+from the control's. A null that is too clean is evidence of a no-op, not of a refutation.
+
+### What the decode step is actually made of
+
+Re-measured with an unconditional half-K edit (`gvmma_tile` walks half its k-block range, so all
+three walks stream half their weights), two real packets, md5-gated. step = F + W, so
+W = 2*(step-half) and F = 2*half - step.
+
+    B    ctx     step     half        W        F
+    1    128    10.765   6.683    8.164    2.601
+    32   128    13.690   8.932    9.516    4.174
+    32   8192   19.036  14.250    9.572    9.464
+
+Against ~22.3 GB of layer weights and 3.35 TB/s:
+
+    B=1  : 22.3 / 8.164 = 2.73 TB/s = 81.5% of roofline
+    B=32 : 22.3 / 9.516 = 2.34 TB/s = 70%
+
+**The "decode weight pass runs at 67% of HBM" figure was an artifact** -- it divided total weight
+bytes by the WHOLE step, which also contains attention, norms, sampling and entry overhead. The
+walk alone is at 81.5% at B=1. Correct the earlier section accordingly.
+
+Two things follow. First, batching costs this walk +1.35 ms on a BYTE-IDENTICAL weight stream
+(gvmma_partition depends on N and nblk, not on rows), so the withdrawn "the batching cost is not
+in this walk" conclusion is wrong in its own terms -- ~1.35 ms of it is exactly there. Second,
+the headroom is smaller than advertised: taking the B=32 walk from 70% to 90% returns ~2.1 ms of
+the 19.036 ms step, not the ~5 ms the 67% figure implied.
+
+At B=32 ctx 8192 the step is almost exactly half walk (9.572) and half everything-else (9.464).
+F grows +5.29 ms from ctx 128 to 8192 -- that is the KV traversal -- and carries 2.601 ms of
+fixed cost already present at B=1 ctx 128 (entry, norms, sampling).
+
+Against vLLM's 15.82 ms median ITL at the same cell, plow needs -3.2 ms. The walk can supply
+~2.1 ms at best, so the remaining ~1.1 ms has to come out of F, where the 2.601 ms fixed term is
+the obvious candidate. Neither is a knob.
