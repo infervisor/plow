@@ -3106,3 +3106,72 @@ touches every ring row once the prompt passes the stride:
 
 So `rc2048` is the arm expected to land and `rc4096` is built to locate the wall rather than argue
 about it. Both are one-variable overrides of the unchanged req1k recipe.
+
+
+### The ring budget at 32 slots, from measured geometry
+
+The previous two sections leave a contradiction: the ring is free at decode (so raise the
+per-request chunk) but the recipes all cap it. Resolving it needs the memory arithmetic written
+down once, because it has now been derived wrongly twice in one session — first as a static
+allocator number that the runtime does not use, then as an estimate that ignored the
+full-attention layers entirely.
+
+Geometry, read from the checkpoint's `config.json`, not from recipe prose:
+
+```
+  num_hidden_layers   48      layer_types  40 sliding + 8 full
+  num_key_value_heads  8      head_dim    256      sliding_window 1024
+```
+
+One KV row costs `2 (K+V) * 8 heads * 256 * 2 B = 8 KiB` per layer. So a row is **320 KiB across
+the 40 sliding layers** and **64 KiB across the 8 full ones**.
+
+`packed_prefill.rs:222-229` sizes a slot's sliding ring at `next_pow2(window + write_rows - 1)`,
+and `Manifest::write_rows` is the PER-REQUEST chunk (`max_request_chunk`), not `max_chunk`:
+
+```
+  req_chunk  ring rows   per slot    x16 slots   x32 slots
+     1024      2048       640 MiB      10 GiB      20 GiB    <- req1k today
+     2048      4096      1.25 GiB      20 GiB      40 GiB
+     4096      8192       2.5 GiB      40 GiB      80 GiB
+     4224      8192       2.5 GiB      40 GiB      80 GiB    <- l8192 ships this at 16 slots
+     8192     16384         5 GiB      80 GiB     160 GiB
+```
+
+The full-attention layers are NOT windowed, so they need `ctx` rows per slot regardless of chunk:
+64 KiB/row * 8192 * 32 = **16 GiB at an 8k prompt**, **32 GiB at 16k**. Weights are 22.7 GiB.
+Against an 80 GiB card:
+
+```
+  32 slots, 8192-token prompts:  22.7 weights + 16 full-KV = 38.7 GiB fixed -> ~41 GiB for rings
+  32 slots, 15000-token prompts: 22.7 weights + 29 full-KV = 52   GiB fixed -> ~28 GiB for rings
+```
+
+Measured peak on p12rq (req 1024) at 8192/C32 is 52.3 GiB, consistent with 22.7 + 16 + 20 less the
+slots that never filled.
+
+**Consequences.**
+
+* An 8k PER-REQUEST chunk at 32 slots wants 160 GiB of rings. It is not a tuning question; it is
+  twice the card. At 16 slots it is 80 GiB, still the whole card before weights.
+* `req_chunk` 4096 at 32 slots is 80 GiB of rings alone — also out.
+* `req_chunk` 2048 at 32 slots is 40 GiB, which fits at 8k prompts (78.7 GiB total, tight) and
+  does NOT fit at 15000 (~92 GiB). So the long end of the C32 ladder is where it breaks.
+* Therefore the req1k cap is load-bearing after all — but for residency, which its header never
+  states, and NOT for the decode cost its header does state, which the ring A/B refuted. Both
+  things are true and they are about different resources.
+
+**What an 8k chunk does mean, and already works.** `max_chunk` and `max_request_chunk` are
+different knobs. `gemma4-12b.h100.bf16-l8192-16k.toml` ships `PLOW_MAX_CHUNK = 8192` — real
+8192-row launches — with `PLOW_MAX_REQUEST_CHUNK = 4224`, so an 8k launch is assembled from
+several requests' slices and the ring is sized by the slice. That is the reachable form of "8k
+chunks", and PACKLOG shows the launch side is already saturated: 109 of 177 launches at 8192/C32
+run a full 4096-row bucket at 6.9% padding.
+
+**Where the static sizing is genuinely wasteful.** The ring is allocated per slot for the case
+where every slot simultaneously runs a full chunk. PACKLOG measured `prefill reqs/pack` mean
+**3.14**, max **5** — at most five slots are mid-prefill at any instant. A shared ring pool sized
+for the concurrent-prefill count rather than the slot count would buy a 4x larger per-request
+chunk at today's 20 GiB. That is a real design lever and the measured number to size it with is
+3.14, but it is an allocator change, not a knob, and nothing in the current packet format
+expresses it.
