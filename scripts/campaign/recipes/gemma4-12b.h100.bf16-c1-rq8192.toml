@@ -1,13 +1,26 @@
-# Gemma-4-12B-it, H100 SXM5, BF16, TP1 — ladder16k (packet p12r) with 8192-ROW PREFILL LAUNCHES.
-# PLOW_MAX_CHUNK=8192 adds an 8192 bucket; PLOW_MAX_REQUEST_CHUNK=4224 caps one request's slice per
-# launch, so the sliding ring is sized by the slice, next_pow2(1024 + 4224 - 1) = 8192 rows: the same
-# per-slot KV as ladder16k and 16 slots still fit. An 8192-row launch packs two or more requests'
-# slices; a lone request still runs <= 4224 rows per launch (4224 = 4096 + BOS in one launch, the
-# reason the cap is not 4096). The 8192 rung takes the GLU and both attention roles (4096 | 8192).
-# Experiment for the cold-first-wave makespan (P99 TTFT at C4/C16): plans/gemma4-packet-geometry.md.
-
+# Gemma-4-12B-it, H100 SXM5, BF16, TP1 — the C1 LATENCY packet: one request may take a whole
+# 8192-row launch.
+#
+# WHY A SEPARATE PACKET. PLOW_MAX_REQUEST_CHUNK sizes the sliding ring as
+# next_pow2(window + chunk - 1), so raising it from 4224 to 8192 takes the ring from 8192 to
+# 16384 rows/slot = 5.37 GiB/slot. At 16 slots that is 86 GiB and does not fit an 80 GiB card;
+# at 4 slots it is 21.5 GiB, plus ~8.6 GiB full-attention KV and 24 GiB of weights = ~54 GiB.
+#
+# THIS IS APPLES TO APPLES. vLLM is configured per concurrency by its own bench harness --
+# `vllm serve --max-num-seqs` is 1 at C1, 4 at C4, 16 at C16 (see the "max_num_seqs=" line in
+# every reference run's health log). Giving plow a 4-slot packet for the C1 column mirrors that
+# exactly; it is not a per-cell tune, it is the same per-concurrency sizing both stacks do.
+# C4/C16/C32 keep gemma4-12b.h100.bf16-ladder16k.toml, which is unchanged.
+#
+# WHAT IT SHOULD BUY. On ladder16k an 8192-row prompt runs [4096, 4096] -- two launches, each
+# paying the ~5.2 ms fixed launch cost. Here it runs [8192], one launch. Target: 8192/C1 TTFT
+# 351.04 -> ~346, against vLLM's 348.61 measured the same session. 8192/C1 also needs TPOT
+# -0.02 ms (10.66 vs 10.65); a 4-slot packet carries a smaller decode arena, which is the other
+# reason to test this shape rather than only the chunk.
+#
+# Everything else is gemma4-12b.h100.bf16-l8192-16k.toml verbatim.
 [cell]
-name = "gemma4-12b.h100.bf16-l8192-16k"
+name = "gemma4-12b.h100.bf16-c1-rq8192"
 model = "google/gemma-4-12B-it"
 revision = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
 hf_dir = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
@@ -33,12 +46,14 @@ PLOW_NO_GLU_FUSE = "1"
 # twice: first token right, the rest noise. Off until the fold arm is qualified here.
 PLOW_NO_FUSE_NRN = "1"
 PLOW_SLIDING_NS_GRID = "1"
-PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
+# 4 slots, not 16: the 16384-row ring costs 5.37 GiB/slot, so 16 slots would need 86 GiB.
+PLOW_DECODE_BATCH_LADDER = "1,2,4"
 PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
 PLOW_SLIDING_NS_CAP = "1"
 PLOW_MAX_CHUNK = "8192"
 # One request's rows per launch; sizes the sliding ring (see the header). Must be a prefill rung.
-PLOW_MAX_REQUEST_CHUNK = "4224"
+# 8192, not 4224: a lone request takes the whole 8192 rung in ONE launch. Ring 16384 rows/slot.
+PLOW_MAX_REQUEST_CHUNK = "8192"
 # FINE-GRAINED RUNGS, as in the 26B recipes: the server prepends BOS, so an N-token bench prompt
 # is N+1 rows and crosses its rung — without these a 129-row prompt runs the 512 bucket and a
 # 1025-row one the 2048 bucket (or pays a second launch for a 1-row tail).
