@@ -7719,6 +7719,18 @@ impl GpuEngine {
         self.prefill[self.pick_prefill_bucket(avail, usize::MAX)].t as usize
     }
 
+    /// Rows to slice off a request with `rem` prefill rows still unsent, under per-launch
+    /// `cap`. Plans the WHOLE remainder, so the slice lands on a rung that fills exactly
+    /// instead of leaving a stranded tail: 8192 rows under a 4224 cap runs [4096, 4096]
+    /// (no padding) where clamping to the cap first ran [4224, 3968->4096] (128 padded rows).
+    pub fn pf_plan_slice(&self, rem: usize, cap: usize) -> usize {
+        if self.prefill.is_empty() {
+            return rem.min(cap);
+        }
+        let rung = self.prefill[self.pick_prefill_bucket(rem, cap)].t as usize;
+        rem.min(cap).min(rung.max(1))
+    }
+
     /// The CUDA arm as the backend-neutral step planner (`crate::sched::step`) sees it: one
     /// fair-split launch per tick under the widest bucket, every waiting request may join it
     /// and may be cut to fit, and under the unified token batch the decode rows ride along.
@@ -8830,13 +8842,12 @@ impl GpuEngine {
         if n_allowed == 0 {
             return smallest;
         }
-        // While the largest allowed rung still FILLS, it is optimal outright:
-        // minimal padding and minimal launches at the same time.
-        let top = n_allowed - 1;
-        if rem >= self.prefill[top].t as usize {
-            return top;
-        }
-        // Tail. Every rung is a multiple of the smallest, so quantizing the
+        // NO top-rung shortcut: "largest rung that still fills" is not optimal. Under a
+        // 4224-row top rung an 8192-row prompt takes [4224, 3968->4096] = 128 padded rows,
+        // where [4096, 4096] is the same two launches with none. The DP below already
+        // considers the top rung, so it picks it whenever it really is best.
+        //
+        // Every rung is a multiple of the smallest, so quantizing the
         // state on it bounds the table at `top_rung / smallest_rung` entries
         // (64 for the shipped 128…8192 ladder).
         let unit = (self.prefill[smallest].t as usize).max(1);

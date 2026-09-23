@@ -4289,7 +4289,7 @@ fn gpu_prefill_batched_pass(
                 if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || s.pf_pos + withheld >= n {
                     return None;
                 }
-                let remaining = (n - withheld - s.pf_pos).min(chunk_cap);
+                let remaining = e.pf_plan_slice(n - withheld - s.pf_pos, chunk_cap);
                 let n_rows = u32::try_from(remaining).ok()?;
                 let slot_u32 = u32::try_from(i).ok()?;
                 let kv_row0 = u32::try_from(s.pf_pos).ok()?;
