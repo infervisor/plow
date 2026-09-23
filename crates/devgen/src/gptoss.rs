@@ -959,6 +959,55 @@ pub(super) fn run(
         };
         sections.push(write_block_descriptor(out, &desc));
     }
+    let ecfg = emit_config::active();
+    if block.is_some() || ecfg.block_packets || ecfg.pf_modular {
+        let mut modular_progs = Vec::new();
+        for (i, &t) in buckets.iter().enumerate() {
+            modular_progs.push(modular::create_modular_block_prog(
+                plow_asset::ModularBlockKind::DenseAttention,
+                plow_asset::ModularPhase::Prefill,
+                i as u32,
+                t,
+                None,
+                false,
+                false,
+                false,
+            ));
+            modular_progs.push(modular::create_modular_block_prog(
+                plow_asset::ModularBlockKind::Moe,
+                plow_asset::ModularPhase::Prefill,
+                i as u32,
+                t,
+                None,
+                false,
+                false,
+                true,
+            ));
+        }
+        modular_progs.push(modular::create_modular_block_prog(
+            plow_asset::ModularBlockKind::DenseAttention,
+            plow_asset::ModularPhase::Decode,
+            buckets.len() as u32,
+            dbatch,
+            None,
+            false,
+            false,
+            false,
+        ));
+        modular_progs.push(modular::create_modular_block_prog(
+            plow_asset::ModularBlockKind::Moe,
+            plow_asset::ModularPhase::Decode,
+            buckets.len() as u32,
+            dbatch,
+            None,
+            false,
+            false,
+            true,
+        ));
+        let manifest = modular::build_modular_manifest(c.layers, modular_progs, &buckets, &[dbatch]);
+        sections.push(modular::modular_pipeline_section(&manifest));
+    }
+    modular::update_section_with_lean(&mut sections, &lean);
     let bytes = if sections.is_empty() {
         m.to_blob()
     } else {

@@ -4432,7 +4432,14 @@ fn emit_phase(
         // kernel must agree (dev_isa.h). GF=2 fuses sliding layers fully (GQA 2) and full layers
         // partially (GQA 8 -> reads each row 4x). Under tp=8 shared-kv-head replication a full layer
         // is GQA 4 locally, still a clean multiple of GF=2. The binding invariant is gqa_local % GF.
-        let gf = if full { fa_gf_full() } else { 2 };
+        let gqa = heads / kvh;
+        let gf = if gqa < 2 {
+            1
+        } else if full {
+            fa_gf_full().min(gqa)
+        } else {
+            2.min(gqa)
+        };
         assert_eq!(
             (heads / kvh) % gf,
             0,
@@ -9402,6 +9409,11 @@ fn emit_dense_gqa(
     if block_mode || ecfg.block_packets || ecfg.pf_modular {
         let is_sandwich = c.arch.is_gemma();
         let mut modular_progs = Vec::new();
+        let ffn_kind = if c.moe {
+            plow_asset::ModularBlockKind::Moe
+        } else {
+            plow_asset::ModularBlockKind::DenseFfn
+        };
         for (i, &t) in buckets.iter().enumerate() {
             modular_progs.push(modular::create_modular_block_prog(
                 plow_asset::ModularBlockKind::DenseAttention,
@@ -9414,14 +9426,14 @@ fn emit_dense_gqa(
                 false,
             ));
             modular_progs.push(modular::create_modular_block_prog(
-                plow_asset::ModularBlockKind::DenseFfn,
+                ffn_kind,
                 plow_asset::ModularPhase::Prefill,
                 i as u32,
                 t,
                 None,
                 false,
                 is_sandwich,
-                false,
+                c.moe,
             ));
         }
         modular_progs.push(modular::create_modular_block_prog(
@@ -9435,14 +9447,14 @@ fn emit_dense_gqa(
             false,
         ));
         modular_progs.push(modular::create_modular_block_prog(
-            plow_asset::ModularBlockKind::DenseFfn,
+            ffn_kind,
             plow_asset::ModularPhase::Decode,
             buckets.len() as u32,
             dbatch,
             None,
             false,
             is_sandwich,
-            false,
+            c.moe,
         ));
         let manifest = modular::build_modular_manifest(c.layers, modular_progs, &buckets, &[dbatch]);
         sections.push(modular::modular_pipeline_section(&manifest));

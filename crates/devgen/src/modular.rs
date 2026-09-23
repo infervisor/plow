@@ -244,4 +244,32 @@ mod tests {
         assert_eq!(parsed.num_layers, 40);
         assert_eq!(parsed.blocks.len(), 2);
     }
+
+    #[test]
+    fn test_moe_modular_manifest() {
+        let b1 = create_modular_block_prog(
+            ModularBlockKind::DenseAttention,
+            ModularPhase::Prefill,
+            0,
+            128,
+            None,
+            false,
+            false,
+            false,
+        );
+        let b2 = create_modular_block_prog(
+            ModularBlockKind::Moe,
+            ModularPhase::Prefill,
+            1,
+            128,
+            None,
+            false,
+            false,
+            true,
+        );
+        let manifest = build_modular_manifest(32, vec![b1, b2], &[128], &[1]);
+        assert_eq!(manifest.blocks.len(), 2);
+        assert_eq!(manifest.blocks[1].name, "moe_t128");
+        assert!(manifest.egg_rules_applied.contains(&"residual3-rmsnorm-fuse".to_string()));
+    }
 }
