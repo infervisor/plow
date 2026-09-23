@@ -516,6 +516,18 @@ const C_SEQ_PAR_PROJ: &[Constraint] = &[Constraint {
     check: Check::Load,
 }];
 
+const C_STAGE_ROWS: &[Constraint] = &[Constraint {
+    id: "stage_rows_requires_max_request_chunk",
+    formula: F::Implies(
+        &F::Atom("emit.stage_rows", Cmp::Ne, Val::Unset),
+        &F::Atom("emit.max_request_chunk", Cmp::Ne, Val::Unset),
+    ),
+    site: "crates/plow-asset/src/packed_prefill.rs: stage_slots refuses an unmasked plan — a stage \
+masks the rows outside it to -1, and only plan_with_limit (max_request_chunk) has its padding \
+already masked. Manifest::validate refuses the pairing too",
+    check: Check::Load,
+}];
+
 const C_K3_WALK: &[Constraint] = &[Constraint {
     id: "k3_wide_decode_requires_walk",
     formula: F::Implies(
@@ -949,6 +961,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.decode_projection_tuning", None, Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.max_chunk", Some("PLOW_MAX_CHUNK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.max_request_chunk", Some("PLOW_MAX_REQUEST_CHUNK"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.stage_rows", Some("PLOW_STAGE_ROWS"), Layer::Emit, U32, UNSET, OPT_IN).with(C_STAGE_ROWS),
     KnobSpec::new("emit.gemv_split", Some("PLOW_GEMV_SPLIT"), Layer::Emit, U32, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("emit.decode_tiled", Some("PLOW_DECODE_TILED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.l2_place_prefill", Some("PLOW_L2_PLACE_PREFILL"), Layer::Emit, Domain::Bool, ON, PROMOTED),

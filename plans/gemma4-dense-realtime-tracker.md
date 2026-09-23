@@ -2813,3 +2813,39 @@ ring-2048 decode cost, AND re-enable both attention role objects, which need the
 That is now the measured case for item 3, and it replaces both earlier rationales (the memory one
 is wrong -- see the correction above -- and "fewer launches" alone did not explain why chunk 1024
 was chosen).
+
+
+### Two corrections to the sections above (2026-09-23, later)
+
+**1. "33 GiB unused" was weak evidence; here is the right arithmetic.** Peak memory scales with
+LIVE streams, so measuring 47.3 GiB at 15000/C32 while only 8 streams ran proves nothing about
+headroom for 32. What 32 LIVE slots actually need, counting only rows a request touches (the
+sliding ring is fully touched once a prompt exceeds it; full-attention KV is `inlen+128`):
+
+| in | chunk 1024 (ring 2048) | chunk 2048 (ring 4096) | chunk 4096 (ring 8192) |
+|---|---|---|---|
+| 4096 | 50.4 GiB | 70.4 GiB | 71.7 GiB |
+| 8192 | **58.4 GiB** | 78.4 GiB | 118.4 GiB |
+| 15000 | **71.7 GiB** | 91.7 GiB | 131.7 GiB |
+
+So at the shipped chunk 1024, 32 live slots fit at EVERY rung including 15000 (71.7 of 80 GiB).
+The conclusion "C32 is not memory-gated" therefore survives, but for a sharper reason: the packet
+could hold 32 streams at 15000 and instead ran 8, stopping ~24 GiB short. The margin is only
+~8 GiB though, and chunk 2048/4096 genuinely do NOT fit 32 slots at long context -- which is
+exactly why the c32-16k recipe picked chunk 1024, as its own header says.
+
+**2. "The doubled ring slows every decode step" is an unverified cross-packet attribution.**
+`kv_stride` (the ring) appears ONLY in the base-address computation --
+`kbase = K + (slot * n_kv_head + hkv) * kv_stride * D` -- while the walk length is
+`span = len - first` with `first = (window && len > window) ? len - window : 0`
+(`op_attention.cuh:772-779`). A bigger ring cannot make the kernel read more rows; it only
+spreads the slots further apart in the address space. The 128/C16 TPOT 13.05 -> 17.97 ms figure
+was measured across TWO DIFFERENT PACKETS (p12c32c vs the chunk-1024 packet), the same
+cross-packet attribution that made `GV_MM_MAX` look like a 0.23-0.37 ms tax when a
+single-variable A/B put it at 0.7%. Re-test it single-variable before building `stage_rows` on
+the premise that a small ring is worth protecting.
+
+This does not retire item 3 -- if the TPOT cost is real, staging is still the only way to get
+chunk-4096 prefill with a 2048-row ring, and the memory table above shows chunk 4096 needs it.
+But the justification is now explicitly UNVERIFIED, and the cheaper experiment (single-variable
+ring A/B on one packet) comes first.

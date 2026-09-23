@@ -221,6 +221,23 @@ pub struct EmitConfig {
     #[arg(long = "emit-max-request-chunk", env = "PLOW_MAX_REQUEST_CHUNK")]
     pub max_request_chunk: Option<u32>,
 
+    /// Rows a request may WRITE per launch when the chunk is staged, which is what the sliding
+    /// ring is sized against (`window + stage - 1`) instead of the whole chunk.
+    ///
+    /// `PLOW_MAX_CHUNK` alone drives two things that want opposite values: the prefill launch
+    /// count wants a LARGE chunk (15000 tokens is 15 launches at chunk 1024, 4 at 4096) and the
+    /// ring stride wants a SMALL one, because every decode step traverses it. Measured on the
+    /// 12B (recipe `gemma4-12b.h100.bf16-c32-16k.toml`): chunk 2048 halves long-prompt C32 TTFT
+    /// (8192/C32 10314 -> 4695 ms) but costs 128/C16 TPOT 13.05 -> 17.97 ms and 1179 -> 856
+    /// tok/s. Staging splits them — chunk 4096 with `stage_rows` 1024 keeps the 2048-row ring.
+    ///
+    /// Requires `max_request_chunk` (a stage masks the rows outside it to -1, and only a
+    /// `plan_with_limit` plan has its padding already masked) and objects built with
+    /// `PLOW_NV_MASKED_PADDING=1`. `packed_prefill::Manifest::validate` refuses the pairing
+    /// otherwise.
+    #[arg(long = "emit-stage-rows", env = "PLOW_STAGE_ROWS")]
+    pub stage_rows: Option<u32>,
+
     /// Emit S·n_cu decode slices for Gemv packets (finer work-stealing).
     #[arg(long, env = "PLOW_GEMV_SPLIT", default_value_t = 1)]
     pub gemv_split: u32,
@@ -1303,6 +1320,7 @@ impl EmitConfig {
             decode_ladder_default: false,
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
             max_request_chunk: env_u32("PLOW_MAX_REQUEST_CHUNK"),
+            stage_rows: env_u32("PLOW_STAGE_ROWS"),
             gemv_split: env_u32("PLOW_GEMV_SPLIT").unwrap_or(1),
             decode_tiled: env_bool("PLOW_DECODE_TILED"),
             l2_place_prefill: env_bool_opt("PLOW_L2_PLACE_PREFILL").unwrap_or(true),
