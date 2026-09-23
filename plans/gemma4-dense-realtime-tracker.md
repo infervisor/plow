@@ -3692,3 +3692,76 @@ So the decode step is NOT irrelevant to throughput even though it is nearly irre
 those are different questions and the earlier "kernel work cannot reach it" was too strong. The
 honest target is ~18-20% more end-to-end throughput, and the biggest unattributed piece is the
 2.6 s overhead term.
+
+## Where the 8192/C32 wall actually goes (measured, not residual)
+
+Every prior split of this cell was `wall - estimated_prefill`, and residual-chaining produced two
+wrong conclusions this campaign. This is the direct measurement: one served run of the ladder cell
+(rc1024permt, 64 prompts, in 8192, C32, out 128) under `PLOW_PF_PACKLOG=1`, 491 ticks.
+`out_tok_s` 270.0 reproduces the ladder cell exactly, so this is the cell, not a proxy.
+
+    sum prefill_ms = 27.50 s
+    sum decode_ms  =  4.89 s
+    accounted      = 32.40 s     vs a 32.36 s wall  -- the split is complete
+    (span 48.28 s; the difference is server idle outside the bench, not overhead)
+
+    prefill ticks 171 / decode-only ticks 320
+    decode_ms on prefill ticks = 0.00 s for all 171
+
+The last line is not starvation: `packlog::tick` reads `feeds.len()` AFTER the unified pass has
+cleared it (mux.rs:2101), so riding decode is billed inside `prefill_ms`. The 27.50 s therefore
+contains both the prefill rows and the decode rows that rode with them.
+
+### The decode kernel is not the problem
+
+    decode-only, rows=32 : median 19.100 ms  (n=98, total 1.88 s)
+    step_bench B=32 ctx8192 :     19.036 ms
+
+Served == isolated, to 0.3%. There is no mixed-phase decode pathology to fix, and decode-only is
+only 4.89 s of a 32.40 s wall. Tasks #59-#64 have been tuning 15% of the wall.
+
+Marginal cost per decode row, from the same table: rows=1 is 10.785 ms and rows=32 is 19.100 ms,
+so 0.268 ms/row over a 10.785 ms fixed weight pass. That is the per-row term task #64 names, and
+it is real -- but it is worth at most 8.3 ms of a step that runs 98 times, i.e. ~0.8 s of 32.40 s.
+
+### Prefill is 85% of the wall, and its GEMMs are already near the roofline
+
+Per-site attribution (`PLOW_PF_SEG_TIME=1`, one decoder block, 8192 tokens, ctx 8192), against
+H100 SXM5 BF16 dense peak 989 TFLOP/s. Gemma-4-12B is hybrid: 40 sliding layers (window 1024,
+hd 256) + 8 full layers (hd 512), hidden 3840, ffn 15360, 16 Q / 8 KV heads.
+
+    sliding block, 6.394 ms            full block, 9.172 ms
+      Gemm q     0.326   791 TF/s        Gemm q     0.646   798 TF/s
+      Gemm k     0.167   772 TF/s        Gemm o     0.635   811 TF/s
+      Gemm v     0.164   786 TF/s        Gemm gate  1.223   790 TF/s
+      Gemm o     0.331   779 TF/s        Gemm up    1.221   791 TF/s
+      Gemm gate  1.232   784 TF/s        Gemm down  1.267   763 TF/s
+      Gemm up    1.238   780 TF/s        FlashPref  3.130   351 TF/s
+      Gemm down  1.274   758 TF/s
+      FlashPref  0.701   196 TF/s
+
+40 x 6.394 + 8 x 9.172 = 329.2 ms predicted vs 355.78 ms measured TTFT at 8192/C1 (-7.5%), so the
+block model is validated and can be used to budget the whole model:
+
+    GEMM (linear)        229.6 ms   70%    758-811 TF/s = 77-82% of peak
+    FlashPrefill          53.0 ms   16%    196 / 351 TF/s = 20-36% of peak
+    norms + Glu + rope    46.4 ms   14%    1.4-1.9 TB/s = 41-57% of HBM
+
+70% of prefill already runs at ~80% of the roofline. vLLM is bounded by the same GEMM physics on
+the same silicon, so prefill GEMM cannot be where the 7.6 s gap lives, and the earlier idea that
+plow's prefill is 58% efficient was an artifact of counting only linear FLOPs against the wall.
+
+### What is actually addressable
+
+    4.73 s   prefill excess over the C1 rate (524288 tok / 23.0k tok/s = 22.77 s vs 27.50 s).
+             Padding plus riding decode; NOT yet decomposed -- packlog cannot separate them
+             because both are billed to prefill_ms. This is task #63 and it needs the unified
+             pass to time decode rows separately from prefill rows.
+    ~1.8 s   FlashPrefill at 20-36% of peak vs the GEMM path's 78%. 53.0 ms/355.78 ms of prefill;
+             closing half of it is ~8% of prefill.
+    ~2.0 s   the norm/Glu/rope tail, 14% of prefill, at 41-57% of HBM. Epilogue fusion.
+
+    27.50 - 4.73 - 1.8 - 2.0 = 18.97 s prefill + 4.89 s decode = 23.9 s  vs vLLM 24.7 s
+
+That is the first arithmetic in this campaign that reaches the goal, and none of its three terms
+is the decode GEMV walk.
