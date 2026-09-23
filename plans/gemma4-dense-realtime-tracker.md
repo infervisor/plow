@@ -4331,3 +4331,76 @@ packet's cubins predate all of them.
 **Consequence for the campaign: the "3 cells at 4/4" result is tied to the 02:24 BINARY, not just
 the packet.** Any 4/4 claim must name the binary and be re-measured against a control built from
 the same commit. Finding this ~0.1 ms is worth more than the 0.01 ms gap at 8192/C1.
+
+### The binary is exonerated: TPOT is bit-stable in a session and drifts BETWEEN sessions
+
+ABAB of two plowrt binaries -- HEAD (md5 af11c9c3) and the 02:24 ladder's commit 06fdd7ca
+(md5 d1850bcd), gate-checked as differing -- on the same packet, same recipe, 128/C1, 32 prompts,
+interleaved old/head/old/head in ONE session:
+
+    old1   TPOT 10.520     head1  TPOT 10.520
+    old2   TPOT 10.520     head2  TPOT 10.520     (sm_clock 1830 MHz in all four)
+
+All four identical to three decimals. So:
+
+  * **No binary regression.** The 7 commits since 06fdd7ca that touch crates/ are exonerated --
+    consistent with the fact that NONE of them touches the decode path (packed_prefill and
+    rt.pf_cover are prefill, devgen is build-time, op_seq is an example, and e13277fd's gpu.rs
+    write is load-time and env-gated). A bisect would have chased nothing.
+  * **Within-session TPOT variance is 0.000 ms** across four full server starts.
+  * The 10.42 -> 10.52 shift is therefore a BETWEEN-SESSION property of the box. SM clock reads
+    1830 MHz against a 1980 max; 1980/1830 = 1.082, and a small compute component of an otherwise
+    memory-bound step scaling with clock lands near the ~1% observed.
+
+**This invalidates the way every cell in this campaign has been scored.** The 4/4 margins at
+128/1024/4096 C1 were TPOT 0.04, 0.04 and 0.02 ms -- 0.2-0.4% -- while between-session drift is
+~1%. The vLLM reference CSV was also taken in an earlier session, so today's plow is being scored
+against a baseline measured under different conditions, in an unknown direction.
+
+A cell is only decidable when BOTH stacks are measured in the SAME session. Within a session the
+measurement is essentially exact (0.000 ms), so same-session paired runs are not merely better --
+they are the only form in which these margins mean anything. Re-measuring vLLM now to pair it
+against today's plow ladder.
+
+## RESOLVED: the C1 wins were never lost — the baseline was stale, not the engine
+
+vLLM 0.28 re-measured in the SAME session as today's plow ladder (gpulease, coherence gate PASS,
+32 prompts / 128 out, prefix cache off both sides, `--num-warmups 2 --seed 42` both sides,
+request counts matched 32/4096 in every cell):
+
+    cell        TTFT plow/vLLM    TPOT          p99 ITL        tok/s          wins
+    128/C1       18.32/ 31.18     10.52/10.56   10.59/11.46    94.5/93.2      4/4
+    1024/C1      45.93/ 47.51     10.59/10.64   10.68/11.56    92.0/91.5      4/4
+    4096/C1     170.51/171.48     10.63/10.65   10.83/11.57    84.2/84.0      4/4
+    8192/C1     355.60/348.61     10.66/10.65   10.86/11.58    74.9/75.2      1/4
+    15000/C1    703.25/675.86     10.72/10.65   10.85/11.60    62.0/63.1      1/4
+
+**vLLM drifted by the same ~0.1 ms plow did.** Its TPOT over the ladder went 10.46 -> 10.56,
+10.54 -> 10.64, 10.55 -> 10.65, 10.55 -> 10.65, 10.56 -> 10.65 between the stored reference and
+today, and its TTFT moved with it (128: 30.04 -> 31.18; 15000: 671.77 -> 675.86). Both stacks
+moved together, so the relative standing never changed.
+
+So the earlier "0 cells at 4/4" was an ARTIFACT of scoring today's plow against a reference
+measured in a different session. There was no engine regression, and the binary bisect that
+finding implied would have chased nothing -- which the ABAB had already shown independently
+(two different binaries, TPOT 10.520 in all four arms).
+
+Paired reference stored at
+`perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.paired-2026-09-23T18.csv`; the
+canonical multi-cell reference is left untouched.
+
+### The rule this establishes
+
+Within a session the measurement is essentially exact (plow TPOT 0.000 ms spread over four
+server starts). Between sessions the whole box moves ~1%, which is 3-5x the margins that decide
+these cells (the 4/4 TPOT margins here are 0.04, 0.05 and 0.02 ms). **A cell is only decidable
+when both stacks are measured in the same session.** Cross-session scoring is not apples to
+apples in either direction -- it can invent a regression, and it can equally invent a win.
+
+Still 1/4 and genuinely behind, now on trustworthy numbers:
+
+    8192/C1   needs -8.3 ms of per-request wall (TTFT -7.0 and TPOT -0.01)
+    15000/C1  needs -36.3 ms (TTFT -27.4 and TPOT -0.07)
+
+p99 ITL is won at every C1 cell by 0.7-0.9 ms, which is the MULTISTEP=0 + DECODE_PIPELINE=1
+profile doing its job.
