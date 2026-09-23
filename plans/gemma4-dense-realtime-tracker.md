@@ -2429,3 +2429,40 @@ Absolute TF/s to be reported alongside, labelled H100 80GB HBM3.
 **The comment at `op_gemm_sm90.cuh:1303` should say GH200, not "this box".** It is a one-word source
 fix, it is not in this campaign's scope, and it will mislead the next reader the same way until
 someone makes it. Added to the proposals list.
+
+## A certificate arm was contaminated by an orphaned unlocked build — re-run queued
+
+2026-09-23. The first `cert-rt_pf_interleave_adaptive` ctrl arm is not trustworthy and is being
+re-measured. Recorded because a certificate gates the merge and its provenance has to be auditable.
+
+Sequence, from the lease log and the arm's own `server.log` / `run.log`:
+
+* 06:34:03 ctrl acquires the GPU lease, then sits at 0.0% CPU for ~11 min waiting on the CPU-quiet
+  lock, which a concurrent packet rebuild held SHARED. Lease held, nothing running.
+* 06:45:03 plowrt starts; 06:45:15 server ready; ~06:45:24 coherence gate PASS ("The capital of
+  France is Paris.").
+* ~06:45:25-06:46:30 the two timed cells run (1024/C1 then 1024/C4, 32 prompts each).
+* ~06:45:45-06:46:30 an ORPHANED `nvcc` build runs with NO lock at all — a `campaign.py build` child
+  that survived its parent being killed.
+
+So the unlocked build overlaps BOTH timed cells, not merely model load. The arm's own numbers are
+consistent with it: 1024/C4 reports `ttft 122.62` against `ttft_med 107.86`, a mean 14% ABOVE the
+median, where the clean `cover0-rt` run at the same cell has the mean BELOW it (101.38 vs 107.55). A
+mean pulled above the median by a few slow requests is what a transient compile produces. That is
+corroboration, not proof, but a confirmed overlap plus a consistent signature is enough.
+
+**All four arms are being re-run, not just ctrl.** The design is ABAB so the verifier can measure
+control drift across the same span as the treatment; splicing a ctrl measured 40 minutes later
+against the original treat would defeat that and would be WORSE than the contaminated certificate,
+because the bias would be invisible instead of known. The re-run carries an explicit
+`--fact integrity:` line naming the window, so the certificate records why it exists.
+
+Two process lessons, both now applied by the agent that caused it:
+1. No multi-build scripts under one lock hold — each build takes the lock separately, so a cert arm
+   waits at most one build rather than a 27-minute stage.
+2. Kill the `campaign.py` PID directly, not the wrapper: `campaign.py build` spawns compile children
+   that survive the wrapper's death and then run unlocked, which is exactly how this happened.
+
+This is the second time today that killing the wrong pid caused damage (the first burned 20 minutes
+of lease on the rungs A/B driver). The general rule for this host: kill the process GROUP, and
+verify with `pgrep -af` afterwards rather than assuming.
