@@ -85,6 +85,16 @@ const CHUNK_PUBLISH_QUALIFIED: Status = Status::Qualified {
 const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
 };
+/// Unset = the cost-aware DP cover, which minimises `padded_rows + PLOW_PF_CHUNK_COST * launches`
+/// over the packet's existing rungs; `=1` restores the covering pick (smallest single rung that
+/// covers the row count).
+const PF_COVER_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "perf-certs/rt.pf_cover.json (12B H100 ladder16k, ABAB, coherence gate PASS every arm): 15000/C1 TTFT 737.256 -> 703.364 ms against a 7.169 ms floor, prefill padding 10.59% -> 1.58%, tpot_ms 10.541 -> 10.538 within a 0.007 floor",
+        "the same certificate records 8192/C1 as NEUTRAL with evidence: 8192 is itself a prefill bucket, so the covering pick and the DP cover both emit one exact-fit launch and there is no padding to remove",
+        "docs/flags-reference.md: `=1` is the rollback",
+    ],
+};
 /// Unset = on for a CUDA engine; AMD and CPU engines keep the engine thread.
 const INLINE_TICK_QUALIFIED: Status = Status::Qualified {
     evidence: &[
@@ -473,7 +483,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.vram_budget_mib", Some("PLOW_VRAM_BUDGET_MIB"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.step_time", Some("PLOW_STEP_TIME"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.l2_place_dispatch", Some("PLOW_L2_PLACE_DISPATCH"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.pf_cover", Some("PLOW_PF_COVER"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.pf_cover", Some("PLOW_PF_COVER"), Layer::Runtime, Domain::Bool, OFF, PF_COVER_QUALIFIED),
     KnobSpec::new("rt.pf_chunk_cost", Some("PLOW_PF_CHUNK_COST"), Layer::Runtime, USIZE, Default::Static(Val::Nat(512)), OPT_IN),
     KnobSpec::new("rt.pf_seg_dir", Some("PLOW_PF_SEG_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_seg_gemm_small", Some("PLOW_PF_SEG_GEMM_SMALL"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_PF_SEG_GEMM_SMALL),

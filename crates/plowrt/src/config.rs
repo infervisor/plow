@@ -818,8 +818,10 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "l2-place-dispatch", env = "PLOW_L2_PLACE_DISPATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub l2_place_dispatch: bool,
 
-    /// Restore covering bucket-pick policy for prefill chunking.
-    #[arg(long = "pf-cover", env = "PLOW_PF_COVER", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// Restore the covering bucket-pick policy for prefill chunking. Off by default: the
+    /// cost-aware DP cover composes existing rungs and cut 15000/C1 TTFT 737.3 -> 703.4 ms with
+    /// prefill padding 10.59% -> 1.58% and TPOT unchanged (perf-certs/rt.pf_cover.json).
+    #[arg(long = "pf-cover", env = "PLOW_PF_COVER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_cover: bool,
 
     /// Fixed cost of ONE prefill launch, in padded-row equivalents. 0 = old
