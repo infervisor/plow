@@ -16,15 +16,21 @@ fn main() {
         let t: Vec<String> = d
             .t
             .iter()
-            .take(4)
-            .map(|&t| blob.tensors.get(t as usize).map_or("-".into(), |x| x.name.clone()))
+            .enumerate()
+            .map(|(j, &t)| {
+                let nm = blob
+                    .tensors
+                    .get(t as usize)
+                    .map_or("-".to_string(), |x| format!("{}[{}B]", x.name, x.bytes));
+                format!("t{j}={t}:{nm}")
+            })
             .collect();
         let seg = p.stream.iter().find(|e| e.inst as usize == k).map_or(-1, |e| e.seg as i32);
         println!(
-            "{k:4} seg={seg:<4} {n:<34} blocks={:<4} i={:?} t={}",
+            "{k:4} seg={seg:<4} {n:<34} blocks={:<4} i={:?}\n      {}",
             d.blocks,
-            &d.i[..4],
-            t.join(" | ")
+            d.i,
+            t.join("  ")
         );
     }
 }
