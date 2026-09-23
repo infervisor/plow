@@ -116,11 +116,11 @@ intent" rule, and it has to be one: the point is precisely to record the intent,
 rebuild cannot reconstruct it from the packet.
 
 Before this, only GEMM tiles were measured and persisted, keyed by a digest that goes stale on
-any `runtime/amd` edit; the ~146 emit knobs were env reads recorded nowhere, and the only durable
+any `runtime/amd` edit; the emit knobs were env reads recorded nowhere, and the only durable
 record of a winning configuration was prose in a markdown file.
 
 ```
-knob_count   146
+knob_count   one per EmitConfig clap argument (~200 today)
 knobs[]      id (the field name), env, value, source
 replay{}     the env assignments that reproduce this configuration
 ```
@@ -149,11 +149,19 @@ still wins, and an already-exported variable is not overwritten.
 ### The coverage boundary
 
 The section covers the knobs **`EmitConfig` declares**. An emit-affecting env var read outside
-`EmitConfig` is invisible here exactly as it is invisible everywhere else. Measured: a GLM-5.3
-TP4 replay from this section reproduces the blob **byte-for-byte** once `PLOW_MLA_PF_V2` is also
-supplied — that one variable is read in `crates/packet/src/devbuild.rs` and is not a field, so
-nothing in devgen can see it. Promoting such a read to an `EmitConfig` field is what makes it
-recordable; that is the follow-up, not a gap in the recorder.
+`EmitConfig` is invisible *to this section*. Measured: a GLM-5.3 TP4 replay from this section
+reproduces the blob **byte-for-byte** once `PLOW_MLA_PF_V2` is also supplied — that one variable
+is read in `crates/packet/src/devbuild.rs` and is not a field, so nothing in devgen can see it.
+Promoting such a read to an `EmitConfig` field is what makes it *recordable here*.
+
+It is no longer invisible everywhere else. The knob registry
+(`crates/devgen/src/knob_spec.rs`) declares three layers — `EMIT` (the `EmitConfig` fields),
+`RAW_ENV` (emit-side `PLOW_*` reads that are not fields, `PLOW_MLA_PF_V2` among them) and
+`OBJECT_DEFINES` (the `-D`/`#if PLOW_*` set) — and its tests hold `RAW_ENV` and `OBJECT_DEFINES`
+to the source tree: a raw env read with no `RAW_ENV` spec fails the build with "declare the knob
+in EmitConfig, or add an ... spec". Checkpoint K resolves the recorded sources against that
+registry at emit and `build.json` records the verdict under `knobs`. See
+[flags-reference](../flags-reference.md) for the per-knob documentation those specs cite.
 
 ## Where the sections sit
 

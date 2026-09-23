@@ -496,7 +496,7 @@ The unified campaign driver in `scripts/campaign/campaign.py` orchestrates the c
 |---|---|
 | `scripts/bench/plowbench-doctor.sh` | pre-flight environment & artifact verification (target-aware sm_90a/120/89 vs gfx942/950) |
 | `scripts/bench/plowbench.sh` | canonical bench library: port allocation, server lifecycle, arch detection, artifact checks |
-| `scripts/campaign/campaign.py` | unified campaign driver: `build`, `bench`, `probe`, `cert`, `compare`, `roofline`, `loop`, `sweep`, `ledger` |
+| `scripts/campaign/campaign.py` | unified campaign driver: `build`, `serve`, `bench`, `probe`, `cert`, `compare`, `roofline`, `loop`, `sweep`, `ledger` |
 | `scripts/campaign/roofline.py` | roofline analysis, memory bandwidth/compute ceilings, and bottleneck diagnostics |
 | `crates/costmodel/src/roofline.rs` | in-tree Rust cost model roofline analysis module |
 | `perf-data/tools/gpulease` | advisory lease + contention audit (rc=76 = contended) |

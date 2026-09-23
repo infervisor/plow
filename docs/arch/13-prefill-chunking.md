@@ -25,7 +25,8 @@ flowchart TD
 ```
 
 **Modules:**
-[`crates/plowrt/src/exec/amd.rs`](../../crates/plowrt/src/exec/amd.rs) — `plan_chunks`, `LAUNCH_ROWS`, `rebase_chunk_rows` ·
+[`crates/plowrt/src/exec/amd.rs`](../../crates/plowrt/src/exec/amd.rs) — `plan_chunks`, `plan_chunks_cfg`, `LAUNCH_ROWS` ·
+[`crates/plowrt/src/exec/kvrow.rs`](../../crates/plowrt/src/exec/kvrow.rs) — `rebase_chunk_rows` ·
 [`crates/plowrt/src/config.rs`](../../crates/plowrt/src/config.rs) — `ragged_chunk`, `launch_rows` ·
 [`crates/devgen/src/mla.rs`](../../crates/devgen/src/mla.rs) — `glm_prefill_buckets`
 
@@ -175,6 +176,13 @@ The cap is now the widest bucket the packet actually carries. Consequences:
 * The `RING ≥ window + chunk − 1` invariant is enforced where the ring is *sized*, at emit. It is a
   **sliding-window** bill: the MLA family is full-causal (`window = 0`), so `kv_ring` returns
   `(ctx, KV_MASK_NONE)` and the chunk does not size the cache at all.
+* **A second cap sits above the ladder on the packed path: `PLOW_MAX_REQUEST_CHUNK`**, the rows one
+  request may contribute to a launch (`pf_request_max_rows()`, `exec/gpu.rs`). It is applied to the
+  slice *before* a bucket is picked, so the rung only covers the capped slice and the cap — not the
+  ladder — decides where a prompt splits. On the 12B ladder packet at 4224 an 8192-token prompt
+  splits `[4224, 3968]`, the tail landing on the 4096 rung with 128 padded rows. Because the ring
+  rounds up, 4224 costs the same per-slot KV as 4096 (`next_pow2(1024 + 4224 − 1) = 8192`), which is
+  why the cap can separate the ring from the ladder — see [22 — KV Cache](22-kv-cache.md).
 
 ---
 
@@ -254,9 +262,14 @@ latter byte-identical. `PLOW_RAGGED_CHUNK=0` is the escape hatch and is byte-ide
 pre-flip engine.
 
 **The cheapest cross-pollination runs the other way.** NVIDIA already reads its launch cost from
-config (`nv.pf_chunk_cost`) where AMD hardcodes `LAUNCH_ROWS`. AMD should adopt that **only as a
-fallback for the non-ragged path** — under ragged-M neither engine's constant is consulted, so
-tuning it is work on a path ragged-M deletes.
+config (`nv.pf_chunk_cost`, `PLOW_PF_CHUNK_COST`, default 512 rows) where AMD hardcodes
+`LAUNCH_ROWS`. AMD should adopt that **only as a fallback for the non-ragged path** — under
+ragged-M neither engine's constant is consulted, so tuning it is work on a path ragged-M deletes.
+
+Note that the NVIDIA constant is mis-set in the *opposite* direction to AMD's: on the 12B H100
+ladder packet the launch fixed cost measures ~5.2 ms against ~0.0398 ms per bucket row, i.e.
+**≈131 rows** against the 512 charged. Both engines are wrong about their launch price; each has
+to be re-fit on its own part.
 
 ---
 

@@ -259,8 +259,9 @@ blocker:
 * **Cross-request batched prefill is not numerics-neutral** and is often a no-op
   or force-off (fp8-KV). **Finer chunking usually loses throughput** — it is a
   tail tool.
-* **Prefix cache: report the hit rate.** The VMM `BlockHash` collision check is
-  not implemented — treat sharing as measured-good, not hardened.
+* **Prefix cache: report the hit rate.** It is on by default
+  (`PLOW_PREFIX_CACHE`), so a no-cache comparison must set `=0`. The `BlockHash`
+  collision check IS implemented — a mismatched block ends the match.
 * **Do not reach for unwired features:** no `Parallel { Dp, Pp, Ep }` selector
   (only TP is wired; EP is a MoE remap, disagg is a skeleton), no S2
   multi-tenancy, no host watchdog, `Streamer::execute_reclaim` is a no-op.

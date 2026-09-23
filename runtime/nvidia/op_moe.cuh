@@ -425,12 +425,6 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
  * megakernel REG 177 -> 229; 2 is the wash that keeps the register headroom. */
 #define GV_MOE_RB_DN 2
 #endif
-/* Staging fu in the arena MEASURED SLOWER (7.183 vs 7.060 ms): the extra __syncthreads on
- * every MoE-down op (30 per token) costs more than the redundant fu reads it removes, which
- * were L1 hits anyway (fu is 11 KiB). Kept behind the flag as a recorded negative. */
-/* Lane-split DOWN. Default OFF so sm_120 objects stay byte-identical; the sm_90a build turns
- * it on. MEASURED at 1 block/SM: bf16 7.060 -> 6.766 ms (fp8 neutral -- it runs the fp8 down
- * arm). At 2 blocks/SM: 6.387 -> 6.106. */
 #ifndef PLOW_MOE_XN_BF16
 #define PLOW_MOE_XN_BF16 0
 #endif
@@ -446,12 +440,18 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
 #ifndef PLOW_MOE_COMBINE_V8
 #define PLOW_MOE_COMBINE_V8 1
 #endif
+/* Lane-split DOWN. Default OFF so sm_120 objects stay byte-identical; the sm_90a build turns
+ * it on. MEASURED at 1 block/SM: bf16 7.060 -> 6.766 ms (fp8 neutral -- it runs the fp8 down
+ * arm). At 2 blocks/SM: 6.387 -> 6.106. */
 #ifndef PLOW_MOE_DOWN_LANESPLIT
 #define PLOW_MOE_DOWN_LANESPLIT 0
 #endif
 #ifndef PLOW_MOE_DOWN_SG
 #define PLOW_MOE_DOWN_SG 4u
 #endif
+/* Staging fu in the arena MEASURED SLOWER (7.183 vs 7.060 ms): the extra __syncthreads on
+ * every MoE-down op (30 per token) costs more than the redundant fu reads it removes, which
+ * were L1 hits anyway (fu is 11 KiB). Kept behind the flag as a recorded negative. */
 #ifndef PLOW_MOE_DOWN_STAGE_FU
 #define PLOW_MOE_DOWN_STAGE_FU 0
 #endif
