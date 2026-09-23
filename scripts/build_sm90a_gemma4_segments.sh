@@ -56,6 +56,14 @@ fi
 gemma_fatlite=${PLOW_BUILD_FATLITE:-$gemma_bf16}
 gemma_fatlite_moe=${PLOW_BUILD_FATLITE_MOE:-$((gemma_fatlite == 1 ? gemma_moe_pf : 0))}
 gemma_masked=${PLOW_BUILD_MASKED_PADDING:-$gemma_bf16}
+# The masked-padding GUARD is a correctness requirement in every object that writes KV on a
+# packed prefill, and it is orthogonal to precision. op_norm.cuh:780 skips a pfslot[t] < 0 row
+# before the unguarded (unsigned)pfslot[t] cast at :806, so without it a negative slot becomes
+# a huge obase -- CUDA_ERROR_ILLEGAL_ADDRESS on the first KV write. Defaulting it to
+# $gemma_bf16 compiled it out of every FP8 packet, which is why all three faulted there and no
+# bf16 packet ever did. $gemma_masked still gates the hd512/hd256 ROLE OBJECTS below, which
+# are a bf16-only default and a separate decision.
+gemma_masked_def=${PLOW_BUILD_MASKED_PADDING:-1}
 # Raw extra nvcc flags for every segment object: the A/B arm of a kernel default on a block packet.
 if [ -n "${PLOW_BUILD_SEG_EXTRA_DEFINES:-}" ]; then
   read -r -a gemma_extra_flags <<<"$PLOW_BUILD_SEG_EXTRA_DEFINES"
@@ -65,7 +73,7 @@ for gemma_packed in 0 1; do
   gemma_prefix=pf
   if [ "$gemma_packed" = 1 ]; then gemma_prefix=pfpacked; fi
   gemma_padding_flags=()
-  if [ "$gemma_packed" = 1 ] && [ "$gemma_masked" = 1 ]; then
+  if [ "$gemma_packed" = 1 ] && [ "$gemma_masked_def" = 1 ]; then
     gemma_padding_flags=(-DPLOW_NV_MASKED_PADDING=1)
   fi
   for gemma_role in gemm fa; do
@@ -100,7 +108,7 @@ for gemma_packed in 0 1; do
 done
 if [ "${PLOW_BUILD_FA_GQA2_PAIR:-$gemma_bf16}" = 1 ]; then
   gemma_gqa2_padding_flags=()
-  if [ "$gemma_masked" = 1 ]; then
+  if [ "$gemma_masked_def" = 1 ]; then
     gemma_gqa2_padding_flags=(-DPLOW_NV_MASKED_PADDING=1)
   fi
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \

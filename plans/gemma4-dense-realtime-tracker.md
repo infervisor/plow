@@ -2620,3 +2620,67 @@ not, and squeezing it spills 208 registers.
 pipelining, arm-dropping, the MINBLK register cap). What remains is not a knob: either a decode GEMV
 whose live state is ~3.6x smaller, or per-op launches where each kernel carries only its own register
 budget. Both are projects to scope, and neither is measured.
+
+
+## FP8 prefill fault: the masked-padding guard was compiled out (FIXED)
+
+Every FP8 packet was `gate:false` with zero data rows, and p12fp8c faulted with
+`CUDA_ERROR_ILLEGAL_ADDRESS` on its first packed prefill. That blocked the whole FP8 campaign.
+
+`build_sm90a_gemma4_segments.sh` derived the masked-padding define from the precision:
+
+```sh
+gemma_bf16=$((1 - gemma_w8a8))
+gemma_masked=${PLOW_BUILD_MASKED_PADDING:-$gemma_bf16}
+```
+
+so `PLOW_NV_MASKED_PADDING` went into every BF16 object and **out of every FP8 one**. It guards
+the packed-prefill KV write:
+
+```c
+#if defined(PLOW_NV_MASKED_PADDING) && PLOW_NV_MASKED_PADDING
+        if (out_stride && pfslot && pfslot[t] < 0) continue;            /* op_norm.cuh:780 */
+#endif
+        ...
+        pfslot ? ((size_t)((unsigned)pfslot[t] * nhead + hh) * out_stride + ...)  /* :806 */
+```
+
+A negative slot casts to a huge `unsigned`, so `obase` runs off the KV cache. The guard is live
+only when `out_stride != 0` -- exactly the bisect boundary, where instruction 6 (q, dense, stride
+0) is clean and instruction 7 (the first KV write) faults.
+
+**The guard has been load-bearing for bf16 all along.** p12fp8c has `max_request_rows` ABSENT
+(verified by scanning `model.pkt`), and `packed_prefill.rs:585` asserts that on an unmasked plan
+"the padding rows carry a real slot". They do not -- otherwise restoring the guard could not have
+changed anything. `Manifest::validate_object` cannot catch it either: it demands the
+masked-padding capability only when `max_request_rows.is_some()`. So every BF16 packet has been
+protected by a define that FP8 happened to lack. Why unmasked plans carry negative padding slots
+is still open, and the guard masks it.
+
+Fix: `gemma_masked_def=${PLOW_BUILD_MASKED_PADDING:-1}` now carries the DEFINE at the two packed
+object sites, precision-independent; `gemma_masked` still gates the hd512/hd256 ROLE OBJECTS,
+which are a separate bf16-only default.
+
+Proof, p12fp8c rebuilt with the default environment and no override:
+
+```
+input_len,concurrency,ttft_ms,...,out_tok_s,req_per_s,ok_reqs,gen_toks,peak_mem_mib
+64,1,24.00,24.00,8.670,8.670,8.600,8.670,8.800,113.8,0.890,1,128,56648
+coherence gate: PASS        "gate": true
+```
+
+First FP8 packet to serve on this host. `pfpackedseg` from the fixed default build is byte-identical
+to the hand-forced one (`867ab982422711c6`) and differs from the faulting original
+(`2f5fdf10df847d53`), while the FP8 object set keeps its bf16-only role objects off (13 cubins vs
+14 when masked padding also turns the roles on).
+
+Unblocks the FP8 campaign. Still missing for it:
+`perf-data/campaign/gemma4-12b.h100.reference-vllm028-fp8.csv` does not exist, so `campaign.py
+bench` on the FP8 recipe raises `FileNotFoundError` in `compare()` AFTER the bench itself
+succeeds -- the vLLM FP8 baseline has to be measured first.
+
+Method note: the bisect localized this to instruction 7, and masked padding was then dismissed BY
+ARGUMENT ("-1 slots only appear with `max_request_rows`"). The argument was wrong, and operand
+dumps could not have settled it either -- `pfslot` contents are runtime-filled and the host
+patches `t6` at load (`op_norm.cuh:744`), so an encoded `t6=65535` does not mean nullptr at run
+time. One rebuild with the define flipped was cheaper and decisive.

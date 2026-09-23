@@ -313,3 +313,47 @@ Two corrections to the design above, both verified by reading the kernels and th
 
 Remaining for item 3: the `HNR_i -> FP_i` emit loop with `Dep::Coarse`, the runtime per-stage
 table fills, the packet build, and the C32 ladder.
+
+
+### Item 3 seam map (2026-09-23): where each remaining piece goes
+
+Why it is the right lever, from the tracker's own words: "Concurrency above 16 is gated by packet
+memory, not kernels: the sliding ring is `next_pow2(window + chunk - 1)` ... Unblocking C32+ with
+roles means either roles qualified at the 2048 rung or A RING DECOUPLED FROM THE CHUNK."
+`stage_rows` IS that decoupling. The 32-slot packet today has to run chunk 2048 with BOTH role
+objects off, which is why 8192/C32 is 4291 ms against vLLM's 3648 -- the only losing 8192 cell
+(plow wins C1 406/350, C4 773/994, C16 1696/2300).
+
+1. **Emit knob.** There is no `stage_rows` in `emit_config.rs` or `knob_spec.rs` yet -- grep
+   returns nothing. It needs declaring in both (`emit.stage_rows`, and a `PLOW_STAGE_ROWS`
+   passthrough), registered per CLAUDE.md's knob rule.
+
+2. **Emit transform.** Do NOT thread it through `emit_phase` (`devgen/src/lib.rs:7397`): that
+   function is shared by every model and both modes. Use the POST-PASS pattern that
+   `devgen/src/gemv_decode_role.rs` already establishes -- `apply(&mut m)` rewrites programs and
+   writes its own metadata section. A `stage_prefill` pass replicates each sliding layer's
+   HNR-k/HNR-v/FlashPrefill(/FlashMerge) group `S = rows / stage_rows` times, points stage i's
+   HNR sites at `slot.{i}` (t[6]) and its FP/merge sites at `request.{i}` (t[6] / t[7]), and
+   chains `HNR_{i+1}` after `FP_i` with `Dep::Coarse` (the WAR edge: at R=2S, HNR_{i+1}
+   overwrites rows FP_i reads). Cost estimate stands at ~0.6-1 ms on a ~100 ms 4096-row chunk.
+
+3. **Manifest.** `devgen/src/lib.rs:9752` currently hardcodes `stage_rows: None, stages:
+   Vec::new()` with a comment saying the chain is not wired. Declare `pf.request.slot.{i}` /
+   `pf.request.table.{i}` in the SAME block that declares `pf.request.slot` / `pf.request.table`
+   (`:9726-9727`) -- per the revision above they reach instructions by load-time operand patching,
+   so no hoisting -- and fill `stages[i] = Stage { slot, request }`.
+   `Manifest::validate` (`packed_prefill.rs:175-192`) already enforces
+   `stages.len() == request_rows.div_ceil(stage_rows)` and refuses `stage_rows` without `stages`.
+
+4. **Runtime fills.** `exec/gpu.rs:8921-8936` binds the whole-chunk tables by walking
+   `bucket.rope_sites` / `flash_sites` / `merge_sites` and calling `pack.bind_request`, which
+   already SKIPS anything `is_staged_site` matches (`packed_prefill.rs:117-129`, landed in
+   `247dae64`). So staged sites need a parallel per-stage path: for each stage i upload
+   `plan_stage(plan, i, stage_rows)` and `stage_slots(plan, i, stage_rows)` into that stage's two
+   tensors. The second bind site is `gpu.rs:9724-9730`. Note `stage_slots` REQUIRES a masked plan
+   (`plan_with_limit` with `max_request_rows`) and refuses otherwise, so the staged packet must
+   also be a `PLOW_MAX_REQUEST_CHUNK` packet built with `PLOW_NV_MASKED_PADDING=1`.
+
+5. **Verify.** Per the fat-object memory note, validate on a block with real inputs before
+   building a packet -- all non-GEMM prefill ops share `pfpackedseg` at the 255-register cap, so
+   an isolated win can invert in situ. Then the 8192/C32 and 15000/C32 cells.
