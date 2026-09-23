@@ -3619,3 +3619,76 @@ passes them as `--env`. Replaying that **fails**: `--env` reaches the BASE emit,
 derived by diffing the final packet's emit env against `[emit.env]`, so anything living in
 `[emit_roles.env]` is misreported as an override. The recorded `rebuild_command` is not replayable
 for any recipe that uses `[emit_roles.env]`.
+
+---
+
+## What served TPOT is made of, and why the interleave knob cannot flip a cell
+
+Two questions that sound the same and have different answers. Keep them apart.
+
+### 1. The TPOT gap sits outside the decode kernel
+
+`step_bench` B=32 on rc1024permt against served C32 TPOT:
+
+|    in | step(ctx) | served TPOT | "other" | other% | vLLM | gap |
+|------:|----------:|------------:|--------:|-------:|-----:|----:|
+|  1024 |    16.938 |       23.62 |    6.68 |    28% | 18.19 | 5.43 |
+|  4096 |    17.852 |       47.89 |   30.04 |    63% | 37.89 | 10.00 |
+|  8192 |    19.035 |       81.58 |   62.55 |    77% | 67.49 | 14.09 |
+| 15000 |    20.989 |      142.65 |  121.66 |    85% | 123.28 | 19.37 |
+
+The decode step is nearly context-flat (13.691 ms at ctx 128 -> 20.989 at 15000) while served TPOT
+quadruples. KV traversal is **0.29 ms per 1k ctx** at B=32 — 4% of the TPOT rise from 1024 to 8192.
+The whole vLLM TPOT gap fits inside "other" at every rung.
+
+At **C1**, where nothing contends, plow is at parity or ahead on BOTH metrics up to 4096:
+TTFT 18.33/46.02/169.55 vs vLLM 30.04/47.24/170.08; TPOT 10.42/10.50/10.53 vs 10.46/10.54/10.55.
+So the kernels are competitive and the loss is concurrency-only.
+
+PACKLOG at 8192/C32: 157 prefill ticks at a mean **174.10 ms**, 327 decode-only ticks at 15.39 ms,
+27.33 s prefill vs 5.03 s decode (84.5% / 15.5%). Mean tick 66.9 ms against TPOT 82.04 — **TPOT is
+tick cadence**, and a decode row riding a 4096-row launch waits the whole 174 ms.
+
+> **Reading PACKLOG TICK:** `decode_rows` is 0 on every prefill tick and that does NOT mean decode
+> was starved. `mux.rs:2101` — the unified token batch decodes `feeds` inside the prefill pass and
+> CLEARS them; `packlog::tick` at :2498 then reads the emptied vector. Decode does ride prefill.
+> This cost one wrong diagnosis; do not repeat it.
+
+### 2. But granularity only redistributes time — it does not create any
+
+`PLOW_PF_INTERLEAVE` (Layer::Runtime, rows per launch, 0 = uncapped) at 8192/C32, verified from
+`server.log` as `pf_interleave: Some(N)` rather than assumed:
+
+| rows/launch |     TTFT |   TPOT | p99ITL |  tok/s | beats vLLM |
+|------------:|---------:|-------:|-------:|-------:|------------|
+| vLLM 0.28   |  3657.96 |  67.49 | 353.90 |  332.2 | — |
+| uncapped    |  4395.14 |  81.95 | 207.35 |  270.5 | 1/4 |
+| 2048        |  6132.05 | 122.35 | 177.44 |  184.0 | 1/4 |
+| **1024**    |  7874.86 |  **55.07** |  **64.65** |  246.5 | **2/4** |
+| 512         | 16640.34 |  49.28 |  58.06 |  150.2 | 2/4 |
+
+TPOT **is** reachable — 55.07 beats vLLM's 67.49, p99 ITL collapses to 64.65. But total per-request
+latency, TTFT + 128 x TPOT, is **flat**: uncapped 14884 ms, 1024 14924 ms, and both 512 (22948) and
+2048 (21793) are worse. vLLM is 12297 ms. The knob moves time between the prefill phase and the
+decode phase and creates none.
+
+The prediction that 2048 would halve the tick for ~0.4% was **wrong**, and the reason is worth
+keeping: the cost curve at `mux.rs:3828` (launch ms 16.8/26.6/45.2/86.6/172.3 at
+128/512/1024/2048/4096 rows) prices **prefill alone**. Every launch also carries a decode step,
+so capping rows multiplies launches AND decode steps. That is why tok/s falls in every capped arm.
+2048 is also non-monotonic (TPOT +50% against uncapped) and unexplained.
+
+### Where the ~18% end-to-end deficit actually is
+
+Wall for the cell: plow 30.3 s (8192 gen / 270.5 tok/s), vLLM 24.7 s. Against measured per-stack
+rates — plow prefill at its own C1 rate 23.0k tok/s = 22.8 s, decode 256 steps x 19.0 ms = 4.9 s,
+total 27.7 s predicted against 30.3 s measured:
+
+* **decode step ~2.1 s (38%)** — plow 19.0 ms vs vLLM ~11 ms at B=32 on the same 23.8 GB.
+* **unexplained overhead ~2.6 s (46%)** — the largest single unknown, and nothing yet measures it.
+* **prefill kernel ~0.5 s (9%)** — plow is 2% off vLLM at C1/8192 (355.78 vs 348.92).
+
+So the decode step is NOT irrelevant to throughput even though it is nearly irrelevant to TPOT;
+those are different questions and the earlier "kernel work cannot reach it" was too strong. The
+honest target is ~18-20% more end-to-end throughput, and the biggest unattributed piece is the
+2.6 s overhead term.
