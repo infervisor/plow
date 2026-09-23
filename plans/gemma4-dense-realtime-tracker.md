@@ -2973,3 +2973,57 @@ carries the instrumentation for exactly this: `PLOW_STEP_TIME=1` makes `token_ba
 `steptime` module log `steps`, `rows_total`, `enqueue_ms` and `terminal_ms` as rolling means.
 The "token-batch route fired" line is one-shot, so batch sizes cannot be recovered from existing
 logs — this needs a fresh instrumented run at 8192/C32 on a 32-slot 16k packet.
+
+
+### The sliding ring is FREE at decode. Item 3's premise is refuted.
+
+The c32-16k recipe rejects a bigger chunk on decode grounds: "the doubled ring slows every decode
+step (128/C16 TPOT 13.05 -> 17.97 ms, 1179 -> 856 tok/s)". The req1k recipe pays for the same
+belief in the other currency, capping `PLOW_MAX_REQUEST_CHUNK` at 1024 so the ring stays 2048 —
+its own header calls 8 launches for an 8192-token prompt "the price of the small ring".
+
+Both numbers came from comparing two DIFFERENT packets. That is the same cross-packet attribution
+that made `GV_MM_MAX` look like a 0.23-0.37 ms tax when a single-variable A/B put it at 0.7%.
+
+`ab_r2048` and `ab_r4096` differ in exactly ONE emit setting — `max_chunk` 1024 vs 2048, hence
+ring `next_pow2(1024 + chunk - 1)` 2048 vs 4096 — with `decode_batch 32` on both. `step_bench`,
+48 layers, same binary, same lease:
+
+```
+  B   ctx   ring2048   ring4096     delta    ratio
+ 16   128     17.750     17.754    +0.004   1.000x
+ 16  1024     19.981     19.969    -0.012   0.999x
+ 32   128     22.771     22.665    -0.106   0.995x
+ 32  1024     27.141     26.989    -0.152   0.994x
+```
+
+Flat to 0.6%, and the two non-zero deltas favour the BIGGER ring. The claimed 1.38x is not there.
+
+The kernel said so first and should have been believed before a packet was built around the
+opposite. `op_attention.cuh:772-779` walks `span = len - first` with
+`first = (window && len > window) ? len - window : 0`. That is `min(kv_len, window)` — live
+sequence length and the compiled window, neither of which is the ring. `kv_stride` enters at
+`:795` and only as the base address. **The ring cannot change decode work, because no loop bound
+reads it.**
+
+What the ring does cost is resident KV on the sliding layers: a prompt longer than the stride
+wraps, so a bigger stride maps more pages for the same prompt. That is a memory question, and
+peak memory on this packet is flat at 46-48 GiB of 80 with 33 GiB unused. It is not a decode
+question.
+
+Consequences, in order of cheapness:
+
+* `PLOW_MAX_REQUEST_CHUNK = 1024` on the req1k recipe is buying nothing. Raising it toward
+  `max_chunk` cuts an 8192-token prompt from 8 launches to 2 at the cost of ring residency —
+  measurable on the existing packet family, no new kernel.
+* **Item 3 (sub-chunk staging) loses its justification.** It exists to keep a small ring while
+  raising the chunk. If the small ring is worth nothing, the staging machinery — emit loop,
+  manifest `stage_rows`/`stages`, runtime per-stage fills — buys nothing either. The
+  `emit.stage_rows` knob already landed (`e56c78b1`) is harmless and stays OPT_IN/UNSET, but the
+  remaining work should not proceed on this rationale.
+* The recipe headers that state the ring tax should be corrected rather than left to seed a third
+  packet built around it.
+
+This is the eighth refuted lever in this campaign and the third that was refuted by making the
+A/B single-variable. The pattern is consistent enough to be a rule: **a number measured across
+two packets is a hypothesis, not a result.**
