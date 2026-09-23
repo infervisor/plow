@@ -3246,3 +3246,61 @@ with the job killed mid role-emit, so `assets/build.json` existed while `weights
 the serve died with `Io { path: ".../weights.json", NotFound }`. `build.json` is written early and
 is NOT sufficient evidence that an emit finished — check the file set. The campaign's coherence
 gate caught it ("numbers above are not evidence"), so nothing false was recorded.
+
+
+### req_chunk 2048 lands, and the residency prediction was too pessimistic
+
+`rc2048` is the req1k recipe with one variable changed: `PLOW_MAX_REQUEST_CHUNK` 1024 -> 2048,
+`max_chunk` 4096 on both, verified from `build.json` (`req_chunk = 2048`, `knobs K = verified`).
+C32, `high_concurrency`, adaptive off.
+
+```
+   arm       in      TTFT ms   TPOT ms   p99 ITL    tok/s   peak GiB    eff
+  req1024   1024      587.77    24.270    179.00   1093.3     47.11    26.5
+  req2048   1024      586.36    24.680    180.59   1078.3     67.10    26.6
+  req2048   4096     1947.53    48.620    193.19    493.9     69.10    24.0
+  req1024   8192     4425.32    82.060    206.28    269.1     51.11    22.1
+  req2048   8192     3822.43    84.120    205.22    276.0     71.10    23.2
+  req2048  15000     7254.35   147.610    228.01    153.8     73.10    22.7
+```
+
+**It did not OOM at 15000.** The section above predicted ~92 GiB there and said rc2048 "does NOT
+fit at 15000". Measured peak is **73.10 GiB**. That prediction was wrong, and the error is worth
+naming because it is the same class of error the ring arithmetic was written to prevent: the
+`weights + full-KV + rings` sum is an upper bound on RESERVED rows, not a measurement of RESIDENT
+pages. Not every slot is live at full context simultaneously, requests retire and release, and the
+VMM maps per block on demand. The bound is still useful as a ceiling — req_chunk 8192 at 160 GiB
+of rings is impossible by any accounting — but a number within ~25% of the card must be measured,
+not asserted.
+
+Peak also grows a uniform +2.0 GiB per cell (67.1 / 69.1 / 71.1 / 73.1) across input lengths that
+are not uniformly spaced, so it is not tracking context. Unexplained; not chased.
+
+**What the chunk buys.** Against req1024 at the same cell, 8192/C32: TTFT **-13.6%** (4425.32 ->
+3822.43), tok/s **+2.6%** (269.1 -> 276.0), p99 ITL -0.5%, TPOT +2.5% worse. Effective streams
+22.1 -> 23.2. At 1024 the two are indistinguishable (TTFT -0.2%, tok/s -1.4%). So it is three of
+four metrics better at 8192, neutral at short prompts, and it opens 15000 at eff 22.7 where
+req1024 under `auto` managed 21.1 with TTFT 8741 (rc2048 is **17% faster to first token** there).
+The cost is +20 GiB of peak, which the card has.
+
+**Standing at C32 with req_chunk 2048, against vLLM 0.28:**
+
+```
+    in      TTFT ms          TPOT ms         p99 ITL           tok/s          eff
+            plow / vLLM      plow / vLLM     plow / vLLM       plow / vLLM
+   1024    586.4 /  704.4    24.68 / 18.19   180.6 / 250.6   1078.3 / 1351.9  26.6 / 24.6
+   4096   1947.5 / 1990.4    48.62 / 37.89   193.2 / 325.4    493.9 /  597.8  24.0 / 22.7
+   8192   3822.4 / 3658.0    84.12 / 67.49   205.2 / 353.9    276.0 /  332.2  23.2 / 22.4
+  15000   7254.4 / 6433.8   147.61 /123.28   228.0 / 383.8    153.8 /  183.9  22.7 / 22.7
+```
+
+plow wins **TTFT at 1024 and 4096**, **p99 ITL at every length** (by 28-41%), and **effective
+streams at every length**. It loses **TPOT and out_tok_s everywhere**, by 16-25%. No cell is a
+clean four-metric win, so the honest C32 standing on the 12B is still 0/4 by the campaign rule,
+but the shape of the remaining deficit is now unambiguous and singular: **decode step time**.
+TTFT is within 4.5% at 8192 and ahead at two lengths; the throughput gap is TPOT and nothing else,
+which is the KV-traversal gap already characterised in the metric-fingerprints note.
+
+That also means the prefill levers are close to exhausted on this model: decode rows already ride
+at ~20/pack, launches already fill their bucket 109/177, the ring is free, and the chunk has now
+been raised as far as memory allows. What is left is the decode kernel.
