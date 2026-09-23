@@ -4622,3 +4622,70 @@ certificate. Still stale, unmeasured, left alone: `bf16-realtime.toml`, `bf16-l8
 2. **TTFT above 4096** — 103/93, 210/180, 431/351. The bench's own roofline puts prefill at
    32-34% of the compute roof, i.e. #66 (FlashPrefill at 196/351 TFLOP/s vs the GEMM path's
    ~780) is the lever, not scheduling.
+
+### #71 narrowed: the fixed per-step cost is NOT host turnaround either
+
+`sched/multistep.rs` states the mechanism plainly: MULTISTEP enqueues *k* decode iterations'
+worth of packet streams at once "so the host isn't in the loop every token" — it removes
+**host->device turnaround**, not per-launch device cost.
+
+Today's 26B A/B is therefore a free experiment on #71. MULTISTEP 4 -> 0 removes three of every
+four host round trips, and TPOT moved **5.58 -> 5.60 ms**, i.e. nothing. (MULTISTEP was
+genuinely active, not silently disabled by `multistep_disabled_by_decode` at gpu.rs:3539 — p99
+ITL fell 4x when it was turned off.)
+
+So host turnaround joins dispatch, smem zeroing and CUDA-graph launch on the excluded list from
+17cacd99. What is left for a ~1 ms cost invariant to batch, context AND register count is a
+per-kernel-launch device cost.
+
+### The 26B's decode problem is bandwidth efficiency, not scheduling
+
+The bench's own roofline, from this run: 3.8B active params / 7.64 GB weights, decode at
+**1375 GB/s = 41.0% of the memory roof**, flat across the whole ladder. Its diagnosis line reads
+"low bandwidth efficiency; check dispatch overhead or wave tail quantization".
+
+For contrast the 12B runs its weight walk at 2.34 TB/s = ~70% of roofline (17cacd99). vLLM's
+5.03 ms on the same 7.64 GB implies ~1.52 TB/s = 45% — also poor, but 11% better than plow.
+At B=1 an A4B MoE reads its 7.64 GB scattered across experts, so both stacks lose locality; the
+gap is the addressable part.
+
+This is why the 26B TPOT is lost at all five C1 cells and why tok/s follows it down. It is
+tasks #35/#36 territory (MoE decode), not a scheduling knob, and it is the single blocker
+keeping 128/C1 and 1024/C1 at 2/4 rather than 4/4.
+
+## 12B C4 column, paired (2026-09-23T21) — first time scored against a same-session baseline
+
+| cell | TTFT p/v | TPOT p/v | p99 ITL p/v | tok/s p/v | win |
+|------|----------|----------|-------------|-----------|-----|
+| 128/C4   | **38.63**/55.60   | 10.79/10.60 | 14.00/11.63  | 362.6/365.2 | 1/4 |
+| 1024/C4  | **101.56**/130.81 | 11.81/11.16 | 53.60/12.03  | 319.3/330.5 | 1/4 |
+| 4096/C4  | **324.20**/466.49 | 14.01/12.17 | 174.19/12.14 | 243.1/254.3 | 1/4 |
+| 8192/C4  | **686.37**/994.78 | 17.29/13.63 | 189.88/13.70 | 177.3/187.7 | 1/4 |
+| 15000/C4 | **1230.22**/1669.69 | 26.46/18.18 | **211.91**/324.48 | 111.2/128.6 | 2/4 |
+
+**0 cells at 4/4, but the shape is a deliberate trade, not a uniform loss.** plow wins TTFT at
+every C4 cell by **30-45%** and loses TPOT everywhere plus p99 ITL at four of five.
+
+**Cause, from the config not a guess**: the realtime profile ships `PLOW_PF_INTERLEAVE = "0"`,
+and `config.rs:986` maps 0 -> `usize::MAX`, i.e. **unbounded prefill rows per launch** (the unset
+default is 2048). A 4096-row prefill therefore runs to completion while every decoder waits,
+which is exactly the TTFT lead and exactly the ITL penalty.
+
+**Decomposition** (pure batching vs prefill interference), using 128/C4 as the
+near-zero-interference control:
+
+|                          | plow  | vLLM  |
+|--------------------------|-------|-------|
+| B=4 batching cost (128/C4 minus C1) | +0.27 | +0.04 |
+| 4096/C4 total over C1               | +3.38 | +1.52 |
+| => prefill interference             | ~3.11 | ~1.48 |
+
+plow's interference is ~2.1x vLLM's; its pure batching penalty is ~7x.
+
+**Pre-registered ceiling for the interleave sweep.** p99 ITL >= TPOT always. At 4096/C4 plow's
+TPOT (14.01) already exceeds vLLM's whole p99 (12.14), so p99 there **cannot** be won without
+winning TPOT first. Even perfectly matching vLLM's interference leaves TPOT ~12.27 vs 12.17.
+Expect big p99 gains and cells moving 1/4 -> 2/4 or 3/4, **not** 4/4 — consistent with the
+earlier recorded null that PF_INTERLEAVE is a TPOT/TTFT dial that does not flip a cell. Running
+it anyway because p99 ITL of 174 ms is the worst single number in the comparison, and the goal
+names serving metrics explicitly.
