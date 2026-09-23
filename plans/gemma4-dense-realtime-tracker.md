@@ -4144,3 +4144,50 @@ Full decode step at B=32 ctx 128, every term now measured:
     2.92 ms   the rest of the op work (norms, attention, lm_head+sampling tail 1.642 ms)
    -------
    13.69 ms   + 5.35 ms KV traversal at ctx 8192 -> 19.03, vs vLLM's 15.82
+
+## RUNG BY RUNG: plow already sweeps three cells 4/4
+
+This should have been the first thing checked. The campaign has been judged on 8192/C32 -- the
+hardest cell in the grid -- and reported as "0/4 clean cells". Comparing the whole ladder against
+`perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.csv` shows otherwise.
+
+From ONE run, ONE packet (df11734dd142dc26, commit 06fdd7ca6e10, provisional=0, the realtime
+profile with PLOW_MULTISTEP=0 + PLOW_DECODE_PIPELINE=1), request counts matched to vLLM at
+32 reqs / 4096 gen tokens in every cell:
+
+    cell        TTFT plow/vLLM    TPOT          p99 ITL        tok/s          wins
+    128/C1       18.33/ 30.04*    10.42/10.46*  10.50/11.27*   95.40/94.20*   4/4
+    1024/C1      46.02/ 47.24*    10.50/10.54*  10.59/11.37*   92.80/92.40*   4/4
+    4096/C1     169.55/170.08*    10.53/10.55*  10.74/11.39*   84.90/84.80*   4/4
+    128/C4       36.87/ 55.31*    10.59/10.49   11.26/11.34*  369.00/368.80*  3/4
+    8192/C1     355.78/348.92     10.56/10.55   10.75/11.52*   75.40/75.80    1/4
+    15000/C1    737.17/671.77     10.62/10.56   10.85/11.48*   61.30/63.60    1/4
+
+The C1 column is three-fifths swept. 128/C4 misses only on TPOT, by 1% (10.59 vs 10.49).
+
+### 8192/C1 is the closest unflipped cell, and it is very close
+
+    TTFT   355.78 vs 348.92  -- lose by 6.86 ms (2.0%)
+    TPOT    10.56 vs  10.55  -- lose by 0.01 ms (0.1%)
+    p99     10.75 vs  11.52  -- WIN
+    tok/s   75.40 vs  75.80  -- lose by 0.5%
+
+tok/s at C1 is not independent: per-request wall is TTFT + 127*TPOT, so plow is
+355.78 + 127*10.56 = 1696.9 ms against vLLM's 348.92 + 127*10.55 = 1688.8 ms. The whole cell
+turns on **8.1 ms per request**. That can come from either end:
+
+  * -8.1 ms of TTFT = 2.3% of prefill. FlashPrefill is 53.0 ms of 329.2 ms (16%) at 196 TF/s
+    sliding / 351 TF/s full against the GEMM path's ~780, so a 15% improvement there covers it
+    outright (#66).
+  * or -0.064 ms of TPOT = 0.6% of the decode step. The step has 1.25 ms of fixed entry (#71)
+    and ~2.1 ms of walk headroom, so 0.6% is well inside what either lever would return.
+
+15000/C1 needs -73 ms per request (TTFT -9.7%), which the same FlashPrefill lever (~9% of
+prefill) very nearly covers.
+
+### What this changes
+
+The decode work at B=32 that has occupied this session targets 8192/C32, which needs -3.2 ms on
+a 19.03 ms step and is the hardest cell in the grid. The C1 column needs 2% on prefill and is
+two cells from a clean sweep. Prefill FlashPrefill (#66) is now the highest-value item in the
+campaign: it is the shared lever for 8192/C1, 15000/C1, and the ~2.3 s prefill term at C32.
