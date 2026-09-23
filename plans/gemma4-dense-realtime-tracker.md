@@ -3825,3 +3825,49 @@ inefficiency. There is no cheap 4x win there; it is a kernel project.
 
 Honest read: these levers take 8192/C32 to roughly throughput parity while winning TTFT, TPOT and
 p99 -- 3 of 4 metrics, not 4 of 4. Nothing measured so far closes the remaining ~4% of tok/s.
+
+### Prefill is at its ceiling; the unified pass's per-row decode cost is the lever
+
+Two more served runs at the same cell on the chunk-2048 packet (rc2048), with and without the
+unified pass, settle two things the rc1024 data could not.
+
+**There is no multi-span penalty.** With decode out of the launch, a 4096-row prefill launch costs
+175.640 ms (n=120), i.e. 0.0429 ms/row -- identical to the C1 single-request rate of 0.0434 ms/row
+(8192 rows in 355.78 ms). The earlier hypothesis that served launches pay 9.4% for carrying
+several request spans is REFUTED; that 9.4% was entirely riding decode. plow's prefill floor is
+524288 x 0.0429 = 22.5 s and the kernel is at its ceiling.
+
+**Riding decode shares the weight pass only partly, and pays 1.9x per row.** Within one run, at
+the same bucket, pricing prefill rows at 0.0429 ms/row:
+
+    4095 prefill + 1 decode  = 182.25 ms  ->  1 decode row costs  6.55 ms
+    4068 prefill + 28 decode = 194.55 ms  -> 28 decode rows cost 20.05 ms
+
+    => riding decode   = 6.05 ms fixed + 0.50 ms/row
+       standalone step = 10.785 ms fixed + 0.268 ms/row   (measured twice, 0.268 / 0.269)
+
+So the fixed weight pass IS partly shared (6.05 vs 10.785), but the marginal per-row cost is 1.9x
+worse. At 28 rows: riding 20.05 ms vs 18.02 ms standalone -- riding is 11% WORSE, which is exactly
+why PLOW_PF_NO_INTERLEAVE=1 wins throughput. The interleave is not buying what it was built to buy.
+
+The likely cause is that decode rows inside the unified pass go through the PREFILL attention path
+rather than the decode attention kernel; a 1-row query is the worst case for a prefill flash tile.
+If the marginal cost came down to the standalone 0.268 ms/row, riding 28 rows would cost
+6.05 + 27 x 0.268 = 13.3 ms against 18.02 standalone -- a 4.7 ms saving per launch, ~0.80 s over
+171 launches, AND it would make interleaving a net win so that more decode could ride.
+
+Today only 42.2% of decode token-steps ride a prefill launch; 57.8% pay a private weight pass
+(8393 token-steps counted against 8192 expected output tokens, so the accounting closes).
+
+### Arm table at 8192/C32 (vLLM: 3657.96 / 67.490 / 353.90 / 332.2)
+
+    arm                out_tok_s   TTFT    TTFT_med   TPOT    p99 ITL   wins
+    rc1024 uncapped      270.0    4424.14  1971.44   81.76    206.25    p99
+    rc1024 no-ilv        281.4    4212.24  1784.99   79.00    213.34    p99
+    rc2048 uncapped      273.7    3874.06  1193.90   84.52    205.52    p99
+    rc2048 no-ilv        278.7    3778.68   996.84   83.31    217.28    p99
+    rc1024 ilv=1024      246.5    7875     -         55.07     64.65    TPOT + p99
+
+rc2048 is the TTFT lever: 4424 -> 3874 uncapped, and its MEDIAN TTFT of 996.84 ms beats vLLM's
+1662.94 outright. Mean TTFT 3778.68 is within 3% of vLLM's 3657.96. No arm yet clears more than
+2 of 4, and tok/s remains the hard blocker on every one.
