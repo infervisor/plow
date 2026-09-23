@@ -4191,3 +4191,143 @@ The decode work at B=32 that has occupied this session targets 8192/C32, which n
 a 19.03 ms step and is the hardest cell in the grid. The C1 column needs 2% on prefill and is
 two cells from a clean sweep. Prefill FlashPrefill (#66) is now the highest-value item in the
 campaign: it is the shared lever for 8192/C1, 15000/C1, and the ~2.3 s prefill term at C32.
+
+### The 8192 prompt splits 4224 + 3968 and pads 128 rows for nothing
+
+Measured composition on the shipped ladder packet (sha df11734dd142dc26, PLOW_PF_PACKLOG=1, C1):
+
+    in=4096    rows=4096  -> [4096]                     bucket 4096            0 padded
+    in=8192    rows=8192  -> [4224, 3968]               buckets 4224+4096    128 padded
+    in=15000   rows=15000 -> [4224,4224,4224,1816,512]  buckets ...2048,512  232 padded, 5 launches
+
+First, the N+1/BOS assumption in the recipe does NOT hold for this bench path: a 4096-token
+prompt is 4096 rows, not 4097. The 1088/4160 rungs were added for a row count that does not occur
+at C1, so they are dead weight there (they may still serve the C4/C16 packs).
+
+Second, 8192 rows split as [4224, 3968] pay 128 padded rows where [4096, 4096] pays NONE, for the
+same two launches. At the measured 352.71 ms / 8320 bucket-rows = 0.0424 ms per bucket-row that
+is ~5.4 ms -- two thirds of the 8.1 ms that 8192/C1 needs.
+
+Cause, `Backend::pick_prefill_bucket` (exec/gpu.rs:8833):
+
+    // While the largest allowed rung still FILLS, it is optimal outright:
+    // minimal padding and minimal launches at the same time.
+    let top = n_allowed - 1;
+    if rem >= self.prefill[top].t as usize { return top; }
+
+The claim is false. It is only true when the top rung also TILES the remainder. Here top=4224 and
+rem=8192, so the shortcut returns 4224 and strands 3968 in the 4096 bucket. The cost-aware DP
+directly below it -- which minimizes exactly `sum(bucket_t) + chunk_cost*launches` -- would pick
+4096 and pad nothing: [4096,4096] costs 8192+2*512=9216 against [4224,4096]'s 8320+1024=9344.
+
+The DP is O(rem/unit * rungs) = ~128*10 for this ladder, so the shortcut buys nothing measurable
+and is only reachable for the long prompts where it does the most damage.
+
+Predicted, before measuring: capping chunks at 4096 (`PLOW_PF_CHUNK=4096`, a RUNTIME knob, no
+rebuild) reproduces the fix at 8192 and should REGRESS 15000, because it forces 4096*3 + 2712 into
+a 4096 bucket = 960 more padded rows (~+41 ms) and throws away the packer's 5-launch tail plan.
+The regression is the real test of the 0.0424 ms/row price.
+
+### Measured: the bucket-picker defect is worth 4.23 ms, and the 15000 prediction was wrong
+
+`PLOW_PF_CHUNK=4096` (runtime, emulates the fix by capping the chunk below the 4224 rung),
+p12rw, 32 prompts, CPU-quiet, PACKLOG on in both arms:
+
+    cell        control    cap4096      delta   predicted
+    8192/C1     355.81     351.58      -4.23      -5.4     composition [4224,3968] -> [4096,4096]
+    15000/C1    702.89     699.03      -3.86      +5.4     WRONG SIGN
+
+Control reproduces the ladder cell to 0.03 ms (355.81 vs 355.78), so the noise floor is far
+below the effect. The 8192 composition changed exactly as the simulator predicted.
+
+The 15000 prediction was wrong because it priced the rung swap and ignored that the TAIL also
+changes: [1816->2048, 512] becomes [1688->2048, 1024]. Solving the two cells together:
+
+    c(4224) - c(4096) = 4.23 ms      (8192: one 4224 launch replaced by a 4096 one)
+    c(1024) - c(512)  = 8.83 ms      (15000: 3 x -4.23 plus the heavier tail = -3.86)
+
+so both cells improve and the model is consistent -- the error was reading the simulator, not
+the model. The DP fix is strictly better than this knob at 15000 (pad 40 vs 360) and identical
+at 8192, so it is the version to land.
+
+Note the defect only fires when the top rung does NOT tile the remainder. On rc1024permt (top
+rung 4096) greedy and DP agree exactly at every ladder cell. It is the appended 4160/4224 rungs
+-- added for a BOS+N row count that does NOT occur on this bench path (a 4096-token prompt is
+4096 rows, verified by PACKLOG) -- that become the greedy top pick and strand the tail.
+
+### The launch fixed cost is ~5.2 ms, not the 21.7 ms the cost model assumes
+
+`pf_chunk_cost` charges a launch 512 rows, which at the measured 0.0424 ms/bucket-row prices a
+launch at 21.7 ms. Fitting the two single-launch cells instead:
+
+    F + 1024r =  46.02        r = 0.0398 ms/row
+    F + 4096r = 168.38        F = 5.2 ms per launch
+
+(128/C1 does not fit this line -- 10.3 predicted vs 18.33 measured -- because small-M GEMMs are
+memory-bound; the fit is only valid over the compute-bound 1024-4096 range.)
+
+The two-launch 8192 costs 351.58 against 2 x 168.38 = 336.76, and that 14.82 ms excess is the
+second chunk's longer-KV attention, which one launch would also pay. So collapsing 8192 into a
+SINGLE launch buys the launch overhead, ~5.2 ms, not the 21.7 the model implies.
+
+### What 8192/C1 needs, priced
+
+    TTFT   355.78 -> 351.6 (bucket fix) -> ~346.4 (single launch)   vs vLLM 348.92   WIN
+    tok/s  128000/(346.4 + 127*10.56) = 75.85                       vs        75.80   WIN (thin)
+    p99    10.75                                                    vs        11.52   WIN
+    TPOT   10.56                                                    vs        10.55   LOSE by 0.01
+
+TPOT is the sole remaining blocker and it is NOT noise: the A/B read 10.660 in both arms at
+8192 and 10.720 in both at 15000, identical to three decimals. A real ~0.02 ms decode win is
+needed, which is 2% of the ~1.0 ms megakernel entry (#71) -- by far the cheapest source.
+
+### RETRACTED: the stranded 128 rows are NOT pick_prefill_bucket's greedy shortcut
+
+The section above ("The 8192 prompt splits 4224 + 3968 and pads 128 rows for nothing") named
+`pick_prefill_bucket`'s `if rem >= top { return top }` as the cause. That is WRONG, and the fix
+built on it is a no-op. Retracted on the measurement:
+
+  * `pf_cover: false` in the running server, so the cost-aware DP branch -- the one holding the
+    shortcut -- is the branch that executes. The shortcut IS reachable.
+  * The DP provably cannot choose 4224 at rem=8192: [4096,4096] costs 8192 + 2*chunk_cost and
+    [4224,4096] costs 8320 + 2*chunk_cost, so 4096 wins for ANY chunk cost.
+  * Gating the shortcut on `rem % top == 0`, rebuilt and re-run on the same packet, changed the
+    composition NOT AT ALL (still `rows=4224 bucket=4224` + `rows=3968 bucket=4096`, read from
+    PACKLOG) and the cell not at all: 8192/C1 TTFT 355.60 against the control's 355.81.
+
+So the 4224 slice is not chosen by bucket selection. It is the per-request SLICE CAP --
+`pf_request_max_rows()` / `pf_chunk_rows()`, i.e. `PLOW_MAX_REQUEST_CHUNK`=4224 -- applied to the
+prompt before a bucket is picked; the bucket then merely covers the 4224-row slice exactly.
+`PLOW_PF_CHUNK=4096` works because it lowers that cap, not because it changes the DP.
+
+What survives, all measured:
+
+    8192/C1   355.81 -> 351.58 with PLOW_PF_CHUNK=4096   (-4.23 ms)  composition [4096,4096]
+    15000/C1  702.89 -> 699.03                           (-3.86 ms)
+
+That is a serve-env / recipe lever with no code change, and it has NOT yet been run across the
+full ladder, so it is not landed. PLOW_PF_CHUNK also feeds a per-tick row budget (mux.rs:2002),
+so part of the -4.23 ms may not be the slice at all -- a full-ladder arm is required before any
+claim.
+
+### The binary drifted: decode TPOT is ~0.1 ms worse than the run that scored 4/4
+
+Same packet (df11734dd142dc26, doctor-verified), clean box (no co-tenant, 100% GPU, 51 C, no
+throttle, load 1.05), full realtime ladder on today's binary:
+
+    cell        TPOT now   TPOT 02:24   vLLM
+    128/C1        10.52       10.42      10.46     <- was a WIN, now a LOSS
+    1024/C1       10.59       10.50      10.54     <- was a WIN, now a LOSS
+    4096/C1       10.63       10.53      10.55     <- was a WIN, now a LOSS
+    8192/C1       10.66       10.56      10.55
+    15000/C1      10.72       10.62      10.56
+
+0 cells at 4/4 on this binary, against 3 on the 02:24 one. Prefill did not regress (15000/C1 TTFT
+703.25 is the rt.pf_cover cert's expected 737 -> 703). This is decode only, ~1%, uniform across
+context, and no commit since 02:24 touches the decode path: e13277fd's `debug_max_inst` writes are
+load-time and gated on the env var, 69083825/1659c37a are comment-only in op_gemv_mma.cuh, and the
+packet's cubins predate all of them.
+
+**Consequence for the campaign: the "3 cells at 4/4" result is tied to the 02:24 BINARY, not just
+the packet.** Any 4/4 claim must name the binary and be re-measured against a control built from
+the same commit. Finding this ~0.1 ms is worth more than the 0.01 ms gap at 8192/C1.
