@@ -2,9 +2,17 @@
 # ladder16k with 32 slots: chunk 1024 keeps a slot's sliding ring at 2048 rows, so 32 slots
 # and the on-demand full-attention KV of the long inputs fit beside 22 GiB of weights (peak
 # 45.5-48.5 GiB over the C16/C32 ladder). Chunk 2048 (ring 4096, p12c32c, 2026-09-21) fits too
-# and halves long-prompt C32 TTFT (8192/C32 10314 -> 4695 ms) but the doubled ring slows every
-# decode step (128/C16 TPOT 13.05 -> 17.97 ms, 1179 -> 856 tok/s), so 1024 stays. Both attention
-# roles need the 4096 rung and are off (same trade as gemma4-12b.h100.bf16-c32.toml).
+# and halves long-prompt C32 TTFT (8192/C32 10314 -> 4695 ms).
+#
+# CORRECTION (2026-09-23): this header used to reject chunk 2048 because "the doubled ring slows
+# every decode step (128/C16 TPOT 13.05 -> 17.97 ms, 1179 -> 856 tok/s)". That was measured across
+# two DIFFERENT packets and is refuted. A single-variable A/B (ab_r2048 vs ab_r4096, differing only
+# in max_chunk, decode_batch 32 on both) is flat to 0.6% at B=16/32 x ctx=128/1024, and both
+# non-zero deltas favour the BIGGER ring. The kernel agrees: op_attention.cuh:772-779 walks
+# min(kv_len, window) and kv_stride appears only as a base address at :795, so no loop bound reads
+# the ring. The ring costs RESIDENCY, not decode time. See plans/gemma4-dense-realtime-tracker.md.
+#
+# Both attention roles need the 4096 rung and are off (same trade as gemma4-12b.h100.bf16-c32.toml).
 
 [cell]
 name = "gemma4-12b.h100.bf16-c32-16k"
