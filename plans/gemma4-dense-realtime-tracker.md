@@ -4689,3 +4689,28 @@ Expect big p99 gains and cells moving 1/4 -> 2/4 or 3/4, **not** 4/4 — consist
 earlier recorded null that PF_INTERLEAVE is a TPOT/TTFT dial that does not flip a cell. Running
 it anyway because p99 ITL of 174 ms is the worst single number in the comparison, and the goal
 names serving metrics explicitly.
+
+### PLOW_PF_INTERLEAVE sweep at C4 — the pre-registered null holds, default unchanged
+
+| arm | 4096 p99 | 8192 p99 | 15000 p99 | 4096 TTFT | 8192 TTFT | cells 4/4 |
+|-----|----------|----------|-----------|-----------|-----------|-----------|
+| unbounded (shipped) | 174.19 | 189.88 | 211.91 | 324.20 | 686.37 | 0 |
+| 2048 | 155.82 | 164.73 | 173.40 | 557.08 | 934.90 | 0 |
+| **1024** | **56.41** | **60.21** | **67.02** | 335.22 | **612.87** | 0 |
+| 512 | 49.56 | 55.31 | 64.52 | 494.07 | 1046.50 | 0 |
+
+**No arm flips a cell anywhere** — exactly the ceiling registered before the run, and it confirms
+the earlier null (#50) that PF_INTERLEAVE is a TPOT/TTFT dial.
+
+`IL=1024` is nonetheless the interesting point: it cuts p99 ITL ~3x AND improves TTFT at the two
+largest cells (686.37 -> 612.87 at 8192, 1230.22 -> 1132.66 at 15000), paying in TPOT
+(17.29 -> 18.97 at 8192) and tok/s. `IL=512` over-chunks: every metric degrades.
+
+**Not claimed:** `IL=2048` scored 3/4 at 128/C4 (vs 1/4 control). Rejected as noise — the tok/s
+margin is 365.5 vs 365.2 (0.08%), and the knob should not even bind on a 4x128 = 512-row
+workload, so a mechanism is missing. Needs a repeat run before it means anything. This session
+already lost a day to a cross-session artifact; see [[greedy-equivalence-needs-a-noise-floor]].
+
+**Decision: leave the shipped `PLOW_PF_INTERLEAVE = "0"` alone.** It does not win a cell, and
+moving it trades three metrics for one. Revisit only if TPOT at C4 comes down enough that p99
+stops being gated by it.
