@@ -2684,3 +2684,66 @@ ARGUMENT ("-1 slots only appear with `max_request_rows`"). The argument was wron
 dumps could not have settled it either -- `pfslot` contents are runtime-filled and the host
 patches `t6` at load (`op_norm.cuh:744`), so an encoded `t6=65535` does not mean nullptr at run
 time. One rebuild with the define flipped was cheaper and decisive.
+
+
+## Where the comparison actually stands, cell by cell (2026-09-23)
+
+Scored from the committed ladders (`perf-data/campaign/*.csv`, plow cells at `453cf4c1`, vLLM
+0.28 reference at `a3ea207e`) with the last run of each cell. A cell is a WIN only if plow is
+better on ALL FOUR of TTFT, TPOT, p99 ITL and out_tok_s.
+
+| config | cells winning all four |
+|---|---|
+| 12B ladder16k (16-slot packet) | **3 of 20** -- 128/C1, 1024/C1, 4096/C1 |
+| 12B c32-16k (32-slot packet) | **0 of 20** |
+| 26B ctx16k | **0 of 20** |
+| 26B c32-16k | **0 of 10** |
+
+**A correction to an earlier claim in this file.** "plow wins 8192 at C1/C4/C16" was TTFT-only.
+Scored on all four metrics 8192/C4 and 8192/C16 LOSE: TPOT 17.2/49.6 against 13.5/37.5 and
+out_tok_s 177.5/269.5 against 188.4/301.1. TTFT is plow's strength and it does win broadly at
+C1-C16; it is not the whole scorecard.
+
+### The three systematic deficits
+
+1. **Request throughput at C>=4.** out_tok_s loses in essentially every C>=4 cell, even where
+   TTFT wins by 1.5-2x.
+2. **Decode TPOT under batch x context.** At C1 TPOT is at PARITY at every context
+   (10.4/10.5 at 128 ... 10.6/10.6 at 15000). It degrades only with concurrency: at C16,
+   +7% at 128, +18% at 1024, +33% at 4096, +32% at 8192, +25% at 15000. So this is batched KV
+   traversal, not per-token weight streaming.
+3. **p99 ITL at short context on the 32-slot packets** (43 ms against 11) -- the MULTISTEP wave.
+
+### Effective concurrency is the throughput story, and the 32-slot packet already wins 3 of 5
+
+Effective streams = out_tok_s x TPOT. It says how many sequences were really in flight, which is
+what separates a real throughput win from under-subscription.
+
+| in | C32, 16-slot pkt | C32, 32-slot pkt | vLLM |
+|---|---|---|---|
+| 128 | 15.0 | **29.9** | 29.0 |
+| 1024 | 14.4 | **26.4** | 24.6 |
+| 4096 | 14.1 | **23.3** | 22.7 |
+| 8192 | 13.7 | 13.6 | 22.4 |
+| 15000 | 13.3 | 8.0 | 22.7 |
+
+The 16-slot packet is pinned near 14 at every length -- that is the slot cap, and its flattering
+C32 TPOT (50.7 against vLLM's 67.5 at 8192) is purely under-subscription. The 32-slot packet
+BEATS vLLM at 128/1024/4096 and then collapses at 8192 and 15000. **That collapse is the single
+highest-value target left**: at 8192/C32, restoring eff 13.6 -> 23 takes out_tok_s from 269.6 to
+roughly 455 against vLLM's 332, and TTFT falls with it because requests stop queueing.
+
+### What the collapse is NOT
+
+* **Not the KV admission budget.** The served log reports `per_token=16384 block_rows=2048
+  max_rows=794890`, i.e. `kv_row_charge` took the full-attention-only branch (`gpu.rs:601`; the
+  sliding rings are pre-allocated so they are already out of `free`). 32 x 15000 = 480000 rows
+  fits inside 794890 with room to spare.
+* **Not startup narrowing.** `mux capacity resolved ... capacity=32 ingress_capacity=128`, with
+  `decode_rungs=[1,2,4,8,16,32] gemv_mm_cap=32 gemv_weight_passes=1`.
+* **Not a harness artefact.** Both stacks run 64 requests per cell and the implied prefill rates
+  are physical: at 15000/C32, plow 18150 tok/s = 436 TFLOP/s and vLLM 21600 = 518 TFLOP/s, i.e.
+  44% and 52% of H100 dense BF16 peak. The comparison is sound.
+
+So the collapse happens DURING the run, not at load. Next step is an instrumented 32-slot run at
+8192/C32 that records admitted-slot count over time against KV pressure and prefill occupancy.
