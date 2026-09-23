@@ -4592,3 +4592,33 @@ and it did not; 2.43 ms of TTFT remain. Only p99 ITL is won there.
 **Where 8192/C1 actually stands**: needs TTFT -2.43 AND TPOT -0.01 AND tok/s +0.1. The first is
 prefill (reachable: FlashPrefill #66 runs at 196/351 TFLOP/s vs the GEMM path's ~780); the
 second is decode KV traversal and no prefill work can touch it.
+
+## 26B C1 ladder, paired (2026-09-23T20) — user ask
+
+Packet p26l8 (bf16, ctx16k, 16 slots, rungs to 8192), vs a vLLM 0.28 26B reference measured in
+the SAME session (coherence gate PASS, matched client/warmups/seed, 32 prompts / 128 out).
+
+| cell | TTFT p/v | TPOT p/v | p99 ITL p/v | tok/s p/v | win |
+|------|----------|----------|-------------|-----------|-----|
+| 128/C1   | **21.34**/38.26  | 5.60/5.03 | **5.67**/5.68 | 174.6/189.0 | 2/4 |
+| 1024/C1  | **38.24**/41.88  | 5.73/5.08 | **5.78**/5.86 | 167.2/186.4 | 2/4 |
+| 4096/C1  | 103.39/93.06 | 5.79/5.09 | **5.86**/5.97 | 152.6/173.0 | 1/4 |
+| 8192/C1  | 210.43/180.09| 5.87/5.09 | **5.95**/6.02 | 133.9/154.8 | 1/4 |
+| 15000/C1 | 431.70/351.55| 5.99/5.09 | **6.04**/6.07 | 107.3/128.3 | 1/4 |
+
+**0 cells at 4/4.** The 26B is well behind the 12B (3/5). But one defect found and fixed:
+
+**The realtime profile was stale at `PLOW_MULTISTEP = "4"`** while the sibling
+`bf16-ctx16k.toml` already carried `"0"` with its own certificate. MULTISTEP=4 emits four tokens
+per wave, so `itl_med` is literally 0.000 and p99 ITL is exactly 4 x TPOT. Fixing it
+(commit 6374d9db) took p99 ITL 22.38/22.88/23.17/23.43/23.93 -> 5.67/5.78/5.86/5.95/6.04 and
+**won p99 ITL at every C1 cell**, with TTFT level and TPOT +0.02 — inside the recorded
+certificate. Still stale, unmeasured, left alone: `bf16-realtime.toml`, `bf16-l8192-r3072-16k.toml`.
+
+**What remains on the 26B C1 column, in order of size:**
+1. **TPOT 5.6-6.0 vs 5.03-5.09 (+11-18%)** — lost at every cell, and it drags tok/s with it
+   (at C1 out_tok_s is just 128000/(TTFT + 127*TPOT)). This is the single blocker for 128 and
+   1024, which already win TTFT and p99.
+2. **TTFT above 4096** — 103/93, 210/180, 431/351. The bench's own roofline puts prefill at
+   32-34% of the compute roof, i.e. #66 (FlashPrefill at 196/351 TFLOP/s vs the GEMM path's
+   ~780) is the lever, not scheduling.
