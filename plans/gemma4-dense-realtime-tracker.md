@@ -2132,3 +2132,48 @@ plow BF16 decode was at PARITY with vLLM BF16 (`itl_med` 0.98-1.09x across all 2
 FP8 at 7.38 ms now sits well under plow's ~10.4 ms BF16. Beating vLLM on FP8 requires plow FP8
 decode under 7.38 ms while running `GemvFp8` at B=1 only, without the dropped decode defaults, and
 with no Lt fallback. That is the real gap, and it is a kernel-tuning gap, not a feature gap.
+
+## peak_mem is NOT a footprint comparison — vLLM's column is its preallocation
+
+Found 2026-09-23 while reviewing the FP8 cells. vLLM serves with `--gpu-memory-utilization 0.92`
+on a 79.18 GiB card, and its own startup log states the target outright: "Desired GPU memory
+utilization is (0.92, 72.85 GiB)". Every measured vLLM cell then reports 72.7-73.9 GiB BF16 and a
+flat 74.4-75.9 GiB FP8 — i.e. the reservation, essentially exactly, in every cell of every model at
+every concurrency. It is a configured ceiling, not demand: the same number would appear serving a
+far smaller model.
+
+So the report's claim at line 245, "Memory: the 12B peaks below vLLM in every matched cell", and the
+`Peak GPU memory | 72.7 GiB | 65.2 GiB` rows in the 3.x scenario tables, compare plow's ACTUAL usage
+against vLLM's CONFIGURED RESERVATION. The methodology line (sec. 2, "nvidia-smi
+--query-compute-apps sampled every second ... the maximum is reported") is accurate, and the 0.92
+setting is stated in the baseline-server cell, but nothing connects the two, so the memory rows read
+as an efficiency win they do not establish. The 26B rows ("peaks 2.0-5.2 GiB above vLLM") are
+confounded the same way and are, if anything, understated against plow.
+
+Options, for the user to pick:
+1. Drop the memory rows and the line-245 bullet. Cheapest, loses nothing measured.
+2. Keep them with the caveat stated inline: vLLM's figure is its 0.92 reservation (72.85 GiB
+   desired), so the column is a ceiling and the comparison is not like-for-like.
+3. Replace bytes with the metric that is actually comparable at a fixed card: KV CAPACITY. vLLM
+   publishes it directly ("GPU KV cache size: 183,113 tokens" on the FP8 12B); plow's is
+   slots x context. That is a real efficiency comparison and it is the one a reader cares about,
+   because it sets how many streams and how much context each stack can hold on one H100.
+
+NOT changed here — the report is the user's and is deliberately uncommitted.
+
+## gpulease has no FIFO: a releasing job re-acquires ahead of hour-long waiters
+
+`gpulease` is a bare advisory flock. A driver that loops over cell groups takes a lease per group,
+and on release re-acquires in the SAME SECOND, ahead of everything queued:
+
+    05:08:47 vllm-fp8-12b ACQUIRED (waited 846s)
+    05:34:41 vllm-fp8-12b RELEASED held=1554s
+    05:34:41 vllm-fp8-12b ACQUIRED (waited 0s)     <- straight back in
+    05:52:56 vllm-fp8-12b RELEASED held=1095s
+    05:52:56 vllm-fp8-26b ACQUIRED (waited 0s)
+    05:33:29 packlog-l12-cover0-15000c1 TIMEOUT after 1800s
+
+Combined with the 1800 s default timeout this starves every other job silently (header-only CSV, see
+above). Mitigation in force: `GPU_LEASE_TIMEOUT=43200` on every queued driver, so waiters survive
+the whole loop rather than dying mid-queue. A real fix would be a ticket/FIFO in gpulease; not
+attempted, since it is shared tooling outside this campaign.
