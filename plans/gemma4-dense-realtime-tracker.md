@@ -3765,3 +3765,63 @@ plow's prefill is 58% efficient was an artifact of counting only linear FLOPs ag
 
 That is the first arithmetic in this campaign that reaches the goal, and none of its three terms
 is the decode GEMV walk.
+
+### Decomposing the 4.73 s: it is rung holes, not decode cost
+
+Re-ran the same cell with `PLOW_PF_NO_INTERLEAVE=1`, which moves every decode row out of the
+prefill pass, so `prefill_ms` becomes pure prefill. No code change needed.
+
+                       unified     no-interleave
+    out_tok_s           270.0         281.4        +4.2%
+    TTFT ms            4424.14       4212.24
+    TPOT ms              81.76         79.00
+    p99 ITL ms          206.25        213.34
+    sum prefill_ms      27.50 s       23.27 s
+    sum decode_ms        4.89 s        7.82 s
+    accounted           32.40 s       31.08 s      -1.32 s
+
+So riding decode costs 4.23 s inside the prefill pass and saves only 2.93 s of decode-only time:
+the unified pass is a NET LOSS of 1.30 s at this cell, which the 1.32 s wall delta confirms
+independently. Pure prefill is 23.27 s against 22.77 s at the C1 rate, so rung/padding waste is
+only 0.50 s -- far less than the 7.8% that had been assumed.
+
+But the aggregate hides the real mechanism. Joining `PACKLOG PACK` (decode_feeds) to `PACKLOG R=`
+(rows, bucket) to the tick's prefill_ms, over the 171 launches (168 of which carry decode):
+
+    pf_rows=4068 + 28 feeds = 4096 -> bucket 4096   194.55 ms  n=45   fits the rung exactly
+    pf_rows=4095 +  1 feed  = 4096 -> bucket 4096   182.25 ms  n=8
+    pf_rows=2048 + 30 feeds = 2078 -> bucket 4096   163.68 ms  n=17   NO RUNG between 2048 and 4096
+    pf_rows=1024 + 28 feeds = 1052 -> bucket 1088    68.35 ms  n=33   +64 rung, 6% pad, fine
+
+The two 4096-total shapes price a riding decode row directly: 27 extra rows cost 12.30 ms, i.e.
+**0.456 ms per decode row inside a prefill launch**, against 0.644 ms/row for a standalone batch
+of 28 (10.785 ms fixed + 27 x 0.268). Riding decode is CHEAP when it fits the rung.
+
+It is expensive only when it pushes across a rung hole. `2048 + 30 = 2078` has no bucket between
+2048 and 4096, so 30 decode rows cost ~50 ms (163.68 vs ~114 for a 2048-rung launch) -- 1.67 ms
+per decode row, 3.7x the in-rung price. That single shape, 17 launches, is ~1.1 s.
+
+`mux.rs:4333` already trims for this and it is not the bug: the trim fires when the pack OVER-fills
+a bucket, but here the pack UNDER-fills. Only 2 requests still had prefill work
+(max_request_chunk=1024, so 2 x 1024 = 2048), which is queue drain, not over-packing. The fix is a
+rung covering 2049-2112, not a scheduler change. Note 1088 = 1024+64 works in production, so the
+"+64 rungs wedge" note from the finer-rung attempt (#51, the 2560 rung) does not generalise to all
+appended rungs and the specific failure should be re-examined before ruling 2112 out.
+
+### The whole remaining budget, priced
+
+    ~1.1 s  rung hole at 2049-2112 (the 2048+30 shape)
+    ~2.3 s  FlashPrefill at 196 (sliding) / 351 (full) TFLOP/s vs the GEMM path's ~780
+    ~2.0 s  norms + Glu + rope, 14% of prefill at 41-57% of HBM (epilogue fusion)
+    ~1.3 s  the unified pass's net loss (available today as PLOW_PF_NO_INTERLEAVE=1, but it
+            trades p99 213.34 for 206.25, so it is a dial and not a free win)
+
+    32.40 - 6.7 = ~25.7 s  =>  out_tok_s ~319 against vLLM's 332.2
+
+Sliding attention is NOT doing wasted work: at ctx 4224 the second chunk (3968 queries) costs
+0.389 ms against the first chunk's (4224 queries) 0.480 ms. Full causal would have made the
+second chunk 2.76x MORE expensive, so the window is being exploited and the 196 TFLOP/s is real
+inefficiency. There is no cheap 4x win there; it is a kernel project.
+
+Honest read: these levers take 8192/C32 to roughly throughput parity while winning TTFT, TPOT and
+p99 -- 3 of 4 metrics, not 4 of 4. Nothing measured so far closes the remaining ~4% of tok/s.
