@@ -2046,3 +2046,44 @@ bucket 2560 runs as a single chunk with no chaining.
 same 15000 padding with only EXISTING rungs: it should cut the 2331-row tail as `[2048, 512]` =
 2560 launched rows — the identical 1.5% padding — without introducing a 2560 rung at all. That A/B
 is running. If it wins, #51 is closed by #52 and the finer rungs are unnecessary.
+
+### Root cause of the 2560 wedge: plowc silently truncates the Gemm segment set
+
+Attributed from `l12r/assets/build.json` alone (CPU, no GPU needed —
+`$CLAUDE_JOB_DIR/tmp/sched/rung_diff.py`).
+
+Per-rung program counts split perfectly along rung shape:
+
+| rung | segments | shape |
+|------|----------|-------|
+| 128, 256, 512, 1024, 2048, 4096 | 571 | pow2 |
+| 1088, 1152, 4160, 4224 | 571 | pow2 + {64,128} |
+| **1536, 2560, 3072, 3584** | **435** | **pow2 + {512,1024,1536}** |
+
+The deficit is entirely ONE group — `kind=prefill topo=ordinary arms=('Gemm',)`, 329 programs at
+2048 against 193 at 2560 — and the missing segments are the contiguous tail **435..570**, exactly
+136 of them, identical for all four new rungs. Instruction count is unchanged at 766, so this is a
+truncation of the emitted program set, not a different lowering.
+
+`appended_rungs` (`lib.rs:3105-3117`) admits any appended rung that satisfies
+`x <= cap || (window > 0 && x <= ctx && window + x - 1 <= ring)`. There is no pow2 or tile-shape
+requirement, so the ladder accepts a rung whose Gemm segments the emitter then cannot fully cover,
+and emits it anyway with no assert and no warning. The runtime's dispatch table gets an entry for
+2560 (verified present for both `dense_attention` and `dense_ffn`), dispatches into the truncated
+chain, and spins on a completion that never arrives.
+
+`plowbench-doctor.sh` does not catch it: it verified the packet hash and "18 cubin(s), arch=sm_90a"
+and reported `RESULT: clean, with 2 warning(s) — safe to lease`. It checks the OBJECT set, not
+per-rung program completeness.
+
+So there are two defects, and the second is the dangerous one:
+
+1. Emit truncates the Gemm segment set for rungs that are not pow2 or pow2+{64,128}, silently.
+2. Nothing between that and a served request validates rung completeness — not the emitter, not the
+   doctor, not packet load. The failure mode is a 99.6%-CPU host spin holding a GPU lease, which is
+   the worst possible shape for a leased-GPU campaign.
+
+Cheapest guard, and it needs no kernel work: every prefill rung in a packet should carry the same
+segment count, so assert that parity at emit (or in the doctor's artifact stage). That converts a
+59-minute silent lease burn into a build-time refusal. NOT implemented here — recorded for the
+user, because it is a production-emit change outside this campaign's scope.
