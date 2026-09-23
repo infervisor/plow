@@ -21,7 +21,15 @@ mod amd_gemm_lt;
 #[cfg(feature = "hsa")]
 mod amd_index_tp;
 #[cfg(feature = "hsa")]
+mod amd_index_fp8;
+#[cfg(feature = "hsa")]
+mod amd_index_fp8_prefill;
+#[cfg(feature = "hsa")]
 mod amd_mla_fold;
+#[cfg(feature = "hsa")]
+mod amd_mla_bf16;
+#[cfg(feature = "hsa")]
+mod amd_rope;
 #[cfg(feature = "hsa")]
 mod amd_moe_aiter;
 #[cfg(feature = "hsa")]

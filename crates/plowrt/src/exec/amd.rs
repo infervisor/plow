@@ -27,7 +27,7 @@ use crate::exec::kvrow::{
 };
 use crate::exec::{
     amd_gemm_blk, amd_gemm_lt, amd_gemma4_glu, amd_index_tp, amd_mla_fold, amd_moe_aiter,
-    amd_sparse_mla,
+    amd_sparse_mla, amd_mla_bf16, amd_index_fp8, amd_index_fp8_prefill,
 };
 use crate::memory::slab_carve;
 use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
@@ -218,6 +218,8 @@ enum DecodeSegmentKind {
     GemmLt,
     GroupedMoeMxfp4 { glu: usize, down: usize },
     SparseMlaDecode(usize),
+    MlaBf16,
+    IndexFp8,
 }
 
 fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
@@ -225,6 +227,10 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
     let mut kinds = vec![DecodeSegmentKind::Interpreter; n_segments];
     let mut raw_segment_owner = vec![None; prog.insts.len()];
     for seg in 0..n_segments {
+        if amd_mla_bf16::pair_index(prog, seg)?.is_some() {
+            kinds[seg] = DecodeSegmentKind::MlaBf16;
+            continue;
+        }
         let mut fused_inst = None;
         let mut mla_flash_inst = None;
         let mut mla_merge_inst = None;
@@ -260,11 +266,14 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
             } else if inst.op == DevOp::KdaDecodeFused as u16
                 || inst.op == DevOp::MoeAiterFp8Pf as u16
                 || inst.op == DevOp::GemmLtPf as u16
+                || inst.op == DevOp::IndexFp8Decode as u16
             {
                 let name = if inst.op == DevOp::MoeAiterFp8Pf as u16 {
                     "MoeAiterFp8Pf"
                 } else if inst.op == DevOp::GemmLtPf as u16 {
                     "GemmLtPf"
+                } else if inst.op == DevOp::IndexFp8Decode as u16 {
+                    "IndexFp8Decode"
                 } else {
                     "KdaDecodeFused"
                 };
@@ -325,6 +334,8 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 "MoeAiterFp8Pf"
             } else if prog.insts[inst].op == DevOp::GemmLtPf as u16 {
                 "GemmLtPf"
+            } else if prog.insts[inst].op == DevOp::IndexFp8Decode as u16 {
+                "IndexFp8Decode"
             } else {
                 "KdaDecodeFused"
             };
@@ -343,6 +354,8 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 DecodeSegmentKind::MoeAiter
             } else if prog.insts[inst].op == DevOp::GemmLtPf as u16 {
                 DecodeSegmentKind::GemmLt
+            } else if prog.insts[inst].op == DevOp::IndexFp8Decode as u16 {
+                DecodeSegmentKind::IndexFp8
             } else {
                 DecodeSegmentKind::KdaDecodeFused(inst)
             };
@@ -409,7 +422,7 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
     for (i, inst) in prog.insts.iter().enumerate() {
         if matches!(
             DevOp::from_u16(inst.op),
-            Some(DevOp::KdaDecodeFused | DevOp::MoeAiterFp8Pf)
+            Some(DevOp::KdaDecodeFused | DevOp::MoeAiterFp8Pf | DevOp::IndexFp8Decode)
         ) && raw_segment_owner[i].is_none()
         {
             return Err(RuntimeError::Device(format!(
@@ -1007,6 +1020,7 @@ enum PrefillSegmentRoute {
     SparseMla(amd_sparse_mla::Route),
     MoeAiter(amd_moe_aiter::Route),
     IndexTp(amd_index_tp::Route),
+    IndexFp8(amd_index_fp8_prefill::Route),
     GemmLt(amd_gemm_lt::Route),
     GemmBlk(amd_gemm_blk::Route),
     Gemma4Glu(amd_gemma4_glu::Route),
@@ -2713,6 +2727,8 @@ enum DecodeSegmentRoute {
     MoeAiter(amd_moe_aiter::Route),
     GemmLt(amd_gemm_lt::Route),
     SparseMlaDecode(amd_sparse_mla::DecodeRoute),
+    MlaBf16(amd_mla_bf16::Route),
+    IndexFp8(amd_index_fp8::Route),
     GroupedMoeMxfp4 {
         glu: GroupedMoeGluArgs,
         down: GroupedMoeDownArgs,
@@ -2749,9 +2765,24 @@ fn decode_segment_routes(
     let aiter = amd_moe_aiter::routes(prog, tensors, kinds.len())?;
     let gemm_lt = amd_gemm_lt::routes(prog, tensors, kinds.len())?;
     let sparse_mla = amd_sparse_mla::decode_routes(prog, tensors, kinds.len())?;
+    let index_fp8 = amd_index_fp8::routes(prog, tensors, devp, kinds.len())?;
     let mut routes = Vec::with_capacity(kinds.len());
     for (seg, kind) in kinds.into_iter().enumerate() {
         let inst_ix = match kind {
+            DecodeSegmentKind::IndexFp8 => {
+                routes.push(DecodeSegmentRoute::IndexFp8(index_fp8[seg].ok_or_else(|| {
+                    RuntimeError::Device("native FP8 indexer segment has no validated route".into())
+                })?));
+                continue;
+            }
+            DecodeSegmentKind::MlaBf16 => {
+                routes.push(DecodeSegmentRoute::MlaBf16(
+                    amd_mla_bf16::route(prog, tensors, seg)?.ok_or_else(|| {
+                        RuntimeError::Device("BF16 MLA segment has no validated route".into())
+                    })?,
+                ));
+                continue;
+            }
             DecodeSegmentKind::Interpreter => {
                 routes.push(DecodeSegmentRoute::Interpreter);
                 continue;
@@ -3312,6 +3343,25 @@ fn packed_family_segments_cover(prog: &DevProg, families: &[u8], wanted: &[u8]) 
         }
     });
     seen && covered
+}
+
+fn native_ocp_fp8_weights(progs: &[DevProg]) -> std::collections::BTreeSet<u16> {
+    let native = |op| op == DevOp::GemmFp8Block128 as u16
+        || op == DevOp::GemmFp8Block128Split4 as u16 || op == DevOp::MlaBmmFp8 as u16;
+    let mut weights = progs.iter().flat_map(|p| &p.insts)
+        .filter(|d| native(d.op))
+        .map(|d| d.t[2])
+        .filter(|&t| t != packet::dev::TENSOR_NONE16)
+        .collect::<std::collections::BTreeSet<_>>();
+    for d in progs.iter().flat_map(|p| &p.insts) {
+        for (slot, handle) in d.t.iter().enumerate() {
+            // A shared legacy consumer still needs the old signed-zero canonicalization.
+            if !native(d.op) || slot != 2 {
+                weights.remove(handle);
+            }
+        }
+    }
+    weights
 }
 
 fn check_packed_dense_program(insts: &[DevInst64]) -> Result<()> {
@@ -4565,6 +4615,8 @@ fn bind_packed_experts(
             if d.t[3] as usize == i_ewt && GLU_ARMS.iter().any(|&o| o as u16 == d.op) {
                 Some(d.i[1] as u64)
             } else if d.t[2] as usize == i_ewt && d.op == DevOp::MoeGroupGluPf as u16 {
+                Some(d.i[0] as u64)
+            } else if d.t[3] as usize == i_ewt && d.op == DevOp::MoeGluFp8Block128 as u16 {
                 Some(d.i[0] as u64)
             } else if d.t[2] as usize == i_ewt && d.op == DevOp::MoeAiterFp8Pf as u16 {
                 Some(d.i[2] as u64)
@@ -6045,6 +6097,9 @@ pub struct AmdEngine {
     k_mla_materialized_prefill: Option<HsaKernel>,
     sparse_mla: Option<amd_sparse_mla::SparseMla>,
     sparse_mla_decode: Option<amd_sparse_mla::SparseMlaDecode>,
+    mla_bf16: Option<amd_mla_bf16::PersistentMla>,
+    index_fp8: Option<amd_index_fp8::Indexer>,
+    index_fp8_prefill: Option<amd_index_fp8_prefill::Indexer>,
     moe_aiter: Option<amd_moe_aiter::MoeAiter>,
     index_tp: Option<amd_index_tp::IndexTp>,
     gemm_lt: Option<amd_gemm_lt::GemmLt>,
@@ -6921,6 +6976,11 @@ impl AmdEngine {
         // Weights and scale grids the route binds in its own layout (shuffled, doubled).
         let gemm_blk_bound = if use_gemm_blk {
             amd_gemm_blk::bound_weights(&blob.progs)?
+        } else {
+            Default::default()
+        };
+        let native_ocp_weights = if arch == "gfx950" {
+            native_ocp_fp8_weights(&blob.progs)
         } else {
             Default::default()
         };
@@ -8763,6 +8823,47 @@ impl AmdEngine {
             None
         };
 
+        let mut index_shape: Option<(u32, u32)> = None;
+        for p in &blob.progs {
+            for d in p.insts.iter().filter(|d| d.op == DevOp::IndexFp8Decode as u16) {
+                if !p.role.is_decode_rung() {
+                    return Err(RuntimeError::Device("FP8 indexer native opcode requires a decode rung".into()));
+                }
+                match index_shape {
+                    Some((rows, ctx)) if ctx == d.i[1] => index_shape = Some((rows.max(p.t), ctx)),
+                    None => index_shape = Some((p.t, d.i[1])),
+                    _ => return Err(RuntimeError::Device("FP8 indexer rungs have different cache strides".into())),
+                }
+            }
+        }
+        let index_fp8 = index_shape.map(|(rows, ctx)| {
+            amd_index_fp8::Indexer::load(&be, hsaco_dir, rows, ctx, &mut modules)
+        }).transpose()?;
+        let mut prefill_index_shape: Option<(u32, u32)> = None;
+        for p in &blob.progs {
+            for d in p.insts.iter().filter(|d| d.op == DevOp::IndexFp8Prefill as u16) {
+                if !p.role.is_prefill_bucket() {
+                    return Err(RuntimeError::Device("FP8 prefill indexer requires an ordinary prefill bucket".into()));
+                }
+                match prefill_index_shape {
+                    Some((rows, ctx)) if ctx == d.i[1] => prefill_index_shape = Some((rows.max(p.t), ctx)),
+                    None => prefill_index_shape = Some((p.t, d.i[1])),
+                    _ => return Err(RuntimeError::Device("FP8 prefill indexer has inconsistent cache strides".into())),
+                }
+            }
+        }
+        let index_fp8_prefill = prefill_index_shape.map(|(rows, ctx)| {
+            amd_index_fp8_prefill::Indexer::load(&be, hsaco_dir, rows, ctx, &mut modules)
+        }).transpose()?;
+        let mla_bf16_rows = blob.decode_phase().filter_map(|p| {
+            decode_segment_kinds(p).ok().filter(|kinds| kinds.contains(&DecodeSegmentKind::MlaBf16)).map(|_| p.t)
+        }).max();
+        let mla_bf16 = mla_bf16_rows.map(|rows| {
+            if crate::config::RuntimeConfig::get().amd.mla_ns_live {
+                return Err(RuntimeError::Device("BF16 MLA excludes PLOW_MLA_NS_LIVE".into()));
+            }
+            amd_mla_bf16::PersistentMla::load(&be, hsaco_dir, rows, &mut modules)
+        }).transpose()?;
         let sparse_mla_decode = match blob
             .decode_phase()
             .filter(|p| {
@@ -9430,7 +9531,8 @@ impl AmdEngine {
                             Some(amd_gemm_blk::Bound::Scales) => {
                                 push(&mut ring, &amd_gemm_blk::prepare_scales(&slice)?, false)?
                             }
-                            None => push(&mut ring, &slice, c.is_fp8_e4m3(resolved))?,
+                            None => push(&mut ring, &slice,
+                                c.is_fp8_e4m3(resolved) && !native_ocp_weights.contains(&(i as u16)))?,
                         }
                         wbytes += td.bytes;
                         nweights += 1;
@@ -9444,21 +9546,23 @@ impl AmdEngine {
             } else if let Some(r) = &td.init {
                 push(&mut ring, &blob.init[r.clone()], false)?;
             } else if let Some(g) = gen_by_tensor.get(&(i as u32)) {
-                let data = g.generate().ok_or_else(|| {
-                    RuntimeError::Device(format!(
-                        "devblob: gen recipe for `{}` has unknown kind {}",
-                        td.name, g.kind
-                    ))
-                })?;
-                if data.len() as u64 != td.bytes {
-                    return Err(RuntimeError::Device(format!(
-                        "devblob: gen recipe for `{}` produced {} B, decl says {}",
-                        td.name,
-                        data.len(),
-                        td.bytes
-                    )));
+                if !g.amd_rope_bf16() {
+                    let data = g.generate().ok_or_else(|| {
+                        RuntimeError::Device(format!(
+                            "devblob: gen recipe for `{}` has unknown kind {}",
+                            td.name, g.kind
+                        ))
+                    })?;
+                    if data.len() as u64 != td.bytes {
+                        return Err(RuntimeError::Device(format!(
+                            "devblob: gen recipe for `{}` produced {} B, decl says {}",
+                            td.name,
+                            data.len(),
+                            td.bytes
+                        )));
+                    }
+                    push(&mut ring, &data, false)?;
                 }
-                push(&mut ring, &data, false)?;
             } else if vmm_va.is_none() && !kv_skips_zeroing(&td.name) {
                 // A VMM window is (mostly) UNMAPPED VA — a memset would fault,
                 // not merely waste time. The `kv.` clause below is the older
@@ -9490,6 +9594,7 @@ impl AmdEngine {
             slab.wait_mapped(slab_bytes)?;
             LoadProf::add(&prof.alloc_ns, t);
         }
+        super::amd_rope::bind(&be, hsaco_dir, &blob.gen, &blob.tensors, &devp, &mut modules)?;
         // The MoE half of the bind, and it has to be here: it needs the tensor
         // table (to find each layer's two pointer slots) and the staging ring
         // (which must outlive it — the C reference records that gathering a
@@ -9807,6 +9912,18 @@ impl AmdEngine {
                         }
                     }
                 }
+                if index_fp8_prefill.is_some() {
+                    for (seg, route) in amd_index_fp8_prefill::routes(p, &blob.tensors, &devp, seg_class.len())?
+                        .into_iter().enumerate()
+                    {
+                        if let Some(route) = route {
+                            if !matches!(prefill_routes[seg], PrefillSegmentRoute::Interpreter) {
+                                return Err(RuntimeError::Device("FP8 prefill indexer overlaps another native route".into()));
+                            }
+                            prefill_routes[seg] = PrefillSegmentRoute::IndexFp8(route);
+                        }
+                    }
+                }
                 if use_moe_aiter {
                     for (seg, route) in amd_moe_aiter::routes(p, &blob.tensors, seg_class.len())?
                         .into_iter()
@@ -9891,6 +10008,7 @@ impl AmdEngine {
                     )));
                 }
                 if (use_sparse_mla
+                    || index_fp8_prefill.is_some()
                     || use_moe_aiter
                     || use_index_tp
                     || use_gemm_lt
@@ -10800,6 +10918,9 @@ impl AmdEngine {
             k_mla_materialized_prefill,
             sparse_mla,
             sparse_mla_decode,
+            mla_bf16,
+            index_fp8,
+            index_fp8_prefill,
             moe_aiter,
             index_tp,
             gemm_lt,
@@ -11503,12 +11624,25 @@ impl AmdEngine {
 
     /// Upload bytes into a named tensor (block I/O, and weight loaders).
     pub fn write_tensor(&mut self, name: &str, src: &[u8]) -> Result<()> {
+        self.write_tensor_at(name, 0, src)
+    }
+
+    pub fn write_tensor_at(&mut self, name: &str, offset: u64, src: &[u8]) -> Result<()> {
+        let capacity = self
+            .tensor_bytes(name)
+            .ok_or_else(|| RuntimeError::Device(format!("no tensor {name:?}")))?;
+        if offset
+            .checked_add(src.len() as u64)
+            .is_none_or(|end| end > capacity)
+        {
+            return Err(RuntimeError::Device(format!("upload exceeds tensor {name:?}")));
+        }
         let i = self
             .tensor_names
             .iter()
             .position(|x| x == name)
             .ok_or_else(|| RuntimeError::Device(format!("no tensor {name:?}")))?;
-        EngineDevice::upload(&*self.be, &self.devp[i], 0, src)
+        EngineDevice::upload(&*self.be, &self.devp[i], offset, src)
     }
 
     /// Dump the decode program's `PlowTraceRec[n_stream]` to `path`.
@@ -11624,6 +11758,9 @@ impl AmdEngine {
     /// DIAGNOSTIC: one slot's KV rows `[0, kv_len)` on the first and last layer (latent, rope,
     /// FP8 scale, index keys) as raw files `dir/<tag>.slot<slot>.kv.<layer>.<kind>.bin`.
     pub fn dump_slot_kv(&self, dir: &Path, tag: &str, slot: usize, kv_len: u32) -> Result<()> {
+        if slot >= self.batch || kv_len as usize > self.max_ctx {
+            return Err(RuntimeError::Device("kv dump: slot or length past capacity".into()));
+        }
         let io = |e: std::io::Error| RuntimeError::Device(format!("kv dump: {e}"));
         std::fs::create_dir_all(dir).map_err(io)?;
         let mut layers: Vec<u32> = self
@@ -11638,14 +11775,22 @@ impl AmdEngine {
             _ => Vec::new(),
         };
         for &l in &layers {
-            for kind in ["ckv", "krot", "scale", "kidx"] {
+            for kind in ["ckv", "krot", "scale", "kidx", "kidx_fp8"] {
                 let name = format!("kv.{l}.{kind}");
                 let Some(i) = self.tensor_names.iter().position(|n| *n == name) else {
                     continue;
                 };
                 let slot_bytes = self.devp[i].len / self.batch as u64;
                 let row_bytes = slot_bytes / self.max_ctx as u64;
-                let mut buf = vec![0u8; (row_bytes * kv_len as u64) as usize];
+                let bytes = if kind == "kidx_fp8" {
+                    packet::ctx_bound::indexer_prefix_bytes(kv_len)
+                } else {
+                    row_bytes * kv_len as u64
+                };
+                if bytes > slot_bytes {
+                    return Err(RuntimeError::Device("kv dump: packed prefix past slot".into()));
+                }
+                let mut buf = vec![0u8; bytes as usize];
                 EngineDevice::download(&*self.be, &self.devp[i], slot as u64 * slot_bytes, &mut buf)?;
                 std::fs::write(dir.join(format!("{tag}.slot{slot}.kv.{l}.{kind}.bin")), &buf)
                     .map_err(io)?;
@@ -11912,6 +12057,17 @@ impl AmdEngine {
         // whether or not a packed binding is staged; the two sparse routes take the staged
         // spans (`stage_kv_spans`). An active binding used to skip every native route here and
         // hand the segment to the primary interpreter, which has no arm for these opcodes.
+        if let Some(PrefillSegmentRoute::IndexFp8(route)) = self.progs[p].prefill_routes.get(seg).copied() {
+            if active {
+                return Err(RuntimeError::Device("FP8 prefill indexer has no packed-span route".into()));
+            }
+            let kernel = self.index_fp8_prefill.as_ref().ok_or_else(|| {
+                RuntimeError::Device("FP8 prefill indexer has no loaded kernels".into())
+            })?;
+            kernel.enqueue(&self.be, route, &self.tens_table)?;
+            self.seg_launches += route.launches() as u64;
+            return Ok(());
+        }
         if let Some(PrefillSegmentRoute::MlaFold(route)) =
             self.progs[p].prefill_routes.get(seg).copied()
         {
@@ -12446,6 +12602,8 @@ impl AmdEngine {
 
     fn decode_segment_launches(&self, p: usize, seg: usize) -> usize {
         match self.progs[p].decode_routes.get(seg) {
+            Some(DecodeSegmentRoute::IndexFp8(_)) => 2,
+            Some(DecodeSegmentRoute::MlaBf16(_)) => 5,
             Some(DecodeSegmentRoute::SparseMlaDecode(route)) if route.active => 3,
             Some(DecodeSegmentRoute::MoeAiter(route)) => route.launches() as usize,
             Some(DecodeSegmentRoute::GroupedMoeMxfp4 { .. }) => 2,
@@ -12455,6 +12613,14 @@ impl AmdEngine {
     }
 
     pub(crate) fn begin_decode_replay(&self, p: usize) -> Result<()> {
+        if self.index_fp8.is_some() {
+            // Refuse an unqualified domain before reserving otherwise unfillable AQL slots.
+            for route in &self.progs[p].decode_routes {
+                if let DecodeSegmentRoute::IndexFp8(route) = route {
+                    route.check_domain()?;
+                }
+            }
+        }
         let packets = (0..self.decode_launches(p))
             .map(|seg| self.decode_segment_launches(p, seg))
             .sum();
@@ -12477,6 +12643,11 @@ impl AmdEngine {
             return Err(RuntimeError::Device(format!(
                 "program {p} has no graph-derived phase-object route"
             )));
+        }
+        for route in &self.progs[p].prefill_routes {
+            if let PrefillSegmentRoute::IndexFp8(route) = route {
+                route.check_domain()?;
+            }
         }
         let packets = (0..self.prog_dispatch(p).launches())
             .map(|seg| self.prefill_segment_launches(p, seg))
@@ -12519,6 +12690,7 @@ impl AmdEngine {
                 Some(PrefillSegmentRoute::MlaFold(_)) => 3,
                 Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
                 Some(PrefillSegmentRoute::IndexTp(route)) => route.launches(),
+                Some(PrefillSegmentRoute::IndexFp8(route)) => route.launches(),
                 _ => 1,
             };
         }
@@ -12534,6 +12706,7 @@ impl AmdEngine {
             Some(PrefillSegmentRoute::MlaFold(_)) => 3,
             Some(PrefillSegmentRoute::MoeAiter(route)) => route.launches() as usize,
             Some(PrefillSegmentRoute::IndexTp(route)) => route.launches(),
+            Some(PrefillSegmentRoute::IndexFp8(route)) => route.launches(),
             Some(PrefillSegmentRoute::MoeEpAlign(_)) if self.k_moe_ep_align.is_some() => 4,
             Some(PrefillSegmentRoute::MoeStage1A4Reuse(_))
                 if self.k_moe_stage1_a4_quant.is_some() && self.k_moe_stage1_a4_reuse.is_some() =>
@@ -12564,6 +12737,19 @@ impl AmdEngine {
             ))
         })?;
         match route {
+            DecodeSegmentRoute::IndexFp8(route) => {
+                self.index_fp8.as_ref().ok_or_else(|| {
+                    RuntimeError::Device("FP8 indexer route has no loaded kernels".into())
+                })?.enqueue(&self.be, route, &self.tens_table)?;
+                self.seg_launches += 1;
+            }
+            DecodeSegmentRoute::MlaBf16(route) => {
+                let kernel = self.mla_bf16.as_ref().ok_or_else(|| {
+                    RuntimeError::Device("BF16 MLA route has no loaded kernels".into())
+                })?;
+                kernel.enqueue(&self.be, route, &self.tens_table)?;
+                self.seg_launches += 4;
+            }
             DecodeSegmentRoute::SparseMlaDecode(route) if route.active => {
                 let kernel = self.sparse_mla_decode.as_ref().ok_or_else(|| {
                     RuntimeError::Device("sparse MLA decode route has no loaded kernels".into())
@@ -13009,13 +13195,28 @@ impl AmdEngine {
     /// Native sparse decode attention runs only when every row of a rung holds all 2048
     /// selected keys; otherwise that rung's segment runs the interpreter arm this step.
     fn arm_sparse_mla_decode(&mut self, kvlen: &[u32]) {
-        if self.sparse_mla_decode.is_none() {
+        if self.sparse_mla_decode.is_none() && self.mla_bf16.is_none() {
             return;
         }
         for prog in &mut self.progs {
             for route in &mut prog.decode_routes {
                 if let DecodeSegmentRoute::SparseMlaDecode(route) = route {
                     route.arm(kvlen);
+                } else if let DecodeSegmentRoute::MlaBf16(route) = route {
+                    route.arm(kvlen);
+                }
+            }
+        }
+    }
+
+    fn arm_index_fp8_decode(&mut self, positions: &[u32], lengths: &[u32]) {
+        if self.index_fp8.is_none() {
+            return;
+        }
+        for prog in &mut self.progs {
+            for route in &mut prog.decode_routes {
+                if let DecodeSegmentRoute::IndexFp8(route) = route {
+                    route.arm(positions, lengths);
                 }
             }
         }
@@ -13130,6 +13331,7 @@ impl AmdEngine {
         self.patch_mla_nsplit(kvlen)?;
         self.patch_kvrow(dp, pos)?;
         self.arm_sparse_mla_decode(&[kvlen]);
+        self.arm_index_fp8_decode(&[pos], &[kvlen]);
 
         // Stage both scalars in pinned memory for the same reason.
         {
@@ -13277,6 +13479,9 @@ impl AmdEngine {
         let row_split = crate::config::RuntimeConfig::get().amd.mla_pf_row_split;
         let native_lo = crate::config::RuntimeConfig::get().amd.mla_pf_row_split_native_lo;
         for route in &mut self.progs[prog].prefill_routes {
+            if let PrefillSegmentRoute::IndexFp8(route) = route {
+                route.arm_for_program(c0, clen, rows)?;
+            }
             if let PrefillSegmentRoute::SparseMla(route) = route {
                 route.rebase(rows, c0, row_split, native_lo)?;
                 // The union header and the flash's query tiles must agree on the row count.
@@ -14488,6 +14693,7 @@ impl AmdEngine {
             self.patch_kvrow(self.decode, pos[0])?;
         }
         self.arm_sparse_mla_decode(kvlen);
+        self.arm_index_fp8_decode(pos, kvlen);
         {
             let s = self.h_scalar.as_mut_slice();
             for (i, p) in pos.iter().enumerate() {
@@ -14659,8 +14865,23 @@ impl AmdEngine {
     /// KV write happen regardless — and that is fine, because those are the parts an idle or
     /// mid-prefill row can safely redo. The recurrence is the part it cannot.
     ///
-    /// A blob without `in.parked` (anything not emitted at `RowKind::Sequences`) ignores this.
+    /// Native FP8 indexer packets require a complete mask and suppress parked cache appends.
+    /// Other blobs without `in.parked` ignore this.
     pub fn upload_parked(&mut self, parked: &[u32]) -> Result<()> {
+        if self.index_fp8.is_some() {
+            for prog in &mut self.progs {
+                for route in &mut prog.decode_routes {
+                    if let DecodeSegmentRoute::IndexFp8(route) = route {
+                        route.set_parked(&[]);
+                    }
+                }
+            }
+            if parked.len() != self.batch || self.t_active.is_none() {
+                return Err(RuntimeError::Device(
+                    "native FP8 indexer requires a complete parked mask".into(),
+                ));
+            }
+        }
         let Some(t) = self.t_active else {
             return Ok(());
         };
@@ -14673,7 +14894,17 @@ impl AmdEngine {
         }
         let dst = self.devp[t].base;
         self.be
-            .memcpy_htod_pinned(dst, &self.h_scalar.as_slice()[..n * 4])
+            .memcpy_htod_pinned(dst, &self.h_scalar.as_slice()[..n * 4])?;
+        if self.index_fp8.is_some() {
+            for prog in &mut self.progs {
+                for route in &mut prog.decode_routes {
+                    if let DecodeSegmentRoute::IndexFp8(route) = route {
+                        route.set_parked(parked);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether model weights were bound at load. A `false` here means the

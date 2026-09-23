@@ -29,6 +29,11 @@ BUN="${PLOW_BUNDLER:-$(ls -1 "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/clang-offloa
         "${ROCM_PATH:-/opt/rocm}"/llvm/bin/clang-offload-bundler \
         /opt/rocm-*/lib/llvm/bin/clang-offload-bundler 2>/dev/null | head -1)}"
 INC="-I$R/amd -I$R/common"
+case "${PLOW_MLA_P_BF16:-0}" in
+  0) ;;
+  1) INC="$INC -DPLOW_MLA_P_BF16=1" ;;
+  *) echo "PLOW_MLA_P_BF16 must be 0 or 1" >&2; exit 2 ;;
+esac
 if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
   [ -f "$PLOW_HSACO_CONFIG" ] || { echo "missing PLOW_HSACO_CONFIG: $PLOW_HSACO_CONFIG" >&2; exit 2; }
   cfg_dir="$(dirname -- "$PLOW_HSACO_CONFIG")"
@@ -63,6 +68,39 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
   need_moe_prefill_ep=1
 fi
 mkdir -p "$OUT"; cd "$OUT"
+
+if [ "$ARCH" = gfx950 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/rope_cache_bf16_gfx950.elf" glm_rope_cache_bf16 64 4 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_rope_cache_bf16_abi_1 \
+    -cuid=plow_rope_cache_bf16_abi_1 \
+    -I"$R/amd" -I"$R/common" "$R/amd/rope_cache.hip"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/rope_indexer_cache_bf16_gfx950.elf" glm_rope_indexer_cache_bf16 64 4 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_rope_indexer_cache_bf16_abi_1 \
+    -cuid=plow_rope_indexer_cache_bf16_abi_1 \
+    -I"$R/amd" -I"$R/common" "$R/amd/rope_indexer_cache.hip"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/indexer_decode_gfx950.elf" glm_indexer_decode_prepare 64 4 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_indexer_decode_abi_2 \
+    -cuid=plow_indexer_decode_abi_2 \
+    -I"$R/amd" -I"$R/common" "$R/amd/indexer_decode.hip"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/indexer_prefill_gfx950.elf" glm_indexer_prefill_prepare 64 4 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_indexer_prefill_abi_1 \
+    -cuid=plow_indexer_prefill_abi_1 \
+    -I"$R/amd" -I"$R/common" "$R/amd/indexer_prefill.hip"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/indexer_prefill_append_gfx950.elf" glm_indexer_prefill_append 64 4 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_indexer_prefill_append_abi_1 \
+    -cuid=plow_indexer_prefill_append_abi_1 \
+    -I"$R/amd" -I"$R/common" "$R/amd/indexer_prefill_append.hip"
+fi
 
 # Delete FIRST. A build that fails must leave nothing behind to run.
 rm -f i_prefill.co i_decode.co i_flash.co tk.co \
@@ -471,6 +509,16 @@ WALK="${PLOW_GEMV_WALK:-0}"
 # Every DECODE object AND its register check must carry the same bucket, or the cliff gate
 # validates an object that is not the one that ships.
 DEC="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM -DPLOW_GEMV_WALK=$WALK"
+case "${PLOW_GEMV_MFMA4:-0}" in
+  0) ;;
+  1) DEC="$DEC -DGV_MFMA4=1" ;;
+  *) echo "PLOW_GEMV_MFMA4 must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${PLOW_MOE_TILE_BINSEARCH:-0}" in
+  0) ;;
+  1) DEC="$DEC -DPLOW_MOE_TILE_BINSEARCH=1" ;;
+  *) echo "PLOW_MOE_TILE_BINSEARCH must be 0 or 1" >&2; exit 2 ;;
+esac
 if [ "$decode_inventory_prune" = 1 ]; then
   DEC="$DEC -DPLOW_DECODE_INVENTORY_PRUNE=1"
 fi
@@ -657,7 +705,7 @@ if [ "$BUILD_MLA" = 1 ]; then
   unbundle i_prefill_mla.co interp_prefill_mla.elf
   MLA_ELFS="interp_prefill_mla.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_prefill_mla_gq.co
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" i_prefill_mla_gq.co
     unbundle i_prefill_mla_gq.co interp_prefill_mla_gq.elf
     MLA_ELFS="interp_prefill_mla.elf interp_prefill_mla_gq.elf"
   fi
@@ -670,7 +718,7 @@ if [ "$BUILD_MOE" = 1 ]; then
   unbundle i_prefill_mla_moe.co interp_prefill_mla_moe.elf
   MOE_ELFS="interp_prefill_mla_moe.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_prefill_mla_moe_gq.co
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" i_prefill_mla_moe_gq.co
     unbundle i_prefill_mla_moe_gq.co interp_prefill_mla_moe_gq.elf
     MOE_ELFS="interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf"
   fi
@@ -833,7 +881,7 @@ if [ "$BUILD_MLA" = 1 ]; then
   # is the block's status and kills the script right here — silently, after the objects are
   # already built. Only reachable with PLOW_NO_GQ=1, which is exactly the rare path nobody runs.
   if [ "$BUILD_GQ" = 1 ]; then
-    check prefill_mla_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    check prefill_mla_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" 256 2
   fi
 fi
 
@@ -842,7 +890,7 @@ fi
 if [ "$BUILD_MOE" = 1 ]; then
   check prefill_mla_moe "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1" 256 2
   if [ "$BUILD_GQ" = 1 ]; then
-    check prefill_mla_moe_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    check prefill_mla_moe_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" 256 2
   fi
 fi
 

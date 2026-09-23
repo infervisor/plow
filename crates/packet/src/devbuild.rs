@@ -458,6 +458,7 @@ pub struct Builder {
     lean_kda_key_factor_segments: bool,
     /// Isolate adjacent FlashMlaDecode+MlaMergeFold pairs for a gfx950 object.
     decode_mla_segments: bool,
+    decode_mla_bf16_segments: bool,
     /// Isolate adjacent grouped decode GLU+DOWN pairs for ordered raw launches.
     decode_grouped_moe_segments: bool,
     /// Isolate XReduceTwoShot packets for the gfx950 wave-RS interpreter object.
@@ -709,6 +710,7 @@ impl Builder {
             kda_carry_keyfeed_segments: false,
             lean_kda_key_factor_segments: false,
             decode_mla_segments: false,
+            decode_mla_bf16_segments: false,
             decode_grouped_moe_segments: false,
             xreduce_wave_rs_segments: false,
             fuse_materialized_residual_inputs: true,
@@ -1079,6 +1081,11 @@ impl Builder {
     /// Preserve an operation as its own segment without dropping dependency edges.
     pub fn isolate(&mut self, counter: u32) {
         self.ops[counter as usize].isolated = true;
+    }
+
+    pub fn set_decode_mla_bf16_segments(&mut self) {
+        self.deny_uniseg();
+        self.decode_mla_bf16_segments = true;
     }
 
     /// Keep this machine-filling op at one workgroup per executor when segment-class slicing is
@@ -2251,6 +2258,11 @@ impl Builder {
                 pair[0].inst.op == DevOp::FlashMlaDecode as u16
                     && pair[1].inst.op == DevOp::MlaMergeFold as u16
             });
+        let bf16_pair = |i: usize| self.ops.get(i..i + 2).is_some_and(|pair| {
+            matches!(DevOp::from_u16(pair[0].inst.op), Some(DevOp::FlashMlaDecode | DevOp::FlashGatherDecode))
+                && pair[1].inst.op == DevOp::FlashMerge as u16
+        });
+        let decode_mla_bf16 = !uniseg && self.decode_mla_bf16_segments;
         let decode_grouped_moe = !uniseg
             && (self.decode_grouped_moe_segments || knobs.moe_decode_standalone)
             && self.ops.windows(2).any(|pair| {
@@ -2334,7 +2346,9 @@ impl Builder {
         let seg_q8 = seg_v2 || v2_env.as_deref() == Some("q8");
         let wave_class = |i: usize| -> u8 {
             let op = self.ops[i].inst.op;
-            if op == DevOp::QwenGdnPrefill as u16 {
+            if decode_mla_bf16 && (bf16_pair(i) || (i > 0 && bf16_pair(i - 1))) {
+                27
+            } else if op == DevOp::QwenGdnPrefill as u16 {
                 21
             } else if op == DevOp::KdaDecodeFused as u16 {
                 // A standalone raw-argument object owns this boundary. Keep its segment pure
@@ -2542,6 +2556,8 @@ impl Builder {
             op.inst.op == DevOp::KdaDecodeFused as u16
                 || op.inst.op == DevOp::MoeAiterFp8Pf as u16
                 || op.inst.op == DevOp::IndexTpPf as u16
+                || op.inst.op == DevOp::IndexFp8Decode as u16
+                || op.inst.op == DevOp::IndexFp8Prefill as u16
                 || op.inst.op == DevOp::GemmLtPf as u16
                 || op.inst.op == DevOp::GemmBlkPf as u16
                 || (op.inst.op == DevOp::MlaMergeFold as u16 && op.inst.i[5] == 1)
@@ -2558,13 +2574,17 @@ impl Builder {
             || mla_materialized
             || mla_aiter
             || decode_mla_segments
+            || decode_mla_bf16
             || decode_grouped_moe
             || isolate_xreduce;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             let producer = dep.producer() as usize;
             let raw_moe_pair_edge =
                 decode_grouped_moe && wave_class(consumer) == 20 && wave_class(producer) == 20;
-            !raw_moe_pair_edge && (!raw_segmented || seg_of[consumer] == seg_of[producer])
+            let raw_mla_pair_edge =
+                decode_mla_bf16 && wave_class(consumer) == 27 && wave_class(producer) == 27;
+            !raw_moe_pair_edge && !raw_mla_pair_edge
+                && (!raw_segmented || seg_of[consumer] == seg_of[producer])
         };
         let mut same_segment_consumer = vec![false; self.ops.len()];
         let mut same_segment_fine_consumer = vec![false; self.ops.len()];
@@ -3998,7 +4018,7 @@ impl Model {
         // produces would leave the tail of the buffer uninitialised on device.
         for g in &self.gen {
             let want = self.tensors[g.tensor as usize].bytes;
-            let got = g.generate().map(|d| d.len() as u64);
+            let got = if g.amd_rope_bf16() { Some(g.byte_len()) } else { g.generate().map(|d| d.len() as u64) };
             assert_eq!(
                 Some(want),
                 got,
@@ -5939,6 +5959,33 @@ mod kda_wu_lean_tests {
 mod decode_mla_segment_tests {
     use super::*;
 
+    #[test]
+    fn bf16_pair_is_counter_free_and_default_off() {
+        for op in [DevOp::FlashMlaDecode, DevOp::FlashGatherDecode] {
+            for enabled in [false, true] {
+                let mut b = Builder::new(4);
+                if enabled { b.set_decode_mla_bf16_segments(); }
+                let all = b.all();
+                let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+                let flash = b.emit(op, all.clone(), &[before], |_| {});
+                let merge = b.emit(DevOp::FlashMerge, all.clone(), &[flash], |_| {});
+                b.emit(DevOp::Nop, all, &[merge], |_| {});
+                let p = b.finish();
+                let seg = |i| p.stream.iter().find(|e| e.inst == i).unwrap().seg;
+                if enabled {
+                    assert_ne!(seg(0), seg(1)); assert_eq!(seg(1), seg(2)); assert_ne!(seg(2), seg(3));
+                    for e in p.stream.iter().chain(&p.gq_stream).filter(|e| e.seg == seg(1)) {
+                        assert!(matches!(e.inst, 1 | 2));
+                        assert_eq!((e.wait_len, e.succ_len, e.flags & crate::dev::SE_XCTR), (0, 0, 0));
+                    }
+                } else {
+                    assert_eq!(seg(0), seg(3));
+                    assert_ne!(p.insts[2].wait_len, 0);
+                }
+            }
+        }
+    }
+
     fn program(enabled: bool) -> Program {
         let mut b = Builder::new(4);
         b.deny_uniseg();
@@ -6629,27 +6676,29 @@ mod isolated_segment_tests {
 
     #[test]
     fn native_moe_boundary_orders_segments_without_counter_obligations() {
-        let mut b = Builder::new(4);
-        b.force_uniseg();
-        let first = b.emit(DevOp::Nop, b.all(), &[], |_| {});
-        let second = b.emit(DevOp::Nop, b.all(), &[first], |_| {});
-        let raw = b.emit(DevOp::MoeAiterFp8Pf, vec![0], &[second], |_| {});
-        b.isolate(raw);
-        b.emit(DevOp::Nop, b.all(), &[raw], |_| {});
-        let p = b.finish();
-        assert!(p.insts[1].wait_len > 0);
-        for stream in [&p.stream, &p.gq_stream] {
-            for entry in stream {
-                if entry.inst == raw {
-                    assert_eq!(entry.seg, 1);
-                    assert_eq!(
-                        (entry.wait_len, entry.succ_len, entry.flags & SE_XCTR),
-                        (0, 0, 0)
-                    );
-                }
-                if entry.inst == raw + 1 {
-                    assert_eq!(entry.seg, 2);
-                    assert_eq!(entry.wait_len, 0);
+        for native in [DevOp::MoeAiterFp8Pf, DevOp::IndexFp8Decode, DevOp::IndexFp8Prefill] {
+            let mut b = Builder::new(4);
+            b.force_uniseg();
+            let first = b.emit(DevOp::Nop, b.all(), &[], |_| {});
+            let second = b.emit(DevOp::Nop, b.all(), &[first], |_| {});
+            let raw = b.emit(native, vec![0], &[second], |_| {});
+            b.isolate(raw);
+            b.emit(DevOp::Nop, b.all(), &[raw], |_| {});
+            let p = b.finish();
+            assert!(p.insts[1].wait_len > 0);
+            for stream in [&p.stream, &p.gq_stream] {
+                for entry in stream {
+                    if entry.inst == raw {
+                        assert_eq!(entry.seg, 1);
+                        assert_eq!(
+                            (entry.wait_len, entry.succ_len, entry.flags & SE_XCTR),
+                            (0, 0, 0)
+                        );
+                    }
+                    if entry.inst == raw + 1 {
+                        assert_eq!(entry.seg, 2);
+                        assert_eq!(entry.wait_len, 0);
+                    }
                 }
             }
         }

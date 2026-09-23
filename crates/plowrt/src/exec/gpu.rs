@@ -3199,6 +3199,11 @@ impl GpuEngine {
                 })?;
                 let blob = DevBlob::parse(&raw)?;
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
+                    d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16
+                }) {
+                    return Err(RuntimeError::Device("native FP8 indexer requires the gfx950 AMD route".into()));
+                }
+                if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::MoeAiterFp8Pf as u16
                         || d.op == DevOp::IndexTpPf as u16
                         || d.op == DevOp::GemmLtPf as u16

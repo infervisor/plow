@@ -56,6 +56,13 @@
 #include "amd_common.h"
 #include "token_batch.h"
 
+#ifndef PLOW_MLA_P_BF16
+#define PLOW_MLA_P_BF16 0
+#endif
+#if PLOW_MLA_P_BF16
+extern "C" __device__ unsigned plow_mla_p_bf16_1 = 1;
+#endif
+
 #define FA_BQ 32   /* query rows per wave; 4 waves => 128-row q-tile */
 #define FA_BKV 32  /* KV rows staged per step (one MFMA N tile)      */
 #define FA_PAD 8   /* LDS row padding, in halves, to break bank conflicts */
@@ -2647,6 +2654,9 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
 #pragma unroll
                     for (int g = 0; g < GF; g++) {
                         float pw = Ssm[g * FA_DEC_TILE + r + (unsigned)c * NG];
+#if PLOW_MLA_P_BF16
+                        if constexpr (!FP8) pw = bf2f(f2bf(pw));
+#endif
                         if constexpr (FP8) pw *= vsf[c];
 #pragma unroll
                         for (int u = 0; u < 8; u++) oacc[g][u] += pw * bf2f(vv[c][u]);
@@ -2666,6 +2676,9 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
 #pragma unroll
                 for (int g = 0; g < GF; g++) {
                     float pw = Ssm[g * FA_DEC_TILE + r];
+#if PLOW_MLA_P_BF16
+                    if constexpr (!FP8) pw = bf2f(f2bf(pw));
+#endif
                     if constexpr (FP8) pw *= vsf;
 #pragma unroll
                     for (int u = 0; u < 8; u++) oacc[g][u] += pw * bf2f(v[u]);

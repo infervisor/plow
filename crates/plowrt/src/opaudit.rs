@@ -287,7 +287,7 @@ pub fn classify(op: DevOp) -> OpClass {
         // ---- norms, elementwise, embedding ------------------------------
         DevOp::RmsNorm => a_rows("i0=rows"),
         DevOp::RowRms => a_rows("i0=rows"),
-        DevOp::Residual => a_elem("i0=n"),
+        DevOp::Residual | DevOp::Sum4Bf16 => a_elem("i0=n"),
         DevOp::Glu => a_elem("i0=n"),
         DevOp::Embed => a_rows("i0=ntok, t2=ids per row"),
         DevOp::SoftCap => a_elem("i0=n"),
@@ -300,6 +300,8 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::ZeroF32 => a_rows("i0=M"),
         DevOp::CastF32Bf16 => a_rows("i0=M"),
         DevOp::QuantFp8 => a_rows("i0=M, per-row a_scale"),
+        DevOp::QuantFp8Block128 | DevOp::GemmFp8Block128 | DevOp::GemmFp8Block128Split4 => a_rows("i0=M, group-major activation scales"),
+        DevOp::MlaBmmFp8 => a_rows("i0=M, head-interleaved BF16 rows with fused group128 quantization"),
         DevOp::Q8GemmF32 => a_rows("i0=M, dense FP32 rows"),
         DevOp::LayerNormF32 => a_rows("i0=rows"),
         DevOp::ScaledAddF32 => a_elem("i0=n"),
@@ -470,6 +472,8 @@ pub fn classify(op: DevOp) -> OpClass {
         // `stage_kv_spans`); the static class stays C because the opcode alone cannot say
         // which form a launch will take.
         DevOp::IndexTpPf => cls_c("kv_len[0] - T isolated; PlowKvSpan table under packing"),
+        DevOp::IndexFp8Decode => cls_c("native decode-only owned block16 cache; no packed-prefill route"),
+        DevOp::IndexFp8Prefill => cls_c("native single-slot prefill cache and causal bounds; no packed-prefill route"),
         DevOp::IndexUnionPf => cls_c("q_pos0 = kv_len[0] - n_tok (op_attention.h:5474)"),
         DevOp::DsaQQuant => a_rows("i0=n_rows (flattened token x index-head)"),
         DevOp::DsaPoolCompress => {
@@ -509,6 +513,9 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::MoeAlignGemmaPf => b("i0=T; builds row_token / row_partidx / row_gate maps"),
         DevOp::MoeGroupGluPf => b("t5=row_token gathers the source token per gathered row"),
         DevOp::MoeGroupDownPf => b("t6=row_partidx / t7=row_gate scatter per gathered row"),
+        DevOp::MoeGluFp8Block128 => b("t6=row_token; i3=T; grouped block128 FP8 gather"),
+        DevOp::MoeQuantFp8Block128 => b("t4=row_partidx; i3=T; slot-major FP8 scatter and output clear"),
+        DevOp::MoeDownFp8Block128 => b("t6=row_partidx / t7=row_gate; i4=T; BF16 atomic reduction"),
         DevOp::MoeAiterFp8Pf => b("i0=T; native A8 MoE reads aligned row maps in t4..t7"),
         DevOp::MoeGroupGluGemmaPf => b("t4=row_token"),
         DevOp::MoeGroupDownGemmaPf => b("t4=row_partidx / t5=row_gate"),

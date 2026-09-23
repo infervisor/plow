@@ -454,7 +454,7 @@ impl DevBlob {
                         tensors.len()
                     )));
                 }
-                if r.generate().is_none() {
+                if !r.amd_rope_bf16() && r.generate().is_none() {
                     return Err(RuntimeError::Device(format!(
                         "devblob: gen recipe for `{}` is unreadable — kind {}, scale {} \
                          — this blob needs a newer plowrt. `generate()` refuses on an unknown \
@@ -1502,6 +1502,32 @@ mod tests {
         let only = DevBlob::parse(&pf.to_blob()).unwrap().tp.expect("sharded");
         assert_eq!((only.n_gpu, only.slot_bytes), (2, slot_b as u64));
         assert_eq!(only.hidden, h, "two-shot supplies t*hidden");
+    }
+
+    #[test]
+    fn v7_device_rope_recipe_roundtrips_without_host_materialization() {
+        use packet::rope::{GEN_AMD_ROPE_BF16_COS, GEN_AMD_ROPE_BF16_SIN,
+            GEN_AMD_ROPE_IDX_BF16_COS, GEN_AMD_ROPE_IDX_BF16_SIN, RopeScale};
+        for indexer in [false, true] {
+        let mut m = tiny_model();
+        let (mut recipes, kinds, names) = if indexer {
+            (GenTensor::rope_idx_pair(8192, 64, 128, 8000000.0),
+                [GEN_AMD_ROPE_IDX_BF16_COS, GEN_AMD_ROPE_IDX_BF16_SIN], ["in.icos", "in.isin"])
+        } else {
+            (GenTensor::rope_pair(8192, 64, 8000000.0, 1.0, RopeScale::None),
+                [GEN_AMD_ROPE_BF16_COS, GEN_AMD_ROPE_BF16_SIN], ["in.cos", "in.sin"])
+        };
+        for (i, kind) in kinds.into_iter().enumerate() {
+            recipes[i].kind = kind;
+            recipes[i].tensor = m.tensors.len() as u32;
+            m.tensors.push(TensorDecl { name: names[i].into(), bytes: recipes[i].byte_len(), init: None });
+        }
+        m.gen = recipes.to_vec();
+        let parsed = DevBlob::parse(&m.to_blob()).unwrap();
+        assert_eq!(parsed.gen, recipes);
+        assert!(parsed.gen.iter().all(|g| g.generate().is_none()));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.bake_gen())).is_err());
+        }
     }
 
     /// A v7 blob must be DISCOVERED, parsed, and its recipes materialised.

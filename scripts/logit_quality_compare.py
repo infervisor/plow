@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,8 @@ def metrics(a, b, topk):
     if len(a) != len(b):
         raise ValueError(f"vocabulary mismatch: candidate={len(a)}, reference={len(b)}")
     n = len(a)
+    if n < 2 or a.ndim != 1 or b.ndim != 1 or not np.isfinite(a).all() or not np.isfinite(b).all():
+        raise ValueError("comparison requires finite full-vocabulary vectors")
     a, b = a.astype(np.float64), b.astype(np.float64)
     # Centering removes the arbitrary scalar offset between logits and logprobs.
     ac, bc = a - a.mean(), b - b.mean()
@@ -119,8 +122,12 @@ def main():
     p.add_argument("--top-k", default="1,5,16,64")
     p.add_argument("--repeat-floor-manifest", action="append", type=Path, default=[])
     p.add_argument("--repeat-floor-multiplier", type=float, default=2.0)
+    p.add_argument("--require-same-phase", action="store_true")
+    p.add_argument("--require-pass", action="store_true", help="exit nonzero on failed or unavailable quality gate")
     args = p.parse_args()
     topk = [int(x) for x in args.top_k.split(",")]
+    if not topk or min(topk) < 1 or not math.isfinite(args.repeat_floor_multiplier) or args.repeat_floor_multiplier <= 0:
+        p.error("top-k and finite repeat-floor multiplier must be positive")
     ref_meta, refs, ref_repeated = load_manifest(args.reference)
     checks = repeat_checks(ref_meta, ref_repeated, topk)
     floor_sources = [str(args.reference)] if checks else []
@@ -157,6 +164,7 @@ def main():
         cand_meta, candidates, _ = load_manifest(candidate_path)
         name = cand_meta.get("name", candidate_path.stem)
         rows = []
+        unmatched = [case["id"] for key, case in candidates.items() if key not in refs]
         for key, cand in candidates.items():
             ref = refs.get(key)
             if ref is None:
@@ -170,6 +178,12 @@ def main():
                 }
             )
             row["prompt_sha256_u32le"] = key
+            row["candidate_execution_phase"] = cand.get("execution_phase")
+            row["reference_execution_phase"] = ref.get("execution_phase")
+            row["same_execution_phase"] = (
+                cand.get("execution_phase") in {"prefill_output", "decode_output"}
+                and cand["execution_phase"] == ref.get("execution_phase")
+            )
             row["reference_argmax_unstable"] = key in unstable_histories
             row["reference_repeat_status"] = (
                 "unstable"
@@ -206,6 +220,8 @@ def main():
         summary = {
             "name": name,
             "matched_histories": len(rows),
+            "unmatched_candidate_cases": unmatched,
+            "phase_mismatch_or_unmeasured_rows": sum(not r["same_execution_phase"] for r in rows),
             "gap_exceeds_row_error_flips": severe,
             "token_agreement_rows": token_agreement,
             "reference_unstable_rows": sum(
@@ -215,8 +231,10 @@ def main():
                 r["reference_repeat_status"] == "unmeasured" for r in rows
             ),
             "rows_outside_repeat_floor": outside if floor else None,
-            "quality_gate_scope": "all-matched-exact-teacher-forced-histories",
-            "quality_gate_pass": (outside == 0) if floor else None,
+            "quality_gate_scope": "all-candidate-exact-teacher-forced-histories",
+            "require_same_phase": args.require_same_phase,
+            "quality_gate_pass": (outside == 0 and not unmatched and
+                                  (not args.require_same_phase or all(r["same_execution_phase"] for r in rows))) if floor else None,
             "longest_prompt_tokens": max(r["prompt_len"] for r in rows),
             "median_full_row_centered_rel_l2": float(
                 np.median([r["full_row_centered_rel_l2"] for r in rows])
@@ -242,6 +260,8 @@ def main():
             f"Matched exact-history rows: {len(rows)} through prompt length "
             f"{summary['longest_prompt_tokens']}; token agreement: "
             f"{token_agreement}/{len(rows)}; {verdict}.",
+            f"Unmatched candidate rows: {len(unmatched)}; phase mismatch/unmeasured: "
+            f"{summary['phase_mismatch_or_unmeasured_rows']} (same phase required: {args.require_same_phase}).",
             "",
             "| prompt | full relL2 | head64 relL2 | floor ratio full/head | "
             "top64 | token | class |",
@@ -264,6 +284,8 @@ def main():
         lines.append("")
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     args.output.with_suffix(".md").write_text("\n".join(lines) + "\n")
+    if args.require_pass and not all(c["quality_gate_pass"] is True for c in report["comparisons"]):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
