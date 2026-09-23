@@ -550,6 +550,97 @@ static __device__ void d_gemv_argmax(__nv_bfloat16* __restrict__ C, const __nv_b
     if (threadIdx.x == 0) part[slice] = best;
 }
 
+template <unsigned MAX_M, int UN = (MAX_M <= 8 ? GV_UNROLL : 2)>
+static __device__ __forceinline__ void d_gemv_argmax_batch_inner(
+    __nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ W, unsigned long long* __restrict__ part,
+    unsigned M, unsigned N, unsigned K, float cap, unsigned slice, unsigned nblk,
+    __nv_bfloat16* __restrict__ arena) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned nchunk = (K + GV_STEP - 1u) / GV_STEP;
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned n0 = slice * per;
+    const unsigned n1 = (n0 + per < N) ? (n0 + per) : N;
+    const float inv = cap > 0.0f ? 1.0f / cap : 0.0f;
+
+    for (unsigned m0 = 0; m0 < M; m0 += MAX_M) {
+        const unsigned cur_m = (m0 + MAX_M <= M) ? MAX_M : (M - m0);
+        unsigned long long best[MAX_M] = {};
+
+        for (unsigned n = n0 + warp; n < n1; n += PLOW_NV_WARPS) {
+            const __nv_bfloat16* wrow = W + (size_t)n * K;
+            float acc[MAX_M] = {};
+            for (unsigned c = 0; c < nchunk; c += UN) {
+                bf16v8 wv[UN];
+                unsigned kk[UN];
+#pragma unroll
+                for (int u = 0; u < UN; u++) {
+                    const unsigned k = (c + (unsigned)u) * GV_STEP + lane * 8u;
+                    kk[u] = k;
+                    wv[u] = (k < K) ? ld_glob8(wrow + k) : bf16v8_zero();
+                }
+#pragma unroll
+                for (int u = 0; u < UN; u++) {
+                    if (kk[u] >= K) continue;
+#pragma unroll
+                    for (unsigned m = 0; m < MAX_M; m++) {
+                        if (m < cur_m) {
+                            const bf16v8 xv = ld_glob8(x + (size_t)(m0 + m) * K + kk[u]);
+                            acc[m] = dot8(wv[u], xv, acc[m]);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (unsigned m = 0; m < MAX_M; m++) {
+                if (m < cur_m) {
+                    const float t = warp_sum32(acc[m]);
+                    const __nv_bfloat16 lg = __float2bfloat16(t);
+                    const __nv_bfloat16 sc =
+                        cap > 0.0f ? __float2bfloat16(cap * tanhf(__bfloat162float(lg) * inv)) : lg;
+                    if (lane == 0) {
+                        C[(size_t)(m0 + m) * N + n] = sc;
+                        const unsigned long long key = amax_pack(sc, n);
+                        best[m] = key > best[m] ? key : best[m];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        for (unsigned m = 0; m < MAX_M; m++) {
+            if (m < cur_m) {
+                const unsigned long long b = block_max_u64(best[m], (unsigned long long*)arena);
+                if (threadIdx.x == 0) part[(size_t)(m0 + m) * nblk + slice] = b;
+                __syncthreads();
+            }
+        }
+    }
+}
+
+/* Batched multi-sequence LM head decode GEMV + argmax (PLOW_FUSE_ARGMAX).
+ * For M sequences, streams the 2.01 GB LM head weight matrix W ONCE in register-budgeted passes
+ * up to batch 16 instead of separate passes over GDDR. */
+static __device__ void d_gemv_argmax_batch(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+                                           const __nv_bfloat16* __restrict__ W, unsigned long long* __restrict__ part,
+                                           unsigned M, unsigned N, unsigned K, float cap, unsigned slice, unsigned nblk,
+                                           __nv_bfloat16* __restrict__ arena) {
+    if (M <= 1u) {
+        d_gemv_argmax(C, x, W, part, N, K, cap, slice, nblk, arena);
+        return;
+    }
+    if (M <= 4u) {
+        d_gemv_argmax_batch_inner<4>(C, x, W, part, M, N, K, cap, slice, nblk, arena);
+        return;
+    }
+    if (M <= 8u) {
+        d_gemv_argmax_batch_inner<8>(C, x, W, part, M, N, K, cap, slice, nblk, arena);
+        return;
+    }
+    d_gemv_argmax_batch_inner<16>(C, x, W, part, M, N, K, cap, slice, nblk, arena);
+}
+
+
 /* FUSED QKV: one x row against three weight matrices, ownership BLOCKED over the
  * CONCATENATED output [0,Nq) u [Nq,Nq+Nk) u [Nq+Nk,Nq+Nk+Nv). x is read once per column
  * regardless, but fusing collapses three packets (three global gates, three single-row ops
@@ -2454,6 +2545,97 @@ static __device__ void d_gemv_glu(__nv_bfloat16* __restrict__ C, const __nv_bflo
         }
     }
 }
+
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
+template <unsigned K>
+__device__ __forceinline__ void d_gemv_qkv_sm90_xreg(
+    __nv_bfloat16* Cq, __nv_bfloat16* Ck, __nv_bfloat16* Cv,
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* Wq, const __nv_bfloat16* Wk, const __nv_bfloat16* Wv,
+    unsigned Nq, unsigned Nk, unsigned Nv, unsigned slice, unsigned nblk) {
+    static_assert(K == 2048 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
+                  K == 3840 || K == 4096 || K == 5120 || K == 5376 || K == 6144);
+    constexpr unsigned chunks = K / GV_STEP;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned N = Nq + Nk + Nv;
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned first = slice * per, end = min(first + per, N);
+    bf16v8 xv[chunks];
+#pragma unroll
+    for (unsigned c = 0; c < chunks; c++)
+        xv[c] = ld_glob8(x + c * GV_STEP + lane * 8u);
+    for (unsigned g = first + warp; g < end; g += blockDim.x / 32u) {
+        const __nv_bfloat16* W;
+        __nv_bfloat16* C;
+        unsigned n;
+        if (g < Nq) {
+            W = Wq; C = Cq; n = g;
+        } else if (g < Nq + Nk) {
+            W = Wk; C = Ck; n = g - Nq;
+        } else {
+            W = Wv; C = Cv; n = g - Nq - Nk;
+        }
+        const __nv_bfloat16* row = W + (size_t)n * K;
+        float acc = 0.f;
+#pragma unroll
+        for (unsigned c = 0; c < chunks; c += GV_UNROLL) {
+            bf16v8 weights[GV_UNROLL];
+#pragma unroll
+            for (unsigned u = 0; u < GV_UNROLL; u++)
+                if (c + u < chunks)
+                    weights[u] = ld_glob8(row + (c + u) * GV_STEP + lane * 8u);
+#pragma unroll
+            for (unsigned u = 0; u < GV_UNROLL; u++)
+                if (c + u < chunks) acc = dot8(weights[u], xv[c + u], acc);
+        }
+        const float total = warp_sum32(acc);
+        if (lane == 0) C[n] = __float2bfloat16(total);
+    }
+}
+
+template <unsigned K>
+__device__ __forceinline__ void d_gemv_glu_sm90_xreg(__nv_bfloat16* C,
+    const __nv_bfloat16* x, const __nv_bfloat16* Wg, const __nv_bfloat16* Wu,
+    unsigned N, unsigned act, unsigned slice, unsigned nblk) {
+    static_assert(K == 2048 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
+                  K == 3840 || K == 4096 || K == 5120 || K == 5376 || K == 6144);
+    constexpr unsigned chunks = K / GV_STEP;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned first = slice * per, end = min(first + per, N);
+    bf16v8 xv[chunks];
+#pragma unroll
+    for (unsigned c = 0; c < chunks; c++)
+        xv[c] = ld_glob8(x + c * GV_STEP + lane * 8u);
+    for (unsigned n = first + warp; n < end; n += blockDim.x / 32u) {
+        const __nv_bfloat16* grow = Wg + (size_t)n * K;
+        const __nv_bfloat16* urow = Wu + (size_t)n * K;
+        float ag = 0.f, au = 0.f;
+#pragma unroll
+        for (unsigned c = 0; c < chunks; c += GV_UNROLL_GLU) {
+            bf16v8 gv[GV_UNROLL_GLU], uv[GV_UNROLL_GLU];
+#pragma unroll
+            for (unsigned u = 0; u < GV_UNROLL_GLU; u++) {
+                if (c + u < chunks) {
+                    gv[u] = ld_glob8(grow + (c + u) * GV_STEP + lane * 8u);
+                    uv[u] = ld_glob8(urow + (c + u) * GV_STEP + lane * 8u);
+                }
+            }
+#pragma unroll
+            for (unsigned u = 0; u < GV_UNROLL_GLU; u++) {
+                if (c + u < chunks) {
+                    ag = dot8(gv[u], xv[c + u], ag);
+                    au = dot8(uv[u], xv[c + u], au);
+                }
+            }
+        }
+        const float tg = warp_sum32(ag), tu = warp_sum32(au);
+        if (lane == 0) {
+            C[n] = gemma_glu_epilogue(tg, tu, act);
+        }
+    }
+}
+#endif
 
 /* ======================= SplitZip (bf16 lossless) DECODE GEMV ==========================
  * p9-v2 C-1. The bf16 weight is stored byte-plane split + 4-bit affine exponent codes:

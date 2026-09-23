@@ -39,7 +39,7 @@ pub async fn chat_completions(
     // instead of showing the user what was wrong with their request.
     req: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let Json(req) = match req {
+    let Json(mut req) = match req {
         Ok(r) => r,
         Err(e) => {
             return crate::serve::api_error(
@@ -51,6 +51,17 @@ pub async fn chat_completions(
             )
         }
     };
+
+    // ALIASES. `model` may be a name this bundle merely answers to (vLLM's
+    // `--served-model-name`). Resolve it ONCE, here, before anything keyed by
+    // slug runs — residency, the manager, the mux, the metrics map — so an
+    // alias never grows a second key for the same model. The response still
+    // echoes the name the client sent, as vLLM does.
+    let requested_model = req.model.clone();
+    if let Some(canonical) = state.registry.resolve(&req.model) {
+        req.model = canonical;
+    }
+
     // S1 multi-model: a request for a managed, non-resident model triggers
     // the switch HERE (evict LRU + load), before the prompt is built — so the
     // template choice below sees the engine. Resident models pass through on
@@ -128,6 +139,29 @@ pub async fn chat_completions(
         }
     }
 
+    // OpenAI's schema requires at least one message, and answering an empty
+    // conversation means generating from a bare generation prompt: the model
+    // invents a question and answers it, with a 200 and a plausible body.
+    // `/v1/completions` already refuses its empty-prompt equivalent.
+    if req.messages.is_empty() {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "`messages` must contain at least one message",
+            "invalid_request_error",
+            Some("invalid_prompt"),
+            Some("messages".into()),
+        );
+    }
+    if let Err(e) = req.sampling.validate() {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            e.message,
+            "invalid_request_error",
+            Some("invalid_value"),
+            Some(e.field.into()),
+        );
+    }
+
     // §TTFT: the clock the breakdown is measured against starts HERE, at the
     // first line of the handler that has the request body — everything before
     // it (accept, read, JSON decode) is axum's and shows up as UNACCOUNTED.
@@ -139,6 +173,11 @@ pub async fn chat_completions(
     // reference path keeps the simple role-prefix flatten — its logits are a
     // stand-in, so a template would be costume jewelry there.
     let mut template_error: Option<String> = None;
+    let render_opts = crate::serve::template::RenderOpts {
+        kwargs: req.chat_template_kwargs.clone().unwrap_or_default(),
+        reasoning_effort: req.reasoning_effort.clone(),
+        continue_final_message: req.continue_final_message.unwrap_or(false),
+    };
     let prompt = crate::obs::ttft::timed(&crate::obs::ttft::TEMPLATE, || {
         if state.has_gpu_engine(&req.model) {
             let tok = state.registry.get(&req.model).ok();
@@ -157,7 +196,7 @@ pub async fn chat_completions(
                         })
                     })
                     .collect();
-                match t.render(&msgs) {
+                match t.render_with(&msgs, &render_opts) {
                     Ok(p) => return p,
                     Err(e) => {
                         // The template REFUSED this conversation (HF templates
@@ -194,17 +233,23 @@ pub async fn chat_completions(
         );
     }
 
-    // Build generation controls from the request.
-    let mut gen = crate::serve::GenParams::default();
+    // Build generation controls: the CHECKPOINT's defaults first, then the
+    // request's own fields on top. Resolution order is
+    // `request > model default > server default` — before this, the model
+    // default step did not exist and every checkpoint was served at the stock
+    // temperature 1.0 / top_p 1.0 whatever its `generation_config.json` said.
+    let mut gen = crate::serve::GenParams {
+        params: state
+            .registry
+            .get(&req.model)
+            .map(|b| b.serving().default_sampling.clone())
+            .unwrap_or_default(),
+        ..Default::default()
+    };
     if let Some(m) = req.max_tokens {
         gen.max_tokens = m as usize;
     }
-    if let Some(t) = req.temperature {
-        gen.params.temperature = t;
-    }
-    if let Some(p) = req.top_p {
-        gen.params.top_p = p;
-    }
+    req.sampling.apply(&mut gen.params);
     if let Some(ignore) = req.ignore_eos {
         gen.ignore_eos = ignore;
     }
@@ -212,6 +257,20 @@ pub async fn chat_completions(
         gen.stop = stop.list();
     }
     gen.seed = req.seed;
+    gen.min_tokens = req.sampling.min_tokens.unwrap_or(0) as usize;
+    gen.stop_token_ids = req.sampling.stop_token_ids.clone().unwrap_or_default();
+    if gen.min_tokens > gen.max_tokens {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "`min_tokens` ({}) exceeds `max_tokens` ({}); the request could never finish",
+                gen.min_tokens, gen.max_tokens
+            ),
+            "invalid_request_error",
+            Some("invalid_value"),
+            Some("min_tokens".into()),
+        );
+    }
 
     // NO VISION PATH EXISTS. `Content::as_text()` flattens a multipart message by
     // keeping the `Text` parts and dropping everything else, so an `image_url`
@@ -253,7 +312,13 @@ pub async fn chat_completions(
     let ingress = mux.ingress();
     // Tokenize HERE, on the handler task — the dispatcher loop is the
     // serialized decode critical path and must never encode a long prompt.
-    let reasoning_open = opens_reasoning(&prompt);
+    // `ThinkTag` unconditionally: the splitter's own `Deciding` state settles
+    // after the first few bytes of generation, so a model that never reasons
+    // costs at most a 7-byte delay on its first chunk and nothing after. What
+    // the PROMPT decides is only whether the trace is already open (GLM leaves
+    // it dangling; Qwen3 and DeepSeek-R1 emit the marker themselves).
+    let reasoning_mode = crate::serve::reasoning::ReasoningMode::ThinkTag;
+    let reasoning_open = crate::serve::reasoning::ReasoningMode::prompt_opens(&prompt);
     let prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
         bundle.tokenizer().encode(&prompt)
     });
@@ -293,17 +358,26 @@ pub async fn chat_completions(
         let include_usage = req.stream_options.map(|o| o.include_usage).unwrap_or(false);
         sse_response(
             request_id,
-            req.model,
+            requested_model,
             rx,
             include_usage,
             t_arrive,
             n_prompt,
             created,
+            reasoning_mode,
             reasoning_open,
         )
         .into_response()
     } else {
-        buffer_and_reply(request_id, req.model, rx, created).await
+        buffer_and_reply(
+            request_id,
+            requested_model,
+            rx,
+            created,
+            reasoning_mode,
+            reasoning_open,
+        )
+        .await
     }
 }
 
@@ -504,28 +578,6 @@ fn glm_chat_prompt(messages: &[Message]) -> String {
     p
 }
 
-/// Split a GLM answer into (reasoning, answer) at the first `</think>`.
-///
-/// The generation prompt leaves `<think>` open, so the model emits its trace
-/// and then closes it. `</think>` is `special: false` in GLM's added tokens, so
-/// `skip_special_tokens` does NOT remove it and it would otherwise land in the
-/// user-visible `content` as literal text along with the whole trace. Returns
-/// `(None, whole)` until the marker is seen, which is also the correct answer
-/// for a model that never opened a trace.
-pub fn split_reasoning(text: &str) -> (Option<String>, String) {
-    const CLOSE: &str = "</think>";
-    match text.find(CLOSE) {
-        Some(i) => {
-            let reasoning = text[..i].trim().to_string();
-            let answer = text[i + CLOSE.len()..].trim_start().to_string();
-            (
-                (!reasoning.is_empty()).then_some(reasoning),
-                answer,
-            )
-        }
-        None => (None, text.to_string()),
-    }
-}
 
 /// The Gemma-4 canonical chat format (the checkpoint's
 /// `chat_template.jinja`, text-only subset): `<bos>`, one
@@ -561,8 +613,19 @@ async fn buffer_and_reply(
     model: String,
     mut rx: stream_mod::ChunkReceiver,
     created: u64,
+    reasoning_mode: crate::serve::reasoning::ReasoningMode,
+    reasoning_open: bool,
 ) -> Response {
     let mut text = String::new();
+    // Driven PER TOKEN, exactly as the streamed path drives it — same type,
+    // same order — so the two cannot disagree, and `trace_tokens` is a real
+    // token count rather than a count of calls.
+    let mut split = crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open);
+    let (mut reasoning_buf, mut answer_buf) = (String::new(), String::new());
+    // Tokens that fell inside the trace, for `completion_tokens_details`.
+    // Counted from CHUNKS (one per generated token) rather than derived from
+    // the split text — the split is over characters and cannot be converted
+    // back into a token count.
     // `None` until a terminal chunk arrives. It must NOT default to "stop": the
     // mux frees a slot on ANY `try_send` failure, and a bounded-channel `Full`
     // (serve/stream.rs caps the stream at 32 chunks) drops the sender without
@@ -570,10 +633,15 @@ async fn buffer_and_reply(
     // a fluent, truncated answer that claimed to be complete — invisible to a
     // benchmark client, which counts it as a successful request.
     let mut finish: Option<stream_mod::FinishReason> = None;
-    let mut usage = None;
+    let mut usage: Option<Usage> = None;
     while let Some(chunk) = rx.recv().await {
         match chunk {
-            StreamChunk::Token { text: delta, .. } => text.push_str(&delta),
+            StreamChunk::Token { text: delta, .. } => {
+                text.push_str(&delta);
+                let (r, c) = split.push(&delta);
+                reasoning_buf.push_str(&r.unwrap_or_default());
+                answer_buf.push_str(&c.unwrap_or_default());
+            }
             StreamChunk::Done {
                 reason, usage: u, ..
             } => {
@@ -615,7 +683,21 @@ async fn buffer_and_reply(
     // and the trace goes to `reasoning_content`, which is where a reasoning
     // model's clients look for it. A model that never opened a trace is
     // unaffected — `split_reasoning` returns the whole string as the answer.
-    let (reasoning, answer) = split_reasoning(&text);
+    let (r, c) = split.finish();
+    reasoning_buf.push_str(&r.unwrap_or_default());
+    answer_buf.push_str(&c.unwrap_or_default());
+    let reasoning = {
+        let t = reasoning_buf.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    let answer = answer_buf;
+    if split.trace_tokens > 0 {
+        if let Some(u) = usage.as_mut() {
+            u.completion_tokens_details = Some(CompletionTokensDetails {
+                reasoning_tokens: split.trace_tokens,
+            });
+        }
+    }
     Json(ChatResponse {
         id: request_id.clone(),
         object: "chat.completion",
@@ -640,22 +722,6 @@ async fn buffer_and_reply(
         usage,
     })
     .into_response()
-}
-
-/// Does the prompt hand generation an OPEN `<think>` block?
-///
-/// Only then do the first tokens belong in `reasoning_content`. The GLM
-/// template ends its generation prompt with `<|assistant|><think>`; Gemma,
-/// Llama and Qwen templates end with an ordinary assistant turn. Assuming
-/// reasoning unconditionally routed the first token of EVERY model into
-/// `reasoning_content` and left `delta.content` absent on the chunk that
-/// stamps the client's TTFT — the same measurement hazard the role delta
-/// documents below, reached by a different path.
-fn opens_reasoning(prompt: &str) -> bool {
-    match prompt.rfind("<think>") {
-        None => false,
-        Some(open) => prompt.rfind("</think>").is_none_or(|close| close < open),
-    }
 }
 
 /// Streaming path: one SSE `chat.completion.chunk` frame per produced token,
@@ -686,8 +752,10 @@ fn sse_response(
     t_arrive: std::time::Instant,
     n_prompt: usize,
     created: u64,
+    reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+
     // State threaded through the unfold: the receiver, and the tail frames
     // (optional usage-only chunk, then [DONE]) drained one per poll.
     struct SseState {
@@ -695,11 +763,10 @@ fn sse_response(
         done: bool,
         /// The `role` delta has not been sent yet — it rides the FIRST token.
         role_pending: bool,
-        /// Still inside the model's `<think>` trace: deltas route to
-        /// `reasoning_content` until `</think>` arrives. The marker can be
-        /// split across token boundaries, so a small tail is held back.
-        in_reasoning: bool,
-        hold: String,
+        /// Routes each delta to `reasoning_content` or `content`. The SAME
+        /// type the buffered path uses, so the two cannot disagree about one
+        /// generation.
+        split: crate::serve::reasoning::ReasoningSplit,
         pending: std::collections::VecDeque<Event>,
     }
     let body = stream::unfold(
@@ -707,8 +774,7 @@ fn sse_response(
             rx,
             done: false,
             role_pending: true,
-            in_reasoning: reasoning_open,
-            hold: String::new(),
+            split: crate::serve::reasoning::ReasoningSplit::new(reasoning_mode, reasoning_open),
             pending: std::collections::VecDeque::new(),
         },
         move |mut st| {
@@ -752,41 +818,7 @@ fn sse_response(
                             crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, n_prompt);
                             crate::obs::pfx::report();
                         }
-                        // Route the delta to `reasoning_content` until the
-                        // trace closes. `</think>` is NOT a special token, so
-                        // without this the whole trace and the literal marker
-                        // land in the user-visible `content`.
-                        const CLOSE: &str = "</think>";
-                        let (reasoning, content) = if st.in_reasoning {
-                            st.hold.push_str(&text);
-                            match st.hold.find(CLOSE) {
-                                Some(i) => {
-                                    let before = st.hold[..i].to_string();
-                                    let after = st.hold[i + CLOSE.len()..].to_string();
-                                    st.hold.clear();
-                                    st.in_reasoning = false;
-                                    (
-                                        (!before.is_empty()).then_some(before),
-                                        Some(after),
-                                    )
-                                }
-                                None => {
-                                    // Hold back only as much as could still be
-                                    // a prefix of the marker; emit the rest.
-                                    let keep = CLOSE.len().min(st.hold.len());
-                                    let cut = (0..=keep)
-                                        .rev()
-                                        .map(|k| st.hold.len() - k)
-                                        .find(|&c| st.hold.is_char_boundary(c))
-                                        .unwrap_or(st.hold.len());
-                                    let emit = st.hold[..cut].to_string();
-                                    st.hold = st.hold[cut..].to_string();
-                                    ((!emit.is_empty()).then_some(emit), None)
-                                }
-                            }
-                        } else {
-                            (None, Some(text))
-                        };
+                        let (reasoning, content) = st.split.push(&text);
                         let ch = ChatChunk {
                             id: request_id.clone(),
                             object: "chat.completion.chunk",
@@ -807,6 +839,10 @@ fn sse_response(
                         (Event::default().data(stream_mod::chunk_data(&ch)), false)
                     }
                     StreamChunk::Done { reason, usage, .. } => {
+                        // FLUSH. Whatever the splitter still holds belongs to
+                        // this generation; abandoning it truncated the streamed
+                        // `reasoning_content` against the buffered path.
+                        let (flushed_r, flushed_c) = st.split.finish();
                         let ch = ChatChunk {
                             id: request_id.clone(),
                             object: "chat.completion.chunk",
@@ -816,8 +852,8 @@ fn sse_response(
                                 index: 0,
                                 delta: Delta {
                                     role: None,
-                                    content: None,
-                                    reasoning_content: None,
+                                    content: flushed_c,
+                                    reasoning_content: flushed_r,
                                 },
                                 // The wire value: "preempted" is not an OpenAI
                                 // finish_reason and a typed client rejects it.
@@ -839,7 +875,16 @@ fn sse_response(
                                 created,
                                 model,
                                 choices: Vec::new(),
-                                usage: Some(usage.into()),
+                                usage: Some({
+                                    let mut u: Usage = usage.into();
+                                    if st.split.trace_tokens > 0 {
+                                        u.completion_tokens_details =
+                                            Some(CompletionTokensDetails {
+                                                reasoning_tokens: st.split.trace_tokens,
+                                            });
+                                    }
+                                    u
+                                }),
                             };
                             st.pending
                                 .push_back(Event::default().data(stream_mod::chunk_data(&uch)));
@@ -1009,37 +1054,11 @@ mod tests {
         assert!(!p.contains("<|user|>"));
     }
 
-    /// `</think>` is `special: false` in GLM's added tokens, so it survives
-    /// `skip_special_tokens` and would otherwise reach the user as literal
-    /// text along with the whole trace.
-    #[test]
-    fn the_reasoning_trace_is_split_out_of_the_answer() {
-        let (r, a) = super::split_reasoning("weighing it up</think>The answer is 4.");
-        assert_eq!(r.as_deref(), Some("weighing it up"));
-        assert_eq!(a, "The answer is 4.");
-    }
 
-    /// A model that never opened a trace must come back unchanged, not empty.
-    #[test]
-    fn text_without_a_think_marker_is_all_answer() {
-        let (r, a) = super::split_reasoning("just an answer");
-        assert!(r.is_none());
-        assert_eq!(a, "just an answer");
-    }
 
-    #[test]
-    fn only_an_open_think_block_starts_the_reasoning_router() {
-        // GLM's generation prompt hands generation an open trace.
-        assert!(super::opens_reasoning("<|assistant|><think>"));
-        // A closed trace in the HISTORY does not.
-        assert!(!super::opens_reasoning(
-            "<|assistant|><think></think>hi<|user|>again<|assistant|>"
-        ));
-        // Gemma, Llama and Qwen never mention it.
-        assert!(!super::opens_reasoning("<start_of_turn>model\n"));
-        // `</think>` must not read as an opening marker.
-        assert!(!super::opens_reasoning("done</think>"));
-    }
+
+
+
 
     /// Pinned against `encoding_k3.py::build_chat_segments` RUN on the real
     /// moonshotai/Kimi-K3 snapshot with `thinking=False, add_generation_prompt=True`,

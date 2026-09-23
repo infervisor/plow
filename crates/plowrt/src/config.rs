@@ -202,11 +202,11 @@ pub struct RuntimeConfig {
     pub pf_defer_decode: bool,
 
     /// Modular block packet execution mode (reusable layer blocks, decoupled attention/FFN).
-    #[arg(long = "block-packets", env = "PLOW_BLOCK_PACKETS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "block-packets", env = "PLOW_BLOCK_PACKETS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub block_packets: bool,
 
     /// Modular block prefill pipeline and fine-grained ladder execution.
-    #[arg(long = "pf-modular", env = "PLOW_PF_MODULAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "pf-modular", env = "PLOW_PF_MODULAR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_modular: bool,
 
     /// Single block stage to execute: "attn", "ffn", "embed", "vocab", or "all".
@@ -674,6 +674,11 @@ pub struct NvidiaRuntimeConfig {
     /// Retain whole sliding-ring slots on first use; requires live KV without prefix reuse.
     #[arg(long = "vmm-live-rings", env = "PLOW_VMM_LIVE_RINGS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_live_rings: bool,
+
+    /// Track NV dense decode KV-split count from the LIVE `kv_len` instead of
+    /// the `max_ctx` the emitter baked it from (NVIDIA twin of `PLOW_MLA_NS_LIVE`).
+    #[arg(long = "nv-ns-live", env = "PLOW_NV_NS_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub nv_ns_live: bool,
 
     /// Direct upload path (CUDA). --no-nv-upload-direct to disable.
     #[arg(long = "nv-upload-direct", env = "PLOW_UPLOAD_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -1476,6 +1481,21 @@ impl RuntimeConfig {
             Self::env_bool("PLOW_VMM_LIVE_RINGS"),
             !Self::is_initialized(),
         )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_ns_live(&self) -> bool {
+        select_compat(
+            self.nv.nv_ns_live,
+            Self::env_bool("PLOW_NV_NS_LIVE"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub fn live_ctx(&self) -> Option<u32> {
+        self.amd.live_ctx.or_else(|| {
+            Self::env_nonempty("PLOW_LIVE_CTX").and_then(|v| v.parse().ok())
+        })
     }
 
     #[cfg(feature = "cuda")]

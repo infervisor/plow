@@ -2672,7 +2672,8 @@ template <unsigned K>
 __device__ __forceinline__ void d_gemv_sm90_xreg(__nv_bfloat16* C,
     const __nv_bfloat16* x, const __nv_bfloat16* W, unsigned N,
     unsigned slice, unsigned nblk) {
-    static_assert(K == 5120 || K == 6144);
+    static_assert(K == 2048 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
+                  K == 3840 || K == 4096 || K == 5120 || K == 5376 || K == 6144 || K == 8192);
     constexpr unsigned chunks = K / GV_STEP;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned per = (N + nblk - 1u) / nblk;
@@ -2710,14 +2711,14 @@ __device__ __forceinline__ void d_gemv_sm90_xreg(__nv_bfloat16* C,
 #define PLOW_NV_GEMV_KPANEL_F32 0
 #endif
 #if PLOW_NV_GEMV_KPANEL
+template <unsigned N = 5120, unsigned K = 17408, unsigned max_rows_per_warp = 5, unsigned panel_chunks = 8>
 __device__ __forceinline__ void d_gemv_sm90_kpanel(__nv_bfloat16* C,
     const __nv_bfloat16* x, const __nv_bfloat16* W, unsigned slice, unsigned nblk) {
-    constexpr unsigned K = 17408, N = 5120, panel_chunks = 8;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned per = (N + nblk - 1u) / nblk;
     const unsigned first = slice * per, end = min(first + per, N);
-    // Dispatch guarantees 256 threads and <=40 owned rows: at most five rows/warp.
-    float acc[5] = {};
+    // Dispatch guarantees 256 threads and <=40 owned rows: at most max_rows_per_warp rows/warp.
+    float acc[max_rows_per_warp] = {};
 #pragma unroll 1
     for (unsigned panel = 0; panel < K; panel += panel_chunks * GV_STEP) {
 #if PLOW_NV_GEMV_KPANEL_F32
@@ -2738,7 +2739,7 @@ __device__ __forceinline__ void d_gemv_sm90_kpanel(__nv_bfloat16* C,
                 xv[c] = ld_glob8(x + panel + c * GV_STEP + lane * 8u);
 #endif
 #pragma unroll
-        for (unsigned r = 0; r < 5; r++) {
+        for (unsigned r = 0; r < max_rows_per_warp; r++) {
             const unsigned n = first + warp + r * 8u;
             if (n >= end) continue;
             const __nv_bfloat16* row = W + (size_t)n * K + panel;
@@ -2764,7 +2765,7 @@ __device__ __forceinline__ void d_gemv_sm90_kpanel(__nv_bfloat16* C,
         }
     }
 #pragma unroll
-    for (unsigned r = 0; r < 5; r++) {
+    for (unsigned r = 0; r < max_rows_per_warp; r++) {
         const unsigned n = first + warp + r * 8u;
         if (n < end) {
             const float total = warp_sum32(acc[r]);

@@ -46,7 +46,7 @@ pub async fn completions(
     // instead of showing the user what was wrong with their request.
     req: Result<Json<CompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let Json(req) = match req {
+    let Json(mut req) = match req {
         Ok(r) => r,
         Err(e) => {
             return crate::serve::api_error(
@@ -58,6 +58,13 @@ pub async fn completions(
             )
         }
     };
+
+    // Aliases, resolved once before any slug-keyed lookup — see `chat`.
+    let requested_model = req.model.clone();
+    if let Some(canonical) = state.registry.resolve(&req.model) {
+        req.model = canonical;
+    }
+
     if let Err(error) = validate_return_token_ids(req.stream, req.return_token_ids) {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
@@ -123,19 +130,32 @@ pub async fn completions(
         }
     }
 
+    if let Err(e) = req.sampling.validate() {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            e.message,
+            "invalid_request_error",
+            Some("invalid_value"),
+            Some(e.field.into()),
+        );
+    }
+
     let t_arrive = std::time::Instant::now();
     crate::obs::ttft::reset();
 
-    let mut gen = crate::serve::GenParams::default();
+    // Model defaults first, request on top — same resolution order as chat.
+    let mut gen = crate::serve::GenParams {
+        params: state
+            .registry
+            .get(&req.model)
+            .map(|b| b.serving().default_sampling.clone())
+            .unwrap_or_default(),
+        ..Default::default()
+    };
     if let Some(m) = req.max_tokens {
         gen.max_tokens = m as usize;
     }
-    if let Some(t) = req.temperature {
-        gen.params.temperature = t;
-    }
-    if let Some(p) = req.top_p {
-        gen.params.top_p = p;
-    }
+    req.sampling.apply(&mut gen.params);
     if let Some(ignore) = req.ignore_eos {
         gen.ignore_eos = ignore;
     }
@@ -143,6 +163,20 @@ pub async fn completions(
         gen.stop = stop.list();
     }
     gen.seed = req.seed;
+    gen.min_tokens = req.sampling.min_tokens.unwrap_or(0) as usize;
+    gen.stop_token_ids = req.sampling.stop_token_ids.clone().unwrap_or_default();
+    if gen.min_tokens > gen.max_tokens {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "`min_tokens` ({}) exceeds `max_tokens` ({}); the request could never finish",
+                gen.min_tokens, gen.max_tokens
+            ),
+            "invalid_request_error",
+            Some("invalid_value"),
+            Some("min_tokens".into()),
+        );
+    }
 
     let (Some(mux), Ok(bundle)) = (state.mux(&req.model), state.registry.get(&req.model)) else {
         return crate::serve::api_error(
@@ -247,7 +281,7 @@ pub async fn completions(
         let include_usage = req.stream_options.map(|o| o.include_usage).unwrap_or(false);
         sse_response(
             id,
-            req.model,
+            requested_model.clone(),
             rx,
             include_usage,
             t_arrive,
@@ -256,7 +290,7 @@ pub async fn completions(
         )
         .into_response()
     } else {
-        buffer_and_reply(id, req.model, rx, response_prompt_ids, created).await
+        buffer_and_reply(id, requested_model, rx, response_prompt_ids, created).await
     }
 }
 

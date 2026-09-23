@@ -4485,7 +4485,7 @@ fn emit_phase(
         // byte-identical to the pre-TP path. Decode fragments flash_decode's fill under TP (fewer
         // work-items than CUs) but per-rank flash work is 1/tp anyway; merge, on the crit path, wins.
         let ns = if gemv_family {
-            (n_cu * mul).div_ceil(c.heads).max(1)
+            (n_cu * mul).div_ceil(t * c.heads).max(1)
         } else {
             ns
         };
@@ -4603,7 +4603,8 @@ fn emit_phase(
         };
         // DECODE nsplit ABSOLUTE OVERRIDE (occupancy tuning). PLOW_NS_MUL scales the CU-fill target;
         let ns = if gemv_family && full {
-            attention_decode_ns(t, heads, kvh, n_cu, ns)
+            let base_ns = attention_decode_ns(t, heads, kvh, n_cu, ns);
+            (base_ns / t).max(1)
         } else {
             ns
         };
@@ -4624,6 +4625,7 @@ fn emit_phase(
         let ns = emit_config::active()
             .ns_full_abs
             .filter(|_| gemv_family && full)
+            .map(|abs| (abs / t).max(1))
             .unwrap_or(ns);
 
         // The norm is ONE packet whose result all of q/k/v share.
@@ -6491,8 +6493,14 @@ fn emit_phase(
     // E5 (rtx-19) PLOW_FUSE_ARGMAX: fuse the greedy-argmax epilogue (+ softcap) into the lm_head
     // GEMV, folding each block's owned vocab slice into an amax partial and dropping the SoftCap +
     // Argmax packets. Greedy B=1 decode on the bf16 head only (fp8 head keeps the classic path).
-    let fuse_am =
-        fuse_argmax_on() && decode && gemv_family && !fp8_head && !mx4_head && !affine_q4 && t == 1;
+    // In a multi-rung decode ladder, all rungs must share the same instruction sequence shape,
+    // so GemvArgmax is prohibited under ladders.
+    let fuse_am = fuse_argmax_on()
+        && decode
+        && gemv_family
+        && !fp8_head
+        && !mx4_head
+        && !affine_q4;
     let lm_op = if affine_q4 {
         DevOp::GemvAffineQ4
     } else if fuse_am {

@@ -2,6 +2,7 @@ use super::*;
 use packet::dev::ROPE_PAIR_HALF;
 
 pub(super) struct DecodeRung {
+    pub(super) host_insts: Vec<DevInst64>,
     pub(super) library: Option<super::cublaslt::CublasLtDecodeGraph>,
     pub(super) rows: usize,
     pub(super) object: Option<Arc<BoundDecodeObject>>,
@@ -212,6 +213,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     | DevOp::Gemm
                     | DevOp::GemmNorm
                     | DevOp::Gemv
+                    | DevOp::GemvArgmax
                     | DevOp::GemvFp8
                     | DevOp::GemvQkv
                     | DevOp::GemvGlu
@@ -533,6 +535,7 @@ impl DecodeRung {
             ..base
         };
         Ok(Self {
+            host_insts: insts.to_vec(),
             library: None,
             rows: g.t as usize,
             object: None,

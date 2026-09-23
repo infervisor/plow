@@ -633,6 +633,86 @@ pub(crate) fn derive_mla_nsplit(insts: &[DevInst64]) -> Option<(Vec<u32>, u32)> 
     (n_flash > 0 && n_flash == n_merge).then_some((sites, baked?))
 }
 
+/// The NV dense decode KV-split count under `PLOW_NV_NS_LIVE`: live `kv_len` scaling.
+///
+/// Operates as the NV twin of `mla_live_nsplit`. Patches `FlashDecode` `i[5]` (and
+/// `FlashMerge` `i[2]`, if present) from the live `kv_len`.
+///
+/// PROVISIONAL: NV_FA_BKV, NV_NS_PER, and NV_NS_FLOOR are provisional heuristics
+/// pending calibration against measured chain optimum on NV architectures.
+pub(crate) const NV_FA_BKV: u32 = 256;
+pub(crate) const NV_NS_PER: u32 = 1024;
+pub(crate) const NV_NS_FLOOR: u32 = 4;
+
+pub(crate) fn nv_dense_live_nsplit(baked: u32, kv_len: u32) -> u32 {
+    let tiles = kv_len.div_ceil(NV_FA_BKV).max(1);
+    (kv_len / NV_NS_PER)
+        .max(NV_NS_FLOOR)
+        .min(tiles)
+        .max(1)
+        .min(baked.max(1))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NvSplitSite {
+    pub(crate) inst_idx: u32,
+    pub(crate) is_merge: bool,
+}
+
+pub(crate) fn derive_nv_nsplit(
+    insts: &[DevInst64],
+    full_caches: impl Fn(u16) -> bool,
+) -> Option<(Vec<NvSplitSite>, u32)> {
+    let flash = [DevOp::FlashDecode as u16, DevOp::FlashDecodeFp8 as u16];
+    let merge = DevOp::FlashMerge as u16;
+    let (mut sites, mut baked, mut n_flash, mut n_merge) = (Vec::new(), None, 0usize, 0usize);
+    let mut last_flash_retained = false;
+    for (k, d) in insts.iter().enumerate() {
+        if flash.contains(&d.op) {
+            let is_full = full_caches(d.t[3]) && full_caches(d.t[4]);
+            if !is_full {
+                last_flash_retained = false;
+                continue;
+            }
+            last_flash_retained = true;
+            n_flash += 1;
+            let val = d.i[5];
+            if *baked.get_or_insert(val) != val {
+                return None;
+            }
+            sites.push(NvSplitSite {
+                inst_idx: k as u32,
+                is_merge: false,
+            });
+        } else if d.op == merge {
+            if !last_flash_retained {
+                continue;
+            }
+            last_flash_retained = false;
+            n_merge += 1;
+            let val = d.i[2];
+            if *baked.get_or_insert(val) != val {
+                return None;
+            }
+            sites.push(NvSplitSite {
+                inst_idx: k as u32,
+                is_merge: true,
+            });
+        }
+    }
+    (n_flash > 0 && (n_merge == 0 || n_flash == n_merge)).then_some((sites, baked?))
+}
+
+pub(crate) fn nv_split_span(sites: &[NvSplitSite]) -> Option<(usize, usize)> {
+    if sites.is_empty() {
+        return None;
+    }
+    let (lo, hi) = sites.iter().fold((usize::MAX, 0usize), |(l, h), s| {
+        (l.min(s.inst_idx as usize), h.max(s.inst_idx as usize))
+    });
+    Some((lo, hi))
+}
+
 // The KV contract has no caller until the head handoff lands. Keep it here
 // rather than deferring it: the transferable-set rule belongs beside the other
 // KV-row rules this module exists to hold in one place, and splitting it across
@@ -704,8 +784,8 @@ pub(crate) fn kv_contract_digest(tensors: &[KvSlotTensor]) -> String {
 
 #[cfg(test)]
 mod row_field_tests {
-    use super::{RowField, PREFILL_ROW_FIELDS};
-    use packet::dev::DevOp;
+    use super::*;
+    use packet::dev::{DevInst64, DevOp};
 
     /// Field names that mean "this instruction's row count" and "an element count that scales
     /// with rows", from `packet::slots`. `Rows` overwrites its field with the live row count, so
@@ -796,5 +876,80 @@ mod row_field_tests {
             "GEMM opcodes in neither PREFILL_ROW_FIELDS nor EXEMPT, so a ragged prefill tail \
              would compute them at the full bucket width: {missing:?}"
         );
+    }
+
+    #[test]
+    fn nv_dense_live_nsplit_ladder() {
+        for (kv, want) in [
+            (1u32, 1u32),
+            (256, 1),
+            (512, 2),
+            (1024, 4),
+            (2048, 4),
+            (4096, 4),
+            (8192, 8),
+            (16384, 16),
+            (32768, 32),
+            (65536, 64),
+        ] {
+            assert_eq!(nv_dense_live_nsplit(64, kv), want, "kv_len {kv}");
+        }
+        assert_eq!(nv_dense_live_nsplit(32, 65536), 32);
+        assert_eq!(nv_dense_live_nsplit(16, 65536), 16);
+    }
+
+    #[test]
+    fn derive_nv_nsplit_matches_flash_and_merge() {
+        let mut d_flash = DevInst64::default();
+        d_flash.op = DevOp::FlashDecode as u16;
+        d_flash.i[5] = 16;
+
+        let mut d_merge = DevInst64::default();
+        d_merge.op = DevOp::FlashMerge as u16;
+        d_merge.i[2] = 16;
+
+        let insts = vec![d_flash, d_merge];
+        let (sites, baked) = derive_nv_nsplit(&insts, |_| true).expect("derived");
+        assert_eq!(baked, 16);
+        assert_eq!(sites.len(), 2);
+        assert!(!sites[0].is_merge);
+        assert!(sites[1].is_merge);
+        assert_eq!(nv_split_span(&sites), Some((0, 1)));
+
+        // Mismatched split counts refuse
+        let mut d_merge_bad = d_merge;
+        d_merge_bad.i[2] = 8;
+        assert!(derive_nv_nsplit(&[d_flash, d_merge_bad], |_| true).is_none());
+
+        // Fused merge (no FlashMerge) succeeds
+        let (sites_single, baked_single) = derive_nv_nsplit(&[d_flash], |_| true).expect("fused merge");
+        assert_eq!(baked_single, 16);
+        assert_eq!(sites_single.len(), 1);
+        assert!(!sites_single[0].is_merge);
+    }
+
+    #[test]
+    fn derive_nv_nsplit_cache_class_aware() {
+        // One sliding-cache flash at i[5]=1 (handles 20, 21)
+        let mut d_sliding = DevInst64::default();
+        d_sliding.op = DevOp::FlashDecode as u16;
+        d_sliding.i[5] = 1;
+        d_sliding.t[3] = 20;
+        d_sliding.t[4] = 21;
+
+        // One full-cache flash at i[5]=16 (handles 10, 11)
+        let mut d_full = DevInst64::default();
+        d_full.op = DevOp::FlashDecode as u16;
+        d_full.i[5] = 16;
+        d_full.t[3] = 10;
+        d_full.t[4] = 11;
+
+        let insts = vec![d_sliding, d_full];
+        let (sites, baked) = derive_nv_nsplit(&insts, |h| h == 10 || h == 11)
+            .expect("derived full cache site");
+        assert_eq!(baked, 16);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].inst_idx, 1);
+        assert!(!sites[0].is_merge);
     }
 }

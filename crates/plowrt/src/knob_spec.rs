@@ -354,8 +354,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_no_chunk", Some("PLOW_PF_NO_CHUNK"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_no_interleave", Some("PLOW_PF_NO_INTERLEAVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_defer_decode", Some("PLOW_PF_DEFER_DECODE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.block_packets", Some("PLOW_BLOCK_PACKETS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.pf_modular", Some("PLOW_PF_MODULAR"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.block_packets", Some("PLOW_BLOCK_PACKETS"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.pf_modular", Some("PLOW_PF_MODULAR"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.block_stage", Some("PLOW_BLOCK_STAGE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.rt_max_ctx", Some("PLOW_RT_MAX_CTX"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.tbt_slo_ms", Some("PLOW_TBT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -460,6 +460,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.ragged_chunk", Some("PLOW_RAGGED_CHUNK"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.ragged_seams", Some("PLOW_AMD_RAGGED_SEAMS"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.mla_ns_live", Some("PLOW_MLA_NS_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.nv_ns_live", Some("PLOW_NV_NS_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.amd_decode_dense_exact", Some("PLOW_AMD_DECODE_DENSE_EXACT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN).scoped(DECODE_DENSE_EXACT_SCOPE),
     KnobSpec::new("rt.glm_rowband", Some("PLOW_GLM_ROWBAND"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.decode_max_rung", Some("PLOW_DECODE_MAX_RUNG"), Layer::Runtime, U32, UNSET, OPT_IN),
@@ -762,6 +763,11 @@ mod tests {
             "metal.rs",
             "requires PLOW_TEST_BLOB, PLOW_TEST_CHECKPOINT and PLOW_TEST_AUDIO_DIR",
             Site::NotAConstraint("an #[ignore] reason naming the Qwen3-ASR Metal test's fixture paths"),
+        ),
+        (
+            "gpu.rs",
+            "widening context via PLOW_LIVE_CTX requires PLOW_VMM_LIVE=1 or PLOW_VMM_PREFIX=1",
+            Site::NotAConstraint("widening past packet compiled max_ctx requires VMM; narrowing does not"),
         ),
     ];
 

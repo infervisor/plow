@@ -104,6 +104,10 @@ async fn endpoint_tracks_models_independently_and_survives_residency_reload() {
     let text = scrape(&state).await;
     for (model, output) in [("alpha", 3.0), ("beta", 7.0)] {
         assert_eq!(sample(&text, "vllm:generation_tokens_total", model), output);
+        assert_eq!(sample(&text, "vllm:prompt_tokens_total", model), 3.0);
+        assert_eq!(sample(&text, "vllm:prompt_tokens_cached_total", model), 0.0);
+        assert_eq!(sample(&text, "vllm:prefix_cache_queries_total", model), 3.0);
+        assert_eq!(sample(&text, "vllm:prefix_cache_hits_total", model), 0.0);
         assert_eq!(sample(&text, "vllm:num_requests_running", model), 0.0);
         assert_eq!(sample(&text, "vllm:num_requests_waiting", model), 0.0);
         assert_eq!(

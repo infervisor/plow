@@ -431,3 +431,304 @@ async fn completion_and_tokenize_apply_requested_special_tokens() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Helper: POST a chat body and return the status plus the body text.
+async fn chat(body: serde_json::Value) -> (StatusCode, String) {
+    let resp = make_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, body_string(resp).await)
+}
+
+fn base_chat() -> serde_json::Value {
+    serde_json::json!({
+        "model": "api-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4
+    })
+}
+
+/// Routers fetch one card to read `max_model_len` before sizing a request.
+/// The route did not exist, so they got a 404 from a server serving the model.
+#[tokio::test]
+async fn a_single_model_card_is_fetchable() {
+    let app = make_app();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/api-model")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("\"id\":\"api-model\""), "{body}");
+    assert!(body.contains("\"object\":\"model\""), "{body}");
+    assert!(body.contains("\"root\":\"api-model\""), "{body}");
+}
+
+#[tokio::test]
+async fn an_unknown_model_card_is_a_404_not_a_panic() {
+    let resp = make_app()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_string(resp).await;
+    assert!(body.contains("model_not_found"), "{body}");
+}
+
+/// `created` was `now_secs()` evaluated per card, so it changed on every
+/// scrape and a client diffing the catalogue saw every model as new.
+#[tokio::test]
+async fn the_model_card_created_stamp_is_stable_across_scrapes() {
+    let app = make_app();
+    let first = {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        body_string(resp).await
+    };
+    // A second later in wall-clock terms would change a per-call `now_secs()`.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let second = {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        body_string(resp).await
+    };
+    assert_eq!(first, second, "the catalogue must not change between scrapes");
+}
+
+/// The host sampler implements these; serde used to drop them, so the request
+/// was answered under different sampling than it asked for, with a 200.
+#[tokio::test]
+async fn the_sampler_knobs_are_accepted_not_dropped() {
+    let mut body = base_chat();
+    body["top_k"] = serde_json::json!(20);
+    body["min_p"] = serde_json::json!(0.05);
+    body["repetition_penalty"] = serde_json::json!(1.1);
+    body["presence_penalty"] = serde_json::json!(0.5);
+    body["frequency_penalty"] = serde_json::json!(0.5);
+    body["logit_bias"] = serde_json::json!({"5": 1.5});
+    body["min_tokens"] = serde_json::json!(1);
+    body["stop_token_ids"] = serde_json::json!([9999]);
+    let (status, text) = chat(body).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+}
+
+/// vLLM's escape hatch into the template. Dropping it meant `enable_thinking:
+/// false` did nothing here while it worked against vLLM.
+#[tokio::test]
+async fn chat_template_kwargs_are_accepted() {
+    let mut body = base_chat();
+    body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+    body["reasoning_effort"] = serde_json::json!("low");
+    let (status, text) = chat(body).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+}
+
+/// `top_p: 0` truncates the candidate set to nothing and a negative
+/// temperature falls through the greedy branch. OpenAI answers 400; this
+/// server used to accept them and sample from the result.
+#[tokio::test]
+async fn out_of_range_sampling_is_a_400() {
+    for (field, value) in [
+        ("top_p", serde_json::json!(0.0)),
+        ("temperature", serde_json::json!(-1.0)),
+        ("min_p", serde_json::json!(2.0)),
+        ("presence_penalty", serde_json::json!(9.0)),
+        ("frequency_penalty", serde_json::json!(-9.0)),
+        ("repetition_penalty", serde_json::json!(0.0)),
+        ("top_k", serde_json::json!(-5)),
+    ] {
+        let mut body = base_chat();
+        body[field] = value.clone();
+        let (status, text) = chat(body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{field}={value} should be refused, got {status}: {text}"
+        );
+        assert!(text.contains(field), "the error must name the field: {text}");
+    }
+}
+
+/// A non-integer key is not a token id, and a bias outside OpenAI's documented
+/// range is a client bug worth naming rather than silently clamping.
+#[tokio::test]
+async fn a_malformed_logit_bias_is_a_400() {
+    let mut body = base_chat();
+    body["logit_bias"] = serde_json::json!({"not-an-id": 1.0});
+    let (status, text) = chat(body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+
+    let mut body = base_chat();
+    body["logit_bias"] = serde_json::json!({"5": 500.0});
+    let (status, text) = chat(body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+}
+
+/// `min_tokens` above `max_tokens` can never finish; saying so beats holding
+/// a slot open until the cap cuts it.
+#[tokio::test]
+async fn min_tokens_above_max_tokens_is_a_400() {
+    let mut body = base_chat();
+    body["min_tokens"] = serde_json::json!(99);
+    let (status, text) = chat(body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("min_tokens"), "{text}");
+}
+
+/// The same surface on /v1/completions, which shares `SamplingFields`.
+#[tokio::test]
+async fn the_completions_endpoint_validates_the_same_way() {
+    let body = serde_json::json!({
+        "model": "api-model",
+        "prompt": "hi",
+        "max_tokens": 4,
+        "top_p": 0.0
+    });
+    let resp = make_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Same shape as `make_app`, plus an extra served name for the one model.
+fn make_app_with_alias(alias: &str) -> axum::Router {
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("plowrt_api_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    common::write_bundle(&dir, "api-model");
+
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(4));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let registry = Registry::new();
+    registry.load(&dir, None).unwrap();
+    registry.add_alias(alias.to_string(), "api-model").unwrap();
+    let state = Arc::new(AppState::new(registry, execset));
+    for slug in state.registry.slugs() {
+        let bundle = state.registry.get(&slug).unwrap();
+        let m = mux::spawn(
+            slug.clone(),
+            bundle,
+            Arc::clone(&state),
+            MuxConfig::default(),
+        );
+        state.install_mux(slug, m);
+    }
+    app(state)
+}
+
+/// A client that hardcodes a model name it cannot change must be servable
+/// without renaming the bundle (which would change every metric label with it).
+#[tokio::test]
+async fn a_request_for_an_alias_is_served_and_echoes_the_requested_name() {
+    let body = serde_json::json!({
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4
+    });
+    let resp = make_app_with_alias("gpt-3.5-turbo")
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = body_string(resp).await;
+    // The RESPONSE echoes what the client asked for, as vLLM does — not the
+    // canonical slug it was resolved to.
+    assert!(text.contains("\"model\":\"gpt-3.5-turbo\""), "{text}");
+}
+
+/// An alias must be discoverable, or a client cannot learn the name works.
+#[tokio::test]
+async fn aliases_appear_in_the_catalogue_pointing_at_their_target() {
+    let resp = make_app_with_alias("gpt-3.5-turbo")
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let text = body_string(resp).await;
+    assert!(text.contains("\"id\":\"api-model\""), "{text}");
+    assert!(text.contains("\"id\":\"gpt-3.5-turbo\""), "{text}");
+    assert!(text.contains("\"parent\":\"api-model\""), "{text}");
+}
+
+#[tokio::test]
+async fn a_single_card_is_fetchable_by_alias() {
+    let resp = make_app_with_alias("gpt-3.5-turbo")
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models/gpt-3.5-turbo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = body_string(resp).await;
+    assert!(text.contains("\"root\":\"api-model\""), "{text}");
+}
+
+/// An empty conversation used to be answered with a 200: the template renders
+/// a bare generation prompt and the model invents a question and answers it.
+#[tokio::test]
+async fn an_empty_messages_array_is_a_400() {
+    let (status, text) = chat(serde_json::json!({
+        "model": "api-model",
+        "messages": [],
+        "max_tokens": 8
+    }))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("messages"), "{text}");
+}

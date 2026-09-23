@@ -302,6 +302,43 @@ fn validates_channel_fp8_rows_and_preserves_projection_and_kv_checks() {
 }
 
 #[test]
+fn validates_gemv_argmax_ladder() {
+    let mut blob = fixture();
+    blob.tensors.push(DevTensor {
+        name: "amax".into(),
+        bytes: 1024,
+        init: None,
+    });
+    for g in &mut blob.progs {
+        let mut d = DevInst64 {
+            op: DevOp::GemvArgmax as u16,
+            blocks: 1,
+            t: [TENSOR_NONE16; 8],
+            ..Default::default()
+        };
+        d.t[0] = 5;
+        d.t[1] = 0;
+        d.t[2] = 1;
+        d.t[3] = 7;
+        d.i[0] = g.t;
+        d.i[1] = 256;
+        d.i[2] = 128;
+        let entry = StreamEnt {
+            inst: g.insts.len() as u32,
+            ..Default::default()
+        };
+        g.insts.push(d);
+        g.stream.push(entry);
+        g.gq_stream.push(entry);
+        g.stream_len[0] += 1;
+        g.gq_seg_ofs[1] += 1;
+    }
+    assert!(validate_decode_ladder(&blob).unwrap());
+    blob.progs[0].insts[4].i[0] = 999;
+    assert!(validate_decode_ladder(&blob).is_err());
+}
+
+#[test]
 fn validates_hd64_half_split_attention_ladder() {
     let mut blob = fixture();
     for g in &mut blob.progs {
@@ -1591,3 +1628,57 @@ fn bound_projection_requires_capability_only_on_assigned_e3_rungs() {
         );
     });
 }
+
+#[test]
+fn rung_patch_images_preserve_uploaded_mutated_insts() {
+    let g_insts = vec![
+        DevInst64 {
+            op: DevOp::FlashDecode as u16,
+            t: [0, TENSOR_NONE16, TENSOR_NONE16, 3, 4, TENSOR_NONE16, TENSOR_NONE16, TENSOR_NONE16],
+            i: [1, 8, 0, 1024, 0, 16, 256, u32::MAX],
+            ..Default::default()
+        },
+        DevInst64 {
+            op: DevOp::GemmF32 as u16,
+            i: [1, 2, 3, 4, 5, 6, 7, 8],
+            ..Default::default()
+        },
+        DevInst64 {
+            op: DevOp::FlashMerge as u16,
+            i: [1, 8, 16, 256, 0, 0, 0, 0],
+            ..Default::default()
+        },
+    ];
+    // Mutated host_insts (e.g. cuBLASLt route prep altered the Gemm op)
+    let mut mutated_host_insts = g_insts.clone();
+    mutated_host_insts[1].i[0] = 9999; // Route mutation
+
+    let full_set: std::collections::HashSet<u16> = [3, 4].into_iter().collect();
+    let (sites, baked) = crate::exec::kvrow::derive_nv_nsplit(&mutated_host_insts, |h| full_set.contains(&h))
+        .expect("derived with merge");
+    assert_eq!(baked, 16);
+    let (lo, hi) = crate::exec::kvrow::nv_split_span(&sites).expect("span");
+    assert_eq!(lo, 0);
+    assert_eq!(hi, 2);
+
+    // Initialized from host_insts:
+    let mut image = mutated_host_insts[lo..=hi].to_vec();
+    assert_eq!(image[1].i[0], 9999, "preserves cuBLASLt route mutation");
+
+    // Patch to want = 8:
+    let want = 8;
+    for site in &sites {
+        let off = site.inst_idx as usize - lo;
+        if site.is_merge {
+            image[off].i[2] = want;
+        } else {
+            image[off].i[5] = want;
+        }
+    }
+
+    assert_eq!(image[0].i[5], 8, "FlashDecode patched");
+    assert_eq!(image[2].i[2], 8, "FlashMerge patched");
+    assert_eq!(image[1].i[0], 9999, "cuBLASLt route mutation retained after patch");
+    assert_ne!(image[1].i[0], g_insts[1].i[0], "does not revert to raw blob insts");
+}
+
