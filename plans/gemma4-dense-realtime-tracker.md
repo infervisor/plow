@@ -3558,3 +3558,64 @@ it reproduced `SHARED:40464` but `STACK:336` against the shipped `192`, because 
 also carries tunedb defines (`PLOW_NV_FORCE_MINBLK`, `GV_UNROLL`, `GV_MOE_UN`, `PLOW_MOE_DOWN_SG`,
 `GV_UNROLL_GLU`, `GV_MM_MAX`, the FA set) that the script does not know about. Rebuilding the
 packet is the reliable route.
+
+---
+
+## FP8 runs on both Gemma-4 models (first 26B FP8 served row)
+
+Both packets build and serve, coherence gate `true`, 128 in / C1 / 4 prompts:
+
+| packet | TTFT ms | TPOT ms | tok/s | peak MiB |
+|--------|--------:|--------:|------:|---------:|
+| p12fp8 (12B FP8) | 24.52 | 8.630 | 114.2 | 56648 |
+| p26fp8 (26B FP8) | 32.39 | 29.130 | 34.3 | 58740 |
+| 26B BF16 reference (p26k, 2026-09-20) | 23.10 | 5.880 | 166.2 | 77-81 GiB |
+
+The 12B reproduces the one previously recorded FP8 row (p12fp8c: 24.0 / 8.67). **The 26B has never
+served FP8 before this.**
+
+### The 26B FP8 decode is ~5x worse than BF16, as its recipe predicted
+
+TPOT 29.130 vs 5.880 ms, tok/s 34.3 vs 166.2. This is note 2 of the recipe header, now confirmed
+rather than predicted: `PLOW_GEMMA_MOE_DEC_GROUP` and the Lt decode route are read only inside the
+bf16 branch of the decode emitter (`devgen/src/lib.rs:6083-6100`), so under any fp8 the 26B falls
+back to per-slot `MoeExpertGluGemmaFp8` / `MoeExpertDownGemmaFp8` GEMV with no `MoeAlignGemmaPf` --
+no assert, no warning. The BF16 grouped-decode win is simply gone.
+
+What FP8 does deliver is the headroom it was built for: 58.7 GiB against a BF16 packet that peaks
+at 77.4-80.8 GiB on an 80 GiB card. That is ~20 GiB, which is the constraint forcing 16 slots and
+C32 queueing. **So 26B FP8 is today a capacity lever, not a latency one, and it cannot serve the
+"beat vLLM on all metrics" goal until grouped MoE decode is reachable under fp8.**
+
+### Two build defects fixed to get here (commit 9efbb116)
+
+1. `build_sm90a_gemma4_segments.sh` could not build a packet without packed prefill. It required
+   `interp_sm90a_pfpackedseg.cubin` unconditionally under `set -euo pipefail`, so a Gemma MoE FP8
+   packet -- which legitimately has no packed-prefill topology -- aborted the script with **exit 1
+   and no message at all**. Past that it compiled packed-request objects anyway and hit
+   `interp_sm120.cu:203 "packed-request object requires packed-prefill packet topology"`. Now gated
+   on the packet's own `PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY` in three places, and a genuinely
+   missing base object names itself.
+
+2. The 12B FP8 recipe's **role emit changes the packet hash** (base `0x65a07f7e459c7474` -> assets
+   `0xb4c7405cf7c04bc3`), while `campaign.py:338` points `PLOW_PF_SEG_DIR` at `objects/`, which the
+   segments script filled with `cp $base/*.cubin` -- objects specialised to the BASE packet. plowrt
+   correctly refuses: `packet/interpreter MISMATCH`. A BF16 recipe never trips this because its
+   role emit leaves the hash unchanged (rc1024: base == assets == `0x2ea414e0`). The 26B FP8 recipe
+   also leaves it unchanged (`0x344208cf` both sides), which is why only the 12B was affected.
+   Worked around by re-running the segments script against the FINAL assets config into `objects2/`
+   and serving with `PLOW_PF_SEG_DIR=objects2`; `scripts/campaign/objenv.py` feeds it the recipe's
+   `[objects.env]` so that rebuild cannot drift.
+
+**Still open:** `campaign.py` does not do this itself, so a plain `campaign.py build` + `bench` on
+the 12B FP8 recipe still cannot serve without the `--env` override. The fix belongs in `cmd_build`:
+when the assets hash differs from the base hash, re-specialise and record the correct seg dir.
+
+### A trap in preserve_packet.py, found the hard way
+
+`p12fp8c`'s record carries `recipe_overrides` = the three role flags, and a `rebuild_command` that
+passes them as `--env`. Replaying that **fails**: `--env` reaches the BASE emit, which panics at
+`devgen/src/lib.rs:9826` looking for a role cubin the later objects step builds. The field is
+derived by diffing the final packet's emit env against `[emit.env]`, so anything living in
+`[emit_roles.env]` is misreported as an override. The recorded `rebuild_command` is not replayable
+for any recipe that uses `[emit_roles.env]`.
