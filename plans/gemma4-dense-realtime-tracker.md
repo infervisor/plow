@@ -4046,3 +4046,59 @@ needs -3.2 ms to reach vLLM's 15.82 ms. Together they would more than cover it. 
 cost has prior history (the entry function taxes every rung; arena bytes cost ms on the 26B), so
 this is the next thing to size -- with a probe that strips layer work down to entry + sampling,
 built unconditionally and md5-gated.
+
+### The fixed per-step decode cost is ~1.3 ms (megakernel entry), measured without a rebuild
+
+`PLOW_DEBUG_MAX_INST` caps the interpreter's instruction count through a module global
+(gpu.rs:3714), so the decode step can be swept against instructions executed with no rebuild.
+Every capped run was gated on the runtime's own `SET plow_debug_max_inst = <n>` line; all 16
+passed, and cap=766 reproduces the uncapped step (13.688 vs 13.689 at B=32, 10.767 vs 10.775 at
+B=1), so the mechanism is clean and does not itself distort.
+
+    cap        B=32 ms    B=1 ms          marginal us/inst   B=32     B=1
+      1          1.352     1.070            1 ->   32        18.00   13.84
+     32          1.910     1.499           32 ->   64        21.62   17.28
+     64          2.602     2.052           64 ->  128        21.66   17.33
+    128          3.988     3.161          128 ->  256        21.29   16.81
+    256          6.713     5.313          256 ->  512        20.83   16.56
+    512         12.046     9.552          512 ->  540        58.6    42.6
+    766/full    13.688    10.767
+
+    linear fit over 1..512:  B=32  21.05 us/inst, intercept 1.285 ms
+                             B=1   16.70 us/inst, intercept 1.010 ms
+
+NOTE a correction: the DECODE program is 540 instructions, not 766 -- 766 is the PREFILL program
+(build.json kernel_cases.programs[8..13] are kind=decode, instruction_count=540). So the range
+512 -> 766 is not a cheap tail of 254 instructions; it is the decode program's last 28 real
+instructions plus a no-op range, and those 28 cost 1.642 ms = 58.6 us/inst -- the MOST expensive
+in the program, which is what lm_head (2.0 GB over a 262144 vocab) plus the final norm and
+sampling should cost. An earlier reading of this as cheap gated arms was wrong.
+
+**~1.285-1.352 ms of every B=32 decode step is spent before the first instruction does any work**
+-- 9.4% of the 13.688 ms step. That is megakernel entry (grid sync, shared-memory claim, per-block
+state init across 132 blocks), not launch latency, which is ~10 us. Note the arena/smem claim is
+already known to cost ms on the 26B, so this has precedent; but 40464 B x 132 blocks is only
+5.3 MB, which at 3.35 TB/s is ~1.6 us, so ZEROING is not the mechanism and the cause is still
+unidentified.
+
+So the B=32 ctx128 step decomposes as:
+
+    1.285 ms   entry, before instruction 1
+   10.76  ms   body, 511 instructions at 21.05 us
+    1.642 ms   final 28 instructions (lm_head, final norm, sampling)
+   -------
+   13.688 ms   and at ctx 8192, +5.35 ms of KV traversal -> 19.036
+
+Cross-checks against the half-K split: walk 9.516 + F 4.174 = 13.690 at ctx 128. Consistent.
+
+### Does this close the gap?
+
+The step needs -3.2 ms to reach vLLM's 15.82 ms. Available and now quantified:
+
+    ~2.1 ms   walk headroom (70% -> 90% of roofline at B=32) -- but PAIR=4, the measured fix, is
+              blocked by the split-K shared-memory budget, so this needs a reduction redesign
+    ~1.3 ms   megakernel entry, cause not yet identified
+
+Together 3.4 ms, which would cover the 3.2 ms. Neither is a knob and neither is close to free,
+and realizing both in full is optimistic -- but for the first time the decode side of the goal
+has a route whose terms are all measured rather than assumed.
