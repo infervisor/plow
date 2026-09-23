@@ -4013,3 +4013,36 @@ vLLM's 15.82 ms step needs -3.2 ms. So PAIR=4 alone does not flip out_tok_s, and
 remainder is unchanged: ~2.1 ms available in the walk (70% -> 90% of roofline), ~1.1 ms that must
 come from F (of which 2.601 ms is fixed entry/norm/sampling cost), plus the prefill terms
 (#66 FlashPrefill ~2.3 s, #67 norm/Glu tail ~2.0 s) and the ~1.1 s rung hole (#65).
+
+### PAIR=4 is blocked, and F's fixed term is the larger target anyway
+
+The mandate from the corrected probes is real -- the walk IS activation-bound -- but the code
+shape blocks the obvious fix. `gemv_rows_mma`'s PAIR block has two branches:
+
+  * WIDE-N (`per >= 2u * PLOW_NV_WARPS`, op_gemv_mma.cuh:358) needs no shared memory, so PAIR=4
+    is a trivial edit there. But for the 12B almost nothing reaches it. Row blocks per block,
+    N/8/132: lm_head 262144 -> 248 YES; gate/up 15360 -> 14.5 (just under the 16 threshold);
+    q 8192/4096 -> 7.8/3.9; down 3840 -> 3.6. It covers lm_head alone, ~2.0 GB of the 24.3 GB
+    weight pass, worth ~0.07 ms of a 9.516 ms walk.
+  * SPLIT-K PAIR, where gate/up/down/qkv/o actually go, needs `red2[2]` -> `red4[4]`.
+    `gvmma_red_t<MT>` is float[WARPS-1][32][MT*4] = 7168 B at MT=2/WARPS=8, so 14336 -> 28672 B.
+    On an object already at SHARED:40464 that lands near 54.8 KB, past the 48 KB static limit.
+
+Making it work means the split-K reduction must stop scaling with NW (two passes through the
+existing slots, or a register/shuffle reduction) -- a redesign, not a template parameter, for a
+payoff capped at 0.868 ms that is itself an upper bound and is traded against halving UNB 8 -> 4.
+
+Meanwhile F deserves the attention. At B=32 ctx 8192, F is 9.464 ms and splits as:
+
+    +5.29 ms   KV traversal (the ctx 128 -> 8192 growth). Geometry says ~705 MB/seq x 32 =
+               22.6 GB, which over 5.29 ms would be 4.27 TB/s -- ABOVE the 3.35 TB/s roofline.
+               So the geometry overestimates (the sliding window is not full at every layer),
+               and the honest reading is that this term is at or near roofline. Not a target.
+     2.601 ms  FIXED, already present at B=1 ctx 128: megakernel entry, norms, sampling.
+    ~1.57 ms   batch-dependent remainder (F goes 2.601 -> 4.174 from B=1 to B=32 at ctx 128).
+
+**The 2.601 ms fixed term is larger than the walk's entire ~2.1 ms of headroom**, and the step
+needs -3.2 ms to reach vLLM's 15.82 ms. Together they would more than cover it. The decode entry
+cost has prior history (the entry function taxes every rung; arena bytes cost ms on the 26B), so
+this is the next thing to size -- with a probe that strips layer work down to entry + sampling,
+built unconditionally and md5-gated.
