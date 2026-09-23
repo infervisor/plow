@@ -45,12 +45,34 @@ pub struct Map {
     pub original: u16,
     pub slots: u16,
 }
+/// One sub-chunk stage's tables. A staged launch runs the same program `stages.len()` times,
+/// each time bound to its own clipped span table and slot mask (see [`plan_stage`],
+/// [`stage_slots`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Stage {
+    pub slot: u16,
+    pub request: u16,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_request_rows: Option<u32>,
+    /// Rows a request may write per LAUNCH when the chunk is staged. This, not
+    /// `max_request_rows`, is what the sliding-ring invariant is sized against, which is the
+    /// whole point: a 4096-row chunk staged at 1024 needs a 2048-row ring instead of 8192, so 32
+    /// slots fit at ctx 16k without narrowing the launch to 1024 rows.
+    ///
+    /// Declaring it is only sound if every staged site is actually bound per stage, so it
+    /// REQUIRES `stages` and masked padding; validation refuses it otherwise. A packet that
+    /// claimed a short ring while still writing the whole chunk in one launch would wrap rows
+    /// onto the rows its own queries read — silent corruption, not a fault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_rows: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<Stage>,
     pub slot: u16,
     pub request: u16,
     pub maps: Vec<Map>,
@@ -115,6 +137,33 @@ impl Manifest {
         }
     }
 
+    /// Rows one LAUNCH may write per request — what the sliding ring must be sized against.
+    ///
+    /// Unstaged that is the request's whole chunk. Staging is the only thing that makes it
+    /// smaller, and it is gated hard because getting it wrong is SILENT: a packet that claimed a
+    /// short ring while still writing the whole chunk in one launch would wrap a request's rows
+    /// onto the rows its own queries read, producing wrong tokens rather than a fault.
+    fn write_rows(&self, request_rows: u32) -> Result<u32> {
+        let Some(stage_rows) = self.stage_rows else {
+            need(self.stages.is_empty(), "stages without stage_rows")?;
+            return Ok(request_rows);
+        };
+        need(
+            self.max_request_rows.is_some(),
+            "staging requires masked padding (max_request_rows): a stage masks the rows outside \
+             it to -1, and on an unmasked plan the padding rows carry a real slot",
+        )?;
+        need(
+            stage_rows > 0 && stage_rows <= request_rows,
+            "stage_rows must be non-zero and within the request limit",
+        )?;
+        need(
+            self.stages.len() == (request_rows as usize).div_ceil(stage_rows as usize),
+            "one stage binding per stage the request limit needs",
+        )?;
+        Ok(stage_rows)
+    }
+
     pub fn validate(&self, p: &Packet<'_>, live: &live_kv::Manifest) -> Result<()> {
         live.validate(p)?;
         need(
@@ -131,17 +180,18 @@ impl Manifest {
             .max()
             .unwrap();
         need(rows <= i32::MAX as u32, "row index width")?;
-        let write_rows = self.max_request_rows.unwrap_or(rows);
+        let request_rows = self.max_request_rows.unwrap_or(rows);
         if self.max_request_rows.is_some() {
             need(
-                write_rows > 0
-                    && write_rows <= rows
+                request_rows > 0
+                    && request_rows <= rows
                     && p.programs[..p.prefill_count]
                         .iter()
-                        .any(|g| g.rows == write_rows),
+                        .any(|g| g.rows == request_rows),
                 "request limit must match a prefill rung",
             )?;
         }
+        let write_rows = self.write_rows(request_rows)?;
         for cache in &live.caches {
             need(
                 cache.window == 0
@@ -169,6 +219,29 @@ impl Manifest {
                     && !t.initialized,
                 "declared table geometry",
             )?;
+        }
+        // Each stage carries its OWN clipped span table and slot mask, with the same geometry as
+        // the unstaged pair and a distinct handle, so a stage can never be bound to another
+        // stage's rows.
+        for (i, stage) in self.stages.iter().enumerate() {
+            for (h, name, bytes) in [
+                (stage.slot, format!("pf.request.slot.{i}"), u64::from(rows) * 4),
+                (
+                    stage.request,
+                    format!("pf.request.table.{i}"),
+                    (1 + 4 * u64::from(live.batch)) * 4,
+                ),
+            ] {
+                let t = p.tensors.get(h as usize).ok_or("packed stage table handle")?;
+                need(
+                    h != TENSOR_NONE16
+                        && handles.insert(h)
+                        && t.name == name
+                        && t.bytes == bytes
+                        && !t.initialized,
+                    "declared stage table geometry",
+                )?;
+            }
         }
         let mut originals = BTreeSet::new();
         for m in &self.maps {
@@ -537,6 +610,8 @@ mod tests {
                     let manifest = Manifest {
                         version,
                         max_request_rows: Some(1024),
+                        stage_rows: None,
+                        stages: Vec::new(),
                         slot: 0,
                         request: 1,
                         maps: vec![],
@@ -610,6 +685,8 @@ mod tests {
         ] {
             let m = Manifest {
                 max_request_rows: None,
+                stage_rows: None,
+                stages: Vec::new(),
                 version,
                 slot: 0,
                 request: 1,
@@ -656,6 +733,8 @@ mod tests {
         let manifest = Manifest {
             version: 2,
             max_request_rows: Some(1024),
+            stage_rows: None,
+            stages: Vec::new(),
             slot: 0,
             request: 1,
             maps: vec![],
@@ -932,6 +1011,79 @@ mod tests {
         for (row, &n) in writes.iter().enumerate() {
             let expected = u32::from(plan.slots[row] >= 0);
             assert_eq!(n, expected, "row {row} written {n} times, expected {expected}");
+        }
+    }
+
+    fn staged_manifest(stage_rows: Option<u32>, stages: usize) -> Manifest {
+        Manifest {
+            version: 1,
+            max_request_rows: Some(4096),
+            stage_rows,
+            stages: (0..stages)
+                .map(|i| Stage { slot: 10 + 2 * i as u16, request: 11 + 2 * i as u16 })
+                .collect(),
+            slot: 0,
+            request: 1,
+            maps: vec![],
+            programs: vec![],
+        }
+    }
+
+    /// The payoff: staging is what lets the ring be sized against the STAGE, not the chunk.
+    /// A 4096-row chunk staged at 1024 needs `window + 1024 - 1` instead of `window + 4096 - 1`,
+    /// which is the difference between 16 and 32 resident slots at ctx 16k on the 12B.
+    #[test]
+    fn staging_sizes_the_ring_against_the_stage_not_the_chunk() {
+        assert_eq!(staged_manifest(None, 0).write_rows(4096).unwrap(), 4096);
+        assert_eq!(staged_manifest(Some(1024), 4).write_rows(4096).unwrap(), 1024);
+        // and the ring each implies, at window 1024
+        let ring = |w: u32| (1024u32 + w - 1).next_power_of_two();
+        assert_eq!(ring(4096), 8192);
+        assert_eq!(ring(1024), 2048);
+    }
+
+    /// Every way of declaring staging that the runtime could not honour must be refused here,
+    /// because the consequence is silent KV corruption rather than a fault.
+    #[test]
+    fn staging_is_refused_unless_every_stage_is_actually_bound() {
+        // stages declared without stage_rows: nothing would ever select them
+        let mut m = staged_manifest(None, 4);
+        assert!(m.write_rows(4096).is_err());
+        // stage_rows without masked padding: padding rows carry a real slot, so masking lies
+        m = staged_manifest(Some(1024), 4);
+        m.max_request_rows = None;
+        assert!(m.write_rows(4096).is_err());
+        // too few / too many stage bindings for the width
+        assert!(staged_manifest(Some(1024), 3).write_rows(4096).is_err());
+        assert!(staged_manifest(Some(1024), 5).write_rows(4096).is_err());
+        // zero width, and a stage wider than the request limit
+        assert!(staged_manifest(Some(0), 4).write_rows(4096).is_err());
+        assert!(staged_manifest(Some(8192), 1).write_rows(4096).is_err());
+        // an exact single stage is legal and is just the unstaged width
+        assert_eq!(staged_manifest(Some(4096), 1).write_rows(4096).unwrap(), 4096);
+        // a width that does not divide the limit still needs a covering stage count
+        assert_eq!(staged_manifest(Some(1536), 3).write_rows(4096).unwrap(), 1536);
+        assert!(staged_manifest(Some(1536), 2).write_rows(4096).is_err());
+    }
+
+    /// The stage count the manifest demands must be the count `stages_needed` produces for the
+    /// widest request, or a plan would run stages the packet has no bindings for.
+    #[test]
+    fn manifest_stage_count_agrees_with_stages_needed() {
+        for (limit, stage_rows) in [(4096u32, 1024u32), (4096, 1536), (4096, 4096), (1024, 256)] {
+            let p = plan_with_limit(
+                &[Request { slot: 0, start: 0, len: limit as usize, prompt: 16384 }],
+                &[0],
+                limit as usize,
+                16384,
+                Some(limit),
+            )
+            .expect("plan");
+            let needed = stages_needed(&p, stage_rows as usize).unwrap();
+            let m = staged_manifest(Some(stage_rows), needed);
+            let mut m = m;
+            m.max_request_rows = Some(limit);
+            assert_eq!(m.write_rows(limit).unwrap(), stage_rows, "limit {limit} stage {stage_rows}");
         }
     }
 

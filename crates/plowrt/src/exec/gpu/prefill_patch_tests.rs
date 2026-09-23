@@ -57,6 +57,8 @@ fn packed_runtime_tables_are_excluded_from_both_weight_consumers() {
     let m = plow_asset::packed_prefill::Manifest {
         version: 1,
         max_request_rows: None,
+        stage_rows: None,
+        stages: Vec::new(),
         slot: 4,
         request: 5,
         maps: vec![plow_asset::packed_prefill::Map {
