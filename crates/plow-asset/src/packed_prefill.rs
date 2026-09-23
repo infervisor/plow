@@ -429,6 +429,103 @@ pub fn plan_with_limit(
     out.mapped_ends[padding_index].1 = padded as u32;
     Ok(out)
 }
+
+/// The span table for sub-chunk STAGE `stage` of a packed prefill processed in slices of
+/// `stage_rows` rows per request.
+///
+/// WHY. The sliding-window KV ring invariant (`dev_isa.h`, "SLIDING-WINDOW KV RING") is
+/// `ring >= window + rows_written_per_request_per_launch - 1`, because a launch writes ALL its
+/// K/V rows before any flash reads and a request's rows must not wrap onto the rows its own
+/// queries read. Writing a whole 4096-row chunk therefore needs an 8192-row ring — 2.5 GiB per
+/// slot on the 12B, so only 16 slots fit at ctx 16k. Writing the same chunk in 1024-row stages
+/// needs only 2048 ring rows (640 MiB) and 32 slots fit, WITHOUT dropping the launch width to
+/// 1024 (which is what makes the chunk-1024 32-slot packet lose long prompts: it turns a 15k
+/// prompt into 15 launches).
+///
+/// The flash body needs NO change. It already derives `rq0`, `qlen`, `slot` and `kvlen` per
+/// request from this table and computes `qp0 = kvlen - qlen` itself (`op_attention_sm90.cuh`),
+/// so clipping the table is enough: for stage `i` this yields `qp0 = r.start + i * stage_rows`,
+/// the stage's true absolute query position, which is what the causal mask and the
+/// sliding-window floor read.
+///
+/// A request shorter than the stage offset contributes a ZERO-length entry rather than being
+/// dropped, so entry `r` keeps addressing request `r` in every stage. The kernel already
+/// guards this: its per-request work count is 0 when `qlen <= 0`.
+pub fn plan_stage(plan: &Plan, stage: usize, stage_rows: usize) -> Result<Vec<i32>> {
+    let nreq = stage_table_reqs(&plan.table, stage_rows)?;
+    let skip = stage.checked_mul(stage_rows).ok_or("stage offset overflow")?;
+    let mut out = Vec::with_capacity(plan.table.len());
+    out.push(plan.table[0]);
+    for r in 0..nreq {
+        let rq0 = plan.table[1 + 4 * r];
+        let qlen = plan.table[2 + 4 * r];
+        let slot = plan.table[3 + 4 * r];
+        let kvlen = plan.table[4 + 4 * r];
+        need(qlen >= 0 && kvlen >= qlen, "span entry")?;
+        // `kvlen - qlen` is the request's frontier: the prior context this chunk continues from.
+        let start = kvlen - qlen;
+        let taken = (qlen as usize).min(skip) as i32;
+        let len = ((qlen - taken) as usize).min(stage_rows) as i32;
+        out.extend_from_slice(&[rq0 + taken, len, slot, start + taken + len]);
+    }
+    Ok(out)
+}
+
+/// The per-row slot map for sub-chunk STAGE `stage`: every row outside the stage is masked to
+/// `-1`, so only this stage's rows write K/V.
+///
+/// A stage's rows are NOT contiguous in the packed buffer — with two requests packed, stage 0 is
+/// rows `[rq0_a, rq0_a+S)` and `[rq0_b, rq0_b+S)` — so a row offset and count cannot express it.
+/// A mask can, and needs no kernel change: `d_headnorm_rope` already skips a masked row
+/// (`op_norm.cuh:781`, `if (out_stride && pfslot && pfslot[t] < 0) continue;`, and the same at
+/// `:985` for the fp8 arm). That is the masked-padding mechanism, reused per stage.
+///
+/// Requires a plan whose padding is ALREADY masked — `plan_with_limit` with `max_request_rows`,
+/// i.e. a `PLOW_MAX_REQUEST_CHUNK` packet. On an unmasked plan the padding rows carry a real
+/// slot and exist so every bucket row is owned; masking them here would silently change what the
+/// KV write covers, and the object must also advertise `plow_pf_masked_padding_abi`.
+pub fn stage_slots(plan: &Plan, stage: usize, stage_rows: usize) -> Result<Vec<i32>> {
+    let nreq = stage_table_reqs(&plan.table, stage_rows)?;
+    let skip = stage.checked_mul(stage_rows).ok_or("stage offset overflow")?;
+    let covered: usize = (0..nreq)
+        .map(|r| plan.table[2 + 4 * r].max(0) as usize)
+        .sum();
+    need(
+        plan.slots.len() >= covered && plan.slots[covered..].iter().all(|&s| s < 0),
+        "stage slots need a masked-padding plan (plan_with_limit with max_request_rows)",
+    )?;
+    let mut out = vec![-1i32; plan.slots.len()];
+    for r in 0..nreq {
+        let rq0 = plan.table[1 + 4 * r] as usize;
+        let qlen = plan.table[2 + 4 * r].max(0) as usize;
+        let taken = qlen.min(skip);
+        let len = (qlen - taken).min(stage_rows);
+        let from = rq0 + taken;
+        need(from + len <= plan.slots.len(), "stage row extent")?;
+        out[from..from + len].copy_from_slice(&plan.slots[from..from + len]);
+    }
+    Ok(out)
+}
+
+/// How many stages `plan` needs at `stage_rows`: the longest request decides, and a plan whose
+/// every request already fits one stage needs exactly one — the unstaged launch, unchanged.
+pub fn stages_needed(plan: &Plan, stage_rows: usize) -> Result<usize> {
+    let nreq = stage_table_reqs(&plan.table, stage_rows)?;
+    let longest = (0..nreq)
+        .map(|r| plan.table[2 + 4 * r].max(0) as usize)
+        .max()
+        .unwrap_or(0);
+    Ok(longest.div_ceil(stage_rows).max(1))
+}
+
+fn stage_table_reqs(table: &[i32], stage_rows: usize) -> Result<usize> {
+    need(stage_rows > 0, "stage_rows must be non-zero")?;
+    need(!table.is_empty() && table.len() % 4 == 1, "span table shape")?;
+    let nreq = table[0].max(0) as usize;
+    need(table.len() == 1 + 4 * nreq, "span table request count")?;
+    Ok(nreq)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,5 +828,134 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Two requests of different lengths sharing one 4096-row launch, staged at 1024.
+    fn staged_plan() -> Plan {
+        plan_with_limit(
+            &[
+                // a long request continuing a 5000-token prefix, and a short fresh one
+                Request { slot: 0, start: 5000, len: 4000, prompt: 9000 },
+                Request { slot: 1, start: 0, len: 96, prompt: 96 },
+            ],
+            &[5000, 0],
+            4096,
+            16384,
+            Some(4096),
+        )
+        .expect("plan")
+    }
+
+    #[test]
+    fn stage_tables_cover_every_row_exactly_once_and_in_order() {
+        let plan = staged_plan();
+        let s = 1024;
+        assert_eq!(stages_needed(&plan, s).unwrap(), 4); // 4000 rows -> 4 stages
+        for r in 0..2usize {
+            let rq0 = plan.table[1 + 4 * r];
+            let qlen = plan.table[2 + 4 * r];
+            let mut next = rq0;
+            let mut total = 0;
+            for stage in 0..stages_needed(&plan, s).unwrap() {
+                let t = plan_stage(&plan, stage, s).unwrap();
+                assert_eq!(t[0], plan.table[0], "request count is preserved");
+                assert_eq!(t[3 + 4 * r], plan.table[3 + 4 * r], "slot is preserved");
+                let (srq0, slen) = (t[1 + 4 * r], t[2 + 4 * r]);
+                assert!(slen >= 0 && slen <= s as i32);
+                assert_eq!(srq0, next, "stages are contiguous in the packed Q buffer");
+                next += slen;
+                total += slen;
+            }
+            assert_eq!(total, qlen, "every row of the request is covered exactly once");
+        }
+    }
+
+    /// The whole point of the clipped table: the flash body computes `qp0 = kvlen - qlen`, and
+    /// that must land on the stage's true absolute query position or the causal mask and the
+    /// sliding-window floor are wrong.
+    #[test]
+    fn derived_qp0_is_the_stage_absolute_query_position() {
+        let plan = staged_plan();
+        let s = 1024;
+        for r in 0..2usize {
+            let qlen = plan.table[2 + 4 * r];
+            let start = plan.table[4 + 4 * r] - qlen;
+            for stage in 0..stages_needed(&plan, s).unwrap() {
+                let t = plan_stage(&plan, stage, s).unwrap();
+                let (slen, skvlen) = (t[2 + 4 * r], t[4 + 4 * r]);
+                let taken = qlen.min((stage * s) as i32);
+                assert_eq!(skvlen - slen, start + taken, "stage {stage} request {r} qp0");
+                // KV visible to this stage is exactly what has been written by the end of it.
+                assert_eq!(skvlen, start + taken + slen);
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_shorter_than_the_stage_offset_contributes_a_zero_length_entry() {
+        let plan = staged_plan();
+        // request 1 is 96 rows, so it is exhausted after stage 0.
+        for stage in 1..4 {
+            let t = plan_stage(&plan, stage, 1024).unwrap();
+            assert_eq!(t[2 + 4 * 1], 0, "stage {stage} leaves the short request empty");
+            // entry index still addresses request 1, and its slot is still intact
+            assert_eq!(t[3 + 4 * 1], plan.table[3 + 4 * 1]);
+        }
+    }
+
+    #[test]
+    fn one_stage_wide_enough_reproduces_the_unstaged_table() {
+        let plan = staged_plan();
+        assert_eq!(stages_needed(&plan, 4096).unwrap(), 1);
+        assert_eq!(plan_stage(&plan, 0, 4096).unwrap(), plan.table);
+    }
+
+    /// The ring invariant is about K/V WRITES, so the union of the stages' unmasked rows must be
+    /// exactly the rows the unstaged launch would have written — no row written twice (it would
+    /// wrap onto itself), none dropped (the KV would have a hole).
+    #[test]
+    fn stage_slot_masks_partition_the_written_rows() {
+        let plan = staged_plan();
+        let s = 1024;
+        let stages = stages_needed(&plan, s).unwrap();
+        let mut writes = vec![0u32; plan.slots.len()];
+        for stage in 0..stages {
+            let m = stage_slots(&plan, stage, s).unwrap();
+            assert_eq!(m.len(), plan.slots.len());
+            for (row, &slot) in m.iter().enumerate() {
+                if slot >= 0 {
+                    assert_eq!(slot, plan.slots[row], "an unmasked row keeps its own slot");
+                    writes[row] += 1;
+                }
+            }
+        }
+        for (row, &n) in writes.iter().enumerate() {
+            let expected = u32::from(plan.slots[row] >= 0);
+            assert_eq!(n, expected, "row {row} written {n} times, expected {expected}");
+        }
+    }
+
+    #[test]
+    fn stage_slots_refuse_an_unmasked_padding_plan() {
+        // No max_request_rows => padding rows carry a real slot, and masking them would change
+        // what the KV write covers.
+        let unmasked = plan(
+            &[Request { slot: 0, start: 0, len: 100, prompt: 4096 }],
+            &[0],
+            4096,
+            16384,
+        )
+        .expect("plan");
+        assert!(unmasked.slots.iter().all(|&s| s >= 0));
+        assert!(stage_slots(&unmasked, 0, 1024).is_err());
+    }
+
+    #[test]
+    fn stage_rejects_a_malformed_table_and_a_zero_width() {
+        let plan = staged_plan();
+        assert!(plan_stage(&plan, 0, 0).is_err());
+        let bad = Plan { table: vec![2, 0, 1, 0, 1], ..staged_plan() };
+        assert!(plan_stage(&bad, 0, 1024).is_err(), "count/length disagree");
+        assert!(stages_needed(&bad, 1024).is_err());
     }
 }
