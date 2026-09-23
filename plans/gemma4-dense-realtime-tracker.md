@@ -3871,3 +3871,49 @@ Today only 42.2% of decode token-steps ride a prefill launch; 57.8% pay a privat
 rc2048 is the TTFT lever: 4424 -> 3874 uncapped, and its MEDIAN TTFT of 996.84 ms beats vLLM's
 1662.94 outright. Mean TTFT 3778.68 is within 3% of vLLM's 3657.96. No arm yet clears more than
 2 of 4, and tok/s remains the hard blocker on every one.
+
+### The throughput blocker is the decode weight pass at 67% of HBM
+
+The interleave cap was swept on rc2048 to see whether rc2048's TTFT headroom could buy the
+TPOT/p99 wins without the throughput collapse. It cannot:
+
+    arm              out_tok_s   TTFT      TPOT    p99 ITL   wins
+    rc2048 uncapped    273.7    3874.06   84.52    205.52    p99
+    rc2048 ilv=1024    245.6    7908.83   55.06     64.29    TPOT + p99
+    rc2048 ilv=512     150.6   16597.25   49.18     58.12    TPOT + p99
+    rc2048 ilv=256     120.5   22951.28   31.90     35.69    TPOT + p99
+    vLLM               332.2    3657.96   67.490   353.90
+
+Tightening the cap monotonically trades TTFT and throughput for TPOT and p99. This reconfirms
+task #50 on a second packet: PLOW_PF_INTERLEAVE is a dial, not a throughput lever, and NO setting
+clears more than 2 of 4.
+
+That leaves total work, and plow's best arm does ~31.3 s of GPU work against vLLM's 24.66 s wall.
+Prefill is already at its kernel ceiling (previous section), so the deficit is the decode step.
+
+**The decode weight pass runs at 67% of HBM peak.** This needs no KV estimate:
+
+    B=1, ctx 128, rc1024permt : 10.766 ms
+    12B weights               : 40 sliding x 224.1M + 8 full x 271.3M + 1.007B embedding
+                              = 12.14B params x 2 B = 24.3 GB
+    => 24.3 GB / 10.766 ms    = 2.26 TB/s = 67.4% of the H100's 3.35 TB/s
+
+At B=32 ctx 8192 the step is 19.65 ms. vLLM's median ITL at the same cell is 15.82 ms -- a 24%
+faster step. Using a derived KV figure (32 seqs x ~705 MB with attention_k_eq_v=true) the two
+land at plow 71% and vLLM ~88% of the roofline, but the ROBUST claim is the ratio 19.65 vs 15.82,
+which needs no KV model at all.
+
+This is the throughput gap, and it is the one thing that would flip out_tok_s. If the decode step
+matched 15.82 ms, decode would fall from 7.98 s to ~6.4 s and the wall to ~29.8 s (tok/s ~293);
+adding the priced prefill terms (~2.0 s norm/Glu fusion, ~2.3 s FlashPrefill) reaches ~25.5 s and
+tok/s ~343, which would finally clear vLLM's 332.2.
+
+The hard part: the usual route to a faster weight pass is occupancy, and that is CLOSED here by
+arithmetic already done in this campaign -- decode live state is ~463 registers, so the 128-reg
+cap needed for more resident waves costs 1.3-1.9x in spill. Prefetch depth has already been tuned
+(per-MT depth, -3.6% at B=32). So reaching ~90% needs a different idea than occupancy or prefetch,
+or it needs to read fewer bytes (FP8 weights), which a bf16-vs-bf16 ladder forbids.
+
+Also note the closed-batch tail, which is NOT the gap but is worth knowing: 142 decode ticks at
+<=2 rows burn 1.60 s producing 273 of 8393 token-steps (5.9 ms/token vs 0.614 at rows=32). vLLM
+pays the same tail in a 64-request closed batch.
