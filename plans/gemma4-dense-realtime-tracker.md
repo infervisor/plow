@@ -1841,3 +1841,109 @@ standing between here and it, in order of size:
    can hold 32 slots at 16k without paying chunk 1024 on long prompts.
 3. Prefill interference at C4+ with long prompts: p99 ITL 104-214 ms against vLLM's 8-13 at
    1024-8192 in, where the wave is already gone. That is the prefill chunk blocking decode.
+
+## Correction: the decode step is at parity; the gap is not KV traversal (2026-09-23)
+
+The "per-KV slope" above was derived from `tpot_ms`, which is the MEAN inter-token time and so
+includes every decode step a prefill launch blocked. Splitting on `itl_med` -- the median step,
+which prefill rarely lands on -- inverts the conclusion:
+
+```
+median ITL, plow / vLLM        128    1024   4096   8192  15000
+12B  C1                       1.00    0.99   0.99   0.99   0.99
+12B  C4                       1.00    0.99   1.00   1.01   1.02
+12B  C16                      1.03    1.04   1.05   1.07   1.09
+26B  C16                      1.22    1.20   1.22   1.26   1.25
+```
+
+The 12B decode step is within 9 % of vLLM everywhere and within 2 % at C1/C4. The 26B is ~22 %
+behind at C16 and ~8 % at C1/C4. What `tpot_ms` was measuring is prefill blocking decode:
+
+```
+share of TPOT that is interference    plow    vLLM
+12B  4096/C4                           20 %     9 %
+12B  8192/C4                           35 %    18 %
+12B 15000/C4                           53 %    38 %
+26B  8192/C4                           33 %    11 %
+26B 15000/C4                           50 %    28 %
+```
+
+**Do not use `tpot_ms` to reason about kernel speed on a continuously-batched server.** Use
+`itl_med` for the step and `tpot_ms - itl_med` for the interference.
+
+### Null result: capping the per-tick prefill budget does not fix it
+
+`PLOW_PF_INTERLEAVE` is plow's `max_num_batched_tokens` (config.rs: unset -> 2048 on CUDA, `0` ->
+`usize::MAX`, i.e. uncapped). Every campaign profile sets `0`, so once a slot is decoding a tick
+may still admit unbounded prefill rows before running decode. A cold tick bypasses the cap, so
+capping should be free for first-request TTFT.
+
+Measured 0 -> 2048, both models, both profiles, 40 cells: **E2E better on 12, and every one of
+those is inside the cell noise.** TPOT barely moves and TTFT gets worse at long inputs (26B
+15000/C16 2417 -> 2702 ms, E2E 1.570 -> 1.730). The knob is not the lever; do not re-try it.
+
+The reason it cannot be: at C16/C32 with long prompts the machine is saturated with prefill work,
+and vLLM shows 80 % interference in the same cells. Interleaving differently moves latency between
+TTFT and TPOT rather than creating throughput.
+
+### What the wall-clock arithmetic says instead
+
+12B 4096/C16, 64 prompts, 8192 output tokens:
+
+```
+                       plow        vLLM
+wall (from tok/s)      18.2 s      16.2 s
+decode  512 steps x    13.38 ms    12.78 ms   =  6.85 s  /  6.54 s
+prefill 262k tokens                           = 10.8  s  / 10.9  s   (at each stack's C1 rate)
+serial sum             17.7 s      17.4 s
+```
+
+plow's measured wall matches its serial sum; vLLM finishes 1.2 s BELOW its own serial sum. So vLLM
+overlaps decode with prefill and plow largely does not -- even though `token_batch` is loaded and
+its route fires on all four runs. That is the thing to measure next, with `PLOW_PF_PACKLOG=1`
+(`PACKLOG WALL prefill_ns/decode_ns/ticks`), not to guess at.
+
+## Runtime scheduling knob audit (2026-09-23, user ask)
+
+Cross-referenced all 210 `rt.*` registry knobs against what every shipping Gemma-4 recipe sets
+(`[serve.env]` plus each profile's `serve_env`). **A knob every recipe overrides is a wrong
+default** -- the default is whatever nobody wants. Script: `knob_audit.py`.
+
+### Already right
+
+`rt.token_batch` ON/PROMOTED (mixed prefill+decode batching; serve log `token_batch: true`),
+`rt.prefix_cache` ON/PROMOTED (recipes set `0` ONLY to match vLLM's `--no-enable-prefix-caching`
+in the ladder -- production is cache-on), `rt.idle_dispatch`, `rt.block_packets`, `rt.pf_modular`.
+
+### Always overridden -> wrong default
+
+| knob | default | every recipe | evidence |
+|---|---|---|---|
+| `rt.pf_interleave_adaptive` | OFF | 1 | 12B 1024/C4 TTFT 167.0 -> 107.7 ms; 26B 114.5 -> 94.4 |
+| `rt.rung_fast_probe` | OFF | 1 | 128/C16 P99 TTFT 170 -> 150 ms |
+| `rt.multistep_adaptive` | OFF | 1 | 26B C1 TPOT 5.66 -> 5.59; 15000/C4 TTFT 700 vs 993 ms |
+| `rt.queue_ttl_ms` | UNSET | 0 | |
+
+### The two the cross-reference cannot see (no recipe touches them)
+
+* **`rt.pf_cover` = ON, PROMOTED.** It selects the OLD covering chunk pick, so the cost-aware DP
+  cover in `pick_prefill_bucket` never runs. `docs/flags-reference.md:959` documents the default as
+  **off**; the registry says ON; the serve log settles it (`pf_cover: true` on every run in this
+  campaign). This is the prefill padding bug: a 2331-row tail takes the whole 4096 rung.
+* **`rt.multistep` = 8.** Pins p99 ITL at 8 x TPOT out of the box (median ITL `0.000`); both
+  campaign profiles override to 0. Measured 4 -> 0 this session: p99 ITL 41.8 -> 10.5 ms at zero
+  TTFT/TPOT cost. A global flip to 0 is NOT right -- on AMD/CPU the host gap multistep amortises is
+  real. It should be engine-conditional like `rt.mux_inline_tick` ("unset = on for a CUDA engine;
+  AMD and CPU keep the engine thread"), since the inline tick already cut the CUDA dispatcher
+  handoff from 50-87 us to 0.3 us, which is the reason multistep existed there.
+
+### Deliberately not flipped
+
+`rt.decode_pipeline` -- only this session's 12B realtime profile sets it, and it is unavailable
+whenever cuBLASLt is on, so the evidence does not support a global default.
+`rt.pf_interleave` -- every recipe sets 0 (uncapped) against a 2048 default, but the measured A/B
+of 0 vs 2048 is a wash on 40 cells, so neither value is clearly right.
+
+Each flip needs a checkpoint-P certificate or the merge gate fails, and a knob the verifier rejects
+goes back to opt-in. Certificates are measured with the arm value pinned explicitly, so they stay
+valid whichever way the registry points; the registry is only flipped for knobs that pass.
