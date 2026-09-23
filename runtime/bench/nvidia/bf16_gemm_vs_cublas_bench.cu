@@ -39,6 +39,16 @@
 #ifndef PGM90_TMA_STAGES
 #define PGM90_TMA_STAGES 3
 #endif
+/* -DPLOW_BENCH_W8A8 swaps the SAME ws384 body to its E4M3 instantiation — the shipped
+ * interp_sm90a_pfgemm.cubin's w8a8 arm (build_sm90a_gemma4_segments.sh adds exactly
+ * PLOW_NV_W8A8=1 and PGM90_FP8_PROMOTE on top of the bf16 flags) — and points the cuBLASLt
+ * reference at e4m3 with OUTER_VEC per-channel/per-token scales. */
+#ifdef PLOW_BENCH_W8A8
+#define PLOW_NV_W8A8 1
+#ifndef PGM90_FP8_PROMOTE
+#define PGM90_FP8_PROMOTE 1
+#endif
+#endif
 #endif
 typedef __nv_bfloat16 bf16;
 #include "op_gemm.cuh"
@@ -77,6 +87,14 @@ static const Shape SHAPES[] = {
     {"down",3840,15360,0}, {"local_q",4096,3840,0},
     {"local_o",3840,4096,0}, {"global_q",8192,3840,0},
     {"global_k_or_v",512,3840,0}, {"global_o",3840,8192,0},
+#ifdef PLOW_BENCH_GEMMA4_26B
+    /* segment_roles::CUBLASLT_PREFILL_GEMMA4_26B_SHAPES — Gemma-4-26B-A4B dense projections
+     * (hidden 2816, dense inter 2112). The routed-expert GEMMs are MoE ops, not here. */
+    {"m26_gate_up",2112,2816,0}, {"m26_down",2816,2112,0},
+    {"m26_local_q",4096,2816,0}, {"m26_local_kv",2048,2816,0},
+    {"m26_local_o",2816,4096,0}, {"m26_global_q",8192,2816,0},
+    {"m26_global_k",1024,2816,0}, {"m26_global_o",2816,8192,0},
+#endif
 #elif defined(PLOW_BENCH_GEMM_ODOWN)
     {"g12_o_local",3840,4096,0}, {"g12_o_full",3840,8192,0}, {"g12_down",3840,15360,0},
     {"g31_o_local",5376,8192,0}, {"g31_o_full",5376,16384,0}, {"g31_down",5376,21504,0},
@@ -147,6 +165,44 @@ __global__ __maxnreg__(160) void k_ws384(bf16* C, const void* ma, const void* mb
             m, n, k, 0, blockIdx.x, gridDim.x, arena);
     }
 }
+#ifdef PLOW_BENCH_W8A8
+/* The SAME body, E4M3=true: what interp_sm90a_pfgemm.cubin runs for DevOp::GemmFp8
+ * (interp_sm120.cu PLOW_DOP_GEMM_FP8 -> d_gemm_sm90_tma_ws384_role<PROD,true>). */
+__global__ __maxnreg__(160) void k_ws384_fp8(bf16* C, const void* ma, const void* mb,
+                                             const float* ascale, const float* wscale,
+                                             unsigned m, unsigned n, unsigned k) {
+    extern __shared__ bf16 arena[];
+    if (threadIdx.x < 128) {
+        sm90_reg_dec(32);
+        d_gemm_sm90_tma_ws384_role<true, true>(C, ma, mb, ascale, wscale,
+            m, n, k, 0, blockIdx.x, gridDim.x, arena);
+    } else {
+        sm90_reg_inc(224);
+        d_gemm_sm90_tma_ws384_role<false, true>(C, ma, mb, ascale, wscale,
+            m, n, k, 0, blockIdx.x, gridDim.x, arena);
+    }
+}
+/* CudaBackend::encode_tmap_e4m3's recipe, byte for byte: UINT8, rank 2, inner box 128. */
+static CUtensorMap e4m3_map(void* base, unsigned rows, unsigned k) {
+    CUtensorMap map{};
+    uint64_t dims[] = {k, rows}, strides[] = {(uint64_t)k};
+    uint32_t box[] = {128, 128}, elements[] = {1, 1};
+    CUresult rc = cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
+        base, dims, strides, box, elements, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (rc != CUDA_SUCCESS) { printf("e4m3 tensor map failed: %d\n", (int)rc); exit(2); }
+    return map;
+}
+__global__ void init_e4m3(uint8_t* d, size_t n, unsigned seed) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        unsigned v = (unsigned)i ^ seed;
+        v ^= v >> 16; v *= 0x7feb352du; v ^= v >> 15; v *= 0x846ca68bu; v ^= v >> 16;
+        /* sign | exp 0b0110/0b0111 | mantissa: +-[0.5, 1.9375], never 0/inf/nan. */
+        d[i] = (uint8_t)(((v & 1u) << 7) | (((v >> 1) & 1u) ? 0x38u : 0x30u) | ((v >> 4) & 7u));
+    }
+}
+#endif
 static CUtensorMap bf16_map(void* base, unsigned rows, unsigned k) {
     CUtensorMap map{};
     uint64_t dims[] = {k, rows}, strides[] = {2ull * k};
@@ -541,6 +597,245 @@ static void bench_cublas(unsigned M) {
     cublasLtDestroy(lt);
 }
 
+#ifdef PLOW_BENCH_W8A8
+/* ---- W8A8 route comparison ------------------------------------------------------------
+ * Same shapes, same rotation/alternation/median protocol as bench_cublas, but both arms are
+ * plow's W8A8 contract (DevOp::GemmFp8): C[M,N] bf16 = (A[M,K] e4m3 . B[N,K] e4m3^T) scaled
+ * by a_scale[m] (per token) and w_scale[n] (per output channel).
+ *   [plow]      the shipped ws384 body, E4M3 instantiation
+ *   [lt_vec]    cuBLASLt e4m3 with CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F on A and B —
+ *               the ONLY mode that expresses plow's scales without re-quantizing
+ *   [lt_scalar] cuBLASLt e4m3 with per-tensor scales — NOT a plow twin, timed only to show
+ *               what the vector scale mode costs
+ * Kept as its own function rather than threaded through bench_cublas with #ifdefs, so the
+ * bf16 arm stays byte-identical to the one earlier campaigns published from. */
+static uint8_t* dev_e4m3(size_t n) {
+    static unsigned seed = 7u;
+    uint8_t* d; CK(cudaMalloc(&d, n));
+    init_e4m3<<<256, 256>>>(d, n, seed++);
+    CK(cudaGetLastError());
+    return d;
+}
+/* Distinct, non-constant patterns on purpose: with a constant scale vector an A/B scale SWAP
+ * between plow's (a_scale[m], w_scale[n]) and cuBLASLt's (A=weight, B=activation) is invisible
+ * to the correctness gate. These two ramps are different functions of the index, so a swap
+ * fails the gate instead of passing it. */
+static float* dev_f32(size_t n, float base, float step) {
+    std::vector<float> h(n);
+    for (size_t i = 0; i < n; i++) h[i] = base * (1.f + step * (float)(i % 13));
+    float* d; CK(cudaMalloc(&d, n * sizeof(float)));
+    CK(cudaMemcpy(d, h.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    return d;
+}
+
+static void bench_w8a8(unsigned M) {
+    cublasLtHandle_t lt; LTK(cublasLtCreate(&lt));
+    size_t wsz = 256 * 1024 * 1024; void* ws; CK(cudaMalloc(&ws, wsz));
+    int dev; CK(cudaGetDevice(&dev));
+    cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, dev));
+    const unsigned smem = PGM90_WS384_ARENA * sizeof(bf16);
+    CK(cudaFuncSetAttribute(k_ws384_fp8, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    static int announced = 0;
+    if (!announced++)
+        printf("# cuBLASLt runtime version %zu (plowrt resolves libcublasLt.so.13 first)\n",
+               cublasLtGetVersion());
+    for (int si = 0; si < NSHAPE; si++) {
+        const Shape& s = SHAPES[si];
+        const char* filter = getenv("PLOW_BENCH_SHAPE");
+        if (filter && strcmp(filter, s.name)) continue;
+        const size_t wn = (size_t)s.N * s.K;
+        int nrep = (int)std::max<size_t>(2, ((size_t)COLD_MB << 20) / std::max<size_t>(wn, 1));
+        nrep = std::min(nrep, 16);
+        std::vector<uint8_t*> Bv(nrep);
+        for (int r = 0; r < nrep; r++) Bv[r] = dev_e4m3(wn);
+        uint8_t* A = dev_e4m3((size_t)M * s.K);
+        /* plow's QuantFp8 writes a_scale[m] = rowmax|x[m,:]|/448; 1/448 is that scale for a
+         * unit-magnitude row, and w_scale is the same order. Values do not affect timing. */
+        float* asc = dev_f32(M, 1.f / 448.f, 0.07f);
+        float* wsc = dev_f32(s.N, 1.f / 448.f, 0.23f);
+        float* sca1 = dev_f32(1, 1.f / 448.f, 0.f);
+        bf16 *D, *cp_alloc;
+        CK(cudaMalloc(&D, (size_t)M * s.N * sizeof(bf16)));
+        CK(cudaMalloc(&cp_alloc, ((size_t)M * s.N + 16) * sizeof(bf16)));
+        CK(cudaMemset(cp_alloc, 0xa5, ((size_t)M * s.N + 16) * sizeof(bf16)));
+        bf16* cp = cp_alloc + 8;
+
+        cublasLtMatrixLayout_t la = nullptr, lb = nullptr, ld = nullptr;
+        LTK(cublasLtMatrixLayoutCreate(&la, CUDA_R_8F_E4M3, s.K, s.N, s.K)); /* Lt A = weight, M_Lt = N */
+        LTK(cublasLtMatrixLayoutCreate(&lb, CUDA_R_8F_E4M3, s.K, M,   s.K)); /* Lt B = acts,   N_Lt = M */
+        LTK(cublasLtMatrixLayoutCreate(&ld, CUDA_R_16BF,    s.N, M,   s.N));
+        cublasLtMatmulPreference_t pref = nullptr;
+        LTK(cublasLtMatmulPreferenceCreate(&pref));
+        LTK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsz, sizeof(wsz)));
+        cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
+
+        /* Build one descriptor per scale mode; keep both so the cost of OUTER_VEC is visible. */
+        struct Arm { const char* tag; cublasLtMatmulDesc_t op; cublasLtMatmulHeuristicResult_t heur;
+                     int have; int cand; };
+        Arm arms[2] = {{"lt_vec", nullptr, {}, 0, 0}, {"lt_scalar", nullptr, {}, 0, 0}};
+        for (int a = 0; a < 2; a++) {
+            cublasLtMatmulDesc_t op = nullptr;
+            LTK(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+            LTK(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof(tA)));
+            LTK(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof(tB)));
+            const void* ap = (a == 0) ? (const void*)wsc : (const void*)sca1;
+            const void* bp = (a == 0) ? (const void*)asc : (const void*)sca1;
+            LTK(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &ap, sizeof(ap)));
+            LTK(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &bp, sizeof(bp)));
+            if (a == 0) {
+                int32_t mode = CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
+                cublasStatus_t ra = cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof(mode));
+                cublasStatus_t rb = cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode, sizeof(mode));
+                if (ra != CUBLAS_STATUS_SUCCESS || rb != CUBLAS_STATUS_SUCCESS) {
+                    printf("%-13s %6u N=%-6u K=%-6u OUTER_VEC set-attr REFUSED a=%d b=%d\n",
+                           s.name, M, s.N, s.K, (int)ra, (int)rb);
+                    cublasLtMatmulDescDestroy(op);
+                    continue;
+                }
+            }
+            arms[a].op = op;
+            int nres = 0;
+            cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(lt, op, la, lb, ld, ld, pref, 1,
+                                                               &arms[a].heur, &nres);
+            arms[a].have = (hs == CUBLAS_STATUS_SUCCESS && nres > 0 &&
+                            arms[a].heur.state == CUBLAS_STATUS_SUCCESS);
+            arms[a].cand = nres;
+            if (!arms[a].have)
+                printf("%-13s %6u N=%-6u K=%-6u %-9s NOALGO status=%d n=%d\n",
+                       s.name, M, s.N, s.K, arms[a].tag, (int)hs, nres);
+        }
+
+        const float alpha = 1.f, beta = 0.f;
+        auto run_lt = [&](int a, int it) {
+            return cublasLtMatmul(lt, arms[a].op, &alpha, Bv[it % nrep], la, A, lb,
+                                  &beta, D, ld, D, ld, &arms[a].heur.algo, ws, wsz, 0);
+        };
+        std::vector<CUtensorMap> maps{e4m3_map(A, M, s.K)};
+        for (auto b : Bv) maps.push_back(e4m3_map(b, s.N, s.K));
+        CUtensorMap* dm; CK(cudaMalloc(&dm, maps.size() * sizeof(CUtensorMap)));
+        CK(cudaMemcpy(dm, maps.data(), maps.size() * sizeof(CUtensorMap), cudaMemcpyHostToDevice));
+        auto run_plow = [&](int it) {
+            k_ws384_fp8<<<prop.multiProcessorCount, 384, smem>>>(cp, dm, dm + 1 + it % nrep,
+                                                                 asc, wsc, M, s.N, s.K);
+        };
+        cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+
+        /* Pick each Lt arm's algorithm by TIMING up to 32 heuristic candidates, exactly as
+         * bench_cublas does for bf16 — otherwise the bf16 Lt column is autotuned and the fp8 one
+         * is not, and the four-way comparison silently favours bf16. */
+        for (int a = 0; a < 2; a++) {
+            if (!arms[a].have) continue;
+            cublasLtMatmulHeuristicResult_t cands[32]; int nres = 0;
+            if (cublasLtMatmulAlgoGetHeuristic(lt, arms[a].op, la, lb, ld, ld, pref, 32,
+                                               cands, &nres) != CUBLAS_STATUS_SUCCESS || nres == 0)
+                continue;
+            float best = INFINITY; int sel = -1;
+            for (int c = 0; c < nres; c++) {
+                if (cands[c].state != CUBLAS_STATUS_SUCCESS) continue;
+                arms[a].heur = cands[c];
+                bool ok = true;
+                for (int i = 0; i < WARM && ok; i++) ok = run_lt(a, i) == CUBLAS_STATUS_SUCCESS;
+                if (!ok) continue;
+                CK(cudaEventRecord(e0));
+                for (int i = 0; i < ITERS; i++) run_lt(a, i);
+                CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaGetLastError());
+                float el; CK(cudaEventElapsedTime(&el, e0, e1));
+                if (el < best) { best = el; sel = c; }
+            }
+            if (sel < 0) { arms[a].have = 0; continue; }
+            arms[a].heur = cands[sel];
+            arms[a].cand = nres;
+            printf("%-13s %6u %-9s selected=%d candidates=%d workspace=%zu\n",
+                   s.name, M, arms[a].tag, sel, nres, arms[a].heur.workspaceSize);
+        }
+
+        /* Correctness gate: identical e4m3 bytes and identical scale vectors through both
+         * arms, so only the accumulation order differs. */
+        if (arms[0].have) {
+            if (run_lt(0, 0) != CUBLAS_STATUS_SUCCESS) { printf("%s lt_vec MATMUL FAILED\n", s.name); exit(3); }
+            run_plow(0);
+            CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+            std::vector<bf16> ref((size_t)M * s.N), got(ref.size());
+            CK(cudaMemcpy(ref.data(), D, ref.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(got.data(), cp, got.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
+            uint16_t guards[16];
+            CK(cudaMemcpy(guards, cp_alloc, 8 * sizeof(bf16), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(guards + 8, cp + (size_t)M * s.N, 8 * sizeof(bf16), cudaMemcpyDeviceToHost));
+            for (auto g : guards) if (g != 0xa5a5) { printf("output guard overwritten\n"); exit(3); }
+            double err2 = 0, ref2 = 0, maxerr = 0, maxref = 0;
+            for (size_t i = 0; i < ref.size(); i++) {
+                double r = __bfloat162float(ref[i]), v = __bfloat162float(got[i]);
+                if (!std::isfinite(r) || !std::isfinite(v)) { printf("nonfinite output\n"); exit(3); }
+                double e = v - r;
+                err2 += e * e; ref2 += r * r;
+                maxerr = std::max(maxerr, std::abs(e)); maxref = std::max(maxref, std::abs(r));
+            }
+            const double rel = std::sqrt(err2 / std::max(ref2, 1e-30));
+            printf("correctness %s M=%u relL2=%.6g max_abs=%.6g max_ref=%.6g\n",
+                   s.name, M, rel, maxerr, maxref);
+            /* Both arms consume identical e4m3 bytes and identical scale vectors, so only the
+             * f32 accumulation order differs. Anything larger means the OUTER_VEC scale mapping
+             * is wrong (an A/B swap, or a vector of the wrong length), not a rounding story. */
+            if (rel > 0.01) { printf("W8A8 route mismatch: scale mapping is wrong\n"); exit(3); }
+        }
+
+        constexpr int rounds = 6, iters = 3;
+        auto time_body = [&](auto&& body) {
+            cold_flush();
+            CK(cudaEventRecord(e0));
+            for (int i = 0; i < iters; i++) body(i);
+            CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaGetLastError());
+            float elapsed = 0; CK(cudaEventElapsedTime(&elapsed, e0, e1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            return elapsed / iters;
+        };
+        float plow_r[rounds], vec_r[rounds], sca_r[rounds];
+        for (int i = 0; i < WARM; i++) {
+            run_plow(i);
+            if (arms[0].have) run_lt(0, i);
+            if (arms[1].have) run_lt(1, i);
+        }
+        CK(cudaDeviceSynchronize());
+        for (int r = 0; r < rounds; r++) {
+            if ((r & 1) == 0) {
+                vec_r[r] = arms[0].have ? time_body([&](int i) { run_lt(0, i); }) : 0.f;
+                plow_r[r] = time_body(run_plow);
+                sca_r[r] = arms[1].have ? time_body([&](int i) { run_lt(1, i); }) : 0.f;
+            } else {
+                sca_r[r] = arms[1].have ? time_body([&](int i) { run_lt(1, i); }) : 0.f;
+                plow_r[r] = time_body(run_plow);
+                vec_r[r] = arms[0].have ? time_body([&](int i) { run_lt(0, i); }) : 0.f;
+            }
+        }
+        auto med = [&](float* v) {
+            std::sort(v, v + rounds);
+            return 0.5f * (v[rounds / 2 - 1] + v[rounds / 2]);
+        };
+        const double fl = 2.0 * M * s.N * s.K;
+        const float pms = med(plow_r), vms = med(vec_r), sms = med(sca_r);
+        printf("%-13s %6u %6u %6u %9.5f %8.1f w8a8_plow  nrep=%d cold_MiB=%.1f\n",
+               s.name, M, s.N, s.K, pms, fl / (pms * 1e-3) / 1e12, nrep,
+               (double)nrep * wn / (1024 * 1024));
+        if (arms[0].have)
+            printf("%-13s %6u %6u %6u %9.5f %8.1f w8a8_lt_vec  plow/lt=%.4f\n",
+                   s.name, M, s.N, s.K, vms, fl / (vms * 1e-3) / 1e12, pms / vms);
+        if (arms[1].have)
+            printf("%-13s %6u %6u %6u %9.5f %8.1f w8a8_lt_scalar  vec/scalar=%.4f\n",
+                   s.name, M, s.N, s.K, sms, fl / (sms * 1e-3) / 1e12,
+                   arms[0].have ? vms / sms : 0.f);
+
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        for (int a = 0; a < 2; a++) if (arms[a].op) cublasLtMatmulDescDestroy(arms[a].op);
+        cublasLtMatmulPreferenceDestroy(pref);
+        cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(ld);
+        CK(cudaFree(dm)); CK(cudaFree(cp_alloc)); CK(cudaFree(D));
+        CK(cudaFree(asc)); CK(cudaFree(wsc)); CK(cudaFree(sca1)); CK(cudaFree(A));
+        for (int r = 0; r < nrep; r++) CK(cudaFree(Bv[r]));
+    }
+    cudaFree(ws); cublasLtDestroy(lt);
+}
+#endif
+
 #ifdef PLOW_BENCH_GEMV_CTA
 #include "bf16_gemv_cta_probe.cuh"
 #endif
@@ -571,16 +866,22 @@ int main(int argc, char** argv) {
     return 0;
 #endif
 #if defined(PLOW_BENCH_WS384) || defined(PLOW_BENCH_QWEN_GEMV)
+#ifdef PLOW_BENCH_W8A8
+#define bench_route bench_w8a8
+    printf("Hopper ws384 W8A8 (e4m3, per-token x per-channel) vs cuBLASLt SMs=%d\n", P);
+#else
+#define bench_route bench_cublas
     printf("Hopper ws384 BF16 vs cuBLASLt SMs=%d\n", P);
+#endif
     if (prop.major != 9) { printf("ws384 comparison requires Hopper\n"); return 2; }
-    if (argc > 1) bench_cublas(M);
+    if (argc > 1) bench_route(M);
     else {
 #ifdef PLOW_BENCH_GEMMA4_ALL
         for (unsigned rows : {1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u, 256u,
                               512u, 1024u, 2048u, 4096u, 8192u})
-            bench_cublas(rows);
+            bench_route(rows);
 #else
-        for (unsigned rows : {128u, 1024u, 4096u}) bench_cublas(rows);
+        for (unsigned rows : {128u, 1024u, 4096u}) bench_route(rows);
 #endif
     }
 #else
