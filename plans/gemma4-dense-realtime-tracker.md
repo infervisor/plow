@@ -4102,3 +4102,45 @@ The step needs -3.2 ms to reach vLLM's 15.82 ms. Available and now quantified:
 Together 3.4 ms, which would cover the 3.2 ms. Neither is a knob and neither is close to free,
 and realizing both in full is optimistic -- but for the first time the decode side of the goal
 has a route whose terms are all measured rather than assumed.
+
+### The interpreter's dispatch is free; ~1.25 ms per decode step is fixed overhead
+
+`PLOW_NV_SKELETON` runs the gate/signal skeleton with no op bodies (interp_sm120.cu:2911). Its
+knob `def.PLOW_NV_SKELETON` has env binding None, like PLOW_EXTRA_DEFINES, so it was enabled by
+flipping the `#ifndef` default in the source and gated on the cubin md5 differing.
+
+First attempt FAILED and produced no numbers: the built-in `PLOW_NV_SKEL_PAD` of 160 KB puts
+static smem at 164868 B and static+dynamic then exceeds the device opt-in (232448 B), so every
+run died on `cuFuncSetAttribute(max dynamic smem) -> CUDA_ERROR_INVALID_VALUE`. Base static is
+164868 - 160*1024 = 1028 B, so PAD=38 gives 39940 B, matching the control object's 40464 and
+therefore its launch profile. With that it runs:
+
+    B    ctx     control   skeleton   op_work
+    32   128      13.689     1.246     12.443
+    1    128      10.770     0.983      9.787
+    32   8192     19.034     1.273     17.761
+
+**Dispatch over all 540 stream entries costs ~0.** The skeleton (entry + 540 gate/signal hops) is
+1.246 ms, no more than entry alone measured by PLOW_DEBUG_MAX_INST=1 (1.285-1.352 ms on the
+heavier REG:255 object; the skeleton is REG:28, which accounts for its being slightly lower). The
+counter protocol, the atomic cursor and the 540 sequential dependency hops are not a tax. There is
+no scheduling overhead to remove -- which also retires the idea that role-segmenting decode would
+pay for itself through cheaper dispatch.
+
+What remains is a **fixed ~1.25 ms per decode step**, and it is invariant where real work is not:
+1.246 ms at B=32 vs 0.983 at B=1, and 1.246 at ctx 128 vs 1.273 at ctx 8192. That is 9.1% of the
+13.689 ms step and 39% of the 3.2 ms needed to reach vLLM's 15.82 ms.
+
+Now excluded as the cause: dispatch (this section), smem zeroing (40464 B x 132 blocks = 5.3 MB,
+~1.6 us at 3.35 TB/s), and CUDA-graph launch overhead -- decode is ONE cooperative megakernel
+launch, so a one-node graph would save ~5-10 us, not 1.25 ms, and the graph APIs are already
+bound and used for prefill segments (rt.pf_seg_graph, ON/PROMOTED). A cooperative launch itself
+is ~10-30 us. The cause is still unidentified; #71 stays open with these three ruled out.
+
+Full decode step at B=32 ctx 128, every term now measured:
+
+    1.25 ms   fixed entry/launch (cause open)
+    9.52 ms   weight walk (2.34 TB/s = 70% of roofline; ~2.1 ms headroom, PAIR=4 blocked)
+    2.92 ms   the rest of the op work (norms, attention, lm_head+sampling tail 1.642 ms)
+   -------
+   13.69 ms   + 5.35 ms KV traversal at ctx 8192 -> 19.03, vs vLLM's 15.82
