@@ -3976,3 +3976,40 @@ fixed cost already present at B=1 ctx 128 (entry, norms, sampling).
 Against vLLM's 15.82 ms median ITL at the same cell, plow needs -3.2 ms. The walk can supply
 ~2.1 ms at best, so the remaining ~1.1 ms has to come out of F, where the 2.601 ms fixed term is
 the obvious candidate. Neither is a knob.
+
+### Re-run correctly: the walk IS activation-bound at B=32
+
+Both withdrawn probes rebuilt with UNCONDITIONAL source edits, each packet gated on its cubin
+md5 differing from the control's.
+
+    probe                    B=32 ctx128        B=32 ctx8192       B=1 ctx128
+    a1 = a0 (activations)    13.689 -> 12.548   19.032 -> 17.803   10.762 -> 10.489
+                             -1.141 (-8.34%)    -1.229 (-6.46%)    -0.273 (-2.54%)
+    half mma issue           13.689 -> 12.676   19.032 -> 17.966   10.762 -> 10.022
+                             -1.013 (-7.40%)    -1.066 (-5.60%)    -0.740 (-6.88%)
+
+The no-op versions of these same probes reported +0.01% and +0.09%. Subtracting the B=1 effect
+isolates each term's share of the +1.35 ms that batching adds to the walk (8.164 -> 9.516 ms on a
+byte-identical weight stream):
+
+    activations  1.141 - 0.273 = 0.868 ms   <- dominant
+    mma issue    1.013 - 0.740 = 0.273 ms
+
+So PAIR=4 -- which the invalid probe told us not to build -- is the indicated change (task #70).
+wgmma, worth 0.273 ms, is not worth its complexity yet.
+
+Two caveats, both recorded in the header. Both probe objects came out REG:247 STACK:160 against
+the control's REG:255 STACK:192, so part of the gain may be lower register/stack pressure rather
+than the removed work; occupancy is unchanged (both fit one 256-thread block per SM) and LOCAL:0
+in all three, so the confound should be small but is not zero. And a probe that DELETES work is
+an upper bound on what a rearrangement recovers: PAIR=4 needs UNB halved 8 -> 4 to hold the same
+prefetch register budget, trading activation traffic against the very prefetch depth the per-MT
+fix was tuned for.
+
+### Where the goal stands
+
+0.868 ms of a 19.036 ms step is 4.6%, worth ~0.3 s of the 31.3 s wall at 8192/C32. Reaching
+vLLM's 15.82 ms step needs -3.2 ms. So PAIR=4 alone does not flip out_tok_s, and the ranked
+remainder is unchanged: ~2.1 ms available in the walk (70% -> 90% of roofline), ~1.1 ms that must
+come from F (of which 2.601 ms is fixed entry/norm/sampling cost), plus the prefill terms
+(#66 FlashPrefill ~2.3 s, #67 norm/Glu tail ~2.0 s) and the ~1.1 s rung hole (#65).

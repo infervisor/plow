@@ -153,8 +153,33 @@ __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_b
      * 8192, which is the KV traversal, and carries 2.601 ms of fixed cost already present at
      * B=1 ctx 128.
      *
-     * Whether the remaining walk gap is activations or mma issue is OPEN -- neither was ever
-     * tested. What stands, being real source changes on genuinely different packets, is the
+     * AND IT IS ACTIVATION-BOUND AFTER ALL. Both withdrawn probes were re-run with
+     * UNCONDITIONAL edits, each gated on its cubin md5 differing from the control:
+     *
+     *     probe                 B=32 ctx128        B=32 ctx8192       B=1 ctx128
+     *     a1 = a0 (activations) 13.689 -> 12.548   19.032 -> 17.803   10.762 -> 10.489
+     *                           -1.141 (-8.34%)    -1.229 (-6.46%)    -0.273 (-2.54%)
+     *     half mma issue        13.689 -> 12.676   19.032 -> 17.966   10.762 -> 10.022
+     *                           -1.013 (-7.40%)    -1.066 (-5.60%)    -0.740 (-6.88%)
+     *
+     * The withdrawn versions of these same probes reported +0.01% and +0.09%. Subtracting the
+     * B=1 effect isolates each term's share of the +1.35 ms that batching adds to this walk:
+     * activations 1.141 - 0.273 = 0.868 ms, mma issue 1.013 - 0.740 = 0.273 ms. So the walk IS
+     * activation-bound at B=32, and PAIR=4 -- which the invalid probe said not to build -- is the
+     * indicated change: at MT=2 each activation pair currently feeds NW=2 weight row blocks, and
+     * NW=4 would feed four, halving activation traffic per weight byte exactly as a1=a0 does.
+     *
+     * TWO CAVEATS before spending a build on it. (1) Both probe objects came out REG:247
+     * STACK:160 against the control's REG:255 STACK:192, so part of the gain may be lower
+     * register/stack pressure rather than the removed work; occupancy is unchanged (both fit one
+     * 256-thread block per SM) and LOCAL:0 in all three, so the confound should be small, but it
+     * is not zero. (2) A probe that DELETES work is an upper bound on what a legitimate
+     * rearrangement can recover. PAIR=4 is not free: wv[NW][UNB] at NW=4 needs UNB halved to 4 to
+     * hold the same prefetch register budget, which trades activation traffic against prefetch
+     * depth in k -- the very depth the per-MT fix above was tuned for. Measure it; do not assume
+     * the 0.868 ms.
+     *
+     * What stands independently, being real source changes on genuinely different packets: the
      * per-MT prefetch depth above (-3.64% at B=32); and from PACKLOG, the served step matches the
      * isolated one (19.100 vs 19.036 ms) at 0.268-0.269 ms/row over a 10.78 ms fixed pass.
      *
