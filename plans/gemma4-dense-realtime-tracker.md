@@ -3410,3 +3410,73 @@ reserved-vs-resident correction stands.
 lengths (177.8/193.9/205.8/227.1 vs 250.6/325.4/353.9/383.8, 29-41% better); TTFT WINS at 1024 and
 4096; TPOT and out_tok_s LOSE at all four. 0 of 4 cells clean. The deficit remains singular and is
 TPOT.
+
+
+### The B=32 decode deficit is NOT attention. It is the per-stream cost of the GEMV walk.
+
+Two entries in this campaign disagreed: the metric-fingerprints note concluded "the TPOT gap is
+entirely KV traversal ... decode *attention* is the target, not the GEMMs" from a constant/slope
+split of SERVED TPOT, while the decode-knee note found the same knee at ctx=1024 and called it
+rung 32. Served TPOT cannot arbitrate — PACKLOG puts prefill at 84.5% of wall at 8192/C32, so
+served TPOT carries interference. Kernel-only `step_bench` on p12rq does.
+
+```
+     ctx       B=1      B=32    B32-B1  per-stream
+     128    10.811    14.247     3.436     0.1108
+    1024    10.894    17.446     6.552     0.2114
+    4096    10.909    18.354     7.445     0.2402
+    8192    10.945    19.526     8.581     0.2768
+   15000    11.021    21.464    10.443     0.3369
+```
+
+**Split at 8192/B=32, by measured secant (not a fit):** constant 14.247 ms, ctx-dependent
+19.526 - 14.247 = 5.279 ms. So **73% of the step is ctx-independent and 27% is attention.**
+
+**The deficit lives in the ctx-independent 73%.** At ctx=128, where KV traffic is ~1.6 GB against
+23.8 GB of weights, plow already pays **0.1108 ms per added stream against vLLM's ~0.049** — a
+2.26x gap with attention essentially out of the picture. B=1 is at parity or better (10.811 vs
+vLLM 10.46-10.55 served at C1).
+
+Stated as achieved bandwidth over the *identical* 23.8 GB weight stream:
+
+```
+  plow  B=1    23.8 GB / 10.811 ms  =  2.20 TB/s     (66% of 3.35 peak)
+  plow  B=32   25.4 GB / 14.247 ms  =  1.78 TB/s     (53%)
+  vLLM  B~29   23.8 GB / 11.59  ms  =  2.05 TB/s     (61%)
+  cuBLASLt, projections only        =  1.54 TB/s
+```
+
+plow is the FASTEST of the four at B=1 and the slowest at B=32, on the same weight stream.
+**Batching costs plow bandwidth efficiency and does not cost vLLM's.** That is the entire
+remaining TPOT gap, and it is a weight-walk property, not an attention property.
+
+This also closes the cuBLAS question for good. Decode carries no `Gemm` arm at all — p12rq's
+decode programs are `Gemv`/`GemvQkv`/`GemvGlu`/`GemvArgmax` plus `FlashDecode`/`FlashMerge` — and
+routing the projections to cuBLASLt is refuted by its own data (13.93 ms for the projections alone
+vs 14.261 ms for plow's whole step). At M=32 there are no FLOPs for a better GEMM to win: the step
+reads 23.8 GB of weights whatever the batch. The loaded Lt algorithm table is pinned at m=128,
+i.e. prefill buckets; `cublaslt_decode` in the target caps routes 26B MoE grouped matmuls, and the
+12B is dense.
+
+**Two defects in this probe, recorded so they are not repeated.**
+
+1. `PLOW_NV_LEAN_DECODE=1` was used as a runtime env to compile the flash arms out and measure the
+   attention share directly. It is `Layer::ObjectDefine` (`devgen/src/knob_spec.rs:1721`) — a
+   COMPILE-TIME define. Setting it in the environment of a prebuilt packet does nothing, and the
+   arm duly returned lean == full to within 0.007 ms at every point. That arm is discarded. A real
+   lean split needs a rebuilt decode object, and arm 1 already answers the question without it.
+2. The byte model for the ctx-dependent part does not reconcile. 5.279 ms at 8192 against the
+   27.9 GB the window arithmetic predicts (40 sliding x 1024 window + 8 full x 8192, x 8 KiB x 32)
+   implies 5.3 TB/s, above the 3.35 TB/s HBM peak. Even the full-attention layers alone do not
+   fit. So the KV byte estimate is wrong by roughly 3x somewhere — candidates are what `step_bench`
+   actually populates per row, the depth-gated attention, or `PLOW_NS_FULL_ABS`. **No attention
+   bandwidth figure should be quoted until that is checked.** The TIMES above are direct
+   measurements and are unaffected.
+
+**Where this leaves the target.** Not attention, not cuBLAS, not occupancy (closed by arithmetic:
+the 128-register cap costs 1.3-1.9x in spill, live state is ~463 registers). What is left is the
+MMA GEMV walk's per-stream cost, and the one direction never tested is DEEPER prefetch — only
+`MMA_UNB=6`, the shallower arm, was tried, and it was worse at both rungs, which is what made the
+recorded diagnosis "bandwidth latency hiding". Deeper costs registers on a walk already at 255
+with spill, so it may lose too; it is one build and one `step_bench` sweep to find out, and
+`preserve_packet.py diff --expect` can assert the arm is single-variable before the lease.
