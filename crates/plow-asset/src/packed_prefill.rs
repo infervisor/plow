@@ -109,8 +109,36 @@ impl Manifest {
         Ok(())
     }
 
+    /// Does this instruction already carry a STAGE's tables rather than the whole chunk's?
+    ///
+    /// A staged site is bound at emit, not at load: `FlashPrefill` has all eight `i[]` and all
+    /// three `fj[]` operands occupied, so there is no slot to tag it with a stage index, and the
+    /// stage is instead identified by which table handle it holds.
+    fn is_staged_site(&self, d: &DevInst64) -> bool {
+        if self.stages.is_empty() {
+            return false;
+        }
+        let mut any = |f: &dyn Fn(&Stage) -> bool| self.stages.iter().any(|s| f(s));
+        match DevOp::from_u16(d.op) {
+            Some(DevOp::HeadNormRope) => any(&|s: &Stage| d.t[6] == s.slot),
+            Some(DevOp::HeadNormRopeFp8) => any(&|s: &Stage| d.t[7] == s.slot),
+            Some(DevOp::FlashPrefill) => any(&|s: &Stage| d.t[6] == s.request),
+            Some(DevOp::FlashMerge) => any(&|s: &Stage| d.t[7] == s.request),
+            Some(DevOp::FlashPrefillFp8) => {
+                any(&|s: &Stage| d.i[4] == FP8_REQUEST_TAG | u32::from(s.request))
+            }
+            _ => false,
+        }
+    }
+
     /// Bind a validated prefill instruction, or restore its ordinary request operands.
     pub fn bind_request(&self, d: &mut DevInst64, packed: bool) {
+        // A staged site already holds its own stage's span table and slot mask. Rebinding it to
+        // the whole-chunk tables would make every stage write every row — precisely the wrap the
+        // shortened ring cannot survive, and silent: wrong tokens, no fault.
+        if self.is_staged_site(d) {
+            return;
+        }
         let slot = if packed { self.slot } else { TENSOR_NONE16 };
         let request = if packed { self.request } else { TENSOR_NONE16 };
         match DevOp::from_u16(d.op) {
@@ -1085,6 +1113,65 @@ mod tests {
             m.max_request_rows = Some(limit);
             assert_eq!(m.write_rows(limit).unwrap(), stage_rows, "limit {limit} stage {stage_rows}");
         }
+    }
+
+    fn inst(op: DevOp) -> DevInst64 {
+        DevInst64 { op: op as u16, blocks: 1, fj: [0; 3], t: [TENSOR_NONE16; 8], i: [0; 8] }
+    }
+
+    /// Load-time binding must not reach a staged site. If it did, every stage would be pointed at
+    /// the whole-chunk span table and slot mask, so every stage would write every row — the wrap
+    /// the shortened ring cannot survive, with no fault to show for it.
+    #[test]
+    fn binding_leaves_a_staged_site_alone_in_both_directions() {
+        let m = staged_manifest(Some(1024), 4);
+        let s = m.stages[2];
+
+        let mut hnr = inst(DevOp::HeadNormRope);
+        hnr.t[6] = s.slot;
+        let mut fp = inst(DevOp::FlashPrefill);
+        fp.t[6] = s.request;
+        let mut merge = inst(DevOp::FlashMerge);
+        merge.t[7] = s.request;
+        let mut hnr8 = inst(DevOp::HeadNormRopeFp8);
+        hnr8.t[7] = s.slot;
+        let mut fp8 = inst(DevOp::FlashPrefillFp8);
+        fp8.i[4] = FP8_REQUEST_TAG | u32::from(s.request);
+
+        for d in [&mut hnr, &mut fp, &mut merge, &mut hnr8, &mut fp8] {
+            let before = *d;
+            m.bind_request(d, true);
+            assert_eq!(*d, before, "packed bind touched a staged site");
+            m.bind_request(d, false);
+            assert_eq!(*d, before, "unpacked bind touched a staged site");
+        }
+    }
+
+    /// An UNSTAGED site in the same packet still binds normally, so a staged packet can carry
+    /// both (only the sliding layers are staged; a full-attention layer is not).
+    #[test]
+    fn binding_still_reaches_an_unstaged_site_in_a_staged_packet() {
+        let m = staged_manifest(Some(1024), 4);
+        let mut hnr = inst(DevOp::HeadNormRope);
+        m.bind_request(&mut hnr, true);
+        assert_eq!(hnr.t[6], m.slot);
+        m.bind_request(&mut hnr, false);
+        assert_eq!(hnr.t[6], TENSOR_NONE16);
+
+        let mut fp = inst(DevOp::FlashPrefill);
+        m.bind_request(&mut fp, true);
+        assert_eq!(fp.t[6], m.request);
+    }
+
+    /// With no stages declared, binding is exactly what it was.
+    #[test]
+    fn binding_is_unchanged_when_nothing_is_staged() {
+        let m = staged_manifest(None, 0);
+        let mut fp = inst(DevOp::FlashPrefill);
+        // a handle that WOULD have matched a stage if any were declared
+        fp.t[6] = 15;
+        m.bind_request(&mut fp, true);
+        assert_eq!(fp.t[6], m.request);
     }
 
     #[test]
