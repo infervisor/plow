@@ -1679,3 +1679,62 @@ it closes is 1.0 % of a prefill tick and 0.5 % of a decode tick, and the 128/C4 
 that originally motivated it turned out to be the `ahead` lag compensation, which the frontier
 rework already removed. Stage 1 (`PLOW_DECODE_PIPELINE`) is the part that pays, and it is correct
 and measured.
+
+## Full ladder at HEAD, both models, 20 cells each vs vLLM 0.28 (2026-09-23)
+
+First pass: 34 of 40 cells. 12B 20/20, 26B 14/20. The gaps and the losses have three named
+causes, none of them kernel speed.
+
+### 1. The 6 missing 26B cells: the MoE memset-hoist aborts the prefill capture
+
+`26B realtime` lost every cell at 4096 rows and above:
+
+```
+FAIL: incomplete cell: ok=0/32 failed=32 generated=0/4096
+gpu: batched prefill failed error=device fault: graph edges: CUDA_ERROR_INVALID_VALUE
+     (code 1) fatal=false packed=3
+prefill seg graph warmup failed ... bucket=6 / bucket=7
+```
+
+`graph edges` is `hoist_memsets` (`device/cuda.rs`), the pass that lifts cuBLASLt's workspace
+memsets above the MoE Lt glue kernel so they overlap instead of serialising. It runs only when
+`untouched` is non-empty, and `untouched` is the MoE Lt glue list -- which is why the 26B fails and
+the 12B, dense, never does. A driver refusal on a dependency *query* propagated out of
+`graph_capture_hoisting` and failed the whole capture, so an optimization could kill the launch.
+
+Fixed: query refusals skip that memset and leave the graph exactly as captured (the queries all run
+before that node's first mutation, so a skip is always on an unmodified graph). The three edge
+mutations stay fatal -- a half-moved edge is a race, not a lost optimization.
+
+`PLOW_PF_INTERLEAVE_ADAPTIVE=0` was ruled out as the cause by a one-variable rerun: it failed
+*earlier* (1024/C4, ok=8/32) with the same error.
+
+Correction to an earlier note in this file: the `prefill seg graph warmup failed` warning is **not**
+benign. On the 26B realtime profile it cost 6 of 20 ladder cells.
+
+### 2. Every C32 cell: a 16-slot admission cap, not throughput
+
+The fingerprint is exact. 12B: C32 tok/s 1318.9 vs C16 1310.7; 26B: 1371.5 vs 1371.1. Peak memory
+is identical at both concurrencies. TPOT at C32 matches or beats vLLM (12B 11.41 vs 11.59). Only
+TTFT explodes (12B 128/C32: 1267 ms vs vLLM 161).
+
+The `ladder16k` / `ctx16k` packets serve 16 slots: chunk 4096 makes a slot's sliding ring
+`next_pow2(window + 4095)` rows, and 32 slots would need ~110 GiB on an 80 GiB card. Half the
+requests therefore wait out a whole 128-token generation before their first token. vLLM runs 32
+slots on paged KV.
+
+Worth recording: at C16/C32 plow peaks at 67.7-70.8 GiB against vLLM's 74.6-75.8 GiB. plow uses
+*less* memory and still fits fewer sequences -- the cost is contiguous power-of-two rings per slot,
+not total footprint.
+
+`*-c32-16k.toml` is the packet shaped for this half (chunk 1024 -> 2048-row ring, 32 slots,
+45-48 GiB peak). Being measured.
+
+### 3. p99 ITL on the realtime profile: the MULTISTEP wave
+
+p99 ITL at C1 is exactly 4x TPOT on both models -- 12B 41.8 = 4 x 10.45, 26B 21.6 = 4 x 5.38 --
+and median ITL is literally `0.000`. That is `PLOW_MULTISTEP=4` emitting four tokens per wave.
+vLLM streams one at a time (11.3 / 5.8 ms). TTFT and TPOT are unaffected; only the streaming
+metric is. A/B running: 12B with `MULTISTEP=0 + PLOW_DECODE_PIPELINE=1` (per-token streaming is
+precisely what stage 1 buys), 26B with `MULTISTEP=0` alone, since the pipeline is unavailable
+whenever cuBLASLt is enabled (`gpu.rs:3539`).

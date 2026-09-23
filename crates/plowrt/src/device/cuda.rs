@@ -1439,29 +1439,45 @@ impl CudaBackend {
         )?;
         nodes.truncate(n);
         let mut hoisted = 0usize;
+        let mut refused = 0usize;
+        // Every query runs before this node's first mutation, so a driver refusal can skip the node
+        // and leave the graph exactly as captured. The hoist is an optimization and must not be
+        // able to fail the launch; the three mutations below stay fatal, because a half-moved edge
+        // is a race rather than a lost optimization.
+        macro_rules! probe {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(_) => {
+                        refused += 1;
+                        continue;
+                    }
+                }
+            };
+        }
         for &memset in &nodes {
-            if kind(memset)? != MEMSET {
+            if probe!(kind(memset)) != MEMSET {
                 continue;
             }
-            let (pred, pred_data) = edges(api.cuGraphNodeGetDependencies_v2, memset)?;
-            let (succ, succ_data) = edges(api.cuGraphNodeGetDependentNodes_v2, memset)?;
+            let (pred, pred_data) = probe!(edges(api.cuGraphNodeGetDependencies_v2, memset));
+            let (succ, succ_data) = probe!(edges(api.cuGraphNodeGetDependentNodes_v2, memset));
             let ([kernel], [0], [consumer], [0]) =
                 (&pred[..], &pred_data[..], &succ[..], &succ_data[..])
             else {
                 continue;
             };
-            if kind(*kernel)? != KERNEL {
+            if probe!(kind(*kernel)) != KERNEL {
                 continue;
             }
             let mut params: CudaKernelNodeParams = std::mem::zeroed();
-            self.check(
+            probe!(self.check(
                 (api.cuGraphKernelNodeGetParams_v2)(*kernel, &mut params),
                 "cuGraphKernelNodeGetParams",
-            )?;
+            ));
             if !untouched.iter().any(|f| f.0 == params.func as usize) {
                 continue;
             }
-            let (above, _) = edges(api.cuGraphNodeGetDependencies_v2, *kernel)?;
+            let (above, _) = probe!(edges(api.cuGraphNodeGetDependencies_v2, *kernel));
             let null = std::ptr::null();
             self.check(
                 (api.cuGraphRemoveDependencies_v2)(graph, kernel, &memset, null, 1),
@@ -1485,6 +1501,14 @@ impl CudaBackend {
                 "cuGraphAddDependencies",
             )?;
             hoisted += 1;
+        }
+        if refused > 0 {
+            tracing::warn!(
+                refused,
+                hoisted,
+                nodes = n,
+                "graph memset hoist: driver refused a node query; those memsets left as captured"
+            );
         }
         tracing::debug!(hoisted, nodes = n, "graph memsets hoisted");
         Ok(())
