@@ -494,6 +494,17 @@ pub(super) fn check_compiled_opcode_markers<'a>(
 ) -> Result<()> {
     for prog in progs {
         for inst in &prog.insts {
+            if inst.op == DevOp::MlaBmmFp8 as u16 && inst.i[5] != 0 {
+                if !(1..32).contains(&inst.i[0])
+                    || inst.i[1..] != [8, 256, 512, 0, 1024, 0, 0]
+                    || !syms.contains(&"plow_mla_bmm_head_stride_1")
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "invalid strided WV contract or missing `plow_mla_bmm_head_stride_1` in {}",
+                        path.display()
+                    )));
+                }
+            }
             let shape = match DevOp::from_u16(inst.op) {
                 Some(DevOp::MoeGluFp8Block128) => Some((inst.i[0], inst.i[1], inst.i[2], 1, inst.i[3], 7, 4)),
                 Some(DevOp::MoeQuantFp8Block128) => Some((inst.i[0], inst.i[4], inst.i[1], inst.i[2], inst.i[3], 6, 5)),
@@ -553,7 +564,7 @@ pub(super) fn check_compiled_opcode_markers<'a>(
             let [m, heads, n, k, rope, i5, i6, i7] = inst.i;
             if m == 0 || m.checked_mul(8 * 512).is_none() || heads != 8
                 || !matches!((n, k, rope), (512, 192, 1) | (256, 512, 0))
-                || i5 != 0 || i6 != 0 || i7 != 0
+                || (i5 != 0 && !(i5 == 1024 && rope == 0 && m < 32)) || i6 != 0 || i7 != 0
                 || inst.t[..if rope == 1 { 5 } else { 4 }].contains(&packet::dev::TENSOR_NONE16)
             {
                 return Err(RuntimeError::Device(format!(

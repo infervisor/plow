@@ -1744,11 +1744,24 @@ fn lean_block(lean: &crate::LeanReport) -> Value {
         "verified": lean.verified,
         "oracle": lean.oracle,
         "rewrite_verified": lean.rewrite_verified,
+        "rewrite_scope": if !lean.rewrite_verified { "not_checked" }
+            else if lean.compile_checks.iter().any(|check|
+                check.scope == plow_asset::certificates::SemanticScope::RewriteBodyExpansion) {
+                "full_arity_rule_body_syntax_expansion"
+            } else { "name_catalog_only" },
+        "logical_effect_gaps": lean.logical_effect_gaps,
+        "dependency_binding_gaps": lean.dependency_binding_gaps,
+        "qualification": {
+            "floating_point_implementation": false,
+            "memory_effect_completeness": false,
+            "empirical_performance": false,
+        },
         "reason": lean.reason,
         "note": "`verified` = a Lean ordering certificate (plow_verify checkpoint D) was \
-                 obtained for EVERY program in this blob; `rewrite_verified` = egglog rewrite \
-                 rule soundness (checkpoint A) verified; `oracle` = the Lean decode \
-                 lower-bound query ran. false means NOT CHECKED (see `reason`), never \
+                 obtained for EVERY program in this blob; `rewrite_verified` = checkpoint A \
+                 checked at the stated `rewrite_scope`, not floating-point kernel implementation \
+                 correctness; `oracle` = a conditional Lean lower-bound query ran, not empirical \
+                 performance qualification. false means NOT CHECKED (see `reason`), never \
                  `checked and rejected` — a rejection aborts emission, so a blob with a \
                  rejected program never reaches disk and has no manifest.",
     });
@@ -2239,6 +2252,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
                     "persistent": d.compiled_persistent,
                 },
                 "qualified": d.selected_source == "qualified",
+                "measured_policy_obligation": d.measured_policy,
                 "selected": {
                     "algorithm": d.selected_algorithm,
                     "nsplit": d.selected_nsplit,
@@ -2312,6 +2326,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
         "n_cu": m.n_cu,
         // Before the large sections: plowrt's load check stops reading here.
         "knobs": crate::knob_spec::manifest_section(arch, m.n_cu, &backends),
+        "structural_cost_inputs": m.progs.iter().map(|p| crate::cost_inputs::program(m, p)).collect::<Vec<_>>(),
         "input_contract": {
             "kind": "token_ids",
             "modalities": ["text"],
@@ -2911,6 +2926,7 @@ mod tests {
             tensors: vec![],
             gq_stream: vec![],
             gq_seg_ofs: vec![],
+            reduction_witness: None,
             l2_sms: 0,
             l2_domains: 0,
         }
@@ -4595,6 +4611,11 @@ mod tests {
         assert_eq!(man["lean"]["verified"], json!(true));
         assert_eq!(man["lean"]["oracle"], json!(true));
         assert_eq!(man["lean"]["reason"], Value::Null);
+        assert_eq!(man["lean"]["qualification"], json!({
+            "floating_point_implementation": false,
+            "memory_effect_completeness": false,
+            "empirical_performance": false,
+        }));
     }
 
     /// The two subsystems are INDEPENDENT (Correction 1). Disabling the

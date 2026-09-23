@@ -1991,6 +1991,12 @@ impl Builder {
             );
         }
 
+        let original_coarse: Vec<_> = self.ops.iter().enumerate().flat_map(|(consumer, op)|
+            op.deps.iter().filter_map(move |dep| match dep {
+                Dep::Coarse(producer) => Some((*producer, consumer as u32)),
+                Dep::Fine { .. } => None,
+            })).collect();
+
         // CHAIN-BYPASS — a MEASUREMENT INSTRUMENT, numerically WRONG, never shipped.
         //
         // knob-contract §7a-REFINED says a serial packet on the decode chain costs ~5.3 us in the
@@ -2107,7 +2113,7 @@ impl Builder {
         // Lean side needed a coverage statement in terms of `happensBefore` rather than
         // `WellFormed.edgeCovered` — see `lean-plow/Plow/TransitiveReduction.lean`,
         // `tr_preserves_coverage`.
-        {
+        let reduction_witness = {
             let mut edges: BTreeSet<(u32, u32)> = BTreeSet::new();
             for (i, op) in self.ops.iter().enumerate() {
                 for d in &op.deps {
@@ -2153,7 +2159,8 @@ impl Builder {
                     dup
                 );
             }
-        }
+            ReductionWitness::new(n_ops, original_coarse, keep)
+        };
 
         // Which ops does someone depend on FINELY? Those get per-slice counters.
         let mut fine_base = vec![u32::MAX; n_ops];
@@ -3084,6 +3091,7 @@ impl Builder {
         };
 
         Program {
+            reduction_witness: Some(reduction_witness),
             n_cu: self.n_cu,
             n_counter,
             hier_base,
@@ -3185,7 +3193,71 @@ pub fn static_seg_ofs(
     Ok(out)
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ReductionWitness {
+    pub original: Vec<(u32, u32)>,
+    pub retained: Vec<(u32, u32)>,
+    pub paths: Vec<Option<Vec<u32>>>,
+}
+
+impl ReductionWitness {
+    fn new(n: usize, original: Vec<(u32, u32)>, retained: BTreeSet<(u32, u32)>) -> Self {
+        let mut next = vec![Vec::new(); n];
+        for &(a, b) in &retained {
+            next[a as usize].push(b);
+        }
+        let paths = original.iter().map(|&(source, target)| {
+            if retained.contains(&(source, target)) {
+                return Some(Vec::new());
+            }
+            let mut parent = vec![u32::MAX; n];
+            let mut queue = std::collections::VecDeque::from([source]);
+            parent[source as usize] = source;
+            while let Some(at) = queue.pop_front() {
+                for &to in &next[at as usize] {
+                    if parent[to as usize] != u32::MAX {
+                        continue;
+                    }
+                    parent[to as usize] = at;
+                    if to == target {
+                        let mut path = Vec::new();
+                        let mut node = at;
+                        while node != source {
+                            path.push(node);
+                            node = parent[node as usize];
+                        }
+                        path.reverse();
+                        return Some(path);
+                    }
+                    queue.push_back(to);
+                }
+            }
+            None
+        }).collect();
+        Self { original, retained: retained.into_iter().collect(), paths }
+    }
+}
+
+#[cfg(test)]
+mod reduction_witness_tests {
+    use super::*;
+
+    #[test]
+    fn retains_original_edges_and_paths_through_final_reduction() {
+        let original = vec![(0, 1), (1, 2), (0, 2), (2, 3), (0, 3)];
+        let kept = transitive_reduction(4, &original.iter().copied().collect());
+        let witness = ReductionWitness::new(4, original.clone(), kept);
+        assert_eq!(witness.original, original);
+        assert_eq!(witness.paths, vec![Some(vec![]), Some(vec![]), Some(vec![1]),
+            Some(vec![]), Some(vec![1, 2])]);
+        let invalid = ReductionWitness::new(2, vec![(0, 1)], BTreeSet::new());
+        assert_eq!(invalid.paths, [None]);
+    }
+}
+
 pub struct Program {
+    /// Pre-flattening coarse-dependency preservation only; not a kernel memory proof.
+    pub reduction_witness: Option<ReductionWitness>,
     pub n_cu: u32,
     pub n_counter: u32,
     /// Base counter id of the two-level maintenance scratch; 0 = hierarchy off. See `DevProgram::hier_base`.
@@ -6206,6 +6278,7 @@ mod v6_tests {
             tensors: Vec::new(),
             gq_stream: vec![se(0, 0), se(1, 0)],
             gq_seg_ofs: vec![0, 2],
+            reduction_witness: None,
             l2_sms: 0,
             l2_domains: 0,
         };
@@ -6354,6 +6427,7 @@ mod v6_tests {
                 .map(|i| se(i as u32 / 2, i as u32 % 2))
                 .collect(),
             gq_seg_ofs: vec![0, n_inst as u32 * 2],
+            reduction_witness: None,
             l2_sms: 0,
             l2_domains: 0,
         };

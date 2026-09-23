@@ -1161,6 +1161,19 @@ Loader/asset overrides: `PLOW_NV_CUBIN[_PF]`, `PLOW_NV_KERNEL[_PF]`, `PLOW_NV_SM
 / `PLOW_NV_SMEM_PF` (override decode/prefill dynamic-smem arena bytes), `PLOW_HSACO`
 (AMD `.hsaco` dir), `PLOW_CHECKPOINT`, `PLOW_LIBCUDA`.
 
+`PLOW_MLA_BF16_METADATA_HOIST=1` / `--mla-bf16-metadata-hoist` is an experimental,
+default-off AMD persistent BF16 attention optimization. Reuses only the work map
+across same-replay layers with identical selected-length vectors and workspace.
+The first layer builds metadata; subsequent matching layers omit that launch.
+Q/KV packing and selected indices remain layer-local. M<32 and positive live rows
+only. Requires exact GPU replay and matched four-arm qualification before promotion.
+
+`PLOW_GLM_MLA_STRIDED_WV=1` is an experimental emit-time candidate requiring
+`PLOW_GLM_MLA_BF16_PS=1`. M<32 attention writes padded BF16 heads directly into
+the activation buffer; the sole WV consumer reads even heads with stride 1024.
+This removes the unpad dispatch/copy, not the BF16 rounding boundary. Objects
+must carry `plow_mla_bmm_head_stride_1`. Default off; GPU qualification pending.
+
 ### What plow does and does not fuse
 
 Three things are easily conflated:

@@ -1407,6 +1407,7 @@ mod tests {
             gq_stream: vec![se(0, 0), se(0, 1), se(1, 0), se(1, 1)],
             gq_seg_ofs: vec![0, 4],
             // Unplaced: `seg` is a wave-class, not an L2 domain (PLOW_L2_PLACE).
+            reduction_witness: None,
             l2_sms: 0,
             l2_domains: 0,
         };

@@ -6055,3 +6055,28 @@ fn dcp_degree_resolves_to_the_sharded_layout() {
     assert_eq!(ok, DcpLayout::replicated(8));
     assert_eq!(ok.local_capacity(81_920), 81_920);
 }
+
+#[test]
+fn glm_mla_strided_wv_preserves_bf16_boundary_and_rung_domain() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("GLM_LINEAR_FP8", "1"), ("PLOW_GLM_QKVA_W8A8", "1"),
+        ("PLOW_GLM_MLA_W8A8", "1"), ("PLOW_GLM_MLA_BF16_PS", "1"),
+        ("PLOW_GLM_MLA_STRIDED_WV", "1"), ("PLOW_GLM_DSA", "1"),
+    ]);
+    let mut c = glm_ref_cfg(); c.tp = 8; c.indexer_full[3] = true;
+    for rows in [1, 8, 16, 31, 32, 64] {
+        let mut decl = Builder::new(256);
+        let n = declare_glm_rows_batched(&mut decl, &c, 8192, &[3], rows, rows, MoeEnc::Fp8Blk);
+        assert_eq!(decl.tensors()[n.olat as usize].bytes, rows as u64 * 16 * 512 * 2);
+        let mut b = Builder::new(256); b.adopt_tensors(decl.tensors()); let all = b.all();
+        emit_glm_block(&mut b, &c, &n, 0, 8192, rows, rows, MoeEnc::Fp8Blk,
+            n.x, n.xnext, &[], &mut 0, &all);
+        let p = b.finish();
+        let merge = p.insts.iter().position(|d| d.op == DevOp::FlashMerge as u16 && d.t[0] == n.olat).unwrap();
+        let stride = if rows < 32 { 1024 } else { 0 };
+        assert_eq!(p.insts[merge].i[4], stride);
+        assert_eq!(p.insts[merge + 1].op, DevOp::MlaBmmFp8 as u16);
+        assert_eq!(p.insts[merge + 1].i, [rows, 8, 256, 512, 0, stride, 0, 0]);
+    }
+}

@@ -18,6 +18,7 @@ use super::kv_layout::kv_tensor_name;
 use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::{HsaBackend, HsaKernel, HsaPinned};
 use crate::device::{DeviceMem, Module};
+use crate::exec::tensor_bindings::{TensorBinding, TensorBindings};
 use crate::exec::amd::packed::validate_rows as validate_amd_packed_rows;
 use crate::exec::device_api::EngineDevice;
 use crate::exec::kvrow::{
@@ -5966,10 +5967,13 @@ struct AmdGq {
 mod mixed_step;
 mod prefix;
 mod shared_prefix;
+mod selected_routes;
+pub use selected_routes::SelectedRouteManifest;
 mod token_batch;
 
 /// The AMD serving engine.
 pub struct AmdEngine {
+    selected_routes: SelectedRouteManifest,
     mixed_step: Option<mixed_step::MixedAmdStep>,
     /// The unified token-batch route. A SECOND instance of the same type on a different code
     /// object: `interp_tokbatch_gq.elf`, spans covering `[0, M)`, no decode prefix. Never
@@ -6202,6 +6206,7 @@ pub struct AmdEngine {
     /// Host mirror of the device tensor-pointer table, so a KV rebase is one
     /// edit + one upload instead of a read-modify-write off the device.
     tens_table: Vec<u8>,
+    tensor_bindings: TensorBindings,
     /// `(tensor index, per-sequence byte stride)` for every `kv.*` buffer.
     ///
     /// The cache is allocated `[batch][kv_head][ring][hd]` (`devgen`
@@ -6536,6 +6541,7 @@ impl AmdEngine {
         // OBJECT below, so a genuinely mismatched pairing is still refused, by inspection instead
         // of by assertion. PLOW_L2_PLACE_DISPATCH=1 still works for anyone scripting it.
         let mut blob = DevBlob::parse_l2(&raw, true)?;
+        crate::certificate_checks::check_packet(blob_path, &raw, &blob)?;
         // BEFORE anything reads the blob's geometry: `max_ctx`, the KV slot
         // stride, the VMM geometry and the prefill planner all derive from the
         // tensor table, so narrowing here is the whole change and none of them
@@ -9316,22 +9322,22 @@ impl AmdEngine {
                         base_mem.len
                     )));
                 }
-                devp.push(DeviceMem::view(base_mem.base + off, td.bytes.max(1)));
+                devp.push(base_mem.subview(off, td.bytes.max(1))?);
                 names.push(td.name.clone());
                 n_view += 1;
                 continue;
             }
-            let slab_base = match &weight_slab {
-                WeightSlab::Vmm(slab) => Some(slab.base()),
-                WeightSlab::Flat(slab) => Some(slab.base),
-                WeightSlab::PerTensor => None,
-            };
-            if let (Some(twin), Some(slab_base)) = (twins[i], slab_base) {
+            if let Some(twin) = twins[i].filter(|_| !matches!(weight_slab, WeightSlab::PerTensor)) {
                 let at = carve_at[twin].ok_or_else(|| {
                     RuntimeError::Device(format!("{}: its full twin is not carved from the slab", td.name))
                 })?;
                 let rank = u64::from(tp.map_or(0, |t| t.rank));
-                devp.push(DeviceMem::view(slab_base + at + rank * td.bytes, td.bytes.max(1)));
+                let off = at + rank * td.bytes;
+                devp.push(match &weight_slab {
+                    WeightSlab::Vmm(slab) => slab.view(off, td.bytes.max(1))?,
+                    WeightSlab::Flat(slab) => slab.subview(off, td.bytes.max(1))?,
+                    WeightSlab::PerTensor => unreachable!(),
+                });
                 names.push(td.name.clone());
                 n_view += 1;
                 continue;
@@ -9353,16 +9359,16 @@ impl AmdEngine {
                 // wait point covers them all. The mapper outruns the upload,
                 // so the wait is ~0 after the first chunk.
                 (None, WeightSlab::Vmm(slab)) => {
-                    let m = DeviceMem::view(slab.base() + slab_off, td.bytes.max(1));
+                    let off = slab_off;
                     slab_off += slab_carve(td.bytes);
                     slab.wait_mapped(slab_off)?;
-                    m
+                    slab.view(off, td.bytes.max(1))?
                 }
                 // Carve from the one allocation, in blob order. The sizing pass
                 // walked this same list with the same filter and the same
                 // `slab_carve`, so the cursor cannot run past the end.
                 (None, WeightSlab::Flat(slab)) => {
-                    let m = DeviceMem::view(slab.base + slab_off, td.bytes.max(1));
+                    let m = slab.subview(slab_off, td.bytes.max(1))?;
                     slab_off += slab_carve(td.bytes);
                     m
                 }
@@ -9677,12 +9683,13 @@ impl AmdEngine {
                 "NO CHECKPOINT — weights are uninitialised; timings are real, tokens are not"
             );
         }
-        let table: Vec<u8> = devp.iter().flat_map(|m| m.base.to_le_bytes()).collect();
+        let mut tensor_bindings = TensorBindings::new(devp.iter()
+            .map(TensorBinding::whole).collect::<Result<Vec<_>>>()?)?;
         if let Some(cache) = &mut shared_prefix {
             cache.bind(&devp.iter().map(|m| m.base).collect::<Vec<_>>());
         }
-        let d_tens = EngineDevice::alloc(&*be, table.len().max(1) as u64)?;
-        EngineDevice::upload(&*be, &d_tens, 0, &table)?;
+        let d_tens = EngineDevice::alloc(&*be, (devp.len() * 8).max(1) as u64)?;
+        let table = tensor_bindings.upload(|bytes| EngineDevice::upload(&*be, &d_tens, 0, bytes))?;
         let kda_key_factor_half =
             if k_kda_key_factor_wu.is_some() && k_kda_key_factor_carry.is_some() {
                 kda_key_factor_scratch_half_bytes(blob.prefill_phase())?
@@ -10864,7 +10871,10 @@ impl AmdEngine {
                 token_batch_refusal.as_deref(),
             );
         }
-        let engine = AmdEngine {
+        let mut engine = AmdEngine {
+            selected_routes: SelectedRouteManifest::new(
+                plow_asset::decode_objects::image_sha256(&raw), tp.map_or(0, |tp| tp.rank),
+            ),
             mixed_step,
             token_batch_step,
             be,
@@ -10980,6 +10990,7 @@ impl AmdEngine {
             weights_bound: ckpt.is_some(),
             batch,
             tens_table: table,
+            tensor_bindings,
             kv_slot_stride,
             kv_slot: 0,
             band_rows_bound: std::collections::HashMap::new(),
@@ -11002,6 +11013,7 @@ impl AmdEngine {
             seg_launches: 0,
             seg_window: crate::config::RuntimeConfig::get().amd.seg_window,
         };
+        engine.selected_routes = engine.capture_selected_routes();
         engine.report_packed_prefill_route(hsaco_dir);
         Ok(engine)
     }
@@ -11984,6 +11996,14 @@ impl AmdEngine {
     /// captured its own copy. An L2-placed program launches each ordered host
     /// segment once; all per-XCD queues for that segment drain concurrently.
     pub fn enqueue_segment(&mut self, p: usize, seg: usize) -> Result<()> {
+        if self.segment_needs_prepare(p, seg)? {
+            self.be.synchronize()?;
+            self.prepare_segment_quiescent(p, seg)?;
+        }
+        self.enqueue_segment_prepared(p, seg)
+    }
+
+    pub(crate) fn enqueue_segment_prepared(&mut self, p: usize, seg: usize) -> Result<()> {
         check_packed_prefill_dispatch(self.packed_prefill, p)?;
         self.trace_write_bytes
             .set(self.progs[p].trace_records * TRACE_REC_BYTES);
@@ -12150,8 +12170,7 @@ impl AmdEngine {
                 let sparse = self.sparse_mla.as_ref().ok_or_else(|| {
                     RuntimeError::Device("sparse MLA route has no loaded kernels".into())
                 })?;
-                sparse.enqueue(&self.be, route, &self.tens_table, self.tp.map_or(0, |t| t.rank))?;
-                self.seg_launches += route.active_launches() as u64;
+                self.seg_launches += sparse.enqueue(&self.be, route, &self.tens_table, self.tp.map_or(0, |t| t.rank))? as u64;
                 return Ok(());
             }
             if route.split_row0 != 0 {
@@ -12603,7 +12622,7 @@ impl AmdEngine {
     fn decode_segment_launches(&self, p: usize, seg: usize) -> usize {
         match self.progs[p].decode_routes.get(seg) {
             Some(DecodeSegmentRoute::IndexFp8(_)) => 2,
-            Some(DecodeSegmentRoute::MlaBf16(route)) => route.dispatch_count(),
+            Some(DecodeSegmentRoute::MlaBf16(route)) => route.launches(),
             Some(DecodeSegmentRoute::SparseMlaDecode(route)) if route.active => 3,
             Some(DecodeSegmentRoute::MoeAiter(route)) => route.launches() as usize,
             Some(DecodeSegmentRoute::GroupedMoeMxfp4 { .. }) => 2,
@@ -12612,7 +12631,7 @@ impl AmdEngine {
         }
     }
 
-    pub(crate) fn begin_decode_replay(&self, p: usize) -> Result<()> {
+    pub(crate) fn preflight_decode_replay(&self, p: usize) -> Result<crate::device::kernarg_retirement::Admission> {
         if self.index_fp8.is_some() {
             // Refuse an unqualified domain before reserving otherwise unfillable AQL slots.
             for route in &self.progs[p].decode_routes {
@@ -12624,7 +12643,20 @@ impl AmdEngine {
         let packets = (0..self.decode_launches(p))
             .map(|seg| self.decode_segment_launches(p, seg))
             .sum();
-        self.be.begin_dispatch_chain(packets)
+        self.be.preflight_dispatch_chain(packets)
+    }
+
+    pub(crate) fn begin_decode_replay_admitted(&self, ticket: crate::device::kernarg_retirement::Admission) -> Result<()> {
+        if let Some(kernel) = &self.mla_bf16 { kernel.reset_metadata(); }
+        self.be.begin_dispatch_chain_admitted(ticket)
+    }
+
+    pub(crate) fn abort_replay(&self) {
+        self.be.abort_dispatch_replay();
+    }
+
+    pub(crate) fn preflight_replay_commit(&self) -> Result<()> {
+        self.be.preflight_dispatch_chain_commit()
     }
 
     pub(crate) fn commit_decode_replay(&self) -> Result<()> {
@@ -12639,6 +12671,11 @@ impl AmdEngine {
     }
 
     pub(crate) fn begin_graph_phase_replay(&self, p: usize) -> Result<()> {
+        let ticket = self.preflight_graph_phase_replay(p)?;
+        self.begin_graph_phase_replay_admitted(ticket)
+    }
+
+    pub(crate) fn preflight_graph_phase_replay(&self, p: usize) -> Result<crate::device::kernarg_retirement::Admission> {
         if !self.graph_phase_replay(p) {
             return Err(RuntimeError::Device(format!(
                 "program {p} has no graph-derived phase-object route"
@@ -12652,7 +12689,11 @@ impl AmdEngine {
         let packets = (0..self.prog_dispatch(p).launches())
             .map(|seg| self.prefill_segment_launches(p, seg))
             .sum();
-        self.be.begin_dispatch_chain(packets)
+        self.be.preflight_dispatch_chain(packets)
+    }
+
+    pub(crate) fn begin_graph_phase_replay_admitted(&self, ticket: crate::device::kernarg_retirement::Admission) -> Result<()> {
+        self.be.begin_dispatch_chain_admitted(ticket)
     }
 
     /// An `IndexUnionPf` segment whose only reader is a sparse flash on its active native route.
@@ -12670,7 +12711,7 @@ impl AmdEngine {
     /// multi-launch route branches in `enqueue_segment`; the commit check refuses
     /// a chain whose emission disagrees, so a drift fails closed rather than
     /// overrunning the queue.
-    fn prefill_segment_launches(&self, p: usize, seg: usize) -> usize {
+    pub(crate) fn prefill_segment_launches(&self, p: usize, seg: usize) -> usize {
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
             return 1;
@@ -12695,11 +12736,14 @@ impl AmdEngine {
             };
         }
         match self.progs[p].prefill_routes.get(seg) {
-            Some(PrefillSegmentRoute::SparseMla(route)) if route.active => route.active_launches(),
+            Some(PrefillSegmentRoute::SparseMla(route)) if route.active => self.sparse_mla
+                .as_ref().map_or(1, |s| s.active_launches(*route)),
             Some(PrefillSegmentRoute::SparseMla(route)) if route.native_lo => self
                 .sparse_mla
                 .as_ref()
                 .map_or(1, |s| s.native_lo_launches(*route)),
+            Some(PrefillSegmentRoute::SparseMla(route)) if route.split_row0 != 0 => self
+                .sparse_mla.as_ref().map_or(1, |s| s.split_launches(*route)),
             Some(PrefillSegmentRoute::GemmLt(_)) => 1,
             Some(PrefillSegmentRoute::Gemma4Glu(_)) => 1,
             Some(PrefillSegmentRoute::GemmBlk(route)) => route.launches(),
@@ -12719,6 +12763,55 @@ impl AmdEngine {
 
     pub(crate) fn commit_graph_phase_replay(&self) -> Result<()> {
         self.be.commit_dispatch_chain()
+    }
+
+    pub(crate) fn preflight_segment_batch(&self, p: usize, seg: usize) -> Result<crate::device::kernarg_retirement::Admission> {
+        check_packed_prefill_dispatch(self.packed_prefill, p)?;
+        if seg >= self.prog_dispatch(p).launches() {
+            return Err(RuntimeError::Rejected("prefill segment outside program".into()));
+        }
+        self.be.preflight_dispatch_chain(self.prefill_segment_launches(p, seg))
+    }
+
+    fn segment_csr_route(&self, p: usize, seg: usize) -> Option<amd_sparse_mla::Route> {
+        if !prefill_segment_specialization_allowed(self.prog_dispatch(p))
+            || self.packed_prefill.is_some_and(|b| b.prog == p) || self.union_unread(p, seg) {
+            return None;
+        }
+        match self.progs[p].prefill_routes.get(seg).copied() {
+            Some(PrefillSegmentRoute::SparseMla(route)) => Some(route),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn segment_needs_prepare(&self, p: usize, seg: usize) -> Result<bool> {
+        match self.segment_csr_route(p, seg) {
+            Some(route) => self.sparse_mla.as_ref()
+                .ok_or_else(|| RuntimeError::Rejected("sparse MLA route has no loaded kernels".into()))?
+                .needs_prepare(route, self.tp.map_or(0, |t| t.rank)),
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) fn prepare_segment_quiescent(&self, p: usize, seg: usize) -> Result<()> {
+        if let Some(route) = self.segment_csr_route(p, seg) {
+            self.sparse_mla.as_ref()
+                .ok_or_else(|| RuntimeError::Rejected("sparse MLA route has no loaded kernels".into()))?
+                .prepare_quiescent(&self.be, route, self.tp.map_or(0, |t| t.rank))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replay_without_prepare(&self, p: usize) -> Result<bool> {
+        if crate::config::RuntimeConfig::get().amd.native_launch_timing { return Ok(false); }
+        for seg in 0..self.prog_dispatch(p).launches() {
+            if self.segment_needs_prepare(p, seg)? { return Ok(false); }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn begin_segment_batch(&self, ticket: crate::device::kernarg_retirement::Admission) -> Result<()> {
+        self.be.begin_dispatch_batch_admitted(ticket)
     }
 
     /// Enqueue one ordered decode segment without rearming or draining.
@@ -12748,7 +12841,7 @@ impl AmdEngine {
                     RuntimeError::Device("BF16 MLA route has no loaded kernels".into())
                 })?;
                 kernel.enqueue(&self.be, route, &self.tens_table)?;
-                self.seg_launches += (route.dispatch_count() - 1) as u64;
+                self.seg_launches += route.launches() as u64 - 1;
             }
             DecodeSegmentRoute::SparseMlaDecode(route) if route.active => {
                 let kernel = self.sparse_mla_decode.as_ref().ok_or_else(|| {
@@ -13009,7 +13102,7 @@ impl AmdEngine {
         self.rearm(p)?;
         let n_seg = self.prog_dispatch(p).launches();
         let t0 = std::time::Instant::now();
-        let replay = self.graph_phase_replay(p);
+        let replay = self.graph_phase_replay(p) && self.replay_without_prepare(p)?;
         if replay {
             self.begin_graph_phase_replay(p)?;
         }
@@ -13198,12 +13291,18 @@ impl AmdEngine {
         if self.sparse_mla_decode.is_none() && self.mla_bf16.is_none() {
             return;
         }
+        if let Some(kernel) = &self.mla_bf16 {
+            kernel.reset_metadata();
+        }
+        let hoist = crate::config::RuntimeConfig::get().amd.mla_bf16_metadata_hoist;
         for prog in &mut self.progs {
+            let mut previous_metadata = None;
             for route in &mut prog.decode_routes {
                 if let DecodeSegmentRoute::SparseMlaDecode(route) = route {
                     route.arm(kvlen);
                 } else if let DecodeSegmentRoute::MlaBf16(route) = route {
                     route.arm(kvlen);
+                    route.plan_metadata(&mut previous_metadata, hoist);
                 }
             }
         }
@@ -13595,10 +13694,9 @@ impl AmdEngine {
         if views.is_empty() {
             return Ok(());
         }
-        for (i, addr) in views {
-            self.tens_table[i * 8..i * 8 + 8].copy_from_slice(&addr.to_le_bytes());
-        }
-        EngineDevice::upload(&*self.be, &self.d_tens, 0, &self.tens_table)?;
+        let updates = crate::exec::tensor_bindings::band_bindings(&self.devp, &self.tensor_names, &views)?;
+        self.tens_table = self.tensor_bindings.rebind(updates,
+            |bytes| EngineDevice::upload(&*self.be, &self.d_tens, 0, bytes))?;
         self.band_rows_bound.insert(t, b);
         Ok(())
     }
@@ -14013,14 +14111,12 @@ impl AmdEngine {
                 self.batch
             )));
         }
-        for &(i, stride) in &self.kv_slot_stride {
-            let base = self.devp[i].base + stride * slot as u64;
-            self.tens_table[i * 8..i * 8 + 8].copy_from_slice(&base.to_le_bytes());
-        }
+        let updates = crate::exec::tensor_bindings::slot_bindings(&self.devp, &self.kv_slot_stride, slot)?;
         // One upload of the whole table (a few KiB) beats one per KV buffer:
         // there are 2-4 per layer and the submission, not the bytes, is the
         // cost. This is off the per-token path — it happens once per prefill.
-        EngineDevice::upload(&*self.be, &self.d_tens, 0, &self.tens_table)?;
+        self.tens_table = self.tensor_bindings.rebind(updates,
+            |bytes| EngineDevice::upload(&*self.be, &self.d_tens, 0, bytes))?;
         self.kv_slot = slot;
         if tracing::enabled!(tracing::Level::DEBUG) {
             let (i, stride) = self.kv_slot_stride[0];

@@ -72,14 +72,29 @@ def sha(path: Path) -> str:
     return h.hexdigest()
 
 
+def execution_artifacts(runtime: Path, assets: Path, recipe: Path, env: dict) -> dict:
+    """Observed files/configuration, not a claim of complete kernel/precision identity."""
+    objects = assets.parent / "objects"
+    env_bytes = json.dumps({key: value for key, value in sorted(env.items()) if key.startswith("PLOW_")},
+                          sort_keys=True, separators=(",", ":")).encode()
+    return {"runtime_sha256": sha(runtime), "recipe_sha256": sha(recipe),
+            "runtime_environment_sha256": hashlib.sha256(env_bytes).hexdigest(),
+            "serve_args_sha256": hashlib.sha256(env.get("SERVE_EXTRA_ARGS", "").encode()).hexdigest(),
+            "assets": {p.name: sha(p) for p in sorted(assets.iterdir()) if p.is_file()
+                       and p.suffix in (".pkt", ".cubin", ".elf", ".co", ".json", ".h")},
+            "objects": {p.name: sha(p) for p in sorted(objects.iterdir()) if p.is_file()
+                        and p.suffix in (".cubin", ".elf", ".co")} if objects.is_dir() else {}}
+
+
 def cmd_block_roofline(a: argparse.Namespace) -> None:
-    from packet_roofline import analyze
+    from packet_roofline import analyze, trace_priorities
 
     with open(a.recipe, "rb") as f:
         recipe = tomllib.load(f)
     roof = recipe["roofline"]
     runtime = Path(a.plowrt).resolve()
     packet = Path(a.packet).resolve()
+    before = (sha(packet), sha(runtime))
     command = [str(runtime), "disasm", str(packet), "--program", str(a.program)]
     result = subprocess.run(command, capture_output=True, text=True, cwd=REPO)
     if result.returncode:
@@ -89,8 +104,31 @@ def cmd_block_roofline(a: argparse.Namespace) -> None:
                      router.read_bytes() if router else None, fp8_tflops=roof.get("fp8_tflops"))
     if router:
         record.update(router_table=str(router), router_table_sha256=sha(router))
+    trace = getattr(a, "trace", None)
+    if trace:
+        if not getattr(a, "trace_clock_hz", None) or not getattr(a, "trace_run_record", None):
+            die("trace priorities require --trace-clock-hz and --trace-run-record")
+        provenance_path = Path(a.trace_run_record)
+        provenance_raw = provenance_path.read_bytes()
+        provenance = json.loads(provenance_raw)
+        if (provenance.get("packet_sha256"), provenance.get("runtime_sha256")) != before:
+            die("trace run record differs from packet/runtime being analyzed")
+        graph = subprocess.run(command + ["--format", "json", "--counters"],
+                               capture_output=True, text=True, cwd=REPO)
+        if graph.returncode:
+            die(graph.stderr or graph.stdout)
+        document = json.loads(graph.stdout[graph.stdout.index("{"):])
+        if len(document["programs"]) != 1:
+            die("trace priorities require exactly one program")
+        record["trace_priorities"] = trace_priorities(Path(trace).read_bytes(),
+            document["programs"][0], a.trace_clock_hz)
+        record["trace_run_record_sha256"] = hashlib.sha256(provenance_raw).hexdigest()
+        record["trace_run_record"] = provenance
+        record["trace_provenance_note"] = "Supplied run record and trace integrity, not authenticated capture provenance"
+    if before != (sha(packet), sha(runtime)):
+        die("packet/runtime changed during roofline analysis")
     record.update(recipe=str(Path(a.recipe).resolve()), recipe_sha256=sha(Path(a.recipe)),
-                  packet=str(packet), packet_sha256=sha(packet), runtime_sha256=sha(runtime),
+                  packet=str(packet), packet_sha256=before[0], runtime_sha256=before[1],
                   commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain")))
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=False)
@@ -233,6 +271,8 @@ def git(*args: str) -> str:
 
 
 def cmd_serve_bench(a: argparse.Namespace) -> None:
+    from client_latency import export_identity
+
     r = load(a.recipe)
     cell, bench = r["cell"], r["bench"]
     raw = Path(cell["hf_dir"]).resolve()
@@ -249,6 +289,7 @@ def cmd_serve_bench(a: argparse.Namespace) -> None:
     shutil.copy2(a.plowrt, out / "plowrt")
     for name in ("plowbench.sh", "vllm029-client.sh"):
         shutil.copy2(REPO / "scripts/bench" / name, out / name)
+    shutil.copy2(REPO / "scripts/campaign/client_latency.py", out / "client_latency.py")
     quality_lens = getattr(a, "quality_lens", None)
     if quality_lens:
         if any(int(n) < 1 or int(n) + 32 > cell["max_ctx"] for n in quality_lens.split(",")):
@@ -325,12 +366,16 @@ def cmd_serve_bench(a: argparse.Namespace) -> None:
                 str(concurrency), str(prompts), str(context), str(output_len),
                 "--backend", "openai", "--endpoint", "/v1/completions", "--num-warmups",
                 str(bench.get("warmups", 2)), "--temperature", "0", "--percentile-metrics", "ttft,tpot,itl,e2el",
+                *(["--plow-exact-latencies"] if bench.get("exact_request_latencies") is True else []),
             ]), "result=$(pb_result " + shlex.join([str(out / "client"), tag]) + ")",
                 f'pb_validate_result "$result" {prompts} {output_len}']
     wrapper = out / "run.sh"
     wrapper.write_text("\n".join(lines) + "\n")
     subprocess.run(["bash", "-n", str(wrapper)], check=True)
     record = dict(server=a.server, recipe_sha256=sha(Path(a.recipe)), cell=cell,
+                  exact_request_latencies=bench.get("exact_request_latencies") is True,
+                  expected_client_identity=export_identity() if bench.get("exact_request_latencies") is True else None,
+                  client_exporter_sha256=sha(out / "client_latency.py"),
                   image=image, env=env, reference_env=reference_env, contexts=in_lens, concurrencies=concs, prompts=prompts,
                   output_len=output_len, raw_index_sha256=sha(raw / "model.safetensors.index.json"),
                   runtime_sha256=sha(out / "plowrt"), packet_sha256=sha(out / "assets/model.pkt"),
@@ -570,7 +615,9 @@ def cmd_bench(a: argparse.Namespace) -> None:
     cmd = [str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label, str(wrapper)]
     log = out / "run.log"
     log.write_bytes(b"")
+    before = execution_artifacts(private, assets, Path(a.recipe), env)
     rc = run(cmd, dict(os.environ), log)
+    after = execution_artifacts(private, assets, Path(a.recipe), env)
     text = log.read_text(errors="replace")
     peak = {}
     for ln in text.splitlines():
@@ -603,6 +650,8 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and p.suffix in (".pkt", ".cubin", ".elf", ".co")},
         "rows": len(rows),
         "bench_rc": rc,
+        "execution_artifacts": before,
+        "execution_artifacts_unchanged": before == after,
     }
     (out / "run-record.json").write_text(json.dumps(rec, indent=1))
     print(f"{CSV_HEADER},{MEM_COL}")
@@ -741,14 +790,16 @@ def cmd_probe(a: argparse.Namespace) -> None:
 # ---------------------------------------------------------------- cert
 def _samples(run_dir: Path) -> dict:
     """Per-request samples per (input_len, concurrency, metric) from a bench run's client JSONs."""
+    from evidence import samples
+
     out = {}
     for f in sorted((run_dir / "client").glob("in*_c*.json")):
         d = json.loads(f.read_text())
-        key = (int(d["input_lens"][0]), int(d["max_concurrency"] or 1))
-        ttft = [x * 1e3 for x in d["ttfts"]]
-        tpot = [sum(i) / len(i) * 1e3 for i in d["itls"] if i]
-        out[(*key, "ttft_ms")] = ttft
-        out[(*key, "tpot_ms")] = tpot
+        key, metrics = samples(d)
+        for metric, values in metrics.items():
+            if (*key, metric) in out:
+                raise ValueError("duplicate client cell")
+            out[(*key, metric)] = values
     return out
 
 
@@ -766,19 +817,29 @@ def cmd_cert(a: argparse.Namespace) -> None:
     treat2): the ledger entries are the runs' per-request samples, the request names every cell
     as a touched serving rung, and `scripts/perf_cert.py make` runs the verifier."""
     runs = {arm: Path(getattr(a, arm)).resolve() for arm in ("ctrl", "ctrl2", "treat", "treat2")}
+    from evidence import capture, validate
+    try:
+        evidence = capture(runs)
+    except (ValueError, OSError) as error:
+        die(str(error))
     recs = {arm: json.loads((p / "run-record.json").read_text()) for arm, p in runs.items()}
     samples = {arm: _samples(p) for arm, p in runs.items()}
-    cells = sorted(set.intersection(*(set(s) for s in samples.values())))
+    cells = sorted(set.union(*(set(s) for s in samples.values())))
     if not cells:
         die("the four runs share no (input_len, concurrency, metric) cell")
+    if any(set(s) != set(cells) for s in samples.values()):
+        die("four-arm sample cell coverage differs")
     delta = dict(kv.split("=", 1) for kv in (a.knob_delta or []))
     gpu = recs["treat"].get("gpu", {})
     hardware = {"box": f"1x{gpu.get('name', 'GPU')}", "driver": gpu.get("driver_version"), "firmware": None, "cuda": None}
     work = Path(a.out).resolve()
     work.mkdir(parents=True, exist_ok=True)
     ledger, touched, serving = [], [], []
+    outlen = recs["treat"].get("protocol", {}).get("OUTLEN")
+    if not str(outlen).isdigit() or int(outlen) <= 1:
+        die("missing output-length protocol for TPOT certification")
     for (L, C, metric) in cells:
-        rung = {"digest": f"{a.cell}/serve/in{L}-c{C}-out128", "prior": 0, "role": "serve", "rows": L, "topology": f"C{C}"}
+        rung = {"digest": f"{a.cell}/serve/in{L}-c{C}-out{outlen}", "prior": 0, "role": "serve", "rows": L, "topology": f"C{C}"}
         ids = {arm: f"{a.job}:in{L}-c{C}:{metric}:{arm}" for arm in runs}
         for arm in ("ctrl", "ctrl2", "treat", "treat2"):
             xs = samples[arm][(L, C, metric)]
@@ -786,13 +847,21 @@ def cmd_cert(a: argparse.Namespace) -> None:
                 "id": ids[arm], "job": a.job, "metric": metric, "better": "lower",
                 "rung": rung, "samples": xs, "stats": _stats(xs),
                 "knob_delta": delta if arm.startswith("treat") else {},
-                "recipe_digest": recs[arm]["hashes"].get("model.pkt", "")[:16],
+                "recipe_digest": recs[arm]["hashes"].get("model.pkt", ""),
                 "hardware": hardware, "harness": "campaign-bench",
                 "date": recs[arm]["utc"][:10],
             }
+            client = next((item for item in evidence["arms"][arm]["clients"]
+                           if json.loads(item["text"])["input_lens"][0] == L
+                           and json.loads(item["text"])["max_concurrency"] == C), None)
+            if client is None:
+                die("missing raw client artifact")
+            e["sample_source"] = {"arm": arm, "input_len": L, "concurrency": C,
+                                  "client_sha256": client["sha256"]}
             if arm.startswith("treat"):
                 e["control_of"] = ids["ctrl"]
                 e["repeat_control_of"] = ids["ctrl2"]
+                e["repeat_treatment_of"] = ids["treat2" if arm == "treat" else "treat"]
             ledger.append(e)
         t = {"rung": rung["digest"], "treat": ids["treat"]}
         # `--neutral tpot_ms` (every rung) or `--neutral ttft_ms@in128` (one input length).
@@ -814,11 +883,17 @@ def cmd_cert(a: argparse.Namespace) -> None:
                    "evidence": "coherence gate PASS on ctrl, ctrl2, treat, treat2 (run-record.json of each)"}]
                  + [{"kind": "note", "pass": True, "evidence": f} for f in (a.fact or [])],
     }
+    try:
+        validate(evidence, {**request, "ledger": ledger})
+    except (ValueError, KeyError, TypeError) as error:
+        die(f"invalid campaign evidence: {error}")
+    (work / "evidence.json").write_text(json.dumps(evidence, indent=1))
     (work / "ledger.jsonl").write_text("".join(json.dumps(e) + "\n" for e in ledger))
     (work / "request.json").write_text(json.dumps(request, indent=1))
     cert = REPO / "perf-certs" / f"{a.knob}.json"
     cmd = ["python3", str(REPO / "scripts" / "perf_cert.py"), "make", "--knob", a.knob,
-           "--request", str(work / "request.json"), "--ledger", str(work / "ledger.jsonl"), "--out", str(cert)]
+           "--request", str(work / "request.json"), "--ledger", str(work / "ledger.jsonl"),
+           "--evidence", str(work / "evidence.json"), "--out", str(cert)]
     print("  $", " ".join(shlex.quote(c) for c in cmd), file=sys.stderr)
     rc = subprocess.run(cmd, cwd=REPO).returncode
     print(f"cert: ledger {len(ledger)} entries, {len(touched)} touched rungs -> {cert} (rc={rc})", file=sys.stderr)
@@ -1069,6 +1144,9 @@ def main() -> None:
     br.add_argument("--ctx", type=int, required=True); br.add_argument("--out", required=True)
     br.add_argument("--plowrt", default=str(REPO / "target/release/plowrt"))
     br.add_argument("--router-table", help="captured rank act.tab.bin; uses actual selected-expert union")
+    br.add_argument("--trace", help="complete single-invocation device trace; diagnostic priorities only")
+    br.add_argument("--trace-clock-hz", type=float, help="explicit calibrated trace clock, not shader clock")
+    br.add_argument("--trace-run-record", help="matching block run-record.json with packet/runtime identities")
     br.set_defaults(f=cmd_block_roofline)
     bb = sp.add_parser("block-bench", help="freeze, preflight and queue a numerically gated modular block")
     bb.add_argument("recipe"); bb.add_argument("--packet", required=True); bb.add_argument("--objects", required=True)

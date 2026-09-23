@@ -2,11 +2,12 @@
 # Plow.Knobs.Ledger — checkpoint P, the performance certificate for a default flip.
 
 A ledger entry is one arm's measurement of one rung: a metric, which direction is better, and its
-samples (or, for older harnesses, only `n`, `median` and `mad`). A treatment names its control and
-its repeated control; both ran in the same job on the same hardware.
+samples (or `n`, `median` and `mad`). Each treatment names its control, repeated control and
+reciprocal repeated treatment; all four ran in the same job on the same hardware.
 
-The floor is `|median(ctrl) − median(ctrl2)| + 2·max(mad)`, exact over the rationals. A rung whose
-floor cannot be computed — no repeated control, a missing MAD, fewer than three samples, arms from
+The floor is `max(control drift, treatment spread) + 2·max(mad)`, exact over the rationals.
+Treatment spread above three times control drift requires a rerun. A rung whose
+floor cannot be computed — a missing arm or MAD, fewer than thirty samples, arms from
 different jobs or hardware — is `insufficient`, and an insufficient rung blocks the flip exactly as a
 rejected one does.
 
@@ -82,6 +83,7 @@ structure Entry where
   stats : Option Stats
   controlOf : Option String
   repeatControlOf : Option String
+  repeatTreatmentOf : Option String
   deriving Repr, Inhabited
 
 def insertSorted (x : Q) : List Q → List Q
@@ -110,26 +112,39 @@ def statsOf (e : Entry) : Option Stats :=
   if e.samples.isEmpty then e.stats
   else (medianOf e.samples).map fun m => ⟨e.samples.length, m, madOf e.samples⟩
 
-def minSamples : Nat := 3
+def minSamples : Nat := 30
 def k : Nat := 2
 
-/-- The noise floor of a treatment against its two controls, or why it cannot be computed. -/
-def floorOf (c c2 t : Entry) : Except String (Q × Q × Q) := do
-  unless c.job = c2.job ∧ c.job = t.job do
-    throw s!"arms ran in different jobs ({c.job}, {c2.job}, {t.job})"
-  unless c.hardware = c2.hardware ∧ c.hardware = t.hardware do
+/-- Four-arm noise floor, or why the run cannot qualify. -/
+def floorOf (c c2 t t2 : Entry) : Except String (Q × Q × Q) := do
+  unless c.id ≠ c2.id ∧ c.id ≠ t.id ∧ c.id ≠ t2.id ∧
+      c2.id ≠ t.id ∧ c2.id ≠ t2.id ∧ t.id ≠ t2.id do
+    throw "four distinct arm identities are required"
+  unless c.job ≠ "" ∧ c.job = c2.job ∧ c.job = t.job ∧ c.job = t2.job do
+    throw "arms ran in different or unspecified jobs"
+  unless c.hardware = c2.hardware ∧ c.hardware = t.hardware ∧ c.hardware = t2.hardware do
     throw "arms ran on different hardware"
-  unless c.rung = t.rung ∧ c2.rung = t.rung ∧ c.metric = t.metric ∧ c2.metric = t.metric do
+  unless c.rung = t.rung ∧ c2.rung = t.rung ∧ t2.rung = t.rung ∧
+      c.metric = t.metric ∧ c2.metric = t.metric ∧ t2.metric = t.metric ∧
+      c.better = t.better ∧ c2.better = t.better ∧ t2.better = t.better do
     throw "arms measured different rungs or metrics"
   let some sc := statsOf c | throw s!"{c.id}: no median"
   let some sc2 := statsOf c2 | throw s!"{c2.id}: no median"
   let some st := statsOf t | throw s!"{t.id}: no median"
-  unless minSamples ≤ sc.n ∧ minSamples ≤ sc2.n ∧ minSamples ≤ st.n do
-    throw s!"fewer than {minSamples} samples in an arm (n = {sc.n}, {sc2.n}, {st.n})"
-  let (some m1, some m2, some m3) := (sc.mad, sc2.mad, st.mad)
+  let some st2 := statsOf t2 | throw s!"{t2.id}: no median"
+  unless minSamples ≤ sc.n ∧ minSamples ≤ sc2.n ∧ minSamples ≤ st.n ∧ minSamples ≤ st2.n do
+    throw s!"fewer than {minSamples} samples in an arm"
+  let (some m1, some m2, some m3, some m4) := (sc.mad, sc2.mad, st.mad, st2.mad)
     | throw "an arm records no MAD"
-  let floor := Q.add (Q.abs (Q.sub sc.median sc2.median)) (Q.mulNat (Q.max m1 (Q.max m2 m3)) k)
-  pure (floor, Q.half (Q.add sc.median sc2.median), st.median)
+  unless [m1, m2, m3, m4].all (Q.le (Q.ofNat 0)) do
+    throw "negative MAD is invalid"
+  let drift := Q.abs (Q.sub sc.median sc2.median)
+  let treatmentSpread := Q.abs (Q.sub st.median st2.median)
+  if Q.lt (Q.mulNat drift 3) treatmentSpread then
+    throw "treatment spread exceeds three times control drift; rerun required"
+  let spread := Q.max drift treatmentSpread
+  let floor := Q.add spread (Q.mulNat (Q.max (Q.max m1 m2) (Q.max m3 m4)) k)
+  pure (floor, Q.half (Q.add sc.median sc2.median), Q.half (Q.add st.median st2.median))
 
 /-- Treatment beats the control mean by more than the floor, in the better direction. -/
 def improves (b : Better) (floor ctrl treat : Q) : Bool :=
@@ -192,7 +207,12 @@ def armsOf (l : List Entry) (treat : String) : Except String (Entry × Q × Q ×
   let some c := lookup l cid | throw s!"no ledger entry {cid}"
   let some c2id := t.repeatControlOf | throw s!"{treat} names no repeated control"
   let some c2 := lookup l c2id | throw s!"no ledger entry {c2id}"
-  let (floor, ctrl, tr) ← floorOf c c2 t
+  let some t2id := t.repeatTreatmentOf | throw s!"{treat} names no repeated treatment"
+  let some t2 := lookup l t2id | throw s!"no ledger entry {t2id}"
+  unless t2.controlOf = t.controlOf ∧ t2.repeatControlOf = t.repeatControlOf ∧
+      t2.repeatTreatmentOf = some t.id do
+    throw "repeated treatment does not name the same controls and reciprocal treatment"
+  let (floor, ctrl, tr) ← floorOf c c2 t t2
   pure (t, floor, ctrl, tr)
 
 def rungVerdict (l : List Entry) (x : Touched) : Verdict :=
@@ -230,9 +250,20 @@ def tier4Verdict (r : Req) : Verdict :=
   else if r.serving.isEmpty then .insufficient "tier 4 is required and no serving measurement is named"
   else .accept "tier 4 measured"
 
+def evidenceVerdict (r : Req) : Verdict :=
+  if r.touched.isEmpty && r.serving.isEmpty then
+    .insufficient "no measured touched or serving rung"
+  else if (r.ledger.map (·.id)).eraseDups.length ≠ r.ledger.length then
+    .reject "duplicate ledger arm identity"
+  else if r.facts.any (fun f => !f.pass || f.evidence.isEmpty) then
+    .reject "a correctness/artifact fact failed or has no evidence"
+  else if !r.facts.any (fun f => f.kind == "gate" && f.pass && !f.evidence.isEmpty) then
+    .insufficient "no passing correctness/artifact gate"
+  else .accept "nonempty measurement scope and passing gate"
+
 def verdicts (r : Req) : List Verdict :=
   r.untouched.map untouchedVerdict ++ r.touched.map (rungVerdict r.ledger) ++
-  r.serving.map (servingVerdict r.ledger) ++ [tier4Verdict r, factsVerdict r]
+  r.serving.map (servingVerdict r.ledger) ++ [tier4Verdict r, factsVerdict r, evidenceVerdict r]
 
 def checkP (r : Req) : Bool := (verdicts r).all Verdict.isAccept
 
@@ -397,7 +428,8 @@ def parseEntry (j : Json) : Except String Entry := do
   pure { id, job := ← strOf "job" (← field j "job"),
          hardware := hw.compress, rung := ← strOf "rung.digest" (← field rung "digest"),
          metric := ← strOf "metric" (← field j "metric"), better, samples, stats,
-         controlOf := optStr j "control_of", repeatControlOf := optStr j "repeat_control_of" }
+         controlOf := optStr j "control_of", repeatControlOf := optStr j "repeat_control_of",
+         repeatTreatmentOf := optStr j "repeat_treatment_of" }
 
 def parseReq (j : Json) : Except String Req := do
   let ledger ← (← arrOf "ledger" (← field j "ledger")).mapM parseEntry

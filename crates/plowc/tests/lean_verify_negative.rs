@@ -50,7 +50,7 @@ fn build_a_real_request() -> (ScheduleRequest, String) {
     let (tile_g, cons) =
         assemble(&soc, &plan, costmodel::SramPolicy::Stream, None).expect("assemble");
     let sched = schedule::schedule(&soc, &tile_g, &cons, &schedule::Config::default());
-    let req = request_for_bucket(&sched.tasks, &sched.schedule, &cons);
+    let req = request_for_bucket(&sched.tasks, &sched.schedule, &cons).expect("complete source schedule");
 
     // Sanity: the untouched request should be accepted (happy path).
     let cert = check_schedule(&req).expect("call verifier");

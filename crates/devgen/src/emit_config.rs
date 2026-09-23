@@ -476,6 +476,8 @@ pub struct EmitConfig {
     pub glm_mla_bf16_ps: bool,
     #[arg(long, env = "PLOW_GLM_ROPE_BF16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_rope_bf16: bool,
+    #[arg(long, env = "PLOW_GLM_MLA_STRIDED_WV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_mla_strided_wv: bool,
 
     /// Native block-scaled W8A8 shared expert; requires GLM_LINEAR_FP8.
     #[arg(long, env = "PLOW_GLM_SHARED_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1385,6 +1387,7 @@ impl EmitConfig {
             glm_indexer_fp8: env_bool("PLOW_GLM_INDEXER_FP8"),
             glm_mla_bf16_ps: env_bool("PLOW_GLM_MLA_BF16_PS"),
             glm_rope_bf16: env_bool("PLOW_GLM_ROPE_BF16"),
+            glm_mla_strided_wv: env_bool("PLOW_GLM_MLA_STRIDED_WV"),
             glm_shared_w8a8: env_bool("PLOW_GLM_SHARED_W8A8"),
             glm_routed_w8a8: env_bool("PLOW_GLM_ROUTED_W8A8"),
             glm_shared_glu_split: env_bool("GLM_SHARED_GLU_SPLIT"),

@@ -175,7 +175,7 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeGluFp8Block128, t: &["fu", "xq", "xscale", "wtab", "stab", "meta", "row_token"], i: &["I", "H", "E", "T"], f: &[], j: &[] },
     S { op: DevOp::MoeQuantFp8Block128, t: &["hq", "fu", "hscale", "meta", "row_partidx", "out"], i: &["I", "E", "topk", "T", "H"], f: &[], j: &[] },
     S { op: DevOp::MoeDownFp8Block128, t: &["out", "hq", "hscale", "wtab", "stab", "meta", "row_partidx", "row_gate"], i: &["I", "H", "E", "topk", "T"], f: &[], j: &[] },
-    S { op: DevOp::MlaBmmFp8, t: &["C", "X", "W", "scale", "raw_rope?"], i: &["M", "heads", "N", "K", "copy_rope64"], f: &[], j: &[] },
+    S { op: DevOp::MlaBmmFp8, t: &["C", "X", "W", "scale", "raw_rope?"], i: &["M", "heads", "N", "K", "copy_rope64", "x_head_stride"], f: &[], j: &[] },
     S { op: DevOp::IndexFp8Decode, t: &["score", "q", "k", "weights", "packed_cache", "pos", "kv_len", "parked"], i: &["M", "ctx"], f: &[], j: &[] },
     S { op: DevOp::IndexFp8Prefill, t: &["score?", "q?", "k", "weights?", "packed_cache", "pos", "kv_len"], i: &["T", "ctx", "append_only"], f: &[], j: &[] },
     S { op: DevOp::GemmFp8, t: &["C", "A", "B", "a_scale", "w_scale"], i: &["M", "N", "K", "", "a_row0"], f: &[], j: &[] },

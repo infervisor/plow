@@ -634,6 +634,24 @@ fn mla_fp8_requires_marker_valid_geometry_and_ocp_bytes() {
 }
 
 #[test]
+fn mla_strided_wv_requires_exact_shape_and_new_object_abi() {
+    let path = Path::new("interp_decode_gq.elf");
+    let syms = ["plow_opcode_mla_bmm_fp8_1", "plow_mla_bmm_head_stride_1"];
+    let mut p = segmented_prog(&[DevOp::MlaBmmFp8], &[0]);
+    p.insts[0].i = [16, 8, 256, 512, 0, 1024, 0, 0];
+    p.insts[0].t = [0, 1, 2, 3, packet::dev::TENSOR_NONE16,
+        packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16];
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+    assert!(check_compiled_opcode_markers(&syms[..1], path, [&p]).is_err());
+    for (slot, value) in [(0, 32), (1, 16), (2, 512), (3, 192), (4, 1), (5, 512)] {
+        let old = p.insts[0].i[slot];
+        p.insts[0].i[slot] = value;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+        p.insts[0].i[slot] = old;
+    }
+}
+
+#[test]
 fn block_fp8_qb_requires_marker_and_geometry() {
     let path = Path::new("interp_decode_gq.elf");
     let syms = ["plow_opcode_gemm_fp8_block128_1", "plow_gemm_fp8_block128_m16_1",

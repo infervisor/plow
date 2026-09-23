@@ -17,6 +17,13 @@ pub mod cpu;
 pub mod cuda;
 #[cfg(feature = "hsa")]
 pub mod hsa;
+pub mod provenance;
+pub(crate) mod retirement;
+pub(crate) mod kernarg_retirement;
+
+pub(crate) fn retirement_error(error: retirement::RetirementError) -> crate::RuntimeError {
+    crate::RuntimeError::Rejected(format!("retirement admission: {error:?}"))
+}
 pub mod visibility;
 
 /// Bring up the best backend this host can actually offer.
@@ -266,6 +273,7 @@ pub struct DeviceMem {
     pub base: u64,
     pub len: u64,
     backing: Backing,
+    provenance: Option<Arc<provenance::MemoryRegion>>,
 }
 
 enum Backing {
@@ -289,6 +297,7 @@ impl DeviceMem {
             base,
             len,
             backing: Backing::Owned { free },
+            provenance: Some(Arc::new(provenance::MemoryRegion::owned(base, len))),
         }
     }
 
@@ -300,7 +309,84 @@ impl DeviceMem {
             base,
             len,
             backing: Backing::View,
+            provenance: None,
         }
+    }
+
+    pub(crate) fn subview(&self, offset: u64, len: u64) -> Result<DeviceMem> {
+        let base = self
+            .base
+            .checked_add(offset)
+            .filter(|_| offset.checked_add(len).is_some_and(|end| end <= self.len))
+            .filter(|base| base.checked_add(len).is_some())
+            .ok_or_else(|| crate::RuntimeError::Rejected("device subview out of bounds".into()))?;
+        Ok(DeviceMem {
+            base,
+            len,
+            backing: Backing::View,
+            provenance: self
+                .provenance
+                .as_ref()
+                .filter(|p| p.matches_range(self.base, self.len))
+                .and_then(|p| p.subrange(base, len))
+                .map(Arc::new),
+        })
+    }
+
+    pub(crate) fn mapped_view(
+        base: u64,
+        len: u64,
+        provenance: Option<provenance::MemoryRegion>,
+    ) -> DeviceMem {
+        DeviceMem {
+            base,
+            len,
+            backing: Backing::View,
+            provenance: provenance.map(Arc::new),
+        }
+    }
+
+    /// Quiescent allocator snapshot, not a GPU completion or execution lease.
+    pub fn allocation_evidence(&self) -> Option<Vec<provenance::AllocationRange>> {
+        self.provenance.as_ref()?.evidence(self.base, self.len)
+    }
+
+    pub fn allocation_disjoint(&self, other: &DeviceMem) -> Option<bool> {
+        Some(provenance::ranges_disjoint(
+            &self.allocation_evidence()?,
+            &other.allocation_evidence()?,
+        ))
+    }
+
+    pub(crate) fn bind_view_provenance(&mut self, region: provenance::MemoryRegion) {
+        if matches!(self.backing, Backing::View) && region.matches_range(self.base, self.len) {
+            self.provenance = Some(Arc::new(region));
+        }
+    }
+
+    pub(crate) fn binding_region(
+        &self,
+        base: u64,
+        bytes: u64,
+    ) -> Result<Option<provenance::MemoryRegion>> {
+        let reject = || crate::RuntimeError::Rejected("invalid or stale tensor binding".into());
+        let offset = base.checked_sub(self.base).ok_or_else(reject)?;
+        if !offset.checked_add(bytes).is_some_and(|end| end <= self.len)
+            || base.checked_add(bytes).is_none()
+        {
+            return Err(reject());
+        }
+        let Some(region) = &self.provenance else {
+            return Ok(None);
+        };
+        if !region.matches_range(self.base, self.len) || !region.is_live() {
+            return Err(reject());
+        }
+        let bound = region.subrange(base, bytes).ok_or_else(reject)?;
+        if !bound.is_live() {
+            return Err(reject());
+        }
+        Ok(Some(bound))
     }
 
     /// Host-visible byte slice for CPU-backed memory; `None` for real-device
@@ -321,6 +407,11 @@ impl DeviceMem {
 
 impl Drop for DeviceMem {
     fn drop(&mut self) {
+        if !matches!(self.backing, Backing::View) {
+            if let Some(p) = &self.provenance {
+                p.invalidate_owner();
+            }
+        }
         // Only owners free; views alias an owner's storage (a naive
         // unconditional free here is the double-free the leak audit flagged),
         // and CPU arenas free through their own `Arc`.
@@ -475,5 +566,88 @@ mod tests {
             "owner frees exactly once"
         );
         assert_eq!(f.last_base.load(Ordering::SeqCst), 0x1000);
+    }
+
+    #[test]
+    fn allocation_provenance_survives_subviews_not_owner_drop_or_address_reuse() {
+        let f = Arc::new(CountingFree {
+            count: AtomicUsize::new(0),
+            last_base: AtomicUsize::new(0),
+        });
+        let owner = DeviceMem::owned(0x1000, 256, f.clone());
+        let child = owner.subview(32, 64).unwrap();
+        let grandchild = child.subview(16, 16).unwrap();
+        let parent = owner.allocation_evidence().unwrap();
+        let leaf = grandchild.allocation_evidence().unwrap();
+        assert_eq!(parent[0].physical_id, leaf[0].physical_id);
+        assert_eq!(leaf[0].physical_offset, 48);
+        assert_eq!(owner.allocation_disjoint(&grandchild), Some(false));
+        assert_eq!(
+            owner
+                .subview(0, 16)
+                .unwrap()
+                .allocation_disjoint(&grandchild),
+            Some(true)
+        );
+        assert!(owner.subview(250, 7).is_err());
+        assert!(owner.subview(u64::MAX, 1).is_err());
+        assert!(DeviceMem::view(owner.base, owner.len)
+            .allocation_evidence()
+            .is_none());
+        drop(owner);
+        assert_eq!(f.count.load(Ordering::SeqCst), 1);
+        assert!(child.allocation_evidence().is_none());
+        assert!(grandchild.allocation_evidence().is_none());
+        assert_eq!(child.allocation_disjoint(&grandchild), None);
+        let next = DeviceMem::owned(0x1000, 256, f.clone());
+        assert_ne!(
+            next.allocation_evidence().unwrap()[0].physical_id,
+            parent[0].physical_id
+        );
+        drop(child);
+        drop(grandchild);
+        assert_eq!(f.count.load(Ordering::SeqCst), 1);
+        drop(next);
+        assert_eq!(f.count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn allocation_provenance_rejects_public_range_mutation() {
+        let f = Arc::new(CountingFree {
+            count: AtomicUsize::new(0),
+            last_base: AtomicUsize::new(0),
+        });
+        let owner = DeviceMem::owned(0x1000, 256, f);
+        let mut child = owner.subview(0, 128).unwrap();
+        child.base += 16;
+        assert!(child.allocation_evidence().is_none());
+        assert!(child
+            .subview(0, 16)
+            .unwrap()
+            .allocation_evidence()
+            .is_none());
+        let mut child = owner.subview(0, 128).unwrap();
+        child.len = 64;
+        assert!(child.allocation_evidence().is_none());
+        assert!(child
+            .subview(0, 16)
+            .unwrap()
+            .allocation_evidence()
+            .is_none());
+    }
+
+    #[test]
+    fn cpu_allocation_provenance_uses_allocator_identity() {
+        eprintln!(
+            "DeviceMem bytes: {} (base+len+Backing before provenance: {})",
+            std::mem::size_of::<DeviceMem>(),
+            16 + std::mem::size_of::<Backing>()
+        );
+        let be = cpu::CpuBackend::new(1);
+        let owner = be.alloc(0, 64).unwrap();
+        let view = owner.subview(16, 32).unwrap();
+        assert_eq!(view.allocation_evidence().unwrap()[0].physical_offset, 16);
+        drop(owner);
+        assert!(view.allocation_evidence().is_none());
     }
 }

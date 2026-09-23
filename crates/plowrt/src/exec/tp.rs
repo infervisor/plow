@@ -425,7 +425,7 @@ impl TpRank {
                 self.scratch.len
             )));
         }
-        Ok(DeviceMem::view(self.scratch.base + off, len))
+        self.scratch.subview(off, len)
     }
 }
 

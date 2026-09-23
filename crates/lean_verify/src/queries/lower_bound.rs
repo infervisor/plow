@@ -1,11 +1,8 @@
 //! Query: schedule lower-bound target.
 //!
-//! Asks Lean to compute `max(E1, E2, E3)` — the certified lower bound on any
-//! valid schedule's makespan — so the compiler can:
-//! 1. Stop optimizing when the schedule achieves the bound (proven optimal).
-//! 2. Report the gap to the user for diagnostics.
-//!
-//! Backed by `Plow.CostBounds.makespan_dominates_lower_bounds`.
+//! Evaluates `max(E1, E2, E3)` on a validated DAG and caller-supplied costs.
+//! The result is conditional on those costs and the channel model; it does not
+//! certify machine-code execution time or physical HBM traffic.
 
 use serde::{Deserialize, Serialize};
 
@@ -39,10 +36,10 @@ pub enum BindingConstraint {
     ComputeThroughput,
 }
 
-/// Response: the certified lower bound.
+/// Response: the conditional model lower bound.
 #[derive(Clone, Debug, Deserialize)]
 pub struct LowerBoundResult {
-    /// The proven lower bound: `max(critical_path, bw_bound, compute_bound)`.
+    /// The model lower bound: `max(critical_path, bw_bound, compute_bound)`.
     pub lower_bound: u64,
     /// Which of the three constraints is the binding one.
     pub binding_constraint: BindingConstraint,
@@ -62,7 +59,8 @@ pub struct LowerBoundResult {
 pub fn query_lower_bound(req: &LowerBoundRequest) -> Result<LowerBoundResult, VerifyError> {
     let payload = serde_json::to_value(req).map_err(VerifyError::SerializeRequest)?;
     let result: QueryResult = query("lower_bound", payload)?;
-    let lb: LowerBoundResult = serde_json::from_value(result.answer)
+    let mut lb: LowerBoundResult = serde_json::from_value(result.answer)
         .map_err(|e| VerifyError::DeserializeQueryResult(e, "lower_bound answer".into()))?;
+    lb.certificate = result.certificate;
     Ok(lb)
 }

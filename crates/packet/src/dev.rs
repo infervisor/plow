@@ -2060,7 +2060,8 @@ pub enum DevOp {
     /// `t0=out t1=hq t2=hscale t3=wtab t4=stab t5=meta t6=row_partidx t7=row_gate` · `i0=I i1=H i2=E i3=topk i4=T`.
     MoeDownFp8Block128 = 190,
     /// CDNA4 MLA BMM with fused group128 input quantization and one scalar weight scale.
-    /// `t0=C t1=X t2=W t3=scale t4=raw_rope?` · `i0=M i1=heads i2=N i3=K i4=copy_rope64`.
+    /// `t0=C t1=X t2=W t3=scale t4=raw_rope?` · `i0=M i1=heads i2=N i3=K i4=copy_rope64 i5=x_head_stride`.
+    /// x_head_stride=0 uses K (or K+64 with copy_rope64); 1024 selects even padded WV heads.
     MlaBmmFp8 = 191,
     /// Native non-pooled FP8 indexer decode: quantize post-RoPE query, scale weights,
     /// append the current key to block16 packed cache, then score its live prefix.

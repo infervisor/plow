@@ -1,28 +1,40 @@
 /-
 # Plow.CLI.Checkpoints — per-checkpoint dispatch handlers for the CLI.
 
-One handler per checkpoint A..F. A and F are the fully-proven paths (they
-delegate to `Plow.Verify.verifyAddressMap`). The rest return `notImplemented`
-until their universal proofs land — the wiring is here so callers see the
-shape of the eventual API.
+Handlers return certificates scoped to the supplied abstract obligations.
+They do not establish completeness of kernel access declarations or machine-code semantics.
 -/
 import Lean.Data.Json
 import Plow.CLI.Schema
 import Plow.CLI.Payload
 import Plow.CLI.FastCheckD
+import Plow.CLI.Effects
 import Plow.Verify
 import Plow.Sram
 import Plow.Wire
 import Plow.Rewrite
+import Plow.RewriteBody
 import Plow.TilePartition
 import Plow.Knobs.Consistency
 import Plow.Knobs.Scope
 import Plow.Knobs.Ledger
+import Plow.MeasuredPolicy
+import Plow.MlaLayout
 
 namespace Plow.CLI.Checkpoints
 
 open Lean (Json)
 open Plow.CLI Plow.Verify
+
+def checkR (payload : Json) : Certificate :=
+  match Plow.MeasuredPolicy.run payload with
+  | .ok notes => ok "R" notes
+  | .error msg => reject "R" msg
+
+def checkL (payload : Json) : Certificate :=
+  match Plow.MlaLayout.run payload with
+  | .ok notes => ok "L" notes
+  | .error msg => reject "L" msg
 
 /-! ## Checkpoint K: knob consistency. -/
 
@@ -72,16 +84,19 @@ def checkA (payload : Json) : Certificate :=
   | .ok j =>
     match j with
     | .arr arr =>
-      let rules := arr.foldr (init := ([] : List String)) fun x acc =>
-        match x.getStr? with
-        | .ok s => s :: acc
-        | _ => acc
+      match arr.toList.mapM Json.getStr? with
+      | .error _ => reject "A" "payload 'rules' must contain only strings"
+      | .ok rules =>
       match rules.find? (fun r => ¬ Plow.Rewrite.isSoundRule r) with
       | some bad =>
         reject "A" s!"rule '{bad}' is not in the sound-rules table; \
                      add it to Plow.Rewrite.soundRules with a proof"
       | none =>
-        ok "A" s!"{rules.length} rules verified sound"
+        match payload.getObjVal? "bodies" with
+        | .error _ => ok "A" s!"{rules.length} rewrite names in the proven syntax catalog; no floating-point or machine-code implementation claim"
+        | .ok bodies => match Plow.RewriteBody.run rules bodies with
+          | .ok notes => ok "A" notes
+          | .error reason => reject "A" reason
     | _ => reject "A" "payload 'rules' must be an array of strings"
 
 /-! ## Checkpoint B: Tile partition + cost bounds (§5.10-B). -/
@@ -178,20 +193,58 @@ def checkD (payload : Json) : IO Certificate := do
   match Payload.parse payload with
   | .error msg => return reject "D" s!"payload parse error: {msg}"
   | .ok d =>
-    -- Execution goes through the scalable twin (Plow.CLI.FastCheckD): the
-    -- reference `verifyAddressMap` recursion is `tg.n` deep and overflows the
-    -- stack on real schedules (~590k tasks). The theorems continue to speak
-    -- about the reference definitions; see FastCheckD's header for the
-    -- equivalence argument and TCB note.
-    match ← FastCheckD.run d with
+    let dependenciesOk ← match payload.getObjVal? "dependency_paths" with
+      | .error _ => pure (verifyDependencies d.protocol)
+      | .ok paths =>
+        let parsed : Except String (List (List (Fin d.taskGraph.n))) := do
+          let raw ← Lean.fromJson? (α := List Json) paths
+          raw.mapM fun path => do
+            let ids ← Payload.parseNatArrayStrict "dependency_paths" path
+            ids.mapM (Payload.strictFin "dependency_paths" d.taskGraph.n)
+        match parsed with
+        | .error msg => return reject "D" s!"dependency witness parse error: {msg}"
+        | .ok paths => pure (checkPaths d.protocol d.taskGraph.edges paths)
+    if !dependenciesOk then
+      return reject "D" "data dependency is not counter-ordered by the supplied protocol"
+    let addressPaths : Option (List (PathWitness d.taskGraph)) ←
+      match payload.getObjVal? "address_paths" with
+      | .error _ => pure none
+      | .ok paths =>
+        let parsed : Except String (List (PathWitness d.taskGraph)) := do
+          let raw ← Lean.fromJson? (α := List Json) paths
+          raw.mapM fun path => do
+            let source ← path.getObjValAs? Nat "source"
+            let target ← path.getObjValAs? Nat "target"
+            let via ← path.getObjVal? "via"
+            let via ← Payload.parseNatArrayStrict "address_paths.via" via
+            return { source := ← Payload.strictFin "address_paths.source" d.taskGraph.n source,
+                     target := ← Payload.strictFin "address_paths.target" d.taskGraph.n target,
+                     via := ← via.mapM (Payload.strictFin "address_paths.via" d.taskGraph.n) }
+        match parsed with
+        | .error msg => return reject "D" s!"address witness parse error: {msg}"
+        | .ok paths => pure (some paths)
+    -- FastCheckD is an early rejection filter, not a proof-backed acceptance path.
+    match ← FastCheckD.run (if addressPaths.isSome then { d with entries := [] } else d) with
     | .error msg => return reject "D" s!"ordering-graph check failed: {msg}"
     | .ok (amOk, djOk) =>
       if ¬ amOk then
         return reject "D" "verifyAddressMap rejected — some byte-overlapping pair is not counter-ordered"
       else if ¬ djOk then
         return reject "D" "reader/writer sets overlap — strict AddressMapSound not derivable"
+      else if !(match addressPaths with
+          | some paths => verifyAddressMapVia d.protocol d.entries paths
+          | none => verifyAddressMap d.protocol d.entries && readersWritersDisjointB d.entries) then
+        return reject "D" "proven reference address checker rejected"
       else
-        return ok "D" s!"verifyAddressMap accepted {d.entries.length} entries (strict)"
+        let mut notes := s!"proven verifyAddressMap accepted {d.entries.length} entries (strict); supplied graph/address scope only"
+        if let .ok effects := payload.getObjVal? "memory_effects" then
+          match addressPaths with
+          | none => return reject "D" "memory effects require explicit address_paths"
+          | some paths =>
+            match Effects.run d paths effects with
+            | .error msg => return reject "D" s!"memory effects rejected: {msg}"
+            | .ok scope => notes := notes ++ "; " ++ scope
+        return ok "D" notes
 
 /-! ## Checkpoint E: Wire-format round-trip (§5.10-E). -/
 
@@ -232,18 +285,10 @@ def checkE (payload : Json) : Certificate :=
     check as D — F is conceptually "post-emit" verification, but it's the
     same math (strict `AddressMapSound`). -/
 def checkF (payload : Json) : IO Certificate := do
-  match Payload.parse payload with
-  | .error msg => return reject "F" s!"payload parse error: {msg}"
-  | .ok d =>
-    -- Same scalable executable twin as checkD (see FastCheckD's header).
-    match ← FastCheckD.run d with
-    | .error msg => return reject "F" s!"ordering-graph check failed: {msg}"
-    | .ok (amOk, djOk) =>
-      if ¬ amOk then
-        return reject "F" "allocation unsafe: two byte-overlapping entries have no counter or resource ordering"
-      else if ¬ djOk then
-        return reject "F" "allocation unsafe: reader/writer sets overlap — cannot derive strict safety"
-      else
-        return ok "F" s!"allocation safe: {d.entries.length} entries checked, strict AddressMapSound"
+  let cert ← checkD payload
+  if cert.ok then
+    return ok "F" s!"strict AddressMapSound; {cert.notes.getD ""}"
+  else
+    return reject "F" (cert.reason.getD "allocation check rejected")
 
 end Plow.CLI.Checkpoints

@@ -1486,13 +1486,16 @@ fn emit_glm_indexer_wq_w8a8(
 fn emit_glm_mla_value_w8a8(
     b: &mut Builder, cus: &[u32], n: &GlmTn, w: &GlmLW, rows: u32, splits: u32, dep: u32,
 ) -> u32 {
+    let strided = emit_config::active().glm_mla_strided_wv && rows < 32;
     let merge = b.emit(DevOp::FlashMerge, cus.to_vec(), &[dep], |d| {
         d.t[..3].copy_from_slice(&[n.olat, n.opart, n.mlpart]);
         d.i[..4].copy_from_slice(&[rows, 8, splits, 512]);
+        d.i[4] = if strided { 1024 } else { 0 };
     });
     b.emit(DevOp::MlaBmmFp8, cus.to_vec(), &[merge], |d| {
         d.t[..4].copy_from_slice(&[n.oat, n.olat, w.wv, w.wv_s]);
         d.i[..4].copy_from_slice(&[rows, 8, 256, 512]);
+        d.i[5] = if strided { 1024 } else { 0 };
     })
 }
 
@@ -2359,7 +2362,8 @@ fn declare_glm_rows_batched_for_prefill(
     let opart = ac(b, "opart", (nh_l * osplits * dk) as u64 * F32);
     let mlpart = ac(b, "mlpart", (nh_l * osplits * 2) as u64 * F32);
     let olat_rows = if emit_config::active().glm_mla_w8a8 { rows } else { 1 };
-    let olat = ac(b, "olat", olat_rows * (nh_l * dk) as u64 * BF16);
+    let olat_heads = nh_l * if emit_config::active().glm_mla_strided_wv { 2 } else { 1 };
+    let olat = ac(b, "olat", olat_rows * (olat_heads * dk) as u64 * BF16);
     let oat = ac(b, "oat", rows * (nh_l * vd) as u64 * BF16);
     // ROW-SPLIT arm scratch. Same total element count as qa/qr/oat (`nh * rows/8 == nh_l * rows`
     // since `nh == nh_l * tp` and this rank's row band is `rows/tp`), so turning the knob on
@@ -2748,6 +2752,8 @@ fn declare_glm_rows_batched_for_prefill(
     assert!(!indexer_wq_w8a8 || (mla_w8a8 && c.has_dsa && c.index_kpool == 1
         && c.index_heads == 32 && c.index_dim == 128 && enc == MoeEnc::Fp8Blk),
         "PLOW_GLM_INDEXER_WQ_W8A8 requires PLOW_GLM_MLA_W8A8 and unpooled GLM FP8 indexer geometry");
+    assert!(!emit_config::active().glm_mla_strided_wv || emit_config::active().glm_mla_bf16_ps,
+        "PLOW_GLM_MLA_STRIDED_WV requires PLOW_GLM_MLA_BF16_PS");
     assert!(!emit_config::active().glm_mla_bf16_ps || (mla_w8a8 && !glm_fp8_kv()),
         "PLOW_GLM_MLA_BF16_PS requires PLOW_GLM_MLA_W8A8 and BF16 KV");
     assert!(!mla_w8a8 || (qkva_w8a8 && c.tp == 8 && nh_l == 8
@@ -11344,6 +11350,7 @@ fn write_mla_manifest(m: &Model, out: &str, target: &str, enc: MoeEnc, lean: &cr
     if target.is_empty() {
         return; // legacy CLI path: output unchanged
     }
+    crate::write_lean_receipts(std::path::Path::new(out), lean);
     let mut man = crate::manifest::build(m, target, lean);
     crate::report_dispatch_audit(&man);
     // The MXFP4 exception list, stated in the artifact a comparison reads rather than left to a

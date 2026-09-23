@@ -150,6 +150,16 @@ const C_INDEXER_FP8: &[Constraint] = &[Constraint {
     check: Check::Site,
 }];
 
+const C_MLA_STRIDED_WV: &[Constraint] = &[Constraint {
+    id: "mla_strided_wv_contract",
+    formula: F::Implies(
+        &F::Atom("emit.glm_mla_strided_wv", Cmp::Eq, TRUE),
+        &F::Atom("emit.glm_mla_bf16_ps", Cmp::Eq, TRUE),
+    ),
+    site: "crates/devgen/src/mla.rs: PLOW_GLM_MLA_STRIDED_WV requires PLOW_GLM_MLA_BF16_PS",
+    check: Check::Site,
+}];
+
 /// `apply_production_defaults`'s gate for the qualified GLM recipe.
 const GLM_TARGET: F = F::And(&[
     F::Target(T::Cap("glm")),
@@ -1070,6 +1080,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_indexer_fp8", Some("PLOW_GLM_INDEXER_FP8"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_INDEXER_FP8),
     KnobSpec::new("emit.glm_mla_bf16_ps", Some("PLOW_GLM_MLA_BF16_PS"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_MLA_BF16_PS),
     KnobSpec::new("emit.glm_rope_bf16", Some("PLOW_GLM_ROPE_BF16"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_GLM_ROPE_BF16),
+    KnobSpec::new("emit.glm_mla_strided_wv", Some("PLOW_GLM_MLA_STRIDED_WV"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_MLA_STRIDED_WV),
     KnobSpec::new("emit.glm_shared_w8a8", Some("PLOW_GLM_SHARED_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_routed_w8a8", Some("PLOW_GLM_ROUTED_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_shared_glu_split", Some("GLM_SHARED_GLU_SPLIT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),

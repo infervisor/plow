@@ -618,6 +618,7 @@ extern "C" __device__ unsigned plow_opcode_gemm_fp8_block128_split4_1 = 1;
 #endif
 #if PLOW_CDNA4 && PLOW_HAS_MLA_BMM_FP8
 extern "C" __device__ unsigned plow_opcode_mla_bmm_fp8_1 = 1;
+extern "C" __device__ unsigned plow_mla_bmm_head_stride_1 = 1;
 #endif
 #if PLOW_HAS_SUM4_BF16
 extern "C" __device__ unsigned plow_opcode_sum4_bf16_1 = 1;
@@ -4036,7 +4037,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             else
                 d_mla_bmm_fp8_m16((bf16*)TEN(0), (const bf16*)TEN(1),
                     (const unsigned char*)TEN(2), (const float*)TEN(3),
-                    PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], in->i[3], slice, nblk);
+                    PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], in->i[3], slice, nblk,
+                    in->i[5]);
             break;
 #endif
 #if PLOW_HAS_GEMM_FP8_BLOCK128_SPLIT4

@@ -285,6 +285,7 @@ pub fn run(
         .collect::<plowrt::Result<Vec<_>>>()?;
     let mut single;
     let mut group;
+    let selected_routes;
     let mut samples = Vec::new();
     let mut outputs = Vec::new();
     let validation_failure = |errors: Vec<String>| -> Result<(), Error> {
@@ -292,11 +293,14 @@ pub fn run(
             return Ok(());
         }
         if let Some(path) = &report {
-            std::fs::write(path, serde_json::to_string_pretty(&serde_json::json!({
-                "scope": "single-block-decode", "batch": batch, "ctx": ctx, "tp": tp,
-                "oracle_verified": false, "validation_errors": errors,
-                "input_dir": inputs, "blob": blob, "hsaco": hsaco, "checkpoint": checkpoint
-            }))?)?;
+            std::fs::write(
+                path,
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "scope": "single-block-decode", "batch": batch, "ctx": ctx, "tp": tp,
+                    "oracle_verified": false, "validation_errors": errors,
+                    "input_dir": inputs, "blob": blob, "hsaco": hsaco, "checkpoint": checkpoint
+                }))?,
+            )?;
         }
         Err(errors.join("; ").into())
     };
@@ -333,6 +337,7 @@ pub fn run(
     };
     if tp == 1 {
         single = AmdEngine::load(backends[0].clone(), &blob, &hsaco, checkpoint.as_deref())?;
+        selected_routes = vec![single.selected_route_evidence().clone()];
         for i in 0..iterations {
             run(&mut [&mut single])?;
             let start = Instant::now();
@@ -345,8 +350,12 @@ pub fn run(
                 let mut bytes = vec![0; output_bytes];
                 single.read_tensor(output, &mut bytes)?;
                 let mut errors = Vec::new();
-                if let Err(e) = check_stages(&single, 0) { errors.push(e.to_string()); }
-                if let Err(e) = check_rows(&bytes, &reference, batch, tolerance) { errors.push(e.to_string()); }
+                if let Err(e) = check_stages(&single, 0) {
+                    errors.push(e.to_string());
+                }
+                if let Err(e) = check_rows(&bytes, &reference, batch, tolerance) {
+                    errors.push(e.to_string());
+                }
                 validation_failure(errors)?;
             }
             if i > warmup {
@@ -359,7 +368,9 @@ pub fn run(
         check_stages(&single, 0)?;
         crate::trace_dump_1(&single, "")?;
     } else {
-        group = AmdTpGroup::load(backends, &blob, &hsaco, checkpoint.as_deref())?;
+        group = AmdTpGroup::load(backends.clone(), &blob, &hsaco, checkpoint.as_deref())?;
+        selected_routes = (0..tp as usize)
+            .map(|rank| group.rank(rank).selected_route_evidence().clone()).collect::<Vec<_>>();
         if !group.counter_audit_enabled() {
             return Err("block measurements require the TP counter audit".into());
         }
@@ -424,7 +435,16 @@ pub fn run(
         "relative_l2_reduction": "max over individual rows, per rank",
         "cache_policy": "operand-uploads-before-each-dispatch; no-L2-flush",
         "trace_instrumented": plowrt::config::RuntimeConfig::get().amd.trace_raw.is_some(),
-        "host_timing_instrumented": plowrt::obs::dstep::on()
+        "host_timing_instrumented": plowrt::obs::dstep::on(),
+        "loaded_object_evidence": {
+            "scope": "successfully-loaded-images-and-load-resolved-kernel-resources",
+            "dispatch_selection_verified": false,
+            "dynamic_lds_launch_geometry_and_register_counts": null,
+            "ranks": backends.iter().map(|b| b.loaded_object_evidence()).collect::<Vec<_>>()
+        },
+        "selected_route_evidence_sha256": selected_routes.iter()
+            .map(|r| r.scoped_digest()).collect::<Result<Vec<_>, _>>()?,
+        "selected_route_evidence": selected_routes
     });
     let json = serde_json::to_string_pretty(&record)?;
     if let Some(path) = report {

@@ -1110,12 +1110,11 @@ fn devblob_verify_hook(
             return Ok(rep);
         }
         {
-            use lean_verify::checkpoints::rewrite::{check_rewrite_rules, RewriteRulesRequest};
-            match plowc::parse_rule_catalog(rewrite::rules_source()) {
-                Ok(rules) => {
-                    let req = RewriteRulesRequest { rules };
-                    match check_rewrite_rules(&req) {
-                        Ok(cert) => {
+            match plowc::rewrite_body_request(rewrite::rules_source()) {
+                Ok(req) => {
+                    match lean_verify::call_batch_bound(&[("A", req.clone())]) {
+                        Ok((mut certs, verifier_sha256)) => {
+                            let cert = certs.remove(0);
                             if !cert.ok {
                                 return Err(format!(
                                     "Checkpoint A (rewrite rules soundness) REJECTED: {}",
@@ -1123,7 +1122,16 @@ fn devblob_verify_hook(
                                 ));
                             }
                             rep.rewrite_verified = true;
-                            info!("lean rewrite soundness: all egglog rewrite rules verified sound against Lean");
+                            rep.compile_checks.push(plow_asset::certificates::CompileCheckReceipt {
+                                program: None,
+                                scope: plow_asset::certificates::SemanticScope::RewriteBodyExpansion,
+                                checkpoint: "A".into(),
+                                request_sha256: plow_asset::decode_objects::image_sha256(
+                                    &serde_json::to_vec(&req).map_err(|error| error.to_string())?),
+                                verifier_sha256, request: req,
+                                response: serde_json::to_value(&cert).map_err(|error| error.to_string())?,
+                            });
+                            info!("lean actual rewrite bodies checked against full-arity syntax expansion; not a floating-point kernel implementation proof");
                         }
                         Err(e) if e.is_binary_unusable() => {
                             warn!(error = %e, "lean rewrite verification skipped: verifier not runnable");
@@ -1137,6 +1145,122 @@ fn devblob_verify_hook(
                     return Err(format!("failed to parse egglog rule catalog: {e}"));
                 }
             }
+        }
+        let mut dependency_programs = Vec::new();
+        let mut dependency_requests = Vec::new();
+        let wire_protocols = plow_asset::program::with_model(m, |packet| {
+            packet.programs.iter().map(plow_asset::logical_effects::coarse_protocol)
+                .collect::<Vec<_>>()
+        });
+        for (pi, p) in m.progs.iter().enumerate() {
+            if let Some(witness) = &p.reduction_witness {
+                let n = p.insts.len();
+                let protocol = match &wire_protocols[pi] {
+                    Ok(protocol) => protocol,
+                    Err(reason) => {
+                        rep.dependency_binding_gaps.push((pi, reason.clone()));
+                        info!(program = pi, %reason, "coarse dependency receipt not bound to this wire protocol");
+                        continue;
+                    }
+                };
+                dependency_programs.push(pi);
+                dependency_requests.push(("D", serde_json::json!({
+                    "task_graph": { "n": n, "edges": witness.original },
+                    "protocol": protocol,
+                    "dependency_paths": witness.paths,
+                    "address_map": [],
+                })));
+            }
+        }
+        let policy_requests = devgen::measured_policy_requests();
+        let mut extra_scopes = Vec::new();
+        plow_asset::program::with_model(m, |packet| {
+            for request in policy_requests {
+                let bound = if request["policy_kind"] == plow_asset::gemm_policy::KIND {
+                    (0..packet.programs.len()).filter_map(|program|
+                        plow_asset::gemm_policy::bind(packet, program, &request).ok()
+                            .map(|request| (program, request))).collect::<Vec<_>>()
+                } else { Vec::new() };
+                if !bound.is_empty() {
+                    for (program, request) in bound {
+                        dependency_requests.push(("R", request));
+                        extra_scopes.push((Some(program), plow_asset::certificates::SemanticScope::SelectedGemmPolicy));
+                    }
+                    continue;
+                }
+                dependency_requests.push(("R", request));
+                extra_scopes.push((None, plow_asset::certificates::SemanticScope::MeasuredPolicy));
+            }
+        });
+        for (program, request) in devgen::mla_layout_requests(m)? {
+            dependency_requests.push(("L", request));
+            extra_scopes.push((Some(program), plow_asset::certificates::SemanticScope::LayoutMapping));
+        }
+        plow_asset::program::with_model(m, |packet| {
+            for program in 0..packet.programs.len() {
+                match plow_asset::logical_effects::obligation(packet, program) {
+                    Ok(request) => {
+                        dependency_requests.push(("D", request));
+                        extra_scopes.push((Some(program), plow_asset::certificates::SemanticScope::LogicalTensorEffects));
+                    }
+                    Err(reason) => {
+                        info!(program, %reason, "logical tensor effects not covered; no physical lifetime qualification");
+                        rep.logical_effect_gaps.push((program, reason));
+                    }
+                }
+            }
+        });
+        let (dependency_certs, dependency_verifier) = match lean_verify::call_batch_bound(&dependency_requests) {
+            Ok(certs) => certs,
+            Err(e) if e.is_binary_unusable() => {
+                warn!(error = %e, "lean dependency certificates skipped: verifier not runnable");
+                rep.verified = false;
+                rep.reason = Some(format!("verifier not runnable: {e}"));
+                return Ok(rep);
+            }
+            Err(e) => return Err(format!("coarse dependency witness batch failed: {e}")),
+        };
+        let dependency_verifier = Some(dependency_verifier);
+        let mut certificates = dependency_certs.into_iter();
+        let mut requests = dependency_requests.into_iter();
+        for pi in dependency_programs {
+            let cert = certificates.next().expect("batch validated certificate count");
+            let (_, request) = requests.next().expect("dependency request count");
+            if !cert.ok {
+                return Err(format!("program {pi}: coarse dependency preservation rejected: {}",
+                    cert.reason.unwrap_or_default()));
+            }
+            if let Some(verifier_sha256) = &dependency_verifier {
+                rep.compile_checks.push(plow_asset::certificates::CompileCheckReceipt {
+                    program: Some(pi),
+                    scope: plow_asset::certificates::SemanticScope::CoarseDependencyPreservation,
+                    checkpoint: "D".into(),
+                    request_sha256: plow_asset::decode_objects::image_sha256(
+                        &serde_json::to_vec(&request).map_err(|error| error.to_string())?),
+                    verifier_sha256: verifier_sha256.clone(),
+                    request,
+                    response: serde_json::to_value(&cert).map_err(|error| error.to_string())?,
+                });
+            }
+        }
+        for ((cert, (checkpoint, request)), (program, scope)) in certificates.zip(requests).zip(extra_scopes) {
+            if !cert.ok {
+                return Err(format!("checkpoint {checkpoint} {scope:?} rejected: {}", cert.reason.unwrap_or_default()));
+            }
+            if let Some(verifier_sha256) = &dependency_verifier {
+                rep.compile_checks.push(plow_asset::certificates::CompileCheckReceipt {
+                    program, scope,
+                    checkpoint: checkpoint.into(),
+                    request_sha256: plow_asset::decode_objects::image_sha256(
+                        &serde_json::to_vec(&request).map_err(|error| error.to_string())?),
+                    verifier_sha256: verifier_sha256.clone(), request,
+                    response: serde_json::to_value(&cert).map_err(|error| error.to_string())?,
+                });
+            }
+        }
+        if !rep.compile_checks.is_empty() {
+            info!(obligations = rep.compile_checks.len(),
+                "Lean scoped compiler checks; no floating-point implementation or performance qualification");
         }
         for (pi, p) in m.progs.iter().enumerate() {
             let n = p.gq_stream.len();
@@ -1216,35 +1340,6 @@ fn devblob_verify_hook(
                 address_map: Vec::new(),
             };
             let t = m.prog_t.get(pi).copied().unwrap_or(0);
-            let cert = match lv::check_schedule(&req) {
-                Ok(c) => c,
-                // Same downgrade as the oracle, and the reason it has to be HERE
-                // rather than at the probe: this is the first point that has
-                // actually tried to run the thing. Bail out of the whole loop —
-                // the remaining programs would each pay another failed spawn and
-                // print another identical warning.
-                Err(e) if e.is_binary_unusable() => {
-                    warn!(error = %e, "lean ordering certificate skipped: verifier not runnable");
-                    rep.verified = false;
-                    rep.reason = Some(format!("verifier not runnable: {e}"));
-                    return Ok(rep);
-                }
-                Err(e) => return Err(format!("program {pi} (T={t}): lean verifier failed: {e}")),
-            };
-            // A REJECTION IS A BUG CAUGHT. Never downgraded: `Err` from this hook
-            // aborts emission before any bytes are written.
-            if !cert.ok {
-                return Err(format!(
-                    "program {pi} (T={t}): GQ order not topological over counter edges: {}",
-                    cert.reason.unwrap_or_default()
-                ));
-            }
-            info!(
-                program = pi,
-                t,
-                entries = n,
-                "lean ordering certificate: GQ order topological over counter edges"
-            );
             // LdsFitSound (checkpoint G): every always-staged GEMV instance in this
             // program must fit the decode-object LDS arena — the task-9 bug class,
             // rejected at emit. The staged set mirrors op_gemm.h's "x is ALWAYS
@@ -1302,29 +1397,35 @@ fn devblob_verify_hook(
                     .collect();
                 let n_staged = staged.len();
                 let arena = devgen::decode_arena_halves();
-                let cert = match lean_verify::call(
-                    "G",
-                    serde_json::json!({ "arena": arena, "ops": staged }),
-                ) {
+                // Bound peak payload memory to one program while sharing verifier startup.
+                let requests = [("D", serde_json::to_value(&req).map_err(|e| e.to_string())?),
+                    ("G", serde_json::json!({ "arena": arena, "ops": staged }))];
+                let certs = match lean_verify::call_batch(&requests) {
                     Ok(c) => c,
                     Err(e) if e.is_binary_unusable() => {
-                        warn!(error = %e, "LdsFitSound skipped: verifier not runnable");
+                        warn!(error = %e, "ordering/LDS checks skipped: verifier not runnable");
                         rep.verified = false;
                         rep.reason = Some(format!("verifier not runnable: {e}"));
                         return Ok(rep);
                     }
                     Err(e) => {
                         return Err(format!(
-                            "program {pi} (T={t}): LdsFitSound call failed: {e}"
+                            "program {pi} (T={t}): ordering/LDS batch failed: {e}"
                         ))
                     }
                 };
-                if !cert.ok {
+                if !certs[0].ok {
+                    return Err(format!("program {pi} (T={t}): GQ order not topological over counter edges: {}",
+                        certs[0].reason.as_deref().unwrap_or_default()));
+                }
+                if !certs[1].ok {
                     return Err(format!(
                         "program {pi} (T={t}): LdsFitSound REJECTED: {}",
-                        cert.reason.unwrap_or_default()
+                        certs[1].reason.as_deref().unwrap_or_default()
                     ));
                 }
+                info!(program = pi, t, entries = n,
+                    "lean ordering certificate: GQ order topological over counter edges");
                 info!(
                     program = pi,
                     t,
@@ -1362,7 +1463,7 @@ fn devblob_verify_hook(
                 lean_correctness: Some(plow_asset::ModularLeanCorrectness {
                     ordering_verified: true,
                     lds_fit_verified: true,
-                    rewrite_soundness_verified: rep.rewrite_verified,
+                    rewrite_name_catalog_checked: rep.rewrite_verified,
                     reason: None,
                 }),
                 lean_performance: perf,
@@ -1371,7 +1472,8 @@ fn devblob_verify_hook(
         // Every program certified. `verified` claims exactly that and nothing more.
         rep.verified = true;
         let all_corr = rep.verified && rep.rewrite_verified;
-        let all_perf = rep.oracle;
+        let all_perf = !rep.modular_blocks.is_empty() && rep.modular_blocks.iter().all(|block|
+            block.lean_performance.as_ref().is_some_and(|perf| perf.structural_bound_certified));
         let total_cp: u64 = rep
             .modular_blocks
             .iter()
@@ -1384,8 +1486,8 @@ fn devblob_verify_hook(
             .sum();
         let n_blocks = rep.modular_blocks.len();
         rep.modular_summary = Some(plow_asset::ModularLeanSummary {
-            all_correctness_verified: all_corr,
-            all_performance_certified: all_perf,
+            all_abstract_checks_passed: all_corr,
+            all_structural_bounds_certified: all_perf,
             total_critical_path_cycles: total_cp,
             total_lower_bound_us: total_us,
             blocks_verified: n_blocks,
@@ -1432,41 +1534,42 @@ fn devblob_oracle_prog(
     let bytes: u64 = touched
         .iter()
         .filter_map(|&t| m.tensors.get(t as usize))
-        .filter(|td| !td.name.starts_with("kv."))
         .map(|td| td.bytes)
         .sum();
     let req = lb::LowerBoundRequest {
         edges,
         durations: vec![1; p.insts.len()],
-        total_hbm_bytes: bytes,
+        // Allocation capacity is not streamed traffic. Until measured costs
+        // are bound to selected kernels, this query checks graph depth only.
+        total_hbm_bytes: 0,
         peak_bw_bytes_per_cycle: bw_bytes_per_cycle.max(1),
         total_flops: 0,
         peak_flops_per_cycle: 1,
     };
     let res = lb::query_lower_bound(&req)?;
-    let us = res.lower_bound as f64 / (clock_hz as f64 / 1e6);
-    let binding = format!("{:?}", res.binding_constraint);
-    let certified = res.certificate.is_some();
+    let mut cost_inputs = devgen::cost_inputs::program(m, p);
+    cost_inputs["topological_depth"] = serde_json::json!(res.critical_path);
+    cost_inputs["legacy_timing_fields"] = serde_json::json!("zero means unavailable, not a measured or predicted duration");
+    let _ = clock_hz;
+    let certified = false;
     info!(
         program = pi,
         insts = p.insts.len(),
         touched_bytes = bytes,
         critical_path_depth = res.critical_path,
-        bw_bound_cycles = res.bw_bound,
-        lower_bound_cycles = res.lower_bound,
-        lower_bound_us = format!("{us:.1}"),
-        binding = ?binding,
         certified,
-        "[oracle] program lower bound (lean)"
+        query_checked = res.certificate.is_some(),
+        "[oracle] graph depth checked; calibrated duration and physical-HBM bounds unavailable"
     );
     Ok(plow_asset::ModularLeanPerformance {
-        critical_path_cycles: res.critical_path as u64,
-        bw_bound_cycles: res.bw_bound as u64,
-        lower_bound_cycles: res.lower_bound as u64,
-        lower_bound_us: us,
-        binding_constraint: binding,
+        critical_path_cycles: 0,
+        bw_bound_cycles: 0,
+        lower_bound_cycles: 0,
+        lower_bound_us: 0.0,
+        binding_constraint: "unavailable_without_measured_kernel_durations_and_physical_traffic".into(),
         touched_bytes: bytes,
-        certified,
+        cost_inputs: Some(cost_inputs),
+        structural_bound_certified: certified,
     })
 }
 
@@ -2668,6 +2771,118 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod cli_tests {
+    #[cfg(feature = "lean-verify")]
+    #[test]
+    #[ignore = "requires built plow_verify"]
+    fn actual_devblob_hook_derives_effects_and_rejects_missing_order() {
+        use packet::dev::DevOp;
+        use packet::devbuild::{Builder, Model};
+        let hook = super::devblob_verify_hook(true, false, 1024, 1_000_000_000, false).unwrap();
+        for ordered in [true, false] {
+            let mut b = Builder::new(1);
+            let x = b.tensor("x", 16);
+            let y = b.tensor("y", 16);
+            let first = b.emit(DevOp::Residual, vec![0], &[], |d| {
+                d.t[..3].copy_from_slice(&[y,x,x]); d.i[0] = 8;
+            });
+            let deps = if ordered { vec![first] } else { vec![] };
+            b.emit(DevOp::Residual, vec![0], &deps, |d| {
+                d.t[..3].copy_from_slice(&[x,y,y]); d.i[0] = 8;
+            });
+            let p = b.finish();
+            let model = Model { n_cu:1,target:0,tensors:p.tensors.clone(),progs:vec![p],
+                kv_row_insts:vec![],prog_t:vec![1],gen:vec![] };
+            let result = hook(&model);
+            if ordered {
+                let report = result.unwrap();
+                assert!(report.logical_effect_gaps.is_empty());
+                assert!(report.compile_checks.iter().any(|check|
+                    check.scope == plow_asset::certificates::SemanticScope::LogicalTensorEffects));
+            } else {
+                assert!(result.unwrap_err().contains("LogicalTensorEffects"));
+            }
+        }
+    }
+
+    #[cfg(feature = "lean-verify")]
+    #[test]
+    #[ignore = "requires built plow_verify"]
+    fn actual_devblob_hook_checks_builder_reduction_witness() {
+        use packet::dev::DevOp;
+        use packet::devbuild::{Builder, Model};
+        let mut builder = Builder::new(1);
+        let a = builder.emit(DevOp::Residual, vec![0], &[], |_| {});
+        let b = builder.emit(DevOp::Residual, vec![0], &[a], |_| {});
+        builder.emit(DevOp::Residual, vec![0], &[a, b], |_| {});
+        let p = builder.finish();
+        let witness = p.reduction_witness.as_ref().unwrap();
+        assert!(witness.original.len() > witness.retained.len());
+        let mut model = Model { n_cu: 1, target: 0, tensors: p.tensors.clone(),
+            progs: vec![p], kv_row_insts: vec![], prog_t: vec![1], gen: vec![] };
+        let hook = super::devblob_verify_hook(true, false, 1024, 1_000_000_000, false).unwrap();
+        let report = hook(&model).unwrap();
+        assert!(report.verified);
+        assert_eq!(report.compile_checks.len(), 2);
+        let rewrite = report.compile_checks.iter().find(|check|
+            check.scope == plow_asset::certificates::SemanticScope::RewriteBodyExpansion).unwrap();
+        assert!(rewrite.request["bodies"].as_array().unwrap().len() > 20);
+        let receipt = report.compile_checks.iter().find(|check|
+            check.scope == plow_asset::certificates::SemanticScope::CoarseDependencyPreservation).unwrap();
+        assert_eq!(receipt.request["task_graph"]["edges"].as_array().unwrap().len(), 3);
+        assert_eq!(receipt.response["ok"], true);
+        assert_eq!(receipt.verifier_sha256, lean_verify::verifier_sha256().unwrap());
+        let saved = model.progs[0].stream.clone();
+        let saved_gq = model.progs[0].gq_stream.clone();
+        let program = &mut model.progs[0];
+        for entry in program.stream.iter_mut().chain(program.gq_stream.iter_mut()) {
+            entry.wait_len = 0;
+        }
+        assert!(hook(&model).unwrap_err().contains("coarse dependency"),
+            "stale builder witnesses cannot certify removed wire waits");
+        model.progs[0].stream = saved;
+        model.progs[0].gq_stream = saved_gq;
+        model.progs[0].reduction_witness.as_mut().unwrap().paths[0] = None;
+        assert!(hook(&model).unwrap_err().contains("coarse dependency"));
+        let program = &mut model.progs[0];
+        for entry in program.stream.iter_mut().chain(program.gq_stream.iter_mut()) {
+            entry.succ_len = 0;
+            entry.wait_len = 0;
+        }
+        let uncovered = hook(&model).unwrap();
+        assert_eq!(uncovered.dependency_binding_gaps.len(), 1);
+        assert!(!uncovered.compile_checks.iter().any(|check|
+            check.scope == plow_asset::certificates::SemanticScope::CoarseDependencyPreservation));
+    }
+
+    #[cfg(feature = "lean-verify")]
+    #[test]
+    #[ignore = "requires built plow_verify"]
+    fn actual_devblob_hook_checks_strided_layout_domain() {
+        use packet::dev::DevOp;
+        use packet::devbuild::{Builder, Model};
+        let mut builder = Builder::new(1);
+        let padded = builder.tensor("padded", 16 * 8192 * 2);
+        let output = builder.tensor("output", 16 * 8 * 256 * 2);
+        let producer = builder.emit(DevOp::FlashMerge, vec![0], &[], |d| {
+            d.t[0] = padded;
+            d.i[..5].copy_from_slice(&[16, 8, 1, 512, 1024]);
+        });
+        builder.emit(DevOp::MlaBmmFp8, vec![0], &[producer], |d| {
+            d.t[..2].copy_from_slice(&[output, padded]);
+            d.i[..6].copy_from_slice(&[16, 8, 256, 512, 0, 1024]);
+        });
+        let p = builder.finish();
+        let mut model = Model { n_cu: 1, target: 0, tensors: p.tensors.clone(),
+            progs: vec![p], kv_row_insts: vec![], prog_t: vec![16], gen: vec![] };
+        let hook = super::devblob_verify_hook(true, false, 1024, 1_000_000_000, false).unwrap();
+        let report = hook(&model).unwrap();
+        assert!(report.compile_checks.iter().any(|check| check.checkpoint == "L"));
+        model.progs[0].insts[1].i[2] = 255;
+        assert!(hook(&model).unwrap_err().contains("LayoutMapping"));
+        model.progs[0].insts[1].i[2] = 256;
+        model.progs[0].insts[0].i[4] = 0;
+        assert!(hook(&model).unwrap_err().contains("matching padded producer"));
+    }
     use super::*;
     use clap::Parser;
 

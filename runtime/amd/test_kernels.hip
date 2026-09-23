@@ -233,6 +233,12 @@ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_bmm_fp8_m16(
     d_mla_bmm_fp8_m16(C, X, W, scale, M, H, N, K, blockIdx.x, gridDim.x);
 }
 extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_bmm_fp8_stride(
+    bf16* C, const bf16* X, const unsigned char* W, const float* scale,
+    unsigned M, unsigned H, unsigned N, unsigned K, unsigned stride) {
+    d_mla_bmm_fp8_m16(C, X, W, scale, M, H, N, K, blockIdx.x, gridDim.x, stride);
+}
+extern "C" __global__ __attribute__((flatten))
 __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_bmm_fp8_qrope(
     bf16* C, bf16* rope, const bf16* X, const unsigned char* W, const float* scale,
     unsigned M, unsigned H, unsigned N, unsigned K) {
@@ -1584,3 +1590,16 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index
 #endif
 
 #endif /* !PLOW_TK_SAFE_ONLY */
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS) void hsa_kernarg_retirement_test(
+    unsigned long long* out, unsigned long long index,
+    unsigned long long value, unsigned long long delay_ticks) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const unsigned long long start = clock64();
+    // Both bounds are finite; this kernel never waits for a host release flag.
+    for (unsigned i = 0; i < (1u << 24) && clock64() - start < delay_ticks; ++i) {
+        __builtin_amdgcn_s_sleep(1);
+    }
+    out[index] = value;
+    __threadfence_system();
+}

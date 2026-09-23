@@ -16,6 +16,10 @@ use crate::{Result, RuntimeError};
 /// scheduler applies before it packs a span onto a sparse rung (`AmdEngine::packed_span_admissible`).
 pub(crate) const SPAN_MIN_PRIOR: u32 = 2047;
 
+fn window_launches(rows: u32, fp8: bool, single_pack: bool, csr: bool) -> usize {
+    if (rows >= 512 || csr) && fp8 && single_pack { 2 } else { 3 }
+}
+
 /// `PLOW_NATIVE_LAUNCH_TIMING`: drain after each launch of a native route and report the split.
 pub(super) struct SplitTimer {
     laps: Option<(std::time::Instant, Vec<(&'static str, f64)>)>,
@@ -25,7 +29,7 @@ impl SplitTimer {
     pub fn start(be: &HsaBackend) -> Result<Self> {
         let on = crate::config::RuntimeConfig::get().amd.native_launch_timing;
         if on {
-            be.synchronize()?;
+            be.synchronize_native_lap()?;
         }
         Ok(Self {
             laps: on.then(|| (std::time::Instant::now(), Vec::new())),
@@ -34,7 +38,7 @@ impl SplitTimer {
 
     pub fn lap(&mut self, be: &HsaBackend, name: &'static str) -> Result<()> {
         if let Some((t, laps)) = &mut self.laps {
-            be.synchronize()?;
+            be.synchronize_native_lap()?;
             laps.push((name, t.elapsed().as_secs_f64() * 1e6));
             *t = std::time::Instant::now();
         }
@@ -224,12 +228,37 @@ impl Route {
     }
 
     /// AQL packets one active whole-sparse `SparseMla::enqueue` is counted as.
-    pub fn active_launches(&self) -> usize {
+    pub fn active_launches(&self, single_pack: bool) -> usize {
         if self.is_rowsplit() {
             5
         } else {
-            3
+            window_launches(self.rows, self.scale.is_some(), single_pack, false)
         }
+    }
+
+    pub fn split_launches(&self, single_pack: bool) -> usize {
+        1 + window_launches(self.rows - self.split_row0, self.scale.is_some(), single_pack, false)
+    }
+
+    fn csr_key(&self, rank: u32) -> Result<Option<(u32, u32)>> {
+        if self.active && self.is_rowsplit() {
+            let prior = self.rows.checked_mul(8).and_then(|n| self.kv_len.checked_sub(n))
+                .ok_or_else(|| RuntimeError::Rejected("invalid row-band CSR bounds".into()))?;
+            return match band_keys(prior, rank, self.rows) {
+                Some(BandKeys::Selection) => Ok(None),
+                Some(BandKeys::Identity { band_prior }) => Ok(Some((band_prior, self.rows))),
+                None => Err(RuntimeError::Rejected("row-band CSR straddles fixed-width boundary".into())),
+            };
+        }
+        if !self.active && self.split_row0 != 0 && self.native_lo {
+            let prior = self.kv_len.checked_sub(self.rows)
+                .ok_or_else(|| RuntimeError::Rejected("invalid lower-half CSR bounds".into()))?;
+            if self.split_row0 >= self.rows || prior.checked_add(self.split_row0) != Some(SPAN_MIN_PRIOR) {
+                return Err(RuntimeError::Rejected("invalid lower-half CSR split".into()));
+            }
+            return Ok(Some((prior, self.split_row0)));
+        }
+        Ok(None)
     }
 
     /// `(flash, union, rows)`: the instructions whose row count the interpreter half runs with.
@@ -243,6 +272,69 @@ impl Route {
 mod tests {
     use super::*;
     use packet::dev::StreamEnt;
+
+    #[test]
+    fn sparse_packet_accounting_matches_single_pass_selection() {
+        for rows in [1, 511, 512, 8192] {
+            for fp8 in [false, true] {
+                for loaded in [false, true] {
+                    for csr in [false, true] {
+                        let single = (rows >= 512 || csr) && fp8 && loaded;
+                        assert_eq!(window_launches(rows, fp8, loaded, csr), if single { 2 } else { 3 });
+                    }
+                }
+            }
+        }
+        let mut route = Route {
+            inst: DevInst64 { i: [1, 8, 8192, 0, 512, 0, 0, 0], ..Default::default() },
+            index: 8, scale: Some(9), rows: 512, kv_len: 4096, active: true,
+            ix: 0, union_ix: None, split_row0: 0, native_lo: false, local_index: false,
+        };
+        assert_eq!(route.active_launches(true), 2);
+        assert_eq!(route.active_launches(false), 3);
+        route.rows = 511;
+        assert_eq!(route.active_launches(true), 3);
+        route.rows = 8192;
+        route.scale = None;
+        assert_eq!(route.active_launches(true), 3);
+        route.inst.i[1] = 64;
+        assert_eq!(route.active_launches(true), 5);
+        route.inst.i[1] = 8;
+        route.scale = Some(9);
+        route.rows = 4096;
+        route.split_row0 = 2047;
+        assert_eq!(route.split_launches(true), 3);
+        assert_eq!(route.split_launches(false), 4);
+        route.rows = 2048;
+        assert_eq!(route.split_launches(true), 4);
+    }
+
+    #[test]
+    fn csr_preparation_keys_follow_actual_row_band_and_lower_half_routes() {
+        let mut route = Route {
+            inst: DevInst64 { i: [1, 8, 8192, 0, 4096, 0, 0, 0], ..Default::default() },
+            index: 8, scale: Some(9), rows: 4096, kv_len: 4096, active: false,
+            ix: 0, union_ix: Some(0), split_row0: 2047, native_lo: true, local_index: false,
+        };
+        assert_eq!(route.csr_key(0).unwrap(), Some((0, 2047)));
+        route.kv_len += 1;
+        assert!(route.csr_key(0).is_err());
+        route.kv_len = 0;
+        assert!(route.csr_key(0).is_err());
+        route.native_lo = false;
+        assert_eq!(route.csr_key(0).unwrap(), None);
+        route.inst.i[1] = 64;
+        route.active = true;
+        route.rows = 512;
+        route.kv_len = 4096;
+        assert_eq!(route.csr_key(0).unwrap(), Some((0, 512)));
+        assert_eq!(route.csr_key(3).unwrap(), Some((1536, 512)));
+        assert_eq!(route.csr_key(4).unwrap(), None);
+        route.kv_len = 4097;
+        assert!(route.csr_key(3).is_err());
+        route.kv_len = 1;
+        assert!(route.csr_key(0).is_err());
+    }
 
     #[test]
     #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR"]
@@ -1105,7 +1197,19 @@ struct LoCsr {
 }
 
 impl LoCsr {
-    /// Drop the staged `(prior, rows)` so the next [`Self::stage`] re-uploads unconditionally.
+    fn matches(&self, prior: u32, rows: u32) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.prior.load(Relaxed) == prior && self.rows.load(Relaxed) == rows
+    }
+
+    fn require(&self, prior: u32, rows: u32) -> Result<()> {
+        if !self.matches(prior, rows) {
+            return Err(RuntimeError::Rejected("sparse CSR was not prepared before admission".into()));
+        }
+        Ok(())
+    }
+
+    /// Drop the staged `(prior, rows)` so the next preparation re-uploads unconditionally.
     fn forget(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         self.prior.store(u32::MAX, Relaxed);
@@ -1113,11 +1217,11 @@ impl LoCsr {
     }
 
     /// Upload the identity CSR of `rows` rows after `prior` unless it is already staged.
-    fn stage(&self, be: &HsaBackend, prior: u32, rows: u32) -> Result<()> {
+    fn stage_quiescent(&self, be: &HsaBackend, prior: u32, rows: u32) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
-        if self.prior.load(Relaxed) != prior || self.rows.load(Relaxed) != rows {
-            // Launches still queued may read the previous layout.
-            be.synchronize()?;
+        if !self.matches(prior, rows) {
+            be.require_quiescent()?;
+            self.forget();
             let (kp, idx) = lo_csr(prior, rows);
             EngineDevice::upload(be, &self.mem, 0, bytemuck::cast_slice(&kp))?;
             EngineDevice::upload(be, &self.mem, LO_IDX_OFF, bytemuck::cast_slice(&idx))?;
@@ -1296,6 +1400,32 @@ mod rowsplit_scratch_tests {
 }
 
 impl SparseMla {
+    pub fn needs_prepare(&self, route: Route, rank: u32) -> Result<bool> {
+        let clear = route.active && route.is_rowsplit()
+            && crate::config::RuntimeConfig::get().amd.glm_rowband_clear_ws;
+        let missing = match route.csr_key(rank)? {
+            Some((prior, rows)) => !self.lo.as_ref()
+                .ok_or_else(|| RuntimeError::Rejected("sparse CSR allocation missing".into()))?
+                .matches(prior, rows),
+            None => false,
+        };
+        Ok(clear || missing)
+    }
+
+    pub fn prepare_quiescent(&self, be: &HsaBackend, route: Route, rank: u32) -> Result<()> {
+        be.require_quiescent()?;
+        let key = route.csr_key(rank)?;
+        if route.active && route.is_rowsplit() && crate::config::RuntimeConfig::get().amd.glm_rowband_clear_ws {
+            self.clear_workspace_quiescent(be)?;
+        }
+        if let Some((prior, rows)) = key {
+            self.lo.as_ref()
+                .ok_or_else(|| RuntimeError::Rejected("sparse CSR allocation missing".into()))?
+                .stage_quiescent(be, prior, rows)?;
+        }
+        Ok(())
+    }
+
     pub fn load(
         be: &HsaBackend,
         dir: &Path,
@@ -1427,11 +1557,11 @@ impl SparseMla {
     ///
     /// Deliberately slow and deliberately off by default: a full zero of a workspace sized for
     /// the packet's max rows is hundreds of MB of H2D per dispatch.
-    fn clear_workspace(&self, be: &HsaBackend) -> Result<()> {
+    fn clear_workspace_quiescent(&self, be: &HsaBackend) -> Result<()> {
+        be.require_quiescent()?;
+        if let Some(lo) = self.lo.as_ref() { lo.forget(); }
         const CHUNK: usize = 4 << 20;
         let zeros = vec![0u8; CHUNK];
-        // Launches still queued would otherwise race the clear.
-        be.synchronize()?;
         for mem in std::iter::once(&self._scratch).chain(self.lo.as_ref().map(|l| &l.mem)) {
             let mut off = 0u64;
             while off < mem.len {
@@ -1483,7 +1613,7 @@ impl SparseMla {
                 "native lower half must end at the first 2048-key row".into(),
             ));
         }
-        lo.stage(be, prior, rows)?;
+        lo.require(prior, rows)?;
         let window = SpanWindow {
             row0: 0,
             rows,
@@ -1496,10 +1626,8 @@ impl SparseMla {
 
     /// Launches of [`Self::enqueue_split_lo`] plus [`Self::enqueue_split`].
     pub fn native_lo_launches(&self, route: Route) -> usize {
-        let single = route.rows - route.split_row0 >= 512
-            && route.scale.is_some()
-            && self.pack_fp8_single.is_some();
-        2 + if single { 2 } else { 3 }
+        window_launches(route.split_row0, route.scale.is_some(), self.pack_fp8_single.is_some(), true)
+            + window_launches(route.rows - route.split_row0, route.scale.is_some(), self.pack_fp8_single.is_some(), false)
     }
 
     /// The AQL packets [`Self::enqueue_spans`] emits for `spans` (each span is its own
@@ -1508,11 +1636,17 @@ impl SparseMla {
         spans
             .iter()
             .map(|s| {
-                let single =
-                    s.n_rows >= 512 && route.scale.is_some() && self.pack_fp8_single.is_some();
-                if single { 2 } else { 3 }
+                window_launches(s.n_rows, route.scale.is_some(), self.pack_fp8_single.is_some(), false)
             })
             .sum()
+    }
+
+    pub fn active_launches(&self, route: Route) -> usize {
+        route.active_launches(self.pack_fp8_single.is_some())
+    }
+
+    pub fn split_launches(&self, route: Route) -> usize {
+        route.split_launches(self.pack_fp8_single.is_some())
     }
 
     /// One packed sibling / token-batch body launch: every request span runs the isolated
@@ -1570,7 +1704,7 @@ impl SparseMla {
         let fp8 = route.scale.is_some();
         let row0 = u64::from(w.row0);
         let mut timer = SplitTimer::start(be)?;
-        let single = (w.rows >= 512 || csr.is_some()) && fp8 && self.pack_fp8_single.is_some();
+        let single = window_launches(w.rows, fp8, self.pack_fp8_single.is_some(), csr.is_some()) == 2;
         if csr.is_some() && !single {
             return Err(RuntimeError::Device(
                 "sparse MLA ragged CSR requires the single-pass FP8 pack (ns=1)".into(),
@@ -1676,6 +1810,11 @@ impl SparseMla {
         w: SpanWindow,
         rank: u32,
     ) -> Result<usize> {
+        if let Some((prior, rows)) = route.csr_key(rank)? {
+            self.lo.as_ref()
+                .ok_or_else(|| RuntimeError::Rejected("row-band CSR allocation missing".into()))?
+                .require(prior, rows)?;
+        }
         let (Some(scale), Some(pack)) = (route.scale, self.pack_fp8_single) else {
             return Err(RuntimeError::Device(
                 "row-split sparse MLA requires the FP8 latent cache and the single-pass pack".into(),
@@ -1684,9 +1823,6 @@ impl SparseMla {
         let attention16 = self.attention16.ok_or_else(|| {
             RuntimeError::Device("row-split sparse AITER MLA object was not loaded".into())
         })?;
-        if crate::config::RuntimeConfig::get().amd.glm_rowband_clear_ws {
-            self.clear_workspace(be)?;
-        }
         if !rowsplit_scratch_fits(self.rows_cap, u64::from(w.rows)) {
             return Err(RuntimeError::Device(format!(
                 "row-split sparse MLA: {} rows inflated 8x exceeds the workspace's {} row \
@@ -1758,7 +1894,7 @@ impl SparseMla {
                 let lo = self.lo.as_ref().ok_or_else(|| {
                     RuntimeError::Device("row-band identity keys need the lower-half CSR buffer".into())
                 })?;
-                lo.stage(be, band_prior, w.rows)?;
+                lo.require(band_prior, w.rows)?;
                 Some((lo.mem.base, lo.mem.base + LO_IDX_OFF))
             }
             None => {

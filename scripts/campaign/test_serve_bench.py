@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import campaign
+import client_latency
 
 
 class ServeBenchTests(unittest.TestCase):
@@ -62,6 +63,9 @@ VLLM_ROCM_USE_AITER="1"
                 scripts.append([line[line.index("in8192"):] for line in text.splitlines() if line.startswith("pb_bench ") and "in8192" in line])
                 record = json.loads((Path(args.out) / "run-record.json").read_text())
                 self.assertEqual(record["status"], "prepared")
+                self.assertFalse(record["exact_request_latencies"])
+                self.assertIsNone(record["expected_client_identity"])
+                self.assertNotIn("--plow-exact-latencies", text)
                 self.assertFalse(record["numerics_qualified"])
                 self.assertFalse(record["precision_qualified"])
                 self.assertEqual(record["plow_declared_precision"]["act_enc"], "bf16")
@@ -91,6 +95,30 @@ VLLM_ROCM_USE_AITER="1"
                         self.assertEqual(result.stdout.strip(), "" if mask is None else "-e\nROCR_VISIBLE_DEVICES=2,3")
             self.assertEqual(scripts[0], scripts[1])
             self.assertFalse(Path(args.queue).exists())
+
+    def test_exact_export_is_same_opt_in_for_both_servers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.fixture(root)
+            recipe = Path(args.recipe)
+            recipe.write_text(recipe.read_text().replace("[bench]", "[bench]\nexact_request_latencies=true"))
+            protocols = []
+            for server in ("plow", "vllm"):
+                args.server = server
+                args.out = str(root / server)
+                with patch.object(campaign, "run", return_value=0), patch.dict(os.environ, ROCM_PATH="/rocm"):
+                    campaign.cmd_serve_bench(args)
+                out = Path(args.out)
+                record = json.loads((out / "run-record.json").read_text())
+                self.assertTrue(record["exact_request_latencies"])
+                self.assertEqual(record["expected_client_identity"], client_latency.export_identity())
+                self.assertEqual(record["client_exporter_sha256"], campaign.sha(out / "client_latency.py"))
+                lines = [line.split('"$model"', 1)[1] for line in (out / "run.sh").read_text().splitlines()
+                         if line.startswith("pb_bench ")]
+                self.assertEqual(len(lines), 4)
+                self.assertTrue(all(line.endswith("--plow-exact-latencies") for line in lines))
+                protocols.append(lines)
+            self.assertEqual(*protocols)
 
     def test_partial_checkpoint_refused_before_preparing_run(self):
         with tempfile.TemporaryDirectory() as directory:

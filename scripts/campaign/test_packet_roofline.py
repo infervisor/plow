@@ -1,7 +1,7 @@
 import unittest
 import struct
 
-from packet_roofline import analyze, decode_cost, routed_experts
+from packet_roofline import analyze, decode_cost, routed_experts, trace_priorities
 
 
 class PacketRooflineTests(unittest.TestCase):
@@ -21,6 +21,55 @@ class PacketRooflineTests(unittest.TestCase):
                 analyze(bad, 8192, 6200, 2300, fp8_tflops=4600)
         with self.assertRaises(ValueError):
             analyze(text, 71681, 6200, 2300, fp8_tflops=4600)
+
+    def test_observed_counter_chain_does_not_serialize_independent_packets(self):
+        program = {"n_inst":3,"n_counter":3,"insts":[
+            {"idx":i,"op":4,"op_name":"Residual","blocks":1} for i in range(3)],
+            "counters":{"per_counter":[
+                {"id":0,"producer":0,"threshold":1,"consumers":[2]},
+                {"id":1,"producer":1,"threshold":1,"consumers":[2]},
+                {"id":2,"producer":2,"threshold":1,"consumers":[]}]}}
+        def record(inst, ready, end):
+            return struct.pack("<IIIHHQQQ",0,inst,inst,4,0,ready,ready,end)
+        trace = record(0,1,11) + record(1,1,21) + record(2,21,26)
+        result = trace_priorities(trace,program,1e9)
+        self.assertEqual(result["counter_chain_ns"],25)
+        self.assertEqual(result["observed_wall_ns"],25)
+        self.assertEqual(result["chain"],[1,2])
+        self.assertEqual(result["priorities"][0]["instruction"],1)
+        self.assertEqual(result["priorities"][-1]["chain_slack_ns"],10)
+        self.assertFalse(result["performance_qualified"])
+        import copy
+        for mutation in range(14):
+            bad = copy.deepcopy(program)
+            raw = trace
+            hz = 1e9
+            if mutation == 0: raw = raw[:-1]
+            elif mutation == 1: raw = raw[:80]
+            elif mutation == 2: raw += raw[:40]
+            elif mutation == 3: bad["insts"][0]["op"] = 5
+            elif mutation == 4: bad["counters"]["per_counter"][0]["threshold"] = 2
+            elif mutation == 5: bad["counters"]["per_counter"][2]["consumers"] = [0]
+            elif mutation == 6: bad["n_counter"] = 4
+            elif mutation == 7: hz = float("nan")
+            elif mutation == 8: hz = True
+            elif mutation == 9: bad["counters"]["per_counter"][0]["id"] = -1
+            elif mutation == 10: bad["counters"]["per_counter"][0]["id"] = 3
+            elif mutation == 11: bad["counters"]["per_counter"][0]["threshold"] = True
+            elif mutation == 12: bad["n_counter"] = True
+            else: bad["insts"][0]["idx"] = False
+            with self.assertRaises(ValueError, msg=f"mutation {mutation}"):
+                trace_priorities(raw,bad,hz)
+
+    def test_roofline_is_explicitly_conditional_not_physical_traffic(self):
+        text = "===== program T=1 1 insts\n#0 Gemv b=256 C<-x | M=1 N=128 K=256\n"
+        result = analyze(text,512,6200,2300)
+        self.assertIsNone(result["physical_hbm_bytes"])
+        self.assertFalse(result["performance_qualified"])
+        self.assertEqual(result["logical_operand_bytes"],result["bytes"])
+        for value in (float("nan"),float("inf"),-1,0):
+            with self.assertRaises(ValueError): analyze(text,512,value,2300)
+            with self.assertRaises(ValueError): analyze(text,512,6200,value)
 
     def test_native_mla_fp8_counts_all_heads_and_one_scalar_scale(self):
         text = ("===== program T=16  2 insts\n"
