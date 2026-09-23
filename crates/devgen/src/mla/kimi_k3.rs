@@ -2003,6 +2003,7 @@ mod kimi_k3_tests {
             algorithm: tunedb::AttentionAlgorithm::SplitReduce,
             nsplit,
             digests: tunedb::Digests {
+                execution: None,
                 implementation: "test-unprobed".into(),
                 interpreter: "test-unprobed".into(),
                 toolchain: "test-unprobed".into(),

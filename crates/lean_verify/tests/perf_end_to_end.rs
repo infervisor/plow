@@ -7,6 +7,11 @@ use serde_json::{json, Value};
 const RUNG: &str = "glm53-tp8/prog3/T8192/rows8192/prior65536";
 
 fn arm(id: &str, samples: &[f64], controls: Option<(&str, &str)>) -> Value {
+    let samples: Vec<_> = if samples.len() >= 3 {
+        samples.iter().copied().cycle().take(30).collect()
+    } else {
+        samples.to_vec()
+    };
     let mut e = json!({
         "id": id, "job": "j", "harness": "proto", "metric": "chunk_ms", "better": "lower",
         "hardware": {"box": "8xMI300X", "rocm": "7.14", "driver": null, "firmware": null},
@@ -16,11 +21,16 @@ fn arm(id: &str, samples: &[f64], controls: Option<(&str, &str)>) -> Value {
     if let Some((c, c2)) = controls {
         e["control_of"] = json!(c);
         e["repeat_control_of"] = json!(c2);
+        e["repeat_treatment_of"] = json!(if id == "t" { "t2" } else { "t" });
     }
     e
 }
 
 fn flip(treat: &[f64], neutral: bool, numeric: bool, facts: Value) -> Value {
+    let mut facts = facts.as_array().unwrap().clone();
+    if !numeric || !facts.is_empty() {
+        facts.push(json!({"kind": "gate", "pass": true, "evidence": "synthetic fixture gate"}));
+    }
     let mut touched = json!({"rung": RUNG, "treat": "t"});
     if neutral {
         touched["neutral_evidence"] = json!(["unchanged by design"]);
@@ -30,6 +40,7 @@ fn flip(treat: &[f64], neutral: bool, numeric: bool, facts: Value) -> Value {
             arm("c", &[660.0, 662.0, 664.0], None),
             arm("c2", &[661.0, 663.0, 665.0], None),
             arm("t", treat, Some(("c", "c2"))),
+            arm("t2", treat, Some(("c", "c2"))),
         ],
         "touched": [touched],
         "untouched": [{"rung": "packet", "base": "8b15f4a2", "variant": "8b15f4a2"}],
@@ -139,9 +150,36 @@ fn history_replay() {
     for case in fx["cases"].as_array().unwrap() {
         assert_eq!(
             verdict(&case["request"]),
-            case["expect"].as_str().unwrap(),
+            "insufficient_evidence",
             "{}",
             case["name"]
         );
     }
+}
+
+#[test]
+#[ignore = "requires plow_verify binary"]
+fn empty_and_failed_gate_never_qualify() {
+    assert_eq!(verdict(&json!({"ledger": [], "touched": [], "untouched": [],
+        "tier4": false, "numeric": false})), "insufficient_evidence");
+    let failed = json!([{"kind": "gate", "pass": false, "evidence": "numerical mismatch"}]);
+    assert_eq!(verdict(&flip(&[638., 640., 642.], false, false, failed)), "reject");
+}
+
+#[test]
+#[ignore = "requires plow_verify binary"]
+fn repeated_treatment_and_both_spreads_are_required() {
+    let fast = [638., 640., 642.];
+    let mut p = flip(&fast, false, false, json!([]));
+    p["ledger"][3]["samples"] = json!(vec![650.; 30]);
+    assert_eq!(verdict(&p), "insufficient_evidence");
+    let mut p = flip(&fast, false, false, json!([]));
+    p["ledger"][2].as_object_mut().unwrap().remove("repeat_treatment_of");
+    assert_eq!(verdict(&p), "insufficient_evidence");
+    let mut p = flip(&fast, false, false, json!([]));
+    p["ledger"][3]["samples"] = json!(vec![640.; 29]);
+    assert_eq!(verdict(&p), "insufficient_evidence");
+    let mut p = flip(&fast, false, false, json!([]));
+    p["ledger"][3]["id"] = json!("t");
+    assert_eq!(verdict(&p), "reject");
 }

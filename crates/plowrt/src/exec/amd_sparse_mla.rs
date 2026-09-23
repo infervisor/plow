@@ -16,6 +16,10 @@ use crate::{Result, RuntimeError};
 /// scheduler applies before it packs a span onto a sparse rung (`AmdEngine::packed_span_admissible`).
 pub(crate) const SPAN_MIN_PRIOR: u32 = 2047;
 
+fn window_launches(rows: u32, fp8: bool, single_pack: bool, csr: bool) -> usize {
+    if (rows >= 512 || csr) && fp8 && single_pack { 2 } else { 3 }
+}
+
 /// `PLOW_NATIVE_LAUNCH_TIMING`: drain after each launch of a native route and report the split.
 pub(super) struct SplitTimer {
     laps: Option<(std::time::Instant, Vec<(&'static str, f64)>)>,
@@ -224,12 +228,16 @@ impl Route {
     }
 
     /// AQL packets one active whole-sparse `SparseMla::enqueue` is counted as.
-    pub fn active_launches(&self) -> usize {
+    pub fn active_launches(&self, single_pack: bool) -> usize {
         if self.is_rowsplit() {
             5
         } else {
-            3
+            window_launches(self.rows, self.scale.is_some(), single_pack, false)
         }
+    }
+
+    pub fn split_launches(&self, single_pack: bool) -> usize {
+        1 + window_launches(self.rows - self.split_row0, self.scale.is_some(), single_pack, false)
     }
 
     /// `(flash, union, rows)`: the instructions whose row count the interpreter half runs with.
@@ -243,6 +251,42 @@ impl Route {
 mod tests {
     use super::*;
     use packet::dev::StreamEnt;
+
+    #[test]
+    fn sparse_packet_accounting_matches_single_pass_selection() {
+        for rows in [1, 511, 512, 8192] {
+            for fp8 in [false, true] {
+                for loaded in [false, true] {
+                    for csr in [false, true] {
+                        let single = (rows >= 512 || csr) && fp8 && loaded;
+                        assert_eq!(window_launches(rows, fp8, loaded, csr), if single { 2 } else { 3 });
+                    }
+                }
+            }
+        }
+        let mut route = Route {
+            inst: DevInst64 { i: [1, 8, 8192, 0, 512, 0, 0, 0], ..Default::default() },
+            index: 8, scale: Some(9), rows: 512, kv_len: 4096, active: true,
+            ix: 0, union_ix: None, split_row0: 0, native_lo: false, local_index: false,
+        };
+        assert_eq!(route.active_launches(true), 2);
+        assert_eq!(route.active_launches(false), 3);
+        route.rows = 511;
+        assert_eq!(route.active_launches(true), 3);
+        route.rows = 8192;
+        route.scale = None;
+        assert_eq!(route.active_launches(true), 3);
+        route.inst.i[1] = 64;
+        assert_eq!(route.active_launches(true), 5);
+        route.inst.i[1] = 8;
+        route.scale = Some(9);
+        route.rows = 4096;
+        route.split_row0 = 2047;
+        assert_eq!(route.split_launches(true), 3);
+        assert_eq!(route.split_launches(false), 4);
+        route.rows = 2048;
+        assert_eq!(route.split_launches(true), 4);
+    }
 
     #[test]
     #[ignore = "requires a gfx942 GPU lease and PLOW_TEST_AITER_DIR"]
@@ -1508,11 +1552,17 @@ impl SparseMla {
         spans
             .iter()
             .map(|s| {
-                let single =
-                    s.n_rows >= 512 && route.scale.is_some() && self.pack_fp8_single.is_some();
-                if single { 2 } else { 3 }
+                window_launches(s.n_rows, route.scale.is_some(), self.pack_fp8_single.is_some(), false)
             })
             .sum()
+    }
+
+    pub fn active_launches(&self, route: Route) -> usize {
+        route.active_launches(self.pack_fp8_single.is_some())
+    }
+
+    pub fn split_launches(&self, route: Route) -> usize {
+        route.split_launches(self.pack_fp8_single.is_some())
     }
 
     /// One packed sibling / token-batch body launch: every request span runs the isolated
@@ -1570,7 +1620,7 @@ impl SparseMla {
         let fp8 = route.scale.is_some();
         let row0 = u64::from(w.row0);
         let mut timer = SplitTimer::start(be)?;
-        let single = (w.rows >= 512 || csr.is_some()) && fp8 && self.pack_fp8_single.is_some();
+        let single = window_launches(w.rows, fp8, self.pack_fp8_single.is_some(), csr.is_some()) == 2;
         if csr.is_some() && !single {
             return Err(RuntimeError::Device(
                 "sparse MLA ragged CSR requires the single-pass FP8 pack (ns=1)".into(),

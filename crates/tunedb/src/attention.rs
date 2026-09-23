@@ -126,6 +126,16 @@ pub struct AttentionSelection {
     pub source: AttentionSource,
 }
 
+fn eligible(record: &AttentionMeasurement, cell: &AttentionCell, want: &Digests,
+    caps: AttentionCapabilities) -> bool {
+    record.cell == *cell && record.state.is_selectable()
+        && record.qualification_blockers().is_empty()
+        && record.stats.median_ns.is_finite() && record.stats.median_ns > 0.0
+        && record.digests.stale_against(want).is_empty()
+        && record.nsplit >= 1 && record.nsplit <= caps.max_nsplit.max(1)
+        && (record.algorithm != AttentionAlgorithm::Persistent || caps.persistent)
+}
+
 /// Select the fastest exact-cell record that is qualified, current, correct,
 /// and executable by this packet/object pair. Missing evidence preserves the
 /// fixed fallback; there is deliberately no nearest-neighbour interpolation.
@@ -138,15 +148,7 @@ pub fn select_attention(
 ) -> AttentionSelection {
     if let Some(best) = records
         .iter()
-        .filter(|r| {
-            r.cell == *cell
-                && r.state.is_selectable()
-                && matches!(r.correctness, Correctness::Pass)
-                && r.digests.stale_against(want).is_empty()
-                && r.nsplit >= 1
-                && r.nsplit <= caps.max_nsplit.max(1)
-                && (r.algorithm != AttentionAlgorithm::Persistent || caps.persistent)
-        })
+        .filter(|record| eligible(record, cell, want, caps))
         .min_by(|a, b| a.stats.median_ns.total_cmp(&b.stats.median_ns))
     {
         return AttentionSelection {
@@ -162,12 +164,38 @@ pub fn select_attention(
     }
 }
 
+/// The compiler can check selection against the exact eligible measured population.
+/// This is not a four-arm serving-performance certificate.
+pub fn policy_witness(records: &[AttentionMeasurement], cell: &AttentionCell, want: &Digests,
+    caps: AttentionCapabilities, selected: AttentionSelection) -> Option<serde_json::Value> {
+    if selected.source != AttentionSource::Qualified { return None; }
+    let domain = plow_asset::decode_objects::image_sha256(&serde_json::to_vec(
+        &(cell, want, caps.max_nsplit, caps.persistent)).ok()?);
+    let candidates: std::collections::BTreeMap<_, _> = records.iter()
+        .filter(|record| eligible(record, cell, want, caps))
+        .map(|record| {
+            let key = plow_asset::decode_objects::image_sha256(&serde_json::to_vec(record).unwrap());
+            (key, record)
+        }).collect();
+    let (key, _) = candidates.iter().filter(|(_, record)|
+        record.algorithm == selected.algorithm && record.nsplit == selected.nsplit)
+        .min_by(|(_, a), (_, b)| a.stats.median_ns.total_cmp(&b.stats.median_ns))?;
+    Some(serde_json::json!({
+        "required": [domain],
+        "candidates": candidates.iter().map(|(key, record)| serde_json::json!({
+            "domain": domain, "key": key, "cost": record.stats.median_ns, "qualified": true
+        })).collect::<Vec<_>>(),
+        "choices": [{"domain": domain, "key": key}],
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn digests(tag: &str) -> Digests {
         Digests {
+            execution: None,
             implementation: tag.into(),
             interpreter: tag.into(),
             toolchain: "rocm-7.2".into(),
@@ -213,6 +241,32 @@ mod tests {
         );
         assert_eq!(got.nsplit, 32);
         assert_eq!(got.source, AttentionSource::Qualified);
+    }
+
+    #[test]
+    fn witness_binds_measured_population_and_ignores_invalid_records() {
+        let c = cell(16, 8192);
+        let want = digests("build-a");
+        let caps = AttentionCapabilities { max_nsplit: 64, persistent: false };
+        let baseline = rec(c.clone(), 16, 80.0);
+        let fast = rec(c.clone(), 32, 60.0);
+        let mut invalid = rec(c.clone(), 8, 1.0);
+        invalid.stats.samples = 1;
+        let mut nan = invalid.clone();
+        nan.stats.samples = 5;
+        nan.stats.median_ns = f64::NAN;
+        let records = vec![baseline, fast.clone(), fast, invalid, nan];
+        let selected = select_attention(&records, &c, &want, caps, 64);
+        assert_eq!(selected.nsplit, 32);
+        let witness = policy_witness(&records, &c, &want, caps, selected).unwrap();
+        assert_eq!(witness["candidates"].as_array().unwrap().len(), 2);
+        let chosen = witness["choices"][0]["key"].as_str().unwrap();
+        let candidate = witness["candidates"].as_array().unwrap().iter()
+            .find(|entry| entry["key"] == chosen).unwrap();
+        assert_eq!(candidate["cost"], 60000.0);
+        let mut changed = want.clone();
+        changed.oracle = "new-oracle".into();
+        assert!(policy_witness(&records, &c, &changed, caps, selected).is_none());
     }
 
     #[test]

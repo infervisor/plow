@@ -6,6 +6,7 @@ pub mod perf;
 pub mod scope;
 pub mod rewrite;
 pub mod schedule;
+pub mod policy;
 pub mod sram;
 pub mod tile_partition;
 pub mod wire;

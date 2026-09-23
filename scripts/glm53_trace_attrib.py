@@ -18,11 +18,11 @@ time to interpreter overhead or establish a critical path.
 
     python3 scripts/glm53_trace_attrib.py trace.bin --opcodes opcodes.csv --ghz 0.1
 """
-import argparse, collections, struct, sys
+import argparse, collections, re, struct, sys
 
 AP = argparse.ArgumentParser()
 AP.add_argument("trace")
-AP.add_argument("--opcodes", required=True, help="CSV of NAME,opcode from dev_isa.h")
+AP.add_argument("--opcodes", required=True, help="CSV of NAME,opcode or the dev_isa.h header")
 AP.add_argument("--ghz", type=float, default=0.1, help="trace clock in GHz (~100 MHz)")
 AP.add_argument("--top", type=int, default=16)
 AP.add_argument("--drain-ms", type=float, default=None, help="measured GPU drain for this step")
@@ -30,6 +30,11 @@ A = AP.parse_args()
 
 names = {}
 for line in open(A.opcodes):
+    if A.opcodes.endswith(".h"):
+        match = re.match(r"\s*(?:#define\s+)?PLOW_DOP_(\w+)(?:\s*=\s*|\s+)(\d+)\b", line)
+        if match:
+            names[int(match[2])] = match[1]
+        continue
     line = line.strip()
     if not line or "," not in line:
         continue

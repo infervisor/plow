@@ -242,17 +242,15 @@ pub fn check_assets(blob: &Path) -> Result<()> {
     };
     let rejected = |e: String| RuntimeError::Rejected(format!("{}: {e}", path.display()));
     let (knobs, rungs) = read_knobs(std::io::BufReader::new(file)).map_err(rejected)?;
-    if !has_perf_cert(rungs.as_ref()) {
-        // Every TP rank loads the same packet; one warning per process.
-        static PERF_CERT_WARNED: std::sync::Once = std::sync::Once::new();
-        PERF_CERT_WARNED.call_once(|| {
-            tracing::warn!(
-                manifest = %path.display(),
-                "no checkpoint P certificate (build.json has no `rungs[].perf_cert`): this packet's \
-                 knob defaults load without a measured performance certificate"
-            );
-        });
-    }
+    // Scoped stamps are claims, not authentication of evidence or execution identity.
+    static PERF_CERT_WARNED: std::sync::Once = std::sync::Once::new();
+    PERF_CERT_WARNED.call_once(|| {
+        tracing::warn!(
+            manifest = %path.display(),
+            scoped_claims_present = has_scoped_perf_claim(rungs.as_ref()),
+            "packet loads without execution-bound performance qualification"
+        );
+    });
     let Some(knobs) = knobs else {
         tracing::warn!(
             manifest = %path.display(),
@@ -264,10 +262,26 @@ pub fn check_assets(blob: &Path) -> Result<()> {
     check_knobs(&knobs, RuntimeConfig::get()).map_err(rejected)
 }
 
-fn has_perf_cert(rungs: Option<&Value>) -> bool {
-    rungs
-        .and_then(Value::as_array)
-        .is_some_and(|r| r.iter().any(|x| x.get("perf_cert").is_some()))
+fn has_scoped_perf_claim(rungs: Option<&Value>) -> bool {
+    let Some(rungs) = rungs.and_then(Value::as_array).filter(|r| !r.is_empty()) else {
+        return false;
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    rungs.iter().all(|rung| {
+        let Some(name) = rung.get("rung").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        seen.insert(name) && rung.get("perf_cert").and_then(Value::as_array)
+            .filter(|certs| !certs.is_empty()).is_some_and(|certs| certs.iter().all(|cert| {
+                cert.get("checkpoint").and_then(Value::as_str) == Some("P")
+                    && cert.get("ok").and_then(Value::as_bool) == Some(true)
+                    && cert.get("scope").and_then(Value::as_str) == Some("knob_rung")
+                    && cert.get("knob").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+                    && matches!(cert.get("basis").and_then(Value::as_str), Some("measured" | "carry_over"))
+                    && cert.get("cert_sha256").and_then(Value::as_str).is_some_and(|s|
+                        s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+            }))
+    })
 }
 
 type HeadBlocks = (Option<Value>, Option<Value>);
@@ -535,6 +549,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.ragged_chunk", Some("PLOW_RAGGED_CHUNK"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.ragged_seams", Some("PLOW_AMD_RAGGED_SEAMS"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.mla_ns_live", Some("PLOW_MLA_NS_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.mla_bf16_metadata_hoist", Some("PLOW_MLA_BF16_METADATA_HOIST"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.nv_ns_live", Some("PLOW_NV_NS_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.amd_decode_dense_exact", Some("PLOW_AMD_DECODE_DENSE_EXACT"), Layer::Runtime, Domain::Bool, OFF, OPT_IN).scoped(DECODE_DENSE_EXACT_SCOPE),
     KnobSpec::new("rt.glm_rowband", Some("PLOW_GLM_ROWBAND"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
@@ -760,6 +775,16 @@ mod tests {
     /// Every `cannot combine` / `requires PLOW_` site in devgen and plowrt, and what encodes it.
     /// The asserts stay as defence; this keeps a new one from landing unencoded.
     const ASSERT_SITES: &[(&str, &str, Site)] = &[
+        (
+            "mla.rs",
+            "PLOW_GLM_MLA_STRIDED_WV requires PLOW_GLM_MLA_BF16_PS",
+            Site::Encoded("mla_strided_wv_contract"),
+        ),
+        (
+            "mla.rs",
+            "PLOW_GLM_MLA_BF16_PS requires PLOW_GLM_MLA_W8A8",
+            Site::Encoded("mla_bf16_ps_contract"),
+        ),
         (
             "emit_config.rs",
             "Runtime offload additionally requires PLOW_ANE_MLP=1",
@@ -1311,7 +1336,9 @@ mod tests {
     /// stops.
     #[test]
     fn head_reader_takes_stamped_rungs() {
-        let rungs = serde_json::json!([{"rung": "packet", "perf_cert": [{"checkpoint": "P"}]}]);
+        let cert = serde_json::json!({"checkpoint": "P", "ok": true, "scope": "knob_rung",
+            "knob": "emit.example", "basis": "measured", "cert_sha256": "a".repeat(64)});
+        let rungs = serde_json::json!([{"rung": "packet", "perf_cert": [cert.clone()]}]);
         let head = serde_json::json!({"schema": 1, "knobs": production_knobs(), "rungs": rungs});
         let mut text = head.to_string();
         text.pop();
@@ -1319,15 +1346,25 @@ mod tests {
         let (knobs, got) = read_knobs(text.as_bytes()).unwrap();
         assert!(knobs.is_some());
         assert_eq!(got.as_ref(), Some(&rungs));
-        assert!(has_perf_cert(got.as_ref()));
+        assert!(has_scoped_perf_claim(got.as_ref()));
 
         let text = serde_json::json!({"knobs": production_knobs(), "programs": []}).to_string();
         let (knobs, got) = read_knobs(text.as_bytes()).unwrap();
         assert!(knobs.is_some() && got.is_none());
-        assert!(!has_perf_cert(got.as_ref()));
-        assert!(!has_perf_cert(Some(
+        assert!(!has_scoped_perf_claim(got.as_ref()));
+        assert!(!has_scoped_perf_claim(Some(
             &serde_json::json!([{"rung": "packet"}])
         )));
+        for invalid in [serde_json::json!(null), serde_json::json!([]),
+            serde_json::json!([{"checkpoint":"P"}]), serde_json::json!([false])] {
+            assert!(!has_scoped_perf_claim(Some(&serde_json::json!([{"rung":"packet", "perf_cert":invalid}]))));
+        }
+        for field in ["checkpoint", "ok", "scope", "knob", "basis", "cert_sha256"] {
+            let mut incomplete = cert.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(!has_scoped_perf_claim(Some(&serde_json::json!([{"rung":"packet", "perf_cert":[incomplete]}]))));
+        }
+        assert!(!has_scoped_perf_claim(Some(&serde_json::json!([rungs[0], rungs[0]]))));
     }
 
     /// Absent and skipped warn and load; failed and a violated constraint refuse.

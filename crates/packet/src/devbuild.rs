@@ -458,6 +458,7 @@ pub struct Builder {
     lean_kda_key_factor_segments: bool,
     /// Isolate adjacent FlashMlaDecode+MlaMergeFold pairs for a gfx950 object.
     decode_mla_segments: bool,
+    decode_mla_bf16_segments: bool,
     /// Isolate adjacent grouped decode GLU+DOWN pairs for ordered raw launches.
     decode_grouped_moe_segments: bool,
     /// Isolate XReduceTwoShot packets for the gfx950 wave-RS interpreter object.
@@ -709,6 +710,7 @@ impl Builder {
             kda_carry_keyfeed_segments: false,
             lean_kda_key_factor_segments: false,
             decode_mla_segments: false,
+            decode_mla_bf16_segments: false,
             decode_grouped_moe_segments: false,
             xreduce_wave_rs_segments: false,
             fuse_materialized_residual_inputs: true,
@@ -1079,6 +1081,11 @@ impl Builder {
     /// Preserve an operation as its own segment without dropping dependency edges.
     pub fn isolate(&mut self, counter: u32) {
         self.ops[counter as usize].isolated = true;
+    }
+
+    pub fn set_decode_mla_bf16_segments(&mut self) {
+        self.deny_uniseg();
+        self.decode_mla_bf16_segments = true;
     }
 
     /// Keep this machine-filling op at one workgroup per executor when segment-class slicing is
@@ -1984,6 +1991,12 @@ impl Builder {
             );
         }
 
+        let original_coarse: Vec<_> = self.ops.iter().enumerate().flat_map(|(consumer, op)|
+            op.deps.iter().filter_map(move |dep| match dep {
+                Dep::Coarse(producer) => Some((*producer, consumer as u32)),
+                Dep::Fine { .. } => None,
+            })).collect();
+
         // CHAIN-BYPASS — a MEASUREMENT INSTRUMENT, numerically WRONG, never shipped.
         //
         // knob-contract §7a-REFINED says a serial packet on the decode chain costs ~5.3 us in the
@@ -2100,7 +2113,7 @@ impl Builder {
         // Lean side needed a coverage statement in terms of `happensBefore` rather than
         // `WellFormed.edgeCovered` — see `lean-plow/Plow/TransitiveReduction.lean`,
         // `tr_preserves_coverage`.
-        {
+        let reduction_witness = {
             let mut edges: BTreeSet<(u32, u32)> = BTreeSet::new();
             for (i, op) in self.ops.iter().enumerate() {
                 for d in &op.deps {
@@ -2146,7 +2159,8 @@ impl Builder {
                     dup
                 );
             }
-        }
+            ReductionWitness::new(n_ops, original_coarse, keep)
+        };
 
         // Which ops does someone depend on FINELY? Those get per-slice counters.
         let mut fine_base = vec![u32::MAX; n_ops];
@@ -2251,6 +2265,11 @@ impl Builder {
                 pair[0].inst.op == DevOp::FlashMlaDecode as u16
                     && pair[1].inst.op == DevOp::MlaMergeFold as u16
             });
+        let bf16_pair = |i: usize| self.ops.get(i..i + 2).is_some_and(|pair| {
+            matches!(DevOp::from_u16(pair[0].inst.op), Some(DevOp::FlashMlaDecode | DevOp::FlashGatherDecode))
+                && pair[1].inst.op == DevOp::FlashMerge as u16
+        });
+        let decode_mla_bf16 = !uniseg && self.decode_mla_bf16_segments;
         let decode_grouped_moe = !uniseg
             && (self.decode_grouped_moe_segments || knobs.moe_decode_standalone)
             && self.ops.windows(2).any(|pair| {
@@ -2334,7 +2353,9 @@ impl Builder {
         let seg_q8 = seg_v2 || v2_env.as_deref() == Some("q8");
         let wave_class = |i: usize| -> u8 {
             let op = self.ops[i].inst.op;
-            if op == DevOp::QwenGdnPrefill as u16 {
+            if decode_mla_bf16 && (bf16_pair(i) || (i > 0 && bf16_pair(i - 1))) {
+                27
+            } else if op == DevOp::QwenGdnPrefill as u16 {
                 21
             } else if op == DevOp::KdaDecodeFused as u16 {
                 // A standalone raw-argument object owns this boundary. Keep its segment pure
@@ -2558,13 +2579,17 @@ impl Builder {
             || mla_materialized
             || mla_aiter
             || decode_mla_segments
+            || decode_mla_bf16
             || decode_grouped_moe
             || isolate_xreduce;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             let producer = dep.producer() as usize;
             let raw_moe_pair_edge =
                 decode_grouped_moe && wave_class(consumer) == 20 && wave_class(producer) == 20;
-            !raw_moe_pair_edge && (!raw_segmented || seg_of[consumer] == seg_of[producer])
+            let raw_mla_pair_edge =
+                decode_mla_bf16 && wave_class(consumer) == 27 && wave_class(producer) == 27;
+            !raw_moe_pair_edge && !raw_mla_pair_edge
+                && (!raw_segmented || seg_of[consumer] == seg_of[producer])
         };
         let mut same_segment_consumer = vec![false; self.ops.len()];
         let mut same_segment_fine_consumer = vec![false; self.ops.len()];
@@ -3064,6 +3089,7 @@ impl Builder {
         };
 
         Program {
+            reduction_witness: Some(reduction_witness),
             n_cu: self.n_cu,
             n_counter,
             hier_base,
@@ -3165,7 +3191,71 @@ pub fn static_seg_ofs(
     Ok(out)
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ReductionWitness {
+    pub original: Vec<(u32, u32)>,
+    pub retained: Vec<(u32, u32)>,
+    pub paths: Vec<Option<Vec<u32>>>,
+}
+
+impl ReductionWitness {
+    fn new(n: usize, original: Vec<(u32, u32)>, retained: BTreeSet<(u32, u32)>) -> Self {
+        let mut next = vec![Vec::new(); n];
+        for &(a, b) in &retained {
+            next[a as usize].push(b);
+        }
+        let paths = original.iter().map(|&(source, target)| {
+            if retained.contains(&(source, target)) {
+                return Some(Vec::new());
+            }
+            let mut parent = vec![u32::MAX; n];
+            let mut queue = std::collections::VecDeque::from([source]);
+            parent[source as usize] = source;
+            while let Some(at) = queue.pop_front() {
+                for &to in &next[at as usize] {
+                    if parent[to as usize] != u32::MAX {
+                        continue;
+                    }
+                    parent[to as usize] = at;
+                    if to == target {
+                        let mut path = Vec::new();
+                        let mut node = at;
+                        while node != source {
+                            path.push(node);
+                            node = parent[node as usize];
+                        }
+                        path.reverse();
+                        return Some(path);
+                    }
+                    queue.push_back(to);
+                }
+            }
+            None
+        }).collect();
+        Self { original, retained: retained.into_iter().collect(), paths }
+    }
+}
+
+#[cfg(test)]
+mod reduction_witness_tests {
+    use super::*;
+
+    #[test]
+    fn retains_original_edges_and_paths_through_final_reduction() {
+        let original = vec![(0, 1), (1, 2), (0, 2), (2, 3), (0, 3)];
+        let kept = transitive_reduction(4, &original.iter().copied().collect());
+        let witness = ReductionWitness::new(4, original.clone(), kept);
+        assert_eq!(witness.original, original);
+        assert_eq!(witness.paths, vec![Some(vec![]), Some(vec![]), Some(vec![1]),
+            Some(vec![]), Some(vec![1, 2])]);
+        let invalid = ReductionWitness::new(2, vec![(0, 1)], BTreeSet::new());
+        assert_eq!(invalid.paths, [None]);
+    }
+}
+
 pub struct Program {
+    /// Pre-flattening coarse-dependency preservation only; not a kernel memory proof.
+    pub reduction_witness: Option<ReductionWitness>,
     pub n_cu: u32,
     pub n_counter: u32,
     /// Base counter id of the two-level maintenance scratch; 0 = hierarchy off. See `DevProgram::hier_base`.
@@ -5939,6 +6029,33 @@ mod kda_wu_lean_tests {
 mod decode_mla_segment_tests {
     use super::*;
 
+    #[test]
+    fn bf16_pair_is_counter_free_and_default_off() {
+        for op in [DevOp::FlashMlaDecode, DevOp::FlashGatherDecode] {
+            for enabled in [false, true] {
+                let mut b = Builder::new(4);
+                if enabled { b.set_decode_mla_bf16_segments(); }
+                let all = b.all();
+                let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+                let flash = b.emit(op, all.clone(), &[before], |_| {});
+                let merge = b.emit(DevOp::FlashMerge, all.clone(), &[flash], |_| {});
+                b.emit(DevOp::Nop, all, &[merge], |_| {});
+                let p = b.finish();
+                let seg = |i| p.stream.iter().find(|e| e.inst == i).unwrap().seg;
+                if enabled {
+                    assert_ne!(seg(0), seg(1)); assert_eq!(seg(1), seg(2)); assert_ne!(seg(2), seg(3));
+                    for e in p.stream.iter().chain(&p.gq_stream).filter(|e| e.seg == seg(1)) {
+                        assert!(matches!(e.inst, 1 | 2));
+                        assert_eq!((e.wait_len, e.succ_len, e.flags & crate::dev::SE_XCTR), (0, 0, 0));
+                    }
+                } else {
+                    assert_eq!(seg(0), seg(3));
+                    assert_ne!(p.insts[2].wait_len, 0);
+                }
+            }
+        }
+    }
+
     fn program(enabled: bool) -> Program {
         let mut b = Builder::new(4);
         b.deny_uniseg();
@@ -6159,6 +6276,7 @@ mod v6_tests {
             tensors: Vec::new(),
             gq_stream: vec![se(0, 0), se(1, 0)],
             gq_seg_ofs: vec![0, 2],
+            reduction_witness: None,
             l2_sms: 0,
             l2_domains: 0,
         };
@@ -6307,6 +6425,7 @@ mod v6_tests {
                 .map(|i| se(i as u32 / 2, i as u32 % 2))
                 .collect(),
             gq_seg_ofs: vec![0, n_inst as u32 * 2],
+            reduction_witness: None,
             l2_sms: 0,
             l2_domains: 0,
         };

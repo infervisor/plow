@@ -448,6 +448,7 @@ mod tests {
 
     fn digests() -> Digests {
         Digests {
+            execution: None,
             implementation: "impl-a".into(),
             interpreter: "interp-a".into(),
             toolchain: "cuda-13.0".into(),

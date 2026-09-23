@@ -6,6 +6,9 @@
 
 #[cfg(any(feature = "hsa", feature = "cuda"))]
 mod kv_layout;
+pub(crate) mod tensor_bindings;
+#[cfg(feature = "hsa")]
+mod chain_admission;
 
 /// The AMD/gfx950 serving engine — a port of the proven `gemma4_chat.c` driver,
 /// deliberately separate from the CUDA engine because the two differ in kind
@@ -22,6 +25,8 @@ mod amd_gemm_lt;
 mod amd_index_tp;
 #[cfg(feature = "hsa")]
 mod amd_mla_fold;
+#[cfg(feature = "hsa")]
+mod amd_mla_bf16;
 #[cfg(feature = "hsa")]
 mod amd_moe_aiter;
 #[cfg(feature = "hsa")]

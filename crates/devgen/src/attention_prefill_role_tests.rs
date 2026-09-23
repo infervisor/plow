@@ -321,6 +321,7 @@ fn hd256_record(model: &Model, image: &[u8]) -> tunedb::AttentionRoleMeasurement
         stats: tunedb::Stats::from_samples(vec![50.0; 5]).unwrap(),
         baseline: tunedb::Stats::from_samples(vec![100.0; 5]).unwrap(),
         digests: tunedb::Digests {
+            execution: None,
             implementation: hd256_implementation(),
             interpreter: object_sha256,
             toolchain: kernelcaps::toolchain_label(hwspec::IsaLevel::Sm90a),

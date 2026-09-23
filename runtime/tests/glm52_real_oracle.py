@@ -52,7 +52,7 @@
 # the whole trusted half of this oracle. Point GLM_EXTRA_DIRS at a directory holding just those two
 # tensors (per layer) from the ORIGINAL fp8 checkpoint and the HF module is buildable again while
 # every other weight comes from the dir plow itself runs on.
-import os, struct, sys, json, mmap
+import os, struct, sys, json, mmap, argparse, copy
 import numpy as np
 import torch
 
@@ -62,11 +62,39 @@ torch.set_grad_enabled(False)
 
 MODEL_DIR = os.environ.get("GLM_MODEL_DIR", "/home/lava/models/GLM-5.2-FP8")
 EXTRA_DIRS = [d for d in os.environ.get("GLM_EXTRA_DIRS", "").split(":") if d]
-OUT = sys.argv[1] if len(sys.argv) > 1 else "glm52_real_fixture.bin"
+parser = argparse.ArgumentParser()
+parser.add_argument("output", nargs="?", default="glm52_real_fixture.bin")
+parser.add_argument("--block-inputs", help="also export raw operands and the reference residual for amd-block")
+parser.add_argument("--candidate-dir", help="diagnose amd-block rank0 dumps against HF; write no fixture")
+parser.add_argument("--batch", type=int, default=1, help="independent decode sequences for block inputs")
+parser.add_argument("--inputs-only", action="store_true", help="omit the legacy weight-bearing fixture")
+parser.add_argument("--block-context", type=int, help="spread supplied selected keys across this logical context")
+parser.add_argument("--shared-w8a8-tp", type=int, default=0,
+                    help="use installed vLLM/AITER FP8 shared-expert reference with this TP degree")
+parser.add_argument("--routed-w8a8", action="store_true",
+                    help="also use pinned AITER routed experts and per-rank BF16 shared addition")
+parser.add_argument("--vllm-post-norm", action="store_true",
+                    help="use vLLM fused residual/RMSNorm on independent HF attention output")
+args = parser.parse_args()
+OUT = args.output
 T = int(os.environ.get("GLM_T", "0"))            # >0 => the T-row prefill fixture (magic GLM8)
+B = args.batch
+if B < 1 or B > 64 or (B > 1 and (T > 0 or args.candidate_dir or not args.inputs_only)):
+    parser.error("batch must be 1..64; batched capture requires --inputs-only and no prefill/candidate mode")
+if args.inputs_only and (not args.block_inputs or T > 0 or args.candidate_dir):
+    parser.error("--inputs-only requires --block-inputs and no prefill/candidate mode")
+if args.shared_w8a8_tp not in (0, 1, 2, 4, 8) or (args.shared_w8a8_tp and not args.inputs_only):
+    parser.error("--shared-w8a8-tp requires --inputs-only and TP 1, 2, 4, or 8")
+if args.vllm_post_norm and not args.inputs_only:
+    parser.error("--vllm-post-norm requires --inputs-only")
+if args.routed_w8a8 and (not args.shared_w8a8_tp or not args.vllm_post_norm):
+    parser.error("--routed-w8a8 requires --shared-w8a8-tp and --vllm-post-norm")
 L = int(os.environ.get("GLM_L", "512"))          # dense context (<=2048 -> indexer no-op)
 if T > 0:
     L = T                                        # prefill: the chunk IS the whole context
+BLOCK_CTX = L if args.block_context is None else args.block_context
+if BLOCK_CTX < L or (args.block_context is not None and (not args.inputs_only or L < 2)):
+    parser.error("--block-context requires --inputs-only, at least two selected keys, and context >= GLM_L")
 LAYER = int(os.environ.get("GLM_LAYER", "3"))    # first sparse layer, "shared" indexer
 BF16 = torch.bfloat16
 
@@ -250,7 +278,10 @@ cfg_i.intermediate_size = 8    # the module's DENSE MLP is never used (the FFN r
                                # init this script would allocate and throw away.
 cfg_i._attn_implementation = "eager"
 layer = GlmMoeDsaDecoderLayer(cfg_i, LAYER).eval()
-rot = GlmMoeDsaRotaryEmbedding(cfg)
+# New Transformers rotary classes use head_dim, while GLM rotates only DR channels.
+rope_cfg = copy.deepcopy(cfg)
+rope_cfg.head_dim = DR
+rot = GlmMoeDsaRotaryEmbedding(rope_cfg)
 
 def cp(param, t):
     param.copy_(t.to(param.dtype).reshape(param.shape))
@@ -273,11 +304,14 @@ bias = None if DENSE else load_tensor(idx, P+"mlp.gate.e_score_correction_bias")
 
 # ---------------------------------------------------------------- inputs (seeded), rope, mask
 g = torch.Generator().manual_seed(0xB4)
-hidden = (0.3 * torch.randn(1, L, H, generator=g)).to(BF16)
-position_ids = torch.arange(L).unsqueeze(0)
+hidden = (0.3 * torch.randn(B, L, H, generator=g)).to(BF16)
+logical_positions = torch.arange(L)
+if BLOCK_CTX != L:
+    logical_positions = logical_positions * (BLOCK_CTX - 1) // (L - 1)
+position_ids = logical_positions.unsqueeze(0).expand(B, -1)
 cos, sin = rot(hidden.float(), position_ids)                              # [1,L,DR]
 mask = torch.triu(torch.full((L, L), torch.finfo(torch.float32).min), 1).view(1, 1, L, L)
-prev_topk = torch.arange(L).view(1, 1, L).expand(1, L, L).to(torch.int32).contiguous()
+prev_topk = torch.arange(L).view(1, 1, L).expand(B, L, L).to(torch.int32).contiguous()
 
 # ---------------------------------------------------------------- HF attention (TRUSTED, real wts)
 residual = hidden
@@ -289,6 +323,22 @@ attn_out = layer.self_attn(
     attention_mask=mask.to(BF16), position_ids=position_ids, prev_topk_indices=prev_topk)[0]
 h1 = residual + attn_out
 xn2 = layer.post_attention_layernorm(h1)
+post_norm_version = None
+if args.vllm_post_norm:
+    from vllm import __version__ as post_norm_version
+    from vllm.kernels.aiter_ops import fused_add_rms_norm
+    if not post_norm_version.startswith("0.29."):
+        raise ValueError("post-attention normalization reference requires vLLM 0.29")
+    def post_norm():
+        return fused_add_rms_norm.impl_fn(attn_out[:, qpos].contiguous().cuda(),
+            residual[:, qpos].contiguous().cuda(), layer.post_attention_layernorm.weight.cuda(), EPS)
+    norm, norm_residual = post_norm()
+    repeat, repeat_residual = post_norm()
+    if (not torch.isfinite(norm).all() or not torch.equal(norm.view(torch.int16), repeat.view(torch.int16))
+            or not torch.equal(norm_residual.view(torch.int16), repeat_residual.view(torch.int16))
+            or not torch.equal(norm_residual.cpu().view(torch.int16), h1[:, qpos].view(torch.int16))):
+        raise ValueError("post-attention norm is unstable or changes the reference residual")
+    xn2[:, qpos] = norm.cpu()
 
 # =================================================================== T-ROW PREFILL FIXTURE (GLM8)
 # Everything above is row-generic already — `hidden` is [1,L,H] and HF attends over the whole
@@ -418,15 +468,158 @@ def shared_fwd(x_row):
     dw = dequant_blockfp8(idx, P+"mlp.shared_experts.down_proj.weight")
     return torch.nn.functional.silu(x_row @ gw.T) * (x_row @ uw.T) @ dw.T, (gw, uw, dw)
 
+def shared_w8a8_reference(rows, tp):
+    from vllm import __version__
+    from vllm._aiter_ops import rocm_aiter_ops
+    if not __version__.startswith("0.29.") or not rocm_aiter_ops.is_linear_fp8_enabled():
+        raise ValueError("shared W8A8 reference requires vLLM 0.29 with AITER FP8 enabled")
+    weights, scales = {}, {}
+    for proj in ("gate", "up", "down"):
+        name = P + f"mlp.shared_experts.{proj}_proj.weight"
+        weights[proj] = load_tensor(idx, name)
+        scales[proj] = load_tensor(idx, name + "_scale_inv")
+    full_inter, hidden = weights["gate"].shape
+    if full_inter % (tp * 128) or hidden % 128:
+        raise ValueError("shared W8A8 requires aligned TP weight shards")
+    inter = full_inter // tp
+    for proj in weights:
+        shape = (hidden, full_inter) if proj == "down" else (full_inter, hidden)
+        if (weights[proj].dtype != torch.float8_e4m3fn or tuple(weights[proj].shape) != shape
+                or scales[proj].dtype != torch.float32
+                or tuple(scales[proj].shape) != tuple(d // 128 for d in shape)):
+            raise ValueError("shared reference requires original FP8 weights and FP32 block scales")
+    x = rows.to(BF16).cuda()
+    def gemm(a, w, sa, sw):
+        n, k = w.shape
+        op = (rocm_aiter_ops.triton_gemm_a8w8_blockscale
+              if rocm_aiter_ops.is_triton_gemm_w8a8_tuned(n, k)
+              else rocm_aiter_ops.gemm_a8w8_blockscale)
+        return op(a, w, sa, sw, [128, 128], output_dtype=BF16)
+    partials = []
+    for rank in range(tp):
+        start, end = rank * inter, (rank + 1) * inter
+        guw = torch.cat([weights[p].view(torch.uint8)[start:end] for p in ("gate", "up")])
+        guw = guw.view(torch.float8_e4m3fn).contiguous().cuda()
+        gus = torch.cat([scales[p][start // 128:end // 128] for p in ("gate", "up")]).cuda()
+        dw = weights["down"][:, start:end].contiguous().cuda()
+        ds = scales["down"][:, start // 128:end // 128].contiguous().cuda()
+        def forward():
+            q, s = rocm_aiter_ops.group_fp8_quant(x, 128)
+            gu = gemm(q, guw, s, gus)
+            act = torch.empty((len(rows), inter), dtype=BF16, device=x.device)
+            torch.ops._C.silu_and_mul(act, gu)
+            q, s = rocm_aiter_ops.group_fp8_quant(act, 128)
+            return gemm(q, dw, s, ds).cpu()
+        value, repeat = forward(), forward()
+        if not torch.isfinite(value).all() or not torch.equal(value.view(torch.int16), repeat.view(torch.int16)):
+            raise ValueError(f"shared W8A8 reference rank{rank} is nonfinite or not repeat-bitwise")
+        partials.append(value.float())
+    return torch.stack(partials).sum(dim=0), __version__, torch.stack(partials)
+
+shared_rows, shared_reference_version, shared_rank_parts = (shared_w8a8_reference(xn2[:, qpos], args.shared_w8a8_tp)
+                                        if args.shared_w8a8_tp else (None, None, None))
 xq_bf = xn2[0, qpos].to(BF16).float()      # experts see bf16 activations (w8a16)
 expert_sum = torch.zeros(H)
 for i, e in enumerate(sel.tolist()):
     expert_sum += float(gate_np[i]) * expert_fwd(xq_bf, e)
-shared_out, (shg, shu, shd) = shared_fwd(xq_bf)
+if shared_rows is None:
+    shared_out, (shg, shu, shd) = shared_fwd(xq_bf)
+else:
+    shared_out = shared_rows[0]
 # f32 accumulate the three bf16 terms (single rounding), matching plow's f32 MOE_COMBINE
 block_out = (h1[0, qpos].float() + expert_sum + shared_out).to(BF16)
 print(f"\n  ref block_out norm={block_out.float().norm():.3f}  "
       f"shared_out norm={shared_out.norm():.3f}  expert_sum norm={expert_sum.norm():.3f}")
+
+block_rows = [block_out]
+ffn_rows = [expert_sum + shared_out]
+router_rows = [sel.tolist()]
+for row in range(1, B):
+    row_x = xn2[row, qpos].float()
+    row_sel, row_gates, _ = route(row_x, Wr, torch.float32)
+    row_experts = torch.zeros(H)
+    for expert, gate in zip(row_sel.tolist(), row_gates.tolist()):
+        row_experts += gate * expert_fwd(row_x, expert)
+    row_shared = (torch.nn.functional.silu(row_x @ shg.T) * (row_x @ shu.T) @ shd.T
+                  if shared_rows is None else shared_rows[row])
+    ffn_rows.append(row_experts + row_shared)
+    block_rows.append((h1[row, qpos].float() + row_experts + row_shared).to(BF16))
+    router_rows.append(row_sel.tolist())
+    print(f"  row {row} fp32 top-8: {sorted(row_sel.tolist())}", flush=True)
+
+routed_reference = None
+if args.routed_w8a8:
+    from pathlib import Path
+    from block_fp8_aiter_compare import routed_weights, tensor_digest
+    from vllm import __version__
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import QuantMethod
+    if __version__ != "0.29.0" or not rocm_aiter_ops.is_fused_moe_enabled():
+        raise ValueError("routed reference requires pinned vLLM 0.29.0 with AITER MoE")
+    ids, gates = zip(*(route(xn2[row, qpos].float(), Wr, torch.float32)[:2] for row in range(B)))
+    ids = torch.stack(ids).to(torch.int32).cuda()
+    gates = torch.stack(gates).float().cuda()
+    x = xn2[:, qpos].to(BF16).contiguous().cuda()
+    tp = args.shared_w8a8_tp
+    partials, repeats, records = [], [], []
+    os.makedirs(args.block_inputs, exist_ok=True)
+    for rank in range(tp):
+        weights = routed_weights(Path(MODEL_DIR), LAYER, rank, tp)
+        hashes = [tensor_digest(v) for v in weights]
+        w1, w2 = rocm_aiter_ops.shuffle_weights(weights[0].cuda(), weights[1].cuda())
+        w1.is_shuffled = w2.is_shuffled = True
+        s1, s2 = weights[2].cuda(), weights[3].cuda()
+        del weights
+        def routed_forward():
+            return rocm_aiter_ops.fused_moe(x, w1, w2, gates, ids,
+                quant_method=QuantMethod.BLOCK_128x128.value, w1_scale=s1, w2_scale=s2,
+                doweight_stage1=False, output_dtype=BF16,
+                moe_sorting_dispatch_policy=rocm_aiter_ops.get_moe_dispatch_policy()).cpu()
+        value, repeat = routed_forward(), routed_forward()
+        if not torch.isfinite(value).all() or not torch.isfinite(repeat).all():
+            raise ValueError("nonfinite routed reference")
+        partials.append((shared_rank_parts[rank] + value.float()).to(BF16).float())
+        repeats.append((shared_rank_parts[rank] + repeat.float()).to(BF16).float())
+        for tag, tensor in (("reference", value), ("repeat", repeat)):
+            with open(os.path.join(args.block_inputs, f"rank{rank}.routed.{tag}.bf16"), "wb") as f:
+                w_bf_(f, tensor)
+        records.append(dict(rank=rank, weights_sha256=hashes, output_sha256=tensor_digest(value),
+            repeat_sha256=tensor_digest(repeat), repeat_max_row_rel_l2=float(
+                ((value.double() - repeat.double()).norm(dim=1) / value.double().norm(dim=1).clamp_min(1e-30)).max())))
+        del w1, w2, s1, s2
+    ffn = torch.stack(partials).sum(dim=0).to(BF16)
+    ffn_repeat = torch.stack(repeats).sum(dim=0).to(BF16)
+    ffn_rows = list(ffn)
+    block_rows = list((h1[:, qpos].float() + ffn.float()).to(BF16))
+    routed_reference = dict(tp=tp, vllm_version=__version__, backend="AITER fused_moe BLOCK_128x128",
+        input="independent HF attention, vLLM post-norm, FP32 router",
+        shared_add="BF16 per rank before FP32 TP sum and BF16 store", ranks=records,
+        ffn_repeat_max_row_rel_l2=float(((ffn.double() - ffn_repeat.double()).norm(dim=1)
+            / ffn.double().norm(dim=1).clamp_min(1e-30)).max()))
+    print("routed W8A8 reference:", json.dumps(routed_reference), flush=True)
+
+if args.candidate_dir:
+    def captured(name):
+        path = os.path.join(args.candidate_dir, f"rank0.{name}.bin")
+        return torch.from_numpy(np.fromfile(path, dtype=np.uint16)).view(BF16).float()
+
+    def compare(name, actual, expected):
+        error = (actual - expected.float()).norm() / expected.float().norm()
+        print(f"  {name}: rel_l2={error.item():.6g} "
+              f"actual_norm={actual.norm().item():.6g} reference_norm={expected.float().norm().item():.6g}")
+
+    candidate_x = captured("act.xn2")
+    compare("xmid", captured("act.xmid"), h1[0, qpos])
+    compare("xn2", candidate_x, xq_bf)
+    compare("FFN end-to-end", captured("act.attn"), expert_sum + shared_out)
+    candidate_sel, candidate_gates, _ = route(candidate_x, Wr, torch.float32)
+    candidate_experts = torch.zeros(H)
+    for e, gate in zip(candidate_sel.tolist(), candidate_gates.tolist()):
+        candidate_experts += gate * expert_fwd(candidate_x, e)
+    candidate_shared, _ = shared_fwd(candidate_x)
+    print(f"  HF router on captured xn2: {candidate_sel.tolist()} gates={candidate_gates.tolist()}")
+    compare("FFN conditioned on captured xn2", captured("act.attn"), candidate_experts + candidate_shared)
+    sys.exit(0)
 
 # ---------------------------------------------------------------- absorbed MLA weights + caches
 q_b = sd.q_b_proj.weight.float().view(NH, QKH, QL)
@@ -446,19 +639,66 @@ Wqr = np.stack([fold_rope_rows(q_b_rope[h].numpy()) for h in range(NH)], 0)   # 
 kv_a_w = sd.kv_a_proj_with_mqa.weight.float().numpy()
 W_ckv_down = kv_a_w[:DK]
 W_krot_folded = fold_rope_rows(kv_a_w[DK:DK+DR])
-compressed = (hn.float() @ sd.kv_a_proj_with_mqa.weight.float().T)[0]
-ckv_raw, krot_raw = compressed[:, :DK], compressed[:, DK:DK+DR]
+compressed = hn.float() @ sd.kv_a_proj_with_mqa.weight.float().T
+ckv_raw, krot_raw = compressed[..., :DK], compressed[..., DK:DK+DR]
 var = ckv_raw.pow(2).mean(-1, keepdim=True)
 c_kv = ckv_raw * torch.rsqrt(var + EPS) * sd.kv_a_layernorm.weight.float()
-kr = krot_raw.view(1, 1, L, DR)
+kr = krot_raw.reshape(B, 1, L, DR)
 _, kr_rot = apply_rotary_pos_emb_interleave(kr, kr, cos.float(), sin.float())
-k_rot = kr_rot[0, 0]
+k_rot = kr_rot[:, 0]
 
 # ---------------------------------------------------------------- write fixture v2
 def w_bf(f, t):    f.write(np.ascontiguousarray(t.to(BF16).view(torch.uint16).cpu().numpy()).tobytes())
 def w_bf_np(f, a): f.write(np.ascontiguousarray(torch.from_numpy(np.ascontiguousarray(a)).to(BF16).view(torch.uint16).numpy()).tobytes())
 def w_f32(f, a):   f.write(np.ascontiguousarray(np.asarray(a, np.float32)).tobytes())
 def w_i32(f, a):   f.write(np.ascontiguousarray(np.asarray(a, np.int32)).tobytes())
+
+if args.block_inputs:
+    os.makedirs(args.block_inputs, exist_ok=True)
+    # The HF sequence contains only supplied selected keys, at their original RoPE positions.
+    # This tests a shared-index block's carried state, not the learned indexer's selections.
+    if BLOCK_CTX != L:
+        def scatter_cache(tensor):
+            full = torch.zeros((B, BLOCK_CTX, tensor.shape[-1]), dtype=BF16)
+            full[:, logical_positions] = tensor.to(BF16)
+            return full
+
+        c_kv, k_rot = scatter_cache(c_kv), scatter_cache(k_rot)
+    for name, tensor in (("act.x", hidden[:, qpos]),
+                         (f"kv.{LAYER}.ckv", c_kv),
+                         (f"kv.{LAYER}.krot", k_rot)):
+        with open(os.path.join(args.block_inputs, name + ".bin"), "wb") as f:
+            w_bf(f, tensor)
+    selected = np.full((B, cfg.index_topk), -1, dtype=np.int32)
+    selected[:, :L] = logical_positions.numpy()
+    with open(os.path.join(args.block_inputs, "act.iidx.bin"), "wb") as f:
+        w_i32(f, selected)
+    with open(os.path.join(args.block_inputs, "reference.bf16"), "wb") as f:
+        w_bf(f, torch.stack(block_rows))
+    # The residual can hide a broken, low-amplitude FFN, so gate its contribution separately.
+    for name, tensor in (("act.xmid", h1[:, qpos]), ("act.xn2", xn2[:, qpos]),
+                         ("act.attn", torch.stack(ffn_rows))):
+        with open(os.path.join(args.block_inputs, name + ".reference.bf16"), "wb") as f:
+            w_bf(f, tensor)
+    with open(os.path.join(args.block_inputs, "reference.json"), "w") as f:
+        json.dump(dict(model=MODEL_DIR, layer=LAYER, ctx=BLOCK_CTX, batch=B, seed=0xB4,
+                       selected_keys=L, selection="supplied evenly spaced logical positions; not learned indexer",
+                       router_topk=router_rows,
+                       routed_reference=routed_reference,
+                       reference="HF single-layer residual", tolerance_rel_l2=0.03,
+                       post_norm_reference=(dict(vllm_version=post_norm_version, backend="aiter fused_add_rms_norm",
+                           input="independent HF attention and original residual", repeat_bitwise=True)
+                           if args.vllm_post_norm else None),
+                       shared_reference=(dict(tp=args.shared_w8a8_tp, vllm_version=shared_reference_version,
+                           weights="FP8 E4M3 block128", activation="FP8 E4M3 group128",
+                           scales="FP32", gemm_output="BF16", silu_intermediate="BF16",
+                           tp_partial_sum="FP32 reference", input="independent HF post-attention norm")
+                           if args.shared_w8a8_tp else None),
+                       stages=["act.xmid", "act.xn2", "act.attn"]), f, indent=2)
+
+if args.inputs_only:
+    print(f"wrote B{B} block operands and per-row references to {args.block_inputs}")
+    sys.exit(0)
 
 IB, HB = IMOE // 128, H // 128
 sz = 0

@@ -193,6 +193,7 @@ pub fn run(opts: &TuneOptions) -> Result<(), Box<dyn std::error::Error>> {
             // version keyed off `all.first()`'s digests, which made a fully stale store report
             // itself as healthy — it compared the store to itself.
             let want = Digests {
+                execution: None,
                 implementation: tuning_build.label(),
                 interpreter: tuning_build.label(),
                 toolchain: tuning_build.toolchain.clone(),

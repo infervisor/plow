@@ -96,21 +96,6 @@ impl ModelSpec {
         )
     }
 
-    /// Preconfigured GLM-5.3 MLA + MoE model.
-    pub fn glm_53(weight_dtype: MmaDtype) -> Self {
-        Self::new(
-            "GLM-5.3",
-            14_000_000_000, // ~14B active parameters per token
-            40,
-            6144,
-            64,
-            64,
-            256,
-            weight_dtype,
-            weight_dtype,
-        )
-    }
-
     /// Preconfigured Llama-3-70B model.
     pub fn llama3_70b(weight_dtype: MmaDtype) -> Self {
         Self::new(

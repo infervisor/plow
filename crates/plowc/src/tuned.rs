@@ -178,6 +178,7 @@ pub const GEMM_ORACLE: &str = "gemm-cpu-ref-v1";
 /// persistent interpreter's whole-translation-unit identity.
 pub fn build_digests(build: &kernelcaps::BuildId) -> Digests {
     Digests {
+        execution: None,
         implementation: build.label(),
         interpreter: build.label(),
         toolchain: build.toolchain.clone(),
