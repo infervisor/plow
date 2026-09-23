@@ -1791,3 +1791,53 @@ So the decode target is decode attention, not the GEMMs: 1.28-2.0x on the 12B, 1
 
 (C32 rows read better than vLLM only because plow serves C32 on the same 16 slots as C16 -- that
 column is the admission cap, not a decode result.)
+
+### The 32-slot packet at C16/C32: a traffic-dependent trade, not a fix
+
+`*-c32-16k.toml` (chunk 1024, 2048-row sliding ring, 32 slots) removes the admission cap and the
+short-prompt C32 cells improve a lot. It also costs much more on long prompts, because chunk 1024
+turns a 15000-token prompt into 15 launches. E2E vs vLLM at C32, 16-slot -> 32-slot:
+
+```
+in       12B                26B
+128      1.663 -> 1.255     1.706 -> 1.302
+1024     1.378 -> 1.253     1.630 -> 1.523
+4096     1.204 -> 1.506     1.533 -> 2.032
+8192     1.133 -> 1.581     1.514 -> 2.223
+15000    1.101 -> 1.727     1.545 -> 2.437
+```
+
+The crossover is between 1024 and 4096 rows on both models. 12B 128/C32 TTFT goes 1267 -> 113 ms
+(vLLM 161, so plow wins it) at 46-49 GiB peak instead of 67-70. But 15000/C32 TTFT goes
+13405 -> 26936 ms. At C16 the 32-slot packet is worse everywhere (it pays chunk 1024 for slots it
+does not need).
+
+So **no single plow packet covers the C32 column the way vLLM's one config does.** The packet has
+to be chosen for the traffic: c32-16k below ~1k input, the 16-slot ladder packet above. That is a
+real limitation of the AOT-compiled packet model and is reported as one. The headline ladder below
+uses the 16-slot packet for the whole C16/C32 half, which is the recipes' own choice and better on
+8 of those 10 cells.
+
+### Final ladder, 40/40 cells, one config per concurrency
+
+C1/C4 from the realtime profile with MULTISTEP=0; C16/C32 from high_concurrency (16 slots).
+
+| model | TTFT | TPOT | p99 ITL | tok/s | E2E |
+|---|---|---|---|---|---|
+| Gemma-4-12B | 13-7 | 8-12 | **15-5** | 4-16 | 4-16 |
+| Gemma-4-26B-A4B | 11-9 | 3-17 | **13-7** | 0-20 | 0-20 |
+
+Against the first pass, the MULTISTEP flip moved p99 ITL from 9-11 to 15-5 (12B) and 8-12 to 13-7
+(26B) at no cost in TTFT or TPOT. Nothing moved TPOT or tok/s, because nothing in this round
+touched decode attention, which is where the whole TPOT gap lives.
+
+**The standing goal is not met.** plow wins TTFT and now p99 ITL on the majority of cells, ties the
+context-free part of TPOT, and loses throughput and E2E almost everywhere. The three things
+standing between here and it, in order of size:
+
+1. Decode attention per KV row: 1.28-2.0x (12B) and 1.69-4.8x (26B) of vLLM. This is the whole
+   TPOT and tok/s column.
+2. The C32 admission cap: needs paged (or at least non-power-of-two) sliding rings so one packet
+   can hold 32 slots at 16k without paying chunk 1024 on long prompts.
+3. Prefill interference at C4+ with long prompts: p99 ITL 104-214 ms against vLLM's 8-13 at
+   1024-8192 in, where the wave is already gone. That is the prefill chunk blocking decode.

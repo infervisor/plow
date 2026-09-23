@@ -99,7 +99,14 @@ gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer i
 # The common ladder both Gemma-4 campaigns run (26B: gemma4-26b-a4b.h100.bf16-ctx16k.toml). The
 # realtime recipe's MAX_CHUNK=16384 / 32-slot ladder needs 110 GiB on this 80 GiB card (sliding ring
 # = next_pow2(window + chunk - 1) rows per slot); chunk 4096 and 16 slots is the shape that fits at
-# a 16k context. C32 cells therefore queue on 16 slots.
+# a 16k context. C32 cells therefore queue on 16 slots: half the requests wait out a whole
+# generation, so C32 TTFT is 1267 ms at 128 in against vLLM's 161 while TPOT matches it (11.41 vs
+# 11.59) and C32 tok/s equals C16 tok/s to three digits. gemma4-12b.h100.bf16-c32-16k.toml is the
+# 32-slot packet (chunk 1024, 46-49 GiB peak) and it is NOT a uniform win: measured 2026-09-23,
+# E2E vs vLLM at C32 goes 1.663 -> 1.255 at 128 in and 1.378 -> 1.253 at 1024, but 1.204 -> 1.506
+# at 4096, 1.133 -> 1.581 at 8192 and 1.101 -> 1.727 at 15000, because chunk 1024 turns a 15k
+# prompt into 15 launches. Pick by prompt length: c32-16k below ~1k input, this packet above.
+
 [bench.profiles.realtime]
 in_lens = "128 1024 4096 8192 15000"
 concs = "1 4"
@@ -108,7 +115,14 @@ nprompt = 32
 # longer share one 172 ms launch; the oldest runs whole and later ones join only while that is cheaper.
 # Measured p12p, 16 prompts, off -> on: 1024 in TTFT 167.0 -> 107.7 ms (vLLM 0.28: 130.6), TPOT 11.93 -> 12.32;
 # 128 / 4096 / 15000 in level (40.5 / 363 / 1712 -> 40.1 / 359 / 1711).
-serve_env = { PLOW_MULTISTEP = "4", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0", PLOW_PF_INTERLEAVE_ADAPTIVE = "1" }
+# MULTISTEP 0, not 4, with the lookahead-1 decode pipeline: 4 emits four tokens per wave, which
+# sets p99 ITL to exactly 4 x TPOT (median ITL is literally 0.000) while TTFT and TPOT are
+# untouched. 32 prompts, 4 -> 0: p99 ITL at C1 41.8 / 42.1 / 42.3 / 42.4 / 42.7 -> 10.5 / 10.6 /
+# 10.7 / 10.8 / 10.8 ms over the 128..15000 ladder (vLLM 0.28: 11.3 / 11.4 / 11.4 / 11.5 / 11.5),
+# TTFT and TPOT level to 0.1 %. 128/C4 p99 ITL 42.4 -> 11.3 and TTFT 40.5 -> 36.9; 15000/C4 TTFT
+# 1439 -> 1180 ms for TPOT 22.29 -> 24.08 (E2E 1.079 -> 1.071 x vLLM). C4 at 1024-8192 in is
+# unchanged: there p99 ITL is prefill interference, not the wave.
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_PIPELINE = "1", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0", PLOW_PF_INTERLEAVE_ADAPTIVE = "1" }
 
 [bench.profiles.high_concurrency]
 in_lens = "128 1024 4096 8192 15000"
