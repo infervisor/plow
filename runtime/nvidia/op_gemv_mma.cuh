@@ -115,6 +115,16 @@ __device__ __forceinline__ void gvmma_tile(float (&acc)[NW][MT][4], const __nv_b
      * prefill objects: 6.63% at 1024, 1.37% at 4096, 0.21% at 8192, 3.32% at 15000) is wider
      * than the effect, so the ladder cannot adjudicate this change — the packet-level step can.
      *
+     * THE B=32 STEP IS NOT ACTIVATION-BOUND — do not build a 4-wide PAIR to "fix" it. The walk
+     * moves MT*2*512 B of activations per NW*512 B of weights, and at the packet's PAIR=1/MT=2
+     * that is 2048 B against 1024 B, with x (245 KB at K=3840) too big for the ~216 KB of L1 left
+     * beside the 40 KB smem claim — so the traffic argument looks compelling and is wrong.
+     * Measured by forcing a1 = a0 (half the activation loads, identical weight stream and mma
+     * count, numerics deliberately invalid) in TWO REAL PACKETS one source apart, both
+     * REG:255 STACK:192 SHARED:40464: B=32 ctx 128 13.691 -> 13.692 ms (+0.01%), ctx 8192
+     * 19.029 -> 19.035 (+0.03%). Nothing. Whatever costs B=32 its bandwidth (1.74 TB/s against
+     * 2.20 at B=1 on the same 23.8 GB) is not the activation re-read.
+     *
      * DO NOT re-tune this with scripts/build_sm90a_cubin.sh. That path never defines
      * PLOW_NV_GEMV_MMA_PAIR or _B1 (decode object SHARED:14480), while every packet sets both to
      * 1 from manifest.rs (SHARED:40464). With PAIR=1 the plain GEMV walks two ROW BLOCKS as NW=2,
