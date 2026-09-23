@@ -19,6 +19,10 @@ _installed = False
 
 
 def _rank():
+    import torch
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
     for name in ("RANK", "LOCAL_RANK"):
         value = os.environ.get(name)
         if value is not None:
@@ -49,6 +53,10 @@ def _extract(spec, module, args, kwargs, output):
 
     if "literal" in spec:
         return spec["literal"]
+    if "call" in spec:
+        module_name, function_name = spec["call"].rsplit(".", 1)
+        value = getattr(importlib.import_module(module_name), function_name)()
+        return _descend(value, spec.get("path", []))
     if "first_tensor" in spec:
         for candidate in spec["first_tensor"]:
             try:
@@ -117,16 +125,29 @@ def install(config):
     prompt_hash = config["prompt_sha256_u32le"]
     history_id = config.get("history_id", prompt_hash[:16])
     wanted_rank = config.get("rank", 0)
-    rank = _rank()
     original = torch.nn.Module._call_impl
     names = {}
     largest = {}
     sequences = {}
     lock = threading.Lock()
 
-    def capture(source_object, module_name, item, match, args, kwargs, output):
+    def capture(source_object, module_name, item, match, args, kwargs, output,
+                invocation_index=None, phase=None):
+        rank = _rank()
         if wanted_rank is not None and rank != wanted_rank:
             return
+        for condition in item.get("when", []):
+            actual = _extract(condition["extract"], source_object, args, kwargs, output)
+            if "equals" in condition:
+                if actual is not None and not isinstance(actual, (bool, int, float, str)):
+                    raise TypeError("capture equality condition requires a JSON scalar")
+                if actual != condition["equals"]:
+                    return
+            elif condition.get("not_none") is True:
+                if actual is None:
+                    return
+            else:
+                raise ValueError("capture condition requires equals or not_none=true")
         value = _extract(item["extract"], source_object, args, kwargs, output)
         if not isinstance(value, torch.Tensor) or value.numel() == 0:
             if item.get("on_missing", "error") == "skip":
@@ -147,12 +168,16 @@ def install(config):
         layer = fields.get("layer", item.get("layer"))
         semantic = item["semantic"].format(**fields)
         key = (semantic, layer, rank)
+        row_policy = item.get("row_policy", "largest")
+        if row_policy not in ("largest", "all"):
+            raise ValueError(f"unsupported row_policy {row_policy!r}")
         with lock:
-            if rows < largest.get(key, 0):
-                return
-            if rows > largest.get(key, 0):
-                sequences[key] = 0
-            largest[key] = rows
+            if row_policy == "largest":
+                if rows < largest.get(key, 0):
+                    return
+                if rows > largest.get(key, 0):
+                    sequences[key] = 0
+                largest[key] = rows
             sequence = sequences.get(key, 0)
             sequences[key] = sequence + 1
         value = value.detach().cpu().contiguous()
@@ -167,6 +192,9 @@ def install(config):
         elif storage_dtype == "float32":
             array = value.float().numpy().astype("<f4", copy=False)
             suffix = "f32"
+        elif storage_dtype == "raw":
+            array = value.reshape(-1).view(torch.uint8).numpy()
+            suffix = "bin"
         else:
             raise ValueError(f"unsupported storage_dtype {storage_dtype!r}")
         retain = int(item.get("retain", 1))
@@ -195,10 +223,14 @@ def install(config):
             "stored_shape": list(array.shape),
             "source_stride": source_stride,
             "forward_rows": rows,
+            "row_policy": row_policy,
             "call_sequence": sequence,
             "file": data_path.name,
             "sha256": hashlib.sha256(array.tobytes()).hexdigest(),
         }
+        if invocation_index is not None:
+            meta["invocation_index"] = invocation_index
+            meta["phase"] = phase
         if item.get("context"):
             context, context_hash = _capture_context(
                 item["context"], source_object, args, kwargs, output
@@ -237,13 +269,15 @@ def install(config):
                 if item.get("phase", "after") == "before" and item.get(
                     "call_index", call_index
                 ) == call_index:
-                    capture(self, __target, item, re.fullmatch("", ""), args, kwargs, None)
+                    capture(self, __target, item, re.fullmatch("", ""), args, kwargs, None,
+                            call_index, "before")
             result = __original(self, *args, **kwargs)
             for item in __items:
                 if item.get("phase", "after") == "after" and item.get(
                     "call_index", call_index
                 ) == call_index:
-                    capture(self, __target, item, re.fullmatch("", ""), args, kwargs, result)
+                    capture(self, __target, item, re.fullmatch("", ""), args, kwargs, result,
+                            call_index, "after")
             return result
 
         setattr(owner, method_name, method_wrapper)
@@ -261,13 +295,15 @@ def install(config):
                 if item.get("phase", "before") == "before" and item.get(
                     "call_index", call_index
                 ) == call_index:
-                    capture(__owner, __target, item, match, args, kwargs, None)
+                    capture(__owner, __target, item, match, args, kwargs, None,
+                            call_index, "before")
             result = __original(*args, **kwargs)
             for item in __items:
                 if item.get("phase", "before") == "after" and item.get(
                     "call_index", call_index
                 ) == call_index:
-                    capture(__owner, __target, item, match, args, kwargs, result)
+                    capture(__owner, __target, item, match, args, kwargs, result,
+                            call_index, "after")
             return result
 
         setattr(owner, function_name, callable_wrapper)

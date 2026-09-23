@@ -3615,6 +3615,17 @@ impl HsaBackend {
         block: u16,
         args: &[u8],
     ) -> Result<()> {
+        self.launch_3d_lds(f, grid, block, 0, args)
+    }
+
+    pub(crate) fn launch_3d_lds(
+        &self,
+        f: HsaKernel,
+        grid: [u32; 3],
+        block: u16,
+        smem_bytes: u32,
+        args: &[u8],
+    ) -> Result<()> {
         let grid_x = grid[0].checked_mul(u32::from(block)).filter(|&n| n != 0);
         if grid_x.is_none() || grid[1] == 0 || grid[2] == 0 || block > 1024 {
             return Err(RuntimeError::Device(format!(
@@ -3629,7 +3640,7 @@ impl HsaBackend {
             block,
             1,
             1,
-            0,
+            smem_bytes,
             args.as_ptr().cast(),
             args.len(),
         )

@@ -9,9 +9,9 @@
 //! # Why these two are different
 //!
 //! `devgen::mla` declares `self_attn.indexer.wq_b.weight` and `self_attn.indexer.wk.weight`
-//! as BF16 unconditionally, and that is deliberate: plow's indexer ops read them as bf16,
-//! and the reference computes both projections in bf16 regardless of the rest of the
-//! model's quantization — vLLM builds the fused `wk_weights_proj` with `quant_config=None`
+//! as BF16 in the legacy path: plow's indexer ops read them as bf16.
+//! This does not establish vLLM 0.29 precision parity: its `wq_b` retains FP8 weights
+//! and quantizes activations. Only its fused `wk_weights_proj` uses `quant_config=None`
 //! and dequantises a checkpoint's fp8 `wk` into it at load ("FP8 wk weights are upcasted
 //! to BF16 during loading to maintain fusion", `deepseek_v2.py`).
 //!
@@ -46,7 +46,8 @@
 //! is the f32 multiply by an arbitrary-f32 block scale and the round-to-nearest-even
 //! narrowing back to bf16, which is exactly what the reference does. This is a lossier
 //! representation than the kernel's per-block dequant-in-the-accumulator, and that is
-//! inherent to fusing the projection in bf16; it is what the reference ships.
+//! inherent to fusing the projection in bf16; it matches the reference's WK storage,
+//! not the reference's WQ computation.
 
 use safetensors::Dtype;
 
@@ -93,9 +94,8 @@ pub enum Plan<'a> {
 
 /// Decide what to do with `name`, or `None` when it is not one of the two projections.
 ///
-/// `want` is the blob's declared byte count for this rank. Both projections are REPLICATED
-/// (`shard::shard_of` classifies them so — the indexer is tiny and its index is head-shared),
-/// so `want` is the whole bf16 tensor at every tp and the equality below is the real check.
+/// Both projections are replicated. The declared byte count selects legacy BF16
+/// upcast or native FP8 WQ; either path validates the checkpoint's block scale grid.
 ///
 /// Every refusal names the tensor, both dtypes and the remedy, because the alternative that
 /// shipped was a `slice_for` byte-count error 200 GiB into a load.
@@ -119,8 +119,7 @@ fn plan_inner<'a>(ckpt: &'a Checkpoint, name: &str, want: u64) -> Result<Plan<'a
         return Ok(Plan::AsIs);
     }
 
-    // The whole reason this file exists: the blob says bf16, the checkpoint says fp8.
-    // Refuse anything the shim cannot turn into exactly `want` bytes of bf16.
+    // Only WQ has a native FP8 consumer; WK still binds BF16.
     let dt = ckpt.dtype(name).unwrap_or(Dtype::F8_E4M3);
     let remedy = "emit with PLOW_GLM_DSA=0, or supply a checkpoint whose indexer is bf16";
     if shape.len() != 2 {
@@ -137,7 +136,8 @@ fn plan_inner<'a>(ckpt: &'a Checkpoint, name: &str, want: u64) -> Result<Plan<'a
             w.len()
         )));
     }
-    if want != (n * k * 2) as u64 {
+    let native_wq = name.ends_with(PROJECTIONS[0]) && want == (n * k) as u64;
+    if !native_wq && want != (n * k * 2) as u64 {
         return Err(bad(format!(
             "checkpoint dtype {dt:?} {shape:?} upcasts to {} B of BF16 but the blob declares \
              {want} B. {remedy}",
@@ -177,6 +177,9 @@ fn plan_inner<'a>(ckpt: &'a Checkpoint, name: &str, want: u64) -> Result<Plan<'a
             sbytes.len(),
             want_sn * want_sk * 4
         )));
+    }
+    if native_wq {
+        return Ok(Plan::AsIs);
     }
     Ok(Plan::Upcast {
         w,
@@ -272,6 +275,76 @@ fn f32_to_bf16_bits(x: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn indexer_checkpoint(name: &str, scale_shape: Option<[usize; 2]>, scale_dtype: &str) -> Checkpoint {
+        let mut header = serde_json::Map::new();
+        header.insert(name.into(), serde_json::json!({
+            "dtype": "F8_E4M3", "shape": [128, 256], "data_offsets": [0, 32768]
+        }));
+        let mut payload = vec![0x38; 32768];
+        if let Some(shape) = scale_shape {
+            let size = shape.iter().product::<usize>() * if scale_dtype == "F32" { 4 } else { 2 };
+            header.insert(format!("{name}_scale_inv"), serde_json::json!({
+                "dtype": scale_dtype, "shape": shape, "data_offsets": [32768, 32768 + size]
+            }));
+            payload.resize(32768 + size, 0);
+        }
+        let mut encoded = serde_json::to_vec(&header).unwrap();
+        encoded.resize(encoded.len().next_multiple_of(8), b' ');
+        let mut bytes = (encoded.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(encoded);
+        bytes.extend(payload);
+        let dir = std::env::temp_dir().join(format!("plow-indexer-fixture-{}-{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("test.safetensors");
+        std::fs::write(&path, bytes).unwrap();
+        let ckpt = Checkpoint::open(&dir).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+        ckpt
+    }
+
+    #[test]
+    fn native_wq_keeps_original_bytes_and_validates_scales() {
+        let name = "model.layers.6.self_attn.indexer.wq_b.weight";
+        let ckpt = indexer_checkpoint(name, Some([1, 2]), "F32");
+        assert!(matches!(plan(&ckpt, name, 32768).unwrap().unwrap(), Plan::AsIs));
+        assert!(matches!(plan(&ckpt, name, 65536).unwrap().unwrap(), Plan::Upcast { .. }));
+        assert!(plan(&ckpt, name, 32767).unwrap().is_err());
+        for (shape, dtype) in [(None, "F32"), (Some([2, 1]), "F32"), (Some([1, 2]), "BF16")] {
+            let invalid = indexer_checkpoint(name, shape, dtype);
+            assert!(plan(&invalid, name, 32768).unwrap().is_err());
+            assert!(plan(&invalid, name, 65536).unwrap().is_err());
+        }
+        let name = "model.layers.6.self_attn.indexer.wk.weight";
+        let ckpt = indexer_checkpoint(name, Some([1, 2]), "F32");
+        assert!(plan(&ckpt, name, 32768).unwrap().is_err());
+        assert!(matches!(plan(&ckpt, name, 65536).unwrap().unwrap(), Plan::Upcast { .. }));
+    }
+
+    #[test]
+    #[ignore = "needs the full GLM checkpoint (PLOW_DSA_VERIFY_CKPT); CPU only"]
+    fn native_wq_binds_every_full_glm_layer_without_upcast() {
+        let dir = std::env::var("PLOW_DSA_VERIFY_CKPT").expect("set PLOW_DSA_VERIFY_CKPT");
+        let path = std::path::Path::new(&dir);
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+        let layers = config["indexer_types"].as_array().expect("GLM indexer layer types");
+        let ckpt = Checkpoint::open(path).unwrap();
+        let mut full = 0;
+        for (layer, kind) in layers.iter().enumerate() {
+            if kind.as_str() != Some("full") { continue; }
+            let name = format!("model.layers.{layer}.self_attn.indexer.wq_b.weight");
+            let (bytes, shape) = ckpt.tensor_ex(&name).unwrap();
+            assert_eq!(ckpt.dtype(&name), Some(Dtype::F8_E4M3));
+            assert_eq!(shape, &[4096, 2048]);
+            assert_eq!(bytes.len(), 4096 * 2048);
+            assert!(matches!(plan(&ckpt, &name, 4096 * 2048).unwrap().unwrap(), Plan::AsIs));
+            assert_eq!(crate::asset::shard::shard_of(&name), crate::asset::shard::Shard::Replicated);
+            full += 1;
+        }
+        assert_eq!(full, 21);
+    }
 
     /// Only the two projections, and not the reference's fused spelling — which is a
     /// DIFFERENT tensor (`[160, 6144]` = wk stacked on weights_proj) that plow never binds.

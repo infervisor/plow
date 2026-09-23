@@ -77,7 +77,7 @@ pub fn shard_of(name: &str) -> Shard {
     // exists for the per-output-channel fp8 scale `[N]`, which is a different tensor that happens
     // to share the spelling. Which one a checkpoint has is decided by its SHAPE, here and in
     // `bind_packed_experts`, never by a flag.)
-    const COL: [&str; 10] = [
+    const COL: [&str; 12] = [
         "q_proj.weight",
         "k_proj.weight",
         "v_proj.weight",
@@ -86,6 +86,8 @@ pub fn shard_of(name: &str) -> Shard {
         "derived.q_absorb",
         "derived.q_rope",
         "derived.v_absorb",
+        "self_attn.q_b_proj.weight",
+        "derived.mla_fp8_tp",
         // Mixtral-spelled routed experts -- see the note below.
         ".w1.weight",
         ".w3.weight",
@@ -221,6 +223,12 @@ pub fn slice_for<'a>(
 ) -> Result<Cow<'a, [u8]>> {
     let bad = |m: String| RuntimeError::Device(format!("shard {name}: {m}"));
     let full = src.len() as u64;
+    if let Some((_, suffix)) = name.split_once(".derived.mla_fp8_tp") {
+        let prepared_tp = suffix.split('.').next().and_then(|s| s.parse::<u32>().ok());
+        if prepared_tp != Some(tp) {
+            return Err(bad(format!("MLA FP8 weights prepared for {prepared_tp:?}, runtime tp={tp}")));
+        }
+    }
 
     // tp==1 binds everything whole, which is byte-identical to the pre-TP path.
     let shard = if tp > 1 {
@@ -928,6 +936,34 @@ mod glm_shard_tests {
             Shard::Replicated
         );
         assert_eq!(shard_of(&format!("{P}o_proj.weight")), Shard::Row);
+    }
+
+    #[test]
+    fn glm_qkva_fp8_weights_and_scales_are_replicated() {
+        for suffix in ["weight_fp8", "weight_scale_inv"] {
+            assert_eq!(shard_of(&format!("model.layers.3.self_attn.fused_qkv_a_proj.{suffix}")),
+                       Shard::Replicated);
+        }
+    }
+
+    #[test]
+    fn glm_fp8_qb_and_tp_specific_mla_shard_by_head() {
+        let bytes: Vec<u8> = (0..64).collect();
+        for suffix in ["weight_fp8", "weight_scale_inv"] {
+            let name = format!("model.layers.3.self_attn.q_b_proj.{suffix}");
+            assert_eq!(shard_of(&name), Shard::Column);
+            assert_eq!(slice_for(&name, &bytes, &[8, 8], 8, 3, 8).unwrap().as_ref(), &bytes[24..32]);
+        }
+        for tag in ["wk", "wv"] {
+            let name = format!("model.layers.3.self_attn.derived.mla_fp8_tp8.{tag}.weight");
+            assert_eq!(shard_of(&name), Shard::Column);
+            assert_eq!(slice_for(&name, &bytes, &[8, 2, 4], 8, 3, 8).unwrap().as_ref(), &bytes[24..32]);
+            for tp in [1, 4, 16] {
+                assert!(slice_for(&name, &bytes, &[8, 2, 4], 64 / tp as u64, 0, tp).is_err());
+            }
+            let scale = format!("model.layers.3.self_attn.derived.mla_fp8_tp8.{tag}.weight_scale");
+            assert_eq!(slice_for(&scale, &bytes[..32], &[8, 1], 4, 3, 8).unwrap().as_ref(), &bytes[12..16]);
+        }
     }
 }
 

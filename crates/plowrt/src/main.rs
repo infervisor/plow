@@ -19,6 +19,9 @@ use plowrt::device::{self, Backend};
 
 #[path = "bin_dist.rs"]
 mod dist_cmd;
+#[cfg(feature = "hsa")]
+#[path = "bin_amd_block.rs"]
+mod amd_block_cmd;
 use plowrt::exec::ExecutorSet;
 use plowrt::orch::Registry;
 use plowrt::serve::mux::{self, MuxConfig};
@@ -386,6 +389,20 @@ enum Cmd {
         /// two precisions.
         #[arg(long)]
         dump: Option<PathBuf>,
+        /// Raw BF16 act.x.bin and carried-state tensor files for an act.x-only block.
+        #[arg(long)]
+        input_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        ctx: u32,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repeat: u32,
+        #[arg(long, default_value_t = 0)]
+        warmup: u32,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        tp: u32,
+        /// JSON timing samples. Host wall time includes preparation and the TP audit.
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
 
     /// Dry-run the compiled packets (no device): walk each packet honoring
@@ -1039,7 +1056,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             inspect,
             list_tensors,
             dump,
-        } => amd_block(blob, hsaco, checkpoint, prompt, inspect, list_tensors, dump),
+            input_dir,
+            ctx,
+            repeat,
+            warmup,
+            tp,
+            report,
+        } => {
+            if let Some(inputs) = input_dir {
+                amd_block_cmd::run(blob, hsaco, checkpoint, inputs, ctx, repeat, warmup, tp, dump, report)
+            } else {
+                if tp != 1 || ctx != 1 || repeat != 1 || warmup != 0 || report.is_some() {
+                    return Err("block timing requires --input-dir with captured block operands".into());
+                }
+                amd_block(blob, hsaco, checkpoint, prompt, inspect, list_tensors, dump)
+            }
+        },
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBlock { .. } => Err("plowrt was built without --features hsa".into()),
     }
@@ -1923,8 +1955,12 @@ fn amd_bench_tp(
     let mut g = AmdTpGroup::load(backends, &blob, &hsaco, checkpoint.as_deref())?;
     // This binary is the TP CORRECTNESS ORACLE: its claim is that every rank
     // emitted an IDENTICAL stream, and a sampled check cannot support that
-    // sentence. Serving samples (`DEFAULT_AGREE_EVERY`); the oracle never does.
-    g.audit_cadence(1);
+    let agree_cfg = plowrt::config::RuntimeConfig::get().amd.tp_agree_every;
+    if agree_cfg > 1 {
+        g.audit_cadence(agree_cfg);
+    } else {
+        g.audit_cadence(1);
+    }
     println!(
         "{timing}loaded in {:.1} s: TP={} ranks, max_ctx={}",
         t0.elapsed().as_secs_f64(),
@@ -2058,7 +2094,7 @@ fn amd_bench_tp(
                 })
                 .collect::<std::result::Result<_, _>>()?,
         };
-        if prompts.is_empty() {
+        if prompts.is_empty() && !synthetic_probe {
             return Err(
                 "--batched on TP needs --prompt: without one every slot decodes over KV \
                         nobody wrote, and agreement between slots is then a statement about VRAM \
@@ -2071,17 +2107,19 @@ fn amd_bench_tp(
             g.n_gpu()
         );
 
-        let mut pos_v: Vec<u32> = vec![0; b];
+        let mut pos_v: Vec<u32> = vec![ctx; b];
         let mut feed: Vec<u32> = vec![0; b];
         for s in 0..b {
-            let ids = &prompts[s % prompts.len()];
-            // Prefill is single-sequence on every rank; `prefill_slot` rebases the whole group's
-            // KV pointer tables onto slot `s` for the duration and restores them after, so each
-            // slot's cache is genuinely populated by this run.
-            let tok = AmdTpGroup::agree(&g.prefill_slot(s, ids)?)?;
-            println!("  slot {s}: prefill {} tokens -> sampled {tok}", ids.len());
-            pos_v[s] = ids.len() as u32;
-            feed[s] = tok;
+            if !prompts.is_empty() {
+                let ids = &prompts[s % prompts.len()];
+                // Prefill is single-sequence on every rank; `prefill_slot` rebases the whole group's
+                // KV pointer tables onto slot `s` for the duration and restores them after, so each
+                // slot's cache is genuinely populated by this run.
+                let tok = AmdTpGroup::agree(&g.prefill_slot(s, ids)?)?;
+                println!("  slot {s}: prefill {} tokens -> sampled {tok}", ids.len());
+                pos_v[s] = ids.len() as u32;
+                feed[s] = tok;
+            }
         }
 
         let mut chains: Vec<Vec<u32>> = vec![Vec::new(); b];

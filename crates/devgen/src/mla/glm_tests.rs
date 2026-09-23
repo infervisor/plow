@@ -1232,6 +1232,7 @@ fn glm_dsa_local_selection_keeps_one_completion_for_independent_rows() {
             &(0..32).collect::<Vec<_>>(),
             &[0],
             None,
+            None,
         );
         let p = b.finish();
         let selects: Vec<_> = p
@@ -1299,6 +1300,7 @@ fn glm_decode_glue_cus_gives_the_key_norm_one_workgroup_per_row() {
                 &rq,
                 &rk,
                 None,
+                None,
             );
             let p = b.finish();
             let blocks = |op: DevOp| -> Vec<u32> {
@@ -1353,6 +1355,7 @@ fn glm_dsa_split_selection_gives_each_row_its_own_group_and_strips() {
             ready,
             &(0..32).collect::<Vec<_>>(),
             &[0],
+            None,
             None,
         );
         let p = b.finish();
@@ -1774,6 +1777,34 @@ fn glm_block_extract_matches_reference() {
         ref_sequence(true),
         "single-block --block 3 op sequence != validated MoE block"
     );
+}
+
+#[test]
+fn glm_block_decode_ladder_has_batched_kv_and_grouped_experts() {
+    let _guard = crate::test_env::env_guard();
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let (m, desc) = glm_build_block_pf_rungs(
+        &c, 131072, 256, 3..4, true, "glm-ref", MlaArch::Glm,
+        &[], PrefillScope::Attn, MoeEnc::Fp8Blk, &[1, 8, 16],
+    );
+    assert_eq!(m.prog_t, [1, 8, 16]);
+    assert_eq!(packet::devbuild::decode_rung_lo(&m.prog_t), 0);
+    assert_eq!(desc.programs.decode_t, 16);
+    let bytes = |name| m.tensors.iter().find(|t| t.name == name).unwrap().bytes;
+    assert_eq!(bytes("act.x"), 16 * 6144 * 2);
+    assert_eq!(bytes("kv.3.ckv"), 16 * 131072 * 512 * 2);
+    assert_eq!(bytes("act.iidx"), 16 * 2048 * 4);
+    for (p, &rows) in m.progs.iter().zip(&m.prog_t) {
+        assert!(!p.insts.iter().any(|d| matches!(d.op,
+            x if x == DevOp::Embed as u16 || x == DevOp::Argmax as u16)));
+        let gather = p.insts.iter().find(|d| d.op == DevOp::FlashGatherDecode as u16).unwrap();
+        assert_eq!(gather.i[0], rows);
+        if rows > 1 {
+            assert!(p.insts.iter().any(|d| d.op == DevOp::MoeGroupGluPf as u16));
+            assert!(!p.insts.iter().any(|d| d.op == DevOp::MoeExpertGluFp8Blk as u16));
+        }
+    }
 }
 
 /// The weight namespace is a CFG PROPERTY, and it is the only thing a wrapper prefix moves.
@@ -2498,6 +2529,553 @@ fn glm_linear_fp8_prefill_routes_to_the_block_fp8_gemm() {
     // fault, because the kernel's promotion multiplies by whatever it reads.
     assert_eq!([d.t[0], d.t[1], d.t[2], d.t[3]], [o, x, w, s]);
     assert_eq!([d.i[0], d.i[1], d.i[2]], [512, 6144, 4096]);
+}
+
+#[test]
+fn glm_oproj_w8a8_routes_decode_and_prefill_with_group_scales() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("GLM_LINEAR_FP8", "1"), ("PLOW_GLM_OPROJ_W8A8", "1"),
+        ("PLOW_UNISEG", "1"), ("PLOW_GLM_DSA", "0"),
+    ]);
+    for tp in [1, 8] {
+        let mut c = glm_ref_cfg();
+        c.tp = tp;
+        let k = c.heads / tp * c.v_head;
+        for (prefill, rows) in [(false, 1), (false, 8), (false, 16), (false, 64), (true, 128)] {
+            let mut decl = Builder::new(256);
+            let n = declare_glm_rows_batched(&mut decl, &c, 512, &[3], rows, rows, MoeEnc::Fp8Blk);
+            let tensors = decl.tensors();
+            assert_eq!(tensors[n.blk_xq as usize].bytes, (rows * k) as u64);
+            assert_eq!(tensors[n.blk_xs as usize].bytes, (rows * (k / 128)) as u64 * F32);
+            if glm_oproj_split4(rows, c.hidden, k) {
+                for part in n.blk_oproj_parts {
+                    assert_eq!(tensors[part as usize].bytes, (rows * c.hidden) as u64 * BF16);
+                }
+            }
+            let mut b = Builder::new(256);
+            b.adopt_tensors(tensors);
+            let all = b.all();
+            if prefill {
+                emit_glm_block_prefill(&mut b, &c, &n, 0, 512, rows, MoeEnc::Fp8Blk,
+                    n.x, n.xnext, &[], &mut 0, &all, None);
+            } else {
+                emit_glm_block(&mut b, &c, &n, 0, 512, rows, rows, MoeEnc::Fp8Blk,
+                    n.x, n.xnext, &[], &mut 0, &all);
+            }
+            let p = b.finish();
+            let find = |op| p.insts.iter().filter(|d| d.op == op as u16).collect::<Vec<_>>();
+            let q = find(DevOp::QuantFp8Block128);
+            let split4 = glm_oproj_split4(rows, c.hidden, k);
+            let op = if split4 { DevOp::GemmFp8Block128Split4 } else { DevOp::GemmFp8Block128 };
+            let g = find(op);
+            assert_eq!((q.len(), g.len()), (1, 1));
+            assert_eq!(u32::from(q[0].blocks), if rows == 16 { (rows * (k / 32)).div_ceil(WG_THREADS).min(256) } else { 256 });
+            assert_eq!(&q[0].t[..3], &[n.blk_xq, n.oat, n.blk_xs]);
+            assert_eq!(&q[0].i[..2], &[rows, k]);
+            assert_eq!(&g[0].t[1..5], &[n.blk_xq, n.lw[0].wo, n.blk_xs, n.lw[0].wo_s]);
+            assert_eq!(&g[0].i[..3], &[rows, c.hidden, k]);
+            let qix = p.insts.iter().position(|d| d.op == DevOp::QuantFp8Block128 as u16).unwrap();
+            let gix = p.insts.iter().position(|d| d.op == op as u16).unwrap();
+            let qe = p.stream.iter().find(|e| e.inst as usize == qix).unwrap();
+            let ge = p.stream.iter().find(|e| e.inst as usize == gix).unwrap();
+            assert_eq!(qe.seg, ge.seg, "quantization must not add a launch boundary");
+            let succs = &p.succs[qe.succ_ofs as usize..][..qe.succ_len as usize];
+            let waits = &p.waits[ge.wait_ofs as usize..][..ge.wait_len as usize];
+            assert!(waits.iter().any(|w| succs.contains(&w.id) && w.threshold == q[0].blocks as u32));
+            if split4 {
+                assert_eq!(&g[0].t[5..8], &n.blk_oproj_parts);
+                let adds = find(DevOp::Sum4Bf16);
+                assert_eq!(adds.len(), 1);
+                assert_eq!(adds[0].t[0], g[0].t[0]);
+                assert_eq!(&adds[0].t[1..4], &n.blk_oproj_parts);
+                assert_eq!(adds[0].i[0], rows * c.hidden);
+                let ix = p.insts.iter().position(|d| d.op == DevOp::Sum4Bf16 as u16).unwrap();
+                let ae = p.stream.iter().find(|e| e.inst as usize == ix).unwrap();
+                assert_eq!(ae.seg, ge.seg);
+                let succs = &p.succs[ge.succ_ofs as usize..][..ge.succ_len as usize];
+                let waits = &p.waits[ae.wait_ofs as usize..][..ae.wait_len as usize];
+                assert!(waits.iter().any(|w| succs.contains(&w.id) && w.threshold == g[0].blocks as u32));
+            } else {
+                assert!(find(DevOp::Sum4Bf16).is_empty());
+            }
+            assert!(p.insts.iter().all(|d| d.op != DevOp::GemmBlkPf as u16));
+        }
+    }
+}
+
+#[test]
+fn glm_qkva_w8a8_routes_replicated_weights_and_three_outputs() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("GLM_LINEAR_FP8", "1"), ("PLOW_GLM_QKVA_W8A8", "1"),
+        ("PLOW_UNISEG", "1"), ("PLOW_GLM_DSA", "0"),
+    ]);
+    for tp in [1, 4, 8] {
+        let mut c = glm_ref_cfg();
+        c.tp = tp;
+        let (h, ql, dk, dr) = (c.hidden, c.q_lora, c.kv_lora, c.qk_rope);
+        for (prefill, rows) in [(false, 1), (false, 8), (false, 16), (false, 32), (false, 64), (true, 128)] {
+            let mut decl = Builder::new(256);
+            let n = declare_glm_rows_batched(&mut decl, &c, 512, &[3], rows, rows, MoeEnc::Fp8Blk);
+            let tensors = decl.tensors();
+            let w = &n.lw[0];
+            assert_eq!(tensors[n.qkva_xq as usize].bytes, (rows * h) as u64);
+            assert_eq!(tensors[n.qkva_xs as usize].bytes, (rows * (h / 128)) as u64 * F32);
+            assert_eq!(tensors[w.qkva as usize].bytes, ((ql + dk + dr) * h) as u64);
+            assert_eq!(tensors[w.qkva_s as usize].bytes, ((ql + dk + dr).div_ceil(128) * (h / 128)) as u64 * F32);
+            let mut b = Builder::new(256);
+            b.adopt_tensors(tensors);
+            let all = b.all();
+            if prefill {
+                emit_glm_block_prefill(&mut b, &c, &n, 0, 512, rows, MoeEnc::Fp8Blk,
+                    n.x, n.xnext, &[], &mut 0, &all, None);
+            } else {
+                emit_glm_block(&mut b, &c, &n, 0, 512, rows, rows, MoeEnc::Fp8Blk,
+                    n.x, n.xnext, &[], &mut 0, &all);
+            }
+            let p = b.finish();
+            let qix = p.insts.iter().position(|d| d.op == DevOp::QuantFp8Block128 as u16 && d.t[0] == n.qkva_xq).unwrap();
+            let gix = p.insts.iter().position(|d| d.op == DevOp::GemmFp8Block128 as u16 && d.t[0] == n.qlr).unwrap();
+            let (q, g) = (&p.insts[qix], &p.insts[gix]);
+            assert_eq!(&g.t[..7], &[n.qlr, n.qkva_xq, w.qkva, n.qkva_xs, w.qkva_s, n.ckvraw, n.krr]);
+            assert_eq!(&g.i[..6], &[rows, ql + dk + dr, h, 16, ql, dk]);
+            assert_eq!(&q.t[..3], &[n.qkva_xq, n.xn, n.qkva_xs]);
+            let qe = p.stream.iter().find(|e| e.inst as usize == qix).unwrap();
+            let ge = p.stream.iter().find(|e| e.inst as usize == gix).unwrap();
+            assert_eq!(qe.seg, ge.seg);
+            let succs = &p.succs[qe.succ_ofs as usize..][..qe.succ_len as usize];
+            let waits = &p.waits[ge.wait_ofs as usize..][..ge.wait_len as usize];
+            assert!(waits.iter().any(|v| succs.contains(&v.id) && v.threshold == q.blocks as u32));
+            for weight in [w.qad, w.ckvd, w.krotd] {
+                assert!(!p.insts.iter().any(|d| d.t.contains(&weight)));
+            }
+            let succs = &p.succs[ge.succ_ofs as usize..][..ge.succ_len as usize];
+            for out in [n.qlr, n.ckvraw, n.krr] {
+                let consumer = p.insts.iter().position(|d| d.t[1] == out).unwrap();
+                let event = p.stream.iter().find(|e| e.inst as usize == consumer).unwrap();
+                let waits = &p.waits[event.wait_ofs as usize..][..event.wait_len as usize];
+                assert!(waits.iter().any(|v| succs.contains(&v.id) && v.threshold == g.blocks as u32));
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "PLOW_GLM_QKVA_W8A8 requires")]
+fn glm_qkva_w8a8_refuses_bf16_weights() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[("PLOW_GLM_QKVA_W8A8", "1"), ("GLM_LINEAR_FP8", "0")]);
+    declare_glm_rows_batched(&mut Builder::new(256), &glm_ref_cfg(), 512, &[3], 16, 16, MoeEnc::Fp8Blk);
+}
+
+#[test]
+fn glm_mla_w8a8_preserves_boundaries_and_atomic_clear_dependency() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("GLM_LINEAR_FP8", "1"), ("PLOW_GLM_QKVA_W8A8", "1"),
+        ("PLOW_GLM_MLA_W8A8", "1"), ("PLOW_UNISEG", "1"), ("PLOW_GLM_DSA", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    for (prefill, rows) in [(false, 1), (false, 8), (false, 16), (false, 32),
+        (false, 64), (true, 128), (true, 2048)] {
+        let mut decl = Builder::new(256);
+        let n = declare_glm_rows_batched(&mut decl, &c, 4096, &[3], rows, rows, MoeEnc::Fp8Blk);
+        let tensors = decl.tensors();
+        let w = &n.lw[0];
+        for (handle, bytes) in [(n.olat, rows * 8 * 512 * 2), (n.qb, rows * 2048 * 2), (n.qb_xq, rows * 2048),
+            (n.qb_xs, rows * 16 * 4), (w.qb, 2048 * 2048), (w.qb_s, 16 * 16 * 4),
+            (w.wk, 8 * 512 * 192), (w.wk_s, 4), (w.wv, 8 * 256 * 512), (w.wv_s, 4)] {
+            assert_eq!(tensors[handle as usize].bytes, bytes as u64);
+        }
+        let mut b = Builder::new(256);
+        b.adopt_tensors(tensors);
+        let all = b.all();
+        if prefill {
+            emit_glm_block_prefill(&mut b, &c, &n, 0, 4096, rows, MoeEnc::Fp8Blk,
+                n.x, n.xnext, &[], &mut 0, &all, None);
+        } else {
+            emit_glm_block(&mut b, &c, &n, 0, 4096, rows, rows, MoeEnc::Fp8Blk,
+                n.x, n.xnext, &[], &mut 0, &all);
+        }
+        let p = b.finish();
+        let find = |op: DevOp, out: u32| p.insts.iter()
+            .position(|d| d.op == op as u16 && d.t[0] == out).unwrap();
+        let q = find(DevOp::QuantFp8Block128, n.qb_xq);
+        let z = find(DevOp::ZeroF32, n.qb);
+        let g = find(DevOp::GemmFp8Block128, n.qb);
+        let k = find(DevOp::MlaBmmFp8, n.qa);
+        let merge = find(DevOp::FlashMerge, n.olat);
+        let v = find(DevOp::MlaBmmFp8, n.oat);
+        assert_eq!(p.insts[g].i, [rows, 2048, 2048, 16, 0, 0, 1, 0]);
+        assert_eq!(&p.insts[z].i[..2], &[rows, 1024]);
+        assert_eq!(&p.insts[k].t[..5], &[n.qa, n.qb, w.wk, w.wk_s, n.qrr]);
+        assert_eq!(&p.insts[k].i[..5], &[rows, 8, 512, 192, 1]);
+        assert_eq!(&p.insts[v].t[..4], &[n.oat, n.olat, w.wv, w.wv_s]);
+        assert_eq!(&p.insts[v].i[..5], &[rows, 8, 256, 512, 0]);
+        for (producer, consumer) in [(q, g), (z, g), (g, k), (merge, v)] {
+            let pe = p.stream.iter().find(|e| e.inst as usize == producer).unwrap();
+            let ce = p.stream.iter().find(|e| e.inst as usize == consumer).unwrap();
+            assert_eq!(pe.seg, ce.seg);
+            let succs = &p.succs[pe.succ_ofs as usize..][..pe.succ_len as usize];
+            let waits = &p.waits[ce.wait_ofs as usize..][..ce.wait_len as usize];
+            assert!(waits.iter().any(|v| succs.contains(&v.id)
+                && v.threshold == p.insts[producer].blocks as u32));
+        }
+        for weight in [w.wqa, w.wqr, w.wuv] {
+            assert!(!p.insts.iter().any(|d| d.t.contains(&weight)));
+        }
+        assert!(!p.insts.iter().any(|d| d.op == DevOp::MlaMergeFold as u16));
+    }
+}
+
+#[test]
+fn glm_indexer_wq_w8a8_shares_quantization_without_bf16_weight() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("GLM_LINEAR_FP8", "1"), ("PLOW_GLM_QKVA_W8A8", "1"),
+        ("PLOW_GLM_MLA_W8A8", "1"), ("PLOW_GLM_INDEXER_WQ_W8A8", "1"),
+        ("PLOW_UNISEG", "1"), ("PLOW_GLM_DSA", "1"), ("PLOW_GLM_DSA_PF", "1"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    for (full, grouped) in [(true, "0"), (false, "0"), (true, "1"), (false, "1")] {
+        let _group = crate::test_env::EnvScope::set(&[("PLOW_GLM_DECODE_GEMM_GROUP", grouped)]);
+        c.indexer_full[3] = full;
+        for (prefill, rows) in [(false, 1), (false, 8), (false, 16), (false, 32),
+            (false, 64), (true, 4096)] {
+            let mut decl = Builder::new(256);
+            let n = declare_glm_rows_batched(&mut decl, &c, 71680, &[3], rows, rows, MoeEnc::Fp8Blk);
+            let w = &n.lw[0];
+            let tensors = decl.tensors();
+            assert_eq!(w.iwqb, TENSOR_NONE);
+            if full {
+                assert_eq!(tensors[w.blk_iwqb as usize].bytes, 4096 * 2048);
+                assert_eq!(tensors[w.blk_iwqb as usize].name, "model.layers.3.self_attn.indexer.wq_b.weight");
+                assert_eq!(tensors[w.blk_iwqb_s as usize].bytes, 32 * 16 * 4);
+            } else {
+                assert_eq!(w.blk_iwqb, TENSOR_NONE);
+                assert_eq!(w.blk_iwqb_s, TENSOR_NONE);
+            }
+            let mut b = Builder::new(256);
+            b.adopt_tensors(tensors);
+            let all = b.all();
+            if prefill {
+                emit_glm_block_prefill(&mut b, &c, &n, 0, 71680, rows, MoeEnc::Fp8Blk,
+                    n.x, n.xnext, &[], &mut 0, &all, None);
+            } else {
+                emit_glm_block(&mut b, &c, &n, 0, 71680, rows, rows, MoeEnc::Fp8Blk,
+                    n.x, n.xnext, &[], &mut 0, &all);
+            }
+            let p = b.finish();
+            let quant: Vec<_> = p.insts.iter().enumerate().filter(|(_, d)|
+                d.op == DevOp::QuantFp8Block128 as u16 && d.t[1] == n.qlat).collect();
+            assert_eq!(quant.len(), 1);
+            let out = if prefill { n.qidx_pf } else { n.qidx };
+            let projection: Vec<_> = p.insts.iter().enumerate().filter(|(_, d)|
+                d.op == DevOp::GemmFp8Block128 as u16 && d.t[0] == out).collect();
+            assert_eq!(projection.len(), usize::from(full));
+            if full {
+                let (index, d) = projection[0];
+                assert_eq!(&d.t[..5], &[out, n.qb_xq, w.blk_iwqb, n.qb_xs, w.blk_iwqb_s]);
+                assert_eq!(d.i, [rows, 4096, 2048, 16, 0, 0, 0, 0]);
+                let producer = p.stream.iter().find(|e| e.inst as usize == quant[0].0).unwrap();
+                let consumer = p.stream.iter().find(|e| e.inst as usize == index).unwrap();
+                let succs = &p.succs[producer.succ_ofs as usize..][..producer.succ_len as usize];
+                let waits = &p.waits[consumer.wait_ofs as usize..][..consumer.wait_len as usize];
+                assert!(waits.iter().any(|v| succs.contains(&v.id)
+                    && v.threshold == quant[0].1.blocks as u32));
+                assert!(!p.insts.iter().any(|d| d.op == DevOp::QuantFp8Block128 as u16
+                    && d.t[0] != n.qb_xq && d.t[1] == n.qlat));
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "PLOW_GLM_INDEXER_WQ_W8A8 requires")]
+fn glm_indexer_wq_w8a8_refuses_missing_mla_quantization() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[("PLOW_GLM_INDEXER_WQ_W8A8", "1")]);
+    declare_glm_rows_batched(&mut Builder::new(256), &glm_ref_cfg(), 71680, &[0], 16, 16, MoeEnc::Fp8Blk);
+}
+
+#[test]
+#[should_panic(expected = "PLOW_GLM_MLA_W8A8 requires")]
+fn glm_mla_w8a8_refuses_other_tp() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("GLM_LINEAR_FP8", "1"), ("PLOW_GLM_QKVA_W8A8", "1"), ("PLOW_GLM_MLA_W8A8", "1"),
+    ]);
+    declare_glm_rows_batched(&mut Builder::new(256), &glm_ref_cfg(), 512, &[3], 16, 16, MoeEnc::Fp8Blk);
+}
+
+#[test]
+fn glm_rope_bf16_emits_only_opted_in_device_recipes() {
+    let _guard = crate::test_env::env_guard();
+    for ctx in [8192, 71680] {
+    for enabled in ["0", "1"] {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("GLM_LINEAR_FP8", "1"), ("PLOW_GLM_QKVA_W8A8", "1"),
+            ("PLOW_GLM_MLA_W8A8", "1"), ("PLOW_GLM_ROPE_BF16", enabled),
+            ("PLOW_GLM_DSA", "1"),
+        ]);
+        let mut c = glm_ref_cfg(); c.tp = 8; c.indexer_full[3] = true;
+        let mut b = Builder::new(256);
+        declare_glm_rows_batched(&mut b, &c, ctx, &[3], 16, 16, MoeEnc::Fp8Blk);
+        let recipes = b.gen_tensors();
+        assert_eq!(recipes.iter().filter(|g| g.amd_rope_bf16()).count(),
+            if enabled == "1" { if c.dsa(ctx) { 4 } else { 2 } } else { 0 });
+        for g in recipes.iter().filter(|g| g.amd_rope_bf16()) {
+            assert_eq!(g.byte_len(), u64::from(ctx) * (g.hd as u64 / 2) * 4);
+            assert!(g.generate().is_none());
+        }
+    }
+    }
+}
+
+#[test]
+fn glm_mla_bf16_ps_isolates_only_qualified_decode_pairs() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("GLM_LINEAR_FP8", "1"), ("PLOW_GLM_QKVA_W8A8", "1"),
+        ("PLOW_GLM_MLA_W8A8", "1"), ("PLOW_GLM_MLA_BF16_PS", "1"),
+        ("PLOW_UNISEG", "1"), ("PLOW_GLM_DSA", "1"),
+    ]);
+    let mut c = glm_ref_cfg(); c.tp = 8; c.indexer_full[3] = true;
+    for (ctx, rows) in [(512, 1), (512, 8), (8192, 16), (71680, 16), (512, 32),
+        (512, 64), (8192, 32), (8192, 64), (71680, 32), (71680, 64), (512, 33)] {
+        let mut decl = Builder::new(256);
+        let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[3], rows, rows, MoeEnc::Fp8Blk);
+        let mut b = Builder::new(256); b.adopt_tensors(decl.tensors()); let all = b.all();
+        emit_glm_block(&mut b, &c, &n, 0, ctx, rows, rows, MoeEnc::Fp8Blk,
+            n.x, n.xnext, &[], &mut 0, &all);
+        let p = b.finish();
+        let merge = p.insts.iter().position(|d| d.op == DevOp::FlashMerge as u16 && d.t[0] == n.olat).unwrap();
+        let flash = merge - 1;
+        assert!(matches!(DevOp::from_u16(p.insts[flash].op), Some(DevOp::FlashMlaDecode | DevOp::FlashGatherDecode)));
+        let segment = p.stream.iter().find(|e| e.inst as usize == flash).unwrap().seg;
+        let entries: Vec<_> = p.stream.iter().filter(|e| e.seg == segment).collect();
+        if rows <= 32 || rows == 64 {
+            assert!(entries.iter().any(|e| e.inst as usize == merge));
+            assert!(entries.iter().all(|e| (e.inst as usize == flash || e.inst as usize == merge)
+                && e.wait_len == 0 && e.succ_len == 0 && e.flags & packet::dev::SE_XCTR == 0));
+        } else {
+            assert!(entries.iter().any(|e| e.inst as usize != flash && e.inst as usize != merge));
+            assert_ne!(p.insts[merge].wait_len, 0);
+        }
+    }
+}
+
+#[test]
+fn glm_native_indexer_shares_fp8_cache_across_decode_and_prefill() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("GLM_LINEAR_FP8", "1"), ("PLOW_GLM_QKVA_W8A8", "1"),
+        ("PLOW_GLM_MLA_W8A8", "1"), ("PLOW_GLM_MLA_BF16_PS", "1"),
+        ("PLOW_GLM_INDEXER_WQ_W8A8", "1"), ("PLOW_GLM_INDEXER_FP8", "1"),
+        ("PLOW_UNISEG", "1"), ("PLOW_GLM_DSA", "1"), ("PLOW_GLM_DSA_PF", "1"),
+    ]);
+    let mut c = glm_ref_cfg(); c.tp = 8; c.indexer_full[3] = true;
+    for ctx in [8192, 71680] {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut b = Builder::new(256);
+            declare_glm_rows_batched(&mut b, &c, ctx, &[3], 8192, 64, MoeEnc::Fp8Blk);
+        })).is_err());
+    }
+    let ctx = 131072;
+    let mut decl = Builder::new(256);
+    let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[3], 8192, 64, MoeEnc::Fp8Blk);
+    let tensors = decl.tensors();
+    assert_eq!(tensors[n.kidx[0] as usize].name, "kv.3.kidx_fp8");
+    assert_eq!(tensors[n.kidx[0] as usize].bytes, 64 * 131072 * 132);
+    assert_eq!(tensors[n.parked as usize].name, "in.parked");
+    assert_eq!(tensors[n.parked as usize].bytes, 64 * 4);
+    for (prefill, rows) in [(false, 1), (false, 8), (false, 16), (false, 32), (false, 64),
+        (true, 128), (true, 512), (true, 1024), (true, 2048), (true, 4096), (true, 8192)] {
+        let mut b = Builder::new(256); b.adopt_tensors(tensors.clone()); let all = b.all();
+        if prefill {
+            emit_glm_block_prefill(&mut b, &c, &n, 0, ctx, rows, MoeEnc::Fp8Blk,
+                n.x, n.xnext, &[], &mut 0, &all, None);
+        } else {
+            emit_glm_block(&mut b, &c, &n, 0, ctx, rows, 64, MoeEnc::Fp8Blk,
+                n.x, n.xnext, &[], &mut 0, &all);
+        }
+        let p = b.finish();
+        let op = if prefill { DevOp::IndexFp8Prefill } else { DevOp::IndexFp8Decode };
+        let native: Vec<_> = p.insts.iter().enumerate().filter(|(_, d)| d.op == op as u16).collect();
+        assert_eq!(native.len(), 1, "prefill={prefill} rows={rows}");
+        let (ix, d) = native[0];
+        let append = prefill && rows <= 2048;
+        assert_eq!(d.i[..3], [rows, ctx, u32::from(append)]);
+        assert_eq!(d.i[3..], [0; 5]);
+        assert_eq!(d.t[4..7], [n.kidx[0], n.pos, n.kvlen]);
+        assert_eq!(d.t[7], if prefill { TENSOR_NONE } else { n.parked });
+        assert_eq!(d.t[2], if prefill { n.kidx_pf } else { n.kidx_normed });
+        if append { assert_eq!([d.t[0], d.t[1], d.t[3]], [TENSOR_NONE; 3]); }
+        assert!(!p.insts.iter().any(|i| matches!(DevOp::from_u16(i.op),
+            Some(DevOp::IndexScore | DevOp::IndexScorePf))));
+        assert!(!p.insts.iter().any(|i| i.op == DevOp::HeadNormRope as u16 && i.t[0] == n.kidx[0]));
+        let seg = p.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg;
+        assert!(p.stream.iter().filter(|e| e.seg == seg).all(|e| e.inst as usize == ix
+            && e.wait_len == 0 && e.succ_len == 0 && e.flags & packet::dev::SE_XCTR == 0));
+    }
+}
+
+#[test]
+#[should_panic(expected = "requires gfx950 and GLM_LINEAR_FP8")]
+fn glm_oproj_w8a8_refuses_bf16_weights() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("GLM_LINEAR_FP8", "0"), ("PLOW_GLM_OPROJ_W8A8", "1"),
+    ]);
+    let mut b = Builder::new(256);
+    declare_glm_rows_batched(&mut b, &glm_ref_cfg(), 512, &[3], 16, 16, MoeEnc::Fp8Blk);
+}
+
+#[test]
+fn glm_shared_w8a8_routes_all_rungs_and_preserves_boundaries() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("GLM_LINEAR_FP8", "1"), ("PLOW_GLM_SHARED_W8A8", "1"),
+        ("PLOW_UNISEG", "1"), ("PLOW_GLM_DSA", "0"), ("GLM_MOE_CORESIDENT", "2"),
+    ]);
+    for tp in [1, 4, 8] {
+        let mut c = glm_ref_cfg();
+        c.tp = tp;
+        let (h, inter) = (c.hidden, c.moe_inter / tp);
+        for (prefill, rows) in [(false, 1), (false, 8), (false, 16), (false, 32), (false, 64), (true, 128)] {
+            let mut decl = Builder::new(256);
+            let n = declare_glm_rows_batched(&mut decl, &c, 512, &[3], rows, rows, MoeEnc::Fp8Blk);
+            let tensors = decl.tensors();
+            for (handle, bytes) in [(n.sh_gate, rows * inter * 2), (n.shfu_up, rows * inter * 2),
+                (n.sh_xq, rows * h), (n.sh_xs, rows * (h / 128) * 4),
+                (n.sh_hq, rows * inter), (n.sh_hs, rows * (inter / 128) * 4)] {
+                assert_eq!(tensors[handle as usize].bytes, bytes as u64);
+            }
+            let mut b = Builder::new(256);
+            b.adopt_tensors(tensors);
+            let all = b.all();
+            if prefill {
+                emit_glm_block_prefill(&mut b, &c, &n, 0, 512, rows, MoeEnc::Fp8Blk,
+                    n.x, n.xnext, &[], &mut 0, &all, None);
+            } else {
+                emit_glm_block(&mut b, &c, &n, 0, 512, rows, rows, MoeEnc::Fp8Blk,
+                    n.x, n.xnext, &[], &mut 0, &all);
+            }
+            let p = b.finish();
+            let find = |op: DevOp, out| p.insts.iter().position(|d| d.op == op as u16 && d.t[0] == out).unwrap();
+            let qx = find(DevOp::QuantFp8Block128, n.sh_xq);
+            let gate = find(DevOp::GemmFp8Block128, n.sh_gate);
+            let up = find(DevOp::GemmFp8Block128, n.shfu_up);
+            let glu = find(DevOp::Glu, n.shfu);
+            let qh = find(DevOp::QuantFp8Block128, n.sh_hq);
+            let down = find(DevOp::GemmFp8Block128, n.shared);
+            for (ix, width) in [(qx, h), (qh, inter)] {
+                if rows == 16 {
+                    assert_eq!(u32::from(p.insts[ix].blocks), (rows * (width / 32)).div_ceil(WG_THREADS).min(256));
+                }
+            }
+            for (ix, out, a, wt, sa, sw, nn, k) in [
+                (gate, n.sh_gate, n.sh_xq, n.lw[0].shg, n.sh_xs, n.lw[0].shg_s, inter, h),
+                (up, n.shfu_up, n.sh_xq, n.lw[0].shu, n.sh_xs, n.lw[0].shu_s, inter, h),
+                (down, n.shared, n.sh_hq, n.lw[0].shd, n.sh_hs, n.lw[0].shd_s, h, inter),
+            ] {
+                assert_eq!(&p.insts[ix].t[..5], &[out, a, wt, sa, sw]);
+                assert_eq!(&p.insts[ix].i[..3], &[rows, nn, k]);
+                assert_eq!(p.insts[ix].i[3], if rows == 16 && h == 6144 && inter == 256 { 16 } else { 0 });
+            }
+            assert_eq!(&p.insts[glu].t[..3], &[n.shfu, n.sh_gate, n.shfu_up]);
+            assert_eq!(p.insts[glu].i[1], 5, "round SiLU to BF16 before multiplying up");
+            for (from, to) in [(qx, gate), (qx, up), (gate, glu), (up, glu), (glu, qh), (qh, down)] {
+                let producer = p.stream.iter().find(|e| e.inst as usize == from).unwrap();
+                let consumer = p.stream.iter().find(|e| e.inst as usize == to).unwrap();
+                assert_eq!(producer.seg, consumer.seg);
+                let succs = &p.succs[producer.succ_ofs as usize..][..producer.succ_len as usize];
+                let waits = &p.waits[consumer.wait_ofs as usize..][..consumer.wait_len as usize];
+                assert!(waits.iter().any(|w| succs.contains(&w.id) && w.threshold == p.insts[from].blocks as u32));
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "PLOW_GLM_SHARED_W8A8 requires")]
+fn glm_shared_w8a8_refuses_bf16_weights() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("GLM_LINEAR_FP8", "0"), ("PLOW_GLM_SHARED_W8A8", "1"),
+    ]);
+    let mut b = Builder::new(256);
+    declare_glm_rows_batched(&mut b, &glm_ref_cfg(), 512, &[3], 16, 16, MoeEnc::Fp8Blk);
+}
+
+#[test]
+fn glm_routed_w8a8_preserves_pipeline_and_bf16_reduction() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("GLM_LINEAR_FP8", "1"), ("PLOW_GLM_ROUTED_W8A8", "1"),
+        ("PLOW_UNISEG", "1"), ("PLOW_GLM_DSA", "0"),
+    ]);
+    for tp in [1, 4, 8] {
+        let mut c = glm_ref_cfg();
+        c.tp = tp;
+        let (h, inter, tk) = (c.hidden, c.moe_inter / tp, c.top_k);
+        for (prefill, rows) in [(false, 1), (false, 8), (false, 16), (false, 32), (false, 64), (true, 128)] {
+            let mut decl = Builder::new(256);
+            let n = declare_glm_rows_batched(&mut decl, &c, 512, &[3], rows, rows, MoeEnc::Fp8Blk);
+            let tensors = decl.tensors();
+            for (handle, bytes) in [(n.routed_xq, rows * h), (n.routed_xs, rows * (h / 128) * 4),
+                (n.routed_hq, rows * tk * inter), (n.routed_hs, rows * tk * (inter / 128) * 4)] {
+                assert_eq!(tensors[handle as usize].bytes, bytes as u64);
+            }
+            let mut b = Builder::new(256);
+            b.adopt_tensors(tensors);
+            let all = b.all();
+            if prefill {
+                emit_glm_block_prefill(&mut b, &c, &n, 0, 512, rows, MoeEnc::Fp8Blk,
+                    n.x, n.xnext, &[], &mut 0, &all, None);
+            } else {
+                emit_glm_block(&mut b, &c, &n, 0, 512, rows, rows, MoeEnc::Fp8Blk,
+                    n.x, n.xnext, &[], &mut 0, &all);
+            }
+            let p = b.finish();
+            let find = |op: DevOp, out| p.insts.iter().position(|d| d.op == op as u16 && d.t[0] == out).unwrap();
+            let qx = find(DevOp::QuantFp8Block128, n.routed_xq);
+            assert_eq!(u32::from(p.insts[qx].blocks), if rows == 16 { (rows * (h / 32)).div_ceil(WG_THREADS).min(256) } else { 256 });
+            let glu = find(DevOp::MoeGluFp8Block128, n.fu_g);
+            let qh = find(DevOp::MoeQuantFp8Block128, n.routed_hq);
+            let down = find(DevOp::MoeDownFp8Block128, n.part);
+            assert_eq!(&p.insts[glu].i[..4], &[inter, h, c.n_exp, rows]);
+            assert_eq!(&p.insts[glu].t[..7], &[n.fu_g, n.routed_xq, n.routed_xs, n.lw[0].ewt,
+                n.lw[0].est, n.meta, n.row_token]);
+            assert_eq!(&p.insts[qh].i[..5], &[inter, c.n_exp, tk, rows, h]);
+            assert_eq!(p.insts[qh].t[5], n.part, "quant zeros the atomic destination");
+            assert_eq!(&p.insts[down].i[..5], &[inter, h, c.n_exp, tk, rows]);
+            for d in p.insts.iter().filter(|d| d.op == DevOp::MoeCombinePf as u16) {
+                assert_eq!((d.t[3], d.i[1], d.i[7]), (n.part, 1, 1));
+            }
+            assert!(!p.insts.iter().any(|d| matches!(DevOp::from_u16(d.op), Some(DevOp::MoeGroupGluPf | DevOp::MoeGroupDownPf))));
+            for (from, to) in [(qx, glu), (glu, qh), (qh, down)] {
+                let producer = p.stream.iter().find(|e| e.inst as usize == from).unwrap();
+                let consumer = p.stream.iter().find(|e| e.inst as usize == to).unwrap();
+                assert_eq!(producer.seg, consumer.seg);
+                let succs = &p.succs[producer.succ_ofs as usize..][..producer.succ_len as usize];
+                let waits = &p.waits[consumer.wait_ofs as usize..][..consumer.wait_len as usize];
+                assert!(waits.iter().any(|w| succs.contains(&w.id) && w.threshold == p.insts[from].blocks as u32));
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "PLOW_GLM_ROUTED_W8A8 requires")]
+fn glm_routed_w8a8_refuses_bf16_weights() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[("GLM_LINEAR_FP8", "0"), ("PLOW_GLM_ROUTED_W8A8", "1")]);
+    let mut b = Builder::new(256);
+    declare_glm_rows_batched(&mut b, &glm_ref_cfg(), 512, &[3], 16, 16, MoeEnc::Fp8Blk);
 }
 
 /// A block-fp8 weight without its scale grid is a NULL pointer inside the kernel's promotion.

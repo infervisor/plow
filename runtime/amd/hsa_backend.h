@@ -101,6 +101,7 @@ int plow_hsa_download(plow_hsa* h, int dev, void* dst, const void* src, size_t b
 /* Load a *raw* AMDGPU code object (an unbundled ELF — NOT the clang offload
  * bundle that `hipcc --genco` emits; see runtime/CMakeLists.txt, which runs
  * clang-offload-bundler to strip the wrapper). */
+/* Loaded modules remain alive until shutdown; get_kernel searches the latest module. */
 int plow_hsa_load_code_object(plow_hsa* h, int dev, const void* elf, size_t bytes);
 
 /* Resolve a kernel by source name (we append the ".kd" the loader expects). */

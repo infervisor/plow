@@ -514,6 +514,152 @@ fn required_compiled_opcode_markers_are_fail_closed() {
 }
 
 #[test]
+fn native_ocp_weights_preserve_bytes_only_without_legacy_consumers() {
+    let mut p = segmented_prog(&[DevOp::GemmFp8Block128, DevOp::GemmFp8Block128], &[0, 0]);
+    for d in &mut p.insts {
+        d.t = [packet::dev::TENSOR_NONE16; 8];
+        d.t[2] = 7;
+    }
+    assert_eq!(native_ocp_fp8_weights(std::slice::from_ref(&p)), [7].into_iter().collect());
+    let mut other = segmented_prog(&[DevOp::GemvFp8Blk], &[0]);
+    other.insts[0].t = [packet::dev::TENSOR_NONE16; 8];
+    other.insts[0].t[2] = 7;
+    assert!(native_ocp_fp8_weights(&[p, other]).is_empty());
+    let p = segmented_prog(&[DevOp::GemvFp8Blk], &[0]);
+    assert!(native_ocp_fp8_weights(&[p]).is_empty());
+}
+
+#[test]
+fn routed_block128_requires_markers_and_valid_geometry() {
+    let path = Path::new("routed.elf");
+    let syms = ["plow_opcode_moe_glu_fp8_block128_1", "plow_opcode_moe_quant_fp8_block128_1",
+        "plow_opcode_moe_down_fp8_block128_1"];
+    for (op, dims) in [
+        (DevOp::MoeGluFp8Block128, [256, 6144, 256, 16, 0, 0, 0, 0]),
+        (DevOp::MoeQuantFp8Block128, [256, 256, 8, 16, 6144, 0, 0, 0]),
+        (DevOp::MoeDownFp8Block128, [256, 6144, 256, 8, 16, 0, 0, 0]),
+    ] {
+        let mut p = segmented_prog(&[op], &[0]);
+        p.insts[0].t = [0; 8];
+        p.insts[0].i = dims;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+        assert!(check_compiled_opcode_markers(&[], path, [&p]).is_err());
+        p.insts[0].i[0] = 129;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+        p.insts[0].i = dims;
+        p.insts[0].t[0] = packet::dev::TENSOR_NONE16;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+    }
+}
+
+#[test]
+fn block_fp8_m16_requires_its_object_marker() {
+    let path = Path::new("interp_decode_gq.elf");
+    let mut p = segmented_prog(&[DevOp::GemmFp8Block128], &[0]);
+    let base = "plow_opcode_gemm_fp8_block128_1";
+    assert!(check_compiled_opcode_markers(&[base], path, [&p]).is_ok());
+    p.insts[0].i[3] = 16;
+    assert!(check_compiled_opcode_markers(&[base], path, [&p]).unwrap_err().to_string()
+        .contains("plow_gemm_fp8_block128_m16_1"));
+    let syms = [base, "plow_gemm_fp8_block128_m16_1"];
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+    p.insts[0].i[3] = 7;
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+}
+
+#[test]
+fn rounded_silu_requires_its_object_marker() {
+    let path = Path::new("interp_decode_gq.elf");
+    let mut p = segmented_prog(&[DevOp::Glu], &[0]);
+    p.insts[0].i[1] = 1;
+    assert!(check_compiled_opcode_markers(&[], path, [&p]).is_ok());
+    p.insts[0].i[1] = 5;
+    assert!(check_compiled_opcode_markers(&[], path, [&p]).unwrap_err().to_string()
+        .contains("plow_glu_silu_bf16_1"));
+    assert!(check_compiled_opcode_markers(&["plow_glu_silu_bf16_1"], path, [&p]).is_ok());
+}
+
+#[test]
+fn block_fp8_split3_requires_marker_and_geometry() {
+    let path = Path::new("interp_decode_gq.elf");
+    let syms = ["plow_opcode_gemm_fp8_block128_1", "plow_gemm_fp8_block128_m16_1",
+        "plow_gemm_fp8_block128_split3_1"];
+    let mut p = segmented_prog(&[DevOp::GemmFp8Block128], &[0]);
+    let dims = [16, 2624, 6144, 16, 2048, 512, 0, 0];
+    p.insts[0].i = dims;
+    p.insts[0].t = [0, 1, 2, 3, 4, 5, 6, packet::dev::TENSOR_NONE16];
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+    assert!(check_compiled_opcode_markers(&syms[..2], path, [&p]).is_err());
+    for (slot, value) in [(0, 0), (0, u32::MAX), (1, 2560), (2, 6143),
+        (3, 0), (4, 0), (4, u32::MAX), (5, 0), (6, 1), (7, 1)] {
+        p.insts[0].i = dims;
+        p.insts[0].i[slot] = value;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err(), "slot{slot}={value}");
+    }
+    p.insts[0].i = dims;
+    for slot in 0..7 {
+        let old = p.insts[0].t[slot];
+        p.insts[0].t[slot] = packet::dev::TENSOR_NONE16;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+        p.insts[0].t[slot] = old;
+    }
+    assert_eq!(native_ocp_fp8_weights(&[p]), [2].into_iter().collect());
+}
+
+#[test]
+fn mla_fp8_requires_marker_valid_geometry_and_ocp_bytes() {
+    let path = Path::new("interp_decode_gq.elf");
+    let syms = ["plow_opcode_mla_bmm_fp8_1"];
+    let mut p = segmented_prog(&[DevOp::MlaBmmFp8], &[0]);
+    for dims in [[16, 8, 512, 192, 1, 0, 0, 0], [16, 8, 256, 512, 0, 0, 0, 0]] {
+        p.insts[0].i = dims;
+        p.insts[0].t = [0, 1, 2, 3, 4, packet::dev::TENSOR_NONE16,
+            packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16];
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+        assert!(check_compiled_opcode_markers(&[], path, [&p]).is_err());
+        for (slot, value) in [(0, 0), (0, u32::MAX), (1, 16), (2, 255),
+            (3, 128), (4, 2), (5, 1), (6, 1), (7, 1)] {
+            p.insts[0].i = dims;
+            p.insts[0].i[slot] = value;
+            assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+        }
+        p.insts[0].i = dims;
+        for slot in 0..if dims[4] == 1 { 5 } else { 4 } {
+            p.insts[0].t[slot] = packet::dev::TENSOR_NONE16;
+            assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+            p.insts[0].t[slot] = slot as u16;
+        }
+        assert_eq!(native_ocp_fp8_weights(std::slice::from_ref(&p)), [2].into_iter().collect());
+    }
+}
+
+#[test]
+fn block_fp8_qb_requires_marker_and_geometry() {
+    let path = Path::new("interp_decode_gq.elf");
+    let syms = ["plow_opcode_gemm_fp8_block128_1", "plow_gemm_fp8_block128_m16_1",
+        "plow_gemm_fp8_block128_qb_1"];
+    let mut p = segmented_prog(&[DevOp::GemmFp8Block128], &[0]);
+    let dims = [16, 2048, 2048, 16, 0, 0, 1, 0];
+    p.insts[0].i = dims;
+    p.insts[0].t = [0, 1, 2, 3, 4, packet::dev::TENSOR_NONE16,
+        packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16];
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+    assert!(check_compiled_opcode_markers(&syms[..2], path, [&p]).is_err());
+    for (slot, value) in [(0, 0), (0, u32::MAX), (1, 1024), (2, 2047),
+        (3, 0), (4, 1), (5, 1), (6, 2), (7, 1)] {
+        p.insts[0].i = dims;
+        p.insts[0].i[slot] = value;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+    }
+    p.insts[0].i = dims;
+    for slot in 0..5 {
+        p.insts[0].t[slot] = packet::dev::TENSOR_NONE16;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+        p.insts[0].t[slot] = slot as u16;
+    }
+}
+
+#[test]
 fn interpreter_wave_geometry_rejects_missing_or_swapped_phase_objects() {
     for phase in [Phase::Prefill, Phase::Decode, Phase::Flash] {
         let expected = phase.interpreter_threads() / 64;
@@ -4860,6 +5006,33 @@ fn rebase_chunk_still_patches_the_dense_gqa_families() {
     assert_eq!(insts[2].i[1], 1536, "n_kv is everything written so far");
 }
 
+#[test]
+fn rebase_indexer_selection_preserves_stride_and_uses_live_rows() {
+    let names = vec!["act.indices".to_string()];
+    for t in [128, 512, 1024, 2048, 4096, 8192] {
+        for base in [0, 71680] {
+            for live in [1, t - 1, t] {
+                for op in [DevOp::IndexSelectPf, DevOp::IndexUnionPf] {
+                    let original = DevInst64 {
+                        op: op as u16,
+                        i: [t, 2048, 131072, 0, 0, 0, 0, 0],
+                        ..Default::default()
+                    };
+                    let mut insts = [original];
+                    rebase_chunk_rows(&mut insts, &names, base, live, t, Some(t));
+                    assert_eq!(insts[0].i[0], live);
+                    assert_eq!(&insts[0].i[1..], &original.i[1..]);
+                    let kv_len = base + live;
+                    assert_eq!(kv_len - insts[0].i[0], base);
+                    let mut padded = [original];
+                    rebase_chunk_rows(&mut padded, &names, base, live, t, None);
+                    assert_eq!(padded[0].i[0], t);
+                }
+            }
+        }
+    }
+}
+
 /// EVERY KDA OP'S ROW COUNT BECOMES `clen`, AND THE BUG IS WHAT THIS ASSERTS.
 ///
 /// This covers both a compiled 512-row rung shortened to 511 and the production
@@ -5466,6 +5639,25 @@ fn native_moe_decode_keeps_ordered_xcd_boundaries() {
     validate_decode_dispatch([(0, &p)]).unwrap();
     for bad in 0..4 {
         let mut p = make();
+        match bad {
+            0 => p.stream[1].wait_len = 1,
+            1 => p.stream[1].succ_len = 1,
+            2 => p.stream[1].flags |= SE_XCTR,
+            _ => p.stream[0].seg = 1,
+        }
+        assert!(decode_segment_kinds(&p).is_err(), "case {bad}");
+    }
+}
+
+#[test]
+fn native_index_fp8_decode_keeps_ordered_boundaries() {
+    let mut p = segmented_decode_probe();
+    p.insts[1].op = DevOp::IndexFp8Decode as u16;
+    assert_eq!(decode_segment_kinds(&p).unwrap()[1], DecodeSegmentKind::IndexFp8);
+    validate_decode_dispatch([(0, &p)]).unwrap();
+    for bad in 0..4 {
+        let mut p = segmented_decode_probe();
+        p.insts[1].op = DevOp::IndexFp8Decode as u16;
         match bad {
             0 => p.stream[1].wait_len = 1,
             1 => p.stream[1].succ_len = 1,

@@ -761,6 +761,21 @@ mod tests {
     /// The asserts stay as defence; this keeps a new one from landing unencoded.
     const ASSERT_SITES: &[(&str, &str, Site)] = &[
         (
+            "mla.rs",
+            "PLOW_GLM_INDEXER_WQ_W8A8 requires PLOW_GLM_MLA_W8A8",
+            Site::Encoded("indexer_wq_w8a8_contract"),
+        ),
+        (
+            "mla.rs",
+            "PLOW_GLM_ROPE_BF16 requires PLOW_GLM_MLA_W8A8",
+            Site::Encoded("glm_rope_bf16_contract"),
+        ),
+        (
+            "mla.rs",
+            "PLOW_GLM_MLA_BF16_PS requires PLOW_GLM_MLA_W8A8",
+            Site::Encoded("mla_bf16_ps_contract"),
+        ),
+        (
             "emit_config.rs",
             "Runtime offload additionally requires PLOW_ANE_MLP=1",
             Site::NotAConstraint("doc: rt.ane_mlp gates the offload"),

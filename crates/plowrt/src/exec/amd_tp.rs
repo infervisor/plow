@@ -1172,6 +1172,11 @@ impl AmdTpGroup {
         })
     }
 
+    /// Complete an act.x-only block without reading the model-only sampled-token tensor.
+    pub fn complete_block(&mut self) -> Result<()> {
+        self.drain_and_audit()
+    }
+
     fn drain_and_audit(&mut self) -> Result<()> {
         use crate::obs::dstep;
         // The decode is on the GPU: a prefix publish deferred from this tick's chunk runs here.

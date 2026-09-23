@@ -18,7 +18,7 @@ not a rewording.
 The verdict is PAIRED. A cell both arms miss is a model limit at that depth, not
 a regression of the candidate.
 """
-import argparse, json, sys, time, urllib.request
+import argparse, hashlib, json, struct, sys, time, urllib.request
 
 FILLER = (
     "The engine keeps one persistent dispatch per rank and advances every sequence "
@@ -50,6 +50,18 @@ def post(url, body, timeout=1800):
         return json.load(r)
 
 
+def exact_prompt(tokenize, length, depth, sentence, question):
+    filler = tokenize(FILLER)
+    needle = tokenize(" " + sentence + "\n\n")
+    suffix = tokenize(question)
+    padding = length - len(needle) - len(suffix)
+    if not filler or padding < 0 or not 0 <= depth <= 1:
+        raise ValueError("invalid exact-length needle geometry")
+    repeated = (filler * ((padding + len(filler) - 1) // len(filler)))[:padding]
+    split = int(padding * depth)
+    return repeated[:split] + needle + repeated[split:] + suffix
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True)
@@ -59,9 +71,13 @@ def main():
     ap.add_argument("--depths", default="0.1,0.5,0.9",
                     help="fraction of the filler BEFORE the needle")
     ap.add_argument("--max-tokens", type=int, default=32)
+    ap.add_argument("--exact-lengths", action="store_true", help="use /tokenize and explicit token-ID prompts")
     a = ap.parse_args()
 
     model = json.load(urllib.request.urlopen(a.url + "/v1/models"))["data"][0]["id"]
+    def tokenize(text):
+        return post(a.url + "/tokenize", {"model": model, "prompt": text,
+                                         "add_special_tokens": False})["tokens"]
     rec = {"arm": a.arm, "model": model, "cells": []}
     t0 = time.perf_counter()
     for n in [int(x) for x in a.lens.split(",")]:
@@ -71,14 +87,21 @@ def main():
             for nid, sentence, question, expect in NEEDLES:
                 prompt = (FILLER * head) + " " + sentence + " " + (FILLER * (reps - head)) \
                     + "\n\n" + question
+                prompt_hash = None
+                if a.exact_lengths:
+                    prompt = exact_prompt(tokenize, n, d, sentence, question)
+                    prompt_hash = hashlib.sha256(struct.pack(f"<{len(prompt)}I", *prompt)).hexdigest()
                 r = post(a.url + "/v1/completions", {
                     "model": model, "prompt": prompt, "add_special_tokens": False,
                     "temperature": 0, "max_tokens": a.max_tokens, "ignore_eos": False})
+                if a.exact_lengths and r["usage"]["prompt_tokens"] != n:
+                    raise ValueError(f"prompt length changed: expected {n}, got {r['usage']['prompt_tokens']}")
                 txt = r["choices"][0]["text"]
                 ok = expect in txt
                 rec["cells"].append({
                     "item": "%s@%.1f" % (nid, d), "tokens": n, "depth": d,
                     "prompt_tokens": r["usage"]["prompt_tokens"],
+                    "prompt_sha256_u32le": prompt_hash,
                     "correct": ok, "expect": expect, "text": txt, "answer_char": 0})
                 print("  %s %s@%.1f n=%d(%d): %s %r" % (
                     a.arm, nid, d, n, r["usage"]["prompt_tokens"],

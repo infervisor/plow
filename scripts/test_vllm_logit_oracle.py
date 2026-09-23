@@ -7,7 +7,37 @@ import numpy as np
 
 from vllm_logit_oracle import (dense_scores, repeat_metrics, suppression_metadata,
                                generation_rows, required_model_length, prompt_digest,
-                               engine_overrides)
+                               engine_overrides, model_precision_inventory, precision_report)
+
+
+class PrecisionInventoryTests(unittest.TestCase):
+    def test_loaded_tensors_and_quantization_flags_without_readback(self):
+        import torch
+
+        model = torch.nn.Linear(4, 2, bias=False, dtype=torch.bfloat16, device="meta")
+        model.kv_cache = torch.empty(3, 132, dtype=torch.uint8, device="meta")
+        model.is_aiter_triton_fp8_bmm_enabled = True
+        model.is_aiter_triton_fp4_bmm_enabled = False
+        model.quant_method = SimpleNamespace(activation_quant_key="dynamic-1x128")
+        row = model_precision_inventory(model)
+        module = row["modules"][""]
+        self.assertEqual(module["tensors"]["weight"]["dtype"], "torch.bfloat16")
+        self.assertEqual(module["tensors"]["weight"]["shape"], [2, 4])
+        self.assertEqual(module["tensors"]["kv_cache"]["dtype"], "torch.uint8")
+        self.assertTrue(module["attributes"]["is_aiter_triton_fp8_bmm_enabled"])
+        self.assertFalse(module["attributes"]["is_aiter_triton_fp4_bmm_enabled"])
+        self.assertEqual(module["attributes"]["quant_method"]["fields"]["activation_quant_key"],
+                         "dynamic-1x128")
+        report = precision_report([row], 1)
+        self.assertFalse(report["precision_qualified"])
+        self.assertIn("not a runtime arithmetic trace", report["scope"])
+
+    def test_missing_duplicate_and_empty_rank_reports_fail(self):
+        row = dict(rank=0, modules={"layer": {}}, sources={})
+        for ranks, expected in (([], 1), ([row], 2), ([row, row], 2),
+                                ([dict(row, modules={})], 1)):
+            with self.subTest(ranks=ranks), self.assertRaises(ValueError):
+                precision_report(ranks, expected)
 
 
 class EngineOverridesTests(unittest.TestCase):
@@ -26,6 +56,10 @@ class EngineOverridesTests(unittest.TestCase):
     def test_unknown_provider_is_rejected(self):
         with self.assertRaises(ValueError):
             engine_overrides(rms_norm_provider="all")
+
+    def test_precision_inventory_uses_named_worker_extension(self):
+        self.assertEqual(engine_overrides(precision_inventory=True), {
+            "worker_extension_cls": "vllm_logit_oracle.PrecisionInventoryWorker"})
 
 
 class SuppressionTests(unittest.TestCase):
