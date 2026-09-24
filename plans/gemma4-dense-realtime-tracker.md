@@ -5578,3 +5578,71 @@ own large weight stream through `op_gemm.cuh`'s gvmma path and were NOT touched 
 **Next probe is the same instrument pointed at the dense walks:** halve the k-range in the gvmma
 path and re-split. That isolates dense-weight time from the genuinely fixed remainder, and it is
 the only remaining place a 0.330 ms can hide.
+
+## MEASURED: the dense walk is FREE too — 88% of the B=1 step is per-op grid sync (2026-09-24)
+
+Third half-K probe, same instrument, pointed at `gvmma_tile:200` (the k-span every dense
+`GEMV_QKV`/`GEMV`/`GEMV_GLU` walks; `op_moe.cuh` has no `gvmma` call, so this isolates the dense
+weights). Control reused, SASS-gated, 3 interleaved order-reversed passes, one lease.
+
+| arm | mean ms | sd |
+|---|---|---|
+| full dense walk | 5.3770 | 0.0000 |
+| half dense walk | **5.3927** | 0.0012 |
+
+**Halving the dense walk made the step SLOWER**, by +0.0157 ms in all three passes. The object
+shrank (1,820,552 -> 1,813,768 B) at identical `REG:255 STACK:544 SHARED:8848 LOCAL:0`, so the
+penalty is the extra conditional the halving guard adds per tile call. `D = -0.031 ms`.
+
+### The step decomposition is now complete
+
+    dense weight walk    ~0.00 ms    0%     (measured: removing half the loads changes nothing)
+    MoE expert walk       0.65 ms   12%     (probe 2)
+    everything else       4.73 ms   88%
+
+At ctx 128 the KV is ~1 MB, so `FLASH_DECODE` is not bytes either. **Almost none of the B=1 step
+is memory traffic.** Both weight streams are hidden behind `PLOW_GEMV_PREFETCH`'s claim-ahead L2
+prefetch, which is why neither responds to having its bytes halved.
+
+### RETRACTION: the "<= 1.3 us/op" bound was invalid, and this reopens the op-count route
+
+Earlier today I bounded per-op overhead at `<= 1.3 us` from the dead-align arm (30 `blocks=1` ops
+removed for `<= 0.040 ms`) and used it to close the op-count route and cap task #79. **That
+inference was wrong.** Those 30 ops are DEAD — `dead_ctr = 31`, nothing waits on their counters —
+so the grid never blocks on them; only the single block that executes one is delayed. A dead op
+costs no grid sync. It is not a proxy for a live op, and the bound never applied to the 551-op
+chain.
+
+The corrected model fits every measurement taken today:
+
+    live op  ~ 4.73 ms / 551 = 8.6 us each   <- grid-wide ordering point, inside AMD's
+                                                measured 3.46-13.16 us gate range
+    dead op  ~ 1.3 us each                   <- no consumer waits, so no sync
+
+**Both numbers are explained by the same mechanism, and the model is falsifiable: removing N LIVE
+ops must save N x ~8.6 us.** It also finally explains task #71's ~1.3 ms "unidentified entry cost"
+and why every bandwidth lever this campaign has tried returned a null — the step is a chain of 551
+grid syncs with the memory traffic hidden underneath.
+
+### The target, quantified: remove ~38 live ops
+
+0.330 ms / 8.6 us = **38 ops of 551 (7%)**. Available, in order of cost-to-implement:
+
+1. **The 3 `HEADNORM_ROPE` per layer -> 2 (30 live ops).** They are consecutive, independent, and
+   each `blocks=2` of 132. Operand slots decide the split: q needs 6 (dst, src, q_norm, cos, sin,
+   pos), k needs 6, v needs 3 (dst, src, pos) and takes NO norm weight and NO rope (`t2..t4` are
+   all `65535:-` — it is a pure KV-cache store). **k+v = 8 slots exactly**, the op's full arity. So
+   merge k and v; q stays. Predicted **-0.26 ms**.
+2. The 30 dead `MOE_ALIGN_GEMMA_PF` ops: real, but ~1.3 us each = ~0.04 ms. Hygiene.
+3. `MOE_ROUTER_GEMMA_SCORE_FAST` + `MOE_ROUTER_GEMMA_TOPK` are adjacent (30 pairs); `TOPK` is
+   `blocks=1`. Fusing them is another 30 live ops = **-0.26 ms**.
+
+1 and 3 together predict **-0.52 ms against the 0.330 needed** — the first credible surplus this
+campaign has had. Both are op-71-shaped fusions (`lib.rs:6012` already did exactly this to remove
+"a separate RmsNorm op + counter gate").
+
+**Constraint on any such fusion:** the decode-ladder validator (`decode_rung.rs:179+`) compares
+normalized instruction lists across rungs with `blocks` zeroed, so the merged op must be emitted
+identically on EVERY compiled rung or the runtime silently falls back to widest-only execution.
+And at `REG:255 LOCAL:0` a fusion that widens the surviving op can still lose
+([[megakernel-array-loop-regression]]): measure single-variable, gate on SASS.
