@@ -5364,3 +5364,76 @@ Route: a `PLOW_TUNE_*` read in `tuning()` with a STRING LITERAL, a `rec.push` in
 `backend_nvcc()`, `env.PLOW_TUNE_*` in RAW_ENV, and **rebuild plowc**. `recommends` deliberately
 does not move the pairing hash (`pairing_hash_tracks_backend_requires_but_not_recommends`), so
 control and arm packets differ in exactly one compile flag.
+
+### RETRACTED, same day, by the measurement: the sm_90a arms DO reach every packet
+
+The section immediately above claimed `PLOW_NV_GEMV_RB` and its group reach no packet. **That is
+wrong.** `runtime/CMakeLists.txt:623-625` defines the sm_90a variant's define set as exactly "the
+two define sets `scripts/build_sm90a_cubin.sh` applies unconditionally", and the second of those is
+commented in place as
+
+>     * the H100 decode-arm fixes (perf-data/gemma26b-h100-gemv-mlp.md):
+>       GEMV row-blocking + warp router, MoE-down lane split, flash
+>       warp-per-row, fp8 RB=4. All default 0 in the sources.
+
+    set(_nv_var_sm90a
+        -DPLOW_NV_MLA=0 -DPLOW_NV_MAMBA=0 -DPLOW_NV_DSA=0
+        -DPLOW_NV_GEMV_RB=1 -DPLOW_NV_RB_GEMV=1 -DPLOW_NV_RB_QKV=1 -DPLOW_NV_RB_LMHEAD=1
+        -DPLOW_NV_GEMV_XREG=1 -DPLOW_NV_GEMV_KPANEL=1 -DPLOW_MOE_DOWN_LANESPLIT=1
+        -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FP8_RB=4)
+
+Every `_cubin_rows` object, decode included, gets it. `dot8_fx` and the row-blocked MoE arms are
+compiled into the shipped decode megakernel and always have been.
+
+**How four "independent" verifications all missed it.** Every one of them tested the
+*recipe -> tuning -> recommends -> PLOW_EXTRA_DEFINES* route and the objects script. The flag does
+not travel that route at all: it is hardcoded per-arch in CMakeLists, which no check looked at. The
+`def.PLOW_NV_GEMV_RB` knob being `UNSET`/`OPT_IN` is a red herring — the knob system is not how this
+define is delivered. Four checks of one route are still one check.
+
+**THE ONLY VALID CHECK for "does define X reach object Y" is the generated nvcc command line:**
+
+    grep -n "<object>.cubin" <packet>/assets/.cubin-build/CMakeFiles/nv_cubins.dir/build.make
+
+which prints the full argv. That was available before the build and would have killed the
+hypothesis in one command.
+
+**AND md5 IS NOT A VALID A/B GATE.** All four arms had DIFFERENT cubin md5s and byte-identical
+SASS (222,072 lines, PRMT 9,469, HMMA 1,768, identical `cmp`), with identical size 1,820,552 B and
+identical `REG:255 STACK:544 SHARED:8848 LOCAL:0`. The md5 moved because the tuning table is
+embedded in `plow_config.h`'s recipe-inputs text, which is compiled in as data. The guidance
+"gate on cubin md5 differing" ([[plow-extra-defines-not-plumbed-to-packets]]) is too weak: md5
+*equality* still proves a no-op, but md5 *inequality* proves nothing. **Gate on SASS.**
+
+**What the arms measured, for the record** (step_bench slots=1, ctx 128, 3 interleaved
+order-reversed passes, one lease). All three arms are redundant re-definitions of a flag already
+set to the same value, so this is a null-by-construction and only confirms the harness's floor:
+
+| arm | flag added | mean ms | sd | vs control |
+|---|---|---|---|---|
+| rctl | — | 5.3767 | 0.0025 | — |
+| rb1 | `PLOW_NV_GEMV_RB=1` | 5.3780 | 0.0017 | +0.0013 (+0.02%) |
+| ls1 | `PLOW_MOE_DOWN_LANESPLIT=1` | 5.3757 | 0.0006 | -0.0010 (-0.02%) |
+| both | both | 5.3780 | 0.0000 | +0.0013 (+0.02%) |
+
+Useful as a noise floor: three redundant rebuilds of the same kernel span 0.0023 ms, so the
+step_bench slots=1 proxy resolves ~0.005 ms at n=3.
+
+### What this closes, properly this time
+
+**The MLP-depth route on the B=1 MoE walk is CLOSED.** The 1425 GB/s (~45% of the 3352 roof) is
+achieved *with* `GEMV_RB`, `RB_GEMV`, `RB_QKV`, `RB_LMHEAD`, `GEMV_XREG`, `GEMV_KPANEL`,
+`MOE_DOWN_LANESPLIT` and `FA_WPR` all on. So the shortfall against the pure-read curve
+(1222 -> 2490 GB/s at 1 -> 8 loads in flight) is NOT un-enabled row blocking. `GV_MOE_RB=2` x
+`GV_MOE_UN=2` is the *tuned* depth — `GV_MOE_UN=4` was measured worse (6.288 vs 6.194) and
+`GV_MOE_RB_DN=4` costs REG 177 -> 229 — so the depth dial is at its measured optimum, not at a
+default.
+
+It also **reinstates last session's audit unchanged**: nine hand-build decode flags reach the
+packet and four do not (`GV_UNROLL_GLU`, `PLOW_NV_FA_KUN`, `PLOW_NV_GEMV_NOSTAGE`, plus
+structurally-blocked `PTXSYNC=3`), all four already measured. There is no fifth member. The
+`PRMT`/`fmaf` scalar shape at `op_moe.cuh:478` is real and is what the tuned row-blocked arm
+*already* compiles to; it is not evidence of a missing arm.
+
+Net from this round: **0.000 ms**, and one route closed with a cheap, reusable test for the next
+one.
