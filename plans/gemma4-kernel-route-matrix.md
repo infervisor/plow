@@ -151,3 +151,103 @@ still open -- but note it only matters for shapes where native is the chosen rou
    Still open: grouped MoE decode is bf16-gated (task #62, `lib.rs:6083-6100`), so the FP8 arm of
    this A/B cannot be built. FP8 MoE routing is undecided.
 4. DONE: route matrix re-run on this branch's binaries (see the table above).
+
+## 6. The dense route at NETWORK level — and why it could not be measured before
+
+Sections 2-3 rank kernels in isolation. `plow-insitu-vs-harness-fat-object` records harness wins
+inverting once served, so the dense route had to be settled end-to-end. That required running a
+packet built `PLOW_EMIT_PREFILL_CUBLASLT=0` on the 26B, which **hung** — task #88.
+
+### 6.1 Root cause: a wait list that omits the attention-GEMM sites
+
+`gpu.rs` had three arms for `cublaslt_waits`. `ordered_waits_for` marks the instructions a **host
+library call** executes; those never signal their device counters, so their consumers must fall
+back to stream order. The middle arm, reached only when `projection_segments.is_empty()` (i.e. a
+native-dense packet), passed an **all-`None`** list — naming no library launches at all. With the
+attention-GEMM route on, the attention sites *are* library launches, so their consumers kept a
+counter wait on an instruction that never signals and the prefill **spun forever holding the GPU
+lease**. The third arm already did this correctly (`.or(attention_gemm_segments…)`).
+
+It needs BOTH conditions, which is why it survived:
+* native dense prefill — to take that arm at all; every shipped packet uses Lt projections, and
+* `t >= pf_attn_gemm_min_rows` (**default 1024**, `config.rs:892`) — to have any attention site.
+
+Fix: delete the middle arm and let the general one handle the empty case; its closure already
+falls back to the attention sites when `projection_segments` is empty.
+
+Measured, one lease, `p26nat2`/`p26lt2` (pow2 ladders, matched):
+
+| arm | ctx 1024, route default | ctx 1024, route off |
+|---|---|---|
+| native dense | **HUNG(spin)** | 0.037 s |
+| cuBLASLt dense | 0.035 s | 0.035 s |
+
+The threshold coincides with the 1024 sliding window, which is why shape-based explanations looked
+plausible. `PLOW_PF_ATTN_GEMM=0` separates them: it moves the route without touching the window.
+
+Refuted on the way, all from the packets alone (no lease): mixed `Gemm`+`FlashPrefill` segments
+(**0 in both arms**); the flash segment's neighbourhood (identical — preceded by `HeadNormRope`,
+followed by `Gemm`, in both); bucket-dependent packet structure (the segment layout is
+**bucket-invariant**, so nothing in the packet changes at 1024); cooperative-launch co-residency
+(dies with the neighbourhood result). An earlier "last op = FlashPrefill" reading was an artifact:
+`PLOW_NV_TRACE` needs a `-DPLOW_NV_TRACE=1` prefill cubin, which these packets lack, so it emitted
+no op trace — the matched string was a startup line present in the passing log too.
+
+### 6.2 The answer: native dense prefill loses the NETWORK by ~5%
+
+Route off on both arms (matched), step_bench prefill wall, 2 reps, spread <= 0.001 s:
+
+| ctx | plow-native | cuBLASLt | native |
+|---|---|---|---|
+| 1024 | 0.037 s | **0.035 s** | +5.7% |
+| 4096 | 0.106 s | **0.101 s** | +5.0% |
+| 8192 | 0.227/0.228 s | **0.218 s** | +4.4% |
+
+This is the whole prefill wall, not a kernel. Native carries a structural advantage here and still
+loses: it has **85 fewer segment boundaries** per bucket (206 -> 121 `Gemm` segments; every other
+segment class is identical). So the Lt glue of task #37 is real but does **not** cover the kernel
+deficit — the gap is in the native GEMM kernels themselves. The isolated verdict (BF16 cuBLASLt
+216/224) is **confirmed end-to-end, not inverted**.
+
+For "use plow-native wherever it has a chance": on 26B dense prefill it does not, at any measured
+rung. The remaining native opportunities are the ones section 5 already names.
+
+### 6.3 Second blind spot: `dispatch_audit` cannot see the route
+
+`dispatch_audit` is **byte-identical** between `p26nat2` and `p26lt2` — same 78 ops, same 29
+findings — although one packet runs every dense GEMM through cuBLASLt and the other runs all of
+them natively. It records geometry (M/N/K, tile, occupancy), not dispatch. So
+alongside "no MoE op is audited at all" (section 5.3), the audit also **cannot distinguish native
+from library for the ops it does cover**. Neither blind spot is visible from the file itself.
+
+### 6.4 VERIFIED after the fix — and the route's own value
+
+Re-run on the fixed binary, one lease. Native + attention route ON now runs at every rung where it
+spun 1/1 before, and **every arm at a given ctx returns the identical token signature**
+(`fnv=08f44507b5900ff3` @1024, `0aadd007b706fc52` @4096, `b6dda40696527f3c` @8192), so the route is
+correct and not merely non-hanging. That signature match is also what proves the new code is in the
+binary: the rebuild came out byte-identical in size, but the old one could not complete this case.
+
+| ctx | native route ON | native OFF | Lt route ON | Lt OFF |
+|---|---|---|---|---|
+| 1024 | 0.041 / 0.040 | **0.038** | **0.035** | 0.035 |
+| 4096 | **0.105** / 0.105 | 0.106 | **0.098** | 0.101 |
+| 8192 | **0.215** / 0.214 | 0.228 | **0.203** | 0.218 |
+
+**`pf_attn_gemm_min_rows = 1024` is too low.** The attention-GEMM route pays only from ~4096 up
+(-6.9% Lt / -5.9% native at 8192; -3.0% / -0.9% at 4096) and at 1024 it is neutral on Lt and
+**+6.6% worse** on native. The rung it switches on at is the same one that exposed the deadlock.
+Raising the default to 4096 is a candidate, but it is a shipped default on the Lt path where the
+1024 rung measures neutral, so it needs its own cert run before flipping.
+
+**Route decision, each arm at its own best policy** — the fair end-to-end comparison:
+
+| ctx | plow-native best | cuBLASLt best | native |
+|---|---|---|---|
+| 1024 | 0.038 | **0.035** | +8.6% |
+| 4096 | 0.105 | **0.098** | +7.1% |
+| 8192 | 0.214 | **0.203** | +5.4% |
+
+Wider than the matched route-off gap of section 6.2 (+4.4 to +5.7%). The conclusion holds and
+strengthens: on the 26B, dense prefill GEMMs belong on cuBLASLt end-to-end, and native's 85-boundary
+structural advantage does not close a kernel-level deficit.
