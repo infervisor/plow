@@ -293,6 +293,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FUSE_KV_HNR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fuse_kv_hnr: bool,
 
+    /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
+    #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
+    pub moe_combine_blocks: Option<u32>,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Attention / flash-decode geometry
     // ──────────────────────────────────────────────────────────────────────────
@@ -1338,6 +1342,7 @@ impl EmitConfig {
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
+            moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
             fa_mmaqk: env_u32("PLOW_FA_MMAQK"),

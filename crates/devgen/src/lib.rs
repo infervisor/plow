@@ -6239,7 +6239,33 @@ fn emit_phase(
                     ct
                 } else {
                     // BATCH B>1: one CTA per row (the body is a per-row block loop).
-                    let comb_cus: Vec<u32> = (0..t).collect();
+                    //
+                    // ONE ROW: the body is a SINGLE CTA moving k*H f32 partials (90 KiB at the
+                    // 26B) while every other CU gates on it, and this op sits on the B=1 decode
+                    // critical path once per layer. op_moe.cuh's PLOW_MOE_COMBINE_ALLBLK arm has
+                    // each block redundantly recompute the reduction and write only its own
+                    // disjoint slice -- it needs blocks > 1 HERE to do anything, since it slices
+                    // on `slice`/`nblk`. The f32[H] it stages through is the per-block dynamic
+                    // smem arena, so the redundant writes cannot race.
+                    //
+                    // MEASURED NEGATIVE 2026-09-24, and left at 1 because of it. With
+                    // -DPLOW_MOE_COMBINE_ALLBLK=1 on sm_90a, 26B B=1 ctx128 step_bench:
+                    //     1 blk 5.3693 | 8 blk 5.5017 (+0.1323) | 32 blk 5.5097 (+0.1403)
+                    // i.e. +4.4 us per layer, not the saving the kernel comment's "0.317 ms of a
+                    // 6.12 ms step" suggests. Widening does not help because the consumer then
+                    // waits the MAX over N blocks instead of one, and every extra block pays the
+                    // coarse-gate machinery on the very gate that was the serialization point.
+                    // Fusing these narrow spine ops is a null too (PLOW_FUSE_KV_HNR, +0.0127 ms
+                    // for 25 ops removed), so neither widening nor merging is the lever here.
+                    let comb_cus: Vec<u32> = if t == 1 {
+                        let n = emit_config::active()
+                            .moe_combine_blocks
+                            .unwrap_or(1)
+                            .clamp(1, n_cu);
+                        (0..n).collect()
+                    } else {
+                        (0..t).collect()
+                    };
                     b.emit(DevOp::MoeCombineNormGemma, comb_cus, &comb_deps, |d| {
                         d.t[0] = n.moe_comb;
                         d.t[1] = n.moe_part;

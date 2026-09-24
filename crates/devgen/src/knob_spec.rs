@@ -975,6 +975,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.fuse_merge", Some("PLOW_FUSE_MERGE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.hn_split", Some("PLOW_HN_SPLIT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fuse_kv_hnr", Some("PLOW_FUSE_KV_HNR"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.moe_combine_blocks", Some("PLOW_MOE_COMBINE_BLOCKS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.fa_gf_full", Some("PLOW_FA_GF_FULL"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.attention_decode_balance_gf", Some("PLOW_ATTENTION_DECODE_BALANCE_GF"), Layer::Emit, U32, GEMMA4_BALANCE_GF_DEFAULT, GEMMA4_RECIPE_QUALIFIED),
     KnobSpec::new("emit.fa_mmaqk", Some("PLOW_FA_MMAQK"), Layer::Emit, U32, UNSET, OPT_IN),
