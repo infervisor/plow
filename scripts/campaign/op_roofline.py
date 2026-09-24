@@ -86,6 +86,20 @@ def cost(op, p, tail, rows, ctx, heads, topk, n_gpu):
     if op in {"Gemm", "GemmMed", "GemmSmall", "GemmWide", "Gemv",
               "GemmMxfp4", "GemmSmallMxfp4", "GemmMedMxfp4", "GemmWideMxfp4", "GemvMxfp4"}:
         return gemm(r, m, g("N"), g("K"))
+    if op in {"GemmFp8Block128", "GemmFp8Block128Split4"}:
+        return gemm("fp8", m, g("N"), g("K"))
+    if op == "QuantFp8Block128":  # bf16 in, e4m3 + one f32 per 128 out
+        m, k = g("M", rows), g("K")
+        return {"hbm": 2 * m * k + m * k + 4 * m * (k // 128), "flops": 0, "dtype": "bf16"}
+    if op == "MlaBmmFp8":  # per-head [M x K] x [K x N], e4m3 weights, A quantized in-kernel
+        m, hh, n, k = g("M", rows), g("heads", heads), g("N"), g("K")
+        return {"hbm": hh * (n * k + 4) + 2 * m * hh * k + 2 * m * hh * n,
+                "flops": 2 * m * hh * n * k, "dtype": "fp8"}
+    if op == "FlashMerge":  # normalize f32 latent partials to bf16
+        n, hh, ns, hd = g("n_batch", rows), g("n_head", heads), g("nsplit", 1), g("hd", MLA_LATENT)
+        return {"hbm": 4 * n * hh * hd * ns + 2 * n * hh * hd, "flops": 0, "dtype": "bf16"}
+    if op == "ZeroF32":
+        return {"hbm": 4 * g("M", rows) * g("N"), "flops": 0, "dtype": "f32"}
     if op == "GemmF32":
         return gemm("bf16", m, g("N"), g("K"), out=4)
     if op == "GemvQkv":
