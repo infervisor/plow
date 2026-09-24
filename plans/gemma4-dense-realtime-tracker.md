@@ -5136,3 +5136,133 @@ prefill workstream (#66). TPOT at C1 is **not** KV traversal: 117x the KV (128 -
 **The column does not reach 4/4 without a ~6.2% MoE decode kernel win.** Every in-kernel route
 tried so far is closed by the 255-register cap; the segment-then-deepen combination is the one
 untested mechanism.
+
+---
+
+## Interpreter gate + decode-kernel instruction audit (2026-09-24)
+
+All timings `step_bench <assets> 1 128 64 --warmup 8` (kernel-only, no HTTP), 3 passes per arm,
+interleaved and order-reversed inside ONE lease. Per-run sd 0.010-0.016 ms, per-arm sd of the
+3 means 0.0006-0.0055 ms. `step_bench` slots=1 reads 5.377 against served TPOT 5.400 and
+`dev_interp` 5.362, so it is a faithful proxy at ~0.2% noise and a kernel A/B no longer needs a
+serving run. **Bar for 128/C1: TPOT must fall 0.330 ms** (5.360 -> under vLLM's 5.030).
+
+### The gate is a busy spin, but it already backs off
+
+Main decode gate, `interp_sm120.cu:3181` inside `PLOW_SYM(interp_sm120)`:
+
+    while (ctr_poll(PLOW_CTR(prog.counters, pw.id)) < pw.threshold) { __nanosleep(64); }
+
+`PLOW_NV_GATE_SLEEP` defaults to 64 ns ("0 spins flat out"). Contention is further limited by
+"one thread per counter" (only `wait_len` threads per block poll, not all `PLOW_NV_THREADS`) and
+by `CTR_STRIDE_U32 = 32`, one 128 B line per counter. The gates at 2711/2799/2853 that have NO
+backoff are the *prefill* role loops (`plow_ws384_role_loop`, `plow_m128n128_direct_role`,
+`plow_ws_role_loop`), not decode.
+
+**Sweep (new `PLOW_TUNE_GATE_SLEEP` key, since reverted):**
+
+| sleep ns | mean ms | sd | vs 64 |
+|---|---|---|---|
+| 0 | 5.3970 | 0.0017 | **+0.0190 (+0.35%)** |
+| 1 | **5.3720** | 0.0017 | **-0.0060 (-0.11%)** |
+| 16 | 5.3783 | 0.0046 | +0.0003 |
+| 32 | 5.3733 | 0.0006 | -0.0047 |
+| 64 | 5.3780 | 0.0010 | 0 |
+
+**Spinning flat out is a real cost: +0.019 ms at ~11 sigma.** So the backoff earns its keep and
+the 132-SM thrash concern is genuine. Among NONZERO values the dial is flat (16/32/64 span
+0.005 ms), which reproduces AMD's verdict ("Swept 0/1/2/8 ... flat inside noise ... do not spend
+anything tuning this", `interp.hip:5671`) except that AMD's sweep did not separate 0. `sleep=1`
+is the best of the five by -0.006 ms (~3.5 sigma, consistent in all three passes) and the
+mechanism is OVERSLEEP, not contention: at B=1 the 551-instruction program runs many gates on
+the critical path, and a gate whose producer is already done still fails once and sleeps.
+
+NOT SHIPPED: -0.006 ms does not justify a permanent knob. If wanted, change the source default
+64 -> 1 (one line, no knob) after a 12B check.
+
+### PTXSYNC V3 is structurally unavailable to packets
+
+`interp_sm120.cu:2691` and `:2833` `#error` when `PLOW_NV_PTXSYNC != 1`, because
+`plow_ws384_role_loop` and `plow_ws_role_loop` hand-copy the V1 protocol. The campaign builds
+`--segmented`, so the decode object compiles them and any other value refuses to build.
+`scripts/build_sm90a_cubin.sh:132` gets away with `-DPLOW_NV_PTXSYNC=3` because it builds a
+non-segmented object. **V3 on a packet requires porting those role loops to the V3 gate** —
+which is also where the missing backoff lives, so the two jobs are the same job.
+
+V1's own measured win was -0.60% (12B decode, 18.398 -> 18.287, ~8 sigma); V2 is the control at
++0.16%, localising the effect to the seq_cst -> acq_rel fence downgrade.
+
+### The four tuned flags the packet never receives: THREE MEASURED, ALL NEGATIVE
+
+`build_sm90a_cubin.sh:132` sets a tuned group for the HAND-BUILT object. Nine flags reach the
+packet by nvcc; four do not, and fall to source defaults. (`PLOW_NV_GEMV_MMA_UNB` was a false
+alarm: the source default is already the hand-build's 12.)
+
+| arm | flag | mean ms | sd | vs control | object | STACK |
+|---|---|---|---|---|---|---|
+| fctl | — | 5.3763 | 0.0015 | — | 1,820,552 | 544 |
+| glu8 | `GV_UNROLL_GLU=8` | 5.5593 | 0.0015 | **+0.1830 (+3.40%)** | 1,862,664 | 576 |
+| glu10 | `GV_UNROLL_GLU=10` | 5.6127 | 0.0015 | **+0.2363 (+4.40%)** | 1,906,184 | 672 |
+| kun4 | `PLOW_NV_FA_KUN=4` | 5.3790 | 0.0010 | +0.0027 (null) | 1,820,552 | 544 |
+| nost1 | `PLOW_NV_GEMV_NOSTAGE=1` | 5.4067 | 0.0055 | +0.0303 (+0.56%) | 1,828,744 | 544 |
+
+`REG:255 LOCAL:0` on every arm — nothing spilled to local, but the GLU arms grew the object
+(+42 KB, +85 KB) and the STACK FRAME (544 -> 576 -> 672), monotonically with unroll depth, and
+the regression tracks it monotonically too.
+
+**This is a clean instance of [[plow-insitu-vs-harness-fat-object]]: the hand-build's tuned
+`GV_UNROLL_GLU=10` is 4.4% WORSE in the packet's 255-register megakernel.** Those values are
+tuned for a different object. Do not import them.
+
+It also **refutes** the hypothesis that motivated the arm (recorded here because it was wrong):
+the B=1 walk spends 8.5% of instructions on software bf16 widening, so deeper unroll "should"
+amortise the unpack over more loads. It does the opposite, monotonically. Register/stack
+pressure at the cap costs more than the amortisation wins.
+
+### SASS audit of the served decode object
+
+111,024 instructions, `REG:255 STACK:544 SHARED:8848 LOCAL:0`. The kernel is dominated by
+addressing and data movement, not math or loads:
+
+    IMAD 18.2% (incl 8,342 IMAD.MOV/IMAD.IADD -- moves on the FMA pipe)
+    ISETP/SEL/PRMT 15.6%     FP math 17.5%     PRMT alone 8.5% (9,466)
+    SHF 7.3%                 branch 3.6%       shared LDS/STS 2.5%
+    GLOBAL LOADS ~3.0% (LD.E.128 2,564 + LDG 696)
+    HMMA 1.6%                MUFU 1.1% (576 EX2, 558 RCP, 44 RSQ)
+
+* **Pure register shuffling is 12.3%** (`MOV` 5,064 + `IMAD.MOV` 7,706 + `UMOV` 908) — the
+  255-register cap made visible, matching the reverted pre-issue arm's LOP3/S2R inflation.
+* **`PRMT` is bf16->fp32 widening**, e.g. `PRMT R6, R6, 0x7732, RZ` (constant byte selector,
+  RZ as the zero source), emitted in pairs. 48.2% sit within 24 instructions of a global load,
+  **0.0% anywhere near an HMMA**, 42.5% within 8 of an FFMA. Consistent with the source: "sm_90a:
+  BATCH>=2 decode rungs walk the weights on the tensor cores ... and the B=1 rung is untouched",
+  so B=1 loads packed bf16 and widens in software for scalar FFMA. Only 3 `UPRMT`.
+* **Reordering is already done.** LDG -> first-use of its destination: median 28 instructions,
+  p25 12, p75 53; only 11.4% within 4. There is no pool of un-hidden loads to reclaim.
+* **Bank conflicts are NOT determinable here.** `LDSM = 0`, shared traffic small (LDS 2,700,
+  STS 327, SHARED 8,848 B), but static SASS cannot show conflict degree and ncu cannot attach to
+  this cooperative megakernel ([[ncu-on-nix-plowrt]]). Recorded as unmeasured, not clean.
+* Most 128-bit loads are GENERIC `LD.E.128` (2,564) rather than `LDG.E` (696), i.e. the compiler
+  cannot prove global — expected for an interpreter reading a `void* const* T` table. The
+  textbook fix is `__restrict__`, which is exactly what caused the NRN fold garbage
+  ([[nvcc-restrict-barrier-hoist]]), so it is booby-trapped.
+
+The design comment justifying the scalar path says "at M=1 it is weight-bandwidth bound". The
+measurement disagrees: 7.64 GB/step at 5.362 ms = 1425 GB/s, **~45% of the 3352 roof**. The step
+is not achieving the bound its design premise assumes. What that leaves is a *compute-issue*
+hypothesis, and the unroll arms above are evidence AGAINST the obvious way to attack it.
+
+### Round verdict
+
+Net available from everything measured today: **-0.006 ms** (gate sleep 1), against the 0.330 ms
+128/C1 needs. Closed this round: entry size (0.05), rung count (null), host/launch overhead
+(0.04 exposed), PTXSYNC V3 (structurally blocked), GV_UNROLL_GLU (+3.4/+4.4%), FA_KUN (null),
+GEMV_NOSTAGE (+0.56%), gate-sleep dial (0.006). The 26B C1 column remains blocked on a ~6.2%
+MoE decode kernel win with no identified route.
+
+All five tuning keys used for these measurements were REVERTED (measured losses; avoid knob
+explosion). To recreate: add a `PLOW_TUNE_<X>` read in `manifest.rs::tuning()` with a STRING
+LITERAL (a loop over names fails `every_emit_side_env_read_is_registered`, which scans for
+`std::env::var("...")`), emit the define in `config_header` beside `moe_down_sg`, register
+`env.PLOW_TUNE_<X>` in RAW_ENV, and **rebuild plowc** — `campaign.py` never does
+([[plow-extra-defines-not-plumbed-to-packets]]).
