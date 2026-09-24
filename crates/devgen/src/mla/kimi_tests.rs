@@ -47,6 +47,7 @@ fn kimi_ref_cfg() -> GlmCfg {
         indexer_full: Vec::new(), // Kimi/DeepSeek config has no `indexer_types`
         softmax_layers: vec![],
         has_dsa: false,
+        quark_mixed: false,
     }
 }
 
@@ -1475,14 +1476,10 @@ fn every_program_shares_one_peer_partial_slot_offset() {
     );
 }
 
-/// MXFP4 is the one encoding with no dense prefill arm: its grouped path is the A4W4
-/// fused-bridge, whose scale rows the dense emit does not declare. Refuse rather than emit an
-/// encoding field pointing at an arm nothing bound operands for.
 #[test]
-#[should_panic(expected = "MXFP4 prefill is not implemented for DENSE layer")]
-fn mla_full_prefill_refuses_a_dense_mxfp4_layer() {
+fn mla_full_prefill_uses_direct_dense_mxfp4_gemm() {
     let c = kimi_ref_cfg();
-    glm_build_block_pf(
+    let (m, _) = glm_build_block_pf(
         &c,
         512,
         256,
@@ -1494,6 +1491,9 @@ fn mla_full_prefill_refuses_a_dense_mxfp4_layer() {
         PrefillScope::Full,
         MoeEnc::Mxfp4,
     );
+    let down = m.tensors.iter().position(|t| t.name == "model.layers.0.mlp.down_proj.weight").unwrap() as u32;
+    assert!(m.progs[0].insts.iter().any(|d| d.t[2] == down));
+    assert!(!m.progs[0].insts.iter().any(|d| d.op == DevOp::MoeGroupDownPf as u16));
 }
 
 /// The DSA gate does NOT reach for `FlashGatherPrefill`, even armed. A gathered prefill wants

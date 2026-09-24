@@ -1,12 +1,12 @@
-//! Checkpoint A — Rewrite rule soundness.
+//! Checkpoint A — legacy rewrite-name catalog check.
 //!
-//! The Lean side proves each rewrite rule's LHS and RHS denote the same tree
-//! (`Plow.Rewrite.rule_*`). The dispatcher accepts a list of rule names
+//! Definitional syntax theorems exist for catalog entries, but this wrapper
+//! does not bind actual rule bodies or floating-point kernels. It accepts rule names
 //! (from the egglog engine's per-bucket "rules fired" report) and confirms
 //! every rule is in the sound-rules table.
 //!
-//! Adding a new rewrite rule requires updating both the Rust egglog side and
-//! `Plow.Rewrite.soundRules` with a proof — the CLI enforces that link.
+//! plowc's actual-body producer additionally sends engine-parsed terms for
+//! `Plow.RewriteBody.check_sound` through the same endpoint.
 
 use serde::{Deserialize, Serialize};
 

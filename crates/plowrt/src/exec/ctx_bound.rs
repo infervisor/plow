@@ -185,14 +185,17 @@ pub fn rescale(
             })
         });
 
-        let scaling = if let Some(c) = cache_entry {
+        let named_scaling = ctx_bound::tensor_scaling(&t.name);
+        let scaling = if named_scaling == Scaling::IndexerBlock16 {
+            named_scaling
+        } else if let Some(c) = cache_entry {
             if c.window == 0 {
                 Scaling::Linear
             } else {
                 Scaling::Inert
             }
         } else {
-            ctx_bound::tensor_scaling(&t.name)
+            named_scaling
         };
 
         if scaling == Scaling::Inert {
@@ -229,11 +232,31 @@ pub fn rescale(
             }
             continue;
         }
-        let bytes = ctx_bound::linear_bytes(t.bytes, ceiling, want).ok_or_else(|| {
+        let resized = if scaling == Scaling::IndexerBlock16 {
+            let mut seen = false;
+            for d in blob.progs.iter().flat_map(|p| &p.insts)
+                .filter(|d| h16.is_some_and(|h| d.t.contains(&h)))
+            {
+                seen = true;
+                if (d.op != DevOp::IndexFp8Decode as u16 && d.op != DevOp::IndexFp8Prefill as u16) || Some(d.t[4]) != h16
+                    || d.i[1] != ceiling
+                {
+                    return Err(err(format!(
+                        "PLOW_LIVE_CTX: `{}` has an unsupported packed indexer use or stride", t.name
+                    )));
+                }
+            }
+            if !seen {
+                return Err(err(format!("PLOW_LIVE_CTX: `{}` has no packed indexer owner", t.name)));
+            }
+            ctx_bound::indexer_rescaled_bytes(t.bytes, ceiling, want)
+        } else {
+            ctx_bound::linear_bytes(t.bytes, ceiling, want)
+        };
+        let bytes = resized.ok_or_else(|| {
             err(format!(
-                "PLOW_LIVE_CTX: `{}` is {} B, not a multiple of the emitted ctx {ceiling} — \
-                 it is not `k * ctx` and this module's rule does not describe it",
-                t.name, t.bytes
+                "PLOW_LIVE_CTX: `{}` is {} B, incompatible with {scaling:?} at ctx {ceiling}->{want}",
+                t.name, t.bytes,
             ))
         })?;
         plan.push((h, bytes));
@@ -453,6 +476,40 @@ mod tests {
     }
 
     #[test]
+    fn narrowing_preserves_device_rope_precision_and_capacity() {
+        use packet::rope::{GEN_AMD_ROPE_BF16_COS, GEN_AMD_ROPE_BF16_SIN,
+            GEN_AMD_ROPE_IDX_BF16_COS, GEN_AMD_ROPE_IDX_BF16_SIN};
+        let mut b = mla_blob(CEILING);
+        b.gen[0].kind = GEN_AMD_ROPE_BF16_COS;
+        b.gen[0].theta = 8000000.0;
+        let sin = GenTensor {
+            tensor: b.tensors.len() as u32,
+            kind: GEN_AMD_ROPE_BF16_SIN,
+            ..b.gen[0]
+        };
+        b.tensors.push(DevTensor {
+            name: "in.sin".into(),
+            bytes: sin.byte_len(),
+            init: None,
+        });
+        b.gen.push(sin);
+        for (kind, name) in [(GEN_AMD_ROPE_IDX_BF16_COS, "in.icos"),
+            (GEN_AMD_ROPE_IDX_BF16_SIN, "in.isin")] {
+            let g = GenTensor { tensor: b.tensors.len() as u32, kind,
+                ..GenTensor::rope_idx_pair(CEILING, 64, 128, 8000000.0)[0] };
+            b.tensors.push(DevTensor { name: name.into(), bytes: g.byte_len(), init: None });
+            b.gen.push(g);
+        }
+        assert_eq!(narrow(&mut b, 2048).unwrap(), 2048);
+        for g in &b.gen {
+            assert_eq!(g.ctx, 2048);
+            assert!(g.amd_rope_bf16());
+            assert!(g.generate().is_none());
+            assert_eq!(b.tensors[g.tensor as usize].bytes, 2048 * (g.hd as u64 / 2) * 4);
+        }
+    }
+
+    #[test]
     fn narrowing_rescales_the_caches_the_recipes_and_the_strides() {
         let mut b = mla_blob(CEILING);
         assert_eq!(narrow(&mut b, 2048).unwrap(), 2048);
@@ -510,10 +567,75 @@ mod tests {
 
     #[test]
     fn a_kv_cache_with_no_scaling_rule_is_refused() {
-        let mut b = mla_blob(CEILING);
-        b.tensors[3].name = "kv.0.mystery".into();
-        let e = narrow(&mut b, 2048).unwrap_err().to_string();
-        assert!(e.contains("kv.0.mystery"), "{e}");
+        for name in ["kv.0.mystery", "kv.0.kidx_pool"] {
+            let mut b = mla_blob(CEILING);
+            b.tensors[3].name = name.into();
+            let e = narrow(&mut b, 2048).unwrap_err().to_string();
+            assert!(e.contains(name), "{e}");
+        }
+    }
+
+    fn indexer_blob(ctx: u32) -> DevBlob {
+        let mut b = mla_blob(ctx);
+        let cache = b.tensors.len() as u16;
+        b.tensors.push(DevTensor {
+            name: "kv.0.kidx_fp8".into(),
+            bytes: BATCH * ctx_bound::indexer_prefix_bytes(ctx),
+            init: None,
+        });
+        let mut inst = DevInst64::default();
+        inst.op = DevOp::IndexFp8Decode as u16;
+        inst.t[4] = cache;
+        inst.i[0] = 1;
+        inst.i[1] = ctx;
+        b.progs[0].insts.push(inst);
+        b
+    }
+
+    #[test]
+    fn packed_indexer_rescale_preserves_slots_and_rewrites_only_its_stride() {
+        for want in [8192, 71680, 81920] {
+            let mut b = indexer_blob(131072);
+            assert_eq!(narrow(&mut b, want).unwrap(), want);
+            assert_eq!(bytes_of(&b, "kv.0.kidx_fp8"), BATCH * u64::from(want) * 132);
+            assert_eq!(b.progs[0].insts[3].i, [1, want, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(b.progs[0].insts[2].i[1], 131072);
+        }
+    }
+
+    #[test]
+    fn packed_indexer_prefill_and_decode_share_the_same_rescaled_cache() {
+        let mut b = indexer_blob(131072);
+        let mut prefill = b.progs[0].insts[3];
+        prefill.op = DevOp::IndexFp8Prefill as u16;
+        prefill.i[0] = 8192;
+        prefill.i[2] = 1;
+        b.progs[0].insts.push(prefill);
+        narrow(&mut b, 81920).unwrap();
+        assert_eq!(bytes_of(&b, "kv.0.kidx_fp8"), BATCH * 81920 * 132);
+        assert_eq!(b.progs[0].insts[3].i[1], 81920);
+        assert_eq!(b.progs[0].insts[4].i, [8192, 81920, 1, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn packed_indexer_rescale_rejects_partial_slots_blocks_and_unknown_uses_atomically() {
+        for bad in 0..6 {
+            let mut b = indexer_blob(131072);
+            let want = if bad == 0 { 71681 } else { 71680 };
+            match bad {
+                1 => b.tensors.last_mut().unwrap().bytes -= 1,
+                2 => b.progs[0].insts[3].i[1] = 8192,
+                3 => b.progs[0].insts[3].op = DevOp::IndexScore as u16,
+                4 => b.progs[0].insts.truncate(3),
+                5 => b.tensors.last_mut().unwrap().bytes = 0,
+                _ => (),
+            }
+            let before: Vec<_> = b.tensors.iter().map(|t| t.bytes).collect();
+            let insts = b.progs[0].insts.clone();
+            assert!(narrow(&mut b, want).is_err(), "case {bad}");
+            assert_eq!(before, b.tensors.iter().map(|t| t.bytes).collect::<Vec<_>>());
+            assert_eq!(insts, b.progs[0].insts);
+        }
     }
 
     /// The staging arrays hold a whole prefill chunk, so the bound cannot go

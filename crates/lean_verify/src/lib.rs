@@ -18,9 +18,8 @@
 //! | S  | Knob scope    | wired (`plowrt knob-scope`) |
 //! | P  | Perf floor    | wired (`scripts/perf_cert.py`, CI) |
 //!
-//! Additionally, the `query` interface allows the compiler to ask Lean for
-//! provably-optimal decisions (counter granularity, lower bounds, ordering
-//! quality) rather than reimplementing the logic in Rust. See the design notes.
+//! Queries return decisions and conditional bounds within their supplied model;
+//! they do not establish hardware performance or floating-point kernel correctness.
 //!
 //! The `PLOW_VERIFY_BIN` env var overrides the binary path (default:
 //! `plow_verify` looked up on `PATH`, then `lean-plow/.lake/build/bin/plow_verify`
@@ -34,6 +33,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod checkpoints;
 pub mod queries;
+mod snapshot;
+mod paths;
 
 /// Certificate returned by the Lean verifier for a single checkpoint call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,10 +171,14 @@ fn locate_binary() -> Result<PathBuf, VerifyError> {
 
 /// Low-level: send a JSON request to `plow_verify` and return raw stdout.
 fn invoke(request: &serde_json::Value) -> Result<String, VerifyError> {
+    let verifier = snapshot::Snapshot::capture(&locate_binary()?)?;
+    invoke_with(&verifier.path, request)
+}
+
+fn invoke_with(bin: &std::path::Path, request: &serde_json::Value) -> Result<String, VerifyError> {
     let request_bytes = serde_json::to_vec(request).map_err(VerifyError::SerializeRequest)?;
 
-    let bin = locate_binary()?;
-    let mut child = Command::new(&bin)
+    let mut child = Command::new(bin)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -202,32 +207,23 @@ fn invoke(request: &serde_json::Value) -> Result<String, VerifyError> {
 
 /// Send a verification request to `plow_verify` and parse the certificate.
 pub fn call(checkpoint: &str, payload: serde_json::Value) -> Result<Certificate, VerifyError> {
-    // Checkpoints D and F run the IDENTICAL Lean computation on the identical
-    // `ScheduleRequest` bundle (memory.rs: "callers hand the exact same
-    // bundle"); only the certificate's message text differs. Cache the
-    // verdict by payload hash so the second spawn (minutes of reachability
-    // work on a full-model bucket) is free. Scoped to the D/F handler pair —
-    // any other checkpoint always spawns.
+    // D/F share the checker. Retain its envelope and bind cache hits to exact
+    // payload bytes and verifier contents, not merely an accepted boolean.
+    let bin = locate_binary()?;
+    let verifier = snapshot::Snapshot::capture(&bin)?;
     let df_cache_key = if checkpoint == "D" || checkpoint == "F" {
-        use std::hash::{Hash, Hasher};
         let bytes = serde_json::to_vec(&payload).map_err(VerifyError::SerializeRequest)?;
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        bytes.hash(&mut h);
-        Some(h.finish())
+        Some((checkpoint.to_string(), bytes, verifier.digest))
     } else {
         None
     };
-    static DF_CACHE: std::sync::Mutex<Option<(u64, bool, Option<String>)>> =
+    type CacheKey = (String, Vec<u8>, [u8; 32]);
+    static DF_CACHE: std::sync::Mutex<Option<(CacheKey, Certificate)>> =
         std::sync::Mutex::new(None);
-    if let Some(key) = df_cache_key {
-        if let Some((k, ok, reason)) = DF_CACHE.lock().unwrap().as_ref() {
-            if *k == key {
-                return Ok(Certificate {
-                    ok: *ok,
-                    checkpoint: checkpoint.to_string(),
-                    notes: Some("verdict cached from the identical D/F payload".into()),
-                    reason: reason.clone(),
-                });
+    if let Some(key) = &df_cache_key {
+        if let Some((k, cert)) = DF_CACHE.lock().unwrap().as_ref() {
+            if k == key {
+                return Ok(cert.clone());
             }
         }
     }
@@ -247,13 +243,68 @@ pub fn call(checkpoint: &str, payload: serde_json::Value) -> Result<Certificate,
             let _ = std::fs::write(path, bytes);
         }
     }
-    let stdout = invoke(&request)?;
+    let stdout = invoke_with(&verifier.path, &request)?;
     let cert: Certificate = serde_json::from_str(stdout.trim())
         .map_err(|e| VerifyError::DeserializeCertificate(e, stdout.clone()))?;
+    if cert.checkpoint != checkpoint {
+        return Err(VerifyError::Rejected(format!("expected checkpoint {checkpoint}, got {}", cert.checkpoint)));
+    }
     if let Some(key) = df_cache_key {
-        *DF_CACHE.lock().unwrap() = Some((key, cert.ok, cert.reason.clone()));
+        *DF_CACHE.lock().unwrap() = Some((key, cert.clone()));
     }
     Ok(cert)
+}
+
+/// Check independent obligations with one verifier process; retain every verdict.
+/// A successful transport may contain rejected certificates, as with [`call`].
+pub fn call_batch(requests: &[(&str, serde_json::Value)]) -> Result<Vec<Certificate>, VerifyError> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    call_batch_bound(requests).map(|(certificates, _)| certificates)
+}
+
+/// Returns the hash of the exact immutable executable image used for this batch.
+pub fn call_batch_bound(requests: &[(&str, serde_json::Value)]) -> Result<(Vec<Certificate>, String), VerifyError> {
+    if !cfg!(target_os = "linux") {
+        return Err(VerifyError::BinaryNotFound("immutable verifier-bound receipts require Linux".into()));
+    }
+    let verifier = snapshot::Snapshot::capture(&locate_binary()?)?;
+    if requests.is_empty() { return Ok((Vec::new(), verifier.sha256())); }
+    let batch: Vec<_> = requests.iter().map(|(checkpoint, payload)|
+        serde_json::json!({ "checkpoint": checkpoint, "payload": payload })).collect();
+    let stdout = invoke_with(&verifier.path, &serde_json::json!({ "batch": batch }))?;
+    #[derive(Deserialize)]
+    struct BatchResult {
+        ok: bool,
+        certificates: Vec<Certificate>,
+    }
+    let result: BatchResult = serde_json::from_str(stdout.trim())
+        .map_err(|e| VerifyError::DeserializeCertificate(e, stdout.clone()))?;
+    if result.certificates.len() != requests.len()
+        || result.ok != result.certificates.iter().all(|cert| cert.ok)
+        || result.certificates.iter().zip(requests).any(|(cert, (cp, _))| cert.checkpoint != *cp)
+    {
+        return Err(VerifyError::Rejected("batch response does not match requested obligations".into()));
+    }
+    Ok((result.certificates, verifier.sha256()))
+}
+
+fn verifier_digest(bin: &std::path::Path) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let resolved = if bin.components().count() == 1 {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join(bin)).find(|path| path.is_file())?
+    } else {
+        bin.to_path_buf()
+    };
+    Some(Sha256::digest(std::fs::read(resolved).ok()?).into())
+}
+
+pub fn verifier_sha256() -> Result<String, VerifyError> {
+    let bin = locate_binary()?;
+    verifier_digest(&bin).map(|digest| digest.iter().map(|b| format!("{b:02x}")).collect())
+        .ok_or_else(|| VerifyError::Rejected("cannot fingerprint verifier executable".into()))
 }
 
 /// Send a performance query to `plow_verify` and parse the result.

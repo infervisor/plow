@@ -166,6 +166,7 @@ fn opcode_with_no_amd_arm_is_refused() {
         tensors: vec![],
         gq_stream: vec![],
         gq_seg_ofs: vec![],
+        reduction_witness: None,
         l2_sms: 0,
         l2_domains: 0,
     };
@@ -223,6 +224,7 @@ fn covered_opcodes_pass_and_nvidia_is_never_checked() {
         tensors: vec![],
         gq_stream: vec![],
         gq_seg_ofs: vec![],
+        reduction_witness: None,
         l2_sms: 0,
         l2_domains: 0,
     };
@@ -254,6 +256,7 @@ fn covered_opcodes_pass_and_nvidia_is_never_checked() {
         tensors: vec![],
         gq_stream: vec![],
         gq_seg_ofs: vec![],
+        reduction_witness: None,
         l2_sms: 0,
         l2_domains: 0,
     };

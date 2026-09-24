@@ -56,6 +56,13 @@
 #include "amd_common.h"
 #include "token_batch.h"
 
+#ifndef PLOW_MLA_P_BF16
+#define PLOW_MLA_P_BF16 0
+#endif
+#if PLOW_MLA_P_BF16
+extern "C" __device__ unsigned plow_mla_p_bf16_1 = 1;
+#endif
+
 #define FA_BQ 32   /* query rows per wave; 4 waves => 128-row q-tile */
 #define FA_BKV 32  /* KV rows staged per step (one MFMA N tile)      */
 #define FA_PAD 8   /* LDS row padding, in halves, to break bank conflicts */
@@ -2647,6 +2654,9 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
 #pragma unroll
                     for (int g = 0; g < GF; g++) {
                         float pw = Ssm[g * FA_DEC_TILE + r + (unsigned)c * NG];
+#if PLOW_MLA_P_BF16
+                        if constexpr (!FP8) pw = bf2f(f2bf(pw));
+#endif
                         if constexpr (FP8) pw *= vsf[c];
 #pragma unroll
                         for (int u = 0; u < 8; u++) oacc[g][u] += pw * bf2f(vv[c][u]);
@@ -2666,6 +2676,9 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
 #pragma unroll
                 for (int g = 0; g < GF; g++) {
                     float pw = Ssm[g * FA_DEC_TILE + r];
+#if PLOW_MLA_P_BF16
+                    if constexpr (!FP8) pw = bf2f(f2bf(pw));
+#endif
                     if constexpr (FP8) pw *= vsf;
 #pragma unroll
                     for (int u = 0; u < 8; u++) oacc[g][u] += pw * bf2f(v[u]);
@@ -4055,6 +4068,19 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
             __syncthreads(); /* slab visible to every wave */
 #endif
 
+#if FA_MLA_PF_SCALE_HOIST
+            float cs_tile[2] = {1.0f, 1.0f};
+            float rs_tile[2] = {1.0f, 1.0f};
+            if constexpr (FP8) {
+#pragma unroll
+                for (int nt = 0; nt < 2; nt++) {
+                    const unsigned row = scale_row(kv0 + (unsigned)nt * 16 + fr);
+                    cs_tile[nt] = csc[row];
+                    if (krot_fp8) rs_tile[nt] = rsc[row];
+                }
+            }
+#endif
+
             /* ---- S = Q·K^T over the full 576, registers × LDS, zero redundancy ---- */
             f32x4 sacc[2] = {(f32x4)(0.0f), (f32x4)(0.0f)};
             f32x4 srope[2] = {(f32x4)(0.0f), (f32x4)(0.0f)};
@@ -4157,7 +4183,9 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                 const unsigned qi = GATHER ? q_base + (row_i >> 3) : my_q0 + kg * 4 + i;
                 const unsigned qg = q_pos0 + qi;
                 float sv[2];
-                float csv[2] = {1.0f, 1.0f}; /* FP8 only: this lane's two kv dequant scales */
+#if !FA_MLA_PF_SCALE_HOIST
+                float csv[2] = {1.0f, 1.0f};
+#endif
 #pragma unroll
                 for (int nt = 0; nt < 2; nt++) {
                     const unsigned kvg = kv0 + nt * 16 + fr;
@@ -4172,11 +4200,15 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     }
                     float score = sacc[nt][i];
                     if constexpr (FP8) {
+#if FA_MLA_PF_SCALE_HOIST
+                        score = score * cs_tile[nt] + srope[nt][i] * rs_tile[nt];
+#else
                         const unsigned row = scale_row(kvg);
                         const float cs = csc[row];
                         const float rs = krot_fp8 ? rsc[row] : 1.0f;
                         score = score * cs + srope[nt][i] * rs;
                         csv[nt] = cs;
+#endif
                     }
                     sv[nt] = valid ? score * FA_SCALE(scale) : FA_MLA_PF2_MASKED;
                 }
@@ -4211,8 +4243,13 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                  * once and let l sum the SAME value. The fp8 arm keeps its existing split —
                  * O carries the per-kv dequant scale on P, l does not — and reuses the scale
                  * the score already loaded. */
+#if FA_MLA_PF_SCALE_HOIST
+                const bf16 b0 = mla_pf2_f2bf(FP8 ? p0 * cs_tile[0] : p0);
+                const bf16 b1 = mla_pf2_f2bf(FP8 ? p1 * cs_tile[1] : p1);
+#else
                 const bf16 b0 = mla_pf2_f2bf(FP8 ? p0 * csv[0] : p0);
                 const bf16 b1 = mla_pf2_f2bf(FP8 ? p1 * csv[1] : p1);
+#endif
                 Pw[pindex(kg * 4 + (unsigned)i, fr)] = b0;
                 Pw[pindex(kg * 4 + (unsigned)i, 16 + fr)] = b1;
                 if constexpr (!FP8) {
@@ -4246,10 +4283,14 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     }
                     float score = sacc[nt][i];
                     if constexpr (FP8) {
+#if FA_MLA_PF_SCALE_HOIST
+                        score = score * cs_tile[nt] + srope[nt][i] * rs_tile[nt];
+#else
                         const unsigned row = scale_row(kvg);
                         const float cs = csc[row];
                         const float rs = krot_fp8 ? rsc[row] : 1.0f;
                         score = score * cs + srope[nt][i] * rs;
+#endif
                     }
                     sv[nt] = valid ? score * FA_SCALE(scale) : FA_NEG_INF;
                     rmax = fmaxf(rmax, sv[nt]);
@@ -4285,7 +4326,11 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                 for (int i = 0; i < 4; i++) {
                     float p = pe[nt][i];
                     if constexpr (FP8)
+#if FA_MLA_PF_SCALE_HOIST
+                        p *= cs_tile[nt];
+#else
                         p *= csc[scale_row(kv0 + (unsigned)nt * 16 + fr)];
+#endif
                     Pw[pindex(kg * 4 + (unsigned)i, (unsigned)nt * 16 + fr)] = f2bf(p);
                 }
 #endif
@@ -4812,8 +4857,13 @@ __device__ void d_index_score_fast(float* __restrict__ Score, const bf16* __rest
  * __shfl_xor(.,32) folds the two halves into score[pos]. Q fragments (A operand, rows = heads) are
  * hoisted to VGPR once per batch and reused across every key slab; only K streams. bf16 in, fp32
  * accumulate — same math as the scalar/fast path (relmax 0.0000 vs the CPU weighted-ReLU ref). */
+#if PLOW_FP8_KV
+#define PLOW_DSA_SCORE_INLINE
+#else
+#define PLOW_DSA_SCORE_INLINE __forceinline__
+#endif
 template <int DI, int HIc, int TILE_N = PLOW_WAVES * 32>
-__device__ void d_index_score_mfma(float* __restrict__ Score, const bf16* __restrict__ Qidx,
+__device__ PLOW_DSA_SCORE_INLINE void d_index_score_mfma(float* __restrict__ Score, const bf16* __restrict__ Qidx,
                                    const bf16* __restrict__ Kidx, const bf16* __restrict__ W,
                                    const int* __restrict__ kv_len, unsigned n_batch,
                                    unsigned kv_stride, float scale, unsigned slice, unsigned nblk,
@@ -4898,6 +4948,7 @@ __device__ void d_index_score_mfma(float* __restrict__ Score, const bf16* __rest
         }
     }
 }
+#undef PLOW_DSA_SCORE_INLINE
 
 /* DSA lightning-indexer score, KPOOL fp8 variant (GLM-5.3-Flash's `index_kpool` pooled
  * indexer). NEW op — `d_index_score`/`_fast`/`_mfma` above are untouched and stay GLM-5.2's
@@ -5305,6 +5356,42 @@ __device__ void d_index_select_coop(int* __restrict__ idx, const float* __restri
             if (slot < top_k) st_act<int>(&ib[slot], (int)t);
         }
     }
+}
+
+/* DCP packs by selected SLOT, so every TP rank must give the same selected set the same order.
+ * The cooperative selector above writes slots through an atomic counter: its set is exact but its
+ * order depends on workgroup arrival. This one-WG, per-row pass canonicalizes only DCP selections.
+ * It runs as a separate packet instruction, after the selector's gate has published its stores. */
+__device__ void d_index_select_canonical(int* __restrict__ idx, const int* __restrict__ kv_len,
+                                         unsigned top_k, unsigned row, unsigned* shared) {
+    if (top_k > 2048u) __builtin_trap();
+    const unsigned live = (unsigned)as_glob(kv_len)[row];
+    const unsigned n = live < top_k ? live : top_k;
+    if (!n) return;
+    unsigned width = 1u;
+    while (width < n) width <<= 1u;
+    int* const ib = as_glob(idx) + (size_t)row * top_k;
+    const unsigned tid = threadIdx.x;
+    for (unsigned i = tid; i < width; i += PLOW_THREADS)
+        shared[i] = i < n ? (unsigned)as_glob(ib)[i] : 0x7fffffffu;
+    __syncthreads();
+    for (unsigned k = 2u; k <= width; k <<= 1u) {
+        for (unsigned j = k >> 1u; j; j >>= 1u) {
+            for (unsigned i = tid; i < width; i += PLOW_THREADS) {
+                const unsigned mate = i ^ j;
+                if (i < mate) {
+                    const unsigned a = shared[i], b = shared[mate];
+                    const bool ascending = (i & k) == 0u;
+                    if (ascending ? a > b : a < b) {
+                        shared[i] = b;
+                        shared[mate] = a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (unsigned i = tid; i < n; i += PLOW_THREADS) st_act<int>(&ib[i], (int)shared[i]);
 }
 
 /* =============================================================================================

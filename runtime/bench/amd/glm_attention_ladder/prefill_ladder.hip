@@ -86,12 +86,13 @@ __global__ void reduce_splits(float* __restrict__ out, const float* __restrict__
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s <objdir> [--rows a,b] [--ctx a,b] [--ns a,b] [--mode dense,sparse] [--split path] [--small path] [--aiter path]\n", argv[0]); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: %s <objdir> [--rows a,b] [--ctx a,b] [--ns a,b] [--mode dense,sparse] [--split path] [--small path] [--aiter path] [--native path]\n", argv[0]); return 2; }
     std::string objdir = argv[1];
     std::vector<unsigned> rows_list{128, 512, 2048, 8192}, ctx_list{1024, 4096, 16384, 32768, 65536, 81920}, ns_list{2, 4, 8, 16, 32};
     std::set<std::string> modes{"dense", "sparse"};
     std::string split_path = objdir + "/interp_mla_split_fp8kv_gq.elf", small_path = objdir + "/interp_mla_small_fp8kv_gq.elf";
     std::string aiter_path = objdir + "/mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co";
+    std::string native_path;
     for (int a = 2; a + 1 < argc; a += 2) {
         std::string k = argv[a];
         if (k == "--rows") rows_list = parse_list(argv[a + 1]);
@@ -100,12 +101,18 @@ int main(int argc, char** argv) {
         else if (k == "--split") split_path = argv[a + 1];
         else if (k == "--small") small_path = argv[a + 1];
         else if (k == "--aiter") aiter_path = argv[a + 1];
+        else if (k == "--native") native_path = argv[a + 1];
         else if (k == "--mode") { modes.clear(); std::string cur; for (const char* p = argv[a + 1];; ++p) { if (*p == ',' || !*p) { if (!cur.empty()) modes.insert(cur); cur.clear(); if (!*p) break; } else cur += *p; } }
         else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); return 2; }
     }
     CK(hipInit(0));
-    Kernel broad = load_kernel("broad8", objdir + "/interp_prefill_fp8kv_mla_moe_gq.elf", "plow_interp_gfx942_gq", 512);
-    Kernel flash = load_kernel("flash4", objdir + "/interp_flash_fp8kv_gq.elf", "plow_interp_flash_gfx942_gq", 256);
+    const bool gfx950 = access((objdir + "/interp_prefill_fp8kv_mla_moe_gq.elf").c_str(), R_OK) != 0;
+    Kernel broad = load_kernel("broad8", objdir + (gfx950 ? "/interp_prefill_fp8kv_mla_moe_a4w4_full_gq.elf" : "/interp_prefill_fp8kv_mla_moe_gq.elf"),
+                               gfx950 ? "plow_interp_gfx950_gq" : "plow_interp_gfx942_gq", 512);
+    Kernel flash = load_kernel("flash4", objdir + "/interp_flash_fp8kv_gq.elf",
+                               gfx950 ? "plow_interp_flash_gfx950_gq" : "plow_interp_flash_gfx942_gq", 256);
+    Kernel native{};
+    if (!native_path.empty()) native = load_kernel("native_flash4", native_path, "mla_flash_prefill_v2_gather_fp8_512", 256);
     Kernel split{}, small{};
     const bool have_split = access(split_path.c_str(), R_OK) == 0, have_small = access(small_path.c_str(), R_OK) == 0;
     if (have_split) split = load_kernel("split4", split_path, "plow_interp_mla_split_gfx942_gq", 256);
@@ -275,6 +282,7 @@ int main(int argc, char** argv) {
                     if (!ok) rc = 5;
                 }
                 // (b) the flash object's GATHER arm (interpreter route)
+                std::vector<float> interp_out, interp_ml;
                 {
                     PlowDevInst d = flash_inst(0, 9 + 1, cap);
                     rp.set_inst(d);
@@ -283,10 +291,61 @@ int main(int argc, char** argv) {
                     rp.run(flash); CK(hipDeviceSynchronize());
                     double mx, rel;
                     const bool ok = check_dense_output(1, &keys, mx, rel);
+                    if (!native_path.empty()) {
+                        interp_out.resize(no + 2 * GUARD);
+                        interp_ml.resize(nm + 2 * GUARD);
+                        download(interp_out, d_out);
+                        download(interp_ml, d_ml);
+                    }
                     const double us = rp.time_us(flash);
                     std::printf("sparse,%u,%u,flash4_gather_union,1,%u,%.3f,%.6g,%.6g,%s\n", R, ctx, d.blocks, us, mx, rel, ok ? "PASS" : "FAIL");
                     std::fflush(stdout);
                     if (!ok) rc = 6;
+                }
+                if (!native_path.empty()) {
+                    const size_t no = size_t(R) * NH * DK, nm = size_t(R) * NH * 2;
+                    poison(d_out, no + 2 * GUARD); poison(d_ml, nm + 2 * GUARD);
+                    float* op = d_out + GUARD;
+                    float* ml = d_ml + GUARD;
+                    unsigned batch = 1, head = NH, stride = STRIDE, native_cap = cap;
+                    float native_scale = scale;
+                    void* args[] = {&op, &ml, &d_qa, &d_qr, &d_lat, &d_rope, &d_len, &d_uni,
+                                    &native_cap, &batch, &R, &head, &stride, &native_scale, &d_sc};
+                    auto run_native = [&] {
+                        CK(hipModuleLaunchKernel(native.fn, GRID, 1, 1, 256, 1, 1, 0, nullptr, args, nullptr));
+                    };
+                    run_native(); CK(hipDeviceSynchronize());
+                    double mx, rel;
+                    const bool ok = check_dense_output(1, &keys, mx, rel);
+                    std::vector<float> native_out(no + 2 * GUARD), native_ml(nm + 2 * GUARD);
+                    download(native_out, d_out); download(native_ml, d_ml);
+                    const bool identical = std::memcmp(interp_out.data(), native_out.data(), no * 4 + 2 * GUARD * 4) == 0 &&
+                                           std::memcmp(interp_ml.data(), native_ml.data(), nm * 4 + 2 * GUARD * 4) == 0;
+                    const double us = timed(run_native);
+                    std::printf("sparse,%u,%u,native_flash4_gather_union,1,%u,%.3f,%.6g,%.6g,%s;bitwise=%s\n",
+                                R, ctx, GRID, us, mx, rel, ok && identical ? "PASS" : "FAIL", identical ? "yes" : "no");
+                    std::vector<double> pair[2];
+                    for (unsigned rep = 0; rep < 10; ++rep) for (unsigned arm = 0; arm < 2; ++arm) {
+                        const unsigned which = (rep + arm) & 1u;
+                        if (!which) CK(hipMemsetAsync(rp.p.gq_cursor, 0, 128));
+                        CK(hipEventRecord(e0));
+                        if (which) run_native();
+                        else {
+                            void* interp_args[] = {&rp.p};
+                            CK(hipModuleLaunchKernel(flash.fn, GRID, 1, 1, flash.threads, 1, 1,
+                                                     0, nullptr, interp_args, nullptr));
+                        }
+                        CK(hipEventRecord(e1)); CK(hipEventSynchronize(e1));
+                        float ms; CK(hipEventElapsedTime(&ms, e0, e1));
+                        if (rep) pair[which].push_back(ms * 1000.0);
+                    }
+                    for (auto& times : pair) std::sort(times.begin(), times.end());
+                    std::printf("sparse,%u,%u,flash4_gather_union_paired,1,%u,%.3f,0,0,PASS\n",
+                                R, ctx, GRID, pair[0][pair[0].size() / 2]);
+                    std::printf("sparse,%u,%u,native_flash4_gather_union_paired,1,%u,%.3f,0,0,PASS\n",
+                                R, ctx, GRID, pair[1][pair[1].size() / 2]);
+                    std::fflush(stdout);
+                    if (!(ok && identical)) rc = 8;
                 }
                 // (c) AITER QH8 behind a full-cache dequant (the native route's packing), CSR = the selections
                 if (have_aiter && R + TOPK <= ctx + 1) {

@@ -1,5 +1,8 @@
 import importlib.util
 import pathlib
+import os
+import subprocess
+import tempfile
 import unittest
 
 
@@ -12,6 +15,23 @@ SPEC.loader.exec_module(MOD)
 
 
 class ObjectRecipeTests(unittest.TestCase):
+    def test_flash_arm_follows_exact_packet_requirement(self):
+        script = (ROOT / "scripts/build_gfx950.sh").read_text()
+        fragment = script.split('DSA_FLASH=""', 1)[1].split('case "${decode_inventory_prune,,}"', 1)[0]
+        command = 'set -eu\nDSA_FLASH=""' + fragment + '\nprintf "%s" "$DSA_FLASH"'
+        with tempfile.TemporaryDirectory() as directory:
+            config = pathlib.Path(directory) / "plow_config.h"
+            for requirement, expected in (
+                ("PLOW_DSA_PF_ARM=1", "-DPLOW_DSA_PF_ARM=1"),
+                ("PLOW_FP8=1 PLOW_DSA_PF_ARM=1 PLOW_MLA_PREFILL=1", "-DPLOW_DSA_PF_ARM=1"),
+                ("PLOW_DSA_PF_ARM=0", ""), ("XPLOW_DSA_PF_ARM=1", ""),
+                ("PLOW_DSA_PF_ARM=10", ""), ("PLOW_FP8=1", ""),
+            ):
+                config.write_text(f'#define PLOW_PACKET_OBJECT_REQUIRES "{requirement}"\n')
+                result = subprocess.run(["bash", "-c", command], check=True, capture_output=True,
+                                        text=True, env={**os.environ, "PLOW_HSACO_CONFIG": str(config)})
+                self.assertEqual(result.stdout, expected)
+
     def test_selection_does_not_depend_on_cmake_row_order(self):
         axes = {
             "pf": ["-DPLOW_BUCKET_DECODE=0"],

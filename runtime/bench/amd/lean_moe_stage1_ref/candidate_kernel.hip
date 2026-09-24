@@ -6,7 +6,9 @@
 #define MPF4_BK 256
 #define MPF4_WNc 2
 #define PLOW_MOE_PF_XCD_WGM 4
+#ifndef GLM53_MOE_BENCH
 #define PLOW_MOE_PF_SITU_ONLY 1
+#endif
 #define PLOW_MOE_PF_A4W4_LOWREG 1
 #define PLOW_MOE_PF_A4W4_BRIDGE_ALIAS 1
 #include "amd_common.h"
@@ -19,7 +21,9 @@ extern "C" __device__ unsigned plow_moe1_candidate_bm64_bn128_bk256_1 = 1;
 extern "C" __device__ unsigned plow_moe1_candidate_wave64_wg256_1 = 1;
 extern "C" __device__ unsigned plow_moe1_candidate_xcd8_wgm4_1 = 1;
 extern "C" __device__ unsigned plow_moe1_candidate_generic_a4w4_1 = 1;
+#ifndef GLM53_MOE_BENCH
 extern "C" __device__ unsigned plow_moe1_candidate_situ_pair_1 = 1;
+#endif
 extern "C" __device__ unsigned plow_moe1_candidate_sorted_mxfp4_scale_1 = 1;
 extern "C" __device__ unsigned plow_moe1_candidate_dynamic_lds_52224 = 1;
 
@@ -44,8 +48,13 @@ void plow_moe1_mxfp4_bm64_bn128_bk256_xcd8_wgm4_gfx950(
     unsigned reserved2) {
     (void)reserved;
     (void)reserved2;
+#ifdef GLM53_MOE_BENCH
+    if (inter_dim != 256 || model_dim != 6144 || experts != 256 ||
+        act != PLOW_MOE_ACT_SILU)
+#else
     if (inter_dim != 384 || model_dim != 3584 || experts != 896 ||
         act != PLOW_MOE_ACT_SITU)
+#endif
         return;
     extern __shared__ unsigned char lds[];
     d_moe_group_pf_a4w4<true>(

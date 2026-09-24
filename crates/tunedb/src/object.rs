@@ -304,6 +304,7 @@ mod tests {
 
     fn digests() -> Digests {
         Digests {
+            execution: None,
             implementation: "op_gemm.cuh@abc123".into(),
             interpreter: "interp_sm120_pf.cubin@d7b3e784".into(),
             toolchain: "cuda-13.0".into(),

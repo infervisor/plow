@@ -102,6 +102,64 @@ const C_DCP: &[Constraint] = &[Constraint {
     check: Check::Site,
 }];
 
+const C_MLA_BF16_PS: &[Constraint] = &[Constraint {
+    id: "mla_bf16_ps_contract",
+    formula: F::Implies(
+        &F::Atom("emit.glm_mla_bf16_ps", Cmp::Eq, TRUE),
+        &F::And(&[
+            F::Atom("emit.glm_mla_w8a8", Cmp::Eq, TRUE),
+            F::Not(&F::Atom("emit.glm_fp8_kv", Cmp::Eq, TRUE)),
+        ]),
+    ),
+    site: "crates/devgen/src/mla.rs: PLOW_GLM_MLA_BF16_PS requires PLOW_GLM_MLA_W8A8 and BF16 KV",
+    check: Check::Site,
+}];
+
+const C_GLM_ROPE_BF16: &[Constraint] = &[Constraint {
+    id: "glm_rope_bf16_contract",
+    formula: F::Implies(
+        &F::Atom("emit.glm_rope_bf16", Cmp::Eq, TRUE),
+        &F::And(&[F::Target(T::Arch("gfx950")), F::Atom("emit.glm_mla_w8a8", Cmp::Eq, TRUE)]),
+    ),
+    site: "crates/devgen/src/mla.rs: PLOW_GLM_ROPE_BF16 requires PLOW_GLM_MLA_W8A8 on gfx950",
+    check: Check::Site,
+}];
+
+const C_INDEXER_WQ_W8A8: &[Constraint] = &[Constraint {
+    id: "indexer_wq_w8a8_contract",
+    formula: F::Implies(
+        &F::Atom("emit.glm_indexer_wq_w8a8", Cmp::Eq, TRUE),
+        &F::And(&[F::Target(T::Arch("gfx950")), F::Atom("emit.glm_mla_w8a8", Cmp::Eq, TRUE)]),
+    ),
+    site: "crates/devgen/src/mla.rs: PLOW_GLM_INDEXER_WQ_W8A8 requires PLOW_GLM_MLA_W8A8 on gfx950",
+    check: Check::Site,
+}];
+
+const C_INDEXER_FP8: &[Constraint] = &[Constraint {
+    id: "indexer_fp8_contract",
+    formula: F::Implies(
+        &F::Atom("emit.glm_indexer_fp8", Cmp::Eq, TRUE),
+        &F::And(&[
+            F::Target(T::Arch("gfx950")),
+            F::Atom("emit.glm_indexer_wq_w8a8", Cmp::Eq, TRUE),
+            F::Atom("emit.glm_mla_bf16_ps", Cmp::Eq, TRUE),
+            F::Atom("emit.glm_dsa_pf", Cmp::Eq, TRUE),
+        ]),
+    ),
+    site: "crates/devgen/src/mla.rs: native FP8 indexer precision contract",
+    check: Check::Site,
+}];
+
+const C_MLA_STRIDED_WV: &[Constraint] = &[Constraint {
+    id: "mla_strided_wv_contract",
+    formula: F::Implies(
+        &F::Atom("emit.glm_mla_strided_wv", Cmp::Eq, TRUE),
+        &F::Atom("emit.glm_mla_bf16_ps", Cmp::Eq, TRUE),
+    ),
+    site: "crates/devgen/src/mla.rs: PLOW_GLM_MLA_STRIDED_WV requires PLOW_GLM_MLA_BF16_PS",
+    check: Check::Site,
+}];
+
 /// `apply_production_defaults`'s gate for the qualified GLM recipe.
 const GLM_TARGET: F = F::And(&[
     F::Target(T::Cap("glm")),
@@ -723,6 +781,14 @@ const NATIVE_ALIGN_SCOPE: &[Allow] = &[Allow {
     ..Allow::ANY
 }];
 
+const GLM_MOE_STAGE1_NATIVE_SCOPE: &[Allow] = &[Allow {
+    kinds: &["prefill"],
+    rows: (128, 8192),
+    model: Some("glm_moe_dsa"),
+    fields: &[ScopeField::Segments],
+    ..Allow::ANY
+}];
+
 /// The attention seam's band `Residual` + `RmsNorm` become one band `AddNorm`; the prefill objects
 /// gain the arm define through the packet's requires.
 const FUSE_SEAM_RN_SCOPE: &[Allow] = &[
@@ -1016,6 +1082,16 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_shared_cus", Some("GLM_SHARED_CUS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_spine_cus", Some("GLM_SPINE_CUS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_linear_fp8", Some("GLM_LINEAR_FP8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_oproj_w8a8", Some("PLOW_GLM_OPROJ_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_qkva_w8a8", Some("PLOW_GLM_QKVA_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_mla_w8a8", Some("PLOW_GLM_MLA_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_indexer_wq_w8a8", Some("PLOW_GLM_INDEXER_WQ_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_INDEXER_WQ_W8A8),
+    KnobSpec::new("emit.glm_indexer_fp8", Some("PLOW_GLM_INDEXER_FP8"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_INDEXER_FP8),
+    KnobSpec::new("emit.glm_mla_bf16_ps", Some("PLOW_GLM_MLA_BF16_PS"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_MLA_BF16_PS),
+    KnobSpec::new("emit.glm_rope_bf16", Some("PLOW_GLM_ROPE_BF16"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_GLM_ROPE_BF16),
+    KnobSpec::new("emit.glm_mla_strided_wv", Some("PLOW_GLM_MLA_STRIDED_WV"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_MLA_STRIDED_WV),
+    KnobSpec::new("emit.glm_shared_w8a8", Some("PLOW_GLM_SHARED_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_routed_w8a8", Some("PLOW_GLM_ROUTED_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_shared_glu_split", Some("GLM_SHARED_GLU_SPLIT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.mla_prefill", Some("PLOW_MLA_PREFILL"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_ep", Some("GLM_EP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -1085,6 +1161,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.dense_pf_ns", Some("PLOW_DENSE_PF_NS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_pf_wide", Some("PLOW_GLM_PF_WIDE"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.glm_place_pf", Some("PLOW_GLM_PLACE_PF"), Layer::Emit, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("emit.glm_moe_stage1_native", Some("PLOW_GLM_MOE_STAGE1_NATIVE"), Layer::Emit, Domain::Bool, OFF, OPT_IN).scoped(GLM_MOE_STAGE1_NATIVE_SCOPE),
     KnobSpec::new("emit.glm_xr_band", Some("PLOW_GLM_XR_BAND"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_xr_band_cus", Some("PLOW_GLM_XR_BAND_CUS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.attnres_decode_mwg", Some("PLOW_ATTNRES_DECODE_MWG"), Layer::Emit, U32, UNSET, OPT_IN),
@@ -1155,6 +1232,14 @@ pub const EMIT: &[KnobSpec] = &[
 
 #[rustfmt::skip]
 pub const RAW_ENV: &[KnobSpec] = &[
+    KnobSpec::new("env.PLOW_GEMV_MFMA4", Some("PLOW_GEMV_MFMA4"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_GATE_HIER_PF", Some("PLOW_GATE_HIER_PF"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_MLA_PF_TR16", Some("PLOW_MLA_PF_TR16"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_MLA_PF_SCALE_HOIST", Some("PLOW_MLA_PF_SCALE_HOIST"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_QKVA_WAVE1", Some("PLOW_QKVA_WAVE1"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_MOE_PF_A4W4_BK", Some("PLOW_MOE_PF_A4W4_BK"), Layer::RawEnv, U32, UNSET, OPT_IN),
+    KnobSpec::new("env.PLOW_MOE_TILE_BINSEARCH", Some("PLOW_MOE_TILE_BINSEARCH"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_MLA_P_BF16", Some("PLOW_MLA_P_BF16"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.GLM_FULL", Some("GLM_FULL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.GLM_LAYER", Some("GLM_LAYER"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.GLM_NLAYERS", Some("GLM_NLAYERS"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -1287,6 +1372,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_CUBIN_PACKED_PREFILL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_ROUTED_DECODE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_DCP_GATHER", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_DCP_INDEX_CANON", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_DCP_NWG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_DECODE_HEADS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_DECODE_INVENTORY_PRUNE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1400,6 +1486,14 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_HAS_GEMM_C5_MXFP4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_GEMM_FP8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_GEMM_FP8_BLK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_QUANT_FP8_BLOCK128", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_GEMM_FP8_BLOCK128", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_GEMM_FP8_BLOCK128_SPLIT4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_SUM4_BF16", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MOE_GLU_FP8_BLOCK128", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MOE_QUANT_FP8_BLOCK128", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MOE_DOWN_FP8_BLOCK128", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MLA_BMM_FP8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_GEMM_GLU", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_GEMM_GLU_FP8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_GEMM_GLU_MXFP4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1468,6 +1562,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_HAS_MOE_GLU_MX_PF", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_MOE_GROUP_DOWN_FP8_BLK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_MOE_GROUP_GLU_FP8_BLK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MOE_GROUP_GLU_PF", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_MOE_ROUTER", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_MOE_ROUTER_GEMMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_MOE_ROUTER_GEMMA_SCORE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1526,12 +1621,15 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_MLA_PF_ABL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_KSPLIT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_MFMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_MLA_P_BF16", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_NOPE_ARM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_PSWZ", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_QK1", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_SMX", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_SV", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_TR16", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.FA_MLA_PF_SCALE_HOIST", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_QKVA_WAVE1", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_V2_ARM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_WPM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PREFILL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2323,6 +2421,64 @@ mod tests {
                 "{}",
                 t.name
             );
+        }
+    }
+
+    #[test]
+    fn glm_rope_bf16_knob_requires_gfx950_and_native_projections() {
+        let specs = emit_specs();
+        for arch in ["gfx950", "gfx942", "sm_90a"] {
+            let mut target = TARGETS[0].target();
+            target.arch = arch.into();
+            for projections in [FALSE, TRUE] {
+                let recipe = [("emit.glm_rope_bf16", TRUE), ("emit.glm_mla_w8a8", projections)];
+                let expected = if arch == "gfx950" && projections == TRUE { "ok" } else { "glm_rope_bf16_contract" };
+                assert_eq!(verdict(&specs, &[&C_GLM_ROPE_BF16[0]], &recipe_sources(&recipe), &target), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn indexer_wq_w8a8_knob_requires_gfx950_and_shared_quantization() {
+        let specs = emit_specs();
+        for arch in ["gfx950", "gfx942", "sm_90a"] {
+            let mut target = TARGETS[0].target();
+            target.arch = arch.into();
+            for projections in [FALSE, TRUE] {
+                let recipe = [("emit.glm_indexer_wq_w8a8", TRUE), ("emit.glm_mla_w8a8", projections)];
+                let expected = if arch == "gfx950" && projections == TRUE { "ok" } else { "indexer_wq_w8a8_contract" };
+                assert_eq!(verdict(&specs, &[&C_INDEXER_WQ_W8A8[0]], &recipe_sources(&recipe), &target), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn indexer_fp8_knob_requires_both_phases_and_original_query() {
+        let specs = emit_specs();
+        for arch in ["gfx950", "gfx942", "sm_90a"] {
+            let mut target = TARGETS[0].target(); target.arch = arch.into();
+            for mask in 0..8 {
+                let value = |bit| if mask & bit != 0 { TRUE } else { FALSE };
+                let recipe = [("emit.glm_indexer_fp8", TRUE),
+                    ("emit.glm_indexer_wq_w8a8", value(1)),
+                    ("emit.glm_mla_bf16_ps", value(2)), ("emit.glm_dsa_pf", value(4))];
+                assert_eq!(verdict(&specs, &[&C_INDEXER_FP8[0]], &recipe_sources(&recipe), &target),
+                    if arch == "gfx950" && mask == 7 { "ok" } else { "indexer_fp8_contract" });
+            }
+        }
+    }
+
+    #[test]
+    fn mla_bf16_ps_knob_accepts_default_bf16_but_rejects_fp8_cache() {
+        let specs = emit_specs();
+        let target = TARGETS[0].target();
+        for cache in [Val::Unset, FALSE, TRUE] {
+            for projections in [FALSE, TRUE] {
+                let recipe = [("emit.glm_mla_bf16_ps", TRUE),
+                    ("emit.glm_mla_w8a8", projections), ("emit.glm_fp8_kv", cache)];
+                let expected = if projections == TRUE && cache != TRUE { "ok" } else { "mla_bf16_ps_contract" };
+                assert_eq!(verdict(&specs, &[&C_MLA_BF16_PS[0]], &recipe_sources(&recipe), &target), expected);
+            }
         }
     }
 

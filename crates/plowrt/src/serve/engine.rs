@@ -46,6 +46,20 @@ impl ServeEngine {
         false
     }
 
+    /// Whether this is the AMD HSA engine.
+    pub fn is_amd(&self) -> bool {
+        #[cfg(feature = "hsa")]
+        if matches!(self, ServeEngine::Amd(_)) {
+            return true;
+        }
+        false
+    }
+
+    /// Whether this is a GPU engine (CUDA or AMD).
+    pub fn is_gpu(&self) -> bool {
+        self.is_cuda() || self.is_amd()
+    }
+
     /// Whether this backend applies the request's sampling parameters.
     ///
     /// ONLY THE CUDA ENGINE DOES. The gfx950 engine and the CPU/Metal engine

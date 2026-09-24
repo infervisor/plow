@@ -177,6 +177,8 @@ fn narrow(e: &CtxEmit, from: u32, to: u32) -> CtxEmit {
             let bytes = match ctx_bound::tensor_scaling(name) {
                 Scaling::Linear => ctx_bound::linear_bytes(*bytes, from, to)
                     .unwrap_or_else(|| panic!("{name}: {bytes} B is not a multiple of ctx {from}")),
+                Scaling::IndexerBlock16 => ctx_bound::indexer_rescaled_bytes(*bytes, from, to)
+                    .unwrap_or_else(|| panic!("{name}: invalid packed indexer context")),
                 Scaling::Rope => rope_bytes[&(h as u32)],
                 Scaling::Inert => *bytes,
                 Scaling::Unknown => panic!("{name}: no ctx-scaling rule"),
@@ -291,6 +293,7 @@ fn the_ctx_scaled_tensor_set_is_exactly_what_moves_with_ctx() {
         let scaling = ctx_bound::tensor_scaling(n1);
         if b1 == b2 {
             assert_ne!(scaling, Scaling::Linear, "`{n1}` is inert but classified");
+            assert_ne!(scaling, Scaling::IndexerBlock16, "`{n1}` is inert but classified");
             assert_ne!(scaling, Scaling::Rope, "`{n1}` is inert but classified");
             continue;
         }
@@ -300,7 +303,7 @@ fn the_ctx_scaled_tensor_set_is_exactly_what_moves_with_ctx() {
             "`{n1}` moves with ctx but not linearly"
         );
         assert!(
-            matches!(scaling, Scaling::Linear | Scaling::Rope),
+            matches!(scaling, Scaling::Linear | Scaling::IndexerBlock16 | Scaling::Rope),
             "`{n1}` moves with ctx and has no rule"
         );
         moved.push(n1.as_str());

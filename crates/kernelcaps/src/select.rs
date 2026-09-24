@@ -178,11 +178,12 @@ pub fn select_kernel(
     // smaller.
     let all_measured: Option<Vec<(KernelId, f64, Option<TileConfig>)>> = candidates
         .iter()
-        .map(|k| measured.median_ns(k.id).map(|ns| (k.id, ns, k.tile)))
+        .map(|k| measured.median_ns(k.id).filter(|ns| ns.is_finite() && *ns > 0.0)
+            .map(|ns| (k.id, ns, k.tile)))
         .collect();
 
     if let Some(mut scored) = all_measured {
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).expect("finite medians"));
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         let (kernel, median_ns, tile) = scored[0];
         return Ok(Realization {
             kernel,
@@ -377,6 +378,22 @@ mod tests {
         assert_eq!(r.kernel, KernelId(DevOp::GemmMed));
         assert_eq!(r.rationale, Rationale::Measured { median_ns: 100.0 });
         assert_eq!(r.rationale.tier(), CalibrationTier::SkuCalibrated);
+    }
+
+    #[test]
+    fn malformed_medians_fall_back_and_ties_are_stable() {
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            let costs = Table(BTreeMap::from([(DevOp::Gemm as u16, 3.0),
+                (DevOp::GemmMed as u16, invalid), (DevOp::GemmSmall as u16, 2.0)]));
+            let result = select_kernel(&amd_registry(), &op(), &fp("MI350X"),
+                ProfileId::PrefillDense, &costs, |_| 10).unwrap();
+            assert!(matches!(result.rationale, Rationale::Analytical { .. }));
+        }
+        let costs = Table(BTreeMap::from([(DevOp::Gemm as u16, 1.0),
+            (DevOp::GemmMed as u16, 1.0), (DevOp::GemmSmall as u16, 1.0)]));
+        let result = select_kernel(&amd_registry(), &op(), &fp("MI350X"),
+            ProfileId::PrefillDense, &costs, |_| 10).unwrap();
+        assert_eq!(result.kernel.raw(), *costs.0.keys().next().unwrap());
     }
 
     /// Partial measurement coverage must not mix units. If only some candidates

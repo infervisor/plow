@@ -251,6 +251,8 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::GemmWideFp8, RowField::Rows(0)),
     (DevOp::GemmGluFp8, RowField::Rows(0)),
     (DevOp::GemmFp8Blk, RowField::Rows(0)),
+    (DevOp::GemmFp8Block128, RowField::Rows(0)),
+    (DevOp::GemmFp8Block128Split4, RowField::Rows(0)),
     (DevOp::GemmMxfp4, RowField::Rows(0)),
     (DevOp::GemmMedMxfp4, RowField::Rows(0)),
     (DevOp::GemmSmallMxfp4, RowField::Rows(0)),
@@ -528,6 +530,30 @@ fn affine_q4_ragged_prefill_places_head_on_real_row() {
         assert_eq!(insts[1].i[4], 16);
         assert_eq!(insts[0].i[3], 0);
         assert_eq!(insts[1].i[3], 0);
+    }
+}
+
+#[test]
+fn fp8_block128_ragged_prefill_shrinks_only_bucket_rows() {
+    for op in [DevOp::GemmFp8Block128, DevOp::GemmFp8Block128Split4] {
+        let mut full = DevInst64 {
+            op: op as u16,
+            ..Default::default()
+        };
+        full.i[0] = 8192;
+        let mut band = full;
+        band.i[0] = 1024;
+        let mut insts = [full, band];
+        rebase_chunk_rows(
+            &mut insts,
+            &["act.full".into(), "act.band".into()],
+            0,
+            4464,
+            8192,
+            Some(8192),
+        );
+        assert_eq!(insts[0].i[0], 4464, "{op:?}");
+        assert_eq!(insts[1].i[0], 1024, "{op:?}");
     }
 }
 

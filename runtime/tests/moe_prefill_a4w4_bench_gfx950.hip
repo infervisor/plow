@@ -70,13 +70,15 @@
  *       -DPLOW_MOE_A4W4_STAGE2_BENCH=1 -DPLOW_MOE_PF_EPI_SIB=0 \
  *       -I runtime/amd -I runtime/common \
  *       runtime/tests/moe_prefill_a4w4_bench_gfx950.hip -o /tmp/moe_pf_a4w4_stage2
- *   argv[7] optionally overrides the TP-local expert width I.
+ *   argv[7..10] optionally override TP-local I, H, expert count, and top-k.
+ *   argv[11]=1 uses deterministic varied inputs to catch expert/row indexing errors.
  *   sg render -c 'ROCR_VISIBLE_DEVICES=<n> /tmp/moe_pf_a4w4_bench [T] [grid] [iters] [act] [beta] [lbeta]'
  */
 #include <vector>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cmath>
 #include <algorithm>
 #ifndef MPF4_BM
@@ -127,16 +129,24 @@ extern "C" __global__ void b_reduce(float* out, const float* part, unsigned T,
 
 static unsigned rngs = 12345u;
 static unsigned rnd() { rngs ^= rngs << 13; rngs ^= rngs >> 17; rngs ^= rngs << 5; return rngs; }
+static uint64_t hash_bytes(const std::vector<unsigned char>& bytes) {
+    uint64_t hash = 14695981039346656037ull;
+    for (unsigned char byte : bytes) hash = (hash ^ byte) * 1099511628211ull;
+    return hash;
+}
 
 int main(int argc, char** argv) {
     /* --- K3 MoE prefill geometry ------------------------------------------------------------ */
-    const unsigned H = 3584;                 /* latent / model width, = GEMM1's K, GEMM2's N   */
+    const unsigned H = (argc > 8) ? (unsigned)atoi(argv[8]) : 3584u;
     const unsigned I = (argc > 7) ? (unsigned)atoi(argv[7]) : 384u; /* TP-local expert width */
-    const unsigned n_exp = 896;              /* routed experts                                 */
-    const unsigned topk = 16;
+    const unsigned n_exp = (argc > 9) ? (unsigned)atoi(argv[9]) : 896u;
+    const unsigned topk = (argc > 10) ? (unsigned)atoi(argv[10]) : 16u;
+    if (!H || !I || !n_exp || !topk || (topk & (topk - 1u)) || n_exp < 8u) return 2;
+    const unsigned atom_ksh = __builtin_ctz(topk) + 1u;
     const unsigned T = (argc > 1) ? (unsigned)atoi(argv[1]) : 1024u;
     const unsigned grid = (argc > 2) ? (unsigned)atoi(argv[2]) : 512u;
     const int iters = (argc > 3) ? atoi(argv[3]) : 11;
+    const bool varied = (argc > 11) && atoi(argv[11]) == 1;
     /* ACTIVATION, from argv, because the GLU epilogue is not free and the three activations do
      * not cost the same. `act=1` (silu) is the historical default this file's table was measured
      * with; K3 actually routes through `situ` (act=2, beta=4, linear_beta=25), which is a strictly
@@ -184,7 +194,14 @@ int main(int argc, char** argv) {
     unsigned char *dfu, *dfs; bf16* dx; int* dmeta; unsigned *drt, *drp;
     float *drg, *dpart, *dacc_ref, *dacc_atom;
     unsigned long long *dwt, *dst;
-    HC(hipMalloc(&dx, (size_t)T * H * 2));      HC(hipMemset(dx, 0x3c, (size_t)T * H * 2));
+    HC(hipMalloc(&dx, (size_t)T * H * 2));
+    if (varied) {
+        std::vector<uint16_t> x((size_t)T * H);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = (uint16_t)(0x3e80u + (i * 17u + i / H * 13u) % 128u);
+        HC(hipMemcpy(dx, x.data(), x.size() * sizeof(uint16_t), hipMemcpyHostToDevice));
+    } else {
+        HC(hipMemset(dx, 0x3c, (size_t)T * H * 2));
+    }
     HC(hipMalloc(&dfu, (size_t)pad * I / 2));   HC(hipMemset(dfu, 0x53, (size_t)pad * I / 2));
     HC(hipMalloc(&dfs, (size_t)pad * I / 32));  HC(hipMemset(dfs, 127, (size_t)pad * I / 32));
     HC(hipMalloc(&dmeta, meta.size() * 4));
@@ -192,6 +209,9 @@ int main(int argc, char** argv) {
     HC(hipMalloc(&drt, (size_t)pad * 4)); HC(hipMemcpy(drt, rtok.data(), (size_t)pad * 4, hipMemcpyHostToDevice));
     HC(hipMalloc(&drp, (size_t)pad * 4)); HC(hipMemcpy(drp, rpid.data(), (size_t)pad * 4, hipMemcpyHostToDevice));
     std::vector<float> rgate(pad, 0.25f);
+    if (varied) {
+        for (size_t i = 0; i < rgate.size(); ++i) rgate[i] = 0.125f + (i % 7u) * 0.03125f;
+    }
     HC(hipMalloc(&drg, (size_t)pad * 4)); HC(hipMemcpy(drg, rgate.data(), (size_t)pad * 4, hipMemcpyHostToDevice));
     HC(hipMalloc(&dpart, (size_t)nassign * H * 4)); HC(hipMemset(dpart, 0, (size_t)nassign * H * 4));
     const size_t out_n = (size_t)T * H, out_bytes = out_n * sizeof(float);
@@ -207,7 +227,9 @@ int main(int argc, char** argv) {
         void *a, *b, *c, *d, *f, *g;
         HC(hipMalloc(&a, wgu)); HC(hipMalloc(&b, wgu)); HC(hipMalloc(&f, wdn));
         HC(hipMalloc(&c, sgu)); HC(hipMalloc(&d, sgu)); HC(hipMalloc(&g, sdn));
-        HC(hipMemset(a, 0x52, wgu)); HC(hipMemset(b, 0x25, wgu)); HC(hipMemset(f, 0x43, wdn));
+        HC(hipMemset(a, varied ? 0x11u + e % 47u : 0x52u, wgu));
+        HC(hipMemset(b, varied ? 0x21u + e % 43u : 0x25u, wgu));
+        HC(hipMemset(f, varied ? 0x31u + e % 41u : 0x43u, wdn));
         HC(hipMemset(c, 127, sgu)); HC(hipMemset(d, 127, sgu)); HC(hipMemset(g, 127, sdn));
         wt[e * 3] = (unsigned long long)a; wt[e * 3 + 1] = (unsigned long long)b; wt[e * 3 + 2] = (unsigned long long)f;
         st[e * 3] = (unsigned long long)c; st[e * 3 + 1] = (unsigned long long)d; st[e * 3 + 2] = (unsigned long long)g;
@@ -237,7 +259,7 @@ int main(int argc, char** argv) {
     hipLaunchKernelGGL(b_reduce, rgrid, rblock, 0, 0, dacc_ref, dpart, T, H, topk);
     HC(hipMemset(dacc_atom, 0, out_bytes));
     hipLaunchKernelGGL(b_down, dim3(grid), dim3(PLOW_THREADS), 0, 0, dacc_atom, dfu, dfs, dwt,
-                       dst, dmeta, drp, drg, H, I, n_exp, 5u);
+                       dst, dmeta, drp, drg, H, I, n_exp, atom_ksh);
     HC(hipDeviceSynchronize());
     std::vector<float> href(out_n), hatom(out_n);
     HC(hipMemcpy(href.data(), dacc_ref, out_bytes, hipMemcpyDeviceToHost));
@@ -283,7 +305,7 @@ int main(int argc, char** argv) {
             HC(hipEventRecord(e0));
             HC(hipMemsetAsync(dacc_atom, 0, out_bytes, 0));
             hipLaunchKernelGGL(b_down, dim3(grid), dim3(PLOW_THREADS), 0, 0, dacc_atom, dfu, dfs,
-                               dwt, dst, dmeta, drp, drg, H, I, n_exp, 5u);
+                               dwt, dst, dmeta, drp, drg, H, I, n_exp, atom_ksh);
             HC(hipEventRecord(e1)); HC(hipEventSynchronize(e1));
             HC(hipEventElapsedTime(&ms, e0, e1)); if (it) tatomv.push_back(ms);
         };
@@ -300,6 +322,21 @@ int main(int argc, char** argv) {
     const double m2 = t2v[t2v.size() / 2];
     const double mb = tbasev[tbasev.size() / 2], ma = tatomv[tatomv.size() / 2];
     const double PEAK = 8.0e12; /* MI355X HBM3E, 8 TB/s */
+
+    std::vector<unsigned char> part_bytes((size_t)nassign * H * sizeof(float));
+    HC(hipMemcpy(part_bytes.data(), dpart, part_bytes.size(), hipMemcpyDeviceToHost));
+#ifndef PLOW_MOE_A4W4_STAGE2_BENCH
+    std::vector<unsigned char> bridge_bytes((size_t)pad * I / 2);
+    std::vector<unsigned char> scale_bytes((size_t)pad * I / 32);
+    HC(hipMemcpy(bridge_bytes.data(), dfu, bridge_bytes.size(), hipMemcpyDeviceToHost));
+    HC(hipMemcpy(scale_bytes.data(), dfs, scale_bytes.size(), hipMemcpyDeviceToHost));
+    printf("  output hashes: bridge=%016llx scales=%016llx down=%016llx\n",
+           (unsigned long long)hash_bytes(bridge_bytes),
+           (unsigned long long)hash_bytes(scale_bytes),
+           (unsigned long long)hash_bytes(part_bytes));
+#else
+    printf("  output hash: down=%016llx\n", (unsigned long long)hash_bytes(part_bytes));
+#endif
 
     printf("K3 MoE prefill A4W4  T=%u topk=%u H=%u I=%u experts=%u grid=%u act=%u beta=%g lbeta=%g\n",
            T, topk, H, I, n_exp, grid, act, beta, lbeta);

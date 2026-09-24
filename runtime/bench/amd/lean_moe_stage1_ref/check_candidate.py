@@ -39,10 +39,13 @@ def remap(lin, n_tiles, tm, tn):
 
 
 def main():
-    if len(sys.argv) != 5:
-        raise SystemExit("usage: check_candidate.py CANDIDATE_NOTES CANDIDATE_ISA SHIPPING_NOTES SHIPPING_ISA")
+    if len(sys.argv) not in (5, 6):
+        raise SystemExit("usage: check_candidate.py CANDIDATE_NOTES CANDIDATE_ISA SHIPPING_NOTES SHIPPING_ISA [glm53-c16]")
+    glm53 = len(sys.argv) == 6 and sys.argv[5] == "glm53-c16"
+    if len(sys.argv) == 6 and not glm53:
+        raise SystemExit(f"unknown mode: {sys.argv[5]}")
     candidate_notes, candidate_isa, shipping_notes, shipping_isa = (
-        Path(arg).read_text() for arg in sys.argv[1:]
+        Path(arg).read_text() for arg in sys.argv[1:5]
     )
     records = {
         "candidate": kernel_record(candidate_notes, CANDIDATE),
@@ -60,7 +63,13 @@ def main():
     }
     for kind, values in expected.items():
         actual = {name: field(records[kind], name) for name in values}
-        if actual != values:
+        if glm53:
+            fixed = {k: v for k, v in values.items() if k not in ("vgpr_count", "sgpr_count")}
+            if any(actual[k] != v for k, v in fixed.items()):
+                raise SystemExit(f"{kind} metadata mismatch: {actual} != {fixed}")
+            if actual["vgpr_count"] > (168 if kind == "candidate" else 192) or actual["sgpr_count"] > 96:
+                raise SystemExit(f"{kind} register ceiling exceeded: {actual}")
+        elif actual != values:
             raise SystemExit(f"{kind} metadata mismatch: {actual} != {values}")
     for kind, isa in (("candidate", candidate_isa), ("shipping", shipping_isa)):
         if "scratch_" in isa:
@@ -68,10 +77,10 @@ def main():
         if "v_mfma_scale_f32_32x32x64_f8f6f4" not in isa:
             raise SystemExit(f"{kind} ISA lacks the scaled A4W4 MFMA")
 
-    # The candidate's GLU half-tile is 64 columns. Six N tiles cover I=384 once,
-    # and each sorted row owns 192 fp4 bytes plus 12 E8M0 output-scale bytes.
-    columns = [column for tile in range(6) for column in range(tile * 64, tile * 64 + 64)]
-    if columns != list(range(384)) or 384 // 2 != 192 or 384 // 32 != 12:
+    # The candidate's GLU half-tile is 64 columns.
+    inter = 256 if glm53 else 384
+    columns = [column for tile in range(inter // 64) for column in range(tile * 64, tile * 64 + 64)]
+    if columns != list(range(inter)) or inter % 32:
         raise SystemExit("candidate sorted-row/output-scale coverage mismatch")
     candidate_lds = 2 * (64 * 128 + 128 * 128) + 2 * 64 * 8 + 2 * 128 * 8
     if candidate_lds != 52224 or candidate_lds * 3 > 160 * 1024:
@@ -81,9 +90,9 @@ def main():
             mapped = [remap(i, tm * tn, tm, tn) for i in range(tm * tn)]
             if sorted(mapped) != list(range(tm * tn)):
                 raise SystemExit(f"XCD/WGM4 map is not bijective for tm={tm}, tn={tn}")
-    print("candidate: wave64 WG256 BM64/BN128/BK256, VGPR=120 SGPR=79 private=0 spills=0")
-    print("shipping:  wave64 WG512 BM64/BN256/BK256, VGPR=190 SGPR=90 private=0 spills=0")
-    print("coverage: N=384 -> 6x64 columns; sorted fp4 row=192 B; scale row=12 B; XCD8/WGM4 bijective")
+    print("candidate: wave64 WG256 BM64/BN128/BK256, private=0 spills=0")
+    print("shipping:  wave64 WG512 BM64/BN256/BK256, private=0 spills=0")
+    print(f"coverage: N={inter} -> {inter // 64}x64 columns; sorted fp4 row={inter // 2} B; scale row={inter // 32} B; XCD8/WGM4 bijective")
     print("occupancy: register ceiling=4 waves/SIMD; 52224 B LDS -> 3 WG/CU -> effective 3 waves/SIMD")
 
 

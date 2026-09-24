@@ -132,6 +132,44 @@ __device__ __forceinline__ float block_max(float v, float* part) {
     return t;
 }
 
+__device__ __forceinline__ float rn_glm_qa_sum(float local, float* part) {
+    for (unsigned delta = 1; delta < 64; delta *= 2)
+        local += __shfl_xor(local, delta);
+    __syncthreads();
+    if ((threadIdx.x & 63) == 0) part[threadIdx.x / 64] = local;
+    __syncthreads();
+    const float sum = (part[0] + part[1]) + (part[2] + part[3]);
+    __syncthreads();
+    return rn_ss(sum);
+}
+
+// Pinned AITER K2048 profile: balanced 256-thread tree and original double epsilon.
+__device__ void d_rmsnorm_glm_qa(bf16* out, const bf16* x, const bf16* gamma,
+                                unsigned rows, unsigned slice, unsigned nblk, float* part) {
+#if PLOW_THREADS >= 256
+    for (unsigned row = slice; row < rows; row += nblk) {
+        const size_t base = (size_t)row * 2048 + threadIdx.x * 8;
+        bf16v8 v = threadIdx.x < 256 ? ld_glob8(as_glob(x) + base) : bf16v8_zero();
+        float ss = 0.0f;
+#pragma unroll
+        for (unsigned j = 0; j < 8; j++) {
+            const float value = bf2f(v[j]);
+            ss += value * value;
+        }
+        const float mean = (float)((double)(rn_glm_qa_sum(ss, part) / 2048.0f) + 1e-5);
+        const float inv = rsqrtf(mean);
+        if (threadIdx.x < 256) {
+            const bf16v8 w = ld_glob8(as_glob(gamma) + threadIdx.x * 8);
+#pragma unroll
+            for (unsigned j = 0; j < 8; j++) v[j] = f2bf(bf2f(v[j]) * inv * bf2f(w[j]));
+            st_glob8(as_glob(out) + base, v);
+        }
+    }
+#else
+    __builtin_trap();
+#endif
+}
+
 /* -DPLOW_RN_ROWS=R: d_rmsnorm's multi-row arm (R rows of loads in flight per workgroup).
  * Default 1 = the shipped single-row loop, byte-identical. */
 #ifndef PLOW_RN_ROWS

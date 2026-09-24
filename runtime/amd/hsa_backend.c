@@ -28,6 +28,11 @@ const char* plow_hsa_last_error(void) { return g_err; }
 #define TRY(call, what) do { hsa_status_t s_ = (call); \
     if (s_ != HSA_STATUS_SUCCESS) { set_err(what, s_); return -1; } } while (0)
 
+typedef struct plow_hsa_module {
+    hsa_executable_t exe;
+    struct plow_hsa_module* next;
+} plow_hsa_module;
+
 typedef struct {
     hsa_agent_t          agent;
     hsa_amd_memory_pool_t vram;
@@ -35,6 +40,7 @@ typedef struct {
     hsa_signal_t         done;     /* counting: +1 per dispatch, -1 on completion */
     hsa_executable_t     exe;
     int                  has_exe;
+    plow_hsa_module*      modules;
     uint8_t*             karg_ring; /* PLOW_HSA_QUEUE_SIZE * PLOW_HSA_KARG_SLOT */
 } plow_dev_t;
 
@@ -145,7 +151,12 @@ void plow_hsa_shutdown(plow_hsa* h) {
     if (!h) return;
     for (int i = 0; i < h->n_dev; i++) {
         plow_dev_t* d = &h->dev[i];
-        if (d->has_exe) hsa_executable_destroy(d->exe);
+        while (d->modules) {
+            plow_hsa_module* module = d->modules;
+            d->modules = module->next;
+            hsa_executable_destroy(module->exe);
+            free(module);
+        }
         if (d->karg_ring) hsa_amd_memory_pool_free(d->karg_ring);
         if (d->queue) hsa_queue_destroy(d->queue);
         hsa_signal_destroy(d->done);
@@ -373,13 +384,27 @@ int plow_hsa_load_code_object(plow_hsa* h, int dev, const void* elf, size_t byte
     plow_dev_t* d = &h->dev[dev];
     hsa_code_object_reader_t rdr;
     TRY(hsa_code_object_reader_create_from_memory(elf, bytes, &rdr), "code_object_reader");
-    TRY(hsa_executable_create_alt(HSA_PROFILE_FULL, HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT,
-                                  NULL, &d->exe),
-        "executable_create");
-    TRY(hsa_executable_load_agent_code_object(d->exe, d->agent, rdr, NULL, NULL),
-        "load_agent_code_object (raw ELF expected — did you unbundle?)");
-    TRY(hsa_executable_freeze(d->exe, NULL), "executable_freeze");
+    plow_hsa_module* module = calloc(1, sizeof(*module));
+    if (!module) {
+        hsa_code_object_reader_destroy(rdr);
+        snprintf(g_err, sizeof(g_err), "module allocation failed");
+        return -1;
+    }
+    hsa_status_t status = hsa_executable_create_alt(HSA_PROFILE_FULL,
+        HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT, NULL, &module->exe);
+    if (status == HSA_STATUS_SUCCESS)
+        status = hsa_executable_load_agent_code_object(module->exe, d->agent, rdr, NULL, NULL);
+    if (status == HSA_STATUS_SUCCESS) status = hsa_executable_freeze(module->exe, NULL);
     hsa_code_object_reader_destroy(rdr);
+    if (status != HSA_STATUS_SUCCESS) {
+        set_err("load_code_object", status);
+        if (module->exe.handle) hsa_executable_destroy(module->exe);
+        free(module);
+        return -1;
+    }
+    module->next = d->modules;
+    d->modules = module;
+    d->exe = module->exe;
     d->has_exe = 1;
     return 0;
 }

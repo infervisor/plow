@@ -83,6 +83,9 @@
 #ifndef FA_MLA_PF2_DEFER
 #define FA_MLA_PF2_DEFER 1
 #endif
+#ifndef FA_MLA_PF_SCALE_HOIST
+#define FA_MLA_PF_SCALE_HOIST 0
+#endif
 
 #include "op_attention_common.h"
 

@@ -118,7 +118,102 @@ fail:
     return -1;
 }
 
+static int block128_wave(const char* object, unsigned M, unsigned K) {
+    if (!M || !K || K % 128) return 2;
+    const size_t elems = (size_t)M * K;
+    const size_t groups = elems / 128;
+    plow_hsa* h = plow_hsa_init();
+    if (!h || load_object(h, object) != 0) return 1;
+    plow_hsa_kernel kernel[2];
+    if (plow_hsa_get_kernel(h, 0, "quant_fp8_block128", &kernel[0]) != 0 ||
+        plow_hsa_get_kernel(h, 0, "quant_fp8_block128_wave1", &kernel[1]) != 0)
+        return 1;
+    bf16* input = plow_hsa_alloc_host(h, elems * sizeof(*input));
+    unsigned char* output = plow_hsa_alloc_host(h, elems);
+    float* scales = plow_hsa_alloc_host(h, groups * sizeof(*scales));
+    unsigned char* reference = malloc(elems);
+    float* reference_scales = malloc(groups * sizeof(*scales));
+    void* dx = plow_hsa_alloc(h, 0, elems * sizeof(*input));
+    void* dq = plow_hsa_alloc(h, 0, elems);
+    void* ds = plow_hsa_alloc(h, 0, groups * sizeof(*scales));
+    if (!input || !output || !scales || !reference || !reference_scales || !dx || !dq || !ds)
+        return 1;
+    for (size_t i = 0; i < elems; i++)
+        input[i] = f2bf(((float)((i * 1315423911u) % 8191u) - 4095.0f) / 17.0f);
+    if (plow_hsa_copy_h2d(h, 0, dx, input, elems * sizeof(*input)) != 0) return 1;
+    struct __attribute__((packed)) {
+        void* q;
+        void* x;
+        void* scale;
+        unsigned m, k;
+    } args = {dq, dx, ds, M, K};
+    const unsigned threads[2] = {512, 64};
+    const unsigned grids[2] = {(unsigned)((groups + 127) / 128), (unsigned)groups};
+    for (int arm = 0; arm < 2; arm++) {
+        if (plow_hsa_launch(h, 0, &kernel[arm], grids[arm] * threads[arm], 1, 1,
+                            threads[arm], 1, 1, 0, &args, sizeof args) != 0 ||
+            plow_hsa_wait(h, 0) != 0 ||
+            plow_hsa_copy_d2h(h, 0, output, dq, elems) != 0 ||
+            plow_hsa_copy_d2h(h, 0, scales, ds, groups * sizeof(*scales)) != 0)
+            return 1;
+        if (arm == 0) {
+            memcpy(reference, output, elems);
+            memcpy(reference_scales, scales, groups * sizeof(*scales));
+        }
+    }
+    size_t bad_bytes = 0, bad_scales = 0;
+    for (size_t i = 0; i < elems; i++) bad_bytes += reference[i] != output[i];
+    for (size_t i = 0; i < groups; i++)
+        bad_scales += memcmp(&reference_scales[i], &scales[i], sizeof(float)) != 0;
+    if (bad_bytes || bad_scales) {
+        printf("M=%u K=%u bad_bytes=%zu bad_scales=%zu\n", M, K, bad_bytes, bad_scales);
+        return 1;
+    }
+    const int batches = 8, reps = 16;
+    double samples[2][batches];
+    for (int i = 0; i < 10; i++)
+        for (int arm = 0; arm < 2; arm++)
+            if (plow_hsa_launch(h, 0, &kernel[arm], grids[arm] * threads[arm], 1, 1,
+                                threads[arm], 1, 1, 0, &args, sizeof args) != 0) return 1;
+    if (plow_hsa_wait(h, 0) != 0) return 1;
+    for (int batch = 0; batch < batches; batch++) {
+        for (int pass = 0; pass < 2; pass++) {
+            const int arm = (batch + pass) & 1;
+            const double begin = now();
+            for (int i = 0; i < reps; i++)
+                if (plow_hsa_launch(h, 0, &kernel[arm], grids[arm] * threads[arm], 1, 1,
+                                    threads[arm], 1, 1, 0, &args, sizeof args) != 0) return 1;
+            if (plow_hsa_wait(h, 0) != 0) return 1;
+            samples[arm][batch] = (now() - begin) * 1e6 / reps;
+        }
+    }
+    for (int arm = 0; arm < 2; arm++)
+        for (int i = 1; i < batches; i++)
+            for (int j = i; j > 0 && samples[arm][j] < samples[arm][j - 1]; j--) {
+                const double x = samples[arm][j];
+                samples[arm][j] = samples[arm][j - 1];
+                samples[arm][j - 1] = x;
+            }
+    const double control_us = (samples[0][3] + samples[0][4]) * 0.5;
+    const double wave_us = (samples[1][3] + samples[1][4]) * 0.5;
+    printf("M=%u K=%u groups=%zu ctl_wg=%u wave_wg=%u bad_bytes=0 bad_scales=0 ctl_us=%.3f wave_us=%.3f speedup=%.3f\n",
+           M, K, groups, grids[0], grids[1], control_us, wave_us, control_us / wave_us);
+    plow_hsa_free(h, input);
+    plow_hsa_free(h, output);
+    plow_hsa_free(h, scales);
+    plow_hsa_free(h, dx);
+    plow_hsa_free(h, dq);
+    plow_hsa_free(h, ds);
+    free(reference);
+    free(reference_scales);
+    plow_hsa_shutdown(h);
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 5 && strcmp(argv[2], "block128-wave") == 0)
+        return block128_wave(argv[1], (unsigned)strtoul(argv[3], NULL, 10),
+                             (unsigned)strtoul(argv[4], NULL, 10));
     if (argc != 5) {
         fprintf(stderr, "usage: %s <control.elf> <candidate.elf> <M> <K>\n", argv[0]);
         return 2;
