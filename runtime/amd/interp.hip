@@ -261,9 +261,17 @@ extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
 #if PLOW_MLA_FOLD_MFMA && PLOW_CDNA4 && PLOW_WAVES == 8
 #include "mla_fold_pf_mfma.h"
 #endif
+/* GemmFp8Block128 rows at or above this take the tiled block-scale GEMM (prefill), below it the
+ * decode-shaped m16 bodies. Decode rungs are <= 128 rows. */
+#ifndef PLOW_FP8_BLK_TILED_ROWS
+#define PLOW_FP8_BLK_TILED_ROWS 256
+#endif
 #include "op_collective.h"
 #include "op_elementwise.h"
 #include "op_gemm.h"
+#if PLOW_CDNA4 && PLOW_HAS_MLA_BMM_FP8 && PLOW_WAVES == 8
+#include "mla_bmm_fp8_pf.h"
+#endif
 #include "op_norm.h" /* block_max — needed by op_dsa_pool.h below */
 #include "op_dsa_pool.h"
 #include "op_hyperconn.h"
@@ -4030,6 +4038,26 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if PLOW_HAS_GEMM_FP8_BLOCK128
         case PLOW_DOP_GEMM_FP8_BLOCK128: {
 #if PLOW_CDNA4
+            /* Prefill rows: the tiled block-scale GEMM (d_gemm_fp8_t BLOCK128), 128x256 tiles for
+             * wide N, 128x128 otherwise; the m16 bodies below are decode-shaped. i4/i5 = split3
+             * widths (fused q_a|kv_a|k_rope into t0/t5/t6). The Q-B selector rows stay below. */
+            if (PLOW_RUNTIME_ROWS(in->i[0]) >= PLOW_FP8_BLK_TILED_ROWS &&
+                !(in->i[3] == 16 && in->i[6] == 2)) {
+                const unsigned m = PLOW_RUNTIME_ROWS(in->i[0]);
+                bf16* c1 = in->i[4] ? (bf16*)TEN(5) : nullptr;
+                bf16* c2 = in->i[4] ? (bf16*)TEN(6) : nullptr;
+                if (in->i[1] >= 1024u)
+                    d_gemm_fp8_t<128, 256, 64, GM_WM, GM_WN, true, false, true>(
+                        (bf16*)TEN(0), (const unsigned char*)TEN(1), (const unsigned char*)TEN(2),
+                        (const float*)TEN(3), (const float*)TEN(4), m, in->i[1], in->i[2], slice,
+                        nblk, sm->gm, nullptr, nullptr, 0, c1, c2, nullptr, in->i[4], in->i[5]);
+                else
+                    d_gemm_fp8_t<128, 128, 64, GM_WM, GM_WN, true, false, true>(
+                        (bf16*)TEN(0), (const unsigned char*)TEN(1), (const unsigned char*)TEN(2),
+                        (const float*)TEN(3), (const float*)TEN(4), m, in->i[1], in->i[2], slice,
+                        nblk, sm->gm, nullptr, nullptr, 0, c1, c2, nullptr, in->i[4], in->i[5]);
+                break;
+            }
             if (in->i[4]) {
 #if PLOW_QKVA_WAVE1
                 if (PLOW_RUNTIME_ROWS(in->i[0]) <= 64) {
@@ -4083,6 +4111,25 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if PLOW_CDNA4 && PLOW_HAS_MLA_BMM_FP8
         case PLOW_DOP_MLA_BMM_FP8:
+            /* Prefill rows: quantize each (32-row, head) block once and stream W (mla_bmm_fp8_pf.h);
+             * 10-15x the m16 body at GLM-5.3 TP8 M1k-16k on MI350X, rel-L2 <= 3e-6 vs it. */
+#if PLOW_WAVES == 8
+            if (PLOW_RUNTIME_ROWS(in->i[0]) >= PLOW_FP8_BLK_TILED_ROWS && in->i[1] == 8u) {
+                const unsigned m = PLOW_RUNTIME_ROWS(in->i[0]);
+                if (in->i[2] == 512u && in->i[3] == 192u && in->i[4]) {
+                    d_mla_bmm_fp8_pf<192, 512>((bf16*)TEN(0), (const bf16*)TEN(1),
+                        (const unsigned char*)TEN(2), (const float*)TEN(3), m, 8u, slice, nblk,
+                        in->i[3] + 64, (bf16*)TEN(4), 64, (unsigned char*)sm->raw);
+                    break;
+                }
+                if (in->i[2] == 256u && in->i[3] == 512u && !in->i[4]) {
+                    d_mla_bmm_fp8_pf<512, 256>((bf16*)TEN(0), (const bf16*)TEN(1),
+                        (const unsigned char*)TEN(2), (const float*)TEN(3), m, 8u, slice, nblk,
+                        in->i[5], nullptr, 0, (unsigned char*)sm->raw);
+                    break;
+                }
+            }
+#endif
             if (in->i[4])
                 d_mla_bmm_fp8_m16<true>((bf16*)TEN(0), (const bf16*)TEN(1),
                     (const unsigned char*)TEN(2), (const float*)TEN(3),

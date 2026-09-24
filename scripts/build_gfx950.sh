@@ -65,6 +65,11 @@ case "${PLOW_MLA_FOLD_MFMA:-0}" in
   1) A4W4_BK="$A4W4_BK -DPLOW_MLA_FOLD_MFMA=1" ;;
   *) echo "PLOW_MLA_FOLD_MFMA must be 0 or 1" >&2; exit 2 ;;
 esac
+case "${PLOW_COMBINE_VEC:-0}" in
+  0) ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_COMBINE_VEC=1" ;;
+  *) echo "PLOW_COMBINE_VEC must be 0 or 1" >&2; exit 2 ;;
+esac
 if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
   [ -f "$PLOW_HSACO_CONFIG" ] || { echo "missing PLOW_HSACO_CONFIG: $PLOW_HSACO_CONFIG" >&2; exit 2; }
   cfg_dir="$(dirname -- "$PLOW_HSACO_CONFIG")"

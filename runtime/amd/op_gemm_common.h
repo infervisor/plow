@@ -1769,7 +1769,8 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
                              unsigned slice, unsigned nblk, bf16* lds,
                              const unsigned char* __restrict__ B2 = nullptr,
                              const float* __restrict__ wscale2 = nullptr, unsigned act = 0,
-                             bf16* C1 = nullptr, bf16* C2 = nullptr, bf16* C3 = nullptr) {
+                             bf16* C1 = nullptr, bf16* C2 = nullptr, bf16* C3 = nullptr,
+                             unsigned split_first = 0, unsigned split_second = 0) {
     (void)B2; (void)wscale2; (void)act;
     (void)BK;
     constexpr int THREADS = WM * WN * PLOW_WAVE;
@@ -2091,10 +2092,20 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
                 for (int j = 0; j < SN; j++) {
                     const unsigned nn = n0 + wn * (BN / WN) + j * MFMA_N + mfma_acc_n(lane);
                     if (nn >= N) continue;
+                    /* split3 (fused q_a|kv_a|k_rope): columns route to three row-major outputs of
+                     * widths first, second, N-first-second, as the m16 kernel's SPLIT3 epilogue. */
+                    auto* out = Cg;
+                    unsigned col = nn, width = N;
+                    if (split_first) {
+                        const unsigned e2 = split_first + split_second;
+                        out = as_glob(nn < split_first ? C : nn < e2 ? C1 : C2);
+                        col = nn < split_first ? nn : nn < e2 ? nn - split_first : nn - e2;
+                        width = nn < split_first ? split_first : nn < e2 ? split_second : N - e2;
+                    }
 #pragma unroll
                     for (int e = 0; e < 16; e++) {
                         const unsigned mm = m0 + wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e);
-                        if (mm < M) st_act1(&Cg[(size_t)mm * N + nn], f2bf(acc[i][j][e]));
+                        if (mm < M) st_act1(&out[(size_t)mm * width + col], f2bf(acc[i][j][e]));
                     }
                 }
         } else if constexpr (GLU) {
