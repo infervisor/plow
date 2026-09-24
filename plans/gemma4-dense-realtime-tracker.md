@@ -5351,6 +5351,56 @@ attention arms are already TMA + WGMMA, GQA2-paired where the shape allows, and 
 routes are genuine kernel work: widen the QK^T N (BKV=64 at 1 block/SM, untested), or a deeper
 K/V pipeline. Do not spend another session looking for a switch.
 
+### 3g. How to A/B a prefill attention kernel (four void runs, and the rule that ends them)
+
+Four GPU A/Bs were run against the sliding-prefill kernel on 2026-09-24 and **all four measured
+nothing**. Every one of them edited a cubin the runtime does not execute. The findings below are
+the method, and they are worth more than the null that prompted them.
+
+**1. The `pf*fa*` objects in the objects dir are NOT on this packet's prefill path.** Rebuilding
+`interp_sm90a_pffa / pfpackedfa / pfpackedfa256_gqa2` with `-DPLOW_NV_FA256_BKV=64` (and the
+whole object set with the recipe's `[objects.env]`) changed the prefill wall by +0.0 ms at 4096
+and +0.7 at 8192. The decisive check was a **positive control**: the same objects at
+`BKV=16` — a structurally different kernel (161 registers / **1** barrier, vs 244 / **16**,
+because BKV=16 falls off the warp-specialized wgitem body) — also changed nothing, 0.098 s in
+three reps at 4096. Halving the KV tile doubles the iteration count; if that code ran, the time
+would move. It does not. Treat a null on these objects as "not executed" until a positive control
+says otherwise.
+
+**2. The live copy of a ROLE object is the one in `assets/`, not the one in `PLOW_PF_SEG_DIR`.**
+The packet's `assets/` dir carries its own `interp_sm90a_pfattn_hd256_*.cubin` /
+`_hd512.cubin` (byte-identical to the objects-dir copies at build time). The role table loads the
+assets copy. Swapping the objects-dir copy is silent and inert — which is exactly what the first
+A/B did.
+
+**3. Role objects are HASH-PINNED to the packet, so they cannot be swapped at all.** Replacing
+`assets/interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin` gives, at load:
+
+    Error: Rejected("packet role object hash mismatch")
+
+This is a clean, loud refusal — much better than the silent inertness of (1) and (2) — and it is
+the proof that this object IS on the prefill path. **The only way to A/B a role kernel is to
+re-emit the packet with the modified object**, never to substitute the file. Any recipe-level
+kernel A/B on prefill attention is therefore a two-packet comparison, and the two packets must be
+scored same-session like any other pair.
+
+**What the compiler says about BKV=64, which is the one real result here.** The wgitem body's
+`static_assert(HD==256 && BQ==64 && BKV==32)` and the `if constexpr (HD == 256 && BKV == 32)`
+dispatch guard at `op_attention_sm90.cuh:622` are **conservative, not structural**. The body's
+math is already written against BKV (`S[BKV/2]`, `fa90_wgmma_score<BKV>`, `fa90_cm_off<BKV>`,
+`KS1`/`NB0`, the `16*BKV` descriptor stride), and relaxing both pins to `BKV in {32,64}` compiles
+clean: **255 registers, zero spills, zero stack, 16 barriers** (i.e. still the warp-specialized
+body). The predicted `S[BKV/2]` spill (16 -> 32 f32/thread on a body already at 244 registers)
+does not happen.
+
+The old occupancy objection is also **void for the paired object**:
+`FA_SM90_GQA2_PAIR_FLOATS(256,64,32)` is already 141 312 B of the 227 328 B budget, i.e. already
+1 block/SM, so BKV=64's 215 040 B costs no occupancy. The "2 -> 1 blocks/SM" note was about the
+*unpaired* 103 424 B object.
+
+So BKV=64 is buildable and cheap to try — it just needs a packet, not a file swap. That is the
+next unit of #66, and it is now a packet build rather than a kernel project.
+
 ### 4. PLOW_STEP_TIME: the step is device-bound, host cost is already hidden
 
 Per-step means, stable over 512 steps (`log_every(128)`, gpu.rs:6829):
