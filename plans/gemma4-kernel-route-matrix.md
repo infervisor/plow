@@ -299,3 +299,28 @@ A defect found but not fixed: `devgen/src/lib.rs:9669-9671` hardcodes `arch: "ge
 `kind: ["dense_attn","dense_ffn"]` for EVERY Gemma block, so an MoE layer is misdescribed as dense
 in `block.json`. Harmless today only because `block_run` reads `desc.arch` just to print it
 (`block_run.rs:185`).
+
+### 7.1 The other layer kind: L5 `full_attention` (hd 512, kv_heads 2)
+
+Same harness, fresh emit and role objects, `gemma4-26b-a4b-full.json` layer 5:
+
+| B | T | decode plow | decode vLLM | ratio | prefill plow | prefill vLLM | ratio |
+|---|---|---|---|---|---|---|---|
+| 1 | 128 | 220.19 us | 352.22 us | **0.63x** | 0.60 ms | 2.99 ms | **0.20x** |
+| 1 | 1024 | 227.00 us | 351.97 us | **0.64x** | 1.05 ms | 3.08 ms | **0.34x** |
+| 4 | 128 | 306.84 us | 471.58 us | **0.65x** | 2.40 ms | 2.98 ms | **0.81x** |
+| 4 | 1024 | 323.01 us | 479.78 us | **0.67x** | 4.18 ms | 5.15 ms | **0.81x** |
+
+Median **0.65x decode**, **0.81x prefill**. **Both layer kinds: 16/16 cells plow-faster.**
+
+Full attention is the harder block for plow on decode — median 0.65x vs the sliding layer's 0.60x,
+and the ratio is flat across the grid (0.63-0.67x) where the sliding layer spread 0.53-0.67x. Its
+prefill ratio saturates at 0.81x rather than climbing to 0.94x, so at B=4 the sliding layer is
+where the block advantage is thinnest, not the full one. The single block does NOT reproduce the
+served deficit, which is the point worth keeping: at the block level plow wins every cell of both
+kinds, so the served TPOT gap (the 20-cell scoreboard: TPOT 3/20) is not a per-layer kernel
+deficit -- it comes from what surrounds the layers.
+
+One reporting caveat: block_compare prints `plow device=?` because sweep.json records no device
+string. Both halves ran on this host's single H100 under gpulease in the same script invocation,
+so they are the same card; the `?` is a missing field, not an unknown machine.
