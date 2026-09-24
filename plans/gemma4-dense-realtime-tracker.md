@@ -5222,6 +5222,69 @@ kernel project (#66, slope) plus epilogue fusion (#67, offset). TPOT 0/5 and tok
 a TPOT readout), needing the decode memory-parallelism route that #82 found gated off for MoE.
 Three kernel projects, no remaining knobs -- that is the honest state of this column.
 
+### 3e. REFUTED: path DEPTH is not the decode cost either — the spine fusion costs +0.29 ms
+
+Section 3 of the decode-depth work made three predictions from the 3.01 us/level figure
+(`GRAPHSTAT_CP=1 graphstat <assets> 1`, 366 of 551 B=1 ops on the critical path). Two were already
+refuted (fusing 25 *parallel* ops: +0.0127, commit c7ddf1f0; widening the single-CTA combine:
++0.13, commit 10c08ddd). The third and strongest was **spine-consecutive** fusion: fuse ops that
+are genuinely adjacent on the critical path and the depth must fall, so the time must fall with it.
+
+It does fall, exactly as predicted, and the time goes UP.
+
+`PLOW_GEMMA_MOE_TAIL_FUSE=1` folds the MoE combine (op70) and the following norm/residual into
+one op72 per layer, 30 layers. Both CPU gates landed on the nose:
+
+| gate | OFF (tf0) | ON (tf1) | predicted |
+|---|---|---|---|
+| B=1 decode ops | 551 | 521 | 521 |
+| critical-path levels | 366 | 336 | 336 |
+| megakernel bytes | 1 822 856 | 1 821 960 | — |
+
+Measured, step_bench slots=1 ctx=128 n=64, three passes with the arm order reversed on pass 2,
+one lease, `PLOW_MULTISTEP=0`:
+
+| arm | mean_ms | sd |
+|---|---|---|
+| tail fuse OFF (ctl) | 5.3723 | 0.0032 |
+| tail fuse ON | 5.6580 | 0.0000 |
+
+**+0.2857 ms, a regression.** The noise floor for this harness is 0.0013 ms and the treatment sd is
+0.0000 across three separated runs, so this is roughly 90 sigma. The prediction was -0.0900.
+The sign is wrong, and the magnitude is 3x the predicted win in the other direction.
+
+**What this closes.** Op *count*, op *width* and now path *depth* have each been measured and each
+is a non-lever on this decode step. The 3.01 us/level figure describes a correlation across the
+existing program, not a cost you can buy back by removing levels: removing 30 real levels bought
+-0.0 and cost +0.29. Stop deriving decode work from the DAG shape. The remaining B=1 budget is a
+bandwidth story (7.64 GB/step, 1425 GB/s = 45% of roof) — see the byte split in
+`gemma4-26b-a4b-h100-campaign` memory, where attention q/k/v/o is 27%, lm_head 19%, experts 54%.
+
+The knob stays `OFF`/`OPT_IN` (`devgen/src/knob_spec.rs:1002`), which is where it already was; what
+changed is that it now *works* at t>1 and its ladder is accepted, so the number above is real
+rather than a silently-skipped arm.
+
+**A measurement defect worth more than the result.** The first two attempts at this A/B both
+reported the treatment as unqualified and measured nothing. The rebuild line was
+
+    nix develop --command cargo build --release -p plowrt --examples     # no --features
+
+which exits rc=0, prints `Finished release profile`, and **does not relink**
+`target/release/examples/step_bench` — the featureless `plowrt` is a different cargo unit, so the
+GPU ran a binary built 3.5 h earlier, before the change existed. `docs/bringup/agent-tools.md:171`
+documents this for the `plowrt` binary; the `--examples` form was not covered. Correct line:
+
+    nix develop --command cargo build --release -p plowrt --features cuda --example step_bench
+
+The cheap tell is `ls -la --time-style=+%H:%M:%S` on the binary before and after: mtime **and**
+size must both move (cargo hardlinks its uplifted artifacts, so the mtime is the real link time).
+Generalised: when a CPU harness and the runtime disagree about the same packet, suspect a stale
+binary before suspecting the cubin or a runtime-only gate. Here the runtime logged
+`decode ladder retains widest execution` while the validator qualified the same blob on CPU; I
+spent the investigation on `plow_dyn_kvrow` and the three validator branches and both were
+provably innocent (`plow_dyn_kvrow` is `= 1` unconditionally at `interp_sm120.cu:1022`, and both
+arms return identical results from all three validators).
+
 ### 4. PLOW_STEP_TIME: the step is device-bound, host cost is already hidden
 
 Per-step means, stable over 512 steps (`log_every(128)`, gpu.rs:6829):

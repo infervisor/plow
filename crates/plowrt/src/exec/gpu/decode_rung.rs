@@ -239,12 +239,17 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     | DevOp::MoeRouterGemmaTopk
                     | DevOp::MoeExpertGluNormGemma
                     | DevOp::MoeExpertDownGemma
-                    | DevOp::MoeCombineNormGemma),
+                    | DevOp::MoeCombineNormGemma
+                    | DevOp::MoeCombineResidNormGemma),
                 ) => {
                     let field = match op {
                         DevOp::MoeRouterGemmaScore
                         | DevOp::MoeRouterGemmaScoreFast
-                        | DevOp::MoeCombineNormGemma => 2,
+                        | DevOp::MoeCombineNormGemma
+                        // op72, the fused combine+NRN tail: carries B in i[2] exactly as the
+                        // unfused op70 it replaces, so it normalizes the same way. Without this
+                        // arm the ladder silently falls back to widest-only execution.
+                        | DevOp::MoeCombineResidNormGemma => 2,
                         DevOp::MoeRouterGemmaTopk => 3,
                         _ => 5,
                     };
@@ -300,6 +305,13 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     }
                 }
                 _ => {
+                    if std::env::var_os("PLOW_LADDER_DEBUG").is_some() {
+                        eprintln!(
+                            "ladder: rung {index} inst {} op {} has no normalization arm",
+                            insts.len(),
+                            d.op
+                        );
+                    }
                     compatible = false;
                 }
             }
@@ -308,6 +320,27 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
         if normalized.is_empty() {
             normalized = insts;
         } else if normalized != insts {
+            // Falling back here is SILENT (Ok(false) -> the widest rung runs every step), and it
+            // reads exactly like a large kernel regression. Name the first difference.
+            if std::env::var_os("PLOW_LADDER_DEBUG").is_some() {
+                if normalized.len() != insts.len() {
+                    eprintln!(
+                        "ladder: rung {index} has {} insts, rung 0 has {}",
+                        insts.len(),
+                        normalized.len()
+                    );
+                } else if let Some((k, (a, b))) = normalized
+                    .iter()
+                    .zip(insts.iter())
+                    .enumerate()
+                    .find(|(_, (a, b))| a != b)
+                {
+                    eprintln!(
+                        "ladder: rung {index} inst {k} differs after normalization\n                           rung0 op={} blocks={} i={:?} t={:?}\n                           rung{index} op={} blocks={} i={:?} t={:?}",
+                        a.op, a.blocks, a.i, a.t, b.op, b.blocks, b.i, b.t
+                    );
+                }
+            }
             same_shape = false;
         }
     }
@@ -621,5 +654,52 @@ impl DecodeRung {
             counter_bytes,
             _tables: tables,
         })
+    }
+}
+
+
+#[cfg(test)]
+mod ladder_diag {
+    use super::*;
+
+    /// CPU-only reproduction of the ladder decision. The real check runs during a GPU load, so
+    /// diagnosing a silent widest-fallback otherwise costs a lease. Point `PLOW_RUNG_PKT` at a
+    /// model.pkt and run with `PLOW_LADDER_DEBUG=1 --nocapture`; a no-op when unset.
+    #[test]
+    fn report_ladder_decision() {
+        let Some(path) = std::env::var_os("PLOW_RUNG_PKT") else {
+            return;
+        };
+        let buf = std::fs::read(&path).expect("read blob");
+        let blob = DevBlob::parse(&buf).expect("parse devblob");
+        eprintln!("decode rungs: {:?}", blob.decode_rungs());
+        eprintln!("segmented=false -> {:?}", validate_decode_ladder_impl(&blob, false));
+        eprintln!("segmented=true  -> {:?}", validate_decode_ladder_impl(&blob, true));
+        // Which of the three validators gpu.rs picks is decided here, and picking the
+        // non-segmented one makes a perfectly good ladder read as unqualified.
+        let prefill = blob.prefill_progs().len();
+        match segment_role_metadata(&blob, &buf) {
+            Ok(Some(roles)) => {
+                for p in &roles.programs {
+                    if p.index >= prefill {
+                        eprintln!("  prog {} roles {:?}", p.index, p.roles);
+                    }
+                }
+                let moe = roles.programs.iter().any(|p| {
+                    p.index >= prefill
+                        && p.roles
+                            .contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT)
+                });
+                eprintln!("moe_lt_decode_roles = {moe}");
+                // The three branches gpu.rs chooses between. Whichever one the runtime takes
+                // is what decides the ladder; calling all three here localizes a silent
+                // fallback without a GPU lease.
+                eprintln!("validate_moe_lt_ladder   -> {:?}", validate_moe_lt_ladder(&blob, &roles));
+                eprintln!("validate_cublaslt_ladder -> {:?}", validate_cublaslt_ladder(&blob, &roles));
+                eprintln!("validate_decode_ladder   -> {:?}", validate_decode_ladder(&blob));
+            }
+            Ok(None) => eprintln!("NO segment role metadata -> falls to validate_decode_ladder"),
+            Err(e) => eprintln!("segment role metadata error: {e:?}"),
+        }
     }
 }

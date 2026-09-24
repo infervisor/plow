@@ -1918,16 +1918,18 @@ static __device__ void d_moe_combine_norm_gemma(bf16* __restrict__ out,
  *   hn = RMSNorm(x, gn)                           (next sublayer's input)
  * arena holds one f32[H] staging row, overwritten pass to pass. */
 static __device__ void d_moe_combine_resid_norm_gemma(
-        bf16* __restrict__ hn, bf16* __restrict__ x, const float* __restrict__ part,
-        const bf16* __restrict__ h1, const bf16* __restrict__ g_pf2,
+        bf16* __restrict__ hn_all, bf16* __restrict__ x_all,
+        const float* __restrict__ part_all, const bf16* __restrict__ h1_all,
+        const bf16* __restrict__ g_pf2,
         const bf16* __restrict__ g_po, const bf16* __restrict__ gn, unsigned H, unsigned k,
-        float eps, float ls, unsigned slice, float* __restrict__ arena) {
-    if (slice != 0) return;
+        float eps, float ls, unsigned slice, unsigned nblk, unsigned nrow,
+        float* __restrict__ arena) {
     const unsigned tid = threadIdx.x;
     const unsigned nth = blockDim.x;
     const unsigned lane = tid & 31u, warp = tid >> 5;
     __shared__ float red[32];
     const unsigned nw = (nth + 31u) >> 5;
+    const unsigned stride = nblk ? nblk : 1u;
 
 #define P9_BLOCK_RED(ssv, out)                                                                     \
     do {                                                                                           \
@@ -1943,69 +1945,82 @@ static __device__ void d_moe_combine_resid_norm_gemma(
         out = red[0];                                                                              \
     } while (0)
 
-    /* Pass 1: combine (sum over slots), ss of the f32 combine. */
-    float ss = 0.0f;
+    /* BATCH B>1: one CTA per row, mirroring d_moe_combine_norm_gemma's loop. `part` rows are
+     * k*H f32 apart, every other per-row tensor is H apart; the gammas are per-feature. At B=1
+     * (nrow==1, one emitted block) this runs exactly once on block 0, so the B=1 instruction
+     * stream and arithmetic are unchanged -- which is what lets the fusion be A/B'd at C1
+     * without this loop being a second variable. */
+    for (unsigned row = slice; row < nrow; row += stride) {
+        bf16* const hn = hn_all + (size_t)row * H;
+        bf16* const x = x_all + (size_t)row * H;
+        const float* const part = part_all + (size_t)row * k * H;
+        const bf16* const h1 = h1_all + (size_t)row * H;
+
+        /* Pass 1: combine (sum over slots), ss of the f32 combine. */
+        float ss = 0.0f;
 #if PLOW_NV_GEMV_RB
-    /* float4 twin. This op runs on ONE CTA (`slice != 0` returns above) and pass 1 moves ~90 KB
-     * of the op's ~120 KB, so it dominates. The scalar form is why the tail fuse measured
-     * NEGATIVE (+0.18 ms) when it was first tried -- devgen's own comment says the fusion is
-     * "only worth revisiting as a register-cached vectorized body", which is this.
-     * `part` rows are H f32 apart and H % 8 == 0 by the emitter's contract, so the float4 reads
-     * are aligned. The ss grouping changes, hence its rounding; it was already a parallel
-     * reduction, and the arena values written are bit-identical. */
-    if ((H & 3u) == 0u) {
-        for (unsigned h = tid * 4u; h < H; h += nth * 4u) {
-            float4 acc4 = make_float4(0.f, 0.f, 0.f, 0.f);
-            for (unsigned slot = 0; slot < k; slot++) {
-                const float4 v = *(const float4*)(part + (size_t)slot * H + h);
-                acc4.x += v.x; acc4.y += v.y; acc4.z += v.z; acc4.w += v.w;
+        /* float4 twin. At B=1 this op runs on ONE CTA and pass 1 moves ~90 KB of the op's
+         * ~120 KB per row, so it dominates. The scalar form is why the tail fuse measured
+         * NEGATIVE (+0.18 ms) when it was first tried -- devgen's own comment says the fusion is
+         * "only worth revisiting as a register-cached vectorized body", which is this.
+         * `part` rows are H f32 apart and H % 8 == 0 by the emitter's contract, so the float4 reads
+         * are aligned. The ss grouping changes, hence its rounding; it was already a parallel
+         * reduction, and the arena values written are bit-identical. */
+        if ((H & 3u) == 0u) {
+            for (unsigned h = tid * 4u; h < H; h += nth * 4u) {
+                float4 acc4 = make_float4(0.f, 0.f, 0.f, 0.f);
+                for (unsigned slot = 0; slot < k; slot++) {
+                    const float4 v = *(const float4*)(part + (size_t)slot * H + h);
+                    acc4.x += v.x; acc4.y += v.y; acc4.z += v.z; acc4.w += v.w;
+                }
+                *(float4*)(arena + h) = acc4;
+                ss += acc4.x * acc4.x + acc4.y * acc4.y + acc4.z * acc4.z + acc4.w * acc4.w;
             }
-            *(float4*)(arena + h) = acc4;
-            ss += acc4.x * acc4.x + acc4.y * acc4.y + acc4.z * acc4.z + acc4.w * acc4.w;
-        }
-    } else
+        } else
 #endif
-    for (unsigned h = tid; h < H; h += nth) {
-        float acc = 0.0f;
-        for (unsigned slot = 0; slot < k; slot++) acc += part[(size_t)slot * H + h];
-        arena[h] = acc;
-        ss += acc * acc;
-    }
-    float inv1;
-    P9_BLOCK_RED(ss, inv1);
+        for (unsigned h = tid; h < H; h += nth) {
+            float acc = 0.0f;
+            for (unsigned slot = 0; slot < k; slot++) acc += part[(size_t)slot * H + h];
+            arena[h] = acc;
+            ss += acc * acc;
+        }
+        float inv1;
+        P9_BLOCK_RED(ss, inv1);
 
-    /* Pass 2: b = bf16(comb*inv1*g_pf2 + h1); ss over the ROUNDED b. */
-    ss = 0.0f;
-    for (unsigned h = tid; h < H; h += nth) {
-        const float v = arena[h] * inv1 * __bfloat162float(g_pf2[h]);
-        const bf16 bh = __float2bfloat16(v + __bfloat162float(h1[h]));
-        const float bf = __bfloat162float(bh);
-        arena[h] = bf;
-        ss += bf * bf;
-    }
-    __syncthreads(); /* red[] reused */
-    float inv2;
-    P9_BLOCK_RED(ss, inv2);
+        /* Pass 2: b = bf16(comb*inv1*g_pf2 + h1); ss over the ROUNDED b. */
+        ss = 0.0f;
+        for (unsigned h = tid; h < H; h += nth) {
+            const float v = arena[h] * inv1 * __bfloat162float(g_pf2[h]);
+            const bf16 bh = __float2bfloat16(v + __bfloat162float(h1[h]));
+            const float bf = __bfloat162float(bh);
+            arena[h] = bf;
+            ss += bf * bf;
+        }
+        __syncthreads(); /* red[] reused */
+        float inv2;
+        P9_BLOCK_RED(ss, inv2);
 
-    /* Pass 3: r = bf16((x + b*inv2*g_po) * ls); ss over the ROUNDED r. */
-    ss = 0.0f;
-    for (unsigned h = tid; h < H; h += nth) {
-        const float v =
-            (__bfloat162float(x[h]) + arena[h] * inv2 * __bfloat162float(g_po[h])) * ls;
-        const bf16 rh = __float2bfloat16(v);
-        const float rf = __bfloat162float(rh);
-        arena[h] = rf;
-        ss += rf * rf;
-    }
-    __syncthreads();
-    float inv3;
-    P9_BLOCK_RED(ss, inv3);
+        /* Pass 3: r = bf16((x + b*inv2*g_po) * ls); ss over the ROUNDED r. */
+        ss = 0.0f;
+        for (unsigned h = tid; h < H; h += nth) {
+            const float v =
+                (__bfloat162float(x[h]) + arena[h] * inv2 * __bfloat162float(g_po[h])) * ls;
+            const bf16 rh = __float2bfloat16(v);
+            const float rf = __bfloat162float(rh);
+            arena[h] = rf;
+            ss += rf * rf;
+        }
+        __syncthreads();
+        float inv3;
+        P9_BLOCK_RED(ss, inv3);
 
-    /* Pass 4: store the new residual and the next-sublayer normed input. */
-    for (unsigned h = tid; h < H; h += nth) {
-        const float rf = arena[h];
-        x[h] = __float2bfloat16(rf);
-        hn[h] = __float2bfloat16(rf * inv3 * __bfloat162float(gn[h]));
+        /* Pass 4: store the new residual and the next-sublayer normed input. */
+        for (unsigned h = tid; h < H; h += nth) {
+            const float rf = arena[h];
+            x[h] = __float2bfloat16(rf);
+            hn[h] = __float2bfloat16(rf * inv3 * __bfloat162float(gn[h]));
+        }
+        __syncthreads(); /* arena/red reused by the next row */
     }
 #undef P9_BLOCK_RED
 }

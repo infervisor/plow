@@ -6207,12 +6207,10 @@ fn emit_phase(
                 // worth revisiting as a register-cached vectorized body that replicates NRN's
                 // summation order. Opt in: PLOW_GEMMA_MOE_TAIL_FUSE=1.
                 let tail_fuse = emit_config::active().gemma_moe_tail_fuse;
-                // op72 is a single-row 1-CTA body and is default-OFF (measured negative); it was not
-                // batched. Refuse the combination loudly rather than emit wrong rows 1..B.
-                assert!(
-                !(tail_fuse && t > 1),
-                "PLOW_GEMMA_MOE_TAIL_FUSE is B=1 only (op72 MoeCombineResidNormGemma is not batched)"
-            );
+                // op72 IS batched now (op_moe.cuh: per-row block loop, `part` rows k*H apart),
+                // so the old B=1-only assert is gone. At B=1 it still emits one block and runs
+                // one row, so the B=1 program is unchanged and the fusion can be A/B'd at C1
+                // without the batching being a second variable.
                 let c_comb = if gfuse && tail_fuse {
                     // op72: fused combine + post_ffn norm + sandwich residual + NEXT input norm.
                     // One 1-block packet replaces the (op70, NormResidualNorm) pair on the layer
@@ -6222,7 +6220,10 @@ fn emit_phase(
                     } else {
                         n.fin
                     };
-                    let ct = b.emit(DevOp::MoeCombineResidNormGemma, vec![0], &comb_deps, |d| {
+                    // One CTA per row at B>1, one at B=1 (widening the B=1 combine is a
+                    // measured regression -- see the comment on comb_cus below).
+                    let tail_cus: Vec<u32> = if t > 1 { (0..t).collect() } else { vec![0] };
+                    let ct = b.emit(DevOp::MoeCombineResidNormGemma, tail_cus, &comb_deps, |d| {
                         d.t[0] = n.hn;
                         d.t[1] = n.x;
                         d.t[2] = n.moe_part;
@@ -6232,6 +6233,7 @@ fn emit_phase(
                         d.t[6] = next_gin;
                         d.i[0] = c.hidden;
                         d.i[1] = c.top_k;
+                        d.i[2] = nb; // BATCH B (0 at B=1: byte-identical), as op70
                         d.f[0] = c.eps;
                         d.f[1] = ls[l];
                     });
