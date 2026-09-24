@@ -251,3 +251,51 @@ Raising the default to 4096 is a candidate, but it is a shipped default on the L
 Wider than the matched route-off gap of section 6.2 (+4.4 to +5.7%). The conclusion holds and
 strengthens: on the 26B, dense prefill GEMMs belong on cuBLASLt end-to-end, and native's 85-boundary
 structural advantage does not close a kernel-level deficit.
+
+## 7. Single block, plow vs vLLM (26B, layer 0 sliding) — RUNS, and plow wins 8/8
+
+`scripts/block_e2e.sh` could not run at all: it invoked `plowc --bin gemma4`, a binary removed when
+`--block` moved into the main binary. Five gates had to be cleared, each a real defect or gap:
+
+1. the deleted `gemma4` bin (and `--out` is a DIRECTORY now, not a `.pkt` path);
+2. **hash-pinned cubins** — borrowing another packet's objects gives
+   `packet/interpreter MISMATCH` (build.json `pairing`), so the block needs its own;
+3. `--emit devblob+cubin` builds **no** Gemma-4 role objects and no MoE Lt glue, so its asset dir
+   cannot execute its own packet (see #91). Fixed by running
+   `build_sm90a_gemma4_segments.sh` with `PLOW_CUBIN_CONFIG=$ASSET/plow_config.h` and pointing
+   `PLOW_PF_SEG_DIR` at its output — all 9 role objects then build and pair;
+4. environment: `plowc` needs `nix develop` for the toolchain, the harness needs the SYSTEM cuda
+   libs (`libcublasLt.so.13` is not on the nix `LD_LIBRARY_PATH`), and the vLLM half needs ninja
+   on PATH and must stay OUT of nix;
+5. **the default segment-class policy faults the block.** First prefill launch died with
+   `CUDA_ERROR_LAUNCH_FAILED` (719) at `bucket_t=128`. Measured: `PURE=1` runs (FA512 either way),
+   `PURE=0` and the default both fault. So `block_e2e.sh` now sets `PLOW_PF_SEG_PURE=1`, matching
+   every working 26B serve config in this campaign.
+
+Exonerated on the way, with controls: the MoE Lt route (identical fault 4/4 across
+`PLOW_MOE_PF_LT` x `PLOW_MOE_DEC_LT`) and the role objects themselves (present and paired, and
+unused here: `packet segment roles loaded launches=15 gemm_launches=0 attention_launches=0`).
+
+### Results — `BATCH=1,4 CTX=128,1024`, iters 100 / warmup 20
+
+| B | T | decode plow | decode vLLM | ratio | prefill plow | prefill vLLM | ratio |
+|---|---|---|---|---|---|---|---|
+| 1 | 128 | 198.73 us | 336.45 us | **0.59x** | 0.57 ms | 3.04 ms | **0.19x** |
+| 1 | 1024 | 206.83 us | 341.89 us | **0.60x** | 1.06 ms | 3.11 ms | **0.34x** |
+| 4 | 128 | 242.80 us | 455.01 us | **0.53x** | 2.29 ms | 3.04 ms | **0.75x** |
+| 4 | 1024 | 315.23 us | 468.38 us | **0.67x** | 4.25 ms | 4.52 ms | **0.94x** |
+
+Median **0.60x decode**, **0.75x prefill**; plow faster in all 8 cells.
+
+**Read this carefully.** The prefill ratio degrades monotonically with work — 0.19x -> 0.94x — so at
+B=4/T=1024 the block advantage is nearly gone, which is the same shape as the served ladder where
+prefill is the half vLLM competes on. Decode holds 0.53-0.67x across the grid. And the comparison is
+TIME ONLY: `block_layer_bench.py` builds vLLM's real `Gemma4DecoderLayer` from the config JSON with
+RANDOM weights and no checkpoint, while plow compiles the block from the real checkpoint, so the
+outputs are not comparable and no numerics claim can be made from this. One block (layer 0,
+`sliding_attention`) is also not the network: `block.json` reports 15 launches for it.
+
+A defect found but not fixed: `devgen/src/lib.rs:9669-9671` hardcodes `arch: "gemma_dense"` and
+`kind: ["dense_attn","dense_ffn"]` for EVERY Gemma block, so an MoE layer is misdescribed as dense
+in `block.json`. Harmless today only because `block_run` reads `desc.arch` just to print it
+(`block_run.rs:185`).
