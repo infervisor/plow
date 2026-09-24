@@ -136,6 +136,10 @@ __device__ __forceinline__ unsigned moe_bound_topk(unsigned char* table, unsigne
 #ifndef PLOW_MOE_PF_A4W4
 #define PLOW_MOE_PF_A4W4 0
 #endif
+/* Op 83 router tail as one wave per token (see d_moe_router_topk_pf). Byte-identical table. */
+#ifndef PLOW_MOE_ROUTER_PF_WAVE
+#define PLOW_MOE_ROUTER_PF_WAVE 0
+#endif
 /* Op 86 A4W4 body = weight-streaming sweep (moe_down_a4w4_sweep.h). Needs the CDNA4 scaled MFMA. */
 #ifndef PLOW_MOE_PF_DOWN_SWEEP
 #define PLOW_MOE_PF_DOWN_SWEEP 0
@@ -2255,6 +2259,77 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
              i += (size_t)nblk * PLOW_THREADS)
             __builtin_nontemporal_store(0.0, as_glob(acc) + i);
         __syncthreads(); /* the token loop below reuses `lds`; keep the phases separate */
+    }
+#endif
+#if PLOW_MOE_ROUTER_PF_WAVE
+    /* WAVE PER TOKEN (sigmoid, no groups/hash, n_exp a multiple of 64 up to 256, k <= 8): each
+     * lane holds 4 experts, ranks its unique packed keys against all n_exp through lane
+     * shuffles, and lane 0 runs the workgroup router's gate tail in the same order, so the
+     * table is byte-identical to d_moe_router_topk's. No workgroup barrier per token: the
+     * block-per-token loop spent 0.45 ms/layer at T8192 TP8 on MI350X for 0.1 ms of traffic. */
+    if ((flags & 1u) && !(flags & 48u) && n_group <= 1u && (n_exp & 63u) == 0u && n_exp <= 256u &&
+        k <= 8u) {
+        const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+        const bool norm_topk = (flags & 2u) != 0, f32log = (flags & 8u) != 0;
+        const unsigned per = n_exp / 64u;
+        unsigned* wl = (unsigned*)lds + wave * 16u;
+        float* ws = (float*)(wl + 8);
+        for (unsigned tok = slice * PLOW_WAVES + wave; tok < T; tok += nblk * PLOW_WAVES) {
+            float s[4];
+            unsigned long long key[4];
+#pragma unroll
+            for (unsigned q = 0; q < 4; q++) {
+                if (q >= per) break;
+                const unsigned e = lane + q * 64u;
+                const float l = f32log ? ((const float*)logit)[(size_t)tok * n_exp + e]
+                                       : bf2f(logit[(size_t)tok * n_exp + e]);
+                s[q] = 1.0f / (1.0f + expf(-l));
+                float sc = s[q] + (bias ? bias[e] : 0.0f);
+                unsigned sb;
+                __builtin_memcpy(&sb, &sc, 4);
+                sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
+                key[q] = ((unsigned long long)sb << 20) | (unsigned long long)((n_exp - 1u - e) & 0xFFFFFu);
+            }
+            unsigned rank[4] = {0u, 0u, 0u, 0u};
+            for (unsigned src = 0; src < 64u; src++)
+#pragma unroll
+                for (unsigned q2 = 0; q2 < 4; q2++) {
+                    if (q2 >= per) break;
+                    const unsigned lo = __shfl((unsigned)key[q2], src), hi = __shfl((unsigned)(key[q2] >> 32), src);
+                    const unsigned long long kf = ((unsigned long long)hi << 32) | lo;
+#pragma unroll
+                    for (unsigned q = 0; q < 4; q++)
+                        if (q < per) rank[q] += kf > key[q];
+                }
+#pragma unroll
+            for (unsigned q = 0; q < 4; q++)
+                if (q < per && rank[q] < k) {
+                    wl[rank[q]] = lane + q * 64u;
+                    ws[rank[q]] = s[q];
+                }
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+            if (lane == 0) {
+                unsigned char* trow = table + (size_t)tok * (k + shared_tail) * 8;
+                float gate[8];
+                for (unsigned j = 0; j < k; j++) gate[j] = ws[j];
+                float sum = 0.0f;
+                for (unsigned j = 0; j < k; j++) sum += gate[j];
+                for (unsigned j = 0; j < k; j++) {
+                    if (norm_topk && sum != 0.0f) gate[j] /= sum;
+                    gate[j] *= route_scale;
+                    *(unsigned*)(trow + (size_t)j * 8) = wl[j];
+                    *(float*)(trow + (size_t)j * 8 + 4) = gate[j];
+                }
+                if (shared_tail) {
+                    *(unsigned*)(trow + (size_t)k * 8) = n_exp;
+                    *(float*)(trow + (size_t)k * 8 + 4) = 1.0f;
+                }
+            }
+            __builtin_amdgcn_wave_barrier();
+        }
+        return;
     }
 #endif
     for (unsigned tok = slice; tok < T; tok += nblk) {
