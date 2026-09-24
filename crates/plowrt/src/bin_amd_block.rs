@@ -8,6 +8,48 @@ use plowrt::{
 
 type Error = Box<dyn std::error::Error>;
 
+fn activation_prefix_bytes(capacity: u64, allocated_rows: usize, live_rows: usize) -> Result<usize, Error> {
+    let capacity = usize::try_from(capacity)?;
+    if allocated_rows == 0 || live_rows == 0 || live_rows > allocated_rows
+        || capacity == 0 || capacity % allocated_rows != 0
+    {
+        return Err("invalid block activation row capacity".into());
+    }
+    Ok(capacity / allocated_rows * live_rows)
+}
+
+fn carried_state_layout(
+    name: &str,
+    capacity: usize,
+    batch: usize,
+    max_ctx: usize,
+    ctx: u32,
+) -> Result<(usize, usize), Error> {
+    if batch == 0 || max_ctx == 0 || ctx == 0 || ctx as usize > max_ctx
+        || capacity == 0 || capacity % batch != 0
+    {
+        return Err("invalid carried-state capacity or context".into());
+    }
+    let stride = capacity / batch;
+    let prefix = if packet::ctx_bound::tensor_scaling(name)
+        == packet::ctx_bound::Scaling::IndexerBlock16
+    {
+        let max_ctx = u32::try_from(max_ctx)?;
+        if max_ctx % 16 != 0
+            || stride as u64 != packet::ctx_bound::indexer_prefix_bytes(max_ctx)
+        {
+            return Err("invalid packed indexer carried-state capacity".into());
+        }
+        usize::try_from(packet::ctx_bound::indexer_prefix_bytes(ctx))?
+    } else {
+        if stride % max_ctx != 0 {
+            return Err("invalid linear carried-state capacity".into());
+        }
+        stride / max_ctx * ctx as usize
+    };
+    Ok((stride, prefix))
+}
+
 fn check_output(bytes: &[u8], reference: &[u8], tolerance: f64) -> Result<f64, Error> {
     if bytes.len() != reference.len() || bytes.len() % 2 != 0 || bytes.is_empty() {
         return Err("reference residual size differs from block output".into());
@@ -87,6 +129,14 @@ pub fn run(
     if checkpoint.is_none() || uses_logits {
         return Err("--input-dir requires a weight-bound act.x-only block".into());
     }
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(inputs.join("reference.json"))?)?;
+    let batch = usize::try_from(metadata["batch"].as_u64().unwrap_or(1))?;
+    if batch == 0 || batch > 64 {
+        return Err("capture batch must be in 1..=64".into());
+    }
+    let allocated_rows = parsed.progs.iter().map(|p| p.role.rows() as usize).max()
+        .ok_or("block has no programs")?;
     let mut operands = Vec::new();
     for entry in std::fs::read_dir(&inputs)? {
         let path = entry?.path();
@@ -115,8 +165,10 @@ pub fn run(
             )
             .into());
         }
-        if name == "act.x" && bytes.len() as u64 != tensor.bytes {
-            return Err("act.x.bin must cover the full packet input tensor".into());
+        if name == "act.x"
+            && bytes.len() != activation_prefix_bytes(tensor.bytes, allocated_rows, batch)?
+        {
+            return Err("act.x.bin must cover exactly the live decode rows".into());
         }
         operands.push((name, bytes));
     }
@@ -131,29 +183,25 @@ pub fn run(
         }
     }
     let output = "act.xnext";
-    let output_bytes = parsed
+    let output_capacity = parsed
         .tensors
         .iter()
         .find(|t| t.name == output)
         .ok_or("packet has no act.xnext; use a single-layer block")?
-        .bytes as usize;
+        .bytes;
+    let output_bytes = activation_prefix_bytes(output_capacity, allocated_rows, batch)?;
     let reference = std::fs::read(inputs.join("reference.bf16"))?;
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(inputs.join("reference.json"))?)?;
-    let batch = usize::try_from(metadata["batch"].as_u64().unwrap_or(1))?;
-    if batch == 0 || batch > 64 {
-        return Err("capture batch must be in 1..=64".into());
-    }
     let positions = vec![ctx - 1; batch];
     let kv_lengths = vec![ctx; batch];
+    let parked = vec![0; batch];
     if metadata["ctx"].as_u64() != Some(u64::from(ctx)) || reference.len() != output_bytes {
         return Err("reference context or residual shape differs from the requested block".into());
     }
     let tolerance = metadata["tolerance_rel_l2"]
         .as_f64()
         .ok_or("reference has no tolerance_rel_l2")?;
-    if !tolerance.is_finite() || tolerance <= 0.0 || tolerance > 0.03 {
-        return Err("reference tolerance must be in (0, 0.03]".into());
+    if !tolerance.is_finite() || tolerance < 0.0 || tolerance > 0.03 {
+        return Err("reference tolerance must be in [0, 0.03]".into());
     }
     let iterations = warmup
         .checked_add(repeat)
@@ -171,7 +219,7 @@ pub fn run(
                 .iter()
                 .find(|t| t.name == name)
                 .ok_or("reference stage absent from packet")?;
-            if bytes.len() as u64 != tensor.bytes {
+            if bytes.len() != activation_prefix_bytes(tensor.bytes, allocated_rows, batch)? {
                 return Err(format!("{name}: stage shape mismatch").into());
             }
             Ok((name, bytes))
@@ -313,19 +361,20 @@ pub fn run(
                 return Err("context exceeds packet capacity".into());
             }
             engine.decode_prepare_batched(&positions, &kv_lengths)?;
+            engine.upload_parked(&parked)?;
             for (name, bytes) in &operands {
                 if name.starts_with("kv.") {
                     let capacity = engine.tensor_bytes(name).ok_or("missing KV tensor")? as usize;
-                    if capacity % (batch * engine.max_ctx()) != 0
-                        || bytes.len() != capacity / engine.max_ctx() * ctx as usize
-                    {
+                    let (stride, prefix) = carried_state_layout(
+                        name, capacity, batch, engine.max_ctx(), ctx,
+                    )?;
+                    if bytes.len() != prefix * batch {
                         return Err(format!(
                             "{name}: capture must cover exactly {batch} rows of context {ctx}"
                         )
                         .into());
                     }
-                    let stride = capacity / batch;
-                    for (row, data) in bytes.chunks_exact(bytes.len() / batch).enumerate() {
+                    for (row, data) in bytes.chunks_exact(prefix).enumerate() {
                         engine.write_tensor_at(name, (row * stride) as u64, data)?;
                     }
                 } else {
@@ -457,6 +506,48 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_oracle_uses_live_decode_rows_not_prefill_capacity() {
+        for allocated in [1, 8, 64, 128, 8192] {
+            for live in [1, 8, 16, 32, 64].into_iter().filter(|r| *r <= allocated) {
+                assert_eq!(activation_prefix_bytes((allocated * 6144 * 2) as u64, allocated, live).unwrap(),
+                           live * 6144 * 2);
+            }
+        }
+        for (bytes, allocated, live) in [(0, 1, 1), (2, 0, 1), (2, 1, 0), (2, 1, 2), (3, 2, 1)] {
+            assert!(activation_prefix_bytes(bytes, allocated, live).is_err());
+        }
+    }
+
+    #[test]
+    fn carried_state_upload_keeps_complete_fp8_scale_blocks() {
+        for batch in [1, 8, 16, 32, 64] {
+            let max_ctx = 131072;
+            for ctx in [1, 15, 16, 17, 8192, 8193, 8194, 8195, 8196, 71681, 131072] {
+                let capacity = batch * max_ctx * 132;
+                let (stride, prefix) = carried_state_layout(
+                    "kv.6.kidx_fp8", capacity, batch, max_ctx, ctx,
+                ).unwrap();
+                assert_eq!(stride, max_ctx * 132);
+                assert_eq!(prefix, (ctx as usize).div_ceil(16) * 2112);
+                assert!(prefix <= stride);
+                if ctx % 16 != 0 {
+                    assert!(prefix > ctx as usize * 132);
+                }
+                assert_eq!(carried_state_layout(
+                    "kv.6.ckv", batch * max_ctx * 1024, batch, max_ctx, ctx,
+                ).unwrap(), (max_ctx * 1024, ctx as usize * 1024));
+            }
+        }
+        for (capacity, batch, max_ctx, ctx) in [
+            (0, 1, 16, 1), (2112, 0, 16, 1), (2112, 1, 0, 1),
+            (2112, 1, 16, 0), (2112, 1, 16, 17), (2112, 3, 16, 1),
+            (2111, 1, 16, 1), (2244, 1, 17, 1),
+        ] {
+            assert!(carried_state_layout("kv.6.kidx_fp8", capacity, batch, max_ctx, ctx).is_err());
+        }
+    }
 
     #[test]
     fn oracle_rejects_silent_zeros_nonfinite_and_shape_mismatch() {

@@ -84,6 +84,8 @@ pub enum DevOp {
     /// `t3/t4` (T11, `PLOW_QNORM_FUSE=1`): fused w8a8 activation quant — the normed row is
     /// also written as e4m3 `xq` with per-row `a_scale`, exactly the values a following
     /// [`DevOp::QuantFp8`] would produce (token-identical; needs a t3/t4-aware cubin).
+    /// `i3=1`: AMD GLM Q-A decode profile, K2048, epsilon=1e-5 (double before rsqrt),
+    /// balanced 256-thread reduction; requires gamma, i2=0 and no fused quant outputs.
     RmsNorm = 1,
     /// `t0=rms(f32) t1=x` · `i0=rows i1=feat` · `f0=eps`.
     /// Row RMS scalars only, so [`DevOp::GemmNorm`] can apply the norm in its
@@ -246,6 +248,9 @@ pub enum DevOp {
     GemmGlu = 20,
     /// `t0=q_out t1=x t2=W_q t3=k_out t4=W_k t5=v_out t6=W_v t7=gamma?` ·
     /// `i0=M i1=Nq i2=K i3=Nk i4=Nv i5=bias_q i6=bias_k i7=bias_v` · `f0=eps`,
+    /// `j0=walk_mm` when a walking object stages fewer than M rows. The runtime requires
+    /// the exact walking-MM object and checks `min(M,walk_mm)*K` against its LDS arena;
+    /// absent `j0` retains the conservative `M*K` requirement.
     /// computing all three attention projections `q=W_q@x`, `k=W_k@x`, `v=W_v@x` in ONE GEMV.
     ///
     /// `i5/i6/i7` are optional bf16 BIAS TENSOR HANDLES (`[Nq]`, `[Nk]`, `[Nv]`; 0 = absent),
@@ -646,6 +651,8 @@ pub enum DevOp {
     /// Host zeroes gHist/gCtl once; the kernel leaves them clean for relaunch. `i4=1` selects independent rows,
     /// one workgroup per row (`row=i3+slice`), using LDS-only selection. This unpooled
     /// mode leaves t2/t3 unused and pads short rows with -1; i4=0 keeps cooperative selection.
+    /// `i4=3`: DCP-only one-workgroup-per-row ascending canonicalization of `t0=idx` after
+    /// the ordinary cooperative select. `t4=kv_len`, `i1=top_k`, and `slice` is the row.
     IndexSelect = 59,
 
     /// LayerNorm WITH bias + mean-subtract over `feat` (`d_layernorm_bias`) — the DSA indexer key-norm
@@ -2041,6 +2048,7 @@ pub enum DevOp {
     /// t4=w_scale(f32[ceil(N/128),K/128]) t5=C1 t6=C2` · `i0=M i1=N i2=K
     /// i3=MFMA(0:32x32,16:16x16 CDNA4) i4=N0 i5=N1 i6=QB_live_split`.
     /// Q-B selector 1 requires N=K=2048, MFMA16 and zeroed BF16 C; live M selects 8/4/1 K parts.
+    /// Selector 2 requires M=1,N=6144,K=2048, MFMA16 and zeroed BF16 C; eight K parts.
     /// Optional CDNA4 split output: N0,N1 >0, t0/t5/t6 hold [M,N0/N1/N-N0-N1].
     GemmFp8Block128 = 185,
     /// Four contiguous K/4 partitions, each accumulated in FP32 and stored as BF16.

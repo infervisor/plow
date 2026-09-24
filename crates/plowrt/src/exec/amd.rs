@@ -2608,7 +2608,11 @@ fn moe_mxfp4_routes_with_scratch(
                     && a.t[0] == d.t[4]
                     && a.i[0] == prog.t
                     && a.i[1] == d.i[2]
-                    && a.i[2] == 16
+                    && (a.i[2] == 16
+                        || (a.i[2] == 8
+                            && d.i[0] == 256
+                            && d.i[1] == 6144
+                            && d.i[2] == 256))
             });
             if align.is_none() {
                 return Err(RuntimeError::Device(format!(
@@ -7138,6 +7142,7 @@ impl AmdEngine {
                         path.display(),
                         match prefill_arm {
                             PrefillArm::MlaMoe => "MLA+MoE prefill",
+                            PrefillArm::MlaMoeA4w4 => "MLA+A4W4 MoE prefill",
                             PrefillArm::Mla => "MLA prefill",
                             PrefillArm::K3 => "Kimi-K3 block",
                             PrefillArm::K3Moe => "Kimi-K3 block + grouped MoE prefill",
@@ -7147,6 +7152,7 @@ impl AmdEngine {
                         hsaco_dir.display(),
                         match prefill_arm {
                             PrefillArm::MlaMoe => "PLOW_MOE_PREFILL=1",
+                            PrefillArm::MlaMoeA4w4 => "PLOW_MOE_PREFILL=1 PLOW_MOE_PF_A4W4=1 PLOW_MXFP4=1",
                             PrefillArm::Mla => "PLOW_MLA_PREFILL=1",
                             PrefillArm::K3 => "PLOW_K3=1 PLOW_MLA_PREFILL=1",
                             PrefillArm::K3Moe => {
@@ -7300,7 +7306,7 @@ impl AmdEngine {
             }
             if phase == Phase::Decode {
                 check_xargmax_capacity(&syms, &path, gemv_need.unwrap_or(max_decode_batch))?;
-                check_dec_stage_capacity(&image, &path, blob.decode_phase())?;
+                check_dec_stage_capacity(&image, &syms, &path, blob.decode_phase())?;
                 check_dsa_decode_batch(&syms, &path, blob.decode_phase(), arch == "gfx942")?;
                 check_sparse_fp8_object(&syms, &path, blob.decode_phase(), true)?;
             } else if phase == Phase::Flash {

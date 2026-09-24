@@ -908,6 +908,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_PLACE_PF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_place_pf: bool,
 
+    /// Isolate GLM MXFP4 grouped gate/up for the native stage-1 route. Opt-in until model
+    /// numerics and serving performance pass the full campaign gate.
+    #[arg(long, env = "PLOW_GLM_MOE_STAGE1_NATIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_moe_stage1_native: bool,
+
     /// Band count for a prefill TP seam (2..=8; unset/1 = the unbanded emit).
     #[arg(long, env = "PLOW_GLM_XR_BAND")]
     pub glm_xr_band: Option<u32>,
@@ -1485,6 +1490,7 @@ impl EmitConfig {
             pf_floor: env_bool("PLOW_PF_FLOOR"),
             glm_pf_wide: env_opt_out("PLOW_GLM_PF_WIDE"),
             glm_place_pf: env_opt_out("PLOW_GLM_PLACE_PF"),
+            glm_moe_stage1_native: env_bool("PLOW_GLM_MOE_STAGE1_NATIVE"),
             glm_xr_band: env_u32("PLOW_GLM_XR_BAND"),
             glm_xr_band_cus: env_u32("PLOW_GLM_XR_BAND_CUS"),
             attnres_decode_mwg: env_u32("PLOW_ATTNRES_DECODE_MWG"),

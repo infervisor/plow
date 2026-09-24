@@ -161,11 +161,13 @@ def main():
     else:
         lines += ["No reference repeats supplied; no quality verdict is emitted.", ""]
     for candidate_path in args.candidate:
-        cand_meta, candidates, _ = load_manifest(candidate_path)
+        cand_meta, candidates, candidate_repeats = load_manifest(candidate_path)
         name = cand_meta.get("name", candidate_path.stem)
         rows = []
-        unmatched = [case["id"] for key, case in candidates.items() if key not in refs]
-        for key, cand in candidates.items():
+        candidate_rows = [(key, row) for key, case in candidates.items()
+                          for row in candidate_repeats.get(key, [case])]
+        unmatched = [case["id"] for key, case in candidate_rows if key not in refs]
+        for key, cand in candidate_rows:
             ref = refs.get(key)
             if ref is None:
                 continue
@@ -219,7 +221,8 @@ def main():
         )
         summary = {
             "name": name,
-            "matched_histories": len(rows),
+            "matched_histories": len({row["prompt_sha256_u32le"] for row in rows}),
+            "matched_rows": len(rows),
             "unmatched_candidate_cases": unmatched,
             "phase_mismatch_or_unmeasured_rows": sum(not r["same_execution_phase"] for r in rows),
             "gap_exceeds_row_error_flips": severe,

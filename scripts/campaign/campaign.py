@@ -101,7 +101,8 @@ def cmd_block_roofline(a: argparse.Namespace) -> None:
         die(result.stderr or result.stdout)
     router = Path(a.router_table).resolve() if a.router_table else None
     record = analyze(result.stdout, a.ctx, roof["bandwidth_gbps"], roof["bf16_tflops"],
-                     router.read_bytes() if router else None, fp8_tflops=roof.get("fp8_tflops"))
+                     router.read_bytes() if router else None, fp8_tflops=roof.get("fp8_tflops"),
+                     mxfp4_tflops=roof.get("mxfp4_tflops"))
     if router:
         record.update(router_table=str(router), router_table_sha256=sha(router))
     trace = getattr(a, "trace", None)

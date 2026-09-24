@@ -678,6 +678,26 @@ fn block_fp8_qb_requires_marker_and_geometry() {
 }
 
 #[test]
+fn block_fp8_oproj_split8_requires_exact_m1_shape() {
+    let path = Path::new("interp_decode_gq.elf");
+    let syms = ["plow_opcode_gemm_fp8_block128_1", "plow_gemm_fp8_block128_m16_1",
+        "plow_gemm_fp8_block128_qb_1"];
+    let mut p = segmented_prog(&[DevOp::GemmFp8Block128], &[0]);
+    let dims = [1, 6144, 2048, 16, 0, 0, 2, 0];
+    p.insts[0].i = dims;
+    p.insts[0].t = [0, 1, 2, 3, 4, packet::dev::TENSOR_NONE16,
+        packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16];
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+    assert!(check_compiled_opcode_markers(&syms[..2], path, [&p]).is_err());
+    for (slot, value) in [(0, 0), (0, 8), (1, 2048), (2, 4096), (3, 0),
+                           (4, 1), (5, 1), (6, 1), (6, 3), (7, 1)] {
+        p.insts[0].i = dims;
+        p.insts[0].i[slot] = value;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+    }
+}
+
+#[test]
 fn interpreter_wave_geometry_rejects_missing_or_swapped_phase_objects() {
     for phase in [Phase::Prefill, Phase::Decode, Phase::Flash] {
         let expected = phase.interpreter_threads() / 64;
@@ -1502,6 +1522,20 @@ fn grouped_decode_requires_its_accumulation_arm() {
     }
 }
 
+#[test]
+fn dcp_canonical_select_refuses_an_old_decode_object() {
+    let requires = vec!["PLOW_DCP_INDEX_CANON=1".to_owned()];
+    let obj = Path::new("interp_decode_fp8kv_gq.elf");
+    assert!(check_decode_object(
+        &["plow_dcp_gather_1"], obj, &requires, false, false
+    )
+    .is_err());
+    assert!(check_decode_object(
+        &["plow_dcp_index_canon_1"], obj, &requires, false, false
+    )
+    .is_ok());
+}
+
 fn segmented_prog(ops: &[DevOp], segs: &[u16]) -> DevProg {
     assert_eq!(ops.len(), segs.len());
     DevProg {
@@ -1753,6 +1787,18 @@ fn lean_moe_stage1_route_requires_exact_shape_and_align() {
     assert_eq!(route.grid, 256);
     assert_eq!((route.args.inter_dim, route.args.model_dim), (384, 3584));
     assert_eq!((route.args.beta, route.args.linear_beta), (4.0, 25.0));
+
+    prog.insts[0].i = [8192, 256, 8, 0, 0, 0, 0, 0];
+    prog.insts[1].i = [256, 6144, 256, MOE_ENC_MXFP4, 0, 1, 0, 0];
+    let glm = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+    let PrefillSegmentRoute::MoeStage1Mxfp4(glm_route) = glm[1] else {
+        panic!("GLM stage-1 packet must route to the native object")
+    };
+    assert_eq!((glm_route.args.inter_dim, glm_route.args.model_dim), (256, 6144));
+
+    prog.insts[0].i[2] = 7;
+    assert!(moe_mxfp4_routes(&prog, &tensors, &devp).is_err());
+    prog.insts[0].i[2] = 8;
 
     prog.insts[1].i[0] = 224;
     let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
@@ -2959,10 +3005,8 @@ fn compact_audit_patches_only_tp_collectives() {
     assert_eq!(&insts[1].i[6..=7], &[23, 29]);
 }
 
-/// `plow_xctr_audit` derives every gate expectation from four opcodes (`PLOW_DOP_XREDUCE` 24,
-/// `PLOW_DOP_XARGMAX_FIN` 28, `PLOW_DOP_XREDUCE2` 29, `PLOW_DOP_XREDUCE_ADD_NORM` 116 in
-/// `dev_isa.h`) and ignores every other instruction, so the audit may scan the collective table
-/// instead of the program only if the table keeps all of those, unchanged and in order.
+/// The compact device audit scans the same collective table as the host audit. In particular,
+/// XDcpGather's arrival gate is i[6], not the i[3] used by XReduce.
 #[test]
 fn xaudit_table_keeps_exactly_the_collectives() {
     let kept: [u16; 8] = [24, 25, 26, 28, 29, 116, 160, 182];
@@ -3206,6 +3250,24 @@ fn prefill_arm_detect_selects_the_right_variant() {
         DevOp::MoeCombinePf,
     ])];
     assert_eq!(PrefillArm::detect(&moe_progs), PrefillArm::MlaMoe);
+    let mut a4w4 = vec![prog_with_ops(&[
+        DevOp::FlashMlaPrefill,
+        DevOp::GemmSmallMxfp4,
+        DevOp::MoeGroupGluPf,
+        DevOp::MoeGroupDownPf,
+    ])];
+    a4w4[0].insts[2].i[MOE_PF_ENC_SLOT] = MOE_ENC_MXFP4;
+    a4w4[0].insts[3].i[MOE_PF_ENC_SLOT] = MOE_ENC_MXFP4;
+    assert_eq!(PrefillArm::detect(&a4w4), PrefillArm::MlaMoeA4w4);
+    assert_eq!(Variant::detect(&a4w4), Variant::Mxfp4);
+    assert_eq!(
+        object_name(Phase::Prefill, Variant::Mxfp4, PrefillArm::MlaMoeA4w4, Sched::GlobalQueue),
+        "interp_prefill_mla_moe_a4w4_full_gq.elf"
+    );
+    assert_eq!(
+        object_name(Phase::Decode, Variant::Mxfp4, PrefillArm::MlaMoeA4w4, Sched::GlobalQueue),
+        "interp_decode_mxfp4_gq.elf"
+    );
 
     // Only MLA-prefill opcodes => Mla, not MlaMoe.
     let mla_progs = vec![prog_with_ops(&[
@@ -3214,6 +3276,13 @@ fn prefill_arm_detect_selects_the_right_variant() {
         DevOp::MlaMergeFold,
     ])];
     assert_eq!(PrefillArm::detect(&mla_progs), PrefillArm::Mla);
+    let mxfp4_mla = vec![prog_with_ops(&[DevOp::FlashMlaPrefill, DevOp::GemmSmallMxfp4])];
+    assert_eq!(Variant::detect(&mxfp4_mla), Variant::Mxfp4);
+    assert_eq!(PrefillArm::detect(&mxfp4_mla), PrefillArm::Mla);
+    assert_eq!(
+        object_name(Phase::Prefill, Variant::Mxfp4, PrefillArm::Mla, Sched::GlobalQueue),
+        "interp_prefill_mxfp4_mla_gq.elf"
+    );
 
     // Decode-only packet (no prefill opcodes at all) => None, unchanged.
     let decode_only = vec![prog_with_ops(&[DevOp::Embed, DevOp::Gemv, DevOp::RmsNorm])];
@@ -3472,11 +3541,15 @@ fn sparse_fp8_rejects_stale_objects_and_invalid_handles() {
     p.insts[0].fj = [0.0625f32.to_bits(), 1, 0];
     let tensors = vec![crate::asset::devblob::DevTensor {
         name: "large".into(),
-        bytes: 16 * 81920 * 512,
+        bytes: 64 * 81920 * 512,
         init: None,
     }];
     assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_ok());
-    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950", false).is_err());
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950", false).is_ok());
+    p.insts[0].i[0] = 64;
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_err());
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950", false).is_ok());
+    p.insts[0].i[0] = 16;
     assert!(
         check_sparse_fp8_object(&[], Path::new("old"), std::slice::from_ref(&p), true).is_err()
     );
@@ -3491,6 +3564,24 @@ fn sparse_fp8_rejects_stale_objects_and_invalid_handles() {
     assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_err());
     p.insts[0].fj[1] = 0;
     assert!(check_sparse_fp8_object(&[], Path::new("old"), &[p], true).is_ok());
+}
+
+#[test]
+fn sparse_fp8_gfx950_prefill_accepts_the_16k_rung_only_with_v2_geometry() {
+    let mut p = segmented_prog(&[DevOp::FlashMlaPrefillFp8], &[0]);
+    p.t = 16384;
+    p.insts[0].i = [1, 8, 70272, 0, 16384, u32::MAX, 16384, 4];
+    p.insts[0].t = [0; 8];
+    p.insts[0].fj = [0.0625f32.to_bits(), 1, 0];
+    let tensors = vec![crate::asset::devblob::DevTensor {
+        name: "large".into(),
+        bytes: 16384 * 70272 * 512,
+        init: None,
+    }];
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950", false).is_ok());
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_err());
+    p.insts[0].i[6] = 8192;
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950", false).is_err());
 }
 
 #[test]
@@ -3702,6 +3793,29 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
         false
     )
     .is_ok());
+}
+
+#[test]
+fn dcp_canonical_selection_checks_its_own_gfx950_geometry() {
+    let mut prog = segmented_prog(&[DevOp::IndexSelect], &[0]);
+    prog.t = 8;
+    prog.role = packet::devbuild::ProgramRole::DecodeRung { rows: 8 };
+    prog.insts[0].blocks = 8;
+    prog.insts[0].t = [0, 65535, 65535, 65535, 1, 65535, 65535, 65535];
+    prog.insts[0].i = [0, 2048, 0, 0, 3, 0, 0, 0];
+    let tensors: Vec<_> = [8 * 2048 * 4, 8 * 4]
+        .into_iter()
+        .enumerate()
+        .map(|(i, bytes)| crate::asset::devblob::DevTensor {
+            name: format!("act.{i}"),
+            bytes,
+            init: None,
+        })
+        .collect();
+    assert!(check_dsa_select_local(std::slice::from_ref(&prog), &tensors, "gfx950", true).is_ok());
+    assert!(check_dsa_select_local(std::slice::from_ref(&prog), &tensors, "gfx942", true).is_err());
+    prog.insts[0].i[1] = 4096;
+    assert!(check_dsa_select_local(std::slice::from_ref(&prog), &tensors, "gfx950", true).is_err());
 }
 
 #[test]
@@ -4391,6 +4505,22 @@ fn the_walk_marker_lifts_the_capacity_refusal() {
     );
     // An unmarked object is still refused, walk or no walk: silence is not consent.
     assert!(check_gemv_capacity(&[], p, 2).is_err());
+}
+
+#[test]
+fn fused_qkv_walk_hint_requires_the_exact_object_width() {
+    let path = Path::new("/tmp/interp_decode.elf");
+    let mut inst = packet::dev::DevInst64::default();
+    inst.op = DevOp::GemvQkv as u16;
+    inst.i[0] = 16;
+    inst.i[2] = 6144;
+    inst.fj[1] = 8;
+    let mm8 = ["plow_gemv_mm_cap_8", GEMV_WALK_SYM];
+    assert_eq!(decode_stage_rows(&inst, &mm8, path).unwrap(), 8);
+    assert!(decode_stage_rows(&inst, &["plow_gemv_mm_cap_8"], path).is_err());
+    assert!(decode_stage_rows(&inst, &["plow_gemv_mm_cap_16", GEMV_WALK_SYM], path).is_err());
+    inst.fj[1] = 0;
+    assert_eq!(decode_stage_rows(&inst, &[], path).unwrap(), 16);
 }
 
 #[test]

@@ -769,6 +769,14 @@ const NATIVE_ALIGN_SCOPE: &[Allow] = &[Allow {
     ..Allow::ANY
 }];
 
+const GLM_MOE_STAGE1_NATIVE_SCOPE: &[Allow] = &[Allow {
+    kinds: &["prefill"],
+    rows: (128, 8192),
+    model: Some("glm_moe_dsa"),
+    fields: &[ScopeField::Segments],
+    ..Allow::ANY
+}];
+
 /// The attention seam's band `Residual` + `RmsNorm` become one band `AddNorm`; the prefill objects
 /// gain the arm define through the packet's requires.
 const FUSE_SEAM_RN_SCOPE: &[Allow] = &[
@@ -1138,6 +1146,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.dense_pf_ns", Some("PLOW_DENSE_PF_NS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_pf_wide", Some("PLOW_GLM_PF_WIDE"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.glm_place_pf", Some("PLOW_GLM_PLACE_PF"), Layer::Emit, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("emit.glm_moe_stage1_native", Some("PLOW_GLM_MOE_STAGE1_NATIVE"), Layer::Emit, Domain::Bool, OFF, OPT_IN).scoped(GLM_MOE_STAGE1_NATIVE_SCOPE),
     KnobSpec::new("emit.glm_xr_band", Some("PLOW_GLM_XR_BAND"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.glm_xr_band_cus", Some("PLOW_GLM_XR_BAND_CUS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.attnres_decode_mwg", Some("PLOW_ATTNRES_DECODE_MWG"), Layer::Emit, U32, UNSET, OPT_IN),
@@ -1209,6 +1218,11 @@ pub const EMIT: &[KnobSpec] = &[
 #[rustfmt::skip]
 pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_GEMV_MFMA4", Some("PLOW_GEMV_MFMA4"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_GATE_HIER_PF", Some("PLOW_GATE_HIER_PF"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_MLA_PF_TR16", Some("PLOW_MLA_PF_TR16"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_MLA_PF_SCALE_HOIST", Some("PLOW_MLA_PF_SCALE_HOIST"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_QKVA_WAVE1", Some("PLOW_QKVA_WAVE1"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_MOE_PF_A4W4_BK", Some("PLOW_MOE_PF_A4W4_BK"), Layer::RawEnv, U32, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_TILE_BINSEARCH", Some("PLOW_MOE_TILE_BINSEARCH"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_MLA_P_BF16", Some("PLOW_MLA_P_BF16"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.GLM_FULL", Some("GLM_FULL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -1343,6 +1357,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_CUBIN_PACKED_PREFILL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_ROUTED_DECODE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_DCP_GATHER", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_DCP_INDEX_CANON", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_DCP_NWG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_DECODE_HEADS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_DECODE_INVENTORY_PRUNE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1595,6 +1610,8 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_MLA_PF_SMX", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_SV", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_TR16", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.FA_MLA_PF_SCALE_HOIST", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_QKVA_WAVE1", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_V2_ARM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PF_WPM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_PREFILL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

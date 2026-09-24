@@ -112,6 +112,18 @@ mod packlog {
         did_decode: bool,
         rows: usize,
     ) {
+        if on() {
+            let t = START.get_or_init(std::time::Instant::now).elapsed();
+            eprintln!(
+                "PACKLOG PHASE t_ms={:.1} prefill_ms={:.2} decode_ms={:.2} did_prefill={} did_decode={} decode_rows={}",
+                t.as_secs_f64() * 1e3,
+                prefill_ns as f64 / 1e6,
+                decode_ns as f64 / 1e6,
+                did_prefill as u8,
+                did_decode as u8,
+                rows,
+            );
+        }
         PREFILL_NS.fetch_add(prefill_ns, Ordering::Relaxed);
         DECODE_NS.fetch_add(decode_ns, Ordering::Relaxed);
         if did_prefill {

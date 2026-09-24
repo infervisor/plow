@@ -13,6 +13,366 @@ from block_fp8_aiter_compare import expected_shapes, load_case, load_quant_case,
 
 
 class CaptureTests(unittest.TestCase):
+    def test_attention_batch_mapping_preserves_each_request_order(self):
+        from block_fp8_aiter_compare import batched_attention_physical_indices
+        selected = torch.stack([torch.arange(2048, dtype=torch.int32).roll(row * 17) for row in range(8)])
+        table = torch.arange(1024, dtype=torch.int32).reshape(8, 128).flip(1)
+        actual = batched_attention_physical_indices(selected, table, 2048, 16384).reshape(8, 2048)
+        expected = table.gather(1, (selected // 16).long()) * 16 + selected % 16
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(actual.unique().numel(), 16384)
+        with self.assertRaises(ValueError):
+            batched_attention_physical_indices(selected, table[:1], 2048, 16384)
+
+    def test_model_decode_boundaries_require_bound_run(self):
+        from block_fp8_aiter_compare import check_model_decode_boundaries
+        with self.assertRaisesRegex(ValueError, "run-record"):
+            check_model_decode_boundaries(SimpleNamespace(reference_json=None))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "inputs").mkdir()
+            (root / "reference").mkdir()
+            manifest = dict(requests=[{}], invalid_cases=[], vllm_version="0.29.0", tensor_parallel_size=8)
+            (root / "reference/manifest.json").write_text(json.dumps(manifest))
+            (root / "inputs/reference.json").write_text(json.dumps(dict(batch=8, ctx=8193,
+                capture_manifest_sha256="wrong")))
+            (root / "run-record.json").write_text("{}")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                check_model_decode_boundaries(SimpleNamespace(reference_json=root / "run-record.json", capture=root))
+
+    def test_qanorm_sweep_is_deterministic_and_labels_resized_rows(self):
+        from block_fp8_aiter_compare import qanorm_sweep_inputs, native_norm_diagnostic, native_qanorm
+        x = torch.arange(8, dtype=torch.bfloat16)[:, None].expand(8, 2048).contiguous()
+        cases = list(qanorm_sweep_inputs(x))
+        self.assertEqual(len(cases), 36)
+        self.assertEqual({m for m, _, _ in cases}, {1, 8, 16, 32, 64, 128})
+        for (m, label, a), (_, label2, b) in zip(cases, qanorm_sweep_inputs(x)):
+            self.assertEqual(label, label2)
+            self.assertTrue(torch.equal(a, b))
+            self.assertEqual(a.shape, (m, 2048))
+            self.assertTrue(torch.isfinite(a).all())
+            if label == "captured-row-resize":
+                self.assertTrue(torch.equal(a, x.repeat(((m + 7) // 8, 1))[:m]))
+        with self.assertRaises(ValueError):
+            list(qanorm_sweep_inputs(x.float()))
+        with self.assertRaises(ValueError):
+            native_norm_diagnostic(None, x, torch.ones(2048, dtype=torch.bfloat16), 1e-5)
+        with self.assertRaises(ValueError):
+            native_qanorm(None, x, torch.ones(2048, dtype=torch.bfloat16))
+
+    def test_mla_bmm_conditioned_scope_and_admission(self):
+        from block_fp8_aiter_compare import compare_packet_mla_bmm
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "inputs").mkdir()
+            (root / "outputs").mkdir()
+            (root / "inputs/reference.json").write_text(json.dumps(dict(batch=1, layer=6)))
+            (root / "measurement.json").write_text(json.dumps(dict(batch=1, tp=8,
+                scope="single-block-decode", oracle_verified=False)))
+            inventory = root / "precision.json"
+            inventory.write_text(json.dumps(dict(ranks=[dict(rank=i) for i in range(8)])))
+            args = SimpleNamespace(capture=root, tp=8, checkpoint=root, precision_inventory=inventory,
+                live_prefix=True, output=root / "result.json")
+            for rank in range(8):
+                (root / "outputs" / f"rank{rank}.act.qa.bin").write_bytes(bytes(16))
+            def replay(args, ops, inv, layer, rank, m, captured, exact, boundaries):
+                self.assertEqual((layer, m), (6, 1))
+                exact("act.qa", torch.zeros((1, 2), dtype=torch.bfloat16))
+                boundaries["act.qa"].update(reference_repeat_bitwise=True, input_finite=True)
+            with patch("block_fp8_aiter_compare.mla_bmm_boundaries", side_effect=replay):
+                self.assertEqual(compare_packet_mla_bmm(args, None, "0.29.0"), 0)
+                result = json.loads(args.output.read_text())
+                self.assertTrue(result["passed"])
+                self.assertFalse(result["precision_qualified"])
+                self.assertIn("Q-A/Q-B", result["scope"])
+                (root / "outputs/rank7.act.qa.bin").write_bytes(struct.pack("<HH", 0x3f80, 0))
+                args.output = root / "mismatch.json"
+                self.assertEqual(compare_packet_mla_bmm(args, None, "0.29.0"), 1)
+                self.assertFalse(json.loads(args.output.read_text())["cases"][7]["passed"])
+                args.output = root / "strict.json"
+                args.live_prefix = False
+                with self.assertRaises(ValueError):
+                    compare_packet_mla_bmm(args, None, "0.29.0")
+                args.live_prefix = True
+                inventory.write_text(json.dumps(dict(ranks=[dict(rank=0) for _ in range(8)])))
+                with self.assertRaises(ValueError):
+                    compare_packet_mla_bmm(args, None, "0.29.0")
+                with self.assertRaises(ValueError):
+                    compare_packet_mla_bmm(args, None, "0.28.0")
+
+    def test_block_rows_reports_later_row_mismatch(self):
+        from block_fp8_aiter_compare import check_block_rows
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "inputs").mkdir()
+            (root / "outputs").mkdir()
+            (root / "inputs/reference.json").write_text(json.dumps(dict(batch=2, stages=[])))
+            (root / "measurement.json").write_text(json.dumps(dict(batch=2, tp=1, scope="single-block-decode")))
+            ref = torch.ones((2, 2), dtype=torch.bfloat16)
+            (root / "inputs/reference.bf16").write_bytes(ref.view(torch.uint8).numpy().tobytes())
+            value = torch.ones((3, 2), dtype=torch.bfloat16)
+            value[1] *= 2
+            (root / "outputs/rank0.act.xnext.bin").write_bytes(value.view(torch.uint8).numpy().tobytes())
+            args = SimpleNamespace(capture=root, tp=1, live_prefix=True, output=root / "result.json")
+            with patch("builtins.print"):
+                self.assertEqual(check_block_rows(args), 1)
+            result = json.loads(args.output.read_text())
+            self.assertEqual(result["cases"][0]["row_changed_elements"], [0, 2])
+            self.assertEqual(result["cases"][0]["row_relative_l2"], [0., 1.])
+
+    def test_router_reference_weight_binding(self):
+        from block_fp8_aiter_compare import router_reference_weights
+        ids = torch.tensor([[1, 2]], dtype=torch.int32)
+        weights = torch.tensor([[0.5, 1.5]], dtype=torch.float32)
+        routed = dict(ids=ids.tolist(), weights=weights.tolist(),
+            weights_sha256=tensor_digest(weights), repeat_bitwise=True)
+        report = dict(vllm_version="0.29.0", cases=[dict(rank=0, input_sha256="x",
+            native_routes_sha256="routes", logits_repeat_bitwise=True,
+            comparisons=dict(reference_logits=routed))])
+        self.assertTrue(torch.equal(router_reference_weights(report, 0, "x", "routes", ids), weights))
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            router_reference_weights(report, 0, "changed", "routes", ids)
+        with self.assertRaisesRegex(ValueError, "ordered"):
+            router_reference_weights(report, 0, "x", "routes", ids.flip(1))
+        routed["weights"][0][0] = 0.25
+        with self.assertRaisesRegex(ValueError, "hashed"):
+            router_reference_weights(report, 0, "x", "routes", ids)
+
+    def test_router_loaded_precision_contract(self):
+        from block_fp8_aiter_compare import router_contract
+        config = dict(architectures=["GlmMoeDsaForCausalLM"], scoring_func="sigmoid",
+            n_group=1, topk_group=1, num_experts_per_tok=8, n_routed_experts=256,
+            hidden_size=6144, norm_topk_prob=True, routed_scaling_factor=2.5)
+        prefix = "model.layers.6.mlp.gate"
+        gate = dict(class_name="vllm.model_executor.layers.fused_moe.router.gate_linear.GateLinear",
+            attributes=dict(out_dtype="torch.float32"), tensors=dict(
+                weight=dict(dtype="torch.bfloat16", shape=[256, 6144]),
+                e_score_correction_bias=dict(dtype="torch.float32")))
+        inventory = dict(ranks=[dict(rank=0, modules={prefix: gate})])
+        self.assertEqual(router_contract(config, inventory, 1, 6), prefix)
+        with self.assertRaisesRegex(ValueError, "ranks"):
+            router_contract(config, inventory, 2, 6)
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            router_contract(dict(config, n_group=8), inventory, 1, 6)
+        gate["attributes"]["out_dtype"] = "torch.bfloat16"
+        with self.assertRaisesRegex(ValueError, "precision"):
+            router_contract(config, inventory, 1, 6)
+
+    def test_mlp_combine_live_prefix_and_corrupt_output(self):
+        from block_fp8_aiter_compare import check_mlp_combine
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "inputs").mkdir()
+            (root / "outputs").mkdir()
+            (root / "inputs/reference.json").write_text(json.dumps(dict(batch=1)))
+            (root / "inputs/reference.bf16").write_bytes(bytes(4))
+            (root / "measurement.json").write_text(json.dumps(dict(
+                batch=1, tp=2, scope="single-block-decode")))
+            for rank in range(2):
+                for name, value in dict(shared=1, part=2, attn=6, xmid=1, xnext=7).items():
+                    tensor = torch.tensor([[value, value], [99, 99]], dtype=torch.bfloat16)
+                    (root / f"outputs/rank{rank}.act.{name}.bin").write_bytes(
+                        tensor.view(torch.uint8).numpy().tobytes())
+            args = SimpleNamespace(capture=root, tp=2, live_prefix=True, output=root / "result.json")
+            with patch("builtins.print"):
+                self.assertEqual(check_mlp_combine(args), 0)
+                report = json.loads(args.output.read_text())
+                self.assertEqual(report["shape"], [1, 2])
+                self.assertFalse(report["precision_qualified"])
+                (root / "outputs/rank1.act.xnext.bin").write_bytes(bytes(8))
+                self.assertEqual(check_mlp_combine(args), 1)
+                args.live_prefix = False
+                with self.assertRaises(ValueError):
+                    check_mlp_combine(args)
+
+    def test_mlp_combine_rounds_rank_partials_before_tp(self):
+        from block_fp8_aiter_compare import mlp_combine_replay
+        shared = [torch.tensor([[1.]], dtype=torch.bfloat16)] * 3
+        routed = [torch.tensor([[2 ** -8]], dtype=torch.bfloat16)] * 3
+        self.assertEqual(mlp_combine_replay(shared, routed).item(), 3.)
+        self.assertNotEqual(sum(x.float() for x in shared + routed).bfloat16().item(), 3.)
+        with self.assertRaises(ValueError):
+            mlp_combine_replay(shared, routed[:1])
+        with self.assertRaises(ValueError):
+            mlp_combine_replay([shared[0].float()], routed[:1])
+        with self.assertRaises(ValueError):
+            mlp_combine_replay([torch.full_like(shared[0], float("nan"))], routed[:1])
+
+    def test_routed_reachability_output_hash_binding(self):
+        from block_fp8_aiter_compare import check_routed_reachability
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            total = torch.full((1, 128), 3., dtype=torch.bfloat16)
+            cases = []
+            for slot in range(2):
+                path = root / f"part{slot}.bin"
+                write_case(path, torch.zeros((1, 128), dtype=torch.uint8),
+                    torch.zeros((128, 128), dtype=torch.float8_e4m3fn), torch.ones((1, 1)), torch.ones((1, 1)),
+                    torch.full((1, 128), float(slot + 1), dtype=torch.bfloat16), row_weights=torch.ones(1))
+                cases.append(dict(file=path.name, sha256=load_case(path, weighted=True)[3],
+                    tokens=[0], slots=[slot], finite=True, repeat_bitwise=True))
+            digest = tensor_digest(total)
+            audit = dict(passed=True, audit_complete=True, vllm_version="0.29.0", cases=[dict(rank=0,
+                shape=[1, 128, 128, 2, 2], stable_boundaries_bitwise=True, isolated_weighted_down=cases,
+                boundaries={"stage2.output": dict(plow_sha256=digest, sha256=digest, repeat_sha256=digest)})])
+            reference = root / "reference.json"
+            reference.write_text(json.dumps(audit))
+            for name in ("plow-routed", "reference", "repeat"):
+                (root / f"reference.rank0.{name}.bf16").write_bytes(total.view(torch.uint8).numpy().tobytes())
+            args = SimpleNamespace(reference_json=reference, tp=1, output=root / "result.json")
+            self.assertEqual(check_routed_reachability(args), 0)
+            (root / "reference.rank0.plow-routed.bf16").write_bytes(torch.zeros_like(total).view(torch.uint8).numpy().tobytes())
+            with self.assertRaisesRegex(ValueError, "output provenance mismatch"):
+                check_routed_reachability(args)
+
+    def test_fp16_partial_case_roundtrip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "partial.bin"
+            a = torch.zeros((1, 512), dtype=torch.uint8)
+            w = torch.zeros((128, 512), dtype=torch.float8_e4m3fn)
+            asc, ws = torch.ones((4, 1)), torch.ones((1, 4))
+            expected = torch.full((1, 128), 0.125, dtype=torch.float16)
+            with self.assertRaises(ValueError):
+                write_case(path, a, w, asc, ws, expected)
+            write_case(path, a, w, asc, ws, expected, fp16=True)
+            shape, _, actual, _ = load_case(path, fp16=True)
+            self.assertEqual(shape, (1, 128, 512))
+            self.assertEqual(actual.dtype, torch.float16)
+            self.assertTrue(torch.equal(actual, expected))
+
+    def test_routed_stage1_partials_partition_and_routes(self):
+        from block_fp8_aiter_compare import routed_stage1_partials
+        a = torch.ones((2, 256), dtype=torch.float32)
+        w = torch.ones((2, 128, 256), dtype=torch.float32)
+        w[1] *= 2
+        ids = torch.tensor([[1], [0]])
+        asc, ws = torch.ones((2, 2)), torch.ones((2, 1, 2))
+        parts = routed_stage1_partials(a, asc, w, ws, ids, 2)
+        self.assertEqual(tuple(parts.shape), (2, 2, 128))
+        self.assertTrue(torch.equal(parts[:, 0], torch.full((2, 128), 256.)))
+        self.assertTrue(torch.equal(parts[:, 1], torch.full((2, 128), 128.)))
+        with self.assertRaises(ValueError):
+            routed_stage1_partials(a, asc, w, ws, ids, 3)
+
+    def test_routed_stage1_diagnostic_capture_and_restore(self):
+        from functools import partial
+        from block_fp8_aiter_compare import diagnose_routed_stage1
+        reference = torch.ones((1, 2, 3), dtype=torch.bfloat16)
+        def forward(*operands):
+            operands[6].fill_(operands[0].sum())
+        fm = SimpleNamespace(aiter=SimpleNamespace(ck_moe_stage1_fwd=forward))
+        def wrapper(*operands, splitk):
+            if splitk:
+                fm.aiter.ck_moe_stage1_fwd(*operands[:6], torch.empty((2, 6)))
+            operands[6].fill_(1 if splitk else 3)
+        fm.ck_moe_stage1 = wrapper
+        call = partial(wrapper, torch.ones((1, 24)), *([None] * 5), reference.clone(), splitk=12)
+        with tempfile.TemporaryDirectory() as directory:
+            report = diagnose_routed_stage1(fm, call, reference, reference, Path(directory) / "comparison.json", 0)
+            self.assertTrue(report["preactivation_repeat_bitwise"])
+            self.assertTrue(report["partials_repeat_bitwise"])
+            self.assertTrue(report["partials_sum"]["bitwise"])
+            self.assertEqual(report["tensors"]["split"]["reference_changed_elements"], 0)
+            self.assertEqual(report["tensors"]["unsplit"]["reference_changed_elements"], 6)
+        self.assertIs(fm.aiter.ck_moe_stage1_fwd, forward)
+        def fail(*operands):
+            raise RuntimeError("capture failed")
+        fm.aiter.ck_moe_stage1_fwd = fail
+        with self.assertRaisesRegex(RuntimeError, "capture failed"):
+            diagnose_routed_stage1(fm, call, reference, reference, Path("unused.json"), 0)
+        self.assertIs(fm.aiter.ck_moe_stage1_fwd, fail)
+
+    def test_model_block_layer_from_bound_cache_files(self):
+        from block_fp8_aiter_compare import captured_block_layer
+        self.assertEqual(captured_block_layer({"files": {"kv.6.ckv.bin": "hash"}}), 6)
+        for files in ({}, {"kv.6.ckv.bin": "x", "kv.7.ckv.bin": "y"}):
+            with self.assertRaises(ValueError):
+                captured_block_layer({"files": files})
+
+    def test_live_prefix_is_explicit_and_rejects_short_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "activation.bin"
+            path.write_bytes(struct.pack("<4f", 1, 2, 3, 4))
+            with self.assertRaises(ValueError):
+                load_tensor(path, torch.float32, (1, 2))
+            value, _ = load_tensor(path, torch.float32, (1, 2), live_prefix=True)
+            self.assertEqual(value.tolist(), [[1, 2]])
+            with self.assertRaises(ValueError):
+                load_tensor(path, torch.float32, (1, 5), live_prefix=True)
+
+    def test_bf16_order_reachability(self):
+        from block_fp8_aiter_compare import bf16_order_reachability
+        parts = torch.tensor([[[256., 1.], [1., 256.], [-256., -256.]]], dtype=torch.bfloat16)
+        result = bf16_order_reachability(parts, torch.tensor([[1., 0.]], dtype=torch.bfloat16))
+        self.assertTrue(result["elementwise_reachable"])
+        result = bf16_order_reachability(parts, torch.tensor([[0.5, 0.]], dtype=torch.bfloat16))
+        self.assertEqual(result["unreachable_count"], 1)
+        self.assertEqual(result["permutations_checked"], 6)
+        with self.assertRaises(ValueError):
+            bf16_order_reachability(parts, torch.zeros(1, 2))
+
+    def test_model_attention_fixture_compacts_pages_without_reordering_tokens(self):
+        from block_fp8_aiter_compare import export_model_attention_fixture
+        query = torch.arange(8 * 576).reshape(1, 8, 576).bfloat16().repeat_interleave(2, 1)
+        cache = torch.arange(3 * 16 * 576).reshape(3, 16, 576).bfloat16()
+        values = dict(query=query, cache=cache, block_table=torch.tensor([[2, 0]], dtype=torch.int32),
+            work_indptr=torch.ones(257, dtype=torch.int32), reduce_indptr=torch.tensor([0, 1, 1]),
+            qo_indptr=torch.tensor([0, 1]), paged_kv_indptr=torch.tensor([0, 17]),
+            paged_kv_last_page_len=torch.tensor([1]), work_info_set=torch.zeros((8447, 8), dtype=torch.int32),
+            reduce_final_map=torch.zeros((8192, 2), dtype=torch.int32),
+            reduce_partial_map=torch.arange(510, dtype=torch.int32))
+        indices = torch.arange(16, -1, -1, dtype=torch.int32)[None]
+        reference = torch.ones((1, 8, 512), dtype=torch.bfloat16)
+        with patch.object(torch.Tensor, "cuda", lambda self: self), \
+                patch("block_fp8_aiter_compare.export_attention_ps_case", return_value={}) as export:
+            export_model_attention_fixture(Path("fixture.bin"), values, indices, reference, 17)
+        _, q, kv, md, output, scale = export.call_args.args
+        self.assertTrue(torch.equal(q, query))
+        self.assertTrue(torch.equal(kv[0], torch.cat((cache[2], cache[0, :1]))))
+        self.assertTrue(torch.equal(md.paged_kv_indices, indices[0]))
+        self.assertEqual(md.work_info_set.shape, (257, 8))
+        self.assertEqual(md.reduce_indptr.tolist(), [0, 1])
+        self.assertEqual(md.reduce_final_map.shape, (1, 2))
+        self.assertEqual(md.reduce_partial_map.shape, (257,))
+        self.assertTrue(torch.equal(output, reference.repeat_interleave(2, 1)))
+        self.assertEqual(scale, 0.0625)
+
+    def test_attention_selection_mapping_preserves_order_and_checks_bounds(self):
+        from block_fp8_aiter_compare import attention_physical_indices
+        indices = torch.arange(2047, -1, -1, dtype=torch.int32)[None]
+        table = torch.arange(127, -1, -1, dtype=torch.int32)[None]
+        before = indices.clone(), table.clone()
+        result = attention_physical_indices(indices, table, 2048, 2048)
+        expected = table[0][indices[0].long() // 16] * 16 + indices[0] % 16
+        self.assertTrue(torch.equal(result, expected))
+        self.assertTrue(torch.equal(indices, before[0]))
+        self.assertTrue(torch.equal(table, before[1]))
+        duplicate = indices.clone()
+        duplicate[0, 1] = duplicate[0, 0]
+        bad_page = table.clone()
+        bad_page[0, 0] = 128
+        for chosen, pages, length, capacity in (
+                (indices.long(), table, 2048, 2048), (duplicate, table, 2048, 2048),
+                (indices, table, 2047, 2048), (indices, table[:, :-1], 2048, 2048),
+                (indices, bad_page, 2048, 2048), (indices, table, 2048, 2047)):
+            with self.assertRaises(ValueError):
+                attention_physical_indices(chosen, pages, length, capacity)
+
+    def test_attention_metadata_rebinds_addresses_without_changing_partition(self):
+        from block_fp8_aiter_compare import rebind_attention_work_metadata
+        pointers = torch.arange(257, dtype=torch.int32)
+        work = torch.arange(256 * 8, dtype=torch.int32).reshape(256, 8)
+        before = pointers.clone(), work.clone()
+        result = rebind_attention_work_metadata(pointers, work)
+        self.assertEqual(result.dtype, torch.uint64)
+        self.assertEqual(result.tolist(), [pointers.data_ptr(), work.data_ptr()])
+        self.assertTrue(torch.equal(pointers, before[0]))
+        self.assertTrue(torch.equal(work, before[1]))
+        for ptr, info in ((pointers.long(), work), (pointers[:-1], work),
+                          (pointers, work[:, :7]), (pointers, work.t())):
+            with self.assertRaisesRegex(ValueError, "invalid captured attention work buffers"):
+                rebind_attention_work_metadata(ptr, info)
+
     def test_model_cache_compaction_preserves_packed_pages(self):
         from block_fp8_aiter_compare import compact_indexer_model_cache
         cache = torch.arange(3 * 16 * 132, dtype=torch.int32).to(torch.uint8).reshape(3, 16, 132)
@@ -469,6 +829,8 @@ class CaptureTests(unittest.TestCase):
         inventory = dict(ranks=[dict(modules={"model.layers.0.self_attn.rotary_emb": copy.deepcopy(module)})
                                 for _ in range(8)])
         self.assertEqual(rope_capture_contract(meta, cfg, inventory, 8), (16, 512, 3))
+        self.assertEqual(rope_capture_contract(dict(batch=8, ctx=8193,
+            files={"kv.6.ckv.bin": "digest"}), cfg, inventory, 8), (8, 8193, 6))
         for field, value in (("dtype", "torch.float32"), ("device_type", "cpu"),
                              ("shape", [512, 64]), ("stride", [1, 1048576])):
             wrong = copy.deepcopy(inventory)
@@ -617,6 +979,9 @@ class CaptureTests(unittest.TestCase):
         indices = torch.full((2, 2048), -1, dtype=torch.int32)
         indices[:, :3] = torch.tensor([[2, 0, 1], [1, 2, 0]])
         self.assertEqual(sparse_decode_indices(indices, 3).tolist(), [2, 0, 1, 4, 5, 3])
+        self.assertEqual(sparse_decode_indices(indices, 3, 16).tolist(), [2, 0, 1, 17, 18, 16])
+        with self.assertRaises(ValueError):
+            sparse_decode_indices(indices, 3, 2)
         for where, value in (((0, 0), -1), ((0, 0), 3), ((0, 0), 0), ((0, 3), 0)):
             bad = indices.clone()
             bad[where] = value
@@ -873,6 +1238,15 @@ class CaptureTests(unittest.TestCase):
             args = SimpleNamespace(capture=root, checkpoint=root, reference_json=root / "audit.json",
                                    output=root / "pass.json", tp=1)
             self.assertEqual(check_qkva(args), 0)
+            activation = root / "outputs/rank0.act.krr.bin"
+            live = activation.read_bytes()
+            activation.write_bytes(live + bytes(len(live)))
+            with self.assertRaises(ValueError):
+                check_qkva(args)
+            args.live_prefix = True
+            args.output = root / "prefix.json"
+            self.assertEqual(check_qkva(args), 0)
+            activation.write_bytes(live)
             write(root / "outputs/rank0.act.krr.bin", out[:, 256:] * 2)
             args.output = root / "fail.json"
             self.assertEqual(check_qkva(args), 1)
@@ -1365,6 +1739,26 @@ class CaptureTests(unittest.TestCase):
             self.assertTrue(all(row["checkpoint_weight_bitwise"] and row["checkpoint_scale_bitwise"]
                                 for row, _ in cases))
             self.assertEqual(cases[1][1][4].tolist(), [[2.0]])
+            measurement = dict(tp=2, batch=2, scope="single-block-decode", oracle_verified=False)
+            (root / "measurement.json").write_text(json.dumps(measurement))
+            with self.assertRaises(ValueError):
+                list(packet_oproj_cases(root, checkpoint, 2))
+            diagnostic = list(packet_oproj_cases(root, checkpoint, 2, diagnostic=True))
+            self.assertTrue(all(row["block_oracle_verified"] is False for row, _ in diagnostic))
+            activation = root / "outputs/rank1.act.og_tp.bin"
+            live = activation.read_bytes()
+            activation.write_bytes(live + bytes(len(live)))
+            with self.assertRaises(ValueError):
+                list(packet_oproj_cases(root, checkpoint, 2, diagnostic=True))
+            self.assertEqual(list(packet_oproj_cases(root, checkpoint, 2,
+                diagnostic=True, live_prefix=True))[1][1][-1].shape, (2, 128))
+            activation.write_bytes(live)
+            measurement["oracle_verified"] = "false"
+            (root / "measurement.json").write_text(json.dumps(measurement))
+            with self.assertRaises(ValueError):
+                list(packet_oproj_cases(root, checkpoint, 2, diagnostic=True))
+            measurement["oracle_verified"] = True
+            (root / "measurement.json").write_text(json.dumps(measurement))
             wrong_scale = root / "outputs" / f"rank1.{name}_scale_inv.bin"
             wrong_scale.write_bytes(struct.pack("<f", 1.0))
             self.assertFalse(list(packet_oproj_cases(root, checkpoint, 2))[1][0]["checkpoint_scale_bitwise"])

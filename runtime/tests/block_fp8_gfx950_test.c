@@ -1429,7 +1429,7 @@ static void run_a8w8_block(plow_hsa* h, plow_hsa_kernel* kernel, unsigned M, uns
 }
 
 static void replay_a8w8(plow_hsa* h, plow_hsa_kernel* kernel, const char* input, const char* output,
-                        unsigned glu, unsigned weighted, unsigned n_first, unsigned n_second) {
+                        unsigned glu, unsigned weighted, unsigned n_first, unsigned n_second, unsigned half_out) {
     FILE* f = fopen(input, "rb");
     uint32_t dims[3];
     if (!f || fread(dims, sizeof(dims), 1, f) != 1) exit(1);
@@ -1500,7 +1500,11 @@ static void replay_a8w8(plow_hsa* h, plow_hsa_kernel* kernel, const char* input,
         double error = 0, norm = 0;
         for (unsigned n = 0; n < N; n++) {
             const size_t i = (size_t)m * N + n;
-            const double got = bf2f(out[i]), want = bf2f(((bf16*)host[4])[i]);
+            _Float16 half_got, half_want;
+            memcpy(&half_got, &out[i], 2);
+            memcpy(&half_want, &((bf16*)host[4])[i], 2);
+            const double got = half_out ? (double)half_got : bf2f(out[i]);
+            const double want = half_out ? (double)half_want : bf2f(((bf16*)host[4])[i]);
             finite &= isfinite(got) && isfinite(want);
             changed += out[i] != ((bf16*)host[4])[i];
             error += (got - want) * (got - want);
@@ -1512,7 +1516,7 @@ static void replay_a8w8(plow_hsa* h, plow_hsa_kernel* kernel, const char* input,
     }
     f = fopen(output, "wbx");
     if (!f || fwrite(out, 1, sizes[4], f) != sizes[4] || fclose(f)) exit(1);
-    const int ok = finite && stable && worst < 0.004;
+    const int ok = finite && stable && (half_out ? changed == 0 : worst < 0.004);
     printf("replay %s M=%u N=%u K=%u %s changed=%zu repeat-bitwise=%d max-row-rel-L2=%.10g\n",
            input, M, N, K, ok ? "PASS" : "FAIL", changed, stable, worst);
     fails += !ok;
@@ -2584,6 +2588,16 @@ int main(int argc, char** argv) {
         free(co);
         return fails ? 1 : 0;
     }
+    if (argc > 2 && strcmp(argv[2], "a8w8-m16-f16-replay") == 0) {
+        if (argc < 5 || (argc - 3) % 2) { fprintf(stderr, "FP16 replay requires input/output pairs\n"); return 1; }
+        plow_hsa_kernel kernel;
+        check_hsa(plow_hsa_get_kernel(h, 0, "gemm_a8w8_block128_m16_f16", &kernel));
+        for (int arg = 3; arg < argc; arg += 2)
+            replay_a8w8(h, &kernel, argv[arg], argv[arg + 1], 0, 0, 0, 0, 1);
+        plow_hsa_shutdown(h);
+        free(co);
+        return fails ? 1 : 0;
+    }
     if (argc > 2 && (strcmp(argv[2], "a8w8-replay") == 0 || strcmp(argv[2], "a8w8-m16-replay") == 0
                     || strcmp(argv[2], "a8w8-m16-qkv-replay") == 0
                     || strcmp(argv[2], "a8w8-m16-glu-replay") == 0
@@ -2598,7 +2612,7 @@ int main(int argc, char** argv) {
             split ? "gemm_qkv_a8w8_block128_m16" : strcmp(argv[2], "a8w8-m16-replay") == 0 ? "gemm_a8w8_block128_m16" : "gemm_a8w8_block128", &kernel));
         replay_a8w8(h, &kernel, argv[3], argv[4], glu, weighted,
                      split ? (unsigned)strtoul(argv[5], NULL, 10) : 0,
-                     split ? (unsigned)strtoul(argv[6], NULL, 10) : 0);
+                     split ? (unsigned)strtoul(argv[6], NULL, 10) : 0, 0);
         plow_hsa_shutdown(h);
         free(co);
         return fails ? 1 : 0;

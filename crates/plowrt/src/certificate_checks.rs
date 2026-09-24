@@ -201,7 +201,7 @@ mod tests {
         let mut receipts = PacketCheckReceipts { schema:1,packet_sha256:image_sha256(&raw),
             compiler_sha256:"a".repeat(64),checks:vec![CompileCheckReceipt {
                 program:Some(0),scope:SemanticScope::SelectedGemmPolicy,checkpoint:"R".into(),
-                request_sha256:image_sha256(&serde_json::to_vec(&request).unwrap()),
+                request_sha256:plow_asset::certificates::request_sha256(&request).unwrap(),
                 verifier_sha256:verifier,request,response:serde_json::to_value(cert).unwrap(),
             }] };
         let directory = std::env::temp_dir().join(format!("plow-gemm-receipts-{}",std::process::id()));
@@ -257,7 +257,7 @@ mod tests {
         let mut receipts = PacketCheckReceipts { schema:1,packet_sha256:image_sha256(&raw),
             compiler_sha256:"a".repeat(64), checks:vec![CompileCheckReceipt {
                 program:Some(0),scope:SemanticScope::LogicalTensorEffects,checkpoint:"D".into(),
-                request_sha256:image_sha256(&serde_json::to_vec(&request).unwrap()),
+                request_sha256:plow_asset::certificates::request_sha256(&request).unwrap(),
                 verifier_sha256:verifier,request,response:serde_json::to_value(cert).unwrap(),
             }] };
         let directory = std::env::temp_dir().join(format!("plow-effects-receipts-{}",std::process::id()));
@@ -309,7 +309,7 @@ mod tests {
             program: Some(0),
             scope: SemanticScope::CoarseDependencyPreservation,
             checkpoint: "D".into(),
-            request_sha256: image_sha256(&serde_json::to_vec(&request).unwrap()),
+            request_sha256: plow_asset::certificates::request_sha256(&request).unwrap(),
             verifier_sha256: lean_verify::verifier_sha256().unwrap(),
             request,
             response: serde_json::to_value(cert).unwrap(),
@@ -330,7 +330,7 @@ mod tests {
             program: None,
             scope: SemanticScope::MeasuredPolicy,
             checkpoint: "R".into(),
-            request_sha256: image_sha256(&serde_json::to_vec(&policy).unwrap()),
+            request_sha256: plow_asset::certificates::request_sha256(&policy).unwrap(),
             verifier_sha256: lean_verify::verifier_sha256().unwrap(),
             request: policy,
             response: serde_json::to_value(cert).unwrap(),
@@ -345,7 +345,7 @@ mod tests {
         assert!(cert.ok);
         receipts.checks.push(CompileCheckReceipt {
             program:None,scope:SemanticScope::RewriteBodyExpansion,checkpoint:"A".into(),
-            request_sha256:image_sha256(&serde_json::to_vec(&rewrite).unwrap()),
+            request_sha256:plow_asset::certificates::request_sha256(&rewrite).unwrap(),
             verifier_sha256:lean_verify::verifier_sha256().unwrap(),request:rewrite,
             response:serde_json::to_value(cert).unwrap(),
         });
@@ -371,16 +371,16 @@ mod tests {
                 4 => {
                     bad.checks[0].request["protocol"]["waits"] = json!([[], []]);
                     bad.checks[0].request_sha256 =
-                        image_sha256(&serde_json::to_vec(&bad.checks[0].request).unwrap());
+                        plow_asset::certificates::request_sha256(&bad.checks[0].request).unwrap();
                 }
                 5 => {
                     bad.checks[1].request["choices"][0]["key"] = json!("baseline");
                     bad.checks[1].request_sha256 =
-                        image_sha256(&serde_json::to_vec(&bad.checks[1].request).unwrap());
+                        plow_asset::certificates::request_sha256(&bad.checks[1].request).unwrap();
                 }
                 _ => {
                     bad.checks[2].request["bodies"][0]["rhs"][2][4][1] = json!("changed_out");
-                    bad.checks[2].request_sha256 = image_sha256(&serde_json::to_vec(&bad.checks[2].request).unwrap());
+                    bad.checks[2].request_sha256 = plow_asset::certificates::request_sha256(&bad.checks[2].request).unwrap();
                 }
             }
             write(&bad);
@@ -444,7 +444,7 @@ mod tests {
                 program: Some(0),
                 scope: SemanticScope::LayoutMapping,
                 checkpoint: "L".into(),
-                request_sha256: image_sha256(&serde_json::to_vec(&request).unwrap()),
+                request_sha256: plow_asset::certificates::request_sha256(&request).unwrap(),
                 verifier_sha256: lean_verify::verifier_sha256().unwrap(),
                 request,
                 response: serde_json::to_value(response).unwrap(),

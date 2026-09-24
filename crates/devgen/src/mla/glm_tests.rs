@@ -643,6 +643,229 @@ fn dense_prefill_rungs_populate_keys_for_sparse_decode() {
     }
 }
 
+#[test]
+fn dense_mxfp4_rows_use_direct_gemm_and_sized_scratch() {
+    let _guard = crate::test_env::env_guard();
+    crate::with_emit_target_amd(true, || {
+        let mut c = glm_ref_cfg();
+        c.tp = 8;
+        for rows in [8, 128, 8192] {
+            let mut decl = Builder::new(256);
+            let n = declare_glm_rows_batched(&mut decl, &c, 81920, &[0], rows, rows, MoeEnc::Mxfp4);
+            let di_l = c.dense_inter / c.tp;
+            assert_eq!(decl.tensors()[n.dfu as usize].bytes, u64::from(rows * di_l) * BF16);
+            assert_eq!(decl.tensors()[n.dfu_up as usize].bytes, u64::from(rows * di_l) * BF16);
+            let mut b = Builder::new(256);
+            b.adopt_tensors(decl.tensors());
+            let all = b.all();
+            let root = b.emit(DevOp::ZeroF32, all.clone(), &[], |d| {
+                d.t[0] = n.part;
+                d.i[..2].copy_from_slice(&[rows, c.hidden]);
+            });
+            emit_glm_dense_mxfp4_rows(
+                &mut b, &c, &n, 0, rows, n.xnext, root, &mut 0, &all, true, false,
+            );
+            let p = b.finish();
+            assert!(!p.insts.iter().any(|d| matches!(d.op,
+                x if x == DevOp::MoeAlignPf as u16
+                    || x == DevOp::MoeGroupGluPf as u16
+                    || x == DevOp::MoeGroupDownPf as u16)));
+            let down = p.insts.iter().find(|d| d.t[2] == n.lw[0].ddown).unwrap();
+            assert_eq!((down.t[0], down.t[1], down.t[3]),
+                (n.dg_tp, n.dfu, n.lw[0].ddown_s));
+            assert_eq!(down.i[..3], [rows, c.hidden, di_l]);
+            assert!(p.insts.iter().any(|d| d.op == DevOp::GemmGluMxfp4 as u16
+                || d.op == DevOp::Glu as u16));
+        }
+    });
+}
+
+#[test]
+fn dense_mxfp4_full_block_has_prefill_and_batched_decode() {
+    let _guard = crate::test_env::env_guard();
+    crate::with_emit_target_amd(true, || {
+        let mut c = glm_ref_cfg();
+        c.tp = 8;
+        let (m, _) = glm_build_block_pf_rungs(
+            &c, 8192, 256, 0..1, false, "glm-ref", MlaArch::Glm,
+            &[128], PrefillScope::Full, MoeEnc::Mxfp4, &[1, 8],
+        );
+        assert_eq!(m.prog_t, [128, 1, 8]);
+        for (p, &rows) in m.progs.iter().zip(&m.prog_t) {
+            if rows == 1 { continue; }
+            assert!(p.insts.iter().any(|d| d.t[2] == m.tensors.iter()
+                .position(|t| t.name == "model.layers.0.mlp.down_proj.weight")
+                .unwrap() as u32));
+            assert!(!p.insts.iter().any(|d| d.op == DevOp::MoeGroupDownPf as u16));
+        }
+    });
+}
+
+#[test]
+fn quark_mixed_packet_keeps_attention_bf16_and_ffn_mxfp4() {
+    let _guard = crate::test_env::env_guard();
+    crate::with_emit_target_amd(true, || {
+        let mut c = glm_ref_cfg();
+        c.tp = 8;
+        c.quark_mixed = true;
+        let (m, _) = glm_build_block_pf_rungs(
+            &c, 8192, 256, 0..1, false, "glm-quark", MlaArch::Glm,
+            &[128], PrefillScope::Full, MoeEnc::Mxfp4, &[1, 8],
+        );
+        let find = |name: &str| m.tensors.iter().position(|t| t.name == name).unwrap();
+        let q_a = find("model.layers.0.self_attn.q_a_proj.weight");
+        let q_absorb = find("model.layers.0.self_attn.derived.q_absorb.weight");
+        let o = find("model.layers.0.self_attn.o_proj.weight");
+        let gate = find("model.layers.0.mlp.gate_proj.weight");
+        let gate_scale = find("model.layers.0.mlp.gate_proj.weight_scale");
+        let dense_table = find("model.layers.0.mlp.dense_weight_table");
+        let scale_table = find("model.layers.0.mlp.dense_scale_table");
+        assert_eq!(m.tensors[q_a].bytes, 2048 * 6144 * BF16);
+        assert_eq!(m.tensors[q_absorb].bytes, 8 * 512 * 2048 * BF16);
+        assert_eq!(m.tensors[o].bytes, 6144 * 8 * 256 * BF16);
+        assert_eq!(m.tensors[gate].bytes, 1536 * 6144 / 2);
+        assert_eq!(m.tensors[gate_scale].bytes, 1536 * 6144 / 32);
+        assert!(!m.tensors.iter().any(|t| t.name.starts_with("model.layers.0.self_attn.")
+            && t.name.ends_with(".weight_scale")));
+        for p in &m.progs {
+            assert!(p.insts.iter().any(|d| d.t.contains(&(q_a as u32))));
+            assert!(!p.insts.iter().any(|d| d.t.contains(&(q_a as u32))
+                && format!("{:?}", DevOp::from_u16(d.op)).contains("Mxfp4")));
+        }
+        assert_eq!(m.prog_t, vec![128, 1, 8]);
+        assert!(m.progs[1].insts.iter().any(|d| d.t.contains(&(gate as u32))));
+        for p in [&m.progs[0], &m.progs[2]] {
+            assert!(p.insts.iter().any(|d| d.op == DevOp::MoeGroupGluPf as u16
+                && d.t[2] == dense_table as u32 && d.t[3] == scale_table as u32
+                && d.t[7] != TENSOR_NONE && d.i[MoeEnc::PREFILL_SLOT] == MoeEnc::Mxfp4.code()));
+            assert!(p.insts.iter().any(|d| d.op == DevOp::MoeGroupDownPf as u16
+                && d.t[2] == dense_table as u32 && d.t[3] == scale_table as u32
+                && d.t[5] != TENSOR_NONE && d.i[MoeEnc::PREFILL_SLOT] == MoeEnc::Mxfp4.code()));
+        }
+        let (moe, _) = glm_build_block_pf_rungs(
+            &c, 8192, 256, 3..4, false, "glm-quark", MlaArch::Glm,
+            &[128], PrefillScope::Full, MoeEnc::Mxfp4, &[1, 8],
+        );
+        let router = moe.tensors.iter().position(|t| t.name == "model.layers.3.mlp.gate.weight").unwrap();
+        assert_eq!(moe.tensors[router].bytes, 256 * 6144 * BF16);
+        assert!(!moe.tensors.iter().any(|t| t.name == "model.layers.3.mlp.gate.weight_scale"));
+        for p in &moe.progs {
+            assert!(p.insts.iter().any(|d| d.op == DevOp::GemmF32 as u16
+                && d.t[2] == router as u32));
+        }
+    });
+}
+
+#[test]
+fn quark_mixed_oproj_w8a8_keeps_mxfp4_ffn() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[("PLOW_GLM_OPROJ_W8A8", "1")]);
+    crate::with_emit_target_amd(true, || {
+        let mut c = glm_ref_cfg();
+        c.tp = 8;
+        c.quark_mixed = true;
+        let (m, _) = glm_build_block_pf_rungs(
+            &c, 8192, 256, 0..1, false, "glm-quark", MlaArch::Glm,
+            &[128], PrefillScope::Full, MoeEnc::Mxfp4, &[1, 8],
+        );
+        let tensor = |name: &str| m.tensors.iter().position(|t| t.name == name).unwrap() as u32;
+        let weight = tensor("model.layers.0.self_attn.o_proj.weight_fp8");
+        let scale = tensor("model.layers.0.self_attn.o_proj.weight_scale_inv");
+        let gate = tensor("model.layers.0.mlp.gate_proj.weight");
+        assert_eq!(m.tensors[weight as usize].bytes, 6144 * 8 * 256);
+        assert_eq!(m.tensors[scale as usize].bytes, 48 * 16 * F32);
+        assert_eq!(m.tensors[gate as usize].bytes, 1536 * 6144 / 2);
+        assert!(!m.tensors.iter().any(|t| t.name == "model.layers.0.self_attn.o_proj.weight"));
+        for p in &m.progs {
+            assert!(p.insts.iter().any(|d| matches!(DevOp::from_u16(d.op),
+                Some(DevOp::GemmFp8Block128 | DevOp::GemmFp8Block128Split4))
+                && d.t[2] == weight && d.t[4] == scale));
+        }
+    });
+}
+
+#[test]
+fn quark_mixed_qkva_w8a8_keeps_mxfp4_ffn() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[("PLOW_GLM_QKVA_W8A8", "1")]);
+    crate::with_emit_target_amd(true, || {
+        let mut c = glm_ref_cfg();
+        c.tp = 8;
+        c.quark_mixed = true;
+        let (m, _) = glm_build_block_pf_rungs(
+            &c, 8192, 256, 0..1, false, "glm-quark", MlaArch::Glm,
+            &[128], PrefillScope::Full, MoeEnc::Mxfp4, &[1, 8],
+        );
+        let tensor = |name: &str| m.tensors.iter().position(|t| t.name == name).unwrap() as u32;
+        let weight = tensor("model.layers.0.self_attn.fused_qkv_a_proj.weight_fp8");
+        let scale = tensor("model.layers.0.self_attn.fused_qkv_a_proj.weight_scale_inv");
+        let gate = tensor("model.layers.0.mlp.gate_proj.weight");
+        assert_eq!(m.tensors[weight as usize].bytes, 2624 * 6144);
+        assert_eq!(m.tensors[scale as usize].bytes, 21 * 48 * F32);
+        assert_eq!(m.tensors[gate as usize].bytes, 1536 * 6144 / 2);
+        for p in &m.progs {
+            assert!(p.insts.iter().any(|d| d.op == DevOp::GemmFp8Block128 as u16
+                && d.t[2] == weight && d.t[4] == scale));
+        }
+    });
+}
+
+#[test]
+fn quark_mxfp4_shared_decode_rows16_split_with_scale_rows() {
+    let _guard = crate::test_env::env_guard();
+    crate::with_emit_target_amd(true, || {
+        let mut c = glm_ref_cfg();
+        c.tp = 8;
+        c.quark_mixed = true;
+        let (m, _) = glm_build_block_pf_rungs(
+            &c, 8192, 256, 3..4, false, "glm-quark", MlaArch::Glm,
+            &[128], PrefillScope::Full, MoeEnc::Mxfp4, &[1, 8, 16],
+        );
+        let tensor = |name: &str| m.tensors.iter().position(|t| t.name == name).unwrap() as u32;
+        let gate = tensor("model.layers.3.mlp.shared_experts.gate_proj.weight");
+        let up = tensor("model.layers.3.mlp.shared_experts.up_proj.weight");
+        let gate_scale = tensor("model.layers.3.mlp.shared_experts.gate_proj.weight_scale");
+        let up_scale = tensor("model.layers.3.mlp.shared_experts.up_proj.weight_scale");
+        let p8 = &m.progs[m.prog_t.iter().position(|&t| t == 8).unwrap()];
+        assert!(p8.insts.iter().any(|d| d.op == DevOp::GemvGluMxfp4 as u16
+            && d.t[2] == gate && d.t[5] == up));
+        let p16 = &m.progs[m.prog_t.iter().position(|&t| t == 16).unwrap()];
+        let half = |weight, scale| p16.insts.iter().find(|d| d.op == DevOp::GemvMxfp4 as u16
+            && d.t[2] == weight && d.t[3] == scale).unwrap();
+        let (gate_out, up_out) = (half(gate, gate_scale).t[0], half(up, up_scale).t[0]);
+        assert!(p16.insts.iter().any(|d| d.op == DevOp::Glu as u16
+            && d.t[0] == gate_out && d.t[1] == gate_out && d.t[2] == up_out
+            && d.i[0] == 16 * (c.moe_inter / c.tp)));
+        assert!(!p16.insts.iter().any(|d| d.op == DevOp::GemvGluMxfp4 as u16
+            && d.t[2] == gate));
+    });
+}
+
+#[test]
+fn dense_mxfp4_prefill_keeps_sequence_parallel_seam() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[("PLOW_GLM_SEQ_PAR", "1")]);
+    crate::with_emit_target_amd(true, || {
+        let mut c = glm_ref_cfg();
+        c.tp = 8;
+        let rows = 8192;
+        let mut decl = Builder::new(256);
+        let n = declare_glm_rows_batched(&mut decl, &c, 81920, &[0], rows, 8, MoeEnc::Mxfp4);
+        let mut b = Builder::new(256);
+        b.adopt_tensors(decl.tensors());
+        let all = b.all();
+        let root = b.emit(DevOp::ZeroF32, all.clone(), &[], |d| {
+            d.t[0] = n.part;
+            d.i[..2].copy_from_slice(&[rows, c.hidden]);
+        });
+        emit_glm_dense_mxfp4_rows(
+            &mut b, &c, &n, 0, rows, n.xnext, root, &mut 0, &all, true, false,
+        );
+        let p = b.finish();
+        assert!(p.insts.iter().any(|d| d.op == DevOp::XReduceScatter as u16));
+    });
+}
+
 /// The real GLM-5.2-FP8 config dims. `layers` is trimmed — the single
 /// block only touches one layer.
 fn glm_ref_cfg() -> GlmCfg {
@@ -681,6 +904,7 @@ fn glm_ref_cfg() -> GlmCfg {
         indexer_full: vec![true, true, true, false],
         softmax_layers: vec![],
         has_dsa: true,
+        quark_mixed: false,
     }
 }
 
@@ -1057,20 +1281,20 @@ fn glm_dcp_stages_writes_and_reads_the_owner_gather() {
     let ctx = 81920;
     let xr: Vec<u32> = (0..256).collect();
     let mut declarations = Builder::new(256);
-    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 16, MoeEnc::Fp8Blk);
+    let n = declare_glm_rows_batched(&mut declarations, &c, ctx, &[3], 8192, 64, MoeEnc::Fp8Blk);
     let tensors = declarations.tensors();
     let local = 10240u64; // ceil(81920 / 64 / 8) pages of 64
     assert_eq!(n.kv_ctx as u64, local);
-    assert_eq!(tensors[n.ckv[0] as usize].bytes, 16 * local * 512);
-    assert_eq!(tensors[n.kv_scale[0] as usize].bytes, 16 * local * 4);
-    assert_eq!(tensors[n.dcp_gckv as usize].bytes, 16 * 2048 * 512);
+    assert_eq!(tensors[n.ckv[0] as usize].bytes, 64 * local * 512);
+    assert_eq!(tensors[n.kv_scale[0] as usize].bytes, 64 * local * 4);
+    assert_eq!(tensors[n.dcp_gckv as usize].bytes, 64 * 2048 * 512);
     assert_eq!(tensors[n.dcp_pckv as usize].bytes, u64::from(ctx) * 512);
-    for rows in [1, 8, 16] {
+    for rows in [1, 8, 16, 64] {
         let mut b = Builder::new(256);
         b.adopt_tensors(tensors.clone());
         let mut xgate = 0;
         emit_glm_mla(
-            &mut b, &c, &n, 0, ctx, rows, 16, MoeEnc::Fp8Blk, n.x, &[], false, &mut xgate, &xr,
+            &mut b, &c, &n, 0, ctx, rows, 64, MoeEnc::Fp8Blk, n.x, &[], false, &mut xgate, &xr,
         );
         let p = b.finish();
         let at = |op: DevOp| p.insts.iter().position(|d| d.op == op as u16).unwrap();
@@ -1087,9 +1311,17 @@ fn glm_dcp_stages_writes_and_reads_the_owner_gather() {
         );
         let pack = &p.insts[at(DevOp::DcpKvPack)];
         assert_eq!((pack.t[0], pack.i[0], pack.i[1], pack.i[5]), (n.iidx, rows, 2048, n.dcp_slot));
+        let canonical = p.insts.iter().position(|d| d.op == DevOp::IndexSelect as u16 && d.i[4] == 3).unwrap();
+        assert_eq!((p.insts[canonical].t[0], p.insts[canonical].t[4], p.insts[canonical].i[1], u32::from(p.insts[canonical].blocks)),
+                   (n.iidx, n.kvlen, 2048, rows));
+        assert!(canonical < at(DevOp::DcpKvPack));
         let gather = &p.insts[at(DevOp::XDcpGather)];
         assert_eq!((gather.t[2], gather.t[5], gather.i[7]), (n.dcp_gckv, n.dcp_glen, 8));
         let flash = &p.insts[at(DevOp::FlashMlaDecodeFp8)];
+        assert_eq!(flash.i[0], rows);
+        if rows == 64 {
+            assert_eq!(flash.i[4], 4);
+        }
         assert_eq!(
             (flash.t[4], flash.t[5], flash.t[6], flash.t[7], flash.i[2], flash.j[0]),
             (n.dcp_gckv, n.dcp_gkrot, n.dcp_glen, n.dcp_gscale, 2048, 0)
@@ -1508,6 +1740,45 @@ fn glm_dsa_full_layer_emits_indexer() {
 }
 
 #[test]
+fn glm_dsa_quark_mxfp4_keeps_indexer_projections_bf16() {
+    let _guard = crate::test_env::env_guard();
+    let mut c = glm_ref_cfg();
+    c.quark_mixed = true;
+    c.indexer_full = vec![false, false, false, true];
+    let ctx = 70272;
+    let mut b = Builder::new(256);
+    let tn = declare_glm_rows_batched(&mut b, &c, ctx, &[3], 8192, 8, MoeEnc::Mxfp4);
+    let indexer_weights = [tn.lw[0].iwqb, tn.lw[0].iwk, tn.lw[0].iwp];
+    assert!(indexer_weights.iter().all(|&w| w != TENSOR_NONE));
+    let tensors = b.tensors();
+    let mut b2 = Builder::new(256);
+    b2.adopt_tensors(tensors);
+    let mut xgate = 0u32;
+    emit_glm_block(
+        &mut b2,
+        &c,
+        &tn,
+        0,
+        ctx,
+        8,
+        8,
+        MoeEnc::Mxfp4,
+        tn.x,
+        tn.xnext,
+        &[],
+        &mut xgate,
+        &[],
+    );
+    let prog = b2.finish();
+    assert!(prog.insts.iter().any(|d| d.op == DevOp::IndexScore as u16));
+    assert!(prog.insts.iter().any(|d| d.op == DevOp::FlashGatherDecode as u16));
+    for weight in indexer_weights {
+        assert!(prog.insts.iter().any(|d| d.op == DevOp::Gemv as u16 && d.t[2] == weight));
+        assert!(!prog.insts.iter().any(|d| d.op == DevOp::GemvMxfp4 as u16 && d.t[2] == weight));
+    }
+}
+
+#[test]
 fn glm_dsa_shared_layer_reuses_idx() {
     let _guard = crate::test_env::env_guard();
     use DevOp::*;
@@ -1804,6 +2075,42 @@ fn glm_block_decode_ladder_has_batched_kv_and_grouped_experts() {
             assert!(p.insts.iter().any(|d| d.op == DevOp::MoeGroupGluPf as u16));
             assert!(!p.insts.iter().any(|d| d.op == DevOp::MoeExpertGluFp8Blk as u16));
         }
+    }
+}
+
+#[test]
+fn glm_wide_walk8_fuses_q_a_kv_a_k_rope_with_staged_row_fit() {
+    let _guard = crate::test_env::env_guard();
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GEMV_WALK", "1"),
+        ("PLOW_GEMV_MM", "8"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let (m, _) = glm_build_block_pf_rungs(
+        &c, 8192, 256, 3..4, true, "glm-ref", MlaArch::Glm,
+        &[], PrefillScope::Attn, MoeEnc::Fp8Blk, &[1, 8, 16, 32, 64],
+    );
+    for rows in [16, 32, 64] {
+        let p = &m.progs[m.prog_t.iter().position(|&t| t == rows).unwrap()];
+        let fused = p.insts.iter().find(|d| d.op == DevOp::GemvQkv as u16
+            && (d.i[0], d.i[1], d.i[2], d.i[3], d.i[4]) == (rows, 2048, 6144, 512, 64)).unwrap();
+        assert_eq!(fused.j[0], 8);
+        assert!(!p.insts.iter().any(|d| d.op == DevOp::Gemv as u16
+            && matches!((d.i[1], d.i[2]), (2048 | 512 | 64, 6144))));
+    }
+
+    let _unfused = crate::test_env::EnvScope::set(&[("PLOW_GEMV_WALK", "0")]);
+    let (m, _) = glm_build_block_pf_rungs(
+        &c, 8192, 256, 3..4, true, "glm-ref", MlaArch::Glm,
+        &[], PrefillScope::Attn, MoeEnc::Fp8Blk, &[1, 8, 16, 32, 64],
+    );
+    for rows in [16, 32, 64] {
+        let p = &m.progs[m.prog_t.iter().position(|&t| t == rows).unwrap()];
+        assert!(!p.insts.iter().any(|d| d.op == DevOp::GemvQkv as u16
+            && (d.i[1], d.i[2]) == (2048, 6144)));
+        assert_eq!(p.insts.iter().filter(|d| d.op == DevOp::Gemv as u16
+            && matches!((d.i[1], d.i[2]), (2048 | 512 | 64, 6144))).count(), 3);
     }
 }
 
@@ -2583,6 +2890,19 @@ fn glm_oproj_w8a8_routes_decode_and_prefill_with_group_scales() {
             let succs = &p.succs[qe.succ_ofs as usize..][..qe.succ_len as usize];
             let waits = &p.waits[ge.wait_ofs as usize..][..ge.wait_len as usize];
             assert!(waits.iter().any(|w| succs.contains(&w.id) && w.threshold == q[0].blocks as u32));
+            let split8 = rows == 1 && c.hidden == 6144 && k == 2048;
+            assert_eq!(g[0].i[6], if split8 { 2 } else { 0 });
+            if split8 {
+                assert_eq!(g[0].i[3], 16);
+                let zeroes = find(DevOp::ZeroF32);
+                let zero = zeroes.iter().find(|d| d.t[0] == g[0].t[0]).unwrap();
+                assert_eq!(&zero.i[..2], &[1, 3072]);
+                let ix = p.insts.iter().position(|d| d.op == DevOp::ZeroF32 as u16 && d.t[0] == g[0].t[0]).unwrap();
+                let ze = p.stream.iter().find(|e| e.inst as usize == ix).unwrap();
+                assert_eq!(ze.seg, ge.seg, "split-K initialization must not add a launch");
+                let zs = &p.succs[ze.succ_ofs as usize..][..ze.succ_len as usize];
+                assert!(waits.iter().any(|w| zs.contains(&w.id) && w.threshold == zero.blocks as u32));
+            }
             if split4 {
                 assert_eq!(&g[0].t[5..8], &n.blk_oproj_parts);
                 let adds = find(DevOp::Sum4Bf16);
@@ -2703,6 +3023,10 @@ fn glm_mla_w8a8_preserves_boundaries_and_atomic_clear_dependency() {
         let find = |op: DevOp, out: u32| p.insts.iter()
             .position(|d| d.op == op as u16 && d.t[0] == out).unwrap();
         let q = find(DevOp::QuantFp8Block128, n.qb_xq);
+        let norm = find(DevOp::RmsNorm, n.qlat);
+        assert_eq!(p.insts[norm].i[3], u32::from(!prefill));
+        assert!(p.insts.iter().filter(|d| d.op == DevOp::RmsNorm as u16 && d.t[0] != n.qlat)
+            .all(|d| d.i[3] == 0));
         let z = find(DevOp::ZeroF32, n.qb);
         let g = find(DevOp::GemmFp8Block128, n.qb);
         let k = find(DevOp::MlaBmmFp8, n.qa);
@@ -2924,7 +3248,7 @@ fn glm_native_indexer_shares_fp8_cache_across_decode_and_prefill() {
 }
 
 #[test]
-#[should_panic(expected = "requires gfx950 and GLM_LINEAR_FP8")]
+#[should_panic(expected = "requires gfx950 block-FP8 o-projection weights")]
 fn glm_oproj_w8a8_refuses_bf16_weights() {
     let _guard = crate::test_env::env_guard();
     let _env = crate::test_env::EnvScope::set(&[
@@ -3141,6 +3465,7 @@ fn glm53_ref_cfg() -> GlmCfg {
         indexer_full: vec![true, true],
         softmax_layers: vec![false, false], // both layers KDA, no MLA layer needed here
         has_dsa: false,
+        quark_mixed: false,
     }
 }
 

@@ -572,9 +572,8 @@ fn lean_moe_stage2_pair(ops: &[Op], i: usize) -> bool {
 
 fn lean_moe_stage1_inst(inst: &DevInst) -> bool {
     inst.op == DevOp::MoeGroupGluPf as u16
-        && inst.i[0] == 384
-        && inst.i[1] == 3584
-        && inst.i[2] == 896
+        && ((inst.i[0] == 384 && inst.i[1] == 3584 && inst.i[2] == 896)
+            || (inst.i[0] == 256 && inst.i[1] == 6144 && inst.i[2] == 256))
         && inst.i[3] == 2
         && inst.i[4] == 0
         && inst.i[5] <= 2
@@ -6180,7 +6179,7 @@ mod lean_kda_key_factor_tests {
 mod lean_moe_stage1_tests {
     use super::*;
 
-    fn program(enabled: bool, inter_dim: u32) -> Program {
+    fn program(enabled: bool, inter_dim: u32, hidden: u32, experts: u32) -> Program {
         let mut b = Builder::new(4);
         b.deny_uniseg();
         b.set_lean_moe_stage1_segments(enabled);
@@ -6189,7 +6188,7 @@ mod lean_moe_stage1_tests {
         let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
         b.emit(DevOp::MoeGroupGluPf, all.clone(), &[before], |d| {
             d.t.copy_from_slice(&tensors);
-            d.i = [inter_dim, 3584, 896, 2, 0, 2, 0, 0];
+            d.i = [inter_dim, hidden, experts, 2, 0, 2, 0, 0];
         });
         b.emit(DevOp::Nop, all, &[1], |_| {});
         b.finish()
@@ -6197,21 +6196,23 @@ mod lean_moe_stage1_tests {
 
     #[test]
     fn eligible_stage1_packet_gets_one_pure_segment() {
-        let p = program(true, 384);
-        let segment_for = |inst: u32| {
-            p.stream
-                .iter()
-                .find(|e| e.inst == inst)
-                .map(|e| e.seg)
-                .unwrap()
-        };
-        assert_ne!(segment_for(0), segment_for(1));
-        assert_ne!(segment_for(1), segment_for(2));
+        for (inter, hidden, experts) in [(384, 3584, 896), (256, 6144, 256)] {
+            let p = program(true, inter, hidden, experts);
+            let segment_for = |inst: u32| {
+                p.stream
+                    .iter()
+                    .find(|e| e.inst == inst)
+                    .map(|e| e.seg)
+                    .unwrap()
+            };
+            assert_ne!(segment_for(0), segment_for(1));
+            assert_ne!(segment_for(1), segment_for(2));
+        }
     }
 
     #[test]
     fn stage1_route_is_opt_in_and_shape_gated() {
-        let disabled = program(false, 384);
+        let disabled = program(false, 256, 6144, 256);
         assert_eq!(
             disabled
                 .stream
@@ -6221,7 +6222,7 @@ mod lean_moe_stage1_tests {
                 .len(),
             1
         );
-        let unsupported = program(true, 512);
+        let unsupported = program(true, 384, 6144, 256);
         assert_eq!(
             unsupported
                 .stream

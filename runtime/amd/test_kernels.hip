@@ -81,6 +81,65 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
     d_rowrms(rms, x, rows, feat, eps, blockIdx.x, gridDim.x, part);
 }
 
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void glm_rmsnorm_qa(
+    bf16* out, const bf16* x, const bf16* gamma, unsigned rows) {
+    __shared__ float part[PLOW_WAVES];
+    d_rmsnorm_glm_qa(out, x, gamma, rows, blockIdx.x, gridDim.x, part);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void glm_rmsnorm_diagnostic_v2(
+    bf16* out, float* raw, float* stats, const bf16* x, const bf16* gamma,
+    unsigned rows, unsigned feat, float eps, double reference_eps) {
+    __shared__ float part[PLOW_WAVES];
+    d_rmsnorm(out, x, gamma, rows, feat, eps, 0, blockIdx.x, gridDim.x, part);
+    for (unsigned row = blockIdx.x; row < rows; row += gridDim.x) {
+        bf16v8 v[rn_vecs];
+#pragma unroll
+        for (unsigned c = 0; c < rn_vecs; c++) {
+            const unsigned i = rn_index(c);
+            v[c] = i < feat ? ld_glob8(as_glob(x) + (size_t)row * feat + i) : bf16v8_zero();
+        }
+        const float ss = rn_ss(rn_sumsq(v, part));
+        const float mean = ss / (float)feat + eps;
+        const float inv = rsqrtf(mean);
+        const float product = mean * inv;
+        const float residual = fmaf(-fmaf(mean, inv, -product), inv, fmaf(-product, inv, 1.0f));
+        const float refined = fmaf(0.5f * inv, residual, inv);
+        const float precise = (float)(1.0 / sqrt((double)mean));
+        float tree_ss = 0.0f;
+        if (threadIdx.x < 256) {
+            for (unsigned j = 0; j < 8; j++) {
+                const float value = bf2f(x[(size_t)row * feat + threadIdx.x * 8 + j]);
+                tree_ss += value * value;
+            }
+        }
+        for (unsigned delta = 1; delta < 64; delta *= 2)
+            tree_ss += __shfl_xor(tree_ss, delta);
+        __syncthreads();
+        if ((threadIdx.x & 63) == 0) part[threadIdx.x / 64] = tree_ss;
+        __syncthreads();
+        tree_ss = (part[0] + part[1]) + (part[2] + part[3]);
+        const float tree_mean = (float)((double)(tree_ss / (float)feat) + reference_eps);
+        const float tree_inv = rsqrtf(tree_mean);
+        if (threadIdx.x == 0) {
+            stats[row * 8] = ss;
+            stats[row * 8 + 1] = mean;
+            stats[row * 8 + 2] = inv;
+            stats[row * 8 + 3] = refined;
+            stats[row * 8 + 4] = precise;
+            stats[row * 8 + 5] = tree_ss;
+            stats[row * 8 + 6] = tree_mean;
+            stats[row * 8 + 7] = tree_inv;
+        }
+        for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
+            raw[(size_t)row * feat + i] = bf2f(x[(size_t)row * feat + i]) * inv * bf2f(gamma[i]);
+            raw[((size_t)rows + row) * feat + i] = bf2f(x[(size_t)row * feat + i]) * refined * bf2f(gamma[i]);
+            raw[((size_t)rows * 2 + row) * feat + i] = bf2f(x[(size_t)row * feat + i]) * precise * bf2f(gamma[i]);
+            raw[((size_t)rows * 3 + row) * feat + i] = bf2f(x[(size_t)row * feat + i]) * tree_inv * bf2f(gamma[i]);
+        }
+    }
+}
+
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_headnorm_rope_bf16(
     bf16* out, const bf16* x, const bf16* gamma, const float* cosb, const float* sinb,
     const int* pos, unsigned ntok, unsigned nhead, unsigned hd, float eps) {
@@ -227,6 +286,20 @@ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemm_a8w8_block128_m16(
     d_gemm_fp8_block128_m16(C, A, B, asc, wsc, M, N, K, blockIdx.x, gridDim.x);
 }
 extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(64, 1) void gemm_a8w8_block128_m16_wave1(
+    bf16* C, const unsigned char* A, const unsigned char* B, const float* asc,
+    const float* wsc, unsigned M, unsigned N, unsigned K) {
+    d_gemm_fp8_block128_m16<false, false, false, false, false, false, 1, false, false, 0, false, 1>(
+        C, A, B, asc, wsc, M, N, K, blockIdx.x, gridDim.x);
+}
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemm_a8w8_block128_m16_f16(
+    bf16* C, const unsigned char* A, const unsigned char* B, const float* asc,
+    const float* wsc, unsigned M, unsigned N, unsigned K) {
+    d_gemm_fp8_block128_m16<false, false, false, false, false, false, 1, false, true>(
+        C, A, B, asc, wsc, M, N, K, blockIdx.x, gridDim.x);
+}
+extern "C" __global__ __attribute__((flatten))
 __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_bmm_fp8_m16(
     bf16* C, const bf16* X, const unsigned char* W, const float* scale,
     unsigned M, unsigned H, unsigned N, unsigned K) {
@@ -263,6 +336,16 @@ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemm_qkv_a8w8_block128_m16(
     const float* asc, const float* wsc, unsigned M, unsigned N, unsigned K,
     unsigned n_first, unsigned n_second) {
     d_gemm_fp8_block128_m16<false, false, false, false, false, true>(C, A, B, asc, wsc,
+        M, N, K, blockIdx.x, gridDim.x, nullptr, nullptr, nullptr, 0, nullptr, 0,
+        C1, C2, n_first, n_second);
+}
+extern "C" __global__ __attribute__((flatten))
+__launch_bounds__(64, 1) void gemm_qkv_a8w8_block128_m16_wave1(
+    bf16* C, bf16* C1, bf16* C2, const unsigned char* A, const unsigned char* B,
+    const float* asc, const float* wsc, unsigned M, unsigned N, unsigned K,
+    unsigned n_first, unsigned n_second) {
+    d_gemm_fp8_block128_m16<false, false, false, false, false, true,
+                             1, false, false, 0, false, 1>(C, A, B, asc, wsc,
         M, N, K, blockIdx.x, gridDim.x, nullptr, nullptr, nullptr, 0, nullptr, 0,
         C1, C2, n_first, n_second);
 }
@@ -344,6 +427,14 @@ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemm_a8w8_block128_split4(
     const float* wsc, unsigned M, unsigned N, unsigned K) {
     __shared__ bf16 lds[GM_LDS_HALVES_T(64, 128, 128)];
     const size_t plane = (size_t)M * N;
+#if PLOW_CDNA4
+    if ((M == 8 || M == 16) && N == 6144 && K == 2048) {
+        d_gemm_fp8_block128_m16<false, false, false, false, false, false, 4, false, false, 0, true>(
+            C, A, B, asc, wsc, M, N, K, blockIdx.x, gridDim.x,
+            nullptr, nullptr, nullptr, 0, nullptr, 0, C + plane, C + 2 * plane, 0, 0, C + 3 * plane);
+        return;
+    }
+#endif
     d_gemm_fp8_t<64, 128, 128, GM_WM, GM_WN, true, false, true, 4>(
         C, A, B, asc, wsc, M, N, K, blockIdx.x, gridDim.x, lds,
         nullptr, nullptr, 0, C + plane, C + 2 * plane, C + 3 * plane);
@@ -601,6 +692,26 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_qua
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void quant_fp8_block128(
     unsigned char* xq, const bf16* x, float* scale, unsigned M, unsigned K) {
     d_quant_fp8_block128(xq, x, scale, M, K, blockIdx.x, gridDim.x);
+}
+
+extern "C" __global__ __launch_bounds__(64, 1) void quant_fp8_block128_wave1(
+    unsigned char* xq, const bf16* x, float* scale, unsigned M, unsigned K) {
+    const unsigned groups = K / 128u;
+    const unsigned group = blockIdx.x;
+    if (group >= M * groups) return;
+    const unsigned lane = threadIdx.x;
+    const size_t base = (size_t)group * 128u + lane * 2u;
+    const float a = bf2f(x[base]);
+    const float b = bf2f(x[base + 1]);
+    float amax = fmaxf(1e-10f, fmaxf(fabsf(a), fabsf(b)));
+    for (unsigned offset = 32; offset; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, offset));
+    const float s = amax * (1.0f / 448.0f);
+    const float inv = 1.0f / s;
+    if (lane == 0) st_act<float>(&scale[(size_t)(group % groups) * M + group / groups], s);
+    const unsigned packed = PLOW_GM_FP8_PACK2(a * inv, b * inv);
+    st_act1_u8(&xq[base], (unsigned char)packed);
+    st_act1_u8(&xq[base + 1], (unsigned char)(packed >> 8));
 }
 
 /* MXFP4 (OCP microscaling e2m1 + one E8M0 scale per 32 K) decode GEMV, w4a16.

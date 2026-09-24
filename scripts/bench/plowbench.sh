@@ -215,6 +215,7 @@ pb_check_assets() {
 pb_check_objects() {
     local dir="${1:?object dir}"
     local arch="${2:-}"
+    local assets="${3:-}"
     [ -n "$arch" ] || arch=$(pb_detect_arch "" "" "$dir")
     [ -d "$dir" ] || { pb_bad "no object dir $dir"; return 1; }
 
@@ -259,6 +260,19 @@ pb_check_objects() {
         for f in interp_decode.elf interp_prefill.elf interp_flash.elf; do
             [ -e "$dir/$f" ] || { pb_bad "object dir lacks $f"; miss=$((miss + 1)); }
         done
+        if [ -f "$assets/build.json" ] && python3 - "$assets/build.json" <<'PYEOF'
+import json, sys
+f = json.load(open(sys.argv[1]))["features"]
+sys.exit(not all(f.get(k) for k in ("fp8_kv", "a4w4", "mla", "moe")))
+PYEOF
+        then
+            for f in interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf \
+                     interp_flash_fp8kv.elf interp_flash_fp8kv_gq.elf \
+                     interp_prefill_fp8kv_mla_moe_a4w4_full.elf \
+                     interp_prefill_fp8kv_mla_moe_a4w4_full_gq.elf; do
+                [ -e "$dir/$f" ] || { pb_bad "mixed FP8-KV/MXFP4 packet lacks $f"; miss=$((miss + 1)); }
+            done
+        fi
         [ "$miss" -eq 0 ] || return 1
         pb_ok "gfx950 interpreter objects in $dir (runtime checks packet pairing and optional routes)"
         return 0
@@ -324,6 +338,10 @@ pb_check_vllm() {
     # AMD target
     v="${v:-/app/plow/build-gemma31/vllm-python}"
     [ -x "$v" ] || { pb_bad "no vLLM client at $v (set PB_VLLM)"; return 1; }
+    if [[ "$v" == */vllm029-client.sh ]]; then
+        pb_ok "vLLM client $v (pinned Docker 0.29; host ROCm lib not needed)"
+        return 0
+    fi
     local lib="${PB_VLLM_ROCM_LIB:-/opt/rocm/core-7.14/lib}"
     [ -d "$lib" ] || { pb_bad "VLLM_ROCM_LIB dir missing: $lib"; return 1; }
     pb_ok "vLLM client $v (ROCm lib $lib)"
@@ -401,7 +419,7 @@ pb_bench() {
         --seed "${PB_SEED:-8193}" --num-prompts "$np" \
         --random-input-len "$isl" --random-output-len "$osl" --random-range-ratio 0 \
         --max-concurrency "$conc" --request-rate "${PB_RATE:-inf}" --ignore-eos \
-        --percentile-metrics ttft,tpot,itl --save-result --save-detailed \
+        --percentile-metrics ttft,tpot,itl,e2el --save-result --save-detailed \
         --result-dir "$res/$tag" --result-filename bench.json \
         "$@" > "$res/$tag.bench.log" 2>&1
     local rc=$?

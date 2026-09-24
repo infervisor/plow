@@ -43,9 +43,18 @@ class Attention:
         return query[:, :8, :512]
 
 
+class Decoder:
+    layer_idx = 6
+
+    def forward(self, positions, hidden, residual):
+        hidden.add_(1)
+        residual.add_(2)
+        return hidden, residual
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
-        config = capture_config(tmp, "a" * 64, attention=True)
+        config = capture_config(tmp, "a" * 64, attention=True, block=True)
         config = json.loads(json.dumps(config).replace(
             "vllm.forward_context.get_forward_context", "__main__.forward_context"
         ).replace(
@@ -56,6 +65,9 @@ def main():
         ).replace(
             "vllm.model_executor.layers.sparse_attn_indexer.SparseAttnIndexer.forward_hip",
             "__main__.Indexer.forward_hip",
+        ).replace(
+            "vllm.model_executor.models.deepseek_v2.DeepseekV2DecoderLayer.forward",
+            "__main__.Decoder.forward",
         ))
         install(config)
         indexer = Indexer()
@@ -113,6 +125,19 @@ def main():
         output = next(r for r in attention_records if r["semantic"] == "attention.output")
         assert output["source_shape"] == [1, 8, 512]
         assert (Path(tmp) / output["file"]).read_bytes() == query[:, :8, :512].contiguous().view(torch.uint8).numpy().tobytes()
+        decoder = Decoder()
+        hidden = torch.ones((1, 8), dtype=torch.bfloat16)
+        residual = torch.full_like(hidden, 2)
+        decoder.forward(torch.tensor([8]), hidden, residual)
+        block_records = {r["semantic"]: r for p in Path(tmp).glob("block.*.json")
+                         if (r := json.loads(p.read_text()))}
+        assert len(block_records) == 5
+        assert len({r["context_sha256"] for r in block_records.values()}) == 1
+        for name, value in (("input.hidden", 1), ("input.residual", 2),
+                            ("output.hidden", 2), ("output.residual", 4)):
+            record = block_records["block." + name]
+            expected = torch.full((1, 8), value, dtype=torch.bfloat16)
+            assert (Path(tmp) / record["file"]).read_bytes() == expected.view(torch.uint8).numpy().tobytes()
 
 
 if __name__ == "__main__":

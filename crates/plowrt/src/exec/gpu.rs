@@ -7801,10 +7801,8 @@ impl GpuEngine {
         self.prefill[self.pick_prefill_bucket(avail, usize::MAX)].t as usize
     }
 
-    /// Rows to slice off a request with `rem` prefill rows still unsent, under per-launch
-    /// `cap`. Plans the WHOLE remainder, so the slice lands on a rung that fills exactly
-    /// instead of leaving a stranded tail: 8192 rows under a 4224 cap runs [4096, 4096]
-    /// (no padding) where clamping to the cap first ran [4224, 3968->4096] (128 padded rows).
+    /// Plan the remaining request before applying the per-launch cap, so a capped
+    /// launch does not strand a padded tail on the next rung.
     pub fn pf_plan_slice(&self, rem: usize, cap: usize) -> usize {
         if self.prefill.is_empty() {
             return rem.min(cap);
@@ -8924,11 +8922,6 @@ impl GpuEngine {
         if n_allowed == 0 {
             return smallest;
         }
-        // NO top-rung shortcut: "largest rung that still fills" is not optimal. Under a
-        // 4224-row top rung an 8192-row prompt takes [4224, 3968->4096] = 128 padded rows,
-        // where [4096, 4096] is the same two launches with none. The DP below already
-        // considers the top rung, so it picks it whenever it really is best.
-        //
         // Every rung is a multiple of the smallest, so quantizing the
         // state on it bounds the table at `top_rung / smallest_rung` entries
         // (64 for the shipped 128…8192 ladder).

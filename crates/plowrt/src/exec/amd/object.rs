@@ -91,6 +91,7 @@ pub enum Variant {
     /// fp8 KV cache (`FlashDecodeFp8`). Supersedes [`Variant::Fp8`] — an fp8-KV
     /// packet is also fp8-weight — and changes BOTH objects, not just decode.
     Fp8Kv,
+    Mxfp4,
 }
 
 impl Variant {
@@ -99,6 +100,7 @@ impl Variant {
             Variant::Bf16 => "",
             Variant::Fp8 => "_fp8",
             Variant::Fp8Kv => "_fp8kv",
+            Variant::Mxfp4 => "_mxfp4",
         }
     }
 
@@ -115,8 +117,14 @@ impl Variant {
                 {
                     return Variant::Fp8Kv;
                 }
-                if i.op == DevOp::GemvFp8 as u16 {
+                if i.op == DevOp::GemvFp8 as u16 && v != Variant::Mxfp4 {
                     v = Variant::Fp8;
+                }
+                if matches!(DevOp::from_u16(i.op), Some(
+                    DevOp::GemvMxfp4 | DevOp::GemvGluMxfp4 | DevOp::GemvQkvMxfp4
+                    | DevOp::GemmMxfp4 | DevOp::GemmSmallMxfp4 | DevOp::GemmGluMxfp4
+                )) {
+                    v = Variant::Mxfp4;
                 }
             }
         }
@@ -143,6 +151,8 @@ pub enum PrefillArm {
     /// needs both, and `scripts/build_gfx950.sh`'s `PLOW_MOE_PREFILL=1` always
     /// turns MLA on with it (there is no moe-without-mla object).
     MlaMoe,
+    /// MLA and grouped A4W4 experts with MXFP4 projection kernels in one object.
+    MlaMoeA4w4,
     /// **Kimi-K3.** The `PLOW_K3` arms — `AttnRes` (104), `SituGlu` (105),
     /// `MlaOutGate` (106) and the KDA mixer (99-103) — which live in NEITHER of
     /// the objects above. Supersedes both: `_hs_ax_mla_k3` composes
@@ -181,6 +191,7 @@ impl PrefillArm {
             PrefillArm::None => "",
             PrefillArm::Mla => "_mla",
             PrefillArm::MlaMoe => "_mla_moe",
+            PrefillArm::MlaMoeA4w4 => "_mla_moe_a4w4_full",
             // `_k3` already implies the MLA prefill arms — see `_hs_ax_mla_k3`
             // in runtime/CMakeLists.txt — so it does not stack with `_mla`.
             PrefillArm::K3 => "_k3",
@@ -248,12 +259,8 @@ impl PrefillArm {
             (true, true, true, _) => PrefillArm::K3MoeA4w4,
             (true, true, false, _) => PrefillArm::K3Moe,
             (true, false, _, _) => PrefillArm::K3,
-            // The non-K3 families do NOT branch on the encoding here, and that is a
-            // known gap rather than a decision: `interp_prefill_mla_moe_a4w4{,_full}`
-            // are built and nothing selects them, so an mxfp4 GLM/Kimi-K2 packet takes
-            // `moe_pf_refuse` today. Loud, so it is not this axis's silent failure —
-            // but it is the same fix, one arm over.
-            (false, true, _, _) => PrefillArm::MlaMoe,
+            (false, true, true, _) => PrefillArm::MlaMoeA4w4,
+            (false, true, false, _) => PrefillArm::MlaMoe,
             (false, false, _, true) => PrefillArm::Mla,
             _ => PrefillArm::None,
         }
@@ -269,6 +276,7 @@ pub fn object_name(phase: Phase, variant: Variant, arm: PrefillArm, sched: Sched
     // There is no separate fp8-weight flash object; flash only varies on KV.
     let variant = match (phase, variant) {
         (Phase::Flash, Variant::Fp8) => Variant::Bf16,
+        (Phase::Flash, Variant::Mxfp4) => Variant::Bf16,
         _ => variant,
     };
     // The mla/mla_moe objects are a PREFILL-only build (`interp_prefill_mla{,_moe}{,_gq}.elf`
@@ -287,10 +295,14 @@ pub fn object_name(phase: Phase, variant: Variant, arm: PrefillArm, sched: Sched
         // head dim, so no packet can reach this phase with a K3 arm.
         _ => PrefillArm::None,
     };
+    let variant_infix = match (variant, arm, phase) {
+        (Variant::Mxfp4, PrefillArm::MlaMoeA4w4 | PrefillArm::K3 | PrefillArm::K3Moe | PrefillArm::K3MoeA4w4, _) => "",
+        _ => variant.infix(),
+    };
     format!(
         "{}{}{}{}.elf",
         phase.object_stem(),
-        variant.infix(),
+        variant_infix,
         arm.infix(),
         sched.suffix()
     )
@@ -526,14 +538,15 @@ pub(super) fn check_compiled_opcode_markers<'a>(
         }
         for inst in prog.insts.iter().filter(|inst| inst.op == DevOp::GemmFp8Block128 as u16) {
             if inst.i[6] != 0 || inst.i[7] != 0 {
-                let [m, n, k, mfma, n0, n1, qb, reserved] = inst.i;
-                if m == 0 || m.checked_mul(2048).is_none() || n != 2048 || k != 2048
-                    || mfma != 16 || n0 != 0 || n1 != 0 || qb != 1 || reserved != 0
+                let [m, n, k, mfma, n0, n1, selector, reserved] = inst.i;
+                let shape = (selector == 1 && n == 2048) || (selector == 2 && m == 1 && n == 6144);
+                if m == 0 || m.checked_mul(n).is_none() || !shape || k != 2048
+                    || mfma != 16 || n0 != 0 || n1 != 0 || reserved != 0
                     || inst.t[..5].contains(&packet::dev::TENSOR_NONE16)
                     || !syms.contains(&"plow_gemm_fp8_block128_qb_1")
                 {
                     return Err(RuntimeError::Device(format!(
-                        "invalid block128 Q-B geometry/operands or missing `plow_gemm_fp8_block128_qb_1` in {}", path.display()
+                        "invalid block128 split-K geometry/operands or missing `plow_gemm_fp8_block128_qb_1` in {}", path.display()
                     )));
                 }
             }
@@ -618,6 +631,7 @@ pub(super) const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_DSA_SELECT_LOCAL", &["plow_dsa_select_local_arm"]),
     // DCP owner gather (ops 181-183): without the arm the flash reads unwritten gather buffers.
     ("PLOW_DCP_GATHER", &["plow_dcp_gather_1"]),
+    ("PLOW_DCP_INDEX_CANON", &["plow_dcp_index_canon_1"]),
     // The gated split selection (op 59 i[4] = 2). An object without the arm runs every phase as
     // the serialized cooperative form on one row: wrong set, no trap. A BUILD axis
     // (`#if PLOW_DSA_SELECT_SPLIT`).
@@ -2094,6 +2108,32 @@ pub(super) fn check_dsa_select_local(
             .iter()
             .filter(|d| d.op == DevOp::IndexSelect as u16 && d.i[4] != 0)
         {
+            if d.i[4] == 3 {
+                let rows = p.t;
+                let idx_bytes = u64::from(rows) * 2048 * 4;
+                let len_bytes = u64::from(rows) * 4;
+                let capacity = |slot: u16, need: u64| {
+                    tensors.get(usize::from(slot)).is_some_and(|t| t.bytes >= need)
+                };
+                if arch != "gfx950"
+                    || !tp8
+                    || !p.role.is_decode_rung()
+                    || !matches!(rows, 1 | 8 | 16 | 32 | 64)
+                    || u32::from(d.blocks) != rows
+                    || d.i != [0, 2048, 0, 0, 3, 0, 0, 0]
+                    || d.fj != [0; 3]
+                    || !capacity(d.t[0], idx_bytes)
+                    || !capacity(d.t[4], len_bytes)
+                    || [1, 2, 3, 5, 6, 7]
+                        .into_iter()
+                        .any(|slot| d.t[slot] != packet::dev::TENSOR_NONE16)
+                {
+                    return Err(RuntimeError::Device(
+                        "DCP canonical selection requires gfx950 TP8 decode rows 1/8/16/32/64, top2048 and row-sized operands".into(),
+                    ));
+                }
+                continue;
+            }
             let err = || {
                 RuntimeError::Device(
                 "local DSA selection requires unpacked gfx942 TP8 decode rows 2/4/8/16/32, unpooled top2048 and row-sized operands".into())
@@ -2242,7 +2282,8 @@ pub(super) fn check_sparse_fp8_packet(
             && d.i[1] == 64
             && (p.role.is_rowsplit_sibling()
                 || p.insts.iter().any(|q| q.op == DevOp::XAllToAllHeads as u16));
-        if arch != "gfx942"
+        let gfx950 = arch == "gfx950";
+        if arch != "gfx942" && !gfx950
             || (d.i[1] != 8 && !row_split)
             || d.i[3] != 0
             || d.i[5] != u32::MAX
@@ -2252,6 +2293,7 @@ pub(super) fn check_sparse_fp8_packet(
             || rows == 0
             || (decode
                 && (!matches!(rows, 1 | 2 | 4 | 8 | 16 | 32)
+                    && !(gfx950 && rows == 64)
                     || d.i[6] != 2048
                     || d.i[7] != 4))
             || (!decode
@@ -2259,13 +2301,13 @@ pub(super) fn check_sparse_fp8_packet(
                     || if row_split {
                         rows != u64::from(p.t) / 8
                     } else {
-                        rows < 2048 || rows > 8192
+                        rows < 2048 || rows > if gfx950 { 16384 } else { 8192 }
                     }
                     || d.i[6] != d.i[2].min(16384)
                     || !mla_pf_v2_enabled()))
         {
             return Err(RuntimeError::Device(
-                "sparse FP8 MLA requires qualified gfx942 QH8 geometry and V2 prefill routing"
+                "sparse FP8 MLA requires supported QH8 geometry and V2 prefill routing"
                     .into(),
             ));
         }
@@ -2658,23 +2700,50 @@ pub(super) const DEC_STAGED_OPS: &[DevOp] = &[
 
 /// Refuse a decode blob whose fused GEMV stages more of `x` than this object's arena holds.
 ///
-/// `M` is `i[0]` and `K` is `i[2]` for every op in [`DEC_STAGED_OPS`] (`packet::slots`). An
-/// object without the marker predates it and is left alone: it can only have been paired with a
-/// blob emitted under the old conservative bound, which every arena satisfies.
+/// A BF16 `GemvQkv` packet may bind a walking MM through `fj[1]`; that width must match the
+/// object's cap and walk markers before it can replace `M` in the LDS demand. Legacy packets
+/// retain the conservative `M*K` check.
+pub(super) fn decode_stage_rows(inst: &DevInst64, syms: &[&str], path: &Path) -> Result<u64> {
+    if inst.op == DevOp::GemvQkv as u16 && inst.fj[1] != 0 {
+        let walk_mm = inst.fj[1];
+        if walk_mm > inst.i[0]
+            || !syms.contains(&GEMV_WALK_SYM)
+            || object_gemv_cap(syms) != Some(walk_mm)
+        {
+            return Err(RuntimeError::Device(format!(
+                "packet/object staged-GEMV mismatch: packet requires a walking MM={walk_mm} \
+                 decode object, but {} does not advertise that exact walk/capacity pair",
+                path.display()
+            )));
+        }
+        return Ok(u64::from(walk_mm));
+    }
+    Ok(u64::from(inst.i[0]))
+}
+
 pub(super) fn check_dec_stage_capacity<'a>(
     image: &[u8],
+    syms: &[&str],
     path: &Path,
     progs: impl IntoIterator<Item = &'a DevProg>,
 ) -> Result<()> {
-    let Some(halves) = elf_symbol_u32(image, DEC_STAGE_SYM) else {
-        return Ok(());
-    };
+    let halves = elf_symbol_u32(image, DEC_STAGE_SYM);
     for p in progs {
         for inst in &p.insts {
             if !DEC_STAGED_OPS.iter().any(|&o| o as u16 == inst.op) {
                 continue;
             }
-            let need = u64::from(inst.i[0]) * u64::from(inst.i[2]);
+            let rows = decode_stage_rows(inst, syms, path)?;
+            let Some(halves) = halves else {
+                if inst.op == DevOp::GemvQkv as u16 && inst.fj[1] != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "packet/object staged-GEMV mismatch: {} lacks `{DEC_STAGE_SYM}`",
+                        path.display()
+                    )));
+                }
+                continue;
+            };
+            let need = rows * u64::from(inst.i[2]);
             if need > u64::from(halves) {
                 return Err(RuntimeError::Device(format!(
                     "packet/object STAGING MISMATCH: a fused decode GEMV (op {}) stages M*K = \

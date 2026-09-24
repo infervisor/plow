@@ -10,6 +10,8 @@ NATIVE_FP8_GEMMS = {"GemmFp8Block128", "GemmFp8Block128Split4"}
 NATIVE_ROUTED_FP8 = {"MoeGluFp8Block128", "MoeDownFp8Block128"}
 NATIVE_MLA_FP8 = {"MlaBmmFp8"}
 NATIVE_INDEXER_FP8 = {"IndexFp8Decode"}
+MXFP4_GEMMS = {"GemvMxfp4", "GemvGluMxfp4", "GemmMxfp4", "GemmSmallMxfp4",
+               "GemmMedMxfp4", "GemmWideMxfp4", "GemmGluMxfp4"}
 
 
 def routed_experts(table, rows, topk, experts):
@@ -31,6 +33,10 @@ def scale_bytes(n, k):
     return ((n + 127) // 128) * ((k + 127) // 128) * 4
 
 
+def mxfp4_weight_bytes(n, k):
+    return n * ((k + 1) // 2 + (k + 31) // 32)
+
+
 def decode_cost(op, p, ctx):
     m, n, k = p.get("M", 1), p.get("N", 0), p.get("K", 0)
     if op in NATIVE_INDEXER_FP8:
@@ -47,20 +53,25 @@ def decode_cost(op, p, ctx):
         return 2 * n * k, 2 * m * n * k
     if op in {"GemvGlu", "GemmGlu"}:
         return 4 * n * k, 4 * m * n * k
+    if op in MXFP4_GEMMS:
+        factor = 2 if op in {"GemmGluMxfp4", "GemvGluMxfp4"} else 1
+        return factor * mxfp4_weight_bytes(n, k), factor * 2 * m * n * k
     if op in {"GemvFp8Blk", "DenseGluFp8Blk"} | NATIVE_FP8_GEMMS:
         factor = 2 if op == "DenseGluFp8Blk" else 1
         return factor * (n * k + scale_bytes(n, k)), factor * 2 * m * n * k
     if op in {"MoeExpertGluFp8Blk", "MoeExpertDownFp8Blk"}:
         n, k = p["I_moe"], p["H"]
         factor = 2 if op == "MoeExpertGluFp8Blk" else 1
-        return factor * (n * k + scale_bytes(n, k)), factor * 2 * n * k
+        weight = mxfp4_weight_bytes(n, k) if p.get("enc") == 2 else n * k + scale_bytes(n, k)
+        return factor * weight, factor * 2 * n * k
     if op in {"MoeGroupGluPf", "MoeGroupDownPf"} | NATIVE_ROUTED_FP8:
         n, k = p["I_moe"], p["H"]
         rows, topk, experts = p["T"], p["k"], p["n_exp"]
         # Distribution-free optimistic union: every row may route to the same experts.
         union = p.get("routed_experts", min(topk, experts))
         factor = 2 if op in {"MoeGroupGluPf", "MoeGluFp8Block128"} else 1
-        return factor * union * (n * k + scale_bytes(n, k)), factor * 2 * rows * topk * n * k
+        weight = mxfp4_weight_bytes(n, k) if p.get("fp8") == 2 else n * k + scale_bytes(n, k)
+        return factor * union * weight, factor * 2 * rows * topk * n * k
     if op in {"FlashMlaDecode", "FlashGatherDecode"}:
         keys = min(ctx, p["top_k"]) if op == "FlashGatherDecode" else ctx
         rows = p.get("n_batch", 1)
@@ -72,11 +83,14 @@ def decode_cost(op, p, ctx):
     return None
 
 
-def analyze(disasm, ctx, bandwidth_gbps, tflops, router_table=None, fp8_tflops=None):
+def analyze(disasm, ctx, bandwidth_gbps, tflops, router_table=None, fp8_tflops=None,
+            mxfp4_tflops=None):
     if type(ctx) is not int or ctx < 1 or any(not math.isfinite(v) or v <= 0 for v in (bandwidth_gbps, tflops)):
         raise ValueError("context and hardware ceilings must be positive")
     if fp8_tflops is not None and (not math.isfinite(fp8_tflops) or fp8_tflops <= 0):
         raise ValueError("FP8 ceiling must be finite and positive")
+    if mxfp4_tflops is not None and (not math.isfinite(mxfp4_tflops) or mxfp4_tflops <= 0):
+        raise ValueError("MXFP4 ceiling must be finite and positive")
     parts = collections.defaultdict(lambda: {"count": 0, "bytes": 0, "flops": 0})
     excluded = collections.Counter()
     programs = re.findall(r"^===== program T=(\d+)", disasm, re.M)
@@ -85,6 +99,8 @@ def analyze(disasm, ctx, bandwidth_gbps, tflops, router_table=None, fp8_tflops=N
     grouped_rows = None
     union = None
     router_count = 0
+    mxfp4_ops = set()
+    encoding_by_op = {}
     for line in disasm.splitlines():
         match = re.match(r"^#\d+\s+(\w+)\s+b=\d+\s+.*?\|\s*(.*)$", line)
         if not match:
@@ -115,6 +131,14 @@ def analyze(disasm, ctx, bandwidth_gbps, tflops, router_table=None, fp8_tflops=N
         if cost is None:
             excluded[op] += 1
             continue
+        is_mxfp4 = op in MXFP4_GEMMS or (op in {"MoeExpertGluFp8Blk", "MoeExpertDownFp8Blk"}
+                                        and params.get("enc") == 2) or (
+                op in {"MoeGroupGluPf", "MoeGroupDownPf"} and params.get("fp8") == 2)
+        if op in encoding_by_op and encoding_by_op[op] != is_mxfp4:
+            raise ValueError(f"mixed encodings under {op} require separate roofline components")
+        encoding_by_op[op] = is_mxfp4
+        if is_mxfp4:
+            mxfp4_ops.add(op)
         row = parts[op]
         row["count"] += 1
         row["bytes"] += cost[0]
@@ -124,9 +148,14 @@ def analyze(disasm, ctx, bandwidth_gbps, tflops, router_table=None, fp8_tflops=N
     if router_table is not None and union is None:
         raise ValueError("captured router table has no grouped-expert packet consumer")
     for op, row in parts.items():
-        if op in NATIVE_FP8_GEMMS | NATIVE_ROUTED_FP8 | NATIVE_MLA_FP8 | NATIVE_INDEXER_FP8 and fp8_tflops is None:
-            raise ValueError("native FP8 GEMM requires an explicit FP8 compute ceiling")
-        ceiling = fp8_tflops if op in NATIVE_FP8_GEMMS | NATIVE_ROUTED_FP8 | NATIVE_MLA_FP8 | NATIVE_INDEXER_FP8 else tflops
+        if op in mxfp4_ops:
+            if mxfp4_tflops is None:
+                raise ValueError("MXFP4 GEMM requires an explicit MXFP4 compute ceiling")
+            ceiling = mxfp4_tflops
+        else:
+            if op in NATIVE_FP8_GEMMS | NATIVE_ROUTED_FP8 | NATIVE_MLA_FP8 | NATIVE_INDEXER_FP8 and fp8_tflops is None:
+                raise ValueError("native FP8 GEMM requires an explicit FP8 compute ceiling")
+            ceiling = fp8_tflops if op in NATIVE_FP8_GEMMS | NATIVE_ROUTED_FP8 | NATIVE_MLA_FP8 | NATIVE_INDEXER_FP8 else tflops
         row["matrix_tflops"] = ceiling
         row["memory_floor_us"] = row["bytes"] / (bandwidth_gbps * 1e3)
         row["compute_floor_us"] = row["flops"] / (ceiling * 1e6)
@@ -139,6 +168,7 @@ def analyze(disasm, ctx, bandwidth_gbps, tflops, router_table=None, fp8_tflops=N
         "routed_experts": union,
         "bandwidth_gbps": bandwidth_gbps, "matrix_tflops": tflops,
         "fp8_matrix_tflops": fp8_tflops,
+        "mxfp4_matrix_tflops": mxfp4_tflops,
         "bytes": total_bytes, "flops": total_flops,
         "logical_operand_bytes": total_bytes, "physical_hbm_bytes": None,
         "spill_hbm_bytes": None, "performance_qualified": False,

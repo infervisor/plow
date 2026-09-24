@@ -72,6 +72,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     const int samples = argc > 3 ? std::atoi(argv[3]) : 9;
+    const bool split_mfma = argc > 4 && std::strcmp(argv[4], "mfma") == 0;
     if (samples < 3 || !(samples & 1)) {
         std::fprintf(stderr, "samples must be odd and >=3\n");
         return 2;
@@ -116,7 +117,7 @@ int main(int argc, char** argv) {
                      &nt, &nh, &stride, &scale};
     launch(control.mfma, 512, amfma);
     launch(control.v2, 256, av2);
-    launch(candidate.v2, 256, acand);
+    launch(split_mfma ? candidate.mfma : candidate.v2, split_mfma ? 512 : 256, acand);
     CK(hipDeviceSynchronize());
 
     std::vector<float> hmfma(no), hv2(no), hcand(no), hmmfma(nm), hmv2(nm), hmcand(nm);
@@ -126,8 +127,9 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(hmmfma.data(), mmfma, nm * 4, hipMemcpyDeviceToHost));
     CK(hipMemcpy(hmv2.data(), mv2, nm * 4, hipMemcpyDeviceToHost));
     CK(hipMemcpy(hmcand.data(), mcand, nm * 4, hipMemcpyDeviceToHost));
-    if (hv2 != hcand || hmv2 != hmcand) {
-        std::fprintf(stderr, "FAIL: candidate V2 is not bit-exact at production shape\n");
+    if ((split_mfma ? hmfma : hv2) != hcand || (split_mfma ? hmmfma : hmv2) != hmcand) {
+        std::fprintf(stderr, "FAIL: candidate %s is not bit-exact at production shape\n",
+                     split_mfma ? "MFMA" : "V2");
         return 3;
     }
     double max_rel = 0;
@@ -156,22 +158,28 @@ int main(int argc, char** argv) {
     size_t flush_n = FLUSH_BYTES / 4;
     void* flush_args[] = {&flush_in, &flush_out, &flush_n};
     std::vector<double> tm, tv, tc;
+    hipFunction_t cand_fn = split_mfma ? candidate.mfma : candidate.v2;
+    unsigned cand_threads = split_mfma ? 512 : 256;
     for (int i = 0; i < samples; ++i) {
         if (i & 1) {
-            tc.push_back(timed(candidate.v2, 256, acand, candidate.flush, flush_args));
+            tc.push_back(timed(cand_fn, cand_threads, acand, candidate.flush, flush_args));
             tv.push_back(timed(control.v2, 256, av2, control.flush, flush_args));
             tm.push_back(timed(control.mfma, 512, amfma, control.flush, flush_args));
         } else {
             tm.push_back(timed(control.mfma, 512, amfma, control.flush, flush_args));
             tv.push_back(timed(control.v2, 256, av2, control.flush, flush_args));
-            tc.push_back(timed(candidate.v2, 256, acand, candidate.flush, flush_args));
+            tc.push_back(timed(cand_fn, cand_threads, acand, candidate.flush, flush_args));
         }
     }
     const double mfma = median(tm), v2 = median(tv), cand = median(tc);
     std::printf("shape B=1 T=%u H=%u DK=%u DR=%u KV=bf16 grid=%u\n", T, NH, DK, DR, GRID);
-    std::printf("mfma8=%9.3f us  v2=%9.3f us  candidate=%9.3f us\n", mfma, v2, cand);
-    std::printf("v2/mfma speedup %.4fx; candidate/v2 speedup %.4fx; 24-layer delta %.3f ms\n",
-                mfma / v2, v2 / cand, (v2 - cand) * 24.0 / 1000.0);
-    std::printf("PASS: V2 max row rel %.3e vs MFMA; candidate bit-exact to V2\n", max_rel);
+    std::printf("mfma8=%9.3f us  v2=%9.3f us  candidate_%s=%9.3f us\n",
+                mfma, v2, split_mfma ? "mfma" : "v2", cand);
+    const double base = split_mfma ? mfma : v2;
+    std::printf("v2/mfma speedup %.4fx; candidate/%s speedup %.4fx; %d-layer delta %.3f ms\n",
+                mfma / v2, split_mfma ? "mfma" : "v2", base / cand,
+                split_mfma ? 78 : 24, (base - cand) * (split_mfma ? 78.0 : 24.0) / 1000.0);
+    std::printf("PASS: V2 max row rel %.3e vs MFMA; candidate bit-exact to %s\n",
+                max_rel, split_mfma ? "MFMA" : "V2");
     return 0;
 }

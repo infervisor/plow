@@ -23,8 +23,18 @@ __device__ void d_moe_group_glu_fp8_block128_m16(
         if (gate && up) {
             const auto* gs = (const float*)(size_t)stab[expert * 3u];
             const auto* us = (const float*)(size_t)stab[expert * 3u + 1u];
-            d_gemm_fp8_block128_m16<true, true>(fu + (size_t)row * I, xq, gate, xscale,
-                gs, count, I, H, nc, nt, up, us, row_token + row, T);
+            if (T == 1 && I == 256 && H == 6144 && n_exp == 256) {
+                d_gemm_fp8_block128_m16<true, true, false, false, false, false, 1, false, false, 4>(
+                    fu + (size_t)row * I, xq, gate, xscale, gs, count, I, H, nc, nt,
+                    up, us, row_token + row, T);
+            } else if (T == 8 && I == 256 && H == 6144 && n_exp == 256) {
+                d_gemm_fp8_block128_m16<true, true, false, false, false, false, 1, false, false, 24>(
+                    fu + (size_t)row * I, xq, gate, xscale, gs, count, I, H, nc, nt,
+                    up, us, row_token + row, T);
+            } else {
+                d_gemm_fp8_block128_m16<true, true>(fu + (size_t)row * I, xq, gate, xscale,
+                    gs, count, I, H, nc, nt, up, us, row_token + row, T);
+            }
         } else {
             count = 0;
         }

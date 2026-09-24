@@ -401,6 +401,7 @@ struct Shapes {
     /// was trained sparse: no trap, no NaN, a fluent answer to a different question.
     glm_dsa_pf: bool,
     dsa_decode_batch: bool,
+    dcp_index_canon: bool,
     dsa_select_local: bool,
     dsa_select_split: bool,
     mla_sparse_fp8: bool,
@@ -635,6 +636,7 @@ fn shapes(m: &Model) -> Shapes {
                 }
                 DevOp::IndexSelect => {
                     s.dsa_decode_batch |= inst.i[3] != 0 || inst.i[4] != 0;
+                    s.dcp_index_canon |= inst.i[4] == 3;
                     s.dsa_select_local |= inst.i[4] == 1;
                     s.dsa_select_split |= inst.i[4] == 2;
                 }
@@ -969,6 +971,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("glm_ofold".into(), json!(s.glm_ofold));
     f.insert("glm_dsa_pf".into(), json!(s.glm_dsa_pf));
     f.insert("dsa_decode_batch".into(), json!(s.dsa_decode_batch));
+    f.insert("dcp_index_canon".into(), json!(s.dcp_index_canon));
     f.insert("dsa_select_local".into(), json!(s.dsa_select_local));
     f.insert("dsa_select_split".into(), json!(s.dsa_select_split));
     f.insert("mla_sparse_fp8".into(), json!(s.mla_sparse_fp8));
@@ -1238,6 +1241,9 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     if on("dsa_decode_batch") {
         req.push("PLOW_DSA_DECODE_BATCH=1".into());
     }
+    if on("dcp_index_canon") {
+        req.push("PLOW_DCP_INDEX_CANON=1".into());
+    }
     let mut rec = Vec::new();
     if let Some(v) = t.get("gv_mm_max").and_then(Value::as_u64) {
         rec.push(format!("GV_MM_MAX={v}"));
@@ -1474,6 +1480,9 @@ fn backend_amd(
     }
     if on("dsa_decode_batch") {
         req.push("PLOW_DSA_DECODE_BATCH=1".into());
+    }
+    if on("dcp_index_canon") {
+        req.push("PLOW_DCP_INDEX_CANON=1".into());
     }
     if on("mla_sparse_fp8") {
         req.push("PLOW_MLA_SPARSE_FP8=1".into());
@@ -3716,7 +3725,7 @@ mod tests {
 
     #[test]
     fn dsa_decode_batch_requires_a_row_aware_object() {
-        for (row, local) in [(0, 0), (1, 0), (7, 0), (0, 1)] {
+        for (row, local) in [(0, 0), (1, 0), (7, 0), (0, 1), (0, 3)] {
             let mut d = inst(DevOp::IndexSelect, [0; 8]);
             d.i[3] = row;
             d.i[4] = local;
@@ -3739,12 +3748,20 @@ mod tests {
             );
             assert_eq!(
                 req.iter().any(|r| r == "PLOW_DSA_SELECT_LOCAL=1"),
-                local != 0
+                local == 1
+            );
+            assert_eq!(
+                req.iter().any(|r| r == "PLOW_DCP_INDEX_CANON=1"),
+                local == 3
             );
             let nvcc = manifest["backends"]["nvcc"]["requires"].as_array().unwrap();
             assert_eq!(
                 nvcc.iter().any(|r| r == "PLOW_DSA_DECODE_BATCH=1"),
                 row != 0 || local != 0
+            );
+            assert_eq!(
+                nvcc.iter().any(|r| r == "PLOW_DCP_INDEX_CANON=1"),
+                local == 3
             );
             assert!(config_header(&manifest).contains(&format!(
                 "#define PLOW_PACKET_REQUIRES_DSA_DECODE_BATCH {}\n",

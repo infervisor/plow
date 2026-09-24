@@ -2,6 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+pub fn request_sha256(request: &serde_json::Value) -> Result<String, String> {
+    // Cargo feature unification can select different JSON map orders in plowc and plowrt.
+    let mut canonical = request.clone();
+    canonical.sort_all_objects();
+    let bytes = serde_json::to_vec(&canonical).map_err(|error| error.to_string())?;
+    Ok(crate::decode_objects::image_sha256(&bytes))
+}
+
 pub fn is_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -391,10 +399,7 @@ impl PacketCheckReceipts {
             if !supported
                 || !obligations.insert((&check.checkpoint, &check.request_sha256, check.program))
                 || !is_sha256(&check.verifier_sha256)
-                || check.request_sha256
-                    != crate::decode_objects::image_sha256(
-                        &serde_json::to_vec(&check.request).map_err(|e| e.to_string())?,
-                    )
+                || check.request_sha256 != request_sha256(&check.request)?
                 || check
                     .response
                     .get("ok")
@@ -490,6 +495,24 @@ impl BoundCertificates {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn request_digest_is_independent_of_json_map_order() {
+        let first: serde_json::Value = serde_json::from_str(
+            r#"{"z":[{"b":2,"a":1}],"a":{"d":4,"c":3}}"#,
+        ).unwrap();
+        let second: serde_json::Value = serde_json::from_str(
+            r#"{"a":{"c":3,"d":4},"z":[{"a":1,"b":2}]}"#,
+        ).unwrap();
+        let expected = crate::decode_objects::image_sha256(
+            br#"{"a":{"c":3,"d":4},"z":[{"a":1,"b":2}]}"#,
+        );
+        assert_eq!(super::request_sha256(&first).unwrap(), expected);
+        assert_eq!(super::request_sha256(&second).unwrap(), expected);
+        let mut changed = second;
+        changed["z"][0]["b"] = serde_json::json!(3);
+        assert_ne!(super::request_sha256(&changed).unwrap(), expected);
+    }
+
     use super::*;
 
     fn identity() -> ExecutionIdentity {

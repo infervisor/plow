@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import itertools
 import json
 import math
 from pathlib import Path
@@ -18,10 +19,10 @@ def expected_shapes():
     }
 
 
-def load_case(path, glu=False, weighted=False):
+def load_case(path, glu=False, weighted=False, fp16=False):
     raw = bytearray(path.read_bytes())
     m, n, k = struct.unpack_from("<III", raw)
-    if not min(m, n, k) or sys.byteorder != "little" or (glu and weighted):
+    if not min(m, n, k) or sys.byteorder != "little" or (glu and weighted) or (fp16 and (glu or weighted)):
         raise ValueError("capture requires positive dimensions and a little-endian host")
     kb, nb = (k + 127) // 128, (n + 127) // 128
     branches = 2 if glu else 1
@@ -43,7 +44,7 @@ def load_case(path, glu=False, weighted=False):
     w = take(torch.uint8, (branches * n, k)).view(torch.float8_e4m3fn)
     asc = take(torch.float32, (kb, m)).T.contiguous()
     wsc = take(torch.float32, (branches * nb, kb))
-    out = take(torch.bfloat16, (m, n))
+    out = take(torch.float16 if fp16 else torch.bfloat16, (m, n))
     gates = (take(torch.float32, (m,)),) if weighted else ()
     if offset != len(raw):
         raise ValueError("unexpected capture size")
@@ -65,7 +66,7 @@ def load_quant_case(path):
     return (m, k), x, q, scale, hashlib.sha256(raw).hexdigest()
 
 
-def write_case(path, a, w, asc, wsc, expected, glu=False, row_weights=None):
+def write_case(path, a, w, asc, wsc, expected, glu=False, row_weights=None, fp16=False):
     m, k = a.shape
     n, wk = w.shape
     branches = 2 if glu else 1
@@ -74,7 +75,9 @@ def write_case(path, a, w, asc, wsc, expected, glu=False, row_weights=None):
             raise ValueError("GLU replay requires two aligned output halves")
         n //= 2
     if (not min(m, n, k) or wk != k or a.dtype != torch.uint8 or w.dtype != torch.float8_e4m3fn
-            or asc.dtype != torch.float32 or wsc.dtype != torch.float32 or expected.dtype != torch.bfloat16
+            or (fp16 and (glu or row_weights is not None))
+            or asc.dtype != torch.float32 or wsc.dtype != torch.float32
+            or expected.dtype != (torch.float16 if fp16 else torch.bfloat16)
             or tuple(asc.shape) != ((k + 127) // 128, m)
             or tuple(wsc.shape) != (branches * ((n + 127) // 128), (k + 127) // 128)
             or tuple(expected.shape) != (m, n) or sys.byteorder != "little"):
@@ -90,21 +93,22 @@ def write_case(path, a, w, asc, wsc, expected, glu=False, row_weights=None):
             f.write(row_weights.cpu().contiguous().numpy().tobytes())
 
 
-def load_tensor(path, dtype, shape):
-    raw = bytearray(path.read_bytes())
+def load_tensor(path, dtype, shape, *, live_prefix=False):
     count = 1
     for dim in shape:
         if dim <= 0:
             raise ValueError("capture dimensions must be positive")
         count *= dim
+    with path.open("rb") as stream:
+        raw = bytearray(stream.read(count * torch.empty((), dtype=dtype).element_size()) if live_prefix else stream.read())
     if sys.byteorder != "little" or len(raw) != count * torch.empty((), dtype=dtype).element_size():
         raise ValueError(f"{path}: unexpected tensor size or byte order")
     value = torch.frombuffer(raw, dtype=dtype).reshape(shape).clone()
     return value, hashlib.sha256(raw).hexdigest()
 
 
-def load_routes(path, batch, topk, experts):
-    table, digest = load_tensor(path, torch.int32, (batch, topk, 2))
+def load_routes(path, batch, topk, experts, *, live_prefix=False):
+    table, digest = load_tensor(path, torch.int32, (batch, topk, 2), live_prefix=live_prefix)
     ids = table[:, :, 0].contiguous()
     weights = table[:, :, 1].contiguous().view(torch.float32)
     if (bool((ids < 0).any() or (ids >= experts).any())
@@ -738,7 +742,7 @@ def indexer_selection_scores(rows, stride, profile, device="cpu"):
 
 
 class IndexerSelectionModule:
-    def __init__(self, path):
+    def __init__(self, path, symbol=b"plow_indexer_select_bounds"):
         import ctypes as c
         prop = torch.cuda.get_device_properties(0)
         if not prop.gcnArchName.startswith("gfx950") or prop.multi_processor_count != 256:
@@ -752,7 +756,7 @@ class IndexerSelectionModule:
         self.lib.hipModuleUnload.argtypes = [ptr]
         self.module, self.function = ptr(), ptr()
         self.call("hipModuleLoad", c.byref(self.module), str(path).encode())
-        self.call("hipModuleGetFunction", c.byref(self.function), self.module, b"plow_indexer_select_bounds")
+        self.call("hipModuleGetFunction", c.byref(self.function), self.module, symbol)
 
     def call(self, name, *args):
         status = getattr(self.lib, name)(*args)
@@ -1412,6 +1416,748 @@ def load_indexer_model_tensor(root, record, dtype, shape):
     if digest != record["sha256"]:
         raise ValueError("model indexer tensor hash mismatch")
     return value
+
+
+def rebind_attention_work_metadata(work_indptr, work_info_set):
+    if (work_indptr.dtype != torch.int32 or work_info_set.dtype != torch.int32
+            or work_indptr.shape != (257,) or work_info_set.ndim != 2
+            or work_info_set.shape[1] != 8 or not work_indptr.is_contiguous()
+            or not work_info_set.is_contiguous() or work_indptr.device != work_info_set.device):
+        raise ValueError("invalid captured attention work buffers")
+    # AITER v1_2_pa stores these two addresses, not portable scheduling values.
+    return torch.tensor([work_indptr.data_ptr(), work_info_set.data_ptr()],
+                        dtype=torch.uint64, device=work_indptr.device)
+
+
+def attention_physical_indices(selected, table, length, cache_tokens):
+    if (selected.dtype != torch.int32 or selected.shape != (1, 2048)
+            or table.dtype != torch.int32 or table.ndim != 2 or table.shape[0] != 1
+            or length <= 0 or table.shape[1] * 16 < length):
+        raise ValueError("invalid attention selection geometry")
+    logical = selected[0].long()
+    if (logical.unique().numel() != 2048
+            or not bool(((logical >= 0) & (logical < length)).all())):
+        raise ValueError("invalid attention selection tokens")
+    physical = table[0][logical // 16].long() * 16 + logical % 16
+    if not bool(((physical >= 0) & (physical < cache_tokens)).all()):
+        raise ValueError("invalid attention selection pages")
+    return physical.to(torch.int32)
+
+
+def batched_attention_physical_indices(selected, table, length, cache_tokens):
+    if (selected.ndim != 2 or not selected.shape[0] or selected.shape[1] != 2048
+            or table.ndim != 2 or table.shape[0] != selected.shape[0]):
+        raise ValueError("attention selection batch mismatch")
+    return torch.cat([attention_physical_indices(selected[row:row+1], table[row:row+1], length, cache_tokens)
+                      for row in range(selected.shape[0])])
+
+
+def model_attention_selection_orders(args, manifest, audit, length, expected):
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as ops
+
+    cases = [c for c in audit["invocations"] if c["length"] == length and c["live"] == 1]
+    if len(cases) != 1:
+        raise ValueError("ambiguous attention/indexer invocation binding")
+    invocation = cases[0]["invocation"]
+    records = {}
+    for path in (args.capture / "tensors").glob("*.json"):
+        record = json.loads(path.read_text())
+        if record["invocation_index"] == invocation and record["semantic"].startswith("indexer."):
+            name = record["semantic"].removeprefix("indexer.")
+            if name in records:
+                raise ValueError("duplicate bound indexer input")
+            records[name] = record
+    hashes = {}
+
+    def load(name):
+        record = records[name]
+        context = record["context"]
+        if (record["rank"] != 0 or record["layer"] != 6
+                or context["max_seq_len"] != length
+                or record["prompt_sha256_u32le"] != manifest["requests"][0]["prompt_sha256_u32le"]
+                or record["context_sha256"] != hashlib.sha256(
+                    json.dumps(context, sort_keys=True, separators=(",", ":")).encode()).hexdigest()):
+            raise ValueError("bound indexer input identity mismatch")
+        hashes[name] = record["sha256"]
+        return load_indexer_model_tensor(args.capture, record, getattr(torch, record["source_dtype"]),
+                                         record["source_shape"])
+
+    model = load("selected")[:1].contiguous()
+    if not torch.equal(model, expected):
+        raise ValueError("indexer order differs from attention capture")
+    query, weights, cache, table, schedule = (load(name).cuda() for name in (
+        "q_fp8", "weights", "cache.after", "decode.block_table", "decode.schedule_metadata"))
+    ends = load("decode.seq_lens")
+    if ends.shape != (1, 1) or ends.dtype != torch.int32:
+        raise ValueError("bound indexer length geometry mismatch")
+    ends = ends.reshape(1).cuda()
+    if query.shape != (1, 32, 128) or weights.shape != (1, 32) or ends.tolist() != [length]:
+        raise ValueError("bound indexer decode geometry mismatch")
+    score_inputs = [tensor_digest(v) for v in (query, weights, cache, table, schedule, ends)]
+    scores = torch.full((1, 131072), float("nan"), device="cuda")
+    for repeat in range(2):
+        live = ops.rocm_fp8_paged_mqa_logits(query[:, None], cache.unsqueeze(2), weights,
+            ends, table, schedule, max_model_len=manifest["max_model_len"])[:, :length].clone()
+        if repeat == 0:
+            scores[:, :length] = live
+        elif tensor_digest(scores[:, :length]) != tensor_digest(live):
+            raise ValueError("bound indexer scores are not repeatable")
+    if score_inputs != [tensor_digest(v) for v in (query, weights, cache, table, schedule, ends)]:
+        raise ValueError("bound indexer scoring changed inputs")
+    starts = torch.zeros_like(ends)
+    model_evidence = indexer_selection_evidence(scores, starts, ends, model.cuda())
+    if not model_evidence["passed"]:
+        raise ValueError("captured selection does not satisfy regenerated scores")
+    if ops._get_aiter_top_k_kernel(is_prefill=False, compress_ratio=1,
+            num_rows=1, max_valid_seq_len=131072) is not None:
+        raise ValueError("unexpected selection dispatch")
+    input_hashes = [tensor_digest(v) for v in (scores, starts, ends)]
+    variants, reports = [], []
+    native = IndexerSelectionModule(args.native_indexer_selection)
+    try:
+        for implementation in ("vllm", "plow"):
+            for repeat, poison in enumerate((-7, -19)):
+                guarded = torch.full((3, 2048), poison, dtype=torch.int32, device="cuda")
+                indices = guarded[1:2]
+                if implementation == "vllm":
+                    torch.ops._C.top_k_per_row_decode(scores, 1, ends, indices, 1,
+                                                      scores.stride(0), scores.stride(1), 2048)
+                else:
+                    native.launch(indices, scores, ends)
+                proof = indexer_selection_evidence(scores, starts, ends, indices)
+                if (not proof["passed"] or not bool((guarded[0] == poison).all())
+                        or not bool((guarded[-1] == poison).all())):
+                    raise ValueError("bound selector evidence or guard failure")
+                result = indices.cpu().contiguous()
+                name = f"{implementation}{repeat}"
+                path = args.output.parent / f"length{length}.{name}.indices.bin"
+                with path.open("xb") as stream:
+                    stream.write(result.numpy().tobytes())
+                variants.append((name, result))
+                reports.append(dict(name=name, evidence=proof, file=path.name, sha256=tensor_digest(result),
+                    same_order_as_model=torch.equal(result, model),
+                    same_set_as_model=torch.equal(result.sort().values, model.sort().values)))
+    finally:
+        native.close()
+    if input_hashes != [tensor_digest(v) for v in (scores, starts, ends)]:
+        raise ValueError("bound selection changed scores or bounds")
+    return variants, dict(invocation=invocation, captured_tensor_sha256=hashes,
+        score_sha256=input_hashes[0], model_evidence=model_evidence, runs=reports, inputs_unchanged=True)
+
+
+def replay_model_query(args, rocm_aiter_ops, version):
+    from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config, AITER_CONFIGS, gemm_a8w8_blockscale_ck
+    from vllm.model_executor.layers.quantization.utils.quant_utils import scaled_dequantize
+    from vllm.model_executor.layers.attention.mla_attention import dynamic_per_batched_tensor_quant
+
+    if version != "0.29.0" or args.checkpoint is None or args.tp != 8:
+        raise ValueError("requires pinned model capture and connected TP8 run record")
+    run_bytes = args.reference_json.read_bytes() if args.reference_json else None
+    native_root = args.reference_json.parent if args.reference_json else None
+    manifest_bytes = (args.capture / "reference/manifest.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    m = len(manifest["requests"])
+    if (manifest["vllm_version"] != version or manifest["invalid_cases"]
+            or manifest["tensor_parallel_size"] != 8 or m not in (1, 8)):
+        raise ValueError("requires valid original-model TP8 capture")
+    if native_root:
+        metadata = json.loads((native_root / "inputs/reference.json").read_text())
+        if (metadata["capture_manifest_sha256"] != hashlib.sha256(manifest_bytes).hexdigest()
+                or metadata["batch"] != m or metadata["ctx"] != 8193):
+            raise ValueError("connected run is not bound to this model capture")
+        for name, digest in json.loads(run_bytes)["inputs"].items():
+            if hashlib.sha256((native_root / "inputs" / name).read_bytes()).hexdigest() != digest:
+                raise ValueError("connected input changed")
+    records = {}
+    for path in (args.capture / "tensors").glob("*.json"):
+        r = json.loads(path.read_text())
+        if r["context"]["max_seq_len"] == 8193:
+            if r["semantic"] in records:
+                raise ValueError("ambiguous query capture")
+            records[r["semantic"]] = r
+
+    def captured(name):
+        r = records[name]
+        if (r["rank"] != 0 or r["layer"] != 6
+                or r["prompt_sha256_u32le"] != manifest["requests"][0]["prompt_sha256_u32le"]
+                or r["context_sha256"] != hashlib.sha256(json.dumps(
+                    r["context"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()):
+            raise ValueError("wrong query capture rank/layer")
+        return load_indexer_model_tensor(args.capture, r, getattr(torch, r["source_dtype"]), r["source_shape"])
+
+    identities = {}
+
+    def native(name, dtype, shape, rank=0):
+        count = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        path = native_root / "outputs" / f"rank{rank}.{name}.bin"
+        with path.open("rb") as stream:
+            raw = stream.read(count)
+        if len(raw) != count:
+            raise ValueError("short native query operand")
+        identities[name if rank == 0 else f"rank{rank}.{name}"] = dict(prefix_bytes=count, allocation_bytes=path.stat().st_size,
+                                prefix_sha256=hashlib.sha256(raw).hexdigest())
+        return torch.frombuffer(bytearray(raw), dtype=dtype).reshape(shape)
+
+    latent = captured("indexer.input.qr")
+    if latent.shape != (m, 2048) or (native_root and not torch.equal(latent, native("act.qlat", torch.bfloat16, (m, 2048)))):
+        raise ValueError("query latent is not exact model input")
+    inventory_bytes = (args.capture / "reference/precision.json").read_bytes()
+    inventory = json.loads(inventory_bytes)
+    prefix = "model.layers.6.self_attn."
+    module = inventory["ranks"][0]["modules"][prefix + "q_b_proj"]
+    selected = module["attributes"]["quant_method"]["fields"]["fp8_linear"]
+    if (selected["class_name"].rsplit(".", 1)[-1] != "AiterFp8BlockScaledMMKernel"
+            or selected["fields"]["use_triton"] is not False
+            or selected["fields"]["quant_fp8"]["fields"]["use_ue8m0"] is not False):
+        raise ValueError("unexpected installed query projection backend")
+    weight, scale, _ = qb_weights(args.checkpoint, 6, 0, 8)
+    boundaries = {}
+    for name, value in ((prefix + "q_b_proj.weight", weight), (prefix + "q_b_proj.weight_scale_inv", scale)):
+        if native_root:
+            boundaries[name] = boundary_difference(native(name, value.dtype, value.shape), value)
+    stride = module["tensors"]["weight"]["stride"]
+    gpu_weight = torch.empty_strided(weight.shape, stride, dtype=weight.dtype, device="cuda")
+    gpu_weight.copy_(weight)
+    xq, xs = rocm_aiter_ops.group_fp8_quant(latent.cuda(), 128)
+    for name, value in (("act.qb_xq", xq), ("act.qb_xs", xs.T.contiguous())):
+        if native_root:
+            boundaries[name] = boundary_difference(native(name, value.dtype, value.shape), value.cpu())
+    projected = [rocm_aiter_ops.gemm_a8w8_blockscale(xq, gpu_weight, xs, scale.cuda(),
+        [128, 128], output_dtype=torch.bfloat16).cpu() for _ in range(2)]
+    native_qb = native("act.qb", torch.bfloat16, (m, 2048)) if native_root else None
+    model_qb = captured("block.qb") if "block.qb" in records else None
+    if native_qb is None and model_qb is None:
+        raise ValueError("query replay requires native or captured model Q-B output")
+    operands = [("installed_qb0", projected[0]), ("installed_qb1", projected[1])]
+    for label, qb in (("native_qb", native_qb), ("model_qb", model_qb)):
+        if qb is not None:
+            boundaries[label + "_vs_installed"] = [boundary_difference(qb, value) for value in projected]
+            operands.append((label, qb))
+    tuned = get_CKGEMM_config(m, 2048, 2048, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE)
+    splits = 1 << int(tuned["splitK"]) if tuned is not None else 1
+    if splits > 8 or 2048 % (128 * splits):
+        raise ValueError("query split-K geometry is outside the audited contract")
+    parts, part_records = [], []
+    for part in range(splits):
+        lo, hi = part * (2048 // splits), (part + 1) * (2048 // splits)
+        a = xq[:, lo:hi].contiguous()
+        w = gpu_weight[:, lo:hi].contiguous()
+        asc = xs[:, lo // 128:hi // 128].contiguous()
+        wsc = scale[:, lo // 128:hi // 128].contiguous().cuda()
+        def isolated():
+            y = torch.empty((m, 2048), dtype=torch.bfloat16, device="cuda")
+            return gemm_a8w8_blockscale_ck(a, w, asc, wsc, y, splitK=0,
+                kernelName="" if tuned is None else str(tuned["kernelName"])).cpu()
+        value, repeat = isolated(), isolated()
+        path = args.output.parent / f"query.part{part}.bin"
+        write_case(path, a.cpu().view(torch.uint8), w.cpu(), asc.cpu().T.contiguous(), wsc.cpu(), value)
+        parts.append(value)
+        part_records.append(dict(part=part, k_start=lo, k_end=hi, file=path.name,
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            repeat_bitwise=tensor_digest(value) == tensor_digest(repeat)))
+    lower, upper = bf16_order_bounds(torch.stack(parts, dim=1))
+    order_bounds = {}
+    for label, value in operands:
+        outside = (value < lower) | (value > upper) | ~torch.isfinite(value)
+        order_bounds[label] = dict(within_bounds=not bool(outside.any()), outside_count=int(outside.sum()),
+            reachability=bf16_order_reachability(torch.stack(parts, dim=1), value))
+    accumulation = dict(split_count=splits, parts=part_records, order_bounds=order_bounds,
+        selected_config=None if tuned is None else {key: str(value) for key, value in tuned.items()})
+    original, scales = mla_kvb_weights(args.checkpoint, 6, 0, 8)
+    dequant = scaled_dequantize(original.cuda(), scales.cuda(), group_shape=[128, 128], out_dtype=torch.bfloat16)
+    uk, uv = dequant.T.reshape(512, 8, 448).split([192, 256], dim=-1)
+    wk, wk_scale = dynamic_per_batched_tensor_quant(uk.transpose(0, 1), dtype=torch.float8_e4m3fn)
+    for name, value in ((prefix + "derived.mla_fp8_tp8.wk.weight", wk.cpu()),
+                        (prefix + "derived.mla_fp8_tp8.wk.weight_scale", wk_scale.cpu().reshape(1))):
+        if native_root:
+            operand = native(name, value.dtype, value.shape)
+            boundaries[name] = boundary_difference(operand.reshape(1, -1), value.reshape(1, -1))
+    full_query = captured("attention.query")
+    if full_query.shape != (m, 16, 576) or not torch.equal(full_query[:, ::2], full_query[:, 1::2]):
+        raise ValueError("unexpected duplicated model query geometry")
+    model_query = full_query[:, ::2, :512].contiguous()
+    actual_query = native("act.qa", torch.bfloat16, (m, 8, 512)) if native_root else None
+    transforms = []
+    for label, qb in operands:
+        x = qb.cuda().reshape(m, 8, 256)[..., :192]
+        results = [rocm_aiter_ops.triton_fp8_bmm(x.transpose(0, 1), wk, wk_scale,
+            group_size=128, transpose_bm=True).cpu() for _ in range(2)]
+        transforms.append(dict(input=label, repeat_bitwise=tensor_digest(results[0]) == tensor_digest(results[1]),
+            vs_native=boundary_difference(results[0], actual_query) if actual_query is not None else None,
+            vs_model=boundary_difference(results[0], model_query)))
+    downstream = {}
+    if native_root:
+        from safetensors import safe_open
+        wv, wv_scale = dynamic_per_batched_tensor_quant(uv.permute(1, 2, 0), dtype=torch.float8_e4m3fn)
+        for name, value in ((prefix + "derived.mla_fp8_tp8.wv.weight", wv.cpu()),
+                            (prefix + "derived.mla_fp8_tp8.wv.weight_scale", wv_scale.cpu().reshape(1))):
+            operand = native(name, value.dtype, value.shape)
+            downstream[name] = boundary_difference(operand.reshape(1, -1), value.reshape(1, -1))
+        olat = native("act.olat", torch.bfloat16, (m, 8, 512))
+        oat = native("act.oat", torch.bfloat16, (m, 2048))
+        value_results = [rocm_aiter_ops.triton_fp8_bmm(olat.cuda().transpose(0, 1), wv, wv_scale,
+            group_size=128, transpose_bm=True).cpu().reshape(m, 2048) for _ in range(2)]
+        downstream["value_transform"] = [boundary_difference(oat, value) for value in value_results]
+        index = json.loads((args.checkpoint / "model.safetensors.index.json").read_text())["weight_map"]
+        projection = []
+        for suffix, width in (("weight", 2048), ("weight_scale_inv", 16)):
+            name = prefix + "o_proj." + suffix
+            with safe_open(args.checkpoint / index[name], framework="pt", device="cpu") as shard:
+                value = shard.get_slice(name)[:, :width].contiguous()
+            loaded_name = name + "_fp8" if suffix == "weight" else name
+            downstream[name] = boundary_difference(native(loaded_name, value.dtype, value.shape), value)
+            projection.append(value.cuda())
+        oq, os = rocm_aiter_ops.group_fp8_quant(oat.cuda(), 128)
+        partial = native("act.og_tp", torch.bfloat16, (m, 6144))
+        projection_results = [rocm_aiter_ops.gemm_a8w8_blockscale(oq, projection[0], os, projection[1],
+            [128, 128], output_dtype=torch.bfloat16).cpu() for _ in range(2)]
+        downstream["output_projection"] = [boundary_difference(partial, value) for value in projection_results]
+        downstream["output_projection_repeat_bitwise"] = tensor_digest(projection_results[0]) == tensor_digest(projection_results[1])
+        config = get_CKGEMM_config(m, 6144, 2048, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE)
+        count = 1 << int(config["splitK"]) if config is not None else 1
+        if count > 8 or 2048 % (128 * count):
+            raise ValueError("output projection partition is outside the audited contract")
+        output_parts, output_records = [], []
+        for part in range(count):
+            lo, hi = part * (2048 // count), (part + 1) * (2048 // count)
+            a, w = oq[:, lo:hi].contiguous(), projection[0][:, lo:hi].contiguous()
+            asc, wsc = os[:, lo // 128:hi // 128].contiguous(), projection[1][:, lo // 128:hi // 128].contiguous()
+            def isolated_output():
+                y = torch.empty((m, 6144), dtype=torch.bfloat16, device="cuda")
+                return gemm_a8w8_blockscale_ck(a, w, asc, wsc, y, splitK=0,
+                    kernelName="" if config is None else str(config["kernelName"])).cpu()
+            value, repeat = isolated_output(), isolated_output()
+            path = args.output.parent / f"output.part{part}.bin"
+            write_case(path, a.cpu().view(torch.uint8), w.cpu(), asc.cpu().T.contiguous(), wsc.cpu(), value)
+            output_parts.append(value)
+            output_records.append(dict(file=path.name, sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                repeat_bitwise=tensor_digest(value) == tensor_digest(repeat)))
+        downstream["output_accumulation"] = dict(split_count=count, parts=output_records,
+            selected_config=None if config is None else {key: str(value) for key, value in config.items()},
+            reachability={label: bf16_order_reachability(torch.stack(output_parts, dim=1), value)
+                for label, value in (("native", partial), ("installed0", projection_results[0]),
+                                     ("installed1", projection_results[1]))})
+        from vllm.kernels.aiter_ops import fused_add_rms_norm
+        norm_name = "model.layers.6.post_attention_layernorm.weight"
+        with safe_open(args.checkpoint / index[norm_name], framework="pt", device="cpu") as shard:
+            gamma = shard.get_tensor(norm_name)
+        epsilon = json.loads((args.checkpoint / "config.json").read_text())["rms_norm_eps"]
+        summed = torch.zeros((m, 6144), dtype=torch.float32)
+        for rank in range(8):
+            summed += native("act.og_tp", torch.bfloat16, (m, 6144), rank).float()
+        residual, _ = load_tensor(native_root / "inputs/act.x.bin", torch.bfloat16, (m, 6144))
+        norm_results = [fused_add_rms_norm.impl_fn(summed.bfloat16().cuda(), residual.cuda(), gamma.cuda(), epsilon)
+                        for _ in range(2)]
+        norm, updated = (value.cpu() for value in norm_results[0])
+        downstream["post_attention"] = dict(
+            scope="installed fused norm on ordered native TP partials and captured residual; not reference TP collective qualification",
+            reference_weight_sha256=tensor_digest(gamma), native_norm_weight_captured=False,
+            repeat_bitwise=all(tensor_digest(a) == tensor_digest(b) for a, b in zip(norm_results[0], norm_results[1])),
+            ranks=[dict(rank=rank,
+                norm=boundary_difference(native("act.xn2", torch.bfloat16, (m, 6144), rank), norm),
+                residual=boundary_difference(native("act.xmid", torch.bfloat16, (m, 6144), rank), updated))
+                for rank in range(8)])
+    report = dict(scope="actual rank0/layer6 query projection and absorbed transform localization, not precision qualification",
+        precision_qualified=False, batch=m, run_record_sha256=hashlib.sha256(run_bytes).hexdigest() if run_bytes else None,
+        capture_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        inventory_sha256=hashlib.sha256(inventory_bytes).hexdigest(), native_prefixes=identities,
+        boundaries=boundaries, transforms=transforms, accumulation=accumulation, downstream=downstream,
+        qb_repeat_bitwise=tensor_digest(projected[0]) == tensor_digest(projected[1]))
+    with args.output.open("x") as stream:
+        json.dump(report, stream, indent=2, allow_nan=False)
+    print(json.dumps(report, allow_nan=False), flush=True)
+    return 0
+
+
+def check_model_decode_boundaries(args):
+    if args.reference_json is None:
+        raise ValueError("requires connected run-record.json")
+    root = args.reference_json.parent
+    run_bytes = args.reference_json.read_bytes()
+    run = json.loads(run_bytes)
+    meta = json.loads((root / "inputs/reference.json").read_text())
+    manifest_bytes = (args.capture / "reference/manifest.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    m, ctx = meta["batch"], meta["ctx"]
+    if (m not in (1, 8) or ctx not in (8193, 8194, 8195, 8196)
+            or len(manifest["requests"]) != m or manifest["invalid_cases"]
+            or manifest["vllm_version"] != "0.29.0" or manifest["tensor_parallel_size"] != 8
+            or meta["capture_manifest_sha256"] != hashlib.sha256(manifest_bytes).hexdigest()):
+        raise ValueError("connected decode does not match model capture")
+    if any(run["inputs"].get(name) != digest for name, digest in meta["files"].items()):
+        raise ValueError("packed model operands differ from connected run inputs")
+    for name, digest in run["inputs"].items():
+        with (root / "inputs" / name).open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
+                raise ValueError("connected input changed")
+    records = {}
+    for path in (args.capture / "tensors").glob("*.json"):
+        record = json.loads(path.read_text())
+        if record["context"]["max_seq_len"] != ctx:
+            continue
+        if record["semantic"] in records:
+            raise ValueError("ambiguous captured boundary")
+        records[record["semantic"]] = record
+
+    def model(name):
+        record = records[name]
+        if (record["rank"] != 0 or record["layer"] != 6
+                or record["prompt_sha256_u32le"] != manifest["requests"][0]["prompt_sha256_u32le"]
+                or record["context_sha256"] != hashlib.sha256(json.dumps(
+                    record["context"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()):
+            raise ValueError("wrong model boundary identity")
+        return load_indexer_model_tensor(args.capture, record,
+            getattr(torch, record["source_dtype"]), record["source_shape"])
+
+    def native(name, dtype, shape):
+        return load_tensor(root / "outputs" / f"rank0.{name}.bin", dtype, shape,
+                           live_prefix=name.startswith("act."))[0]
+
+    boundaries = {}
+    for source, target in (("block.xn", "act.xn"), ("indexer.input.qr", "act.qlat"),
+                           ("block.qb", "act.qb"), ("attention.output", "act.olat")):
+        expected = model(source)
+        boundaries[target] = boundary_difference(native(target, expected.dtype, expected.shape), expected)
+    query = model("attention.query")
+    if query.shape != (m, 16, 576) or not torch.equal(query[:, ::2], query[:, 1::2]):
+        raise ValueError("unexpected duplicated model query heads")
+    for name, expected in (("act.qa", query[:, ::2, :512]), ("act.qr", query[:, ::2, 512:])):
+        boundaries[name] = boundary_difference(native(name, expected.dtype, expected.shape), expected)
+    for name, width in (("ckv", 512), ("krot", 64)):
+        expected, _ = load_tensor(root / "inputs" / f"kv.6.{name}.bin", torch.bfloat16, (m, ctx, width))
+        actual = torch.stack([native(f"slot{slot}.kv.6.{name}", torch.bfloat16, (ctx, width))
+                              for slot in range(m)])
+        boundaries["kv." + name + ".new_row"] = boundary_difference(actual[:, -1], expected[:, -1])
+        boundaries["kv." + name + ".history"] = dict(bitwise=torch.equal(actual[:, :-1], expected[:, :-1]),
+            sha256=tensor_digest(actual[:, :-1]), reference_sha256=tensor_digest(expected[:, :-1]))
+    selected = model("indexer.selected")[:m].contiguous()
+    actual = native("act.iidx", torch.int32, (m, 2048))
+    for value in (actual, selected):
+        sparse_decode_indices(value, ctx)
+    selection = dict(sha256=tensor_digest(actual), reference_sha256=tensor_digest(selected),
+        order_bitwise=torch.equal(actual, selected),
+        overlap_per_row=[len(set(a) & set(b)) for a, b in zip(actual.tolist(), selected.tolist())])
+    report = dict(scope="rank0 actual-model decode boundary localization; not precision qualification",
+        precision_qualified=False, batch=m, ctx=ctx, boundaries=boundaries, selection=selection,
+        run_record_sha256=hashlib.sha256(run_bytes).hexdigest(),
+        capture_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest())
+    with args.output.open("x") as stream:
+        json.dump(report, stream, indent=2, allow_nan=False)
+    print(json.dumps(report), flush=True)
+    return 0
+
+
+def pack_model_block(args):
+    manifest_bytes = (args.capture / "reference/manifest.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    audit_path = args.reference_json or (args.capture / "block-cache-audit.json")
+    audit_bytes = audit_path.read_bytes()
+    audit = json.loads(audit_bytes)
+    batch = len(manifest["requests"])
+    if (manifest["vllm_version"] != "0.29.0" or manifest["invalid_cases"]
+            or manifest["tensor_parallel_size"] != 8 or batch not in (1, 8)
+            or [c["length"] for c in audit["block_invocations"]] != [8193, 8194, 8195, 8196]):
+        raise ValueError("requires complete audited original-model block capture")
+    if batch > 1 and (audit.get("batch") != batch
+            or audit.get("manifest_sha256") != hashlib.sha256(manifest_bytes).hexdigest()
+            or [c["length"] for c in audit.get("cache_invocations", [])] != [8193, 8194, 8195, 8196]
+            or any(c["batch"] != batch for c in audit["cache_invocations"])):
+        raise ValueError("requires manifest-bound batched cache audit")
+    records = {}
+    for path in (args.capture / "tensors").glob("*.json"):
+        record = json.loads(path.read_text())
+        length = record["context"]["max_seq_len"]
+        key = length, record["semantic"]
+        if length < 8193:
+            continue
+        if key in records:
+            raise ValueError("ambiguous model block tensor")
+        records[key] = record
+    cases = []
+    for length in (8193, 8194, 8195, 8196):
+        identities = {}
+
+        def load(name):
+            record = records[length, name]
+            if (record["rank"] != 0 or record["layer"] != 6
+                    or record["prompt_sha256_u32le"] != manifest["requests"][0]["prompt_sha256_u32le"]):
+                raise ValueError("wrong model block identity")
+            identities[name] = record["sha256"]
+            if batch > 1:
+                category = "block_invocations" if name.startswith("block.") else "cache_invocations"
+                bound = next(row for row in audit[category] if row["length"] == length)["tensor_sha256"]
+                key = name.removeprefix("block.") if category == "block_invocations" else name
+                if bound.get(key) != record["sha256"]:
+                    raise ValueError("block packing tensor differs from batch audit")
+            return load_indexer_model_tensor(args.capture, record,
+                getattr(torch, record["source_dtype"]), record["source_shape"])
+
+        directory = args.output.parent / f"length{length}"
+        directory.mkdir(parents=True, exist_ok=False)
+        outputs = {}
+
+        def save(name, value):
+            data = value.contiguous().view(torch.uint8).numpy().tobytes()
+            with (directory / name).open("xb") as stream:
+                stream.write(data)
+            outputs[name] = hashlib.sha256(data).hexdigest()
+
+        save("act.x.bin", load("block.x"))
+        for source, target in (("xn", "act.xn"), ("xmid", "act.xmid"), ("xn2", "act.xn2")):
+            save(target + ".reference.bf16", load("block." + source))
+        hidden, residual = load("block.output.hidden"), load("block.output.residual")
+        save("reference.bf16", (hidden.float() + residual.float()).bfloat16())
+        save("input.hidden.reference.bf16", load("block.input.hidden"))
+        save("input.residual.reference.bf16", load("block.input.residual"))
+        selected = load("indexer.selected")[:batch]
+        save("act.iidx.bin", selected)
+        cache, table = load("attention.cache"), load("attention.block_table")
+        logical = torch.arange(length, dtype=torch.int64)
+        compact = []
+        for row in range(batch):
+            attention_physical_indices(selected[row:row+1], table[row:row+1], length, cache.shape[0] * 16)
+            pages = table[row][logical // 16].long()
+            if not bool(((pages >= 0) & (pages < cache.shape[0])).all()):
+                raise ValueError("invalid full block main-cache pages")
+            compact.append(cache[pages, logical % 16])
+        compact = torch.stack(compact)
+        save("kv.6.ckv.bin", compact[:, :, :512])
+        save("kv.6.krot.bin", compact[:, :, 512:])
+        del cache, compact
+        cache, table = load("indexer.cache.before"), load("indexer.decode.block_table")
+        compact = torch.stack([compact_indexer_model_cache(cache, table[row:row+1], length,
+            ((length + 15) // 16) * 16) for row in range(batch)])
+        save("kv.6.kidx_fp8.bin", compact)
+        del cache, compact
+        metadata = dict(batch=batch, ctx=length, tolerance_rel_l2=0.0,
+            stages=["act.xn", "act.xmid", "act.xn2"],
+            scope="original model block; input is captured rounded residual, raw fused-norm operands retained; strict diagnostic, not qualified",
+            captured_tensor_sha256=identities, files=outputs,
+            capture_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+            capture_audit_sha256=hashlib.sha256(audit_bytes).hexdigest())
+        with (directory / "reference.json").open("x") as stream:
+            json.dump(metadata, stream, indent=2)
+        cases.append(dict(length=length, directory=directory.name, files=outputs))
+    with args.output.open("x") as stream:
+        json.dump(dict(scope="CPU block operand packing, not native execution", cases=cases), stream, indent=2)
+    return 0
+
+
+def export_model_attention_fixture(path, values, indices, reference, length):
+    from types import SimpleNamespace
+
+    if values["query"].shape != (1, 16, 576) or reference.shape != (1, 8, 512):
+        raise ValueError("invalid model attention fixture geometry")
+    query = values["query"].cuda()
+    if not torch.equal(query[:, ::2], query[:, 1::2]):
+        raise ValueError("model attention query heads are not duplicated")
+    logical = torch.arange(length, dtype=torch.int64)
+    pages = values["block_table"][0][logical // 16].long()
+    if not bool(((pages >= 0) & (pages < values["cache"].shape[0])).all()):
+        raise ValueError("invalid model attention cache pages")
+    kv = values["cache"][pages, logical % 16].unsqueeze(0).contiguous().cuda()
+    cap, nwork = 257, int(values["work_indptr"][-1])
+    if not 0 < nwork <= cap or values["reduce_indptr"][:2].tolist() != [0, nwork]:
+        raise ValueError("invalid model attention live reduction")
+    metadata = {name: values[name].cuda() for name in (
+        "qo_indptr", "paged_kv_indptr", "paged_kv_last_page_len", "work_indptr")}
+    metadata.update(work_info_set=values["work_info_set"][:cap].contiguous().cuda(),
+        reduce_indptr=values["reduce_indptr"][:2].contiguous().cuda(),
+        reduce_final_map=values["reduce_final_map"][:1].contiguous().cuda(),
+        reduce_partial_map=values["reduce_partial_map"][:cap].contiguous().cuda(),
+        paged_kv_indices=indices.flatten().contiguous().cuda())
+    metadata["work_meta_data"] = rebind_attention_work_metadata(
+        metadata["work_indptr"], metadata["work_info_set"])
+    md = SimpleNamespace(max_seq_len=length, topk_tokens=2048, **metadata)
+    return export_attention_ps_case(path, query, kv, md,
+        reference.repeat_interleave(2, dim=1).cuda(), 0.0625)
+
+
+def replay_model_attention(args, version):
+    import inspect
+    from types import SimpleNamespace
+    from vllm.platforms import current_platform
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import ROCMAiterMLASparseImpl
+
+    source = Path(inspect.getfile(ROCMAiterMLASparseImpl))
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    if (version != "0.29.0" or args.tp != 8 or args.indexer_layer != 6
+            or current_platform.num_compute_units() != 256
+            or source_hash != "187d72a2ecbf0c845950454dbc3cda2c7eff022568a035ebb57ab5b8b98b132c"):
+        raise ValueError("requires pinned vLLM 0.29 TP8 gfx950 attention backend")
+    manifest_bytes = (args.capture / "reference/manifest.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    batch = len(manifest["requests"])
+    audit_path = args.capture / ("cache-audit.json" if batch == 1 else "batch-cache-audit-v2.json")
+    audit_bytes = audit_path.read_bytes()
+    audit = json.loads(audit_bytes)
+    if (manifest["vllm_version"] != version or manifest["invalid_cases"]
+            or manifest["tensor_parallel_size"] != 8 or batch not in (1, 8)):
+        raise ValueError("invalid original-model attention capture")
+    request = manifest["requests"][0]
+    if batch > 1 and (audit["batch"] != batch
+            or audit["manifest_sha256"] != hashlib.sha256(manifest_bytes).hexdigest()
+            or args.export_attention_ps or args.native_indexer_selection is not None):
+        raise ValueError("requires bound batch audit; batched fixture export/selector replay unsupported")
+    cases = audit["attention_invocations"] if batch == 1 else audit["cache_invocations"]
+    if (len(request["prompt_token_ids"]) != 8192
+            or [c["length"] for c in cases] != [8193, 8194, 8195, 8196]
+            or (batch == 1 and not all(c["mapping_matches_indexer"] for c in cases))):
+        raise ValueError("incomplete original-model attention history")
+    native_root = args.reference_json.parent if args.reference_json else None
+    if native_root:
+        run_bytes = args.reference_json.read_bytes()
+        run = json.loads(run_bytes)
+        meta = json.loads((native_root / "inputs/reference.json").read_text())
+        if (meta["batch"] != batch or meta["capture_manifest_sha256"] != hashlib.sha256(manifest_bytes).hexdigest()
+                or meta["capture_audit_sha256"] != hashlib.sha256(audit_bytes).hexdigest()):
+            raise ValueError("native attention run differs from audited capture")
+        for name, digest in run["inputs"].items():
+            with (native_root / "inputs" / name).open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
+                    raise ValueError("native attention input changed")
+        cases = [case for case in cases if case["length"] == meta["ctx"]]
+        if len(cases) != 1:
+            raise ValueError("native attention context missing from capture")
+    records = {}
+    for path in (args.capture / "tensors").glob("attention.*.json"):
+        record = json.loads(path.read_text())
+        key = record["invocation_index"], record["semantic"]
+        if key in records:
+            raise ValueError("duplicate attention capture record")
+        records[key] = record
+    results = []
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    if args.native_indexer_selection is not None:
+        from vllm.v1.worker.workspace import init_workspace_manager
+        init_workspace_manager(torch.device("cuda"))
+    for case in cases:
+        values, identities = {}, {}
+        context = None
+        for (invocation, semantic), record in records.items():
+            if (batch == 1 and invocation != case["invocation"]) or (batch > 1
+                    and record["context"]["max_seq_len"] != case["length"]):
+                continue
+            ctx = record["context"]
+            if (record["rank"] != 0 or record["layer"] != 6
+                    or record["prompt_sha256_u32le"] != request["prompt_sha256_u32le"]
+                    or ctx != dict(num_actual_tokens=batch, max_seq_len=case["length"], block_size=16,
+                                   topk_tokens=2048, layer_name="model.layers.6.self_attn.attn", scale=0.0625)
+                    or hashlib.sha256(json.dumps(ctx, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                    != record["context_sha256"]):
+                raise ValueError("attention capture identity mismatch")
+            context = ctx
+            name = semantic.removeprefix("attention.")
+            if name in values or (batch > 1 and semantic in case["tensor_sha256"]
+                    and case["tensor_sha256"][semantic] != record["sha256"]):
+                raise ValueError("ambiguous attention tensor or changed audited tensor")
+            dtype = {"bfloat16": torch.bfloat16, "int32": torch.int32, "uint64": torch.uint64}[record["source_dtype"]]
+            values[name] = load_indexer_model_tensor(args.capture, record, dtype, record["source_shape"])
+            identities[name] = record["sha256"]
+        if (context is None or values["query"].shape != (batch, 16, 576)
+                or values["output"].shape != (batch, 8, 512) or values["cache"].shape[1:] != (16, 576)
+                or values["work_meta_data"].shape != (2,) or values["qo_indptr"].tolist() != list(range(batch + 1))
+                or values["paged_kv_indptr"].tolist() != [i * 2048 for i in range(batch + 1)]
+                or values["paged_kv_last_page_len"].tolist() != [1] * batch):
+            raise ValueError("attention capture geometry mismatch")
+        def physical_indices(indices):
+            if indices.shape != (batch, 2048):
+                raise ValueError("attention selection batch mismatch")
+            return batched_attention_physical_indices(indices, values["block_table"],
+                case["length"], values["cache"].shape[0] * 16)
+        physical = physical_indices(values["selected"][:batch])
+        if (not torch.equal(physical, values["paged_kv_indices"].to(torch.int64))
+                or not bool(((physical >= 0) & (physical < values["cache"].shape[0] * 16)).all())):
+            raise ValueError("attention page mapping mismatch")
+        variants = []
+        selection = None
+        if args.native_indexer_selection is not None:
+            variants, selection = model_attention_selection_orders(
+                args, manifest, audit, case["length"], values["selected"][:1])
+        query, cache = values["query"].cuda(), values["cache"].cuda()
+        variants = [(name, indices, query) for name, indices in variants]
+        native_output = None
+        if native_root:
+            def native(name, dtype, shape):
+                return load_tensor(native_root / "outputs" / f"rank0.{name}.bin", dtype, shape, live_prefix=True)[0]
+            nq = torch.cat((native("act.qa", torch.bfloat16, (batch, 8, 512)),
+                            native("act.qr", torch.bfloat16, (batch, 8, 64))), dim=-1).repeat_interleave(2, dim=1).cuda()
+            ni = native("act.iidx", torch.int32, (batch, 2048))
+            if not torch.equal(ni.sort(-1).values, values["selected"][:batch].sort(-1).values):
+                raise ValueError("counterfactual requires identical selected sets")
+            native_output = native("act.olat", torch.bfloat16, (batch, 8, 512))
+            variants += [("native-query-model-order", values["selected"][:batch], nq),
+                         ("model-query-native-order", ni, query), ("native-query-native-order", ni, nq)]
+        impl = SimpleNamespace(num_heads=8, kv_lora_rank=512, scale=context["scale"])
+        layer = SimpleNamespace(_q_scale=torch.ones((), device="cuda"), _k_scale=torch.ones((), device="cuda"))
+        repeats, outputs = [], []
+        for repeat in range(2):
+            metadata = {name: values[name].cuda() for name in (
+                "qo_indptr", "paged_kv_indptr", "paged_kv_indices", "paged_kv_last_page_len",
+                "work_indptr", "work_info_set", "reduce_indptr", "reduce_final_map", "reduce_partial_map")}
+            metadata["work_meta_data"] = rebind_attention_work_metadata(metadata["work_indptr"], metadata["work_info_set"])
+            md = SimpleNamespace(attn_out_dtype=torch.bfloat16, **metadata)
+            result = ROCMAiterMLASparseImpl._forward_mla(impl, layer, query, cache, md).cpu().contiguous()
+            comparison = boundary_difference(result, values["output"])
+            path = args.output.parent / f"length{case['length']}.repeat{repeat}.bf16.bin"
+            with path.open("xb") as stream:
+                stream.write(result.view(torch.uint8).numpy().tobytes())
+            comparison.update(file=path.name, sha256=tensor_digest(result))
+            repeats.append(comparison)
+            outputs.append(result)
+        stable = tensor_digest(outputs[0]) == tensor_digest(outputs[1])
+        passed = stable and all(r["bitwise"] and r["finite"] for r in repeats)
+        exports = []
+        if args.export_attention_ps:
+            exports.append(dict(order="model", **export_model_attention_fixture(
+                args.output.parent / f"length{case['length']}.model.attention-ps.bin",
+                values, values["selected"][:1], outputs[0], case["length"])))
+        order_results = []
+        for name, indices, variant_query in variants:
+            physical = physical_indices(indices)
+            variant_outputs = []
+            for repeat in range(2):
+                metadata = {key: values[key].cuda() for key in (
+                    "qo_indptr", "paged_kv_indptr", "paged_kv_last_page_len", "work_indptr",
+                    "work_info_set", "reduce_indptr", "reduce_final_map", "reduce_partial_map")}
+                metadata["paged_kv_indices"] = physical.cuda()
+                metadata["work_meta_data"] = rebind_attention_work_metadata(
+                    metadata["work_indptr"], metadata["work_info_set"])
+                md = SimpleNamespace(attn_out_dtype=torch.bfloat16, **metadata)
+                result = ROCMAiterMLASparseImpl._forward_mla(impl, layer, variant_query, cache, md).cpu().contiguous()
+                comparison = boundary_difference(result, values["output"])
+                if native_output is not None:
+                    comparison["vs_native"] = boundary_difference(result, native_output)
+                path = args.output.parent / f"length{case['length']}.{name}.repeat{repeat}.bf16.bin"
+                with path.open("xb") as stream:
+                    stream.write(result.view(torch.uint8).numpy().tobytes())
+                comparison.update(file=path.name)
+                variant_outputs.append(comparison)
+                if args.export_attention_ps and repeat == 0:
+                    exports.append(dict(order=name, **export_model_attention_fixture(
+                        args.output.parent / f"length{case['length']}.{name}.attention-ps.bin",
+                        values, indices, result, case["length"])))
+            repeat_bitwise = variant_outputs[0]["sha256"] == variant_outputs[1]["sha256"]
+            passed = passed and repeat_bitwise and all(r["finite"] for r in variant_outputs)
+            order_results.append(dict(name=name, repeats=variant_outputs, repeat_bitwise=repeat_bitwise,
+                query_sha256=tensor_digest(variant_query), indices_sha256=tensor_digest(indices)))
+        results.append(dict(**case, captured_tensor_sha256=identities, repeats=repeats,
+                            repeat_bitwise=stable, selection=selection, order_results=order_results,
+                            native_fixtures=exports, passed=passed))
+        print(json.dumps(results[-1], allow_nan=False), flush=True)
+        del query, cache, values, metadata, md
+    report = dict(scope="actual model rank0 layer6 decode attention; bitwise control and optional query/selection-order diagnostics, fixed work partition; not serving parity",
+        precision_qualified=False,
+        native_selector_sha256=(hashlib.sha256(args.native_indexer_selection.read_bytes()).hexdigest()
+                                if args.native_indexer_selection is not None else None),
+        vllm_version=version, backend_sha256=source_hash,
+        run_record_sha256=hashlib.sha256(run_bytes).hexdigest() if native_root else None,
+        capture_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        pointer_rebinding="work_meta_data=[work_indptr.data_ptr(),work_info_set.data_ptr()]; all scheduling arrays captured unchanged",
+        cases=results, passed=all(c["passed"] for c in results))
+    with args.output.open("x") as stream:
+        json.dump(report, stream, indent=2, allow_nan=False)
+    return 0 if report["passed"] else 1
 
 
 def export_indexer_model(args, harness, rope, snapshots, sources, version):
@@ -2189,7 +2935,7 @@ def export_qkva(args, rocm_aiter_ops, version):
     metadata = json.loads((args.capture / "inputs/reference.json").read_text())
     config = json.loads((args.checkpoint / "config.json").read_text())
     inventory = json.loads(args.precision_inventory.read_text())
-    layer = metadata["layer"]
+    layer = captured_block_layer(metadata)
     weight, scale, gamma = qkva_weights(args.checkpoint, layer)
     n, k = weight.shape
     name = f"model.layers.{layer}.self_attn.fused_qkv_a_proj"
@@ -2256,7 +3002,7 @@ def check_qkva(args):
     audit = json.loads(args.reference_json.read_text())
     meta = json.loads((args.capture / "inputs/reference.json").read_text())
     cfg = json.loads((args.checkpoint / "config.json").read_text())
-    m, layer = meta["batch"], meta["layer"]
+    m, layer = meta["batch"], captured_block_layer(meta)
     ql, dk, dr = cfg["q_lora_rank"], cfg["kv_lora_rank"], cfg["qk_rope_head_dim"]
     n, k = ql + dk + dr, cfg["hidden_size"]
     cases = [c for c in audit["cases"] if c["shape"] == [m, n, k]]
@@ -2282,7 +3028,8 @@ def check_qkva(args):
     for rank in range(args.tp):
         boundaries = {}
         for name, want in expected.items():
-            value, value_hash = load_tensor(args.capture / "outputs" / f"rank{rank}.{name}.bin", want.dtype, want.shape)
+            value, value_hash = load_tensor(args.capture / "outputs" / f"rank{rank}.{name}.bin", want.dtype, want.shape,
+                live_prefix=getattr(args, "live_prefix", False) and name.startswith("act."))
             finite = bool(torch.isfinite(value.float()).all() and torch.isfinite(want.float()).all())
             bitwise = torch.equal(value.contiguous().view(torch.uint8), want.contiguous().view(torch.uint8))
             rel = ((value.double() - want.double()).norm(dim=1) / want.double().norm(dim=1).clamp_min(1e-30)).max()
@@ -2300,10 +3047,221 @@ def check_qkva(args):
     return 0 if passed else 1
 
 
-def compare_packet_mla(args, rocm_aiter_ops, version):
+def mla_bmm_boundaries(args, rocm_aiter_ops, inventory, layer, rank, m, captured, exact, boundaries):
     from vllm.model_executor.layers.quantization.utils.quant_utils import scaled_dequantize
     from vllm.model_executor.layers.attention.mla_attention import dynamic_per_batched_tensor_quant
 
+    cfg = json.loads((args.checkpoint / "config.json").read_text())
+    if tuple(cfg[key] for key in ("num_attention_heads", "kv_lora_rank", "qk_nope_head_dim",
+            "qk_rope_head_dim", "v_head_dim", "q_lora_rank")) != (64, 512, 192, 64, 256, 2048):
+        raise ValueError("unsupported MLA geometry")
+    prefix = f"model.layers.{layer}.self_attn."
+    q = captured("act.qb", torch.bfloat16, (m, 8, 256)).cuda()
+    original, scales = mla_kvb_weights(args.checkpoint, layer, rank, args.tp)
+    dequant = scaled_dequantize(original.cuda(), scales.cuda(), group_shape=[128, 128], out_dtype=torch.bfloat16)
+    uk, uv = dequant.T.reshape(512, 8, 448).split([192, 256], dim=-1)
+    loaded = inventory["ranks"][rank]["modules"][prefix + "mla_attn.mla_attn"]["tensors"]
+    for tag, name, bf16, x in (("W_K", "qa", uk.transpose(0, 1), q[..., :192]),
+        ("W_V", "oat", uv.permute(1, 2, 0), captured("act.olat", torch.bfloat16, (m, 8, 512)).cuda())):
+        w, scale = dynamic_per_batched_tensor_quant(bf16, dtype=torch.float8_e4m3fn)
+        if (loaded[tag]["shape"] != list(w.shape) or loaded[tag]["stride"] != list(w.stride())
+                or loaded[tag]["dtype"] != str(w.dtype) or loaded[tag + "_scale"]["shape"] != []
+                or loaded[tag + "_scale"]["dtype"] != "torch.float32"):
+            raise ValueError("MLA weight contract differs from loaded pinned inventory")
+        stem = prefix + "derived.mla_fp8_tp8." + ("wk" if tag == "W_K" else "wv")
+        exact(stem + ".weight", w.cpu())
+        exact(stem + ".weight_scale", scale.cpu().reshape(1))
+        expected = rocm_aiter_ops.triton_fp8_bmm(x.transpose(0, 1), w, scale, group_size=128, transpose_bm=True)
+        repeat = rocm_aiter_ops.triton_fp8_bmm(x.transpose(0, 1), w, scale, group_size=128, transpose_bm=True)
+        exact("act." + name, expected.cpu())
+        boundaries["act." + name].update(reference_repeat_bitwise=tensor_digest(expected) == tensor_digest(repeat),
+            input_sha256=tensor_digest(x), input_finite=bool(torch.isfinite(x).all()))
+
+
+def native_norm_diagnostic(native, x, gamma, eps):
+    m, k = x.shape
+    if (x.dtype != torch.bfloat16 or gamma.dtype != x.dtype or not x.is_cuda
+            or gamma.device != x.device or not x.is_contiguous() or not gamma.is_contiguous()
+            or gamma.shape != (k,) or k != 2048 or not 1 <= m <= 128):
+        raise ValueError("native norm diagnostic requires contiguous GPU BF16 M1..128 K2048")
+    out = torch.empty_like(x)
+    raw = torch.empty((4, m, k), dtype=torch.float32, device=x.device)
+    stats = torch.empty((m, 8), dtype=torch.float32, device=x.device)
+    c = native.c
+    values = [c.c_void_p(v.data_ptr()) for v in (out, raw, stats, x, gamma)]
+    values += [c.c_uint(m), c.c_uint(k), c.c_float(eps), c.c_double(eps)]
+    params = (c.c_void_p * len(values))(*(c.cast(c.byref(v), c.c_void_p) for v in values))
+    native.call("hipModuleLaunchKernel", native.function, m, 1, 1, 512, 1, 1, 0,
+        c.c_void_p(torch.cuda.current_stream().cuda_stream), params, None)
+    return out.cpu(), raw.cpu(), stats.cpu()
+
+
+def qanorm_sweep_inputs(captured):
+    if captured.dtype != torch.bfloat16 or captured.ndim != 2 or captured.shape[1] != 2048 or not captured.shape[0]:
+        raise ValueError("requires nonempty BF16 Q-A rows")
+    generator = torch.Generator().manual_seed(53029)
+    for m in (1, 8, 16, 32, 64, 128):
+        yield m, "captured-row-resize", captured.cpu().repeat(((m + captured.shape[0] - 1) // captured.shape[0], 1))[:m].contiguous()
+        yield m, "zero", torch.zeros((m, 2048), dtype=torch.bfloat16)
+        for scale in (0.0001, 0.1, 1.0, 100.0):
+            yield m, f"seeded-gaussian-{scale}", (torch.randn((m, 2048), generator=generator) * scale).bfloat16()
+
+
+def native_qanorm(native, x, gamma):
+    if (x.dtype != torch.bfloat16 or x.ndim != 2 or not x.shape[0] or x.shape[1] != 2048
+            or not x.is_cuda or not x.is_contiguous() or gamma.dtype != x.dtype
+            or gamma.device != x.device or gamma.shape != (2048,) or not gamma.is_contiguous()):
+        raise ValueError("requires contiguous GPU BF16 Q-A operands")
+    out = torch.empty_like(x)
+    c = native.c
+    values = [c.c_void_p(v.data_ptr()) for v in (out, x, gamma)] + [c.c_uint(x.shape[0])]
+    params = (c.c_void_p * len(values))(*(c.cast(c.byref(v), c.c_void_p) for v in values))
+    native.call("hipModuleLaunchKernel", native.function, min(x.shape[0], 8), 1, 1, 512, 1, 1, 0,
+        c.c_void_p(torch.cuda.current_stream().cuda_stream), params, None)
+    return out.cpu()
+
+
+def compare_packet_qanorm(args, rocm_aiter_ops, version):
+    if version != "0.29.0" or args.checkpoint is None or args.native_rmsnorm is None:
+        raise ValueError("requires pinned reference, original checkpoint and native norm object")
+    meta = json.loads((args.capture / "inputs/reference.json").read_text())
+    m, layer = meta["batch"], captured_block_layer(meta)
+    if not 1 <= m <= 128:
+        raise ValueError("unsupported norm batch")
+    _, _, gamma = qb_weights(args.checkpoint, layer, 0, args.tp)
+    k = gamma.numel()
+    if k != 2048:
+        raise ValueError("requires GLM Q-A width2048")
+    def captured(name, dtype, shape):
+        return load_tensor(args.capture / "outputs" / f"rank0.{name}.bin", dtype, shape,
+            live_prefix=args.live_prefix and name.startswith("act."))[0]
+    x = captured("act.qlr", torch.bfloat16, (m, k)).cuda()
+    actual = captured("act.qlat", torch.bfloat16, (m, k))
+    weight = captured(f"model.layers.{layer}.self_attn.q_a_layernorm.weight", torch.bfloat16, (k,))
+    if tensor_digest(weight) != tensor_digest(gamma):
+        raise ValueError("native Q-A norm weight differs from checkpoint")
+    gamma = gamma.cuda()
+    eps = json.loads((args.checkpoint / "config.json").read_text())["rms_norm_eps"]
+    if eps != 1e-5:
+        raise ValueError("Q-A production profile requires original epsilon1e-5")
+    reference = rocm_aiter_ops.rms_norm(x, gamma, eps)
+    repeat = rocm_aiter_ops.rms_norm(x, gamma, eps)
+    native = IndexerSelectionModule(args.native_rmsnorm, b"glm_rmsnorm_diagnostic_v2")
+    production = IndexerSelectionModule(args.native_rmsnorm, b"glm_rmsnorm_qa")
+    sweep = []
+    try:
+        production_out = native_qanorm(production, x, gamma)
+        production_repeat = native_qanorm(production, x, gamma)
+        first, first_raw, first_stats = native_norm_diagnostic(native, x, gamma, eps)
+        second, raw_cpu, stats_cpu = native_norm_diagnostic(native, x, gamma, eps)
+        raw, stats = raw_cpu.cuda(), stats_cpu.cuda()
+        if args.qanorm_sweep:
+            for rows, profile, source in qanorm_sweep_inputs(x):
+                gpu = source.cuda()
+                ref = rocm_aiter_ops.rms_norm(gpu, gamma, eps).cpu()
+                ref2 = rocm_aiter_ops.rms_norm(gpu, gamma, eps).cpu()
+                got = native_norm_diagnostic(native, gpu, gamma, eps)
+                again = native_norm_diagnostic(native, gpu, gamma, eps)
+                prod = native_qanorm(production, gpu, gamma)
+                prod2 = native_qanorm(production, gpu, gamma)
+                # AITER HIP takes double epsilon, but divides the FP32 sum first.
+                hip_mean = ((got[2][:, 0] / k).double() + eps).float()
+                hip_inv = torch.rsqrt(hip_mean.double()).float()
+                hip_epsilon = (source.float() * hip_inv[:, None] * gamma.cpu().float()).bfloat16()
+                finite = all(bool(torch.isfinite(v).all()) for v in (*got, *again, ref, ref2))
+                sweep.append(dict(rows=rows, profile=profile, input_sha256=tensor_digest(source),
+                    finite=finite, repeat_bitwise=all(tensor_digest(a) == tensor_digest(b) for a, b in zip(got, again)),
+                    reference_repeat_bitwise=tensor_digest(ref) == tensor_digest(ref2),
+                    native_changed=int((got[0] != ref).sum()),
+                    refined_changed=int((got[1][1].bfloat16() != ref).sum()),
+                    fp64_inverse_changed=int((got[1][2].bfloat16() != ref).sum()),
+                    reference_tree_changed=int((got[1][3].bfloat16() != ref).sum()),
+                    production_changed=int((prod != ref).sum()),
+                    production_repeat_bitwise=tensor_digest(prod) == tensor_digest(prod2),
+                    reference_tree_sum_changed=int((got[2][:, 0] != got[2][:, 5]).sum()),
+                    double_epsilon_precise_inverse_changed=int((hip_epsilon != ref).sum()),
+                    double_epsilon_mean_changed=int((hip_mean != got[2][:, 1]).sum()),
+                    refined_vs_fp64_changed=int((got[1][1].bfloat16() != got[1][2].bfloat16()).sum())))
+    finally:
+        native.close()
+        production.close()
+    variants = {"native": first, "native_raw_rounded": raw[0].bfloat16(),
+        "production": production_out,
+        "refined_raw_rounded": raw[1].bfloat16(), "fp64_inverse_raw_rounded": raw[2].bfloat16(),
+        "reference_tree_raw_rounded": raw[3].bfloat16(),
+        "torch_fp32": (x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps) * gamma.float()).bfloat16(),
+        "native_inv": (x.float() * stats[:, 2:3] * gamma.float()).bfloat16()}
+    torch_ss = x.float().square().sum(-1)
+    torch_mean = torch_ss / k + eps
+    torch_inv = torch.rsqrt(torch_mean)
+    native_mean_inv = torch.rsqrt(stats[:, 1])
+    records = {}
+    for name, value in variants.items():
+        value = value.cpu()
+        records[name] = dict(sha256=tensor_digest(value), reference_changed=int((value != reference.cpu()).sum()),
+            captured_changed=int((value != actual).sum()))
+    indices = (actual != reference.cpu()).nonzero()
+    samples = [dict(row=int(i), column=int(j), captured=float(actual[i, j]),
+        reference=float(reference[i, j]), native=float(first[i, j]), raw=raw[:, i, j].cpu().tolist(),
+        stats=stats[i].cpu().tolist(), torch_stats=[float(torch_ss[i]), float(torch_mean[i]), float(torch_inv[i])],
+        torch_rsqrt_native_mean=float(native_mean_inv[i])) for i, j in indices[:32].tolist()]
+    report = dict(scope="rank0 Q-A normalization diagnostic; no full-block or performance qualification",
+        precision_qualified=False, vllm_version=version, shape=[m, k],
+        input_sha256=tensor_digest(x), gamma_sha256=tensor_digest(gamma),
+        native_object_sha256=hashlib.sha256(args.native_rmsnorm.read_bytes()).hexdigest(),
+        reference_repeat_bitwise=tensor_digest(reference) == tensor_digest(repeat),
+        native_repeat_bitwise=tensor_digest(first) == tensor_digest(second),
+        production_repeat_bitwise=tensor_digest(production_out) == tensor_digest(production_repeat),
+        diagnostic_repeat_bitwise=(tensor_digest(first_raw) == tensor_digest(raw)
+                                   and tensor_digest(first_stats) == tensor_digest(stats)),
+        variants=records, mismatch_samples=samples, synthetic_sweep=sweep)
+    with args.output.open("x") as f:
+        json.dump(report, f, indent=2, allow_nan=False)
+    print(json.dumps(report), flush=True)
+    return 0 if (all(report[key] for key in ("reference_repeat_bitwise", "native_repeat_bitwise", "production_repeat_bitwise",
+                                           "diagnostic_repeat_bitwise"))
+        and records["production"]["reference_changed"] == 0
+        and all(r["finite"] and r["repeat_bitwise"] and r["reference_repeat_bitwise"]
+                and r["production_repeat_bitwise"] and r["production_changed"] == 0 for r in sweep)) else 1
+
+
+def compare_packet_mla_bmm(args, rocm_aiter_ops, version):
+    if version != "0.29.0" or args.tp != 8 or args.checkpoint is None or args.precision_inventory is None:
+        raise ValueError("requires pinned TP8 MLA inventory and original checkpoint")
+    meta = json.loads((args.capture / "inputs/reference.json").read_text())
+    measurement = json.loads((args.capture / "measurement.json").read_text())
+    inventory = json.loads(args.precision_inventory.read_text())
+    m, layer = meta["batch"], captured_block_layer(meta)
+    if (m < 1 or measurement.get("batch") != m or measurement.get("tp") != args.tp
+            or measurement.get("scope") != "single-block-decode"
+            or [r["rank"] for r in inventory["ranks"]] != list(range(args.tp))):
+        raise ValueError("requires matching block capture and ordered TP inventory")
+    records = []
+    for rank in range(args.tp):
+        boundaries = {}
+        def captured(name, dtype, shape):
+            return load_tensor(args.capture / "outputs" / f"rank{rank}.{name}.bin", dtype, shape,
+                live_prefix=args.live_prefix and name.startswith("act."))[0]
+        def exact(name, want):
+            got = captured(name, want.dtype, want.shape)
+            boundaries[name] = dict(sha256=tensor_digest(got), reference_sha256=tensor_digest(want),
+                finite=bool(torch.isfinite(got.float()).all() and torch.isfinite(want.float()).all()),
+                bitwise=tensor_digest(got) == tensor_digest(want))
+        mla_bmm_boundaries(args, rocm_aiter_ops, inventory, layer, rank, m, captured, exact, boundaries)
+        passed = all(v["finite"] and v["bitwise"] and v.get("reference_repeat_bitwise", True)
+                     and v.get("input_finite", True) for v in boundaries.values())
+        records.append(dict(rank=rank, shape=[m, 8], passed=passed, boundaries=boundaries))
+        print(json.dumps(records[-1]), flush=True)
+    passed = len(records) == args.tp and all(r["passed"] for r in records)
+    with args.output.open("x") as f:
+        json.dump(dict(scope="query/value BMM conditioned on captured BF16 inputs; Q-A/Q-B, attention and full-block parity not qualified",
+            passed=passed, precision_qualified=False, vllm_version=version,
+            loaded_inventory_sha256=hashlib.sha256(args.precision_inventory.read_bytes()).hexdigest(),
+            cases=records), f, indent=2, allow_nan=False)
+    return 0 if passed else 1
+
+
+def compare_packet_mla(args, rocm_aiter_ops, version):
     if (version != "0.29.0" or args.tp != 8 or args.checkpoint is None
             or args.precision_inventory is None or args.qb_reference is None):
         raise ValueError("requires pinned TP8 MLA inventory, original checkpoint and independent Q-B reference")
@@ -2311,7 +3269,7 @@ def compare_packet_mla(args, rocm_aiter_ops, version):
     cfg = json.loads((args.checkpoint / "config.json").read_text())
     inventory = json.loads(args.precision_inventory.read_text())
     audit = json.loads(args.qb_reference.read_text())
-    m, layer = meta["batch"], meta["layer"]
+    m, layer = meta["batch"], captured_block_layer(meta)
     if (not audit["audit_complete"] or audit["vllm_version"] != version
             or audit["layer"] != layer or audit["tp"] != args.tp or len(inventory["ranks"]) != args.tp
             or audit["loaded_inventory_sha256"] != hashlib.sha256(args.precision_inventory.read_bytes()).hexdigest()
@@ -2323,7 +3281,8 @@ def compare_packet_mla(args, rocm_aiter_ops, version):
         prefix = f"model.layers.{layer}.self_attn."
         boundaries = {}
         def captured(name, dtype, shape):
-            return load_tensor(args.capture / "outputs" / f"rank{rank}.{name}.bin", dtype, shape)[0]
+            return load_tensor(args.capture / "outputs" / f"rank{rank}.{name}.bin", dtype, shape,
+                live_prefix=args.live_prefix and name.startswith("act."))[0]
         def exact(name, want):
             got = captured(name, want.dtype, want.shape)
             boundaries[name] = dict(sha256=tensor_digest(got), reference_sha256=tensor_digest(want),
@@ -2367,27 +3326,8 @@ def compare_packet_mla(args, rocm_aiter_ops, version):
         bounded = bool(torch.isfinite(qb).all() and ((qb >= lower) & (qb <= upper)).all())
         boundaries["act.qb"] = dict(sha256=tensor_digest(qb), finite=bool(torch.isfinite(qb).all()),
             exact_bf16_addition_order_bounds=bounded, reference_bitwise=tensor_digest(qb) == tensor_digest(ref_qb))
-        q = qb.reshape(m, 8, 256).cuda()
         exact("act.qrr", qb.reshape(m, 8, 256)[..., 192:])
-        original, scales = mla_kvb_weights(args.checkpoint, layer, rank, args.tp)
-        dequant = scaled_dequantize(original.cuda(), scales.cuda(), group_shape=[128, 128], out_dtype=torch.bfloat16)
-        uk, uv = dequant.T.reshape(512, 8, 448).split([192, 256], dim=-1)
-        loaded = inventory["ranks"][rank]["modules"][prefix + "mla_attn.mla_attn"]["tensors"]
-        for tag, name, bf16, x in (("W_K", "qa", uk.transpose(0, 1), q[..., :192]),
-            ("W_V", "oat", uv.permute(1, 2, 0), captured("act.olat", torch.bfloat16, (m, 8, 512)).cuda())):
-            w, scale = dynamic_per_batched_tensor_quant(bf16, dtype=torch.float8_e4m3fn)
-            if (loaded[tag]["shape"] != list(w.shape) or loaded[tag]["stride"] != list(w.stride())
-                    or loaded[tag]["dtype"] != str(w.dtype) or loaded[tag + "_scale"]["shape"] != []
-                    or loaded[tag + "_scale"]["dtype"] != "torch.float32"):
-                raise ValueError("MLA weight contract differs from loaded pinned inventory")
-            stem = prefix + "derived.mla_fp8_tp8." + ("wk" if tag == "W_K" else "wv")
-            exact(stem + ".weight", w.cpu())
-            exact(stem + ".weight_scale", scale.cpu().reshape(1))
-            expected = rocm_aiter_ops.triton_fp8_bmm(x.transpose(0, 1), w, scale, group_size=128, transpose_bm=True)
-            repeat = rocm_aiter_ops.triton_fp8_bmm(x.transpose(0, 1), w, scale, group_size=128, transpose_bm=True)
-            exact("act." + name, expected.cpu())
-            boundaries["act." + name].update(reference_repeat_bitwise=tensor_digest(expected) == tensor_digest(repeat),
-                input_sha256=tensor_digest(x), input_finite=bool(torch.isfinite(x).all()))
+        mla_bmm_boundaries(args, rocm_aiter_ops, inventory, layer, rank, m, captured, exact, boundaries)
         passed = all(v["finite"] and v.get("bitwise", v.get("exact_bf16_addition_order_bounds", False))
                      and v.get("reference_repeat_bitwise", True) and v.get("input_finite", True)
                      for v in boundaries.values())
@@ -2404,9 +3344,10 @@ def compare_packet_mla(args, rocm_aiter_ops, version):
     return 0 if passed else 1
 
 
-def sparse_decode_indices(indices, ctx):
+def sparse_decode_indices(indices, ctx, capacity=None):
+    capacity = ctx if capacity is None else capacity
     if (indices.dtype != torch.int32 or indices.ndim != 2 or not indices.shape[0]
-            or indices.shape[1] != 2048 or ctx <= 0):
+            or indices.shape[1] != 2048 or ctx <= 0 or capacity < ctx):
         raise ValueError("requires nonempty int32 decode indices with topk2048")
     count = min(ctx, indices.shape[1])
     selected = indices[:, :count]
@@ -2414,7 +3355,7 @@ def sparse_decode_indices(indices, ctx):
             or bool((indices[:, count:] != -1).any())
             or any(len(set(row)) != count for row in selected.tolist())):
         raise ValueError("invalid selected-key prefix or padding")
-    return (selected + torch.arange(indices.shape[0], dtype=torch.int32)[:, None] * ctx).flatten()
+    return (selected + torch.arange(indices.shape[0], dtype=torch.int32)[:, None] * capacity).flatten()
 
 
 def boundary_difference(actual, expected):
@@ -2912,7 +3853,7 @@ def export_attention_sweep(args, version):
 
 
 def rope_capture_contract(meta, cfg, inventory, tp):
-    m, ctx, layer = meta["batch"], meta["ctx"], meta["layer"]
+    m, ctx, layer = meta["batch"], meta["ctx"], captured_block_layer(meta)
     if (tp != 8 or not 1 <= m <= 64 or not 1 <= ctx <= cfg["max_position_embeddings"]
             or cfg["qk_rope_head_dim"] != 64 or cfg["num_attention_heads"] != 64
             or cfg["rope_parameters"] != {"rope_theta": 8000000, "rope_type": "default"}
@@ -2963,7 +3904,8 @@ def compare_packet_rope(args, version):
     records = []
     for rank in range(args.tp):
         def captured(name, shape):
-            return load_tensor(args.capture / "outputs" / f"rank{rank}.{name}.bin", torch.bfloat16, shape)[0]
+            return load_tensor(args.capture / "outputs" / f"rank{rank}.{name}.bin", torch.bfloat16, shape,
+                live_prefix=args.live_prefix and name.startswith("act."))[0]
         query = captured("act.qrr", (m, 8, 64)).cuda()
         key = captured("act.krr", (m, 1, 64)).cuda()
         expected = rope(positions, query.clone(), key.clone())
@@ -3070,7 +4012,7 @@ def compare_packet_attention(args, rocm_aiter_ops, version):
     meta = json.loads((args.capture / "inputs/reference.json").read_text())
     cfg = json.loads((args.checkpoint / "config.json").read_text())
     inventory = json.loads(args.precision_inventory.read_text())
-    m, ctx, layer = meta["batch"], meta["ctx"], meta["layer"]
+    m, ctx, layer = meta["batch"], meta["ctx"], captured_block_layer(meta)
     if (not 1 <= m <= 64 or ctx <= 0 or len(inventory["ranks"]) != 8
             or (cfg["num_attention_heads"], cfg["kv_lora_rank"], cfg["qk_nope_head_dim"],
                 cfg["qk_rope_head_dim"], cfg["index_topk"]) != (64, 512, 192, 64, 2048)
@@ -3083,8 +4025,6 @@ def compare_packet_attention(args, rocm_aiter_ops, version):
         sources[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
     if sources[inspect.getfile(ROCMAiterMLASparseImpl)] != "187d72a2ecbf0c845950454dbc3cda2c7eff022568a035ebb57ab5b8b98b132c":
         raise ValueError("installed sparse backend differs from pinned loaded inventory")
-    indices, indices_hash = load_tensor(args.capture / "inputs/act.iidx.bin", torch.int32, (m, 2048))
-    expected_indices = sparse_decode_indices(indices, ctx)
     heads = AiterMLAHelper.get_actual_mla_num_heads(8)
     units = current_platform.num_compute_units()
     splits = ROCMAiterMLASparseMetadataBuilder._sparse_decode_max_split(
@@ -3132,11 +4072,15 @@ def compare_packet_attention(args, rocm_aiter_ops, version):
         block_size = loaded["tensors"]["kv_cache"]["shape"][1]
         if (loaded["attributes"]["impl"]["class_name"] != ROCMAiterMLASparseImpl.__module__ + "." + ROCMAiterMLASparseImpl.__name__
                 or loaded["attributes"]["kv_cache_dtype"] != "auto"
-                or loaded["tensors"]["kv_cache"]["dtype"] != "torch.bfloat16"
-                or ctx % block_size):
-            raise ValueError("loaded backend/cache layout differs or context not page-aligned")
+                or loaded["tensors"]["kv_cache"]["dtype"] != "torch.bfloat16"):
+            raise ValueError("loaded backend/cache layout differs")
+        capacity = ((ctx + block_size - 1) // block_size) * block_size
         def captured(name, dtype, shape):
-            return load_tensor(args.capture / "outputs" / f"rank{rank}.{name}.bin", dtype, shape)[0]
+            return load_tensor(args.capture / "outputs" / f"rank{rank}.{name}.bin", dtype, shape,
+                live_prefix=args.live_prefix)[0]
+        indices = captured("act.iidx", torch.int32, (m, 2048))
+        indices_hash = tensor_digest(indices)
+        expected_indices = sparse_decode_indices(indices, ctx, capacity)
         ckv = torch.stack([captured(f"slot{row}.kv.{layer}.ckv", torch.bfloat16, (ctx, 512)) for row in range(m)])
         krot = torch.stack([captured(f"slot{row}.kv.{layer}.krot", torch.bfloat16, (ctx, 64)) for row in range(m)])
         carried = {}
@@ -3153,7 +4097,10 @@ def compare_packet_attention(args, rocm_aiter_ops, version):
         norm_difference["reference_repeat_bitwise"] = tensor_digest(norm) == tensor_digest(norm_repeat)
         qa = captured("act.qa", torch.bfloat16, (m, 8, 512)).cuda()
         qr = captured("act.qr", torch.bfloat16, (m, 8, 64)).cuda()
-        kv = torch.cat((ckv, krot), dim=-1).reshape(-1, block_size, 576).cuda()
+        logical_kv = torch.cat((ckv, krot), dim=-1).cuda()
+        padded_kv = torch.zeros((m, capacity, 576), dtype=torch.bfloat16, device="cuda")
+        padded_kv[:, :ctx] = logical_kv
+        kv = padded_kv.reshape(-1, block_size, 576)
         # Only replace serving allocation/config plumbing; execute the installed forward unchanged.
         impl = ROCMAiterMLASparseImpl.__new__(ROCMAiterMLASparseImpl)
         impl.num_heads, impl.kv_lora_rank, impl.kv_cache_dtype = 8, 512, "auto"
@@ -3162,8 +4109,8 @@ def compare_packet_attention(args, rocm_aiter_ops, version):
         impl.topk_indices_buffer = indices.cuda()
         attention_layer = SimpleNamespace(_q_scale=torch.ones((), device="cuda"), _k_scale=torch.ones((), device="cuda"))
         md = ROCMAiterMLASparseMetadata(num_reqs=m, max_query_len=1, max_seq_len=ctx, num_actual_tokens=m,
-            query_start_loc=qo, slot_mapping=torch.arange(m, device="cuda") * ctx + ctx - 1,
-            block_table=torch.arange(m * ctx // block_size, dtype=torch.int32, device="cuda").reshape(m, -1),
+            query_start_loc=qo, slot_mapping=torch.arange(m, device="cuda") * capacity + ctx - 1,
+            block_table=torch.arange(m * capacity // block_size, dtype=torch.int32, device="cuda").reshape(m, -1),
             req_id_per_token=torch.arange(m, dtype=torch.int32, device="cuda"),
             qo_indptr=qo, paged_kv_last_page_len=lastpage,
             paged_kv_indices=torch.zeros(m * 2048, dtype=torch.int32, device="cuda"), paged_kv_indptr=indptr,
@@ -3189,7 +4136,7 @@ def compare_packet_attention(args, rocm_aiter_ops, version):
                 continue
             for rounded in (False, True):
                 model = split_attention_rounding_model(torch.cat((qa, qr), dim=-1),
-                    kv.reshape(m, ctx, 576), indices[:, :min(ctx, 2048)].cuda(),
+                    logical_kv, indices[:, :min(ctx, 2048)].cuda(),
                     model_splits, impl.scale, rounded).cpu()
                 models.append(dict(splits=model_splits, bf16_probability=rounded,
                     versus_plow=boundary_difference(model, actual),
@@ -3198,7 +4145,7 @@ def compare_packet_attention(args, rocm_aiter_ops, version):
             ends = [end for _, end in work_ranges[0]]
             for model_tile in (None, 32):
                 model = split_attention_rounding_model(torch.cat((qa, qr), dim=-1),
-                    kv.reshape(m, ctx, 576), indices[:, :selected_count].cuda(), len(ends),
+                    logical_kv, indices[:, :selected_count].cuda(), len(ends),
                     impl.scale, True, split_ends=ends, tile=model_tile).cpu()
                 models.append(dict(split_ends=ends, tile=model_tile, bf16_probability=True,
                     versus_plow=boundary_difference(model, actual),
@@ -3211,6 +4158,7 @@ def compare_packet_attention(args, rocm_aiter_ops, version):
                   and difference["reference_repeat_bitwise"] and norm_difference["finite"]
                   and norm_difference["bitwise"] and norm_difference["reference_repeat_bitwise"])
         record = dict(rank=rank, passed=passed, carried_rows_bitwise=carried, inputs_finite=inputs_finite,
+            selected_indices_sha256=indices_hash,
             query_sha256=tensor_digest(torch.cat((qa, qr), dim=-1)), kv_sha256=tensor_digest(kv),
             mapped_indices_sha256=tensor_digest(mapped), attention=difference, kv_norm=norm_difference,
             rounding_models=models, persistent_export=exported)
@@ -3225,7 +4173,7 @@ def compare_packet_attention(args, rocm_aiter_ops, version):
             metadata_buffers=metadata_buffers,
             work_ranges=work_ranges,
             rounding_model_scope="diagnostic only: FP64 QK/exp/accumulation; uniform splits plus captured work boundaries with whole-partition or 32-key online tiles; not exact kernel reduction or a qualification oracle",
-            selected_indices_sha256=indices_hash, sources=sources,
+            selected_indices_sha256={str(r["rank"]): r["selected_indices_sha256"] for r in records}, sources=sources,
             loaded_inventory_sha256=hashlib.sha256(args.precision_inventory.read_bytes()).hexdigest(), cases=records),
             f, indent=2, allow_nan=False)
     return 0 if passed else 1
@@ -3308,7 +4256,7 @@ def unsort_routed_hidden(meta, tokens, slots, gates, hidden, ids, weights):
     return result.reshape(m, topk, hidden.shape[1])
 
 
-def native_routed_boundaries(prefix, h, i, experts, ids, gates):
+def native_routed_boundaries(prefix, h, i, experts, ids, gates, *, live_prefix=False):
     m, topk = ids.shape
     capacity = Path(str(prefix) + ".act.moe_rowtok.bin").stat().st_size // 4
     if capacity < m * topk:
@@ -3325,7 +4273,8 @@ def native_routed_boundaries(prefix, h, i, experts, ids, gates):
         ("moe_rowgate", torch.float32, (capacity,)),
         ("moe_fug", torch.bfloat16, (capacity, i)),
     ):
-        tensors[name], hashes[name] = load_tensor(Path(str(prefix) + f".act.{name}.bin"), dtype, shape)
+        tensors[name], hashes[name] = load_tensor(Path(str(prefix) + f".act.{name}.bin"), dtype, shape,
+                                                 live_prefix=live_prefix and (name.startswith("routed_") or name == "moe_meta"))
     hidden = unsort_routed_hidden(tensors["moe_meta"], tensors["moe_rowtok"],
         tensors["moe_rowpart"], tensors["moe_rowgate"], tensors["moe_fug"], ids, gates)
     path = Path(str(prefix) + ".act.part.bin")
@@ -3354,6 +4303,75 @@ def bf16_order_bounds(parts):
                 high = b if high is None else torch.maximum(high, b)
         lo.append(low); hi.append(high)
     return lo[-1], hi[-1]
+
+
+def bf16_order_reachability(parts, output):
+    if (parts.dtype != torch.bfloat16 or parts.ndim != 3 or not 1 <= parts.shape[1] <= 8
+            or output.dtype != parts.dtype or output.shape != (parts.shape[0], parts.shape[2])
+            or not bool(torch.isfinite(parts).all() and torch.isfinite(output).all())):
+        raise ValueError("requires finite BF16 parts and matching output")
+    parts, output = parts.cpu(), output.cpu()
+    reached = torch.zeros_like(output, dtype=torch.bool)
+    checked = 0
+    for order in itertools.permutations(range(parts.shape[1])):
+        value = torch.zeros_like(output)
+        for slot in order:
+            value = value + parts[:, slot]
+        reached |= value.view(torch.int16) == output.view(torch.int16)
+        checked += 1
+        if bool(reached.all()):
+            break
+    return dict(elementwise_reachable=bool(reached.all()), unreachable_count=int((~reached).sum()),
+                elements=output.numel(), permutations_checked=checked,
+                scope="per-element BF16 serial addition orders, not one common order or execution-schedule proof")
+
+
+def check_routed_reachability(args):
+    audit = json.loads(args.reference_json.read_text())
+    if (audit.get("passed") is not True or audit.get("audit_complete") is not True
+            or audit.get("vllm_version") != "0.29.0" or len(audit["cases"]) != args.tp
+            or {row["rank"] for row in audit["cases"]} != set(range(args.tp))):
+        raise ValueError("requires complete passed pinned routed audit")
+    records = []
+    for row in audit["cases"]:
+        rank = row["rank"]
+        m, h, i, _, topk = row["shape"]
+        if not row["stable_boundaries_bitwise"]:
+            raise ValueError("stable routed boundaries must match before reduction analysis")
+        parts = torch.empty((m, topk, h), dtype=torch.bfloat16)
+        seen = torch.zeros((m, topk), dtype=torch.bool)
+        for case in row["isolated_weighted_down"]:
+            shape, _, value, digest = load_case(args.reference_json.parent / case["file"], weighted=True)
+            tokens, slots = torch.tensor(case["tokens"], dtype=torch.long), torch.tensor(case["slots"], dtype=torch.long)
+            if (digest != case["sha256"] or not case["finite"] or not case["repeat_bitwise"]
+                    or shape != (len(tokens), h, i) or tokens.shape != slots.shape
+                    or bool((tokens < 0).any() or (tokens >= m).any() or (slots < 0).any() or (slots >= topk).any())
+                    or (tokens * topk + slots).unique().numel() != tokens.numel()
+                    or bool(seen[tokens, slots].any())):
+                raise ValueError("isolated routed partial provenance/coverage mismatch")
+            parts[tokens, slots] = value
+            seen[tokens, slots] = True
+        if not bool(seen.all()):
+            raise ValueError("missing isolated routed partials")
+        boundary = row["boundaries"]["stage2.output"]
+        results = {}
+        for name, expected_hash in (("plow-routed", boundary["plow_sha256"]),
+                                    ("reference", boundary["sha256"]), ("repeat", boundary["repeat_sha256"])):
+            path = args.reference_json.parent / f"{args.reference_json.stem}.rank{rank}.{name}.bf16"
+            value, digest = load_tensor(path, torch.bfloat16, (m, h))
+            if digest != expected_hash:
+                raise ValueError("routed output provenance mismatch")
+            results[name] = dict(sha256=digest, **bf16_order_reachability(parts, value))
+        record = dict(rank=rank, parts_sha256=tensor_digest(parts), outputs=results)
+        records.append(record)
+        print(json.dumps(record), flush=True)
+    passed = all(value["elementwise_reachable"] for row in records for value in row["outputs"].values())
+    with args.output.open("x") as f:
+        json.dump(dict(scope="per-element BF16 serial expert-addition reachability; not a common order, schedule proof, router or full-model qualification",
+            passed=passed, precision_qualified=False,
+            reference_sha256=hashlib.sha256(args.reference_json.read_bytes()).hexdigest(), cases=records), f, indent=2)
+        f.write("\n")
+    return 0 if passed else 1
 
 
 def check_routed_ab(args):
@@ -3497,10 +4515,11 @@ def export_routed(args):
                     or not torch.equal(value.view(torch.uint8), repeated.view(torch.uint8))):
                 raise ValueError("routed boundary hash or repeat mismatch")
             captured[key] = value
-        ids, gates, route_digest = load_routes(args.capture / "outputs" / f"rank{rank}.act.tab.bin", m, topk, experts)
+        ids, gates, route_digest = load_routes(args.capture / "outputs" / f"rank{rank}.act.tab.bin", m, topk, experts,
+                                              live_prefix=getattr(args, "live_prefix", False))
         if route_digest != row["routes_sha256"]:
             raise ValueError("routed table changed since reference audit")
-        weights = routed_weights(args.checkpoint, metadata["layer"], rank, args.tp)
+        weights = routed_weights(args.checkpoint, captured_block_layer(metadata), rank, args.tp)
         for name, value in zip(("gate_up", "down", "gate_up_scale", "down_scale"), weights):
             if tensor_digest(value) != row["checkpoint_shard_sha256"][name]:
                 raise ValueError("original checkpoint shard changed since reference audit")
@@ -3613,6 +4632,228 @@ def isolate_routed_down(args, rank, call, ids, gates, down, down_scale):
     return records, parts
 
 
+def router_reference_weights(report, rank, xhash, routehash, ids):
+    rows = [row for row in report["cases"] if row["rank"] == rank]
+    if len(rows) != 1 or report.get("vllm_version") != "0.29.0":
+        raise ValueError("requires unique pinned router reference rank")
+    row = rows[0]
+    if row["input_sha256"] != xhash or row["native_routes_sha256"] != routehash:
+        raise ValueError("router input/routes provenance mismatch")
+    routed = row["comparisons"]["reference_logits"]
+    other_ids = torch.tensor(routed["ids"], dtype=torch.int32)
+    weights = torch.tensor(routed["weights"], dtype=torch.float32)
+    if (not routed["repeat_bitwise"] or not row["logits_repeat_bitwise"]
+            or not torch.equal(ids, other_ids) or weights.shape != ids.shape
+            or not torch.isfinite(weights).all() or bool((weights < 0).any())
+            or tensor_digest(weights) != routed["weights_sha256"]):
+        raise ValueError("requires stable identical ordered expert routes and hashed weights")
+    return weights
+
+
+def routed_router_impact(call, ids, gates, alternative, native_parts):
+    sorted_ids = call.args[3]
+    token = sorted_ids.long() & 0xffffff
+    slot = (sorted_ids.long() >> 24) & 0xff
+    valid_count = int(call.args[5][0].item())
+    valid = ((token < ids.shape[0]) & (slot < ids.shape[1])
+        & (torch.arange(sorted_ids.numel(), device=sorted_ids.device) < valid_count))
+    token, slot = token.clamp_max(ids.shape[0] - 1), slot.clamp_max(ids.shape[1] - 1)
+    gpu_gates, gpu_ids = gates.to(sorted_ids.device), ids.to(sorted_ids.device)
+    if not torch.equal(call.keywords["sorted_weights"][valid].view(torch.int32),
+                       gpu_gates[token[valid], slot[valid]].view(torch.int32)):
+        raise ValueError("sorted native route weights differ from captured routes")
+    new_sorted = torch.where(valid, alternative.to(sorted_ids.device)[token, slot],
+                             torch.zeros_like(call.keywords["sorted_weights"]))
+    parts = torch.empty_like(native_parts)
+    for expert in sorted(set(ids.flatten().tolist())):
+        tokens, slots = (ids == expert).nonzero(as_tuple=True)
+        kw = dict(call.keywords)
+        kw["sorted_weights"] = isolated_route_weights(gpu_ids, sorted_ids, new_sorted, valid_count, expert)
+        values = []
+        for _ in range(2):
+            out = torch.zeros_like(call.args[6])
+            call.func(*(call.args[:6] + (out,) + call.args[7:]), **kw)
+            values.append(out.cpu()[tokens].contiguous())
+        if (not torch.isfinite(values[0]).all()
+                or not torch.equal(values[0].view(torch.int16), values[1].view(torch.int16))):
+            raise ValueError("router impact isolated output is nonfinite or unstable")
+        parts[tokens, slots] = values[0]
+    return dict(scope="same installed stage2 operands and selected experts; only route weights replaced; isolated contributions avoid atomic-order noise",
+        changed_elements=int((parts.view(torch.int16) != native_parts.view(torch.int16)).sum()),
+        elements=parts.numel(), max_abs=float((parts.float()-native_parts.float()).abs().max()),
+        native_parts_sha256=tensor_digest(native_parts), reference_parts_sha256=tensor_digest(parts),
+        reference_weights_sha256=tensor_digest(alternative), repeat_bitwise=True)
+
+
+def routed_stage1_partials(a, asc, w, ws, ids, splitk):
+    m, k = a.shape
+    experts, n, wk = w.shape
+    if (splitk < 1 or a.device.type != "cpu" or w.device.type != "cpu" or k != wk or k % (128 * splitk)
+            or tuple(asc.shape) != (m, k // 128) or tuple(ws.shape) != (experts, n // 128, k // 128)
+            or n % 128 or ids.shape[0] != m or ids.min() < 0 or ids.max() >= experts):
+        raise ValueError("unsupported CPU routed accumulation geometry")
+    selected = w.view(torch.uint8)[ids.flatten()].view(w.dtype).double()
+    scales = ws[ids.flatten()].repeat_interleave(128, dim=1)
+    inputs = a.double().repeat_interleave(ids.shape[1], dim=0)
+    input_scales = asc.repeat_interleave(ids.shape[1], dim=0)
+    parts = []
+    width = k // splitk // 128
+    for part in range(splitk):
+        acc = torch.zeros((ids.numel(), n), dtype=torch.float32)
+        for group in range(part * width, (part + 1) * width):
+            lo = group * 128
+            dot = (selected[:, :, lo:lo + 128] * inputs[:, None, lo:lo + 128]).sum(dim=-1).float()
+            scale = input_scales[:, group, None] * scales[:, :, group]
+            # FP64 intermediates model FP32 FMA; this is not an MFMA instruction oracle.
+            acc = (dot.double() * scale.double() + acc.double()).float()
+        parts.append(acc)
+    return torch.stack(parts)
+
+
+def model_routed_stage1(args):
+    report = json.loads(args.reference_json.read_text())
+    metadata = json.loads((args.capture / "inputs/reference.json").read_text())
+    config = json.loads((args.checkpoint / "config.json").read_text())
+    m, h, topk = metadata["batch"], config["hidden_size"], config["num_experts_per_tok"]
+    layer, rows = captured_block_layer(metadata), []
+    for case in report["cases"]:
+        rank = case["rank"]
+        ids, _, routehash = load_routes(args.capture / "outputs" / f"rank{rank}.act.tab.bin",
+            m, topk, config["n_routed_experts"], live_prefix=True)
+        if routehash != case["routes_sha256"]:
+            raise ValueError("route provenance mismatch")
+        weights = routed_weights(args.checkpoint, layer, rank, args.tp)
+        for key, value in (("gate_up", weights[0]), ("gate_up_scale", weights[2])):
+            if tensor_digest(value) != case["checkpoint_shard_sha256"][key]:
+                raise ValueError("checkpoint provenance mismatch")
+        def captured(name, dtype, shape):
+            value, digest = load_tensor(args.reference_json.parent / f"{args.reference_json.stem}.rank{rank}.{name}.bin", dtype, shape)
+            expected = (case["stage1_diagnostic"]["tensors"][name.split(".")[-1]]["sha256"]
+                        if name.startswith("stage1-diagnostic.") else case["boundaries"][name]["sha256"])
+            if digest != expected:
+                raise ValueError("stage1 boundary provenance mismatch")
+            return value
+        a = captured("stage1.input", torch.float8_e4m3fn, (m, h))
+        asc = captured("stage1.scale", torch.float32, (m, h // 128))
+        pre = captured("stage1-diagnostic.preactivation", torch.float32, (m * topk, weights[0].shape[1]))
+        if args.export_routed_stage1_partials:
+            diagnostic = case["stage1_diagnostic"]
+            splitk = case["selected"]["ksplit"]
+            width = h // splitk
+            if (h % splitk or width % 128 or not diagnostic["partials_repeat_bitwise"]
+                    or not diagnostic["partials_sum"]["bitwise"]):
+                raise ValueError("requires stable, reconstructing block-aligned partials")
+            isolated = captured("stage1-diagnostic.partials", torch.float32, (splitk, m * topk, weights[0].shape[1]))
+            repeated = captured("stage1-diagnostic.partials_repeat", torch.float32, tuple(isolated.shape))
+            if not torch.equal(isolated, isolated.half().float()) or not torch.equal(isolated, repeated):
+                raise ValueError("partial values are not stable exact FP16")
+            exports = []
+            for expert in sorted(set(ids.flatten().tolist())):
+                token, slot = (ids == expert).nonzero(as_tuple=True)
+                for part in range(splitk):
+                    lo, hi = part * width, (part + 1) * width
+                    path = args.output.parent / f"rank{rank}.expert{expert}.part{part}.fp16.bin"
+                    write_case(path, a.view(torch.uint8)[token, lo:hi], weights[0][expert, :, lo:hi],
+                        asc[token, lo // 128:hi // 128].T.contiguous(), weights[2][expert, :, lo // 128:hi // 128],
+                        isolated[part, token * topk + slot].half(), fp16=True)
+                    exports.append(dict(expert=expert, part=part, file=path.name,
+                        shape=[token.numel(), weights[0].shape[1], width], output_dtype="float16",
+                        sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
+            rows.append(dict(rank=rank, exports=exports))
+            continue
+        parts = routed_stage1_partials(a, asc, weights[0], weights[2], ids, case["selected"]["ksplit"])
+        isolated = (captured("stage1-diagnostic.partials", torch.float32, tuple(parts.shape))
+                    if "partials" in case["stage1_diagnostic"]["tensors"] else None)
+        variants = {}
+        half = parts.half()
+        half_rtz = torch.where(half.float().abs() > parts.abs(), torch.nextafter(half, torch.zeros_like(half)), half)
+        for name, rounded in (("float32", parts), ("float16_rne", half.float()),
+                              ("float16_rtz", half_rtz.float()), ("bfloat16_rne", parts.bfloat16().float())):
+            total = torch.zeros_like(pre)
+            for part in rounded:
+                total += part
+            variants[name] = boundary_difference(total, pre)
+            if isolated is not None:
+                variants[name]["isolated_partials"] = boundary_difference(rounded.flatten(0, 1), isolated.flatten(0, 1))
+        row = dict(rank=rank, partials_sha256=tensor_digest(parts), variants=variants)
+        rows.append(row)
+        print(json.dumps(row), flush=True)
+    with args.output.open("x") as f:
+        json.dump(dict(scope=("installed isolated stage1 FP16 partial fixtures; not serving qualification" if args.export_routed_stage1_partials
+            else "CPU rounding diagnostic; FP64 block dot then FP32 FMA model, not native MFMA qualification"),
+            source_report_sha256=hashlib.sha256(args.reference_json.read_bytes()).hexdigest(), cases=rows), f, indent=2, allow_nan=False)
+        f.write("\n")
+    return 0
+
+
+def diagnose_routed_stage1(fm, call, native, reference, output, rank):
+    if call.func != fm.ck_moe_stage1 or call.keywords.get("splitk", 0) <= 1:
+        raise ValueError("stage1 diagnostic requires installed CK split-K wrapper")
+    captures = []
+    original = fm.aiter.ck_moe_stage1_fwd
+
+    def capture(*operands, **keywords):
+        result = original(*operands, **keywords)
+        tmp = operands[6]
+        if tmp.dtype != torch.float32 or tmp.ndim != 2:
+            raise ValueError("expected split-K FP32 preactivation")
+        captures.append(tmp[:reference.shape[0] * reference.shape[1]].detach().cpu().clone())
+        return result
+
+    def replay(splitk, inputs=None):
+        out = torch.zeros_like(call.args[6])
+        keywords = dict(call.keywords, splitk=splitk)
+        operands = call.args[:6] + (out,) + call.args[7:]
+        if inputs is not None:
+            operands = (inputs,) + operands[1:]
+        call.func(*operands, **keywords)
+        return out.detach().cpu().clone()
+
+    try:
+        fm.aiter.ck_moe_stage1_fwd = capture
+        split = replay(call.keywords["splitk"])
+        split_repeat = replay(call.keywords["splitk"])
+        splitk = call.keywords["splitk"]
+        k = call.args[0].shape[-1]
+        if k % splitk:
+            raise ValueError("stage1 isolation requires equally sized K partitions")
+        for _ in range(2):
+            for part in range(splitk):
+                masked = torch.zeros_like(call.args[0])
+                lo, hi = part * (k // splitk), (part + 1) * (k // splitk)
+                masked[:, lo:hi] = call.args[0][:, lo:hi]
+                replay(splitk, masked)
+    finally:
+        fm.aiter.ck_moe_stage1_fwd = original
+    if len(captures) != 2 + 2 * splitk or captures[0].shape != (reference.numel() // reference.shape[-1], 2 * reference.shape[-1]):
+        raise ValueError("unexpected split-K preactivation geometry/count")
+    unsplit, unsplit_repeat = replay(0), replay(0)
+    values = dict(split=split, split_repeat=split_repeat, unsplit=unsplit,
+                  unsplit_repeat=unsplit_repeat, preactivation=captures[0],
+                  preactivation_repeat=captures[1], partials=torch.stack(captures[2:2 + splitk]),
+                  partials_repeat=torch.stack(captures[2 + splitk:]))
+    records = {}
+    for name, value in values.items():
+        if not bool(torch.isfinite(value).all()):
+            raise ValueError(f"nonfinite stage1 diagnostic: {name}")
+        dest = output.parent / f"{output.stem}.rank{rank}.stage1-diagnostic.{name}.bin"
+        with dest.open("xb") as f:
+            f.write(value.contiguous().view(torch.uint8).numpy().tobytes())
+        records[name] = dict(file=dest.name, shape=list(value.shape), dtype=str(value.dtype),
+                             sha256=tensor_digest(value))
+        if value.shape == reference.shape and value.dtype == reference.dtype:
+            records[name].update(
+                reference_changed_elements=int((value.view(torch.int16) != reference.view(torch.int16)).sum()),
+                native_changed_elements=int((value.view(torch.int16) != native.view(torch.int16)).sum()))
+    total = torch.zeros_like(captures[0])
+    for part in values["partials"]:
+        total += part
+    return dict(scope="diagnostic only; splitk=0 is not the selected reference configuration; isolated parts zero other prequantized K ranges with original scales",
+                tensors=records, partials_sum=boundary_difference(total, captures[0]),
+                partials_repeat_bitwise=tensor_digest(values["partials"]) == tensor_digest(values["partials_repeat"]),
+                preactivation_repeat_bitwise=torch.equal(captures[0].view(torch.int32), captures[1].view(torch.int32)))
+
+
 def compare_packet_routed(args, rocm_aiter_ops, version):
     import importlib
     from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import QuantMethod
@@ -3627,18 +4868,21 @@ def compare_packet_routed(args, rocm_aiter_ops, version):
             or measurement.get("scope") != "single-block-decode"
             or measurement.get("batch") != metadata.get("batch")):
         raise ValueError("requires single-block capture with matching TP and batch")
-    m, layer = metadata["batch"], metadata["layer"]
+    m, layer = metadata["batch"], captured_block_layer(metadata)
     h, topk, experts = (config[key] for key in
                         ("hidden_size", "num_experts_per_tok", "n_routed_experts"))
     i = config["moe_intermediate_size"] // args.tp
+    router_reference = json.loads(args.router_reference.read_text()) if args.router_reference else None
     rows = []
     for rank in range(args.tp):
         prefix = args.capture / "outputs" / f"rank{rank}"
-        x, xhash = load_tensor(Path(str(prefix) + ".act.xn2.bin"), torch.bfloat16, (m, h))
-        ids, gates, routehash = load_routes(Path(str(prefix) + ".act.tab.bin"), m, topk, experts)
+        x, xhash = load_tensor(Path(str(prefix) + ".act.xn2.bin"), torch.bfloat16, (m, h), live_prefix=args.live_prefix)
+        ids, gates, routehash = load_routes(Path(str(prefix) + ".act.tab.bin"), m, topk, experts, live_prefix=args.live_prefix)
+        alternative_gates = (router_reference_weights(router_reference, rank, xhash, routehash, ids)
+            if router_reference is not None else None)
         native = None
         if args.routed_w8a8:
-            native, native_hashes = native_routed_boundaries(prefix, h, i, experts, ids, gates)
+            native, native_hashes = native_routed_boundaries(prefix, h, i, experts, ids, gates, live_prefix=args.live_prefix)
             part, parthash = native["stage2.output"], native_hashes["part"]
         else:
             part, parthash = load_tensor(Path(str(prefix) + ".act.part.bin"), torch.float32, (m, topk, h))
@@ -3677,13 +4921,22 @@ def compare_packet_routed(args, rocm_aiter_ops, version):
             fm.kernel_bench_callable = []
             repeat = run().cpu()
             repeated = routed_stage_snapshots(fm.kernel_bench_callable, selected.run_1stage)
+            stage1_diagnostic = None
+            if args.routed_stage1_diagnostic:
+                if selected.run_1stage or native is None or [name for name, _ in calls] != ["stage1", "stage2"]:
+                    raise ValueError("stage1 diagnostic requires native two-stage reference")
+                stage1_diagnostic = diagnose_routed_stage1(fm, calls[0][1], native["stage1.output"],
+                    snapshots["stage1.output"], args.output, rank)
             if args.routed_down_isolate:
                 if selected.run_1stage or [name for name, _ in fm.kernel_bench_callable] != ["stage1", "stage2"]:
                     raise ValueError("weighted-down isolation requires two-stage reference")
                 down_cases, down_parts = isolate_routed_down(args, rank, fm.kernel_bench_callable[1][1],
                     ids, gates, *down_original)
+                router_impact = (routed_router_impact(fm.kernel_bench_callable[1][1], ids, gates,
+                    alternative_gates, down_parts) if alternative_gates is not None else None)
             else:
                 down_cases = []
+                router_impact = None
         finally:
             fm.kernel_bench_callable = previous
         del calls
@@ -3723,6 +4976,8 @@ def compare_packet_routed(args, rocm_aiter_ops, version):
         row = dict(rank=rank, shape=[m, h, i, experts, topk], selected=selection, stages=stages,
             boundaries=boundaries,
             isolated_weighted_down=down_cases,
+            router_weight_impact=router_impact,
+            stage1_diagnostic=stage1_diagnostic,
             input_sha256=xhash, routes_sha256=routehash, part_sha256=parthash,
             checkpoint_shard_sha256=weight_hashes, finite=finite,
             reference_repeat_bitwise=torch.equal(reference.view(torch.int16), repeat.view(torch.int16)),
@@ -3751,26 +5006,30 @@ def compare_packet_routed(args, rocm_aiter_ops, version):
         row["stable_boundaries_bitwise"] and all(row["bf16_addition_order_bounds"].values()) for row in rows)
     with args.output.open("x") as f:
         json.dump(dict(scope="routed MoE diagnostic conditioned on Plow input and routes; excludes router, shared addition and TP reduction",
+            activation_hash_scope="live_prefix_for_row_tensors" if args.live_prefix else "whole_file",
             vllm_version=version, checkpoint=str(args.checkpoint), precision_qualified=False,
             passed=passed, audit_complete=complete,
             plow_reduction=("captured BF16 atomic output; exact addition-order extrema, not bitwise reduction or reachability of interior values"
                 if args.routed_w8a8 else "FP32 captured weighted parts summed in slot order, then BF16; not packet shared-add boundary"),
             aiter_source_sha256=hashlib.sha256(Path(fm.__file__).read_bytes()).hexdigest(),
+            router_reference_sha256=(hashlib.sha256(args.router_reference.read_bytes()).hexdigest()
+                if args.router_reference else None),
             cases=rows), f, indent=2, allow_nan=False)
         f.write("\n")
     return 0 if (passed if args.routed_w8a8 else complete) else 1
 
 
-def packet_oproj_cases(capture, checkpoint, tp):
+def packet_oproj_cases(capture, checkpoint, tp, *, live_prefix=False, diagnostic=False):
     from safetensors import safe_open
 
     measurement = json.loads((capture / "measurement.json").read_text())
     metadata = json.loads((capture / "inputs/reference.json").read_text())
     if (tp < 1 or measurement.get("tp") != tp or measurement.get("scope") != "single-block-decode"
-            or measurement.get("oracle_verified") is not True
+            or (measurement.get("oracle_verified") is not True and not diagnostic)
+            or not isinstance(measurement.get("oracle_verified"), bool)
             or measurement.get("batch") != metadata.get("batch")):
         raise ValueError("requires a passed single-block capture with matching TP and batch")
-    m, layer = metadata["batch"], metadata["layer"]
+    m, layer = metadata["batch"], captured_block_layer(metadata)
     weight_name = f"model.layers.{layer}.self_attn.o_proj.weight"
     scale_name = weight_name + "_scale_inv"
     index = json.loads((checkpoint / "model.safetensors.index.json").read_text())["weight_map"]
@@ -3795,12 +5054,14 @@ def packet_oproj_cases(capture, checkpoint, tp):
             (scale_name, torch.float32, (n // 128, k // 128)),
         ):
             path = capture / "outputs" / f"rank{rank}.{name}.bin"
-            tensors[name], hashes[name] = load_tensor(path, dtype, shape)
+            tensors[name], hashes[name] = load_tensor(path, dtype, shape,
+                live_prefix=live_prefix and name.startswith("act."))
         w = weight[:, rank * k:(rank + 1) * k].contiguous()
         ws = scale[:, rank * (k // 128):(rank + 1) * (k // 128)].contiguous()
         weight_equal = torch.equal(tensors[weight_name + "_fp8"], w.view(torch.uint8))
         scale_equal = torch.equal(tensors[scale_name].view(torch.int32), ws.view(torch.int32))
         yield dict(rank=rank, shape=(m, n, k), hashes=hashes,
+                   block_oracle_verified=measurement["oracle_verified"],
                    checkpoint_weight_bitwise=weight_equal, checkpoint_scale_bitwise=scale_equal), (
             tensors["act.oat"], tensors["act.blk_xq"], tensors["act.blk_xs"].T.contiguous(),
             w, ws, tensors["act.og_tp"])
@@ -3816,7 +5077,215 @@ def ordered_bf16_sum(partials):
     return result
 
 
-def packet_shared_cases(capture, checkpoint, tp):
+def router_contract(config, inventory, tp, layer):
+    prefix = f"model.layers.{layer}.mlp.gate"
+    if (config.get("architectures") != ["GlmMoeDsaForCausalLM"]
+            or config.get("scoring_func") != "sigmoid" or config.get("n_group") != 1
+            or config.get("topk_group") != 1 or config.get("num_experts_per_tok") != 8
+            or config.get("n_routed_experts") != 256 or config.get("hidden_size") != 6144
+            or config.get("norm_topk_prob") is not True
+            or config.get("routed_scaling_factor") != 2.5):
+        raise ValueError("unsupported GLM router contract")
+    if sorted(r["rank"] for r in inventory["ranks"]) != list(range(tp)):
+        raise ValueError("router inventory ranks differ from TP")
+    for rank in inventory["ranks"]:
+        gate = rank["modules"][prefix]
+        if (gate["class_name"] != "vllm.model_executor.layers.fused_moe.router.gate_linear.GateLinear"
+                or gate["attributes"]["out_dtype"] != "torch.float32"
+                or gate["tensors"]["weight"]["dtype"] != "torch.bfloat16"
+                or gate["tensors"]["weight"]["shape"] != [256, 6144]
+                or gate["tensors"]["e_score_correction_bias"]["dtype"] != "torch.float32"):
+            raise ValueError("loaded router precision differs from replay")
+    return prefix
+
+
+def compare_packet_router(args, version):
+    import inspect
+    from types import SimpleNamespace
+    from safetensors import safe_open
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+    from vllm.model_executor.layers.fused_moe.router.router_factory import create_fused_moe_router
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    if version != "0.29.0" or args.checkpoint is None or args.precision_inventory is None:
+        raise ValueError("requires pinned vLLM0.29, original checkpoint and loaded inventory")
+    config = json.loads((args.checkpoint / "config.json").read_text())
+    inventory = json.loads(args.precision_inventory.read_text())
+    metadata = json.loads((args.capture / "inputs/reference.json").read_text())
+    measurement = json.loads((args.capture / "measurement.json").read_text())
+    if (measurement.get("scope") != "single-block-decode" or measurement.get("tp") != args.tp
+            or measurement.get("batch") != metadata["batch"]):
+        raise ValueError("requires matching single-block TP capture")
+    prefix = router_contract(config, inventory, args.tp, captured_block_layer(metadata))
+    gate_name = GateLinear.__module__ + "." + GateLinear.__name__
+    source_digest = hashlib.sha256(Path(inspect.getfile(GateLinear)).read_bytes()).hexdigest()
+    if any(r["sources"][gate_name]["sha256"] != source_digest for r in inventory["ranks"]):
+        raise ValueError("installed gate source differs from loaded inventory")
+    index = json.loads((args.checkpoint / "model.safetensors.index.json").read_text())["weight_map"]
+    weights = {}
+    for name in ("weight", "e_score_correction_bias"):
+        key = prefix + "." + name
+        with safe_open(args.checkpoint / index[key], framework="pt", device="cpu") as shard:
+            weights[name] = shard.get_tensor(key)
+    weight, bias = weights["weight"], weights["e_score_correction_bias"]
+    if weight.dtype != torch.bfloat16 or bias.dtype != torch.float32 or tuple(bias.shape) != (256,):
+        raise ValueError("original router weight precision mismatch")
+    gate = SimpleNamespace(weight=weight.cuda(), out_dtype=torch.float32,
+        allow_ll_bf16_gemm=False, allow_fp32_router_gemm=False,
+        allow_bf16x3_router_gemm=False, allow_cublas_router_gemm=True)
+    router = create_fused_moe_router(top_k=8, global_num_experts=256, renormalize=True,
+        use_grouped_topk=True, num_expert_group=1, topk_group=1, scoring_func="sigmoid",
+        routed_scaling_factor=2.5, e_score_correction_bias=bias.cuda())
+    if not rocm_aiter_ops.is_fused_moe_enabled():
+        raise ValueError("captured AITER routing backend is not enabled")
+    records = []
+    for rank in range(args.tp):
+        base = args.capture / "outputs"
+        m = metadata["batch"]
+        x, xhash = load_tensor(base / f"rank{rank}.act.xn2.bin", torch.bfloat16,
+            (m, 6144), live_prefix=args.live_prefix)
+        native_logits, lhash = load_tensor(base / f"rank{rank}.act.rlogit.bin", torch.float32,
+            (m, 256), live_prefix=args.live_prefix)
+        native_ids, native_weights, thash = load_routes(base / f"rank{rank}.act.tab.bin",
+            m, 8, 256, live_prefix=args.live_prefix)
+        logits, _ = GateLinear.forward(gate, x.cuda())
+        logits_repeat, _ = GateLinear.forward(gate, x.cuda())
+        comparisons = {}
+        for label, values in (("native_logits", native_logits.cuda()), ("reference_logits", logits)):
+            gates, ids = router._compute_routing(x.cuda(), values, torch.int32)
+            gates2, ids2 = router._compute_routing(x.cuda(), values, torch.int32)
+            gates, ids, gates2, ids2 = [v.cpu() for v in (gates, ids, gates2, ids2)]
+            order = ids.argsort(dim=1)
+            native_order = native_ids.argsort(dim=1)
+            aligned, native_aligned = gates.gather(1, order), native_weights.gather(1, native_order)
+            comparisons[label] = dict(ids_equal=torch.equal(ids, native_ids),
+                sets_equal=torch.equal(ids.gather(1, order), native_ids.gather(1, native_order)),
+                weights_bitwise=torch.equal(aligned.view(torch.int32), native_aligned.view(torch.int32)),
+                weights_max_abs=float((aligned - native_aligned).abs().max()),
+                repeat_bitwise=torch.equal(gates.view(torch.int32), gates2.view(torch.int32)) and torch.equal(ids, ids2),
+                ids=ids.tolist(), weights=gates.tolist(), weights_sha256=tensor_digest(gates))
+        ref = logits.cpu()
+        records.append(dict(rank=rank, input_sha256=xhash, native_logits_sha256=lhash,
+            native_routes_sha256=thash, reference_logits_sha256=tensor_digest(ref),
+            logits_bitwise=torch.equal(ref.view(torch.int32), native_logits.view(torch.int32)),
+            logits_max_abs=float((ref-native_logits).abs().max()),
+            logits_repeat_bitwise=torch.equal(ref.view(torch.int32), logits_repeat.cpu().view(torch.int32)),
+            comparisons=comparisons))
+    passed = all(r["logits_bitwise"] and r["logits_repeat_bitwise"] and all(
+        c["sets_equal"] and c["weights_bitwise"] and c["repeat_bitwise"]
+        for c in r["comparisons"].values()) for r in records)
+    sources = {str(Path(inspect.getfile(obj))): hashlib.sha256(Path(inspect.getfile(obj)).read_bytes()).hexdigest()
+        for obj in (GateLinear, create_fused_moe_router, type(router))}
+    report = dict(passed=passed, precision_qualified=False, vllm_version=version,
+        scope="native-input router diagnostic: installed ROCm GateLinear tier4 and factory-selected routing; not full-model qualification",
+        router_class=type(router).__name__, sources=sources,
+        inventory_sha256=hashlib.sha256(args.precision_inventory.read_bytes()).hexdigest(),
+        weights={k: tensor_digest(v) for k, v in weights.items()}, cases=records)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report, indent=2))
+    return 0 if passed else 1
+
+
+def check_block_rows(args):
+    metadata = json.loads((args.capture / "inputs/reference.json").read_text())
+    measurement = json.loads((args.capture / "measurement.json").read_text())
+    m = metadata["batch"]
+    if (m < 1 or measurement.get("batch") != m or measurement.get("tp") != args.tp
+            or measurement.get("scope") != "single-block-decode"):
+        raise ValueError("requires matching batched block capture")
+    cases = []
+    for name in [*metadata["stages"], "act.xnext"]:
+        path = args.capture / "inputs" / ("reference.bf16" if name == "act.xnext" else name + ".reference.bf16")
+        if path.stat().st_size % (2 * m):
+            raise ValueError("invalid block reference row size")
+        shape = (m, path.stat().st_size // (2 * m))
+        reference, digest = load_tensor(path, torch.bfloat16, shape)
+        for rank in range(args.tp):
+            value, actual_digest = load_tensor(args.capture / "outputs" / f"rank{rank}.{name}.bin",
+                torch.bfloat16, shape, live_prefix=args.live_prefix)
+            if not torch.isfinite(reference).all() or not torch.isfinite(value).all():
+                raise ValueError("nonfinite block row")
+            delta = value.double() - reference.double()
+            relative = delta.norm(dim=1) / reference.double().norm(dim=1).clamp_min(1e-30)
+            cases.append(dict(stage=name, rank=rank, shape=shape, reference_sha256=digest,
+                actual_sha256=actual_digest, row_relative_l2=relative.tolist(),
+                row_changed_elements=(value.view(torch.int16) != reference.view(torch.int16)).sum(dim=1).tolist(),
+                max_row_relative_l2=float(relative.max())))
+    report = dict(scope="all live block rows; strict numerical diagnostic, no tolerance promotion",
+        precision_qualified=False, passed=all(not any(c["row_changed_elements"]) for c in cases), cases=cases)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report, indent=2))
+    return 0 if report["passed"] else 1
+
+
+def mlp_combine_replay(shared, routed):
+    if (not shared or len(shared) != len(routed)
+            or any(x.dtype != torch.bfloat16 or x.shape != shared[0].shape
+                   or not torch.isfinite(x).all() for x in shared + routed)):
+        raise ValueError("requires finite equally shaped BF16 shared/routed rank pairs")
+    partials = [(s.float() + r.float()).bfloat16() for s, r in zip(shared, routed)]
+    total = torch.zeros_like(partials[0], dtype=torch.float32)
+    for partial in partials:
+        total += partial.float()
+    return total.bfloat16()
+
+
+def check_mlp_combine(args):
+    measurement = json.loads((args.capture / "measurement.json").read_text())
+    metadata = json.loads((args.capture / "inputs/reference.json").read_text())
+    m = metadata.get("batch")
+    if (measurement.get("scope") != "single-block-decode" or args.tp < 2
+            or measurement.get("tp") != args.tp or measurement.get("batch") != m
+            or not isinstance(m, int) or m < 1):
+        raise ValueError("requires matching single-block decode TP and batch")
+    output_path = args.capture / "inputs/reference.bf16"
+    if output_path.stat().st_size % (m * 2):
+        raise ValueError("invalid live block output size")
+    shape = (m, output_path.stat().st_size // (m * 2))
+    tensors, digests = {}, {}
+    for rank in range(args.tp):
+        for name in ("shared", "part", "attn", "xmid", "xnext"):
+            key = f"rank{rank}.act.{name}.bin"
+            tensors[key], digests[key] = load_tensor(args.capture / "outputs" / key,
+                torch.bfloat16, shape, live_prefix=args.live_prefix)
+            if not torch.isfinite(tensors[key]).all():
+                raise ValueError(f"non-finite MLP boundary: {key}")
+    reduced = mlp_combine_replay(
+        [tensors[f"rank{rank}.act.shared.bin"] for rank in range(args.tp)],
+        [tensors[f"rank{rank}.act.part.bin"] for rank in range(args.tp)])
+    cases = []
+    for rank in range(args.tp):
+        residual = tensors[f"rank{rank}.act.xmid.bin"]
+        expected = (residual.float() + reduced.float()).bfloat16()
+        cases.append(dict(rank=rank, reduced_bitwise=torch.equal(reduced.view(torch.int16),
+            tensors[f"rank{rank}.act.attn.bin"].view(torch.int16)),
+            output_bitwise=torch.equal(expected.view(torch.int16),
+            tensors[f"rank{rank}.act.xnext.bin"].view(torch.int16))))
+    passed = all(row["reduced_bitwise"] and row["output_bitwise"] for row in cases)
+    report = dict(passed=passed, precision_qualified=False, shape=shape, tp=args.tp,
+        scope="native-conditioned BF16 shared+routed combine, rank-ordered FP32 TP sum, residual; not vLLM collective equivalence",
+        capture=str(args.capture), live_prefix=args.live_prefix, input_sha256=digests,
+        measurement_sha256=hashlib.sha256((args.capture / "measurement.json").read_bytes()).hexdigest(),
+        cases=cases)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report, indent=2))
+    return 0 if passed else 1
+
+
+def captured_block_layer(metadata):
+    if "layer" in metadata:
+        return metadata["layer"]
+    layers = {int(name.split(".")[1]) for name in metadata.get("files", {})
+              if name.startswith("kv.") and name.endswith(".ckv.bin") and name.split(".")[1].isdigit()}
+    if len(layers) != 1:
+        raise ValueError("capture must identify exactly one block layer")
+    return layers.pop()
+
+
+def packet_shared_cases(capture, checkpoint, tp, *, live_prefix=False):
     from safetensors import safe_open
 
     measurement = json.loads((capture / "measurement.json").read_text())
@@ -3825,7 +5294,7 @@ def packet_shared_cases(capture, checkpoint, tp):
             or not isinstance(measurement.get("oracle_verified"), bool)
             or measurement.get("batch") != metadata.get("batch")):
         raise ValueError("requires an explicitly validated single-block capture with matching TP and batch")
-    m, layer = metadata["batch"], metadata["layer"]
+    m, layer = metadata["batch"], captured_block_layer(metadata)
     prefix = f"model.layers.{layer}.mlp.shared_experts."
     index = json.loads((checkpoint / "model.safetensors.index.json").read_text())["weight_map"]
     originals = {}
@@ -3847,7 +5316,8 @@ def packet_shared_cases(capture, checkpoint, tp):
     for rank in range(tp):
         tensors, hashes = {}, {}
         def read(name, dtype, shape):
-            value, hashes[name] = load_tensor(capture / "outputs" / f"rank{rank}.{name}.bin", dtype, shape)
+            value, hashes[name] = load_tensor(capture / "outputs" / f"rank{rank}.{name}.bin", dtype, shape,
+                                             live_prefix=live_prefix and name.startswith("act."))
             return value
         for name, dtype, shape in (
             ("xn2", torch.bfloat16, (m, h)), ("sh_gate", torch.bfloat16, (m, inter)),
@@ -3869,6 +5339,7 @@ def packet_shared_cases(capture, checkpoint, tp):
                 matched[proj + "." + suffix] = torch.equal(captured.view(torch.uint8), part.view(torch.uint8))
                 tensors[proj + "." + suffix] = part
         yield dict(rank=rank, shape=(m, h, inter), hashes=hashes, checkpoint_bitwise=matched,
+                   activation_hash_scope="live_prefix" if live_prefix else "whole_file",
                    block_oracle_verified=measurement["oracle_verified"]), tensors
 
 
@@ -3990,7 +5461,7 @@ def compare_packet_shared(args, rocm_aiter_ops, version):
     if args.checkpoint is None or not rocm_aiter_ops.is_linear_fp8_enabled():
         raise ValueError("shared comparison requires original checkpoint and active AITER FP8")
     rows = []
-    for row, t in packet_shared_cases(args.capture, args.checkpoint, args.tp):
+    for row, t in packet_shared_cases(args.capture, args.checkpoint, args.tp, live_prefix=args.live_prefix):
         m, h, inter = row["shape"]
         row["quantization"] = {}
         quantized = {}
@@ -4067,7 +5538,8 @@ def compare_packet_oproj(args, rocm_aiter_ops, version):
     if args.checkpoint is None or not rocm_aiter_ops.is_linear_fp8_enabled():
         raise ValueError("packet comparison requires original checkpoint and active AITER FP8")
     rows = []
-    for row, (x, q, scales, w, ws, plow) in packet_oproj_cases(args.capture, args.checkpoint, args.tp):
+    for row, (x, q, scales, w, ws, plow) in packet_oproj_cases(args.capture, args.checkpoint, args.tp,
+            live_prefix=args.live_prefix, diagnostic=args.oproj_diagnostic):
         m, n, k = row["shape"]
         reference_q, reference_s = rocm_aiter_ops.group_fp8_quant(x.cuda(), 128)
         repeat_q, repeat_s = rocm_aiter_ops.group_fp8_quant(x.cuda(), 128)
@@ -4104,16 +5576,26 @@ def compare_packet_oproj(args, rocm_aiter_ops, version):
                 if row["effective_k_partitions"] == 4 and k % 512 == 0:
                     from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck
 
-                    partials = []
+                    partials, exports = [], []
                     for part in range(4):
                         lo, hi = part * (k // 4), (part + 1) * (k // 4)
-                        out = torch.empty((m, n), dtype=torch.bfloat16, device=reference_q.device)
-                        gemm_a8w8_blockscale_ck(
-                            reference_q[:, lo:hi].contiguous(), gpu_w[:, lo:hi].contiguous(),
-                            reference_s[:, lo // 128:hi // 128].contiguous(),
-                            gpu_ws[:, lo // 128:hi // 128].contiguous(), out,
-                            splitK=0, kernelName=str(config["kernelName"]))
-                        partials.append(out.cpu())
+                        operands = (reference_q[:, lo:hi].contiguous(), gpu_w[:, lo:hi].contiguous(),
+                                    reference_s[:, lo // 128:hi // 128].contiguous(),
+                                    gpu_ws[:, lo // 128:hi // 128].contiguous())
+                        results = []
+                        for _ in range(2):
+                            out = torch.empty((m, n), dtype=torch.bfloat16, device=reference_q.device)
+                            gemm_a8w8_blockscale_ck(*operands, out,
+                                splitK=0, kernelName=str(config["kernelName"]))
+                            results.append(out.cpu())
+                        partials.append(results[0])
+                        dest = args.output.parent / f"{args.output.stem}.rank{row['rank']}.partial{part}.bin"
+                        pa, pw, ps, pws = (v.cpu() for v in operands)
+                        write_case(dest, pa.view(torch.uint8), pw, ps.T.contiguous(), pws, results[0])
+                        exports.append(dict(file=dest.name, sha256=hashlib.sha256(dest.read_bytes()).hexdigest(),
+                            k_begin=lo, k_end=hi, finite=bool(torch.isfinite(results[0]).all()),
+                            repeat_bitwise=torch.equal(results[0].view(torch.int16), results[1].view(torch.int16))))
+                    row["isolated_partials"] = exports
                     ordered = ordered_bf16_sum(partials)
                     ordered_rel = (a - ordered.double()).norm(dim=1) / ordered.double().norm(dim=1).clamp_min(1e-30)
                     row["ordered_split4_audit"] = dict(
@@ -4121,6 +5603,14 @@ def compare_packet_oproj(args, rocm_aiter_ops, version):
                         finite=bool(torch.isfinite(ordered).all()),
                         max_row_rel_l2=float(ordered_rel.max()),
                         bitwise=torch.equal(plow.view(torch.int16), ordered.view(torch.int16)))
+                    lo, hi = bf16_order_bounds(torch.stack(partials, dim=1))
+                    row["split4_addition_order_bounds"] = {tag: bool(torch.isfinite(value).all()
+                        and ((value >= lo) & (value <= hi)).all())
+                        for tag, value in (("plow", plow), ("reference", reference), ("repeat", repeat))}
+                    if all(item["finite"] and item["repeat_bitwise"] for item in exports):
+                        row["split4_addition_order_reachability"] = {
+                            tag: bf16_order_reachability(torch.stack(partials, dim=1), value)
+                            for tag, value in (("plow", plow), ("reference", reference), ("repeat", repeat))}
                     for part, value in enumerate(partials + [ordered]):
                         dest = args.output.parent / f"{args.output.stem}.rank{row['rank']}.ordered{part}.bf16"
                         with dest.open("xb") as f:
@@ -4133,7 +5623,7 @@ def compare_packet_oproj(args, rocm_aiter_ops, version):
         print(json.dumps(row), flush=True)
     passed = len(rows) == args.tp and all(row["passed"] for row in rows)
     with args.output.open("x") as f:
-        json.dump(dict(scope="captured block o_proj boundary; synthetic upstream activations; not serving",
+        json.dump(dict(scope="captured block o_proj conditioned on native inputs; not serving or full-block qualification",
                        vllm_version=version, precision_qualified=False, passed=passed,
                        checkpoint=str(args.checkpoint), max_row_rel_l2_limit=0.004, cases=rows),
                   f, indent=2, allow_nan=False)
@@ -4181,14 +5671,17 @@ def compare_quant(args, rocm_aiter_ops, version):
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("capture", type=Path)
+    parser.add_argument("--live-prefix", action="store_true", help="compare live activation prefixes in expert dumps")
     parser.add_argument("--output", type=Path, required=True)
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--quant128", action="store_true")
     modes.add_argument("--block-oproj", action="store_true")
+    parser.add_argument("--oproj-diagnostic", action="store_true")
     modes.add_argument("--block-shared", action="store_true")
     modes.add_argument("--export-shared", action="store_true")
     modes.add_argument("--block-norm", action="store_true")
     modes.add_argument("--block-routed", action="store_true")
+    modes.add_argument("--block-router", action="store_true")
     modes.add_argument("--check-routed-ab", action="store_true")
     modes.add_argument("--export-qkva", action="store_true")
     modes.add_argument("--export-qb", action="store_true")
@@ -4197,10 +5690,18 @@ def main():
     modes.add_argument("--check-mla", action="store_true")
     modes.add_argument("--check-mla-weights", action="store_true")
     modes.add_argument("--block-mla", action="store_true")
+    modes.add_argument("--block-mla-bmm", action="store_true")
+    modes.add_argument("--block-qanorm", action="store_true")
+    parser.add_argument("--native-rmsnorm", type=Path)
+    parser.add_argument("--qanorm-sweep", action="store_true")
     modes.add_argument("--block-attention", action="store_true")
     modes.add_argument("--block-rope", action="store_true")
     modes.add_argument("--export-indexer", action="store_true")
     modes.add_argument("--export-indexer-model", action="store_true")
+    modes.add_argument("--replay-model-attention", action="store_true")
+    modes.add_argument("--pack-model-block", action="store_true")
+    modes.add_argument("--check-model-decode-boundaries", action="store_true")
+    modes.add_argument("--replay-model-query", action="store_true")
     modes.add_argument("--block-indexer", action="store_true")
     modes.add_argument("--export-indexer-quant", action="store_true")
     modes.add_argument("--export-indexer-decode", action="store_true")
@@ -4223,11 +5724,18 @@ def main():
     modes.add_argument("--check-rope", action="store_true")
     modes.add_argument("--check-qkva", action="store_true")
     modes.add_argument("--export-routed", action="store_true")
+    modes.add_argument("--model-routed-stage1", action="store_true")
+    modes.add_argument("--export-routed-stage1-partials", action="store_true")
+    modes.add_argument("--check-routed-reachability", action="store_true")
+    modes.add_argument("--check-mlp-combine", action="store_true")
+    modes.add_argument("--check-block-rows", action="store_true")
     modes.add_argument("--export-routed-grouped", action="store_true")
     modes.add_argument("--export-routed-down-grouped", action="store_true")
     parser.add_argument("--grouped-repeat", type=int, default=1)
     parser.add_argument("--routed-down-isolate", action="store_true")
+    parser.add_argument("--routed-stage1-diagnostic", action="store_true")
     parser.add_argument("--routed-w8a8", action="store_true")
+    parser.add_argument("--router-reference", type=Path)
     parser.add_argument("--reference-json", type=Path)
     parser.add_argument("--qb-reference", type=Path, help="also verify strided MLA input provenance and copied raw RoPE output")
     parser.add_argument("--checkpoint", type=Path)
@@ -4239,16 +5747,37 @@ def main():
     parser.add_argument("--tp", type=int, default=8)
     parser.add_argument("--indexer-layer", type=int, default=6)
     args = parser.parse_args()
+    if args.check_block_rows:
+        return check_block_rows(args)
+    if args.router_reference is not None and not (args.block_routed and args.routed_down_isolate):
+        parser.error("--router-reference requires --block-routed and --routed-down-isolate")
+    if args.check_mlp_combine:
+        return check_mlp_combine(args)
+    if args.pack_model_block:
+        return pack_model_block(args)
+    if args.check_model_decode_boundaries:
+        return check_model_decode_boundaries(args)
+    if args.check_routed_reachability:
+        if args.reference_json is None:
+            parser.error("--check-routed-reachability requires --reference-json")
+        return check_routed_reachability(args)
+    if args.model_routed_stage1 or args.export_routed_stage1_partials:
+        if args.reference_json is None or args.checkpoint is None:
+            parser.error("--model-routed-stage1 requires --reference-json and --checkpoint")
+        return model_routed_stage1(args)
     if args.selection_attention and not args.export_attention_sweep:
         parser.error("--selection-attention requires --export-attention-sweep")
     if args.export_attention_split and (not args.export_attention_sweep or args.selection_attention):
         parser.error("--export-attention-split requires attention sweep without selection replay")
-    if args.native_indexer_selection is not None and not (args.export_indexer_selection or args.export_indexer_model_selection):
-        parser.error("--native-indexer-selection requires --export-indexer-selection")
-    if args.export_attention_ps and not args.block_attention:
-        parser.error("--export-attention-ps requires --block-attention")
+    if args.native_indexer_selection is not None and not (args.export_indexer_selection
+            or args.export_indexer_model_selection or args.replay_model_attention):
+        parser.error("--native-indexer-selection requires a selection export or model attention replay")
+    if args.export_attention_ps and not (args.block_attention or args.replay_model_attention):
+        parser.error("--export-attention-ps requires --block-attention or --replay-model-attention")
     if args.routed_w8a8 and not (args.block_routed and args.routed_down_isolate):
         parser.error("--routed-w8a8 requires --block-routed and --routed-down-isolate")
+    if args.routed_stage1_diagnostic and not args.routed_w8a8:
+        parser.error("--routed-stage1-diagnostic requires --routed-w8a8")
     if args.check_routed_ab:
         return check_routed_ab(args)
     if args.pack_attention_split:
@@ -4280,6 +5809,13 @@ def main():
     if args.export_routed or args.export_routed_grouped or args.export_routed_down_grouped:
         return export_routed(args)
     from vllm import __version__
+    if args.block_router:
+        return compare_packet_router(args, __version__)
+    if args.replay_model_query:
+        from vllm._aiter_ops import rocm_aiter_ops
+        return replay_model_query(args, rocm_aiter_ops, __version__)
+    if args.replay_model_attention:
+        return replay_model_attention(args, __version__)
     if args.check_attention_addressing:
         if args.reference_json is None:
             parser.error("--check-attention-addressing requires --reference-json")
@@ -4307,6 +5843,10 @@ def main():
         return export_indexer(args, rocm_aiter_ops, __version__)
     if args.check_mla_weights:
         return check_mla_weights(args, __version__)
+    if args.block_qanorm:
+        return compare_packet_qanorm(args, rocm_aiter_ops, __version__)
+    if args.block_mla_bmm:
+        return compare_packet_mla_bmm(args, rocm_aiter_ops, __version__)
     if args.block_mla:
         return compare_packet_mla(args, rocm_aiter_ops, __version__)
     if args.block_attention:

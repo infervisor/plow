@@ -4,6 +4,9 @@ source /home/lava/plow/scripts/bench/plowbench.sh
 pb_require_nix
 pb_hazard_env
 capture=$(realpath "${1:?usage: glm53-indexer-capture.sh frozen-capture-directory}")
+request_batch=${2:-1}
+prefill_tokens=${3:-8192}
+[[ "$request_batch" =~ ^[1-9][0-9]*$ && "$prefill_tokens" =~ ^[1-9][0-9]*$ ]] || exit 2
 for file in capture.json cases.json sitecustomize.py vllm_forward_capture.py vllm_logit_oracle.py; do
     test -f "$capture/$file"
 done
@@ -25,5 +28,6 @@ timeout --foreground --kill-after=30s 1800 sudo -n docker run --rm --network non
     vllm/vllm-openai-rocm@sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1 \
     "$capture/vllm_logit_oracle.py" --model /opt/models/GLM-5.3-full-aca966e4 \
     --cases "$capture/cases.json" --output "$capture/reference" --precision-report \
-    --max-output-tokens 5 --tp 8 --max-model-len 73728 --max-num-batched-tokens 8192 \
+    --max-output-tokens 5 --tp 8 --max-model-len 73728 --max-num-batched-tokens "$prefill_tokens" \
+    --request-batch-size "$request_batch" \
     --enforce-eager --trust-remote-code > "$capture/oracle.log" 2>&1

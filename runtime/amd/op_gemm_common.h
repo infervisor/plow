@@ -1592,7 +1592,9 @@ __device__ __forceinline__ void atomic_add_bf16_pair(bf16* dst, unsigned packed)
 
 // GLU stores gate/up consecutively, with a separate block-scale grid for each half.
 template <bool GLU = false, bool GATHER = false, bool WEIGHTED = false, bool SCATTER = false,
-          bool ATOMIC = false, bool SPLIT3 = false, unsigned SPLITK = 1, bool KATOMIC = false>
+          bool ATOMIC = false, bool SPLIT3 = false, unsigned SPLITK = 1, bool KATOMIC = false,
+          bool HALF_OUT = false, unsigned GLU_KGROUPS = 0, bool SEPARATE_K_PARTS = false,
+          unsigned WAVES_PER_BLOCK = PLOW_WAVES>
 __device__ void d_gemm_fp8_block128_m16(bf16* C, const unsigned char* A,
                                      const unsigned char* B, const float* ascale,
                                      const float* wscale, unsigned M, unsigned N, unsigned K,
@@ -1601,7 +1603,8 @@ __device__ void d_gemm_fp8_block128_m16(bf16* C, const unsigned char* A,
                                      const unsigned* row_token = nullptr, unsigned source_rows = 0,
                                      const float* row_weight = nullptr, unsigned topk = 0,
                                      bf16* C1 = nullptr, bf16* C2 = nullptr,
-                                     unsigned n_first = 0, unsigned n_second = 0) {
+                                     unsigned n_first = 0, unsigned n_second = 0,
+                                     bf16* C3 = nullptr) {
     static_assert(!GLU || !WEIGHTED, "routed weights apply after the down GEMM");
     static_assert(!SCATTER || GATHER, "scatter uses the gathered row map");
     static_assert(!ATOMIC || (SCATTER && WEIGHTED), "atomic reduction requires weighted slot rows");
@@ -1609,6 +1612,14 @@ __device__ void d_gemm_fp8_block128_m16(bf16* C, const unsigned char* A,
     static_assert(SPLITK == 1 || ((SPLITK == 4 || SPLITK == 8) && !GLU && !GATHER && !WEIGHTED && !SCATTER && !SPLIT3),
                   "Q-B split-K requires a plain block128 GEMM");
     static_assert(!KATOMIC || SPLITK > 1, "K atomic reduction requires multiple partitions");
+    static_assert(!SEPARATE_K_PARTS || (SPLITK == 4 && !KATOMIC),
+                  "separate K outputs require four non-atomic partitions");
+    static_assert(!HALF_OUT || (!GLU && !GATHER && !WEIGHTED && !SCATTER && !SPLIT3 && SPLITK == 1),
+                  "FP16 partial capture requires a plain GEMM");
+    static_assert(GLU_KGROUPS == 0 || (GLU && SPLITK == 1 && !HALF_OUT),
+                  "rounded gate/up partials require an unsplit GLU tile");
+    static_assert(WAVES_PER_BLOCK >= 1 && WAVES_PER_BLOCK <= PLOW_WAVES,
+                  "wave mapping must fit the interpreter workgroup");
     const unsigned lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
     const unsigned nt = (N + 15) / 16, mt = (M + 15) / 16, kb = (K + 127) / 128;
     if constexpr (GLU && !GATHER) {
@@ -1617,7 +1628,8 @@ __device__ void d_gemm_fp8_block128_m16(bf16* C, const unsigned char* A,
     }
     const bool packed = (K % 128 == 0) && (((size_t)A | (size_t)B | (GLU ? (size_t)B2 : 0)) & 15u) == 0;
     const unsigned scale_rows = GATHER ? source_rows : M;
-    for (unsigned tile = slice * PLOW_WAVES + wave; tile < mt * nt * SPLITK; tile += nblk * PLOW_WAVES) {
+    for (unsigned tile = slice * WAVES_PER_BLOCK + wave; tile < mt * nt * SPLITK;
+         tile += nblk * WAVES_PER_BLOCK) {
         const unsigned part = SPLITK == 1 ? 0 : tile / (mt * nt);
         const unsigned local = SPLITK == 1 ? tile : tile % (mt * nt);
         const unsigned m0 = (local / nt) * 16, n0 = (tile % nt) * 16;
@@ -1630,6 +1642,7 @@ __device__ void d_gemm_fp8_block128_m16(bf16* C, const unsigned char* A,
             scale_row[e] = GATHER && m < M ? row_token[m] : m;
         }
         f32x4 acc = (f32x4)(0.0f), up = (f32x4)(0.0f);
+        f32x4 gate_sum = (f32x4)(0.0f), up_sum = (f32x4)(0.0f);
         for (unsigned group = part * (kb / SPLITK); group < (part + 1) * (kb / SPLITK); group++) {
             fp8v32 av = (fp8v32)(0), bv = (fp8v32)(0), uv = (fp8v32)(0);
             const unsigned k0 = group * 128 + (lane / 16) * 32;
@@ -1692,12 +1705,26 @@ __device__ void d_gemm_fp8_block128_m16(bf16* C, const unsigned char* A,
                 acc[e] = fmaf(dot[e], as * ws, acc[e]);
                 if constexpr (GLU) up[e] = fmaf(udot[e], as * us, up[e]);
             }
+            if constexpr (GLU_KGROUPS != 0) {
+                if ((group + 1) % GLU_KGROUPS == 0 || group + 1 == kb) {
+                    // CK's split-K epilogue rounds each partial to FP16 before FP32 atomic add.
+#pragma unroll
+                    for (unsigned e = 0; e < 4; e++) {
+                        gate_sum[e] += (float)(_Float16)acc[e];
+                        up_sum[e] += (float)(_Float16)up[e];
+                    }
+                    acc = up = (f32x4)(0.0f);
+                }
+            }
         }
+        if constexpr (GLU_KGROUPS != 0) { acc = gate_sum; up = up_sum; }
 #pragma unroll
         for (unsigned e = 0; e < 4; e++) {
             const unsigned m = m0 + (lane / 16) * 4 + e, n = n0 + lane % 16;
             // CK rounds the reciprocal before either FP32 multiply.
-            if constexpr (GLU) acc[e] = (acc[e] * (1.0f / (1.0f + expf(-acc[e])))) * up[e];
+            if constexpr (GLU_KGROUPS != 0)
+                acc[e] = (acc[e] * __builtin_amdgcn_rcpf(1.0f + expf(-acc[e]))) * up[e];
+            else if constexpr (GLU) acc[e] = (acc[e] * (1.0f / (1.0f + expf(-acc[e])))) * up[e];
             if (m < M && n < N) {
                 if constexpr (WEIGHTED) acc[e] *= row_weight[m];
                 const unsigned dst = SCATTER ? scale_row[e] : m;
@@ -1718,12 +1745,20 @@ __device__ void d_gemm_fp8_block128_m16(bf16* C, const unsigned char* A,
                     const unsigned width = n < n_first ? n_first : n < second_end ? n_second : N - second_end;
                     const unsigned col = n < n_first ? n : n < second_end ? n - n_first : n - second_end;
                     st_act1(out + (size_t)m * width + col, f2bf(acc[e]));
-                } else if (!SCATTER || dst < source_rows)
-                    st_act1(&C[((size_t)part * M + dst) * N + n], f2bf(acc[e]));
+                } else if (!SCATTER || dst < source_rows) {
+                    const bf16 value = HALF_OUT ? __builtin_bit_cast(unsigned short, (_Float16)acc[e]) : f2bf(acc[e]);
+                    if constexpr (SEPARATE_K_PARTS) {
+                        bf16* out = part == 0 ? C : part == 1 ? C1 : part == 2 ? C2 : C3;
+                        st_act1(&out[(size_t)dst * N + n], value);
+                    } else {
+                        st_act1(&C[((size_t)part * M + dst) * N + n], value);
+                    }
+                }
             }
         }
     }
 }
+
 #endif
 
 template <int BM, int BN, int BK, int WM, int WN, bool KEXACT = true, bool GLU = false,
@@ -5711,12 +5746,19 @@ __device__ void d_gemv_qkv_mxfp4(bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x,
      * sequences, and therefore what makes the fusion byte-exact rather than merely close. */
 #define GEMV_MXFP4_DISP(UN)                                                                      \
     do {                                                                                         \
-        if (lds_ok)                                                                              \
-            gemv_rows_mxfp4<PLOW_GEMV_MM, true, UN>(Cq, Ck, Cv, x, Wq, Wk, Wv, Sq, Sk, Sv, M, Nq, \
-                                                    Nk, Nv, K, slice, nblk, lds);                 \
-        else                                                                                     \
-            gemv_rows_mxfp4<PLOW_GEMV_MM, false, UN>(Cq, Ck, Cv, x, Wq, Wk, Wv, Sq, Sk, Sv, M,    \
-                                                     Nq, Nk, Nv, K, slice, nblk, lds);            \
+        gemv_walk(M, [&](unsigned m0, unsigned rows) {                                          \
+            bf16* q = Cq ? Cq + (size_t)m0 * Nq : nullptr;                                      \
+            bf16* k = Ck ? Ck + (size_t)m0 * Nk : nullptr;                                      \
+            bf16* v = Cv ? Cv + (size_t)m0 * Nv : nullptr;                                      \
+            const bf16* xb = x + (size_t)m0 * K;                                                \
+            const bf16* lb = lds + (size_t)m0 * K;                                              \
+            if (lds_ok)                                                                          \
+                gemv_rows_mxfp4<PLOW_GEMV_MM, true, UN>(q, k, v, xb, Wq, Wk, Wv, Sq, Sk, Sv,   \
+                                                        rows, Nq, Nk, Nv, K, slice, nblk, lb);  \
+            else                                                                                 \
+                gemv_rows_mxfp4<PLOW_GEMV_MM, false, UN>(q, k, v, xb, Wq, Wk, Wv, Sq, Sk, Sv,  \
+                                                         rows, Nq, Nk, Nv, K, slice, nblk, lds);\
+        });                                                                                      \
     } while (0)
     if (nchunk >= 8u) GEMV_MXFP4_DISP(4);      /* K>=16384: 8 chunks -> 2 clean groups of 4 */
     else if (nchunk >= 6u) GEMV_MXFP4_DISP(3); /* K=12288: 6 -> 2 groups of 3               */

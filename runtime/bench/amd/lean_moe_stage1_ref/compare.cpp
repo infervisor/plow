@@ -12,7 +12,14 @@
     std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, hipGetErrorString(e_)); \
     std::exit(1); } } while (0)
 
-constexpr uint32_t T = 8192, H = 3584, I = 384, E = 896, TOPK = 16, BM = 64, GRID = 512;
+#ifdef GLM53_MOE_BENCH
+constexpr uint32_t T = 16, H = 6144, I = 256, E = 256, TOPK = 8, ACTIVE = 68;
+constexpr uint32_t ACT = 1;
+#else
+constexpr uint32_t T = 8192, H = 3584, I = 384, E = 896, TOPK = 16, ACTIVE = E;
+constexpr uint32_t ACT = 2;
+#endif
+constexpr uint32_t BM = 64, GRID = 512;
 constexpr uint32_t UNUSED = ~0u;
 
 __device__ __forceinline__ uint32_t mix32(uint32_t x) {
@@ -70,7 +77,7 @@ struct Module {
     }
     void launch(void* out, void* activation, void* wtab, void* stab, void* meta,
                 void* row_token, void* row_partidx, void* out_scale) {
-        uint32_t inter = I, hidden = H, experts = E, act = 2, zero = 0;
+        uint32_t inter = I, hidden = H, experts = E, act = ACT, zero = 0;
         float beta = 4.0f, linear_beta = 25.0f;
         void* args[] = {&out, &activation, &wtab, &stab, &meta, &row_token, &row_partidx,
                         &out_scale, &inter, &hidden, &experts, &act, &beta, &linear_beta,
@@ -113,9 +120,9 @@ int main(int argc, char** argv) {
     std::vector<std::vector<uint32_t>> buckets(E);
     uint32_t state = 930100;
     for (uint32_t pidx = 0; pidx < T * TOPK; ++pidx) {
-        state = xorshift(state); uint32_t expert = state % E;
+        state = xorshift(state); uint32_t expert = state % ACTIVE;
         state = xorshift(state);
-        if ((state & 3u) == 0) { state = xorshift(state); expert = state % (E / 8); }
+        if ((state & 3u) == 0) { state = xorshift(state); expert = state % (ACTIVE / 8); }
         buckets[expert].push_back(pidx);
     }
     std::vector<int32_t> rowoff(E), counts(E), tilep(E + 1);
@@ -181,9 +188,11 @@ int main(int argc, char** argv) {
     size_t payload_bad = 0, scales_bad = 0;
     for (size_t i = 0; i < payload_bytes; ++i) payload_bad += hso[i] != hco[i];
     for (size_t i = 0; i < scale_bytes; ++i) scales_bad += hss[i] != hcs[i];
-    std::printf("oracle rows=%zu payload_bytes=%zu bad=%zu scale_bytes=%zu bad=%zu\n",
-                rows, payload_bytes, payload_bad, scale_bytes, scales_bad);
-    if (payload_bad || scales_bad) return 3;
+    const size_t payload_changed = std::count_if(hso.begin(), hso.end(), [](uint8_t x) { return x != 0xa5; });
+    const size_t scales_changed = std::count_if(hss.begin(), hss.end(), [](uint8_t x) { return x != 0xa5; });
+    std::printf("oracle rows=%zu payload_bytes=%zu bad=%zu changed=%zu scale_bytes=%zu bad=%zu changed=%zu\n",
+                rows, payload_bytes, payload_bad, payload_changed, scale_bytes, scales_bad, scales_changed);
+    if (payload_bad || scales_bad || !payload_changed || !scales_changed) return 3;
 
     void* flush{}; constexpr size_t flush_bytes = 256u * 1024 * 1024;
     CK(hipMalloc(&flush, flush_bytes)); CK(hipMemset(flush, 0x5a, flush_bytes));

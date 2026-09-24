@@ -1126,8 +1126,7 @@ fn devblob_verify_hook(
                                 program: None,
                                 scope: plow_asset::certificates::SemanticScope::RewriteBodyExpansion,
                                 checkpoint: "A".into(),
-                                request_sha256: plow_asset::decode_objects::image_sha256(
-                                    &serde_json::to_vec(&req).map_err(|error| error.to_string())?),
+                                request_sha256: plow_asset::certificates::request_sha256(&req)?,
                                 verifier_sha256, request: req,
                                 response: serde_json::to_value(&cert).map_err(|error| error.to_string())?,
                             });
@@ -1235,8 +1234,7 @@ fn devblob_verify_hook(
                     program: Some(pi),
                     scope: plow_asset::certificates::SemanticScope::CoarseDependencyPreservation,
                     checkpoint: "D".into(),
-                    request_sha256: plow_asset::decode_objects::image_sha256(
-                        &serde_json::to_vec(&request).map_err(|error| error.to_string())?),
+                    request_sha256: plow_asset::certificates::request_sha256(&request)?,
                     verifier_sha256: verifier_sha256.clone(),
                     request,
                     response: serde_json::to_value(&cert).map_err(|error| error.to_string())?,
@@ -1251,8 +1249,7 @@ fn devblob_verify_hook(
                 rep.compile_checks.push(plow_asset::certificates::CompileCheckReceipt {
                     program, scope,
                     checkpoint: checkpoint.into(),
-                    request_sha256: plow_asset::decode_objects::image_sha256(
-                        &serde_json::to_vec(&request).map_err(|error| error.to_string())?),
+                    request_sha256: plow_asset::certificates::request_sha256(&request)?,
                     verifier_sha256: verifier_sha256.clone(), request,
                     response: serde_json::to_value(&cert).map_err(|error| error.to_string())?,
                 });
@@ -1344,7 +1341,9 @@ fn devblob_verify_hook(
             // program must fit the decode-object LDS arena — the task-9 bug class,
             // rejected at emit. The staged set mirrors op_gemm.h's "x is ALWAYS
             // staged in LDS here" family; demand is the kernel's rows*K (+ the
-            // q-norm fold scratch when t[7] rides GemvQkv). Plain Gemv is excluded
+            // q-norm fold scratch when t[7] rides GemvQkv). A BF16 GemvQkv with
+            // a packet-bound walking MM stages at most that many rows per pass.
+            // Plain Gemv is excluded
             // by design: its body carries a per-op fit fallback.
             {
                 use packet::dev::{DevOp, TENSOR_NONE};
@@ -1392,6 +1391,11 @@ fn devblob_verify_hook(
                             "rows": staged_rows,
                             "k": inst.i[2],
                             "scratch": scratch,
+                            "walk_mm": if !nvidia_target && name == "GemvQkv" {
+                                inst.j[0]
+                            } else {
+                                0
+                            },
                         }))
                     })
                     .collect();
@@ -1820,20 +1824,20 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // So `--no-tuning`, whose documented contract is "the compiled output is identical to the
     // pre-tuner compiler", did not disable the one tuner that was choosing tiles. An escape
     // hatch nobody can reach is worse than none: it is a documented promise that silently does
-    // not hold. Carried through the environment because that is how every other compiler-side
-    // knob in `devgen` is read (`PLOW_BLOCK`, `PLOW_FA_GF_FULL`, `PLOW_MXFP4`, …); an empty
-    // value means "no store", which is what `--no-tuning` asks for.
-    std::env::set_var(
-        "PLOW_TUNEDB",
-        if cli.no_tuning {
-            String::new()
-        } else {
-            cli.tuning_db
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "tuning".to_string())
-        },
-    );
+    // not hold. Keep the environment and the installed emit config aligned: both are read by
+    // compiler paths. An empty value means "no store", which is what `--no-tuning` asks for.
+    let tunedb_root = if cli.no_tuning {
+        String::new()
+    } else {
+        cli.tuning_db
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .or_else(|| cli.emit_cfg.tunedb.clone())
+            .unwrap_or_else(|| "tuning".to_string())
+    };
+    std::env::set_var("PLOW_TUNEDB", &tunedb_root);
+    let mut emit_cfg = cli.emit_cfg.clone();
+    emit_cfg.tunedb = Some(tunedb_root);
     if cli.segmented {
         devgen::knob_spec::note_cap("segmented");
     }
@@ -1856,7 +1860,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             l2_layout,
             gpu: cli.gpu.clone(),
             arch: cli.arch.clone(),
-            emit_cfg: Some(cli.emit_cfg.clone()),
+            emit_cfg: Some(emit_cfg),
             whole_graph_fusions,
         },
         verify,
@@ -2225,6 +2229,8 @@ fn run_tune(t: &TuneCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                  …`. The flags go BEFORE the `tune` word because they are the compile's flags."
             )
         })?;
+        let mut emit_cfg = cli.emit_cfg.clone();
+        emit_cfg.tunedb = Some(t.db.to_string_lossy().into_owned());
         Ok(tune::demand::EmitSpec {
             hf_dir: dir,
             ctx: cli.max_ctx,
@@ -2238,6 +2244,7 @@ fn run_tune(t: &TuneCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             tp: cli.num_gpus.max(1) as u32,
             gpu: cli.gpu.clone(),
             arch: cli.arch.clone(),
+            emit_cfg,
             db: t.db.clone(),
         })
     };

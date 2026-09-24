@@ -2438,6 +2438,16 @@ fn check_rowsplit_attn(blob: &DevBlob, seq_par_slots: u64) -> Result<u64> {
 fn check_dcp_gather(blob: &DevBlob, slots: u64, slot_bytes: u64) -> Result<u64> {
     use packet::dev::DevOp;
     const REC_BYTES: u64 = 656;
+    let canonical = blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
+        d.op == DevOp::IndexSelect as u16 && d.i[4] == 3
+    });
+    if !canonical && blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
+        d.op == DevOp::DcpKvPack as u16 && u32::from(d.t[0]) != packet::TENSOR_NONE
+    }) {
+        return Err(RuntimeError::Device(
+            "DCP decode requires canonical selection before owner pack".into(),
+        ));
+    }
     let mut any = false;
     for (pi, p) in blob.progs.iter().enumerate() {
         for d in &p.insts {
@@ -3071,6 +3081,20 @@ mod tests {
         assert!(check_dcp_gather(&blob([32, 2048, 0, 6, 3, three, 7, 8]), 6, slot).is_err());
         assert!(check_dcp_gather(&blob([32, 8192, 0, 6, 3, six, 7, 8]), 6, slot).is_err());
         assert!(check_dcp_gather(&blob([32, 2048, 0, 6, 3, six, 7, 8]), 9, slot).is_err());
+        let mut decode = blob([32, 2048, 0, 6, 3, six, 7, 8]);
+        decode.progs[0].insts.insert(0, DevInst64 {
+            op: DevOp::DcpKvPack as u16,
+            t: [0, 65535, 65535, 65535, 65535, 65535, 65535, 65535],
+            i: [32, 2048, 0, 6, 3, six, 0, 0],
+            ..Default::default()
+        });
+        assert!(check_dcp_gather(&decode, 6, slot).is_err());
+        decode.progs[0].insts.insert(0, DevInst64 {
+            op: DevOp::IndexSelect as u16,
+            i: [0, 2048, 0, 0, 3, 0, 0, 0],
+            ..Default::default()
+        });
+        assert_eq!(check_dcp_gather(&decode, 6, slot).unwrap(), 7);
         let mut plain = blob([0; 8]);
         plain.progs[0].insts.clear();
         assert_eq!(check_dcp_gather(&plain, 6, slot).unwrap(), 6);

@@ -818,6 +818,9 @@ extern "C" __device__ unsigned plow_gate_hier_1 = 1;
 #endif
 #if PLOW_DCP_GATHER
 extern "C" __device__ unsigned plow_dcp_gather_1 = 1;
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_SELECT
+extern "C" __device__ unsigned plow_dcp_index_canon_1 = 1;
+#endif
 #endif
 #ifndef PLOW_GQ_BATCH
 #define PLOW_GQ_BATCH 1
@@ -846,6 +849,12 @@ extern "C" __device__ unsigned plow_dsa_select_split_arm = 1;
 #endif
 #ifndef IDXPF_TILE_N_DEF
 #define IDXPF_TILE_N_DEF 64u
+#endif
+#ifndef PLOW_QKVA_WAVE1
+#define PLOW_QKVA_WAVE1 0
+#endif
+#if PLOW_QKVA_WAVE1
+extern "C" __device__ unsigned plow_qkva_wave1_arm = 1;
 #endif
 #if PLOW_DSA_IDX_ROW
 /* Marker so "which arm is in this object?" is answerable by a symbol scan rather than by
@@ -3062,6 +3071,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
     if (!plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
     switch (in->op) {
         case PLOW_DOP_RMSNORM:
+            if (in->i[3] != 0) __builtin_trap();
             d_rmsnorm((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), PLOW_RUNTIME_ROWS(in->i[0]),
                       in->i[1], in->fj[0].f, in->i[2], slice, nblk, sm->part,
                       (unsigned char*)TEN(3), (float*)TEN(4), prog_meta, in->i[7]);
@@ -3271,6 +3281,17 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
     switch (in->op) {
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_RMSNORM
         case PLOW_DOP_RMSNORM:
+            if (in->i[3] == 1) {
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
+                if (plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
+#endif
+                if (in->i[1] != 2048 || in->i[2] != 0 || in->fj[0].f != 1e-5f
+                    || TEN(2) == nullptr || TEN(3) != nullptr || TEN(4) != nullptr)
+                    __builtin_trap();
+                d_rmsnorm_glm_qa((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                PLOW_RUNTIME_ROWS(in->i[0]), slice, nblk, sm->part);
+                break;
+            }
             /* i[2] = out_row0: the OUTPUT cache row (GLM decode-step latent write, patched per step);
              * 0 for every other RMSNORM (in-place), so all existing packets are bit-identical.
              * t[3]/t[4] = OPTIONAL fused w8a8 activation-quant outputs (xq bytes + per-row
@@ -3990,6 +4011,19 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         case PLOW_DOP_GEMM_FP8_BLOCK128: {
 #if PLOW_CDNA4
             if (in->i[4]) {
+#if PLOW_QKVA_WAVE1
+                if (PLOW_RUNTIME_ROWS(in->i[0]) <= 64) {
+                    if (threadIdx.x < 64)
+                        d_gemm_fp8_block128_m16<false, false, false, false, false, true,
+                                                 1, false, false, 0, false, 1>(
+                            (bf16*)TEN(0), (const unsigned char*)TEN(1),
+                            (const unsigned char*)TEN(2), (const float*)TEN(3),
+                            (const float*)TEN(4), PLOW_RUNTIME_ROWS(in->i[0]), in->i[1],
+                            in->i[2], slice, nblk, nullptr, nullptr, nullptr, 0, nullptr, 0,
+                            (bf16*)TEN(5), (bf16*)TEN(6), in->i[4], in->i[5]);
+                    break;
+                }
+#endif
                 d_gemm_fp8_block128_m16<false, false, false, false, false, true>(
                     (bf16*)TEN(0), (const unsigned char*)TEN(1), (const unsigned char*)TEN(2),
                     (const float*)TEN(3), (const float*)TEN(4), PLOW_RUNTIME_ROWS(in->i[0]),
@@ -3998,7 +4032,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 break;
             }
             const unsigned qb_m = PLOW_RUNTIME_ROWS(in->i[0]);
-            // Pinned AITER gfx950 Q-B table: exact M first, then ceil(M/16)*16.
+            // Selector 2 is the admitted M1 O projection; selector 1 follows the Q-B table.
             if (in->i[6] && (qb_m <= 64 || qb_m == 72 || qb_m == 88
                 || (qb_m > 224 && qb_m <= 240 && qb_m != 232))) {
                 const unsigned m = qb_m;
@@ -4043,6 +4077,17 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if PLOW_HAS_GEMM_FP8_BLOCK128_SPLIT4
         case PLOW_DOP_GEMM_FP8_BLOCK128_SPLIT4:
+#if PLOW_CDNA4
+            // This path matches CK's captured partials; the 32x32 path differs in BF16 rounding.
+            if ((PLOW_RUNTIME_ROWS(in->i[0]) == 8 || PLOW_RUNTIME_ROWS(in->i[0]) == 16)
+                    && in->i[1] == 6144 && in->i[2] == 2048) {
+                d_gemm_fp8_block128_m16<false, false, false, false, false, false, 4, false, false, 0, true>(
+                    (bf16*)TEN(0), (const unsigned char*)TEN(1), (const unsigned char*)TEN(2),
+                    (const float*)TEN(3), (const float*)TEN(4), PLOW_RUNTIME_ROWS(in->i[0]),
+                    in->i[1], in->i[2], slice, nblk, nullptr, nullptr, nullptr, 0, nullptr, 0,
+                    (bf16*)TEN(5), (bf16*)TEN(6), 0, 0, (bf16*)TEN(7));
+            } else
+#endif
             d_gemm_fp8_t<64, 128, 128, GM_WM, GM_WN, true, false, true, 4>(
                 (bf16*)TEN(0), (const unsigned char*)TEN(1), (const unsigned char*)TEN(2),
                 (const float*)TEN(3), (const float*)TEN(4), PLOW_RUNTIME_ROWS(in->i[0]),
@@ -4652,6 +4697,14 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_SELECT
         case PLOW_DOP_INDEX_SELECT: {
             unsigned* lh = (unsigned*)sm->raw;
+#if PLOW_DCP_GATHER
+            if (in->i[4] == 3u) {
+                static_assert(PLOW_SMEM_HALVES * sizeof(bf16) >= 2048u * sizeof(unsigned),
+                              "DCP index canonicalization needs 8 KiB LDS");
+                d_index_select_canonical((int*)TEN(0), (const int*)TEN(4), in->i[1], slice, lh);
+                break;
+            }
+#endif
 #if defined(__gfx942__)
             if (in->i[4] == 1u) {
                 const unsigned row = in->i[3] + slice;
@@ -6335,6 +6388,12 @@ extern "C" __global__ void plow_xctr_audit(PlowXAuditArgs a) {
             } else if (d.op == PLOW_DOP_XREDUCE2) {
                 if (d.i[3] == gate) want = a.n_gpu;
                 if (d.i[4] == gate) want = a.n_gpu * d.blocks;
+            } else if (d.op == PLOW_DOP_XREDUCESCATTER || d.op == PLOW_DOP_XALLGATHER) {
+                if (d.i[3] == gate) want = a.n_gpu;
+            } else if (d.op == PLOW_DOP_XALLTOALL_HEADS) {
+                if (d.i[4] == gate) want = a.n_gpu;
+            } else if (d.op == PLOW_DOP_XDCP_GATHER) {
+                if (d.i[6] == gate) want = a.n_gpu;
             } else if (d.op == PLOW_DOP_XARGMAX_FIN) {
                 if (d.i[3] == gate) want = a.n_gpu;
                 const uint32_t n = d.i[1] ? d.i[1] : 1u;

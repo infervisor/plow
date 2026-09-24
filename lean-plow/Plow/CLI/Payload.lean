@@ -288,10 +288,15 @@ def parseStagedOp (j : Json) : Except String LdsFit.StagedOp := do
   let rows ← getNatF "rows"
   let k ← getNatF "k"
   let scratch ← getNatF "scratch"
-  return { op := opName, idx := idx, rows := rows, k := k, scratch := scratch }
+  let walkMm ← (match j.getObjVal? "walk_mm" with
+    | .error _ => pure 0
+    | .ok _ => getNatF "walk_mm"
+    : Except String Nat)
+  return { op := opName, idx := idx, rows := rows, k := k, scratch := scratch,
+           walkMm := walkMm }
 
 /-- Parse the full G-checkpoint payload:
-    `{ "arena": Nat, "ops": [ {op, idx, rows, k, scratch}, ... ] }`. -/
+    `{ "arena": Nat, "ops": [ {op, idx, rows, k, scratch, walk_mm?}, ... ] }`. -/
 def parseLdsFit (payload : Json) : Except String LdsFitPayload := do
   let arena ← match payload.getObjVal? "arena" with
     | .error _ => throw "missing arena"

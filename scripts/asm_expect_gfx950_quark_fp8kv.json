@@ -1,0 +1,42 @@
+{
+  "_arch": "gfx950",
+  "interp_decode_fp8kv": {
+    "plow_exec": {
+      "require_min": {
+        "v_cvt_scalef32_pk_bf16_fp4": 16,
+        "v_dot2c_f32_bf16": 16
+      },
+      "forbid": ["v_mfma"]
+    },
+    "d_index_score_mfma": {
+      "mfma": "v_mfma_f32_32x32x16_bf16",
+      "require_min": {"v_mfma_f32_32x32x16_bf16": 8},
+      "no_scratch": true
+    }
+  },
+  "interp_flash_fp8kv": {
+    "plow_interp_flash": {
+      "require_min": {"v_cvt_scalef32_pk_bf16_fp8": 32},
+      "forbid": ["v_mfma_f32_32x32x64_f8f6f4"]
+    }
+  },
+  "interp_prefill_fp8kv_mla_moe_a4w4_full": {
+    "plow_exec": {
+      "require_min": {"v_mfma_f32_32x32x16_bf16": 1}
+    },
+    "d_moe_group_glu_pf": {
+      "require_min": {"v_mfma_scale_f32_32x32x64_f8f6f4": 4},
+      "fmt_on": {
+        "v_mfma_scale_f32_32x32x64_f8f6f4": {"cbsz": 4, "blgp": 4}
+      },
+      "forbid": ["v_mfma_f32_32x32x64_f8f6f4", "v_mfma_f32_32x32x16_fp8_fp8"]
+    },
+    "d_moe_group_down_pf": {
+      "require_min": {"v_mfma_scale_f32_32x32x64_f8f6f4": 4},
+      "fmt_on": {
+        "v_mfma_scale_f32_32x32x64_f8f6f4": {"cbsz": 4, "blgp": 4}
+      },
+      "forbid": ["v_mfma_f32_32x32x64_f8f6f4", "v_mfma_f32_32x32x16_fp8_fp8"]
+    }
+  }
+}

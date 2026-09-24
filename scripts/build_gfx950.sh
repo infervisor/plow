@@ -20,7 +20,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 R="$REPO/runtime"
-OUT="${1:-${PLOW_BUILD_DIR:-/tmp/rtb}}"
+OUT="$(realpath -m -- "${1:-${PLOW_BUILD_DIR:-/tmp/rtb}}")"
 ARCH="${PLOW_HIP_ARCH:-gfx950}"
 # Discover the bundler from the INSTALLED ROCm instead of pinning a version. This
 # was pinned to 7.0.2 and the path does not exist on a 7.2.4 box, so the build died
@@ -29,10 +29,30 @@ BUN="${PLOW_BUNDLER:-$(ls -1 "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/clang-offloa
         "${ROCM_PATH:-/opt/rocm}"/llvm/bin/clang-offload-bundler \
         /opt/rocm-*/lib/llvm/bin/clang-offload-bundler 2>/dev/null | head -1)}"
 INC="-I$R/amd -I$R/common"
+case "${PLOW_QKVA_WAVE1:-0}" in
+  0) ;;
+  1) INC="$INC -DPLOW_QKVA_WAVE1=1" ;;
+  *) echo "PLOW_QKVA_WAVE1 must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_MLA_P_BF16:-0}" in
   0) ;;
   1) INC="$INC -DPLOW_MLA_P_BF16=1" ;;
   *) echo "PLOW_MLA_P_BF16 must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${PLOW_MLA_PF_TR16:-0}" in
+  0) FLASH_TR16="" ;;
+  1) FLASH_TR16="-DPLOW_MLA_PF_SV=1 -DPLOW_MLA_PF_TR16=1" ;;
+  *) echo "PLOW_MLA_PF_TR16 must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${PLOW_MLA_PF_SCALE_HOIST:-0}" in
+  0) FLASH_SCALE_HOIST="" ;;
+  1) FLASH_SCALE_HOIST="-DFA_MLA_PF_SCALE_HOIST=1" ;;
+  *) echo "PLOW_MLA_PF_SCALE_HOIST must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${PLOW_MOE_PF_A4W4_BK:-128}" in
+  128) A4W4_BK="" ;;
+  256) A4W4_BK="-DMPF4_BK=256" ;;
+  *) echo "PLOW_MOE_PF_A4W4_BK must be 128 or 256" >&2; exit 2 ;;
 esac
 if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
   [ -f "$PLOW_HSACO_CONFIG" ] || { echo "missing PLOW_HSACO_CONFIG: $PLOW_HSACO_CONFIG" >&2; exit 2; }
@@ -41,6 +61,11 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
   INC="$INC -I$cfg_dir -DPLOW_CONFIG=\"$cfg_name\""
 fi
 decode_inventory_prune="${PLOW_HSACO_DECODE_INVENTORY_PRUNE:-auto}"
+DSA_FLASH=""
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_DSA_PF_ARM=1( |")' "$PLOW_HSACO_CONFIG"; then
+  DSA_FLASH="-DPLOW_DSA_PF_ARM=1"
+fi
 case "${decode_inventory_prune,,}" in
   auto) [ -n "${PLOW_HSACO_CONFIG:-}" ] && decode_inventory_prune=1 || decode_inventory_prune=0 ;;
   1|on|true|yes) decode_inventory_prune=1 ;;
@@ -111,6 +136,9 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       interp_decode_mla.elf interp_decode_mla_gq.elf \
       i_decode_fp8.co i_decode_fp8_gq.co interp_decode_fp8.elf interp_decode_fp8_gq.elf \
       i_decode_fp8kv.co i_decode_fp8kv_gq.co interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf \
+      i_flash_fp8kv.co i_flash_fp8kv_gq.co interp_flash_fp8kv.elf interp_flash_fp8kv_gq.elf \
+      i_prefill_fp8kv_mla_moe_a4w4_full.co i_prefill_fp8kv_mla_moe_a4w4_full_gq.co \
+      interp_prefill_fp8kv_mla_moe_a4w4_full.elf interp_prefill_fp8kv_mla_moe_a4w4_full_gq.elf \
       i_prefill_mla_moe.co i_prefill_mla_moe_gq.co \
       interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf \
       kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf \
@@ -541,7 +569,7 @@ fi
 # SEGMENTED-DISPATCH flash object: prefill op set at 4 waves / FA_DC=256, compiling ONLY the class-4
 # flash_prefill segment (PLOW_BUCKET_FLASH). 1 wave/SIMD => 512-reg budget; the Q-hoist spills Q to
 # on-chip scratch by design (cheaper than the L2 re-read it replaces).
-genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1" i_flash.co
+genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $FLASH_TR16" i_flash.co
 unbundle i_flash.co interp_flash.elf
 
 # GLOBAL-QUEUE variant (Experiment E1). Same op set / tiles / wave count as the static prefill+decode
@@ -616,16 +644,23 @@ BUILD_MOE=0; [ "${PLOW_MOE_PREFILL:-0}" = 1 ] && { BUILD_MOE=1; BUILD_MLA=1; }
 # the hottest loop in the interpreter pays nothing for it.
 L2D=""
 HIERD=""
+HIERPF=""
 HIER_STATUS="off"
 if [ "${PLOW_L2_PLACE:-1}" = 1 ]; then
   L2D="-DPLOW_L2_PLACE_DISPATCH"
   if [ "${PLOW_GATE_HIER:-1}" = 1 ]; then HIERD="-DPLOW_GATE_HIER=1"; HIER_STATUS="on"; fi
   echo "   per-XCD packet queues: prefill+decode L2 dispatch; decode hierarchy=$HIER_STATUS"
 fi
+case "${PLOW_GATE_HIER_PF:-0}" in
+  0) ;;
+  1) [ -n "$L2D" ] || { echo "PLOW_GATE_HIER_PF=1 requires PLOW_L2_PLACE=1" >&2; exit 2; }
+     HIERPF="-DPLOW_GATE_HIER=1" ;;
+  *) echo "PLOW_GATE_HIER_PF must be 0 or 1" >&2; exit 2 ;;
+esac
 if [ "$BUILD_GQ" = 1 ]; then
   for B in 0 1; do
     N=$([ "$B" -eq 0 ] && echo prefill || echo decode)
-    D=$([ "$B" -eq 0 ] && echo "-DPLOW_BUCKET_DECODE=0 $L2D" || echo "$DEC $L2D $HIERD")
+    D=$([ "$B" -eq 0 ] && echo "-DPLOW_BUCKET_DECODE=0 $L2D $HIERPF" || echo "$DEC $L2D $HIERD")
     genco "$D -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" "i_${N}_gq.co"
     unbundle "i_${N}_gq.co" "interp_${N}_gq.elf"
   done
@@ -633,7 +668,7 @@ if [ "$BUILD_GQ" = 1 ]; then
   # one — it is the SAME object with one extra scalar read, and if that ever costs occupancy the
   # build must fail rather than ship a decode kernel at occ 1.
   # GQ flash object (Gemma's segmented 4-wave flash segment under the global queue).
-  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" i_flash_gq.co
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $FLASH_TR16 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_flash_gq.co
   unbundle i_flash_gq.co interp_flash_gq.elf
   if [ "$need_decode_mla" = 1 ]; then
     genco "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_mla_gq.co
@@ -656,7 +691,7 @@ if [ "$BUILD_FP8" = 1 ]; then
   genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_FP8=1" i_prefill_fp8.co
   unbundle i_prefill_fp8.co interp_prefill_fp8.elf
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_prefill_fp8_gq.co
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_prefill_fp8_gq.co
     unbundle i_prefill_fp8_gq.co interp_prefill_fp8_gq.elf
   fi
 fi
@@ -664,11 +699,22 @@ fi
 # FP8 KV-CACHE decode objects (static + GQ). Swap FLASH_DECODE for the fp8 flash + add HeadNormRopeFp8,
 # keeping the fp8 GEMV weight arms. bf16/fp8-weight objects above are unaffected.
 if [ "$BUILD_FP8KV" = 1 ]; then
-  genco "$DEC -DPLOW_FP8=1 -DPLOW_FP8_KV=1" i_decode_fp8kv.co
+  FP8KV_WEIGHTS="-DPLOW_FP8=1"
+  if [ "$BUILD_MXFP4" = 1 ]; then
+    FP8KV_WEIGHTS="-DPLOW_MXFP4=1"
+    if [ "$BUILD_MOE" = 1 ] && [ "$GVMM" -gt 1 ]; then
+      FP8KV_WEIGHTS="$FP8KV_WEIGHTS -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1"
+    fi
+  fi
+  genco "$DEC $FP8KV_WEIGHTS -DPLOW_FP8_KV=1" i_decode_fp8kv.co
   unbundle i_decode_fp8kv.co interp_decode_fp8kv.elf
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_FP8_KV=1 $DSA_FLASH $FLASH_TR16 $FLASH_SCALE_HOIST" i_flash_fp8kv.co
+  unbundle i_flash_fp8kv.co interp_flash_fp8kv.elf
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "$DEC -DPLOW_FP8=1 -DPLOW_FP8_KV=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_fp8kv_gq.co
+    genco "$DEC $FP8KV_WEIGHTS -DPLOW_FP8_KV=1 $L2D $HIERD -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_fp8kv_gq.co
     unbundle i_decode_fp8kv_gq.co interp_decode_fp8kv_gq.elf
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_FP8_KV=1 $DSA_FLASH $FLASH_TR16 $FLASH_SCALE_HOIST -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_flash_fp8kv_gq.co
+    unbundle i_flash_fp8kv_gq.co interp_flash_fp8kv_gq.elf
   fi
 fi
 
@@ -684,15 +730,19 @@ fi
 # construction) and they cost nothing.
 MXFP4_ELFS=""
 if [ "$BUILD_MXFP4" = 1 ]; then
-  genco "$DEC -DPLOW_MXFP4=1" i_decode_mxfp4.co
+  MXDEC="$DEC -DPLOW_MXFP4=1"
+  if [ "$BUILD_MOE" = 1 ] && [ "$GVMM" -gt 1 ]; then
+    MXDEC="$MXDEC -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1"
+  fi
+  genco "$MXDEC" i_decode_mxfp4.co
   unbundle i_decode_mxfp4.co interp_decode_mxfp4.elf
   genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1" i_prefill_mxfp4.co
   unbundle i_prefill_mxfp4.co interp_prefill_mxfp4.elf
   MXFP4_ELFS="interp_decode_mxfp4.elf interp_prefill_mxfp4.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "$DEC -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_mxfp4_gq.co
+    genco "$MXDEC $L2D $HIERD -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_mxfp4_gq.co
     unbundle i_decode_mxfp4_gq.co interp_decode_mxfp4_gq.elf
-    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_prefill_mxfp4_gq.co
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_prefill_mxfp4_gq.co
     unbundle i_prefill_mxfp4_gq.co interp_prefill_mxfp4_gq.elf
     MXFP4_ELFS="interp_decode_mxfp4.elf interp_decode_mxfp4_gq.elf interp_prefill_mxfp4.elf interp_prefill_mxfp4_gq.elf"
   fi
@@ -705,9 +755,20 @@ if [ "$BUILD_MLA" = 1 ]; then
   unbundle i_prefill_mla.co interp_prefill_mla.elf
   MLA_ELFS="interp_prefill_mla.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" i_prefill_mla_gq.co
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_prefill_mla_gq.co
     unbundle i_prefill_mla_gq.co interp_prefill_mla_gq.elf
     MLA_ELFS="interp_prefill_mla.elf interp_prefill_mla_gq.elf"
+  fi
+fi
+
+if [ "$BUILD_MLA" = 1 ] && [ "$BUILD_MXFP4" = 1 ]; then
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_MLA_PREFILL=1" i_prefill_mxfp4_mla.co
+  unbundle i_prefill_mxfp4_mla.co interp_prefill_mxfp4_mla.elf
+  MLA_ELFS="$MLA_ELFS interp_prefill_mxfp4_mla.elf"
+  if [ "$BUILD_GQ" = 1 ]; then
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_prefill_mxfp4_mla_gq.co
+    unbundle i_prefill_mxfp4_mla_gq.co interp_prefill_mxfp4_mla_gq.elf
+    MLA_ELFS="$MLA_ELFS interp_prefill_mxfp4_mla_gq.elf"
   fi
 fi
 
@@ -718,9 +779,32 @@ if [ "$BUILD_MOE" = 1 ]; then
   unbundle i_prefill_mla_moe.co interp_prefill_mla_moe.elf
   MOE_ELFS="interp_prefill_mla_moe.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" i_prefill_mla_moe_gq.co
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_prefill_mla_moe_gq.co
     unbundle i_prefill_mla_moe_gq.co interp_prefill_mla_moe_gq.elf
     MOE_ELFS="interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf"
+  fi
+fi
+
+if [ "$BUILD_MOE" = 1 ] && [ "$BUILD_MXFP4" = 1 ]; then
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1 $A4W4_BK" i_prefill_mla_moe_a4w4_full.co
+  unbundle i_prefill_mla_moe_a4w4_full.co interp_prefill_mla_moe_a4w4_full.elf
+  MOE_ELFS="$MOE_ELFS interp_prefill_mla_moe_a4w4_full.elf"
+  if [ "$BUILD_GQ" = 1 ]; then
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF $A4W4_BK" i_prefill_mla_moe_a4w4_full_gq.co
+    unbundle i_prefill_mla_moe_a4w4_full_gq.co interp_prefill_mla_moe_a4w4_full_gq.elf
+    MOE_ELFS="$MOE_ELFS interp_prefill_mla_moe_a4w4_full_gq.elf"
+  fi
+fi
+
+if [ "$BUILD_FP8KV" = 1 ] && [ "$BUILD_MOE" = 1 ] && [ "$BUILD_MXFP4" = 1 ]; then
+  FP8KV_A4W4="-DPLOW_BUCKET_DECODE=0 -DPLOW_FP8_KV=1 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1 $A4W4_BK"
+  genco "$FP8KV_A4W4" i_prefill_fp8kv_mla_moe_a4w4_full.co
+  unbundle i_prefill_fp8kv_mla_moe_a4w4_full.co interp_prefill_fp8kv_mla_moe_a4w4_full.elf
+  MOE_ELFS="$MOE_ELFS interp_prefill_fp8kv_mla_moe_a4w4_full.elf"
+  if [ "$BUILD_GQ" = 1 ]; then
+    genco "$FP8KV_A4W4 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_prefill_fp8kv_mla_moe_a4w4_full_gq.co
+    unbundle i_prefill_fp8kv_mla_moe_a4w4_full_gq.co interp_prefill_fp8kv_mla_moe_a4w4_full_gq.elf
+    MOE_ELFS="$MOE_ELFS interp_prefill_fp8kv_mla_moe_a4w4_full_gq.elf"
   fi
 fi
 
@@ -757,7 +841,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   if [ "$BUILD_GQ" = 1 ]; then
     genco "$DEC $GMD -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_gmoe_gq.co
     unbundle i_decode_gmoe_gq.co interp_decode_gmoe_gq.elf
-    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MOE_GEMMA_PF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_prefill_gmoe_gq.co
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MOE_GEMMA_PF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" i_prefill_gmoe_gq.co
     unbundle i_prefill_gmoe_gq.co interp_prefill_gmoe_gq.elf
     GMOE_ELFS="$GMOE_ELFS interp_decode_gmoe_gq.elf interp_prefill_gmoe_gq.elf"
   fi
@@ -819,7 +903,7 @@ check() { # <name> <defs> <max-total> <min-occ>
 }
 check prefill "-DPLOW_BUCKET_DECODE=0" 256 2
 check decode  "$DEC" 256 2
-check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1" 512 1
+check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $FLASH_TR16" 512 1
 if [ "$need_decode_mla" = 1 ]; then
   check decode_mla "$DEC -DPLOW_BUCKET_DECODE_MLA=1" 256 2
 fi
@@ -828,9 +912,9 @@ fi
 # with occ-2 prefill). These run only when the GQ objects were built.
 GQ_ELFS=""
 if [ "$BUILD_GQ" = 1 ]; then
-  check prefill_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+  check prefill_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 256 2
   check decode_gq  "$DEC $L2D -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
-  check flash_gq   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 512 1
+  check flash_gq   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 $DSA_FLASH $FLASH_TR16 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 512 1
   if [ "$need_decode_mla" = 1 ]; then
     check decode_mla_gq "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
   fi
@@ -845,17 +929,19 @@ if [ "$BUILD_FP8" = 1 ]; then
   FP8_ELFS="interp_decode_fp8.elf interp_prefill_fp8.elf"
   if [ "$BUILD_GQ" = 1 ]; then
     check decode_fp8_gq "$DEC -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
-    check prefill_fp8_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    check prefill_fp8_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 256 2
     FP8_ELFS="interp_decode_fp8.elf interp_decode_fp8_gq.elf interp_prefill_fp8.elf interp_prefill_fp8_gq.elf"
   fi
 fi
 FP8KV_ELFS=""
 if [ "$BUILD_FP8KV" = 1 ]; then
-  check decode_fp8kv "$DEC -DPLOW_FP8=1 -DPLOW_FP8_KV=1" 256 2
-  FP8KV_ELFS="interp_decode_fp8kv.elf"
+  check decode_fp8kv "$DEC $FP8KV_WEIGHTS -DPLOW_FP8_KV=1" 256 2
+  check flash_fp8kv "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_FP8_KV=1 $DSA_FLASH $FLASH_TR16 $FLASH_SCALE_HOIST" 512 1
+  FP8KV_ELFS="interp_decode_fp8kv.elf interp_flash_fp8kv.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    check decode_fp8kv_gq "$DEC -DPLOW_FP8=1 -DPLOW_FP8_KV=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
-    FP8KV_ELFS="interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf"
+    check decode_fp8kv_gq "$DEC $FP8KV_WEIGHTS -DPLOW_FP8_KV=1 $L2D $HIERD -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    check flash_fp8kv_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_FP8_KV=1 $DSA_FLASH $FLASH_TR16 $FLASH_SCALE_HOIST -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 512 1
+    FP8KV_ELFS="interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf interp_flash_fp8kv.elf interp_flash_fp8kv_gq.elf"
   fi
 fi
 
@@ -864,14 +950,14 @@ if [ "$BUILD_MXFP4" = 1 ]; then
   # Dropping it here would silently revert batched decode to one row for the mxfp4 object
   # only — exactly the class of bug that made PLOW_GEMV_MM unreachable in the first place.
   # The prefill_mxfp4 checks are new and are kept as written.
-  check decode_mxfp4 "$DEC -DPLOW_MXFP4=1" 256 2
+  check decode_mxfp4 "$MXDEC" 256 2
   # The prefill twin carries the fp4 GEMM at all five tile rungs. Its accumulators are the
   # bf16 ones (w4a16 dequantizes in the B-fetch and issues a bf16 MFMA), and every rung is
   # smaller than the 256x256 arm the object already had, so it must stay at the same cliff.
   check prefill_mxfp4 "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1" 256 2
   if [ "$BUILD_GQ" = 1 ]; then
-    check decode_mxfp4_gq "$DEC -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
-    check prefill_mxfp4_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    check decode_mxfp4_gq "$MXDEC $L2D $HIERD -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    check prefill_mxfp4_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 256 2
   fi
 fi
 
@@ -881,7 +967,13 @@ if [ "$BUILD_MLA" = 1 ]; then
   # is the block's status and kills the script right here — silently, after the objects are
   # already built. Only reachable with PLOW_NO_GQ=1, which is exactly the rare path nobody runs.
   if [ "$BUILD_GQ" = 1 ]; then
-    check prefill_mla_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" 256 2
+    check prefill_mla_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 256 2
+  fi
+fi
+if [ "$BUILD_MLA" = 1 ] && [ "$BUILD_MXFP4" = 1 ]; then
+  check prefill_mxfp4_mla "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_MLA_PREFILL=1" 256 2
+  if [ "$BUILD_GQ" = 1 ]; then
+    check prefill_mxfp4_mla_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 256 2
   fi
 fi
 
@@ -890,7 +982,19 @@ fi
 if [ "$BUILD_MOE" = 1 ]; then
   check prefill_mla_moe "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1" 256 2
   if [ "$BUILD_GQ" = 1 ]; then
-    check prefill_mla_moe_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" 256 2
+    check prefill_mla_moe_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 256 2
+  fi
+fi
+if [ "$BUILD_MOE" = 1 ] && [ "$BUILD_MXFP4" = 1 ]; then
+  check prefill_mla_moe_a4w4_full "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1 $A4W4_BK" 256 2
+  if [ "$BUILD_GQ" = 1 ]; then
+    check prefill_mla_moe_a4w4_full_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF $A4W4_BK" 256 2
+  fi
+fi
+if [ "$BUILD_FP8KV" = 1 ] && [ "$BUILD_MOE" = 1 ] && [ "$BUILD_MXFP4" = 1 ]; then
+  check prefill_fp8kv_mla_moe_a4w4_full "$FP8KV_A4W4" 256 2
+  if [ "$BUILD_GQ" = 1 ]; then
+    check prefill_fp8kv_mla_moe_a4w4_full_gq "$FP8KV_A4W4 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 256 2
   fi
 fi
 
@@ -901,7 +1005,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   check prefill_gmoe "-DPLOW_BUCKET_DECODE=0 -DPLOW_MOE_GEMMA_PF=1" 256 2
   if [ "$BUILD_GQ" = 1 ]; then
     check decode_gmoe_gq "$DEC $GMD -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
-    check prefill_gmoe_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MOE_GEMMA_PF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    check prefill_gmoe_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MOE_GEMMA_PF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D $HIERPF" 256 2
   fi
 fi
 
@@ -935,6 +1039,10 @@ for e in interp_flash.elf ${BUILD_GQ:+interp_flash_gq.elf}; do
   symbols=$("${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/llvm-nm "$e")
   grep -q plow_mla_pf_v2_arm_1 <<<"$symbols" || {
     echo "FAIL: $e omits the gfx950 default MLA-prefill V2 arm"; exit 1; }
+  if [ -n "$DSA_FLASH" ]; then
+    grep -q plow_dsa_pf_arm <<<"$symbols" || {
+      echo "FAIL: $e omits the packet-required gathered sparse-prefill arm"; exit 1; }
+  fi
 done
 
 # Packed consumers are a separate opt-in object axis. Default production objects retain the
@@ -947,7 +1055,47 @@ done
 EXPECT="$REPO/scripts/asm_expect_gfx950.json"
 if [ -f "$EXPECT" ] && command -v python3 >/dev/null; then
   echo "   --- instruction-selection audit ---"
-  python3 "$REPO/scripts/asm_audit.py" --expect "$EXPECT" $ALL_ELFS | tail -20
+  if [ "${PLOW_GEMV_MFMA4:-0}" = 1 ]; then
+    DEFAULT_ELFS=""
+    MFMA4_ELFS=""
+    for e in $ALL_ELFS; do
+      case "$e" in
+        interp_decode_mxfp4*.elf) MFMA4_ELFS="$MFMA4_ELFS $e" ;;
+        *) DEFAULT_ELFS="$DEFAULT_ELFS $e" ;;
+      esac
+    done
+    python3 "$REPO/scripts/asm_audit.py" --expect "$EXPECT" $DEFAULT_ELFS | tail -20
+    if [ -n "$MFMA4_ELFS" ]; then
+      python3 "$REPO/scripts/asm_audit.py" \
+        --expect "$REPO/scripts/asm_expect_gfx950_mfma4.json" $MFMA4_ELFS | tail -20
+    fi
+  elif [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+       grep -qx '#define PLOW_PACKET_HAS_INDEX_SCORE 1' "$PLOW_HSACO_CONFIG"; then
+    DEFAULT_ELFS=""
+    DSA_DECODE_ELFS=""
+    QUARK_FP8KV_ELFS=""
+    for e in $ALL_ELFS; do
+      case "$e" in
+        interp_decode_mxfp4*.elf) DSA_DECODE_ELFS="$DSA_DECODE_ELFS $e" ;;
+        interp_decode_fp8kv*.elf|interp_flash_fp8kv*.elf|interp_prefill_fp8kv_mla_moe_a4w4_full*.elf)
+          QUARK_FP8KV_ELFS="$QUARK_FP8KV_ELFS $e" ;;
+        *) DEFAULT_ELFS="$DEFAULT_ELFS $e" ;;
+      esac
+    done
+    python3 "$REPO/scripts/asm_audit.py" --expect "$EXPECT" $DEFAULT_ELFS | tail -20
+    if [ -n "$DSA_DECODE_ELFS" ]; then
+      python3 "$REPO/scripts/asm_audit.py" \
+        --expect "$REPO/scripts/asm_expect_gfx950_dsa_decode_mxfp4.json" \
+        $DSA_DECODE_ELFS | tail -20
+    fi
+    if [ -n "$QUARK_FP8KV_ELFS" ]; then
+      python3 "$REPO/scripts/asm_audit.py" \
+        --expect "$REPO/scripts/asm_expect_gfx950_quark_fp8kv.json" \
+        $QUARK_FP8KV_ELFS | tail -20
+    fi
+  else
+    python3 "$REPO/scripts/asm_audit.py" --expect "$EXPECT" $ALL_ELFS | tail -20
+  fi
 fi
 
 # Freshness is the whole point of this script: print it, every time.

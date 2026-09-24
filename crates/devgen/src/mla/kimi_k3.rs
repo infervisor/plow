@@ -984,7 +984,7 @@ pub(crate) fn k3_emit_full(
         m.progs.last().map(|p| p.insts.len()).unwrap_or(0),
         m.progs.len(),
     );
-    write_mla_manifest(&m, out, target, MoeEnc::Mxfp4, &lean);
+    write_mla_manifest(&m, out, target, MoeEnc::Mxfp4, false, &lean);
 }
 
 fn ensure_k3_text_only(c: &K3Cfg) -> Result<(), String> {

@@ -117,6 +117,39 @@ class PacketRooflineTests(unittest.TestCase):
         self.assertEqual(parts["GemmFp8Block128Split4"]["flops"], 2 * 16 * 6144 * 2048)
         self.assertEqual(result["excluded_ops"], {})
 
+    def test_mxfp4_packet_ops_use_packed_weights_and_explicit_ceiling(self):
+        text = ("===== program T=16  5 insts\n"
+                "#0 GemvMxfp4 b=256 C<-x | M=16 N=256 K=6144\n"
+                "#1 GemmSmallMxfp4 b=256 C<-x | M=16 N=256 K=6144\n"
+                "#2 GemmGluMxfp4 b=256 C<-x | M=16 N=256 K=6144\n"
+                "#3 MoeAlignPf b=1 meta<-routes | T=16 n_exp=256 k=8\n"
+                "#4 MoeGroupGluPf b=256 fu<-x | I_moe=256 H=6144 n_exp=256 fp8=2\n")
+        with self.assertRaisesRegex(ValueError, "MXFP4 compute ceiling"):
+            analyze(text, 8192, 6200, 2300)
+        result = analyze(text, 8192, 6200, 2300, mxfp4_tflops=9200)
+        weight = 256 * (6144 // 2 + 6144 // 32)
+        self.assertEqual(result["components"]["GemvMxfp4"]["bytes"], weight)
+        self.assertEqual(result["components"]["GemmGluMxfp4"]["bytes"], 2 * weight)
+        self.assertEqual(result["components"]["MoeGroupGluPf"]["bytes"], 2 * 8 * weight)
+        self.assertEqual(result["components"]["MoeGroupGluPf"]["matrix_tflops"], 9200)
+        self.assertEqual(result["excluded_ops"], {"MoeAlignPf": 1})
+        for op in ("GemmMedMxfp4", "GemmWideMxfp4", "GemmMxfp4", "GemvGluMxfp4"):
+            size, flops = decode_cost(op, dict(M=16, N=256, K=6144), 8192)
+            factor = 2 if op == "GemvGluMxfp4" else 1
+            self.assertEqual(size, factor * weight)
+            self.assertEqual(flops, factor * 2 * 16 * 256 * 6144)
+
+    def test_mxfp4_expert_opcode_name_does_not_imply_fp8_bytes(self):
+        p = dict(I_moe=256, H=6144, enc=2)
+        weight = 256 * (6144 // 2 + 6144 // 32)
+        self.assertEqual(decode_cost("MoeExpertGluFp8Blk", p, 8192)[0], 2 * weight)
+        text = ("===== program T=1  1 insts\n"
+                "#0 MoeExpertGluFp8Blk b=32 fu<-x | I_moe=256 H=6144 enc=2\n")
+        with self.assertRaisesRegex(ValueError, "MXFP4 compute ceiling"):
+            analyze(text, 8192, 6200, 2300)
+        self.assertEqual(analyze(text, 8192, 6200, 2300, mxfp4_tflops=9200)
+                         ["components"]["MoeExpertGluFp8Blk"]["bytes"], 2 * weight)
+
     def test_captured_expert_union_and_rejections(self):
         table = b"".join(struct.pack("<If", expert, 0.5) for expert in (1, 2, 2, 3))
         self.assertEqual(routed_experts(table, 2, 2, 4), 3)

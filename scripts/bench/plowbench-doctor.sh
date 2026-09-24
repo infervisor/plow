@@ -60,7 +60,7 @@ else
     pb_warn "no assets dir given — pass one, or set PB_ASSETS, to check the packet"
 fi
 if [ -n "$OBJDIR" ]; then
-    pb_check_objects "$OBJDIR" "$ARCH"
+    pb_check_objects "$OBJDIR" "$ARCH" "$ASSETS"
 else
     pb_warn "no object dir given — pass one, or set PLOW_HSACO, to check the object set"
 fi

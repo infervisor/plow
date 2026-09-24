@@ -10,6 +10,36 @@ from vllm_logit_oracle import (dense_scores, repeat_metrics, suppression_metadat
                                engine_overrides, model_precision_inventory, precision_report)
 
 
+class RequestBatchTests(unittest.TestCase):
+    def test_batches_preserve_case_order_and_tail(self):
+        from vllm_logit_oracle import generate_requests
+        calls = []
+        def generate(prompts, sampling, use_tqdm):
+            calls.append(prompts)
+            return [SimpleNamespace(prompt_token_ids=p["prompt_token_ids"]) for p in prompts]
+        cases = [dict(id=str(i), prompt_token_ids=[i + 1]) for i in range(5)]
+        rows = list(generate_requests(SimpleNamespace(generate=generate), cases, None, 2))
+        self.assertEqual([len(x) for x in calls], [2, 2, 1])
+        self.assertEqual([case for case, _ in rows], cases)
+
+    def test_single_default_and_invalid_batch_results(self):
+        from vllm_logit_oracle import generate_requests
+        cases = [dict(id="one", prompt_token_ids=[1])]
+        def generate(prompt, sampling, use_tqdm):
+            self.assertIsInstance(prompt, dict)
+            return [SimpleNamespace(prompt_token_ids=prompt["prompt_token_ids"])]
+        llm = SimpleNamespace(generate=generate)
+        self.assertEqual(len(list(generate_requests(llm, cases, None, 1))), 1)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            list(generate_requests(llm, cases, None, 0))
+        llm.generate = lambda *a, **kw: []
+        with self.assertRaisesRegex(ValueError, "count"):
+            list(generate_requests(llm, cases, None, 2))
+        llm.generate = lambda *a, **kw: [SimpleNamespace(prompt_token_ids=[2])]
+        with self.assertRaisesRegex(ValueError, "order"):
+            list(generate_requests(llm, cases, None, 2))
+
+
 class PrecisionInventoryTests(unittest.TestCase):
     def test_loaded_tensors_and_quantization_flags_without_readback(self):
         import torch

@@ -20,9 +20,11 @@ class TraceOpcodeTests(unittest.TestCase):
             for names in (csv, header, root / "runtime/common/dev_isa.h"):
                 with self.subTest(names=names):
                     result = subprocess.run([sys.executable, str(root / "scripts/glm53_trace_attrib.py"),
-                        str(trace), "--opcodes", str(names)], text=True, capture_output=True, check=True)
+                        str(trace), "--opcodes", str(names), "--top-packets", "1"],
+                        text=True, capture_output=True, check=True)
                     self.assertIn("GEMM_FP8_BLOCK128", result.stdout)
                     self.assertIn("not wall-time attribution", result.stdout)
+                    self.assertIn("     0 GEMM_FP8_BLOCK128", result.stdout)
 
 
 if __name__ == "__main__":
