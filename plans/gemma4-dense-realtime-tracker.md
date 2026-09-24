@@ -5314,13 +5314,36 @@ dead. None cost a lease; all three would have.
 3. **"Use BKV=64 for a wider QK^T."** BKV=32 does give the QK^T wgmma an N of only 32, which is
    a real tensor-core inefficiency, and `interp_sm90a_pfattn_hd256_bkv64.cu` exists. But
    `FA_SM90_WG_ELIGIBLE` accepts BKV=64 only at `BQ==64`, and the smem then goes 103 424 ->
-   173 056 B, which drops the block from 2/SM to 1. Earlier notes called BKV64 "refuted from the
-   record"; that was an armchair call, not a measurement. But it is **also not a lease-ready
-   A/B**, which the first version of this section got wrong: `interp_sm90a_pfattn_hd256_bkv64.cu`
-   carries neither `PLOW_NV_FA_GQA2_PAIR` nor `PLOW_NV_FA_WGITEM`, so swapping the sliding path
-   onto it trades away GQA-2 K/V reuse (a 2x on K/V traffic) to buy the wider N — two variables
-   at once, and probably a net loss. A clean test needs a `gqa2_bkv64` object that does not
-   exist. Writing it is the smallest real unit of #66.
+   173 056 B. Earlier notes called BKV64 "refuted from the record"; that was an armchair call,
+   not a measurement, and the occupancy half of it turns out to be **wrong for the paired
+   object**: `FA_SM90_GQA2_PAIR_FLOATS(256,64,32)` is already 141 312 B, i.e. already 1 block/SM
+   out of the 227 328 B budget, so going to BKV=64's 215 040 B costs no occupancy at all. The
+   2->1 blocks/SM argument was about the *unpaired* 103 424 B object and does not apply here.
+
+   So the idea is live — but it is **not** a new-object-file job, which is what the first two
+   versions of this section claimed. I wrote the `gqa2_bkv64` object (a pure transform of the
+   bkv32 one: template arg, symbol names, kv_tile, arena macro) and compiled it: nvcc rc=0,
+   229/208 registers, **zero** spills. It looks clean and it is a trap. `-Xptxas=-v` reports
+   **1 barrier where the bkv32 build reports 16**, and the reason is
+   `op_attention_sm90.cuh:622`:
+
+       #if PLOW_NV_FA_WGITEM
+           if constexpr (HD == 256 && BKV == 32) { d_flash_prefill_sm90_wgitem<...>; return; }
+       #endif
+
+   At BKV=64 that `if constexpr` is false, so the warp-specialized body is never instantiated
+   (its own `static_assert(HD==256 && BQ==64 && BKV==32)` at line 257 therefore never fires) and
+   control falls through to the generic two-warpgroup body. **The entire `GQA2_PAIR` implementation
+   lives inside the wgitem body**, so at BKV=64 the `-DPLOW_NV_FA_GQA2_PAIR=1` define is accepted
+   and silently does nothing. Benching that object would have measured "BKV=64 minus GQA-2
+   pairing" and scored the wider N as a loss for the wrong reason. The file was deleted rather
+   than left in the tree.
+
+   **The real smallest unit of #66** is therefore: generalize `d_flash_prefill_sm90_wgitem` from
+   its hardcoded `<256,64,32>` shape to BKV=64 — the score tile already has an n64 form
+   (`op_attention_sm90.cuh:172-175`), but `KS1`, `NB0`, the smem layout and the P-tile staging
+   are all written against BKV=32. That is kernel work inside the warp-specialized body, and it
+   is the only way to test the wider QK^T N without confounding it with the GQA-2 pairing.
 
 **So #66 is what the tracker already said it was: a kernel project, not a knob.** Both prefill
 attention arms are already TMA + WGMMA, GQA2-paired where the shape allows, and 196 (sliding) /
