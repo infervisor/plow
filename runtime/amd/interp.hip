@@ -272,13 +272,6 @@ extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
 #if PLOW_CDNA4 && PLOW_HAS_MLA_BMM_FP8 && PLOW_WAVES == 8
 #include "mla_bmm_fp8_pf.h"
 #endif
-/* Prefill GemmF32 with N <= 512 (the MoE router) as wave-owned 16x64 units (gemm_f32_smalln.h). */
-#ifndef PLOW_GEMM_F32_SMALLN
-#define PLOW_GEMM_F32_SMALLN 0
-#endif
-#if PLOW_GEMM_F32_SMALLN
-#include "gemm_f32_smalln.h"
-#endif
 #include "op_norm.h" /* block_max — needed by op_dsa_pool.h below */
 #include "op_dsa_pool.h"
 #include "op_hyperconn.h"
@@ -3989,13 +3982,6 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         case PLOW_DOP_GEMM_F32:
             /* Decode routers need FP32 logits too; keep the MFMA tile out of that bucket. */
 #if PLOW_BUCKET_PREFILL || PLOW_MIXED_STEP
-#if PLOW_GEMM_F32_SMALLN
-            if (PLOW_RUNTIME_ROWS(in->i[0]) > PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS && in->i[1] <= 512u &&
-                (in->i[2] % 128u) == 0u)
-                d_gemm_f32_smalln((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
-                                  PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk);
-            else
-#endif
             if (PLOW_RUNTIME_ROWS(in->i[0]) > PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS)
                 d_gemm_f32((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                            PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk, sm->gm);
