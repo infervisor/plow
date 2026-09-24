@@ -5285,6 +5285,45 @@ spent the investigation on `plow_dyn_kvrow` and the three validator branches and
 provably innocent (`plow_dyn_kvrow` is `= 1` unconditionally at `interp_sm120.cu:1022`, and both
 arms return identical results from all three validators).
 
+### 3f. Aiming #66: there is no unflipped switch in prefill attention
+
+Before starting the FlashPrefill kernel project (#66, the growing term that decides 4096/8192/
+15000 C1 TTFT), three cheap "it's just switched off" hypotheses were checked and all three are
+dead. None cost a lease; all three would have.
+
+1. **"The GQA2 kernel isn't being used."** The 26B is 16 heads / 8 KV heads, so GQA-2 pairing
+   (load K/V once, run two query heads) is exactly its shape, and
+   `PLOW_PF_SEG_FA256_GQA2` is an OPT_IN runtime knob sitting at OFF. But that is the *runtime*
+   knob; the *emit* knob `PLOW_SEG_FA256_GQA2` is production-default **true**
+   (`docs/flags-reference.md:299`), and `interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin` is in the
+   c1-lean recipe's `role_files` already. The shipped sliding kernel also carries
+   `PLOW_NV_FA_GQA2_PAIR 1`, `PLOW_NV_FA_TMA 1`, `PLOW_NV_PACKED_FA_WGMMA 1`. Already on.
+
+2. **"The full-attention layers aren't on the WGMMA arm."** This one looked strong:
+   `FA_SM90_WG_ELIGIBLE(HD,BQ,BKV)` requires `BQ==64`, the hd512 object uses BQ=32 by default,
+   and `interp_sm90a_pfattn_hd512.cu` reads `#define PLOW_NV_FA512_WG 0`. All true, and all
+   irrelevant — that `#define` sits behind an `#ifndef`, and
+   `build_sm90a_gemma4_segments.sh:278` passes `${PLOW_BUILD_PFATTN_WG:-1}`, i.e. **1**.
+   Verified by rebuilding the object both ways with the script's exact argv: the shipped cubin is
+   91 632 bytes, byte-size identical to the WG=1 build and 35 KB smaller than WG=0's 126 320.
+   (The md5 differs only because the packet build adds `-Xptxas=-v`.) The full layers are on
+   WGMMA at BQ=64. This is the third time a source-level `#define X 0` has been read as "off"
+   when the build passes 1 — see [[plow-extra-defines-not-plumbed-to-packets]]: **read the nvcc
+   argv, never the source default.**
+
+3. **"Use BKV=64 for a wider QK^T."** BKV=32 does give the QK^T wgmma an N of only 32, which is
+   a real tensor-core inefficiency, and `interp_sm90a_pfattn_hd256_bkv64.cu` exists. But
+   `FA_SM90_WG_ELIGIBLE` accepts BKV=64 only at `BQ==64`, and the smem then goes 103 424 ->
+   173 056 B, which drops the block from 2/SM to 1. Earlier notes called BKV64 "refuted from the
+   record"; that was an armchair call, not a measurement, and it should be labelled as such. It
+   remains untested, and it is the one of these three still worth a lease.
+
+**So #66 is what the tracker already said it was: a kernel project, not a knob.** Both prefill
+attention arms are already TMA + WGMMA, GQA2-paired where the shape allows, and 196 (sliding) /
+351 (full) TFLOP/s is what this tiling achieves — against the GEMM path's ~780. The remaining
+routes are genuine kernel work: widen the QK^T N (BKV=64 at 1 block/SM, untested), or a deeper
+K/V pipeline. Do not spend another session looking for a switch.
+
 ### 4. PLOW_STEP_TIME: the step is device-bound, host cost is already hidden
 
 Per-step means, stable over 512 steps (`log_every(128)`, gpu.rs:6829):
