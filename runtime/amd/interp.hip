@@ -1430,7 +1430,7 @@ __device__ __forceinline__ void exec_flash_merge(CInst in, CTens T, unsigned n_b
     const bf16* const sinks = (const bf16*)TEN(3);
 #define PLOW_AMD_FLASH_MERGE(DD)                                                                 \
     d_flash_merge<DD>((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), n_batch,        \
-                      in->i[1], in->i[2], slice, nblk, sinks)
+                      in->i[1], in->i[2], slice, nblk, sinks, in->i[6])
     if (in->i[3] == 128) PLOW_AMD_FLASH_MERGE(128);
     else if (in->i[3] == 256) PLOW_AMD_FLASH_MERGE(256);
     else if (in->i[3] == 512) PLOW_AMD_FLASH_MERGE(512);

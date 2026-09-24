@@ -1493,6 +1493,9 @@ fn emit_glm_mla_value_w8a8(
         d.t[..3].copy_from_slice(&[n.olat, n.opart, n.mlpart]);
         d.i[..4].copy_from_slice(&[rows, 8, splits, 512]);
         d.i[4] = if strided { 1024 } else { 0 };
+        // Coarse dependency and one split: the device may normalize flat over the whole
+        // [rows, heads, 512] block instead of per (row, head) workgroup items.
+        d.i[6] = u32::from(!strided && splits == 1);
     });
     b.emit(DevOp::MlaBmmFp8, cus.to_vec(), &[merge], |d| {
         d.t[..4].copy_from_slice(&[n.oat, n.olat, w.wv, w.wv_s]);

@@ -2098,7 +2098,7 @@ template <int D>
 __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ Opart_,
                               const float* __restrict__ mlpart_, unsigned n_batch,
                               unsigned n_head, unsigned nsplit, unsigned slice, unsigned nblk,
-                              const bf16* __restrict__ sinks_ = nullptr) {
+                              const bf16* __restrict__ sinks_ = nullptr, unsigned flat = 0) {
     /* All three came out of the tensor table, so all three were generic: the Opart reads were
      * flat_load_dword and the O writes flat_store_short. Nothing about the ACCESS was wrong --
      * they are coalesced -- they were just on the slow path. */
@@ -2107,6 +2107,34 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
     const auto* const mlpart = as_glob(mlpart_);
     const auto* const sinks = sinks_ ? as_glob(sinks_) : nullptr;
     const unsigned n_bh = n_batch * n_head;
+    /* ONE SPLIT, NO SINKS (MLA prefill): the merge is O = f2bf(Opart * inv(row, head)). The
+     * (row, head) item loop below gives one workgroup one 512-wide row at a time with one f32 per
+     * thread — 0.53 ms/layer at T8192 TP8. Flat over 8-element groups instead: the same
+     * fa_merge_ml / FA_RECIP per group and the same single product per element, so bit-identical.
+     * Only when the packet says so (`flat`, i6): a flat map ignores flash_merge_map()'s per-
+     * workgroup slice gating, so it is legal only behind a coarse dependency (GLM MLA W8A8). */
+    if (flat && nsplit == 1u && !sinks_ && (D % 8) == 0) {
+        const size_t groups = (size_t)n_bh * (D / 8);
+        for (size_t gi = (size_t)slice * PLOW_THREADS + threadIdx.x; gi < groups;
+             gi += (size_t)nblk * PLOW_THREADS) {
+            const size_t bh = gi / (D / 8), e = gi * 8;
+            float gm;
+            const float gl = fa_merge_ml(mlpart + bh * 2, 1u, gm);
+            const float inv = (gl > 0.0f) ? FA_RECIP(gl) : 0.0f;
+            const float4 a = *(const PLOW_GLOB float4*)(const PLOW_GLOB void*)(Opart + e);
+            const float4 b = *(const PLOW_GLOB float4*)(const PLOW_GLOB void*)(Opart + e + 4);
+            const float m = mlpart[bh * 2];
+            const float wgt = (m == FA_NEG_INF) ? 0.0f : FA_EXP(m - gm);
+            /* `0.0f +` is the item loop's accumulator start: it turns a -0 product into +0. */
+            bf16v8 o;
+            o[0] = f2bf((0.0f + a.x * wgt) * inv); o[1] = f2bf((0.0f + a.y * wgt) * inv);
+            o[2] = f2bf((0.0f + a.z * wgt) * inv); o[3] = f2bf((0.0f + a.w * wgt) * inv);
+            o[4] = f2bf((0.0f + b.x * wgt) * inv); o[5] = f2bf((0.0f + b.y * wgt) * inv);
+            o[6] = f2bf((0.0f + b.z * wgt) * inv); o[7] = f2bf((0.0f + b.w * wgt) * inv);
+            *(PLOW_GLOB bf16v8*)(PLOW_GLOB void*)(O + e) = o;
+        }
+        return;
+    }
     /* MUST match flash_merge_map() in crates/devgen/src/lib.rs. A mismatch is a silent wrong
      * token, not an error: the fine dep would gate a workgroup on the wrong flash slices. */
     const unsigned dsplit = (nblk + n_bh - 1) / n_bh;
