@@ -305,7 +305,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     }
                 }
                 _ => {
-                    if std::env::var_os("PLOW_LADDER_DEBUG").is_some() {
+                    if crate::config::RuntimeConfig::get().nv.ladder_debug {
                         eprintln!(
                             "ladder: rung {index} inst {} op {} has no normalization arm",
                             insts.len(),
@@ -322,7 +322,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
         } else if normalized != insts {
             // Falling back here is SILENT (Ok(false) -> the widest rung runs every step), and it
             // reads exactly like a large kernel regression. Name the first difference.
-            if std::env::var_os("PLOW_LADDER_DEBUG").is_some() {
+            if crate::config::RuntimeConfig::get().nv.ladder_debug {
                 if normalized.len() != insts.len() {
                     eprintln!(
                         "ladder: rung {index} has {} insts, rung 0 has {}",
@@ -659,7 +659,7 @@ impl DecodeRung {
 
 
 #[cfg(test)]
-mod ladder_diag {
+mod tests {
     use super::*;
 
     /// CPU-only reproduction of the ladder decision. The real check runs during a GPU load, so

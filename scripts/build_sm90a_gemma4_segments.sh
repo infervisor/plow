@@ -253,6 +253,7 @@ if [ "${PLOW_BUILD_PFATTN_HD256_GQA2_BKV32:-$gemma_bf16}" = 1 ]; then
   gemma_gqa2_log=$(mktemp)
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin /usr/local/cuda/bin/nvcc \
     -std=c++17 -arch=sm_90a -O3 -cubin -Xptxas=-v -I runtime/common -I runtime/nvidia \
+    -DPLOW_NV_GQA2_ROLE_BKV="${PLOW_BUILD_PFATTN_GQA2_BKV:-32}" \
     -o "$gemma_out/interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin" \
     runtime/nvidia/interp_sm90a_pfattn_hd256_gqa2_bkv32.cu 2> >(tee "$gemma_gqa2_log" >&2)
   if grep -Eq '[1-9][0-9]* bytes (stack frame|spill stores|spill loads)' "$gemma_gqa2_log"; then
