@@ -5171,6 +5171,57 @@ lead.
 Data: `perf-data/campaign/gemma4-26b-a4b.h100.reference-vllm028-bf16.paired-2026-09-24T16.csv`
 and `gemma4-26b-a4b.h100.bf16-c1-lean.paired-2026-09-24T16.csv`.
 
+### 3d. Why the 26B loses TTFT above 1024: FlashPrefill is the growing term
+
+Fitting the paired C1 TTFT (3c) against input length separates a fixed cost from a per-token one:
+
+    range          plow ms/tok   vLLM ms/tok   ratio
+    1024 -> 4096      0.02108       0.01652     1.28x
+    4096 -> 15000     0.02952       0.02369     1.25x
+    intercept          9.6 ms        18.9 ms    plow 2x BETTER
+
+plow's prefill is a uniform **~26% slower per token** and only wins 128/1024 on its much lower
+fixed cost. So this is ONE defect, not three cells: 26% off per-token prefill flips 4096, 8192
+and 15000 C1 TTFT together.
+
+Attribution with `PLOW_PF_SEG_TIME=1` + `scripts/campaign/segtime_table.py`, 26B, 4 prompts at
+4096 + 15000, C1 (SHARES, never latency -- SEG_TIME drains per segment, ~3.7x inflation). The
+chunks below are one 15000-token request's successive chunks, so the change ACROSS them isolates
+the context-dependent term:
+
+    opcode                        ch33    ch34    ch35    ch36      behaviour
+    MoeGroupDownPf+GroupGluPf    22.07   39.68   40.75   40.40   flat  (34-41%)
+    FlashPrefill                  8.50   18.39   25.94   32.58   GROWS (16 -> 28%)
+    Gemm                          9.65   17.94   18.47   18.56   flat  (16-18%)
+    MoeAlign+MoeRouter+RmsNorm    5.20    8.46    8.58    8.60   flat
+    MoeCombineNorm+NormResid      4.14    7.57    7.74    7.68   flat
+    HeadNormRope                  2.95    5.70    5.88    5.81   flat
+    NormResidual+RmsNorm          1.06    1.94    2.00    2.00   flat
+    Glu                           0.79    1.17    1.23    1.24   flat
+
+The MoE expert GEMMs are the single largest share, but they are FLAT -- per-token work, already
+on the grouped cuBLASLt route. **FlashPrefill is the only term that grows**, 8.5 -> 32.6 ms inside
+one request. That is the fingerprint the deficit has: plow trails vLLM by 10.4 ms at 4096, 30.8 at
+8192 and 74.0 at 15000, i.e. ~N^1.5 -- faster than the token count, so a growing term dominates it.
+
+The flat norm/rope/router/combine tail is ~22% of the chunk here (the earlier estimate was 14%;
+SEG_TIME inflates small ops' shares because each pays a drain, so treat 22% as an upper bound).
+
+**Neither lever is a knob, and neither closes 26% alone.**
+* #66 FlashPrefill, 196 (sliding) / 351 (full) TFLOP/s against the GEMM path's ~780. Already
+  established above that sliding attention is not doing wasted work -- the window IS being
+  exploited -- so the inefficiency is real and, in this file's own words, "no cheap 4x win
+  there; it is a kernel project". It is the growing term, so it is the one that decides these
+  three cells.
+* #67 norm/Glu/rope epilogue fusion, priced at ~2.0 s of the C32 wall and ~22% of a C1 chunk
+  here. Flat, so it shifts the line down rather than changing its slope -- it helps every cell
+  a little and does not by itself fix the crossover.
+
+**Column verdict for the 26B C1 after 3c/3d:** p99 ITL 5/5 won. TTFT 2/5, needing a prefill
+kernel project (#66, slope) plus epilogue fusion (#67, offset). TPOT 0/5 and tok/s 0/5 (tok/s is
+a TPOT readout), needing the decode memory-parallelism route that #82 found gated off for MoE.
+Three kernel projects, no remaining knobs -- that is the honest state of this column.
+
 ### 4. PLOW_STEP_TIME: the step is device-bound, host cost is already hidden
 
 Per-step means, stable over 512 steps (`log_every(128)`, gpu.rs:6829):
