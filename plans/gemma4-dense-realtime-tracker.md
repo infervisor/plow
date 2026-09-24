@@ -4883,3 +4883,70 @@ killed with TaskStop; GPU confirmed free afterwards (0% util, 0 MiB, no plowrt p
 
 Note the cell was never winnable in one shot anyway: TPOT at 15000 is 10.65 vs vLLM 10.65, an
 exact tie, and the scorer requires strictly less.
+
+## 26B C1: the lean ladder lands, and where the remaining TPOT gap actually is (2026-09-24)
+
+### The lean decode ladder transfers from the 12B, and flips nothing
+
+`PLOW_DECODE_BATCH_LADDER = "1,2,4"` (was `1,2,4,8,16`) on the 26B, paired against a FRESH
+same-session vLLM 26B reference (the prior one was ~6 h old):
+
+| cell | TPOT lean / 5-rung / vLLM | tok/s lean / 5-rung / vLLM | TTFT lean / vLLM | win |
+|---|---|---|---|---|
+| 128/C1 | 5.40 / 5.60 / **5.03** | 181.0 / 174.6 / **189.2** | **21.09** / 37.96 | 2/4 |
+| 1024/C1 | 5.49 / 5.73 / **5.07** | 174.2 / 167.2 / **186.5** | **37.86** / 41.86 | 2/4 |
+| 4096/C1 | 5.52 / 5.79 / **5.08** | 159.2 / 152.6 / **173.2** | 102.51 / **93.37** | 1/4 |
+| 8192/C1 | 5.57 / 5.87 / **5.08** | 139.7 / 133.9 / **155.1** | 208.92 / **179.62** | 1/4 |
+| 15000/C1 | 5.64 / 5.99 / **5.07** | 112.2 / 107.3 / **128.5** | 423.77 / **352.21** | 1/4 |
+
+Strict improvement over the 5-rung packet at every cell (TPOT -0.20..-0.35, tok/s +5..+7, TTFT
+and p99 also better), so it shipped (7bd45936). **0 cells at 4/4 before and after.** Committed as
+an improvement, not a flip.
+
+Two corrections to what this campaign had been assuming:
+
+1. **26B C1 TTFT is NOT won across the board.** vLLM is faster at 4096/8192/15000
+   (93.37 vs 102.51, 179.62 vs 208.92, 352.21 vs 423.77). The 26B long-context prefill is a
+   second open deficit, separate from decode. p99 ITL is won at all five.
+2. **This is not a bandwidth-starved regime.** At 7.64 GB read per step, plow runs 1415 GB/s and
+   vLLM 1519 GB/s -- only 7% apart, and vLLM is itself at just 45% of the 3352 GB/s roof. The
+   roofline's "43% of memory roof, low bandwidth efficiency" reads like a bandwidth problem and
+   is really a latency/occupancy one that BOTH stacks have. Chasing the roof is the wrong frame;
+   the 7% is the whole prize, and it is worth 0.37-0.57 ms of TPOT.
+
+Also: the lean packet moved the roofline 41.0% -> 43.2%, which confirms megakernel entry overhead
+was inflating the denominator rather than bandwidth being the only term.
+
+### The one measured asymmetry inside the MoE step: expert-DOWN loads in flight
+
+Read of the decode MoE arms as this packet actually compiles them (`plow_config.h` checked, not
+assumed -- `PLOW_MOE_DOWN_SG 8u` is present, `GV_UNROLL_GLU` is NOT, so the GLU arm runs the
+op_gemm.cuh source default of 4):
+
+| arm | share of MoE weight traffic | loads in flight per lane |
+|---|---|---|
+| GLU (gate+up) | 2/3 | `GV_UNROLL_GLU=4` x 2 streams = **8** |
+| expert DOWN | 1/3 | **2** ("2 chunks pre-issued", op_moe.cuh lane-split) |
+
+The repo's own `runtime/nvidia/experiments/hbm_ceiling_h100.cu` measures a pure read at 1 block/SM
+going **1222 -> 2490 GB/s as in-flight loads go 1 -> 8**, and the kernel comment above the
+lane-split arm already recorded DOWN as the worst GEMV in the step (1163 GB/s against 3269
+achievable). So 8 is not an arbitrary depth: it is what the other arm already has and what the
+board's own curve asks for.
+
+`PLOW_MOE_DOWN_PRE` (kernel, default 2) + `tuning.moe_down_pre` (manifest -> `plow_config.h`) +
+`emit.PLOW_TUNE_MOE_DOWN_PRE`. With `PLOW_MOE_DOWN_SG=8`: `LCH=32`, `nch = 704/32 = 22` chunks, so
+depth 8 covers 22 as 8+8+6. `acc` still walks `c` ascending at every depth, so the FMA order and
+the output are **unchanged** -- depth 2 is bit-identical to the pairing it replaces.
+
+**Plumbing trap avoided.** The define had to go through the MANIFEST, not
+`PLOW_BUILD_SEG_EXTRA_DEFINES`: the recipe's own `[objects.env]` comment records that the decode
+object is built from the manifest and that the segments env does not reach it. That is the same
+shape as the recorded `PLOW_EXTRA_DEFINES is not plumbed to packets` finding, where a
+`#if`-guarded probe silently measures the same object twice and the too-clean null looks like a
+result. Guarded with two md5 gates on the built objects: `p26lean2` (no env) must be
+byte-identical to the pre-edit `p26lean`, and `p26dp8` must differ from `p26lean2`. If either
+gate fails the measurement is void.
+
+Pre-registered target at 128/C1: TPOT **<= 5.163** takes tok/s, **<= 5.03** takes TPOT outright.
+A null means loads-in-flight in the DOWN arm is not the binding term -- it does NOT mean try 16.
