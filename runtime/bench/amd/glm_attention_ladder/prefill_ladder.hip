@@ -86,7 +86,7 @@ __global__ void reduce_splits(float* __restrict__ out, const float* __restrict__
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s <objdir> [--rows a,b] [--ctx a,b] [--ns a,b] [--mode dense,sparse] [--split path] [--small path] [--aiter path] [--native path]\n", argv[0]); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: %s <objdir> [--rows a,b] [--ctx a,b] [--ns a,b] [--mode dense,sparse] [--split path] [--small path] [--aiter path] [--native path] [--grid n]\n", argv[0]); return 2; }
     std::string objdir = argv[1];
     std::vector<unsigned> rows_list{128, 512, 2048, 8192}, ctx_list{1024, 4096, 16384, 32768, 65536, 81920}, ns_list{2, 4, 8, 16, 32};
     std::set<std::string> modes{"dense", "sparse"};
@@ -102,9 +102,11 @@ int main(int argc, char** argv) {
         else if (k == "--small") small_path = argv[a + 1];
         else if (k == "--aiter") aiter_path = argv[a + 1];
         else if (k == "--native") native_path = argv[a + 1];
+        else if (k == "--grid") GRID = std::stoul(argv[a + 1]);
         else if (k == "--mode") { modes.clear(); std::string cur; for (const char* p = argv[a + 1];; ++p) { if (*p == ',' || !*p) { if (!cur.empty()) modes.insert(cur); cur.clear(); if (!*p) break; } else cur += *p; } }
         else { std::fprintf(stderr, "unknown arg %s\n", k.c_str()); return 2; }
     }
+    if (GRID == 0 || GRID > 1024) { std::fprintf(stderr, "grid must be 1..1024\n"); return 2; }
     CK(hipInit(0));
     const bool gfx950 = access((objdir + "/interp_prefill_fp8kv_mla_moe_gq.elf").c_str(), R_OK) != 0;
     Kernel broad = load_kernel("broad8", objdir + (gfx950 ? "/interp_prefill_fp8kv_mla_moe_a4w4_full_gq.elf" : "/interp_prefill_fp8kv_mla_moe_gq.elf"),

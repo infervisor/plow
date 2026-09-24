@@ -14,7 +14,8 @@
 #define CK(expr) do { auto e_ = (expr); if (e_ != hipSuccess) { \
     std::fprintf(stderr, "%s: %s at %s:%d\n", #expr, hipGetErrorString(e_), __FILE__, __LINE__); std::exit(1); } } while (0)
 
-constexpr unsigned GRID = 304, GUARD = 128;
+static unsigned GRID = 304;
+constexpr unsigned GUARD = 128;
 
 template<class T> T* dalloc(size_t n) { T* p; CK(hipMalloc(&p, n * sizeof(T))); return p; }
 template<class T> T* upload(const std::vector<T>& x) {
