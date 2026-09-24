@@ -121,6 +121,48 @@ def cost(op, p, tail, rows, ctx, heads, topk, n_gpu):
         split = g("nsplit", 1)
         return {"hbm": w_bytes("fp8", hh * v, MLA_LATENT) + 4 * n * hh * MLA_LATENT * split + 2 * n * hh * v,
                 "flops": 2 * n * hh * MLA_LATENT * v, "dtype": "fp8"}
+    qk = MLA_LATENT + MLA_ROPE
+    kv_row = 2 * qk  # vLLM 0.29 main MLA cache resolves to BF16 for this checkpoint
+    if op == "FlashMlaPrefillFp8":
+        t, hh = g("n_tok", rows), g("n_head", heads)
+        return {"hbm": 2 * t * hh * (qk + MLA_LATENT) + t * kv_row,
+                "flops": 2 * hh * attn_keys(t, topk) * (qk + MLA_LATENT), "dtype": "bf16"}
+    if op == "FlashMlaDecodeFp8":
+        n, keys = g("n_batch", rows), min(ctx, topk or ctx)
+        return {"hbm": n * keys * kv_row + 2 * n * heads * (qk + MLA_LATENT),
+                "flops": 2 * n * g("n_head", heads) * keys * (qk + MLA_LATENT), "dtype": "bf16"}
+    if op in {"IndexScore", "IndexScorePf"}:
+        # FP8 key + F32 scale per position (132 B), FP8 per-token-group query, F32 scores
+        ih, hd = g("index_heads"), g("index_head_dim")
+        if op == "IndexScore":
+            n = g("n_batch", rows)
+            keys, fresh = n * ctx, n * ctx
+        else:
+            n = g("n_tok", rows)
+            keys, fresh = attn_keys(n, 0), n
+        return {"hbm": fresh * (hd + 4) + n * ih * (hd + 4) + 4 * keys,
+                "flops": 2 * ih * hd * keys, "dtype": "fp8"}
+    if op == "IndexSelectPf":
+        n = g("n_tok", rows)
+        return {"hbm": 4 * attn_keys(n, 0) + 4 * n * g("top_k"), "flops": 0, "dtype": "f32"}
+    if op == "IndexSelect":
+        return {"hbm": 4 * ctx + 4 * g("top_k"), "flops": 0, "dtype": "f32"}  # one row each
+    if op == "IndexUnionPf":
+        return {"hbm": 8 * g("n_tok", rows) * g("top_k"), "flops": 0, "dtype": "i32"}
+    if op == "HeadNormRopeFp8":
+        return {"hbm": 3 * rows * qk, "flops": 0, "dtype": "bf16"}
+    if op == "DcpKvScatter":
+        return {"hbm": 2 * g("rows", rows) * kv_row, "flops": 0, "dtype": "bf16"}
+    if op == "DcpKvPack":
+        keys = min(ctx, topk or ctx)
+        return {"hbm": 2 * g("n_batch", 1) * keys * kv_row, "flops": 0, "dtype": "bf16"}
+    if op == "XDcpGather":
+        moved = g("n_batch", 1) * min(ctx, topk or ctx) * kv_row
+        return {"hbm": 2 * moved, "flops": 0, "dtype": "bf16", "fabric": moved * (n_gpu - 1) / n_gpu}
+    if op == "LayerNorm":
+        return {"hbm": 4 * g("rows") * g("feat") + 4 * g("feat"), "flops": 0, "dtype": "bf16"}
+    if op == "XArgmaxFin":
+        return {"hbm": 8 * g("n_gpu"), "flops": 0, "dtype": "f32"}
     if op == "RmsNorm":
         return {"hbm": 4 * g("rows") * g("feat") + 2 * g("feat"), "flops": 0, "dtype": "bf16"}
     if op == "Residual":
