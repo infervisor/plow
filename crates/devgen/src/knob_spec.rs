@@ -1241,6 +1241,8 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_MOE_PF_DOWN_SWEEP", Some("PLOW_MOE_PF_DOWN_SWEEP"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_MLA_FOLD_MFMA", Some("PLOW_MLA_FOLD_MFMA"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_COMBINE_VEC", Some("PLOW_COMBINE_VEC"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_GEMM_F32_SMALLN", Some("PLOW_GEMM_F32_SMALLN"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("def.PLOW_GEMM_F32_SMALLN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_TILE_BINSEARCH", Some("PLOW_MOE_TILE_BINSEARCH"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_MLA_P_BF16", Some("PLOW_MLA_P_BF16"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.GLM_FULL", Some("GLM_FULL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),

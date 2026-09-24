@@ -65,6 +65,11 @@ case "${PLOW_MLA_FOLD_MFMA:-0}" in
   1) A4W4_BK="$A4W4_BK -DPLOW_MLA_FOLD_MFMA=1" ;;
   *) echo "PLOW_MLA_FOLD_MFMA must be 0 or 1" >&2; exit 2 ;;
 esac
+case "${PLOW_GEMM_F32_SMALLN:-0}" in
+  0) ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_GEMM_F32_SMALLN=1" ;;
+  *) echo "PLOW_GEMM_F32_SMALLN must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_COMBINE_VEC:-0}" in
   0) ;;
   1) A4W4_BK="$A4W4_BK -DPLOW_COMBINE_VEC=1" ;;
