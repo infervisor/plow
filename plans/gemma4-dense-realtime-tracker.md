@@ -5437,3 +5437,81 @@ structurally-blocked `PTXSYNC=3`), all four already measured. There is no fifth 
 
 Net from this round: **0.000 ms**, and one route closed with a cheap, reusable test for the next
 one.
+
+---
+
+## The B=1 op chain, measured with graphstat: the gate DAG has no slack, and the norms are the target (2026-09-24)
+
+Reframing first, from today's own numbers. The B=1 step reads ~7.64 GB and runs 5.362 ms =
+1425 GB/s. vLLM's 5.030 ms on the SAME byte count implies 1519 GB/s. **Both stacks sit at ~45% of
+the 3352 GB/s roof**, and at bf16 with top-8 the byte count is irreducible (30 layers x 8 experts x
+3 x 2816 x 704 x 2 B accounts for it). So the 6.2% deficit is NOT bandwidth and NOT bytes: it is the
+fixed, non-walk term — the `F` of `op_gemv_mma.cuh`'s `step = F + W`, and task #71's ~1.3 ms.
+
+`graphstat` (`crates/plowrt/examples/graphstat.rs`, no GPU touched) on the shipped C1 packet:
+
+| T | ops | counters | edges | edges_tr | dead_ctr | ents | polls | bumps | bumps_live |
+|---|---|---|---|---|---|---|---|---|---|
+| 128..8192 | 691 | 691 | 840 | 840 | 1 | 75795 | 95463 | 75795 | 75794 |
+| **1** | **551** | 551 | **640** | **640** | **31** | 29303 | 37252 | 29303 | 29272 |
+| 2 | 551 | 551 | 640 | 640 | 31 | 30659 | 38637 | 30659 | 30628 |
+| 4 | 551 | 551 | 640 | 640 | 1 | 33247 | 41283 | 33247 | 33246 |
+
+### 1. CLOSED without a build: there are no redundant gates to remove
+
+`edges_tr == edges` at every rung. **Transitive reduction removes nothing** — not one of the 640
+producer->consumer edges is implied by a longer path. Any "prune the dependency graph" idea is dead
+on arrival; gate count can only fall by *fusing ops*, which is what the op-71 GluNorm fusion did
+(`lib.rs:6012`, "eliminating a separate RmsNorm op + counter gate").
+
+### 2. The 31 dead counters are the MoE align ops, and their cost is <= 0.040 ms, NOT 0.27 ms
+
+`dead_ctr = 31` at T=1/T=2 but `1` at T=4 and at every prefill program. The op histogram of T=1
+(`op_seq <pkt> 9 0 551`) names them: **`PLOW_DOP_MOE_ALIGN_GEMMA_PF` x30** (+1 pre-existing), each
+`blocks=1`, `i=[1, 128, 8, 4, ...]` = 1 row, 128 experts, top_k 8, group min 4. `lib.rs:6115` says:
+
+> A rung below the threshold still carries the align op, but nothing waits on it: on the
+> router -> GLU chain its 30 no-op packets cost **0.27 ms of a 5.9 ms B=1 step**.
+
+**That 0.27 ms does not hold on this build.** At B=1 the grouped route never engages (`t=1 < min=4`),
+so `PLOW_EMIT_MOE_DEC_LT=0` + `PLOW_GEMMA_MOE_DEC_GROUP=0` removes the align ops *and nothing else
+that B=1 executes*. That is exactly the arm measured earlier today (section "the entry-size route is
+CLOSED"), and its TOTAL was **-0.040 ms at 128/C1** — while also shrinking the object 28%, the stack
+to 184 and shared to 3216, and dropping two rungs. So the align ops' own share is **at most 0.040 ms
+and plausibly near zero**, an order of magnitude under the comment. The comment cites a 5.9 ms step
+against today's 5.377, i.e. it is stale. Treat it as a recorded overestimate, not a budget.
+
+(Still a real emit wart: 30 ops + 30 counters + 30 bumps per step that nothing consumes. Worth
+removing for hygiene, not for the ladder.)
+
+### 3. Where the fixed term actually is: 181 of 551 ops are norms
+
+T=1 op histogram, 30 layers:
+
+    90  PLOW_DOP_HEADNORM_ROPE          (3/layer)
+    71  PLOW_DOP_GEMV
+    60  PLOW_DOP_NORM_RESIDUAL_NORM     (2/layer)
+    31  PLOW_DOP_RMSNORM                (~1/layer + final)
+    30  each: MOE_ROUTER_GEMMA_TOPK, MOE_ROUTER_GEMMA_SCORE_FAST,
+             MOE_EXPERT_GLU_NORM_GEMMA, MOE_EXPERT_DOWN_GEMMA,
+             MOE_COMBINE_NORM_GEMMA, MOE_ALIGN_GEMMA_PF (dead),
+             GEMV_GLU, FLASH_MERGE, FLASH_DECODE
+    25  PLOW_DOP_GEMV_QKV
+     1  each: SOFTCAP, EMBED, ARGMAX, ARGMAX_FIN
+
+**181 ops (33%) are pure normalisation** — `HEADNORM_ROPE` 90 + `NORM_RESIDUAL_NORM` 60 +
+`RMSNORM` 31 — each operating on ONE row at B=1 and each costing a stream entry, a counter, a gate
+and a grid-wide ordering point. They move almost no bytes; their cost is entirely the per-op
+overhead that constitutes `F`. This is the same shape as task #67 (fuse the prefill norm/Glu/rope
+tail into GEMM epilogues) but on the DECODE program, where it has never been tried.
+
+**The budget is the right size for once.** 0.330 ms over 181 ops is 1.8 us/op; over the 90
+`HEADNORM_ROPE` alone it is 3.7 us/op. AMD's gate measurements are 3.46-13.16 us
+(`interp.hip:5127-5200`), and the B=1 gate-sleep sweep showed spinning flat out costs +0.019 ms,
+which is only consistent with gates being hit constantly. Fusing `HEADNORM_ROPE` into the
+`GEMV_QKV` epilogue would delete up to 90 of 551 ops (16%) and their gates.
+
+**Why it is not obviously free:** op 71's fusion is the precedent that it works, but every fusion
+widens the surviving op's register footprint, and the decode megakernel is at `REG:255 LOCAL:0`
+with a documented history of arithmetic-identical rewrites costing +0.37 ms
+([[megakernel-array-loop-regression]]). Must be measured, single-variable, gated on SASS.
