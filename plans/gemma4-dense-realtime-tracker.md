@@ -5079,6 +5079,56 @@ rung >= 4 to isolate the grouped GLU/DOWN pair), serve `PLOW_MOE_DEC_LT=0 PLOW_D
 0.05 ms against the **0.33** needed at 128/C1. Closed. (3-variable arm, but immaterial at this
 magnitude.)
 
+### 3b. CORRECTION: the ladder-width lever is sign-unstable, and that closes it for good
+
+Re-measured 2026-09-24 on this branch's tree, in `step_bench` (slots=1 ctx=128 n=64, 3 interleaved
+order-reversed passes, one lease), with the one-rung packet now legal (#77):
+
+         ladder   batch   megakernel     mean_ms      sd   vs ctl
+    1,2,4 (ctl)       4   1,822,856 B     5.3687  0.0015       --
+            1,2       2   1,816,456 B     5.3920  0.0020  +0.0233
+              1       1   1,477,128 B     5.4923  0.0021  +0.1237
+
+The noise floor for this harness is **0.0013 ms** -- in the previous run all three arms were
+accidentally the *same* packet and spanned 5.3680-5.3693 -- so +0.1237 is ~95 sigma. It is a real,
+clean regression: the object shrank 19% and the step got slower.
+
+**It is also the opposite sign to section 3**, which measured the same nominal change (`1,2,4` ->
+`1`) on the served ladder and got -0.040 to -0.060 ms at every C1 cell. The two are not the same
+packet: section 3's arm also carried `PLOW_GEMMA_MOE_DEC_GROUP=0` and came out 1,296,776 B, against
+1,477,128 B here. Different build, different harness, opposite sign, both under 0.13 ms.
+
+Gates that make this a measurement rather than another silent no-op:
+
+* the rung lists genuinely differ (`programs` printed per packet, with a HARD ABORT if they match --
+  which is what caught the run before this one, where the recipe's own `[env]` silently beat the
+  ambient env and all three "arms" were one packet);
+* the **B=1 program is identical across arms** -- 551 ops, 551 counters, 640 edges, 31 deadctr,
+  29303 ents, 37252 polls, 29272 bumps_live -- so the `PLOW_EMIT_MOE_DEC_LT=0` that the narrow arms
+  require (`lib.rs:9616` asserts without a rung >= 4) is *confirmed* inert at B=1, not assumed inert;
+* every arm loaded without `retains widest execution`, so no arm silently ran widest-only.
+
+**Section 2's title is wrong as a general claim.** Dropping the *widest* rung (4) did not cut the
+entry cost; it cost 0.124 ms. The occupancy explanation is refuted too: both arms log
+`grid=132 smem=164864 occ_per_sm=1`, because the 164864 B dynamic arena sets occupancy, so the
+static SHARED difference (8848 -> 5264) cannot move it.
+
+What actually co-varies with ladder width is the packet's **max decode batch**, and with it the KV
+allocation: ctl `batch=4 kv_gib=7.5`, `1,2` -> `batch=2`, `1` -> `batch=1 kv_gib=1.875`. Ladder width
+and KV geometry are perfectly confounded in *both* directions, so neither this experiment nor
+section 3 ever isolated the entry.
+
+**Verdict: closed, and not worth another lease.** The lever's entire measured dynamic range across
+ladder `1` -> `1,2,4` is 0.124 ms, its sign does not survive a change of build config or harness, and
+128/C1 needs 0.339. A widening arm (`1,2,4,8`) was written and then abandoned before it took a lease
+for exactly this reason -- best case ~-0.02 ms, and it would cost 15 GiB of KV against the C32
+capacity story. Do not re-open this on object size or rung count.
+
+Follow-up (not done here, to avoid perturbing the recipe digest and invalidating cached packets):
+`gemma4-26b-a4b.h100.bf16-c1-lean.toml` still carries the comment "the megakernel ENTRY is
+essentially the whole fixed per-step cost (#71) and it taxes EVERY compiled rung". That is the claim
+refuted above and it will mislead the next campaign.
+
 ### 4. PLOW_STEP_TIME: the step is device-bound, host cost is already hidden
 
 Per-step means, stable over 512 steps (`log_every(128)`, gpu.rs:6829):
