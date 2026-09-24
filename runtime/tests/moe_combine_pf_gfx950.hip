@@ -30,7 +30,7 @@ static float h_bf(unsigned short h) { unsigned u = (unsigned)h << 16; float f; m
 int main() {
     const unsigned H = 6144, k = 8;
     int bad_total = 0;
-    for (unsigned T : {1024u, 8192u}) {
+    for (unsigned T : {1024u, 8192u, 16384u}) {
         const size_t n = (size_t)T * H;
         std::vector<unsigned short> r(n), s(n), out(n);
         std::vector<float> p(n * k);

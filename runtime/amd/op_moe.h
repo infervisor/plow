@@ -4994,31 +4994,33 @@ __device__ void d_moe_combine_pf(bf16* out, const bf16* residual, const bf16* sh
         for (size_t v = gid; v < vt; v += stride) {
             const size_t e = v * 8;
             const unsigned tok = (unsigned)(e / H), h = (unsigned)(e - (size_t)tok * H);
-            float4 p0[16], p1[16];
-#pragma unroll
-            for (unsigned j = 0; j < 16; j++) {
-                if (j < k) {
-                    const size_t q = (((size_t)tok * k + j) * H + h) / 4;
-                    p0[j] = pf[q];
-                    p1[j] = pf[q + 1];
-                }
-            }
+            /* Running sum residual, shared, slot 0..k-1 (the scalar order) with a 2-slot load
+             * window: ~30 live VGPR. Holding all k slots in flight (128 VGPR) was 4.4x faster
+             * standalone but slower inside the 256-VGPR interpreter. */
             const bf16v8 vr = residual ? ld_glob8(rg + e) : bf16v8_zero();
             const bf16v8 vs = shared ? ld_glob8(sg + e) : bf16v8_zero();
-            bf16v8 o;
+            const size_t q0 = (((size_t)tok * k) * H + h) / 4, qs = (size_t)H / 4;
+            float acc[8];
 #pragma unroll
             for (int c = 0; c < 8; c++) {
-                float acc = residual ? bf2f(vr[c]) : 0.0f;
-                if (shared) acc += bf2f(vs[c]);
-#pragma unroll
-                for (unsigned j = 0; j < 16; j++) {
-                    if (j < k) {
-                        const float4& q = c < 4 ? p0[j] : p1[j];
-                        acc += (c & 3) == 0 ? q.x : (c & 3) == 1 ? q.y : (c & 3) == 2 ? q.z : q.w;
-                    }
-                }
-                o[c] = f2bf(acc);
+                acc[c] = residual ? bf2f(vr[c]) : 0.0f;
+                if (shared) acc[c] += bf2f(vs[c]);
             }
+            float4 a0 = pf[q0], a1 = pf[q0 + 1];
+            float4 b0 = pf[q0 + qs], b1 = pf[q0 + qs + 1];
+            for (unsigned j = 0; j < k; j++) {
+                const float4 c0 = a0, c1 = a1;
+                a0 = b0; a1 = b1;
+                if (j + 2 < k) {
+                    b0 = pf[q0 + (j + 2) * qs];
+                    b1 = pf[q0 + (j + 2) * qs + 1];
+                }
+                acc[0] += c0.x; acc[1] += c0.y; acc[2] += c0.z; acc[3] += c0.w;
+                acc[4] += c1.x; acc[5] += c1.y; acc[6] += c1.z; acc[7] += c1.w;
+            }
+            bf16v8 o;
+#pragma unroll
+            for (int c = 0; c < 8; c++) o[c] = f2bf(acc[c]);
             st_glob8(og + e, o);
         }
         return;
