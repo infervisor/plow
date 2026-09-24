@@ -5129,6 +5129,48 @@ Follow-up (not done here, to avoid perturbing the recipe digest and invalidating
 essentially the whole fixed per-step cost (#71) and it taxes EVERY compiled rung". That is the claim
 refuted above and it will mislead the next campaign.
 
+### 3c. The first SAME-SESSION paired 26B C1 ladder: 7/20, and the TPOT target is REAL
+
+The 26B had never had a same-session paired vLLM reference (only the 12B did). Run 2026-09-24,
+plow and vLLM 0.28 back to back, each under its own lease, matched client / backend / dataset /
+NPROMPT 32 / OUTLEN 128 / `--num-warmups 2 --seed 42` / gate prompt, prefix caching OFF on both
+sides, vLLM `--max-num-seqs 1`. Packet p26kvctl2 (this recipe, knobs `verified`), realtime profile.
+
+    cell        TTFT plow/vLLM     TPOT           p99 ITL        tok/s         wins
+    128/C1       20.97/ 37.76      5.390/5.030    5.45/5.82      181.4/189.2   2/4
+    1024/C1      37.96/ 41.52      5.480/5.080    5.54/5.82      174.4/186.4   2/4
+    4096/C1     102.72/ 92.28      5.520/5.090    5.58/5.94      159.3/173.1   1/4
+    8192/C1     209.21/178.44      5.560/5.090    5.63/5.97      139.7/155.0   1/4
+    15000/C1    424.56/350.58      5.640/5.090    5.70/6.03      112.2/128.3   1/4
+
+**7 of 20 metric-cells.** p99 ITL is a clean 5/5 sweep. TPOT loses 5/5. tok/s loses 5/5 (it is a
+TPOT readout). Peak memory: plow 59.3 GiB vs vLLM 74.6 -- 15 GiB less, not one of the four metrics.
+
+**The stored cross-session reference is VALIDATED for the 26B.** Same-session vLLM minus the
+stored `reference-vllm028-bf16.csv`, per cell: TPOT -0.010 / 0.000 / -0.010 / -0.010 / 0.000;
+TTFT -0.56 / -0.36 / -0.24 / -0.08 / +0.20; p99 -0.02 / +0.03 / -0.01 / +0.05 / +0.05. Everything
+is inside 0.01 ms on TPOT. So unlike the 12B -- where vLLM drifted ~0.1 ms between sessions and
+faked a "0 cells at 4/4" (99d939ad) -- the 26B's stored baseline was never stale, and every past
+26B scoreboard scored against it was decidable after all.
+
+**This refutes the hypothesis that drove the run.** This recipe carried a note citing vLLM 0.28
+"measured the same session" at 5.68 / 5.86 / 5.97 / 6.02 / 6.07, which would have meant plow's
+5.58 already won 128/C1 and that the whole -0.34 ms hunt was chasing a stale number. It does not
+reproduce: vLLM is 5.03-5.09 across C1. **The 26B C1 TPOT deficit is real** -- -0.36 ms at 128
+widening to -0.55 at 15000 -- and the levers refuted above (#79 #80 #81 #82) were correctly
+aimed, they simply did not work. The misleading note has been corrected in the recipe.
+
+**A target this run exposes: TTFT above 1024.** plow wins TTFT at 128 (20.97 vs 37.76, 44% better)
+and 1024 (37.96 vs 41.52), then LOSES it from 4096 up -- by 11% at 4096, 17% at 8192, 21% at
+15000. The crossover sits between 1024 and 4096, i.e. it is prefill scaling, not a fixed cost.
+That is 3 cells of 1 metric each against a KNOWN inefficiency (#66: FlashPrefill at 196/351
+TFLOP/s while the GEMM path runs 77-82% of peak), where the TPOT column needs a route that is
+currently closed. Cheaper cells than TPOT, and they are regressions from a column plow used to
+lead.
+
+Data: `perf-data/campaign/gemma4-26b-a4b.h100.reference-vllm028-bf16.paired-2026-09-24T16.csv`
+and `gemma4-26b-a4b.h100.bf16-c1-lean.paired-2026-09-24T16.csv`.
+
 ### 4. PLOW_STEP_TIME: the step is device-bound, host cost is already hidden
 
 Per-step means, stable over 512 steps (`log_every(128)`, gpu.rs:6829):

@@ -43,14 +43,23 @@ PLOW_FA_MMAQK = "3"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
 # LEAN DECODE LADDER for the C1/C4 columns: 1,2,4 instead of 1,2,4,8,16.
-# The megakernel ENTRY is essentially the whole fixed per-step cost (17cacd99, #71) and it
-# taxes EVERY compiled rung. The realtime profile ALREADY caps serving at
-# PLOW_DECODE_MAX_RUNG=4, so rungs 8 and 16 are dead weight at C1/C4 -- they cost entry time
-# on every step and are never executed.
+# The realtime profile ALREADY caps serving at PLOW_DECODE_MAX_RUNG=4, so rungs 8 and 16 are
+# never executed at C1/C4.
 # MEASURED on the 12B: -0.07 ms TPOT at every C1 cell and -0.29 at 128/C4, which flipped
-# 8192/C1 and 128/C4 to 4/4. The 26B should gain MORE: its step is only 5.60 ms so a ~1 ms
-# entry is ~18% of it, and its megakernel is far larger (MoE member cases).
-# 26B C1 needs TPOT -0.57 to win outright, -0.44 for tok/s (5.60 vs vLLM 5.03).
+# 8192/C1 and 128/C4 to 4/4. That measurement stands.
+#
+# ITS STATED MECHANISM DOES NOT. This comment used to claim "the megakernel ENTRY is
+# essentially the whole fixed per-step cost and it taxes EVERY compiled rung", and predicted
+# the 26B would gain MORE. Measured 2026-09-24 (commit 3807076e), narrowing FURTHER on the 26B
+# is a REGRESSION, monotone in width, at a 0.0013 ms noise floor:
+#     1,2,4 (ctl) 5.3687 | 1,2 +0.0233 | 1 +0.1237
+# and the slowest arm has the SMALLEST object (1.48 vs 1.82 MB, SHARED 5264 vs 8848). Occupancy
+# is not the mechanism either -- every arm runs grid=132 smem=164864 occ_per_sm=1, the dynamic
+# arena sets occupancy. Ladder width also sets max decode batch and hence KV geometry
+# (batch=4 kv_gib=7.5 -> batch=1 kv_gib=1.875), so width and KV are confounded in both
+# directions and the entry was never isolated. Do NOT narrow this further, and do not size
+# this lever from object bytes.
+# 1,2,4 is kept because it MEASURED fastest of 1 / 1,2 / 1,2,4 -- not for the entry story.
 # Dropping 16 slots to 4 also FREES sliding KV, which this memory-tight model wants.
 PLOW_DECODE_BATCH_LADDER = "1,2,4"
 # Rungs of >= 8 rows sort their B*k slots by expert and run the routed experts through the
@@ -167,8 +176,11 @@ concs = "1 4"
 # MULTISTEP 0, not 4: 4 emits four tokens per wave, which sets p99 ITL to exactly 4 x TPOT
 # (median ITL is literally 0.000) while TTFT and TPOT are untouched. Measured on p26l8, 32 prompts,
 # C1 over 128..15000: p99 ITL 22.38 / 22.88 / 23.17 / 23.43 / 23.93 ms against a 5.58..5.97 TPOT,
-# i.e. a pure wave artifact, versus vLLM 0.28 measured the same session at 5.68 / 5.86 / 5.97 /
-# 6.02 / 6.07. gemma4-26b-a4b.h100.bf16-ctx16k.toml already carries this and records 4 -> 0 taking
+# i.e. a pure wave artifact. (This line used to cite vLLM 0.28 "measured the same session" at
+# 5.68 / 5.86 / 5.97 / 6.02 / 6.07. That does NOT reproduce and should not be used as the
+# baseline: a same-session paired C1 ladder on 2026-09-24 put vLLM 0.28 at
+# 5.030 / 5.080 / 5.090 / 5.090 / 5.090, within 0.01 ms of the stored reference CSV at every
+# cell -- see perf-data/campaign/*.paired-2026-09-24T16.csv. The 26B TPOT gap at C1 is real.) gemma4-26b-a4b.h100.bf16-ctx16k.toml already carries this and records 4 -> 0 taking
 # p99 ITL to 5.5 / 5.5 / 5.6 / 5.6 / 5.7 with TPOT +0.02-0.03; this recipe was simply stale.
 # PLOW_DECODE_PIPELINE is NOT the lever on the 26B -- it is disabled whenever cuBLASLt is on.
 serve_env = { PLOW_MULTISTEP = "0", PLOW_MULTISTEP_ADAPTIVE = "1", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0", PLOW_PF_INTERLEAVE_ADAPTIVE = "1" }
