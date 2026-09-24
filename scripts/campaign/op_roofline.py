@@ -13,6 +13,7 @@ import collections
 import json
 import math
 import re
+import struct
 
 from packet_roofline import mxfp4_weight_bytes, scale_bytes
 
@@ -204,7 +205,8 @@ def analyze(disasm, ctx, bw_gbps, ceilings, fabric_gbps, topk=0):
             rows = int(pm.group(1))
             if cur is not None and rows < cur["rows"]:
                 phase = "decode"  # plowc orders prefill rungs, then decode rungs, each ascending
-            cur = {"rows": rows, "ops": collections.OrderedDict(), "excluded": collections.Counter()}
+            cur = {"rows": rows, "ops": collections.OrderedDict(), "excluded": collections.Counter(),
+                   "inst_keys": {}}
             programs[f"{phase}-{rows}"] = cur
             continue
         lm = LINE.match(line.strip())
@@ -223,6 +225,7 @@ def analyze(disasm, ctx, bw_gbps, ceilings, fabric_gbps, topk=0):
             continue
         key = f"{op}:{role(seg[0]) or c['dtype']}:" + " ".join(
             f"{k}={p[k]}" for k in ("M", "N", "K", "Nq", "I_moe", "H", "n_exp", "rows", "feat", "n", "n_batch") if k in p)
+        cur["inst_keys"][int(lm.group(1))] = key
         mem = c["hbm"] / (bw_gbps * 1e3)
         mat = c["flops"] / (ceilings[c["dtype"]] * 1e6) if c["flops"] else 0.0
         fab = c.get("fabric", 0) / (fabric_gbps * 1e3)
@@ -242,11 +245,41 @@ def analyze(disasm, ctx, bw_gbps, ceilings, fabric_gbps, topk=0):
         ops = sorted(prog["ops"].items(), key=lambda kv: -kv[1]["floor_us"])
         out[name] = {"rows": prog["rows"], "floor_us": total,
                      "tokens_per_s_floor": prog["rows"] / total * 1e6 if total else None,
-                     "ops": dict(ops), "excluded": dict(prog["excluded"])}
+                     "ops": dict(ops), "excluded": dict(prog["excluded"]),
+                     "inst_keys": prog["inst_keys"]}
     return {"scope": "per-instruction max(HBM, matrix, fabric) at the vLLM 0.29 MXFP4/AttnFP8 dtype "
                      "contract; serialized sum, no overlap, no launch/sync floor, weights streamed once",
             "ctx": ctx, "sparse_topk": topk, "bandwidth_gbps": bw_gbps, "fabric_gbps": fabric_gbps,
             "matrix_tflops": ceilings, "programs": out}
+
+
+def attach_trace(prog, data, clock_hz):
+    """Per-op measured time from a PLOW_TRACE_RAW dump of exactly this program.
+
+    Body envelope per instruction = last workgroup end - first workgroup ready. Instructions
+    overlap, so the per-op sums are attribution, not a serialized wall-time breakdown."""
+    rec = struct.Struct("<IIIHHQQQ")
+    if not data or len(data) % rec.size:
+        raise ValueError("incomplete trace")
+    first, last, arrive = {}, {}, None
+    for _, _, inst, _, _, a, ready, end in rec.iter_unpack(data):
+        if a == ready == end == 0:
+            continue
+        first[inst] = min(first.get(inst, ready), ready)
+        last[inst] = max(last.get(inst, end), end)
+        arrive = a if arrive is None else min(arrive, a)
+    keys = prog["inst_keys"]
+    if not set(first) <= set(keys) | set(range(max(keys, default=0) + 1)):
+        raise ValueError("trace instructions outside the program")
+    tick_us = 1e6 / clock_hz
+    for row in prog["ops"].values():
+        row["measured_us"] = 0.0
+    for inst, key in keys.items():
+        if inst in first:
+            prog["ops"][key]["measured_us"] += (last[inst] - first[inst]) * tick_us
+    prog["trace_wall_us"] = (max(last.values()) - arrive) * tick_us if last else None
+    prog["traced_insts"] = len(first)
+    return prog
 
 
 def markdown(result, top):
@@ -254,11 +287,22 @@ def markdown(result, top):
     for name, prog in result["programs"].items():
         lines.append(f"### {name}  floor {prog['floor_us'] / 1e3:.3f} ms  "
                      f"({prog['tokens_per_s_floor']:.0f} tok/s/rank-step)")
-        lines.append("| op | dtype | n | bound | floor ms | share |")
-        lines.append("|---|---|---:|---|---:|---:|")
-        for key, r in list(prog["ops"].items())[:top]:
+        traced = prog.get("trace_wall_us") is not None
+        if traced:
+            lines.append(f"trace wall {prog['trace_wall_us'] / 1e3:.3f} ms = "
+                         f"{100 * prog['floor_us'] / prog['trace_wall_us']:.1f}% of floor-sum roof")
+        lines.append("| op | dtype | n | bound | floor ms | share |" + (" measured ms | % roof |" if traced else ""))
+        lines.append("|---|---|---:|---|---:|---:|" + ("---:|---:|" if traced else ""))
+        rows = list(prog["ops"].items())
+        if traced:
+            rows.sort(key=lambda kv: -kv[1].get("measured_us", 0))
+        for key, r in rows[:top]:
+            extra = ""
+            if traced:
+                m = r.get("measured_us", 0)
+                extra = f" {m / 1e3:.3f} | {100 * r['floor_us'] / m if m else 0:.1f}% |"
             lines.append(f"| `{key}` | {r['dtype']} | {r['count']} | {r['bound']} | "
-                         f"{r['floor_us'] / 1e3:.3f} | {100 * r['floor_us'] / prog['floor_us']:.1f}% |")
+                         f"{r['floor_us'] / 1e3:.3f} | {100 * r['floor_us'] / prog['floor_us']:.1f}% |" + extra)
         if prog["excluded"]:
             lines.append(f"\nexcluded: {prog['excluded']}")
         lines.append("")
@@ -278,16 +322,25 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--md")
     ap.add_argument("--top", type=int, default=12)
+    ap.add_argument("--trace", action="append", default=[], metavar="PROGRAM=FILE",
+                    help="attach a PLOW_TRACE_RAW dump to a program, e.g. prefill-8192=T8192.trace.prefill")
+    ap.add_argument("--trace-clock-hz", type=float, default=100e6)
     a = ap.parse_args()
     ceilings = {"bf16": a.bf16, "fp8": a.fp8, "mxfp4": a.mxfp4, "f32": a.bf16, "i32": a.bf16}
     result = analyze(open(a.disasm).read(), a.ctx, a.bw, ceilings, a.fabric, a.sparse_topk)
+    for spec in a.trace:
+        name, path = spec.split("=", 1)
+        attach_trace(result["programs"][name], open(path, "rb").read(), a.trace_clock_hz)
     with open(a.out, "w") as f:
         json.dump(result, f, indent=1)
     if a.md:
         with open(a.md, "w") as f:
             f.write(markdown(result, a.top))
     for name, prog in result["programs"].items():
-        print(f"{name:22s} floor {prog['floor_us'] / 1e3:9.3f} ms   excluded {prog['excluded']}")
+        wall = prog.get("trace_wall_us")
+        print(f"{name:22s} floor {prog['floor_us'] / 1e3:9.3f} ms"
+              + (f"   traced {wall / 1e3:9.3f} ms ({100 * prog['floor_us'] / wall:5.1f}% of roof)" if wall else "")
+              + f"   excluded {prog['excluded']}")
 
 
 if __name__ == "__main__":

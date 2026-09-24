@@ -1,6 +1,7 @@
+import struct
 import unittest
 
-from op_roofline import analyze, attn_keys
+from op_roofline import analyze, attach_trace, attn_keys
 
 CEIL = {"bf16": 2300.0, "fp8": 4600.0, "mxfp4": 9200.0, "f32": 2300.0, "i32": 2300.0}
 TEXT = """===== program T=1024  3 insts
@@ -40,6 +41,16 @@ class OpRooflineTests(unittest.TestCase):
     def test_sparse_topk_caps_keys(self):
         self.assertEqual(attn_keys(4096, 2048), 2048 * 2049 // 2 + 2048 * 2048)
         self.assertEqual(attn_keys(100, 2048), 100 * 101 // 2)
+
+    def test_trace_attributes_body_envelope_per_op(self):
+        prog = self.r["prefill-1024"]
+        rec = lambda inst, part, a, ready, end: struct.pack("<IIIHHQQQ", 0, 0, inst, 0, part, a, ready, end)
+        data = rec(0, 0, 1, 5, 105) + rec(0, 1, 2, 10, 205) + rec(2, 0, 300, 300, 400)
+        attach_trace(prog, data, 100e6)
+        flash = next(v for k, v in prog["ops"].items() if k.startswith("FlashMlaPrefill"))
+        self.assertAlmostEqual(flash["measured_us"], 2.0)
+        self.assertAlmostEqual(prog["trace_wall_us"], 3.99)
+        self.assertEqual(prog["traced_insts"], 2)
 
     def test_unparsed_instruction_is_refused(self):
         with self.assertRaises(ValueError):
