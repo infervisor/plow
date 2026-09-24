@@ -1451,6 +1451,19 @@ void mla_flash_prefill_v2_fp8_512(float* Opart, float* mlpart, const bf16* Qabs,
         kv_scale, krot_fp8);
 }
 
+extern "C" __global__ __launch_bounds__(256, 1)
+void mla_flash_prefill_v2_gather_fp8_512(
+    float* Opart, float* mlpart, const bf16* Qabs, const bf16* Qrope,
+    const bf16* Ckv, const bf16* Krope, const int* kv_len, const unsigned char* uni,
+    unsigned cap, unsigned n_batch, unsigned n_tok, unsigned n_head,
+    unsigned kv_stride, float scale, const float* kv_scale) {
+    __shared__ bf16 lds[(FA_MLA_PF2_LDS_BYTES(512, 64) + 256) / 2];
+    d_flash_mla_prefill_v2<512, 64, true, true>(
+        Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len, n_batch, n_tok, n_head,
+        kv_stride, 0u, scale, PLOW_KV_MASK_NONE, blockIdx.x, gridDim.x, lds,
+        uni, cap, 1, false, kv_scale, 0);
+}
+
 /* GATHERED MLA prefill (GLM DSA / DeepSeek sparse). idx is [b][t][top_k] — one selected set
  * PER QUERY, the axis the decode gather does not have. No mask: the selected set is causal by
  * construction, matching FLASH_GATHER_DECODE. [DEEPSEEK-MLA] */
