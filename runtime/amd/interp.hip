@@ -254,6 +254,13 @@ extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
 
 #include "amd_common.h"
 #include "op_attention.h"
+/* MlaMergeFold prefill (one split, V=256) as a batched MFMA GEMM; 8-wave CDNA4 objects only. */
+#ifndef PLOW_MLA_FOLD_MFMA
+#define PLOW_MLA_FOLD_MFMA 0
+#endif
+#if PLOW_MLA_FOLD_MFMA && PLOW_CDNA4 && PLOW_WAVES == 8
+#include "mla_fold_pf_mfma.h"
+#endif
 #include "op_collective.h"
 #include "op_elementwise.h"
 #include "op_gemm.h"
@@ -1683,6 +1690,19 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
     const float* const FOLD_OPART = (const float*)TEN(1) + fold_g_off * 512;
     const float* const FOLD_MLPART = (const float*)TEN(2) + fold_g_off * 2;
     const bf16* const FOLD_WUV = (const bf16*)TEN(3) + (size_t)in->i[3] * in->i[1] * 512 * V;
+#if PLOW_MLA_FOLD_MFMA && PLOW_CDNA4 && PLOW_WAVES == 8
+    /* One split and V=256 (GLM prefill): batched MFMA GEMM, 2.7-5.2x the scalar fold at T 1k-16k
+     * on MI350X; bf16 rounding of the normalized latent, rel-L2 2.5e-3 vs the scalar fold. */
+    if (in->i[4] == 1u && V == 256u) {
+        if (in->i[0] >= 1024u)
+            d_mla_fold_pf_mfma<2, 256>(FOLD_O, FOLD_OPART, FOLD_MLPART, FOLD_WUV, in->i[0],
+                                       in->i[1], slice, nblk, (bf16*)raw);
+        else
+            d_mla_fold_pf_mfma<1, 256>(FOLD_O, FOLD_OPART, FOLD_MLPART, FOLD_WUV, in->i[0],
+                                       in->i[1], slice, nblk, (bf16*)raw);
+        return;
+    }
+#endif
 #if PLOW_MLA_FOLD_TB > 1
     /* TOKEN-BLOCKED PREFILL ARM (-DPLOW_MLA_FOLD_TB=<G>; op_attention.h d_mla_merge_fold_tb).
      *

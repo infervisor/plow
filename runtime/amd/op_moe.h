@@ -136,6 +136,13 @@ __device__ __forceinline__ unsigned moe_bound_topk(unsigned char* table, unsigne
 #ifndef PLOW_MOE_PF_A4W4
 #define PLOW_MOE_PF_A4W4 0
 #endif
+/* Op 86 A4W4 body = weight-streaming sweep (moe_down_a4w4_sweep.h). Needs the CDNA4 scaled MFMA. */
+#ifndef PLOW_MOE_PF_DOWN_SWEEP
+#define PLOW_MOE_PF_DOWN_SWEEP 0
+#endif
+#if PLOW_MOE_PF_DOWN_SWEEP
+#include "moe_down_a4w4_sweep.h"
+#endif
 /* This used to #error on CDNA3 ("no fp4"). The flag no longer demands the scaled f8f6f4 matrix
  * core: without PLOW_HAS_MX_MMA the same ops compile as the SIMULATED arm — fp4 dequantized to
  * bf16 in staging (exact: <= 3 significant bits, power-of-two scale) and fed to the ordinary
@@ -4804,6 +4811,23 @@ __device__ void d_moe_group_down_pf(float* part, const bf16* fu, const unsigned 
                                     ) {
 #if PLOW_MOE_PF_A4W4
     if (enc == PLOW_MOE_ENC_MXFP4) { /* A = the bridge's MXFP4 output + its E8M0 rows */
+#if PLOW_MOE_PF_DOWN_SWEEP
+        /* Weight-streaming sweep (moe_down_a4w4_sweep.h): same f32 part scatter, 2.3-5.5x
+         * faster on MI350X at GLM-5.3 TP8 (I=256) from T=1 to T=16384. */
+        if (I_moe == 256u && !part16
+#if PLOW_MOE_PF_ATOMIC
+            && !atom_ksh
+#endif
+#if PLOW_MOE_PF_DET
+            && !det_ksh
+#endif
+        ) {
+            moe_down_a4w4_sweep_auto<2>(part, (const unsigned char*)fu, fu_scale, wtab, stab, meta,
+                                        row_partidx, row_gate, H, n_exp, slice, nblk,
+                                        (unsigned*)lds);
+            return;
+        }
+#endif
         d_moe_group_pf_a4w4<false>((void*)part, (const void*)fu, fu_scale, wtab, stab, meta,
                                    nullptr, row_partidx, row_gate, nullptr, H, I_moe, n_exp, 0,
                                    slice, nblk, 0.0f, 0.0f, (void*)lds MPF_ATOM_ARG MPF_DET_ARG);

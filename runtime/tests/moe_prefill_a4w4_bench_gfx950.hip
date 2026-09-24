@@ -81,6 +81,7 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
+#include <type_traits>
 #ifndef MPF4_BM
 #define MPF4_BM 64
 #endif
@@ -91,6 +92,7 @@
 #define st_act1(p, v) st_act<bf16>((PLOW_GLOB bf16*)(p), (v))
 #include "op_moe.h"
 #undef st_act1
+#include "moe_down_a4w4_sweep.h"
 
 #ifndef PLOW_MOE_A4W4_STAGE2_BENCH
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
@@ -113,6 +115,17 @@ void b_down(float* part, const unsigned char* fu, const unsigned char* fu_scale,
     d_moe_group_pf_a4w4<false>((void*)part, (const void*)fu, fu_scale, wtab, stab, meta, nullptr,
                                row_partidx, row_gate, nullptr, H, I, n_exp, 0, blockIdx.x,
                                gridDim.x, 0.0f, 0.0f, (void*)lds, atom_ksh);
+}
+
+/* Weight-streaming DOWN sweep (moe_down_a4w4_sweep.h), GLM-5.3 I=256 (KS=2), 4 waves. */
+template <unsigned TM>
+__global__ __launch_bounds__(256, 2)
+void b_down_sweep(float* part, const unsigned char* fu, const unsigned char* fu_scale,
+                  const unsigned long long* wtab, const unsigned long long* stab, const int* meta,
+                  const unsigned* row_partidx, const float* row_gate, unsigned H, unsigned n_exp,
+                  unsigned nsplit) {
+    d_moe_down_a4w4_sweep<TM, 2, 4>(part, fu, fu_scale, wtab, stab, meta, row_partidx, row_gate,
+                                    H, n_exp, nsplit, blockIdx.x, gridDim.x, 4u);
 }
 
 extern "C" __global__ void b_reduce(float* out, const float* part, unsigned T,
@@ -277,6 +290,62 @@ int main(int argc, char** argv) {
     if (bad) return 2;
 
     hipEvent_t e0, e1; HC(hipEventCreate(&e0)); HC(hipEventCreate(&e1));
+
+    /* --- weight-streaming DOWN sweep vs op86: same partial layout, f32-rounding equality ---- */
+    if (I == 256) {
+        /* Random fp4 payload and E8M0 scales: a constant A would make any lane map pass. */
+        {
+            std::vector<unsigned char> r((size_t)pad * I / 2), rs((size_t)pad * I / 32);
+            for (auto& x : r) x = (unsigned char)(rnd() & 0xff);
+            for (auto& x : rs) x = (unsigned char)(122u + rnd() % 9u);
+            HC(hipMemcpy(dfu, r.data(), r.size(), hipMemcpyHostToDevice));
+            HC(hipMemcpy(dfs, rs.data(), rs.size(), hipMemcpyHostToDevice));
+            /* and random DOWN weights/scales, so a wrong column or K-lane map cannot pass */
+            std::vector<unsigned char> w(wdn), ws(sdn);
+            for (unsigned e = 0; e < n_exp; e++) {
+                for (auto& x : w) x = (unsigned char)(rnd() & 0xff);
+                for (auto& x : ws) x = (unsigned char)(122u + rnd() % 9u);
+                HC(hipMemcpy((void*)wt[e * 3 + 2], w.data(), wdn, hipMemcpyHostToDevice));
+                HC(hipMemcpy((void*)st[e * 3 + 2], ws.data(), sdn, hipMemcpyHostToDevice));
+            }
+        }
+        std::vector<float> pref((size_t)nassign * H), psw((size_t)nassign * H);
+        HC(hipMemset(dpart, 0, (size_t)nassign * H * 4));
+        hipLaunchKernelGGL(b_down, dim3(grid), dim3(PLOW_THREADS), 0, 0, dpart, dfu, dfs, dwt, dst,
+                           dmeta, drp, drg, H, I, n_exp, 0u);
+        HC(hipMemcpy(pref.data(), dpart, pref.size() * 4, hipMemcpyDeviceToHost));
+        auto sweep = [&](auto tm_tag) {
+            constexpr unsigned TM = decltype(tm_tag)::value;
+            unsigned live_sub = 0;
+            for (unsigned e = 0; e < n_exp; e++) live_sub += (cnt[e] + TM - 1) / TM;
+            const unsigned sgrid = 2u * grid;
+            unsigned nsplit = live_sub ? (2u * sgrid + live_sub - 1) / live_sub : 1u;
+            nsplit = std::max(1u, std::min(nsplit, H / 64u));
+            HC(hipMemset(dpart, 0, (size_t)nassign * H * 4));
+            hipLaunchKernelGGL(b_down_sweep<TM>, dim3(sgrid), dim3(256), 0, 0, dpart, dfu, dfs, dwt,
+                               dst, dmeta, drp, drg, H, n_exp, nsplit);
+            HC(hipMemcpy(psw.data(), dpart, psw.size() * 4, hipMemcpyDeviceToHost));
+            size_t bad = 0; double worst = 0;
+            for (size_t i = 0; i < psw.size(); i++) {
+                const double rel = fabs((double)pref[i] - psw[i]) / fmax(1e-3, fabs((double)pref[i]));
+                worst = fmax(worst, rel);
+                if (!std::isfinite(psw[i]) || rel > 1e-3) ++bad;
+            }
+            std::vector<double> tv;
+            for (int it = 0; it < iters; it++) {
+                HC(hipEventRecord(e0));
+                hipLaunchKernelGGL(b_down_sweep<TM>, dim3(sgrid), dim3(256), 0, 0, dpart, dfu, dfs,
+                                   dwt, dst, dmeta, drp, drg, H, n_exp, nsplit);
+                HC(hipEventRecord(e1)); HC(hipEventSynchronize(e1));
+                float ms = 0; HC(hipEventElapsedTime(&ms, e0, e1)); if (it) tv.push_back(ms);
+            }
+            std::sort(tv.begin(), tv.end());
+            printf("  sweep DOWN TM=%-2u nsplit=%-3u: %8.3f ms  oracle %s (%zu bad, worst rel %.3g)\n",
+                   TM, nsplit, tv[tv.size() / 2], bad ? "FAIL" : "PASS", bad, worst);
+        };
+        sweep(std::integral_constant<unsigned, 16>{});
+        sweep(std::integral_constant<unsigned, 64>{});
+    }
     std::vector<double> t1v, t2v, tbasev, tatomv;
     for (int it = 0; it < iters; it++) {
 #ifndef PLOW_MOE_A4W4_STAGE2_BENCH

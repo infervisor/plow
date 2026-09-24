@@ -54,6 +54,17 @@ case "${PLOW_MOE_PF_A4W4_BK:-128}" in
   256) A4W4_BK="-DMPF4_BK=256" ;;
   *) echo "PLOW_MOE_PF_A4W4_BK must be 128 or 256" >&2; exit 2 ;;
 esac
+# Prefill-object arms (moe_down_a4w4_sweep.h, mla_fold_pf_mfma.h); same packet ABI as default.
+case "${PLOW_MOE_PF_DOWN_SWEEP:-0}" in
+  0) ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_MOE_PF_DOWN_SWEEP=1" ;;
+  *) echo "PLOW_MOE_PF_DOWN_SWEEP must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${PLOW_MLA_FOLD_MFMA:-0}" in
+  0) ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_MLA_FOLD_MFMA=1" ;;
+  *) echo "PLOW_MLA_FOLD_MFMA must be 0 or 1" >&2; exit 2 ;;
+esac
 if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
   [ -f "$PLOW_HSACO_CONFIG" ] || { echo "missing PLOW_HSACO_CONFIG: $PLOW_HSACO_CONFIG" >&2; exit 2; }
   cfg_dir="$(dirname -- "$PLOW_HSACO_CONFIG")"
