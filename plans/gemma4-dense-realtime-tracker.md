@@ -5692,3 +5692,65 @@ unchanged. 30 injected ops separate the two readings by 0.26 ms, i.e. ~50 sigma 
 
 Do NOT build the k+v hnr merge, the router fusion, or task #79 until that slope is known. Three
 routes were closed today by measuring first; this one is the same shape.
+
+## ANSWERED: a live coarse-gated op costs 3.01 us, and 110 of them are the 0.330 ms (2026-09-24)
+
+`PLOW_TUNE_OPINJ=N` chained N duplicate LIVE `HeadNormRope` ops per layer between q's norm and its
+consumer — dependency chain intact, same injection on every rung so the decode-ladder validator
+still matches, correctness irrelevant to a timing probe. Gate was `graphstat`'s op count (this
+edits the PACKET, not the kernel, so the cubin is identical by design and SASS/md5 are not the
+gate). 30 layers, so N=1 -> +30 ops.
+
+| inj | ops (T=1) | edges | mean ms | sd | vs control | us/op |
+|---|---|---|---|---|---|---|
+| 0 | 551 | 640 | 5.3763 | 0.0006 | — | — |
+| 1 | 581 | 670 | 5.4693 | 0.0006 | +0.0930 | 3.10 |
+| 3 | 641 | 730 | 5.6500 | 0.0020 | +0.2737 | 3.04 |
+
+**Least-squares slope = 3.01 us per live coarse-gated op**, linear across both points, ~150 sigma
+against the 0.0006 ms arm sd. The gate confirmed +30/+90 ops and +30/+90 edges exactly.
+
+**BOTH earlier readings were wrong.** Reading A (coarse gates on a uniform producer are ~free) is
+refuted: they cost 3.01 us each. Reading B (my 4.73/551 = 8.6 us) overestimated by 2.9x. The
+correct accounting of the 4.73 ms remainder is therefore:
+
+    per-op gate/dispatch   551 x 3.01 us = 1.66 ms   (35% of the remainder)
+    work inside the ops                  ~3.07 ms    (65%)
+
+And the AMD `PLOW_FUSE_HNR` null is now fully consistent rather than contradictory: there the hnr
+ops carried FINE producer maps and really were nearly free; here every dep is coarse
+(`SE_FINE = 0`) and each op costs 3.01 us. Same mechanism, different granularity. The dead-op
+figure fits too — dead ops measured <= 1.3 us against live 3.01 us, because nothing waits on them.
+
+### The op-fusion route is OPEN, and the arithmetic is exact
+
+**0.330 ms / 3.01 us = 110 live ops of 551 (20%).** Candidates, all op-71-shaped, with what each is
+worth at the measured slope:
+
+| fusion | live ops removed | ms |
+|---|---|---|
+| 3 `HEADNORM_ROPE`/layer -> 2 (merge k+v; v takes no norm and no rope, so k+v fit the 8 operand slots exactly) | 30 | 0.090 |
+| q `HEADNORM_ROPE` into the `GEMV_QKV` epilogue | 30 | 0.090 |
+| `MOE_ROUTER_SCORE_FAST` + `MOE_ROUTER_GEMMA_TOPK` (adjacent; TOPK is `blocks=1`) | 30 | 0.090 |
+| `MOE_COMBINE_NORM_GEMMA` + the following `NORM_RESIDUAL_NORM` (adjacent, both `blocks=1`) | 30 | 0.090 |
+| drop the 30 dead `MOE_ALIGN_GEMMA_PF` | 30 (dead) | ~0.040 |
+| **total** | **150** | **~0.40** |
+
+That is **0.40 ms against the 0.330 needed** — the first route of this campaign with a measured
+surplus rather than a hoped-for one. It does not require any of them individually to work: any four
+of the five clear the bar.
+
+**Order to build them in** (cheapest and least register-risk first): the k+v merge (both ops have
+IDENTICAL immediates `i=[1,8,256,0,0,0,1,0]` and differ only in null `gamma`/`cos`/`sin`, so the
+kernel already has the `skip_norm` parameter it needs); then the router pair; then combine+norm;
+then the dead align; q-into-QKV last, since folding into a 132-block GEMV epilogue is the one that
+can widen the survivor at `REG:255`.
+
+**Constraints that apply to every one of them:** `decode_rung.rs:179+` compares normalized
+instruction lists across rungs with `blocks` zeroed, so a merged op must be emitted identically on
+EVERY compiled rung or the runtime silently falls back to widest-only execution. And at
+`REG:255 LOCAL:0` a fusion that widens the surviving op can still lose outright
+([[megakernel-array-loop-regression]]: +0.37 ms for an arithmetic-identical rewrite). Single
+variable, gate on SASS, and check `LOCAL > 0` before believing any timing.
+
+The probe knob is reverted.
