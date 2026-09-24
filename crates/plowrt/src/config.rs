@@ -209,18 +209,6 @@ pub struct RuntimeConfig {
     #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_defer_decode: bool,
 
-    /// Modular block packet execution mode (reusable layer blocks, decoupled attention/FFN).
-    #[arg(long = "block-packets", env = "PLOW_BLOCK_PACKETS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub block_packets: bool,
-
-    /// Modular block prefill pipeline and fine-grained ladder execution.
-    #[arg(long = "pf-modular", env = "PLOW_PF_MODULAR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub pf_modular: bool,
-
-    /// Single block stage to execute: "attn", "ffn", "embed", "vocab", or "all".
-    #[arg(long = "block-stage", env = "PLOW_BLOCK_STAGE", value_parser = clap::builder::PossibleValuesParser::new(["attn", "ffn", "embed", "vocab", "all"]), global = true)]
-    pub block_stage: Option<String>,
-
     /// Prefill cross-request span allocation policy: "greedy" (completion priority, lowest TTFT)
     /// or "fair" (fair-split rows across all concurrent requests).
     /// Serving profile selection. `auto` picks the campaign's realtime/high_concurrency knob
