@@ -1850,14 +1850,10 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
         const unsigned kend = SPLITK == 1 ? K : kbegin + K / SPLITK;
 
         f32x16 acc[SM][SN];
-        f32x16 promoted[BLOCK128 ? SM : 1][BLOCK128 ? SN : 1];
 #pragma unroll
         for (int i = 0; i < SM; i++)
 #pragma unroll
-            for (int j = 0; j < SN; j++) {
-                acc[i][j] = (f32x16)(0.0f);
-                if constexpr (BLOCK128) promoted[i][j] = (f32x16)(0.0f);
-            }
+            for (int j = 0; j < SN; j++) acc[i][j] = (f32x16)(0.0f);
 
         __align__(8) unsigned char ra[APT], rb[BPT];
         [[maybe_unused]] float rsc = 0.0f;
@@ -1987,7 +1983,58 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
 #pragma unroll 1
         for (unsigned kt = kbegin / FBK; kt < kbegin / FBK + NT; kt++) {
             const unsigned kn = (kt + 1) * FBK;
-            if constexpr (!PLR) {
+            if constexpr (BLOCK128) {
+                /* Block scales, one accumulator (the ck_tile blockscale scheme): each fragment's
+                 * K128 product is formed from zero in a temporary and folded into `acc` with one
+                 * FMA by a_scale*w_scale. A second full promoted accumulator doubled the
+                 * register file and spilled every tile above 128x128. A scales [ceil(K/128), M]
+                 * and W scales [ceil(N/128), ceil(K/128)] are staged in LDS with this K-tile;
+                 * arbitrary f32 scales cannot be folded into E8M0 MFMA scales. */
+                static_assert(NSL == 2 && KS == 1, "one K128 tile = two K64 MFMAs");
+                GM8_FENCE();
+                /* B fragments for both K64 halves stay live across the tile; A is read per
+                 * row-block below, so only 2 A fragments are live at once (c0 fits 256 VGPR). */
+                fp8v32 bf0[SN][KS], bf1[SN][KS];
+#pragma unroll
+                for (int j = 0; j < SN; j++) {
+                    const unsigned brow = wn * (BN / WN) + j * MFMA_N + frow;
+                    __builtin_memcpy(&bf0[j][0],
+                        &GM8_BSM(buf)[brow * STRIDE + GM8_XORSWZ(brow, frag_k64(lane, 0))], 32);
+                    __builtin_memcpy(&bf1[j][0],
+                        &GM8_BSM(buf)[brow * STRIDE + GM8_XORSWZ(brow, frag_k64(lane, SLICE))], 32);
+                }
+                if (kn < kend) { GM8_FETCH(kn); }
+                if (DBUF && kn < kend) { GM8_COMMIT(buf ^ 1); }
+                GM8_FENCE();
+                GM8_CLUSTER_BARRIER();
+                const float* sc = GM8_SC(buf);
+                float wsj[SN];
+#pragma unroll
+                for (int j = 0; j < SN; j++)
+                    wsj[j] = sc[BM + (n0 + wn * (BN / WN) + j * MFMA_N + mfma_acc_n(lane)) / 128u - n0 / 128u];
+                if constexpr (PRIO) __builtin_amdgcn_s_setprio(1);
+#pragma unroll
+                for (int i = 0; i < SM; i++) {
+                    const unsigned arow = wm * (BM / WM) + i * MFMA_M + frow;
+                    fp8v32 a0, a1;
+                    __builtin_memcpy(&a0, &GM8_ASM(buf)[arow * STRIDE + GM8_XORSWZ(arow, frag_k64(lane, 0))], 32);
+                    __builtin_memcpy(&a1, &GM8_ASM(buf)[arow * STRIDE + GM8_XORSWZ(arow, frag_k64(lane, SLICE))], 32);
+                    float asv[16];
+#pragma unroll
+                    for (int e = 0; e < 16; e++)
+                        asv[e] = sc[wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e)];
+#pragma unroll
+                    for (int j = 0; j < SN; j++) {
+                        f32x16 t = plow_mfma_fp8_32x32(a0, bf0[j][0], (f32x16)(0.0f));
+                        t = plow_mfma_fp8_32x32(a1, bf1[j][0], t);
+#pragma unroll
+                        for (int e = 0; e < 16; e++) acc[i][j][e] += t[e] * (asv[e] * wsj[j]);
+                    }
+                }
+                if constexpr (PRIO) __builtin_amdgcn_s_setprio(0);
+                GM8_FENCE();
+                GM8_CLUSTER_BARRIER();
+            } else if constexpr (!PLR) {
 #pragma unroll
                 for (int sl = 0; sl < NSL; sl++) {
                     GM8_FENCE();
@@ -2014,24 +2061,6 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
                     if (sl == 0 && kn < kend) { GM8_FETCH(kn); }
                     GM8_MFMA_FROM(afp[sl & 1], bfp[sl & 1])
                 }
-            }
-            if constexpr (BLOCK128) {
-                // A scales [ceil(K/128), M]; W scales [ceil(N/128), ceil(K/128)], staged in LDS
-                // with this K-tile. Arbitrary FP32 scales cannot be folded into E8M0 MFMA scales.
-                const float* sc = GM8_SC(buf);
-#pragma unroll
-                for (int i = 0; i < SM; i++)
-#pragma unroll
-                    for (int j = 0; j < SN; j++) {
-                        const unsigned nl = wn * (BN / WN) + j * MFMA_N + mfma_acc_n(lane);
-                        const float ws = sc[BM + (n0 + nl) / 128u - n0 / 128u];
-#pragma unroll
-                        for (int e = 0; e < 16; e++) {
-                            const float as = sc[wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e)];
-                            promoted[i][j][e] += acc[i][j][e] * (as * ws);
-                        }
-                        acc[i][j] = (f32x16)(0.0f);
-                    }
             }
             if constexpr (!DBUF) {
                 /* One buffer: the commit waits until every wave has read the tile. Same trade as
@@ -2065,7 +2094,7 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
 #pragma unroll
                     for (int e = 0; e < 16; e++) {
                         const unsigned mm = m0 + wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e);
-                        if (mm < M) st_act1(&Cg[(size_t)mm * N + nn], f2bf(promoted[i][j][e]));
+                        if (mm < M) st_act1(&Cg[(size_t)mm * N + nn], f2bf(acc[i][j][e]));
                     }
                 }
         } else if constexpr (GLU) {
