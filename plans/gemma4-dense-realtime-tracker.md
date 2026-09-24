@@ -5515,3 +5515,66 @@ which is only consistent with gates being hit constantly. Fusing `HEADNORM_ROPE`
 widens the surviving op's register footprint, and the decode megakernel is at `REG:255 LOCAL:0`
 with a documented history of arithmetic-identical rewrites costing +0.37 ms
 ([[megakernel-array-loop-regression]]). Must be measured, single-variable, gated on SASS.
+
+---
+
+## MEASURED: the MoE expert walk is only 12% of the B=1 step (2026-09-24)
+
+Half-K probe on the current build, the method `op_gemv_mma.cuh` validated: halve the k-range both
+RB expert walks stream and `W = 2*(step-half)`, `F = 2*half-step`. Unconditional source edit at
+`op_moe.cuh:2086/2120` (GLU over H) and `:1378/1415` (DOWN over I_moe); the router walk at `:911`
+deliberately untouched (router weights are not part of the expert stream). Gated on **SASS
+differing**, not md5. 3 interleaved order-reversed passes, one lease.
+
+| arm | mean ms | sd |
+|---|---|---|
+| full walk | **5.3783** | 0.0006 |
+| half walk | **5.0550** | 0.0010 |
+
+    W (expert walk, k-proportional) = 0.6467 ms  = 12.0% of the step
+    F (everything else)             = 4.7317 ms  = 88.0% of the step
+
+**The expert weight walk is 12% of the B=1 step.** The 0.330 ms that 128/C1 needs is **51% of the
+entire walk** — it cannot come from walk efficiency, and it could not come from eliminating the
+walk outright in any realistic form.
+
+### The byte model is contradicted, and the contradiction is the finding
+
+From the op immediates (`i=[8, 704, 2816, 128]`: top_k 8, I_moe 704, H 2816, 128 experts) the
+expert stream is exact: gate+up `5632 ch x 2 x 5632 B` = 63.4 MB/layer, down `22528 ch x 1408 B` =
+31.7 MB/layer, **95.1 MB x 30 layers = 2.855 GB/step**. Each layer has its own table
+(`moe.ewt.0..29`, 2 uses each), so nothing is shared. The probe removed ~1.58 GB of that and bought
+0.323 ms, which implies **~4.9 TB/s — above the 3.35 TB/s roof, i.e. impossible from DRAM.**
+
+The consistent explanation is `PLOW_GEMV_PREFETCH` (commit 32688ffb, "claim-ahead L2 weight
+prefetch **before the gate**"): the expert weights are pulled toward L2 while earlier ops still
+run, so by the time the walk's gate opens it reads largely resident data and the DRAM time is
+hidden behind `F`. **The step is not bandwidth-bound; the prefetch already hid the bandwidth.**
+
+### This retires the framing the last three rounds were built on
+
+"7.64 GB/step at 5.362 ms = 1425 GB/s = ~45% of the 3352 roof" is **not a meaningful description of
+this step** and should not be used to size levers again. It divides total weight bytes by the whole
+step and reads the quotient as an efficiency, exactly the artifact `op_gemv_mma.cuh` already
+retracted once for the B=32 case. The step is a sequence of 551 gated ops whose DRAM traffic is
+prefetched; its time is not `bytes / bandwidth`.
+
+Consequently CLOSED, with numbers rather than argument:
+
+* **walk bandwidth / memory-level parallelism** — the walk is 12% of the step and reads from L2.
+  Row blocking, deeper prefetch, PAIR, tensor-core walks: all bounded by 0.65 ms total, and all
+  already on.
+* **op count / gate count** — bounded at <= 1.3 us/op by the dead-align arm (30 `blocks=1` ops
+  removed for <= 0.040 ms), so all 551 ops cap at ~0.72 ms and realistic merges buy ~0.04-0.08 ms.
+  `edges_tr == edges` means none are removable without fusion.
+
+### Where the 4.73 ms actually is, and the next probe
+
+`F` is not gates (<= 0.72 ms) and not the expert walk (measured out). What remains inside it:
+the **dense attention projections** — `GEMV_QKV` 25, `GEMV` 71, `GEMV_GLU` 30 — which carry their
+own large weight stream through `op_gemm.cuh`'s gvmma path and were NOT touched by this probe;
+`FLASH_DECODE`/`FLASH_MERGE` 30 each; 181 norm ops; and the megakernel entry.
+
+**Next probe is the same instrument pointed at the dense walks:** halve the k-range in the gvmma
+path and re-split. That isolates dense-weight time from the genuinely fixed remainder, and it is
+the only remaining place a 0.330 ms can hide.
