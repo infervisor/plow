@@ -573,7 +573,8 @@ fn lean_moe_stage2_pair(ops: &[Op], i: usize) -> bool {
 fn lean_moe_stage1_inst(inst: &DevInst) -> bool {
     inst.op == DevOp::MoeGroupGluPf as u16
         && ((inst.i[0] == 384 && inst.i[1] == 3584 && inst.i[2] == 896)
-            || (inst.i[0] == 256 && inst.i[1] == 6144 && inst.i[2] == 256))
+            // 257: GLM's shared expert folded in as the last expert (PLOW_GLM_MOE_SHARED_FOLD).
+            || (inst.i[0] == 256 && inst.i[1] == 6144 && matches!(inst.i[2], 256 | 257)))
         && inst.i[3] == 2
         && inst.i[4] == 0
         && inst.i[5] <= 2

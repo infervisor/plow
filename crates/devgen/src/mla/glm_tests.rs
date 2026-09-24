@@ -4558,6 +4558,94 @@ fn shared_fold_rewrites_only_the_prefill_moe_chain() {
     assert_eq!(plain_tensors.len(), folded_tensors.len());
 }
 
+/// PLOW_GLM_MOE_SHARED_FOLD on GLM-5.3 MXFP4 TP8: the shared expert joins the grouped A4W4
+/// prefill chain as expert 256 (router i5=1, align/85/86 at 257/9, combine k=9 with no `shared`),
+/// its W4A16 GEMMs leave every prefill program, and decode is unchanged.
+#[test]
+fn mxfp4_shared_fold_joins_the_grouped_a4w4_prefill_chain() {
+    let _guard = crate::test_env::env_guard();
+    let pf = [128u32, 2048];
+    let emit = |fold: &str| {
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_GLM_MOE_SHARED_FOLD", fold),
+            ("PLOW_GLM_MOE_STAGE1_NATIVE", "1"),
+        ]);
+        crate::with_emit_target_amd(true, || {
+            let mut c = glm_ref_cfg();
+            c.tp = 8;
+            c.quark_mixed = true;
+            glm_build_block_pf_rungs(
+                &c, 8192, 256, 3..4, false, "glm-quark", MlaArch::Glm,
+                &pf, PrefillScope::Full, MoeEnc::Mxfp4, &[1, 8],
+            )
+            .0
+        })
+    };
+    let (plain, folded) = (emit("0"), emit("1"));
+    assert_eq!(plain.prog_t, folded.prog_t);
+    let name = |m: &packet::devbuild::Model, h: u32| {
+        m.tensors.get(h as usize).map_or("", |t| t.name.as_str()).to_owned()
+    };
+    let shared = |m: &packet::devbuild::Model, d: &packet::dev::DevInst| {
+        d.t.iter().any(|&h| name(m, h).contains("shared_experts."))
+    };
+    fn find(insts: &[packet::dev::DevInst], op: DevOp) -> Vec<&packet::dev::DevInst> {
+        insts.iter().filter(|d| d.op == op as u16).collect()
+    }
+    for (p, (off, on)) in plain.progs.iter().zip(&folded.progs).enumerate() {
+        let t = plain.prog_t[p];
+        let (off, on) = (&off.insts, &on.insts);
+        let ops = |v: &[packet::dev::DevInst]| {
+            let mut o: Vec<u16> = v.iter().map(|d| d.op).collect();
+            o.sort_unstable();
+            o
+        };
+        if p >= pf.len() {
+            assert_eq!(ops(off), ops(on), "t={t}: the fold changed a decode program's ops");
+            assert!(on.iter().any(|d| shared(&folded, d)), "t={t}: decode lost its shared GEMVs");
+            continue;
+        }
+        // Fold off: the unfolded 256/8 chain with its W4A16 shared expert.
+        assert!(off.iter().any(|d| shared(&plain, d)));
+        let [r] = find(off, DevOp::MoeRouterTopkPf)[..] else { panic!("t={t}: one router") };
+        assert_eq!((r.i[1], r.i[2], r.i[5]), (256, 8, 0));
+        // Fold on.
+        assert!(!on.iter().any(|d| shared(&folded, d)), "t={t}: a shared-expert GEMM survived");
+        let [r] = find(on, DevOp::MoeRouterTopkPf)[..] else { panic!("t={t}: one router") };
+        assert_eq!((r.i[1], r.i[2], r.i[5]), (256, 8, 1), "t={t}");
+        for a in find(on, DevOp::MoeAlignPf) {
+            assert_eq!(a.i[..3], [t, 257, 9], "t={t}");
+        }
+        for op in [DevOp::MoeGroupGluPf, DevOp::MoeGroupDownPf] {
+            let [d] = find(on, op)[..] else { panic!("t={t}: one {op:?}") };
+            assert_eq!((d.i[2], d.i[MoeEnc::PREFILL_SLOT]), (257, MoeEnc::Mxfp4.code()));
+            assert!(name(&folded, d.t[2]).ends_with("mlp.expert_weight_table_sf"));
+            assert!(name(&folded, d.t[3]).ends_with("mlp.expert_scale_table_sf"));
+        }
+        let combines = find(on, DevOp::MoeCombinePf);
+        assert!(!combines.is_empty());
+        for c in combines {
+            assert_eq!((c.t[2], c.i[1]), (TENSOR_NONE, 9), "t={t}");
+        }
+        // Exactly the shared-expert packets (and the Glu between an unfused pair) go away.
+        let mut removed = ops(off);
+        for o in ops(on) {
+            let at = removed.iter().position(|x| *x == o).expect("the fold added an op");
+            removed.remove(at);
+        }
+        let shared_ops = off.iter().filter(|d| shared(&plain, d)).count();
+        let glu = removed.iter().filter(|&&o| o == DevOp::Glu as u16).count();
+        assert_eq!(removed.len(), shared_ops + glu, "t={t}: removed {removed:?}");
+    }
+    let tables = |m: &packet::devbuild::Model, suffix: &str| {
+        m.tensors.iter().filter(|t| t.name.ends_with(suffix)).map(|t| t.bytes).collect::<Vec<_>>()
+    };
+    assert_eq!(tables(&folded, "_table_sf"), [257 * 24, 257 * 24]);
+    assert!(tables(&folded, "mlp.expert_weight_table").is_empty());
+    assert_eq!(tables(&plain, "mlp.expert_weight_table"), [256 * 24]);
+    assert!(tables(&plain, "_table_sf").is_empty());
+}
+
 /// The packed siblings ride next to the native AITER MoE and hipBLASLt segments — the production
 /// gfx942 TP8 recipe — and emitting them leaves every ordinary program byte-identical. This is
 /// the emit half of what lets the serve mux pack several requests' spans into one rung on that

@@ -1796,6 +1796,19 @@ fn lean_moe_stage1_route_requires_exact_shape_and_align() {
     };
     assert_eq!((glm_route.args.inter_dim, glm_route.args.model_dim), (256, 6144));
 
+    // PLOW_GLM_MOE_SHARED_FOLD: 257 experts at top-9, and only as a pair.
+    prog.insts[0].i[1..3].copy_from_slice(&[257, 9]);
+    prog.insts[1].i[2] = 257;
+    let folded = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+    let PrefillSegmentRoute::MoeStage1Mxfp4(folded_route) = folded[1] else {
+        panic!("shared-fold GLM stage-1 packet must route to the native object")
+    };
+    assert_eq!(folded_route.args.experts, 257);
+    prog.insts[0].i[2] = 8;
+    assert!(moe_mxfp4_routes(&prog, &tensors, &devp).is_err());
+    prog.insts[0].i[1..3].copy_from_slice(&[256, 8]);
+    prog.insts[1].i[2] = 256;
+
     prog.insts[0].i[2] = 7;
     assert!(moe_mxfp4_routes(&prog, &tensors, &devp).is_err());
     prog.insts[0].i[2] = 8;

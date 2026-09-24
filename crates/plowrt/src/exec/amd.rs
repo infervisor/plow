@@ -2609,10 +2609,10 @@ fn moe_mxfp4_routes_with_scratch(
                     && a.i[0] == prog.t
                     && a.i[1] == d.i[2]
                     && (a.i[2] == 16
-                        || (a.i[2] == 8
-                            && d.i[0] == 256
+                        || (d.i[0] == 256
                             && d.i[1] == 6144
-                            && d.i[2] == 256))
+                            // (257, 9): the shared-expert fold's extra expert and slot.
+                            && matches!((d.i[2], a.i[2]), (256, 8) | (257, 9))))
             });
             if align.is_none() {
                 return Err(RuntimeError::Device(format!(
@@ -4723,6 +4723,26 @@ fn bind_packed_experts(
                 )));
             }
             for j in 0..3 {
+                // MXFP4: the checkpoint's own packed u8 payload + E8M0 scale, which no prep
+                // shadows; the scale must match the routed slot's too.
+                if en.microscaled() {
+                    for shared_name in [en.weight_of(n_exp - 1, j, true), en.scale_of(n_exp - 1, j, true)] {
+                        let routed_name = if shared_name.ends_with(en.scale) {
+                            en.scale_of(0, j, false)
+                        } else {
+                            en.weight_of(0, j, false)
+                        };
+                        let shared = ckpt.tensor_ex(&shared_name).map(|(b, s)| (b.len(), s));
+                        let routed = ckpt.tensor_ex(&routed_name).map(|(b, s)| (b.len(), s));
+                        if shared.is_none() || shared != routed {
+                            return Err(RuntimeError::Device(format!(
+                                "{pfx}: the shared-expert fold routes `{shared_name}` ({shared:?}) \
+                                 AS routed `{routed_name}` ({routed:?}) and cannot reshape it"
+                            )));
+                        }
+                    }
+                    continue;
+                }
                 let (name, want) = (en.weight_of(n_exp - 1, j, true), w0.len());
                 let (bytes, shape) = ckpt.fp8_tensor_ex(&name).ok_or_else(|| {
                     RuntimeError::Device(format!(
@@ -4892,7 +4912,7 @@ fn bind_packed_experts(
                     down_rows,
                     down_kbytes,
                     false,
-                    shared,
+                    shared && !en.microscaled(),
                 ));
                 plan.push((
                     en.scale_of(e, j, shared),

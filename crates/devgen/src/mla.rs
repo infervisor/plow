@@ -1636,14 +1636,20 @@ fn emit_glm_shared_w8a8_down(
 /// NOT bit-identical, and not only by reassociation: the shared expert stops being a bf16 GEMM
 /// pair and becomes block-fp8 W8 against the A8 activation quant the routed experts already use
 /// — the checkpoint's OWN fp8 bytes rather than the lite prep's bf16 dequant of them, which is
-/// what vLLM serves. Requires the native AITER MoE route (nothing else consumes a 257-entry
-/// table) and TP, not EP: under EP the routed experts are distributed whole across ranks while
-/// the shared expert is TP-sliced on every rank, so it has no single owner to be expert 256 of.
+/// what vLLM serves. Block-FP8 requires the native AITER MoE route. MXFP4 folds into the
+/// interpreter's grouped A4W4 chain (ops 85/86, or the lean stage-1 object): the shared expert
+/// moves from W4A16 GEMMs to A4W4 like vLLM's, over its own MXFP4 bytes. Both require TP, not
+/// EP (neither `c.ep` nor `PLOW_MOE_PREFILL_EP`): under EP the routed experts are distributed
+/// whole across ranks while the shared expert is TP-sliced on every rank, so it has no single
+/// owner to be expert 256 of.
 fn glm_shared_fold(c: &GlmCfg, enc: MoeEnc) -> bool {
     let cfg = emit_config::active();
     cfg.glm_moe_shared_fold
-        && (cfg.glm_moe_aiter() || cfg.glm_moe_resident())
-        && enc == MoeEnc::Fp8Blk
+        && match enc {
+            MoeEnc::Fp8Blk => cfg.glm_moe_aiter() || cfg.glm_moe_resident(),
+            MoeEnc::Mxfp4 => !cfg.moe_prefill_ep,
+            _ => false,
+        }
         && !c.ep
         && c.tp > 1
 }
@@ -2484,9 +2490,11 @@ fn declare_glm_rows_batched_for_prefill(
     // fields come from, because a size that disagreed with the kernel arm is a silent k-fold
     // heap overrun rather than a fault. The `.max()` term is the DECODE expert ops, which still
     // write f32 `part` for their single token out of this buffer.
+    // The grouped (non-native) fold scatters k+1 slots per token into `part`.
+    let tk_part = if native_moe { tk } else { tk_all };
     let part_pf = match moe_pf_fuse(tk) {
         MoePfFuse::Det => rows * h as u64 * 8,
-        MoePfFuse::None => rows * (tk * h) as u64 * F32,
+        MoePfFuse::None => rows * (tk_part * h) as u64 * F32,
     };
     let part_bytes = if compact_native_scratch {
         let dense_pf = rows * h as u64 * F32;
@@ -8045,14 +8053,16 @@ fn emit_glm_moe_ffn_prefill(
     // SCORES, because the [T, n_exp] logit matrix has no column for the shared expert.
     let fold = glm_shared_fold(c, enc);
     assert!(
-        !fold || native_moe,
-        "PLOW_GLM_MOE_SHARED_FOLD needs the native MoE route: nothing else reads a {}-entry \
-         expert table or a top-{} routing slot",
+        !fold || native_moe || enc == MoeEnc::Mxfp4,
+        "PLOW_GLM_MOE_SHARED_FOLD needs the native MoE route or the grouped A4W4 chain: nothing \
+         else reads a {}-entry expert table or a top-{} routing slot",
         e + 1,
         tk + 1
     );
     let (e_all, tk_all) = (e + u32::from(fold), tk + u32::from(fold));
     let det = !native_moe && moe_pf_fuse(tk) == MoePfFuse::Det;
+    // Op 86's det epilogue recovers the token as `row_partidx >> log2(k)`; k+1 is not a power of 2.
+    assert!(!fold || !det, "PLOW_GLM_MOE_SHARED_FOLD excludes PLOW_MOE_PF_DET");
     let align_par = emit_config::active().moe_align_par && t >= 1024;
     // PLOW_GLM_SEQ_PAR_PROJ: score and top-k on the owned band, then gather the route table out
     // of peer slot 5 (free between this layer's attention reduce-scatter and the next layer's
@@ -8371,7 +8381,7 @@ fn emit_glm_moe_ffn_prefill(
             }
             d.i[0] = imoe_e;
             d.i[1] = h;
-            d.i[2] = e;
+            d.i[2] = e_all;
             d.i[MoeEnc::PREFILL_SLOT] = enc.code();
             d.i[5] = GLM_ACT_SILU;
         });
@@ -8393,7 +8403,7 @@ fn emit_glm_moe_ffn_prefill(
             d.t[7] = n.row_gate;
             d.i[0] = h;
             d.i[1] = imoe_e;
-            d.i[2] = e;
+            d.i[2] = e_all;
             d.i[MoeEnc::PREFILL_SLOT] = enc.code();
             // PLOW_MOE_PF_DET: log2(k)+1 in i[5]. `row_partidx[row] == token*k + slot`
             // (d_moe_align_pf), so the epilogue recovers the token with one shift and adds into
@@ -8451,7 +8461,7 @@ fn emit_glm_moe_ffn_prefill(
                         d.i[0] = h;
                         // PLOW_MOE_PF_DET: op 86 already summed the k slots in place, so this
                         // reads ONE contiguous stream. Same kernel, same expression, k = 1.
-                        d.i[1] = if det || native_moe || routed_w8a8 { 1 } else { tk };
+                        d.i[1] = if det || native_moe || routed_w8a8 { 1 } else { tk_all };
                         d.i[2] = rows;
                         d.i[3] = i * rows; // t_row0
                         d.i[4] = u32::from(det); // f64 fixed-point accumulator (PLOW_MOE_PF_DET)
@@ -8512,7 +8522,7 @@ fn emit_glm_moe_ffn_prefill(
             d.t[2] = if fold { TENSOR_NONE } else { n.shared }; // see the banded twin
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if det || native_moe || routed_w8a8 { 1 } else { tk }; // see the banded twin
+            d.i[1] = if det || native_moe || routed_w8a8 { 1 } else { tk_all }; // see the banded twin
             d.i[2] = t;
             d.i[4] = u32::from(det); // see the banded twin
             d.i[7] = u32::from(native_moe || routed_w8a8);
