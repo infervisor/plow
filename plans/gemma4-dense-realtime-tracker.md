@@ -4950,3 +4950,79 @@ gate fails the measurement is void.
 
 Pre-registered target at 128/C1: TPOT **<= 5.163** takes tok/s, **<= 5.03** takes TPOT outright.
 A null means loads-in-flight in the DOWN arm is not the binding term -- it does NOT mean try 16.
+
+### RESULT: the expert-down pre-issue lever is CLOSED, and the rewrite to reach it was a regression
+
+Measured 26B C1, H100, one session, paired against the fresh vLLM reference taken the same session.
+
+| cell | TPOT lean2 (DP2) | TPOT dp8 | delta | TPOT shipped lean | vLLM |
+|---|---|---|---|---|---|
+| 128/C1 | 5.770 | 5.760 | -0.010 | **5.400** | 5.030 |
+| 1024/C1 | 5.860 | 5.830 | -0.030 | **5.490** | 5.070 |
+| 4096/C1 | 5.890 | 5.870 | -0.020 | **5.520** | 5.080 |
+| 8192/C1 | 5.940 | 5.910 | -0.030 | **5.570** | 5.080 |
+| 15000/C1 | 6.020 | 5.990 | -0.030 | **5.640** | 5.070 |
+
+Two separate findings, and both are negative:
+
+1. **Depth 8 buys 0.01-0.03 ms** -- about 0.5%, against the 0.237 ms needed for tok/s at 128/C1.
+2. **The rewrite that made depth a knob cost +0.37 ms TPOT at every cell, at DP=2**, where it is
+   arithmetically identical to the loop it replaced (same chunks ascending, same `acc` chain).
+   TTFT moved <0.2 ms at every cell so it is not drift, and 18 of 19 objects were md5-identical so
+   it is not the emit. That +0.37 is the whole remaining gap to vLLM and would have erased
+   7bd45936's gain by itself. Reverted in 3afffd18.
+
+**Why, from the SASS** (`nvdisasm -c`, addresses stripped before diffing): the array form added no
+loads. `LD.E.128` 2156 -> 2162 (+6); the loads-in-flight run histogram did not move at all. The
++936 instructions were address arithmetic -- **LOP3.LUT +368, S2R +326**, MOV -186. Both objects
+sit at **REG:255 LOCAL:0** -- the cap, with no spill. At the cap the compiler will not keep 8
+`bf16v8` (32 registers) live; it rematerialises `kk[i]` and the lane ids every iteration. So
+**written pre-issue depth never becomes loads in flight**, and the premise was wrong: the DOWN arm
+is not starved because its loop says 2, it is starved because the megakernel is at its register
+ceiling. Raising loads in flight there requires moving the arm OUT of the 255-register megakernel.
+Same mechanism that already closed the occupancy route.
+
+The measurement now lives in the kernel comment above the loop so it is not re-derived.
+
+### A single-rung decode ladder cannot coexist with the grouped-Lt MoE decode emit
+
+`PLOW_DECODE_BATCH_LADDER=1` aborts the emit: `devgen/src/lib.rs:9568` panics **"no grouped MoE
+decode GLU/DOWN pair to isolate"**, because `PLOW_EMIT_MOE_DEC_LT=1` +
+`PLOW_GEMMA_MOE_DEC_GROUP=4` need a rung >= 4 to isolate. So the "compile only what C1 runs" arm
+has to drop the grouped route as well -- three knobs, one hypothesis (total compiled entry size),
+and it must be reported as one combined arm rather than attributed to any single knob. Queued as
+p26c1min; the two single-variable r1 arms in this round produced NO cells for this reason.
+
+### Agentic turn-by-turn FP8, first attempt: one real dataset, two harness defects
+
+Workload: 16 conversations x 8 turns, concurrency 4, 64 out tok/turn, 300-token observations, so a
+conversation's prompt grows 1.7 -> 20.1 kchar inside one logical session. `/v1/completions` with
+raw prompt text on both stacks, because plowrt refuses `tools` with a 400 by design
+(`serve/chat.rs:119`) and vLLM's BFCL dataset therefore cannot be apples to apples.
+
+**26B FP8 (p26fp8) ran clean, 128/128 turns:**
+
+| turn | prompt kchar | TTFT ms | p99 TTFT | TPOT ms |
+|---|---|---|---|---|
+| 1 | 1.7 | 47.57 | 242.42 | 35.06 |
+| 2 | 4.3 | 113.04 | 225.98 | 35.50 |
+| 4 | 9.6 | 128.81 | 240.77 | 36.42 |
+| 6 | 14.8 | 101.68 | 135.75 | 37.12 |
+| 8 | 20.1 | 107.19 | 222.34 | 36.20 |
+
+TTFT stays ~100-130 ms while the prompt grows 12x, which is the prefix cache doing its job (the
+serve log confirms `prefix_cache: true`). TPOT ~36 ms against the same model's 5.4 ms in bf16 is
+**~6.7x worse, not the ~5x previously recorded** -- grouped MoE decode is bf16-gated, so FP8 on the
+26B remains a capacity story, not a latency one.
+
+**12B FP8 (p12fp8) faulted on every request**, including the 8-token warmup:
+`device fault: cuStreamSynchronize: CUDA_ERROR_ILLEGAL_ADDRESS`. The client only reported "no
+tokens streamed" 128 times, so the fault existed only in the serve log -- the harness now smoke-
+tests one completion first and prints the serve-log fault. The same client drove the 26B cleanly,
+so this is the 12B FP8 path, not the workload. Both FP8 packets are from 09-23 14:2x and plowrt is
+from 19:04, i.e. newer than both, so staleness alone does not explain why only the 12B faults; a
+rebuild from the current tree discriminates packet/binary skew from a live defect, and
+`pf_plan_slice` (added this session) is the first suspect if the rebuild still faults.
+
+**Both vLLM arms died instantly**: `vllm: error: unrecognized arguments: --disable-log-requests`.
+vLLM 0.28 removed the flag. My bug, fixed.
