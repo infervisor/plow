@@ -5026,3 +5026,113 @@ rebuild from the current tree discriminates packet/binary skew from a live defec
 
 **Both vLLM arms died instantly**: `vllm: error: unrecognized arguments: --disable-log-requests`.
 vLLM 0.28 removed the flag. My bug, fixed.
+
+---
+
+## 26B C1 column: the decode deficit is 100% inside the megakernel (2026-09-24)
+
+Four measurements, all same-session paired, all on packet `p26lean` unless noted. Reference is the
+same-session vLLM 0.28 C1 ladder (`vllm_26b2.csv`).
+
+### 1. A runtime bug blocked every single-rung ladder (FIXED, commit 3fd3416a)
+
+`packed_terminal.rs` validated sampled token ids with `self.ids(self.host_rows.len())`, but
+`host_rows` is `[Vec<u32>; 2]` -- the double-buffered staging pair -- so `.len()` is the **array
+arity 2**, never the staged row count. `output_bytes` three lines above derives it correctly as
+`host_rows[i].len()`.
+
+* `capacity >= 2`: reads one u32 that was never copied back (a stale word in the pinned slab).
+  Latent spurious "compact terminal produced an invalid token".
+* `capacity == 1`: `capacity = e.batch` = max decode rung, so `host_ids` is 4 bytes and the slice
+  panics -- *range end index 8 out of range for slice of length 4* -- aborting the server on
+  request 1.
+
+It surfaced only as the campaign's generic "coherence gate did not pass", because the panic lands
+in the per-run `server.log`. Fixed; the ladder-"1" packet now serves a full C1 ladder.
+
+### 2. It is the WIDEST compiled rung that taxes the entry, not the rung count
+
+`PLOW_DECODE_BATCH_LADDER` `1,2,4` -> `1,4` (one fewer rung) is a **clean null**:
+
+    decode object  1,812,616 -> 1,820,552 B   (no shrink, marginally larger)
+    STACK 544 -> 544,   SHARED 8848 -> 8848   (identical)
+    TPOT  5.400/5.480/5.520/5.570/5.640       (identical to 3 dp, both arms)
+
+The earlier 5->3 cut paid off because it dropped rungs **8 and 16**. Rung 2 is an interior narrow
+rung; removing it changes no allocation. Do not count rungs when estimating this lever.
+
+### 3. The entry-size route is CLOSED: a 28% smaller object buys 0.05 ms
+
+Ladder `1` (+ `PLOW_EMIT_MOE_DEC_LT=0`, `PLOW_GEMMA_MOE_DEC_GROUP=0`, since `lib.rs:9568` needs a
+rung >= 4 to isolate the grouped GLU/DOWN pair), serve `PLOW_MOE_DEC_LT=0 PLOW_DECODE_MAX_RUNG=1`:
+
+    decode object 1,812,616 -> 1,296,776 B (-28%), STACK 544 -> 184, SHARED 8848 -> 3216
+
+| cell | 1-rung | lean (1,2,4) | delta | vLLM | win |
+|---|---|---|---|---|---|
+| 128/C1 | 5.360 | 5.400 | -0.040 | 5.030 | 2/4 |
+| 1024/C1 | 5.430 | 5.480 | -0.050 | 5.070 | 2/4 |
+| 4096/C1 | 5.470 | 5.520 | -0.050 | 5.080 | 1/4 |
+| 8192/C1 | 5.520 | 5.560 | -0.040 | 5.080 | 1/4 |
+| 15000/C1 | 5.590 | 5.650 | -0.060 | 5.070 | 1/4 |
+
+0.05 ms against the **0.33** needed at 128/C1. Closed. (3-variable arm, but immaterial at this
+magnitude.)
+
+### 4. PLOW_STEP_TIME: the step is device-bound, host cost is already hidden
+
+Per-step means, stable over 512 steps (`log_every(128)`, gpu.rs:6829):
+
+    dev_interp_ms   = 5.362      <- the megakernel
+    sync_wait_ms    = 5.3637     <- host just blocks on it
+    submit_us       = 35.7       = 0.036 ms
+    dev_upload_us   = 20.7       = 0.021 ms
+    dev_download_us =  7.4       = 0.0074 ms
+    gap_us          = 705.6      <- NOT per-step serial
+
+Measured TPOT 5.400 vs `dev_interp` 5.362 => **~0.04 ms of exposed non-kernel time**.
+
+The 0.706 ms `gap` is a probe artifact, not a serving cost. Per `gpu.rs:6813-6826`, `gap_ns` is host
+time *outside* `step_slots` between steps, and the probe pays one large inter-request interval
+(curl + python + prefill) per 128 steps, so the mean is `(G + 127g)/128` -- constant in request
+count, which is exactly why all four cumulative lines read 0.702-0.706. With G ~ 80 ms, per-step
+g ~ 0.08 ms. Were all 0.706 serial, TPOT would be ~6.1 ms; it is 5.40.
+
+**This refutes the CUDA-graph / launch-overhead route.** The megakernel alone (5.362) already
+exceeds vLLM's entire TPOT (5.030); removing every host cost buys at most 0.04 of the 0.33 needed.
+
+### Why the kernel is slow, and the one route left
+
+7.64 GB/step at 5.362 ms = **1425 GB/s, ~45% of the 3352 roof** (vLLM 1519, also ~45%). A B=1 GEMV
+streams each weight exactly once, so at half roof this is latency-bound on memory parallelism --
+too few loads in flight -- not an HBM wall. That is the same constraint the reverted pre-issue
+experiment hit, whose SASS verdict was: raising loads in flight needs the arm OUT of the
+255-register megakernel, not a bigger DP ([[megakernel-array-loop-regression]]).
+
+So the two prior nulls must be re-read: role-segmenting decode was measured **alone** (null), and
+deeper pre-issue was measured **alone** (null, register-capped). The mechanism needs *both* --
+segment the expert arm out so it has its own register budget, then deepen pre-issue inside it.
+
+Not a knob flip: `emit.gemv_decode_role` (`PLOW_GEMV_DECODE_ROLE`) is gated on
+`capabilities.dense_packet_contracts` (`lib.rs:7983`), and `emit.decode_grouped_moe_segments`
+(`PLOW_SEG_DECODE_GROUPED_MOE`) only touches the grouped route, which is inactive at B=1
+(`PLOW_MOE_DEC_LT=4` needs rung >= 4). Segmenting the B=1 expert arm is new emit work.
+
+### Column verdict
+
+| cell | TTFT | TPOT | p99 ITL | tok/s | still needs |
+|---|---|---|---|---|---|
+| 128/C1 | win 20.8/38.0 | lose 5.360/5.030 | win 5.42/5.75 | lose 182/189 | TPOT -0.33 |
+| 1024/C1 | win 37.7/41.9 | lose 5.430/5.070 | win 5.48/5.83 | lose 176/187 | TPOT -0.36 |
+| 4096/C1 | lose 102.3/93.4 | lose | win | lose | + TTFT -8.9 |
+| 8192/C1 | lose 208.6/179.6 | lose | win | lose | + TTFT -29.0 |
+| 15000/C1 | lose 423.4/352.2 | lose | win | lose | + TTFT -71.2 |
+
+p99 ITL is won at all five cells -- plow's decode is steadier (5.360 mean -> 5.42 p99) than vLLM's
+(5.030 -> 5.75). TPOT is the sole blocker at 128 and 1024; the other three additionally need the
+prefill workstream (#66). TPOT at C1 is **not** KV traversal: 117x the KV (128 -> 15000) costs only
++0.23 ms, so it is a fixed per-step cost, and per (4) that cost is the kernel itself.
+
+**The column does not reach 4/4 without a ~6.2% MoE decode kernel win.** Every in-kernel route
+tried so far is closed by the 255-register cap; the segment-then-deepen combination is the one
+untested mechanism.
