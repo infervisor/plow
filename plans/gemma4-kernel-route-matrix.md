@@ -120,5 +120,17 @@ still open -- but note it only matters for shapes where native is the chosen rou
    occupancy defect is real but it sits on shapes that should be going to cuBLASLt anyway, so it
    is NOT the lever it first looked like.
 3. MoE routed-expert GEMMs (26B) and `lm_head` are not in the matrix at all. On an MoE model the
-   expert GEMMs are the bulk of the FFN work, so this is the largest remaining blind spot.
+   expert GEMMs are the bulk of the FFN work, so this is the largest remaining blind spot, and it
+   is bigger than it looks: `dispatch_audit.ops` covers ONLY `Gemm`/`Gemv`/`GemvGlu`/`GemvQkv`
+   (81/18/3/3 rows) -- **no MoE op is audited at all**, so the routed-expert path has no M/N/K, no
+   tile, no occupancy and no tuner row anywhere. It is untuned, unaudited and unmeasured.
+
+   The dense `n=2112` shape in the matrix is the DENSE intermediate (config `intermediate_size`),
+   not the experts: routed experts are `moe_intermediate_size` 704, i.e. gate/up 2816->704 and
+   down 704->2816 per expert, top-k of 128. Those never appear.
+
+   For MoE the route question is answered at the packet level, not by a microbench: the knobs
+   already exist (`PLOW_EMIT_MOE_PF_LT` / `PLOW_MOE_PF_LT`, `PLOW_MOE_DEC_LT`), so it is a
+   two-packet A/B with grouped-Lt on vs off, same session. Note grouped MoE decode is bf16-gated
+   (task #62), so the FP8 arm of that A/B is blocked until that gate is relaxed.
 4. DONE: route matrix re-run on this branch's binaries (see the table above).
