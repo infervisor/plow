@@ -4852,3 +4852,34 @@ control plus TPOT 11.31 from lean still loses TPOT (needs 11.04, i.e. -0.70; the
 **So the entry lever has a shape constraint**: it pays when the dropped rungs are ones the
 column does not use (C1 never needs 8 or 16; C4 never needs 8 or 16) and costs when they are
 (C16 uses 2 and 8 constantly during ramp/tail).
+
+## The 15104 rung WEDGES at run time — #45's blocker confirmed, and my checker was wrong
+
+Attempt: a 15104 rung (= 118*128) so a 15000-token prompt (15001 rows with BOS) runs in ONE
+launch instead of padding to 16384 across two. The arithmetic was sound — ~1280 fewer rows
+(~51 ms at 0.0398 ms/row) plus one saved ~5.2 ms launch, against an 18.7 ms TTFT deficit — and
+the ring was UNCHANGED at next_pow2(1024+15104-1) = 16384, so it cost no extra sliding KV.
+
+Two build-time facts learned:
+* `plowc` enforces `PLOW_MAX_REQUEST_CHUNK <= PLOW_MAX_CHUNK` (lib.rs:3078), and MAX_CHUNK must
+  stay a power of two — so request_chunk 15104 forces MAX_CHUNK 8192 -> 16384. That grows chunk
+  activations but NOT the KV ring.
+* `campaign.py build` refuses a non-empty out dir ("reproducible only into a fresh dir"), so a
+  failed attempt must be cleared before retrying.
+
+**Result: the packet built, and then WEDGED on the 15000 cell.** 128/1024/4096/8192 completed
+normally (and held their 4/4 — TTFT 18.15/45.96/170.03/347.44, TPOT 10.44/10.50/10.54/10.57),
+then the 15000 cell produced no row for ~60 min while holding the GPU lease; a `gpulease` probe
+queued behind it. That is exactly the #51 / #45 signature.
+
+**My pre-bench check was the WRONG diagnostic.** I verified every rung had a complete
+`dispatch_table` role set (all 13 rungs, 2/2 roles, including 15104) and concluded "SAFE to
+bench". It wedged anyway. So `dispatch_table` completeness does NOT certify a rung shape —
+whatever the Gemm segmentation defect is, it is not visible there. A real pre-flight check for
+this still does not exist, which is the actual content of #45's "BLOCKED".
+
+**Recipe deleted, not shipped.** 15000/C1 stays 1/4. Cost of the lesson: one wedged lease,
+killed with TaskStop; GPU confirmed free afterwards (0% util, 0 MiB, no plowrt process).
+
+Note the cell was never winnable in one shot anyway: TPOT at 15000 is 10.65 vs vLLM 10.65, an
+exact tie, and the scorer requires strictly less.
