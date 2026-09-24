@@ -449,11 +449,6 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
 #ifndef PLOW_MOE_DOWN_SG
 #define PLOW_MOE_DOWN_SG 4u
 #endif
-/* Weight vectors pre-issued per lane in the lane-split DOWN arm. 2 reproduces the original
- * pairing byte-for-byte; the sm_90a build raises it. */
-#ifndef PLOW_MOE_DOWN_PRE
-#define PLOW_MOE_DOWN_PRE 2u
-#endif
 /* Staging fu in the arena MEASURED SLOWER (7.183 vs 7.060 ms): the extra __syncthreads on
  * every MoE-down op (30 per token) costs more than the redundant fu reads it removes, which
  * were L1 hits anyway (fu is 11 KiB). Kept behind the flag as a recorded negative. */
@@ -1327,30 +1322,28 @@ static __device__ void d_moe_expert_down_gemma(float* __restrict__ part, const b
             }
             float acc = 0.0f;
             if (live) {
-                /* PLOW_MOE_DOWN_PRE weight vectors in flight per lane. The DOWN arm's K is
-                 * short -- I_moe=704 gives nch=11 chunks of LCH=64 -- so the depth-2 pairing
-                 * this replaced left only 2 loads in flight, against the ~8 the H100 needs at
-                 * 1 block/SM (runtime/nvidia/experiments/hbm_ceiling_h100.cu: a pure read goes
-                 * 1222 -> 2490 GB/s as in-flight loads go 1 -> 8). The GLU arm alongside it
-                 * already runs GV_UNROLL_GLU=10, which is why DOWN was the slowest GEMV in the
-                 * step. acc still walks c ascending at every depth, so the FMA order -- and
-                 * therefore the output -- is unchanged; DP=2 is bit-identical to the pairing.
-                 * xr is the 1.4 KiB fu slot and stays an inline L1 read: pre-issuing it would
-                 * spend registers on latency that is not there. */
-                constexpr unsigned DP = PLOW_MOE_DOWN_PRE;
-                for (unsigned c = 0; c < nch; c += DP) {
-                    bf16v8 wv[DP];
-                    unsigned kk[DP];
-#pragma unroll
-                    for (unsigned i = 0; i < DP; i++) {
-                        kk[i] = (c + i) * LCH + sl * 8u;
-                        wv[i] = (c + i < nch) ? ld_glob8(wr + kk[i]) : bf16v8_zero();
-                    }
-#pragma unroll
-                    for (unsigned i = 0; i < DP; i++) {
-                        if (c + i >= nch) continue;
-                        acc = dot8(wv[i], ld_glob8(xr + kk[i]), acc);
-                    }
+                unsigned c = 0;
+                /* 2 chunks pre-issued. DEEPENING THIS IS A MEASURED NEGATIVE (2026-09-24,
+                 * 26B C1, H100). Making the depth a knob over `bf16v8 wv[DP]` + `kk[DP]` with
+                 * (c+i<nch) predication is arithmetically IDENTICAL at DP=2 -- same chunks in
+                 * ascending c, same acc chain -- and still cost +0.37 ms TPOT at all five C1
+                 * cells (5.400 -> 5.770 at 128 in; TTFT unchanged, so not drift). At DP=8 it
+                 * recovered only 0.01-0.03 of that. SASS says why: LD.E.128 went 2156 -> 2162
+                 * (+6) and the loads-in-flight histogram did not move, while LOP3.LUT +368 and
+                 * S2R +326 appeared -- at REG:255/LOCAL:0 the compiler rematerialises the
+                 * addresses instead of keeping 8 vectors live, so written depth never becomes
+                 * loads in flight. Keep the explicit two-pointer form. Raising loads in flight
+                 * here needs the arm OUT of the 255-register megakernel, not a bigger DP. */
+                for (; c + 2u <= nch; c += 2u) {
+                    const unsigned k0 = c * LCH + sl * 8u, k1 = (c + 1u) * LCH + sl * 8u;
+                    const bf16v8 w0 = ld_glob8(wr + k0), w1 = ld_glob8(wr + k1);
+                    const bf16v8 x0 = ld_glob8(xr + k0), x1 = ld_glob8(xr + k1);
+                    acc = dot8(w0, x0, acc);
+                    acc = dot8(w1, x1, acc);
+                }
+                for (; c < nch; c++) {
+                    const unsigned k0 = c * LCH + sl * 8u;
+                    acc = dot8(ld_glob8(wr + k0), ld_glob8(xr + k0), acc);
                 }
             }
 #pragma unroll

@@ -989,11 +989,6 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
 /// * `moe_down_sg = 8` — the Gemma decode expert-down lane split. Measured on h100-sxm5
 ///   (step_bench, ms at B=1/4/16): sg4 5.905 / 11.034 / 26.786, sg8 5.833 / 10.648 / 26.387. The
 ///   arm needs `I_moe % (32 / sg * 8) == 0` and silently falls back otherwise, hence the guard.
-/// * `moe_down_pre` — weight vectors pre-issued per lane in that same expert-down arm, from
-///   `PLOW_TUNE_MOE_DOWN_PRE`. Only written when the env asks for a value other than the
-///   kernel's 2, so every other sm_90a packet keeps its pairing hash. The arm's K is short
-///   (`I_moe / (32 / sg * 8)` chunks) and depth 2 left 2 loads in flight per lane against the
-///   ~8 this board needs at 1 block/SM, while the GLU arm beside it runs 10.
 fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     let mut t = Map::new();
     t.insert("gv_mm_max".into(), json!(next_pow2(s.decode_batch.max(1))));
@@ -1024,13 +1019,6 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     let sm90a = arch == "sm_90a";
     if sm90a && s.moe_down_inter > 0 && s.moe_down_inter % 32 == 0 {
         t.insert("moe_down_sg".into(), json!(8));
-        if let Some(v) = std::env::var("PLOW_TUNE_MOE_DOWN_PRE")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|v| *v >= 1 && *v != 2)
-        {
-            t.insert("moe_down_pre".into(), json!(v));
-        }
     }
     // The decode object compiles the grouped MoE arm (and claims its ring) only for a packet
     // whose decode program asks for it.
@@ -2749,13 +2737,6 @@ pub fn config_header(manifest: &Value) -> String {
             if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
                 out.push_str(&format!(
                     "#ifndef PLOW_MOE_DOWN_SG\n#define PLOW_MOE_DOWN_SG {v}u\n#endif\n"
-                ));
-            }
-        }
-        if let Some(v) = t.get("moe_down_pre").and_then(Value::as_u64) {
-            if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
-                out.push_str(&format!(
-                    "#ifndef PLOW_MOE_DOWN_PRE\n#define PLOW_MOE_DOWN_PRE {v}u\n#endif\n"
                 ));
             }
         }
