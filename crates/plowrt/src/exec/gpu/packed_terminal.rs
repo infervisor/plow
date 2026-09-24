@@ -354,7 +354,7 @@ impl PackedTerminal {
             return Err(error);
         }
         if self
-            .ids(self.host_rows.len())
+            .ids(self.host_rows[i].len())
             .iter()
             .any(|&id| id as usize >= e.vocab)
         {
