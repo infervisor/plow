@@ -5646,3 +5646,49 @@ normalized instruction lists across rungs with `blocks` zeroed, so the merged op
 identically on EVERY compiled rung or the runtime silently falls back to widest-only execution.
 And at `REG:255 LOCAL:0` a fusion that widens the surviving op can still lose
 ([[megakernel-array-loop-regression]]): measure single-variable, gate on SASS.
+
+### The 8.6 us/live-op model is NOT yet validated — and there is prior evidence against it
+
+Before building any fusion on it, two facts from the tree that bear directly on it:
+
+**1. The three-HeadNormRope fold ALREADY EXISTS and measured a null.** `lib.rs:5016` (`PLOW_FUSE_HNR`,
+off by default) folds all three hnr packets into `d_flash_decode`'s NRF arm. Its recorded result,
+Gemma-4-12B fp8 occ4, 48 steps x 3 interleaved reps, token-identical serve:
+
+    coarse deps onto q/k/v : 11.36 -> 11.99  (agent-scope fence per owner item)
+                             11.36 -> 11.40  (the workgroup release actually required)
+    FINE per-head deps     : 11.33 -> 11.37  (+0.3%)
+
+with the stated reason: *"The deleted chain level was already almost fully OVERLAPPED: the hnr
+packets' fine producer maps let them start before the slowest gemv workgroup, so their wall-clock
+cost was ~the post-producer tail, **not a 10 us gate**."*
+
+**That is direct evidence against ~8.6 us per live op — but only where FINE deps exist.** The arm
+is gated `&& amd && fp8 && !fuse_qkv_fp8`, so it was never measured on this NVIDIA bf16 packet.
+
+**2. This packet has NO fine deps at all.** `graphstat` reports `SE_FINE = 0` and
+`counters == ops == 551` on every program. The cause is `hn_dep` (`lib.rs:4985`):
+
+    if !gemv_family || fuse_qkv || fuse_qkv_fp8 { return vec![Dep::Coarse(gemv)]; }
+
+and our decode program emits the FUSED `PLOW_DOP_GEMV_QKV` (25 of them), so every hnr dep falls
+back to coarse. The source argues this is fine — *"the fused op is one uniform packet, so all
+workgroups finish together and coarse costs ~nothing"* — which is an ASSUMPTION about the fused
+GEMV's block skew, not a measurement on this packet.
+
+So the two readings are not yet distinguishable:
+
+* **A**: coarse gates on a uniform producer really are ~free, the remainder is genuine per-op
+  execution, and op merging buys little (consistent with the AMD fold null).
+* **B**: coarse gates on this packet cost ~8.6 us because nothing here is fine-grained, and the
+  AMD null does not transfer (consistent with `F` = 4.73 ms over 551 coarse-gated ops).
+
+**THE DECIDING EXPERIMENT (cheap, do this first, before any fusion):** inject N duplicate LIVE
+coarse-gated ops into the B=1 program and measure the slope. Reading B predicts `+N x 8.6 us`;
+reading A predicts ~0. A live injection needs a consumer that waits on the new counter — chain the
+duplicate between an existing producer and its consumer so the op count rises with semantics
+unchanged. 30 injected ops separate the two readings by 0.26 ms, i.e. ~50 sigma at the measured
+0.005 ms floor.
+
+Do NOT build the k+v hnr merge, the router fusion, or task #79 until that slope is known. Three
+routes were closed today by measuring first; this one is the same shape.
