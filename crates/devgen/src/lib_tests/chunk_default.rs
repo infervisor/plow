@@ -1,4 +1,4 @@
-use super::{default_chunk, kv_ring, kv_ring_rows, MAX_CHUNK_MAX};
+use super::{default_chunk, kv_ring, kv_ring_rows, DEFAULT_CHUNK_MAX};
 
 /// An all-global model (`window == 0`) must keep the full chunk. `kv_ring`
 /// returns `(ctx, MASK_NONE)` for full layers, so a smaller chunk buys no
@@ -6,9 +6,9 @@ use super::{default_chunk, kv_ring, kv_ring_rows, MAX_CHUNK_MAX};
 /// must not leak onto Llama-shaped networks.
 #[test]
 fn all_global_models_keep_the_full_chunk() {
-    assert_eq!(default_chunk(0), MAX_CHUNK_MAX);
+    assert_eq!(default_chunk(0), DEFAULT_CHUNK_MAX);
     // and the chunk genuinely does not size a full layer's cache
-    let (rows_big, mask) = kv_ring(true, 8192, 0, MAX_CHUNK_MAX);
+    let (rows_big, mask) = kv_ring(true, 8192, 0, DEFAULT_CHUNK_MAX);
     let (rows_small, _) = kv_ring(true, 8192, 0, 1024);
     assert_eq!(rows_big, rows_small, "chunk must not change a full layer");
     assert_eq!(mask, super::KV_MASK_NONE);
@@ -23,7 +23,7 @@ fn windowed_models_derive_chunk_from_window() {
     assert_eq!(default_chunk(768), 1024); // rounded up to a power of two
                                           // never below the bucket floor, never above the ladder top
     assert_eq!(default_chunk(1), super::MAX_CHUNK_MIN);
-    assert_eq!(default_chunk(1 << 20), MAX_CHUNK_MAX);
+    assert_eq!(default_chunk(1 << 20), DEFAULT_CHUNK_MAX);
 }
 
 /// The wrap invariant must hold for every window the default picks —

@@ -1,6 +1,7 @@
 //! §K Profiling & telemetry — per-SM/per-task timing + aggregate metrics.
 
 pub mod dstep;
+pub mod host;
 pub mod pfx;
 pub mod serving;
 pub mod tick;

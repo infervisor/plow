@@ -11,13 +11,22 @@ now code and tests. Where the two disagree, the disagreement is called out here.
 
 ## Contents
 
-Runtime selection defaults on. `--token-batch=false` or `PLOW_TOKEN_BATCH=0` disables it;
-explicit `--fusion` takes precedence. Selection still requires a gfx942 dense program with
-direct BF16 KV, matching object markers, multiple slots, and an attention epilogue compatible
-with the packet: fused output for `nsplit=1`, or contiguous partials followed by `FlashMerge` for
-`nsplit>1`. BF16 and FP8 weights are armed; FP8 KV is not. Tensor parallelism and unsupported
-programs use ordinary execution. The ring-aware snapshot prefix cache composes with this route.
-CUDA has no token-batch executor yet, so the default does not enable token batching on H100.
+Runtime selection defaults on (`PLOW_TOKEN_BATCH`, `RuntimeConfig::token_batch`, default
+**true**). `--token-batch=false` or `PLOW_TOKEN_BATCH=0` disables it; explicit `--fusion` takes
+precedence. There are **two** executors, with two different gates:
+
+* **AMD (gfx942 dense GQA)** — a dense program with direct BF16 KV, matching object markers,
+  multiple slots, and an attention epilogue compatible with the packet: fused output for
+  `nsplit=1`, or contiguous partials followed by `FlashMerge` for `nsplit>1`. BF16 and FP8
+  weights are armed; FP8 KV is not.
+* **CUDA (`crates/plowrt/src/exec/gpu/token_batch.rs`, `CudaTokenBatch::load`)** — armed when
+  `token_batch && !fusion`, compute capability is exactly **(9, 0)** (H100/sm_90a), the packet
+  carries packed-prefill metadata and a packed terminal, and the engine has no recurrent state
+  and no mixed step. `GpuEngine::token_batch_step` and `token_batch_step_pipelined` are its
+  entry points. **The default therefore does enable token batching on H100.**
+
+Tensor parallelism and unsupported programs use ordinary execution. The ring-aware snapshot
+prefix cache composes with this route.
 
 Startup logs distinguish object `armed` from executor `ready` and always report `fires=false`.
 The first successful device dispatch reports `fires=true`. These capability and lifecycle
@@ -29,7 +38,8 @@ their cross-references were the only thing tying them.
 * **Part I** (below) — the shared foundation: contract, planner, ABI, `RowGather`, CPU tail.
 * **Part II** — the gfx942 dense-GQA device route: what it is, its gates, its refusals, and
   the GEMM tile that decided its long-prompt behaviour.
-* **Part III** — the row-identity classification of all 154 opcodes, and what it says about
+* **Part III** — the row-identity classification of the device ISA (taken at 154 opcodes; it is
+  now 184), and what it says about
   runtime fusion v1.
 
 Each part keeps its own section numbering, so a reference like "Part II §4" resolves.
@@ -56,7 +66,7 @@ token to a request that asked for none.
 
 `crates/plow-asset/src/mixed_step.rs` already carries a backend-neutral mixed decode/prefill
 plan. The token batch is a second, versioned contract beside it, not a replacement — the mixed
-v1 route (`PLOW_FUSION`, `exec/amd_mixed_step.rs`, `exec/mixed_program.rs`) is untouched and
+v1 route (`PLOW_FUSION`, `exec/amd/mixed_step.rs`, `exec/mixed_program.rs`) is untouched and
 keeps its protocol until measurement replaces it per `(backend, family)` pair.
 
 Two differences are load-bearing.
@@ -364,7 +374,9 @@ Concretely, against the object it replaces:
 | Row counts | compiled capacity, or the decode prefix `spans[0].row0` | the descriptor's live `real_rows` |
 | Row `0` | must be a decode row — the resolver **traps** if `spans[0].row0 == 0` | spans cover exactly `[0, M)`; pure prefill and pure decode are both legal |
 
-The axis is `PLOW_TOKEN_BATCH`, default `0`. Every shipped object is unchanged; see §6.
+The axis is `PLOW_TOKEN_BATCH`. The build-time `-DPLOW_TOKEN_BATCH=1` define is set on the
+`interp_tokbatch` object row; the **runtime** knob of the same name defaults **on**
+(`RuntimeConfig::token_batch`). Every shipped object is unchanged; see §6.
 
 ---
 
@@ -598,7 +610,7 @@ Everything the route cannot execute is refused with the capability named. Nothin
 the op headers, because `#if UNDEFINED` is `0` and a guard written before the axis macros resolve
 reads as satisfied and proves nothing. FP8-weight objects advertise a separate marker.
 
-**At load** (`crates/plowrt/src/exec/amd_token_batch.rs`), from `.symtab`, before the object
+**At load** (`crates/plowrt/src/exec/amd/token_batch.rs`), from `.symtab`, before the object
 reaches a device:
 
 | Marker | Claim |
@@ -640,9 +652,10 @@ campaigns on this branch measured "no effect" from something that never fired.
      no `lm_head`; `eagle3` is `model_type: llama` but is a `midlayer` draft head. Neither is a
      standalone LM. Gemma-4 was **not** substituted — it is Phase 3 by the plan's own table.
      Everything above is synthetic shapes plus a CPU f64 reference, and is labelled as such.
-  2. **The planner still emits a decode band.** `plow_asset::mixed_step::plan_into` produces
-     spans starting at `decode_rows`; §4.4 wants spans covering `[0, M)`. That is Phase 1a and is
-     refused by name rather than worked around.
+  2. ~~**The planner still emits a decode band.**~~ **Closed.** `plan_into` still produces the
+     `SpanCover::DecodeBand` cover of mixed step v1, but `plow_asset::mixed_step::plan_into_cover`
+     with `SpanCover::PrefixFree` produces spans covering exactly `[0, real_rows)`, with decode
+     requests as spans of length one and sampled rows named by `Plan::sample_input_rows`.
 * **The emitter still does not emit the body.** See §9.
 * **The output segment (§6) is not here.** `RowGather`, the compact tail and the sample-row
   contract are Phase 1c.
@@ -697,13 +710,13 @@ The seam, for whoever picks it up:
 | File | Role |
 |---|---|
 | `runtime/amd/token_batch.h` | descriptor adapter, row resolver, span-table validation, attention partition |
-| `runtime/amd/op_attention.h` | `d_flash_prefill<…, TB>` flat per-span schedule; `d_flash_decode<…, TB>` span slot/length |
+| `runtime/amd/op_attention_common.h` (via the `op_attention.h` arch selector) | `d_flash_prefill<…, TB>` flat per-span schedule; `d_flash_decode<…, TB>` span slot/length |
 | `runtime/amd/op_norm.h` | `d_headnorm_rope` span-addressed KV write (the second class-C site) |
 | `runtime/amd/interp.hip` | `PLOW_TOKEN_BATCH` dispatch, combined-M projections, markers, refusals, kernel symbol |
-| `runtime/tests/token_batch_dense_gfx942_test.hip` | the seven gates |
+| `runtime/tests/token_batch_dense_gfx942_test.hip` | the device gates (§5: 31 gates, 31 passing) |
 | `scripts/token_batch_dense_test.sh` | build + lease + run |
 | `scripts/build_gfx942.sh` | `interp_tokbatch` row and its object contract |
-| `crates/plowrt/src/exec/amd_token_batch.rs` | load/admission capability gate, armed-vs-fires log |
+| `crates/plowrt/src/exec/amd/token_batch.rs` | load/admission capability gate, armed-vs-fires log |
 
 ---
 
@@ -712,9 +725,17 @@ The seam, for whoever picks it up:
 *Folded in from `docs/arch/17-unified-token-batch.md (Part III)`. Section numbers below are this part's own.*
 Packing rows from several requests into one activation matrix is safe for an
 operator exactly when the operator cannot confuse one request's rows for
-another's. This document is the answer to that question for all 154 opcodes of
-the device ISA, reproduced from the tool rather than written by hand, plus what
-the classification says about the fusion that ships today.
+another's. This document is the answer to that question for the device ISA,
+reproduced from the tool rather than written by hand, plus what the
+classification says about the fusion that ships today.
+
+> **The tables below were taken when the ISA was 154 opcodes.** `DevOp::COUNT`
+> is now **184** (`crates/packet/src/dev.rs`), so the counts no longer sum to the
+> ISA and the ~30 opcodes added since — `PerLayerInput`, `MoeAiterFp8Pf`,
+> `IndexTpPf`, `GemmLtPf`, `GemmBlkPf`, `XAllToAllHeads`, the affine-Q4 trio, the
+> speech/vision ops, `LayerNormF32` and the DCP ops — are unclassified here.
+> **Re-run `plowrt op-audit --table` rather than trusting these numbers.** The
+> per-class reasoning below is still the method; only the totals are as-of.
 
 It implements Phase 1d of `plans/unified-token-batch.md` and carries that plan's
 §3 table. Where this document and the plan disagree, the disagreements are listed
@@ -780,7 +801,7 @@ Dispositions: `ready` and `descriptor-fills` are packable; `use-row-form`,
 
 ## 3. The ISA, as the tool reports it
 
-`plowrt op-audit --table`, 154 opcodes:
+`plowrt op-audit --table`, as of 154 opcodes (see the note above — the ISA is now 184):
 
 | | count |
 |---|---|
@@ -984,7 +1005,7 @@ says there is none.
 
 §3's class-C row says "`IndexScore` (`s <= q_pos0 + t`)", and §11 repeats it.
 `IndexScore` is op **58**, the decode indexer, and `d_index_score`
-(`runtime/amd/op_attention.h:4558`) reads `kv_len[b]` — a per-row array indexed
+(`runtime/amd/op_attention_common.h`) reads `kv_len[b]` — a per-row array indexed
 by the batch row:
 
 ```c
@@ -993,7 +1014,7 @@ for (unsigned b = 0; b < n_batch; b++) {
 ```
 
 Op 58 is **class B**. The `s <= q_pos0 + t` derivation is in `IndexScorePf`, op
-**117**, its prefill twin (`op_attention.h:5173-5174`):
+**117**, its prefill twin (`runtime/amd/op_attention_common.h`):
 
 ```c
 const unsigned len = (unsigned)as_glob(kv_len)[0];
@@ -1016,7 +1037,7 @@ const unsigned len = (unsigned)kv_len[b];       // PER-ROW
 const unsigned q_pos0 = len - n_tok;            // n_tok is a packet IMMEDIATE
 ```
 
-(`op_attention.h:2877-2878` and `:3625-3626`.) `kv_len` is already a per-request
+(Both in `runtime/amd/op_attention_common.h`.) `kv_len` is already a per-request
 array. What is shared is `n_tok`, the chunk length. So MLA prefill *can* carry
 several requests today — it just requires every one of them to contribute the
 same number of query rows, ending at its own `kv_len[b]`. Under ragged packing it
@@ -1113,7 +1134,7 @@ spec is wrong and records that it did.
 ## 7. The verdict on runtime fusion v1
 
 "Mixed step v1" is the AMD runtime fusion behind `--fusion` / `PLOW_FUSION`
-(default **false**, one consumer: `crates/plowrt/src/exec/amd.rs:11215`). It
+(default **false**). It
 synthesizes a packed program at model load by rewriting the blob's ordinary
 prefill program (`exec/mixed_program.rs`), binds it to a separately-built code
 object (`interp_mixed_gq.elf`), and runs one step that carries the decode batch
@@ -1210,17 +1231,20 @@ The object-swap hypothesis — that arming fusion makes the server run a
 differently-built decode object (`GM_BM=64 GM_BN=128`, 4 waves) on every tick —
 does not survive reading the exec path:
 
-- `RuntimeConfig::fusion` has exactly **one** consumer in the whole runtime,
-  `exec/amd.rs:11215`.
+- `RuntimeConfig::fusion` gates only *whether the mixed step is built and taken*
+  (`exec/amd.rs` mixed-step construction; the other readers are the CUDA
+  token-batch and packed-prefix gates in `exec/gpu.rs` / `exec/gpu/token_batch.rs`,
+  the shared-prefix layout gate, `serve/engine.rs`, and two log lines). **None of
+  them selects a decode object.**
 - `GM_BM` / `GM_BN` / `PLOW_WG_WAVES` are `-D` defines of the asset build
   (`scripts/build_gfx942.sh`). No Rust code reads or sets them; the only mentions
   in `crates/` are `kernelcaps`' target descriptions and comments.
-- Decode-object selection is `exec/amd.rs:3187`'s
+- Decode-object selection is `exec/amd/object.rs`'s
   `object_name(phase, variant, arm, sched)`. Fusion is not one of its inputs.
 - The mixed object is a separate HSA module with its own kernel symbol
   (`plow_interp_mixed_{arch}_gq`), launched from exactly one site,
-  `amd_mixed_step.rs:433`, inside `AmdEngine::mixed_step` — which requires both a
-  non-empty decode set and a non-empty prefill set (`amd_mixed_step.rs:356-357`)
+  `exec/amd/mixed_step.rs`, inside `AmdEngine::mixed_step` — which requires both a
+  non-empty decode set and a non-empty prefill set (`exec/amd/mixed_step.rs`)
   and therefore cannot run at concurrency 1.
 - `interp_mixed_gq.elf` is built unconditionally and ships either way
   (`build_gfx942.sh:1045`); fusion only decides whether it is *loaded*.
@@ -1256,7 +1280,7 @@ Two honest caveats: (1) this accounts for one extra full pass per request, which
 at 128-token prompts and typical output lengths is order 1%, not obviously all of
 2.9-5.5%; (2) the standing costs of arming are real too — a second HSA executable
 resident on the agent, and a private device copy of `in.ids`/`in.pos`/`in.kvlen`
-plus widened `act.*` scratch and per-program buffers (`amd_mixed_step.rs:150-191`).
+plus widened `act.*` scratch and per-program buffers (`exec/amd/mixed_step.rs`).
 The cheap experiment that would settle the remainder is a one-line one: arm
 fusion with the `split_terminal_prefill` call disabled and re-run the
 concurrency-1 cell. Until someone does, "the object swap" should not be repeated
@@ -1283,7 +1307,7 @@ Reasons, in order of weight:
    one-span restriction, and the descriptor generalizes v1's compile-time
    `PLOW_MIXED_STEP` row resolver. What does *not* carry over is
    `mixed_program.rs`'s 500-line load-time program rewriter and
-   `amd_mixed_step.rs`'s ~30 structural checks — the Phase-2 route emits its
+   `exec/amd/mixed_step.rs`'s ~30 structural checks — the Phase-2 route emits its
    variants from the emitter (plan §8 Phase 2) rather than synthesizing them from
    a blob, so that code is deleted rather than ported. The device side that stays
    is `runtime/common/mixed_step.h`'s row resolver, which §4.3 already plans to

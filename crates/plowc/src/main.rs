@@ -1928,6 +1928,9 @@ fn build_cubin_from_manifest(
     if let Some(option) = packed_prefill_cubin_option(&man) {
         args.push(option.into());
     }
+    if routed_decode_required(&man) {
+        args.push("-DPLOW_CUBIN_ROUTED_DECODE=ON".into());
+    }
     if segmented || manifest_requires_segmented_prefill(&man) {
         args.push("-DPLOW_SM120_CUBIN_SEG=ON".into());
     }
@@ -2000,6 +2003,13 @@ fn packed_prefill_cubin_option(manifest: &serde_json::Value) -> Option<&'static 
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
         .then_some("-DPLOW_CUBIN_PACKED_PREFILL=ON")
+}
+
+fn routed_decode_required(manifest: &serde_json::Value) -> bool {
+    manifest
+        .pointer("/objects/routed_decode/required")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn manifest_requires_segmented_prefill(manifest: &serde_json::Value) -> bool {

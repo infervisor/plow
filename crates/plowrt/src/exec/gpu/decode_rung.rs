@@ -5,6 +5,9 @@ pub(super) struct DecodeRung {
     pub(super) host_insts: Vec<DevInst64>,
     pub(super) library: Option<super::cublaslt::CublasLtDecodeGraph>,
     pub(super) rows: usize,
+    /// This rung runs the grouped-MoE arm (align rows >= its threshold), so its launch needs the
+    /// object's full arena; the other rungs launch with `plow_arena_bytes_narrow`.
+    pub(super) group_arena: bool,
     pub(super) object: Option<Arc<BoundDecodeObject>>,
     pub(super) kernarg: DevProgram,
     pub(super) counters: DeviceMem,
@@ -100,6 +103,23 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
         Ok(())
     })
     .map_err(RuntimeError::Rejected)?;
+    validate_decode_ladder_impl(blob, true)
+}
+
+/// A ladder whose grouped-arm rungs declare `MOE_DECODE_CUBLASLT` segments. Every rung is
+/// served on its own (routed, or run as one merged window), so unlike the dense library ladder
+/// the rungs' dependencies may differ: a rung below the grouped threshold does not wait on the
+/// align op.
+pub(super) fn validate_moe_lt_ladder(blob: &DevBlob, metadata: &SegmentRoles) -> Result<bool> {
+    let start = blob.progs.len() - blob.decode_progs().len();
+    for (index, program) in blob.progs.iter().enumerate().skip(start) {
+        match metadata.program(index) {
+            Some(roles) => {
+                moe_lt::decode_segments(program, &blob.tensors, &roles.roles)?;
+            }
+            None => program.check_coarse_single_segment()?,
+        }
+    }
     validate_decode_ladder_impl(blob, true)
 }
 
@@ -205,6 +225,39 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     }
                     d.i[2] = 1;
                 }
+                // Grouped-decode align (PLOW_GEMMA_MOE_DEC_GROUP): rows ride i0, like prefill.
+                Some(DevOp::MoeAlignGemmaPf) => {
+                    if d.i[0] != g.t {
+                        return Err(reject("MoE align rows disagree with rung width"));
+                    }
+                    d.i[0] = 1;
+                }
+                // Gemma MoE decode carries B in a spare immediate, 0 at B=1 (devgen `nb`).
+                Some(
+                    op @ (DevOp::MoeRouterGemmaScore
+                    | DevOp::MoeRouterGemmaScoreFast
+                    | DevOp::MoeRouterGemmaTopk
+                    | DevOp::MoeExpertGluNormGemma
+                    | DevOp::MoeExpertDownGemma
+                    | DevOp::MoeCombineNormGemma
+                    | DevOp::MoeCombineResidNormGemma),
+                ) => {
+                    let field = match op {
+                        DevOp::MoeRouterGemmaScore
+                        | DevOp::MoeRouterGemmaScoreFast
+                        | DevOp::MoeCombineNormGemma
+                        // op72, the fused combine+NRN tail: carries B in i[2] exactly as the
+                        // unfused op70 it replaces, so it normalizes the same way. Without this
+                        // arm the ladder silently falls back to widest-only execution.
+                        | DevOp::MoeCombineResidNormGemma => 2,
+                        DevOp::MoeRouterGemmaTopk => 3,
+                        _ => 5,
+                    };
+                    if d.i[field] != if g.t > 1 { g.t } else { 0 } {
+                        return Err(reject("Gemma MoE rows disagree with rung width"));
+                    }
+                    d.i[field] = 0;
+                }
                 Some(
                     DevOp::RmsNorm
                     | DevOp::RowRms
@@ -252,6 +305,13 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     }
                 }
                 _ => {
+                    if std::env::var_os("PLOW_LADDER_DEBUG").is_some() {
+                        eprintln!(
+                            "ladder: rung {index} inst {} op {} has no normalization arm",
+                            insts.len(),
+                            d.op
+                        );
+                    }
                     compatible = false;
                 }
             }
@@ -260,6 +320,27 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
         if normalized.is_empty() {
             normalized = insts;
         } else if normalized != insts {
+            // Falling back here is SILENT (Ok(false) -> the widest rung runs every step), and it
+            // reads exactly like a large kernel regression. Name the first difference.
+            if std::env::var_os("PLOW_LADDER_DEBUG").is_some() {
+                if normalized.len() != insts.len() {
+                    eprintln!(
+                        "ladder: rung {index} has {} insts, rung 0 has {}",
+                        insts.len(),
+                        normalized.len()
+                    );
+                } else if let Some((k, (a, b))) = normalized
+                    .iter()
+                    .zip(insts.iter())
+                    .enumerate()
+                    .find(|(_, (a, b))| a != b)
+                {
+                    eprintln!(
+                        "ladder: rung {index} inst {k} differs after normalization\n                           rung0 op={} blocks={} i={:?} t={:?}\n                           rung{index} op={} blocks={} i={:?} t={:?}",
+                        a.op, a.blocks, a.i, a.t, b.op, b.blocks, b.i, b.t
+                    );
+                }
+            }
             same_shape = false;
         }
     }
@@ -463,8 +544,33 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                                 "KV writer requires physical-slot position addressing",
                             ));
                         }
-                        if scale.is_none() && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16) {
+                        // FUSED KV PAIR (devgen `fuse_kv`, i[7]=1): ONE HeadNormRope writes
+                        // both halves of the pair, so t6/t7 carry v's (cache, source) rather
+                        // than being empty. bf16 only -- under fp8 t6 is the scale handle,
+                        // which the `scale.is_some()` branch above already pins.
+                        if scale.is_none()
+                            && d.i[7] != 1
+                            && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16)
+                        {
                             return Ok(false);
+                        }
+                        if !writes.insert(id) {
+                            return Err(reject("duplicate KV writer"));
+                        }
+                    }
+                    // The v half of a fused pair. Its addressing immediates are SHARED with the
+                    // k half at operand 0, which was checked above; what has to hold here is
+                    // that this cache agrees with them, so one instruction cannot silently
+                    // write two caches of different geometry.
+                    Some(DevOp::HeadNormRope) if operand == 6 && d.i[7] == 1 => {
+                        // hd==64 gives the two halves DIFFERENT pair modes (ROPE_PAIR_HALF on k,
+                        // 0 on v) and d.i[5] can only carry one: leave such a packet unqualified
+                        // rather than validate it under the k half's mode.
+                        if scale.is_some() || pair_mode != 0 {
+                            return Ok(false);
+                        }
+                        if (d.i[1], d.i[2], d.fj[1], d.fj[2]) != (heads, hd, stride, mask) {
+                            return Err(reject("fused KV pair writers disagree on addressing"));
                         }
                         if !writes.insert(id) {
                             return Err(reject("duplicate KV writer"));
@@ -487,15 +593,18 @@ impl DecodeRung {
         g: &crate::asset::devblob::DevProg,
         base: DevProgram,
     ) -> Result<Self> {
-        Self::upload_with_insts(be, g, base, &g.insts, &g.waits)
+        Self::upload_with_insts(be, g, base, &g.insts, &g.waits, &g.gq_seg_ofs)
     }
 
+    /// `gq_seg_ofs` is the queue window set this rung launches with: the program's own, or the
+    /// merged `[0, len]` window that runs a segmented program as one launch.
     pub(super) fn upload_with_insts(
         be: &CudaBackend,
         g: &crate::asset::devblob::DevProg,
         base: DevProgram,
         insts: &[DevInst64],
         waits: &[packet::dev::Wait],
+        gq_seg_ofs: &[u32],
     ) -> Result<Self> {
         let upload = |bytes: &[u8]| -> Result<DeviceMem> {
             let mem = be.alloc(0, bytes.len().max(4) as u64)?;
@@ -512,12 +621,10 @@ impl DecodeRung {
             upload(pod_bytes(waits))?,
             upload(pod_bytes(&g.succs))?,
             upload(pod_bytes(&g.gq_stream))?,
-            upload(pod_bytes(&g.gq_seg_ofs))?,
+            upload(pod_bytes(gq_seg_ofs))?,
         ];
         let cursor_offset = (g.n_counter as usize * CTR_STRIDE as usize * 4).max(4);
-        let cursor_bytes = g.gq_seg_ofs.len().saturating_sub(1).max(1)
-            * CTR_STRIDE as usize
-            * 4;
+        let cursor_bytes = gq_seg_ofs.len().saturating_sub(1).max(1) * CTR_STRIDE as usize * 4;
         let counter_bytes = cursor_offset + cursor_bytes;
         let (counters, [counter_view, cursor_view]) =
             slab_carve(be, [cursor_offset, cursor_bytes])?;
@@ -538,11 +645,61 @@ impl DecodeRung {
             host_insts: insts.to_vec(),
             library: None,
             rows: g.t as usize,
+            group_arena: insts.iter().any(|d| {
+                DevOp::from_u16(d.op) == Some(DevOp::MoeAlignGemmaPf) && d.i[3] != 0 && d.i[0] >= d.i[3]
+            }),
             object: None,
             kernarg,
             counters,
             counter_bytes,
             _tables: tables,
         })
+    }
+}
+
+
+#[cfg(test)]
+mod ladder_diag {
+    use super::*;
+
+    /// CPU-only reproduction of the ladder decision. The real check runs during a GPU load, so
+    /// diagnosing a silent widest-fallback otherwise costs a lease. Point `PLOW_RUNG_PKT` at a
+    /// model.pkt and run with `PLOW_LADDER_DEBUG=1 --nocapture`; a no-op when unset.
+    #[test]
+    fn report_ladder_decision() {
+        let Some(path) = std::env::var_os("PLOW_RUNG_PKT") else {
+            return;
+        };
+        let buf = std::fs::read(&path).expect("read blob");
+        let blob = DevBlob::parse(&buf).expect("parse devblob");
+        eprintln!("decode rungs: {:?}", blob.decode_rungs());
+        eprintln!("segmented=false -> {:?}", validate_decode_ladder_impl(&blob, false));
+        eprintln!("segmented=true  -> {:?}", validate_decode_ladder_impl(&blob, true));
+        // Which of the three validators gpu.rs picks is decided here, and picking the
+        // non-segmented one makes a perfectly good ladder read as unqualified.
+        let prefill = blob.prefill_progs().len();
+        match segment_role_metadata(&blob, &buf) {
+            Ok(Some(roles)) => {
+                for p in &roles.programs {
+                    if p.index >= prefill {
+                        eprintln!("  prog {} roles {:?}", p.index, p.roles);
+                    }
+                }
+                let moe = roles.programs.iter().any(|p| {
+                    p.index >= prefill
+                        && p.roles
+                            .contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT)
+                });
+                eprintln!("moe_lt_decode_roles = {moe}");
+                // The three branches gpu.rs chooses between. Whichever one the runtime takes
+                // is what decides the ladder; calling all three here localizes a silent
+                // fallback without a GPU lease.
+                eprintln!("validate_moe_lt_ladder   -> {:?}", validate_moe_lt_ladder(&blob, &roles));
+                eprintln!("validate_cublaslt_ladder -> {:?}", validate_cublaslt_ladder(&blob, &roles));
+                eprintln!("validate_decode_ladder   -> {:?}", validate_decode_ladder(&blob));
+            }
+            Ok(None) => eprintln!("NO segment role metadata -> falls to validate_decode_ladder"),
+            Err(e) => eprintln!("segment role metadata error: {e:?}"),
+        }
     }
 }

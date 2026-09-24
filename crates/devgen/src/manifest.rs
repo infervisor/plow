@@ -334,6 +334,12 @@ struct Shapes {
     full_kv_heads: u32,
     /// Decode batch: `n_batch` on the decode program's flash sites.
     decode_batch: u32,
+    /// `I_moe` on the Gemma decode expert-down sites (`i[2]`); 0 when the packet has none.
+    moe_down_inter: u32,
+    /// The decode program carries the grouped-MoE align op (`PLOW_GEMMA_MOE_DEC_GROUP`).
+    moe_dec_group: bool,
+    /// `K` (`i[2]`) of every dense decode GEMV site: the row kernels the decode object needs.
+    decode_gemv_k: BTreeSet<u32>,
     /// hd → "bf16" | "e4m3", from which flash opcode reads that hd.
     kv_dtype: BTreeMap<u32, &'static str>,
     /// Largest prefill bucket = the largest chunk the runtime can submit.
@@ -466,6 +472,14 @@ fn shapes(m: &Model) -> Shapes {
         for inst in &p.insts {
             let Some(op) = op_of(inst.op) else { continue };
             s.ops_present.insert(op_name(op));
+            if decode
+                && matches!(
+                    op,
+                    DevOp::Gemv | DevOp::GemvQkv | DevOp::GemvGlu | DevOp::GemvArgmax
+                )
+            {
+                s.decode_gemv_k.insert(inst.i[2]);
+            }
             match op {
                 DevOp::XReduce if inst.i[7] != 0 => s.xr_combine_fold = true,
                 DevOp::KdaStateStepG if inst.i[4] & 12 != 0 => {
@@ -651,6 +665,8 @@ fn shapes(m: &Model) -> Shapes {
                 | DevOp::MoeGroupDownFp8Blk => {
                     s.moe_enc.insert(inst.i[6]);
                 }
+                DevOp::MoeExpertDownGemma if decode => s.moe_down_inter = inst.i[2],
+                DevOp::MoeAlignGemmaPf if decode => s.moe_dec_group = true,
                 // EVERY mxfp4 tile rung, not just the 256x256 one. This classifier decides
                 // `mxfp4_weights`, which decides which OBJECT the host loads
                 // (`scripts/gfx950_objects.py:150`). Before the prefill GEMM became
@@ -970,7 +986,10 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
 ///   1.48x (perf-data/px11-flash-decode.md). `GF_FULL` must also divide `gqa`
 ///   or the interpreter traps (`interp_sm120.cu`: `if ((gqa % GF_FULL) != 0)
 ///   __trap()`), which the `1|2|4|8` clamp below keeps true.
-fn tuning(s: &Shapes) -> Map<String, Value> {
+/// * `moe_down_sg = 8` — the Gemma decode expert-down lane split. Measured on h100-sxm5
+///   (step_bench, ms at B=1/4/16): sg4 5.905 / 11.034 / 26.786, sg8 5.833 / 10.648 / 26.387. The
+///   arm needs `I_moe % (32 / sg * 8) == 0` and silently falls back otherwise, hence the guard.
+fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     let mut t = Map::new();
     t.insert("gv_mm_max".into(), json!(next_pow2(s.decode_batch.max(1))));
     // TILE PROVENANCE. Written because its absence made a real regression unauditable: for
@@ -995,11 +1014,67 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
             }),
         );
     }
+    // The keys below drive NVIDIA-only defines (config_header), so other targets keep main's
+    // pairing hash.
+    let sm90a = arch == "sm_90a";
+    if sm90a && s.moe_down_inter > 0 && s.moe_down_inter % 32 == 0 {
+        t.insert("moe_down_sg".into(), json!(8));
+    }
+    // The decode object compiles the grouped MoE arm (and claims its ring) only for a packet
+    // whose decode program asks for it.
+    if arch.starts_with("sm_") && s.moe_dec_group {
+        t.insert("moe_dec_group".into(), json!(1));
+    }
+    // The decode entry is ONE function at the 255-register cap, so every kernel compiled into it
+    // taxes every rung. Measured on h100-sxm5 (step_bench ms at B=1/2/4/8/16):
+    // * `xreg_k`: the B=1 xreg kernels exist for ten K sizes and a packet uses two. Compiling only
+    //   its own: 26B 5.98/8.07/10.41/16.13/26.31 -> 5.66/8.01/10.31/15.94/25.94, 12B B=1 13.12 -> 12.60.
+    // * `gemv_mma_b1`: a DENSE packet also walks its B=1 GEMVs on the tensor cores, which drops the
+    //   classic B=1 kernels altogether: 12B 12.60/13.01/13.59 -> 11.93/12.60/13.16. The MoE 26B
+    //   keeps its xreg kernels (B=1 5.66 vs 6.10 on the walk: its dense GEMVs are small).
+    if sm90a && !s.decode_gemv_k.is_empty() {
+        t.insert("xreg_k".into(), json!(s.decode_gemv_k.iter().collect::<Vec<_>>()));
+        if s.moe_down_inter == 0 && s.decode_batch >= 2 && s.decode_gemv_k.iter().all(|k| k % 32 == 0) {
+            t.insert("gemv_mma_b1".into(), json!(1));
+            // * `gemv_mma_pair`: its single-stream walks (down, o_proj, lm_head) take two row blocks
+            //   per k-step (op_gemv_mma.cuh): 12B B=1/4/16 10.99/11.70/14.25 -> 10.92/11.60/13.94.
+            t.insert("gemv_mma_pair".into(), json!(1));
+        }
+    }
+    // * `fa_spart`: decode attention parks its score partials in smem (op_attention.cuh,
+    //   PLOW_NV_FA_SPART) and holds 8 hd256 rows in flight. 12B 11.03/11.45/11.98/13.04/15.24 ->
+    //   10.99/11.30/11.67/12.59/14.35. Of that, 0.10/0.17/0.10 ms at B=1/4/16 is the larger smem
+    //   claim by itself (same kernels with a 40-128 KiB arena floor: 10.93/11.81/15.14; cliff at
+    //   208 KiB). DENSE only: on the 26B every extra KiB of claim costs the per-slot MoE rung
+    //   (B=4 9.55 -> 9.71 at 24-40 KiB, 9.99 at 57) more than attention gains.
+    // * `fa_tc_hd512`: the hd512/GQA8 layers score and accumulate on the tensor cores
+    //   (PLOW_NV_FA_TC_GQA8_HD512). Neutral at ctx 1024 (10.99/11.67/14.35 -> 11.02/11.66/14.29),
+    //   and the long-context term: ctx 8192 B=1/4 11.30/12.99 -> 11.14/12.19.
+    // * A MoE packet takes the hd256 depth alone (chosen per tile, no partials, no extra claim):
+    //   26B B=8/16 12.76/15.52 -> 12.69/15.29 at depth 4 with B<=4 unchanged (depth 8: 15.24, but
+    //   +0.06 at B=2/4).
+    if sm90a && s.moe_down_inter == 0 && s.decode_batch >= 2 {
+        t.insert("fa_spart".into(), json!(8));
+        t.insert("fa_tc_hd512".into(), json!(1));
+    } else if sm90a && s.moe_down_inter > 0 && s.decode_batch >= 8 {
+        t.insert("fa_rb256".into(), json!(4));
+    }
     if s.full_kv_heads == 1 && s.gqa > 0 {
-        // The template is instantiated at 1|2|4|8 only.
+        // The template is instantiated at 1|2|4|8; 16 (the whole Gemma-4-12B group, one K/V
+        // stream for all 16 heads) only when the emit asks for it, on the wide-reduction arm.
         let gf = next_pow2(s.gqa).min(8);
         let gf = if s.gqa % gf == 0 { gf } else { 1 };
+        let gf = if crate::emit_config::active().fa_gf_full == Some(16) && s.gqa == 16 {
+            16
+        } else {
+            gf
+        };
         t.insert("gf_full".into(), json!(gf));
+    }
+    // * `fa_mmaqk`: the emit's PLOW_FA_MMAQK, opt-in. Object-paired (the score arm and its smem
+    //   claim change), so it rides in `tuning` and the pairing hash.
+    if let Some(v) = crate::emit_config::active().fa_mmaqk.filter(|v| *v != 0) {
+        t.insert("fa_mmaqk".into(), json!(v));
     }
     t
 }
@@ -1053,11 +1128,11 @@ pub(crate) const UNRECORDED_ENV: &[&str] = &[
     "PLOW_MOE_DECODE_STANDALONE",
     "PLOW_PHASE_OBJECTS",
     "PLOW_SEG_CLASS_SLICE",
+    // SEG_FA256_GQA2, SEG_FA512 and SEG_PURE_GEMM: the packet crate retains an env fallback for
+    // direct callers, while plowc carries the resolved EmitConfig field into its SegKnobs snapshot.
     "PLOW_SEG_FA256_GQA2",
     "PLOW_SEG_FA512",
     "PLOW_SEG_PER_OP",
-    // The packet crate retains an env fallback for direct callers, while plowc
-    // carries the resolved EmitConfig field into its SegKnobs snapshot.
     "PLOW_SEG_PURE_GEMM",
     "PLOW_SEG_SLICE_ALL",
     "PLOW_SEG_V2",
@@ -1564,6 +1639,27 @@ pub fn build_for_packet(
             }
             manifest["pairing"]["hash"] = json!(format!("0x{:016x}", pairing_hash(&manifest)));
         }
+    }
+    // cuBLASLt-routed MoE decode rungs run a second decode object without the expert GEMV arms.
+    let routed_decode = sections
+        .iter()
+        .filter(|section| {
+            section.kind == packet::devbuild::SECT_METADATA
+                && section.name == plow_asset::segment_roles::SECTION
+        })
+        .filter_map(|section| {
+            plow_asset::segment_roles::SegmentRoles::from_bytes(&section.data).ok()
+        })
+        .any(|roles| {
+            roles.programs.iter().any(|program| {
+                program
+                    .roles
+                    .contains(&plow_asset::segment_roles::MOE_DECODE_CUBLASLT)
+            })
+        });
+    if routed_decode {
+        manifest["objects"]["routed_decode"] = json!({ "required": true });
+        manifest["pairing"]["hash"] = json!(format!("0x{:016x}", pairing_hash(&manifest)));
     }
     let modular_section = sections.iter().find(|section| {
         section.kind == packet::devbuild::SECT_METADATA
@@ -2096,7 +2192,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
     f.insert("rope_half_hd64".into(), json!(s.rope_half_hd64));
     f.insert("attention_sinks".into(), json!(s.attention_sinks));
     let axes = precision_axes(&mut f, &s, &union, &progs);
-    let t = tuning(&s);
+    let t = tuning(&s, arch);
     let attention: Vec<Value> = crate::attention_decisions()
         .into_iter()
         .map(|d| {
@@ -2636,6 +2732,60 @@ pub fn config_header(manifest: &Value) -> String {
                  #ifndef PLOW_FA_GF_FULL\n#define PLOW_FA_GF_FULL {v}\n#endif\n"
             ));
         }
+        // Measured on sm_90a only; every other target keeps the kernel's own default.
+        if let Some(v) = t.get("moe_down_sg").and_then(Value::as_u64) {
+            if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
+                out.push_str(&format!(
+                    "#ifndef PLOW_MOE_DOWN_SG\n#define PLOW_MOE_DOWN_SG {v}u\n#endif\n"
+                ));
+            }
+        }
+        if t.get("moe_dec_group").is_some() {
+            out.push_str("#ifndef PLOW_MOE_DEC_GROUP\n#define PLOW_MOE_DEC_GROUP 1\n#endif\n");
+        }
+        if manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
+            if let Some(ks) = t.get("xreg_k").and_then(Value::as_array) {
+                let any = ks
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .map(|k| format!("(k) == {k}u"))
+                    .collect::<Vec<_>>()
+                    .join(" || ");
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_XREG_K\n#define PLOW_NV_XREG_K(k) ({any})\n#endif\n"
+                ));
+            }
+            if t.get("gemv_mma_b1").is_some() {
+                out.push_str("#ifndef PLOW_NV_GEMV_MMA_B1\n#define PLOW_NV_GEMV_MMA_B1 1\n#endif\n");
+            }
+            if t.get("gemv_mma_pair").is_some() {
+                out.push_str("#ifndef PLOW_NV_GEMV_MMA_PAIR\n#define PLOW_NV_GEMV_MMA_PAIR 1\n#endif\n");
+            }
+            if t.get("fa_tc_hd512").is_some() {
+                out.push_str(
+                    "#ifndef PLOW_NV_FA_TC_GQA8_HD512\n#define PLOW_NV_FA_TC_GQA8_HD512 1\n#endif\n",
+                );
+            }
+            if let Some(v) = t.get("fa_spart").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_FA_SPART\n#define PLOW_NV_FA_SPART 1\n#endif\n\
+                     #ifndef PLOW_NV_FA_WPR_RB256\n#define PLOW_NV_FA_WPR_RB256 {v}\n#endif\n"
+                ));
+            }
+            if let Some(v) = t.get("fa_rb256").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_FA_WPR_RB256\n#define PLOW_NV_FA_WPR_RB256 {v}\n#endif\n"
+                ));
+            }
+            if let Some(v) = t.get("fa_mmaqk").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_FA_MMAQK\n#define PLOW_NV_FA_MMAQK {v}\n#endif\n"
+                ));
+            }
+            if t.get("gf_full").and_then(Value::as_u64) == Some(16) {
+                out.push_str("#ifndef PLOW_NV_FA_GF16_BENCH\n#define PLOW_NV_FA_GF16_BENCH 1\n#endif\n");
+            }
+        }
     }
     if let Some(gqa) = manifest.pointer("/shapes/gqa").and_then(Value::as_u64) {
         out.push_str(&format!("#define PLOW_PACKET_GQA {gqa}\n"));
@@ -3124,6 +3274,40 @@ mod tests {
         assert_eq!(
             dense["objects"]["packed_prefill"]["arms"],
             dense["objects"]["ordinary"]["prefill"]["arms"]
+        );
+    }
+
+    /// cuBLASLt-routed decode rungs ask the object build for the routed decode object, and the
+    /// request is part of the pairing.
+    #[test]
+    fn routed_decode_object_follows_the_decode_lt_roles() {
+        let lean = crate::LeanReport::skipped("test: gate not run");
+        let roles = |role: u8| packet::devbuild::SectionData {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::segment_roles::SECTION.into(),
+            data: format!(r#"{{"version":1,"objects":{{}},"programs":[{{"index":0,"roles":[0,{role},0]}}]}}"#)
+                .into_bytes(),
+        };
+        let plain = build_for_packet(&model(), "sm_90a", &lean, &[]);
+        assert!(plain["objects"].get("routed_decode").is_none());
+        let prefill = build_for_packet(
+            &model(),
+            "sm_90a",
+            &lean,
+            &[roles(plow_asset::segment_roles::MOE_PREFILL_CUBLASLT)],
+        );
+        assert!(prefill["objects"].get("routed_decode").is_none());
+        let routed = build_for_packet(
+            &model(),
+            "sm_90a",
+            &lean,
+            &[roles(plow_asset::segment_roles::MOE_DECODE_CUBLASLT)],
+        );
+        assert_eq!(routed["objects"]["routed_decode"]["required"], true);
+        assert_ne!(routed["pairing"]["hash"], plain["pairing"]["hash"]);
+        assert_eq!(
+            routed["pairing"]["hash"],
+            json!(format!("0x{:016x}", pairing_hash(&routed)))
         );
     }
 

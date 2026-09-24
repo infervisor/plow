@@ -33,7 +33,7 @@ elem = ((slot * n_kv_head + kv_head) * kv_stride + (row & kv_mask)) * head_dim +
 
 `kv_stride` is the **allocated** ring depth, not the current length, so it has to
 travel with the instruction rather than be inferred
-(`runtime/common/dev_isa.h:1485`): `HEADNORM_ROPE j0 = out_stride`,
+(`runtime/common/dev_isa.h:1488`): `HEADNORM_ROPE j0 = out_stride`,
 `FLASH_PREFILL j0 = kv_stride`, `FLASH_DECODE i3 = kv_stride`.
 
 ```mermaid
@@ -58,7 +58,7 @@ flowchart TD
 
 The rationale is worth quoting in full, because it is the one place the layout
 choice is argued from the reader rather than the writer
-(`runtime/common/dev_isa.h:1473-1483`):
+(`runtime/common/dev_isa.h:1474-1486`):
 
 > THE KV CACHE IS HEAD-MAJOR: `[kv_head][ctx][head_dim]`, NOT
 > `[ctx][kv_head][head_dim]`.
@@ -77,11 +77,11 @@ choice is argued from the reader rather than the writer
 > writes its own contiguous 512 bytes — just at a different address.
 
 **The batch axis is outermost** and each sequence owns a private ring
-(`crates/devgen/src/lib.rs:2390`): the per-slot stride is `kv_head * ring * hd`,
+(`crates/devgen/src/lib.rs:2393`): the per-slot stride is `kv_head * ring * hd`,
 and at one slot the tensor is byte-identical to the single-sequence cache.
 
 **Measured null:** re-packing these bytes another way — token-major, or
-vLLM-style paging — moved nothing (`crates/devgen/src/lib.rs:2377`: "a
+vLLM-style paging — moved nothing (`crates/devgen/src/lib.rs:2378`: "a
 byte-repack (token-major, or vLLM-style paging) is a measured null here"). The
 layout is settled; do not re-litigate it without a new measurement.
 
@@ -91,7 +91,7 @@ layout is settled; do not re-litigate it without a new measurement.
 
 A windowed layer only ever reads the last `window` positions, so storing `ctx`
 rows for it is waste. Plow stores a **ring** instead and masks the index. The
-device header carries the invariant (`runtime/common/dev_isa.h:1857`):
+device header carries the invariant (`runtime/common/dev_isa.h:1856`):
 
 > A prefill CHUNK of C tokens has queries at `[c0, c0+C)`, which between them
 > need KV rows `[c0-1023, c0+C-1]` — a span of `W + C - 1`. And the chunk writes
@@ -110,11 +110,12 @@ The emitter's formulas (`crates/devgen/src/lib.rs`):
 
 | Function | Definition | Line |
 |---|---|---|
-| `kv_ring_rows(window, chunk)` | `(window + chunk - 1).next_power_of_two()` | 3087 |
-| `kv_ring(full=true, ...)` | `(ctx, 0xFFFF_FFFF)` — no masking on global layers | 3102 |
-| `kv_ring(full=false, ...)` | `r = min(ctx, kv_ring_rows(...))`, mask `r - 1` | 3102 |
-| `default_chunk(window)` | `window.next_power_of_two()` clamped to `[128, 8192]` | 3037 |
-| `request_chunk(window)` | `PLOW_MAX_REQUEST_CHUNK` else `max_chunk(window)` | 3068 |
+| `kv_ring_rows(window, chunk)` | `(window + chunk - 1).next_power_of_two()` | 3094 |
+| `kv_ring(full=true, ...)` | `(ctx, 0xFFFF_FFFF)` — no masking on global layers | 3139 |
+| `kv_ring(full=false, ...)` | `r = min(ctx, kv_ring_rows(...))`, mask `r - 1` | 3139 |
+| `default_chunk(window)` | `window.next_power_of_two()` clamped to `[128, 8192]` | 3041 |
+| `request_chunk(window)` | `PLOW_MAX_REQUEST_CHUNK` else `max_chunk(window)` | 3072 |
+| `appended_rungs(window, ctx)` | `PLOW_PF_LADDER_APPEND` rungs the ring already holds | 3104 |
 
 The ring must be a power of two because the index is an AND, and the emitter
 asserts it: a non-power-of-two ring "aliases rows to WRONG (in-bounds) rows —
@@ -273,8 +274,24 @@ That third constraint is why the 32-slot packet above runs with both attention
 roles off — and it is avoidable. `kv_ring` is sized by `request_chunk`, and
 `PLOW_MAX_REQUEST_CHUNK` lowers that independently of `PLOW_MAX_CHUNK`, while
 the packed planner enforces the same cap per request
-(`crates/plow-asset/src/packed_prefill.rs:384`). The two knobs therefore
-separate the ladder from the ring.
+(`plan_with_limit`, `crates/plow-asset/src/packed_prefill.rs:461-486`). The two
+knobs therefore separate the ladder from the ring.
+
+Because the ring rounds `window + request_chunk - 1` **up** to a power of two,
+it usually has slack, and `request_chunk` need not be a power of two — only a
+prefill rung. Window 1024 at request chunk **4224** rings `next_pow2(5247) =
+8192`, exactly what a 4096 chunk costs: 128 extra rows per launch for free.
+`appended_rungs` admits such a rung above `PLOW_MAX_CHUNK` on the same
+already-holds-it test.
+
+**The cap is applied before the bucket is picked, not after.** The serve layer
+bounds each candidate's slice at `pf_chunk_rows().min(e.pf_request_max_rows())`
+and the serialized path does the same in `prefill_chunk`
+(`crates/plowrt/src/exec/gpu.rs`); `pick_prefill_bucket` then only has to cover
+that capped slice. So the cap decides where a prompt splits and the rung merely
+covers the piece — on the 12B ladder packet at `PLOW_MAX_REQUEST_CHUNK=4224` an
+8192-token prompt splits `[4224, 3968]`, the 3968-row tail landing on the 4096
+rung with 128 padded rows.
 
 **Verified at emit.** A packet emitted with `PLOW_MAX_CHUNK=4096` and
 `PLOW_MAX_REQUEST_CHUNK=1024` declares, in its own `HeadNormRope` operands:
@@ -482,7 +499,7 @@ cost, paid down by the block pool, the premap thread and deferred reclaim.
 One measured note, offered as a result rather than an argument: Plow has tried
 the other side. Re-packing this cache token-major, or vLLM-style paged, is
 recorded as a **measured null** on these shapes
-(`crates/devgen/src/lib.rs:2377`) — the kernel-side gather did not pay for
+(`crates/devgen/src/lib.rs:2378`) — the kernel-side gather did not pay for
 itself once the layout was head-major. That is a finding about this model family
 and these kernels, not a general claim about PagedAttention, which solves a
 harder allocation problem than Plow's fixed slot count poses.
@@ -497,7 +514,7 @@ be mapped before the launch**. Only the unified token-batch route or an explicit
 admitted slot's rows plus row zero of every other slot
 (`admit_packed_slot`, `gpu.rs:5564`).
 
-The decision is (`gpu.rs:3078-3084`):
+The decision is (`gpu.rs:3434-3439`):
 
 ```rust
 let prefix_requested = config.nv_vmm_prefix() == Some(true) || prefix_layout.is_some();
@@ -523,7 +540,7 @@ can absorb a multi-thousand-row pad.
 
 Under TP the cache shards on the **kv-head axis** and replicates when it cannot
 split: `kvh_local = kvh / tp` when `tp <= kvh`, else 1, with `tp / kvh` ranks
-sharing a head (`crates/devgen/src/lib.rs:3132`). Ring depth is never split by
+sharing a head (`crates/devgen/src/lib.rs:2385`). Ring depth is never split by
 TP, only the head count, so on Gemma-4 global layers — one KV head — every rank
 holds a full copy. The comment calls this "the design's chosen tradeoff": 2x on
 a minority of layers.
@@ -548,7 +565,9 @@ latent cache, not to this dense head-major cache.
 | `PLOW_VMM_BLOCK_MIB` | 2 | Physical block size, the prefix match granularity |
 | `PLOW_KV_POOL_MIB` | 512 | Block pool cap; 0 disables |
 | `PLOW_VMM_DEFERRED_RECLAIM` | on | Background unmapping, keeping column 0 mapped |
-| `PLOW_VMM_CACHE_MIB` | 5% of device | Prefix cache soft cap |
+| `PLOW_VMM_CACHE_MEMORY_UTILIZATION` | 0.05 | Prefix cache soft cap as a fraction of device memory (4 GiB on an 80 GiB H100) |
+| `PLOW_VMM_CACHE_MIB` | unset | Explicit soft cap in MiB; overrides the fraction above. `0` = OOM-driven eviction only |
+| `PLOW_VMM_CACHE_MIN_FREE_MIB` | unset = 4% of device | Keep cached prefixes until free device memory would drop below this; `0` rolls back to the byte budget as the only trim trigger |
 | `PLOW_VMM_LIVE_RINGS` | off | Grow packet KV with the live frontier; disables prefix auto-selection |
 
 Benchmarks that compare against an engine with prefix caching disabled must set

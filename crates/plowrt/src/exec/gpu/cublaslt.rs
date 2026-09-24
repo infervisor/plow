@@ -25,6 +25,39 @@ impl CublasLtDecodeRoute {
     }
 }
 
+/// A host library call that replaces one decode segment.
+pub(super) enum LibraryRoute {
+    Projection(CublasLtDecodeRoute),
+    Moe(moe_lt::MoeLtRoute),
+}
+
+impl LibraryRoute {
+    pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
+        match self {
+            Self::Projection(route) => route.run(stream),
+            Self::Moe(route) => route.run(stream),
+        }
+    }
+}
+
+/// Every host-launched kernel of `routes` that leaves cuBLASLt's workspace alone.
+fn glue_kernels<'a>(routes: impl Iterator<Item = &'a LibraryRoute>) -> Vec<KernelFn> {
+    routes
+        .filter_map(|route| match route {
+            LibraryRoute::Moe(route) => Some(route.glue()),
+            LibraryRoute::Projection(_) => None,
+        })
+        .flatten()
+        .collect()
+}
+
+pub(super) fn library_routes(routes: Vec<Option<CublasLtDecodeRoute>>) -> Vec<Option<LibraryRoute>> {
+    routes
+        .into_iter()
+        .map(|route| route.map(LibraryRoute::Projection))
+        .collect()
+}
+
 pub(super) enum ProjectionBackend {
     Lt(Arc<crate::device::cuda::lt::Lt>),
     Native(Arc<native_decode::Native>),
@@ -44,9 +77,24 @@ impl ProjectionPlan {
     }
 }
 
+/// `extra` names further `(segment, instruction)` pairs a library route executes.
 pub(super) fn ordered_waits(
     g: &DevProg,
     segments: &[Option<DecodeSegment>],
+    extra: &[(usize, usize)],
+) -> Result<Vec<packet::dev::Wait>> {
+    let library: Vec<_> = segments
+        .iter()
+        .map(|segment| segment.map(|s| s.instruction))
+        .collect();
+    ordered_waits_for(g, &library, extra)
+}
+
+/// `segments[seg]` names the one instruction of a segment that a host library call replaces.
+pub(super) fn ordered_waits_for(
+    g: &DevProg,
+    segments: &[Option<usize>],
+    extra: &[(usize, usize)],
 ) -> Result<Vec<packet::dev::Wait>> {
     validate_segment_windows(g)?;
     let reject = || RuntimeError::Rejected("cuBLASLt requires ordered coarse dependencies".into());
@@ -90,13 +138,15 @@ pub(super) fn ordered_waits(
         }
     }
     let mut library = vec![false; g.insts.len()];
-    for (seg, route) in segments.iter().enumerate() {
-        if let Some(route) = route {
-            if placement.get(route.instruction) != Some(&Some(seg as u16)) {
-                return Err(reject());
-            }
-            library[route.instruction] = true;
+    let routed = segments
+        .iter()
+        .enumerate()
+        .filter_map(|(seg, instruction)| instruction.map(|i| (seg, i)));
+    for (seg, instruction) in routed.chain(extra.iter().copied()) {
+        if placement.get(instruction) != Some(&Some(seg as u16)) {
+            return Err(reject());
         }
+        library[instruction] = true;
     }
     let mut waits = g.waits.clone();
     for w in &mut waits {
@@ -113,7 +163,7 @@ pub(super) fn prepare_routes(
     segments: Vec<Option<DecodeSegment>>,
     insts: &mut [DevInst64],
     devp: &[DeviceMem],
-    templates: Option<&[Option<CublasLtDecodeRoute>]>,
+    templates: Option<&[Option<LibraryRoute>]>,
 ) -> Result<Vec<Option<CublasLtDecodeRoute>>> {
     let mut routes = Vec::new();
     if segments.is_empty() {
@@ -148,12 +198,11 @@ pub(super) fn prepare_routes(
                 std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.get()),
                 std::collections::hash_map::Entry::Vacant(e) => {
                     let template = templates
-                        .map(|routes| {
-                            routes.get(index).and_then(Option::as_ref).ok_or_else(|| {
-                                RuntimeError::Rejected(
-                                    "cuBLASLt rung template route missing".into(),
-                                )
-                            })
+                        .map(|routes| match routes.get(index) {
+                            Some(Some(LibraryRoute::Projection(route))) => Ok(route),
+                            _ => Err(RuntimeError::Rejected(
+                                "cuBLASLt rung template route missing".into(),
+                            )),
                         })
                         .transpose()?;
                     let plan = match backend {
@@ -208,7 +257,7 @@ pub(super) fn prepare_routes(
 pub(super) struct CublasLtDecodeGraph {
     be: Arc<CudaBackend>,
     graph: Option<crate::device::cuda::GraphExec>,
-    _routes: Vec<Option<CublasLtDecodeRoute>>,
+    _routes: Vec<Option<LibraryRoute>>,
 }
 
 impl CublasLtDecodeGraph {
@@ -219,14 +268,13 @@ impl CublasLtDecodeGraph {
         function: KernelFn,
         grid: u32,
         smem: u32,
-        routes: Vec<Option<CublasLtDecodeRoute>>,
+        routes: Vec<Option<LibraryRoute>>,
     ) -> Result<Self> {
-        let graph = be.graph_capture(stream, || {
+        let untouched = glue_kernels(routes.iter().flatten());
+        let graph = be.graph_capture_hoisting(stream, &untouched, || {
             for (seg, route) in routes.iter().enumerate() {
                 if let Some(route) = route {
-                    route
-                        .plan
-                        .run(route.input, route.weight, route.output, stream)?;
+                    route.run(stream)?;
                     continue;
                 }
                 let mut arg = base;
@@ -266,9 +314,7 @@ impl GpuEngine {
         self.be.graph_capture(&self.stream, || {
             for (seg, route) in self.cublaslt_decode.iter().enumerate() {
                 if let Some(route) = route {
-                    route
-                        .plan
-                        .run(route.input, route.weight, route.output, &self.stream)?;
+                    route.run(&self.stream)?;
                 }
                 let mut arg = self.kernarg;
                 arg.waits = waits;
@@ -289,8 +335,11 @@ impl GpuEngine {
 
     pub(super) fn capture_decode_graph(&mut self) -> Result<()> {
         let be = Arc::clone(&self.be);
+        let untouched = glue_kernels(self.cublaslt_decode.iter().flatten());
         self.cublaslt_decode_graph =
-            Some(be.graph_capture(&self.stream, || self.enqueue_decode_chain())?);
+            Some(be.graph_capture_hoisting(&self.stream, &untouched, || {
+                self.enqueue_decode_chain()
+            })?);
         Ok(())
     }
 
@@ -302,9 +351,7 @@ impl GpuEngine {
             .max(1);
         for seg in 0..segments {
             if let Some(Some(route)) = self.cublaslt_decode.get(seg) {
-                route
-                    .plan
-                    .run(route.input, route.weight, route.output, &self.stream)?;
+                route.run(&self.stream)?;
                 continue;
             }
             let mut arg = self.kernarg;
@@ -322,11 +369,17 @@ impl GpuEngine {
                 arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
             }
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+            // A MoE-routed chain runs no grouped-arm body: its launches take the narrow arena.
+            let (function, smem) = match &self.routed_decode {
+                Some(routed) => (routed.function, routed.smem),
+                None if self.moe_lt_decode => (self.f, self.smem_narrow),
+                None => (self.f, self.smem),
+            };
             self.be.launch_cooperative(
-                role.map_or(self.f, |r| r.function),
+                role.map_or(function, |r| r.function),
                 role.map_or(self.grid, |r| r.grid),
                 role.map_or(BLOCK, |r| r.block),
-                role.map_or(self.smem, |r| r.smem),
+                role.map_or(smem, |r| r.smem),
                 &mut params,
                 Some(&self.stream),
             )?;
@@ -583,7 +636,7 @@ mod tests {
         }
         g.gq_stream = g.stream.clone();
         let routes = decode_segments(&g, &tensors, &roles()).unwrap();
-        let waits = ordered_waits(&g, &routes).unwrap();
+        let waits = ordered_waits(&g, &routes, &[]).unwrap();
         assert_eq!(waits[0], g.waits[0]);
         assert_eq!(
             waits[1],
@@ -595,20 +648,20 @@ mod tests {
         assert_eq!(g.waits[1].threshold, 1);
 
         g.succs[0] = 1;
-        assert!(ordered_waits(&g, &routes).is_err());
+        assert!(ordered_waits(&g, &routes, &[]).is_err());
         g.succs[0] = 0;
         g.waits[0].id = 2;
-        assert!(ordered_waits(&g, &routes).is_err());
+        assert!(ordered_waits(&g, &routes, &[]).is_err());
         g.waits[0].id = 0;
         g.waits[1].id = 3;
-        assert!(ordered_waits(&g, &routes).is_err());
+        assert!(ordered_waits(&g, &routes, &[]).is_err());
         g.waits[1].id = 1;
         g.waits[1].threshold = 2;
-        assert!(ordered_waits(&g, &routes).is_err());
+        assert!(ordered_waits(&g, &routes, &[]).is_err());
         g.waits[1].threshold = 1;
         g.stream[1].flags = packet::dev::SE_FINE;
         g.gq_stream = g.stream.clone();
-        assert!(ordered_waits(&g, &routes).is_err());
+        assert!(ordered_waits(&g, &routes, &[]).is_err());
     }
 
     #[test]
@@ -636,19 +689,18 @@ mod tests {
 
     #[test]
     fn accepts_only_measured_sm90_bf16_prefill_cells() {
-        for rows in plow_asset::segment_roles::CUBLASLT_PREFILL_ROWS {
-            for k in [8192, 15360] {
-                let (program, tensors) = prefill_fixture(rows, 3840, k);
-                let routes = prefill_segments(&program, &tensors, &roles(), "sm90a").unwrap();
-                let route = routes[1].expect("measured projection route");
-                assert_eq!((route.m, route.n, route.k), (rows, 3840, k));
-            }
-        }
-        for rows in plow_asset::segment_roles::CUBLASLT_PREFILL_WIDE_ROWS {
-            for (n, k) in plow_asset::segment_roles::CUBLASLT_PREFILL_GEMMA4_SHAPES {
+        use plow_asset::segment_roles::{
+            CUBLASLT_PREFILL_GEMMA4_26B_SHAPES, CUBLASLT_PREFILL_GEMMA4_SHAPES,
+            CUBLASLT_PREFILL_ROWS, CUBLASLT_PREFILL_WIDE_ROWS,
+        };
+        for &rows in CUBLASLT_PREFILL_ROWS.iter().chain(&CUBLASLT_PREFILL_WIDE_ROWS) {
+            for &(n, k) in CUBLASLT_PREFILL_GEMMA4_SHAPES
+                .iter()
+                .chain(&CUBLASLT_PREFILL_GEMMA4_26B_SHAPES)
+            {
                 let (program, tensors) = prefill_fixture(rows, n, k);
                 let routes = prefill_segments(&program, &tensors, &roles(), "sm90a").unwrap();
-                let route = routes[1].expect("measured wide projection route");
+                let route = routes[1].expect("measured projection route");
                 assert_eq!((route.m, route.n, route.k), (rows, n, k));
             }
         }
@@ -656,9 +708,10 @@ mod tests {
         for (profile, rows, n, k) in [
             ("sm120", 128, 3840, 15360),
             ("sm90a", 64, 3840, 15360),
-            ("sm90a", 16384, 3840, 15360),
-            ("sm90a", 128, 4096, 3840),
-            ("sm90a", 128, 3840, 4096),
+            ("sm90a", 1000, 3840, 15360),
+            ("sm90a", 32768, 3840, 15360),
+            ("sm90a", 128, 3840, 3840),
+            ("sm90a", 128, 2816, 3840),
             ("sm90a", 1024, 3840, 3840),
         ] {
             let (program, tensors) = prefill_fixture(rows, n, k);

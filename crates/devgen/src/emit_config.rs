@@ -153,6 +153,16 @@ pub struct EmitConfig {
     #[arg(long = "emit-pure-gemm-segments", env = "PLOW_SEG_PURE_GEMM")]
     pub seg_pure_gemm: Option<String>,
 
+    /// Give hd512 FlashPrefill its own segment class, launched on the `*_pffa` object: `1` =
+    /// hd512 only, `all` = every head dim. Unset lets plowc select a qualified target default.
+    #[arg(long = "emit-seg-fa512", env = "PLOW_SEG_FA512")]
+    pub seg_fa512: Option<String>,
+
+    /// Isolate exact HD256/GQA2 sliding FlashPrefill in segments of their own, for the paired
+    /// object. Unset lets plowc select a qualified target default.
+    #[arg(long = "emit-seg-fa256-gqa2", env = "PLOW_SEG_FA256_GQA2", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), num_args = 0..=1, default_missing_value = "true")]
+    pub seg_fa256_gqa2: Option<bool>,
+
     /// Emit the packet ABI for packed cross-request prefill. Unset lets plowc
     /// select it from the target and packet capabilities.
     #[arg(long = "emit-packed-prefill", env = "PLOW_EMIT_PACKED_PREFILL", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), num_args = 0..=1, default_missing_value = "true")]
@@ -211,6 +221,23 @@ pub struct EmitConfig {
     #[arg(long = "emit-max-request-chunk", env = "PLOW_MAX_REQUEST_CHUNK")]
     pub max_request_chunk: Option<u32>,
 
+    /// Rows a request may WRITE per launch when the chunk is staged, which is what the sliding
+    /// ring is sized against (`window + stage - 1`) instead of the whole chunk.
+    ///
+    /// `PLOW_MAX_CHUNK` alone drives two things that want opposite values: the prefill launch
+    /// count wants a LARGE chunk (15000 tokens is 15 launches at chunk 1024, 4 at 4096) and the
+    /// ring stride wants a SMALL one, because every decode step traverses it. Measured on the
+    /// 12B (recipe `gemma4-12b.h100.bf16-c32-16k.toml`): chunk 2048 halves long-prompt C32 TTFT
+    /// (8192/C32 10314 -> 4695 ms) but costs 128/C16 TPOT 13.05 -> 17.97 ms and 1179 -> 856
+    /// tok/s. Staging splits them — chunk 4096 with `stage_rows` 1024 keeps the 2048-row ring.
+    ///
+    /// Requires `max_request_chunk` (a stage masks the rows outside it to -1, and only a
+    /// `plan_with_limit` plan has its padding already masked) and objects built with
+    /// `PLOW_NV_MASKED_PADDING=1`. `packed_prefill::Manifest::validate` refuses the pairing
+    /// otherwise.
+    #[arg(long = "emit-stage-rows", env = "PLOW_STAGE_ROWS")]
+    pub stage_rows: Option<u32>,
+
     /// Emit S·n_cu decode slices for Gemv packets (finer work-stealing).
     #[arg(long, env = "PLOW_GEMV_SPLIT", default_value_t = 1)]
     pub gemv_split: u32,
@@ -233,6 +260,10 @@ pub struct EmitConfig {
     /// Cap sliding-window decode nsplit to (win / 64) to prevent over-splitting.
     #[arg(long, env = "PLOW_SLIDING_NS_CAP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub sliding_ns_cap: bool,
+
+    /// Floor the sliding-window decode nsplit of a batched rung to one work item per block.
+    #[arg(long, env = "PLOW_SLIDING_NS_GRID", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub sliding_ns_grid: bool,
 
     /// Revert fused QKV to split-3 path (A/B control).
     #[arg(long, env = "PLOW_NO_FUSE_QKV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -258,6 +289,14 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_HN_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub hn_split: bool,
 
+    /// Emit the k and v head-norms as ONE instruction on a fused-QKV decode program.
+    #[arg(long, env = "PLOW_FUSE_KV_HNR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub fuse_kv_hnr: bool,
+
+    /// Blocks for the one-row MoE combine (arms the all-block combine; 0/1 = today's single CTA).
+    #[arg(long, env = "PLOW_MOE_COMBINE_BLOCKS")]
+    pub moe_combine_blocks: Option<u32>,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Attention / flash-decode geometry
     // ──────────────────────────────────────────────────────────────────────────
@@ -268,6 +307,11 @@ pub struct EmitConfig {
     /// Experimental full-attention decode GF with batch-aware balanced split counts.
     #[arg(long, env = "PLOW_ATTENTION_DECODE_BALANCE_GF")]
     pub attention_decode_balance_gf: Option<u32>,
+
+    /// sm_90a decode attention scores on the tensor cores with K straight from global
+    /// (op_attention.cuh PLOW_NV_FA_MMAQK): bit 0 = hd256 layers, bit 1 = hd512 layers.
+    #[arg(long, env = "PLOW_FA_MMAQK")]
+    pub fa_mmaqk: Option<u32>,
 
     /// Widen the flash-merge dispatch by this factor (diagnostic; measured no effect).
     #[arg(long, env = "PLOW_FLASH_MERGE_DSPLIT", hide = true)]
@@ -353,6 +397,12 @@ pub struct EmitConfig {
     /// CTA count for the split router score GEMV.
     #[arg(long, env = "PLOW_GEMMA_MOE_ROUTER_BLOCKS")]
     pub gemma_moe_router_blocks: Option<u32>,
+
+    /// Decode rungs with at least this many rows run the routed experts through the GROUPED
+    /// tensor-core GEMMs (the prefill bodies) instead of the per-slot GEMV walk. Unset = off.
+    /// Needs a decode object built with `PLOW_MOE_DEC_GROUP=1`.
+    #[arg(long, env = "PLOW_GEMMA_MOE_DEC_GROUP")]
+    pub gemma_moe_dec_group: Option<u32>,
 
     /// Exact MoeRouterGemmaScore op instead of ScoreFast.
     #[arg(long, env = "PLOW_GEMMA_MOE_ROUTER_EXACT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1062,6 +1112,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMMA4_SM90_HD256_GQA2_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemma4_sm90_hd256_gqa2_role: bool,
 
+    /// With the paired-GQA2 role, also route the appended prefill rungs above 4096 (4160, 4224).
+    /// DEFAULT ON wherever that role is on (`apply_production_defaults`); `=0` rolls back.
+    #[arg(long, env = "PLOW_GEMMA4_SM90_HD256_GQA2_WIDE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub gemma4_sm90_hd256_gqa2_wide: bool,
+
     /// Route Gemma-4 M4096/M8192 global attention through the 512-thread px4 Hopper object.
     #[arg(long, env = "PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemma4_sm90_hd512_px4_bq64_role: bool,
@@ -1099,6 +1154,19 @@ pub struct EmitConfig {
     /// Emit the measured SM90 BF16 prefill projections as packet-declared cuBLASLt segments.
     #[arg(long = "emit-prefill-cublaslt", env = "PLOW_EMIT_PREFILL_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub prefill_cublaslt: bool,
+
+    /// Isolate each layer's grouped MoE prefill GLU + DOWN pair as a packet-declared library
+    /// segment, which the CUDA runtime serves with cuBLASLt grouped matmuls under
+    /// `PLOW_MOE_PF_LT`. A runtime that leaves that knob unset runs the packet unchanged.
+    #[arg(long = "emit-moe-pf-lt", env = "PLOW_EMIT_MOE_PF_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_pf_lt: bool,
+
+    /// Isolate each layer's fused expert GLU + DOWN pair on every decode rung that runs the
+    /// grouped-MoE arm (`PLOW_GEMMA_MOE_DEC_GROUP`) as a packet-declared library segment, which
+    /// the CUDA runtime serves with cuBLASLt grouped matmuls under `PLOW_MOE_DEC_LT`. A runtime
+    /// that leaves that knob unset runs the packet unchanged.
+    #[arg(long = "emit-moe-dec-lt", env = "PLOW_EMIT_MOE_DEC_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_dec_lt: bool,
 
     /// Emit qualified Gemma-31B gfx942 BF16 o/down projections as pinned assembly segments.
     #[arg(long = "emit-gemma-gemm-lt", env = "PLOW_GEMMA_GEMM_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1247,6 +1315,8 @@ impl EmitConfig {
             mx4_prefill: env_str("PLOW_MX4_PREFILL"),
             uniseg: env_bool("PLOW_UNISEG"),
             seg_pure_gemm: env_str("PLOW_SEG_PURE_GEMM"),
+            seg_fa512: env_str("PLOW_SEG_FA512"),
+            seg_fa256_gqa2: env_bool_opt("PLOW_SEG_FA256_GQA2"),
             emit_packed_prefill: env_bool_opt("PLOW_EMIT_PACKED_PREFILL"),
             packed_prefill_default: false,
             // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on
@@ -1258,19 +1328,24 @@ impl EmitConfig {
             decode_ladder_default: false,
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
             max_request_chunk: env_u32("PLOW_MAX_REQUEST_CHUNK"),
+            stage_rows: env_u32("PLOW_STAGE_ROWS"),
             gemv_split: env_u32("PLOW_GEMV_SPLIT").unwrap_or(1),
             decode_tiled: env_bool("PLOW_DECODE_TILED"),
             l2_place_prefill: env_bool_opt("PLOW_L2_PLACE_PREFILL").unwrap_or(true),
             fuse_argmax: env_bool("PLOW_FUSE_ARGMAX"),
             sliding_ns_cap: env_bool("PLOW_SLIDING_NS_CAP"),
+            sliding_ns_grid: env_bool("PLOW_SLIDING_NS_GRID"),
             no_fuse_qkv: env_bool("PLOW_NO_FUSE_QKV"),
             fuse_qkv_fp8: env_bool("PLOW_FUSE_QKV_FP8"),
             no_fuse_nrn: env_bool("PLOW_NO_FUSE_NRN"),
             fuse_hnr: env_bool("PLOW_FUSE_HNR"),
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
             hn_split: env_bool("PLOW_HN_SPLIT"),
+            fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
+            moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
+            fa_mmaqk: env_u32("PLOW_FA_MMAQK"),
             flash_merge_dsplit: env_u32("PLOW_FLASH_MERGE_DSPLIT"),
             ns_mul: env_u32("PLOW_NS_MUL"),
             ns_abs: env_u32("PLOW_NS_ABS"),
@@ -1289,6 +1364,7 @@ impl EmitConfig {
             moe_prefill: env_str("PLOW_MOE_PREFILL"),
             gemma_moe_router_fused: env_bool("PLOW_GEMMA_MOE_ROUTER_FUSED"),
             gemma_moe_router_blocks: env_u32("PLOW_GEMMA_MOE_ROUTER_BLOCKS"),
+            gemma_moe_dec_group: env_u32("PLOW_GEMMA_MOE_DEC_GROUP"),
             gemma_moe_router_exact: env_bool("PLOW_GEMMA_MOE_ROUTER_EXACT"),
             gemma_moe_tail_fuse: env_bool("PLOW_GEMMA_MOE_TAIL_FUSE"),
             k3_full: env_bool_default_true("K3_FULL"),
@@ -1433,6 +1509,7 @@ impl EmitConfig {
             gemma4_sm90_gemm_glu_role: env_bool("PLOW_GEMMA4_SM90_GEMM_GLU_ROLE"),
             gemma4_sm90_w8a8_gemm_glu_role: env_bool("PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE"),
             gemma4_sm90_hd256_gqa2_role: env_bool("PLOW_GEMMA4_SM90_HD256_GQA2_ROLE"),
+            gemma4_sm90_hd256_gqa2_wide: env_bool("PLOW_GEMMA4_SM90_HD256_GQA2_WIDE"),
             gemma4_sm90_hd512_px4_bq64_role: env_bool("PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE"),
             fp8_pf_gemm_role: env_bool("PLOW_FP8_PF_GEMM_ROLE"),
             fp8_pf_isolate: env_bool("PLOW_QWEN_FP8_PF_ISOLATE"),
@@ -1445,6 +1522,8 @@ impl EmitConfig {
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
             decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),
             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
+            moe_pf_lt: env_bool("PLOW_EMIT_MOE_PF_LT"),
+            moe_dec_lt: env_bool("PLOW_EMIT_MOE_DEC_LT"),
             gemma_gemm_lt: env_bool("PLOW_GEMMA_GEMM_LT"),
             decode_native_tc: env_bool("PLOW_EMIT_DECODE_NATIVE_TC"),
             qwen_fuse_ab: env_bool("PLOW_QWEN_FUSE_AB"),
@@ -1840,6 +1919,8 @@ pub fn install(mut cfg: EmitConfig) {
     // production default and a replay behave like the equivalent explicit env
     // setting instead of silently falling back to mixed segments.
     seg_knobs.seg_pure_gemm = cfg.seg_pure_gemm.clone();
+    seg_knobs.seg_fa512 = cfg.seg_fa512.clone();
+    seg_knobs.seg_fa256_gqa2 = cfg.seg_fa256_gqa2.unwrap_or(false);
     let ptr = Box::into_raw(Box::new(cfg));
     // In production there is only one call; in tests the last call wins (matches env-var
     // semantics where `set_var` before `run()` is the intent). We intentionally leak the

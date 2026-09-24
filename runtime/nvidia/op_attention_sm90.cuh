@@ -254,7 +254,8 @@ __device__ void d_flash_prefill_sm90_wgitem(
     unsigned n_kv_head, unsigned q_pos0, unsigned window, unsigned nsplit, unsigned kv_stride,
     unsigned kv_mask, float scale, unsigned slice, unsigned nblk, float* lds,
     const int* __restrict__ req, const void* __restrict__ mapkv) {
-    static_assert(HD == 256 && BQ == 64 && BKV == 32, "wgitem body is the <256,64,32> shape");
+    static_assert(HD == 256 && BQ == 64 && (BKV == 32 || BKV == 64),
+                  "wgitem body is the <256,64,32|64> shape");
     constexpr int NSUB = HD / 64;
     constexpr int NTO = HD / 64; /* n64 O tiles per wg — the FULL head dim */
     constexpr int KS0 = HD / 16;
@@ -619,7 +620,10 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
                                      const int* __restrict__ req,
                                      const void* __restrict__ mapkv = nullptr) {
 #if PLOW_NV_FA_WGITEM
-    if constexpr (HD == 256 && BKV == 32) {
+    /* BKV=64 reuses this body unchanged: the math is already written against BKV (S[BKV/2],
+     * fa90_wgmma_score<BKV>, fa90_cm_off<BKV>, KS1/NB0, the 16*BKV descriptor stride), and at
+     * 64 it compiles to 255 registers with zero spills. The pin to 32 was conservative. */
+    if constexpr (HD == 256 && (BKV == 32 || BKV == 64)) {
         d_flash_prefill_sm90_wgitem<HD, BQ, BKV>(Opart, mlpart, Q, K, V, O, seq_q, seq_kv,
                                                  n_head, n_kv_head, q_pos0, window, nsplit,
                                                  kv_stride, kv_mask, scale, slice, nblk, lds,

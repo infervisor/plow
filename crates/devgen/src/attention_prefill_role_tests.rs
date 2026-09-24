@@ -698,3 +698,16 @@ fn accepts_fused_output_and_rejects_unsafe_fused_contracts() {
         .i[7] = 2;
     assert!(apply(&mut split, &mut Vec::new(), &selection(), "sm90a", None).is_err());
 }
+
+#[test]
+fn hd256_gqa2_wide_admits_only_whole_tile_rungs_above_4096() {
+    for rows in [4096, 8192] {
+        assert!(gqa2_rung(rows, false) && gqa2_rung(rows, true));
+    }
+    for rows in [4160, 4224] {
+        assert!(!gqa2_rung(rows, false) && gqa2_rung(rows, true));
+    }
+    for rows in [128, 1152, 2048, 4097] {
+        assert!(!gqa2_rung(rows, true));
+    }
+}

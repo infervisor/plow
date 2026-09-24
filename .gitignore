@@ -84,6 +84,14 @@ sglang-pkgs/
 !/runtime/bench/amd/glm_fold_tail/gemm-selected.json
 !/runtime/bench/amd/mla_materialized_prefill/vllm_capture.example.json
 /perf-data/**/*.csv
+# Packet recreate records are PROVENANCE, not results: the recipe, the emit env (including env
+# read outside EmitConfig), the tune-store constants and the registry digest that rebuild a packet
+# and its cubins, plus that packet's own cuBLASLt probe result. The packets live under
+# /opt/dlami/nvme/tmp, which is scratch, so losing these loses the only record of what was built.
+# See perf-data/packets/README.md and scripts/campaign/preserve_packet.py.
+!/perf-data/packets/*.json
+!/perf-data/packets/*.jsonl
+!/perf-data/packets/README.md
 /runtime/nvidia/experiments/*.md
 !/runtime/nvidia/experiments/README.md
 /runtime/bench/amd/*/README.md

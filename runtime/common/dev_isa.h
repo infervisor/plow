@@ -578,6 +578,7 @@ enum {
     PLOW_DOP_MOE_COMBINE_NORM_GEMMA = 70,
     /* Fused pre-FFN-norm-2 + expert GLU. Inline RMSNorm before the expert dots,
      * eliminating a separate RmsNorm packet. t0=fu t1=resid t2=table t3=ewt t4=gamma
+     * t5=xn_scratch (B*H bf16; stages the normed rows for the B>1 vector body)
      * i0=k i1=I i2=H i3=n_exp f0=eps */
     PLOW_DOP_MOE_EXPERT_GLU_NORM_GEMMA = 71,
     /* Fused MoE layer tail: (MoeCombineNormGemma -> NormResidualNorm) in ONE packet.

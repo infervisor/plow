@@ -1,0 +1,4 @@
+# devgen's tests run whole packet emits on test threads; the debug-build emit outgrows the 2 MiB
+# test-thread default (mla::glm_tests overflows). plowc runs it on the 8 MiB main thread.
+[env]
+RUST_MIN_STACK = "8388608"

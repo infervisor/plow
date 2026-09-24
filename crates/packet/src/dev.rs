@@ -667,6 +667,9 @@ pub enum DevOp {
     /// Gemma-4 expert down (`d_moe_expert_down_gemma`): `part[slot][h] = gate·(down_e[h]·fu)`,
     /// f32, one warp per output. `t0=part([k,H],f32) t1=fu t2=table t3=ewt` · `i0=k i1=H
     /// i2=I_moe i3=n_exp`.
+    /// Grouped decode (PLOW_GEMMA_MOE_DEC_GROUP): slots 5, 6, 7 carry the align op's meta,
+    /// row_partidx and row_gate, fu is the gathered tensor, and immediate 6 is the row threshold
+    /// at or above which the grouped tensor-core DOWN body runs instead of the per-slot walk.
     MoeExpertDownGemma = 63,
     /// Gemma-4 combine (`d_moe_combine_gemma`): `moe[h] = Σ_slot part[slot][h]` (f32, fixed
     /// slot order) → bf16. `t0=moe t1=part([k,H])` · `i0=H i1=k`.
@@ -702,8 +705,12 @@ pub enum DevOp {
     MoeCombineNormGemma = 70,
     /// Fused pre-FFN-norm-2 + expert GLU. Same as [`DevOp::MoeExpertGluGemma`] but
     /// takes raw residual + gamma and computes RMSNorm inline, eliminating a separate
-    /// RmsNorm packet. `t0=fu t1=resid t2=table t3=ewt t4=gamma` ·
-    /// `i0=k i1=I i2=H i3=n_exp` · `f0=eps`.
+    /// RmsNorm packet. `t0=fu t1=resid t2=table t3=ewt t4=gamma t5=xn_scratch` ·
+    /// `i0=k i1=I i2=H i3=n_exp` · `f0=eps`. `t5` (B*H bf16) stages the normed rows for the
+    /// B>1 vector body; it rides every rung because the decode-ladder validator compares operands.
+    /// Grouped decode (PLOW_GEMMA_MOE_DEC_GROUP): slots 6, 7 carry the align op's meta and
+    /// row_token, fu is the gathered tensor, immediate 4 is the activation and immediate 6 the row
+    /// threshold at or above which the grouped tensor-core GLU body runs.
     MoeExpertGluNormGemma = 71,
     /// Fused MoE layer tail: ([`DevOp::MoeCombineNormGemma`] → NormResidualNorm) in one
     /// counter-gated packet — combine + post_ffn norm, sandwich residual, and the NEXT
@@ -728,6 +735,8 @@ pub enum DevOp {
     /// (destination row in part[T*k,H]; UNUSED for pad); `row_gate` = the slot gate.
     /// `t0=meta(i32) t1=table t2=row_token(u32) t3=row_partidx(u32) t4=row_gate(f32)` ·
     /// `i0=T i1=n_exp i2=k`.
+    /// In a DECODE program (grouped decode) immediate 3 is a row threshold: below it the op
+    /// returns at once. Prefill leaves it 0.
     MoeAlignGemmaPf = 74,
     /// Grouped gate/up GEMM + GeGLU. Flat tile list over (workitem→(expert,m_tile))×n_tiles; A
     /// gathered from `xn2` via `row_token`; B = fused `ewt[e*2+0]` (`[2*I,H]`); GeGLU epilogue to

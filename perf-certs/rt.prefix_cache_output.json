@@ -1,0 +1,565 @@
+{
+ "schema": 1,
+ "knob": "rt.prefix_cache_output",
+ "request": {
+  "touched": [
+   {
+    "rung": "gemma4-12b.h100.bf16/serve/in2304-c4-out128",
+    "treat": "cert-e_out:in2304-c4:tpot_ms:treat",
+    "neutral_evidence": [
+     "prefix-cache feature knob: its measured wins are on workloads this single-turn prefix-repetition cell does not exercise (knob_spec evidence); here within floor (multi-turn follow-up output reuse)"
+    ]
+   },
+   {
+    "rung": "gemma4-12b.h100.bf16/serve/in2304-c4-out128",
+    "treat": "cert-e_out:in2304-c4:ttft_ms:treat",
+    "neutral_evidence": [
+     "prefix-cache feature knob: its measured wins are on workloads this single-turn prefix-repetition cell does not exercise (knob_spec evidence); here within floor (multi-turn follow-up output reuse)"
+    ]
+   }
+  ],
+  "untouched": [],
+  "tier4": true,
+  "serving": [
+   "cert-e_out:in2304-c4:tpot_ms:treat",
+   "cert-e_out:in2304-c4:tpot_ms:treat2",
+   "cert-e_out:in2304-c4:ttft_ms:treat",
+   "cert-e_out:in2304-c4:ttft_ms:treat2"
+  ],
+  "numeric": false,
+  "facts": [
+   {
+    "kind": "gate",
+    "pass": true,
+    "evidence": "coherence gate PASS on ctrl, ctrl2, treat, treat2 (run-record.json of each)"
+   }
+  ],
+  "ledger": [
+   {
+    "id": "cert-e_out:in2304-c4:tpot_ms:treat",
+    "job": "cert-e_out",
+    "metric": "tpot_ms",
+    "better": "lower",
+    "rung": {
+     "digest": "gemma4-12b.h100.bf16/serve/in2304-c4-out128",
+     "prior": 0,
+     "role": "serve",
+     "rows": 2304,
+     "topology": "C4"
+    },
+    "samples": [
+     14.173356445098761,
+     13.040025149166468,
+     11.255517732934095,
+     12.145184313339996,
+     12.33205328026088,
+     12.161496155385976,
+     12.164041680080118,
+     12.179106219264213,
+     11.420449664001353,
+     11.245442601648392,
+     12.153779898653738,
+     12.1887721325038,
+     11.44919801481592,
+     11.252182195676141,
+     11.255342735239537,
+     12.16283000758267,
+     12.334594195635873,
+     11.274524469627067,
+     11.254574805207085,
+     11.275699405814521,
+     11.429260532167973,
+     11.250477688008687,
+     11.245869616686832,
+     11.267757592577254,
+     11.429157484599273,
+     11.253373844738235,
+     11.427635727159213,
+     11.2700043591758,
+     11.243945906244335,
+     11.245913765378646,
+     11.079401414463064,
+     10.919332265984849
+    ],
+    "stats": {
+     "median": 11.348074534907937,
+     "mad": 0.10218284387519816,
+     "n": 32,
+     "p95": 13.040025149166468
+    },
+    "knob_delta": {
+     "PLOW_PREFIX_CACHE_OUTPUT": "default"
+    },
+    "recipe_digest": "df11734dd142dc26",
+    "hardware": {
+     "box": "1xNVIDIA H100 80GB HBM3",
+     "driver": "595.91.07",
+     "firmware": null,
+     "cuda": null
+    },
+    "harness": "campaign-bench",
+    "date": "2026-09-22",
+    "control_of": "cert-e_out:in2304-c4:tpot_ms:ctrl",
+    "repeat_control_of": "cert-e_out:in2304-c4:tpot_ms:ctrl2"
+   },
+   {
+    "id": "cert-e_out:in2304-c4:tpot_ms:ctrl",
+    "job": "cert-e_out",
+    "metric": "tpot_ms",
+    "better": "lower",
+    "rung": {
+     "digest": "gemma4-12b.h100.bf16/serve/in2304-c4-out128",
+     "prior": 0,
+     "role": "serve",
+     "rows": 2304,
+     "topology": "C4"
+    },
+    "samples": [
+     13.08674596111814,
+     11.240745219765813,
+     11.95831999211805,
+     13.085086475257413,
+     12.129918921345961,
+     12.126636274842895,
+     11.053098203774425,
+     12.028486733470345,
+     11.221492537515587,
+     11.22294365632115,
+     11.047544483517413,
+     12.01276679057628,
+     11.228016586755984,
+     11.228052913793363,
+     11.053830561650102,
+     11.08291040691256,
+     12.173707524198107,
+     11.042035852369736,
+     11.044708102417644,
+     11.05857738366467,
+     11.39129502189462,
+     11.029878327462939,
+     11.029720984879532,
+     11.053832835386856,
+     11.388122531570843,
+     11.031251719032298,
+     11.03193618109799,
+     11.053302891014027,
+     11.392764039555914,
+     11.033590664737858,
+     11.03446240631456,
+     10.869960968193482
+    ],
+    "stats": {
+     "median": 11.152201472214074,
+     "mad": 0.11943804929614998,
+     "n": 32,
+     "p95": 13.085086475257413
+    },
+    "knob_delta": {},
+    "recipe_digest": "df11734dd142dc26",
+    "hardware": {
+     "box": "1xNVIDIA H100 80GB HBM3",
+     "driver": "595.91.07",
+     "firmware": null,
+     "cuda": null
+    },
+    "harness": "campaign-bench",
+    "date": "2026-09-22"
+   },
+   {
+    "id": "cert-e_out:in2304-c4:tpot_ms:ctrl2",
+    "job": "cert-e_out",
+    "metric": "tpot_ms",
+    "better": "lower",
+    "rung": {
+     "digest": "gemma4-12b.h100.bf16/serve/in2304-c4-out128",
+     "prior": 0,
+     "role": "serve",
+     "rows": 2304,
+     "topology": "C4"
+    },
+    "samples": [
+     11.9589075075055,
+     11.958551875068224,
+     11.062271281844005,
+     13.159567788534332,
+     12.183084296339075,
+     11.991047882474959,
+     11.973381102507119,
+     11.975884750427213,
+     11.3859032644541,
+     11.197751555300783,
+     11.958692733969656,
+     11.962435242821812,
+     11.397172969736857,
+     11.204627484403318,
+     11.044479180782218,
+     11.041899446354364,
+     12.317875180087867,
+     11.217098921406432,
+     11.050167742723715,
+     11.049948203435633,
+     11.396760297429864,
+     11.206121336726937,
+     11.048917171137873,
+     11.046730640373426,
+     11.402722140701371,
+     11.20770886700484,
+     11.049407248719945,
+     11.049535452912096,
+     11.397693046092172,
+     11.208434118088917,
+     10.865467500480008,
+     10.864657398997224
+    ],
+    "stats": {
+     "median": 11.212766519747674,
+     "mad": 0.17856526119430782,
+     "n": 32,
+     "p95": 12.317875180087867
+    },
+    "knob_delta": {},
+    "recipe_digest": "df11734dd142dc26",
+    "hardware": {
+     "box": "1xNVIDIA H100 80GB HBM3",
+     "driver": "595.91.07",
+     "firmware": null,
+     "cuda": null
+    },
+    "harness": "campaign-bench",
+    "date": "2026-09-22"
+   },
+   {
+    "id": "cert-e_out:in2304-c4:ttft_ms:treat",
+    "job": "cert-e_out",
+    "metric": "ttft_ms",
+    "better": "lower",
+    "rung": {
+     "digest": "gemma4-12b.h100.bf16/serve/in2304-c4-out128",
+     "prior": 0,
+     "role": "serve",
+     "rows": 2304,
+     "topology": "C4"
+    },
+    "samples": [
+     31.83074900880456,
+     189.673971850425,
+     489.8818919900805,
+     339.69908487051725,
+     48.97306906059384,
+     71.71667995862663,
+     188.3506418671459,
+     187.89168307557702,
+     167.03103203326464,
+     190.11035980656743,
+     73.53185908868909,
+     70.50421484746039,
+     167.39731002599,
+     191.19030400179327,
+     75.86493110284209,
+     72.281532920897,
+     50.810107961297035,
+     188.77452099695802,
+     188.4553439449519,
+     72.16679793782532,
+     50.04374007694423,
+     72.47264310717583,
+     74.400455923751,
+     71.34911906905472,
+     50.67911301739514,
+     73.53556691668928,
+     73.95779597572982,
+     70.98490092903376,
+     73.62997904419899,
+     59.713338036090136,
+     50.33569619990885,
+     70.6207740586251
+    ],
+    "stats": {
+     "median": 73.53371300268918,
+     "mad": 22.789102513343096,
+     "n": 32,
+     "p95": 339.69908487051725
+    },
+    "knob_delta": {
+     "PLOW_PREFIX_CACHE_OUTPUT": "default"
+    },
+    "recipe_digest": "df11734dd142dc26",
+    "hardware": {
+     "box": "1xNVIDIA H100 80GB HBM3",
+     "driver": "595.91.07",
+     "firmware": null,
+     "cuda": null
+    },
+    "harness": "campaign-bench",
+    "date": "2026-09-22",
+    "control_of": "cert-e_out:in2304-c4:ttft_ms:ctrl",
+    "repeat_control_of": "cert-e_out:in2304-c4:ttft_ms:ctrl2"
+   },
+   {
+    "id": "cert-e_out:in2304-c4:ttft_ms:ctrl",
+    "job": "cert-e_out",
+    "metric": "ttft_ms",
+    "better": "lower",
+    "rung": {
+     "digest": "gemma4-12b.h100.bf16/serve/in2304-c4-out128",
+     "prior": 0,
+     "role": "serve",
+     "rows": 2304,
+     "topology": "C4"
+    },
+    "samples": [
+     160.23298492655158,
+     468.90053199604154,
+     319.177603116259,
+     159.30993505753577,
+     72.69265805371106,
+     72.24548794329166,
+     209.74541315808892,
+     186.387550085783,
+     173.7603668589145,
+     173.64459484815598,
+     196.34292391128838,
+     71.21669501066208,
+     172.49134904704988,
+     172.47544904239476,
+     194.8937128763646,
+     71.04832213371992,
+     52.22979583777487,
+     209.27490293979645,
+     195.13530796393752,
+     192.21434486098588,
+     49.2613420356065,
+     95.72115493938327,
+     95.45207908377051,
+     92.69975800998509,
+     49.270902993157506,
+     95.14034097082913,
+     94.95470789261162,
+     92.261360026896,
+     49.19956088997424,
+     95.29748605564237,
+     95.08187114261091,
+     92.47689507901669
+    ],
+    "stats": {
+     "median": 95.58661701157689,
+     "mad": 46.35616554878652,
+     "n": 32,
+     "p95": 319.177603116259
+    },
+    "knob_delta": {},
+    "recipe_digest": "df11734dd142dc26",
+    "hardware": {
+     "box": "1xNVIDIA H100 80GB HBM3",
+     "driver": "595.91.07",
+     "firmware": null,
+     "cuda": null
+    },
+    "harness": "campaign-bench",
+    "date": "2026-09-22"
+   },
+   {
+    "id": "cert-e_out:in2304-c4:ttft_ms:ctrl2",
+    "job": "cert-e_out",
+    "metric": "ttft_ms",
+    "better": "lower",
+    "rung": {
+     "digest": "gemma4-12b.h100.bf16/serve/in2304-c4-out128",
+     "prior": 0,
+     "role": "serve",
+     "rows": 2304,
+     "topology": "C4"
+    },
+    "samples": [
+     319.1536969970912,
+     318.9751831814647,
+     470.80773999914527,
+     151.51625988073647,
+     49.9763791449368,
+     74.67879098840058,
+     229.70244684256613,
+     192.6467379089445,
+     166.2817490287125,
+     190.06917183287442,
+     92.5379570107907,
+     92.35428203828633,
+     165.78117804601789,
+     190.60868304222822,
+     93.56668894179165,
+     93.23795209638774,
+     47.523535788059235,
+     188.7405829038471,
+     210.60480480082333,
+     210.3177891112864,
+     48.4805260784924,
+     72.9378538671881,
+     93.3183440938592,
+     93.08022796176374,
+     47.871742863208055,
+     73.12488788738847,
+     93.54720893315971,
+     93.21470092982054,
+     48.44332602806389,
+     72.76640995405614,
+     93.10895879752934,
+     92.90169482119381
+    ],
+    "stats": {
+     "median": 93.27814809512347,
+     "mad": 44.81622204184532,
+     "n": 32,
+     "p95": 319.1536969970912
+    },
+    "knob_delta": {},
+    "recipe_digest": "df11734dd142dc26",
+    "hardware": {
+     "box": "1xNVIDIA H100 80GB HBM3",
+     "driver": "595.91.07",
+     "firmware": null,
+     "cuda": null
+    },
+    "harness": "campaign-bench",
+    "date": "2026-09-22"
+   },
+   {
+    "id": "cert-e_out:in2304-c4:tpot_ms:treat2",
+    "job": "cert-e_out",
+    "metric": "tpot_ms",
+    "better": "lower",
+    "rung": {
+     "digest": "gemma4-12b.h100.bf16/serve/in2304-c4-out128",
+     "prior": 0,
+     "role": "serve",
+     "rows": 2304,
+     "topology": "C4"
+    },
+    "samples": [
+     11.950646961849998,
+     11.064353311667219,
+     13.143643867806531,
+     11.949926249144482,
+     12.182039063191041,
+     11.99774227279704,
+     11.980603234405862,
+     11.982246624029358,
+     11.411797138862312,
+     11.039224023988936,
+     12.103928782380535,
+     11.039267852538615,
+     11.208355954295257,
+     11.08246347757813,
+     11.228911242142203,
+     12.098608905944275,
+     11.189536953679635,
+     11.186806032128516,
+     11.061599196182215,
+     11.259483773756074,
+     11.2283347734774,
+     11.228925639443332,
+     11.405807032133453,
+     11.242107493671938,
+     11.235302812565351,
+     11.238919834795524,
+     11.225473930608132,
+     11.22440139806713,
+     11.221611266591935,
+     11.223963116208324,
+     10.882349577514105,
+     10.883217641094234
+    ],
+    "stats": {
+     "median": 11.228918440792768,
+     "mad": 0.16594218686805107,
+     "n": 32,
+     "p95": 12.182039063191041
+    },
+    "knob_delta": {
+     "PLOW_PREFIX_CACHE_OUTPUT": "default"
+    },
+    "recipe_digest": "df11734dd142dc26",
+    "hardware": {
+     "box": "1xNVIDIA H100 80GB HBM3",
+     "driver": "595.91.07",
+     "firmware": null,
+     "cuda": null
+    },
+    "harness": "campaign-bench",
+    "date": "2026-09-22",
+    "control_of": "cert-e_out:in2304-c4:tpot_ms:ctrl",
+    "repeat_control_of": "cert-e_out:in2304-c4:tpot_ms:ctrl2"
+   },
+   {
+    "id": "cert-e_out:in2304-c4:ttft_ms:treat2",
+    "job": "cert-e_out",
+    "metric": "ttft_ms",
+    "better": "lower",
+    "rung": {
+     "digest": "gemma4-12b.h100.bf16/serve/in2304-c4-out128",
+     "prior": 0,
+     "role": "serve",
+     "rows": 2304,
+     "topology": "C4"
+    },
+    "samples": [
+     318.31556488759816,
+     468.7211490236223,
+     152.15991204604506,
+     317.46713700704277,
+     50.111810909584165,
+     74.66772990301251,
+     229.32321508415043,
+     192.3913499340415,
+     167.025902075693,
+     214.53969716094434,
+     95.49813019111753,
+     61.554827028885484,
+     183.64337109960616,
+     203.4919480793178,
+     170.0453779194504,
+     67.59909796528518,
+     179.72463578917086,
+     179.07577310688794,
+     196.89817703329027,
+     66.03427394293249,
+     75.48566814512014,
+     74.71626112237573,
+     96.37623792514205,
+     71.82797882705927,
+     59.88150089979172,
+     59.45766298100352,
+     72.4222119897604,
+     58.87518008239567,
+     59.418100863695145,
+     59.155914932489395,
+     59.14590507745743,
+     58.9227001182735
+    ],
+    "stats": {
+     "median": 85.49189916811883,
+     "mad": 26.59295906778425,
+     "n": 32,
+     "p95": 318.31556488759816
+    },
+    "knob_delta": {
+     "PLOW_PREFIX_CACHE_OUTPUT": "default"
+    },
+    "recipe_digest": "df11734dd142dc26",
+    "hardware": {
+     "box": "1xNVIDIA H100 80GB HBM3",
+     "driver": "595.91.07",
+     "firmware": null,
+     "cuda": null
+    },
+    "harness": "campaign-bench",
+    "date": "2026-09-22",
+    "control_of": "cert-e_out:in2304-c4:ttft_ms:ctrl",
+    "repeat_control_of": "cert-e_out:in2304-c4:ttft_ms:ctrl2"
+   }
+  ]
+ },
+ "certificate": {
+  "ok": true,
+  "notes": "flip accepted: accept: gemma4-12b.h100.bf16/serve/in2304-c4-out128: neutral within floor 0.417, cited [prefix-cache feature knob: its measured wins are on workloads this single-turn prefix-repetition cell does not exercise (knob_spec evidence); here within floor (multi-turn follow-up output reuse)] | accept: gemma4-12b.h100.bf16/serve/in2304-c4-out128: neutral within floor 95.020, cited [prefix-cache feature knob: its measured wins are on workloads this single-turn prefix-repetition cell does not exercise (knob_spec evidence); here within floor (multi-turn follow-up output reuse)] | accept: serving tpot_ms: 11.182 -> 11.348 (floor 0.417) | accept: serving tpot_ms: 11.182 -> 11.228 (floor 0.417) | accept: serving ttft_ms: 94.432 -> 73.533 (floor 95.020) | accept: serving ttft_ms: 94.432 -> 85.491 (floor 95.020) | accept: tier 4 measured | accept: no numeric-changing field in scope",
+  "checkpoint": "P"
+ }
+}

@@ -384,10 +384,17 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
   fi
 fi
 
+# The packet header derives the full-layer GQA fusion from the model (8 for the Gemma-4 12B/26B);
+# a -D here would override it, and the interpreter traps when gqa % PLOW_NV_FA_GF_FULL != 0.
+GF_FULL="-DPLOW_NV_FA_GF_FULL=${PLOW_NV_FA_GF_FULL:-4}"
+if [ -z "${PLOW_NV_FA_GF_FULL:-}" ] && [ -n "${PLOW_CUBIN_CONFIG:-}" ] &&
+   grep -q '^#define PLOW_NV_FA_GF_FULL ' "$PLOW_CUBIN_CONFIG"; then
+  GF_FULL=""
+fi
 "${NVENV[@]}" \
   "$NVCC" -arch=sm_90a -O3 -cubin \
   -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
-  $PACKET_GEOMETRY -DPLOW_NV_FA_GF_FULL=4 -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $DECODE_EXTRA \
+  $PACKET_GEOMETRY $GF_FULL -DPLOW_NV_FA_TC_GQA8_HD512="${PLOW_NV_FA_TC_GQA8_HD512:-1}" -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $DECODE_EXTRA \
   -o "$OUT" "$SRC"
 
 if ! "${NVENV[@]}" \

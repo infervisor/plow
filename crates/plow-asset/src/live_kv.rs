@@ -436,6 +436,27 @@ impl Manifest {
                                 "scale writer contract",
                             )?;
                         }
+                        // FUSED KV PAIR (devgen `fuse_kv`, i[7]=1): ONE HeadNormRope writes both
+                        // halves of a layer's cache — k at slot 0, v here at slot 6, with v's
+                        // source activation in slot 7. bf16 only: under fp8 slot 6 is the scale
+                        // handle, which is why that arm above matches the fp8 opcode alone.
+                        // The k half at slot 0 checks the shared immediates; this checks that the
+                        // two halves are the SAME declared pair, and registers v's write so
+                        // `cache access coverage` still sees every handle written exactly once.
+                        DevOp::HeadNormRope if slot == 6 && d.i[7] == 1 => {
+                            let c = self
+                                .caches
+                                .iter()
+                                .find(|c| c.pair.contains(&h))
+                                .ok_or("fused KV pair writer targets scale")?;
+                            require(
+                                c.scales.is_none()
+                                    && c.pair.contains(&d.t[0])
+                                    && d.t[0] != h
+                                    && writes.insert(h),
+                                "fused KV pair writer contract",
+                            )?;
+                        }
                         DevOp::HeadNormRope | DevOp::HeadNormRopeFp8 if slot == 0 => {
                             let c = self
                                 .caches
@@ -468,7 +489,13 @@ impl Manifest {
                                     && d.fj[1] == c.stride
                                     && d.fj[2] == c.mask
                                     && d.t[5] == self.position
-                                    && d.t[7] == TENSOR_NONE16
+                                    && (if d.i[7] == 1 {
+                                        // fused KV pair: t[6]/t[7] are v's (cache, source);
+                                        // the slot-6 arm above validates the cache half.
+                                        op == DevOp::HeadNormRope && c.scales.is_none()
+                                    } else {
+                                        d.t[7] == TENSOR_NONE16
+                                    })
                                     && (if prefill {
                                         d.i[6] == 0
                                     } else {
@@ -619,6 +646,28 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::MoeDownMx
                 | DevOp::MoeGluMxPf
                 | DevOp::MoeDownMxPf
+                // Gemma-4 26B-A4B MoE, decode (61-72) and grouped prefill (73-77).
+                // Audited against the operand contracts in packet::dev: every one of these
+                // reads and writes only hidden-state activations, routing metadata
+                // (table/meta/row_token/row_partidx/row_gate/score) and expert weights
+                // (`ewt`/`proj`/`est`). None names a KV cache pair, and none takes a
+                // generated tensor map, so none can reach the cache the manifest guards.
+                // Same class as the mxfp4 MoE ops listed above.
+                | DevOp::MoeRouterGemma
+                | DevOp::MoeExpertGluGemma
+                | DevOp::MoeExpertDownGemma
+                | DevOp::MoeCombineGemma
+                | DevOp::MoeRouterGemmaScore
+                | DevOp::MoeRouterGemmaScoreFast
+                | DevOp::MoeRouterGemmaTopk
+                | DevOp::MoeCombineNormGemma
+                | DevOp::MoeExpertGluNormGemma
+                | DevOp::MoeCombineResidNormGemma
+                | DevOp::MoeRouterGemmaPf
+                | DevOp::MoeAlignGemmaPf
+                | DevOp::MoeGroupGluGemmaPf
+                | DevOp::MoeGroupDownGemmaPf
+                | DevOp::MoeCombineNormGemmaPf
         ),
         "opcode has no audited direct-operand access contract",
     )

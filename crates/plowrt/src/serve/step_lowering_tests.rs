@@ -244,6 +244,7 @@ fn a_packing_engine_accepts_every_pack_and_chunk_the_planner_emits() {
         packing: true,
         split_spans: false,
         decode_rows_join_prefill: false,
+        span_policy: None,
     };
     let (packs, chunks) = run(amd, true, u32::MAX);
     assert!(packs > 0, "the ragged mixes contain packable pairs");

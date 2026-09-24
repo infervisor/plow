@@ -45,12 +45,34 @@ pub struct Map {
     pub original: u16,
     pub slots: u16,
 }
+/// One sub-chunk stage's tables. A staged launch runs the same program `stages.len()` times,
+/// each time bound to its own clipped span table and slot mask (see [`plan_stage`],
+/// [`stage_slots`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Stage {
+    pub slot: u16,
+    pub request: u16,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_request_rows: Option<u32>,
+    /// Rows a request may write per LAUNCH when the chunk is staged. This, not
+    /// `max_request_rows`, is what the sliding-ring invariant is sized against, which is the
+    /// whole point: a 4096-row chunk staged at 1024 needs a 2048-row ring instead of 8192, so 32
+    /// slots fit at ctx 16k without narrowing the launch to 1024 rows.
+    ///
+    /// Declaring it is only sound if every staged site is actually bound per stage, so it
+    /// REQUIRES `stages` and masked padding; validation refuses it otherwise. A packet that
+    /// claimed a short ring while still writing the whole chunk in one launch would wrap rows
+    /// onto the rows its own queries read — silent corruption, not a fault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_rows: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<Stage>,
     pub slot: u16,
     pub request: u16,
     pub maps: Vec<Map>,
@@ -87,8 +109,36 @@ impl Manifest {
         Ok(())
     }
 
+    /// Does this instruction already carry a STAGE's tables rather than the whole chunk's?
+    ///
+    /// A staged site is bound at emit, not at load: `FlashPrefill` has all eight `i[]` and all
+    /// three `fj[]` operands occupied, so there is no slot to tag it with a stage index, and the
+    /// stage is instead identified by which table handle it holds.
+    fn is_staged_site(&self, d: &DevInst64) -> bool {
+        if self.stages.is_empty() {
+            return false;
+        }
+        let mut any = |f: &dyn Fn(&Stage) -> bool| self.stages.iter().any(|s| f(s));
+        match DevOp::from_u16(d.op) {
+            Some(DevOp::HeadNormRope) => any(&|s: &Stage| d.t[6] == s.slot),
+            Some(DevOp::HeadNormRopeFp8) => any(&|s: &Stage| d.t[7] == s.slot),
+            Some(DevOp::FlashPrefill) => any(&|s: &Stage| d.t[6] == s.request),
+            Some(DevOp::FlashMerge) => any(&|s: &Stage| d.t[7] == s.request),
+            Some(DevOp::FlashPrefillFp8) => {
+                any(&|s: &Stage| d.i[4] == FP8_REQUEST_TAG | u32::from(s.request))
+            }
+            _ => false,
+        }
+    }
+
     /// Bind a validated prefill instruction, or restore its ordinary request operands.
     pub fn bind_request(&self, d: &mut DevInst64, packed: bool) {
+        // A staged site already holds its own stage's span table and slot mask. Rebinding it to
+        // the whole-chunk tables would make every stage write every row — precisely the wrap the
+        // shortened ring cannot survive, and silent: wrong tokens, no fault.
+        if self.is_staged_site(d) {
+            return;
+        }
         let slot = if packed { self.slot } else { TENSOR_NONE16 };
         let request = if packed { self.request } else { TENSOR_NONE16 };
         match DevOp::from_u16(d.op) {
@@ -115,6 +165,33 @@ impl Manifest {
         }
     }
 
+    /// Rows one LAUNCH may write per request — what the sliding ring must be sized against.
+    ///
+    /// Unstaged that is the request's whole chunk. Staging is the only thing that makes it
+    /// smaller, and it is gated hard because getting it wrong is SILENT: a packet that claimed a
+    /// short ring while still writing the whole chunk in one launch would wrap a request's rows
+    /// onto the rows its own queries read, producing wrong tokens rather than a fault.
+    fn write_rows(&self, request_rows: u32) -> Result<u32> {
+        let Some(stage_rows) = self.stage_rows else {
+            need(self.stages.is_empty(), "stages without stage_rows")?;
+            return Ok(request_rows);
+        };
+        need(
+            self.max_request_rows.is_some(),
+            "staging requires masked padding (max_request_rows): a stage masks the rows outside \
+             it to -1, and on an unmasked plan the padding rows carry a real slot",
+        )?;
+        need(
+            stage_rows > 0 && stage_rows <= request_rows,
+            "stage_rows must be non-zero and within the request limit",
+        )?;
+        need(
+            self.stages.len() == (request_rows as usize).div_ceil(stage_rows as usize),
+            "one stage binding per stage the request limit needs",
+        )?;
+        Ok(stage_rows)
+    }
+
     pub fn validate(&self, p: &Packet<'_>, live: &live_kv::Manifest) -> Result<()> {
         live.validate(p)?;
         need(
@@ -131,20 +208,22 @@ impl Manifest {
             .max()
             .unwrap();
         need(rows <= i32::MAX as u32, "row index width")?;
-        let write_rows = self.max_request_rows.unwrap_or(rows);
+        let request_rows = self.max_request_rows.unwrap_or(rows);
         if self.max_request_rows.is_some() {
             need(
-                write_rows > 0
-                    && write_rows <= rows
+                request_rows > 0
+                    && request_rows <= rows
                     && p.programs[..p.prefill_count]
                         .iter()
-                        .any(|g| g.rows == write_rows),
+                        .any(|g| g.rows == request_rows),
                 "request limit must match a prefill rung",
             )?;
         }
+        let write_rows = self.write_rows(request_rows)?;
         for cache in &live.caches {
             need(
                 cache.window == 0
+                    || u64::from(cache.stride) >= u64::from(live.max_ctx)
                     || u64::from(cache.stride)
                         >= u64::from(cache.window) + u64::from(write_rows) - 1,
                 "ring must retain the attention window across all padded KV writes",
@@ -168,6 +247,29 @@ impl Manifest {
                     && !t.initialized,
                 "declared table geometry",
             )?;
+        }
+        // Each stage carries its OWN clipped span table and slot mask, with the same geometry as
+        // the unstaged pair and a distinct handle, so a stage can never be bound to another
+        // stage's rows.
+        for (i, stage) in self.stages.iter().enumerate() {
+            for (h, name, bytes) in [
+                (stage.slot, format!("pf.request.slot.{i}"), u64::from(rows) * 4),
+                (
+                    stage.request,
+                    format!("pf.request.table.{i}"),
+                    (1 + 4 * u64::from(live.batch)) * 4,
+                ),
+            ] {
+                let t = p.tensors.get(h as usize).ok_or("packed stage table handle")?;
+                need(
+                    h != TENSOR_NONE16
+                        && handles.insert(h)
+                        && t.name == name
+                        && t.bytes == bytes
+                        && !t.initialized,
+                    "declared stage table geometry",
+                )?;
+            }
         }
         let mut originals = BTreeSet::new();
         for m in &self.maps {
@@ -428,6 +530,103 @@ pub fn plan_with_limit(
     out.mapped_ends[padding_index].1 = padded as u32;
     Ok(out)
 }
+
+/// The span table for sub-chunk STAGE `stage` of a packed prefill processed in slices of
+/// `stage_rows` rows per request.
+///
+/// WHY. The sliding-window KV ring invariant (`dev_isa.h`, "SLIDING-WINDOW KV RING") is
+/// `ring >= window + rows_written_per_request_per_launch - 1`, because a launch writes ALL its
+/// K/V rows before any flash reads and a request's rows must not wrap onto the rows its own
+/// queries read. Writing a whole 4096-row chunk therefore needs an 8192-row ring — 2.5 GiB per
+/// slot on the 12B, so only 16 slots fit at ctx 16k. Writing the same chunk in 1024-row stages
+/// needs only 2048 ring rows (640 MiB) and 32 slots fit, WITHOUT dropping the launch width to
+/// 1024 (which is what makes the chunk-1024 32-slot packet lose long prompts: it turns a 15k
+/// prompt into 15 launches).
+///
+/// The flash body needs NO change. It already derives `rq0`, `qlen`, `slot` and `kvlen` per
+/// request from this table and computes `qp0 = kvlen - qlen` itself (`op_attention_sm90.cuh`),
+/// so clipping the table is enough: for stage `i` this yields `qp0 = r.start + i * stage_rows`,
+/// the stage's true absolute query position, which is what the causal mask and the
+/// sliding-window floor read.
+///
+/// A request shorter than the stage offset contributes a ZERO-length entry rather than being
+/// dropped, so entry `r` keeps addressing request `r` in every stage. The kernel already
+/// guards this: its per-request work count is 0 when `qlen <= 0`.
+pub fn plan_stage(plan: &Plan, stage: usize, stage_rows: usize) -> Result<Vec<i32>> {
+    let nreq = stage_table_reqs(&plan.table, stage_rows)?;
+    let skip = stage.checked_mul(stage_rows).ok_or("stage offset overflow")?;
+    let mut out = Vec::with_capacity(plan.table.len());
+    out.push(plan.table[0]);
+    for r in 0..nreq {
+        let rq0 = plan.table[1 + 4 * r];
+        let qlen = plan.table[2 + 4 * r];
+        let slot = plan.table[3 + 4 * r];
+        let kvlen = plan.table[4 + 4 * r];
+        need(qlen >= 0 && kvlen >= qlen, "span entry")?;
+        // `kvlen - qlen` is the request's frontier: the prior context this chunk continues from.
+        let start = kvlen - qlen;
+        let taken = (qlen as usize).min(skip) as i32;
+        let len = ((qlen - taken) as usize).min(stage_rows) as i32;
+        out.extend_from_slice(&[rq0 + taken, len, slot, start + taken + len]);
+    }
+    Ok(out)
+}
+
+/// The per-row slot map for sub-chunk STAGE `stage`: every row outside the stage is masked to
+/// `-1`, so only this stage's rows write K/V.
+///
+/// A stage's rows are NOT contiguous in the packed buffer — with two requests packed, stage 0 is
+/// rows `[rq0_a, rq0_a+S)` and `[rq0_b, rq0_b+S)` — so a row offset and count cannot express it.
+/// A mask can, and needs no kernel change: `d_headnorm_rope` already skips a masked row
+/// (`op_norm.cuh:781`, `if (out_stride && pfslot && pfslot[t] < 0) continue;`, and the same at
+/// `:985` for the fp8 arm). That is the masked-padding mechanism, reused per stage.
+///
+/// Requires a plan whose padding is ALREADY masked — `plan_with_limit` with `max_request_rows`,
+/// i.e. a `PLOW_MAX_REQUEST_CHUNK` packet. On an unmasked plan the padding rows carry a real
+/// slot and exist so every bucket row is owned; masking them here would silently change what the
+/// KV write covers, and the object must also advertise `plow_pf_masked_padding_abi`.
+pub fn stage_slots(plan: &Plan, stage: usize, stage_rows: usize) -> Result<Vec<i32>> {
+    let nreq = stage_table_reqs(&plan.table, stage_rows)?;
+    let skip = stage.checked_mul(stage_rows).ok_or("stage offset overflow")?;
+    let covered: usize = (0..nreq)
+        .map(|r| plan.table[2 + 4 * r].max(0) as usize)
+        .sum();
+    need(
+        plan.slots.len() >= covered && plan.slots[covered..].iter().all(|&s| s < 0),
+        "stage slots need a masked-padding plan (plan_with_limit with max_request_rows)",
+    )?;
+    let mut out = vec![-1i32; plan.slots.len()];
+    for r in 0..nreq {
+        let rq0 = plan.table[1 + 4 * r] as usize;
+        let qlen = plan.table[2 + 4 * r].max(0) as usize;
+        let taken = qlen.min(skip);
+        let len = (qlen - taken).min(stage_rows);
+        let from = rq0 + taken;
+        need(from + len <= plan.slots.len(), "stage row extent")?;
+        out[from..from + len].copy_from_slice(&plan.slots[from..from + len]);
+    }
+    Ok(out)
+}
+
+/// How many stages `plan` needs at `stage_rows`: the longest request decides, and a plan whose
+/// every request already fits one stage needs exactly one — the unstaged launch, unchanged.
+pub fn stages_needed(plan: &Plan, stage_rows: usize) -> Result<usize> {
+    let nreq = stage_table_reqs(&plan.table, stage_rows)?;
+    let longest = (0..nreq)
+        .map(|r| plan.table[2 + 4 * r].max(0) as usize)
+        .max()
+        .unwrap_or(0);
+    Ok(longest.div_ceil(stage_rows).max(1))
+}
+
+fn stage_table_reqs(table: &[i32], stage_rows: usize) -> Result<usize> {
+    need(stage_rows > 0, "stage_rows must be non-zero")?;
+    need(!table.is_empty() && table.len() % 4 == 1, "span table shape")?;
+    let nreq = table[0].max(0) as usize;
+    need(table.len() == 1 + 4 * nreq, "span table request count")?;
+    Ok(nreq)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +638,8 @@ mod tests {
                     let manifest = Manifest {
                         version,
                         max_request_rows: Some(1024),
+                        stage_rows: None,
+                        stages: Vec::new(),
                         slot: 0,
                         request: 1,
                         maps: vec![],
@@ -512,6 +713,8 @@ mod tests {
         ] {
             let m = Manifest {
                 max_request_rows: None,
+                stage_rows: None,
+                stages: Vec::new(),
                 version,
                 slot: 0,
                 request: 1,
@@ -558,6 +761,8 @@ mod tests {
         let manifest = Manifest {
             version: 2,
             max_request_rows: Some(1024),
+            stage_rows: None,
+            stages: Vec::new(),
             slot: 0,
             request: 1,
             maps: vec![],
@@ -730,5 +935,266 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Two requests of different lengths sharing one 4096-row launch, staged at 1024.
+    fn staged_plan() -> Plan {
+        plan_with_limit(
+            &[
+                // a long request continuing a 5000-token prefix, and a short fresh one
+                Request { slot: 0, start: 5000, len: 4000, prompt: 9000 },
+                Request { slot: 1, start: 0, len: 96, prompt: 96 },
+            ],
+            &[5000, 0],
+            4096,
+            16384,
+            Some(4096),
+        )
+        .expect("plan")
+    }
+
+    #[test]
+    fn stage_tables_cover_every_row_exactly_once_and_in_order() {
+        let plan = staged_plan();
+        let s = 1024;
+        assert_eq!(stages_needed(&plan, s).unwrap(), 4); // 4000 rows -> 4 stages
+        for r in 0..2usize {
+            let rq0 = plan.table[1 + 4 * r];
+            let qlen = plan.table[2 + 4 * r];
+            let mut next = rq0;
+            let mut total = 0;
+            for stage in 0..stages_needed(&plan, s).unwrap() {
+                let t = plan_stage(&plan, stage, s).unwrap();
+                assert_eq!(t[0], plan.table[0], "request count is preserved");
+                assert_eq!(t[3 + 4 * r], plan.table[3 + 4 * r], "slot is preserved");
+                let (srq0, slen) = (t[1 + 4 * r], t[2 + 4 * r]);
+                assert!(slen >= 0 && slen <= s as i32);
+                assert_eq!(srq0, next, "stages are contiguous in the packed Q buffer");
+                next += slen;
+                total += slen;
+            }
+            assert_eq!(total, qlen, "every row of the request is covered exactly once");
+        }
+    }
+
+    /// The whole point of the clipped table: the flash body computes `qp0 = kvlen - qlen`, and
+    /// that must land on the stage's true absolute query position or the causal mask and the
+    /// sliding-window floor are wrong.
+    #[test]
+    fn derived_qp0_is_the_stage_absolute_query_position() {
+        let plan = staged_plan();
+        let s = 1024;
+        for r in 0..2usize {
+            let qlen = plan.table[2 + 4 * r];
+            let start = plan.table[4 + 4 * r] - qlen;
+            for stage in 0..stages_needed(&plan, s).unwrap() {
+                let t = plan_stage(&plan, stage, s).unwrap();
+                let (slen, skvlen) = (t[2 + 4 * r], t[4 + 4 * r]);
+                let taken = qlen.min((stage * s) as i32);
+                assert_eq!(skvlen - slen, start + taken, "stage {stage} request {r} qp0");
+                // KV visible to this stage is exactly what has been written by the end of it.
+                assert_eq!(skvlen, start + taken + slen);
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_shorter_than_the_stage_offset_contributes_a_zero_length_entry() {
+        let plan = staged_plan();
+        // request 1 is 96 rows, so it is exhausted after stage 0.
+        for stage in 1..4 {
+            let t = plan_stage(&plan, stage, 1024).unwrap();
+            assert_eq!(t[2 + 4 * 1], 0, "stage {stage} leaves the short request empty");
+            // entry index still addresses request 1, and its slot is still intact
+            assert_eq!(t[3 + 4 * 1], plan.table[3 + 4 * 1]);
+        }
+    }
+
+    #[test]
+    fn one_stage_wide_enough_reproduces_the_unstaged_table() {
+        let plan = staged_plan();
+        assert_eq!(stages_needed(&plan, 4096).unwrap(), 1);
+        assert_eq!(plan_stage(&plan, 0, 4096).unwrap(), plan.table);
+    }
+
+    /// The ring invariant is about K/V WRITES, so the union of the stages' unmasked rows must be
+    /// exactly the rows the unstaged launch would have written — no row written twice (it would
+    /// wrap onto itself), none dropped (the KV would have a hole).
+    #[test]
+    fn stage_slot_masks_partition_the_written_rows() {
+        let plan = staged_plan();
+        let s = 1024;
+        let stages = stages_needed(&plan, s).unwrap();
+        let mut writes = vec![0u32; plan.slots.len()];
+        for stage in 0..stages {
+            let m = stage_slots(&plan, stage, s).unwrap();
+            assert_eq!(m.len(), plan.slots.len());
+            for (row, &slot) in m.iter().enumerate() {
+                if slot >= 0 {
+                    assert_eq!(slot, plan.slots[row], "an unmasked row keeps its own slot");
+                    writes[row] += 1;
+                }
+            }
+        }
+        for (row, &n) in writes.iter().enumerate() {
+            let expected = u32::from(plan.slots[row] >= 0);
+            assert_eq!(n, expected, "row {row} written {n} times, expected {expected}");
+        }
+    }
+
+    fn staged_manifest(stage_rows: Option<u32>, stages: usize) -> Manifest {
+        Manifest {
+            version: 1,
+            max_request_rows: Some(4096),
+            stage_rows,
+            stages: (0..stages)
+                .map(|i| Stage { slot: 10 + 2 * i as u16, request: 11 + 2 * i as u16 })
+                .collect(),
+            slot: 0,
+            request: 1,
+            maps: vec![],
+            programs: vec![],
+        }
+    }
+
+    /// The payoff: staging is what lets the ring be sized against the STAGE, not the chunk.
+    /// A 4096-row chunk staged at 1024 needs `window + 1024 - 1` instead of `window + 4096 - 1`,
+    /// which is the difference between 16 and 32 resident slots at ctx 16k on the 12B.
+    #[test]
+    fn staging_sizes_the_ring_against_the_stage_not_the_chunk() {
+        assert_eq!(staged_manifest(None, 0).write_rows(4096).unwrap(), 4096);
+        assert_eq!(staged_manifest(Some(1024), 4).write_rows(4096).unwrap(), 1024);
+        // and the ring each implies, at window 1024
+        let ring = |w: u32| (1024u32 + w - 1).next_power_of_two();
+        assert_eq!(ring(4096), 8192);
+        assert_eq!(ring(1024), 2048);
+    }
+
+    /// Every way of declaring staging that the runtime could not honour must be refused here,
+    /// because the consequence is silent KV corruption rather than a fault.
+    #[test]
+    fn staging_is_refused_unless_every_stage_is_actually_bound() {
+        // stages declared without stage_rows: nothing would ever select them
+        let mut m = staged_manifest(None, 4);
+        assert!(m.write_rows(4096).is_err());
+        // stage_rows without masked padding: padding rows carry a real slot, so masking lies
+        m = staged_manifest(Some(1024), 4);
+        m.max_request_rows = None;
+        assert!(m.write_rows(4096).is_err());
+        // too few / too many stage bindings for the width
+        assert!(staged_manifest(Some(1024), 3).write_rows(4096).is_err());
+        assert!(staged_manifest(Some(1024), 5).write_rows(4096).is_err());
+        // zero width, and a stage wider than the request limit
+        assert!(staged_manifest(Some(0), 4).write_rows(4096).is_err());
+        assert!(staged_manifest(Some(8192), 1).write_rows(4096).is_err());
+        // an exact single stage is legal and is just the unstaged width
+        assert_eq!(staged_manifest(Some(4096), 1).write_rows(4096).unwrap(), 4096);
+        // a width that does not divide the limit still needs a covering stage count
+        assert_eq!(staged_manifest(Some(1536), 3).write_rows(4096).unwrap(), 1536);
+        assert!(staged_manifest(Some(1536), 2).write_rows(4096).is_err());
+    }
+
+    /// The stage count the manifest demands must be the count `stages_needed` produces for the
+    /// widest request, or a plan would run stages the packet has no bindings for.
+    #[test]
+    fn manifest_stage_count_agrees_with_stages_needed() {
+        for (limit, stage_rows) in [(4096u32, 1024u32), (4096, 1536), (4096, 4096), (1024, 256)] {
+            let p = plan_with_limit(
+                &[Request { slot: 0, start: 0, len: limit as usize, prompt: 16384 }],
+                &[0],
+                limit as usize,
+                16384,
+                Some(limit),
+            )
+            .expect("plan");
+            let needed = stages_needed(&p, stage_rows as usize).unwrap();
+            let m = staged_manifest(Some(stage_rows), needed);
+            let mut m = m;
+            m.max_request_rows = Some(limit);
+            assert_eq!(m.write_rows(limit).unwrap(), stage_rows, "limit {limit} stage {stage_rows}");
+        }
+    }
+
+    fn inst(op: DevOp) -> DevInst64 {
+        DevInst64 { op: op as u16, blocks: 1, fj: [0; 3], t: [TENSOR_NONE16; 8], i: [0; 8] }
+    }
+
+    /// Load-time binding must not reach a staged site. If it did, every stage would be pointed at
+    /// the whole-chunk span table and slot mask, so every stage would write every row — the wrap
+    /// the shortened ring cannot survive, with no fault to show for it.
+    #[test]
+    fn binding_leaves_a_staged_site_alone_in_both_directions() {
+        let m = staged_manifest(Some(1024), 4);
+        let s = m.stages[2];
+
+        let mut hnr = inst(DevOp::HeadNormRope);
+        hnr.t[6] = s.slot;
+        let mut fp = inst(DevOp::FlashPrefill);
+        fp.t[6] = s.request;
+        let mut merge = inst(DevOp::FlashMerge);
+        merge.t[7] = s.request;
+        let mut hnr8 = inst(DevOp::HeadNormRopeFp8);
+        hnr8.t[7] = s.slot;
+        let mut fp8 = inst(DevOp::FlashPrefillFp8);
+        fp8.i[4] = FP8_REQUEST_TAG | u32::from(s.request);
+
+        for d in [&mut hnr, &mut fp, &mut merge, &mut hnr8, &mut fp8] {
+            let before = *d;
+            m.bind_request(d, true);
+            assert_eq!(*d, before, "packed bind touched a staged site");
+            m.bind_request(d, false);
+            assert_eq!(*d, before, "unpacked bind touched a staged site");
+        }
+    }
+
+    /// An UNSTAGED site in the same packet still binds normally, so a staged packet can carry
+    /// both (only the sliding layers are staged; a full-attention layer is not).
+    #[test]
+    fn binding_still_reaches_an_unstaged_site_in_a_staged_packet() {
+        let m = staged_manifest(Some(1024), 4);
+        let mut hnr = inst(DevOp::HeadNormRope);
+        m.bind_request(&mut hnr, true);
+        assert_eq!(hnr.t[6], m.slot);
+        m.bind_request(&mut hnr, false);
+        assert_eq!(hnr.t[6], TENSOR_NONE16);
+
+        let mut fp = inst(DevOp::FlashPrefill);
+        m.bind_request(&mut fp, true);
+        assert_eq!(fp.t[6], m.request);
+    }
+
+    /// With no stages declared, binding is exactly what it was.
+    #[test]
+    fn binding_is_unchanged_when_nothing_is_staged() {
+        let m = staged_manifest(None, 0);
+        let mut fp = inst(DevOp::FlashPrefill);
+        // a handle that WOULD have matched a stage if any were declared
+        fp.t[6] = 15;
+        m.bind_request(&mut fp, true);
+        assert_eq!(fp.t[6], m.request);
+    }
+
+    #[test]
+    fn stage_slots_refuse_an_unmasked_padding_plan() {
+        // No max_request_rows => padding rows carry a real slot, and masking them would change
+        // what the KV write covers.
+        let unmasked = plan(
+            &[Request { slot: 0, start: 0, len: 100, prompt: 4096 }],
+            &[0],
+            4096,
+            16384,
+        )
+        .expect("plan");
+        assert!(unmasked.slots.iter().all(|&s| s >= 0));
+        assert!(stage_slots(&unmasked, 0, 1024).is_err());
+    }
+
+    #[test]
+    fn stage_rejects_a_malformed_table_and_a_zero_width() {
+        let plan = staged_plan();
+        assert!(plan_stage(&plan, 0, 0).is_err());
+        let bad = Plan { table: vec![2, 0, 1, 0, 1], ..staged_plan() };
+        assert!(plan_stage(&bad, 0, 1024).is_err(), "count/length disagree");
+        assert!(stages_needed(&bad, 1024).is_err());
     }
 }

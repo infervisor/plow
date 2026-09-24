@@ -141,6 +141,7 @@ pub struct RungController {
     target: usize,
     dwell_ticks: u32,
     low_load_ticks: u32,
+    fast_probe: bool,
 }
 
 impl RungController {
@@ -152,7 +153,20 @@ impl RungController {
             target: 0,
             dwell_ticks: 0,
             low_load_ticks: 0,
+            fast_probe: false,
         }
+    }
+
+    /// Probe the widest rung after one penultimate sample instead of four
+    /// (`PLOW_RUNG_FAST_PROBE`).
+    pub fn with_fast_probe(mut self, on: bool) -> Self {
+        self.fast_probe = on;
+        self
+    }
+
+    /// Follow a serving-policy switch: the probe is a per-window choice, not a fixed property.
+    pub fn set_fast_probe(&mut self, on: bool) {
+        self.fast_probe = on;
     }
 
     #[inline]
@@ -305,10 +319,17 @@ impl RungController {
         // by running, so holding the widest back until it has samples would cap it forever.
         // `width(widest) > 4`: don't hold back ladders capped at small widths (e.g. realtime
         // profiles with PLOW_DECODE_MAX_RUNG <= 4) where all rungs fit within the latency budget.
+        // Waiting for four penultimate samples stalls the rest of a cold burst: 16 x 128-row
+        // prompts on a fresh server ran 1 + 7, then four decode-only ticks (43 ms) at rung 8,
+        // then the last 8 (12B 128/C16 P99 TTFT 200 ms). Seating the widest outright instead
+        // packs all 15 into one launch, which synchronizes the cohort for the whole run (every
+        // later wave a 16-burst: mean TTFT 78 -> 107 ms). `fast_probe` keeps the penultimate
+        // bootstrap (the 7 + 8 stagger) and probes the widest after ONE sample.
+        let probe_after = if self.fast_probe { 1 } else { MIN_THROUGHPUT_SAMPLES };
         if demand_seat == widest
             && self.rungs.width(widest) > 4
             && self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES
-            && self.stats[demand_seat - 1].samples < MIN_THROUGHPUT_SAMPLES
+            && self.stats[demand_seat - 1].samples < probe_after
         {
             return demand_seat - 1;
         }
@@ -352,6 +373,27 @@ mod tests {
             mean_output_tokens: 1.0,
             slo_ms: 250.0,
         }
+    }
+
+    /// A rung with few samples must not win the throughput seat on a half-converged average.
+    ///
+    /// The defect this guards (h100-sxm5, Gemma-4-12B at C16): rung 8 only ran during ramps, so
+    /// its zero-seeded EWMA read ~7.4 ms for a 12.5 ms step, its capacity beat rung 16's
+    /// 16 / 14.3 ms, and admission narrowed to 8 with 8 requests queued for up to 18 s.
+    #[test]
+    fn a_sparsely_sampled_rung_does_not_steal_the_throughput_seat() {
+        let mut c = controller(&[1, 2, 4, 8, 16]);
+        let one = NonZeroUsize::new(1).unwrap();
+        for _ in 0..MIN_THROUGHPUT_SAMPLES {
+            c.observe_decode(3, 12.5, one);
+        }
+        for _ in 0..200 {
+            c.observe_decode(4, 14.3, one);
+        }
+        assert_eq!(c.step_ms(3), 12.5);
+        c.target = 4;
+        let decision = c.decide(load(16, 8));
+        assert_eq!(c.admission_limit(), 16, "{decision:?}");
     }
 
     /// A burst must widen the admission window and a QUIET PERIOD must narrow it back.
@@ -502,6 +544,17 @@ mod tests {
         let d = c.decide(load(1, 99));
         assert_eq!(c.width(d.admission), 16);
         assert_eq!(d.reason, RungReason::Backlog);
+    }
+
+    #[test]
+    fn fast_probe_widens_after_one_penultimate_sample() {
+        let mut c = controller(&[1, 2, 4, 8, 16]).with_fast_probe(true);
+        let d = c.decide(load(1, 15));
+        assert_eq!(c.width(d.admission), 8, "a cold backlog still bootstraps on the penultimate rung");
+        assert_eq!(d.reason, RungReason::Backlog);
+        c.observe_decode(3, 47.0, NonZeroUsize::MIN);
+        let admission = c.decide(load(8, 8)).admission;
+        assert_eq!(c.width(admission), 16, "one sample is enough to probe the widest");
     }
 
     #[test]

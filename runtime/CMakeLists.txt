@@ -506,6 +506,7 @@ option(PLOW_SM90A_CUBIN "Emit the sm_90a .cubin artifacts `plowrt serve` loads" 
 option(PLOW_SM120_CUBIN_FP8KV "Also emit the _fp8kv cubin variants (all enabled arches)" OFF)
 option(PLOW_SM120_CUBIN_SEG "Also emit the _pfseg (fat) and _pfgemm (lean occ-2) segmented prefill cubins" OFF)
 option(PLOW_CUBIN_PACKED_PREFILL "Emit ordinary and packet-request ABI segmented prefill pairs" OFF)
+option(PLOW_CUBIN_ROUTED_DECODE "Also emit the _routed decode cubin for cuBLASLt-routed MoE rungs" OFF)
 
 # GQA fusion factor for the FULL-attention (hd512) flash-decode instantiation.
 # Measured: GF_FULL should equal `gqa` when the full layers have kv_heads == 1
@@ -587,6 +588,8 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     set(_ax_seg_gemm -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1)
     set(_ax_packed_seg_fat -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_PACKED_REQUEST=1)
     set(_ax_packed_seg_gemm -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1 -DPLOW_NV_PACKED_REQUEST=1)
+    # Second axis of the routed decode object: the decode axis minus the expert GEMV arms.
+    set(_ax_routed -DPLOW_NV_DECODE_ROUTED=1)
     if(PLOW_NV_PF_GEMV_HEAD)
         list(APPEND _ax_prefill -DPLOW_NV_PF_GEMV_HEAD=1)
         list(APPEND _ax_seg_fat -DPLOW_NV_PF_GEMV_HEAD=1)
@@ -646,6 +649,11 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
         set(_cubin_rows
             "${_vstem}|${_ksym_dec}|_ax_decode|"
             "${_vstem}_pf|${_ksym_pf}|_ax_prefill|")
+        if(PLOW_CUBIN_ROUTED_DECODE)
+            string(LENGTH "${_vstem}_routed" _len_routed)
+            list(APPEND _cubin_rows
+                "${_vstem}_routed|_Z${_len_routed}${_vstem}_routed11PlowProgram|_ax_decode|_ax_routed")
+        endif()
         if(PLOW_SM120_CUBIN_FP8KV)
             list(APPEND _cubin_rows
                 "${_vstem}_fp8kv|${_ksym_dec}|_ax_decode|_ax_fp8kv"

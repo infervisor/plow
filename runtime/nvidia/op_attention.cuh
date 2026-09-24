@@ -110,12 +110,78 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #define PLOW_NV_FA_TC_GQA8_HD512 0
 #endif
 /* Opt-in HD512/GQA8 decode candidate: 16 padded Q rows and a two-stage 64-row K/V ring. */
-#define FA_DEC_TC_GQA8(HD, GF) (PLOW_NV_FA_TC_GQA8_HD512 && (HD) == 512 && (GF) == 8)
+#define FA_DEC_TC_GQA8(HD, GF) (PLOW_NV_FA_TC_GQA8_HD512 && (HD) == 512 && ((GF) == 8 || (GF) == 16))
 #define FA_DEC_BASE_SMEM_FLOATS(D, GF)                                                         \
     ((GF) * FA_DEC_TILE + 2 * FA_DEC_REDUCTION_HEADS(GF) + (GF) * ((D) / 2) + FA_DEC_NG(D) * (D))
+/* SCORE PARTIALS IN SMEM (the WPR path, GF 2/4/8). The warp-per-row dot ends in a 5-round lane
+ * reduction per (row, head), which also serializes the K loads: only PLOW_NV_FA_WPR_RB rows are
+ * ever in flight, against 8 V rows in the P.V loop that moves the same bytes 2.3x faster. Here
+ * log2(GF/2) rounds leave 64/GF lane-group partials per (row, head); the lanes park them in smem
+ * and each thread folds its own row after the barrier (16 four-float loads whatever GF is).
+ * At GF=2 that is NO sync point in the score loop, so hd256 can hold PLOW_NV_FA_WPR_RB256 rows in
+ * flight: hd512/GF8 owns the decode entry's register peak and keeps PLOW_NV_FA_WPR_RB, hd256/GF2
+ * fits 8 rows at the same 239 registers.
+ * MEASURED h100-sxm5, Gemma-4-12B step_bench ctx 1024, B=1/4/16, against a control with the
+ * same smem claim (10.93/11.81/15.14; the claim alone is worth 0.10/0.17/0.10 on this packet):
+ * depth 8 alone 10.97/11.80/14.54, + partials 11.00/11.66/14.34, + tensor-core hd512
+ * 10.98/11.70/14.26 (and ctx 8192 B=1/4 11.25/13.18 -> 11.21/12.29). Body ablation of the B=16
+ * step: score 2.71 ms (shuffles 0.56), P.V 1.16, rest of FlashDecode ~0.5.
+ * Costs TILE*64 floats (64 KiB) of arena. Score sums change order: not bit-identical. */
+#ifndef PLOW_NV_FA_SPART
+#define PLOW_NV_FA_SPART 0
+#endif
+#ifndef PLOW_NV_FA_WPR_RB256
+#define PLOW_NV_FA_WPR_RB256 PLOW_NV_FA_WPR_RB
+#endif
+/* The deep hd256 loop only for tiles with this many live rows: at B=1 a sliding item is <= 64
+ * rows (8 per warp), where depth 8 is one iteration of mostly dead loads and costs the step
+ * 0.10 ms at ctx 1024, 0.16 at ctx 192 (12B, measured with everything else equal). */
+#ifndef PLOW_NV_FA_WPR_RB256_MINROWS
+#define PLOW_NV_FA_WPR_RB256_MINROWS 128
+#endif
+/* SCORE ON THE TENSOR CORES, K STRAIGHT FROM GLOBAL: the decode GEMV walk's form
+ * (op_gemv_mma.cuh) with the roles swapped -- the mma's 16 A rows are 16 KV rows, its 8 B rows
+ * the item's GF query heads. A warp scores 16 of its tile rows per walk: lane (g = lane>>2,
+ * t = lane&3) streams the 16-byte K fragments of rows g and g+8 for all D/32 k-steps, loads the
+ * matching Q fragment of head g from smem, and after 2*D/32 mmas holds the FINISHED scores of
+ * rows g, g+8 x heads 2t, 2t+1: no FMA chain, no widening, no lane reduction, and no partials in
+ * smem (a shape that scores here does not claim PLOW_NV_FA_SPART's 64 KiB). Heads >= GF and rows
+ * past the tile read a clamped valid fragment and are not stored. Both operands take the same
+ * virtual K order, so a score is exact w.r.t. the true dot; the f32 sum order differs from
+ * dot8's: not bit-identical. */
+#ifndef PLOW_NV_FA_MMAQK
+#define PLOW_NV_FA_MMAQK 0
+#endif
+#if PLOW_NV_FA_MMAQK && PLOW_NV_FA_QGLOB
+#error PLOW_NV_FA_MMAQK reads the staged Q (qsm); PLOW_NV_FA_QGLOB skips that staging
+#endif
+#ifndef PLOW_NV_FA_MMAQK_DEPTH
+#define PLOW_NV_FA_MMAQK_DEPTH 8
+#endif
+/* Bit 0: hd256. Bit 1: hd512, where it replaces the staged-K score of PLOW_NV_FA_TC_GQA8_HD512
+ * (whose P.V stays). */
+#define FA_DEC_MMAQK(D, GF)                                                                    \
+    (((((PLOW_NV_FA_MMAQK) & 1) && (D) == 256) || (((PLOW_NV_FA_MMAQK) & 2) && (D) == 512)) && \
+     ((GF) == 2 || (GF) == 4 || (GF) == 8 || (GF) == 16))
+/* Rows per stage of the TC P.V ring. The staged-K score walks 64-row stages, so 64 there; with
+ * the mma score (bit 1) the ring only feeds P.V and 32 halves the claim (hd512/GF8 154 -> 91 KiB),
+ * which the dense 12B pays for in L1: p12m B=1/4/16 ctx 1024 10.663/11.204/13.384 -> 10.591/
+ * 11.088/13.011, ctx 8192 10.765/11.665/15.137 -> 10.676/11.570/14.880. */
+#ifndef PLOW_NV_FA_TC_RING_ROWS
+#define PLOW_NV_FA_TC_RING_ROWS (((PLOW_NV_FA_MMAQK) & 2) ? 32 : 64)
+#endif
+#if !((PLOW_NV_FA_MMAQK) & 2) && PLOW_NV_FA_TC_RING_ROWS != 64
+#error the staged-K TC score walks 64-row stages; PLOW_NV_FA_TC_RING_ROWS != 64 needs PLOW_NV_FA_MMAQK bit 1
+#endif
+template <int V> struct fa_depth { static constexpr int v = V; };
+#define FA_DEC_SPART(D, GF)                                                                    \
+    (PLOW_NV_FA_SPART && (D) >= 256 && ((GF) == 2 || (GF) == 4 || (GF) == 8) &&               \
+     !FA_DEC_TC_GQA8(D, GF) && !FA_DEC_MMAQK(D, GF))
+#define FA_DEC_SPART_NP(GF) (64 / (GF))
 #define FA_DEC_SMEM_FLOATS(D, GF)                                                              \
     (FA_DEC_BASE_SMEM_FLOATS(D, GF) +                                                         \
-     (FA_DEC_TC_GQA8(D, GF) ? (16 + 2 * 64) * ((D) + 8) / 2 : 0))
+     (FA_DEC_TC_GQA8(D, GF) ? ((FA_DEC_MMAQK(D, GF) ? 0 : 16) + 2 * PLOW_NV_FA_TC_RING_ROWS) * ((D) + 8) / 2 : 0) +   \
+     (FA_DEC_SPART(D, GF) ? FA_DEC_TILE * 64 : 0))
 
 /* V rows in flight per thread. A fused row feeds GF accumulators, so arithmetic per load
  * grows with GF and the unroll can shrink before the 255-register cliff. */
@@ -428,7 +494,7 @@ __device__ __forceinline__ void fa_decode_qk_tc_gqa8(
     float* scores, const __nv_bfloat16* qtile, __nv_bfloat16* ktile,
     const __nv_bfloat16* kbase, unsigned kv0, unsigned live_rows, unsigned kv_mask,
     float scale) {
-    static_assert(D == 512 && GF == 8, "tensor-core decode is HD512/GQA8 only");
+    static_assert(D == 512 && (GF == 8 || GF == 16), "tensor-core decode is HD512, GQA8 or GQA16");
     constexpr unsigned STRIDE = D + 8;
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     for (unsigned r = live_rows + tid; r < FA_DEC_TILE; r += PLOW_NV_THREADS)
@@ -499,8 +565,9 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
     float (&acc)[D / 64][4], const float* scores, __nv_bfloat16* vtile,
     const __nv_bfloat16* vbase, unsigned kv0, unsigned live_rows, unsigned kv_mask,
     const float* corr_shared) {
-    static_assert(D == 512 && GF == 8, "tensor-core decode is HD512/GQA8 only");
-    constexpr unsigned STRIDE = D + 8, NJ = D / 64;
+    static_assert(D == 512 && (GF == 8 || GF == 16), "tensor-core decode is HD512, GQA8 or GQA16");
+    constexpr unsigned STRIDE = D + 8, NJ = D / 64, SR = PLOW_NV_FA_TC_RING_ROWS;
+    static_assert(SR == 64 || SR == 32 || SR == 16, "TC P.V ring stage rows");
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     const float resc[2] = {lane / 4 < GF ? corr_shared[lane / 4] : 0.0f,
                            lane / 4 + 8 < GF ? corr_shared[lane / 4 + 8] : 0.0f};
@@ -508,10 +575,10 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
     for (unsigned j = 0; j < NJ; ++j)
 #pragma unroll
         for (unsigned e = 0; e < 4; ++e) acc[j][e] *= resc[e / 2];
-    constexpr unsigned TILE_ELEMS = 64 * STRIDE;
+    constexpr unsigned TILE_ELEMS = SR * STRIDE;
     {
-        const unsigned nr = live_rows < 64 ? live_rows : 64;
-        for (unsigned i = tid; i < 64u * (D / 8); i += PLOW_NV_THREADS) {
+        const unsigned nr = live_rows < SR ? live_rows : SR;
+        for (unsigned i = tid; i < SR * (D / 8); i += PLOW_NV_THREADS) {
             const unsigned r = i / (D / 8), c = (i % (D / 8)) * 8;
             const bool live = r < nr;
             const __nv_bfloat16* in = live
@@ -521,13 +588,13 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
         }
         fa_cp_commit();
     }
-    for (unsigned first = 0; first < live_rows; first += 64) {
-        const unsigned nr = live_rows - first < 64 ? live_rows - first : 64;
-        const unsigned next = first + 64;
+    for (unsigned first = 0; first < live_rows; first += SR) {
+        const unsigned nr = live_rows - first < SR ? live_rows - first : SR;
+        const unsigned next = first + SR;
         if (next < live_rows) {
-            const unsigned next_nr = live_rows - next < 64 ? live_rows - next : 64;
-            __nv_bfloat16* next_tile = vtile + (((first / 64) + 1) & 1) * TILE_ELEMS;
-            for (unsigned i = tid; i < 64u * (D / 8); i += PLOW_NV_THREADS) {
+            const unsigned next_nr = live_rows - next < SR ? live_rows - next : SR;
+            __nv_bfloat16* next_tile = vtile + (((first / SR) + 1) & 1) * TILE_ELEMS;
+            for (unsigned i = tid; i < SR * (D / 8); i += PLOW_NV_THREADS) {
                 const unsigned r = i / (D / 8), c = (i % (D / 8)) * 8;
                 const bool live = r < next_nr;
                 const __nv_bfloat16* in = live
@@ -541,9 +608,9 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
             fa_cp_wait<0>();
         }
         __syncthreads();
-        const __nv_bfloat16* current_tile = vtile + ((first / 64) & 1) * TILE_ELEMS;
+        const __nv_bfloat16* current_tile = vtile + ((first / SR) & 1) * TILE_ELEMS;
 #pragma unroll
-        for (unsigned k = 0; k < 64; k += 8) {
+        for (unsigned k = 0; k < SR; k += 8) {
             unsigned hi[4], lo[4];
 #pragma unroll
             for (unsigned e = 0; e < 4; ++e) {
@@ -571,6 +638,79 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
     }
 }
 #endif
+
+#if PLOW_NV_FA_MMAQK
+__device__ __forceinline__ void fa_mma16816_acc(float (&d)[4], unsigned a0, unsigned a1,
+                                                unsigned a2, unsigned a3, unsigned b0,
+                                                unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+/* One tile's scores into scores[head][row]. Warp w owns tile rows w, w+8, ... (the P.V row
+ * groups); walk j takes 16 of them. */
+template <int D, int GF>
+__device__ __forceinline__ void fa_decode_qk_mma(float* scores, const __nv_bfloat16* qsm,
+                                                 const __nv_bfloat16* kbase, unsigned kv0,
+                                                 unsigned rmax, unsigned kv_mask, float scale) {
+    static_assert(D % 32 == 0 && (GF <= 8 || GF == 16), "mma score walk shape");
+    constexpr unsigned NKB = D / 32;
+    /* k-steps in flight per row pair: 2 * NFL 16-byte K loads ahead of the first mma. */
+    constexpr unsigned NFL = NKB < (unsigned)PLOW_NV_FA_MMAQK_DEPTH ? NKB : (unsigned)PLOW_NV_FA_MMAQK_DEPTH;
+    static_assert(NKB % NFL == 0, "PLOW_NV_FA_MMAQK_DEPTH must divide D/32");
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned g = lane >> 2, t = lane & 3u;
+    const __nv_bfloat16* qf = qsm + (g < (unsigned)GF ? g : 0u) * D + t * 8u;
+    const float sc = FA_SCALE(scale);
+    for (unsigned i = tid + rmax; i < (unsigned)FA_DEC_TILE; i += PLOW_NV_THREADS)
+#pragma unroll
+        for (int h = 0; h < GF; h++) scores[h * FA_DEC_TILE + i] = FA_NEG_INF;
+    for (unsigned j = 0; warp + 16u * j * PLOW_NV_WARPS < rmax; j++) {
+        const unsigned r0 = warp + (16u * j + g) * PLOW_NV_WARPS;
+        const unsigned r1 = r0 + 8u * PLOW_NV_WARPS;
+        /* A dead row aliases a live one's fragment: a B=1 sliding item is <= 64 rows, 8 per warp,
+         * and a second stream of dead loads would double its K traffic. */
+        const unsigned a0 = r0 < rmax ? r0 : 0u, a1 = r1 < rmax ? r1 : a0;
+        const __nv_bfloat16* k0 = kbase + (size_t)((kv0 + a0) & kv_mask) * D + t * 8u;
+        const __nv_bfloat16* k1 = kbase + (size_t)((kv0 + a1) & kv_mask) * D + t * 8u;
+        /* GF = 16: heads 8..15 are a second B operand against the same K fragments. */
+        float acc[GF > 8 ? 2 : 1][4];
+#pragma unroll
+        for (int hs = 0; hs < (GF > 8 ? 2 : 1); hs++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) acc[hs][e] = 0.0f;
+#pragma unroll
+        for (unsigned c = 0; c < NKB; c += NFL) {
+            uint4 ka[NFL], kb[NFL];
+#pragma unroll
+            for (unsigned u = 0; u < NFL; u++) {
+                ka[u] = __ldcs((const uint4*)(k0 + (c + u) * 32u));
+                kb[u] = __ldcs((const uint4*)(k1 + (c + u) * 32u));
+            }
+#pragma unroll
+            for (unsigned u = 0; u < NFL; u++)
+#pragma unroll
+                for (int hs = 0; hs < (GF > 8 ? 2 : 1); hs++) {
+                    const uint4 q = *(const uint4*)(qf + (size_t)hs * 8u * D + (c + u) * 32u);
+                    fa_mma16816_acc(acc[hs], ka[u].x, kb[u].x, ka[u].y, kb[u].y, q.x, q.y);
+                    fa_mma16816_acc(acc[hs], ka[u].z, kb[u].z, ka[u].w, kb[u].w, q.z, q.w);
+                }
+        }
+#pragma unroll
+        for (int hs = 0; hs < (GF > 8 ? 2 : 1); hs++)
+            if (8u * hs + 2u * t < (unsigned)GF) {
+                float* s0 = scores + (8u * hs + 2u * t) * FA_DEC_TILE;
+                float* s1 = s0 + FA_DEC_TILE;
+                if (r0 < rmax) { s0[r0] = acc[hs][0] * sc; s1[r0] = acc[hs][1] * sc; }
+                if (r1 < rmax) { s0[r1] = acc[hs][2] * sc; s1[r1] = acc[hs][3] * sc; }
+            }
+    }
+}
+#endif
+
+
 
 /* Persistent-grid body: this block runs work items `slice, slice+nblk, ...`.
  *
@@ -681,8 +821,9 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 
 #if PLOW_NV_FA_TC_GQA8_HD512
         __nv_bfloat16* tc_q = (__nv_bfloat16*)(lds + FA_DEC_BASE_SMEM_FLOATS(D, GF));
-        __nv_bfloat16* tc_kv = tc_q + 16 * (D + 8);
-        if constexpr (FA_DEC_TC_GQA8(D, GF) && !FP8KV && !SZKV) {
+        /* The padded Q tile only feeds the staged-K score; the mma score reads qsm. */
+        __nv_bfloat16* tc_kv = tc_q + (FA_DEC_MMAQK(D, GF) ? 0 : 16 * (D + 8));
+        if constexpr (FA_DEC_TC_GQA8(D, GF) && !FA_DEC_MMAQK(D, GF) && !FP8KV && !SZKV) {
             for (unsigned i = tid; i < 16u * D; i += PLOW_NV_THREADS) {
                 const unsigned g = i / D, c = i % D;
                 tc_q[g * (D + 8) + c] =
@@ -736,6 +877,14 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             const unsigned rmax_t = (hi - kv0 < (unsigned)FA_DEC_TILE) ? (hi - kv0)
                                                                        : (unsigned)FA_DEC_TILE;
             float s[GF];
+#if PLOW_NV_FA_MMAQK
+            if constexpr (FA_DEC_MMAQK(D, GF) && !FP8KV && !SZKV) {
+                fa_decode_qk_mma<D, GF>(Ssm, qsm, kbase, kv0, rmax_t, kv_mask, scale);
+                __syncthreads();
+#pragma unroll
+                for (int g = 0; g < GF; ++g) s[g] = Ssm[g * FA_DEC_TILE + tid];
+            } else
+#endif
 #if PLOW_NV_FA_TC_GQA8_HD512
             if constexpr (FA_DEC_TC_GQA8(D, GF) && !FP8KV && !SZKV) {
                 fa_decode_qk_tc_gqa8<D, GF>(Ssm, tc_q, tc_kv, kbase, kv0, rmax_t,
@@ -762,11 +911,15 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
              * against a 256-row tile, so half the sweep was pure loop+store overhead. Fill the
              * dead tail with NEG_INF in one cheap strided pass instead of iterating it. */
             const unsigned rmax = rmax_t;
+            float* Psm = lds + FA_DEC_BASE_SMEM_FLOATS(D, GF);
+            if constexpr (!FA_DEC_SPART(D, GF)) {
             for (unsigned i = tid + rmax; i < (unsigned)FA_DEC_TILE; i += PLOW_NV_THREADS) {
 #pragma unroll
                 for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + i] = FA_NEG_INF;
             }
-            constexpr int WRB = PLOW_NV_FA_WPR_RB;
+            }
+            auto score_rows = [&](auto depth) {
+            constexpr int WRB = decltype(depth)::v;
             for (unsigned rb = warp; rb < rmax; rb += PLOW_NV_WARPS * WRB) {
                 /* WRB rows, strided by the warp count so each warp's batch stays disjoint. */
                 bf16v8 k8[WRB][NC];
@@ -792,10 +945,10 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                     float sr[GF];
 #pragma unroll
                     for (int g = 0; g < GF; g++) sr[g] = FA_NEG_INF;
-                    if (live[t]) {
-                        float dt[GF];
+                    float dt[GF];
 #pragma unroll
-                        for (int g = 0; g < GF; g++) dt[g] = 0.0f;
+                    for (int g = 0; g < GF; g++) dt[g] = 0.0f;
+                    if (FA_DEC_SPART(D, GF) || live[t]) {
 #pragma unroll
                         for (int c = 0; c < NC; c++) {
                             const unsigned off = (unsigned)c * 256u + lane * 8u;
@@ -814,18 +967,68 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                 dt[g] = dot8(k8[t][c], ld_smem8(qsm + g * D + off), dt[g]);
 #endif
                         }
+                        if constexpr (!FA_DEC_SPART(D, GF)) {
 #pragma unroll
                         for (int g = 0; g < GF; g++) sr[g] = warp_sum32(dt[g]) * FA_SCALE(scale);
+                        }
                     }
+                    if constexpr (FA_DEC_SPART(D, GF)) {
+                        /* r depends on (warp, t) only, so the rounds below are lane-uniform. */
+                        if (r < rmax) {
+                            constexpr unsigned NP = FA_DEC_SPART_NP(GF);
+                            float* pp = Psm + ((size_t)r * NP + lane) * GF;
+#pragma unroll
+                            for (int g = 0; g < GF; g++) {
+                                float pv = dt[g];
+#pragma unroll
+                                for (int off = 16; off >= (int)NP; off >>= 1)
+                                    pv += __shfl_xor_sync(0xffffffffu, pv, off, 32);
+                                if (lane < NP) pp[g] = pv;
+                            }
+                        }
+                    } else
                     if (lane == 0 && r < rmax) {
 #pragma unroll
                         for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + r] = sr[g];
                     }
                 }
             }
+            };
+            if constexpr (D == 256 && PLOW_NV_FA_WPR_RB256 != PLOW_NV_FA_WPR_RB) {
+                if (rmax >= PLOW_NV_FA_WPR_RB256_MINROWS) score_rows(fa_depth<PLOW_NV_FA_WPR_RB256>{});
+                else score_rows(fa_depth<PLOW_NV_FA_WPR_RB>{});
+            } else {
+                score_rows(fa_depth<PLOW_NV_FA_WPR_RB>{});
+            }
             __syncthreads();
+            if constexpr (FA_DEC_SPART(D, GF)) {
+                /* Every row of [lo, hi) is live at decode (causal + window hold by construction),
+                 * so a thread's row is either live or past the tile's last row. */
+                float f[GF];
+#pragma unroll
+                for (int g = 0; g < GF; g++) f[g] = 0.0f;
+                if (tid < rmax) {
+                    /* [lane-group][head] row-major: element e of the row belongs to head e % GF. */
+                    const float* pp = Psm + (size_t)tid * 64u;
+#pragma unroll
+                    for (int j = 0; j < 16; j++) {
+                        const float4 v = *(const float4*)(pp + j * 4);
+                        f[(4 * j) % GF] += v.x;
+                        f[(4 * j + 1) % GF] += v.y;
+                        f[(4 * j + 2) % GF] += v.z;
+                        f[(4 * j + 3) % GF] += v.w;
+                    }
+                }
+#pragma unroll
+                for (int g = 0; g < GF; g++) {
+                    s[g] = (tid < rmax) ? f[g] * FA_SCALE(scale) : FA_NEG_INF;
+                    Ssm[g * FA_DEC_TILE + tid] = s[g];
+                }
+                __syncthreads();
+            } else {
 #pragma unroll
             for (int g = 0; g < GF; g++) s[g] = Ssm[g * FA_DEC_TILE + tid];
+            }
           } else
 #endif
           {

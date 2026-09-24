@@ -18,12 +18,11 @@ precision = "bf16"
 [emit]
 args = ["--segmented"]
 [emit.env]
-PLOW_SEG_PURE_GEMM = "1"
-PLOW_SEG_FA512 = "1"
-PLOW_SEG_FA256_GQA2 = "1"
+# The HD256-GQA2 / HD512 prefill role objects bind the TMA map; opt-in (its P certificate was rejected).
 PLOW_TMA_GEMM = "1"
-PLOW_EMIT_PREFILL_CUBLASLT = "1"   # projections and gate/up on cuBLASLt (policy: plow-asset segment_roles)
-PLOW_NO_GLU_FUSE = "1"             # gate/up as two GEMMs + GeGLU pass; the fused role is off
+# Decode attention QK on the tensor cores; opt-in (its P certificate was rejected:
+# 26B 128/C1 TPOT 5.400 -> 5.418 ms, worse than its 0.002 floor, while longer contexts win).
+PLOW_FA_MMAQK = "3"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"  # 32 slots; with chunk 2048 the sliding ring is 4096 rows -> ~1.5 GiB per slot at ctx 8192
 PLOW_MAX_CHUNK = "2048"     # the attention roles need the 4096/8192 rungs, so BOTH roles are off here (fallback FA objects)
 
@@ -31,10 +30,6 @@ PLOW_MAX_CHUNK = "2048"     # the attention roles need the 4096/8192 rungs, so B
 script = "scripts/build_sm90a_gemma4_segments.sh"
 role_files = []
 [objects.env]
-PLOW_BUILD_FATLITE = "1"           # light-op object: flash arms out, 128-reg cap, launches at 2 blocks/SM (2026-09-17: -2.8 ms @1024, -4.8 ms @4096, bit-identical)
-PLOW_BUILD_FA_GQA2_PAIR = "1"
-PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
-PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
 PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
 
 [emit_roles.env]
@@ -45,9 +40,6 @@ PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
 # vLLM 0.28 reference ran with prefix caching disabled; match it. A realtime-chat profile may
 # turn it on, but then the reference must too.
 PLOW_PREFIX_CACHE = "0"
-# Mirrors of the emit-side classing; a mismatch is a wrong-object launch.
-PLOW_PF_SEG_PURE = "1"
-PLOW_PF_SEG_FA512 = "1"
 # plowrt dlopens libcublasLt by soname; the host toolkit is not on the nix loader path.
 LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
 # PLOW_PF_SEG_DIR is the build's objects/ dir; set it at bench time:

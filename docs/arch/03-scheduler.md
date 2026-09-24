@@ -361,10 +361,15 @@ gated by emit flags. A single-segment override (`uniseg`) forces class 8; the
 under `mla_v2` is class 4. The `seg_of` run-length recurrence and the soundness
 argument below are unchanged by the extra classes.
 
-When `PLOW_L2_PLACE` is set, the same `seg` field is repurposed to carry the
-per-slice **L2 domain** instead of the wave class, and `gq_seg_ofs` windows the
+Under L2 placement the same `seg` field is repurposed to carry the per-slice
+**L2 domain** instead of the wave class, and `gq_seg_ofs` windows the
 global-queue stream by domain rather than by wave class — the wave-class meaning
 is byte-identical when L2 placement is off.
+
+`PLOW_L2_PLACE` is a `plowc` env var and is **on by default on gfx942 and
+gfx950**; `PLOW_L2_PLACE=0` opts out (`crates/plowc/src/main.rs`, `l2_default`).
+Other architectures stay explicit opt-in. Do not confuse it with the distinct
+`PLOW_L2_PLACE_DISPATCH` (runtime, off) or `PLOW_L2_PLACE_PREFILL` (emit, on).
 
 ### Soundness (the segmentation theorem)
 
@@ -511,7 +516,7 @@ pub struct SimResult {
     pub makespan: Cycle,        // real, counter-gated
     pub ideal_makespan: Cycle,  // perfect per-tile pipelining (dependency-gated)
     pub busy: HashMap<ResourceId, Cycle>,  // per-resource busy cycles → utilization()
-    pub consistent: bool,       // replays to exactly schedule.makespan
+    pub consistent: bool,       // ideal_makespan == schedule.makespan
     pub cyclic: bool,           // counter graph has a cycle → would deadlock
 }
 ```

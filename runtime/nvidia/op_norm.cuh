@@ -744,10 +744,10 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
  * host only patches t6 (the slot map) on prefill KV-write sites in batched mode; pfslot==nullptr
  * keeps every existing packet byte-identical. */
 template <int HD, bool INTERLEAVE = false>
-static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
-                                const __nv_bfloat16* __restrict__ x,
-                                const __nv_bfloat16* __restrict__ gamma,
-                                const float* __restrict__ cosb, const float* __restrict__ sinb,
+static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
+                                const __nv_bfloat16* __restrict__ hnr_x,
+                                const __nv_bfloat16* __restrict__ hnr_gamma,
+                                const float* __restrict__ hnr_cosb, const float* __restrict__ hnr_sinb,
                                 const int* __restrict__ pos, unsigned ntok, unsigned nhead,
                                 float eps, unsigned out_row0, unsigned out_stride,
                                 unsigned kv_mask, unsigned skip_norm, unsigned slice,
@@ -756,6 +756,16 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
 #if PLOW_MIXED_STEP
                                 , const PlowProgram* mixed = nullptr
 #endif
+                                /* FUSED KV PAIR: a SECOND (out, in) carrying NO gamma and
+                                 * NO rope -- the v store. The pair runs INSIDE the same warp
+                                 * iteration as k, not as extra items: `ibase`/`obase` are
+                                 * identical for k and v, and, decisively, the item -> workgroup
+                                 * map stays exactly what it was, so the flash fine-dependency
+                                 * maps keyed on `headnorm_wg_of` remain correct. Appending the
+                                 * v items instead would move them to another workgroup that
+                                 * flash does not wait on -- a read-before-write race. */
+                                , __nv_bfloat16* __restrict__ out2 = nullptr
+                                , const __nv_bfloat16* __restrict__ x2 = nullptr
                                 ) {
     static_assert(HD % 64 == 0,
                   "head_dim must be a multiple of 64 so the half-split RoPE partner (i, i+HD/2) "
@@ -810,6 +820,15 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
                        ? ((size_t)(t * nhead + hh) * out_stride + ((unsigned)pos[t] & kv_mask)) * hd
                        : ((size_t)hh * out_stride + ((out_row0 + t) & kv_mask)) * hd)
                 : ((size_t)(out_row0 + t) * nhead + hh) * hd;
+
+        for (unsigned pi = 0; pi < (out2 ? 2u : 1u); pi++) {
+        /* Shadow the parameters so the body below stays the single-pair kernel
+         * verbatim. Uniform across the warp. */
+        __nv_bfloat16* out = pi ? out2 : hnr_out;
+        const __nv_bfloat16* x = pi ? x2 : hnr_x;
+        const __nv_bfloat16* gamma = pi ? nullptr : hnr_gamma;
+        const float* cosb = pi ? nullptr : hnr_cosb;
+        const float* sinb = pi ? nullptr : hnr_sinb;
 
         /* PACK-OF-4 lane layout (HD % 256 == 0, half-split rotate): lane l chunk c owns the
          * FOUR CONTIGUOUS elements [4*(l+32c), +4), so x/gamma/out are 8-byte accesses and the
@@ -889,56 +908,57 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
                 }
                 *(ushort4*)(out + obase + 4u * (lane + 32u * c)) = o;
             }
-            continue;
-        }
-        /* PRODUCE: the head AND its weight, all E of each, before anything is waited on. */
-        float v[E], g[E];
+        } else {
+            /* PRODUCE: the head AND its weight, all E of each, before anything is waited on. */
+            float v[E], g[E];
 #pragma unroll
-        for (unsigned e = 0; e < E; e++) {
-            v[e] = __bfloat162float(x[ibase + lane + e * 32]);
-            g[e] = gamma ? norm_weight(__bfloat162float(gamma[lane + e * 32])) : 1.0f;
-        }
-        float inv = 1.0f;
-        if (!skip_norm) {
-            float ss = 0.0f;
+            for (unsigned e = 0; e < E; e++) {
+                v[e] = __bfloat162float(x[ibase + lane + e * 32]);
+                g[e] = gamma ? norm_weight(__bfloat162float(gamma[lane + e * 32])) : 1.0f;
+            }
+            float inv = 1.0f;
+            if (!skip_norm) {
+                float ss = 0.0f;
 #pragma unroll
-            for (unsigned e = 0; e < E; e++) ss += v[e] * v[e];
-            inv = rsqrtf(warp_sum32(ss) * __fdividef(1.0f, (float)hd) + eps);
-        }
-#pragma unroll
-        for (unsigned e = 0; e < E; e++) v[e] = gemma3_bf16_round(v[e] * inv * g[e]);
-
-        if (cosb) {
-            constexpr unsigned H2 = HD / 2;
-            const size_t p = (size_t)pos[t] * H2;
-            float r[E];
-            if constexpr (!INTERLEAVE) {
-                constexpr unsigned EH = H2 / 32; /* lane-local stride to the half-split partner */
-#pragma unroll
-                for (unsigned e = 0; e < E; e++) {
-                    const unsigned i = lane + e * 32;
-                    const unsigned j = (i < H2) ? i : (i - H2);
-                    const float c = gemma3_bf16_round(cosb[p + j]), s = gemma3_bf16_round(sinb[p + j]);
-                    r[e] = (e < EH) ? (v[e] * c - v[e + EH] * s)  /* i in [0, H2)  */
-                                    : (v[e] * c + v[e - EH] * s); /* i in [H2, hd) */
-                }
-            } else {
-#pragma unroll
-                for (unsigned e = 0; e < E; e++) {
-                    const unsigned i = lane + e * 32;
-                    const float c = gemma3_bf16_round(cosb[p + (i >> 1)]), s = gemma3_bf16_round(sinb[p + (i >> 1)]);
-                    const float partner = __shfl_xor_sync(0xffffffffu, v[e], 1, 32);
-                    r[e] = ((i & 1u) == 0u) ? (v[e] * c - partner * s)
-                                            : (v[e] * c + partner * s);
-                }
+                for (unsigned e = 0; e < E; e++) ss += v[e] * v[e];
+                inv = rsqrtf(warp_sum32(ss) * __fdividef(1.0f, (float)hd) + eps);
             }
 #pragma unroll
-            for (unsigned e = 0; e < E; e++) v[e] = r[e];
-        }
+            for (unsigned e = 0; e < E; e++) v[e] = gemma3_bf16_round(v[e] * inv * g[e]);
+
+            if (cosb) {
+                constexpr unsigned H2 = HD / 2;
+                const size_t p = (size_t)pos[t] * H2;
+                float r[E];
+                if constexpr (!INTERLEAVE) {
+                    constexpr unsigned EH = H2 / 32; /* lane-local stride to the half-split partner */
+#pragma unroll
+                    for (unsigned e = 0; e < E; e++) {
+                        const unsigned i = lane + e * 32;
+                        const unsigned j = (i < H2) ? i : (i - H2);
+                        const float c = gemma3_bf16_round(cosb[p + j]), s = gemma3_bf16_round(sinb[p + j]);
+                        r[e] = (e < EH) ? (v[e] * c - v[e + EH] * s)  /* i in [0, H2)  */
+                                        : (v[e] * c + v[e - EH] * s); /* i in [H2, hd) */
+                    }
+                } else {
+#pragma unroll
+                    for (unsigned e = 0; e < E; e++) {
+                        const unsigned i = lane + e * 32;
+                        const float c = gemma3_bf16_round(cosb[p + (i >> 1)]), s = gemma3_bf16_round(sinb[p + (i >> 1)]);
+                        const float partner = __shfl_xor_sync(0xffffffffu, v[e], 1, 32);
+                        r[e] = ((i & 1u) == 0u) ? (v[e] * c - partner * s)
+                                                : (v[e] * c + partner * s);
+                    }
+                }
+#pragma unroll
+                for (unsigned e = 0; e < E; e++) v[e] = r[e];
+            }
 
 #pragma unroll
-        for (unsigned e = 0; e < E; e++)
-            out[obase + lane + e * 32] = __float2bfloat16(v[e]);
+            for (unsigned e = 0; e < E; e++)
+                out[obase + lane + e * 32] = __float2bfloat16(v[e]);
+        }
+        } /* pi: k, then the fused v */
     }
 }
 

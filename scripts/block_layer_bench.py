@@ -127,6 +127,10 @@ class DuckConfig:
             setattr(self, k, v)
 
     def __getattr__(self, name):  # unknown attrs -> None, like a sparse config
+        # Dunder lookups must MISS: vLLM 0.28's gemma4_layer_config() does copy(text_config), and
+        # copy probes __setstate__/__reduce_ex__ — a None there is "'NoneType' is not callable".
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
         return None
 
 
@@ -146,7 +150,12 @@ def make_metadata(query_lens, seq_lens, block_table, device):
             blk = int(block_table[req, pos // BLOCK_SIZE])
             slots.append(blk * BLOCK_SIZE + pos % BLOCK_SIZE)
     slot_mapping = torch.tensor(slots, dtype=torch.int64, device=device)
-    md = FlashAttentionMetadata(
+    # Field set drifts across vLLM versions (0.28 dropped `sliding_window`): pass only what the
+    # installed dataclass declares.
+    import dataclasses
+
+    fields = {f.name for f in dataclasses.fields(FlashAttentionMetadata)}
+    kw = dict(
         num_actual_tokens=sum(query_lens),
         max_query_len=max(query_lens),
         query_start_loc=qsl,
@@ -166,6 +175,7 @@ def make_metadata(query_lens, seq_lens, block_table, device):
         # and silently break sliding-attention layers.
         sliding_window=None,
     )
+    md = FlashAttentionMetadata(**{k: v for k, v in kw.items() if k in fields})
     return md, slot_mapping
 
 
@@ -289,6 +299,11 @@ def main() -> int:
         hidden = int(cfg_d["hidden_size"])
         n_kv = int(cfg_d.get("num_key_value_heads") or cfg_d["num_attention_heads"])
         head_dim = int(cfg_d.get("head_dim") or hidden // int(cfg_d["num_attention_heads"]))
+        # The constructed layer is the truth: hybrid models give full-attention layers their own
+        # geometry (Gemma-4: 2 KV heads x 512, vs 8 x 256 on sliding layers), and a cache shaped
+        # from the top-level config fails the backend's K/V split.
+        n_kv = int(getattr(attn.impl, "num_kv_heads", n_kv))
+        head_dim = int(getattr(attn.impl, "head_size", head_dim))
 
         print(f"block: {name}  arch={arch}  layer={LayerCls.__name__}  idx={layer_idx}")
         print(

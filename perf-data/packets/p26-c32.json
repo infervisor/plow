@@ -1,0 +1,159 @@
+{
+  "label": "p26-c32",
+  "preserved_at": "2026-09-23T12:44:08+00:00",
+  "preserved_from": "/opt/dlami/nvme/tmp/agent-geom/chk26",
+  "preserved_at_commit": "1cca8979934bb2039374090d86190f47c1a8d00d",
+  "preserved_at_commit_is_build_commit": false,
+  "tree_dirty_at_preservation": true,
+  "build_mtime": "2026-09-21T15:22:35+00:00",
+  "recipe": "scripts/campaign/recipes/gemma4-26b-a4b.h100.bf16-l8192-16k.toml",
+  "recipe_match": {
+    "agreeing_keys": 10,
+    "recipe_keys_absent_from_packet": [
+      "PLOW_SEG_FA512",
+      "PLOW_SEG_FA256_GQA2",
+      "PLOW_FA_MMAQK",
+      "PLOW_EMIT_MOE_DEC_LT"
+    ],
+    "packet_keys_absent_from_recipe": []
+  },
+  "recipe_overrides": {
+    "PLOW_DECODE_BATCH_LADDER": "1,2,4,8,16,32",
+    "PLOW_GEMMA_MOE_DEC_GROUP": "8",
+    "PLOW_MAX_CHUNK": "4096",
+    "PLOW_MAX_REQUEST_CHUNK": "1024",
+    "PLOW_PF_LADDER_APPEND": "256,1152"
+  },
+  "cell": {
+    "name": "gemma4-26b-a4b.h100.bf16-l8192-16k",
+    "model": "google/gemma-4-26b-a4b-it",
+    "revision": "local",
+    "gpu": "H100 SXM5",
+    "arch": "sm_90a",
+    "n_cu": 132,
+    "max_ctx": 16384,
+    "precision": "bf16"
+  },
+  "arch": "sm_90a",
+  "n_cu": 132,
+  "shapes": {
+    "hd": [
+      256,
+      512
+    ],
+    "kv_heads": [
+      2,
+      8
+    ],
+    "gqa": 8,
+    "decode_batch": 32,
+    "kv_dtype": {
+      "hd256": "bf16",
+      "hd512": "bf16"
+    },
+    "max_chunk": 4096,
+    "prefill_buckets": [
+      128,
+      256,
+      512,
+      1024,
+      1152,
+      2048,
+      4096
+    ],
+    "moe_enc": [],
+    "moe_prefill_ep": []
+  },
+  "precision": {
+    "weight_enc": "bf16",
+    "act_enc": "bf16",
+    "kv_enc": "bf16",
+    "expert_enc": "none"
+  },
+  "features": {
+    "moe": true,
+    "prefill": true,
+    "moe_prefill": true
+  },
+  "emit_env_replay": {
+    "PLOW_ATTENTION_DECODE_BALANCE_GF": "4",
+    "PLOW_DECODE_BATCH_LADDER": "1,2,4,8,16,32",
+    "PLOW_EMIT_MOE_PF_LT": "1",
+    "PLOW_EMIT_PREFILL_CUBLASLT": "1",
+    "PLOW_FUSE_ARGMAX": "0",
+    "PLOW_GEMMA_MOE_DEC_GROUP": "8",
+    "PLOW_GEMMA_MOE_ROUTER_EXACT": "0",
+    "PLOW_MAX_CHUNK": "4096",
+    "PLOW_MAX_REQUEST_CHUNK": "1024",
+    "PLOW_NO_GLU_FUSE": "1",
+    "PLOW_PF_LADDER_APPEND": "256,1152",
+    "PLOW_SEG_PURE_GEMM": "1",
+    "PLOW_SLIDING_NS_CAP": "1",
+    "PLOW_SLIDING_NS_GRID": "1",
+    "PLOW_TMA_GEMM": "1"
+  },
+  "unrecorded_env": {
+    "PLOW_UNISEG": "0",
+    "PLOW_SEG_FA256_GQA2": "1",
+    "PLOW_SEG_FA512": "1",
+    "PLOW_SEG_PURE_GEMM": "1"
+  },
+  "tuning": {
+    "gv_mm_max": 32,
+    "moe_down_sg": 8,
+    "moe_dec_group": 1,
+    "xreg_k": [
+      2112,
+      2816,
+      4096,
+      8192
+    ],
+    "fa_rb256": 4
+  },
+  "registry_digest": "29252ee3cf8c4e7158f87b3746ebcce15946f2744845b4d6c981d8b946ef6939",
+  "knobs_K": "verified",
+  "lean": {
+    "verified": true,
+    "oracle": true,
+    "rewrite_verified": true,
+    "reason": null,
+    "note": "`verified` = a Lean ordering certificate (plow_verify checkpoint D) was obtained for EVERY program in this blob; `rewrite_verified` = egglog rewrite rule soundness (checkpoint A) verified; `oracle` = the Lean decode lower-bound query ran. false means NOT CHECKED (see `reason`), never `checked and rejected` \u2014 a rejection aborts emission, so a blob with a rejected program never reaches disk and has no manifest.",
+    "modular_summary": {
+      "all_correctness_verified": true,
+      "all_performance_certified": true,
+      "total_critical_path_cycles": 5058,
+      "total_lower_bound_us": 22754.11262626263,
+      "blocks_verified": 13,
+      "total_blocks": 13
+    }
+  },
+  "artifacts": [
+    {
+      "name": "build.json",
+      "bytes": 5042287,
+      "sha256": "2f57317424d5c3ced76f1d70a719fe4ac9c6ecc1fd9590609b19f2c2be595f4c"
+    },
+    {
+      "name": "cublaslt_algos.jsonl",
+      "bytes": 15041,
+      "sha256": "b550728726b45a335f38993a673d100933513b1ce18db39f6db956f7517ed56d"
+    },
+    {
+      "name": "model.pkt",
+      "bytes": 36675293,
+      "sha256": "5e522116f70f582f9a7083c9a78176e7e9606ce537375d87604dea0cf1937a3e"
+    },
+    {
+      "name": "plow_config.h",
+      "bytes": 74018,
+      "sha256": "53d7e0297644305b9e37054ce64f4d526eed362c2f22a76402caf2623db629da"
+    },
+    {
+      "name": "weights.json",
+      "bytes": 278,
+      "sha256": "129055bc48c975321305aad98b77d037c415ad6ccea07b0145e0440439080256"
+    }
+  ],
+  "rebuild_command": "nix develop --command python3 scripts/campaign/campaign.py build scripts/campaign/recipes/gemma4-26b-a4b.h100.bf16-l8192-16k.toml --out <dir> --no-probe --env PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32 --env PLOW_GEMMA_MOE_DEC_GROUP=8 --env PLOW_MAX_CHUNK=4096 --env PLOW_MAX_REQUEST_CHUNK=1024 --env PLOW_PF_LADDER_APPEND=256,1152",
+  "note": "Recreate: run rebuild_command, then verify registry_digest, tuning and shapes match this record -- a mismatch means the tree moved under you, which is the signal to check out a commit near build_mtime and retry. tuning/ in the repo supplies the shape constants; cublaslt_algos.jsonl beside this file is the packet's own probe result, which --no-probe reuses. recipe/recipe_overrides are DERIVED by matching emit_env_replay against the recipes present today, so recipe_match.agreeing_keys and the *_absent_from_* lists say how much to trust them; emit_env_replay + unrecorded_env are the ground truth."
+}

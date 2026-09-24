@@ -1,0 +1,157 @@
+# Gemma-4-12B-it, H100 SXM5, BF16, TP1 — the C1 LATENCY packet: one request may take a whole
+# 8192-row launch.
+#
+# WHY A SEPARATE PACKET. PLOW_MAX_REQUEST_CHUNK sizes the sliding ring as
+# next_pow2(window + chunk - 1), so raising it from 4224 to 8192 takes the ring from 8192 to
+# 16384 rows/slot = 5.37 GiB/slot. At 16 slots that is 86 GiB and does not fit an 80 GiB card;
+# at 4 slots it is 21.5 GiB, plus ~8.6 GiB full-attention KV and 24 GiB of weights = ~54 GiB.
+#
+# THIS IS APPLES TO APPLES. vLLM is configured per concurrency by its own bench harness --
+# `vllm serve --max-num-seqs` is 1 at C1, 4 at C4, 16 at C16 (see the "max_num_seqs=" line in
+# every reference run's health log). Giving plow a 4-slot packet for the C1 column mirrors that
+# exactly; it is not a per-cell tune, it is the same per-concurrency sizing both stacks do.
+# C4/C16/C32 keep gemma4-12b.h100.bf16-ladder16k.toml, which is unchanged.
+#
+# WHAT IT SHOULD BUY. On ladder16k an 8192-row prompt runs [4096, 4096] -- two launches, each
+# paying the ~5.2 ms fixed launch cost. Here it runs [8192], one launch. Target: 8192/C1 TTFT
+# 351.04 -> ~346, against vLLM's 348.61 measured the same session. 8192/C1 also needs TPOT
+# -0.02 ms (10.66 vs 10.65); a 4-slot packet carries a smaller decode arena, which is the other
+# reason to test this shape rather than only the chunk.
+#
+# Everything else is gemma4-12b.h100.bf16-l8192-16k.toml verbatim.
+[cell]
+name = "gemma4-12b.h100.bf16-c1-rq8192"
+model = "google/gemma-4-12B-it"
+revision = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+hf_dir = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "bf16"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_SEG_PURE_GEMM = "1"
+PLOW_SEG_FA512 = "1"
+PLOW_SEG_FA256_GQA2 = "1"
+PLOW_TMA_GEMM = "1"
+# Decode attention QK on the tensor cores; opt-in (its P certificate was rejected:
+# 26B 128/C1 TPOT 5.400 -> 5.418 ms, worse than its 0.002 floor, while longer contexts win).
+PLOW_FA_MMAQK = "3"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+# The BF16 NRN2 -> q/k/v fold (c1f1ac38) decodes garbage on the H100, and not the same garbage
+# twice: first token right, the rest noise. Off until the fold arm is qualified here.
+PLOW_NO_FUSE_NRN = "1"
+PLOW_SLIDING_NS_GRID = "1"
+# 4 slots, not 16: the 16384-row ring costs 5.37 GiB/slot, so 16 slots would need 86 GiB.
+PLOW_DECODE_BATCH_LADDER = "1,2,4"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+PLOW_SLIDING_NS_CAP = "1"
+PLOW_MAX_CHUNK = "8192"
+# One request's rows per launch; sizes the sliding ring (see the header). Must be a prefill rung.
+# 8192, not 4224: a lone request takes the whole 8192 rung in ONE launch. Ring 16384 rows/slot.
+PLOW_MAX_REQUEST_CHUNK = "8192"
+# FINE-GRAINED RUNGS, as in the 26B recipes: the server prepends BOS, so an N-token bench prompt
+# is N+1 rows and crosses its rung — without these a 129-row prompt runs the 512 bucket and a
+# 1025-row one the 2048 bucket (or pays a second launch for a 1-row tail).
+# 1088 / 4160 are the tight ones (N+1 rows in the smallest multiple of 64): C1 TTFT at 1024 in
+# 47.22 -> 46.82 ms with 1088; 256 / 1152 / 4160 measured neutral and stay for the C4/C16 packs.
+PLOW_PF_LADDER_APPEND = "256,1088,1152,4160,4224"
+PLOW_FUSE_ARGMAX = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+PLOW_NS_FULL_ABS = "66"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = [
+  "interp_sm90a_pfattn_hd512_px4_bq64.cubin",
+  "interp_sm90a_pfattn_hd512.cubin",
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+  "interp_sm90a_pfgemm_glu_gemma4.cubin",
+]
+[objects.env]
+PLOW_BUILD_FATLITE = "1"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
+PLOW_BUILD_MASKED_PADDING = "1"
+PLOW_BUILD_PFATTN_WG = "1"
+PLOW_BUILD_PFATTN_KV16 = "0"
+PLOW_BUILD_PFATTN_KV64 = "0"
+PLOW_BUILD_PFATTN_QK_UNROLL = "4"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+
+[serve.env]
+# The matched ladder runs cache-off (vLLM --no-enable-prefix-caching; vllm-bench random prompts
+# share a leading prefix). Production serving is cache-on with PLOW_PREFIX_CACHE=1 and nothing
+# else: whole-block (2048-row) checkpoints, pressure eviction and the in-flight prefix wait are
+# the defaults (bd317b28; shared-system-prompt scenario 8 x 2048 + 256: C4 TTFT 291 -> 113 ms,
+# C16 541 -> 281, vLLM 121 / 283). Beside co-tenants raise PLOW_VMM_CACHE_MIN_FREE_MIB.
+PLOW_PREFIX_CACHE = "0"
+# Vendor cuBLASLt Q.K^T / causal softmax / P.V for the hd512 full-attention prefill segments
+# (attn_softmax_sm90a.cubin from the objects script; agent/pf-attn-batched-gemm, e8227eed..):
+# served C1 TTFT 4096 176.7 -> 170.6, 8192 386 -> 360, 15000 832 -> 750 ms; C4/C16 8192-15000
+# TTFT -7..-12%, TPOT -6..-12%; packs of short slices keep the segment graph (MIN_ROWS 1024).
+PLOW_PF_ATTN_GEMM = "1"
+PLOW_PF_SEG_PURE = "1"
+PLOW_PF_SEG_FA512 = "1"
+PLOW_PF_INTERLEAVE = "0"
+# Threaded split encode (exact for Gemma's one-word BPE, tokenizer.rs): C1 TTFT 50.1 -> 47.3 ms
+# at 1024 in, 186.3 -> 176.7 at 4096, 863 -> 830 at 15000 (the 26B recipes already carry it).
+PLOW_ENCODE_THREADS = "16"
+PLOW_ENCODE_SPLIT_MIN = "512"
+PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
+LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096 8192"
+concs = "1 4 8"
+nprompt = 10
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+model_id = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer in one short sentence.<end_of_turn>\n<start_of_turn>model\n"
+
+# The common ladder both Gemma-4 campaigns run (26B: gemma4-26b-a4b.h100.bf16-ctx16k.toml). The
+# realtime recipe's MAX_CHUNK=16384 / 32-slot ladder needs 110 GiB on this 80 GiB card (sliding ring
+# = next_pow2(window + chunk - 1) rows per slot); chunk 4096 and 16 slots is the shape that fits at
+# a 16k context. C32 cells therefore queue on 16 slots.
+[bench.profiles.realtime]
+in_lens = "128 1024 4096 8192 15000"
+concs = "1 4"
+nprompt = 32
+# Queue-driven prefill packing (PLOW_PF_INTERLEAVE_ADAPTIVE): four 1024-row prompts arriving together no
+# longer share one 172 ms launch; the oldest runs whole and later ones join only while that is cheaper.
+# Measured p12p, 16 prompts, off -> on: 1024 in TTFT 167.0 -> 107.7 ms (vLLM 0.28: 130.6), TPOT 11.93 -> 12.32;
+# 128 / 4096 / 15000 in level (40.5 / 363 / 1712 -> 40.1 / 359 / 1711).
+# MULTISTEP 0 + the lookahead-1 decode pipeline, as in gemma4-12b.h100.bf16-ladder16k.toml.
+# 4 emits four tokens per wave, which pins p99 ITL at exactly 4 x TPOT and leaves median ITL
+# literally 0.000, while TTFT and TPOT are untouched. MEASURED on this packet at C1:
+# p99 ITL 41.87 / 42.15 / 42.35 / 42.56 / 42.87 ms against a 10.45..10.65 TPOT (ratio 4.02),
+# versus vLLM 0.28 the same session at 11.46 / 11.56 / 11.57 / 11.58 / 11.60.
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_PIPELINE = "1", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0", PLOW_PF_INTERLEAVE_ADAPTIVE = "1" }
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096 8192 15000"
+concs = "16 32"
+nprompt = 64
+# MULTISTEP 0, not 8: an arrival waits out the running decode block (8 x ~14 ms at B=16) and
+# completions quantize into waves. Measured C16, p12m, 64 prompts, 8 -> 0: 128 in TTFT 112.8 ->
+# 74.9 ms, p99 ITL 98.5 -> 14.4, 1164 -> 1204 tok/s, TPOT 12.55 -> 12.71; 1024 / 4096 in level.
+# FAST_PROBE: a cold backlog tries the widest rung after one sample instead of four. C16, p12r,
+# 64 prompts (agent/pack-fairness): 128 in P99 TTFT 170 -> 150 ms, mean / tok/s level, 1024 / 4096 level.
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0", PLOW_RUNG_FAST_PROBE = "1" }
+
+[reference]
+csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-bf16.csv"

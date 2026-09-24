@@ -17,6 +17,7 @@ pub mod engine;
 #[cfg(feature = "cpu")]
 #[allow(dead_code)]
 pub mod head;
+pub mod policy;
 #[cfg(feature = "cuda")]
 pub mod manager;
 pub mod models;

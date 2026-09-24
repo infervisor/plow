@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Perf-campaign driver: one recipe file per measured cell, one command per stage.
 
-    campaign.py build   <recipe.toml> --out DIR        # base emit -> objects -> role emit
+    campaign.py build   <recipe.toml> --out DIR [--hf-dir SNAPSHOT]  # base emit -> objects -> role emit
+    campaign.py serve   <recipe.toml> --assets DIR --profile P [--port N]  # production plowrt serve
     campaign.py bench   <recipe.toml> --assets DIR --out DIR [--concs "1 4"] [--in-lens ...]
     campaign.py compare <results.csv> <reference.csv> [--roofline] [--recipe <recipe.toml>]
     campaign.py roofline <recipe.toml> [--results results.csv]
@@ -46,6 +47,9 @@ CSV_HEADER = (
     "input_len,concurrency,ttft_ms,ttft_med,tpot_ms,tpot_med,itl_ms,itl_med,itl_p99,"
     "out_tok_s,req_per_s,ok_reqs,gen_toks"
 )
+# Appended by `bench` from the bench script's `peak_mem_mib,<in>,<c>,<MiB>` lines; empty when the
+# cell was not sampled (no nvidia-smi, or a results.csv from before the column existed).
+MEM_COL = "peak_mem_mib"
 
 
 def die(msg: str) -> None:
@@ -96,6 +100,8 @@ def env_with(base: dict, extra: dict) -> dict:
 def cmd_build(a: argparse.Namespace) -> None:
     r = load(a.recipe)
     cell, emit = r["cell"], r["emit"]
+    if getattr(a, "hf_dir", None):
+        cell["hf_dir"] = a.hf_dir
     out = Path(a.out).resolve()
     if out.exists() and any(out.iterdir()):
         die(f"{out} exists and is not empty; a build is reproducible only into a fresh dir")
@@ -237,22 +243,14 @@ def cmd_bench(a: argparse.Namespace) -> None:
     # The one variable of an A/B, named on the command line so the record carries it.
     overrides = dict(kv.split("=", 1) for kv in (a.env or []))
     env.update(overrides)
-    # A `build` places the segment/role objects beside the assets; the serve-side mirror of
-    # the emit classing needs that directory and must not be typed by hand.
-    objects = assets.parent / "objects"
-    if "objects" in r and "PLOW_PF_SEG_DIR" not in env and objects.is_dir():
-        env["PLOW_PF_SEG_DIR"] = str(objects)
-    # A `probe` (or a prior write) leaves the exact-shape cuBLASLt algorithm table beside the
-    # packet; serving with it pins every Lt shape after AlgoCheck instead of re-timing at load.
+    packet_env(r, assets, env)
     lt_table = assets / "cublaslt_algos.jsonl"
-    if lt_table.is_file() and "PLOW_LT_ALGOS" not in env and "PLOW_LT_ALGOS_WRITE" not in env:
-        env["PLOW_LT_ALGOS"] = str(lt_table)
     env.update({
         "VLLM_VENV": bench.get("vllm_venv", "/opt/pytorch"),
         "HF_HOME": str(out / "hf-home"),
         "IN_LENS": a.in_lens or bench.get("in_lens", "128 1024 4096"),
         "CONCS": a.concs or bench.get("concs", "1"),
-        "NPROMPT": str(bench.get("nprompt", 32)),
+        "NPROMPT": str(getattr(a, "nprompt", None) or bench.get("nprompt", 32)),
         "OUTLEN": str(bench.get("outlen", 128)),
         "BENCH_BACKEND": bench.get("backend", "openai"),
         "BENCH_EXTRA_ARGS": f"--num-warmups {bench.get('warmups', 16)} --seed {bench.get('seed', 42)}",
@@ -261,6 +259,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "OUTDIR": str(out / "client"),
         "LOG": str(out / "server.log"),
         "SERVE_EXTRA_ARGS": serve.get("extra_args", ""),
+        "DATASET_ARGS": getattr(a, "dataset_args", None) or bench.get("dataset_args", ""),
     })
     (out / "hf-home").mkdir(exist_ok=True)
     model_id = bench.get("model_id") or json.loads((assets / "build.json").read_text()).get("slug") or cell["revision"]
@@ -274,7 +273,12 @@ def cmd_bench(a: argparse.Namespace) -> None:
         if k in os.environ and os.environ[k] == v and k not in overrides:
             continue  # inherited, unchanged
         lines.append(f"export {k}={shlex.quote(v)}")
-    lines.append("exec " + " ".join(shlex.quote(x) for x in [
+    # `--quiet-lock`: the bench holds this file lock exclusively for its whole session, INSIDE the
+    # GPU lease (lease first, then lock, everywhere — the other order deadlocks against a run that
+    # already holds the GPU). Builds take the same lock shared through scripts/bench/quiets.sh, so
+    # no compile overlaps a measurement; quietx.sh gates new builds while this session waits.
+    quiet = [str(REPO / "scripts" / "bench" / "quietx.sh"), a.quiet_lock] if getattr(a, "quiet_lock", None) else []
+    lines.append("exec " + " ".join(shlex.quote(x) for x in [*quiet,
         str(BENCH), str(assets), str(bench.get("port", 8765)), model_id, bench["tokenizer"], str(bench.get("ready_s", 1200))]))
     wrapper.write_text("\n".join(lines) + "\n")
     wrapper.chmod(0o755)
@@ -283,8 +287,14 @@ def cmd_bench(a: argparse.Namespace) -> None:
     log.write_bytes(b"")
     rc = run(cmd, dict(os.environ), log)
     text = log.read_text(errors="replace")
+    peak = {}
+    for ln in text.splitlines():
+        f = ln.split(",")
+        if f[0] == MEM_COL and len(f) == 4:
+            peak[(f[1], f[2])] = f[3]
     rows = [ln for ln in text.splitlines() if ln[:1].isdigit() and ln.count(",") == 12]
-    (out / "results.csv").write_text(CSV_HEADER + "\n" + "\n".join(rows) + ("\n" if rows else ""))
+    rows = [ln + "," + peak.get(tuple(ln.split(",")[:2]), "") for ln in rows]
+    (out / "results.csv").write_text(f"{CSV_HEADER},{MEM_COL}\n" + "\n".join(rows) + ("\n" if rows else ""))
     rec = {
         "recipe": str(Path(a.recipe).resolve()),
         "cell": cell,
@@ -296,7 +306,8 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "gpu": gpu_header(),
         "contended": "CONTENDED" in text,
         "gate": "coherence gate: PASS" in text,
-        "protocol": {k: env[k] for k in ("IN_LENS", "CONCS", "NPROMPT", "OUTLEN", "BENCH_BACKEND", "BENCH_EXTRA_ARGS")},
+        "protocol": {k: env[k] for k in ("IN_LENS", "CONCS", "NPROMPT", "OUTLEN", "BENCH_BACKEND", "BENCH_EXTRA_ARGS", "DATASET_ARGS")},
+        "quiet_lock": getattr(a, "quiet_lock", None),
         "serve_env": serve.get("env", {}),
         "overrides": overrides,
         "lt_algos": {
@@ -309,7 +320,7 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "bench_rc": rc,
     }
     (out / "run-record.json").write_text(json.dumps(rec, indent=1))
-    print(CSV_HEADER)
+    print(f"{CSV_HEADER},{MEM_COL}")
     print("\n".join(rows))
     if not rec["gate"]:
         die("coherence gate did not pass; numbers above are not evidence")
@@ -322,6 +333,49 @@ def cmd_bench(a: argparse.Namespace) -> None:
             print("\n" + generate_roofline_report(Path(a.recipe), out / "results.csv"))
         except Exception as e:
             print(f"campaign: roofline report skipped: {e}", file=sys.stderr)
+
+
+def packet_env(r: dict, assets: Path, env: dict) -> None:
+    # A `build` places the segment/role objects beside the assets; the serve-side mirror of
+    # the emit classing needs that directory and must not be typed by hand.
+    objects = assets.parent / "objects"
+    if "objects" in r and "PLOW_PF_SEG_DIR" not in env and objects.is_dir():
+        env["PLOW_PF_SEG_DIR"] = str(objects)
+    # A `probe` (or a prior write) leaves the exact-shape cuBLASLt algorithm table beside the
+    # packet; serving with it pins every Lt shape after AlgoCheck instead of re-timing at load.
+    lt_table = assets / "cublaslt_algos.jsonl"
+    if lt_table.is_file() and "PLOW_LT_ALGOS" not in env and "PLOW_LT_ALGOS_WRITE" not in env:
+        env["PLOW_LT_ALGOS"] = str(lt_table)
+
+
+# ---------------------------------------------------------------- serve
+def cmd_serve(a: argparse.Namespace) -> None:
+    """Production `plowrt serve` of a recipe-built packet, in the foreground: the env `bench`
+    serves the profile with, minus the matched ladder's prefix-cache pin. No lease, no client."""
+    r = load(a.recipe)
+    serve = dict(r.get("serve", {}))
+    profiles = r.get("bench", {}).get("profiles", {})
+    if a.profile not in profiles:
+        die(f"recipe has no [bench.profiles.{a.profile}]; have {sorted(profiles)}")
+    env = {k: str(v) for k, v in serve.get("env", {}).items()}
+    # [serve.env] pins the cache off so the ladder matches vLLM's --no-enable-prefix-caching;
+    # production takes plowrt's default (on) unless --env sets it.
+    env.pop("PLOW_PREFIX_CACHE", None)
+    env.update({k: str(v) for k, v in profiles[a.profile].get("serve_env", {}).items()})
+    env.update(dict(kv.split("=", 1) for kv in (a.env or [])))
+    assets = Path(a.assets).resolve()
+    if not (assets / "model.pkt").exists():
+        die(f"{assets}/model.pkt missing")
+    # As in `bench`: the shell's exports are visible to packet_env's guards.
+    env = env_with(os.environ, env)
+    packet_env(r, assets, env)
+    plowrt = Path(a.plowrt or serve.get("plowrt", str(REPO / "target" / "release" / "plowrt"))).resolve()
+    cmd = [str(plowrt), "serve", "--assets", str(assets), "--port", str(a.port), *shlex.split(serve.get("extra_args", ""))]
+    shown = sorted((k, v) for k, v in env.items() if os.environ.get(k) != v)
+    print(" ".join(f"{k}={shlex.quote(v)}" for k, v in shown) + " " + shlex.join(cmd), file=sys.stderr)
+    if a.dry_run:
+        return
+    os.execvpe(cmd[0], cmd, env)
 
 
 # ---------------------------------------------------------------- probe
@@ -702,14 +756,22 @@ def cmd_ledger(a: argparse.Namespace) -> None:
         die("run did not pass the coherence gate")
     ledger = REPO / "perf-data" / "campaign" / f"{a.cell}.csv"
     ledger.parent.mkdir(parents=True, exist_ok=True)
+    cols = [*CSV_HEADER.split(","), MEM_COL]
     new = not ledger.exists()
+    if not new:
+        # A ledger from before the memory column: widen it in place, old rows get an empty field.
+        with open(ledger, newline="") as f:
+            old_rows = list(csv.reader(f))
+        if old_rows and MEM_COL not in old_rows[0]:
+            with open(ledger, "w", newline="") as f:
+                csv.writer(f).writerows([old_rows[0] + [MEM_COL], *[r + [""] for r in old_rows[1:]]])
     with open(ledger, "a", newline="") as f:
         w = csv.writer(f)
         if new:
-            w.writerow(["utc", "commit", "label", "provisional", "pkt_sha", "note", *CSV_HEADER.split(",")])
+            w.writerow(["utc", "commit", "label", "provisional", "pkt_sha", "note", *cols])
         for row in read_rows(res).values():
             w.writerow([rec["utc"], rec["commit"][:12], rec["label"], int(bool(rec.get("contended"))),
-                        rec["hashes"].get("model.pkt", "")[:16], a.note, *[row[c] for c in CSV_HEADER.split(",")]])
+                        rec["hashes"].get("model.pkt", "")[:16], a.note, *[row.get(c) or "" for c in cols]])
     print(f"appended {len(read_rows(res))} row(s) to {ledger}")
 
 
@@ -720,9 +782,19 @@ def main() -> None:
     b.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the emit env; recorded")
     b.add_argument("--no-probe", action="store_true", help="skip the leased cuBLASLt algorithm probe even with the GPU present")
     b.add_argument("--store-cell", help="tune-store cell for the probe (default h100)")
+    b.add_argument("--hf-dir", help="checkpoint snapshot on this host, replacing [cell].hf_dir; recorded")
     b.set_defaults(f=cmd_build)
+    s = sp.add_parser("serve"); s.add_argument("recipe"); s.add_argument("--assets", required=True)
+    s.add_argument("--profile", required=True, help="serving policy from [bench.profiles.*] (e.g. realtime, high_concurrency)")
+    s.add_argument("--port", type=int, default=8080); s.add_argument("--plowrt", help="plowrt binary (default target/release/plowrt)")
+    s.add_argument("--env", action="append", metavar="K=V", help="host-specific or policy override, e.g. PLOW_LIBCUDA=...")
+    s.add_argument("--dry-run", action="store_true", help="print the env and command, do not start")
+    s.set_defaults(f=cmd_serve)
     n = sp.add_parser("bench"); n.add_argument("recipe"); n.add_argument("--assets", required=True); n.add_argument("--out", required=True)
     n.add_argument("--concs"); n.add_argument("--in-lens"); n.add_argument("--label"); n.add_argument("--reference")
+    n.add_argument("--nprompt", type=int, help="prompts per cell, overriding the recipe/profile")
+    n.add_argument("--dataset-args", help="replaces the client's random-dataset block (see bench_plowrt_serve.sh DATASET_ARGS); recorded")
+    n.add_argument("--quiet-lock", metavar="FILE", help="hold this lock exclusively for the bench session, inside the GPU lease (scripts/bench/quietx.sh; builds take it shared via quiets.sh)")
     n.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the server env; recorded")
     n.add_argument("--profile", help="named workload from [bench.profiles.*] (e.g. realtime, throughput)")
     n.set_defaults(f=cmd_bench)

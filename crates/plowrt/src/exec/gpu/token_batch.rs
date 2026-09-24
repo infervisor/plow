@@ -2,6 +2,53 @@ use super::*;
 use crate::exec::mixed_step_staging::TokenBatchStaging;
 use plow_asset::token_batch::{Phase, Request, Selection};
 
+/// `PLOW_STEP_TIME=1` attribution for the UNIFIED TOKEN-BATCH route.
+///
+/// `StepTiming` (gpu.rs) instruments the `step_slots` path only, so a model that decodes
+/// through this route — Gemma-4-26B-A4B does; the log says
+/// `route="unified-token-batch" ... fires=true` — produces no timing at all under
+/// `PLOW_STEP_TIME=1`, and the 26B campaign could not say whether its 48.8 ms TPOT was
+/// host gap, submission, or device time. (Standalone benches put the MoE kernels at
+/// 3.1 ms and all decode kernels at ~5.5 ms, so ~88 % was unattributed.)
+///
+/// Split reported: `enqueue` is `packed_token_body_enqueue` (host-side submission of the
+/// interpreter launch, async) and `terminal` is `run_rows`, which must wait on the device
+/// for the sampled ids — so `terminal` carries the device time the enqueue deferred.
+mod steptime {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub(super) static STEPS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static ENQUEUE_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static TERMINAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static ROWS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn add(enqueue_ns: u64, terminal_ns: u64, rows: u64) {
+        STEPS.fetch_add(1, Ordering::Relaxed);
+        ENQUEUE_NS.fetch_add(enqueue_ns, Ordering::Relaxed);
+        TERMINAL_NS.fetch_add(terminal_ns, Ordering::Relaxed);
+        ROWS.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// Log a rolling mean every `n` steps. Means, not last-step values: a single decode
+    /// step is noisy and the campaign protocol compares medians of many.
+    pub(super) fn log_every(n: u64) {
+        let steps = STEPS.load(Ordering::Relaxed);
+        if steps == 0 || steps % n != 0 {
+            return;
+        }
+        let per = |v: u64| v as f64 / steps as f64 / 1e6; // ns total -> ms mean
+        let enq = per(ENQUEUE_NS.load(Ordering::Relaxed));
+        let term = per(TERMINAL_NS.load(Ordering::Relaxed));
+        tracing::info!(
+            steps,
+            rows_total = ROWS.load(Ordering::Relaxed),
+            enqueue_ms = enq,
+            terminal_ms = term,
+            step_ms = enq + term,
+            "token-batch step means (host clocks; terminal includes the device wait)"
+        );
+    }
+}
+
 pub(super) struct CudaTokenBatch {
     staging: TokenBatchStaging,
     fired: bool,
@@ -36,6 +83,27 @@ impl GpuEngine {
         &mut self,
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
+    ) -> Result<()> {
+        self.token_batch_step_inner(requests, output, false)
+    }
+
+    /// As [`Self::token_batch_step`], but parked behind the decode pipeline's event instead of
+    /// waited on. Decode rows take their input token from the device (the previous launch sampled
+    /// it and nobody has read it), and this launch's samples — a prompt's first token included —
+    /// are read back on a later tick, so the host never blocks between launches.
+    pub fn token_batch_step_pipelined(
+        &mut self,
+        requests: &[Request<'_>],
+        output: &mut Vec<(u32, u32)>,
+    ) -> Result<()> {
+        self.token_batch_step_inner(requests, output, true)
+    }
+
+    fn token_batch_step_inner(
+        &mut self,
+        requests: &[Request<'_>],
+        output: &mut Vec<(u32, u32)>,
+        pipelined: bool,
     ) -> Result<()> {
         output.clear();
         let mut state = self.token_batch.take().ok_or_else(|| {
@@ -101,6 +169,42 @@ impl GpuEngine {
                     }
                 })
                 .collect();
+            // Owned copies of what this step needs after the plan's borrow ends.
+            let phases: smallvec::SmallVec<[Phase; 16]> = plan.phases.iter().copied().collect();
+            let sample_rows: smallvec::SmallVec<[u32; 32]> =
+                plan.sample_input_rows.iter().copied().collect();
+            let real_rows = plan.real_rows as usize;
+            // Rows whose input token is on the device, by packed row offset and slot.
+            let mut device_ids: smallvec::SmallVec<[(u32, u32); 16]> = Default::default();
+            if pipelined {
+                let mut row = 0u32;
+                for (chunk, phase) in chunks.iter().zip(&phases) {
+                    // Only a row whose newest token the pipe still owes: for any other row the
+                    // host's token is the authoritative one and `d_last` is stale.
+                    if *phase == Phase::Decode && self.pipe_owes(chunk.slot) {
+                        device_ids.push((row, chunk.slot as u32));
+                    }
+                    row += chunk.tokens.len() as u32;
+                }
+            }
+            // The terminal's sample order, with each row's kind: a decode row carries the token
+            // it consumed into the prefix history when this step is read. `carry` is the row's
+            // KIND, not where its input came from -- a decode row the host staged (the pipe owed
+            // it nothing) still consumed a token and still has to match `pipe_covers`.
+            let decode_slots: smallvec::SmallVec<[u32; 32]> = chunks
+                .iter()
+                .zip(&phases)
+                .filter(|(_, phase)| **phase == Phase::Decode)
+                .map(|(chunk, _)| chunk.slot as u32)
+                .collect();
+            let pipe_rows: smallvec::SmallVec<[super::PipeRow; 32]> = plan
+                .sample_owners
+                .iter()
+                .map(|owner| super::PipeRow {
+                    slot: owner.slot as usize,
+                    carry: decode_slots.contains(&owner.slot),
+                })
+                .collect();
             let completed: smallvec::SmallVec<[_; 16]> = plan
                 .pending
                 .iter()
@@ -108,6 +212,26 @@ impl GpuEngine {
                 .filter(|(pending, phase)| pending.completes_prompt && **phase == Phase::Prefill)
                 .map(|(pending, _)| pending.slot as usize)
                 .collect();
+            // A request waiting on this prompt's shared blocks attaches as soon as the chunk
+            // that computed them lands, not after the owner's whole prompt.
+            let chunk_ends: smallvec::SmallVec<[(usize, u32); 16]> = match RuntimeConfig::get()
+                .prefix_chunk_publish()
+                .then(|| self.vmm.as_ref().map(|v| v.kv.block_rows()))
+                .flatten()
+            {
+                Some(br) => plan
+                    .pending
+                    .iter()
+                    .zip(&plan.phases)
+                    .filter(|(pending, phase)| {
+                        **phase == Phase::Prefill
+                            && !pending.completes_prompt
+                            && pending.new_frontier / br > pending.expected_frontier / br
+                    })
+                    .map(|(pending, _)| (pending.slot as usize, pending.new_frontier / br * br))
+                    .collect(),
+                None => smallvec::SmallVec::new(),
+            };
             if self.vmm_prefix_enabled()
                 && chunks
                     .iter()
@@ -117,32 +241,71 @@ impl GpuEngine {
                     "CUDA token-batch prefix history frontier mismatch".into(),
                 ));
             }
-            self.packed_token_body_enqueue(&chunks)?;
+            // PLOW_STEP_TIME=1 only: `Instant::now` is a syscall-class read, so it stays
+            // behind the flag rather than running on every decode step.
+            let timed = RuntimeConfig::get().nv.step_time;
+            let t_enq = timed.then(std::time::Instant::now);
+            if pipelined {
+                self.packed_token_body_enqueue_device(&chunks, &device_ids)?;
+            } else {
+                self.packed_token_body_enqueue(&chunks)?;
+            }
             body_enqueued = true;
+            let enqueue_ns = t_enq.map_or(0, |t| t.elapsed().as_nanos() as u64);
             let mut terminal = self
                 .packed_terminal
                 .take()
                 .expect("capability checked at load");
-            let sampled = terminal
-                .run_rows(self, &plan.sample_input_rows, plan.real_rows as usize)
-                .and_then(|ids| {
-                    state
-                        .staging
-                        .deliver(ids, output)
-                        .map_err(|error| RuntimeError::Rejected(error.to_string()))
-                });
+            let t_term = timed.then(std::time::Instant::now);
+            let sampled = if pipelined {
+                terminal.launch_rows(self, &sample_rows, real_rows).and_then(|()| {
+                    if pipe_rows.is_empty() {
+                        // A chunk that finished no prompt and carried no decode row samples
+                        // nothing: there is no token to wait for and nothing to park.
+                        Ok(())
+                    } else {
+                        self.pipe_enqueue_mixed(&pipe_rows)
+                    }
+                })
+            } else {
+                terminal
+                    .run_rows(self, &sample_rows, real_rows)
+                    .and_then(|ids| {
+                        state
+                            .staging
+                            .deliver(ids, output)
+                            .map_err(|error| RuntimeError::Rejected(error.to_string()))
+                    })
+            };
+            let terminal_ns = t_term.map_or(0, |t| t.elapsed().as_nanos() as u64);
             self.packed_terminal = Some(terminal);
             sampled?;
+            if timed {
+                steptime::add(enqueue_ns, terminal_ns, rows as u64);
+                steptime::log_every(8);
+            }
             state
                 .staging
                 .commit_after_device_success(&mut self.pos, &self.slot_generations)
                 .map_err(|error| RuntimeError::Rejected(error.to_string()))?;
             if self.vmm_prefix_enabled() {
-                for chunk in &chunks {
+                for (chunk, phase) in chunks.iter().zip(&phases) {
+                    // A pipelined decode row's input token is the previous launch's sample, which
+                    // the host has not read; the pipe appends it when that token arrives.
+                    if pipelined
+                        && *phase == Phase::Decode
+                        && device_ids.iter().any(|&(_, slot)| slot as usize == chunk.slot)
+                    {
+                        continue;
+                    }
                     self.seq_tokens[chunk.slot].extend_from_slice(chunk.tokens);
                 }
                 for slot in completed {
                     self.vmm_publish(slot, self.pos[slot].saturating_sub(1));
+                    self.vmm_prefill_done(slot);
+                }
+                for (slot, rows) in chunk_ends {
+                    self.vmm_publish(slot, rows);
                 }
             }
             if !state.fired {
@@ -172,6 +335,9 @@ impl GpuEngine {
         if result.is_err() {
             if body_enqueued {
                 let _ = self.be.stream_synchronize(&self.stream);
+            }
+            if pipelined {
+                self.pipe_abandon();
             }
             state.staging.discard();
             output.clear();

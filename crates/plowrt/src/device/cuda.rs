@@ -270,6 +270,13 @@ driver_api! {
     cuGraphLaunch: fn(CUgraphExec, CUstream) -> CUresult,
     cuGraphDestroy: fn(CUgraph) -> CUresult,
     cuGraphExecDestroy: fn(CUgraphExec) -> CUresult,
+    cuGraphGetNodes: fn(CUgraph, *mut CUgraphNode, *mut usize) -> CUresult,
+    cuGraphNodeGetType: fn(CUgraphNode, *mut i32) -> CUresult,
+    cuGraphKernelNodeGetParams_v2: fn(CUgraphNode, *mut CudaKernelNodeParams) -> CUresult,
+    cuGraphNodeGetDependencies_v2: fn(CUgraphNode, *mut CUgraphNode, *mut u64, *mut usize) -> CUresult,
+    cuGraphNodeGetDependentNodes_v2: fn(CUgraphNode, *mut CUgraphNode, *mut u64, *mut usize) -> CUresult,
+    cuGraphAddDependencies_v2: fn(CUgraph, *const CUgraphNode, *const CUgraphNode, *const u64, usize) -> CUresult,
+    cuGraphRemoveDependencies_v2: fn(CUgraph, *const CUgraphNode, *const CUgraphNode, *const u64, usize) -> CUresult,
 }
 
 thread_local! {
@@ -1047,6 +1054,36 @@ impl CudaBackend {
         Ok(Some(v))
     }
 
+    pub fn module_global_set_u32(&self, module: &Module, name: &str, val: u32) -> Result<bool> {
+        self.bind()?;
+        let raw = *self.modules.lock().get(&module.id).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "module_global_set_u32: module {} not loaded",
+                module.id
+            ))
+        })?;
+        let cname = std::ffi::CString::new(name)
+            .map_err(|_| RuntimeError::Device("global name contains NUL".into()))?;
+        let mut ptr: CUdeviceptr = 0;
+        let mut bytes: usize = 0;
+        let rc = unsafe {
+            (self.api.cuModuleGetGlobal_v2)(&mut ptr, &mut bytes, raw as CUmodule, cname.as_ptr())
+        };
+        if rc != 0 {
+            return Ok(false);
+        }
+        if bytes != 4 {
+            return Err(RuntimeError::Device(format!(
+                "module global {name} is {bytes} B, want 4"
+            )));
+        }
+        self.check(
+            unsafe { (self.api.cuMemcpyHtoD_v2)(ptr, &val as *const u32 as *const c_void, 4) },
+            &format!("cuMemcpyHtoD({name})"),
+        )?;
+        Ok(true)
+    }
+
     /// Read up to `max` bytes of a module-scope global (`__device__`/
     /// `__constant__`) by name into `out` (cleared first). `Ok(false)` when
     /// the symbol is absent — the caller keeps its fallback. Copies
@@ -1312,6 +1349,19 @@ impl CudaBackend {
         stream: &CudaStream,
         enqueue: impl FnOnce() -> Result<()>,
     ) -> Result<GraphExec> {
+        self.graph_capture_hoisting(stream, &[], enqueue)
+    }
+
+    /// [`Self::graph_capture`], with every memset node whose only predecessor is one of
+    /// `untouched`'s kernels moved up beside that kernel. cuBLASLt's grouped matmul captures a
+    /// 4-byte workspace memset before each GEMM; serialized behind the glue kernel it costs
+    /// ~3-5 us per GEMM. `untouched` = kernels that never touch a captured memset's target.
+    pub(crate) fn graph_capture_hoisting(
+        &self,
+        stream: &CudaStream,
+        untouched: &[KernelFn],
+        enqueue: impl FnOnce() -> Result<()>,
+    ) -> Result<GraphExec> {
         self.bind()?;
         // Thread-local capture; callers enqueue only immutable same-stream operations.
         self.check(
@@ -1330,6 +1380,13 @@ impl CudaBackend {
             return Err(e);
         }
         self.check(ended, "cuStreamEndCapture")?;
+        if !untouched.is_empty() {
+            // SAFETY: `graph` is the live graph just captured; destroyed below on every path.
+            if let Err(e) = unsafe { self.hoist_memsets(graph, untouched) } {
+                unsafe { (self.api.cuGraphDestroy)(graph) };
+                return Err(e);
+            }
+        }
         let mut exec = std::ptr::null_mut();
         let status = unsafe { (self.api.cuGraphInstantiateWithFlags)(&mut exec, graph, 0) };
         unsafe {
@@ -1340,6 +1397,121 @@ impl CudaBackend {
             exec,
             api: self.api.as_ref() as *const _ as *const c_void,
         })
+    }
+
+    /// SAFETY: `graph` is a live, not yet instantiated graph.
+    unsafe fn hoist_memsets(&self, graph: CUgraph, untouched: &[KernelFn]) -> Result<()> {
+        const KERNEL: i32 = 0;
+        const MEMSET: i32 = 2;
+        type Edges =
+            unsafe extern "C" fn(CUgraphNode, *mut CUgraphNode, *mut u64, *mut usize) -> CUresult;
+        let api = &*self.api;
+        // Edge data is 8 bytes; 0 = a full (default) dependency.
+        let edges = |get: Edges, node: CUgraphNode| -> Result<(Vec<CUgraphNode>, Vec<u64>)> {
+            let mut n = 0usize;
+            self.check(
+                get(node, std::ptr::null_mut(), std::ptr::null_mut(), &mut n),
+                "graph edges",
+            )?;
+            let (mut nodes, mut data) = (vec![std::ptr::null_mut(); n], vec![0u64; n]);
+            self.check(
+                get(node, nodes.as_mut_ptr(), data.as_mut_ptr(), &mut n),
+                "graph edges",
+            )?;
+            nodes.truncate(n);
+            data.truncate(n);
+            Ok((nodes, data))
+        };
+        let kind = |node: CUgraphNode| -> Result<i32> {
+            let mut t = -1;
+            self.check((api.cuGraphNodeGetType)(node, &mut t), "cuGraphNodeGetType")?;
+            Ok(t)
+        };
+        let mut n = 0usize;
+        self.check(
+            (api.cuGraphGetNodes)(graph, std::ptr::null_mut(), &mut n),
+            "cuGraphGetNodes",
+        )?;
+        let mut nodes = vec![std::ptr::null_mut(); n];
+        self.check(
+            (api.cuGraphGetNodes)(graph, nodes.as_mut_ptr(), &mut n),
+            "cuGraphGetNodes",
+        )?;
+        nodes.truncate(n);
+        let mut hoisted = 0usize;
+        let mut refused = 0usize;
+        // Every query runs before this node's first mutation, so a driver refusal can skip the node
+        // and leave the graph exactly as captured. The hoist is an optimization and must not be
+        // able to fail the launch; the three mutations below stay fatal, because a half-moved edge
+        // is a race rather than a lost optimization.
+        macro_rules! probe {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(_) => {
+                        refused += 1;
+                        continue;
+                    }
+                }
+            };
+        }
+        for &memset in &nodes {
+            if probe!(kind(memset)) != MEMSET {
+                continue;
+            }
+            let (pred, pred_data) = probe!(edges(api.cuGraphNodeGetDependencies_v2, memset));
+            let (succ, succ_data) = probe!(edges(api.cuGraphNodeGetDependentNodes_v2, memset));
+            let ([kernel], [0], [consumer], [0]) =
+                (&pred[..], &pred_data[..], &succ[..], &succ_data[..])
+            else {
+                continue;
+            };
+            if probe!(kind(*kernel)) != KERNEL {
+                continue;
+            }
+            let mut params: CudaKernelNodeParams = std::mem::zeroed();
+            probe!(self.check(
+                (api.cuGraphKernelNodeGetParams_v2)(*kernel, &mut params),
+                "cuGraphKernelNodeGetParams",
+            ));
+            if !untouched.iter().any(|f| f.0 == params.func as usize) {
+                continue;
+            }
+            let (above, _) = probe!(edges(api.cuGraphNodeGetDependencies_v2, *kernel));
+            let null = std::ptr::null();
+            self.check(
+                (api.cuGraphRemoveDependencies_v2)(graph, kernel, &memset, null, 1),
+                "cuGraphRemoveDependencies",
+            )?;
+            let targets = vec![memset; above.len()];
+            if !above.is_empty() {
+                self.check(
+                    (api.cuGraphAddDependencies_v2)(
+                        graph,
+                        above.as_ptr(),
+                        targets.as_ptr(),
+                        null,
+                        above.len(),
+                    ),
+                    "cuGraphAddDependencies",
+                )?;
+            }
+            self.check(
+                (api.cuGraphAddDependencies_v2)(graph, kernel, consumer, null, 1),
+                "cuGraphAddDependencies",
+            )?;
+            hoisted += 1;
+        }
+        if refused > 0 {
+            tracing::warn!(
+                refused,
+                hoisted,
+                nodes = n,
+                "graph memset hoist: driver refused a node query; those memsets left as captured"
+            );
+        }
+        tracing::debug!(hoisted, nodes = n, "graph memsets hoisted");
+        Ok(())
     }
 
     pub fn graph_launch(&self, g: &GraphExec, stream: &CudaStream) -> Result<()> {
@@ -1842,8 +2014,18 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         self.check(
             unsafe { (self.api.cuMemAlloc_v2)(&mut dptr, bytes as usize) },
             "cuMemAlloc(vmm snapshot)",
-        )?;
+        )
+        // CUDA_ERROR_OUT_OF_MEMORY is memory pressure, not a fault: the pool evicts
+        // and retries on `Oom` only.
+        .map_err(|e| match e.device_code() {
+            Some(2) => RuntimeError::Oom(e.to_string()),
+            _ => e,
+        })?;
         Ok(dptr)
+    }
+
+    fn free_bytes(&self) -> Option<u64> {
+        self.mem_info().ok().map(|(free, _)| free)
     }
 
     fn free(&self, va: u64) {

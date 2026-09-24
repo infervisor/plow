@@ -56,8 +56,79 @@ const RELEASE_RETIRE_QUALIFIED: Status = Status::Qualified {
         "docs/flags-reference.md: `=0` is the rollback",
     ],
 };
+const PUBLISH_SHARED_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "agent/prefix-cache v2, 12B H100 random unique prompts, cache on vs off: 1024 C4/C16 TTFT 101.9/101.4, 306.8/307.3 ms, peak +1.2 GiB (v1 published two tailed windows per request); prefix-repetition hits 26/35, 57/67 as v1",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
+const CACHE_OUTPUT_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "agent/prefix-cache v1: a 7230-token follow-up turn 404 -> 32 ms TTFT",
+        "agent/prefix-cache v2, 12B H100 prefix-repetition, =0 vs default: C4 144.4/144.7, C16 258.4/259.4 ms TTFT, hits equal (neutral on single-turn)",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
+const INFLIGHT_WAIT_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "agent/prefix-cache v2, 12B H100 prefix-repetition C16, default vs =0: hits 57/67 vs 53/67, TTFT 259.4 vs 295.7 ms, tok/s 915 vs 889; C4 hits 26 vs 25, TTFT 144.7 vs 123.3 (v1 default 122.3, same hits)",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
+const CHUNK_PUBLISH_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "agent/prefix-cache v2, 12B H100 prefix-repetition 2048 shared + 6144 unique, C16, default vs =0: TTFT mean/median 1097.6/405.1 vs 1123.5/609.4 ms, TPOT 48.2 vs 47.6, tok/s 281.0 vs 283.3",
+        "agent/prefix-cache v5 ABAB, prefix-repetition 2048 + 256, C16, default vs =0: 12B TTFT mean 318.9/327.3 vs 311.2/280.2 ms, median 239.6/235.7 vs 250.9/241.0; 26B mean 200.5/214.5 vs 182.5/220.6; hits, TPOT, tok/s equal (neutral within session spread)",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
 const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
+};
+/// Unset = the cost-aware DP cover, which minimises `padded_rows + PLOW_PF_CHUNK_COST * launches`
+/// over the packet's existing rungs; `=1` restores the covering pick (smallest single rung that
+/// covers the row count).
+const PF_COVER_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "perf-certs/rt.pf_cover.json (12B H100 ladder16k, ABAB, coherence gate PASS every arm): 15000/C1 TTFT 737.256 -> 703.364 ms against a 7.169 ms floor, prefill padding 10.59% -> 1.58%, tpot_ms 10.541 -> 10.538 within a 0.007 floor",
+        "the same certificate records 8192/C1 as NEUTRAL with evidence: 8192 is itself a prefill bucket, so the covering pick and the DP cover both emit one exact-fit launch and there is no padding to remove",
+        "docs/flags-reference.md: `=1` is the rollback",
+    ],
+};
+/// Unset = on for a CUDA engine; AMD and CPU engines keep the engine thread.
+const INLINE_TICK_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "0b88ef14 (26B-A4B H100, ctl/inline/ctl2/inline2): dispatcher-engine handoff 50-87 -> 0.3 us per tick, 128/C1 TPOT 5.66 -> 5.61 ms, C16 15.53 -> 15.42 ms, TTFT unchanged, coherence gate PASS every arm",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
+/// Unset = split encode for a metaspace one-word BPE only (`text/tokenizer.rs`
+/// `metaspace_bpe_split_safe`), where it is exact; every other tokenizer stays serial.
+const ONE_WORD_ENCODE_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "scripts/campaign/recipes gemma4 H100 serve.env history: 26B served wall 46.0 -> 43.7 ms at 1k, 131.6 -> 122.4 at 4k; 12B C1 TTFT 50.1 -> 47.3 ms at 1024 in, 186.3 -> 176.7 at 4096",
+        "text/tokenizer.rs metaspace_bpe_split_encode_matches_whole_text_encode: ids identical to the whole-text encode",
+        "docs/flags-reference.md: `PLOW_ENCODE_THREADS=0` is the rollback",
+    ],
+};
+/// Unset = route the packet's own `MOE_*_CUBLASLT` segments; a packet without them is unchanged.
+const MOE_LT_QUALIFIED: Status = Status::Qualified {
+    evidence: &[
+        "agent/moe-grouped-gemm bb2c5c14 (26B-A4B H100): MoE prefill segment 0.744 -> 0.569 ms at 1024 rows, TTFT 1024/C1 43.0 -> 38.7 ms, 8192 257.7 -> 231.0; MoE relL2 3.6e-3, gate + needle + consistency pass",
+        "26B-A4B H100 served vs the GROUP 8 packet: C16 TPOT 15.26 / 17.84 / 26.87 -> 12.41 / 15.10 / 24.51 ms at 128 / 1024 / 4096 in; the MOE_DEC_LT emit without the route is +1.65 ms at B=4",
+        "docs/flags-reference.md: `=0` is the rollback",
+    ],
+};
+
+/// Unset = on when the packet carries `attn_softmax_sm90a.cubin` and the KV admission budget left
+/// after the route's scratch still admits every live request at full context.
+const PF_ATTN_GEMM_AUTO: Status = Status::Qualified {
+    evidence: &[
+        "839911e9 (GQA sites): Gemma-4-26B C1 TTFT 1024 / 4096 / 8192 / 15000 in 38.66 / 107.29 / 230.96 / 484.72 -> 38.27 / 103.30 / 214.73 / 431.77 ms, TPOT unchanged; the 12B recipes serve it (=1)",
+        "its 1 GiB score scratch comes out of the 26B KV admission budget, where 133 MiB already cost one 15000-token request at C16 (dc3f5ee4): unset keeps it off unless the budget still admits PLOW_DECODE_MAX_RUNG full-context requests",
+        "26B p26dl, one session, unset: realtime (rung 4) routes, C1 TTFT 4096 / 8192 / 15000 106.64 / 230.06 / 483.12 (=0) -> 102.92 / 214.14 / 430.50 ms; high_concurrency (rung 16) stays native, 15000/C16 KV max_rows 231424, 14 live, TTFT 2515 ms as the unrouted control; forced (=1) there: 184320 rows, 11 live, TTFT 3686 ms (tok/s 198.7 -> 207.6)",
+        "docs/flags-reference.md: `=0` is the rollback, `=1` forces it past the budget gate",
+    ],
 };
 
 /// KV-capacity admission. The mux admitted on free SLOTS alone, so a device that can back
@@ -336,8 +407,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.prefix_cache", Some("PLOW_PREFIX_CACHE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.idle_dispatch", Some("PLOW_IDLE_DISPATCH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.encode_fast", Some("PLOW_ENCODE_FAST"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.encode_threads", Some("PLOW_ENCODE_THREADS"), Layer::Runtime, U32, UNSET, OPT_IN),
-    KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, OPT_IN),
+    KnobSpec::new("rt.encode_threads", Some("PLOW_ENCODE_THREADS"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
+    KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
     KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.05")), OPT_IN),
     KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PRESSURE_EVICTION_DEFAULT),
     KnobSpec::new("rt.kv_admit_headroom", Some("PLOW_KV_ADMIT_HEADROOM"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.9")), KV_ADMIT_DEFAULT),
@@ -350,13 +421,15 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.weight_vmm", Some("PLOW_WEIGHT_VMM"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_batch", Some("PLOW_PF_BATCH"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_interleave", Some("PLOW_PF_INTERLEAVE"), Layer::Runtime, U32, UNSET, OPT_IN),
+    KnobSpec::new("rt.pf_interleave_adaptive", Some("PLOW_PF_INTERLEAVE_ADAPTIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.rung_fast_probe", Some("PLOW_RUNG_FAST_PROBE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.mux_inline_tick", Some("PLOW_MUX_INLINE_TICK"), Layer::Runtime, Domain::Bool, UNSET, INLINE_TICK_QUALIFIED),
     KnobSpec::new("rt.pf_chunk", Some("PLOW_PF_CHUNK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.pf_no_chunk", Some("PLOW_PF_NO_CHUNK"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_no_interleave", Some("PLOW_PF_NO_INTERLEAVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_defer_decode", Some("PLOW_PF_DEFER_DECODE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.block_packets", Some("PLOW_BLOCK_PACKETS"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.pf_modular", Some("PLOW_PF_MODULAR"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.block_stage", Some("PLOW_BLOCK_STAGE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.serve_policy", Some("PLOW_SERVE_POLICY"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.pf_span_policy", Some("PLOW_PF_SPAN_POLICY"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.rt_max_ctx", Some("PLOW_RT_MAX_CTX"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.tbt_slo_ms", Some("PLOW_TBT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.queue_ttl_ms", Some("PLOW_QUEUE_TTL_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -373,15 +446,22 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.preload", Some("PLOW_PRELOAD"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.kv_pool_mib", Some("PLOW_KV_POOL_MIB"), Layer::Runtime, USIZE, Default::Static(Val::Nat(512)), OPT_IN),
     KnobSpec::new("rt.vmm_deferred_reclaim", Some("PLOW_VMM_DEFERRED_RECLAIM"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
-    KnobSpec::new("rt.vmm_publish_shared", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
+    KnobSpec::new("rt.vmm_publish_shared", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::Runtime, Domain::Bool, ON, PUBLISH_SHARED_QUALIFIED),
+    KnobSpec::new("rt.prefix_cache_output", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::Runtime, Domain::Bool, ON, CACHE_OUTPUT_QUALIFIED),
+    KnobSpec::new("rt.prefix_inflight_wait", Some("PLOW_PREFIX_INFLIGHT_WAIT"), Layer::Runtime, Domain::Bool, ON, INFLIGHT_WAIT_QUALIFIED),
+    KnobSpec::new("rt.prefix_chunk_publish", Some("PLOW_PREFIX_CHUNK_PUBLISH"), Layer::Runtime, Domain::Bool, ON, CHUNK_PUBLISH_QUALIFIED),
     KnobSpec::new("rt.vmm_release_retire", Some("PLOW_VMM_RELEASE_RETIRE"), Layer::Runtime, Domain::Bool, ON, RELEASE_RETIRE_QUALIFIED),
     KnobSpec::new("rt.ttft_log", Some("PLOW_TTFT_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.host_timing", Some("PLOW_HOST_TIMING"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pfx_log", Some("PLOW_PFX_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.tick_log", Some("PLOW_TICK_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.dstep_log", Some("PLOW_DSTEP_LOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_packlog", Some("PLOW_PF_PACKLOG"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.load_profile", Some("PLOW_LOAD_PROFILE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.multistep", Some("PLOW_MULTISTEP"), Layer::Runtime, U32, Default::Static(Val::Nat(8)), OPT_IN),
+    KnobSpec::new("rt.multistep_adaptive", Some("PLOW_MULTISTEP_ADAPTIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.decode_pipeline", Some("PLOW_DECODE_PIPELINE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.pipe_prefill", Some("PLOW_PIPE_PREFILL"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.vmm_prefix", Some("PLOW_VMM_PREFIX"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_live", Some("PLOW_VMM_LIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.vmm_live_rings", Some("PLOW_VMM_LIVE_RINGS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
@@ -398,10 +478,12 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.libcuda", Some("PLOW_LIBCUDA"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.lt_algos", Some("PLOW_LT_ALGOS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.lt_algos_write", Some("PLOW_LT_ALGOS_WRITE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.moe_pf_lt", Some("PLOW_MOE_PF_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
+    KnobSpec::new("rt.moe_dec_lt", Some("PLOW_MOE_DEC_LT"), Layer::Runtime, U32, UNSET, MOE_LT_QUALIFIED),
     KnobSpec::new("rt.vram_budget_mib", Some("PLOW_VRAM_BUDGET_MIB"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.step_time", Some("PLOW_STEP_TIME"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.l2_place_dispatch", Some("PLOW_L2_PLACE_DISPATCH"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
-    KnobSpec::new("rt.pf_cover", Some("PLOW_PF_COVER"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.pf_cover", Some("PLOW_PF_COVER"), Layer::Runtime, Domain::Bool, OFF, PF_COVER_QUALIFIED),
     KnobSpec::new("rt.pf_chunk_cost", Some("PLOW_PF_CHUNK_COST"), Layer::Runtime, USIZE, Default::Static(Val::Nat(512)), OPT_IN),
     KnobSpec::new("rt.pf_seg_dir", Some("PLOW_PF_SEG_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_seg_gemm_small", Some("PLOW_PF_SEG_GEMM_SMALL"), Layer::Runtime, Domain::Str, UNSET, OPT_IN).with(C_PF_SEG_GEMM_SMALL),
@@ -410,6 +492,12 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_seg_fa256_gqa2", Some("PLOW_PF_SEG_FA256_GQA2"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_graph", Some("PLOW_PF_SEG_GRAPH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.pf_seg_v2", Some("PLOW_PF_SEG_V2"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("rt.pf_attn_gemm", Some("PLOW_PF_ATTN_GEMM"), Layer::Runtime, Domain::Bool, UNSET, PF_ATTN_GEMM_AUTO),
+    KnobSpec::new("rt.pf_attn_gemm_tile", Some("PLOW_PF_ATTN_GEMM_TILE"), Layer::Runtime, U32, Default::Static(Val::Nat(2048)), OPT_IN),
+    KnobSpec::new("rt.pf_attn_gemm_min_rows", Some("PLOW_PF_ATTN_GEMM_MIN_ROWS"), Layer::Runtime, U32, Default::Static(Val::Nat(1024)), OPT_IN),
+    KnobSpec::new("rt.pf_attn_gemm_grid", Some("PLOW_PF_ATTN_GEMM_GRID"), Layer::Runtime, U32, Default::Static(Val::Nat(8)), OPT_IN),
+    KnobSpec::new("rt.pf_attn_gemm_s32", Some("PLOW_PF_ATTN_GEMM_S32"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.pf_attn_gemm_grouped", Some("PLOW_PF_ATTN_GEMM_GROUPED"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_time", Some("PLOW_PF_SEG_TIME"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_fatonly", Some("PLOW_PF_SEG_FATONLY"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_noncoop", Some("PLOW_PF_SEG_NONCOOP"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
@@ -514,13 +602,16 @@ pub const RUNTIME: &[KnobSpec] = &[
 
 #[rustfmt::skip]
 pub const RAW_ENV: &[KnobSpec] = &[
+    KnobSpec::new("env.PLOW_DEBUG_MAX_INST", Some("PLOW_DEBUG_MAX_INST"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DEV_SAMPLE", Some("PLOW_DEV_SAMPLE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DSA_VERIFY_CKPT", Some("PLOW_DSA_VERIFY_CKPT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DSA_VERIFY_OUT", Some("PLOW_DSA_VERIFY_OUT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_GPU_ASSETS", Some("PLOW_GPU_ASSETS"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_LADDER_DEBUG", Some("PLOW_LADDER_DEBUG"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_LT_PACKETS", Some("PLOW_LT_PACKETS"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_NV_CUBIN_SAMPLE", Some("PLOW_NV_CUBIN_SAMPLE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_PREFIX_EMIT_CHILD", Some("PLOW_PREFIX_EMIT_CHILD"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_RUNG_PKT", Some("PLOW_RUNG_PKT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_SHARED_PREFIX_BASELINE", Some("PLOW_SHARED_PREFIX_BASELINE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_SHARED_PREFIX_EMIT_CHILD", Some("PLOW_SHARED_PREFIX_EMIT_CHILD"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_SHARED_PREFIX_PACKET", Some("PLOW_SHARED_PREFIX_PACKET"), Layer::RawEnv, Domain::Str, UNSET, DIAG),

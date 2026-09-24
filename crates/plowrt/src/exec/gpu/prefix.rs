@@ -684,8 +684,9 @@ impl GpuEngine {
 
     /// Publish slot `b` up to a computed 32-token boundary. Prompt publication
     /// limits rows to prompt_len - 1 so an identical prompt can replay its tail.
-    /// Also publishes regular intermediate checkpoints (every 256 tokens) so that
-    /// prompts sharing common prefixes hit the prefix cache even when suffixes differ.
+    /// Also publishes intermediate checkpoints at every whole-block boundary below it (a
+    /// block-aligned boundary has no tail, so any prompt sharing those blocks attaches to
+    /// it), or every `PLOW_AMD_PREFIX_FINE_ROWS` rows when that is set.
     pub(super) fn vmm_publish(&self, b: usize, max_rows: u32) {
         let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
             return;
@@ -714,13 +715,32 @@ impl GpuEngine {
         }
         let step = crate::config::RuntimeConfig::get()
             .amd_prefix_fine_rows()
-            .unwrap_or(256)
-            .max(32);
+            .map_or(v.kv.block_rows(), |step| step.max(32));
         let mut p = step;
         while p < p_a {
             self.publish_boundary(b, p);
             p += step;
         }
         self.publish_boundary(b, p_a);
+    }
+
+    /// Slot `b`'s prompt is prefilled and its prompt-end publish has run.
+    pub(super) fn vmm_prefill_done(&self, b: usize) {
+        if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
+            v.kv.prefill_done(b);
+        }
+    }
+
+    /// Another slot is prefilling a prompt whose whole-block checkpoint will cover more of
+    /// `prompt` than the cache can attach now: `(owner slot, rows)`. A boundary is only
+    /// publishable while the sliding rings still hold its window (`publish_boundary`).
+    pub(super) fn vmm_inflight_prefix(&self, b: usize, prompt: &[u32]) -> Option<(usize, u32)> {
+        let v = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse())?;
+        let lookback = if v.slide.is_empty() {
+            u32::MAX
+        } else {
+            v.ring as u32 - v.kv.geometry().window
+        };
+        v.kv.inflight_prefix(b, prompt, lookback)
     }
 }

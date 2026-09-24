@@ -254,6 +254,9 @@ pub async fn completions(
         arrived: std::time::Instant::now(),
         respond: tx,
     };
+    if crate::obs::host::on() {
+        crate::obs::host::submitted(n_prompt, t_arrive.elapsed());
+    }
     if let Err(err) = mux.submit_arrived(job, t_arrive, Some(ingress)) {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
@@ -405,6 +408,9 @@ fn sse_response(
                             st.first = false;
                             crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, n_prompt);
                             crate::obs::pfx::report();
+                            if crate::obs::host::on() {
+                                crate::obs::host::first_frame(n_prompt, t_arrive.elapsed());
+                            }
                         }
                         (
                             vec![CompletionChoice {

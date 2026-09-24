@@ -314,18 +314,19 @@ mod tests {
             assert_eq!(
                 blob.prefill_progs()
                     .iter()
-                    .filter(|p| !packet::devbuild::is_packed_prefill_program(p.t))
+                    .filter(|p| !p.role.is_packed_sibling())
                     .map(|p| p.t)
                     .collect::<Vec<_>>(),
                 [128, 512, 1024]
             );
+            // Packed siblings are a BF16-KV default on gfx942 (`apply_production_defaults`).
             assert_eq!(
                 blob.prefill_progs()
                     .iter()
-                    .filter(|p| packet::devbuild::is_packed_prefill_program(p.t))
-                    .map(|p| packet::devbuild::program_rows(p.t))
+                    .filter(|p| p.role.is_packed_sibling())
+                    .map(|p| p.t)
                     .collect::<Vec<_>>(),
-                [128, 512, 1024]
+                if fp8 { vec![] } else { vec![128u32, 512, 1024] }
             );
             let regions = snapshot_regions(
                 &blob.tensors,

@@ -17,15 +17,28 @@ pub const BF16_PREFILL_GEMM_GLU_GEMMA4: u8 = 12;
 pub const W8A8_PREFILL_GEMM_GLU_GEMMA4: u8 = 13;
 pub const PREFILL_ATTENTION_HD256_GQA2_BKV32: u8 = 14;
 pub const PREFILL_ATTENTION_HD512_PX4_BQ64: u8 = 15;
-pub const MAX_ROLE: u8 = PREFILL_ATTENTION_HD512_PX4_BQ64;
+/// Library role, like [`CUBLASLT`]: one segment holding a layer's `MoeGroupGluGemmaPf` +
+/// `MoeGroupDownGemmaPf` pair, which the CUDA runtime may serve with cuBLASLt grouped matmuls
+/// (`PLOW_MOE_PF_LT`). Without the runtime knob the segment runs in the interpreter unchanged.
+pub const MOE_PREFILL_CUBLASLT: u8 = 16;
+/// Library role for a DECODE rung, like [`MOE_PREFILL_CUBLASLT`]: one segment holding a layer's
+/// `MoeExpertGluNormGemma` + `MoeExpertDownGemma` pair on a rung that runs the grouped-MoE arm
+/// (`PLOW_GEMMA_MOE_DEC_GROUP`), which the CUDA runtime may serve with cuBLASLt grouped matmuls
+/// (`PLOW_MOE_DEC_LT`). Without the runtime knob the rung runs in the interpreter unchanged.
+pub const MOE_DECODE_CUBLASLT: u8 = 17;
+pub const MAX_ROLE: u8 = MOE_DECODE_CUBLASLT;
 
 pub fn is_projection(role: u8) -> bool {
     matches!(role, CUBLASLT | NATIVE_DECODE_TC)
 }
 
-pub const CUBLASLT_PREFILL_MAX_ROWS: u32 = 8192;
+pub const CUBLASLT_PREFILL_MAX_ROWS: u32 = 16384;
 pub const CUBLASLT_PREFILL_ROWS: [u32; 3] = [128, 256, 512];
-pub const CUBLASLT_PREFILL_WIDE_ROWS: [u32; 4] = [1024, 2048, 4096, 8192];
+/// 1088 / 1152 / 4160 are fine-grained rungs (`PLOW_PF_LADDER_APPEND`): BOS makes an N-token prompt
+/// N+1 rows. Left out, such a rung ran every projection on the native GEMM object. Measured on
+/// h100-sxm5 2026-09-21: 12B C1 TTFT at 1024 in 47.22 -> 46.82 ms on the 1088 rung; 1152 (26B and
+/// 12B) and 4160 neutral.
+pub const CUBLASLT_PREFILL_WIDE_ROWS: [u32; 12] = [1024, 1088, 1152, 2048, 4096, 4160, 4224, 8192, 8320, 12288, 12416, 16384];
 pub const CUBLASLT_PREFILL_GEMMA4_SHAPES: [(u32, u32); 8] = [
     (15360, 3840),
     (2048, 3840),
@@ -35,6 +48,24 @@ pub const CUBLASLT_PREFILL_GEMMA4_SHAPES: [(u32, u32); 8] = [
     (8192, 3840),
     (512, 3840),
     (3840, 8192),
+];
+
+/// The same projection set for Gemma-4-26B-A4B (hidden 2816, dense inter 2112).
+/// Kept as its own list rather than folded into the 12B one so each shape's
+/// provenance stays readable; the two are disjoint (3840- vs 2816-keyed).
+/// Sliding layers: q (4096), k/v (2048), o (2816 x 4096). Full layers: q (8192),
+/// k (1024), o (2816 x 8192) — no v_proj, V is the raw k_proj (attention_k_eq_v).
+/// Dense MLP: gate/up (2112), down (2816 x 2112). The 128-wide router and the
+/// routed-expert GEMMs are NOT here: they are MoE ops, not dense projections.
+pub const CUBLASLT_PREFILL_GEMMA4_26B_SHAPES: [(u32, u32); 8] = [
+    (4096, 2816),
+    (2048, 2816),
+    (2816, 4096),
+    (8192, 2816),
+    (1024, 2816),
+    (2816, 8192),
+    (2112, 2816),
+    (2816, 2112),
 ];
 
 pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
@@ -47,7 +78,8 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
     // cuBLASLt calls at the same M run 10-45 us (H100 2026-09-17, campaign tracker).
     matches!(profile, "sm90a" | "sm_90a")
         && (CUBLASLT_PREFILL_ROWS.contains(&m) || CUBLASLT_PREFILL_WIDE_ROWS.contains(&m))
-        && CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
+        && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
+            || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k)))
 }
 
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";
@@ -334,6 +366,16 @@ mod tests {
                     assert!(cublaslt_prefill_bf16(profile, m, n, k));
                 }
             }
+            for m in CUBLASLT_PREFILL_ROWS.iter().chain(&CUBLASLT_PREFILL_WIDE_ROWS) {
+                for (n, k) in CUBLASLT_PREFILL_GEMMA4_26B_SHAPES {
+                    assert!(cublaslt_prefill_bf16(profile, *m, n, k));
+                }
+            }
+        }
+        // The two model shape sets must stay disjoint, or a 12B admission silently
+        // starts depending on a 26B entry (and the reverse) when either is edited.
+        for shape in CUBLASLT_PREFILL_GEMMA4_26B_SHAPES {
+            assert!(!CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&shape));
         }
         for (profile, m, n, k) in [
             ("sm120", 128, 3840, 15360),
@@ -342,7 +384,7 @@ mod tests {
             ("sm90a", 64, 3840, 15360),
             ("sm90a", 1024, 3840, 3840),
             ("sm90a", 1024, 15360, 8192),
-            ("sm90a", 16384, 3840, 15360),
+            ("sm90a", 32768, 3840, 15360),
             ("sm90a", 128, 3840, 3840),
         ] {
             assert!(!cublaslt_prefill_bf16(profile, m, n, k));

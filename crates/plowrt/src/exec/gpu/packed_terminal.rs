@@ -12,7 +12,11 @@ pub(super) struct PackedTerminal {
     arg: DevProgram,
     counter_bytes: usize,
     _tables: Vec<DeviceMem>,
-    host_rows: Vec<u32>,
+    /// Sample rows and patched instructions, two sets alternating per launch: a parked
+    /// launch's uploads are still queued behind the body kernel when the host stages the next.
+    host_rows: [Vec<u32>; 2],
+    insts: [Vec<DevInst64>; 2],
+    stage: usize,
     host_ids: PinnedHost,
 }
 
@@ -240,9 +244,9 @@ impl PackedTerminal {
         insts[3].i[0] = elements;
         insts[4].i[1] = capacity as u32;
         insts[5].i[1] = capacity as u32;
-        let program = chain(insts, e.grid, capacity as u32);
+        let program = chain(insts, e.grid_pf, capacity as u32);
         plow_asset::aux_program::Section {
-            n_cu: e.grid,
+            n_cu: e.grid_pf,
             programs: vec![program.clone()],
         }
         .validate(pointers.len())
@@ -256,11 +260,13 @@ impl PackedTerminal {
             _selected: selected,
             _normalized: normalized,
             _tensors: tensors,
+            insts: [program.insts.clone(), program.insts.clone()],
             program,
+            stage: 0,
             arg,
             counter_bytes,
             _tables: tables,
-            host_rows: Vec::with_capacity(capacity),
+            host_rows: [Vec::with_capacity(capacity), Vec::with_capacity(capacity)],
             host_ids: e.be.host_alloc_pinned(capacity * 4)?,
         }))
     }
@@ -269,43 +275,71 @@ impl PackedTerminal {
         bytemuck::cast_slice(&self.host_ids.as_slice()[..count * 4])
     }
 
-    pub(super) fn run(&mut self, e: &GpuEngine, live: usize) -> Result<()> {
-        if self.host_rows.is_empty() {
+    /// Stage and launch the terminal for the rows in `host_rows`, leaving the stream
+    /// unsynchronized. [`Self::run`] reads the ids back and waits; the decode pipeline instead
+    /// parks the launch behind its own event and reads the ids a tick later.
+    /// Take the next staging set, filling it with `rows`. Two consecutive launches never share
+    /// one, which is what lets a parked launch's uploads still be in flight.
+    pub(super) fn stage_rows(&mut self, rows: &[u32]) -> usize {
+        let i = self.stage;
+        self.stage ^= 1;
+        self.host_rows[i].clear();
+        self.host_rows[i].extend_from_slice(rows);
+        i
+    }
+
+    pub(super) fn launch(&mut self, e: &GpuEngine, live: usize, i: usize) -> Result<()> {
+        if self.host_rows[i].is_empty() {
             return Ok(());
         }
-        if self.host_rows.len() > self.capacity
-            || self.host_rows.iter().any(|&r| r as usize >= live)
+        if self.host_rows[i].len() > self.capacity
+            || self.host_rows[i].iter().any(|&r| r as usize >= live)
         {
             return Err(RuntimeError::Rejected(
                 "compact terminal sample rows out of bounds".into(),
             ));
         }
-        let count = self.host_rows.len() as u32;
-        self.program.insts[0].i[0] = count;
-        self.program.insts[0].i[2] = live as u32;
-        self.program.insts[1].i[0] = count;
-        self.program.insts[2].i[0] = count;
-        self.program.insts[3].i[0] = count * self.template[1].i[1];
-        self.program.insts[4].i[1] = count;
-        self.program.insts[5].i[1] = count;
-        let output_bytes = self.host_rows.len() * 4;
+        let count = self.host_rows[i].len() as u32;
+        self.insts[i][0].i[0] = count;
+        self.insts[i][0].i[2] = live as u32;
+        self.insts[i][1].i[0] = count;
+        self.insts[i][2].i[0] = count;
+        self.insts[i][3].i[0] = count * self.template[1].i[1];
+        self.insts[i][4].i[1] = count;
+        self.insts[i][5].i[1] = count;
         let launched = (|| {
             // Both upload sources are owned here until the stream is drained.
             unsafe {
-                e.be.memcpy_htod_async(self.rows.base, pod_bytes(&self.host_rows), &e.stream)?;
-                e.be.memcpy_htod_async(self.arg.insts, pod_bytes(&self.program.insts), &e.stream)?;
+                e.be.memcpy_htod_async(self.rows.base, pod_bytes(&self.host_rows[i]), &e.stream)?;
+                e.be.memcpy_htod_async(self.arg.insts, pod_bytes(&self.insts[i]), &e.stream)?;
             }
             e.be.memset_d8_async(self.arg.counters, 0, self.counter_bytes, &e.stream)?;
             let mut arg = self.arg;
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
             e.be.launch_cooperative(
                 e.f_pf.unwrap(),
-                e.grid,
+                e.grid_pf,
                 BLOCK,
                 e.smem_pf,
                 &mut params,
                 Some(&e.stream),
-            )?;
+            )
+        })();
+        if let Err(error) = launched {
+            let _ = e.be.stream_synchronize(&e.stream);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(super) fn run(&mut self, e: &GpuEngine, live: usize, i: usize) -> Result<()> {
+        if self.host_rows[i].is_empty() {
+            return Ok(());
+        }
+        self.launch(e, live, i)?;
+        let output_bytes = self.host_rows[i].len() * 4;
+        let read = (|| {
+            // SAFETY: the pinned slab lives on self past the synchronize below.
             unsafe {
                 e.be.memcpy_dtoh_async(
                     &mut self.host_ids.as_mut_slice()[..output_bytes],
@@ -315,12 +349,12 @@ impl PackedTerminal {
             }
             e.be.stream_synchronize(&e.stream)
         })();
-        if let Err(error) = launched {
+        if let Err(error) = read {
             let _ = e.be.stream_synchronize(&e.stream);
             return Err(error);
         }
         if self
-            .ids(self.host_rows.len())
+            .ids(self.host_rows[i].len())
             .iter()
             .any(|&id| id as usize >= e.vocab)
         {
@@ -331,15 +365,20 @@ impl PackedTerminal {
         Ok(())
     }
 
+    /// Launch the terminal for `rows` without waiting for it (the pipelined mixed step).
+    pub(super) fn launch_rows(&mut self, e: &GpuEngine, rows: &[u32], live: usize) -> Result<()> {
+        let i = self.stage_rows(rows);
+        self.launch(e, live, i)
+    }
+
     pub(super) fn run_rows(&mut self, e: &GpuEngine, rows: &[u32], live: usize) -> Result<&[u32]> {
-        self.host_rows.clear();
-        self.host_rows.extend_from_slice(rows);
+        let i = self.stage_rows(rows);
         if rows.is_empty() {
             // An enqueue-only body still needs retirement when S=0.
             e.be.stream_synchronize(&e.stream)?;
             return Ok(self.ids(0));
         }
-        self.run(e, live)?;
+        self.run(e, live, i)?;
         Ok(self.ids(rows.len()))
     }
 }
@@ -362,17 +401,18 @@ impl GpuEngine {
         out.clear();
         self.prefill_batched(reqs)?;
         let mut terminal = self.packed_terminal.take().unwrap();
-        terminal.host_rows.clear();
+        let mut rows: smallvec::SmallVec<[u32; 16]> = Default::default();
         let mut live = 0;
         for req in reqs {
             live += req.len;
             if req.c0 + req.len == req.prompt.len() {
-                terminal.host_rows.push((live - 1) as u32);
+                rows.push((live - 1) as u32);
             }
         }
-        let result = terminal.run(self, live);
+        let i = terminal.stage_rows(&rows);
+        let result = terminal.run(self, live, i);
         if result.is_ok() {
-            let ids = terminal.ids(terminal.host_rows.len());
+            let ids = terminal.ids(rows.len());
             out.extend(
                 reqs.iter()
                     .filter(|r| r.c0 + r.len == r.prompt.len())
