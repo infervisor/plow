@@ -4978,6 +4978,51 @@ __device__ void d_moe_combine_pf(bf16* out, const bf16* residual, const bf16* sh
         }
         return;
     }
+    /* k > 1, f32 part (the GLM top-8 scatter): 8 contiguous h per thread, all k slots' 2x16 B
+     * issued before any is consumed, then summed residual, shared, slot 0..k-1 — the scalar
+     * loop's operands in its order, so bit-identical to it. */
+    if (k > 1u && k <= 16u && (H & 7u) == 0u && !part16
+#if PLOW_MOE_PF_DET
+        && !det
+#endif
+    ) {
+        const size_t vt = total / 8;
+        const float4* pf = (const float4*)part;
+        const auto* rg = as_glob(residual);
+        const auto* sg = as_glob(shared);
+        auto* og = as_glob(out);
+        for (size_t v = gid; v < vt; v += stride) {
+            const size_t e = v * 8;
+            const unsigned tok = (unsigned)(e / H), h = (unsigned)(e - (size_t)tok * H);
+            float4 p0[16], p1[16];
+#pragma unroll
+            for (unsigned j = 0; j < 16; j++) {
+                if (j < k) {
+                    const size_t q = (((size_t)tok * k + j) * H + h) / 4;
+                    p0[j] = pf[q];
+                    p1[j] = pf[q + 1];
+                }
+            }
+            const bf16v8 vr = residual ? ld_glob8(rg + e) : bf16v8_zero();
+            const bf16v8 vs = shared ? ld_glob8(sg + e) : bf16v8_zero();
+            bf16v8 o;
+#pragma unroll
+            for (int c = 0; c < 8; c++) {
+                float acc = residual ? bf2f(vr[c]) : 0.0f;
+                if (shared) acc += bf2f(vs[c]);
+#pragma unroll
+                for (unsigned j = 0; j < 16; j++) {
+                    if (j < k) {
+                        const float4& q = c < 4 ? p0[j] : p1[j];
+                        acc += (c & 3) == 0 ? q.x : (c & 3) == 1 ? q.y : (c & 3) == 2 ? q.z : q.w;
+                    }
+                }
+                o[c] = f2bf(acc);
+            }
+            st_glob8(og + e, o);
+        }
+        return;
+    }
 #endif
     for (size_t i = gid; i < total; i += stride) {
         const unsigned tok = (unsigned)(i / H), h = (unsigned)(i - (size_t)tok * H);
