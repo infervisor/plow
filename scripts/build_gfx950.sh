@@ -44,6 +44,12 @@ case "${PLOW_MLA_PF_TR16:-0}" in
   1) FLASH_TR16="-DPLOW_MLA_PF_SV=1 -DPLOW_MLA_PF_TR16=1" ;;
   *) echo "PLOW_MLA_PF_TR16 must be 0 or 1" >&2; exit 2 ;;
 esac
+case "${PLOW_MLA_MHA:-0}" in
+  0) ;;
+  1) [ "${PLOW_MLA_PF_TR16:-0}" = 1 ] || { echo "PLOW_MLA_MHA=1 requires PLOW_MLA_PF_TR16=1" >&2; exit 2; }
+     FLASH_TR16="$FLASH_TR16 -DPLOW_MLA_MHA_ARM=1" ;;
+  *) echo "PLOW_MLA_MHA must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_MLA_PF_SCALE_HOIST:-0}" in
   0) FLASH_SCALE_HOIST="" ;;
   1) FLASH_SCALE_HOIST="-DFA_MLA_PF_SCALE_HOIST=1" ;;

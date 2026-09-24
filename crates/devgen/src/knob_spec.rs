@@ -115,6 +115,19 @@ const C_MLA_BF16_PS: &[Constraint] = &[Constraint {
     check: Check::Site,
 }];
 
+const C_MLA_MHA: &[Constraint] = &[Constraint {
+    id: "mla_mha_contract",
+    formula: F::Implies(
+        &F::Atom("emit.glm_mla_mha", Cmp::Eq, TRUE),
+        &F::And(&[
+            F::Atom("emit.glm_mla_w8a8", Cmp::Eq, TRUE),
+            F::Not(&F::Atom("emit.glm_fp8_kv", Cmp::Eq, TRUE)),
+        ]),
+    ),
+    site: "crates/devgen/src/mla.rs: PLOW_GLM_MLA_MHA requires PLOW_GLM_MLA_W8A8, BF16 KV and dense attention",
+    check: Check::Site,
+}];
+
 const C_GLM_ROPE_BF16: &[Constraint] = &[Constraint {
     id: "glm_rope_bf16_contract",
     formula: F::Implies(
@@ -1085,6 +1098,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_oproj_w8a8", Some("PLOW_GLM_OPROJ_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_qkva_w8a8", Some("PLOW_GLM_QKVA_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_mla_w8a8", Some("PLOW_GLM_MLA_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.glm_mla_mha", Some("PLOW_GLM_MLA_MHA"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_MLA_MHA),
     KnobSpec::new("emit.glm_indexer_wq_w8a8", Some("PLOW_GLM_INDEXER_WQ_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_INDEXER_WQ_W8A8),
     KnobSpec::new("emit.glm_indexer_fp8", Some("PLOW_GLM_INDEXER_FP8"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_INDEXER_FP8),
     KnobSpec::new("emit.glm_mla_bf16_ps", Some("PLOW_GLM_MLA_BF16_PS"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_MLA_BF16_PS),
@@ -1242,6 +1256,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_MLA_FOLD_MFMA", Some("PLOW_MLA_FOLD_MFMA"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_COMBINE_VEC", Some("PLOW_COMBINE_VEC"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_ROUTER_PF_WAVE", Some("PLOW_MOE_ROUTER_PF_WAVE"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_MLA_MHA", Some("PLOW_MLA_MHA"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_TILE_BINSEARCH", Some("PLOW_MOE_TILE_BINSEARCH"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_MLA_P_BF16", Some("PLOW_MLA_P_BF16"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.GLM_FULL", Some("GLM_FULL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -1617,6 +1632,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_MLA_FOLD_MFMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_FP8_BLK_TILED_ROWS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MOE_ROUTER_PF_WAVE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_MLA_MHA_ARM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MOE_PF_DOWN_SWEEP", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_FOLD_TB", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MLA_FOLD_TB_LDS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

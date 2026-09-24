@@ -272,6 +272,15 @@ extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
 #if PLOW_CDNA4 && PLOW_HAS_MLA_BMM_FP8 && PLOW_WAVES == 8
 #include "mla_bmm_fp8_pf.h"
 #endif
+/* Expanded-form (MHA) GLM MLA prefill flash: FlashMlaPrefill with i6 bit 9 (mla_mha_pf.h).
+ * Flash object only; its 140 KiB arena is a member of that object's LDS union alone. */
+#ifndef PLOW_MLA_MHA_ARM
+#define PLOW_MLA_MHA_ARM 0
+#endif
+#if PLOW_MLA_MHA_ARM && defined(PLOW_BUCKET_FLASH) && PLOW_CDNA4
+#include "mla_mha_pf.h"
+extern "C" __device__ unsigned plow_mla_mha_arm_1 = 1;
+#endif
 #include "op_norm.h" /* block_max — needed by op_dsa_pool.h below */
 #include "op_dsa_pool.h"
 #include "op_hyperconn.h"
@@ -1045,6 +1054,9 @@ typedef union __align__(16) {
 #endif
 #if !PLOW_NO_MLA_DEC
     float fmla[FA_MLA_DEC_LDS_FLOATS(512, 64, GLM_MLA_GF_MAX)]; /* MLA latent decode (DK=512,DR=64) */
+#endif
+#if PLOW_MLA_MHA_ARM && defined(PLOW_BUCKET_FLASH) && PLOW_CDNA4
+    bf16 mha[mla_mha::LDS_BYTES / 2]; /* MHA-form MLA prefill: 2 stages x (K + V) */
 #endif
 #if PLOW_MLA_PREFILL
     /* MLA latent PREFILL tiles: Q|K staged plus the P transpose. Bigger than `fmla` (the
@@ -2208,6 +2220,8 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
      * (check_dsa_pf_arm); this is the belt to that braces, for the case where the object was
      * never asked. */
     if (in->op == PLOW_DOP_FLASH_MLA_PREFILL && in->t[7] != PLOW_TENSOR_NONE) __builtin_trap();
+    /* The expanded (MHA) form lives in the flash object only (mla_mha_pf.h). */
+    if (in->op == PLOW_DOP_FLASH_MLA_PREFILL && ((in->i[6] >> 9) & 1u)) __builtin_trap();
     if (in->op == PLOW_DOP_FLASH_GATHER_PREFILL) {
         if (nope && gf == 2)
             d_flash_gather_prefill<512, 0, 2>(
@@ -2965,6 +2979,26 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
      * still traps, exactly as it did before this arm existed -- a blob that needs it and an
      * object that lacks it is a hard stop, never a silently wrong answer. */
     const bool pf_nope = (in->i[3] & 0x80000000u) != 0;
+#if !(PLOW_MLA_MHA_ARM && PLOW_CDNA4)
+    if (in->op == PLOW_DOP_FLASH_MLA_PREFILL && ((in->i[6] >> 9) & 1u)) __builtin_trap();
+#else
+    /* MHA form (i6 bit 9): t0=O bf16[T][H*256] t1=pos t2=q_b out [T][H*256] (raw q_rope strip)
+     * t3=kv_b out [T][H*448] t4=cos t5=k_rope cache t6=kv_len; i7 = sin table (demoted handle);
+     * i1=H i4=T f0=scale. Fresh single-chunk prefill only: kv_len must equal T. */
+    if (in->op == PLOW_DOP_FLASH_MLA_PREFILL && ((in->i[6] >> 9) & 1u)) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+        const unsigned t = in->i[4], H = in->i[1];
+        if (((const int*)TEN(6))[0] != (int)t || in->t[7] != PLOW_TENSOR_NONE || pf_nope)
+            __builtin_trap();
+        const bf16* kvx = (const bf16*)TEN(3);
+        d_mla_mha_pf((bf16*)TEN(0), (const bf16*)TEN(2), nullptr, kvx, (const bf16*)TEN(5),
+                     kvx + 192, t, H, H * 256u, 256u, 0u, 0u, H * 448u, 448u, 64u,
+                     in->fj[0].f, slice, nblk, sm->mha, (const float*)TEN(4),
+                     (const float*)T[in->i[7]], (const int*)TEN(1));
+#undef TEN
+        return;
+    }
+#endif
 #if PLOW_MLA_PF_NOPE_ARM
     static_assert(FA_MLA_PF2_LDS_BYTES(512, 0) + 256 <= (int)sizeof(((plow_smem*)nullptr)->fa),
                   "NoPE V2 MLA prefill LDS (+ the GATHER mask words) exceeds the flash arena");

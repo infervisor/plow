@@ -39,7 +39,10 @@ __device__ void d_mla_mha_pf(bf16* __restrict__ O, const bf16* __restrict__ Qn,
                              const bf16* __restrict__ Kr, const bf16* __restrict__ V, unsigned T,
                              unsigned H, unsigned qn_rs, unsigned qn_hs, unsigned qr_rs,
                              unsigned qr_hs, unsigned kv_rs, unsigned kv_hs, unsigned kr_rs,
-                             float scale, unsigned slice, unsigned nblk, bf16* lds) {
+                             float scale, unsigned slice, unsigned nblk, bf16* lds,
+                             const float* __restrict__ cosb = nullptr,
+                             const float* __restrict__ sinb = nullptr,
+                             const int* __restrict__ pos = nullptr) {
     using namespace mla_mha;
     const unsigned tid = threadIdx.x, lane = tid & 63u, wave = tid >> 6;
     const unsigned g = lane >> 5, r32 = lane & 31u;
@@ -94,8 +97,20 @@ __device__ void d_mla_mha_pf(bf16* __restrict__ O, const bf16* __restrict__ Qn,
             for (unsigned s = 0; s < 16; s++) {
                 const unsigned d = 16u * s + 8u * g;
                 const unsigned qq = qv ? q : T - 1u;
-                qf[s] = d < DN ? *(const bf16x8*)(Qn + (size_t)qq * qn_rs + h * qn_hs + d)
-                               : *(const bf16x8*)(Qr + (size_t)qq * qr_rs + h * qr_hs + (d - DN));
+                if (d < DN || !Qr) qf[s] = *(const bf16x8*)(Qn + (size_t)qq * qn_rs + h * qn_hs + d);
+                else qf[s] = *(const bf16x8*)(Qr + (size_t)qq * qr_rs + h * qr_hs + (d - DN));
+                if (d >= DN && !Qr) {
+                    // Raw q_rope in Qn: GPT-J interleaved RoPE, HeadNormRope's hd=64 skip_norm
+                    // arithmetic (pair m of the 64-wide strip at table index pos*32 + m).
+                    const size_t tb = (size_t)pos[qq] * 32u + (d - DN) / 2u;
+#pragma unroll
+                    for (unsigned k = 0; k < 4; k++) {
+                        const float c = cosb[tb + k], sn = sinb[tb + k];
+                        const float a = (float)qf[s][2 * k], b = (float)qf[s][2 * k + 1];
+                        qf[s][2 * k] = (bf16_t)(a * c - b * sn);
+                        qf[s][2 * k + 1] = (bf16_t)(b * c + a * sn);
+                    }
+                }
             }
             f32x16 o[8];
 #pragma unroll

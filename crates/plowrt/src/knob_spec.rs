@@ -811,6 +811,11 @@ mod tests {
             Site::Encoded("mla_bf16_ps_contract"),
         ),
         (
+            "mla.rs",
+            "PLOW_GLM_MLA_MHA requires PLOW_GLM_MLA_W8A8",
+            Site::Encoded("mla_mha_contract"),
+        ),
+        (
             "emit_config.rs",
             "Runtime offload additionally requires PLOW_ANE_MLP=1",
             Site::NotAConstraint("doc: rt.ane_mlp gates the offload"),

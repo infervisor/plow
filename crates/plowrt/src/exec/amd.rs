@@ -3088,7 +3088,9 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
             // that DEGRADE for plain V2 blobs must REFUSE here instead of corrupting.
             let d = &prog.insts[e.inst as usize];
             let small_split = op == DevOp::FlashMlaPrefillFp8 as u16 && d.fj[2] != 0;
-            mla_pure[seg] &= prog.t >= 2048 || small_split;
+            // The expanded (MHA) form (i6 bit 9) exists only in the flash object: every rung.
+            let mha = op == DevOp::FlashMlaPrefill as u16 && (d.i[6] >> 9) & 1 == 1;
+            mla_pure[seg] &= prog.t >= 2048 || small_split || mha;
             mla_nope[seg] |= d.i[3] & 0x8000_0000 != 0;
             // DEFERRED to after the class pass, and that is the whole point. This used to
             // refuse on `!v2` -- the ENV -- which misses the case that actually corrupts:

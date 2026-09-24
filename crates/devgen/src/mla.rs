@@ -1454,7 +1454,7 @@ fn emit_glm_qkva_w8a8(
 }
 
 fn emit_glm_mla_query_w8a8(
-    b: &mut Builder, cus: &[u32], n: &GlmTn, w: &GlmLW, rows: u32, dep: u32,
+    b: &mut Builder, cus: &[u32], n: &GlmTn, w: &GlmLW, rows: u32, dep: u32, mha: bool,
 ) -> (u32, u32) {
     let quant = b.emit(DevOp::QuantFp8Block128, glm_quant128_cus(cus, rows, 2048), &[dep], |d| {
         d.t[..3].copy_from_slice(&[n.qb_xq, n.qlat, n.qb_xs]);
@@ -1468,6 +1468,10 @@ fn emit_glm_mla_query_w8a8(
         d.t[..5].copy_from_slice(&[n.qb, n.qb_xq, w.qb, n.qb_xs, w.qb_s]);
         d.i[..7].copy_from_slice(&[rows, 2048, 2048, 16, 0, 0, 1]);
     });
+    if mha {
+        // The expanded form reads q_b's [nope | raw rope] rows directly (flash applies RoPE).
+        return (qb, quant);
+    }
     let done = b.emit(DevOp::MlaBmmFp8, cus.to_vec(), &[qb], |d| {
         d.t[..5].copy_from_slice(&[n.qa, n.qb, w.wk, w.wk_s, n.qrr]);
         d.i[..5].copy_from_slice(&[rows, 8, 512, 192, 1]);
@@ -1911,6 +1915,8 @@ struct GlmLW {
     wk_s: u32,
     wv: u32,
     wv_s: u32,
+    kvb: u32,   // kv_b_proj block-FP8 [nh_l*(DN+VD), DK] (PLOW_GLM_MLA_MHA)
+    kvb_s: u32,
     wqa_s: u32,
     wqr_s: u32,
     ckvd_s: u32,
@@ -2021,6 +2027,9 @@ pub(crate) struct GlmTn {
     qb: u32,
     qb_xq: u32,
     qb_xs: u32,
+    kvx: u32,    // kv_b output [T][nh_l*(DN+VD)] (PLOW_GLM_MLA_MHA)
+    ckv_xq: u32,
+    ckv_xs: u32,
     qlr: u32,
     qlat: u32,
     ckvraw: u32,
@@ -2796,6 +2805,13 @@ fn declare_glm_rows_batched_for_prefill(
         && !emit_config::active().glm_ofold && !emit_config::active().glm_fold_lt()
         && emit_config::active().glm_rowsplit_arm().is_none()),
         "PLOW_GLM_MLA_W8A8 excludes absorbed norm, value and row-split fusions");
+    let mla_mha = emit_config::active().glm_mla_mha;
+    assert!(!mla_mha || (mla_w8a8 && !glm_fp8_kv() && !c.dsa(ctx)),
+        "PLOW_GLM_MLA_MHA requires PLOW_GLM_MLA_W8A8, BF16 KV and dense attention");
+    let [kvx, ckv_xq, ckv_xs] = if mla_mha {
+        [ac(b, "kvx", rows * 8 * 448 * BF16), ac(b, "ckv_xq", rows * 512),
+         ac(b, "ckv_xs", rows * 4 * F32)]
+    } else { [TENSOR_NONE; 3] };
     let [qb, qb_xq, qb_xs] = if mla_w8a8 {
         [ac(b, "qb", rows * 2048 * BF16), ac(b, "qb_xq", rows * 2048),
          ac(b, "qb_xs", rows * 16 * F32)]
@@ -3051,6 +3067,8 @@ fn declare_glm_rows_batched_for_prefill(
             wk_s: if mla && mla_w8a8 { t(b, "self_attn.derived.mla_fp8_tp8.wk.weight_scale", F32) } else { TENSOR_NONE },
             wv: if mla && mla_w8a8 { t(b, "self_attn.derived.mla_fp8_tp8.wv.weight", 8 * 256 * 512) } else { TENSOR_NONE },
             wv_s: if mla && mla_w8a8 { t(b, "self_attn.derived.mla_fp8_tp8.wv.weight_scale", F32) } else { TENSOR_NONE },
+            kvb: if mla && emit_config::active().glm_mla_mha { t(b, "self_attn.kv_b_proj.weight", 8 * 448 * 512) } else { TENSOR_NONE },
+            kvb_s: if mla && emit_config::active().glm_mla_mha { t(b, "self_attn.kv_b_proj.weight_scale_inv", 28 * 4 * F32) } else { TENSOR_NONE },
             qad_s: mats(b, "self_attn.q_a_proj.weight", ql as u64, h as u64),
             wqa_s: mats(
                 b,
@@ -3560,6 +3578,9 @@ fn declare_glm_rows_batched_for_prefill(
         qb,
         qb_xq,
         qb_xs,
+        kvx,
+        ckv_xq,
+        ckv_xs,
         qlr,
         qlat,
         ckvraw,
@@ -4370,7 +4391,7 @@ pub(crate) fn emit_glm_mla(
     //   Byte-exact. q_rope then gets a dynamic INTERLEAVED RoPE per head at pos (no norm); HD=64
     //   selects the interleaved template; q is not cached (out_row0/stride 0).
     let fp8_q = emit_config::active().glm_mla_w8a8
-        .then(|| emit_glm_mla_query_w8a8(b, &all, n, w, rows, c_rnq));
+        .then(|| emit_glm_mla_query_w8a8(b, &all, n, w, rows, c_rnq, false));
     let (c_qa, c_qrr) = if let Some((done, _)) = fp8_q {
         (done, done)
     } else if fuse_g {
@@ -7318,8 +7339,12 @@ pub(crate) fn emit_glm_mla_prefill(
     });
     assert!(!emit_config::active().glm_mla_w8a8 || (band.is_none() && !rowband && !use_rowsplit),
         "PLOW_GLM_MLA_W8A8 excludes token bands and row-split attention");
+    // PLOW_GLM_MLA_MHA: the expanded (MHA) prefill form — kv_b GEMM, D=256 flash with the q
+    // RoPE folded in, fused bf16 output straight into o_proj (mla_mha_pf.h, FlashMlaPrefill i6
+    // bit 9). Fresh single-chunk prefill only: the device refuses kv_len != t.
+    let mla_mha = emit_config::active().glm_mla_mha && emit_config::active().glm_mla_w8a8;
     let fp8_q = emit_config::active().glm_mla_w8a8
-        .then(|| emit_glm_mla_query_w8a8(b, &all, n, w, t, c_rnq));
+        .then(|| emit_glm_mla_query_w8a8(b, &all, n, w, t, c_rnq, mla_mha));
     let c_qa = match fp8_q.map(|(done, _)| (done, done)).or(rowband_q) {
         Some((c_qa, _)) => c_qa,
         None => gemm(b, n.qa, n.qlat, w.wqa, w.wqa_s, nh_l * dk, ql, &[c_rnq]),
@@ -7362,7 +7387,7 @@ pub(crate) fn emit_glm_mla_prefill(
     // per-token angle comes from in.pos[t], which the host already fills for a prefill chunk.
     let c_qr = if let Some((_, c_qr)) = rowband_q {
         c_qr
-    } else if dr == 0 {
+    } else if dr == 0 || mla_mha {
         c_qa
     } else if fuse_post {
         c_qrr
@@ -7540,6 +7565,19 @@ pub(crate) fn emit_glm_mla_prefill(
     if let Some(d) = c_sel_pf {
         fl_deps.push(d);
     }
+    if mla_mha {
+        assert!(!fp8kv && !sparse && !dcp && !use_rowsplit && band.is_none()
+            && !b.packed_prefill_segments() && dr == 64 && dk == 512 && vd == 256 && nh_l == 8,
+            "PLOW_GLM_MLA_MHA (t={t}) requires dense BF16-KV single-chunk TP8 prefill");
+        let quant = b.emit(DevOp::QuantFp8Block128, glm_quant128_cus(&all, t, dk), &[c_rnkv], |d| {
+            d.t[..3].copy_from_slice(&[n.ckv_xq, n.ckv[slot], n.ckv_xs]);
+            d.i[..2].copy_from_slice(&[t, dk]);
+        });
+        fl_deps.push(b.emit(DevOp::GemmFp8Block128, all.clone(), &[quant], |d| {
+            d.t[..5].copy_from_slice(&[n.kvx, n.ckv_xq, w.kvb, n.ckv_xs, w.kvb_s]);
+            d.i[..4].copy_from_slice(&[t, nh_l * 448, dk, 16]);
+        }));
+    }
     // Causal KV-split (PLOW_GLM_PF_NS, V2 flash only): items become (q-tile, head, split),
     // each split a ceil-equal share of ITS tile's causal range — what fixes the tail-round
     // quantization (1024 items on 304 CUs = 3.37 rounds, 34% of the machine idle inside the
@@ -7620,6 +7658,16 @@ pub(crate) fn emit_glm_mla_prefill(
             d.i[5] = KV_MASK_NONE;
             d.i[7] = glm_gf_prefill(ctx, nh_l);
             d.f[0] = c.attn_scale;
+            if mla_mha {
+                d.t[0] = n.oat;
+                d.t[1] = n.pos;
+                d.t[2] = n.qb;
+                d.t[3] = n.kvx;
+                d.t[4] = n.cos;
+                d.t[5] = n.krot[slot];
+                d.i[6] = 1 << 9;
+                d.i[7] = n.sin; // demoted tensor handle (the t slots are full)
+            }
             if dcp {
                 // The owner gather assembled the prefix at its global rows, so every flash arm
                 // (dense small buckets, the interpreter and native sparse routes) reads it at the
@@ -7656,7 +7704,7 @@ pub(crate) fn emit_glm_mla_prefill(
             "native MLA fold requires gfx942 TP8 latent512/value256, splits<8, and no ofold fusion"
         );
     }
-    if ofold {
+    if ofold || mla_mha {
         c_fl
     } else if emit_config::active().glm_mla_w8a8 {
         emit_glm_mla_value_w8a8(b, &all, n, w, t, pf_ns, c_fl)
