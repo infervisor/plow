@@ -452,6 +452,34 @@ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemm_a8w8_block128_split4(
 #if GM_TILE_FITS(256, 256, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c0, 256, 256, 64)
 #endif
+/* [128,128] weight blocks x [1,128] activation groups with arbitrary f32 scales (DeepSeek/GLM
+ * checkpoint FP8, the vLLM/AITER a8w8 blockscale contract). d_gemm_fp8_t's K-tile is always
+ * FBK=128 bytes, so the scale promotes per K-tile and the (BM,BN,64) bf16-halves arena is its
+ * exact byte arena, as for GEMM_FP8_VARIANT. */
+#define GEMM_FP8_B128_VARIANT(NAME, BM, BN)                                         \
+    extern "C" __global__ __attribute__((flatten))                                 \
+    __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(                      \
+        bf16* C, const unsigned char* A, const unsigned char* B, const float* asc,   \
+        const float* wsc, unsigned M, unsigned N, unsigned K) {                      \
+        __shared__ bf16 lds[GM_LDS_HALVES_T(BM, BN, 64)];                            \
+        d_gemm_fp8_t<BM, BN, 64, GM_WM, GM_WN, true, false, true>(                   \
+            C, A, B, asc, wsc, M, N, K, blockIdx.x, gridDim.x, lds);                 \
+    }
+#if GM_TILE_FITS(256, 256, 64)
+GEMM_FP8_B128_VARIANT(gemm_fp8b128_c0, 256, 256)
+#endif
+#if GM_TILE_FITS(192, 256, 64)
+GEMM_FP8_B128_VARIANT(gemm_fp8b128_c5, 192, 256)
+#endif
+#if GM_TILE_FITS(128, 256, 64)
+GEMM_FP8_B128_VARIANT(gemm_fp8b128_c2, 128, 256)
+#endif
+#if GM_TILE_FITS(128, 128, 64)
+GEMM_FP8_B128_VARIANT(gemm_fp8b128_c3, 128, 128)
+#endif
+#if GM_TILE_FITS(64, 128, 64)
+GEMM_FP8_B128_VARIANT(gemm_fp8b128_e2, 64, 128)
+#endif
 #if GM_TILE_FITS(128, 256, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c2, 128, 256, 64) /* GemmWideFp8: the fifth selectable fp8 rung */
 #if PLOW_GEMMA4_QO_EXACT_BENCH

@@ -164,7 +164,7 @@ int main(int argc, char** argv) {
     std::vector<unsigned> owner(nassign);
     for (unsigned i = 0; i < nassign; i++) {
         unsigned e = rnd() % n_exp;
-        if ((rnd() & 3u) == 0u) e = (rnd() % (n_exp / 8u));   /* hot head: a skewed tail      */
+        if (n_exp >= 8u && (rnd() & 3u) == 0u) e = (rnd() % (n_exp / 8u)); /* hot head skew */
         owner[i] = e; cnt[e]++;
     }
     std::vector<unsigned> tiles(n_exp + 1), rowoff(n_exp);
