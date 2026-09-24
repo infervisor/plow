@@ -1687,8 +1687,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #elif PLOW_NV_PREFILL
 #define PLOW_HNR_SLOT , (const int*)TEN(6)
 #else
-#define PLOW_HNR_SLOT
+#define PLOW_HNR_SLOT , nullptr
 #endif
+        /* i[7] = 1 is the FUSED k+v form (decode only): t6/t7 hold v's (out, in) and the
+         * kernel runs a second, gamma-less rope-less pass over them. It cannot collide with
+         * the prefill/mixed pfslot use of t6 above — those programs leave i[7] at 0. */
+#define PLOW_HNR_KV2 , (in->i[7] ? (__nv_bfloat16*)TEN(6) : nullptr), \
+                     (in->i[7] ? (const __nv_bfloat16*)TEN(7) : nullptr)
 #if PLOW_HAS_HEADNORM_HD64
         /* The packet flag selects explicit half-split pairing; other HD64 packets use the
          * pre-existing interleaved pairing. Packet inventory keeps this template out of
@@ -1698,13 +1703,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
-                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
+                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT PLOW_HNR_KV2);
         else if (in->i[2] == 64)
             d_headnorm_rope<64, /*INTERLEAVE=*/true>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
-                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
+                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT PLOW_HNR_KV2);
         else
 #endif
 #if PLOW_NV_GEMMA
@@ -1716,36 +1721,37 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
-                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
+                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT PLOW_HNR_KV2);
         else if (in->i[2] == 128 && in->i[5] == 0)
             d_headnorm_rope<128>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
-                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
+                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT PLOW_HNR_KV2);
         else if (in->i[2] == 256 && in->i[5] == 0)
             d_headnorm_rope<256>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
-                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
+                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT PLOW_HNR_KV2);
         else if (in->i[2] == 512 && in->i[5] == 0)
             d_headnorm_rope<512>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
-                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
+                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT PLOW_HNR_KV2);
 #else
         if (in->i[2] == PLOW_NV_FA_HD && in->i[5] == 0)
             d_headnorm_rope<PLOW_NV_FA_HD>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
-                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
+                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT PLOW_HNR_KV2);
 #endif
         else
             __trap();
 #undef PLOW_HNR_SLOT
+#undef PLOW_HNR_KV2
         break;
 
 #if PLOW_FP8_KV

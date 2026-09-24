@@ -511,8 +511,33 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                                 "KV writer requires physical-slot position addressing",
                             ));
                         }
-                        if scale.is_none() && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16) {
+                        // FUSED KV PAIR (devgen `fuse_kv`, i[7]=1): ONE HeadNormRope writes
+                        // both halves of the pair, so t6/t7 carry v's (cache, source) rather
+                        // than being empty. bf16 only -- under fp8 t6 is the scale handle,
+                        // which the `scale.is_some()` branch above already pins.
+                        if scale.is_none()
+                            && d.i[7] != 1
+                            && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16)
+                        {
                             return Ok(false);
+                        }
+                        if !writes.insert(id) {
+                            return Err(reject("duplicate KV writer"));
+                        }
+                    }
+                    // The v half of a fused pair. Its addressing immediates are SHARED with the
+                    // k half at operand 0, which was checked above; what has to hold here is
+                    // that this cache agrees with them, so one instruction cannot silently
+                    // write two caches of different geometry.
+                    Some(DevOp::HeadNormRope) if operand == 6 && d.i[7] == 1 => {
+                        // hd==64 gives the two halves DIFFERENT pair modes (ROPE_PAIR_HALF on k,
+                        // 0 on v) and d.i[5] can only carry one: leave such a packet unqualified
+                        // rather than validate it under the k half's mode.
+                        if scale.is_some() || pair_mode != 0 {
+                            return Ok(false);
+                        }
+                        if (d.i[1], d.i[2], d.fj[1], d.fj[2]) != (heads, hd, stride, mask) {
+                            return Err(reject("fused KV pair writers disagree on addressing"));
                         }
                         if !writes.insert(id) {
                             return Err(reject("duplicate KV writer"));

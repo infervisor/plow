@@ -5081,6 +5081,24 @@ fn emit_phase(
         } else {
             DevOp::HeadNormRope
         };
+        // [KV-PAIR FUSION] On a fused-QKV decode program k and v are the SAME instruction twice:
+        // identical immediates (t / kvh / hd / skip / kvr / kvm / i6), the same block set, the
+        // same Coarse dep on the one GEMV_QKV packet — and v carries no gamma, no cos, no sin.
+        // ONE instruction with v's (out, in) in the spare t6/t7 and i7=1 computes exactly what
+        // two did, and the chain loses one coarse gate per layer. A live coarse-gated op costs
+        // 3.01 us on this packet (measured by injection: 30 and 90 duplicate live ops, slope
+        // 3.01 us/op), so 30 layers is 0.090 ms of a 5.378 ms B=1 step.
+        // t6 carries the fp8 per-row scale, so this needs bf16 KV; hn_split would put the two
+        // on DIFFERENT CU sets, so it needs the default placement too.
+        let fuse_kv = decode
+            && !fuse_hnr
+            && !shared
+            && !fp8_kv
+            && !hn_split
+            && (fuse_qkv || fuse_qkv_fp8)
+            && c_k == c_v
+            && qk_skip == v_skip
+            && emit_config::active().fuse_kv_hnr;
         let c_kn = if fuse_hnr || shared {
             0
         } else {
@@ -5115,6 +5133,12 @@ fn emit_phase(
                 if decode && (t > 1 || seq_rows) {
                     d.i[6] = t;
                 }
+                if fuse_kv {
+                    // v's (out, in). t6 held the fp8 scale, TENSOR_NONE under bf16 KV.
+                    d.t[6] = n.vc[l];
+                    d.t[7] = v_src;
+                    d.i[7] = 1;
+                }
             })
         };
         if decode && !fuse_hnr && !shared {
@@ -5129,7 +5153,9 @@ fn emit_phase(
         } else {
             hn_dep(c_v, nv, kvh)
         };
-        let c_vn = if fuse_hnr || shared {
+        let c_vn = if fuse_kv {
+            c_kn // ONE instruction writes both rows; i[3] (the write row) is shared
+        } else if fuse_hnr || shared {
             0
         } else {
             b.emit_dep(hn_op, hn_set(2), vn_dep, |d| {
@@ -5150,7 +5176,7 @@ fn emit_phase(
                 }
             })
         };
-        if decode && !fuse_hnr && !shared {
+        if decode && !fuse_hnr && !shared && !fuse_kv {
             kv_rows.push(c_vn);
         }
 
@@ -5189,7 +5215,7 @@ fn emit_phase(
                     })
                     .collect()
             };
-            vec![
+            let mut deps = vec![
                 Dep::Fine {
                     producer: c_qn,
                     map: mk(false),
@@ -5198,11 +5224,15 @@ fn emit_phase(
                     producer: c_kn,
                     map: mk(true),
                 },
-                Dep::Fine {
+            ];
+            // fuse_kv makes c_vn == c_kn: one producer, one edge (the K map is the V map).
+            if c_vn != c_kn {
+                deps.push(Dep::Fine {
                     producer: c_vn,
                     map: mk(true),
-                },
-            ]
+                });
+            }
+            deps
         };
         // [MERGE-FOLD] per-layer arm: rides the NRF packet (its spare i1/i6 bits carry the two
         // handles), so it exists only where the hnr fold does. When on, the FlashMerge packet
@@ -5367,6 +5397,8 @@ fn emit_phase(
                 .then(|| tmap_kv(n.kc[l], n.vc[l], kvr, hd, kvh, box_rows));
             let fa_deps: Vec<u32> = if shared {
                 vec![c_qn]
+            } else if c_vn == c_kn {
+                vec![c_qn, c_kn]
             } else {
                 vec![c_qn, c_kn, c_vn]
             };

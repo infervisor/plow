@@ -289,6 +289,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_HN_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub hn_split: bool,
 
+    /// Emit the k and v head-norms as ONE instruction on a fused-QKV decode program.
+    #[arg(long, env = "PLOW_FUSE_KV_HNR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub fuse_kv_hnr: bool,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Attention / flash-decode geometry
     // ──────────────────────────────────────────────────────────────────────────
@@ -1333,6 +1337,7 @@ impl EmitConfig {
             fuse_hnr: env_bool("PLOW_FUSE_HNR"),
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
             hn_split: env_bool("PLOW_HN_SPLIT"),
+            fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
             fa_mmaqk: env_u32("PLOW_FA_MMAQK"),
