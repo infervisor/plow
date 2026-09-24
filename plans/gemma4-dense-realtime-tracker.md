@@ -5315,8 +5315,12 @@ dead. None cost a lease; all three would have.
    a real tensor-core inefficiency, and `interp_sm90a_pfattn_hd256_bkv64.cu` exists. But
    `FA_SM90_WG_ELIGIBLE` accepts BKV=64 only at `BQ==64`, and the smem then goes 103 424 ->
    173 056 B, which drops the block from 2/SM to 1. Earlier notes called BKV64 "refuted from the
-   record"; that was an armchair call, not a measurement, and it should be labelled as such. It
-   remains untested, and it is the one of these three still worth a lease.
+   record"; that was an armchair call, not a measurement. But it is **also not a lease-ready
+   A/B**, which the first version of this section got wrong: `interp_sm90a_pfattn_hd256_bkv64.cu`
+   carries neither `PLOW_NV_FA_GQA2_PAIR` nor `PLOW_NV_FA_WGITEM`, so swapping the sliding path
+   onto it trades away GQA-2 K/V reuse (a 2x on K/V traffic) to buy the wider N — two variables
+   at once, and probably a net loss. A clean test needs a `gqa2_bkv64` object that does not
+   exist. Writing it is the smallest real unit of #66.
 
 **So #66 is what the tracker already said it was: a kernel project, not a knob.** Both prefill
 attention arms are already TMA + WGMMA, GQA2-paired where the shape allows, and 196 (sliding) /
