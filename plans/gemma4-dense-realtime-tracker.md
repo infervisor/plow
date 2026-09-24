@@ -5266,3 +5266,101 @@ LITERAL (a loop over names fails `every_emit_side_env_read_is_registered`, which
 `std::env::var("...")`), emit the define in `config_header` beside `moe_down_sg`, register
 `env.PLOW_TUNE_<X>` in RAW_ENV, and **rebuild plowc** — `campaign.py` never does
 ([[plow-extra-defines-not-plumbed-to-packets]]).
+
+---
+
+## CORRECTION: B=1 already walks on the tensor cores, and the real scalar walk is the MoE expert arm (2026-09-24)
+
+The SASS-audit section above concluded, from `op_gemm.cuh`'s `MM >= 2` gate and the comment
+"BATCH>=2 decode rungs walk the weights on the tensor cores ... and the B=1 rung is untouched",
+that the 8.5% `PRMT` was the B=1 dense walk widening bf16 in software for scalar FFMA.
+
+**That is wrong.** The gate is `if constexpr (TC && (MM >= 2 || PLOW_NV_GEMV_MMA_B1))`
+(`op_gemm.cuh:182`, and the same at 881/2669; the runtime twins at 499/1004/2796 read
+`M > 1 || PLOW_NV_GEMV_MMA_B1`). `manifest.rs:2759` emits
+
+    #ifndef PLOW_NV_GEMV_MMA_B1
+    #define PLOW_NV_GEMV_MMA_B1 1
+
+for every sm_90a packet whose tuning carries `gemv_mma_b1`, and a shipped packet's
+`assets/plow_config.h` confirms `PLOW_NV_GEMV_MMA_B1 1` beside `PLOW_NV_GEMV_MMA 1` and
+`PLOW_NV_GEMV_MMA_PAIR 1`. **The B=1 dense GEMV/QKV/GLU/lm_head walks already run on the tensor
+cores.** The "route B=1 through the MMA walk" lever does not exist; it shipped in 8bf5b264/
+b3b3b8d4's round.
+
+Two further corrections to that section, both about method:
+
+* **The instruction mix is STATIC, not a time attribution.** 111,024 instructions counted over
+  `_Z12interp_sm90a11PlowProgram` (SASS lines 5-219,897) covers every rung and every op in the
+  decode object at once. A percentage there says how much CODE exists, not where the B=1 step
+  spends time. `HMMA 1.6%` in particular cannot be read as "the tensor cores are barely used" —
+  one `m16n8k16` HMMA consumes 256 B of B-operand, so a bandwidth-bound walk needs few static
+  HMMA sites and executes them enormously. The only other functions in the file are three
+  `plow_moe_*_fp8_blk` kernels that a bf16 packet never launches.
+* **`0.0% of PRMT within 24 instructions of an HMMA` was a real measurement of the wrong thing.**
+  It is consistent with the widening living in a different arm entirely, which is what it does.
+
+### Where the PRMT actually is: the MoE expert walk, and it is not compiled with its fix
+
+`op_moe.cuh` contains **no `gvmma` call at all** — the tensor-core walk is `op_gemm.cuh`-only. The
+expert arm dots weights scalar-wise:
+
+    /* op_moe.cuh:478, inside dot8_fx */
+    for (int j = 0; j < 8; j++) acc = fmaf(xs[j], __bfloat162float(w.x[j]), acc);
+
+`__bfloat162float` on a packed pair lowers to exactly the audited idiom
+(`PRMT Rd, Rs, 0x7732, RZ`, constant selector, `RZ` as the zero source, emitted in pairs). On the
+26B-A4B the experts are essentially ALL of the 7.64 GB/step, so this — not the dense walk — is the
+B=1 weight stream.
+
+**And `dot8_fx` sits inside `#if PLOW_NV_GEMV_RB`, which is 0 in every packet.** Four sm_90a
+decode arms are set by the hand-build scripts and reach no packet:
+
+| flag | hand-build | packet | what it does |
+|---|---|---|---|
+| `PLOW_NV_GEMV_RB` | 1 | **0** | master gate for the row-blocked walks |
+| `PLOW_MOE_DOWN_LANESPLIT` | 1 | **0** | MoE-down lane split |
+| `PLOW_NV_GEMV_XREG` | 1 | **0** | dense GEMV activations in registers |
+| `PLOW_NV_GEMV_KPANEL` | 1 | **0** | dense GEMV K-panel walk |
+
+`build_sm90a_cubin.sh:132` sets all four; `build_sm90a_gemma4_segments.sh:49` sets
+`PLOW_NV_GEMV_RB=1 -DPLOW_MOE_DOWN_LANESPLIT=1 -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FP8_RB=4`. Verified
+absent from packets four independent ways, because inferring it once already went wrong
+([[plow-extra-defines-not-plumbed-to-packets]]):
+
+1. No recipe under `scripts/campaign/recipes/` mentions `gemv_rb` in any spelling.
+2. `manifest.rs::backend_nvcc()` builds `recommends` from exactly two keys — `gv_mm_max` and
+   `gf_full` (line 1231-1238). There is no code path that could emit the others.
+3. A real packet's `assets/build.json` records **2** `def.*` knobs total, both `null`.
+4. `build_sm90a_gemma4_segments.sh` compiles only `pf*`/`pfattn*`/`pfgemm*`/`pfpacked*` objects —
+   all PREFILL — and merely `cp`s `interp_sm90a.cubin`, which is the object decode runs. So the
+   `-DPLOW_NV_GEMV_RB=1` on its line 49 never touches the decode megakernel.
+
+### Why this is the best-evidenced remaining lever for the 26B C1 column
+
+`op_moe.cuh:409-416`, on why the row-blocked arm exists:
+
+> At the megakernel's 1 block/SM a warp that owns ONE output row keeps only UN weight loads in
+> flight, and the H100 needs ~16 to reach its bandwidth (measured: a pure read at 1 blk/SM goes
+> 1222 -> 2490 GB/s as loads-in-flight go 1 -> 8; `runtime/nvidia/experiments/hbm_ceiling_h100.cu`).
+
+The B=1 step runs **1425 GB/s** (7.64 GB / 5.362 ms), ~45% of the 3352 roof — sitting at the
+shallow end of precisely that curve, with `GV_MOE_RB=2 x GV_MOE_UN=2` worth of streams against the
+~16 the part wants. `PLOW_MOE_DOWN_LANESPLIT`'s own note records **bf16 7.060 -> 6.766 ms at
+1 block/SM** (-4.2%), and 1 block/SM IS the megakernel's occupancy. This also retires the standing
+puzzle of the section above: the step is not achieving the bandwidth bound its design premise
+assumes because the arm written to achieve it is compiled out.
+
+**The honest risk.** Every hand-build flag imported into the packet so far has inverted at
+REG:255 (`GV_UNROLL_GLU` +4.40%), and `GV_MOE_RB_DN=4` is on record as pushing the megakernel
+REG 177 -> 229 in a leaner object. `LOCAL>0` on the arm object predicts a regression before any
+timing is taken. Measured, not assumed.
+
+**How the A/B reaches a packet.** `PLOW_EXTRA_DEFINES` IS a functional CMake cache var
+(`runtime/CMakeLists.txt:523`, space-split at :545, appended to every served cubin at :707) — it
+was only the *environment variable* that was never plumbed. But `plowc` overwrites it from the
+manifest's `recommends` (`main.rs:1938-1946`), so an external env value cannot reach a packet.
+Route: a `PLOW_TUNE_*` read in `tuning()` with a STRING LITERAL, a `rec.push` in
+`backend_nvcc()`, `env.PLOW_TUNE_*` in RAW_ENV, and **rebuild plowc**. `recommends` deliberately
+does not move the pairing hash (`pairing_hash_tracks_backend_requires_but_not_recommends`), so
+control and arm packets differ in exactly one compile flag.
