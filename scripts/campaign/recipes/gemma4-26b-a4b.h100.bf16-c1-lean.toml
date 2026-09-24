@@ -1,0 +1,187 @@
+# Gemma-4-26B-A4B-it, H100 SXM5, BF16, TP1 — ctx16k + the MoE decode route (packet p26dl) with
+# 8192-ROW PREFILL LAUNCHES. PLOW_MAX_CHUNK=8192 adds an 8192 bucket; PLOW_MAX_REQUEST_CHUNK=4224
+# caps one request's slice per launch, so the sliding ring is sized by the slice,
+# next_pow2(1024 + 4224 - 1) = 8192 rows: the same per-slot KV as ctx16k and 16 slots still fit.
+# An 8192-row launch packs two or more requests' slices; a lone request still runs <= 4224 rows.
+# MoE decode route as p26dl: PLOW_EMIT_MOE_DEC_LT=1 + PLOW_GEMMA_MOE_DEC_GROUP=4 at emit,
+# PLOW_MOE_DEC_LT=4 at serve. Experiment: plans/gemma4-packet-geometry.md.
+
+[cell]
+name = "gemma4-26b-a4b.h100.bf16-c1-lean"
+model = "google/gemma-4-26b-a4b-it"
+revision = "local"
+hf_dir = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+# TWO constraints pin this, and 8192 satisfies neither for the 8K rung:
+#
+#  1. The 8K rung needs 8192 input + 128 output = 8320 live positions. A packet compiled
+#     at exactly 8192 rejects every 8192-token request ("context length exceeded:
+#     prompt + max_tokens = 8320 exceeds the compiled context 8192") and the top rung of
+#     the ladder silently produces no cell.
+#  2. max_ctx must be a MULTIPLE OF 2048. The full-attention KV head window is
+#     max_ctx * global_head_dim(512) * 2 B, and the VMM pool requires it to be a
+#     multiple of the 2 MiB allocation granularity. 8704 loads and then dies with
+#     "vmm: head window 8912896 B not a multiple of granularity 2097152"
+#     (8704*512*2 = 4.25 granules). 8192 happens to work (exactly 4).
+#
+# 10240 is the smallest value satisfying both (5 granules). The 12B recipe's 16384 is 8.
+max_ctx = 16384
+precision = "bf16"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_SEG_PURE_GEMM = "1"
+PLOW_SEG_FA512 = "1"
+PLOW_SEG_FA256_GQA2 = "1"
+PLOW_TMA_GEMM = "1"
+# Decode attention QK on the tensor cores; opt-in (its P certificate was rejected:
+# 26B 128/C1 TPOT 5.400 -> 5.418 ms, worse than its 0.002 floor, while longer contexts win).
+PLOW_FA_MMAQK = "3"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+# LEAN DECODE LADDER for the C1/C4 columns: 1,2,4 instead of 1,2,4,8,16.
+# The megakernel ENTRY is essentially the whole fixed per-step cost (17cacd99, #71) and it
+# taxes EVERY compiled rung. The realtime profile ALREADY caps serving at
+# PLOW_DECODE_MAX_RUNG=4, so rungs 8 and 16 are dead weight at C1/C4 -- they cost entry time
+# on every step and are never executed.
+# MEASURED on the 12B: -0.07 ms TPOT at every C1 cell and -0.29 at 128/C4, which flipped
+# 8192/C1 and 128/C4 to 4/4. The 26B should gain MORE: its step is only 5.60 ms so a ~1 ms
+# entry is ~18% of it, and its megakernel is far larger (MoE member cases).
+# 26B C1 needs TPOT -0.57 to win outright, -0.44 for tok/s (5.60 vs vLLM 5.03).
+# Dropping 16 slots to 4 also FREES sliding KV, which this memory-tight model wants.
+PLOW_DECODE_BATCH_LADDER = "1,2,4"
+# Rungs of >= 8 rows sort their B*k slots by expert and run the routed experts through the
+# grouped tensor-core GEMMs (step_bench ms/step at B=8/16: 16.3 -> 14.3, 27.0 -> 18.0).
+PLOW_GEMMA_MOE_DEC_GROUP = "4"
+# Grouped MoE decode rungs through cuBLASLt grouped GEMMs (served with PLOW_MOE_DEC_LT=4), as p26dl.
+PLOW_EMIT_MOE_DEC_LT = "1"
+PLOW_SLIDING_NS_GRID = "1"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+PLOW_SLIDING_NS_CAP = "1"
+# FINE-GRAINED RUNGS. The server re-tokenises and prepends BOS, so an N-token bench prompt is
+# N+1 rows and crosses its rung: measured 25 -> 42 ms at 128|129 rows, 62 -> 91 at 1024|1025,
+# 177 -> 202 at 4096|4097, 368 -> 394 at 8192|8193 (one more token, +17..29 ms: either the next
+# bucket's padding or a second full-model launch for a 1-row tail). Each appended rung is the
+# shipped rung + 128, which swallows that tail in one launch; the runtime's chunk-cost model
+# picks it on its own. 4224 exceeds MAX_CHUNK but fits the sliding ring that MAX_CHUNK=4096
+# already sizes (next_pow2(1024 + 4096 - 1) = 8192 rows >= 1024 + 4224 - 1), which is the
+# condition the emitter admits an appended rung on; per-slot KV is unchanged.
+PLOW_PF_LADDER_APPEND = "256,1152,4224"
+PLOW_MAX_CHUNK = "8192"
+# One request's rows per launch; sizes the sliding ring (see the header). Must be a prefill rung.
+PLOW_MAX_REQUEST_CHUNK = "4224"
+# Measured on this board (tune_decode_sweep.sh, step_bench, B=1, occ 1:132): folding the greedy
+# argmax into the lm_head GEMV epilogue is SLOWER here — 6.501 ms/step vs 5.837 without it.
+# (PLOW_FUSE_MERGE / PLOW_FUSE_HNR: no effect; PLOW_GEMMA_MOE_ROUTER_FUSED: 142 ms/step.)
+PLOW_FUSE_ARGMAX = "0"
+# Each layer's grouped MoE prefill pair (GLU + down) isolated as a MOE_PREFILL_CUBLASLT segment;
+# served by two cuBLASLt grouped matmuls when PLOW_MOE_PF_LT is set: segment 0.744 -> 0.569 ms at
+# 1024 rows, 1.777 -> 1.352 at 4096; TTFT 1024/C1 43.0 -> 38.7 ms, 4096 120.9 -> 107.2, 8192
+# 257.7 -> 231.0; MoE relL2 3.6e-3 (BF16 rounding of gate|up), gate + needle + consistency pass
+# (agent/moe-grouped-gemm, bb2c5c14).
+PLOW_EMIT_MOE_PF_LT = "1"
+# The exact scorer replays the legacy scalar fmaf order on ONE lane per expert: measured
+# 0.0460 ms/layer at B=1 vs 0.0085 for ScoreFast (moe_decode_gemma26b_bench.cu) — 1.1 ms of
+# an 8.15 ms C1 decode step. ScoreFast is f32 end to end with a tree reduction, which is
+# already tighter than the reference: vLLM's Gemma4Router feeds bf16 h2 into its GateLinear.
+# The prefill router (moe90_router_gemma_pf) makes the same bf16-h2 / f32-logit choice.
+PLOW_GEMMA_MOE_ROUTER_EXACT = "0"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = [
+  "interp_sm90a_pfattn_hd512.cubin",
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+]
+[objects.env]
+# FATLITE strips the native GEMM / GLU / flash arms the fat object never runs here (Lt, the GEMM
+# object and the FA objects own them); FATLITE_MOE keeps the Gemma MoE prefill opcodes in it, at
+# occ-1 with the full register budget their 128 accumulators need. Plain FATLITE=1 compiles the
+# MoE cases OUT and no other object implements them. Block outputs are bit-identical to the
+# unstripped object; the unstripped 255-register build spills, and the MoE segment ran 0.3 / 0.9
+# ms per layer slower in it at 1k / 4k (in-situ block bisect, 2026-09-20).
+PLOW_BUILD_FATLITE = "1"
+PLOW_BUILD_FATLITE_MOE = "1"
+# The MoE-down lane split (PLOW_MOE_DOWN_SG=8, measured on this board) is NOT set here: this env
+# only reaches the segments script, and the decode object is built from the manifest. It is a
+# manifest rule now (tuning.moe_down_sg -> plow_config.h), which every object of the packet sees.
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "0"
+PLOW_BUILD_MASKED_PADDING = "1"
+# MUST be 1: the role file interp_sm90a_pfattn_hd512.cubin carries the ABI
+# `attention_sm90_hd512_wg32_v1`, i.e. the WGMMA BQ64 body. Building it with WG=0
+# emits the mma.sync BQ32 body instead, so the object's block/warp geometry does not
+# match what the role dispatch assumes. The 12B recipe sets 1 for the same reason.
+PLOW_BUILD_PFATTN_WG = "1"
+PLOW_BUILD_PFATTN_KV16 = "0"
+PLOW_BUILD_PFATTN_KV64 = "0"
+PLOW_BUILD_PFATTN_QK_UNROLL = "4"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "0"
+
+[serve.env]
+PLOW_MOE_DEC_LT = "4"
+PLOW_PREFIX_CACHE = "0"
+PLOW_MOE_PF_LT = "1"
+PLOW_PF_SEG_PURE = "1"
+PLOW_PF_SEG_FA512 = "1"
+PLOW_PF_INTERLEAVE = "0"
+# Gemma's tokenizer is one-word BPE (space -> "▁" normalizer): 1.6 ms for a 1k-token prompt and
+# 8.9 ms for 4k, serial, inside TTFT. Split encode is exact for it (tokenizer.rs); a 1k prompt is
+# only ~5 KB, so the 4096-byte default floor would not split it. Served wall, bench-like prompts:
+# 46.0 -> 43.7 ms at 1k, 131.6 -> 122.4 at 4k.
+PLOW_ENCODE_THREADS = "16"
+PLOW_ENCODE_SPLIT_MIN = "512"
+PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
+LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096 8192 15000"
+concs = "1 4"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
+model_id = "gemma-4-26b-a4b-it"
+gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer in one short sentence.<end_of_turn>\n<start_of_turn>model\n"
+
+# The common ladder both Gemma-4 campaigns run (12B: gemma4-12b.h100.bf16-realtime.toml): random
+# prompts to a 16k context (15000 in + 128 out), C1/C4 latency cells and C16/C32 serving cells.
+[bench.profiles.realtime]
+in_lens = "128 1024 4096 8192 15000"
+concs = "1 4"
+# Queue-driven prefill packing (PLOW_PF_INTERLEAVE_ADAPTIVE): four 1024-row prompts arriving together no
+# longer share one 172 ms launch; the oldest runs whole and later ones join only while that is cheaper.
+# Measured p26i, 16 prompts, off -> on: 1024 in TTFT 114.5 -> 94.4 ms, TPOT 10.03 -> 10.32;
+# 128 / 4096 / 15000 in level (40.1 / 247.5 / 1140.8 -> 40.5 / 246.3 / 1141.7).
+# MULTISTEP 0, not 4: 4 emits four tokens per wave, which sets p99 ITL to exactly 4 x TPOT
+# (median ITL is literally 0.000) while TTFT and TPOT are untouched. Measured on p26l8, 32 prompts,
+# C1 over 128..15000: p99 ITL 22.38 / 22.88 / 23.17 / 23.43 / 23.93 ms against a 5.58..5.97 TPOT,
+# i.e. a pure wave artifact, versus vLLM 0.28 measured the same session at 5.68 / 5.86 / 5.97 /
+# 6.02 / 6.07. gemma4-26b-a4b.h100.bf16-ctx16k.toml already carries this and records 4 -> 0 taking
+# p99 ITL to 5.5 / 5.5 / 5.6 / 5.6 / 5.7 with TPOT +0.02-0.03; this recipe was simply stale.
+# PLOW_DECODE_PIPELINE is NOT the lever on the 26B -- it is disabled whenever cuBLASLt is on.
+serve_env = { PLOW_MULTISTEP = "0", PLOW_MULTISTEP_ADAPTIVE = "1", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0", PLOW_PF_INTERLEAVE_ADAPTIVE = "1" }
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096 8192 15000"
+concs = "16 32"
+nprompt = 64
+# MULTISTEP 2, not 8: measured at C16 (64 prompts) 1024-token TTFT 375 -> 249 ms, p99 ITL 228 ->
+# 106 ms, tok/s 464 -> 488; 4096-token cells are unchanged (the CUDA quantum is already 1 above B=8).
+# MULTISTEP 0, not 2 (2026-09-21, p26i, 32 prompts at C16, 2 -> 0): 128 in TTFT 102.9 -> 90.9 ms, TPOT 15.51 ->
+# 15.15, 970 -> 1005 tok/s, p99 ITL 32.9 -> 16.7; 1024 / 4096 in level within the cell noise.
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
+
+[reference]
+csv = "perf-data/campaign/gemma4-26b-a4b.h100.reference-vllm028-bf16.csv"
