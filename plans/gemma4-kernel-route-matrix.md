@@ -131,6 +131,23 @@ still open -- but note it only matters for shapes where native is the chosen rou
 
    For MoE the route question is answered at the packet level, not by a microbench: the knobs
    already exist (`PLOW_EMIT_MOE_PF_LT` / `PLOW_MOE_PF_LT`, `PLOW_MOE_DEC_LT`), so it is a
-   two-packet A/B with grouped-Lt on vs off, same session. Note grouped MoE decode is bf16-gated
-   (task #62), so the FP8 arm of that A/B is blocked until that gate is relaxed.
+   two-packet A/B with grouped-Lt on vs off, same session.
+
+   **MEASURED 2026-09-24, and it closes the 26B BF16 MoE route.** `p26mlt` (recipe as-is,
+   `moe_pf_lt=True moe_dec_lt=True`) vs `p26mnat` (both forced to 0), step_bench prefill wall,
+   3 reps, order-reversed within each ctx, one lease:
+
+   | ctx | MoE cuBLASLt | MoE native | delta |
+   |---|---|---|---|
+   | 1024 | **35.0** +-0.0 ms | 40.0 +-0.0 ms | **+5.0 ms (14.3%)** |
+   | 4096 | **98.0** +-0.0 ms | 112.3 +-0.6 ms | **+14.3 ms (14.6%)** |
+
+   Grouped cuBLASLt wins by ~15% of the WHOLE prefill wall -- an order of magnitude more than
+   anything available in the dense shapes, where cuBLASLt already runs at 82-90% of roofline.
+   The shipped default is right. Both packets emit the identical MoE opcode set, so what differs
+   is the dispatch of those ops, not which ops exist; the knob values in `build.json` are what
+   distinguishes the arms and they were checked before the bench ran.
+
+   Still open: grouped MoE decode is bf16-gated (task #62, `lib.rs:6083-6100`), so the FP8 arm of
+   this A/B cannot be built. FP8 MoE routing is undecided.
 4. DONE: route matrix re-run on this branch's binaries (see the table above).
