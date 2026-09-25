@@ -16,7 +16,7 @@ rungs 1–128, TP8, priced against a per-op roofline. Every GPU job ran through 
 | all-reduce | BF16 | XReduceScatter/XAllGather (seq-par seams), BF16 |
 | DSA sparse attention / FP8 indexer | on for T > 2048 | **off (dense)** — open gap |
 
-## Recipe (best: packet `parity-sf-sp-v9`, objects `…-v9-hsaco-best8`)
+## Recipe (best: packet `parity-sf-sp-v9`, objects `…-v9-hsaco-final`)
 
 Emit (`plowc --replay-knobs <static packet>/build.json …`, env):
 `PLOW_GLM_QKVA_W8A8=1 PLOW_GLM_OPROJ_W8A8=1 PLOW_GLM_MLA_W8A8=1 PLOW_GLM_MLA_MHA=1
@@ -30,7 +30,7 @@ PLOW_MLA_PF_TR16=1 PLOW_DECODE_BATCH=128 PLOW_GEMV_MM=8 PLOW_GEMV_WALK=1 PLOW_MO
 PLOW_MLA_FOLD_MFMA=1 PLOW_MOE_PF_A4W4_BK=256 PLOW_COMBINE_VEC=1 PLOW_MOE_ROUTER_PF_WAVE=1
 PLOW_MLA_MHA=1 PLOW_GEMV_MFMA4=1 PLOW_XR_SCHED=aiter PLOW_XR_SCHED_NWG=40 PLOW_XR_SCHED_NWG_SRS=16
 PLOW_FP8_BLK_DMA=1 PLOW_FP8_BLK_KW=1 PLOW_MERGE_UNROLL4=1 PLOW_GEMV_F32_COL=1
-PLOW_MOE_STAGE1_PIPE=1 PLOW_MOE_GLU_KW=1`
+PLOW_MOE_STAGE1_PIPE=1 PLOW_MOE_GLU_KW=1 PLOW_MOE_DOWN_SWEEP_LINE=1 PLOW_MOE_ALIGN_WAVES=1`
 
 Runtime: plowrt from this branch (MHA segment routing, MoE stage-1 token-gather route, ragged
 QuantFp8Block128 row shrink); checkpoint overlay `/opt/models/plow-glm53-mxfp4-prepped-mla-mha-20260925`
@@ -53,6 +53,8 @@ i.e. prefix-cache hits / continuation chunks); `PLOW_AMD_DECODE_MIN_RUNG=1` for 
 | router col GEMV (GEMV_F32_COL=1) | router decode M1 | 0.015->0.007 | rel-L2 1e-7 |
 | RmsNorm+Q128 (NORM_Q128) | norm + block-128 quant | one packet fewer per layer (decode input norm, prefill q_a norm) | same formula |
 | xr sched (XR_SCHED=aiter, 40/16) | seq-par collectives | in-model -7.5% prefill | bit-exact |
+| DOWN line stores (MOE_DOWN_SWEEP_LINE) | MoE DOWN part writes (128 B non-temporal lines) | 8k 0.73->0.48, 16k 1.33->0.84 | bit-exact |
+| align all waves (MOE_ALIGN_WAVES) | MoeAlignPf phases 2/4 | phase 4 8k 103->45 us, 16k 201->70 us | bit-exact |
 
 ## In-model TP8 (warm medians, `amd-bench --prefill-sweep … --prefill-reps 5`, 2 alternating rounds)
 
@@ -81,6 +83,7 @@ merge unroll (-9%), decode shared fold (-6% M8, -16% M64), kw decode GLU (-5..-1
 | | TTFT mean | TPOT mean | total tok/s |
 |---|---|---|---|
 | vLLM c8 | 15.57 s | 34.9 ms | 3268 |
+| vLLM c1 (in8064) | 13.24 s | 19.5 ms | 521 |
 | plow v8b/best8 c8 | 2.07 s | 75.1 ms | 5551 |
 | plow v8b/best8 c1 (in8064) | 0.43 s | 43.0 ms | 1392 |
 | plow v8b/best8 c1 (in1024) | 0.32 s | 45.8 ms | 188 |
@@ -89,6 +92,8 @@ Logits vs vLLM oracle (last prompt position, T1024–T8192): top-1 match 4/4, KL
 8.5e-5 / 6e-6 / 2.7e-7 / 2.8e-8 (MHA form). Smoke "capital of France" -> " Paris".
 
 ## Negatives (do not re-try blind)
+- MoE stage-1 wide tile (128 rows, A+B via LDS): bit-exact but 423 -> 501 us at T8192.
+  DOWN global loads / plain float4 stores / 256 B lines / 9-slot combine loads: no gain or slower.
 - Router small-N GEMM prefill: 0.6x. GLU full-K sweep prefill: slower. XR sched 24/8 (gfx942
   defaults): no gain on gfx950. `PLOW_MLA_DEC_MINPER=64`: decode M32..M128 slower. Router col GEMV at
   M<=16: M16 slower in-model. FP8 GEMM DMA on 64x128 tiles: mismatch (cause not found; excluded).
