@@ -4679,7 +4679,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
              * this packet's block count, not the tile count. */
             d_index_union_pf((unsigned char*)TEN(0), (unsigned long long*)TEN(1),
                              (const int*)TEN(2), (const int*)TEN(3), in->i[0], in->i[1],
-                             in->i[2], in->i[3], in->i[4], slice, nblk, (unsigned*)sm->raw);
+                             in->i[2], in->i[3], in->i[4], slice, nblk, (unsigned*)sm->raw,
+                             in->i[5]);
             break;
 #endif
         /* The latent epilogue has to be in the SAME object as the prefill that produces the

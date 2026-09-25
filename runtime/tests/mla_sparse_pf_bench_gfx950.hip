@@ -19,7 +19,7 @@
 #include "op_attention.h"
 #include "mla_sparse_pf.h"
 #else
-namespace mla_sp { constexpr unsigned LDS_BYTES = 161792; }
+namespace mla_sp { constexpr unsigned LDS_BYTES = 161808; }
 #endif
 
 #define CK(x) do { hipError_t e_ = (x); if (e_) { printf("hip %s @%d\n", hipGetErrorString(e_), __LINE__); exit(1); } } while (0)
@@ -71,7 +71,8 @@ int main(int argc, char** argv) {
     // Union table exactly as d_index_union_pf lays it out (tile_p = 8).
     const unsigned n_qt = (T + QP - 1) / QP, cap = std::min(QP * TOPK, T);
     const size_t hdr = (n_qt * 4u + 255u) / 256u * 256u;
-    std::vector<unsigned char> uni(hdr + (size_t)n_qt * cap * 12u, 0);
+    const size_t ctr_off = hdr + (size_t)n_qt * cap * 12u;  // pack ticket counter (IndexUnionPf i5)
+    std::vector<unsigned char> uni(ctr_off + 256, 0);
     size_t pairs = 0, upairs = 0;
     for (unsigned qt = 0; qt < n_qt; qt++) {
         std::vector<unsigned long long> m(T, 0);
@@ -129,7 +130,7 @@ int main(int argc, char** argv) {
         return ts[ts.size() / 2];
     };
     const float tv = timed([&] { hipLaunchKernelGGL(k_v2, dim3(256), dim3(256), V2_LDS, 0, dop, dml, dqa, dqr, dck, dkr, dkvl, duni, T, cap, scale); });
-    const float ts = timed([&] { hipLaunchKernelGGL(k_sparse, dim3(256), dim3(256), mla_sp::LDS_BYTES, 0, dout, dqa, dqr, dck, dkr, duni, T, cap, scale); });
+    const float ts = timed([&] { CK(hipMemsetAsync(duni + ctr_off, 0, 4)); hipLaunchKernelGGL(k_sparse, dim3(256), dim3(256), mla_sp::LDS_BYTES, 0, dout, dqa, dqr, dck, dkr, duni, T, cap, scale); });
     const double fl = (double)upairs * H * 1088 * 2;
     printf("v2gather %.3f ms   sparse %.3f ms (%.2fx)   sparse %.0f TF/s on union pairs\n", tv, ts, tv / ts, fl / ts / 1e9);
 

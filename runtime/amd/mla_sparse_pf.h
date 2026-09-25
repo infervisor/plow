@@ -23,7 +23,8 @@ constexpr unsigned STAGE = 2 * SUB + ROPE;      // halves
 constexpr unsigned STATS_B = 2 * STAGE * 2;     // byte offsets
 constexpr unsigned RING_B = STATS_B + 4 * 32 * 4;
 constexpr unsigned RING = 3, SLOT_B = 2 * BKV * 4;
-constexpr unsigned LDS_BYTES = RING_B + RING * SLOT_B;  // 161,792
+constexpr unsigned TICKET_B = RING_B + RING * SLOT_B;
+constexpr unsigned LDS_BYTES = TICKET_B + 16;  // 161,808
 typedef bf16_t bx4 __attribute__((ext_vector_type(4)));
 }  // namespace mla_sp
 
@@ -47,13 +48,25 @@ __device__ void d_mla_sparse_pf(bf16* __restrict__ O, const bf16* __restrict__ Q
     const unsigned g16 = (lane >> 4) & 1u, i16 = lane & 15u;
     const unsigned rt = wave & 1u, kh = wave >> 1, pw = wave ^ 2u;
     const float sl2 = scale * 1.4426950408889634f;
+    (void)slice;
+    (void)nblk;
     const unsigned n_qt = (T + QP - 1) / QP;
     const unsigned hdr = (n_qt * 4u + 255u) / 256u * 256u;
     bf16* const lh = (bf16*)lds;
     float* const stats = (float*)(lds + STATS_B);
     const unsigned ql = 4u * rt + (r32 >> 3), hh = r32 & 7u;
 
-    for (unsigned it = slice; it < n_qt; it += nblk) {
+    // Packs are handed out largest-first from a ticket counter IndexUnionPf zeroed (one word past
+    // the last union block): union sizes vary ~500x across packs, so a static stride leaves a
+    // 1.3-1.5x tail.
+    unsigned* const ticket = (unsigned*)(lds + TICKET_B);
+    unsigned* const ctr = (unsigned*)(uni + hdr + (size_t)n_qt * cap * 12u);
+    for (;;) {
+        __syncthreads();  // previous item's LDS reads (and ticket read) are done
+        if (tid == 0u) *ticket = atomicAdd(ctr, 1u);
+        __syncthreads();
+        const unsigned it = *ticket;
+        if (it >= n_qt) break;
         const unsigned qt = n_qt - 1u - it;  // longest unions first
         const unsigned ucount = ((const unsigned*)uni)[qt];
         const unsigned char* blk = uni + hdr + (size_t)qt * cap * 12u;
@@ -94,7 +107,6 @@ __device__ void d_mla_sparse_pf(bf16* __restrict__ O, const bf16* __restrict__ Q
             }
         };
 
-        __syncthreads();  // previous item's LDS reads are done
         if (nch) ring(0);
         if (nch > 1) ring(1);
         cp_async_wait();

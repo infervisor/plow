@@ -2747,7 +2747,8 @@ fn declare_glm_rows_batched_for_prefill(
                 "iidx_pf",
                 rows64 * glm_dsa_select_width(c, ctx) as u64 * I32,
             ),
-            ac(b, "iuni", hdr + n_qt * cap * 12),
+            // + 256: the B8 sparse flash's pack ticket counter (IndexUnionPf i5 zeroes it).
+            ac(b, "iuni", hdr + n_qt * cap * 12 + 256),
             // SLICE-indexed inside op 119 (one scratch row per in-flight workgroup), so the
             // size is bound by the op's block count (<= n_cu), not the 8x-denser pack count.
             ac(b, "iumask", b.n_cu() as u64 * ctx as u64 * 8),
@@ -6785,6 +6786,8 @@ fn emit_glm_dsa_prefill_select(
             d.i[2] = ctx;
             d.i[3] = glm_dsa_pf_cap(c, ctx);
             d.i[4] = GLM_DSA_PF_PACK; // queries per union tile (kernel: 0 = legacy 64)
+            // Zero the B8 sparse flash's pack ticket counter (mla_sparse_pf.h).
+            d.i[5] = u32::from(emit_config::active().glm_dsa_pf_b8 && !glm_fp8_kv());
         },
     )
 }

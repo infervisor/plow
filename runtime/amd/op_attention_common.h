@@ -6556,7 +6556,7 @@ __device__ void d_index_union_pf(unsigned char* __restrict__ uni,
                                  const int* __restrict__ idx, const int* __restrict__ kv_len,
                                  unsigned n_tok, unsigned top_k, unsigned kv_stride, unsigned cap,
                                  unsigned tile_p, unsigned slice, unsigned nblk,
-                                 unsigned* sc /* [PLOW_THREADS+1] */) {
+                                 unsigned* sc /* [PLOW_THREADS+1] */, unsigned zero_ctr = 0) {
     const unsigned tid = threadIdx.x;
     const unsigned len = (unsigned)as_glob(kv_len)[0];
     const unsigned q_pos0 = len - n_tok;
@@ -6567,6 +6567,9 @@ __device__ void d_index_union_pf(unsigned char* __restrict__ uni,
     const unsigned n_qt = (n_tok + P - 1u) / P;
     const unsigned hdr = (n_qt * 4u + 255u) / 256u * 256u;
     unsigned* const cnt = (unsigned*)uni;
+    /* i5: the B8 sparse flash's pack ticket counter, one word past the last union block. */
+    if (zero_ctr && slice == 0u && tid == 0u)
+        st_act<unsigned>((unsigned*)(uni + hdr + (size_t)n_qt * cap * 12u), 0u);
     for (unsigned qt = slice; qt < n_qt; qt += nblk) {
         const unsigned q_hi = (qt * P + P - 1u < n_tok - 1u) ? qt * P + P - 1u : n_tok - 1u;
         const unsigned tile_end = q_pos0 + q_hi + 1u; /* strictest causal bound in the tile */
