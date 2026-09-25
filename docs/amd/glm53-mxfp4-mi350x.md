@@ -150,6 +150,24 @@ dsa1 0.977, dsa2 0.980, dsa4 0.984 (top-10 overlap 9/10). Greedy T1024/T8192 ide
 dsa-v4 T8192 trace (ms): sparse flash 82 (dense MHA 39), score 10, select 9, MlaBmm 11+8 (dense kv_b
 8.5), indexer ropes 8, union 4, LayerNorm 4, wq_b 4, projections 5. T16384: flash 201 (MHA 153),
 score 34, select 30, MlaBmm 19+15, union 11. In-model flash is ~1.5x its standalone time.
+dsa-v4 detail (job ab-dsa4, packet cf2a668a = `GLM_RECIPE=dsa` emit before the ticket counter;
+objects `PLOW_MLA_SPARSE=1 PLOW_DSA_SELECT_V2=1 PLOW_DSA_IDX_QPW=1`, plowrt-v5, overlay `--dsa`):
+
+| | 4k | 8k | 16k (ms) |
+|---|---|---|---|
+| dsa-v4 sweep median | 279.2 | 469.6 | 911.8 |
+| dense v9, same job | 231.5 | 388.5 | 736.1 |
+| delta | +47.7 | +81.1 | +175.7 |
+
+| logits vs vLLM oracle | T1024 | T2048 | T4096 | T8192 |
+|---|---|---|---|---|
+| top-1 | match | match | match | match |
+| cos | 0.959 | 0.733 | 0.955 | 0.984 |
+| KL(vLLM‖plow) | 8.5e-5 | 6.0e-6 | 6.9e-7 | 2.9e-8 |
+| top-10 overlap | 6/10 | 5/10 | 8/10 | 9/10 |
+
+Greedy 16 steps: T1024 [2615, 5383, 24417, 11, …], T8192 [16539, 264, 16148, 429, …] — identical to
+dense. (T1024/T2048 rows are dense MHA buckets in every build, hence identical to dense.)
 Decode (dsa-v1): ctx1k M1/M8/M64 51.1/67.5/220.7 vs dense 38.4/53.5/117.4 ms — not yet worked on.
 The "16k last-8-rows" zeros were not a bug: prompt-16384.ids holds 16376 tokens (kvrow shrink).
 
