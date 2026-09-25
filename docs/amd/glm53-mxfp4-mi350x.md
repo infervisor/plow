@@ -134,6 +134,7 @@ Status: correct and closer to vLLM than dense, but NOT yet faster than dense pre
 | select v2 (DSA_SELECT_V2) | IndexSelectPf | 8k 1.70 -> 0.34, 16k 3.75 -> 0.94 | same set |
 | score QPW (DSA_IDX_QPW) | IndexScorePf (BF16) | 8k 0.875 -> 0.472, 16k 3.39 -> 1.77 | byte-identical |
 | HNR ILP (HNR_ILP) | indexer q/k rope HD=128 | 8k 0.100 -> 0.060 | byte-identical |
+| score FP8 (DSA_IDX_FP8, opt-in) | IndexScorePf via `dsa_score_fp8.h`, vLLM's FP8 recipe | vs QPW: 4k 0.148 -> 0.072, 8k 0.49 -> 0.24, 16k 1.71 -> 1.01 | bit-identical to vLLM's ops (T4096/8192) |
 
 In-model TP8 prefill (ms, warm medians; dense v9 = 232 / 388 / 736 at 4k / 8k / 16k):
 
@@ -205,7 +206,7 @@ indexer DSA is not expected to cross over by 64k; the indexer chain is the bindi
 A 3-4x faster indexer (FP8 score per vLLM, fused/faster select) would put the crossover at ~24-32k.
 32k correctness not checked (no oracle at 32k).
 
-### Indexer: reference implementations and adoption plan (research, 2026-09-25; not yet implemented)
+### Indexer: reference implementations and adoption plan (research, 2026-09-25; step 1 done)
 - vLLM 0.29 ROCm path (pinned image): `rocm_fp8_mqa_logits` -> AITER gfx950 gluon
   `_gluon_fp8_mqa_logits_kernel` (1 program/query row, longest rows first, BLOCK_KV=32,
   `mfma_scaled` 32x32x64 e4m3 unscaled, relu -> head reduce -> x kscale, fp32 logits; -inf prefill) +
@@ -224,14 +225,38 @@ A 3-4x faster indexer (FP8 score per vLLM, fused/faster select) would put the cr
   (recall 0.53) and truncated overflow bins (wrong sets). Fully fused score+top-k (FusedIndexTopK):
   only +3-9% — the score round trip is not the dominant cost.
 - Plan (projected indexer chain 8k 31 -> ~9 ms, 16k ~85 -> ~28 ms):
-  1. FP8 score arm with the numerics above (x64 MFMA, K in LDS as fp8, 2-4 rows/wave, >=2 waves/SIMD
-     so the relu/weight epilogue overlaps MFMA): 16k 1.77 -> ~0.75 ms/layer, 8k 0.47 -> ~0.2.
+  1. DONE (`PLOW_DSA_IDX_FP8=1`, see below): 16k 1.71 -> 1.01 ms/layer, 8k 0.49 -> 0.24.
   2. Select: one fp32-key 11-12-bit histogram pass with the row in registers, compact threshold-bin
      candidates into LDS, refine only those; handle overflow bins exactly: ~2.5x.
   3. Fuse select + union per 8-query pack (LDS bitmask): union 10.8 -> ~1 ms at 16k.
   4. Fuse indexer prep: k LN -> rope -> fp8 quant/cache in one pass; q rope + round + quant + weight
      fold in one pass; wk + weights_proj as one N=160 GEMM: ~10 ms at 8k.
   Then re-measure the crossover; the sparse flash (2x needed for 8k/16k) remains the other half.
+
+### FP8 indexer score (`PLOW_DSA_IDX_FP8=1`, object-only, 2026-09-25)
+Enable: `GLM_RECIPE=dsa GLM_OBJ_EXTRA="PLOW_DSA_IDX_FP8=1" scripts/glm53_mxfp4_mi350x.sh objects <pkt> <out>`
+(no packet change; wins over DSA_IDX_QPW). `runtime/amd/dsa_score_fp8.h`: quantizes the packet's bf16
+q/k/w on the fly (k per slab as it is staged into LDS, q per row in registers), 2 rows/wave sharing each
+K fragment, 128-key double-buffered fp8 slabs, subtile epilogue under the next subtile's MFMAs.
+- Numerics = vLLM's ops, bit for bit: `runtime/tests/index_score_pf_fp8_gfx950.hip dump` + the pinned
+  image's `per_token_group_quant_fp8` / `indexer_k_quant_and_cache` / `rocm_fp8_mqa_logits` on the same
+  operands: 100% of causal logits bit-identical at T4096 and T8192. Findings that got it there:
+  - the head sum must replay the gluon kernel's ISA order, not the source: that image's Triton lacks the
+    folded reduction (NUM_CHAINS=0), and LLVM emits `s=w1*r1; s=fma(w0,r0,s); fma slots 2..9; then
+    s += round(w*r)` for slots 10..15 (packed muls, not contracted). The 4-chain source order matched 44%.
+  - the x64 MFMA is not exactly rounded (fixed-point-like 64-term sum), but it is permutation-invariant:
+    the k-slot layout and scaled vs unscaled MFMA give identical results.
+  - `v_cvt_scalef32_pk_fp8_bf16(x, s)` == `cvt_pk_fp8_f32(x / s)` (1M probes); `v_cvt_pk_fp8_f32` is
+    OCP e4m3fn on gfx950, NaN (not saturating) above 448. UE8M0 of amax/448 is an exact bit formula.
+  - a packed-u16 amax must fold its halves before the cross-lane max (the one real bug found).
+- Standalone (1 GPU, 256 WG, us, vs QPW): T4096 148 -> 72, T8192 489-506 -> 237-249 (1.1 PF/s),
+  T16384 1706 -> 1006-1014 (1.08 PF/s), len 8192/n 4096 328 -> 211-224. 16k target (0.8) not reached:
+  the per-row-subtile VALU epilogue (16 relu + 22 packed ops per 2 rows) ~ the MFMA time, and K is
+  re-quantized per 16-row pack. Tried: 64/256-key slabs, 2/8/16 spans per WG (no gain).
+- In-model (dsa-v5 packet, same job, 2 alternating rounds, ms): 4k 257/257 vs dsa-v6 273/273,
+  8k 463/458 vs 461/461, 16k 858/870 vs 882/883. Score op (trace, 21 layers): 8k 10.2 -> 6.6 ms,
+  16k 34.5 -> 20.9 ms. Greedy T1024/T8192 identical; top-1 == vLLM oracle 4/4; T8192 cos 0.977
+  (dsa-v6 0.984), KL 3.3e-8 (2.9e-8); T4096 cos 0.957 (0.955).
 
 ## Negatives (do not re-try blind)
 - MoE stage-1 wide tile (128 rows, A+B via LDS): bit-exact but 423 -> 501 us at T8192.
