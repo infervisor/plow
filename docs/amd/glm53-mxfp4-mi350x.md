@@ -14,13 +14,26 @@ rungs 1–128, TP8, priced against a per-op roofline. Every GPU job ran through 
 | routed + shared experts, dense MLP | MXFP4 A4W4 (1x32 E8M0) | A4W4 grouped (shared folded as expert 257 at prefill and batched decode) |
 | router | BF16 in, FP32 out | `GemmF32` |
 | all-reduce | BF16 | XReduceScatter/XAllGather (seq-par seams), BF16 |
-| DSA sparse attention / FP8 indexer | on for T > 2048 | **off (dense)** — open gap |
+| DSA sparse attention / FP8 indexer | on for T > 2048 | opt-in `GLM_RECIPE=dsa` (BF16 indexer; see DSA section) |
 
 ## Recipe (best: packet `parity-sf-sp-v9`, objects `…-v9-hsaco-final`)
 
 Checked in as `scripts/glm53_mxfp4_mi350x.sh overlay|emit|objects|assets|validate` (the env below).
-Inputs outside the repo: Quark checkpoint, prepped dir from `scripts/glm53_prep_quark.py`, FP8-original
-checkpoint + its derived MLA TP8 dir (`scripts/glm53_mxfp4_overlay.py` byte-checks kv_b/q_b against them).
+Inputs outside the repo (downloads + checked-in prep): Quark checkpoint
+`amd/GLM-5.3-MXFP4-AttnFP8` (rev 4992911b); prepped dir from `scripts/glm53_prep_quark.py`;
+FP8-original `zai-org/GLM-5.3-FP8` (aca966e4) + its derived MLA TP8 dir from
+`scripts/glm52_prep_fp8_linear.py --mla-tp 8`; `scripts/glm53_mxfp4_overlay.py` byte-checks kv_b/q_b
+against them. Full chain on a fresh machine (inside `nix develop`, after `cargo build --release`):
+
+    scripts/glm53_mxfp4_mi350x.sh overlay CKPT            # GLM_RECIPE=dsa adds --dsa sidecars
+    scripts/glm53_mxfp4_mi350x.sh emit PKT                # plowc flags + emit env (GLM_RECIPE=dsa)
+    scripts/glm53_mxfp4_mi350x.sh objects PKT OBJ         # build_gfx950.sh env -> .co / .elf
+    scripts/glm53_mxfp4_mi350x.sh assets PKT CKPT ASSETS
+    python3 scripts/bench/gpuq.py submit scripts/glm53_mxfp4_mi350x.sh validate PKT OBJ CKPT ASSETS OUT
+
+plowc flags: `--hf-dir <prepped> --gpu mi350 --arch gfx950 --num-gpus 8 --n-cu 256 --max-ctx 16384
+--batch 128 --seq 128,512,1024,2048,4096,8192,16384`. plowrt env: `PLOW_PREFIX_CACHE=0
+PLOW_AMD_DECODE_MIN_RUNG=1 PLOW_TP_NO_AUDIT=0 PLOW_TP_AGREE_EVERY=1`.
 Re-check 2026-09-25: `emit` reproduces v9 byte-identical (sha16 3b8b96fd6339691d); `overlay` reproduces
 every sidecar byte-identical and every symlink target; `objects` reproduces every interpreter .co
 byte-identical and every lean ELF with identical disassembly (a metadata note differs).
@@ -102,6 +115,24 @@ merge unroll (-9%), decode shared fold (-6% M8, -16% M64), kw decode GLU (-5..-1
 
 Logits vs vLLM oracle (last prompt position, T1024–T8192): top-1 match 4/4, KL(vLLM||plow)
 8.5e-5 / 6e-6 / 2.7e-7 / 2.8e-8 (MHA form). Smoke "capital of France" -> " Paris".
+
+## DSA sparse attention (GLM_RECIPE=dsa, packet dsa-v1 sha16 fbdd65b0b3da7bf6)
+
+Emit adds `PLOW_GLM_DSA=topk PLOW_GLM_DSA_PF=1 PLOW_GLM_DSA_PF_SPAN=3 PLOW_GLM_FUSE_ROPE=0`; buckets
+<= 2048 keep MHA (exact dense = top-k identity), >= 4096 run indexer -> top-2048 -> absorbed gather.
+Objects pick up `PLOW_DSA_PF_ARM=1 PLOW_DSA_DECODE_BATCH=1` from the packet config. Overlay `--dsa`.
+dsa-v1 (interpreter BF16 indexer, V2 gather flash): top-1 == vLLM oracle 4/4; T8192 logit cos 0.977
+vs dense 0.957 (vLLM runs DSA). Prefill 1k/2k/4k/8k/16k 139/163/340/632/1289 ms vs dense
+141/165/232/389/736. Decode ctx1k M1/M8/M64 51.1/67.5/220.7 vs 38.4/53.5/117.4.
+T8192 trace (ms, 78 layers): sparse FlashMlaPrefill 190 (dense MHA 39), HeadNormRope 30, IndexSelectPf
+29, IndexScorePf 20, MlaBmmFp8 x2 21, FlashMerge 8. T16384: flash 498 (MHA 153), score 76, select 74.
+Bug: at T=16384 the last 8 selection rows are all zeros.
+
+Selection structure (real iidx_pf dump, 118-distinct-token prompt): union of B adjacent queries' top-2048
+vs dense causal pairs — 8k: B1 0.43x, B2 0.49, B4 0.57, B8 0.66, B64 0.91, B128 0.99; 16k: 0.23, 0.28,
+0.34, 0.42, 0.76, 0.93. 64-key block skipping saves nothing (0.96-1.00x): selections are scattered.
+So only the absorbed per-pack gather cuts work; absorbed costs 2.125x the MACs/pair of the MHA form, so
+at 8k ideal sparse ~= dense MHA and the win must come from kernel efficiency; 16k has ~2x headroom.
 
 ## Negatives (do not re-try blind)
 - MoE stage-1 wide tile (128 rows, A+B via LDS): bit-exact but 423 -> 501 us at T8192.

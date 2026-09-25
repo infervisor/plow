@@ -8,6 +8,7 @@
 #   scripts/glm53_mxfp4_mi350x.sh validate PKT OBJ CKPT ASSETS OUT   # 8 GPUs, submit through gpuq:
 #     python3 scripts/bench/gpuq.py submit scripts/glm53_mxfp4_mi350x.sh validate ...
 #
+# GLM_RECIPE=dsa: DSA sparse attention (vLLM's top-2048 indexer; overlay needs --dsa).
 # GLM_EMIT_EXTRA / GLM_OBJ_EXTRA="K=V ..." override the recipe env (later assignment wins).
 # v9 (2026-09-25): packet sha16 3b8b96fd6339691d; prefill 1k/8k/16k 140/388/736 ms,
 # decode M1 37.7 ms/token, M128 177.9 ms/step; top-1 == vLLM 0.29 oracle T1024..T8192.
@@ -26,6 +27,9 @@ EMIT_ENV=(
   PLOW_GLM_SEQ_PAR=1 PLOW_GLM_SEQ_PAR_PROJ=1 GLM_GROUP=1 PLOW_GLM_FUSE_B1=1 GLM_FUSE_XRN=1
   PLOW_GLM_FUSE_ROPE=1 PLOW_GLM_DECODE_NORM_ROWS=1 GLM_SPINE_CUS=64 PLOW_GLM_DECODE_GLUE_CUS=1
 )
+if [ "${GLM_RECIPE:-dense}" = dsa ]; then
+  EMIT_ENV+=(PLOW_GLM_DSA=topk PLOW_GLM_DSA_PF=1 PLOW_GLM_DSA_PF_SPAN=3 PLOW_GLM_FUSE_ROPE=0)
+fi
 OBJ_ENV=(
   PLOW_MXFP4=1 PLOW_MOE_PREFILL=1 PLOW_MOE_PF_A4W4=1 PLOW_MLA_PF_TR16=1 PLOW_DECODE_BATCH=128
   PLOW_GEMV_MM=8 PLOW_GEMV_WALK=1 PLOW_MOE_PF_DOWN_SWEEP=1 PLOW_MLA_FOLD_MFMA=1 PLOW_MOE_PF_A4W4_BK=256
@@ -40,7 +44,8 @@ RUN_ENV=(PLOW_PREFIX_CACHE=0 PLOW_AMD_DECODE_MIN_RUNG=1 PLOW_TP_NO_AUDIT=0 PLOW_
 cmd="${1:-}"; shift || true
 case "$cmd" in
 overlay)
-  python3 "$WT/scripts/glm53_mxfp4_overlay.py" "$1" ;;
+  dsa=(); [ "${GLM_RECIPE:-dense}" = dsa ] && dsa=(--dsa)
+  python3 "$WT/scripts/glm53_mxfp4_overlay.py" "$1" "${dsa[@]}" ;;
 emit)
   out="$1"; mkdir -p "$(dirname "$out")"
   env "${EMIT_ENV[@]}" ${GLM_EMIT_EXTRA:-} PLOW_VERIFY_BIN="${PLOW_VERIFY_BIN:-$WT/lean-plow/.lake/build/bin/plow_verify}" \
