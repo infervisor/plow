@@ -324,3 +324,66 @@ deficit -- it comes from what surrounds the layers.
 One reporting caveat: block_compare prints `plow device=?` because sweep.json records no device
 string. Both halves ran on this host's single H100 under gpulease in the same script invocation,
 so they are the same card; the `?` is a missing field, not an unknown machine.
+
+## 8. The 2176 prefill rung: root cause of the incomplete Gemm segment set (#65)
+
+The 1k/2k/4k/8k/16k ladder needs a rung that covers a 2048-token prompt. The server re-tokenises
+and prepends BOS, so that prompt is 2049 rows; with rungs `[..., 2048, 4096, ...]` it pads 2049 ->
+4096 and the 2k cell reads as an artificial plow loss. The recipe already appends 256 / 1152 / 4224
+(= 128/1024/4096 + 128) for exactly this reason and simply has no 2048+128.
+
+Appending 2176 via `PLOW_PF_LADDER_APPEND` produced a **structurally incomplete rung**:
+
+```
+t=2176   segments=333   DIFFERS      (modal 418)
+    Gemm: has 121, modal 206
+```
+
+### Root cause
+
+`plow_asset::segment_roles::CUBLASLT_PREFILL_WIDE_ROWS` is a **hardcoded M allowlist**:
+
+```rust
+pub const CUBLASLT_PREFILL_WIDE_ROWS: [u32; 12] =
+    [1024, 1088, 1152, 2048, 4096, 4160, 4224, 8192, 8320, 12288, 12416, 16384];
+```
+
+`cublaslt_prefill_bf16(profile, m, n, k)` requires `m` to be in that list (or the narrow
+`CUBLASLT_PREFILL_ROWS`), and `dense_cublaslt::prefill_eligible` consults it for every op. 2176 was
+absent, so **every projection at that rung failed eligibility and reverted to the native GEMM
+object** -- exactly the 206 -> 121 Gemm drop. The array's own doc comment already records this
+failure mode for the three rungs added before it: *"1088 / 1152 / 4160 are fine-grained rungs
+(`PLOW_PF_LADDER_APPEND`): BOS makes an N-token prompt N+1 rows. Left out, such a rung ran every
+projection on the native GEMM object."*
+
+Fix: add 2176 to the allowlist. One row, same provenance as 1152 and 4224.
+
+### The Lt algo table was a symptom, not the cause
+
+The first diagnosis looked at the packet's `cublaslt_algos.jsonl` and found no M=2176 row, which
+suggested a GPU re-probe was needed. That reasoning is **circular**:
+
+```rust
+// packetize_algo_table
+for op in &model.progs[index].insts {
+    if prefill_eligible(model, op, rows, profile) { shapes.insert((op.i[0], op.i[1], op.i[2])); }
+}
+```
+
+The table's shape set is collected *from* `prefill_eligible`. A rung with no Lt segments can never
+contribute a row, so the missing row is downstream of the allowlist. `campaign.py probe` writes the
+table from what the packet *loads*, so probing before the allowlist fix could not have produced a
+2176 row either.
+
+And a missing row does not disable the route. `device::cuda::lt::Lt::plan` pins a stored algorithm
+when it has one and otherwise falls through to `cublasLtMatmulAlgoGetHeuristic` plus load-time
+timing -- *"which is exactly what produced the table."* So the allowlist fix alone makes the rung
+whole; a probe afterwards only upgrades 2176 from a heuristic pick to a measured one. That probe is
+worth running because the 2k cell's TTFT is the number under test, and it is only now non-circular.
+
+### Correction to the gate
+
+`lad_verify.py` also refused on `missing=[8192]`. That requirement was wrong: with
+`PLOW_MAX_CHUNK=4096` an 8192- or 15000-token prompt is prefilled in chunks of <=4096 rows, so the
+8k/16k ladder cells ride the <=4224 rungs -- which is how the shipped recipe has always benched
+them. The rung set the ladder actually needs is `{256, 1152, 2176, 4224}`.
