@@ -109,6 +109,11 @@ case "${PLOW_MOE_PF_DOWN_SWEEP:-0}" in
   1) A4W4_BK="$A4W4_BK -DPLOW_MOE_PF_DOWN_SWEEP=1" ;;
   *) echo "PLOW_MOE_PF_DOWN_SWEEP must be 0 or 1" >&2; exit 2 ;;
 esac
+case "${PLOW_MOE_ALIGN_WAVES:-0}" in
+  0) ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_MOE_ALIGN_WAVES=1" ;;
+  *) echo "PLOW_MOE_ALIGN_WAVES must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_MOE_DOWN_SWEEP_LINE:-0}" in
   0) ;;
   1) A4W4_BK="$A4W4_BK -DPLOW_MOE_DOWN_SWEEP_LINE=1" ;;

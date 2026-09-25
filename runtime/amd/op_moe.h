@@ -2413,6 +2413,9 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
 #ifndef PLOW_MOE_ALIGN_PAR_PREFIX
 #define PLOW_MOE_ALIGN_PAR_PREFIX 0
 #endif
+#ifndef PLOW_MOE_ALIGN_WAVES
+#define PLOW_MOE_ALIGN_WAVES 0
+#endif
 __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* row_token,
                                unsigned* row_partidx, float* row_gate, unsigned T, unsigned n_exp,
                                unsigned k, unsigned slice, unsigned* lds, unsigned phase = 0,
@@ -2456,12 +2459,28 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
             unsigned thread_tiles = 0;
             for (unsigned e = begin; e < end; e++) {
                 unsigned total = 0;
+#if PLOW_MOE_ALIGN_WAVES
+                /* 16 partition counts in flight per round instead of one load-store pair. */
+                for (unsigned b0 = 0; b0 < npart; b0 += 16u) {
+                    unsigned cnt16[16];
+#pragma unroll
+                    for (unsigned i = 0; i < 16; i++)
+                        cnt16[i] = b0 + i < npart ? partial[(size_t)(b0 + i) * n_exp + e] : 0u;
+#pragma unroll
+                    for (unsigned i = 0; i < 16; i++)
+                        if (b0 + i < npart) {
+                            partial[(size_t)(b0 + i) * n_exp + e] = total;
+                            total += cnt16[i];
+                        }
+                }
+#else
                 for (unsigned b = 0; b < npart; b++) {
                     const size_t at = (size_t)b * n_exp + e;
                     const unsigned count = partial[at];
                     partial[at] = total;
                     total += count;
                 }
+#endif
                 mcnt[e] = (int)total;
                 thread_tiles += (total + MPF_BM - 1u) / MPF_BM;
             }
@@ -2495,6 +2514,63 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
         }
 
         if (phase == 4) {
+#if PLOW_MOE_ALIGN_WAVES
+            /* Every wave of the workgroup takes a run of whole 64-slot steps of this slice (the
+             * single-wave loop below walked all of them serially, ~0.1 ms at T=8192). Per-wave
+             * expert counts in LDS give each wave its starting row per expert: wave w's rows go
+             * after waves < w, and within a wave the step/lane order is the loop's, so the row
+             * arrays are identical to the single-wave form. */
+            {
+                constexpr unsigned NW = PLOW_THREADS / PLOW_WAVE;
+                const unsigned wv = tid / PLOW_WAVE, lane = tid % PLOW_WAVE;
+                const unsigned first = (unsigned)(((unsigned long long)nslot * slice) / npart);
+                const unsigned last = (unsigned)(((unsigned long long)nslot * (slice + 1u)) / npart);
+                const unsigned steps = (last - first + PLOW_WAVE - 1u) / PLOW_WAVE;
+                const unsigned per = (steps + NW - 1u) / NW;
+                const unsigned w0 = first + wv * per * PLOW_WAVE;
+                const unsigned w1 = min(last, w0 + per * PLOW_WAVE);
+                unsigned* wc = lds; /* [NW][n_exp] */
+                for (unsigned i = tid; i < NW * n_exp; i += PLOW_THREADS) wc[i] = 0u;
+                __syncthreads();
+                for (unsigned base = w0; base < w1; base += PLOW_WAVE) {
+                    const unsigned s = base + lane;
+                    const unsigned e = s < w1 ? (synth ? 0u : moe_slot_expert(table, s)) : ~0u;
+                    const unsigned long long peers = __match_any(e);
+                    if (lane == (unsigned)__builtin_ctzll(peers) && e < n_exp)
+                        wc[wv * n_exp + e] += __builtin_popcountll(peers);
+                }
+                __syncthreads();
+                for (unsigned e = tid; e < n_exp; e += PLOW_THREADS) {
+                    unsigned run = (unsigned)rowoff[e] + partial[(size_t)slice * n_exp + e];
+                    for (unsigned w = 0; w < NW; w++) {
+                        const unsigned c = wc[w * n_exp + e];
+                        wc[w * n_exp + e] = run;
+                        run += c;
+                    }
+                }
+                __syncthreads();
+                for (unsigned base = w0; base < w1; base += PLOW_WAVE) {
+                    const unsigned s = base + lane;
+                    const unsigned e = s < w1 ? (synth ? 0u : moe_slot_expert(table, s)) : ~0u;
+                    const unsigned long long peers = __match_any(e);
+                    const unsigned leader = __builtin_ctzll(peers);
+                    const unsigned rank = __builtin_popcountll(peers & ((1ull << lane) - 1ull));
+                    unsigned pos0 = 0;
+                    if (lane == leader && e < n_exp) {
+                        pos0 = wc[wv * n_exp + e];
+                        wc[wv * n_exp + e] = pos0 + __builtin_popcountll(peers);
+                    }
+                    pos0 = __shfl(pos0, leader, PLOW_WAVE);
+                    if (e < n_exp) {
+                        const unsigned pos = pos0 + rank;
+                        row_token[pos] = s / k;
+                        row_partidx[pos] = s;
+                        row_gate[pos] = synth ? 1.0f : moe_slot_gate(table, s);
+                    }
+                }
+                return;
+            }
+#endif
             if (tid >= PLOW_WAVE) return;
             const unsigned lane = tid;
             const unsigned first = (unsigned)(((unsigned long long)nslot * slice) / npart);
