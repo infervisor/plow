@@ -806,3 +806,33 @@ ships **no role_files** (packed prefill is unavailable under fp8), so the fp8 bl
 object set from the bf16 block, which does build its role objects from the packet. The comparison is
 therefore fp8-as-deployed vs bf16-as-deployed, which is the decision-relevant one, not a
 single-variable kernel A/B.
+
+## 14. r3 (branch gemma4-fp8-beat-vllm-r3): FP8 decode fixed and moved to the tensor cores
+
+§13's "batch-independent defect" was the decode-ladder validator: FP8 MoE ops were missing from
+the Gemma MoE normalization arm in `decode_rung.rs`, validation failed and EVERY step silently ran
+the widest (B=16) program. Fix 79b95783: 26B FP8 B=1 29.75 -> 4.83 ms/step.
+
+step_bench ctx 1024, ms/step (paired, 2 reps, sd < 0.05):
+
+| model | B | ladder fix | +lane-split down / dedup GLU | +TC dense GEMV | +TC MoE (per-slot) |
+|---|---|---|---|---|---|
+| 26B | 1 | 4.83 | 4.85 | 4.85 | **4.49** |
+| 26B | 4 | 10.3 | 9.2 | 8.06 | **6.65** |
+| 26B | 8 | — | 11.9 | 11.85 | **8.76** |
+| 26B | 16 | 32.0 | 22.6 | 19.0 | **14.61** |
+| 12B | 1 | 8.76 | — | **8.25** | — |
+| 12B | 4 | 16.53 | — | **8.73** | — |
+| 12B | 16 | 35.2 | — | **10.86** | — |
+
+* TC = `op_gemv_fp8_tc.cuh`: mma.sync m16n8k16 bf16, e4m3->f16->bf16 exact, K permuted inside a
+  64-chunk so each lane's weight load is one 16 B vector. The FFMA dequant walk was
+  instruction-bound from M=2 on. WGMMA GEMV has a ~15 ms floor at small M (not viable).
+* The MoE per-slot FFMA walk was latency-bound (~2 KB in flight per warp; B=4 MoE 1.8x its byte
+  floor). The TC MoE walk: item = (slot, 16 rows), M=1 per mma.
+* 12B B=1 anatomy (block-0 trace): GLU body ~2.7 TB/s, single-matrix GEMVs (qkv/o/down) only
+  ~1.67 TB/s (~1.1 ms/step of headroom); gate waits 20% (~1.6 ms); bf16 lm_head 0.66 ms.
+* Claim-ahead L2 prefetch for the TC walk (`PLOW_FP8TC_PF`): -0.11 ms at B=1 (32 KiB), flat B=4.
+
+vLLM 0.28 FP8 (PTPC hub checkpoints) TPOT, prefix 0: 12B C1 7.28-7.39, C4 7.35-13.37;
+26B C1 5.11-5.18, C4 5.91-9.10 (128..15000 in-len).

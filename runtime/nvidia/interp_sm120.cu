@@ -2588,7 +2588,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                     (const unsigned char*)TEN(2) + (size_t)soff * 8u,
                                     (const unsigned long long*)TEN(3),
                                     (const unsigned long long*)TEN(4), in->i[0], in->i[1],
-                                    in->i[2], in->i[3], slice, nblk, PLOW_NROW(in->i[5]));
+                                    in->i[2], in->i[3], slice, nblk, PLOW_NROW(in->i[5]),
+                                    (float*)arena);
         break;
     }
 #endif
@@ -3033,6 +3034,27 @@ __device__ __forceinline__ void plow_gemv_prefetch(const PlowDevInst* in, void* 
     }
 }
 #endif
+#if PLOW_FP8TC_PF && PLOW_NV_FP8_DECODE_TC_ACTIVE
+__device__ __forceinline__ void plow_fp8tc_prefetch(const PlowDevInst* in, void* const* T,
+                                                    unsigned slice, unsigned nblk) {
+    auto W = [&](int k) { return (const uint8_t*)T[in->t[k]]; };
+    switch (in->op) {
+#if PLOW_HAS_GEMV_FP8
+    case PLOW_DOP_GEMV_FP8:
+        if (gemv_fp8_tc_supported(in->i[0], in->i[2])) fp8tc_pf(W(2), nullptr, in->i[1], in->i[2], slice, nblk);
+        break;
+#endif
+#if PLOW_HAS_GEMV_GLU_FP8
+    case PLOW_DOP_GEMV_GLU_FP8:
+        if (gemv_fp8_tc_supported(in->i[0], in->i[2]) && in->i[5] == PLOW_ACT_GELU_TANH_)
+            fp8tc_pf(W(2), W(5), in->i[1], in->i[2], slice, nblk);
+        break;
+#endif
+    default:
+        break;
+    }
+}
+#endif
 /* Backoff inside the counter-gate poll. 64 ns is the shipped value; 0 spins flat out. */
 #ifndef PLOW_NV_GATE_SLEEP
 #define PLOW_NV_GATE_SLEEP 64
@@ -3185,6 +3207,9 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 
 #if PLOW_GEMV_PREFETCH && !PLOW_NV_PREFILL && PLOW_NV_GEMV_MMA
         if (wait_len) plow_gemv_prefetch(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
+#endif
+#if PLOW_FP8TC_PF && PLOW_NV_FP8_DECODE_TC_ACTIVE
+        if (wait_len) plow_fp8tc_prefetch(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
 #endif
 #if PLOW_NV_TRACE
         const bool tr = (blockIdx.x == 0 && threadIdx.x == 0 && g_tr_n < PLOW_TRACE_MAX);

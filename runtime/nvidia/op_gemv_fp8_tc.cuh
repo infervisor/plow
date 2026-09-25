@@ -24,6 +24,13 @@
 #ifndef PLOW_FP8TC_U1
 #define PLOW_FP8TC_U1 4 /* single matrix */
 #endif
+/* Issue the x loads (L2 hits) with the weight loads instead of one chunk at a time in the MMA
+ * loop, where each waits out an L2 round trip. 1 = one-group tiles (M <= 8), 2 = all, 0 = off.
+ * ms/step off -> 1: 12B B=1 8.25 -> 7.25, B=4 8.73 -> 7.61; 26B B=1 4.49 -> 4.31, B=16
+ * 14.59 -> 13.57. Two-group tiles lose (12B B=16 10.86 -> 10.99: the x registers double). */
+#ifndef PLOW_FP8TC_XHOIST
+#define PLOW_FP8TC_XHOIST 1
+#endif
 #define PLOW_FP8TC_ARENA_BYTES (PLOW_NV_WARPS * 32u * 16u * 4u)
 
 __device__ __forceinline__ unsigned fp8tc_bf16x2(unsigned short two) {
@@ -74,6 +81,106 @@ __device__ __forceinline__ void fp8tc_chunk(float (&cg)[NG][4], float (&cu)[NG][
     }
 }
 
+/* One warp's share of a 16-row tile: 64-wide K chunks my_k, my_k + ks, ... accumulated into
+ * cg (and cu). wa/wb (ua/ub) point at rows g and g+8 already offset by t*16; xr[q] at token
+ * q*8+g offset by t*16. Cs streams the weights (evict-first); the MoE walk keeps them in L2 for
+ * slots that share an expert. */
+template <int NG, bool Glu, int U, bool Cs>
+__device__ __forceinline__ void fp8tc_tile(float (&cg)[NG][4], float (&cu)[NG][4], const uint8_t* wa,
+                                           const uint8_t* wb, const uint8_t* ua, const uint8_t* ub,
+                                           bool va, bool vb, const __nv_bfloat16* const (&xr)[NG],
+                                           const bool (&vx)[NG], unsigned nchunk, unsigned my_k,
+                                           unsigned ks) {
+    constexpr bool XH = PLOW_FP8TC_XHOIST >= (NG == 1 ? 1 : 2);
+    constexpr int UX = XH ? U : 1;
+    for (unsigned c0 = my_k; c0 < nchunk; c0 += ks * U) {
+        uint4 w0[U], w1[U], v0[U], v1[U];
+        uint4 xa[UX][NG], xb[UX][NG];
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            const unsigned c = c0 + (unsigned)u * ks;
+            const bool in = c < nchunk;
+            const size_t off = (size_t)c * 64u;
+            const uint4 z = make_uint4(0, 0, 0, 0);
+            if constexpr (XH) {
+#pragma unroll
+                for (int q = 0; q < NG; q++) {
+                    xa[u][q] = (in && vx[q]) ? *(const uint4*)(xr[q] + off) : z;
+                    xb[u][q] = (in && vx[q]) ? *(const uint4*)(xr[q] + off + 8u) : z;
+                }
+            }
+            if constexpr (Cs) {
+                w0[u] = (in && va) ? __ldcs((const uint4*)(wa + off)) : z;
+                w1[u] = (in && vb) ? __ldcs((const uint4*)(wb + off)) : z;
+            } else {
+                w0[u] = (in && va) ? *(const uint4*)(wa + off) : z;
+                w1[u] = (in && vb) ? *(const uint4*)(wb + off) : z;
+            }
+            if constexpr (Glu) {
+                if constexpr (Cs) {
+                    v0[u] = (in && va) ? __ldcs((const uint4*)(ua + off)) : z;
+                    v1[u] = (in && vb) ? __ldcs((const uint4*)(ub + off)) : z;
+                } else {
+                    v0[u] = (in && va) ? *(const uint4*)(ua + off) : z;
+                    v1[u] = (in && vb) ? *(const uint4*)(ub + off) : z;
+                }
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            const unsigned c = c0 + (unsigned)u * ks;
+            if (c >= nchunk) break;
+            if constexpr (!XH) {
+#pragma unroll
+                for (int q = 0; q < NG; q++) {
+                    xa[0][q] = vx[q] ? *(const uint4*)(xr[q] + (size_t)c * 64u) : make_uint4(0, 0, 0, 0);
+                    xb[0][q] = vx[q] ? *(const uint4*)(xr[q] + (size_t)c * 64u + 8u) : make_uint4(0, 0, 0, 0);
+                }
+            }
+            fp8tc_chunk<NG, Glu>(cg, cu, w0[u], w1[u], v0[u], v1[u], xa[XH ? u : 0], xb[XH ? u : 0]);
+        }
+    }
+}
+
+/* K-split partials of warps my_k > 0 -> arena; my_k == 0 adds them in k order (deterministic).
+ * Block-uniform call. */
+template <int NG, bool Glu>
+__device__ __forceinline__ void fp8tc_reduce(float (&cg)[NG][4], float (&cu)[NG][4], float* red,
+                                             bool active, unsigned warp, unsigned lane, unsigned my_k,
+                                             unsigned ks) {
+    if (active && my_k > 0u) {
+#pragma unroll
+        for (int q = 0; q < NG; q++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                red[((warp * 32u + lane) * NG + q) * 8u + i] = cg[q][i];
+                if constexpr (Glu) red[((warp * 32u + lane) * NG + q) * 8u + 4 + i] = cu[q][i];
+            }
+    }
+    __syncthreads();
+    if (active && my_k == 0u) {
+        for (unsigned j = 1; j < ks; j++) {
+            const unsigned src = warp + j;
+#pragma unroll
+            for (int q = 0; q < NG; q++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    cg[q][i] += red[((src * 32u + lane) * NG + q) * 8u + i];
+                    if constexpr (Glu) cu[q][i] += red[((src * 32u + lane) * NG + q) * 8u + 4 + i];
+                }
+        }
+    }
+    __syncthreads();
+}
+
+/* Warps split K when the CTA owns fewer 16-row tiles than warps: ks = largest power of two with
+ * ntile * ks <= nw. */
+__device__ __forceinline__ unsigned fp8tc_ksplit(unsigned ntile, unsigned nw) {
+    unsigned ks = 1u;
+    while (ks * 2u <= nw && ntile * ks * 2u <= nw) ks *= 2u;
+    return ks;
+}
+
 /* C[m][n] = scale[n] * dot(x[m], W[n]) (Glu: gelu(g)*u), M <= 8*NG, K % 64 == 0. */
 template <int NG, bool Glu>
 static __device__ void d_gemv_fp8_tc(__nv_bfloat16* C, const __nv_bfloat16* x, const uint8_t* W,
@@ -85,8 +192,7 @@ static __device__ void d_gemv_fp8_tc(__nv_bfloat16* C, const __nv_bfloat16* x, c
     const unsigned per = (N + nblk - 1u) / nblk;
     const unsigned n0 = slice * per, n1 = min(n0 + per, N);
     const unsigned ntile = n1 > n0 ? (n1 - n0 + 15u) / 16u : 0u;
-    unsigned ks = 1u;
-    while (ks * 2u <= nw && ntile * ks * 2u <= nw) ks *= 2u;
+    const unsigned ks = fp8tc_ksplit(ntile, nw);
     const unsigned tiles_per_round = nw / ks;
     const unsigned nchunk = K / 64u;
     const unsigned my_tile = warp / ks, my_k = warp % ks;
@@ -111,60 +217,9 @@ static __device__ void d_gemv_fp8_tc(__nv_bfloat16* C, const __nv_bfloat16* x, c
                 vx[q] = m < M;
                 xr[q] = x + (size_t)(vx[q] ? m : 0u) * K + t * 16u;
             }
-            for (unsigned c0 = my_k; c0 < nchunk; c0 += ks * U) {
-                uint4 w0[U], w1[U], v0[U], v1[U];
-#pragma unroll
-                for (int u = 0; u < U; u++) {
-                    const unsigned c = c0 + (unsigned)u * ks;
-                    const bool in = c < nchunk;
-                    const size_t off = (size_t)c * 64u;
-                    w0[u] = (in && va) ? __ldcs((const uint4*)(wa + off)) : make_uint4(0, 0, 0, 0);
-                    w1[u] = (in && vb) ? __ldcs((const uint4*)(wb + off)) : make_uint4(0, 0, 0, 0);
-                    if constexpr (Glu) {
-                        v0[u] = (in && va) ? __ldcs((const uint4*)(ua + off)) : make_uint4(0, 0, 0, 0);
-                        v1[u] = (in && vb) ? __ldcs((const uint4*)(ub + off)) : make_uint4(0, 0, 0, 0);
-                    }
-                }
-#pragma unroll
-                for (int u = 0; u < U; u++) {
-                    const unsigned c = c0 + (unsigned)u * ks;
-                    if (c >= nchunk) break;
-                    uint4 xa[NG], xb[NG];
-#pragma unroll
-                    for (int q = 0; q < NG; q++) {
-                        xa[q] = vx[q] ? *(const uint4*)(xr[q] + (size_t)c * 64u) : make_uint4(0, 0, 0, 0);
-                        xb[q] = vx[q] ? *(const uint4*)(xr[q] + (size_t)c * 64u + 8u) : make_uint4(0, 0, 0, 0);
-                    }
-                    fp8tc_chunk<NG, Glu>(cg, cu, w0[u], w1[u], v0[u], v1[u], xa, xb);
-                }
-            }
+            fp8tc_tile<NG, Glu, U, true>(cg, cu, wa, wb, ua, ub, va, vb, xr, vx, nchunk, my_k, ks);
         }
-        if (ks > 1u) {
-            /* partials of warps my_k > 0 -> arena; my_k == 0 adds them in k order */
-            if (active && my_k > 0u) {
-#pragma unroll
-                for (int q = 0; q < NG; q++)
-#pragma unroll
-                    for (int i = 0; i < 4; i++) {
-                        red[((warp * 32u + lane) * NG + q) * 8u + i] = cg[q][i];
-                        if constexpr (Glu) red[((warp * 32u + lane) * NG + q) * 8u + 4 + i] = cu[q][i];
-                    }
-            }
-            __syncthreads();
-            if (active && my_k == 0u) {
-                for (unsigned j = 1; j < ks; j++) {
-                    const unsigned src = warp + j;
-#pragma unroll
-                    for (int q = 0; q < NG; q++)
-#pragma unroll
-                        for (int i = 0; i < 4; i++) {
-                            cg[q][i] += red[((src * 32u + lane) * NG + q) * 8u + i];
-                            if constexpr (Glu) cu[q][i] += red[((src * 32u + lane) * NG + q) * 8u + 4 + i];
-                        }
-                }
-            }
-            __syncthreads();
-        }
+        if (ks > 1u) fp8tc_reduce<NG, Glu>(cg, cu, red, active, warp, lane, my_k, ks);
         if (active && my_k == 0u) {
 #pragma unroll
             for (int q = 0; q < NG; q++)
@@ -181,3 +236,29 @@ static __device__ void d_gemv_fp8_tc(__nv_bfloat16* C, const __nv_bfloat16* x, c
         }
     }
 }
+
+/* Claim-ahead L2 prefetch (the FP8 twin of PLOW_GEMV_PREFETCH): issued between claim and gate, it
+ * asks L2 for the head of every row the first round of the walk above starts on, so HBM works
+ * while the block waits on the previous op's tail. Bytes per CTA; 0 = off. Hints only. */
+#ifndef PLOW_FP8TC_PF
+#define PLOW_FP8TC_PF 0
+#endif
+#if PLOW_FP8TC_PF
+__device__ __forceinline__ void fp8tc_pf(const uint8_t* W, const uint8_t* Wu, unsigned N, unsigned K,
+                                         unsigned slice, unsigned nblk) {
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned n0 = slice * per, n1 = min(n0 + per, N);
+    if (n1 <= n0) return;
+    const unsigned nw = blockDim.x >> 5;
+    const unsigned ks = fp8tc_ksplit((n1 - n0 + 15u) / 16u, nw);
+    const unsigned rows = min(n1 - n0, (nw / ks) * 16u), mats = Wu ? 2u : 1u;
+    unsigned b = PLOW_FP8TC_PF / (rows * mats);
+    if (b > K) b = K;
+    b &= ~127u;
+    if (!b) return;
+    for (unsigned p = threadIdx.x; p < rows * mats; p += blockDim.x) {
+        const uint8_t* r = (p < rows ? W : Wu) + (size_t)(n0 + p % rows) * K;
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(r), "r"(b) : "memory");
+    }
+}
+#endif

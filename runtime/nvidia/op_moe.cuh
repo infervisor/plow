@@ -1542,7 +1542,8 @@ __shared__ unsigned plow_dd_nu, plow_dd_ng;
 /* Fills uexp[0..nu) (ascending expert id), uofs[0..nu] and the grouped slot list; slots with no
  * valid expert sit at [uofs[nu], nslot). Every thread of the block must call it. */
 __device__ __forceinline__ unsigned plow_dd_build(const unsigned char* table,
-                                                  unsigned nslot, unsigned n_exp) {
+                                                  unsigned nslot, unsigned n_exp,
+                                                  unsigned gsz = PLOW_DD_G) {
     const unsigned tid = threadIdx.x, nth = blockDim.x, lane = tid & 31u;
     for (unsigned i = tid; i <= PLOW_DD_MAXE; i += nth) plow_dd_cnt[i] = 0u;
     __syncthreads();
@@ -1595,7 +1596,7 @@ __device__ __forceinline__ unsigned plow_dd_build(const unsigned char* table,
         for (unsigned t = 0; t < s; t++) r += plow_dd_bkt[t] == b;
         plow_dd_slot[plow_dd_start[b] + r] = (unsigned short)s;
     }
-    /* Work units of <= PLOW_DD_G slots of one expert: a popular expert is split so no warp (and no
+    /* Work units of <= gsz slots of one expert: a popular expert is split so no warp (and no
      * contiguous CTA range) carries ~10x the average work. */
     if (tid < 32u) {
         const unsigned nu = plow_dd_nu;
@@ -1603,7 +1604,7 @@ __device__ __forceinline__ unsigned plow_dd_build(const unsigned char* table,
         for (unsigned u0 = 0; u0 < nu; u0 += 32u) {
             const unsigned u = u0 + lane;
             const unsigned c = u < nu ? plow_dd_uofs[u + 1] - plow_dd_uofs[u] : 0u;
-            const unsigned ng = (c + PLOW_DD_G - 1u) / PLOW_DD_G;
+            const unsigned ng = (c + gsz - 1u) / gsz;
             unsigned incl = ng;
 #pragma unroll
             for (int o = 1; o < 32; o <<= 1) {
@@ -1612,9 +1613,9 @@ __device__ __forceinline__ unsigned plow_dd_build(const unsigned char* table,
             }
             unsigned g = run + incl - ng;
             for (unsigned j = 0; j < ng; j++, g++) {
-                const unsigned o = plow_dd_uofs[u] + j * PLOW_DD_G;
+                const unsigned o = plow_dd_uofs[u] + j * gsz;
                 plow_dd_gofs[g] = (unsigned short)o;
-                plow_dd_glen[g] = (unsigned char)((c - j * PLOW_DD_G) < PLOW_DD_G ? (c - j * PLOW_DD_G) : PLOW_DD_G);
+                plow_dd_glen[g] = (unsigned char)((c - j * gsz) < gsz ? (c - j * gsz) : gsz);
                 plow_dd_gexp[g] = plow_dd_uexp[u];
             }
             run += __shfl_sync(~0u, incl, 31);
@@ -1714,6 +1715,141 @@ static __device__ void d_moe_expert_glu_gemma_fp8_dd(
 
 #endif /* PLOW_MOE_FP8_DEDUP */
 
+/* Expert GLU / DOWN on the tensor cores (op_gemv_fp8_tc.cuh), one token per slot (M = 1): an item
+ * is (slot, 16 output rows), a CTA owns a contiguous item range and its warps split K when it owns
+ * fewer items than warps. The per-slot FFMA walk keeps ~2 KB in flight per warp and is
+ * latency-bound (B=4 MoE ~1.8x its byte floor); here a warp holds 16 rows x U chunks. Glu:
+ * fu[slot][n] = gelu(g)*u, n < I_moe, K = H. Down: part[slot][h] = gate*(dot*sc), K = I_moe.
+ * Numerically equivalent to the FFMA walk, not bit-equal. 0 = off. 26B ms/step vs the FFMA walk:
+ * B=1 4.85 -> 4.49, B=4 8.06 -> 6.65, B=16 19.03 -> 14.61. */
+#ifndef PLOW_MOE_FP8_TC
+#define PLOW_MOE_FP8_TC 1
+#endif
+#if PLOW_MOE_FP8_TC && PLOW_NV_FP8_DECODE_TC_ACTIVE
+#define PLOW_MOE_FP8_TC_ACTIVE 1
+__device__ __forceinline__ bool plow_moe_tc_ok(unsigned N, unsigned K) {
+    return !(N % 16u) && K && !(K % 64u) && blockDim.x == 256;
+}
+/* Dd: an item's token columns are a group of <= 8 slots routed to one expert (plow_dd_build), so
+ * a shared expert streams once per group instead of once per slot. Minimum rows; 0 = off.
+ * 26B ms/step per-slot -> grouped: B=2 5.08 -> 5.23, B=4 6.65 -> 6.23, B=8 8.75 -> 7.23,
+ * B=16 14.60 -> 9.26. */
+#ifndef PLOW_MOE_FP8_TC_DD
+#define PLOW_MOE_FP8_TC_DD 4
+#endif
+/* DOWN's K (I_moe = 704 on the 26B) is only 11 chunks: at the dense depth a warp pays three
+ * exposed round trips per tile. */
+#ifndef PLOW_MOE_TC_UD
+#define PLOW_MOE_TC_UD PLOW_FP8TC_U1
+#endif
+template <bool Glu, bool Dd>
+static __device__ void d_moe_fp8_tc(void* out, const bf16* x, const unsigned char* table,
+                                    const unsigned long long* ewt, const unsigned long long* est,
+                                    unsigned k, unsigned N, unsigned K, unsigned I_moe,
+                                    unsigned n_exp, unsigned slice, unsigned nblk, unsigned nrow,
+                                    float* red) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const unsigned g = lane >> 2, t = lane & 3u;
+    const unsigned nslot = nrow * k;
+#if PLOW_MOE_FP8_DEDUP
+    const unsigned ngr = Dd ? plow_dd_build(table, nslot, n_exp, 8u) : nslot;
+#else
+    const unsigned ngr = nslot;
+#endif
+    const unsigned tpn = N / 16u, total = ngr * tpn;
+    const unsigned per = (total + nblk - 1u) / nblk;
+    const unsigned i0 = slice * per, i1 = min(i0 + per, total);
+    const unsigned ntile = i1 > i0 ? i1 - i0 : 0u;
+    const unsigned ks = fp8tc_ksplit(ntile, nw);
+    const unsigned tiles_per_round = nw / ks;
+    const unsigned nchunk = K / 64u;
+    const unsigned my_tile = warp / ks, my_k = warp % ks;
+    constexpr int U = Glu ? PLOW_FP8TC_U : PLOW_MOE_TC_UD;
+    auto slot_of = [&](unsigned gi, unsigned gofs, unsigned j) -> unsigned {
+#if PLOW_MOE_FP8_DEDUP
+        if constexpr (Dd) return plow_dd_slot[gofs + j];
+#endif
+        (void)gofs; (void)j;
+        return gi;
+    };
+#if PLOW_MOE_FP8_DEDUP
+    /* slots with no valid expert are in no group: DOWN still owes them zeros */
+    if constexpr (Dd && !Glu)
+        if (slice == 0u)
+            for (unsigned i = plow_dd_uofs[plow_dd_nu] * N + threadIdx.x; i < nslot * N; i += blockDim.x)
+                ((float*)out)[(size_t)plow_dd_slot[i / N] * N + i % N] = 0.0f;
+#endif
+    for (unsigned r0 = 0; r0 < ntile; r0 += tiles_per_round) {
+        const unsigned item = i0 + r0 + my_tile;
+        const bool active = my_tile < tiles_per_round && r0 + my_tile < ntile;
+        float cg[1][4] = {}, cu[1][4] = {};
+        unsigned gi = 0u, ra = 0u, gofs = 0u, glen = 0u;
+        bool live = false;
+        const float* sc = nullptr;
+        if (active) {
+            gi = item / tpn;
+            ra = (item - gi * tpn) * 16u + g;
+            unsigned eid;
+#if PLOW_MOE_FP8_DEDUP
+            if constexpr (Dd) {
+                eid = plow_dd_gexp[gi]; gofs = plow_dd_gofs[gi]; glen = plow_dd_glen[gi];
+            } else
+#endif
+            {
+                eid = plow_moe_slot_expert(table, gi); glen = 1u;
+            }
+            const unsigned long long wb = eid < n_exp ? ewt[(size_t)eid * 2 + (Glu ? 0 : 1)] : 0ull;
+            const unsigned long long sb = eid < n_exp ? est[(size_t)eid * 2 + (Glu ? 0 : 1)] : 0ull;
+            live = wb != 0ull && sb != 0ull;
+            sc = (const float*)(size_t)sb;
+            const uint8_t* W = (const uint8_t*)(size_t)wb;
+            const uint8_t* wa = W + (size_t)ra * K + t * 16u;
+            const uint8_t* wbp = wa + (size_t)8u * K;
+            const uint8_t* ua = Glu ? wa + (size_t)I_moe * K : nullptr;
+            const uint8_t* ub = Glu ? wbp + (size_t)I_moe * K : nullptr;
+            const unsigned xs = slot_of(gi, gofs, g < glen ? g : 0u);
+            const bf16* const xr[1] = {(Glu ? x + (size_t)(xs / k) * K : x + (size_t)xs * K) + t * 16u};
+            const bool vx[1] = {live && g < glen};
+            fp8tc_tile<1, Glu, U, false>(cg, cu, wa, wbp, ua, ub, live, live, xr, vx, nchunk, my_k, ks);
+        }
+        if (ks > 1u) fp8tc_reduce<1, Glu>(cg, cu, red, active, warp, lane, my_k, ks);
+        if (active && my_k == 0u) {
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const unsigned m = t * 2u + (i & 1u);
+                if (m >= glen) continue;
+                const unsigned slot = slot_of(gi, gofs, m);
+                const unsigned n = ra + (i >= 2 ? 8u : 0u);
+                if constexpr (Glu) {
+                    if (live)
+                        ((bf16*)out)[(size_t)slot * N + n] = __float2bfloat16(
+                            plow_moe_gelu_tanh(cg[0][i] * sc[n]) * (cu[0][i] * sc[I_moe + n]));
+                } else {
+                    ((float*)out)[(size_t)slot * N + n] =
+                        live ? plow_moe_slot_gate(table, slot) * (cg[0][i] * sc[n]) : 0.0f;
+                }
+            }
+        }
+    }
+}
+template <bool Glu>
+static __device__ void d_moe_fp8_tc_any(void* out, const bf16* x, const unsigned char* table,
+                                        const unsigned long long* ewt, const unsigned long long* est,
+                                        unsigned k, unsigned N, unsigned K, unsigned I_moe,
+                                        unsigned n_exp, unsigned slice, unsigned nblk, unsigned nrow,
+                                        float* red) {
+#if PLOW_MOE_FP8_DEDUP && PLOW_MOE_FP8_TC_DD
+    if (nrow >= PLOW_MOE_FP8_TC_DD && n_exp <= PLOW_DD_MAXE && nrow * k <= PLOW_DD_MAXS) {
+        d_moe_fp8_tc<Glu, true>(out, x, table, ewt, est, k, N, K, I_moe, n_exp, slice, nblk, nrow, red);
+        return;
+    }
+#endif
+    d_moe_fp8_tc<Glu, false>(out, x, table, ewt, est, k, N, K, I_moe, n_exp, slice, nblk, nrow, red);
+}
+#else
+#define PLOW_MOE_FP8_TC_ACTIVE 0
+#endif
+
 /* Non-arena B>1 overload (fwd decl): reads x rows from global, channel-major sweep. */
 static __device__ void d_moe_expert_glu_gemma_fp8(
         bf16* __restrict__ fu, const bf16* __restrict__ x,
@@ -1728,6 +1864,13 @@ static __device__ void d_moe_expert_glu_gemma_fp8(
         const unsigned long long* __restrict__ est, unsigned k, unsigned I_moe, unsigned H,
         unsigned n_exp, unsigned slice, unsigned nblk, unsigned nrow,
         bf16* __restrict__ arena) {
+#if PLOW_MOE_FP8_TC_ACTIVE
+    if (plow_moe_tc_ok(I_moe, H)) {
+        d_moe_fp8_tc_any<true>(fu, x, table, ewt, est, k, I_moe, H, I_moe, n_exp, slice, nblk, nrow,
+                           (float*)arena);
+        return;
+    }
+#endif
     /* B>1: staging every row would overflow the arena (bf16 twin of the bf16 body). The batched
      * rows are read straight from global (B*5.6 KB, L2-resident); the weight stream is unaffected. */
     if (nrow != 1u) {
@@ -1929,6 +2072,24 @@ static __device__ void d_moe_expert_down_gemma_fp8(
                                               Wd + (size_t)h * I_moe, I_moe, lane) * scale[h];
         if (lane == 0) pslot[h] = plow_moe_slot_gate(table, slot) * y;
     }
+}
+
+/* Interpreter overload: the arena carries the tensor-core walk's K-split partials. */
+static __device__ void d_moe_expert_down_gemma_fp8(
+        float* __restrict__ part, const bf16* __restrict__ fu,
+        const unsigned char* __restrict__ table,
+        const unsigned long long* __restrict__ ewt,
+        const unsigned long long* __restrict__ est, unsigned k, unsigned H, unsigned I_moe,
+        unsigned n_exp, unsigned slice, unsigned nblk, unsigned nrow, float* arena) {
+#if PLOW_MOE_FP8_TC_ACTIVE
+    if (plow_moe_tc_ok(H, I_moe)) {
+        d_moe_fp8_tc_any<false>(part, fu, table, ewt, est, k, H, I_moe, I_moe, n_exp, slice, nblk, nrow,
+                            arena);
+        return;
+    }
+#endif
+    (void)arena;
+    d_moe_expert_down_gemma_fp8(part, fu, table, ewt, est, k, H, I_moe, n_exp, slice, nblk, nrow);
 }
 
 /* ---- COMBINE (PLOW_DOP_MOE_COMBINE_GEMMA) — sum the k gate-scaled partials ----------------
