@@ -187,8 +187,23 @@ would cut B8 flash work to 0.86x / 0.80x. dsa-v6 in-model flash: 0.82-0.85 ms/la
 Break-even budget (attention-related ms, dense = MHA flash + kv_b + quant + k-rope): 8k dense ~55 vs
 dsa-v6 ~120 (flash ~65, indexer ~42, absorbed MlaBmm ~19); 16k dense ~176 vs ~260. Beating dense needs
 roughly 2x on the sparse flash AND 3-4x on the indexer chain; with the absorbed form's 2.125x
-MACs/pair, the crossover against plow's MHA prefill is expected beyond 16k (not measured; ladder tops
-at 16k).
+MACs/pair, the crossover against plow's MHA prefill is expected beyond 16k.
+
+Crossover probe at max-ctx 32768 (`GLM_MAX_CTX=32768 GLM_SEQ=...,32768 GLM_BATCH=64`,
+`PLOW_DECODE_BATCH_LADDER=1..64`, objects `PLOW_DECODE_BATCH=64`; 128 x 32k KV does not fit), 2 rounds:
+
+| prefill (ms) | 8k | 16k | 32k |
+|---|---|---|---|
+| DSA (preset) | 462-464 | 882 | 1892-1896 |
+| dense | 392-396 | 735-742 | 1674-1678 |
+| DSA / dense | 1.18 | 1.20 | 1.13 |
+
+16k -> 32k growth: dense +939 ms, DSA +1011 ms; subtracting the shared non-attention part (~+559),
+attention grew dense ~176 -> ~556 (the MHA kernel gets more efficient at long T) vs DSA ~260 -> ~712
+(indexer score/select/union are O(T^2) and grew ~4x; union waste grows with T). With the current BF16
+indexer DSA is not expected to cross over by 64k; the indexer chain is the binding term at long context.
+A 3-4x faster indexer (FP8 score per vLLM, fused/faster select) would put the crossover at ~24-32k.
+32k correctness not checked (no oracle at 32k).
 
 ## Negatives (do not re-try blind)
 - MoE stage-1 wide tile (128 rows, A+B via LDS): bit-exact but 423 -> 501 us at T8192.
