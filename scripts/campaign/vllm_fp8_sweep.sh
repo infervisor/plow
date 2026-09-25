@@ -17,7 +17,10 @@ export IN_LENS="${IN_LENS:-128 1024 4096 8192 15000}" OUTLEN=128
 export GATE_PROMPT=$'<bos><start_of_turn>user\nWhat is the capital of France? Answer in one short sentence.<end_of_turn>\n<start_of_turn>model\n'
 export BENCH_EXTRA_ARGS="--num-warmups 2 --seed 42"
 for m in ${MODELS:-12b 26b}; do
-  case $m in 12b) dir=$HUB/gemma-4-12b-it-fp8 ;; 26b) dir=$HUB/gemma-4-26b-a4b-it-fp8 ;; esac
+  # The 26B FP8 hub dir ships no tokenizer.json (vLLM then tokenizes the gate prompt to 2 tokens
+  # and generates nothing): FP8_26B is a symlink farm of it plus the BF16 26B tokenizer.json.
+  case $m in 12b) dir=$HUB/gemma-4-12b-it-fp8 ;;
+             26b) dir=${FP8_26B:-/opt/dlami/nvme/tmp/fp8-r3/models/gemma-4-26b-a4b-it-fp8} ;; esac
   for p in ${PREFIXES:-0 50}; do
     for prof in ${PROFILES:-rt hc}; do
       case $prof in rt) concs="1 4"; np=32 ;; hc) concs="16 32"; np=64 ;; esac

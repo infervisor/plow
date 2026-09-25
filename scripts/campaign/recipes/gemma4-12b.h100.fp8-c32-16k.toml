@@ -1,0 +1,148 @@
+# Gemma-4-12B-it, H100 SXM5, FP8 (PTPC), 32 decode slots: the C16/C32 twin of
+# gemma4-12b.h100.fp8-ladder16k.toml, identical except the decode ladder and name. C1/C4 serve
+# the 16-slot packet (the widest compiled rung taxes every step), C16/C32 this one.
+#
+# Gemma-4-12B-it, H100 SXM5, FP8 (PTPC) weights: W8A8 prefill, W8A16 decode, BF16 KV, BF16 lm_head.
+#
+# This is gemma4-12b.h100.w8a8-roles.toml widened to the SHAPE of the BF16 comparison packet
+# (gemma4-12b.h100.bf16-ladder16k.toml), so that an FP8-vs-BF16 cell differs in the weight
+# encoding and nothing else: max_ctx 16384 (not 8192), decode ladder 1..16 (not B=1 only), the
+# same fine prefill rungs, the same 16 serving slots. Without that the two packets are different
+# deployments and the delta is not a quantization result.
+#
+# NOT bit-comparable to vLLM's FP8 recipe: vLLM 0.28 `--quantization fp8` is per-tensor online
+# with dynamic per-token activations and a BF16 lm_head; this is per-output-channel (PTPC) static
+# weight scales (perf-data/tools/quantize_fp8.py) with per-row dynamic activation quant in
+# prefill and BF16 activations in decode. Report both engines' quality, not just their speed.
+#
+# THE FP8 DEFAULT TAX. `apply_production_defaults` (crates/devgen/src/lib.rs ~7556-7612) gates the
+# whole Gemma-4 Hopper production default block on `bf16`, i.e. on
+# `!fp8 && !w8a8 && !w8a16 && !mxfp4` (knob_spec LT_GLU_TARGET / GEMMA4_HOPPER). An FP8 packet
+# therefore silently ships WITHOUT six defaults the BF16 packet gets. Four of them are decode-side
+# attention/GEMV knobs that do not touch the weight encoding at all — the KV cache and the
+# attention math are BF16 either way — so they are restored explicitly below and marked with
+# [FP8-TAX]. The other two (prefill_cublaslt / no_glu_fuse, the Lt gate/up split) genuinely have
+# no FP8 equivalent: cuBLASLt is not carrying the e4m3 GLU here, so W8A8 keeps the fused
+# PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE object instead. That one is a real difference, not a tax.
+#
+# Production, inside `nix develop`:
+#   python3 scripts/campaign/campaign.py build <this> --out DIR
+#   python3 scripts/campaign/campaign.py bench <this> --assets DIR/assets --out RUN --profile realtime
+
+[cell]
+name = "gemma4-12b.h100.fp8-c32-16k"
+model = "google/gemma-4-12B-it"
+revision = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+hf_dir = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+# BF16 shards + fp8/-keyed PTPC twins (656 tensors) in one directory; plowrt scans every safetensors.
+checkpoint_dir = "/opt/dlami/nvme/tmp/plow-h100-campaign/gemma12b-w8a16/checkpoint-mixed"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "w8a8"
+
+[emit]
+args = ["--segmented"]
+[emit.env]
+PLOW_FP8 = "1"
+PLOW_W8A8 = "1"
+PLOW_EMIT_PACKED_PREFILL = "1"     # default-on only for BF16 Hopper; the roles need the metadata
+PLOW_SEG_PURE_GEMM = "fp8"
+PLOW_SEG_FA512 = "1"               # [FP8-TAX] GEMMA4_SEG_FA512_DEFAULT is bf16-gated
+PLOW_SEG_FA256_GQA2 = "1"          # [FP8-TAX] GEMMA4_SEG_FA256_GQA2_DEFAULT is bf16-gated
+PLOW_TMA_GEMM = "1"
+PLOW_MAX_CHUNK = "4096"
+# [FP8-TAX] Three of the Hopper decode defaults the bf16 gate withholds. All three act on the
+# ATTENTION side, which is BF16 in this scheme either way (BF16 KV), so the FP8 weight encoding
+# is irrelevant to them and restoring them here is a restore, not a new claim:
+#   sliding_ns_cap / sliding_ns_grid -- sliding-window decode nsplit cap and grid floor
+#   attention_decode_balance_gf = 4  -- grid-aligned full-attention decode split (ns=33 on 132 SMs)
+PLOW_SLIDING_NS_CAP = "1"
+PLOW_SLIDING_NS_GRID = "1"
+PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
+# PLOW_GEMV_PREFETCH is deliberately NOT restored. It is the fourth withheld default, but unlike
+# the three above it is dtype-DEPENDENT: it prefetches the decode GEMV weight stream, and under
+# W8A16 decode that stream is e4m3, half the bytes the prefetch distance was tuned against
+# (GEMV_PREFETCH_QUALIFIED's evidence is BF16-only, "measured on the dense 12B"). It is an A/B on
+# this packet, not a restore: build a twin with `--env PLOW_GEMV_PREFETCH=1` and bench the decode
+# cells. Carry it only if it wins in FP8.
+PLOW_NS_FULL_ABS = "66"
+# Geometry, copied from the BF16 ladder packet so the two are the same deployment:
+PLOW_FA_MMAQK = "3"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+# HAZARD -- do not re-add 1536 / 2560 / 3072 / 3584. This line originally copied
+# bf16-ladder16k.toml's full append set. Those four rungs were reverted from the BF16 recipe the
+# same day after a 15000-token prompt cut its TAIL onto the 2560 rung and wedged plowrt: 99.6 %
+# CPU for 59 minutes, no fault, no log line, holding BOTH the GPU lease and the CPU-quiet lock
+# until it was killed by process group. The mechanism is still unexplained (two candidate
+# explanations were falsified), so this is a hazard, not a known bug with a known blast radius.
+# 256/1088/1152/4160/4224 is the reverted BF16 value: whitelisted-shape rungs only. Nothing the
+# FP8 question needs lives on the four removed rungs.
+# Open question, cheap to answer, NOT answered here: on BF16 an un-whitelisted rung loses the
+# cuBLASLt route and falls back to the native GEMM object, which is where the wedge lives. FP8 has
+# no Lt route at ANY rung, so every FP8 bucket is already native -- which could mean FP8 is immune,
+# or that FP8 wedges everywhere and nobody has yet sent it a long enough prompt. Test it by serving
+# a packet that HAS 2560 and sending one ~2500-token prompt, capped, with a process-group kill.
+PLOW_PF_LADDER_APPEND = "256,1088,1152,4160,4224"
+PLOW_FUSE_ARGMAX = "1"
+
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = [
+  "interp_sm90a_pfattn_hd512_px4_bq64.cubin",
+  "interp_sm90a_pfattn_hd256_gqa2_bkv32.cubin",
+  "interp_sm90a_pfattn_hd256_bkv32.cubin",
+  "interp_sm90a_pfgemm_glu_w8a8_gemma4.cubin",
+]
+[objects.env]
+# PLOW_BUILD_W8A8 sets -DPLOW_NV_W8A8=1 on every segment object: a W8A8 packet MUST run against a
+# PLOW_NV_W8A8 prefill cubin or the T6 (w8a16) body misreads the e4m3 activation bytes as bf16.
+PLOW_BUILD_W8A8 = "1"
+PLOW_BUILD_FA_GQA2_PAIR = "1"
+PLOW_BUILD_PFATTN_HD256_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD256_GQA2_BKV32 = "1"
+PLOW_BUILD_PFATTN_HD512_PX4_BQ64 = "1"
+
+[emit_roles.env]
+PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "1"
+PLOW_GEMMA4_SM90_HD512_PX4_BQ64_ROLE = "1"
+PLOW_GEMMA4_SM90_HD256_GQA2_ROLE = "1"
+
+[serve.env]
+# vLLM 0.28 reference ran with prefix caching disabled; match it.
+PLOW_PREFIX_CACHE = "0"
+PLOW_PF_SEG_PURE = "fp8"
+PLOW_PF_SEG_FA512 = "1"
+PLOW_PF_INTERLEAVE = "0"
+PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
+LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "/opt/dlami/nvme/hf-cache/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+model_id = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+gate_prompt = "<bos><start_of_turn>user\nWhat is the capital of France? Answer in one short sentence.<end_of_turn>\n<start_of_turn>model\n"
+
+# The common ladder, identical to gemma4-12b.h100.bf16-ladder16k.toml's profiles so `compare`
+# matches cell for cell.
+[bench.profiles.realtime]
+in_lens = "128 1024 4096 8192 15000"
+concs = "1 4"
+nprompt = 32
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_PIPELINE = "1", PLOW_DECODE_MAX_RUNG = "4", PLOW_PF_INTERLEAVE = "0", PLOW_PF_INTERLEAVE_ADAPTIVE = "1" }
+
+[bench.profiles.high_concurrency]
+in_lens = "128 1024 4096 8192 15000"
+concs = "16 32"
+nprompt = 64
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "32", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0", PLOW_RUNG_FAST_PROBE = "1" }
+
+[reference]
+csv = "perf-data/campaign/gemma4-12b.h100.reference-vllm028-fp8.csv"

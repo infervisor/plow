@@ -149,6 +149,17 @@ def cmd_build(a: argparse.Namespace) -> None:
         # CLI overrides win over the recipe's role env too, so an A/B can switch a role off.
         if run(nix([*base_args, "--out", str(assets)]), env_with(env_with(common, roles.get("env", {})), overrides), log):
             die("role emit failed; see build.log")
+        # A role emit that moves the packet hash (the 12B W8A8 GLU role does) leaves the segment
+        # objects specialised for the BASE packet, and plowrt refuses them ("packet/interpreter
+        # MISMATCH"). Rebuild them against the final config; the base set stays for the record.
+        final_cfg = assets / "plow_config.h"
+        if objects and final_cfg.read_bytes() != (base_dir / "plow_config.h").read_bytes():
+            print("== objects (final packet config differs from base: rebuilding)", file=sys.stderr)
+            obj_dir.rename(out / "objects-base")
+            oenv = env_with(os.environ, objects.get("env", {}))
+            oenv["PLOW_CUBIN_CONFIG"] = str(final_cfg)
+            if run(["bash", str(REPO / objects["script"]), str(assets), str(obj_dir)], oenv, log):
+                die("final object build failed; see build.log")
     else:
         assets = out / "assets"
         print("== emit", file=sys.stderr)

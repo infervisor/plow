@@ -1,3 +1,8 @@
+# Gemma-4-26B-A4B-it, H100 SXM5, FP8 (PTPC), 32 decode slots: the C16/C32 twin of
+# gemma4-26b-a4b.h100.fp8-ctx16k.toml (identical except the decode ladder and name). The 16-slot
+# packet queues half of a C32 client, and the widest compiled rung taxes every step
+# (decode-rung-count memory), so C1/C4 serve the 16-slot packet and C16/C32 this one.
+#
 # Gemma-4-26B-A4B-it, H100 SXM5, FP8 (PTPC) weights: W8A8 prefill, W8A16 decode, BF16 KV + lm_head.
 # The FP8 twin of gemma4-26b-a4b.h100.bf16-ctx16k.toml, same geometry, same ladder, same profiles.
 #
@@ -55,7 +60,7 @@
 #   python3 scripts/campaign/campaign.py build <this> --out DIR --no-probe
 
 [cell]
-name = "gemma4-26b-a4b.h100.fp8-ctx16k"
+name = "gemma4-26b-a4b.h100.fp8-c32-16k"
 model = "google/gemma-4-26b-a4b-it"
 revision = "local"
 hf_dir = "/opt/dlami/nvme/hf-cache/hub/gemma-4-26b-a4b-it"
@@ -98,7 +103,7 @@ PLOW_ATTENTION_DECODE_BALANCE_GF = "4"
 # [serve.env] forces PLOW_PF_SEG_PURE -- but do not reach for =0 as a safe knob here.
 PLOW_TMA_GEMM = "1"
 PLOW_FA_MMAQK = "3"
-PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
 PLOW_PF_LADDER_APPEND = "256,1152,4224"
 PLOW_MAX_CHUNK = "4096"
 PLOW_FUSE_ARGMAX = "0"
@@ -163,7 +168,7 @@ serve_env = { PLOW_MULTISTEP = "0", PLOW_MULTISTEP_ADAPTIVE = "1", PLOW_DECODE_M
 in_lens = "128 1024 4096 8192 15000"
 concs = "16 32"
 nprompt = 64
-serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "16", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
+serve_env = { PLOW_MULTISTEP = "0", PLOW_DECODE_MAX_RUNG = "32", PLOW_PF_INTERLEAVE = "0", PLOW_TOKEN_BATCH = "1", PLOW_QUEUE_TTL_MS = "0" }
 
 [reference]
 csv = "perf-data/campaign/gemma4-26b-a4b.h100.reference-vllm028-fp8.csv"
