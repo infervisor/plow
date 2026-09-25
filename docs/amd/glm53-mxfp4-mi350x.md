@@ -119,14 +119,16 @@ Logits vs vLLM oracle (last prompt position, T1024–T8192): top-1 match 4/4, KL
 ## DSA sparse attention (`GLM_RECIPE=dsa`)
 
 Emit adds `PLOW_GLM_DSA=topk PLOW_GLM_DSA_PF=1 PLOW_GLM_DSA_PF_SPAN=3 PLOW_GLM_FUSE_ROPE=0
-PLOW_GLM_DSA_PF_B8=1`; buckets <= 2048 keep MHA (exact dense = top-k identity), >= 4096 run
+PLOW_GLM_DSA_PF_B8=1 PLOW_GLM_DSA_KPREP=1 PLOW_GLM_DSA_KW_DUAL=1 PLOW_GLM_DSA_SEL_UNION=1`; buckets <= 2048 keep MHA (exact dense = top-k identity), >= 4096 run
 indexer -> top-2048 -> union per 8-query pack -> `d_mla_sparse_pf` (absorbed form, what vLLM runs).
-Objects add `PLOW_MLA_SPARSE=1 PLOW_DSA_SELECT_V2=1 PLOW_DSA_IDX_QPW=1 PLOW_HNR_ILP=1` and pick up
+Objects add `PLOW_MLA_SPARSE=1 PLOW_DSA_SELECT_V2=1 PLOW_DSA_IDX_QPW=1 PLOW_HNR_ILP=1 PLOW_DSA_PREP=1
+PLOW_DSA_IDX_FP8=1 PLOW_DSA_SELECT_V3=1` and pick up
 `PLOW_DSA_PF_ARM=1 PLOW_DSA_DECODE_BATCH=1` from the packet config. Overlay `--dsa` (indexer
 wq_b/wk `weight_scale_inv`). Same plowrt + run env as dense. Packets: dsa-v1 fbdd65b0 (BF16 interp
-chain), dsa-v4 cf2a668a, dsa-v5 3aaa4a53 (= `GLM_RECIPE=dsa` emit; objects dsa-v6 from 5cfb283f).
-Status: correct and closer to vLLM than dense, but NOT yet faster than dense prefill at any rung
-(dsa-v6 vs dense in the same job: 4k +42, 8k +67..74, 16k +140..149 ms).
+chain), dsa-v4 cf2a668a, dsa-v5 3aaa4a53, dsa-v7 8e73386d (= `GLM_RECIPE=dsa` emit, reproduced
+byte-identical; objects from 1bc7c752).
+Status: correct (top-1 == vLLM 4/4), but NOT yet faster than dense prefill at any rung
+(dsa-v7 vs dense in the same job: 4k +20..38, 8k +55, 16k +78..95 ms).
 
 | kernel (knob) | op | standalone (ms) | numerics |
 |---|---|---|---|
@@ -146,7 +148,16 @@ In-model TP8 prefill (ms, warm medians; dense v9 = 232 / 388 / 736 at 4k / 8k / 
 | dsa-v2 (+ sparse flash) | 292 | 503-506 | 992-1001 |
 | dsa-v3 (+ select v2, score QPW) | 291 | 486 | 910 |
 | dsa-v4 (+ q-rope fold) | 279 | 470 | 912 |
-| dsa-v6 (+ pack tickets, HNR ILP; = current preset) | 274 | 463 | 884 |
+| dsa-v6 (+ pack tickets, HNR ILP) | 274 | 463 | 884 |
+| dsa-v7 (+ prep fusion, FP8 score, select v3 + fused union; = current preset) | 252-270 | 445-446 | 818-835 |
+
+dsa-v7 (job ab-dsa7, dense v9 same job 232 / 391 / 740-743): greedy T1024/T8192 identical; logits vs
+vLLM oracle top-1 4/4, T4096 cos 0.957 KL 2.5e-6, T8192 cos 0.977 KL 3.3e-8 (the FP8 score is
+bit-identical to vLLM's indexer ops; dsa4 with the BF16 score had T8192 cos 0.984). T8192 trace (ms,
+21 or 78 layers): sparse flash 75.5 (dense MHA 39), MlaBmm 11.4+8.3, score 6.6, select 3.2, union 0.4,
+ropes (all 120 HNR) 6.2, wq_b 4.1, dual projection 2.6 — indexer chain ~42 -> ~17 ms. T16384: flash 180
+(MHA 153), score 20.8, MlaBmm 19.4+14.7, select 7.8, union 0.4 — indexer chain ~95 -> ~45 ms. The sparse
+flash + absorbed MlaBmm (vs MHA flash + kv_b) is now the whole remaining gap.
 
 Numerics (vLLM runs DSA): top-1 == vLLM oracle 4/4 on every build; T8192 logit cos dense 0.957,
 dsa1 0.977, dsa2 0.980, dsa4 0.984 (top-10 overlap 9/10). Greedy T1024/T8192 identical to dense.
