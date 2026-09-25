@@ -125,8 +125,9 @@ void b_down_sweep(float* part, const unsigned char* fu, const unsigned char* fu_
                   const unsigned long long* wtab, const unsigned long long* stab, const int* meta,
                   const unsigned* row_partidx, const float* row_gate, unsigned H, unsigned n_exp,
                   unsigned nsplit) {
+    extern __shared__ float sweep_lds[];
     d_moe_down_a4w4_sweep<TM, 2, 4>(part, fu, fu_scale, wtab, stab, meta, row_partidx, row_gate,
-                                    H, n_exp, nsplit, blockIdx.x, gridDim.x, 4u);
+                                    H, n_exp, nsplit, blockIdx.x, gridDim.x, 4u, sweep_lds);
 }
 
 #ifndef PLOW_MOE_A4W4_STAGE2_BENCH
@@ -335,9 +336,12 @@ int main(int argc, char** argv) {
             unsigned nsplit = live_sub ? (2u * sgrid + live_sub - 1) / live_sub : 1u;
             nsplit = std::max(1u, std::min(nsplit, H / 64u));
             HC(hipMemset(dpart, 0, (size_t)nassign * H * 4));
-            hipLaunchKernelGGL(b_down_sweep<TM>, dim3(sgrid), dim3(256), 0, 0, dpart, dfu, dfs, dwt,
+            hipLaunchKernelGGL(b_down_sweep<TM>, dim3(sgrid), dim3(256), 4 * 64 * 36 * 4, 0, dpart, dfu, dfs, dwt,
                                dst, dmeta, drp, drg, H, n_exp, nsplit);
             HC(hipMemcpy(psw.data(), dpart, psw.size() * 4, hipMemcpyDeviceToHost));
+            unsigned long long fp = 1469598103934665603ull;
+            for (float x : psw) { unsigned u; memcpy(&u, &x, 4); fp = (fp ^ u) * 1099511628211ull; }
+            printf("  sweep TM=%u output fingerprint %016llx\n", TM, fp);
             size_t bad = 0; double worst = 0;
             for (size_t i = 0; i < psw.size(); i++) {
                 const double rel = fabs((double)pref[i] - psw[i]) / fmax(1e-3, fabs((double)pref[i]));
@@ -347,7 +351,7 @@ int main(int argc, char** argv) {
             std::vector<double> tv;
             for (int it = 0; it < iters; it++) {
                 HC(hipEventRecord(e0));
-                hipLaunchKernelGGL(b_down_sweep<TM>, dim3(sgrid), dim3(256), 0, 0, dpart, dfu, dfs,
+                hipLaunchKernelGGL(b_down_sweep<TM>, dim3(sgrid), dim3(256), 4 * 64 * 36 * 4, 0, dpart, dfu, dfs,
                                    dwt, dst, dmeta, drp, drg, H, n_exp, nsplit);
                 HC(hipEventRecord(e1)); HC(hipEventSynchronize(e1));
                 float ms = 0; HC(hipEventElapsedTime(&ms, e0, e1)); if (it) tv.push_back(ms);

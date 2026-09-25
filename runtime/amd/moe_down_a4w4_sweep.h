@@ -49,7 +49,8 @@ __device__ void d_moe_down_a4w4_sweep(float* __restrict__ part, const unsigned c
                                       const int* __restrict__ meta,
                                       const unsigned* __restrict__ row_partidx,
                                       const float* __restrict__ row_gate, unsigned H, unsigned n_exp,
-                                      unsigned nsplit, unsigned slice, unsigned nblk, unsigned waves) {
+                                      unsigned nsplit, unsigned slice, unsigned nblk, unsigned waves,
+                                      float* stage = nullptr) {
     static_assert(TM % 16 == 0 && TM <= 64 && 64 % TM == 0, "TM divides the 64-row routing tile");
     constexpr unsigned MI = TM / 16, SUB = 64 / TM;
     constexpr unsigned I = KS * 128, ROWB = I / 2, GROUPS = I / 32;
@@ -90,6 +91,21 @@ __device__ void d_moe_down_a4w4_sweep(float* __restrict__ part, const unsigned c
                 sa[ks] |= (int)fu_scale[(size_t)row * GROUPS + ks * 4u + lane_k] << (8 * mi);
             }
         }
+#if PLOW_MOE_DOWN_SWEEP_LINE
+        /* Line-wide stores: a wave's two adjacent 16-column groups go through a per-wave LDS
+         * tile ([TM][36] f32) and leave as whole 128 B row segments, lane = (row, 16 B chunk). */
+        static_assert(DEPTH % 2 == 0, "groups are flushed in adjacent pairs");
+        constexpr unsigned NJ = TM / 8;
+        unsigned pidl[NJ];
+        float gatel[NJ];
+#pragma unroll
+        for (unsigned j = 0; j < NJ; j++) {
+            const unsigned row = rowbase + j * 8u + (lane >> 3);
+            pidl[j] = row_partidx[row];
+            gatel[j] = row_gate[row];
+        }
+        float* tile = stage + wave * (TM * 36u);
+#endif
         // Output rows this lane owns: 4*lane_k + r within each 16-row block.
         unsigned pid[MI][4];
         float gate[MI][4];
@@ -117,20 +133,47 @@ __device__ void d_moe_down_a4w4_sweep(float* __restrict__ part, const unsigned c
                 sb[slot][ks] = ok ? (int)S[(size_t)col * GROUPS + ks * 4u + lane_k] : 0;
             }
         };
+#if PLOW_MOE_DOWN_SWEEP_LINE
+        auto colof = [&](unsigned c, unsigned d) {
+            return c + (d >> 1) * (2u * step) + wave * 32u + (d & 1u) * 16u;
+        };
+        unsigned c = h0;
+#else
+        auto colof = [&](unsigned c, unsigned d) { return c + d * step; };
         unsigned c = h0 + wave * 16u;
+#endif
 #pragma unroll
-        for (unsigned d = 0; d < DEPTH; d++) load(d, c + d * step);
+        for (unsigned d = 0; d < DEPTH; d++) load(d, colof(c, d));
         for (; c < h1; c += DEPTH * step) {
 #pragma unroll
             for (unsigned d = 0; d < DEPTH; d++) {
-                const unsigned cd = c + d * step;
+                const unsigned cd = colof(c, d);
                 moe_sw_f32x4 acc[MI];
 #pragma unroll
                 for (unsigned mi = 0; mi < MI; mi++) acc[mi] = moe_sw_f32x4{0, 0, 0, 0};
 #pragma unroll
                 for (unsigned ks = 0; ks < KS; ks++)
                     moe_sw_mfma_rows<MI>(acc, a[ks], b[d][ks], sa[ks], sb[d][ks]);
-                load(d, cd + DEPTH * step);  // refill this slot while the next group computes
+                load(d, colof(c + DEPTH * step, d));  // refill this slot while the next group computes
+#if PLOW_MOE_DOWN_SWEEP_LINE
+#pragma unroll
+                for (unsigned mi = 0; mi < MI; mi++)
+#pragma unroll
+                    for (unsigned r = 0; r < 4; r++)
+                        tile[(mi * 16u + lane_k * 4u + r) * 36u + (d & 1u) * 16u + lane_n] = acc[mi][r];
+                if (d & 1u) {
+                    const unsigned c0 = cd - 16u + (lane & 7u) * 4u;
+#pragma unroll
+                    for (unsigned j = 0; j < NJ; j++) {
+                        const moe_sw_f32x4 v = *reinterpret_cast<const moe_sw_f32x4*>(
+                            tile + (j * 8u + (lane >> 3)) * 36u + (lane & 7u) * 4u);
+                        if (c0 < h1 && pidl[j] != PLOW_EXPERT_UNUSED)
+                            __builtin_nontemporal_store(
+                                gatel[j] * v, reinterpret_cast<moe_sw_f32x4*>(
+                                                  part + (size_t)pidl[j] * H + c0));
+                    }
+                }
+#else
                 if (cd < h1) {
                     const unsigned col = cd + lane_n;
 #pragma unroll
@@ -140,6 +183,7 @@ __device__ void d_moe_down_a4w4_sweep(float* __restrict__ part, const unsigned c
                             if (pid[mi][r] != PLOW_EXPERT_UNUSED)
                                 part[(size_t)pid[mi][r] * H + col] = gate[mi][r] * acc[mi][r];
                 }
+#endif
             }
         }
     }
@@ -175,8 +219,10 @@ __device__ void moe_down_a4w4_sweep_auto(float* part, const unsigned char* fu,
     const unsigned waves = blockDim.x / 64u;
     if (small)
         d_moe_down_a4w4_sweep<16, KS, 4>(part, fu, fu_scale, wtab, stab, meta, row_partidx, row_gate,
-                                         H, n_exp, nsplit, slice, nblk, waves);
+                                         H, n_exp, nsplit, slice, nblk, waves,
+                                         reinterpret_cast<float*>(red + 4));
     else
         d_moe_down_a4w4_sweep<64, KS, 4>(part, fu, fu_scale, wtab, stab, meta, row_partidx, row_gate,
-                                         H, n_exp, nsplit, slice, nblk, waves);
+                                         H, n_exp, nsplit, slice, nblk, waves,
+                                         reinterpret_cast<float*>(red + 4));
 }
