@@ -34,22 +34,21 @@ extern "C" __global__ __launch_bounds__(512, 1) void k_qpw(float* s, const bf16*
     d_index_score_pf_rowq<128, 128u, 2, 16384u>(s, q, k, w, len, n, STRIDE, SCALE, blockIdx.x, gridDim.x, kt);
 #endif
 }
-#define FP8_ARM(name, TN, QPW, ABL)                                                                     \
+#define FP8_ARM(name, TN, QPW)                                                                     \
     extern "C" __global__ __launch_bounds__(512, 1) void name(float* s, const bf16* q, const bf16* k,   \
                                                               const bf16* w, const int* len, unsigned n) { \
-        FP8_BODY(TN, QPW, ABL)                                                                          \
+        FP8_BODY(TN, QPW)                                                                          \
     }
 #if defined(__HIP_DEVICE_COMPILE__)
-#define FP8_BODY(TN, QPW, ABL)                                                              \
+#define FP8_BODY(TN, QPW)                                                                   \
     __shared__ __align__(16) unsigned char lds[dsa_fp8::lds_bytes<TN>()];                   \
-    d_index_score_pf_fp8<TN, QPW, ABL>(s, q, k, w, len, n, STRIDE, blockIdx.x, gridDim.x, lds);
+    d_index_score_pf_fp8<TN, QPW>(s, q, k, w, len, n, STRIDE, blockIdx.x, gridDim.x, lds);
 #else
-#define FP8_BODY(TN, QPW, ABL)
+#define FP8_BODY(TN, QPW)
 #endif
-FP8_ARM(k_fp8_128_2, 128u, 2, 0)
-FP8_ARM(k_fp8_256_2, 256u, 2, 0)
-FP8_ARM(k_fp8_64_2, 64u, 2, 0)
-FP8_ARM(k_fp8_256_sc, 256u, 2, 1024)
+FP8_ARM(k_fp8_128_2, 128u, 2)
+FP8_ARM(k_fp8_256_2, 256u, 2)
+FP8_ARM(k_fp8_64_2, 64u, 2)
 
 static float b2f(unsigned short b) { unsigned u = (unsigned)b << 16; float f; memcpy(&f, &u, 4); return f; }
 static float e4m3_val(unsigned c) {
@@ -125,7 +124,7 @@ int main(int argc, char** argv) {
         put("k.bin", hk.data(), (size_t)n * 128 * 2);
         put("w.bin", hw.data(), (size_t)n * 32 * 2);
         std::vector<float> c((size_t)n * n);
-        const Arm vars[] = {{"plow.bin", k_fp8_256_2}, {"plow_scaled.bin", k_fp8_256_sc}};
+        const Arm vars[] = {{"plow.bin", k_fp8_128_2}};
         for (const Arm& v : vars) {
             CK(hipMemset(s1, 0, (size_t)T * STRIDE * 4));
             hipLaunchKernelGGL(v.fn, dim3(NWG), dim3(512), 0, 0, s1, dq, dk, dw, dlen, n);

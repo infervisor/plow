@@ -42,6 +42,7 @@ __device__ __forceinline__ unsigned amax2(unsigned m, unsigned x) {
     return __builtin_bit_cast(unsigned, __builtin_elementwise_max(__builtin_bit_cast(u16x2, m),
                                                                   __builtin_bit_cast(u16x2, x & 0x7fff7fffu)));
 }
+/* packed |bf16| max -> f32 */
 __device__ __forceinline__ float amax_f(unsigned m) { return __uint_as_float(max(m & 0xffffu, m >> 16) << 16); }
 /* four bf16 (two packed pairs) -> four e4m3 of x / s; bit-identical to cvt_pk_fp8_f32(x / s) for a
  * power-of-two s (probed over 1M pairs) */
@@ -73,7 +74,7 @@ __device__ __forceinline__ f32x2 head_sum2(const f32x16& a0, const f32x16& a1, c
 }
 }  // namespace dsa_fp8
 
-template <unsigned TILE_N, int QPW, int ABL = 0>
+template <unsigned TILE_N, int QPW>
 __device__ void d_index_score_pf_fp8(float* __restrict__ Score, const bf16* __restrict__ Qidx,
                                      const bf16* __restrict__ Kidx, const bf16* __restrict__ W,
                                      const int* __restrict__ kv_len, unsigned n_tok,
@@ -119,8 +120,9 @@ __device__ void d_index_score_pf_fp8(float* __restrict__ Score, const bf16* __re
             const unsigned c = tid + i * PLOW_THREADS;
             const unsigned row = c / (DI / 8u), c8 = (c % (DI / 8u)) * 8u;
             const uint4 u = pre[i];
-            const unsigned am = row16_max(amax2(amax2(amax2(u.x & 0x7fff7fffu, u.y), u.z), u.w));
-            const float ks = ue8m0_div448(fmaxf(amax_f(am), 1e-4f));
+            const unsigned m = amax2(amax2(amax2(u.x & 0x7fff7fffu, u.y), u.z), u.w);
+            const unsigned am = row16_max(max(m & 0xffffu, m >> 16));
+            const float ks = ue8m0_div448(fmaxf(__uint_as_float(am << 16), 1e-4f));
             *(uint2*)(buf + row * KS8 + c8) = make_uint2(pk4(u.x, u.y, ks), pk4(u.z, u.w, ks));
             if (c8 == 0u) ((float*)(buf + TILE_N * KS8))[row] = ks;
         }
@@ -198,10 +200,6 @@ __device__ void d_index_score_pf_fp8(float* __restrict__ Score, const bf16* __re
                 }
             };
             auto mm = [&](const fp8v32* q, const fp8v32* kq) -> f32x16 {
-                if constexpr ((ABL & 1024) != 0) {
-                    const f32x16 z = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(q[0], kq[0], (f32x16)(0.0f), 0, 0, 0, 127, 0, 127);
-                    return __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(q[1], kq[1], z, 0, 0, 0, 127, 0, 127);
-                }
                 return plow_mfma_fp8_32x32(q[1], kq[1], plow_mfma_fp8_32x32(q[0], kq[0], (f32x16)(0.0f)));
             };
             /* row 0's sum lands in lanes 0-31 and row 1's in lanes 32-63 after the half swap */
