@@ -903,6 +903,17 @@ extern "C" __device__ unsigned plow_dsa_select_split_arm = 1;
 #if PLOW_DSA_SELECT_V2
 extern "C" __device__ unsigned plow_dsa_select_v2_arm = 1;
 #endif
+/* PLOW_DSA_SELECT_V3 — op 118 through dsa_select_v3.h (same set as v2). An op 118 carrying the
+ * union operands (i4 = cap, t3 = union table, i5 = zero the pack tickets) also writes op 119's
+ * table itself, and the op 119 marked i6 = 1 is then skipped. Objects without the arm ignore
+ * both marks and run the plain select + union, so the packet is valid either way. */
+#ifndef PLOW_DSA_SELECT_V3
+#define PLOW_DSA_SELECT_V3 0
+#endif
+#if PLOW_DSA_SELECT_V3
+#include "dsa_select_v3.h"
+extern "C" __device__ unsigned plow_dsa_select_v3_arm = 1;
+#endif
 /* PLOW_DSA_IDX_QPW — op 117 (32 heads) through d_index_score_pf_rowq: two rows per wave, a
  * 128-key slab prefetched into registers, 16384-key spans. Bit-identical to the row arm. */
 #ifndef PLOW_DSA_IDX_QPW
@@ -1170,6 +1181,10 @@ static_assert(dsa_fp8::lds_bytes<128u>() <= sizeof(((plow_smem*)nullptr)->raw),
 static_assert((4096u + 16u) * sizeof(unsigned) <= sizeof(((plow_smem*)nullptr)->raw),
               "d_index_select_pf_v2 histogram does not fit the interpreter LDS arena");
 #endif
+#endif
+#if PLOW_DSA_SELECT_V3
+static_assert(isel3::WORDS_FUSED * sizeof(unsigned) <= sizeof(((plow_smem*)nullptr)->raw),
+              "dsa_select_v3 LDS does not fit the interpreter LDS arena");
 #endif
 
 #if PLOW_NO_MLA_DEC
@@ -4711,6 +4726,20 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             /* i[3]=pool_size: zero-means-1 guard, same reasoning as PLOW_DOP_INDEX_SELECT above
              * — every existing emitter writes i[3]==0, so this must not divide by it directly. */
             const unsigned pool_size = in->i[3] ? in->i[3] : 1u;
+#if PLOW_DSA_SELECT_V3
+            if (pool_size == 1u) {
+                if (in->i[4])
+                    d_index_select_union_pf((unsigned char*)TEN(3), (int*)TEN(0),
+                                            (const float*)TEN(1), (const int*)TEN(2), in->i[0],
+                                            in->i[1], in->i[2], in->i[4], in->i[5], slice, nblk,
+                                            (unsigned*)sm->raw);
+                else
+                    d_index_select_pf_v3((int*)TEN(0), (const float*)TEN(1), (const int*)TEN(2),
+                                         in->i[0], in->i[1], in->i[2], slice, nblk,
+                                         (unsigned*)sm->raw);
+                break;
+            }
+#endif
 #if PLOW_DSA_SELECT_V2
             if (pool_size == 1u) {
                 d_index_select_pf_v2((int*)TEN(0), (const float*)TEN(1), (const int*)TEN(2),
@@ -4728,6 +4757,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_UNION_PF
         case PLOW_DOP_INDEX_UNION_PF:
+#if PLOW_DSA_SELECT_V3
+            if (in->i[6]) break; /* op 118 (d_index_select_union_pf) wrote this table */
+#endif
             /* i4 = queries per union tile (0 = legacy 64; the B2 head-batched walk emits 8).
              * The umask scratch is SLICE-indexed inside the kernel, so its size is bound by
              * this packet's block count, not the tile count. */
