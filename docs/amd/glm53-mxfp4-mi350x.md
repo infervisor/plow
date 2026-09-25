@@ -132,6 +132,8 @@ Status: correct and closer to vLLM than dense, but NOT yet faster than dense pre
 |---|---|---|---|
 | `d_mla_sparse_pf` (DSA_PF_B8 + MLA_SPARSE) | sparse MLA prefill, 64 rows = 8 q x 8 heads, DMA gather, bf16 latent out (no merge), q-rope folded, largest-first pack tickets | T8192 2.43 (V2 gather) -> 0.695, T16384 6.67 -> 1.753 (~560 TF/s on union pairs) | rel-L2 5e-4 vs double ref over each query's own selection |
 | select v2 (DSA_SELECT_V2) | IndexSelectPf | 8k 1.70 -> 0.34, 16k 3.75 -> 0.94 | same set |
+| select v3 (DSA_SELECT_V3) | IndexSelectPf, one wave per row | real scores 8k 0.301 -> 0.121, 16k 0.998 -> 0.353 | same set |
+| select+union (DSA_SELECT_V3 + emit GLM_DSA_SEL_UNION) | IndexSelectPf writes IndexUnionPf's table | real 8k 0.469 -> 0.111, 16k 1.487 -> 0.301 (v2 + union -> fused) | union bytes identical |
 | score QPW (DSA_IDX_QPW) | IndexScorePf (BF16) | 8k 0.875 -> 0.472, 16k 3.39 -> 1.77 | byte-identical |
 | HNR ILP (HNR_ILP) | indexer q/k rope HD=128 | 8k 0.100 -> 0.060 | byte-identical |
 
@@ -205,7 +207,54 @@ indexer DSA is not expected to cross over by 64k; the indexer chain is the bindi
 A 3-4x faster indexer (FP8 score per vLLM, fused/faster select) would put the crossover at ~24-32k.
 32k correctness not checked (no oracle at 32k).
 
-### Indexer: reference implementations and adoption plan (research, 2026-09-25; not yet implemented)
+### Select v3 and fused select + union (plan steps 2-3, 2026-09-25)
+`runtime/amd/dsa_select_v3.h`, test `runtime/tests/index_select_pf_v3_gfx950.hip` (1 GPU, 256 WGs).
+- One WAVE per row, no workgroup barrier inside a row. v2 ranks a row with the whole workgroup and
+  pays ~15 barrier / LDS round trips per row regardless of length (measured ~20k cycles/row fixed);
+  here 8 waves rank 8 rows (fused: the 8 rows of one query pack) with wave-local LDS (15 KB each).
+- Pass 1 streams the row (buffer loads, 4 x 16 B per lane in flight) into an 11-bit histogram of
+  the fp32 key's top bits; with a previous row on the wave, into 2046 bins of 2^13 keys around that
+  row's threshold instead (keys below the window uncounted, above aggregated; miss -> top-digit
+  passes, window skipped for the next row). A threshold group > 1792 keys takes more streaming
+  digits (never truncated). Pass 2 emits keys above the prefix and compacts the equal ones (<= 1792)
+  into LDS; 8-bit digit passes, score bits first and index bits (lowest index) only on an exact tie,
+  until the group is needed whole or <= 16 keys, ranked exactly.
+- Real GLM rows (act.iscore_pf dumps, last indexer layer): scores ~ -55..-82, and up to 70% of a
+  16k row sits in the threshold's 11-bit top-digit bin (37/53 sampled rows > 1792), but <= ~60 in a
+  2^13-key bin. Without the window pass v3 was 0.598 ms at 16k real (0.361 on gaussian rows).
+- Fused (`PLOW_GLM_DSA_SEL_UNION=1` emit): op 118 carries t3 = union table, i4 = cap, i5 = zero
+  the pack tickets; op 119 carries i6 = 1 and is skipped by V3 objects (~20 us/layer gate). Objects
+  without the arm ignore both marks and run select + union, so the packet is valid either way.
+  Pack mask = one byte per position (LDS, 16384 positions); packs with a causal bound past that
+  select into iidx_pf and build the union from it in 16384-position windows. iidx_pf is not
+  written otherwise (under B8 only the union is read).
+
+| standalone (us/layer) | v2 | v3 | v2 + union | fused |
+|---|---|---|---|---|
+| real T8192 | 301 | 121 | 469 | 111 |
+| real T16376 | 998 | 353 | 1487 | 301 |
+| gaussian T4096 / 8192 / 16384 | 78 / 247 / 760 | 30 / 128 / 337 | 136 / 439 / 1386 | 29 / 125 / 308 |
+| tie/overflow mix T16384 | 1297 | 904 | 1874 | 1081 |
+
+Every case: sets identical to v2 on every row and to a CPU exact top-k on sampled rows; union
+table + ticket words byte-identical to d_index_union_pf over v2's selection (also offset / ragged
+chunks, causal bounds past 16384).
+
+In-model TP8 (job sel3-final; packet dsa-su 5217ad9f = `GLM_RECIPE=dsa` + `PLOW_GLM_DSA_SEL_UNION=1`,
+objects + `PLOW_DSA_SELECT_V3=1` built before the window pass, i.e. real-score v3 0.598 / fused
+0.641 ms at 16k; plowrt-v5; greedy T1024/T8192 identical, logits T1024..T8192 byte-identical to dsa6):
+
+| prefill (ms) | 4k | 8k | 16k |
+|---|---|---|---|
+| dsa-v6 baseline r1 / r2 | 257.3 / 274.6 | 461.4 / (608.9 noisy) | 882.1 / 883.5 |
+| fused select+union r1 / r2 | 271.1 / 271.0 | 453.3 / 453.9 | 858.3 / 859.3 |
+| select v3 object only (dsa-v5 packet), 1 run | 256.2 | 458.3 | 853.8 |
+
+4k reps are bimodal (~255 / ~272) in every arm. Trace (fused): IndexSelectPf 4.16 / 14.32 ms and
+IndexUnionPf (skipped) 0.40 / 0.42 ms over 21 layers at 8k / 16k, vs 8.91 + 4.07 / 30.11 + 10.76.
+The window pass (real-score fused 0.641 -> 0.301 ms at 16k) is not in these objects.
+
+### Indexer: reference implementations and adoption plan (research, 2026-09-25; steps 2-3 done above)
 - vLLM 0.29 ROCm path (pinned image): `rocm_fp8_mqa_logits` -> AITER gfx950 gluon
   `_gluon_fp8_mqa_logits_kernel` (1 program/query row, longest rows first, BLOCK_KV=32,
   `mfma_scaled` 32x32x64 e4m3 unscaled, relu -> head reduce -> x kscale, fp32 logits; -inf prefill) +
