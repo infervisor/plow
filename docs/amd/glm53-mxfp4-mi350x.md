@@ -116,23 +116,50 @@ merge unroll (-9%), decode shared fold (-6% M8, -16% M64), kw decode GLU (-5..-1
 Logits vs vLLM oracle (last prompt position, T1024–T8192): top-1 match 4/4, KL(vLLM||plow)
 8.5e-5 / 6e-6 / 2.7e-7 / 2.8e-8 (MHA form). Smoke "capital of France" -> " Paris".
 
-## DSA sparse attention (GLM_RECIPE=dsa, packet dsa-v1 sha16 fbdd65b0b3da7bf6)
+## DSA sparse attention (`GLM_RECIPE=dsa`)
 
-Emit adds `PLOW_GLM_DSA=topk PLOW_GLM_DSA_PF=1 PLOW_GLM_DSA_PF_SPAN=3 PLOW_GLM_FUSE_ROPE=0`; buckets
-<= 2048 keep MHA (exact dense = top-k identity), >= 4096 run indexer -> top-2048 -> absorbed gather.
-Objects pick up `PLOW_DSA_PF_ARM=1 PLOW_DSA_DECODE_BATCH=1` from the packet config. Overlay `--dsa`.
-dsa-v1 (interpreter BF16 indexer, V2 gather flash): top-1 == vLLM oracle 4/4; T8192 logit cos 0.977
-vs dense 0.957 (vLLM runs DSA). Prefill 1k/2k/4k/8k/16k 139/163/340/632/1289 ms vs dense
-141/165/232/389/736. Decode ctx1k M1/M8/M64 51.1/67.5/220.7 vs 38.4/53.5/117.4.
-T8192 trace (ms, 78 layers): sparse FlashMlaPrefill 190 (dense MHA 39), HeadNormRope 30, IndexSelectPf
-29, IndexScorePf 20, MlaBmmFp8 x2 21, FlashMerge 8. T16384: flash 498 (MHA 153), score 76, select 74.
-Bug: at T=16384 the last 8 selection rows are all zeros.
+Emit adds `PLOW_GLM_DSA=topk PLOW_GLM_DSA_PF=1 PLOW_GLM_DSA_PF_SPAN=3 PLOW_GLM_FUSE_ROPE=0
+PLOW_GLM_DSA_PF_B8=1`; buckets <= 2048 keep MHA (exact dense = top-k identity), >= 4096 run
+indexer -> top-2048 -> union per 8-query pack -> `d_mla_sparse_pf` (absorbed form, what vLLM runs).
+Objects add `PLOW_MLA_SPARSE=1 PLOW_DSA_SELECT_V2=1 PLOW_DSA_IDX_QPW=1 PLOW_HNR_ILP=1` and pick up
+`PLOW_DSA_PF_ARM=1 PLOW_DSA_DECODE_BATCH=1` from the packet config. Overlay `--dsa` (indexer
+wq_b/wk `weight_scale_inv`). Same plowrt + run env as dense. Packets: dsa-v1 fbdd65b0 (BF16 interp
+chain), dsa-v4 cf2a668a (current preset without the ticket counter), dsa-v5 3aaa4a53 (preset).
+
+| kernel (knob) | op | standalone (ms) | numerics |
+|---|---|---|---|
+| `d_mla_sparse_pf` (DSA_PF_B8 + MLA_SPARSE) | sparse MLA prefill, 64 rows = 8 q x 8 heads, DMA gather, bf16 latent out (no merge), q-rope folded, largest-first pack tickets | T8192 2.43 (V2 gather) -> 0.695, T16384 6.67 -> 1.753 (~560 TF/s on union pairs) | rel-L2 5e-4 vs double ref over each query's own selection |
+| select v2 (DSA_SELECT_V2) | IndexSelectPf | 8k 1.70 -> 0.34, 16k 3.75 -> 0.94 | same set |
+| score QPW (DSA_IDX_QPW) | IndexScorePf (BF16) | 8k 0.875 -> 0.472, 16k 3.39 -> 1.77 | byte-identical |
+| HNR ILP (HNR_ILP) | indexer q/k rope HD=128 | 8k 0.100 -> 0.060 | byte-identical |
+
+In-model TP8 prefill (ms, warm medians; dense v9 = 232 / 388 / 736 at 4k / 8k / 16k):
+
+| build | 4k | 8k | 16k |
+|---|---|---|---|
+| dsa-v1 (V2 gather, BF16 interp indexer) | 340 | 632 | 1289 |
+| dsa-v2 (+ sparse flash) | 292 | 503-506 | 992-1001 |
+| dsa-v3 (+ select v2, score QPW) | 291 | 486 | 910 |
+| dsa-v4 (+ q-rope fold) | 279 | 470 | 912 |
+
+Numerics (vLLM runs DSA): top-1 == vLLM oracle 4/4 on every build; T8192 logit cos dense 0.957,
+dsa1 0.977, dsa2 0.980, dsa4 0.984 (top-10 overlap 9/10). Greedy T1024/T8192 identical to dense.
+dsa-v4 T8192 trace (ms): sparse flash 82 (dense MHA 39), score 10, select 9, MlaBmm 11+8 (dense kv_b
+8.5), indexer ropes 8, union 4, LayerNorm 4, wq_b 4, projections 5. T16384: flash 201 (MHA 153),
+score 34, select 30, MlaBmm 19+15, union 11. In-model flash is ~1.5x its standalone time.
+Decode (dsa-v1): ctx1k M1/M8/M64 51.1/67.5/220.7 vs dense 38.4/53.5/117.4 ms — not yet worked on.
+The "16k last-8-rows" zeros were not a bug: prompt-16384.ids holds 16376 tokens (kvrow shrink).
 
 Selection structure (real iidx_pf dump, 118-distinct-token prompt): union of B adjacent queries' top-2048
 vs dense causal pairs — 8k: B1 0.43x, B2 0.49, B4 0.57, B8 0.66, B64 0.91, B128 0.99; 16k: 0.23, 0.28,
 0.34, 0.42, 0.76, 0.93. 64-key block skipping saves nothing (0.96-1.00x): selections are scattered.
 So only the absorbed per-pack gather cuts work; absorbed costs 2.125x the MACs/pair of the MHA form, so
 at 8k ideal sparse ~= dense MHA and the win must come from kernel efficiency; 16k has ~2x headroom.
+Kernel probes (T8192 standalone): no K gather 0.585 ms, no QK MFMA 0.695, no PV MFMA 0.687 vs 0.729 —
+latency-chain bound at 1 wave/SIMD, not DMA- or MFMA-bound. Negatives: two QK accumulators (0.748),
+optimistic 2-barrier softmax (0.86); FP8 score arm (failed its CPU reference of vLLM's recipe, not faster).
+Open levers: FP8 indexer (vLLM parity + ~2x score), select/union fusion, in-model flash tail (1.5x
+standalone), MlaBmm (13% of roof), fewer/lighter chunks (B=4 packs need a smaller LDS stage).
 
 ## Negatives (do not re-try blind)
 - MoE stage-1 wide tile (128 rows, A+B via LDS): bit-exact but 423 -> 501 us at T8192.
