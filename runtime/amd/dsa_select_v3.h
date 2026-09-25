@@ -30,7 +30,10 @@ constexpr unsigned MAXPOS = 16384u;         /* positions the fused pack mask cov
 constexpr unsigned MASK = NW * REGW;
 constexpr unsigned WORDS_SEL = NW * REGW, WORDS_FUSED = MASK + MAXPOS / 4u;
 constexpr unsigned PACK = 8u;
-constexpr unsigned BATCH = 8u;              /* 16-byte loads per lane per streaming step */
+#ifndef IDXSEL_V3_BATCH
+#define IDXSEL_V3_BATCH 8u
+#endif
+constexpr unsigned BATCH = IDXSEL_V3_BATCH;  /* 16-byte loads per lane per streaming step */
 static_assert(NW == PACK, "the fused form ranks a pack's rows one per wave");
 static_assert(NBH <= REGW && REGW % 4u == 0u && CAPW % 64u == 0u, "wave region layout");
 }  // namespace isel3
@@ -113,9 +116,10 @@ __device__ __forceinline__ unsigned isel3_key(unsigned b) {
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
 
-/* Streams one row through f(key, pos, valid), 2048 keys per step per wave, the next step's
- * loads issued before this one is consumed. Buffer loads past the row read 0 (masked by valid).
- * Every lane calls f the same number of times, so f may ballot. */
+/* Streams one row through f(k[4], p0, nv): four consecutive keys at positions p0.. of which
+ * the first nv are in the row, 2048 keys per step per wave, the next step's loads issued before
+ * this one is consumed. Buffer loads past the row read 0. Every lane calls f the same number of
+ * times, so f may ballot. */
 template <class F>
 __device__ __forceinline__ void isel3_stream(const float* row, unsigned row_len, F&& f) {
     using namespace isel3;
@@ -141,16 +145,18 @@ __device__ __forceinline__ void isel3_stream(const float* row, unsigned row_len,
 #pragma unroll
         for (unsigned j = 0; j < BATCH; j++) {
             const unsigned p0 = (b * BATCH + j) * 256u + lane * 4u;
-            const unsigned v[4] = {cur[j].x, cur[j].y, cur[j].z, cur[j].w};
-#pragma unroll
-            for (unsigned c = 0; c < 4u; c++) f(isel3_key(v[c]), p0 + c, p0 + c < row_len);
+            const unsigned k[4] = {isel3_key(cur[j].x), isel3_key(cur[j].y), isel3_key(cur[j].z),
+                                   isel3_key(cur[j].w)};
+            const unsigned nv = p0 < row_len ? (row_len - p0 < 4u ? row_len - p0 : 4u) : 0u;
+            f(k, p0, nv);
         }
 #pragma unroll
         for (unsigned j = 0; j < BATCH; j++) cur[j] = nx[j];
     }
 }
 
-/* Taken positions go to one idx row (wave-compacted slots; n is wave-uniform). */
+/* Taken positions go to one idx row (wave-compacted slots; n is wave-uniform). group() takes
+ * a 4-bit mask of positions p0..p0+3. */
 struct Isel3EmitRow {
     PLOW_GLOB int* row;
     unsigned top_k;
@@ -163,14 +169,33 @@ struct Isel3EmitRow {
         }
         n += (unsigned)__builtin_popcountll(m);
     }
+    __device__ __forceinline__ void group(unsigned bits, unsigned p0) {
+        unsigned tot;
+        unsigned o = n + isel3_wave_excl((unsigned)__builtin_popcount(bits), 3u, tot);
+        n += tot;
+        while (bits) {
+            const unsigned c = (unsigned)__builtin_ctz(bits);
+            bits &= bits - 1u;
+            if (o < top_k) st_act<int>(&row[o], (int)(p0 + c));
+            o++;
+        }
+    }
 };
 
-/* Taken positions set query q's bit in the pack mask (one byte per position). */
+/* Taken positions set query q's bit in the pack mask (one byte per position; p0 % 4 == 0, so a
+ * group is one mask word). */
 struct Isel3EmitMask {
     unsigned* mask;
     unsigned bit;
     __device__ __forceinline__ void operator()(bool take, unsigned s) {
         if (take) atomicOr(&mask[s >> 2], bit << ((s & 3u) * 8u));
+    }
+    __device__ __forceinline__ void group(unsigned bits, unsigned p0) {
+        if (bits) {
+            const unsigned w = (bits & 1u) | ((bits & 2u) << 7) | ((bits & 4u) << 14) |
+                               ((bits & 8u) << 21);
+            atomicOr(&mask[p0 >> 2], w * bit);
+        }
     }
 };
 
@@ -229,10 +254,22 @@ __device__ __forceinline__ void isel3_row(const float* row, unsigned row_len, un
 #pragma unroll
         for (unsigned j = 0; j < NBH / 256u; j++) ((uint4*)wl)[j * 64u + lane] = uint4{0u, 0u, 0u, 0u};
         isel3_wsync();
-        isel3_stream(row, row_len, [&](unsigned k, unsigned pos, bool v) {
-            const unsigned ik = (row_len - 1u - pos) & 0xFFFFFFu;
-            if (v && px.eq(k, ik)) atomicAdd(&wl[px.digit(isx, sh, nb, k, ik)], 1u);
-        });
+        if (px.sres == 0u) {
+            isel3_stream(row, row_len, [&](const unsigned (&k)[4], unsigned, unsigned nv) {
+#pragma unroll
+                for (unsigned c = 0; c < 4u; c++)
+                    if (c < nv) atomicAdd(&wl[k[c] >> (32u - B1)], 1u);
+            });
+        } else {
+            isel3_stream(row, row_len, [&](const unsigned (&k)[4], unsigned p0, unsigned nv) {
+#pragma unroll
+                for (unsigned c = 0; c < 4u; c++) {
+                    const unsigned ik = (row_len - 1u - p0 - c) & 0xFFFFFFu;
+                    if (c < nv && px.eq(k[c], ik))
+                        atomicAdd(&wl[px.digit(isx, sh, nb, k[c], ik)], 1u);
+                }
+            });
+        }
         isel3_wsync();
         unsigned d, above;
         isel3_scan<NBH / 256u>(wl, 25u, k_rem, d, above, bnd);
@@ -240,25 +277,60 @@ __device__ __forceinline__ void isel3_row(const float* row, unsigned row_len, un
         px.add(isx, sh, nb, d);
         k_rem -= above;
     }
+#if defined(ISEL3_PROBE) && ISEL3_PROBE == 1
+    if (bnd == 12345u) emit(true, 0u);
+    return;
+#endif
     const bool whole = bnd == k_rem;
     unsigned* const ckey = wl + CKEY;
     unsigned* const cpos = wl + CPOS;
     unsigned nc = 0u;
-    isel3_stream(row, row_len, [&](unsigned k, unsigned pos, bool v) {
-        const unsigned ik = (row_len - 1u - pos) & 0xFFFFFFu;
-        const bool e = v && px.eq(k, ik);
-        emit(v && (px.gt(k, ik) || (whole && e)), pos);
-        if (!whole) {
-            const unsigned long long m = __ballot(e);
-            if (e) {
-                const unsigned slot = nc + isel3_mbcnt(m);
-                ckey[slot] = k;
-                cpos[slot] = pos;
+    /* Above-prefix keys are emitted, prefix-equal ones compacted (or emitted when needed whole).
+     * Until an index digit is resolved the comparison is on score bits alone. */
+    auto pass2 = [&](auto idx_digits) {
+        constexpr bool IX = decltype(idx_digits)::value;
+        isel3_stream(row, row_len, [&](const unsigned (&k)[4], unsigned p0, unsigned nv) {
+            unsigned gb = 0u, eb = 0u;
+#pragma unroll
+            for (unsigned c = 0; c < 4u; c++) {
+                const unsigned ks = k[c] & px.smask;
+                bool g = ks > px.sprefix, e = ks == px.sprefix;
+                if (IX) {
+                    const unsigned ix = (row_len - 1u - p0 - c) & 0xFFFFFFu & px.imask;
+                    g = g || (e && ix > px.iprefix);
+                    e = e && ix == px.iprefix;
+                }
+                gb |= (unsigned)(c < nv && g) << c;
+                eb |= (unsigned)(c < nv && e) << c;
             }
-            nc += (unsigned)__builtin_popcountll(m);
-        }
-    });
+            if (whole) {
+                emit.group(gb | eb, p0);
+            } else {
+                emit.group(gb, p0);
+                if (__ballot(eb != 0u)) {
+                    unsigned tot;
+                    unsigned o = nc + isel3_wave_excl((unsigned)__builtin_popcount(eb), 3u, tot);
+                    nc += tot;
+#pragma unroll
+                    for (unsigned c = 0; c < 4u; c++) {
+                        if ((eb >> c) & 1u) {
+                            ckey[o] = k[c];
+                            cpos[o] = p0 + c;
+                            o++;
+                        }
+                    }
+                }
+            }
+        });
+    };
+    if (px.ires == 0u)
+        pass2(std::false_type{});
+    else
+        pass2(std::true_type{});
     if (whole) return;
+#if defined(ISEL3_PROBE) && ISEL3_PROBE == 2
+    return;
+#endif
     isel3_wsync();
     /* nc == bnd <= CAPW candidates share the prefix; k_rem < nc of them are needed. */
     unsigned* const sh8 = wl + SHIST;
