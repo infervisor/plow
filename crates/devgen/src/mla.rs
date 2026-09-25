@@ -7297,6 +7297,11 @@ pub(crate) fn emit_glm_mla_prefill(
             d.t[..3].copy_from_slice(&[n.qlat, n.qlr, w.gqa]);
             d.i[..2].copy_from_slice(&[t, ql]);
             d.f[0] = eps;
+            if pf_norm_q {
+                d.t[3] = n.qb_xq;
+                d.t[4] = n.qb_xs;
+                d.i[4] = 128;
+            }
         });
         (done, done, norm)
     } else {
