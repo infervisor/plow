@@ -1846,7 +1846,7 @@ fn lean_moe_stage1_a4_reuse_is_geometry_gated_and_scratch_bounded() {
         .map(|(i, t)| DeviceMem::view(0x1000 + i as u64 * 0x10_0000, t.bytes))
         .collect();
     let (payload, scales) =
-        moe_stage1_a4_scratch_bytes(std::slice::from_ref(&prog), &tensors).unwrap();
+        moe_stage1_a4_scratch_bytes(std::slice::from_ref(&prog), &tensors, false).unwrap();
     assert_eq!((payload, scales), (rows * 3584 / 2, rows * 3584 / 32));
     let routes = moe_mxfp4_routes_with_scratch(
         &prog,
@@ -1854,6 +1854,7 @@ fn lean_moe_stage1_a4_reuse_is_geometry_gated_and_scratch_bounded() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         None,
+        false,
     )
     .unwrap();
     let PrefillSegmentRoute::MoeStage1A4Reuse(route) = routes[1] else {
@@ -1877,12 +1878,27 @@ fn lean_moe_stage1_a4_reuse_is_geometry_gated_and_scratch_bounded() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         None,
+        false,
     )
     .unwrap();
     assert!(matches!(
         fallback[1],
         PrefillSegmentRoute::MoeStage1Mxfp4(_)
     ));
+    // A token-gather object takes the one-N-tile shape and carries row_token to the GEMM.
+    let gather = moe_mxfp4_routes_with_scratch(
+        &prog,
+        &tensors,
+        &devp,
+        Some((0x8000_0000, 0x9000_0000)),
+        None,
+        true,
+    )
+    .unwrap();
+    let PrefillSegmentRoute::MoeStage1A4Reuse(route) = gather[1] else {
+        panic!("token-gather object must take the I=256 shape")
+    };
+    assert_eq!(route.args.row_token, route.quant_args.row_token);
 }
 
 #[test]
@@ -1934,6 +1950,7 @@ fn replicated_prefill_ep_routes_full_i_and_balanced_whole_experts() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         Some((3, 8)),
+        false,
     )
     .unwrap();
     let PrefillSegmentRoute::MoeEpAlign(align) = routes[0] else {
@@ -1971,6 +1988,7 @@ fn replicated_prefill_ep_routes_full_i_and_balanced_whole_experts() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         None,
+        false,
     )
     .unwrap_err();
     assert!(err.to_string().contains("without a TP binding"));
@@ -1980,6 +1998,7 @@ fn replicated_prefill_ep_routes_full_i_and_balanced_whole_experts() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         Some((0, 4)),
+        false,
     )
     .unwrap_err();
     assert!(err.to_string().contains("topology-mismatched"));
