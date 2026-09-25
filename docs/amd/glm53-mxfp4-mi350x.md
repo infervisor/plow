@@ -181,6 +181,14 @@ latency-chain bound at 1 wave/SIMD, not DMA- or MFMA-bound. Negatives: two QK ac
 optimistic 2-barrier softmax (0.86); FP8 score arm (failed its CPU reference of vLLM's recipe, not faster).
 Open levers: FP8 indexer (vLLM parity + ~2x score), select/union fusion, in-model flash tail (1.5x
 standalone), MlaBmm (13% of roof), fewer/lighter chunks (B=4 packs need a smaller LDS stage).
+Half-pack split (keys only queries 0-3 or only 4-7 selected: 27% of union keys at 8k, 39% at 16k)
+would cut B8 flash work to 0.86x / 0.80x. dsa-v6 in-model flash: 0.82-0.85 ms/layer at 8k (WG bodies
+0.68-0.82 after tickets) vs dense MHA 0.50.
+Break-even budget (attention-related ms, dense = MHA flash + kv_b + quant + k-rope): 8k dense ~55 vs
+dsa-v6 ~120 (flash ~65, indexer ~42, absorbed MlaBmm ~19); 16k dense ~176 vs ~260. Beating dense needs
+roughly 2x on the sparse flash AND 3-4x on the indexer chain; with the absorbed form's 2.125x
+MACs/pair, the crossover against plow's MHA prefill is expected beyond 16k (not measured; ladder tops
+at 16k).
 
 ## Negatives (do not re-try blind)
 - MoE stage-1 wide tile (128 rows, A+B via LDS): bit-exact but 423 -> 501 us at T8192.
