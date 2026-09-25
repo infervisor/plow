@@ -66,12 +66,15 @@ i.e. prefix-cache hits / continuation chunks); `PLOW_AMD_DECODE_MIN_RUNG=1` for 
 | + XR sched 40 + GEMM DMA | 159 | ~194 | 280 | 483 | 929–942 |
 | + MoE stage-1 pipe (best3) | 144 | 172 | 246 | 405–422 | 811–823 |
 | + decode fold, kw GLU, NORM_Q128 (v8b/best8) | 142.7–144.1 | 170.8–170.9 | 245.9–246.5 | 421.1–421.7 | 823–824 |
+| + QUANT_NARROW, DOWN line stores, align waves (v9/final) | 140.2–140.6 | 165.1–165.5 | 231.9–232.0 | 387.8–388.3 | 735.7–736.1 |
 
 Decode (8 identical prompts, ctx 1k; v8b/best8, ms/step, 2 rounds): M1 41.3–45.9 ms/token,
 M2 51.6–73.5, M4 51.1–54.0, M8 53.6–56.6, M16 61.1–64.6, M32 85.1–85.3, M64 120.2–120.4, M128 181.4
 (start of campaign: M1 ~50–87, M8 87–103, M64 205). Batched M8 at ctx 8k: 58.7 ms/step.
 v9 (+QUANT_NARROW) same-run vs v8b: M2 50.6 vs 55.6–57.0, M8 53.5 vs 56.2–56.4, M32 80.2–82.6 vs
 82.6–85.0, M64 117.8 vs 120.5, M128 177–179 vs 181; prefill unchanged.
+v9/final (same run as best8): M1 37.7 ms/token, M2 49.2, M4 49.5, M8 52.2, M16 63.1, M32 83.5, M64 115.9,
+M128 177.9; greedy T1024/T8192 and oracle logits identical to best8.
 
 Decode determinism: the q_b live-split and o_proj split8 selectors (kept for AITER-CK rounding parity)
 accumulate with bf16 atomics, so near-tie greedy tokens can differ run to run (seen on a ragged
@@ -85,6 +88,8 @@ merge unroll (-9%), decode shared fold (-6% M8, -16% M64), kw decode GLU (-5..-1
 | vLLM c8 | 15.57 s | 34.9 ms | 3268 |
 | vLLM c1 (in8064) | 13.24 s | 19.5 ms | 521 |
 | plow v8b/best8 c8 | 2.07 s | 75.1 ms | 5551 |
+| plow v9/final c8 | 1.96 s | 76.4 ms | 5528 |
+| plow v9/final c1 (in8064) | 0.69 s | 43.8 ms | 1310 |
 | plow v8b/best8 c1 (in8064) | 0.43 s | 43.0 ms | 1392 |
 | plow v8b/best8 c1 (in1024) | 0.32 s | 45.8 ms | 188 |
 
