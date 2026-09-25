@@ -129,6 +129,18 @@ case "${PLOW_MOE_ROUTER_PF_WAVE:-0}" in
   1) A4W4_BK="$A4W4_BK -DPLOW_MOE_ROUTER_PF_WAVE=1" ;;
   *) echo "PLOW_MOE_ROUTER_PF_WAVE must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_DSA_SELECT_V2=1: DSA prefill top-k (op 118) through d_index_select_pf_v2 (same set).
+case "${PLOW_DSA_SELECT_V2:-0}" in
+  0) ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_DSA_SELECT_V2=1" ;;
+  *) echo "PLOW_DSA_SELECT_V2 must be 0 or 1" >&2; exit 2 ;;
+esac
+# PLOW_DSA_IDX_QPW=1: DSA prefill indexer score (op 117) through d_index_score_pf_rowq (bit-identical).
+case "${PLOW_DSA_IDX_QPW:-0}" in
+  0) ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_DSA_IDX_QPW=1" ;;
+  *) echo "PLOW_DSA_IDX_QPW must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_COMBINE_VEC:-0}" in
   0) ;;
   1) A4W4_BK="$A4W4_BK -DPLOW_COMBINE_VEC=1" ;;
