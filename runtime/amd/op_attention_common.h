@@ -5924,21 +5924,23 @@ __device__ void d_index_select_pf(int* __restrict__ idx, const float* __restrict
 }
 
 /* op 118, register-resident form (PLOW_DSA_SELECT_V2). Selects EXACTLY the set of
- * d_index_select_pf<true> (same dsa_pack_key_a key, same k-th key), faster on three counts:
- *   - the row is read from global ONCE into VGPRs (IDXSEL_V2_PER elements per thread, rows up
- *     to IDXSEL_V2_PER * PLOW_THREADS); longer rows fall back to d_index_select_pf<true>;
- *   - 11/11/10-bit score digits then 12/12-bit index digits (3 score passes, not 4);
- *   - the boundary bin is found by a workgroup prefix scan, not a serial 256-bin walk by one
- *     thread (that walk dominated the old kernel: ~256 dependent LDS round trips per pass).
- * Emission is wave-compacted (one LDS atomic per wave). Order within a row is unspecified,
- * as for every other selector. LDS: hist[4096] u32 + red[16] u32. */
+ * d_index_select_pf<true> (same key: score desc, lowest index on ties), faster because:
+ *   - the row lives in VGPRs (IDXSEL_V2_PER per thread, rows up to IDXSEL_V2_PER * PLOW_THREADS;
+ *     longer rows fall back to d_index_select_pf<true>), and the NEXT row is fetched while this
+ *     one is ranked;
+ *   - the 32-bit score is resolved in three 11/11/10-bit passes on 32-bit keys; the two 12-bit
+ *     index passes run only when the boundary score is tied beyond what is needed;
+ *   - the boundary bin is found by a workgroup prefix scan, not by thread 0 walking 256 bins
+ *     (that serial walk was the old kernel's main cost).
+ * Emission is wave-compacted. Order within a row is unspecified, as for every selector.
+ * LDS: hist[4096] u32 + red[16] u32. */
 #ifndef IDXSEL_V2_PER
 #define IDXSEL_V2_PER 32u
 #endif
 __device__ __forceinline__ void idxsel_v2_find(unsigned* hist, unsigned* red, unsigned nb,
                                                unsigned k_rem) {
-    /* thread i owns nb/PLOW_THREADS consecutive bins counted from the TOP; exclusive prefix
-     * over threads in order = population strictly above its bins. */
+    /* thread i owns nb/PLOW_THREADS consecutive bins counted from the TOP; its exclusive prefix
+     * over threads is the population strictly above its bins. */
     const unsigned tid = threadIdx.x, lane = tid & 63u, wave = tid >> 6;
     const unsigned c = nb / PLOW_THREADS;
     const unsigned hi = nb - tid * c; /* bins [hi - c, hi) */
@@ -5980,9 +5982,20 @@ __device__ void d_index_select_pf_v2(int* __restrict__ idx, const float* __restr
     const unsigned tid = threadIdx.x, lane = tid & 63u;
     const unsigned len = (unsigned)as_glob(kv_len)[0];
     const unsigned q_pos0 = len - n_tok;
-    /* (shift, bits) over the 56-bit key: score bits 55..24, then index bits 23..0. */
-    constexpr unsigned SH[5] = {45u, 34u, 24u, 12u, 0u};
-    constexpr unsigned NBIT[5] = {11u, 11u, 10u, 12u, 12u};
+    unsigned nxt[PER];
+    auto fetch = [&](unsigned t) {
+        const unsigned rl = q_pos0 + t + 1u;
+        const bool want = t < n_tok && rl > top_k && rl <= PER * PLOW_THREADS;
+        const float* const sr = Sc + (size_t)t * kv_stride;
+#pragma unroll
+        for (unsigned u = 0; u < PER; u++) {
+            const unsigned s = tid + u * PLOW_THREADS;
+            unsigned b = 0u;
+            if (want && s < rl) __builtin_memcpy(&b, &sr[s], 4);
+            nxt[u] = b;
+        }
+    };
+    fetch(slice);
     for (unsigned t = slice; t < n_tok; t += nblk) {
         const unsigned row_len = q_pos0 + t + 1u;
         int* const row = ib + (size_t)t * top_k;
@@ -5990,56 +6003,81 @@ __device__ void d_index_select_pf_v2(int* __restrict__ idx, const float* __restr
             for (unsigned s = tid; s < top_k; s += PLOW_THREADS)
                 st_act<int>(&row[s], s < row_len ? (int)s : -1);
             __syncthreads();
+            fetch(t + nblk);
             continue;
         }
         if (row_len > PER * PLOW_THREADS) {
             d_index_select_pf<true>(idx, Score, kv_len, n_tok, top_k, kv_stride, 0u, 1u, hist,
                                     red + 8, 1u, t, t + 1u);
+            fetch(t + nblk);
             continue;
         }
-        const float* const sr = Sc + (size_t)t * kv_stride;
-        unsigned sb[PER]; /* monotone score bits; 0 = past the row (never selected: k <= len) */
+        /* Monotone score bits; 0 marks a slot past the row. A real key is never 0 (non-negative
+         * scores keep the sign bit set; ~b is 0 only for the all-ones NaN), so a 0 slot matches
+         * no prefix and is never emitted. */
+        unsigned sb[PER];
 #pragma unroll
         for (unsigned u = 0; u < PER; u++) {
             const unsigned s = tid + u * PLOW_THREADS;
-            unsigned b = 0u;
-            if (s < row_len) {
-                __builtin_memcpy(&b, &sr[s], 4);
-                b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
-            }
-            sb[u] = b;
+            const unsigned b = nxt[u];
+            sb[u] = s < row_len ? ((b & 0x80000000u) ? ~b : (b | 0x80000000u)) : 0u;
         }
-        unsigned long long prefix = 0ull, himask = 0ull;
-        unsigned k_rem = top_k;
-        for (unsigned p = 0; p < 5u; p++) {
+        fetch(t + nblk);
+        constexpr unsigned SH[3] = {21u, 10u, 0u};
+        constexpr unsigned NBIT[3] = {11u, 11u, 10u};
+        unsigned prefix = 0u, himask = 0u, k_rem = top_k, bnd = 0u;
+        for (unsigned p = 0; p < 3u; p++) {
             const unsigned sh = SH[p], nb = 1u << NBIT[p];
             for (unsigned i = tid; i < nb; i += PLOW_THREADS) hist[i] = 0u;
             __syncthreads();
 #pragma unroll
             for (unsigned u = 0; u < PER; u++) {
-                const unsigned s = tid + u * PLOW_THREADS;
-                const unsigned long long key =
-                    ((unsigned long long)sb[u] << 24) | ((row_len - 1u - s) & 0xFFFFFFu);
-                if (s < row_len && (key & himask) == prefix)
-                    atomicAdd(&hist[(unsigned)(key >> sh) & (nb - 1u)], 1u);
+                if (u * PLOW_THREADS >= row_len) break;
+                const unsigned k = sb[u];
+                if (k != 0u && (k & himask) == prefix)
+                    atomicAdd(&hist[(k >> sh) & (nb - 1u)], 1u);
             }
             __syncthreads();
             idxsel_v2_find(hist, red, nb, k_rem);
-            prefix |= (unsigned long long)red[0] << sh;
-            himask |= (unsigned long long)(nb - 1u) << sh;
+            prefix |= red[0] << sh;
+            himask |= (nb - 1u) << sh;
             k_rem -= red[1];
-            const unsigned bnd = red[3];
+            bnd = red[3];
             __syncthreads();
-            if (p == 2u && bnd == k_rem) break; /* whole tied score group is needed */
+        }
+        /* `prefix` is the k-th score; k_rem of its tied group are needed, lowest index first
+         * (index key = row_len - 1 - s, larger is better, as in dsa_pack_key_a). */
+        unsigned iprefix = 0u, imask = 0u;
+        if (bnd != k_rem) {
+            for (unsigned p = 0; p < 2u; p++) {
+                const unsigned sh = p ? 0u : 12u, nb = 4096u;
+                for (unsigned i = tid; i < nb; i += PLOW_THREADS) hist[i] = 0u;
+                __syncthreads();
+#pragma unroll
+                for (unsigned u = 0; u < PER; u++) {
+                    if (u * PLOW_THREADS >= row_len) break;
+                    const unsigned s = tid + u * PLOW_THREADS;
+                    const unsigned ik = (row_len - 1u - s) & 0xFFFFFFu;
+                    if (sb[u] == prefix && (ik & imask) == iprefix)
+                        atomicAdd(&hist[(ik >> sh) & (nb - 1u)], 1u);
+                }
+                __syncthreads();
+                idxsel_v2_find(hist, red, nb, k_rem);
+                iprefix |= red[0] << sh;
+                imask |= (nb - 1u) << sh;
+                k_rem -= red[1];
+                __syncthreads();
+            }
         }
         if (tid == 0) red[2] = 0u;
         __syncthreads();
 #pragma unroll
         for (unsigned u = 0; u < PER; u++) {
+            if (u * PLOW_THREADS >= row_len) break;
             const unsigned s = tid + u * PLOW_THREADS;
-            const unsigned long long key =
-                ((unsigned long long)sb[u] << 24) | ((row_len - 1u - s) & 0xFFFFFFu);
-            const bool take = s < row_len && key >= prefix;
+            const unsigned k = sb[u];
+            const unsigned ik = (row_len - 1u - s) & 0xFFFFFFu;
+            const bool take = k != 0u && (k > prefix || (k == prefix && ik >= iprefix));
             const unsigned long long m = __ballot(take);
             if (m == 0ull) continue;
             const unsigned lead = (unsigned)__builtin_ctzll(m);

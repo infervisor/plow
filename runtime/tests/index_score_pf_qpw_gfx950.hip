@@ -36,9 +36,9 @@ __device__ void run_q(float* s, const bf16* q, const bf16* k, const bf16* w, con
 #endif
 }
 extern "C" __global__ __launch_bounds__(512, 1) void k_q2(float* s, const bf16* q, const bf16* k, const bf16* w,
-                                                         const int* len, unsigned n) { run_q<2, 128, 4096>(s, q, k, w, len, n); }
+                                                         const int* len, unsigned n) { run_q<2, 128, 16384>(s, q, k, w, len, n); }
 extern "C" __global__ __launch_bounds__(512, 1) void k_q3(float* s, const bf16* q, const bf16* k, const bf16* w,
-                                                         const int* len, unsigned n) { run_q<2, 128>(s, q, k, w, len, n); }
+                                                         const int* len, unsigned n) { run_q<1, 128, 16384>(s, q, k, w, len, n); }
 
 static unsigned long long rng = 0x243F6A8885A308D3ull;
 static unsigned nxt() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return (unsigned)(rng >> 11); }
@@ -82,11 +82,11 @@ int main() {
             size_t bad = 0;
             for (unsigned r = 0; r < n; r++)
                 bad += memcmp(&a[(size_t)r * STRIDE], &b[(size_t)r * STRIDE], (size_t)(r + 1) * 4) != 0;
-            printf("T=%5u QPW=%d rows-differ %zu\n", n, v == 1 ? 4096 : 128, bad);
+            printf("T=%5u QPW=%d rows-differ %zu\n", n, v == 1 ? 2 : 1, bad);
             fails += bad != 0;
         }
         const double fl = (double)n * (n + 1) / 2 * 32 * 128 * 2;
-        printf("T=%5u row %8.1f us (%.0f TF/s)  q2t128s4096 %8.1f us (%.0f)  q2t128 %8.1f us (%.0f)\n", n, ms[0] * 1e3,
+        printf("T=%5u row %8.1f us (%.0f TF/s)  rowq<2,128,16384> %8.1f us (%.0f)  rowq<1,128,16384> %8.1f us (%.0f)\n", n, ms[0] * 1e3,
                fl / ms[0] / 1e9, ms[1] * 1e3, fl / ms[1] / 1e9, ms[2] * 1e3, fl / ms[2] / 1e9);
     }
     printf(fails ? "FAIL\n" : "PASS\n");
