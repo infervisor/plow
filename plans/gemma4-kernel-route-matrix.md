@@ -502,3 +502,90 @@ and every FP8 number in this campaign is plow-native by construction. The measur
 cuBLASLt-vs-native route decision is a BF16 result (§6), and that is the honest scope of it.
 Extending the tuner to FP8 means implementing an FP8 Lt path (a datatype/scale/layout change in
 `lt.rs` plus an fp8 admission predicate), not flipping a knob.
+
+## 10. The 1k/2k/4k/8k/16k x C1/C4/C16/C32 ladder on the 2176 packet, paired same-session
+
+Packet `p26lad2` (sha `ab183a7fa4525492`), rungs `[128, 256, 512, 1024, 1152, 2048, 2176, 4096,
+4224]`, all nine structurally complete. vLLM 0.28 measured back to back on the same card in the same
+session, same client, same dataset, prefix caching off on both sides. Raw CSVs in
+`plans/ladder-2176/`. A cell is 4/4 only when plow wins TTFT, TPOT, p99 ITL and out_tok_s.
+
+**Result: 0/20 cells at 4/4.** Per metric: **TTFT 10/20, p99 ITL 13/20, TPOT 2/20, tok/s 0/20.**
+
+### 10.1 The 2176 rung delivered, and it is measurable
+
+2048/C1 TTFT is **56.8 ms**. Before the fix a 2049-row request had no qualified rung below 4224, and
+a 2049-row request on the 4224 rung does the same work as a 4096-row one, which measures **102.5 ms**
+in the very next cell. So the rung is worth **~45 ms, a ~1.8x TTFT improvement at the 2k cell**, and
+2048 now sits correctly between 1024 (38.2) and 4096 (102.5) instead of collapsing onto the 4096
+cost. Padding at the 2k cell is 2049 -> 2176 = 6.2%, against 106% before.
+
+### 10.2 C1 / C4 (realtime profile, nprompt 32), TTFT / TPOT / p99 ITL / tok/s
+
+| in | C | TTFT plow/vLLM | TPOT | p99 ITL | tok/s | score |
+|---|---|---|---|---|---|---|
+| 1024 | 1 | **38.2 / 43.1** | 5.51 / 5.07 | **5.57 / 5.84** | 173.3 / 186.2 | 2/4 |
+| 1024 | 4 | **78.4 / 90.9** | 8.53 / 7.56 | 41.2 / 8.5 | 439.8 / 487.1 | 1/4 |
+| 2048 | 1 | 56.8 / 54.4 | 5.53 / 5.08 | **5.62 / 5.82** | 168.6 / 183.0 | 1/4 |
+| 2048 | 4 | **115.4 / 134.3** | 8.85 / 7.55 | 61.3 / 8.5 | 412.4 / 468.2 | 1/4 |
+| 4096 | 1 | 102.5 / 93.4 | 5.54 / 5.09 | **5.63 / 5.89** | 158.7 / 173.0 | 1/4 |
+| 4096 | 4 | **196.7 / 225.4** | 9.59 / 7.94 | 105.1 / 8.5 | 361.4 / 414.5 | 1/4 |
+| 8192 | 1 | 209.2 / 179.8 | 5.59 / 5.09 | **5.66 / 5.90** | 139.2 / 154.9 | 1/4 |
+| 8192 | 4 | **334.0 / 457.1** | 12.17 / 8.56 | 112.0 / 9.1 | 271.9 / 331.1 | 1/4 |
+| 15000 | 1 | 426.4 / 351.5 | 5.66 / 5.09 | **5.72 / 6.04** | 111.7 / 128.3 | 1/4 |
+| 15000 | 4 | **628.5 / 811.8** | 17.51 / 10.83 | **124.6 / 147.9** | 178.6 / 233.8 | 2/4 |
+
+TTFT 6/10, p99 ITL 6/10, TPOT 0/10, tok/s 0/10.
+
+**TTFT inverts with concurrency.** plow loses every C1 cell from 2048 up (-4% at 2048 to -21% at
+15000) and wins every C4 cell (up to -27% at 8192, -23% at 15000). Adaptive interleave is paying
+under load and costing nothing at C1.
+
+**p99 ITL splits cleanly by concurrency.** plow wins every C1 cell -- MULTISTEP=0 removed the wave,
+as #49 intended -- and loses every C4 cell but 15000, at 41-125 ms against vLLM's flat 8.5-9.1.
+Median ITL is healthy (7.9-8.5), so this is a TAIL: prefill interrupting decode at C4, not the
+multistep wave. It is the largest addressable deficit on the C1/C4 half.
+
+### 10.3 C16 / C32 (high_concurrency profile, nprompt 64)
+
+| in | C | TTFT plow/vLLM | TPOT | p99 ITL | tok/s | score |
+|---|---|---|---|---|---|---|
+| 1024 | 16 | **160.9 / 205.7** | 13.68 / 10.12 | 109.2 / 18.6 | 1070 / 1372 | 1/4 |
+| 1024 | 32 | 1593.6 / 356.6 | 13.60 / 13.51 | 108.9 / 68.8 | 1089 / 1965 | 0/4 |
+| 2048 | 16 | **244.2 / 346.6** | 16.38 / 10.72 | 113.1 / 95.2 | 873 / 1197 | 1/4 |
+| 2048 | 32 | 2044.9 / 546.8 | 16.73 / 16.15 | **112.4 / 131.8** | 872 / 1566 | 1/4 |
+| 4096 | 16 | **403.9 / 523.7** | 21.98 / 13.72 | **119.7 / 142.2** | 635 / 901 | 2/4 |
+| 4096 | 32 | 2916.8 / 899.7 | 22.39 / 22.03 | **117.8 / 152.8** | 637 / 1097 | 1/4 |
+| 8192 | 16 | **811.5 / 928.3** | 35.13 / 20.97 | **133.7 / 159.2** | 384 / 568 | 2/4 |
+| 8192 | 32 | 5088.1 / 1680.1 | **35.75 / 36.33** | **135.3 / 160.5** | 385 / 643 | 2/4 |
+| 15000 | 16 | 2818.2 / 1573.9 | 55.11 / 34.92 | **162.0 / 190.7** | 204 / 339 | 1/4 |
+| 15000 | 32 | 10787.0 / 3114.2 | **55.07 / 62.73** | **161.7 / 189.4** | 204 / 365 | 2/4 |
+
+TTFT 4/10, p99 ITL 7/10, TPOT 2/10, tok/s 0/10.
+
+**The whole C32 column is the 16-slot cap, not a kernel result.** This packet serves 16 slots, so a
+C32 client queues 16 requests behind a full generation. The tell is decisive and is exactly the
+fingerprint in `plow-vs-vllm-metric-fingerprints`: **C32 tok/s equals C16 tok/s to three digits in
+every rung** -- 1088.5/1070.1, 872.2/872.9, 636.5/634.7, 384.8/384.3, 204.1/203.9. C32 TTFT is
+correspondingly 3.0-4.5x vLLM's. `gemma4-26b-a4b.h100.bf16-c32-16k.toml` is the 32-slot packet and
+the recipe header records that it is NOT a uniform win (better at 128/1024 in, worse from 4096 up),
+so the honest reading is: **pick the packet by prompt length, and do not read the C32 column of a
+16-slot packet as a throughput result.** The C16 column is the real high-concurrency evidence, and
+there plow wins TTFT 4/5 and p99 ITL 3/5.
+
+### 10.4 What the board says the levers are
+
+1. **TPOT is the systematic loss: 2/20, and it fully explains tok/s 0/20.** With 1 prompt to 127
+   output tokens, out_tok_s is a TPOT readout, not an independent metric -- these are ONE finding.
+   At C1 the gap is a tight 9-11% (5.51-5.66 vs 5.07-5.09). The two TPOT wins are both at C32/8192+,
+   where vLLM is itself degrading.
+2. **p99 ITL at C4/C16 with short prompts.** 1024/C16 is 109.2 vs 18.6 -- the worst ratio on the
+   board (5.9x). Median ITL is fine, so it is prefill interference in the tail. #44 (pipelined
+   decode / prefill overlap) is aimed exactly here.
+3. **TTFT at C1 for long prompts** (-16% at 8192, -21% at 15000) while C4 wins. Consistent with
+   prefill at only 33% of the compute roof at C1 (the run's own roofline line), i.e. a single
+   request does not fill the machine.
+
+The roofline diagnosis printed alongside the run agrees: decode at **43.0% of the memory roof** and
+prefill at **33.1% of the compute roof** at C1 -- neither phase is near its ceiling at low
+concurrency, which is where the TPOT and C1-TTFT losses sit.
