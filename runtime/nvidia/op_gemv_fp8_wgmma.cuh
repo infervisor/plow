@@ -2,8 +2,14 @@
 
 #define PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES 70720u
 
+/* Narrowest rung that takes the W8A8 tensor-core walk. Rows below 8 run the Rows=8 instance with
+ * zero-padded x rows (the stage already zero-fills m >= M). */
+#ifndef PLOW_NV_FP8_DECODE_WGMMA_MIN
+#define PLOW_NV_FP8_DECODE_WGMMA_MIN 8
+#endif
 __device__ __forceinline__ bool gemv_fp8_wgmma_supported(unsigned M, unsigned K) {
-    return (M == 8 || M == 16) && K && !(K % 16) && blockDim.x == 256;
+    return M >= PLOW_NV_FP8_DECODE_WGMMA_MIN && (M <= 8 || M == 16) && K && !(K % 16) &&
+           blockDim.x == 256;
 }
 
 template <unsigned Rows>

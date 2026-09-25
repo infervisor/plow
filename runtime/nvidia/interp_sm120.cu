@@ -943,6 +943,10 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #define PLOW_NV_ARENA_FLOATS                                                                  \
     (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)
 #endif
+#if PLOW_NV_FP8_DECODE_TC_ACTIVE
+static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_FP8TC_ARENA_BYTES,
+              "FP8 decode tensor-core GEMV reduces its K split through the arena");
+#endif
 #if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
 static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES,
               "FP8 decode WGMMA requires its full arena; incompatible role flags are unsupported");
@@ -2143,6 +2147,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         if (in->i[2] <= PLOW_NV_GEMV_STAGING_BYTES / 2u
 #if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
             || gemv_fp8_wgmma_supported(in->i[0], in->i[2])
+#endif
+#if PLOW_NV_FP8_DECODE_TC_ACTIVE
+            || gemv_fp8_tc_supported(in->i[0], in->i[2])
 #endif
         )
             d_gemv_fp8((__nv_bfloat16*)TEN(0),
