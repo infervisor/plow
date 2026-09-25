@@ -76,6 +76,11 @@ case "${PLOW_FP8_BLK_KW:-0}" in
 esac
 # FA_MERGE_UNROLL4=1: four splits in flight in d_flash_merge (gfx942's form; gfx950 kept the serial
 # merge for bit-identity). Decode's 64-split merge is a dependent-load chain without it.
+case "${PLOW_GEMV_F32_COL:-0}" in
+  0) ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_GEMV_F32_COL=1" ;;
+  *) echo "PLOW_GEMV_F32_COL must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_MERGE_UNROLL4:-0}" in
   0) ;;
   1) A4W4_BK="$A4W4_BK -DFA_MERGE_UNROLL4=1" ;;

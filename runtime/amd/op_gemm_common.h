@@ -5600,6 +5600,37 @@ __device__ void d_gemv_bf16_f32(float* __restrict__ C, const bf16* __restrict__ 
     }
 }
 
+/* Decode router GEMV, one wave per output COLUMN for all M <= 16 rows: the W row is read once in
+ * 16-byte pieces (d_gemv_bf16_f32 reads it once per row, 2 bytes per lane per step) and x stays
+ * L2-resident. f32 reassociation only. Requires K % 512 == 0 and 16-byte aligned rows. */
+template <unsigned MR>
+__device__ void d_gemv_bf16_f32_col(float* __restrict__ C, const bf16* __restrict__ x,
+                                    const bf16* __restrict__ W, unsigned M, unsigned N, unsigned K,
+                                    unsigned slice, unsigned nblk) {
+    const unsigned wave = threadIdx.x / PLOW_WAVE, lane = threadIdx.x % PLOW_WAVE;
+    for (unsigned n = slice * PLOW_WAVES + wave; n < N; n += nblk * PLOW_WAVES) {
+        const bf16* const wn = W + (size_t)n * K;
+        float acc[MR] = {};
+#pragma unroll 4
+        for (unsigned k = lane * 8u; k < K; k += PLOW_WAVE * 8u) {
+            const bf16v8 w = ld_glob8(wn + k);
+#pragma unroll
+            for (unsigned m = 0; m < MR; m++) {
+                if (m >= M) break;
+                const bf16v8 xv = ld_glob8(x + (size_t)m * K + k);
+#pragma unroll
+                for (unsigned j = 0; j < 8; j++) acc[m] += bf2f(xv[j]) * bf2f(w[j]);
+            }
+        }
+#pragma unroll
+        for (unsigned m = 0; m < MR; m++) {
+            if (m >= M) break;
+            const float t = wave_sum(acc[m]);
+            if (lane == 0) C[(size_t)m * N + n] = t;
+        }
+    }
+}
+
 /* FP8 decode GEMV. x is staged in LDS when M*K fits (always true at decode M=1), leaving the whole
  * vector-memory path to the fp8 weight stream — exactly as the bf16 d_gemv_t does. */
 __device__ void d_gemv_fp8(bf16* C, const bf16* x, const unsigned char* W, const float* wscale,

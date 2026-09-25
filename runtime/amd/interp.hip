@@ -877,6 +877,9 @@ extern "C" __device__ unsigned plow_dsa_select_split_arm = 1;
 #ifndef PLOW_FP8_BLK_KW
 #define PLOW_FP8_BLK_KW 0
 #endif
+#ifndef PLOW_GEMV_F32_COL
+#define PLOW_GEMV_F32_COL 0
+#endif
 #ifndef PLOW_QKVA_WAVE1
 #define PLOW_QKVA_WAVE1 0
 #endif
@@ -4018,6 +4021,17 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #define PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS 32u
         case PLOW_DOP_GEMM_F32:
             /* Decode routers need FP32 logits too; keep the MFMA tile out of that bucket. */
+#if PLOW_GEMV_F32_COL
+            if (PLOW_RUNTIME_ROWS(in->i[0]) <= 16u && in->i[2] % 512u == 0u) {
+                if (PLOW_RUNTIME_ROWS(in->i[0]) <= 8u)
+                    d_gemv_bf16_f32_col<8>((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                           PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk);
+                else
+                    d_gemv_bf16_f32_col<16>((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                            PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk);
+                break;
+            }
+#endif
 #if PLOW_BUCKET_PREFILL || PLOW_MIXED_STEP
             if (PLOW_RUNTIME_ROWS(in->i[0]) > PLOW_GEMM_F32_STANDARD_DECODE_MAX_ROWS)
                 d_gemm_f32((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
