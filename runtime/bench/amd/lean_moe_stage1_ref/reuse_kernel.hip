@@ -460,12 +460,12 @@ extern "C" __device__ unsigned plow_moe1_a4_token_gather_1 = 1;
  * about two full memory latencies. Here every load is a branchless global load issued a whole
  * K256 stage before its use (B two stages ahead, A one), so the compiler's vmcnt counts leave
  * the next stage in flight across the MFMA block.
- * LDS: A 2x8192 + A scales 2x512 = 17,408 B, under the 32 KiB bridge alias. */
+ * A's E8M0 rows for the whole K are staged into LDS once, in MFMA lane order.
+ * LDS: A 2x8192 + A scales 64x192 = 28,672 B, under the 32 KiB bridge alias. */
 struct PipeStage {
     u32x4 b[2][2][2];   /* [branch][k-step][ni] */
     uint2 bs[2][2];     /* [branch][ni]: 8 E8M0 bytes, groups 8S..8S+7 */
-    u32x4 a[2];         /* 32 B of one A row for LDS */
-    uint2 as;           /* threads < 64: row tid's 8 E8M0 bytes */
+    u32x4 a[2];         /* A rows a_row0 and a_row0 + 32, 16 B each */
 };
 
 extern "C" __global__ __launch_bounds__(256, 2)
@@ -486,14 +486,14 @@ void plow_moe1_a4_reuse_16x16x128_gfx950(
     float linear_beta,
     const unsigned* __restrict__ row_token) {
     constexpr unsigned TM = 64, TN = 128, ROWB = 128, A_SLOT = TM * ROWB;
-    constexpr unsigned AS_OFF = 2 * A_SLOT, AS_SLOT = 512;
+    constexpr unsigned AS_OFF = 2 * A_SLOT;
     extern __shared__ __align__(16) unsigned char a_lds[];
     const unsigned tid = threadIdx.x;
     const unsigned wave = tid / 64u;
     const unsigned lane = tid % 64u;
     const unsigned lane_k = lane / 16u;
     const unsigned lane_n = lane % 16u;
-    if (hidden % 512u != 0u || inter % TN != 0u) __builtin_trap();
+    if (hidden % 512u != 0u || hidden > 6144u || inter % TN != 0u) __builtin_trap();
     const unsigned n_tiles = inter / TN;
     const int* tile_prefix = meta + 2 * experts;
     const unsigned total_tiles = static_cast<unsigned>(tile_prefix[experts]);
@@ -536,22 +536,36 @@ void plow_moe1_a4_reuse_16x16x128_gfx950(
 
     const unsigned b_off = (n0 + wave * 32u + lane_n) * kbytes + lane_k * 16u;
     const unsigned bs_off = (n0 + wave * 32u + lane_n) * groups;
-    const unsigned a_row = tid / 4u;
-    const unsigned a_chunk = (tid % 4u) * 2u;
+    const unsigned a_row = tid / 8u;
+    const unsigned a_chunk = tid % 8u;
     /* Pad rows (row_token ~0) read token 0; their outputs are never stored. */
-    const unsigned a_tok = row_token[rowbase + a_row];
-    const unsigned as_tok = row_token[rowbase + (tid & 63u)];
-    const PLOW_GLOB unsigned char* a_src = as_glob(activation)
-        + static_cast<size_t>(a_tok == ~0u ? 0u : a_tok) * kbytes + a_chunk * 16u;
-    const PLOW_GLOB unsigned char* as_src = as_glob(activation_scale)
-        + static_cast<size_t>(as_tok == ~0u ? 0u : as_tok) * groups;
+    auto tok_of = [&](unsigned r) {
+        const unsigned t = row_token[rowbase + r];
+        return static_cast<size_t>(t == ~0u ? 0u : t);
+    };
+    /* A: instruction i covers rows 32i + tid/8, whole 128 B lines (8 lanes per row). */
+    const PLOW_GLOB unsigned char* a_src[2] = {
+        as_glob(activation) + tok_of(a_row) * kbytes + a_chunk * 16u,
+        as_glob(activation) + tok_of(a_row + 32u) * kbytes + a_chunk * 16u};
+    {
+        /* A scales, all K: 64 rows x groups bytes as 16 B pieces, stored [group][lane_n][mi]. */
+        const unsigned pieces = groups / 16u;
+        for (unsigned c = tid; c < TM * pieces; c += 256u) {
+            const unsigned r = c / pieces, part = c - r * pieces;
+            const u32x4 v = *reinterpret_cast<const PLOW_GLOB u32x4*>(
+                as_glob(activation_scale) + tok_of(r) * groups + part * 16u);
+            unsigned char* d = a_lds + AS_OFF + (part * 16u) * 64u + (r & 15u) * 4u + r / 16u;
+#pragma unroll
+            for (unsigned b = 0; b < 16; ++b)
+                d[b * 64u] = static_cast<unsigned char>(v[b / 4u] >> ((b % 4u) * 8u));
+        }
+    }
 
     auto load = [&](unsigned s, PipeStage& st) {
         s = min(s, nst - 1u);
         const unsigned k0 = s * 128u;
-        st.a[0] = *reinterpret_cast<const PLOW_GLOB u32x4*>(a_src + k0);
-        st.a[1] = *reinterpret_cast<const PLOW_GLOB u32x4*>(a_src + k0 + 16u);
-        st.as = *reinterpret_cast<const PLOW_GLOB uint2*>(as_src + s * 8u);
+        st.a[0] = *reinterpret_cast<const PLOW_GLOB u32x4*>(a_src[0] + k0);
+        st.a[1] = *reinterpret_cast<const PLOW_GLOB u32x4*>(a_src[1] + k0);
 #pragma unroll
         for (unsigned br = 0; br < 2; ++br) {
 #pragma unroll
@@ -565,25 +579,20 @@ void plow_moe1_a4_reuse_16x16x128_gfx950(
         }
     };
     auto commit_a = [&](const PipeStage& st, unsigned slot) {
-        unsigned char* dst = a_lds + slot * A_SLOT + a_row * ROWB;
-        const unsigned sw = (a_row >> 1) & 7u;
-        *reinterpret_cast<u32x4*>(dst + ((a_chunk ^ sw) * 16u)) = st.a[0];
-        *reinterpret_cast<u32x4*>(dst + (((a_chunk + 1u) ^ sw) * 16u)) = st.a[1];
-        if (tid < TM) {
-            unsigned char* d = a_lds + AS_OFF + slot * AS_SLOT + (tid & 15u) * 4u + tid / 16u;
 #pragma unroll
-            for (unsigned g = 0; g < 8; ++g)
-                d[g * 64u] = static_cast<unsigned char>(
-                    (g < 4 ? st.as.x : st.as.y) >> ((g % 4u) * 8u));
+        for (unsigned h = 0; h < 2; ++h) {
+            const unsigned r = a_row + h * 32u;
+            *reinterpret_cast<u32x4*>(a_lds + slot * A_SLOT + r * ROWB
+                                      + ((a_chunk ^ ((r >> 1) & 7u)) * 16u)) = st.a[h];
         }
     };
-    auto compute = [&](const PipeStage& st, unsigned slot) {
+    auto compute = [&](const PipeStage& st, unsigned slot, unsigned s) {
         const unsigned char* a_slot = a_lds + slot * A_SLOT;
 #pragma unroll
         for (unsigned ks = 0; ks < 2; ++ks) {
             const unsigned chunk = ks * 4u + lane_k;
             const int a_scale_word = *reinterpret_cast<const int*>(
-                a_lds + AS_OFF + slot * AS_SLOT + (chunk * 16u + lane_n) * 4u);
+                a_lds + AS_OFF + ((s * 8u + chunk) * 16u + lane_n) * 4u);
             i32x8 a_frag[4];
 #pragma unroll
             for (unsigned mi = 0; mi < 4; ++mi) {
@@ -629,11 +638,11 @@ void plow_moe1_a4_reuse_16x16x128_gfx950(
     commit_a(p0, 0);
     __syncthreads();
     for (unsigned s = 0; s < nst; s += 2) {
-        compute(p0, 0);
+        compute(p0, 0, s);
         commit_a(p1, 1);
         load(s + 2u, p0);
         __syncthreads();
-        compute(p1, 1);
+        compute(p1, 1, s + 1u);
         commit_a(p0, 0);
         load(s + 3u, p1);
         __syncthreads();
