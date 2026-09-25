@@ -3312,7 +3312,7 @@ static __device__ void d_gemv_fp8(__nv_bfloat16* __restrict__ C, const __nv_bflo
 #if PLOW_NV_FP8_DECODE_TC_ACTIVE
     if (gemv_fp8_tc_supported(M, K)) {
         if (M <= 8) d_gemv_fp8_tc<1, false>(C, x, W, nullptr, scale, nullptr, M, N, K, slice, nblk, (float*)arena);
-        else d_gemv_fp8_tc<2, false>(C, x, W, nullptr, scale, nullptr, M, N, K, slice, nblk, (float*)arena);
+        else d_gemv_fp8_tc2<false>(C, x, W, nullptr, scale, nullptr, M, N, K, slice, nblk, (float*)arena);
         return;
     }
 #endif
@@ -3573,7 +3573,7 @@ static __device__ void d_gemv_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_
 #if PLOW_NV_FP8_DECODE_TC_ACTIVE
     if (gemv_fp8_tc_supported(M, K) && act == PLOW_ACT_GELU_TANH_) {
         if (M <= 8) d_gemv_fp8_tc<1, true>(C, x, Wg, Wu, sg, su, M, N, K, slice, nblk, (float*)arena);
-        else d_gemv_fp8_tc<2, true>(C, x, Wg, Wu, sg, su, M, N, K, slice, nblk, (float*)arena);
+        else d_gemv_fp8_tc2<true>(C, x, Wg, Wu, sg, su, M, N, K, slice, nblk, (float*)arena);
         return;
     }
 #endif

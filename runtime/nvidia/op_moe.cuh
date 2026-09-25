@@ -1742,6 +1742,12 @@ __device__ __forceinline__ bool plow_moe_tc_ok(unsigned N, unsigned K) {
 #ifndef PLOW_MOE_TC_UD
 #define PLOW_MOE_TC_UD PLOW_FP8TC_U1
 #endif
+/* DOWN items of 32 rows: the GLU tile's second row set carries rows +16 instead of the up
+ * matrix, so one pointer chase and one x fragment feed twice the weight bytes per round trip.
+ * Needs H % 32 == 0. */
+#ifndef PLOW_MOE_TC_DOWN2
+#define PLOW_MOE_TC_DOWN2 0
+#endif
 template <bool Glu, bool Dd>
 static __device__ void d_moe_fp8_tc(void* out, const bf16* x, const unsigned char* table,
                                     const unsigned long long* ewt, const unsigned long long* est,
@@ -1756,7 +1762,10 @@ static __device__ void d_moe_fp8_tc(void* out, const bf16* x, const unsigned cha
 #else
     const unsigned ngr = nslot;
 #endif
-    const unsigned tpn = N / 16u, total = ngr * tpn;
+    constexpr bool D2 = !Glu && PLOW_MOE_TC_DOWN2;
+    constexpr bool Pair = Glu || D2; /* two row sets per warp item */
+    constexpr unsigned RI = D2 ? 32u : 16u;
+    const unsigned tpn = N / RI, total = ngr * tpn;
     const unsigned per = (total + nblk - 1u) / nblk;
     const unsigned i0 = slice * per, i1 = min(i0 + per, total);
     const unsigned ntile = i1 > i0 ? i1 - i0 : 0u;
@@ -1788,7 +1797,7 @@ static __device__ void d_moe_fp8_tc(void* out, const bf16* x, const unsigned cha
         const float* sc = nullptr;
         if (active) {
             gi = item / tpn;
-            ra = (item - gi * tpn) * 16u + g;
+            ra = (item - gi * tpn) * RI + g;
             unsigned eid;
 #if PLOW_MOE_FP8_DEDUP
             if constexpr (Dd) {
@@ -1805,14 +1814,15 @@ static __device__ void d_moe_fp8_tc(void* out, const bf16* x, const unsigned cha
             const uint8_t* W = (const uint8_t*)(size_t)wb;
             const uint8_t* wa = W + (size_t)ra * K + t * 16u;
             const uint8_t* wbp = wa + (size_t)8u * K;
-            const uint8_t* ua = Glu ? wa + (size_t)I_moe * K : nullptr;
-            const uint8_t* ub = Glu ? wbp + (size_t)I_moe * K : nullptr;
+            const size_t second = Glu ? (size_t)I_moe * K : (size_t)16u * K;
+            const uint8_t* ua = Pair ? wa + second : nullptr;
+            const uint8_t* ub = Pair ? wbp + second : nullptr;
             const unsigned xs = slot_of(gi, gofs, g < glen ? g : 0u);
             const bf16* const xr[1] = {(Glu ? x + (size_t)(xs / k) * K : x + (size_t)xs * K) + t * 16u};
             const bool vx[1] = {live && g < glen};
-            fp8tc_tile<1, Glu, U, false>(cg, cu, wa, wbp, ua, ub, live, live, xr, vx, nchunk, my_k, ks);
+            fp8tc_tile<1, Pair, U, false>(cg, cu, wa, wbp, ua, ub, live, live, xr, vx, nchunk, my_k, ks);
         }
-        if (ks > 1u) fp8tc_reduce<1, Glu>(cg, cu, red, active, warp, lane, my_k, ks);
+        if (ks > 1u) fp8tc_reduce<1, Pair>(cg, cu, red, active, warp, lane, my_k, ks);
         if (active && my_k == 0u) {
 #pragma unroll
             for (int i = 0; i < 4; i++) {
@@ -1825,8 +1835,11 @@ static __device__ void d_moe_fp8_tc(void* out, const bf16* x, const unsigned cha
                         ((bf16*)out)[(size_t)slot * N + n] = __float2bfloat16(
                             plow_moe_gelu_tanh(cg[0][i] * sc[n]) * (cu[0][i] * sc[I_moe + n]));
                 } else {
-                    ((float*)out)[(size_t)slot * N + n] =
-                        live ? plow_moe_slot_gate(table, slot) * (cg[0][i] * sc[n]) : 0.0f;
+                    const float gate = live ? plow_moe_slot_gate(table, slot) : 0.0f;
+                    ((float*)out)[(size_t)slot * N + n] = live ? gate * (cg[0][i] * sc[n]) : 0.0f;
+                    if constexpr (D2)
+                        ((float*)out)[(size_t)slot * N + n + 16u] =
+                            live ? gate * (cu[0][i] * sc[n + 16u]) : 0.0f;
                 }
             }
         }
@@ -2082,7 +2095,7 @@ static __device__ void d_moe_expert_down_gemma_fp8(
         const unsigned long long* __restrict__ est, unsigned k, unsigned H, unsigned I_moe,
         unsigned n_exp, unsigned slice, unsigned nblk, unsigned nrow, float* arena) {
 #if PLOW_MOE_FP8_TC_ACTIVE
-    if (plow_moe_tc_ok(H, I_moe)) {
+    if (plow_moe_tc_ok(H, I_moe) && (!PLOW_MOE_TC_DOWN2 || !(H % 32u))) {
         d_moe_fp8_tc_any<false>(part, fu, table, ewt, est, k, H, I_moe, I_moe, n_exp, slice, nblk, nrow,
                             arena);
         return;

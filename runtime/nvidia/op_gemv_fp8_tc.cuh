@@ -24,12 +24,17 @@
 #ifndef PLOW_FP8TC_U1
 #define PLOW_FP8TC_U1 4 /* single matrix */
 #endif
+#ifndef PLOW_FP8TC_U2
+#define PLOW_FP8TC_U2 4 /* single matrix, two token groups (M > 8) */
+#endif
 /* Issue the x loads (L2 hits) with the weight loads instead of one chunk at a time in the MMA
- * loop, where each waits out an L2 round trip. 1 = one-group tiles (M <= 8), 2 = all, 0 = off.
+ * loop, where each waits out an L2 round trip. 1 = one-group tiles (M <= 8), 2 = all, 3 = one-group
+ * tiles plus two-group single-matrix tiles, 0 = off.
  * ms/step off -> 1: 12B B=1 8.25 -> 7.25, B=4 8.73 -> 7.61; 26B B=1 4.49 -> 4.31, B=16
- * 14.59 -> 13.57. Two-group tiles lose (12B B=16 10.86 -> 10.99: the x registers double). */
+ * 14.59 -> 13.57. Hoisting two-group GLU tiles loses (the x registers double). With the M > 8
+ * body out of line, 3 + PLOW_FP8TC_U2=4: 12B B=16 10.83 -> 9.86, 26B 8.90 -> 8.74, B<=4 flat. */
 #ifndef PLOW_FP8TC_XHOIST
-#define PLOW_FP8TC_XHOIST 1
+#define PLOW_FP8TC_XHOIST 3
 #endif
 #define PLOW_FP8TC_ARENA_BYTES (PLOW_NV_WARPS * 32u * 16u * 4u)
 
@@ -91,7 +96,7 @@ __device__ __forceinline__ void fp8tc_tile(float (&cg)[NG][4], float (&cu)[NG][4
                                            bool va, bool vb, const __nv_bfloat16* const (&xr)[NG],
                                            const bool (&vx)[NG], unsigned nchunk, unsigned my_k,
                                            unsigned ks) {
-    constexpr bool XH = PLOW_FP8TC_XHOIST >= (NG == 1 ? 1 : 2);
+    constexpr bool XH = NG == 1 ? PLOW_FP8TC_XHOIST >= 1 : (PLOW_FP8TC_XHOIST == 2 || (PLOW_FP8TC_XHOIST == 3 && !Glu));
     constexpr int UX = XH ? U : 1;
     for (unsigned c0 = my_k; c0 < nchunk; c0 += ks * U) {
         uint4 w0[U], w1[U], v0[U], v1[U];
@@ -197,7 +202,7 @@ static __device__ void d_gemv_fp8_tc(__nv_bfloat16* C, const __nv_bfloat16* x, c
     const unsigned nchunk = K / 64u;
     const unsigned my_tile = warp / ks, my_k = warp % ks;
     constexpr int U0 = Glu ? PLOW_FP8TC_U : PLOW_FP8TC_U1;
-    constexpr int U = NG == 1 ? U0 : (U0 > 1 ? U0 / 2 : 1);
+    constexpr int U = NG == 1 ? U0 : Glu ? (U0 > 1 ? U0 / 2 : 1) : PLOW_FP8TC_U2;
     for (unsigned r0 = 0; r0 < ntile; r0 += tiles_per_round) {
         const unsigned tile = r0 + my_tile;
         const bool active = my_tile < tiles_per_round && tile < ntile;
@@ -262,3 +267,20 @@ __device__ __forceinline__ void fp8tc_pf(const uint8_t* W, const uint8_t* Wu, un
     }
 }
 #endif
+
+/* M > 8 runs out of line: its deeper, hoisted instantiation inlined beside the M <= 8 path cost
+ * that path ~0.14 ms/step (12B B=1) with the code never executed. PLOW_FP8TC_NOINLINE2=0 inlines. */
+#ifndef PLOW_FP8TC_NOINLINE2
+#define PLOW_FP8TC_NOINLINE2 1
+#endif
+template <bool Glu>
+#if PLOW_FP8TC_NOINLINE2
+static __device__ __noinline__
+#else
+static __device__ __forceinline__
+#endif
+void d_gemv_fp8_tc2(__nv_bfloat16* C, const __nv_bfloat16* x, const uint8_t* W, const uint8_t* Wu,
+                    const float* sg, const float* su, unsigned M, unsigned N, unsigned K,
+                    unsigned slice, unsigned nblk, float* red) {
+    d_gemv_fp8_tc<2, Glu>(C, x, W, Wu, sg, su, M, N, K, slice, nblk, red);
+}
