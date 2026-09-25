@@ -1441,12 +1441,16 @@ fn glm_quant128_cus(cus: &[u32], rows: u32, k: u32) -> Vec<u32> {
 
 fn emit_glm_qkva_w8a8(
     b: &mut Builder, cus: &[u32], n: &GlmTn, w: &GlmLW,
-    rows: u32, h: u32, ql: u32, dk: u32, dr: u32, dep: u32,
+    rows: u32, h: u32, ql: u32, dk: u32, dr: u32, dep: u32, norm_quantized: bool,
 ) -> u32 {
-    let quant = b.emit(DevOp::QuantFp8Block128, glm_quant128_cus(cus, rows, h), &[dep], |d| {
-        d.t[..3].copy_from_slice(&[n.qkva_xq, n.xn, n.qkva_xs]);
-        d.i[..2].copy_from_slice(&[rows, h]);
-    });
+    let quant = if norm_quantized {
+        dep
+    } else {
+        b.emit(DevOp::QuantFp8Block128, glm_quant128_cus(cus, rows, h), &[dep], |d| {
+            d.t[..3].copy_from_slice(&[n.qkva_xq, n.xn, n.qkva_xs]);
+            d.i[..2].copy_from_slice(&[rows, h]);
+        })
+    };
     b.emit(DevOp::GemmFp8Block128, cus.to_vec(), &[quant], |d| {
         d.t[..7].copy_from_slice(&[n.qlr, n.qkva_xq, w.qkva, n.qkva_xs, w.qkva_s, n.ckvraw, n.krr]);
         d.i[..6].copy_from_slice(&[rows, ql + dk + dr, h, 16, ql, dk]);
@@ -1455,11 +1459,16 @@ fn emit_glm_qkva_w8a8(
 
 fn emit_glm_mla_query_w8a8(
     b: &mut Builder, cus: &[u32], n: &GlmTn, w: &GlmLW, rows: u32, dep: u32, mha: bool,
+    norm_quantized: bool,
 ) -> (u32, u32) {
-    let quant = b.emit(DevOp::QuantFp8Block128, glm_quant128_cus(cus, rows, 2048), &[dep], |d| {
-        d.t[..3].copy_from_slice(&[n.qb_xq, n.qlat, n.qb_xs]);
-        d.i[..2].copy_from_slice(&[rows, 2048]);
-    });
+    let quant = if norm_quantized {
+        dep
+    } else {
+        b.emit(DevOp::QuantFp8Block128, glm_quant128_cus(cus, rows, 2048), &[dep], |d| {
+            d.t[..3].copy_from_slice(&[n.qb_xq, n.qlat, n.qb_xs]);
+            d.i[..2].copy_from_slice(&[rows, 2048])
+        })
+    };
     let zero = b.emit(DevOp::ZeroF32, elem_cus(cus, rows * 1024), &[dep], |d| {
         d.t[0] = n.qb;
         d.i[..2].copy_from_slice(&[rows, 1024]);
@@ -4227,7 +4236,12 @@ pub(crate) fn emit_glm_mla(
     // blocks are emitted in slot order, layer 0's input comes from the embedding (nothing upstream
     // to fold into), and `seam_next_gin` is what guarantees the producer actually did it (it
     // returns None for the last slot, so the two ends of the seam agree by construction).
-    let c_rn1 = if slot > 0 && glm_fuse_seam(b, tp, w.gin) {
+    let seam_fold = slot > 0 && glm_fuse_seam(b, tp, w.gin);
+    let dec_norm_q = emit_config::active().glm_norm_q128
+        && emit_config::active().glm_qkva_w8a8
+        && !seam_fold
+        && h % 128 == 0;
+    let c_rn1 = if seam_fold {
         assert_eq!(
             pre.len(),
             1,
@@ -4244,6 +4258,12 @@ pub(crate) fn emit_glm_mla(
             d.i[0] = rows;
             d.i[1] = h;
             d.f[0] = eps;
+            if dec_norm_q {
+                // PLOW_GLM_NORM_Q128: the block-128 quant rides the norm (d_rmsnorm_q128).
+                d.t[3] = n.qkva_xq;
+                d.t[4] = n.qkva_xs;
+                d.i[4] = 128;
+            }
         })
     };
     // 2/6/8 down-projections. FUSION A (audit §A): q_a, kv_a and k_rope ALL read n.xn with K=h, so
@@ -4251,7 +4271,7 @@ pub(crate) fn emit_glm_mla(
     //   fills every wave (fixing the k_rope/kv_a CU-starvation) and deletes 2 gates/layer. Byte-exact
     //   to the three Gemvs. Legal: M*K = h fits GM_LDS_HALVES.
     let (c_qad, c_ckvd, c_krr) = if emit_config::active().glm_qkva_w8a8 {
-        let done = emit_glm_qkva_w8a8(b, &all, n, w, rows, h, ql, dk, dr, c_rn1);
+        let done = emit_glm_qkva_w8a8(b, &all, n, w, rows, h, ql, dk, dr, c_rn1, dec_norm_q);
         (done, done, done)
     } else if fuse_a {
         // n = ql + dk + dr concatenated columns; `blocked_gemv_cus` drops the ceiling tail that
@@ -4391,7 +4411,7 @@ pub(crate) fn emit_glm_mla(
     //   Byte-exact. q_rope then gets a dynamic INTERLEAVED RoPE per head at pos (no norm); HD=64
     //   selects the interleaved template; q is not cached (out_row0/stride 0).
     let fp8_q = emit_config::active().glm_mla_w8a8
-        .then(|| emit_glm_mla_query_w8a8(b, &all, n, w, rows, c_rnq, false));
+        .then(|| emit_glm_mla_query_w8a8(b, &all, n, w, rows, c_rnq, false, false));
     let (c_qa, c_qrr) = if let Some((done, _)) = fp8_q {
         (done, done)
     } else if fuse_g {
@@ -7266,10 +7286,13 @@ pub(crate) fn emit_glm_mla_prefill(
     // split; T rows already parallelise"). Each is a separate tiled GEMM over the whole machine.
     // PLOW_GLM_GEMM_BLK: q_a quantizes `xn` into the shared FP8 scratch and kv_a reads it back,
     // after q_a by an explicit edge.
+    // PLOW_GLM_NORM_Q128: the q_a norm also writes q_b's block-128 FP8 input (d_rmsnorm_q128).
+    let pf_norm_q = emit_config::active().glm_norm_q128 && emit_config::active().glm_mla_w8a8
+        && proj_g.is_none() && ql % 128 == 0;
     let (c_ckvd, c_krr, c_rnq) = if let Some((g, _)) = proj_g {
         (g, g, g)
     } else if emit_config::active().glm_qkva_w8a8 {
-        let done = emit_glm_qkva_w8a8(b, &all, n, w, t, h, ql, dk, dr, c_rn1);
+        let done = emit_glm_qkva_w8a8(b, &all, n, w, t, h, ql, dk, dr, c_rn1, false);
         let norm = b.emit(DevOp::RmsNorm, pf_wide_cus(n_cu, t), &[done], |d| {
             d.t[..3].copy_from_slice(&[n.qlat, n.qlr, w.gqa]);
             d.i[..2].copy_from_slice(&[t, ql]);
@@ -7327,6 +7350,12 @@ pub(crate) fn emit_glm_mla_prefill(
             d.i[0] = t;
             d.i[1] = ql;
             d.f[0] = eps;
+            if pf_norm_q {
+                // PLOW_GLM_NORM_Q128: q_b's block-128 activation quant rides the q_a norm.
+                d.t[3] = n.qb_xq;
+                d.t[4] = n.qb_xs;
+                d.i[4] = 128;
+            }
         });
         (c_ckvd, c_krr, c_rnq)
     };
@@ -7344,7 +7373,7 @@ pub(crate) fn emit_glm_mla_prefill(
     // bit 9). Fresh single-chunk prefill only: the device refuses kv_len != t.
     let mla_mha = emit_config::active().glm_mla_mha && emit_config::active().glm_mla_w8a8;
     let fp8_q = emit_config::active().glm_mla_w8a8
-        .then(|| emit_glm_mla_query_w8a8(b, &all, n, w, t, c_rnq, mla_mha));
+        .then(|| emit_glm_mla_query_w8a8(b, &all, n, w, t, c_rnq, mla_mha, pf_norm_q));
     let c_qa = match fp8_q.map(|(done, _)| (done, done)).or(rowband_q) {
         Some((c_qa, _)) => c_qa,
         None => gemm(b, n.qa, n.qlat, w.wqa, w.wqa_s, nh_l * dk, ql, &[c_rnq]),
