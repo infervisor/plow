@@ -7,7 +7,22 @@
  * — so each wave_sum is the same addition tree and block_sum's combine (0 + p0 + p1 + the zero
  * sums of the idle waves) is replayed term for term. The LayerNorm result is rounded to bf16
  * before the rope, as the separate pair stores and reloads it. The HeadNormRope skip_norm scale
- * (x * 1.0f * 1.0f) is the identity and is dropped. */
+ * (x * 1.0f * 1.0f) is the identity and is dropped.
+ *
+ * d_gemm_small_dual: two GemmSmall over the same A (the indexer wk and weights_proj, N = 128 and
+ * 32: 128 tiles each at T8192, half the GPU apiece) in one packet, each GEMM on its own share of
+ * the workgroups in proportion to its tile count. Per-tile arithmetic is d_gemm_small's. Needs
+ * op_gemm.h.
+ *
+ * d_dsa_rope_vec: d_headnorm_rope(_ilp)<128, interleaved> with skip_norm, no gamma and a plain
+ * row-major output (the indexer q rope, in place, and the key rope) as 16-byte chunks: a lane
+ * owns 8 consecutive head dims, so each rope pair (2i, 2i+1) is lane-local and the cos/sin are
+ * one float4 each. Bit-identical.
+ *
+ * The rope is written as the explicit fma(u, c, +-(partner * s)) that hipcc contracts the shipped
+ * `u * c -+ partner * s` into (gfx950 ISA: v_pk_mul then v_pk_fma). Left as the expression, the
+ * lane-local form here is SLP-vectorised into two v_pk_mul + v_sub/v_add first and never
+ * contracted, which differs in the last bit. */
 #pragma once
 
 #ifndef DSA_KPREP_G
@@ -85,10 +100,75 @@ __device__ void d_dsa_k_prep(bf16* __restrict__ out, const bf16* __restrict__ x,
 #pragma unroll
             for (unsigned e = 0; e < 2; e++) {
                 const float partner = __shfl_xor(u[e], 1, PLOW_WAVE);
-                const float r = ((lane & 1u) == 0u) ? (u[e] * c[q][e] - partner * s[q][e])
-                                                    : (u[e] * c[q][e] + partner * s[q][e]);
+                const float ps = partner * s[q][e];
+                const float r = __builtin_fmaf(u[e], c[q][e], (lane & 1u) == 0u ? -ps : ps);
                 st_act1(&og[(size_t)(out_row0 + t) * HD + lane + e * 64], f2bf(r));
             }
+        }
+    }
+}
+
+__device__ void d_gemm_small_dual(bf16* C0, bf16* C1, const bf16* A, const bf16* B0, const bf16* B1,
+                                  unsigned M, unsigned N0, unsigned N1, unsigned K, unsigned slice,
+                                  unsigned nblk, bf16* lds) {
+    const unsigned tm = (M + GM_SM_BM - 1) / GM_SM_BM;
+    const unsigned t0 = tm * ((N0 + GM_SM_BN - 1) / GM_SM_BN), t1 = tm * ((N1 + GM_SM_BN - 1) / GM_SM_BN);
+    if (nblk < 2u) {
+        d_gemm_small(C0, A, B0, M, N0, K, slice, nblk, lds);
+        __syncthreads();
+        d_gemm_small(C1, A, B1, M, N1, K, slice, nblk, lds);
+        return;
+    }
+    unsigned nb0 = (unsigned)(((unsigned long long)nblk * t0 + (t0 + t1) / 2) / (t0 + t1));
+    nb0 = nb0 < 1u ? 1u : (nb0 > nblk - 1u ? nblk - 1u : nb0);
+    if (slice < nb0)
+        d_gemm_small(C0, A, B0, M, N0, K, slice, nb0, lds);
+    else
+        d_gemm_small(C1, A, B1, M, N1, K, slice - nb0, nblk - nb0, lds);
+}
+
+#ifndef DSA_ROPE_G
+#define DSA_ROPE_G 4u
+#endif
+__device__ void d_dsa_rope_vec(bf16* out, const bf16* x, const float* __restrict__ cosb,
+                               const float* __restrict__ sinb, const int* __restrict__ pos,
+                               unsigned ntok, unsigned nhead, unsigned out_row0, unsigned slice,
+                               unsigned nblk) {
+    constexpr unsigned G = DSA_ROPE_G, CPH = 128 / 8; /* 16-byte chunks per head */
+    const unsigned per_tok = nhead * CPH, total = ntok * per_tok;
+    const auto* cg = as_glob(cosb);
+    const auto* sg = as_glob(sinb);
+    const auto* pg = as_glob(pos);
+    bf16* const ob = out + (size_t)out_row0 * nhead * 128;
+    for (unsigned b0 = slice * G * PLOW_THREADS; b0 < total; b0 += nblk * G * PLOW_THREADS) {
+        bf16v8 v[G];
+        float4 c[G], s[G];
+#pragma unroll
+        for (unsigned q = 0; q < G; q++) {
+            const unsigned id = b0 + q * PLOW_THREADS + threadIdx.x;
+            const unsigned ic = id < total ? id : total - 1u;
+            const unsigned t = ic / per_tok;
+            const unsigned position = pg ? (unsigned)pg[t] : out_row0 + t;
+            const size_t p = (size_t)position * 64 + (ic % CPH) * 4;
+            v[q] = ld_glob8(x + (size_t)ic * 8);
+            c[q] = *(const PLOW_GLOB float4*)(cg + p);
+            s[q] = *(const PLOW_GLOB float4*)(sg + p);
+        }
+#pragma unroll
+        for (unsigned q = 0; q < G; q++) {
+            const unsigned id = b0 + q * PLOW_THREADS + threadIdx.x;
+            if (id >= total) break;
+            const float cc[4] = {c[q].x, c[q].y, c[q].z, c[q].w};
+            const float ss[4] = {s[q].x, s[q].y, s[q].z, s[q].w};
+            bf16v8 o;
+#pragma unroll
+            for (unsigned k = 0; k < 8; k++) {
+                const float u = bf2f(v[q][k]), partner = bf2f(v[q][k ^ 1u]);
+                const float ps = partner * ss[k >> 1];
+                const float r = __builtin_fmaf(u, cc[k >> 1], (k & 1u) == 0u ? -ps : ps);
+                o[k] = f2bf(r);
+            }
+            st_glob8(ob + (size_t)id * 8, o);
         }
     }
 }

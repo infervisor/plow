@@ -400,8 +400,9 @@ struct Shapes {
     /// arm it falls to never reads `t[7]`. The result is full causal attention where the model
     /// was trained sparse: no trap, no NaN, a fluent answer to a different question.
     glm_dsa_pf: bool,
-    /// Any `HeadNormRope` with pair_mode 3 (the fused DSA key prep): a pre-arm object runs it as
-    /// the plain half-split rope on the un-normed key. PLOW_DSA_PREP.
+    /// Any `HeadNormRope` with pair_mode 3 (the fused DSA key prep) or dual `GemmSmall` (t4): a
+    /// pre-arm object runs the plain rope on the un-normed key / never writes the second GEMM.
+    /// PLOW_DSA_PREP.
     dsa_prep: bool,
     dsa_decode_batch: bool,
     dcp_index_canon: bool,
@@ -619,6 +620,9 @@ fn shapes(m: &Model) -> Shapes {
                 DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall | DevOp::Gemv => {
                     if op == DevOp::GemmMed && inst.t[5] != packet::TENSOR_NONE {
                         s.glm_fuse_post = true;
+                    }
+                    if op == DevOp::GemmSmall && inst.t[4] != packet::TENSOR_NONE {
+                        s.dsa_prep = true;
                     }
                     if inst.t[7] != packet::TENSOR_NONE {
                         s.linear_bias = true;

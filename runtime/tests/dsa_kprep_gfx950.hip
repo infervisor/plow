@@ -16,6 +16,7 @@
 #include <vector>
 #include "amd_common.h"
 #if defined(__HIP_DEVICE_COMPILE__)
+#include "op_gemm.h"
 #include "op_norm.h"
 #include "dsa_prep.h"
 #endif
@@ -49,6 +50,21 @@ extern "C" __global__ __launch_bounds__(512, 1) void k_fused(bf16* o, const bf16
                                                             unsigned ntok, unsigned row0, unsigned feat) {
 #if defined(__HIP_DEVICE_COMPILE__)
     d_dsa_k_prep(o, x, g, b, c, s, pos, ntok, feat, 1e-6f, row0, blockIdx.x, gridDim.x);
+#endif
+}
+
+extern "C" __global__ __launch_bounds__(512, 1) void k_hnr_ilp_nh(bf16* o, const bf16* x, const float* c,
+                                                                 const float* s, const int* pos, unsigned ntok,
+                                                                 unsigned nh, unsigned row0) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    d_headnorm_rope_ilp<128, true>(o, x, nullptr, c, s, pos, ntok, nh, 1e-5f, row0, 0, 0xFFFFFFFFu, 1, blockIdx.x,
+                                   gridDim.x, 0);
+#endif
+}
+extern "C" __global__ __launch_bounds__(512, 1) void k_vec(bf16* o, const bf16* x, const float* c, const float* s,
+                                                          const int* pos, unsigned ntok, unsigned nh, unsigned row0) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    d_dsa_rope_vec(o, x, c, s, pos, ntok, nh, row0, blockIdx.x, gridDim.x);
 #endif
 }
 
@@ -138,6 +154,54 @@ int main() {
                cs.row0, ms[0] * 1e3, ms[1] * 1e3, ms[2] * 1e3, same ? "identical" : "DIFFER",
                same2 ? "identical" : "DIFFER", ndiff);
         fails += !same || !same2;
+    }
+    {   /* d_dsa_rope_vec vs d_headnorm_rope_ilp: q (32 heads, in place) and k (1 head, cache row0). */
+        const size_t qn = (size_t)8192 * 32 * 128;
+        std::vector<unsigned short> hq(qn);
+        for (auto& e : hq) e = tobf(((int)(rnd() % 65536) - 32768) / 4096.0f);
+        bf16 *q0, *q1;
+        CK(hipMalloc(&q0, qn * 2)); CK(hipMalloc(&q1, qn * 2));
+        struct VC { unsigned nt, nh, row0; bool inplace; } vcs[] = {
+            {8192, 32, 0, true}, {4096, 32, 0, true}, {1000, 32, 0, true}, {16384, 1, 0, false}, {3000, 1, 12288, false}};
+        for (auto v : vcs) {
+            std::vector<int> hp(v.nt);
+            for (unsigned t = 0; t < v.nt; t++) hp[t] = (int)(v.row0 + t);
+            CK(hipMemcpy(pos, hp.data(), v.nt * 4, hipMemcpyHostToDevice));
+            float ms[2];
+            for (int k = 0; k < 2; k++) {
+                bf16* o = k ? q1 : q0;
+                auto run = [&]() {
+                    if (v.inplace) CK(hipMemcpy(o, hq.data(), (size_t)v.nt * v.nh * 256, hipMemcpyHostToDevice));
+                    const bf16* in = v.inplace ? o : x;
+                    bf16* dst = v.inplace ? o : (k ? o2 : o0);
+                    if (k) hipLaunchKernelGGL(k_vec, dim3(256), dim3(512), 0, 0, dst, in, c, s, pos, v.nt, v.nh, v.row0);
+                    else hipLaunchKernelGGL(k_hnr_ilp_nh, dim3(256), dim3(512), 0, 0, dst, in, c, s, pos, v.nt, v.nh, v.row0);
+                };
+                if (!v.inplace) { CK(hipMemset(k ? o2 : o0, 0x5a, cache)); }
+                run();
+                CK(hipDeviceSynchronize());
+                float tot = 0;
+                for (int i = 0; i < 10; i++) {
+                    if (v.inplace) CK(hipMemcpy(o, hq.data(), (size_t)v.nt * v.nh * 256, hipMemcpyHostToDevice));
+                    CK(hipEventRecord(e0));
+                    if (k) hipLaunchKernelGGL(k_vec, dim3(256), dim3(512), 0, 0, v.inplace ? o : o2, v.inplace ? o : x, c, s, pos, v.nt, v.nh, v.row0);
+                    else hipLaunchKernelGGL(k_hnr_ilp_nh, dim3(256), dim3(512), 0, 0, v.inplace ? o : o0, v.inplace ? o : x, c, s, pos, v.nt, v.nh, v.row0);
+                    CK(hipEventRecord(e1)); CK(hipEventSynchronize(e1));
+                    float m1; CK(hipEventElapsedTime(&m1, e0, e1)); tot += m1;
+                }
+                if (v.inplace) run();
+                CK(hipDeviceSynchronize());
+                ms[k] = tot / 10;
+            }
+            const size_t nbytes = v.inplace ? (size_t)v.nt * v.nh * 256 : cache;
+            std::vector<unsigned short> a(nbytes / 2), f(nbytes / 2);
+            CK(hipMemcpy(a.data(), v.inplace ? q0 : o0, nbytes, hipMemcpyDeviceToHost));
+            CK(hipMemcpy(f.data(), v.inplace ? q1 : o2, nbytes, hipMemcpyDeviceToHost));
+            const bool same = !memcmp(a.data(), f.data(), nbytes);
+            printf("rope ntok=%5u nhead=%2u row0=%5u  hnr_ilp %7.1f us  vec %7.1f us  %s\n", v.nt, v.nh, v.row0,
+                   ms[0] * 1e3, ms[1] * 1e3, same ? "identical" : "DIFFER");
+            fails += !same;
+        }
     }
     {   /* LayerNorm half alone: identity rope (cos 1, sin 0) must reproduce the LayerNorm output. */
         std::vector<float> one((size_t)CTX * 64, 1.0f), zero((size_t)CTX * 64, 0.0f);

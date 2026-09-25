@@ -6444,9 +6444,31 @@ fn emit_glm_dsa_prefill_select(
             d.j[1] = KV_MASK_NONE;
         })
     });
-    let c_k0 = match gathered {
-        Some(g) => g,
-        None => bf16_gemm(b, n.kidx_pf, n.xn, w.iwk, di, h, &[pre[0]]),
+    // PLOW_GLM_DSA_KW_DUAL: wk and weights_proj as ONE GemmSmall packet (t3/t4/i3 = the second
+    // GEMM), their tiles sharing the workgroups; per-element arithmetic unchanged.
+    let small = |nn: u32| pick_tile(t, nn, h, n_cu, kernelcaps::QuantScheme::None) == DevOp::GemmSmall;
+    let c_kw = (emit_config::active().glm_dsa_kw_dual
+        && select
+        && gathered.is_none()
+        && c.index_kpool == 1
+        && small(di)
+        && small(hi))
+    .then(|| {
+        b.emit(DevOp::GemmSmall, all.to_vec(), &[pre[0]], |d| {
+            d.t[0] = n.kidx_pf;
+            d.t[1] = n.xn;
+            d.t[2] = w.iwk;
+            d.t[3] = n.widx_pf;
+            d.t[4] = w.iwp;
+            d.i[0] = t;
+            d.i[1] = di;
+            d.i[2] = h;
+            d.i[3] = hi;
+        })
+    });
+    let c_k0 = match (gathered, c_kw) {
+        (Some(g), _) | (None, Some(g)) => g,
+        (None, None) => bf16_gemm(b, n.kidx_pf, n.xn, w.iwk, di, h, &[pre[0]]),
     };
     // PLOW_GLM_DSA_KPREP: the key LayerNorm folds into the rope write below (pair_mode 3).
     let kprep = emit_config::active().glm_dsa_kprep
@@ -6675,7 +6697,7 @@ fn emit_glm_dsa_prefill_select(
         return c_ki;
     }
     let c_qi = c_qi.unwrap();
-    let c_w = match gathered {
+    let c_w = match gathered.or(c_kw) {
         Some(g) => g,
         None => b.emit(
             pick_tile(t, hi, h, n_cu, kernelcaps::QuantScheme::None),

@@ -752,6 +752,9 @@ pub struct EmitConfig {
     /// pair_mode 3; objects need PLOW_DSA_PREP=1).
     #[arg(long, env = "PLOW_GLM_DSA_KPREP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_dsa_kprep: bool,
+    /// DSA indexer wk + weights_proj as one dual GemmSmall packet (objects need PLOW_DSA_PREP=1).
+    #[arg(long, env = "PLOW_GLM_DSA_KW_DUAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dsa_kw_dual: bool,
 
     /// Set by [`super::apply_production_defaults`] when this emit is the QUALIFIED GLM target —
     /// gfx942, TP8, 304 CU. The nine knobs whose accessors read it are `Option<bool>` precisely
@@ -1514,6 +1517,7 @@ impl EmitConfig {
             glm_dsa_pf: env_bool("PLOW_GLM_DSA_PF"),
             glm_dsa_pf_b8: env_bool("PLOW_GLM_DSA_PF_B8"),
             glm_dsa_kprep: env_bool("PLOW_GLM_DSA_KPREP"),
+            glm_dsa_kw_dual: env_bool("PLOW_GLM_DSA_KW_DUAL"),
             glm_production_defaults: false,
             glm_fp8_kv: env_bool_opt("PLOW_GLM_FP8_KV"),
             glm_moe_aiter: env_bool_opt("PLOW_GLM_MOE_AITER"),
