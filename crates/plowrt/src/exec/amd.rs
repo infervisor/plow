@@ -846,6 +846,8 @@ struct MoeStage1A4QuantArgs {
     row_capacity: u32,
     experts: u32,
     hidden: u32,
+    /// Token-gather objects only (`plow_moe1_a4_token_gather_1`); the old tail padding.
+    tokens: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<MoeStage1A4QuantArgs>() == 56);
@@ -867,9 +869,13 @@ struct MoeStage1A4ReuseArgs {
     act: u32,
     beta: f32,
     linear_beta: f32,
+    /// Token-gather objects only: A4 rows are read at `row_token[row]`. Sorted-A4 objects take
+    /// the first `MOE_STAGE1_A4_SORTED_ARGS` bytes.
+    row_token: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<MoeStage1A4ReuseArgs>() == 88);
+const _: () = assert!(std::mem::size_of::<MoeStage1A4ReuseArgs>() == 96);
+const MOE_STAGE1_A4_SORTED_ARGS: usize = 88;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -2342,6 +2348,7 @@ fn moe_mxfp4_routes_with_scratch(
                             row_capacity,
                             experts: d.i[2],
                             hidden: d.i[1],
+                            tokens: prog.t,
                         },
                         args: MoeStage1A4ReuseArgs {
                             out: addr(d.t[0], "out")?,
@@ -2358,6 +2365,7 @@ fn moe_mxfp4_routes_with_scratch(
                             act: d.i[5],
                             beta: f32::from_bits(d.fj[0]),
                             linear_beta: f32::from_bits(d.fj[1]),
+                            row_token: addr(d.t[5], "row_token")?,
                         },
                         quant_grid: 1024,
                         grid,
@@ -2663,6 +2671,7 @@ fn moe_mxfp4_routes_with_scratch(
                                 row_capacity,
                                 experts: d.i[2],
                                 hidden: d.i[1],
+                                tokens: prog.t,
                             },
                             args: MoeStage1A4ReuseArgs {
                                 out: addr(d.t[0], "out")?,
@@ -2679,6 +2688,7 @@ fn moe_mxfp4_routes_with_scratch(
                                 act: d.i[5],
                                 beta: f32::from_bits(d.fj[0]),
                                 linear_beta: f32::from_bits(d.fj[1]),
+                                row_token: addr(d.t[5], "row_token")?,
                             },
                             quant_grid: 1024,
                             grid,
@@ -6112,7 +6122,8 @@ pub struct AmdEngine {
     _kda_keyfeed_scratch: Option<DeviceMem>,
     k_moe_stage1_mxfp4: Option<HsaKernel>,
     k_moe_stage1_a4_quant: Option<HsaKernel>,
-    k_moe_stage1_a4_reuse: Option<HsaKernel>,
+    /// The GEMM and its kernarg bytes (sorted-A4 or token-gather ABI).
+    k_moe_stage1_a4_reuse: Option<(HsaKernel, usize)>,
     _moe_stage1_a4_scratch: Option<DeviceMem>,
     k_moe_stage2_mxfp4: Option<HsaKernel>,
     k_moe_combine: Option<HsaKernel>,
@@ -8504,9 +8515,13 @@ impl AmdEngine {
                         RuntimeError::Device(format!("{NAME}: no A4 reuse symbol: {e}"))
                     })?;
                     let qwant = std::mem::size_of::<MoeStage1A4QuantArgs>() as u32;
-                    let rwant = std::mem::size_of::<MoeStage1A4ReuseArgs>() as u32;
+                    let rwant = if syms.contains(&"plow_moe1_a4_token_gather_1") {
+                        std::mem::size_of::<MoeStage1A4ReuseArgs>()
+                    } else {
+                        MOE_STAGE1_A4_SORTED_ARGS
+                    };
                     if ![qwant, qwant + 256].contains(&quant.kernarg_size())
-                        || ![rwant, rwant + 256].contains(&reuse.kernarg_size())
+                        || ![rwant as u32, rwant as u32 + 256].contains(&reuse.kernarg_size())
                         || quant.private_segment_size() != 0
                         || reuse.private_segment_size() != 0
                     {
@@ -8517,7 +8532,7 @@ impl AmdEngine {
                         )));
                     }
                     EngineDevice::set_max_dynamic_smem(&*be, reuse, 32_768)?;
-                    (Some(quant), Some(reuse))
+                    (Some(quant), Some((reuse, rwant)))
                 } else {
                     (None, None)
                 };
@@ -12517,7 +12532,7 @@ impl AmdEngine {
                 self.seg_launches += 4;
                 return Ok(());
             }
-            if let (Some(quant), Some(kernel), Some(PrefillSegmentRoute::MoeStage1A4Reuse(route))) = (
+            if let (Some(quant), Some((kernel, args_bytes)), Some(PrefillSegmentRoute::MoeStage1A4Reuse(route))) = (
                 self.k_moe_stage1_a4_quant,
                 self.k_moe_stage1_a4_reuse,
                 self.progs[p].prefill_routes.get(seg).copied(),
@@ -12537,7 +12552,7 @@ impl AmdEngine {
                     route.grid,
                     256,
                     32_768,
-                    as_bytes(std::slice::from_ref(&route.args)),
+                    &as_bytes(std::slice::from_ref(&route.args))[..args_bytes],
                     None,
                 )?;
                 self.seg_launches += 2;
