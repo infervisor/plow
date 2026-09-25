@@ -281,6 +281,15 @@ extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
 #include "mla_mha_pf.h"
 extern "C" __device__ unsigned plow_mla_mha_arm_1 = 1;
 #endif
+/* DSA sparse MLA prefill, 8-query packs: FlashMlaPrefill with t7 = union table and i6 bit 31
+ * (mla_sparse_pf.h). Flash object only; bf16 latent out, no merge. */
+#ifndef PLOW_MLA_SPARSE_ARM
+#define PLOW_MLA_SPARSE_ARM 0
+#endif
+#if PLOW_MLA_SPARSE_ARM && defined(PLOW_BUCKET_FLASH) && PLOW_CDNA4
+#include "mla_sparse_pf.h"
+extern "C" __device__ unsigned plow_mla_sparse_arm_1 = 1;
+#endif
 #include "op_norm.h" /* block_max — needed by op_dsa_pool.h below */
 #include "op_dsa_pool.h"
 #include "op_hyperconn.h"
@@ -1063,6 +1072,9 @@ typedef union __align__(16) {
 #endif
 #if PLOW_MLA_MHA_ARM && defined(PLOW_BUCKET_FLASH) && PLOW_CDNA4
     bf16 mha[mla_mha::LDS_BYTES / 2]; /* MHA-form MLA prefill: 2 stages x (K + V) */
+#endif
+#if PLOW_MLA_SPARSE_ARM && defined(PLOW_BUCKET_FLASH) && PLOW_CDNA4
+    unsigned char msp[mla_sp::LDS_BYTES]; /* DSA sparse MLA prefill: 2 gather stages + ring */
 #endif
 #if PLOW_MLA_PREFILL
     /* MLA latent PREFILL tiles: Q|K staged plus the P transpose. Bigger than `fmla` (the
@@ -2990,6 +3002,22 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
      * still traps, exactly as it did before this arm existed -- a blob that needs it and an
      * object that lacks it is a hard stop, never a silently wrong answer. */
     const bool pf_nope = (in->i[3] & 0x80000000u) != 0;
+    const bool pf_sparse8 = in->op == PLOW_DOP_FLASH_MLA_PREFILL && in->t[7] != PLOW_TENSOR_NONE
+        && (in->i[6] >> 31);
+#if !(PLOW_MLA_SPARSE_ARM && PLOW_CDNA4 && defined(PLOW_BUCKET_FLASH))
+    if (pf_sparse8) __builtin_trap();
+#else
+    /* t0=olat bf16[T][8][512] t2=q absorbed t3=q rope (roped) t4=ckv t5=k rope t7=union table;
+     * i4=T, i6 = bit31 | cap, f0=scale. */
+    if (pf_sparse8) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+        d_mla_sparse_pf((bf16*)TEN(0), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                        (const bf16*)TEN(4), (const bf16*)TEN(5), (const unsigned char*)TEN(7),
+                        in->i[4], in->i[6] & 0x7fffffffu, in->fj[0].f, slice, nblk, sm->msp);
+#undef TEN
+        return;
+    }
+#endif
 #if !(PLOW_MLA_MHA_ARM && PLOW_CDNA4)
     if (in->op == PLOW_DOP_FLASH_MLA_PREFILL && ((in->i[6] >> 9) & 1u)) __builtin_trap();
 #else

@@ -1510,16 +1510,17 @@ fn emit_glm_indexer_wq_w8a8(
 
 fn emit_glm_mla_value_w8a8(
     b: &mut Builder, cus: &[u32], n: &GlmTn, w: &GlmLW, rows: u32, splits: u32, dep: u32,
+    normalized: bool,
 ) -> u32 {
     let strided = emit_config::active().glm_mla_strided_wv && rows < 32;
-    let merge = b.emit(DevOp::FlashMerge, cus.to_vec(), &[dep], |d| {
+    let merge = if normalized { dep } else { b.emit(DevOp::FlashMerge, cus.to_vec(), &[dep], |d| {
         d.t[..3].copy_from_slice(&[n.olat, n.opart, n.mlpart]);
         d.i[..4].copy_from_slice(&[rows, 8, splits, 512]);
         d.i[4] = if strided { 1024 } else { 0 };
         // Coarse dependency and one split: the device may normalize flat over the whole
         // [rows, heads, 512] block instead of per (row, head) workgroup items.
         d.i[6] = u32::from(!strided && splits == 1);
-    });
+    }) };
     b.emit(DevOp::MlaBmmFp8, cus.to_vec(), &[merge], |d| {
         d.t[..4].copy_from_slice(&[n.oat, n.olat, w.wv, w.wv_s]);
         d.i[..4].copy_from_slice(&[rows, 8, 256, 512]);
@@ -4861,7 +4862,7 @@ pub(crate) fn emit_glm_mla(
     //    `n_batch * nh_l * ceil(vd/VT)` times, which is 128 at GLM TP4 — half the machine used to
     //    sit in this packet's gate doing nothing. n_batch is 1 for every decode packet here.
     let c_uv = if emit_config::active().glm_mla_w8a8 {
-        emit_glm_mla_value_w8a8(b, &all, n, w, rows, ns_attn, c_fl)
+        emit_glm_mla_value_w8a8(b, &all, n, w, rows, ns_attn, c_fl, false)
     } else { b.emit(
         DevOp::MlaMergeFold,
         mla_fold_cus(&all, rows * nh_l, vd),
@@ -7638,6 +7639,10 @@ pub(crate) fn emit_glm_mla_prefill(
     };
     let sparse_sel =
         if b.packed_prefill_segments() || b.rowsplit_attn() { n.iidx_pf } else { n.iuni };
+    let sparse_b8 = sparse && !fp8kv && emit_config::active().glm_dsa_pf_b8;
+    assert!(!sparse_b8 || (emit_config::active().glm_mla_w8a8 && nh_l == 8 && dr == 64 && dk == 512
+        && !dcp && !use_rowsplit && !b.packed_prefill_segments()),
+        "PLOW_GLM_DSA_PF_B8 requires the W8A8 MLA TP8 single-chunk sparse prefill");
     let pf_ns = if fp8kv && !sparse {
         small_pf_ns
     } else if fp8kv || sparse || t < 2048 || ofold {
@@ -7685,6 +7690,11 @@ pub(crate) fn emit_glm_mla_prefill(
             } else if sparse {
                 d.t[7] = n.iuni; // the union table; its presence selects the GATHER arm
                 d.i[6] = glm_dsa_pf_cap(c, ctx);
+                if sparse_b8 {
+                    // mla_sparse_pf.h: normalized bf16 latent straight into `olat`, no merge.
+                    d.t[0] = n.olat;
+                    d.i[6] |= 1 << 31;
+                }
             } else if ofold {
                 // Dense V2 arm bitfield, bit 8: the W_ofold fused epilogue (normalized bf16
                 // partials for the fused o-GEMM; requires ns==1 — the fold consumes the
@@ -7752,7 +7762,7 @@ pub(crate) fn emit_glm_mla_prefill(
     if ofold || mla_mha {
         c_fl
     } else if emit_config::active().glm_mla_w8a8 {
-        emit_glm_mla_value_w8a8(b, &all, n, w, t, pf_ns, c_fl)
+        emit_glm_mla_value_w8a8(b, &all, n, w, t, pf_ns, c_fl, sparse_b8)
     } else {
         let counter = b.emit(
             DevOp::MlaMergeFold,
