@@ -1761,6 +1761,9 @@ __device__ void d_gemm_fp8_block128_m16(bf16* C, const unsigned char* A,
 
 #endif
 
+#ifndef PLOW_FP8_BLK_DMA
+#define PLOW_FP8_BLK_DMA 0
+#endif
 template <int BM, int BN, int BK, int WM, int WN, bool KEXACT = true, bool GLU = false,
           bool BLOCK128 = false, int SPLITK = 1>
 __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restrict__ A,
@@ -1921,6 +1924,37 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
         if (threadIdx.x < NSC) GM8_SC(buf)[threadIdx.x] = rsc;                                \
     }
 
+/* PLOW_FP8_BLK_DMA (BLOCK128, KEXACT, double buffer): operands go global->LDS by 16-byte DMA
+ * (no ra/rb registers, no commit pass); the XOR swizzle moves to the per-lane global column, as
+ * in GM_DMA. Rows/cols past M/N clamp to the last line (their outputs are discarded). Scales
+ * still ride `rsc` and are stored after the DMA wait. */
+#define GM8_DMA_ISSUE(buf, k0)                                                               \
+    _Pragma("unroll") for (int it = 0; it < APT / 16; it++) {                                 \
+        const unsigned e = threadIdx.x * 16 + it * (THREADS * 16);                            \
+        const unsigned rl = e / FBK, r = m0 + rl < M ? m0 + rl : M - 1;                       \
+        cp_async16((const PLOW_GLOB bf16*)(as_glob(A) + (size_t)r * K + (k0) +                \
+                                           GM8_XORSWZ(rl, e % FBK)),                          \
+                   (bf16*)&GM8_ASM(buf)[(threadIdx.x & ~63u) * 16 + it * (THREADS * 16)]);     \
+    }                                                                                         \
+    _Pragma("unroll") for (int it = 0; it < BPT / 16; it++) {                                 \
+        const unsigned e = threadIdx.x * 16 + it * (THREADS * 16);                            \
+        const unsigned rl = e / FBK, r = n0 + rl < N ? n0 + rl : N - 1;                       \
+        cp_async16((const PLOW_GLOB bf16*)(as_glob(B) + (size_t)r * K + (k0) +                \
+                                           GM8_XORSWZ(rl, e % FBK)),                          \
+                   (bf16*)&GM8_BSM(buf)[(threadIdx.x & ~63u) * 16 + it * (THREADS * 16)]);     \
+    }                                                                                         \
+    {                                                                                         \
+        const unsigned g = (k0) / FBK, t = threadIdx.x;                                       \
+        if (t < BM) rsc = m0 + t < M ? as_glob(ascale)[(size_t)g * M + m0 + t] : 0.0f;       \
+        else if (t < NSC) {                                                                   \
+            const unsigned cb = n0 / 128u + (t - BM);                                         \
+            rsc = cb < ncb ? as_glob(wscale)[(size_t)cb * kgroups + g] * PLOW_FP8_MMA_FIX : 0.0f; \
+        }                                                                                     \
+    }
+#define GM8_DMA_COMMIT(buf)                                                                  \
+    cp_async_wait();                                                                          \
+    if (threadIdx.x < NSC) GM8_SC(buf)[threadIdx.x] = rsc;
+
 #define GM8_READ_INTO(af, bfr, buf, sl)                                                      \
     _Pragma("unroll") for (int i = 0; i < SM; i++)                                            \
         _Pragma("unroll") for (int q = 0; q < KS; q++) {                                      \
@@ -1972,9 +2006,19 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
         if constexpr (CLBAR) __builtin_amdgcn_s_barrier();                                    \
     } while (0)
 
+        /* BM == 128 only: the 64x128 tile MISMATCHED under DMA (cause not found) and the
+         * 192/256-row tiles were slower; 128x256 / 128x128 (the interpreter's prefill tiles)
+         * are 11-18% faster and exact at every GLM shape tried. */
+        constexpr bool DMA = BLOCK128 && KEXACT && DBUF && (PLOW_FP8_BLK_DMA) && !GLU && BM == 128
+            && APT % 16 == 0 && BPT % 16 == 0;
         __syncthreads();
-        GM8_FETCH(kbegin);
-        GM8_COMMIT(0);
+        if constexpr (DMA) {
+            GM8_DMA_ISSUE(0, kbegin);
+            GM8_DMA_COMMIT(0);
+        } else {
+            GM8_FETCH(kbegin);
+            GM8_COMMIT(0);
+        }
         __syncthreads();
 
         const unsigned NT = PLOW_GEMM_ABL_NT((kend - kbegin + FBK - 1) / FBK);
@@ -2004,8 +2048,12 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
                     __builtin_memcpy(&bf1[j][0],
                         &GM8_BSM(buf)[brow * STRIDE + GM8_XORSWZ(brow, frag_k64(lane, SLICE))], 32);
                 }
-                if (kn < kend) { GM8_FETCH(kn); }
-                if (DBUF && kn < kend) { GM8_COMMIT(buf ^ 1); }
+                if constexpr (DMA) {
+                    if (kn < kend) { GM8_DMA_ISSUE(buf ^ 1, kn); }
+                } else {
+                    if (kn < kend) { GM8_FETCH(kn); }
+                    if (DBUF && kn < kend) { GM8_COMMIT(buf ^ 1); }
+                }
                 GM8_FENCE();
                 GM8_CLUSTER_BARRIER();
                 const float* sc = GM8_SC(buf);
@@ -2035,6 +2083,11 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
                 if constexpr (PRIO) __builtin_amdgcn_s_setprio(0);
                 GM8_FENCE();
                 GM8_CLUSTER_BARRIER();
+                if constexpr (DMA) {
+                    /* buf^1 lands before anyone reads it; buf is free for the next issue. */
+                    if (kn < kend) { GM8_DMA_COMMIT(buf ^ 1); }
+                    __syncthreads();
+                }
             } else if constexpr (!PLR) {
 #pragma unroll
                 for (int sl = 0; sl < NSL; sl++) {
@@ -2145,6 +2198,8 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
         }
 #undef GM8_FETCH
 #undef GM8_COMMIT
+#undef GM8_DMA_ISSUE
+#undef GM8_DMA_COMMIT
 #undef GM8_READ_FRAGS
 #undef GM8_MFMA_BURST
 #undef GM8_FENCE

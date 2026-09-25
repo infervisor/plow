@@ -60,6 +60,20 @@ case "${PLOW_MOE_PF_A4W4_BK:-128}" in
   256) A4W4_BK="-DMPF4_BK=256" ;;
   *) echo "PLOW_MOE_PF_A4W4_BK must be 128 or 256" >&2; exit 2 ;;
 esac
+# PLOW_XR_SCHED=aiter: the 16-byte prefill collective schedule (op_collective.h
+# PLOW_XR_SCHED_AITER) on capped data workgroups, as build_gfx942.sh ships it. Bit-identical
+# (strict rank order); default off here until the gfx950 in-model A/B.
+case "${PLOW_XR_SCHED:-twoshot}" in
+  twoshot|off) ;;
+  aiter) A4W4_BK="$A4W4_BK -DPLOW_XR_SCHED_AITER=1 -DPLOW_XR_SCHED_NWG=${PLOW_XR_SCHED_NWG:-24} -DPLOW_XR_SCHED_NWG_RS=${PLOW_XR_SCHED_NWG_RS:-8} -DPLOW_XR_SCHED_AG_U=${PLOW_XR_SCHED_AG_U:-1} -DPLOW_XR_SCHED_NWG_SRS=${PLOW_XR_SCHED_NWG_SRS:-8}"
+         [ -n "${PLOW_XR_SCHED_NWG_SAG:-}" ] && A4W4_BK="$A4W4_BK -DPLOW_XR_SCHED_NWG_SAG=$PLOW_XR_SCHED_NWG_SAG" ;;
+  *) echo "PLOW_XR_SCHED must be aiter or twoshot" >&2; exit 2 ;;
+esac
+case "${PLOW_FP8_BLK_DMA:-0}" in
+  0) ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_FP8_BLK_DMA=1" ;;
+  *) echo "PLOW_FP8_BLK_DMA must be 0 or 1" >&2; exit 2 ;;
+esac
 # Prefill-object arms (moe_down_a4w4_sweep.h, mla_fold_pf_mfma.h); same packet ABI as default.
 case "${PLOW_MOE_PF_DOWN_SWEEP:-0}" in
   0) ;;

@@ -11,7 +11,8 @@ case "$mode" in
 build)
     : "${ROCM_PATH:?run build inside nix develop}"
     mkdir -p "$obj"
-    hipcc --offload-arch=gfx950 -O3 -w --genco "$repo/runtime/amd/test_kernels.hip" -o "$obj/tk.co" \
+    # shellcheck disable=SC2086
+    hipcc --offload-arch=gfx950 -O3 -w ${GEMM_DEFS:-} --genco "$repo/runtime/amd/test_kernels.hip" -o "$obj/tk.co" \
         -I"$repo/runtime/amd" -I"$repo/runtime/common"
     bun=$(command -v clang-offload-bundler || echo "$ROCM_PATH/llvm/bin/clang-offload-bundler")
     "$bun" --unbundle --type=o --targets=hipv4-amdgcn-amd-amdhsa--gfx950 \
@@ -33,6 +34,7 @@ run)
     # dense layers, router (BF16, FP32 out in production; timed here as BF16 GEMM).
     shapes=(
         "qkv_a 2624 6144 BlockFp8" "q_b 2048 2048 BlockFp8" "o_proj 6144 2048 BlockFp8"
+        "kv_b 3584 512 BlockFp8"
         "idx_wq_b 4096 2048 BlockFp8"
         "shared_gate_up 512 6144 Mxfp4" "shared_down 6144 256 Mxfp4"
         "dense_gate_up 3072 6144 Mxfp4" "dense_down 6144 1536 Mxfp4"
