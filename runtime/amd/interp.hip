@@ -1158,6 +1158,11 @@ static_assert(MPF_LDS_HALVES * sizeof(bf16) <= sizeof(((plow_smem*)nullptr)->raw
  * silent LDS overrun lived. */
 static_assert(MPF4_LDS_BYTES <= sizeof(((plow_smem*)nullptr)->raw),
               "mxfp4 grouped-MoE prefill LDS tiles exceed the interpreter's shared allocation");
+#if PLOW_MOE_DOWN_SWEEP_LINE
+/* moe_down_a4w4_sweep.h line-wide stores: one reduction word block + a [64][36] f32 tile per wave. */
+static_assert(16 + PLOW_WAVES * 64 * 36 * 4 <= sizeof(((plow_smem*)nullptr)->raw),
+              "DOWN sweep store tiles exceed the interpreter's shared allocation");
+#endif
 #endif
 #endif
 
