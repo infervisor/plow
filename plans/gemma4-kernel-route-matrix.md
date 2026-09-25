@@ -387,3 +387,118 @@ worth running because the 2k cell's TTFT is the number under test, and it is onl
 `PLOW_MAX_CHUNK=4096` an 8192- or 15000-token prompt is prefilled in chunks of <=4096 rows, so the
 8k/16k ladder cells ride the <=4224 rungs -- which is how the shipped recipe has always benched
 them. The rung set the ladder actually needs is `{256, 1152, 2176, 4224}`.
+
+## 9. FP8 closure: the kernel set, the route decision, and a CORRECTION to §earlier FP8 accounting
+
+### 9.1 CORRECTION: the 26B MoE experts ARE fp8. Task #92 is void.
+
+An earlier pass in this campaign read `shapes.moe_enc == []` and `precision.expert_enc == "none"`
+off the 26B FP8 packet and concluded the MoE experts had stayed bf16, making FP8 worth only 3.7%
+of decode bytes at B=32 against 48.3% if they were quantised. **That was wrong.**
+
+`manifest.rs` populates `moe_enc` from only three sources -- `MoeGroupGluPf`/`MoeGroupDownPf`
+(field `i[3]`), `MoeAiterFp8Pf`, and the four `*Fp8Blk` ops (field `i[6]`). **None of the Gemma-4
+opcode family is among them**, and the Gemma MoE ops carry no encoding field at all: their
+encoding is the opcode identity. The proof that the field carries no signal here is that the
+**BF16 packet also reports `expert_enc: "none"`** -- it is blind in both directions.
+
+What the packets actually carry (from `union`, and complementary between the two):
+
+| packet | prefill expert GEMMs | decode expert GEMMs |
+|---|---|---|
+| 26B **fp8** | `MoeGroupGluGemmaPfW8a8`, `MoeGroupDownGemmaPfW8a8` | `MoeExpertGluGemmaFp8`, `MoeExpertDownGemmaFp8` |
+| 26B **bf16** | `MoeGroupGluGemmaPf`, `MoeGroupDownGemmaPf` | `MoeExpertGluNormGemma`, `MoeExpertDownGemma` |
+
+The FP8 packet carries **zero** bf16 expert arms and the BF16 packet **zero** quantised ones. The
+experts are quantised. #92 ("quantise the 26B MoE experts") is a **non-task**.
+
+What does stay bf16 in both FP8 packets is **lm_head**: the audited op at N=vocab is `Gemm`/`Gemv`
+at (262144, 2816) with no `Fp8` sibling. That is #93, and it is real.
+
+### 9.2 Why 26B FP8 decode still loses ~5x: traversal, not bytes
+
+Decode is bandwidth-bound in both precisions, so the natural suspicion is bytes. Corrected
+accounting (`scripts/campaign/fp8_decode_bytes.py`, H100 3352 GB/s; 26B active 3.822 G = dense-linear 1.656 + lm_head 0.738
++ experts 1.427 G, 0.178 G per expert):
+
+Expert bytes per step. GROUPED streams each touched expert ONCE (union `n*(1-(1-k/n)^B)`);
+PER-SLOT streams one expert per slot-dot, `B*top_k` times:
+
+| B | union | B·k | bf16 grouped | fp8 grouped | fp8 per-slot | fp8 per-slot vs bf16 grouped |
+|---|---|---|---|---|---|---|
+| 1 | 8.0 | 8 | 2.66 GiB | 1.33 GiB | 1.33 GiB | 0.50x |
+| 4 | 29.1 | 32 | 9.68 GiB | 4.84 GiB | 5.32 GiB | 0.55x |
+| 16 | 82.4 | 128 | 27.39 GiB | 13.70 GiB | 21.27 GiB | 0.78x |
+| 32 | 111.8 | 256 | 37.15 GiB | 18.57 GiB | 42.54 GiB | **1.15x** |
+
+Whole step (lm_head bf16 in both):
+
+| B | bf16 grouped | fp8 as shipped | fp8 + grouped (#62) | + fp8 lm_head (#93) |
+|---|---|---|---|---|
+| 1 | 7.12 GiB / 2.28 ms | 4.25 / 1.36 (**+40.3%**) | 4.25 / 1.36 (+40.3%) | 3.56 / 1.14 (+50.0%) |
+| 4 | 14.14 / 4.53 | 8.23 / 2.64 (+41.8%) | 7.76 / 2.48 (+45.1%) | 7.07 / 2.26 (+50.0%) |
+| 16 | 31.85 / 10.20 | 24.19 / 7.75 (+24.1%) | 16.61 / 5.32 (+47.8%) | 15.93 / 5.10 (+50.0%) |
+| 32 | 41.61 / 13.33 | 45.46 / 14.56 (**-9.3%**) | 21.49 / 6.88 (+48.3%) | 20.80 / 6.66 (+50.0%) |
+
+The per-slot walk costs `B*top_k` expert streams, growing LINEARLY in B, while grouped saturates as
+the union approaches all 128 experts. **They cross at B ~ 28.** Below it fp8 wins on bytes even
+per-slot; at B=32 it loses by 9.3%, because 256 slot-streams exceed 2x the 111.8-expert union.
+
+So bytes explain a modest B=32 regression but **not** the measured ~5x. The dominant term is
+efficiency: the per-slot dot walk gives up the grouped tensor-core GEMM entirely.
+
+### 9.3 #62 located exactly: the grouped decode route is bf16 all the way down
+
+`crates/devgen/src/lib.rs` decode MoE GLU:
+
+```rust
+let c_glu = if fp8 {
+    // fp8 path: separate norm + expert GLU (no fused fp8 norm variant)
+    ... RmsNorm ... MoeExpertGluGemmaFp8 ...
+} else {
+    // GROUPED DECODE (PLOW_GEMMA_MOE_DEC_GROUP=min rows) ...
+    MoeAlignGemmaPf + MoeExpertGluNormGemma with t[6]=moe_meta, t[7]=moe_rowtok, i[6]=min
+};
+```
+
+The grouped branch is inside the **bf16-only `else`**. The fp8 arm never emits `MoeAlignGemmaPf`, so
+`moe_dec_group` stays `None` and the DOWN op runs ungrouped too. It is not only an emitter gate:
+`runtime/nvidia/op_moe.cuh`'s grouped decode body delegates to the **bf16** grouped prefill GEMM,
+
+```c
+static __device__ void d_moe_dec_group_glu_gemma(bf16* fug, const bf16* resid, ...) {
+    plow_moe_stage_xn(xn, resid, gamma, H, nrow, eps);
+    d_moe_group_glu_gemma_pf(fug, xn, ewt, meta, row_token, ...);   /* bf16 body */
+}
+```
+
+but the **w8a8 twins already exist**: `d_moe_group_glu_gemma_pf_w8a8` (op_moe.cuh:2862) and
+`d_moe_group_down_gemma_pf_w8a8` (:2952), both commented "beat26b", mma.sync.m16n8k32, BK8=64,
+per-token/-row e4m3 activation. So #62 is well-scoped, not blocked:
+
+1. device: `d_moe_dec_group_glu_gemma_w8a8` + down twin, staging `xn` and quantising it to e4m3
+   per row (the w8a8 prefill bodies want a gathered `xq8` by `row_token` + per-token `ascale`);
+2. emitter: hoist the grouped branch so the fp8 arm can take it;
+3. worth **+48.3% of decode bytes at B=32** against fp8-as-shipped's -9.3% -- a 2.1x byte swing --
+   and it is the lever that should close the measured 5x.
+
+### 9.4 The route decision under FP8: the tuner CANNOT pick cuBLASLt, in three layers
+
+"Allow cuBLAS to be used based on the plow tuner's decision" is answerable for BF16 and, today,
+structurally unanswerable for FP8. The Lt integration is bf16-only in three independent places:
+
+1. `plow_asset::segment_roles::cublaslt_prefill_bf16` -- the policy predicate, bf16 by name and by
+   its `(n, k)` shape tables.
+2. `devgen::dense_cublaslt::prefill_eligible` -- admits only `DevOp::Gemm | GemmMed | GemmSmall`.
+   A test (`prefill_projection_rejects_bias_fp8_and_nonisolated_packets`) asserts `GemmFp8` is
+   rejected, so this is intended, not incidental.
+3. `plowrt::device::cuda::lt` -- **every** `cublasLtMatrixLayoutCreate` call passes dtype `14`
+   (BF16) hardcoded; there are no FP8 scale-pointer attributes (cuBLASLt FP8 requires
+   A/B_SCALE_POINTER and is TN-only); stored algorithms are filtered `if rec.dtype != "bf16" {
+   continue }`; and the failure strings read "no supported BF16 cuBLASLt algorithm".
+
+So for FP8 the native kernels are not the tuner's *choice* -- they are the only implemented route,
+and every FP8 number in this campaign is plow-native by construction. The measured
+cuBLASLt-vs-native route decision is a BF16 result (§6), and that is the honest scope of it.
+Extending the tuner to FP8 means implementing an FP8 Lt path (a datatype/scale/layout change in
+`lt.rs` plus an fp8 admission predicate), not flipping a knob.
