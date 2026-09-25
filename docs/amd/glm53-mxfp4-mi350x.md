@@ -124,7 +124,9 @@ indexer -> top-2048 -> union per 8-query pack -> `d_mla_sparse_pf` (absorbed for
 Objects add `PLOW_MLA_SPARSE=1 PLOW_DSA_SELECT_V2=1 PLOW_DSA_IDX_QPW=1 PLOW_HNR_ILP=1` and pick up
 `PLOW_DSA_PF_ARM=1 PLOW_DSA_DECODE_BATCH=1` from the packet config. Overlay `--dsa` (indexer
 wq_b/wk `weight_scale_inv`). Same plowrt + run env as dense. Packets: dsa-v1 fbdd65b0 (BF16 interp
-chain), dsa-v4 cf2a668a (current preset without the ticket counter), dsa-v5 3aaa4a53 (preset).
+chain), dsa-v4 cf2a668a, dsa-v5 3aaa4a53 (= `GLM_RECIPE=dsa` emit; objects dsa-v6 from 5cfb283f).
+Status: correct and closer to vLLM than dense, but NOT yet faster than dense prefill at any rung
+(dsa-v6 vs dense in the same job: 4k +42, 8k +67..74, 16k +140..149 ms).
 
 | kernel (knob) | op | standalone (ms) | numerics |
 |---|---|---|---|
@@ -141,6 +143,7 @@ In-model TP8 prefill (ms, warm medians; dense v9 = 232 / 388 / 736 at 4k / 8k / 
 | dsa-v2 (+ sparse flash) | 292 | 503-506 | 992-1001 |
 | dsa-v3 (+ select v2, score QPW) | 291 | 486 | 910 |
 | dsa-v4 (+ q-rope fold) | 279 | 470 | 912 |
+| dsa-v6 (+ pack tickets, HNR ILP; = current preset) | 274 | 463 | 884 |
 
 Numerics (vLLM runs DSA): top-1 == vLLM oracle 4/4 on every build; T8192 logit cos dense 0.957,
 dsa1 0.977, dsa2 0.980, dsa4 0.984 (top-10 overlap 9/10). Greedy T1024/T8192 identical to dense.
