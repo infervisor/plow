@@ -404,6 +404,13 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
    grep -qx '#define PLOW_OBJECT_MOE_STAGE2_BODY 1' "$PLOW_HSACO_CONFIG"; then
   MOE2_BODY_DEFS="-DPLOW_MOE2_BODY=1"
 fi
+# Pipelined token-gather stage-1 (reuse_kernel.hip PLOW_MOE1_BODY=2); the runtime picks its ABI
+# from the object's plow_moe1_a4_token_gather_1 marker.
+case "${PLOW_MOE_STAGE1_PIPE:-0}" in
+  0) ;;
+  1) MOE1_BODY_DEFS="-DPLOW_MOE1_BODY=2"; MOE1_MAXREG=256 ;;
+  *) echo "PLOW_MOE_STAGE1_PIPE must be 0 or 1" >&2; exit 2 ;;
+esac
 
 MOE_STAGE2_ELFS=""
 if [ "$ARCH" = gfx950 ]; then
