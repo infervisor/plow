@@ -93,6 +93,7 @@
 #include "op_moe.h"
 #undef st_act1
 #include "moe_down_a4w4_sweep.h"
+#include "moe_glu_a4w4_kw.h"
 
 #ifndef PLOW_MOE_A4W4_STAGE2_BENCH
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
@@ -127,6 +128,18 @@ void b_down_sweep(float* part, const unsigned char* fu, const unsigned char* fu_
     d_moe_down_a4w4_sweep<TM, 2, 4>(part, fu, fu_scale, wtab, stab, meta, row_partidx, row_gate,
                                     H, n_exp, nsplit, blockIdx.x, gridDim.x, 4u);
 }
+
+#ifndef PLOW_MOE_A4W4_STAGE2_BENCH
+__global__ __launch_bounds__(PLOW_THREADS, 1)
+void b_glu_sweep(unsigned char* fu, unsigned char* fs, const bf16* x, const unsigned long long* wtab,
+                 const unsigned long long* stab, const int* meta, const unsigned* row_token,
+                 const unsigned* row_partidx, unsigned I, unsigned H, unsigned n_exp, unsigned act,
+                 float beta, float lbeta) {
+    extern __shared__ unsigned char glds[];
+    d_moe_glu_a4w4_kw<2>(fu, fs, x, wtab, stab, meta, row_token, row_partidx, I, H, n_exp, act,
+                            beta, lbeta, blockIdx.x, gridDim.x, (float*)glds);
+}
+#endif
 
 extern "C" __global__ void b_reduce(float* out, const float* part, unsigned T,
                                     unsigned H, unsigned topk) {
@@ -346,6 +359,56 @@ int main(int argc, char** argv) {
         sweep(std::integral_constant<unsigned, 16>{});
         sweep(std::integral_constant<unsigned, 64>{});
     }
+#ifndef PLOW_MOE_A4W4_STAGE2_BENCH
+    /* --- GLU sweep vs op85: random gate/up weights+scales, byte-compare fp4 + E8M0 on live rows */
+    if (I == 256) {
+        std::vector<unsigned char> w(wgu), ws(sgu);
+        for (unsigned e = 0; e < n_exp; e++)
+            for (unsigned q = 0; q < 2; q++) {
+                for (auto& v : w) v = (unsigned char)(rnd() & 0xff);
+                for (auto& v : ws) v = (unsigned char)(122u + rnd() % 9u);
+                HC(hipMemcpy((void*)wt[e * 3 + q], w.data(), wgu, hipMemcpyHostToDevice));
+                HC(hipMemcpy((void*)st[e * 3 + q], ws.data(), sgu, hipMemcpyHostToDevice));
+            }
+        const size_t fub = (size_t)pad * I / 2, fsb = (size_t)pad * I / 32;
+        std::vector<unsigned char> rf(fub), rs(fsb), gf(fub), gs(fsb);
+        HC(hipMemset(dfu, 0, fub)); HC(hipMemset(dfs, 0, fsb));
+        hipLaunchKernelGGL(b_glu, dim3(grid), dim3(PLOW_THREADS), 0, 0, dfu, dx, dwt, dst, dmeta,
+                           drt, drp, dfs, I, H, n_exp, act, beta, lbeta);
+        HC(hipMemcpy(rf.data(), dfu, fub, hipMemcpyDeviceToHost));
+        HC(hipMemcpy(rs.data(), dfs, fsb, hipMemcpyDeviceToHost));
+        const size_t glds = (8 * 4 * 64 * 4 + 16 * 32) * 4 + (3 * n_exp + 1) * 4;
+        HC(hipFuncSetAttribute((const void*)b_glu_sweep, hipFuncAttributeMaxDynamicSharedMemorySize, (int)glds));
+        HC(hipMemset(dfu, 0, fub)); HC(hipMemset(dfs, 0, fsb));
+        hipLaunchKernelGGL(b_glu_sweep, dim3(grid), dim3(PLOW_THREADS), glds, 0, dfu, dfs, dx, dwt, dst,
+                           dmeta, drt, drp, I, H, n_exp, act, beta, lbeta);
+        HC(hipMemcpy(gf.data(), dfu, fub, hipMemcpyDeviceToHost));
+        HC(hipMemcpy(gs.data(), dfs, fsb, hipMemcpyDeviceToHost));
+        size_t bad = 0, live_rows = 0;
+        for (size_t r = 0; r < pad; r++) {
+            if (rpid[r] == PLOW_EXPERT_UNUSED) continue;
+            live_rows++;
+            if (memcmp(&rf[r * I / 2], &gf[r * I / 2], I / 2) || memcmp(&rs[r * I / 32], &gs[r * I / 32], I / 32)) bad++;
+        }
+        std::vector<double> tv, tr;
+        for (int it = 0; it < iters; it++) {
+            float ms;
+            HC(hipEventRecord(e0));
+            hipLaunchKernelGGL(b_glu_sweep, dim3(grid), dim3(PLOW_THREADS), glds, 0, dfu, dfs, dx, dwt, dst,
+                               dmeta, drt, drp, I, H, n_exp, act, beta, lbeta);
+            HC(hipEventRecord(e1)); HC(hipEventSynchronize(e1));
+            HC(hipEventElapsedTime(&ms, e0, e1)); if (it) tv.push_back(ms);
+            HC(hipEventRecord(e0));
+            hipLaunchKernelGGL(b_glu, dim3(grid), dim3(PLOW_THREADS), 0, 0, dfu, dx, dwt, dst, dmeta,
+                               drt, drp, dfs, I, H, n_exp, act, beta, lbeta);
+            HC(hipEventRecord(e1)); HC(hipEventSynchronize(e1));
+            HC(hipEventElapsedTime(&ms, e0, e1)); if (it) tr.push_back(ms);
+        }
+        std::sort(tv.begin(), tv.end()); std::sort(tr.begin(), tr.end());
+        printf("  kw GLU     : %8.3f ms  op85 %8.3f ms  oracle %s (%zu/%zu live rows differ)\n",
+               tv[tv.size() / 2], tr[tr.size() / 2], bad ? "FAIL" : "BIT-EXACT", bad, live_rows);
+    }
+#endif
     std::vector<double> t1v, t2v, tbasev, tatomv;
     for (int it = 0; it < iters; it++) {
 #ifndef PLOW_MOE_A4W4_STAGE2_BENCH

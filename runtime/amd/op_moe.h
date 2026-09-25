@@ -4821,6 +4821,15 @@ __device__ __forceinline__ void moe_pf_refuse(void* Cout, const int* meta,
  * branch too, so a gate-only call would leave `up` un-clipped. For every other activation
  * `moe_glu` is byte-identical to the `moe_act(g, act) * u` it replaces. */
 #ifndef PLOW_MOE_PF_A4W4_DIRECT_ONLY
+/* PLOW_MOE_GLU_KW (decode objects): op 85's A4W4 GLU on decode rows with K split over the
+ * waves and units = occupied (expert, 16-row subtile, 32-column chunk) — moe_glu_a4w4_kw.h,
+ * byte-identical to the tile arm. */
+#ifndef PLOW_MOE_GLU_KW
+#define PLOW_MOE_GLU_KW 0
+#endif
+#if PLOW_MOE_GLU_KW && PLOW_MOE_PF_A4W4
+#include "moe_glu_a4w4_kw.h"
+#endif
 __device__ void d_moe_group_glu_pf(bf16* fu, const bf16* xn2, const unsigned long long* wtab,
                                    const unsigned long long* stab, const int* meta,
                                    const unsigned* row_token, unsigned I_moe, unsigned H,
@@ -4837,6 +4846,14 @@ __device__ void d_moe_group_glu_pf(bf16* fu, const bf16* xn2, const unsigned lon
     const float* as_row = a8 ? (const float*)fu_scale : nullptr;
 #if PLOW_MOE_PF_A4W4 && !defined(PLOW_MOE_A4W4_STAGE2_BENCH)
     if (enc == PLOW_MOE_ENC_MXFP4) {
+#if PLOW_MOE_GLU_KW
+        if (I_moe == 256u) {
+            d_moe_glu_a4w4_kw<2>((unsigned char*)fu, fu_scale, xn2, wtab, stab, meta, row_token,
+                                 row_partidx, I_moe, H, n_exp, act, beta, lbeta, slice, nblk,
+                                 (float*)lds);
+            return;
+        }
+#endif
         /* A4W4. `fu` is the MXFP4 gathered intermediate and `fu_scale` its E8M0 rows; the
          * epilogue IS the fused bridge (SwiGLU + quantize + scale write in the sorted layout),
          * so no bf16 intermediate exists anywhere on this path and there is no separate bridge

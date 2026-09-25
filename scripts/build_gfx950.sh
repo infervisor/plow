@@ -88,6 +88,11 @@ case "${PLOW_MLA_DEC_MINPER:-0}" in
   *[!0-9]*) echo "PLOW_MLA_DEC_MINPER must be a row count" >&2; exit 2 ;;
   *) DEC_KNOBS="$DEC_KNOBS -DPLOW_MLA_DEC_MINPER=$PLOW_MLA_DEC_MINPER" ;;
 esac
+case "${PLOW_MOE_GLU_KW:-0}" in
+  0) ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_MOE_GLU_KW=1" ;;
+  *) echo "PLOW_MOE_GLU_KW must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_MERGE_UNROLL4:-0}" in
   0) ;;
   1) DEC_KNOBS="$DEC_KNOBS -DFA_MERGE_UNROLL4=1" ;;
