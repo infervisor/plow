@@ -9,7 +9,8 @@
 #     python3 scripts/bench/gpuq.py submit scripts/glm53_mxfp4_mi350x.sh validate ...
 #
 # GLM_RECIPE=dsa: DSA sparse attention (vLLM's top-2048 indexer; overlay needs --dsa).
-# GLM_MAX_CTX / GLM_SEQ override the context and prefill bucket ladder (default 16384 / 128..16384).
+# GLM_MAX_CTX / GLM_SEQ / GLM_BATCH override the context, prefill bucket ladder and decode batch
+# (default 16384 / 128..16384 / 128; also set PLOW_DECODE_BATCH_LADDER and PLOW_DECODE_BATCH to match).
 # GLM_EMIT_EXTRA / GLM_OBJ_EXTRA="K=V ..." override the recipe env (later assignment wins).
 # v9 (2026-09-25): packet sha16 3b8b96fd6339691d; prefill 1k/8k/16k 140/388/736 ms,
 # decode M1 37.7 ms/token, M128 177.9 ms/step; top-1 == vLLM 0.29 oracle T1024..T8192.
@@ -21,6 +22,7 @@ PLOWRT="${PLOWRT_BIN:-$WT/target/release/plowrt}"
 
 MAX_CTX="${GLM_MAX_CTX:-16384}"
 SEQ="${GLM_SEQ:-128,512,1024,2048,4096,8192,16384}"
+BATCH="${GLM_BATCH:-128}"  # decode rows; KV = BATCH x MAX_CTX (128 x 32k does not fit)
 EMIT_ENV=(
   PLOW_MXFP4=1 PLOW_GLM_MOE_STAGE1_NATIVE=1 PLOW_GLM_DSA=0 PLOW_UNISEG=0
   PLOW_MLA_PREFILL=full:$SEQ PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32,64,128
@@ -57,7 +59,7 @@ emit)
   out="$1"; mkdir -p "$(dirname "$out")"
   env "${EMIT_ENV[@]}" ${GLM_EMIT_EXTRA:-} PLOW_VERIFY_BIN="${PLOW_VERIFY_BIN:-$WT/lean-plow/.lake/build/bin/plow_verify}" \
     "$WT/target/release/plowc" --hf-dir "$PREPPED" --gpu mi350 --arch gfx950 --num-gpus 8 --n-cu 256 \
-    --max-ctx "$MAX_CTX" --batch 128 --seq "$SEQ" --out "$out"
+    --max-ctx "$MAX_CTX" --batch "$BATCH" --seq "$SEQ" --out "$out"
   sha256sum "$out/model.pkt" ;;
 objects)
   env "${OBJ_ENV[@]}" ${GLM_OBJ_EXTRA:-} PLOW_HSACO_CONFIG="$1/plow_config.h" bash "$WT/scripts/build_gfx950.sh" "$2" ;;
