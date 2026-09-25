@@ -26,7 +26,7 @@ __device__ unsigned long long g_isel3_prof[16];
 #define CK(x) do { hipError_t e_ = (x); if (e_) { printf("hip %s @%d\n", hipGetErrorString(e_), __LINE__); exit(1); } } while (0)
 constexpr unsigned TOPK = 2048, NWG = 256, PACK = 8;
 #ifndef V3_LDS_WORDS
-#define V3_LDS_WORDS 18728u
+#define V3_LDS_WORDS 34816u
 #endif
 
 extern "C" __global__ __launch_bounds__(512, 1) void k_v2(int* idx, const float* sc, const int* len,

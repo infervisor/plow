@@ -141,6 +141,13 @@ case "${PLOW_DSA_SELECT_V2:-0}" in
   1) A4W4_BK="$A4W4_BK -DPLOW_DSA_SELECT_V2=1" ;;
   *) echo "PLOW_DSA_SELECT_V2 must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_DSA_SELECT_V3=1: op 118 through dsa_select_v3.h (same set); fused select+union when the
+# packet asks (emit PLOW_GLM_DSA_SEL_UNION=1).
+case "${PLOW_DSA_SELECT_V3:-0}" in
+  0) ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_DSA_SELECT_V3=1" ;;
+  *) echo "PLOW_DSA_SELECT_V3 must be 0 or 1" >&2; exit 2 ;;
+esac
 # PLOW_DSA_IDX_QPW=1: DSA prefill indexer score (op 117) through d_index_score_pf_rowq (bit-identical).
 case "${PLOW_DSA_IDX_QPW:-0}" in
   0) ;;

@@ -6680,6 +6680,12 @@ fn emit_glm_dsa_prefill_select(
             },
         ),
     };
+    let zero_ctr = u32::from(emit_config::active().glm_dsa_pf_b8 && !glm_fp8_kv());
+    let sel_union = emit_config::active().glm_dsa_sel_union
+        && !(emit_config::active().glm_index_tp() && t >= 2048)
+        && !b.packed_prefill_segments()
+        && !b.rowsplit_attn();
+    assert!(!sel_union || GLM_DSA_PF_PACK == 8, "fused select+union builds 8-query packs");
     let c_se =
         if emit_config::active().glm_index_tp() && t >= 2048 {
             // Under the packed topology the runtime hands this kernel the launch's PlowKvSpan
@@ -6751,6 +6757,12 @@ fn emit_glm_dsa_prefill_select(
                     d.i[0] = t;
                     d.i[1] = itk;
                     d.i[2] = ctx;
+                    // Fused select + union (PLOW_DSA_SELECT_V3 objects): op 119's operands.
+                    if sel_union {
+                        d.t[3] = n.iuni;
+                        d.i[4] = glm_dsa_pf_cap(c, ctx);
+                        d.i[5] = zero_ctr;
+                    }
                 },
             );
             c_se
@@ -6787,7 +6799,8 @@ fn emit_glm_dsa_prefill_select(
             d.i[3] = glm_dsa_pf_cap(c, ctx);
             d.i[4] = GLM_DSA_PF_PACK; // queries per union tile (kernel: 0 = legacy 64)
             // Zero the B8 sparse flash's pack ticket counter (mla_sparse_pf.h).
-            d.i[5] = u32::from(emit_config::active().glm_dsa_pf_b8 && !glm_fp8_kv());
+            d.i[5] = zero_ctr;
+            d.i[6] = u32::from(sel_union);
         },
     )
 }
