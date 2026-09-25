@@ -734,3 +734,75 @@ Note the interaction with §10: prefill is 85% of the C32 wall, so TPOT work pay
 decode is the wall. The C1 fixed cost is the cheapest 4/4 flip (those cells already win p99 ITL and
 need only TPOT + tok/s, which are ONE metric at 1:127); the C16 KV slope is the largest absolute
 prize.
+
+## 13. FP8 SINGLE BLOCK, both layer kinds: FP8 as shipped is a large REGRESSION vs BF16
+
+Same harness as §7 (`block_e2e.sh`), same layers (L0 sliding, L5 full attention), same grid
+(B 1,4 x T 128,1024), same vLLM decoder-layer baseline. FP8 configuration is the recipe's own emit /
+objects env (`PLOW_FP8` + `PLOW_W8A8`, `PLOW_SEG_PURE_GEMM=fp8`, `PLOW_BUILD_W8A8`, ...).
+
+**Two setup facts worth recording, both of which cost a run to find:**
+
+1. The fp8 WEIGHTS are a separate pre-quantised MIXED checkpoint
+   (`/opt/dlami/nvme/tmp/fp8-campaign/gemma26b-w8a8/checkpoint-mixed`): the bf16 shards symlinked
+   plus one `fp8-model.safetensors`. Pointing the block at the plain bf16 HF dir fails with
+   `MISSING WEIGHT: fp8/model.language_model.layers.0.experts.gate_up_proj`. That error is a THIRD
+   independent confirmation of §9.1 -- an fp8 *expert* weight is a tensor the runtime expects by
+   name, so the experts are quantised by design. The mixed dir is a symlink farm with no HF index
+   and non-standard shard names, so it cannot be the vLLM half's model dir; point only plowrt at it
+   with `PLOW_CHECKPOINT` and leave the HF dir for `plowc` and vLLM.
+2. It also explains why lm_head stays bf16 (#93): lm_head lives in the bf16 shards.
+
+### 13.1 L5, full attention (median of 3, p95 within 0.3%)
+
+| B | T | decode plow | decode vLLM | ratio | prefill plow | prefill vLLM | ratio |
+|---|---|---|---|---|---|---|---|
+| 1 | 128 | 1179.60 us | 352.13 us | **3.35x** | 1.00 ms | 3.03 ms | **0.33x** |
+| 1 | 1024 | 1208.17 us | 351.49 us | **3.44x** | 1.70 ms | 3.13 ms | **0.54x** |
+| 4 | 128 | 1179.65 us | 471.23 us | **2.50x** | 4.02 ms | 3.04 ms | 1.32x |
+| 4 | 1024 | 1208.19 us | 480.51 us | **2.51x** | 6.78 ms | 5.13 ms | 1.32x |
+
+L0 sliding is the same shape: decode 2.31-3.13x (median 2.99x), prefill 0.34 / 0.77 / 1.31 / 2.17x.
+
+### 13.2 Against plow's OWN bf16 block (§7.1, same layer, same grid)
+
+The vLLM baseline reproduces across the two sessions to **0.03% at decode** (352.13 vs 352.22 us)
+and 1.3% at prefill (3.03 vs 2.99 ms), so the plow-side delta is real and not drift.
+
+| B | T | decode bf16 -> fp8 | | prefill bf16 -> fp8 | |
+|---|---|---|---|---|---|
+| 1 | 128 | 220.19 -> 1179.60 us | **5.36x worse** | 0.60 -> 1.00 ms | 1.67x worse |
+| 1 | 1024 | 227.00 -> 1208.17 us | **5.32x worse** | 1.05 -> 1.70 ms | 1.62x worse |
+| 4 | 128 | 306.84 -> 1179.65 us | 3.84x worse | 2.40 -> 4.02 ms | 1.68x worse |
+| 4 | 1024 | 323.01 -> 1208.19 us | 3.74x worse | 4.18 -> 6.78 ms | 1.62x worse |
+
+### 13.3 Read against the roofline (§11.4), which predicted the opposite
+
+| phase | roofline floor says | block measures | gap to roofline |
+|---|---|---|---|
+| prefill | fp8 **2.24x BETTER** than bf16 | fp8 **1.6x WORSE** | ~3.6x off |
+| decode | fp8 **3.35x BETTER** than bf16 | fp8 **3.7-5.4x WORSE** | ~12-18x off |
+
+So the fp8 kernels are collecting almost none of the precision win, and at decode they are far
+slower in absolute terms than the bf16 ones they replace. Three things this pins down:
+
+* **Decode is the disaster, and #62 is not the whole story.** The per-slot-vs-grouped argument
+  (§9.2) predicts trouble at BATCH, yet fp8 decode is already 5.36x worse at **B=1**, where the
+  expert union equals top_k and grouping is irrelevant. So a second, batch-independent defect sits
+  in the fp8 decode expert path -- consistent with the recipe's "W8A16 decode" (8-bit weights fed to
+  16-bit math needs an in-register dequant per use) and with the emitter comment "fp8 path: separate
+  norm + expert GLU (no fused fp8 norm variant)". Note the fp8 decode time is also FLAT in B
+  (1179.6 at B=1 vs 1179.65 at B=4) and flat in T -- a signature of a fixed per-step cost that
+  dominates everything else, not of a bandwidth or batching effect.
+* **Prefill still beats vLLM at B=1** (0.33x / 0.54x) and loses at B=4 (1.32x), so the fp8 prefill
+  GEMMs are usable but are giving up the 2.24x their compute-bound roofline allows.
+* **FP8's case today is capacity, not latency** -- which matches the serving verdict already
+  recorded: the 26B bf16 packet peaks at 77-81 GiB of 80 and serves 16 slots, while fp8 weights
+  return ~24.5 GiB. That is the reason to keep the arm, and the block numbers say plainly that it is
+  not yet a speed win.
+
+One methodology caveat, inherent to the configuration rather than a harness error: the fp8 recipe
+ships **no role_files** (packed prefill is unavailable under fp8), so the fp8 block runs a different
+object set from the bf16 block, which does build its role objects from the packet. The comparison is
+therefore fp8-as-deployed vs bf16-as-deployed, which is the decision-relevant one, not a
+single-variable kernel A/B.
