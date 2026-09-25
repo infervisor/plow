@@ -644,6 +644,40 @@ fn dense_prefill_rungs_populate_keys_for_sparse_decode() {
 }
 
 #[test]
+fn dsa_prefill_prep_knobs_fuse_key_norm_and_projections() {
+    let _guard = crate::test_env::env_guard();
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let ctx = 16384;
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_DSA", "1"),
+        ("PLOW_GLM_DSA_PF", "1"),
+        ("PLOW_GLM_DSA_KPREP", "1"),
+        ("PLOW_GLM_DSA_KW_DUAL", "1"),
+    ]);
+    let t = 8192;
+    let mut decl = Builder::new(256);
+    let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[0], t, 20, MoeEnc::Fp8Blk);
+    let mut b = Builder::new(256);
+    b.adopt_tensors(decl.tensors());
+    let all = b.all();
+    emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false, &mut 0, &all, None);
+    let p = b.finish();
+    let w = &n.lw[0];
+    assert!(!p.insts.iter().any(|d| d.op == DevOp::LayerNorm as u16 && d.t[0] == n.kidx_pf));
+    let writer = p.insts.iter().find(|d| d.t[0] == n.kidx[0]).unwrap();
+    assert_eq!(writer.op, DevOp::HeadNormRope as u16);
+    assert_eq!((writer.t[1], writer.t[2], writer.t[6]), (n.kidx_pf, w.iknw, w.iknb));
+    assert_eq!((writer.i[2], writer.i[5], writer.f[0]), (128, packet::dev::ROPE_PAIR_DSA_KPREP, 1e-6));
+    let proj: Vec<_> = p.insts.iter().filter(|d| d.t[1] == n.xn && (d.t[2] == w.iwk || d.t[2] == w.iwp)).collect();
+    assert_eq!(proj.len(), 1, "wk and weights_proj must be one dual GemmSmall");
+    let g = proj[0];
+    assert_eq!(g.op, DevOp::GemmSmall as u16);
+    assert_eq!((g.t[0], g.t[2], g.t[3], g.t[4]), (n.kidx_pf, w.iwk, n.widx_pf, w.iwp));
+    assert_eq!((g.i[0], g.i[1], g.i[2], g.i[3]), (t, c.index_dim, c.hidden, c.index_heads));
+}
+
+#[test]
 fn dense_mxfp4_rows_use_direct_gemm_and_sized_scratch() {
     let _guard = crate::test_env::env_guard();
     crate::with_emit_target_amd(true, || {
