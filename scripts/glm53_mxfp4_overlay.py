@@ -1,11 +1,12 @@
-"""glm53_mxfp4_overlay.py OUT — runtime checkpoint for the GLM-5.3 MXFP4 W8A8/MHA recipe
+"""glm53_mxfp4_overlay.py OUT [--dsa] — runtime checkpoint for the GLM-5.3 MXFP4 W8A8/MHA recipe
 (docs/amd/glm53-mxfp4-mi350x.md). New directory of symlinks over the prepped checkpoint
 (scripts/glm53_prep_quark.py) plus:
   * model-mla-tp8-* : derived self_attn.derived.mla_fp8_tp8.{wk,wv} from the FP8-original MLA overlay,
     valid only because kv_b/q_b bytes are identical between Quark and the FP8 original (checked);
   * model-plow-qb-scale-inv / model-plow-kvb-scale-inv : sidecar copies of Quark's
     {q_b,kv_b}_proj.weight_scale under Plow's FP8 scale name (weight_scale_inv);
-  * model-plow-oproj-fp8 : o_proj FP8 weight/scale aliases (PLOW_GLM_OPROJ_W8A8), all layers.
+  * model-plow-oproj-fp8 : o_proj FP8 weight/scale aliases (PLOW_GLM_OPROJ_W8A8), all layers;
+  * --dsa: indexer.{wq_b,wk}.weight_scale_inv sidecars (the bind-time block-FP8 upcast's name).
 Existing files are never modified."""
 import hashlib, json, os, struct, sys
 
@@ -14,6 +15,7 @@ QUARK = os.environ.get("GLM_QUARK", "/opt/models/GLM-5.3-MXFP4-AttnFP8-amd-49929
 FP8 = os.environ.get("GLM_FP8", "/opt/models/GLM-5.3-full-aca966e4")
 MLA = os.environ.get("GLM_MLA_TP8", "/opt/models/GLM-5.3-full-aca966e4-plow-mla-fp8-tp8")
 OUT = sys.argv[1]
+DSA = "--dsa" in sys.argv[2:]
 LAYERS = 78
 
 
@@ -43,6 +45,8 @@ def raw(idx, k):
 def sidecar(name, proj, note):
     header, blob = {}, bytearray()
     for l in range(LAYERS):
+        if f"model.layers.{l}.self_attn.{proj}.weight_scale" not in q:
+            continue
         data, v = raw(q, f"model.layers.{l}.self_attn.{proj}.weight_scale")
         header[f"model.layers.{l}.self_attn.{proj}.weight_scale_inv"] = {
             "dtype": v["dtype"], "shape": v["shape"], "data_offsets": [len(blob), len(blob) + len(data)]}
@@ -103,4 +107,8 @@ for e in sorted(os.listdir(MLA)):
 sidecar("model-plow-qb-scale-inv.safetensors", "q_b_proj", "copy of Quark q_b_proj.weight_scale (Plow scale name)")
 sidecar("model-plow-kvb-scale-inv.safetensors", "kv_b_proj", "copy of Quark kv_b_proj.weight_scale (Plow scale name)")
 oproj_sidecar()
+if DSA:
+    for proj in ("indexer.wq_b", "indexer.wk"):
+        sidecar(f"model-plow-{proj.replace('.', '-')}-scale-inv.safetensors", proj,
+                f"copy of Quark {proj}.weight_scale (Plow scale name)")
 print("overlay", OUT)

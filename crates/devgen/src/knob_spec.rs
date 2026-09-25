@@ -124,7 +124,7 @@ const C_MLA_MHA: &[Constraint] = &[Constraint {
             F::Not(&F::Atom("emit.glm_fp8_kv", Cmp::Eq, TRUE)),
         ]),
     ),
-    site: "crates/devgen/src/mla.rs: PLOW_GLM_MLA_MHA requires PLOW_GLM_MLA_W8A8, BF16 KV and dense attention",
+    site: "crates/devgen/src/mla.rs: PLOW_GLM_MLA_MHA requires PLOW_GLM_MLA_W8A8 and BF16 KV",
     check: Check::Site,
 }];
 

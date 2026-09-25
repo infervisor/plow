@@ -176,7 +176,14 @@ impl GlmCfg {
     /// PLOW_GLM_DSA=0 forces the dense path even at long ctx (the apples-to-apples decode baseline).
     fn dsa(&self, ctx: u32) -> bool {
         const CROSSOVER: u32 = 65536; // measured full-model TP4 dense/gather crossover (~69k, rounded)
-        let crossover = if emit_config::active().glm_mla_bf16_ps { self.index_topk } else { CROSSOVER };
+        // `PLOW_GLM_DSA=topk` is vLLM's gate: sparse as soon as a row can exceed index_topk.
+        let crossover = if emit_config::active().glm_mla_bf16_ps
+            || emit_config::active().glm_dsa.as_deref() == Some("topk")
+        {
+            self.index_topk
+        } else {
+            CROSSOVER
+        };
         let on = self.has_dsa
             && ctx > crossover
             && emit_config::active().glm_dsa.as_deref() != Some("0");
@@ -2818,8 +2825,9 @@ fn declare_glm_rows_batched_for_prefill(
         && emit_config::active().glm_rowsplit_arm().is_none()),
         "PLOW_GLM_MLA_W8A8 excludes absorbed norm, value and row-split fusions");
     let mla_mha = emit_config::active().glm_mla_mha;
-    assert!(!mla_mha || (mla_w8a8 && !glm_fp8_kv() && !c.dsa(ctx)),
-        "PLOW_GLM_MLA_MHA requires PLOW_GLM_MLA_W8A8, BF16 KV and dense attention");
+    // The MHA form is prefill-only and per bucket: sparse buckets keep the absorbed W8A8 gather.
+    assert!(!mla_mha || (mla_w8a8 && !glm_fp8_kv()),
+        "PLOW_GLM_MLA_MHA requires PLOW_GLM_MLA_W8A8 and BF16 KV");
     let [kvx, ckv_xq, ckv_xs] = if mla_mha {
         [ac(b, "kvx", rows * 8 * 448 * BF16), ac(b, "ckv_xq", rows * 512),
          ac(b, "ckv_xs", rows * 4 * F32)]
@@ -7378,8 +7386,8 @@ pub(crate) fn emit_glm_mla_prefill(
         "PLOW_GLM_MLA_W8A8 excludes token bands and row-split attention");
     // PLOW_GLM_MLA_MHA: the expanded (MHA) prefill form — kv_b GEMM, D=256 flash with the q
     // RoPE folded in, fused bf16 output straight into o_proj (mla_mha_pf.h, FlashMlaPrefill i6
-    // bit 9). Fresh single-chunk prefill only: the device refuses kv_len != t.
-    let mla_mha = emit_config::active().glm_mla_mha && emit_config::active().glm_mla_w8a8;
+    // bit 9). Fresh single-chunk prefill only: the device refuses kv_len != t. Dense buckets only.
+    let mla_mha = emit_config::active().glm_mla_mha && emit_config::active().glm_mla_w8a8 && !sparse;
     let fp8_q = emit_config::active().glm_mla_w8a8
         .then(|| emit_glm_mla_query_w8a8(b, &all, n, w, t, c_rnq, mla_mha, pf_norm_q));
     let c_qa = match fp8_q.map(|(done, _)| (done, done)).or(rowband_q) {

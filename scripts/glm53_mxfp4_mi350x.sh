@@ -8,6 +8,7 @@
 #   scripts/glm53_mxfp4_mi350x.sh validate PKT OBJ CKPT ASSETS OUT   # 8 GPUs, submit through gpuq:
 #     python3 scripts/bench/gpuq.py submit scripts/glm53_mxfp4_mi350x.sh validate ...
 #
+# GLM_EMIT_EXTRA / GLM_OBJ_EXTRA="K=V ..." override the recipe env (later assignment wins).
 # v9 (2026-09-25): packet sha16 3b8b96fd6339691d; prefill 1k/8k/16k 140/388/736 ms,
 # decode M1 37.7 ms/token, M128 177.9 ms/step; top-1 == vLLM 0.29 oracle T1024..T8192.
 set -euo pipefail
@@ -42,12 +43,12 @@ overlay)
   python3 "$WT/scripts/glm53_mxfp4_overlay.py" "$1" ;;
 emit)
   out="$1"; mkdir -p "$(dirname "$out")"
-  env "${EMIT_ENV[@]}" PLOW_VERIFY_BIN="${PLOW_VERIFY_BIN:-$WT/lean-plow/.lake/build/bin/plow_verify}" \
+  env "${EMIT_ENV[@]}" ${GLM_EMIT_EXTRA:-} PLOW_VERIFY_BIN="${PLOW_VERIFY_BIN:-$WT/lean-plow/.lake/build/bin/plow_verify}" \
     "$WT/target/release/plowc" --hf-dir "$PREPPED" --gpu mi350 --arch gfx950 --num-gpus 8 --n-cu 256 \
     --max-ctx 16384 --batch 128 --seq 128,512,1024,2048,4096,8192,16384 --out "$out"
   sha256sum "$out/model.pkt" ;;
 objects)
-  env "${OBJ_ENV[@]}" PLOW_HSACO_CONFIG="$1/plow_config.h" bash "$WT/scripts/build_gfx950.sh" "$2" ;;
+  env "${OBJ_ENV[@]}" ${GLM_OBJ_EXTRA:-} PLOW_HSACO_CONFIG="$1/plow_config.h" bash "$WT/scripts/build_gfx950.sh" "$2" ;;
 assets)
   pkt="$1"; ckpt="$2"; out="$3"; mkdir -p "$out"
   for f in model.pkt build.json plow_config.h lean-checks.json weights.json; do
