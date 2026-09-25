@@ -503,6 +503,9 @@ pub struct EmitConfig {
     /// prefill q_a norm), deleting the QuantFp8Block128 packet.
     #[arg(long, env = "PLOW_GLM_NORM_Q128", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_norm_q128: bool,
+    /// QuantFp8Block128 at <= 128 rows runs on only the workgroups that own a group.
+    #[arg(long, env = "PLOW_GLM_QUANT_NARROW", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_quant_narrow: bool,
     #[arg(long, env = "PLOW_GLM_INDEXER_WQ_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_indexer_wq_w8a8: bool,
     #[arg(long, env = "PLOW_GLM_INDEXER_FP8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1429,6 +1432,7 @@ impl EmitConfig {
             glm_mla_mha: env_bool("PLOW_GLM_MLA_MHA"),
             glm_decode_shared_fold: env_bool("PLOW_GLM_DECODE_SHARED_FOLD"),
             glm_norm_q128: env_bool("PLOW_GLM_NORM_Q128"),
+            glm_quant_narrow: env_bool("PLOW_GLM_QUANT_NARROW"),
             glm_indexer_wq_w8a8: env_bool("PLOW_GLM_INDEXER_WQ_W8A8"),
             glm_indexer_fp8: env_bool("PLOW_GLM_INDEXER_FP8"),
             glm_mla_bf16_ps: env_bool("PLOW_GLM_MLA_BF16_PS"),

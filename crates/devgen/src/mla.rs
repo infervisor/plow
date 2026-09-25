@@ -1431,7 +1431,10 @@ fn glm_oproj_split4(rows: u32, width: u32, k: u32) -> bool {
 }
 
 fn glm_quant128_cus(cus: &[u32], rows: u32, k: u32) -> Vec<u32> {
-    if rows == 16 {
+    // PLOW_GLM_QUANT_NARROW: every decode-sized row count takes only the workgroups that own a
+    // group (128 per workgroup pass); an all-CU packet over 8 rows paid 256 workgroups' gate
+    // maintenance for 3 workgroups of work.
+    if rows == 16 || (emit_config::active().glm_quant_narrow && rows <= 128) {
         // Four lanes quantize each group of 128; the device loop handles the tail.
         elem_cus(cus, rows * (k / 32))
     } else {
