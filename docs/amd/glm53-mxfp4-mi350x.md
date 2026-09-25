@@ -18,7 +18,14 @@ rungs 1–128, TP8, priced against a per-op roofline. Every GPU job ran through 
 
 ## Recipe (best: packet `parity-sf-sp-v9`, objects `…-v9-hsaco-final`)
 
-Emit (`plowc --replay-knobs <static packet>/build.json …`, env):
+Checked in as `scripts/glm53_mxfp4_mi350x.sh overlay|emit|objects|assets|validate` (the env below).
+Inputs outside the repo: Quark checkpoint, prepped dir from `scripts/glm53_prep_quark.py`, FP8-original
+checkpoint + its derived MLA TP8 dir (`scripts/glm53_mxfp4_overlay.py` byte-checks kv_b/q_b against them).
+Re-check 2026-09-25: `emit` reproduces v9 byte-identical (sha16 3b8b96fd6339691d); `overlay` reproduces
+every sidecar byte-identical and every symlink target; `objects` reproduces every interpreter .co
+byte-identical and every lean ELF with identical disassembly (a metadata note differs).
+
+Emit (env):
 `PLOW_GLM_QKVA_W8A8=1 PLOW_GLM_OPROJ_W8A8=1 PLOW_GLM_MLA_W8A8=1 PLOW_GLM_MLA_MHA=1
 PLOW_GLM_MOE_SHARED_FOLD=1 PLOW_GLM_DECODE_SHARED_FOLD=1 PLOW_GLM_NORM_Q128=1 PLOW_GLM_QUANT_NARROW=1 PLOW_GLM_SEQ_PAR=1
 PLOW_GLM_SEQ_PAR_PROJ=1 GLM_GROUP=1 PLOW_GLM_FUSE_B1=1 GLM_FUSE_XRN=1 PLOW_GLM_FUSE_ROPE=1
