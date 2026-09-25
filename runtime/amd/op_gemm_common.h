@@ -1585,6 +1585,72 @@ __device__ void d_mla_bmm_fp8_m16(bf16* C, const bf16* X, const unsigned char* W
     }
 }
 
+/* Decode-rows block-FP8 GEMM (plain or SPLIT3 outputs), K split across the workgroup's waves.
+ * d_gemm_fp8_block128_m16 gives each WAVE one 16x16 tile and walks all of K: at GLM qkv_a
+ * (N=2624, K=6144) that is 164 busy waves out of 2048, each a 48-group dependent load chain
+ * (0.086 ms). Here a WORKGROUP owns the tile, wave w takes K groups [w*kb/W, (w+1)*kb/W), and the
+ * partials are summed through LDS in wave order. Same per-group scale fold; f32 reassociation
+ * only. Requires K % 128 == 0 and 16-byte aligned A/B. `red` holds W*64*4 floats. */
+__device__ void d_gemm_fp8_block128_m16_kw(bf16* C, const unsigned char* A, const unsigned char* B,
+                                           const float* ascale, const float* wscale, unsigned M,
+                                           unsigned N, unsigned K, unsigned slice, unsigned nblk,
+                                           float* red, bf16* C1 = nullptr, bf16* C2 = nullptr,
+                                           unsigned n_first = 0, unsigned n_second = 0) {
+    const unsigned lane = threadIdx.x & 63, wave = threadIdx.x >> 6, W = blockDim.x >> 6;
+    const unsigned nt = (N + 15) / 16, mt = (M + 15) / 16, kb = K / 128;
+    const unsigned g0 = wave * kb / W, g1 = (wave + 1) * kb / W;
+    for (unsigned tile = slice; tile < mt * nt; tile += nblk) {
+        const unsigned m0 = (tile / nt) * 16, n0 = (tile % nt) * 16;
+        const unsigned am = m0 + lane % 16, n = n0 + lane % 16;
+        f32x4 acc = (f32x4)(0.0f);
+        for (unsigned group = g0; group < g1; group++) {
+            const unsigned k0 = group * 128 + (lane / 16) * 32;
+            fp8v32 av = (fp8v32)(0), bv = (fp8v32)(0);
+#pragma unroll
+            for (unsigned half = 0; half < 2; half++) {
+                fp8v16 a = (fp8v16)(0), b = (fp8v16)(0);
+                if (am < M) a = ld_glob_fp8v16(A + (size_t)am * K + k0 + half * 16);
+                if (n < N) b = ld_glob_fp8v16(B + (size_t)n * K + k0 + half * 16);
+#pragma unroll
+                for (unsigned j = 0; j < 4; j++) {
+                    av[half * 4 + j] = a[j];
+                    bv[half * 4 + j] = b[j];
+                }
+            }
+            const f32x4 dot = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                av, bv, (f32x4)(0.0f), 0, 0, 0, 0, 0, 0);
+            const float ws = n < N ? wscale[(n / 128) * kb + group] : 0.0f;
+#pragma unroll
+            for (unsigned e = 0; e < 4; e++) {
+                const unsigned m = m0 + (lane / 16) * 4 + e;
+                const float as = m < M ? ascale[(size_t)group * M + m] : 0.0f;
+                acc[e] = fmaf(dot[e], as * ws, acc[e]);
+            }
+        }
+        *(f32x4*)(red + (wave * 64u + lane) * 4u) = acc;
+        __syncthreads();
+        if (wave == 0) {
+            f32x4 sum = *(const f32x4*)(red + lane * 4u);
+            for (unsigned w = 1; w < W; w++) sum += *(const f32x4*)(red + (w * 64u + lane) * 4u);
+#pragma unroll
+            for (unsigned e = 0; e < 4; e++) {
+                const unsigned m = m0 + (lane / 16) * 4 + e;
+                if (m >= M || n >= N) continue;
+                if (n_first) {
+                    const unsigned second_end = n_first + n_second;
+                    bf16* out = n < n_first ? C : n < second_end ? C1 : C2;
+                    const unsigned width = n < n_first ? n_first : n < second_end ? n_second : N - second_end;
+                    const unsigned col = n < n_first ? n : n < second_end ? n - n_first : n - second_end;
+                    st_act1(out + (size_t)m * width + col, f2bf(sum[e]));
+                } else {
+                    st_act1(C + (size_t)m * N + n, f2bf(sum[e]));
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
 __device__ __forceinline__ void atomic_add_bf16_pair(bf16* dst, unsigned packed) {
     typedef short pair_t __attribute__((ext_vector_type(2)));
     __builtin_amdgcn_global_atomic_fadd_v2bf16((pair_t*)dst, __builtin_bit_cast(pair_t, packed));

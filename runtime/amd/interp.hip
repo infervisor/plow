@@ -874,6 +874,9 @@ extern "C" __device__ unsigned plow_dsa_select_split_arm = 1;
 #ifndef IDXPF_TILE_N_DEF
 #define IDXPF_TILE_N_DEF 64u
 #endif
+#ifndef PLOW_FP8_BLK_KW
+#define PLOW_FP8_BLK_KW 0
+#endif
 #ifndef PLOW_QKVA_WAVE1
 #define PLOW_QKVA_WAVE1 0
 #endif
@@ -4093,6 +4096,14 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 break;
             }
             if (in->i[4]) {
+#if PLOW_FP8_BLK_KW
+                /* Decode rows: K split over the waves (d_gemm_fp8_block128_m16_kw). */
+                d_gemm_fp8_block128_m16_kw((bf16*)TEN(0), (const unsigned char*)TEN(1),
+                    (const unsigned char*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
+                    PLOW_RUNTIME_ROWS(in->i[0]), in->i[1], in->i[2], slice, nblk, (float*)sm->raw,
+                    (bf16*)TEN(5), (bf16*)TEN(6), in->i[4], in->i[5]);
+                break;
+#endif
 #if PLOW_QKVA_WAVE1
                 if (PLOW_RUNTIME_ROWS(in->i[0]) <= 64) {
                     if (threadIdx.x < 64)
