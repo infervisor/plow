@@ -15,9 +15,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-#ifdef ISEL3_PROF
-__device__ unsigned long long g_isel3_prof[16];
-#endif
 #if defined(__HIP_DEVICE_COMPILE__)
 #include "op_attention.h"
 #include "dsa_select_v3.h"
@@ -210,28 +207,6 @@ int main(int argc, char** argv) {
         return fails != 0;
     }
     constexpr unsigned S = 16384;
-    if (argc == 2 && !strcmp(argv[1], "quick")) {
-        std::vector<float> h((size_t)S * S);
-        for (size_t r = 0; r < S; r++)
-            for (size_t c = 0; c < S; c++) h[r * S + c] = gen(0);
-        for (unsigned T : {4096u, 8192u, 16384u}) {
-#ifdef ISEL3_PROF
-            unsigned long long z[16] = {};
-            CK(hipMemcpyToSymbol(HIP_SYMBOL(g_isel3_prof), z, sizeof(z)));
-#endif
-            fails += run_case("gauss", h, S, S, T, T, 10);
-#ifdef ISEL3_PROF
-            unsigned long long pr[16];
-            CK(hipMemcpyFromSymbol(pr, HIP_SYMBOL(g_isel3_prof), sizeof(pr)));
-            const double n = pr[6] ? (double)pr[6] : 1.0;
-            printf("prof/row (%llu rows): hist %.0f find %.0f compact %.0f refine %.0f fetch %.0f row %.0f\n",
-                   pr[6], pr[0] / n, pr[1] / n, pr[2] / n, pr[3] / n, pr[4] / n, pr[5] / n);
-            printf("  compact: masks %.0f alloc %.0f emit %.0f | refine: passes %.0f rank %.0f\n", pr[8] / n,
-                   pr[9] / n, pr[10] / n, pr[11] / n, pr[12] / n);
-#endif
-        }
-        return 0;
-    }
     {
         std::vector<float> h((size_t)S * S);
         for (size_t r = 0; r < S; r++)

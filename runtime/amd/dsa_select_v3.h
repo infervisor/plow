@@ -8,7 +8,8 @@
  * and pays ~15 barrier / LDS round trips per row whatever its length; here the eight waves rank
  * eight rows side by side (in the fused form: the eight rows of one query pack):
  *   1. stream the row from global into an 11-bit histogram of the key's top bits (fp32 sign /
- *      exponent / mantissa — not fp16 bins) in the wave's own LDS region;
+ *      exponent / mantissa — not fp16 bins) in the wave's own LDS region — or, once the wave has
+ *      ranked a row, into 2^13-key bins in a window around that row's threshold (Isel3Pred);
  *   2. the wave scans it for the threshold bin; while that bin holds more than CAPW keys (and is
  *      not needed whole) further 11-bit digits are resolved by more streaming passes, so an
  *      overflowing bin is never truncated;
@@ -24,6 +25,7 @@ namespace isel3 {
 constexpr unsigned NW = PLOW_WAVES;         /* waves per workgroup = rows in flight */
 constexpr unsigned REGW = 3840u;            /* LDS words per wave */
 constexpr unsigned NBH = 2048u, B1 = 11u;   /* streaming digits */
+constexpr unsigned WSH = 13u;               /* predicted-window bin width: 2^13 keys (~1e-3 relative) */
 constexpr unsigned CAPW = (REGW - 256u) / 2u; /* boundary candidates per wave */
 constexpr unsigned CKEY = 0u, CPOS = CAPW, SHIST = 2u * CAPW; /* region layout after the scan */
 constexpr unsigned MAXPOS = 16384u;         /* positions the fused pack mask covers */
@@ -241,14 +243,59 @@ struct Isel3Prefix {
     }
 };
 
-/* One wave ranks one row (top_k < row_len). wl: this wave's REGW-word LDS region. */
+/* The previous row's threshold key prefix, per wave (a row's scores sit where its neighbours'
+ * do: real GLM rows put 70% of a 16k row in the threshold's 11-bit top-digit bin, but <= 60 keys
+ * in a 2^13-ulp bin). */
+struct Isel3Pred {
+    unsigned key;
+    bool valid, skip; /* skip: the last window missed; rank the next row without one */
+};
+
+/* One wave ranks one row (top_k < row_len). wl: this wave's REGW-word LDS region.
+ * With a prediction, the first pass histograms a window of NBH - 2 bins of 2^WSH keys centred on
+ * the predicted threshold (bin 0 / NBH - 1 aggregate everything below / above it). A threshold
+ * inside the window resolves the top 32 - WSH key bits in that one pass; one in an aggregate bin
+ * falls back to the top-digit passes. Either way the set is exact. */
 template <class Emit>
 __device__ __forceinline__ void isel3_row(const float* row, unsigned row_len, unsigned top_k,
-                                          unsigned* wl, Emit& emit) {
+                                          unsigned* wl, Isel3Pred& pred, Emit& emit) {
     using namespace isel3;
     const unsigned lane = threadIdx.x & 63u;
     Isel3Prefix px{0u, 0u, 0u, 0u, 0u, 0u};
     unsigned k_rem = top_k, bnd = row_len;
+    const bool use = pred.valid && !pred.skip;
+    pred.skip = false;
+    if (use) {
+        const unsigned c = pred.key >> WSH;
+        const unsigned base = c > NBH / 2u ? c - NBH / 2u : 0u;
+#pragma unroll
+        for (unsigned j = 0; j < NBH / 256u; j++) ((uint4*)wl)[j * 64u + lane] = uint4{0u, 0u, 0u, 0u};
+        /* Keys below the window are not counted (one hot bin would serialise the atomics); bin 0
+         * holds a count no row reaches instead, so a threshold below the window lands there. */
+        if (lane == 0u) wl[0] = 1u << 24;
+        isel3_wsync();
+        isel3_stream(row, row_len, [&](const unsigned (&k)[4], unsigned, unsigned nv) {
+#pragma unroll
+            for (unsigned c4 = 0; c4 < 4u; c4++) {
+                const unsigned v = k[c4] >> WSH;
+                const unsigned d = v - base + 1u < NBH - 1u ? v - base + 1u : NBH - 1u;
+                if (c4 < nv && v >= base) atomicAdd(&wl[d], 1u);
+            }
+        });
+        isel3_wsync();
+        unsigned d, above, b;
+        isel3_scan<NBH / 256u>(wl, 25u, top_k, d, above, b);
+        isel3_wsync();
+        if (d != 0u && d != NBH - 1u) {
+            px.sprefix = (base + d - 1u) << WSH;
+            px.smask = ~0u << WSH;
+            px.sres = 32u - WSH;
+            k_rem = top_k - above;
+            bnd = b;
+        } else {
+            pred.skip = true;
+        }
+    }
     /* Streaming digits until the boundary group fits the candidate buffer or is needed whole.
      * Histogram bins are laid out from the top of the NBH-bin buffer, digit value d at bin d. */
     while (bnd != k_rem && bnd > CAPW && (px.sres < 32u || px.ires < 24u)) {
@@ -280,10 +327,8 @@ __device__ __forceinline__ void isel3_row(const float* row, unsigned row_len, un
         px.add(isx, sh, nb, d);
         k_rem -= above;
     }
-#if defined(ISEL3_PROBE) && ISEL3_PROBE == 1
-    if (bnd == 12345u) emit(true, 0u);
-    return;
-#endif
+    pred.key = px.sprefix;
+    pred.valid = true;
     const bool whole = bnd == k_rem;
     unsigned* const ckey = wl + CKEY;
     unsigned* const cpos = wl + CPOS;
@@ -331,9 +376,6 @@ __device__ __forceinline__ void isel3_row(const float* row, unsigned row_len, un
     else
         pass2(std::true_type{});
     if (whole) return;
-#if defined(ISEL3_PROBE) && ISEL3_PROBE == 2
-    return;
-#endif
     isel3_wsync();
     /* nc == bnd <= CAPW candidates share the prefix; k_rem < nc of them are needed. */
     unsigned* const sh8 = wl + SHIST;
@@ -399,14 +441,14 @@ __device__ __forceinline__ void isel3_row(const float* row, unsigned row_len, un
 /* Row t into idx: identity (-1 padded) or ranked. One wave. */
 __device__ __forceinline__ void isel3_select_row(PLOW_GLOB int* ib, const float* Score,
                                                  unsigned top_k, unsigned kv_stride, unsigned t,
-                                                 unsigned row_len, unsigned* wl) {
+                                                 unsigned row_len, unsigned* wl, Isel3Pred& pred) {
     PLOW_GLOB int* const row = ib + (size_t)t * top_k;
     if (row_len <= top_k) {
         for (unsigned s = threadIdx.x & 63u; s < top_k; s += 64u)
             st_act<int>(&row[s], s < row_len ? (int)s : -1);
     } else {
         Isel3EmitRow e{row, top_k, 0u};
-        isel3_row(Score + (size_t)t * kv_stride, row_len, top_k, wl, e);
+        isel3_row(Score + (size_t)t * kv_stride, row_len, top_k, wl, pred, e);
     }
 }
 
@@ -420,8 +462,9 @@ __device__ void d_index_select_pf_v3(int* __restrict__ idx, const float* __restr
     const unsigned q_pos0 = (unsigned)as_glob(kv_len)[0] - n_tok;
     const unsigned wave = threadIdx.x >> 6;
     unsigned* const wl = lds + wave * REGW;
+    Isel3Pred pred{0u, false, false};
     for (unsigned t = slice * NW + wave; t < n_tok; t += nblk * NW)
-        isel3_select_row(ib, Score, top_k, kv_stride, t, q_pos0 + t + 1u, wl);
+        isel3_select_row(ib, Score, top_k, kv_stride, t, q_pos0 + t + 1u, wl, pred);
 }
 
 /* Appends the mask's positions [w0, w0 + 4*nw) (ascending) to the pack's union block. One
@@ -490,6 +533,7 @@ __device__ void d_index_select_union_pf(unsigned char* __restrict__ uni, int* __
     unsigned* const red = lds; /* compaction scratch: every row region is idle by then */
     if (zero_ctr && slice == 0u && tid < 2u)
         st_act<unsigned>((PLOW_GLOB unsigned*)(as_glob(uni) + hdr + (size_t)n_qt * cap * 12u) + tid, 0u);
+    Isel3Pred pred{0u, false, false};
     for (unsigned qt = slice; qt < n_qt; qt += nblk) {
         const unsigned q_lo = qt * PACK;
         const unsigned q_hi = q_lo + PACK - 1u < n_tok - 1u ? q_lo + PACK - 1u : n_tok - 1u;
@@ -511,13 +555,13 @@ __device__ void d_index_select_union_pf(unsigned char* __restrict__ uni, int* __
                         atomicOr(&mask[s >> 2], bit << ((s & 3u) * 8u));
                 } else {
                     Isel3EmitMask e{mask, bit};
-                    isel3_row(Score + (size_t)t * kv_stride, row_len, top_k, wl, e);
+                    isel3_row(Score + (size_t)t * kv_stride, row_len, top_k, wl, pred, e);
                 }
             }
             isel3_sync();
             base = isel3_compact(mask, (tile_end + 3u) / 4u, 0u, 0u, cap, upos, ulo, uhi, red);
         } else {
-            if (t <= q_hi) isel3_select_row(ib, Score, top_k, kv_stride, t, row_len, wl);
+            if (t <= q_hi) isel3_select_row(ib, Score, top_k, kv_stride, t, row_len, wl, pred);
             /* idx rows were stored by this workgroup; L1-bypassing loads read them back. */
             __threadfence_block();
             __syncthreads();
