@@ -354,6 +354,13 @@ int main(int argc, char** argv) {
     for (unsigned n : Ns)
         for (unsigned t : Ts) run_shape(t, n, K);
 
+    printf("GLM-5.3 dense TP8: gate/up N=1536 K=6144; down N=6144 K=1536\n");
+    const unsigned glm_ts[] = {8, 128, 8192};
+    for (unsigned t : glm_ts) {
+        run_shape(t, 1536, 6144);
+        run_shape(t, 6144, 1536);
+    }
+
     printf("\n%s\n", bad == 0 ? "PASS" : "FAIL");
     return bad == 0 ? 0 : 1;
 }

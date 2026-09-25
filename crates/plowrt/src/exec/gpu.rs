@@ -30,6 +30,7 @@ fn pf_chunk_cost_rows() -> usize {
 use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
+use crate::exec::tensor_bindings::{TensorBinding, TensorBindings};
 use crate::memory::slab_carve as carve_bytes;
 #[cfg(test)]
 use crate::memory::SLAB_ALIGN;
@@ -432,8 +433,8 @@ fn slab_carve(be: &CudaBackend, sections: [usize; 2]) -> Result<(DeviceMem, [Dev
         .ok_or_else(|| RuntimeError::Rejected("CUDA slab size overflow".into()))?;
     let slab = be.alloc(0, bytes.max(4) as u64)?;
     let views = [
-        DeviceMem::view(slab.base, sections[0] as u64),
-        DeviceMem::view(slab.base + sections[0] as u64, sections[1] as u64),
+        slab.subview(0, sections[0] as u64)?,
+        slab.subview(sections[0] as u64, sections[1] as u64)?,
     ];
     Ok((slab, views))
 }
@@ -2258,6 +2259,7 @@ pub struct GpuEngine {
     /// launch selects its table through the kernarg (`tens_slot_base`) —
     /// nothing is rewritten or restored. Empty at B == 1.
     d_tens_slots: Vec<DeviceMem>,
+    _tensor_bindings: Vec<TensorBindings>,
     /// Rank-3 KV descriptors bind slot-specific addresses and outlive every slot table use.
     _kv_tmap_slots: Vec<DeviceMem>,
     /// The other decode tables live for the engine's lifetime and are never
@@ -2734,7 +2736,9 @@ struct PipeTiming {
 struct UploadPipe<'a> {
     be: &'a CudaBackend,
     stream: CudaStream,
-    bufs: [PinnedHost; 2],
+    bufs: std::mem::ManuallyDrop<[PinnedHost; 2]>,
+    retirement: [crate::device::retirement::RetirementSlot; 2],
+    retired: bool,
     /// End-of-H2D markers (also gate buffer reuse). Timing-enabled when profiling.
     ends: [CudaEvent; 2],
     /// Start-of-H2D markers for `cuEventElapsedTime` (only when profiling).
@@ -2803,7 +2807,9 @@ impl<'a> UploadPipe<'a> {
         };
         Ok(UploadPipe {
             stream,
-            bufs,
+            bufs: std::mem::ManuallyDrop::new(bufs),
+            retirement: std::array::from_fn(|_| crate::device::retirement::RetirementSlot::new()),
+            retired: true,
             ends,
             starts,
             primed: [false, false],
@@ -2829,6 +2835,7 @@ impl<'a> UploadPipe<'a> {
     /// returns — the loader only passes slices of the checkpoint mmap and the
     /// blob, both of which outlive the pipe.
     unsafe fn push_direct(&mut self, dst: u64, src: &[u8]) -> Result<()> {
+        self.retired = false;
         if !self.direct_started {
             self.direct_started = true;
             if let Some((start, _)) = &self.dwin {
@@ -2855,9 +2862,13 @@ impl<'a> UploadPipe<'a> {
     /// previous DMA has not yet retired (two-deep pipeline).
     fn push(&mut self, dst: u64, chunk: &[u8]) -> Result<()> {
         let slot = self.n & 1;
-        if self.primed[slot] {
+        if let Some(ticket) = self.retirement[slot].event_ticket().map_err(crate::device::retirement_error)? {
             let t_wait = self.timing.is_some().then(std::time::Instant::now);
-            self.be.event_synchronize(&self.ends[slot])?;
+            if let Err(error) = self.be.event_synchronize(&self.ends[slot]) {
+                self.retirement[slot].failed(ticket).map_err(crate::device::retirement_error)?;
+                return Err(error);
+            }
+            self.retirement[slot].complete(ticket).map_err(crate::device::retirement_error)?;
             if let Some(tm) = self.timing.as_mut() {
                 if let Some(t) = t_wait {
                     tm.event_sync_ns += t.elapsed().as_nanos();
@@ -2867,7 +2878,9 @@ impl<'a> UploadPipe<'a> {
                     tm.dma_ms += self.be.event_elapsed_ms(&starts[slot], &self.ends[slot])? as f64;
                 }
             }
+            self.primed[slot] = false;
         }
+        let ticket = self.retirement[slot].begin().map_err(crate::device::retirement_error)?;
         let t_copy = self.timing.is_some().then(std::time::Instant::now);
         self.bufs[slot].as_mut_slice()[..chunk.len()].copy_from_slice(chunk);
         if let Some(tm) = self.timing.as_mut() {
@@ -2877,22 +2890,34 @@ impl<'a> UploadPipe<'a> {
             tm.bytes += chunk.len() as u64;
         }
         if let Some(starts) = &self.starts {
-            self.be.event_record(&starts[slot], &self.stream)?;
+            if let Err(error) = self.be.event_record(&starts[slot], &self.stream) {
+                self.retirement[slot].not_submitted(ticket).map_err(crate::device::retirement_error)?;
+                return Err(error);
+            }
         }
         // SAFETY: the pinned buffer stays alive (owned by self) until finish()
         // synchronizes the stream; dst is inside a live allocation (caller).
         let t_enq = self.timing.is_some().then(std::time::Instant::now);
-        unsafe {
+        self.retired = false;
+        let submitted = unsafe {
             self.be.memcpy_htod_async(
                 dst,
                 &self.bufs[slot].as_slice()[..chunk.len()],
                 &self.stream,
-            )?;
+            )
+        };
+        if let Err(error) = submitted {
+            self.retirement[slot].failed(ticket).map_err(crate::device::retirement_error)?;
+            return Err(error);
         }
+        self.retirement[slot].submitted(ticket).map_err(crate::device::retirement_error)?;
         if let (Some(t), Some(tm)) = (t_enq, self.timing.as_mut()) {
             tm.htod_enq_ns += t.elapsed().as_nanos();
         }
-        self.be.event_record(&self.ends[slot], &self.stream)?;
+        if let Err(error) = self.be.event_record(&self.ends[slot], &self.stream) {
+            self.retirement[slot].failed(ticket).map_err(crate::device::retirement_error)?;
+            return Err(error);
+        }
         self.primed[slot] = true;
         self.n += 1;
         Ok(())
@@ -2921,6 +2946,10 @@ impl<'a> UploadPipe<'a> {
         }
         let t_sync = self.timing.is_some().then(std::time::Instant::now);
         self.be.stream_synchronize(&self.stream)?;
+        self.retired = true;
+        for slot in &mut self.retirement {
+            if let Some(ticket) = slot.pending() { slot.quiesced(ticket).map_err(crate::device::retirement_error)?; }
+        }
         if let (Some(t), Some(tm)) = (t_sync, self.timing.as_mut()) {
             tm.stream_sync_ns = t.elapsed().as_nanos();
         }
@@ -2934,6 +2963,22 @@ impl<'a> UploadPipe<'a> {
 
     fn take_timing(&mut self) -> Option<PipeTiming> {
         self.timing.take()
+    }
+}
+
+impl Drop for UploadPipe<'_> {
+    fn drop(&mut self) {
+        for slot in &mut self.retirement {
+            if let Some(ticket) = slot.pending() { let _ = slot.cancel(ticket); }
+        }
+        if !self.retired {
+            if let Err(error) = self.be.stream_synchronize(&self.stream) {
+                tracing::error!(%error, "upload retirement failed; retaining pinned staging buffers");
+                return;
+            }
+        }
+        // Successful stream completion (or no submission) covers both staging buffers.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.bufs) };
     }
 }
 
@@ -3279,6 +3324,12 @@ impl GpuEngine {
                     source,
                 })?;
                 let blob = DevBlob::parse(&raw)?;
+                crate::certificate_checks::check_packet(&pkt, &raw, &blob)?;
+                if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
+                    d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16
+                }) {
+                    return Err(RuntimeError::Device("native FP8 indexer requires the gfx950 AMD route".into()));
+                }
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::MoeAiterFp8Pf as u16
                         || d.op == DevOp::IndexTpPf as u16
@@ -4036,7 +4087,7 @@ impl GpuEngine {
                         m
                     }
                     (None, WeightSlab::Flat(slab)) => {
-                        let m = DeviceMem::view(slab.base + slab_off, tensor_bytes);
+                        let m = slab.subview(slab_off, tensor_bytes)?;
                         slab_off += carve_bytes(tensor_bytes);
                         m
                     }
@@ -4209,6 +4260,13 @@ impl GpuEngine {
         if let WeightSlab::Vmm(slab) = &weight_slab {
             let t_join = std::time::Instant::now();
             slab.wait_mapped(slab_bytes)?;
+            for mem in &mut devp {
+                if let Some(region) = crate::memory::vmm::VmmOps::allocation_provenance(
+                    &*be, mem.base, mem.len,
+                ) {
+                    mem.bind_view_provenance(region);
+                }
+            }
             if let Some(tm) = load_tim.as_mut() {
                 tm.slab_join_ms = t_join.elapsed().as_secs_f64() * 1e3;
             }
@@ -4364,8 +4422,8 @@ impl GpuEngine {
         let pf_batch_requested = packed_prefill.is_some() || pf_batch_env;
         let pf_bufs = if let Some(p) = &packed_prefill {
             Some((
-                DeviceMem::view(devp[p.slot as usize].base, devp[p.slot as usize].len),
-                DeviceMem::view(devp[p.request as usize].base, devp[p.request as usize].len),
+                devp[p.slot as usize].subview(0, devp[p.slot as usize].len)?,
+                devp[p.request as usize].subview(0, devp[p.request as usize].len)?,
             ))
         } else if pf_batch_requested && pf_max_t_blob > 0 {
             Some((
@@ -4431,7 +4489,20 @@ impl GpuEngine {
             (h_slot, h_slot + 1)
         });
         let d_tens = be.alloc(0, (ptrs.len() * 8) as u64)?;
-        be.upload(&d_tens, 0, bytemuck::cast_slice(&ptrs))?;
+        let base_bindings = || -> Result<Vec<TensorBinding>> {
+            let mut slots = devp.iter().map(TensorBinding::whole).collect::<Result<Vec<_>>>()?;
+            if packed_prefill.is_none() {
+                if let Some((s, r)) = &pf_bufs {
+                    slots.push(TensorBinding::whole(s)?);
+                    slots.push(TensorBinding::whole(r)?);
+                }
+            }
+            Ok(slots)
+        };
+        let mut bindings = TensorBindings::new(base_bindings()?)?;
+        bindings.check_pointers(&ptrs)?;
+        bindings.upload(|bytes| be.upload(&d_tens, 0, bytes))?;
+        let mut tensor_bindings = vec![bindings];
 
         // ---- decode program tables ----
         let g = blob.decode_prog()?;
@@ -4989,13 +5060,20 @@ impl GpuEngine {
         if batch > 1 && (!kv_slots.is_empty() || !kv_maps.is_empty()) {
             let mut shifted = ptrs.clone();
             for b in 1..batch {
-                for &(i, stride) in &kv_slots {
-                    shifted[i] = ptrs[i] + b as u64 * stride;
+                let mut slots = base_bindings()?;
+                for (i, binding) in crate::exec::tensor_bindings::slot_bindings(&devp, &kv_slots, b)? {
+                    shifted[i] = binding.address();
+                    slots[i] = binding;
                 }
                 for map in &kv_maps {
                     let descriptor = be.alloc(0, 256)?;
                     for (id, base) in map.encode_slot(&be, &ptrs, b, &descriptor)? {
                         shifted[id] = base;
+                        slots[id] = if id == map.tensor {
+                            TensorBinding::whole(&descriptor)?
+                        } else {
+                            TensorBinding::capture(&devp[id], base, map.stride)?
+                        };
                     }
                     kv_tmap_slots.push(descriptor);
                 }
@@ -5005,7 +5083,10 @@ impl GpuEngine {
                     }
                 }
                 let mem = be.alloc(0, (shifted.len() * 8) as u64)?;
-                be.upload(&mem, 0, bytemuck::cast_slice(&shifted))?;
+                let mut bindings = TensorBindings::new(slots)?;
+                bindings.check_pointers(&shifted)?;
+                bindings.upload(|bytes| be.upload(&mem, 0, bytes))?;
+                tensor_bindings.push(bindings);
                 d_tens_slots.push(mem);
             }
         }
@@ -5896,6 +5977,7 @@ impl GpuEngine {
             _d_gq_cursor: d_gq_cursor,
             d_tens,
             d_tens_slots,
+            _tensor_bindings: tensor_bindings,
             _kv_tmap_slots: kv_tmap_slots,
             _tables: vec![
                 d_stream,

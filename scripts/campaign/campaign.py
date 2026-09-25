@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -50,6 +51,7 @@ CSV_HEADER = (
 # Appended by `bench` from the bench script's `peak_mem_mib,<in>,<c>,<MiB>` lines; empty when the
 # cell was not sampled (no nvidia-smi, or a results.csv from before the column existed).
 MEM_COL = "peak_mem_mib"
+VLLM_REFERENCE_IMAGE = "vllm/vllm-openai-rocm@sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1"
 
 
 def die(msg: str) -> None:
@@ -74,8 +76,329 @@ def sha(path: Path) -> str:
     return h.hexdigest()
 
 
+def execution_artifacts(runtime: Path, assets: Path, recipe: Path, env: dict) -> dict:
+    """Observed files/configuration, not a claim of complete kernel/precision identity."""
+    objects = assets.parent / "objects"
+    env_bytes = json.dumps({key: value for key, value in sorted(env.items()) if key.startswith("PLOW_")},
+                          sort_keys=True, separators=(",", ":")).encode()
+    return {"runtime_sha256": sha(runtime), "recipe_sha256": sha(recipe),
+            "runtime_environment_sha256": hashlib.sha256(env_bytes).hexdigest(),
+            "serve_args_sha256": hashlib.sha256(env.get("SERVE_EXTRA_ARGS", "").encode()).hexdigest(),
+            "assets": {p.name: sha(p) for p in sorted(assets.iterdir()) if p.is_file()
+                       and p.suffix in (".pkt", ".cubin", ".elf", ".co", ".json", ".h")},
+            "objects": {p.name: sha(p) for p in sorted(objects.iterdir()) if p.is_file()
+                        and p.suffix in (".cubin", ".elf", ".co")} if objects.is_dir() else {}}
+
+
+def cmd_block_roofline(a: argparse.Namespace) -> None:
+    from packet_roofline import analyze, trace_priorities
+
+    with open(a.recipe, "rb") as f:
+        recipe = tomllib.load(f)
+    roof = recipe["roofline"]
+    runtime = Path(a.plowrt).resolve()
+    packet = Path(a.packet).resolve()
+    before = (sha(packet), sha(runtime))
+    command = [str(runtime), "disasm", str(packet), "--program", str(a.program)]
+    result = subprocess.run(command, capture_output=True, text=True, cwd=REPO)
+    if result.returncode:
+        die(result.stderr or result.stdout)
+    router = Path(a.router_table).resolve() if a.router_table else None
+    record = analyze(result.stdout, a.ctx, roof["bandwidth_gbps"], roof["bf16_tflops"],
+                     router.read_bytes() if router else None, fp8_tflops=roof.get("fp8_tflops"),
+                     mxfp4_tflops=roof.get("mxfp4_tflops"))
+    if router:
+        record.update(router_table=str(router), router_table_sha256=sha(router))
+    trace = getattr(a, "trace", None)
+    if trace:
+        if not getattr(a, "trace_clock_hz", None) or not getattr(a, "trace_run_record", None):
+            die("trace priorities require --trace-clock-hz and --trace-run-record")
+        provenance_path = Path(a.trace_run_record)
+        provenance_raw = provenance_path.read_bytes()
+        provenance = json.loads(provenance_raw)
+        if (provenance.get("packet_sha256"), provenance.get("runtime_sha256")) != before:
+            die("trace run record differs from packet/runtime being analyzed")
+        graph = subprocess.run(command + ["--format", "json", "--counters"],
+                               capture_output=True, text=True, cwd=REPO)
+        if graph.returncode:
+            die(graph.stderr or graph.stdout)
+        document = json.loads(graph.stdout[graph.stdout.index("{"):])
+        if len(document["programs"]) != 1:
+            die("trace priorities require exactly one program")
+        record["trace_priorities"] = trace_priorities(Path(trace).read_bytes(),
+            document["programs"][0], a.trace_clock_hz)
+        record["trace_run_record_sha256"] = hashlib.sha256(provenance_raw).hexdigest()
+        record["trace_run_record"] = provenance
+        record["trace_provenance_note"] = "Supplied run record and trace integrity, not authenticated capture provenance"
+    if before != (sha(packet), sha(runtime)):
+        die("packet/runtime changed during roofline analysis")
+    record.update(recipe=str(Path(a.recipe).resolve()), recipe_sha256=sha(Path(a.recipe)),
+                  packet=str(packet), packet_sha256=before[0], runtime_sha256=before[1],
+                  commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain")))
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=False)
+    (out / "disasm.txt").write_text(result.stdout)
+    (out / "roofline.json").write_text(json.dumps(record, indent=2) + "\n")
+    print(json.dumps(record, indent=2))
+
+
+def prepare_block_bench(a: argparse.Namespace) -> dict:
+    with open(a.recipe, "rb") as f:
+        recipe = tomllib.load(f)
+    cell = recipe["cell"]
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    assets = out / "assets"
+    assets.mkdir()
+    packet, objects, inputs = Path(a.packet).resolve(), Path(a.objects).resolve(), Path(a.inputs).resolve()
+    checkpoint = Path(a.checkpoint).resolve()
+    if not (inputs / "reference.bf16").is_file() or not (inputs / "reference.json").is_file():
+        die("block inputs require reference.bf16 and reference.json from the numerical oracle")
+    shutil.copy2(packet, assets / "model.pkt")
+    build_record = packet.parent.parent / "build-record.json"
+    if packet.name == "model.pkt" and build_record.is_file():
+        built = json.loads(build_record.read_text())
+        for name in ("model.pkt", "build.json", "plow_config.h"):
+            source = packet.parent / name
+            if built["hashes"].get(name) != sha(source):
+                die(f"{source}: differs from the campaign build record")
+            if name != "model.pkt":
+                shutil.copy2(source, assets / name)
+        shutil.copy2(build_record, out / "build-record.json")
+    shutil.copytree(objects, out / "objects")
+    shutil.copytree(inputs, out / "inputs")
+    shutil.copy2(a.plowrt, out / "plowrt")
+    private = out / "plowrt"
+    private.chmod(0o755)
+    command = [str(private), "amd-block", "--blob", str(assets / "model.pkt"),
+               "--hsaco", str(out / "objects"), "--checkpoint", str(checkpoint),
+               "--input-dir", str(out / "inputs"), "--ctx", str(a.ctx),
+               "--tp", str(cell["n_gpu"]), "--repeat", str(a.repeat), "--warmup", str(a.warmup),
+               "--dump", str(out / "outputs"), "--report", str(out / "measurement.json")]
+    check = [str(REPO / "scripts/bench/plowbench-doctor.sh"), str(assets), str(out / "objects"),
+             str(private), cell["arch"], "block"]
+    rc = run(check, dict(os.environ), out / "doctor.log")
+    if rc not in (0, 2):
+        die(f"block preflight failed; see {out / 'doctor.log'}")
+    env = {str(k): str(v) for k, v in recipe.get("block", {}).get("env", {}).items()}
+    if a.trace:
+        env.update(PLOW_TRACE_RAW=str(out / "trace.bin"), PLOW_TRACE_ALLRANKS="1")
+    if getattr(a, "dstep_log", False):
+        env.update(PLOW_DSTEP_LOG="1", PLOW_DSTEP_EVERY="32")
+    record = dict(recipe=str(Path(a.recipe).resolve()), recipe_sha256=sha(Path(a.recipe)),
+                  cell=cell, commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain")),
+                  command=command, env=env, packet_sha256=sha(assets / "model.pkt"),
+                  runtime_sha256=sha(private),
+                  objects={p.name: sha(p) for p in sorted((out / "objects").iterdir()) if p.is_file()},
+                  inputs={p.name: sha(p) for p in sorted((out / "inputs").iterdir()) if p.is_file()})
+    # The queue exports visibility inside gpulease; never capture a parent's GPU mask.
+    wrapper = out / "run.sh"
+    lines = ["#!/usr/bin/env bash", "set -euo pipefail",
+             "source " + shlex.quote(str(REPO / "scripts/bench/plowbench.sh")), "pb_require_nix", "pb_hazard_env"]
+    lines += [f"export {k}={shlex.quote(v)}" for k, v in sorted(env.items())]
+    lines += ["exec " + shlex.join(command)]
+    wrapper.write_text("\n".join(lines) + "\n")
+    (out / "run-record.json").write_text(json.dumps(record, indent=2) + "\n")
+    return record
+
+
+def cmd_block_bench(a: argparse.Namespace) -> None:
+    record = prepare_block_bench(a)
+    out = Path(a.out).resolve()
+    cell = record["cell"]
+    submitted = subprocess.run([sys.executable, str(REPO / "scripts/bench/gpuq.py"),
+                               "--root", str(Path(a.queue).resolve()), "submit", cell["name"],
+                               str(cell["n_gpu"]), "bash", str(out / "run.sh")], check=True, capture_output=True, text=True)
+    record.update(queue=str(Path(a.queue).resolve()), job=submitted.stdout.strip())
+    (out / "run-record.json").write_text(json.dumps(record, indent=2) + "\n")
+    print(f"queued {record['job']}; results: {out}")
+
+
+def cmd_block_ab(a: argparse.Namespace) -> None:
+    if a.routed_reference and a.require_bitwise:
+        die("routed atomic repeat validation cannot claim bitwise reduction")
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    arms = {}
+    for name, source in (("ctl", a.control_build), ("treat", a.treatment_build),
+                         ("ctl2", a.control_build), ("treat2", a.treatment_build)):
+        build = Path(source).resolve()
+        args = argparse.Namespace(**vars(a))
+        args.out, args.packet, args.objects = str(out / name), str(build / "assets/model.pkt"), str(build / "objects")
+        args.trace = False
+        arms[name] = prepare_block_bench(args)
+    scorer = out / "block_ab.py"
+    shutil.copy2(REPO / "scripts/campaign/block_ab.py", scorer)
+    wrapper = out / "run.sh"
+    lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
+    lines += [f"bash {shlex.quote(str(out / name / 'run.sh'))} >{shlex.quote(str(out / name / 'run.log'))} 2>&1"
+              for name in arms]
+    score_command = [sys.executable, str(scorer), str(out)]
+    audit_record = {}
+    if a.routed_reference:
+        reference = Path(a.routed_reference).resolve()
+        audit = json.loads(reference.read_text())
+        if audit.get("passed") is not True or audit.get("vllm_version") != "0.29.0":
+            die("routed A/B requires a passed pinned connected reference audit")
+        reference_dir = out / "routed-reference"
+        shutil.copytree(reference.parent, reference_dir)
+        checker = out / "block_fp8_aiter_compare.py"
+        shutil.copy2(REPO / "runtime/tests/block_fp8_aiter_compare.py", checker)
+        certificate = out / "routed-repeat.json"
+        lines += [shlex.join(["sudo", "-n", "docker", "run", "--rm", "--network", "none",
+            "-e", "OMP_NUM_THREADS=8", "-e", "MKL_NUM_THREADS=8", "-v", f"{out}:{out}",
+            "--entrypoint", "python3", VLLM_REFERENCE_IMAGE, str(checker), str(out),
+            "--check-routed-ab", "--reference-json", str(reference_dir / reference.name),
+            "--tp", str(arms["ctl"]["cell"]["n_gpu"]), "--output", str(certificate)])]
+        score_command += ["--routed-repeat-audit", str(certificate)]
+        audit_record = dict(routed_reference_sha256=sha(reference_dir / reference.name),
+                            routed_checker_sha256=sha(checker), routed_checker_image=VLLM_REFERENCE_IMAGE)
+    if a.require_bitwise:
+        score_command.append("--require-bitwise")
+    lines += [shlex.join(score_command)]
+    wrapper.write_text("\n".join(lines) + "\n")
+    command = [sys.executable, str(REPO / "scripts/bench/gpuq.py"), "--root", a.queue,
+               "submit", arms["ctl"]["cell"]["name"] + "-ab", str(arms["ctl"]["cell"]["n_gpu"]),
+               "bash", str(REPO / "scripts/bench/quietx.sh"), str(Path(a.quiet_lock).resolve()),
+               "bash", str(wrapper)]
+    submitted = subprocess.run(command, check=True, capture_output=True, text=True)
+    record = dict(scope="single-block-four-arm; not serving qualification", note=a.note,
+                  require_bitwise=a.require_bitwise,
+                  arms={name: sha(out / name / "run-record.json") for name in arms},
+                  scorer_sha256=sha(scorer), job=submitted.stdout.strip(), queue=a.queue,
+                  quiet_lock=str(Path(a.quiet_lock).resolve()), **audit_record)
+    (out / "run-record.json").write_text(json.dumps(record, indent=2) + "\n")
+    print(f"queued {record['job']}; results: {out}")
+
+
 def git(*args: str) -> str:
     return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True).stdout.strip()
+
+
+def cmd_serve_bench(a: argparse.Namespace) -> None:
+    from client_latency import export_identity
+
+    r = load(a.recipe)
+    cell, bench = r["cell"], r["bench"]
+    raw = Path(cell["hf_dir"]).resolve()
+    index = json.loads((raw / "model.safetensors.index.json").read_text())
+    missing = [name for name in set(index["weight_map"].values()) if not (raw / name).is_file()]
+    if missing:
+        die(f"full checkpoint incomplete: {len(missing)} missing shards")
+    assets = Path(a.assets).resolve()
+    objects = Path(a.objects).resolve()
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    shutil.copytree(assets, out / "assets", symlinks=True)
+    shutil.copytree(objects, out / "objects")
+    shutil.copy2(a.plowrt, out / "plowrt")
+    for name in ("plowbench.sh", "vllm029-client.sh"):
+        shutil.copy2(REPO / "scripts/bench" / name, out / name)
+    shutil.copy2(REPO / "scripts/campaign/client_latency.py", out / "client_latency.py")
+    quality_lens = getattr(a, "quality_lens", None)
+    if quality_lens:
+        if any(int(n) < 1 or int(n) + 32 > cell["max_ctx"] for n in quality_lens.split(",")):
+            die("quality context plus output exceeds the compiled capacity")
+        shutil.copy2(REPO / "scripts/glm53_needle_probe.py", out / "needle_probe.py")
+    env = {str(k): str(v) for k, v in r.get("serve", {}).get("env", {}).items()}
+    env.update(dict(item.split("=", 1) for item in (a.env or [])))
+    env.update(PB_VLLM=str(out / "vllm029-client.sh"), PB_TOKENIZER=str(raw),
+               PB_SEED=str(bench.get("seed", 8193)), HSA_DISABLE_COREDUMP_ON_EXCEPTION="1")
+    doctor_env = dict(os.environ, **env, PB_VLLM_ROCM_LIB=os.environ["ROCM_PATH"] + "/lib")
+    rc = run([str(REPO / "scripts/bench/plowbench-doctor.sh"), str(out / "assets"),
+              str(out / "objects"), str(out / "plowrt"), cell["arch"]], doctor_env, out / "doctor.log")
+    if rc not in (0, 2):
+        die(f"preflight failed: {out / 'doctor.log'}")
+    in_lens = [int(n) for n in (a.in_lens or bench["in_lens"]).split()]
+    concs = [int(n) for n in (a.concs or bench["concs"]).split()]
+    prompts = a.nprompt or bench.get("nprompt", 128)
+    output_len = bench.get("outlen", 128)
+    if not in_lens or not concs or min(*in_lens, *concs, prompts, output_len) < 1:
+        die("benchmark dimensions must be positive")
+    if prompts < max(concs):
+        die("prompt count must reach every requested concurrency")
+    if max(in_lens) + output_len > cell["max_ctx"]:
+        die("input plus output exceeds the compiled context capacity")
+    image = VLLM_REFERENCE_IMAGE
+    reference_env = {str(k): str(v) for k, v in r.get("reference", {}).get("env", {}).items()}
+    reference_env_args = [arg for key, value in sorted(reference_env.items()) for arg in ("-e", f"{key}={value}")]
+    lines = ["#!/usr/bin/env bash", "set -euo pipefail",
+             "source " + shlex.quote(str(out / "plowbench.sh")), "pb_require_nix", "pb_hazard_env"]
+    lines += [f"export {key}={shlex.quote(value)}" for key, value in sorted(env.items())]
+    lines += ["PB_SERVER_PORT=$(pb_free_port)",
+              "PB_SERVER_LOG=" + shlex.quote(str(out / "server.log"))]
+    if a.server == "plow":
+        lines += ["trap pb_serve_stop EXIT",
+                  "pb_serve_start " + shlex.join([str(out / "plowrt"), str(out / "assets"),
+                                                  str(out / "objects")]) +
+                  ' "$PB_SERVER_PORT" "$PB_SERVER_LOG" 86400']
+    else:
+        cidfile = out / "container.id"
+        lines += ["cidfile=" + shlex.quote(str(cidfile)),
+                  'cleanup() { if test -s "$cidfile"; then sudo -n docker stop --time 30 "$(<"$cidfile")" >/dev/null 2>&1 || true; fi; if test -n "${PB_SERVER_PID:-}"; then wait "$PB_SERVER_PID" 2>/dev/null || true; fi; }',
+                  "trap cleanup EXIT",
+                  "visibility=()",
+                  'if test -n "${ROCR_VISIBLE_DEVICES:-}"; then visibility+=(-e "ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES"); fi',
+                  'if test -n "${HIP_VISIBLE_DEVICES:-}"; then visibility+=(-e "HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES"); fi',
+                  "sudo -n docker run --rm --network host --ipc host --device /dev/kfd --device /dev/dri "
+                  '--cidfile "$cidfile" "${visibility[@]}" '
+                  "-e HF_HUB_OFFLINE=1 -e HSA_DISABLE_COREDUMP_ON_EXCEPTION=1 "
+                  "-v /opt/models:/opt/models:ro --entrypoint vllm " + shlex.join([
+                      *reference_env_args, image, "serve", str(raw), "--host", "127.0.0.1",
+                      "--served-model-name", bench.get("model_id", "glm-5.3"),
+                      "--tensor-parallel-size", str(cell["n_gpu"]), "--max-model-len", str(cell["max_ctx"]),
+                      "--max-num-seqs", str(max(concs)), "--gpu-memory-utilization", "0.95",
+                      "--no-enable-prefix-caching", "--trust-remote-code",
+                      *r.get("reference", {}).get("args", []),
+                  ]) + ' --port "$PB_SERVER_PORT" > "$PB_SERVER_LOG" 2>&1 &',
+                  "PB_SERVER_PID=$!"]
+    smoke_code = "import json,sys; print(json.dumps(dict(model=sys.argv[1], prompt='What is the capital of France? Answer:', max_tokens=64, temperature=0)))"
+    lines += [f"pb_serve_wait {bench.get('ready_s', 1800)}", "model=$(pb_model_id)",
+              "smoke_payload=$(python3 -c " + shlex.quote(smoke_code) + ' "$model")',
+              'curl -fsS --max-time 600 "http://127.0.0.1:$PB_SERVER_PORT/v1/completions" '
+              '-H "Content-Type: application/json" --data "$smoke_payload" > ' + shlex.quote(str(out / "smoke.json")),
+              "python3 -c " + shlex.quote("import json,sys; d=json.load(open(sys.argv[1])); assert 'paris' in d['choices'][0]['text'].lower(), d; print('coherence smoke passed; not a full numerics gate')") + " " + shlex.quote(str(out / "smoke.json"))]
+    if quality_lens:
+        lines += ["python3 " + shlex.quote(str(out / "needle_probe.py")) +
+                  ' --url "http://127.0.0.1:$PB_SERVER_PORT" ' + shlex.join([
+                      "--arm", a.server, "--out", str(out / "needle.json"),
+                      "--lens", quality_lens, "--exact-lengths",
+                  ])]
+    for context in in_lens:
+        for concurrency in concs:
+            tag = f"in{context}_c{concurrency}"
+            lines += ["pb_bench " + shlex.join([str(out / "client"), tag]) + ' "$model" ' + shlex.join([
+                str(concurrency), str(prompts), str(context), str(output_len),
+                "--backend", "openai", "--endpoint", "/v1/completions", "--num-warmups",
+                str(bench.get("warmups", 2)), "--temperature", "0", "--percentile-metrics", "ttft,tpot,itl,e2el",
+                *(["--plow-exact-latencies"] if bench.get("exact_request_latencies") is True else []),
+            ]), "result=$(pb_result " + shlex.join([str(out / "client"), tag]) + ")",
+                f'pb_validate_result "$result" {prompts} {output_len}']
+    wrapper = out / "run.sh"
+    wrapper.write_text("\n".join(lines) + "\n")
+    subprocess.run(["bash", "-n", str(wrapper)], check=True)
+    record = dict(server=a.server, recipe_sha256=sha(Path(a.recipe)), cell=cell,
+                  exact_request_latencies=bench.get("exact_request_latencies") is True,
+                  expected_client_identity=export_identity() if bench.get("exact_request_latencies") is True else None,
+                  client_exporter_sha256=sha(out / "client_latency.py"),
+                  image=image, env=env, reference_env=reference_env, contexts=in_lens, concurrencies=concs, prompts=prompts,
+                  output_len=output_len, raw_index_sha256=sha(raw / "model.safetensors.index.json"),
+                  runtime_sha256=sha(out / "plowrt"), packet_sha256=sha(out / "assets/model.pkt"),
+                  objects={p.name: sha(p) for p in sorted((out / "objects").iterdir()) if p.is_file()},
+                  status="prepared", numerics_qualified=False, precision_qualified=False,
+                  comparison_scope="diagnostic; per-operation dtype parity and numerics not qualified")
+    manifest = out / "assets/build.json"
+    if manifest.is_file():
+        record["plow_declared_precision"] = json.loads(manifest.read_text()).get("precision")
+    if quality_lens:
+        record.update(quality_lens=quality_lens, quality_probe_sha256=sha(out / "needle_probe.py"))
+    if not a.dry_run:
+        submitted = subprocess.run([sys.executable, str(REPO / "scripts/bench/gpuq.py"), "--root", a.queue,
+                                    "submit", cell["name"] + "-" + a.server, str(cell["n_gpu"]),
+                                    "bash", str(wrapper)], check=True, capture_output=True, text=True)
+        record.update(status="queued", job=submitted.stdout.strip())
+    (out / "run-record.json").write_text(json.dumps(record, indent=2) + "\n")
+    print(f"{record['status']}: {out}")
 
 
 def run(cmd: list[str], env: dict, log: Path) -> int:
@@ -123,6 +446,7 @@ def cmd_build(a: argparse.Namespace) -> None:
     common = env_with(os.environ, emit.get("env", {}))
     # The one emit-side variable of an A/B, named on the command line so build-record carries it.
     overrides = dict(kv.split("=", 1) for kv in (a.env or []))
+    object_overrides = dict(kv.split("=", 1) for kv in (getattr(a, "object_env", None) or []))
     common.update(overrides)
 
     roles = r.get("emit_roles")
@@ -138,6 +462,7 @@ def cmd_build(a: argparse.Namespace) -> None:
         if objects:
             print("== objects", file=sys.stderr)
             oenv = env_with(os.environ, objects.get("env", {}))
+            oenv.update(object_overrides)
             oenv["PLOW_CUBIN_CONFIG"] = str(base_dir / "plow_config.h")
             if run(["bash", str(REPO / objects["script"]), str(base_dir), str(obj_dir)], oenv, log):
                 die("object build failed; see build.log")
@@ -154,6 +479,13 @@ def cmd_build(a: argparse.Namespace) -> None:
         print("== emit", file=sys.stderr)
         if run(nix([*base_args, "--out", str(assets)]), common, log):
             die("emit failed; see build.log")
+        if objects and cell["arch"].startswith("gfx"):
+            print("== AMD objects", file=sys.stderr)
+            oenv = env_with(os.environ, objects.get("env", {}))
+            oenv.update(object_overrides)
+            oenv["PLOW_HSACO_CONFIG"] = str(assets / "plow_config.h")
+            if run(nix(["bash", str(REPO / objects["script"]), str(out / "objects")]), oenv, log):
+                die("object build failed; see build.log")
 
     ck = cell.get("checkpoint_dir")
     if ck:
@@ -165,13 +497,16 @@ def cmd_build(a: argparse.Namespace) -> None:
 
     rec = {
         "recipe": str(Path(a.recipe).resolve()),
+        "recipe_sha256": sha(Path(a.recipe)),
+        "compiler_sha256": sha(plowc),
         "cell": cell,
         "overrides": overrides,
+        "object_overrides": object_overrides,
         "commit": git("rev-parse", "HEAD"),
         "dirty": bool(git("status", "--porcelain")),
         "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and p.suffix in (".pkt", ".cubin", ".elf", ".co")},
-        "objects": {p.name: sha(p) for p in sorted((out / "objects").glob("*.cubin"))} if (out / "objects").exists() else {},
+        "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and p.suffix in (".pkt", ".cubin", ".elf", ".co", ".json", ".h")},
+        "objects": {p.name: sha(p) for p in sorted((out / "objects").glob("*")) if p.is_file() and p.suffix in (".cubin", ".elf", ".co")} if (out / "objects").exists() else {},
     }
     (out / "build-record.json").write_text(json.dumps(rec, indent=1))
     print(f"built {assets}\nrecord {out / 'build-record.json'}", file=sys.stderr)
@@ -285,7 +620,9 @@ def cmd_bench(a: argparse.Namespace) -> None:
     cmd = [str(GPULEASE), "-n", str(cell.get("n_gpu", 1)), label, str(wrapper)]
     log = out / "run.log"
     log.write_bytes(b"")
+    before = execution_artifacts(private, assets, Path(a.recipe), env)
     rc = run(cmd, dict(os.environ), log)
+    after = execution_artifacts(private, assets, Path(a.recipe), env)
     text = log.read_text(errors="replace")
     peak = {}
     for ln in text.splitlines():
@@ -318,6 +655,8 @@ def cmd_bench(a: argparse.Namespace) -> None:
         "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and p.suffix in (".pkt", ".cubin", ".elf", ".co")},
         "rows": len(rows),
         "bench_rc": rc,
+        "execution_artifacts": before,
+        "execution_artifacts_unchanged": before == after,
     }
     (out / "run-record.json").write_text(json.dumps(rec, indent=1))
     print(f"{CSV_HEADER},{MEM_COL}")
@@ -456,14 +795,16 @@ def cmd_probe(a: argparse.Namespace) -> None:
 # ---------------------------------------------------------------- cert
 def _samples(run_dir: Path) -> dict:
     """Per-request samples per (input_len, concurrency, metric) from a bench run's client JSONs."""
+    from evidence import samples
+
     out = {}
     for f in sorted((run_dir / "client").glob("in*_c*.json")):
         d = json.loads(f.read_text())
-        key = (int(d["input_lens"][0]), int(d["max_concurrency"] or 1))
-        ttft = [x * 1e3 for x in d["ttfts"]]
-        tpot = [sum(i) / len(i) * 1e3 for i in d["itls"] if i]
-        out[(*key, "ttft_ms")] = ttft
-        out[(*key, "tpot_ms")] = tpot
+        key, metrics = samples(d)
+        for metric, values in metrics.items():
+            if (*key, metric) in out:
+                raise ValueError("duplicate client cell")
+            out[(*key, metric)] = values
     return out
 
 
@@ -481,19 +822,29 @@ def cmd_cert(a: argparse.Namespace) -> None:
     treat2): the ledger entries are the runs' per-request samples, the request names every cell
     as a touched serving rung, and `scripts/perf_cert.py make` runs the verifier."""
     runs = {arm: Path(getattr(a, arm)).resolve() for arm in ("ctrl", "ctrl2", "treat", "treat2")}
+    from evidence import capture, validate
+    try:
+        evidence = capture(runs)
+    except (ValueError, OSError) as error:
+        die(str(error))
     recs = {arm: json.loads((p / "run-record.json").read_text()) for arm, p in runs.items()}
     samples = {arm: _samples(p) for arm, p in runs.items()}
-    cells = sorted(set.intersection(*(set(s) for s in samples.values())))
+    cells = sorted(set.union(*(set(s) for s in samples.values())))
     if not cells:
         die("the four runs share no (input_len, concurrency, metric) cell")
+    if any(set(s) != set(cells) for s in samples.values()):
+        die("four-arm sample cell coverage differs")
     delta = dict(kv.split("=", 1) for kv in (a.knob_delta or []))
     gpu = recs["treat"].get("gpu", {})
     hardware = {"box": f"1x{gpu.get('name', 'GPU')}", "driver": gpu.get("driver_version"), "firmware": None, "cuda": None}
     work = Path(a.out).resolve()
     work.mkdir(parents=True, exist_ok=True)
     ledger, touched, serving = [], [], []
+    outlen = recs["treat"].get("protocol", {}).get("OUTLEN")
+    if not str(outlen).isdigit() or int(outlen) <= 1:
+        die("missing output-length protocol for TPOT certification")
     for (L, C, metric) in cells:
-        rung = {"digest": f"{a.cell}/serve/in{L}-c{C}-out128", "prior": 0, "role": "serve", "rows": L, "topology": f"C{C}"}
+        rung = {"digest": f"{a.cell}/serve/in{L}-c{C}-out{outlen}", "prior": 0, "role": "serve", "rows": L, "topology": f"C{C}"}
         ids = {arm: f"{a.job}:in{L}-c{C}:{metric}:{arm}" for arm in runs}
         for arm in ("ctrl", "ctrl2", "treat", "treat2"):
             xs = samples[arm][(L, C, metric)]
@@ -501,13 +852,21 @@ def cmd_cert(a: argparse.Namespace) -> None:
                 "id": ids[arm], "job": a.job, "metric": metric, "better": "lower",
                 "rung": rung, "samples": xs, "stats": _stats(xs),
                 "knob_delta": delta if arm.startswith("treat") else {},
-                "recipe_digest": recs[arm]["hashes"].get("model.pkt", "")[:16],
+                "recipe_digest": recs[arm]["hashes"].get("model.pkt", ""),
                 "hardware": hardware, "harness": "campaign-bench",
                 "date": recs[arm]["utc"][:10],
             }
+            client = next((item for item in evidence["arms"][arm]["clients"]
+                           if json.loads(item["text"])["input_lens"][0] == L
+                           and json.loads(item["text"])["max_concurrency"] == C), None)
+            if client is None:
+                die("missing raw client artifact")
+            e["sample_source"] = {"arm": arm, "input_len": L, "concurrency": C,
+                                  "client_sha256": client["sha256"]}
             if arm.startswith("treat"):
                 e["control_of"] = ids["ctrl"]
                 e["repeat_control_of"] = ids["ctrl2"]
+                e["repeat_treatment_of"] = ids["treat2" if arm == "treat" else "treat"]
             ledger.append(e)
         t = {"rung": rung["digest"], "treat": ids["treat"]}
         # `--neutral tpot_ms` (every rung) or `--neutral ttft_ms@in128` (one input length).
@@ -529,11 +888,17 @@ def cmd_cert(a: argparse.Namespace) -> None:
                    "evidence": "coherence gate PASS on ctrl, ctrl2, treat, treat2 (run-record.json of each)"}]
                  + [{"kind": "note", "pass": True, "evidence": f} for f in (a.fact or [])],
     }
+    try:
+        validate(evidence, {**request, "ledger": ledger})
+    except (ValueError, KeyError, TypeError) as error:
+        die(f"invalid campaign evidence: {error}")
+    (work / "evidence.json").write_text(json.dumps(evidence, indent=1))
     (work / "ledger.jsonl").write_text("".join(json.dumps(e) + "\n" for e in ledger))
     (work / "request.json").write_text(json.dumps(request, indent=1))
     cert = REPO / "perf-certs" / f"{a.knob}.json"
     cmd = ["python3", str(REPO / "scripts" / "perf_cert.py"), "make", "--knob", a.knob,
-           "--request", str(work / "request.json"), "--ledger", str(work / "ledger.jsonl"), "--out", str(cert)]
+           "--request", str(work / "request.json"), "--ledger", str(work / "ledger.jsonl"),
+           "--evidence", str(work / "evidence.json"), "--out", str(cert)]
     print("  $", " ".join(shlex.quote(c) for c in cmd), file=sys.stderr)
     rc = subprocess.run(cmd, cwd=REPO).returncode
     print(f"cert: ledger {len(ledger)} entries, {len(touched)} touched rungs -> {cert} (rc={rc})", file=sys.stderr)
@@ -778,8 +1143,49 @@ def cmd_ledger(a: argparse.Namespace) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = p.add_subparsers(dest="cmd", required=True)
+    br = sp.add_parser("block-roofline", help="CPU-only floor from one modular decode packet")
+    br.add_argument("recipe"); br.add_argument("--packet", required=True)
+    br.add_argument("--program", type=int, default=1, help="compiled row width, as in plowrt disasm")
+    br.add_argument("--ctx", type=int, required=True); br.add_argument("--out", required=True)
+    br.add_argument("--plowrt", default=str(REPO / "target/release/plowrt"))
+    br.add_argument("--router-table", help="captured rank act.tab.bin; uses actual selected-expert union")
+    br.add_argument("--trace", help="complete single-invocation device trace; diagnostic priorities only")
+    br.add_argument("--trace-clock-hz", type=float, help="explicit calibrated trace clock, not shader clock")
+    br.add_argument("--trace-run-record", help="matching block run-record.json with packet/runtime identities")
+    br.set_defaults(f=cmd_block_roofline)
+    bb = sp.add_parser("block-bench", help="freeze, preflight and queue a numerically gated modular block")
+    bb.add_argument("recipe"); bb.add_argument("--packet", required=True); bb.add_argument("--objects", required=True)
+    bb.add_argument("--inputs", required=True); bb.add_argument("--checkpoint", required=True)
+    bb.add_argument("--ctx", type=int, required=True); bb.add_argument("--out", required=True)
+    bb.add_argument("--repeat", type=int, default=30); bb.add_argument("--warmup", type=int, default=5)
+    bb.add_argument("--plowrt", default=str(REPO / "target/release/plowrt"))
+    bb.add_argument("--queue", default="/tmp/plow-gpuq"); bb.set_defaults(f=cmd_block_bench)
+    bb.add_argument("--trace", action="store_true", help="record device traces; instrumented timings are diagnostic only")
+    bb.add_argument("--dstep-log", action="store_true", help="log host phase timings; diagnostic only, not A/B evidence")
+    ba = sp.add_parser("block-ab", help="freeze and compare four block arms in one quiet GPU lease")
+    ba.add_argument("recipe"); ba.add_argument("--control-build", required=True)
+    ba.add_argument("--treatment-build", required=True); ba.add_argument("--inputs", required=True)
+    ba.add_argument("--checkpoint", required=True); ba.add_argument("--ctx", type=int, required=True)
+    ba.add_argument("--out", required=True); ba.add_argument("--note", required=True)
+    ba.add_argument("--repeat", type=int, default=300); ba.add_argument("--warmup", type=int, default=30)
+    ba.add_argument("--plowrt", default=str(REPO / "target/release/plowrt"))
+    ba.add_argument("--queue", default="/tmp/plow-gpuq")
+    ba.add_argument("--quiet-lock", default="/tmp/plow-campaign-quiet.lock")
+    ba.add_argument("--require-bitwise", action="store_true", help="reject any control/candidate output difference")
+    ba.add_argument("--routed-reference", help="passed pinned routed audit; validate atomic repeats before scoring")
+    ba.set_defaults(f=cmd_block_ab)
+    sb = sp.add_parser("serve-bench", help="freeze and queue plow or vLLM 0.29 with the same Docker client")
+    sb.add_argument("recipe"); sb.add_argument("--server", choices=["plow", "vllm"], required=True)
+    sb.add_argument("--assets", required=True); sb.add_argument("--objects", required=True)
+    sb.add_argument("--out", required=True); sb.add_argument("--in-lens"); sb.add_argument("--concs")
+    sb.add_argument("--nprompt", type=int); sb.add_argument("--env", action="append", metavar="K=V")
+    sb.add_argument("--plowrt", default=str(REPO / "target/release/plowrt"))
+    sb.add_argument("--queue", default="/tmp/plow-gpuq"); sb.add_argument("--dry-run", action="store_true")
+    sb.add_argument("--quality-lens", help="comma-separated exact needle contexts, run before timing")
+    sb.set_defaults(f=cmd_serve_bench)
     b = sp.add_parser("build"); b.add_argument("recipe"); b.add_argument("--out", required=True)
     b.add_argument("--env", action="append", metavar="K=V", help="one-variable override for the emit env; recorded")
+    b.add_argument("--object-env", action="append", metavar="K=V", help="object-build-only override; recorded")
     b.add_argument("--no-probe", action="store_true", help="skip the leased cuBLASLt algorithm probe even with the GPU present")
     b.add_argument("--store-cell", help="tune-store cell for the probe (default h100)")
     b.add_argument("--hf-dir", help="checkpoint snapshot on this host, replacing [cell].hf_dir; recorded")

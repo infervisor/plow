@@ -1,0 +1,29 @@
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -1610,2 +1610,10 @@
+         params_dict = dict(self.named_parameters())
++
++        def remap_fp8_block_scale(name: str) -> str:
++            if name.endswith(".weight_scale") and name not in params_dict:
++                scale_inv = name + "_inv"
++                if scale_inv in params_dict:
++                    return scale_inv
++            return name
++
+         loaded_params: set[str] = set()
+@@ -1662,2 +1670,3 @@
+                 name_mapped = name.replace(weight_name, param_name)
++                name_mapped = remap_fp8_block_scale(name_mapped)
+ 
+@@ -1673,3 +1682,4 @@
+                 if name.endswith(".bias") and name not in params_dict:
+                     continue
++                name = remap_fp8_block_scale(name)
+ 
+@@ -1782,4 +1792,5 @@
+                         name = remapped_name
+ 
++                        name = remap_fp8_block_scale(name)
+                         if is_pp_missing_parameter(name, self):
+                             continue

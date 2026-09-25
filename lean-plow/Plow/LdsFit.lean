@@ -2,7 +2,7 @@
 # Plow.LdsFit — staged-LDS fit obligation (LdsFitSound).
 
 The always-staged GEMV family (`gemv_qkv_rows` / `gemv_glu_rows`, op_gemm.h)
-reads `x` ONLY through LDS: the kernel stages `M*K` halves unconditionally and
+reads `x` ONLY through LDS: the kernel stages one row band at a time and
 "plowc emits this op only when M*K fits GM_LDS_HALVES" — choosing the fused
 opcode IS that promise. Task 9 (perf-data/plow-gfx942/glm52-batched-decode-r4.md,
 TASK 9 ROOT CAUSE) is what a broken promise serves: at rows=8, K=6144 the stage
@@ -17,7 +17,7 @@ at emit rather than found by seven rounds of GPU discriminators.
 `checkLdsFit` is the executable checker the CLI runs per program; the theorem
 `fits_of_check_ok` is its soundness: an accepted list contains no instance
 whose staged demand exceeds the arena. The demand model is deliberately the
-kernel's own arithmetic (`rows * k + scratch` halves — scratch is
+kernel's own arithmetic (`effectiveRows * k + scratch` halves — scratch is
 GV_NORM_SCRATCH when the q-norm fold rides the packet, else 0); the arena is
 supplied by the Rust side from `hwspec` (single source of truth, held against
 the device headers by `device_header_agreement.rs`).
@@ -34,10 +34,15 @@ structure StagedOp where
   rows    : Nat
   k       : Nat
   scratch : Nat
+  walkMm  : Nat := 0
   deriving Repr
 
+/-- A packet without a bound walking object stages every row. -/
+def effectiveRows (s : StagedOp) : Nat :=
+  if s.walkMm == 0 then s.rows else min s.rows s.walkMm
+
 /-- Staged-LDS demand in halves — the kernel's own arithmetic. -/
-def demand (s : StagedOp) : Nat := s.rows * s.k + s.scratch
+def demand (s : StagedOp) : Nat := effectiveRows s * s.k + s.scratch
 
 /-- Executable checker: first instance whose demand exceeds `arena`, or `ok`. -/
 def checkLdsFit (arena : Nat) : List StagedOp → Except StagedOp Unit

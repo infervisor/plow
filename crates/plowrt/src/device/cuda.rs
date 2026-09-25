@@ -583,6 +583,8 @@ pub struct CudaBackend {
     /// `VmmOps::pool_put`/`pool_take`). Device-local by construction (one
     /// pool per backend, one backend per device); leftovers released in Drop.
     slab_pool: Mutex<Vec<(u64, u64)>>,
+    // Serialize driver mutations with metadata so rebinding cannot revive stale evidence.
+    vmm_provenance: Mutex<super::provenance::VmmProvenance>,
     /// Set once, on the first fatal driver status ([`is_cuda_fatal`]): the
     /// fault that killed the context. When set, [`Self::bind`] short-circuits
     /// with a clone BEFORE touching the driver, so a poisoned context stops
@@ -778,6 +780,7 @@ impl CudaBackend {
                 module_images: Mutex::new(FxHashMap::default()),
                 next_module: AtomicU64::new(1),
                 slab_pool: Mutex::new(Vec::new()),
+                vmm_provenance: Mutex::new(super::provenance::VmmProvenance::default()),
                 poisoned,
             })
         }
@@ -1881,6 +1884,10 @@ impl CudaBackend {
 /// pass-throughs; every entry re-binds the primary context (threads vary —
 /// the pool's pre-mapper thread calls in from its own thread).
 impl crate::memory::vmm::VmmOps for CudaBackend {
+    fn allocation_provenance(&self, va: u64, bytes: u64) -> Option<super::provenance::MemoryRegion> {
+        self.vmm_provenance.lock().region(va, bytes)
+    }
+
     fn granularity(&self) -> Result<u64> {
         self.bind()?;
         let prop = self.vmm_prop();
@@ -1929,16 +1936,20 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
     fn create(&self, bytes: u64) -> Result<u64> {
         self.bind()?;
         let prop = self.vmm_prop();
+        let mut provenance = self.vmm_provenance.lock();
         let mut h = 0u64;
         // SAFETY: out-pointer; bytes is a granularity multiple (pool contract).
         self.check(
             unsafe { (self.api.cuMemCreate)(&mut h, bytes as usize, &prop, 0) },
             "cuMemCreate",
         )?;
+        provenance.created(h, bytes);
         Ok(h)
     }
 
     fn release(&self, handle: u64) {
+        let mut provenance = self.vmm_provenance.lock();
+        provenance.released(handle);
         // SAFETY: handle from create, released exactly once (pool refcount).
         let rc = unsafe {
             let _ = bind_context(&self.api, self.ctx, self.freer.context_id);
@@ -1955,6 +1966,7 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
 
     fn map(&self, va: u64, bytes: u64, handle: u64) -> Result<()> {
         self.bind()?;
+        let mut provenance = self.vmm_provenance.lock();
         // SAFETY: va range inside a reservation, handle live, offset 0 —
         // multi-map of one handle into several ranges is legal (probe [2]).
         self.check(
@@ -1963,10 +1975,14 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
         )
         .map_err(|e| {
             RuntimeError::Device(format!("{e} (va={va:#x} bytes={bytes} handle={handle:#x})"))
-        })
+        })?;
+        provenance.mapped(va, bytes, handle);
+        Ok(())
     }
 
     fn unmap(&self, va: u64, bytes: u64) {
+        let mut provenance = self.vmm_provenance.lock();
+        provenance.unmapped(va, bytes);
         // SAFETY: exactly the mapped range (pool contract).
         let rc = unsafe {
             let _ = bind_context(&self.api, self.ctx, self.freer.context_id);
@@ -2021,6 +2037,7 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
             Some(2) => RuntimeError::Oom(e.to_string()),
             _ => e,
         })?;
+        self.vmm_provenance.lock().allocated(dptr, bytes);
         Ok(dptr)
     }
 
@@ -2029,6 +2046,8 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
     }
 
     fn free(&self, va: u64) {
+        let mut provenance = self.vmm_provenance.lock();
+        provenance.freed(va);
         // SAFETY: va from VmmOps::alloc, freed exactly once (pool contract).
         let rc = unsafe {
             let _ = bind_context(&self.api, self.ctx, self.freer.context_id);

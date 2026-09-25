@@ -60,6 +60,7 @@ pub struct EmitSpec {
     pub tp: u32,
     pub gpu: String,
     pub arch: String,
+    pub emit_cfg: devgen::emit_config::EmitConfig,
     /// Tuning store the emit reads. Passed through so the HIT/MISS column reports against the
     /// store the campaign is about to write to.
     pub db: PathBuf,
@@ -102,7 +103,7 @@ pub fn derive(spec: &EmitSpec) -> Result<Vec<Demand>, Box<dyn std::error::Error>
             l2_layout: None,
             gpu: spec.gpu.clone(),
             arch: spec.arch.clone(),
-            emit_cfg: None,
+            emit_cfg: Some(spec.emit_cfg.clone()),
             whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
         },
         Some(devgen::skip_hook(

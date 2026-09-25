@@ -9,8 +9,13 @@ description = "Rust client for the plow_verify Lean 4 CLI (per-instance verifica
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror.workspace = true
+sha2 = "0.10"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
+packet = { workspace = true }
 schedule = { workspace = true }
 plow-asset = { workspace = true }
 proptest = "1"

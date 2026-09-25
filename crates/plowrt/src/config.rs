@@ -1406,6 +1406,10 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "mla-ns-live", env = "PLOW_MLA_NS_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_ns_live: bool,
 
+    /// Experimental BF16 persistent MLA work-map reuse within one ordered decode replay.
+    #[arg(long = "mla-bf16-metadata-hoist", env = "PLOW_MLA_BF16_METADATA_HOIST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mla_bf16_metadata_hoist: bool,
+
     /// Run the dense-exact decode rung of a `PLOW_GLM_DECODE_DENSE_EXACT` packet instead of the
     /// DSA rung of the same width on TP steps where every advanced row holds at most the
     /// selection width of keys (the selection would keep all of them). Not bit-identical: the

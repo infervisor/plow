@@ -1,0 +1,43 @@
+[cell]
+name = "glm53.mi350x.fp8-block3-b8"
+model = "zai-org/GLM-5.3"
+revision = "aca966e4e02791568aa6a4ced368624b3d897f42"
+hf_dir = "/opt/models/GLM-5.3"
+gpu = "MI350X"
+arch = "gfx950"
+n_cu = 256
+n_gpu = 8
+precision = "fp8"
+max_ctx = 131072
+checkpoint_dir = "/opt/models/GLM-5.3-plow-lite"
+
+[emit]
+emit = "devblob"
+args = ["--block", "3", "--num-gpus", "8"]
+
+[emit.env]
+PLOW_VERIFY_BIN = "/home/lava/plow/lean-plow/.lake/build/bin/plow_verify"
+PLOW_FP8 = "1"
+PLOW_GLM_DSA = "1"
+PLOW_DECODE_BATCH_LADDER = "8"
+GLM_MOE_CORESIDENT = "1"
+
+[objects]
+script = "scripts/build_gfx950.sh"
+
+[objects.env]
+PLOW_GEMV_MM = "4"
+PLOW_GEMV_WALK = "1"
+PLOW_MLA_PREFILL = "1"
+PLOW_MOE_PREFILL = "1"
+
+[bench]
+
+[block.env]
+PLOW_TP_NO_AUDIT = "0"
+PLOW_TP_AGREE_EVERY = "1"
+
+[roofline]
+bandwidth_gbps = 6200.0
+bf16_tflops = 2300.0
+fp8_tflops = 4600.0

@@ -91,43 +91,41 @@ def counterGranularity (payload : Json) : IO QueryResultJ := do
 
     Computes max(critical_path, bw_bound, compute_bound). -/
 
-private def longestPath (n : Nat) (edges : List (Nat × Nat)) (durations : List Nat) : Nat :=
-  -- Simple O(V+E) via topological relaxation. We compute finish times.
-  -- (`Id.run do` because the body uses `let mut`/`while`/`for`.)
-  Id.run do
+private def longestPath (edges : List (Nat × Nat)) (durations : List Nat) : Except String Nat := do
+  let n := durations.length
   let durArr := durations.toArray
-  let mut finish := Array.mkArray n 0
-  -- Iterate edges in a fixed-point loop (at most n iterations for a DAG).
-  let mut changed := true
-  let mut iters := 0
-  while changed && iters < n do
-    changed := false
-    iters := iters + 1
-    for (a, b) in edges do
-      let fa := finish.getD a 0
-      let da := durArr.getD a 0
-      let fb := finish.getD b 0
-      let db := durArr.getD b 0
-      let candidate := fa + da + db
-      if candidate > fb + db then
-        -- Update start of b so its finish = max over predecessors + own duration
-        -- Actually: finish[b] = max(finish[b], finish[a] + dur[a]) + dur[b] on first
-        -- visit. Simpler: compute as longest-path to each node.
-        let newFinB := Nat.max (finish.getD b 0) (fa + da)
-        if newFinB > finish.getD b 0 then
-          finish := finish.setD b newFinB
-          changed := true
-  -- Makespan = max(finish[t] + dur[t]) over all t.
+  let mut successors : Array (Array Nat) := Array.mkArray n #[]
+  let mut indegree := Array.mkArray n 0
+  for (a, b) in edges do
+    unless a < n && b < n do
+      throw s!"edge ({a}, {b}) is outside {n} tasks"
+    successors := successors.setD a ((successors.getD a #[]).push b)
+    indegree := indegree.setD b (indegree.getD b 0 + 1)
+  let mut ready := (Array.range n).filter fun i => indegree.getD i 0 == 0
+  let mut cursor := 0
+  let mut finish := durArr
   let mut ms := 0
-  for t in List.range n do
-    let f := finish.getD t 0
-    let d := durArr.getD t 0
-    ms := Nat.max ms (f + d)
+  while cursor < ready.size do
+    let a := ready.getD cursor 0
+    cursor := cursor + 1
+    ms := Nat.max ms (finish.getD a 0)
+    for b in successors.getD a #[] do
+      finish := finish.setD b (Nat.max (finish.getD b 0)
+        (finish.getD a 0 + durArr.getD b 0))
+      let remaining := indegree.getD b 0 - 1
+      indegree := indegree.setD b remaining
+      if remaining == 0 then ready := ready.push b
+  unless cursor == n do throw "task graph contains a cycle"
   return ms
 
 def lowerBound (payload : Json) : IO QueryResultJ := do
   let edges ← match payload.getObjValAs? (List (List Nat)) "edges" with
-    | .ok es => pure (es.filterMap fun l => match l with | [a, b] => some (a, b) | _ => none)
+    | .ok es =>
+      match es.mapM (fun l => match l with
+        | [a, b] => Except.ok (a, b)
+        | _ => Except.error "each edge must contain exactly two task indices") with
+      | .ok pairs => pure pairs
+      | .error msg => return errResult "lower_bound" msg
     | .error msg => return errResult "lower_bound" s!"missing 'edges': {msg}"
   let durations ← match payload.getObjValAs? (List Nat) "durations" with
     | .ok ds => pure ds
@@ -145,8 +143,13 @@ def lowerBound (payload : Json) : IO QueryResultJ := do
     | .ok v => pure v
     | .error msg => return errResult "lower_bound" s!"missing 'peak_flops_per_cycle': {msg}"
 
-  let n := durations.length
-  let cp := longestPath n edges durations
+  let cp ← match longestPath edges durations with
+    | .ok v => pure v
+    | .error msg => return errResult "lower_bound" msg
+  if totalHbm > 0 && peakBw == 0 then
+    return errResult "lower_bound" "positive HBM work requires positive bandwidth"
+  if totalFlops > 0 && peakFlops == 0 then
+    return errResult "lower_bound" "positive compute work requires positive throughput"
   let bwBound := if peakBw > 0 then (totalHbm + peakBw - 1) / peakBw else 0
   let compBound := if peakFlops > 0 then (totalFlops + peakFlops - 1) / peakFlops else 0
   let lb := Nat.max cp (Nat.max bwBound compBound)
@@ -162,6 +165,6 @@ def lowerBound (payload : Json) : IO QueryResultJ := do
     ("compute_bound", toJson compBound)]
 
   return okResult "lower_bound" answer
-    s!"max(E1={cp}, E2={bwBound}, E3={compBound}) = {lb}; binding={binding} (CostBounds.makespan_dominates_lower_bounds)"
+    s!"validated DAG; evaluated max(E1={cp}, E2={bwBound}, E3={compBound}) = {lb}; binding={binding}; conditional on supplied durations, work and channel rates; not a measured hardware guarantee"
 
 end Plow.CLI.Queries

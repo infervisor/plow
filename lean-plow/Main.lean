@@ -6,6 +6,7 @@ top-level key:
 
 * `{"checkpoint": "D", "payload": {...}}` → verification (accept/reject)
 * `{"query": "counter_granularity", "payload": {...}}` → performance oracle
+* `{"batch": [{"checkpoint": "D", "payload": {...}}, ...]}` → independent certificates
 
 ## Checkpoint output:
   { "ok": true,  "checkpoint": "D", "notes": "…" }
@@ -38,6 +39,8 @@ def runCheckpoint (cp : String) (payload : Json) : IO Certificate := do
   | "K" => return Checkpoints.checkK payload
   | "S" => return Checkpoints.checkS payload
   | "P" => return Checkpoints.checkP payload
+  | "R" => return Checkpoints.checkR payload
+  | "L" => return Checkpoints.checkL payload
   | _   => return { ok := false, checkpoint := cp,
                     notes := none, reason := some s!"unknown checkpoint '{cp}'" }
 
@@ -46,6 +49,22 @@ def runQuery (qt : String) (payload : Json) : IO Queries.QueryResultJ := do
   | "counter_granularity" => Queries.counterGranularity payload
   | "lower_bound"         => Queries.lowerBound payload
   | _                     => return Queries.errResult qt s!"unknown query type '{qt}'"
+
+def runBatch (batch : Json) : IO (Json × Bool) := do
+  let mut certs : Array Certificate := #[]
+  match batch.getArr? with
+  | .error _ =>
+    certs := #[{ ok := false, checkpoint := "?", reason := some "batch must be an array" }]
+  | .ok requests =>
+    if requests.isEmpty then
+      certs := #[{ ok := false, checkpoint := "?", reason := some "empty batch" }]
+    else
+      for request in requests do
+        match request.getObjValAs? String "checkpoint", request.getObjVal? "payload" with
+        | .ok cp, .ok payload => certs := certs.push (← runCheckpoint cp payload)
+        | _, _ => certs := certs.push { ok := false, checkpoint := "?", reason := some "batch entry requires checkpoint and payload" }
+  let ok := certs.all (·.ok)
+  return (Json.mkObj [("ok", Lean.toJson ok), ("certificates", Json.arr (certs.map (·.toJson)))], ok)
 
 partial def readAllStdin (acc : String) : IO String := do
   let stdin ← IO.getStdin
@@ -63,6 +82,10 @@ def main (_args : List String) : IO UInt32 := do
     IO.println cert.toJson.compress
     return 1
   | .ok request =>
+    if let .ok batch := request.getObjVal? "batch" then
+      let (result, ok) ← runBatch batch
+      IO.println result.compress
+      return if ok then 0 else 1
     -- Dispatch: "query" key → performance oracle; "checkpoint" key → verification.
     match request.getObjValAs? String "query" with
     | .ok qt =>

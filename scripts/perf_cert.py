@@ -20,11 +20,13 @@ Verifier: $PLOW_VERIFY_BIN, else lean-plow/.lake/build/bin/plow_verify, else plo
 Exit: 0 accepted, 1 rejected or insufficient_evidence, 2 usage or verifier missing.
 """
 import hashlib
+import fcntl
 import json
 import os
 import shutil
 import subprocess
 import sys
+from campaign.evidence import validate as validate_evidence
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEDGER = os.environ.get("LEDGER_PATH", "/workspace/plow-glm53/plow-ledger/ledger.jsonl")
@@ -37,14 +39,32 @@ def verifier():
     return shutil.which("plow_verify")
 
 
-def run_p(request):
+def run_p(request, expected_sha=None):
     bin_ = verifier()
     if not bin_:
         sys.exit("perf_cert: plow_verify not found (set PLOW_VERIFY_BIN or `lake build` lean-plow)")
-    out = subprocess.run([bin_], input=json.dumps({"checkpoint": "P", "payload": request}),
-                         capture_output=True, text=True, check=False)
+    image = open(bin_, "rb").read()
+    if not os.access(bin_, os.X_OK):
+        sys.exit("perf_cert: verifier is not executable")
+    if expected_sha is not None and hashlib.sha256(image).hexdigest() != expected_sha:
+        sys.exit("perf_cert: verifier identity changed")
+    fd = os.memfd_create("plow-verify", os.MFD_ALLOW_SEALING)
     try:
-        return json.loads(out.stdout)
+        with os.fdopen(os.dup(fd), "wb") as stream:
+            stream.write(image)
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
+                    fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+        out = subprocess.run([f"/proc/self/fd/{fd}"], pass_fds=(fd,),
+                             input=json.dumps({"checkpoint": "P", "payload": request}),
+                             capture_output=True, text=True, check=False)
+    finally:
+        os.close(fd)
+    try:
+        cert = json.loads(out.stdout)
+        if cert.get("checkpoint") != "P" or type(cert.get("ok")) is not bool \
+                or out.returncode != int(not cert["ok"]):
+            sys.exit("perf_cert: invalid checkpoint P response or failed verifier process")
+        return cert
     except json.JSONDecodeError:
         sys.exit(f"perf_cert: plow_verify gave no certificate: {out.stderr.strip()[:400]}")
 
@@ -63,7 +83,7 @@ def fill_ledger(request, path):
         if e is None:
             sys.exit(f"perf_cert: {eid} is not in {path}")
         picked[eid] = e
-        for ref in ("control_of", "repeat_control_of"):
+        for ref in ("control_of", "repeat_control_of", "repeat_treatment_of"):
             if ref in e and e[ref] in known:
                 picked[e[ref]] = known[e[ref]]
     return list(picked.values())
@@ -82,14 +102,33 @@ def make(args):
     request = json.load(open(opts["--request"]))
     if "ledger" not in request:
         request["ledger"] = fill_ledger(request, opts.get("--ledger", LEDGER))
-    cert = run_p(request)
+    evidence = json.load(open(opts["--evidence"])) if "--evidence" in opts else None
+    if evidence is not None:
+        try:
+            validate_evidence(evidence, request)
+        except (ValueError, KeyError, TypeError) as error:
+            print(f"perf_cert: invalid campaign evidence: {error}", file=sys.stderr)
+            return 1
+    if evidence is not None and verifier() is None:
+        print("perf_cert: plow_verify not found", file=sys.stderr)
+        return 2
+    verifier_sha = hashlib.sha256(open(verifier(), "rb").read()).hexdigest() if evidence is not None else None
+    cert = run_p(request, verifier_sha)
+    if verifier_sha is not None and hashlib.sha256(open(verifier(), "rb").read()).hexdigest() != verifier_sha:
+        print("perf_cert: verifier changed during certification", file=sys.stderr)
+        return 1
     print(verdict(cert))
     if not cert.get("ok"):
         return 1
     out = opts.get("--out", os.path.join(ROOT, "perf-certs", f"{knob}.json"))
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as f:
-        json.dump({"schema": 1, "knob": knob, "request": request, "certificate": cert}, f, indent=1)
+        doc = {"schema": 2 if evidence is not None else 1, "knob": knob,
+               "request": request, "certificate": cert}
+        if evidence is not None:
+            doc["evidence"] = evidence
+            doc["verifier_sha256"] = verifier_sha
+        json.dump(doc, f, indent=1)
         f.write("\n")
     print(f"wrote {out}")
     return 0
@@ -97,9 +136,19 @@ def make(args):
 
 def check(path):
     doc = json.load(open(path))
-    cert = run_p(doc["request"])
+    if doc.get("schema") == 2:
+        try:
+            validate_evidence(doc["evidence"], doc["request"])
+            if hashlib.sha256(open(verifier(), "rb").read()).hexdigest() != doc["verifier_sha256"]:
+                raise ValueError("verifier identity changed")
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            print(f"{path}: invalid campaign evidence: {error}")
+            return doc, False
+    elif doc.get("schema") != 1:
+        return doc, False
+    cert = run_p(doc["request"], doc.get("verifier_sha256"))
     print(f"{path}: {verdict(cert)}")
-    return doc, cert.get("ok", False)
+    return doc, cert.get("ok", False) and cert == doc.get("certificate")
 
 
 def verify(paths):
@@ -139,7 +188,8 @@ def stamp(build, paths):
         rows += [(u["rung"], "carry_over") for u in req.get("untouched", [])]
         for rung, basis in rows:
             rungs.setdefault(rung, []).append(
-                {"checkpoint": "P", "knob": doc["knob"], "basis": basis, "cert_sha256": sha})
+                {"checkpoint": "P", "ok": True, "scope": "knob_rung",
+                 "knob": doc["knob"], "basis": basis, "cert_sha256": sha})
     block = [{"rung": r, "perf_cert": c} for r, c in sorted(rungs.items())]
     text = open(build).read()
     knobs_end, rungs_end = head(text)

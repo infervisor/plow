@@ -317,9 +317,12 @@ def main() -> int:
                 # Paged KV cache sized for this (B, T) point (+1 decode token).
                 per_req = (t + 1 + BLOCK_SIZE - 1) // BLOCK_SIZE
                 nblocks = b * per_req
-                kv_shape = attn.attn_backend.get_kv_cache_shape(
-                    nblocks, BLOCK_SIZE, n_kv, head_dim
-                )
+                if hasattr(attn.attn_backend, "get_kv_cache_shape"):
+                    kv_shape = attn.attn_backend.get_kv_cache_shape(
+                        nblocks, BLOCK_SIZE, n_kv, head_dim
+                    )
+                else:
+                    kv_shape = (nblocks, n_kv, BLOCK_SIZE, 2 * head_dim)
                 kv_cache = torch.zeros(kv_shape, dtype=dtype, device=device)
                 attn.kv_cache = kv_cache  # what vllm.v1.worker.utils.bind_kv_cache does
                 block_table = (

@@ -12,6 +12,9 @@ use crate::sample::Stats;
 /// input to the number that was measured.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Digests {
+    /// Absent in legacy screening records; present records bind the complete execution contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<plow_asset::certificates::ExecutionIdentity>,
     /// Identity of the kernel body. Changes when the code changes.
     pub implementation: String,
     /// Identity of the built interpreter object the kernel ran inside. Two
@@ -32,6 +35,14 @@ impl Digests {
     /// still current.
     pub fn stale_against(&self, want: &Digests) -> Vec<&'static str> {
         let mut out = Vec::new();
+        if self.execution != want.execution {
+            out.push("execution");
+        }
+        if self.execution.as_ref().is_some_and(|identity| identity.validate().is_err())
+            || want.execution.as_ref().is_some_and(|identity| identity.validate().is_err())
+        {
+            out.push("invalid_execution");
+        }
         if self.implementation != want.implementation {
             out.push("implementation");
         }
@@ -120,7 +131,20 @@ impl KernelMeasurement {
     ///
     /// Kept separate from the act of promoting so the reasons can be reported.
     pub fn qualification_blockers(&self) -> Vec<String> {
-        blockers_for(&self.correctness, self.stats.samples)
+        let mut blockers = blockers_for(&self.correctness, self.stats.samples);
+        if [self.stats.min_ns, self.stats.p10_ns, self.stats.median_ns, self.stats.p90_ns]
+            .iter().any(|v| !v.is_finite() || *v <= 0.0)
+            || self.stats.min_ns > self.stats.p10_ns
+            || self.stats.p10_ns > self.stats.median_ns
+            || self.stats.median_ns > self.stats.p90_ns
+        {
+            blockers.push("invalid kernel timing distribution".into());
+        }
+        if let Some(identity) = &self.digests.execution {
+            if let Err(reason) = identity.validate() { blockers.push(reason); }
+            if identity.hardware != self.hardware { blockers.push("execution hardware differs".into()); }
+        }
+        blockers
     }
 }
 
@@ -219,6 +243,7 @@ mod tests {
 
     fn digests() -> Digests {
         Digests {
+            execution: None,
             implementation: "impl-a".into(),
             interpreter: "interp-a".into(),
             toolchain: "cuda-13.0".into(),
@@ -316,5 +341,21 @@ mod tests {
             serde_json::from_str::<RecordState>(&text).unwrap(),
             rejected
         );
+    }
+
+    #[test]
+    fn a_qualified_state_does_not_hide_invalid_timing_statistics() {
+        for mutation in 0..5 {
+            let mut record = measurement(Correctness::Pass);
+            record.state = RecordState::Qualified;
+            match mutation {
+                0 => record.stats.median_ns = f64::NAN,
+                1 => record.stats.p90_ns = f64::INFINITY,
+                2 => record.stats.min_ns = 0.0,
+                3 => record.stats.p10_ns = record.stats.median_ns + 1.0,
+                _ => record.stats.min_ns = record.stats.p10_ns + 1.0,
+            }
+            assert!(!record.qualification_blockers().is_empty(), "mutation {mutation}");
+        }
     }
 }

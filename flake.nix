@@ -44,14 +44,13 @@
       # GPU toolchains, from nix. This is what makes the build self-contained:
       # no /opt/rocm, no /usr/local/cuda anywhere in a `nix build`.
       #
-      # VERSION NOTE: ROCm here is 7.14 (clang-23) — the toolchain the branch's
-      # kernel measurements were taken on (scripts/build_gfx942.sh header).
-      # AMD publishes 7.14.0 as a stable relocatable TheRock SDK. The gfx94X
+      # VERSION NOTE: ROCm here is 7.14.1 (clang-23), the latest stable relocatable
+      # TheRock SDK (2026-08-31); kernel measurements before 2026-09-24 were taken on 7.14.0. The gfx94X
       # family package carries the MI300/MI325 kernel packs. Its compiler,
       # device-lib bitcode and ROCr can also compile Plow gfx950 code objects;
       # only vendor math-library kernel packs are family-specific, and Plow
       # links none of those into its interpreter.
-      rocmVersion = "7.14.0";
+      rocmVersion = "7.14.1";
       gpuToolsFor = pkgs: rec {
         cuda = pkgs.cudaPackages;
         rocm = pkgs.stdenv.mkDerivation {
@@ -59,7 +58,7 @@
           version = rocmVersion;
           src = pkgs.fetchurl {
             url = "https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx94X-dcgpu-${rocmVersion}.tar.gz";
-            sha256 = "sha256-MuFtyn+EQKCKjWNqan2wA0xhUY8y6pFTR7mNn1UZmww=";
+            sha256 = "1h4jp3kl78j6m8rixb5a9r0bd8q6wqsaw5ywh2r71w5a1mrzjdnz";
           };
           dontUnpack = true;
           # autoPatchelf sets the nix ELF interpreter and resolves the few

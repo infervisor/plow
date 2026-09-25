@@ -7,7 +7,67 @@ import numpy as np
 
 from vllm_logit_oracle import (dense_scores, repeat_metrics, suppression_metadata,
                                generation_rows, required_model_length, prompt_digest,
-                               engine_overrides)
+                               engine_overrides, model_precision_inventory, precision_report)
+
+
+class RequestBatchTests(unittest.TestCase):
+    def test_batches_preserve_case_order_and_tail(self):
+        from vllm_logit_oracle import generate_requests
+        calls = []
+        def generate(prompts, sampling, use_tqdm):
+            calls.append(prompts)
+            return [SimpleNamespace(prompt_token_ids=p["prompt_token_ids"]) for p in prompts]
+        cases = [dict(id=str(i), prompt_token_ids=[i + 1]) for i in range(5)]
+        rows = list(generate_requests(SimpleNamespace(generate=generate), cases, None, 2))
+        self.assertEqual([len(x) for x in calls], [2, 2, 1])
+        self.assertEqual([case for case, _ in rows], cases)
+
+    def test_single_default_and_invalid_batch_results(self):
+        from vllm_logit_oracle import generate_requests
+        cases = [dict(id="one", prompt_token_ids=[1])]
+        def generate(prompt, sampling, use_tqdm):
+            self.assertIsInstance(prompt, dict)
+            return [SimpleNamespace(prompt_token_ids=prompt["prompt_token_ids"])]
+        llm = SimpleNamespace(generate=generate)
+        self.assertEqual(len(list(generate_requests(llm, cases, None, 1))), 1)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            list(generate_requests(llm, cases, None, 0))
+        llm.generate = lambda *a, **kw: []
+        with self.assertRaisesRegex(ValueError, "count"):
+            list(generate_requests(llm, cases, None, 2))
+        llm.generate = lambda *a, **kw: [SimpleNamespace(prompt_token_ids=[2])]
+        with self.assertRaisesRegex(ValueError, "order"):
+            list(generate_requests(llm, cases, None, 2))
+
+
+class PrecisionInventoryTests(unittest.TestCase):
+    def test_loaded_tensors_and_quantization_flags_without_readback(self):
+        import torch
+
+        model = torch.nn.Linear(4, 2, bias=False, dtype=torch.bfloat16, device="meta")
+        model.kv_cache = torch.empty(3, 132, dtype=torch.uint8, device="meta")
+        model.is_aiter_triton_fp8_bmm_enabled = True
+        model.is_aiter_triton_fp4_bmm_enabled = False
+        model.quant_method = SimpleNamespace(activation_quant_key="dynamic-1x128")
+        row = model_precision_inventory(model)
+        module = row["modules"][""]
+        self.assertEqual(module["tensors"]["weight"]["dtype"], "torch.bfloat16")
+        self.assertEqual(module["tensors"]["weight"]["shape"], [2, 4])
+        self.assertEqual(module["tensors"]["kv_cache"]["dtype"], "torch.uint8")
+        self.assertTrue(module["attributes"]["is_aiter_triton_fp8_bmm_enabled"])
+        self.assertFalse(module["attributes"]["is_aiter_triton_fp4_bmm_enabled"])
+        self.assertEqual(module["attributes"]["quant_method"]["fields"]["activation_quant_key"],
+                         "dynamic-1x128")
+        report = precision_report([row], 1)
+        self.assertFalse(report["precision_qualified"])
+        self.assertIn("not a runtime arithmetic trace", report["scope"])
+
+    def test_missing_duplicate_and_empty_rank_reports_fail(self):
+        row = dict(rank=0, modules={"layer": {}}, sources={})
+        for ranks, expected in (([], 1), ([row], 2), ([row, row], 2),
+                                ([dict(row, modules={})], 1)):
+            with self.subTest(ranks=ranks), self.assertRaises(ValueError):
+                precision_report(ranks, expected)
 
 
 class EngineOverridesTests(unittest.TestCase):
@@ -26,6 +86,10 @@ class EngineOverridesTests(unittest.TestCase):
     def test_unknown_provider_is_rejected(self):
         with self.assertRaises(ValueError):
             engine_overrides(rms_norm_provider="all")
+
+    def test_precision_inventory_uses_named_worker_extension(self):
+        self.assertEqual(engine_overrides(precision_inventory=True), {
+            "worker_extension_cls": "vllm_logit_oracle.PrecisionInventoryWorker"})
 
 
 class SuppressionTests(unittest.TestCase):

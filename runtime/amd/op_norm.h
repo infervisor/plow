@@ -132,6 +132,44 @@ __device__ __forceinline__ float block_max(float v, float* part) {
     return t;
 }
 
+__device__ __forceinline__ float rn_glm_qa_sum(float local, float* part) {
+    for (unsigned delta = 1; delta < 64; delta *= 2)
+        local += __shfl_xor(local, delta);
+    __syncthreads();
+    if ((threadIdx.x & 63) == 0) part[threadIdx.x / 64] = local;
+    __syncthreads();
+    const float sum = (part[0] + part[1]) + (part[2] + part[3]);
+    __syncthreads();
+    return rn_ss(sum);
+}
+
+// Pinned AITER K2048 profile: balanced 256-thread tree and original double epsilon.
+__device__ void d_rmsnorm_glm_qa(bf16* out, const bf16* x, const bf16* gamma,
+                                unsigned rows, unsigned slice, unsigned nblk, float* part) {
+#if PLOW_THREADS >= 256
+    for (unsigned row = slice; row < rows; row += nblk) {
+        const size_t base = (size_t)row * 2048 + threadIdx.x * 8;
+        bf16v8 v = threadIdx.x < 256 ? ld_glob8(as_glob(x) + base) : bf16v8_zero();
+        float ss = 0.0f;
+#pragma unroll
+        for (unsigned j = 0; j < 8; j++) {
+            const float value = bf2f(v[j]);
+            ss += value * value;
+        }
+        const float mean = (float)((double)(rn_glm_qa_sum(ss, part) / 2048.0f) + 1e-5);
+        const float inv = rsqrtf(mean);
+        if (threadIdx.x < 256) {
+            const bf16v8 w = ld_glob8(as_glob(gamma) + threadIdx.x * 8);
+#pragma unroll
+            for (unsigned j = 0; j < 8; j++) v[j] = f2bf(bf2f(v[j]) * inv * bf2f(w[j]));
+            st_glob8(as_glob(out) + base, v);
+        }
+    }
+#else
+    __builtin_trap();
+#endif
+}
+
 /* -DPLOW_RN_ROWS=R: d_rmsnorm's multi-row arm (R rows of loads in flight per workgroup).
  * Default 1 = the shipped single-row loop, byte-identical. */
 #ifndef PLOW_RN_ROWS
@@ -332,6 +370,72 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
  * Fused-norm GEMM consumes these, so the normalized activation never touches
  * HBM. Cost is one extra pass over x (M*K reads) but it saves a full M*K write
  * plus a full M*K read. */
+/* RmsNorm + BLOCK-128 FP8 activation quant (i4 = 128 with t3/t4): the normed bf16 row is also
+ * written as e4m3 `xq` [rows][feat] with a_scale [feat/128][rows], exactly what a following
+ * QuantFp8Block128 over `out` produces (same amax floor, scale, and PLOW_GM_FP8_PACK2 on the
+ * ROUNDED outputs), so the pair becomes one packet. A 128-group is 16 consecutive lanes' 8-element
+ * chunks of rn_index. Requires the register-resident row (`fits`) and feat % 128 == 0. */
+#ifdef PLOW_GM_FP8_PACK2
+__device__ void d_rmsnorm_q128(bf16* __restrict__ out, const bf16* __restrict__ x,
+                               const bf16* __restrict__ gamma, unsigned rows, unsigned feat,
+                               float eps, unsigned slice, unsigned nblk, float* part,
+                               unsigned char* __restrict__ xq, float* __restrict__ ascale) {
+    static_assert(rn_groups == 1, "the 16-lane group map assumes one thread group");
+    const auto* xg = as_glob(x);
+    const auto* gg = as_glob(gamma);
+    auto* og = as_glob(out);
+    auto* xqg = as_glob(xq);
+    auto* asg = as_glob(ascale);
+    for (unsigned row = slice; row < rows; row += nblk) {
+        const size_t base = (size_t)row * feat;
+        bf16v8 v[rn_vecs], w[rn_vecs];
+#pragma unroll
+        for (int c = 0; c < rn_vecs; c++) {
+            const unsigned i = rn_index(c);
+            v[c] = bf16v8_zero();
+            w[c] = bf16v8_zero();
+            if (i < feat) {
+                v[c] = ld_glob8(xg + base + i);
+                if (gamma) w[c] = ld_glob8(gg + i);
+            }
+        }
+        const float inv = rsqrtf(rn_ss(rn_sumsq(v, part)) / (float)feat + eps);
+#pragma unroll
+        for (int c = 0; c < rn_vecs; c++) {
+            const unsigned i = rn_index(c);
+            bf16v8 o;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float g = gamma ? bf2f(w[c][j]) : 1.0f;
+                o[j] = f2bf(bf2f(v[c][j]) * inv * g);
+            }
+            if (i < feat) st_glob8(og + base + i, o);
+            float amax = 1e-10f;
+#pragma unroll
+            for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(bf2f(o[j])));
+            amax = fmaxf(amax, __shfl_xor(amax, 1, 16));
+            amax = fmaxf(amax, __shfl_xor(amax, 2, 16));
+            amax = fmaxf(amax, __shfl_xor(amax, 4, 16));
+            amax = fmaxf(amax, __shfl_xor(amax, 8, 16));
+            if (i < feat) {
+                const float sc = amax * (1.0f / 448.0f);
+                const float qi = 1.0f / sc;
+                if ((threadIdx.x & 15u) == 0) st_act<float>(&asg[(size_t)(i / 128u) * rows + row], sc);
+                unsigned lo = 0, hi = 0;
+#pragma unroll
+                for (int j = 0; j < 4; j += 2)
+                    lo |= PLOW_GM_FP8_PACK2(bf2f(o[j]) * qi, bf2f(o[j + 1]) * qi) << (j * 8);
+#pragma unroll
+                for (int j = 4; j < 8; j += 2)
+                    hi |= PLOW_GM_FP8_PACK2(bf2f(o[j]) * qi, bf2f(o[j + 1]) * qi) << ((j - 4) * 8);
+                *(PLOW_GLOB uint2*)(PLOW_GLOB void*)(xqg + base + i) = uint2{lo, hi};
+            }
+        }
+    }
+}
+
+#endif
+
 __device__ void d_rowrms(float* __restrict__ rms, const bf16* __restrict__ x, unsigned rows,
                          unsigned feat, float eps, unsigned slice, unsigned nblk,
                          float* part) {

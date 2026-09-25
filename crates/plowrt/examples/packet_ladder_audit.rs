@@ -190,6 +190,7 @@ mod tests {
             tensors: vec![],
             gq_stream: vec![StreamEnt::default()],
             gq_seg_ofs: vec![0, 1],
+            reduction_witness: None,
             l2_sms: 0,
             l2_domains: 0,
         };

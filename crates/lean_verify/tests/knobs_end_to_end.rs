@@ -40,7 +40,13 @@ fn request(target: &Target, sources: &[(&'static str, Val<'static>)]) -> Value {
 
 fn glm_with(extra: &[(&'static str, Val<'static>)]) -> Vec<(&'static str, Val<'static>)> {
     let mut r = extra.to_vec();
-    r.extend(TARGETS[0].recipe.iter().copied());
+    r.extend(
+        TARGETS[0]
+            .recipe
+            .iter()
+            .copied()
+            .filter(|(id, _)| !extra.iter().any(|(key, _)| key == id)),
+    );
     r
 }
 
@@ -65,6 +71,7 @@ fn negative_fixtures_are_rejected() {
             &[
                 ("emit.glm_seq_par", TRUE),
                 ("emit.glm_xr_band", Val::Nat(2)),
+                ("emit.token_batch_tp", Val::Bool(false)),
             ],
             "seq_par_excludes_two_shot_seams",
         ),
@@ -97,7 +104,7 @@ fn negative_fixtures_are_rejected() {
 #[ignore = "requires plow_verify binary"]
 fn stale_registry_defaults_are_rejected() {
     let mut p = request(&TARGETS[0].target(), &glm_with(&[]));
-    p["recorded"] = json!([{"id": "emit.glm_seq_par", "value": false}]);
+    p["recorded"] = json!([{"id": "emit.token_batch_tp", "value": false}]);
     let cert = check_knobs(&p).unwrap();
     assert!(!cert.ok && cert.reason.unwrap().contains("resolves differently"));
 }

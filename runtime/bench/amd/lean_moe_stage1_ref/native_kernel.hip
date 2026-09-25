@@ -20,6 +20,9 @@ extern "C" __device__ unsigned plow_moe1_mxfp4_stage1_vgpr_le_192 = 1;
 #ifndef PLOW_MOE1_EXPERTS
 #define PLOW_MOE1_EXPERTS 896
 #endif
+#ifndef MOE1_MODEL_DIM
+#define MOE1_MODEL_DIM 3584
+#endif
 
 extern "C" __global__ __launch_bounds__(512, 2)
 __attribute__((amdgpu_waves_per_eu(2, 2)))
@@ -43,7 +46,8 @@ void plow_moe1_mxfp4_bk256_gfx950(
     (void)reserved;
     (void)reserved2;
     extern __shared__ unsigned char lds[];
-    if (inter_dim != PLOW_MOE1_INTER_DIM || model_dim != 3584 || experts != PLOW_MOE1_EXPERTS)
+    if (inter_dim != PLOW_MOE1_INTER_DIM || model_dim != MOE1_MODEL_DIM ||
+        experts != PLOW_MOE1_EXPERTS)
         return;
     d_moe_group_pf_a4w4<true>(
         out, activation, nullptr, weight_table, weight_scale_table, meta,

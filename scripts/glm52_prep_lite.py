@@ -29,7 +29,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import glm52_prep as P
-from glm52_prep_full import _shard_ok, _globals_builder, _parse_layers, N_LAYERS
+from glm52_prep_full import _shard_ok, _globals_builder, _parse_layers, N_LAYERS, expected_names, verify
 
 EXPERT_RE = re.compile(r"^model\.layers\.\d+\.mlp\.experts\.\d+\.")
 
@@ -53,13 +53,40 @@ def _write_filtered(build, path):
     return len(w.entries)
 
 
+def verify_lite(model_dir, out_dir, layers):
+    required = [f"zz-derived-{layer:05d}.safetensors" for layer in layers] + ["zz-globals.safetensors"]
+    for name in required:
+        if not _shard_ok(os.path.join(out_dir, name))[0]:
+            print(f"[verify] missing or incomplete derived shard: {name}")
+            return False
+    cfg = P.load_cfg(model_dir)
+    want = expected_names(cfg, layers)
+    weight_map = {}
+    for name in sorted(os.listdir(out_dir)):
+        if not name.endswith(".safetensors"):
+            continue
+        ok, header = _shard_ok(os.path.join(out_dir, name))
+        if not ok:
+            print(f"[verify] incomplete shard: {name}")
+            return False
+        # Raw symlinks retain unused FP8 projections and the MTP layer; the
+        # checkpoint loader resolves the required names with last-file-wins.
+        for tensor in header.keys() & want:
+            weight_map[tensor] = name
+    return verify(model_dir, out_dir, weight_map=weight_map, cfg=cfg, layers=layers)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default=None, help="e.g. 0-5 for a smoke slice; default all 78")
+    ap.add_argument("--verify-only", action="store_true", help="verify all requested layers without writing")
     args = ap.parse_args()
     layers = _parse_layers(args.layers) if args.layers else list(range(N_LAYERS))
+
+    if args.verify_only:
+        return 0 if verify_lite(args.model, args.out, layers) else 1
 
     os.makedirs(args.out, exist_ok=True)
     # 1. symlink raw shards (idempotent) + config for provenance.
@@ -97,4 +124,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

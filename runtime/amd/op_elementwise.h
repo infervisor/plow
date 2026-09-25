@@ -124,6 +124,37 @@ __device__ void d_residual(bf16* __restrict__ out, const bf16* __restrict__ a,
     }
 }
 
+__device__ void d_sum4_bf16(bf16* __restrict__ out, const bf16* __restrict__ b,
+                            const bf16* __restrict__ c, const bf16* __restrict__ d,
+                            unsigned n, unsigned slice, unsigned nblk) {
+    auto* og = as_glob(out);
+    const auto* bg = as_glob(b);
+    const auto* cg = as_glob(c);
+    const auto* dg = as_glob(d);
+    const unsigned stride = nblk * PLOW_THREADS * 8;
+    for (unsigned i = (slice * PLOW_THREADS + threadIdx.x) * 8; i < n; i += stride) {
+        if (i + 8 <= n) {
+            const bf16v8 va = ld_glob8(og + i), vb = ld_glob8(bg + i);
+            const bf16v8 vc = ld_glob8(cg + i), vd = ld_glob8(dg + i);
+            bf16v8 vo;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                // Reproduce the BF16 stores between the three unfused additions.
+                const bf16 ab = f2bf(bf2f(va[j]) + bf2f(vb[j]));
+                const bf16 abc = f2bf(bf2f(ab) + bf2f(vc[j]));
+                vo[j] = f2bf(bf2f(abc) + bf2f(vd[j]));
+            }
+            st_glob8(og + i, vo);
+        } else {
+            for (unsigned j = i; j < n; j++) {
+                const bf16 ab = f2bf(bf2f(out[j]) + bf2f(b[j]));
+                const bf16 abc = f2bf(bf2f(ab) + bf2f(c[j]));
+                st_act1(&out[j], f2bf(bf2f(abc) + bf2f(d[j])));
+            }
+        }
+    }
+}
+
 /* Gated MLP: act(gate) * up.
  *
  * Gemma is GeGLU (gelu_pytorch_tanh), NOT SwiGLU. `act` selects so the same op
@@ -137,7 +168,8 @@ enum {
      * for why it is a fourth code and not GPT-OSS's act 3 at alpha = 1 (act 3 adds 1 to the up
      * branch). V4's SHARED expert takes this path; its 256 routed experts take op_moe.h's.
      * [DSV4-ACT] */
-    PLOW_ACT_SWIGLU_CLAMP_ = 4
+    PLOW_ACT_SWIGLU_CLAMP_ = 4,
+    PLOW_ACT_SILU_BF16_ = 5
 };
 
 /* The GATE-ONLY half of a GLU epilogue, for every fused path that computes
@@ -163,6 +195,10 @@ __device__ __forceinline__ float act_gate_only(float g, unsigned act) {
 /* The GLU epilogue as a PAIR, `A(g) * B(u)`, for the codes that transform the up branch. For
  * every gate-only activation this is byte-identical to `act_gate_only(g, act) * u`. */
 __device__ __forceinline__ float act_glu_pair(float g, float u, unsigned act, float limit) {
+    if (act == PLOW_ACT_SILU_BF16_) {
+        // vLLM's BF16 SiluAndMul rounds the activation before multiplying up.
+        return bf2f(f2bf(act_silu(g))) * u;
+    }
     if (act == PLOW_ACT_SWIGLU_CLAMP_) {
         const float gc = fminf(g, limit); /* upper clamp only -- model.py:607 */
         return act_silu(gc) * fminf(fmaxf(u, -limit), limit);

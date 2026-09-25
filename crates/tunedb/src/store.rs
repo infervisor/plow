@@ -595,7 +595,8 @@ impl TuneStore {
         let mut stale = Vec::new();
 
         for rec in self.load_kernels(hardware)? {
-            if !rec.state.is_selectable() {
+            if !rec.state.is_selectable() || !rec.qualification_blockers().is_empty()
+                || rec.hardware != hardware {
                 continue;
             }
             let changed = rec.digests.stale_against(want);
@@ -646,6 +647,7 @@ mod tests {
 
     fn digests() -> Digests {
         Digests {
+            execution: None,
             implementation: "impl-a".into(),
             interpreter: "interp-a".into(),
             toolchain: "cuda-13.0".into(),

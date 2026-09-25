@@ -198,6 +198,7 @@ mod tests {
             stats: Stats::from_samples(vec![50.0; 5]).unwrap(),
             baseline: Stats::from_samples(vec![100.0; 5]).unwrap(),
             digests: Digests {
+                execution: None,
                 implementation: "impl".into(),
                 interpreter: "a".repeat(64),
                 toolchain: "cuda-13".into(),
