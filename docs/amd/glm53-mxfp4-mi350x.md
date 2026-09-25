@@ -16,11 +16,11 @@ rungs 1–128, TP8, priced against a per-op roofline. Every GPU job ran through 
 | all-reduce | BF16 | XReduceScatter/XAllGather (seq-par seams), BF16 |
 | DSA sparse attention / FP8 indexer | on for T > 2048 | **off (dense)** — open gap |
 
-## Recipe (best: packet `parity-sf-sp-v8b`, objects `…-v8b-hsaco-best8`)
+## Recipe (best: packet `parity-sf-sp-v9`, objects `…-v9-hsaco-best8`)
 
 Emit (`plowc --replay-knobs <static packet>/build.json …`, env):
 `PLOW_GLM_QKVA_W8A8=1 PLOW_GLM_OPROJ_W8A8=1 PLOW_GLM_MLA_W8A8=1 PLOW_GLM_MLA_MHA=1
-PLOW_GLM_MOE_SHARED_FOLD=1 PLOW_GLM_DECODE_SHARED_FOLD=1 PLOW_GLM_NORM_Q128=1 PLOW_GLM_SEQ_PAR=1
+PLOW_GLM_MOE_SHARED_FOLD=1 PLOW_GLM_DECODE_SHARED_FOLD=1 PLOW_GLM_NORM_Q128=1 PLOW_GLM_QUANT_NARROW=1 PLOW_GLM_SEQ_PAR=1
 PLOW_GLM_SEQ_PAR_PROJ=1 GLM_GROUP=1 PLOW_GLM_FUSE_B1=1 GLM_FUSE_XRN=1 PLOW_GLM_FUSE_ROPE=1
 PLOW_GLM_DECODE_NORM_ROWS=1 GLM_SPINE_CUS=64 PLOW_GLM_DECODE_GLUE_CUS=1`
 (`PLOW_GLM_FUSE_SEAM` is illegal with QKVA W8A8.)
@@ -67,7 +67,13 @@ i.e. prefix-cache hits / continuation chunks); `PLOW_AMD_DECODE_MIN_RUNG=1` for 
 
 Decode (8 identical prompts, ctx 1k; v8b/best8, ms/step, 2 rounds): M1 41.3–45.9 ms/token,
 M2 51.6–73.5, M4 51.1–54.0, M8 53.6–56.6, M16 61.1–64.6, M32 85.1–85.3, M64 120.2–120.4, M128 181.4
-(start of campaign: M1 ~50–87, M8 87–103, M64 205). Batched M8 at ctx 8k: 58.7 ms/step. Levers: comboA decode knobs + GEMV_MFMA4 (-21% M64), K-split qkv_a GEMM +
+(start of campaign: M1 ~50–87, M8 87–103, M64 205). Batched M8 at ctx 8k: 58.7 ms/step.
+v9 (+QUANT_NARROW) same-run vs v8b: M2 50.6 vs 55.6–57.0, M8 53.5 vs 56.2–56.4, M32 80.2–82.6 vs
+82.6–85.0, M64 117.8 vs 120.5, M128 177–179 vs 181; prefill unchanged.
+
+Decode determinism: the q_b live-split and o_proj split8 selectors (kept for AITER-CK rounding parity)
+accumulate with bf16 atomics, so near-tie greedy tokens can differ run to run (seen on a ragged
+100-token prompt); exact-bucket T1024/T8192 greedy lists are stable across every arm. Levers: comboA decode knobs + GEMV_MFMA4 (-21% M64), K-split qkv_a GEMM +
 merge unroll (-9%), decode shared fold (-6% M8, -16% M64), kw decode GLU (-5..-16%).
 
 ## vs vLLM 0.29 (same `vllm bench serve` client, random in8064/out128, temperature 0)
