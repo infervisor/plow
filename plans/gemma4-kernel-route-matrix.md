@@ -589,3 +589,148 @@ there plow wins TTFT 4/5 and p99 ITL 3/5.
 The roofline diagnosis printed alongside the run agrees: decode at **43.0% of the memory roof** and
 prefill at **33.1% of the compute roof** at C1 -- neither phase is near its ceiling at low
 concurrency, which is where the TPOT and C1-TTFT losses sit.
+
+## 11. The FP8 kernel set with DIMS and RUNGS, and the roofline comparison per kernel
+
+Source: each emitted packet's own `dispatch_audit`, which carries per-op `m`/`n`/`k`, the rung `t`,
+`insts` (layer multiplicity), `bytes` moved, `tile` and `occupancy`. Reproduce with
+`scripts/campaign/fp8_kernels.py` and `fp8_kernel_floor.py`.
+
+Roofline, H100 SXM5 (3352 GB/s; bf16 989 / fp8 1979 TFLOP/s):
+`FLOPs = 2*m*n*k`, `AI = FLOPs/bytes`, ridge = peak/BW = **bf16 295, fp8 590 FLOP/B**.
+`bytes` in the audit is PER INSTRUCTION, so the floor is `max(bytes/BW, FLOPs/peak)` and the
+per-layer total is that times `insts`. **ROUTE is derivable, not guessed**: cuBLASLt can only ever
+appear on `Gemm`/`GemmMed`/`GemmSmall` (`prefill_eligible`), so every fp8 op is native by
+construction (§9.4).
+
+### 11.1 26B-A4B FP8 — prefill, 8 rungs each (128, 256, 512, 1024, 1152, 2048, 4096, 4224)
+
+| op | N | K | insts | tile | occ | AI | bound | floor x insts | route |
+|---|---|---|---|---|---|---|---|---|---|
+| `Gemm` (lm_head) | 262144 | 2816 | 1 | 256x256 | 0.97 | **1.0** | **mem** | 0.441 | Lt-eligible, **bf16** |
+| `GemmFp8` o_proj (full) | 2816 | 8192 | 5 | 256x256 | 0.71 | 1679 | compute | 0.492 | native |
+| `GemmFp8` qkv (full) | 8192 | 2816 | 5 | 256x256 | 0.93 | 1679 | compute | 0.492 | native |
+| `GemmFp8` o_proj (slide) | 2816 | 4096 | 25 | 256x256 | 0.71 | 1394 | compute | 1.231 | native |
+| `GemmFp8` q_proj (slide) | 4096 | 2816 | 25 | 256x256 | 0.82 | 1394 | compute | 1.231 | native |
+| `GemmGluFp8` gate+up | 2112 | 2816 | 30 | fused | — | 939 | compute | 0.762 | native |
+| `GemmFp8` down | 2816 | 2112 | 30 | 256x256 | 0.71 | 1056 | compute | 0.762 | native |
+| `GemmFp8` kv (slide) | 2048 | 2816 | 50 | 256x256 | 0.82 | 1040 | compute | 1.231 | native |
+| `GemmFp8` k (full) | 1024 | 2816 | 5 | 256x256 | 0.91 | 690 | compute | 0.062 | native |
+
+Every fp8 linear is **compute bound** (AI 690-1679 vs ridge 590) -- so fp8's 2x peak is the whole
+prize, and it lands: see 11.4.
+
+### 11.2 26B-A4B FP8 — decode, rungs 1, 2, 4, 8, 16
+
+| op | N | K | insts | AI | bound | floor x insts | route |
+|---|---|---|---|---|---|---|---|
+| `Gemv` (lm_head) | 262144 | 2816 | 1 | **15.9** | mem | **0.443** | **bf16** |
+| `GemvGluFp8` gate+up | 2112 | 2816 | 30 | 15.8 | mem | 0.108 | native |
+| `GemvFp8` o (full) | 2816 | 8192 | 5 | 31.5 | mem | 0.035 | native |
+| `GemvFp8` qkv (full) | 8192 | 2816 | 5 | 31.5 | mem | 0.035 | native |
+| `GemvFp8` o (slide) | 2816 | 4096 | 25 | 31.4 | mem | 0.088 | native |
+| `GemvFp8` q (slide) | 4096 | 2816 | 25 | 31.4 | mem | 0.088 | native |
+| `GemvFp8` kv (slide) | 2048 | 2816 | 50 | 31.2 | mem | 0.088 | native |
+| `GemvFp8` down | 2816 | 2112 | 30 | 31.2 | mem | 0.055 | native |
+| `GemvFp8` k (full) | 1024 | 2816 | 5 | 30.7 | mem | 0.004 | native |
+
+Every decode op is **memory bound** (AI 16-32 vs ridge 590), confirming decode time tracks weight
+BYTES in both precisions (§9.2).
+
+### 11.3 12B FP8 — the shapes differ; the fused GLU is the biggest decode item
+
+Prefill adds `GemmGluFp8` 15360x3840 (48 insts, **only at the 4096 rung**) and
+`GemmFp8` 15360x3840 at 96 insts; `GemmFp8` 512x3840 is the one **memory-bound** prefill op
+(AI 429 < 590). Decode: `GemvArgmax` 262144x3840 = **0.603 ms** (bf16) and
+`GemvGluFp8` 15360x3840 x48 = **1.698 ms** -- on the 12B the fused GLU is larger than lm_head.
+
+### 11.4 Roofline verdict: the audited-linear floor, fp8 vs bf16 (same tree, same rungs)
+
+| packet | phase | lm_head | other linears | total |
+|---|---|---|---|---|
+| 26B fp8 | prefill | 0.441 | **6.262** | 6.703 |
+| 26B bf16 | prefill | 0.441 | **14.055** | 14.496 |
+| 26B fp8 | decode | 0.443 | **0.501** | 0.944 |
+| 26B bf16 | decode | 0.443 | **1.678** | 2.121 |
+| 12B fp8 | prefill | 0.601 | 58.275 | 58.875 |
+| 12B fp8 | decode | 0.603 | 3.282 | 3.885 |
+
+* **26B prefill: 14.055 -> 6.262 ms = 2.24x better on fp8.** The linears are compute bound, so this
+  is fp8's 2x tensor-core peak being collected, slightly better than 2x because the fp8 packet also
+  FUSES gate+up (`GemmGluFp8`, 30 insts) where the bf16 packet runs them unfused as 60 separate Lt
+  GEMMs -- the deliberate bf16 choice from §1 (Lt gate/up + a separate GeGLU beat the fused role).
+* **26B decode: 1.678 -> 0.501 ms = 3.35x better on fp8** on the audited linears.
+* These are FLOORS over audited linear ops only. They EXCLUDE the MoE expert GEMMs entirely
+  (`dispatch_audit` has no MoE row at all -- the blind spot recorded in §6), and exclude attention,
+  norms and rope. The 12B number is not comparable to the 26B's for that reason: the 12B is dense,
+  so its FFN is audited, while the 26B's routed experts are not.
+
+### 11.5 The finding that matters most: lm_head is the largest single decode kernel, and it is BF16
+
+`lm_head` is **47% of the 26B FP8 decode linear floor** (0.443 of 0.944 ms) and 21% of the bf16
+one -- it does not shrink when everything else does, so its share doubles under fp8. It is memory
+bound at AI 15.9, so quantising it is worth **half its floor**:
+
+* 26B: 0.443 -> ~0.221 ms **per decode step**, and 0.441 -> ~0.220 ms per request at prefill.
+* 12B: 0.603 -> ~0.302 ms per decode step.
+
+Against the **measured** 26B C1 TPOT gap of **0.42 ms/step** of context-independent work (§12),
+fp8 lm_head alone is worth **~53% of that gap from one change**. That makes #93, not #62, the
+cheapest TPOT lever on the board -- and unlike #62 it needs no new grouped kernel, since a
+`GemvFp8` body at N=vocab is the same shape as the eight that already exist.
+
+Corroboration that this is real and not an artefact of my reading: the FP8 recipe's own header says
+so in its first line -- *"FP8 (PTPC) weights: W8A8 prefill, W8A16 decode, BF16 KV + lm_head."*
+It is a deliberate, documented exclusion, not an oversight.
+
+## 12. The TPOT gap decomposed: TWO causes in two regimes (corrects "it is all KV traversal")
+
+Fit `TPOT(ctx) ~ fixed + slope*ctx` on the §10 ladder, both stacks, per concurrency
+(`tpot_split.py`). A fixed offset and a slope have DIFFERENT fixes, so they must not be pooled.
+
+| C | fixed ms plow/vLLM | slope us per 1k ctx plow/vLLM | slope ratio | gap@1k | gap@15k | fixed share of gap@1k |
+|---|---|---|---|---|---|---|
+| 1 | 5.50 / 5.08 | ~0 / ~0 | — | 0.44 | 0.57 | **96%** |
+| 4 | 7.38 / 7.06 | 0.7 / 0.2 | 2.76x | 0.97 | 6.68 | 33% |
+| 16 | 10.30 / 7.10 | 3.0 / 1.8 | **1.65x** | 3.56 | 20.19 | 90% |
+| 32 | 10.59 / 8.61 | 3.0 / 3.5 | 0.84x | 0.09 | -7.66 | (slot-capped, ignore) |
+
+**At C1 the gap is 96% a FIXED ~0.42 ms/step, not KV traversal.** Both stacks have essentially zero
+context slope at C1, and the reason is structural: 28 of 30 Gemma-4 layers are sliding with a 1024
+window, so past 1024 only the two full-attention layers add KV, which at B=1 is negligible. This
+**corrects** the earlier campaign note "the TPOT gap is all KV traversal" -- that holds at batch and
+is false at C1. 0.42 ms over 30 layers is **~14 us per layer**, and it is 8% of a 5.5 ms step.
+
+**At C16 KV traversal takes over.** plow's effective KV throughput is **1/1.65 of vLLM's**; the
+fixed part stays ~3.2 ms but the slope adds ~17 ms by 15k, which is the whole 3.56 -> 20.19 ms
+widening. (Converting the slope to absolute GB/s using nominal 240 KiB/token gives an unphysical
+695% of peak at C1 -- which is itself proof that the effective bytes/token is far below nominal
+because of the sliding window. Trust the 1.65x RATIO, not an absolute achieved-bandwidth number.)
+
+Do not read the C32 row: this packet is slot-capped at 16 (§10.3), so its two apparent TPOT "wins"
+at 8192/15000 are vLLM degrading, not plow improving.
+
+### 12.1 What to attack, and what is already closed
+
+**C1, find 0.42 ms/step.** The register/occupancy route is CLOSED by arithmetic (128-reg cap costs
+1.3-1.9x in spill against ~463 regs of live state) and decode GRAPH SHAPE is fully closed -- op
+count, op width and path depth each refuted, and spine fusion cost +0.29 ms. So this is per-step
+entry and per-layer glue, not the graph:
+1. **#93, fp8 lm_head: ~0.221 ms/step, = ~53% of the gap, from one change** (§11.5). Cheapest lever
+   on the board and needs no new kernel shape.
+2. **#71, the megakernel entry (~1.3 ms/step at B=32, cause unidentified)** -- the largest named
+   fixed cost.
+3. The B=1 MoE glue: 8 of 128 experts are touched yet router + align + combine run every layer.
+
+**C16, close the KV slope** -- worth ~17 of the 20 ms at 15000/C16, far more than anything at C1:
+1. **#68** (riding decode rows through the decode attention kernel), plus #12/#59.
+2. **An FP8 KV cache, which was NOT on the task list and should be.** `precision.kv_enc` is **bf16
+   in every packet here**, fp8 and bf16 alike, and vLLM is also serving bf16 KV
+   (`--kv-cache-dtype` unset), so this is not a place plow is behind -- it is an unexploited axis on
+   the dominant batched term. Caveat: it changes numerics, and an apples-to-apples claim would have
+   to grant vLLM the same, so it is a capacity/quality decision rather than a free win.
+
+Note the interaction with §10: prefill is 85% of the C32 wall, so TPOT work pays at C1-C16 where
+decode is the wall. The C1 fixed cost is the cheapest 4/4 flip (those cells already win p99 ITL and
+need only TPOT + tok/s, which are ONE metric at 1:127); the C16 KV slope is the largest absolute
+prize.
