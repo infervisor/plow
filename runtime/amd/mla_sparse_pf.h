@@ -49,16 +49,16 @@ __device__ void d_mla_sparse_pf(bf16* __restrict__ O, const bf16* __restrict__ Q
     const unsigned rt = wave & 1u, kh = wave >> 1, pw = wave ^ 2u;
     const float sl2 = scale * 1.4426950408889634f;
     (void)slice;
-    (void)nblk;
     const unsigned n_qt = (T + QP - 1) / QP;
     const unsigned hdr = (n_qt * 4u + 255u) / 256u * 256u;
     bf16* const lh = (bf16*)lds;
     float* const stats = (float*)(lds + STATS_B);
     const unsigned ql = 4u * rt + (r32 >> 3), hh = r32 & 7u;
 
-    // Packs are handed out largest-first from a ticket counter IndexUnionPf zeroed (one word past
-    // the last union block): union sizes vary ~500x across packs, so a static stride leaves a
-    // 1.3-1.5x tail.
+    // Packs are handed out largest-first from a ticket counter one word past the last union block
+    // (union sizes vary ~500x across packs, so a static stride leaves a 1.3-1.5x tail).
+    // IndexUnionPf zeroes [ticket, exits]; layers that reuse a union table (span) get no fresh
+    // zero, so the last workgroup out resets both for the next flash on this table.
     unsigned* const ticket = (unsigned*)(lds + TICKET_B);
     unsigned* const ctr = (unsigned*)(uni + hdr + (size_t)n_qt * cap * 12u);
     for (;;) {
@@ -66,7 +66,13 @@ __device__ void d_mla_sparse_pf(bf16* __restrict__ O, const bf16* __restrict__ Q
         if (tid == 0u) *ticket = atomicAdd(ctr, 1u);
         __syncthreads();
         const unsigned it = *ticket;
-        if (it >= n_qt) break;
+        if (it >= n_qt) {
+            if (tid == 0u && atomicAdd(ctr + 1, 1u) == nblk - 1u) {
+                atomicExch(ctr, 0u);
+                atomicExch(ctr + 1, 0u);
+            }
+            break;
+        }
         const unsigned qt = n_qt - 1u - it;  // longest unions first
         const unsigned ucount = ((const unsigned*)uni)[qt];
         const unsigned char* blk = uni + hdr + (size_t)qt * cap * 12u;

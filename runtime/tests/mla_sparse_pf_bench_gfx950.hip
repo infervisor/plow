@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
         return ts[ts.size() / 2];
     };
     const float tv = timed([&] { hipLaunchKernelGGL(k_v2, dim3(256), dim3(256), V2_LDS, 0, dop, dml, dqa, dqr, dck, dkr, dkvl, duni, T, cap, scale); });
-    const float ts = timed([&] { CK(hipMemsetAsync(duni + ctr_off, 0, 4)); hipLaunchKernelGGL(k_sparse, dim3(256), dim3(256), mla_sp::LDS_BYTES, 0, dout, dqa, dqr, dck, dkr, duni, T, cap, scale); });
+    const float ts = timed([&] { hipLaunchKernelGGL(k_sparse, dim3(256), dim3(256), mla_sp::LDS_BYTES, 0, dout, dqa, dqr, dck, dkr, duni, T, cap, scale); });
     const double fl = (double)upairs * H * 1088 * 2;
     printf("v2gather %.3f ms   sparse %.3f ms (%.2fx)   sparse %.0f TF/s on union pairs\n", tv, ts, tv / ts, fl / ts / 1e9);
 
