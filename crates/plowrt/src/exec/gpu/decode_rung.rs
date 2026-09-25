@@ -239,6 +239,8 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     | DevOp::MoeRouterGemmaTopk
                     | DevOp::MoeExpertGluNormGemma
                     | DevOp::MoeExpertDownGemma
+                    | DevOp::MoeExpertGluGemmaFp8
+                    | DevOp::MoeExpertDownGemmaFp8
                     | DevOp::MoeCombineNormGemma
                     | DevOp::MoeCombineResidNormGemma),
                 ) => {
