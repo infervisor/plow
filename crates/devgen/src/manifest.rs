@@ -400,6 +400,9 @@ struct Shapes {
     /// arm it falls to never reads `t[7]`. The result is full causal attention where the model
     /// was trained sparse: no trap, no NaN, a fluent answer to a different question.
     glm_dsa_pf: bool,
+    /// Any `HeadNormRope` with pair_mode 3 (the fused DSA key prep): a pre-arm object runs it as
+    /// the plain half-split rope on the un-normed key. PLOW_DSA_PREP.
+    dsa_prep: bool,
     dsa_decode_batch: bool,
     dcp_index_canon: bool,
     dsa_select_local: bool,
@@ -628,6 +631,7 @@ fn shapes(m: &Model) -> Shapes {
                     if inst.i[2] == 64 && inst.i[5] == packet::dev::ROPE_PAIR_HALF {
                         s.rope_half_hd64 = true;
                     }
+                    s.dsa_prep |= inst.i[5] == packet::dev::ROPE_PAIR_DSA_KPREP;
                 }
                 DevOp::FlashMerge => {
                     if inst.t[3] != packet::TENSOR_NONE {
@@ -970,6 +974,9 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     );
     f.insert("glm_ofold".into(), json!(s.glm_ofold));
     f.insert("glm_dsa_pf".into(), json!(s.glm_dsa_pf));
+    if s.dsa_prep {
+        f.insert("dsa_prep".into(), json!(true));
+    }
     f.insert("dsa_decode_batch".into(), json!(s.dsa_decode_batch));
     f.insert("dcp_index_canon".into(), json!(s.dcp_index_canon));
     f.insert("dsa_select_local".into(), json!(s.dsa_select_local));
@@ -1496,6 +1503,9 @@ fn backend_amd(
     // which has no gathered arm for op 51 at all.
     if on("glm_dsa_pf") {
         req.push("PLOW_DSA_PF_ARM=1".into());
+    }
+    if on("dsa_prep") {
+        req.push("PLOW_DSA_PREP=1".into());
     }
     // A NoPE (zero-rope) MLA prefill needs the `d_flash_mla_prefill_v2<512, 0>` instantiation.
     // The arm is default-ON and costs nothing (same body at DR=0: identical VGPR/AGPR/LDS/spill,

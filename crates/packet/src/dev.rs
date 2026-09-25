@@ -2091,6 +2091,9 @@ pub enum DevOp {
 pub const ACT_SWIGLU_OAI: u32 = 3;
 /// [`DevOp::HeadNormRope`] `i5 = pair_mode`: force half-split (NeoX) pairing at every `hd`.
 pub const ROPE_PAIR_HALF: u32 = 2;
+/// [`DevOp::HeadNormRope`] `i5 = pair_mode`: the DSA indexer key prep (PLOW_DSA_PREP) — LayerNorm
+/// with bias (`t2 = gamma`, `t6 = beta`, `f0 = eps`) then HD=128 interleaved rope, skip_norm.
+pub const ROPE_PAIR_DSA_KPREP: u32 = 3;
 
 impl DevOp {
     /// Every opcode, in numeric order.

@@ -153,6 +153,13 @@ case "${PLOW_HNR_ILP:-0}" in
   1) A4W4_BK="$A4W4_BK -DPLOW_HNR_ILP=1" ;;
   *) echo "PLOW_HNR_ILP must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_DSA_PREP=1: DSA indexer prep fusions (dsa_prep.h; packet HeadNormRope pair_mode 3). Also
+# turned on below when the packet's plow_config.h requires it.
+case "${PLOW_DSA_PREP:-0}" in
+  0) ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_DSA_PREP=1" ;;
+  *) echo "PLOW_DSA_PREP must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_COMBINE_VEC:-0}" in
   0) ;;
   1) A4W4_BK="$A4W4_BK -DPLOW_COMBINE_VEC=1" ;;
@@ -169,6 +176,10 @@ DSA_FLASH=""
 if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
    grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_DSA_PF_ARM=1( |")' "$PLOW_HSACO_CONFIG"; then
   DSA_FLASH="-DPLOW_DSA_PF_ARM=1"
+fi
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] && [ "${PLOW_DSA_PREP:-0}" = 0 ] &&
+   grep -Eq '^#define PLOW_PACKET_OBJECT_REQUIRES "([^"]* )?PLOW_DSA_PREP=1( |")' "$PLOW_HSACO_CONFIG"; then
+  A4W4_BK="$A4W4_BK -DPLOW_DSA_PREP=1"
 fi
 case "${decode_inventory_prune,,}" in
   auto) [ -n "${PLOW_HSACO_CONFIG:-}" ] && decode_inventory_prune=1 || decode_inventory_prune=0 ;;

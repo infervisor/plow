@@ -392,6 +392,9 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // ns packets at the nsplit=1 partial layout while the merge reads ns — refuse.
     ("PLOW_MLA_PF_NS", &["plow_mla_pf_ns_arm"]),
     ("PLOW_MOE_PF_A8", &["plow_moe_pf_a8_arm"]),
+    // DSA indexer prep (HeadNormRope pair_mode 3). An object without the arm runs it as the plain
+    // rope on the un-normed key: no trap. A BUILD axis (`#if PLOW_DSA_PREP`).
+    ("PLOW_DSA_PREP", &["plow_dsa_prep_arm"]),
     // Op 83's `i[5]` shared-expert tail (PLOW_GLM_MOE_SHARED_FOLD). Unconditional arm, so the
     // marker IS the test: no marker means the object predates the fold and would drop the
     // shared expert entirely. See `packet_prefill_arm_requirements`.

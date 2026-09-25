@@ -6448,7 +6448,13 @@ fn emit_glm_dsa_prefill_select(
         Some(g) => g,
         None => bf16_gemm(b, n.kidx_pf, n.xn, w.iwk, di, h, &[pre[0]]),
     };
-    let c_kn = b.emit(DevOp::LayerNorm, pf_wide_cus(n_cu, t), &[c_k0], |d| {
+    // PLOW_GLM_DSA_KPREP: the key LayerNorm folds into the rope write below (pair_mode 3).
+    let kprep = emit_config::active().glm_dsa_kprep
+        && !native_fp8
+        && c.index_kpool == 1
+        && di == 128
+        && !b.packed_prefill_segments();
+    let c_kn = if kprep { c_k0 } else { b.emit(DevOp::LayerNorm, pf_wide_cus(n_cu, t), &[c_k0], |d| {
         d.t[0] = n.kidx_pf;
         d.t[1] = n.kidx_pf;
         d.t[2] = w.iknw;
@@ -6457,7 +6463,7 @@ fn emit_glm_dsa_prefill_select(
         d.i[1] = di;
         d.i[3] = 0;
         d.f[0] = 1e-6; // k_norm eps, the decode chain's constant
-    });
+    }) };
     if c.index_kpool > 1 {
         assert_eq!(
             di, 128,
@@ -6649,6 +6655,12 @@ fn emit_glm_dsa_prefill_select(
         d.f[0] = c.eps;
         d.j[0] = 0;
         d.j[1] = KV_MASK_NONE;
+        if kprep {
+            d.t[2] = w.iknw;
+            d.t[6] = w.iknb;
+            d.i[5] = packet::dev::ROPE_PAIR_DSA_KPREP;
+            d.f[0] = 1e-6; // k_norm eps (the LayerNorm's)
+        }
     });
     if !select {
         if native_fp8 {

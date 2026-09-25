@@ -748,6 +748,10 @@ pub struct EmitConfig {
     /// Sparse prefill flash on mla_sparse_pf.h (8-query packs, bf16 latent out, no merge).
     #[arg(long, env = "PLOW_GLM_DSA_PF_B8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_dsa_pf_b8: bool,
+    /// DSA indexer key prep: k_norm LayerNorm folded into the key rope/cache write (HeadNormRope
+    /// pair_mode 3; objects need PLOW_DSA_PREP=1).
+    #[arg(long, env = "PLOW_GLM_DSA_KPREP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dsa_kprep: bool,
 
     /// Set by [`super::apply_production_defaults`] when this emit is the QUALIFIED GLM target —
     /// gfx942, TP8, 304 CU. The nine knobs whose accessors read it are `Option<bool>` precisely
@@ -1509,6 +1513,7 @@ impl EmitConfig {
             gemv_wg_tuning: env_str("PLOW_GEMV_WG_TUNING"),
             glm_dsa_pf: env_bool("PLOW_GLM_DSA_PF"),
             glm_dsa_pf_b8: env_bool("PLOW_GLM_DSA_PF_B8"),
+            glm_dsa_kprep: env_bool("PLOW_GLM_DSA_KPREP"),
             glm_production_defaults: false,
             glm_fp8_kv: env_bool_opt("PLOW_GLM_FP8_KV"),
             glm_moe_aiter: env_bool_opt("PLOW_GLM_MOE_AITER"),
