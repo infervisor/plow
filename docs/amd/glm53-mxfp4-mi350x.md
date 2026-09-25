@@ -205,6 +205,34 @@ indexer DSA is not expected to cross over by 64k; the indexer chain is the bindi
 A 3-4x faster indexer (FP8 score per vLLM, fused/faster select) would put the crossover at ~24-32k.
 32k correctness not checked (no oracle at 32k).
 
+### Indexer: reference implementations and adoption plan (research, 2026-09-25; not yet implemented)
+- vLLM 0.29 ROCm path (pinned image): `rocm_fp8_mqa_logits` -> AITER gfx950 gluon
+  `_gluon_fp8_mqa_logits_kernel` (1 program/query row, longest rows first, BLOCK_KV=32,
+  `mfma_scaled` 32x32x64 e4m3 unscaled, relu -> head reduce -> x kscale, fp32 logits; -inf prefill) +
+  `top_k_per_row_prefill` (512-thread block/row, 2048-bin histogram passes 11/11/11/10 bits, final
+  bin insertion/CUB sort; ties by atomic order, so vLLM's own selection is nondeterministic on ties).
+  Tuned AITER on MI355X: 1.43-1.76 PF/s causal (plow BF16 score: 0.62 PF/s).
+- Exact numerics: k after LN + bf16 rope, UE8M0 scale `2^ceil(log2(max(1e-4, amax)/448))` per token
+  (132 B/token cache); q per (token, head) group-128 UE8M0; `w' = ((w*q_scale)*128^-0.5)*32^-0.5`
+  fp32; `logit = kscale[j] * sum_h w'[h]*relu(mfma_e4m3(q_h, k_j))`, per-lane serial head sum then
+  lane^32 add (plow `rowq` order). OCP e4m3fn (not FNUZ). No Hadamard rotation in vLLM's GLM path.
+  Likely causes of plow's failed FP8 arm: FNUZ/fmt operand bits, q_scale applied twice (already in w'),
+  or mismatched A/B k-permutation for the x64 MFMA.
+- DeepGEMM sm90 `fp8_mqa_logits` (KV as A, BLOCK_Q x heads as B, TMA + math warps, per-CTA [ks,ke]);
+  TRT-LLM: radix 8-bit x 4 passes then sort below 2048 candidates (7.4x torch.topk), fused K quant/store
+  +33-64%. SGLang: same logits kernels + `topk_transform`; pitfalls on GLM data: fp16-bit coarse bins
+  (recall 0.53) and truncated overflow bins (wrong sets). Fully fused score+top-k (FusedIndexTopK):
+  only +3-9% — the score round trip is not the dominant cost.
+- Plan (projected indexer chain 8k 31 -> ~9 ms, 16k ~85 -> ~28 ms):
+  1. FP8 score arm with the numerics above (x64 MFMA, K in LDS as fp8, 2-4 rows/wave, >=2 waves/SIMD
+     so the relu/weight epilogue overlaps MFMA): 16k 1.77 -> ~0.75 ms/layer, 8k 0.47 -> ~0.2.
+  2. Select: one fp32-key 11-12-bit histogram pass with the row in registers, compact threshold-bin
+     candidates into LDS, refine only those; handle overflow bins exactly: ~2.5x.
+  3. Fuse select + union per 8-query pack (LDS bitmask): union 10.8 -> ~1 ms at 16k.
+  4. Fuse indexer prep: k LN -> rope -> fp8 quant/cache in one pass; q rope + round + quant + weight
+     fold in one pass; wk + weights_proj as one N=160 GEMM: ~10 ms at 8k.
+  Then re-measure the crossover; the sparse flash (2x needed for 8k/16k) remains the other half.
+
 ## Negatives (do not re-try blind)
 - MoE stage-1 wide tile (128 rows, A+B via LDS): bit-exact but 423 -> 501 us at T8192.
   DOWN global loads / plain float4 stores / 256 B lines / 9-slot combine loads: no gain or slower.
