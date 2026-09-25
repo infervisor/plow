@@ -7431,9 +7431,11 @@ pub(crate) fn emit_glm_mla_prefill(
     };
     // q_rope: dynamic interleaved RoPE over T tokens. i[0]=t is the only change from decode — the
     // per-token angle comes from in.pos[t], which the host already fills for a prefill chunk.
+    // The B8 sparse flash ropes q on load (mla_sparse_pf.h), so it reads the raw strip.
+    let sparse_b8 = sparse && !glm_fp8_kv() && emit_config::active().glm_dsa_pf_b8;
     let c_qr = if let Some((_, c_qr)) = rowband_q {
         c_qr
-    } else if dr == 0 || mla_mha {
+    } else if dr == 0 || mla_mha || sparse_b8 {
         c_qa
     } else if fuse_post {
         c_qrr
@@ -7639,7 +7641,6 @@ pub(crate) fn emit_glm_mla_prefill(
     };
     let sparse_sel =
         if b.packed_prefill_segments() || b.rowsplit_attn() { n.iidx_pf } else { n.iuni };
-    let sparse_b8 = sparse && !fp8kv && emit_config::active().glm_dsa_pf_b8;
     assert!(!sparse_b8 || (emit_config::active().glm_mla_w8a8 && nh_l == 8 && dr == 64 && dk == 512
         && !dcp && !use_rowsplit && !b.packed_prefill_segments()),
         "PLOW_GLM_DSA_PF_B8 requires the W8A8 MLA TP8 single-chunk sparse prefill");
@@ -7691,8 +7692,11 @@ pub(crate) fn emit_glm_mla_prefill(
                 d.t[7] = n.iuni; // the union table; its presence selects the GATHER arm
                 d.i[6] = glm_dsa_pf_cap(c, ctx);
                 if sparse_b8 {
-                    // mla_sparse_pf.h: normalized bf16 latent straight into `olat`, no merge.
+                    // mla_sparse_pf.h: normalized bf16 latent straight into `olat`, no merge;
+                    // raw q rope (t3) roped on load with t1=cos, i7=sin (demoted handle).
                     d.t[0] = n.olat;
+                    d.t[1] = n.cos;
+                    d.t[3] = n.qrr;
                     d.i[6] |= 1 << 31;
                 }
             } else if ofold {
@@ -7711,7 +7715,7 @@ pub(crate) fn emit_glm_mla_prefill(
             d.i[3] = if dr == 0 { 1u32 << 31 } else { 0 };
             d.i[4] = t; // n_tok — the slot decode used for nsplit
             d.i[5] = KV_MASK_NONE;
-            d.i[7] = glm_gf_prefill(ctx, nh_l);
+            d.i[7] = if sparse_b8 { n.sin } else { glm_gf_prefill(ctx, nh_l) };
             d.f[0] = c.attn_scale;
             if mla_mha {
                 d.t[0] = n.oat;

@@ -31,12 +31,16 @@ __device__ __forceinline__ unsigned mla_sp_off(unsigned row, unsigned col) {
     return (row >> 1) * mla_sp::PS + ((col >> 3) * 2u + (row & 1u)) * 8u + (col & 7u);
 }
 
-// uni: IndexUnionPf table (pack = 8). Qa [T][8][512], Qr [T][8][64] roped, Ckv [kv][512], Kr [kv][64].
+// uni: IndexUnionPf table (pack = 8). Qa [T][8][512], Qr [T][8][64] (roped, or raw with cosb/sinb),
+// Ckv [kv][512], Kr [kv][64].
 __device__ void d_mla_sparse_pf(bf16* __restrict__ O, const bf16* __restrict__ Qa,
                                 const bf16* __restrict__ Qr, const bf16* __restrict__ Ckv,
                                 const bf16* __restrict__ Kr, const unsigned char* __restrict__ uni,
                                 unsigned T, unsigned cap, float scale, unsigned slice,
-                                unsigned nblk, unsigned char* lds) {
+                                unsigned nblk, unsigned char* lds,
+                                const float* __restrict__ cosb = nullptr,
+                                const float* __restrict__ sinb = nullptr,
+                                const int* __restrict__ kv_len = nullptr) {
     using namespace mla_sp;
     const unsigned tid = threadIdx.x, lane = tid & 63u, wave = tid >> 6;
     const unsigned g = lane >> 5, r32 = lane & 31u;
@@ -106,6 +110,19 @@ __device__ void d_mla_sparse_pf(bf16* __restrict__ O, const bf16* __restrict__ Q
             const unsigned d = 16u * s + 8u * g;
             qf[s] = d < DK ? *(const bf16x8*)(Qa + qrow * DK + d)
                            : *(const bf16x8*)(Qr + qrow * DR + (d - DK));
+            if (d >= DK && cosb) {
+                // Raw q_rope: GPT-J interleaved RoPE, HeadNormRope's hd=64 skip_norm arithmetic
+                // (pair m of the strip at table index pos*32 + m); fresh prefill: pos = kv_len - T + q.
+                const unsigned qq = qv ? qi : T - 1u;
+                const size_t tb = (size_t)((unsigned)kv_len[0] - T + qq) * 32u + (d - DK) / 2u;
+#pragma unroll
+                for (unsigned k = 0; k < 4; k++) {
+                    const float c = cosb[tb + k], sn = sinb[tb + k];
+                    const float a = (float)qf[s][2 * k], b = (float)qf[s][2 * k + 1];
+                    qf[s][2 * k] = (bf16_t)(a * c - b * sn);
+                    qf[s][2 * k + 1] = (bf16_t)(b * c + a * sn);
+                }
+            }
         }
         f32x16 o[8];
 #pragma unroll

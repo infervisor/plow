@@ -3030,13 +3030,16 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if !(PLOW_MLA_SPARSE_ARM && PLOW_CDNA4 && defined(PLOW_BUCKET_FLASH))
     if (pf_sparse8) __builtin_trap();
 #else
-    /* t0=olat bf16[T][8][512] t2=q absorbed t3=q rope (roped) t4=ckv t5=k rope t7=union table;
-     * i4=T, i6 = bit31 | cap, f0=scale. */
+    /* t0=olat bf16[T][8][512] t2=q absorbed t3=q rope t4=ckv t5=k rope t6=kv_len t7=union table;
+     * i4=T, i6 = bit31 | cap, f0=scale. t1 set = raw q rope: t1=cos, i7=sin (demoted handle). */
     if (pf_sparse8) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
         d_mla_sparse_pf((bf16*)TEN(0), (const bf16*)TEN(2), (const bf16*)TEN(3),
                         (const bf16*)TEN(4), (const bf16*)TEN(5), (const unsigned char*)TEN(7),
-                        in->i[4], in->i[6] & 0x7fffffffu, in->fj[0].f, slice, nblk, sm->msp);
+                        in->i[4], in->i[6] & 0x7fffffffu, in->fj[0].f, slice, nblk, sm->msp,
+                        (const float*)TEN(1),
+                        in->t[1] == PLOW_TENSOR_NONE ? nullptr : (const float*)T[in->i[7]],
+                        (const int*)TEN(6));
 #undef TEN
         return;
     }
