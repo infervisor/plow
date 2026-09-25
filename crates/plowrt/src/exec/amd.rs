@@ -1348,8 +1348,15 @@ fn moe_stage1_mxfp4_inst(d: &DevInst64) -> bool {
         && d.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
 }
 
-fn moe_stage1_a4_reuse_inst(d: &DevInst64) -> bool {
-    moe_stage1_mxfp4_inst(d) && d.i[0].div_ceil(256) >= 2
+/// `gather`: the object is the token-gather pipe body (`plow_moe1_a4_token_gather_1`), which
+/// also wins at one 256-wide N tile (GLM-5.3 TP8 I=256) and needs H % 512 == 0, H <= 6144.
+fn moe_stage1_a4_reuse_inst(d: &DevInst64, gather: bool) -> bool {
+    moe_stage1_mxfp4_inst(d)
+        && if gather {
+            d.i[0].is_multiple_of(128) && d.i[1].is_multiple_of(512) && d.i[1] <= 6144
+        } else {
+            d.i[0].div_ceil(256) >= 2
+        }
 }
 
 fn moe_stage2_mxfp4_inst(d: &DevInst64) -> bool {
@@ -2013,12 +2020,13 @@ fn has_moe_stage1_mxfp4_segment(prog: &DevProg) -> bool {
 fn moe_stage1_a4_scratch_bytes<'a>(
     progs: impl IntoIterator<Item = &'a DevProg>,
     tensors: &[crate::asset::devblob::DevTensor],
+    a4_gather: bool,
 ) -> Result<(u64, u64)> {
     let mut payload = 0u64;
     let mut scales = 0u64;
     for prog in progs {
         for d in &prog.insts {
-            if !moe_stage1_a4_reuse_inst(d) {
+            if !moe_stage1_a4_reuse_inst(d, a4_gather) {
                 continue;
             }
             let row_bytes = tensors
@@ -2133,6 +2141,7 @@ fn moe_mxfp4_routes_with_scratch(
     devp: &[DeviceMem],
     stage1_a4_scratch: Option<(u64, u64)>,
     ep_bind: Option<(u32, u32)>,
+    a4_gather: bool,
 ) -> Result<Vec<PrefillSegmentRoute>> {
     let n_seg = prog
         .stream
@@ -2632,7 +2641,7 @@ fn moe_mxfp4_routes_with_scratch(
                     "segment {seg} has a zero-grid MoE stage-1 packet"
                 )));
             }
-            if moe_stage1_a4_reuse_inst(d)
+            if moe_stage1_a4_reuse_inst(d, a4_gather)
                 && crate::config::RuntimeConfig::get().amd.moe_stage1_a4_reuse
             {
                 if let Some((a4, a4_scale)) = stage1_a4_scratch {
@@ -2731,7 +2740,7 @@ fn moe_mxfp4_routes(
     tensors: &[crate::asset::devblob::DevTensor],
     devp: &[DeviceMem],
 ) -> Result<Vec<PrefillSegmentRoute>> {
-    moe_mxfp4_routes_with_scratch(prog, tensors, devp, None, None)
+    moe_mxfp4_routes_with_scratch(prog, tensors, devp, None, None, false)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -9769,9 +9778,11 @@ impl AmdEngine {
         let kda_keyfeed_scratch = d_kda_keyfeed_scratch
             .as_ref()
             .map(|m| (m.base, kda_keyfeed_half));
+        let stage1_a4_gather = matches!(k_moe_stage1_a4_reuse,
+            Some((_, n)) if n == std::mem::size_of::<MoeStage1A4ReuseArgs>());
         let (stage1_a4_payload, stage1_a4_scales) =
             if k_moe_stage1_a4_quant.is_some() && k_moe_stage1_a4_reuse.is_some() {
-                moe_stage1_a4_scratch_bytes(blob.prefill_phase(), &blob.tensors)?
+                moe_stage1_a4_scratch_bytes(blob.prefill_phase(), &blob.tensors, stage1_a4_gather)?
             } else {
                 (0, 0)
             };
@@ -9844,6 +9855,7 @@ impl AmdEngine {
                     &devp,
                     stage1_a4_scratch,
                     tp.map(|b| (b.rank, b.n_gpu)),
+                    stage1_a4_gather,
                 )?
             } else {
                 vec![PrefillSegmentRoute::Interpreter; seg_class.len()]
