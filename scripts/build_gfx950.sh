@@ -147,6 +147,13 @@ case "${PLOW_DSA_IDX_QPW:-0}" in
   1) A4W4_BK="$A4W4_BK -DPLOW_DSA_IDX_QPW=1" ;;
   *) echo "PLOW_DSA_IDX_QPW must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_DSA_IDX_FP8=1: DSA prefill indexer score (op 117) with vLLM 0.29 ROCm's FP8 arithmetic
+# (runtime/amd/dsa_score_fp8.h). Changes the scores (not bit-identical to the bf16 arms); wins over QPW.
+case "${PLOW_DSA_IDX_FP8:-0}" in
+  0) ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_DSA_IDX_FP8=1" ;;
+  *) echo "PLOW_DSA_IDX_FP8 must be 0 or 1" >&2; exit 2 ;;
+esac
 # PLOW_HNR_ILP=1: HeadNormRope HD=128 interleaved (DSA indexer rope) four heads per wave pass.
 case "${PLOW_HNR_ILP:-0}" in
   0) ;;
