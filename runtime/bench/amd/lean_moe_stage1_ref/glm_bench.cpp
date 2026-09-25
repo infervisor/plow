@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -48,7 +49,7 @@ static double median(std::vector<float> v) { std::sort(v.begin(), v.end()); retu
 
 struct Obj {
     hipModule_t mod{};
-    hipFunction_t quant{}, gemm{};
+    hipFunction_t quant{}, gemm{}, bk256{};
     bool gather = false; /* plow_moe1_a4_token_gather_1: A4 by token, GEMM takes row_token */
     explicit Obj(const char* path) {
         CK(hipModuleLoad(&mod, path));
@@ -57,6 +58,8 @@ struct Obj {
         CK(hipModuleGetFunction(&quant, mod, "plow_moe1_quant_sort_a4_gfx950"));
         CK(hipModuleGetFunction(&gemm, mod, "plow_moe1_a4_reuse_16x16x128_gfx950"));
         CK(hipFuncSetAttribute(gemm, hipFuncAttributeMaxDynamicSharedMemorySize, 32768));
+        CK(hipModuleGetFunction(&bk256, mod, "plow_moe1_mxfp4_bk256_gfx950"));
+        CK(hipFuncSetAttribute(bk256, hipFuncAttributeMaxDynamicSharedMemorySize, 119808));
     }
 };
 
@@ -171,6 +174,35 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < I / 2; ++i) nz += o0[r * I / 2 + i] != 0;
     }
 
+    /* The route GLM I=256 took before the token-gather object: plow_moe1_mxfp4_bk256 (op85 body,
+     * 512 threads, grid 256). Different MFMA chain, so compared by dequantized rel-L2. */
+    auto ship = [&](int slot) {
+        uint32_t inter = I, hidden = H, experts = E, act = 0, zero = 0; float beta = 0, linear = 0;
+        void* a[] = {&out[slot], &activation, &d_wt, &d_st, &d_meta, &d_token, &d_partidx, &os[slot],
+                     &inter, &hidden, &experts, &act, &beta, &linear, &zero, &zero};
+        CK(hipModuleLaunchKernel(base.bk256, 256, 1, 1, 512, 1, 1, 119808, nullptr, a, nullptr));
+    };
+    ship(0); CK(hipDeviceSynchronize());
+    std::vector<uint8_t> so(out_bytes), ss(os_bytes);
+    CK(hipMemcpy(so.data(), out[0], out_bytes, hipMemcpyDeviceToHost));
+    CK(hipMemcpy(ss.data(), os[0], os_bytes, hipMemcpyDeviceToHost));
+    auto deq = [](const std::vector<uint8_t>& q, const std::vector<uint8_t>& sc, size_t r, uint32_t i) {
+        static const float lut[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+        const uint8_t b = q[r * I / 2 + i / 2], n = (i & 1) ? b >> 4 : b & 15;
+        const float v = lut[n & 7] * std::ldexp(1.0f, int(sc[r * I / 32 + i / 32]) - 127);
+        return (n & 8) ? -v : v;
+    };
+    double num = 0, den = 0; size_t sdiff = 0;
+    for (size_t r = 0; r < rows; ++r) {
+        if (row_partidx[r] == UNUSED) continue;
+        sdiff += memcmp(&so[r * I / 2], &o1[r * I / 2], I / 2) != 0;
+        for (uint32_t i = 0; i < I; ++i) {
+            const double a = deq(so, ss, r, i), b = deq(o1, s1, r, i);
+            num += (a - b) * (a - b); den += a * a;
+        }
+    }
+    std::vector<float> tship;
+
     void* flush{}; constexpr size_t flush_bytes = 512u << 20;
     CK(hipMalloc(&flush, flush_bytes)); CK(hipMemset(flush, 0x5a, flush_bytes));
     hipEvent_t ev[3]; for (auto& e : ev) CK(hipEventCreate(&e));
@@ -187,6 +219,12 @@ int main(int argc, char** argv) {
             (c ? tc : tb).push_back(g);
         }
     }
+    for (int it = 0; it < iters; ++it) {
+        flush_cache<<<4096, 256>>>((uint32_t*)flush, flush_bytes / 4, 99 + it);
+        CK(hipEventRecord(ev[0])); ship(0);
+        CK(hipEventRecord(ev[1])); CK(hipEventSynchronize(ev[1]));
+        float g; CK(hipEventElapsedTime(&g, ev[0], ev[1])); tship.push_back(g);
+    }
     const double flop = 2.0 * live * H * 2.0 * I;
     const double wbytes = double(E) * 2 * (branch_w + branch_s);
     const double roof_us = std::max(wbytes / 6.2e12, flop / 9.2e15) * 1e6;
@@ -201,5 +239,8 @@ int main(int argc, char** argv) {
                 median(tb) / median(tc));
     std::printf("  stage1 total : %8.1f us  cand %8.1f us  speedup %.2fx\n", (median(tq) + median(tb)) * 1e3,
                 (median(tqc) + median(tc)) * 1e3, (median(tq) + median(tb)) / (median(tqc) + median(tc)));
+    std::printf("  bk256 route  : %8.1f us (in-model I=256 stage-1 before)  cand total speedup %.2fx  "
+                "rows differing %zu/%zu, dequantized rel-L2 %.3e\n", median(tship) * 1e3,
+                median(tship) / (median(tqc) + median(tc)), sdiff, live, std::sqrt(num / den));
     return bad || qbad ? 3 : 0;
 }
