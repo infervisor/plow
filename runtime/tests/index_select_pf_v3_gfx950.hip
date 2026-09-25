@@ -4,7 +4,7 @@
  *   - v3 sets == v2 sets per row, == a CPU exact top-k on sampled rows, rows >= n_tok untouched;
  *   - fused union table bytes (+ ticket counter) == d_index_union_pf over v2's selection;
  *   - timings. Tie-heavy / overflowing-bin synthetic rows, plus real scores:
- *     isel_v3 [scores.bin T]   (f32 [T][T] rows as dumped from act.iscore_pf, kv_len = T)
+ *     isel_v3 [scores.bin n_tok stride]   (f32 [n_tok][stride] rows of an act.iscore_pf dump)
  *   hipcc --offload-arch=gfx950 -O3 -I runtime/amd -I runtime/common \
  *       runtime/tests/index_select_pf_v3_gfx950.hip -o isel_v3
  */
@@ -198,13 +198,14 @@ static int run_case(const char* tag, const std::vector<float>& h, unsigned rows,
 
 int main(int argc, char** argv) {
     int fails = 0;
-    if (argc >= 3) {
-        const unsigned T = (unsigned)atoi(argv[2]);
-        std::vector<float> h((size_t)T * T);
+    if (argc >= 4) {
+        /* real scores: rows [n_tok][stride] f32 (the act.iscore_pf dump), kv_len = n_tok */
+        const unsigned n_tok = (unsigned)atoi(argv[2]), stride = (unsigned)atoi(argv[3]);
+        std::vector<float> h((size_t)n_tok * stride);
         FILE* f = fopen(argv[1], "rb");
         if (!f || fread(h.data(), 4, h.size(), f) != h.size()) { printf("read %s failed\n", argv[1]); return 2; }
         fclose(f);
-        fails += run_case("real", h, T, T, T, T, 10);
+        fails += run_case("real", h, n_tok, stride, n_tok, n_tok, 10);
         printf(fails ? "FAIL\n" : "PASS\n");
         return fails != 0;
     }

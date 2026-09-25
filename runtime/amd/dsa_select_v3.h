@@ -30,8 +30,11 @@ constexpr unsigned MAXPOS = 16384u;         /* positions the fused pack mask cov
 constexpr unsigned MASK = NW * REGW;
 constexpr unsigned WORDS_SEL = NW * REGW, WORDS_FUSED = MASK + MAXPOS / 4u;
 constexpr unsigned PACK = 8u;
+#ifndef IDXSEL_V3_AUX
+#define IDXSEL_V3_AUX 1 /* score row loads: glc (3-5% faster than glc|slc here) */
+#endif
 #ifndef IDXSEL_V3_BATCH
-#define IDXSEL_V3_BATCH 8u
+#define IDXSEL_V3_BATCH 4u
 #endif
 constexpr unsigned BATCH = IDXSEL_V3_BATCH;  /* 16-byte loads per lane per streaming step */
 static_assert(NW == PACK, "the fused form ranks a pack's rows one per wave");
@@ -135,13 +138,13 @@ __device__ __forceinline__ void isel3_stream(const float* row, unsigned row_len,
 #pragma unroll
     for (unsigned j = 0; j < BATCH; j++)
         cur[j] = __builtin_bit_cast(uint4, __builtin_amdgcn_raw_buffer_load_b128(
-                                               r, lane * 16u, j * 1024u, /*glc|slc*/ 3));
+                                               r, lane * 16u, j * 1024u, IDXSEL_V3_AUX));
     for (unsigned b = 0; b < ns; b++) {
         uint4 nx[BATCH];
 #pragma unroll
         for (unsigned j = 0; j < BATCH; j++)
             nx[j] = __builtin_bit_cast(uint4, __builtin_amdgcn_raw_buffer_load_b128(
-                                                  r, lane * 16u, ((b + 1u) * BATCH + j) * 1024u, 3));
+                                                  r, lane * 16u, ((b + 1u) * BATCH + j) * 1024u, IDXSEL_V3_AUX));
 #pragma unroll
         for (unsigned j = 0; j < BATCH; j++) {
             const unsigned p0 = (b * BATCH + j) * 256u + lane * 4u;
