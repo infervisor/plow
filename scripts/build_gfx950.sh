@@ -147,6 +147,12 @@ case "${PLOW_DSA_IDX_QPW:-0}" in
   1) A4W4_BK="$A4W4_BK -DPLOW_DSA_IDX_QPW=1" ;;
   *) echo "PLOW_DSA_IDX_QPW must be 0 or 1" >&2; exit 2 ;;
 esac
+# PLOW_HNR_ILP=1: HeadNormRope HD=128 interleaved (DSA indexer rope) four heads per wave pass.
+case "${PLOW_HNR_ILP:-0}" in
+  0) ;;
+  1) A4W4_BK="$A4W4_BK -DPLOW_HNR_ILP=1" ;;
+  *) echo "PLOW_HNR_ILP must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_COMBINE_VEC:-0}" in
   0) ;;
   1) A4W4_BK="$A4W4_BK -DPLOW_COMBINE_VEC=1" ;;

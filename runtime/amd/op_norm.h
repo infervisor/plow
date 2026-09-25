@@ -741,6 +741,107 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
     }
 }
 
+/* PLOW_HNR_ILP: d_headnorm_rope for plain prefill rows (no token-batch / mixed / packed routing),
+ * HNR_G (token, head) items per wave iteration with every load of the group issued before any
+ * is consumed. The per-item arithmetic is d_headnorm_rope's, so the output is bit-identical; the
+ * shipped form walks one head per iteration behind a pos -> cos/sin dependent-load chain and is
+ * latency-bound at prefill widths (the GLM indexer q rope: 8192 x 32 heads, ~150 us per WG). */
+#ifndef HNR_G
+#define HNR_G 4u
+#endif
+template <int HD, bool INTERLEAVE>
+__device__ void d_headnorm_rope_ilp(bf16* __restrict__ out, const bf16* __restrict__ x,
+                                    const bf16* __restrict__ gamma,
+                                    const float* __restrict__ cosb, const float* __restrict__ sinb,
+                                    const int* __restrict__ pos, unsigned ntok, unsigned nhead,
+                                    float eps, unsigned out_row0, unsigned out_stride,
+                                    unsigned kv_mask, unsigned skip_norm, unsigned slice,
+                                    unsigned nblk, unsigned n_batch_kv) {
+    constexpr unsigned hd = HD, E = HD >> 6, H2 = HD >> 1, G = HNR_G;
+    const unsigned lane = threadIdx.x & 63;
+    const unsigned wave_in_blk = threadIdx.x >> 6;
+    const unsigned total = ntok * nhead;
+    const auto* xg = as_glob(x);
+    const auto* gg = as_glob(gamma);
+    const auto* cg = as_glob(cosb);
+    const auto* sg = as_glob(sinb);
+    const auto* pg = as_glob(pos);
+    auto* og = as_glob(out);
+    float g[E];
+#pragma unroll
+    for (unsigned e = 0; e < E; e++) g[e] = gamma ? bf2f(gg[lane + e * 64]) : 1.0f;
+    for (unsigned w0 = (slice * PLOW_WAVES + wave_in_blk) * G; w0 < total;
+         w0 += nblk * PLOW_WAVES * G) {
+        float v[G][E], c[G][E], s[G][E];
+        unsigned position[G];
+#pragma unroll
+        for (unsigned q = 0; q < G; q++) {
+            const unsigned w = w0 + q < total ? w0 + q : total - 1u;
+            const unsigned t = w / nhead;
+            position[q] = pg ? (unsigned)pg[t] : out_row0 + t;
+#pragma unroll
+            for (unsigned e = 0; e < E; e++) v[q][e] = bf2f(xg[(size_t)w * hd + lane + e * 64]);
+        }
+        if (cosb) {
+#pragma unroll
+            for (unsigned q = 0; q < G; q++) {
+                const size_t p = (size_t)position[q] * H2;
+#pragma unroll
+                for (unsigned e = 0; e < E; e++) {
+                    const unsigned i = lane + e * 64;
+                    const unsigned j = INTERLEAVE ? (i >> 1) : ((i < H2) ? i : (i - H2));
+                    c[q][e] = cg[p + j];
+                    s[q][e] = sg[p + j];
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned q = 0; q < G; q++) {
+            const unsigned w = w0 + q;
+            if (w >= total) break;
+            const unsigned t = w / nhead, hh = w % nhead;
+            float inv = 1.0f;
+            if (!skip_norm) {
+                float ss = 0.0f;
+#pragma unroll
+                for (unsigned e = 0; e < E; e++) ss += v[q][e] * v[q][e];
+                inv = rsqrtf(rn_ss(wave_sum(ss)) / (float)hd + eps);
+            }
+            float u[E];
+#pragma unroll
+            for (unsigned e = 0; e < E; e++) u[e] = v[q][e] * inv * g[e];
+            if (cosb) {
+                float r[E];
+                if constexpr (!INTERLEAVE) {
+                    constexpr unsigned EH = H2 >> 6;
+#pragma unroll
+                    for (unsigned e = 0; e < E; e++)
+                        r[e] = (e < EH) ? (u[e] * c[q][e] - u[e + EH] * s[q][e])
+                                        : (u[e] * c[q][e] + u[e - EH] * s[q][e]);
+                } else {
+#pragma unroll
+                    for (unsigned e = 0; e < E; e++) {
+                        const unsigned i = lane + e * 64;
+                        const float partner = __shfl_xor(u[e], 1, PLOW_WAVE);
+                        r[e] = ((i & 1u) == 0u) ? (u[e] * c[q][e] - partner * s[q][e])
+                                                : (u[e] * c[q][e] + partner * s[q][e]);
+                    }
+                }
+#pragma unroll
+                for (unsigned e = 0; e < E; e++) u[e] = r[e];
+            }
+            const size_t obase =
+                out_stride
+                    ? (n_batch_kv != 0
+                           ? ((size_t)(t * nhead + hh) * out_stride + (position[q] & kv_mask)) * hd
+                           : ((size_t)hh * out_stride + ((out_row0 + t) & kv_mask)) * hd)
+                    : ((size_t)(out_row0 + t) * nhead + hh) * hd;
+#pragma unroll
+            for (unsigned e = 0; e < E; e++) st_act1(&og[obase + lane + e * 64], f2bf(u[e]));
+        }
+    }
+}
+
 /* FP8 (e4m3) KV-cache twin of d_headnorm_rope. Identical math — the norm/RoPE produce the SAME
  * v[e] — but the store quantizes to e4m3 with a PER-ROW scale so flash-decode reads half the bytes.
  *
