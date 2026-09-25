@@ -80,8 +80,8 @@ esac
 # merge for bit-identity). Decode's 64-split merge is a dependent-load chain without it.
 case "${PLOW_GEMV_F32_COL:-0}" in
   0) ;;
-  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_GEMV_F32_COL=1" ;;
-  *) echo "PLOW_GEMV_F32_COL must be 0 or 1" >&2; exit 2 ;;
+  1|2) DEC_KNOBS="$DEC_KNOBS -DPLOW_GEMV_F32_COL=$PLOW_GEMV_F32_COL" ;;
+  *) echo "PLOW_GEMV_F32_COL must be 0, 1 or 2" >&2; exit 2 ;;
 esac
 case "${PLOW_MERGE_UNROLL4:-0}" in
   0) ;;
