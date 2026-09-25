@@ -889,14 +889,6 @@ extern "C" __device__ unsigned plow_dsa_select_v2_arm = 1;
 #if PLOW_DSA_IDX_QPW
 extern "C" __device__ unsigned plow_dsa_idx_qpw_arm = 1;
 #endif
-/* PLOW_DSA_IDX_FP8 — op 117 (32 heads) through d_index_score_pf_fp8: vLLM's FP8 indexer
- * arithmetic (e4m3 q/k with ue8m0 scales). CHANGES the scores (not bit-identical to bf16). */
-#ifndef PLOW_DSA_IDX_FP8
-#define PLOW_DSA_IDX_FP8 0
-#endif
-#if PLOW_DSA_IDX_FP8
-extern "C" __device__ unsigned plow_dsa_idx_fp8_arm = 1;
-#endif
 /* PLOW_HNR_ILP — HeadNormRope HD=128 interleaved (the DSA indexer q/k rope) through
  * d_headnorm_rope_ilp: four heads per wave iteration, bit-identical. */
 #ifndef PLOW_HNR_ILP
@@ -1131,10 +1123,6 @@ static_assert(GMPF_LDS_HALVES * sizeof(bf16) <= sizeof(((plow_smem*)nullptr)->ra
 static_assert(IDXPF_TILE_N_DEF * (128 + FA_PAD) * sizeof(bf16)
                   <= sizeof(((plow_smem*)nullptr)->raw),
               "IDXPF_TILE_N_DEF key slab does not fit the interpreter LDS arena — lower it");
-#endif
-#if PLOW_DSA_IDX_FP8
-static_assert(128u * (128u + 16u) + 128u * sizeof(float) <= sizeof(((plow_smem*)nullptr)->raw),
-              "d_index_score_pf_fp8 key slab does not fit the interpreter LDS arena");
 #endif
 #if PLOW_DSA_IDX_QPW
 static_assert(128u * (128 + FA_PAD) * sizeof(bf16) <= sizeof(((plow_smem*)nullptr)->raw),
@@ -4608,12 +4596,6 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             }
 #endif
             if (in->i[1] && in->i[1] != (unsigned)HI_) __builtin_trap();
-#if PLOW_DSA_IDX_FP8
-            d_index_score_pf_fp8<128u, 2, 16384u>(
-                (float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
-                (const int*)TEN(4), in->i[0], in->i[2], slice, nblk, (unsigned char*)sm->raw);
-            break;
-#endif
 #if PLOW_DSA_IDX_QPW
             d_index_score_pf_rowq<DI_, 128u, 2, 16384u>(
                 (float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
