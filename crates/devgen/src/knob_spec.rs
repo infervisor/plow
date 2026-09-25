@@ -128,6 +128,16 @@ const C_MLA_MHA: &[Constraint] = &[Constraint {
     check: Check::Site,
 }];
 
+const C_DECODE_SHARED_FOLD: &[Constraint] = &[Constraint {
+    id: "decode_shared_fold_contract",
+    formula: F::Implies(
+        &F::Atom("emit.glm_decode_shared_fold", Cmp::Eq, TRUE),
+        &F::Atom("emit.glm_moe_shared_fold", Cmp::Eq, TRUE),
+    ),
+    site: "crates/devgen/src/mla.rs: PLOW_GLM_DECODE_SHARED_FOLD requires PLOW_GLM_MOE_SHARED_FOLD on the grouped MXFP4 decode path",
+    check: Check::Site,
+}];
+
 const C_GLM_ROPE_BF16: &[Constraint] = &[Constraint {
     id: "glm_rope_bf16_contract",
     formula: F::Implies(
@@ -1099,6 +1109,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.glm_qkva_w8a8", Some("PLOW_GLM_QKVA_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_mla_w8a8", Some("PLOW_GLM_MLA_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.glm_mla_mha", Some("PLOW_GLM_MLA_MHA"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_MLA_MHA),
+    KnobSpec::new("emit.glm_decode_shared_fold", Some("PLOW_GLM_DECODE_SHARED_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_DECODE_SHARED_FOLD),
     KnobSpec::new("emit.glm_indexer_wq_w8a8", Some("PLOW_GLM_INDEXER_WQ_W8A8"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_INDEXER_WQ_W8A8),
     KnobSpec::new("emit.glm_indexer_fp8", Some("PLOW_GLM_INDEXER_FP8"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_INDEXER_FP8),
     KnobSpec::new("emit.glm_mla_bf16_ps", Some("PLOW_GLM_MLA_BF16_PS"), Layer::Emit, Domain::Bool, OFF, OPT_IN).with(C_MLA_BF16_PS),

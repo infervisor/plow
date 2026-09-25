@@ -816,6 +816,11 @@ mod tests {
             Site::Encoded("mla_mha_contract"),
         ),
         (
+            "mla.rs",
+            "PLOW_GLM_DECODE_SHARED_FOLD requires PLOW_GLM_MOE_SHARED_FOLD",
+            Site::Encoded("decode_shared_fold_contract"),
+        ),
+        (
             "emit_config.rs",
             "Runtime offload additionally requires PLOW_ANE_MLP=1",
             Site::NotAConstraint("doc: rt.ane_mlp gates the offload"),

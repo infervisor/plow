@@ -9250,6 +9250,14 @@ fn emit_glm_moe_ffn_rows(
     // make the two disagree about which allocation the pointers describe.
     let e_all = e + u32::from(glm_shared_fold(c, enc));
     let det = !flat && moe_pf_fuse(tk) == MoePfFuse::Det;
+    // PLOW_GLM_DECODE_SHARED_FOLD: route the shared expert as the constant tail slot here too
+    // (the prefill fold's router i[5]), so it runs A4W4 in the grouped ops like vLLM's routed
+    // path instead of the W4A16 GEMV pair, and its two decode packets disappear.
+    let dfold = emit_config::active().glm_decode_shared_fold;
+    assert!(!dfold || (glm_shared_fold(c, enc) && enc == MoeEnc::Mxfp4 && !flat && !det
+        && !emit_config::active().glm_routed_w8a8 && !emit_config::active().glm_shared_w8a8),
+        "PLOW_GLM_DECODE_SHARED_FOLD requires PLOW_GLM_MOE_SHARED_FOLD on the grouped MXFP4 decode path");
+    let (e_route, tk_route) = if dfold { (e_all, tk + 1) } else { (e, tk) };
     // PLOW_GLM_DECODE_GLUE_CUS: the top-k tail is block-per-token, so `rows` workgroups is
     // its saturation point (the prefill twin already sizes it so); the combine saturates at
     // one thread per element (`elem_cus`). Both are pure narrowings, bit-identical.
@@ -9276,6 +9284,7 @@ fn emit_glm_moe_ffn_rows(
         d.i[2] = tk;
         d.i[3] = GLM_ROUTER_FLAGS;
         d.i[4] = rows;
+        d.i[5] = u32::from(dfold);
         d.i[6] = c.n_group;
         d.i[7] = c.topk_group;
         d.f[0] = c.route_scale;
@@ -9290,14 +9299,16 @@ fn emit_glm_moe_ffn_rows(
             d.t[3] = n.row_partidx;
             d.t[4] = n.row_gate;
             d.i[0] = rows;
-            d.i[1] = e;
-            d.i[2] = tk;
+            d.i[1] = e_route;
+            d.i[2] = tk_route;
         })
     };
 
     // Shared expert at M = rows. The decode fused ops that cannot carry M (`DenseGluFp8Blk` is
     // i0=N) unfuse into their GEMV halves; the plain arm is `GemvGlu`, which takes M directly.
-    let c_shglu = if emit_config::active().glm_shared_w8a8 {
+    let c_shglu = if dfold {
+        c_routes
+    } else if emit_config::active().glm_shared_w8a8 {
         emit_glm_shared_w8a8_glu(b, &all, n, w, rows, h, imoe_l, c_rn2)
     } else if lin_fp8 {
         let gemv_half = |b: &mut Builder, out: u32, wt: u32, ws: u32| {
@@ -9389,7 +9400,9 @@ fn emit_glm_moe_ffn_rows(
             d.i[5] = GLM_ACT_SILU;
         })
     };
-    let c_shd = if emit_config::active().glm_shared_w8a8 {
+    let c_shd = if dfold {
+        c_shglu
+    } else if emit_config::active().glm_shared_w8a8 {
         emit_glm_shared_w8a8_down(b, &all, n, w, rows, h, imoe_l,
             if raw_output { n.attn } else { n.shared }, c_shglu)
     } else if lin_fp8 {
@@ -9466,7 +9479,7 @@ fn emit_glm_moe_ffn_rows(
             }
             d.i[0] = imoe_e;
             d.i[1] = h;
-            d.i[2] = e;
+            d.i[2] = e_route;
             d.i[MoeEnc::PREFILL_SLOT] = enc.code();
             d.i[5] = GLM_ACT_SILU;
         });
@@ -9483,7 +9496,7 @@ fn emit_glm_moe_ffn_rows(
             d.t[7] = n.row_gate;
             d.i[0] = h;
             d.i[1] = imoe_e;
-            d.i[2] = e;
+            d.i[2] = e_route;
             d.i[MoeEnc::PREFILL_SLOT] = enc.code();
             if det {
                 d.i[5] = tk.trailing_zeros() + 1;
@@ -9498,10 +9511,10 @@ fn emit_glm_moe_ffn_rows(
         let c_cmb = b.emit(DevOp::MoeCombinePf, combine_cus, &[c_shd, c_d], |d| {
             d.t[0] = n.dg_tp;
             d.t[1] = TENSOR_NONE; // residual rides AFTER the all-reduce (else summed tp times)
-            d.t[2] = if raw_output { n.attn } else { n.shared };
+            d.t[2] = if dfold { TENSOR_NONE } else if raw_output { n.attn } else { n.shared };
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if det || flat || routed_w8a8 { 1 } else { tk };
+            d.i[1] = if det || flat || routed_w8a8 { 1 } else { tk_route };
             d.i[2] = rows;
             d.i[3] = 0;
             d.i[4] = u32::from(det);
@@ -9549,10 +9562,10 @@ fn emit_glm_moe_ffn_rows(
         b.emit(DevOp::MoeCombinePf, all.clone(), &[c_shd, c_d], |d| {
             d.t[0] = if raw_output { n.attn } else { x_out };
             d.t[1] = if raw_output { TENSOR_NONE } else { n.xmid };
-            d.t[2] = n.shared;
+            d.t[2] = if dfold { TENSOR_NONE } else { n.shared };
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if det || flat || routed_w8a8 { 1 } else { tk };
+            d.i[1] = if det || flat || routed_w8a8 { 1 } else { tk_route };
             d.i[2] = rows;
             d.i[3] = 0;
             d.i[4] = u32::from(det);
