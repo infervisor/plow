@@ -63,10 +63,11 @@ i.e. prefix-cache hits / continuation chunks); `PLOW_AMD_DECODE_MIN_RUNG=1` for 
 | + MLA MHA form (v5/v8) | 172 | 208 | 308–323 | 538 | 1043–1053 |
 | + XR sched 40 + GEMM DMA | 159 | ~194 | 280 | 483 | 929–942 |
 | + MoE stage-1 pipe (best3) | 144 | 172 | 246 | 405–422 | 811–823 |
-| + NORM_Q128 (v8b) | see below | | | | |
+| + decode fold, kw GLU, NORM_Q128 (v8b/best8) | 142.7–144.1 | 170.8–170.9 | 245.9–246.5 | 421.1–421.7 | 823–824 |
 
-Decode (8 identical prompts, ctx 1k, ms/step): M1 50 -> 42.5, M8 102/87 -> 57.7, M64 205 -> 119.5,
-M128 -> 184 (v7/best8). Levers: comboA decode knobs + GEMV_MFMA4 (-21% M64), K-split qkv_a GEMM +
+Decode (8 identical prompts, ctx 1k; v8b/best8, ms/step, 2 rounds): M1 41.3–45.9 ms/token,
+M2 51.6–73.5, M4 51.1–54.0, M8 53.6–56.6, M16 61.1–64.6, M32 85.1–85.3, M64 120.2–120.4, M128 181.4
+(start of campaign: M1 ~50–87, M8 87–103, M64 205). Batched M8 at ctx 8k: 58.7 ms/step. Levers: comboA decode knobs + GEMV_MFMA4 (-21% M64), K-split qkv_a GEMM +
 merge unroll (-9%), decode shared fold (-6% M8, -16% M64), kw decode GLU (-5..-16%).
 
 ## vs vLLM 0.29 (same `vllm bench serve` client, random in8064/out128, temperature 0)
@@ -74,8 +75,9 @@ merge unroll (-9%), decode shared fold (-6% M8, -16% M64), kw decode GLU (-5..-1
 | | TTFT mean | TPOT mean | total tok/s |
 |---|---|---|---|
 | vLLM c8 | 15.57 s | 34.9 ms | 3268 |
-| plow best8 c8 | 2.67 s | 82.2 ms | 4920 |
-| plow best8 c1 | 0.41 s | 43.6 ms | — |
+| plow v8b/best8 c8 | 2.07 s | 75.1 ms | 5551 |
+| plow v8b/best8 c1 (in8064) | 0.43 s | 43.0 ms | 1392 |
+| plow v8b/best8 c1 (in1024) | 0.32 s | 45.8 ms | 188 |
 
 Logits vs vLLM oracle (last prompt position, T1024–T8192): top-1 match 4/4, KL(vLLM||plow)
 8.5e-5 / 6e-6 / 2.7e-7 / 2.8e-8 (MHA form). Smoke "capital of France" -> " Paris".
