@@ -142,7 +142,8 @@ PLOW_GEMMA4_SM90_W8A8_GEMM_GLU_ROLE = "0"
 [serve.env]
 PLOW_PREFIX_CACHE = "0"
 PLOW_PF_SEG_PURE = "fp8"
-PLOW_PF_SEG_FA512 = "1"
+# "all": see gemma4-26b-a4b.h100.fp8-ctx16k.toml (hd256 flash off the fat object).
+PLOW_PF_SEG_FA512 = "all"
 PLOW_PF_INTERLEAVE = "0"
 PLOW_LIBCUDA = "/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07"
 LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
