@@ -69,21 +69,23 @@ case "${PLOW_XR_SCHED:-twoshot}" in
          [ -n "${PLOW_XR_SCHED_NWG_SAG:-}" ] && A4W4_BK="$A4W4_BK -DPLOW_XR_SCHED_NWG_SAG=$PLOW_XR_SCHED_NWG_SAG" ;;
   *) echo "PLOW_XR_SCHED must be aiter or twoshot" >&2; exit 2 ;;
 esac
+# Decode-object arms (appended to DEC below; A4W4_BK reaches only the prefill MoE object).
+DEC_KNOBS=""
 case "${PLOW_FP8_BLK_KW:-0}" in
   0) ;;
-  1) A4W4_BK="$A4W4_BK -DPLOW_FP8_BLK_KW=1" ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_FP8_BLK_KW=1" ;;
   *) echo "PLOW_FP8_BLK_KW must be 0 or 1" >&2; exit 2 ;;
 esac
 # FA_MERGE_UNROLL4=1: four splits in flight in d_flash_merge (gfx942's form; gfx950 kept the serial
 # merge for bit-identity). Decode's 64-split merge is a dependent-load chain without it.
 case "${PLOW_GEMV_F32_COL:-0}" in
   0) ;;
-  1) A4W4_BK="$A4W4_BK -DPLOW_GEMV_F32_COL=1" ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DPLOW_GEMV_F32_COL=1" ;;
   *) echo "PLOW_GEMV_F32_COL must be 0 or 1" >&2; exit 2 ;;
 esac
 case "${PLOW_MERGE_UNROLL4:-0}" in
   0) ;;
-  1) A4W4_BK="$A4W4_BK -DFA_MERGE_UNROLL4=1" ;;
+  1) DEC_KNOBS="$DEC_KNOBS -DFA_MERGE_UNROLL4=1" ;;
   *) echo "PLOW_MERGE_UNROLL4 must be 0 or 1" >&2; exit 2 ;;
 esac
 case "${PLOW_FP8_BLK_DMA:-0}" in
@@ -601,7 +603,7 @@ fi
 WALK="${PLOW_GEMV_WALK:-0}"
 # Every DECODE object AND its register check must carry the same bucket, or the cliff gate
 # validates an object that is not the one that ships.
-DEC="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM -DPLOW_GEMV_WALK=$WALK"
+DEC="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM -DPLOW_GEMV_WALK=$WALK $DEC_KNOBS"
 case "${PLOW_GEMV_MFMA4:-0}" in
   0) ;;
   1) DEC="$DEC -DGV_MFMA4=1" ;;
