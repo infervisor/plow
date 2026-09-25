@@ -2350,6 +2350,9 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
  * quantization error here is common-mode across all `n_head` heads rather than confined to one.
  * That is a reason to MEASURE this family separately from the dense one, not a reason it cannot
  * work; the numbers are in perf-data/mla-fp8-kv.md. */
+#ifndef PLOW_MLA_DEC_MINPER
+#define PLOW_MLA_DEC_MINPER 0
+#endif
 template <int DK, int DR, int GF, bool GATHER = false, bool FP8 = false>
 __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                    const bf16* __restrict__ Qabs, const bf16* __restrict__ Qrope,
@@ -2404,10 +2407,21 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
         const unsigned tk_live = GATHER ? (top_k < len ? top_k : len) : 0u;
         const unsigned first = GATHER ? 0u : ((window && cend > window) ? (cend - window) : 0u);
         const unsigned span = GATHER ? tk_live : (cend - first);
-        const unsigned per = (span + nsplit - 1) / nsplit;
-        const unsigned lo = first + sp * per;
-        const unsigned hi = GATHER ? (lo + per < tk_live ? lo + per : tk_live)
-                                   : (lo + per < cend ? lo + per : cend);
+        /* PLOW_MLA_DEC_MINPER: the packet's nsplit is sized for the longest context; at a short
+         * live span it cut the window into slivers (64 splits of 16 rows at 1k) whose fixed cost
+         * dominated. Use at least MINPER rows per split; the splits past the live count keep an
+         * empty range, which already writes the zero partial and m = -inf the merge expects. */
+#if PLOW_MLA_DEC_MINPER > 0
+        const unsigned ns_live = (span + PLOW_MLA_DEC_MINPER - 1) / PLOW_MLA_DEC_MINPER;
+        const unsigned ns_eff = ns_live < 1u ? 1u : (ns_live < nsplit ? ns_live : nsplit);
+#else
+        const unsigned ns_eff = nsplit;
+#endif
+        const unsigned per = (span + ns_eff - 1) / ns_eff;
+        const unsigned lo0 = first + sp * per;
+        const unsigned hi = GATHER ? (lo0 + per < tk_live ? lo0 + per : tk_live)
+                                   : (lo0 + per < cend ? lo0 + per : cend);
+        const unsigned lo = lo0 < hi ? lo0 : hi;
 
         /* ONE latent "head": the cache base is just this batch's latent block. */
         const auto* cbase = as_glob(Ckv) + (size_t)b * kv_stride * DK;
