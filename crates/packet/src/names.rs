@@ -71,23 +71,37 @@ pub fn is_runtime_tensor(name: &str) -> bool {
 /// after packing the experts — no checkpoint contains them. `bind_packed_experts` /
 /// `bind_dense_ffn_tables` fill them once packing is done.
 ///
-/// Suffix-matched, not prefix-matched, precisely because the model prefix in front of them is
-/// whatever the checkpoint uses.
+/// Matched on the LAST COMPONENT ALONE, not on `mlp.<table>`.
+///
+/// The FFN's own component name is the checkpoint's to choose just as the model prefix is: GLM,
+/// DeepSeek-V3 and Kimi spell it `mlp.`, DeepSeek-V4.1 spells it `ffn.`. Requiring `mlp.` here sent
+/// `layers.0.ffn.expert_weight_table` down the checkpoint path, where the preflight refused it as
+/// a MISSING WEIGHT -- correctly, since no checkpoint has one; the name was simply not recognised
+/// as host-filled. No checkpoint carries a tensor whose last component is one of these, so the
+/// component is the whole signal and the prefix in front of it is free.
 pub fn is_host_filled_table(name: &str) -> bool {
-    name.ends_with("mlp.expert_weight_table")
-        || name.ends_with("mlp.expert_scale_table")
-        || name.ends_with("mlp.expert_weight_table_moe2")
-        || name.ends_with("mlp.expert_scale_table_moe2")
-        || name.ends_with("mlp.dense_weight_table")
-        || name.ends_with("mlp.dense_scale_table")
-        // PLOW_GLM_MOE_SHARED_FOLD's spelling of the same pair: one entry longer, the last one
-        // pointing at the SHARED expert packed into the routed slab. Still host addresses.
-        || name.ends_with("mlp.expert_weight_table_sf")
-        || name.ends_with("mlp.expert_scale_table_sf")
-        // The PRESHUFFLED twin of expert_weight_table (PLOW_MOE_PF_SHUF): points into a second
-        // packed slab whose per-projection layout is [K/64][R][64] so the grouped prefill GEMM's
-        // B stream is contiguous per k-tile. Host-computed addresses, no checkpoint bytes.
-        || name.ends_with("mlp.expert_weight_table_pf")
+    let table = name.rsplit('.').next().unwrap_or(name);
+    matches!(
+        table,
+        "expert_weight_table"
+            | "expert_scale_table"
+            | "expert_weight_table_moe2"
+            | "expert_scale_table_moe2"
+            | "dense_weight_table"
+            | "dense_scale_table"
+            // PLOW_GLM_MOE_SHARED_FOLD's spelling of the same pair: one entry longer, the last one
+            // pointing at the SHARED expert packed into the routed slab. Still host addresses.
+            | "expert_weight_table_sf"
+            | "expert_scale_table_sf"
+            // The PRESHUFFLED twin of expert_weight_table (PLOW_MOE_PF_SHUF): points into a second
+            // packed slab whose per-projection layout is [K/64][R][64] so the grouped prefill
+            // GEMM's B stream is contiguous per k-tile. Host addresses, no checkpoint bytes.
+            | "expert_weight_table_pf"
+            // EP's spelling, which the loader also resolves by suffix
+            // (`bind_packed_experts`: `strip_suffix("expert_weight_table_ep")`).
+            | "expert_weight_table_ep"
+            | "expert_scale_table_ep"
+    )
 }
 
 /// True when this declared tensor's bytes must come from the checkpoint.
@@ -185,5 +199,56 @@ mod tests {
         assert!(is_checkpoint_weight(
             "model.layers.3.mlp.experts.0.down_proj.weight"
         ));
+    }
+}
+
+#[cfg(test)]
+mod host_filled_table_tests {
+    use super::*;
+
+    /// The FFN's component name belongs to the checkpoint, not to this rule.
+    ///
+    /// `mlp.` is GLM's, DeepSeek-V3's and Kimi's; DeepSeek-V4.1 writes `ffn.`. When this matched
+    /// `mlp.<table>` the V4.1 spelling fell through to the checkpoint path and the loader refused
+    /// `layers.0.ffn.expert_weight_table` as a MISSING WEIGHT -- which it is, in every checkpoint,
+    /// because it is an array of device addresses the host computes after packing the experts.
+    #[test]
+    fn the_table_is_recognised_under_any_ffn_component_name() {
+        for base in ["mlp", "ffn", "block_sparse_moe", "feed_forward"] {
+            for table in [
+                "expert_weight_table",
+                "expert_scale_table",
+                "expert_weight_table_sf",
+                "expert_scale_table_sf",
+                "expert_weight_table_moe2",
+                "expert_scale_table_moe2",
+                "expert_weight_table_pf",
+                "expert_weight_table_ep",
+                "expert_scale_table_ep",
+                "dense_weight_table",
+                "dense_scale_table",
+            ] {
+                let n = format!("model.layers.7.{base}.{table}");
+                assert!(is_host_filled_table(&n), "{n} is host-filled");
+                assert!(
+                    !is_checkpoint_weight(&n),
+                    "{n} must not be asked of the checkpoint"
+                );
+            }
+        }
+    }
+
+    /// And REAL weights under the same components are still the checkpoint's.
+    #[test]
+    fn ordinary_expert_weights_are_still_checkpoint_weights() {
+        for n in [
+            "layers.0.ffn.experts.3.w1.weight",
+            "layers.0.ffn.shared_experts.w2.scale",
+            "model.layers.0.mlp.experts.3.gate_proj.weight",
+            "layers.0.attn.wq_b.weight",
+        ] {
+            assert!(!is_host_filled_table(n), "{n} is a real weight");
+            assert!(is_checkpoint_weight(n), "{n} comes from the checkpoint");
+        }
     }
 }

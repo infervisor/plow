@@ -533,6 +533,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.trace_allranks", Some("PLOW_TRACE_ALLRANKS"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.attnres_f32mix_grid", Some("PLOW_ATTNRES_F32MIX_GRID"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.moe_prefill_ep_max_extra_bytes", Some("PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES"), Layer::Runtime, USIZE, UNSET, DIAG),
+    KnobSpec::new("rt.moe_ep_cuts", Some("PLOW_MOE_EP_CUTS"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.phase_objects", Some("PLOW_PHASE_OBJECTS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.live_ctx", Some("PLOW_LIVE_CTX"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.vmm_kv", Some("PLOW_VMM_KV"), Layer::Runtime, Domain::Bool, UNSET, OPT_IN),

@@ -302,6 +302,7 @@ fn moe(nn: &mut Nn, cfg: &GlmConfig, layer: u32, p: &str, x: TensorId) -> Tensor
         },
         cfg.norm_topk_prob,
         cfg.routed_scaling_factor,
+        crate::op::MoeScoring::Sigmoid,
     );
 
     let mut routed_experts = Vec::with_capacity(cfg.n_routed_experts as usize);

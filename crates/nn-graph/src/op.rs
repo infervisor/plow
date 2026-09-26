@@ -282,6 +282,45 @@ pub enum Op {
     /// (measured 3.0e-3 at the block output against 8.1e-1 at the mix itself),
     /// so a graph that used `Add` here would look right and be wrong.
     BlockResidual { max_snapshots: u32 },
+
+    /// DeepSeek-V4.1's mHC coefficients: one projection of the flattened
+    /// `hc_mult`-copy residual stream, split into the `pre`, `post` and `comb`
+    /// mixes, with `comb` made doubly stochastic by `sinkhorn_iters` Sinkhorn
+    /// iterations.
+    ///
+    /// Inputs `[x, hc_fn, hc_scale, hc_base]`, where `x` is `[.., hc_mult, H]`.
+    /// Output is `[.., (2 + hc_mult) * hc_mult]`: `pre` at `[0, hc_mult)`,
+    /// `post` at `[hc_mult, 2*hc_mult)`, and the flattened `[hc_mult, hc_mult]`
+    /// `comb` after that. Packed rather than three ops because the reference
+    /// produces all three from ONE `F.linear` and one Sinkhorn
+    /// (`inference/model.py:948`), and splitting them would invite an emitter
+    /// to compute the projection three times.
+    HcMixes {
+        hc_mult: u32,
+        sinkhorn_iters: u32,
+        eps: f32,
+    },
+
+    /// Collapse the `hc_mult` residual copies into one sublayer input:
+    /// `sum_c pre[c] * x[c]`. Inputs `[x, pre_mix]` with `x` `[.., hc_mult, H]`
+    /// and `pre_mix` `[.., hc_mult]`; output `[.., H]`.
+    ///
+    /// `pre_mix` is a SEPARATE input rather than being read from this layer's
+    /// own [`Op::HcMixes`] because V4.1's mHC is single-pass: the mix a
+    /// sublayer computes is used by the NEXT sublayer, and this one consumes
+    /// what the previous sublayer produced (`inference/model.py:968-995`). A
+    /// same-sublayer wiring is a different function that still runs.
+    HcPre { hc_mult: u32 },
+
+    /// Expand a sublayer output back to `hc_mult` copies and mix the residual
+    /// in: `post[c] * x + sum_d comb[c][d] * residual[d]`.
+    ///
+    /// Inputs `[x, residual, post_mix, comb_mix]` with `x` `[.., H]`,
+    /// `residual` `[.., hc_mult, H]`; output `[.., hc_mult, H]`.
+    ///
+    /// This REPLACES the plain residual add, which is why none of the
+    /// `residual*-norm` fusion rules can fire on a V4.1 block.
+    HcPost { hc_mult: u32 },
 }
 
 /// DeepSeek `noaux_tc` group-limited expert routing.
@@ -297,10 +336,20 @@ pub struct MoeGroups {
     pub topk_group: u32,
 }
 
+/// How a router turns logits into expert scores.
+///
+/// This is not cosmetic: the scores are what the top-k weights are read from,
+/// so a router scored with the wrong function selects plausible experts and
+/// weights them wrongly. `noaux_tc` routing does NOT imply sigmoid — DeepSeek
+/// V3 and Kimi are sigmoid, DeepSeek V4/V4.1 are `sqrtsoftplus` — which is why
+/// this rides on [`Op::MoeRouter`] rather than being implied by `group`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MoeScoring {
     Softmax,
     Sigmoid,
+    /// `sqrt(softplus(logits))`, DeepSeek V4 and V4.1 (`scoring_func:
+    /// "sqrtsoftplus"`). Unbounded above, unlike sigmoid.
+    SqrtSoftplus,
 }
 
 /// Which linear-attention recurrence [`Op::LinearAttention`] carries.
@@ -353,6 +402,9 @@ impl Op {
             Op::LinearAttention { .. } => "linear_attention",
             Op::SituGlu { .. } => "situ_glu",
             Op::BlockResidual { .. } => "block_residual",
+            Op::HcMixes { .. } => "hc_mixes",
+            Op::HcPre { .. } => "hc_pre",
+            Op::HcPost { .. } => "hc_post",
         }
     }
 }

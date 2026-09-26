@@ -5,6 +5,19 @@ struct RouteEntry {
     float gate;
 };
 
+/* The gathered-row TILE HEIGHT, which must equal the consumer's. `rowoff[e]` and `tilep[e]` are
+ * read back as `rowbase = rowoff[e] + (mt - tilep[e]) * <tile height>`, so a mismatch does not
+ * degrade -- it addresses another expert's rows and multiplies the tile count by the ratio.
+ *
+ * 64 is the gfx950 lean stage-1/stage-2 pair's tile. When the consumer is instead the ordinary
+ * interpreter GEMM (`d_moe_group_pf_a4w4`, the gfx942 path), the value is that object's MPF_BM
+ * and the build passes the same -DMPF_BM it passes the interpreter row. */
+#ifndef MPF_BM
+#define MPF_BM 64u
+#endif
+static_assert(MPF_BM >= 16u && (MPF_BM & (MPF_BM - 1u)) == 0u,
+              "the gathered-row tile height must be a power of two");
+
 extern "C" __device__ unsigned plow_moe_ep_filter_align_abi_1 = 1;
 extern "C" __device__ unsigned plow_moe_ep_filter_align_wave64_1 = 1;
 extern "C" __device__ unsigned plow_moe_ep_filter_align_stable_1 = 1;
@@ -67,7 +80,7 @@ void plow_moe_ep_filter_align_gfx950(
                 total += n;
             }
             count[e] = total;
-            tiles += (total + 63u) / 64u;
+            tiles += (total + (MPF_BM - 1u)) / MPF_BM;
         }
         scratch[tid] = tiles;
         __syncthreads();
@@ -80,15 +93,15 @@ void plow_moe_ep_filter_align_gfx950(
         unsigned prefix = tid == 0 ? 0u : scratch[tid - 1u];
         for (unsigned e = begin; e < end; ++e) {
             tilep[e] = prefix;
-            rowoff[e] = prefix * 64u;
-            prefix += (count[e] + 63u) / 64u;
+            rowoff[e] = prefix * MPF_BM;
+            prefix += (count[e] + (MPF_BM - 1u)) / MPF_BM;
         }
         if (tid == blockDim.x - 1u)
-            tilep[experts] = scratch[tid] * 64u <= row_capacity ? scratch[tid] : ~0u;
+            tilep[experts] = scratch[tid] * MPF_BM <= row_capacity ? scratch[tid] : ~0u;
         return;
     }
     if (tilep[experts] == ~0u) return;
-    const unsigned rows = tilep[experts] * 64u;
+    const unsigned rows = tilep[experts] * MPF_BM;
     if (phase == 3u) {
         for (unsigned row = slice * blockDim.x + tid; row < rows;
              row += npart * blockDim.x) {

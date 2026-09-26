@@ -316,6 +316,24 @@ extern "C" __device__ unsigned plow_dsa_prep_arm = 1;
 #include "op_moe.h"
 #if PLOW_CDNA4 && (PLOW_HAS_MOE_GLU_FP8_BLOCK128 || PLOW_HAS_MOE_QUANT_FP8_BLOCK128 || PLOW_HAS_MOE_DOWN_FP8_BLOCK128)
 #include "op_moe_fp8_block128.h"
+#if PLOW_DSV41_ENGRAM
+#include "op_engram.h"
+/* CONDITIONALLY compiled, like plow_dsv4_csa2_arm: without the axis there is no case for op
+ * 182 and an Engram packet would fall through the switch, leaving the residual stream with no
+ * memory contribution and no fault anywhere. The loader refuses on the missing symbol. */
+extern "C" __device__ unsigned plow_dsv41_engram_arm = 1;
+#endif
+/* No #include: `d_gemm_fp8_mx` lives in op_gemm_common.h, which this file already pulls in via
+ * op_gemm.h. Only the marker and the case are conditional, so the axis-off object is unchanged. */
+#if PLOW_DSV41_BLKFP8
+extern "C" __device__ unsigned plow_dsv41_blkfp8_arm = 1;
+#endif
+#if PLOW_DSV4_CSA2
+#include "op_compress.h"
+/* CONDITIONALLY compiled, like PLOW_MOE_PF_ATOMIC's marker and unlike the unconditional
+ * part16/a8 ones: an object built without the axis has no case for ops 194/195 at all, so a
+ * CSA2 packet would fall through the switch. The loader refuses on the missing symbol instead. */
+extern "C" __device__ unsigned plow_dsv4_csa2_arm = 1;
 #endif
 #if PLOW_TOKEN_BATCH
 /* Placed here, not at the axis definition: PLOW_FP8 and friends are resolved by the op headers
@@ -849,6 +867,21 @@ extern "C" __device__ unsigned plow_prefill_nrn_consumer_1 = 1;
  * PLOW_GQ_BATCH must stay 1: claiming >1 packet per fetch-add starves parallelism (a K-wide batch is
  * drained by only n_cu/K workgroups), measured 6-8x slower at K=8. The knob exists only to document
  * that dead end; do not raise it. */
+/* DeepSeek-V4 CSA2 (ops 194/195). Own flag for the same reason PLOW_MOE_PREFILL has one: the
+ * compressor is a second pooling body with its own LDS staging, and nothing but a V4 object can
+ * reach it. Off => every existing object is byte-identical. */
+#ifndef PLOW_DSV4_CSA2
+#define PLOW_DSV4_CSA2 0
+#endif
+/* DeepSeek-V4.1 Engram (op 196). Its own flag rather than riding PLOW_DSV4_CSA2: a model can
+ * have CSA2 without Engram (V4 does), and only two layers of V4.1 carry a table. Off => every
+ * existing object is byte-identical. */
+#ifndef PLOW_DSV41_BLKFP8
+#define PLOW_DSV41_BLKFP8 0
+#endif
+#ifndef PLOW_DSV41_ENGRAM
+#define PLOW_DSV41_ENGRAM 0
+#endif
 #ifndef PLOW_GLOBAL_QUEUE
 #define PLOW_GLOBAL_QUEUE 0
 #endif
@@ -2314,41 +2347,81 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
     if (in->op == PLOW_DOP_FLASH_MLA_PREFILL && in->t[7] != PLOW_TENSOR_NONE) __builtin_trap();
     /* The expanded (MHA) form lives in the flash object only (mla_mha_pf.h). */
     if (in->op == PLOW_DOP_FLASH_MLA_PREFILL && ((in->i[6] >> 9) & 1u)) __builtin_trap();
+    /* i[7] = WRITE-ONLY OUTPUT SPLIT: low 8 bits the split index this call fills, next 8 the
+     * total. Absent (0) on every existing emission and read as the shipped one-partial layout.
+     * DeepSeek-V4.1 emits (2 << 8) | 0 on op 51 and (2 << 8) | 1 on op 55: one window pass and
+     * one gathered pass into disjoint halves of one partial pair, combined by a single
+     * FLASH_MERGE at nsplit 2 -- which is `Attention.forward`'s ONE `sparse_attn` over
+     * `cat([window_kv, compress_kv])` with the sink added once, without materialising the
+     * concatenation. */
+    const unsigned osp0 = in->i[7] & 0xffu;
+    const unsigned ons = (in->i[7] >> 8) & 0xffu;
     if (in->op == PLOW_DOP_FLASH_GATHER_PREFILL) {
+#if PLOW_FA_GATHER_MFMA
+        /* NoPE only: V4.1's compressed pass is the sole gathered emit and it is DR=0 (i3 bit 31),
+         * so the MFMA body's rope addendum has no caller to validate it. */
+        if (nope)
+            d_flash_gather_prefill_mfma<512, 0>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), (const int*)TEN(7),
+                in->i[6], in->i[0], in->i[4], in->i[1], in->i[2], in->fj[0].f, in->i[5], slice,
+                nblk, lds, ons, osp0);
+        else
+#endif
         if (nope && gf == 2)
             d_flash_gather_prefill<512, 0, 2>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), (const int*)TEN(7),
                 in->i[6], in->i[0], in->i[4], in->i[1], in->i[2], in->fj[0].f, in->i[5], slice,
-                nblk, lds);
-        else if (nope)
-            d_flash_gather_prefill<512, 0, 4>(
-                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
-                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), (const int*)TEN(7),
-                in->i[6], in->i[0], in->i[4], in->i[1], in->i[2], in->fj[0].f, in->i[5], slice,
-                nblk, lds);
+                nblk, lds, ons, osp0);
+        else if (nope) {
+            /* GF must divide n_head -- n_grp = n_head/GF, and a zero group count silently does no
+             * work. At the default 4 the first arm is a compile-time false and costs nothing. */
+            if (PLOW_FA_GATHER_GF != 4 && (in->i[1] % PLOW_FA_GATHER_GF) == 0)
+                d_flash_gather_prefill<512, 0, PLOW_FA_GATHER_GF>(
+                    (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                    (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6),
+                    (const int*)TEN(7), in->i[6], in->i[0], in->i[4], in->i[1], in->i[2],
+                    in->fj[0].f, in->i[5], slice, nblk, lds, ons, osp0);
+            else
+                d_flash_gather_prefill<512, 0, 4>(
+                    (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                    (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6),
+                    (const int*)TEN(7), in->i[6], in->i[0], in->i[4], in->i[1], in->i[2],
+                    in->fj[0].f, in->i[5], slice, nblk, lds, ons, osp0);
+        }
         else if (gf == 2)
             d_flash_gather_prefill<512, 64, 2>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), (const int*)TEN(7),
                 in->i[6], in->i[0], in->i[4], in->i[1], in->i[2], in->fj[0].f, in->i[5], slice,
-                nblk, lds);
+                nblk, lds, ons, osp0);
         else
             d_flash_gather_prefill<512, 64, 4>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), (const int*)TEN(7),
                 in->i[6], in->i[0], in->i[4], in->i[1], in->i[2], in->fj[0].f, in->i[5], slice,
-                nblk, lds);
+                nblk, lds, ons, osp0);
     } else {
 #if PLOW_MLA_PF_MFMA
         /* Dense only. The gathered arm above keeps the scalar body: its top_k set is per
          * QUERY, so a tile of query rows shares no KV range to stage. */
-        if (!nope && mla_pf_tiled_fills(in->i[0], in->i[4], in->i[1], nblk)) {
-            d_flash_mla_prefill_mfma<512, 64, /*FP8=*/false>(
-                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
-                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0],
-                in->i[4], in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk,
-                lds, nullptr, 0);
+        /* The arm carries out_nsplit/out_sp0 now, so a split packet writes its own half rather
+         * than the other one's. PLOW_MLA_PF_MFMA_SPLIT=0 restores the scalar dense body. */
+        if ((!ons || PLOW_MLA_PF_MFMA_SPLIT)
+            && mla_pf_tiled_fills(in->i[0], in->i[4], in->i[1], nblk)) {
+            if (nope)
+                d_flash_mla_prefill_mfma<512, 0, /*FP8=*/false>(
+                    (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                    (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0],
+                    in->i[4], in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk,
+                    lds, nullptr, 0, ons, osp0);
+            else
+                d_flash_mla_prefill_mfma<512, 64, /*FP8=*/false>(
+                    (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                    (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0],
+                    in->i[4], in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk,
+                    lds, nullptr, 0, ons, osp0);
             return;
         }
 #endif
@@ -2356,22 +2429,22 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
             d_flash_mla_prefill<512, 0, 2>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[4],
-                in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk, lds);
+                in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk, lds, ons, osp0);
         else if (nope)
             d_flash_mla_prefill<512, 0, 4>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[4],
-                in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk, lds);
+                in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk, lds, ons, osp0);
         else if (gf == 2)
             d_flash_mla_prefill<512, 64, 2>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[4],
-                in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk, lds);
+                in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk, lds, ons, osp0);
         else
             d_flash_mla_prefill<512, 64, 4>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[4],
-                in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk, lds);
+                in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk, lds, ons, osp0);
     }
 #undef TEN
 }
@@ -2859,6 +2932,28 @@ __device__ __forceinline__ void exec_gemm_fp8_blk(CInst in, CTens T, unsigned sl
                    (const float*)TEN(3), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
 #undef TEN
 }
+
+/* DeepSeek-V4.1's [32,32] ue8m0 twin of the above. The SCALE OPERAND TYPE is the whole reason
+ * this is a separate opcode and not a field on 107: `const unsigned char*` here against
+ * `const float*` there, over a grid blocked 32 rather than 128 on BOTH axes. Its tile is
+ * 128x128x32, so its LDS (2*(128+128)*32 halves = 32 KiB) is HALF op 107's and well under the
+ * arena, and it measured 136 VGPR / 0 spill / occupancy 3 against 107's 160 / occupancy 2 -- so
+ * it cannot move the worst case this switch already sets. */
+#if PLOW_DSV41_BLKFP8
+__device__ __forceinline__ void exec_gemm_fp8_mx(CInst in, CTens T, unsigned slice, unsigned nblk,
+                                                 bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    /* i4 = a_row0, i5 = c_row0, the same free pointer arithmetic exec_gemm documents: disjoint
+     * row bands over the same tiles give bit-identical sums, which is what lets a banded TP seam
+     * start band 0's all-reduce while bands 1..K-1 are still in this GEMM. The scale grid is
+     * indexed by N and K only, so it does NOT move with the rows. */
+    d_gemm_fp8_mx((bf16*)TEN(0) + (size_t)in->i[5] * in->i[1],
+                  (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                  (const unsigned char*)TEN(2), (const unsigned char*)TEN(3), in->i[0], in->i[1],
+                  in->i[2], slice, nblk, lds);
+#undef TEN
+}
+#endif /* PLOW_DSV41_BLKFP8 */
 #endif /* PLOW_BUCKET_PREFILL */
 
 /* RESTORE THE SCALAR PROMISE ACROSS THE CALL BOUNDARY.
@@ -3126,18 +3221,32 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * masked off. i6 keeps its dense meaning (low 8 bits = causal KV-split ns) except
          * on the GATHER arm, where it is `cap`, disambiguated by t7 as in the DR=64 chain. */
         if (in->t[7] != PLOW_TENSOR_NONE)
-            d_flash_mla_prefill_v2<512, 0, /*GATHER=*/true>(
+            /* i7 = (gather_split << 16) | (out_nsplit << 8) | out_sp0, the low two bytes being
+             * the encoding op 55 carries. The gathered half occupies partials
+             * out_sp0 .. out_sp0+gather_split-1, so out_nsplit is 1 + gather_split. */
+            d_flash_mla_prefill_v2<512, 0, /*GATHER=*/true, /*FP8=*/false,
+                                   /*SPLITOUT=*/true>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), nullptr,
                 (const bf16*)TEN(4), nullptr, (const int*)TEN(6), in->i[0], in->i[4],
                 in->i[1], in->i[2], in->i[3] & 0x7fffffffu, in->fj[0].f, in->i[5], slice,
-                nblk, sm->fa, (const unsigned char*)TEN(7), in->i[6]);
+                nblk, sm->fa, (const unsigned char*)TEN(7), in->i[6],
+                ((in->i[7] >> 16) & 0xffu) ? ((in->i[7] >> 16) & 0xffu) : 1u, false, nullptr,
+                0u, (in->i[7] >> 8) & 0xffu, in->i[7] & 0xffu);
         else
-            d_flash_mla_prefill_v2<512, 0>(
+            /* i7 CARRIES HERE TOO. The 8-wave dense bodies have always honoured the
+             * write-only output split, so a V4.1 packet routed to THIS object must as
+             * well: its windowed half is partial 0 of 2 and its gathered half partial 1,
+             * and a body that writes the un-split layout puts the window rows where the
+             * merge expects neither. Not a trap and not a crash -- a wrong answer that
+             * still looks like attention. */
+            d_flash_mla_prefill_v2<512, 0, /*GATHER=*/false, /*FP8=*/false,
+                                   /*SPLITOUT=*/true>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), nullptr,
                 (const bf16*)TEN(4), nullptr, (const int*)TEN(6), in->i[0], in->i[4],
                 in->i[1], in->i[2], in->i[3] & 0x7fffffffu, in->fj[0].f, in->i[5], slice,
                 nblk, sm->fa, nullptr, 0u, (in->i[6] & 0xffu) ? (in->i[6] & 0xffu) : 1u,
-                ((in->i[6] >> 8) & 1u) != 0u);
+                ((in->i[6] >> 8) & 1u) != 0u, nullptr, 0u,
+                (in->i[7] >> 8) & 0xffu, in->i[7] & 0xffu);
 #undef TEN
     } else
 #endif
@@ -3908,7 +4017,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             d_hyperconn_pre((float*)TEN(0), (float*)TEN(1), (bf16*)TEN(2), (const float*)TEN(3),
                             (const bf16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6),
                             in->i[0], in->i[1], in->i[2], in->i[3], in->fj[0].f, in->fj[1].f, slice,
-                            nblk, sm->part);
+                            nblk, sm->part, false, (float*)TEN(7), in->i[4], in->i[5]);
             break;
         case PLOW_DOP_HYPER_CONN_POST:
             d_hyperconn_post((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
@@ -4162,6 +4271,67 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             break;
 #endif /* PLOW_HAS_MLA_OUT_GATE */
 #endif /* PLOW_K3 */
+#if PLOW_DSV4_CSA2
+        /* CSA2 (DeepSeek-V4/V4.1). i7 picks the arm: 0 the fp8 path, 1 the Hadamard-rotated fp4
+         * path -- different clamp constants, not a tuning flag, so it is a uniform branch over two
+         * instantiations and not a runtime predicate inside one -- and 2 V4.1's, which is the
+         * unrotated template with the epilogue stopped after the norm. t7=pos non-null is the
+         * DECODE form, which gates on (pos[0] + 1) % ratio and takes its output slot from pos[0];
+         * prefill passes null and i6=out_base. */
+        case PLOW_DOP_COMPRESS_POOL:
+            if (in->i[7] == 1u)
+                d_compress_pool<true>(
+                    (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), (const float*)TEN(3),
+                    (const bf16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6), in->i[0],
+                    in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->fj[0].f, in->i[6], slice,
+                    nblk, (float*)sm->raw, sm->part, (const int*)TEN(7));
+            else
+                d_compress_pool<false>(
+                    (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), (const float*)TEN(3),
+                    (const bf16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6), in->i[0],
+                    in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->fj[0].f, in->i[6], slice,
+                    nblk, (float*)sm->raw, sm->part, (const int*)TEN(7),
+                    in->i[7] == 2u ? PLOW_CMP_EPI_NORM : PLOW_CMP_EPI_ROPE_QUANT);
+            break;
+        case PLOW_DOP_COMPRESS_ROPE_QUANT:
+            d_compress_rope_quant((bf16*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
+                                  (const float*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[3],
+                                  in->i[4], in->i[5], in->i[6], slice, nblk, (float*)sm->raw,
+                                  (const int*)TEN(4), in->i[7] ? in->i[7] : 1u);
+            break;
+        case PLOW_DOP_ROPE_INVERSE_O:
+            d_rope_inverse_o((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), in->i[0],
+                             in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk,
+                             (const int*)TEN(3));
+            break;
+#endif /* PLOW_DSV4_CSA2 */
+#if PLOW_DSV41_ENGRAM
+        case PLOW_DOP_ENGRAM_EMBED:
+            /* i4 = PLOW_TENSOR_NONE means DERIVE the shard base from this rank:
+             * `ParallelEngramEmbedding` puts rank r's rows at `r * part_num_embeddings`
+             * (model.py:303-305) and nowhere else, so the emitter cannot write it as an immediate
+             * -- one program serves all eight ranks -- and there is no need to patch it per rank
+             * either, because `prog_meta->rank` is right here. An explicit i4 still wins, which is
+             * what a single-rank test passes.
+             *
+             * The sentinel is the WIRE one (0xFFFF), not `TENSOR_NONE`'s 0xFFFF_FFFF: `i[]` does
+             * not narrow the way `t[]` does, so devgen widens `TENSOR_NONE16` and the device
+             * compares against `PLOW_TENSOR_NONE`. Both are 0xFFFF; see `dev.rs`'s
+             * `TENSOR_NONE_I`. It matters that it is not 0, because rank 0's base IS 0. */
+            d_engram_embed((bf16*)TEN(0), (const unsigned char*)TEN(1),
+                           (const unsigned char*)TEN(2), (const int*)TEN(3), in->i[0], in->i[1],
+                           in->i[2], in->i[3],
+                           in->i[4] == PLOW_TENSOR_NONE
+                               ? (prog_meta ? prog_meta->rank : 0u) * in->i[5]
+                               : in->i[4],
+                           in->i[5], slice, nblk);
+            break;
+        case PLOW_DOP_ENGRAM_GATE:
+            d_engram_gate((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                          (const bf16*)TEN(3), (const unsigned char*)TEN(4), in->i[0], in->i[1],
+                          in->i[2], in->fj[0].f, slice, nblk, sm->part);
+            break;
+#endif /* PLOW_DSV41_ENGRAM */
         /* Greedy sampling on device. In BOTH buckets: prefill samples the first token, decode
          * every one after it, and the id lands in `in.ids` where the next EMBED reads it. */
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_ARGMAX
@@ -4539,6 +4709,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             exec_gemm_fp8_blk(in, T, slice, nblk, sm->gm);
             break;
 #endif
+#if PLOW_DSV41_BLKFP8
+        case PLOW_DOP_GEMM_FP8_MX:
+            exec_gemm_fp8_mx(in, T, slice, nblk, sm->gm);
+            break;
+#endif
         /* PREFILL-ONLY, and it has to be: d_gemm_glu is a full 256x256 MFMA GEMM, so inlining
          * it into the DECODE interpreter drags 128 AGPRs in and drops that kernel from 2
          * waves/SIMD to 1 (measured: 159 + 128 = 287, over the 256 cliff). Register allocation
@@ -4662,6 +4837,10 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_SCORE_PF
         case PLOW_DOP_INDEX_SCORE_PF: {
             constexpr int DI_ = 128, HI_ = 32; /* same baked geometry as INDEX_SCORE */
+            /* i[4] = pool_size, absent on every GLM emission and read as 1 there. DeepSeek-V4.1's
+             * index keys are COMPRESSED entries, so its columns are pools and its causal bound
+             * divides (model.py:563-565). Same handle op 118 already takes at i[3]. */
+            const unsigned ipool = in->i[4] ? in->i[4] : 1u;
             /* 64-INDEX-HEAD ARM (DeepSeek-V4; GLM-5.3 has 32).  [DSV4-IDX]
              *
              * `i[1]` has always carried index_heads (mla.rs writes `d.i[1] = hi`) and this site
@@ -4679,12 +4858,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 d_index_score_pf_row<DI_, 64, IDXPF_TILE_N_DEF>(
                     (float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                     (const int*)TEN(4), in->i[0], in->i[2], in->fj[0].f, slice, nblk,
-                    (bf16*)sm->raw);
+                    (bf16*)sm->raw, 0u, ~0u, ipool);
 #else
                 d_index_score_pf<DI_, 64>((float*)TEN(0), (const bf16*)TEN(1),
                                           (const bf16*)TEN(2), (const bf16*)TEN(3),
                                           (const int*)TEN(4), in->i[0], in->i[2], in->fj[0].f,
-                                          slice, nblk);
+                                          slice, nblk, ipool);
 #endif
                 break;
             }
@@ -4711,11 +4890,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
              * packet's operands MEAN, and this one changes nothing a packet carries. */
             d_index_score_pf_row<DI_, HI_, IDXPF_TILE_N_DEF>(
                 (float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
-                (const int*)TEN(4), in->i[0], in->i[2], in->fj[0].f, slice, nblk, (bf16*)sm->raw);
+                (const int*)TEN(4), in->i[0], in->i[2], in->fj[0].f, slice, nblk, (bf16*)sm->raw,
+                0u, ~0u, ipool);
 #else
             d_index_score_pf<DI_, HI_>((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                        (const bf16*)TEN(3), (const int*)TEN(4), in->i[0],
-                                       in->i[2], in->fj[0].f, slice, nblk);
+                                       in->i[2], in->fj[0].f, slice, nblk, ipool);
 #endif
         } break;
 #endif
@@ -5351,11 +5531,33 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                  nullptr, nullptr, in->i[5]
             );
             break;
-        case PLOW_DOP_MOE_ALIGN_PF:
+        /* i5 = EXPERT-PARALLEL DEGREE, 0 or 1 meaning the ordinary TP placement. Under EP this
+         * rank keeps only the experts whose weights it holds, and the window is derived here
+         * rather than baked per rank: `balanced_expert_range(n_exp, degree, rank)`, the same even
+         * split `packet::moe_ep` computes host-side when it binds the weights. The two must agree
+         * or a rank gathers rows for experts it has no weights for. */
+        case PLOW_DOP_MOE_ALIGN_PF: {
+            unsigned ep_lo = 0u, ep_hi = ~0u;
+            const unsigned deg = in->i[5];
+            if (deg > 1u && prog_meta && prog_meta->n_gpu == deg) {
+                if (in->i[7] > in->i[6]) {
+                    /* The host PATCHED this rank's window in (PLOW_MOE_EP_CUTS). The instruction
+                     * stream is uploaded per rank, so these two fields are this rank's and
+                     * nobody else's -- which is the only way a calibrated, UNEVEN split can
+                     * reach the device, since the even split below is all `rank` can derive. */
+                    ep_lo = in->i[6];
+                    ep_hi = in->i[7];
+                } else {
+                    const unsigned r = prog_meta->rank, q = in->i[1] / deg, rem = in->i[1] % deg;
+                    ep_lo = r * q + (r < rem ? r : rem);
+                    ep_hi = ep_lo + q + (r < rem ? 1u : 0u);
+                }
+            }
             d_moe_align_pf((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
                            (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2], slice,
-                           (unsigned*)sm->raw, in->i[3], nblk, in->i[4]);
+                           (unsigned*)sm->raw, in->i[3], nblk, in->i[4], ep_lo, ep_hi);
             break;
+        }
         /* i3 = weight encoding (0 bf16, 1 block-fp8, 2 MXFP4/A4W4) — a precision swap is a
          * field change, not a re-emit. t6=row_partidx, t7=row_gate on DOWN; under A4W4 the GLU
          * arm also takes t6 (so the fused bridge can skip pad rows) and t7 = the E8M0 scale
@@ -5541,7 +5743,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                  (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
                                  (const int*)TEN(6), in->i[0], in->i[1], in->i[2], in->i[3],
                                  in->i[4], in->i[5], in->fj[0].f, in->fj[1].f, slice, nblk,
-                                 in->i[6]);
+                                 in->i[6], in->i[7]);
             break;
         case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
             d_qwen_gdn_conv_prefill((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
