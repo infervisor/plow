@@ -17,6 +17,7 @@
 //   int plow_s3gen_synthesize_host(void* h, int voice_id, const int32_t* tokens, int n_tokens,
 //                                  float* wav_out, int max_samples, unsigned long long seed,
 //                                  int* n_samples_out);
+//   int plow_s3gen_warm(void* h, int max_batch);   (captures every reachable graph; returns count)
 //   int plow_s3gen_synthesize_batch_host(void* h, int B, const int* voice_ids,
 //                                  const int32_t* tokens /*concatenated*/, const int* n_tokens,
 //                                  float* wav_out /*[B][max_samples]*/, int max_samples,
@@ -3054,6 +3055,30 @@ extern "C" int plow_s3gen_synthesize_host(void* hp, int voice_id, const int32_t*
                                           int* n_samples_out) {
   return plow_s3gen_synthesize_batch_host(hp, 1, &voice_id, tokens, &n_tokens, wav_out, max_samples, &seed,
                                           n_samples_out);
+}
+
+// Capture the graph of every (batch, length bucket) a single-voice batch of up to max_batch can
+// reach, so no capture happens while another thread of the process synchronizes the context
+// (a capture then fails with cudaErrorStreamCaptureUnsupported). Returns the graphs cached.
+extern "C" int plow_s3gen_warm(void* hp, int max_batch) {
+  if (!hp || max_batch < 1) return -1;
+  S3* s = (S3*)hp;
+  if (!s->use_graph) return 0;
+  CK(cudaSetDevice(s->device));
+  for (const Voice& v : s->voices)
+    for (int n = 1; n <= s->max_tokens; ++n) {
+      const int T0 = v.P + n, G = 2 * T0 - v.Pf;
+      if (G < 1 || rup(T0, 128) > s->t0max || rup(G, 128) > s->gmax) continue;
+      for (int B = 1; B <= std::min(max_batch, s->max_batch); ++B) {
+        const Caps c = make_caps(B, T0, G);
+        auto key = std::make_tuple(B, c.t0, c.g);
+        if (s->graphs.count(key)) continue;
+        GraphEntry ge;
+        RC(build_graph(s, c, &ge));
+        s->graphs.emplace(key, ge);
+      }
+    }
+  return (int)s->graphs.size();
 }
 
 // Stats of the last synthesize call: out[0] = kernel launches in the pipeline, out[1] = CUDA

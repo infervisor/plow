@@ -7,10 +7,14 @@
 //! stream re-renders its whole token prefix every `STREAM_CHUNK` tokens and emits the audio of all
 //! but the last `STREAM_HOLD` tokens, crossfading `FADE` samples into the previous render's tail.
 //! The noise streams are keyed by frame, so re-renders of a prefix agree up to that lookahead.
+//! A render sharing the GPU with T3's back-to-back cooperative decode launches runs ~6x slower
+//! (220 vs 35 ms for a first chunk), so T3 pauses while a batch holding a first chunk renders:
+//! first audio is then prefill + `STREAM_FIRST` tokens + one uncontended render.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 
 use super::s3gen::{Render, S3Gen, SAMPLES_PER_TOKEN};
 use super::t3::{T3Engine, T3Job};
@@ -138,7 +142,7 @@ impl Utterance {
     }
 }
 
-fn s3gen_loop(s3: &mut S3Gen, rx: mpsc::Receiver<S3Msg>) {
+fn s3gen_loop(s3: &mut S3Gen, rx: mpsc::Receiver<S3Msg>, urgent: &AtomicBool) {
     let mut live: HashMap<usize, Utterance> = HashMap::new();
     let apply = |live: &mut HashMap<usize, Utterance>, m: S3Msg| match m {
         S3Msg::Open { id, voice, seed, reply } => {
@@ -184,6 +188,11 @@ fn s3gen_loop(s3: &mut S3Gen, rx: mpsc::Receiver<S3Msg>) {
         if due.is_empty() {
             continue;
         }
+        let first = due.iter().any(|k| {
+            let u = &live[k];
+            u.rendered == 0 && u.t3_ms.is_none() && matches!(u.reply, Reply::Stream(_))
+        });
+        urgent.store(first, Ordering::Release);
         let t = std::time::Instant::now();
         let mut pcms: Vec<Vec<f32>> = vec![Vec::new(); due.len()];
         let res = {
@@ -197,7 +206,9 @@ fn s3gen_loop(s3: &mut S3Gen, rx: mpsc::Receiver<S3Msg>) {
                 .collect();
             s3.synthesize_batch(&items, |i, pcm| pcms[i] = pcm.to_vec())
         };
+        urgent.store(false, Ordering::Release);
         let ms = t.elapsed().as_secs_f64() * 1e3;
+        tracing::debug!(renders = due.len(), tokens = ?due.iter().map(|k| live[k].tokens.len()).collect::<Vec<_>>(), ms, "s3gen render");
         for (k, pcm) in due.into_iter().zip(pcms) {
             match &res {
                 Err(e) => {
@@ -224,6 +235,8 @@ impl ChatterboxWorker {
         let dir = assets.to_path_buf();
         let dir2 = dir.clone();
         let (s_ready_tx, s_ready_rx) = mpsc::channel::<Result<()>>();
+        let urgent = Arc::new(AtomicBool::new(false));
+        let urgent2 = Arc::clone(&urgent);
         std::thread::Builder::new()
             .name("plow-tts-t3".into())
             .spawn(move || {
@@ -246,6 +259,9 @@ impl ChatterboxWorker {
                         Some(T3Job { voice: req.voice, text: req.text, seed: Some(req.seed), max_tokens: None })
                     },
                     |id, token| {
+                        while urgent.load(Ordering::Acquire) {
+                            std::thread::sleep(std::time::Duration::from_micros(50));
+                        }
                         if token < valid_below {
                             let _ = s_tx.send(S3Msg::Token { id, token });
                         }
@@ -267,12 +283,12 @@ impl ChatterboxWorker {
         std::thread::Builder::new()
             .name("plow-tts-s3gen".into())
             .spawn(move || {
-                let mut s3 = match S3Gen::load(&dir2, S3_BATCH, S3_MAX_TOKENS) {
+                let mut s3 = match S3Gen::load(&dir2, S3_BATCH, S3_MAX_TOKENS).and_then(|mut s| s.warm().map(|()| s)) {
                     Ok(s) => s,
                     Err(e) => return drop(s_ready_tx.send(Err(e))),
                 };
                 let _ = s_ready_tx.send(Ok(()));
-                s3gen_loop(&mut s3, s_rx);
+                s3gen_loop(&mut s3, s_rx, &urgent2);
             })
             .map_err(|e| RuntimeError::Device(e.to_string()))?;
         s_ready_rx.recv().map_err(|e| RuntimeError::Device(e.to_string()))??;

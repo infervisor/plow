@@ -14,6 +14,7 @@ pub const VOICES: &str = "codec/voices";
 
 type Create = unsafe extern "C" fn(i32, *const i8, i32, i32, *mut *mut c_void) -> i32;
 type AddVoice = unsafe extern "C" fn(*mut c_void, *const i8, *mut i32) -> i32;
+type Warm = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 type SynthBatch =
     unsafe extern "C" fn(*mut c_void, i32, *const i32, *const i32, *const i32, *mut f32, i32, *const u64, *mut i32) -> i32;
 
@@ -22,6 +23,7 @@ pub struct S3Gen {
     _lib: libloading::Library,
     h: usize,
     synth: SynthBatch,
+    warm: Warm,
     voices: HashMap<String, i32>,
     max_tokens: usize,
     pub max_batch: usize,
@@ -50,11 +52,12 @@ impl S3Gen {
         let lib = unsafe { libloading::Library::new(&lib_path) }
             .map_err(|e| RuntimeError::Device(format!("load {}: {e}", lib_path.display())))?;
         let sym = |e: libloading::Error| RuntimeError::Device(format!("{}: {e}", lib_path.display()));
-        let (create, add_voice, synth) = unsafe {
+        let (create, add_voice, synth, warm) = unsafe {
             (
                 *lib.get::<Create>(b"plow_s3gen_create\0").map_err(sym)?,
                 *lib.get::<AddVoice>(b"plow_s3gen_add_voice\0").map_err(sym)?,
                 *lib.get::<SynthBatch>(b"plow_s3gen_synthesize_batch_host\0").map_err(sym)?,
+                *lib.get::<Warm>(b"plow_s3gen_warm\0").map_err(sym)?,
             )
         };
         let weights = assets.join(WEIGHTS);
@@ -82,6 +85,7 @@ impl S3Gen {
             _lib: lib,
             h: h as usize,
             synth,
+            warm,
             voices,
             max_tokens,
             max_batch,
@@ -92,6 +96,18 @@ impl S3Gen {
             counts: Vec::new(),
             wav: Vec::new(),
         })
+    }
+
+    /// Capture every (batch, length bucket) graph now. A capture while another thread of the
+    /// process synchronizes the context (the T3 engine) fails with STREAM_CAPTURE_UNSUPPORTED.
+    pub fn warm(&mut self) -> Result<()> {
+        let t = std::time::Instant::now();
+        let rc = unsafe { (self.warm)(self.h as *mut c_void, self.max_batch as i32) };
+        if rc < 0 {
+            return Err(RuntimeError::Device(format!("plow_s3gen_warm failed ({rc})")));
+        }
+        tracing::info!(graphs = rc, ms = t.elapsed().as_millis() as u64, "s3gen graphs warmed");
+        Ok(())
     }
 
     pub fn has_voice(&self, voice: &str) -> bool {
