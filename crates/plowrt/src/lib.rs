@@ -21,6 +21,7 @@
 
 pub mod analysis;
 pub mod asr;
+pub mod tts;
 pub mod asset;
 pub mod config;
 pub mod device;

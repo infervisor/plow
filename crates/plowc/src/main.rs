@@ -1764,7 +1764,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // the CLI's idea of what was emitted, which is the drift this whole change
     // exists to remove.
     if cli.emit() == EmitKind::DevblobCubin {
-        build_cubin_from_manifest(&pkt, &cli.arch, cli.segmented)?;
+        build_cubin_from_manifest(&pkt, &cli.arch, cli.segmented, cli.emit_cfg.tts_profile.is_some())?;
     }
 
     // Bare-blob mode (`--out foo.pkt`) stops here: no manifest, exactly the
@@ -1857,6 +1857,7 @@ fn build_cubin_from_manifest(
     pkt: &std::path::Path,
     arch: &str,
     segmented: bool,
+    speech: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mpath = pkt.with_file_name("build.json");
     let man: serde_json::Value = serde_json::from_slice(
@@ -1864,7 +1865,10 @@ fn build_cubin_from_manifest(
             .map_err(|e| format!("--emit devblob+cubin: cannot read {}: {e}", mpath.display()))?,
     )?;
 
-    let nvcc = std::path::Path::new("/usr/local/cuda/bin/nvcc");
+    // The dev shell exports PLOW_NVCC (nix toolkit); /usr/local/cuda is the non-nix default.
+    let nvcc = std::env::var_os("PLOW_NVCC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/local/cuda/bin/nvcc"));
     if !nvcc.exists() {
         return Err(format!(
             "--emit devblob+cubin needs a CUDA toolkit: {} not found. The packet and \
@@ -1934,7 +1938,12 @@ fn build_cubin_from_manifest(
     if segmented || manifest_requires_segmented_prefill(&man) {
         args.push("-DPLOW_SM120_CUBIN_SEG=ON".into());
     }
-    let mut extra = Vec::new();
+    // A required hd128 GQA grouping is correctness (the kernel traps on GF not dividing gqa).
+    let mut extra: Vec<String> = req
+        .iter()
+        .filter(|d| d.starts_with("PLOW_NV_FA_GF="))
+        .map(|d| format!("-D{d}"))
+        .collect();
     for d in &rec {
         match d.split_once('=') {
             Some(("PLOW_NV_FA_GF_FULL", v)) => args.push(format!("-DPLOW_NV_FA_GF_FULL={v}")),
@@ -1945,6 +1954,9 @@ fn build_cubin_from_manifest(
         args.push(format!("-DPLOW_EXTRA_DEFINES={}", extra.join(" ")));
     }
     args.push(format!("-DPLOW_CUBIN_ARCH={arch}"));
+    args.push(format!("-DPLOW_CUBIN_NVCC={}", nvcc.display()));
+    // A speech packet ships its codec object next to the interpreter objects.
+    args.push(format!("-DPLOW_TTS_SNAC={}", if speech { "ON" } else { "OFF" }));
 
     let out_dir = pkt.parent().map(PathBuf::from).unwrap_or_default();
     let config = pkt.with_file_name("plow_config.h");

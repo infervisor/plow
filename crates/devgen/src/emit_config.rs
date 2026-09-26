@@ -313,6 +313,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FA_MMAQK")]
     pub fa_mmaqk: Option<u32>,
 
+    /// Declare the packet a speech model: emit a `tts.codec_lm.v1` pipeline ("speech") carrying
+    /// the codec/prompt contract of the named family (`veena`). Metadata only; programs unchanged.
+    #[arg(long, env = "PLOW_TTS_PROFILE")]
+    pub tts_profile: Option<String>,
+
     /// Widen the flash-merge dispatch by this factor (diagnostic; measured no effect).
     #[arg(long, env = "PLOW_FLASH_MERGE_DSPLIT", hide = true)]
     pub flash_merge_dsplit: Option<u32>,
@@ -1346,6 +1351,7 @@ impl EmitConfig {
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
             fa_mmaqk: env_u32("PLOW_FA_MMAQK"),
+            tts_profile: env_str("PLOW_TTS_PROFILE"),
             flash_merge_dsplit: env_u32("PLOW_FLASH_MERGE_DSPLIT"),
             ns_mul: env_u32("PLOW_NS_MUL"),
             ns_abs: env_u32("PLOW_NS_ABS"),

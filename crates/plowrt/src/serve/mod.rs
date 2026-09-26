@@ -889,7 +889,10 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Build the axum app.
 pub fn app(state: Arc<AppState>) -> Router {
-    Router::new()
+    let router = Router::new();
+    #[cfg(feature = "cuda")]
+    let router = router.route("/v1/audio/speech", post(crate::tts::serving::speech));
+    router
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/completions", post(completion::completions))
         .route("/tokenize", post(tokenize::tokenize))

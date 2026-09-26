@@ -176,27 +176,36 @@ static __device__ void d_argmax(unsigned long long* __restrict__ part, const __n
     for (unsigned b = 0; b < B; b++) {
         const __nv_bfloat16* xb = x + (size_t)b * n;
         unsigned long long best = 0;
+        /* An n that is not a multiple of 8 (Veena: 156951) leaves row b>0 off 16-byte alignment;
+         * scan `h` scalar elements first so the vector loads start aligned. h = 0 on aligned rows. */
+        const unsigned mis = (unsigned)(((size_t)b * n) & 7u);
+        const unsigned h = mis ? min(8u - mis, n) : 0u;
         /* VECTORIZED scan: 1 LD.E.128 per 8 elements instead of 8 scalar LD.E.U16 each with its
          * own 64-bit address build (~16 -> ~7 slots/element). This changes which block scans
          * which elements (part[slice] partials shift between slots), but the ONLY consumer is
          * ARGMAX_FIN's max-fold over all slots, and max over the same global candidate set with
          * the same packed tie-break key picks the same winner — the token is unchanged. */
-        const unsigned nv = n / 8;
+        const unsigned nv = (n - h) / 8;
         for (unsigned iv = slice * PLOW_NV_THREADS + threadIdx.x; iv < nv;
              iv += nblk * PLOW_NV_THREADS) {
-            const bf16v8 v = ld_glob8_cs(xb + (size_t)iv * 8);
+            const bf16v8 v = ld_glob8_cs(xb + h + (size_t)iv * 8);
 #pragma unroll
             for (int j = 0; j < 8; j++) {
-                const unsigned long long p = amax_pack(v.x[j], iv * 8 + (unsigned)j);
+                const unsigned long long p = amax_pack(v.x[j], h + iv * 8 + (unsigned)j);
                 best = p > best ? p : best;
             }
         }
-        /* n % 8 tail (none on any shipped vocab; kept so an unaligned n cannot over-read). */
-        if (slice == 0)
-            for (unsigned i = nv * 8 + threadIdx.x; i < n; i += PLOW_NV_THREADS) {
+        /* Unaligned head and n % 8 tail, scalar. */
+        if (slice == 0) {
+            for (unsigned i = threadIdx.x; i < h; i += PLOW_NV_THREADS) {
                 const unsigned long long p = amax_pack(xb[i], i);
                 best = p > best ? p : best;
             }
+            for (unsigned i = h + nv * 8 + threadIdx.x; i < n; i += PLOW_NV_THREADS) {
+                const unsigned long long p = amax_pack(xb[i], i);
+                best = p > best ? p : best;
+            }
+        }
         best = block_max_u64(best, lds);
         if (threadIdx.x == 0) part[(size_t)b * nblk + slice] = best;
     }

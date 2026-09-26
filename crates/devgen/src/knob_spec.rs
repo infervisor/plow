@@ -979,6 +979,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.fa_gf_full", Some("PLOW_FA_GF_FULL"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.attention_decode_balance_gf", Some("PLOW_ATTENTION_DECODE_BALANCE_GF"), Layer::Emit, U32, GEMMA4_BALANCE_GF_DEFAULT, GEMMA4_RECIPE_QUALIFIED),
     KnobSpec::new("emit.fa_mmaqk", Some("PLOW_FA_MMAQK"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.tts_profile", Some("PLOW_TTS_PROFILE"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.flash_merge_dsplit", Some("PLOW_FLASH_MERGE_DSPLIT"), Layer::Emit, U32, UNSET, DIAG),
     KnobSpec::new("emit.ns_mul", Some("PLOW_NS_MUL"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.ns_abs", Some("PLOW_NS_ABS"), Layer::Emit, U32, UNSET, OPT_IN),
@@ -1206,6 +1207,9 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_NV_FA512_BKV", Some("PLOW_NV_FA512_BKV"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_NV_PLACE", Some("PLOW_NV_PLACE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_NV_ZG", Some("PLOW_NV_ZG"), Layer::RawEnv, Domain::Str, UNSET, REMOVED),
+    // plowc `--emit devblob+cubin`: the toolkit nvcc (the dev shell exports it); toolchain, not a
+    // numerics knob.
+    KnobSpec::new("env.PLOW_NVCC", Some("PLOW_NVCC"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_PACKED_PREFILL_CONSUMERS", Some("PLOW_PACKED_PREFILL_CONSUMERS"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY", Some("PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_PACKET_HAS_TOKEN_BATCH_BODIES", Some("PLOW_PACKET_HAS_TOKEN_BATCH_BODIES"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
@@ -1283,6 +1287,8 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_CUBIN_ARCH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_CONFIG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_DIR", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_CUBIN_NVCC", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_TTS_SNAC", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_GEMMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_PACKED_PREFILL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_ROUTED_DECODE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

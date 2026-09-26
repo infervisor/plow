@@ -170,10 +170,19 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
         }
     }
     // Optional placed, segmented and opaque programs retain the existing widest path.
-    if programs.iter().any(|g| {
+    if let Some(g) = programs.iter().find(|g| {
         g.l2_domains != 0
             || (!segmented && (g.gq_seg_ofs.len() != 2 || g.check_coarse_single_segment().is_err()))
     }) {
+        if std::env::var_os("PLOW_LADDER_DEBUG").is_some() {
+            eprintln!(
+                "ladder: rung {} keeps widest: l2_domains={} gq_seg_ofs={} coarse_single={:?}",
+                g.t,
+                g.l2_domains,
+                g.gq_seg_ofs.len(),
+                g.check_coarse_single_segment().err()
+            );
+        }
         return Ok(false);
     }
     let widest = programs.last().expect("multiple programs");
@@ -367,7 +376,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
             continue;
         }
         let fp8 = d.op == DevOp::FlashDecodeFp8 as u16;
-        if !matches!(d.i[6], 64 | 256 | 512)
+        if !matches!(d.i[6], 64 | 128 | 256 | 512)
             || (fp8 && d.i[6] == 64)
             || (!fp8 && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16))
         {

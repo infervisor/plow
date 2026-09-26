@@ -741,6 +741,21 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
         list(APPEND _cubin_outs "${_smp_out}")
     endif()
 
+    # Speech packets (`tts.codec_lm.v1`, codec.kind 1): the native SNAC-24k decoder the speech
+    # controller loads from <assets>/codec/. Host-callable shared object, not a megakernel arm.
+    option(PLOW_TTS_SNAC "Also build codec/libplow_snac.so for a SNAC-24k speech packet" OFF)
+    if(PLOW_TTS_SNAC AND PLOW_SM90A_CUBIN)
+        set(_snac_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/snac/snac.cu")
+        set(_snac_out "${PLOW_CUBIN_DIR}/codec/libplow_snac.so")
+        add_custom_command(OUTPUT "${_snac_out}"
+            COMMAND env PLOW_NVCC=${PLOW_CUBIN_NVCC}
+                    bash "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/snac/build.sh" "${_snac_out}"
+            DEPENDS "${_snac_src}" "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/snac/build.sh"
+            COMMENT "nvcc codec/libplow_snac.so"
+            VERBATIM)
+        list(APPEND _cubin_outs "${_snac_out}")
+    endif()
+
     # `nv_cubins` builds every enabled arch variant; `sm120_cubins` keeps the
     # name scripts/build_sm120_cubin.sh has always driven.
     add_custom_target(nv_cubins ALL DEPENDS ${_cubin_outs})

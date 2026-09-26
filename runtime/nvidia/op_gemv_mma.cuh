@@ -249,11 +249,18 @@ __device__ __forceinline__ gvmma_range gvmma_partition(unsigned N, unsigned slic
     return {rb0, rb1};
 }
 
-/* Two adjacent bf16 of one C row as a 4-byte store: n is even and N is even (N % 8 == 0). */
+/* Two adjacent bf16 of one C row as a 4-byte store: n is even, so the pair is aligned whenever
+ * the row start m*N is. An odd N (a 156951-row vocab head) leaves odd rows at odd elements. */
 __device__ __forceinline__ void gvmma_store2(__nv_bfloat16* C, unsigned N, unsigned m, unsigned n,
                                              float c0, float c1) {
     if (n + 1u < N) {
-        *(__nv_bfloat162*)(C + (size_t)m * N + n) = __floats2bfloat162_rn(c0, c1);
+        const size_t o = (size_t)m * N + n;
+        if ((o & 1u) == 0u) {
+            *(__nv_bfloat162*)(C + o) = __floats2bfloat162_rn(c0, c1);
+        } else {
+            C[o] = __float2bfloat16(c0);
+            C[o + 1u] = __float2bfloat16(c1);
+        }
     } else if (n < N) {
         C[(size_t)m * N + n] = __float2bfloat16(c0);
     }

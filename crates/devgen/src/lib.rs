@@ -84,6 +84,7 @@ pub mod pipeline;
 mod projection_rewrite;
 mod rewrite_lower;
 pub mod rnnt;
+pub mod tts;
 pub mod tune_demand;
 pub mod segment_resource;
 
@@ -4474,7 +4475,14 @@ fn emit_phase(
         let gf = if gqa < 2 {
             1
         } else if full {
-            fa_gf_full().min(gqa)
+            // An odd group (Llama-3.2-3B / Veena: 24 heads over 8 KV heads = 3) takes no fusion;
+            // the manifest pairs the object's hd128 arm at PLOW_NV_FA_GF=1 for the same shapes.
+            let g = fa_gf_full().min(gqa);
+            if gqa % g == 0 {
+                g
+            } else {
+                1
+            }
         } else {
             2.min(gqa)
         };
@@ -9595,6 +9603,31 @@ fn emit_dense_gqa(
                 },
             )
             .unwrap_or_else(|error| panic!("causal packet pipeline: {error}")),
+        );
+    } else if let Some(name) = ecfg.tts_profile.as_deref().filter(|_| !block_mode) {
+        let profile = tts::profile(name).unwrap_or_else(|e| panic!("{e}"));
+        sections.push(
+            tts::speech_pipeline_section(
+                &m,
+                pipeline::CausalPipelineSpec {
+                    name: "speech",
+                    max_context: ctx,
+                    hidden: c.hidden,
+                    decode_capacity: dbatch,
+                    overlay_rows: 0,
+                    ordered_dispatch: false,
+                    tensors: pipeline::CausalPipelineTensors {
+                        tokens: emitter.tn.ids,
+                        positions: emitter.tn.pos,
+                        kv_lengths: emitter.tn.kvlen,
+                        overlay: None,
+                        overlay_index: None,
+                    },
+                },
+                profile,
+                c.vocab,
+            )
+            .unwrap_or_else(|error| panic!("speech packet pipeline: {error}")),
         );
     }
     if ecfg.gemv_decode_role {
