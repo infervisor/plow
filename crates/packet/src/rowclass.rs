@@ -203,6 +203,11 @@ pub fn class_of(op: DevOp) -> RowClass {
         // Attention couples rows within one sequence. Packed request spans require per-span
         // execution until the op gains an explicit span descriptor.
         RelativeAttentionF32 | GroupedAttentionF32 | CausalDepthwiseConv1dF32 => RowClass::C,
+        // The generic signal ops derive a row's item and position from its index (`rows_per_item`,
+        // strides, `[batch][rows]` geometry); only the pure elementwise one is row-agnostic.
+        GatherRowsF32 | CopyColsF32 | Conv1dF32 | ConvTranspose1dF32 | BinaryF32 | CumSumF64
+        | RandF32 | AttentionF32 => RowClass::C,
+        UnaryF32 => RowClass::A,
 
         // ---- D: per-sequence carried state -------------------------------------------------
         // Operand shapes with no request axis at all: `state`/`outstate` `[1, HV, V, K]`,

@@ -327,8 +327,21 @@ pub fn classify(op: DevOp) -> OpClass {
             cls_c("causal rows belong to one sequence"),
             "run once per request span until a span descriptor is bound",
         ),
-        DevOp::RelativeAttentionF32 | DevOp::GroupedAttentionF32 => note(
+        DevOp::RelativeAttentionF32 | DevOp::GroupedAttentionF32 | DevOp::AttentionF32 => note(
             cls_c("attention rows belong to one sequence"),
+            "run once per request span until a span descriptor is bound",
+        ),
+        DevOp::UnaryF32 => a_rows("i0=rows"),
+        DevOp::GatherRowsF32
+        | DevOp::CopyColsF32
+        | DevOp::BinaryF32
+        | DevOp::CumSumF64
+        | DevOp::RandF32 => note(
+            cls_c("item and position derived from the row index"),
+            "run once per request span until a span descriptor is bound",
+        ),
+        DevOp::Conv1dF32 | DevOp::ConvTranspose1dF32 => note(
+            cls_c("1D convolution couples neighboring rows"),
             "run once per request span until a span descriptor is bound",
         ),
 

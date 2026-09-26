@@ -312,6 +312,15 @@ const DOC: &[S] = &[
     S { op: DevOp::GroupedAttentionF32, t: &["context", "query", "key", "value", "valid_rows?"], i: &["rows", "width", "head_width", "group_rows", "flags"], f: &[], j: &[] },
     S { op: DevOp::EmbedPosBf16, t: &["out", "table", "tokens", "pos_table", "pos", "base"], i: &["rows", "width", "vocab", "pos_rows"], f: &[], j: &[] },
     S { op: DevOp::EmbedOverlayBf16, t: &["out", "table", "tokens", "overlay", "overlay_index"], i: &["rows", "width", "vocab", "overlay_rows"], f: &[], j: &[] },
+    S { op: DevOp::GatherRowsF32, t: &["out", "table", "index?"], i: &["rows", "width", "vocab", "rows_per_item", "repeat", "index_item_stride", "table_item_stride", "flags"], f: &[], j: &["out_stride", "out_col0"] },
+    S { op: DevOp::CopyColsF32, t: &["out", "x"], i: &["items", "rows", "cols", "in_stride", "in_offset", "out_stride", "out_offset"], f: &[], j: &["in_item_stride", "out_item_stride"] },
+    S { op: DevOp::Conv1dF32, t: &["out", "x", "weight", "bias?", "alpha?", "residual?", "lengths?"], i: &["batch", "in_rows", "in_channels", "out_channels", "kernel", "stride", "dilation", "groups"], f: &["slope"], j: &["pads", "flags"] },
+    S { op: DevOp::ConvTranspose1dF32, t: &["out", "x", "weight", "bias?", "alpha?", "residual?", "lengths?"], i: &["batch", "in_rows", "in_channels", "out_channels", "kernel", "stride", "output_padding", "groups"], f: &["slope"], j: &["crops", "flags"] },
+    S { op: DevOp::UnaryF32, t: &["out", "x", "param?"], i: &["rows", "width", "kind", "stride", "col0"], f: &["p0", "p1"], j: &[] },
+    S { op: DevOp::BinaryF32, t: &["out", "a", "b"], i: &["items", "rows", "width", "op", "b_item_stride", "b_row_stride", "b_col_stride", "flags"], f: &["scale"], j: &[] },
+    S { op: DevOp::CumSumF64, t: &["out", "x", "column_scale?", "lengths?"], i: &["items", "rows", "width", "x_width", "flags"], f: &["scale", "post_scale"], j: &[] },
+    S { op: DevOp::RandF32, t: &["out", "seed"], i: &["items", "rows", "width", "stream", "stream_shift", "coords", "a_offset", "b_offset"], f: &["scale", "offset"], j: &["", "flags"] },
+    S { op: DevOp::AttentionF32, t: &["out", "query", "key", "value", "key_lengths?", "bias?"], i: &["batch", "q_rows", "kv_rows", "heads", "head_width", "in_stride", "flags", "bias_head_stride"], f: &["scale"], j: &["k_col0", "v_col0"] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

@@ -63,6 +63,15 @@ G_K(g_argmax_f32);
 G_K(g_relu_f32);
 G_K(g_broadcast_add_f32);
 G_K(g_grouped_attention_f32);
+G_K(g_gather_rows_f32);
+G_K(g_copy_cols_f32);
+G_K(g_conv1d_f32);
+G_K(g_conv_transpose1d_f32);
+G_K(g_unary_f32);
+G_K(g_binary_f32);
+G_K(g_cumsum_f64);
+G_K(g_rand_f32);
+G_K(g_attention_f32);
 /* affine_q4.c */
 G_K(g_gemv_affine_q4);
 G_K(g_gemm_affine_q4);

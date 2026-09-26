@@ -1844,6 +1844,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_PACK_NCFW_ROWS_F32:
     case PLOW_DOP_GROUPED_ATTENTION_F32:
     case PLOW_DOP_GEMM_F32:
+    case PLOW_DOP_GATHER_ROWS_F32:
+    case PLOW_DOP_COPY_COLS_F32:
+    case PLOW_DOP_CONV1D_F32:
+    case PLOW_DOP_CONV_TRANSPOSE1D_F32:
+    case PLOW_DOP_UNARY_F32:
+    case PLOW_DOP_BINARY_F32:
+    case PLOW_DOP_CUMSUM_F64:
+    case PLOW_DOP_RAND_F32:
+    case PLOW_DOP_ATTENTION_F32:
         d_speech_f32(in, T, slice, nblk, arena);
         break;
 #endif

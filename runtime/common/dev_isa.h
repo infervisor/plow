@@ -1436,6 +1436,17 @@ enum {
     PLOW_DOP_INDEX_FP8_DECODE = 192,
     PLOW_DOP_INDEX_FP8_PREFILL = 193,
     PLOW_DOP_EMBED_POS_BF16 = 194,
+    /* Generic FP32 signal primitives (channels-last [batch][rows][channels]). Exact operand
+     * contracts live in packet::dev::DevOp; reference semantics in golden/f32_primitives.c. */
+    PLOW_DOP_GATHER_ROWS_F32 = 195,
+    PLOW_DOP_COPY_COLS_F32 = 196,
+    PLOW_DOP_CONV1D_F32 = 197,
+    PLOW_DOP_CONV_TRANSPOSE1D_F32 = 198,
+    PLOW_DOP_UNARY_F32 = 199,
+    PLOW_DOP_BINARY_F32 = 200,
+    PLOW_DOP_CUMSUM_F64 = 201,
+    PLOW_DOP_RAND_F32 = 202,
+    PLOW_DOP_ATTENTION_F32 = 203,
 
     PLOW_DOP__COUNT
 };

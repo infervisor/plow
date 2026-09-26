@@ -2091,7 +2091,118 @@ pub enum DevOp {
     /// t3=pos_table(bf16[pos_rows,width]) t4=pos(u32[rows]) t5=base(u32[rows])` ·
     /// `i0=rows i1=width i2=vocab i3=pos_rows`.
     EmbedPosBf16 = 194,
+    /// FP32 row gather. Output row `r` belongs to item `r / rows_per_item` (0 = `rows`) at local
+    /// row `l`; its source is `s = index[item*index_item_stride + l/repeat]`, or `l/repeat`
+    /// without an index (`repeat` 0 = 1). `s >= vocab` (e.g. `u32::MAX`) contributes zero,
+    /// otherwise table row `item*table_item_stride + s`. Writes `out[r*out_stride + out_col0 + c]
+    /// (+)= value` for `c < width` (`out_stride` 0 = `width`). Flags: bit 0 FP16 table, bit 1
+    /// accumulate into `out`. Nearest upsampling is `repeat`; padding, reflection, reordering and
+    /// concatenation are index tensors.
+    /// `t0=out(f32) t1=table(f32|f16) t2=index(u32)?` ·
+    /// `i0=rows i1=width i2=vocab i3=rows_per_item i4=repeat i5=index_item_stride
+    /// i6=table_item_stride i7=flags` · `j0=out_stride j1=out_col0`.
+    GatherRowsF32 = 195,
+    /// Strided FP32 block copy (concatenate/slice/broadcast along any axis):
+    /// `out[b*out_item_stride + r*out_stride + out_offset + c] = x[b*in_item_stride + r*in_stride
+    /// + in_offset + c]` for `b < items, r < rows, c < cols`. Strides are literal element counts;
+    /// zero broadcasts. Offsets are element offsets.
+    /// `t0=out t1=x` · `i0=items i1=rows i2=cols i3=in_stride i4=in_offset i5=out_stride
+    /// i6=out_offset` · `j0=in_item_stride j1=out_item_stride`.
+    CopyColsF32 = 196,
+    /// Channels-last FP32 1D convolution, torch `Conv1d` semantics:
+    /// `out[b][t][o] = post(bias[o] + sum_{k,i} pre(x[b][t*stride + k*dilation - pad_before][g*Cin/groups
+    /// + i]) * weight[o][i][k]) + residual[b][t][o]`, where `g` is `o`'s group.
+    /// `out_rows = (in_rows + pad_before + pad_after - dilation*(kernel-1) - 1) / stride + 1`.
+    /// `j0 = pad_before | pad_after << 16`. With `lengths`, item `b` has
+    /// `L = min(lengths[b], in_rows)` input rows: padding is taken relative to `L`, and output rows
+    /// at or past `(L + pads - span)/stride + 1` are written as zero. Flags (`j1`): bits 0..1 pad
+    /// mode (0 zero, 1 reflect, 2 replicate), bits 4..7 input activation, bits 8..11 output
+    /// activation (codes [`ACT_TANH`]..[`ACT_RELU`], 13 and 14 invalid here; `f0` is the
+    /// leaky-ReLU slope, `alpha[channel]` the snake alpha of the channel it is applied to),
+    /// bit 12 FP16 weights.
+    /// `t0=out(f32[batch,out_rows,out_channels]) t1=x(f32[batch,in_rows,in_channels])
+    /// t2=weight(f32|f16[out_channels,in_channels/groups,kernel]) t3=bias? t4=alpha?
+    /// t5=residual? t6=lengths(u32[batch])?` ·
+    /// `i0=batch i1=in_rows i2=in_channels i3=out_channels i4=kernel i5=stride i6=dilation
+    /// i7=groups` · `f0=slope` · `j0=pads j1=flags`.
+    Conv1dF32 = 197,
+    /// Channels-last FP32 transposed 1D convolution, torch `ConvTranspose1d` semantics with the
+    /// output cropped by `j0 = crop_before | crop_after << 16`:
+    /// `out[b][t][o] = post(bias[o] + sum pre(x[b][s][i]) * weight[i][o % (Cout/groups)][k]) +
+    /// residual`, summed over `s*stride + k = t + crop_before` within `o`'s group.
+    /// `out_rows = (in_rows-1)*stride + kernel + output_padding - crop_before - crop_after`.
+    /// `lengths`, activations, `alpha` and flags as [`DevOp::Conv1dF32`] (no pad mode); outputs
+    /// past item `b`'s `(L-1)*stride + kernel + output_padding - crops` are zero.
+    /// `t0=out t1=x t2=weight(f32|f16[in_channels,out_channels/groups,kernel]) t3=bias? t4=alpha?
+    /// t5=residual? t6=lengths(u32[batch])?` ·
+    /// `i0=batch i1=in_rows i2=in_channels i3=out_channels i4=kernel i5=stride
+    /// i6=output_padding i7=groups` · `f0=slope` · `j0=crops j1=flags`.
+    ConvTranspose1dF32 = 198,
+    /// Elementwise FP32 function over `rows x width` at row stride `stride` (0 = `width`) from
+    /// column `col0`, in place or not: `out = f(x)` with `kind` an `ACT_*` code. `p0(c) =
+    /// param[c]` when present, else `f0`: the leaky-ReLU slope, snake alpha, clamp low and
+    /// scale-shift scale; `f1` is the clamp high and scale-shift shift.
+    /// `t0=out t1=x t2=param?` · `i0=rows i1=width i2=kind i3=stride i4=col0` · `f0=p0 f1=p1`.
+    UnaryF32 = 199,
+    /// FP32 binary op with a strided `b`: `out[i][r][c] = s * (a[i][r][c] op
+    /// b[i*b_item_stride + r*b_row_stride + c*b_col_stride])` (full, row vector, column vector,
+    /// scalar, per-item: all by strides). `op`: 0 add, 1 sub, 2 mul, 3 div, 4 max, 5 min.
+    /// Flag bit 0 scales the result by `f0` (else `s = 1`). Output may alias `a`.
+    /// `t0=out t1=a t2=b` · `i0=items i1=rows i2=width i3=op i4=b_item_stride i5=b_row_stride
+    /// i6=b_col_stride i7=flags` · `f0=scale`.
+    BinaryF32 = 200,
+    /// FP64-accumulated prefix sum down the rows of each (item, column):
+    /// `S = sum x[i][r'][c % x_width]` over `r' <= r` (flag bit 0: `r' < r`) and `r' < lengths[i]`;
+    /// `v = S * column_scale[c] * f0` in double; flag bit 1 wraps `v -= floor(v)`; then `v *= f1`,
+    /// stored as f32 (flag bit 2: f64). `x_width` 0 = `width`.
+    /// `t0=out(f32|f64) t1=x(f32) t2=column_scale? t3=lengths(u32[items])?` ·
+    /// `i0=items i1=rows i2=width i3=x_width i4=flags` · `f0=scale f1=post_scale`.
+    CumSumF64 = 201,
+    /// Counter-based FP32 random numbers. Per element, `a`/`b` are coordinates chosen by
+    /// `coords` (bits 0..1 for `a`, 2..3 for `b`: 0 row within item, 1 column, 2 item) plus
+    /// `a_offset`/`b_offset`; `key = stream << stream_shift ^ a << 32 ^ b` and
+    /// `h = splitmix64(seed ^ splitmix64(key))`. Uniform: `(h >> 40) * 2^-24`; normal (flag bit 0):
+    /// Box-Muller of `u1 = ((h >> 40) + 1) * 2^-24`, `u2 = (splitmix64(h) >> 40) * 2^-24`,
+    /// `sqrtf(-2 logf(u1)) * cospif(2 u2)`. `out = (v + f1) * f0`. Seed is `seed[item]`, or
+    /// `seed[0]` with flag bit 1.
+    /// `t0=out(f32[items,rows,width]) t1=seed(u64[items])` · `i0=items i1=rows i2=width i3=stream
+    /// i4=stream_shift i5=coords i6=a_offset i7=b_offset` · `f0=scale f1=offset` · `j1=flags`.
+    RandF32 = 202,
+    /// Batched multi-head FP32 attention, flash-style (any row count). Query row `r` of item `b`
+    /// reads `query[(b*q_rows + r)*in_stride + h*head_width ..]`, key/value row `j`
+    /// `key[(b*kv_rows + j)*in_stride + k_col0 + h*head_width ..]` (`v_col0` for value;
+    /// `in_stride` 0 = `heads*head_width`). Score `f0 * q.k + bias[h*bias_head_stride +
+    /// r*kv_rows + j]`, softmax over keys `j < key_lengths[b]` (and `j <= r` with flag bit 0); a
+    /// row with no visible key is zero. Output is dense `[batch,q_rows,heads*head_width]`.
+    /// `head_width` is 64 or 128.
+    /// `t0=out t1=query t2=key t3=value t4=key_lengths(u32[batch])? t5=bias?` ·
+    /// `i0=batch i1=q_rows i2=kv_rows i3=heads i4=head_width i5=in_stride i6=flags
+    /// i7=bias_head_stride` · `f0=scale` · `j0=k_col0 j1=v_col0`.
+    AttentionF32 = 203,
 }
+
+/// Activation codes shared by [`DevOp::UnaryF32`] (`kind`) and the convolution input/output
+/// activations. `ACT_NONE` is the identity.
+pub const ACT_NONE: u32 = 0;
+pub const ACT_TANH: u32 = 1;
+pub const ACT_SIN: u32 = 2;
+pub const ACT_COS: u32 = 3;
+pub const ACT_EXP: u32 = 4;
+pub const ACT_ABS: u32 = 5;
+pub const ACT_SIGMOID: u32 = 6;
+pub const ACT_SILU: u32 = 7;
+/// ELU with alpha 1.
+pub const ACT_ELU: u32 = 8;
+pub const ACT_LEAKY_RELU: u32 = 9;
+pub const ACT_MISH: u32 = 10;
+/// Exact `0.5 x (1 + erf(x / sqrt 2))`.
+pub const ACT_GELU_ERF: u32 = 11;
+/// `x + sin^2(alpha x) / (alpha + 1e-9)`.
+pub const ACT_SNAKE: u32 = 12;
+pub const ACT_CLAMP: u32 = 13;
+/// `x * p0 + p1`.
+pub const ACT_SCALE_SHIFT: u32 = 14;
+pub const ACT_RELU: u32 = 15;
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
 /// Codes 0/1/2 are gelu_tanh / silu / situ; see [`DevOp::Glu`].
@@ -2304,6 +2415,15 @@ impl DevOp {
         DevOp::IndexFp8Decode,
         DevOp::IndexFp8Prefill,
         DevOp::EmbedPosBf16,
+        DevOp::GatherRowsF32,
+        DevOp::CopyColsF32,
+        DevOp::Conv1dF32,
+        DevOp::ConvTranspose1dF32,
+        DevOp::UnaryF32,
+        DevOp::BinaryF32,
+        DevOp::CumSumF64,
+        DevOp::RandF32,
+        DevOp::AttentionF32,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2519,6 +2639,15 @@ impl DevOp {
             DevOp::IndexFp8Decode => "PLOW_DOP_INDEX_FP8_DECODE",
             DevOp::IndexFp8Prefill => "PLOW_DOP_INDEX_FP8_PREFILL",
             DevOp::EmbedPosBf16 => "PLOW_DOP_EMBED_POS_BF16",
+            DevOp::GatherRowsF32 => "PLOW_DOP_GATHER_ROWS_F32",
+            DevOp::CopyColsF32 => "PLOW_DOP_COPY_COLS_F32",
+            DevOp::Conv1dF32 => "PLOW_DOP_CONV1D_F32",
+            DevOp::ConvTranspose1dF32 => "PLOW_DOP_CONV_TRANSPOSE1D_F32",
+            DevOp::UnaryF32 => "PLOW_DOP_UNARY_F32",
+            DevOp::BinaryF32 => "PLOW_DOP_BINARY_F32",
+            DevOp::CumSumF64 => "PLOW_DOP_CUMSUM_F64",
+            DevOp::RandF32 => "PLOW_DOP_RAND_F32",
+            DevOp::AttentionF32 => "PLOW_DOP_ATTENTION_F32",
         }
     }
 
@@ -2571,7 +2700,8 @@ impl DevOp {
     /// context parallelism).
     /// 184..193 for the FP8 block-128 GEMM/MoE/MLA/indexer family; 194 -> 195 for
     /// `EmbedPosBf16 = 194` (Chatterbox T3 learned speech positions).
-    pub const COUNT: u16 = 195;
+    /// 195 -> 204 for `GatherRowsF32 = 195` .. `AttentionF32 = 203` (generic FP32 signal ops).
+    pub const COUNT: u16 = 204;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
