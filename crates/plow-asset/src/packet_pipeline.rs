@@ -21,6 +21,10 @@ pub struct PacketPipeline {
     pub tensors: BTreeMap<String, PipelineTensor>,
     #[serde(default)]
     pub parameters: BTreeMap<String, u64>,
+    /// Text the host side of a generic driver needs (prompt templates, output patterns,
+    /// marker tokens), so the runtime never names a model.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub strings: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +101,11 @@ impl PacketPipelines {
             if pipeline.parameters.keys().any(|name| !identifier(name, 64)) {
                 return Err("invalid packet pipeline parameter".into());
             }
+            if pipeline.strings.len() > 64
+                || pipeline.strings.iter().any(|(name, value)| !identifier(name, 64) || value.len() > 16384)
+            {
+                return Err("invalid packet pipeline string".into());
+            }
         }
         Ok(())
     }
@@ -119,6 +128,7 @@ mod tests {
         let metadata = PacketPipelines {
             version: VERSION,
             pipelines: vec![PacketPipeline {
+                strings: Default::default(),
                 name: "transcribe".into(),
                 driver: "rnnt.greedy.v1".into(),
                 programs: BTreeMap::from([("encoder".into(), 0)]),

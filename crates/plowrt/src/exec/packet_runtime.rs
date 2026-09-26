@@ -55,6 +55,7 @@ pub struct BoundPacketPipeline {
     programs: BTreeMap<String, usize>,
     tensors: BTreeMap<String, PacketTensor>,
     parameters: BTreeMap<String, u64>,
+    strings: BTreeMap<String, String>,
 }
 
 pub struct LoadedPacketRuntime {
@@ -97,6 +98,14 @@ impl ForwardPacket {
             input,
             output,
         })
+    }
+
+    pub fn pipeline(&self) -> &BoundPacketPipeline {
+        &self.pipeline
+    }
+
+    pub fn runtime(&self) -> &dyn PacketRuntime {
+        self.runtime.as_ref()
     }
 
     pub fn backend(&self) -> &'static str {
@@ -342,11 +351,22 @@ impl PacketAsset {
                 .collect(),
             tensors,
             parameters: pipeline.parameters.clone(),
+            strings: pipeline.strings.clone(),
         })
     }
 }
 
 impl BoundPacketPipeline {
+    pub fn string(&self, name: &str) -> Result<&str> {
+        self.strings.get(name).map(String::as_str).ok_or_else(|| {
+            RuntimeError::Rejected(format!("packet pipeline string {name:?} is missing"))
+        })
+    }
+
+    pub fn optional_string(&self, name: &str) -> Option<&str> {
+        self.strings.get(name).map(String::as_str)
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -636,6 +656,7 @@ mod tests {
         let metadata = PacketPipelines {
             version: VERSION,
             pipelines: vec![PacketPipeline {
+                strings: Default::default(),
                 name: "infer".into(),
                 driver: "feedforward.v1".into(),
                 programs: BTreeMap::from([

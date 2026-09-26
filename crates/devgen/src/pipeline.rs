@@ -111,6 +111,7 @@ pub fn causal_pipeline_section(
     let metadata = PacketPipelines {
         version: VERSION,
         pipelines: vec![PacketPipeline {
+            strings: Default::default(),
             name: spec.name.into(),
             driver: "causal.v1".into(),
             programs,
@@ -261,6 +262,7 @@ impl PacketPrefix {
         let metadata = PacketPipelines {
             version: VERSION,
             pipelines: vec![PacketPipeline {
+                strings: Default::default(),
                 name: name.into(),
                 driver: "forward.v1".into(),
                 programs,

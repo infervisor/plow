@@ -53,6 +53,7 @@ impl NemotronFrontend {
             normalize_per_feature,
             mask_invalid_frames: boolean(metadata, "asr.preprocessor.mask_invalid_frames")?,
             log_guard: 1.0 / 16_777_216.0,
+            shaping: Default::default(),
         };
         Ok((config, filter.f32_values()?))
     }

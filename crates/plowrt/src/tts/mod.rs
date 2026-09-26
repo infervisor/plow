@@ -179,6 +179,7 @@ mod tests {
             p.insert(k.into(), v);
         }
         PacketPipeline {
+            strings: Default::default(),
             name: "speech".into(),
             driver: DRIVER.into(),
             programs: BTreeMap::new(),

@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::{
-    frontend::{MelFeatures, QwenFrontend},
+    frontend::{MelFeatures, PacketLogMelFrontend},
     Transcript,
 };
 use crate::exec::packet_runtime::ForwardPacket;
@@ -34,56 +34,77 @@ pub(crate) struct QwenPrefilled {
 }
 
 pub(crate) struct PacketAudioEncoder {
-    packet: ForwardPacket,
+    pub(crate) packet: ForwardPacket,
     feature_frames: usize,
     feature_bins: usize,
     output_rows: usize,
     output_width: usize,
+    chunking: AudioChunking,
+}
+
+/// How features map to encoder rows: fixed-size frame chunks, each producing
+/// `ceil(len / frame_stride)` rows.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AudioChunking {
+    pub chunk_frames: usize,
+    pub frame_stride: usize,
+    pub round_bf16: bool,
+}
+
+impl AudioChunking {
+    fn from_pipeline(parameter: impl Fn(&str) -> Option<u64>) -> Result<Self> {
+        let get = |name: &str| {
+            parameter(name)
+                .and_then(|v| usize::try_from(v).ok())
+                .filter(|&v| v > 0)
+                .ok_or_else(|| RuntimeError::Rejected(format!("audio packet parameter {name:?} is missing")))
+        };
+        Ok(Self {
+            chunk_frames: get("input.chunk_frames")?,
+            frame_stride: get("encoder.frame_stride")?,
+            round_bf16: parameter("input.round_bf16").unwrap_or(0) == 1,
+        })
+    }
+
+    pub fn rows(&self, frames: usize) -> usize {
+        (frames / self.chunk_frames) * self.chunk_frames.div_ceil(self.frame_stride)
+            + (frames % self.chunk_frames).div_ceil(self.frame_stride)
+    }
 }
 
 impl PacketAudioEncoder {
     pub(crate) fn load(path: &std::path::Path, backend: &str) -> Result<Self> {
         let packet = ForwardPacket::load(path, "audio.encode", backend)?;
-        let feature_frames = usize::try_from(packet.parameter("input_frames")?)
-            .map_err(|_| RuntimeError::Rejected("audio packet frame capacity overflows".into()))?;
-        let output_rows = usize::try_from(packet.parameter("output_rows")?)
-            .map_err(|_| RuntimeError::Rejected("audio packet row capacity overflows".into()))?;
-        let feature_bins = usize::try_from(packet.parameter("feature_bins")?)
-            .map_err(|_| RuntimeError::Rejected("audio packet feature width overflows".into()))?;
-        let output_width = usize::try_from(
-            packet.optional_parameter("output_width").unwrap_or(2048),
-        )
-        .map_err(|_| RuntimeError::Rejected("audio packet output width overflows".into()))?;
-        let input_bytes = feature_frames
-            .div_ceil(100)
+        let chunking = AudioChunking::from_pipeline(|name| packet.optional_parameter(name))?;
+        let usize_param = |name: &str| {
+            usize::try_from(packet.parameter(name)?)
+                .map_err(|_| RuntimeError::Rejected(format!("audio packet parameter {name:?} overflows")))
+        };
+        let feature_frames = usize_param("input_frames")?;
+        let output_rows = usize_param("output_rows")?;
+        let feature_bins = usize_param("feature_bins")?;
+        let output_width = usize_param("output_width")?;
+        let chunks = feature_frames.div_ceil(chunking.chunk_frames);
+        let input_bytes = chunks
             .checked_mul(feature_bins)
-            .and_then(|elements| elements.checked_mul(100 * std::mem::size_of::<f32>()));
+            .and_then(|elements| elements.checked_mul(chunking.chunk_frames * std::mem::size_of::<f32>()));
         let output_bytes = output_rows
             .checked_mul(output_width)
             .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()));
         if feature_frames == 0
-            || feature_frames > 3000
             || feature_bins == 0
             || output_width == 0
-            || output_rows != super::qwen_audio_rows(feature_frames)
+            || output_rows != chunking.rows(feature_frames)
             || input_bytes != Some(packet.input_bytes())
             || output_bytes != Some(packet.output_bytes())
         {
-            return Err(RuntimeError::Rejected(
-                "audio packet geometry is inconsistent".into(),
-            ));
+            return Err(RuntimeError::Rejected("audio packet geometry is inconsistent".into()));
         }
-        Ok(Self {
-            packet,
-            feature_frames,
-            feature_bins,
-            output_rows,
-            output_width,
-        })
+        Ok(Self { packet, feature_frames, feature_bins, output_rows, output_width, chunking })
     }
 
     pub(crate) fn accepts(&self, frames: usize) -> bool {
-        (50..=self.feature_frames).contains(&frames)
+        (1..=self.feature_frames).contains(&frames)
     }
 
     pub(crate) fn encode(&mut self, features: &MelFeatures) -> Result<Vec<f32>> {
@@ -93,33 +114,30 @@ impl PacketAudioEncoder {
                 .checked_mul(features.frames)
                 .is_none_or(|elements| features.values.len() != elements)
         {
-            return Err(RuntimeError::Rejected(
-                "audio features do not match packet capacity".into(),
-            ));
+            return Err(RuntimeError::Rejected("audio features do not match packet capacity".into()));
         }
-        let chunks = self.feature_frames.div_ceil(100);
-        let mut input = vec![0.0f32; chunks * self.feature_bins * 100];
+        let chunk = self.chunking.chunk_frames;
+        let chunks = self.feature_frames.div_ceil(chunk);
+        let mut input = vec![0.0f32; chunks * self.feature_bins * chunk];
         for batch in 0..chunks {
             for bin in 0..self.feature_bins {
-                for frame in 0..100 {
-                    let source_frame = batch * 100 + frame;
+                for frame in 0..chunk {
+                    let source_frame = batch * chunk + frame;
                     if source_frame < features.frames {
-                        input[(batch * self.feature_bins + bin) * 100 + frame] =
-                            round_bf16(features.values[bin * features.frames + source_frame]);
+                        let v = features.values[bin * features.frames + source_frame];
+                        input[(batch * self.feature_bins + bin) * chunk + frame] =
+                            if self.chunking.round_bf16 { round_bf16(v) } else { v };
                     }
                 }
             }
         }
         let mut output = vec![0.0f32; self.output_rows * self.output_width];
-        let valid_rows = super::qwen_audio_rows(features.frames);
+        let valid_rows = self.chunking.rows(features.frames);
         let valid_rows_u32 = u32::try_from(valid_rows)
             .map_err(|_| RuntimeError::Rejected("audio packet row count overflows".into()))?;
-        self.packet
-            .write("valid_rows", &valid_rows_u32.to_le_bytes())?;
+        self.packet.write("valid_rows", &valid_rows_u32.to_le_bytes())?;
         self.packet.run_for_capacity(
-            features.frames.try_into().map_err(|_| {
-                RuntimeError::Rejected("audio feature frame count overflows".into())
-            })?,
+            features.frames.try_into().map_err(|_| RuntimeError::Rejected("audio feature frame count overflows".into()))?,
             bytemuck::cast_slice(&input),
             bytemuck::cast_slice_mut(&mut output),
         )?;
@@ -151,24 +169,137 @@ pub(crate) trait QwenExecution: Send {
     ) -> Result<QwenDecode>;
 }
 
+/// A causal audio LM (encoder rows spliced over a placeholder token, then greedy decoding)
+/// driven entirely by its packets: `encoder.pkt` carries the frontend and chunking, the causal
+/// pipeline of `model.pkt` the prompt layout, markers, languages and stop ids. The checkpoint
+/// directory supplies only the tokenizer and chat template.
 pub struct QwenAsr {
     execution: Box<dyn QwenExecution>,
-    frontend: QwenFrontend,
+    frontend: PacketLogMelFrontend,
     tokenizer: Arc<dyn Tokenize>,
     template: Arc<ChatTemplate>,
-    languages: Vec<String>,
-    hidden: usize,
-    placeholder: u32,
-    stop: Vec<u32>,
+    contract: AudioLmContract,
 }
 
-struct QwenCheckpoint {
-    tokenizer: Arc<dyn Tokenize>,
-    template: Arc<ChatTemplate>,
-    languages: Vec<String>,
+pub type AudioLmAsr = QwenAsr;
+
+struct AudioLmContract {
     hidden: usize,
     placeholder: u32,
     stop: Vec<u32>,
+    max_tokens: usize,
+    context_max_tokens: usize,
+    messages: serde_json::Value,
+    marker: String,
+    language_suffix: String,
+    forbidden: Vec<String>,
+    text_marker: String,
+    language_prefix: String,
+    language_none: String,
+    languages: Vec<String>,
+    aliases: Vec<(String, String)>,
+    chunking: AudioChunking,
+}
+
+impl AudioLmContract {
+    fn load(packet: &std::path::Path) -> Result<(Self, PacketLogMelFrontend)> {
+        let asset = crate::exec::packet_runtime::PacketAsset::load(packet)?;
+        let decoder = asset
+            .pipelines()
+            .iter()
+            .find(|p| p.driver == "causal.v1" && p.parameters.get("overlay_rows").is_some_and(|&r| r > 0))
+            .ok_or_else(|| RuntimeError::Rejected("packet has no causal audio pipeline".into()))?;
+        let param = |name: &str| {
+            decoder
+                .parameters
+                .get(name)
+                .copied()
+                .ok_or_else(|| RuntimeError::Rejected(format!("audio LM parameter {name:?} is missing")))
+        };
+        let text = |name: &str| {
+            decoder
+                .strings
+                .get(name)
+                .cloned()
+                .ok_or_else(|| RuntimeError::Rejected(format!("audio LM string {name:?} is missing")))
+        };
+        let lines = |name: &str| -> Result<Vec<String>> {
+            Ok(text(name)?.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect())
+        };
+        let to_usize = |v: u64| usize::try_from(v).map_err(|_| RuntimeError::Rejected("audio LM parameter overflows".into()));
+        let stop = (0..param("stop.count")?)
+            .map(|i| param(&format!("stop.{i}")).and_then(|id| u32::try_from(id).map_err(|_| RuntimeError::Rejected("stop id overflows".into()))))
+            .collect::<Result<Vec<_>>>()?;
+        let messages: serde_json::Value = serde_json::from_str(&text("prompt.messages")?)
+            .map_err(|e| RuntimeError::Rejected(format!("audio LM prompt.messages: {e}")))?;
+
+        let encoder_path = packet.with_file_name("encoder.pkt");
+        let encoder = crate::exec::packet_runtime::PacketAsset::load(&encoder_path)?;
+        let audio = encoder
+            .pipelines()
+            .iter()
+            .find(|p| p.name == "audio.encode")
+            .ok_or_else(|| RuntimeError::Rejected("encoder packet has no audio.encode pipeline".into()))?;
+        let chunking = AudioChunking::from_pipeline(|name| audio.parameters.get(name).copied())?;
+        let filterbank = audio
+            .tensors
+            .get("audio.frontend.filterbank")
+            .ok_or_else(|| RuntimeError::Rejected("encoder packet has no frontend filterbank".into()))?;
+        let raw = std::fs::read(&encoder_path).map_err(|source| RuntimeError::Io { path: encoder_path.clone(), source })?;
+        let blob = crate::asset::devblob::DevBlob::parse(&raw)?;
+        let bytes = blob
+            .tensors
+            .iter()
+            .find(|t| t.name == filterbank.name)
+            .and_then(|t| t.init.clone())
+            .map(|range| blob.init[range].to_vec())
+            .ok_or_else(|| RuntimeError::Rejected("frontend filterbank has no data".into()))?;
+        let frontend = PacketLogMelFrontend::from_parameters(|name| audio.parameters.get(name).copied(), &bytes)?;
+        Ok((
+            Self {
+                hidden: to_usize(param("hidden")?)?,
+                placeholder: u32::try_from(param("audio.token_id")?).map_err(|_| RuntimeError::Rejected("audio token overflows".into()))?,
+                stop,
+                max_tokens: to_usize(param("output.max_tokens")?)?,
+                context_max_tokens: to_usize(param("prompt.context_max_tokens")?)?,
+                messages,
+                marker: text("audio.marker")?,
+                language_suffix: text("prompt.language_suffix")?,
+                forbidden: lines("prompt.context_forbidden")?,
+                text_marker: text("output.text_marker")?,
+                language_prefix: text("output.language_prefix")?,
+                language_none: text("output.language_none")?,
+                languages: lines("languages")?,
+                aliases: lines("language.aliases")?
+                    .into_iter()
+                    .filter_map(|l| l.split_once('=').map(|(a, b)| (a.to_owned(), b.to_owned())))
+                    .collect(),
+                chunking,
+            },
+            frontend,
+        ))
+    }
+
+    /// `[text_marker]`-separated output with an optional `<language_prefix>NAME` header.
+    fn parse(&self, output: &str, forced_language: Option<&str>) -> Result<Transcript> {
+        let output = output.trim();
+        if output.is_empty() {
+            return Ok(Transcript { text: String::new(), language: None });
+        }
+        let (language, text) = if let Some(language) = forced_language {
+            (Some(language.to_owned()), output)
+        } else if let Some((header, text)) = output.split_once(self.text_marker.as_str()) {
+            let language = header
+                .strip_prefix(self.language_prefix.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| RuntimeError::Rejected("invalid ASR language header".into()))?;
+            let language = language.lines().next().unwrap_or_default().trim();
+            ((!language.eq_ignore_ascii_case(&self.language_none)).then(|| language.to_owned()), text)
+        } else {
+            return Err(RuntimeError::Rejected("missing ASR text marker".into()));
+        };
+        Ok(Transcript { text: text.trim().to_owned(), language })
+    }
 }
 
 struct PrefilledAudio {
@@ -222,142 +353,41 @@ impl QwenAsr {
         checkpoint: &std::path::Path,
         backend: &str,
     ) -> Result<(Self, &'static str)> {
-        let model = Self::checkpoint(checkpoint)?;
-        let (execution, loaded_backend) =
-            load_execution(packet, checkpoint, backend, model.hidden)?;
-        Ok((Self::from_checkpoint(model, execution), loaded_backend))
+        let (contract, frontend) = AudioLmContract::load(packet)?;
+        let tokenizer = load_tokenizer(checkpoint);
+        if tokenizer.is_byte_fallback() {
+            return Err(RuntimeError::Rejected("ASR requires a real tokenizer".into()));
+        }
+        if tokenizer.encode(&contract.marker) != [contract.placeholder] {
+            return Err(RuntimeError::Rejected("ASR audio marker does not tokenize to the packet's audio token".into()));
+        }
+        let template = ChatTemplate::load(checkpoint)
+            .ok_or_else(|| RuntimeError::Rejected("ASR requires the checkpoint chat template".into()))?;
+        let (execution, loaded_backend) = load_execution(packet, checkpoint, backend, contract.hidden)?;
+        Ok((Self { execution, frontend, tokenizer, template, contract }, loaded_backend))
     }
 
     pub fn batch_capacity(&self) -> usize {
         self.execution.batch_capacity()
     }
 
-    fn checkpoint(checkpoint: &std::path::Path) -> Result<QwenCheckpoint> {
-        let cfg: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(checkpoint.join("config.json"))
-                .map_err(|e| RuntimeError::Rejected(e.to_string()))?,
-        )
-        .map_err(|e| RuntimeError::Rejected(e.to_string()))?;
-        if cfg["model_type"] != "qwen3_asr" {
-            return Err(RuntimeError::Rejected("unsupported ASR family".into()));
-        }
-        let processor: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(checkpoint.join("preprocessor_config.json"))
-                .map_err(|e| RuntimeError::Rejected(e.to_string()))?,
-        )
-        .map_err(|e| RuntimeError::Rejected(e.to_string()))?;
-        validate_frontend(&processor)?;
-        let tokenizer = load_tokenizer(checkpoint);
-        if tokenizer.is_byte_fallback() {
-            return Err(RuntimeError::Rejected(
-                "ASR requires a real tokenizer".into(),
-            ));
-        }
-        let template = ChatTemplate::load(checkpoint)
-            .ok_or_else(|| RuntimeError::Rejected("ASR requires the checkpoint template".into()))?;
-        let hidden = cfg["thinker_config"]["text_config"]["hidden_size"]
-            .as_u64()
-            .ok_or_else(|| RuntimeError::Rejected("ASR hidden size missing".into()))?;
-        let hidden = usize::try_from(hidden)
-            .map_err(|_| RuntimeError::Rejected("ASR hidden size overflows".into()))?;
-        if hidden == 0 {
-            return Err(RuntimeError::Rejected("ASR hidden size is zero".into()));
-        }
-        let placeholder = cfg["thinker_config"]["audio_token_id"]
-            .as_u64()
-            .ok_or_else(|| RuntimeError::Rejected("ASR audio token missing".into()))?;
-        let placeholder = u32::try_from(placeholder)
-            .map_err(|_| RuntimeError::Rejected("ASR audio token overflows".into()))?;
-        for (marker, field) in [
-            ("<|audio_pad|>", "audio_token_id"),
-            ("<|audio_start|>", "audio_start_token_id"),
-            ("<|audio_end|>", "audio_end_token_id"),
-        ] {
-            let id = cfg["thinker_config"][field]
-                .as_u64()
-                .and_then(|id| u32::try_from(id).ok());
-            if id.is_none_or(|id| tokenizer.encode(marker) != [id]) {
-                return Err(RuntimeError::Rejected("ASR tokenizer id mismatch".into()));
-            }
-        }
-        let languages: Vec<String> = serde_json::from_value(cfg["support_languages"].clone())
-            .map_err(|e| RuntimeError::Rejected(e.to_string()))?;
-        let stop = read_eos_ids(checkpoint)?;
-        if stop.is_empty() {
-            return Err(RuntimeError::Rejected("ASR EOS ids missing".into()));
-        }
-        Ok(QwenCheckpoint {
-            tokenizer,
-            template,
-            languages,
-            hidden,
-            placeholder,
-            stop,
-        })
-    }
-
-    fn from_checkpoint(checkpoint: QwenCheckpoint, execution: Box<dyn QwenExecution>) -> Self {
-        Self {
-            execution,
-            frontend: QwenFrontend::default(),
-            tokenizer: checkpoint.tokenizer,
-            template: checkpoint.template,
-            languages: checkpoint.languages,
-            hidden: checkpoint.hidden,
-            placeholder: checkpoint.placeholder,
-            stop: checkpoint.stop,
-        }
-    }
-
     pub fn language(&self, requested: Option<&str>) -> Result<Option<String>> {
         let Some(requested) = requested else {
             return Ok(None);
         };
-        let aliases = [
-            ("zh", "Chinese"),
-            ("en", "English"),
-            ("yue", "Cantonese"),
-            ("ar", "Arabic"),
-            ("de", "German"),
-            ("fr", "French"),
-            ("es", "Spanish"),
-            ("pt", "Portuguese"),
-            ("id", "Indonesian"),
-            ("it", "Italian"),
-            ("ko", "Korean"),
-            ("ru", "Russian"),
-            ("th", "Thai"),
-            ("vi", "Vietnamese"),
-            ("ja", "Japanese"),
-            ("tr", "Turkish"),
-            ("hi", "Hindi"),
-            ("ms", "Malay"),
-            ("nl", "Dutch"),
-            ("sv", "Swedish"),
-            ("da", "Danish"),
-            ("fi", "Finnish"),
-            ("pl", "Polish"),
-            ("cs", "Czech"),
-            ("fil", "Filipino"),
-            ("fa", "Persian"),
-            ("el", "Greek"),
-            ("hu", "Hungarian"),
-            ("mk", "Macedonian"),
-            ("ro", "Romanian"),
-        ];
-        let requested = aliases
+        let requested = self
+            .contract
+            .aliases
             .iter()
             .find(|(code, _)| code.eq_ignore_ascii_case(requested))
-            .map(|(_, name)| *name)
-            .unwrap_or(requested);
-        self.languages
+            .map_or(requested, |(_, name)| name.as_str());
+        self.contract
+            .languages
             .iter()
             .find(|name| name.eq_ignore_ascii_case(requested))
             .cloned()
             .map(Some)
-            .ok_or_else(|| {
-                RuntimeError::Rejected(format!("unsupported ASR language {requested:?}"))
-            })
+            .ok_or_else(|| RuntimeError::Rejected(format!("unsupported ASR language {requested:?}")))
     }
 
     fn prefill_audio(
@@ -378,54 +408,54 @@ impl QwenAsr {
         };
         cancelled()?;
         let language = self.language(language)?;
-        if self.tokenizer.encode(context).len() > 256
-            || context.contains("<|")
-            || context.contains("<asr_text>")
+        let c = &self.contract;
+        if self.tokenizer.encode(context).len() > c.context_max_tokens
+            || c.forbidden.iter().any(|marker| context.contains(marker.as_str()))
         {
-            return Err(RuntimeError::Rejected(
-                "ASR prompt exceeds 256 tokens or contains control markers".into(),
-            ));
+            return Err(RuntimeError::Rejected(format!(
+                "ASR prompt exceeds {} tokens or contains control markers",
+                c.context_max_tokens
+            )));
         }
-        let features = self.frontend.extract(samples)?;
-        let rows = super::qwen_audio_rows(features.frames);
-        let messages = [
-            serde_json::json!({"role":"system","content":context}),
-            serde_json::json!({"role":"user","content":[{"type":"audio"}]}),
-        ];
-        let prompt = self
-            .template
-            .render(&messages)
-            .map_err(RuntimeError::Rejected)?;
-        if prompt.matches("<|audio_pad|>").count() != 1 {
-            return Err(RuntimeError::Rejected(
-                "ASR template needs exactly one audio marker".into(),
-            ));
+        let log_mel = self.frontend.extract(samples)?;
+        let mut features = MelFeatures { values: vec![0.0; log_mel.values.len()], frames: log_mel.frames };
+        for frame in 0..log_mel.frames {
+            for bin in 0..log_mel.bins {
+                features.values[bin * log_mel.frames + frame] = log_mel.values[frame * log_mel.bins + bin];
+            }
         }
-        let mut prompt = prompt.replace("<|audio_pad|>", &"<|audio_pad|>".repeat(rows));
+        let rows = c.chunking.rows(features.frames);
+        let mut messages = c.messages.clone();
+        fill_context(&mut messages, context);
+        let messages = messages.as_array().cloned().unwrap_or_default();
+        let prompt = self.template.render(&messages).map_err(RuntimeError::Rejected)?;
+        if prompt.matches(c.marker.as_str()).count() != 1 {
+            return Err(RuntimeError::Rejected("ASR template needs exactly one audio marker".into()));
+        }
+        let mut prompt = prompt.replace(c.marker.as_str(), &c.marker.repeat(rows));
         if let Some(language) = &language {
-            prompt.push_str(&format!("language {language}<asr_text>"));
+            prompt.push_str(&c.language_suffix.replace("{language}", language));
         }
         let ids = self.tokenizer.encode(&prompt);
         let required_context = ids
             .len()
-            .checked_add(1024)
+            .checked_add(c.max_tokens)
             .ok_or_else(|| RuntimeError::ContextLength("ASR prompt length overflows".into()))?;
         if required_context > self.execution.max_context() {
             return Err(RuntimeError::ContextLength(format!(
-                "ASR needs {} prompt + 1024 output positions; bundle has {}",
+                "ASR needs {} prompt + {} output positions; bundle has {}",
                 ids.len(),
+                c.max_tokens,
                 self.execution.max_context()
             )));
         }
         let positions: Vec<_> = ids
             .iter()
             .enumerate()
-            .filter_map(|(i, &id)| (id == self.placeholder).then_some(i))
+            .filter_map(|(i, &id)| (id == c.placeholder).then_some(i))
             .collect();
         if positions.len() != rows {
-            return Err(RuntimeError::Rejected(
-                "ASR placeholder count mismatch".into(),
-            ));
+            return Err(RuntimeError::Rejected("ASR placeholder count mismatch".into()));
         }
         cancelled()?;
         let frontend_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -435,7 +465,7 @@ impl QwenAsr {
                 features: &features,
                 token_ids: &ids,
                 audio_positions: &positions,
-                hidden: self.hidden,
+                hidden: self.contract.hidden,
             },
         )?;
         cancelled()?;
@@ -474,11 +504,12 @@ impl QwenAsr {
         };
         let decode_started = std::time::Instant::now();
         let mut output = Vec::new();
-        for step in 0..1024 {
+        let max_tokens = self.contract.max_tokens;
+        for step in 0..max_tokens {
             cancelled()?;
-            if self.stop.contains(&token) {
+            if self.contract.stop.contains(&token) {
                 let result =
-                    super::parse_qwen_output(&self.tokenizer.decode(&output), language.as_deref())?;
+                    self.contract.parse(&self.tokenizer.decode(&output), language.as_deref())?;
                 let elapsed = started.elapsed().as_secs_f64();
                 let audio_seconds = samples.len() as f64 / super::frontend::SAMPLE_RATE as f64;
                 tracing::info!(
@@ -495,7 +526,7 @@ impl QwenAsr {
                 return Ok(result);
             }
             output.push(token);
-            if step == 1023 {
+            if step + 1 == max_tokens {
                 break;
             }
             let pos = u32::try_from(prompt_len + step)
@@ -585,7 +616,8 @@ impl QwenAsr {
         let mut kvlen = vec![1; batch];
         let decode_started = std::time::Instant::now();
         let mut launched_decode_rows = 0usize;
-        for step in 0..1024 {
+        let max_tokens = self.contract.max_tokens;
+        for step in 0..max_tokens {
             for slot in 0..ready.len() {
                 let request_index = request_indices[slot];
                 if results[request_index].is_some() {
@@ -603,8 +635,8 @@ impl QwenAsr {
                 let request = ready[slot]
                     .as_ref()
                     .expect("unfinished request is prepared");
-                if self.stop.contains(&tokens[slot]) {
-                    results[request_index] = Some(super::parse_qwen_output(
+                if self.contract.stop.contains(&tokens[slot]) {
+                    results[request_index] = Some(self.contract.parse(
                         &self.tokenizer.decode(&output[slot]),
                         request.language.as_deref(),
                     ));
@@ -639,7 +671,7 @@ impl QwenAsr {
                 );
                 return Ok(results.into_iter().map(Option::unwrap).collect());
             }
-            if step == 1023 {
+            if step + 1 == max_tokens {
                 break;
             }
             let decoded = self
@@ -679,66 +711,72 @@ fn load_execution(
     )))
 }
 
-fn validate_frontend(v: &serde_json::Value) -> Result<()> {
-    for (key, expected) in [
-        ("feature_size", 128),
-        ("hop_length", 160),
-        ("n_fft", 400),
-        ("chunk_length", 30),
-        ("n_samples", 480000),
-        ("nb_max_frames", 3000),
-    ] {
-        if v[key].as_u64() != Some(expected) {
-            return Err(RuntimeError::Rejected(format!(
-                "unsupported ASR frontend {key}"
-            )));
-        }
+/// Replace every `"{context}"` string in the packet's message layout with the request context.
+fn fill_context(value: &mut serde_json::Value, context: &str) {
+    match value {
+        serde_json::Value::String(s) if s == "{context}" => *s = context.to_owned(),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|v| fill_context(v, context)),
+        serde_json::Value::Object(map) => map.values_mut().for_each(|v| fill_context(v, context)),
+        _ => {}
     }
-    if v["feature_extractor_type"] != "WhisperFeatureExtractor"
-        || v["padding_side"] != "right"
-        || v["padding_value"].as_f64() != Some(0.0)
-        || v["dither"].as_f64() != Some(0.0)
-        || v.get("sampling_rate")
-            .is_some_and(|rate| rate.as_u64() != Some(16000))
-    {
-        return Err(RuntimeError::Rejected(
-            "unsupported ASR frontend normalization or sample rate".into(),
-        ));
-    }
-    Ok(())
 }
 
-fn read_eos_ids(checkpoint: &std::path::Path) -> Result<Vec<u32>> {
-    for file in ["generation_config.json", "config.json"] {
-        let Ok(bytes) = std::fs::read(checkpoint.join(file)) else {
-            continue;
-        };
-        let Ok(config) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
-        };
-        match config.get("eos_token_id") {
-            Some(serde_json::Value::Number(id)) => {
-                if let Some(id) = id.as_u64() {
-                    return u32::try_from(id)
-                        .map(|id| vec![id])
-                        .map_err(|_| RuntimeError::Rejected("ASR EOS id overflows".into()));
-                }
-            }
-            Some(serde_json::Value::Array(ids)) => {
-                let ids: Option<Vec<_>> = ids
-                    .iter()
-                    .map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
-                    .collect();
-                if let Some(ids) = ids {
-                    if !ids.is_empty() {
-                        return Ok(ids);
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    /// Chunked rows equal three stride-2 convolutions over each 100-frame chunk.
+    #[test]
+    fn chunked_rows_cover_all_tails() {
+        let chunking = AudioChunking { chunk_frames: 100, frame_stride: 8, round_bf16: true };
+        for frames in 0usize..=3000 {
+            let expected: usize = (0..frames)
+                .step_by(100)
+                .map(|start| {
+                    let mut length = (frames - start).min(100);
+                    for _ in 0..3 {
+                        length = length.div_ceil(2);
                     }
-                } else {
-                    return Err(RuntimeError::Rejected("invalid ASR EOS ids".into()));
-                }
-            }
-            _ => {}
+                    length
+                })
+                .sum();
+            assert_eq!(chunking.rows(frames), expected);
         }
     }
-    Ok(Vec::new())
+
+    #[test]
+    fn marker_output_parse() {
+        let c = AudioLmContract {
+            hidden: 1,
+            placeholder: 0,
+            stop: vec![],
+            max_tokens: 1,
+            context_max_tokens: 1,
+            messages: serde_json::Value::Null,
+            marker: String::new(),
+            language_suffix: String::new(),
+            forbidden: vec![],
+            text_marker: "<asr_text>".into(),
+            language_prefix: "language ".into(),
+            language_none: "none".into(),
+            languages: vec![],
+            aliases: vec![],
+            chunking: AudioChunking { chunk_frames: 1, frame_stride: 1, round_bf16: false },
+        };
+        let result = c.parse("language English<asr_text>Hello.", None).unwrap();
+        assert_eq!(result.language.as_deref(), Some("English"));
+        assert_eq!(result.text, "Hello.");
+        assert_eq!(c.parse("你好", Some("Chinese")).unwrap().text, "你好");
+        assert!(c.parse("Hello.", None).is_err());
+        assert!(c.parse("language None<asr_text>", None).unwrap().language.is_none());
+        assert_eq!(c.parse("", None).unwrap().text, "");
+    }
+
+    #[test]
+    fn context_fills_every_placeholder() {
+        let mut v: serde_json::Value = serde_json::from_str(r#"[{"role":"system","content":"{context}"},{"role":"user","content":[{"type":"audio"}]}]"#).unwrap();
+        fill_context(&mut v, "hi \"there\"");
+        assert_eq!(v[0]["content"], "hi \"there\"");
+        assert_eq!(v[1]["content"][0]["type"], "audio");
+    }
 }

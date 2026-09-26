@@ -132,6 +132,7 @@ impl ConformerPackets {
         let metadata = PacketPipelines {
             version: VERSION,
             pipelines: vec![PacketPipeline {
+                strings: Default::default(),
                 name: "encode".into(),
                 driver: "forward.v1".into(),
                 programs,

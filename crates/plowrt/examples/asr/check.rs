@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokenizer = plowrt::text::tokenizer::load_tokenizer(checkpoint);
     let input: serde_json::Value =
         serde_json::from_slice(&std::fs::read(reference.join("input.json"))?)?;
-    let rows = plowrt::asr::qwen_audio_rows(features.frames);
+    let rows = 13 * (features.frames / 100) + (features.frames % 100).div_ceil(8);
     let prompt = input["prompt"]
         .as_str()
         .unwrap()

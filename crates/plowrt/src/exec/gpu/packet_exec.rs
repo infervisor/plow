@@ -207,18 +207,25 @@ impl PacketRuntime for CudaPacketRuntime {
     }
 
     fn run(&mut self, program: usize) -> Result<()> {
-        let p = self
-            .programs
-            .get(program)
-            .ok_or_else(|| RuntimeError::Rejected(format!("packet program {program} is missing")))?;
-        self.be.memset_d8_async(p.counters, 0, p.counter_bytes, &self.stream)?;
+        self.run_sequence(&[program])
+    }
+
+    /// Every program is enqueued on the one stream (stream order is the dependency); one sync.
+    fn run_sequence(&mut self, programs: &[usize]) -> Result<()> {
         self.be.event_record(&self.events.0, &self.stream)?;
-        for seg in 0..p.segments {
-            let mut arg = p.kernarg;
-            arg.gq_seg_ofs += (seg * 4) as u64;
-            arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
-            let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-            self.be.launch_cooperative(self.function, self.grid, BLOCK, self.smem, &mut params, Some(&self.stream))?;
+        for &program in programs {
+            let p = self
+                .programs
+                .get(program)
+                .ok_or_else(|| RuntimeError::Rejected(format!("packet program {program} is missing")))?;
+            self.be.memset_d8_async(p.counters, 0, p.counter_bytes, &self.stream)?;
+            for seg in 0..p.segments {
+                let mut arg = p.kernarg;
+                arg.gq_seg_ofs += (seg * 4) as u64;
+                arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
+                let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+                self.be.launch_cooperative(self.function, self.grid, BLOCK, self.smem, &mut params, Some(&self.stream))?;
+            }
         }
         self.be.event_record(&self.events.1, &self.stream)?;
         self.be.stream_synchronize(&self.stream)?;

@@ -9771,6 +9771,11 @@ fn emit_dense_gqa(
                     },
                 },
             )
+            .and_then(|mut section| {
+                let (parameters, strings) = asr::qwen::audio_lm_contract(&dir)?;
+                asr::qwen::extend_pipeline_section(&mut section, &parameters, &strings)?;
+                Ok(section)
+            })
             .unwrap_or_else(|error| panic!("causal packet pipeline: {error}")),
         );
     } else if let Some(name) = ecfg.tts_profile.as_deref().filter(|_| !block_mode) {
@@ -10240,6 +10245,9 @@ fn emit_dense_gqa(
         encoder
             .embed_checkpoint(&dir)
             .unwrap_or_else(|error| panic!("Qwen audio packet weights: {error}"));
+        encoder.embed_frontend(
+            asr::qwen::whisper_frontend(&dir).unwrap_or_else(|error| panic!("Qwen audio frontend: {error}")),
+        );
         let section = encoder
             .pipeline_section(3000)
             .unwrap_or_else(|error| panic!("Qwen audio packet metadata: {error}"));

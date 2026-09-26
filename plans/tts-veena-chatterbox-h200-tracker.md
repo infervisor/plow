@@ -83,3 +83,30 @@ Note: after merging worktree-asr-nvidia, rebuild lean-plow (plow_verify) before 
 
 - Veena `tie_word_embeddings: true` but the checkpoint also has `lm_head.weight`, differing from
   `embed_tokens` by up to 0.0105. vLLM ties (uses embed); transformers 5 does not. plow ties.
+
+## H100 SXM (eai-gpu-03-h100, 2026-09-26) — second box, same branch
+
+Toolchain: no nix; /home/lava/tts-work/env.sh (CUDA 12.9 from runfile components, gcc-14 host,
+rustup 1.95, elan). Assets /opt/dlami/nvme/lava-tts/assets, results .../results. gpulease for all GPU.
+
+Ceilings (measured): bf16 GEMM 803 TF, TF32 389 TF, fp32 47.6 TF; HBM read 3.15 TB/s, copy 3.05 TB/s.
+
+Baselines: vLLM Qwen3-ASR (73 LS clips, 481 s) WER 3.913%, p50 76.8 ms, p90 131 ms, seq RTFx 76, batch RTFx 1266.
+Stock Chatterbox RTF 0.608 (T3 19.2 ms/tok, S3Gen 485 ms).
+
+End to end (same tts_bench client):
+| arm | plow | vLLM+SNAC |
+|---|---|---|
+| Veena c1 stream aps / TTFA p50 | 3.24 / 108 ms | 3.15 / 91 ms |
+| Veena c8 stream | 14.96 / 235 (p90 356) | 13.89 / 209 (p90 2102) |
+| Veena c32 stream | 26.8 / 2883 (16 slots) | 39.1 / 1186 |
+| Chatterbox c1 full RTF | 0.065 (15.5 aps) | stock 0.608 |
+| Chatterbox c1 stream TTFA | 105 ms (after T3 yield fix; was 300) | n/a |
+| Chatterbox c8 full / stream aps | 41.0 / 39.1 | n/a |
+ASR gate CER: plow Veena 0.008, vLLM Veena 0.005, plow Chatterbox stream 0.000.
+Qwen3-ASR on plowrt CUDA (encoder.pkt on CudaPacketRuntime + speech object): WER 3.913% (= vLLM),
+p50 139 ms, p90 221 ms, seq RTFx 42.8. WS partials ("partials": true) every 1 s of audio.
+
+User rule (2026-09-26): all model support via plowc packets; plowrt runs packets only (CPU threads ok
+for host tasks); no model-specific ops/segments in plowrt. Open: SNAC + S3Gen are bespoke .so;
+t3.rs/chatterbox.rs/asr qwen host code is model-specific.

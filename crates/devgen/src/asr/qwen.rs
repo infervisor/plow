@@ -23,6 +23,7 @@ pub struct AudioEncoderPackets {
     feature_frames: u32,
     valid_rows: u32,
     capacity_programs: BTreeMap<u32, Vec<usize>>,
+    frontend: Option<(u32, BTreeMap<String, u64>, [u64; 2])>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,8 +194,31 @@ impl AudioEncoderPackets {
                 shape: vec![1],
             },
         );
+        if let Some((tensor, parameters, shape)) = &self.frontend {
+            pipeline.parameters.extend(parameters.iter().map(|(k, v)| (k.clone(), *v)));
+            pipeline.tensors.insert(
+                "audio.frontend.filterbank".into(),
+                plow_asset::packet_pipeline::PipelineTensor {
+                    name: self.prefix.model.tensors[*tensor as usize].name.clone(),
+                    dtype: PipelineDType::F32,
+                    shape: shape.to_vec(),
+                },
+            );
+        }
         section.data = serde_json::to_vec(&metadata).map_err(|error| error.to_string())?;
         Ok(section)
+    }
+
+    /// Embed the host frontend (its parameters and filterbank) in the encoder packet.
+    pub fn embed_frontend(&mut self, frontend: WhisperFrontend) {
+        let bytes: Vec<u8> = frontend.filterbank.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tensor = self.prefix.model.tensors.len() as u32;
+        self.prefix.model.tensors.push(packet::devbuild::TensorDecl {
+            name: "const.audio.log_mel_filterbank".into(),
+            bytes: bytes.len() as u64,
+            init: Some(bytes),
+        });
+        self.frontend = Some((tensor, frontend.parameters, [u64::from(frontend.bins), u64::from(frontend.spectrum_bins)]));
     }
 }
 
@@ -476,6 +500,7 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
         feature_frames,
         valid_rows,
         capacity_programs: BTreeMap::new(),
+        frontend: None,
         prefix,
     })
 }
@@ -784,4 +809,146 @@ mod tests {
         assert!(programs.contains_key("forward.100.270"));
         assert!(programs.contains_key("forward.200.270"));
     }
+}
+
+/// Whisper feature extraction as the generic packet log-mel frontend: parameters plus the
+/// Slaney mel filterbank (`[bins][n_fft/2+1]`), from `preprocessor_config.json`.
+pub struct WhisperFrontend {
+    pub parameters: BTreeMap<String, u64>,
+    pub filterbank: Vec<f32>,
+    pub bins: u32,
+    pub spectrum_bins: u32,
+}
+
+pub fn whisper_frontend(checkpoint: &std::path::Path) -> Result<WhisperFrontend, String> {
+    let text = std::fs::read(checkpoint.join("preprocessor_config.json")).map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_slice(&text).map_err(|e| e.to_string())?;
+    if v["feature_extractor_type"] != "WhisperFeatureExtractor" || v["dither"].as_f64().unwrap_or(0.0) != 0.0 {
+        return Err("audio frontend is not a dither-free WhisperFeatureExtractor".into());
+    }
+    let get = |k: &str| v[k].as_u64().ok_or(format!("preprocessor_config.json: {k} missing"));
+    let (bins, hop, fft, samples) = (get("feature_size")?, get("hop_length")?, get("n_fft")?, get("n_samples")?);
+    let rate = v["sampling_rate"].as_u64().unwrap_or(16_000);
+    let spectrum = fft / 2 + 1;
+    let hz_to_mel = |hz: f64| if hz < 1000.0 { hz * 3.0 / 200.0 } else { 15.0 + (hz / 1000.0).ln() * 27.0 / 6.4f64.ln() };
+    let mel_to_hz = |mel: f64| if mel < 15.0 { mel * 200.0 / 3.0 } else { 1000.0 * ((mel - 15.0) * 6.4f64.ln() / 27.0).exp() };
+    let top = hz_to_mel(rate as f64 / 2.0);
+    let points: Vec<f64> = (0..bins + 2).map(|i| mel_to_hz(top * i as f64 / (bins + 1) as f64)).collect();
+    let mut filterbank = vec![0f32; (bins * spectrum) as usize];
+    for m in 0..bins as usize {
+        for k in 0..spectrum as usize {
+            let hz = k as f64 * rate as f64 / fft as f64;
+            let rise = (hz - points[m]) / (points[m + 1] - points[m]);
+            let fall = (points[m + 2] - hz) / (points[m + 2] - points[m + 1]);
+            filterbank[m * spectrum as usize + k] = (rise.min(fall).max(0.0) * 2.0 / (points[m + 2] - points[m])) as f32;
+        }
+    }
+    let f = |x: f32| u64::from(x.to_bits());
+    let parameters = BTreeMap::from([
+        ("audio.frontend.kind".into(), 1),
+        ("audio.sample_rate".into(), rate),
+        ("audio.frontend.fft".into(), fft),
+        ("audio.frontend.window".into(), fft),
+        ("audio.frontend.hop".into(), hop),
+        ("audio.frontend.bins".into(), bins),
+        ("audio.frontend.preemphasis_f32".into(), f(0.0)),
+        ("audio.frontend.center_window".into(), 0),
+        ("audio.frontend.periodic_hann".into(), 1),
+        ("audio.frontend.normalize_per_feature".into(), 0),
+        ("audio.frontend.mask_invalid_frames".into(), 0),
+        ("audio.frontend.log_guard_f32".into(), f(1e-10)),
+        ("audio.frontend.pad_reflect".into(), 1),
+        ("audio.frontend.drop_last_frame".into(), 1),
+        ("audio.frontend.log10".into(), 1),
+        ("audio.frontend.log_floor".into(), 1),
+        ("audio.frontend.dynamic_range_f32".into(), f(8.0)),
+        ("audio.frontend.scale_f32".into(), f(0.25)),
+        ("audio.frontend.shift_f32".into(), f(4.0)),
+        ("audio.min_samples".into(), rate / 2),
+        ("audio.max_samples".into(), samples),
+        // Encoder input: 100-frame chunks, each ceil(len / 8) output rows (three stride-2 convs).
+        ("input.chunk_frames".into(), 100),
+        ("input.round_bf16".into(), 1),
+        ("encoder.frame_stride".into(), 8),
+    ]);
+    Ok(WhisperFrontend { parameters, filterbank, bins: bins as u32, spectrum_bins: spectrum as u32 })
+}
+
+/// Host contract of the Qwen3-ASR decoder for the generic audio-LM driver: prompt layout,
+/// audio marker, output markers, languages and stop ids, as packet strings and parameters.
+pub fn audio_lm_contract(
+    checkpoint: &std::path::Path,
+) -> Result<(BTreeMap<String, u64>, BTreeMap<String, String>), String> {
+    let json = |file: &str| -> Result<serde_json::Value, String> {
+        serde_json::from_slice(&std::fs::read(checkpoint.join(file)).map_err(|e| format!("{file}: {e}"))?)
+            .map_err(|e| format!("{file}: {e}"))
+    };
+    let config = json("config.json")?;
+    let thinker = &config["thinker_config"];
+    let audio_token = thinker["audio_token_id"].as_u64().ok_or("audio_token_id missing")?;
+    let mut stops = Vec::new();
+    for file in ["generation_config.json", "config.json"] {
+        let Ok(v) = json(file) else { continue };
+        match &v["eos_token_id"] {
+            serde_json::Value::Number(n) => stops.extend(n.as_u64()),
+            serde_json::Value::Array(a) => stops.extend(a.iter().filter_map(|x| x.as_u64())),
+            _ => {}
+        }
+        if !stops.is_empty() {
+            break;
+        }
+    }
+    if stops.is_empty() {
+        return Err("no EOS ids".into());
+    }
+    let languages: Vec<String> =
+        serde_json::from_value(config["support_languages"].clone()).map_err(|e| format!("support_languages: {e}"))?;
+    const ALIASES: &[(&str, &str)] = &[
+        ("zh", "Chinese"), ("en", "English"), ("yue", "Cantonese"), ("ar", "Arabic"), ("de", "German"),
+        ("fr", "French"), ("es", "Spanish"), ("pt", "Portuguese"), ("id", "Indonesian"), ("it", "Italian"),
+        ("ko", "Korean"), ("ru", "Russian"), ("th", "Thai"), ("vi", "Vietnamese"), ("ja", "Japanese"),
+        ("tr", "Turkish"), ("hi", "Hindi"), ("ms", "Malay"), ("nl", "Dutch"), ("sv", "Swedish"),
+        ("da", "Danish"), ("fi", "Finnish"), ("pl", "Polish"), ("cs", "Czech"), ("fil", "Filipino"),
+        ("fa", "Persian"), ("el", "Greek"), ("hu", "Hungarian"), ("mk", "Macedonian"), ("ro", "Romanian"),
+    ];
+    let mut parameters = BTreeMap::from([
+        ("audio.token_id".into(), audio_token),
+        ("output.max_tokens".into(), 1024),
+        ("prompt.context_max_tokens".into(), 256),
+        ("stop.count".into(), stops.len() as u64),
+    ]);
+    for (i, id) in stops.iter().enumerate() {
+        parameters.insert(format!("stop.{i}"), *id);
+    }
+    let strings = BTreeMap::from([
+        (
+            "prompt.messages".into(),
+            r#"[{"role":"system","content":"{context}"},{"role":"user","content":[{"type":"audio"}]}]"#.into(),
+        ),
+        ("audio.marker".into(), "<|audio_pad|>".into()),
+        ("prompt.language_suffix".into(), "language {language}<asr_text>".into()),
+        ("prompt.context_forbidden".into(), "<|\n<asr_text>".into()),
+        ("output.text_marker".into(), "<asr_text>".into()),
+        ("output.language_prefix".into(), "language ".into()),
+        ("output.language_none".into(), "none".into()),
+        ("languages".into(), languages.join("\n")),
+        ("language.aliases".into(), ALIASES.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>().join("\n")),
+    ]);
+    Ok((parameters, strings))
+}
+
+/// Merge extra parameters and strings into every pipeline of a metadata section.
+pub fn extend_pipeline_section(
+    section: &mut packet::devbuild::SectionData,
+    parameters: &BTreeMap<String, u64>,
+    strings: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mut metadata: plow_asset::packet_pipeline::PacketPipelines =
+        serde_json::from_slice(&section.data).map_err(|e| e.to_string())?;
+    for pipeline in &mut metadata.pipelines {
+        pipeline.parameters.extend(parameters.iter().map(|(k, v)| (k.clone(), *v)));
+        pipeline.strings.extend(strings.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    section.data = serde_json::to_vec(&metadata).map_err(|e| e.to_string())?;
+    Ok(())
 }
