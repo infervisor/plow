@@ -369,6 +369,32 @@ enum Cmd {
     /// same weights, same input, and the outputs compared. It exists separately
     /// from `amd-bench` because a block is not a model — no embed, no lm_head,
     /// no argmax — so none of the token-level entry points apply.
+    /// Serve DeepSeek-V4.1-Flash on NVIDIA sm_90a GPUs (OpenAI `/v1/completions`): the dedicated
+    /// host-driven engine in `plowrt::dsv41`, pipeline-parallel over the visible GPUs.
+    Dsv41Serve {
+        /// Hugging Face checkpoint directory (config.json, shards, tokenizer.json).
+        #[arg(long, id = "dsv41_ckpt")]
+        ckpt: PathBuf,
+        /// Kernel cubin from scripts/build_dsv41_sm90a.sh.
+        #[arg(long, id = "dsv41_cubin")]
+        cubin: PathBuf,
+        #[arg(long, id = "dsv41_port", default_value_t = 8200)]
+        port: u16,
+        /// Longest sequence (prompt + generated) a slot holds.
+        #[arg(long, id = "dsv41_max_len", default_value_t = 20480)]
+        max_len: usize,
+        /// Concurrent sequences (decode batch ceiling).
+        #[arg(long, id = "dsv41_max_slots", default_value_t = 64)]
+        max_slots: usize,
+        /// Layer boundaries per GPU, e.g. 0,10,20,30,40.
+        #[arg(long, id = "dsv41_bounds", default_value = "0,10,20,30,40")]
+        bounds: String,
+        /// Per-GPU scratch arena, GiB.
+        #[arg(long, id = "dsv41_arena_gib", default_value_t = 24)]
+        arena_gib: u64,
+        #[arg(long, id = "dsv41_served_model_name", default_value = "deepseek-ai/DeepSeek-V4.1-Flash")]
+        served_model_name: String,
+    },
     AmdBlock {
         /// Compiled block blob (`model.pkt`).
         #[arg(long)]
@@ -1082,6 +1108,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBlock { .. } => Err("plowrt was built without --features hsa".into()),
+        #[cfg(feature = "cuda")]
+        Cmd::Dsv41Serve { ckpt, cubin, port, max_len, max_slots, bounds, arena_gib, served_model_name } => {
+            let bounds: Vec<usize> = bounds
+                .split(',')
+                .map(|v| v.trim().parse::<usize>())
+                .collect::<Result<_, _>>()
+                .map_err(|e| format!("--bounds: {e}"))?;
+            plowrt::dsv41::serve::run(plowrt::dsv41::serve::ServeOpts {
+                ckpt,
+                cubin,
+                port,
+                model_name: served_model_name,
+                engine: plowrt::dsv41::engine::EngineOpts { max_len, max_slots, bounds, arena_bytes: arena_gib << 30 },
+            })
+            .await
+        }
+        #[cfg(not(feature = "cuda"))]
+        Cmd::Dsv41Serve { .. } => Err("plowrt was built without --features cuda".into()),
     }
 }
 

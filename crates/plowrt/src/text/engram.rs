@@ -10,11 +10,88 @@
 //! either: the lookback stops at a dead token, so a position's ids depend on the MASK, not only on
 //! its own id.
 //!
-//! The tables it hashes with come from [`nn_graph::models::config::DeepSeekV41Config::
-//! engram_hash_tables`]. Only the compressed-token map is built here, because only it needs the
-//! tokenizer.
+//! The tables it hashes with come from [`v41_hash_tables`], a copy of
+//! `nn_graph::models::config::DeepSeekV41Config::engram_hash_tables` kept here so the runtime does
+//! not depend on the model-definition crate (a test pins the two equal).
 
 use std::collections::HashMap;
+
+/// The Engram hash tables, `[engram layer][...]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngramTables {
+    /// `[layer][lookback]`, odd and bounded so `token_id * multiplier` cannot overflow `i64`.
+    pub multipliers: Vec<Vec<i64>>,
+    /// `[layer][flat (n-gram size, head) column]` bucket modulus.
+    pub primes: Vec<Vec<i64>>,
+    /// `[layer][flat column]` first row of that column's bucket range.
+    pub offsets: Vec<Vec<i64>>,
+}
+
+/// DeepSeek-V4.1-Flash's tables (`engram.py` `EngramLayout.from_args` + `compute_hash_multipliers`).
+///
+/// The multipliers are numpy `default_rng(10007 * layer)` draws, extracted from the released
+/// model; they are valid only for `layer_ids == [1, 14]`, `max_ngram == 4` and
+/// `compressed_vocab == 99_092` (the draw's bound is `(i64::MAX / compressed_vocab) / 2`), and any
+/// other configuration gets `None` rather than a plausible wrong hash. The primes are drawn in
+/// order from `vocab_size - 1` upward, never reused across layers or n-gram sizes.
+pub fn v41_hash_tables(
+    layer_ids: &[usize],
+    max_ngram: usize,
+    n_heads: usize,
+    vocab_size: i64,
+    compressed_vocab: usize,
+) -> Option<EngramTables> {
+    const MULTIPLIERS: [[i64; 4]; 2] = [
+        [76_632_096_046_245, 4_839_876_093_313, 35_959_672_319_349, 73_987_337_458_391],
+        [67_716_810_739_261, 51_510_806_800_915, 30_921_347_202_721, 82_619_226_485_591],
+    ];
+    if layer_ids != [1, 14] || max_ngram != 4 || compressed_vocab != 99_092 {
+        return None;
+    }
+    let is_prime = |n: i64| {
+        if n < 2 {
+            return false;
+        }
+        if n % 2 == 0 {
+            return n == 2;
+        }
+        let mut d = 3i64;
+        while d * d <= n {
+            if n % d == 0 {
+                return false;
+            }
+            d += 2;
+        }
+        true
+    };
+    let mut seen: Vec<i64> = Vec::new();
+    let (mut primes, mut offsets) = (Vec::new(), Vec::new());
+    for _ in layer_ids {
+        let mut flat = Vec::new();
+        for _ in 0..max_ngram - 1 {
+            // `current` restarts at the vocab bound for every n-gram size; `seen` persists
+            let mut current = vocab_size - 1;
+            for _ in 0..n_heads {
+                loop {
+                    current += 1;
+                    if is_prime(current) && !seen.contains(&current) {
+                        break;
+                    }
+                }
+                seen.push(current);
+                flat.push(current);
+            }
+        }
+        let mut acc = 0i64;
+        offsets.push(flat.iter().map(|p| {
+            let o = acc;
+            acc += *p;
+            o
+        }).collect());
+        primes.push(flat);
+    }
+    Some(EngramTables { multipliers: MULTIPLIERS.iter().map(|r| r.to_vec()).collect(), primes, offsets })
+}
 
 /// Maps every token id onto a smaller id space where tokens that normalize alike collapse
 /// together, so `" The"`, `"the"` and `"THE"` hash the same way.
@@ -236,6 +313,26 @@ impl EngramHasher {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn v41_tables_match_nn_graph() {
+        use nn_graph::models::config::{sub_config, ModelConfig};
+        // The released checkpoint's config (not vendored: it is the model's, not ours).
+        let dir = std::env::var("DSV41_CKPT").unwrap_or_else(|_| {
+            "/root/dsv41/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277".into()
+        });
+        let Ok(raw) = std::fs::read_to_string(std::path::Path::new(&dir).join("config.json")) else {
+            eprintln!("v41_tables_match_nn_graph: SKIPPED, no config.json under {dir} (set DSV41_CKPT)");
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let tower = if v.get("text_config").is_some() { sub_config(&v, "text_config") } else { v };
+        let ModelConfig::DeepSeekV41(c) = ModelConfig::from_json(&tower.to_string()).unwrap() else { panic!("not v41") };
+        let theirs = c.engram_hash_tables().unwrap();
+        let layers: Vec<usize> = c.engram_layer_ids.iter().map(|&l| l as usize).collect();
+        let ours = super::v41_hash_tables(&layers, c.engram_max_ngram_size as usize, c.engram_n_heads as usize, c.engram_vocab_size, c.engram_compressed_vocab_size as usize).unwrap();
+        assert_eq!((ours.multipliers, ours.primes, ours.offsets), (theirs.multipliers, theirs.primes, theirs.offsets));
+    }
+
     use super::*;
 
     /// The released checkpoint's constants. The multipliers come from numpy's PCG64 and cannot be

@@ -2852,6 +2852,7 @@ dependencies = [
  "libloading",
  "memmap2",
  "minijinja",
+ "nn-graph",
  "objc2",
  "objc2-core-ml",
  "objc2-foundation",

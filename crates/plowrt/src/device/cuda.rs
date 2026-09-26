@@ -251,6 +251,8 @@ driver_api! {
     cuMemcpyHtoDAsync_v2: fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult,
     cuMemcpyDtoHAsync_v2: fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult,
     cuMemcpyDtoDAsync_v2: fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult,
+    cuCtxEnablePeerAccess: fn(CUcontext, u32) -> CUresult,
+    cuMemcpyPeerAsync: fn(CUdeviceptr, CUcontext, CUdeviceptr, CUcontext, usize, CUstream) -> CUresult,
     cuMemcpy3DAsync_v2: fn(*const CUDA_MEMCPY3D, CUstream) -> CUresult,
     cuMemsetD8Async: fn(CUdeviceptr, u8, usize, CUstream) -> CUresult,
     cuEventCreate: fn(*mut CUevent, u32) -> CUresult,
@@ -1868,6 +1870,45 @@ impl CudaBackend {
             win32_handle_meta_data: std::ptr::null_mut(),
             alloc_flags: [0; 8],
         }
+    }
+
+    /// Let kernels on this device dereference `peer`'s allocations (NVLink/PCIe P2P). Idempotent:
+    /// an already-enabled pair is not an error.
+    pub fn enable_peer_access(&self, peer: &CudaBackend) -> Result<()> {
+        self.bind()?;
+        // SAFETY: both contexts are live primary contexts retained by their backends.
+        let rc = unsafe { (self.api.cuCtxEnablePeerAccess)(peer.ctx as CUcontext, 0) };
+        const CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED: CUresult = 704;
+        if rc == CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED {
+            return Ok(());
+        }
+        self.check(rc, "cuCtxEnablePeerAccess")
+    }
+
+    /// Copy `bytes` from `src` on `src_dev` to `dst` on this device, ordered on `stream` (this device's).
+    pub fn memcpy_peer_async(
+        &self,
+        dst: u64,
+        src_dev: &CudaBackend,
+        src: u64,
+        bytes: u64,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.bind()?;
+        self.check(
+            // SAFETY: caller keeps both device ranges live through stream completion.
+            unsafe {
+                (self.api.cuMemcpyPeerAsync)(
+                    dst,
+                    self.ctx as CUcontext,
+                    src,
+                    src_dev.ctx as CUcontext,
+                    bytes as usize,
+                    stream.raw as CUstream,
+                )
+            },
+            "cuMemcpyPeerAsync",
+        )
     }
 
     pub fn memcpy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {

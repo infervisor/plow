@@ -147,6 +147,7 @@ gguf = ["dep:gguf-rs-lib"]
 nemo-asr = ["dep:libloading", "gguf"]
 
 [dev-dependencies]
+nn-graph = { workspace = true }
 tokio-tungstenite = "0.24"
 plow-asset = { workspace = true, features = ["test-util"] }
 # `tests/op_audit_families.rs` emits one miniature blob per model family and runs
