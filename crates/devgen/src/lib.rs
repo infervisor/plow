@@ -8178,12 +8178,12 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     }
     if emit_config::active().prefill_cublaslt {
         assert!(
-            (model_type.starts_with("gemma4") || model_type == "llama")
+            (model_type.starts_with("gemma4") || model_type == "llama" || model_type == "qwen3_asr")
                 && arch == "sm_90a"
                 && tp == 1
                 && !emit_config::active().any_fp8_weights()
                 && !emit_config::active().mxfp4,
-            "cuBLASLt prefill emission requires Gemma 4 or Llama BF16 on single-GPU SM90"
+            "cuBLASLt prefill emission requires Gemma 4, Llama or Qwen3-ASR BF16 on single-GPU SM90"
         );
     }
     if emit_config::active().gemma4_sm90_gemm_glu_role {

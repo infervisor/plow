@@ -3727,9 +3727,9 @@ impl GpuEngine {
                         .module_global_u32(&module, "plow_arena_bytes")?
                         .unwrap_or(12352),
                 };
-                if smem > 48 * 1024 {
-                    be.set_max_dynamic_smem(f, smem)?;
-                }
+                // Static + dynamic above 48 KiB needs the opt-in even when the dynamic part
+                // alone is under it (wide GV_MM_MAX objects carry ~40 KiB of static smem).
+                be.set_max_dynamic_smem(f, smem)?;
                 let occ = be.occupancy_blocks_per_sm(f, BLOCK, smem as usize)?;
                 let grid = decode_object::initial_grid(
                     decode_objects.as_ref(),
