@@ -5462,7 +5462,7 @@ fn glm_seq_par_proj_routes_on_the_band() {
     let c_rn2 = emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false,
         &mut xgate, &all, None);
     emit_glm_moe_ffn_prefill(&mut b, &c, &n, 0, t, MoeEnc::Fp8Blk, n.xnext, c_rn2, &mut xgate,
-        &all, false);
+        &all, false, None, GLM_ROUTER_FLAGS);
     let p = b.finish();
     let name = |h: u32| p.tensors[h as usize].name.as_str();
     let is = |d: &crate::DevInst, op: DevOp| d.op == op as u16;
@@ -5517,7 +5517,7 @@ fn glm_router_overlap_runs_the_band_router_beside_the_hidden_gather() {
         let c_rn2 = emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false,
             &mut xgate, &all, None);
         emit_glm_moe_ffn_prefill(&mut b, &c, &n, 0, t, MoeEnc::Fp8Blk, n.xnext, c_rn2, &mut xgate,
-            &all, false);
+            &all, false, None, GLM_ROUTER_FLAGS);
         (n, c, b.finish())
     };
     type P = packet::devbuild::Program;
@@ -5602,7 +5602,7 @@ fn glm_gemm_lt_pf_ext_routes_the_interpreter_projections() {
         let c_rn2 = emit_glm_mla_prefill(&mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false,
             &mut xgate, &all, None);
         emit_glm_moe_ffn_prefill(&mut b, &c, &n, 0, t, MoeEnc::Fp8Blk, n.xnext, c_rn2, &mut xgate,
-            &all, false);
+            &all, false, None, GLM_ROUTER_FLAGS);
         b.finish()
     };
     let off = layer(None);
@@ -6527,3 +6527,88 @@ fn glm_mla_strided_wv_preserves_bf16_boundary_and_rung_domain() {
         assert_eq!(p.insts[merge + 1].i, [rows, 8, 256, 512, 0, stride, 0, 0]);
     }
 }
+/// A stable digest of one emitted program's instruction stream.
+///
+/// Field by field rather than over the serialized blob, so the number it prints is the same one a
+/// reader can reconstruct from an assertion failure elsewhere in this file.
+#[cfg(test)]
+pub(crate) fn emission_digest(p: &packet::devbuild::Program) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut put = |v: u64, h: &mut u64| {
+        for b in v.to_le_bytes() {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    };
+    for d in &p.insts {
+        put(d.op as u64, &mut h);
+        put(d.blocks as u64, &mut h);
+        put(d.wait_len as u64, &mut h);
+        put(d.succ_len as u64, &mut h);
+        for v in d.t {
+            put(v as u64, &mut h);
+        }
+        for v in d.i {
+            put(v as u64, &mut h);
+        }
+        for v in d.f {
+            put(v.to_bits() as u64, &mut h);
+        }
+        for v in d.j {
+            put(v as u64, &mut h);
+        }
+    }
+    for w in &p.waits {
+        put(w.id as u64, &mut h);
+        put(w.threshold as u64, &mut h);
+    }
+    h
+}
+
+/// The GLM-5.2 prefill MoE emission, pinned byte for byte.
+///
+/// `emit_glm_moe_ffn_prefill` is 516 lines of measured, tile-picked, lean-segmented prefill body
+/// that four model families share. Anything that reshapes it for reuse -- parameterising its
+/// config and scratch so another family can call it, say -- must not move a single emitted field,
+/// and the ordinary assertions in this file check a handful of ops rather than the whole stream.
+/// This pins the whole stream. A change here is either a bug or a deliberate re-blessing, and the
+/// commit that changes the number has to say which.
+#[test]
+fn the_moe_prefill_emission_is_pinned() {
+    let _guard = crate::test_env::env_guard();
+    let _target = crate::EmitAmdGuard::set(true);
+    let _env = crate::test_env::EnvScope::set(&[
+        ("PLOW_GLM_MOE_AITER", "1"),
+        ("PLOW_GLM_FP8_KV", "1"),
+        ("PLOW_UNISEG", "0"),
+    ]);
+    let mut c = glm_ref_cfg();
+    c.tp = 8;
+    let (ctx, t) = (81920u32, 8192u32);
+    let mut decl = Builder::new(304);
+    let n = declare_glm_rows_batched(&mut decl, &c, ctx, &[3], t, 1, MoeEnc::Fp8Blk);
+    let mut b = Builder::new(304);
+    b.adopt_tensors(decl.tensors());
+    let all = b.all();
+    let mut xgate = 0;
+    let c_rn2 = emit_glm_mla_prefill(
+        &mut b, &c, &n, 0, ctx, t, MoeEnc::Fp8Blk, n.x, &[], false, &mut xgate, &all, None,
+    );
+    emit_glm_moe_ffn_prefill(
+        &mut b, &c, &n, 0, t, MoeEnc::Fp8Blk, n.xnext, c_rn2, &mut xgate, &all, false,
+        None,
+        GLM_ROUTER_FLAGS,
+    );
+    let p = b.finish();
+    assert_eq!(
+        emission_digest(&p),
+        GLM_MOE_PF_DIGEST,
+        "the GLM prefill MoE emission moved. If that was deliberate, re-bless \
+         GLM_MOE_PF_DIGEST and say why in the commit; if it was not, a refactor that was \
+         supposed to be shape-preserving changed an emitted field."
+    );
+}
+
+/// Re-blessed when the V4.1 bringup was ported onto main: this is origin/main's own emission,
+/// computed on a pristine main tree with this same test, so the port moves no emitted field.
+const GLM_MOE_PF_DIGEST: u64 = 8101875709743526241;

@@ -1384,6 +1384,68 @@ fn moe_combine_inst(d: &DevInst64) -> bool {
         && d.fj.iter().all(|&v| v == 0)
 }
 
+/// Which experts this rank owns, honouring `PLOW_MOE_EP_CUTS` when it is set.
+///
+/// The even split `balanced_expert_range` gives is only balanced if routing is uniform, and it is
+/// not: measured on V4.1 at 8k, 153 of 384 experts take any row at all, one takes 5868 rows
+/// against a mean of 128, and the even split's per-rank TILE load -- what the grouped GEMM bills,
+/// since a one-row expert costs the same MPF_BM tile as a full one -- runs 1.558x. That is paid at
+/// the next reduction, because the early ranks simply wait there.
+///
+/// An optimal set of UNEVEN contiguous cuts reaches 1.004x on the same histogram, as good as an
+/// unrestricted assignment, and without relabelling any expert -- so the router, the align filter
+/// and the weight binder keep agreeing by construction.
+///
+/// Cut points are a CALIBRATION of one routing distribution, not a property of the model.
+///
+/// MEASURED, AND IT IS AN ORACLE BOUND, NOT A SCHEDULE: on V4.1 at 8k/TP8, balancing the tile
+/// load from 1.558x to 1.004x takes the layer from 17149 us (even cuts) to 15164 us, against
+/// 16989 us for TP8. But those cuts were solved against the histogram that run produced, which a
+/// real request does not hand you in advance. Everything realizable lands at the even split's
+/// 17149 us, which is WORSE than TP8. See 12.77: expert popularity is predictable neither from
+/// the checkpoint (corr 0.13 between a Monte-Carlo through the real gate and the observed counts)
+/// nor from index position (corr -0.05, so round-robin gets 198 tiles against contiguous 217),
+/// and the top-8 experts carry 68.6% of the rows with the hottest alone at 83% of a rank's fair
+/// share. A static binding cannot absorb that tail. TP is balanced by construction here.
+///
+/// An earlier revision of this comment said the opposite, on numbers (13914 us against 13854 us)
+/// taken before `rung_run` restored its entry between iterations. It did not, so every iteration
+/// but the first ran on the previous one's output; the activations degenerate, the router lights
+/// fewer experts, and the tile histogram being balanced here is not the one that was measured.
+/// Balance looked inert because the benchmark had already flattened it.
+///
+/// A malformed list is FATAL rather than ignored. Every caller must reach ownership through here,
+/// and they arrive with the expert count spelled three different ways (the weight table's size,
+/// the align packet's `i[1]`, the combine's `i[6]`); silently falling back on one of them and not
+/// the others would leave a rank loading the weights of one expert set while its align kernel
+/// filtered for another, which does not fail -- it returns a slightly wrong answer.
+fn ep_expert_range(experts: u32, ranks: u32, rank: u32) -> Result<core::ops::Range<u32>> {
+    let Some(spec) = crate::config::RuntimeConfig::get().amd.moe_ep_cuts.as_deref() else {
+        return Ok(packet::moe_ep::balanced_expert_range(experts, ranks, rank));
+    };
+    let cuts: Vec<u32> = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| t.parse::<u32>().map_err(|_| {
+            RuntimeError::Device(format!("PLOW_MOE_EP_CUTS has a non-numeric entry {t:?}"))
+        }))
+        .collect::<Result<_>>()?;
+    if cuts.len() != ranks as usize + 1 || cuts[0] != 0 || cuts[ranks as usize] != experts {
+        return Err(RuntimeError::Device(format!(
+            "PLOW_MOE_EP_CUTS must be {} ascending cuts from 0 to {experts}; got {} ({spec})",
+            ranks + 1,
+            cuts.len()
+        )));
+    }
+    if cuts.windows(2).any(|w| w[0] > w[1]) {
+        return Err(RuntimeError::Device(format!(
+            "PLOW_MOE_EP_CUTS is not ascending ({spec})"
+        )));
+    }
+    Ok(cuts[rank as usize]..cuts[rank as usize + 1])
+}
+
 fn moe_ep_degree(d: &DevInst64) -> Option<u32> {
     let degree = match DevOp::from_u16(d.op) {
         Some(DevOp::MoeAlignPf | DevOp::MoeCombinePf) => d.i[5],
@@ -2072,6 +2134,38 @@ fn has_moe_combine_segment(prog: &DevProg) -> bool {
         .any(|set| set.len() == 1 && moe_combine_inst(&prog.insts[*set.first().unwrap()]))
 }
 
+/// This rank's copy of `insts`, with each EP align op carrying its own expert window.
+///
+/// Only needed for a CALIBRATED split: the device can derive the even split itself from the
+/// program uniform's rank, but not an uneven one, and `PLOW_MOE_EP_CUTS` is a host-side table.
+/// The instruction stream is uploaded per rank, so `i[6]`/`i[7]` here are this rank's alone.
+/// They are otherwise unread on this opcode -- the align takes T, n_exp, k, phase, npart and the
+/// degree in `i[0..=5]`.
+///
+/// Returns None when nothing needs patching, so the ordinary path uploads the blob's own slice.
+fn ep_align_window_patch(
+    prog: &DevProg,
+    tp: Option<(u32, u32)>,
+) -> Result<Option<Vec<DevInst64>>> {
+    if crate::config::RuntimeConfig::get().amd.moe_ep_cuts.is_none() {
+        return Ok(None);
+    }
+    let Some((rank, n_gpu)) = tp else {
+        return Ok(None);
+    };
+    let mut out: Option<Vec<DevInst64>> = None;
+    for (i, d) in prog.insts.iter().enumerate() {
+        if d.op != DevOp::MoeAlignPf as u16 || moe_ep_degree(d) != Some(n_gpu) {
+            continue;
+        }
+        let range = ep_expert_range(d.i[1], n_gpu, rank)?;
+        let v = out.get_or_insert_with(|| prog.insts.clone());
+        v[i].i[6] = range.start;
+        v[i].i[7] = range.end;
+    }
+    Ok(out)
+}
+
 fn has_moe_prefill_ep(prog: &DevProg) -> bool {
     prog.insts.iter().any(|d| moe_ep_degree(d).is_some())
 }
@@ -2142,6 +2236,7 @@ fn moe_mxfp4_routes_with_scratch(
     stage1_a4_scratch: Option<(u64, u64)>,
     ep_bind: Option<(u32, u32)>,
     a4_gather: bool,
+    ep_specialists: bool,
 ) -> Result<Vec<PrefillSegmentRoute>> {
     let n_seg = prog
         .stream
@@ -2201,7 +2296,12 @@ fn moe_mxfp4_routes_with_scratch(
                     .and_then(|d| moe_ep_degree(d).map(|n| (d, n)))
             })
             .collect();
-        if !ep_members.is_empty() {
+        // Without the gfx950 specialist chain there is nothing to route TO, and nothing to route
+        // FOR: `d_moe_align_pf` filters to this rank's expert window off `i[5]` and the program
+        // uniform's rank, and both grouped GEMMs already skip a null weight base. Leaving the
+        // segment to the interpreter is then not a fallback but the whole EP boundary, and it
+        // costs no standalone dispatches between cooperative packets.
+        if !ep_members.is_empty() && ep_specialists {
             let (rank, n_gpu) = ep_bind.ok_or_else(|| {
                 RuntimeError::Device(format!(
                     "program T={} segment {seg} declares expert parallelism without a TP binding",
@@ -2222,9 +2322,12 @@ fn moe_mxfp4_routes_with_scratch(
                 .all(|(d, _)| d.op == DevOp::MoeAlignPf as u16)
             {
                 let first = ep_members[0].0;
+                // `i[2]` is the align op's top_k. It used to be required to equal 16, which is
+                // Kimi-K3's top_k and not a property of the boundary -- DeepSeek-V4.1 routes
+                // top-6 and reached here only to be rejected as an "invalid EP align packet set".
                 if first.i[0] != prog.t
                     || first.i[1] == 0
-                    || first.i[2] != 16
+                    || first.i[2] == 0
                     || ep_members.iter().any(|(d, _)| {
                         d.t[..5] != first.t[..5]
                             || d.i[0] != first.i[0]
@@ -2237,7 +2340,7 @@ fn moe_mxfp4_routes_with_scratch(
                         prog.t
                     )));
                 }
-                let range = packet::moe_ep::balanced_expert_range(first.i[1], n_gpu, rank);
+                let range = ep_expert_range(first.i[1], n_gpu, rank)?;
                 let row_bytes = tensors
                     .get(first.t[2] as usize)
                     .ok_or_else(|| RuntimeError::Device("EP row-token handle is invalid".into()))?
@@ -2330,12 +2433,12 @@ fn moe_mxfp4_routes_with_scratch(
         if set.len() == 1 {
             let i = *set.first().unwrap();
             let d = &prog.insts[i];
-            if moe_ep_stage1_inst(d) {
-                let (a4, a4_scale) = stage1_a4_scratch.ok_or_else(|| {
-                    RuntimeError::Device(
-                        "EP stage-1 requires the reusable A4 quantization scratch".into(),
-                    )
-                })?;
+            // `stage1_a4_scratch` is Some exactly when BOTH lean stage-1 specialists loaded
+            // (they are gfx950-only), so its absence means "no specialist", not "bad packet":
+            // the interpreter's `d_moe_group_glu_pf` runs the same GLU and skips a null weight
+            // base, which is all EP asks of stage 1. Falling through is what makes the boundary
+            // reachable on gfx942.
+            if let (true, Some((a4, a4_scale))) = (moe_ep_stage1_inst(d), stage1_a4_scratch) {
                 let row_bytes = tensors
                     .get(d.t[5] as usize)
                     .ok_or_else(|| RuntimeError::Device("EP row-token handle is invalid".into()))?
@@ -2384,7 +2487,7 @@ fn moe_mxfp4_routes_with_scratch(
             }
             if moe_ep_combine_inst(d) {
                 let (rank, n_gpu) = ep_bind.expect("EP segment binding checked above");
-                let range = packet::moe_ep::balanced_expert_range(d.i[6], n_gpu, rank);
+                let range = ep_expert_range(d.i[6], n_gpu, rank)?;
                 let grid = d.i[2]
                     .checked_mul(d.i[0].div_ceil(256))
                     .ok_or_else(|| RuntimeError::Device("EP combine grid overflows".into()))?;
@@ -2403,23 +2506,22 @@ fn moe_mxfp4_routes_with_scratch(
                 }));
                 continue;
             }
-            if moe_ep_stage2_inst(d) {
-                let weight_table =
-                    companion(d.t[2], "expert_weight_table", "expert_weight_table_moe2")?
-                        .ok_or_else(|| {
-                            RuntimeError::Device(
-                                "EP stage-2 requires its shuffled down-weight companion table"
-                                    .into(),
-                            )
-                        })?;
-                let weight_scale_table =
-                    companion(d.t[3], "expert_scale_table", "expert_scale_table_moe2")?
-                        .ok_or_else(|| {
-                            RuntimeError::Device(
-                                "EP stage-2 requires its shuffled down-scale companion table"
-                                    .into(),
-                            )
-                        })?;
+            // The `_moe2` companions hold the down weights RE-SHUFFLED for the CDNA4 stage-2
+            // kernel's fragment order, so a packet built for a part without that kernel does not
+            // declare them. Absent, the interpreter's `d_moe_group_down_pf` runs the segment: it
+            // already scatters `part[row_partidx[row]][H]` scaled by `row_gate[row]` and skips a
+            // null weight base, which is stage-2's contract in the shipped layout.
+            // Resolved BEFORE the `if` and only for a stage-2 instruction: `companion` rejects a
+            // `TENSOR_NONE16` handle, and every other op in the segment reaches this line.
+            let ep_stage2_tables = if moe_ep_stage2_inst(d) {
+                (
+                    companion(d.t[2], "expert_weight_table", "expert_weight_table_moe2")?,
+                    companion(d.t[3], "expert_scale_table", "expert_scale_table_moe2")?,
+                )
+            } else {
+                (None, None)
+            };
+            if let (Some(weight_table), Some(weight_scale_table)) = ep_stage2_tables {
                 let rows = tensors
                     .get(d.t[6] as usize)
                     .ok_or_else(|| RuntimeError::Device("EP row-part handle is invalid".into()))?
@@ -2740,7 +2842,7 @@ fn moe_mxfp4_routes(
     tensors: &[crate::asset::devblob::DevTensor],
     devp: &[DeviceMem],
 ) -> Result<Vec<PrefillSegmentRoute>> {
-    moe_mxfp4_routes_with_scratch(prog, tensors, devp, None, None, false)
+    moe_mxfp4_routes_with_scratch(prog, tensors, devp, None, None, false, true)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4164,8 +4266,15 @@ impl ExpertNames {
 
     /// Is the scale an MX microscaling row (one E8M0 byte per 32 elements along
     /// K) rather than a block-fp8 `[N/128][K/128]` f32 grid?
+    ///
+    /// Keyed on the SCALE's spelling, and both MX spellings are listed. `.weight_scale` is the
+    /// compressed-tensors one that rides `.weight_packed`; `.scale` is DeepSeek-V4.1's, which
+    /// rides a plain `.weight`. Only `.weight_scale_inv` -- block-fp8's -- is not MX, and
+    /// enumerating the MX side rather than excluding that one means a spelling nobody has taught
+    /// this function is read as block-fp8 and caught by `check_expert_geometry`'s grid arithmetic,
+    /// rather than read as MX and accepted because the byte counts happened to line up.
     fn microscaled(&self) -> bool {
-        self.scale == ".weight_scale"
+        self.scale == ".weight_scale" || self.scale == ".scale"
     }
 }
 
@@ -4186,11 +4295,16 @@ fn resolve_expert_names(
     ckpt: &crate::asset::checkpoint::Checkpoint,
     pfx: &str,
 ) -> Result<ExpertNames> {
-    const TEMPLATES: [([&str; 3], &str); 2] = [
+    const TEMPLATES: [([&str; 3], &str); 3] = [
         (["gate_proj", "up_proj", "down_proj"], ".weight"),
         (["w1", "w3", "w2"], ".weight_packed"),
+        // DeepSeek-V4.1-Flash: `w1`/`w3`/`w2` with a PLAIN `.weight` payload and a `.scale` grid,
+        // which is neither of the two above. LAST, so it can only be reached once the other two
+        // have missed -- a checkpoint carrying `gate_proj.weight` still resolves as it always did,
+        // and one carrying `w1.weight_packed` still prefers the packed spelling over this one.
+        (["w1", "w3", "w2"], ".weight"),
     ];
-    const SCALES: [&str; 2] = [".weight_scale_inv", ".weight_scale"];
+    const SCALES: [&str; 3] = [".weight_scale_inv", ".weight_scale", ".scale"];
     let base = pfx.strip_prefix("moe.").unwrap_or(pfx);
     let mut tried: Vec<String> = Vec::new();
     for sub in ["", "mlp.", "block_sparse_moe."] {
@@ -4637,7 +4751,7 @@ fn bind_packed_experts(
         if ep_full.is_some() {
             return ep_full;
         }
-        dec.insts.iter().find_map(|d| {
+        let width_of = |d: &DevInst64| -> Option<u64> {
             if d.t[3] as usize == i_ewt && GLU_ARMS.iter().any(|&o| o as u16 == d.op) {
                 Some(d.i[1] as u64)
             } else if d.t[2] as usize == i_ewt && d.op == DevOp::MoeGroupGluPf as u16 {
@@ -4649,7 +4763,20 @@ fn bind_packed_experts(
             } else {
                 None
             }
-        })
+        };
+        // The DECODE program first, so every packet that has one answers exactly as it did.
+        //
+        // Then every other program, because a packet need not have a decode program that streams
+        // experts. A single-block PREFILL RUNG is the case: `derive_roles` reads a parent blob's
+        // roles positionally, so such a rung carries an empty decode program purely to make its
+        // real work classify as a prefill bucket, and the instruction that streams the experts is
+        // in the bucket. `I_moe` is a property of the PACKET's sharding -- the two programs cannot
+        // disagree about how wide one expert is -- so which program is asked does not change the
+        // answer, only whether there is one.
+        dec.insts
+            .iter()
+            .find_map(&width_of)
+            .or_else(|| blob.progs.iter().flat_map(|p| &p.insts).find_map(&width_of))
     };
 
     let mut bufs = Vec::with_capacity(layers.len() * 2);
@@ -4685,12 +4812,28 @@ fn bind_packed_experts(
                 blob.tensors[*i_ewt].bytes
             )));
         }
-        i_moe = i_moe_of(*i_ewt).ok_or_else(|| {
-            RuntimeError::Device(format!(
-                "{pfx}expert_weight_table is declared but no decode instruction \
-                 streams experts through it — nothing to pack against"
-            ))
-        })?;
+        i_moe = match i_moe_of(*i_ewt) {
+            Some(width) => width,
+            // An EP packet declares BOTH tables. `rewrite_replicated_moe_prefill_ep` points every
+            // prefill GLU/DOWN at the `_ep` companion and leaves the base table to the decode
+            // program -- so on a PREFILL-ONLY rung the base table is provably dead rather than
+            // mis-bound, and packing it would gather a checkpoint slice no op ever reads.
+            //
+            // The guard still fires for its own case: a table with no streaming instruction and
+            // no EP companion to explain it.
+            None if !*ep_table
+                && !*shared_fold
+                && names.iter().any(|x| *x == format!("{pfx}expert_weight_table_ep")) =>
+            {
+                continue;
+            }
+            None => {
+                return Err(RuntimeError::Device(format!(
+                    "{pfx}expert_weight_table is declared but no decode instruction \
+                     streams experts through it — nothing to pack against"
+                )));
+            }
+        };
         // WHICH SPELLING, from the checkpoint, before anything is sized against
         // it — then the weight/scale size agreement, once, for expert 0.
         let en = resolve_expert_names(ckpt, pfx)?;
@@ -4709,7 +4852,7 @@ fn bind_packed_experts(
         let (owned, whole) = if i_moe == i_moe_full {
             // EP: this rank owns a contiguous block of WHOLE experts.
             (
-                packet::moe_ep::balanced_expert_range(n_exp, n_gpu, rank),
+                ep_expert_range(n_exp, n_gpu, rank)?,
                 true,
             )
         } else if i_moe * n_gpu as u64 == i_moe_full {
@@ -6922,11 +7065,23 @@ impl AmdEngine {
             .prefill_phase()
             .any(|p| p.insts.iter().any(lean_attn_res_f32mix_inst64));
         if need_moe_ep {
-            if arch != "gfx950" {
+            // EP's DEVICE requirement is that the grouped prefill GEMM skip an expert whose weight
+            // base is null, and `d_moe_group_pf_a4w4` does exactly that on both parts:
+            //     if (wb0 == 0ull) continue;  /* EP: expert not local */   [op_moe.h]
+            // The gfx950 lean stage-1 specialist ELF is a FASTER path, not a correctness one, and
+            // it is already loaded conditionally (`arch == "gfx950" && need_moe_stage1_lean`
+            // below), so on gfx942 EP simply runs on the ordinary grouped kernel. What genuinely
+            // cannot run elsewhere is a packet carrying lean stage-1 MXFP4 SEGMENTS, whose kernel
+            // (`plow_moe1_a4_reuse_16x16x128_gfx950`) is built on a CDNA4-only MFMA shape.
+            //
+            // This used to refuse ALL non-gfx950 EP, which made the whole placement unreachable on
+            // MI300X even though the kernel supports it.
+            if arch != "gfx950" && blob.prefill_phase().any(has_moe_stage1_mxfp4_segment) {
                 return Err(RuntimeError::Device(format!(
-                    "replicated-input MoE EP requires gfx950 specialist objects, but this device is {arch}"
+                    "replicated-input MoE EP with lean stage-1 MXFP4 segments requires gfx950 specialist objects, but this device is {arch}"
                 )));
             }
+
             let bind = tp.ok_or_else(|| {
                 RuntimeError::Device(
                     "replicated-input MoE EP packet requires a tensor-parallel binding".into(),
@@ -8706,7 +8861,12 @@ impl AmdEngine {
             None
         };
 
-        let (k_moe_ep_align, k_moe_ep_stage2, k_moe_ep_combine) = if need_moe_ep {
+        // The specialist chain is gfx950's. Its align exists to feed the lean stage-1/stage-2
+        // pair at THEIR 64-row tile, and its combine to serve that pair's row lists -- there is
+        // no use for either without them. Elsewhere the interpreter runs the whole boundary.
+        let (k_moe_ep_align, k_moe_ep_stage2, k_moe_ep_combine) = if need_moe_ep
+            && arch == "gfx950"
+        {
             let mut load_ep = |name: &str,
                                symbol: &str,
                                markers: &[&str],
@@ -8757,18 +8917,34 @@ impl AmdEngine {
                 std::mem::size_of::<MoeEpAlignArgs>() as u32,
                 0,
             )?;
-            let stage2 = load_ep(
-                "moe_ep_stage2_gfx950.elf",
-                "plow_moe2_ep_full_i_16x16x128_gfx950",
-                &[
-                    "plow_moe2_mxfp4_stage2_abi_3",
-                    "plow_moe2_mxfp4_stage2_no_spill_1",
-                    "plow_moe2_ep_full_i_3072",
-                    "plow_moe2_ep_full_i_vgpr_le_128",
-                ],
-                std::mem::size_of::<MoeStage2Mxfp4Args>() as u32,
-                4_352,
-            )?;
+            // OPTIONAL, unlike align and combine. Stage-2's body is the scaled MFMA
+            // `v_mfma_scale_f32_16x16x128_f8f6f4`, which exists only on CDNA4, so gfx942 cannot
+            // build it -- but it is an ACCELERATION of a contract the interpreter already
+            // implements: `d_moe_group_down_pf` scatters `part[row_partidx[row]][H]` scaled by
+            // `row_gate[row]` and skips a null weight base, which is byte-for-byte the work
+            // stage-2 does. Absent, `prefill_segment_launches` falls through to the interpreter.
+            //
+            // Align and combine stay REQUIRED because nothing else does their work: align is what
+            // restricts the tile list to `[expert_begin, expert_end)`, and combine is what makes
+            // the boundary correct at all -- under EP the ranks that do not own slot `s` never
+            // write `part[token*k + s]`, so a combine that summed every slot would read rows no
+            // kernel wrote. Both are pure VALU and build on either arch.
+            let stage2 = if hsaco_dir.join("moe_ep_stage2_gfx950.elf").exists() {
+                Some(load_ep(
+                    "moe_ep_stage2_gfx950.elf",
+                    "plow_moe2_ep_full_i_16x16x128_gfx950",
+                    &[
+                        "plow_moe2_mxfp4_stage2_abi_3",
+                        "plow_moe2_mxfp4_stage2_no_spill_1",
+                        "plow_moe2_ep_full_i_3072",
+                        "plow_moe2_ep_full_i_vgpr_le_128",
+                    ],
+                    std::mem::size_of::<MoeStage2Mxfp4Args>() as u32,
+                    4_352,
+                )?)
+            } else {
+                None
+            };
             let combine = load_ep(
                 "moe_ep_combine_gfx950.elf",
                 "plow_moe_ep_combine_gfx950",
@@ -8781,7 +8957,7 @@ impl AmdEngine {
                 std::mem::size_of::<MoeEpCombineArgs>() as u32,
                 0,
             )?;
-            (Some(align), Some(stage2), Some(combine))
+            (Some(align), stage2, Some(combine))
         } else {
             (None, None, None)
         };
@@ -9856,6 +10032,7 @@ impl AmdEngine {
                     stage1_a4_scratch,
                     tp.map(|b| (b.rank, b.n_gpu)),
                     stage1_a4_gather,
+                    k_moe_ep_align.is_some(),
                 )?
             } else {
                 vec![PrefillSegmentRoute::Interpreter; seg_class.len()]
@@ -10140,8 +10317,10 @@ impl AmdEngine {
                 *device_args = mem.base;
                 xreduce_attnres_args.push(mem);
             }
-            let d_inst = up(as_bytes(&p.insts))?;
-            let xaudit_insts = xaudit_insts(&p.insts);
+            let ep_patched = ep_align_window_patch(p, tp.map(|b| (b.rank, b.n_gpu)))?;
+            let insts = ep_patched.as_deref().unwrap_or(&p.insts);
+            let d_inst = up(as_bytes(insts))?;
+            let xaudit_insts = xaudit_insts(insts);
             let d_xaudit_inst = up(as_bytes(&xaudit_insts))?;
             let d_stream = up(as_bytes(&p.stream))?;
             let d_sofs = up(as_bytes(&p.stream_ofs))?;
@@ -10632,10 +10811,17 @@ impl AmdEngine {
 
         // --- pinned staging --------------------------------------------------
         let n_dec_inst = blob.progs[decode].insts.len();
-        let mut h_inst =
-            EngineDevice::host_alloc_pinned(&*be, n_dec_inst * std::mem::size_of::<DevInst64>())?;
-        h_inst
-            .as_mut_slice()
+        // `.max(1)`: a single-block PREFILL RUNG carries an EMPTY decode program -- `derive_roles`
+        // is positional, so the placeholder is what makes the rung's real work classify as a
+        // prefill bucket -- and `hsa_amd_memory_pool_allocate` refuses a zero-byte request with
+        // HSA_STATUS_ERROR_INVALID_ARGUMENT rather than returning a null. One unused instruction's
+        // worth of pinned staging is cheaper than a special case, and the copy below is a no-op at
+        // length zero.
+        let mut h_inst = EngineDevice::host_alloc_pinned(
+            &*be,
+            n_dec_inst.max(1) * std::mem::size_of::<DevInst64>(),
+        )?;
+        h_inst.as_mut_slice()[..n_dec_inst * std::mem::size_of::<DevInst64>()]
             .copy_from_slice(as_bytes(&blob.progs[decode].insts));
         // Prefill stages ids AND pos for a whole chunk, so this must hold
         // 2 * max_bucket_T * 4 bytes. Sizing it at a fixed 64 KiB silently

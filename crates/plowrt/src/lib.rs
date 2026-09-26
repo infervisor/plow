@@ -25,6 +25,8 @@ pub mod asset;
 mod certificate_checks;
 pub mod config;
 pub mod device;
+#[cfg(feature = "cuda")]
+pub mod dsv41;
 pub mod disasm;
 /// Asset distribution: resolve a model reference against this machine and fetch
 /// what is missing. `serve` reads only the local store and never the network.

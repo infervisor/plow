@@ -363,6 +363,50 @@ enum Cmd {
         prefill_reps: u32,
     },
 
+    /// Serve DeepSeek-V4.1-Flash on NVIDIA sm_90a GPUs (OpenAI `/v1/completions`): the dedicated
+    /// host-driven engine in `plowrt::dsv41`, pipeline-parallel over the visible GPUs.
+    Dsv41Serve {
+        /// Hugging Face checkpoint directory (config.json, shards, tokenizer.json).
+        #[arg(long, id = "dsv41_ckpt")]
+        ckpt: PathBuf,
+        /// Kernel cubin from scripts/build_dsv41_sm90a.sh.
+        #[arg(long, id = "dsv41_cubin")]
+        cubin: PathBuf,
+        #[arg(long, id = "dsv41_port", default_value_t = 8200)]
+        port: u16,
+        /// Longest sequence (prompt + generated) a slot holds.
+        #[arg(long, id = "dsv41_max_len", default_value_t = 20480)]
+        max_len: usize,
+        /// Concurrent sequences (decode batch ceiling).
+        #[arg(long, id = "dsv41_max_slots", default_value_t = 64)]
+        max_slots: usize,
+        /// Layer boundaries per GPU, e.g. 0,10,20,30,40.
+        #[arg(long, id = "dsv41_bounds", default_value = "0,10,20,30,40")]
+        bounds: String,
+        /// Per-GPU scratch arena, GiB.
+        #[arg(long, id = "dsv41_arena_gib", default_value_t = 24)]
+        arena_gib: u64,
+        /// Decode groups kept in flight across the pipeline stages (0: one step at a time).
+        #[arg(long, id = "dsv41_decode_lanes", default_value_t = 4)]
+        decode_lanes: usize,
+        /// Per-GPU arena of each decode lane, MiB.
+        #[arg(long, id = "dsv41_decode_arena_mib", default_value_t = 1024)]
+        decode_arena_mib: u64,
+        #[arg(long, id = "dsv41_served_model_name", default_value = "deepseek-ai/DeepSeek-V4.1-Flash")]
+        served_model_name: String,
+        /// Requests admitted but unfinished (queued + running); beyond it the server answers 429.
+        #[arg(long, id = "dsv41_max_queued", default_value_t = 1024)]
+        max_queued: usize,
+        /// Measure rungs instead of serving, e.g. "prefill=1024,4096;decode=1x1024,64x1024".
+        /// Per-kernel roofline tables need PLOW_DSV41_PROFILE=2.
+        #[arg(long, id = "dsv41_rung_bench")]
+        rung_bench: Option<String>,
+        #[arg(long, id = "dsv41_rung_reps", default_value_t = 5)]
+        rung_reps: usize,
+        /// Where to write the rung report (markdown).
+        #[arg(long, id = "dsv41_rung_out")]
+        rung_out: Option<PathBuf>,
+    },
     /// Run a BLOCK asset (act.x in, act.x out) through the AMD engine.
     ///
     /// The A/B vehicle for numerics: two blocks that differ only in precision,
@@ -1082,6 +1126,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBlock { .. } => Err("plowrt was built without --features hsa".into()),
+        #[cfg(feature = "cuda")]
+        Cmd::Dsv41Serve { ckpt, cubin, port, max_len, max_slots, bounds, arena_gib, decode_lanes, decode_arena_mib, served_model_name, max_queued, rung_bench, rung_reps, rung_out } => {
+            let bounds: Vec<usize> = bounds
+                .split(',')
+                .map(|v| v.trim().parse::<usize>())
+                .collect::<Result<_, _>>()
+                .map_err(|e| format!("--bounds: {e}"))?;
+            plowrt::dsv41::serve::run(plowrt::dsv41::serve::ServeOpts {
+                ckpt,
+                cubin,
+                port,
+                model_name: served_model_name,
+                max_queued,
+                rung_bench: rung_bench.map(|s| (s, rung_reps, rung_out)),
+                engine: plowrt::dsv41::engine::EngineOpts { max_len, max_slots, bounds, arena_bytes: arena_gib << 30, decode_lanes, decode_arena_bytes: decode_arena_mib << 20 },
+            })
+            .await
+        }
+        #[cfg(not(feature = "cuda"))]
+        Cmd::Dsv41Serve { .. } => Err("plowrt was built without --features cuda".into()),
     }
 }
 

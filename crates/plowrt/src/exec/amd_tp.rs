@@ -1841,6 +1841,115 @@ impl AmdTpGroup {
     ///
     /// `next` is the same prompt's following chunk, if the plan has one; see
     /// [`AmdEngine::prefill_map_ahead`].
+    /// Launch program `p` on every rank, SEGMENT-MAJOR, with a host drain between segments.
+    ///
+    /// The bare collective launcher, for a packet that carries no tokens: a single-block PREFILL
+    /// RUNG, whose entry is an activation the caller uploaded with `write_tensor` and whose exit is
+    /// one it reads back. `prefill_chunk` cannot serve that -- it begins with `prefill_prepare`,
+    /// which stages a prompt and a KV mapping a rung has neither of.
+    ///
+    /// SEGMENT-MAJOR is the part that is not a style choice. `AmdEngine::run_segmented` enqueues
+    /// all of one rank's segments before moving to the next, and `tp_decode.c` recorded what that
+    /// does at TP>=4: the ranks desync, a lagging rank makes its peers time out and bail, and the
+    /// reduction comes back WRONG and 100x slow. A class-8 segment holds a layer's all-reduces and
+    /// their inline system-scope gate only rendezvouses cheaply when every rank is inside that
+    /// segment at once -- so every rank enqueues segment `s` before any rank enqueues `s + 1`, and
+    /// every rank drains before the next segment goes out.
+    pub fn run_rung(&mut self, p: usize) -> Result<()> {
+        self.run_rung_upto(p, usize::MAX)
+    }
+
+    /// Run program `p`, but enqueue only its first `max_segs` SEGMENTS.
+    ///
+    /// A bring-up instrument, and the one a memory-access fault actually needs. A fault reports
+    /// an ADDRESS and nothing else -- not the op, not the dispatch -- so on a 34-instruction
+    /// layer it names a suspect only by inference, and three runs in a row can be spent
+    /// exonerating the wrong stage. Capping the segment count turns that into a bisection: the
+    /// smallest cap that still faults contains the op that faults, and the largest that does not
+    /// is a run whose `--probe` output is READABLE, which is the other half of the answer.
+    ///
+    /// Segments, not instructions, because segments are the dispatch unit -- `enqueue_segment` is
+    /// what reaches the queue, and a partial segment is not a thing the engine can launch.
+    ///
+    /// CUT BEFORE A COLLECTIVE, not inside one. Every rank truncates at the same segment (the cap
+    /// is uniform here), so a cut that lands between collectives is consistent across the group;
+    /// a cut that drops the second half of a two-shot reduce would leave peers waiting on a gate
+    /// this rank will now never pass, and `drain` would block rather than return.
+    pub fn run_rung_upto(&mut self, p: usize, max_segs: usize) -> Result<()> {
+        if p >= self.ranks[0].n_programs() {
+            return Err(RuntimeError::Device(format!(
+                "program {p} does not exist (the packet has {})",
+                self.ranks[0].n_programs()
+            )));
+        }
+        for e in &mut self.ranks {
+            e.rearm_prog(p)?;
+        }
+        // THE CROSS-GPU COUNTERS, ONCE, BEFORE ANY RANK IS DISPATCHED.
+        //
+        // `prefill_chunk` does this and `run_rung` did not, and the symptom was not a hang: every
+        // `XReduceTwoShot` in the layer COMPLETED and wrote ZEROS. The attention output, the shared
+        // expert's output and the FFN's were all exactly zero, so the layer returned its input
+        // unchanged -- finite, plausible, and nothing at all. A stale arrival count lets a gate
+        // pass before any peer has published its partial, and the sum is then over a region no one
+        // wrote.
+        //
+        // Once for the whole launch, not per segment: the counters are indexed per collective, and
+        // re-zeroing between segments would erase the arrivals of a gate the next segment is still
+        // waiting on.
+        self.group.zero_xctr()?;
+        let launches = self.ranks[0].prog_dispatch(p).launches();
+        if launches == 0 {
+            return Err(RuntimeError::Device(format!(
+                "program {p} has no segments to launch -- an empty program, such as the decode                  placeholder a prefill-only rung carries"
+            )));
+        }
+        let n_ranks = self.ranks.len();
+        let phase_replay = self.ranks[0].graph_phase_replay(p);
+        if self
+            .ranks
+            .iter()
+            .any(|rank| rank.graph_phase_replay(p) != phase_replay)
+        {
+            return Err(RuntimeError::Device(
+                "graph phase-object selection differs across TP ranks".into(),
+            ));
+        }
+        if phase_replay {
+            for rank in &self.ranks {
+                rank.begin_graph_phase_replay(p)?;
+            }
+        }
+        for (seg, rank) in segment_major_order(launches, n_ranks) {
+            if seg >= max_segs {
+                continue;
+            }
+            self.ranks[rank].enqueue_segment(p, seg)?;
+        }
+        if phase_replay {
+            for rank in &self.ranks {
+                rank.commit_graph_phase_replay()?;
+            }
+        }
+        for e in &self.ranks {
+            e.drain()?;
+        }
+        // DID THE COLLECTIVES ACTUALLY REDUCE? `interp.hip` passes the collectives a null status
+        // word and a 1 s `PLOW_XCTR_DEADLINE_TICKS`; on timeout the op RETURNS WITHOUT REDUCING
+        // and `out` keeps whatever it held before. Nothing faults, nothing is logged, and the
+        // result stays finite and plausible -- so a rung run that reports "no NaN, no Inf" has
+        // said nothing at all about whether its three reduces happened. `prefill_chunk` and the
+        // decode path have audited this on every step all along; `run_rung` was the one driver
+        // that did not, which made it the one driver whose numbers could not be trusted.
+        //
+        // Skipped for a truncated run: a segment cap deliberately leaves later gates unsignalled,
+        // and auditing those would report the cut rather than a timeout.
+        if max_segs == usize::MAX && self.audit {
+            self.group.audit_xctr(&self.gate_expect[p])?;
+        }
+        Ok(())
+    }
+
     pub fn prefill_chunk(
         &mut self,
         prompt: &[u32],
