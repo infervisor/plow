@@ -40,13 +40,6 @@ complete() { # prompt max_tokens
   echo
 }
 
-if [ "$MODE" = smoke ]; then
-  complete "The capital of France is" 16 | tee -a "$OUT/smoke.txt"
-  complete "def fibonacci(n):" 64 | tee -a "$OUT/smoke.txt"
-  complete "Q: What is 17 * 23? A:" 24 | tee -a "$OUT/smoke.txt"
-  exit 0
-fi
-
 run() { # name in out conc
   local name=$1 inl=$2 outl=$3 c=$4
   local n=${NPROMPT:-$(( c * 4 ))}; [ -z "${NPROMPT:-}" ] && [ $n -lt 16 ] && n=16
@@ -54,11 +47,28 @@ run() { # name in out conc
     --dataset-name random --random-input-len $inl --random-output-len $outl \
     --ignore-eos --num-prompts $n --max-concurrency $c --num-warmups 2 --seed 1 \
     --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99 \
-    --save-result --result-dir "$OUT" --result-filename "${name}_c${c}.json" \
+    --save-result --save-detailed --result-dir "$OUT" --result-filename "${name}_c${c}.json" \
     > "$OUT/${name}_c${c}.log" 2>&1
   echo "[$name c=$c] rc=$?"
   grep -E "Output token throughput|Total token throughput|Median TTFT|Median TPOT|Failed requests" "$OUT/${name}_c${c}.log"
 }
+
+if [ "$MODE" = streamtest ]; then  # client-side SSE delivery timing under concurrency
+  if [ -z "${BENCH_ONLY:-}" ]; then
+    echo "== token-id prompts"; $VENV/python "$ROOT/scripts/dsv41_nv/stream_probe.py" "$PORT" 8 32 256 | tee "$OUT/stream_probe.txt"
+    echo "== text prompts"; $VENV/python "$ROOT/scripts/dsv41_nv/stream_probe.py" "$PORT" 8 32 256 text | tee -a "$OUT/stream_probe.txt"
+  fi
+  echo "== vllm bench"; NPROMPT=8 run probe_1k_32 1024 32 8
+  exit 0
+fi
+
+if [ "$MODE" = smoke ]; then
+  complete "The capital of France is" 16 | tee -a "$OUT/smoke.txt"
+  complete "def fibonacci(n):" 64 | tee -a "$OUT/smoke.txt"
+  complete "Q: What is 17 * 23? A:" 24 | tee -a "$OUT/smoke.txt"
+  exit 0
+fi
+
 if [ "$MODE" = quick ]; then  # a short profile pass: few prompts, 64 output tokens
   NPROMPT=4 run quick_1k_64 1024 64 1
   NPROMPT=16 run quick_1k_64 1024 64 16

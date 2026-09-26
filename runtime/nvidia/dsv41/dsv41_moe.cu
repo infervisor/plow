@@ -125,36 +125,58 @@ __device__ __forceinline__ void mma_e4m3_m(float* c, const uint32_t* a, const ui
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-// e2m1 nibble -> e4m3 byte (exact: every e2m1 value is an e4m3 value).
-__constant__ uint8_t kE2M1toE4M3[16] = {0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C,
-                                        0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC};
+// e2m1 -> e4m3 (exact: every e2m1 value is an e4m3 value), four at a time. `x16` holds four nibbles in
+// element order (element 2i is byte i's low nibble); a byte-permute looks up the 3-bit magnitudes in
+// a register-resident table {00,30,38,3C,40,44,48,4C} and the sign bits move from bit 3 of each
+// nibble to bit 7 of each byte.
+__device__ __forceinline__ uint32_t e2m1x4_to_e4m3x4(uint32_t x16) {
+    const uint32_t mag = __byte_perm(0x3C383000u, 0x4C484440u, x16 & 0x7777u);
+    const uint32_t s = x16 & 0x8888u;
+    return mag | ((s & 0x8u) << 4) | ((s & 0x80u) << 8) | ((s & 0x800u) << 12) | ((s & 0x8000u) << 16);
+}
 
 // Grouped expert GEMM (kernel.py fp4_gemm at act block 32): for tile i = (expert e, row0), rows
 // row0 .. min(row0+64, offs[e+1]) of the expert-sorted list: C[p][n] = sum_kb (A8[tok(p)] . W4[e][n]) *
 // sa[tok(p)][kb] * sw[e][n][kb]. A is indexed by token (gather through `rows`) unless a_by_row, in which
 // case A row p itself (the down projection reads the SwiGLU output, already in sorted order).
-// W fp4 packed [N][K/2] per expert (element 2i in the low nibble), sw ue8m0 [N][K/32].
+// W fp4 packed [N][K/2] per expert (element 2i in the low nibble), sw ue8m0 [N][K/32]. K % 64 == 0.
+//
+// Tile 64 x 128, 4 warps (2 x 2, warp tile 32 x 64). A three-stage cp.async ring stages 64 K per
+// stage: the gathered e4m3 A rows and the RAW packed weights; the B fragments are decoded from the
+// raw nibbles in registers. Both scale grids for the tile are staged once, up front.
+// Dynamic shared memory: G_SMEM(K) bytes.
 #define G_BM 64
 #define G_BN 128
-#define G_LD 48
+#define G_ST 3
+#define G_ALD 80  // A row: 64 B + pad (20 words: fragment rows land on distinct banks)
+#define G_WLD 48  // W row: 32 B raw (64 fp4) + pad
+#define G_SMEM(K) (G_ST * G_BM * G_ALD + G_ST * G_BN * G_WLD + (G_BN + G_BM) * ((K) / 32) + G_BM * 4)
+
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, int bytes) {
+    const uint32_t d = (uint32_t)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(src), "r"(bytes));
+}
+
 DSV_EXTERN void __launch_bounds__(128)
     dsv_moe_gemm_fp4(bf16* __restrict__ C, const uint8_t* __restrict__ A, const uint8_t* __restrict__ sa,
                      const uint8_t* __restrict__ W, const uint8_t* __restrict__ sw, const int* __restrict__ tiles,
                      const int* __restrict__ meta, const int* __restrict__ offs, const int* __restrict__ rows,
                      int a_by_row, int N, int K, long long w_estride, long long sw_estride) {
-    __shared__ __align__(16) uint8_t As[G_BM * G_LD];
-    __shared__ __align__(16) uint8_t Ws[G_BN * G_LD];
-    __shared__ float Ss[G_BN];
-    __shared__ int Arow[G_BM];
+    extern __shared__ __align__(16) uint8_t g_smem[];
     const int tile = blockIdx.y;
     if (tile >= meta[0]) return;
+    const int KB = K >> 5, KS = K >> 6;
+    uint8_t* As = g_smem;                                  // [ST][64][80]
+    uint8_t* Ws = As + G_ST * G_BM * G_ALD;                // [ST][128][48]
+    uint8_t* SWs = Ws + G_ST * G_BN * G_WLD;               // [128][KB] weight scales
+    uint8_t* SAs = SWs + G_BN * KB;                        // [64][KB] activation scales
+    int* Arow = (int*)(SAs + G_BM * KB + ((16 - ((G_BN + G_BM) * KB) % 16) % 16));
     const int e = tiles[tile * 2], row0 = tiles[tile * 2 + 1];
     const int rend = offs[e + 1];
     const int n0 = blockIdx.x * G_BN;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp >> 1, wn = warp & 1;
     const int g = lane >> 2, t4 = lane & 3;
-    const int KB = K >> 5;
     const uint8_t* We = W + (long long)e * w_estride;
     const uint8_t* Se = sw + (long long)e * sw_estride;
     if (tid < G_BM) {
@@ -162,6 +184,32 @@ DSV_EXTERN void __launch_bounds__(128)
         Arow[tid] = p < rend ? (a_by_row ? p : rows[p]) : -1;
     }
     __syncthreads();
+    // scales for the whole tile
+    for (int i = tid; i < G_BN * KB; i += 128) {
+        const int r = i / KB, kb = i % KB;
+        const int gn = n0 + r;
+        SWs[i] = gn < N ? Se[(long long)gn * KB + kb] : 0;
+    }
+    for (int i = tid; i < G_BM * KB; i += 128) {
+        const int r = i / KB, kb = i % KB;
+        const int ar = Arow[r];
+        SAs[i] = ar >= 0 ? sa[(long long)ar * KB + kb] : 0;
+    }
+    auto load = [&](int slot, int ks) {
+#pragma unroll
+        for (int i = 0; i < 2; i++) {  // A: 64 rows x 4 chunks of 16 B
+            const int c = tid + i * 128, r = c >> 2, off = (c & 3) * 16;
+            const int ar = Arow[r];
+            cp_async16(&As[(slot * G_BM + r) * G_ALD + off], A + (long long)max(ar, 0) * K + ks * 64 + off, ar >= 0 ? 16 : 0);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; i++) {  // W: 128 rows x 2 chunks of 16 B (raw fp4)
+            const int c = tid + i * 128, r = c >> 1, off = (c & 1) * 16;
+            const int gn = n0 + r;
+            cp_async16(&Ws[(slot * G_BN + r) * G_WLD + off], We + (long long)min(gn, N - 1) * (K / 2) + ks * 32 + off, gn < N ? 16 : 0);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
     float acc[2][8][4];
 #pragma unroll
     for (int i = 0; i < 2; i++)
@@ -169,76 +217,51 @@ DSV_EXTERN void __launch_bounds__(128)
         for (int j = 0; j < 8; j++)
 #pragma unroll
             for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
-    int arows[2][2];
-#pragma unroll
-    for (int i = 0; i < 2; i++) {
-        arows[i][0] = Arow[wm * 32 + i * 16 + g];
-        arows[i][1] = Arow[wm * 32 + i * 16 + g + 8];
-    }
-    for (int kb = 0; kb < KB; kb++) {
-        {  // A: 64 rows x 32 B
-            const int r = tid >> 1, c = (tid & 1) * 16;
-            const int ar = Arow[r];
-            uint4 v = make_uint4(0, 0, 0, 0);
-            if (ar >= 0) v = *(const uint4*)(A + (long long)ar * K + kb * 32 + c);
-            *(uint4*)&As[r * G_LD + c] = v;
-        }
-        {  // W: 128 rows x 16 B packed -> 32 B e4m3, plus the per-row scale
-            const int r = tid;
-            const int gn = n0 + r;
-            uint8_t o[32];
-            float s = 0.f;
-            if (gn < N) {
-                const uint4 raw = *(const uint4*)(We + (long long)gn * (K / 2) + kb * 16);
-                const uint8_t* rb = (const uint8_t*)&raw;
-#pragma unroll
-                for (int i = 0; i < 16; i++) {
-                    o[2 * i] = kE2M1toE4M3[rb[i] & 0xf];
-                    o[2 * i + 1] = kE2M1toE4M3[rb[i] >> 4];
-                }
-                s = e8m0_to_f(Se[(long long)gn * KB + kb]);
-            } else {
-#pragma unroll
-                for (int i = 0; i < 32; i++) o[i] = 0;
-            }
-            *(uint4*)&Ws[r * G_LD] = *(const uint4*)&o[0];
-            *(uint4*)&Ws[r * G_LD + 16] = *(const uint4*)&o[16];
-            Ss[r] = s;
-        }
+    load(0, 0);
+    if (KS > 1) load(1, 1); else asm volatile("cp.async.commit_group;\n" ::);
+    for (int ks = 0; ks < KS; ks++) {
+        asm volatile("cp.async.wait_group 1;\n" ::);
         __syncthreads();
-        uint32_t af[2][4], bfr[8][2];
+        // the slot computed at ks-1 is free now: refill it with stage ks+2
+        if (ks + 2 < KS) load((ks + 2) % G_ST, ks + 2); else asm volatile("cp.async.commit_group;\n" ::);
+        const int slot = ks % G_ST;
 #pragma unroll
-        for (int i = 0; i < 2; i++) {
-            const uint8_t* base = &As[(wm * 32 + i * 16 + g) * G_LD + t4 * 4];
-            af[i][0] = *(const uint32_t*)(base);
-            af[i][1] = *(const uint32_t*)(base + 8 * G_LD);
-            af[i][2] = *(const uint32_t*)(base + 16);
-            af[i][3] = *(const uint32_t*)(base + 8 * G_LD + 16);
-        }
+        for (int kk = 0; kk < 2; kk++) {
+            const int kb = ks * 2 + kk;
+            uint32_t af[2][4], bfr[8][2];
 #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            const uint8_t* base = &Ws[(wn * 64 + j * 8 + g) * G_LD + t4 * 4];
-            bfr[j][0] = *(const uint32_t*)(base);
-            bfr[j][1] = *(const uint32_t*)(base + 16);
-        }
-#pragma unroll
-        for (int i = 0; i < 2; i++) {
-            const float sa0 = arows[i][0] >= 0 ? e8m0_to_f(sa[(long long)arows[i][0] * KB + kb]) : 0.f;
-            const float sa1 = arows[i][1] >= 0 ? e8m0_to_f(sa[(long long)arows[i][1] * KB + kb]) : 0.f;
+            for (int i = 0; i < 2; i++) {
+                const uint8_t* base = &As[(slot * G_BM + wm * 32 + i * 16 + g) * G_ALD + kk * 32 + t4 * 4];
+                af[i][0] = *(const uint32_t*)(base);
+                af[i][1] = *(const uint32_t*)(base + 8 * G_ALD);
+                af[i][2] = *(const uint32_t*)(base + 16);
+                af[i][3] = *(const uint32_t*)(base + 8 * G_ALD + 16);
+            }
 #pragma unroll
             for (int j = 0; j < 8; j++) {
-                float tt[4] = {0.f, 0.f, 0.f, 0.f};
-                mma_e4m3_m(tt, af[i], bfr[j]);
-                const int cn = wn * 64 + j * 8 + t4 * 2;
-                const float s0 = Ss[cn], s1 = Ss[cn + 1];
-                acc[i][j][0] += tt[0] * sa0 * s0;
-                acc[i][j][1] += tt[1] * sa0 * s1;
-                acc[i][j][2] += tt[2] * sa1 * s0;
-                acc[i][j][3] += tt[3] * sa1 * s1;
+                const uint8_t* base = &Ws[(slot * G_BN + wn * 64 + j * 8 + g) * G_WLD + kk * 16 + t4 * 2];
+                bfr[j][0] = e2m1x4_to_e4m3x4(*(const uint16_t*)(base));
+                bfr[j][1] = e2m1x4_to_e4m3x4(*(const uint16_t*)(base + 8));
+            }
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const float sa0 = e8m0_to_f(SAs[(wm * 32 + i * 16 + g) * KB + kb]);
+                const float sa1 = e8m0_to_f(SAs[(wm * 32 + i * 16 + g + 8) * KB + kb]);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    float tt[4] = {0.f, 0.f, 0.f, 0.f};
+                    mma_e4m3_m(tt, af[i], bfr[j]);
+                    const int cn = wn * 64 + j * 8 + t4 * 2;
+                    const float s0 = e8m0_to_f(SWs[cn * KB + kb]), s1 = e8m0_to_f(SWs[(cn + 1) * KB + kb]);
+                    acc[i][j][0] += tt[0] * sa0 * s0;
+                    acc[i][j][1] += tt[1] * sa0 * s1;
+                    acc[i][j][2] += tt[2] * sa1 * s0;
+                    acc[i][j][3] += tt[3] * sa1 * s1;
+                }
             }
         }
-        __syncthreads();
     }
+    asm volatile("cp.async.wait_group 0;\n" ::);
 #pragma unroll
     for (int i = 0; i < 2; i++)
 #pragma unroll

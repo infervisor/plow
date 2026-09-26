@@ -355,6 +355,54 @@ DSV_EXTERN void __launch_bounds__(256) dsv_gemm_f32_dot(float* __restrict__ C, c
     if (threadIdx.x == 0) C[(long long)m * ldc + n] = acc;
 }
 
+// fp32 row form for few outputs over many rows (the mHC mixes in prefill: N = 24, K = 20480):
+// each block owns 4 rows and all N <= 32 outputs, accumulating in registers, so every A row is read
+// once and W (N x K) streams from L2. grid = ceil(M / 4).
+#define F32R_ROWS 4
+DSV_EXTERN void __launch_bounds__(256) dsv_gemm_f32_rows(float* __restrict__ C, const void* __restrict__ A,
+                                                         const void* __restrict__ W, int M, int N, int K, long long lda,
+                                                         long long ldc, int a_bf16, int w_bf16) {
+    __shared__ float red[8][F32R_ROWS][32];
+    const int m0 = blockIdx.x * F32R_ROWS;
+    float acc[F32R_ROWS][32];
+#pragma unroll
+    for (int r = 0; r < F32R_ROWS; r++)
+#pragma unroll
+        for (int n = 0; n < 32; n++) acc[r][n] = 0.f;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        float a[F32R_ROWS];
+#pragma unroll
+        for (int r = 0; r < F32R_ROWS; r++) {
+            const int m = min(m0 + r, M - 1);
+            a[r] = a_bf16 ? bf2f(((const bf16*)A)[(long long)m * lda + k]) : ((const float*)A)[(long long)m * lda + k];
+        }
+#pragma unroll
+        for (int n = 0; n < 32; n++) {
+            if (n >= N) break;
+            const float w = w_bf16 ? bf2f(((const bf16*)W)[(long long)n * K + k]) : ((const float*)W)[(long long)n * K + k];
+#pragma unroll
+            for (int r = 0; r < F32R_ROWS; r++) acc[r][n] = fmaf(a[r], w, acc[r][n]);
+        }
+    }
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+#pragma unroll
+    for (int r = 0; r < F32R_ROWS; r++)
+#pragma unroll
+        for (int n = 0; n < 32; n++) {
+            const float v = warp_sum(acc[r][n]);
+            if (lane == 0) red[wid][r][n] = v;
+        }
+    __syncthreads();
+    for (int i = threadIdx.x; i < F32R_ROWS * N; i += blockDim.x) {
+        const int r = i / N, n = i % N;
+        const int m = m0 + r;
+        if (m >= M) continue;
+        float s = 0.f;
+        for (int w = 0; w < (int)(blockDim.x >> 5); w++) s += red[w][r][n];
+        C[(long long)m * ldc + n] = s;
+    }
+}
+
 DSV_EXTERN void __launch_bounds__(256) dsv_gemm_f32(float* C, const void* A, const void* W, int M, int N, int K,
                                                     long long lda, long long ldc, int a_bf16, int w_bf16) {
     if (a_bf16) {

@@ -28,6 +28,12 @@ pub enum A {
 }
 
 pub const IX_SMEM: u32 = ((4 * 32 * (128 + 8) + 64 * (128 + 8)) * 2 + 2 * 4 * 64 * 4) as u32;
+/// `G_SMEM(K)` in dsv41_moe.cu: the grouped fp4 GEMM's stage ring plus both scale grids.
+pub const fn moe_smem(k: usize) -> u32 {
+    (3 * 64 * 80 + 3 * 128 * 48 + (128 + 64) * (k / 32) + 64 * 4) as u32
+}
+/// The largest K the engine launches it with (the hidden size, 5120) sets the attribute.
+pub const MOE_SMEM_MAX: u32 = moe_smem(8192);
 pub const SA_SMEM: u32 = ((64 * 520 + 64 * 520 + 64 * 72) * 2 + 4 * 64 * 4 * 2 + 64 * 4) as u32;
 
 const MAX_ARGS: usize = 24;
@@ -40,6 +46,7 @@ const NAMES: &[&str] = &[
     "dsv_gemm_bf16w",
     "dsv_gemm_f32",
     "dsv_gemm_f32_dot",
+    "dsv_gemm_f32_rows",
     "dsv_rope",
     "dsv_sparse_attn",
     "dsv_attn_index",
@@ -102,6 +109,7 @@ impl Kernels {
         }
         dev.set_max_dynamic_smem(fns["dsv_sparse_attn"], SA_SMEM)?;
         dev.set_max_dynamic_smem(fns["dsv_index_score"], IX_SMEM)?;
+        dev.set_max_dynamic_smem(fns["dsv_moe_gemm_fp4"], MOE_SMEM_MAX)?;
         Ok(Kernels { dev, _module: module, fns, prof: profile.then(|| RefCell::new(KernelProf::default())) })
     }
 
@@ -153,12 +161,15 @@ impl Kernels {
     }
 
     /// C[m][n] (f32) = A[m][k] . W[n][k]^T, A/W bf16 or f32. Small output grids (the mHC mixes are
-    /// 24 x 20480; the router and head at small batch) take the one-block-per-output dot form: the
-    /// 64x64-tiled kernel would put a single block on the whole K loop.
+    /// 24 x 20480; the router and head at small batch) take the one-block-per-output dot form, and
+    /// few outputs over many rows the row form; the 64x64-tiled kernel would put a single block on
+    /// the whole K loop.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_f32(&self, c: u64, a: u64, w: u64, m: usize, n: usize, k: usize, lda: usize, a_bf16: bool, w_bf16: bool, s: &CudaStream) -> Result<()> {
         let args = [A::P(c), A::P(a), A::P(w), A::I(m as i32), A::I(n as i32), A::I(k as i32), A::L(lda as i64), A::L(n as i64), A::I(a_bf16 as i32), A::I(w_bf16 as i32)];
-        if m * n <= 1 << 20 {
+        if n <= 32 && m > 64 {
+            self.launch("dsv_gemm_f32_rows", [cdiv(m as u64, 4), 1, 1], 256, 0, &args, s)
+        } else if m * n <= 1 << 20 {
             self.launch("dsv_gemm_f32_dot", [n as u32, m as u32, 1], 256, 0, &args, s)
         } else {
             self.launch("dsv_gemm_f32", [cdiv(n as u64, 64), cdiv(m as u64, 64), 1], 256, 0, &args, s)

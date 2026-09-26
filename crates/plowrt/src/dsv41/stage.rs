@@ -14,7 +14,7 @@ use crate::device::{Backend, DeviceMem};
 use crate::error::{Result, RuntimeError};
 
 use super::config::Cfg;
-use super::kernels::{cdiv, Kernels, A, IX_SMEM, SA_SMEM};
+use super::kernels::{cdiv, moe_smem, Kernels, A, IX_SMEM, SA_SMEM};
 use super::weights::Layer;
 
 /// Bump allocator over one device allocation; `mark`/`reset` scope per-layer scratch.
@@ -645,7 +645,7 @@ impl Stage {
             "dsv_moe_gemm_fp4",
             [cdiv((2 * mi) as u64, 128), max_tiles as u32, 1],
             128,
-            0,
+            moe_smem(h),
             &[A::P(gu), A::P(xq.0), A::P(xq.1), A::P(ly.w13), A::P(ly.w13_s), A::P(tiles), A::P(meta), A::P(offs), A::P(rows), A::I(0), A::I((2 * mi) as i32), A::I(h as i32), A::L((2 * mi * h / 2) as i64), A::L((2 * mi * h / 32) as i64)],
         )?;
         let hq = self.arena.alloc((n * mi) as u64)?;
@@ -662,7 +662,7 @@ impl Stage {
             "dsv_moe_gemm_fp4",
             [cdiv(h as u64, 128), max_tiles as u32, 1],
             128,
-            0,
+            moe_smem(mi),
             &[A::P(down), A::P(hq), A::P(hs), A::P(ly.w2), A::P(ly.w2_s), A::P(tiles), A::P(meta), A::P(offs), A::P(rows), A::I(1), A::I(h as i32), A::I(mi as i32), A::L((h * mi / 2) as i64), A::L((h * mi / 32) as i64)],
         )?;
         // shared expert (fp8 weights, no routing weight)

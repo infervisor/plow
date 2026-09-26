@@ -30,6 +30,10 @@ IXD = 128
 IXK = 512
 EPS = 1e-20
 IX_SMEM = (4 * IXH * (IXD + 8) + 64 * (IXD + 8)) * 2 + 2 * 4 * 64 * 4
+def MOE_SMEM(k):
+    return 3 * 64 * 80 + 3 * 128 * 48 + (128 + 64) * (k // 32) + 64 * 4
+
+
 SA_SMEM = (64 * 520 + 64 * 520 + 64 * 72) * 2 + 4 * 64 * 4 * 2 + 64 * 4
 
 
@@ -429,7 +433,7 @@ class Engine:
         gu = torch.empty(n, 2 * MI, dtype=torch.bfloat16, device=dev)
         self.K.launch("dsv_moe_gemm_fp4", ((2 * MI + 127) // 128, max_tiles), (128,),
                       [gu, xq, xs, ly.w13, ly.w13_s, tiles, meta, offs, rows, i32(0), i32(2 * MI), i32(H),
-                       i64(2 * MI * H // 2), i64(2 * MI * H // 32)])
+                       i64(2 * MI * H // 2), i64(2 * MI * H // 32)], smem=MOE_SMEM(H))
         hq = torch.empty(n, MI, dtype=torch.uint8, device=dev)
         hs = torch.empty(n, MI // 32, dtype=torch.uint8, device=dev)
         lim = float(self.cfg["swiglu_limit"])
@@ -438,7 +442,7 @@ class Engine:
         down = torch.empty(n, H, dtype=torch.bfloat16, device=dev)
         self.K.launch("dsv_moe_gemm_fp4", ((H + 127) // 128, max_tiles), (128,),
                       [down, hq, hs, ly.w2, ly.w2_s, tiles, meta, offs, rows, i32(1), i32(H), i32(MI),
-                       i64(H * MI // 2), i64(H * MI // 32)])
+                       i64(H * MI // 2), i64(H * MI // 32)], smem=MOE_SMEM(MI))
         # shared expert (fp8 weights)
         sgu = self.w8a8((xq, xs), ly.sh_w13, ly.sh_w13_s)
         shq = torch.empty(T, MI, dtype=torch.uint8, device=dev)

@@ -144,6 +144,23 @@ if want("gemm_f32"):
         r = rel(c, ref)
         check(f"gemm_f32 M={M} N={N} K={Kd}", r < 1e-5, f"rel={r:.3g}")
 
+# ------------------------------------------------------------------------------------------ fp32 dot / rows forms
+if want("gemm_f32_small"):
+    for name, M, N, Kd, abf, wbf, grid in (
+        ("dsv_gemm_f32_rows", 1024, 24, 20480, 1, 0, None),
+        ("dsv_gemm_f32_rows", 130, 24, 20480, 1, 0, None),
+        ("dsv_gemm_f32_dot", 9, 384, 5120, 1, 1, None),
+        ("dsv_gemm_f32_dot", 1, 24, 20480, 1, 0, None),
+    ):
+        a = torch.randn(M, Kd, device=dev, dtype=torch.bfloat16 if abf else torch.float32)
+        w = torch.randn(N, Kd, device=dev, dtype=torch.bfloat16 if wbf else torch.float32)
+        ref = a.float() @ w.float().T
+        c = torch.empty(M, N, device=dev, dtype=torch.float32)
+        g = ((M + 3) // 4,) if name.endswith("rows") else (N, M)
+        K.launch(name, g, (256,), [c, a, w, i32(M), i32(N), i32(Kd), i64(Kd), i64(N), i32(abf), i32(wbf)])
+        r = rel(c, ref)
+        check(f"{name} M={M} N={N} K={Kd}", r < 1e-5, f"rel={r:.3g}")
+
 torch.cuda.synchronize()
 bad = [n for n, ok in RESULTS if not ok]
 print(f"{len(RESULTS) - len(bad)}/{len(RESULTS)} passed" + (f"; FAILED: {bad}" if bad else ""))
