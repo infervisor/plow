@@ -363,12 +363,6 @@ enum Cmd {
         prefill_reps: u32,
     },
 
-    /// Run a BLOCK asset (act.x in, act.x out) through the AMD engine.
-    ///
-    /// The A/B vehicle for numerics: two blocks that differ only in precision,
-    /// same weights, same input, and the outputs compared. It exists separately
-    /// from `amd-bench` because a block is not a model — no embed, no lm_head,
-    /// no argmax — so none of the token-level entry points apply.
     /// Serve DeepSeek-V4.1-Flash on NVIDIA sm_90a GPUs (OpenAI `/v1/completions`): the dedicated
     /// host-driven engine in `plowrt::dsv41`, pipeline-parallel over the visible GPUs.
     Dsv41Serve {
@@ -394,7 +388,16 @@ enum Cmd {
         arena_gib: u64,
         #[arg(long, id = "dsv41_served_model_name", default_value = "deepseek-ai/DeepSeek-V4.1-Flash")]
         served_model_name: String,
+        /// Requests admitted but unfinished (queued + running); beyond it the server answers 429.
+        #[arg(long, id = "dsv41_max_queued", default_value_t = 1024)]
+        max_queued: usize,
     },
+    /// Run a BLOCK asset (act.x in, act.x out) through the AMD engine.
+    ///
+    /// The A/B vehicle for numerics: two blocks that differ only in precision,
+    /// same weights, same input, and the outputs compared. It exists separately
+    /// from `amd-bench` because a block is not a model — no embed, no lm_head,
+    /// no argmax — so none of the token-level entry points apply.
     AmdBlock {
         /// Compiled block blob (`model.pkt`).
         #[arg(long)]
@@ -1109,7 +1112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBlock { .. } => Err("plowrt was built without --features hsa".into()),
         #[cfg(feature = "cuda")]
-        Cmd::Dsv41Serve { ckpt, cubin, port, max_len, max_slots, bounds, arena_gib, served_model_name } => {
+        Cmd::Dsv41Serve { ckpt, cubin, port, max_len, max_slots, bounds, arena_gib, served_model_name, max_queued } => {
             let bounds: Vec<usize> = bounds
                 .split(',')
                 .map(|v| v.trim().parse::<usize>())
@@ -1120,6 +1123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cubin,
                 port,
                 model_name: served_model_name,
+                max_queued,
                 engine: plowrt::dsv41::engine::EngineOpts { max_len, max_slots, bounds, arena_bytes: arena_gib << 30 },
             })
             .await

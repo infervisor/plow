@@ -4,8 +4,11 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-$ROOT/target/dsv41/dsv41_sm90a.cubin}
-NVCC=${PLOW_NVCC:-$(ls -d /nix/store/*-cuda-merged-12.9/bin/nvcc 2>/dev/null | head -1)}
-CCBIN=${PLOW_NVCC_CCBIN:-$(ls -d /nix/store/*-gcc-wrapper-14.*/bin 2>/dev/null | head -1)}
+# Outside `nix develop`: the newest CUDA 12.x merged toolkit and gcc 14 wrapper in the store, chosen
+# by version rather than glob order, so repeated builds pick the same toolchain.
+newest() { ls -d $1 2>/dev/null | sed -E "s|^(.*-$2-([0-9.]+))(.*)$|\2\t\1\3|" | sort -V | tail -1 | cut -f2; }
+NVCC=${PLOW_NVCC:-$(newest '/nix/store/*-cuda-merged-12.*/bin/nvcc' cuda-merged)}
+CCBIN=${PLOW_NVCC_CCBIN:-$(newest '/nix/store/*-gcc-wrapper-14.*/bin' gcc-wrapper)}
 [ -x "$NVCC" ] || { echo "nvcc not found; set PLOW_NVCC" >&2; exit 1; }
 mkdir -p "$(dirname "$OUT")"
 # nvcc resolves through its symlink to cuda_nvcc, whose include/ lacks cuda_runtime.h (see flake.nix).

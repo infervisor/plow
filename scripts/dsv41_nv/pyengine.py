@@ -415,12 +415,12 @@ class Engine:
         counts = torch.zeros(E, dtype=torch.int32, device=dev)
         self.K.launch("dsv_moe_count", ((n + 255) // 256,), (256,), [counts, idx, i32(n)])
         BM = 64
-        max_tiles = (n + BM - 1) // BM + E
+        max_tiles = (n + BM - 1) // BM + min(n, E)
         offs = torch.empty(E + 1, dtype=torch.int32, device=dev)
         tiles = torch.empty(max_tiles * 2, dtype=torch.int32, device=dev)
         meta = torch.empty(1, dtype=torch.int32, device=dev)
         ctr = torch.empty(E, dtype=torch.int32, device=dev)
-        self.K.launch("dsv_moe_offsets", (1,), (32,), [offs, tiles, meta, ctr, counts, i32(E), i32(BM)])
+        self.K.launch("dsv_moe_offsets", (1,), (512,), [offs, tiles, meta, ctr, counts, i32(E), i32(BM)])
         rows = torch.empty(n, dtype=torch.int32, device=dev)
         rowpos = torch.empty(n, dtype=torch.int32, device=dev)
         row_w = torch.empty(n, dtype=torch.float32, device=dev)

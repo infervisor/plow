@@ -1,15 +1,21 @@
 //! Typed launches of the DeepSeek-V4.1 sm_90a cubin (`runtime/nvidia/dsv41/dsv41_all.cu`).
 //!
 //! One [`Kernels`] per device. Every launch goes on the stage's stream. Argument order and meaning
-//! mirror the `extern "C"` kernel signatures exactly; see the .cu files for the math.
+//! mirror the `extern "C"` kernel signatures exactly; [`ABI_VERSION`] must match the cubin's
+//! `dsv41_abi_version`, bumped whenever a signature changes, so a stale cubin is refused at load
+//! instead of reading its arguments wrong.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use crate::device::cuda::{CudaBackend, CudaStream, KernelFn};
+use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, KernelFn};
 use crate::device::Backend;
 use crate::error::{Result, RuntimeError};
+
+/// Must equal `dsv41_abi_version` in `runtime/nvidia/dsv41/dsv41_common.cuh`.
+pub const ABI_VERSION: u32 = 2;
 
 /// One kernel argument, held by value until the launch copies it.
 #[derive(Clone, Copy)]
@@ -23,6 +29,8 @@ pub enum A {
 
 pub const IX_SMEM: u32 = ((4 * 32 * (128 + 8) + 64 * (128 + 8)) * 2 + 2 * 4 * 64 * 4) as u32;
 pub const SA_SMEM: u32 = ((64 * 520 + 64 * 520 + 64 * 72) * 2 + 4 * 64 * 4 * 2 + 64 * 4) as u32;
+
+const MAX_ARGS: usize = 24;
 
 const NAMES: &[&str] = &[
     "dsv_rmsnorm",
@@ -46,6 +54,7 @@ const NAMES: &[&str] = &[
     "dsv_engram_gate",
     "dsv_embed_hc",
     "dsv_argmax",
+    "dsv_gumbel",
     "dsv_bf16_to_f32",
     "dsv_scale_bf16",
     "dsv_index_score",
@@ -62,52 +71,87 @@ const NAMES: &[&str] = &[
     "dsv_gather_rows",
 ];
 
+/// Per-kernel GPU time (`PLOW_DSV41_PROFILE=2`): an event pair around every launch.
+#[derive(Default)]
+pub struct KernelProf {
+    pending: Vec<(&'static str, CudaEvent, CudaEvent)>,
+    pub totals: HashMap<&'static str, (u64, f64)>,
+}
+
 pub struct Kernels {
     pub dev: Arc<CudaBackend>,
     _module: crate::device::Module,
     fns: HashMap<&'static str, KernelFn>,
+    pub prof: Option<RefCell<KernelProf>>,
 }
 
 impl Kernels {
-    pub fn load(dev: Arc<CudaBackend>, cubin: &[u8]) -> Result<Self> {
+    pub fn load(dev: Arc<CudaBackend>, cubin: &[u8], profile: bool) -> Result<Self> {
         let module = dev.module_load(cubin)?;
+        match dev.module_global_u32(&module, "dsv41_abi_version")? {
+            Some(v) if v == ABI_VERSION => {}
+            got => {
+                return Err(RuntimeError::Device(format!(
+                    "dsv41: cubin ABI {got:?}, engine expects {ABI_VERSION}; rebuild with scripts/build_dsv41_sm90a.sh"
+                )))
+            }
+        }
         let mut fns = HashMap::new();
         for &n in NAMES {
             fns.insert(n, dev.get_function(&module, n)?);
         }
         dev.set_max_dynamic_smem(fns["dsv_sparse_attn"], SA_SMEM)?;
         dev.set_max_dynamic_smem(fns["dsv_index_score"], IX_SMEM)?;
-        Ok(Kernels { dev, _module: module, fns })
+        Ok(Kernels { dev, _module: module, fns, prof: profile.then(|| RefCell::new(KernelProf::default())) })
     }
 
     pub fn launch(&self, name: &str, grid: [u32; 3], block: u32, smem: u32, args: &[A], s: &CudaStream) -> Result<()> {
-        let f = *self
+        let (&key, &f) = self
             .fns
-            .get(name)
+            .get_key_value(name)
             .ok_or_else(|| RuntimeError::Device(format!("dsv41: no kernel {name}")))?;
-        let mut vals: Vec<[u8; 8]> = args
-            .iter()
-            .map(|a| match *a {
-                A::P(v) => v.to_ne_bytes(),
-                A::L(v) => v.to_ne_bytes(),
-                A::I(v) => {
-                    let mut b = [0u8; 8];
-                    b[..4].copy_from_slice(&v.to_ne_bytes());
-                    b
-                }
-                A::F(v) => {
-                    let mut b = [0u8; 8];
-                    b[..4].copy_from_slice(&v.to_ne_bytes());
-                    b
-                }
-            })
-            .collect();
-        let mut ptrs: Vec<*mut c_void> = vals.iter_mut().map(|v| v.as_mut_ptr() as *mut c_void).collect();
-        self.dev.launch_kernel_grid(f, grid, block, smem, &mut ptrs, Some(s))
+        if args.len() > MAX_ARGS {
+            return Err(RuntimeError::Device(format!("dsv41: {name} has {} args (> {MAX_ARGS})", args.len())));
+        }
+        let mut vals = [[0u8; 8]; MAX_ARGS];
+        for (v, a) in vals.iter_mut().zip(args) {
+            match *a {
+                A::P(x) => *v = x.to_ne_bytes(),
+                A::L(x) => *v = x.to_ne_bytes(),
+                A::I(x) => v[..4].copy_from_slice(&x.to_ne_bytes()),
+                A::F(x) => v[..4].copy_from_slice(&x.to_ne_bytes()),
+            }
+        }
+        let mut ptrs = [std::ptr::null_mut::<c_void>(); MAX_ARGS];
+        for (p, v) in ptrs.iter_mut().zip(vals.iter_mut()) {
+            *p = v.as_mut_ptr() as *mut c_void;
+        }
+        let Some(prof) = &self.prof else {
+            return self.dev.launch_kernel_grid(f, grid, block, smem, &mut ptrs[..args.len()], Some(s));
+        };
+        let (e0, e1) = (self.dev.event_create(true)?, self.dev.event_create(true)?);
+        self.dev.event_record(&e0, s)?;
+        self.dev.launch_kernel_grid(f, grid, block, smem, &mut ptrs[..args.len()], Some(s))?;
+        self.dev.event_record(&e1, s)?;
+        prof.borrow_mut().pending.push((key, e0, e1));
+        Ok(())
     }
-}
 
-impl Kernels {
+    /// Fold the finished launches' times into the totals (call after the stream is synced).
+    pub fn prof_collect(&self) -> Result<()> {
+        if let Some(prof) = &self.prof {
+            let mut p = prof.borrow_mut();
+            let pending = std::mem::take(&mut p.pending);
+            for (name, e0, e1) in pending {
+                let ms = self.dev.event_elapsed_ms(&e0, &e1)? as f64;
+                let t = p.totals.entry(name).or_insert((0, 0.0));
+                t.0 += 1;
+                t.1 += ms;
+            }
+        }
+        Ok(())
+    }
+
     /// C[m][n] (f32) = A[m][k] . W[n][k]^T, A/W bf16 or f32. Small output grids (the mHC mixes are
     /// 24 x 20480; the router and head at small batch) take the one-block-per-output dot form: the
     /// 64x64-tiled kernel would put a single block on the whole K loop.

@@ -70,26 +70,40 @@ DSV_EXTERN void dsv_moe_count(int* __restrict__ counts, const int* __restrict__ 
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) atomicAdd(&counts[idx[i]], 1);
 }
-// Single block: offs[e] = exclusive prefix of counts; tile list (expert, row0) of BM-row tiles.
-// meta[0] = number of tiles. fill_ctr[e] zeroed for the fill pass.
+// One block of >= E threads: offs[e] = exclusive prefix of counts, and the tile list (expert, row0)
+// of BM-row tiles in expert order; meta[0] = number of tiles. fill_ctr[e] zeroed for the fill pass.
+// Two block-wide exclusive scans (row counts, tile counts), then each thread writes its own tiles.
 DSV_EXTERN void dsv_moe_offsets(int* __restrict__ offs, int* __restrict__ tiles, int* __restrict__ meta,
                                 int* __restrict__ fill_ctr, const int* __restrict__ counts, int E, int BM) {
-    if (threadIdx.x != 0) return;
-    int acc = 0, nt = 0;
-    for (int e = 0; e < E; e++) {
-        offs[e] = acc;
-        fill_ctr[e] = 0;
-        const int c = counts[e];
-        for (int r = 0; r < c; r += BM) {
-            tiles[nt * 2] = e;
-            tiles[nt * 2 + 1] = acc + r;
-            nt++;
-        }
-        acc += c;
+    __shared__ int sc[1024], st[1024];
+    const int e = threadIdx.x;
+    const int c = e < E ? counts[e] : 0;
+    const int nt = (c + BM - 1) / BM;
+    sc[e] = c;
+    st[e] = nt;
+    __syncthreads();
+    for (int o = 1; o < (int)blockDim.x; o <<= 1) {
+        const int a = e >= o ? sc[e - o] : 0, b = e >= o ? st[e - o] : 0;
+        __syncthreads();
+        sc[e] += a;
+        st[e] += b;
+        __syncthreads();
     }
-    offs[E] = acc;
-    meta[0] = nt;
+    const int row0 = sc[e] - c, tile0 = st[e] - nt;  // exclusive
+    if (e < E) {
+        offs[e] = row0;
+        fill_ctr[e] = 0;
+        for (int k = 0; k < nt; k++) {
+            tiles[(tile0 + k) * 2] = e;
+            tiles[(tile0 + k) * 2 + 1] = row0 + k * BM;
+        }
+    }
+    if (e == E - 1) {
+        offs[E] = sc[e];
+        meta[0] = st[e];
+    }
 }
+
 // rows[pos] = token, rowpos[t*topk+s] = pos, row_w[pos] = routing weight.
 DSV_EXTERN void dsv_moe_fill(int* __restrict__ rows, int* __restrict__ rowpos, float* __restrict__ row_w,
                              int* __restrict__ fill_ctr, const int* __restrict__ offs, const int* __restrict__ idx,

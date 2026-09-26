@@ -134,8 +134,9 @@ impl Stage {
         max_len: usize,
         max_slots: usize,
         arena_bytes: u64,
+        profile_kernels: bool,
     ) -> Result<Stage> {
-        let k = Kernels::load(dev.clone(), cubin)?;
+        let k = Kernels::load(dev.clone(), cubin, profile_kernels)?;
         let stream = dev.stream_create()?;
         let hd = cfg.head_dim as u64;
         let ixd = cfg.index_dim as u64;
@@ -308,48 +309,62 @@ impl Stage {
     // ------------------------------------------------------------------ step metadata
     /// Device arrays every layer of a step reads.
     pub fn step_meta(&self, st: &Step) -> Result<Meta> {
+        // Every per-step array (positions, lengths, emit flags, and each cache region's per-slot
+        // pointer table) is packed into one host buffer and uploaded with a single copy.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut push = |bytes: &[u8]| -> u64 {
+            let at = buf.len().next_multiple_of(16);
+            buf.resize(at, 0);
+            buf.extend_from_slice(bytes);
+            at as u64
+        };
+        let i32s = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_ne_bytes()).collect() };
         let t = st.t;
         let row_pos: Vec<i32> = if st.decode { st.pos.iter().map(|&p| p as i32).collect() } else { (0..t as i32).collect() };
-        let b_pos: Vec<i32> = st.pos.iter().map(|&p| p as i32).collect();
-        let mut clen = HashMap::new();
-        let mut gpos = HashMap::new();
-        let mut emit = HashMap::new();
+        let o_row_pos = push(&i32s(&row_pos));
+        let o_b_pos = push(&i32s(&st.pos.iter().map(|&p| p as i32).collect::<Vec<_>>()));
+        let mut o_clen = HashMap::new();
+        let mut o_gpos = HashMap::new();
+        let mut o_emit = HashMap::new();
+        let mut o_cmp_row = HashMap::new();
         for r in [1usize, 2] {
-            let cl: Vec<i32> = if st.decode {
-                st.pos.iter().map(|&p| ((p + 1) / r) as i32).collect()
-            } else {
-                (0..t).map(|i| ((i + 1) / r) as i32).collect()
-            };
-            clen.insert(r, self.put(&cl)?);
+            let cl: Vec<i32> = if st.decode { st.pos.iter().map(|&p| ((p + 1) / r) as i32).collect() } else { (0..t).map(|i| ((i + 1) / r) as i32).collect() };
+            o_clen.insert(r, push(&i32s(&cl)));
             // group index a latent row lands in (rope position = gidx * r)
-            let gp: Vec<i32> = if st.decode { st.pos.iter().map(|&p| (p / r) as i32).collect() } else { (0..(t / r) as i32).collect() };
-            gpos.insert(r, self.put(&gp)?);
+            let gp: Vec<i32> = if st.decode { st.pos.iter().map(|&p| (p / r) as i32).collect() } else { (0..(t / r).max(1) as i32).collect() };
+            o_gpos.insert(r, push(&i32s(&gp)));
             let em: Vec<i32> = if st.decode { st.pos.iter().map(|&p| ((p + 1) % r == 0) as i32).collect() } else { vec![0] };
-            emit.insert(r, self.put(&em)?);
+            o_emit.insert(r, push(&i32s(&em)));
+            o_cmp_row.insert(r, push(&i32s(&st.pos.iter().map(|&p| (p / r) as i32).collect::<Vec<_>>())));
         }
-        let ones = self.put(&vec![1i32; st.nb()])?;
-        let arange = self.put(&(0..st.nb() as i32).collect::<Vec<_>>())?;
-        let win_slot = self.put(&st.pos.iter().map(|&p| (p % self.cfg.window) as i32).collect::<Vec<_>>())?;
-        let mut cmp_row = HashMap::new();
-        for r in [1usize, 2] {
-            cmp_row.insert(r, self.put(&st.pos.iter().map(|&p| (p / r) as i32).collect::<Vec<_>>())?);
+        let o_ones = push(&i32s(&vec![1i32; st.nb()]));
+        let o_arange = push(&i32s(&(0..st.nb() as i32).collect::<Vec<_>>()));
+        let o_win_slot = push(&i32s(&st.pos.iter().map(|&p| (p % self.cfg.window) as i32).collect::<Vec<_>>()));
+        let mut o_ptrs = HashMap::new();
+        let c = &self.caches;
+        for reg in c.win.values().chain(c.cmp.values()).chain(c.idxk.values()).chain(c.st_kv.values()).chain(c.st_sc.values()) {
+            let v: Vec<u8> = st.slots.iter().flat_map(|&sl| reg.at(sl).to_ne_bytes()).collect();
+            o_ptrs.insert(reg.base, push(&v));
         }
+        let base = self.put(&buf)?;
+        let at = |o: u64| base + o;
         Ok(Meta {
-            row_pos: self.put(&row_pos)?,
-            b_pos: self.put(&b_pos)?,
-            clen,
-            gpos,
-            emit,
-            ones,
-            arange,
-            win_slot,
-            cmp_row,
+            row_pos: at(o_row_pos),
+            b_pos: at(o_b_pos),
+            clen: o_clen.into_iter().map(|(k, v)| (k, at(v))).collect(),
+            gpos: o_gpos.into_iter().map(|(k, v)| (k, at(v))).collect(),
+            emit: o_emit.into_iter().map(|(k, v)| (k, at(v))).collect(),
+            ones: at(o_ones),
+            arange: at(o_arange),
+            win_slot: at(o_win_slot),
+            cmp_row: o_cmp_row.into_iter().map(|(k, v)| (k, at(v))).collect(),
+            ptrs: o_ptrs.into_iter().map(|(k, v)| (k, at(v))).collect(),
         })
     }
 
-    fn ptrs(&self, reg: &Region, st: &Step) -> Result<u64> {
-        let v: Vec<u64> = st.slots.iter().map(|&s| reg.at(s)).collect();
-        self.put(&v)
+    /// The per-slot pointer table of a cache region, uploaded with the step's metadata.
+    fn ptrs(&self, reg: &Region, m: &Meta) -> Result<u64> {
+        m.ptrs.get(&reg.base).copied().ok_or_else(|| RuntimeError::Device("dsv41: region has no pointer table".into()))
     }
 
     // ------------------------------------------------------------------ attention
@@ -395,7 +410,7 @@ impl Stage {
             }
             (self.put(&[kv])?, t)
         } else {
-            let wp = self.ptrs(&wreg, st)?;
+            let wp = self.ptrs(&wreg, m)?;
             self.launch(
                 "dsv_scatter_rows",
                 [1, st.nb() as u32, 1],
@@ -440,8 +455,8 @@ impl Stage {
                             &[A::P(pooled), A::P(kvf), A::P(sc), A::I(t as i32), A::I(hd as i32), A::I(r as i32), A::P(sk.at(slot)), A::P(ss.at(slot))],
                         )?;
                     } else {
-                        let skp = self.ptrs(&sk, st)?;
-                        let ssp = self.ptrs(&ss, st)?;
+                        let skp = self.ptrs(&sk, m)?;
+                        let ssp = self.ptrs(&ss, m)?;
                         self.launch(
                             "dsv_compress_pool_decode",
                             [st.nb() as u32, 1, 1],
@@ -486,7 +501,7 @@ impl Stage {
                     self.launch("dsv_scale_bf16", [cdiv(n, 256), 1, 1], 256, 0, &[A::P(w), A::L(n as i64), A::F(scale)])?;
                     let s_ld = s_max.next_multiple_of(64);
                     let score = self.arena.alloc((t * s_ld * 2) as u64)?;
-                    let kp = self.ptrs(&kreg, st)?;
+                    let kp = self.ptrs(&kreg, m)?;
                     self.launch(
                         "dsv_index_score",
                         [(s_ld / 64) as u32, cdiv(t as u64, 4), 1],
@@ -542,7 +557,7 @@ impl Stage {
                 n_cmp = sh.kout;
                 cmp_idx = sh.topk;
             }
-            cmp_ptrs = self.ptrs(&creg, st)?;
+            cmp_ptrs = self.ptrs(&creg, m)?;
         }
         let n_idx = win + n_cmp;
         let table = self.arena.alloc((t * n_idx * 4) as u64)?;
@@ -588,7 +603,7 @@ impl Stage {
             let slot = st.slots[0];
             self.dev.memcpy_dtod_async(reg.at(slot), src, (g * row_bytes) as u64, &self.stream)
         } else {
-            let dp = self.ptrs(reg, st)?;
+            let dp = self.ptrs(reg, m)?;
             self.launch(
                 "dsv_scatter_rows",
                 [1, st.nb() as u32, 1],
@@ -613,12 +628,13 @@ impl Stage {
         self.dev.memset_d8_async(counts, 0, e * 4, &self.stream)?;
         self.launch("dsv_moe_count", [cdiv(n as u64, 256), 1, 1], 256, 0, &[A::P(counts), A::P(idx), A::I(n as i32)])?;
         let bm = 64usize;
-        let max_tiles = n.div_ceil(bm) + e;
+        // sum over experts of ceil(c_e / bm) <= n / bm + (experts with any row) <= ceil(n / bm) + min(n, e)
+        let max_tiles = n.div_ceil(bm) + n.min(e);
         let offs = self.arena.alloc(((e + 1) * 4) as u64)?;
         let tiles = self.arena.alloc((max_tiles * 8) as u64)?;
         let meta = self.arena.alloc(4)?;
         let ctr = self.arena.alloc((e * 4) as u64)?;
-        self.launch("dsv_moe_offsets", [1, 1, 1], 32, 0, &[A::P(offs), A::P(tiles), A::P(meta), A::P(ctr), A::P(counts), A::I(e as i32), A::I(bm as i32)])?;
+        self.launch("dsv_moe_offsets", [1, 1, 1], e.next_power_of_two().max(32) as u32, 0, &[A::P(offs), A::P(tiles), A::P(meta), A::P(ctr), A::P(counts), A::I(e as i32), A::I(bm as i32)])?;
         let rows = self.arena.alloc((n * 4) as u64)?;
         let rowpos = self.arena.alloc((n * 4) as u64)?;
         let roww = self.arena.alloc((n * 4) as u64)?;
@@ -723,6 +739,8 @@ pub struct Meta {
     pub arange: u64,
     pub win_slot: u64,
     pub cmp_row: HashMap<usize, u64>,
+    /// Region base -> device pointer table [nb] u64.
+    pub ptrs: HashMap<u64, u64>,
 }
 
 fn bytemuck_f32(v: &[f32]) -> &[u8] {

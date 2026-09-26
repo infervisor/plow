@@ -258,6 +258,7 @@ driver_api! {
     cuEventCreate: fn(*mut CUevent, u32) -> CUresult,
     cuEventDestroy_v2: fn(CUevent) -> CUresult,
     cuEventRecord: fn(CUevent, CUstream) -> CUresult,
+    cuStreamWaitEvent: fn(CUstream, CUevent, u32) -> CUresult,
     cuEventQuery: fn(CUevent) -> CUresult,
     cuEventSynchronize: fn(CUevent) -> CUresult,
     cuEventElapsedTime: fn(*mut f32, CUevent, CUevent) -> CUresult,
@@ -1724,6 +1725,17 @@ impl CudaBackend {
         self.check(
             unsafe { (self.api.cuEventRecord)(event.raw as CUevent, stream.raw as CUstream) },
             "cuEventRecord",
+        )
+    }
+
+    /// Make every later op on `stream` wait for `event` (which may have been recorded on another
+    /// device's stream) without blocking the host.
+    pub fn stream_wait_event(&self, stream: &CudaStream, event: &CudaEvent) -> Result<()> {
+        self.bind()?;
+        // SAFETY: live event/stream handles.
+        self.check(
+            unsafe { (self.api.cuStreamWaitEvent)(stream.raw as CUstream, event.raw as CUevent, 0) },
+            "cuStreamWaitEvent",
         )
     }
 

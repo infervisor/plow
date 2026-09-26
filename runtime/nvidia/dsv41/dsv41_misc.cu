@@ -248,6 +248,29 @@ DSV_EXTERN void dsv_embed_hc(bf16* __restrict__ x, const bf16* __restrict__ emb,
     for (int c = 0; c < 4; c++) *(uint4*)(x + ((long long)t * 4 + c) * D + c8) = v;
 }
 
+// Temperature sampling as Gumbel-max (model.py `sample`): for rows with temp[b] > 0,
+// logits[b][j] <- logits[b][j] / temp[b] + g, g = -log(-log(u)), u uniform in (0,1) from a counter
+// hash of (seed[b], step[b], j) -- reproducible per request seed. temp 0 rows are left for argmax.
+__device__ __forceinline__ uint64_t splitmix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+DSV_EXTERN void dsv_gumbel(float* __restrict__ logits, const float* __restrict__ temp, const unsigned long long* __restrict__ seed,
+                           const unsigned long long* __restrict__ step, int V) {
+    const int b = blockIdx.y;
+    const float T = temp[b];
+    if (T <= 0.f) return;
+    const uint64_t key = splitmix64(seed[b] ^ splitmix64(step[b]));
+    float* l = logits + (long long)b * V;
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < V; j += gridDim.x * blockDim.x) {
+        const uint64_t r = splitmix64(key ^ (uint64_t)j);
+        const float u = ((float)(r >> 40) + 0.5f) * (1.0f / 16777216.0f);
+        l[j] = l[j] / T - logf(-logf(u));
+    }
+}
+
 // out[b] = argmax_j logits[b][j] (first index on ties), one block per row.
 DSV_EXTERN void dsv_argmax(int* __restrict__ out, const float* __restrict__ logits, int V) {
     __shared__ float sv[32];
