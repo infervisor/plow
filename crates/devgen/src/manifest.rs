@@ -1035,7 +1035,11 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     if sm90a && !s.decode_gemv_k.is_empty() {
         t.insert("xreg_k".into(), json!(s.decode_gemv_k.iter().collect::<Vec<_>>()));
         if s.moe_down_inter == 0 && s.decode_batch >= 2 && s.decode_gemv_k.iter().all(|k| k % 32 == 0) {
-            t.insert("gemv_mma_b1".into(), json!(1));
+            // Small dense GEMVs keep the classic B=1 kernels, as the MoE 26B does: Veena
+            // (Llama-3.2-3B, K 3072/8192) on h200 B=1 3.106 -> 2.979 ms with the walk off.
+            if s.decode_gemv_k.iter().min().is_some_and(|&k| k >= 3840) {
+                t.insert("gemv_mma_b1".into(), json!(1));
+            }
             // * `gemv_mma_pair`: its single-stream walks (down, o_proj, lm_head) take two row blocks
             //   per k-step (op_gemv_mma.cuh): 12B B=1/4/16 10.99/11.70/14.25 -> 10.92/11.60/13.94.
             t.insert("gemv_mma_pair".into(), json!(1));
@@ -1211,7 +1215,8 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
         req.push("PLOW_NV_FA_GF=2".into());
     } else if s.hd.iter().all(|&h| h <= 128) && s.gqa > 1 && s.gqa % 4 != 0 {
         // The hd128 flash-decode arm defaults to GF 4 and traps unless GF | gqa.
-        req.push(format!("PLOW_NV_FA_GF={}", if s.gqa % 2 == 0 { 2 } else { 1 }));
+        let gf = if s.gqa % 2 == 0 { 2 } else { crate::odd_group_gf(s.gqa) };
+        req.push(format!("PLOW_NV_FA_GF={gf}"));
     }
     if on("w8a8") {
         req.push("PLOW_NV_W8A8=1".into());

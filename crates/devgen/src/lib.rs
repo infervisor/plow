@@ -193,6 +193,16 @@ pub(crate) fn fa_gf_full() -> u32 {
         .unwrap_or(FA_GF_FULL)
 }
 
+/// GF for a GQA group the power-of-two GFs do not divide: the whole group when it fits one work
+/// item (the decode kernel allows GF <= warps), else no fusion.
+pub(crate) fn odd_group_gf(gqa: u32) -> u32 {
+    if gqa <= 8 {
+        gqa
+    } else {
+        1
+    }
+}
+
 pub(crate) fn attention_decode_ns(
     batch: u32,
     heads: u32,
@@ -4496,13 +4506,14 @@ fn emit_phase(
         let gf = if gqa < 2 {
             1
         } else if full {
-            // An odd group (Llama-3.2-3B / Veena: 24 heads over 8 KV heads = 3) takes no fusion;
-            // the manifest pairs the object's hd128 arm at PLOW_NV_FA_GF=1 for the same shapes.
+            // A group the configured GF does not divide (Llama-3.2-3B / Veena: 24 heads over 8
+            // KV heads = 3) fuses WHOLE: one work item reads each KV row once for all its heads.
+            // The manifest pairs the object's hd128 arm at the same PLOW_NV_FA_GF.
             let g = fa_gf_full().min(gqa);
             if gqa % g == 0 {
                 g
             } else {
-                1
+                odd_group_gf(gqa)
             }
         } else {
             2.min(gqa)
@@ -8060,12 +8071,12 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     }
     if emit_config::active().prefill_cublaslt {
         assert!(
-            model_type.starts_with("gemma4")
+            (model_type.starts_with("gemma4") || model_type == "llama")
                 && arch == "sm_90a"
                 && tp == 1
                 && !emit_config::active().any_fp8_weights()
                 && !emit_config::active().mxfp4,
-            "cuBLASLt prefill emission requires Gemma 4 BF16 on single-GPU SM90"
+            "cuBLASLt prefill emission requires Gemma 4 or Llama BF16 on single-GPU SM90"
         );
     }
     if emit_config::active().gemma4_sm90_gemm_glu_role {

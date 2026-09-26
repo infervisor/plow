@@ -447,8 +447,11 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
  * level; RTX experiments opt in with -DPLOW_NV_FA_GF_FULL=4 or 8. */
 #define PLOW_NV_FA_GF_FULL PLOW_NV_FA_GF
 #endif
+/* 3 is a whole odd GQA group (Llama-3.2-3B: 24/8). Only the generic hd<=128 body instantiates it;
+ * the hd512 full-attention arms exist only in Gemma builds. */
 #if PLOW_NV_FA_GF_FULL != 1 && PLOW_NV_FA_GF_FULL != 2 && PLOW_NV_FA_GF_FULL != 4 && \
-    PLOW_NV_FA_GF_FULL != 8 && !(PLOW_NV_FA_GF_FULL == 16 && PLOW_NV_FA_GF16_BENCH)
+    PLOW_NV_FA_GF_FULL != 8 && !(PLOW_NV_FA_GF_FULL == 16 && PLOW_NV_FA_GF16_BENCH) && \
+    !(PLOW_NV_FA_GF_FULL == 3 && !PLOW_NV_GEMMA)
 #error "PLOW_NV_FA_GF_FULL requires {1,2,4,8}, or16 with wide softmax reductions"
 #endif
 #ifndef PLOW_NV_FA_GF_HD256

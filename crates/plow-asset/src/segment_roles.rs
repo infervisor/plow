@@ -68,6 +68,20 @@ pub const CUBLASLT_PREFILL_GEMMA4_26B_SHAPES: [(u32, u32); 8] = [
     (2816, 2112),
 ];
 
+/// Llama-3.2-3B (Veena: hidden 3072, 24/8 heads, inter 8192) and Chatterbox T3 (Llama-520M:
+/// hidden 1024, inter 4096) projections: q/o, k/v, down, and gate/up when emitted unfused
+/// (`PLOW_NO_GLU_FUSE`). On h200 the native object's 128-row segment cost ~1.95 ms per Veena
+/// layer; q/k/v/o/down on cuBLASLt took TTFT@60 56.7 -> 45.3 ms (sm90a, 2026-09-26).
+pub const CUBLASLT_PREFILL_LLAMA_TTS_SHAPES: [(u32, u32); 7] = [
+    (3072, 3072),
+    (1024, 3072),
+    (3072, 8192),
+    (8192, 3072),
+    (1024, 1024),
+    (1024, 4096),
+    (4096, 1024),
+];
+
 pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
     // At M <= 512 the small set is the down projection (3840, 15360), the o projection
     // (3840, 8192) and the unfused gate/up (15360, 3840): measured on H100 2026-09-17, Lt
@@ -79,7 +93,8 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
     matches!(profile, "sm90a" | "sm_90a")
         && (CUBLASLT_PREFILL_ROWS.contains(&m) || CUBLASLT_PREFILL_WIDE_ROWS.contains(&m))
         && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
-            || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k)))
+            || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k))
+            || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k)))
 }
 
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";

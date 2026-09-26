@@ -3773,6 +3773,12 @@ async fn serve(
     trace: bool,
     mux_cfg: MuxConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Speech pipelines that own their engine start first; the rest are text-engine models.
+    #[cfg(feature = "cuda")]
+    let assets = {
+        let device = RuntimeConfig::get().devices.first().copied().unwrap_or(0).min(u32::from(u8::MAX)) as u8;
+        plowrt::tts::serving::start_speech_workers(assets, device)?
+    };
     let state = bringup_runtime(assets, executors, trace, mux_cfg, served_model_name).await?;
 
     let router = app(Arc::clone(&state));
