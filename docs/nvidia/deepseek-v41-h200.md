@@ -53,13 +53,15 @@ FlashMLA sparse, DeepGEMM indexer).
 | 1k in / 256 out | 4 | 36.1 | 1672 | 104.5 | 447.7 | 145 | 8.38 |
 | 1k in / 256 out | 16 | 74.8 | 1751 | 206.4 | 792.9 | 567 | 13.36 |
 | 1k in / 256 out | 64 | 125.4 | 1893 | 494.4 | 1765.5 | 1325 | 33.52 |
-| 4k in / 512 out | 1 | | | | 131.6 | 248 | 7.15 |
-| 4k in / 512 out | 4 | | | | 458.8 | 163 | 8.46 |
-| 4k in / 512 out | 16 | | | | 936.0 | 1358 | 14.70 |
-| 16k in / 128 out | 1 | | | | 75.4 | 844 | 7.07 |
-| 16k in / 128 out | 4 | | | | 424.3 | 107 | 8.42 |
+| 4k in / 512 out | 1 | 14.4 | 1808 | 66.3 | 131.6 | 248 | 7.15 |
+| 4k in / 512 out | 4 | 35.5 | 3672 | 106.1 | 458.8 | 163 | 8.46 |
+| 4k in / 512 out | 16 | 74.6 | 3744 | 204.0 | 936.0 | 1358 | 14.70 |
+| 16k in / 128 out | 1 | 8.8 | 6067 | 66.4 | 75.4 | 844 | 7.07 |
+| 16k in / 128 out | 4 | 14.1 | 12132 | 189.4 | 424.3 | 107 | 8.42 |
 
-(plowrt sweep `plowrt-sweep2`, kernels as of eedddffd.)
+(plowrt sweep `/root/dsv41/results/plowrt-sweep2`, kernels as of eedddffd; every request succeeded. vLLM runs
+with chunked prefill and CUDA graphs; plowrt admits one unchunked prefill per scheduler loop, so
+TTFT under concurrency includes queueing behind other prefills.)
 
 ## 5. Kernel log
 
