@@ -756,6 +756,20 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
         list(APPEND _cubin_outs "${_snac_out}")
     endif()
 
+    # Chatterbox speech packets (`tts.t3_cfg.v1`): the native S3Gen stage (tokens -> 24 kHz PCM).
+    option(PLOW_TTS_S3GEN "Also build codec/libplow_s3gen.so for a Chatterbox T3 speech packet" OFF)
+    if(PLOW_TTS_S3GEN AND PLOW_SM90A_CUBIN)
+        set(_s3gen_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/s3gen/s3gen.cu")
+        set(_s3gen_out "${PLOW_CUBIN_DIR}/codec/libplow_s3gen.so")
+        add_custom_command(OUTPUT "${_s3gen_out}"
+            COMMAND env PLOW_NVCC=${PLOW_CUBIN_NVCC}
+                    bash "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/s3gen/build.sh" "${_s3gen_out}"
+            DEPENDS "${_s3gen_src}" "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/s3gen/build.sh"
+            COMMENT "nvcc codec/libplow_s3gen.so"
+            VERBATIM)
+        list(APPEND _cubin_outs "${_s3gen_out}")
+    endif()
+
     # `nv_cubins` builds every enabled arch variant; `sm120_cubins` keeps the
     # name scripts/build_sm120_cubin.sh has always driven.
     add_custom_target(nv_cubins ALL DEPENDS ${_cubin_outs})

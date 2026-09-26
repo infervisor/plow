@@ -1764,7 +1764,13 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // the CLI's idea of what was emitted, which is the drift this whole change
     // exists to remove.
     if cli.emit() == EmitKind::DevblobCubin {
-        build_cubin_from_manifest(&pkt, &cli.arch, cli.segmented, cli.emit_cfg.tts_profile.is_some())?;
+        let t3 = cli.hf_dir.as_deref().is_some_and(|dir| {
+            std::fs::read(dir.join("config.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .is_some_and(|v| v.get("chatterbox_t3").is_some())
+        });
+        build_cubin_from_manifest(&pkt, &cli.arch, cli.segmented, cli.emit_cfg.tts_profile.is_some(), t3)?;
     }
 
     // Bare-blob mode (`--out foo.pkt`) stops here: no manifest, exactly the
@@ -1858,6 +1864,7 @@ fn build_cubin_from_manifest(
     arch: &str,
     segmented: bool,
     speech: bool,
+    t3: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mpath = pkt.with_file_name("build.json");
     let man: serde_json::Value = serde_json::from_slice(
@@ -1957,6 +1964,7 @@ fn build_cubin_from_manifest(
     args.push(format!("-DPLOW_CUBIN_NVCC={}", nvcc.display()));
     // A speech packet ships its codec object next to the interpreter objects.
     args.push(format!("-DPLOW_TTS_SNAC={}", if speech { "ON" } else { "OFF" }));
+    args.push(format!("-DPLOW_TTS_S3GEN={}", if t3 { "ON" } else { "OFF" }));
 
     let out_dir = pkt.parent().map(PathBuf::from).unwrap_or_default();
     let config = pkt.with_file_name("plow_config.h");

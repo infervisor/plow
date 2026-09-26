@@ -45,27 +45,6 @@ impl ChatterboxWorker {
         let dir2 = dir.clone();
         let (s_ready_tx, s_ready_rx) = mpsc::channel::<Result<()>>();
         std::thread::Builder::new()
-            .name("plow-tts-s3gen".into())
-            .spawn(move || {
-                let mut s3 = match S3Gen::load(&dir2, 1000) {
-                    Ok(s) => s,
-                    Err(e) => return drop(s_ready_tx.send(Err(e))),
-                };
-                let _ = s_ready_tx.send(Ok(()));
-                while let Ok((p, tokens, t3_ms)) = s_rx.recv() {
-                    let t = std::time::Instant::now();
-                    let r = s3.synthesize(&p.voice, &tokens, p.seed).map_err(|e| e.to_string()).map(|pcm| SpeechAudio {
-                        pcm,
-                        tokens: tokens.len(),
-                        t3_ms,
-                        s3gen_ms: t.elapsed().as_secs_f64() * 1e3,
-                    });
-                    let _ = p.reply.send(r);
-                }
-            })
-            .map_err(|e| RuntimeError::Device(e.to_string()))?;
-        s_ready_rx.recv().map_err(|e| RuntimeError::Device(e.to_string()))??;
-        std::thread::Builder::new()
             .name("plow-tts-t3".into())
             .spawn(move || {
                 let mut t3 = match T3Engine::load(&dir, device) {
@@ -99,6 +78,30 @@ impl ChatterboxWorker {
             })
             .map_err(|e| RuntimeError::Device(e.to_string()))?;
         ready_rx.recv().map_err(|e| RuntimeError::Device(e.to_string()))??;
+        // After the engine: its backend loads the real driver by path. The stage's static CUDA
+        // runtime then resolves `libcuda.so.1` to that library instead of searching (which can
+        // land on a toolkit stub: "driver version is insufficient").
+        std::thread::Builder::new()
+            .name("plow-tts-s3gen".into())
+            .spawn(move || {
+                let mut s3 = match S3Gen::load(&dir2, 1000) {
+                    Ok(s) => s,
+                    Err(e) => return drop(s_ready_tx.send(Err(e))),
+                };
+                let _ = s_ready_tx.send(Ok(()));
+                while let Ok((p, tokens, t3_ms)) = s_rx.recv() {
+                    let t = std::time::Instant::now();
+                    let r = s3.synthesize(&p.voice, &tokens, p.seed).map_err(|e| e.to_string()).map(|pcm| SpeechAudio {
+                        pcm,
+                        tokens: tokens.len(),
+                        t3_ms,
+                        s3gen_ms: t.elapsed().as_secs_f64() * 1e3,
+                    });
+                    let _ = p.reply.send(r);
+                }
+            })
+            .map_err(|e| RuntimeError::Device(e.to_string()))?;
+        s_ready_rx.recv().map_err(|e| RuntimeError::Device(e.to_string()))??;
         Ok(ChatterboxWorker { tx: parking_lot::Mutex::new(tx), sample_rate: 24000 })
     }
 

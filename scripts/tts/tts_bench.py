@@ -12,7 +12,8 @@ plus texts.json for scripts/tts/asr_check.py.
 import argparse, concurrent.futures as cf, json, os, statistics, sys, time, urllib.request
 
 sys.path.insert(0, os.path.dirname(__file__))
-from veena_ref import PROMPTS
+from veena_ref import PROMPTS as VEENA_PROMPTS
+from chatterbox_ref import PROMPTS as CBX_TEXTS
 
 SR = 24000
 
@@ -55,11 +56,16 @@ def main():
     ap.add_argument("--tag", default=None)
     ap.add_argument("--wav", action="store_true")
     ap.add_argument("--warmup", type=int, default=2)
+    ap.add_argument("--prompt-set", choices=["veena", "chatterbox"], default="veena")
+    ap.add_argument("--voice", default=None, help="override every prompt's voice")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     tag = args.tag or f"{'stream' if args.stream else 'full'}_c{args.conc}"
     extra = dict(temperature=0.0) if args.greedy else {}
-    jobs = [(PROMPTS[i % len(PROMPTS)], i) for i in range(args.n)]
+    prompts = VEENA_PROMPTS if args.prompt_set == "veena" else [("default", t) for t in CBX_TEXTS]
+    if args.voice:
+        prompts = [(args.voice, t) for _, t in prompts]
+    jobs = [(prompts[i % len(prompts)], i) for i in range(args.n)]
     for (spk, text), i in jobs[: args.warmup]:
         one(args.url, args.model, spk, text, args.stream, 1000 + i, extra)
     t0 = time.perf_counter()

@@ -7,7 +7,9 @@ Usage:
       out/s3gen.bin [--voice-out out/voice_default.bin] [--conds path/to/conds.pt]
 
 Runs on CPU. Weight norm is folded (the parametrization's computed .weight). Everything is
-exported in the layout the native GEMMs consume; the library only pads rows/cols.
+exported in fp32 in the layout the native GEMMs consume; at create the library pads rows / K
+(to 128) and converts GEMM weights to fp16 (round to nearest; the CFM ResNet / final convs also
+get an fp16 residual plane w - fp16(w)).
 
 File format (both files; all little-endian):
   offset 0  : 8 bytes magic  "S3GENW01" (weights) or "S3GENV01" (voice)

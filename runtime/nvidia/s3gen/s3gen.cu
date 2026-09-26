@@ -620,12 +620,6 @@ __device__ __forceinline__ void wgmma_h128(float* d, uint64_t da, uint64_t db) {
                : S3G_ACC64
                : "l"(da), "l"(db));
 }
-__device__ __forceinline__ void wgmma_h256(float* d, uint64_t da, uint64_t db) {
-  asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, 1, 0;\nwgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63, %64, %65, %66, %67, %68, %69, %70, %71, %72, %73, %74, %75, %76, %77, %78, %79, %80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, %92, %93, %94, %95, %96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, %108, %109, %110, %111, %112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, %123, %124, %125, %126, %127}"
-               ", %128, %129, p, 1, 1, 0, 0;\n}\n"
-               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]), "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]), "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]), "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]), "+f"(d[68]), "+f"(d[69]), "+f"(d[70]), "+f"(d[71]), "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]), "+f"(d[76]), "+f"(d[77]), "+f"(d[78]), "+f"(d[79]), "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]), "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]), "+f"(d[88]), "+f"(d[89]), "+f"(d[90]), "+f"(d[91]), "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]), "+f"(d[96]), "+f"(d[97]), "+f"(d[98]), "+f"(d[99]), "+f"(d[100]), "+f"(d[101]), "+f"(d[102]), "+f"(d[103]), "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]), "+f"(d[108]), "+f"(d[109]), "+f"(d[110]), "+f"(d[111]), "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]), "+f"(d[116]), "+f"(d[117]), "+f"(d[118]), "+f"(d[119]), "+f"(d[120]), "+f"(d[121]), "+f"(d[122]), "+f"(d[123]), "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])
-               : "l"(da), "l"(db));
-}
 // D (f32) += A (registers, f16 fragment) * B (smem, f16, MN-major i.e. transposed: rows = K)
 __device__ __forceinline__ void wgmma_h64_rA_tB(float* d, const uint32_t* a, uint64_t db) {
   asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, 1, 0;\nwgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 " S3G_R32
@@ -923,9 +917,7 @@ __global__ void __launch_bounds__(C::NT, C::MINB) k_hgemm(const __grid_constant_
 #pragma unroll
     for (int kk = 0; kk < 4; ++kk) {
       const uint64_t da = wg_desc_b(aa + kk * 32), db = wg_desc_b(ba + kk * 32);
-      if constexpr (BN == 256)
-        wgmma_h256(acc, da, db);
-      else if constexpr (BN == 128)
+      if constexpr (BN == 128)
         wgmma_h128(acc, da, db);
       else
         wgmma_h64(acc, da, db);
@@ -965,6 +957,54 @@ __global__ void __launch_bounds__(C::NT, C::MINB) k_hgemm(const __grid_constant_
   const long obase = (long)b * a.o_tcap;
   const int rb = (KS == 2 ? 0 : wg * 64) + 16 * (warp & 3) + (lane >> 2);
   const int cb = n0 + 2 * (lane & 3) + (KS == 2 ? wg * NG * 8 : 0);
+  if constexpr (O16 && E2 == E2_NONE && NG % 4 == 0) {
+    // Plain fp16 output (QKV, FF1, HiFT conv1): the four lanes of a quad hold 8 consecutive
+    // columns of a row; a 4x4 in-quad transpose (shuffles) lets every lane store 16 bytes.
+    if (!a.aux && !a.aux2 && !a.reflect && a.ostride == 1 && a.ooff == 0 && a.o_lo == 0 && !(a.ldo & 7) &&
+        n0 + BN <= a.N) {
+      const int cq = lane & 3, cg = cb - 2 * cq;  // first column of this warpgroup's groups
+#pragma unroll
+      for (int hh = 0; hh < 2; ++hh) {
+        const int t = t0 + rb + 8 * hh;
+        const bool rok = t < rlen && t < olen;
+        __half* orow = reinterpret_cast<__half*>(a.out) + (obase + t) * a.ldo + cg;
+#pragma unroll
+        for (int g0 = 0; g0 < NG; g0 += 4) {
+          uint32_t in[4];
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const int g = g0 + j, n = cb + 8 * g;
+            float w0 = fin[4 * g + 2 * hh] + (a.bias ? __ldg(a.bias + n) : 0.f);
+            float w1 = fin[4 * g + 2 * hh + 1] + (a.bias ? __ldg(a.bias + n + 1) : 0.f);
+            if constexpr (ACT == ACT_SNAKE) {
+              w0 = snakef(w0, __ldg(a.actp + n));
+              w1 = snakef(w1, __ldg(a.actp + n + 1));
+            } else {
+              w0 = act_t<ACT>(w0, a.aslope);
+              w1 = act_t<ACT>(w1, a.aslope);
+            }
+            in[j] = pack_h2(w0 * a.oscale, w1 * a.oscale);
+          }
+          // round j: lane s sends its value for receiver (s - j) & 3; receiver r gets position
+          // (r + j) & 3 of column group g0 + r
+          uint32_t o[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const int si = (cq - j) & 3;
+            const uint32_t v = si == 0 ? in[0] : si == 1 ? in[1] : si == 2 ? in[2] : in[3];
+            const uint32_t got = __shfl_sync(0xffffffffu, v, (lane & ~3) | ((cq + j) & 3));
+            const int p = (cq + j) & 3;
+            o[0] = p == 0 ? got : o[0];
+            o[1] = p == 1 ? got : o[1];
+            o[2] = p == 2 ? got : o[2];
+            o[3] = p == 3 ? got : o[3];
+          }
+          if (rok) *reinterpret_cast<uint4*>(orow + 8 * (g0 + cq)) = make_uint4(o[0], o[1], o[2], o[3]);
+        }
+      }
+      return;
+    }
+  }
   // Column groups are processed in chunks of CH; each chunk batches its loads (bias, activation
   // parameters, aux, aux2) ahead of the math and the stores.
   constexpr int CH = NG < 8 ? NG : 8;
@@ -1084,7 +1124,7 @@ struct HAttnArgs {
   __half* out;
   int tcap;
 };
-constexpr int kHAttnSmem = 9 * 8192 + 1024;
+constexpr int kHAttnSmem = 13 * 8192 + 1024;  // Q + 2 warpgroups x 3 x (K, V)
 // Per-warpgroup barrier with compile-time ids (a runtime id reserves all 16 hardware barriers).
 __device__ __forceinline__ void bar_wg(int wg) {
   if (wg == 0)
@@ -1102,9 +1142,9 @@ __global__ void __launch_bounds__(256, 2) k_hattn(const __grid_constant__ HAttnA
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wg = warp >> 2, w = warp & 3, tq = lane & 3;
   const int wt = tid & 127;  // thread index within the warpgroup
   char* Qs = sm;
-  char* KV = sm + 8192 + wg * 32768;  // this warpgroup's K[2] | V[2] tiles
+  char* KV = sm + 8192 + wg * 49152;  // this warpgroup's K[3] | V[3] tiles (prefetch 2 ahead)
   auto Kt = [&](int s) { return KV + s * 8192; };
-  auto Vt = [&](int s) { return KV + 16384 + s * 8192; };
+  auto Vt = [&](int s) { return KV + 24576 + s * 8192; };
   const __half* base = a.qkv + (long)b * a.tcap * 1536 + h * 64;
   const int c = wt & 7, r0 = wt >> 3;  // 16-byte chunk column, first row (rows r0 + 16 i)
   if (wg == 0) {
@@ -1127,7 +1167,9 @@ __global__ void __launch_bounds__(256, 2) k_hattn(const __grid_constant__ HAttnA
   const int nt = (len + 63) >> 6;
   if (wg < nt) load_kv(wg * 64, 0);
   cp_commit();
-  cp_wait<0>();
+  if (wg + 2 < nt) load_kv(wg * 64 + 128, 1);
+  cp_commit();
+  cp_wait<1>();
   __syncthreads();  // Q (loaded by warpgroup 0) visible to both
   float o[32];
 #pragma unroll
@@ -1136,10 +1178,10 @@ __global__ void __launch_bounds__(256, 2) k_hattn(const __grid_constant__ HAttnA
   constexpr float kScale = 0.125f * 1.4426950408889634f;  // 1/sqrt(64) * log2(e)
   int it = 0;
   for (int jt = wg; jt < nt; jt += 2, ++it) {
-    const int j0 = jt * 64, s = it & 1;
-    if (jt + 2 < nt) load_kv(j0 + 128, s ^ 1);
+    const int j0 = jt * 64, s = it % 3;
+    if (jt + 4 < nt) load_kv(j0 + 256, (it + 2) % 3);  // slot of tile it-1, retired at its end
     cp_commit();
-    cp_wait<1>();
+    cp_wait<2>();
     fence_async_smem();
     bar_wg(wg);
     float sc[32];
@@ -1772,7 +1814,7 @@ inline unsigned cdiv(long n, long d) { return (unsigned)((n + d - 1) / d); }
 inline int rup(int n, int d) { return (n + d - 1) / d * d; }
 
 bool g_pdl = true;
-int g_force_cfg = -1;  // test hook: force the fp16 GEMM tile config
+int g_force_cfg = -1;  // test hook: force the fp16 GEMM tile config (0: 128x128, 1/4: 64x128, 2: 64x64 K split)
 template <typename... KArgs, typename... Args>
 cudaError_t launch(void (*k)(KArgs...), dim3 g, dim3 b, size_t smem, cudaStream_t st, Args... args) {
   cudaLaunchConfig_t cfg{};
@@ -1921,7 +1963,6 @@ template <int AM>
 using HC1 = HCfg<64, 128, 3, AM, 1>;
 template <int AM>
 using HC2 = HCfg<64, 64, AM ? 4 : 3, AM, 2>;
-using HC3 = HCfg<128, 256, 3, 1, 1>;  // wide-N fp16-input GEMMs (benchmark only)
 template <int AM>
 using HC4 = HCfg<64, 128, 4, AM, 1>;
 template <int AM>
@@ -1945,8 +1986,7 @@ cudaError_t hgemm_cfg(const GemmArgs* a, int pre, int act, int o16, int e2, int 
   using C = std::conditional_t<
       CFG == 0, HC0<AM>,
       std::conditional_t<CFG == 1, HC1<AM>,
-                         std::conditional_t<CFG == 2, HC2<AM>,
-                                            std::conditional_t<CFG == 3, HC3, std::conditional_t<CFG == 4, HC4<AM>, HC5<AM>>>>>>;
+                         std::conditional_t<CFG == 2, HC2<AM>, std::conditional_t<CFG == 4, HC4<AM>, HC5<AM>>>>>;
 #define S3G_H(AMX, P, A, O, E)                                                        \
   if constexpr (AM == AMX)                                                          \
     if (pre == P && act == A && o16 == O && e2 == E) return hgemm_kernel<C, P, A, O, E>(a, M, phases, st);
@@ -1965,7 +2005,6 @@ cudaError_t hgemm_dispatch(const GemmArgs* a, int cfg, int am, int pre, int act,
                           : hgemm_cfg<5, 0>(a, pre, act, o16, e2, M, phases, st);
   if (am) {
     if (cfg == 4) return hgemm_cfg<4, 1>(a, pre, act, o16, e2, M, phases, st);
-    if (cfg == 3) return hgemm_cfg<3, 1>(a, pre, act, o16, e2, M, phases, st);
     if (cfg == 0) return hgemm_cfg<0, 1>(a, pre, act, o16, e2, M, phases, st);
     if (cfg == 1) return hgemm_cfg<1, 1>(a, pre, act, o16, e2, M, phases, st);
     return hgemm_cfg<2, 1>(a, pre, act, o16, e2, M, phases, st);
@@ -1977,7 +2016,7 @@ cudaError_t hgemm_dispatch(const GemmArgs* a, int cfg, int am, int pre, int act,
 int set_attrs() {
   for (int cfg = 0; cfg < 3; ++cfg) CK(gemm3_dispatch(nullptr, cfg, 0, 0, 0));
 #define S3G_A(AMX, P, A, O, E) \
-  if (cfg < 3 || AMX == 1) CK(hgemm_dispatch(nullptr, cfg, AMX, P, A, O, E, 0, 0, 0));
+  if (cfg != 3 && (cfg < 3 || AMX == 1)) CK(hgemm_dispatch(nullptr, cfg, AMX, P, A, O, E, 0, 0, 0));
   for (int cfg = 0; cfg < 5; ++cfg) {
     S3G_HCOMBOS(S3G_A)
   }
@@ -2110,16 +2149,13 @@ int gemm(S3* s, const GB& gb, const GW& w, int nb, cudaStream_t st, int prec = 0
   } else {
     if (!w.wh) return -1;
     a.W = w.wh;
-    const long t0 = (long)(M / 128) * cdiv(a.N, 128) * phases, t1 = (long)(M / 64) * cdiv(a.N, 128) * phases;
-    const long t3 = (long)(M / 128) * cdiv(a.N, 256) * phases;
+    const long t1 = (long)(M / 64) * cdiv(a.N, 128) * phases;  // 64x128 tiles
     // 64x64 with the K split over two warpgroups for narrow N or small grids; otherwise 64x128
     // (fp16 A: 4 stages / 2 CTAs per SM while the grid fits one wave, else 3 stages / 3 per SM;
     // fp32 A: 3 stages). The 128x128 tile (255 registers, 1 CTA / SM) is not auto-selected.
-    (void)t0;
     int cfg = 2;
     if (a.N > 64 && (t1 >= 100 || (a.a16 && a.N >= 512))) cfg = a.a16 ? (t1 > 264 ? 1 : 4) : 1;
-    (void)t3;
-    if (g_force_cfg >= 0 && (g_force_cfg < 3 || a.a16)) cfg = g_force_cfg;  // benchmark hook
+    if (g_force_cfg >= 0 && g_force_cfg != 3 && (g_force_cfg < 3 || a.a16)) cfg = g_force_cfg;  // benchmark hook
     if (w.wl) {  // 2-term weights
       if (a.pre != PRE_NONE || a.act != ACT_NONE || a.o16 || a.e2 != E2_NONE) return -1;
       cfg = 5;
@@ -2888,6 +2924,7 @@ extern "C" int plow_s3gen_create(int device, const char* weights_path, int max_b
   if (const char* e = getenv("PLOW_S3GEN_PDL")) g_pdl = e[0] != '0';
   if (const char* e = getenv("PLOW_S3GEN_DEBUG")) s->debug = e[0] == '1';
   auto fail = [&](int rc) {
+    if (rc == -2) fprintf(stderr, "plow_s3gen: create failed: %s\n", cudaGetErrorString(cudaGetLastError()));
     plow_s3gen_destroy(s);
     return rc;
   };

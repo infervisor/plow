@@ -13,8 +13,8 @@ PORT=$(pb_free_port)
 pb_serve_start "$RT" "$ASSETS" "$ASSETS" "$PORT" "$RES/serve.log" 7200
 trap pb_serve_stop EXIT
 pb_serve_wait 600 || exit 1
-MODEL=$(pb_model_id)
+MODEL=${PB_MODEL:-$(pb_model_id)}
 for arm in "$@"; do
   # shellcheck disable=SC2086
-  "$PY" "$HERE/scripts/tts/tts_bench.py" --url "http://127.0.0.1:$PORT" --model "$MODEL" --out "$RES" $arm || exit 1
+  "$PY" "$HERE/scripts/tts/tts_bench.py" --url "http://127.0.0.1:$PORT" --model "$MODEL" --out "$RES" ${BENCH_EXTRA:-} $arm || exit 1
 done
