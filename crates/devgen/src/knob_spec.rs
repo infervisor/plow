@@ -1070,6 +1070,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.fa_mmaqk", Some("PLOW_FA_MMAQK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.tts_profile", Some("PLOW_TTS_PROFILE"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.tts_codec", Some("PLOW_TTS_CODEC_DIR"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("emit.tts_vocoder", Some("PLOW_TTS_VOCODER_DIR"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.flash_merge_dsplit", Some("PLOW_FLASH_MERGE_DSPLIT"), Layer::Emit, U32, UNSET, DIAG),
     KnobSpec::new("emit.ns_mul", Some("PLOW_NS_MUL"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.ns_abs", Some("PLOW_NS_ABS"), Layer::Emit, U32, UNSET, OPT_IN),

@@ -88,6 +88,7 @@ mod rewrite_lower;
 pub mod rnnt;
 pub mod tts;
 pub mod codec;
+pub mod s3gen;
 pub mod tune_demand;
 pub mod segment_resource;
 
@@ -10261,6 +10262,12 @@ fn emit_dense_gqa(
         let path = std::path::Path::new(&out).with_file_name("codec.pkt");
         std::fs::write(&path, blob).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         eprintln!("  codec packet -> {}", path.display());
+    }
+    if let Some(dir) = ecfg.tts_vocoder.as_deref().filter(|_| !block_mode) {
+        let blob = s3gen::lower_s3gen(dir, n_cu, m.target).unwrap_or_else(|error| panic!("s3gen packet: {error}"));
+        let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
+        std::fs::write(&path, blob).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        eprintln!("  s3gen packet -> {}", path.display());
     }
     if let Some(blob) = audio_blob {
         let path = std::path::Path::new(&out).with_file_name("encoder.pkt");

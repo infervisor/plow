@@ -206,6 +206,10 @@ name = "codec_check"
 path = "examples/codec_check.rs"
 
 [[example]]
+name = "packet_run"
+path = "examples/packet_run.rs"
+
+[[example]]
 name = "asr_stream"
 path = "examples/asr/stream.rs"
 

@@ -147,6 +147,14 @@ fn bind(path: &Path) -> Result<Bound, String> {
         return Err("codec packet declares no decode capacity".into());
     }
     capacities.sort_by_key(|&(b, f, _)| (b * f, f));
+    // Run every capacity once now: each program sequence is captured as a CUDA graph on first
+    // use, and a capture that overlaps another thread's context synchronize (the LM engine) fails.
+    let t = std::time::Instant::now();
+    let mut runtime = runtime;
+    for (_, _, programs) in &capacities {
+        runtime.run_sequence(programs).map_err(e)?;
+    }
+    tracing::info!(capacities = capacities.len(), ms = t.elapsed().as_millis() as u64, "codec graphs warmed");
     let lengths = (0..param("lengths.count")?)
         .map(|k| Ok((pipeline.tensor(&format!("lengths.{k}")).map_err(e)?, param(&format!("lengths.{k}.rows_per_frame"))?)))
         .collect::<Result<Vec<_>, String>>()?;

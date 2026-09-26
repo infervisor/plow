@@ -1333,6 +1333,46 @@ impl StageProgram {
     }
 }
 
+/// [`DevOp::LayerNormF32`] inside a [`StageProgram`] (FP64 statistics).
+#[derive(Clone, Copy)]
+pub struct LayerNormRowsF32Stage<'a> {
+    pub output: TensorRef<'a>,
+    pub gamma: Option<TensorRef<'a>>,
+    pub beta: Option<TensorRef<'a>>,
+    pub rows: u32,
+    pub width: u32,
+    pub epsilon: f32,
+}
+
+impl StageProgram {
+    /// In place when `output` is `TensorRef::Handle(x)`.
+    pub fn layer_norm_f32(
+        &mut self,
+        x: u32,
+        deps: &[u32],
+        stage: LayerNormRowsF32Stage<'_>,
+    ) -> Result<Emitted, String> {
+        if stage.rows == 0 || stage.width == 0 || !stage.epsilon.is_finite() || stage.epsilon <= 0.0 {
+            return Err("invalid layer-normalization stage".into());
+        }
+        let bytes = f32_bytes(product(&[stage.rows, stage.width])?)?;
+        self.input(x, bytes, "layer-norm input")?;
+        let output = self.resolve(stage.output, bytes, "layer-norm output")?;
+        let mut affine = |t: Option<TensorRef<'_>>, what| match t {
+            Some(t) => self.resolve(t, u64::from(stage.width) * 4, what),
+            None => Ok(packet::dev::TENSOR_NONE),
+        };
+        let gamma = affine(stage.gamma, "layer-norm gamma")?;
+        let beta = affine(stage.beta, "layer-norm beta")?;
+        // One warp per row, eight warps per slice.
+        self.emit(DevOp::LayerNormF32, u64::from(stage.rows).div_ceil(8), deps, output, |d| {
+            d.t[..4].copy_from_slice(&[output, x, gamma, beta]);
+            d.i[..3].copy_from_slice(&[stage.rows, stage.width, 0]);
+            d.f[0] = stage.epsilon;
+        })
+    }
+}
+
 impl PacketPrefix {
     /// Open a multi-stage program; see [`StageProgram`].
     pub fn program(mut self) -> StageProgram {
