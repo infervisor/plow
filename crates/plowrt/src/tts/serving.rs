@@ -3,7 +3,8 @@
 //! A model serves speech when its packet declares a `tts.codec_lm.v1` pipeline. The LM stage is
 //! submitted to that model's continuous-batching mux like a completion; the codec stage runs on
 //! the model's [`Codec`] worker. `stream: true` returns chunked audio: each new frame decodes a
-//! window of `WINDOW` frames and emits the frames that have `LOOKAHEAD` frames of right context.
+//! window of the codec's `stream.window_frames` and emits the frames that have
+//! `stream.lookahead_frames` of right context (both `codec.pkt` parameters).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,8 +24,6 @@ use super::{pcm16, wav_header, SpeechContract};
 use crate::serve::stream::{self as stream_mod, StreamChunk};
 use crate::serve::AppState;
 
-const WINDOW: usize = 6;
-const LOOKAHEAD: usize = 2;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -304,19 +303,20 @@ pub async fn speech(
         .into_response()
 }
 
-/// Whole utterance; beyond the codec's frame capacity, windows with `WINDOW` frames of context
+/// Whole utterance; beyond the codec's frame capacity, windows with the codec's context frames
 /// on each side keep their centres.
 async fn decode_all(model: &SpeechModel, codes: &[i32], frames: usize, seed: u64) -> Result<Vec<f32>, String> {
     let (fc, fs, max) = (model.contract.frame_codes, model.contract.frame_samples, model.codec.max_frames);
     if frames <= max {
         return model.codec.decode(codes.to_vec(), frames, seed).await;
     }
-    let step = max - 2 * WINDOW;
+    let window = model.codec.window;
+    let step = max - 2 * window;
     let mut pcm = Vec::with_capacity(frames * fs);
     let mut s = 0;
     while s < frames {
         let e = (s + step).min(frames);
-        let (ws, we) = (s.saturating_sub(WINDOW), (e + WINDOW).min(frames));
+        let (ws, we) = (s.saturating_sub(window), (e + window).min(frames));
         let w = model.codec.decode(codes[ws * fc..we * fc].to_vec(), we - ws, seed ^ s as u64).await?;
         pcm.extend_from_slice(&w[(s - ws) * fs..(e - ws) * fs]);
         s = e;
@@ -344,11 +344,11 @@ async fn collect_codes(c: &SpeechContract, mut rx: stream_mod::ChunkReceiver) ->
 
 /// The emission plan for a stream holding `n` complete frames of which `emitted` are sent:
 /// `Some((window_start, window_end, emit_to))`, or `None` when nothing new is ready.
-fn stream_step(n: usize, emitted: usize, done: bool) -> Option<(usize, usize, usize)> {
-    let upto = if done { n } else { n.saturating_sub(LOOKAHEAD) };
+fn stream_step(n: usize, emitted: usize, done: bool, window: usize, lookahead: usize) -> Option<(usize, usize, usize)> {
+    let upto = if done { n } else { n.saturating_sub(lookahead) };
     (upto > emitted).then(|| {
-        let e = n.min(upto + LOOKAHEAD);
-        (e.saturating_sub(WINDOW).min(emitted), e, upto)
+        let e = n.min(upto + lookahead);
+        (e.saturating_sub(window).min(emitted), e, upto)
     })
 }
 
@@ -390,7 +390,7 @@ async fn stream_task(
                 frames.extend(f);
             }
         }
-        if let Some((s, e, upto)) = stream_step(frames.len() / fc, emitted, done) {
+        if let Some((s, e, upto)) = stream_step(frames.len() / fc, emitted, done, model.codec.window, model.codec.lookahead) {
             let window = frames[s * fc..e * fc].to_vec();
             match model.codec.decode(window, e - s, seed ^ (emitted as u64).wrapping_mul(0x9E37_79B9)).await {
                 Ok(pcm) => {
@@ -421,6 +421,9 @@ async fn stream_task(
 mod tests {
     use super::*;
 
+    const WINDOW: usize = 6;
+    const LOOKAHEAD: usize = 2;
+
     /// Every frame is emitted exactly once, in order, each with LOOKAHEAD right context until
     /// the final flush.
     #[test]
@@ -428,14 +431,14 @@ mod tests {
         for total in 1..20 {
             let (mut emitted, mut seen) = (0, Vec::new());
             for n in 1..=total {
-                if let Some((s, e, upto)) = stream_step(n, emitted, false) {
+                if let Some((s, e, upto)) = stream_step(n, emitted, false, WINDOW, LOOKAHEAD) {
                     assert!(s <= emitted && upto <= e && e <= n && e - s <= WINDOW + LOOKAHEAD);
                     assert!(e - upto >= LOOKAHEAD.min(n - upto));
                     seen.extend(emitted..upto);
                     emitted = upto;
                 }
             }
-            if let Some((_, e, upto)) = stream_step(total, emitted, true) {
+            if let Some((_, e, upto)) = stream_step(total, emitted, true, WINDOW, LOOKAHEAD) {
                 assert_eq!((e, upto), (total, total));
                 seen.extend(emitted..upto);
             }

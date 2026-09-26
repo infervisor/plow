@@ -25,6 +25,10 @@ pub struct Codec {
     pub max_frames: usize,
     pub frame_codes: usize,
     pub frame_samples: usize,
+    /// Streaming: frames of context a decode window carries, and right context before a frame
+    /// is final.
+    pub window: usize,
+    pub lookahead: usize,
 }
 
 struct Bound {
@@ -38,6 +42,8 @@ struct Bound {
     lengths: Vec<(PacketTensor, usize)>,
     frame_codes: usize,
     frame_samples: usize,
+    window: usize,
+    lookahead: usize,
 }
 
 impl Codec {
@@ -59,13 +65,15 @@ impl Codec {
                     bound.capacities.iter().map(|c| c.1).max().unwrap_or(0),
                     bound.frame_codes,
                     bound.frame_samples,
+                    bound.window,
+                    bound.lookahead,
                 );
                 let _ = ready_tx.send(Ok(info));
                 run(rx, bound);
             })
             .map_err(|e| e.to_string())?;
-        let (max_frames, frame_codes, frame_samples) = ready_rx.recv().map_err(|e| e.to_string())??;
-        Ok(Codec { tx: Mutex::new(tx), max_frames, frame_codes, frame_samples })
+        let (max_frames, frame_codes, frame_samples, window, lookahead) = ready_rx.recv().map_err(|e| e.to_string())??;
+        Ok(Codec { tx: Mutex::new(tx), max_frames, frame_codes, frame_samples, window, lookahead })
     }
 
     /// `frames * frame_codes` codebook ids -> `frames * frame_samples` samples.
@@ -109,6 +117,8 @@ fn bind(path: &Path) -> Result<Bound, String> {
         pcm: pipeline.tensor("pcm").map_err(e)?,
         frame_codes: param("codec.frame_codes")?,
         frame_samples: param("codec.frame_samples")?,
+        window: param("stream.window_frames")?,
+        lookahead: param("stream.lookahead_frames")?,
         lengths,
         capacities,
         runtime,

@@ -388,6 +388,10 @@ fn pipeline_section(
         ("codec.codebook".into(), u64::from(cfg.codebook_size)),
         ("audio.sample_rate".into(), u64::from(cfg.sampling_rate)),
         ("lengths.count".into(), lengths.len() as u64),
+        // Streaming decode: frames of left context per window and right context before a frame
+        // is final (the decoder's receptive field, measured against whole-utterance decodes).
+        ("stream.window_frames".into(), 6),
+        ("stream.lookahead_frames".into(), 2),
     ]);
     // Valid rows per frame at each resolution: the host writes frames * scale per item.
     let mut scale = u64::from(cfg.vq_strides[0]);

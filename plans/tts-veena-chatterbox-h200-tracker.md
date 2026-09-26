@@ -110,3 +110,26 @@ p50 139 ms, p90 221 ms, seq RTFx 42.8. WS partials ("partials": true) every 1 s 
 User rule (2026-09-26): all model support via plowc packets; plowrt runs packets only (CPU threads ok
 for host tasks); no model-specific ops/segments in plowrt. Open: SNAC + S3Gen are bespoke .so;
 t3.rs/chatterbox.rs/asr qwen host code is model-specific.
+
+## Roofline (H100, 2026-09-26) — measured per op
+
+Ceilings: HBM 3.15 TB/s (read), bf16 TC 803 TF, TF32 389 TF, FP32 47.6 TF.
+Method: LM decode by instruction-cap deltas (step_bench, PLOW_DEBUG_MAX_INST); packets
+(codec/encoder) by packet_bench cap sweeps or ncu per program launch.
+
+LM decode, B=1, ctx 512 (plow step / vLLM GPU kernel time per step):
+| model | step | floor | % | notes |
+|---|---|---|---|---|
+| Qwen3-ASR decoder 1.7B | 2.30 ms (vLLM 2.12) | 1.11 ms | 48% | skeleton 0.40 ms; layer 59 us vs 32 floor; lm_head 0.203 ms = 97% (vLLM 0.203) |
+| Veena 3B | 3.56 ms | 2.04 ms | 57% | skeleton 0.41; layer 100 us vs 64 (GLU 68%, down 62%, qkv 67%, o 55%); lm_head 0.310 = 99% |
+| Chatterbox T3 520M (B=2 CFG) | 1.94 ms | 0.33 ms | 17% | latency-bound: skeleton 0.48; ~44 us/layer vs 11 floor |
+Per-layer GEMVs: plow ~46 us vs vLLM nvjet ~44 us (Qwen). Attention decode plow 7 us vs FA3 11.3 us.
+Tried, no gain: PLOW_GEMV_PREFETCH (claim-ahead L2), PLOW_NV_GATE_SLEEP 0/16.
+Veena rung 32 (PLOW_DECODE_BATCH_LADDER=1..32, GV_MM_MAX=32 object): B1 3.60 / B16 4.81 / B32 6.09 ms
+(5256 tok/s); needed the dynamic-smem opt-in fix. Serving c32 26.8 -> 33.9 aps (native SNAC).
+
+Qwen3-ASR encoder (390 rows, ncu): 63 ms GPU; DenseGemmF32 79% at 1.6 TF (floor ~0.3 ms bf16 TC,
+5.3 ms FP32); vLLM does prefill incl. encoder in 14.4 ms. -> tensor-core GEMM path (in progress).
+
+SNAC codec packet (parity 3-4e-6 vs native): b1.f8 4.29 ms (ConvT 55%, pointwise 31%);
+b32.f8 31.8 ms (pointwise 37%, ConvT 23%, snake 18%, binary 11%) -> kernel work in progress.
