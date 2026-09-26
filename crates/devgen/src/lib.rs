@@ -9728,6 +9728,7 @@ fn emit_dense_gqa(
         );
     }
     if c.speech_pos_rows > 0 && !block_mode {
+        m.tensors.extend(tts::t3_host_tables(&dir, c.hidden).unwrap_or_else(|e| panic!("T3 host tables: {e}")));
         sections.push(
             tts::t3_pipeline_section(
                 &m,
