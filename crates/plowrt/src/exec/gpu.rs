@@ -8472,11 +8472,12 @@ impl GpuEngine {
                 && attention_gemm_segments.iter().all(Option::is_none)
             {
                 None
-            } else if projection_segments.is_empty() {
-                let none = vec![None; g.gq_seg_ofs.len().saturating_sub(1)];
-                Some(cublaslt::ordered_waits(g, &none, &moe_instructions)?)
             } else {
                 // Library launches do not signal counters: their consumers rely on stream order.
+                // This must cover the attention-GEMM sites even with no Lt projections: naming
+                // none of them leaves their consumers waiting on a counter a library launch never
+                // signals, and the prefill spins forever holding the GPU. That is reachable only
+                // as (native dense) x (t >= pf_attn_gemm_min_rows), which is why it survived.
                 let library: Vec<Option<usize>> = (0..g.gq_seg_ofs.len().saturating_sub(1))
                     .map(|seg| {
                         projection_segments

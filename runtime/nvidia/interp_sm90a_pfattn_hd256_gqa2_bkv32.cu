@@ -11,6 +11,12 @@
 #define PLOW_NV_MASKED_PADDING 1
 #define PLOW_NV_FA_WGITEM 1
 #define PLOW_NV_FA_GQA2_PAIR 1
+/* KV tile width. 32 is the shipped geometry; 64 also stays on the
+ * warp-specialized wgitem body (255 regs, no spills). The _bkv32 SYMBOL
+ * names are fixed by the role table and do not follow this value. */
+#ifndef PLOW_NV_GQA2_ROLE_BKV
+#define PLOW_NV_GQA2_ROLE_BKV 32
+#endif
 #include "op_attention.cuh"
 
 extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 2;
@@ -18,7 +24,7 @@ extern "C" __device__ __constant__ unsigned plow_pf_masked_padding_abi = 1;
 extern "C" __device__ unsigned plow_attention_sm90_hd256_gqa2_bkv32_abi = 2;
 extern "C" __device__ unsigned plow_attention_head_dim = 256;
 extern "C" __device__ unsigned plow_attention_query_tile = 64;
-extern "C" __device__ unsigned plow_attention_kv_tile = 32;
+extern "C" __device__ unsigned plow_attention_kv_tile = PLOW_NV_GQA2_ROLE_BKV;
 extern "C" __device__ unsigned plow_attention_warps = 8;
 extern "C" __device__ unsigned plow_attention_packed_only = 1;
 extern "C" __device__ unsigned plow_attention_n_head = 16;
@@ -28,7 +34,7 @@ extern "C" __device__ unsigned plow_attention_nsplit = 1;
 extern "C" __device__ unsigned plow_attention_direct_entry = 1;
 extern "C" __device__ unsigned plow_block_pfattn_hd256_gqa2_bkv32 = 256;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd256_gqa2_bkv32 =
-    FA_SM90_GQA2_PAIR_FLOATS(256, 64, 32) * sizeof(float);
+    FA_SM90_GQA2_PAIR_FLOATS(256, 64, PLOW_NV_GQA2_ROLE_BKV) * sizeof(float);
 
 __device__ __forceinline__ unsigned attention_ctr_poll(const unsigned* p) {
     unsigned value;
@@ -72,7 +78,7 @@ static_assert(sizeof(PlowHd256Gqa2Direct) == 112, "HD256 GQA2 direct role ABI");
 extern "C" __global__ __launch_bounds__(256, 1)
 void plow_sm90a_pfattn_hd256_gqa2_bkv32_direct(PlowHd256Gqa2Direct args) {
     extern __shared__ float arena[];
-    d_flash_prefill_mux<256, 64, 32>(
+    d_flash_prefill_mux<256, 64, PLOW_NV_GQA2_ROLE_BKV>(
         args.requests, args.opart, args.mlpart, args.q, args.k, args.v, args.output,
         args.seq_q, args.seq_kv, 16, 8, args.q_pos0, 1024, 1, args.kv_stride,
         args.kv_mask, args.scale, blockIdx.x, gridDim.x, arena, args.mapkv);
@@ -111,7 +117,7 @@ void plow_sm90a_pfattn_hd256_gqa2_bkv32(PlowProgram prog) {
     }
     const int* requests = in->t[6] == PLOW_TENSOR_NONE
         ? nullptr : static_cast<const int*>(prog.tensors[in->t[6]]);
-    d_flash_prefill_mux<256, 64, 32>(
+    d_flash_prefill_mux<256, 64, PLOW_NV_GQA2_ROLE_BKV>(
         requests, static_cast<float*>(prog.tensors[in->t[0]]),
         static_cast<float*>(prog.tensors[in->t[1]]),
         static_cast<const __nv_bfloat16*>(prog.tensors[in->t[2]]),

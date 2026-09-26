@@ -38,7 +38,12 @@ pub const CUBLASLT_PREFILL_ROWS: [u32; 3] = [128, 256, 512];
 /// N+1 rows. Left out, such a rung ran every projection on the native GEMM object. Measured on
 /// h100-sxm5 2026-09-21: 12B C1 TTFT at 1024 in 47.22 -> 46.82 ms on the 1088 rung; 1152 (26B and
 /// 12B) and 4160 neutral.
-pub const CUBLASLT_PREFILL_WIDE_ROWS: [u32; 12] = [1024, 1088, 1152, 2048, 4096, 4160, 4224, 8192, 8320, 12288, 12416, 16384];
+/// 2176 is 2048+128, the same BOS-swallowing step as 1152 and 4224: without it a 2048-token
+/// prompt has no qualified rung and every projection at that rung reverts to the native GEMM
+/// object (Gemm segments 206 -> 121 in build.json).
+pub const CUBLASLT_PREFILL_WIDE_ROWS: [u32; 13] = [
+    1024, 1088, 1152, 2048, 2176, 4096, 4160, 4224, 8192, 8320, 12288, 12416, 16384,
+];
 pub const CUBLASLT_PREFILL_GEMMA4_SHAPES: [(u32, u32); 8] = [
     (15360, 3840),
     (2048, 3840),
