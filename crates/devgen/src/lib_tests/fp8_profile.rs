@@ -20,6 +20,7 @@ fn prog(insts: Vec<DevInst>) -> Program {
         tensors: vec![],
         gq_stream: vec![],
         gq_seg_ofs: vec![],
+        reduction_witness: None,
         l2_sms: 0,
         l2_domains: 0,
     }

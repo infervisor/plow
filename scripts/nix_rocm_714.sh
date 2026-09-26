@@ -17,8 +17,8 @@ plow_require_nix_tool() {
 
 plow_init_rocm_714() {
     [ -n "${IN_NIX_SHELL:-}" ] || plow_rocm_fail "run through nix develop"
-    [ "${PLOW_TOOLCHAIN_LABEL:-}" = "rocm-7.14.0-nix" ] ||
-        plow_rocm_fail "expected ROCm 7.14.0 from the flake, got ${PLOW_TOOLCHAIN_LABEL:-unset}"
+    [ "${PLOW_TOOLCHAIN_LABEL:-}" = "rocm-7.14.1-nix" ] ||
+        plow_rocm_fail "expected ROCm 7.14.1 from the flake, got ${PLOW_TOOLCHAIN_LABEL:-unset}"
     : "${ROCM_PATH:?nix develop did not set ROCM_PATH}"
     : "${PLOW_HIPCC:?nix develop did not set PLOW_HIPCC}"
     : "${PLOW_BUNDLER:?nix develop did not set PLOW_BUNDLER}"

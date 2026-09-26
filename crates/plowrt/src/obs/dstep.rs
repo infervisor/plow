@@ -21,24 +21,21 @@
 //!          -> audit xctr -> read every rank's id -> agree -> detok + stream
 //! ```
 //!
-//! Only `DRAIN` is GPU time. Everything before it is host work the GPU waits
-//! for, and everything after it is host work that waits for the GPU. If the
-//! non-`DRAIN` rows sum to a percent of the token, pipelining `submit`/`complete`
-//! buys a percent and the honest answer is to change nothing; if they sum to a
-//! fifth, the split API in `exec::amd_tp` is worth wiring up. That number is not
-//! guessable from the code — `zero_xctr` alone is a copy-engine pass over
-//! `n_gpu · n_xctr · 128 B` and was measured at ~32 µs/token at TP4 — so it is
-//! measured.
+//! These are host-observed intervals, not device timestamps. Enqueue and
+//! inactive-bank rearming can overlap GPU execution; `DRAIN` measures only the
+//! remaining wait. Copy and audit intervals can include device work too. Their
+//! sum partitions host wall time, but does not measure GPU execution time or
+//! the amount a pipelined submit could hide.
 //!
 //! # Which side of the drain a phase is on
 //!
 //! The label prefix says it, because that is what decides whether pipelining can
 //! hide it:
 //!
-//! * `pre `  — before the dispatch. Hideable ONLY if it touches no buffer the
-//!   resident tick reads; `xctr` zeroing and the enqueue itself never are.
-//! * `GPU `  — the drain. Not host work at all.
-//! * `post`  — after the dispatch. Hideable: it feeds the client, not the device.
+//! * `pre `  — preparation and submission; submission can overlap execution.
+//! * `bank`  — rearming, before or after submission depending on buffering.
+//! * `wait`  — host wait for submitted work to complete.
+//! * `post`  — audit, readback, and client output after the main dispatch.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -68,7 +65,7 @@ pub static SEED: Phase = Phase::new("pre  seed_ids (H2D in.ids, x ranks)");
 /// `decode_prepare` on every rank: `patch_kvrow` + the `pos`/`kvlen` scalars.
 pub static PREPARE: Phase = Phase::new("pre  decode_prepare (kvrow patch + scalars)");
 /// `rearm_prog` on every rank — local counter/cursor zeroing.
-pub static REARM: Phase = Phase::new("pre  rearm_prog (local counters)");
+pub static REARM: Phase = Phase::new("bank rearm_prog (may overlap execution)");
 /// `zero_xctr` across the whole group. LIVE during the tick; cannot be hoisted.
 pub static XCTR: Phase = Phase::new("pre  zero_xctr (cross-GPU gates, all ranks)");
 /// The N AQL launches. Must follow the drain; cannot be hoisted.
@@ -76,8 +73,8 @@ pub static ENQUEUE: Phase = Phase::new("pre  enqueue (AQL launch x ranks)");
 
 // --- the dispatch ------------------------------------------------------------
 
-/// The all-rank drain. This is the GPU tick.
-pub static DRAIN: Phase = Phase::new("GPU  drain (all ranks)");
+/// Remaining host wait; submission and rearming may already have overlapped execution.
+pub static DRAIN: Phase = Phase::new("wait drain (all ranks; not GPU duration)");
 
 // --- after the dispatch ------------------------------------------------------
 
@@ -190,7 +187,7 @@ fn dump() {
     let mut host = 0u64;
     for p in PHASES {
         let (ns, calls) = p.read();
-        if !p.label.starts_with("GPU") {
+        if !std::ptr::eq(*p, &DRAIN) {
             host += ns;
         }
         out.push_str(&format!(
@@ -209,10 +206,9 @@ fn dump() {
         idle_calls as f64 / n as f64,
         100.0 * idle_ns as f64 / tot_ns.max(1) as f64,
     ));
-    // The line the pipelining decision is made on.
     out.push_str(&format!(
         "{:<46} {:>10.2} {:>8} {:>6.1}%\n",
-        "HOST TOTAL (everything but the drain)",
+        "NON-DRAIN WALL (may overlap device work)",
         per(host),
         "",
         100.0 * host as f64 / tot_ns.max(1) as f64,

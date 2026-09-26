@@ -145,8 +145,12 @@ def parseEntry (tg : TaskGraph) (idx : Nat) (eJson : Json) :
     | other        => throw s!"{ctx}.cls: unknown value '{other}' (expected Persistent/RequestIo/Growable/Scratch)"
     : Except String BufClass)
   -- Readers / writers are optional (some entries have no readers, e.g. terminal outputs).
-  let rawWriters := ((eJson.getObjVal? "writers").toOption.map parseNatArray).getD []
-  let rawReaders := ((eJson.getObjVal? "readers").toOption.map parseNatArray).getD []
+  let rawWriters ← match eJson.getObjVal? "writers" with
+    | .ok j => parseNatArrayStrict s!"{ctx}.writers" j
+    | .error _ => pure []
+  let rawReaders ← match eJson.getObjVal? "readers" with
+    | .ok j => parseNatArrayStrict s!"{ctx}.readers" j
+    | .error _ => pure []
   let writers ← rawWriters.mapM (strictFin s!"{ctx}.writers" tg.n)
   let readers ← rawReaders.mapM (strictFin s!"{ctx}.readers" tg.n)
   return { name := name, offset := offset, size := size, cls := cls,
@@ -284,10 +288,15 @@ def parseStagedOp (j : Json) : Except String LdsFit.StagedOp := do
   let rows ← getNatF "rows"
   let k ← getNatF "k"
   let scratch ← getNatF "scratch"
-  return { op := opName, idx := idx, rows := rows, k := k, scratch := scratch }
+  let walkMm ← (match j.getObjVal? "walk_mm" with
+    | .error _ => pure 0
+    | .ok _ => getNatF "walk_mm"
+    : Except String Nat)
+  return { op := opName, idx := idx, rows := rows, k := k, scratch := scratch,
+           walkMm := walkMm }
 
 /-- Parse the full G-checkpoint payload:
-    `{ "arena": Nat, "ops": [ {op, idx, rows, k, scratch}, ... ] }`. -/
+    `{ "arena": Nat, "ops": [ {op, idx, rows, k, scratch, walk_mm?}, ... ] }`. -/
 def parseLdsFit (payload : Json) : Except String LdsFitPayload := do
   let arena ← match payload.getObjVal? "arena" with
     | .error _ => throw "missing arena"

@@ -136,6 +136,17 @@ __device__ __forceinline__ unsigned moe_bound_topk(unsigned char* table, unsigne
 #ifndef PLOW_MOE_PF_A4W4
 #define PLOW_MOE_PF_A4W4 0
 #endif
+/* Op 83 router tail as one wave per token (see d_moe_router_topk_pf). Byte-identical table. */
+#ifndef PLOW_MOE_ROUTER_PF_WAVE
+#define PLOW_MOE_ROUTER_PF_WAVE 0
+#endif
+/* Op 86 A4W4 body = weight-streaming sweep (moe_down_a4w4_sweep.h). Needs the CDNA4 scaled MFMA. */
+#ifndef PLOW_MOE_PF_DOWN_SWEEP
+#define PLOW_MOE_PF_DOWN_SWEEP 0
+#endif
+#if PLOW_MOE_PF_DOWN_SWEEP
+#include "moe_down_a4w4_sweep.h"
+#endif
 /* This used to #error on CDNA3 ("no fp4"). The flag no longer demands the scaled f8f6f4 matrix
  * core: without PLOW_HAS_MX_MMA the same ops compile as the SIMULATED arm — fp4 dequantized to
  * bf16 in staging (exact: <= 3 significant bits, power-of-two scale) and fed to the ordinary
@@ -2250,6 +2261,77 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
         __syncthreads(); /* the token loop below reuses `lds`; keep the phases separate */
     }
 #endif
+#if PLOW_MOE_ROUTER_PF_WAVE
+    /* WAVE PER TOKEN (sigmoid, no groups/hash, n_exp a multiple of 64 up to 256, k <= 8): each
+     * lane holds 4 experts, ranks its unique packed keys against all n_exp through lane
+     * shuffles, and lane 0 runs the workgroup router's gate tail in the same order, so the
+     * table is byte-identical to d_moe_router_topk's. No workgroup barrier per token: the
+     * block-per-token loop spent 0.45 ms/layer at T8192 TP8 on MI350X for 0.1 ms of traffic. */
+    if ((flags & 1u) && !(flags & 48u) && n_group <= 1u && (n_exp & 63u) == 0u && n_exp <= 256u &&
+        k <= 8u) {
+        const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+        const bool norm_topk = (flags & 2u) != 0, f32log = (flags & 8u) != 0;
+        const unsigned per = n_exp / 64u;
+        unsigned* wl = (unsigned*)lds + wave * 16u;
+        float* ws = (float*)(wl + 8);
+        for (unsigned tok = slice * PLOW_WAVES + wave; tok < T; tok += nblk * PLOW_WAVES) {
+            float s[4];
+            unsigned long long key[4];
+#pragma unroll
+            for (unsigned q = 0; q < 4; q++) {
+                if (q >= per) break;
+                const unsigned e = lane + q * 64u;
+                const float l = f32log ? ((const float*)logit)[(size_t)tok * n_exp + e]
+                                       : bf2f(logit[(size_t)tok * n_exp + e]);
+                s[q] = 1.0f / (1.0f + expf(-l));
+                float sc = s[q] + (bias ? bias[e] : 0.0f);
+                unsigned sb;
+                __builtin_memcpy(&sb, &sc, 4);
+                sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
+                key[q] = ((unsigned long long)sb << 20) | (unsigned long long)((n_exp - 1u - e) & 0xFFFFFu);
+            }
+            unsigned rank[4] = {0u, 0u, 0u, 0u};
+            for (unsigned src = 0; src < 64u; src++)
+#pragma unroll
+                for (unsigned q2 = 0; q2 < 4; q2++) {
+                    if (q2 >= per) break;
+                    const unsigned lo = __shfl((unsigned)key[q2], src), hi = __shfl((unsigned)(key[q2] >> 32), src);
+                    const unsigned long long kf = ((unsigned long long)hi << 32) | lo;
+#pragma unroll
+                    for (unsigned q = 0; q < 4; q++)
+                        if (q < per) rank[q] += kf > key[q];
+                }
+#pragma unroll
+            for (unsigned q = 0; q < 4; q++)
+                if (q < per && rank[q] < k) {
+                    wl[rank[q]] = lane + q * 64u;
+                    ws[rank[q]] = s[q];
+                }
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+            if (lane == 0) {
+                unsigned char* trow = table + (size_t)tok * (k + shared_tail) * 8;
+                float gate[8];
+                for (unsigned j = 0; j < k; j++) gate[j] = ws[j];
+                float sum = 0.0f;
+                for (unsigned j = 0; j < k; j++) sum += gate[j];
+                for (unsigned j = 0; j < k; j++) {
+                    if (norm_topk && sum != 0.0f) gate[j] /= sum;
+                    gate[j] *= route_scale;
+                    *(unsigned*)(trow + (size_t)j * 8) = wl[j];
+                    *(float*)(trow + (size_t)j * 8 + 4) = gate[j];
+                }
+                if (shared_tail) {
+                    *(unsigned*)(trow + (size_t)k * 8) = n_exp;
+                    *(float*)(trow + (size_t)k * 8 + 4) = 1.0f;
+                }
+            }
+            __builtin_amdgcn_wave_barrier();
+        }
+        return;
+    }
+#endif
     for (unsigned tok = slice; tok < T; tok += nblk) {
         /* slice=0 so the callee's single-workgroup guard passes; this workgroup owns `tok`. */
         /* The f32-logit arm changes the ELEMENT WIDTH, so the per-token row advance has to be
@@ -2331,6 +2413,9 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
 #ifndef PLOW_MOE_ALIGN_PAR_PREFIX
 #define PLOW_MOE_ALIGN_PAR_PREFIX 0
 #endif
+#ifndef PLOW_MOE_ALIGN_WAVES
+#define PLOW_MOE_ALIGN_WAVES 0
+#endif
 __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* row_token,
                                unsigned* row_partidx, float* row_gate, unsigned T, unsigned n_exp,
                                unsigned k, unsigned slice, unsigned* lds, unsigned phase = 0,
@@ -2374,12 +2459,28 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
             unsigned thread_tiles = 0;
             for (unsigned e = begin; e < end; e++) {
                 unsigned total = 0;
+#if PLOW_MOE_ALIGN_WAVES
+                /* 16 partition counts in flight per round instead of one load-store pair. */
+                for (unsigned b0 = 0; b0 < npart; b0 += 16u) {
+                    unsigned cnt16[16];
+#pragma unroll
+                    for (unsigned i = 0; i < 16; i++)
+                        cnt16[i] = b0 + i < npart ? partial[(size_t)(b0 + i) * n_exp + e] : 0u;
+#pragma unroll
+                    for (unsigned i = 0; i < 16; i++)
+                        if (b0 + i < npart) {
+                            partial[(size_t)(b0 + i) * n_exp + e] = total;
+                            total += cnt16[i];
+                        }
+                }
+#else
                 for (unsigned b = 0; b < npart; b++) {
                     const size_t at = (size_t)b * n_exp + e;
                     const unsigned count = partial[at];
                     partial[at] = total;
                     total += count;
                 }
+#endif
                 mcnt[e] = (int)total;
                 thread_tiles += (total + MPF_BM - 1u) / MPF_BM;
             }
@@ -2413,6 +2514,63 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
         }
 
         if (phase == 4) {
+#if PLOW_MOE_ALIGN_WAVES
+            /* Every wave of the workgroup takes a run of whole 64-slot steps of this slice (the
+             * single-wave loop below walked all of them serially, ~0.1 ms at T=8192). Per-wave
+             * expert counts in LDS give each wave its starting row per expert: wave w's rows go
+             * after waves < w, and within a wave the step/lane order is the loop's, so the row
+             * arrays are identical to the single-wave form. */
+            {
+                constexpr unsigned NW = PLOW_THREADS / PLOW_WAVE;
+                const unsigned wv = tid / PLOW_WAVE, lane = tid % PLOW_WAVE;
+                const unsigned first = (unsigned)(((unsigned long long)nslot * slice) / npart);
+                const unsigned last = (unsigned)(((unsigned long long)nslot * (slice + 1u)) / npart);
+                const unsigned steps = (last - first + PLOW_WAVE - 1u) / PLOW_WAVE;
+                const unsigned per = (steps + NW - 1u) / NW;
+                const unsigned w0 = first + wv * per * PLOW_WAVE;
+                const unsigned w1 = min(last, w0 + per * PLOW_WAVE);
+                unsigned* wc = lds; /* [NW][n_exp] */
+                for (unsigned i = tid; i < NW * n_exp; i += PLOW_THREADS) wc[i] = 0u;
+                __syncthreads();
+                for (unsigned base = w0; base < w1; base += PLOW_WAVE) {
+                    const unsigned s = base + lane;
+                    const unsigned e = s < w1 ? (synth ? 0u : moe_slot_expert(table, s)) : ~0u;
+                    const unsigned long long peers = __match_any(e);
+                    if (lane == (unsigned)__builtin_ctzll(peers) && e < n_exp)
+                        wc[wv * n_exp + e] += __builtin_popcountll(peers);
+                }
+                __syncthreads();
+                for (unsigned e = tid; e < n_exp; e += PLOW_THREADS) {
+                    unsigned run = (unsigned)rowoff[e] + partial[(size_t)slice * n_exp + e];
+                    for (unsigned w = 0; w < NW; w++) {
+                        const unsigned c = wc[w * n_exp + e];
+                        wc[w * n_exp + e] = run;
+                        run += c;
+                    }
+                }
+                __syncthreads();
+                for (unsigned base = w0; base < w1; base += PLOW_WAVE) {
+                    const unsigned s = base + lane;
+                    const unsigned e = s < w1 ? (synth ? 0u : moe_slot_expert(table, s)) : ~0u;
+                    const unsigned long long peers = __match_any(e);
+                    const unsigned leader = __builtin_ctzll(peers);
+                    const unsigned rank = __builtin_popcountll(peers & ((1ull << lane) - 1ull));
+                    unsigned pos0 = 0;
+                    if (lane == leader && e < n_exp) {
+                        pos0 = wc[wv * n_exp + e];
+                        wc[wv * n_exp + e] = pos0 + __builtin_popcountll(peers);
+                    }
+                    pos0 = __shfl(pos0, leader, PLOW_WAVE);
+                    if (e < n_exp) {
+                        const unsigned pos = pos0 + rank;
+                        row_token[pos] = s / k;
+                        row_partidx[pos] = s;
+                        row_gate[pos] = synth ? 1.0f : moe_slot_gate(table, s);
+                    }
+                }
+                return;
+            }
+#endif
             if (tid >= PLOW_WAVE) return;
             const unsigned lane = tid;
             const unsigned first = (unsigned)(((unsigned long long)nslot * slice) / npart);
@@ -4739,6 +4897,15 @@ __device__ __forceinline__ void moe_pf_refuse(void* Cout, const int* meta,
  * branch too, so a gate-only call would leave `up` un-clipped. For every other activation
  * `moe_glu` is byte-identical to the `moe_act(g, act) * u` it replaces. */
 #ifndef PLOW_MOE_PF_A4W4_DIRECT_ONLY
+/* PLOW_MOE_GLU_KW (decode objects): op 85's A4W4 GLU on decode rows with K split over the
+ * waves and units = occupied (expert, 16-row subtile, 32-column chunk) — moe_glu_a4w4_kw.h,
+ * byte-identical to the tile arm. */
+#ifndef PLOW_MOE_GLU_KW
+#define PLOW_MOE_GLU_KW 0
+#endif
+#if PLOW_MOE_GLU_KW && PLOW_MOE_PF_A4W4
+#include "moe_glu_a4w4_kw.h"
+#endif
 __device__ void d_moe_group_glu_pf(bf16* fu, const bf16* xn2, const unsigned long long* wtab,
                                    const unsigned long long* stab, const int* meta,
                                    const unsigned* row_token, unsigned I_moe, unsigned H,
@@ -4755,6 +4922,14 @@ __device__ void d_moe_group_glu_pf(bf16* fu, const bf16* xn2, const unsigned lon
     const float* as_row = a8 ? (const float*)fu_scale : nullptr;
 #if PLOW_MOE_PF_A4W4 && !defined(PLOW_MOE_A4W4_STAGE2_BENCH)
     if (enc == PLOW_MOE_ENC_MXFP4) {
+#if PLOW_MOE_GLU_KW
+        if (I_moe == 256u) {
+            d_moe_glu_a4w4_kw<2>((unsigned char*)fu, fu_scale, xn2, wtab, stab, meta, row_token,
+                                 row_partidx, I_moe, H, n_exp, act, beta, lbeta, slice, nblk,
+                                 (float*)lds);
+            return;
+        }
+#endif
         /* A4W4. `fu` is the MXFP4 gathered intermediate and `fu_scale` its E8M0 rows; the
          * epilogue IS the fused bridge (SwiGLU + quantize + scale write in the sorted layout),
          * so no bf16 intermediate exists anywhere on this path and there is no separate bridge
@@ -4804,6 +4979,23 @@ __device__ void d_moe_group_down_pf(float* part, const bf16* fu, const unsigned 
                                     ) {
 #if PLOW_MOE_PF_A4W4
     if (enc == PLOW_MOE_ENC_MXFP4) { /* A = the bridge's MXFP4 output + its E8M0 rows */
+#if PLOW_MOE_PF_DOWN_SWEEP
+        /* Weight-streaming sweep (moe_down_a4w4_sweep.h): same f32 part scatter, 2.3-5.5x
+         * faster on MI350X at GLM-5.3 TP8 (I=256) from T=1 to T=16384. */
+        if (I_moe == 256u && !part16
+#if PLOW_MOE_PF_ATOMIC
+            && !atom_ksh
+#endif
+#if PLOW_MOE_PF_DET
+            && !det_ksh
+#endif
+        ) {
+            moe_down_a4w4_sweep_auto<2>(part, (const unsigned char*)fu, fu_scale, wtab, stab, meta,
+                                        row_partidx, row_gate, H, n_exp, slice, nblk,
+                                        (unsigned*)lds);
+            return;
+        }
+#endif
         d_moe_group_pf_a4w4<false>((void*)part, (const void*)fu, fu_scale, wtab, stab, meta,
                                    nullptr, row_partidx, row_gate, nullptr, H, I_moe, n_exp, 0,
                                    slice, nblk, 0.0f, 0.0f, (void*)lds MPF_ATOM_ARG MPF_DET_ARG);
@@ -4951,6 +5143,53 @@ __device__ void d_moe_combine_pf(bf16* out, const bf16* residual, const bf16* sh
                 f1 = pf[v * 2 + 1];
             }
             body(v, vr, vs, vp, f0, f1);
+        }
+        return;
+    }
+    /* k > 1, f32 part (the GLM top-8 scatter): 8 contiguous h per thread, all k slots' 2x16 B
+     * issued before any is consumed, then summed residual, shared, slot 0..k-1 — the scalar
+     * loop's operands in its order, so bit-identical to it. */
+    if (k > 1u && k <= 16u && (H & 7u) == 0u && !part16
+#if PLOW_MOE_PF_DET
+        && !det
+#endif
+    ) {
+        const size_t vt = total / 8;
+        const float4* pf = (const float4*)part;
+        const auto* rg = as_glob(residual);
+        const auto* sg = as_glob(shared);
+        auto* og = as_glob(out);
+        for (size_t v = gid; v < vt; v += stride) {
+            const size_t e = v * 8;
+            const unsigned tok = (unsigned)(e / H), h = (unsigned)(e - (size_t)tok * H);
+            /* Running sum residual, shared, slot 0..k-1 (the scalar order) with a 2-slot load
+             * window: ~30 live VGPR. Holding all k slots in flight (128 VGPR) was 4.4x faster
+             * standalone but slower inside the 256-VGPR interpreter. */
+            const bf16v8 vr = residual ? ld_glob8(rg + e) : bf16v8_zero();
+            const bf16v8 vs = shared ? ld_glob8(sg + e) : bf16v8_zero();
+            const size_t q0 = (((size_t)tok * k) * H + h) / 4, qs = (size_t)H / 4;
+            float acc[8];
+#pragma unroll
+            for (int c = 0; c < 8; c++) {
+                acc[c] = residual ? bf2f(vr[c]) : 0.0f;
+                if (shared) acc[c] += bf2f(vs[c]);
+            }
+            float4 a0 = pf[q0], a1 = pf[q0 + 1];
+            float4 b0 = pf[q0 + qs], b1 = pf[q0 + qs + 1];
+            for (unsigned j = 0; j < k; j++) {
+                const float4 c0 = a0, c1 = a1;
+                a0 = b0; a1 = b1;
+                if (j + 2 < k) {
+                    b0 = pf[q0 + (j + 2) * qs];
+                    b1 = pf[q0 + (j + 2) * qs + 1];
+                }
+                acc[0] += c0.x; acc[1] += c0.y; acc[2] += c0.z; acc[3] += c0.w;
+                acc[4] += c1.x; acc[5] += c1.y; acc[6] += c1.z; acc[7] += c1.w;
+            }
+            bf16v8 o;
+#pragma unroll
+            for (int c = 0; c < 8; c++) o[c] = f2bf(acc[c]);
+            st_glob8(og + e, o);
         }
         return;
     }

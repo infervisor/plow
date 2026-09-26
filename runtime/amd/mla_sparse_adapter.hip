@@ -219,6 +219,78 @@ extern "C" __global__ void plow_mla_sparse_decode_relayout(SparseDecodeRelayoutA
 
 extern "C" __device__ unsigned plow_mla_sparse_adapter_abi_1 = 1;
 extern "C" __device__ unsigned plow_mla_sparse_decode_abi_1 = 1;
+
+struct SparseDecodeBf16PackArgs {
+    uint4 *q, *kv;
+    unsigned* kvi;
+    const uint4 *qa, *qr, *ck, *kr;
+    const int *idx, *kvlen;
+    unsigned *qp, *kp, *last;
+    unsigned rows, ctx, index_width, pad;
+};
+static_assert(sizeof(SparseDecodeBf16PackArgs) == 112);
+
+extern "C" __global__ void plow_mla_bf16_pack(SparseDecodeBf16PackArgs a) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    if (!a.rows || a.rows > 64 || !a.ctx || (a.index_width && a.index_width != 2048)) __builtin_trap();
+    __shared__ unsigned kp[65];
+    if (threadIdx.x < 64) {
+        const unsigned b = threadIdx.x;
+        const int len = b < a.rows ? a.kvlen[b] : 0;
+        if (len < 0 || (unsigned)len > a.ctx) __builtin_trap();
+        unsigned sum = len > 2048 ? 2048u : (unsigned)len;
+#pragma unroll
+        for (unsigned offset = 1; offset < 64; offset *= 2) {
+            const unsigned previous = __shfl_up(sum, offset, 64);
+            if (b >= offset) sum += previous;
+        }
+        kp[b + 1] = sum;
+        if (b == 0) kp[0] = 0;
+    }
+    __syncthreads();
+    const unsigned first = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned stride = blockDim.x * gridDim.x;
+    for (unsigned i = first; i < a.rows * 16u * 72u; i += stride) {
+        const unsigned row = i / 72u, col = i % 72u, source = row / 2;
+        a.q[i] = col < 64u ? a.qa[source * 64u + col] : a.qr[source * 8u + col - 64u];
+    }
+    for (unsigned i = first; i < kp[a.rows] * 72u; i += stride) {
+        const unsigned slot = i / 72u, col = i % 72u;
+        unsigned lo = 0, hi = a.rows;
+        while (lo + 1 < hi) {
+            const unsigned mid = (lo + hi) / 2;
+            if (kp[mid] <= slot) lo = mid; else hi = mid;
+        }
+        const unsigned b = lo, selected = slot - kp[b];
+        const unsigned key = a.index_width ? (unsigned)a.idx[b * a.index_width + selected] : selected;
+        if (key >= (unsigned)a.kvlen[b]) __builtin_trap();
+        const size_t source = (size_t)b * a.ctx + key;
+        a.kv[i] = col < 64u ? a.ck[source * 64u + col] : a.kr[source * 8u + col - 64u];
+        if (col == 0) a.kvi[slot] = slot;
+    }
+    for (unsigned b = first; b <= a.rows; b += stride) {
+        a.qp[b] = b;
+        a.kp[b] = kp[b];
+        if (b < a.rows) a.last[b] = 1;
+    }
+#endif
+}
+
+struct SparseDecodeBf16UnpadArgs {
+    uint4* out;
+    const uint4* padded;
+    unsigned rows, pad;
+};
+static_assert(sizeof(SparseDecodeBf16UnpadArgs) == 24);
+
+extern "C" __global__ void plow_mla_bf16_unpad(SparseDecodeBf16UnpadArgs a) {
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < a.rows * 8u * 64u;
+         i += blockDim.x * gridDim.x) {
+        a.out[i] = a.padded[(i / 64u) * 128u + i % 64u];
+    }
+}
+
+extern "C" __device__ unsigned plow_mla_bf16_adapter_abi_1 = 1;
 extern "C" __device__ unsigned plow_mla_sparse_adapter_fp8_abi_1 = 1;
 #if defined(PLOW_MLA_SPARSE_SINGLE_PASS)
 extern "C" __device__ unsigned plow_mla_sparse_single_abi_1 = 1;

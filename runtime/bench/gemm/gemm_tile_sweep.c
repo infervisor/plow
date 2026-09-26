@@ -121,6 +121,13 @@ static const struct tile_spec F8EXACT_TILES[] = {
     {"gemm_g31_og_fp8_c5_exact", 192, 256, 128, 5376, 16384},
 };
 #define NF8EXACT_TILES ((int)(sizeof F8EXACT_TILES / sizeof F8EXACT_TILES[0]))
+/* BlockFp8: [128,128] weight blocks x [1,128] activation groups, arbitrary f32 scales. */
+static const struct tile_spec B8TILES[] = {
+    {"gemm_fp8b128_c0", 256, 256, 128}, {"gemm_fp8b128_c5", 192, 256, 128},
+    {"gemm_fp8b128_c2", 128, 256, 128}, {"gemm_fp8b128_c3", 128, 128, 128},
+    {"gemm_fp8b128_e2", 64, 128, 128}, {"gemm_a8w8_block128", 64, 128, 128},
+};
+#define NB8TILES ((int)(sizeof B8TILES / sizeof B8TILES[0]))
 
 /* OCP e2m1: three magnitude bits on the ladder 0,0.5,1,1.5,2,3,4,6 and a sign bit. This is the
  * HOST-side twin of `amd_common.h`'s `fp4_to_bf16v8`, and it is exact — every code is a small
@@ -154,7 +161,7 @@ static int e4m3_finite(unsigned char b) {
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s <M> <N> <K> [label] [quant: None|Mxfp4|W8A8]\n", argv[0]);
+        fprintf(stderr, "usage: %s <M> <N> <K> [label] [quant: None|Mxfp4|W8A8|BlockFp8]\n", argv[0]);
         return 2;
     }
     const unsigned M = (unsigned)atoi(argv[1]), N = (unsigned)atoi(argv[2]),
@@ -162,9 +169,10 @@ int main(int argc, char** argv) {
     const char* label = argc > 4 ? argv[4] : "shape";
     const char* quant = argc > 5 ? argv[5] : "None";
     const int mx = strcmp(quant, "Mxfp4") == 0;
-    const int f8 = strcmp(quant, "W8A8") == 0;
+    const int b8 = strcmp(quant, "BlockFp8") == 0;
+    const int f8 = b8 || strcmp(quant, "W8A8") == 0;
     if (!mx && !f8 && strcmp(quant, "None") != 0) {
-        fprintf(stderr, "unknown quant %s (want None, Mxfp4 or W8A8)\n", quant);
+        fprintf(stderr, "unknown quant %s (want None, Mxfp4, W8A8 or BlockFp8)\n", quant);
         return 2;
     }
     /* REFUSED rather than measured wrong, same as the mxfp4 guard below. `d_gemm_fp8_t` stages a
@@ -221,15 +229,18 @@ int main(int argc, char** argv) {
     /* mxfp4 weights are packed 2/byte with one E8M0 byte per 32 K — a QUARTER and a
      * thirty-second of the bf16 stream. That ratio is the whole reason the rung exists. */
     const size_t nW = nB / 2, nS = (size_t)N * (K / 32);
+    /* f8 scale extents: per-row/per-channel for W8A8, [K/128, M] and [N/128, K/128] for BlockFp8. */
+    const size_t kg = (K + 127u) / 128u;
+    const size_t nAs = b8 ? kg * M : M, nWs = b8 ? (N + 127u) / 128u * kg : N;
     /* w8a8 quantizes BOTH operands: one byte per element on each side, plus an f32 scale row
      * per A row and per B output channel — the exact operand shape `d_gemm_fp8_t` binds. */
     bf16* hA = f8 ? NULL : plow_hsa_alloc_host(H, nA * 2);
     unsigned char* hAq = f8 ? plow_hsa_alloc_host(H, nA) : NULL;
-    float* hAs = f8 ? plow_hsa_alloc_host(H, M * sizeof(float)) : NULL;
+    float* hAs = f8 ? plow_hsa_alloc_host(H, nAs * sizeof(float)) : NULL;
     bf16* hB = (mx || f8) ? NULL : plow_hsa_alloc_host(H, nB * 2);
     unsigned char* hW = mx ? plow_hsa_alloc_host(H, nW) : (f8 ? plow_hsa_alloc_host(H, nB) : NULL);
     unsigned char* hS = mx ? plow_hsa_alloc_host(H, nS) : NULL;
-    float* hWs = f8 ? plow_hsa_alloc_host(H, N * sizeof(float)) : NULL;
+    float* hWs = f8 ? plow_hsa_alloc_host(H, nWs * sizeof(float)) : NULL;
     bf16* hC = plow_hsa_alloc_host(H, nC * 2);
     bf16* hC2 = mx ? NULL : malloc(nC * sizeof(*hC2));
     int have_c2 = 0;
@@ -255,8 +266,8 @@ int main(int argc, char** argv) {
         }
         /* VARIED, not pinned at 1.0, for the same reason the mxfp4 block scales are: a kernel
          * that dropped either scale fetch must fail the spot-check rather than pass it. */
-        for (unsigned i = 0; i < M; i++) hAs[i] = 0.0625f * (1.0f + (float)(i % 3));
-        for (unsigned i = 0; i < N; i++) hWs[i] = 0.03125f * (1.0f + (float)(i % 5));
+        for (size_t i = 0; i < nAs; i++) hAs[i] = 0.0625f * (1.0f + (float)(i % 3));
+        for (size_t i = 0; i < nWs; i++) hWs[i] = 0.03125f * (1.0f + (float)(i % 5));
     } else {
         for (size_t i = 0; i < nA; i++) hA[i] = f2bf(((float)(rand() % 17) - 8.0f) / 16.0f);
     }
@@ -273,14 +284,14 @@ int main(int argc, char** argv) {
     void* dA = plow_hsa_alloc(H, 0, f8 ? nA : nA * 2);
     void* dB = plow_hsa_alloc(H, 0, mx ? nW : (f8 ? nB : nB * 2));
     void* dS = mx ? plow_hsa_alloc(H, 0, nS) : NULL;
-    void* dAs = f8 ? plow_hsa_alloc(H, 0, M * sizeof(float)) : NULL;
-    void* dWs = f8 ? plow_hsa_alloc(H, 0, N * sizeof(float)) : NULL;
+    void* dAs = f8 ? plow_hsa_alloc(H, 0, nAs * sizeof(float)) : NULL;
+    void* dWs = f8 ? plow_hsa_alloc(H, 0, nWs * sizeof(float)) : NULL;
     void* dC = plow_hsa_alloc(H, 0, nC * 2);
     if (f8) {
         plow_hsa_copy_h2d(H, 0, dA, hAq, nA);
         plow_hsa_copy_h2d(H, 0, dB, hW, nB);
-        plow_hsa_copy_h2d(H, 0, dAs, hAs, M * sizeof(float));
-        plow_hsa_copy_h2d(H, 0, dWs, hWs, N * sizeof(float));
+        plow_hsa_copy_h2d(H, 0, dAs, hAs, nAs * sizeof(float));
+        plow_hsa_copy_h2d(H, 0, dWs, hWs, nWs * sizeof(float));
     } else {
         plow_hsa_copy_h2d(H, 0, dA, hA, nA * 2);
         if (mx) {
@@ -310,7 +321,7 @@ int main(int argc, char** argv) {
      * dominates and A/C are noise, so B bytes / 6200 GB/s is the achievable wall time. */
     const double flops = 2.0 * (double)M * N * K;
     const double wbytes = mx ? (double)(nW + nS)
-                             : (f8 ? (double)nB + 4.0 * (double)N : 2.0 * (double)N * K);
+                             : (f8 ? (double)nB + 4.0 * (double)nWs : 2.0 * (double)N * K);
     const double mem_floor_ms = wbytes / (HBM_GBPS * 1e9) * 1e3;
     printf("%s  %u CUs  %u waves/wg\n", nm, NCU, WAVES);
     printf("%s  M=%u N=%u K=%u   %.1f MFLOP  weights %.2f MB  HBM floor %.4f ms "
@@ -325,10 +336,12 @@ int main(int argc, char** argv) {
     FILE* jf = jsonl ? fopen(jsonl, "a") : NULL;
 
     const int ntiles = mx ? NMXTILES
+                          : b8 ? NB8TILES
                           : (f8 ? NF8TILES + NF8EXACT_TILES : NTILES + NEXACT_TILES);
     for (int t = 0; t < ntiles; t++) {
         const struct tile_spec* tile =
             mx ? &MXTILES[t]
+               : b8 ? &B8TILES[t]
                : (f8 ? (t < NF8TILES ? &F8TILES[t] : &F8EXACT_TILES[t - NF8TILES])
                      : (t < NTILES ? &TILES[t] : &EXACT_TILES[t - NTILES]));
         if (tile->exact_n && (N != tile->exact_n || K != tile->exact_k)) continue;
@@ -381,7 +394,7 @@ int main(int argc, char** argv) {
         }
         for (int s = 0; s < 24; s++) {
             unsigned m = (unsigned)(rand() % (int)M), nn = (unsigned)(rand() % (int)N);
-            double acc = 0;
+            double acc = 0, blk = 0;
             for (unsigned kk = 0; kk < K; kk++) {
                 /* The SAME oracle in all three ladders — an f64 dot product over the values the
                  * kernel consumed — which is what lets one `GEMM_ORACLE` string key them. For
@@ -402,11 +415,20 @@ int main(int argc, char** argv) {
                     b = bf2f(hB[(size_t)nn * K + kk]);
                     a = (double)bf2f(hA[(size_t)m * K + kk]);
                 }
+                if (b8) {
+                    blk += a * b;
+                    if ((kk & 127u) == 127u || kk + 1 == K) {
+                        const size_t g = kk / 128u;
+                        acc += blk * (double)hAs[g * M + m] * (double)hWs[(nn / 128u) * kg + g];
+                        blk = 0;
+                    }
+                    continue;
+                }
                 acc += a * b;
             }
             /* The per-row and per-channel scales are applied ONCE, in the kernel's epilogue,
              * so the oracle applies them the same way rather than inside the K loop. */
-            if (f8) acc *= (double)hAs[m] * (double)hWs[nn];
+            if (f8 && !b8) acc *= (double)hAs[m] * (double)hWs[nn];
             const double g = bf2f(hC[(size_t)m * N + nn]);
             if (fabs(g - acc) / (fabs(acc) + 1e-3) > 0.03) bad++;
         }

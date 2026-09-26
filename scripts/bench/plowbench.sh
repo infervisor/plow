@@ -215,6 +215,7 @@ pb_check_assets() {
 pb_check_objects() {
     local dir="${1:?object dir}"
     local arch="${2:-}"
+    local assets="${3:-}"
     [ -n "$arch" ] || arch=$(pb_detect_arch "" "" "$dir")
     [ -d "$dir" ] || { pb_bad "no object dir $dir"; return 1; }
 
@@ -255,6 +256,27 @@ pb_check_objects() {
 
     # AMD target check
     local miss=0 f
+    if [ "$arch" = gfx950 ]; then
+        for f in interp_decode.elf interp_prefill.elf interp_flash.elf; do
+            [ -e "$dir/$f" ] || { pb_bad "object dir lacks $f"; miss=$((miss + 1)); }
+        done
+        if [ -f "$assets/build.json" ] && python3 - "$assets/build.json" <<'PYEOF'
+import json, sys
+f = json.load(open(sys.argv[1]))["features"]
+sys.exit(not all(f.get(k) for k in ("fp8_kv", "a4w4", "mla", "moe")))
+PYEOF
+        then
+            for f in interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf \
+                     interp_flash_fp8kv.elf interp_flash_fp8kv_gq.elf \
+                     interp_prefill_fp8kv_mla_moe_a4w4_full.elf \
+                     interp_prefill_fp8kv_mla_moe_a4w4_full_gq.elf; do
+                [ -e "$dir/$f" ] || { pb_bad "mixed FP8-KV/MXFP4 packet lacks $f"; miss=$((miss + 1)); }
+            done
+        fi
+        [ "$miss" -eq 0 ] || return 1
+        pb_ok "gfx950 interpreter objects in $dir (runtime checks packet pairing and optional routes)"
+        return 0
+    fi
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         [ -e "$dir/$f" ] || { pb_bad "object dir lacks pinned vendor kernel $f"; miss=$((miss + 1)); }
@@ -316,6 +338,10 @@ pb_check_vllm() {
     # AMD target
     v="${v:-/app/plow/build-gemma31/vllm-python}"
     [ -x "$v" ] || { pb_bad "no vLLM client at $v (set PB_VLLM)"; return 1; }
+    if [[ "$v" == */vllm029-client.sh ]]; then
+        pb_ok "vLLM client $v (pinned Docker 0.29; host ROCm lib not needed)"
+        return 0
+    fi
     local lib="${PB_VLLM_ROCM_LIB:-/opt/rocm/core-7.14/lib}"
     [ -d "$lib" ] || { pb_bad "VLLM_ROCM_LIB dir missing: $lib"; return 1; }
     pb_ok "vLLM client $v (ROCm lib $lib)"
@@ -335,11 +361,10 @@ PYEOF
 }
 
 # pb_serve_start <plowrt> <assets> <objdir> <port> <logfile> [timeout-s]
-# setsid so the whole server tree can be torn down by process group: `nix develop -c` execs a
-# shell that forks plowrt, so killing the pid we waited on can leave the real server holding cards.
+# Foreground timeout forwards signals only to this server, never its process group.
 pb_serve_start() {
     local rt="$1" assets="$2" objdir="$3" port="$4" log="$5" tmo="${6:-5400}"
-    PLOW_HSACO="$objdir" setsid timeout -s TERM "$tmo" \
+    PLOW_HSACO="$objdir" timeout --foreground --kill-after=10s -s TERM "$tmo" \
         "$rt" serve --assets "$assets" --port "$port" > "$log" 2>&1 &
     PB_SERVER_PID=$!
     PB_SERVER_PORT=$port
@@ -350,7 +375,7 @@ pb_serve_start() {
 pb_serve_wait() {
     local secs="${1:-900}" i
     for i in $(seq 1 "$secs"); do
-        curl -fsS "http://127.0.0.1:$PB_SERVER_PORT/v1/models" > /dev/null 2>&1 && return 0
+        curl -fsS --max-time 2 "http://127.0.0.1:$PB_SERVER_PORT/v1/models" > /dev/null 2>&1 && return 0
         kill -0 "$PB_SERVER_PID" 2>/dev/null || break
         sleep 1
     done
@@ -366,10 +391,10 @@ pb_model_id() {
 
 pb_serve_stop() {
     [ -n "${PB_SERVER_PID:-}" ] || return 0
-    kill -TERM -- "-$PB_SERVER_PID" 2>/dev/null || kill -TERM "$PB_SERVER_PID" 2>/dev/null
+    kill -TERM "$PB_SERVER_PID" 2>/dev/null || true
     local i
     for i in $(seq 1 120); do kill -0 "$PB_SERVER_PID" 2>/dev/null || break; sleep 1; done
-    kill -KILL -- "-$PB_SERVER_PID" 2>/dev/null || kill -KILL "$PB_SERVER_PID" 2>/dev/null
+    wait "$PB_SERVER_PID" 2>/dev/null || true
     PB_SERVER_PID=
 }
 
@@ -387,14 +412,14 @@ pb_bench() {
     PB_ARM_N=$((PB_ARM_N + 1))
     mkdir -p "$res"
     echo "$PB_ARM_N" > "$res/$tag.armorder"
-    timeout -s TERM "${PB_BENCH_TIMEOUT:-3000}" env VLLM_ROCM_LIB="$lib" "$v" \
+    timeout --foreground --kill-after=10s -s TERM "${PB_BENCH_TIMEOUT:-3000}" env VLLM_ROCM_LIB="$lib" "$v" \
         -m vllm.entrypoints.cli.main bench serve \
         --backend vllm --host 127.0.0.1 --port "$PB_SERVER_PORT" --model "$model" \
         --tokenizer "$tokz" --trust-remote-code --dataset-name random \
         --seed "${PB_SEED:-8193}" --num-prompts "$np" \
         --random-input-len "$isl" --random-output-len "$osl" --random-range-ratio 0 \
         --max-concurrency "$conc" --request-rate "${PB_RATE:-inf}" --ignore-eos \
-        --percentile-metrics ttft,tpot,itl --save-result --save-detailed \
+        --percentile-metrics ttft,tpot,itl,e2el --save-result --save-detailed \
         --result-dir "$res/$tag" --result-filename bench.json \
         "$@" > "$res/$tag.bench.log" 2>&1
     local rc=$?
@@ -411,4 +436,21 @@ pb_result() {
     p=$(find "$res/$tag" -name '*.json' -type f 2>/dev/null | head -1)
     [ -n "$p" ] && { echo "$p"; return 0; }
     return 1
+}
+
+pb_validate_result() {
+    python3 - "$1" "$2" "$3" <<'PYEOF'
+import json, math, sys
+path, requests, output_len = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(path) as source:
+    result = json.load(source)
+if result.get("completed") != requests or result.get("total_output_tokens") != requests * output_len:
+    raise SystemExit(f"incomplete benchmark cell: {path}")
+keys = ["output_throughput", "request_throughput"]
+keys += [f"{stat}_{metric}_ms" for stat in ("mean", "median", "p99") for metric in ("ttft", "tpot", "itl", "e2el")]
+for key in keys:
+    value = result.get(key)
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise SystemExit(f"missing or invalid metric {key}: {path}")
+PYEOF
 }

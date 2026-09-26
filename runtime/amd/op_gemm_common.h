@@ -1506,13 +1506,340 @@ __device__ void d_gemm_norm(bf16* C, const bf16* A, const bf16* B, const float* 
  *
  * DIRECT global_load_lds is NOT used (byte-granular per-lane DMA is fiddly, and the kernel is
  * MFMA-bound); the register FETCH+COMMIT path stages the tile. GLU rides the bf16 twin's SN trick. */
-template <int BM, int BN, int BK, int WM, int WN, bool KEXACT = true, bool GLU = false>
+#if PLOW_CDNA4
+template <bool COPY_ROPE = false>
+__device__ void d_mla_bmm_fp8_m16(bf16* C, const bf16* X, const unsigned char* W,
+                                 const float* wscale, unsigned M, unsigned H, unsigned N,
+                                 unsigned K, unsigned slice, unsigned nblk,
+                                 unsigned x_head_stride = 0, bf16* rope = nullptr, unsigned rope_dim = 0) {
+    const unsigned lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
+    const unsigned nt = (N + 15) / 16, mt = (M + 15) / 16;
+    const unsigned xstride = x_head_stride ? x_head_stride : K;
+    for (unsigned tile = slice * PLOW_WAVES + wave; tile < H * mt * nt; tile += nblk * PLOW_WAVES) {
+        const unsigned head = tile / (mt * nt), local = tile % (mt * nt);
+        const unsigned m0 = (local / nt) * 16, n0 = (local % nt) * 16;
+        const unsigned am = m0 + lane % 16, bn = n0 + lane % 16;
+        if constexpr (COPY_ROPE) {
+            if (n0 == 0) {
+                for (unsigned j = lane; j < 16 * rope_dim; j += 64) {
+                    const unsigned m = m0 + j / rope_dim, col = j % rope_dim;
+                    if (m < M)
+                        st_act1(rope + ((size_t)m * H + head) * rope_dim + col,
+                                X[((size_t)m * H + head) * xstride + K + col]);
+                }
+            }
+        }
+        f32x4 acc = (f32x4)(0.0f);
+        for (unsigned group = 0; group < (K + 127) / 128; group++) {
+            const unsigned k0 = group * 128 + (lane / 16) * 32;
+            bf16 values[32];
+            float amax = 1e-10f;
+#pragma unroll
+            for (unsigned j = 0; j < 32; j++) {
+                values[j] = am < M && k0 + j < K ? X[((size_t)am * H + head) * xstride + k0 + j] : (bf16)0;
+                amax = fmaxf(amax, fabsf(bf2f(values[j])));
+            }
+            amax = fmaxf(amax, __shfl_xor(amax, 16));
+            amax = fmaxf(amax, __shfl_xor(amax, 32));
+            const float scale = amax * (1.0f / 448.0f), inv = 1.0f / scale;
+            fp8v32 av = (fp8v32)(0), bv = (fp8v32)(0);
+#pragma unroll
+            for (unsigned j = 0; j < 8; j++) {
+                unsigned a = 0;
+#pragma unroll
+                for (unsigned pair = 0; pair < 2; pair++) {
+                    const unsigned offset = j * 4 + pair * 2;
+                    const float x0 = fminf(448.0f, fmaxf(-448.0f, bf2f(values[offset]) * inv));
+                    const float x1 = fminf(448.0f, fmaxf(-448.0f, bf2f(values[offset + 1]) * inv));
+                    a |= PLOW_GM_FP8_PACK2(x0, x1) << (pair * 16);
+                }
+                av[j] = a;
+            }
+#pragma unroll
+            for (unsigned half = 0; half < 2; half++) {
+                fp8v16 b = (fp8v16)(0);
+                if (bn < N && k0 + half * 16 + 15 < K)
+                    b = ld_glob_fp8v16(W + ((size_t)head * N + bn) * K + k0 + half * 16);
+                else {
+#pragma unroll
+                    for (unsigned j = 0; j < 16; j++)
+                        if (bn < N && k0 + half * 16 + j < K)
+                            b[j / 4] |= (unsigned)W[((size_t)head * N + bn) * K + k0 + half * 16 + j] << ((j % 4) * 8);
+                }
+#pragma unroll
+                for (unsigned j = 0; j < 4; j++) bv[half * 4 + j] = b[j];
+            }
+            const f32x4 dot = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                av, bv, (f32x4)(0.0f), 0, 0, 0, 0, 0, 0);
+#pragma unroll
+            for (unsigned e = 0; e < 4; e++)
+                acc[e] = fmaf(dot[e], __shfl(scale, (lane / 16) * 4 + e), acc[e]);
+        }
+        // MLA applies the scalar weight scale after the group-scaled accumulation.
+        const float ws = *wscale;
+#pragma unroll
+        for (unsigned e = 0; e < 4; e++) {
+            const unsigned m = m0 + (lane / 16) * 4 + e;
+            if (m < M && bn < N) st_act1(C + ((size_t)m * H + head) * N + bn, f2bf(acc[e] * ws));
+        }
+    }
+}
+
+/* Decode-rows block-FP8 GEMM (plain or SPLIT3 outputs), K split across the workgroup's waves.
+ * d_gemm_fp8_block128_m16 gives each WAVE one 16x16 tile and walks all of K: at GLM qkv_a
+ * (N=2624, K=6144) that is 164 busy waves out of 2048, each a 48-group dependent load chain
+ * (0.086 ms). Here a WORKGROUP owns the tile, wave w takes K groups [w*kb/W, (w+1)*kb/W), and the
+ * partials are summed through LDS in wave order. Same per-group scale fold; f32 reassociation
+ * only. Requires K % 128 == 0 and 16-byte aligned A/B. `red` holds W*64*4 floats. */
+__device__ void d_gemm_fp8_block128_m16_kw(bf16* C, const unsigned char* A, const unsigned char* B,
+                                           const float* ascale, const float* wscale, unsigned M,
+                                           unsigned N, unsigned K, unsigned slice, unsigned nblk,
+                                           float* red, bf16* C1 = nullptr, bf16* C2 = nullptr,
+                                           unsigned n_first = 0, unsigned n_second = 0) {
+    const unsigned lane = threadIdx.x & 63, wave = threadIdx.x >> 6, W = blockDim.x >> 6;
+    const unsigned nt = (N + 15) / 16, mt = (M + 15) / 16, kb = K / 128;
+    const unsigned g0 = wave * kb / W, g1 = (wave + 1) * kb / W;
+    for (unsigned tile = slice; tile < mt * nt; tile += nblk) {
+        const unsigned m0 = (tile / nt) * 16, n0 = (tile % nt) * 16;
+        const unsigned am = m0 + lane % 16, n = n0 + lane % 16;
+        f32x4 acc = (f32x4)(0.0f);
+        for (unsigned group = g0; group < g1; group++) {
+            const unsigned k0 = group * 128 + (lane / 16) * 32;
+            fp8v32 av = (fp8v32)(0), bv = (fp8v32)(0);
+#pragma unroll
+            for (unsigned half = 0; half < 2; half++) {
+                fp8v16 a = (fp8v16)(0), b = (fp8v16)(0);
+                if (am < M) a = ld_glob_fp8v16(A + (size_t)am * K + k0 + half * 16);
+                if (n < N) b = ld_glob_fp8v16(B + (size_t)n * K + k0 + half * 16);
+#pragma unroll
+                for (unsigned j = 0; j < 4; j++) {
+                    av[half * 4 + j] = a[j];
+                    bv[half * 4 + j] = b[j];
+                }
+            }
+            const f32x4 dot = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                av, bv, (f32x4)(0.0f), 0, 0, 0, 0, 0, 0);
+            const float ws = n < N ? wscale[(n / 128) * kb + group] : 0.0f;
+#pragma unroll
+            for (unsigned e = 0; e < 4; e++) {
+                const unsigned m = m0 + (lane / 16) * 4 + e;
+                const float as = m < M ? ascale[(size_t)group * M + m] : 0.0f;
+                acc[e] = fmaf(dot[e], as * ws, acc[e]);
+            }
+        }
+        *(f32x4*)(red + (wave * 64u + lane) * 4u) = acc;
+        __syncthreads();
+        if (wave == 0) {
+            f32x4 sum = *(const f32x4*)(red + lane * 4u);
+            for (unsigned w = 1; w < W; w++) sum += *(const f32x4*)(red + (w * 64u + lane) * 4u);
+#pragma unroll
+            for (unsigned e = 0; e < 4; e++) {
+                const unsigned m = m0 + (lane / 16) * 4 + e;
+                if (m >= M || n >= N) continue;
+                if (n_first) {
+                    const unsigned second_end = n_first + n_second;
+                    bf16* out = n < n_first ? C : n < second_end ? C1 : C2;
+                    const unsigned width = n < n_first ? n_first : n < second_end ? n_second : N - second_end;
+                    const unsigned col = n < n_first ? n : n < second_end ? n - n_first : n - second_end;
+                    st_act1(out + (size_t)m * width + col, f2bf(sum[e]));
+                } else {
+                    st_act1(C + (size_t)m * N + n, f2bf(sum[e]));
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__device__ __forceinline__ void atomic_add_bf16_pair(bf16* dst, unsigned packed) {
+    typedef short pair_t __attribute__((ext_vector_type(2)));
+    __builtin_amdgcn_global_atomic_fadd_v2bf16((pair_t*)dst, __builtin_bit_cast(pair_t, packed));
+}
+
+// GLU stores gate/up consecutively, with a separate block-scale grid for each half.
+template <bool GLU = false, bool GATHER = false, bool WEIGHTED = false, bool SCATTER = false,
+          bool ATOMIC = false, bool SPLIT3 = false, unsigned SPLITK = 1, bool KATOMIC = false,
+          bool HALF_OUT = false, unsigned GLU_KGROUPS = 0, bool SEPARATE_K_PARTS = false,
+          unsigned WAVES_PER_BLOCK = PLOW_WAVES>
+__device__ void d_gemm_fp8_block128_m16(bf16* C, const unsigned char* A,
+                                     const unsigned char* B, const float* ascale,
+                                     const float* wscale, unsigned M, unsigned N, unsigned K,
+                                     unsigned slice, unsigned nblk,
+                                     const unsigned char* B2 = nullptr, const float* wscale2 = nullptr,
+                                     const unsigned* row_token = nullptr, unsigned source_rows = 0,
+                                     const float* row_weight = nullptr, unsigned topk = 0,
+                                     bf16* C1 = nullptr, bf16* C2 = nullptr,
+                                     unsigned n_first = 0, unsigned n_second = 0,
+                                     bf16* C3 = nullptr) {
+    static_assert(!GLU || !WEIGHTED, "routed weights apply after the down GEMM");
+    static_assert(!SCATTER || GATHER, "scatter uses the gathered row map");
+    static_assert(!ATOMIC || (SCATTER && WEIGHTED), "atomic reduction requires weighted slot rows");
+    static_assert(!SPLIT3 || (!GLU && !GATHER && !WEIGHTED && !SCATTER), "split outputs require a plain GEMM");
+    static_assert(SPLITK == 1 || ((SPLITK == 4 || SPLITK == 8) && !GLU && !GATHER && !WEIGHTED && !SCATTER && !SPLIT3),
+                  "Q-B split-K requires a plain block128 GEMM");
+    static_assert(!KATOMIC || SPLITK > 1, "K atomic reduction requires multiple partitions");
+    static_assert(!SEPARATE_K_PARTS || (SPLITK == 4 && !KATOMIC),
+                  "separate K outputs require four non-atomic partitions");
+    static_assert(!HALF_OUT || (!GLU && !GATHER && !WEIGHTED && !SCATTER && !SPLIT3 && SPLITK == 1),
+                  "FP16 partial capture requires a plain GEMM");
+    static_assert(GLU_KGROUPS == 0 || (GLU && SPLITK == 1 && !HALF_OUT),
+                  "rounded gate/up partials require an unsplit GLU tile");
+    static_assert(WAVES_PER_BLOCK >= 1 && WAVES_PER_BLOCK <= PLOW_WAVES,
+                  "wave mapping must fit the interpreter workgroup");
+    const unsigned lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
+    const unsigned nt = (N + 15) / 16, mt = (M + 15) / 16, kb = (K + 127) / 128;
+    if constexpr (GLU && !GATHER) {
+        B2 = B + (size_t)N * K;
+        wscale2 = wscale + (size_t)((N + 127) / 128) * kb;
+    }
+    const bool packed = (K % 128 == 0) && (((size_t)A | (size_t)B | (GLU ? (size_t)B2 : 0)) & 15u) == 0;
+    const unsigned scale_rows = GATHER ? source_rows : M;
+    for (unsigned tile = slice * WAVES_PER_BLOCK + wave; tile < mt * nt * SPLITK;
+         tile += nblk * WAVES_PER_BLOCK) {
+        const unsigned part = SPLITK == 1 ? 0 : tile / (mt * nt);
+        const unsigned local = SPLITK == 1 ? tile : tile % (mt * nt);
+        const unsigned m0 = (local / nt) * 16, n0 = (tile % nt) * 16;
+        const unsigned am = m0 + lane % 16;
+        const unsigned ai = GATHER && am < M ? row_token[am] : am;
+        unsigned scale_row[4];
+#pragma unroll
+        for (unsigned e = 0; e < 4; e++) {
+            const unsigned m = m0 + (lane / 16) * 4 + e;
+            scale_row[e] = GATHER && m < M ? row_token[m] : m;
+        }
+        f32x4 acc = (f32x4)(0.0f), up = (f32x4)(0.0f);
+        f32x4 gate_sum = (f32x4)(0.0f), up_sum = (f32x4)(0.0f);
+        for (unsigned group = part * (kb / SPLITK); group < (part + 1) * (kb / SPLITK); group++) {
+            fp8v32 av = (fp8v32)(0), bv = (fp8v32)(0), uv = (fp8v32)(0);
+            const unsigned k0 = group * 128 + (lane / 16) * 32;
+            if (packed) {
+#pragma unroll
+                for (unsigned half = 0; half < 2; half++) {
+                    fp8v16 a = (fp8v16)(0), b = (fp8v16)(0), u = (fp8v16)(0);
+                    if (am < M && ai < scale_rows)
+                        a = ld_glob_fp8v16(A + (size_t)ai * K + k0 + half * 16);
+                    if (n0 + lane % 16 < N)
+                        b = ld_glob_fp8v16(B + (size_t)(n0 + lane % 16) * K + k0 + half * 16);
+                    if constexpr (GLU) {
+                        if (n0 + lane % 16 < N)
+                            u = ld_glob_fp8v16(B2 + (size_t)(n0 + lane % 16) * K + k0 + half * 16);
+                    }
+#pragma unroll
+                    for (unsigned j = 0; j < 4; j++) {
+                        av[half * 4 + j] = a[j];
+                        bv[half * 4 + j] = b[j];
+                        if constexpr (GLU) uv[half * 4 + j] = u[j];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (unsigned j = 0; j < 8; j++) {
+                    unsigned a = 0, b = 0, u = 0;
+#pragma unroll
+                    for (unsigned byte = 0; byte < 4; byte++) {
+                        const unsigned k = k0 + j * 4 + byte;
+                        if (am < M && ai < scale_rows && k < K)
+                            a |= (unsigned)A[(size_t)ai * K + k] << (byte * 8);
+                        if (n0 + lane % 16 < N && k < K)
+                            b |= (unsigned)B[(size_t)(n0 + lane % 16) * K + k] << (byte * 8);
+                        if constexpr (GLU) {
+                            if (n0 + lane % 16 < N && k < K)
+                                u |= (unsigned)B2[(size_t)(n0 + lane % 16) * K + k] << (byte * 8);
+                        }
+                    }
+                    av[j] = a;
+                    bv[j] = b;
+                    if constexpr (GLU) uv[j] = u;
+                }
+            }
+            const f32x4 dot = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                av, bv, (f32x4)(0.0f), 0, 0, 0, 0, 0, 0);
+            const unsigned n = n0 + lane % 16;
+            const float ws = n < N ? wscale[(n / 128) * kb + group] : 0.0f;
+            f32x4 udot = (f32x4)(0.0f);
+            float us = 0.0f;
+            if constexpr (GLU) {
+                udot = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                    av, uv, (f32x4)(0.0f), 0, 0, 0, 0, 0, 0);
+                us = n < N ? wscale2[(n / 128) * kb + group] : 0.0f;
+            }
+#pragma unroll
+            for (unsigned e = 0; e < 4; e++) {
+                const unsigned m = m0 + (lane / 16) * 4 + e;
+                const float as = m < M && scale_row[e] < scale_rows
+                    ? ascale[(size_t)group * scale_rows + scale_row[e]] : 0.0f;
+                acc[e] = fmaf(dot[e], as * ws, acc[e]);
+                if constexpr (GLU) up[e] = fmaf(udot[e], as * us, up[e]);
+            }
+            if constexpr (GLU_KGROUPS != 0) {
+                if ((group + 1) % GLU_KGROUPS == 0 || group + 1 == kb) {
+                    // CK's split-K epilogue rounds each partial to FP16 before FP32 atomic add.
+#pragma unroll
+                    for (unsigned e = 0; e < 4; e++) {
+                        gate_sum[e] += (float)(_Float16)acc[e];
+                        up_sum[e] += (float)(_Float16)up[e];
+                    }
+                    acc = up = (f32x4)(0.0f);
+                }
+            }
+        }
+        if constexpr (GLU_KGROUPS != 0) { acc = gate_sum; up = up_sum; }
+#pragma unroll
+        for (unsigned e = 0; e < 4; e++) {
+            const unsigned m = m0 + (lane / 16) * 4 + e, n = n0 + lane % 16;
+            // CK rounds the reciprocal before either FP32 multiply.
+            if constexpr (GLU_KGROUPS != 0)
+                acc[e] = (acc[e] * __builtin_amdgcn_rcpf(1.0f + expf(-acc[e]))) * up[e];
+            else if constexpr (GLU) acc[e] = (acc[e] * (1.0f / (1.0f + expf(-acc[e])))) * up[e];
+            if (m < M && n < N) {
+                if constexpr (WEIGHTED) acc[e] *= row_weight[m];
+                const unsigned dst = SCATTER ? scale_row[e] : m;
+                if constexpr (KATOMIC) {
+                    const unsigned value = f2bf(acc[e]);
+                    const unsigned adjacent = __shfl_xor(value, 1);
+                    if (!(n & 1u) && n + 1 < N)
+                        atomic_add_bf16_pair(C + (size_t)m * N + n, value | (adjacent << 16));
+                } else if constexpr (ATOMIC) {
+                    // GLM's even N keeps neighboring columns in one aligned BF16 pair.
+                    const unsigned value = f2bf(acc[e]);
+                    const unsigned adjacent = __shfl_xor(value, 1);
+                    if (!(n & 1u) && n + 1 < N && dst < source_rows)
+                        atomic_add_bf16_pair(C + (size_t)(dst / topk) * N + n, value | (adjacent << 16));
+                } else if constexpr (SPLIT3) {
+                    const unsigned second_end = n_first + n_second;
+                    bf16* out = n < n_first ? C : n < second_end ? C1 : C2;
+                    const unsigned width = n < n_first ? n_first : n < second_end ? n_second : N - second_end;
+                    const unsigned col = n < n_first ? n : n < second_end ? n - n_first : n - second_end;
+                    st_act1(out + (size_t)m * width + col, f2bf(acc[e]));
+                } else if (!SCATTER || dst < source_rows) {
+                    const bf16 value = HALF_OUT ? __builtin_bit_cast(unsigned short, (_Float16)acc[e]) : f2bf(acc[e]);
+                    if constexpr (SEPARATE_K_PARTS) {
+                        bf16* out = part == 0 ? C : part == 1 ? C1 : part == 2 ? C2 : C3;
+                        st_act1(&out[(size_t)dst * N + n], value);
+                    } else {
+                        st_act1(&C[((size_t)part * M + dst) * N + n], value);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#endif
+
+#ifndef PLOW_FP8_BLK_DMA
+#define PLOW_FP8_BLK_DMA 0
+#endif
+template <int BM, int BN, int BK, int WM, int WN, bool KEXACT = true, bool GLU = false,
+          bool BLOCK128 = false, int SPLITK = 1>
 __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restrict__ A,
                              const unsigned char* __restrict__ B, const float* __restrict__ ascale,
                              const float* __restrict__ wscale, unsigned M, unsigned N, unsigned K,
                              unsigned slice, unsigned nblk, bf16* lds,
                              const unsigned char* __restrict__ B2 = nullptr,
-                             const float* __restrict__ wscale2 = nullptr, unsigned act = 0) {
+                             const float* __restrict__ wscale2 = nullptr, unsigned act = 0,
+                             bf16* C1 = nullptr, bf16* C2 = nullptr, bf16* C3 = nullptr,
+                             unsigned split_first = 0, unsigned split_second = 0) {
     (void)B2; (void)wscale2; (void)act;
     (void)BK;
     constexpr int THREADS = WM * WN * PLOW_WAVE;
@@ -1548,12 +1875,25 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
     static_assert(NSL >= 2 || !CLBAR, "the ping-pong needs at least 2 MEM/MFMA cluster pairs");
     static_assert(THREADS == PLOW_THREADS, "GEMM wave grid must match the interpreter's");
     static_assert(!GLU || SN == 2, "the GLU epilogue uses the SN axis to select gate vs up");
+    static_assert(!BLOCK128 || !GLU, "block-scale GLU needs its own quantized intermediate boundary");
+    static_assert(SPLITK == 1 || (SPLITK == 4 && BLOCK128 && KEXACT),
+                  "split4 requires exact block128 K partitions");
     constexpr int NB = GLU ? BN / 2 : BN;
     constexpr bool PP = (GM_PP != 0) && DBUF; /* the ping-pong trades BUFFERS */
 
     unsigned char* const lds8 = (unsigned char*)lds;
 #define GM8_ASM(b) (lds8 + (b) * TILE)
 #define GM8_BSM(b) (lds8 + (b) * TILE + BM * STRIDE)
+    /* BLOCK128: each K-tile's [BM] activation scales and the tile's NWB weight col-block scales
+     * are staged in LDS with the operands, so promotion reads LDS instead of issuing
+     * SM*16 dependent global loads per lane per K-tile (measured 2.1x at 128x128). */
+    constexpr int NWB = (BN + 127) / 128 + (BN % 128 != 0);
+    constexpr int NSC = BM + NWB;
+    float* const gm8_sc = (float*)(lds8 + (DBUF ? 2 : 1) * TILE);
+#define GM8_SC(b) (gm8_sc + (b) * NSC)
+    static_assert(!BLOCK128 || (DBUF ? 2 : 1) * TILE + (DBUF ? 2 : 1) * NSC * 4 <= PLOW_LDS_MAX_BYTES,
+                  "block128 scale staging must fit the LDS arena");
+    static_assert(!BLOCK128 || NSC <= THREADS, "one staged scale per thread");
     /* 32-byte-granular XOR swizzle: a K64 fragment is 32 CONSECUTIVE fp8 (v8i32, ds_read_b256)
      * starting at a multiple of 32, so the permutation must move whole 32-byte groups to stay
      * aligned — XOR the 32-byte column with (row & (FBK/32-1)). Self-inverse; COMMIT (8-byte) and
@@ -1572,9 +1912,12 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
     const unsigned tn = (N + NB - 1) / NB, tm = (M + BM - 1) / BM;
     const unsigned n_tiles = tm * tn;
 
-    for (unsigned lin = slice; lin < n_tiles; lin += nblk) {
-        const unsigned tile = gm_remap<GM_SWZ, GM_WGM>(lin, n_tiles, tm, tn);
+    for (unsigned lin = slice; lin < n_tiles * SPLITK; lin += nblk) {
+        const unsigned part = SPLITK == 1 ? 0 : lin / n_tiles;
+        const unsigned tile = gm_remap<GM_SWZ, GM_WGM>(SPLITK == 1 ? lin : lin % n_tiles, n_tiles, tm, tn);
         const unsigned m0 = (tile / tn) * BM, n0 = (tile % tn) * NB;
+        const unsigned kbegin = part * (K / SPLITK);
+        const unsigned kend = SPLITK == 1 ? K : kbegin + K / SPLITK;
 
         f32x16 acc[SM][SN];
 #pragma unroll
@@ -1583,6 +1926,9 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
             for (int j = 0; j < SN; j++) acc[i][j] = (f32x16)(0.0f);
 
         __align__(8) unsigned char ra[APT], rb[BPT];
+        [[maybe_unused]] float rsc = 0.0f;
+        [[maybe_unused]] const unsigned kgroups = (K + 127u) / 128u;
+        [[maybe_unused]] const unsigned ncb = (N + 127u) / 128u;
 
 #define GM8_FETCH(k0)                                                                        \
     _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                    \
@@ -1615,6 +1961,14 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
             _Pragma("unroll") for (int j = 0; j < 8; j++)                                     \
                 rb[it * 8 + j] = (r < N && kk + j < K) ? bsrc[(size_t)r * K + kk + j] : 0;    \
         }                                                                                     \
+    }                                                                                         \
+    if constexpr (BLOCK128) {                                                                 \
+        const unsigned g = (k0) / FBK, t = threadIdx.x;                                       \
+        if (t < BM) rsc = m0 + t < M ? as_glob(ascale)[(size_t)g * M + m0 + t] : 0.0f;       \
+        else if (t < NSC) {                                                                   \
+            const unsigned cb = n0 / 128u + (t - BM);                                         \
+            rsc = cb < ncb ? as_glob(wscale)[(size_t)cb * kgroups + g] * PLOW_FP8_MMA_FIX : 0.0f; \
+        }                                                                                     \
     }
 
 /* GM8_FIX8(p): the arch hook for an 8-byte FP8 staging group. Production gfx942 operands are
@@ -1631,7 +1985,41 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
         GM8_FIX8(&rb[it * 8]);                                                                \
         __builtin_memcpy(&GM8_BSM(buf)[(e / FBK) * STRIDE + GM8_XORSWZ(e / FBK, e % FBK)],       \
                          &rb[it * 8], 8);                                                     \
+    }                                                                                         \
+    if constexpr (BLOCK128) {                                                                 \
+        if (threadIdx.x < NSC) GM8_SC(buf)[threadIdx.x] = rsc;                                \
     }
+
+/* PLOW_FP8_BLK_DMA (BLOCK128, KEXACT, double buffer): operands go global->LDS by 16-byte DMA
+ * (no ra/rb registers, no commit pass); the XOR swizzle moves to the per-lane global column, as
+ * in GM_DMA. Rows/cols past M/N clamp to the last line (their outputs are discarded). Scales
+ * still ride `rsc` and are stored after the DMA wait. */
+#define GM8_DMA_ISSUE(buf, k0)                                                               \
+    _Pragma("unroll") for (int it = 0; it < APT / 16; it++) {                                 \
+        const unsigned e = threadIdx.x * 16 + it * (THREADS * 16);                            \
+        const unsigned rl = e / FBK, r = m0 + rl < M ? m0 + rl : M - 1;                       \
+        cp_async16((const PLOW_GLOB bf16*)(as_glob(A) + (size_t)r * K + (k0) +                \
+                                           GM8_XORSWZ(rl, e % FBK)),                          \
+                   (bf16*)&GM8_ASM(buf)[(threadIdx.x & ~63u) * 16 + it * (THREADS * 16)]);     \
+    }                                                                                         \
+    _Pragma("unroll") for (int it = 0; it < BPT / 16; it++) {                                 \
+        const unsigned e = threadIdx.x * 16 + it * (THREADS * 16);                            \
+        const unsigned rl = e / FBK, r = n0 + rl < N ? n0 + rl : N - 1;                       \
+        cp_async16((const PLOW_GLOB bf16*)(as_glob(B) + (size_t)r * K + (k0) +                \
+                                           GM8_XORSWZ(rl, e % FBK)),                          \
+                   (bf16*)&GM8_BSM(buf)[(threadIdx.x & ~63u) * 16 + it * (THREADS * 16)]);     \
+    }                                                                                         \
+    {                                                                                         \
+        const unsigned g = (k0) / FBK, t = threadIdx.x;                                       \
+        if (t < BM) rsc = m0 + t < M ? as_glob(ascale)[(size_t)g * M + m0 + t] : 0.0f;       \
+        else if (t < NSC) {                                                                   \
+            const unsigned cb = n0 / 128u + (t - BM);                                         \
+            rsc = cb < ncb ? as_glob(wscale)[(size_t)cb * kgroups + g] * PLOW_FP8_MMA_FIX : 0.0f; \
+        }                                                                                     \
+    }
+#define GM8_DMA_COMMIT(buf)                                                                  \
+    cp_async_wait();                                                                          \
+    if (threadIdx.x < NSC) GM8_SC(buf)[threadIdx.x] = rsc;
 
 #define GM8_READ_INTO(af, bfr, buf, sl)                                                      \
     _Pragma("unroll") for (int i = 0; i < SM; i++)                                            \
@@ -1684,25 +2072,95 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
         if constexpr (CLBAR) __builtin_amdgcn_s_barrier();                                    \
     } while (0)
 
+        /* BM == 128 only: the 64x128 tile MISMATCHED under DMA (cause not found) and the
+         * 192/256-row tiles were slower; 128x256 / 128x128 (the interpreter's prefill tiles)
+         * are 11-18% faster and exact at every GLM shape tried. */
+        constexpr bool DMA = BLOCK128 && KEXACT && DBUF && (PLOW_FP8_BLK_DMA) && !GLU && BM == 128
+            && APT % 16 == 0 && BPT % 16 == 0;
         __syncthreads();
-        GM8_FETCH(0);
-        GM8_COMMIT(0);
+        if constexpr (DMA) {
+            GM8_DMA_ISSUE(0, kbegin);
+            GM8_DMA_COMMIT(0);
+        } else {
+            GM8_FETCH(kbegin);
+            GM8_COMMIT(0);
+        }
         __syncthreads();
 
-        const unsigned NT = PLOW_GEMM_ABL_NT((K + FBK - 1) / FBK);
+        const unsigned NT = PLOW_GEMM_ABL_NT((kend - kbegin + FBK - 1) / FBK);
         unsigned buf = 0;
         if (PP && wm == 1) __builtin_amdgcn_s_barrier();
 
 #pragma unroll 1
-        for (unsigned kt = 0; kt < NT; kt++) {
+        for (unsigned kt = kbegin / FBK; kt < kbegin / FBK + NT; kt++) {
             const unsigned kn = (kt + 1) * FBK;
-            if constexpr (!PLR) {
+            if constexpr (BLOCK128) {
+                /* Block scales, one accumulator (the ck_tile blockscale scheme): each fragment's
+                 * K128 product is formed from zero in a temporary and folded into `acc` with one
+                 * FMA by a_scale*w_scale. A second full promoted accumulator doubled the
+                 * register file and spilled every tile above 128x128. A scales [ceil(K/128), M]
+                 * and W scales [ceil(N/128), ceil(K/128)] are staged in LDS with this K-tile;
+                 * arbitrary f32 scales cannot be folded into E8M0 MFMA scales. */
+                static_assert(NSL == 2 && KS == 1, "one K128 tile = two K64 MFMAs");
+                GM8_FENCE();
+                /* B fragments for both K64 halves stay live across the tile; A is read per
+                 * row-block below, so only 2 A fragments are live at once (c0 fits 256 VGPR). */
+                fp8v32 bf0[SN][KS], bf1[SN][KS];
+#pragma unroll
+                for (int j = 0; j < SN; j++) {
+                    const unsigned brow = wn * (BN / WN) + j * MFMA_N + frow;
+                    __builtin_memcpy(&bf0[j][0],
+                        &GM8_BSM(buf)[brow * STRIDE + GM8_XORSWZ(brow, frag_k64(lane, 0))], 32);
+                    __builtin_memcpy(&bf1[j][0],
+                        &GM8_BSM(buf)[brow * STRIDE + GM8_XORSWZ(brow, frag_k64(lane, SLICE))], 32);
+                }
+                if constexpr (DMA) {
+                    if (kn < kend) { GM8_DMA_ISSUE(buf ^ 1, kn); }
+                } else {
+                    if (kn < kend) { GM8_FETCH(kn); }
+                    if (DBUF && kn < kend) { GM8_COMMIT(buf ^ 1); }
+                }
+                GM8_FENCE();
+                GM8_CLUSTER_BARRIER();
+                const float* sc = GM8_SC(buf);
+                float wsj[SN];
+#pragma unroll
+                for (int j = 0; j < SN; j++)
+                    wsj[j] = sc[BM + (n0 + wn * (BN / WN) + j * MFMA_N + mfma_acc_n(lane)) / 128u - n0 / 128u];
+                if constexpr (PRIO) __builtin_amdgcn_s_setprio(1);
+#pragma unroll
+                for (int i = 0; i < SM; i++) {
+                    const unsigned arow = wm * (BM / WM) + i * MFMA_M + frow;
+                    fp8v32 a0, a1;
+                    __builtin_memcpy(&a0, &GM8_ASM(buf)[arow * STRIDE + GM8_XORSWZ(arow, frag_k64(lane, 0))], 32);
+                    __builtin_memcpy(&a1, &GM8_ASM(buf)[arow * STRIDE + GM8_XORSWZ(arow, frag_k64(lane, SLICE))], 32);
+                    float asv[16];
+#pragma unroll
+                    for (int e = 0; e < 16; e++)
+                        asv[e] = sc[wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e)];
+#pragma unroll
+                    for (int j = 0; j < SN; j++) {
+                        f32x16 t = plow_mfma_fp8_32x32(a0, bf0[j][0], (f32x16)(0.0f));
+                        t = plow_mfma_fp8_32x32(a1, bf1[j][0], t);
+#pragma unroll
+                        for (int e = 0; e < 16; e++) acc[i][j][e] += t[e] * (asv[e] * wsj[j]);
+                    }
+                }
+                if constexpr (PRIO) __builtin_amdgcn_s_setprio(0);
+                GM8_FENCE();
+                GM8_CLUSTER_BARRIER();
+                if constexpr (DMA) {
+                    /* buf^1 lands before anyone reads it; buf is free for the next issue. */
+                    if (kn < kend) { GM8_DMA_COMMIT(buf ^ 1); }
+                    __syncthreads();
+                }
+            } else if constexpr (!PLR) {
 #pragma unroll
                 for (int sl = 0; sl < NSL; sl++) {
                     GM8_FENCE();
                     GM8_READ_FRAGS(buf, sl)
-                    if (sl == 0 && kn < K) { GM8_FETCH(kn); }
-                    if (DBUF && sl == NSL - 1 && kn < K) { GM8_COMMIT(buf ^ 1); }
+                    if (sl == 0 && kn < kend) { GM8_FETCH(kn); }
+                    if (DBUF && sl == NSL - 1 && kn < kend) { GM8_COMMIT(buf ^ 1); }
                     GM8_FENCE();
                     GM8_CLUSTER_BARRIER();
 
@@ -1720,7 +2178,7 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
 #pragma unroll
                 for (int sl = 0; sl < NSL; sl++) {
                     if (sl + 1 < NSL) { GM8_READ_INTO(afp[(sl + 1) & 1], bfp[(sl + 1) & 1], buf, sl + 1) }
-                    if (sl == 0 && kn < K) { GM8_FETCH(kn); }
+                    if (sl == 0 && kn < kend) { GM8_FETCH(kn); }
                     GM8_MFMA_FROM(afp[sl & 1], bfp[sl & 1])
                 }
             }
@@ -1729,7 +2187,7 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
                  * the bf16 body -- and required here too, because this arena is sized by
                  * GM_LDS_HALVES_T, so a two-buffer fp8 stage in a one-buffer allocation runs off
                  * the end. That is exactly what it did: 4/4 fp8 GEMM shapes wrong at GM_DBUF=1. */
-                if (kn < K) {
+                if (kn < kend) {
                     if constexpr (!CLBAR) __syncthreads(); /* every wave done reading the stage */
                     GM8_COMMIT(0);
                     if constexpr (CLBAR) {
@@ -1745,8 +2203,31 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
         if (PP && wm == 0) __builtin_amdgcn_s_barrier();
         __syncthreads();
 
-        auto* const Cg = as_glob(C);
-        if constexpr (GLU) {
+        auto* const Cg = as_glob(SPLITK == 1 || part == 0 ? C : part == 1 ? C1 : part == 2 ? C2 : C3);
+        if constexpr (BLOCK128) {
+#pragma unroll
+            for (int i = 0; i < SM; i++)
+#pragma unroll
+                for (int j = 0; j < SN; j++) {
+                    const unsigned nn = n0 + wn * (BN / WN) + j * MFMA_N + mfma_acc_n(lane);
+                    if (nn >= N) continue;
+                    /* split3 (fused q_a|kv_a|k_rope): columns route to three row-major outputs of
+                     * widths first, second, N-first-second, as the m16 kernel's SPLIT3 epilogue. */
+                    auto* out = Cg;
+                    unsigned col = nn, width = N;
+                    if (split_first) {
+                        const unsigned e2 = split_first + split_second;
+                        out = as_glob(nn < split_first ? C : nn < e2 ? C1 : C2);
+                        col = nn < split_first ? nn : nn < e2 ? nn - split_first : nn - e2;
+                        width = nn < split_first ? split_first : nn < e2 ? split_second : N - e2;
+                    }
+#pragma unroll
+                    for (int e = 0; e < 16; e++) {
+                        const unsigned mm = m0 + wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e);
+                        if (mm < M) st_act1(&out[(size_t)mm * width + col], f2bf(acc[i][j][e]));
+                    }
+                }
+        } else if constexpr (GLU) {
             const unsigned nn = n0 + wn * MFMA_N + mfma_acc_n(lane);
             if (nn < N) {
                 const float gs = wscale[nn] * PLOW_FP8_MMA_FIX,
@@ -1783,6 +2264,8 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
         }
 #undef GM8_FETCH
 #undef GM8_COMMIT
+#undef GM8_DMA_ISSUE
+#undef GM8_DMA_COMMIT
 #undef GM8_READ_FRAGS
 #undef GM8_MFMA_BURST
 #undef GM8_FENCE
@@ -1901,6 +2384,44 @@ __device__ void d_quant_fp8(unsigned char* __restrict__ xq_, bf16* __restrict__ 
             const unsigned pk = PLOW_GM_FP8_PACK2(a, b);
             st_act1_u8(&xq[row + k], (unsigned char)(pk & 0xffu));
             if (k + 1 < K) st_act1_u8(&xq[row + k + 1], (unsigned char)((pk >> 8) & 0xffu));
+        }
+    }
+}
+
+template <bool SCATTER = false>
+__device__ void d_quant_fp8_block128(unsigned char* __restrict__ xq_,
+                                    const bf16* __restrict__ x_, float* __restrict__ scale_,
+                                    unsigned M, unsigned K, unsigned slice, unsigned nblk,
+                                    const unsigned* row_partidx = nullptr, unsigned slots = 0) {
+    const auto* x = as_glob(x_);
+    auto* xq = as_glob(xq_);
+    auto* scale = as_glob(scale_);
+    const unsigned groups = K / 128u;
+    const unsigned lane = threadIdx.x & 3u;
+    for (unsigned group = (slice * PLOW_THREADS + threadIdx.x) / 4u;
+         group < M * groups; group += nblk * PLOW_THREADS / 4u) {
+        const unsigned dst = SCATTER ? row_partidx[group / groups] : group / groups;
+        if (SCATTER && dst >= slots) continue;
+        const size_t base = (size_t)group * 128u + lane * 32u;
+        const size_t outbase = SCATTER ? (size_t)dst * K + (group % groups) * 128u + lane * 32u : base;
+        bf16 values[32];
+        // AITER's continuous-scale HIP path floors amax, not the resulting scale.
+        float amax = 1e-10f;
+#pragma unroll
+        for (unsigned j = 0; j < 32; j++) {
+            values[j] = x[base + j];
+            amax = fmaxf(amax, fabsf(bf2f(values[j])));
+        }
+        amax = fmaxf(amax, __shfl_xor(amax, 1, 4));
+        amax = fmaxf(amax, __shfl_xor(amax, 2, 4));
+        const float s = amax * (1.0f / 448.0f);
+        const float inv = 1.0f / s;
+        if (lane == 0) st_act<float>(&scale[(size_t)(group % groups) * (SCATTER ? slots : M) + dst], s);
+#pragma unroll
+        for (unsigned j = 0; j < 32; j += 2) {
+            const unsigned packed = PLOW_GM_FP8_PACK2(bf2f(values[j]) * inv, bf2f(values[j + 1]) * inv);
+            st_act1_u8(&xq[outbase + j], (unsigned char)packed);
+            st_act1_u8(&xq[outbase + j + 1], (unsigned char)(packed >> 8));
         }
     }
 }
@@ -5066,15 +5587,46 @@ __device__ void d_gemv_bf16_f32(float* __restrict__ C, const bf16* __restrict__ 
                                 unsigned slice, unsigned nblk) {
     const unsigned wave = threadIdx.x / PLOW_WAVE;
     const unsigned lane = threadIdx.x % PLOW_WAVE;
-    for (unsigned m = 0; m < M; m++) {
+    // Distribute independent batch rows too: a narrow router otherwise leaves most CUs idle.
+    for (size_t output = slice * PLOW_WAVES + wave; output < (size_t)M * N;
+         output += nblk * PLOW_WAVES) {
+        const unsigned m = output / N, n = output % N;
         const bf16* const xm = x + (size_t)m * K;
-        float* const cm = C + (size_t)m * N;
-        for (unsigned n = slice * PLOW_WAVES + wave; n < N; n += nblk * PLOW_WAVES) {
-            const bf16* const wn = W + (size_t)n * K;
-            float acc = 0.0f;
-            for (unsigned k = lane; k < K; k += PLOW_WAVE) acc += bf2f(xm[k]) * bf2f(wn[k]);
-            acc = wave_sum(acc);
-            if (lane == 0) cm[n] = acc;
+        const bf16* const wn = W + (size_t)n * K;
+        float acc = 0.0f;
+        for (unsigned k = lane; k < K; k += PLOW_WAVE) acc += bf2f(xm[k]) * bf2f(wn[k]);
+        acc = wave_sum(acc);
+        if (lane == 0) C[output] = acc;
+    }
+}
+
+/* Decode router GEMV, one wave per output COLUMN for all M <= 16 rows: the W row is read once in
+ * 16-byte pieces (d_gemv_bf16_f32 reads it once per row, 2 bytes per lane per step) and x stays
+ * L2-resident. f32 reassociation only. Requires K % 512 == 0 and 16-byte aligned rows. */
+template <unsigned MR>
+__device__ void d_gemv_bf16_f32_col(float* __restrict__ C, const bf16* __restrict__ x,
+                                    const bf16* __restrict__ W, unsigned M, unsigned N, unsigned K,
+                                    unsigned slice, unsigned nblk) {
+    const unsigned wave = threadIdx.x / PLOW_WAVE, lane = threadIdx.x % PLOW_WAVE;
+    for (unsigned n = slice * PLOW_WAVES + wave; n < N; n += nblk * PLOW_WAVES) {
+        const bf16* const wn = W + (size_t)n * K;
+        float acc[MR] = {};
+#pragma unroll 4
+        for (unsigned k = lane * 8u; k < K; k += PLOW_WAVE * 8u) {
+            const bf16v8 w = ld_glob8(wn + k);
+#pragma unroll
+            for (unsigned m = 0; m < MR; m++) {
+                if (m >= M) break;
+                const bf16v8 xv = ld_glob8(x + (size_t)m * K + k);
+#pragma unroll
+                for (unsigned j = 0; j < 8; j++) acc[m] += bf2f(xv[j]) * bf2f(w[j]);
+            }
+        }
+#pragma unroll
+        for (unsigned m = 0; m < MR; m++) {
+            if (m >= M) break;
+            const float t = wave_sum(acc[m]);
+            if (lane == 0) C[(size_t)m * N + n] = t;
         }
     }
 }
@@ -5319,7 +5871,7 @@ __device__ void d_gemv_qkv_fp8(bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x,
         if (lds_ok) gemv_rows_fp8_blk<PLOW_GEMV_MM, true, UN>(C, x, W, wscale, M, N, K, slice, nblk, lds);  \
         else gemv_rows_fp8_blk<PLOW_GEMV_MM, false, UN>(C, x, W, wscale, M, N, K, slice, nblk, lds); \
     } while (0)
-__device__ void d_gemv_fp8_blk(bf16* C, const bf16* x, const unsigned char* W, const float* wscale,
+__device__ void gemv_fp8_blk_band(bf16* C, const bf16* x, const unsigned char* W, const float* wscale,
                                unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk,
                                bf16* lds) {
     const bool lds_ok = (size_t)M * K <= GM_LDS_HALVES;
@@ -5344,6 +5896,20 @@ __device__ void d_gemv_fp8_blk(bf16* C, const bf16* x, const unsigned char* W, c
     else GEMV_FP8_BLK_DISP(3);                     /* K=6144: 6 chunks -> 2 clean groups of 3 */
 }
 #undef GEMV_FP8_BLK_DISP
+
+__device__ void d_gemv_fp8_blk(bf16* C, const bf16* x, const unsigned char* W, const float* wscale,
+                               unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk,
+                               bf16* lds) {
+    if (M <= PLOW_GEMV_MM) {
+        gemv_fp8_blk_band(C, x, W, wscale, M, N, K, slice, nblk, lds);
+        return;
+    }
+    for (unsigned row = 0; row < M; row += PLOW_GEMV_MM) {
+        gemv_fp8_blk_band(C + (size_t)row * N, x + (size_t)row * K, W, wscale,
+                         min(M - row, (unsigned)PLOW_GEMV_MM), N, K, slice, nblk, lds);
+        __syncthreads(); // All waves must finish reading LDS before the next band stages x.
+    }
+}
 
 /* MXFP4 decode GEMV entry. Mirrors d_gemv_fp8: stage x in LDS when it fits, then pick UN so it
  * DIVIDES the chunk count (a dead overshoot chunk still costs a full 16-convert dequant, so an UN
@@ -5395,12 +5961,19 @@ __device__ void d_gemv_qkv_mxfp4(bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x,
      * sequences, and therefore what makes the fusion byte-exact rather than merely close. */
 #define GEMV_MXFP4_DISP(UN)                                                                      \
     do {                                                                                         \
-        if (lds_ok)                                                                              \
-            gemv_rows_mxfp4<PLOW_GEMV_MM, true, UN>(Cq, Ck, Cv, x, Wq, Wk, Wv, Sq, Sk, Sv, M, Nq, \
-                                                    Nk, Nv, K, slice, nblk, lds);                 \
-        else                                                                                     \
-            gemv_rows_mxfp4<PLOW_GEMV_MM, false, UN>(Cq, Ck, Cv, x, Wq, Wk, Wv, Sq, Sk, Sv, M,    \
-                                                     Nq, Nk, Nv, K, slice, nblk, lds);            \
+        gemv_walk(M, [&](unsigned m0, unsigned rows) {                                          \
+            bf16* q = Cq ? Cq + (size_t)m0 * Nq : nullptr;                                      \
+            bf16* k = Ck ? Ck + (size_t)m0 * Nk : nullptr;                                      \
+            bf16* v = Cv ? Cv + (size_t)m0 * Nv : nullptr;                                      \
+            const bf16* xb = x + (size_t)m0 * K;                                                \
+            const bf16* lb = lds + (size_t)m0 * K;                                              \
+            if (lds_ok)                                                                          \
+                gemv_rows_mxfp4<PLOW_GEMV_MM, true, UN>(q, k, v, xb, Wq, Wk, Wv, Sq, Sk, Sv,   \
+                                                        rows, Nq, Nk, Nv, K, slice, nblk, lb);  \
+            else                                                                                 \
+                gemv_rows_mxfp4<PLOW_GEMV_MM, false, UN>(q, k, v, xb, Wq, Wk, Wv, Sq, Sk, Sv,  \
+                                                         rows, Nq, Nk, Nv, K, slice, nblk, lds);\
+        });                                                                                      \
     } while (0)
     if (nchunk >= 8u) GEMV_MXFP4_DISP(4);      /* K>=16384: 8 chunks -> 2 clean groups of 4 */
     else if (nchunk >= 6u) GEMV_MXFP4_DISP(3); /* K=12288: 6 -> 2 groups of 3               */

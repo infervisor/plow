@@ -47,6 +47,8 @@ use packet::rope::{GenTensor, RopeScale};
 use serde_json::Value;
 
 mod checkpoint;
+pub mod cost_inputs;
+pub mod gemm_policy;
 use checkpoint::{layer_scalars, validate_coverage};
 mod attention_prefill_role;
 mod gemma4_gemm_glu_role;
@@ -696,8 +698,22 @@ fn select_gemm_over(
     n_cu: u32,
     quant: kernelcaps::QuantScheme,
 ) -> (DevOp, kernelcaps::CalibrationTier) {
-    let measured = gfx950_gemm_measurements().for_shape(m as i64, n as i64, k as i64, quant);
-    select_gemm_with(inv, m, n, k, n_cu, quant, measured)
+    let measurements = gfx950_gemm_measurements();
+    let measured = measurements.for_shape(m as i64, n as i64, k as i64, quant);
+    let selected = select_gemm_with(inv, m, n, k, n_cu, quant, measured);
+    let (spec, _) = amd_target::active();
+    // The legacy store does not encode reduced-CU launches or inactive-row domains.
+    if selected.1 == kernelcaps::CalibrationTier::SkuCalibrated && n_cu == spec.sm_count {
+        let case = tunedb::gemm_op_case(m.into(), n.into(), k.into(), quant);
+        if let (Some(costs), Some(hardware)) = (measurements.by_case.get(&case),
+            kernelcaps::HardwareFingerprint::from_spec(spec)) {
+            if let Some(request) = gemm_policy::request(inv, [m,n,k], &hardware, n_cu,
+                quant, costs, selected.0) {
+                GEMM_POLICIES.with(|policies| policies.borrow_mut().push(request));
+            }
+        }
+    }
+    selected
 }
 
 /// The analytical tier alone: the answer with no qualified record for the shape.
@@ -1016,6 +1032,7 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
         // preprocessed dense family across all supported encodings, not
         // unrelated arms in the persistent interpreter.
         let want = tunedb::Digests {
+            execution: None,
             implementation: build.label(),
             interpreter: build.label(),
             toolchain: build.toolchain.clone(),
@@ -1036,7 +1053,8 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
         let mut parked: std::collections::HashMap<String, std::collections::HashMap<u16, f64>> =
             Default::default();
         for r in records {
-            if !r.state.is_selectable() {
+            if !r.state.is_selectable() || !r.qualification_blockers().is_empty()
+                || r.hardware != cell || r.profile != "prefill_dense" {
                 continue;
             }
             let target = if r.digests.stale_against(&want).is_empty() {
@@ -1126,6 +1144,7 @@ pub fn install_gfx950_gemv_cases() {
         Some(s) => s,
     };
     let want = tunedb::Digests {
+        execution: None,
         implementation: gfx950_gemm_inventory().build().label(),
         interpreter: gfx950_gemm_inventory().build().label(),
         toolchain: gfx950_gemm_inventory().build().toolchain.clone(),
@@ -1300,20 +1319,75 @@ struct AttentionDecisionReport {
     selected_nsplit: u32,
     selected_algorithm: &'static str,
     selected_source: &'static str,
+    measured_policy: Option<serde_json::Value>,
 }
 
 thread_local! {
     static ATTENTION_DECISIONS: std::cell::RefCell<Vec<AttentionDecisionReport>> = const {
         std::cell::RefCell::new(Vec::new())
     };
+    static MOE_ROUTE_POLICIES: std::cell::RefCell<Vec<serde_json::Value>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+    static GEMM_POLICIES: std::cell::RefCell<Vec<serde_json::Value>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
 }
 
 fn clear_attention_decisions() {
     ATTENTION_DECISIONS.with(|d| d.borrow_mut().clear());
+    MOE_ROUTE_POLICIES.with(|d| d.borrow_mut().clear());
+    GEMM_POLICIES.with(|d| d.borrow_mut().clear());
 }
 
 fn attention_decisions() -> Vec<AttentionDecisionReport> {
     ATTENTION_DECISIONS.with(|d| d.borrow().clone())
+}
+
+pub fn measured_policy_requests() -> Vec<serde_json::Value> {
+    let mut requests = std::collections::BTreeMap::new();
+    for decision in attention_decisions() {
+        if let Some(request) = decision.measured_policy {
+            let bytes = serde_json::to_vec(&request).expect("measured policy request");
+            requests.insert(plow_asset::decode_objects::image_sha256(&bytes), request);
+        }
+    }
+    MOE_ROUTE_POLICIES.with(|policies| {
+        for request in policies.borrow().iter() {
+            let bytes = serde_json::to_vec(request).expect("measured MoE policy request");
+            requests.insert(plow_asset::decode_objects::image_sha256(&bytes), request.clone());
+        }
+    });
+    GEMM_POLICIES.with(|policies| {
+        for request in policies.borrow().iter() {
+            let bytes = serde_json::to_vec(request).expect("measured GEMM policy request");
+            requests.insert(plow_asset::decode_objects::image_sha256(&bytes), request.clone());
+        }
+    });
+    requests.into_values().collect()
+}
+
+pub fn mla_layout_requests(model: &packet::devbuild::Model) -> Result<Vec<(usize, serde_json::Value)>, String> {
+    let mut requests = Vec::new();
+    for (program, p) in model.progs.iter().enumerate() {
+        for (index, producer) in p.insts.iter().enumerate() {
+            if producer.op == DevOp::MlaBmmFp8 as u16 && producer.i[5] == 1024 {
+                let prior = index.checked_sub(1).and_then(|i| p.insts.get(i))
+                    .ok_or("strided WV consumer has no padded producer")?;
+                if prior.op != DevOp::FlashMerge as u16 || prior.i[4] != 1024 || prior.t[0] != producer.t[1] {
+                    return Err("strided WV consumer has no matching padded producer".into());
+                }
+            }
+            if producer.op != DevOp::FlashMerge as u16 || producer.i[4] != 1024 { continue; }
+            let consumer = p.insts.get(index + 1).ok_or("padded MLA output has no consumer")?;
+            let capacity = model.tensors.get(producer.t[0] as usize)
+                .ok_or("padded MLA output handle is absent")?.bytes;
+            let request = plow_asset::certificates::mla_layout_obligation(index,
+                &producer.pack(), &consumer.pack(), capacity)?;
+            requests.push((program, request));
+        }
+    }
+    Ok(requests)
 }
 
 /// Exact-cell attention selection. This is compile-time packet policy, not an
@@ -1352,6 +1426,7 @@ pub(crate) fn select_amd_moe_decode_route(
     };
     #[cfg(test)]
     let want = tunedb::Digests {
+        execution: None,
         implementation: "test-unprobed".into(),
         interpreter: "test-unprobed".into(),
         toolchain: "test-unprobed".into(),
@@ -1359,6 +1434,7 @@ pub(crate) fn select_amd_moe_decode_route(
     };
     #[cfg(not(test))]
     let want = tunedb::Digests {
+        execution: None,
         implementation: gfx950_gemm_inventory().build().label(),
         interpreter: gfx950_gemm_inventory().build().label(),
         toolchain: gfx950_gemm_inventory().build().toolchain.clone(),
@@ -1371,6 +1447,10 @@ pub(crate) fn select_amd_moe_decode_route(
         tunedb::GFX950_SEGMENT_HANDOFF_NS,
         tunedb::MIN_GAIN_FRACTION,
     );
+    if let Some(request) = tunedb::moe_decode::policy_witness(&records, &cell, &want,
+        tunedb::GFX950_SEGMENT_HANDOFF_NS, tunedb::MIN_GAIN_FRACTION, selected) {
+        MOE_ROUTE_POLICIES.with(|policies| policies.borrow_mut().push(request));
+    }
     if selected.source == tunedb::MoeDecodeSource::Qualified {
         eprintln!(
             "  grouped-MoE decode route: {} -> {:?} (projected {:+.2} us/layer after handoff)",
@@ -1424,6 +1504,7 @@ fn select_amd_attention(
         .unwrap_or_default();
     #[cfg(test)]
     let want = tunedb::Digests {
+        execution: None,
         implementation: "test-unprobed".into(),
         interpreter: "test-unprobed".into(),
         toolchain: "test-unprobed".into(),
@@ -1431,6 +1512,7 @@ fn select_amd_attention(
     };
     #[cfg(not(test))]
     let want = tunedb::Digests {
+        execution: None,
         implementation: gfx950_gemm_inventory().build().label(),
         interpreter: gfx950_gemm_inventory().build().label(),
         toolchain: gfx950_gemm_inventory().build().toolchain.clone(),
@@ -1485,6 +1567,8 @@ fn select_amd_attention(
                 tunedb::AttentionSource::FixedFallback => "fixed_fallback",
                 tunedb::AttentionSource::Qualified => "qualified",
             },
+            measured_policy: tunedb::attention::policy_witness(&records, &cell, &want,
+                tunedb::AttentionCapabilities { max_nsplit, persistent: false }, selected),
         });
     });
     selected
@@ -7058,6 +7142,9 @@ pub struct LeanReport {
     pub modular_summary: Option<plow_asset::ModularLeanSummary>,
     /// Modular blocks detailed certificates if present.
     pub modular_blocks: Vec<plow_asset::ModularBlockProg>,
+    pub compile_checks: Vec<plow_asset::certificates::CompileCheckReceipt>,
+    pub logical_effect_gaps: Vec<(usize, String)>,
+    pub dependency_binding_gaps: Vec<(usize, String)>,
 }
 
 impl LeanReport {
@@ -7070,8 +7157,28 @@ impl LeanReport {
             reason: Some(reason.into()),
             modular_summary: None,
             modular_blocks: Vec::new(),
+            compile_checks: Vec::new(),
+            logical_effect_gaps: Vec::new(),
+            dependency_binding_gaps: Vec::new(),
         }
     }
+}
+
+pub(crate) fn write_lean_receipts(packet: &std::path::Path, lean: &LeanReport) {
+    use plow_asset::certificates::{PacketCheckReceipts, PACKET_CHECKS_FILE};
+    let bytes = std::fs::read(packet).expect("read emitted packet for check binding");
+    let compiler = std::fs::read(std::env::current_exe().expect("compiler executable path"))
+        .expect("read compiler executable for check binding");
+    let receipts = PacketCheckReceipts {
+        schema: 1,
+        packet_sha256: plow_asset::decode_objects::image_sha256(&bytes),
+        compiler_sha256: plow_asset::decode_objects::image_sha256(&compiler),
+        checks: lean.compile_checks.clone(),
+    };
+    receipts.validate_packet(&bytes).expect("compiler check receipt binding");
+    let path = packet.with_file_name(PACKET_CHECKS_FILE);
+    std::fs::write(&path, serde_json::to_vec(&receipts).expect("serialize compiler checks"))
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
 }
 
 /// Read-only verification hook for [`run_verified`], called with the finished
@@ -10065,6 +10172,7 @@ fn emit_dense_gqa(
     // Skipped when `arch` is empty (the legacy `gemma4` CLI), so that path's output
     // is unchanged.
     if !arch.is_empty() {
+        write_lean_receipts(std::path::Path::new(&out), &lean);
         let man = manifest::build_for_packet(&m, &arch, &lean, &sections);
         report_dispatch_audit(&man);
         report_segment_resource(&man);

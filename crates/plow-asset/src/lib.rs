@@ -15,6 +15,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod certificates;
+pub mod logical_effects;
+pub mod gemm_policy;
+
 // --- Shared domain enums -----------------------------------------------------
 
 /// Which inference phase a bucket serves.

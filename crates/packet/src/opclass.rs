@@ -58,7 +58,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
 
         IndexScore | IndexSelect | IndexScorePf | IndexSelectPf | IndexUnionPf
         | IndexScoreKpool => &["indexer"],
-        IndexTpPf => &["indexer", "native_route"],
+        IndexTpPf | IndexFp8Decode | IndexFp8Prefill => &["indexer", "native_route"],
 
         HeadNormRope | HeadNormRopeFp8 | QwenHeadNormRope => &["kv_write"],
 
@@ -98,14 +98,14 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | MoeGluMx
         | MoeDownMx
         | MoeGluMxPf
-        | MoeDownMxPf => &["moe"],
+        | MoeDownMxPf | MoeGluFp8Block128 | MoeQuantFp8Block128 | MoeDownFp8Block128 => &["moe"],
         MoeAiterFp8Pf => &["moe", "native_route"],
 
         Gemm | GemmNorm | GemmSmall | GemmMed | GemmGlu | GemmFp8 | GemmMedFp8 | GemmSmallFp8
         | GemmGluFp8 | GemmMxfp4 | GemmWide | GemmC5 | GemmMedMxfp4 | GemmSmallMxfp4
         | GemmWideMxfp4 | GemmC5Mxfp4 | GemmWideFp8 | GemmC5Fp8 | GemmFp8Blk | GemmGluMxfp4
         | GemmSplitK | GemmF32 | DenseGluFp8Blk | GemmAffineQ4 | Q8GemmF32 | DenseGemmF32
-        | Conv2dF32 => &["gemm"],
+        | Conv2dF32 | GemmFp8Block128 | GemmFp8Block128Split4 | MlaBmmFp8 => &["gemm"],
         GemmLtPf | GemmBlkPf => &["gemm", "native_route"],
 
         Gemv | GemvGlu | GemvQkv | GemvFp8 | GemvGluFp8 | GemvFp8Blk | GemvSz | GemvGluSz
@@ -123,9 +123,9 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
 
         Argmax | ArgmaxFin | GemvArgmax | RowGather | ArgmaxF32 => &["sample"],
 
-        Nop | Residual | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32 | CastF32Bf16
+        Nop | Residual | Sum4Bf16 | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32 | CastF32Bf16
         | PerLayerInput | ScaledAddF32 | GluF32 | SiluF32 | ReluF32 | BroadcastAddF32 | EmbedF16F32
-        | EmbedOverlayBf16 | PackNcfwRowsF32 => &["elementwise"],
+        | EmbedOverlayBf16 | PackNcfwRowsF32 | QuantFp8Block128 => &["elementwise"],
     }
 }
 

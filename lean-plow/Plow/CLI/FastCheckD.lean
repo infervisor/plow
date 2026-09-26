@@ -37,10 +37,10 @@ This module computes the SAME booleans with scalable structures:
   strictly stronger than the theorem needs and rejected legitimate packets
   (see `disjointFast`).
 
-The theorems in `Plow.Verify` continue to speak about the reference
-definitions; `checkD`/`checkF` call this module for execution. A formal
-equivalence proof between the two is future work — until then this module
-is part of the same trusted computing base as the JSON bridge itself.
+The theorems in `Plow.Verify` speak about the reference definitions.
+`checkD`/`checkF` use this module only as an early rejection filter; acceptance
+also requires the proven reference checker or checked address-path witnesses.
+A formal equivalence proof for this optimized implementation remains open.
 
 Cycles: a cyclic counter/resource graph (a deadlocking schedule) fails the
 topological sort here and is REJECTED with an explicit reason. The

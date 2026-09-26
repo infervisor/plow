@@ -95,6 +95,8 @@ pub const STRIDE_SITES: &[(DevOp, Slot)] = &[
     (DevOp::IndexSelectPf, Slot::I(2)),
     (DevOp::IndexUnionPf, Slot::I(2)),
     (DevOp::IndexTpPf, Slot::I(1)),
+    (DevOp::IndexFp8Decode, Slot::I(1)),
+    (DevOp::IndexFp8Prefill, Slot::I(1)),
 ];
 
 fn sites_for(op: u16) -> impl Iterator<Item = Slot> {
@@ -109,6 +111,8 @@ fn sites_for(op: u16) -> impl Iterator<Item = Slot> {
 pub enum Scaling {
     /// `bytes = k * ctx` for an integer `k`. Narrowing multiplies by `to/from`.
     Linear,
+    /// `[slot][ctx/16][2112]` FP8 index keys with F32 scale tails.
+    IndexerBlock16,
     /// A RoPE table materialised from a [`GenTensor`] whose `ctx` field is the
     /// row count. Narrowing rewrites the recipe, and the bytes follow from it.
     Rope,
@@ -184,7 +188,9 @@ pub fn tensor_scaling(name: &str) -> Scaling {
     }
     match rest.split_once('.') {
         Some((layer, suffix)) if layer.bytes().all(|b| b.is_ascii_digit()) => {
-            if KV_LINEAR.contains(&suffix) {
+            if !layer.is_empty() && suffix == "kidx_fp8" {
+                Scaling::IndexerBlock16
+            } else if KV_LINEAR.contains(&suffix) {
                 Scaling::Linear
             } else if KV_INERT.contains(&suffix) {
                 Scaling::Inert
@@ -199,7 +205,45 @@ pub fn tensor_scaling(name: &str) -> Scaling {
 /// Does `name` name a per-sequence cache this module narrows? The instructions
 /// that address one must carry a stride site — see [`check_stride_coverage`].
 pub fn is_narrowed_cache(name: &str) -> bool {
-    name.starts_with("kv.") && tensor_scaling(name) == Scaling::Linear
+    name.starts_with("kv.")
+        && matches!(tensor_scaling(name), Scaling::Linear | Scaling::IndexerBlock16)
+}
+
+pub fn indexer_prefix_bytes(rows: u32) -> u64 {
+    u64::from(rows.div_ceil(16)) * 2112
+}
+
+pub fn indexer_rescaled_bytes(bytes: u64, from: u32, to: u32) -> Option<u64> {
+    if from == 0 || to == 0 || from % 16 != 0 || to % 16 != 0 {
+        return None;
+    }
+    let slot = indexer_prefix_bytes(from);
+    if bytes == 0 || bytes % slot != 0 {
+        return None;
+    }
+    (bytes / slot).checked_mul(indexer_prefix_bytes(to))
+}
+
+#[cfg(test)]
+mod indexer_tests {
+    use super::*;
+
+    #[test]
+    fn packed_indexer_context_and_partial_prefix_geometry() {
+        assert_eq!(tensor_scaling("kv.6.kidx_fp8"), Scaling::IndexerBlock16);
+        assert!(is_narrowed_cache("kv.6.kidx_fp8"));
+        assert_eq!(tensor_scaling("kv..kidx_fp8"), Scaling::Unknown);
+        for (rows, bytes) in [(0, 0), (1, 2112), (15, 2112), (16, 2112), (17, 4224)] {
+            assert_eq!(indexer_prefix_bytes(rows), bytes);
+        }
+        assert_eq!(indexer_rescaled_bytes(64 * 131072 * 132, 131072, 81920), Some(64 * 81920 * 132));
+        for (bytes, from, to) in [(0, 16, 16), (2111, 16, 16), (2112, 0, 16),
+            (2112, 16, 0), (2112, 15, 16), (2112, 16, 17)] {
+            assert_eq!(indexer_rescaled_bytes(bytes, from, to), None);
+        }
+        let whole_slots = u64::MAX / 2112 * 2112;
+        assert_eq!(indexer_rescaled_bytes(whole_slots, 16, u32::MAX - 15), None);
+    }
 }
 
 /// `bytes` re-declared at the live bound `to`, for a [`Scaling::Linear`] tensor
@@ -218,6 +262,8 @@ pub fn is_rope_recipe(g: &GenTensor) -> bool {
     matches!(
         g.kind,
         GEN_ROPE_COS | GEN_ROPE_SIN | GEN_ROPE_IDX_COS | GEN_ROPE_IDX_SIN
+            | crate::rope::GEN_AMD_ROPE_BF16_COS | crate::rope::GEN_AMD_ROPE_BF16_SIN
+            | crate::rope::GEN_AMD_ROPE_IDX_BF16_COS | crate::rope::GEN_AMD_ROPE_IDX_BF16_SIN
     )
 }
 
@@ -387,4 +433,3 @@ pub fn residual_mask_builder(
             .next()
     })
 }
-

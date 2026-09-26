@@ -57,6 +57,9 @@ __device__ __forceinline__ mla_pf_bf16x4 mla_pf_ds_read_tr16(const bf16* p) {
 #ifndef FA_MLA_PF2_DEFER
 #define FA_MLA_PF2_DEFER 0
 #endif
+#ifndef FA_MLA_PF_SCALE_HOIST
+#define FA_MLA_PF_SCALE_HOIST 0
+#endif
 /* The historical row-per-lane K-phase map. The 8 that gfx942 picks is a gfx942 memory-system
  * measurement; CDNA4 has a different L1, LDS budget and wave-per-SIMD budget, so the same probe
  * has to be re-run here before the map changes under a shipped, tuned object. */

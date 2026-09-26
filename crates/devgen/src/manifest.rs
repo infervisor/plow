@@ -400,7 +400,12 @@ struct Shapes {
     /// arm it falls to never reads `t[7]`. The result is full causal attention where the model
     /// was trained sparse: no trap, no NaN, a fluent answer to a different question.
     glm_dsa_pf: bool,
+    /// Any `HeadNormRope` with pair_mode 3 (the fused DSA key prep) or dual `GemmSmall` (t4): a
+    /// pre-arm object runs the plain rope on the un-normed key / never writes the second GEMM.
+    /// PLOW_DSA_PREP.
+    dsa_prep: bool,
     dsa_decode_batch: bool,
+    dcp_index_canon: bool,
     dsa_select_local: bool,
     dsa_select_split: bool,
     mla_sparse_fp8: bool,
@@ -555,6 +560,9 @@ fn shapes(m: &Model) -> Shapes {
                         s.moe_pf_det = true;
                     }
                 }
+                DevOp::MoeGluFp8Block128 | DevOp::MoeDownFp8Block128 => {
+                    s.moe_enc.insert(crate::mla::MoeEnc::Fp8Blk as u32);
+                }
                 DevOp::MoeAiterFp8Pf => {
                     s.moe_aiter_fp8 = true;
                     s.moe_aiter_flat |= inst.i[6] == 1;
@@ -613,6 +621,9 @@ fn shapes(m: &Model) -> Shapes {
                     if op == DevOp::GemmMed && inst.t[5] != packet::TENSOR_NONE {
                         s.glm_fuse_post = true;
                     }
+                    if op == DevOp::GemmSmall && inst.t[4] != packet::TENSOR_NONE {
+                        s.dsa_prep = true;
+                    }
                     if inst.t[7] != packet::TENSOR_NONE {
                         s.linear_bias = true;
                     }
@@ -624,6 +635,7 @@ fn shapes(m: &Model) -> Shapes {
                     if inst.i[2] == 64 && inst.i[5] == packet::dev::ROPE_PAIR_HALF {
                         s.rope_half_hd64 = true;
                     }
+                    s.dsa_prep |= inst.i[5] == packet::dev::ROPE_PAIR_DSA_KPREP;
                 }
                 DevOp::FlashMerge => {
                     if inst.t[3] != packet::TENSOR_NONE {
@@ -632,6 +644,7 @@ fn shapes(m: &Model) -> Shapes {
                 }
                 DevOp::IndexSelect => {
                     s.dsa_decode_batch |= inst.i[3] != 0 || inst.i[4] != 0;
+                    s.dcp_index_canon |= inst.i[4] == 3;
                     s.dsa_select_local |= inst.i[4] == 1;
                     s.dsa_select_split |= inst.i[4] == 2;
                 }
@@ -707,6 +720,9 @@ fn shapes(m: &Model) -> Shapes {
 // That is the §4 shape reached by adding an arm; the single list is what makes the next
 // rung a one-line edit instead of two that can disagree.
 const FP8_WEIGHT_OPS: &[&str] = &[
+    "MlaBmmFp8",
+    "GemmFp8Block128",
+    "GemmFp8Block128Split4",
     "GemvFp8",
     "GemvQkvFp8",
     "GemvGluFp8",
@@ -766,6 +782,7 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
     );
     // w8a8 is the per-row ACTIVATION quant: `QuantFp8` exists only on that path.
     f.insert("w8a8".into(), json!(has("QuantFp8")));
+    f.insert("w8a8_block128".into(), json!(has("QuantFp8Block128")));
     f.insert(
         "qwen_gdn".into(),
         json!(union.iter().any(|a| a.op.starts_with("Qwen"))),
@@ -869,7 +886,9 @@ fn precision_axes(
             .any(|p| p.arms.iter().any(|a| a.op == "QuantFp8"))
     };
     let phase_present = |kind: &str| progs.iter().any(|p| p.kind == kind);
-    let act = if !has("QuantFp8") {
+    let act = if has("QuantFp8Block128") {
+        "mixed"
+    } else if !has("QuantFp8") {
         "bf16"
     } else if phase_present("prefill")
         && phase_present("decode")
@@ -959,7 +978,11 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     );
     f.insert("glm_ofold".into(), json!(s.glm_ofold));
     f.insert("glm_dsa_pf".into(), json!(s.glm_dsa_pf));
+    if s.dsa_prep {
+        f.insert("dsa_prep".into(), json!(true));
+    }
     f.insert("dsa_decode_batch".into(), json!(s.dsa_decode_batch));
+    f.insert("dcp_index_canon".into(), json!(s.dcp_index_canon));
     f.insert("dsa_select_local".into(), json!(s.dsa_select_local));
     f.insert("dsa_select_split".into(), json!(s.dsa_select_split));
     f.insert("mla_sparse_fp8".into(), json!(s.mla_sparse_fp8));
@@ -1229,6 +1252,9 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     if on("dsa_decode_batch") {
         req.push("PLOW_DSA_DECODE_BATCH=1".into());
     }
+    if on("dcp_index_canon") {
+        req.push("PLOW_DCP_INDEX_CANON=1".into());
+    }
     let mut rec = Vec::new();
     if let Some(v) = t.get("gv_mm_max").and_then(Value::as_u64) {
         rec.push(format!("GV_MM_MAX={v}"));
@@ -1330,6 +1356,26 @@ fn backend_amd(
     // the activation-quant arm, and emitting w8a16 for this target is refused upstream anyway.
     if on("fp8_weights") {
         req.push("PLOW_FP8=1".into());
+    }
+    if has("QuantFp8Block128") {
+        req.push("PLOW_HAS_QUANT_FP8_BLOCK128=1".into());
+    }
+    if has("GemmFp8Block128") {
+        req.push("PLOW_HAS_GEMM_FP8_BLOCK128=1".into());
+    }
+    if has("MlaBmmFp8") {
+        req.push("PLOW_HAS_MLA_BMM_FP8=1".into());
+    }
+    if has("GemmFp8Block128Split4") {
+        req.push("PLOW_HAS_GEMM_FP8_BLOCK128_SPLIT4=1".into());
+    }
+    if has("Sum4Bf16") {
+        req.push("PLOW_HAS_SUM4_BF16=1".into());
+    }
+    for (op, define) in [("MoeGluFp8Block128", "PLOW_HAS_MOE_GLU_FP8_BLOCK128=1"),
+        ("MoeQuantFp8Block128", "PLOW_HAS_MOE_QUANT_FP8_BLOCK128=1"),
+        ("MoeDownFp8Block128", "PLOW_HAS_MOE_DOWN_FP8_BLOCK128=1")] {
+        if has(op) { req.push(define.into()); }
     }
     if on("w8a8") {
         req.push("PLOW_W8A8=1".into());
@@ -1446,6 +1492,9 @@ fn backend_amd(
     if on("dsa_decode_batch") {
         req.push("PLOW_DSA_DECODE_BATCH=1".into());
     }
+    if on("dcp_index_canon") {
+        req.push("PLOW_DCP_INDEX_CANON=1".into());
+    }
     if on("mla_sparse_fp8") {
         req.push("PLOW_MLA_SPARSE_FP8=1".into());
     }
@@ -1458,6 +1507,9 @@ fn backend_amd(
     // which has no gathered arm for op 51 at all.
     if on("glm_dsa_pf") {
         req.push("PLOW_DSA_PF_ARM=1".into());
+    }
+    if on("dsa_prep") {
+        req.push("PLOW_DSA_PREP=1".into());
     }
     // A NoPE (zero-rope) MLA prefill needs the `d_flash_mla_prefill_v2<512, 0>` instantiation.
     // The arm is default-ON and costs nothing (same body at DR=0: identical VGPR/AGPR/LDS/spill,
@@ -1715,11 +1767,24 @@ fn lean_block(lean: &crate::LeanReport) -> Value {
         "verified": lean.verified,
         "oracle": lean.oracle,
         "rewrite_verified": lean.rewrite_verified,
+        "rewrite_scope": if !lean.rewrite_verified { "not_checked" }
+            else if lean.compile_checks.iter().any(|check|
+                check.scope == plow_asset::certificates::SemanticScope::RewriteBodyExpansion) {
+                "full_arity_rule_body_syntax_expansion"
+            } else { "name_catalog_only" },
+        "logical_effect_gaps": lean.logical_effect_gaps,
+        "dependency_binding_gaps": lean.dependency_binding_gaps,
+        "qualification": {
+            "floating_point_implementation": false,
+            "memory_effect_completeness": false,
+            "empirical_performance": false,
+        },
         "reason": lean.reason,
         "note": "`verified` = a Lean ordering certificate (plow_verify checkpoint D) was \
-                 obtained for EVERY program in this blob; `rewrite_verified` = egglog rewrite \
-                 rule soundness (checkpoint A) verified; `oracle` = the Lean decode \
-                 lower-bound query ran. false means NOT CHECKED (see `reason`), never \
+                 obtained for EVERY program in this blob; `rewrite_verified` = checkpoint A \
+                 checked at the stated `rewrite_scope`, not floating-point kernel implementation \
+                 correctness; `oracle` = a conditional Lean lower-bound query ran, not empirical \
+                 performance qualification. false means NOT CHECKED (see `reason`), never \
                  `checked and rejected` — a rejection aborts emission, so a blob with a \
                  rejected program never reaches disk and has no manifest.",
     });
@@ -2210,6 +2275,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
                     "persistent": d.compiled_persistent,
                 },
                 "qualified": d.selected_source == "qualified",
+                "measured_policy_obligation": d.measured_policy,
                 "selected": {
                     "algorithm": d.selected_algorithm,
                     "nsplit": d.selected_nsplit,
@@ -2283,6 +2349,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
         "n_cu": m.n_cu,
         // Before the large sections: plowrt's load check stops reading here.
         "knobs": crate::knob_spec::manifest_section(arch, m.n_cu, &backends),
+        "structural_cost_inputs": m.progs.iter().map(|p| crate::cost_inputs::program(m, p)).collect::<Vec<_>>(),
         "input_contract": {
             "kind": "token_ids",
             "modalities": ["text"],
@@ -2882,6 +2949,7 @@ mod tests {
             tensors: vec![],
             gq_stream: vec![],
             gq_seg_ofs: vec![],
+            reduction_witness: None,
             l2_sms: 0,
             l2_domains: 0,
         }
@@ -3457,6 +3525,29 @@ mod tests {
         assert_eq!(man2["features"]["w8a8"], true);
     }
 
+    #[test]
+    fn block128_projection_does_not_claim_whole_packet_w8a8() {
+        let m = Model {
+            n_cu: 256,
+            target: 0,
+            tensors: vec![],
+            progs: vec![prog(vec![
+                inst(DevOp::QuantFp8Block128, [0; 8]),
+                inst(DevOp::GemmFp8Block128, [0; 8]),
+            ])],
+            kv_row_insts: vec![],
+            prog_t: vec![16],
+            gen: vec![],
+        };
+        let man = build(&m, "gfx950");
+        assert_eq!(man["precision"]["weight_enc"], "fp8");
+        assert_eq!(man["precision"]["act_enc"], "mixed");
+        assert_eq!(man["features"]["w8a8"], false);
+        assert_eq!(man["features"]["w8a8_block128"], true);
+        assert!(man["backends"]["gfx950"]["requires"].as_array().unwrap()
+            .iter().any(|v| v == "PLOW_FP8=1"));
+    }
+
     /// The gfx950 backend renders the defines a covering object must carry. On AMD a missing arm
     /// does not trap — it writes nothing — so `requires` is the correctness half in a stronger
     /// sense than on NVIDIA.
@@ -3648,7 +3739,7 @@ mod tests {
 
     #[test]
     fn dsa_decode_batch_requires_a_row_aware_object() {
-        for (row, local) in [(0, 0), (1, 0), (7, 0), (0, 1)] {
+        for (row, local) in [(0, 0), (1, 0), (7, 0), (0, 1), (0, 3)] {
             let mut d = inst(DevOp::IndexSelect, [0; 8]);
             d.i[3] = row;
             d.i[4] = local;
@@ -3671,12 +3762,20 @@ mod tests {
             );
             assert_eq!(
                 req.iter().any(|r| r == "PLOW_DSA_SELECT_LOCAL=1"),
-                local != 0
+                local == 1
+            );
+            assert_eq!(
+                req.iter().any(|r| r == "PLOW_DCP_INDEX_CANON=1"),
+                local == 3
             );
             let nvcc = manifest["backends"]["nvcc"]["requires"].as_array().unwrap();
             assert_eq!(
                 nvcc.iter().any(|r| r == "PLOW_DSA_DECODE_BATCH=1"),
                 row != 0 || local != 0
+            );
+            assert_eq!(
+                nvcc.iter().any(|r| r == "PLOW_DCP_INDEX_CANON=1"),
+                local == 3
             );
             assert!(config_header(&manifest).contains(&format!(
                 "#define PLOW_PACKET_REQUIRES_DSA_DECODE_BATCH {}\n",
@@ -3863,6 +3962,36 @@ mod tests {
                 op.c_name()
             );
         }
+    }
+
+    #[test]
+    fn fp32_router_dispatch_is_not_prefill_only() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("runtime/amd/interp.hip");
+        let src = std::fs::read_to_string(path).unwrap();
+        let case = src.find("        case PLOW_DOP_GEMM_F32:").unwrap();
+        let prefill = src.find("#if PLOW_BUCKET_PREFILL || PLOW_MIXED_STEP").unwrap();
+        assert!(
+            case < prefill,
+            "decode router must not silently leave zero logits"
+        );
+    }
+
+    #[test]
+    fn paired_batched_decode_arms_grouped_experts() {
+        let src = include_str!("../../../runtime/amd/interp.hip");
+        let guard = src.find("#if PLOW_BUCKET_DECODE && PLOW_DECODE_INVENTORY_PRUNE && \\\n").unwrap();
+        let enabled = src[guard..].find("\n#define PLOW_MOE_PREFILL 1").unwrap() + guard;
+        for op in ["MOE_ROUTER_TOPK_PF", "MOE_ALIGN_PF", "MOE_GROUP_GLU_PF",
+                   "MOE_GROUP_DOWN_PF", "MOE_COMBINE_PF"] {
+            assert!(src[guard..enabled].contains(&format!("PLOW_HAS_{op}")));
+        }
+        let capability = src.find("#if PLOW_MOE_PREFILL\nextern").unwrap();
+        assert!(guard < capability);
+        assert_eq!(src.matches("#ifndef PLOW_MOE_PREFILL\n").count(), 1);
     }
 
     #[test]
@@ -4513,6 +4642,11 @@ mod tests {
         assert_eq!(man["lean"]["verified"], json!(true));
         assert_eq!(man["lean"]["oracle"], json!(true));
         assert_eq!(man["lean"]["reason"], Value::Null);
+        assert_eq!(man["lean"]["qualification"], json!({
+            "floating_point_implementation": false,
+            "memory_effect_completeness": false,
+            "empirical_performance": false,
+        }));
     }
 
     /// The two subsystems are INDEPENDENT (Correction 1). Disabling the
