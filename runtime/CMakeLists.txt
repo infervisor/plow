@@ -253,6 +253,16 @@ if(PLOW_CUDA)
     target_link_libraries(sm120_interp_op_test PRIVATE plow_interp_sm120 plow_runtime)
     add_test(NAME sm120_interp_ops COMMAND sm120_interp_op_test)
 
+    # FP32 speech arms (op_speech_f32.cuh) against the CPU golden f32_primitives.c.
+    # The golden is compiled here, not linked from plow_cpu_dev: -ffp-contract=off keeps its
+    # float sums as written, which the arms reproduce bit for bit.
+    add_executable(speech_f32_op_test tests/speech_f32_op_test.cu cpu/dev/golden/f32_primitives.c)
+    set_target_properties(speech_f32_op_test PROPERTIES CUDA_ARCHITECTURES "90a")
+    target_include_directories(speech_f32_op_test PRIVATE nvidia common cpu/dev)
+    target_compile_options(speech_f32_op_test PRIVATE $<$<COMPILE_LANGUAGE:C>:-O2 -ffp-contract=off>)
+    target_link_libraries(speech_f32_op_test PRIVATE m)
+    add_test(NAME speech_f32_ops COMMAND speech_f32_op_test)
+
     # NEGATIVE CONTROL AS A BUILD TARGET. The same test compiled with the naively
     # transliterated wave64 reduction offsets (__shfl_xor starting at 32 on a 32-lane warp).
     # It MUST fail: measured, it breaks 7 of 10 ops (HEADNORM_ROPE relL2 0.29, FLASH 0.50).
@@ -507,6 +517,7 @@ option(PLOW_SM120_CUBIN_FP8KV "Also emit the _fp8kv cubin variants (all enabled 
 option(PLOW_SM120_CUBIN_SEG "Also emit the _pfseg (fat) and _pfgemm (lean occ-2) segmented prefill cubins" OFF)
 option(PLOW_CUBIN_PACKED_PREFILL "Emit ordinary and packet-request ABI segmented prefill pairs" OFF)
 option(PLOW_CUBIN_ROUTED_DECODE "Also emit the _routed decode cubin for cuBLASLt-routed MoE rungs" OFF)
+option(PLOW_CUBIN_SPEECH "Also emit the _speech decode cubin carrying the FP32 speech arms (ASR encoder)" OFF)
 
 # GQA fusion factor for the FULL-attention (hd512) flash-decode instantiation.
 # Measured: GF_FULL should equal `gqa` when the full layers have kv_heads == 1
@@ -590,6 +601,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     set(_ax_packed_seg_gemm -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1 -DPLOW_NV_PACKED_REQUEST=1)
     # Second axis of the routed decode object: the decode axis minus the expert GEMV arms.
     set(_ax_routed -DPLOW_NV_DECODE_ROUTED=1)
+    set(_ax_speech -DPLOW_NV_SPEECH=1)
     if(PLOW_NV_PF_GEMV_HEAD)
         list(APPEND _ax_prefill -DPLOW_NV_PF_GEMV_HEAD=1)
         list(APPEND _ax_seg_fat -DPLOW_NV_PF_GEMV_HEAD=1)
@@ -653,6 +665,11 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
             string(LENGTH "${_vstem}_routed" _len_routed)
             list(APPEND _cubin_rows
                 "${_vstem}_routed|_Z${_len_routed}${_vstem}_routed11PlowProgram|_ax_decode|_ax_routed")
+        endif()
+        if(PLOW_CUBIN_SPEECH)
+            string(LENGTH "${_vstem}_speech" _len_speech)
+            list(APPEND _cubin_rows
+                "${_vstem}_speech|_Z${_len_speech}${_vstem}_speech11PlowProgram|_ax_decode|_ax_speech")
         endif()
         if(PLOW_SM120_CUBIN_FP8KV)
             list(APPEND _cubin_rows

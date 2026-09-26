@@ -2072,6 +2072,9 @@ fn build_cubin_from_manifest(
     // A speech packet ships its codec object next to the interpreter objects.
     args.push(format!("-DPLOW_TTS_SNAC={}", if speech { "ON" } else { "OFF" }));
     args.push(format!("-DPLOW_TTS_S3GEN={}", if t3 { "ON" } else { "OFF" }));
+    // An ASR packet's audio encoder runs the FP32 speech arms, which only the _speech object has.
+    let asr = pkt.with_file_name("encoder.pkt").is_file();
+    args.push(format!("-DPLOW_CUBIN_SPEECH={}", if asr { "ON" } else { "OFF" }));
 
     let out_dir = pkt.parent().map(PathBuf::from).unwrap_or_default();
     let config = pkt.with_file_name("plow_config.h");

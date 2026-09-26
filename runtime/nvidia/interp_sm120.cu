@@ -223,6 +223,12 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #include "op_mla.cuh"        /* MLA (DeepSeek/GLM/Kimi) latent decode + fused merge-fold (P1) */
 #include "op_dsa.cuh"        /* GLM DSA indexer: score (mma.sync) + top-k select (P3) */
 #include "op_elementwise.cuh"
+#ifndef PLOW_NV_SPEECH
+#define PLOW_NV_SPEECH 0
+#endif
+#if PLOW_NV_SPEECH
+#include "op_speech_f32.cuh"
+#endif
 #ifndef PLOW_NV_PREFILL
 #define PLOW_NV_PREFILL 0
 #endif
@@ -737,6 +743,8 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _fp8m1)
 #elif PLOW_NV_GEMV512_ROLE
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _gemv512)
+#elif PLOW_NV_SPEECH
+#define PLOW_SYM(n) PLOW_NV_CAT(n, _speech)
 #elif PLOW_NV_PREFILL && PLOW_NV_PACKED_REQUEST && PLOW_NV_SEG_GEMM
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _pfpackedgemm)
 #elif PLOW_NV_PREFILL && PLOW_NV_PACKED_REQUEST && PLOW_NV_FA_ONLY
@@ -943,12 +951,22 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #endif
 #define PLOW_NV_ARENA_FLOATS0                                                                 \
     (PLOW_NV_BASE_ARENA_FLOATS > PLOW_NV_M16_ARENA_FLOATS ? PLOW_NV_BASE_ARENA_FLOATS : PLOW_NV_M16_ARENA_FLOATS)
+#if PLOW_NV_SPEECH
+#define PLOW_NV_ARENA_FLOATS1                                                                 \
+    (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)
+#define PLOW_NV_ARENA_FLOATS                                                                  \
+    (PLOW_NV_ARENA_FLOATS1 > SP_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS1 : SP_ARENA_FLOATS)
+#else
 #define PLOW_NV_ARENA_FLOATS                                                                  \
     (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)
+#endif
 #endif
 #if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
 static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES,
               "FP8 decode WGMMA requires its full arena; incompatible role flags are unsupported");
+#endif
+#if PLOW_NV_SPEECH
+static_assert(PLOW_NV_ARENA_FLOATS >= SP_ARENA_FLOATS, "speech arms need their arena");
 #endif
 /* block_max_u64 needs PLOW_NV_WARPS u64 = 2*WARPS floats; block_sum needs WARPS floats. Both
  * fit inside the flash claim at any supported head dim, but the max above keeps that true if
@@ -1808,6 +1826,27 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                         (const float*)TEN(3), (const unsigned*)TEN(4), in->i[0], in->i[1], in->i[2],
                         in->i[3], slice, nblk);
         break;
+#if PLOW_NV_SPEECH
+    case PLOW_DOP_Q8_GEMM_F32:
+    case PLOW_DOP_LAYERNORM_F32:
+    case PLOW_DOP_SCALED_ADD_F32:
+    case PLOW_DOP_GLU_F32:
+    case PLOW_DOP_CAUSAL_DEPTHWISE_CONV1D_F32:
+    case PLOW_DOP_RELATIVE_ATTENTION_F32:
+    case PLOW_DOP_SILU_F32:
+    case PLOW_DOP_DENSE_GEMM_F32:
+    case PLOW_DOP_EMBED_F16_F32:
+    case PLOW_DOP_LSTM_CELL_F32:
+    case PLOW_DOP_ARGMAX_F32:
+    case PLOW_DOP_RELU_F32:
+    case PLOW_DOP_BROADCAST_ADD_F32:
+    case PLOW_DOP_CONV2D_F32:
+    case PLOW_DOP_PACK_NCFW_ROWS_F32:
+    case PLOW_DOP_GROUPED_ATTENTION_F32:
+    case PLOW_DOP_GEMM_F32:
+        d_speech_f32(in, T, slice, nblk, arena);
+        break;
+#endif
     case PLOW_DOP_EMBED_POS_BF16:
         d_embed_pos((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned*)TEN(2),
                     (const __nv_bfloat16*)TEN(3), (const unsigned*)TEN(4), (const unsigned*)TEN(5),

@@ -62,7 +62,7 @@ impl CudaPacketRuntime {
         let image = std::fs::read(&object).map_err(|source| RuntimeError::Io { path: object.clone(), source })?;
         let module = be.module_load(&image)?;
         let function = be.get_function(&module, SYMBOL)?;
-        let smem = be.module_global_u32(&module, "plow_arena_bytes")?.unwrap_or(12352);
+        let smem = be.module_global_u32(&module, "plow_arena_bytes_speech")?.unwrap_or(49152);
         if smem > 48 * 1024 {
             be.set_max_dynamic_smem(function, smem)?;
         }
