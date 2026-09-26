@@ -2323,13 +2323,19 @@ fn run_one_tick(
                 // are discarded). Remaining output budgets cap K. Any sampling adjustment
                 // falls through to the per-token path below.
                 let use_pipe = e.pipe_enabled() && gpu_pipe_rows(&feeds, &slots);
+                // Device-sampleable rows ride the quantum too when the sampler is loaded:
+                // `plow_sample` runs between each decode and advance.
+                let sampled_multi = e.multistep_sampling();
                 let use_multi = !use_pipe
                     && steps > 1
                     && e.multistep_quantum().is_some()
                     && feeds.iter().all(|&(i, _)| {
                         slots[i]
                             .as_ref()
-                            .map(|s| gpu_argmax_eligible(&s.gen.params))
+                            .map(|s| {
+                                gpu_argmax_eligible(&s.gen.params)
+                                    || (sampled_multi && dev_sample_spec(s).is_some())
+                            })
                             .unwrap_or(true)
                     });
                 if use_pipe {
@@ -2388,8 +2394,27 @@ fn run_one_tick(
                         steps as usize,
                         e.multistep_quantum().unwrap_or(1),
                     );
+                    let quantum = requested.min(e.multistep_quantum().unwrap_or(1));
+                    let mut specs: Vec<crate::exec::gpu::DevSample> = Vec::new();
+                    let mut draws: Vec<f32> = Vec::new();
+                    for &(i, _) in &feeds {
+                        if let Some(spec) = slots[i].as_ref().and_then(dev_sample_spec) {
+                            if specs.is_empty() {
+                                specs = vec![crate::exec::gpu::DevSample::greedy(); e.batch()];
+                                draws = vec![0.0; e.batch() * quantum];
+                            }
+                            specs[i] = spec;
+                            let slot = slots[i].as_ref().expect("fed slot");
+                            for k in 0..quantum {
+                                draws[i * quantum + k] = slot_rng01_at(slot, k);
+                            }
+                        }
+                    }
+                    let rng = |b: usize, k: usize| draws.get(b * quantum + k).copied().unwrap_or(0.0);
+                    let sample = (!specs.is_empty())
+                        .then_some((specs.as_slice(), &rng as &dyn Fn(usize, usize) -> f32));
                     let t_call = crate::obs::host::on().then(Instant::now);
-                    match e.multi_step_at_most(&feeds, requested, &mut toks) {
+                    match e.multi_step_sampled_at_most(&feeds, requested, sample, &mut toks) {
                         Ok(k) => {
                             let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                             decode_progress = completed_decode(&feeds, k);
@@ -4608,6 +4633,13 @@ fn gpu_prefill_advance(
 /// no-bucket reference path — i.e. only where there is no model to sample from.
 fn slot_rng01(slot: &Slot) -> f32 {
     crate::serve::seeded_unit_with(&slot.prompt_ids, &slot.out_ids, slot.step, slot.gen.seed)
+}
+
+/// The draw for the `k`-th token of a device multi-step quantum. Tokens produced inside the
+/// quantum are not on the host yet, so the draw keys on the quantum-start history and the step.
+#[cfg(feature = "cuda")]
+fn slot_rng01_at(slot: &Slot, k: usize) -> f32 {
+    crate::serve::seeded_unit_with(&slot.prompt_ids, &slot.out_ids, slot.step + k, slot.gen.seed)
 }
 
 /// Device-sampling eligibility for a slot (plan stage 4). `Some(spec)` when the

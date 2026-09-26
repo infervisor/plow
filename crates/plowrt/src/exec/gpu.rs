@@ -3108,18 +3108,24 @@ impl DevSample {
     }
 }
 
+/// Uniform draws per row the sampler slab holds: the widest sampled multi-step quantum.
+const SAMPLE_RNG_STEPS: usize = 64;
+
 /// Device sampler state: the `plow_sample` kernel + its per-slot parameter and
 /// scratch buffers, all sized to the engine batch × vocab at load.
 struct Sampler {
     f: KernelFn,
     _module: Module,
-    /// Pinned staging for the 5 per-slot param arrays `[temp|topk|topp|minp|rng]`
-    /// (each `batch` wide) — one async H2D per step.
+    /// Pinned staging for the per-slot param arrays `[temp|topk|topp|minp|rng]`
+    /// (each `batch` wide) — one async H2D per step. `rng` extends to
+    /// `[SAMPLE_RNG_STEPS][batch]`: a sampled multi-step quantum draws step k from row k.
     params: PinnedHost,
     /// Device copies of the 5 param arrays (contiguous, same layout as `params`).
     d_params: DeviceMem,
     /// `[batch][vocab]` f32 softmax-weight scratch the kernel reuses each pass.
     d_escratch: DeviceMem,
+    /// Block width the object was built for (`plow_sample_threads`; absent on older objects => 256).
+    threads: u32,
     #[allow(dead_code)]
     batch: usize,
 }
@@ -6148,8 +6154,10 @@ impl GpuEngine {
             .clone()
             .unwrap_or_else(|| "plow_sample".into());
         let f = be.get_function(&module, &kname)?;
-        let params = be.host_alloc_pinned(5 * batch * 4)?;
-        let d_params = be.alloc(0, (5 * batch * 4) as u64)?;
+        let threads = be.module_global_u32(&module, "plow_sample_threads")?.unwrap_or(256);
+        let slab = (4 + SAMPLE_RNG_STEPS) * batch * 4;
+        let params = be.host_alloc_pinned(slab)?;
+        let d_params = be.alloc(0, slab as u64)?;
         let d_escratch = be.alloc(0, (batch * vocab * 4) as u64)?;
         tracing::info!(cubin = %cubin.display(), "device sampler enabled (PLOW_DEV_SAMPLE=1)");
         Ok(Some(Sampler {
@@ -6158,6 +6166,7 @@ impl GpuEngine {
             params,
             d_params,
             d_escratch,
+            threads,
             batch,
         }))
     }
@@ -6733,11 +6742,11 @@ impl GpuEngine {
                     rng[b] = specs[b].rng01;
                 }
             }
-            let (sf, sdp, ses) = (smp.f, smp.d_params.base, smp.d_escratch.base);
+            let (sf, sdp, ses, sthreads) = (smp.f, smp.d_params.base, smp.d_escratch.base, smp.threads);
             // SAFETY: pinned slab lives on self past the synchronize.
             unsafe {
                 self.be
-                    .memcpy_htod_async(sdp, smp.params.as_slice(), &self.stream)?;
+                    .memcpy_htod_async(sdp, &smp.params.as_slice()[..5 * bsz * 4], &self.stream)?;
             }
             let dp = |k: u64| sdp + k * (bsz * 4) as u64;
             let mut a_logits = self.devp[self.t_logits].base;
@@ -6758,7 +6767,7 @@ impl GpuEngine {
                 &mut a_b as *mut u32 as *mut std::ffi::c_void,
             ];
             self.be
-                .launch_kernel(sf, bsz as u32, 256, 0, &mut a, Some(&self.stream))?;
+                .launch_kernel(sf, bsz as u32, sthreads, 0, &mut a, Some(&self.stream))?;
         }
 
         // Token readback: `in.ids` (rewritten by `ARGMAX_FIN`, or by the
@@ -7070,7 +7079,8 @@ impl GpuEngine {
     }
 
     /// Bounded device multi-step decode (plan stage 5; `PLOW_MULTISTEP=K`).
-    /// GREEDY only. Runs a K-token quantum for every fed row with ONE host
+    /// Greedy here; [`Self::multi_step_sampled_at_most`] adds device sampling.
+    /// Runs a K-token quantum for every fed row with ONE host
     /// sync: the host uploads ids/pos/kvlen ONCE, then enqueues
     /// `[memset → decode → advance] × K` on the stream — the `plow_advance`
     /// kernel advances each row's device-owned pos/kvlen and appends its token
@@ -7089,7 +7099,30 @@ impl GpuEngine {
         requested: usize,
         out: &mut Vec<u32>,
     ) -> Result<usize> {
+        self.multi_step_sampled_at_most(feeds, requested, None, out)
+    }
+
+    /// Whether a quantum can sample on the device (sampler loaded).
+    pub fn multistep_sampling(&self) -> bool {
+        self.sampler.is_some() && self.multistep.is_some()
+    }
+
+    /// [`Self::multi_step_at_most`] with device sampling: `sample = (specs, rng)` where `specs`
+    /// is batch-wide ([`Self::step_slots_sampled`]'s contract; `rng01` ignored) and `rng(slot,
+    /// k)` is the uniform for the row's k-th token of this quantum. `plow_sample` runs between
+    /// each decode and `plow_advance`, so the sampled token is what advance appends and feeds.
+    pub fn multi_step_sampled_at_most(
+        &mut self,
+        feeds: &[(usize, u32)],
+        requested: usize,
+        sample: Option<(&[DevSample], &dyn Fn(usize, usize) -> f32)>,
+        out: &mut Vec<u32>,
+    ) -> Result<usize> {
         out.clear();
+        let sample = sample.filter(|(specs, _)| specs.iter().any(|s| s.temp > 0.0));
+        if sample.is_some() && self.sampler.is_none() {
+            return Err(RuntimeError::Rejected("sampled multi-step needs the device sampler".into()));
+        }
         let Some(ms) = self.multistep.as_ref() else {
             return Err(RuntimeError::Rejected("multi-step not enabled".into()));
         };
@@ -7099,7 +7132,7 @@ impl GpuEngine {
             &self.pos,
             self.max_ctx,
             requested,
-            ms.quantum,
+            if sample.is_some() { ms.quantum.min(SAMPLE_RNG_STEPS) } else { ms.quantum },
         )
         .map_err(|error| RuntimeError::Rejected(error.to_string()))?;
         if k == 0 {
@@ -7172,11 +7205,71 @@ impl GpuEngine {
             )?;
         }
 
-        // Enqueue [memset → decode → advance] × K on the stream — no sync.
+        // Sampled quantum: params and all K rows of uniforms go up once.
+        let sampler_args = if let Some((specs, rng)) = sample {
+            debug_assert_eq!(specs.len(), bsz, "specs must be batch-wide");
+            let smp = self.sampler.as_mut().expect("checked");
+            {
+                let raw = smp.params.as_mut_slice();
+                let (s_temp, r) = raw.split_at_mut(bsz * 4);
+                let (s_topk, r) = r.split_at_mut(bsz * 4);
+                let (s_topp, r) = r.split_at_mut(bsz * 4);
+                let (s_minp, s_rng) = r.split_at_mut(bsz * 4);
+                let temp: &mut [f32] = bytemuck::cast_slice_mut(s_temp);
+                let topk: &mut [i32] = bytemuck::cast_slice_mut(s_topk);
+                let topp: &mut [f32] = bytemuck::cast_slice_mut(s_topp);
+                let minp: &mut [f32] = bytemuck::cast_slice_mut(s_minp);
+                let rngs: &mut [f32] = bytemuck::cast_slice_mut(&mut s_rng[..k * bsz * 4]);
+                for b in 0..bsz {
+                    temp[b] = specs[b].temp;
+                    topk[b] = specs[b].top_k;
+                    topp[b] = specs[b].top_p;
+                    minp[b] = specs[b].min_p;
+                    for step in 0..k {
+                        rngs[step * bsz + b] = if specs[b].temp > 0.0 { rng(b, step) } else { 0.0 };
+                    }
+                }
+            }
+            // SAFETY: pinned slab lives on self past the synchronize.
+            unsafe {
+                self.be.memcpy_htod_async(
+                    smp.d_params.base,
+                    &smp.params.as_slice()[..(4 + k) * bsz * 4],
+                    &self.stream,
+                )?;
+            }
+            Some((smp.f, smp.d_params.base, smp.d_escratch.base, smp.threads))
+        } else {
+            None
+        };
+
+        // Enqueue [memset → decode → (sample) → advance] × K on the stream — no sync.
         let advance_grid = (bsz as u32).div_ceil(256);
         for step in 0..k {
             self.reset_selected_decode_counters(rung)?;
             self.launch_selected_decode(rung)?;
+            if let Some((sf, sdp, ses, sthreads)) = sampler_args {
+                let dp = |j: u64| sdp + j * (bsz * 4) as u64;
+                let mut a_logits = self.devp[self.t_logits].base;
+                let mut a_ids = self.devp[self.t_ids].base;
+                let (mut a_temp, mut a_topk, mut a_topp, mut a_minp) = (dp(0), dp(1), dp(2), dp(3));
+                let (mut a_rng, mut a_es) = (dp(4 + step as u64), ses);
+                let (mut a_v, mut a_b) = (self.vocab as u32, bsz as u32);
+                let mut a = [
+                    &mut a_logits as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_ids as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_temp as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_topk as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_topp as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_minp as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_rng as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_es as *mut u64 as *mut std::ffi::c_void,
+                    &mut a_v as *mut u32 as *mut std::ffi::c_void,
+                    &mut a_b as *mut u32 as *mut std::ffi::c_void,
+                ];
+                self.be
+                    .launch_kernel(sf, bsz as u32, sthreads, 0, &mut a, Some(&self.stream))?;
+            }
             let mut a_ids = self.devp[self.t_ids].base;
             let mut a_pos = self.devp[self.t_pos].base;
             let mut a_kvl = self.devp[self.t_kvlen].base;
