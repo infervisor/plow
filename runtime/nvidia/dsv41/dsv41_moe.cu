@@ -311,94 +311,138 @@ DSV_MOE_GEMM(dsv_moe_gemm_fp4, 64)
 DSV_MOE_GEMM(dsv_moe_gemm_fp4_m32, 32)
 DSV_MOE_GEMM(dsv_moe_gemm_fp4_m16, 16)
 
-// Decode form of the grouped fp4 expert GEMM: the same math as dsv_moe_gemm_fp4 for tiles holding a
-// handful of rows, as one warp per output row streaming that row's packed weights (bandwidth-bound,
-// where the 64-row MMA tile would be almost all padding). Per 32-wide K block: the fp4 x e4m3
-// products are exact in fp32 (<= 6 significant bits), summed in fp32, then scaled by sa * sw into
-// the accumulator -- the MMA kernel's per-block promotion, in another summation order.
-// grid = (ceil(N / 8), tiles), 256 threads.
-__device__ __forceinline__ void e4m3x4_to_f32x4(uint32_t v, float* o) {
-    const __half2_raw lo = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(v & 0xffffu), __NV_E4M3);
-    const __half2_raw hi = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(v >> 16), __NV_E4M3);
-    const float2 a = __half22float2(*(const __half2*)&lo), b = __half22float2(*(const __half2*)&hi);
-    o[0] = a.x;
-    o[1] = a.y;
-    o[2] = b.x;
-    o[3] = b.y;
-}
-
-#define GV_ROWS 4  // output rows per warp: four independent weight streams in flight per lane
-DSV_EXTERN void __launch_bounds__(256)
+// Decode form of the grouped fp4 expert GEMM: swap-AB tensor-core GEMV. For tile i = (expert e, row0)
+// of dsv_moe_offsets at bm = 8 (up to 8 routed rows of one expert): the expert's weights are the
+// MMA's M side (16 rows per warp), the tile's rows its N side. A 32-wide K block of an fp4 row is only
+// 16 bytes, so lanes load 8 contiguous bytes at t4 * 8 of a PAIR of blocks (whole 32 B sectors per
+// instruction): lanes 0, 1 hold block 2j's bytes 0-7 / 8-15, lanes 2, 3 block 2j+1's, and one
+// shfl.xor 2 hands each lane the other block's half it needs. Lane t4 thus feeds block 2j with bytes
+// at off = (t4 & 1) * 8 + (t4 >> 1) * 4 and block 2j+1 with off = (t4 & 1) * 8 + (1 - (t4 >> 1)) * 4 --
+// permutations inside each block, mirrored on the activation side (8 bytes at 2 * off). The shift
+// decode gives the even elements (-> a0 / a1) and the odd ones (-> a2 / a3) as e4m3 * 2^-6, the
+// activation bytes are permuted to the same order (b0 = even, b1 = odd); each MMA is one scale block,
+// promoted with sa[tok][kb] * sw[e][n][kb] * 2^6 as dsv_moe_gemm_fp4. GVM_U block pairs are loaded
+// before any MMA; KB must be even. Block: 4 warps = 64 weight rows; grid = (ceil(N / 64),
+// max_tiles, ksplit); ksplit > 1 writes part [ksplit][nrows][N] f32 for dsv_splitk_reduce (in split
+// order, deterministic), else C bf16 directly.
+#ifndef GVM_U
+#define GVM_U 8
+#endif
+DSV_EXTERN void __launch_bounds__(128)
     dsv_moe_gemv_fp4(bf16* __restrict__ C, const uint8_t* __restrict__ A, const uint8_t* __restrict__ sa,
                      const uint8_t* __restrict__ W, const uint8_t* __restrict__ sw, const int* __restrict__ tiles,
                      const int* __restrict__ meta, const int* __restrict__ offs, const int* __restrict__ rows,
-                     int a_by_row, int N, int K, long long w_estride, long long sw_estride) {
+                     int a_by_row, int N, int K, long long w_estride, long long sw_estride, float* __restrict__ part, int nrows) {
     const int tile = blockIdx.y;
     if (tile >= meta[0]) return;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int nw = (blockIdx.x * 8 + warp) * GV_ROWS;  // this warp's first output row
-    if (nw >= N) return;
+    const int g = lane >> 2, t4 = lane & 3;
+    const int n0 = (blockIdx.x * 4 + warp) * 16;
+    if (n0 >= N) return;
     const int e = tiles[tile * 2], row0 = tiles[tile * 2 + 1];
-    const int R = min(offs[e + 1], row0 + 64) - row0;
+    const int R = min(offs[e + 1], row0 + 8) - row0;
     const int KB = K >> 5;
-    const uint8_t* wbase = W + (long long)e * w_estride + (long long)nw * (K / 2);
-    const uint8_t* sbase = sw + (long long)e * sw_estride + (long long)nw * KB;
-    const int nr = min(GV_ROWS, N - nw);
-    for (int tb = 0; tb < R; tb += 8) {
-        const int nt = min(8, R - tb);
-        int tok[8];
+    const int split = blockIdx.z, ksplit = gridDim.z;
+    const int KG = KB >> 4;  // 16-block granules: splits and batches start 8-byte aligned in the scale rows
+    const int kb0 = 16 * (int)((long long)KG * split / ksplit);
+    const int kb1 = split + 1 == ksplit ? KB : 16 * (int)((long long)KG * (split + 1) / ksplit);
+    const uint8_t* We = W + (long long)e * w_estride;
+    const uint8_t* Se = sw + (long long)e * sw_estride;
+    const int ra = min(n0 + g, N - 1), rb = min(n0 + g + 8, N - 1);
+    const uint8_t* w0 = We + (long long)ra * (K / 2) + t4 * 4;
+    const uint8_t* w1 = We + (long long)rb * (K / 2) + t4 * 4;
+    const uint8_t* s0p = Se + (long long)ra * KB;
+    const uint8_t* s1p = Se + (long long)rb * KB;
+    // this lane's B column (row g of the tile) and C columns (rows t4*2, t4*2+1)
+    const bool bv = g < R;
+    const int tb = bv ? (a_by_row ? row0 + g : rows[row0 + g]) : 0;
+    const uint8_t* ab = A + (long long)tb * K + t4 * 8;
+    int tc[2];
 #pragma unroll
-        for (int t = 0; t < 8; t++) tok[t] = t < nt ? (a_by_row ? row0 + tb + t : rows[row0 + tb + t]) : -1;
-        float acc[GV_ROWS][8];
+    for (int h = 0; h < 2; h++) {
+        const int r = t4 * 2 + h;
+        tc[h] = r < R ? (a_by_row ? row0 + r : rows[row0 + r]) : -1;
+    }
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    const bool hi_lane = t4 >= 2;
+    const int off_e = (t4 & 1) * 8 + (t4 >> 1) * 4, off_o = (t4 & 1) * 8 + (1 - (t4 >> 1)) * 4;
+    // scale bytes: weight rows g / g + 8 (s0 / s1) and the two C tokens (q0 / q1); 0 = the zero scale
+    const uint8_t* q0p = tc[0] >= 0 ? sa + (long long)tc[0] * KB : nullptr;
+    const uint8_t* q1p = tc[1] >= 0 ? sa + (long long)tc[1] * KB : nullptr;
+    auto block = [&](uint32_t wa, uint32_t wb, uint2 x, uint32_t s0, uint32_t s1, uint32_t q0, uint32_t q1) {
+        const uint32_t a[4] = {fp4x8_lo(wa), fp4x8_lo(wb), fp4x8_hi(wa), fp4x8_hi(wb)};
+        const uint32_t b[2] = {__byte_perm(x.x, x.y, 0x6420), __byte_perm(x.x, x.y, 0x7531)};
+        float tt[4] = {0.f, 0.f, 0.f, 0.f};
+        mma_e4m3_m(tt, a, b);
+        const float swa = e8m0_to_f(s0) * FP4_E4M3_UNSCALE, swb = e8m0_to_f(s1) * FP4_E4M3_UNSCALE;
+        const float sa0 = q0p ? e8m0_to_f(q0) : 0.f, sa1 = q1p ? e8m0_to_f(q1) : 0.f;
+        acc[0] += tt[0] * swa * sa0;
+        acc[1] += tt[1] * swa * sa1;
+        acc[2] += tt[2] * swb * sa0;
+        acc[3] += tt[3] * swb * sa1;
+    };
+    auto sbyte = [](uint2 v, int i) { return ((i < 4 ? v.x : v.y) >> (8 * (i & 3))) & 0xffu; };
+    // one pair of blocks (kb, kb + 1) from this lane's 8-byte loads of rows g / g + 8
+    auto pair = [&](uint2 va, uint2 vb, uint2 xe, uint2 xo, const uint32_t* s0, const uint32_t* s1, const uint32_t* q0,
+                    const uint32_t* q1) {
+        const uint32_t pa = __shfl_xor_sync(0xffffffffu, va.y, 2), pb = __shfl_xor_sync(0xffffffffu, vb.y, 2);
+        block(hi_lane ? pa : va.x, hi_lane ? pb : vb.x, xe, s0[0], s1[0], q0[0], q1[0]);
+        block(hi_lane ? va.x : pa, hi_lane ? vb.x : pb, xo, s0[1], s1[1], q0[1], q1[1]);
+    };
+    const uint8_t* ab_e = ab - t4 * 8 + off_e * 2;  // activation bytes for block 2j / 2j + 1
+    const uint8_t* ab_o = ab - t4 * 8 + off_o * 2 + 32;
+    const uint8_t* wp0 = w0 - t4 * 4 + t4 * 8;  // 8 bytes at t4 * 8 of each 32-byte block pair
+    const uint8_t* wp1 = w1 - t4 * 4 + t4 * 8;
+    int kb = kb0;
+    // batches of 8 block pairs (16 blocks): weights, activations and all their scale bytes issued first
+    static_assert(GVM_U == 8, "a batch is 16 blocks: two 8-byte scale loads per row");
+    for (; kb + 16 <= kb1; kb += 16) {
+        uint2 va[8], vb[8], xe[8], xo[8], sv0[2], sv1[2], sq0[2], sq1[2];
 #pragma unroll
-        for (int r = 0; r < GV_ROWS; r++)
-#pragma unroll
-            for (int t = 0; t < 8; t++) acc[r][t] = 0.f;
-        for (int kb = lane; kb < KB; kb += 32) {
-            uint4 raw[GV_ROWS];
-            float ws[GV_ROWS];
-#pragma unroll
-            for (int r = 0; r < GV_ROWS; r++) {  // all rows' loads issued before any arithmetic
-                raw[r] = r < nr ? *(const uint4*)(wbase + (long long)r * (K / 2) + kb * 16) : make_uint4(0, 0, 0, 0);
-                ws[r] = r < nr ? e8m0_to_f(sbase[(long long)r * KB + kb]) : 0.f;
-            }
-#pragma unroll
-            for (int r = 0; r < GV_ROWS; r++) {
-                // 32 weights as f32, via the exact fp4 -> e4m3 -> f16 path
-                float w[32];
-                const uint32_t rw[4] = {raw[r].x, raw[r].y, raw[r].z, raw[r].w};
-#pragma unroll
-                for (int q = 0; q < 4; q++) {
-                    e4m3x4_to_f32x4(e2m1x4_to_e4m3x4(rw[q] & 0xffffu), &w[q * 8]);
-                    e4m3x4_to_f32x4(e2m1x4_to_e4m3x4(rw[q] >> 16), &w[q * 8 + 4]);
-                }
-#pragma unroll
-                for (int t = 0; t < 8; t++) {
-                    if (tok[t] < 0) continue;
-                    const uint8_t* ap = A + (long long)tok[t] * K + kb * 32;
-                    const uint4 a0 = *(const uint4*)ap, a1 = *(const uint4*)(ap + 16);
-                    const uint32_t ra[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
-                    float d = 0.f;
-#pragma unroll
-                    for (int q = 0; q < 8; q++) {
-                        float a[4];
-                        e4m3x4_to_f32x4(ra[q], a);
-                        d = fmaf(w[q * 4 + 0], a[0], d);
-                        d = fmaf(w[q * 4 + 1], a[1], d);
-                        d = fmaf(w[q * 4 + 2], a[2], d);
-                        d = fmaf(w[q * 4 + 3], a[3], d);
-                    }
-                    acc[r][t] += d * e8m0_to_f(sa[(long long)tok[t] * KB + kb]) * ws[r];
-                }
-            }
+        for (int u = 0; u < 8; u++) {
+            const long long kp = (long long)(kb + 2 * u);
+            va[u] = __ldg((const uint2*)(wp0 + kp * 16));
+            vb[u] = __ldg((const uint2*)(wp1 + kp * 16));
+            xe[u] = bv ? *(const uint2*)(ab_e + kp * 32) : make_uint2(0, 0);
+            xo[u] = bv ? *(const uint2*)(ab_o + kp * 32) : make_uint2(0, 0);
         }
 #pragma unroll
-        for (int r = 0; r < GV_ROWS; r++)
+        for (int h = 0; h < 2; h++) {
+            sv0[h] = __ldg((const uint2*)(s0p + kb + 8 * h));
+            sv1[h] = __ldg((const uint2*)(s1p + kb + 8 * h));
+            sq0[h] = q0p ? *(const uint2*)(q0p + kb + 8 * h) : make_uint2(0, 0);
+            sq1[h] = q1p ? *(const uint2*)(q1p + kb + 8 * h) : make_uint2(0, 0);
+        }
 #pragma unroll
-            for (int t = 0; t < 8; t++) {
-                const float v = warp_sum(acc[r][t]);
-                if (lane == 0 && t < nt && r < nr) C[(long long)(row0 + tb + t) * N + nw + r] = f2bf(v);
+        for (int u = 0; u < 8; u++) {
+            uint32_t s0[2], s1[2], q0[2], q1[2];
+#pragma unroll
+            for (int d = 0; d < 2; d++) {
+                const int bi = 2 * u + d;  // block within the batch
+                s0[d] = sbyte(sv0[bi >> 3], bi & 7);
+                s1[d] = sbyte(sv1[bi >> 3], bi & 7);
+                q0[d] = sbyte(sq0[bi >> 3], bi & 7);
+                q1[d] = sbyte(sq1[bi >> 3], bi & 7);
             }
+            pair(va[u], vb[u], xe[u], xo[u], s0, s1, q0, q1);
+        }
+    }
+    for (; kb < kb1; kb += 2) {
+        const long long kp = kb;
+        const uint32_t s0[2] = {s0p[kb], s0p[kb + 1]}, s1[2] = {s1p[kb], s1p[kb + 1]};
+        const uint32_t q0[2] = {q0p ? q0p[kb] : 0u, q0p ? q0p[kb + 1] : 0u}, q1[2] = {q1p ? q1p[kb] : 0u, q1p ? q1p[kb + 1] : 0u};
+        pair(__ldg((const uint2*)(wp0 + kp * 16)), __ldg((const uint2*)(wp1 + kp * 16)),
+             bv ? *(const uint2*)(ab_e + kp * 32) : make_uint2(0, 0), bv ? *(const uint2*)(ab_o + kp * 32) : make_uint2(0, 0), s0, s1,
+             q0, q1);
+    }
+    // c0 (n g, row t4*2), c1 (n g, row t4*2+1), c2 (n g+8, row t4*2), c3 (n g+8, row t4*2+1)
+#pragma unroll
+    for (int q = 0; q < 4; q++) {
+        const int n = n0 + g + (q >> 1) * 8, r = t4 * 2 + (q & 1);
+        if (n >= N || r >= R) continue;
+        const long long o = (long long)(row0 + r) * N + n;
+        if (part) part[(long long)split * nrows * N + o] = acc[q];
+        else C[o] = f2bf(acc[q]);
     }
 }
 

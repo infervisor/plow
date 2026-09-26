@@ -82,6 +82,7 @@ TTFT under concurrency includes queueing behind other prefills.)
 | Hopper wgmma prefill GEMMs (`dsv41_wg.cu`): producer warpgroup decodes fp8 / fp4 weights to bf16 in 128B-swizzled smem (bit placement: e4m3 bits in bf16 position are the value * 2^-120, one bf16x2 multiply applies 2^(120+S)); A is the fake-quantized bf16 activation (`act_quant` fq); two consumer warpgroups on m64n256k16; mbarrier ring, cp.async with noinc arrive; scale loads prefetched a lookahead ahead | prefill 16k | 3916 ms (MoE 1574, W8A8 912, wo_a 413) | 2594 ms (MoE 893, dense 671) |
 | same, at 4k / 1k | prefill | 1095 / 367 ms | 818 / 338 ms |
 | decode W8A8 as a swap-AB tensor-core GEMV (weights on the MMA's M side straight from memory, tokens on N; a K permutation inside each scale block lets every lane load 8 contiguous bytes per row; split-K into the ordered reduce) for M <= 16 | decode B=1 | 22.9 ms (W8A8 6.3 ms, 0.87 TB/s) | 20.2 ms (bench_gemv.py: 2.3-3.2 TB/s on the large shapes) |
+| routed experts at decode (T <= 64) as a swap-AB tensor-core GEMV on 8-row expert tiles: lanes load 8 contiguous bytes over a PAIR of fp4 blocks (whole sectors; one shfl.xor hands over the other block's half), scale bytes prefetched per 16-block batch; bit-exact vs fp4_gemm | decode B=16 / 64 | 47.3 / 87.5 ms (16-row MMA tile, ~2.0 TB/s) | 44.6 / 83.9 ms (~2.3 TB/s: the fp4 decode + per-block promotion keep it near issue-bound) |
 
 The wgmma kernels are 1.6-1.8x the mma.sync ones (bench_wg.py: ~350 TFLOP/s dense, ~320 grouped
 fp4 at 16k rows) and bit-identical or at bf16 rounding against kernel.py (`test_kernels.py wg`); on
@@ -91,8 +92,8 @@ TFLOP/s with no loads and no decode, ~475 with the decode, ~500 with the loads -
 the bf16 operands' shared-memory traffic bound it; fp8 wgmma with per-32 promotion (DeepGEMM-style,
 two consumer warpgroups ping-ponging MMA and promotion) is the next step.
 
-Rungs after these (`/root/dsv41/results/rungs_v6.md`): prefill 1k / 4k / 16k 338 / 818 / 2594 ms
-(3032 / 5007 / 6316 tok/s); decode B=1 / 16 / 64 at ctx 1k 22.9 / 49.4 / 87.4 ms (44 / 324 / 733
+Rungs after these (`/root/dsv41/results/rungs_v8.md`): prefill 1k / 4k / 16k 338 / 819 / 2592 ms
+(3027 / 5002 / 6322 tok/s); decode B=1 / 16 / 64 at ctx 1k 20.1 / 44.6 / 83.9 ms (50 / 359 / 763
 tok/s).
 
 Open, ranked by that profile: prefill 16k is 35% grouped fp4 wgmma (312 TFLOP/s), 26% dense wgmma

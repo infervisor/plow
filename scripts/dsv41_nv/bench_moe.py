@@ -67,6 +67,7 @@ reps = 20
 
 def timed(f):
     f()
+    torch.cuda._sleep(50_000_000)  # hold the stream so the ctypes launches queue up back to back
     ev[0].record()
     for _ in range(reps):
         f()
@@ -104,12 +105,22 @@ for T in Ts:
               f"| rel err vs fp4_gemm {worst:.2e} {'PASS' if worst < 5e-3 else 'FAIL'}", flush=True)
         if bm == 64:
             C64, tiles64, meta64, offs64, rows64, mt64 = C, tiles, meta, offs, rows, max_tiles
-    if T <= 64:  # the decode (GEMV) form, on the 64-row tiles
+    if T <= 64:  # the decode (swap-AB GEMV) form, on 8-row tiles
+        offs8, tiles8, meta8, rows8, mt8, _ = route(idx, 8)
         C2 = torch.empty_like(C64)
-        gargs = [C2, xq.view(torch.uint8), xs.view(torch.uint8), w13, s13, tiles64, meta64, offs64, rows64, i32(0), i32(2 * MI), i32(H),
-                 i64(2 * MI * H // 2), i64(2 * MI * H // 32)]
-        grid = ((2 * MI + 31) // 32, mt64)
-        gms = timed(lambda: K.launch("dsv_moe_gemv_fp4", grid, (256,), gargs))
-        g_err = ((C2.float() - C64.float()).norm() / C64.float().norm()).item()
+        gargs = [C2, xq.view(torch.uint8), xs.view(torch.uint8), w13, s13, tiles8, meta8, offs8, rows8, i32(0), i32(2 * MI), i32(H),
+                 i64(2 * MI * H // 2), i64(2 * MI * H // 32), None, i32(n)]
+        grid = ((2 * MI + 63) // 64, mt8)
+        gms = timed(lambda: K.launch("dsv_moe_gemv_fp4", grid, (128,), gargs))
+        # against the reference per expert on the 8-row routing (moe_fill orders an expert's rows by
+        # atomics, so a row-for-row comparison with the 64-row routing is not meaningful)
+        o8, r8 = offs8.cpu(), rows8.cpu()
+        g_err = 0.0
+        for e in sorted(set(idx.flatten().tolist()))[:6]:
+            p0, p1 = int(o8[e]), int(o8[e + 1])
+            toks = r8[p0:p1].long().to(dev)
+            ref = kr.fp4_gemm(xq[toks].contiguous(), xs[toks].contiguous(), w13[e].view(torch.float4_e2m1fn_x2),
+                              s13[e].view(torch.float8_e8m0fnu), torch.float8_e8m0fnu, 32)
+            g_err = max(g_err, ((C2[p0:p1].float() - ref.float()).norm() / ref.float().norm()).item())
         print(f"T={T:5d} experts={n_exp:3d} rows={n:6d} gemv : {gms*1e3:8.1f} us  weights {wbytes/1e6:7.1f} MB -> {wbytes/gms/1e9:6.3f} TB/s  "
-              f"| rel diff vs mma {g_err:.2e} {'PASS' if g_err < 5e-3 else 'FAIL'}", flush=True)
+              f"| rel err vs fp4_gemm {g_err:.2e} {'PASS' if g_err < 5e-3 else 'FAIL'}", flush=True)

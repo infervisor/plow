@@ -737,7 +737,7 @@ impl Stage {
         // MMA tile height from the rows an expert holds on average: the tiles stream every weight
         // column once each, so padding rows cost decode and MMA work but no bandwidth
         let bm = match moe_bm(n as f64 / touched.max(1.0)) {
-            _ if gemv => 64,
+            _ if gemv => MOE_GEMV_BM,
             // the wgmma tiles read the bf16 activation copy, which quant() makes from WG_MIN_M rows
             MOE_WG_BM if t < WG_MIN_M || !self.wg => 64,
             b => b,
@@ -766,18 +766,14 @@ impl Stage {
                 &[A::P(gu), A::P(xq.2), A::P(ly.w13), A::P(ly.w13_s), A::P(tiles), A::P(meta), A::P(offs), A::P(rows), A::I(0), A::I((2 * mi) as i32), A::I(h as i32), A::L((2 * mi * h / 2) as i64), A::L((2 * mi * h / 32) as i64)],
             )?;
         } else {
-            let (name, grid, block, smem) = if gemv {
-                ("dsv_moe_gemv_fp4", [cdiv((2 * mi) as u64, 32), max_tiles as u32, 1], 256, 0)
+            let w13_args = [A::P(gu), A::P(xq.0), A::P(xq.1), A::P(ly.w13), A::P(ly.w13_s), A::P(tiles), A::P(meta), A::P(offs), A::P(rows), A::I(0), A::I((2 * mi) as i32), A::I(h as i32), A::L((2 * mi * h / 2) as i64), A::L((2 * mi * h / 32) as i64)];
+            if gemv {
+                let mut a = w13_args.to_vec();
+                a.extend([A::P(0), A::I(n as i32)]);
+                self.launch("dsv_moe_gemv_fp4", [cdiv((2 * mi) as u64, 64), max_tiles as u32, 1], 128, 0, &a)?;
             } else {
-                (moe_gemm_name(bm), [cdiv((2 * mi) as u64, 128), max_tiles as u32, 1], 128, moe_smem(h, bm))
-            };
-            self.launch(
-                name,
-                grid,
-                block,
-                smem,
-                &[A::P(gu), A::P(xq.0), A::P(xq.1), A::P(ly.w13), A::P(ly.w13_s), A::P(tiles), A::P(meta), A::P(offs), A::P(rows), A::I(0), A::I((2 * mi) as i32), A::I(h as i32), A::L((2 * mi * h / 2) as i64), A::L((2 * mi * h / 32) as i64)],
-            )?;
+                self.launch(moe_gemm_name(bm), [cdiv((2 * mi) as u64, 128), max_tiles as u32, 1], 128, moe_smem(h, bm), &w13_args)?;
+            }
         }
         let hq = self.arena.alloc((n * mi) as u64)?;
         let hs = self.arena.alloc((n * mi / 32) as u64)?;
@@ -801,18 +797,14 @@ impl Stage {
                 &[A::P(down), A::P(hfq), A::P(ly.w2), A::P(ly.w2_s), A::P(tiles), A::P(meta), A::P(offs), A::P(rows), A::I(1), A::I(h as i32), A::I(mi as i32), A::L((h * mi / 2) as i64), A::L((h * mi / 32) as i64)],
             )?;
         } else {
-            let (name, grid, block, smem) = if gemv {
-                ("dsv_moe_gemv_fp4", [cdiv(h as u64, 32), max_tiles as u32, 1], 256, 0)
+            let w2_args = [A::P(down), A::P(hq), A::P(hs), A::P(ly.w2), A::P(ly.w2_s), A::P(tiles), A::P(meta), A::P(offs), A::P(rows), A::I(1), A::I(h as i32), A::I(mi as i32), A::L((h * mi / 2) as i64), A::L((h * mi / 32) as i64)];
+            if gemv {
+                let mut a = w2_args.to_vec();
+                a.extend([A::P(0), A::I(n as i32)]);
+                self.launch("dsv_moe_gemv_fp4", [cdiv(h as u64, 64), max_tiles as u32, 1], 128, 0, &a)?;
             } else {
-                (moe_gemm_name(bm), [cdiv(h as u64, 128), max_tiles as u32, 1], 128, moe_smem(mi, bm))
-            };
-            self.launch(
-                name,
-                grid,
-                block,
-                smem,
-                &[A::P(down), A::P(hq), A::P(hs), A::P(ly.w2), A::P(ly.w2_s), A::P(tiles), A::P(meta), A::P(offs), A::P(rows), A::I(1), A::I(h as i32), A::I(mi as i32), A::L((h * mi / 2) as i64), A::L((h * mi / 32) as i64)],
-            )?;
+                self.launch(moe_gemm_name(bm), [cdiv(h as u64, 128), max_tiles as u32, 1], 128, moe_smem(mi, bm), &w2_args)?;
+            }
         }
         // shared expert (fp8 weights, no routing weight)
         let sgu = self.arena.alloc((t * 2 * mi * 2) as u64)?;
@@ -923,9 +915,10 @@ const MOE_WG_BM: usize = 128;
 /// wins 1.5x at 64 (4k tokens).
 const MOE_WG_MIN_ROWS: f64 = 48.0;
 
-/// Steps of at most this many tokens run the routed experts through `dsv_moe_gemv_fp4`. Off: the
-/// 16-row MMA tile streams the weights faster at every decode size (bench_moe.py).
-const MOE_GEMV_MAX_T: usize = 0;
+/// Steps of at most this many tokens run the routed experts through `dsv_moe_gemv_fp4` (swap-AB, 8-row
+/// expert tiles); above it the 16-row MMA tile (bench_moe.py).
+const MOE_GEMV_MAX_T: usize = 64;
+const MOE_GEMV_BM: usize = 8;
 
 /// K splits for a GEMM of `tiles` output tiles over `kb` 32-wide K blocks: enough blocks for about
 /// two waves on the 132 SMs, each split keeping at least 4 K blocks; 1 when the grid already fills.
