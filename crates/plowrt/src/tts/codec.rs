@@ -1,7 +1,8 @@
-//! The codec stage of a speech pipeline: the asset's `codec.pkt` (`codec.v1` driver: codes in,
-//! PCM out, one program per (batch, frames) capacity) on the packet runtime, driven by one worker
-//! thread. Pending jobs share each launch the way concurrent streams share LM decode steps; per-item
-//! valid lengths make a partly filled capacity decode exactly like its own size.
+//! The codec stage of a speech pipeline: a `codec.v1` packet (codes or speech tokens in, PCM out,
+//! one program or program sequence per (batch, frames) capacity: roles `decode.b{B}.f{F}` or
+//! `synth.b{B}.t{T}.{stage}`) on the packet runtime, driven by one worker thread. Pending jobs share
+//! each launch the way concurrent streams share LM decode steps; per-item valid lengths, seeds and
+//! voice indices make every item decode exactly as it would alone.
 
 use std::path::Path;
 use std::sync::mpsc;
@@ -17,6 +18,7 @@ struct Job {
     codes: Vec<i32>,
     frames: usize,
     seed: u64,
+    voice: u32,
     reply: tokio::sync::oneshot::Sender<Result<Vec<f32>, String>>,
 }
 
@@ -29,14 +31,19 @@ pub struct Codec {
     /// is final.
     pub window: usize,
     pub lookahead: usize,
+    /// Voice names in voice-index order (empty when the packet takes no voice).
+    pub voices: Vec<String>,
+    /// Optional packet parameters (e.g. a streaming schedule).
+    pub parameters: std::collections::BTreeMap<String, u64>,
 }
 
 struct Bound {
     runtime: Box<dyn crate::exec::packet_runtime::PacketRuntime>,
-    /// (batch, frames, program), ascending by batch * frames.
-    capacities: Vec<(usize, usize, usize)>,
+    /// (batch, frames, programs in order), ascending by batch * frames.
+    capacities: Vec<(usize, usize, Vec<usize>)>,
     codes: PacketTensor,
     seed: PacketTensor,
+    voice: Option<PacketTensor>,
     pcm: PacketTensor,
     /// Valid-length tensor and rows per frame at each time resolution.
     lengths: Vec<(PacketTensor, usize)>,
@@ -44,6 +51,8 @@ struct Bound {
     frame_samples: usize,
     window: usize,
     lookahead: usize,
+    voices: Vec<String>,
+    parameters: std::collections::BTreeMap<String, u64>,
 }
 
 impl Codec {
@@ -52,6 +61,11 @@ impl Codec {
         if !path.is_file() {
             return Err(format!("{} missing: emit it with PLOW_TTS_CODEC_DIR (docs/runtime/tts.md)", path.display()));
         }
+        Self::load_packet(&path)
+    }
+
+    pub fn load_packet(path: &Path) -> Result<Self, String> {
+        let path = path.to_path_buf();
         let (tx, rx) = mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = mpsc::channel();
         std::thread::Builder::new()
@@ -67,21 +81,29 @@ impl Codec {
                     bound.frame_samples,
                     bound.window,
                     bound.lookahead,
+                    bound.voices.clone(),
+                    bound.parameters.clone(),
                 );
                 let _ = ready_tx.send(Ok(info));
                 run(rx, bound);
             })
             .map_err(|e| e.to_string())?;
-        let (max_frames, frame_codes, frame_samples, window, lookahead) = ready_rx.recv().map_err(|e| e.to_string())??;
-        Ok(Codec { tx: Mutex::new(tx), max_frames, frame_codes, frame_samples, window, lookahead })
+        let (max_frames, frame_codes, frame_samples, window, lookahead, voices, parameters) =
+            ready_rx.recv().map_err(|e| e.to_string())??;
+        Ok(Codec { tx: Mutex::new(tx), max_frames, frame_codes, frame_samples, window, lookahead, voices, parameters })
     }
 
     /// `frames * frame_codes` codebook ids -> `frames * frame_samples` samples.
     pub async fn decode(&self, codes: Vec<i32>, frames: usize, seed: u64) -> Result<Vec<f32>, String> {
+        self.decode_voice(codes, frames, seed, 0).await
+    }
+
+    /// [`Self::decode`] for the packet's voice `voice` (an index into [`Self::voices`]).
+    pub async fn decode_voice(&self, codes: Vec<i32>, frames: usize, seed: u64, voice: u32) -> Result<Vec<f32>, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .lock()
-            .send(Job { codes, frames, seed, reply })
+            .send(Job { codes, frames, seed, voice, reply })
             .map_err(|_| "codec worker stopped".to_string())?;
         rx.await.map_err(|_| "codec worker dropped the job".to_string())?
     }
@@ -94,16 +116,33 @@ fn bind(path: &Path) -> Result<Bound, String> {
     let asset = PacketAsset::load(path).map_err(e)?;
     let pipeline = asset.bind_driver(DRIVER, runtime.as_ref()).map_err(e)?;
     let param = |k: &str| pipeline.parameter(k).map(|v| v as usize).map_err(e);
-    let mut capacities = Vec::new();
+    let mut sequences: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> = Default::default();
     for (role, program) in pipeline.programs() {
-        let dims = role
-            .strip_prefix("decode.b")
-            .and_then(|r| r.split_once(".f"))
-            .and_then(|(b, f)| Some((b.parse::<usize>().ok()?, f.parse::<usize>().ok()?)));
-        if let Some((b, f)) = dims {
-            capacities.push((b, f, program));
+        let parts: Vec<&str> = role.split('.').collect();
+        let dims = |b: &str, u: &str, bp: &str, up: &str| {
+            Some((b.strip_prefix(bp)?.parse::<usize>().ok()?, u.strip_prefix(up)?.parse::<usize>().ok()?))
+        };
+        match parts.as_slice() {
+            ["decode", b, f] => {
+                if let Some(key) = dims(b, f, "b", "f") {
+                    sequences.entry(key).or_default().push((0, program));
+                }
+            }
+            ["synth", b, t, stage] => {
+                if let (Some(key), Ok(stage)) = (dims(b, t, "b", "t"), stage.parse::<usize>()) {
+                    sequences.entry(key).or_default().push((stage, program));
+                }
+            }
+            _ => {}
         }
     }
+    let mut capacities: Vec<(usize, usize, Vec<usize>)> = sequences
+        .into_iter()
+        .map(|((b, f), mut stages)| {
+            stages.sort();
+            (b, f, stages.into_iter().map(|(_, p)| p).collect())
+        })
+        .collect();
     if capacities.is_empty() {
         return Err("codec packet declares no decode capacity".into());
     }
@@ -119,6 +158,14 @@ fn bind(path: &Path) -> Result<Bound, String> {
         frame_samples: param("codec.frame_samples")?,
         window: param("stream.window_frames")?,
         lookahead: param("stream.lookahead_frames")?,
+        voice: pipeline.tensor("voice").ok(),
+        voices: pipeline.optional_string("voices").map(|v| v.lines().map(str::to_owned).collect()).unwrap_or_default(),
+        parameters: asset
+            .pipelines()
+            .iter()
+            .find(|p| p.driver == DRIVER)
+            .map(|p| p.parameters.clone())
+            .unwrap_or_default(),
         lengths,
         capacities,
         runtime,
@@ -127,14 +174,15 @@ fn bind(path: &Path) -> Result<Bound, String> {
 
 impl Bound {
     /// The smallest capacity holding `batch` items of `frames` frames.
-    fn capacity(&self, batch: usize, frames: usize) -> Option<(usize, usize, usize)> {
-        self.capacities.iter().copied().find(|&(b, f, _)| b >= batch && f >= frames)
+    fn capacity(&self, batch: usize, frames: usize) -> Option<&(usize, usize, Vec<usize>)> {
+        self.capacities.iter().find(|&&(b, f, _)| b >= batch && f >= frames)
     }
 
     fn decode(&mut self, jobs: &[Job]) -> Result<Vec<Vec<f32>>, String> {
         let frames = jobs.iter().map(|j| j.frames).max().unwrap_or(0);
-        let (cb, cf, program) = self
+        let (cb, cf, programs) = self
             .capacity(jobs.len(), frames)
+            .cloned()
             .ok_or_else(|| format!("{} x {frames} frames exceeds every codec capacity", jobs.len()))?;
         let fc = self.frame_codes;
         let mut codes = vec![0u32; self.codes.bytes / 4];
@@ -157,7 +205,14 @@ impl Bound {
             seeds[i] = j.seed;
         }
         self.runtime.write_tensor(self.seed, bytemuck::cast_slice(&seeds)).map_err(e)?;
-        self.runtime.run(program).map_err(e)?;
+        if let Some(voice) = self.voice {
+            let mut v = vec![0u32; voice.bytes / 4];
+            for (i, j) in jobs.iter().enumerate() {
+                v[i] = j.voice;
+            }
+            self.runtime.write_tensor(voice, bytemuck::cast_slice(&v)).map_err(e)?;
+        }
+        self.runtime.run_sequence(&programs).map_err(e)?;
         let mut pcm = vec![0f32; self.pcm.bytes / 4];
         self.runtime.read_tensor(self.pcm, bytemuck::cast_slice_mut(&mut pcm)).map_err(e)?;
         let per = cf * self.frame_samples;
