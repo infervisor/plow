@@ -622,6 +622,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_DEV_SAMPLE", Some("PLOW_DEV_SAMPLE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DSA_VERIFY_CKPT", Some("PLOW_DSA_VERIFY_CKPT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DSV41_PROFILE", Some("PLOW_DSV41_PROFILE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_DSV41_NO_WG", Some("PLOW_DSV41_NO_WG"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_DSA_VERIFY_OUT", Some("PLOW_DSA_VERIFY_OUT"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_GPU_ASSETS", Some("PLOW_GPU_ASSETS"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_LADDER_DEBUG", Some("PLOW_LADDER_DEBUG"), Layer::RawEnv, Domain::Str, UNSET, DIAG),

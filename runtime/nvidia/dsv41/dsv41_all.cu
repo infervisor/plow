@@ -5,3 +5,4 @@
 #include "dsv41_misc.cu"
 #include "dsv41_index.cu"
 #include "dsv41_moe.cu"
+#include "dsv41_wg.cu"

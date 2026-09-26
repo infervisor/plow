@@ -403,12 +403,13 @@ DSV_EXTERN void __launch_bounds__(256)
 }
 
 // SwiGLU (model.py Expert.forward) fused with the down projection's act_quant:
-// h = bf16(silu(min(g, lim)) * clamp(u, -lim, lim) * w), then e4m3 per 32 with a ue8m0 scale.
+// h = bf16(silu(min(g, lim)) * clamp(u, -lim, lim) * w), then e4m3 per 32 with a ue8m0 scale; fq
+// (optional) takes the dequantized bf16 [R][I] for the wgmma GEMMs.
 // gate [R][I] / up [R][I] bf16 (separate buffers, or one with up_off), w optional per-row weight.
 // One warp per 32-element group.
 DSV_EXTERN void dsv_swiglu_quant(uint8_t* __restrict__ q, uint8_t* __restrict__ s, const bf16* __restrict__ gate,
                                  const bf16* __restrict__ up, long long ld, const float* __restrict__ w, int R, int I,
-                                 float lim, const int* __restrict__ nrows) {
+                                 float lim, const int* __restrict__ nrows, bf16* __restrict__ fq) {
     const int lane = threadIdx.x & 31;
     const long long gi = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     const int R_eff = nrows ? *nrows : R;
@@ -427,8 +428,10 @@ DSV_EXTERN void dsv_swiglu_quant(uint8_t* __restrict__ q, uint8_t* __restrict__ 
     float amax = warp_max(fabsf(v));
     amax = fmaxf(amax, 1e-4f);
     const float sc = fast_pow2(fast_log2_ceil(amax * (1.0f / 448.0f)));
-    q[(long long)r * I + b * 32 + lane] = f_to_e4m3(fminf(fmaxf(v / sc, -448.f), 448.f));
+    const uint8_t code = f_to_e4m3(fminf(fmaxf(v / sc, -448.f), 448.f));
+    q[(long long)r * I + b * 32 + lane] = code;
     if (lane == 0) s[(long long)r * kg + b] = f_to_e8m0_pow2(sc);
+    if (fq) fq[(long long)r * I + b * 32 + lane] = f2bf(e4m3_to_f(code) * sc);
 }
 
 // y[t] = bf16( sum over the token's topk slots in ascending expert order of f32(down[rowpos]) + f32(shared[t]) ).

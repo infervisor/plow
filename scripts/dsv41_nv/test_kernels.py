@@ -160,7 +160,7 @@ if want("hc_mix"):
         pre = torch.empty(T, 4, device=dev, dtype=torch.float32)
         post = torch.empty(T, 4, device=dev, dtype=torch.float32)
         comb = torch.empty(T, 4, 4, device=dev, dtype=torch.float32)
-        K.launch("dsv_hc_mix_finish", ((T + 127) // 128,), (128,),
+        K.launch("dsv_hc_mix_finish", ((T + 7) // 8,), (128,),
                  [pre, post, comb, part, i32(S), i32(T), i32(Kd), scale, base, i32(20), f32(1e-20), f32(1e-6)])
         # reference: model.py Block.hc_mixes + kernel.py hc_split_sinkhorn, in torch
         xf = x.float()
@@ -177,6 +177,105 @@ if want("hc_mix"):
         check(f"hc_mix T={T} splits={S}", e < 1e-4, f"rel={e:.3g}")
 
 # ------------------------------------------------------------------------------------------ split-K
+if want("wg"):
+    # wgmma prefill GEMMs (dsv41_wg.cu): dense fp8 against fp8_gemm with ragged M / N edges and f32 or
+    # bf16 out, the batched wo_a form against per-group launches, grouped fp4 in both A modes
+    kr = ref_kernels()
+    WG_SMEM = 3 * (128 * 64 * 2 + 256 * 64 * 2 + 256 * 80) + 3 * 3 * 8 + 128 * 4 + 1024
+
+    def wg_fp8(c, a, w, ws, M, N, Kd, lda, ldc, f32o, batch=1, strides=(0, 0, 0, 0)):
+        K.launch("dsv_gemm_wg_fp8", ((N + 255) // 256, (M + 127) // 128, batch), (384,),
+                 [c, a, w, ws, i32(M), i32(N), i32(Kd), i64(lda), i64(ldc), i32(f32o)] + [i64(v) for v in strides], smem=WG_SMEM)
+
+    for M, N, Kd, f32o in ((300, 640, 1024, 1), (129, 256, 5120, 0), (1000, 1280, 4096, 1)):
+        x = torch.randn(M, Kd, device=dev)
+        w = (torch.randn(N, Kd, device=dev) * 0.05).to(torch.float8_e4m3fn)
+        ws = torch.randint(118, 124, ((N + 31) // 32, Kd // 32), device=dev, dtype=torch.uint8)
+        xq, xs = kr.act_quant(x.bfloat16(), 32, "ue8m0", torch.float8_e8m0fnu)
+        fq = (xq.float() * xs.float().repeat_interleave(32, 1)).bfloat16()
+        ref = kr.fp8_gemm(xq, xs, w, ws.view(torch.float8_e8m0fnu), torch.float8_e8m0fnu, 32).float()
+        c = torch.empty(M, N, device=dev, dtype=torch.float32 if f32o else torch.bfloat16)
+        wg_fp8(c, fq, w.view(torch.uint8), ws, M, N, Kd, Kd, N, f32o)
+        r = rel(c.float(), ref)
+        check(f"wg_fp8 M={M} N={N} K={Kd} f32={f32o}", r < 3e-3, f"rel vs fp8_gemm={r:.3g}")
+    # batched: G groups of (T x KG) . (OR x KG)^T side by side, as wo_a
+    T, G, OR, KG = 300, 4, 512, 1024
+    o = torch.randn(T, G * KG, device=dev).bfloat16()
+    wa = (torch.randn(G * OR, KG, device=dev) * 0.05).to(torch.float8_e4m3fn)
+    was = torch.randint(118, 124, (G * OR // 32, KG // 32), device=dev, dtype=torch.uint8)
+    cb = torch.empty(T, G * OR, device=dev, dtype=torch.bfloat16)
+    wg_fp8(cb, o, wa.view(torch.uint8), was, T, OR, KG, G * KG, G * OR, 0, G, (OR * KG, (OR // 32) * (KG // 32), KG, OR))
+    worst = 0.0
+    for g in range(G):
+        cg = torch.empty(T, OR, device=dev, dtype=torch.bfloat16)
+        wg_fp8(cg, o[:, g * KG:(g + 1) * KG].contiguous(), wa.view(torch.uint8)[g * OR:(g + 1) * OR].contiguous(),
+               was[g * OR // 32:(g + 1) * OR // 32].contiguous(), T, OR, KG, KG, OR, 0)
+        worst = max(worst, rel(cb[:, g * OR:(g + 1) * OR].float(), cg.float()))
+    check(f"wg_fp8 batched G={G}", worst == 0.0, f"rel vs per-group={worst:.3g}")
+    # grouped fp4: 3 experts with 5 / 130 / 0 / 260 rows, A gathered through rows vs pre-gathered
+    E, N, Kd, BM = 4, 512, 1024, 128
+    counts = [5, 130, 0, 260]
+    n = sum(counts)
+    offs = torch.tensor([0] + list(torch.tensor(counts).cumsum(0)), dtype=torch.int32, device=dev)
+    tl = []
+    for e in range(E):
+        for r0 in range(int(offs[e]), int(offs[e + 1]), BM):
+            tl += [e, r0]
+    tiles = torch.tensor(tl, dtype=torch.int32, device=dev)
+    meta = torch.tensor([len(tl) // 2], dtype=torch.int32, device=dev)
+    ntok = 200
+    rows = torch.randint(0, ntok, (n,), dtype=torch.int32, device=dev)
+    x = torch.randn(ntok, Kd, device=dev).bfloat16()
+    xq, xs = kr.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
+    fq = (xq.float() * xs.float().repeat_interleave(32, 1)).bfloat16()
+    w4 = torch.randint(0, 256, (E, N, Kd // 2), dtype=torch.uint8, device=dev)
+    s4 = torch.randint(118, 124, (E, N, Kd // 32), dtype=torch.uint8, device=dev)
+    C = torch.full((n, N), float("nan"), device=dev, dtype=torch.bfloat16)
+    C2 = torch.full((n, N), float("nan"), device=dev, dtype=torch.bfloat16)
+    for out, a, by_row in ((C, fq, 0), (C2, fq[rows.long()].contiguous(), 1)):
+        K.launch("dsv_moe_gemm_wg_fp4", ((N + 255) // 256, len(tl) // 2), (384,),
+                 [out, a, w4, s4, tiles, meta, offs, rows, i32(by_row), i32(N), i32(Kd), i64(N * Kd // 2), i64(N * Kd // 32)], smem=WG_SMEM)
+    worst = 0.0
+    for e in range(E):
+        p0, p1 = int(offs[e]), int(offs[e + 1])
+        if p1 == p0:
+            continue
+        toks = rows[p0:p1].long()
+        ref = kr.fp4_gemm(xq[toks].contiguous(), xs[toks].contiguous(), w4[e].view(torch.float4_e2m1fn_x2),
+                          s4[e].view(torch.float8_e8m0fnu), torch.float8_e8m0fnu, 32)
+        worst = max(worst, rel(C[p0:p1].float(), ref.float()))
+    check("wg_fp4 grouped (gathered A)", worst < 3e-3 and not C.isnan().any().item(), f"rel vs fp4_gemm={worst:.3g}")
+    check("wg_fp4 grouped (a_by_row == gathered)", torch.equal(C, C2))
+
+if want("sparse_split"):
+    # split-KV sparse attention + merge against the unsplit kernel: decode rows over a window ring
+    # and compressed picks, with -1 holes and one row that has no valid index (sink-only zeros)
+    SA_SMEM = (64 * 520 + 64 * 520 + 64 * 72) * 2 + 4 * 64 * 4 * 2 + 64 * 4
+    H, D, Wn, Nc = 64, 512, 128, 512
+    for T in (1, 3):
+        n_idx = Wn + Nc
+        q = torch.randn(T, H, D, device=dev, dtype=torch.bfloat16)
+        win = [torch.randn(Wn, D, device=dev, dtype=torch.bfloat16) for _ in range(T)]
+        cmp = [torch.randn(4096, D, device=dev, dtype=torch.bfloat16) for _ in range(T)]
+        idx = torch.cat([torch.arange(Wn, device=dev).repeat(T, 1),
+                         Wn + torch.randint(0, 4096, (T, Nc), device=dev)], 1).int()
+        idx[:, 5:40] = -1
+        if T > 1:
+            idx[1] = -1
+        wp = torch.tensor([w.data_ptr() for w in win], dtype=torch.uint64, device=dev)
+        cp = torch.tensor([c.data_ptr() for c in cmp], dtype=torch.uint64, device=dev)
+        sink = torch.randn(H, device=dev, dtype=torch.float32)
+        base = torch.empty(T, H, D, device=dev, dtype=torch.bfloat16)
+        args = [idx, i32(n_idx), wp, cp, i32(Wn), i32(1), sink, f32(D ** -0.5)]
+        K.launch("dsv_sparse_attn", (T, 1), (512,), [base, q] + args + [None], smem=SA_SMEM)
+        for S in (2, 4, 11):
+            part = torch.empty(T, S, H, D + 4, device=dev, dtype=torch.float32)
+            o = torch.empty(T, H, D, device=dev, dtype=torch.bfloat16)
+            K.launch("dsv_sparse_attn", (T, S), (512,), [o, q] + args + [part], smem=SA_SMEM)
+            K.launch("dsv_sparse_attn_merge", (T, H), (128,), [o, part, i32(S), sink])
+            r = rel(o.float(), base.float())
+            check(f"sparse_attn split-KV T={T} S={S}", r < 1e-2 and torch.isfinite(o.float()).all().item(), f"rel vs unsplit={r:.3g}")
+
 if want("splitk"):
     kr = ref_kernels()
     for M, N, Kd, ks in ((9, 5120, 8192, 4), (1, 1280, 5120, 8)):

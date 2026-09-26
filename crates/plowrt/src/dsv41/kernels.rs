@@ -15,7 +15,7 @@ use crate::device::Backend;
 use crate::error::{Result, RuntimeError};
 
 /// Must equal `dsv41_abi_version` in `runtime/nvidia/dsv41/dsv41_common.cuh`.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// One kernel argument, held by value until the launch copies it.
 #[derive(Clone, Copy)]
@@ -44,6 +44,9 @@ pub const fn moe_gemm_name(bm: usize) -> &'static str {
 pub const MOE_SMEM_MAX_K: usize = 8192;
 /// `W8_SMEM` in dsv41_gemm.cu: the W8A8 GEMM's three 128-K stages of A (64 rows) and W (128 rows).
 pub const W8_SMEM: u32 = 3 * (64 + 128) * 144;
+/// `WG_SMEM` in dsv41_wg.cu: three stages of the bf16 A (128 x 64) and B (256 x 64) tiles and the raw
+/// weight staging, the mbarriers, the tile's row table and the 1 KiB alignment slack.
+pub const WG_SMEM: u32 = 3 * (128 * 64 * 2 + 256 * 64 * 2 + 256 * 80) + 3 * 3 * 8 + 128 * 4 + 1024;
 pub const SA_SMEM: u32 = ((64 * 520 + 64 * 520 + 64 * 72) * 2 + 4 * 64 * 4 * 2 + 64 * 4) as u32;
 
 const MAX_ARGS: usize = 24;
@@ -60,6 +63,7 @@ const NAMES: &[&str] = &[
     "dsv_gemm_f32_rows",
     "dsv_rope",
     "dsv_sparse_attn",
+    "dsv_sparse_attn_merge",
     "dsv_attn_index",
     "dsv_compress_pool_prefill",
     "dsv_compress_pool_decode",
@@ -88,6 +92,8 @@ const NAMES: &[&str] = &[
     "dsv_moe_gemm_fp4",
     "dsv_moe_gemm_fp4_m32",
     "dsv_moe_gemm_fp4_m16",
+    "dsv_moe_gemm_wg_fp4",
+    "dsv_gemm_wg_fp8",
     "dsv_moe_gemv_fp4",
     "dsv_swiglu_quant",
     "dsv_moe_combine",
@@ -194,6 +200,8 @@ impl Kernels {
             dev.set_max_dynamic_smem(fns[moe_gemm_name(bm)], moe_smem(MOE_SMEM_MAX_K, bm))?;
         }
         dev.set_max_dynamic_smem(fns["dsv_gemm_w8a8"], W8_SMEM)?;
+        dev.set_max_dynamic_smem(fns["dsv_gemm_wg_fp8"], WG_SMEM)?;
+        dev.set_max_dynamic_smem(fns["dsv_moe_gemm_wg_fp4"], WG_SMEM)?;
         Ok(Kernels { dev, _module: module, fns, prof: profile.then(|| RefCell::new(KernelProf::default())), next_cost: Cell::new(None) })
     }
 
@@ -259,9 +267,10 @@ impl Kernels {
     }
 
     /// C[m][n] (f32) = A[m][k] . W[n][k]^T, A/W bf16 or f32. Small output grids (the mHC mixes are
-    /// 24 x 20480; the router and head at decode batch) take the one-block-per-output dot form, and
-    /// few outputs over many rows the row form; everything else the 64x64 tiles (the dot form re-reads
-    /// each A row once per output, which at prefill M is hundreds of reads).
+    /// 24 x 20480; the router and head at decode batch, M <= 64) take the one-block-per-output dot
+    /// form (the 384-expert router at M = 64 is 6 tiles; not the vocab head, 8M blocks), few outputs over
+    /// many rows the row form, and
+    /// everything else the 64x64 tiles (the dot form re-reads each A row once per output).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_f32(&self, c: u64, a: u64, w: u64, m: usize, n: usize, k: usize, lda: usize, a_bf16: bool, w_bf16: bool, s: &CudaStream) -> Result<()> {
         let args = [A::P(c), A::P(a), A::P(w), A::I(m as i32), A::I(n as i32), A::I(k as i32), A::L(lda as i64), A::L(n as i64), A::I(a_bf16 as i32), A::I(w_bf16 as i32)];
@@ -270,7 +279,7 @@ impl Kernels {
         self.cost(Cost { flops: 2.0 * mf * nf * kf, bytes: mf * kf * ab + nf * kf * wb + mf * nf * 4.0, peak: Peak::Fp32 });
         if n <= 32 && m > 64 {
             self.launch("dsv_gemm_f32_rows", [cdiv(m as u64, 4), 1, 1], 256, 0, &args, s)
-        } else if m <= 16 {
+        } else if m <= 64 && m * n <= 1 << 20 {
             self.launch("dsv_gemm_f32_dot", [n as u32, m as u32, 1], 256, 0, &args, s)
         } else {
             self.launch("dsv_gemm_f32", [cdiv(n as u64, 64), cdiv(m as u64, 64), 1], 256, 0, &args, s)

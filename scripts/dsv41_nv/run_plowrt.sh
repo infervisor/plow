@@ -69,6 +69,17 @@ if [ "$MODE" = smoke ]; then
   exit 0
 fi
 
+if [ "$MODE" = long ]; then  # greedy completions over prefill-sized prompts (the wgmma GEMM paths)
+  for f in docs/serving-openai-compat.md docs/BUILD.md docs/flags-reference.md; do
+    for chars in 6000 16000; do
+      p=$(python3 -c 'import sys; t=open(sys.argv[1]).read()[:int(sys.argv[2])]; print(t + "\n\nQuestion: In one sentence, what is the document above about?\nAnswer:")' "$ROOT/$f" "$chars")
+      echo "== $f $chars" | tee -a "$OUT/long.txt"
+      complete "$p" 40 | tee -a "$OUT/long.txt"
+    done
+  done
+  exit 0
+fi
+
 if [ "$MODE" = quick ]; then  # a short profile pass: few prompts, 64 output tokens
   NPROMPT=4 run quick_1k_64 1024 64 1
   NPROMPT=16 run quick_1k_64 1024 64 16

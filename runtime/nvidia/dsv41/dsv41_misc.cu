@@ -222,67 +222,50 @@ DSV_EXTERN void __launch_bounds__(256)
 }
 
 // Fused mHC mix, part 2: sum the S partials in split order, rsq = rsqrt(sumsq / K + eps), and the
-// Sinkhorn split of mixes * rsq into pre / post / comb (as dsv_hc_sinkhorn). One thread per token.
-DSV_EXTERN void dsv_hc_mix_finish(float* __restrict__ pre, float* __restrict__ post, float* __restrict__ comb,
-                                  const float* __restrict__ part, int S, int T, int K, const float* __restrict__ hc_scale,
-                                  const float* __restrict__ hc_base, int iters, float norm_eps, float eps) {
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= T) return;
-    float m[HCM_N + 1];
-#pragma unroll
-    for (int n = 0; n <= HCM_N; n++) m[n] = 0.f;
-    for (int s = 0; s < S; s++)
-#pragma unroll
-        for (int n = 0; n <= HCM_N; n++) m[n] += part[((long long)s * T + t) * (HCM_N + 1) + n];
-    const float r = rsqrtf(m[HCM_N] / (float)K + norm_eps);
-#pragma unroll
-    for (int i = 0; i < HCM_N; i++) m[i] *= r;
-#pragma unroll
-    for (int j = 0; j < 4; j++) {
-        pre[t * 4 + j] = 1.f / (1.f + expf(-(m[j] * hc_scale[0] + hc_base[j]))) + eps;
-        post[t * 4 + j] = 2.f * (1.f / (1.f + expf(-(m[j + 4] * hc_scale[1] + hc_base[j + 4]))));
+// Sinkhorn split of mixes * rsq into pre / post / comb (as dsv_hc_sinkhorn). 16 lanes per token,
+// lane l = comb element (l / 4, l % 4): row sums over lanes xor 1, 2 and column sums over xor 4, 8,
+// so the 20 normalization rounds are a short shuffle chain instead of one thread's serial divides
+// (the per-step Sinkhorn was ~35 us of latency per sublayer at one token). grid = ceil(T / 8), 128.
+DSV_EXTERN void __launch_bounds__(128)
+    dsv_hc_mix_finish(float* __restrict__ pre, float* __restrict__ post, float* __restrict__ comb,
+                      const float* __restrict__ part, int S, int T, int K, const float* __restrict__ hc_scale,
+                      const float* __restrict__ hc_base, int iters, float norm_eps, float eps) {
+    const unsigned FULL = 0xffffffffu;
+    const int l = threadIdx.x & 15;
+    const int t = blockIdx.x * 8 + (threadIdx.x >> 4);
+    const bool live = t < T;
+    const int tt = live ? t : T - 1;  // dead lanes still take part in the shuffles
+    // lane l sums projection l and (l < 9) projection 16 + l; projection 24 is the sum of squares
+    float v0 = 0.f, v1 = 0.f;
+    for (int sp = 0; sp < S; sp++) {
+        const float* pp = part + ((long long)sp * T + tt) * (HCM_N + 1);
+        v0 += pp[l];
+        if (l < 9) v1 += pp[16 + l];
     }
-    float c[4][4];
-#pragma unroll
-    for (int j = 0; j < 4; j++)
-#pragma unroll
-        for (int k = 0; k < 4; k++) c[j][k] = m[j * 4 + k + 8] * hc_scale[2] + hc_base[j * 4 + k + 8];
-#pragma unroll
-    for (int j = 0; j < 4; j++) {
-        const float mx = fmaxf(fmaxf(c[j][0], c[j][1]), fmaxf(c[j][2], c[j][3]));
-        float sm = 0.f;
-#pragma unroll
-        for (int k = 0; k < 4; k++) {
-            c[j][k] = expf(c[j][k] - mx);
-            sm += c[j][k];
-        }
-#pragma unroll
-        for (int k = 0; k < 4; k++) c[j][k] = c[j][k] / sm + eps;
-    }
-#pragma unroll
-    for (int k = 0; k < 4; k++) {
-        const float sm = c[0][k] + c[1][k] + c[2][k] + c[3][k];
-#pragma unroll
-        for (int j = 0; j < 4; j++) c[j][k] = c[j][k] / (sm + eps);
-    }
+    const float r = rsqrtf(__shfl_sync(FULL, v1, 8, 16) / (float)K + norm_eps);
+    if (live && l < 4) pre[t * 4 + l] = 1.f / (1.f + expf(-(v0 * r * hc_scale[0] + hc_base[l]))) + eps;
+    if (live && l >= 4 && l < 8) post[t * 4 + l - 4] = 2.f * (1.f / (1.f + expf(-(v0 * r * hc_scale[1] + hc_base[l]))));
+    // comb element l is projection 8 + l: lane l + 8's v0 for l < 8, lane l - 8's v1 otherwise
+    const float a = __shfl_sync(FULL, v0, (l + 8) & 15, 16), b = __shfl_sync(FULL, v1, (l + 8) & 15, 16);
+    float c = (l < 8 ? a : b) * r * hc_scale[2] + hc_base[8 + l];
+    auto row_sum = [&](float x) {
+        x += __shfl_xor_sync(FULL, x, 1, 16);
+        return x + __shfl_xor_sync(FULL, x, 2, 16);
+    };
+    auto col_sum = [&](float x) {
+        x += __shfl_xor_sync(FULL, x, 4, 16);
+        return x + __shfl_xor_sync(FULL, x, 8, 16);
+    };
+    float mx = fmaxf(c, __shfl_xor_sync(FULL, c, 1, 16));
+    mx = fmaxf(mx, __shfl_xor_sync(FULL, mx, 2, 16));
+    c = expf(c - mx);
+    c = c / row_sum(c) + eps;
+    c = c / (col_sum(c) + eps);
     for (int it = 0; it < iters - 1; it++) {
-#pragma unroll
-        for (int j = 0; j < 4; j++) {
-            const float sm = c[j][0] + c[j][1] + c[j][2] + c[j][3];
-#pragma unroll
-            for (int k = 0; k < 4; k++) c[j][k] = c[j][k] / (sm + eps);
-        }
-#pragma unroll
-        for (int k = 0; k < 4; k++) {
-            const float sm = c[0][k] + c[1][k] + c[2][k] + c[3][k];
-#pragma unroll
-            for (int j = 0; j < 4; j++) c[j][k] = c[j][k] / (sm + eps);
-        }
+        c = c / (row_sum(c) + eps);
+        c = c / (col_sum(c) + eps);
     }
-#pragma unroll
-    for (int j = 0; j < 4; j++)
-#pragma unroll
-        for (int k = 0; k < 4; k++) comb[t * 16 + j * 4 + k] = c[j][k];
+    if (live) comb[t * 16 + l] = c;
 }
 
 // y[t][d] = bf16(sum_c pre[t][c] * x[t][c][d])

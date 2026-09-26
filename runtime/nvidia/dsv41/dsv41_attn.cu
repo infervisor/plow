@@ -36,11 +36,16 @@ DSV_EXTERN void dsv_rope(bf16* __restrict__ x, const int* __restrict__ pos, cons
 //
 // Block: 512 threads (16 warps), one query row. Warp w: head tile (w & 3) x 16 heads; for S it owns
 // kv columns (w >> 2) * 16, for O it owns dims (w >> 2) * 128.
+//
+// Split-KV (decode, where t blocks alone leave most SMs idle): grid.y = S splits over the 64-row
+// tiles; with part != null each split writes its unnormalized O and its (max, sum) without the sink
+// to part, and dsv_sparse_attn_merge combines them. part layout: [t][S][64 heads] x {O[512], m, l}.
 #define SA_H 64
 #define SA_D 512
 #define SA_BN 64
 #define SA_LDQ (SA_D + 8)
 #define SA_LDP (SA_BN + 8)
+#define SA_PART_ROW (SA_D + 4)  // a split's row in part: O[512], m, l, pad
 
 __device__ __forceinline__ void mma_bf16_sa(float* c, const uint32_t* a, const uint32_t* b) {
     asm volatile(
@@ -57,7 +62,7 @@ __device__ __forceinline__ void ldsm_x2_trans(uint32_t* r, const void* p) {
 DSV_EXTERN void __launch_bounds__(512)
     dsv_sparse_attn(bf16* __restrict__ o, const bf16* __restrict__ q, const int* __restrict__ idx, int n_idx,
                     const unsigned long long* __restrict__ win_ptrs, const unsigned long long* __restrict__ cmp_ptrs,
-                    int off, int q_per_b, const float* __restrict__ sink, float scale) {
+                    int off, int q_per_b, const float* __restrict__ sink, float scale, float* __restrict__ part) {
     extern __shared__ __align__(16) uint8_t smem[];
     bf16* Qs = (bf16*)smem;                         // [64][520]
     bf16* Ks = Qs + SA_H * SA_LDQ;                  // [64][520]
@@ -88,7 +93,9 @@ DSV_EXTERN void __launch_bounds__(512)
     float mrow[2] = {-1e30f, -1e30f}, lrow[2] = {0.f, 0.f};
 
     const int n_tiles = (n_idx + SA_BN - 1) / SA_BN;
-    for (int tile = 0; tile < n_tiles; tile++) {
+    const int per = (n_tiles + gridDim.y - 1) / gridDim.y;
+    const int tile0 = blockIdx.y * per, tile1 = min(n_tiles, tile0 + per);
+    for (int tile = tile0; tile < tile1; tile++) {
         __syncthreads();
         if (tid < SA_BN) {
             const int j = tile * SA_BN + tid;
@@ -211,6 +218,25 @@ DSV_EXTERN void __launch_bounds__(512)
         }
     }
 
+    if (part) {  // split-KV partial: O unnormalized, (m, l) without the sink
+        float* pt = part + ((long long)t * gridDim.y + blockIdx.y) * SA_H * SA_PART_ROW;
+#pragma unroll
+        for (int j = 0; j < 16; j++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int row = mt * 16 + g + h * 8;
+                const int col = nq * 128 + j * 8 + t4 * 2;
+                *(float2*)&pt[row * SA_PART_ROW + col] = make_float2(acc[j][h * 2], acc[j][h * 2 + 1]);
+            }
+        if (nq == 0 && t4 == 0)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int row = mt * 16 + g + h * 8;
+                pt[row * SA_PART_ROW + SA_D] = mrow[h];
+                pt[row * SA_PART_ROW + SA_D + 1] = lrow[h];
+            }
+        return;
+    }
     // sink + normalize
 #pragma unroll
     for (int h = 0; h < 2; h++) {
@@ -229,6 +255,35 @@ DSV_EXTERN void __launch_bounds__(512)
             v.y = f2bf(acc[j][h * 2 + 1] / lrow[h]);
             *(__nv_bfloat162*)&ot[row * SA_D + col] = v;
         }
+}
+
+// Split-KV merge: o[t][h] = sum_s O_s e^(m_s - M) / (sum_s l_s e^(m_s - M) + e^(sink_h - M)), M = max_s m_s
+// (the sink joins once, as in the unsplit kernel). grid = (t, 64 heads), 128 threads x 4 dims.
+DSV_EXTERN void __launch_bounds__(128)
+    dsv_sparse_attn_merge(bf16* __restrict__ o, const float* __restrict__ part, int S, const float* __restrict__ sink) {
+    const int t = blockIdx.x, h = blockIdx.y;
+    const float* pt = part + (long long)t * S * SA_H * SA_PART_ROW + h * SA_PART_ROW;
+    const long long sstride = (long long)SA_H * SA_PART_ROW;
+    float M = -1e30f;
+    for (int s = 0; s < S; s++) M = fmaxf(M, pt[s * sstride + SA_D]);
+    float L = __expf(sink[h] - M);
+    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+    const int d = threadIdx.x * 4;
+    for (int s = 0; s < S; s++) {
+        const float* ps = pt + s * sstride;
+        const float w = __expf(ps[SA_D] - M);
+        L += ps[SA_D + 1] * w;
+        const float4 v = *(const float4*)&ps[d];
+        acc.x += v.x * w;
+        acc.y += v.y * w;
+        acc.z += v.z * w;
+        acc.w += v.w * w;
+    }
+    bf16* ot = o + ((long long)t * SA_H + h) * SA_D + d;
+    ot[0] = f2bf(acc.x / L);
+    ot[1] = f2bf(acc.y / L);
+    ot[2] = f2bf(acc.z / L);
+    ot[3] = f2bf(acc.w / L);
 }
 
 // Attention index table for one forward. Row t (batch row b = t / q_per_b) gets n_win window slots then

@@ -76,13 +76,28 @@ TTFT under concurrency includes queueing behind other prefills.)
 | grouped fp4 MoE GEMM: tile height 16/32/64 from rows per expert (the 64-row tile was ~75% padding at 1k prefill and decode); warps side by side along N | 1k prefill (MoE w13, bench) | 7.1 ms | 3.4 ms |
 | fp4 -> e4m3 by shifts alone (e2m1 s.ee.m -> s.0000.ee.m00 is the e4m3 encoding of w * 2^-6, subnormal included; 2^6 into the scale), activations byte-permuted to the same K order; still bit-exact vs kernel.py `fp4_gemm` | MoE, all T | | 10-25% faster |
 | routed experts at decode: 16-row MMA tile instead of the fp32 GEMV (the GEMV was issue-bound at ~1 TB/s) | decode B=64 | 227 ms (MoE 189 ms, 0.97 TB/s) | 106 ms (MoE 51 ms, 3.6 TB/s, 75% of roofline) |
+| mHC Sinkhorn on 16 lanes per token (shuffle row/column sums) instead of one thread's serial divides | decode B=1 | 35 us/sublayer | ~3 us |
+| sparse attention split-KV (flash-decoding: grid.y splits over the 64-row KV tiles + a merge that adds the sink once) | decode B=1 | 96 us/layer on one SM | 27.6 -> 22.8 ms/token with the above |
+| fp32 GEMM dispatch: dot form only for M <= 64 and M*N <= 2^20 (the router at M=64 was 6 tiles; the vocab head is not a dot-form shape) | decode B=64 | 25 ms (tiled router) / 73 ms (dot head) | 6 ms |
+| Hopper wgmma prefill GEMMs (`dsv41_wg.cu`): producer warpgroup decodes fp8 / fp4 weights to bf16 in 128B-swizzled smem (bit placement: e4m3 bits in bf16 position are the value * 2^-120, one bf16x2 multiply applies 2^(120+S)); A is the fake-quantized bf16 activation (`act_quant` fq); two consumer warpgroups on m64n256k16; mbarrier ring, cp.async with noinc arrive; scale loads prefetched a lookahead ahead | prefill 16k | 3916 ms (MoE 1574, W8A8 912, wo_a 413) | 2594 ms (MoE 893, dense 671) |
+| same, at 4k / 1k | prefill | 1095 / 367 ms | 818 / 338 ms |
 
-Rungs after these (`/root/dsv41/results/rungs_v4.md`): prefill 1k / 4k / 16k 369 / 1099 / 3916 ms;
-decode B=1 / 16 / 64 at ctx 1k 27.6 / 67.8 / 105.7 ms (36 / 236 / 605 tok/s).
+The wgmma kernels are 1.6-1.8x the mma.sync ones (bench_wg.py: ~350 TFLOP/s dense, ~320 grouped
+fp4 at 16k rows) and bit-identical or at bf16 rounding against kernel.py (`test_kernels.py wg`); on
+live activations every call matched its mma.sync twin to <= 3.6e-4 (bf16 output rounding).
+`PLOW_DSV41_NO_WG=1` pins the mma.sync kernels. Measured ceilings of the same pipeline: ~800
+TFLOP/s with no loads and no decode, ~475 with the decode, ~500 with the loads -- the producer and
+the bf16 operands' shared-memory traffic bound it; fp8 wgmma with per-32 promotion (DeepGEMM-style,
+two consumer warpgroups ping-ponging MMA and promotion) is the next step.
 
-Open, ranked by that profile: prefill 16k is 41% MoE GEMM (177 TFLOP/s, compute-bound: needs
-wgmma), 24% W8A8 and 11% bf16 (both ~10% of peak); decode B=1 is launch- and latency-bound
-(~1400 launches; sparse attention 96 us/call at one token; the one-thread Sinkhorn 35 us/call).
+Rungs after these (`/root/dsv41/results/rungs_v6.md`): prefill 1k / 4k / 16k 338 / 818 / 2594 ms
+(3032 / 5007 / 6316 tok/s); decode B=1 / 16 / 64 at ctx 1k 22.9 / 49.4 / 87.4 ms (44 / 324 / 733
+tok/s).
+
+Open, ranked by that profile: prefill 16k is 35% grouped fp4 wgmma (312 TFLOP/s), 26% dense wgmma
+(334), 15% sparse attention (28% of its memory floor); decode B=64 is 57% routed experts at 3.55 TB/s
+(74% of roofline); decode B=1 is launch- and latency-bound (~1400 launches, W8A8 at 18% of its
+floor): CUDA graphs and fused per-layer blocks.
 
 ## 6. Plan
 

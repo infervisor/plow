@@ -394,7 +394,7 @@ class Engine:
         wp = torch.tensor([win_src.data_ptr()], dtype=torch.uint64, device=dev)
         cp = torch.tensor([sh.cmp.data_ptr() if (comp and sh.cmp is not None) else 0], dtype=torch.uint64, device=dev)
         self.K.launch("dsv_sparse_attn", (T,), (512,),
-                      [o, q, table, i32(n_idx), wp, cp, i32(off), i32(T if not decode else 1), ly.sink, f32(HD ** -0.5)],
+                      [o, q, table, i32(n_idx), wp, cp, i32(off), i32(T if not decode else 1), ly.sink, f32(HD ** -0.5), None],
                       smem=SA_SMEM)
         self.rope(o, T, NH, NH * HD, HD, HD, pos, comp, inverse=True)
         # wo_a: 8 groups, o[t][g*4096 ..] x wo_a[g*1024 ..]^T -> ga[t][g*1024 ..]
@@ -438,7 +438,7 @@ class Engine:
         hs = torch.empty(n, MI // 32, dtype=torch.uint8, device=dev)
         lim = float(self.cfg["swiglu_limit"])
         self.K.launch("dsv_swiglu_quant", ((n * MI // 32 + 7) // 8,), (256,),
-                      [hq, hs, gu, gu[:, MI:], i64(2 * MI), row_w, i32(n), i32(MI), f32(lim), None])
+                      [hq, hs, gu, gu[:, MI:], i64(2 * MI), row_w, i32(n), i32(MI), f32(lim), None, None])
         down = torch.empty(n, H, dtype=torch.bfloat16, device=dev)
         self.K.launch("dsv_moe_gemm_fp4", ((H + 127) // 128, max_tiles), (128,),
                       [down, hq, hs, ly.w2, ly.w2_s, tiles, meta, offs, rows, i32(1), i32(H), i32(MI),
@@ -448,7 +448,7 @@ class Engine:
         shq = torch.empty(T, MI, dtype=torch.uint8, device=dev)
         shs = torch.empty(T, MI // 32, dtype=torch.uint8, device=dev)
         self.K.launch("dsv_swiglu_quant", ((T * MI // 32 + 7) // 8,), (256,),
-                      [shq, shs, sgu, sgu[:, MI:], i64(2 * MI), None, i32(T), i32(MI), f32(lim), None])
+                      [shq, shs, sgu, sgu[:, MI:], i64(2 * MI), None, i32(T), i32(MI), f32(lim), None, None])
         shared = self.w8a8((shq, shs), ly.sh_w2, ly.sh_w2_s)
         y = torch.empty(T, H, dtype=torch.bfloat16, device=dev)
         self.K.launch("dsv_moe_combine", (T,), (256,), [y, down, shared, idx, rowpos, i32(T), i32(H), i32(TOPK)])
