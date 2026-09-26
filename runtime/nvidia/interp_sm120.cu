@@ -1800,6 +1800,17 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 in->i[0], in->i[1], in->fj[0].f, slice, nblk);
         break;
 
+    case PLOW_DOP_EMBED_OVERLAY_BF16:
+        d_embed_overlay((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned*)TEN(2),
+                        (const float*)TEN(3), (const unsigned*)TEN(4), in->i[0], in->i[1], in->i[2],
+                        in->i[3], slice, nblk);
+        break;
+    case PLOW_DOP_EMBED_POS_BF16:
+        d_embed_pos((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned*)TEN(2),
+                    (const __nv_bfloat16*)TEN(3), (const unsigned*)TEN(4), (const unsigned*)TEN(5),
+                    in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
+        break;
+
     /* Terminal row selection for the unified token batch. One arm serves BOTH NVIDIA images:
      * interp_sm90a.cu is a wrapper TU that renames the public symbols and then includes this
      * file, so there is no second switch to keep in step. */
@@ -2449,8 +2460,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         __trap();
 #else
 #if PLOW_HAS_FLASH_HD64
-        if (in->i[3] == 64 && PLOW_HAS_FLASH_HD64 && PLOW_PACKET_ATTENTION_SINKS)
-            d_flash_merge<64, true>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
+        /* HD64 with or without sinks (GPT-OSS carries them; Chatterbox T3 does not). */
+        if (in->i[3] == 64 && PLOW_HAS_FLASH_HD64)
+            d_flash_merge<64, (bool)PLOW_PACKET_ATTENTION_SINKS>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                     (const float*)TEN(2), in->i[0], in->i[1], in->i[2],
                                     slice, nblk,
 #if PLOW_NV_PACKED_REQUEST

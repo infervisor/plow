@@ -170,19 +170,10 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
         }
     }
     // Optional placed, segmented and opaque programs retain the existing widest path.
-    if let Some(g) = programs.iter().find(|g| {
+    if programs.iter().any(|g| {
         g.l2_domains != 0
             || (!segmented && (g.gq_seg_ofs.len() != 2 || g.check_coarse_single_segment().is_err()))
     }) {
-        if std::env::var_os("PLOW_LADDER_DEBUG").is_some() {
-            eprintln!(
-                "ladder: rung {} keeps widest: l2_domains={} gq_seg_ofs={} coarse_single={:?}",
-                g.t,
-                g.l2_domains,
-                g.gq_seg_ofs.len(),
-                g.check_coarse_single_segment().err()
-            );
-        }
         return Ok(false);
     }
     let widest = programs.last().expect("multiple programs");

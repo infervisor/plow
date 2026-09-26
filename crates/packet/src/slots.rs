@@ -300,6 +300,7 @@ const DOC: &[S] = &[
     S { op: DevOp::Conv2dF32, t: &["out", "x", "weight", "bias"], i: &["in_frames", "in_width", "in_channels", "out_channels", "kernel", "stride", "pad_before", "pad_after"], f: &[], j: &["flags", "batch"] },
     S { op: DevOp::PackNcfwRowsF32, t: &["out", "x"], i: &["rows", "channels", "frames", "width", "batches"], f: &[], j: &[] },
     S { op: DevOp::GroupedAttentionF32, t: &["context", "query", "key", "value", "valid_rows?"], i: &["rows", "width", "head_width", "group_rows", "flags"], f: &[], j: &[] },
+    S { op: DevOp::EmbedPosBf16, t: &["out", "table", "tokens", "pos_table", "pos", "base"], i: &["rows", "width", "vocab", "pos_rows"], f: &[], j: &[] },
     S { op: DevOp::EmbedOverlayBf16, t: &["out", "table", "tokens", "overlay", "overlay_index"], i: &["rows", "width", "vocab", "overlay_rows"], f: &[], j: &[] },
 ];
 

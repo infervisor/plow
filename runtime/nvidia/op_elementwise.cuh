@@ -38,6 +38,43 @@ static __device__ void d_embed(__nv_bfloat16* __restrict__ out, const __nv_bfloa
     }
 }
 
+/* EmbedOverlayBf16 (op 179): a row is table[tokens[r]] unless overlay_index[r] names an
+ * overlay row, which is BF16-rounded in (the CPU golden's plow_f2bf: round-to-nearest-even). */
+static __device__ void d_embed_overlay(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ table,
+                                       const unsigned* __restrict__ tokens, const float* __restrict__ overlay,
+                                       const unsigned* __restrict__ overlay_index, unsigned rows, unsigned width,
+                                       unsigned vocab, unsigned overlay_rows, unsigned slice, unsigned nblk) {
+    for (unsigned r = slice; r < rows; r += nblk) {
+        const unsigned sel = overlay_index[r];
+        if (sel == 0xFFFFFFFFu) {
+            if (tokens[r] >= vocab) { __trap(); return; }
+            const __nv_bfloat16* src = table + (size_t)tokens[r] * width;
+            for (unsigned i = threadIdx.x; i < width; i += PLOW_NV_THREADS) out[(size_t)r * width + i] = src[i];
+        } else {
+            if (sel >= overlay_rows) { __trap(); return; }
+            const float* src = overlay + (size_t)sel * width;
+            for (unsigned i = threadIdx.x; i < width; i += PLOW_NV_THREADS)
+                out[(size_t)r * width + i] = __float2bfloat16_rn(src[i]);
+        }
+    }
+}
+
+/* EmbedPosBf16 (op 184): out[r] = bf16(table[tokens[r]] + pos_table[pos[r] - base[r]]). */
+static __device__ void d_embed_pos(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ table,
+                                   const unsigned* __restrict__ tokens, const __nv_bfloat16* __restrict__ pos_table,
+                                   const unsigned* __restrict__ pos, const unsigned* __restrict__ base,
+                                   unsigned rows, unsigned width, unsigned vocab, unsigned pos_rows,
+                                   unsigned slice, unsigned nblk) {
+    for (unsigned r = slice; r < rows; r += nblk) {
+        const unsigned p = pos[r] - base[r];
+        if (tokens[r] >= vocab || pos[r] < base[r] || p >= pos_rows) { __trap(); return; }
+        const __nv_bfloat16* a = table + (size_t)tokens[r] * width;
+        const __nv_bfloat16* b = pos_table + (size_t)p * width;
+        for (unsigned i = threadIdx.x; i < width; i += PLOW_NV_THREADS)
+            out[(size_t)r * width + i] = __float2bfloat16_rn(__bfloat162float(a[i]) + __bfloat162float(b[i]));
+    }
+}
+
 /* Compact hidden-row gather — the unified token batch's terminal row selection.
  *
  * out[s][h] = x[rows[s]][h], for s in [0, S), over H features.

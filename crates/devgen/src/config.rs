@@ -209,6 +209,11 @@ pub(crate) struct Cfg {
     // Maximum FP32 encoder rows that may replace token embeddings during prefill. Zero means a
     // text-only model. The replacement map and operation remain generic packet data.
     pub(crate) encoder_overlay_rows: u32,
+    // Learned speech-position rows added to the DECODE token embedding (Chatterbox T3:
+    // speech_emb[tok] + speech_pos_emb[pos - in.pos_base]). Zero means a plain Embed.
+    pub(crate) speech_pos_rows: u32,
+    // `chatterbox_t3` contract scalars for the speech pipeline (floats as `<key>_f32` bit patterns).
+    pub(crate) speech_params: Vec<(String, u64)>,
     // Tensor-parallel degree (Megatron sharding). 1 = single-GPU (current path, byte-identical).
     // >1 emits a DECODE-ONLY sharded blob: column-parallel q/k/v/gate/up/
     // lm_head, row-parallel o_proj/down with an XReduce all-reduce after each, attention split by
@@ -299,7 +304,20 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
     if arch == Arch::ModernBert {
         return cfg_modernbert(&v);
     }
-    cfg_llama_qwen(&v, arch)
+    let mut c = cfg_llama_qwen(&v, arch);
+    if let Some(t3) = v.get("chatterbox_t3") {
+        c.encoder_overlay_rows = t3["overlay_rows"].as_u64().expect("chatterbox_t3.overlay_rows") as u32;
+        c.speech_pos_rows = t3["speech_pos_rows"].as_u64().expect("chatterbox_t3.speech_pos_rows") as u32;
+        assert!(c.encoder_overlay_rows > 0 && c.speech_pos_rows > 0);
+        for (k, v) in t3.as_object().expect("chatterbox_t3 object") {
+            if let Some(n) = v.as_u64() {
+                c.speech_params.push((k.clone(), n));
+            } else if let Some(f) = v.as_f64() {
+                c.speech_params.push((format!("{k}_f32"), u64::from((f as f32).to_bits())));
+            }
+        }
+    }
+    c
 }
 
 fn cfg_qwen3_asr(v: &Value) -> Cfg {
@@ -389,6 +407,8 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         }
         .to_string(),
         encoder_overlay_rows: 0,
+        speech_pos_rows: 0,
+        speech_params: Vec::new(),
         tp: 1,
         // 26B-A4B: enable_moe_block=true, num_experts=128, top_k_experts=8, moe_inter=704.
         // 12B/31B: field absent -> dense-only (moe=false).
@@ -475,6 +495,8 @@ fn cfg_gemma3(v: &Value) -> Cfg {
         rope_frac_full: 1.0,
         rope_scale,
         encoder_overlay_rows: 0,
+        speech_pos_rows: 0,
+        speech_params: Vec::new(),
         attn_scale: (t["query_pre_attn_scalar"]
             .as_f64()
             .expect("gemma3: query_pre_attn_scalar") as f32)
@@ -574,6 +596,8 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         tied: v["tie_word_embeddings"].as_bool().unwrap_or(false),
         prefix: "model.".to_string(),
         encoder_overlay_rows: 0,
+        speech_pos_rows: 0,
+        speech_params: Vec::new(),
         tp: 1,
         moe: false, // Llama/Qwen3 dense here
         n_exp: 0,
@@ -622,6 +646,8 @@ fn cfg_bert(v: &Value) -> Cfg {
         tied: v["tie_word_embeddings"].as_bool().unwrap_or(true),
         prefix: if v.get("bert").is_some() { "bert.".into() } else { "model.".into() },
         encoder_overlay_rows: 0,
+        speech_pos_rows: 0,
+        speech_params: Vec::new(),
         tp: 1,
         moe: false,
         n_exp: 0,
@@ -674,6 +700,8 @@ fn cfg_modernbert(v: &Value) -> Cfg {
         tied: v["tie_word_embeddings"].as_bool().unwrap_or(true),
         prefix: "model.".to_string(),
         encoder_overlay_rows: 0,
+        speech_pos_rows: 0,
+        speech_params: Vec::new(),
         tp: 1,
         moe: false,
         n_exp: 0,

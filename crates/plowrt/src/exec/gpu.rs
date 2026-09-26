@@ -10340,6 +10340,26 @@ impl GpuEngine {
         self.be.download(&self.devp[i], offset, dst)
     }
 
+    /// Write raw bytes into a named tensor at `offset` (host-owned pipeline inputs: embedding
+    /// overlay rows, per-slot scalars). Synchronous with respect to the engine stream.
+    pub fn write_tensor(&mut self, name: &str, offset: u64, src: &[u8]) -> Result<()> {
+        let i = self.handle_of(name).ok_or_else(|| {
+            RuntimeError::Rejected(format!("no tensor named {name:?} in the blob"))
+        })?;
+        let end = offset
+            .checked_add(src.len() as u64)
+            .ok_or_else(|| RuntimeError::Rejected("tensor write range overflow".into()))?;
+        if end > self.devp[i].len {
+            return Err(RuntimeError::Rejected(format!(
+                "write_tensor {name}: range {offset}..{end} exceeds {} bytes",
+                self.devp[i].len
+            )));
+        }
+        self.be.upload(&self.devp[i], offset, src)?;
+        // Pageable H2D can return before DMA completes; kernels use a nonblocking stream.
+        self.be.synchronize()
+    }
+
     /// Byte size of a named tensor's device allocation.
     pub fn tensor_bytes(&self, name: &str) -> Option<u64> {
         self.handle_of(name).map(|i| self.devp[i].len)

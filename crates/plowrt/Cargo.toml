@@ -307,3 +307,8 @@ required-features = ["gguf"]
 name = "step_bench"
 path = "examples/step_bench.rs"
 required-features = ["cuda"]
+
+[[example]]
+name = "t3_check"
+path = "examples/t3_check.rs"
+required-features = ["cuda"]

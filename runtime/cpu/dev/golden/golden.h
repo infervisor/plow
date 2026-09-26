@@ -57,6 +57,7 @@ G_K(g_conv2d_f32);
 G_K(g_pack_ncfw_rows_f32);
 G_K(g_embed_f16_f32);
 G_K(g_embed_overlay_bf16);
+G_K(g_embed_pos_bf16);
 G_K(g_lstm_cell_f32);
 G_K(g_argmax_f32);
 G_K(g_relu_f32);

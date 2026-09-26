@@ -308,6 +308,7 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::DenseGemmF32 => a_rows("i0=M, dense FP32 rows"),
         DevOp::EmbedF16F32 => a_rows("single explicit token row"),
         DevOp::EmbedOverlayBf16 => a_rows("i0=rows, token gather with explicit row overlay"),
+        DevOp::EmbedPosBf16 => a_rows("i0=rows, token gather plus per-row learned position"),
         DevOp::LstmCellF32 => a_elem("i0=width, explicit state tensors"),
         DevOp::ArgmaxF32 => a_rows("i0=rows"),
         DevOp::ReluF32 => a_elem("i0=n"),

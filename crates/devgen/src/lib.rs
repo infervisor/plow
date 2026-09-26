@@ -1719,6 +1719,9 @@ struct Tn {
     ids: u32,
     encoder_overlay: u32,
     encoder_overlay_index: u32,
+    // Chatterbox T3 decode: per-slot speech start and the learned speech-position table.
+    pos_base: u32,
+    speech_pos: u32,
     pos: u32,
     kvlen: u32,
     cos_s: u32,
@@ -2042,6 +2045,19 @@ fn declare(
         },
         encoder_overlay_index: if c.encoder_overlay_rows > 0 {
             b.tensor("in.encoder_overlay_index", ctx as u64 * I32)
+        } else {
+            TENSOR_NONE
+        },
+        pos_base: if c.speech_pos_rows > 0 {
+            b.tensor("in.pos_base", dbatch as u64 * I32)
+        } else {
+            TENSOR_NONE
+        },
+        speech_pos: if c.speech_pos_rows > 0 {
+            b.tensor(
+                &format!("{}speech_pos_emb.weight", c.prefix),
+                u64::from(c.speech_pos_rows) * u64::from(c.hidden) * BF16,
+            )
         } else {
             TENSOR_NONE
         },
@@ -3927,6 +3943,11 @@ fn emit_phase(
             ]);
             d.i[..4].copy_from_slice(&[t, c.hidden, c.vocab, c.encoder_overlay_rows]);
         })
+    } else if decode && c.speech_pos_rows > 0 {
+        b.emit(DevOp::EmbedPosBf16, rows.clone(), &[], |d| {
+            d.t[..6].copy_from_slice(&[n.x, n.emb, n.ids, n.speech_pos, n.pos, n.pos_base]);
+            d.i[..4].copy_from_slice(&[t, c.hidden, c.vocab, c.speech_pos_rows]);
+        })
     } else {
         b.emit(DevOp::Embed, rows.clone(), &[], |d| {
             d.t[0] = n.x;
@@ -5071,6 +5092,10 @@ fn emit_phase(
             && ns < (1 << 12)
             && heads < (1 << 16)
             && emit_config::active().fuse_hnr;
+        // Every model this dense emitter serves (Gemma, Llama, Qwen, Chatterbox T3) rotates
+        // NeoX-style (rotate_half). HEADNORM_ROPE's legacy pairing is GPT-J interleaved at hd 64
+        // (GLM/Kimi k_rope, emitted elsewhere), so hd 64 must force the half split.
+        let rope_pair = if hd == 64 { packet::dev::ROPE_PAIR_HALF } else { 0 };
         let c_qn = if fuse_hnr {
             0 // no packet: the fold computes q's norm+rope in flash's staging
         } else {
@@ -5090,6 +5115,7 @@ fn emit_phase(
                     d.i[2] = hd;
                     d.i[3] = 0;
                     d.i[4] = qk_skip;
+                    d.i[5] = rope_pair;
                     d.f[0] = c.eps;
                 },
             )
@@ -5135,6 +5161,7 @@ fn emit_phase(
                 d.i[2] = hd;
                 d.i[3] = 0;
                 d.i[4] = qk_skip;
+                d.i[5] = rope_pair;
                 d.f[0] = c.eps;
                 // j0 = the KV cache's row stride (the RING size on a sliding layer); j1 = the row
                 // mask. The write lands in the HEAD-MAJOR cache so flash can stream a head
@@ -9582,7 +9609,31 @@ fn emit_dense_gqa(
             .expect("dense decode projection segments"),
         );
     }
-    if c.encoder_overlay_rows > 0 && !block_mode {
+    if c.speech_pos_rows > 0 && !block_mode {
+        sections.push(
+            tts::t3_pipeline_section(
+                &m,
+                pipeline::CausalPipelineSpec {
+                    name: "speech",
+                    max_context: ctx,
+                    hidden: c.hidden,
+                    decode_capacity: dbatch,
+                    overlay_rows: c.encoder_overlay_rows,
+                    ordered_dispatch: false,
+                    tensors: pipeline::CausalPipelineTensors {
+                        tokens: emitter.tn.ids,
+                        positions: emitter.tn.pos,
+                        kv_lengths: emitter.tn.kvlen,
+                        overlay: Some(emitter.tn.encoder_overlay),
+                        overlay_index: Some(emitter.tn.encoder_overlay_index),
+                    },
+                },
+                emitter.tn.pos_base,
+                &c.speech_params,
+            )
+            .unwrap_or_else(|error| panic!("T3 speech packet pipeline: {error}")),
+        );
+    } else if c.encoder_overlay_rows > 0 && !block_mode {
         sections.push(
             pipeline::causal_pipeline_section(
                 &m,
@@ -10047,6 +10098,7 @@ fn emit_dense_gqa(
     check_cpu_or_metal_opcode_coverage(
         &m,
         arch == "metal3" || (arch.is_empty() && gpu.is_empty()),
+        arch.starts_with("sm_"),
     );
     check_group_routing_supported(&m, amd, &arch);
     warn_arch_gpu_vendor_mismatch(&arch, &gpu);
@@ -10056,7 +10108,7 @@ fn emit_dense_gqa(
         hetero_channel::plan(&m, channels, weights, channel_progs)
             .unwrap_or_else(|e| panic!("{e}"))
     });
-    let audio_blob = (c.encoder_overlay_rows > 0 && !block_mode).then(|| {
+    let audio_blob = (c.encoder_overlay_rows > 0 && c.speech_pos_rows == 0 && !block_mode).then(|| {
         let mut encoder = asr::qwen::lower_audio_encoder(3000, n_cu)
             .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
         for capacity in [400, 800, 1200, 1600, 2000] {
@@ -10271,10 +10323,12 @@ pub mod fp8_m1_role;
 /// Opcodes only the Metal interpreter (and the CPU golden tier) implement. Refused at emit for
 /// any other GPU target, so an E-series blob cannot reach a CUDA/HIP interpreter's
 /// `default: __trap()`.
-fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool) {
+fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool) {
     if supported {
         return;
     }
+    // The CUDA interpreter carries the embedding-overlay handoff (op 179) too.
+    let cuda_ok = |op: DevOp| cuda && op == DevOp::EmbedOverlayBf16;
     const CPU_OR_METAL_ONLY: [DevOp; 4] = [
         DevOp::PerLayerInput,
         DevOp::GemvAffineQ4,
@@ -10283,6 +10337,7 @@ fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool) {
     ];
     let bad: Vec<&'static str> = CPU_OR_METAL_ONLY
         .iter()
+        .filter(|op| !cuda_ok(**op))
         .filter(|op| {
             m.progs
                 .iter()

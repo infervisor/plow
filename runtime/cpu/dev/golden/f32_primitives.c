@@ -331,6 +331,28 @@ G_K(g_embed_overlay_bf16) {
     }
 }
 
+G_K(g_embed_pos_bf16) {
+    (void)ctx;
+    plow_bf16* out = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* table = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t* tokens = PLOW_CPU_TEN(in, T, 2);
+    const plow_bf16* pos_table = PLOW_CPU_TEN(in, T, 3);
+    const uint32_t* pos = PLOW_CPU_TEN(in, T, 4);
+    const uint32_t* base = PLOW_CPU_TEN(in, T, 5);
+    const uint32_t rows = in->i[0], width = in->i[1], vocab = in->i[2], pos_rows = in->i[3];
+    const uint64_t count64 = (uint64_t)rows * width;
+    if (!rows || !width || !vocab || !pos_rows || count64 > UINT32_MAX) return;
+    uint32_t lo, hi;
+    g_range((uint32_t)count64, slice, nblk, &lo, &hi);
+    for (uint32_t index = lo; index < hi; index++) {
+        const uint32_t row = index / width, column = index % width;
+        const uint32_t p = pos[row] - base[row];
+        if (tokens[row] >= vocab || pos[row] < base[row] || p >= pos_rows) return;
+        out[index] = plow_f2bf(plow_bf2f(table[(size_t)tokens[row] * width + column]) +
+                               plow_bf2f(pos_table[(size_t)p * width + column]));
+    }
+}
+
 G_K(g_lstm_cell_f32) {
     (void)ctx;
     float* h_new = PLOW_CPU_TEN(in, T, 0);

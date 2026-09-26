@@ -36,6 +36,7 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_DENSE_GEMM_F32] = g_dense_gemm_f32;
     tab[PLOW_DOP_EMBED_F16_F32] = g_embed_f16_f32;
     tab[PLOW_DOP_EMBED_OVERLAY_BF16] = g_embed_overlay_bf16;
+    tab[PLOW_DOP_EMBED_POS_BF16] = g_embed_pos_bf16;
     tab[PLOW_DOP_LSTM_CELL_F32] = g_lstm_cell_f32;
     tab[PLOW_DOP_ARGMAX_F32] = g_argmax_f32;
     tab[PLOW_DOP_RELU_F32] = g_relu_f32;

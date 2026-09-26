@@ -51,6 +51,35 @@ pub const VEENA: SpeechProfile = SpeechProfile {
     top_p: 0.9,
 };
 
+/// Chatterbox T3 (`tts.t3_cfg.v1`): a causal LM whose prefill rows are host embeddings (the
+/// `overlay` role, every row) and whose decode embedding adds a learned speech position counted
+/// from the per-slot `pos_base`. Classifier-free guidance pairs two slots per request; the
+/// contract scalars (text/speech control ids, sampling, guidance weight) ride as parameters.
+pub const T3_DRIVER: &str = "tts.t3_cfg.v1";
+
+pub fn t3_pipeline_section(
+    model: &Model,
+    spec: CausalPipelineSpec<'_>,
+    pos_base: u32,
+    params: &[(String, u64)],
+) -> Result<SectionData, String> {
+    use plow_asset::packet_pipeline::{PipelineDType, PipelineTensor};
+    let causal = causal_pipeline_section(model, spec)?;
+    let mut meta: PacketPipelines = serde_json::from_slice(&causal.data).map_err(|e| e.to_string())?;
+    let pipe = meta.pipelines.first_mut().ok_or("causal section has no pipeline")?;
+    pipe.driver = T3_DRIVER.into();
+    let t = model.tensors.get(pos_base as usize).ok_or("T3 pos_base tensor is missing")?;
+    pipe.tensors.insert(
+        "pos_base".into(),
+        PipelineTensor { name: t.name.clone(), dtype: PipelineDType::U32, shape: vec![u64::from(spec.decode_capacity)] },
+    );
+    for (k, v) in params {
+        pipe.parameters.insert(format!("t3.{k}"), *v);
+    }
+    meta.validate(model.progs.len(), |name| model.tensors.iter().find(|t| t.name == name).map(|t| t.bytes))?;
+    Ok(SectionData { kind: causal.kind, name: SECTION.into(), data: serde_json::to_vec(&meta).map_err(|e| e.to_string())? })
+}
+
 pub fn profile(name: &str) -> Result<&'static SpeechProfile, String> {
     match name {
         "veena" => Ok(&VEENA),

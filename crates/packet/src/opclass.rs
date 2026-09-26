@@ -125,7 +125,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
 
         Nop | Residual | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32 | CastF32Bf16
         | PerLayerInput | ScaledAddF32 | GluF32 | SiluF32 | ReluF32 | BroadcastAddF32 | EmbedF16F32
-        | EmbedOverlayBf16 | PackNcfwRowsF32 => &["elementwise"],
+        | EmbedOverlayBf16 | EmbedPosBf16 | PackNcfwRowsF32 => &["elementwise"],
     }
 }
 

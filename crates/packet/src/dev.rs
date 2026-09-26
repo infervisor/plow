@@ -2033,6 +2033,13 @@ pub enum DevOp {
     /// t2=krot_stage(bf16[rows][64]) t3=scale_stage(f32[rows]) t4=ckv t5=krot t6=kv_scale` ·
     /// `i0=rows i1=local_stride i2=page_shift i3=degree_shift i5=batched`.
     DcpKvScatter = 183,
+    /// Token embedding plus a learned POSITION embedding indexed from a per-row base:
+    /// `out[r] = bf16(table[tokens[r]] + pos_table[pos[r] - base[r]])`. Chatterbox T3 decode
+    /// (speech_emb + speech_pos_emb, the speech index counted from the row's speech start).
+    /// `t0=out(bf16[rows,width]) t1=table(bf16[vocab,width]) t2=tokens(u32[rows])
+    /// t3=pos_table(bf16[pos_rows,width]) t4=pos(u32[rows]) t5=base(u32[rows])` ·
+    /// `i0=rows i1=width i2=vocab i3=pos_rows`.
+    EmbedPosBf16 = 184,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2232,6 +2239,7 @@ impl DevOp {
         DevOp::DcpKvPack,
         DevOp::XDcpGather,
         DevOp::DcpKvScatter,
+        DevOp::EmbedPosBf16,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2436,6 +2444,7 @@ impl DevOp {
             DevOp::DcpKvPack => "PLOW_DOP_DCP_KV_PACK",
             DevOp::XDcpGather => "PLOW_DOP_XDCP_GATHER",
             DevOp::DcpKvScatter => "PLOW_DOP_DCP_KV_SCATTER",
+            DevOp::EmbedPosBf16 => "PLOW_DOP_EMBED_POS_BF16",
         }
     }
 
@@ -2486,7 +2495,8 @@ impl DevOp {
     /// 180 -> 181 for GLM's BF16-input/FP32-weight/FP32-output router GEMM.
     /// 181 -> 184 for `DcpKvPack = 181` / `XDcpGather = 182` / `DcpKvScatter = 183` (decode
     /// context parallelism).
-    pub const COUNT: u16 = 184;
+    /// 184 -> 185 for `EmbedPosBf16 = 184` (Chatterbox T3 learned speech positions).
+    pub const COUNT: u16 = 185;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

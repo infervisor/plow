@@ -10,6 +10,8 @@
 pub mod codec;
 #[cfg(feature = "cuda")]
 pub mod serving;
+#[cfg(feature = "cuda")]
+pub mod t3;
 
 use std::path::Path;
 
