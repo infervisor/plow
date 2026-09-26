@@ -41,6 +41,9 @@ pub struct ServeOpts {
     /// Requests admitted but not finished (queued + running); beyond it the server answers 429.
     pub max_queued: usize,
     pub engine: EngineOpts,
+    /// Measure instead of serving: (rung spec, reps per rung, report path). See
+    /// [`Engine::rung_bench`].
+    pub rung_bench: Option<(String, usize, Option<PathBuf>)>,
 }
 
 /// What the scheduler sends a request's HTTP side.
@@ -586,6 +589,15 @@ pub async fn run(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
     let eng = Engine::load(&opts.ckpt, &cubin, opts.engine)?;
     tracing::info!(target: "dsv41", "engine loaded in {:.0}s", t0.elapsed().as_secs_f32());
     let vocab = eng.cfg.vocab;
+    if let Some((spec, reps, path)) = opts.rung_bench {
+        let mut eng = eng;
+        let report = eng.rung_bench(&spec, reps.max(1))?;
+        if let Some(p) = path {
+            std::fs::write(&p, &report)?;
+            tracing::info!(target: "dsv41", "rung report written to {}", p.display());
+        }
+        return Ok(());
+    }
     let (jtx, jrx) = mpsc::unbounded_channel();
     let inflight = Arc::new(AtomicUsize::new(0));
     let health = Arc::new(Health { dead: AtomicBool::new(false), busy_since_ms: AtomicU64::new(0), epoch: Instant::now() });

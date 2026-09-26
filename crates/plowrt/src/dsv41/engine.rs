@@ -20,7 +20,7 @@ use crate::error::{Result, RuntimeError};
 use crate::text::engram::{build_compressed_token_map, v41_hash_tables, EngramHasher};
 
 use super::config::Cfg;
-use super::kernels::{cdiv, A};
+use super::kernels::{cdiv, KTotal, A};
 use super::stage::{Shared, Stage, Step};
 use super::weights::Layer;
 
@@ -528,25 +528,139 @@ impl Engine {
         let per: Vec<String> = p.stage_ms[kind].iter().map(|v| format!("{:.2}", v / n)).collect();
         tracing::info!(target: "dsv41", "{} t={} nb={}: step {:.2} ms (stages [{}]) avg over {n}", if st.decode { "decode" } else { "prefill" }, st.t, st.nb(), p.host_ms[kind] / n, per.join(", "));
         if self.prof_kernels {
-            let mut all: std::collections::HashMap<&'static str, (u64, f64)> = std::collections::HashMap::new();
-            for s in &self.stages {
-                if let Some(kp) = &s.k.prof {
-                    for (k, (cnt, ms)) in kp.borrow_mut().totals.drain() {
-                        let e = all.entry(k).or_insert((0, 0.0));
-                        e.0 += cnt;
-                        e.1 += ms;
-                    }
-                }
-            }
-            let mut v: Vec<_> = all.into_iter().collect();
-            v.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
-            let top: Vec<String> = v.iter().take(12).map(|(k, (cnt, ms))| format!("{k} {:.2}ms/step ({} calls)", ms / n, cnt / n as u64)).collect();
-            tracing::info!(target: "dsv41", "  kernels: {}", top.join("; "));
+            let rows = self.kernel_totals();
+            let lines: Vec<String> = rows.iter().take(12).map(|(k, t)| {
+                let eff = if t.ms > 0.0 && t.floor_ms > 0.0 { format!(" {:.0}% of roofline", 100.0 * t.floor_ms / t.ms) } else { String::new() };
+                format!("{k} {:.2}ms/step ({} calls){eff}", t.ms / n, t.calls / n as u64)
+            }).collect();
+            tracing::info!(target: "dsv41", "  kernels: {}", lines.join("; "));
         }
         p.steps[kind] = 0;
         p.host_ms[kind] = 0.0;
         p.stage_ms[kind].iter_mut().for_each(|v| *v = 0.0);
         Ok(())
+    }
+
+    /// Drain every stage's per-kernel totals, merged by kernel name, largest time first.
+    fn kernel_totals(&self) -> Vec<(&'static str, KTotal)> {
+        let mut all: std::collections::HashMap<&'static str, KTotal> = std::collections::HashMap::new();
+        for s in &self.stages {
+            if let Some(kp) = &s.k.prof {
+                for (k, t) in kp.borrow_mut().totals.drain() {
+                    let e = all.entry(k).or_default();
+                    e.calls += t.calls;
+                    e.ms += t.ms;
+                    e.flops += t.flops;
+                    e.bytes += t.bytes;
+                    e.floor_ms += t.floor_ms;
+                    e.peak = e.peak.or(t.peak);
+                }
+            }
+        }
+        let mut v: Vec<_> = all.into_iter().collect();
+        v.sort_by(|a, b| b.1.ms.total_cmp(&a.1.ms));
+        v
+    }
+
+    fn set_kernel_events(&self, on: bool) {
+        for s in &self.stages {
+            if let Some(kp) = &s.k.prof {
+                kp.borrow_mut().on = on;
+            }
+        }
+    }
+
+    /// The perf campaign's measurement: for each rung, the unperturbed step time, then a per-kernel
+    /// breakdown against the roofline (needs `PLOW_DSV41_PROFILE=2`). `spec`:
+    /// `prefill=1024,4096;decode=1x1024,64x1024` -- prefill token counts, decode batch x context.
+    /// Decode rungs run on synthetic positions (cache contents do not change the work done).
+    pub fn rung_bench(&mut self, spec: &str, reps: usize) -> Result<String> {
+        let mut out = String::new();
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "# dsv41 rung bench ({} stages, H200 roofline: HBM 4.8 TB/s, fp8 1979 / bf16 989 / fp32 67 TFLOP/s dense)\n", self.stages.len());
+        let mut rungs: Vec<(bool, usize, usize)> = Vec::new(); // (decode, batch or tokens, context)
+        for part in spec.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            let (kind, list) = part.split_once('=').ok_or_else(|| RuntimeError::Device(format!("rung spec: {part}")))?;
+            for item in list.split(',').map(str::trim) {
+                match kind.trim() {
+                    "prefill" => rungs.push((false, item.parse().map_err(|_| RuntimeError::Device(format!("rung: {item}")))?, 0)),
+                    "decode" => {
+                        let (b, ctx) = item.split_once('x').ok_or_else(|| RuntimeError::Device(format!("decode rung {item}: want BxCTX")))?;
+                        rungs.push((true, b.parse().map_err(|_| RuntimeError::Device(format!("rung: {item}")))?, ctx.parse().map_err(|_| RuntimeError::Device(format!("rung: {item}")))?));
+                    }
+                    k => return Err(RuntimeError::Device(format!("rung spec: unknown kind {k}"))),
+                }
+            }
+        }
+        let tok = |i: usize| ((i * 7919 + 13) % 120_000 + 10) as u32;
+        let greedy = Sampling::default();
+        for (decode, n, ctx) in rungs {
+            if n > self.slots.len() && decode {
+                let _ = writeln!(out, "## decode B={n} ctx={ctx}: skipped (max_slots {})\n", self.slots.len());
+                continue;
+            }
+            let run = |eng: &mut Engine, pos_base: usize| -> Result<()> {
+                if decode {
+                    let seqs: Vec<(usize, Vec<u32>, usize)> = (0..n).map(|b| (b, vec![tok(b)], pos_base + b)).collect();
+                    let samp = vec![greedy; n];
+                    eng.step(&seqs, true, &samp).map(|_| ())
+                } else {
+                    eng.release(0)?;
+                    let ids: Vec<u32> = (0..n).map(tok).collect();
+                    eng.step(&[(0, ids, 0)], false, &[greedy]).map(|_| ())
+                }
+            };
+            // unperturbed timing
+            self.set_kernel_events(false);
+            run(self, ctx)?; // warm-up
+            let t0 = std::time::Instant::now();
+            for r in 0..reps {
+                run(self, ctx + r)?;
+            }
+            let step_ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            // per-kernel breakdown
+            let mut rows = Vec::new();
+            if self.prof_kernels {
+                self.set_kernel_events(true);
+                let _ = self.kernel_totals();
+                run(self, ctx)?;
+                for s in &self.stages {
+                    s.k.prof_collect()?;
+                }
+                rows = self.kernel_totals();
+            }
+            let (gpu_ms, floor_ms): (f64, f64) = rows.iter().fold((0.0, 0.0), |a, (_, t)| (a.0 + t.ms, a.1 + t.floor_ms));
+            let mark = out.len();
+            let title = if decode { format!("decode B={n} ctx={ctx}") } else { format!("prefill T={n}") };
+            let tok_s = if decode { n as f64 / step_ms * 1e3 } else { n as f64 / step_ms * 1e3 };
+            let _ = writeln!(out, "## {title}: step {step_ms:.2} ms ({tok_s:.0} tok/s); kernels {gpu_ms:.2} ms GPU, roofline floor {floor_ms:.2} ms ({:.1}% of floor)\n", if gpu_ms > 0.0 { 100.0 * floor_ms / gpu_ms } else { 0.0 });
+            if !rows.is_empty() {
+                let _ = writeln!(out, "| kernel | calls | ms | % step | TB/s | TFLOP/s | floor ms | eff | bound |");
+                let _ = writeln!(out, "|---|---:|---:|---:|---:|---:|---:|---:|---|");
+                for (k, t) in &rows {
+                    let s = t.ms / 1e3;
+                    let bound = match t.peak {
+                        Some(p) if t.flops / super::kernels::peak_flops(p) > t.bytes / super::kernels::HBM_BYTES_PER_S => format!("{p:?}"),
+                        Some(_) => "mem".to_string(),
+                        None => "-".to_string(),
+                    };
+                    let _ = writeln!(
+                        out,
+                        "| {k} | {} | {:.3} | {:.1} | {} | {} | {} | {} | {bound} |",
+                        t.calls,
+                        t.ms,
+                        100.0 * t.ms / gpu_ms.max(1e-9),
+                        if t.bytes > 0.0 { format!("{:.2}", t.bytes / s / 1e12) } else { "-".into() },
+                        if t.flops > 0.0 { format!("{:.1}", t.flops / s / 1e12) } else { "-".into() },
+                        if t.floor_ms > 0.0 { format!("{:.3}", t.floor_ms) } else { "-".into() },
+                        if t.floor_ms > 0.0 { format!("{:.0}%", 100.0 * t.floor_ms / t.ms) } else { "-".into() },
+                    );
+                }
+                let _ = writeln!(out);
+            }
+            eprint!("{}", &out[mark..]);
+        }
+        Ok(out)
     }
 
     pub fn n_slots(&self) -> usize {

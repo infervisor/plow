@@ -14,7 +14,7 @@ use crate::device::{Backend, DeviceMem};
 use crate::error::{Result, RuntimeError};
 
 use super::config::Cfg;
-use super::kernels::{cdiv, moe_smem, Kernels, A, IX_SMEM, SA_SMEM};
+use super::kernels::{cdiv, moe_smem, Cost, Kernels, Peak, A, IX_SMEM, SA_SMEM};
 use super::weights::Layer;
 
 /// Bump allocator over one device allocation; `mark`/`reset` scope per-layer scratch.
@@ -224,6 +224,7 @@ impl Stage {
 
     // ------------------------------------------------------------------ primitives
     fn rmsnorm(&self, y: u64, x: u64, w: u64, m: usize, d: usize) -> Result<()> {
+        self.k.cost(Cost::mem((m * d * 4) as f64));
         self.launch("dsv_rmsnorm", [m as u32, 1, 1], 256, 0, &[A::P(y), A::P(x), A::P(w), A::I(d as i32), A::L(d as i64), A::L(d as i64), A::F(self.cfg.eps)])
     }
     /// e4m3 codes + ue8m0 scales of x [m][kd].
@@ -231,17 +232,22 @@ impl Stage {
         let q = self.arena.alloc((m * kd) as u64)?;
         let s = self.arena.alloc((m * kd / 32) as u64)?;
         let groups = (m * kd / 32) as u64;
+        self.k.cost(Cost::mem((m * kd * 3) as f64 + (m * kd / 32) as f64));
         self.launch("dsv_act_quant_fp8", [cdiv(groups, 8), 1, 1], 256, 0, &[A::P(q), A::P(s), A::P(0), A::P(x), A::I(m as i32), A::I(kd as i32), A::L(kd as i64)])?;
         Ok((q, s))
     }
     fn fq8(&self, x: u64, m: usize, kd: usize) -> Result<()> {
         let groups = (m * kd / 32) as u64;
+        self.k.cost(Cost::mem((m * kd * 4) as f64));
         self.launch("dsv_act_quant_fp8", [cdiv(groups, 8), 1, 1], 256, 0, &[A::P(0), A::P(0), A::P(x), A::P(x), A::I(m as i32), A::I(kd as i32), A::L(kd as i64)])
     }
     fn fq4(&self, x: u64, n: usize, gs: i32, e4m3: i32) -> Result<()> {
+        self.k.cost(Cost::mem((n * 4) as f64));
         self.launch("dsv_fp4_fakequant", [cdiv(n as u64, 256), 1, 1], 256, 0, &[A::P(x), A::L(n as i64), A::I(gs), A::I(e4m3)])
     }
     fn w8a8(&self, c: u64, qs: (u64, u64), w: (u64, u64), m: usize, n: usize, kd: usize, f32out: bool) -> Result<()> {
+        let (mf, nf, kf) = (m as f64, n as f64, kd as f64);
+        self.k.cost(Cost { flops: 2.0 * mf * nf * kf, bytes: mf * kf * 1.03 + nf * kf * 1.001 + mf * nf * if f32out { 4.0 } else { 2.0 }, peak: Peak::Fp8Mma });
         self.launch(
             "dsv_gemm_w8a8",
             [cdiv(n as u64, 128), cdiv(m as u64, 64), 1],
@@ -251,6 +257,8 @@ impl Stage {
         )
     }
     fn bf16w(&self, c: u64, a: u64, w: u64, ws: u64, m: usize, n: usize, kd: usize) -> Result<()> {
+        let (mf, nf, kf) = (m as f64, n as f64, kd as f64);
+        self.k.cost(Cost { flops: 2.0 * mf * nf * kf, bytes: mf * kf * 2.0 + nf * kf * if ws != 0 { 1.001 } else { 2.0 } + mf * nf * 2.0, peak: Peak::Bf16Mma });
         self.launch(
             "dsv_gemm_bf16w",
             [cdiv(n as u64, 128), cdiv(m as u64, 64), 1],
@@ -268,6 +276,7 @@ impl Stage {
         let (c, s) = if compressed { self.rope_c } else { self.rope_w };
         let rd = self.cfg.rope_dim;
         let total = (n_tok * n_head * rd / 2) as u64;
+        self.k.cost(Cost::mem((n_tok * n_head * rd * 4) as f64 + (n_tok * rd * 4) as f64));
         self.launch(
             "dsv_rope",
             [cdiv(total, 256), 1, 1],
@@ -281,6 +290,7 @@ impl Stage {
         let h = self.cfg.hidden;
         let hcm = self.cfg.hc_mult;
         let rsq = self.arena.alloc((t * 4) as u64)?;
+        self.k.cost(Cost::mem((t * hcm * h * 2) as f64));
         self.launch("dsv_row_rsqrt", [t as u32, 1, 1], 256, 0, &[A::P(rsq), A::P(x), A::I((hcm * h) as i32), A::F(self.cfg.eps)])?;
         let nmix = (2 + hcm) * hcm;
         let mixes = self.arena.alloc((t * nmix * 4) as u64)?;
@@ -299,10 +309,12 @@ impl Stage {
     }
     fn hc_pre(&self, y: u64, x: u64, pre: u64, t: usize) -> Result<()> {
         let h = self.cfg.hidden;
+        self.k.cost(Cost::mem((t * h * 10) as f64));
         self.launch("dsv_hc_pre", [cdiv((t * h) as u64, 256), 1, 1], 256, 0, &[A::P(y), A::P(x), A::P(pre), A::I(t as i32), A::I(h as i32)])
     }
     fn hc_post(&self, out: u64, y: u64, res: u64, post: u64, comb: u64, t: usize) -> Result<()> {
         let h = self.cfg.hidden;
+        self.k.cost(Cost::mem((t * h * 18) as f64));
         self.launch("dsv_hc_post", [cdiv((t * h) as u64, 256), 1, 1], 256, 0, &[A::P(out), A::P(y), A::P(res), A::P(post), A::P(comb), A::I(t as i32), A::I(h as i32)])
     }
 
@@ -502,6 +514,9 @@ impl Stage {
                     let s_ld = s_max.next_multiple_of(64);
                     let score = self.arena.alloc((t * s_ld * 2) as u64)?;
                     let kp = self.ptrs(&kreg, m)?;
+                    // each (query, head) row against the visible keys; keys stream once per 4-query tile
+                    let s_avg = if st.decode { s_max as f64 } else { s_max as f64 / 2.0 };
+                    self.k.cost(Cost { flops: 2.0 * (t * ixh * ixd) as f64 * s_avg, bytes: (t * ixh * ixd * 2) as f64 + (t as f64) * s_avg * 2.0 + (st.nb() * s_max * ixd * 2) as f64, peak: Peak::Bf16Mma });
                     self.launch(
                         "dsv_index_score",
                         [(s_ld / 64) as u32, cdiv(t as u64, 4), 1],
@@ -534,6 +549,7 @@ impl Stage {
                     }
                     let kout = c.index_topk.min(s_max);
                     let idx = self.topk_buf;
+                    self.k.cost(Cost::mem((t * s_ld * 2 * 3) as f64 + (t * kout * 4) as f64));
                     self.launch(
                         "dsv_topk_select",
                         [t as u32, 1, 1],
@@ -569,6 +585,8 @@ impl Stage {
             &[A::P(table), A::I(t as i32), A::I(st.q_per_b() as i32), A::I(win as i32), A::I(st.decode as i32), A::P(m.b_pos), A::P(cmp_idx), A::I(n_cmp as i32)],
         )?;
         let o = self.arena.alloc((t * nh * hd * 2) as u64)?;
+        // q, o and the gathered KV rows; S = Q.K^T and P.V per head
+        self.k.cost(Cost { flops: 4.0 * (t * nh * n_idx * hd) as f64, bytes: (t * nh * hd * 4) as f64 + (t * n_idx * hd * 2) as f64, peak: Peak::Bf16Mma });
         self.launch(
             "dsv_sparse_attn",
             [t as u32, 1, 1],
@@ -581,6 +599,7 @@ impl Stage {
         let (og, or) = (c.o_groups, c.o_lora);
         let kg = nh * hd / og;
         let ga = self.arena.alloc((t * og * or * 2) as u64)?;
+        self.k.cost(Cost { flops: 2.0 * (t * og * or * kg) as f64, bytes: (t * nh * hd * 2) as f64 + (og * or * kg) as f64 * 1.001 + (t * og * or * 2) as f64, peak: Peak::Bf16Mma });
         self.launch(
             "dsv_gemm_bf16w",
             [cdiv(or as u64, 128), cdiv(t as u64, 64), og as u32],
@@ -622,6 +641,7 @@ impl Stage {
         self.f32gemm(logits, hn, ly.gate_w, t, e, h, true, true)?;
         let idx = self.arena.alloc((t * tk * 4) as u64)?;
         let wt = self.arena.alloc((t * tk * 4) as u64)?;
+        self.k.cost(Cost::mem((t * e * 4) as f64));
         self.launch("dsv_moe_route", [cdiv(t as u64, 8), 1, 1], 256, 0, &[A::P(idx), A::P(wt), A::P(logits), A::P(ly.gate_b), A::I(t as i32), A::I(e as i32), A::I(tk as i32), A::I(c.norm_topk as i32), A::F(c.route_scale)])?;
         let n = t * tk;
         let counts = self.arena.alloc((e * 4) as u64)?;
@@ -639,8 +659,11 @@ impl Stage {
         let rowpos = self.arena.alloc((n * 4) as u64)?;
         let roww = self.arena.alloc((n * 4) as u64)?;
         self.launch("dsv_moe_fill", [cdiv(n as u64, 256), 1, 1], 256, 0, &[A::P(rows), A::P(rowpos), A::P(roww), A::P(ctr), A::P(offs), A::P(idx), A::P(wt), A::I(n as i32), A::I(tk as i32)])?;
+        // distinct experts a batch of t tokens touches, in expectation (uniform routing)
+        let touched = (e as f64) * (1.0 - (1.0 - tk as f64 / e as f64).powf(t as f64));
         let xq = self.quant(hn, t, h)?;
         let gu = self.arena.alloc((n * 2 * mi * 2) as u64)?;
+        self.k.cost(Cost { flops: 2.0 * (n * 2 * mi * h) as f64, bytes: touched * (2 * mi) as f64 * (h as f64 / 2.0 + h as f64 / 32.0) + (n * h) as f64 + (n * 2 * mi * 2) as f64, peak: Peak::Fp8Mma });
         self.launch(
             "dsv_moe_gemm_fp4",
             [cdiv((2 * mi) as u64, 128), max_tiles as u32, 1],
@@ -650,6 +673,7 @@ impl Stage {
         )?;
         let hq = self.arena.alloc((n * mi) as u64)?;
         let hs = self.arena.alloc((n * mi / 32) as u64)?;
+        self.k.cost(Cost::mem((n * 2 * mi * 2 + n * mi + n * mi / 32 + n * 4) as f64));
         self.launch(
             "dsv_swiglu_quant",
             [cdiv((n * mi / 32) as u64, 8), 1, 1],
@@ -658,6 +682,7 @@ impl Stage {
             &[A::P(hq), A::P(hs), A::P(gu), A::P(gu + (mi * 2) as u64), A::L((2 * mi) as i64), A::P(roww), A::I(n as i32), A::I(mi as i32), A::F(c.swiglu_limit), A::P(0)],
         )?;
         let down = self.arena.alloc((n * h * 2) as u64)?;
+        self.k.cost(Cost { flops: 2.0 * (n * h * mi) as f64, bytes: touched * h as f64 * (mi as f64 / 2.0 + mi as f64 / 32.0) + (n * mi) as f64 + (n * h * 2) as f64, peak: Peak::Fp8Mma });
         self.launch(
             "dsv_moe_gemm_fp4",
             [cdiv(h as u64, 128), max_tiles as u32, 1],
@@ -670,6 +695,7 @@ impl Stage {
         self.w8a8(sgu, xq, (ly.sh_w13.w, ly.sh_w13.s), t, 2 * mi, h, false)?;
         let shq = self.arena.alloc((t * mi) as u64)?;
         let shs = self.arena.alloc((t * mi / 32) as u64)?;
+        self.k.cost(Cost::mem((t * 2 * mi * 2 + t * mi + t * mi / 32) as f64));
         self.launch(
             "dsv_swiglu_quant",
             [cdiv((t * mi / 32) as u64, 8), 1, 1],
@@ -679,6 +705,7 @@ impl Stage {
         )?;
         let shared = self.arena.alloc((t * h * 2) as u64)?;
         self.w8a8(shared, (shq, shs), (ly.sh_w2.w, ly.sh_w2.s), t, h, mi, false)?;
+        self.k.cost(Cost::mem((n * h * 2 + t * h * 4) as f64));
         self.launch("dsv_moe_combine", [t as u32, 1, 1], 256, 0, &[A::P(y), A::P(down), A::P(shared), A::P(idx), A::P(rowpos), A::I(t as i32), A::I(h as i32), A::I(tk as i32)])
     }
 

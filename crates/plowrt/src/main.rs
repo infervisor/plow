@@ -391,6 +391,15 @@ enum Cmd {
         /// Requests admitted but unfinished (queued + running); beyond it the server answers 429.
         #[arg(long, id = "dsv41_max_queued", default_value_t = 1024)]
         max_queued: usize,
+        /// Measure rungs instead of serving, e.g. "prefill=1024,4096;decode=1x1024,64x1024".
+        /// Per-kernel roofline tables need PLOW_DSV41_PROFILE=2.
+        #[arg(long, id = "dsv41_rung_bench")]
+        rung_bench: Option<String>,
+        #[arg(long, id = "dsv41_rung_reps", default_value_t = 5)]
+        rung_reps: usize,
+        /// Where to write the rung report (markdown).
+        #[arg(long, id = "dsv41_rung_out")]
+        rung_out: Option<PathBuf>,
     },
     /// Run a BLOCK asset (act.x in, act.x out) through the AMD engine.
     ///
@@ -1112,7 +1121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBlock { .. } => Err("plowrt was built without --features hsa".into()),
         #[cfg(feature = "cuda")]
-        Cmd::Dsv41Serve { ckpt, cubin, port, max_len, max_slots, bounds, arena_gib, served_model_name, max_queued } => {
+        Cmd::Dsv41Serve { ckpt, cubin, port, max_len, max_slots, bounds, arena_gib, served_model_name, max_queued, rung_bench, rung_reps, rung_out } => {
             let bounds: Vec<usize> = bounds
                 .split(',')
                 .map(|v| v.trim().parse::<usize>())
@@ -1124,6 +1133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 port,
                 model_name: served_model_name,
                 max_queued,
+                rung_bench: rung_bench.map(|s| (s, rung_reps, rung_out)),
                 engine: plowrt::dsv41::engine::EngineOpts { max_len, max_slots, bounds, arena_bytes: arena_gib << 30 },
             })
             .await

@@ -139,18 +139,19 @@ __device__ __forceinline__ uint32_t e2m1x4_to_e4m3x4(uint32_t x16) {
 // row0 .. min(row0+64, offs[e+1]) of the expert-sorted list: C[p][n] = sum_kb (A8[tok(p)] . W4[e][n]) *
 // sa[tok(p)][kb] * sw[e][n][kb]. A is indexed by token (gather through `rows`) unless a_by_row, in which
 // case A row p itself (the down projection reads the SwiGLU output, already in sorted order).
-// W fp4 packed [N][K/2] per expert (element 2i in the low nibble), sw ue8m0 [N][K/32]. K % 64 == 0.
+// W fp4 packed [N][K/2] per expert (element 2i in the low nibble), sw ue8m0 [N][K/32]. K % 128 == 0.
 //
-// Tile 64 x 128, 4 warps (2 x 2, warp tile 32 x 64). A three-stage cp.async ring stages 64 K per
+// Tile 64 x 128, 4 warps (2 x 2, warp tile 32 x 64). A three-stage cp.async ring stages 128 K per
 // stage: the gathered e4m3 A rows and the RAW packed weights; the B fragments are decoded from the
-// raw nibbles in registers. Both scale grids for the tile are staged once, up front.
-// Dynamic shared memory: G_SMEM(K) bytes.
+// raw nibbles in registers. Both scale grids for the tile are staged up front with vector copies
+// (the tile's weight scales are one contiguous block). Dynamic shared memory: G_SMEM(K) bytes.
 #define G_BM 64
 #define G_BN 128
 #define G_ST 3
-#define G_ALD 80  // A row: 64 B + pad (20 words: fragment rows land on distinct banks)
-#define G_WLD 48  // W row: 32 B raw (64 fp4) + pad
-#define G_SMEM(K) (G_ST * G_BM * G_ALD + G_ST * G_BN * G_WLD + (G_BN + G_BM) * ((K) / 32) + G_BM * 4)
+#define G_KS 128  // K per stage
+#define G_ALD 144 // A row: 128 B + pad (36 words: fragment rows land on distinct banks)
+#define G_WLD 80  // W row: 64 B raw (128 fp4) + pad (20 words)
+#define G_SMEM(K) (G_ST * G_BM * G_ALD + G_ST * G_BN * G_WLD + (G_BN + G_BM) * ((K) / 32) + G_BM * 4 + 16)
 
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, int bytes) {
     const uint32_t d = (uint32_t)__cvta_generic_to_shared(dst);
@@ -165,12 +166,13 @@ DSV_EXTERN void __launch_bounds__(128)
     extern __shared__ __align__(16) uint8_t g_smem[];
     const int tile = blockIdx.y;
     if (tile >= meta[0]) return;
-    const int KB = K >> 5, KS = K >> 6;
+    const int KB = K >> 5, KS = K / G_KS;
     uint8_t* As = g_smem;                                  // [ST][64][80]
     uint8_t* Ws = As + G_ST * G_BM * G_ALD;                // [ST][128][48]
     uint8_t* SWs = Ws + G_ST * G_BN * G_WLD;               // [128][KB] weight scales
     uint8_t* SAs = SWs + G_BN * KB;                        // [64][KB] activation scales
     int* Arow = (int*)(SAs + G_BM * KB + ((16 - ((G_BN + G_BM) * KB) % 16) % 16));
+    const int kb_per_stage = G_KS / 32;
     const int e = tiles[tile * 2], row0 = tiles[tile * 2 + 1];
     const int rend = offs[e + 1];
     const int n0 = blockIdx.x * G_BN;
@@ -184,29 +186,33 @@ DSV_EXTERN void __launch_bounds__(128)
         Arow[tid] = p < rend ? (a_by_row ? p : rows[p]) : -1;
     }
     __syncthreads();
-    // scales for the whole tile
-    for (int i = tid; i < G_BN * KB; i += 128) {
-        const int r = i / KB, kb = i % KB;
-        const int gn = n0 + r;
-        SWs[i] = gn < N ? Se[(long long)gn * KB + kb] : 0;
-    }
-    for (int i = tid; i < G_BM * KB; i += 128) {
-        const int r = i / KB, kb = i % KB;
-        const int ar = Arow[r];
-        SAs[i] = ar >= 0 ? sa[(long long)ar * KB + kb] : 0;
+    // Scales for the whole tile. The weight scales of rows n0..n0+127 are one contiguous
+    // 128*KB-byte block (N is a multiple of 128 for every V4.1 expert GEMM); the activation scales
+    // are gathered per row, KB bytes each (KB % 8 == 0), with 8-byte loads.
+    {
+        const int chunks = G_BN * KB / 16;
+        const uint8_t* src = Se + (long long)n0 * KB;
+        for (int c = tid; c < chunks; c += 128) cp_async16(&SWs[c * 16], src + c * 16, n0 + (c * 16) / KB < N ? 16 : 0);
+        const int per_row = KB / 8;
+        for (int c = tid; c < G_BM * per_row; c += 128) {
+            const int r = c / per_row, off = (c % per_row) * 8;
+            const int ar = Arow[r];
+            *(uint2*)&SAs[r * KB + off] = ar >= 0 ? *(const uint2*)(sa + (long long)ar * KB + off) : make_uint2(0, 0);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
     }
     auto load = [&](int slot, int ks) {
 #pragma unroll
-        for (int i = 0; i < 2; i++) {  // A: 64 rows x 4 chunks of 16 B
-            const int c = tid + i * 128, r = c >> 2, off = (c & 3) * 16;
+        for (int i = 0; i < 4; i++) {  // A: 64 rows x 8 chunks of 16 B
+            const int c = tid + i * 128, r = c >> 3, off = (c & 7) * 16;
             const int ar = Arow[r];
-            cp_async16(&As[(slot * G_BM + r) * G_ALD + off], A + (long long)max(ar, 0) * K + ks * 64 + off, ar >= 0 ? 16 : 0);
+            cp_async16(&As[(slot * G_BM + r) * G_ALD + off], A + (long long)max(ar, 0) * K + ks * G_KS + off, ar >= 0 ? 16 : 0);
         }
 #pragma unroll
-        for (int i = 0; i < 2; i++) {  // W: 128 rows x 2 chunks of 16 B (raw fp4)
-            const int c = tid + i * 128, r = c >> 1, off = (c & 1) * 16;
+        for (int i = 0; i < 4; i++) {  // W: 128 rows x 4 chunks of 16 B (raw fp4)
+            const int c = tid + i * 128, r = c >> 2, off = (c & 3) * 16;
             const int gn = n0 + r;
-            cp_async16(&Ws[(slot * G_BN + r) * G_WLD + off], We + (long long)min(gn, N - 1) * (K / 2) + ks * 32 + off, gn < N ? 16 : 0);
+            cp_async16(&Ws[(slot * G_BN + r) * G_WLD + off], We + (long long)min(gn, N - 1) * (K / 2) + ks * (G_KS / 2) + off, gn < N ? 16 : 0);
         }
         asm volatile("cp.async.commit_group;\n" ::);
     };
@@ -226,8 +232,8 @@ DSV_EXTERN void __launch_bounds__(128)
         if (ks + 2 < KS) load((ks + 2) % G_ST, ks + 2); else asm volatile("cp.async.commit_group;\n" ::);
         const int slot = ks % G_ST;
 #pragma unroll
-        for (int kk = 0; kk < 2; kk++) {
-            const int kb = ks * 2 + kk;
+        for (int kk = 0; kk < G_KS / 32; kk++) {
+            const int kb = ks * kb_per_stage + kk;
             uint32_t af[2][4], bfr[8][2];
 #pragma unroll
             for (int i = 0; i < 2; i++) {
