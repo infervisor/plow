@@ -69,7 +69,15 @@ ASR gate v4: median CER 0.008 (n=40); baseline 0.026.
 ## Chatterbox
 
 T3 on plow: logits rel-L2 0.006-0.020 vs fp32 (top-1 4/4); 1.69 ms/token at 1 request (stock 12.7),
-8 concurrent 50.9 audio s/s. S3Gen native stage: agent in progress.
+8 concurrent 50.9 audio s/s. S3Gen native: mel rel-L2 2-5e-4, 30-37 ms/utterance (stock ~285).
+
+End to end on plowrt serve (/v1/audio/speech, full wav, H200, after the asr-nvidia merge):
+| conc | audio s/s | RTF | stock chatterbox |
+|---|---|---|---|
+| 1 | 17.42 | 0.055 | RTF 0.419 (~2.4 audio s/s, single request only) |
+| 8 | 49.94 | 0.152 | n/a (no batching) |
+ASR gate: median CER 0.000 (n=40), same as stock.
+Note: after merging worktree-asr-nvidia, rebuild lean-plow (plow_verify) before emitting.
 
 ## Findings
 
