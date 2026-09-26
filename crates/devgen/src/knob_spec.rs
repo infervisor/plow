@@ -1069,6 +1069,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.attention_decode_balance_gf", Some("PLOW_ATTENTION_DECODE_BALANCE_GF"), Layer::Emit, U32, GEMMA4_BALANCE_GF_DEFAULT, GEMMA4_RECIPE_QUALIFIED),
     KnobSpec::new("emit.fa_mmaqk", Some("PLOW_FA_MMAQK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.tts_profile", Some("PLOW_TTS_PROFILE"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("emit.tts_codec", Some("PLOW_TTS_CODEC_DIR"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.flash_merge_dsplit", Some("PLOW_FLASH_MERGE_DSPLIT"), Layer::Emit, U32, UNSET, DIAG),
     KnobSpec::new("emit.ns_mul", Some("PLOW_NS_MUL"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.ns_abs", Some("PLOW_NS_ABS"), Layer::Emit, U32, UNSET, OPT_IN),

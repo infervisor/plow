@@ -198,6 +198,10 @@ name = "asr_batch_dataset"
 path = "examples/asr/batch_dataset.rs"
 
 [[example]]
+name = "codec_check"
+path = "examples/codec_check.rs"
+
+[[example]]
 name = "asr_stream"
 path = "examples/asr/stream.rs"
 

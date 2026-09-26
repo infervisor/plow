@@ -371,6 +371,11 @@ impl BoundPacketPipeline {
         &self.name
     }
 
+    /// Every program role and its program index.
+    pub fn programs(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.programs.iter().map(|(role, &program)| (role.as_str(), program))
+    }
+
     pub fn driver(&self) -> &str {
         &self.driver
     }

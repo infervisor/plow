@@ -24,18 +24,18 @@ use plow_asset::packet_pipeline::PacketPipeline;
 use crate::{Result, RuntimeError};
 
 pub const DRIVER: &str = "tts.codec_lm.v1";
-const PROMPT_SPEAKER_TAG: u64 = 1;
-const CODEC_SNAC24K_FRAME7: u64 = 1;
 
 /// The numeric contract of one `tts.codec_lm.v1` pipeline, read from packet metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpeechContract {
     pub pipeline: String,
-    pub prompt_format: u64,
+    /// Prompt text with `{voice}` and `{input}` placeholders.
+    pub prompt_template: String,
+    /// The voice's vocabulary token with a `{voice}` placeholder.
+    pub voice_token: String,
     pub prefix: Vec<u32>,
     pub suffix: Vec<u32>,
     pub stops: Vec<u32>,
-    pub codec_kind: u64,
     pub sample_rate: u32,
     pub frame_codes: usize,
     pub codebook: u32,
@@ -64,11 +64,11 @@ impl SpeechContract {
         let f32p = |k: &str| get(k).map(|v| f32::from_bits(v as u32));
         let c = SpeechContract {
             pipeline: p.name.clone(),
-            prompt_format: get("prompt.format")?,
+            prompt_template: p.strings.get("prompt.template").cloned().ok_or_else(|| RuntimeError::Rejected("speech pipeline lacks prompt.template".into()))?,
+            voice_token: p.strings.get("prompt.voice_token").cloned().ok_or_else(|| RuntimeError::Rejected("speech pipeline lacks prompt.voice_token".into()))?,
             prefix: list("prompt.prefix")?,
             suffix: list("prompt.suffix")?,
             stops: list("stop")?,
-            codec_kind: get("codec.kind")?,
             sample_rate: get("audio.sample_rate")? as u32,
             frame_codes: get("codec.frame_codes")? as usize,
             codebook: get("codec.codebook")? as u32,
@@ -79,11 +79,8 @@ impl SpeechContract {
             temperature: f32p("sampling.temperature_f32")?,
             top_p: f32p("sampling.top_p_f32")?,
         };
-        if c.prompt_format != PROMPT_SPEAKER_TAG {
-            return Err(RuntimeError::Rejected(format!("unsupported prompt.format {}", c.prompt_format)));
-        }
-        if c.codec_kind != CODEC_SNAC24K_FRAME7 || c.frame_codes != 7 || c.frame_samples != 2048 || c.codebook != 4096 {
-            return Err(RuntimeError::Rejected("unsupported codec contract (want SNAC-24k, 7 codes/frame)".into()));
+        if !c.prompt_template.contains("{input}") || !c.voice_token.contains("{voice}") {
+            return Err(RuntimeError::Rejected("speech prompt templates need {input} and {voice}".into()));
         }
         Ok(c)
     }
@@ -99,14 +96,14 @@ impl SpeechContract {
         }
     }
 
-    /// Prompt text for `prompt.format` 1; the tokenizer encodes it between prefix and suffix.
+    /// The packet's prompt template; the tokenizer encodes it between prefix and suffix.
     pub fn prompt_text(&self, voice: &str, input: &str) -> String {
-        format!("<spk_{voice}> {input}")
+        self.prompt_template.replace("{voice}", voice).replace("{input}", input)
     }
 
-    /// The speaker tag must be one vocabulary token, which is how a voice is known to exist.
+    /// The voice's token; it must be one vocabulary token, which is how a voice is known to exist.
     pub fn voice_token(&self, voice: &str) -> String {
-        format!("<spk_{voice}>")
+        self.voice_token.replace("{voice}", voice)
     }
 
     pub fn max_new_tokens(&self, input: &str) -> usize {
@@ -155,7 +152,6 @@ mod tests {
     fn pipeline() -> PacketPipeline {
         let mut p: BTreeMap<String, u64> = BTreeMap::new();
         for (k, v) in [
-            ("prompt.format", 1),
             ("prompt.prefix.count", 1),
             ("prompt.prefix.0", 128259),
             ("prompt.suffix.count", 3),
@@ -165,7 +161,6 @@ mod tests {
             ("stop.count", 2),
             ("stop.0", 128258),
             ("stop.1", 128262),
-            ("codec.kind", 1),
             ("audio.sample_rate", 24000),
             ("codec.frame_codes", 7),
             ("codec.codebook", 4096),
@@ -179,7 +174,10 @@ mod tests {
             p.insert(k.into(), v);
         }
         PacketPipeline {
-            strings: Default::default(),
+            strings: BTreeMap::from([
+                ("prompt.template".into(), "<spk_{voice}> {input}".into()),
+                ("prompt.voice_token".into(), "<spk_{voice}>".into()),
+            ]),
             name: "speech".into(),
             driver: DRIVER.into(),
             programs: BTreeMap::new(),

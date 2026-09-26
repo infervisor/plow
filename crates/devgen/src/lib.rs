@@ -87,6 +87,7 @@ mod projection_rewrite;
 mod rewrite_lower;
 pub mod rnnt;
 pub mod tts;
+pub mod codec;
 pub mod tune_demand;
 pub mod segment_resource;
 
@@ -10255,6 +10256,12 @@ fn emit_dense_gqa(
         encoder.prefix.model.to_blob_v6(&[section])
     });
     std::fs::write(&out, blob).unwrap();
+    if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
+        let blob = codec::lower_snac(dir, n_cu, m.target).unwrap_or_else(|error| panic!("codec packet: {error}"));
+        let path = std::path::Path::new(&out).with_file_name("codec.pkt");
+        std::fs::write(&path, blob).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        eprintln!("  codec packet -> {}", path.display());
+    }
     if let Some(blob) = audio_blob {
         let path = std::path::Path::new(&out).with_file_name("encoder.pkt");
         std::fs::write(&path, blob).unwrap_or_else(|error| panic!("{}: {error}", path.display()));

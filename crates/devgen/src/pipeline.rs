@@ -937,6 +937,11 @@ impl StageProgram {
         Ok(Emitted { output, done })
     }
 
+    /// Handle of an already-declared tensor.
+    pub fn handle_of(&self, name: &str) -> Option<u32> {
+        (0..self.builder.n_tensors() as u32).find(|&h| self.builder.tensor_name(h) == name)
+    }
+
     /// Append the program to the prefix; `tag` is its `prog_t` entry.
     pub fn finish(mut self, tag: u32) -> PacketPrefix {
         let program = self.prefix.model.progs.len();

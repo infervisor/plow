@@ -318,6 +318,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_TTS_PROFILE")]
     pub tts_profile: Option<String>,
 
+    /// Exported codec decoder (scripts/tts/snac_export.py) to lower into `codec.pkt` beside the
+    /// speech packet.
+    #[arg(long, env = "PLOW_TTS_CODEC_DIR")]
+    pub tts_codec: Option<std::path::PathBuf>,
+
     /// Widen the flash-merge dispatch by this factor (diagnostic; measured no effect).
     #[arg(long, env = "PLOW_FLASH_MERGE_DSPLIT", hide = true)]
     pub flash_merge_dsplit: Option<u32>,
@@ -1412,6 +1417,7 @@ impl EmitConfig {
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
             fa_mmaqk: env_u32("PLOW_FA_MMAQK"),
             tts_profile: env_str("PLOW_TTS_PROFILE"),
+            tts_codec: env_str("PLOW_TTS_CODEC_DIR").map(std::path::PathBuf::from),
             flash_merge_dsplit: env_u32("PLOW_FLASH_MERGE_DSPLIT"),
             ns_mul: env_u32("PLOW_NS_MUL"),
             ns_abs: env_u32("PLOW_NS_ABS"),

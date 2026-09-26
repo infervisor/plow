@@ -8,18 +8,16 @@ use packet::devbuild::{Model, SectionData};
 use plow_asset::packet_pipeline::{PacketPipelines, SECTION};
 
 pub const DRIVER: &str = "tts.codec_lm.v1";
-/// `prompt.format` values. 1: `<spk_{voice}> {input}` between prefix and suffix ids (Veena).
-pub const PROMPT_SPEAKER_TAG: u64 = 1;
-/// `codec.kind` values. 1: SNAC 24 kHz, 7 codes per frame in Orpheus order, 2048 samples/frame.
-pub const CODEC_SNAC24K_FRAME7: u64 = 1;
 
 /// One speech family's contract. Token ids are the checkpoint tokenizer's.
 pub struct SpeechProfile {
-    pub prompt_format: u64,
+    /// Prompt text between the prefix and suffix ids, with `{voice}` and `{input}`.
+    pub prompt_template: &'static str,
+    /// A voice is valid when this renders to one vocabulary token.
+    pub voice_token: &'static str,
     pub prefix: &'static [u64],
     pub suffix: &'static [u64],
     pub stops: &'static [u64],
-    pub codec_kind: u64,
     pub sample_rate: u64,
     pub frame_codes: u64,
     pub codebook: u64,
@@ -35,11 +33,11 @@ pub struct SpeechProfile {
 /// maya-research/Veena (model card): [SOH] <spk_v> text [EOH] [SOA] [SOS] -> SNAC codes, stop on
 /// END_OF_SPEECH / END_OF_AI.
 pub const VEENA: SpeechProfile = SpeechProfile {
-    prompt_format: PROMPT_SPEAKER_TAG,
+    prompt_template: "<spk_{voice}> {input}",
+    voice_token: "<spk_{voice}>",
     prefix: &[128259],
     suffix: &[128260, 128261, 128257],
     stops: &[128258, 128262],
-    codec_kind: CODEC_SNAC24K_FRAME7,
     sample_rate: 24000,
     frame_codes: 7,
     codebook: 4096,
@@ -112,18 +110,18 @@ pub fn speech_pipeline_section(
     let pipe = meta.pipelines.first_mut().ok_or("causal section has no pipeline")?;
     pipe.name = "speech".into();
     pipe.driver = DRIVER.into();
+    pipe.strings.insert("prompt.template".into(), p.prompt_template.into());
+    pipe.strings.insert("prompt.voice_token".into(), p.voice_token.into());
     let params = &mut pipe.parameters;
     let mut put = |k: String, v: u64| {
         params.insert(k, v);
     };
-    put("prompt.format".into(), p.prompt_format);
     for (list, key) in [(p.prefix, "prompt.prefix"), (p.suffix, "prompt.suffix"), (p.stops, "stop")] {
         put(format!("{key}.count"), list.len() as u64);
         for (i, &id) in list.iter().enumerate() {
             put(format!("{key}.{i}"), id);
         }
     }
-    put("codec.kind".into(), p.codec_kind);
     put("audio.sample_rate".into(), p.sample_rate);
     put("codec.frame_codes".into(), p.frame_codes);
     put("codec.codebook".into(), p.codebook);

@@ -1,21 +1,17 @@
-//! The codec stage of a speech pipeline: the native SNAC-24k decoder (`codec/libplow_snac.so`,
-//! built from runtime/nvidia/snac by `plowc --emit devblob+cubin --tts-profile ...`) driven by one
-//! worker thread. Jobs with the same frame count are decoded in ONE call, so concurrent streams
-//! share each codec launch the way they share LM decode steps.
+//! The codec stage of a speech pipeline: the asset's `codec.pkt` (`codec.v1` driver: codes in,
+//! PCM out, one program per (batch, frames) capacity) on the packet runtime, driven by one worker
+//! thread. Pending jobs share each launch the way concurrent streams share LM decode steps; per-item
+//! valid lengths make a partly filled capacity decode exactly like its own size.
 
-use std::ffi::{c_void, CString};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc;
 
 use parking_lot::Mutex;
 
-pub const LIBRARY: &str = "codec/libplow_snac.so";
-pub const WEIGHTS: &str = "codec/snac24k.bin";
-const CODES: usize = 7;
-const SAMPLES: usize = 2048;
+use crate::exec::packet_runtime::{load_packet_runtime, PacketAsset, PacketTensor};
 
-type Create = unsafe extern "C" fn(i32, *const i8, i32, i32, *mut *mut c_void) -> i32;
-type DecodeHost = unsafe extern "C" fn(*mut c_void, *const i32, i32, i32, *mut f32, u64) -> i32;
+pub const PACKET: &str = "codec.pkt";
+const DRIVER: &str = "codec.v1";
 
 struct Job {
     codes: Vec<i32>,
@@ -27,55 +23,52 @@ struct Job {
 pub struct Codec {
     tx: Mutex<mpsc::Sender<Job>>,
     pub max_frames: usize,
+    pub frame_codes: usize,
+    pub frame_samples: usize,
+}
+
+struct Bound {
+    runtime: Box<dyn crate::exec::packet_runtime::PacketRuntime>,
+    /// (batch, frames, program), ascending by batch * frames.
+    capacities: Vec<(usize, usize, usize)>,
+    codes: PacketTensor,
+    seed: PacketTensor,
+    pcm: PacketTensor,
+    /// Valid-length tensor and rows per frame at each time resolution.
+    lengths: Vec<(PacketTensor, usize)>,
+    frame_codes: usize,
+    frame_samples: usize,
 }
 
 impl Codec {
-    /// Loads the codec object and weights shipped in the asset directory.
-    pub fn load(assets: &Path, max_batch: usize, max_frames: usize) -> Result<Self, String> {
-        let (library, weights) = (assets.join(LIBRARY), assets.join(WEIGHTS));
-        if !weights.is_file() {
-            return Err(format!(
-                "{} missing: export it with scripts/tts/snac_prep.py (see docs/runtime/tts.md)",
-                weights.display()
-            ));
+    pub fn load(assets: &Path) -> Result<Self, String> {
+        let path = assets.join(PACKET);
+        if !path.is_file() {
+            return Err(format!("{} missing: emit it with PLOW_TTS_CODEC_DIR (docs/runtime/tts.md)", path.display()));
         }
-        Self::start(library, weights, max_batch, max_frames)
-    }
-
-    fn start(library: PathBuf, weights: PathBuf, max_batch: usize, max_frames: usize) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("plow-tts-codec".into())
             .spawn(move || {
-                // SAFETY: the library implements the plow_snac C ABI (runtime/nvidia/snac/snac.cu).
-                let lib = match unsafe { libloading::Library::new(&library) } {
-                    Ok(l) => l,
-                    Err(e) => return drop(ready_tx.send(Err(format!("load {}: {e}", library.display())))),
+                let bound = match bind(&path) {
+                    Ok(b) => b,
+                    Err(e) => return drop(ready_tx.send(Err(e))),
                 };
-                let (create, decode) = match unsafe {
-                    (lib.get::<Create>(b"plow_snac_create\0"), lib.get::<DecodeHost>(b"plow_snac_decode_host\0"))
-                } {
-                    (Ok(c), Ok(d)) => (*c, *d),
-                    _ => return drop(ready_tx.send(Err("codec object lacks plow_snac_create/decode_host".into()))),
-                };
-                let path = CString::new(weights.to_string_lossy().as_bytes()).unwrap_or_default();
-                let mut h = std::ptr::null_mut();
-                // Device 0 of the visible set: the device the engine serves on.
-                let rc = unsafe { create(0, path.as_ptr(), max_batch as i32, max_frames as i32, &mut h) };
-                if rc != 0 || h.is_null() {
-                    return drop(ready_tx.send(Err(format!("plow_snac_create failed ({rc})"))));
-                }
-                let _ = ready_tx.send(Ok(()));
-                run(rx, h, decode, max_batch, max_frames);
-                drop(lib);
+                let info = (
+                    bound.capacities.iter().map(|c| c.1).max().unwrap_or(0),
+                    bound.frame_codes,
+                    bound.frame_samples,
+                );
+                let _ = ready_tx.send(Ok(info));
+                run(rx, bound);
             })
             .map_err(|e| e.to_string())?;
-        ready_rx.recv().map_err(|e| e.to_string())??;
-        Ok(Codec { tx: Mutex::new(tx), max_frames })
+        let (max_frames, frame_codes, frame_samples) = ready_rx.recv().map_err(|e| e.to_string())??;
+        Ok(Codec { tx: Mutex::new(tx), max_frames, frame_codes, frame_samples })
     }
 
-    /// `frames * 7` codebook ids -> `frames * 2048` samples.
+    /// `frames * frame_codes` codebook ids -> `frames * frame_samples` samples.
     pub async fn decode(&self, codes: Vec<i32>, frames: usize, seed: u64) -> Result<Vec<f32>, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
@@ -86,40 +79,115 @@ impl Codec {
     }
 }
 
-fn run(rx: mpsc::Receiver<Job>, h: *mut c_void, decode: DecodeHost, max_batch: usize, max_frames: usize) {
+fn bind(path: &Path) -> Result<Bound, String> {
+    let e = |x: crate::RuntimeError| x.to_string();
+    let loaded = load_packet_runtime(path, "cuda").map_err(e)?;
+    let runtime = loaded.runtime;
+    let asset = PacketAsset::load(path).map_err(e)?;
+    let pipeline = asset.bind_driver(DRIVER, runtime.as_ref()).map_err(e)?;
+    let param = |k: &str| pipeline.parameter(k).map(|v| v as usize).map_err(e);
+    let mut capacities = Vec::new();
+    for (role, program) in pipeline.programs() {
+        let dims = role
+            .strip_prefix("decode.b")
+            .and_then(|r| r.split_once(".f"))
+            .and_then(|(b, f)| Some((b.parse::<usize>().ok()?, f.parse::<usize>().ok()?)));
+        if let Some((b, f)) = dims {
+            capacities.push((b, f, program));
+        }
+    }
+    if capacities.is_empty() {
+        return Err("codec packet declares no decode capacity".into());
+    }
+    capacities.sort_by_key(|&(b, f, _)| (b * f, f));
+    let lengths = (0..param("lengths.count")?)
+        .map(|k| Ok((pipeline.tensor(&format!("lengths.{k}")).map_err(e)?, param(&format!("lengths.{k}.rows_per_frame"))?)))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Bound {
+        codes: pipeline.tensor("codes").map_err(e)?,
+        seed: pipeline.tensor("seed").map_err(e)?,
+        pcm: pipeline.tensor("pcm").map_err(e)?,
+        frame_codes: param("codec.frame_codes")?,
+        frame_samples: param("codec.frame_samples")?,
+        lengths,
+        capacities,
+        runtime,
+    })
+}
+
+impl Bound {
+    /// The smallest capacity holding `batch` items of `frames` frames.
+    fn capacity(&self, batch: usize, frames: usize) -> Option<(usize, usize, usize)> {
+        self.capacities.iter().copied().find(|&(b, f, _)| b >= batch && f >= frames)
+    }
+
+    fn decode(&mut self, jobs: &[Job]) -> Result<Vec<Vec<f32>>, String> {
+        let frames = jobs.iter().map(|j| j.frames).max().unwrap_or(0);
+        let (cb, cf, program) = self
+            .capacity(jobs.len(), frames)
+            .ok_or_else(|| format!("{} x {frames} frames exceeds every codec capacity", jobs.len()))?;
+        let fc = self.frame_codes;
+        let mut codes = vec![0u32; self.codes.bytes / 4];
+        for (i, j) in jobs.iter().enumerate() {
+            for (k, &c) in j.codes.iter().enumerate() {
+                codes[i * cf * fc + k] = c.clamp(0, i32::MAX) as u32;
+            }
+        }
+        let e = |x: crate::RuntimeError| x.to_string();
+        self.runtime.write_tensor(self.codes, bytemuck::cast_slice(&codes)).map_err(e)?;
+        for &(tensor, per_frame) in &self.lengths {
+            let mut len = vec![0u32; tensor.bytes / 4];
+            for (i, j) in jobs.iter().enumerate() {
+                len[i] = (j.frames * per_frame) as u32;
+            }
+            self.runtime.write_tensor(tensor, bytemuck::cast_slice(&len)).map_err(e)?;
+        }
+        let mut seeds = vec![0u64; self.seed.bytes / 8];
+        for (i, j) in jobs.iter().enumerate() {
+            seeds[i] = j.seed;
+        }
+        self.runtime.write_tensor(self.seed, bytemuck::cast_slice(&seeds)).map_err(e)?;
+        self.runtime.run(program).map_err(e)?;
+        let mut pcm = vec![0f32; self.pcm.bytes / 4];
+        self.runtime.read_tensor(self.pcm, bytemuck::cast_slice_mut(&mut pcm)).map_err(e)?;
+        let per = cf * self.frame_samples;
+        debug_assert!(cb * per <= pcm.len());
+        Ok(jobs.iter().enumerate().map(|(i, j)| pcm[i * per..i * per + j.frames * self.frame_samples].to_vec()).collect())
+    }
+}
+
+fn run(rx: mpsc::Receiver<Job>, mut codec: Bound) {
+    let max_batch = codec.capacities.iter().map(|c| c.0).max().unwrap_or(1);
     let mut pending: Vec<Job> = Vec::new();
     while let Ok(first) = rx.recv() {
         pending.push(first);
         pending.extend(rx.try_iter());
+        // Longest first so each launch's capacity is set by its first job.
+        pending.sort_by_key(|j| std::cmp::Reverse(j.frames));
         while !pending.is_empty() {
-            let f = pending[0].frames;
-            let (mut batch, mut rest) = (Vec::new(), Vec::new());
-            for j in pending.drain(..) {
-                if j.frames == f && batch.len() < max_batch {
-                    batch.push(j);
-                } else {
-                    rest.push(j);
-                }
+            let frames = pending[0].frames;
+            let mut n = 1;
+            while n < pending.len() && n < max_batch && codec.capacity(n + 1, frames).is_some() {
+                n += 1;
             }
-            pending = rest;
-            if f == 0 || f > max_frames {
+            let batch: Vec<Job> = pending.drain(..n).collect();
+            if frames == 0 || batch.iter().any(|j| j.codes.len() != j.frames * codec.frame_codes) {
                 for j in batch {
-                    let _ = j.reply.send(Err(format!("{f} frames outside 1..={max_frames}")));
+                    let _ = j.reply.send(Err("codec job has no frames or a partial frame".into()));
                 }
                 continue;
             }
-            let b = batch.len();
-            let codes: Vec<i32> = batch.iter().flat_map(|j| j.codes.iter().copied()).collect();
-            debug_assert_eq!(codes.len(), b * f * CODES);
-            let mut pcm = vec![0f32; b * f * SAMPLES];
-            // SAFETY: buffers are [b][f][7] and [b][f*2048]; the call is synchronous.
-            let rc = unsafe { decode(h, codes.as_ptr(), b as i32, f as i32, pcm.as_mut_ptr(), batch[0].seed) };
-            for (i, j) in batch.into_iter().enumerate() {
-                let _ = j.reply.send(if rc == 0 {
-                    Ok(pcm[i * f * SAMPLES..(i + 1) * f * SAMPLES].to_vec())
-                } else {
-                    Err(format!("plow_snac_decode_host failed ({rc})"))
-                });
+            match codec.decode(&batch) {
+                Ok(pcm) => {
+                    for (j, p) in batch.into_iter().zip(pcm) {
+                        let _ = j.reply.send(Ok(p));
+                    }
+                }
+                Err(e) => {
+                    for j in batch {
+                        let _ = j.reply.send(Err(e.clone()));
+                    }
+                }
             }
         }
     }

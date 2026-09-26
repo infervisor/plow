@@ -25,8 +25,6 @@ use crate::serve::AppState;
 
 const WINDOW: usize = 6;
 const LOOKAHEAD: usize = 2;
-const CODEC_MAX_BATCH: usize = 64;
-const CODEC_MAX_FRAMES: usize = 128;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,7 +159,13 @@ pub fn speech_model(assets: &Path) -> Result<Option<Arc<SpeechModel>>, String> {
     let model = match SpeechContract::load(assets).map_err(|e| e.to_string())? {
         None => None,
         Some(contract) => {
-            let codec = Codec::load(assets, CODEC_MAX_BATCH, CODEC_MAX_FRAMES)?;
+            let codec = Codec::load(assets)?;
+            if codec.frame_codes != contract.frame_codes || codec.frame_samples != contract.frame_samples {
+                return Err(format!(
+                    "codec packet frames ({} codes, {} samples) disagree with the speech contract ({}, {})",
+                    codec.frame_codes, codec.frame_samples, contract.frame_codes, contract.frame_samples
+                ));
+            }
             tracing::info!(pipeline = %contract.pipeline, sample_rate = contract.sample_rate, "tts: speech pipeline bound");
             Some(Arc::new(SpeechModel { contract, codec }))
         }
