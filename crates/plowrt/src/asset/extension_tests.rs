@@ -56,6 +56,7 @@ fn prog(n_counter: u32) -> Program {
         tensors: vec![],
         gq_stream: vec![],
         gq_seg_ofs: vec![0, 0],
+        reduction_witness: None,
         l2_sms: 0,
         l2_domains: 0,
     }

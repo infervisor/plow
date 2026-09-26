@@ -514,6 +514,190 @@ fn required_compiled_opcode_markers_are_fail_closed() {
 }
 
 #[test]
+fn native_ocp_weights_preserve_bytes_only_without_legacy_consumers() {
+    let mut p = segmented_prog(&[DevOp::GemmFp8Block128, DevOp::GemmFp8Block128], &[0, 0]);
+    for d in &mut p.insts {
+        d.t = [packet::dev::TENSOR_NONE16; 8];
+        d.t[2] = 7;
+    }
+    assert_eq!(native_ocp_fp8_weights(std::slice::from_ref(&p)), [7].into_iter().collect());
+    let mut other = segmented_prog(&[DevOp::GemvFp8Blk], &[0]);
+    other.insts[0].t = [packet::dev::TENSOR_NONE16; 8];
+    other.insts[0].t[2] = 7;
+    assert!(native_ocp_fp8_weights(&[p, other]).is_empty());
+    let p = segmented_prog(&[DevOp::GemvFp8Blk], &[0]);
+    assert!(native_ocp_fp8_weights(&[p]).is_empty());
+}
+
+#[test]
+fn routed_block128_requires_markers_and_valid_geometry() {
+    let path = Path::new("routed.elf");
+    let syms = ["plow_opcode_moe_glu_fp8_block128_1", "plow_opcode_moe_quant_fp8_block128_1",
+        "plow_opcode_moe_down_fp8_block128_1"];
+    for (op, dims) in [
+        (DevOp::MoeGluFp8Block128, [256, 6144, 256, 16, 0, 0, 0, 0]),
+        (DevOp::MoeQuantFp8Block128, [256, 256, 8, 16, 6144, 0, 0, 0]),
+        (DevOp::MoeDownFp8Block128, [256, 6144, 256, 8, 16, 0, 0, 0]),
+    ] {
+        let mut p = segmented_prog(&[op], &[0]);
+        p.insts[0].t = [0; 8];
+        p.insts[0].i = dims;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+        assert!(check_compiled_opcode_markers(&[], path, [&p]).is_err());
+        p.insts[0].i[0] = 129;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+        p.insts[0].i = dims;
+        p.insts[0].t[0] = packet::dev::TENSOR_NONE16;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+    }
+}
+
+#[test]
+fn block_fp8_m16_requires_its_object_marker() {
+    let path = Path::new("interp_decode_gq.elf");
+    let mut p = segmented_prog(&[DevOp::GemmFp8Block128], &[0]);
+    let base = "plow_opcode_gemm_fp8_block128_1";
+    assert!(check_compiled_opcode_markers(&[base], path, [&p]).is_ok());
+    p.insts[0].i[3] = 16;
+    assert!(check_compiled_opcode_markers(&[base], path, [&p]).unwrap_err().to_string()
+        .contains("plow_gemm_fp8_block128_m16_1"));
+    let syms = [base, "plow_gemm_fp8_block128_m16_1"];
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+    p.insts[0].i[3] = 7;
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+}
+
+#[test]
+fn rounded_silu_requires_its_object_marker() {
+    let path = Path::new("interp_decode_gq.elf");
+    let mut p = segmented_prog(&[DevOp::Glu], &[0]);
+    p.insts[0].i[1] = 1;
+    assert!(check_compiled_opcode_markers(&[], path, [&p]).is_ok());
+    p.insts[0].i[1] = 5;
+    assert!(check_compiled_opcode_markers(&[], path, [&p]).unwrap_err().to_string()
+        .contains("plow_glu_silu_bf16_1"));
+    assert!(check_compiled_opcode_markers(&["plow_glu_silu_bf16_1"], path, [&p]).is_ok());
+}
+
+#[test]
+fn block_fp8_split3_requires_marker_and_geometry() {
+    let path = Path::new("interp_decode_gq.elf");
+    let syms = ["plow_opcode_gemm_fp8_block128_1", "plow_gemm_fp8_block128_m16_1",
+        "plow_gemm_fp8_block128_split3_1"];
+    let mut p = segmented_prog(&[DevOp::GemmFp8Block128], &[0]);
+    let dims = [16, 2624, 6144, 16, 2048, 512, 0, 0];
+    p.insts[0].i = dims;
+    p.insts[0].t = [0, 1, 2, 3, 4, 5, 6, packet::dev::TENSOR_NONE16];
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+    assert!(check_compiled_opcode_markers(&syms[..2], path, [&p]).is_err());
+    for (slot, value) in [(0, 0), (0, u32::MAX), (1, 2560), (2, 6143),
+        (3, 0), (4, 0), (4, u32::MAX), (5, 0), (6, 1), (7, 1)] {
+        p.insts[0].i = dims;
+        p.insts[0].i[slot] = value;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err(), "slot{slot}={value}");
+    }
+    p.insts[0].i = dims;
+    for slot in 0..7 {
+        let old = p.insts[0].t[slot];
+        p.insts[0].t[slot] = packet::dev::TENSOR_NONE16;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+        p.insts[0].t[slot] = old;
+    }
+    assert_eq!(native_ocp_fp8_weights(&[p]), [2].into_iter().collect());
+}
+
+#[test]
+fn mla_fp8_requires_marker_valid_geometry_and_ocp_bytes() {
+    let path = Path::new("interp_decode_gq.elf");
+    let syms = ["plow_opcode_mla_bmm_fp8_1"];
+    let mut p = segmented_prog(&[DevOp::MlaBmmFp8], &[0]);
+    for dims in [[16, 8, 512, 192, 1, 0, 0, 0], [16, 8, 256, 512, 0, 0, 0, 0]] {
+        p.insts[0].i = dims;
+        p.insts[0].t = [0, 1, 2, 3, 4, packet::dev::TENSOR_NONE16,
+            packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16];
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+        assert!(check_compiled_opcode_markers(&[], path, [&p]).is_err());
+        for (slot, value) in [(0, 0), (0, u32::MAX), (1, 16), (2, 255),
+            (3, 128), (4, 2), (5, 1), (6, 1), (7, 1)] {
+            p.insts[0].i = dims;
+            p.insts[0].i[slot] = value;
+            assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+        }
+        p.insts[0].i = dims;
+        for slot in 0..if dims[4] == 1 { 5 } else { 4 } {
+            p.insts[0].t[slot] = packet::dev::TENSOR_NONE16;
+            assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+            p.insts[0].t[slot] = slot as u16;
+        }
+        assert_eq!(native_ocp_fp8_weights(std::slice::from_ref(&p)), [2].into_iter().collect());
+    }
+}
+
+#[test]
+fn mla_strided_wv_requires_exact_shape_and_new_object_abi() {
+    let path = Path::new("interp_decode_gq.elf");
+    let syms = ["plow_opcode_mla_bmm_fp8_1", "plow_mla_bmm_head_stride_1"];
+    let mut p = segmented_prog(&[DevOp::MlaBmmFp8], &[0]);
+    p.insts[0].i = [16, 8, 256, 512, 0, 1024, 0, 0];
+    p.insts[0].t = [0, 1, 2, 3, packet::dev::TENSOR_NONE16,
+        packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16];
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+    assert!(check_compiled_opcode_markers(&syms[..1], path, [&p]).is_err());
+    for (slot, value) in [(0, 32), (1, 16), (2, 512), (3, 192), (4, 1), (5, 512)] {
+        let old = p.insts[0].i[slot];
+        p.insts[0].i[slot] = value;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+        p.insts[0].i[slot] = old;
+    }
+}
+
+#[test]
+fn block_fp8_qb_requires_marker_and_geometry() {
+    let path = Path::new("interp_decode_gq.elf");
+    let syms = ["plow_opcode_gemm_fp8_block128_1", "plow_gemm_fp8_block128_m16_1",
+        "plow_gemm_fp8_block128_qb_1"];
+    let mut p = segmented_prog(&[DevOp::GemmFp8Block128], &[0]);
+    let dims = [16, 2048, 2048, 16, 0, 0, 1, 0];
+    p.insts[0].i = dims;
+    p.insts[0].t = [0, 1, 2, 3, 4, packet::dev::TENSOR_NONE16,
+        packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16];
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+    assert!(check_compiled_opcode_markers(&syms[..2], path, [&p]).is_err());
+    for (slot, value) in [(0, 0), (0, u32::MAX), (1, 1024), (2, 2047),
+        (3, 0), (4, 1), (5, 1), (6, 2), (7, 1)] {
+        p.insts[0].i = dims;
+        p.insts[0].i[slot] = value;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+    }
+    p.insts[0].i = dims;
+    for slot in 0..5 {
+        p.insts[0].t[slot] = packet::dev::TENSOR_NONE16;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+        p.insts[0].t[slot] = slot as u16;
+    }
+}
+
+#[test]
+fn block_fp8_oproj_split8_requires_exact_m1_shape() {
+    let path = Path::new("interp_decode_gq.elf");
+    let syms = ["plow_opcode_gemm_fp8_block128_1", "plow_gemm_fp8_block128_m16_1",
+        "plow_gemm_fp8_block128_qb_1"];
+    let mut p = segmented_prog(&[DevOp::GemmFp8Block128], &[0]);
+    let dims = [1, 6144, 2048, 16, 0, 0, 2, 0];
+    p.insts[0].i = dims;
+    p.insts[0].t = [0, 1, 2, 3, 4, packet::dev::TENSOR_NONE16,
+        packet::dev::TENSOR_NONE16, packet::dev::TENSOR_NONE16];
+    assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_ok());
+    assert!(check_compiled_opcode_markers(&syms[..2], path, [&p]).is_err());
+    for (slot, value) in [(0, 0), (0, 8), (1, 2048), (2, 4096), (3, 0),
+                           (4, 1), (5, 1), (6, 1), (6, 3), (7, 1)] {
+        p.insts[0].i = dims;
+        p.insts[0].i[slot] = value;
+        assert!(check_compiled_opcode_markers(&syms, path, [&p]).is_err());
+    }
+}
+
+#[test]
 fn interpreter_wave_geometry_rejects_missing_or_swapped_phase_objects() {
     for phase in [Phase::Prefill, Phase::Decode, Phase::Flash] {
         let expected = phase.interpreter_threads() / 64;
@@ -1338,6 +1522,20 @@ fn grouped_decode_requires_its_accumulation_arm() {
     }
 }
 
+#[test]
+fn dcp_canonical_select_refuses_an_old_decode_object() {
+    let requires = vec!["PLOW_DCP_INDEX_CANON=1".to_owned()];
+    let obj = Path::new("interp_decode_fp8kv_gq.elf");
+    assert!(check_decode_object(
+        &["plow_dcp_gather_1"], obj, &requires, false, false
+    )
+    .is_err());
+    assert!(check_decode_object(
+        &["plow_dcp_index_canon_1"], obj, &requires, false, false
+    )
+    .is_ok());
+}
+
 fn segmented_prog(ops: &[DevOp], segs: &[u16]) -> DevProg {
     assert_eq!(ops.len(), segs.len());
     DevProg {
@@ -1590,6 +1788,31 @@ fn lean_moe_stage1_route_requires_exact_shape_and_align() {
     assert_eq!((route.args.inter_dim, route.args.model_dim), (384, 3584));
     assert_eq!((route.args.beta, route.args.linear_beta), (4.0, 25.0));
 
+    prog.insts[0].i = [8192, 256, 8, 0, 0, 0, 0, 0];
+    prog.insts[1].i = [256, 6144, 256, MOE_ENC_MXFP4, 0, 1, 0, 0];
+    let glm = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+    let PrefillSegmentRoute::MoeStage1Mxfp4(glm_route) = glm[1] else {
+        panic!("GLM stage-1 packet must route to the native object")
+    };
+    assert_eq!((glm_route.args.inter_dim, glm_route.args.model_dim), (256, 6144));
+
+    // PLOW_GLM_MOE_SHARED_FOLD: 257 experts at top-9, and only as a pair.
+    prog.insts[0].i[1..3].copy_from_slice(&[257, 9]);
+    prog.insts[1].i[2] = 257;
+    let folded = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+    let PrefillSegmentRoute::MoeStage1Mxfp4(folded_route) = folded[1] else {
+        panic!("shared-fold GLM stage-1 packet must route to the native object")
+    };
+    assert_eq!(folded_route.args.experts, 257);
+    prog.insts[0].i[2] = 8;
+    assert!(moe_mxfp4_routes(&prog, &tensors, &devp).is_err());
+    prog.insts[0].i[1..3].copy_from_slice(&[256, 8]);
+    prog.insts[1].i[2] = 256;
+
+    prog.insts[0].i[2] = 7;
+    assert!(moe_mxfp4_routes(&prog, &tensors, &devp).is_err());
+    prog.insts[0].i[2] = 8;
+
     prog.insts[1].i[0] = 224;
     let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
     assert!(matches!(fallback[1], PrefillSegmentRoute::Interpreter));
@@ -1623,7 +1846,7 @@ fn lean_moe_stage1_a4_reuse_is_geometry_gated_and_scratch_bounded() {
         .map(|(i, t)| DeviceMem::view(0x1000 + i as u64 * 0x10_0000, t.bytes))
         .collect();
     let (payload, scales) =
-        moe_stage1_a4_scratch_bytes(std::slice::from_ref(&prog), &tensors).unwrap();
+        moe_stage1_a4_scratch_bytes(std::slice::from_ref(&prog), &tensors, false).unwrap();
     assert_eq!((payload, scales), (rows * 3584 / 2, rows * 3584 / 32));
     let routes = moe_mxfp4_routes_with_scratch(
         &prog,
@@ -1631,6 +1854,7 @@ fn lean_moe_stage1_a4_reuse_is_geometry_gated_and_scratch_bounded() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         None,
+        false,
     )
     .unwrap();
     let PrefillSegmentRoute::MoeStage1A4Reuse(route) = routes[1] else {
@@ -1654,12 +1878,27 @@ fn lean_moe_stage1_a4_reuse_is_geometry_gated_and_scratch_bounded() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         None,
+        false,
     )
     .unwrap();
     assert!(matches!(
         fallback[1],
         PrefillSegmentRoute::MoeStage1Mxfp4(_)
     ));
+    // A token-gather object takes the one-N-tile shape and carries row_token to the GEMM.
+    let gather = moe_mxfp4_routes_with_scratch(
+        &prog,
+        &tensors,
+        &devp,
+        Some((0x8000_0000, 0x9000_0000)),
+        None,
+        true,
+    )
+    .unwrap();
+    let PrefillSegmentRoute::MoeStage1A4Reuse(route) = gather[1] else {
+        panic!("token-gather object must take the I=256 shape")
+    };
+    assert_eq!(route.args.row_token, route.quant_args.row_token);
 }
 
 #[test]
@@ -1711,6 +1950,7 @@ fn replicated_prefill_ep_routes_full_i_and_balanced_whole_experts() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         Some((3, 8)),
+        false,
     )
     .unwrap();
     let PrefillSegmentRoute::MoeEpAlign(align) = routes[0] else {
@@ -1748,6 +1988,7 @@ fn replicated_prefill_ep_routes_full_i_and_balanced_whole_experts() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         None,
+        false,
     )
     .unwrap_err();
     assert!(err.to_string().contains("without a TP binding"));
@@ -1757,6 +1998,7 @@ fn replicated_prefill_ep_routes_full_i_and_balanced_whole_experts() {
         &devp,
         Some((0x8000_0000, 0x9000_0000)),
         Some((0, 4)),
+        false,
     )
     .unwrap_err();
     assert!(err.to_string().contains("topology-mismatched"));
@@ -2795,10 +3037,8 @@ fn compact_audit_patches_only_tp_collectives() {
     assert_eq!(&insts[1].i[6..=7], &[23, 29]);
 }
 
-/// `plow_xctr_audit` derives every gate expectation from four opcodes (`PLOW_DOP_XREDUCE` 24,
-/// `PLOW_DOP_XARGMAX_FIN` 28, `PLOW_DOP_XREDUCE2` 29, `PLOW_DOP_XREDUCE_ADD_NORM` 116 in
-/// `dev_isa.h`) and ignores every other instruction, so the audit may scan the collective table
-/// instead of the program only if the table keeps all of those, unchanged and in order.
+/// The compact device audit scans the same collective table as the host audit. In particular,
+/// XDcpGather's arrival gate is i[6], not the i[3] used by XReduce.
 #[test]
 fn xaudit_table_keeps_exactly_the_collectives() {
     let kept: [u16; 8] = [24, 25, 26, 28, 29, 116, 160, 182];
@@ -3042,6 +3282,24 @@ fn prefill_arm_detect_selects_the_right_variant() {
         DevOp::MoeCombinePf,
     ])];
     assert_eq!(PrefillArm::detect(&moe_progs), PrefillArm::MlaMoe);
+    let mut a4w4 = vec![prog_with_ops(&[
+        DevOp::FlashMlaPrefill,
+        DevOp::GemmSmallMxfp4,
+        DevOp::MoeGroupGluPf,
+        DevOp::MoeGroupDownPf,
+    ])];
+    a4w4[0].insts[2].i[MOE_PF_ENC_SLOT] = MOE_ENC_MXFP4;
+    a4w4[0].insts[3].i[MOE_PF_ENC_SLOT] = MOE_ENC_MXFP4;
+    assert_eq!(PrefillArm::detect(&a4w4), PrefillArm::MlaMoeA4w4);
+    assert_eq!(Variant::detect(&a4w4), Variant::Mxfp4);
+    assert_eq!(
+        object_name(Phase::Prefill, Variant::Mxfp4, PrefillArm::MlaMoeA4w4, Sched::GlobalQueue),
+        "interp_prefill_mla_moe_a4w4_full_gq.elf"
+    );
+    assert_eq!(
+        object_name(Phase::Decode, Variant::Mxfp4, PrefillArm::MlaMoeA4w4, Sched::GlobalQueue),
+        "interp_decode_mxfp4_gq.elf"
+    );
 
     // Only MLA-prefill opcodes => Mla, not MlaMoe.
     let mla_progs = vec![prog_with_ops(&[
@@ -3050,6 +3308,13 @@ fn prefill_arm_detect_selects_the_right_variant() {
         DevOp::MlaMergeFold,
     ])];
     assert_eq!(PrefillArm::detect(&mla_progs), PrefillArm::Mla);
+    let mxfp4_mla = vec![prog_with_ops(&[DevOp::FlashMlaPrefill, DevOp::GemmSmallMxfp4])];
+    assert_eq!(Variant::detect(&mxfp4_mla), Variant::Mxfp4);
+    assert_eq!(PrefillArm::detect(&mxfp4_mla), PrefillArm::Mla);
+    assert_eq!(
+        object_name(Phase::Prefill, Variant::Mxfp4, PrefillArm::Mla, Sched::GlobalQueue),
+        "interp_prefill_mxfp4_mla_gq.elf"
+    );
 
     // Decode-only packet (no prefill opcodes at all) => None, unchanged.
     let decode_only = vec![prog_with_ops(&[DevOp::Embed, DevOp::Gemv, DevOp::RmsNorm])];
@@ -3308,11 +3573,15 @@ fn sparse_fp8_rejects_stale_objects_and_invalid_handles() {
     p.insts[0].fj = [0.0625f32.to_bits(), 1, 0];
     let tensors = vec![crate::asset::devblob::DevTensor {
         name: "large".into(),
-        bytes: 16 * 81920 * 512,
+        bytes: 64 * 81920 * 512,
         init: None,
     }];
     assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_ok());
-    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950", false).is_err());
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950", false).is_ok());
+    p.insts[0].i[0] = 64;
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_err());
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950", false).is_ok());
+    p.insts[0].i[0] = 16;
     assert!(
         check_sparse_fp8_object(&[], Path::new("old"), std::slice::from_ref(&p), true).is_err()
     );
@@ -3327,6 +3596,24 @@ fn sparse_fp8_rejects_stale_objects_and_invalid_handles() {
     assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_err());
     p.insts[0].fj[1] = 0;
     assert!(check_sparse_fp8_object(&[], Path::new("old"), &[p], true).is_ok());
+}
+
+#[test]
+fn sparse_fp8_gfx950_prefill_accepts_the_16k_rung_only_with_v2_geometry() {
+    let mut p = segmented_prog(&[DevOp::FlashMlaPrefillFp8], &[0]);
+    p.t = 16384;
+    p.insts[0].i = [1, 8, 70272, 0, 16384, u32::MAX, 16384, 4];
+    p.insts[0].t = [0; 8];
+    p.insts[0].fj = [0.0625f32.to_bits(), 1, 0];
+    let tensors = vec![crate::asset::devblob::DevTensor {
+        name: "large".into(),
+        bytes: 16384 * 70272 * 512,
+        init: None,
+    }];
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950", false).is_ok());
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx942", false).is_err());
+    p.insts[0].i[6] = 8192;
+    assert!(check_sparse_fp8_packet(std::slice::from_ref(&p), &tensors, "gfx950", false).is_err());
 }
 
 #[test]
@@ -3538,6 +3825,29 @@ fn local_dsa_selection_checks_rows_operands_and_object() {
         false
     )
     .is_ok());
+}
+
+#[test]
+fn dcp_canonical_selection_checks_its_own_gfx950_geometry() {
+    let mut prog = segmented_prog(&[DevOp::IndexSelect], &[0]);
+    prog.t = 8;
+    prog.role = packet::devbuild::ProgramRole::DecodeRung { rows: 8 };
+    prog.insts[0].blocks = 8;
+    prog.insts[0].t = [0, 65535, 65535, 65535, 1, 65535, 65535, 65535];
+    prog.insts[0].i = [0, 2048, 0, 0, 3, 0, 0, 0];
+    let tensors: Vec<_> = [8 * 2048 * 4, 8 * 4]
+        .into_iter()
+        .enumerate()
+        .map(|(i, bytes)| crate::asset::devblob::DevTensor {
+            name: format!("act.{i}"),
+            bytes,
+            init: None,
+        })
+        .collect();
+    assert!(check_dsa_select_local(std::slice::from_ref(&prog), &tensors, "gfx950", true).is_ok());
+    assert!(check_dsa_select_local(std::slice::from_ref(&prog), &tensors, "gfx942", true).is_err());
+    prog.insts[0].i[1] = 4096;
+    assert!(check_dsa_select_local(std::slice::from_ref(&prog), &tensors, "gfx950", true).is_err());
 }
 
 #[test]
@@ -4230,6 +4540,22 @@ fn the_walk_marker_lifts_the_capacity_refusal() {
 }
 
 #[test]
+fn fused_qkv_walk_hint_requires_the_exact_object_width() {
+    let path = Path::new("/tmp/interp_decode.elf");
+    let mut inst = packet::dev::DevInst64::default();
+    inst.op = DevOp::GemvQkv as u16;
+    inst.i[0] = 16;
+    inst.i[2] = 6144;
+    inst.fj[1] = 8;
+    let mm8 = ["plow_gemv_mm_cap_8", GEMV_WALK_SYM];
+    assert_eq!(decode_stage_rows(&inst, &mm8, path).unwrap(), 8);
+    assert!(decode_stage_rows(&inst, &["plow_gemv_mm_cap_8"], path).is_err());
+    assert!(decode_stage_rows(&inst, &["plow_gemv_mm_cap_16", GEMV_WALK_SYM], path).is_err());
+    inst.fj[1] = 0;
+    assert_eq!(decode_stage_rows(&inst, &[], path).unwrap(), 16);
+}
+
+#[test]
 fn symbols_carry_the_isa_and_the_scheduler() {
     assert_eq!(
         symbol_name(Phase::Decode, Sched::Static, "gfx950"),
@@ -4860,6 +5186,33 @@ fn rebase_chunk_still_patches_the_dense_gqa_families() {
     assert_eq!(insts[2].i[1], 1536, "n_kv is everything written so far");
 }
 
+#[test]
+fn rebase_indexer_selection_preserves_stride_and_uses_live_rows() {
+    let names = vec!["act.indices".to_string()];
+    for t in [128, 512, 1024, 2048, 4096, 8192] {
+        for base in [0, 71680] {
+            for live in [1, t - 1, t] {
+                for op in [DevOp::IndexSelectPf, DevOp::IndexUnionPf] {
+                    let original = DevInst64 {
+                        op: op as u16,
+                        i: [t, 2048, 131072, 0, 0, 0, 0, 0],
+                        ..Default::default()
+                    };
+                    let mut insts = [original];
+                    rebase_chunk_rows(&mut insts, &names, base, live, t, Some(t));
+                    assert_eq!(insts[0].i[0], live);
+                    assert_eq!(&insts[0].i[1..], &original.i[1..]);
+                    let kv_len = base + live;
+                    assert_eq!(kv_len - insts[0].i[0], base);
+                    let mut padded = [original];
+                    rebase_chunk_rows(&mut padded, &names, base, live, t, None);
+                    assert_eq!(padded[0].i[0], t);
+                }
+            }
+        }
+    }
+}
+
 /// EVERY KDA OP'S ROW COUNT BECOMES `clen`, AND THE BUG IS WHAT THIS ASSERTS.
 ///
 /// This covers both a compiled 512-row rung shortened to 511 and the production
@@ -5466,6 +5819,25 @@ fn native_moe_decode_keeps_ordered_xcd_boundaries() {
     validate_decode_dispatch([(0, &p)]).unwrap();
     for bad in 0..4 {
         let mut p = make();
+        match bad {
+            0 => p.stream[1].wait_len = 1,
+            1 => p.stream[1].succ_len = 1,
+            2 => p.stream[1].flags |= SE_XCTR,
+            _ => p.stream[0].seg = 1,
+        }
+        assert!(decode_segment_kinds(&p).is_err(), "case {bad}");
+    }
+}
+
+#[test]
+fn native_index_fp8_decode_keeps_ordered_boundaries() {
+    let mut p = segmented_decode_probe();
+    p.insts[1].op = DevOp::IndexFp8Decode as u16;
+    assert_eq!(decode_segment_kinds(&p).unwrap()[1], DecodeSegmentKind::IndexFp8);
+    validate_decode_dispatch([(0, &p)]).unwrap();
+    for bad in 0..4 {
+        let mut p = segmented_decode_probe();
+        p.insts[1].op = DevOp::IndexFp8Decode as u16;
         match bad {
             0 => p.stream[1].wait_len = 1,
             1 => p.stream[1].succ_len = 1,

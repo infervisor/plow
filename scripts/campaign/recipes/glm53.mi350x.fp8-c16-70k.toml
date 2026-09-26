@@ -1,0 +1,57 @@
+# GLM-5.3-FP8, MI350X, FP8, TP8 — campaign recipe for C16 / 70k context
+# Target: 8x AMD Instinct MI350X (gfx950, CDNA4, 256/304 CU, 288 GiB HBM3e)
+
+[cell]
+name = "glm53.mi350x.fp8-c16-70k"
+model = "zai-org/GLM-5.3"
+revision = "local"
+hf_dir = "/opt/models/GLM-5.3"
+gpu = "MI350X"
+arch = "gfx950"
+n_cu = 256
+num_gpus = 8
+max_ctx = 73728
+precision = "fp8"
+
+[emit]
+args = ["--segmented", "--block-packets"]
+
+[emit.env]
+GLM_FULL = "1"
+PLOW_FP8 = "1"
+PLOW_MLA_PREFILL = "full:128,512,2048,8192"
+PLOW_MLA_PF_V2 = "1"
+PLOW_GLM_PF_NS = "2"
+PLOW_GLM_DSA = "0"
+GLM_MOE_CORESIDENT = "2"
+GLM_SHARED_CUS = "48"
+GLM_SHARD_HEAD = "1"
+PLOW_GLM_FUSE_ROPE = "1"
+PLOW_GLM_FUSE_SEAM = "1"
+PLOW_GLM_FUSE_B1 = "1"
+PLOW_MOE_PF_DET = "1"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
+PLOW_EMIT_PACKED_PREFILL = "1"
+PLOW_TOKEN_BATCH_TP = "1"
+PLOW_PACKED_SPARSE_PF = "1"
+PLOW_BLOCK_PACKETS = "1"
+PLOW_PF_MODULAR = "1"
+
+[serve.env]
+PLOW_QUEUE_TTL_MS = "0"
+PLOW_KV_ADMIT_HEADROOM = "0.8"
+PLOW_GLM_ROWBAND = "1"
+PLOW_MULTISTEP = "8"
+PLOW_TP_AGREE_EVERY = "4"
+PLOW_PACKED_PREFILL_ROUTE = "0"
+PLOW_AMD_KERNARG_VRAM = "1"
+PLOW_AMD_NUMA_HOST_POOLS = "1"
+PLOW_TP_NO_AUDIT = "1"
+
+[roofline]
+bandwidth_gbps = 6200.0
+bf16_tflops = 2300.0
+fp8_tflops = 4600.0
+target_throughput_tps = 1000.0
+concurrency = 16
+context = 70000

@@ -1,8 +1,8 @@
-//! Integration test for checkpoint A — Rewrite rule soundness.
+//! Integration test for checkpoint A's legacy name-catalog mode.
 //!
 //! Backed by `Plow.Rewrite.rule_*` (definitional-equality proofs for the
-//! egglog rewrite rules). Every rule that fires must appear in the
-//! sound-rules table; unknown rules are rejected.
+//! abstract rewrite syntax). Actual body binding is tested in rewrite_body.rs;
+//! neither mode establishes floating-point kernel implementation correctness.
 
 #![cfg(feature = "lean-verify")]
 

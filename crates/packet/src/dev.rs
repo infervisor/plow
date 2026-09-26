@@ -84,6 +84,8 @@ pub enum DevOp {
     /// `t3/t4` (T11, `PLOW_QNORM_FUSE=1`): fused w8a8 activation quant — the normed row is
     /// also written as e4m3 `xq` with per-row `a_scale`, exactly the values a following
     /// [`DevOp::QuantFp8`] would produce (token-identical; needs a t3/t4-aware cubin).
+    /// `i3=1`: AMD GLM Q-A decode profile, K2048, epsilon=1e-5 (double before rsqrt),
+    /// balanced 256-thread reduction; requires gamma, i2=0 and no fused quant outputs.
     RmsNorm = 1,
     /// `t0=rms(f32) t1=x` · `i0=rows i1=feat` · `f0=eps`.
     /// Row RMS scalars only, so [`DevOp::GemmNorm`] can apply the norm in its
@@ -246,6 +248,9 @@ pub enum DevOp {
     GemmGlu = 20,
     /// `t0=q_out t1=x t2=W_q t3=k_out t4=W_k t5=v_out t6=W_v t7=gamma?` ·
     /// `i0=M i1=Nq i2=K i3=Nk i4=Nv i5=bias_q i6=bias_k i7=bias_v` · `f0=eps`,
+    /// `j0=walk_mm` when a walking object stages fewer than M rows. The runtime requires
+    /// the exact walking-MM object and checks `min(M,walk_mm)*K` against its LDS arena;
+    /// absent `j0` retains the conservative `M*K` requirement.
     /// computing all three attention projections `q=W_q@x`, `k=W_k@x`, `v=W_v@x` in ONE GEMV.
     ///
     /// `i5/i6/i7` are optional bf16 BIAS TENSOR HANDLES (`[Nq]`, `[Nk]`, `[Nv]`; 0 = absent),
@@ -646,6 +651,8 @@ pub enum DevOp {
     /// Host zeroes gHist/gCtl once; the kernel leaves them clean for relaunch. `i4=1` selects independent rows,
     /// one workgroup per row (`row=i3+slice`), using LDS-only selection. This unpooled
     /// mode leaves t2/t3 unused and pads short rows with -1; i4=0 keeps cooperative selection.
+    /// `i4=3`: DCP-only one-workgroup-per-row ascending canonicalization of `t0=idx` after
+    /// the ordinary cooperative select. `t4=kv_len`, `i1=top_k`, and `slice` is the row.
     IndexSelect = 59,
 
     /// LayerNorm WITH bias + mean-subtract over `feat` (`d_layernorm_bias`) — the DSA indexer key-norm
@@ -2033,13 +2040,57 @@ pub enum DevOp {
     /// t2=krot_stage(bf16[rows][64]) t3=scale_stage(f32[rows]) t4=ckv t5=krot t6=kv_scale` ·
     /// `i0=rows i1=local_stride i2=page_shift i3=degree_shift i5=batched`.
     DcpKvScatter = 183,
+    /// BF16 to E4M3 FP8, dynamic groups of 128 along K; K must be divisible by 128.
+    /// `t0=xq t1=x t2=a_scale(f32[K/128,M])` · `i0=M i1=K`.
+    QuantFp8Block128 = 184,
+    /// W8A8 GEMM with FP32 accumulation and BF16 output; K must be divisible by 128.
+    /// `t0=C t1=A(fp8[M,K]) t2=W(fp8[N,K]) t3=a_scale(f32[K/128,M])
+    /// t4=w_scale(f32[ceil(N/128),K/128]) t5=C1 t6=C2` · `i0=M i1=N i2=K
+    /// i3=MFMA(0:32x32,16:16x16 CDNA4) i4=N0 i5=N1 i6=QB_live_split`.
+    /// Q-B selector 1 requires N=K=2048, MFMA16 and zeroed BF16 C; live M selects 8/4/1 K parts.
+    /// Selector 2 requires M=1,N=6144,K=2048, MFMA16 and zeroed BF16 C; eight K parts.
+    /// Optional CDNA4 split output: N0,N1 >0, t0/t5/t6 hold [M,N0/N1/N-N0-N1].
+    GemmFp8Block128 = 185,
+    /// Four contiguous K/4 partitions, each accumulated in FP32 and stored as BF16.
+    /// Same operands as GemmFp8Block128; t0/t5/t6/t7 are partial outputs. K divisible by 512.
+    /// `t0=C0 t1=A t2=W t3=a_scale t4=w_scale t5=C1 t6=C2 t7=C3` · `i0=M i1=N i2=K`.
+    GemmFp8Block128Split4 = 186,
+    /// In-place ordered sum of four BF16 tensors, rounding after EACH addition.
+    /// `t0=out_partial0 t1=partial1 t2=partial2 t3=partial3` · `i0=n`.
+    Sum4Bf16 = 187,
+    /// CDNA4 grouped gate/up: FP8 block128 operands, FP32 SiLU product, BF16 sorted rows.
+    /// `t0=fu t1=xq t2=xscale t3=wtab t4=stab t5=meta t6=row_token` · `i0=I i1=H i2=E i3=T`.
+    MoeGluFp8Block128 = 188,
+    /// Quantize sorted BF16 rows to slot-major FP8/F32 scales and zero routed BF16 output.
+    /// `t0=hq t1=fu t2=hscale t3=meta t4=row_partidx t5=out` · `i0=I i1=E i2=topk i3=T i4=H`.
+    MoeQuantFp8Block128 = 189,
+    /// CDNA4 grouped down: FP32 route weighting followed by native BF16 atomic reduction.
+    /// `t0=out t1=hq t2=hscale t3=wtab t4=stab t5=meta t6=row_partidx t7=row_gate` · `i0=I i1=H i2=E i3=topk i4=T`.
+    MoeDownFp8Block128 = 190,
+    /// CDNA4 MLA BMM with fused group128 input quantization and one scalar weight scale.
+    /// `t0=C t1=X t2=W t3=scale t4=raw_rope?` · `i0=M i1=heads i2=N i3=K i4=copy_rope64 i5=x_head_stride`.
+    /// x_head_stride=0 uses K (or K+64 with copy_rope64); 1024 selects even padded WV heads.
+    MlaBmmFp8 = 191,
+    /// Native non-pooled FP8 indexer decode: quantize post-RoPE query, scale weights,
+    /// append the current key to block16 packed cache, then score its live prefix.
+    /// `t0=score(f32[M,ctx]) t1=q(bf16[M,32,128]) t2=k(bf16[M,128])
+    /// t3=weights(bf16[M,32]) t4=packed_cache(u8[M,ctx/16,2112]) t5=pos(i32[M]) t6=kv_len(u32[M]) t7=parked(u32[M])` · `i0=M i1=ctx`.
+    /// Rows with parked!=0 or kv_len=0 have effective length zero and do not append.
+    /// Cache is owned, not a BF16 alias.
+    /// Score outside each live prefix is unspecified. Requires an isolated native segment.
+    IndexFp8Decode = 192,
+    /// Native non-pooled FP8 indexer prefill, fixed score stride `ctx`.
+    /// `t0=score? t1=q? t2=k t3=weights? t4=packed_cache t5=pos t6=kv_len` · `i0=T i1=ctx i2=append_only`.
+    /// The last tensor slot is NONE; append-only also requires score/q/weights to be NONE.
+    /// Runtime binds chunk base/live rows; inactive scores and causal tails are unspecified.
+    IndexFp8Prefill = 193,
     /// Token embedding plus a learned POSITION embedding indexed from a per-row base:
     /// `out[r] = bf16(table[tokens[r]] + pos_table[pos[r] - base[r]])`. Chatterbox T3 decode
     /// (speech_emb + speech_pos_emb, the speech index counted from the row's speech start).
     /// `t0=out(bf16[rows,width]) t1=table(bf16[vocab,width]) t2=tokens(u32[rows])
     /// t3=pos_table(bf16[pos_rows,width]) t4=pos(u32[rows]) t5=base(u32[rows])` ·
     /// `i0=rows i1=width i2=vocab i3=pos_rows`.
-    EmbedPosBf16 = 184,
+    EmbedPosBf16 = 194,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -2047,6 +2098,9 @@ pub enum DevOp {
 pub const ACT_SWIGLU_OAI: u32 = 3;
 /// [`DevOp::HeadNormRope`] `i5 = pair_mode`: force half-split (NeoX) pairing at every `hd`.
 pub const ROPE_PAIR_HALF: u32 = 2;
+/// [`DevOp::HeadNormRope`] `i5 = pair_mode`: the DSA indexer key prep (PLOW_DSA_PREP) — LayerNorm
+/// with bias (`t2 = gamma`, `t6 = beta`, `f0 = eps`) then HD=128 interleaved rope, skip_norm.
+pub const ROPE_PAIR_DSA_KPREP: u32 = 3;
 
 impl DevOp {
     /// Every opcode, in numeric order.
@@ -2239,6 +2293,16 @@ impl DevOp {
         DevOp::DcpKvPack,
         DevOp::XDcpGather,
         DevOp::DcpKvScatter,
+        DevOp::QuantFp8Block128,
+        DevOp::GemmFp8Block128,
+        DevOp::GemmFp8Block128Split4,
+        DevOp::Sum4Bf16,
+        DevOp::MoeGluFp8Block128,
+        DevOp::MoeQuantFp8Block128,
+        DevOp::MoeDownFp8Block128,
+        DevOp::MlaBmmFp8,
+        DevOp::IndexFp8Decode,
+        DevOp::IndexFp8Prefill,
         DevOp::EmbedPosBf16,
     ];
 
@@ -2444,6 +2508,16 @@ impl DevOp {
             DevOp::DcpKvPack => "PLOW_DOP_DCP_KV_PACK",
             DevOp::XDcpGather => "PLOW_DOP_XDCP_GATHER",
             DevOp::DcpKvScatter => "PLOW_DOP_DCP_KV_SCATTER",
+            DevOp::QuantFp8Block128 => "PLOW_DOP_QUANT_FP8_BLOCK128",
+            DevOp::GemmFp8Block128 => "PLOW_DOP_GEMM_FP8_BLOCK128",
+            DevOp::GemmFp8Block128Split4 => "PLOW_DOP_GEMM_FP8_BLOCK128_SPLIT4",
+            DevOp::Sum4Bf16 => "PLOW_DOP_SUM4_BF16",
+            DevOp::MoeGluFp8Block128 => "PLOW_DOP_MOE_GLU_FP8_BLOCK128",
+            DevOp::MoeQuantFp8Block128 => "PLOW_DOP_MOE_QUANT_FP8_BLOCK128",
+            DevOp::MoeDownFp8Block128 => "PLOW_DOP_MOE_DOWN_FP8_BLOCK128",
+            DevOp::MlaBmmFp8 => "PLOW_DOP_MLA_BMM_FP8",
+            DevOp::IndexFp8Decode => "PLOW_DOP_INDEX_FP8_DECODE",
+            DevOp::IndexFp8Prefill => "PLOW_DOP_INDEX_FP8_PREFILL",
             DevOp::EmbedPosBf16 => "PLOW_DOP_EMBED_POS_BF16",
         }
     }
@@ -2495,8 +2569,9 @@ impl DevOp {
     /// 180 -> 181 for GLM's BF16-input/FP32-weight/FP32-output router GEMM.
     /// 181 -> 184 for `DcpKvPack = 181` / `XDcpGather = 182` / `DcpKvScatter = 183` (decode
     /// context parallelism).
-    /// 184 -> 185 for `EmbedPosBf16 = 184` (Chatterbox T3 learned speech positions).
-    pub const COUNT: u16 = 185;
+    /// 184..193 for the FP8 block-128 GEMM/MoE/MLA/indexer family; 194 -> 195 for
+    /// `EmbedPosBf16 = 194` (Chatterbox T3 learned speech positions).
+    pub const COUNT: u16 = 195;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

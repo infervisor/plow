@@ -43,7 +43,7 @@ fi
 object_sha="$(sha256sum "$OBJECT" | awk '{print $1}')"
 export PLOW_STAGE4_CLEARED=1
 export PLOW_GPU=MI325X
-export PLOW_TOOLCHAIN_LABEL=rocm-7.14.0-nix
+export PLOW_TOOLCHAIN_LABEL=rocm-7.14.1-nix
 export PLOW_BUILD_ID="gfx942-${object_sha:0:16}"
 export PLOW_LEASE_LABEL="$LEASE"
 export PLOW_GEMM_JSONL="$JSONL"

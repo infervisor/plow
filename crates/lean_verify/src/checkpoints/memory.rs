@@ -11,6 +11,6 @@ pub use super::schedule::ScheduleRequest;
 
 /// Verify the emitted address map. Returns the certificate on success.
 pub fn check_address_map(req: &ScheduleRequest) -> Result<Certificate, VerifyError> {
-    let payload = serde_json::to_value(req).map_err(VerifyError::SerializeRequest)?;
+    let payload = crate::paths::payload(req)?;
     call("F", payload)
 }

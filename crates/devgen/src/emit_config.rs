@@ -488,6 +488,47 @@ pub struct EmitConfig {
     #[arg(long, env = "GLM_LINEAR_FP8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_linear_fp8: bool,
 
+    /// Native block-scaled W8A8 output projection; requires GLM_LINEAR_FP8.
+    #[arg(long, env = "PLOW_GLM_OPROJ_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_oproj_w8a8: bool,
+
+    /// Experimental CDNA4 fused QKV-A with original block128 FP8 weights/scales.
+    #[arg(long, env = "PLOW_GLM_QKVA_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_qkva_w8a8: bool,
+    /// Experimental TP8 CDNA4 original Q-B and FP8 MLA projections.
+    #[arg(long, env = "PLOW_GLM_MLA_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_mla_w8a8: bool,
+    /// MLA W8A8 prefill in the expanded (MHA) form vLLM runs: kv_b GEMM + D=256 flash.
+    #[arg(long, env = "PLOW_GLM_MLA_MHA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_mla_mha: bool,
+    /// Batched decode routes the shared expert as the folded tail slot (A4W4 grouped path).
+    #[arg(long, env = "PLOW_GLM_DECODE_SHARED_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_decode_shared_fold: bool,
+    /// RmsNorm writes the following block-128 FP8 activation quant itself (decode input norm,
+    /// prefill q_a norm), deleting the QuantFp8Block128 packet.
+    #[arg(long, env = "PLOW_GLM_NORM_Q128", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_norm_q128: bool,
+    /// QuantFp8Block128 at <= 128 rows runs on only the workgroups that own a group.
+    #[arg(long, env = "PLOW_GLM_QUANT_NARROW", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_quant_narrow: bool,
+    #[arg(long, env = "PLOW_GLM_INDEXER_WQ_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_indexer_wq_w8a8: bool,
+    #[arg(long, env = "PLOW_GLM_INDEXER_FP8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_indexer_fp8: bool,
+    #[arg(long, env = "PLOW_GLM_MLA_BF16_PS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_mla_bf16_ps: bool,
+    #[arg(long, env = "PLOW_GLM_ROPE_BF16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_rope_bf16: bool,
+    #[arg(long, env = "PLOW_GLM_MLA_STRIDED_WV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_mla_strided_wv: bool,
+
+    /// Native block-scaled W8A8 shared expert; requires GLM_LINEAR_FP8.
+    #[arg(long, env = "PLOW_GLM_SHARED_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_shared_w8a8: bool,
+    /// Experimental CDNA4 routed block128 FP8 pipeline with BF16 atomic reduction.
+    #[arg(long, env = "PLOW_GLM_ROUTED_W8A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_routed_w8a8: bool,
+
     /// Split GLU path for fp8 linear.
     #[arg(long, env = "GLM_SHARED_GLU_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_shared_glu_split: bool,
@@ -709,6 +750,20 @@ pub struct EmitConfig {
     /// Route GLM's DSA indexer through the prefill chain (requires `has_dsa`).
     #[arg(long, env = "PLOW_GLM_DSA_PF", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_dsa_pf: bool,
+    /// Sparse prefill flash on mla_sparse_pf.h (8-query packs, bf16 latent out, no merge).
+    #[arg(long, env = "PLOW_GLM_DSA_PF_B8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dsa_pf_b8: bool,
+    /// DSA indexer key prep: k_norm LayerNorm folded into the key rope/cache write (HeadNormRope
+    /// pair_mode 3; objects need PLOW_DSA_PREP=1).
+    #[arg(long, env = "PLOW_GLM_DSA_KPREP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dsa_kprep: bool,
+    /// DSA indexer wk + weights_proj as one dual GemmSmall packet (objects need PLOW_DSA_PREP=1).
+    #[arg(long, env = "PLOW_GLM_DSA_KW_DUAL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dsa_kw_dual: bool,
+    /// DSA prefill: op 118 also writes op 119's union table (PLOW_DSA_SELECT_V3 objects) and the
+    /// op 119 is marked skipped; objects without the arm run both ops as before.
+    #[arg(long, env = "PLOW_GLM_DSA_SEL_UNION", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_dsa_sel_union: bool,
 
     /// Set by [`super::apply_production_defaults`] when this emit is the QUALIFIED GLM target —
     /// gfx942, TP8, 304 CU. The nine knobs whose accessors read it are `Option<bool>` precisely
@@ -909,6 +964,11 @@ pub struct EmitConfig {
     /// Per-XCD CU placement for the GLM prefill chain. Default on; pass `=0` for rollback.
     #[arg(long, env = "PLOW_GLM_PLACE_PF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_place_pf: bool,
+
+    /// Isolate GLM MXFP4 grouped gate/up for the native stage-1 route. Opt-in until model
+    /// numerics and serving performance pass the full campaign gate.
+    #[arg(long, env = "PLOW_GLM_MOE_STAGE1_NATIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub glm_moe_stage1_native: bool,
 
     /// Band count for a prefill TP seam (2..=8; unset/1 = the unbanded emit).
     #[arg(long, env = "PLOW_GLM_XR_BAND")]
@@ -1386,6 +1446,20 @@ impl EmitConfig {
             glm_shared_cus: env_u32("GLM_SHARED_CUS"),
             glm_spine_cus: env_str("GLM_SPINE_CUS"),
             glm_linear_fp8: env_bool("GLM_LINEAR_FP8"),
+            glm_oproj_w8a8: env_bool("PLOW_GLM_OPROJ_W8A8"),
+            glm_qkva_w8a8: env_bool("PLOW_GLM_QKVA_W8A8"),
+            glm_mla_w8a8: env_bool("PLOW_GLM_MLA_W8A8"),
+            glm_mla_mha: env_bool("PLOW_GLM_MLA_MHA"),
+            glm_decode_shared_fold: env_bool("PLOW_GLM_DECODE_SHARED_FOLD"),
+            glm_norm_q128: env_bool("PLOW_GLM_NORM_Q128"),
+            glm_quant_narrow: env_bool("PLOW_GLM_QUANT_NARROW"),
+            glm_indexer_wq_w8a8: env_bool("PLOW_GLM_INDEXER_WQ_W8A8"),
+            glm_indexer_fp8: env_bool("PLOW_GLM_INDEXER_FP8"),
+            glm_mla_bf16_ps: env_bool("PLOW_GLM_MLA_BF16_PS"),
+            glm_rope_bf16: env_bool("PLOW_GLM_ROPE_BF16"),
+            glm_mla_strided_wv: env_bool("PLOW_GLM_MLA_STRIDED_WV"),
+            glm_shared_w8a8: env_bool("PLOW_GLM_SHARED_W8A8"),
+            glm_routed_w8a8: env_bool("PLOW_GLM_ROUTED_W8A8"),
             glm_shared_glu_split: env_bool("GLM_SHARED_GLU_SPLIT"),
             layers: Some(env_str("PLOW_LAYERS").unwrap_or_else(|| {
                 // Legacy synthesis: GLM_FULL=1 → "all" (with GLM_NLAYERS cap),
@@ -1451,6 +1525,10 @@ impl EmitConfig {
             gemv_wg: env_u32("PLOW_GEMV_WG"),
             gemv_wg_tuning: env_str("PLOW_GEMV_WG_TUNING"),
             glm_dsa_pf: env_bool("PLOW_GLM_DSA_PF"),
+            glm_dsa_pf_b8: env_bool("PLOW_GLM_DSA_PF_B8"),
+            glm_dsa_kprep: env_bool("PLOW_GLM_DSA_KPREP"),
+            glm_dsa_kw_dual: env_bool("PLOW_GLM_DSA_KW_DUAL"),
+            glm_dsa_sel_union: env_bool("PLOW_GLM_DSA_SEL_UNION"),
             glm_production_defaults: false,
             glm_fp8_kv: env_bool_opt("PLOW_GLM_FP8_KV"),
             glm_moe_aiter: env_bool_opt("PLOW_GLM_MOE_AITER"),
@@ -1481,6 +1559,7 @@ impl EmitConfig {
             pf_floor: env_bool("PLOW_PF_FLOOR"),
             glm_pf_wide: env_opt_out("PLOW_GLM_PF_WIDE"),
             glm_place_pf: env_opt_out("PLOW_GLM_PLACE_PF"),
+            glm_moe_stage1_native: env_bool("PLOW_GLM_MOE_STAGE1_NATIVE"),
             glm_xr_band: env_u32("PLOW_GLM_XR_BAND"),
             glm_xr_band_cus: env_u32("PLOW_GLM_XR_BAND_CUS"),
             attnres_decode_mwg: env_u32("PLOW_ATTNRES_DECODE_MWG"),

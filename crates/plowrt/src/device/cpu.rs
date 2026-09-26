@@ -115,6 +115,10 @@ impl Backend for CpuBackend {
         Ok(DeviceMem {
             base: arena.base(),
             len: bytes,
+            provenance: Some(Arc::new(super::provenance::MemoryRegion::owned(
+                arena.base(),
+                bytes,
+            ))),
             backing: Backing::Cpu(arena),
         })
     }

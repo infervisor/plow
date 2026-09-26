@@ -61,8 +61,8 @@ ARCH=gfx942
 : "${PLOW_HIPCC:?nix develop did not set PLOW_HIPCC}"
 : "${PLOW_BUNDLER:?nix develop did not set PLOW_BUNDLER}"
 : "${PLOW_READELF:?nix develop did not set PLOW_READELF}"
-[ "${PLOW_TOOLCHAIN_LABEL:-}" = "rocm-7.14.0-nix" ] || {
-  echo "FAIL: expected ROCm 7.14.0 from the flake, got ${PLOW_TOOLCHAIN_LABEL:-unset}" >&2; exit 2; }
+[ "${PLOW_TOOLCHAIN_LABEL:-}" = "rocm-7.14.1-nix" ] || {
+  echo "FAIL: expected ROCm 7.14.1 from the flake, got ${PLOW_TOOLCHAIN_LABEL:-unset}" >&2; exit 2; }
 HIPCC="$PLOW_HIPCC"
 BUN="$PLOW_BUNDLER"
 READELF="$PLOW_READELF"

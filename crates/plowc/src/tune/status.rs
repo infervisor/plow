@@ -340,6 +340,7 @@ mod tests {
             hardware: "amd/gfx950/mi350x".into(),
             sku: "MI355X".into(),
             digests: Digests {
+                execution: None,
                 implementation: interp.into(),
                 interpreter: interp.into(),
                 toolchain: "rocm-7.2".into(),
@@ -378,6 +379,7 @@ mod tests {
     fn a_stale_digest_contributes_no_selectable_records() {
         let all = vec![rec("gemm/a/None", "gemm_c4", "gfx950-old", 10.0)];
         let want = Digests {
+            execution: None,
             implementation: "gfx950-new".into(),
             interpreter: "gfx950-new".into(),
             toolchain: "rocm-7.2".into(),

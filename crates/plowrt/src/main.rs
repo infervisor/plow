@@ -19,6 +19,9 @@ use plowrt::device::{self, Backend};
 
 #[path = "bin_dist.rs"]
 mod dist_cmd;
+#[cfg(feature = "hsa")]
+#[path = "bin_amd_block.rs"]
+mod amd_block_cmd;
 use plowrt::exec::ExecutorSet;
 use plowrt::orch::Registry;
 use plowrt::serve::mux::{self, MuxConfig};
@@ -259,7 +262,7 @@ enum Cmd {
         /// Removed compatibility flag. Use the distinct `amd-probe` command.
         #[arg(long, default_value_t = false, hide = true)]
         synthetic_probe: bool,
-        /// Prompt token ids to decode from, comma-separated. Needs
+        /// Prompt token ids to decode from, comma-separated, or `@file`. Needs
         /// `--checkpoint` to mean anything.
         ///
         /// Under `--batched`, `;` separates one prompt PER SEQUENCE SLOT and
@@ -283,6 +286,9 @@ enum Cmd {
         /// are the two axes a concurrency sweep compares.
         #[arg(long, default_value_t = false)]
         batched: bool,
+        /// Active slots for a TP batched diagnostic; selects the matching decode rung.
+        #[arg(long, requires = "batched", value_parser = clap::value_parser!(u32).range(1..))]
+        active_batch: Option<u32>,
         /// Tensor-parallel degree. Needs a blob compiled `--num-gpus N`, and
         /// runs one rank per device over the first N visible GPUs.
         ///
@@ -386,6 +392,20 @@ enum Cmd {
         /// two precisions.
         #[arg(long)]
         dump: Option<PathBuf>,
+        /// Raw BF16 act.x.bin and carried-state tensor files for an act.x-only block.
+        #[arg(long)]
+        input_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        ctx: u32,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repeat: u32,
+        #[arg(long, default_value_t = 0)]
+        warmup: u32,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        tp: u32,
+        /// JSON timing samples. Host wall time includes preparation and the TP audit.
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
 
     /// Dry-run the compiled packets (no device): walk each packet honoring
@@ -950,6 +970,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             steps,
             ctx,
             batched,
+            active_batch,
             tp,
             dump_logits,
             prefill_sweep,
@@ -970,12 +991,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ctx,
                     tp,
                     batched,
+                    active_batch,
                     dump_logits,
                     prefill_sweep,
                     prefill_reps,
                 )
             } else if prefill_sweep.is_some() {
                 Err("--prefill-sweep is implemented on the TP path only (--tp N, N>1)".into())
+            } else if active_batch.is_some() {
+                Err("--active-batch requires --tp N with N>1".into())
             } else {
                 amd_bench(
                     blob,
@@ -1017,6 +1041,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tp,
                     batched,
                     None,
+                    None,
                     prefill_sweep,
                     prefill_reps,
                 )
@@ -1039,7 +1064,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             inspect,
             list_tensors,
             dump,
-        } => amd_block(blob, hsaco, checkpoint, prompt, inspect, list_tensors, dump),
+            input_dir,
+            ctx,
+            repeat,
+            warmup,
+            tp,
+            report,
+        } => {
+            if let Some(inputs) = input_dir {
+                amd_block_cmd::run(blob, hsaco, checkpoint, inputs, ctx, repeat, warmup, tp, dump, report)
+            } else {
+                if tp != 1 || ctx != 1 || repeat != 1 || warmup != 0 || report.is_some() {
+                    return Err("block timing requires --input-dir with captured block operands".into());
+                }
+                amd_block(blob, hsaco, checkpoint, prompt, inspect, list_tensors, dump)
+            }
+        },
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBlock { .. } => Err("plowrt was built without --features hsa".into()),
     }
@@ -1085,6 +1125,24 @@ fn synthetic_timing_prefix(synthetic_probe: bool) -> &'static str {
 
 #[cfg(test)]
 mod amd_bench_cli_tests {
+    #[test]
+    fn batched_prompt_file_matches_inline_and_rejects_empty_slots() {
+        use std::io::Write;
+        let prompt = "1,2,3; 7,8\n";
+        let expected = vec![vec![1, 2, 3], vec![7, 8]];
+        assert_eq!(super::batched_prompt_ids(prompt).unwrap(), expected);
+        let path = std::env::temp_dir().join(format!("plow-batched-prompt-{}.txt", std::process::id()));
+        let mut file = std::fs::File::create_new(&path).unwrap();
+        file.write_all(prompt.as_bytes()).unwrap();
+        drop(file);
+        let result = super::batched_prompt_ids(&format!("@{}", path.display()));
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(result.unwrap(), expected);
+        for invalid in ["", "1,2;", "1,,2", "-1", "4294967296"] {
+            assert!(super::batched_prompt_ids(invalid).is_err());
+        }
+    }
+
     use super::{
         parse_prefill_lengths, require_synthetic_probe, synthetic_timing_prefix,
         validate_amd_probe_steps, validate_parity_report_options, validate_token_audit_options,
@@ -1848,6 +1906,16 @@ fn dump_act_path(rest: &str) -> (&str, Option<usize>) {
     }
 }
 
+fn batched_prompt_ids(prompt: &str) -> Result<Vec<Vec<u32>>, Box<dyn std::error::Error>> {
+    let text = match prompt.strip_prefix('@') {
+        Some(path) => std::fs::read_to_string(path)?,
+        None => prompt.to_owned(),
+    };
+    Ok(text.split(';')
+        .map(|one| one.split(',').map(|s| s.trim().parse::<u32>()).collect())
+        .collect::<Result<_, _>>()?)
+}
+
 /// Write the packet trace, if `PLOW_TRACE_RAW` asked for one.
 ///
 /// A FUNCTION rather than three copies of the same `if let`, because every copy so far has been on
@@ -1905,6 +1973,7 @@ fn amd_bench_tp(
     ctx: u32,
     tp: u32,
     batched: bool,
+    active_batch: Option<u32>,
     dump_logits: Option<PathBuf>,
     prefill_sweep: Option<String>,
     prefill_reps: u32,
@@ -1923,8 +1992,12 @@ fn amd_bench_tp(
     let mut g = AmdTpGroup::load(backends, &blob, &hsaco, checkpoint.as_deref())?;
     // This binary is the TP CORRECTNESS ORACLE: its claim is that every rank
     // emitted an IDENTICAL stream, and a sampled check cannot support that
-    // sentence. Serving samples (`DEFAULT_AGREE_EVERY`); the oracle never does.
-    g.audit_cadence(1);
+    let agree_cfg = plowrt::config::RuntimeConfig::get().amd.tp_agree_every;
+    if agree_cfg > 1 {
+        g.audit_cadence(agree_cfg);
+    } else {
+        g.audit_cadence(1);
+    }
     println!(
         "{timing}loaded in {:.1} s: TP={} ranks, max_ctx={}",
         t0.elapsed().as_secs_f64(),
@@ -2047,18 +2120,19 @@ fn amd_bench_tp(
     // identically or the comparison is between a chain and a formatting difference.
     if batched {
         let b = g.rank(0).batch();
+        let active = active_batch.map(|n| n as usize).unwrap_or(b);
+        if active > b {
+            return Err(format!("--active-batch {active} exceeds packet batch {b}").into());
+        }
+        let dp = g.rank(0).decode_prog_for(active);
+        if g.rank(0).prog_t(dp) as usize != active {
+            return Err(format!("--active-batch {active} has no exact decode rung").into());
+        }
         let prompts: Vec<Vec<u32>> = match &prompt {
             None => Vec::new(),
-            Some(p) => p
-                .split(';')
-                .map(|one| {
-                    one.split(',')
-                        .map(|s| s.trim().parse::<u32>())
-                        .collect::<std::result::Result<Vec<u32>, _>>()
-                })
-                .collect::<std::result::Result<_, _>>()?,
+            Some(p) => batched_prompt_ids(p)?,
         };
-        if prompts.is_empty() {
+        if prompts.is_empty() && !synthetic_probe {
             return Err(
                 "--batched on TP needs --prompt: without one every slot decodes over KV \
                         nobody wrote, and agreement between slots is then a statement about VRAM \
@@ -2067,24 +2141,28 @@ fn amd_bench_tp(
             );
         }
         println!(
-            "\nbatched TP decode: {b} sequences per dispatch, {} ranks",
+            "\nbatched TP decode: {active} active of {b} slots per dispatch, {} ranks",
             g.n_gpu()
         );
 
-        let mut pos_v: Vec<u32> = vec![0; b];
+        let mut pos_v: Vec<u32> = vec![ctx; b];
         let mut feed: Vec<u32> = vec![0; b];
-        for s in 0..b {
-            let ids = &prompts[s % prompts.len()];
-            // Prefill is single-sequence on every rank; `prefill_slot` rebases the whole group's
-            // KV pointer tables onto slot `s` for the duration and restores them after, so each
-            // slot's cache is genuinely populated by this run.
-            let tok = AmdTpGroup::agree(&g.prefill_slot(s, ids)?)?;
-            println!("  slot {s}: prefill {} tokens -> sampled {tok}", ids.len());
-            pos_v[s] = ids.len() as u32;
-            feed[s] = tok;
+        for s in 0..active {
+            if !prompts.is_empty() {
+                let ids = &prompts[s % prompts.len()];
+                // Prefill is single-sequence on every rank; `prefill_slot` rebases the whole group's
+                // KV pointer tables onto slot `s` for the duration and restores them after, so each
+                // slot's cache is genuinely populated by this run.
+                let tok = AmdTpGroup::agree(&g.prefill_slot(s, ids)?)?;
+                println!("  slot {s}: prefill {} tokens -> sampled {tok}", ids.len());
+                pos_v[s] = ids.len() as u32;
+                feed[s] = tok;
+            }
         }
 
-        let mut chains: Vec<Vec<u32>> = vec![Vec::new(); b];
+        // Native indexer admission requires an explicit mask even when every row participates.
+        g.upload_parked(&vec![0; b])?;
+        let mut chains: Vec<Vec<u32>> = vec![Vec::new(); active];
         let mut timed = std::time::Duration::ZERO;
         for step in 0..steps {
             // SEED EVERY ROW EXPLICITLY. Prefill is single-sequence and writes `in.ids[0]` only,
@@ -2094,12 +2172,12 @@ fn amd_bench_tp(
             g.seed_ids(&feed)?;
             let kv: Vec<u32> = pos_v.iter().map(|x| x + 1).collect();
             let t = std::time::Instant::now();
-            let out = g.decode_step_batched(&pos_v, &kv)?;
+            let out = g.decode_step_batched_at(&pos_v, &kv, dp)?;
             if step > 0 {
                 timed += t.elapsed();
             }
             dump(&g, &format!("b{:03}", chains[0].len()))?;
-            for s in 0..b {
+            for s in 0..active {
                 chains[s].push(out[s]);
                 feed[s] = out[s];
                 pos_v[s] += 1;
@@ -2112,9 +2190,9 @@ fn amd_bench_tp(
             let timed_steps = steps - 1;
             let ms = timed.as_secs_f64() * 1e3 / timed_steps as f64;
             println!(
-                "  {timing}{timed_steps} timed batched steps (+1 discarded warmup): {ms:.3} ms/step, {:.1} tok/s AGGREGATE over {b} \
+                "  {timing}{timed_steps} timed batched steps (+1 discarded warmup): {ms:.3} ms/step, {:.1} tok/s AGGREGATE over {active} \
                  sequences ({:.1} tok/s per stream), all {} ranks token-identical",
-                b as f64 * 1e3 / ms,
+                active as f64 * 1e3 / ms,
                 1e3 / ms,
                 g.n_gpu()
             );

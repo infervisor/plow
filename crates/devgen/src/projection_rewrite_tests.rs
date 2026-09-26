@@ -141,6 +141,7 @@ fn fixture() -> (DecodeObjects, ProjectionMeasurement) {
             },
         }],
         digests: tunedb::Digests {
+            execution: None,
             implementation: "body".into(),
             interpreter: "b".repeat(64),
             toolchain: "cuda".into(),

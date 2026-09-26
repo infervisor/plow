@@ -82,7 +82,8 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_qkv_mxfp4(const KAr
     } while (0)
 
 /* Kimi-K3 MLA decode: hidden 7168; q_a -> q_lora 1536, kv_a -> kv_lora 512, k_rope -> 64. */
-static const unsigned K3_K = 7168, K3_NQ = 1536, K3_NK = 512, K3_NV = 64, K3_M = 1;
+static const unsigned K3_K = 7168, K3_NQ = 1536, K3_NK = 512, K3_NV = 64;
+static unsigned K3_M = 1;
 static const unsigned NBLK = 256, NTHREADS = 512;
 
 static unsigned rng_state = 0x2545F491u;
@@ -159,14 +160,14 @@ static size_t cmp(const char* what, const std::vector<unsigned short>& a,
  * itself, not the fusion (fused and unfused share it exactly). */
 static double col_err(const std::vector<unsigned short>& C, const std::vector<unsigned short>& x,
                       const std::vector<unsigned char>& W, const std::vector<unsigned char>& S,
-                      unsigned n, unsigned K) {
+                      unsigned m, unsigned n, unsigned N, unsigned K) {
     double acc = 0;
     for (unsigned k = 0; k < K; k++) {
         const unsigned char byte = W[(size_t)n * (K / 2) + k / 2];
         const unsigned nib = (k & 1u) ? (byte >> 4) : (byte & 0xFu); /* low nibble = even k */
-        acc += (double)bf2f_h(x[k]) * (double)fp4_h(nib) * (double)e8m0_h(S[(size_t)n * (K / 32) + k / 32]);
+        acc += (double)bf2f_h(x[(size_t)m * K + k]) * (double)fp4_h(nib) * (double)e8m0_h(S[(size_t)n * (K / 32) + k / 32]);
     }
-    return fabs((double)bf2f_h(C[n]) - acc) / (fabs(acc) > 1e-30 ? fabs(acc) : 1e-30);
+    return fabs((double)bf2f_h(C[(size_t)m * N + n]) - acc) / fmax(1.0, fabs(acc));
 }
 
 static hipFunction_t f_gemv, f_qkv;
@@ -220,6 +221,8 @@ static void report_per_cu(const char* what, unsigned n, unsigned nblk) {
 
 int main(int argc, char** argv) {
     const char* co = argc > 1 ? argv[1] : "/tmp/qkvmx.co";
+    if (argc > 2) K3_M = (unsigned)strtoul(argv[2], nullptr, 10);
+    if (K3_M == 0 || K3_M > 16) { printf("M must be 1..16\n"); return 2; }
     hipDeviceProp_t prop;
     HIP_OK(hipGetDeviceProperties(&prop, 0));
     hipModule_t mod;
@@ -313,40 +316,48 @@ int main(int argc, char** argv) {
     /* ---- the reference: three independent mxfp4 GEMVs, the packets this fusion replaces ---- */
     run_three_separate();
     HIP_OK(hipDeviceSynchronize());
-    const auto rq = read_bf16(Cq, K3_NQ), rk = read_bf16(Ck, K3_NK), rv = read_bf16(Cv, K3_NV);
+    const auto rq = read_bf16(Cq, (size_t)K3_M * K3_NQ);
+    const auto rk = read_bf16(Ck, (size_t)K3_M * K3_NK);
+    const auto rv = read_bf16(Cv, (size_t)K3_M * K3_NV);
     printf("absolute accuracy vs an f64 host dot over the decoded fp4 (prices the GEMV, not the "
            "fusion):\n");
     printf("  q_a  col 0    rel err %.3e     col %-5u rel err %.3e\n",
-           col_err(rq, hx, hWq, hSq, 0, K3_K), K3_NQ - 1,
-           col_err(rq, hx, hWq, hSq, K3_NQ - 1, K3_K));
+           col_err(rq, hx, hWq, hSq, 0, 0, K3_NQ, K3_K), K3_NQ - 1,
+           col_err(rq, hx, hWq, hSq, 0, K3_NQ - 1, K3_NQ, K3_K));
     printf("  krope col 0   rel err %.3e     col %-5u rel err %.3e\n\n",
-           col_err(rv, hx, hWv, hSv, 0, K3_K), K3_NV - 1,
-           col_err(rv, hx, hWv, hSv, K3_NV - 1, K3_K));
+           col_err(rv, hx, hWv, hSv, 0, 0, K3_NV, K3_K), K3_NV - 1,
+           col_err(rv, hx, hWv, hSv, 0, K3_NV - 1, K3_NV, K3_K));
 
     size_t bad = 0;
+    if (K3_M > 1) {
+        const double tail_q = col_err(rq, hx, hWq, hSq, K3_M - 1, 0, K3_NQ, K3_K);
+        const double tail_v = col_err(rv, hx, hWv, hSv, K3_M - 1, 0, K3_NV, K3_K);
+        printf("  last row q_a/k_rope col 0 relative-or-absolute err %.3e / %.3e\n", tail_q, tail_v);
+        bad += tail_q > 0.05 || tail_v > 0.05;
+    }
 
     /* ---- 1. the fused 3-stream sweep, ELEMENTWISE ---- */
-    HIP_OK(hipMemset(Cq, 0, (size_t)K3_NQ * 2));
-    HIP_OK(hipMemset(Ck, 0, (size_t)K3_NK * 2));
-    HIP_OK(hipMemset(Cv, 0, (size_t)K3_NV * 2));
+    HIP_OK(hipMemset(Cq, 0, (size_t)K3_M * K3_NQ * 2));
+    HIP_OK(hipMemset(Ck, 0, (size_t)K3_M * K3_NK * 2));
+    HIP_OK(hipMemset(Cv, 0, (size_t)K3_M * K3_NV * 2));
     run_fused();
     HIP_OK(hipDeviceSynchronize());
     printf("GemvQkvMxfp4 (fused) vs three separate GemvMxfp4, elementwise:\n");
-    bad += cmp("q_a", read_bf16(Cq, K3_NQ), rq);
-    bad += cmp("kv_a", read_bf16(Ck, K3_NK), rk);
-    bad += cmp("k_rope", read_bf16(Cv, K3_NV), rv);
+    bad += cmp("q_a", read_bf16(Cq, (size_t)K3_M * K3_NQ), rq);
+    bad += cmp("kv_a", read_bf16(Ck, (size_t)K3_M * K3_NK), rk);
+    bad += cmp("k_rope", read_bf16(Cv, (size_t)K3_M * K3_NV), rv);
 
     /* ---- 2. the 2-stream form; v_out is poisoned and must stay poisoned ---- */
-    HIP_OK(hipMemset(Cq, 0, (size_t)K3_NQ * 2));
-    HIP_OK(hipMemset(Ck, 0, (size_t)K3_NK * 2));
-    HIP_OK(hipMemset(Cv, 0xEE, (size_t)K3_NV * 2));
+    HIP_OK(hipMemset(Cq, 0, (size_t)K3_M * K3_NQ * 2));
+    HIP_OK(hipMemset(Ck, 0, (size_t)K3_M * K3_NK * 2));
+    HIP_OK(hipMemset(Cv, 0xEE, (size_t)K3_M * K3_NV * 2));
     launch(f_qkv, a_two);
     HIP_OK(hipDeviceSynchronize());
     printf("\ntwo-stream form (Nv=0, the q_nope|q_rope shape) vs the same reference:\n");
-    bad += cmp("q_a", read_bf16(Cq, K3_NQ), rq);
-    bad += cmp("kv_a", read_bf16(Ck, K3_NK), rk);
+    bad += cmp("q_a", read_bf16(Cq, (size_t)K3_M * K3_NQ), rq);
+    bad += cmp("kv_a", read_bf16(Ck, (size_t)K3_M * K3_NK), rk);
     {
-        const auto poisoned = read_bf16(Cv, K3_NV);
+        const auto poisoned = read_bf16(Cv, (size_t)K3_M * K3_NV);
         size_t touched = 0;
         for (size_t i = 0; i < poisoned.size(); i++) touched += (poisoned[i] != 0xEEEEu);
         printf("  %-26s %zu halves written (must be 0)\n", "v_out left alone", touched);

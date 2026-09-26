@@ -359,7 +359,6 @@ fn pick_decode_prog(
 /// One action of a token-batch body launch, in the order [`body_launch_plan`] yields them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BodyLaunch {
-    Reserve(usize),
     Enqueue { seg: usize, rank: usize },
     Commit(usize),
     Drain(usize),
@@ -376,12 +375,8 @@ fn body_launch_plan(
     phase_replay: bool,
 ) -> impl Iterator<Item = BodyLaunch> {
     let replay = if phase_replay { n_ranks } else { 0 };
-    (0..replay)
-        .map(BodyLaunch::Reserve)
-        .chain(
-            segment_major_order(n_segments, n_ranks)
-                .map(|(seg, rank)| BodyLaunch::Enqueue { seg, rank }),
-        )
+    segment_major_order(n_segments, n_ranks)
+        .map(|(seg, rank)| BodyLaunch::Enqueue { seg, rank })
         .chain((0..replay).map(BodyLaunch::Commit))
         .chain((0..n_ranks).map(BodyLaunch::Drain))
 }
@@ -392,6 +387,7 @@ pub struct AmdTpGroup {
     group: TpGroup,
     /// One engine per rank, in rank order.
     ranks: Vec<AmdEngine>,
+    chain_tickets: Vec<Option<crate::device::kernarg_retirement::Admission>>,
     reset: XctrReset,
     /// Per-program expected cross-GPU gate counts — see [`gate_expectations`].
     /// `None` for an id that is a peer-visible DATA slot rather than a counter.
@@ -426,14 +422,65 @@ pub struct AmdTpGroup {
 }
 
 impl AmdTpGroup {
-    /// Wait for every rank's queue on an error path, keeping the original error. Rank errors here
-    /// are dropped deliberately: the caller already has the one that failed the step.
-    fn drain_all_ranks(&self) {
-        for e in &self.ranks {
-            if let Err(err) = e.drain() {
-                tracing::warn!(%err, "drain after a failed prefill enqueue");
-            }
+    fn phase_replay_for(&self, prog: usize) -> Result<bool> {
+        let selected = self.ranks[0].graph_phase_replay(prog);
+        if self.ranks.iter().any(|rank| rank.graph_phase_replay(prog) != selected) {
+            return Err(RuntimeError::Device("graph phase-object selection differs across TP ranks".into()));
         }
+        if !selected { return Ok(false); }
+        for rank in &self.ranks {
+            if !rank.replay_without_prepare(prog)? { return Ok(false); }
+        }
+        Ok(true)
+    }
+
+    fn enqueue_segment_all(&mut self, prog: usize, seg: usize) -> Result<()> {
+        let skipped = self.ranks[0].prefill_segment_launches(prog, seg) == 0;
+        if self.ranks.iter().any(|rank| (rank.prefill_segment_launches(prog, seg) == 0) != skipped) {
+            for rank in &self.ranks { rank.abort_replay(); }
+            return Err(RuntimeError::Rejected("TP segment skip differs across ranks".into()));
+        }
+        if skipped { return Ok(()); }
+        let prepared = super::chain_admission::prepare_all(
+            self.ranks.len(), crate::config::RuntimeConfig::get().amd.native_launch_timing,
+            |rank| self.ranks[rank].segment_needs_prepare(prog, seg),
+            |rank| self.ranks[rank].drain(),
+            |rank| self.ranks[rank].prepare_segment_quiescent(prog, seg),
+        );
+        if let Err(error) = prepared {
+            for rank in &self.ranks { rank.abort_replay(); }
+            return Err(error);
+        }
+        let admitted = super::chain_admission::reserve_all(
+            &mut self.chain_tickets,
+            |rank| self.ranks[rank].preflight_segment_batch(prog, seg),
+            |rank, ticket| self.ranks[rank].begin_segment_batch(ticket),
+            |rank| self.ranks[rank].abort_replay(),
+        );
+        if let Err(error) = admitted {
+            // Earlier segments may still use the rebased tensor tables. Refuse
+            // subsequent device writes; cancellation is not kernel completion.
+            for rank in &self.ranks { rank.abort_replay(); }
+            return Err(error);
+        }
+        let result = (|| -> Result<()> {
+            for rank in &mut self.ranks { rank.enqueue_segment_prepared(prog, seg)?; }
+            for rank in &self.ranks { rank.preflight_replay_commit()?; }
+            for rank in &self.ranks { rank.commit_graph_phase_replay()?; }
+            Ok(())
+        })();
+        if result.is_err() {
+            for rank in &self.ranks { rank.abort_replay(); }
+        }
+        result
+    }
+
+    fn finish_ranks(&self) -> Result<()> {
+        let result = super::chain_admission::finish_all(self.ranks.len(), |rank| self.ranks[rank].drain());
+        if result.is_err() {
+            for rank in &self.ranks { rank.abort_replay(); }
+        }
+        result
     }
 
     /// Bring up every rank of a sharded blob.
@@ -732,6 +779,7 @@ impl AmdTpGroup {
 
         Ok(AmdTpGroup {
             group,
+            chain_tickets: vec![None; ranks.len()],
             ranks,
             reset: XctrReset::Host,
             gate_expect,
@@ -899,7 +947,10 @@ impl AmdTpGroup {
     ) -> Result<()> {
         use crate::obs::dstep;
         let rows = (self.ranks[0].prog_t(self.cur_dp) as usize).min(batch);
-        self.ranks[0].enqueue_token_capture(step, quantum, rows)?;
+        if let Err(error) = self.ranks[0].enqueue_token_capture(step, quantum, rows) {
+            for rank in &self.ranks { rank.abort_replay(); }
+            return Err(error);
+        }
         self.drain_and_audit()?;
         if agreement_due(&mut self.agree_tick, self.agree_every) {
             dstep::timed(&dstep::READ, || {
@@ -1056,53 +1107,73 @@ impl AmdTpGroup {
         // Prepare every rank's complete packet chain before publishing any doorbell. Ringing each
         // segment as it is written lets an early GPU run ahead of the host's segment-major loop;
         // at wide rungs that can put peers in different collective segments.
-        for e in &*ranks {
-            e.begin_decode_replay(dp)?;
-        }
-        self.group.launch_token(self.reset, |_| {
-            if let (Some(t0), None) = (t0, launched_at) {
-                let now = std::time::Instant::now();
-                dstep::XCTR.add((now - t0).as_nanos() as u64);
-                launched_at = Some(now);
-            }
-            let e = &mut ranks[i];
-            let k = e.decode_kernel_for(dp);
-            i += 1;
-            e.enqueue_decode_segment(dp, 0, k)
-        })?;
-        // All queues were reserved above and publish no doorbell until every fill completes.
-        // Their only ordering requirement is local segment order, so fill the eight independent
-        // rank queues in parallel. This removes the serialized host submission term without
-        // allowing an early rank to enter a collective before its peers are ready.
-        if n_segments > 1 {
-            std::thread::scope(|scope| -> Result<()> {
-                let handles: Vec<_> = ranks
-                    .iter_mut()
-                    .enumerate()
-                    .map(|(rank, e)| {
-                        scope.spawn(move || -> Result<()> {
-                            let k = e.decode_kernel_for(dp);
-                            for seg in 1..n_segments {
-                                e.enqueue_decode_segment(dp, seg, k).map_err(|err| {
-                                    RuntimeError::Device(format!(
-                                        "rank {rank} decode replay segment {seg}: {err}"
-                                    ))
-                                })?;
-                            }
-                            Ok(())
-                        })
-                    })
-                    .collect();
-                for handle in handles {
-                    handle.join().map_err(|_| {
-                        RuntimeError::Device("decode replay fill thread panicked".into())
-                    })??;
+        super::chain_admission::reserve_all(
+            &mut self.chain_tickets,
+            |rank| ranks[rank].preflight_decode_replay(dp),
+            |rank, ticket| ranks[rank].begin_decode_replay_admitted(ticket),
+            |rank| ranks[rank].abort_replay(),
+        )?;
+        let replay_result = (|| -> Result<()> {
+            self.group.launch_token(self.reset, |_| {
+                if let (Some(t0), None) = (t0, launched_at) {
+                    let now = std::time::Instant::now();
+                    dstep::XCTR.add((now - t0).as_nanos() as u64);
+                    launched_at = Some(now);
                 }
-                Ok(())
+                let e = &mut ranks[i];
+                let k = e.decode_kernel_for(dp);
+                i += 1;
+                e.enqueue_decode_segment(dp, 0, k)
             })?;
-        }
-        for e in &*ranks {
-            e.commit_decode_replay()?;
+            // All queues were reserved above and publish no doorbell until every fill completes.
+            // Their only ordering requirement is local segment order, so fill the eight independent
+            // rank queues in parallel. This removes the serialized host submission term without
+            // allowing an early rank to enter a collective before its peers are ready.
+            if n_segments > 1 {
+                std::thread::scope(|scope| -> Result<()> {
+                    let handles: Vec<_> = ranks
+                        .iter_mut()
+                        .enumerate()
+                        .map(|(rank, e)| {
+                            scope.spawn(move || -> Result<()> {
+                                let k = e.decode_kernel_for(dp);
+                                for seg in 1..n_segments {
+                                    e.enqueue_decode_segment(dp, seg, k).map_err(|err| {
+                                        RuntimeError::Device(format!(
+                                            "rank {rank} decode replay segment {seg}: {err}"
+                                        ))
+                                    })?;
+                                }
+                                Ok(())
+                            })
+                        })
+                        .collect();
+                    let mut fill_error = None;
+                    for handle in handles {
+                        let result = handle.join().map_err(|_| {
+                            RuntimeError::Device("decode replay fill thread panicked".into())
+                        }).and_then(|result| result);
+                        if let Err(error) = result {
+                            fill_error.get_or_insert(error);
+                        }
+                    }
+                    match fill_error {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    }
+                })?;
+            }
+            for e in &*ranks {
+                e.preflight_replay_commit()?;
+            }
+            for e in &*ranks {
+                e.commit_decode_replay()?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = replay_result {
+            for rank in &*ranks { rank.abort_replay(); }
+            return Err(error);
         }
         if let Some(z) = launched_at {
             dstep::ENQUEUE.add(z.elapsed().as_nanos() as u64);
@@ -1172,15 +1243,17 @@ impl AmdTpGroup {
         })
     }
 
+    /// Complete an act.x-only block without reading the model-only sampled-token tensor.
+    pub fn complete_block(&mut self) -> Result<()> {
+        self.drain_and_audit()
+    }
+
     fn drain_and_audit(&mut self) -> Result<()> {
         use crate::obs::dstep;
         // The decode is on the GPU: a prefix publish deferred from this tick's chunk runs here.
         let published = self.flush_deferred_publish();
         dstep::timed(&dstep::DRAIN, || -> Result<()> {
-            for e in &self.ranks {
-                e.drain()?;
-            }
-            Ok(())
+            self.finish_ranks()
         })?;
         if self.audit {
             // The rung that actually launched, not the widest — a narrow rung emits fewer
@@ -1189,18 +1262,17 @@ impl AmdTpGroup {
             let dp = self.cur_dp;
             dstep::timed(&dstep::AUDIT, || {
                 if self.audit_compact {
-                    for (e, r) in self.ranks.iter().zip(self.group.ranks()) {
+                    let submitted = self.ranks.iter().zip(self.group.ranks()).try_for_each(|(e, r)| {
                         e.enqueue_xaudit(
                             dp,
                             r.xctr(),
                             self.group.layout().n_xctr,
                             self.group.n_gpu(),
                             r.xstatus(),
-                        )?;
-                    }
-                    for e in &self.ranks {
-                        e.drain()?;
-                    }
+                        )
+                    });
+                    let finished = self.finish_ranks();
+                    submitted.and(finished)?;
                     match self.group.audit_xstatus_direct() {
                         Ok(()) => Ok(()),
                         Err(status) => self
@@ -1312,12 +1384,9 @@ impl AmdTpGroup {
             for e in &mut self.ranks {
                 e.prepare_device_state_clear(slot)?;
             }
-            for e in &self.ranks {
-                e.enqueue_state_clear(slot)?;
-            }
-            for e in &self.ranks {
-                e.drain()?;
-            }
+            let submitted = self.ranks.iter().try_for_each(|e| e.enqueue_state_clear(slot));
+            let finished = self.finish_ranks();
+            submitted.and(finished)?;
             return Ok(());
         }
         for e in &mut self.ranks {
@@ -1536,13 +1605,9 @@ impl AmdTpGroup {
             // Timing a segment needs its own drain, as on the prefill path.
             for seg in 0..launches {
                 let submit = std::time::Instant::now();
-                for e in &mut self.ranks {
-                    e.enqueue_segment(prog, seg)?;
-                }
+                self.enqueue_segment_all(prog, seg)?;
                 let enqueued = std::time::Instant::now();
-                for e in &self.ranks {
-                    e.drain()?;
-                }
+                self.finish_ranks()?;
                 eprintln!(
                     "TB_SEG_TIMING program={prog} rows={} segment={seg} family={} enqueue_us={:.3} critical_us={:.3}",
                     self.ranks[0].prog_t(prog),
@@ -1552,27 +1617,45 @@ impl AmdTpGroup {
                 );
             }
         } else {
-            let phase_replay = self.ranks[0].graph_phase_replay(prog);
-            if self.ranks.iter().any(|rank| rank.graph_phase_replay(prog) != phase_replay) {
-                return Err(RuntimeError::Device(
-                    "graph phase-object selection differs across TP ranks".into(),
-                ));
+            let phase_replay = self.phase_replay_for(prog)?;
+            if phase_replay {
+                super::chain_admission::reserve_all(
+                    &mut self.chain_tickets,
+                    |rank| self.ranks[rank].preflight_graph_phase_replay(prog),
+                    |rank, ticket| self.ranks[rank].begin_graph_phase_replay_admitted(ticket),
+                    |rank| self.ranks[rank].abort_replay(),
+                )?;
             }
-            for op in body_launch_plan(launches, self.ranks.len(), phase_replay) {
-                match op {
-                    BodyLaunch::Reserve(rank) => {
-                        self.ranks[rank].begin_graph_phase_replay(prog)?;
-                    }
-                    BodyLaunch::Enqueue { seg, rank } => {
-                        self.ranks[rank].enqueue_segment(prog, seg)?;
-                    }
-                    BodyLaunch::Commit(rank) => {
-                        self.ranks[rank].commit_graph_phase_replay()?;
-                    }
-                    BodyLaunch::Drain(rank) => {
-                        self.ranks[rank].drain()?;
+            let replay_result = (|| -> Result<()> {
+                for op in body_launch_plan(launches, self.ranks.len(), phase_replay) {
+                    match op {
+                        BodyLaunch::Enqueue { seg, rank } => {
+                            if phase_replay {
+                                self.ranks[rank].enqueue_segment(prog, seg)?;
+                            } else if rank == 0 {
+                                self.enqueue_segment_all(prog, seg)?;
+                            }
+                        }
+                        BodyLaunch::Commit(rank) => {
+                            if rank == 0 {
+                                for e in &self.ranks {
+                                    e.preflight_replay_commit()?;
+                                }
+                            }
+                            self.ranks[rank].commit_graph_phase_replay()?;
+                        }
+                        BodyLaunch::Drain(rank) => {
+                            if rank == 0 { self.finish_ranks()?; }
+                        }
                     }
                 }
+                Ok(())
+            })();
+            if let Err(error) = replay_result {
+                if phase_replay {
+                    for rank in &self.ranks { rank.abort_replay(); }
+                }
+                return Err(error);
             }
         }
         if self.audit {
@@ -1804,37 +1887,38 @@ impl AmdTpGroup {
         if segment_major {
             let t = std::time::Instant::now();
             let n_ranks = self.ranks.len();
-            let phase_replay = self.ranks[0].graph_phase_replay(step.prog);
-            if self
-                .ranks
-                .iter()
-                .any(|rank| rank.graph_phase_replay(step.prog) != phase_replay)
-            {
-                return Err(RuntimeError::Device(
-                    "graph phase-object selection differs across TP ranks".into(),
-                ));
-            }
+            let phase_replay = self.phase_replay_for(step.prog)?;
             if phase_replay {
                 // Reserve every rank before publishing any doorbell. Rank-first
                 // chain commit recreates the measured TP desynchronization bug.
-                for rank in &self.ranks {
-                    rank.begin_graph_phase_replay(step.prog)?;
-                }
+                super::chain_admission::reserve_all(
+                    &mut self.chain_tickets,
+                    |rank| self.ranks[rank].preflight_graph_phase_replay(step.prog),
+                    |rank, ticket| self.ranks[rank].begin_graph_phase_replay_admitted(ticket),
+                    |rank| self.ranks[rank].abort_replay(),
+                )?;
             }
             for (seg, rank) in segment_major_order(launches, n_ranks) {
+                if !phase_replay {
+                    if rank == 0 { self.enqueue_segment_all(step.prog, seg)?; }
+                    continue;
+                }
                 if let Err(e) = self.ranks[rank].enqueue_segment(step.prog, seg) {
-                    // Segments before this one are already queued on every rank. Returning with
-                    // them in flight let the caller's `kv_rebase_all(0)` rewrite the tensor table
-                    // under them (engine.rs), so queued KV writes landed on slot 0's rows or on a
-                    // half-rebased address. Drain first; a partially enqueued collective bails at
-                    // its deadline, which is slow but touches nothing it does not own.
-                    self.drain_all_ranks();
+                    // Partial reserved chains cannot be drained or rolled back.
+                    // Poison every rank before a caller can attempt table rebinding.
+                    for rank in &self.ranks { rank.abort_replay(); }
                     return Err(e);
                 }
             }
             if phase_replay {
-                for rank in &self.ranks {
-                    rank.commit_graph_phase_replay()?;
+                let committed = (|| -> Result<()> {
+                    for rank in &self.ranks { rank.preflight_replay_commit()?; }
+                    for rank in &self.ranks { rank.commit_graph_phase_replay()?; }
+                    Ok(())
+                })();
+                if let Err(error) = committed {
+                    for rank in &self.ranks { rank.abort_replay(); }
+                    return Err(error);
                 }
             }
             let enqueue_ns = t.elapsed().as_nanos() as u64;
@@ -1865,6 +1949,7 @@ impl AmdTpGroup {
                 }
             }
             if let Some(err) = drain_err {
+                for rank in &self.ranks { rank.abort_replay(); }
                 return Err(err);
             }
             let ns = t.elapsed().as_nanos() as u64;
@@ -1935,9 +2020,7 @@ impl AmdTpGroup {
             let submit_begin = std::time::Instant::now();
             let family =
                 segment_timing.then(|| self.ranks[0].prefill_segment_family(step.prog, seg));
-            for e in &mut self.ranks {
-                e.enqueue_segment(step.prog, seg)?;
-            }
+            self.enqueue_segment_all(step.prog, seg)?;
             let enqueued = std::time::Instant::now();
             ttft::PF_ENQUEUE.add((enqueued - submit_begin).as_nanos() as u64);
             // For WaveSegments this is THE BARRIER. Without it the ranks drift
@@ -1945,9 +2028,7 @@ impl AmdTpGroup {
             // each other. L2Domains has one iteration and this is its final
             // all-rank drain.
             let drain_begin = std::time::Instant::now();
-            for e in &self.ranks {
-                e.drain()?;
-            }
+            self.finish_ranks()?;
             let drain_ns = drain_begin.elapsed().as_nanos() as u64;
             if let Some(family) = family {
                 eprintln!(
@@ -2110,14 +2191,10 @@ impl AmdTpGroup {
         ttft::PF_SEGMENTS.tally(launches as u64);
         for seg in 0..launches {
             let t = std::time::Instant::now();
-            for e in &mut self.ranks {
-                e.enqueue_segment(prog, seg)?;
-            }
+            self.enqueue_segment_all(prog, seg)?;
             ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
             let t = std::time::Instant::now();
-            for e in &self.ranks {
-                e.drain()?;
-            }
+            self.finish_ranks()?;
             ttft::PF_DRAIN.add(t.elapsed().as_nanos() as u64);
         }
         if self.audit {
@@ -2361,6 +2438,16 @@ fn check_rowsplit_attn(blob: &DevBlob, seq_par_slots: u64) -> Result<u64> {
 fn check_dcp_gather(blob: &DevBlob, slots: u64, slot_bytes: u64) -> Result<u64> {
     use packet::dev::DevOp;
     const REC_BYTES: u64 = 656;
+    let canonical = blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
+        d.op == DevOp::IndexSelect as u16 && d.i[4] == 3
+    });
+    if !canonical && blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
+        d.op == DevOp::DcpKvPack as u16 && u32::from(d.t[0]) != packet::TENSOR_NONE
+    }) {
+        return Err(RuntimeError::Device(
+            "DCP decode requires canonical selection before owner pack".into(),
+        ));
+    }
     let mut any = false;
     for (pi, p) in blob.progs.iter().enumerate() {
         for d in &p.insts {
@@ -2682,7 +2769,7 @@ mod tests {
 
     #[test]
     fn a_token_batch_body_launches_segment_major_and_drains_each_rank_once() {
-        use BodyLaunch::{Commit, Drain, Enqueue, Reserve};
+        use BodyLaunch::{Commit, Drain, Enqueue};
         assert_eq!(
             body_launch_plan(2, 3, false).collect::<Vec<_>>(),
             [
@@ -2697,12 +2784,10 @@ mod tests {
                 Drain(2),
             ]
         );
-        // Every rank reserved before any doorbell, committed after the last enqueue.
+        // Collective admission reserves all ranks before this fill/commit plan.
         assert_eq!(
             body_launch_plan(2, 2, true).collect::<Vec<_>>(),
             [
-                Reserve(0),
-                Reserve(1),
                 Enqueue { seg: 0, rank: 0 },
                 Enqueue { seg: 0, rank: 1 },
                 Enqueue { seg: 1, rank: 0 },
@@ -2996,6 +3081,20 @@ mod tests {
         assert!(check_dcp_gather(&blob([32, 2048, 0, 6, 3, three, 7, 8]), 6, slot).is_err());
         assert!(check_dcp_gather(&blob([32, 8192, 0, 6, 3, six, 7, 8]), 6, slot).is_err());
         assert!(check_dcp_gather(&blob([32, 2048, 0, 6, 3, six, 7, 8]), 9, slot).is_err());
+        let mut decode = blob([32, 2048, 0, 6, 3, six, 7, 8]);
+        decode.progs[0].insts.insert(0, DevInst64 {
+            op: DevOp::DcpKvPack as u16,
+            t: [0, 65535, 65535, 65535, 65535, 65535, 65535, 65535],
+            i: [32, 2048, 0, 6, 3, six, 0, 0],
+            ..Default::default()
+        });
+        assert!(check_dcp_gather(&decode, 6, slot).is_err());
+        decode.progs[0].insts.insert(0, DevInst64 {
+            op: DevOp::IndexSelect as u16,
+            i: [0, 2048, 0, 0, 3, 0, 0, 0],
+            ..Default::default()
+        });
+        assert_eq!(check_dcp_gather(&decode, 6, slot).unwrap(), 7);
         let mut plain = blob([0; 8]);
         plain.progs[0].insts.clear();
         assert_eq!(check_dcp_gather(&plain, 6, slot).unwrap(), 6);

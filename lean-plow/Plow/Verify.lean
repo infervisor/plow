@@ -102,6 +102,106 @@ theorem happensBeforeB_sound {tg : TaskGraph} (p : CounterProtocol tg)
   · exact Or.inl heq.symm
   · exact Or.inr hhb
 
+def verifyDependencies {tg : TaskGraph} (p : CounterProtocol tg) : Bool :=
+  tg.edges.all fun (a, b) => a != b && happensBeforeB p a b
+
+theorem verifyDependencies_sound {tg : TaskGraph} (p : CounterProtocol tg)
+    (h : verifyDependencies p = true) :
+    ∀ a b, (a, b) ∈ tg.edges → happensBefore p a b := by
+  intro a b hab
+  have edge := List.all_eq_true.mp h (a, b) hab
+  simp only [Bool.and_eq_true, bne_iff_ne] at edge
+  rcases happensBeforeB_sound p a b edge.2 with eq | hb
+  · exact False.elim (edge.1 eq)
+  · exact hb
+
+def checkPath {tg : TaskGraph} (p : CounterProtocol tg)
+    (a b : Fin tg.n) : List (Fin tg.n) → Bool
+  | [] => directEdgeB p a b
+  | mid :: rest => directEdgeB p a mid && checkPath p mid b rest
+
+theorem checkPath_sound {tg : TaskGraph} (p : CounterProtocol tg)
+    (a b : Fin tg.n) (path : List (Fin tg.n))
+    (h : checkPath p a b path = true) : happensBefore p a b := by
+  induction path generalizing a with
+  | nil => exact directEdgeB_sound p a b h
+  | cons mid rest ih =>
+    simp only [checkPath, Bool.and_eq_true] at h
+    exact happensBefore.trans (directEdgeB_sound p a mid h.1) (ih mid h.2)
+
+def checkPaths {tg : TaskGraph} (p : CounterProtocol tg) :
+    List (Fin tg.n × Fin tg.n) → List (List (Fin tg.n)) → Bool
+  | [], [] => true
+  | (a, b) :: edges, path :: paths => checkPath p a b path && checkPaths p edges paths
+  | _, _ => false
+
+theorem checkPaths_sound {tg : TaskGraph} (p : CounterProtocol tg)
+    (edges : List (Fin tg.n × Fin tg.n)) (paths : List (List (Fin tg.n)))
+    (h : checkPaths p edges paths = true) :
+    ∀ a b, (a, b) ∈ edges → happensBefore p a b := by
+  induction edges generalizing paths with
+  | nil => simp
+  | cons edge rest ih =>
+    cases paths with
+    | nil => simp [checkPaths] at h
+    | cons path paths =>
+      obtain ⟨a, b⟩ := edge
+      simp only [checkPaths, Bool.and_eq_true] at h
+      intro x y hxy
+      rcases List.mem_cons.mp hxy with same | tail
+      · cases same
+        exact checkPath_sound p a b path h.1
+      · exact ih paths h.2 x y tail
+
+
+structure PathWitness (tg : TaskGraph) where
+  source : Fin tg.n
+  target : Fin tg.n
+  via : List (Fin tg.n)
+
+def witnessedBefore {tg : TaskGraph} (p : CounterProtocol tg)
+    (paths : List (PathWitness tg)) (a b : Fin tg.n) : Bool :=
+  paths.any fun w => decide (w.source = a) && decide (w.target = b) &&
+    checkPath p w.source w.target w.via
+
+theorem witnessedBefore_sound {tg : TaskGraph} (p : CounterProtocol tg)
+    (paths : List (PathWitness tg)) (a b : Fin tg.n)
+    (h : witnessedBefore p paths a b = true) : happensBefore p a b := by
+  simp only [witnessedBefore, List.any_eq_true, Bool.and_eq_true, decide_eq_true_eq] at h
+  obtain ⟨w, _, ⟨hs, ht⟩, hp⟩ := h
+  have checked := checkPath_sound p w.source w.target w.via hp
+  simpa [hs, ht] using checked
+
+def readersBeforeWritersVia {tg : TaskGraph} (p : CounterProtocol tg)
+    (paths : List (PathWitness tg)) (readers writers : List (Fin tg.n)) : Bool :=
+  readers.all fun r => writers.all fun w => witnessedBefore p paths r w
+
+def verifyAddressMapVia {tg : TaskGraph} (p : CounterProtocol tg)
+    (entries : List (AddrEntry tg)) (paths : List (PathWitness tg)) : Bool :=
+  entries.all fun a => entries.all fun b =>
+    decide (a.name = b.name) || !bytesOverlapB a.offset a.size b.offset b.size
+    || readersBeforeWritersVia p paths a.readers b.writers
+    || readersBeforeWritersVia p paths b.readers a.writers
+
+theorem verifyAddressMapVia_sound {tg : TaskGraph} (p : CounterProtocol tg)
+    (entries : List (AddrEntry tg)) (paths : List (PathWitness tg))
+    (h : verifyAddressMapVia p entries paths = true) : AddressMapSound p entries := by
+  intro a b ha hb hne hov
+  have pair := (List.all_eq_true.mp ((List.all_eq_true.mp h) a ha)) b hb
+  have name : decide (a.name = b.name) = false := by simp [hne]
+  have overlap : bytesOverlapB a.offset a.size b.offset b.size = true :=
+    (bytesOverlapB_iff a.offset a.size b.offset b.size).mpr hov
+  rw [name, overlap] at pair
+  simp only [Bool.false_or, Bool.not_true, Bool.or_eq_true] at pair
+  rcases pair with forward | backward
+  · left
+    intro r hr w hw
+    exact witnessedBefore_sound p paths r w
+      ((List.all_eq_true.mp ((List.all_eq_true.mp forward) r hr)) w hw)
+  · right
+    intro r hr w hw
+    exact witnessedBefore_sound p paths r w
+      ((List.all_eq_true.mp ((List.all_eq_true.mp backward) r hr)) w hw)
 
 /-! ## The address-map verifier. -/
 

@@ -44,7 +44,9 @@ pb_hazard_env
 echo
 echo "[3] binaries"
 pb_check_plowrt "$PLOWRT" "$ARCH"
-pb_check_vllm "$ARCH"
+if [ "${5:-serve}" != block ]; then
+    pb_check_vllm "$ARCH"
+fi
 # plowc is needed only for emit, and lives in a per-campaign target dir more often than not.
 for c in "$WT/target/release/plowc" "$WT/target-glm53/release/plowc"; do
     [ -x "$c" ] && { pb_ok "plowc $c"; break; }
@@ -58,7 +60,7 @@ else
     pb_warn "no assets dir given — pass one, or set PB_ASSETS, to check the packet"
 fi
 if [ -n "$OBJDIR" ]; then
-    pb_check_objects "$OBJDIR" "$ARCH"
+    pb_check_objects "$OBJDIR" "$ARCH" "$ASSETS"
 else
     pb_warn "no object dir given — pass one, or set PLOW_HSACO, to check the object set"
 fi

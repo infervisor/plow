@@ -112,6 +112,18 @@ mod packlog {
         did_decode: bool,
         rows: usize,
     ) {
+        if on() {
+            let t = START.get_or_init(std::time::Instant::now).elapsed();
+            eprintln!(
+                "PACKLOG PHASE t_ms={:.1} prefill_ms={:.2} decode_ms={:.2} did_prefill={} did_decode={} decode_rows={}",
+                t.as_secs_f64() * 1e3,
+                prefill_ns as f64 / 1e6,
+                decode_ns as f64 / 1e6,
+                did_prefill as u8,
+                did_decode as u8,
+                rows,
+            );
+        }
         PREFILL_NS.fetch_add(prefill_ns, Ordering::Relaxed);
         DECODE_NS.fetch_add(decode_ns, Ordering::Relaxed);
         if did_prefill {
@@ -599,7 +611,7 @@ pub fn spawn(
     // else changes: the loop below already waits for every tick before touching the queue.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     let inline_tick = state.gpu_engine(&slug).is_some_and(|engine| {
-        crate::config::RuntimeConfig::get().mux_inline_tick(engine.lock().is_cuda())
+        crate::config::RuntimeConfig::get().mux_inline_tick(engine.lock().is_gpu())
     });
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let inline_tick = false;
@@ -1001,16 +1013,16 @@ pub fn spawn(
             // Handed to the blocking pool so the dispatcher task stays hot
             // for arrivals.
             let steps = if cfg.multi_step {
-                #[cfg(feature = "cuda")]
-                let cuda_quantum = crate::config::RuntimeConfig::get().multistep();
-                #[cfg(not(feature = "cuda"))]
-                let cuda_quantum = 0;
-                #[cfg(feature = "cuda")]
+                #[cfg(any(feature = "cuda", feature = "hsa"))]
+                let device_quantum = crate::config::RuntimeConfig::get().multistep();
+                #[cfg(not(any(feature = "cuda", feature = "hsa")))]
+                let device_quantum = 0;
+                #[cfg(any(feature = "cuda", feature = "hsa"))]
                 let adaptive = crate::config::RuntimeConfig::get().nv.multistep_adaptive;
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(any(feature = "cuda", feature = "hsa")))]
                 let adaptive = false;
 
-                if cuda_quantum > 1
+                if device_quantum > 1
                     && adaptive
                     && (freed_last_tick
                         || !waiting.is_empty()
@@ -1021,8 +1033,8 @@ pub fn spawn(
                     // successor is usually a round trip away, and a K-step quantum here lets
                     // the next completion land in the same wave (two prefills back to back).
                     1
-                } else if cuda_quantum > 1 {
-                    cuda_quantum.max(MultiStep::for_batch(live as i64).steps)
+                } else if device_quantum > 1 {
+                    device_quantum.max(MultiStep::for_batch(live as i64).steps)
                 } else {
                     MultiStep::for_batch(live as i64).steps
                 }
@@ -3493,34 +3505,40 @@ fn run_one_tick(
             let multi = e.multistep_quantum(&feeds, requested);
             let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
             let t_dec = (crate::obs::tick::on() || slo_on).then(Instant::now);
+            let t_call = crate::obs::host::on().then(Instant::now);
             let step_result = if let Some(quantum) = multi {
-                e.multi_step(&feeds, quantum, &mut deferred)
-                    .and_then(|quantum| {
-                        for &(i, _) in &feeds {
-                            for step in 0..quantum {
-                                if slots[i].is_none() {
-                                    break;
-                                }
-                                let token = deferred_token(&deferred, i, step, quantum)?;
-                                tracing::debug!(token, slot = i, "amd: token (deferred read)");
-                                handle_produced_token(
-                                    &mut slots[i],
-                                    &arena,
-                                    bundle,
-                                    token,
-                                    1,
-                                    &mut tokens_this_tick,
-                                    Some(stop.as_slice()),
-                                );
-                            }
+                let call_res = e.multi_step(&feeds, quantum, &mut deferred);
+                let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
+                let res = call_res.and_then(|quantum| {
+                    for &(i, _) in &feeds {
+                        for step in 0..quantum {
                             if slots[i].is_none() {
-                                e.release(i);
+                                break;
                             }
+                            let token = deferred_token(&deferred, i, step, quantum)?;
+                            tracing::debug!(token, slot = i, "amd: token (deferred read)");
+                            handle_produced_token(
+                                &mut slots[i],
+                                &arena,
+                                bundle,
+                                token,
+                                1,
+                                &mut tokens_this_tick,
+                                Some(stop.as_slice()),
+                            );
                         }
-                        Ok(quantum)
-                    })
+                        if slots[i].is_none() {
+                            e.release(i);
+                        }
+                    }
+                    Ok(quantum)
+                });
+                host_emit_done(t_emit, tokens_this_tick);
+                res
             } else {
-                e.step_batch(&feeds).map(|out| {
+                let call_res = e.step_batch(&feeds);
+                let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
+                let res = call_res.map(|out| {
                     for (i, token) in out {
                         tracing::debug!(token, slot = i, "amd: token");
                         let t_stream = crate::obs::dstep::on().then(Instant::now);
@@ -3541,7 +3559,9 @@ fn run_one_tick(
                         }
                     }
                     1
-                })
+                });
+                host_emit_done(t_emit, tokens_this_tick);
+                res
             };
             obs.host.slot_tokens = deferred;
             if let Some(t) = t_dec {
@@ -4693,14 +4713,14 @@ fn gpu_argmax_eligible(params: &crate::text::sample::SamplingParams) -> bool {
 
 /// §HOSTT: close a timed decode engine call and open its emit loop (`tokens` = the tick's count
 /// so far).
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 fn host_engine_call(t_call: Option<Instant>, rows: usize, tokens: usize) -> Option<(Instant, usize)> {
     let t = t_call?;
     crate::obs::host::engine_call(t.elapsed().as_nanos() as u64, rows);
     Some((Instant::now(), tokens))
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 fn host_emit_done(t_emit: Option<(Instant, usize)>, tokens: usize) {
     if let Some((t, before)) = t_emit {
         crate::obs::host::emit(t.elapsed().as_nanos() as u64, tokens - before);

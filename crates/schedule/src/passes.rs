@@ -881,7 +881,7 @@ fn build_packets(
     out
 }
 
-fn packet_kind(r: ResourceId, k: TaskKind) -> PacketKind {
+pub(crate) fn packet_kind(r: ResourceId, k: TaskKind) -> PacketKind {
     match (r, k) {
         (ResourceId::Sm(..), _) => PacketKind::Compute,
         (ResourceId::Dpu(_), _) => PacketKind::Rdma,

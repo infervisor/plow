@@ -1,0 +1,13 @@
+{
+  "_arch": "gfx950",
+  "interp_decode_mxfp4": {
+    "plow_exec": {
+      "mfma": "v_mfma_f32_4x4x4_16b_bf16",
+      "require_min": {
+        "v_cvt_scalef32_pk_bf16_fp4": 16,
+        "v_dot2c_f32_bf16": 16,
+        "v_mfma_f32_4x4x4_16b_bf16": 16
+      }
+    }
+  }
+}

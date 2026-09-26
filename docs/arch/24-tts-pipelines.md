@@ -45,7 +45,7 @@ control ids, `max_speech_tokens`, `cfg_weight_f32`, `temperature_f32`,
 | Op | What | Backends |
 |---|---|---|
 | `EmbedOverlayBf16` (179) | row = `table[tok]` or a BF16-rounded host overlay row | CPU golden, Metal, CUDA |
-| `EmbedPosBf16` (184) | `table[tok] + pos_table[pos - base]` per row | CPU golden, CUDA |
+| `EmbedPosBf16` (194) | `table[tok] + pos_table[pos - base]` per row | CPU golden, CUDA |
 
 `EmbedOverlayBf16` is the same generic encoder-to-decoder handoff Qwen3-ASR
 uses. `EmbedPosBf16` is T3's decode embedding (`speech_emb` + learned

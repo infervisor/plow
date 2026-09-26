@@ -109,6 +109,29 @@ pub(super) fn snapshot_regions<'a>(
         }
     }
     for d in instructions.clone() {
+        if d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16 {
+            let index = d.t[4] as usize;
+            let tensor = tensors.get(index)?;
+            let ctx = u32::try_from(max_ctx).ok()?;
+            if packet::ctx_bound::tensor_scaling(&tensor.name)
+                != packet::ctx_bound::Scaling::IndexerBlock16
+                || ctx % 16 != 0
+                || d.i[1] != ctx
+                || tensor.bytes != packet::ctx_bound::indexer_prefix_bytes(ctx)
+                    .checked_mul(batch as u64)?
+            {
+                return None;
+            }
+            // Each append writes disjoint key/scale bytes, even in a partial block.
+            known[index] = true;
+            continue;
+        }
+        if d.t.iter().any(|&h| tensors.get(h as usize).is_some_and(|t| {
+            packet::ctx_bound::tensor_scaling(&t.name)
+                == packet::ctx_bound::Scaling::IndexerBlock16
+        })) {
+            return None;
+        }
         let dst = d.t[0] as usize;
         if !tensors.get(dst).is_some_and(|t| t.name.starts_with("kv.")) {
             continue;
@@ -205,6 +228,29 @@ pub(super) fn snapshot_regions<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_only_packed_indexer_needs_no_prefix_copy_but_unknown_writers_refuse() {
+        let mut tensors = [tensor("kv.6.kidx_fp8", 4 * 64 * 132)];
+        let mut d = DevInst64::default();
+        d.op = DevOp::IndexFp8Decode as u16;
+        d.t[4] = 0;
+        d.i[1] = 64;
+        assert!(snapshot_regions(&tensors, [d, d].iter(), 4, 64).unwrap().is_empty());
+        let mut prefill = d;
+        prefill.op = DevOp::IndexFp8Prefill as u16;
+        prefill.i[2] = 1;
+        assert!(snapshot_regions(&tensors, [d, prefill].iter(), 4, 64).unwrap().is_empty());
+        assert!(snapshot_regions(&tensors, [].iter(), 4, 64).is_none());
+        let mut unknown = d;
+        unknown.op = DevOp::RmsNorm as u16;
+        assert!(snapshot_regions(&tensors, [d, unknown].iter(), 4, 64).is_none());
+        d.i[1] = 32;
+        assert!(snapshot_regions(&tensors, [d].iter(), 4, 64).is_none());
+        d.i[1] = 64;
+        tensors[0].bytes -= 1;
+        assert!(snapshot_regions(&tensors, [d].iter(), 4, 64).is_none());
+    }
 
     #[test]
     fn delta_restore_copies_only_ring_rows_overwritten_after_snapshot() {

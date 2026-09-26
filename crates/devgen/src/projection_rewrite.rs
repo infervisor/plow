@@ -79,6 +79,7 @@ pub(crate) fn apply(
     ));
     let directory = output.parent().ok_or("missing output directory")?;
     let want = tunedb::Digests {
+        execution: None,
         implementation,
         interpreter: String::new(),
         toolchain,

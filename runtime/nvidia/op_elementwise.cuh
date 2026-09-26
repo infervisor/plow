@@ -59,7 +59,7 @@ static __device__ void d_embed_overlay(__nv_bfloat16* __restrict__ out, const __
     }
 }
 
-/* EmbedPosBf16 (op 184): out[r] = bf16(table[tokens[r]] + pos_table[pos[r] - base[r]]). */
+/* EmbedPosBf16 (op 194): out[r] = bf16(table[tokens[r]] + pos_table[pos[r] - base[r]]). */
 static __device__ void d_embed_pos(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ table,
                                    const unsigned* __restrict__ tokens, const __nv_bfloat16* __restrict__ pos_table,
                                    const unsigned* __restrict__ pos, const unsigned* __restrict__ base,

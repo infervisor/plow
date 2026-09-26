@@ -23,6 +23,7 @@ pub mod analysis;
 pub mod asr;
 pub mod tts;
 pub mod asset;
+mod certificate_checks;
 pub mod config;
 pub mod device;
 pub mod disasm;

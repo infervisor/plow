@@ -18,18 +18,25 @@ time to interpreter overhead or establish a critical path.
 
     python3 scripts/glm53_trace_attrib.py trace.bin --opcodes opcodes.csv --ghz 0.1
 """
-import argparse, collections, struct, sys
+import argparse, collections, re, struct, sys
 
 AP = argparse.ArgumentParser()
 AP.add_argument("trace")
-AP.add_argument("--opcodes", required=True, help="CSV of NAME,opcode from dev_isa.h")
+AP.add_argument("--opcodes", required=True, help="CSV of NAME,opcode or the dev_isa.h header")
 AP.add_argument("--ghz", type=float, default=0.1, help="trace clock in GHz (~100 MHz)")
 AP.add_argument("--top", type=int, default=16)
+AP.add_argument("--top-packets", type=int, default=0,
+                help="show the slowest individual packet envelopes")
 AP.add_argument("--drain-ms", type=float, default=None, help="measured GPU drain for this step")
 A = AP.parse_args()
 
 names = {}
 for line in open(A.opcodes):
+    if A.opcodes.endswith(".h"):
+        match = re.match(r"\s*(?:#define\s+)?PLOW_DOP_(\w+)(?:\s*=\s*|\s+)(\d+)\b", line)
+        if match:
+            names[int(match[2])] = match[1]
+        continue
     line = line.strip()
     if not line or "," not in line:
         continue
@@ -86,3 +93,12 @@ print(f"    wall span of the trace   : {wall/1e3:.3f} ms")
 if A.drain_ms:
     print(f"    measured GPU drain       : {A.drain_ms:.3f} ms"
           f"   (trace covers {100*wall/1e3/A.drain_ms:.0f}% of it)")
+
+if A.top_packets > 0:
+    print()
+    print(f"{'inst':>6} {'op':<24} {'wgs':>5} {'ready ms':>10} {'tail ms':>10} {'span ms':>10}")
+    ranked = sorted(packets.items(), key=lambda item: item[1][3] - item[1][1], reverse=True)
+    for inst, (op, ta, tr, te, wgs) in ranked[:A.top_packets]:
+        print(f"{inst:>6} {names.get(op, f'op{op}'):<24} {wgs:>5}"
+              f" {us(max(0, tr - ta))/1e3:>10.3f} {us(max(0, te - tr))/1e3:>10.3f}"
+              f" {us(te - ta)/1e3:>10.3f}")
