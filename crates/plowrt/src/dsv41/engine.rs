@@ -33,7 +33,7 @@ struct SlotHost {
 }
 
 pub struct Engine {
-    pub cfg: Cfg,
+    pub cfg: Arc<Cfg>,
     pub stages: Vec<Stage>,
     devs: Vec<Arc<CudaBackend>>,
     ck: Arc<Checkpoint>,
@@ -48,6 +48,17 @@ pub struct Engine {
     slots: Vec<SlotHost>,
     /// For each mirrored source layer: (producer stage, consumer stage).
     mirrors: Vec<(usize, usize, usize)>,
+    /// `PLOW_DSV41_PROFILE=1`: sync after every stage and report per-stage milliseconds (perturbs timing:
+    /// the stages stop overlapping host enqueue with device work).
+    prof: Option<std::cell::RefCell<Prof>>,
+}
+
+#[derive(Default)]
+struct Prof {
+    steps: [u64; 2],
+    host_ms: [f64; 2],
+    stage_ms: [Vec<f64>; 2],
+    head_ms: [f64; 2],
 }
 
 fn stage_of(bounds: &[usize], l: usize) -> usize {
@@ -149,7 +160,7 @@ impl Engine {
             ))
         };
         let mut eng = Engine {
-            cfg,
+            cfg: Arc::new(cfg),
             stages,
             devs,
             ck,
@@ -161,6 +172,7 @@ impl Engine {
             hash_proto,
             slots: Vec::new(),
             mirrors,
+            prof: std::env::var("PLOW_DSV41_PROFILE").ok().filter(|v| v != "0").map(|_| std::cell::RefCell::new(Prof::default())),
         };
         for _ in 0..opts.max_slots {
             let h = eng.new_hasher()?;
@@ -241,6 +253,10 @@ impl Engine {
         let mut prev: Option<(usize, u64, u64, Shared)> = None;
         let n_stages = self.stages.len();
         let mut result = Vec::new();
+        let kind = decode as usize;
+        let t_host = std::time::Instant::now();
+        let mut t_stage = std::time::Instant::now();
+        let mut stage_ms = vec![0f64; n_stages];
         for s in 0..n_stages {
             let stg = &self.stages[s];
             stg.arena.reset(0);
@@ -268,13 +284,13 @@ impl Engine {
                     stg.dev.memcpy_peer_async(pa, &src.dev, pp, p_bytes, &stg.stream)?;
                     if psh.kout > 0 {
                         let b = (t * psh.kout * 4) as u64;
-                        sh.topk = stg.alloc_persistent(b)?;
+                        sh.topk = stg.topk_buf;
                         sh.kout = psh.kout;
                         stg.dev.memcpy_peer_async(sh.topk, &src.dev, psh.topk, b, &stg.stream)?;
                     }
                     if psh.nblk > 0 {
                         let b = (t * psh.nblk) as u64;
-                        sh.keep = stg.alloc_persistent(b)?;
+                        sh.keep = stg.keep_buf;
                         sh.nblk = psh.nblk;
                         stg.dev.memcpy_peer_async(sh.keep, &src.dev, psh.keep, b, &stg.stream)?;
                     }
@@ -322,10 +338,48 @@ impl Engine {
                 std::mem::swap(&mut x, &mut xo);
                 std::mem::swap(&mut pm, &mut po);
             }
+            if self.prof.is_some() {
+                stg.stream_sync()?;
+                stage_ms[s] = t_stage.elapsed().as_secs_f64() * 1e3;
+                t_stage = std::time::Instant::now();
+            }
             if s + 1 < n_stages {
                 prev = Some((s, x, pm, sh));
             } else {
                 result = self.head_sample(stg, x, pm, &st)?;
+            }
+        }
+        if let Some(p) = &self.prof {
+            let mut p = p.borrow_mut();
+            let head = t_stage.elapsed().as_secs_f64() * 1e3;
+            p.steps[kind] += 1;
+            p.host_ms[kind] += t_host.elapsed().as_secs_f64() * 1e3;
+            p.head_ms[kind] += head;
+            if p.stage_ms[kind].is_empty() {
+                p.stage_ms[kind] = vec![0.0; n_stages];
+            }
+            for (a, b) in p.stage_ms[kind].iter_mut().zip(&stage_ms) {
+                *a += b;
+            }
+            let every = if decode { 64 } else { 1 };
+            if p.steps[kind] % every == 0 {
+                let n = p.steps[kind] as f64;
+                let per: Vec<String> = p.stage_ms[kind].iter().map(|v| format!("{:.2}", v / n)).collect();
+                tracing::info!(
+                    target: "dsv41",
+                    "{} t={t} nb={}: step {:.2} ms (stages [{}] head {:.2}) avg over {n}",
+                    if decode { "decode" } else { "prefill" },
+                    st.nb(),
+                    p.host_ms[kind] / n,
+                    per.join(", "),
+                    p.head_ms[kind] / n,
+                );
+                if decode {
+                    p.steps[1] = 0;
+                    p.host_ms[1] = 0.0;
+                    p.head_ms[1] = 0.0;
+                    p.stage_ms[1].iter_mut().for_each(|v| *v = 0.0);
+                }
             }
         }
         Ok(result)
@@ -349,7 +403,7 @@ impl Engine {
         let hn = stg.alloc_persistent((nb * h * 2) as u64)?;
         stg.k.launch("dsv_rmsnorm", [nb as u32, 1, 1], 256, 0, &[A::P(hn), A::P(hp), A::P(self.norm), A::I(h as i32), A::L(h as i64), A::L(h as i64), A::F(c.eps)], &stg.stream)?;
         let logits = stg.alloc_persistent((nb * v * 4) as u64)?;
-        stg.k.launch("dsv_gemm_f32", [cdiv(v as u64, 64), cdiv(nb as u64, 64), 1], 256, 0, &[A::P(logits), A::P(hn), A::P(self.head), A::I(nb as i32), A::I(v as i32), A::I(h as i32), A::L(h as i64), A::L(v as i64), A::I(1), A::I(1)], &stg.stream)?;
+        stg.k.gemm_f32(logits, hn, self.head, nb, v, h, h, true, true, &stg.stream)?;
         let tok = stg.alloc_persistent((nb * 4) as u64)?;
         stg.k.launch("dsv_argmax", [nb as u32, 1, 1], 1024, 0, &[A::P(tok), A::P(logits), A::I(v as i32)], &stg.stream)?;
         stg.stream_sync()?;

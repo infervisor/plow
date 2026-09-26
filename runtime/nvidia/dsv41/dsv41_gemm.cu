@@ -326,6 +326,35 @@ __device__ __forceinline__ void gemm_f32_body(float* __restrict__ C, const void*
         }
     }
 }
+// fp32 dot form for small output grids (M*N small, K large -- the mHC mixes are 24 x 20480):
+// one block per output element, the whole block reducing over K. grid = (N, M).
+DSV_EXTERN void __launch_bounds__(256) dsv_gemm_f32_dot(float* __restrict__ C, const void* __restrict__ A,
+                                                        const void* __restrict__ W, int M, int N, int K, long long lda,
+                                                        long long ldc, int a_bf16, int w_bf16) {
+    __shared__ float red[32];
+    const int n = blockIdx.x, m = blockIdx.y;
+    float acc = 0.f;
+    if (a_bf16 && w_bf16) {
+        const bf16* a = (const bf16*)A + (long long)m * lda;
+        const bf16* w = (const bf16*)W + (long long)n * K;
+        for (int k = threadIdx.x; k < K; k += blockDim.x) acc = fmaf(bf2f(a[k]), bf2f(w[k]), acc);
+    } else if (a_bf16) {
+        const bf16* a = (const bf16*)A + (long long)m * lda;
+        const float* w = (const float*)W + (long long)n * K;
+        for (int k = threadIdx.x; k < K; k += blockDim.x) acc = fmaf(bf2f(a[k]), w[k], acc);
+    } else if (w_bf16) {
+        const float* a = (const float*)A + (long long)m * lda;
+        const bf16* w = (const bf16*)W + (long long)n * K;
+        for (int k = threadIdx.x; k < K; k += blockDim.x) acc = fmaf(a[k], bf2f(w[k]), acc);
+    } else {
+        const float* a = (const float*)A + (long long)m * lda;
+        const float* w = (const float*)W + (long long)n * K;
+        for (int k = threadIdx.x; k < K; k += blockDim.x) acc = fmaf(a[k], w[k], acc);
+    }
+    acc = block_sum(acc, red);
+    if (threadIdx.x == 0) C[(long long)m * ldc + n] = acc;
+}
+
 DSV_EXTERN void __launch_bounds__(256) dsv_gemm_f32(float* C, const void* A, const void* W, int M, int N, int K,
                                                     long long lda, long long ldc, int a_bf16, int w_bf16) {
     if (a_bf16) {

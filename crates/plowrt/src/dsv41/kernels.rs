@@ -31,6 +31,7 @@ const NAMES: &[&str] = &[
     "dsv_gemm_w8a8",
     "dsv_gemm_bf16w",
     "dsv_gemm_f32",
+    "dsv_gemm_f32_dot",
     "dsv_rope",
     "dsv_sparse_attn",
     "dsv_attn_index",
@@ -103,6 +104,21 @@ impl Kernels {
             .collect();
         let mut ptrs: Vec<*mut c_void> = vals.iter_mut().map(|v| v.as_mut_ptr() as *mut c_void).collect();
         self.dev.launch_kernel_grid(f, grid, block, smem, &mut ptrs, Some(s))
+    }
+}
+
+impl Kernels {
+    /// C[m][n] (f32) = A[m][k] . W[n][k]^T, A/W bf16 or f32. Small output grids (the mHC mixes are
+    /// 24 x 20480; the router and head at small batch) take the one-block-per-output dot form: the
+    /// 64x64-tiled kernel would put a single block on the whole K loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f32(&self, c: u64, a: u64, w: u64, m: usize, n: usize, k: usize, lda: usize, a_bf16: bool, w_bf16: bool, s: &CudaStream) -> Result<()> {
+        let args = [A::P(c), A::P(a), A::P(w), A::I(m as i32), A::I(n as i32), A::I(k as i32), A::L(lda as i64), A::L(n as i64), A::I(a_bf16 as i32), A::I(w_bf16 as i32)];
+        if m * n <= 1 << 20 {
+            self.launch("dsv_gemm_f32_dot", [n as u32, m as u32, 1], 256, 0, &args, s)
+        } else {
+            self.launch("dsv_gemm_f32", [cdiv(n as u64, 64), cdiv(m as u64, 64), 1], 256, 0, &args, s)
+        }
     }
 }
 

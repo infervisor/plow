@@ -49,7 +49,7 @@ fi
 
 run() { # name in out conc
   local name=$1 inl=$2 outl=$3 c=$4
-  local n=$(( c * 4 )); [ $n -lt 16 ] && n=16
+  local n=${NPROMPT:-$(( c * 4 ))}; [ -z "${NPROMPT:-}" ] && [ $n -lt 16 ] && n=16
   $VENV/vllm bench serve --model $MODEL --port $PORT --backend openai --endpoint /v1/completions \
     --dataset-name random --random-input-len $inl --random-output-len $outl \
     --ignore-eos --num-prompts $n --max-concurrency $c --num-warmups 2 --seed 1 \
@@ -59,6 +59,11 @@ run() { # name in out conc
   echo "[$name c=$c] rc=$?"
   grep -E "Output token throughput|Total token throughput|Median TTFT|Median TPOT|Failed requests" "$OUT/${name}_c${c}.log"
 }
+if [ "$MODE" = quick ]; then  # a short profile pass: few prompts, 64 output tokens
+  NPROMPT=4 run quick_1k_64 1024 64 1
+  NPROMPT=16 run quick_1k_64 1024 64 16
+  exit 0
+fi
 for c in ${CONCS:-1 4 16 64}; do run chat_1k_256 1024 256 $c; done
 for c in ${CONCS_MID:-1 4 16}; do run mid_4k_512 4096 512 $c; done
 for c in ${CONCS_LONG:-1 4}; do run prefill_16k_128 16384 128 $c; done

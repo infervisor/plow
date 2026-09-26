@@ -112,6 +112,12 @@ pub struct Stage {
     rope_w: (u64, u64),
     rope_c: (u64, u64),
     _rope_mem: DeviceMem,
+    /// The latest index picks [max_len][index_topk] i32 and candidate keep mask
+    /// [max_len][max_len / cand_block] u8: written by index / candidate sources, read by the layers
+    /// after them. Outside the arena so the per-layer scratch reset never reclaims them.
+    pub topk_buf: u64,
+    pub keep_buf: u64,
+    _shared_mem: Vec<DeviceMem>,
 }
 
 const WIN_DT: u64 = 2;
@@ -174,11 +180,17 @@ impl Stage {
             dev.memcpy_htod(at(i as u64), bytemuck_f32(t))?;
         }
         let arena = Arena::new(&dev, arena_bytes)?;
+        let topk_mem = dev.alloc(dev.device_ordinal, (max_len * cfg.index_topk * 4) as u64)?;
+        let keep_mem = dev.alloc(dev.device_ordinal, (max_len * max_len.div_ceil(cfg.cand_block)) as u64)?;
+        let (topk_buf, keep_buf) = (topk_mem.base, keep_mem.base);
         Ok(Stage {
             idx,
             rope_w: (at(0), at(1)),
             rope_c: (at(2), at(3)),
             _rope_mem: rope_mem,
+            topk_buf,
+            keep_buf,
+            _shared_mem: vec![topk_mem, keep_mem],
             dev,
             k,
             stream,
@@ -246,14 +258,9 @@ impl Stage {
             &[A::P(c), A::P(a), A::P(w), A::P(ws), A::I(m as i32), A::I(n as i32), A::I(kd as i32), A::L(kd as i64), A::L(n as i64), A::I((ws != 0) as i32), A::I(0), A::L(0), A::L(0), A::L(0), A::L(0)],
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn f32gemm(&self, c: u64, a: u64, w: u64, m: usize, n: usize, kd: usize, a_bf16: bool, w_bf16: bool) -> Result<()> {
-        self.launch(
-            "dsv_gemm_f32",
-            [cdiv(n as u64, 64), cdiv(m as u64, 64), 1],
-            256,
-            0,
-            &[A::P(c), A::P(a), A::P(w), A::I(m as i32), A::I(n as i32), A::I(kd as i32), A::L(kd as i64), A::L(n as i64), A::I(a_bf16 as i32), A::I(w_bf16 as i32)],
-        )
+        self.k.gemm_f32(c, a, w, m, n, kd, kd, a_bf16, w_bf16, &self.stream)
     }
     #[allow(clippy::too_many_arguments)]
     fn rope(&self, x: u64, n_tok: usize, n_head: usize, tok_stride: usize, head_stride: usize, width: usize, pos: u64, compressed: bool, inverse: bool, pos_mul: i32) -> Result<()> {
@@ -409,7 +416,10 @@ impl Stage {
             // latent rows this call produces (prefill: G groups; decode: one candidate row per slot)
             let mut latent = 0u64;
             let g = if st.decode { st.nb() } else { t / r };
-            if ly.kv_source && g > 0 {
+            // A prefill shorter than one group produces no latent but still owes the compressor its
+            // partial group (state rows 0..t%r), which the first decode steps pool.
+            let tail = !st.decode && r > 1 && t % r != 0;
+            if ly.kv_source && (g > 0 || tail) {
                 let pooled = self.arena.alloc((g.max(1) * hd * 2) as u64)?;
                 if r > 1 {
                     let kvf = self.arena.alloc((t * hd * 4) as u64)?;
@@ -445,8 +455,10 @@ impl Stage {
                     self.bf16w(raw, hn, ly.c_wkv, 0, t, hd, h)?;
                     self.dev.memcpy_dtod_async(pooled, raw, (t * hd * 2) as u64, &self.stream)?;
                 }
-                latent = self.arena.alloc((g * hd * 2) as u64)?;
-                self.rmsnorm(latent, pooled, ly.c_norm, g, hd)?;
+                if g > 0 {
+                    latent = self.arena.alloc((g * hd * 2) as u64)?;
+                    self.rmsnorm(latent, pooled, ly.c_norm, g, hd)?;
+                }
             }
             // clen: compressed positions each row may see
             let clen = m.clen[&r];
@@ -497,7 +509,7 @@ impl Stage {
                         let kb = c.cand_topk_blocks.min(nb_ld);
                         let bidx = self.arena.alloc((t * kb * 4) as u64)?;
                         self.launch("dsv_topk_select", [t as u32, 1, 1], 1024, 0, &[A::P(bidx), A::I(kb as i32), A::P(bs), A::L(nb_ld as i64), A::P(nbl), A::I(kb as i32), A::I(0), A::P(0), A::L(0), A::I(1)])?;
-                        let kp = self.arena.alloc((t * nb_ld) as u64)?;
+                        let kp = self.keep_buf;
                         self.launch("dsv_keep_from_idx", [t as u32, 1, 1], 256, 0, &[A::P(kp), A::L(nb_ld as i64), A::I(nb_ld as i32), A::P(bidx), A::I(kb as i32)])?;
                         sh.keep = kp;
                         sh.nblk = nb_ld;
@@ -506,7 +518,7 @@ impl Stage {
                         keep = (sh.keep, sh.nblk);
                     }
                     let kout = c.index_topk.min(s_max);
-                    let idx = self.arena.alloc((t * kout * 4) as u64)?;
+                    let idx = self.topk_buf;
                     self.launch(
                         "dsv_topk_select",
                         [t as u32, 1, 1],
@@ -688,44 +700,8 @@ impl Stage {
         self.moe(ly, hn2, y, t)?;
         self.hc_post(x_out, y, x2, f_post, f_comb, t)?;
         self.dev.memcpy_dtod_async(pre_out, f_pre, (t * c.hc_mult * 4) as u64, &self.stream)?;
-        // the index picks and candidate mask outlive this layer: keep them past the reset
-        if sh.kout > 0 || sh.nblk > 0 {
-            self.stream_sync()?;
-            let (topk, keep) = self.persist_shared(sh, t, mark)?;
-            sh.topk = topk;
-            sh.keep = keep;
-        } else {
-            self.arena.reset(mark);
-        }
-        Ok(())
-    }
-
-    /// Move the shared picks/mask to the bottom of the scratch region so the per-layer reset keeps
-    /// them. Returns their new addresses.
-    fn persist_shared(&self, sh: &Shared, t: usize, mark: u64) -> Result<(u64, u64)> {
-        let tb = (t * sh.kout * 4) as u64;
-        let kb = (t * sh.nblk) as u64;
-        // copy out to temporaries above everything, then back down to `mark`
-        let tmp_t = if tb > 0 { self.arena.alloc(tb)? } else { 0 };
-        let tmp_k = if kb > 0 { self.arena.alloc(kb)? } else { 0 };
-        if tb > 0 {
-            self.dev.memcpy_dtod_async(tmp_t, sh.topk, tb, &self.stream)?;
-        }
-        if kb > 0 {
-            self.dev.memcpy_dtod_async(tmp_k, sh.keep, kb, &self.stream)?;
-        }
-        self.stream_sync()?;
         self.arena.reset(mark);
-        let nt = if tb > 0 { self.arena.alloc(tb)? } else { 0 };
-        let nk = if kb > 0 { self.arena.alloc(kb)? } else { 0 };
-        if tb > 0 {
-            self.dev.memcpy_dtod_async(nt, tmp_t, tb, &self.stream)?;
-        }
-        if kb > 0 {
-            self.dev.memcpy_dtod_async(nk, tmp_k, kb, &self.stream)?;
-        }
-        self.stream_sync()?;
-        Ok((nt, nk))
+        Ok(())
     }
 
     pub fn stream_sync(&self) -> Result<()> {

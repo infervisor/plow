@@ -49,6 +49,8 @@ struct AppState {
     jobs: mpsc::UnboundedSender<Job>,
     tok: Arc<dyn Tokenize>,
     model: String,
+    vocab: usize,
+    max_len: usize,
 }
 
 struct Active {
@@ -166,6 +168,18 @@ async fn completions(State(st): State<Arc<AppState>>, Json(req): Json<Value>) ->
         _ => return (StatusCode::BAD_REQUEST, "prompt must be a string or a list of token ids").into_response(),
     };
     let max_tokens = req["max_tokens"].as_u64().unwrap_or(16).max(1) as usize;
+    // Validate here, not in the engine: an id past the vocab is an out-of-bounds embedding read on
+    // the device, which poisons the CUDA context for every later request.
+    if prompt.is_empty() {
+        return (StatusCode::BAD_REQUEST, "prompt is empty").into_response();
+    }
+    if let Some(bad) = prompt.iter().find(|&&t| t as usize >= st.vocab) {
+        return (StatusCode::BAD_REQUEST, format!("token id {bad} is outside the vocabulary ({})", st.vocab)).into_response();
+    }
+    if prompt.len().checked_add(max_tokens).is_none_or(|n| n > st.max_len) {
+        return (StatusCode::BAD_REQUEST, format!("prompt ({}) + max_tokens ({max_tokens}) exceeds the maximum length {}", prompt.len(), st.max_len))
+            .into_response();
+    }
     let ignore_eos = req["ignore_eos"].as_bool().unwrap_or(false);
     let streaming = req["stream"].as_bool().unwrap_or(false);
     let usage = req["stream_options"]["include_usage"].as_bool().unwrap_or(false);
@@ -271,10 +285,11 @@ pub async fn run(opts: ServeOpts) -> Result<(), Box<dyn std::error::Error>> {
     let max_len = opts.engine.max_len;
     let t0 = Instant::now();
     let eng = Engine::load(&opts.ckpt, &cubin, opts.engine)?;
+    let vocab = eng.cfg.vocab;
     eprintln!("dsv41: engine loaded in {:.0}s", t0.elapsed().as_secs_f32());
     let (jtx, jrx) = mpsc::unbounded_channel();
     std::thread::Builder::new().name("dsv41-sched".into()).spawn(move || scheduler(eng, jrx, max_len))?;
-    let state = Arc::new(AppState { jobs: jtx, tok, model: opts.model_name });
+    let state = Arc::new(AppState { jobs: jtx, tok, model: opts.model_name, vocab, max_len });
     let app = Router::new()
         .route("/v1/completions", post(completions))
         .route("/v1/models", get(models))
