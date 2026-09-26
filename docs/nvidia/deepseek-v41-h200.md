@@ -47,21 +47,49 @@ so the floor is what an ideal kernel would reach, not the current kernel's.
 vLLM baseline: `/root/dsv41/results/tp4-base4` (Marlin weight-only FP8 dense, Marlin W4A16 MoE,
 FlashMLA sparse, DeepGEMM indexer).
 
-| Workload | c | plowrt tok/s | plowrt TTFT ms | plowrt TPOT ms | vLLM tok/s | vLLM TTFT ms | vLLM TPOT ms |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| 1k in / 256 out | 1 | 14.4 | 806 | 66.4 | 131.8 | 124 | 7.15 |
-| 1k in / 256 out | 4 | 36.1 | 1672 | 104.5 | 447.7 | 145 | 8.38 |
-| 1k in / 256 out | 16 | 74.8 | 1751 | 206.4 | 792.9 | 567 | 13.36 |
-| 1k in / 256 out | 64 | 125.4 | 1893 | 494.4 | 1765.5 | 1325 | 33.52 |
-| 4k in / 512 out | 1 | 14.4 | 1808 | 66.3 | 131.6 | 248 | 7.15 |
-| 4k in / 512 out | 4 | 35.5 | 3672 | 106.1 | 458.8 | 163 | 8.46 |
-| 4k in / 512 out | 16 | 74.6 | 3744 | 204.0 | 936.0 | 1358 | 14.70 |
-| 16k in / 128 out | 1 | 8.8 | 6067 | 66.4 | 75.4 | 844 | 7.07 |
-| 16k in / 128 out | 4 | 14.1 | 12132 | 189.4 | 424.3 | 107 | 8.42 |
+Output tokens/s, median TTFT and TPOT. plowrt sweep2 = the first end-to-end run (kernels as of
+eedddffd), sweep3 = after the kernel work in section 5 up to 62dd2e0f (before decode pipelining);
+every request succeeded in both.
 
-(plowrt sweep `/root/dsv41/results/plowrt-sweep2`, kernels as of eedddffd; every request succeeded. vLLM runs
-with chunked prefill and CUDA graphs; plowrt admits one unchunked prefill per scheduler loop, so
-TTFT under concurrency includes queueing behind other prefills.)
+| Workload | c | sweep2 tok/s | sweep3 tok/s | sweep3 TTFT ms | sweep3 TPOT ms | vLLM tok/s | vLLM TTFT ms | vLLM TPOT ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1k in / 256 out | 1 | 14.4 | 47.2 | 343 | 19.9 | 131.8 | 124 | 7.15 |
+| 1k in / 256 out | 4 | 36.1 | 113.0 | 691 | 32.8 | 447.7 | 145 | 8.38 |
+| 1k in / 256 out | 16 | 74.8 | 241.6 | 714 | 63.0 | 792.9 | 567 | 13.36 |
+| 1k in / 256 out | 64 | 125.4 | 368.6 | 754 | 168.0 | 1765.5 | 1325 | 33.52 |
+| 4k in / 512 out | 1 | 14.4 | 46.6 | 824 | 19.9 | 131.6 | 248 | 7.15 |
+| 4k in / 512 out | 4 | 35.5 | 108.9 | 1647 | 33.5 | 458.8 | 163 | 8.46 |
+| 4k in / 512 out | 16 | 74.6 | 228.8 | 1663 | 66.6 | 936.0 | 1358 | 14.70 |
+| 16k in / 128 out | 1 | 8.8 | 24.8 | 2621 | 20.1 | 75.4 | 844 | 7.07 |
+| 16k in / 128 out | 4 | 14.1 | 36.2 | 6495 | 60.1 | 424.3 | 107 | 8.42 |
+
+(`/root/dsv41/results/plowrt-sweep2`, `plowrt-sweep3`. vLLM runs with chunked prefill and CUDA
+graphs; plowrt admits one unchunked prefill at a time, so TTFT under concurrency includes queueing
+behind other prefills.)
+
+The remaining gap is structural as much as per-kernel. vLLM's TP4 splits every layer over the four
+GPUs, so one token uses all four HBMs at once; plowrt's PP sends it through four stages in turn
+(single-token floor 2.75 ms, spent today in ~1400 small kernels), and with one decode batch in
+flight three GPUs wait. Decode lanes (below) keep several groups in flight; the next levers are the
+host launch rate (the lanes now make it the limit), fused per-layer blocks, and TP / EP with
+in-kernel collectives.
+
+### Decode lanes
+
+The scheduler splits the running sequences into groups (one per decode lane, `--decode-lanes`,
+default 4) and keeps each group's step in flight while the others run on other stages; a prefill runs
+on lane 0 alongside. Each lane has its own arena, index buffers and Engram staging, so a step's
+hand-off buffers survive until the next stage has read them. Greedy outputs are byte-identical run
+one at a time or concurrently across lanes (`run_plowrt.sh concur`).
+
+| rung (ctx 1k) | one batch in flight | 4 groups in flight |
+|---|---|---|
+| 4 sequences | B=4: 135 tok/s, 29.7 ms/step | 4x1: 145 tok/s, 27.7 ms TPOT |
+| 16 sequences | B=16: 379 tok/s, 42.2 ms/step | 4x4: 405 tok/s, 39.6 ms TPOT |
+| 64 sequences | B=64: 808 tok/s, 79.2 ms/step | 4x16: 1166 tok/s, 54.9 ms TPOT |
+
+Less than the GPUs allow: one step's ~1400 launches cost ~5 ms (B=1) to ~10 ms (B=16) of host
+time, and with four groups in flight the single issuing thread is as busy as the GPUs.
 
 ## 5. Kernel log
 

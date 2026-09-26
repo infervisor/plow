@@ -80,6 +80,23 @@ if [ "$MODE" = long ]; then  # greedy completions over prefill-sized prompts (th
   exit 0
 fi
 
+if [ "$MODE" = concur ]; then  # greedy prompts one at a time, then all at once: the texts must match
+  prompts=("The capital of France is" "def fibonacci(n):" "Q: What is 17 * 23? A:" "The three laws of thermodynamics are"
+           "Write a haiku about the sea:" "In 1969, the Apollo 11 mission" "The difference between TCP and UDP is"
+           "A recipe for pancakes:" "SELECT name FROM users WHERE" "The mitochondria is")
+  for i in "${!prompts[@]}"; do complete "${prompts[$i]}" 48 > "$OUT/seq_$i.json"; done
+  pids=()
+  for i in "${!prompts[@]}"; do complete "${prompts[$i]}" 48 > "$OUT/par_$i.json" & pids+=($!); done
+  wait "${pids[@]}"  # the clients only: a bare wait would also wait on the server
+  bad=0
+  for i in "${!prompts[@]}"; do
+    a=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["text"])' "$OUT/seq_$i.json")
+    b=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["text"])' "$OUT/par_$i.json")
+    if [ "$a" = "$b" ]; then echo "[same] ${prompts[$i]}"; else echo "[DIFF] ${prompts[$i]}"; echo "  seq: $a"; echo "  par: $b"; bad=1; fi
+  done | tee "$OUT/concur.txt"
+  exit 0
+fi
+
 if [ "$MODE" = quick ]; then  # a short profile pass: few prompts, 64 output tokens
   NPROMPT=4 run quick_1k_64 1024 64 1
   NPROMPT=16 run quick_1k_64 1024 64 16

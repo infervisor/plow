@@ -386,6 +386,12 @@ enum Cmd {
         /// Per-GPU scratch arena, GiB.
         #[arg(long, id = "dsv41_arena_gib", default_value_t = 24)]
         arena_gib: u64,
+        /// Decode groups kept in flight across the pipeline stages (0: one step at a time).
+        #[arg(long, id = "dsv41_decode_lanes", default_value_t = 4)]
+        decode_lanes: usize,
+        /// Per-GPU arena of each decode lane, MiB.
+        #[arg(long, id = "dsv41_decode_arena_mib", default_value_t = 1024)]
+        decode_arena_mib: u64,
         #[arg(long, id = "dsv41_served_model_name", default_value = "deepseek-ai/DeepSeek-V4.1-Flash")]
         served_model_name: String,
         /// Requests admitted but unfinished (queued + running); beyond it the server answers 429.
@@ -1121,7 +1127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBlock { .. } => Err("plowrt was built without --features hsa".into()),
         #[cfg(feature = "cuda")]
-        Cmd::Dsv41Serve { ckpt, cubin, port, max_len, max_slots, bounds, arena_gib, served_model_name, max_queued, rung_bench, rung_reps, rung_out } => {
+        Cmd::Dsv41Serve { ckpt, cubin, port, max_len, max_slots, bounds, arena_gib, decode_lanes, decode_arena_mib, served_model_name, max_queued, rung_bench, rung_reps, rung_out } => {
             let bounds: Vec<usize> = bounds
                 .split(',')
                 .map(|v| v.trim().parse::<usize>())
@@ -1134,7 +1140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 model_name: served_model_name,
                 max_queued,
                 rung_bench: rung_bench.map(|s| (s, rung_reps, rung_out)),
-                engine: plowrt::dsv41::engine::EngineOpts { max_len, max_slots, bounds, arena_bytes: arena_gib << 30 },
+                engine: plowrt::dsv41::engine::EngineOpts { max_len, max_slots, bounds, arena_bytes: arena_gib << 30, decode_lanes, decode_arena_bytes: decode_arena_mib << 20 },
             })
             .await
         }

@@ -43,6 +43,35 @@ impl Arena {
     }
 }
 
+/// A stage's arenas. Lane 0 serves prefill and synchronous steps; lanes 1.. serve decode steps the
+/// scheduler keeps in flight together: a step's persistent outputs (the hc stream handed to the next
+/// stage, index picks, the sampled tokens) must survive until their consumer has read them, so steps
+/// in flight cannot share one bump region. `select` picks the lane later allocations come from; a
+/// lane is reset only by the next step issued on it, after the previous one was collected.
+pub struct Lanes {
+    lanes: Vec<Arena>,
+    cur: Cell<usize>,
+}
+
+impl Lanes {
+    pub fn select(&self, lane: usize) {
+        assert!(lane < self.lanes.len(), "dsv41: lane {lane} of {}", self.lanes.len());
+        self.cur.set(lane);
+    }
+    pub fn lane(&self) -> usize {
+        self.cur.get()
+    }
+    pub fn alloc(&self, bytes: u64) -> Result<u64> {
+        self.lanes[self.cur.get()].alloc(bytes)
+    }
+    pub fn mark(&self) -> u64 {
+        self.lanes[self.cur.get()].mark()
+    }
+    pub fn reset(&self, m: u64) {
+        self.lanes[self.cur.get()].reset(m)
+    }
+}
+
 /// Per-slot cache regions of one stage: `base + slot * stride`.
 #[derive(Clone, Copy, Default)]
 pub struct Region {
@@ -106,17 +135,17 @@ pub struct Stage {
     pub cfg: Cfg,
     pub layers: Vec<Layer>,
     pub caches: Caches,
-    pub arena: Arena,
+    pub arena: Lanes,
     pub max_len: usize,
     pub max_slots: usize,
     rope_w: (u64, u64),
     rope_c: (u64, u64),
     _rope_mem: DeviceMem,
-    /// The latest index picks [max_len][index_topk] i32 and candidate keep mask
-    /// [max_len][max_len / cand_block] u8: written by index / candidate sources, read by the layers
-    /// after them. Outside the arena so the per-layer scratch reset never reclaims them.
-    pub topk_buf: u64,
-    pub keep_buf: u64,
+    /// Per lane: the latest index picks [rows][index_topk] i32 and candidate keep mask
+    /// [rows][max_len / cand_block] u8 (rows = max_len on lane 0, max_slots on decode lanes): written
+    /// by index / candidate sources, read by the layers after them. Outside the arenas so the
+    /// per-layer scratch reset never reclaims them.
+    bufs: Vec<(u64, u64)>,
     _shared_mem: Vec<DeviceMem>,
     /// Prefill GEMMs may take the wgmma kernels (dsv41_wg.cu); `PLOW_DSV41_NO_WG` pins them to the
     /// mma.sync kernels (a kill switch, and the A/B for end-to-end checks).
@@ -137,6 +166,8 @@ impl Stage {
         max_len: usize,
         max_slots: usize,
         arena_bytes: u64,
+        decode_lanes: usize,
+        decode_arena_bytes: u64,
         profile_kernels: bool,
     ) -> Result<Stage> {
         if cfg.hc_mult != 4 {
@@ -186,19 +217,29 @@ impl Stage {
         for (i, t) in [&cw, &sw, &cc, &sc].iter().enumerate() {
             dev.memcpy_htod(at(i as u64), bytemuck_f32(t))?;
         }
-        let arena = Arena::new(&dev, arena_bytes)?;
-        let topk_mem = dev.alloc(dev.device_ordinal, (max_len * cfg.index_topk * 4) as u64)?;
-        let keep_mem = dev.alloc(dev.device_ordinal, (max_len * max_len.div_ceil(cfg.cand_block)) as u64)?;
-        let (topk_buf, keep_buf) = (topk_mem.base, keep_mem.base);
+        let mut lanes = vec![Arena::new(&dev, arena_bytes)?];
+        let mut bufs = Vec::new();
+        let mut buf_mem = Vec::new();
+        for lane in 0..=decode_lanes {
+            if lane > 0 {
+                lanes.push(Arena::new(&dev, decode_arena_bytes)?);
+            }
+            let rows = if lane == 0 { max_len } else { max_slots };
+            let topk_mem = dev.alloc(dev.device_ordinal, (rows * cfg.index_topk * 4) as u64)?;
+            let keep_mem = dev.alloc(dev.device_ordinal, (rows * max_len.div_ceil(cfg.cand_block)) as u64)?;
+            bufs.push((topk_mem.base, keep_mem.base));
+            buf_mem.push(topk_mem);
+            buf_mem.push(keep_mem);
+        }
+        let arena = Lanes { lanes, cur: Cell::new(0) };
         Ok(Stage {
             idx,
             wg: std::env::var_os("PLOW_DSV41_NO_WG").is_none(),
             rope_w: (at(0), at(1)),
             rope_c: (at(2), at(3)),
             _rope_mem: rope_mem,
-            topk_buf,
-            keep_buf,
-            _shared_mem: vec![topk_mem, keep_mem],
+            bufs,
+            _shared_mem: buf_mem,
             dev,
             k,
             stream,
@@ -604,7 +645,7 @@ impl Stage {
                         let kb = c.cand_topk_blocks.min(nb_ld);
                         let bidx = self.arena.alloc((t * kb * 4) as u64)?;
                         self.launch("dsv_topk_select", [t as u32, 1, 1], 1024, 0, &[A::P(bidx), A::I(kb as i32), A::P(bs), A::L(nb_ld as i64), A::P(nbl), A::I(kb as i32), A::I(0), A::P(0), A::L(0), A::I(1)])?;
-                        let kp = self.keep_buf;
+                        let kp = self.keep_buf();
                         self.launch("dsv_keep_from_idx", [t as u32, 1, 1], 256, 0, &[A::P(kp), A::L(nb_ld as i64), A::I(nb_ld as i32), A::P(bidx), A::I(kb as i32)])?;
                         sh.keep = kp;
                         sh.nblk = nb_ld;
@@ -613,7 +654,7 @@ impl Stage {
                         keep = (sh.keep, sh.nblk);
                     }
                     let kout = c.index_topk.min(s_max);
-                    let idx = self.topk_buf;
+                    let idx = self.topk_buf();
                     self.k.cost(Cost::mem((t * s_ld * 2 * 3) as f64 + (t * kout * 4) as f64));
                     self.launch(
                         "dsv_topk_select",
@@ -870,6 +911,14 @@ impl Stage {
 
     pub fn alloc_persistent(&self, bytes: u64) -> Result<u64> {
         self.arena.alloc(bytes)
+    }
+
+    /// The selected lane's index-pick and keep-mask buffers.
+    pub fn topk_buf(&self) -> u64 {
+        self.bufs[self.arena.lane()].0
+    }
+    pub fn keep_buf(&self) -> u64 {
+        self.bufs[self.arena.lane()].1
     }
 }
 

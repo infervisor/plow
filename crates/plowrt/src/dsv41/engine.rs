@@ -7,6 +7,10 @@
 //! consumers sit on a later stage writes the rows it produced into that stage's mirror directly
 //! (a copy kernel on the producer's stream through the peer mapping). The one host sync per step
 //! is the sampled tokens' readback.
+//!
+//! Steps can be kept in flight together ([`Engine::issue`] / [`Engine::collect`]): each runs on its
+//! own lane (arena, index buffers, Engram staging), so while stage 2 works on one decode group
+//! stage 1 can already run the next -- with one batch in flight three of the four GPUs idle.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -34,6 +38,17 @@ pub struct EngineOpts {
     /// Layer boundaries: stage s holds layers bounds[s]..bounds[s+1].
     pub bounds: Vec<usize>,
     pub arena_bytes: u64,
+    /// Decode lanes (steps that can be in flight besides lane 0) and each one's arena.
+    pub decode_lanes: usize,
+    pub decode_arena_bytes: u64,
+}
+
+/// A step in flight: collect it with [`Engine::collect`] before issuing on its lane again.
+#[must_use]
+pub struct Ticket {
+    pub lane: usize,
+    nb: usize,
+    tok: u64,
 }
 
 /// Per-sequence sampling: temperature 0 is greedy; otherwise Gumbel-max over logits / temperature
@@ -63,7 +78,8 @@ struct EngramTab {
     stage: usize,
     weight: String,
     scale: String,
-    staging: std::cell::RefCell<PinnedHost>,
+    /// Per lane (lane 0 sized for max_len rows, decode lanes for max_slots).
+    staging: Vec<std::cell::RefCell<PinnedHost>>,
 }
 
 struct Mirror {
@@ -88,8 +104,13 @@ pub struct Engine {
     hash_proto: Option<(Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<u32>, usize, usize, usize, usize)>,
     slots: Vec<SlotHost>,
     mirrors: Vec<Mirror>,
-    /// One event per stage, recorded after its layers; the next stage's stream waits on it.
+    /// One event per stage, recorded after its layers; the next stage's stream waits on it (the wait
+    /// is captured when enqueued, so steps in flight can share them).
     done: Vec<CudaEvent>,
+    /// Per lane, on the last stage: recorded after the step's sampled tokens.
+    lane_done: Vec<CudaEvent>,
+    /// Per lane: a ticket is out.
+    lane_busy: Vec<bool>,
     /// `PLOW_DSV41_PROFILE=1`: sync after every stage and report per-stage milliseconds; `=2`
     /// also per-kernel GPU time. Both perturb timing (the stages stop overlapping).
     prof: Option<std::cell::RefCell<Prof>>,
@@ -174,6 +195,7 @@ impl Engine {
                     let bounds = opts.bounds.clone();
                     let mir: Vec<usize> = mirrors.iter().filter(|m| m.consumer == s).map(|m| m.src).collect();
                     let (max_len, max_slots, arena) = (opts.max_len, opts.max_slots, opts.arena_bytes);
+                    let (dl, da) = (opts.decode_lanes, opts.decode_arena_bytes);
                     sc.spawn(move || -> Result<Stage> {
                         let t0 = std::time::Instant::now();
                         let mut layers = Vec::new();
@@ -181,7 +203,7 @@ impl Engine {
                             layers.push(Layer::load(&dev, &ck, &cfg, l)?);
                         }
                         tracing::info!(target: "dsv41", "stage {s}: layers {}..{} loaded in {:.1}s", bounds[s], bounds[s + 1], t0.elapsed().as_secs_f32());
-                        Stage::new(s, dev, cubin, cfg, layers, &mir, max_len, max_slots, arena, prof_level >= 2)
+                        Stage::new(s, dev, cubin, cfg, layers, &mir, max_len, max_slots, arena, dl, da, prof_level >= 2)
                     })
                 })
                 .collect();
@@ -211,8 +233,12 @@ impl Engine {
                 return Err(RuntimeError::Device(format!("dsv41: layer {l} has no engram table")));
             }
             let stage = stage_of(&opts.bounds, l);
-            let staging = devs[stage].host_alloc_pinned(opts.max_len * cols * cfg.engram_head_dim * 2)?;
-            engram.push(EngramTab { layer: l, stage, weight, scale, staging: std::cell::RefCell::new(staging) });
+            let mut staging = Vec::new();
+            for lane in 0..=opts.decode_lanes {
+                let rows = if lane == 0 { opts.max_len } else { opts.max_slots };
+                staging.push(std::cell::RefCell::new(devs[stage].host_alloc_pinned(rows * cols * cfg.engram_head_dim * 2)?));
+            }
+            engram.push(EngramTab { layer: l, stage, weight, scale, staging });
         }
         let hash_proto = if cfg.engram_layers.is_empty() {
             None
@@ -224,6 +250,7 @@ impl Engine {
             Some((tabs.multipliers, tabs.primes, tabs.offsets, map, vocab, cfg.engram_compressed_vocab, cfg.engram_pad_id, opts.max_len + 64))
         };
         let done = devs.iter().map(|d| d.event_create(false)).collect::<Result<Vec<_>>>()?;
+        let lane_done = (0..=opts.decode_lanes).map(|_| devs[n_stages - 1].event_create(false)).collect::<Result<Vec<_>>>()?;
         let mut eng = Engine {
             cfg: Arc::new(cfg),
             stages,
@@ -238,6 +265,8 @@ impl Engine {
             slots: Vec::new(),
             mirrors,
             done,
+            lane_busy: vec![false; lane_done.len()],
+            lane_done,
             prof: (prof_level >= 1).then(|| std::cell::RefCell::new(Prof::default())),
             prof_kernels: prof_level >= 2,
             rung_mode: false,
@@ -280,7 +309,7 @@ impl Engine {
 
     /// Gather + dequantize one Engram layer's rows into its pinned staging buffer (as
     /// ParallelEngramEmbedding: e4m3 x ue8m0 per 32 -> bf16), rows in parallel. Returns the bytes.
-    fn engram_gather(&self, li: usize, hashes: &[i64], rows: usize) -> Result<usize> {
+    fn engram_gather(&self, li: usize, lane: usize, hashes: &[i64], rows: usize) -> Result<usize> {
         let c = &self.cfg;
         let (hd, blk) = (c.engram_head_dim, 32usize);
         let n_el = self.engram.len();
@@ -289,7 +318,7 @@ impl Engine {
         let w = self.ck.tensor(&tab.weight).ok_or_else(|| RuntimeError::Device("dsv41: engram table".into()))?;
         let s = self.ck.tensor(&tab.scale).ok_or_else(|| RuntimeError::Device("dsv41: engram scale".into()))?;
         let n_rows = w.len() / hd;
-        let mut staging = tab.staging.borrow_mut();
+        let mut staging = tab.staging[lane].borrow_mut();
         let bytes = rows * cols * hd * 2;
         if bytes > staging.len() {
             return Err(RuntimeError::Device("dsv41: engram rows exceed the staging buffer".into()));
@@ -322,21 +351,67 @@ impl Engine {
     /// On any error every stage is drained before returning, so no later step's arena reuse can
     /// race a copy or kernel this step left in flight.
     pub fn step(&mut self, seqs: &[(usize, Vec<u32>, usize)], decode: bool, samp: &[Sampling]) -> Result<Vec<u32>> {
-        let r = self.step_inner(seqs, decode, samp);
-        if r.is_err() {
-            for s in &self.stages {
-                let _ = s.stream_sync();
+        let t = self.issue(0, seqs, decode, samp)?;
+        self.collect(t)
+    }
+
+    /// Lanes steps can be issued on: 0 and the decode lanes 1..=n.
+    pub fn n_lanes(&self) -> usize {
+        self.lane_busy.len()
+    }
+
+    /// Enqueue a step on `lane` (no host sync) and return its ticket. On error every stage is
+    /// drained and every lane freed (a half-enqueued step leaves nothing to collect).
+    pub fn issue(&mut self, lane: usize, seqs: &[(usize, Vec<u32>, usize)], decode: bool, samp: &[Sampling]) -> Result<Ticket> {
+        if lane >= self.lane_busy.len() || self.lane_busy[lane] {
+            return Err(RuntimeError::Device(format!("dsv41: lane {lane} is busy or out of range")));
+        }
+        let r = self.issue_inner(lane, seqs, decode, samp);
+        match r {
+            Ok(t) => {
+                self.lane_busy[lane] = true;
+                Ok(t)
             }
+            Err(e) => {
+                self.drain();
+                Err(e)
+            }
+        }
+    }
+
+    /// Wait for a ticket's step and return its sampled tokens (one per sequence).
+    pub fn collect(&mut self, t: Ticket) -> Result<Vec<u32>> {
+        self.lane_busy[t.lane] = false;
+        let last = self.stages.last().expect("stages");
+        let r = (|| {
+            last.dev.event_synchronize(&self.lane_done[t.lane])?;
+            let mut out = vec![0u8; t.nb * 4];
+            last.dev.memcpy_dtoh(&mut out, t.tok)?;
+            Ok(out.chunks(4).map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]])).collect())
+        })();
+        if r.is_err() {
+            self.drain();
         }
         r
     }
 
-    fn step_inner(&mut self, seqs: &[(usize, Vec<u32>, usize)], decode: bool, samp: &[Sampling]) -> Result<Vec<u32>> {
+    /// Synchronize every stage and free every lane (after an error, or before tearing down).
+    pub fn drain(&mut self) {
+        for s in &self.stages {
+            let _ = s.stream_sync();
+        }
+        self.lane_busy.iter_mut().for_each(|b| *b = false);
+    }
+
+    fn issue_inner(&mut self, lane: usize, seqs: &[(usize, Vec<u32>, usize)], decode: bool, samp: &[Sampling]) -> Result<Ticket> {
         let c = self.cfg.clone();
         let (h, hcm) = (c.hidden, c.hc_mult);
         let t: usize = seqs.iter().map(|s| s.1.len()).sum();
         if (!decode && seqs.len() != 1) || (decode && seqs.iter().any(|s| s.1.len() != 1)) || samp.len() != seqs.len() || t == 0 {
             return Err(RuntimeError::Device("dsv41: a step is one prefill sequence or single-token decodes".into()));
+        }
+        if lane > 0 && (!decode || t > self.slots.len()) {
+            return Err(RuntimeError::Device("dsv41: decode lanes take decode steps of at most max_slots rows".into()));
         }
         let st = Step { decode, t, slots: seqs.iter().map(|s| s.0).collect(), pos: seqs.iter().map(|s| s.2).collect() };
         let hashes = if self.engram.is_empty() { Vec::new() } else { self.engram_hashes(seqs) };
@@ -349,9 +424,10 @@ impl Engine {
         let t_host = std::time::Instant::now();
         let mut t_stage = std::time::Instant::now();
         let mut stage_ms = vec![0f64; n_stages];
-        let mut result = Vec::new();
+        let mut ticket = None;
         for s in 0..n_stages {
             let stg = &self.stages[s];
+            stg.arena.select(lane);
             stg.arena.reset(0);
             let meta = stg.step_meta(&st)?;
             let xa = stg.alloc_persistent(x_bytes)?;
@@ -377,12 +453,12 @@ impl Engine {
                     stg.dev.memcpy_peer_async(xa, &src.dev, px, x_bytes, &stg.stream)?;
                     stg.dev.memcpy_peer_async(pa, &src.dev, pp, p_bytes, &stg.stream)?;
                     if psh.kout > 0 {
-                        sh.topk = stg.topk_buf;
+                        sh.topk = stg.topk_buf();
                         sh.kout = psh.kout;
                         stg.dev.memcpy_peer_async(sh.topk, &src.dev, psh.topk, (t * psh.kout * 4) as u64, &stg.stream)?;
                     }
                     if psh.nblk > 0 {
-                        sh.keep = stg.keep_buf;
+                        sh.keep = stg.keep_buf();
                         sh.nblk = psh.nblk;
                         stg.dev.memcpy_peer_async(sh.keep, &src.dev, psh.keep, (t * psh.nblk) as u64, &stg.stream)?;
                     }
@@ -394,11 +470,11 @@ impl Engine {
                 if tab.stage != s {
                     continue;
                 }
-                let bytes = self.engram_gather(li, &hashes, t)?;
+                let bytes = self.engram_gather(li, lane, &hashes, t)?;
                 let d = stg.alloc_persistent(bytes as u64)?;
-                let staging = tab.staging.borrow();
-                // SAFETY: pinned source, stable until the step's final sync (the next step's gather
-                // into it happens after that sync).
+                let staging = tab.staging[lane].borrow();
+                // SAFETY: pinned source, stable until this lane's ticket is collected (the next gather
+                // into this lane's staging happens on the next step issued on the lane, after that).
                 unsafe { stg.dev.memcpy_htod_async(d, &staging.as_slice()[..bytes], &stg.stream)? };
                 emb_dev.insert(tab.layer, d);
             }
@@ -419,13 +495,16 @@ impl Engine {
             if s + 1 < n_stages {
                 prev = Some((s, x, pm, sh));
             } else {
-                result = self.head_sample(stg, x, pm, &st, samp)?;
+                let tok = self.head_sample(stg, x, pm, &st, samp)?;
+                stg.dev.event_record(&self.lane_done[lane], &stg.stream)?;
+                ticket = Some(Ticket { lane, nb: st.nb(), tok });
             }
         }
         if self.prof.is_some() {
+            self.stages[n_stages - 1].stream_sync()?;
             self.report(kind, &st, t_host.elapsed().as_secs_f64() * 1e3, &stage_ms)?;
         }
-        Ok(result)
+        Ok(ticket.expect("a last stage"))
     }
 
     /// Copy the compressed-cache rows stage `s`'s kv sources wrote this step into the mirrors on the
@@ -472,8 +551,8 @@ impl Engine {
     }
 
     /// hc_pre with the final pre-mix, norm, fp32 head, optional Gumbel noise, argmax -- for the last
-    /// row of each sequence. The step's one host sync is the token readback here.
-    fn head_sample(&self, stg: &Stage, x: u64, pm: u64, st: &Step, samp: &[Sampling]) -> Result<Vec<u32>> {
+    /// row of each sequence. Returns the device tokens [nb] u32 (read back by `collect`).
+    fn head_sample(&self, stg: &Stage, x: u64, pm: u64, st: &Step, samp: &[Sampling]) -> Result<u64> {
         let c = &self.cfg;
         let (h, hcm, v) = (c.hidden, c.hc_mult, c.vocab);
         let nb = st.nb();
@@ -501,10 +580,7 @@ impl Engine {
         }
         let tok = stg.alloc_persistent((nb * 4) as u64)?;
         stg.k.launch("dsv_argmax", [nb as u32, 1, 1], 1024, 0, &[A::P(tok), A::P(logits), A::I(v as i32)], &stg.stream)?;
-        stg.stream_sync()?;
-        let mut out = vec![0u8; nb * 4];
-        stg.dev.memcpy_dtoh(&mut out, tok)?;
-        Ok(out.chunks(4).map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]])).collect())
+        Ok(tok)
     }
 
     fn report(&self, kind: usize, st: &Step, host_ms: f64, stage_ms: &[f64]) -> Result<()> {
@@ -575,13 +651,16 @@ impl Engine {
 
     /// The perf campaign's measurement: for each rung, the unperturbed step time, then a per-kernel
     /// breakdown against the roofline (needs `PLOW_DSV41_PROFILE=2`). `spec`:
-    /// `prefill=1024,4096;decode=1x1024,64x1024` -- prefill token counts, decode batch x context.
-    /// Decode rungs run on synthetic positions (cache contents do not change the work done).
+    /// `prefill=1024,4096;decode=1x1024,64x1024;pdecode=4x16x1024` -- prefill token counts, decode
+    /// batch x context, pipelined decode groups x batch x context (that many steps kept in flight on
+    /// the decode lanes, as the scheduler runs them). Decode rungs run on synthetic positions (cache
+    /// contents do not change the work done).
     pub fn rung_bench(&mut self, spec: &str, reps: usize) -> Result<String> {
         let mut out = String::new();
         use std::fmt::Write as _;
         let _ = writeln!(out, "# dsv41 rung bench ({} stages, H200 roofline: HBM 4.8 TB/s, fp8 1979 / bf16 989 / fp32 67 TFLOP/s dense)\n", self.stages.len());
         let mut rungs: Vec<(bool, usize, usize)> = Vec::new(); // (decode, batch or tokens, context)
+        let mut piped: Vec<(usize, usize, usize)> = Vec::new(); // (groups, batch, context)
         for part in spec.split(';').map(str::trim).filter(|p| !p.is_empty()) {
             let (kind, list) = part.split_once('=').ok_or_else(|| RuntimeError::Device(format!("rung spec: {part}")))?;
             for item in list.split(',').map(str::trim) {
@@ -591,6 +670,13 @@ impl Engine {
                         let (b, ctx) = item.split_once('x').ok_or_else(|| RuntimeError::Device(format!("decode rung {item}: want BxCTX")))?;
                         rungs.push((true, b.parse().map_err(|_| RuntimeError::Device(format!("rung: {item}")))?, ctx.parse().map_err(|_| RuntimeError::Device(format!("rung: {item}")))?));
                     }
+                    "pdecode" => {
+                        let v: Vec<usize> = item.split('x').map(|x| x.parse::<usize>()).collect::<std::result::Result<_, _>>().map_err(|_| RuntimeError::Device(format!("rung: {item}")))?;
+                        if v.len() != 3 {
+                            return Err(RuntimeError::Device(format!("pdecode rung {item}: want GxBxCTX")));
+                        }
+                        piped.push((v[0], v[1], v[2]));
+                    }
                     k => return Err(RuntimeError::Device(format!("rung spec: unknown kind {k}"))),
                 }
             }
@@ -598,6 +684,41 @@ impl Engine {
         self.rung_mode = true;
         let tok = |i: usize| ((i * 7919 + 13) % 120_000 + 10) as u32;
         let greedy = Sampling::default();
+        for (g, b, ctx) in piped {
+            if g * b > self.slots.len() || g >= self.n_lanes() {
+                let _ = writeln!(out, "## pipelined decode {g}x{b} ctx={ctx}: skipped (max_slots {}, {} decode lanes)\n", self.slots.len(), self.n_lanes() - 1);
+                continue;
+            }
+            self.set_kernel_events(false);
+            let seqs = |gi: usize, pos: usize| -> Vec<(usize, Vec<u32>, usize)> { (0..b).map(|i| (gi * b + i, vec![tok(gi * b + i)], pos + i)).collect() };
+            let samp = vec![greedy; b];
+            let rounds = reps.max(2) * 2;
+            let mut pending: std::collections::VecDeque<(usize, Ticket)> = std::collections::VecDeque::new();
+            let mut steps = vec![0usize; g];
+            let t0 = std::time::Instant::now();
+            for gi in 0..g {
+                pending.push_back((gi, self.issue(gi + 1, &seqs(gi, ctx), true, &samp)?));
+            }
+            let mut done = 0usize;
+            let mut t_warm = None;
+            while let Some((gi, t)) = pending.pop_front() {
+                self.collect(t)?;
+                steps[gi] += 1;
+                done += 1;
+                if done == g {
+                    t_warm = Some((std::time::Instant::now(), done));
+                }
+                if steps[gi] < rounds {
+                    pending.push_back((gi, self.issue(gi + 1, &seqs(gi, ctx + steps[gi]), true, &samp)?));
+                }
+            }
+            let (tw, dw) = t_warm.unwrap_or((t0, 0));
+            let steady_s = tw.elapsed().as_secs_f64();
+            let steps_steady = (done - dw) as f64;
+            let tok_s = steps_steady * b as f64 / steady_s;
+            let step_ms = steady_s * 1e3 / (steps_steady / g as f64);
+            let _ = writeln!(out, "## pipelined decode {g}x{b} ctx={ctx}: {tok_s:.0} tok/s, {step_ms:.2} ms per group step (TPOT) over {} steady steps\n", steps_steady as usize);
+        }
         for (decode, n, ctx) in rungs {
             if n > self.slots.len() && decode {
                 let _ = writeln!(out, "## decode B={n} ctx={ctx}: skipped (max_slots {})\n", self.slots.len());

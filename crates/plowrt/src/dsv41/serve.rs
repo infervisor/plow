@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use crate::error::RuntimeError;
 use crate::text::tokenizer::{load_tokenizer, Tokenize};
 
-use super::engine::{Engine, EngineOpts, Sampling};
+use super::engine::{Engine, EngineOpts, Sampling, Ticket};
 
 pub struct ServeOpts {
     pub ckpt: PathBuf,
@@ -237,7 +237,14 @@ fn scheduler(mut eng: Engine, mut rx: mpsc::UnboundedReceiver<Job>, max_len: usi
     let eos = eng.cfg.eos_id;
     let mut free: Vec<usize> = (0..eng.n_slots()).rev().collect();
     let mut waiting: VecDeque<Job> = VecDeque::new();
-    let mut active: Vec<Active> = Vec::new();
+    // Decode groups, one per decode lane (lane 0 alone when there are none): each group's step is
+    // issued as soon as its previous one is collected, so up to n groups flow through the pipeline
+    // stages together. A prefill runs on lane 0 alongside them. Tickets are collected oldest first.
+    let n_groups = (eng.n_lanes() - 1).max(1);
+    let group_lane = |g: usize| if eng.n_lanes() > 1 { g + 1 } else { 0 };
+    let mut groups: Vec<Group> = (0..n_groups).map(|g| Group { lane: group_lane(g), members: Vec::new(), inflight: None }).collect();
+    let mut prefill: Option<(Ticket, Job, usize)> = None;
+    let mut order: VecDeque<Pending> = VecDeque::new();
     let done = |job: &Job, n_prompt: usize, generated: usize, reason: &'static str, first: Option<Instant>| {
         let _ = job.tx.send(Ev::Done { prompt: n_prompt, completion: generated, reason });
         inflight.fetch_sub(1, Ordering::SeqCst);
@@ -260,17 +267,37 @@ fn scheduler(mut eng: Engine, mut rx: mpsc::UnboundedReceiver<Job>, max_len: usi
         std::thread::sleep(Duration::from_millis(200));
         std::process::exit(1);
     };
+    // A failed issue or collect drains the engine: every step in flight is done or abandoned, so
+    // every in-flight sequence fails (their caches may hold a partial step).
+    let fail_all = |groups: &mut Vec<Group>, prefill: &mut Option<(Ticket, Job, usize)>, order: &mut VecDeque<Pending>, free: &mut Vec<usize>, e: &RuntimeError| {
+        order.clear();
+        for g in groups.iter_mut() {
+            g.inflight = None;
+            for a in g.members.drain(..) {
+                fail(&a.job, StatusCode::INTERNAL_SERVER_ERROR, format!("decode failed: {e}"));
+                free.push(a.slot);
+            }
+        }
+        if let Some((_, j, slot)) = prefill.take() {
+            fail(&j, StatusCode::INTERNAL_SERVER_ERROR, format!("prefill failed: {e}"));
+            free.push(slot);
+        }
+        if is_fatal(e) {
+            fatal(e);
+        }
+    };
     loop {
         while let Ok(j) = rx.try_recv() {
             waiting.push_back(j);
         }
-        if active.is_empty() && waiting.is_empty() {
+        let idle = order.is_empty() && groups.iter().all(|g| g.members.is_empty());
+        if idle && waiting.is_empty() {
             match rx.blocking_recv() {
                 Some(j) => waiting.push_back(j),
                 None => return,
             }
         }
-        // admit one prefill, skipping requests whose client already left
+        // drop requests whose client already left
         while let Some(j) = waiting.front() {
             if j.tx.is_closed() {
                 let j = waiting.pop_front().unwrap();
@@ -280,86 +307,138 @@ fn scheduler(mut eng: Engine, mut rx: mpsc::UnboundedReceiver<Job>, max_len: usi
                 break;
             }
         }
-        if let (Some(slot), true) = (free.last().copied(), !waiting.is_empty()) {
-            let j = waiting.pop_front().unwrap();
-            free.pop();
-            health.busy_since_ms.store(health.now_ms(), Ordering::SeqCst);
-            let r = eng.release(slot).and_then(|_| eng.step(&[(slot, j.prompt.clone(), 0)], false, &[j.sampling]));
-            health.busy_since_ms.store(0, Ordering::SeqCst);
-            match r {
-                Ok(t) => {
-                    let n_prompt = j.prompt.len();
-                    let mut a = Active {
-                        slot,
-                        pos: n_prompt,
-                        last: t[0],
-                        generated: 0,
-                        n_prompt,
-                        detok: Detok::new(),
-                        stop: StopScan::new(j.stop.clone()),
-                        first_token: Instant::now(),
-                        job: j,
-                    };
-                    match a.accept(t[0], tok.as_ref(), eos, max_len) {
-                        Outcome::Continue => active.push(a),
-                        Outcome::Finished(reason) => {
-                            done(&a.job, a.n_prompt, a.generated, reason, Some(a.first_token));
-                            free.push(slot);
-                        }
-                        Outcome::Gone => {
-                            inflight.fetch_sub(1, Ordering::SeqCst);
-                            free.push(slot);
-                        }
+        // issue one prefill on lane 0
+        if prefill.is_none() {
+            if let (Some(slot), true) = (free.last().copied(), !waiting.is_empty()) {
+                let j = waiting.pop_front().unwrap();
+                free.pop();
+                match eng.release(slot).and_then(|_| eng.issue(0, &[(slot, j.prompt.clone(), 0)], false, &[j.sampling])) {
+                    Ok(t) => {
+                        prefill = Some((t, j, slot));
+                        order.push_back(Pending::Prefill);
                     }
+                    Err(e) => {
+                        fail(&j, StatusCode::INTERNAL_SERVER_ERROR, format!("prefill failed: {e}"));
+                        free.push(slot);
+                        fail_all(&mut groups, &mut prefill, &mut order, &mut free, &e);
+                        continue;
+                    }
+                }
+            }
+        }
+        // issue every idle group's next decode step
+        let mut issue_err = None;
+        for (gi, g) in groups.iter_mut().enumerate() {
+            if g.inflight.is_some() || g.members.is_empty() {
+                continue;
+            }
+            let seqs: Vec<(usize, Vec<u32>, usize)> = g.members.iter().map(|a| (a.slot, vec![a.last], a.pos)).collect();
+            let samp: Vec<Sampling> = g.members.iter().map(|a| a.job.sampling.at(a.generated as u64)).collect();
+            match eng.issue(g.lane, &seqs, true, &samp) {
+                Ok(t) => {
+                    g.inflight = Some((t, seqs.len()));
+                    order.push_back(Pending::Group(gi));
                 }
                 Err(e) => {
-                    fail(&j, StatusCode::INTERNAL_SERVER_ERROR, format!("prefill failed: {e}"));
-                    free.push(slot);
-                    if is_fatal(&e) {
-                        fatal(&e);
-                    }
+                    issue_err = Some(e);
+                    break;
                 }
             }
         }
-        if active.is_empty() {
+        if let Some(e) = issue_err {
+            fail_all(&mut groups, &mut prefill, &mut order, &mut free, &e);
             continue;
         }
-        let seqs: Vec<(usize, Vec<u32>, usize)> = active.iter().map(|a| (a.slot, vec![a.last], a.pos)).collect();
-        let samp: Vec<Sampling> = active.iter().map(|a| a.job.sampling.at(a.generated as u64)).collect();
+        // collect the oldest step in flight
+        let Some(p) = order.pop_front() else { continue };
         health.busy_since_ms.store(health.now_ms(), Ordering::SeqCst);
-        let r = eng.step(&seqs, true, &samp);
-        health.busy_since_ms.store(0, Ordering::SeqCst);
-        match r {
-            Ok(toks) => {
-                let mut keep = Vec::with_capacity(active.len());
-                for (mut a, t) in active.drain(..).zip(toks) {
-                    a.pos += 1;
-                    a.last = t;
-                    match a.accept(t, tok.as_ref(), eos, max_len) {
-                        Outcome::Continue => keep.push(a),
-                        Outcome::Finished(reason) => {
-                            done(&a.job, a.n_prompt, a.generated, reason, Some(a.first_token));
-                            free.push(a.slot);
-                        }
-                        Outcome::Gone => {
-                            inflight.fetch_sub(1, Ordering::SeqCst);
-                            free.push(a.slot);
+        match p {
+            Pending::Prefill => {
+                let (t, j, slot) = prefill.take().expect("prefill in flight");
+                let r = eng.collect(t);
+                health.busy_since_ms.store(0, Ordering::SeqCst);
+                match r {
+                    Ok(t) => {
+                        let n_prompt = j.prompt.len();
+                        let mut a = Active {
+                            slot,
+                            pos: n_prompt,
+                            last: t[0],
+                            generated: 0,
+                            n_prompt,
+                            detok: Detok::new(),
+                            stop: StopScan::new(j.stop.clone()),
+                            first_token: Instant::now(),
+                            job: j,
+                        };
+                        match a.accept(t[0], tok.as_ref(), eos, max_len) {
+                            // join the smallest group (its next issue picks the sequence up)
+                            Outcome::Continue => groups.iter_mut().min_by_key(|g| g.members.len()).expect("a group").members.push(a),
+                            Outcome::Finished(reason) => {
+                                done(&a.job, a.n_prompt, a.generated, reason, Some(a.first_token));
+                                free.push(slot);
+                            }
+                            Outcome::Gone => {
+                                inflight.fetch_sub(1, Ordering::SeqCst);
+                                free.push(slot);
+                            }
                         }
                     }
+                    Err(e) => {
+                        fail(&j, StatusCode::INTERNAL_SERVER_ERROR, format!("prefill failed: {e}"));
+                        free.push(slot);
+                        fail_all(&mut groups, &mut prefill, &mut order, &mut free, &e);
+                    }
                 }
-                active = keep;
             }
-            Err(e) => {
-                for a in active.drain(..) {
-                    fail(&a.job, StatusCode::INTERNAL_SERVER_ERROR, format!("decode failed: {e}"));
-                    free.push(a.slot);
-                }
-                if is_fatal(&e) {
-                    fatal(&e);
+            Pending::Group(gi) => {
+                let (t, n_issued) = groups[gi].inflight.take().expect("group in flight");
+                let r = eng.collect(t);
+                health.busy_since_ms.store(0, Ordering::SeqCst);
+                match r {
+                    Ok(toks) => {
+                        // members past n_issued joined while the step was in flight: untouched
+                        let g = &mut groups[gi];
+                        let mut keep = Vec::with_capacity(g.members.len());
+                        for (i, mut a) in g.members.drain(..).enumerate() {
+                            if i >= n_issued {
+                                keep.push(a);
+                                continue;
+                            }
+                            a.pos += 1;
+                            a.last = toks[i];
+                            match a.accept(toks[i], tok.as_ref(), eos, max_len) {
+                                Outcome::Continue => keep.push(a),
+                                Outcome::Finished(reason) => {
+                                    done(&a.job, a.n_prompt, a.generated, reason, Some(a.first_token));
+                                    free.push(a.slot);
+                                }
+                                Outcome::Gone => {
+                                    inflight.fetch_sub(1, Ordering::SeqCst);
+                                    free.push(a.slot);
+                                }
+                            }
+                        }
+                        g.members = keep;
+                    }
+                    Err(e) => fail_all(&mut groups, &mut prefill, &mut order, &mut free, &e),
                 }
             }
         }
     }
+}
+
+/// A decode group: the sequences stepped together on one lane.
+struct Group {
+    lane: usize,
+    members: Vec<Active>,
+    /// The step in flight and how many members (a prefix) it covers.
+    inflight: Option<(Ticket, usize)>,
+}
+
+enum Pending {
+    Prefill,
+    Group(usize),
 }
 
 fn now_secs() -> u64 {
