@@ -2072,7 +2072,9 @@ fn build_cubin_from_manifest(
     // The codec is a packet (codec.pkt); no native codec object is shipped.
     let _ = speech;
     args.push("-DPLOW_TTS_SNAC=OFF".into());
-    args.push(format!("-DPLOW_TTS_S3GEN={}", if t3 { "ON" } else { "OFF" }));
+    // The vocoder is a packet (s3gen.pkt); no native vocoder object is shipped.
+    let _ = t3;
+    args.push("-DPLOW_TTS_S3GEN=OFF".into());
     // An ASR packet's audio encoder runs the FP32 speech arms, which only the _speech object has.
     let asr = ["encoder.pkt", "codec.pkt", "s3gen.pkt"].iter().any(|f| pkt.with_file_name(f).is_file());
     args.push(format!("-DPLOW_CUBIN_SPEECH={}", if asr { "ON" } else { "OFF" }));

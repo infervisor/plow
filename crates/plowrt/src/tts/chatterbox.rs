@@ -1,31 +1,52 @@
-//! The Chatterbox speech worker: T3 (`tts.t3_cfg.v1` packet on its own `GpuEngine`) feeding the
-//! S3Gen stage. Two threads: the T3 thread batches requests continuously over CFG slot pairs and
-//! forwards each speech token as it is committed; the S3Gen thread renders batches of utterances,
-//! so decoding never waits on audio rendering.
+//! The guided speech worker: a guided token LM (`tts.t3_cfg.v1` packet on its own `GpuEngine`)
+//! feeding a token vocoder (`s3gen.pkt`, a `codec.v1` packet on the packet runtime). Two threads:
+//! the LM thread batches requests continuously over CFG slot pairs and forwards each speech token
+//! as it is committed; the render thread renders batches of utterances, so decoding never waits on
+//! audio rendering.
 //!
-//! Streaming: S3Gen is not causal over tokens (the conformer encoder attends both ways), so a
-//! stream re-renders its whole token prefix every `STREAM_CHUNK` tokens and emits the audio of all
-//! but the last `STREAM_HOLD` tokens, crossfading `FADE` samples into the previous render's tail.
-//! The noise streams are keyed by frame, so re-renders of a prefix agree up to that lookahead.
-//! A render sharing the GPU with T3's back-to-back cooperative decode launches runs ~6x slower
-//! (220 vs 35 ms for a first chunk), so T3 pauses while a batch holding a first chunk renders:
-//! first audio is then prefill + `STREAM_FIRST` tokens + one uncontended render.
+//! Streaming (schedule from the vocoder packet's `stream.*` parameters): the vocoder is not causal
+//! over tokens, so a stream re-renders its whole token prefix every `chunk` tokens and emits the
+//! audio of all but the last `hold` tokens, crossfading `fade` samples into the previous render's
+//! tail. The noise streams are keyed by frame, so re-renders of a prefix agree up to that
+//! lookahead. A render sharing the GPU with the LM's back-to-back cooperative decode launches runs
+//! several times slower, so the LM pauses while a batch holding a first chunk renders: first audio
+//! is then prefill + `first` tokens + one uncontended render.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
-use super::s3gen::{Render, S3Gen, SAMPLES_PER_TOKEN};
+use super::codec::Codec;
 use super::t3::{T3Engine, T3Job};
 use crate::{Result, RuntimeError};
 
-const S3_BATCH: usize = 8;
-const S3_MAX_TOKENS: usize = 1000;
-const STREAM_FIRST: usize = 20;
-const STREAM_CHUNK: usize = 25;
-const STREAM_HOLD: usize = 3;
-const FADE: usize = 480;
+/// The vocoder packet beside the LM packet.
+pub const VOCODER: &str = "s3gen.pkt";
+
+#[derive(Clone, Copy, Debug)]
+struct Schedule {
+    first: usize,
+    chunk: usize,
+    hold: usize,
+    fade: usize,
+    samples_per_token: usize,
+    max_tokens: usize,
+}
+
+impl Schedule {
+    fn from_codec(c: &Codec) -> std::result::Result<Self, String> {
+        let p = |k: &str| c.parameters.get(k).map(|&v| v as usize).ok_or(format!("vocoder packet lacks {k}"));
+        Ok(Self {
+            first: p("stream.first_tokens")?,
+            chunk: p("stream.chunk_tokens")?,
+            hold: p("stream.hold_tokens")?,
+            fade: p("stream.fade_samples")?,
+            samples_per_token: c.frame_samples,
+            max_tokens: c.max_frames,
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SpeechAudio {
@@ -78,19 +99,19 @@ struct Utterance {
 
 impl Utterance {
     /// Due for a render: a closed utterance always; an open stream once a chunk has arrived.
-    fn due(&self) -> bool {
+    fn due(&self, sc: &Schedule) -> bool {
         match (&self.reply, self.t3_ms) {
             (_, Some(_)) => true,
             (Reply::Whole(_), None) => false,
             (Reply::Stream(_), None) => {
                 let n = self.tokens.len();
-                if self.rendered == 0 { n >= STREAM_FIRST } else { n >= self.rendered + STREAM_CHUNK }
+                if self.rendered == 0 { n >= sc.first } else { n >= self.rendered + sc.chunk }
             }
         }
     }
 
     /// Consume a render of `self.tokens`; returns false when the utterance is finished.
-    fn take(&mut self, pcm: &[f32], ms: f64) -> bool {
+    fn take(&mut self, pcm: &[f32], ms: f64, sc: &Schedule) -> bool {
         self.s3gen_ms += ms;
         self.rendered = self.tokens.len();
         let last = self.t3_ms.is_some();
@@ -109,14 +130,14 @@ impl Utterance {
                 false
             }
             Reply::Stream(tx) => {
-                let end = if last { pcm.len() } else { pcm.len().saturating_sub(STREAM_HOLD * SAMPLES_PER_TOKEN) };
+                let end = if last { pcm.len() } else { pcm.len().saturating_sub(sc.hold * sc.samples_per_token) };
                 if end > self.emitted {
                     let mut chunk = pcm[self.emitted..end].to_vec();
                     for (i, (o, t)) in chunk.iter_mut().zip(&self.tail).enumerate() {
                         let w = (i as f32 + 0.5) / self.tail.len() as f32;
                         *o = *t * (1.0 - w) + *o * w;
                     }
-                    self.tail = pcm[end..pcm.len().min(end + FADE)].to_vec();
+                    self.tail = pcm[end..pcm.len().min(end + sc.fade)].to_vec();
                     self.emitted = end;
                     if tx.send(StreamEvent::Pcm(chunk)).is_err() {
                         return false;
@@ -142,7 +163,8 @@ impl Utterance {
     }
 }
 
-fn s3gen_loop(s3: &mut S3Gen, rx: mpsc::Receiver<S3Msg>, urgent: &AtomicBool) {
+fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, urgent: &AtomicBool) {
+    let max_batch = 8;
     let mut live: HashMap<usize, Utterance> = HashMap::new();
     let apply = |live: &mut HashMap<usize, Utterance>, m: S3Msg| match m {
         S3Msg::Open { id, voice, seed, reply } => {
@@ -163,7 +185,7 @@ fn s3gen_loop(s3: &mut S3Gen, rx: mpsc::Receiver<S3Msg>, urgent: &AtomicBool) {
         }
     };
     loop {
-        if !live.values().any(Utterance::due) {
+        if !live.values().any(|u| u.due(&sc)) {
             match rx.recv() {
                 Ok(m) => apply(&mut live, m),
                 Err(_) => return,
@@ -179,12 +201,12 @@ fn s3gen_loop(s3: &mut S3Gen, rx: mpsc::Receiver<S3Msg>, urgent: &AtomicBool) {
             }
         }
         // Closed utterances first, then the streams furthest behind.
-        let mut due: Vec<usize> = live.iter().filter(|(_, u)| u.due()).map(|(&k, _)| k).collect();
+        let mut due: Vec<usize> = live.iter().filter(|(_, u)| u.due(&sc)).map(|(&k, _)| k).collect();
         due.sort_by_key(|k| {
             let u = &live[k];
             (u.t3_ms.is_none(), u.rendered as isize - u.tokens.len() as isize, *k)
         });
-        due.truncate(s3.max_batch);
+        due.truncate(max_batch);
         if due.is_empty() {
             continue;
         }
@@ -194,30 +216,35 @@ fn s3gen_loop(s3: &mut S3Gen, rx: mpsc::Receiver<S3Msg>, urgent: &AtomicBool) {
         });
         urgent.store(first, Ordering::Release);
         let t = std::time::Instant::now();
-        let mut pcms: Vec<Vec<f32>> = vec![Vec::new(); due.len()];
-        let res = {
-            let items: Vec<Render> = due
-                .iter()
-                .map(|k| {
-                    let u = &live[k];
-                    let n = u.tokens.len().min(S3_MAX_TOKENS);
-                    Render { voice: &u.voice, tokens: &u.tokens[..n], seed: u.seed }
-                })
-                .collect();
-            s3.synthesize_batch(&items, |i, pcm| pcms[i] = pcm.to_vec())
-        };
-        urgent.store(false, Ordering::Release);
-        let ms = t.elapsed().as_secs_f64() * 1e3;
-        tracing::debug!(renders = due.len(), tokens = ?due.iter().map(|k| live[k].tokens.len()).collect::<Vec<_>>(), ms, "s3gen render");
-        for (k, pcm) in due.into_iter().zip(pcms) {
-            match &res {
-                Err(e) => {
-                    if let Some(u) = live.remove(&k) {
-                        u.fail(e.to_string());
+        // Submitted together so the vocoder worker batches them into one launch.
+        let renders: Vec<_> = due
+            .iter()
+            .map(|k| {
+                let u = &live[k];
+                let n = u.tokens.len().min(sc.max_tokens);
+                let voice = vocoder.voices.iter().position(|v| *v == u.voice);
+                let codes: Vec<i32> = u.tokens[..n].iter().map(|&t| t as i32).collect();
+                async move {
+                    match voice {
+                        Some(v) => vocoder.decode_voice(codes, n, u.seed, v as u32).await,
+                        None => Err(format!("unknown voice {:?}", u.voice)),
                     }
                 }
-                Ok(()) => {
-                    let keep = live.get_mut(&k).is_some_and(|u| u.take(&pcm, ms));
+            })
+            .collect();
+        let results = futures::executor::block_on(futures::future::join_all(renders));
+        urgent.store(false, Ordering::Release);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        tracing::debug!(renders = due.len(), tokens = ?due.iter().map(|k| live[k].tokens.len()).collect::<Vec<_>>(), ms, "vocoder render");
+        for (k, pcm) in due.into_iter().zip(results) {
+            match pcm {
+                Err(e) => {
+                    if let Some(u) = live.remove(&k) {
+                        u.fail(e);
+                    }
+                }
+                Ok(pcm) => {
+                    let keep = live.get_mut(&k).is_some_and(|u| u.take(&pcm, ms, &sc));
                     if !keep {
                         live.remove(&k);
                     }
@@ -281,14 +308,18 @@ impl ChatterboxWorker {
         // runtime then resolves `libcuda.so.1` to that library instead of searching (which can
         // land on a toolkit stub: "driver version is insufficient").
         std::thread::Builder::new()
-            .name("plow-tts-s3gen".into())
+            .name("plow-tts-render".into())
             .spawn(move || {
-                let mut s3 = match S3Gen::load(&dir2, S3_BATCH, S3_MAX_TOKENS).and_then(|mut s| s.warm().map(|()| s)) {
-                    Ok(s) => s,
-                    Err(e) => return drop(s_ready_tx.send(Err(e))),
+                let vocoder = match Codec::load_packet(&dir2.join(VOCODER)) {
+                    Ok(v) => v,
+                    Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Device(e)))),
+                };
+                let sc = match Schedule::from_codec(&vocoder) {
+                    Ok(sc) => sc,
+                    Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Rejected(e)))),
                 };
                 let _ = s_ready_tx.send(Ok(()));
-                s3gen_loop(&mut s3, s_rx, &urgent2);
+                render_loop(&vocoder, sc, s_rx, &urgent2);
             })
             .map_err(|e| RuntimeError::Device(e.to_string()))?;
         s_ready_rx.recv().map_err(|e| RuntimeError::Device(e.to_string()))??;
@@ -337,6 +368,8 @@ mod tests {
         (u, rx)
     }
 
+    const SC: Schedule = Schedule { first: 20, chunk: 25, hold: 3, fade: 480, samples_per_token: 960, max_tokens: 1000 };
+
     /// Renders of a growing prefix emit every sample exactly once, in order, then Done.
     #[test]
     fn stream_renders_cover_each_sample_once() {
@@ -347,9 +380,9 @@ mod tests {
             if n == 90 {
                 u.t3_ms = Some(1.0);
             }
-            if u.due() {
-                let pcm: Vec<f32> = (0..n * SAMPLES_PER_TOKEN).map(|i| (i % 1024) as f32).collect();
-                let more = u.take(&pcm, 1.0);
+            if u.due(&SC) {
+                let pcm: Vec<f32> = (0..n * SC.samples_per_token).map(|i| (i % 1024) as f32).collect();
+                let more = u.take(&pcm, 1.0, &SC);
                 assert_eq!(more, n != 90);
             }
         }
@@ -370,6 +403,6 @@ mod tests {
                 StreamEvent::Err(e) => panic!("{e}"),
             }
         }
-        assert_eq!(total, 90 * SAMPLES_PER_TOKEN);
+        assert_eq!(total, 90 * SC.samples_per_token);
     }
 }

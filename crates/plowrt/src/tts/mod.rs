@@ -13,7 +13,6 @@ pub mod serving;
 #[cfg(feature = "cuda")]
 pub mod t3;
 #[cfg(feature = "cuda")]
-pub mod s3gen;
 #[cfg(feature = "cuda")]
 pub mod chatterbox;
 
