@@ -48,22 +48,22 @@ vLLM baseline: `/root/dsv41/results/tp4-base4` (Marlin weight-only FP8 dense, Ma
 FlashMLA sparse, DeepGEMM indexer).
 
 Output tokens/s, median TTFT and TPOT. plowrt sweep2 = the first end-to-end run (kernels as of
-eedddffd), sweep3 = after the kernel work in section 5 up to 62dd2e0f (before decode pipelining);
-every request succeeded in both.
+eedddffd), sweep3 = after the kernel work in section 5 up to 62dd2e0f, sweep4 = sweep3 plus decode
+lanes (fe8ec07b); every request succeeded in all three.
 
-| Workload | c | sweep2 tok/s | sweep3 tok/s | sweep3 TTFT ms | sweep3 TPOT ms | vLLM tok/s | vLLM TTFT ms | vLLM TPOT ms |
+| Workload | c | sweep2 tok/s | sweep3 tok/s | sweep3 TTFT / TPOT ms | sweep4 tok/s | sweep4 TTFT / TPOT ms | vLLM tok/s | vLLM TTFT / TPOT ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1k in / 256 out | 1 | 14.4 | 47.2 | 343 | 19.9 | 131.8 | 124 | 7.15 |
-| 1k in / 256 out | 4 | 36.1 | 113.0 | 691 | 32.8 | 447.7 | 145 | 8.38 |
-| 1k in / 256 out | 16 | 74.8 | 241.6 | 714 | 63.0 | 792.9 | 567 | 13.36 |
-| 1k in / 256 out | 64 | 125.4 | 368.6 | 754 | 168.0 | 1765.5 | 1325 | 33.52 |
-| 4k in / 512 out | 1 | 14.4 | 46.6 | 824 | 19.9 | 131.6 | 248 | 7.15 |
-| 4k in / 512 out | 4 | 35.5 | 108.9 | 1647 | 33.5 | 458.8 | 163 | 8.46 |
-| 4k in / 512 out | 16 | 74.6 | 228.8 | 1663 | 66.6 | 936.0 | 1358 | 14.70 |
-| 16k in / 128 out | 1 | 8.8 | 24.8 | 2621 | 20.1 | 75.4 | 844 | 7.07 |
-| 16k in / 128 out | 4 | 14.1 | 36.2 | 6495 | 60.1 | 424.3 | 107 | 8.42 |
+| 1k in / 256 out | 1 | 14.4 | 47.2 | 343 / 19.9 | 47.5 | 343 / 19.8 | 131.8 | 124 / 7.15 |
+| 1k in / 256 out | 4 | 36.1 | 113.0 | 691 / 32.8 | 119.3 | 497 / 31.7 | 447.7 | 145 / 8.38 |
+| 1k in / 256 out | 16 | 74.8 | 241.6 | 714 / 63.0 | 262.4 | 543 / 58.7 | 792.9 | 567 / 13.36 |
+| 1k in / 256 out | 64 | 125.4 | 368.6 | 754 / 168.0 | 451.8 | 559 / 136.7 | 1765.5 | 1325 / 33.52 |
+| 4k in / 512 out | 1 | 14.4 | 46.6 | 824 / 19.9 | 47.0 | 823 / 19.7 | 131.6 | 248 / 7.15 |
+| 4k in / 512 out | 4 | 35.5 | 108.9 | 1647 / 33.5 | 115.1 | 1828 / 31.2 | 458.8 | 163 / 8.46 |
+| 4k in / 512 out | 16 | 74.6 | 228.8 | 1663 / 66.6 | 243.2 | 1635 / 62.5 | 936.0 | 1358 / 14.70 |
+| 16k in / 128 out | 1 | 8.8 | 24.8 | 2621 / 20.1 | 24.9 | 2623 / 19.9 | 75.4 | 844 / 7.07 |
+| 16k in / 128 out | 4 | 14.1 | 36.2 | 6495 / 60.1 | 36.7 | 6470 / 58.9 | 424.3 | 107 / 8.42 |
 
-(`/root/dsv41/results/plowrt-sweep2`, `plowrt-sweep3`. vLLM runs with chunked prefill and CUDA
+(`/root/dsv41/results/plowrt-sweep2`, `plowrt-sweep3`, `plowrt-sweep4`. vLLM runs with chunked prefill and CUDA
 graphs; plowrt admits one unchunked prefill at a time, so TTFT under concurrency includes queueing
 behind other prefills.)
 
