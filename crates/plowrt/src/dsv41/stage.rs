@@ -248,24 +248,47 @@ impl Stage {
     fn w8a8(&self, c: u64, qs: (u64, u64), w: (u64, u64), m: usize, n: usize, kd: usize, f32out: bool) -> Result<()> {
         let (mf, nf, kf) = (m as f64, n as f64, kd as f64);
         self.k.cost(Cost { flops: 2.0 * mf * nf * kf, bytes: mf * kf * 1.03 + nf * kf * 1.001 + mf * nf * if f32out { 4.0 } else { 2.0 }, peak: Peak::Fp8Mma });
+        let tiles = cdiv(n as u64, 128) * cdiv(m as u64, 64);
+        let ks = ksplit(tiles, kd / 32);
+        let part = if ks > 1 { self.arena.alloc((ks * m * n * 4) as u64)? } else { 0 };
         self.launch(
             "dsv_gemm_w8a8",
-            [cdiv(n as u64, 128), cdiv(m as u64, 64), 1],
+            [cdiv(n as u64, 128), cdiv(m as u64, 64), ks as u32],
             128,
             0,
-            &[A::P(c), A::P(qs.0), A::P(qs.1), A::P(w.0), A::P(w.1), A::I(m as i32), A::I(n as i32), A::I(kd as i32), A::L(n as i64), A::I(f32out as i32)],
+            &[A::P(c), A::P(qs.0), A::P(qs.1), A::P(w.0), A::P(w.1), A::I(m as i32), A::I(n as i32), A::I(kd as i32), A::L(n as i64), A::I(f32out as i32), A::I(ks as i32), A::P(part)],
+        )?;
+        self.splitk_reduce(c, part, ks, 1, m, n, n, 0, f32out)
+    }
+    /// Sum the split-K partials into C, in split order.
+    #[allow(clippy::too_many_arguments)]
+    fn splitk_reduce(&self, c: u64, part: u64, ks: usize, batch: usize, m: usize, n: usize, ldc: usize, c_bstride: usize, f32out: bool) -> Result<()> {
+        if ks <= 1 {
+            return Ok(());
+        }
+        let total = (batch * m * n) as u64;
+        self.k.cost(Cost::mem((total * 4 * ks as u64 + total * if f32out { 4 } else { 2 }) as f64));
+        self.launch(
+            "dsv_splitk_reduce",
+            [cdiv(total, 256).min(4096), 1, 1],
+            256,
+            0,
+            &[A::P(c), A::P(part), A::I(ks as i32), A::I(batch as i32), A::I(m as i32), A::I(n as i32), A::L(ldc as i64), A::L(c_bstride as i64), A::I(f32out as i32)],
         )
     }
     fn bf16w(&self, c: u64, a: u64, w: u64, ws: u64, m: usize, n: usize, kd: usize) -> Result<()> {
         let (mf, nf, kf) = (m as f64, n as f64, kd as f64);
         self.k.cost(Cost { flops: 2.0 * mf * nf * kf, bytes: mf * kf * 2.0 + nf * kf * if ws != 0 { 1.001 } else { 2.0 } + mf * nf * 2.0, peak: Peak::Bf16Mma });
+        let ks = ksplit(cdiv(n as u64, 128) * cdiv(m as u64, 64), kd / 32);
+        let part = if ks > 1 { self.arena.alloc((ks * m * n * 4) as u64)? } else { 0 };
         self.launch(
             "dsv_gemm_bf16w",
-            [cdiv(n as u64, 128), cdiv(m as u64, 64), 1],
+            [cdiv(n as u64, 128), cdiv(m as u64, 64), ks as u32],
             128,
             0,
-            &[A::P(c), A::P(a), A::P(w), A::P(ws), A::I(m as i32), A::I(n as i32), A::I(kd as i32), A::L(kd as i64), A::L(n as i64), A::I((ws != 0) as i32), A::I(0), A::L(0), A::L(0), A::L(0), A::L(0)],
-        )
+            &[A::P(c), A::P(a), A::P(w), A::P(ws), A::I(m as i32), A::I(n as i32), A::I(kd as i32), A::L(kd as i64), A::L(n as i64), A::I((ws != 0) as i32), A::I(0), A::L(0), A::L(0), A::L(0), A::L(0), A::I(ks as i32), A::P(part)],
+        )?;
+        self.splitk_reduce(c, part, ks, 1, m, n, n, 0, false)
     }
     #[allow(clippy::too_many_arguments)]
     fn f32gemm(&self, c: u64, a: u64, w: u64, m: usize, n: usize, kd: usize, a_bf16: bool, w_bf16: bool) -> Result<()> {
@@ -600,13 +623,17 @@ impl Stage {
         let kg = nh * hd / og;
         let ga = self.arena.alloc((t * og * or * 2) as u64)?;
         self.k.cost(Cost { flops: 2.0 * (t * og * or * kg) as f64, bytes: (t * nh * hd * 2) as f64 + (og * or * kg) as f64 * 1.001 + (t * og * or * 2) as f64, peak: Peak::Bf16Mma });
+        let ks = ksplit(cdiv(or as u64, 128) * cdiv(t as u64, 64) * og as u32, kg / 32);
+        let part = if ks > 1 { self.arena.alloc((ks * og * t * or * 4) as u64)? } else { 0 };
         self.launch(
             "dsv_gemm_bf16w",
-            [cdiv(or as u64, 128), cdiv(t as u64, 64), og as u32],
+            [cdiv(or as u64, 128), cdiv(t as u64, 64), (og * ks) as u32],
             128,
             0,
-            &[A::P(ga), A::P(o), A::P(ly.wo_a.w), A::P(ly.wo_a.s), A::I(t as i32), A::I(or as i32), A::I(kg as i32), A::L((nh * hd) as i64), A::L((og * or) as i64), A::I(1), A::I(0), A::L(kg as i64), A::L((or * kg) as i64), A::L(((or / 32) * (kg / 32)) as i64), A::L(or as i64)],
+            &[A::P(ga), A::P(o), A::P(ly.wo_a.w), A::P(ly.wo_a.s), A::I(t as i32), A::I(or as i32), A::I(kg as i32), A::L((nh * hd) as i64), A::L((og * or) as i64), A::I(1), A::I(0), A::L(kg as i64), A::L((or * kg) as i64), A::L(((or / 32) * (kg / 32)) as i64), A::L(or as i64), A::I(ks as i32), A::P(part)],
         )?;
+        // partials are [split][group][t][or]; the output row t holds the groups side by side
+        self.splitk_reduce(ga, part, ks, og, t, or, og * or, or, false)?;
         let gq = self.quant(ga, t, og * or)?;
         self.w8a8(out, gq, (ly.wo_b.w, ly.wo_b.s), t, h, og * or, false)?;
         let _ = rd;
@@ -664,11 +691,19 @@ impl Stage {
         let xq = self.quant(hn, t, h)?;
         let gu = self.arena.alloc((n * 2 * mi * 2) as u64)?;
         self.k.cost(Cost { flops: 2.0 * (n * 2 * mi * h) as f64, bytes: touched * (2 * mi) as f64 * (h as f64 / 2.0 + h as f64 / 32.0) + (n * h) as f64 + (n * 2 * mi * 2) as f64, peak: Peak::Fp8Mma });
+        // decode-sized steps: each routed expert holds a row or two, so the weight-streaming GEMV beats
+        // a 64-row MMA tile that would be almost all padding
+        let gemv = t <= MOE_GEMV_MAX_T;
+        let (name, grid, block, smem) = if gemv {
+            ("dsv_moe_gemv_fp4", [cdiv((2 * mi) as u64, 8), max_tiles as u32, 1], 256, 0)
+        } else {
+            ("dsv_moe_gemm_fp4", [cdiv((2 * mi) as u64, 128), max_tiles as u32, 1], 128, moe_smem(h))
+        };
         self.launch(
-            "dsv_moe_gemm_fp4",
-            [cdiv((2 * mi) as u64, 128), max_tiles as u32, 1],
-            128,
-            moe_smem(h),
+            name,
+            grid,
+            block,
+            smem,
             &[A::P(gu), A::P(xq.0), A::P(xq.1), A::P(ly.w13), A::P(ly.w13_s), A::P(tiles), A::P(meta), A::P(offs), A::P(rows), A::I(0), A::I((2 * mi) as i32), A::I(h as i32), A::L((2 * mi * h / 2) as i64), A::L((2 * mi * h / 32) as i64)],
         )?;
         let hq = self.arena.alloc((n * mi) as u64)?;
@@ -683,11 +718,16 @@ impl Stage {
         )?;
         let down = self.arena.alloc((n * h * 2) as u64)?;
         self.k.cost(Cost { flops: 2.0 * (n * h * mi) as f64, bytes: touched * h as f64 * (mi as f64 / 2.0 + mi as f64 / 32.0) + (n * mi) as f64 + (n * h * 2) as f64, peak: Peak::Fp8Mma });
+        let (name, grid, block, smem) = if gemv {
+            ("dsv_moe_gemv_fp4", [cdiv(h as u64, 8), max_tiles as u32, 1], 256, 0)
+        } else {
+            ("dsv_moe_gemm_fp4", [cdiv(h as u64, 128), max_tiles as u32, 1], 128, moe_smem(mi))
+        };
         self.launch(
-            "dsv_moe_gemm_fp4",
-            [cdiv(h as u64, 128), max_tiles as u32, 1],
-            128,
-            moe_smem(mi),
+            name,
+            grid,
+            block,
+            smem,
             &[A::P(down), A::P(hq), A::P(hs), A::P(ly.w2), A::P(ly.w2_s), A::P(tiles), A::P(meta), A::P(offs), A::P(rows), A::I(1), A::I(h as i32), A::I(mi as i32), A::L((h * mi / 2) as i64), A::L((h * mi / 32) as i64)],
         )?;
         // shared expert (fp8 weights, no routing weight)
@@ -754,6 +794,19 @@ impl Stage {
     pub fn alloc_persistent(&self, bytes: u64) -> Result<u64> {
         self.arena.alloc(bytes)
     }
+}
+
+/// Steps of at most this many tokens run the routed experts through `dsv_moe_gemv_fp4`.
+const MOE_GEMV_MAX_T: usize = 16;
+
+/// K splits for a GEMM of `tiles` output tiles over `kb` 32-wide K blocks: enough blocks for about
+/// two waves on the 132 SMs, each split keeping at least 4 K blocks; 1 when the grid already fills.
+fn ksplit(tiles: u32, kb: usize) -> usize {
+    const TARGET: u32 = 264;
+    if tiles >= TARGET / 2 {
+        return 1;
+    }
+    (TARGET.div_ceil(tiles.max(1)) as usize).min(kb / 4).max(1)
 }
 
 pub struct Meta {

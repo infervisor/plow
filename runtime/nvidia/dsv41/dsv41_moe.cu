@@ -287,6 +287,82 @@ DSV_EXTERN void __launch_bounds__(128)
         }
 }
 
+// Decode form of the grouped fp4 expert GEMM: the same math as dsv_moe_gemm_fp4 for tiles holding a
+// handful of rows, as one warp per output row streaming that row's packed weights (bandwidth-bound,
+// where the 64-row MMA tile would be almost all padding). Per 32-wide K block: the fp4 x e4m3
+// products are exact in fp32 (<= 6 significant bits), summed in fp32, then scaled by sa * sw into
+// the accumulator -- the MMA kernel's per-block promotion, in another summation order.
+// grid = (ceil(N / 8), tiles), 256 threads.
+__device__ __forceinline__ void e4m3x4_to_f32x4(uint32_t v, float* o) {
+    const __half2_raw lo = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(v & 0xffffu), __NV_E4M3);
+    const __half2_raw hi = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(v >> 16), __NV_E4M3);
+    const float2 a = __half22float2(*(const __half2*)&lo), b = __half22float2(*(const __half2*)&hi);
+    o[0] = a.x;
+    o[1] = a.y;
+    o[2] = b.x;
+    o[3] = b.y;
+}
+
+DSV_EXTERN void __launch_bounds__(256)
+    dsv_moe_gemv_fp4(bf16* __restrict__ C, const uint8_t* __restrict__ A, const uint8_t* __restrict__ sa,
+                     const uint8_t* __restrict__ W, const uint8_t* __restrict__ sw, const int* __restrict__ tiles,
+                     const int* __restrict__ meta, const int* __restrict__ offs, const int* __restrict__ rows,
+                     int a_by_row, int N, int K, long long w_estride, long long sw_estride) {
+    const int tile = blockIdx.y;
+    if (tile >= meta[0]) return;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n = blockIdx.x * 8 + warp;
+    if (n >= N) return;
+    const int e = tiles[tile * 2], row0 = tiles[tile * 2 + 1];
+    const int R = min(offs[e + 1], row0 + 64) - row0;
+    const int KB = K >> 5;
+    const uint8_t* wrow = W + (long long)e * w_estride + (long long)n * (K / 2);
+    const uint8_t* srow = sw + (long long)e * sw_estride + (long long)n * KB;
+    for (int tb = 0; tb < R; tb += 8) {
+        const int nt = min(8, R - tb);
+        int tok[8];
+#pragma unroll
+        for (int t = 0; t < 8; t++) tok[t] = t < nt ? (a_by_row ? row0 + tb + t : rows[row0 + tb + t]) : -1;
+        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        for (int kb = lane; kb < KB; kb += 32) {
+            const uint4 raw = *(const uint4*)(wrow + kb * 16);
+            const float ws = e8m0_to_f(srow[kb]);
+            // 32 weights as f32, via the exact fp4 -> e4m3 -> f16 path
+            float w[32];
+            const uint32_t rw[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                e4m3x4_to_f32x4(e2m1x4_to_e4m3x4(rw[q] & 0xffffu), &w[q * 8]);
+                e4m3x4_to_f32x4(e2m1x4_to_e4m3x4(rw[q] >> 16), &w[q * 8 + 4]);
+            }
+#pragma unroll
+            for (int t = 0; t < 8; t++) {
+                if (tok[t] < 0) continue;
+                const uint8_t* ap = A + (long long)tok[t] * K + kb * 32;
+                const uint4 a0 = *(const uint4*)ap, a1 = *(const uint4*)(ap + 16);
+                const uint32_t ra[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+                float d = 0.f;
+#pragma unroll
+                for (int q = 0; q < 8; q++) {
+                    float a[4];
+                    e4m3x4_to_f32x4(ra[q], a);
+                    // each product is exact in f32; the block sum is fp32 as in the MMA
+                    d = fmaf(w[q * 4 + 0], a[0], d);
+                    d = fmaf(w[q * 4 + 1], a[1], d);
+                    d = fmaf(w[q * 4 + 2], a[2], d);
+                    d = fmaf(w[q * 4 + 3], a[3], d);
+                }
+                acc[t] += d * e8m0_to_f(sa[(long long)tok[t] * KB + kb]) * ws;
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < 8; t++) {
+            const float v = warp_sum(acc[t]);
+            if (lane == 0 && t < nt) C[(long long)(row0 + tb + t) * N + n] = f2bf(v);
+        }
+    }
+}
+
 // SwiGLU (model.py Expert.forward) fused with the down projection's act_quant:
 // h = bf16(silu(min(g, lim)) * clamp(u, -lim, lim) * w), then e4m3 per 32 with a ue8m0 scale.
 // gate [R][I] / up [R][I] bf16 (separate buffers, or one with up_off), w optional per-row weight.

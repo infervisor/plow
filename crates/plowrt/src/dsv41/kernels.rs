@@ -15,7 +15,7 @@ use crate::device::Backend;
 use crate::error::{Result, RuntimeError};
 
 /// Must equal `dsv41_abi_version` in `runtime/nvidia/dsv41/dsv41_common.cuh`.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// One kernel argument, held by value until the launch copies it.
 #[derive(Clone, Copy)]
@@ -44,6 +44,7 @@ const NAMES: &[&str] = &[
     "dsv_fp4_fakequant",
     "dsv_gemm_w8a8",
     "dsv_gemm_bf16w",
+    "dsv_splitk_reduce",
     "dsv_gemm_f32",
     "dsv_gemm_f32_dot",
     "dsv_gemm_f32_rows",
@@ -73,6 +74,7 @@ const NAMES: &[&str] = &[
     "dsv_moe_offsets",
     "dsv_moe_fill",
     "dsv_moe_gemm_fp4",
+    "dsv_moe_gemv_fp4",
     "dsv_swiglu_quant",
     "dsv_moe_combine",
     "dsv_gather_rows",

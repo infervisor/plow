@@ -15,7 +15,7 @@ typedef __nv_bfloat16 bf16;
 
 // Kernel signature version; the host (crates/plowrt/src/dsv41/kernels.rs ABI_VERSION) refuses a
 // cubin whose value differs. Bump both whenever any kernel's parameter list changes.
-extern "C" __constant__ unsigned dsv41_abi_version = 2;
+extern "C" __constant__ unsigned dsv41_abi_version = 3;
 
 __device__ __forceinline__ float bf2f(bf16 v) { return __bfloat162float(v); }
 __device__ __forceinline__ bf16 f2bf(float v) { return __float2bfloat16_rn(v); }

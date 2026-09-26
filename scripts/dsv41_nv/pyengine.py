@@ -220,7 +220,7 @@ class Engine:
         N = w.shape[0]
         c = torch.empty(M, N, dtype=torch.float32 if out_f32 else torch.bfloat16, device=self.dev)
         self.K.launch("dsv_gemm_w8a8", ((N + 127) // 128, (M + 63) // 64), (128,),
-                      [c, q, s, w, ws, i32(M), i32(N), i32(Kd), i64(N), i32(int(out_f32))])
+                      [c, q, s, w, ws, i32(M), i32(N), i32(Kd), i64(N), i32(int(out_f32)), i32(1), None])
         return c
 
     def bf16w(self, a, w, ws=None, out_f32=False):
@@ -229,7 +229,7 @@ class Engine:
         c = torch.empty(M, N, dtype=torch.float32 if out_f32 else torch.bfloat16, device=self.dev)
         self.K.launch("dsv_gemm_bf16w", ((N + 127) // 128, (M + 63) // 64, 1), (128,),
                       [c, a, w, ws, i32(M), i32(N), i32(Kd), i64(Kd), i64(N), i32(int(ws is not None)), i32(int(out_f32)),
-                       i64(0), i64(0), i64(0), i64(0)])
+                       i64(0), i64(0), i64(0), i64(0), i32(1), None])
         return c
 
     def f32gemm(self, a, w):
@@ -402,7 +402,7 @@ class Engine:
         KG = NH * HD // OG
         self.K.launch("dsv_gemm_bf16w", ((OR + 127) // 128, (T + 63) // 64, OG), (128,),
                       [ga, o, ly.wo_a, ly.wo_a_s, i32(T), i32(OR), i32(KG), i64(NH * HD), i64(OG * OR), i32(1), i32(0),
-                       i64(KG), i64(OR * KG), i64((OR // 32) * (KG // 32)), i64(OR)])
+                       i64(KG), i64(OR * KG), i64((OR // 32) * (KG // 32)), i64(OR), i32(1), None])
         return self.w8a8(self.quant(ga), ly.wo_b, ly.wo_b_s)
 
 

@@ -91,5 +91,21 @@ for T in Ts:
     ms = ev[0].elapsed_time(ev[1]) / reps
     n_exp = len(set(idx.flatten().tolist()))
     wbytes = n_exp * 2 * MI * (H // 2 + H // 32)
-    print(f"T={T:5d} experts={n_exp:3d} rows={n:6d}: {ms*1e3:8.1f} us  weights {wbytes/1e6:7.1f} MB -> {wbytes/ms/1e6:7.2f} TB/s  "
+    print(f"T={T:5d} experts={n_exp:3d} rows={n:6d} mma : {ms*1e3:8.1f} us  weights {wbytes/1e6:7.1f} MB -> {wbytes/ms/1e6:7.2f} TB/s  "
           f"| rel err vs fp4_gemm {worst:.2e} {'PASS' if worst < 5e-3 else 'FAIL'}", flush=True)
+    if T <= 64:  # the decode (GEMV) form
+        C2 = torch.empty_like(C)
+        gargs = [C2, xq.view(torch.uint8), xs.view(torch.uint8), w13, s13, tiles, meta, offs, rows, i32(0), i32(2 * MI), i32(H),
+                 i64(2 * MI * H // 2), i64(2 * MI * H // 32)]
+        grid = ((2 * MI + 7) // 8, max_tiles)
+        K.launch("dsv_moe_gemv_fp4", grid, (256,), gargs)
+        torch.cuda.synchronize()
+        g_err = ((C2.float() - C.float()).norm() / C.float().norm()).item()
+        ev[0].record()
+        for _ in range(reps):
+            K.launch("dsv_moe_gemv_fp4", grid, (256,), gargs)
+        ev[1].record()
+        torch.cuda.synchronize()
+        gms = ev[0].elapsed_time(ev[1]) / reps
+        print(f"T={T:5d} experts={n_exp:3d} rows={n:6d} gemv: {gms*1e3:8.1f} us  weights {wbytes/1e6:7.1f} MB -> {wbytes/gms/1e6:7.2f} TB/s  "
+              f"| rel diff vs mma {g_err:.2e} {'PASS' if g_err < 5e-3 else 'FAIL'}", flush=True)

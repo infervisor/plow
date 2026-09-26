@@ -41,7 +41,7 @@ __device__ __forceinline__ void mma_bf16(float* c, const uint32_t* a, const uint
 DSV_EXTERN void __launch_bounds__(128)
     dsv_gemm_w8a8(void* __restrict__ C, const uint8_t* __restrict__ A, const uint8_t* __restrict__ sa,
                   const uint8_t* __restrict__ W, const uint8_t* __restrict__ sw, int M, int N, int K,
-                  long long ldc, int c_f32) {
+                  long long ldc, int c_f32, int ksplit, float* __restrict__ part) {
     __shared__ __align__(16) uint8_t As[2][W8_BM * W8_LD];
     __shared__ __align__(16) uint8_t Ws[2][W8_BN * W8_LD];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -49,6 +49,9 @@ DSV_EXTERN void __launch_bounds__(128)
     const int g = lane >> 2, t4 = lane & 3;
     const int m0 = blockIdx.y * W8_BM, n0 = blockIdx.x * W8_BN;
     const int KB = K >> 5;
+    // split-K: this block owns K blocks [kb0, kb1) (ksplit 1: all of them)
+    const int split = blockIdx.z;
+    const int kb0 = (int)((long long)KB * split / ksplit), kb1 = (int)((long long)KB * (split + 1) / ksplit);
 
     auto load = [&](int stage, int kb) {
         // A: 64 rows x 32 B = 128 chunks of 16 B; W: 128 rows x 32 B = 256 chunks.
@@ -88,10 +91,10 @@ DSV_EXTERN void __launch_bounds__(128)
     const int nb0 = min(n0 + wn * 64, N - 1) >> 5, nb1 = min(n0 + wn * 64 + 32, N - 1) >> 5;
     const int NB = (N + 31) >> 5;
 
-    load(0, 0);
-    for (int kb = 0; kb < KB; kb++) {
-        const int st = kb & 1;
-        if (kb + 1 < KB) {
+    load(0, kb0);
+    for (int kb = kb0; kb < kb1; kb++) {
+        const int st = (kb - kb0) & 1;
+        if (kb + 1 < kb1) {
             load(st ^ 1, kb + 1);
             CP_ASYNC_WAIT(1);
         } else {
@@ -144,7 +147,11 @@ DSV_EXTERN void __launch_bounds__(128)
                 const int n = n0 + wn * 64 + j * 8 + t4 * 2;
                 if (n >= N) continue;
                 const float v0 = acc[i][j][h * 2], v1 = acc[i][j][h * 2 + 1];
-                if (c_f32) {
+                if (ksplit > 1) {
+                    float* pp = part + ((long long)split * M + m) * N + n;
+                    pp[0] = v0;
+                    if (n + 1 < N) pp[1] = v1;
+                } else if (c_f32) {
                     float* cp = (float*)C + (long long)m * ldc + n;
                     cp[0] = v0;
                     if (n + 1 < N) cp[1] = v1;
@@ -166,16 +173,19 @@ DSV_EXTERN void __launch_bounds__(128)
     dsv_gemm_bf16w(void* __restrict__ C, const bf16* __restrict__ A, const void* __restrict__ W,
                    const uint8_t* __restrict__ sw, int M, int N, int K, long long lda, long long ldc,
                    int w_fp8, int c_f32, long long a_bstride, long long w_bstride, long long sw_bstride,
-                   long long c_bstride) {
+                   long long c_bstride, int ksplit, float* __restrict__ part) {
     __shared__ __align__(16) bf16 As[64 * BW_LD];
     __shared__ __align__(16) bf16 Ws[128 * BW_LD];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp >> 1, wn = warp & 1;
     const int g = lane >> 2, t4 = lane & 3;
     const int m0 = blockIdx.y * 64, n0 = blockIdx.x * 128;
-    const int bz = blockIdx.z;
+    // grid.z = batch * ksplit: batch entry bz, K split `split` owning K blocks [kb0, kb1)
+    const int bz = blockIdx.z / ksplit, split = blockIdx.z % ksplit;
+    const int nbatch = gridDim.z / ksplit;
     A += bz * a_bstride;
     const int KB = K >> 5;
+    const int kb0 = (int)((long long)KB * split / ksplit), kb1 = (int)((long long)KB * (split + 1) / ksplit);
     const int NB = (N + 31) >> 5;
 
     float acc[2][8][4];
@@ -186,7 +196,7 @@ DSV_EXTERN void __launch_bounds__(128)
 #pragma unroll
             for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
 
-    for (int kb = 0; kb < KB; kb++) {
+    for (int kb = kb0; kb < kb1; kb++) {
         // A: 64 rows x 32 bf16; each thread 16 elements (2 x uint4)
 #pragma unroll
         for (int i = 0; i < 2; i++) {
@@ -257,7 +267,11 @@ DSV_EXTERN void __launch_bounds__(128)
                 const int n = n0 + wn * 64 + j * 8 + t4 * 2;
                 if (n >= N) continue;
                 const float v0 = acc[i][j][h * 2], v1 = acc[i][j][h * 2 + 1];
-                if (c_f32) {
+                if (ksplit > 1) {
+                    float* pp = part + (((long long)split * nbatch + bz) * M + m) * N + n;
+                    pp[0] = v0;
+                    if (n + 1 < N) pp[1] = v1;
+                } else if (c_f32) {
                     float* cp = (float*)C + bz * c_bstride + (long long)m * ldc + n;
                     cp[0] = v0;
                     if (n + 1 < N) cp[1] = v1;
@@ -268,6 +282,23 @@ DSV_EXTERN void __launch_bounds__(128)
                 }
             }
         }
+}
+
+// Split-K reduction: C[b][m][n] = sum over splits in order of part[s][b][m][n] (deterministic).
+// part is [ksplit][batch][M][N] f32; C row stride ldc, batch stride c_bstride, bf16 or f32.
+DSV_EXTERN void dsv_splitk_reduce(void* __restrict__ C, const float* __restrict__ part, int ksplit, int batch, int M, int N,
+                                  long long ldc, long long c_bstride, int c_f32) {
+    const long long total = (long long)batch * M * N;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long)gridDim.x * blockDim.x) {
+        float v = 0.f;
+        for (int s = 0; s < ksplit; s++) v += part[(long long)s * total + i];
+        const int b = (int)(i / ((long long)M * N));
+        const long long r = i % ((long long)M * N);
+        const int m = (int)(r / N), n = (int)(r % N);
+        const long long o = b * c_bstride + (long long)m * ldc + n;
+        if (c_f32) ((float*)C)[o] = v;
+        else ((bf16*)C)[o] = f2bf(v);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------

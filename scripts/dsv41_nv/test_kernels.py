@@ -105,7 +105,7 @@ if want("gemm_w8a8"):
             "dsv_gemm_w8a8",
             ((N + 127) // 128, (M + 63) // 64),
             (128,),
-            [c, xq.view(torch.uint8), xs.view(torch.uint8), w.view(torch.uint8), ws, i32(M), i32(N), i32(Kd), i64(N), i32(1)],
+            [c, xq.view(torch.uint8), xs.view(torch.uint8), w.view(torch.uint8), ws, i32(M), i32(N), i32(Kd), i64(N), i32(1), i32(1), None],
         )
         r = rel(c, ref)
         check(f"gemm_w8a8 M={M} N={N} K={Kd}", r < 2e-3, f"rel={r:.3g}")
@@ -128,7 +128,7 @@ if want("gemm_bf16w"):
             "dsv_gemm_bf16w",
             ((N + 127) // 128, (M + 63) // 64, 1),
             (128,),
-            [c, x, wp, wsp, i32(M), i32(N), i32(Kd), i64(Kd), i64(N), i32(fp8), i32(0), i64(0), i64(0), i64(0), i64(0)],
+            [c, x, wp, wsp, i32(M), i32(N), i32(Kd), i64(Kd), i64(N), i32(fp8), i32(0), i64(0), i64(0), i64(0), i64(0), i32(1), None],
         )
         r = rel(c, ref)
         check(f"gemm_bf16w M={M} N={N} K={Kd} fp8={fp8}", r < 5e-3, f"rel={r:.3g}")
@@ -143,6 +143,44 @@ if want("gemm_f32"):
         K.launch("dsv_gemm_f32", ((N + 63) // 64, (M + 63) // 64), (256,), [c, a, w, i32(M), i32(N), i32(Kd), i64(Kd), i64(N), i32(abf), i32(wbf)])
         r = rel(c, ref)
         check(f"gemm_f32 M={M} N={N} K={Kd}", r < 1e-5, f"rel={r:.3g}")
+
+# ------------------------------------------------------------------------------------------ split-K
+if want("splitk"):
+    kr = ref_kernels()
+    for M, N, Kd, ks in ((9, 5120, 8192, 4), (1, 1280, 5120, 8)):
+        x = torch.randn(M, Kd, device=dev)
+        w = (torch.randn(N, Kd, device=dev) * 0.05).to(torch.float8_e4m3fn)
+        ws = torch.randint(118, 124, ((N + 31) // 32, Kd // 32), device=dev, dtype=torch.uint8)
+        xq, xs = kr.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
+        base = torch.empty(M, N, device=dev, dtype=torch.float32)
+        K.launch("dsv_gemm_w8a8", ((N + 127) // 128, (M + 63) // 64, 1), (128,),
+                 [base, xq.view(torch.uint8), xs.view(torch.uint8), w.view(torch.uint8), ws, i32(M), i32(N), i32(Kd), i64(N), i32(1), i32(1), None])
+        part = torch.empty(ks, M, N, device=dev, dtype=torch.float32)
+        c = torch.empty(M, N, device=dev, dtype=torch.float32)
+        K.launch("dsv_gemm_w8a8", ((N + 127) // 128, (M + 63) // 64, ks), (128,),
+                 [c, xq.view(torch.uint8), xs.view(torch.uint8), w.view(torch.uint8), ws, i32(M), i32(N), i32(Kd), i64(N), i32(1), i32(ks), part])
+        K.launch("dsv_splitk_reduce", ((M * N + 255) // 256,), (256,), [c, part, i32(ks), i32(1), i32(M), i32(N), i64(N), i64(0), i32(1)])
+        r = rel(c, base)
+        check(f"w8a8 split-K {ks} M={M} N={N} K={Kd}", r < 1e-5, f"rel vs unsplit={r:.3g}")
+    # bf16w batched (the wo_a shape): 8 groups x (T x 4096 -> 1024)
+    T, G, OR, KG = 3, 8, 1024, 4096
+    o = torch.randn(T, G * KG, device=dev)
+    wa = (torch.randn(G * OR, KG, device=dev) * 0.05).to(torch.float8_e4m3fn)
+    was = torch.randint(118, 124, (G * OR // 32, KG // 32), device=dev, dtype=torch.uint8)
+    def woa(ks):
+        c = torch.empty(T, G * OR, device=dev)
+        part = torch.empty(ks, G, T, OR, device=dev, dtype=torch.float32) if ks > 1 else None
+        K.launch("dsv_gemm_bf16w", ((OR + 127) // 128, (T + 63) // 64, G * ks), (128,),
+                 [c, o, wa.view(torch.uint8), was, i32(T), i32(OR), i32(KG), i64(G * KG), i64(G * OR), i32(1), i32(0),
+                  i64(KG), i64(OR * KG), i64((OR // 32) * (KG // 32)), i64(OR), i32(ks), part])
+        if ks > 1:
+            K.launch("dsv_splitk_reduce", ((G * T * OR + 255) // 256,), (256,), [c, part, i32(ks), i32(G), i32(T), i32(OR), i64(G * OR), i64(OR), i32(0)])
+        return c
+    a1, a4 = woa(1), woa(4)
+    wd = (wa.float() * torch.pow(2.0, was.float() - 127).repeat_interleave(32, 0).repeat_interleave(32, 1)).view(G, OR, KG)
+    ref = torch.einsum("tgk,grk->tgr", o.float().view(T, G, KG), wd).reshape(T, G * OR)
+    r1, r4 = rel(a1, ref), rel(a4, ref)
+    check("bf16w batched split-K 4 (wo_a)", r1 < 5e-3 and r4 < 5e-3, f"rel unsplit={r1:.3g} split={r4:.3g}")
 
 # ------------------------------------------------------------------------------------------ fp32 dot / rows forms
 if want("gemm_f32_small"):
