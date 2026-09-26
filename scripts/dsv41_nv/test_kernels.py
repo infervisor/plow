@@ -247,6 +247,24 @@ if want("wg"):
     check("wg_fp4 grouped (gathered A)", worst < 3e-3 and not C.isnan().any().item(), f"rel vs fp4_gemm={worst:.3g}")
     check("wg_fp4 grouped (a_by_row == gathered)", torch.equal(C, C2))
 
+if want("gemv"):
+    # decode W8A8 GEMV (swap-AB) against fp8_gemm, unsplit and split-K, ragged N
+    kr = ref_kernels()
+    for M, N, Kd, ks in ((1, 1280, 5120, 1), (5, 1000, 2304, 4), (16, 4608, 1280, 8), (12, 512, 5120, 16)):
+        x = torch.randn(M, Kd, device=dev).bfloat16()
+        w = (torch.randn(N, Kd, device=dev) * 0.05).to(torch.float8_e4m3fn)
+        ws = torch.randint(118, 124, ((N + 31) // 32, Kd // 32), device=dev, dtype=torch.uint8)
+        xq, xs = kr.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
+        ref = kr.fp8_gemm(xq, xs, w, ws.view(torch.float8_e8m0fnu), torch.float8_e8m0fnu, 32).float()
+        c = torch.empty(M, N, device=dev, dtype=torch.float32)
+        part = torch.empty(ks, M, N, device=dev, dtype=torch.float32) if ks > 1 else None
+        K.launch("dsv_gemv_w8a8_t8" if M <= 8 else "dsv_gemv_w8a8_t16", ((N + 63) // 64, ks), (128,),
+                 [c, xq.view(torch.uint8), xs.view(torch.uint8), w.view(torch.uint8), ws, i32(M), i32(N), i32(Kd), i64(N), i32(1), part])
+        if ks > 1:
+            K.launch("dsv_splitk_reduce", ((M * N + 255) // 256,), (256,), [c, part, i32(ks), i32(1), i32(M), i32(N), i64(N), i64(0), i32(1)])
+        r = rel(c, ref)
+        check(f"gemv_w8a8 M={M} N={N} K={Kd} ks={ks}", r < 3e-3, f"rel vs fp8_gemm={r:.3g}")
+
 if want("sparse_split"):
     # split-KV sparse attention + merge against the unsplit kernel: decode rows over a window ring
     # and compressed picks, with -1 holes and one row that has no valid index (sink-only zeros)

@@ -81,6 +81,7 @@ TTFT under concurrency includes queueing behind other prefills.)
 | fp32 GEMM dispatch: dot form only for M <= 64 and M*N <= 2^20 (the router at M=64 was 6 tiles; the vocab head is not a dot-form shape) | decode B=64 | 25 ms (tiled router) / 73 ms (dot head) | 6 ms |
 | Hopper wgmma prefill GEMMs (`dsv41_wg.cu`): producer warpgroup decodes fp8 / fp4 weights to bf16 in 128B-swizzled smem (bit placement: e4m3 bits in bf16 position are the value * 2^-120, one bf16x2 multiply applies 2^(120+S)); A is the fake-quantized bf16 activation (`act_quant` fq); two consumer warpgroups on m64n256k16; mbarrier ring, cp.async with noinc arrive; scale loads prefetched a lookahead ahead | prefill 16k | 3916 ms (MoE 1574, W8A8 912, wo_a 413) | 2594 ms (MoE 893, dense 671) |
 | same, at 4k / 1k | prefill | 1095 / 367 ms | 818 / 338 ms |
+| decode W8A8 as a swap-AB tensor-core GEMV (weights on the MMA's M side straight from memory, tokens on N; a K permutation inside each scale block lets every lane load 8 contiguous bytes per row; split-K into the ordered reduce) for M <= 16 | decode B=1 | 22.9 ms (W8A8 6.3 ms, 0.87 TB/s) | 20.2 ms (bench_gemv.py: 2.3-3.2 TB/s on the large shapes) |
 
 The wgmma kernels are 1.6-1.8x the mma.sync ones (bench_wg.py: ~350 TFLOP/s dense, ~320 grouped
 fp4 at 16k rows) and bit-identical or at bf16 rounding against kernel.py (`test_kernels.py wg`); on

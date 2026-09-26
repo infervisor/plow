@@ -285,6 +285,98 @@ DSV_EXTERN void __launch_bounds__(128)
         }
 }
 
+// Decode W8A8 (M <= 8 * NT tokens): swap-AB tensor-core GEMV. The weights are the MMA's M side,
+// straight from global memory (fp8 needs no decode), the tokens its N side (NT n8 tiles). Per 32-wide
+// K block a lane loads 8 contiguous bytes at t4 * 8 of its two weight rows (g, g + 8) and of its token
+// column: the low word feeds MMA k t4*4 .. +3, the high word k 16 + t4*4 .. +3, on both operands --
+// a K permutation inside one scale block, so each MMA is still exactly one block, promoted with
+// sw[n/32][kb] (one per 16-row warp tile) * sa[token][kb] as kernel.py's fp8_gemm does. Warp loads
+// cover whole 32 B sectors; GV8_U blocks are loaded before any MMA. Block: 4 warps = 64 weight rows;
+// grid = (ceil(N / 64), ksplit). ksplit > 1 writes part [ksplit][M][N] f32 for dsv_splitk_reduce.
+#define GV8_U 4
+template <int NT>
+__device__ __forceinline__ void gemv_w8a8_body(void* __restrict__ C, const uint8_t* __restrict__ A, const uint8_t* __restrict__ sa,
+                                               const uint8_t* __restrict__ W, const uint8_t* __restrict__ sw, int M, int N, int K,
+                                               long long ldc, int c_f32, float* __restrict__ part) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t4 = lane & 3;
+    const int n0 = (blockIdx.x * 4 + warp) * 16;
+    if (n0 >= N) return;
+    const int KB = K >> 5;
+    const int split = blockIdx.y, ksplit = gridDim.y;
+    const int kb0 = (int)((long long)KB * split / ksplit), kb1 = (int)((long long)KB * (split + 1) / ksplit);
+    const uint8_t* w0 = W + (long long)min(n0 + g, N - 1) * K + t4 * 8;
+    const uint8_t* w1 = W + (long long)min(n0 + g + 8, N - 1) * K + t4 * 8;
+    const uint8_t* swr = sw + (long long)(n0 >> 5) * KB;
+    const uint8_t* ab[NT];
+    bool av[NT];
+#pragma unroll
+    for (int j = 0; j < NT; j++) {
+        const int tk = j * 8 + g;
+        av[j] = tk < M;
+        ab[j] = A + (long long)min(tk, M - 1) * K + t4 * 8;
+    }
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    auto block = [&](int kb, uint2 wa, uint2 wb, const uint2* x) {
+        const float swv = e8m0_to_f(swr[kb]);
+        const uint32_t a[4] = {wa.x, wb.x, wa.y, wb.y};
+#pragma unroll
+        for (int j = 0; j < NT; j++) {
+            const uint32_t b[2] = {x[j].x, x[j].y};
+            float tt[4] = {0.f, 0.f, 0.f, 0.f};
+            mma_e4m3(tt, a, b);
+            const int tc = j * 8 + t4 * 2;
+            const float s0 = tc < M ? e8m0_to_f(sa[(long long)tc * KB + kb]) * swv : 0.f;
+            const float s1 = tc + 1 < M ? e8m0_to_f(sa[(long long)(tc + 1) * KB + kb]) * swv : 0.f;
+            acc[j][0] += tt[0] * s0;
+            acc[j][1] += tt[1] * s1;
+            acc[j][2] += tt[2] * s0;
+            acc[j][3] += tt[3] * s1;
+        }
+    };
+    int kb = kb0;
+    for (; kb + GV8_U <= kb1; kb += GV8_U) {
+        uint2 wa[GV8_U], wb[GV8_U], x[GV8_U][NT];
+#pragma unroll
+        for (int u = 0; u < GV8_U; u++) {
+            wa[u] = __ldg((const uint2*)(w0 + (long long)(kb + u) * 32));
+            wb[u] = __ldg((const uint2*)(w1 + (long long)(kb + u) * 32));
+#pragma unroll
+            for (int j = 0; j < NT; j++) x[u][j] = av[j] ? *(const uint2*)(ab[j] + (long long)(kb + u) * 32) : make_uint2(0, 0);
+        }
+#pragma unroll
+        for (int u = 0; u < GV8_U; u++) block(kb + u, wa[u], wb[u], x[u]);
+    }
+    for (; kb < kb1; kb++) {
+        uint2 x[NT];
+#pragma unroll
+        for (int j = 0; j < NT; j++) x[j] = av[j] ? *(const uint2*)(ab[j] + (long long)kb * 32) : make_uint2(0, 0);
+        block(kb, __ldg((const uint2*)(w0 + (long long)kb * 32)), __ldg((const uint2*)(w1 + (long long)kb * 32)), x);
+    }
+    // c0 (n g, token t4*2), c1 (n g, token +1), c2 (n g+8, token), c3 (n g+8, token +1)
+#pragma unroll
+    for (int j = 0; j < NT; j++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const int n = n0 + g + (e >> 1) * 8, tk = j * 8 + t4 * 2 + (e & 1);
+            if (n >= N || tk >= M) continue;
+            if (part) part[((long long)split * M + tk) * N + n] = acc[j][e];
+            else if (c_f32) ((float*)C)[(long long)tk * ldc + n] = acc[j][e];
+            else ((bf16*)C)[(long long)tk * ldc + n] = f2bf(acc[j][e]);
+        }
+}
+#define DSV_GEMV_W8A8(name, NT)                                                                                            \
+    DSV_EXTERN void __launch_bounds__(128)                                                                                \
+        name(void* __restrict__ C, const uint8_t* __restrict__ A, const uint8_t* __restrict__ sa, const uint8_t* __restrict__ W, \
+             const uint8_t* __restrict__ sw, int M, int N, int K, long long ldc, int c_f32, float* __restrict__ part) {         \
+        gemv_w8a8_body<NT>(C, A, sa, W, sw, M, N, K, ldc, c_f32, part);                                                   \
+    }
+DSV_GEMV_W8A8(dsv_gemv_w8a8_t8, 1)
+DSV_GEMV_W8A8(dsv_gemv_w8a8_t16, 2)
+DSV_GEMV_W8A8(dsv_gemv_w8a8_t32, 4)
+
 // Split-K reduction: C[b][m][n] = sum over splits in order of part[s][b][m][n] (deterministic).
 // part is [ksplit][batch][M][N] f32; C row stride ldc, batch stride c_bstride, bf16 or f32.
 DSV_EXTERN void dsv_splitk_reduce(void* __restrict__ C, const float* __restrict__ part, int ksplit, int batch, int M, int N,

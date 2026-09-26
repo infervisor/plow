@@ -271,6 +271,20 @@ impl Stage {
         if qs.2 != 0 && wg_fits(m, n, kd, 1) {
             return self.wg_fp8(c, qs.2, w, m, n, kd, kd, n, f32out, 1, [0; 4]);
         }
+        if m <= GEMV_MAX_M {
+            // decode: the swap-AB tensor-core GEMV streams the weights (bench_gemv.py: 1.3-3x the tile kernel)
+            let gx = cdiv(n as u64, 64);
+            let ks = gemv_ksplit(gx as usize, kd / 32);
+            let part = if ks > 1 { self.arena.alloc((ks * m * n * 4) as u64)? } else { 0 };
+            self.launch(
+                if m <= 8 { "dsv_gemv_w8a8_t8" } else { "dsv_gemv_w8a8_t16" },
+                [gx, ks as u32, 1],
+                128,
+                0,
+                &[A::P(c), A::P(qs.0), A::P(qs.1), A::P(w.0), A::P(w.1), A::I(m as i32), A::I(n as i32), A::I(kd as i32), A::L(n as i64), A::I(f32out as i32), A::P(part)],
+            )?;
+            return self.splitk_reduce(c, part, ks, 1, m, n, n, 0, f32out);
+        }
         let tiles = cdiv(n as u64, 128) * cdiv(m as u64, 64);
         let ks = ksplit(tiles, kd / 32);
         let part = if ks > 1 { self.arena.alloc((ks * m * n * 4) as u64)? } else { 0 };
@@ -865,6 +879,14 @@ impl Stage {
     pub fn alloc_persistent(&self, bytes: u64) -> Result<u64> {
         self.arena.alloc(bytes)
     }
+}
+
+/// Rows up to which the W8A8 GEMMs take the decode GEMV (`dsv_gemv_w8a8_t8/t16`).
+const GEMV_MAX_M: usize = 16;
+/// GEMV K splits: about 640 blocks of 4 warps (~5 per SM), a power of two, each split >= 4 K blocks.
+fn gemv_ksplit(gx: usize, kb: usize) -> usize {
+    let want = (640 / gx.max(1)).min(kb / 4).max(1);
+    1 << (usize::BITS - 1 - want.leading_zeros())
 }
 
 /// e4m3 codes, ue8m0 scales and (prefill) the dequantized bf16 copy of an activation.
