@@ -85,104 +85,77 @@ impl T3Contract {
     }
 }
 
-/// `chatterbox.tts.punc_norm`, verbatim in behaviour.
-pub fn punc_norm(text: &str) -> String {
-    if text.is_empty() {
-        return "You need to add some text for me to talk.".into();
-    }
-    let mut t: String = text.to_string();
-    let mut chars = t.chars();
-    if let Some(c0) = chars.next() {
-        if c0.is_lowercase() {
-            t = c0.to_uppercase().chain(chars).collect();
-        }
-    }
-    t = t.split_whitespace().collect::<Vec<_>>().join(" ");
-    for (a, b) in [
-        ("...", ", "),
-        ("…", ", "),
-        (":", ","),
-        (" - ", ", "),
-        (";", ", "),
-        ("—", "-"),
-        ("–", "-"),
-        (" ,", ","),
-        ("“", "\""),
-        ("”", "\""),
-        ("‘", "'"),
-        ("’", "'"),
-    ] {
-        t = t.replace(a, b);
-    }
-    let t = t.trim_end_matches(' ').to_string();
-    if [".", "!", "?", "-", ","].iter().any(|e| t.ends_with(e)) {
-        t
-    } else {
-        t + "."
-    }
-}
-
 /// Little-endian f32s from bytes of any alignment (mmap'd safetensors data need not be aligned).
 fn le_f32s(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
-/// Host tables for prefill rows, read from the checkpoint the prep script wrote.
+/// Host tables for prefill rows (`in.prompt.*` packet tensors) and the packet's text rules.
 pub struct T3Tables {
     hidden: usize,
     text_emb: Vec<f32>,
     text_pos: Vec<f32>,
     bos: Vec<f32>,
+    bos_repeat: usize,
+    uncond_drops_text: bool,
     voices: HashMap<String, Vec<f32>>,
+    rules: String,
     tokenizer: tokenizers::Tokenizer,
 }
 
 impl T3Tables {
     pub fn load(assets: &Path, hidden: usize) -> Result<Self> {
-        let ckpt = assets.join("checkpoint");
-        let path = ckpt.join("model.safetensors");
-        let file = std::fs::File::open(&path).map_err(|source| RuntimeError::Io { path: path.clone(), source })?;
-        // SAFETY: read-only map of an immutable checkpoint file.
-        let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|source| RuntimeError::Io { path: path.clone(), source })?;
-        let st = safetensors::SafeTensors::deserialize(&map)
-            .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", path.display())))?;
-        let f32s = |name: &str| -> Result<Vec<f32>> {
-            let t = st.tensor(name).map_err(|e| RuntimeError::Rejected(format!("{name}: {e}")))?;
-            if t.dtype() != safetensors::Dtype::F32 {
-                return Err(RuntimeError::Rejected(format!("{name}: expected f32")));
-            }
-            Ok(le_f32s(t.data()))
+        let path = assets.join("model.pkt");
+        let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io { path: path.clone(), source })?;
+        let blob = crate::asset::devblob::DevBlob::parse(&raw)?;
+        let host = |name: &str| -> Option<Vec<f32>> {
+            let t = blob.tensors.iter().find(|t| t.name == name)?;
+            Some(le_f32s(&blob.init[t.init.clone()?]))
         };
-        let (text_emb, text_pos, bos) = (f32s("t3.text_emb.weight")?, f32s("t3.text_pos_emb.weight")?, f32s("t3.speech_bos")?);
+        let need = |name: &str| host(name).ok_or_else(|| RuntimeError::Rejected(format!("packet lacks {name}")));
+        let (text_emb, text_pos, bos) = (need("in.prompt.text_table")?, need("in.prompt.text_pos")?, need("in.prompt.bos_row")?);
         if bos.len() != hidden || text_emb.len() % hidden != 0 || text_pos.len() % hidden != 0 {
             return Err(RuntimeError::Rejected("T3 host tables disagree with hidden".into()));
         }
         let mut voices = HashMap::new();
-        let vdir = ckpt.join("voices");
-        for entry in std::fs::read_dir(&vdir).map_err(|source| RuntimeError::Io { path: vdir.clone(), source })? {
-            let p = entry.map_err(|source| RuntimeError::Io { path: vdir.clone(), source })?.path();
-            if p.extension().is_some_and(|e| e == "f32") {
-                let raw = std::fs::read(&p).map_err(|source| RuntimeError::Io { path: p.clone(), source })?;
-                let rows: Vec<f32> = le_f32s(&raw);
-                if rows.is_empty() || rows.len() % hidden != 0 {
-                    return Err(RuntimeError::Rejected(format!("{}: not [rows][{hidden}] f32", p.display())));
-                }
-                voices.insert(p.file_stem().unwrap_or_default().to_string_lossy().into_owned(), rows);
+        for t in blob.tensors.iter().filter(|t| t.name.starts_with("in.prompt.voice.")) {
+            let rows = host(&t.name).unwrap_or_default();
+            if rows.is_empty() || rows.len() % hidden != 0 {
+                return Err(RuntimeError::Rejected(format!("{}: not [rows][{hidden}] f32", t.name)));
             }
+            voices.insert(t.name["in.prompt.voice.".len()..].to_string(), rows);
         }
-        let tk = ckpt.join("tokenizer.json");
+        let asset = crate::exec::packet_runtime::PacketAsset::load(&path)?;
+        let pipe = asset
+            .pipelines()
+            .iter()
+            .find(|p| p.driver == DRIVER)
+            .ok_or_else(|| RuntimeError::Rejected(format!("packet has no {DRIVER} pipeline")))?;
+        let rules = pipe.strings.get("text.rules").cloned().unwrap_or_default();
+        crate::text::rules::validate(&rules)?;
+        let tk = assets.join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tk)
             .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", tk.display())))?;
-        Ok(T3Tables { hidden, text_emb, text_pos, bos, voices, tokenizer })
+        Ok(T3Tables {
+            hidden,
+            text_emb,
+            text_pos,
+            bos,
+            bos_repeat: pipe.parameters.get("prompt.bos_repeat").copied().unwrap_or(1) as usize,
+            uncond_drops_text: pipe.parameters.get("cfg.uncond_drops_text").copied().unwrap_or(0) == 1,
+            voices,
+            rules,
+            tokenizer,
+        })
     }
 
     pub fn voices(&self) -> impl Iterator<Item = &str> {
         self.voices.keys().map(String::as_str)
     }
 
-    /// EnTokenizer.encode(punc_norm(text)).
+    /// Tokenize after the packet's text rules.
     pub fn text_ids(&self, text: &str) -> Result<Vec<u32>> {
-        let t = punc_norm(text).replace(' ', "[SPACE]");
+        let t = crate::text::rules::apply(&self.rules, text)?;
         let enc = self.tokenizer.encode(t, true).map_err(|e| RuntimeError::Rejected(format!("tokenize: {e}")))?;
         Ok(enc.get_ids().to_vec())
     }
@@ -195,19 +168,20 @@ impl T3Tables {
         if ids.len() * h > self.text_pos.len() || ids.iter().any(|&i| i as usize >= c.text_vocab) {
             return Err(RuntimeError::Rejected("text exceeds the T3 text tables".into()));
         }
-        let mut rows = Vec::with_capacity(cond.len() + (ids.len() + 2) * h);
+        let mut rows = Vec::with_capacity(cond.len() + (ids.len() + self.bos_repeat) * h);
         rows.extend_from_slice(cond);
         for (i, &id) in ids.iter().enumerate() {
             let pos = &self.text_pos[i * h..(i + 1) * h];
-            if uncond {
+            if uncond && self.uncond_drops_text {
                 rows.extend_from_slice(pos);
             } else {
                 let e = &self.text_emb[id as usize * h..(id as usize + 1) * h];
                 rows.extend(e.iter().zip(pos).map(|(a, b)| a + b));
             }
         }
-        rows.extend_from_slice(&self.bos);
-        rows.extend_from_slice(&self.bos);
+        for _ in 0..self.bos_repeat {
+            rows.extend_from_slice(&self.bos);
+        }
         Ok(rows)
     }
 }
@@ -533,16 +507,6 @@ impl T3Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn punc_norm_matches_reference_cases() {
-        assert_eq!(punc_norm("hello world"), "Hello world.");
-        // Whitespace collapses BEFORE "..." -> ", ", so the reference keeps two spaces.
-        assert_eq!(punc_norm("It was  a bright... day"), "It was a bright,  day.");
-        assert_eq!(punc_norm("Wait: what?"), "Wait, what?");
-        assert_eq!(punc_norm(""), "You need to add some text for me to talk.");
-        assert_eq!(punc_norm("“Quote” — dash"), "\"Quote\" - dash.");
-    }
 
     fn contract() -> T3Contract {
         T3Contract {

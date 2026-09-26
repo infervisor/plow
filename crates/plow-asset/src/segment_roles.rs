@@ -82,6 +82,10 @@ pub const CUBLASLT_PREFILL_LLAMA_TTS_SHAPES: [(u32, u32); 7] = [
     (4096, 1024),
 ];
 
+/// Qwen3-1.7B decoder (Qwen3-ASR thinker: hidden 2048, 16/8 heads x 128, inter 6144): q/o, k/v,
+/// unfused gate/up, down.
+pub const CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES: [(u32, u32); 4] = [(2048, 2048), (1024, 2048), (6144, 2048), (2048, 6144)];
+
 pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
     // At M <= 512 the small set is the down projection (3840, 15360), the o projection
     // (3840, 8192) and the unfused gate/up (15360, 3840): measured on H100 2026-09-17, Lt
@@ -94,7 +98,8 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
         && (CUBLASLT_PREFILL_ROWS.contains(&m) || CUBLASLT_PREFILL_WIDE_ROWS.contains(&m))
         && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
             || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k))
-            || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k)))
+            || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))
+            || CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k)))
 }
 
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";

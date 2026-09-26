@@ -10,7 +10,7 @@ use packet::dev::{DevProgram, CTR_STRIDE};
 
 use super::{pod_bytes, slab_carve, BLOCK};
 use crate::asset::devblob::DevBlob;
-use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, KernelFn};
+use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, GraphExec, KernelFn};
 use crate::device::{Backend, DeviceMem, Module};
 use crate::exec::packet_runtime::{check_copy, check_transfer, PacketRuntime, PacketTensor};
 use crate::{Result, RuntimeError};
@@ -38,6 +38,9 @@ pub struct CudaPacketRuntime {
     tensors: Vec<DeviceMem>,
     _table: DeviceMem,
     programs: Vec<Program>,
+    /// One CUDA graph per program sequence (every pointer is fixed at load, so a capture stays
+    /// valid); `None` once capture failed for that sequence.
+    graphs: std::collections::HashMap<Vec<usize>, Option<GraphExec>>,
     last_us: f64,
 }
 
@@ -157,6 +160,7 @@ impl CudaPacketRuntime {
             tensors,
             _table: table,
             programs,
+            graphs: std::collections::HashMap::new(),
             last_us: 0.0,
         })
     }
@@ -168,6 +172,21 @@ impl CudaPacketRuntime {
     /// Device address of a tensor, for device-to-device handoff to another engine on the same GPU.
     pub fn device_ptr(&self, tensor: PacketTensor) -> Option<u64> {
         self.tensors.get(tensor.handle).map(|m| m.base)
+    }
+
+    fn enqueue(&self, programs: &[usize]) -> Result<()> {
+        for &program in programs {
+            let p = &self.programs[program];
+            self.be.memset_d8_async(p.counters, 0, p.counter_bytes, &self.stream)?;
+            for seg in 0..p.segments {
+                let mut arg = p.kernarg;
+                arg.gq_seg_ofs += (seg * 4) as u64;
+                arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
+                let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+                self.be.launch_cooperative(self.function, self.grid, BLOCK, self.smem, &mut params, Some(&self.stream))?;
+            }
+        }
+        Ok(())
     }
 
     fn mem(&self, t: PacketTensor) -> Result<&DeviceMem> {
@@ -210,22 +229,26 @@ impl PacketRuntime for CudaPacketRuntime {
         self.run_sequence(&[program])
     }
 
-    /// Every program is enqueued on the one stream (stream order is the dependency); one sync.
+    /// Every program is enqueued on the one stream (stream order is the dependency), as one
+    /// CUDA graph after the first run of a sequence; one sync.
     fn run_sequence(&mut self, programs: &[usize]) -> Result<()> {
+        if let Some(&bad) = programs.iter().find(|&&p| p >= self.programs.len()) {
+            return Err(RuntimeError::Rejected(format!("packet program {bad} is missing")));
+        }
+        if !self.graphs.contains_key(programs) {
+            let graph = match self.be.graph_capture(&self.stream, || self.enqueue(programs)) {
+                Ok(g) => Some(g),
+                Err(error) => {
+                    tracing::warn!(%error, programs = programs.len(), "packet sequence graph capture failed; launching directly");
+                    None
+                }
+            };
+            self.graphs.insert(programs.to_vec(), graph);
+        }
         self.be.event_record(&self.events.0, &self.stream)?;
-        for &program in programs {
-            let p = self
-                .programs
-                .get(program)
-                .ok_or_else(|| RuntimeError::Rejected(format!("packet program {program} is missing")))?;
-            self.be.memset_d8_async(p.counters, 0, p.counter_bytes, &self.stream)?;
-            for seg in 0..p.segments {
-                let mut arg = p.kernarg;
-                arg.gq_seg_ofs += (seg * 4) as u64;
-                arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
-                let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-                self.be.launch_cooperative(self.function, self.grid, BLOCK, self.smem, &mut params, Some(&self.stream))?;
-            }
+        match self.graphs.get(programs).and_then(Option::as_ref) {
+            Some(graph) => self.be.graph_launch(graph, &self.stream)?,
+            None => self.enqueue(programs)?,
         }
         self.be.event_record(&self.events.1, &self.stream)?;
         self.be.stream_synchronize(&self.stream)?;

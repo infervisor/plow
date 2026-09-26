@@ -3,4 +3,5 @@
 
 pub mod guided;
 pub mod sample;
+pub mod rules;
 pub mod tokenizer;
