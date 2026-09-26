@@ -63,9 +63,7 @@ impl CudaPacketRuntime {
         let module = be.module_load(&image)?;
         let function = be.get_function(&module, SYMBOL)?;
         let smem = be.module_global_u32(&module, "plow_arena_bytes_speech")?.unwrap_or(49152);
-        if smem > 48 * 1024 {
-            be.set_max_dynamic_smem(function, smem)?;
-        }
+        be.set_max_dynamic_smem(function, smem)?;
         let capacity = be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count();
         if blob.n_cu == 0 || blob.n_cu > capacity {
             return Err(RuntimeError::Rejected(format!("{}: n_cu {} exceeds cooperative capacity {capacity}", path.display(), blob.n_cu)));

@@ -817,8 +817,19 @@ impl DevBlob {
 
     /// Find the (single) device blob in an assets dir: any file whose first 8
     /// bytes are the `PLOWDEV` magic. Two candidates is an error — the layout
-    /// is ambiguous and picking one silently would serve the wrong model.
+    /// is ambiguous and picking one silently would serve the wrong model —
+    /// unless one is `model.pkt`, the named main packet beside its side packets
+    /// (e.g. an ASR `encoder.pkt`).
     pub fn find_in_dir(dir: &Path) -> Result<Option<PathBuf>> {
+        let main = dir.join("model.pkt");
+        if main.is_file() {
+            let mut magic = [0u8; 8];
+            if std::fs::File::open(&main).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok()
+                && is_blob_magic(&magic)
+            {
+                return Ok(Some(main));
+            }
+        }
         let mut found: Option<PathBuf> = None;
         let entries = std::fs::read_dir(dir).map_err(|source| RuntimeError::Io {
             path: dir.to_path_buf(),

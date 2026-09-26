@@ -64,17 +64,22 @@ impl QwenExecution for CudaQwenExecution {
         let prefill_started = std::time::Instant::now();
         self.decoder.begin_slot(slot, self.decoder.max_ctx())?;
         self.decoder.write_tensor("in.encoder_overlay", 0, bytemuck::cast_slice(&audio))?;
-        let mut index = vec![u32::MAX; self.decoder.max_ctx().max(n)];
+        let mut absolute = vec![u32::MAX; n];
         for (row, &pos) in input.audio_positions.iter().enumerate() {
-            index[pos] = row as u32;
+            absolute[pos] = row as u32;
         }
+        // EmbedOverlayBf16 reads the index by chunk row, like `in.ids`: rewrite it per chunk.
         let index_rows = self.decoder.tensor_bytes("in.encoder_overlay_index").unwrap_or(0) as usize / 4;
-        index.resize(index_rows, u32::MAX);
-        self.decoder.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&index))?;
-        let token = match self.decoder.prefill_chunk(slot, input.token_ids, n)? {
-            PrefillStep::Done(token) => token,
-            PrefillStep::Progress(_) => {
-                return Err(RuntimeError::ContextLength(format!("ASR prompt of {n} rows must fit one prefill chunk")))
+        let mut index = vec![u32::MAX; index_rows];
+        let mut c0 = 0usize;
+        let token = loop {
+            for (j, slot) in index.iter_mut().enumerate() {
+                *slot = absolute.get(c0 + j).copied().unwrap_or(u32::MAX);
+            }
+            self.decoder.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&index))?;
+            match self.decoder.prefill_chunk(slot, input.token_ids, n)? {
+                PrefillStep::Done(token) => break token,
+                PrefillStep::Progress(end) => c0 = end,
             }
         };
         Ok(QwenPrefilled { token, encoder_ms, prefill_ms: prefill_started.elapsed().as_secs_f64() * 1000.0 })
