@@ -441,6 +441,7 @@ impl T3Engine {
                     max_tokens: j.max_tokens,
                 })
             },
+            |_, _| {},
             on_done,
         )
     }
@@ -448,11 +449,13 @@ impl T3Engine {
     /// Continuous batching over slot pairs. `next(block)` supplies the next job (arrival index =
     /// call order); it is polled while a pair is free and asked to BLOCK only when nothing is in
     /// flight, and `None` from a blocking call ends the loop. `on_done(index, output)` fires as
-    /// each job finishes. A job whose admission fails (unknown voice, text too long) is reported
+    /// each job finishes; `on_token(index, token)` fires for each speech token as it is committed.
+    /// A job whose admission fails (unknown voice, text too long) is reported
     /// through `on_done` with no tokens and does not stop the loop.
     pub fn serve(
         &mut self,
         mut next: impl FnMut(bool) -> Option<T3Job>,
+        mut on_token: impl FnMut(usize, u32),
         mut on_done: impl FnMut(usize, T3Output),
     ) -> Result<()> {
         let mut jobs: Vec<T3Job> = Vec::new();
@@ -505,6 +508,7 @@ impl T3Engine {
             for a in active.iter_mut().flatten() {
                 a.out.push(a.last);
                 a.history.push(a.last);
+                on_token(a.job_index, a.last);
                 feeds.push((a.cond, a.last));
                 feeds.push((a.uncond, a.last));
             }

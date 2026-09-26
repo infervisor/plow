@@ -91,6 +91,43 @@ async fn speech_on_worker(w: Arc<super::chatterbox::ChatterboxWorker>, req: Spee
     let seed = req.seed.unwrap_or_else(|| {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
     });
+    if req.stream {
+        let mut ev = match w.synthesize_stream(req.voice.clone(), req.input.clone(), seed) {
+            Ok(rx) => rx,
+            Err(e) => return server_error(e),
+        };
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(64);
+        if wav {
+            let _ = out_tx.try_send(Ok(wav_header(w.sample_rate, u32::MAX)));
+        }
+        let sr = f64::from(w.sample_rate);
+        tokio::spawn(async move {
+            let (mut samples, mut first) = (0usize, None);
+            while let Some(e) = ev.recv().await {
+                match e {
+                    super::chatterbox::StreamEvent::Pcm(p) => {
+                        first.get_or_insert_with(|| t_arrive.elapsed());
+                        samples += p.len();
+                        let mut bytes = Vec::with_capacity(p.len() * 2);
+                        pcm16(&p, &mut bytes);
+                        if out_tx.send(Ok(bytes)).await.is_err() {
+                            return;
+                        }
+                    }
+                    super::chatterbox::StreamEvent::Done { tokens, t3_ms, s3gen_ms } => {
+                        let total = t_arrive.elapsed().as_secs_f64();
+                        let audio_s = samples as f64 / sr;
+                        tracing::info!(tokens, audio_s, t3_ms, s3gen_ms, ttfa_ms = first.map(|d| d.as_secs_f64() * 1e3), total_ms = total * 1e3, rtf = total / audio_s, "tts: chatterbox stream");
+                        return;
+                    }
+                    super::chatterbox::StreamEvent::Err(e) => return drop(out_tx.send(Err(std::io::Error::other(e))).await),
+                }
+            }
+        });
+        let body = Body::from_stream(futures::stream::poll_fn(move |cx| out_rx.poll_recv(cx)));
+        let ct = if wav { "audio/wav" } else { "audio/pcm" };
+        return ([(header::CONTENT_TYPE, ct)], body).into_response();
+    }
     match w.synthesize(req.voice.clone(), req.input.clone(), seed).await {
         Err(e) => server_error(e),
         Ok(a) => {
