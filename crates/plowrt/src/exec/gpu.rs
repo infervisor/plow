@@ -80,6 +80,7 @@ mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
 mod decode_rung;
 mod mixed_step;
+pub mod packet_exec;
 mod moe_lt;
 mod native_decode;
 mod packed_terminal;

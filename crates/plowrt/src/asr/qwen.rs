@@ -10,6 +10,8 @@ use crate::serve::template::ChatTemplate;
 use crate::text::tokenizer::{load_tokenizer, Tokenize};
 use crate::{Result, RuntimeError};
 
+#[cfg(feature = "cuda")]
+mod cuda;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal;
 
@@ -666,6 +668,10 @@ fn load_execution(
     #[cfg(all(feature = "metal", target_os = "macos"))]
     if matches!(backend, "auto" | "metal") {
         return Ok((metal::load_execution(packet, checkpoint, hidden)?, "metal"));
+    }
+    #[cfg(feature = "cuda")]
+    if matches!(backend, "auto" | "cuda") {
+        return Ok((cuda::load_execution(packet, checkpoint, hidden)?, "cuda"));
     }
     let _ = (packet, checkpoint, hidden);
     Err(RuntimeError::Rejected(format!(

@@ -125,6 +125,10 @@ impl GpuEngine {
         capability: (u32, u32),
         granularity: u64,
     ) -> Option<VmmPrefixLayout> {
+        // Overlay rows (audio, voice conditioning) are not keyed by the prompt ids.
+        if blob.tensors.iter().any(|t| t.name == "in.encoder_overlay") {
+            return None;
+        }
         let requested = config.nv_vmm_prefix();
         if requested == Some(false)
             || (requested.is_none()

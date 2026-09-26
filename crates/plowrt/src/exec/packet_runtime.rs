@@ -201,7 +201,11 @@ pub fn load_packet_runtime(path: &Path, requested: &str) -> Result<LoadedPacketR
         {
             return load_packet_runtime(path, "cpu");
         }
-        #[cfg(not(any(feature = "cpu", all(feature = "metal", target_os = "macos"))))]
+        #[cfg(all(feature = "cuda", not(feature = "cpu"), not(all(feature = "metal", target_os = "macos"))))]
+        {
+            return load_packet_runtime(path, "cuda");
+        }
+        #[cfg(not(any(feature = "cpu", feature = "cuda", all(feature = "metal", target_os = "macos"))))]
         {
             return Err(RuntimeError::Rejected(
                 "no packet execution backend is compiled in".into(),
@@ -219,6 +223,11 @@ pub fn load_packet_runtime(path: &Path, requested: &str) -> Result<LoadedPacketR
                 )?),
             })
         }
+        #[cfg(feature = "cuda")]
+        "cuda" => Ok(LoadedPacketRuntime {
+            backend: "cuda",
+            runtime: Box::new(crate::exec::gpu::packet_exec::CudaPacketRuntime::load(path, 0)?),
+        }),
         #[cfg(all(feature = "metal", target_os = "macos"))]
         "metal" => Ok(LoadedPacketRuntime {
             backend: "metal",

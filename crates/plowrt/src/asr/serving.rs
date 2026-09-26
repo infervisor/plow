@@ -332,6 +332,16 @@ struct Start {
     language: Option<String>,
     #[serde(default)]
     prompt: String,
+    /// Revisable partial transcripts while audio arrives (`"type":"partial"` events).
+    #[serde(default)]
+    partials: bool,
+}
+
+/// Audio between partial transcriptions; each re-transcribes the whole buffer so far.
+const PARTIAL_STRIDE: usize = SAMPLE_RATE as usize;
+
+fn common_prefix_bytes(a: &str, b: &str) -> usize {
+    a.char_indices().zip(b.chars()).take_while(|((_, x), y)| x == y).map(|((i, x), _)| i + x.len_utf8()).last().unwrap_or(0)
 }
 
 async fn send(socket: &mut WebSocket, value: serde_json::Value) -> bool {
@@ -388,20 +398,38 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
             return;
         }
     };
-    let language = start.language;
+    let language = start.language.clone();
+    let partials = start.partials;
     let session = state.next_session.fetch_add(1, Ordering::Relaxed);
     let max_audio_samples = MAX_SAMPLES.saturating_sub(state.finalization.final_padding_samples);
     let initial_credit = 16000usize.min(max_audio_samples);
     if !send(&mut socket,json!({"type":"ready","version":1,"session_id":session.to_string(),
         "sample_rate":SAMPLE_RATE,"format":"pcm_s16le","max_chunk_bytes":32000,"credit_samples":initial_credit,
-        "max_audio_samples":max_audio_samples,"partial_mode":"final_only"})).await{return;}
+        "max_audio_samples":max_audio_samples,"partial_mode":if partials {"revision"} else {"final_only"}})).await{return;}
     let mut samples = Vec::new();
     let mut sequence = 0u64;
     let mut credit = initial_credit;
+    let (mut revision, mut last_partial, mut partial_at) = (0u64, String::new(), 0usize);
+    let mut pending: Option<oneshot::Receiver<crate::Result<Transcript>>> = None;
     loop {
-        let message = match tokio::time::timeout(Duration::from_secs(30), socket.recv()).await {
-            Ok(Some(Ok(m))) => m,
-            _ => return,
+        let message = tokio::select! {
+            m = tokio::time::timeout(Duration::from_secs(30), socket.recv()) => match m {
+                Ok(Some(Ok(m))) => m,
+                _ => return,
+            },
+            Ok(result) = async { pending.as_mut().expect("guarded").await }, if pending.is_some() => {
+                pending = None;
+                if let Ok(result) = result {
+                    revision += 1;
+                    let stable = common_prefix_bytes(&last_partial, &result.text);
+                    if !send(&mut socket, json!({"type":"partial","revision":revision,"text":result.text,
+                        "language":result.language,"stable_prefix_bytes":stable})).await {
+                        return;
+                    }
+                    last_partial = result.text;
+                }
+                continue;
+            }
         };
         let finish = match message {
             Message::Binary(bytes) => {
@@ -449,6 +477,9 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
                 state.finalization.final_padding_samples,
                 state.finalization.final_padding_amplitude,
             );
+            if let Some(p) = pending.take() {
+                let _ = p.await;
+            }
             let mut work = match state
                 .mux
                 .submit(samples, language, start.prompt, cancel.0.clone())
@@ -491,7 +522,7 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
                 Ok(Ok(result)) => {
                     send(
                         &mut socket,
-                        json!({"type":"final","revision":1,
+                        json!({"type":"final","revision":revision + 1,
                         "text":result.text,"language":result.language,
                         "stable_prefix_bytes":result.text.len()}),
                     )
@@ -509,6 +540,11 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
                 }
             }
             return;
+        }
+        if partials && pending.is_none() && samples.len() >= partial_at + PARTIAL_STRIDE {
+            partial_at = samples.len();
+            // A full queue skips this partial; the next stride retries.
+            pending = state.mux.submit(samples.clone(), language.clone(), start.prompt.clone(), cancel.0.clone()).ok();
         }
         let grant = (16000 - samples.len() % 16000)
             .min(max_audio_samples - samples.len())
