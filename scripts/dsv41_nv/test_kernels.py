@@ -106,6 +106,7 @@ if want("gemm_w8a8"):
             ((N + 127) // 128, (M + 63) // 64),
             (128,),
             [c, xq.view(torch.uint8), xs.view(torch.uint8), w.view(torch.uint8), ws, i32(M), i32(N), i32(Kd), i64(N), i32(1), i32(1), None],
+            smem=3 * (64 + 128) * 144,
         )
         r = rel(c, ref)
         check(f"gemm_w8a8 M={M} N={N} K={Kd}", r < 2e-3, f"rel={r:.3g}")
@@ -140,9 +141,40 @@ if want("gemm_f32"):
         w = torch.randn(N, Kd, device=dev, dtype=torch.bfloat16 if wbf else torch.float32)
         ref = a.float() @ w.float().T
         c = torch.empty(M, N, device=dev, dtype=torch.float32)
-        K.launch("dsv_gemm_f32", ((N + 63) // 64, (M + 63) // 64), (256,), [c, a, w, i32(M), i32(N), i32(Kd), i64(Kd), i64(N), i32(abf), i32(wbf)])
+        K.launch("dsv_gemm_f32", ((N + 63) // 64, (M + 63) // 64), (256,), [c, a, w, i32(M), i32(N), i32(Kd), i64(Kd), i64(N), i32(abf), i32(wbf)], smem=3 * (64 + 128) * 144)
         r = rel(c, ref)
         check(f"gemm_f32 M={M} N={N} K={Kd}", r < 1e-5, f"rel={r:.3g}")
+
+# ------------------------------------------------------------------------------------------ fused mHC mix
+if want("hc_mix"):
+    import math
+    for T in (1, 9, 1024):
+        Kd = 20480
+        x = torch.randn(T, Kd, device=dev, dtype=torch.bfloat16)
+        fn = torch.randn(24, Kd, device=dev, dtype=torch.float32) * 0.01
+        scale = torch.tensor([0.9, 1.1, 0.7], device=dev, dtype=torch.float32)
+        base = torch.randn(24, device=dev, dtype=torch.float32) * 0.1
+        S = max(1, min(math.ceil(264 / math.ceil(T / 4)), Kd // 1024))
+        part = torch.empty(S, T, 25, device=dev, dtype=torch.float32)
+        K.launch("dsv_hc_mix_partial", (S, (T + 3) // 4), (256,), [part, x, fn, i32(T), i32(Kd)])
+        pre = torch.empty(T, 4, device=dev, dtype=torch.float32)
+        post = torch.empty(T, 4, device=dev, dtype=torch.float32)
+        comb = torch.empty(T, 4, 4, device=dev, dtype=torch.float32)
+        K.launch("dsv_hc_mix_finish", ((T + 127) // 128,), (128,),
+                 [pre, post, comb, part, i32(S), i32(T), i32(Kd), scale, base, i32(20), f32(1e-20), f32(1e-6)])
+        # reference: model.py Block.hc_mixes + kernel.py hc_split_sinkhorn, in torch
+        xf = x.float()
+        mixes = (xf @ fn.T) * torch.rsqrt(xf.square().mean(-1, keepdim=True) + 1e-20)
+        rp = torch.sigmoid(mixes[:, :4] * scale[0] + base[:4]) + 1e-6
+        rq = 2 * torch.sigmoid(mixes[:, 4:8] * scale[1] + base[4:8])
+        c = (mixes[:, 8:] * scale[2] + base[8:]).view(T, 4, 4)
+        c = c.softmax(-1) + 1e-6
+        c = c / (c.sum(-2, keepdim=True) + 1e-6)
+        for _ in range(19):
+            c = c / (c.sum(-1, keepdim=True) + 1e-6)
+            c = c / (c.sum(-2, keepdim=True) + 1e-6)
+        e = max(rel(pre, rp), rel(post, rq), rel(comb, c))
+        check(f"hc_mix T={T} splits={S}", e < 1e-4, f"rel={e:.3g}")
 
 # ------------------------------------------------------------------------------------------ split-K
 if want("splitk"):
@@ -154,11 +186,11 @@ if want("splitk"):
         xq, xs = kr.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
         base = torch.empty(M, N, device=dev, dtype=torch.float32)
         K.launch("dsv_gemm_w8a8", ((N + 127) // 128, (M + 63) // 64, 1), (128,),
-                 [base, xq.view(torch.uint8), xs.view(torch.uint8), w.view(torch.uint8), ws, i32(M), i32(N), i32(Kd), i64(N), i32(1), i32(1), None])
+                 [base, xq.view(torch.uint8), xs.view(torch.uint8), w.view(torch.uint8), ws, i32(M), i32(N), i32(Kd), i64(N), i32(1), i32(1), None], smem=3 * (64 + 128) * 144)
         part = torch.empty(ks, M, N, device=dev, dtype=torch.float32)
         c = torch.empty(M, N, device=dev, dtype=torch.float32)
         K.launch("dsv_gemm_w8a8", ((N + 127) // 128, (M + 63) // 64, ks), (128,),
-                 [c, xq.view(torch.uint8), xs.view(torch.uint8), w.view(torch.uint8), ws, i32(M), i32(N), i32(Kd), i64(N), i32(1), i32(ks), part])
+                 [c, xq.view(torch.uint8), xs.view(torch.uint8), w.view(torch.uint8), ws, i32(M), i32(N), i32(Kd), i64(N), i32(1), i32(ks), part], smem=3 * (64 + 128) * 144)
         K.launch("dsv_splitk_reduce", ((M * N + 255) // 256,), (256,), [c, part, i32(ks), i32(1), i32(M), i32(N), i64(N), i64(0), i32(1)])
         r = rel(c, base)
         check(f"w8a8 split-K {ks} M={M} N={N} K={Kd}", r < 1e-5, f"rel vs unsplit={r:.3g}")

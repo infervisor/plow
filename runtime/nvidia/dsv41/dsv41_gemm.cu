@@ -33,41 +33,44 @@ __device__ __forceinline__ void mma_bf16(float* c, const uint32_t* a, const uint
 }
 
 // ---------------------------------------------------------------------------------------------------
-// W8A8. Tile 64(M) x 128(N) x 32(K), 4 warps as 2x2, warp tile 32x64. Rows padded to 48 B so the
-// fragment loads (8 rows x 4 B) hit distinct banks. Two-stage cp.async pipeline.
+// W8A8. Tile 64(M) x 128(N), 4 warps as 2x2, warp tile 32x64. A three-stage cp.async ring stages
+// 128 K per step (four m16n8k32 steps, each one 32-wide scale block, promoted into the fp32
+// accumulator with sa[m][kb] * sw[n/32][kb] as kernel.py's fp8_gemm does). Rows padded to 144 B so
+// the fragment loads land on distinct banks. Split-K over whole stages. K % 128 == 0.
+// Dynamic shared memory: W8_SMEM.
 #define W8_BM 64
 #define W8_BN 128
-#define W8_LD 48
+#define W8_ST 3
+#define W8_KS 128
+#define W8_LD 144
+#define W8_SMEM (W8_ST * (W8_BM + W8_BN) * W8_LD)
 DSV_EXTERN void __launch_bounds__(128)
     dsv_gemm_w8a8(void* __restrict__ C, const uint8_t* __restrict__ A, const uint8_t* __restrict__ sa,
                   const uint8_t* __restrict__ W, const uint8_t* __restrict__ sw, int M, int N, int K,
                   long long ldc, int c_f32, int ksplit, float* __restrict__ part) {
-    __shared__ __align__(16) uint8_t As[2][W8_BM * W8_LD];
-    __shared__ __align__(16) uint8_t Ws[2][W8_BN * W8_LD];
+    extern __shared__ __align__(16) uint8_t w8_smem[];
+    uint8_t* As = w8_smem;                          // [ST][64][144]
+    uint8_t* Ws = w8_smem + W8_ST * W8_BM * W8_LD;  // [ST][128][144]
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp >> 1, wn = warp & 1;
     const int g = lane >> 2, t4 = lane & 3;
     const int m0 = blockIdx.y * W8_BM, n0 = blockIdx.x * W8_BN;
-    const int KB = K >> 5;
-    // split-K: this block owns K blocks [kb0, kb1) (ksplit 1: all of them)
+    const int KB = K >> 5, KS = K / W8_KS;
     const int split = blockIdx.z;
-    const int kb0 = (int)((long long)KB * split / ksplit), kb1 = (int)((long long)KB * (split + 1) / ksplit);
+    const int ks0 = (int)((long long)KS * split / ksplit), ks1 = (int)((long long)KS * (split + 1) / ksplit);
 
-    auto load = [&](int stage, int kb) {
-        // A: 64 rows x 32 B = 128 chunks of 16 B; W: 128 rows x 32 B = 256 chunks.
-        {
-            const int r = tid >> 1, c = (tid & 1) * 16;
+    auto load = [&](int slot, int ks) {
+#pragma unroll
+        for (int i = 0; i < 4; i++) {  // A: 64 rows x 8 chunks of 16 B
+            const int c = tid + i * 128, r = c >> 3, off = (c & 7) * 16;
             const int gm = m0 + r;
-            const uint8_t* src = A + (long long)min(gm, M - 1) * K + kb * 32 + c;
-            CP_ASYNC_16(smem_u32(&As[stage][r * W8_LD + c]), src, gm < M ? 16 : 0);
+            CP_ASYNC_16(smem_u32(&As[(slot * W8_BM + r) * W8_LD + off]), A + (long long)min(gm, M - 1) * K + ks * W8_KS + off, gm < M ? 16 : 0);
         }
 #pragma unroll
-        for (int i = 0; i < 2; i++) {
-            const int ch = tid + i * 128;
-            const int r = ch >> 1, c = (ch & 1) * 16;
+        for (int i = 0; i < 8; i++) {  // W: 128 rows x 8 chunks of 16 B
+            const int c = tid + i * 128, r = c >> 3, off = (c & 7) * 16;
             const int gn = n0 + r;
-            const uint8_t* src = W + (long long)min(gn, N - 1) * K + kb * 32 + c;
-            CP_ASYNC_16(smem_u32(&Ws[stage][r * W8_LD + c]), src, gn < N ? 16 : 0);
+            CP_ASYNC_16(smem_u32(&Ws[(slot * W8_BN + r) * W8_LD + off]), W + (long long)min(gn, N - 1) * K + ks * W8_KS + off, gn < N ? 16 : 0);
         }
         CP_ASYNC_COMMIT();
     };
@@ -79,62 +82,60 @@ DSV_EXTERN void __launch_bounds__(128)
         for (int j = 0; j < 8; j++)
 #pragma unroll
             for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
-
-    // Rows this thread's accumulators cover, for the activation scale.
     int rows[2][2];
 #pragma unroll
     for (int i = 0; i < 2; i++) {
         rows[i][0] = min(m0 + wm * 32 + i * 16 + g, M - 1);
         rows[i][1] = min(m0 + wm * 32 + i * 16 + g + 8, M - 1);
     }
-    // The two 32-wide N scale blocks this warp's 64 columns span.
-    const int nb0 = min(n0 + wn * 64, N - 1) >> 5, nb1 = min(n0 + wn * 64 + 32, N - 1) >> 5;
     const int NB = (N + 31) >> 5;
+    const int nb0 = min((n0 + wn * 64) >> 5, NB - 1), nb1 = min((n0 + wn * 64 + 32) >> 5, NB - 1);
 
-    load(0, kb0);
-    for (int kb = kb0; kb < kb1; kb++) {
-        const int st = (kb - kb0) & 1;
-        if (kb + 1 < kb1) {
-            load(st ^ 1, kb + 1);
-            CP_ASYNC_WAIT(1);
-        } else {
-            CP_ASYNC_WAIT(0);
-        }
+    if (ks0 < ks1) load(0, ks0);
+    if (ks0 + 1 < ks1) load(1, ks0 + 1); else CP_ASYNC_COMMIT();
+    for (int ks = ks0; ks < ks1; ks++) {
+        CP_ASYNC_WAIT(1);
         __syncthreads();
-        uint32_t af[2][4], bfr[8][2];
+        if (ks + 2 < ks1) load((ks - ks0 + 2) % W8_ST, ks + 2); else CP_ASYNC_COMMIT();
+        const int slot = (ks - ks0) % W8_ST;
 #pragma unroll
-        for (int i = 0; i < 2; i++) {
-            const uint8_t* base = &As[st][(wm * 32 + i * 16 + g) * W8_LD + t4 * 4];
-            af[i][0] = *(const uint32_t*)(base);
-            af[i][1] = *(const uint32_t*)(base + 8 * W8_LD);
-            af[i][2] = *(const uint32_t*)(base + 16);
-            af[i][3] = *(const uint32_t*)(base + 8 * W8_LD + 16);
-        }
+        for (int kk = 0; kk < W8_KS / 32; kk++) {
+            const int kb = ks * (W8_KS / 32) + kk;
+            uint32_t af[2][4], bfr[8][2];
 #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            const uint8_t* base = &Ws[st][(wn * 64 + j * 8 + g) * W8_LD + t4 * 4];
-            bfr[j][0] = *(const uint32_t*)(base);
-            bfr[j][1] = *(const uint32_t*)(base + 16);
-        }
-        const float s_w0 = e8m0_to_f(sw[(long long)min(nb0, NB - 1) * KB + kb]);
-        const float s_w1 = e8m0_to_f(sw[(long long)min(nb1, NB - 1) * KB + kb]);
-#pragma unroll
-        for (int i = 0; i < 2; i++) {
-            const float sa0 = e8m0_to_f(sa[(long long)rows[i][0] * KB + kb]);
-            const float sa1 = e8m0_to_f(sa[(long long)rows[i][1] * KB + kb]);
+            for (int i = 0; i < 2; i++) {
+                const uint8_t* base = &As[(slot * W8_BM + wm * 32 + i * 16 + g) * W8_LD + kk * 32 + t4 * 4];
+                af[i][0] = *(const uint32_t*)(base);
+                af[i][1] = *(const uint32_t*)(base + 8 * W8_LD);
+                af[i][2] = *(const uint32_t*)(base + 16);
+                af[i][3] = *(const uint32_t*)(base + 8 * W8_LD + 16);
+            }
 #pragma unroll
             for (int j = 0; j < 8; j++) {
-                float t[4] = {0.f, 0.f, 0.f, 0.f};
-                mma_e4m3(t, af[i], bfr[j]);
-                const float swj = j < 4 ? s_w0 : s_w1;
-                acc[i][j][0] += t[0] * sa0 * swj;
-                acc[i][j][1] += t[1] * sa0 * swj;
-                acc[i][j][2] += t[2] * sa1 * swj;
-                acc[i][j][3] += t[3] * sa1 * swj;
+                const uint8_t* base = &Ws[(slot * W8_BN + wn * 64 + j * 8 + g) * W8_LD + kk * 32 + t4 * 4];
+                bfr[j][0] = *(const uint32_t*)(base);
+                bfr[j][1] = *(const uint32_t*)(base + 16);
+            }
+            const float s_w0 = e8m0_to_f(sw[(long long)nb0 * KB + kb]);
+            const float s_w1 = e8m0_to_f(sw[(long long)nb1 * KB + kb]);
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const float sa0 = e8m0_to_f(sa[(long long)rows[i][0] * KB + kb]);
+                const float sa1 = e8m0_to_f(sa[(long long)rows[i][1] * KB + kb]);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    float t[4] = {0.f, 0.f, 0.f, 0.f};
+                    mma_e4m3(t, af[i], bfr[j]);
+                    const float swj = j < 4 ? s_w0 : s_w1;
+                    acc[i][j][0] += t[0] * sa0 * swj;
+                    acc[i][j][1] += t[1] * sa0 * swj;
+                    acc[i][j][2] += t[2] * sa1 * swj;
+                    acc[i][j][3] += t[3] * sa1 * swj;
+                }
             }
         }
-        __syncthreads();
     }
+    CP_ASYNC_WAIT(0);
 
 #pragma unroll
     for (int i = 0; i < 2; i++)

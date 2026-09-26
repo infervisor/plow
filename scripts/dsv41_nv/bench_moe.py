@@ -24,7 +24,7 @@ dev = "cuda"
 K = Cubin(sys.argv[1])
 Ts = [int(t) for t in sys.argv[2:]] or [1, 9, 64, 1024]
 E, TOPK, H, MI = 384, 6, 5120, 2304
-BM = 64
+GEMM = {64: "dsv_moe_gemm_fp4", 32: "dsv_moe_gemm_fp4_m32", 16: "dsv_moe_gemm_fp4_m16"}
 
 
 def fp4_weights(N, Kd):
@@ -33,8 +33,8 @@ def fp4_weights(N, Kd):
     return w, s
 
 
-def route(T):
-    idx = torch.stack([torch.randperm(E, device=dev)[:TOPK] for _ in range(T)]).int()
+def route(idx, BM):
+    T = idx.shape[0]
     n = T * TOPK
     counts = torch.zeros(E, dtype=torch.int32, device=dev)
     K.launch("dsv_moe_count", ((n + 255) // 256,), (256,), [counts, idx, i32(n)])
@@ -49,63 +49,67 @@ def route(T):
     roww = torch.empty(n, dtype=torch.float32, device=dev)
     wt = torch.ones(T, TOPK, dtype=torch.float32, device=dev)
     K.launch("dsv_moe_fill", ((n + 255) // 256,), (256,), [rows, rowpos, roww, ctr, offs, idx, wt, i32(n), i32(TOPK)])
-    return idx, offs, tiles, meta, rows, max_tiles, n
+    return offs, tiles, meta, rows, max_tiles, n
 
 
-def run(C, A, sa, w, s, tiles, meta, offs, rows, by_row, N, Kd, max_tiles):
-    K.launch("dsv_moe_gemm_fp4", ((N + 127) // 128, max_tiles), (128,),
+def run(bm, C, A, sa, w, s, tiles, meta, offs, rows, by_row, N, Kd, max_tiles):
+    K.launch(GEMM[bm], ((N + 127) // 128, max_tiles), (128,),
              [C, A, sa, w, s, tiles, meta, offs, rows, i32(by_row), i32(N), i32(Kd), i64(N * Kd // 2), i64(N * Kd // 32)],
-             smem=MOE_SMEM(Kd))
+             smem=MOE_SMEM(Kd, bm))
 
 
 import kernel as kr  # noqa: E402
 
 w13, s13 = fp4_weights(2 * MI, H)
-for T in Ts:
-    idx, offs, tiles, meta, rows, max_tiles, n = route(T)
-    x = torch.randn(T, H, device=dev)
-    xq, xs = kr.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
-    C = torch.empty(n, 2 * MI, device=dev)
-    args = (C, xq.view(torch.uint8), xs.view(torch.uint8), w13, s13, tiles, meta, offs, rows, 0, 2 * MI, H, max_tiles)
-    run(*args)
-    torch.cuda.synchronize()
-    # correctness: a few experts against the reference kernel
-    o = offs.cpu()
-    r = rows.cpu()
-    worst = 0.0
-    for e in sorted(set(idx.flatten().tolist()))[:6]:
-        p0, p1 = int(o[e]), int(o[e + 1])
-        toks = r[p0:p1].long().to(dev)
-        ref = kr.fp4_gemm(xq[toks].contiguous(), xs[toks].contiguous(), w13[e].view(torch.float4_e2m1fn_x2),
-                          s13[e].view(torch.float8_e8m0fnu), torch.float8_e8m0fnu, 32)
-        got = C[p0:p1]
-        worst = max(worst, ((got.float() - ref.float()).norm() / ref.float().norm()).item())
-    # timing
-    ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
-    reps = 20
+ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
+reps = 20
+
+
+def timed(f):
+    f()
     ev[0].record()
     for _ in range(reps):
-        run(*args)
+        f()
     ev[1].record()
     torch.cuda.synchronize()
-    ms = ev[0].elapsed_time(ev[1]) / reps
+    return ev[0].elapsed_time(ev[1]) / reps
+
+
+for T in Ts:
+    idx = torch.stack([torch.randperm(E, device=dev)[:TOPK] for _ in range(T)]).int()
+    x = torch.randn(T, H, device=dev)
+    xq, xs = kr.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
     n_exp = len(set(idx.flatten().tolist()))
     wbytes = n_exp * 2 * MI * (H // 2 + H // 32)
-    print(f"T={T:5d} experts={n_exp:3d} rows={n:6d} mma : {ms*1e3:8.1f} us  weights {wbytes/1e6:7.1f} MB -> {wbytes/ms/1e6:7.2f} TB/s  "
-          f"| rel err vs fp4_gemm {worst:.2e} {'PASS' if worst < 5e-3 else 'FAIL'}", flush=True)
-    if T <= 64:  # the decode (GEMV) form
-        C2 = torch.empty_like(C)
-        gargs = [C2, xq.view(torch.uint8), xs.view(torch.uint8), w13, s13, tiles, meta, offs, rows, i32(0), i32(2 * MI), i32(H),
+    C64 = None
+    for bm in (64, 32, 16):
+        offs, tiles, meta, rows, max_tiles, n = route(idx, bm)
+        C = torch.empty(n, 2 * MI, device=dev)
+        args = (bm, C, xq.view(torch.uint8), xs.view(torch.uint8), w13, s13, tiles, meta, offs, rows, 0, 2 * MI, H, max_tiles)
+        run(*args)
+        torch.cuda.synchronize()
+        # correctness: a few experts against the reference kernel
+        o = offs.cpu()
+        r = rows.cpu()
+        worst = 0.0
+        for e in sorted(set(idx.flatten().tolist()))[:6]:
+            p0, p1 = int(o[e]), int(o[e + 1])
+            toks = r[p0:p1].long().to(dev)
+            ref = kr.fp4_gemm(xq[toks].contiguous(), xs[toks].contiguous(), w13[e].view(torch.float4_e2m1fn_x2),
+                              s13[e].view(torch.float8_e8m0fnu), torch.float8_e8m0fnu, 32)
+            got = C[p0:p1]
+            worst = max(worst, ((got.float() - ref.float()).norm() / ref.float().norm()).item())
+        ms = timed(lambda: run(*args))
+        print(f"T={T:5d} experts={n_exp:3d} rows={n:6d} mma{bm:<2d}: {ms*1e3:8.1f} us  weights {wbytes/1e6:7.1f} MB -> {wbytes/ms/1e9:6.3f} TB/s  "
+              f"| rel err vs fp4_gemm {worst:.2e} {'PASS' if worst < 5e-3 else 'FAIL'}", flush=True)
+        if bm == 64:
+            C64, tiles64, meta64, offs64, rows64, mt64 = C, tiles, meta, offs, rows, max_tiles
+    if T <= 64:  # the decode (GEMV) form, on the 64-row tiles
+        C2 = torch.empty_like(C64)
+        gargs = [C2, xq.view(torch.uint8), xs.view(torch.uint8), w13, s13, tiles64, meta64, offs64, rows64, i32(0), i32(2 * MI), i32(H),
                  i64(2 * MI * H // 2), i64(2 * MI * H // 32)]
-        grid = ((2 * MI + 7) // 8, max_tiles)
-        K.launch("dsv_moe_gemv_fp4", grid, (256,), gargs)
-        torch.cuda.synchronize()
-        g_err = ((C2.float() - C.float()).norm() / C.float().norm()).item()
-        ev[0].record()
-        for _ in range(reps):
-            K.launch("dsv_moe_gemv_fp4", grid, (256,), gargs)
-        ev[1].record()
-        torch.cuda.synchronize()
-        gms = ev[0].elapsed_time(ev[1]) / reps
-        print(f"T={T:5d} experts={n_exp:3d} rows={n:6d} gemv: {gms*1e3:8.1f} us  weights {wbytes/1e6:7.1f} MB -> {wbytes/gms/1e6:7.2f} TB/s  "
+        grid = ((2 * MI + 31) // 32, mt64)
+        gms = timed(lambda: K.launch("dsv_moe_gemv_fp4", grid, (256,), gargs))
+        g_err = ((C2.float() - C64.float()).norm() / C64.float().norm()).item()
+        print(f"T={T:5d} experts={n_exp:3d} rows={n:6d} gemv : {gms*1e3:8.1f} us  weights {wbytes/1e6:7.1f} MB -> {wbytes/gms/1e9:6.3f} TB/s  "
               f"| rel diff vs mma {g_err:.2e} {'PASS' if g_err < 5e-3 else 'FAIL'}", flush=True)

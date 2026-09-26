@@ -28,12 +28,22 @@ pub enum A {
 }
 
 pub const IX_SMEM: u32 = ((4 * 32 * (128 + 8) + 64 * (128 + 8)) * 2 + 2 * 4 * 64 * 4) as u32;
-/// `G_SMEM(K)` in dsv41_moe.cu: the grouped fp4 GEMM's stage ring plus both scale grids.
-pub const fn moe_smem(k: usize) -> u32 {
-    (3 * 64 * 144 + 3 * 128 * 80 + (128 + 64) * (k / 32) + 64 * 4 + 16) as u32
+/// `G_SMEM(K, BM)` in dsv41_moe.cu: the grouped fp4 GEMM's stage ring plus both scale grids.
+pub const fn moe_smem(k: usize, bm: usize) -> u32 {
+    (3 * bm * 160 + 3 * 128 * 80 + (128 + bm) * (k / 32) + bm * 4 + 16) as u32
+}
+/// The grouped fp4 GEMM entry for a tile height.
+pub const fn moe_gemm_name(bm: usize) -> &'static str {
+    match bm {
+        16 => "dsv_moe_gemm_fp4_m16",
+        32 => "dsv_moe_gemm_fp4_m32",
+        _ => "dsv_moe_gemm_fp4",
+    }
 }
 /// The largest K the engine launches it with (the hidden size, 5120) sets the attribute.
-pub const MOE_SMEM_MAX: u32 = moe_smem(8192);
+pub const MOE_SMEM_MAX_K: usize = 8192;
+/// `W8_SMEM` in dsv41_gemm.cu: the W8A8 GEMM's three 128-K stages of A (64 rows) and W (128 rows).
+pub const W8_SMEM: u32 = 3 * (64 + 128) * 144;
 pub const SA_SMEM: u32 = ((64 * 520 + 64 * 520 + 64 * 72) * 2 + 4 * 64 * 4 * 2 + 64 * 4) as u32;
 
 const MAX_ARGS: usize = 24;
@@ -57,6 +67,8 @@ const NAMES: &[&str] = &[
     "dsv_copy_rows",
     "dsv_row_rsqrt",
     "dsv_hc_sinkhorn",
+    "dsv_hc_mix_partial",
+    "dsv_hc_mix_finish",
     "dsv_hc_pre",
     "dsv_hc_post",
     "dsv_engram_gate",
@@ -74,6 +86,8 @@ const NAMES: &[&str] = &[
     "dsv_moe_offsets",
     "dsv_moe_fill",
     "dsv_moe_gemm_fp4",
+    "dsv_moe_gemm_fp4_m32",
+    "dsv_moe_gemm_fp4_m16",
     "dsv_moe_gemv_fp4",
     "dsv_swiglu_quant",
     "dsv_moe_combine",
@@ -176,7 +190,10 @@ impl Kernels {
         }
         dev.set_max_dynamic_smem(fns["dsv_sparse_attn"], SA_SMEM)?;
         dev.set_max_dynamic_smem(fns["dsv_index_score"], IX_SMEM)?;
-        dev.set_max_dynamic_smem(fns["dsv_moe_gemm_fp4"], MOE_SMEM_MAX)?;
+        for bm in [16, 32, 64] {
+            dev.set_max_dynamic_smem(fns[moe_gemm_name(bm)], moe_smem(MOE_SMEM_MAX_K, bm))?;
+        }
+        dev.set_max_dynamic_smem(fns["dsv_gemm_w8a8"], W8_SMEM)?;
         Ok(Kernels { dev, _module: module, fns, prof: profile.then(|| RefCell::new(KernelProf::default())), next_cost: Cell::new(None) })
     }
 
@@ -242,9 +259,9 @@ impl Kernels {
     }
 
     /// C[m][n] (f32) = A[m][k] . W[n][k]^T, A/W bf16 or f32. Small output grids (the mHC mixes are
-    /// 24 x 20480; the router and head at small batch) take the one-block-per-output dot form, and
-    /// few outputs over many rows the row form; the 64x64-tiled kernel would put a single block on
-    /// the whole K loop.
+    /// 24 x 20480; the router and head at decode batch) take the one-block-per-output dot form, and
+    /// few outputs over many rows the row form; everything else the 64x64 tiles (the dot form re-reads
+    /// each A row once per output, which at prefill M is hundreds of reads).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_f32(&self, c: u64, a: u64, w: u64, m: usize, n: usize, k: usize, lda: usize, a_bf16: bool, w_bf16: bool, s: &CudaStream) -> Result<()> {
         let args = [A::P(c), A::P(a), A::P(w), A::I(m as i32), A::I(n as i32), A::I(k as i32), A::L(lda as i64), A::L(n as i64), A::I(a_bf16 as i32), A::I(w_bf16 as i32)];
@@ -253,7 +270,7 @@ impl Kernels {
         self.cost(Cost { flops: 2.0 * mf * nf * kf, bytes: mf * kf * ab + nf * kf * wb + mf * nf * 4.0, peak: Peak::Fp32 });
         if n <= 32 && m > 64 {
             self.launch("dsv_gemm_f32_rows", [cdiv(m as u64, 4), 1, 1], 256, 0, &args, s)
-        } else if m * n <= 1 << 20 {
+        } else if m <= 16 {
             self.launch("dsv_gemm_f32_dot", [n as u32, m as u32, 1], 256, 0, &args, s)
         } else {
             self.launch("dsv_gemm_f32", [cdiv(n as u64, 64), cdiv(m as u64, 64), 1], 256, 0, &args, s)

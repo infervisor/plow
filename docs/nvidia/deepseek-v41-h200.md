@@ -71,9 +71,18 @@ TTFT under concurrency includes queueing behind other prefills.)
 | grouped fp4 MoE GEMM: cp.async ring, prmt fp4->fp8 (the __constant__ LUT serialized), staged scales | 1k prefill | 1.87 s | 0.81 s |
 | same | decode B=9 | 360 ms | 156 ms |
 | fp32 row form for the mHC mix in prefill | 1k prefill | 143 ms (dot) | 82 ms |
+| split-K W8A8 / bf16 GEMMs (about two waves on 132 SMs); W8A8 as a 3-stage 128-K cp.async ring | 1k prefill | 593 ms | 496 ms |
+| mHC mix fused: one pass over x for the 24 projections and the sum of squares, split-K (DeepGEMM `tf32_hc_prenorm_gemm` idea), then reduce + Sinkhorn | all | 3 launches | 2; matches the unfused path to 6e-7 on live activations |
+| grouped fp4 MoE GEMM: tile height 16/32/64 from rows per expert (the 64-row tile was ~75% padding at 1k prefill and decode); warps side by side along N | 1k prefill (MoE w13, bench) | 7.1 ms | 3.4 ms |
+| fp4 -> e4m3 by shifts alone (e2m1 s.ee.m -> s.0000.ee.m00 is the e4m3 encoding of w * 2^-6, subnormal included; 2^6 into the scale), activations byte-permuted to the same K order; still bit-exact vs kernel.py `fp4_gemm` | MoE, all T | | 10-25% faster |
+| routed experts at decode: 16-row MMA tile instead of the fp32 GEMV (the GEMV was issue-bound at ~1 TB/s) | decode B=64 | 227 ms (MoE 189 ms, 0.97 TB/s) | 106 ms (MoE 51 ms, 3.6 TB/s, 75% of roofline) |
 
-Open, ranked by the last profile: the MoE GEMM is still ~0.5 TB/s against 4.8 (64% of prefill,
-48% of a 9-sequence decode step); the W8A8 and bf16 GEMMs are mma.sync without TMA/wgmma.
+Rungs after these (`/root/dsv41/results/rungs_v4.md`): prefill 1k / 4k / 16k 369 / 1099 / 3916 ms;
+decode B=1 / 16 / 64 at ctx 1k 27.6 / 67.8 / 105.7 ms (36 / 236 / 605 tok/s).
+
+Open, ranked by that profile: prefill 16k is 41% MoE GEMM (177 TFLOP/s, compute-bound: needs
+wgmma), 24% W8A8 and 11% bf16 (both ~10% of peak); decode B=1 is launch- and latency-bound
+(~1400 launches; sparse attention 96 us/call at one token; the one-thread Sinkhorn 35 us/call).
 
 ## 6. Plan
 

@@ -172,6 +172,119 @@ DSV_EXTERN void dsv_hc_sinkhorn(float* __restrict__ pre, float* __restrict__ pos
         for (int k = 0; k < 4; k++) comb[t * 16 + j * 4 + k] = c[j][k];
 }
 
+// Fused mHC mix, part 1 (DeepGEMM's tf32_hc_prenorm_gemm idea, in fp32): for a K split and a tile of
+// 4 rows, the 24 dot products of each row of the flattened hc stream x [T][K] (bf16) against
+// fn [24][K] (f32), plus the row's sum of squares, into part [S][T][25]. Every x row is read once
+// for all 25 outputs; S splits of K fill the GPU at decode batch sizes. grid = (S, ceil(T/4)).
+#define HCM_ROWS 4
+#define HCM_N 24
+DSV_EXTERN void __launch_bounds__(256)
+    dsv_hc_mix_partial(float* __restrict__ part, const bf16* __restrict__ x, const float* __restrict__ fn, int T, int K) {
+    __shared__ float red[8][HCM_ROWS][HCM_N + 1];
+    const int S = gridDim.x, s = blockIdx.x;
+    const int t0 = blockIdx.y * HCM_ROWS;
+    const int k0 = (int)((long long)K * s / S), k1 = (int)((long long)K * (s + 1) / S);
+    float acc[HCM_ROWS][HCM_N + 1];
+#pragma unroll
+    for (int r = 0; r < HCM_ROWS; r++)
+#pragma unroll
+        for (int n = 0; n <= HCM_N; n++) acc[r][n] = 0.f;
+    for (int k = k0 + threadIdx.x; k < k1; k += blockDim.x) {
+        float a[HCM_ROWS];
+#pragma unroll
+        for (int r = 0; r < HCM_ROWS; r++) {
+            a[r] = t0 + r < T ? bf2f(x[(long long)(t0 + r) * K + k]) : 0.f;
+            acc[r][HCM_N] = fmaf(a[r], a[r], acc[r][HCM_N]);
+        }
+#pragma unroll
+        for (int n = 0; n < HCM_N; n++) {
+            const float w = fn[(long long)n * K + k];
+#pragma unroll
+            for (int r = 0; r < HCM_ROWS; r++) acc[r][n] = fmaf(a[r], w, acc[r][n]);
+        }
+    }
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+#pragma unroll
+    for (int r = 0; r < HCM_ROWS; r++)
+#pragma unroll
+        for (int n = 0; n <= HCM_N; n++) {
+            const float v = warp_sum(acc[r][n]);
+            if (lane == 0) red[wid][r][n] = v;
+        }
+    __syncthreads();
+    for (int i = threadIdx.x; i < HCM_ROWS * (HCM_N + 1); i += blockDim.x) {
+        const int r = i / (HCM_N + 1), n = i % (HCM_N + 1);
+        if (t0 + r >= T) continue;
+        float v = 0.f;
+        for (int w = 0; w < (int)(blockDim.x >> 5); w++) v += red[w][r][n];
+        part[((long long)s * T + t0 + r) * (HCM_N + 1) + n] = v;
+    }
+}
+
+// Fused mHC mix, part 2: sum the S partials in split order, rsq = rsqrt(sumsq / K + eps), and the
+// Sinkhorn split of mixes * rsq into pre / post / comb (as dsv_hc_sinkhorn). One thread per token.
+DSV_EXTERN void dsv_hc_mix_finish(float* __restrict__ pre, float* __restrict__ post, float* __restrict__ comb,
+                                  const float* __restrict__ part, int S, int T, int K, const float* __restrict__ hc_scale,
+                                  const float* __restrict__ hc_base, int iters, float norm_eps, float eps) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T) return;
+    float m[HCM_N + 1];
+#pragma unroll
+    for (int n = 0; n <= HCM_N; n++) m[n] = 0.f;
+    for (int s = 0; s < S; s++)
+#pragma unroll
+        for (int n = 0; n <= HCM_N; n++) m[n] += part[((long long)s * T + t) * (HCM_N + 1) + n];
+    const float r = rsqrtf(m[HCM_N] / (float)K + norm_eps);
+#pragma unroll
+    for (int i = 0; i < HCM_N; i++) m[i] *= r;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        pre[t * 4 + j] = 1.f / (1.f + expf(-(m[j] * hc_scale[0] + hc_base[j]))) + eps;
+        post[t * 4 + j] = 2.f * (1.f / (1.f + expf(-(m[j + 4] * hc_scale[1] + hc_base[j + 4]))));
+    }
+    float c[4][4];
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+        for (int k = 0; k < 4; k++) c[j][k] = m[j * 4 + k + 8] * hc_scale[2] + hc_base[j * 4 + k + 8];
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const float mx = fmaxf(fmaxf(c[j][0], c[j][1]), fmaxf(c[j][2], c[j][3]));
+        float sm = 0.f;
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            c[j][k] = expf(c[j][k] - mx);
+            sm += c[j][k];
+        }
+#pragma unroll
+        for (int k = 0; k < 4; k++) c[j][k] = c[j][k] / sm + eps;
+    }
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const float sm = c[0][k] + c[1][k] + c[2][k] + c[3][k];
+#pragma unroll
+        for (int j = 0; j < 4; j++) c[j][k] = c[j][k] / (sm + eps);
+    }
+    for (int it = 0; it < iters - 1; it++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float sm = c[j][0] + c[j][1] + c[j][2] + c[j][3];
+#pragma unroll
+            for (int k = 0; k < 4; k++) c[j][k] = c[j][k] / (sm + eps);
+        }
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const float sm = c[0][k] + c[1][k] + c[2][k] + c[3][k];
+#pragma unroll
+            for (int j = 0; j < 4; j++) c[j][k] = c[j][k] / (sm + eps);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+        for (int k = 0; k < 4; k++) comb[t * 16 + j * 4 + k] = c[j][k];
+}
+
 // y[t][d] = bf16(sum_c pre[t][c] * x[t][c][d])
 DSV_EXTERN void dsv_hc_pre(bf16* __restrict__ y, const bf16* __restrict__ x, const float* __restrict__ pre, int T, int D) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;

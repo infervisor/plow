@@ -94,6 +94,8 @@ pub struct Engine {
     /// also per-kernel GPU time. Both perturb timing (the stages stop overlapping).
     prof: Option<std::cell::RefCell<Prof>>,
     prof_kernels: bool,
+    /// Set by [`Engine::rung_bench`]: the step report leaves the per-kernel totals to it.
+    rung_mode: bool,
 }
 
 #[derive(Default)]
@@ -238,6 +240,7 @@ impl Engine {
             done,
             prof: (prof_level >= 1).then(|| std::cell::RefCell::new(Prof::default())),
             prof_kernels: prof_level >= 2,
+            rung_mode: false,
         };
         for _ in 0..opts.max_slots {
             let h = eng.new_hasher()?;
@@ -515,7 +518,7 @@ impl Engine {
         for (a, b) in p.stage_ms[kind].iter_mut().zip(stage_ms) {
             *a += b;
         }
-        if self.prof_kernels {
+        if self.prof_kernels && !self.rung_mode {
             for s in &self.stages {
                 s.k.prof_collect()?;
             }
@@ -527,7 +530,7 @@ impl Engine {
         let n = p.steps[kind] as f64;
         let per: Vec<String> = p.stage_ms[kind].iter().map(|v| format!("{:.2}", v / n)).collect();
         tracing::info!(target: "dsv41", "{} t={} nb={}: step {:.2} ms (stages [{}]) avg over {n}", if st.decode { "decode" } else { "prefill" }, st.t, st.nb(), p.host_ms[kind] / n, per.join(", "));
-        if self.prof_kernels {
+        if self.prof_kernels && !self.rung_mode {
             let rows = self.kernel_totals();
             let lines: Vec<String> = rows.iter().take(12).map(|(k, t)| {
                 let eff = if t.ms > 0.0 && t.floor_ms > 0.0 { format!(" {:.0}% of roofline", 100.0 * t.floor_ms / t.ms) } else { String::new() };
@@ -592,6 +595,7 @@ impl Engine {
                 }
             }
         }
+        self.rung_mode = true;
         let tok = |i: usize| ((i * 7919 + 13) % 120_000 + 10) as u32;
         let greedy = Sampling::default();
         for (decode, n, ctx) in rungs {

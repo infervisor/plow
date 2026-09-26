@@ -14,7 +14,7 @@ use crate::device::{Backend, DeviceMem};
 use crate::error::{Result, RuntimeError};
 
 use super::config::Cfg;
-use super::kernels::{cdiv, moe_smem, Cost, Kernels, Peak, A, IX_SMEM, SA_SMEM};
+use super::kernels::{cdiv, moe_gemm_name, moe_smem, Cost, Kernels, Peak, A, IX_SMEM, SA_SMEM, W8_SMEM};
 use super::weights::Layer;
 
 /// Bump allocator over one device allocation; `mark`/`reset` scope per-layer scratch.
@@ -136,6 +136,9 @@ impl Stage {
         arena_bytes: u64,
         profile_kernels: bool,
     ) -> Result<Stage> {
+        if cfg.hc_mult != 4 {
+            return Err(RuntimeError::Device(format!("dsv41: hc_mult {} unsupported (the mHC kernels are built for 4)", cfg.hc_mult)));
+        }
         let k = Kernels::load(dev.clone(), cubin, profile_kernels)?;
         let stream = dev.stream_create()?;
         let hd = cfg.head_dim as u64;
@@ -255,7 +258,7 @@ impl Stage {
             "dsv_gemm_w8a8",
             [cdiv(n as u64, 128), cdiv(m as u64, 64), ks as u32],
             128,
-            0,
+            W8_SMEM,
             &[A::P(c), A::P(qs.0), A::P(qs.1), A::P(w.0), A::P(w.1), A::I(m as i32), A::I(n as i32), A::I(kd as i32), A::L(n as i64), A::I(f32out as i32), A::I(ks as i32), A::P(part)],
         )?;
         self.splitk_reduce(c, part, ks, 1, m, n, n, 0, f32out)
@@ -309,24 +312,26 @@ impl Stage {
         )
     }
 
+    /// The mHC coefficients for a sublayer: pre / post / comb from the flattened stream x [t][4H].
+    /// Two launches: a split-K partial of the 24 projections plus the row's sum of squares (x read
+    /// once), then the in-order reduction, the RMS scale and the Sinkhorn.
     fn hc_mixes(&self, x: u64, hc: [u64; 3], t: usize) -> Result<(u64, u64, u64)> {
-        let h = self.cfg.hidden;
-        let hcm = self.cfg.hc_mult;
-        let rsq = self.arena.alloc((t * 4) as u64)?;
-        self.k.cost(Cost::mem((t * hcm * h * 2) as f64));
-        self.launch("dsv_row_rsqrt", [t as u32, 1, 1], 256, 0, &[A::P(rsq), A::P(x), A::I((hcm * h) as i32), A::F(self.cfg.eps)])?;
-        let nmix = (2 + hcm) * hcm;
-        let mixes = self.arena.alloc((t * nmix * 4) as u64)?;
-        self.f32gemm(mixes, x, hc[0], t, nmix, hcm * h, true, false)?;
-        let pre = self.arena.alloc((t * hcm * 4) as u64)?;
-        let post = self.arena.alloc((t * hcm * 4) as u64)?;
-        let comb = self.arena.alloc((t * hcm * hcm * 4) as u64)?;
+        let k = self.cfg.hidden * self.cfg.hc_mult;
+        let row_tiles = t.div_ceil(4);
+        let splits = 264usize.div_ceil(row_tiles).clamp(1, k / 1024);
+        let part = self.arena.alloc((splits * t * 25 * 4) as u64)?;
+        self.k.cost(Cost { flops: 2.0 * (t * 25 * k) as f64, bytes: (t * k * 2 + 24 * k * 4) as f64, peak: Peak::Fp32 });
+        self.launch("dsv_hc_mix_partial", [splits as u32, row_tiles as u32, 1], 256, 0, &[A::P(part), A::P(x), A::P(hc[0]), A::I(t as i32), A::I(k as i32)])?;
+        let pre = self.arena.alloc((t * 4 * 4) as u64)?;
+        let post = self.arena.alloc((t * 4 * 4) as u64)?;
+        let comb = self.arena.alloc((t * 16 * 4) as u64)?;
+        self.k.cost(Cost::mem((splits * t * 25 * 4 + t * 24 * 4) as f64));
         self.launch(
-            "dsv_hc_sinkhorn",
+            "dsv_hc_mix_finish",
             [cdiv(t as u64, 128), 1, 1],
             128,
             0,
-            &[A::P(pre), A::P(post), A::P(comb), A::P(mixes), A::P(rsq), A::P(hc[1]), A::P(hc[2]), A::I(t as i32), A::I(self.cfg.sinkhorn_iters as i32), A::F(self.cfg.hc_eps)],
+            &[A::P(pre), A::P(post), A::P(comb), A::P(part), A::I(splits as i32), A::I(t as i32), A::I(k as i32), A::P(hc[1]), A::P(hc[2]), A::I(self.cfg.sinkhorn_iters as i32), A::F(self.cfg.eps), A::F(self.cfg.hc_eps)],
         )?;
         Ok((pre, post, comb))
     }
@@ -674,7 +679,14 @@ impl Stage {
         let counts = self.arena.alloc((e * 4) as u64)?;
         self.dev.memset_d8_async(counts, 0, e * 4, &self.stream)?;
         self.launch("dsv_moe_count", [cdiv(n as u64, 256), 1, 1], 256, 0, &[A::P(counts), A::P(idx), A::I(n as i32)])?;
-        let bm = 64usize;
+        // distinct experts a batch of t tokens touches, in expectation (uniform routing)
+        let touched = (e as f64) * (1.0 - (1.0 - tk as f64 / e as f64).powf(t as f64));
+        // decode-sized steps: each routed expert holds a row or two, so the weight-streaming GEMV beats
+        // an MMA tile that would be almost all padding
+        let gemv = t <= MOE_GEMV_MAX_T;
+        // MMA tile height from the rows an expert holds on average: the tiles stream every weight
+        // column once each, so padding rows cost decode and MMA work but no bandwidth
+        let bm = if gemv { 64 } else { moe_bm(n as f64 / touched.max(1.0)) };
         // sum over experts of ceil(c_e / bm) <= n / bm + (experts with any row) <= ceil(n / bm) + min(n, e)
         let max_tiles = n.div_ceil(bm) + n.min(e);
         let offs = self.arena.alloc(((e + 1) * 4) as u64)?;
@@ -686,18 +698,13 @@ impl Stage {
         let rowpos = self.arena.alloc((n * 4) as u64)?;
         let roww = self.arena.alloc((n * 4) as u64)?;
         self.launch("dsv_moe_fill", [cdiv(n as u64, 256), 1, 1], 256, 0, &[A::P(rows), A::P(rowpos), A::P(roww), A::P(ctr), A::P(offs), A::P(idx), A::P(wt), A::I(n as i32), A::I(tk as i32)])?;
-        // distinct experts a batch of t tokens touches, in expectation (uniform routing)
-        let touched = (e as f64) * (1.0 - (1.0 - tk as f64 / e as f64).powf(t as f64));
         let xq = self.quant(hn, t, h)?;
         let gu = self.arena.alloc((n * 2 * mi * 2) as u64)?;
         self.k.cost(Cost { flops: 2.0 * (n * 2 * mi * h) as f64, bytes: touched * (2 * mi) as f64 * (h as f64 / 2.0 + h as f64 / 32.0) + (n * h) as f64 + (n * 2 * mi * 2) as f64, peak: Peak::Fp8Mma });
-        // decode-sized steps: each routed expert holds a row or two, so the weight-streaming GEMV beats
-        // a 64-row MMA tile that would be almost all padding
-        let gemv = t <= MOE_GEMV_MAX_T;
         let (name, grid, block, smem) = if gemv {
-            ("dsv_moe_gemv_fp4", [cdiv((2 * mi) as u64, 8), max_tiles as u32, 1], 256, 0)
+            ("dsv_moe_gemv_fp4", [cdiv((2 * mi) as u64, 32), max_tiles as u32, 1], 256, 0)
         } else {
-            ("dsv_moe_gemm_fp4", [cdiv((2 * mi) as u64, 128), max_tiles as u32, 1], 128, moe_smem(h))
+            (moe_gemm_name(bm), [cdiv((2 * mi) as u64, 128), max_tiles as u32, 1], 128, moe_smem(h, bm))
         };
         self.launch(
             name,
@@ -719,9 +726,9 @@ impl Stage {
         let down = self.arena.alloc((n * h * 2) as u64)?;
         self.k.cost(Cost { flops: 2.0 * (n * h * mi) as f64, bytes: touched * h as f64 * (mi as f64 / 2.0 + mi as f64 / 32.0) + (n * mi) as f64 + (n * h * 2) as f64, peak: Peak::Fp8Mma });
         let (name, grid, block, smem) = if gemv {
-            ("dsv_moe_gemv_fp4", [cdiv(h as u64, 8), max_tiles as u32, 1], 256, 0)
+            ("dsv_moe_gemv_fp4", [cdiv(h as u64, 32), max_tiles as u32, 1], 256, 0)
         } else {
-            ("dsv_moe_gemm_fp4", [cdiv(h as u64, 128), max_tiles as u32, 1], 128, moe_smem(mi))
+            (moe_gemm_name(bm), [cdiv(h as u64, 128), max_tiles as u32, 1], 128, moe_smem(mi, bm))
         };
         self.launch(
             name,
@@ -796,8 +803,22 @@ impl Stage {
     }
 }
 
-/// Steps of at most this many tokens run the routed experts through `dsv_moe_gemv_fp4`.
-const MOE_GEMV_MAX_T: usize = 16;
+/// The grouped fp4 GEMM's tile height for `rows` rows per touched expert.
+fn moe_bm(rows: f64) -> usize {
+    if rows <= MOE_BM16_MAX_ROWS {
+        16
+    } else if rows <= MOE_BM32_MAX_ROWS {
+        32
+    } else {
+        64
+    }
+}
+const MOE_BM16_MAX_ROWS: f64 = 8.0;
+const MOE_BM32_MAX_ROWS: f64 = 64.0;
+
+/// Steps of at most this many tokens run the routed experts through `dsv_moe_gemv_fp4`. Off: the
+/// 16-row MMA tile streams the weights faster at every decode size (bench_moe.py).
+const MOE_GEMV_MAX_T: usize = 0;
 
 /// K splits for a GEMM of `tiles` output tiles over `kb` 32-wide K blocks: enough blocks for about
 /// two waves on the 132 SMs, each split keeping at least 4 K blocks; 1 when the grid already fills.

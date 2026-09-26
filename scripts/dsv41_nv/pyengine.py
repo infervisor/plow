@@ -30,8 +30,8 @@ IXD = 128
 IXK = 512
 EPS = 1e-20
 IX_SMEM = (4 * IXH * (IXD + 8) + 64 * (IXD + 8)) * 2 + 2 * 4 * 64 * 4
-def MOE_SMEM(k):
-    return 3 * 64 * 144 + 3 * 128 * 80 + (128 + 64) * (k // 32) + 64 * 4 + 16
+def MOE_SMEM(k, bm=64):
+    return 3 * bm * 160 + 3 * 128 * 80 + (128 + bm) * (k // 32) + bm * 4 + 16
 
 
 SA_SMEM = (64 * 520 + 64 * 520 + 64 * 72) * 2 + 4 * 64 * 4 * 2 + 64 * 4
@@ -220,7 +220,7 @@ class Engine:
         N = w.shape[0]
         c = torch.empty(M, N, dtype=torch.float32 if out_f32 else torch.bfloat16, device=self.dev)
         self.K.launch("dsv_gemm_w8a8", ((N + 127) // 128, (M + 63) // 64), (128,),
-                      [c, q, s, w, ws, i32(M), i32(N), i32(Kd), i64(N), i32(int(out_f32)), i32(1), None])
+                      [c, q, s, w, ws, i32(M), i32(N), i32(Kd), i64(N), i32(int(out_f32)), i32(1), None], smem=3 * (64 + 128) * 144)
         return c
 
     def bf16w(self, a, w, ws=None, out_f32=False):
