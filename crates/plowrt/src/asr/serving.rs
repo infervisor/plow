@@ -419,6 +419,9 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
             },
             Ok(result) = async { pending.as_mut().expect("guarded").await }, if pending.is_some() => {
                 pending = None;
+                if let Err(error) = &result {
+                    tracing::warn!(%error, samples = samples.len(), "ASR partial failed");
+                }
                 if let Ok(result) = result {
                     revision += 1;
                     let stable = common_prefix_bytes(&last_partial, &result.text);
