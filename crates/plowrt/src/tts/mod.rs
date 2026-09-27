@@ -11,10 +11,10 @@ pub mod codec;
 #[cfg(feature = "cuda")]
 pub mod serving;
 #[cfg(feature = "cuda")]
-pub mod t3;
+pub mod guided_lm;
 #[cfg(feature = "cuda")]
 #[cfg(feature = "cuda")]
-pub mod chatterbox;
+pub mod guided_speech;
 
 use std::path::Path;
 

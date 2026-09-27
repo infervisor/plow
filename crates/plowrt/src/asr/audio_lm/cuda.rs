@@ -5,12 +5,12 @@ use crate::device::cuda::CudaBackend;
 use crate::exec::gpu::{GpuEngine, PrefillStep};
 use crate::{Result, RuntimeError};
 
-use super::{PacketAudioEncoder, QwenDecode, QwenExecution, QwenPrefill, QwenPrefilled};
+use super::{PacketAudioEncoder, AudioLmDecode, AudioLmExecution, AudioLmPrefill, AudioLmPrefilled};
 
 /// Qwen3-ASR on CUDA: the audio encoder is `encoder.pkt` on the CUDA packet runtime, the decoder
 /// `model.pkt` on `GpuEngine`, whose prefill splices the encoder rows over the audio
 /// placeholders (`EmbedOverlayBf16`, `in.encoder_overlay` / `in.encoder_overlay_index`).
-struct CudaQwenExecution {
+struct CudaAudioLmExecution {
     encoder: PacketAudioEncoder,
     decoder: GpuEngine,
     overlay_rows: usize,
@@ -18,7 +18,7 @@ struct CudaQwenExecution {
     out: Vec<u32>,
 }
 
-impl CudaQwenExecution {
+impl CudaAudioLmExecution {
     fn load(blob: &Path, checkpoint: &Path, hidden: usize) -> Result<Self> {
         let be = Arc::new(CudaBackend::new(0)?);
         let assets = blob.parent().unwrap_or(Path::new("."));
@@ -35,7 +35,7 @@ impl CudaQwenExecution {
     }
 }
 
-impl QwenExecution for CudaQwenExecution {
+impl AudioLmExecution for CudaAudioLmExecution {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
@@ -48,7 +48,7 @@ impl QwenExecution for CudaQwenExecution {
         self.decoder.max_ctx()
     }
 
-    fn prefill(&mut self, slot: usize, input: QwenPrefill<'_>) -> Result<QwenPrefilled> {
+    fn prefill(&mut self, slot: usize, input: AudioLmPrefill<'_>) -> Result<AudioLmPrefilled> {
         let started = std::time::Instant::now();
         let audio = self.encoder.encode(input.features)?;
         let encoder_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -82,10 +82,10 @@ impl QwenExecution for CudaQwenExecution {
                 PrefillStep::Progress(end) => c0 = end,
             }
         };
-        Ok(QwenPrefilled { token, encoder_ms, prefill_ms: prefill_started.elapsed().as_secs_f64() * 1000.0 })
+        Ok(AudioLmPrefilled { token, encoder_ms, prefill_ms: prefill_started.elapsed().as_secs_f64() * 1000.0 })
     }
 
-    fn decode(&mut self, positions: &[u32], kv_lengths: &[u32], token_ids: &[u32], occupied_rows: usize) -> Result<QwenDecode> {
+    fn decode(&mut self, positions: &[u32], kv_lengths: &[u32], token_ids: &[u32], occupied_rows: usize) -> Result<AudioLmDecode> {
         if positions.len() != kv_lengths.len()
             || positions.len() != token_ids.len()
             || occupied_rows == 0
@@ -104,10 +104,10 @@ impl QwenExecution for CudaQwenExecution {
                 tokens[slot] = t;
             }
         }
-        Ok(QwenDecode { tokens, launched_rows: self.feeds.len() })
+        Ok(AudioLmDecode { tokens, launched_rows: self.feeds.len() })
     }
 }
 
-pub(super) fn load_execution(packet: &Path, checkpoint: &Path, hidden: usize) -> Result<Box<dyn QwenExecution>> {
-    Ok(Box::new(CudaQwenExecution::load(packet, checkpoint, hidden)?))
+pub(super) fn load_execution(packet: &Path, checkpoint: &Path, hidden: usize) -> Result<Box<dyn AudioLmExecution>> {
+    Ok(Box::new(CudaAudioLmExecution::load(packet, checkpoint, hidden)?))
 }

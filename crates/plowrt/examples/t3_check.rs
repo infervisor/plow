@@ -14,7 +14,7 @@ fn main() {
 
 #[cfg(feature = "cuda")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use plowrt::tts::t3::{T3Engine, T3Job};
+    use plowrt::tts::guided_lm::{GuidedLm, GuidedJob};
     let mut args = std::env::args().skip(1);
     let assets = std::path::PathBuf::from(args.next().ok_or("usage: t3_check <assets> <ref.json>")?);
     let reference: serde_json::Value = serde_json::from_slice(&std::fs::read(args.next().ok_or("ref.json")?)?)?;
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
-    let mut t3 = T3Engine::load(&assets, 0)?;
+    let mut t3 = GuidedLm::load(&assets, 0)?;
     println!("T3 engine: pairs={} contract={:?}", t3.pairs(), t3.c);
     let rel = |a: &[f32], b: &[f64]| {
         let (mut num, mut den) = (0f64, 0f64);
@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let want: Vec<u32> = serde_json::from_value(r["greedy_cfg"].clone())?;
         let mut got = Vec::new();
         t3.run(
-            &[T3Job { voice: "default".into(), text: text.into(), seed: None, max_tokens: Some(want.len()) }],
+            &[GuidedJob { voice: "default".into(), text: text.into(), seed: None, max_tokens: Some(want.len()) }],
             |_, o| got = o.tokens,
         )?;
         let agree = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
@@ -73,8 +73,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|r| r["text"].as_str().unwrap_or_default().to_string())
             .collect();
-        let jobs: Vec<T3Job> = (0..jobs_n)
-            .map(|i| T3Job { voice: "default".into(), text: texts[i % texts.len()].clone(), seed: Some(i as u64 + 1), max_tokens: None })
+        let jobs: Vec<GuidedJob> = (0..jobs_n)
+            .map(|i| GuidedJob { voice: "default".into(), text: texts[i % texts.len()].clone(), seed: Some(i as u64 + 1), max_tokens: None })
             .collect();
         let t0 = std::time::Instant::now();
         let mut total_steps = 0;

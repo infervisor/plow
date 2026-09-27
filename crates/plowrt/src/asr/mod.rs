@@ -4,7 +4,7 @@ pub mod frontend;
 pub mod nemotron;
 #[cfg(feature = "gguf")]
 mod packet;
-pub mod qwen;
+pub mod audio_lm;
 pub mod rnnt;
 pub mod serving;
 pub mod subsampling;
@@ -181,6 +181,6 @@ fn load_causal_transcriber(
     tokenizer: &Path,
     backend: &str,
 ) -> crate::Result<(Box<dyn Transcriber>, &'static str)> {
-    let (engine, loaded_backend) = qwen::QwenAsr::load_with_backend(packet, tokenizer, backend)?;
+    let (engine, loaded_backend) = audio_lm::AudioLmAsr::load_with_backend(packet, tokenizer, backend)?;
     Ok((Box::new(engine), loaded_backend))
 }

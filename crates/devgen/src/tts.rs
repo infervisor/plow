@@ -53,7 +53,7 @@ pub const VEENA: SpeechProfile = SpeechProfile {
 /// `overlay` role, every row) and whose decode embedding adds a learned speech position counted
 /// from the per-slot `pos_base`. Classifier-free guidance pairs two slots per request; the
 /// contract scalars (text/speech control ids, sampling, guidance weight) ride as parameters.
-pub const T3_DRIVER: &str = "tts.t3_cfg.v1";
+pub const GUIDED_LM_DRIVER: &str = "tts.guided_lm.v1";
 
 pub fn t3_pipeline_section(
     model: &Model,
@@ -65,14 +65,15 @@ pub fn t3_pipeline_section(
     let causal = causal_pipeline_section(model, spec)?;
     let mut meta: PacketPipelines = serde_json::from_slice(&causal.data).map_err(|e| e.to_string())?;
     let pipe = meta.pipelines.first_mut().ok_or("causal section has no pipeline")?;
-    pipe.driver = T3_DRIVER.into();
+    pipe.driver = GUIDED_LM_DRIVER.into();
     let t = model.tensors.get(pos_base as usize).ok_or("T3 pos_base tensor is missing")?;
     pipe.tensors.insert(
         "pos_base".into(),
         PipelineTensor { name: t.name.clone(), dtype: PipelineDType::U32, shape: vec![u64::from(spec.decode_capacity)] },
     );
     for (k, v) in params {
-        pipe.parameters.insert(format!("t3.{k}"), *v);
+        let k = if k == "s3_valid_below" { "valid_below" } else { k.as_str() };
+        pipe.parameters.insert(format!("lm.{k}"), *v);
     }
     // Prefill layout: [voice rows][start_text, text..., stop_text: table + position][BOS x2];
     // the unconditional CFG member keeps positions but drops the text table.

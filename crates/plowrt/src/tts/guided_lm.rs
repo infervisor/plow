@@ -20,10 +20,10 @@ use plow_asset::packet_pipeline::PacketPipeline;
 use crate::exec::gpu::{GpuEngine, PrefillStep};
 use crate::{Result, RuntimeError};
 
-pub const DRIVER: &str = "tts.t3_cfg.v1";
+pub const DRIVER: &str = "tts.guided_lm.v1";
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct T3Contract {
+pub struct GuidedLmContract {
     pub hidden: usize,
     pub overlay_rows: usize,
     pub decode_capacity: usize,
@@ -34,7 +34,7 @@ pub struct T3Contract {
     pub text_vocab: usize,
     pub speech_vocab: usize,
     pub max_speech_tokens: usize,
-    pub s3_valid_below: u32,
+    pub valid_below: u32,
     pub cfg_weight: f32,
     pub temperature: f32,
     pub min_p: f32,
@@ -42,7 +42,7 @@ pub struct T3Contract {
     pub repetition_penalty: f32,
 }
 
-impl T3Contract {
+impl GuidedLmContract {
     pub fn from_pipeline(p: &PacketPipeline) -> Result<Self> {
         if p.driver != DRIVER {
             return Err(RuntimeError::Rejected(format!("pipeline {} is {}, not {DRIVER}", p.name, p.driver)));
@@ -51,26 +51,26 @@ impl T3Contract {
             p.parameters
                 .get(k)
                 .copied()
-                .ok_or_else(|| RuntimeError::Rejected(format!("T3 pipeline lacks parameter {k}")))
+                .ok_or_else(|| RuntimeError::Rejected(format!("guided LM pipeline lacks parameter {k}")))
         };
         let f = |k: &str| get(k).map(|v| f32::from_bits(v as u32));
-        Ok(T3Contract {
+        Ok(GuidedLmContract {
             hidden: get("hidden")? as usize,
             overlay_rows: get("overlay_rows")? as usize,
             decode_capacity: get("decode_capacity")? as usize,
-            start_text: get("t3.start_text")? as u32,
-            stop_text: get("t3.stop_text")? as u32,
-            start_speech: get("t3.start_speech")? as u32,
-            stop_speech: get("t3.stop_speech")? as u32,
-            text_vocab: get("t3.text_vocab")? as usize,
-            speech_vocab: get("t3.speech_vocab")? as usize,
-            max_speech_tokens: get("t3.max_speech_tokens")? as usize,
-            s3_valid_below: get("t3.s3_valid_below")? as u32,
-            cfg_weight: f("t3.cfg_weight_f32")?,
-            temperature: f("t3.temperature_f32")?,
-            min_p: f("t3.min_p_f32")?,
-            top_p: f("t3.top_p_f32")?,
-            repetition_penalty: f("t3.repetition_penalty_f32")?,
+            start_text: get("lm.start_text")? as u32,
+            stop_text: get("lm.stop_text")? as u32,
+            start_speech: get("lm.start_speech")? as u32,
+            stop_speech: get("lm.stop_speech")? as u32,
+            text_vocab: get("lm.text_vocab")? as usize,
+            speech_vocab: get("lm.speech_vocab")? as usize,
+            max_speech_tokens: get("lm.max_speech_tokens")? as usize,
+            valid_below: get("lm.valid_below")? as u32,
+            cfg_weight: f("lm.cfg_weight_f32")?,
+            temperature: f("lm.temperature_f32")?,
+            min_p: f("lm.min_p_f32")?,
+            top_p: f("lm.top_p_f32")?,
+            repetition_penalty: f("lm.repetition_penalty_f32")?,
         })
     }
 
@@ -91,7 +91,7 @@ fn le_f32s(b: &[u8]) -> Vec<f32> {
 }
 
 /// Host tables for prefill rows (`in.prompt.*` packet tensors) and the packet's text rules.
-pub struct T3Tables {
+pub struct PromptTables {
     hidden: usize,
     text_emb: Vec<f32>,
     text_pos: Vec<f32>,
@@ -103,7 +103,7 @@ pub struct T3Tables {
     tokenizer: tokenizers::Tokenizer,
 }
 
-impl T3Tables {
+impl PromptTables {
     pub fn load(assets: &Path, hidden: usize) -> Result<Self> {
         let path = assets.join("model.pkt");
         let raw = std::fs::read(&path).map_err(|source| RuntimeError::Io { path: path.clone(), source })?;
@@ -136,7 +136,7 @@ impl T3Tables {
         let tk = assets.join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tk)
             .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", tk.display())))?;
-        Ok(T3Tables {
+        Ok(PromptTables {
             hidden,
             text_emb,
             text_pos,
@@ -161,7 +161,7 @@ impl T3Tables {
     }
 
     /// The prefill rows ([rows][hidden] f32) for one CFG member.
-    pub fn prefill_rows(&self, c: &T3Contract, voice: &str, text_ids: &[u32], uncond: bool) -> Result<Vec<f32>> {
+    pub fn prefill_rows(&self, c: &GuidedLmContract, voice: &str, text_ids: &[u32], uncond: bool) -> Result<Vec<f32>> {
         let h = self.hidden;
         let cond = self.voices.get(voice).ok_or_else(|| RuntimeError::Rejected(format!("unknown voice {voice:?}")))?;
         let ids: Vec<u32> = std::iter::once(c.start_text).chain(text_ids.iter().copied()).chain(std::iter::once(c.stop_text)).collect();
@@ -205,7 +205,7 @@ impl Rng {
 /// The reference sampling chain over one CFG pair: cond + w(cond - uncond), repetition penalty
 /// over the sequence so far (BOS included, as the reference's `generated_ids`), temperature,
 /// min_p, top_p, then a draw. `u` in [0,1); `None` = greedy (argmax of the guided logits).
-pub fn sample_cfg(c: &T3Contract, cond: &[f32], uncond: &[f32], history: &[u32], u: Option<f32>, scratch: &mut Vec<f32>) -> u32 {
+pub fn sample_cfg(c: &GuidedLmContract, cond: &[f32], uncond: &[f32], history: &[u32], u: Option<f32>, scratch: &mut Vec<f32>) -> u32 {
     scratch.clear();
     scratch.extend(cond.iter().zip(uncond).map(|(a, b)| a + c.cfg_weight * (a - b)));
     let Some(u) = u else {
@@ -275,7 +275,7 @@ fn argmax(v: &[f32]) -> u32 {
 }
 
 /// One request in flight on a slot pair.
-pub struct T3Job {
+pub struct GuidedJob {
     pub voice: String,
     pub text: String,
     /// `None` = greedy guided decoding (the numerics gate); `Some(seed)` = the sampling chain.
@@ -297,10 +297,10 @@ struct Active {
 
 /// T3 over a `GpuEngine` it owns: prefill and CFG decode for a batch of jobs, continuous over
 /// slot pairs (a finished pair is refilled from the pending queue before the next step).
-pub struct T3Engine {
+pub struct GuidedLm {
     pub e: GpuEngine,
-    pub c: T3Contract,
-    pub tables: T3Tables,
+    pub c: GuidedLmContract,
+    pub tables: PromptTables,
     logits: Vec<f32>,
     uncond: Vec<f32>,
     scratch: Vec<f32>,
@@ -309,24 +309,24 @@ pub struct T3Engine {
 
 /// Per-job result: speech tokens (stop excluded) and timing.
 #[derive(Debug, Clone, Default)]
-pub struct T3Output {
+pub struct GuidedOutput {
     pub tokens: Vec<u32>,
     pub prefill_us: u64,
     pub decode_us: u64,
     pub steps: usize,
 }
 
-impl T3Engine {
+impl GuidedLm {
     pub fn load(assets: &Path, device: u8) -> Result<Self> {
-        let c = T3Contract::load(assets)?
+        let c = GuidedLmContract::load(assets)?
             .ok_or_else(|| RuntimeError::Rejected(format!("{} declares no {DRIVER} pipeline", assets.display())))?;
         let be = std::sync::Arc::new(crate::device::cuda::CudaBackend::new(device)?);
         let e = GpuEngine::load(be, assets, &assets.join("checkpoint"))?;
         if e.vocab() != c.speech_vocab {
             return Err(RuntimeError::Rejected("T3 engine vocab disagrees with the contract".into()));
         }
-        let tables = T3Tables::load(assets, c.hidden)?;
-        Ok(T3Engine { e, c, tables, logits: Vec::new(), uncond: Vec::new(), scratch: Vec::new(), raw: Vec::new() })
+        let tables = PromptTables::load(assets, c.hidden)?;
+        Ok(GuidedLm { e, c, tables, logits: Vec::new(), uncond: Vec::new(), scratch: Vec::new(), raw: Vec::new() })
     }
 
     pub fn pairs(&self) -> usize {
@@ -364,7 +364,7 @@ impl T3Engine {
         Ok(())
     }
 
-    fn admit(&mut self, jobs: &[T3Job], index: usize, pair: usize, out: &mut [T3Output]) -> Result<Active> {
+    fn admit(&mut self, jobs: &[GuidedJob], index: usize, pair: usize, out: &mut [GuidedOutput]) -> Result<Active> {
         let t0 = std::time::Instant::now();
         let job = &jobs[index];
         let ids = self.tables.text_ids(&job.text)?;
@@ -404,11 +404,11 @@ impl T3Engine {
     }
 
     /// Run every job to completion; `on_done(index, output)` fires as each finishes.
-    pub fn run(&mut self, jobs: &[T3Job], on_done: impl FnMut(usize, T3Output)) -> Result<()> {
+    pub fn run(&mut self, jobs: &[GuidedJob], on_done: impl FnMut(usize, GuidedOutput)) -> Result<()> {
         let mut it = jobs.iter();
         self.serve(
             |_| {
-                it.next().map(|j| T3Job {
+                it.next().map(|j| GuidedJob {
                     voice: j.voice.clone(),
                     text: j.text.clone(),
                     seed: j.seed,
@@ -428,12 +428,12 @@ impl T3Engine {
     /// through `on_done` with no tokens and does not stop the loop.
     pub fn serve(
         &mut self,
-        mut next: impl FnMut(bool) -> Option<T3Job>,
+        mut next: impl FnMut(bool) -> Option<GuidedJob>,
         mut on_token: impl FnMut(usize, u32),
-        mut on_done: impl FnMut(usize, T3Output),
+        mut on_done: impl FnMut(usize, GuidedOutput),
     ) -> Result<()> {
-        let mut jobs: Vec<T3Job> = Vec::new();
-        let mut outputs: Vec<T3Output> = Vec::new();
+        let mut jobs: Vec<GuidedJob> = Vec::new();
+        let mut outputs: Vec<GuidedOutput> = Vec::new();
         let mut started: Vec<std::time::Instant> = Vec::new();
         let mut active: Vec<Option<Active>> = (0..self.pairs()).map(|_| None).collect();
         let mut toks = Vec::new();
@@ -451,7 +451,7 @@ impl T3Engine {
                 };
                 let index = jobs.len();
                 jobs.push(job);
-                outputs.push(T3Output::default());
+                outputs.push(GuidedOutput::default());
                 started.push(std::time::Instant::now());
                 match self.admit(&jobs, index, pair, &mut outputs) {
                     Ok(a) => active[pair] = Some(a),
@@ -508,8 +508,8 @@ impl T3Engine {
 mod tests {
     use super::*;
 
-    fn contract() -> T3Contract {
-        T3Contract {
+    fn contract() -> GuidedLmContract {
+        GuidedLmContract {
             hidden: 4,
             overlay_rows: 8,
             decode_capacity: 2,
@@ -520,7 +520,7 @@ mod tests {
             text_vocab: 704,
             speech_vocab: 6,
             max_speech_tokens: 10,
-            s3_valid_below: 6561,
+            valid_below: 6561,
             cfg_weight: 0.5,
             temperature: 0.8,
             min_p: 0.05,

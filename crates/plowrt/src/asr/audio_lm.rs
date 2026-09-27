@@ -15,19 +15,19 @@ mod cuda;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal;
 
-pub(crate) struct QwenPrefill<'a> {
+pub(crate) struct AudioLmPrefill<'a> {
     pub features: &'a MelFeatures,
     pub token_ids: &'a [u32],
     pub audio_positions: &'a [usize],
     pub hidden: usize,
 }
 
-pub(crate) struct QwenDecode {
+pub(crate) struct AudioLmDecode {
     pub tokens: Vec<u32>,
     pub launched_rows: usize,
 }
 
-pub(crate) struct QwenPrefilled {
+pub(crate) struct AudioLmPrefilled {
     pub token: u32,
     pub encoder_ms: f64,
     pub prefill_ms: f64,
@@ -155,33 +155,31 @@ fn round_bf16(value: f32) -> f32 {
     f32::from_bits((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
 }
 
-pub(crate) trait QwenExecution: Send {
+pub(crate) trait AudioLmExecution: Send {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
     fn batch_capacity(&self) -> usize;
     fn max_context(&self) -> usize;
-    fn prefill(&mut self, slot: usize, input: QwenPrefill<'_>) -> Result<QwenPrefilled>;
+    fn prefill(&mut self, slot: usize, input: AudioLmPrefill<'_>) -> Result<AudioLmPrefilled>;
     fn decode(
         &mut self,
         positions: &[u32],
         kv_lengths: &[u32],
         token_ids: &[u32],
         occupied_rows: usize,
-    ) -> Result<QwenDecode>;
+    ) -> Result<AudioLmDecode>;
 }
 
 /// A causal audio LM (encoder rows spliced over a placeholder token, then greedy decoding)
 /// driven entirely by its packets: `encoder.pkt` carries the frontend and chunking, the causal
 /// pipeline of `model.pkt` the prompt layout, markers, languages and stop ids. The checkpoint
 /// directory supplies only the tokenizer and chat template.
-pub struct QwenAsr {
-    execution: Box<dyn QwenExecution>,
+pub struct AudioLmAsr {
+    execution: Box<dyn AudioLmExecution>,
     frontend: PacketLogMelFrontend,
     tokenizer: Arc<dyn Tokenize>,
     template: Arc<ChatTemplate>,
     contract: AudioLmContract,
 }
-
-pub type AudioLmAsr = QwenAsr;
 
 struct AudioLmContract {
     hidden: usize,
@@ -311,9 +309,9 @@ struct PrefilledAudio {
     prefill_ms: f64,
 }
 
-impl super::Transcriber for QwenAsr {
+impl super::Transcriber for AudioLmAsr {
     fn language(&self, requested: Option<&str>) -> Result<Option<String>> {
-        QwenAsr::language(self, requested)
+        AudioLmAsr::language(self, requested)
     }
     fn batch_capacity(&self) -> usize {
         self.execution.batch_capacity()
@@ -332,7 +330,7 @@ impl super::Transcriber for QwenAsr {
         context: &str,
         cancel: &AtomicBool,
     ) -> Result<Transcript> {
-        QwenAsr::transcribe(self, samples, language, context, cancel)
+        AudioLmAsr::transcribe(self, samples, language, context, cancel)
     }
 
     fn transcribe_batch(
@@ -343,7 +341,7 @@ impl super::Transcriber for QwenAsr {
     }
 }
 
-impl QwenAsr {
+impl AudioLmAsr {
     pub fn load(packet: &std::path::Path, checkpoint: &std::path::Path) -> Result<Self> {
         Self::load_with_backend(packet, checkpoint, "auto").map(|(engine, _)| engine)
     }
@@ -461,7 +459,7 @@ impl QwenAsr {
         let frontend_ms = started.elapsed().as_secs_f64() * 1000.0;
         let prepared = self.execution.prefill(
             slot,
-            QwenPrefill {
+            AudioLmPrefill {
                 features: &features,
                 token_ids: &ids,
                 audio_positions: &positions,
@@ -696,7 +694,7 @@ fn load_execution(
     checkpoint: &std::path::Path,
     backend: &str,
     hidden: usize,
-) -> Result<(Box<dyn QwenExecution>, &'static str)> {
+) -> Result<(Box<dyn AudioLmExecution>, &'static str)> {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     if matches!(backend, "auto" | "metal") {
         return Ok((metal::load_execution(packet, checkpoint, hidden)?, "metal"));

@@ -1,6 +1,6 @@
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use plowrt::asr::{frontend::decode_wav, qwen::QwenAsr};
+    use plowrt::asr::{frontend::decode_wav, audio_lm::AudioLmAsr};
     use serde_json::{json, Value};
     use std::{io::Write, path::Path, sync::atomic::AtomicBool, time::Instant};
 
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .create_new(true)
         .open(&args[5])?;
     let cancel = AtomicBool::new(false);
-    let mut baseline = QwenAsr::load(Path::new(&args[2]), Path::new(&args[1]))?;
+    let mut baseline = AudioLmAsr::load(Path::new(&args[2]), Path::new(&args[1]))?;
     assert_eq!(
         baseline.batch_capacity(),
         1,
@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         expected.push(result);
     }
     drop(baseline);
-    let mut engine = QwenAsr::load(Path::new(&args[3]), Path::new(&args[1]))?;
+    let mut engine = AudioLmAsr::load(Path::new(&args[3]), Path::new(&args[1]))?;
     let batch = engine.batch_capacity();
     if batch < 2 || samples.len() <= batch || samples.len() % batch == 0 {
         return Err(

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use super::codec::Codec;
-use super::t3::{T3Engine, T3Job};
+use super::guided_lm::{GuidedLm, GuidedJob};
 use crate::{Result, RuntimeError};
 
 /// The vocoder packet beside the LM packet.
@@ -80,7 +80,7 @@ enum S3Msg {
     Close { id: usize, t3_ms: f64 },
 }
 
-pub struct ChatterboxWorker {
+pub struct GuidedSpeechWorker {
     tx: parking_lot::Mutex<mpsc::Sender<SpeechRequest>>,
     pub sample_rate: u32,
 }
@@ -254,7 +254,7 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, urgent:
     }
 }
 
-impl ChatterboxWorker {
+impl GuidedSpeechWorker {
     pub fn start(assets: &Path, device: u8) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<SpeechRequest>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
@@ -267,11 +267,11 @@ impl ChatterboxWorker {
         std::thread::Builder::new()
             .name("plow-tts-t3".into())
             .spawn(move || {
-                let mut t3 = match T3Engine::load(&dir, device) {
+                let mut t3 = match GuidedLm::load(&dir, device) {
                     Ok(t) => t,
                     Err(e) => return drop(ready_tx.send(Err(e))),
                 };
-                let valid_below = t3.c.s3_valid_below;
+                let valid_below = t3.c.valid_below;
                 let _ = ready_tx.send(Ok(()));
                 let started: std::cell::RefCell<Vec<std::time::Instant>> = Default::default();
                 let res = t3.serve(
@@ -283,7 +283,7 @@ impl ChatterboxWorker {
                             s.len() - 1
                         };
                         let _ = s_tx.send(S3Msg::Open { id, voice: req.voice.clone(), seed: req.seed, reply: req.reply });
-                        Some(T3Job { voice: req.voice, text: req.text, seed: Some(req.seed), max_tokens: None })
+                        Some(GuidedJob { voice: req.voice, text: req.text, seed: Some(req.seed), max_tokens: None })
                     },
                     |id, token| {
                         while urgent.load(Ordering::Acquire) {
@@ -323,7 +323,7 @@ impl ChatterboxWorker {
             })
             .map_err(|e| RuntimeError::Device(e.to_string()))?;
         s_ready_rx.recv().map_err(|e| RuntimeError::Device(e.to_string()))??;
-        Ok(ChatterboxWorker { tx: parking_lot::Mutex::new(tx), sample_rate: 24000 })
+        Ok(GuidedSpeechWorker { tx: parking_lot::Mutex::new(tx), sample_rate: 24000 })
     }
 
     fn submit(&self, voice: String, text: String, seed: u64, reply: Reply) -> std::result::Result<(), String> {

@@ -53,8 +53,8 @@ pub struct SpeechRequest {
 }
 
 /// Speech pipelines that own their engine (`tts.t3_cfg.v1`), by served model name.
-fn workers() -> &'static Mutex<HashMap<String, Arc<super::chatterbox::ChatterboxWorker>>> {
-    static W: OnceLock<Mutex<HashMap<String, Arc<super::chatterbox::ChatterboxWorker>>>> = OnceLock::new();
+fn workers() -> &'static Mutex<HashMap<String, Arc<super::guided_speech::GuidedSpeechWorker>>> {
+    static W: OnceLock<Mutex<HashMap<String, Arc<super::guided_speech::GuidedSpeechWorker>>>> = OnceLock::new();
     W.get_or_init(Default::default)
 }
 
@@ -64,19 +64,19 @@ fn workers() -> &'static Mutex<HashMap<String, Arc<super::chatterbox::Chatterbox
 pub fn start_speech_workers(assets: Vec<PathBuf>, device: u8) -> crate::Result<Vec<PathBuf>> {
     let mut text = Vec::new();
     for dir in assets {
-        if super::t3::T3Contract::load(&dir)?.is_none() {
+        if super::guided_lm::GuidedLmContract::load(&dir)?.is_none() {
             text.push(dir);
             continue;
         }
         let name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        let w = super::chatterbox::ChatterboxWorker::start(&dir, device)?;
+        let w = super::guided_speech::GuidedSpeechWorker::start(&dir, device)?;
         tracing::info!(model = %name, dir = %dir.display(), "tts: chatterbox speech pipeline ready");
         workers().lock().insert(name, Arc::new(w));
     }
     Ok(text)
 }
 
-async fn speech_on_worker(w: Arc<super::chatterbox::ChatterboxWorker>, req: SpeechRequest, t_arrive: Instant) -> Response {
+async fn speech_on_worker(w: Arc<super::guided_speech::GuidedSpeechWorker>, req: SpeechRequest, t_arrive: Instant) -> Response {
     let wav = match req.response_format.as_deref().unwrap_or("wav") {
         "wav" => true,
         "pcm" => false,
@@ -102,7 +102,7 @@ async fn speech_on_worker(w: Arc<super::chatterbox::ChatterboxWorker>, req: Spee
             let (mut samples, mut first) = (0usize, None);
             while let Some(e) = ev.recv().await {
                 match e {
-                    super::chatterbox::StreamEvent::Pcm(p) => {
+                    super::guided_speech::StreamEvent::Pcm(p) => {
                         first.get_or_insert_with(|| t_arrive.elapsed());
                         samples += p.len();
                         let mut bytes = Vec::with_capacity(p.len() * 2);
@@ -111,13 +111,13 @@ async fn speech_on_worker(w: Arc<super::chatterbox::ChatterboxWorker>, req: Spee
                             return;
                         }
                     }
-                    super::chatterbox::StreamEvent::Done { tokens, t3_ms, s3gen_ms } => {
+                    super::guided_speech::StreamEvent::Done { tokens, t3_ms, s3gen_ms } => {
                         let total = t_arrive.elapsed().as_secs_f64();
                         let audio_s = samples as f64 / sr;
                         tracing::info!(tokens, audio_s, t3_ms, s3gen_ms, ttfa_ms = first.map(|d| d.as_secs_f64() * 1e3), total_ms = total * 1e3, rtf = total / audio_s, "tts: chatterbox stream");
                         return;
                     }
-                    super::chatterbox::StreamEvent::Err(e) => return drop(out_tx.send(Err(std::io::Error::other(e))).await),
+                    super::guided_speech::StreamEvent::Err(e) => return drop(out_tx.send(Err(std::io::Error::other(e))).await),
                 }
             }
         });
