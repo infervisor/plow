@@ -67,10 +67,13 @@ def main():
     s = requests.Session()
     for c in clips[:4]:
         post(s, args.url, args.model, c["path"])
+    failed = False
     for n in map(int, args.conc.split(",")):
         r = level(args, clips, n)
         r["tag"] = args.tag
         print(json.dumps(r), flush=True)
+        failed |= r["errors"] > 0
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":

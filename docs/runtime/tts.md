@@ -81,6 +81,21 @@ each model has its own mux and KV, and the device changes hands at launch bounda
 (`--co-sched free|rr`). `scripts/tts/plow_coserve_probe.sh` runs each model alone, the
 switch latency (`switch_bench.py`) and all three under concurrent load in one lease.
 
+H100, 2026-09-27, reproduced assets, one process:
+
+| | solo (same process) | mixed, `--co-sched free` | mixed, `--co-sched rr` |
+|---|---|---|---|
+| Qwen3-ASR c4 (RTFx, p50) | 168.6, 134 ms | 21.6, 1323 ms | 25.3, 738 ms |
+| Veena stream c8 (audio s/s) | 14.76 | 9.46 | 11.73 |
+| Chatterbox full c4 (audio s/s) | 12.84 | 2.82 | 4.86 |
+
+Gates hold co-served (WER 3.913%, CER 0.026 / 0.000); switching between models costs < 0.5 ms
+(back-to-back requests alternating across the three vs one model). Under mixed load the GPU is
+saturated: persistent cooperative kernels take the whole device, so models alternate, and the
+solo-normalized shares sum to ~1.0 (`free`) and ~1.3 (`rr`). Use `rr` when co-serving speech.
+Tried and reverted (no gain): single-step ticks while a co-tenant waits, and holding the turn for
+a whole encoder/codec/vocoder sequence (worse: a 166 ms S3Gen render then blocks everyone).
+
 ## Validation tools (`scripts/tts/`)
 
 | tool | use |
