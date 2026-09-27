@@ -133,3 +133,18 @@ Qwen3-ASR encoder (390 rows, ncu): 63 ms GPU; DenseGemmF32 79% at 1.6 TF (floor 
 
 SNAC codec packet (parity 3-4e-6 vs native): b1.f8 4.29 ms (ConvT 55%, pointwise 31%);
 b32.f8 31.8 ms (pointwise 37%, ConvT 23%, snake 18%, binary 11%) -> kernel work in progress.
+
+## Goal (2026-09-27): +50% at production workloads, all three models
+Baseline = results/final-pre (H100, same client). Targets (1.5x):
+| model | metric | pre | target |
+|---|---|---|---|
+| Veena | stream aps c8/c32/c64 | 13.9/26.7/30.0 | >=20.9/40.1/45.0 |
+| Veena | c1 TTFA | 104 ms | <=69 ms |
+| Chatterbox | full aps c1/c8 | 8.16/12.0 | >=12.2/18.0 |
+| Chatterbox | stream c8 aps / c1 TTFA | 3.9 / 251 ms | >=5.8 / <=167 ms |
+| Qwen3-ASR | p50 / seq RTFx | 113 ms / 54 | <=75 ms / >=81 |
+Rungs (speech-shaped, replace LLM 128..2048): Veena prefill 64,128,256,512 decode 1..32(->64);
+T3 prefill 128,256,384,512 decode 1..32 (CFG pairs); Qwen decoder prefill 128,256,384,512 decode 1..16;
+SNAC (B,F) incl. streaming windows B<=64 x F=8; S3Gen (B,T) 1..8 x 64..1000; ASR encoder 400..3000 frames.
+Admission findings: Veena LM slot frees before codec (unbounded codec queue); Chatterbox bypasses mux (no
+bound/TTL/cancel, burst stalls live streams 2N prefills); ASR cohort-to-completion, N^2 partials.

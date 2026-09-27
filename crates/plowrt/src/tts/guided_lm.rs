@@ -293,6 +293,8 @@ struct Active {
     greedy: bool,
     max: usize,
     last: u32,
+    started: std::time::Instant,
+    prefill_us: u64,
 }
 
 /// T3 over a `GpuEngine` it owns: prefill and CFG decode for a batch of jobs, continuous over
@@ -364,9 +366,8 @@ impl GuidedLm {
         Ok(())
     }
 
-    fn admit(&mut self, jobs: &[GuidedJob], index: usize, pair: usize, out: &mut [GuidedOutput]) -> Result<Active> {
+    fn admit(&mut self, job: &GuidedJob, index: usize, pair: usize) -> Result<Active> {
         let t0 = std::time::Instant::now();
-        let job = &jobs[index];
         let ids = self.tables.text_ids(&job.text)?;
         let (cond, uncond) = (2 * pair, 2 * pair + 1);
         let rows = self.tables.prefill_rows(&self.c, &job.voice, &ids, true)?;
@@ -385,10 +386,12 @@ impl GuidedLm {
             greedy,
             max: job.max_tokens.unwrap_or(self.c.max_speech_tokens).min(self.c.max_speech_tokens),
             last: 0,
+            started: t0,
+            prefill_us: 0,
         };
         let u = (!greedy).then(|| a.rng.unit());
         a.last = sample_cfg(&self.c, &self.logits, &self.uncond, &a.history, u, &mut self.scratch);
-        out[index].prefill_us = t0.elapsed().as_micros() as u64;
+        a.prefill_us = t0.elapsed().as_micros() as u64;
         Ok(a)
     }
 
@@ -415,31 +418,32 @@ impl GuidedLm {
                     max_tokens: j.max_tokens,
                 })
             },
-            |_, _| {},
+            |_, _| true,
             on_done,
         )
     }
 
     /// Continuous batching over slot pairs. `next(block)` supplies the next job (arrival index =
     /// call order); it is polled while a pair is free and asked to BLOCK only when nothing is in
-    /// flight, and `None` from a blocking call ends the loop. `on_done(index, output)` fires as
-    /// each job finishes; `on_token(index, token)` fires for each speech token as it is committed.
-    /// A job whose admission fails (unknown voice, text too long) is reported
-    /// through `on_done` with no tokens and does not stop the loop.
+    /// flight, and `None` from a blocking call ends the loop. While other requests are decoding at
+    /// most one job is admitted (two prefills) per step, so a burst of arrivals does not stall live
+    /// streams. `on_token(index, token)` fires for each speech token as it is committed and returns
+    /// false to cancel the request (its pair is freed). `on_done(index, output)` fires as each job
+    /// finishes; a job whose admission fails (unknown voice, text too long) is reported through
+    /// `on_done` with no tokens and does not stop the loop.
     pub fn serve(
         &mut self,
         mut next: impl FnMut(bool) -> Option<GuidedJob>,
-        mut on_token: impl FnMut(usize, u32),
+        mut on_token: impl FnMut(usize, u32) -> bool,
         mut on_done: impl FnMut(usize, GuidedOutput),
     ) -> Result<()> {
-        let mut jobs: Vec<GuidedJob> = Vec::new();
-        let mut outputs: Vec<GuidedOutput> = Vec::new();
-        let mut started: Vec<std::time::Instant> = Vec::new();
+        let mut arrivals = 0usize;
         let mut active: Vec<Option<Active>> = (0..self.pairs()).map(|_| None).collect();
         let mut toks = Vec::new();
         let mut feeds = Vec::new();
         let mut closed = false;
         loop {
+            let live = active.iter().any(Option::is_some);
             for pair in 0..active.len() {
                 if active[pair].is_some() || closed {
                     continue;
@@ -449,27 +453,28 @@ impl GuidedLm {
                     closed = idle;
                     break;
                 };
-                let index = jobs.len();
-                jobs.push(job);
-                outputs.push(GuidedOutput::default());
-                started.push(std::time::Instant::now());
-                match self.admit(&jobs, index, pair, &mut outputs) {
+                let index = arrivals;
+                arrivals += 1;
+                match self.admit(&job, index, pair) {
                     Ok(a) => active[pair] = Some(a),
                     Err(e) => {
-                        tracing::warn!(error = %e, "t3: request rejected at admission");
-                        on_done(index, std::mem::take(&mut outputs[index]));
+                        tracing::warn!(error = %e, "guided LM: request rejected at admission");
+                        on_done(index, GuidedOutput::default());
                     }
+                }
+                if live {
+                    break;
                 }
             }
             for pair in 0..active.len() {
                 let finished = active[pair].as_ref().is_some_and(|a| a.last == self.c.stop_speech || a.out.len() >= a.max);
                 if finished {
                     let a = active[pair].take().expect("checked");
-                    let mut o = std::mem::take(&mut outputs[a.job_index]);
-                    o.tokens = a.out;
-                    o.steps = o.tokens.len();
-                    o.decode_us = started[a.job_index].elapsed().as_micros() as u64;
-                    on_done(a.job_index, o);
+                    let steps = a.out.len();
+                    on_done(
+                        a.job_index,
+                        GuidedOutput { tokens: a.out, prefill_us: a.prefill_us, decode_us: a.started.elapsed().as_micros() as u64, steps },
+                    );
                 }
             }
             if active.iter().all(Option::is_none) {
@@ -479,12 +484,20 @@ impl GuidedLm {
                 continue;
             }
             feeds.clear();
-            for a in active.iter_mut().flatten() {
+            for slot in active.iter_mut() {
+                let Some(a) = slot.as_mut() else { continue };
                 a.out.push(a.last);
                 a.history.push(a.last);
-                on_token(a.job_index, a.last);
+                if !on_token(a.job_index, a.last) {
+                    // Cancelled: the caller already dropped the request; free the pair now.
+                    *slot = None;
+                    continue;
+                }
                 feeds.push((a.cond, a.last));
                 feeds.push((a.uncond, a.last));
+            }
+            if feeds.is_empty() {
+                continue;
             }
             self.e.step_slots(&feeds, &mut toks)?;
             for pair in 0..active.len() {

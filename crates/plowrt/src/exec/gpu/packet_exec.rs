@@ -30,7 +30,7 @@ pub struct CudaPacketRuntime {
     be: Arc<CudaBackend>,
     stream: CudaStream,
     events: (CudaEvent, CudaEvent),
-    _module: Module,
+    module: Module,
     function: KernelFn,
     grid: u32,
     smem: u32,
@@ -157,7 +157,7 @@ impl CudaPacketRuntime {
             be,
             stream,
             events,
-            _module: module,
+            module,
             function,
             grid: blob.n_cu,
             smem,
@@ -168,6 +168,11 @@ impl CudaPacketRuntime {
             graphs: std::collections::HashMap::new(),
             last_us: 0.0,
         })
+    }
+
+    /// Skip every instruction at or past `limit` (per-instruction cost by caps).
+    pub fn set_debug_max_inst(&self, limit: u32) -> Result<bool> {
+        self.be.module_global_set_u32(&self.module, "plow_debug_max_inst_speech", limit)
     }
 
     pub fn backend(&self) -> &Arc<CudaBackend> {

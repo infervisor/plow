@@ -10527,6 +10527,12 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// Skip every decode instruction at or past `limit` (profiling by instruction caps: the
+    /// marginal step time of instruction i is time(limit = i + 1) - time(limit = i)).
+    pub fn set_debug_max_inst(&self, limit: u32) -> Result<bool> {
+        self.be.module_global_set_u32(&self.module, "plow_debug_max_inst", limit)
+    }
+
     /// Reset the PLOW_NV_TRACE packet counter so [`Self::trace_summary`]
     /// reports only launches after this call (drop prefill/warmup). No-op on
     /// a normal cubin.

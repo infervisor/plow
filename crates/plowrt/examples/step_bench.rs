@@ -44,12 +44,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut same = false;
     let mut multistep = false;
     let mut warmup = 16usize;
+    let mut sweep: Option<(u32, u32)> = None;
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--same" => same = true,
             "--multistep" => multistep = true,
             "--warmup" => warmup = args.next().ok_or("--warmup N")?.parse()?,
+            // `--sweep LO..HI`: time decode steps with instruction caps LO..=HI in this process.
+            "--sweep" => {
+                let r = args.next().ok_or("--sweep LO..HI")?;
+                let (lo, hi) = r.split_once("..").ok_or("--sweep LO..HI")?;
+                sweep = Some((lo.parse()?, hi.parse()?));
+            }
             "--dump-tensors" => dump_names = Some(args.next().ok_or("--dump-tensors a,b")?),
             "--dump-dir" => dump_dir = Some(args.next().ok_or("--dump-dir d")?),
             other => return Err(format!("unknown argument {other}").into()),
@@ -107,6 +114,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..warmup {
         e.step_slots(&feeds_of(&last), &mut toks)?;
         last.copy_from_slice(&toks);
+    }
+    if let Some((lo, hi)) = sweep {
+        for cap in (lo..=hi).chain([u32::MAX]) {
+            e.set_debug_max_inst(cap)?;
+            for _ in 0..4 {
+                e.step_slots(&feeds_of(&last), &mut toks)?;
+            }
+            let mut v: Vec<f64> = (0..steps)
+                .map(|_| {
+                    let t0 = Instant::now();
+                    e.step_slots(&feeds_of(&last), &mut toks).map(|_| t0.elapsed().as_secs_f64() * 1e3)
+                })
+                .collect::<Result<_, _>>()?;
+            v.sort_by(f64::total_cmp);
+            println!("{{\"cap\":{},\"ms\":{:.4}}}", if cap == u32::MAX { -1 } else { cap as i64 }, v[v.len() / 2]);
+        }
+        return Ok(());
     }
     // Drop prefill + warmup from the trace so the profile is timed-decode only.
     e.trace_reset()?;

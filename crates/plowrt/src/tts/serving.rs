@@ -52,14 +52,14 @@ pub struct SpeechRequest {
     pub max_tokens: Option<usize>,
 }
 
-/// Speech pipelines that own their engine (`tts.t3_cfg.v1`), by served model name.
+/// Speech pipelines that own their engine (`tts.guided_lm.v1`), by served model name.
 fn workers() -> &'static Mutex<HashMap<String, Arc<super::guided_speech::GuidedSpeechWorker>>> {
     static W: OnceLock<Mutex<HashMap<String, Arc<super::guided_speech::GuidedSpeechWorker>>>> = OnceLock::new();
     W.get_or_init(Default::default)
 }
 
 /// Split `plowrt serve --assets` into text-engine assets and self-hosted speech pipelines. Each
-/// `tts.t3_cfg.v1` asset starts a Chatterbox worker (its own engine on `device`) served under
+/// `tts.guided_lm.v1` asset starts a guided speech worker (its own engine on `device`) served under
 /// the directory name; the rest go to the text registry unchanged.
 pub fn start_speech_workers(assets: Vec<PathBuf>, device: u8) -> crate::Result<Vec<PathBuf>> {
     let mut text = Vec::new();
@@ -178,6 +178,10 @@ fn bad(msg: impl Into<String>, param: &str) -> Response {
 }
 
 fn server_error(msg: impl Into<String>) -> Response {
+    let msg = msg.into();
+    if msg == super::guided_speech::QUEUE_FULL {
+        return crate::serve::api_error(StatusCode::TOO_MANY_REQUESTS, msg, "rate_limit_error", Some("server_overloaded"), None);
+    }
     crate::serve::api_error(StatusCode::INTERNAL_SERVER_ERROR, msg, "server_error", None, None)
 }
 

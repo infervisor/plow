@@ -38,6 +38,9 @@ pub const CUBLASLT_PREFILL_ROWS: [u32; 3] = [128, 256, 512];
 /// N+1 rows. Left out, such a rung ran every projection on the native GEMM object. Measured on
 /// h100-sxm5 2026-09-21: 12B C1 TTFT at 1024 in 47.22 -> 46.82 ms on the 1088 rung; 1152 (26B and
 /// 12B) and 4160 neutral.
+/// Short-prompt speech rungs (`PLOW_PF_LADDER_APPEND`): codec-LM prompts are ~20-60 rows, guided
+/// speech-LM prefills (voice rows + text) and audio-LM prefills (audio rows + prompt) ~150-420.
+pub const CUBLASLT_PREFILL_SPEECH_ROWS: [u32; 2] = [64, 384];
 pub const CUBLASLT_PREFILL_WIDE_ROWS: [u32; 12] = [1024, 1088, 1152, 2048, 4096, 4160, 4224, 8192, 8320, 12288, 12416, 16384];
 pub const CUBLASLT_PREFILL_GEMMA4_SHAPES: [(u32, u32); 8] = [
     (15360, 3840),
@@ -95,7 +98,9 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
     // ~50 us per launch for the q/k/v and sliding-o shapes (~176 launches per chunk) while the
     // cuBLASLt calls at the same M run 10-45 us (H100 2026-09-17, campaign tracker).
     matches!(profile, "sm90a" | "sm_90a")
-        && (CUBLASLT_PREFILL_ROWS.contains(&m) || CUBLASLT_PREFILL_WIDE_ROWS.contains(&m))
+        && (CUBLASLT_PREFILL_ROWS.contains(&m)
+            || CUBLASLT_PREFILL_WIDE_ROWS.contains(&m)
+            || CUBLASLT_PREFILL_SPEECH_ROWS.contains(&m))
         && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
             || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k))
             || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))

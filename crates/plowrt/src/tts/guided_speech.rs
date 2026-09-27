@@ -21,6 +21,10 @@ use super::codec::Codec;
 use super::guided_lm::{GuidedLm, GuidedJob};
 use crate::{Result, RuntimeError};
 
+/// Requests waiting for a slot pair; beyond this the route answers 429.
+const QUEUE: usize = 64;
+pub const QUEUE_FULL: &str = "speech request queue full";
+
 /// The vocoder packet beside the LM packet.
 pub const VOCODER: &str = "s3gen.pkt";
 
@@ -78,10 +82,12 @@ enum S3Msg {
     Open { id: usize, voice: String, seed: u64, reply: Reply },
     Token { id: usize, token: u32 },
     Close { id: usize, t3_ms: f64 },
+    /// The client went away: forget the utterance.
+    Drop { id: usize },
 }
 
 pub struct GuidedSpeechWorker {
-    tx: parking_lot::Mutex<mpsc::Sender<SpeechRequest>>,
+    tx: parking_lot::Mutex<mpsc::SyncSender<SpeechRequest>>,
     pub sample_rate: u32,
 }
 
@@ -98,6 +104,11 @@ struct Utterance {
 }
 
 impl Utterance {
+    /// An open stream whose first audio has not been rendered yet.
+    fn first_chunk(&self) -> bool {
+        self.rendered == 0 && self.t3_ms.is_none() && matches!(self.reply, Reply::Stream(_))
+    }
+
     /// Due for a render: a closed utterance always; an open stream once a chunk has arrived.
     fn due(&self, sc: &Schedule) -> bool {
         match (&self.reply, self.t3_ms) {
@@ -183,6 +194,9 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, urgent:
                 u.t3_ms = Some(t3_ms);
             }
         }
+        S3Msg::Drop { id } => {
+            live.remove(&id);
+        }
     };
     loop {
         if !live.values().any(|u| u.due(&sc)) {
@@ -200,21 +214,28 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, urgent:
                 u.fail("T3 produced no speech tokens".into());
             }
         }
-        // Closed utterances first, then the streams furthest behind.
+        // First chunks of streams first (time to first audio), then closed utterances, then the
+        // streams furthest behind.
         let mut due: Vec<usize> = live.iter().filter(|(_, u)| u.due(&sc)).map(|(&k, _)| k).collect();
         due.sort_by_key(|k| {
             let u = &live[k];
-            (u.t3_ms.is_none(), u.rendered as isize - u.tokens.len() as isize, *k)
+            let class = if u.first_chunk() { 0 } else if u.t3_ms.is_some() { 1 } else { 2 };
+            (class, u.rendered as isize - u.tokens.len() as isize, *k)
         });
         due.truncate(max_batch);
         if due.is_empty() {
             continue;
         }
-        let first = due.iter().any(|k| {
-            let u = &live[k];
-            u.rendered == 0 && u.t3_ms.is_none() && matches!(u.reply, Reply::Stream(_))
-        });
+        let first = due.iter().any(|k| live[k].first_chunk());
+        // Cleared on every exit, a panicking render included, so the LM never waits forever.
+        struct Urgent<'a>(&'a AtomicBool);
+        impl Drop for Urgent<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
         urgent.store(first, Ordering::Release);
+        let guard = Urgent(urgent);
         let t = std::time::Instant::now();
         // Submitted together so the vocoder worker batches them into one launch.
         let renders: Vec<_> = due
@@ -233,7 +254,7 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, urgent:
             })
             .collect();
         let results = futures::executor::block_on(futures::future::join_all(renders));
-        urgent.store(false, Ordering::Release);
+        drop(guard);
         let ms = t.elapsed().as_secs_f64() * 1e3;
         tracing::debug!(renders = due.len(), tokens = ?due.iter().map(|k| live[k].tokens.len()).collect::<Vec<_>>(), ms, "vocoder render");
         for (k, pcm) in due.into_iter().zip(results) {
@@ -256,7 +277,7 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, urgent:
 
 impl GuidedSpeechWorker {
     pub fn start(assets: &Path, device: u8) -> Result<Self> {
-        let (tx, rx) = mpsc::channel::<SpeechRequest>();
+        let (tx, rx) = mpsc::sync_channel::<SpeechRequest>(QUEUE);
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let (s_tx, s_rx) = mpsc::channel::<S3Msg>();
         let dir = assets.to_path_buf();
@@ -273,29 +294,41 @@ impl GuidedSpeechWorker {
                 };
                 let valid_below = t3.c.valid_below;
                 let _ = ready_tx.send(Ok(()));
-                let started: std::cell::RefCell<Vec<std::time::Instant>> = Default::default();
+                // Per request: arrival time and, for a stream, a handle to tell a vanished client.
+                let started: std::cell::RefCell<HashMap<usize, (std::time::Instant, Option<tokio::sync::mpsc::UnboundedSender<StreamEvent>>)>> =
+                    Default::default();
+                let arrivals = std::cell::Cell::new(0usize);
                 let res = t3.serve(
                     |block| {
                         let req = if block { rx.recv().ok() } else { rx.try_recv().ok() }?;
-                        let id = {
-                            let mut s = started.borrow_mut();
-                            s.push(std::time::Instant::now());
-                            s.len() - 1
+                        let id = arrivals.get();
+                        arrivals.set(id + 1);
+                        let probe = match &req.reply {
+                            Reply::Stream(tx) => Some(tx.clone()),
+                            Reply::Whole(_) => None,
                         };
+                        started.borrow_mut().insert(id, (std::time::Instant::now(), probe));
                         let _ = s_tx.send(S3Msg::Open { id, voice: req.voice.clone(), seed: req.seed, reply: req.reply });
                         Some(GuidedJob { voice: req.voice, text: req.text, seed: Some(req.seed), max_tokens: None })
                     },
                     |id, token| {
+                        if started.borrow().get(&id).and_then(|(_, p)| p.as_ref()).is_some_and(|p| p.is_closed()) {
+                            started.borrow_mut().remove(&id);
+                            let _ = s_tx.send(S3Msg::Drop { id });
+                            return false;
+                        }
                         while urgent.load(Ordering::Acquire) {
                             std::thread::sleep(std::time::Duration::from_micros(50));
                         }
                         if token < valid_below {
                             let _ = s_tx.send(S3Msg::Token { id, token });
                         }
+                        true
                     },
                     |id, _| {
-                        let t3_ms = started.borrow()[id].elapsed().as_secs_f64() * 1e3;
-                        let _ = s_tx.send(S3Msg::Close { id, t3_ms });
+                        if let Some((t0, _)) = started.borrow_mut().remove(&id) {
+                            let _ = s_tx.send(S3Msg::Close { id, t3_ms: t0.elapsed().as_secs_f64() * 1e3 });
+                        }
                     },
                 );
                 if let Err(e) = res {
@@ -327,7 +360,10 @@ impl GuidedSpeechWorker {
     }
 
     fn submit(&self, voice: String, text: String, seed: u64, reply: Reply) -> std::result::Result<(), String> {
-        self.tx.lock().send(SpeechRequest { voice, text, seed, reply }).map_err(|_| "chatterbox worker stopped".to_string())
+        self.tx.lock().try_send(SpeechRequest { voice, text, seed, reply }).map_err(|e| match e {
+            mpsc::TrySendError::Full(_) => QUEUE_FULL.to_string(),
+            mpsc::TrySendError::Disconnected(_) => "speech worker stopped".to_string(),
+        })
     }
 
     pub async fn synthesize(&self, voice: String, text: String, seed: u64) -> std::result::Result<SpeechAudio, String> {
