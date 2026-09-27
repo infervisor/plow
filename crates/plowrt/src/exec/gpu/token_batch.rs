@@ -95,7 +95,19 @@ impl GpuEngine {
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
     ) -> Result<()> {
-        self.token_batch_step_inner(requests, output, false)
+        self.token_batch_step_inner(requests, output, false, None)
+    }
+
+    /// As [`Self::token_batch_step`], with `spec(slot)` rows drawn on the device by `plow_sample`
+    /// from their logits rows instead of returning the argmax. A row whose spec is `None` keeps
+    /// the argmax; with no sampler loaded every row does.
+    pub fn token_batch_step_sampled(
+        &mut self,
+        requests: &[Request<'_>],
+        output: &mut Vec<(u32, u32)>,
+        spec: &dyn Fn(u32) -> Option<DevSample>,
+    ) -> Result<()> {
+        self.token_batch_step_inner(requests, output, false, Some(spec))
     }
 
     /// As [`Self::token_batch_step`], but parked behind the decode pipeline's event instead of
@@ -107,7 +119,7 @@ impl GpuEngine {
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
     ) -> Result<()> {
-        self.token_batch_step_inner(requests, output, true)
+        self.token_batch_step_inner(requests, output, true, None)
     }
 
     fn token_batch_step_inner(
@@ -115,6 +127,7 @@ impl GpuEngine {
         requests: &[Request<'_>],
         output: &mut Vec<(u32, u32)>,
         pipelined: bool,
+        spec: Option<&dyn Fn(u32) -> Option<DevSample>>,
     ) -> Result<()> {
         output.clear();
         let mut state = self.token_batch.take().ok_or_else(|| {
@@ -216,6 +229,15 @@ impl GpuEngine {
                     carry: decode_slots.contains(&owner.slot),
                 })
                 .collect();
+            let specs: Option<smallvec::SmallVec<[DevSample; 32]>> =
+                spec.filter(|_| !pipelined && self.sampler.is_some()).and_then(|spec| {
+                    let specs: smallvec::SmallVec<[DevSample; 32]> = plan
+                        .sample_owners
+                        .iter()
+                        .map(|owner| spec(owner.slot).unwrap_or_else(DevSample::greedy))
+                        .collect();
+                    specs.iter().any(|s| s.temp > 0.0).then_some(specs)
+                });
             let completed: smallvec::SmallVec<[_; 16]> = plan
                 .pending
                 .iter()
@@ -279,8 +301,10 @@ impl GpuEngine {
                     }
                 })
             } else {
-                terminal
-                    .run_rows(self, &sample_rows, real_rows)
+                match &specs {
+                    Some(specs) => terminal.run_rows_sampled(self, &sample_rows, real_rows, specs),
+                    None => terminal.run_rows(self, &sample_rows, real_rows),
+                }
                     .and_then(|ids| {
                         state
                             .staging

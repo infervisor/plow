@@ -151,3 +151,50 @@ fn device_sampler_serve_integration() {
     std::env::remove_var("PLOW_DEV_SAMPLE");
     std::env::remove_var("PLOW_NV_CUBIN_SAMPLE");
 }
+
+/// `GpuEngine::sample_rows_on_device` (the token-batch / packed-prefill draw) against the host
+/// sampler on a real prefill logits row: stratified draws `u = (i + 0.5) / N` through each
+/// inverse CDF give histograms within `kept / N` of the exact distribution, so their total
+/// variation distance bounds any disagreement in the kept set or its weights.
+///
+/// `PLOW_GPU_TEST=1 PLOW_GPU_ASSETS=<packet with sample_sm120.cubin>`.
+#[test]
+fn device_rows_match_host_sampler_distribution() {
+    use plowrt::text::sample::{sample, SamplingParams};
+    if std::env::var("PLOW_GPU_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set PLOW_GPU_TEST=1 (needs GPU + assets)");
+        return;
+    }
+    let assets = PathBuf::from(std::env::var("PLOW_GPU_ASSETS").expect("PLOW_GPU_ASSETS"));
+    let be = Arc::new(CudaBackend::new(0).expect("CUDA backend"));
+    let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint")).expect("engine load");
+    assert!(e.dev_sample_enabled(), "device sampler did not load");
+    let prompt: Vec<u32> = (0..48u32).map(|i| 2 + (i * 7919) % 30000).collect();
+    e.begin_slot(0, prompt.len() + 4).expect("begin");
+    e.prefill_slot(0, &prompt).expect("prefill");
+    let mut logits = Vec::new();
+    e.logits_row(0, &mut logits).expect("logits");
+    const N: usize = 4096;
+    for (temp, top_k, top_p) in [(1.0f32, 64i32, 0.95f32), (1.3, 40, 1.0)] {
+        let params = SamplingParams { temperature: temp, top_k: top_k as usize, top_p, ..Default::default() };
+        let mut host = std::collections::HashMap::<u32, usize>::new();
+        let mut dev = std::collections::HashMap::<u32, usize>::new();
+        let mut tok = [0u32];
+        for i in 0..N {
+            let u = (i as f32 + 0.5) / N as f32;
+            *host.entry(sample(&logits, &params, None, u)).or_default() += 1;
+            let spec = DevSample { temp, top_k, top_p, min_p: 0.0, rng01: u };
+            e.sample_rows_on_device(&[spec], &mut tok).expect("device draw");
+            *dev.entry(tok[0]).or_default() += 1;
+        }
+        let keys: std::collections::BTreeSet<u32> = host.keys().chain(dev.keys()).copied().collect();
+        let tv = keys
+            .iter()
+            .map(|k| host.get(k).copied().unwrap_or(0).abs_diff(dev.get(k).copied().unwrap_or(0)))
+            .sum::<usize>() as f64
+            / (2 * N) as f64;
+        let bound = keys.len() as f64 / N as f64 + 0.01;
+        eprintln!("T={temp} top_k={top_k} top_p={top_p}: {} tokens kept, TV(host, device) {tv:.4} (bound {bound:.4})", keys.len());
+        assert!(tv <= bound, "device and host samplers disagree: TV {tv} > {bound}");
+    }
+}

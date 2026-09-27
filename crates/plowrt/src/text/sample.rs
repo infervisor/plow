@@ -201,10 +201,14 @@ pub fn sample_with_scratch(
     for (_, v) in probs.iter_mut() {
         *v /= sum;
     }
-    probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let desc = |a: &(usize, f32), b: &(usize, f32)| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
+    // Top-k first selects, then sorts only the k survivors: a full sort of a 262k vocabulary
+    // costs milliseconds per row.
     if params.top_k > 0 && probs.len() > params.top_k {
+        probs.select_nth_unstable_by(params.top_k - 1, desc);
         probs.truncate(params.top_k);
     }
+    probs.sort_unstable_by(desc);
     if params.min_p > 0.0 {
         let thresh = probs[0].1 * params.min_p;
         probs.retain(|(_, p)| *p >= thresh);

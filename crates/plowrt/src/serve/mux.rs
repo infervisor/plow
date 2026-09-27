@@ -2249,10 +2249,15 @@ fn run_one_tick(
 
             // A pipelined mixed launch takes its decode rows' tokens from the device, so a
             // prefill tick no longer has to read the in-flight step out first.
+            // The pipe reads each launch's argmax a tick later, so a prompt that samples its first
+            // token keeps the synchronous launch (where it is drawn on the device).
             let pipe_prefill = e.pipe_prefill_enabled()
                 && e.pf_batch_enabled()
                 && !e.pipe_full()
-                && (feeds.is_empty() || gpu_pipe_rows(&feeds, &slots));
+                && (feeds.is_empty() || gpu_pipe_rows(&feeds, &slots))
+                && slots.iter().take(cap).flatten().all(|s| {
+                    s.step != 0 || (gpu_argmax_eligible(&s.gen.params) && s.cfg.is_none())
+                });
             // A pipelined decode step may still be in flight from the previous tick. Anything
             // but its exact continuation (prefill the pipe cannot carry, a changed row set, a row
             // the device cannot sample) completes it first, streams its tokens, and re-gathers.
@@ -2490,9 +2495,10 @@ fn run_one_tick(
                 let compact = e.has_packed_terminal();
                 let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
                 completed.clear();
+                let mut dev_sampled = false;
                 if let Some(f) = gpu_prefill_batched_pass(
                     &mut *e, &mut slots, cap, &arena, feeds.is_empty(), co_scheduled, &mut completed,
-                    &mut feeds, &mut obs.host.token_batch_tokens, pipe_prefill,
+                    &mut feeds, &mut obs.host.token_batch_tokens, pipe_prefill, &mut dev_sampled,
                 ) {
                     if tick_fault.is_none() {
                         tick_fault = Some(f);
@@ -2523,6 +2529,7 @@ fn run_one_tick(
                             continue;
                         }
                     }
+                    let was_dev = dev_sampled && slots[i].as_ref().and_then(dev_row_spec).is_some();
                     gpu_finish_and_emit_token(
                         &mut *e,
                         row,
@@ -2531,7 +2538,7 @@ fn run_one_tick(
                         &arena,
                         bundle,
                         token,
-                        false,
+                        was_dev,
                         &mut tokens_this_tick,
                         stop.as_slice(),
                         &mut tick_fault,
@@ -4715,10 +4722,12 @@ fn gpu_prefill_batched_pass(
     feeds: &mut Vec<(usize, u32)>,
     unified_output: &mut Vec<(u32, u32)>,
     pipelined: bool,
+    dev_sampled: &mut bool,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
     completed.clear();
+    *dev_sampled = false;
     let compact = e.has_packed_terminal();
     let unified =
         e.token_batch_enabled() && !crate::config::RuntimeConfig::get().pf_no_interleave;
@@ -4983,6 +4992,13 @@ fn gpu_prefill_batched_pass(
             // token — are read back on a later tick, and `completed` stays empty.
             let result = if pipelined {
                 e.token_batch_step_pipelined(&requests, unified_output)
+            } else if e.dev_sample_enabled() {
+                // Stochastic rows draw on the device: a host draw downloads the row's 512 KiB of
+                // logits and walks the vocabulary once per row, serially, inside the tick.
+                *dev_sampled = true;
+                e.token_batch_step_sampled(&requests, unified_output, &|slot| {
+                    slots.get(slot as usize)?.as_ref().and_then(dev_row_spec)
+                })
             } else {
                 e.token_batch_step(&requests, unified_output)
             };
@@ -5006,13 +5022,39 @@ fn gpu_prefill_batched_pass(
                     len,
                 })
                 .collect();
-            staged.and_then(|()| {
-                if compact {
-                    e.prefill_batched_complete(&reqs, completed)
-                } else {
-                    e.prefill_batched(&reqs)
-                }
-            })
+            staged
+                .and_then(|()| {
+                    if compact {
+                        e.prefill_batched_complete(&reqs, completed)
+                    } else {
+                        e.prefill_batched(&reqs)
+                    }
+                })
+                .and_then(|()| {
+                    // Completed prompts' logits sit in compact rows 0.. in `completed` order.
+                    if !e.dev_sample_enabled() || completed.is_empty() {
+                        return Ok(());
+                    }
+                    let specs: smallvec::SmallVec<[crate::exec::gpu::DevSample; 16]> = completed
+                        .iter()
+                        .map(|&(i, _)| {
+                            slots[i]
+                                .as_ref()
+                                .and_then(dev_row_spec)
+                                .unwrap_or_else(crate::exec::gpu::DevSample::greedy)
+                        })
+                        .collect();
+                    if specs.iter().all(|s| s.temp <= 0.0) {
+                        return Ok(());
+                    }
+                    let mut ids: smallvec::SmallVec<[u32; 16]> = smallvec::smallvec![0; specs.len()];
+                    e.sample_rows_on_device(&specs, &mut ids)?;
+                    for (entry, id) in completed.iter_mut().zip(ids) {
+                        entry.1 = id;
+                    }
+                    *dev_sampled = true;
+                    Ok(())
+                })
         };
         match res {
             Ok(()) => {
@@ -5185,6 +5227,11 @@ fn gpu_prefill_advance(
     if let Some(run) = slot.cfg.as_mut() {
         e.logits_row(0, &mut run.cond)?;
         return Ok(Some(cfg_draw(slot)));
+    }
+    if let Some(spec) = dev_row_spec(slot).filter(|_| e.dev_sample_enabled()) {
+        let mut tok = [0u32];
+        e.sample_rows_on_device(&[spec], &mut tok)?;
+        return Ok(Some(tok[0]));
     }
     gpu_finish_token(e, 0, slot, tok).map(Some)
 }
@@ -5427,6 +5474,13 @@ fn dev_sample_spec(slot: &Slot) -> Option<crate::exec::gpu::DevSample> {
         min_p: p.min_p,
         rng01: slot_rng01(slot),
     })
+}
+
+/// The spec a token-batch row is drawn with on the device: a stochastic, non-CFG row that needs
+/// no host logits. `None` keeps the argmax and the host path.
+#[cfg(feature = "cuda")]
+fn dev_row_spec(slot: &Slot) -> Option<crate::exec::gpu::DevSample> {
+    slot.cfg.is_none().then(|| dev_sample_spec(slot)).flatten()
 }
 
 /// Unmodified greedy requests keep the device argmax. Sampling adjustments

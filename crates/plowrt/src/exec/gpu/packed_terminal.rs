@@ -337,6 +337,11 @@ impl PackedTerminal {
             return Ok(());
         }
         self.launch(e, live, i)?;
+        self.read(e, i)
+    }
+
+    /// Read the launched terminal's ids back (after anything else enqueued behind it) and wait.
+    fn read(&mut self, e: &GpuEngine, i: usize) -> Result<()> {
         let output_bytes = self.host_rows[i].len() * 4;
         let read = (|| {
             // SAFETY: the pinned slab lives on self past the synchronize below.
@@ -379,6 +384,29 @@ impl PackedTerminal {
             return Ok(self.ids(0));
         }
         self.run(e, live, i)?;
+        Ok(self.ids(rows.len()))
+    }
+
+    /// [`Self::run_rows`] with `plow_sample` drawing each row's token from its logits row on
+    /// the device (`specs[r]` for sample row r) before the ids are read.
+    pub(super) fn run_rows_sampled(
+        &mut self,
+        e: &mut GpuEngine,
+        rows: &[u32],
+        live: usize,
+        specs: &[DevSample],
+    ) -> Result<&[u32]> {
+        let i = self.stage_rows(rows);
+        if rows.is_empty() {
+            e.be.stream_synchronize(&e.stream)?;
+            return Ok(self.ids(0));
+        }
+        self.launch(e, live, i)?;
+        if let Err(error) = e.launch_sampler_rows(specs) {
+            let _ = e.be.stream_synchronize(&e.stream);
+            return Err(error);
+        }
+        self.read(e, i)?;
         Ok(self.ids(rows.len()))
     }
 }

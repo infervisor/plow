@@ -9,7 +9,8 @@
 #
 # Env: PYREF (python with vllm + transformers), HF (checkpoint dir), PLOWRT (plowrt binary),
 # CONCS (default "1 8 32 64 128 200"), ISL/OSL (1000/128), PORT, VLLM_MEM (0.85), SERVE_ARGS,
-# SESSION_CALLS (call counts for the session client, e.g. "64 200"; 0 = skip; default 64).
+# SESSION_CALLS (call counts for the session client, e.g. "64 200"; 0 = skip; default 64),
+# BENCH_ARGS (extra `vllm bench serve` args, e.g. "--temperature 0"; unset = the model's sampling defaults).
 set -u
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 source "$HERE/scripts/bench/plowbench.sh"
@@ -32,7 +33,7 @@ MODEL=$(pb_model_id)
 export PB_VLLM=$PYREF PB_TOKENIZER=$HF
 for c in $CONCS; do
     np=$(( c < 4 ? 16 : c * 3 ))
-    pb_bench "$RES" "c$c" "$MODEL" "$c" "$np" "$ISL" "$OSL"
+    pb_bench "$RES" "c$c" "$MODEL" "$c" "$np" "$ISL" "$OSL" ${BENCH_ARGS:-}
     f=$(pb_result "$RES" "c$c") && python3 - "$f" "$c" <<'EOF'
 import json, sys
 d = json.load(open(sys.argv[1]))

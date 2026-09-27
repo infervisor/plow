@@ -8087,6 +8087,78 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// Enqueue `plow_sample` over the first `specs.len()` rows of `act.logits`, overwriting those
+    /// `in.ids` entries (the compact terminal's layout: sample row r at logits row r). The caller
+    /// reads `in.ids` back after it, on the same stream.
+    pub(crate) fn launch_sampler_rows(&mut self, specs: &[DevSample]) -> Result<()> {
+        let bsz = self.batch;
+        let rows = specs.len();
+        let Some(smp) = self.sampler.as_mut() else {
+            return Err(RuntimeError::Rejected("device sampler not loaded".into()));
+        };
+        if rows == 0 || rows > bsz {
+            return Err(RuntimeError::Rejected(format!("sampler rows {rows} outside 1..={bsz}")));
+        }
+        {
+            let raw = smp.params.as_mut_slice();
+            let (s_temp, r) = raw.split_at_mut(bsz * 4);
+            let (s_topk, r) = r.split_at_mut(bsz * 4);
+            let (s_topp, r) = r.split_at_mut(bsz * 4);
+            let (s_minp, s_rng) = r.split_at_mut(bsz * 4);
+            let temp: &mut [f32] = bytemuck::cast_slice_mut(s_temp);
+            let topk: &mut [i32] = bytemuck::cast_slice_mut(s_topk);
+            let topp: &mut [f32] = bytemuck::cast_slice_mut(s_topp);
+            let minp: &mut [f32] = bytemuck::cast_slice_mut(s_minp);
+            let rng: &mut [f32] = bytemuck::cast_slice_mut(s_rng);
+            for (b, s) in specs.iter().enumerate() {
+                temp[b] = s.temp;
+                topk[b] = s.top_k;
+                topp[b] = s.top_p;
+                minp[b] = s.min_p;
+                rng[b] = s.rng01;
+            }
+        }
+        let (sf, sdp, ses, sthreads) = (smp.f, smp.d_params.base, smp.d_escratch.base, smp.threads);
+        // SAFETY: the pinned slab lives on self; every caller synchronizes the stream before the
+        // slab is written again.
+        unsafe {
+            self.be
+                .memcpy_htod_async(sdp, &smp.params.as_slice()[..5 * bsz * 4], &self.stream)?;
+        }
+        let dp = |k: u64| sdp + k * (bsz * 4) as u64;
+        let mut a_logits = self.devp[self.t_logits].base;
+        let mut a_ids = self.devp[self.t_ids].base;
+        let (mut a_temp, mut a_topk, mut a_topp) = (dp(0), dp(1), dp(2));
+        let (mut a_minp, mut a_rng, mut a_es) = (dp(3), dp(4), ses);
+        let (mut a_v, mut a_b) = (self.vocab as u32, rows as u32);
+        let mut a = [
+            &mut a_logits as *mut u64 as *mut std::ffi::c_void,
+            &mut a_ids as *mut u64 as *mut std::ffi::c_void,
+            &mut a_temp as *mut u64 as *mut std::ffi::c_void,
+            &mut a_topk as *mut u64 as *mut std::ffi::c_void,
+            &mut a_topp as *mut u64 as *mut std::ffi::c_void,
+            &mut a_minp as *mut u64 as *mut std::ffi::c_void,
+            &mut a_rng as *mut u64 as *mut std::ffi::c_void,
+            &mut a_es as *mut u64 as *mut std::ffi::c_void,
+            &mut a_v as *mut u32 as *mut std::ffi::c_void,
+            &mut a_b as *mut u32 as *mut std::ffi::c_void,
+        ];
+        self.be
+            .launch_kernel(sf, rows as u32, sthreads, 0, &mut a, Some(&self.stream))
+    }
+
+    /// Draw rows `0..specs.len()` of `act.logits` on the device and wait for the tokens.
+    pub fn sample_rows_on_device(&mut self, specs: &[DevSample], out: &mut [u32]) -> Result<()> {
+        self.launch_sampler_rows(specs)?;
+        self.be.stream_synchronize(&self.stream)?;
+        let mut raw = vec![0u8; specs.len() * 4];
+        self.be.download(&self.devp[self.t_ids], 0, &mut raw)?;
+        for (o, c) in out.iter_mut().zip(raw.chunks_exact(4)) {
+            *o = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        Ok(())
+    }
+
     /// Steps of guided draws staged for this decode call (consumed: the next call stages anew).
     fn take_cfg_staged(&mut self) -> usize {
         self.sampler.as_mut().map_or(0, |s| std::mem::take(&mut s.cfg_staged))
