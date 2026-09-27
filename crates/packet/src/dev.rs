@@ -123,8 +123,9 @@ pub enum DevOp {
     /// everything to 0). The same code and immediates apply on every GLU-family op
     /// ([`DevOp::GemvGlu`], [`DevOp::GemmGlu`], [`DevOp::MoeGluMx`], ...). See `dev_isa.h` op 5.
     Glu = 5,
-    /// `t0=out t1=table t2=ids(i32)` · `i0=ntok i1=hidden` · `f0=scale`.
+    /// `t0=out t1=table t2=ids(i32)` · `i0=ntok i1=hidden i2=rep?` · `f0=scale`.
     /// `scale` must be the BF16-ROUNDED `sqrt(hidden)`: 73.5 (31B), 62.0 (12B).
+    /// `rep > 1` (NVIDIA): token `t` fills rows `t*rep .. t*rep+rep-1` (V4.1's hc copies).
     Embed = 6,
     /// `t0=out t1=x` · `i0=n` · `f0=cap`, computing `cap * tanh(x / cap)`.
     SoftCap = 7,
@@ -177,7 +178,10 @@ pub enum DevOp {
     /// compact row `b`; when absent, physical slot and compact row are identical. Packed
     /// extension forms retain their extension-specific operands.
     FlashDecode = 12,
-    /// `t0=O t1=Opart t2=mlpart t3=sinks?` · `i0=n_batch i1=n_head i2=nsplit i3=hd`.
+    /// `t0=O t1=Opart t2=mlpart t3=sinks?` · `i0=n_batch i1=n_head i2=nsplit i3=hd i4=sink_f32?`.
+    ///
+    /// `i4 = 1`: `sinks` is f32 (DeepSeek-V4.1's `attn_sink`); 0 = bf16. Honoured by the NVIDIA
+    /// hd-512 arm; the AMD merge reads bf16 regardless.
     ///
     /// `sinks` (optional bf16 `[n_head]`, GPT-OSS `self_attn.sinks`) is one extra UNSCALED logit
     /// per head that joins the softmax denominator with no value row, folded HERE and only here:
@@ -578,6 +582,14 @@ pub enum DevOp {
     /// combinations.
     FlashMlaDecode = 50,
     /// MLA prefill MFMA twin — not yet built (reserved so the ABI is stable).
+    ///
+    /// `i7 = out_split`, as on [`DevOp::FlashGatherPrefill`] and for the same reason: the two ops
+    /// are the two halves of one V4.1 attention. Default 0 keeps the shipped layout.
+    ///
+    /// Low two bytes are `(out_nsplit << 8) | out_sp0`. Byte 2 is the GATHERED arm's own split:
+    /// that half occupies partials `out_sp0 ..= out_sp0 + gather_split - 1`, each walking a
+    /// ceil-equal share of its query pack's union, so `out_nsplit == 1 + gather_split`. It is a
+    /// SCHEDULING split only — every share folds back at the merge and the result is unchanged.
     FlashMlaPrefill = 51,
     /// Per-head `W_uv` fold (`sparse-attn-design.md §2.5`): `o[b][h][v] =
     /// Σ_l O_latent[b][h][l]·W_uv[h][l][v]` — the O(n_q) query-side epilogue that folds
@@ -600,7 +612,41 @@ pub enum DevOp {
     /// t7=idx(i32)` · `i0=n_batch i1=n_head i2=kv_stride i4=nsplit i5=kv_mask i6=top_k` ·
     /// `f0=scale`.
     FlashGatherDecode = 54,
-    /// Gathered flash prefill — reserved, not yet built.
+    /// Gathered flash PREFILL — the MLA latent flash reading only the rows `idx` names, with a
+    /// DIFFERENT selection per query token. `d_flash_gather_prefill` is built and dispatched
+    /// (`interp.hip`), at `<512, 0>` and `<512, 64>`.
+    ///
+    /// `idx` is `[b][t][top_k]` — one row PER QUERY, which is the axis the decode gather
+    /// ([`DevOp::FlashGatherDecode`]) does not have. The flash applies NO causal mask under
+    /// GATHER: the selected set is assumed causal because the selector produced it, so a selector
+    /// that lets query `t` name a row past `kv_len - n_tok + t` is not caught here.
+    ///
+    /// What kept this without an emit site is the SELECTOR, not the flash: a learned top-k needs
+    /// T-row `IndexScore`/`IndexSelect`, which is a real design problem. A sliding WINDOW needs
+    /// none of it — row `t` is `clamp(t - w + 1, 0) ..= t`, pure arithmetic, causal by
+    /// construction, with `-1` for a slot before the sequence started.
+    ///
+    /// `t0=Opart(f32) t1=mlpart(f32) t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len(i32)
+    /// t7=idx(i32)` · `i0=n_batch i1=n_head i2=kv_stride i3=nope i4=n_tok i5=kv_mask i6=top_k
+    /// i7=out_split` · `f0=scale`.
+    ///
+    /// `i3` bit 31 is NOPE: the rope width is 0, `t3`/`t5` repeat `t2`/`t4`, and the whole head is
+    /// scored unrotated. DeepSeek-V4.1 sets it because its rope is INTERIOR to `head_dim` and has
+    /// already been applied by then.
+    ///
+    /// `i7 = out_split` is the WRITE-ONLY output split — low 8 bits the partial index this call
+    /// fills, next 8 the total — and [`DevOp::FlashMlaPrefill`] takes the same handle at the same
+    /// slot. **Default 0**, the shipped one-partial layout, on every existing emission. It does
+    /// NOT divide the KV range (that is the merge's `nsplit`, which this then matches); it says
+    /// where this flash's partials LIVE, so two flashes over two DIFFERENT caches fill disjoint
+    /// halves of one `(Opart, mlpart)` pair and one [`DevOp::FlashMerge`] combines them under a
+    /// single online softmax with the sink folded ONCE.
+    ///
+    /// That pair IS DeepSeek-V4.1's attention: `Attention.forward` runs one `sparse_attn` over
+    /// `cat([window_kv, compress_kv])` with `cat([window_idxs, compress_idxs])`
+    /// (`model.py:775-779`), and a window pass at split 0 plus a gathered pass at split 1 is that
+    /// expression without materialising either concatenation — no copy of the shared compressed
+    /// cache into a per-layer buffer, and no `+offset` rewrite of the index table.
     FlashGatherPrefill = 55,
 
     /// ROUTER TOP-K tail (the router SPLIT). The score matmul `logit = x·Wr` is now the ordinary
@@ -1459,7 +1505,15 @@ pub enum DevOp {
     /// Σ_h w[t][h]·ReLU(q_idx[t][h]·k_idx[s]) for s <= q_pos0 + t. Score is f32
     /// [n_tok][kv_stride].
     /// `t0=Score t1=Qidx t2=Kidx t3=W t4=kv_len` · `i0=n_tok i1=index_heads i2=kv_stride
-    /// i3=index_head_dim` · `f0=scale`.
+    /// i3=index_head_dim i4=pool_size` · `f0=scale`.
+    ///
+    /// `i4=pool_size` makes the COLUMN axis pools rather than tokens (**default 1**, zero on
+    /// every existing emission and read as 1 at dispatch, so no existing blob changes). `kv_len`
+    /// stays token-granular — it is what the host patches — so the key axis is
+    /// `kv_len/pool_size` and a row's causal bound is `(q_pos0+t+1)/pool_size`, both FLOOR.
+    /// That is DeepSeek-V4.1's `compress_lens = arange(1, seqlen+1) // ratio` (`model.py:564`):
+    /// a compressed entry is visible only once the query has passed its LAST token. Same handle
+    /// [`DevOp::IndexSelectPf`] takes at `i3`, and the two MUST agree.
     IndexScorePf = 117,
     /// Per-query-row EXACT top-k select (op 118): one workgroup per row, the op-59
     /// radix key (score desc, lowest-index tie-break) with LDS-only histograms. idx is
@@ -1549,11 +1603,30 @@ pub enum DevOp {
     /// something this op should bake in. `mhc_no_norm_weight` (unset in GLM-5.3-Flash's
     /// config, defaults false) selects whether the caller chains that norm at all.
     ///
+    /// `pre_mode` picks WHOSE `pre` gates the collapse, and the two models it serves
+    /// disagree. GLM-5.3 (`pre_mode=0`, `PRE_OWN`) gates with the `pre` this same call
+    /// derives. DeepSeek-V4.1's mHC is CROSS-SUBLAYER: `Block.forward` collapses
+    /// attention with the PREVIOUS block's `ffn_pre` and the FFN with this block's
+    /// `attn_pre`, and the class docstring says so outright — "the coefficients a
+    /// sublayer computes are used by the *next* one" (`model.py:965-996`). So V4.1 uses
+    /// `pre_mode=2` (`PRE_DEFER`), reading `pre_pair` half `pre_in_half` and publishing
+    /// its own `pre` into the other half, with `pre_mode=1` (`PRE_SEED`) on the model's
+    /// FIRST sublayer, where `make_identity_pre_mix` supplies a one-hot on copy 0
+    /// (`model.py:1159-1163`). Nothing distinguishes the two in the shapes, so the wrong
+    /// mode is the "finite, fluent and wrong" failure this file's other notes warn about;
+    /// `scripts/dsv41_mhc_oracle.py` prices it at 51.9% relative on layer 0 alone.
+    ///
+    /// `pre_pair` is ONE `[2,T,n]` f32 tensor rather than a separate in and out, because
+    /// the descriptor has 8 tensor slots and this op already spent 7. Consecutive
+    /// sublayers alternate halves; a call's read and write are to different halves.
+    /// `post` and `comb` stay same-sublayer in both models.
+    ///
     /// `t0=post_mix(out,[T,n]f32) t1=comb_mix(out,[T,n,n]f32)
     /// t2=layer_input(out,[T,hidden]bf16,UNNORMED) t3=mixes(in,[T,n3]f32, the Gemv/Gemm
     /// projection's raw output) t4=residual(in,[T,n,hidden]bf16) t5=hc_scale(in,[3]f32)
-    /// t6=hc_base(in,[n3]f32)` · `i0=T i1=n i2=hidden i3=sinkhorn_repeat` ·
-    /// `f0=rms_eps f1=hc_eps`.
+    /// t6=hc_base(in,[n3]f32) t7=pre_pair(in/out,[2,T,n]f32, TENSOR_NONE when
+    /// pre_mode=0)` · `i0=T i1=n i2=hidden i3=sinkhorn_repeat i4=pre_in_half
+    /// i5=pre_mode` · `f0=rms_eps f1=hc_eps`.
     HyperConnPre = 128,
     /// GLM5-Next's hyper-connections (mHC) post-block — the companion to
     /// [`DevOp::HyperConnPre`], ported the same way from `mhc_post_torch`.
@@ -1746,7 +1819,11 @@ pub enum DevOp {
     /// long-context tasks" — a documented ACCURACY requirement of the reference model, not
     /// an implementation shortcut to optimize away.
     ///
-    /// `t0=C(out,f32[M][N]) t1=x(in,bf16[M][K]) t2=W(in,f32[N][K])` · `i0=M i1=N i2=K`.
+    /// `t0=C(out,f32[M][N]) t1=x(in,bf16[M][K]) t2=W(in,f32[N][K]) t3=scratch?` ·
+    /// `i0=M i1=N i2=K i3=splits?`.
+    ///
+    /// `t3`/`i3` (NVIDIA): split K `i3` ways; `t3` holds u32 row-block counters (zero at load, reset
+    /// after use) padded to 256 B, then `i3` f32 partials `[M][N]`, summed in split order.
     GemvF32 = 135,
     /// Packed causal convolution plus SiLU. BF16 x/out[B,C], weight[C,W], and mutable history[B,C,W-1] (oldest first); optional I32 active[B] masks writes.
     ///
@@ -1774,7 +1851,21 @@ pub enum DevOp {
     QwenRmsNorm = 141,
     /// D=256; rotary is 0 or 64. BF16 x[rows,H,D] and optional gamma[D]. FP32 cos/sin tables are required when rotary is nonzero and round to BF16 before rotation; normalization also rounds to BF16 first. Optional I32 pos[rows] defaults to zero; optional I32 active[rows] masks writes. ctx=0 writes contiguous output; otherwise writes KV[slot,H,ctx,D]. prefill=1 treats rows as query tokens and writes the single selected KV slot, while decode uses one slot per row.
     ///
-    /// `t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos? t6=active?` · `i0=H i1=D i2=rotary i3=rows i4=ctx i5=normalize i6=prefill` · `f0=eps f1=gamma_offset`.
+    /// `t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos? t6=active?` · `i0=H i1=D i2=rotary i3=rows i4=ctx i5=normalize i6=prefill i7=rot_offset` · `f0=eps f1=gamma_offset`.
+    ///
+    /// `i7` is where the rotated range STARTS, default 0. The row is lane-strided, so the range
+    /// must begin on a `PLOW_WAVE` boundary and `rotary` must fit one register; the kernel traps
+    /// otherwise. Qwen rotates the prefix and emits 0, which keeps every existing packet
+    /// byte-identical. DeepSeek-V4.1 rotates the SUFFIX -- `q[..., -64:]` of a 512-wide head --
+    /// and emits 448.
+    ///
+    /// `i2` BIT 31 IS THE PAIRING, not part of the width: set selects interleaved (GPT-J,
+    /// adjacent pairs `(2m, 2m+1)`), clear the half-split (NeoX, `(i, i + rotary/2)`) arm every
+    /// Qwen packet emits. DeepSeek-V4.1 sets it — `apply_rotary_emb` takes "adjacent element
+    /// pairs as complex numbers" (`model.py:392`) — and the two are different operators, not
+    /// relabellings: applying the wrong one consistently to q AND k does not cancel.
+    /// The interleaved arm also reads the tables as f32, because the reference multiplies by a
+    /// complex64 `freqs_cis` and rounds only the result.
     QwenHeadNormRope = 142,
     /// BF16 causal convolution plus SiLU for exactly T valid tokens: x/out[T,C], weight[C,W], mutable oldest-first history[1,C,W-1]. Updates history after the chunk.
     ///
@@ -2021,7 +2112,10 @@ pub enum DevOp {
     /// `i0=rows i1=width i2=vocab i3=overlay_rows`.
     EmbedOverlayBf16 = 179,
     /// BF16 projection with an FP32 accumulator/output, used for GLM router logits.
-    /// `t0=C(f32[M,N]) t1=A(bf16[M,K]) t2=W(bf16[N,K])` · `i0=M i1=N i2=K`.
+    /// `t0=C(f32[M,N]) t1=A(bf16[M,K]) t2=W(bf16[N,K]) t3=scratch?` · `i0=M i1=N i2=K i3=splits?`.
+    ///
+    /// `t3`/`i3` (NVIDIA): split K `i3` ways; `t3` holds u32 counters per 128 x 64 tile (zero at
+    /// load, reset after use) padded to 256 B, then `i3` f32 partials `[M][N]`, summed in split order.
     GemmF32 = 180,
     /// Decode context parallelism, pack half: this rank copies the latent KV records its DCP
     /// shard OWNS into its peer slot, record-major at 656 B (`[512 e4m3 ckv][64 bf16 krot][f32
@@ -2205,6 +2299,173 @@ pub enum DevOp {
     /// the `[T][layers*P]` per-layer input table, `col0 = layer*P`.
     /// `t0=out t1=gate t2=up` · `i0=rows i1=width i2=col0 i3=stride i4=act`.
     GluStrided = 205,
+    /// DeepSeek-V4 CSA2's learned-pooling KV compressor (`op_compress.h`
+    /// `d_compress_pool`, `[DSV4-COMPRESS]`). One workgroup per compressed entry,
+    /// grid-strided over `n_pools`: a per-channel softmax pools `ratio` source rows
+    /// into one cache row, RMSNorms it, applies RoPE and quantizes.
+    /// `t0=out t1=kv t2=score t3=ape t4=gamma t5=cosb t6=sinb t7=pos` ·
+    /// `i0=n_pools i1=ratio i2=coff i3=d i4=rd i5=qblk i6=out_base i7=rotate` ·
+    /// `f0=eps`. On arm `i7 = 2` `i5` is the kv/score element size instead (4 = f32, NVIDIA; 0 = bf16).
+    ///
+    /// `t3 = ape` may be `TENSOR_NONE`, read as zero. V4.1's `Compressor` has no such parameter,
+    /// and `scripts/dsv41_csa2_oracle.py` check [2] shows a nonzero one is worth 1.65 absolute --
+    /// so the emit must OMIT it, which a sentinel says and a zero-filled buffer only promises.
+    ///
+    /// `i7 = arm`: 0 is V4's fp8 path, 1 the Hadamard-rotated fp4 path (different clamp
+    /// constants, not a tuning flag), 2 V4.1's — pool and norm and STOP, leaving the rope and
+    /// the quant to [`DevOp::CompressRopeQuant`] and `t5`/`t6`/`i4`/`i5` unused.
+    /// A non-null `t7` makes it a DECODE call — the kernel gates on
+    /// `(pos[0] + 1) % ratio == 0` and takes the output slot from `pos[0]` instead
+    /// of `i6`, so the decode packet needs no per-step immediate patching.
+    CompressPool = 206,
+    /// DeepSeek-V4 CSA2's conjugate rotation on the attention output's last `rd`
+    /// dims (`op_compress.h` `d_rope_inverse_o`, `[DSV4-IROPE]`). In place.
+    /// `t0=o(in/out) t1=cosb t2=sinb t3=pos` · `i0=n_tok i1=n_head i2=D i3=rd i4=pos0 i5=per_row?`. `per_row`: token `t` at `pos[t]` (batched decode).
+    ///
+    /// STRUCTURAL, not cosmetic: `o` mixes cached rows each rotated by its OWN
+    /// position, so de-rotating by the QUERY's position is what leaves a
+    /// position-independent latent for the fixed `wo_a`. Interleaved (GPT-J) pairs,
+    /// NOT the half-split [`DevOp::HeadNormRope`] defaults to. `t3` supersedes `i4`
+    /// when present, for the same reason [`DevOp::CompressPool`]'s does.
+    RopeInverseO = 207,
+    /// DeepSeek-V4.1's Engram conditional memory: the gate + mix (`op_engram.h`
+    /// `d_engram_gate`, `[DSV41-ENGRAM]`). In place on `t0`.
+    /// `t0=x(bf16[T][n][hidden], in/out) t1=kv(bf16[T][(n+1)*hidden]) t2=q_weight
+    /// t3=k_weight t4=token_mask(u8[T])` · `i0=T i1=n i2=hidden` · `f0=norm_eps`.
+    ///
+    /// Only the THIRD stage of Engram is an opcode. The n-gram hash is integer work over
+    /// token ids alone, with its primes, multipliers and compressed-token map fixed at
+    /// load time from the tokenizer, so it arrives as a host-built tensor like `pos`. The
+    /// embed and `wkv` projection are an ordinary gathered fp8 read and fp8 block-scale
+    /// GEMM. What is left, and what this computes, is the gate: a per-(token, hc copy)
+    /// normalized dot of the stream against the key, through a SIGNED sqrt before the
+    /// sigmoid, with the shared value added into every copy under it.
+    ///
+    /// `t4 = 0` shuts the gate and the token passes through UNTOUCHED -- it does not get a
+    /// zero value added. That distinction is the whole point of masking image spans, which
+    /// take part in no n-gram.
+    EngramGate = 208,
+    /// DeepSeek-V4.1 Engram stage 2: the gathered table read (`op_engram.h`
+    /// `d_engram_embed`, `[DSV41-ENGRAM]`).
+    /// `t0=out(bf16[T][n_cols*head_dim]) t1=table(fp8 e4m3 OCP) t2=scale(ue8m0)
+    /// t3=ids(i32[T][n_cols])` · `i0=T i1=n_cols i2=head_dim i3=blk i4=vocab_start
+    /// i5=part_rows`.
+    ///
+    /// `i4 = `[`TENSOR_NONE_I`] (the wire sentinel, 0xFFFF -- NOT zero, because rank 0's
+    /// base IS zero) means DERIVE the shard base as `rank * i5`. One program
+    /// serves all eight ranks, so the emitter cannot write `vocab_start` as an immediate
+    /// -- and does not need to patch it per rank either, since the interpreter has
+    /// `prog.rank`. `ParallelEngramEmbedding` places rank `r` at `r * part_num_embeddings`
+    /// and nowhere else (`model.py:303-305`), so this is the placement rather than a
+    /// convention. An explicit `i4` still wins, which is what a single-rank test passes.
+    ///
+    /// The output is laid out flat as one `n_cols * head_dim` row per token, which is
+    /// exactly what the `wkv` GEMM consumes, so no reshape sits between them.
+    ///
+    /// The table is sharded over its ROWS -- it is the largest tensor in the checkpoint,
+    /// 384 006 168 rows of 256 fp8 -- so an id outside `[i4, i4 + i5)` writes ZEROS and the
+    /// emitter's [`DevOp::XReduce`] sums the ranks back together.
+    ///
+    /// `i3 = blk` is 32 for V4.1 (`weight_block_size [32, 32]`), NOT the `[128, 128]` grid
+    /// V4 used. Getting it wrong rescales every lookup and faults nowhere.
+    EngramEmbed = 209,
+    /// DeepSeek-V4.1 block-fp8 prefill GEMM at a `[32, 32]` **ue8m0** scale grid
+    /// (`op_gemm_common.h` `d_gemm_fp8_mx` -> `d_gemm_t<WFP8MX>`).
+    ///
+    /// `t0=out(bf16[T][N]) t1=x(bf16[T][K]) t2=w(fp8 e4m3 OCP[N][K])
+    /// t3=scale(ue8m0[ceil(N/32)][ceil(K/32)]) t4=xs?` · `i0=T i1=N i2=K i3=groups i4=a_row0 i5=c_row0 i6=fp8?`.
+    ///
+    /// `i3 = groups` > 1 makes it block-diagonal (the output LoRA `wo_a` below TP8): `out` is
+    /// `[T][groups*N]`, `x` `[T][groups*K]`, `w` `[groups*N][K]`, and group `g` multiplies `x`
+    /// columns `g*K..` by weight rows `g*N..` into `out` columns `g*N..` (`N % 32 == 0`). The sm_90a
+    /// role object implements it; the AMD arm traps on it. `i4`/`i5` offset A and C by a row band.
+    ///
+    /// `i6 = 1` (sm_90a role only): `x` is e4m3 `[T][K]` and `t4` its ue8m0 scales `[T][K/32]`,
+    /// ActQuantMx's `t2` form (`K % 128 == 0`).
+    ///
+    /// The scale grid is row-major with K innermost. `K % 32 == 0` is REQUIRED -- the kernel is
+    /// the KEXACT instantiation at BK=32 -- and every V4.1 projection satisfies it by
+    /// construction, since the scale grid could not exist otherwise.
+    ///
+    /// **A SEPARATE OPCODE FROM [`DevOp::GemmFp8Blk`], NOT A FLAG ON IT.** Op 107 indexes its
+    /// grid as `S[(n>>7) * ceil(K/128) + (k>>7)]` with **f32** entries; this one is blocked 32
+    /// on BOTH axes with **byte** entries. Handing 107 a V4.1 scale handle does not fault -- it
+    /// rescales every output, and the model merely gets worse. Encoding that in the opcode is
+    /// what makes the mismatch a load-time refusal instead of a silent one.
+    ///
+    /// Every V4.1 projection lowers to this: `wq_a`/`wq_b`/`wkv`/`wo_a`/`wo_b`, the shared
+    /// expert, `engram.wkv` and `indexer.wq_b` -- 39.8% of an 8k prefill's FLOPs. The routed
+    /// experts do NOT; they are MXFP4 on ops 85/86.
+    GemmFp8Mx = 210,
+    /// DeepSeek-V4.1's compressed-row tail: interleaved RoPE on the last `rd` channels, then
+    /// the blockwise fake quant, one workgroup per row (`op_compress.h`
+    /// `d_compress_rope_quant`, `[DSV41-CQUANT]`).
+    /// `t0=out t1=src t2=cosb t3=sinb t4=pos t5=kvlen?` ·
+    /// `i0=n_rows i1=d i2=rd i3=qblk i4=ratio i5=row_base i6=qmode i7=n_head` · `j0=slot_stride? j1=batched_ring?`.
+    ///
+    /// V4.1 SPLIT WHAT V4 FUSED. [`DevOp::CompressPool`] with `i7 = 2` stops after the norm,
+    /// because `Compressor.forward` returns the latent before RoPE for the indexer to consume;
+    /// this op is the rest, and it serves both consumers of that latent —
+    /// `i6 = 2` (fp4 e2m1, E4M3 scale) with `i3 = 16` is the compressed KV cache,
+    /// `i6 = 1` (fp4 e2m1, E8M0 scale) with `i3 = 32` is the indexer's keys.
+    /// The whole row is quantized either way; the rope tail stays bf16 only on
+    /// [`DevOp::CompressPool`]'s V4 arm.
+    ///
+    /// `t0` and `t1` must NOT alias: the indexer reads `src`, and the reference's in-place rope
+    /// is a write-after-read the packet order does not express. `t4` supersedes `i5` when
+    /// present, for the same reason [`DevOp::CompressPool`]'s `t7` does.
+    ///
+    /// `i7 = n_head` (**default 1**) makes a row `[n_head][d]` rotated at ONE position — the
+    /// indexer's queries, `apply_rotary_emb(q[..., -rd:], freqs_cis[start:end])` over
+    /// `[b, s, n_heads, index_head_dim]` then `fp4_act_quant(q, 32, True)` (`model.py:550-552`).
+    /// A third call site, differing from the other two only in `i3`/`i6`/`i7`.
+    ///
+    /// Batched decode (`j1` bit 31): row `r` is slot `r` at `pos[r]`, gated on its own group
+    /// completing, written to out row `r * j0 + pos[r] / ratio` (wrapped by `j1 & 0x7fffffff`
+    /// when nonzero: the window ring), or row `r` when `j0 == 0` (the indexer query).
+    /// `t5 = kvlen` with the batched bit is the PREFILL SEED of one slot: chunk row `r` at `pos[r]`
+    /// writes row `pos[r] / ratio` (wrapped), skipping rows at or past `kvlen[0]` and, on a ring,
+    /// rows older than the ring holds.
+    CompressRopeQuant = 211,
+    /// DeepSeek-V4.1's activation quant ahead of a [`DevOp::GemmFp8Mx`], as a FAKE quant
+    /// (`runtime/common/op_act_quant_mx.h`): kernel.py `act_quant(x, 32, "ue8m0")` -- per 32-element
+    /// block `s = 2^ceil(log2(max(amax, 1e-4) / 448))`, `out = e4m3_rne(x / s) * s` in bf16, which
+    /// is exact. `t0=out(bf16[rows][K], may alias t1) t1=x(bf16[rows][K]) t2=scale?` · `i0=rows i1=K`
+    /// (`K % 32 == 0`).
+    ///
+    /// `t2` set (NVIDIA): the real quant -- `t0` is e4m3 `[rows][K]` and `t2` the ue8m0 exponents
+    /// `[rows][K/32]`.
+    ///
+    /// The reference quantizes the activation of EVERY block-fp8 projection; op 198 alone
+    /// multiplies the unquantized bf16 row (w8a16), which is not the model. Emitted once per
+    /// activation, ahead of the GEMMs that share it, as `QuantFp8` is on the w8a8 path.
+    ActQuantMx = 212,
+    /// DeepSeek-V4.1 sparse attention, one decode token per slot (`runtime/nvidia/op_sparse_attn_decode.cuh`):
+    /// row `b` attends over its window ring rows `[0, min(pos[b]+1, W))` plus the compressed rows
+    /// `idx[b][..]` names (`-1` skipped), 16 heads per MMA tile. `nsplit > 1` writes unnormalized
+    /// partials to `scratch` that [`DevOp::SparseAttnMerge`] folds with the sink.
+    /// `t0=o(bf16[B][H][512]) t1=q t2=ring([B][W][512]) t3=cmp? t4=idx? t5=pos(i32[B]) t6=sink(f32[H])
+    /// t7=scratch` · `i0=B i1=H i2=W i3=cmp_stride i4=topk i5=nsplit` · `f0=scale`. `cmp` is
+    /// `[B][cmp_stride][512]` and `idx` `i32[B][topk]`; both absent on window-only layers.
+    SparseAttnDecode = 213,
+    /// Folds [`DevOp::SparseAttnDecode`]'s partials with the f32 sink. `t0=o t1=scratch t2=sink` ·
+    /// `i0=B i1=H i2=nsplit`.
+    SparseAttnMerge = 214,
+    /// V4.1 `Compressor` decode step (`op_compress.cuh`): `state[b][pos%ratio] = (kv, score)`; on a
+    /// completed group `latent[b] = RMSNorm(bf16(softmax-pool(state))) * gamma`, else untouched.
+    /// `t0=latent(bf16[B][d]) t1=st_kv(f32[B][ratio][d]) t2=st_sc t3=kv(f32[B][d]) t4=score t5=gamma
+    /// t6=pos(i32[B])` · `i0=B i1=ratio i2=d i3=seed?` · `f0=eps`. `seed` (prefill, one slot,
+    /// `pos = kvlen`): copy the chunk's incomplete tail group into the state, no pooling.
+    CompressDecodeStep = 215,
+    /// V4.1 indexer score at decode (`op_index_decode.cuh`); the indexer is replicated at TP:
+    /// `score[b][t] = sum_h w[b][h] relu(q[b][h] . k[b][t])` for `t < (pos[b]+1)/ratio`, only for
+    /// slots with more than 512 keys. `t0=score(f32[B][cap]) t1=q(bf16[B][HI][128]) t2=w(bf16[B][HI])
+    /// t3=k(bf16[B][cap][128]) t4=pos` · `i0=B i1=HI i2=cap i3=ratio` · `f0=wscale`
+    /// (`softmax_scale * n_heads^-0.5`, applied to `w`).
+    IndexScoreDecode = 216,
+    /// Top-512 of [`DevOp::IndexScoreDecode`]'s (reduced) score, ascending positions, -1 padded.
+    /// `t0=idx(i32[B][512]) t1=score t2=pos` · `i0=B i1=cap i2=ratio`.
+    IndexSelectDecode = 217,
 }
 
 /// Activation codes shared by [`DevOp::UnaryF32`] (`kind`) and the convolution input/output
@@ -2452,6 +2713,18 @@ impl DevOp {
         DevOp::AttentionF32,
         DevOp::RowStatsF32,
         DevOp::GluStrided,
+        DevOp::CompressPool,
+        DevOp::RopeInverseO,
+        DevOp::EngramGate,
+        DevOp::EngramEmbed,
+        DevOp::GemmFp8Mx,
+        DevOp::CompressRopeQuant,
+        DevOp::ActQuantMx,
+        DevOp::SparseAttnDecode,
+        DevOp::SparseAttnMerge,
+        DevOp::CompressDecodeStep,
+        DevOp::IndexScoreDecode,
+        DevOp::IndexSelectDecode,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2678,6 +2951,18 @@ impl DevOp {
             DevOp::AttentionF32 => "PLOW_DOP_ATTENTION_F32",
             DevOp::RowStatsF32 => "PLOW_DOP_ROW_STATS_F32",
             DevOp::GluStrided => "PLOW_DOP_GLU_STRIDED",
+            DevOp::CompressPool => "PLOW_DOP_COMPRESS_POOL",
+            DevOp::RopeInverseO => "PLOW_DOP_ROPE_INVERSE_O",
+            DevOp::EngramGate => "PLOW_DOP_ENGRAM_GATE",
+            DevOp::EngramEmbed => "PLOW_DOP_ENGRAM_EMBED",
+            DevOp::GemmFp8Mx => "PLOW_DOP_GEMM_FP8_MX",
+            DevOp::CompressRopeQuant => "PLOW_DOP_COMPRESS_ROPE_QUANT",
+            DevOp::ActQuantMx => "PLOW_DOP_ACT_QUANT_MX",
+            DevOp::SparseAttnDecode => "PLOW_DOP_SPARSE_ATTN_DECODE",
+            DevOp::SparseAttnMerge => "PLOW_DOP_SPARSE_ATTN_MERGE",
+            DevOp::CompressDecodeStep => "PLOW_DOP_COMPRESS_DECODE_STEP",
+            DevOp::IndexScoreDecode => "PLOW_DOP_INDEX_SCORE_DECODE",
+            DevOp::IndexSelectDecode => "PLOW_DOP_INDEX_SELECT_DECODE",
         }
     }
 
@@ -2733,7 +3018,22 @@ impl DevOp {
     /// 195 -> 204 for `GatherRowsF32 = 195` .. `AttentionF32 = 203` (generic FP32 signal ops).
     /// 204 -> 205 for `RowStatsF32 = 204` (DenseGemmF32's LayerNorm prologue statistics).
     /// 205 -> 206 for `GluStrided = 205` (Gemma-4 E-series per-layer input gate on CUDA).
-    pub const COUNT: u16 = 206;
+    /// 206 -> 208 for `CompressPool = 206` / `RopeInverseO = 207` (DeepSeek-V4 CSA2). Both
+    /// kernels and their gfx942 tests predate the opcodes by some time: they were reachable
+    /// only from the tests, so no packet could run them.
+    /// 208 -> 210 for `EngramGate = 208` / `EngramEmbed = 209` (DeepSeek-V4.1 Engram). The
+    /// hash is host work and the `wkv` projection is an ordinary fp8 GEMM, so the family costs
+    /// two opcodes rather than four.
+    /// 210 -> 212 for `GemmFp8Mx = 210` (DeepSeek-V4.1's `[32, 32]` ue8m0 block-fp8 GEMM) and
+    /// `CompressRopeQuant = 211` (its compressed-row rope + quant tail).
+    /// An opcode rather than a field on 107 because the scale OPERAND TYPE differs -- byte
+    /// against f32 -- and a mismatch there rescales every output without faulting.
+    /// 212 -> 213 for `ActQuantMx = 212` (V4.1's per-32 ue8m0 activation fake quant ahead of 210).
+    /// 213 -> 218 for V4.1 batched decode: `SparseAttnDecode`/`SparseAttnMerge`,
+    /// `CompressDecodeStep`, `IndexScoreDecode`/`IndexSelectDecode`.
+    /// The V4.1 ops were numbered from 194 on their branch; merging them after the speech ops at
+    /// 194-205 moved every one up by 12.
+    pub const COUNT: u16 = 218;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

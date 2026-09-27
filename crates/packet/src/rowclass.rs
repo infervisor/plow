@@ -92,7 +92,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         // elementwise, quantization, argmax, the collectives, and the whole MoE routing /
         // grouping / combine chain, whose row maps are built from the batch it is given.
         Nop | RmsNorm | RowRms | Residual | Sum4Bf16 | Glu | SituGlu | SoftCap | LayerNorm | NormResidual
-        | AddNorm | NormResidualNorm | PerLayerInput | GluStrided | QuantFp8 | ZeroF32 | CastF32Bf16
+        | AddNorm | NormResidualNorm | PerLayerInput | GluStrided | QuantFp8 | ActQuantMx | ZeroF32 | CastF32Bf16
         | MlaOutGate | KdaGatedNorm | QwenGatedNorm | QwenQGateSplit | QwenSigmoidGate
         | QwenRmsNorm | LayerNormF32 | ScaledAddF32 | GluF32 | EmbedF16F32 | EmbedOverlayBf16 | EmbedPosBf16
         | LstmCellF32 | ReluF32 | BroadcastAddF32 | QuantFp8Block128 => RowClass::A,
@@ -101,7 +101,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         Embed => RowClass::A,
         Gemm | GemmSmall | GemmMed | GemmF32 | GemmLtPf | GemmBlkPf | GemmWide | GemmC5
         | GemmNorm | GemmGlu | GemmSplitK | GemmFp8 | GemmMedFp8 | GemmSmallFp8 | GemmGluFp8
-        | GemmWideFp8 | GemmC5Fp8 | GemmFp8Blk | GemmMxfp4 | GemmMedMxfp4 | GemmSmallMxfp4
+        | GemmWideFp8 | GemmC5Fp8 | GemmFp8Blk | GemmFp8Mx | GemmMxfp4 | GemmMedMxfp4 | GemmSmallMxfp4
         | GemmWideMxfp4 | GemmC5Mxfp4 | GemmGluMxfp4 | DenseGluFp8Blk | GemmAffineQ4
         | Q8GemmF32 | DenseGemmF32 | SiluF32 | GemmFp8Block128 | GemmFp8Block128Split4 | MlaBmmFp8 => RowClass::A,
         Gemv | GemvSz | GemvGlu | GemvGluSz | GemvArgmax | GemvQkv | GemvQkvg | GemvF32
@@ -153,7 +153,12 @@ pub fn class_of(op: DevOp) -> RowClass {
         MlaMaterializePack | QwenGdnQkvPrep | QwenGdnGatePrep | KdaGate => RowClass::A,
         // Per-token hyper-connection mix/push and the attention-residual ring: the ring is per
         // token and the workgroups partition tokens.
-        HyperConnPre | HyperConnPost | AttnRes => RowClass::A,
+        // Engram joins them: per token, workgroups partition tokens, no scalar base and no
+        // cross-token coupling. Its `token_mask` is a per-row array, not a derived position.
+        HyperConnPre | HyperConnPost | AttnRes | EngramGate => RowClass::A,
+        // The table read is per token too: `t3=ids` is a per-row array already, and a row's
+        // lookup depends on nothing but its own ids.
+        EngramEmbed => RowClass::A,
         // Per-row Hadamard + fp8 quant of the indexer queries. `n_rows` is the only axis; it
         // has no pool, no `ape`, and no position, unlike the rest of the DSA chain.
         DsaQQuant => RowClass::A,
@@ -172,6 +177,8 @@ pub fn class_of(op: DevOp) -> RowClass {
         // `t4 = pos[rows]` selects each row's ring slot (`pos % pool_size`); the position is
         // read per row rather than derived from a chunk end.
         DsaPoolStash => RowClass::B,
+        // V4.1 batched decode: every row reads its own `pos[b]` and its slot's state.
+        SparseAttnDecode | SparseAttnMerge | CompressDecodeStep | IndexScoreDecode | IndexSelectDecode => RowClass::B,
         // The terminal segment's own gather: an explicit `[S]` row-index table, which is
         // exactly the table the descriptor fills. Bounds-checked against live `M`.
         RowGather => RowClass::B,
@@ -199,6 +206,14 @@ pub fn class_of(op: DevOp) -> RowClass {
         // own capability marker because a legal packet otherwise runs dense and ignores `t7`.
         IndexScore | IndexScorePf | IndexScoreKpool | IndexSelect | IndexSelectPf
         | IndexUnionPf | IndexTpPf | IndexFp8Decode | IndexFp8Prefill | DsaPoolExpand | DsaPoolCompress => RowClass::C,
+        // DeepSeek-V4's CSA2 pair, C for the same derivation hazard the two groups above
+        // name. `CompressPool` takes ONE `out_base` for the whole packet and resolves a
+        // pool's source rows as `pool * ratio + r` off it; `RopeInverseO` takes one `pos0`
+        // and de-rotates row `t` by `pos0 + t`. Both are the scalar-base form, and both are
+        // wrong for every row outside the last span under packing. The `pos` tensor each
+        // gained supersedes the scalar, but it carries ONE step, not a per-row array, so it
+        // does not lift either op out of C.
+        CompressPool | CompressRopeQuant | RopeInverseO => RowClass::C,
 
         // Attention couples rows within one sequence. Packed request spans require per-span
         // execution until the op gains an explicit span descriptor.

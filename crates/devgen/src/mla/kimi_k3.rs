@@ -308,7 +308,7 @@ fn k3_attn_map(t: &Value, layers: u32) -> Vec<K3Attn> {
 /// shards and a download in progress is the normal case, so this reads whatever has landed and
 /// reports the count. **A tensor's absence proves nothing** — every caller below must only ever
 /// use this to CONTRADICT the config, never to conclude something does not exist.
-fn k3_shard_headers(
+pub(super) fn k3_shard_headers(
     dir: &Path,
 ) -> (
     std::collections::BTreeMap<String, (String, Vec<i64>)>,

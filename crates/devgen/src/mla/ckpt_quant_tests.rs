@@ -67,6 +67,77 @@ fn an_unsupported_quantization_is_refused_rather_than_downgraded() {
     mla_ckpt_enc(&d);
 }
 
+/// The REAL DeepSeek-V4.1-Flash `quantization_config`, copied field for field off the
+/// checkpoint. Its five fields say two different things at once: `weight_block_size [32,32]`
+/// with `scale_fmt: "ue8m0"` describes the DENSE projections, and `expert_dtype: "fp4"` the
+/// routed experts.
+///
+/// The PARSE can state that, so it does. What cannot is the collapse to one `MoeEnc`, and the
+/// two tests below are the pair: a checkpoint this reads correctly, and an emitter that refuses
+/// to pretend it is uniform.
+#[test]
+fn the_v41_checkpoint_parses_as_mixed_rather_than_being_refused_outright() {
+    let d = cfg_dir(
+        "ckpt_v41",
+        r#"{"model_type":"deepseek_v41","dtype":"bfloat16",
+                "quantization_config":{"quant_method":"fp8","activation_scheme":"dynamic",
+                "weight_block_size":[32,32],"scale_fmt":"ue8m0","expert_dtype":"fp4"}}"#,
+    );
+    let ck = mla_ckpt_enc_full(&d).expect("V4.1 carries a quantization_config");
+    assert_eq!(ck.dense, DenseEnc::Fp8Mx32, "dense projections are the [32,32] ue8m0 grid");
+    assert_eq!(ck.expert, MoeEnc::Mxfp4, "routed experts are fp4, per expert_dtype");
+    assert!(!ck.is_uniform(), "the whole point: one MoeEnc cannot describe this checkpoint");
+}
+
+/// And the collapse refuses, naming the capability rather than a constant. Answering with EITHER
+/// side would be a lie about the other: the expert encoding would declare fp4 scale grids for
+/// projections that are block-fp8 on disk, and the dense one would do the reverse to the experts.
+///
+/// The message must NOT read as a kernel gap, because it is not one — op 198 and
+/// `d_gemm_t<WFP8MX>` exist and pass on gfx942. What is missing is an emitter that can thread two
+/// encodings through one run.
+#[test]
+#[should_panic(expected = "emit_mixed_dense_expert_encoding")]
+fn collapsing_a_mixed_checkpoint_to_one_encoding_is_refused() {
+    let d = cfg_dir(
+        "ckpt_v41_collapse",
+        r#"{"model_type":"deepseek_v41","dtype":"bfloat16",
+                "quantization_config":{"quant_method":"fp8","activation_scheme":"dynamic",
+                "weight_block_size":[32,32],"scale_fmt":"ue8m0","expert_dtype":"fp4"}}"#,
+    );
+    mla_ckpt_enc(&d);
+}
+
+/// The uniform families must keep collapsing exactly as before — this split is meant to change
+/// nothing for them, and `is_uniform` is what decides.
+#[test]
+fn the_uniform_families_still_collapse_to_one_encoding() {
+    let d = cfg_dir(
+        "ckpt_uniform_fp8",
+        r#"{"model_type":"glm_moe_dsa","quantization_config":{"quant_method":"fp8",
+                "fmt":"e4m3","weight_block_size":[128,128]}}"#,
+    );
+    let ck = mla_ckpt_enc_full(&d).unwrap();
+    assert_eq!(ck.dense, DenseEnc::Fp8Blk128);
+    assert!(ck.is_uniform());
+    assert_eq!(mla_ckpt_enc(&d), Some(MoeEnc::Fp8Blk));
+}
+
+/// The V4.1 refusal is keyed on BOTH the block size and the scale format, so it must not
+/// swallow a plain `[32,32]` fp8 checkpoint with f32 scales — a shape no V4.1 has, and which
+/// still belongs to the generic block-size refusal below it. Pinning this keeps the specific
+/// branch from widening into the general one on a later edit.
+#[test]
+#[should_panic(expected = "fp8_block_size")]
+fn a_32_block_without_ue8m0_scales_still_takes_the_generic_refusal() {
+    let d = cfg_dir(
+        "ckpt_blk32_f32",
+        r#"{"quantization_config":{"quant_method":"fp8","fmt":"e4m3",
+                "weight_block_size":[32,32]}}"#,
+    );
+    mla_ckpt_enc(&d);
+}
+
 /// A non-e4m3 fp8 flavour is refused too — `fmt` is checked, not assumed.
 #[test]
 #[should_panic(expected = "fp8_fmt_e5m2")]

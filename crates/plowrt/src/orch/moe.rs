@@ -245,3 +245,225 @@ mod tests {
         );
     }
 }
+
+/// How ONE routed expert is spelled in the checkpoint on disk.
+///
+/// Three spellings reach this loader and they disagree on all four axes:
+///
+/// | checkpoint | sub-namespace | projections | payload | scale |
+/// |---|---|---|---|---|
+/// | GLM-5.2 / DeepSeek block-fp8 | `…mlp.` | `gate_proj`/`up_proj`/`down_proj` | `.weight` | `.weight_scale_inv` |
+/// | Kimi-K2.7-Code MXFP4 | `…mlp.` | the same three | `.weight` | `.weight_scale` |
+/// | Kimi-K3 (compressed-tensors mxfp4) | `…block_sparse_moe.` | `w1`/`w3`/`w2` | `.weight_packed` | `.weight_scale` |
+///
+/// The middle row is the reason this is RESOLVED and not switched on a flag: a
+/// K2.7 checkpoint is the standard projection names with an E8M0 scale, so
+/// "mxfp4" and "Mixtral-spelled" are independent facts and no single boolean
+/// carries both. A flag that disagrees with the bytes is the failure this file
+/// keeps finding; the bytes are the only thing that cannot disagree with itself.
+///
+/// `proj` is in `expert_weight_table` slot order — gate, up, down — which is why
+/// the Mixtral row reads `w1`/`w3`/`w2` and not `w1`/`w2`/`w3`.
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExpertNames {
+    /// Everything up to and including `experts.`; an expert index follows.
+    pub(crate) ns: String,
+    /// gate, up, down.
+    pub(crate) proj: [&'static str; 3],
+    /// `.weight` or `.weight_packed`.
+    pub(crate) payload: &'static str,
+    /// `.weight_scale_inv` (block-fp8 f32 grid) or `.weight_scale` (E8M0 row).
+    pub(crate) scale: &'static str,
+}
+
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+impl ExpertNames {
+    /// `shared`: name the SHARED expert instead of routed expert `e`.
+    ///
+    /// GLM spells it `…mlp.shared_experts.{gate,up,down}_proj.*` beside
+    /// `…mlp.experts.{e}.{gate,up,down}_proj.*`, so the substitution is exactly `experts.{e}.`
+    /// -> `shared_experts.` and everything after it — projection name, payload suffix, scale
+    /// suffix — is the routed spelling unchanged. Only the shared-expert fold passes `true`,
+    /// and only for the last table entry.
+    fn projection(&self, e: u32, j: usize, shared: bool, suffix: &str) -> String {
+        let ns = match self.ns.strip_suffix("experts.") {
+            Some(base) if shared => format!("{base}shared_experts."),
+            _ => format!("{}{e}.", self.ns),
+        };
+        format!("{ns}{}{suffix}", self.proj[j])
+    }
+
+    pub(crate) fn weight_of(&self, e: u32, j: usize, shared: bool) -> String {
+        self.projection(e, j, shared, self.payload)
+    }
+
+    pub(crate) fn scale_of(&self, e: u32, j: usize, shared: bool) -> String {
+        self.projection(e, j, shared, self.scale)
+    }
+
+    /// Is the scale an MX microscaling row (one E8M0 byte per 32 elements along
+    /// K) rather than a block-fp8 `[N/128][K/128]` f32 grid?
+    ///
+    /// Keyed on the SCALE's spelling, and both MX spellings are listed. `.weight_scale` is the
+    /// compressed-tensors one that rides `.weight_packed`; `.scale` is DeepSeek-V4.1's, which
+    /// rides a plain `.weight`. Only `.weight_scale_inv` -- block-fp8's -- is not MX, and
+    /// enumerating the MX side rather than excluding that one means a spelling nobody has taught
+    /// this function is read as block-fp8 and caught by `check_expert_geometry`'s grid arithmetic,
+    /// rather than read as MX and accepted because the byte counts happened to line up.
+    pub(crate) fn microscaled(&self) -> bool {
+        self.scale == ".weight_scale" || self.scale == ".scale"
+    }
+}
+
+/// Which spelling THIS checkpoint uses, decided by probing it.
+///
+/// `pfx` is what is left of the packet's `…expert_weight_table` after the suffix
+/// is stripped, and it is not always a checkpoint prefix: the GLM emitter
+/// declares the table under the model prefix (`model.layers.{l}.mlp.`), the K3
+/// emitter under its own `moe.` namespace (`moe.language_model.model.layers.{l}.`)
+/// because `packet::names` classifies compiler-owned tensors by that prefix. So
+/// `moe.` is stripped and the MoE sub-namespace is probed rather than assumed.
+///
+/// ORDER IS THE COMPATIBILITY GUARANTEE. The first candidate is `{pfx}experts.0.
+/// gate_proj.weight` + `.weight_scale_inv` — character for character the two
+/// names this function replaced hardcoded — so a block-fp8 packet resolves on
+/// probe one and every name built downstream is the name it was built before.
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+pub(crate) fn resolve_expert_names(
+    ckpt: &crate::asset::checkpoint::Checkpoint,
+    pfx: &str,
+) -> crate::Result<ExpertNames> {
+    const TEMPLATES: [([&str; 3], &str); 3] = [
+        (["gate_proj", "up_proj", "down_proj"], ".weight"),
+        (["w1", "w3", "w2"], ".weight_packed"),
+        // DeepSeek-V4.1-Flash: `w1`/`w3`/`w2` with a PLAIN `.weight` payload and a `.scale` grid,
+        // which is neither of the two above. LAST, so it can only be reached once the other two
+        // have missed -- a checkpoint carrying `gate_proj.weight` still resolves as it always did,
+        // and one carrying `w1.weight_packed` still prefers the packed spelling over this one.
+        (["w1", "w3", "w2"], ".weight"),
+    ];
+    const SCALES: [&str; 3] = [".weight_scale_inv", ".weight_scale", ".scale"];
+    let base = pfx.strip_prefix("moe.").unwrap_or(pfx);
+    let mut tried: Vec<String> = Vec::new();
+    for sub in ["", "mlp.", "block_sparse_moe."] {
+        for (proj, payload) in TEMPLATES {
+            let ns = format!("{base}{sub}experts.");
+            let probe = format!("{ns}0.{}{payload}", proj[0]);
+            if ckpt.tensor_ex(&probe).is_none() {
+                tried.push(probe);
+                continue;
+            }
+            // The payload is there, so this IS the layout — a missing scale is
+            // now a broken checkpoint and not a wrong guess, and saying so beats
+            // falling through to a spelling that cannot be right.
+            for scale in SCALES {
+                if ckpt
+                    .tensor_ex(&format!("{ns}0.{}{scale}", proj[0]))
+                    .is_some()
+                {
+                    return Ok(ExpertNames {
+                        ns,
+                        proj,
+                        payload,
+                        scale,
+                    });
+                }
+            }
+            return Err(crate::RuntimeError::Device(format!(
+                "MISSING EXPERT SCALE: `{probe}` is in the checkpoint but neither \
+                 `{ns}0.{}{}` nor `{ns}0.{}{}` is. A quantized expert without its scale \
+                 cannot be dequantized, and binding the payload alone would decode from \
+                 4-bit or 8-bit mantissas read as if they were already scaled.",
+                proj[0], SCALES[0], proj[0], SCALES[1]
+            )));
+        }
+    }
+    Err(crate::RuntimeError::Device(format!(
+        "MISSING EXPERT WEIGHT: the packet declares `{pfx}expert_weight_table` but the \
+         checkpoint has no routed experts under any spelling this loader knows. Probed: \
+         {tried:?}"
+    )))
+}
+
+/// Fail unless expert 0's three scale twins are the right SIZE for the weights
+/// they scale.
+///
+/// Every expert in a layer is the same shape, and `slice_for` re-checks each one
+/// against the stride derived here — so this is the only place the WEIGHT and its
+/// SCALE are compared to each other at all. Getting it wrong is silent in the
+/// worst way: an E8M0 row and a block-fp8 grid can be the same number of bytes
+/// for some geometries, so a size that merely "looks plausible" is exactly the
+/// thing that must not be accepted.
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+pub(crate) fn check_expert_geometry(
+    ckpt: &crate::asset::checkpoint::Checkpoint,
+    n: &ExpertNames,
+) -> crate::Result<()> {
+    let miss = |name: &str| {
+        crate::RuntimeError::Device(format!(
+            "MISSING EXPERT WEIGHT: {name} (expert 0 resolved to the `{}` + `{}` layout \
+             under `{}`, so every projection must be present in it)",
+            n.payload, n.scale, n.ns
+        ))
+    };
+    for j in 0..3 {
+        let (wn, sn) = (n.weight_of(0, j, false), n.scale_of(0, j, false));
+        let (w, ws) = ckpt.tensor_ex(&wn).ok_or_else(|| miss(&wn))?;
+        let (s, ss) = ckpt.tensor_ex(&sn).ok_or_else(|| miss(&sn))?;
+        let bad = |m: String| {
+            Err(crate::RuntimeError::Device(format!(
+                "EXPERT SCALE GEOMETRY: `{sn}` {ss:?} ({} B) cannot be the scale of `{wn}` \
+                 {ws:?} ({} B): {m}",
+                s.len(),
+                w.len()
+            )))
+        };
+        if ws.len() != 2 || ss.len() != 2 {
+            return bad(
+                "both must be 2-D — a routed expert is a matrix and its scale is \
+                        a grid or a per-group row, never a vector"
+                    .into(),
+            );
+        }
+        let (wn0, wn1, sn0, sn1) = (ws[0], ws[1], ss[0], ss[1]);
+        if n.microscaled() {
+            // MX: payload is [N, K/2] (two fp4 per byte), scale is [N, K/32]
+            // (one E8M0 byte per group of 32 along K). Both are u8, so the byte
+            // count IS the element count.
+            if w.len() != wn0 * wn1 || s.len() != sn0 * sn1 {
+                return bad("an mxfp4 payload and its E8M0 scale are both u8, so each \
+                            must be exactly the product of its shape"
+                    .into());
+            }
+            if sn0 != wn0 {
+                return bad(format!("the output dim disagrees: {wn0} vs {sn0}"));
+            }
+            if wn1 * 2 != sn1 * 32 {
+                return bad(format!(
+                    "K disagrees: the payload packs {} elements per row, the scale covers {}",
+                    wn1 * 2,
+                    sn1 * 32
+                ));
+            }
+        } else {
+            // Block-fp8: payload is [N, K] e4m3 (1 B/element), scale is
+            // [ceil(N/128), ceil(K/128)] f32. Verified against
+            // zai-org/GLM-5.2-FP8: [2048, 6144] -> [16, 48].
+            const B: usize = 128;
+            if w.len() != wn0 * wn1 {
+                return bad("an fp8 e4m3 payload is 1 B/element, so it must be exactly \
+                            the product of its shape"
+                    .into());
+            }
+            let (gn, gk) = (wn0.div_ceil(B), wn1.div_ceil(B));
+            if (sn0, sn1) != (gn, gk) || s.len() != gn * gk * 4 {
+                return bad(format!(
+                    "a block-fp8 scale grid must be [{gn}, {gk}] f32 ({} B)",
+                    gn * gk * 4
+                ));
+            }
+        }
+    }
+    Ok(())
+}

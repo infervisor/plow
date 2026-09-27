@@ -195,6 +195,96 @@ pub fn shard_of(name: &str) -> Shard {
         return Shard::Column;
     }
 
+    // DeepSeek-V4.1-Flash. Its names collide with nothing in COL/ROW -- `wq_b`, `wo_a`, `wo_b`,
+    // `w1`/`w2`/`w3` are its own spelling -- so without these rows EVERY tensor below falls through
+    // to `Replicated` and the load fails on the first size check it reaches. That is how this list
+    // was found: `attn_sink: replicated but the checkpoint has 256 B and the blob declares 32 B`.
+    //
+    // These mirror `devgen::mla::dsv41::dsv41_shard_of`, which is the reviewed specification (it
+    // panics on an unclassified name for this reason) and cannot be called from here, since plowrt
+    // does not depend on devgen. The mapping is OutSplit -> Column, InSplit -> Row. The enforcement
+    // that the two agree is `slice_for`'s own `full == want * tp` check, which is what caught the
+    // absence of this block rather than a wrong answer.
+    //
+    // Both `.weight` and `.scale` ride the same substring: the block-FP8 scale grid is 2-D and cuts
+    // on the same axis as its weight.
+    const DSV41_COL: [&str; 6] = [
+        // The q UP projection, column-parallel by head.
+        "attn.wq_b.",
+        // The output LoRA's block-diagonal down: rank r's rows ARE group r's block.
+        "attn.wo_a.",
+        // One sink per head, so it follows the heads. 1-D, and Column is happy with that --
+        // a contiguous element range is exactly one rank's heads.
+        "attn.attn_sink",
+        // Shared expert gate/up, column-parallel over the intermediate.
+        "ffn.shared_experts.w1.",
+        "ffn.shared_experts.w3.",
+
+        // THE ENGRAM TABLE, split over its ROWS by capacity rather than by preference: it is
+        // 384 006 168 rows of 256 fp8 = 98.31 GB, and there are two of them against 192 GB of
+        // HBM, so a replicated copy does not fit on one card at all. `ParallelEngramEmbedding`
+        // shards exactly this way -- `part_num_embeddings = ceil(rows / world_size)`,
+        // `vocab_start = rank * part` (`model.py:303-305`) -- and op 197 writes zeros for any id
+        // outside the shard, which the emit's XReduce then sums. Both `.weight` [rows, 256] and
+        // `.scale` [rows, 8] are 2-D and cut on the same row axis, so they ride the one substring.
+        "engram.embed.",
+    ];
+    const DSV41_ROW: [&str; 2] = [
+        // wo_b reduces over every group's LoRA output, so it splits on the INPUT.
+        "attn.wo_b.",
+        // Shared expert down, reducing over the intermediate.
+        "ffn.shared_experts.w2.",
+    ];
+    // REPLICATED ON PURPOSE, and listed rather than left to the fall-through, because each one
+    // would be plausible as a split and wrong. `wkv` is the absorbed latent -- ONE 512-wide row
+    // serves all 64 heads, so a rank holding an eighth of it could not attend with the heads it
+    // owns. `wq_a`'s rank is shared across heads, so there is nothing head-shaped to cut. The
+    // router must score every expert on every rank or it cannot pick a global top-6.
+    const DSV41_REPLICATED: [&str; 8] = [
+        "attn.wkv.",
+        "attn.wq_a.",
+        "ffn.gate.",
+        "attn.compressor.",
+        // THE WHOLE INDEXER, queries included. `ColumnParallelLinear` would give a rank 4 of the
+        // 32 index heads and `d_index_score_pf_row`'s MFMA A tile IS the head axis -- its own
+        // static_assert says to "replicate a sharded indexer instead" ([DSV4-IDX]) rather than
+        // run a one-eighth-full tile. The alternative, an all-reduce of `index_score`, is
+        // 268 MB per layer at 8k. See `dsv41_shard_of`, which must agree with this.
+        "attn.indexer.",
+        // ENGRAM, EVERYTHING DOWNSTREAM OF THE TABLE. `self.wkv` is the plain `Linear`
+        // (`model.py:345`), not `ColumnParallelLinear` or `RowParallelLinear`, and the gate
+        // weights are plain `[hc_mult, dim]` parameters -- so the only cross-rank exchange is the
+        // embedding's own `all_reduce`, and it happens before `wkv` ever runs. Note these do NOT
+        // collide with `attn.wkv.`: the spellings are `engram.wkv.` and `attn.wkv.`.
+        "engram.wkv.",
+        "engram.q_weight",
+        "engram.k_weight",
+    ];
+    // The ROUTED experts: `ffn.experts.{e}.w{1,2,3}.{weight,scale}`. Same classes as the shared
+    // expert -- gate/up column-parallel over `moe_inter`, down reducing over it -- but the expert
+    // INDEX sits in the middle, so no fixed substring can name them. `ffn.shared_experts.` does not
+    // contain `ffn.experts.`, so the two families cannot be confused here.
+    //
+    // These reach `slice_for` from `bind_packed_experts`, one expert at a time, on the way into the
+    // packed slab -- not from the blob's tensor table, which does not declare them.
+    if let Some(rest) = name.split("ffn.experts.").nth(1) {
+        if rest.contains(".w1.") || rest.contains(".w3.") {
+            return Shard::Column;
+        }
+        if rest.contains(".w2.") {
+            return Shard::Row;
+        }
+    }
+    if DSV41_REPLICATED.iter().any(|s| name.contains(s)) {
+        return Shard::Replicated;
+    }
+    if DSV41_COL.iter().any(|s| name.contains(s)) {
+        return Shard::Column;
+    }
+    if DSV41_ROW.iter().any(|s| name.contains(s)) {
+        return Shard::Row;
+    }
+
     if COL.iter().any(|s| name.contains(s)) {
         Shard::Column
     } else if ROW.iter().any(|s| name.contains(s)) {
@@ -1080,4 +1170,73 @@ mod mxfp4_shard_tests {
             assert_eq!(gw.len() * 2, gs.len() * 32);
         }
     }
+
+    /// DeepSeek-V4.1's table, against the sizes `devgen::mla::dsv41::dsv41_shard_of` declares.
+    ///
+    /// Without these rows every V4.1 tensor fell through to `Replicated` and the load died on the
+    /// first size check it reached -- `attn_sink: replicated but the checkpoint has 256 B and the
+    /// blob declares 32 B`. That check is the real enforcement (plowrt cannot call devgen), so this
+    /// test states the classification the emitter expects rather than re-deriving it.
+    #[test]
+    fn dsv41_tensors_shard_on_the_axis_the_emitter_declared() {
+        for n in [
+            "layers.0.attn.wq_b.weight",
+            "layers.0.attn.wq_b.scale",
+            "layers.0.attn.wo_a.weight",
+            "layers.0.attn.wo_a.scale",
+            "layers.0.attn.attn_sink",
+            "layers.0.ffn.shared_experts.w1.weight",
+            "layers.0.ffn.shared_experts.w3.scale",
+            // The Engram table, row-split because 98.31 GB cannot be replicated on a 192 GB card.
+            "layers.1.engram.embed.weight",
+            "layers.14.engram.embed.scale",
+            // Routed experts, which carry the expert index mid-name.
+            "layers.0.ffn.experts.0.w1.weight",
+            "layers.0.ffn.experts.383.w1.scale",
+            "layers.0.ffn.experts.17.w3.weight",
+        ] {
+            assert_eq!(shard_of(n), Shard::Column, "{n}");
+        }
+        for n in [
+            "layers.0.attn.wo_b.weight",
+            "layers.0.attn.wo_b.scale",
+            "layers.0.ffn.shared_experts.w2.weight",
+            "layers.0.ffn.shared_experts.w2.scale",
+            "layers.0.ffn.experts.0.w2.weight",
+            "layers.0.ffn.experts.383.w2.scale",
+        ] {
+            assert_eq!(shard_of(n), Shard::Row, "{n}");
+        }
+        for n in [
+            // THE ABSORBED LATENT. One 512-wide row serves all 64 heads, so a rank holding an
+            // eighth of it could not attend with the heads it owns.
+            "layers.0.attn.wkv.weight",
+            "layers.0.attn.wkv.scale",
+            // The q-LoRA rank is shared across heads: nothing head-shaped to cut.
+            "layers.0.attn.wq_a.weight",
+            // Every rank scores every expert or it cannot pick a global top-6.
+            "layers.0.ffn.gate.weight",
+            "layers.0.ffn.gate.bias",
+            "layers.0.attn_norm.weight",
+            "layers.0.ffn_norm.weight",
+            "layers.0.attn.q_norm.weight",
+            "layers.0.attn.kv_norm.weight",
+            "layers.0.hc_attn_fn",
+            "layers.2.attn.compressor.wkv.weight",
+            // The indexer, replicated so its 32 heads fill the MFMA A tile on every rank.
+            "layers.2.attn.indexer.wq_b.weight",
+            "layers.2.attn.indexer.weights_proj.weight",
+            "layers.8.attn.indexer.wk.weight",
+            // Everything downstream of the Engram all-reduce: `self.wkv` is the plain `Linear`,
+            // and the gate weights are plain [hc_mult, dim] parameters. `engram.wkv.` must NOT be
+            // caught by `attn.wkv.`, which is a different tensor of a different shape.
+            "layers.1.engram.wkv.weight",
+            "layers.1.engram.wkv.scale",
+            "layers.14.engram.q_weight",
+            "layers.14.engram.k_weight",
+        ] {
+            assert_eq!(shard_of(n), Shard::Replicated, "{n}");
+        }
+    }
+
 }

@@ -451,6 +451,21 @@ OUT_W8A16_M1="${OUT%.cubin}_pfgemm_w8a16_m1.cubin"
   }
 echo "built $OUT_W8A16_M1 ($(stat -c%s "$OUT_W8A16_M1") B)"
 
+# DeepSeek-V4.1 prefill role objects (segment roles 18/19; devgen marks them when the object sits
+# next to the packet).
+for ROLE in pfgemm_fp8mx pfmoe_fp4 pfflash_v41; do
+  OUT_ROLE="${OUT%.cubin}_${ROLE}.cubin"
+  "${NVENV[@]}" \
+    "$NVCC" -std=c++17 -arch=sm_90a -O3 -cubin \
+    -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+    -o "$OUT_ROLE" "$HERE/runtime/nvidia/interp_sm90a_${ROLE}.cu"
+  "${NVENV[@]}" cuobjdump -symbols "$OUT_ROLE" | grep -q "plow_sm90a_${ROLE}" || {
+    echo "FATAL: role kernel plow_sm90a_${ROLE} missing in $OUT_ROLE" >&2
+    exit 1
+  }
+  echo "built $OUT_ROLE ($(stat -c%s "$OUT_ROLE") B)"
+done
+
 # fp8-KV variants (rtx-19 E3, PLOW_BUILD_FP8KV=1): same two objects + -DPLOW_FP8_KV=1, which
 # compiles in the e4m3 KV op-arms (HEADNORM_ROPE_FP8 / FLASH_DECODE_FP8). The default objects above
 # stay byte-identical (fp8 arms are behind the flag). fp8-KV composes with fp8 WEIGHTS at runtime:
