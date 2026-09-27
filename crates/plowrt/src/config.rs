@@ -963,6 +963,10 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-trace-log", env = "PLOW_PF_TRACE_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_trace_log: bool,
 
+    /// Diagnostic: name why a decode rung failed ladder normalization (widest-rung fallback).
+    #[arg(long = "ladder-debug", env = "PLOW_LADDER_DEBUG", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub ladder_debug: bool,
+
     /// Per-shape cuBLASLt algorithm table (JSONL, see `device::cuda::lt::StoredAlgo`): each
     /// `(m, n, k)` BF16 shape uses the pinned algorithm after `cublasLtMatmulAlgoCheck` accepts
     /// it; a rejected entry falls back to the heuristic plus load-time timing.
