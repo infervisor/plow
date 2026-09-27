@@ -691,9 +691,13 @@ mod tests {
     fn accepts_only_measured_sm90_bf16_prefill_cells() {
         use plow_asset::segment_roles::{
             CUBLASLT_PREFILL_GEMMA4_26B_SHAPES, CUBLASLT_PREFILL_GEMMA4_SHAPES,
-            CUBLASLT_PREFILL_ROWS, CUBLASLT_PREFILL_WIDE_ROWS,
+            CUBLASLT_PREFILL_ROWS, CUBLASLT_PREFILL_SPEECH_ROWS, CUBLASLT_PREFILL_WIDE_ROWS,
         };
-        for &rows in CUBLASLT_PREFILL_ROWS.iter().chain(&CUBLASLT_PREFILL_WIDE_ROWS) {
+        for &rows in CUBLASLT_PREFILL_ROWS
+            .iter()
+            .chain(&CUBLASLT_PREFILL_WIDE_ROWS)
+            .chain(&CUBLASLT_PREFILL_SPEECH_ROWS)
+        {
             for &(n, k) in CUBLASLT_PREFILL_GEMMA4_SHAPES
                 .iter()
                 .chain(&CUBLASLT_PREFILL_GEMMA4_26B_SHAPES)
@@ -707,7 +711,7 @@ mod tests {
 
         for (profile, rows, n, k) in [
             ("sm120", 128, 3840, 15360),
-            ("sm90a", 64, 3840, 15360),
+            ("sm90a", 48, 3840, 15360),
             ("sm90a", 1000, 3840, 15360),
             ("sm90a", 32768, 3840, 15360),
             ("sm90a", 128, 3840, 3840),

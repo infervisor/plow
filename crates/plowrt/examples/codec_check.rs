@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .chunks_exact(per)
         .map(|c| {
             let (codec, c) = (codec.clone(), c.to_vec());
-            tokio::spawn(async move { codec.decode(c, frames, seed).await })
+            tokio::spawn(async move { codec.decode(c, frames, seed, plowrt::tts::codec::Urgency::Whole).await })
         })
         .collect();
     let mut out = Vec::new();
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let t = std::time::Instant::now();
     for _ in 0..20 {
-        codec.decode(codes[..per].to_vec(), frames, seed).await?;
+        codec.decode(codes[..per].to_vec(), frames, seed, plowrt::tts::codec::Urgency::Whole).await?;
     }
     eprintln!("single-item decode {:.3} ms", t.elapsed().as_secs_f64() * 1e3 / 20.0);
     std::fs::write(&args[5], bytemuck::cast_slice(&out))?;

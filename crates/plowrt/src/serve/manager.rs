@@ -1003,6 +1003,7 @@ impl ModelManager {
                 .await
                 .map_err(|e| EnsureError::Load(RuntimeError::Msg(format!("load task: {e}"))))?
                 .map_err(EnsureError::Load)?;
+        mux::check_speech_packet(&engine).map_err(EnsureError::Load)?;
         let (free_after, _) = self.be.mem_info().map_err(EnsureError::Load)?;
         let pool_after = VmmOps::pool_bytes(&*self.be);
 

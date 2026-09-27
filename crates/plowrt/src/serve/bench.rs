@@ -869,6 +869,7 @@ fn submit(
         gen,
         arrived: submitted,
         respond: tx,
+        opts: Default::default(),
     };
     mux.submit(job).map_err(|e| match e {
         SubmitError::Full(_) => RuntimeError::Rejected("bench request queue full".into()),

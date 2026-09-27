@@ -201,6 +201,82 @@ pub struct Job {
     pub gen: GenParams,
     pub arrived: Instant,
     pub respond: ChunkSender,
+    pub opts: JobOpts,
+}
+
+/// Per-request options beyond the text sampling contract. `Default` is a plain text request.
+#[derive(Default)]
+pub struct JobOpts {
+    pub class: JobClass,
+    /// Stream token ids only: no detokenization, and a consumer that falls behind is parked
+    /// (not fed) instead of cut, up to [`PARK_TIMEOUT`].
+    pub raw_tokens: bool,
+    /// Host-built prefill rows for a speech/audio packet; `None` for text.
+    pub speech: Option<Box<SpeechJob>>,
+}
+
+/// Queue priority. Orders the waiting queue and serial prefill, and scales the queue TTL.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum JobClass {
+    /// A user is waiting on this one's first output (a stream's first audio, an ASR final).
+    Critical = 0,
+    #[default]
+    Normal = 1,
+    /// Yields to everything else, and is superseded if it waits: revisable partial results.
+    Bulk = 2,
+}
+
+impl JobClass {
+    /// Multiple of the queue TTL this class may wait. A bulk result that has queued a tenth of it
+    /// has been superseded by the time it would run.
+    fn ttl_scale(self) -> f64 {
+        match self {
+            JobClass::Critical | JobClass::Normal => 1.0,
+            JobClass::Bulk => 0.1,
+        }
+    }
+}
+
+/// How long a raw-token consumer may hold its slot parked before the request is cut.
+const PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A request whose prefill splices host rows over prompt positions (`EmbedOverlayBf16`: the
+/// packet's `in.encoder_overlay` / `in.encoder_overlay_index`) and whose decode embedding may
+/// offset a learned position by a per-slot base (`EmbedPosBf16`: `in.pos_base`).
+///
+/// Both packet ops index their inputs by LAUNCH row, and the overlay is one global tensor, so such
+/// jobs run only through the serial per-slot prefill (which rewrites the overlay before each of
+/// their chunks) and the plain decode launch (launch row == slot).
+#[derive(Default)]
+pub struct SpeechJob {
+    /// `[rows][hidden]` f32, one row per entry of `overlay_pos`.
+    pub overlay: Vec<f32>,
+    /// Absolute prompt position each overlay row replaces, strictly increasing.
+    pub overlay_pos: Vec<u32>,
+    /// Written to `in.pos_base[slot]` once the prompt is prefilled (decode position base).
+    pub pos_base: Option<u32>,
+    /// Classifier-free guidance: the request also runs unconditionally on the partner slot
+    /// (owner + 1), and each token is drawn from the combined logits on the host.
+    pub cfg: Option<CfgJob>,
+}
+
+/// The unconditional member of a CFG pair and the guided sampling chain.
+pub struct CfgJob {
+    /// The unconditional member's prefill rows, at `SpeechJob::overlay_pos`.
+    pub uncond_overlay: Vec<f32>,
+    pub params: crate::text::sample::CfgParams,
+    /// Penalty history ahead of the generated tokens (the reference counts its BOS).
+    pub history: Vec<u32>,
+    /// `None` = greedy guided decoding.
+    pub seed: Option<u64>,
+}
+
+/// A CFG owner's host state: its draws and reused logits buffers.
+struct CfgRun {
+    rng: Option<crate::text::sample::SplitMix>,
+    cond: Vec<f32>,
+    uncond: Vec<f32>,
+    scratch: Vec<f32>,
 }
 
 /// Handle to a per-model dispatcher — cheap to clone (wraps a Sender).
@@ -422,6 +498,34 @@ struct Slot {
     /// Bytes withheld from the client because they are a proper prefix of a stop string and
     /// the rest of it may still be generated. Released once a later token proves otherwise.
     stop_pending: String,
+    class: JobClass,
+    raw_tokens: bool,
+    speech: Option<Box<SpeechJob>>,
+    /// Set on the owner of a CFG pair; its partner slot (owner + 1) stays `None` in the table
+    /// and is reserved while the owner lives (see [`slot_free`]).
+    cfg: Option<Box<CfgRun>>,
+    /// Raw tokens produced while the consumer's channel was full, oldest first. A parked slot is
+    /// not fed; see [`flush_parked`].
+    held: Vec<u32>,
+    held_finish: Option<FinishReason>,
+    parked_at: Option<Instant>,
+}
+
+impl Slot {
+    /// Rows that must take the serial prefill path (see [`SpeechJob`]).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn serial_prefill(&self) -> bool {
+        self.speech.is_some()
+    }
+
+    /// Rows that take the plain one-step decode launch: `EmbedPosBf16` reads the position base by
+    /// launch row, and speech outputs are short and stop unpredictably, so a device multi-step
+    /// quantum mostly decodes past the stop (Qwen3-ASR served, 73 clips, C16: 246.7 vs 227.3 RTFx
+    /// one-step vs K=8).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn plain_decode(&self) -> bool {
+        self.speech.is_some()
+    }
 }
 
 /// Buffers reused across ticks for one bucket. Reallocated only when the live
@@ -616,6 +720,7 @@ pub fn spawn(
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let inline_tick = false;
     let dispatcher_name = format!("plow-mux-{slug}");
+    let downstream = state.downstream(&slug);
 
     let dispatcher = async move {
         let mut slots: Vec<Option<Slot>> = (0..capacity).map(|_| None).collect();
@@ -744,6 +849,7 @@ pub fn spawn(
                             &metrics,
                             &health,
                             kv_budget,
+                            downstream.full(),
                         );
                         if let Some(j) = held {
                             Metrics::inc(&metrics.queued_requests);
@@ -843,6 +949,7 @@ pub fn spawn(
                     &metrics,
                     &health,
                     kv_budget,
+                    downstream.full(),
                 );
             }
             let idle = slots[..admission_limit]
@@ -892,6 +999,7 @@ pub fn spawn(
                                             &metrics,
                                             &health,
                                             kv_budget,
+                                            downstream.full(),
                                         ) {
                                             Metrics::inc(&metrics.queued_requests);
                                             waiting.push_back(j);
@@ -935,6 +1043,7 @@ pub fn spawn(
                                         &metrics,
                                         &health,
                                         kv_budget,
+                                        downstream.full(),
                                     ) {
                                         Metrics::inc(&metrics.queued_requests);
                                         waiting.push_back(j);
@@ -951,10 +1060,43 @@ pub fn spawn(
                     }
                 }
             }
+            // A full slot table leaves arrivals in the channel in arrival order; in `waiting`,
+            // `drain_waiting` seats them by class as slots free.
+            while !draining
+                && waiting.len() < ingress_capacity
+                && !rx.is_empty()
+                && slots[..admission_limit].iter().all(Option::is_some)
+            {
+                let Ok(msg) = rx.try_recv() else { break };
+                note_dequeued(&msg, &metrics);
+                match msg {
+                    MuxMsg::Job(job, arrived) => {
+                        note_arrival(job.arrived, &mut load, &metrics);
+                        Metrics::inc(&metrics.queued_requests);
+                        waiting.push_back((job, arrived));
+                    }
+                    MuxMsg::Drain(done) => {
+                        draining = true;
+                        drain_done = Some(done);
+                    }
+                }
+            }
 
             let live = slots.iter().filter(|s| s.is_some()).count();
             if live == 0 {
+                // Everything queued waits on the downstream stage: sleep until it finishes work.
+                if !waiting.is_empty() && downstream.full() {
+                    turn.release();
+                    tokio::select! {
+                        _ = downstream.released() => {}
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                    }
+                }
                 continue;
+            }
+            // Every live slot is parked on a slow consumer: nothing to launch.
+            if slots.iter().flatten().all(|s| s.parked_at.is_some()) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
 
             // Pick the covering bucket for (Decode, live, max seq requirement)
@@ -1059,6 +1201,13 @@ pub fn spawn(
                 Vec::new()
             };
 
+            // A downstream stage rendering a first chunk has the device to itself.
+            while downstream.urgent() && !preempt_seen.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = downstream.released() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                }
+            }
             if let Some(dt) = &device_turn {
                 tokio::select! {
                     biased;
@@ -1364,10 +1513,10 @@ enum Queued {
 /// The queue-entry policy, kept pure so the two ways a waiting request leaves without running
 /// are decided in one place.
 #[inline]
-fn queue_verdict(closed: bool, waited_ms: f64, slo_ms: f64) -> Queued {
+fn queue_verdict(closed: bool, waited_ms: f64, slo_ms: f64, class: JobClass) -> Queued {
     if closed {
         Queued::Disconnected
-    } else if waited_ms > queue_ttl_ms(slo_ms) {
+    } else if waited_ms > queue_ttl_ms(slo_ms) * class.ttl_scale() {
         Queued::Expired
     } else {
         Queued::Retry
@@ -1407,9 +1556,11 @@ fn drain_waiting(
     metrics: &Arc<Metrics>,
     health: &EngineHealth,
     kv_budget: Option<crate::sched::admission::KvBudget>,
+    downstream_full: bool,
 ) {
     waiting.retain(|(job, arrived)| {
-        match queue_verdict(job.respond.is_closed(), waited_ms(now, *arrived), slo_ms) {
+        let class = job.opts.class;
+        match queue_verdict(job.respond.is_closed(), waited_ms(now, *arrived), slo_ms, class) {
             Queued::Retry => true,
             Queued::Disconnected => {
                 metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
@@ -1423,13 +1574,17 @@ fn drain_waiting(
                     .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(format!(
                         "queued {:.0} ms past the {:.0} ms queue TTL",
                         waited_ms(now, *arrived),
-                        queue_ttl_ms(slo_ms)
+                        queue_ttl_ms(slo_ms) * class.ttl_scale()
                     ))));
                 false
             }
         }
     });
 
+    // Class order, arrival order within a class (a stable sort of an arrival-ordered queue).
+    if waiting.iter().any(|(job, _)| job.opts.class != JobClass::Normal) {
+        waiting.make_contiguous().sort_by_key(|(job, _)| job.opts.class);
+    }
     let aging = queue_aging_ms(slo_ms);
     let mut still: std::collections::VecDeque<(Job, Instant)> =
         std::collections::VecDeque::new();
@@ -1449,6 +1604,7 @@ fn drain_waiting(
             metrics,
             health,
             kv_budget,
+            downstream_full,
         ) {
             Some(held) => {
                 let blocks = waited_ms(now, held.1) >= aging;
@@ -1486,20 +1642,33 @@ fn admit_into(
     metrics: &Arc<Metrics>,
     health: &EngineHealth,
     kv_budget: Option<crate::sched::admission::KvBudget>,
+    downstream_full: bool,
 ) -> Option<(Job, Instant)> {
     if job.respond.is_closed() {
         return None;
     }
 
-    let want = reserved_kv_rows(job.prompt_ids.len(), job.gen.max_tokens, 0);
-    let seq_upper = want as i64;
-    let free_slot = slots[..limit.min(slots.len())]
-        .iter()
-        .position(Option::is_none);
-    let committed = slots
-        .iter()
-        .flatten()
-        .map(|s| reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()));
+    let pair = job.opts.speech.as_ref().is_some_and(|s| s.cfg.is_some());
+    let seq_upper = reserved_kv_rows(job.prompt_ids.len(), job.gen.max_tokens, 0) as i64;
+    // A CFG pair holds two engine slots' KV.
+    let want = seq_upper as u64 * (1 + pair as u64);
+    let lim = limit.min(slots.len());
+    let free_slot = if pair {
+        (0..lim.saturating_sub(1))
+            .step_by(2)
+            .find(|&i| slots[i].is_none() && slots[i + 1].is_none())
+    } else {
+        (0..lim).find(|&i| slot_free(slots, i))
+    };
+    // Idle slots that cannot take this job (a lone slot for a pair, a live pair's partner) free
+    // up as requests retire: queue, do not refuse.
+    if free_slot.is_none() && !(pair && slots.len() < 2) && slots[..lim].iter().any(Option::is_none) {
+        return Some((job, arrived));
+    }
+    let committed = slots.iter().flatten().map(|s| {
+        reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len())
+            * (1 + s.cfg.is_some() as u64)
+    });
 
     let idx = match seat(
         matches!(health, EngineHealth::Dead(_)),
@@ -1507,6 +1676,7 @@ fn admit_into(
         want,
         committed,
         kv_budget,
+        downstream_full,
     ) {
         Ok(idx) => idx,
         Err(denied) => {
@@ -1551,7 +1721,9 @@ fn admit_into(
                          all concurrent sequences"
                     ))
                 }
-                Denied::KvBudgetFull { .. } => unreachable!("handled as retryable above"),
+                Denied::KvBudgetFull { .. } | Denied::DownstreamFull => {
+                    unreachable!("handled as retryable above")
+                }
             };
             // Counted for every terminal denial. Kept separate from the admission-shed path:
             // both end as a 429, but shedding is the controller dropping live work because
@@ -1602,8 +1774,27 @@ fn admit_into(
         pf_pos: 0,
         cached_tokens: 0,
         kv,
+        class: job.opts.class,
+        raw_tokens: job.opts.raw_tokens,
+        cfg: pair.then(|| {
+            Box::new(CfgRun {
+                rng: job.opts.speech.as_ref().and_then(|s| s.cfg.as_ref()?.seed).map(crate::text::sample::SplitMix::new),
+                cond: Vec::new(),
+                uncond: Vec::new(),
+                scratch: Vec::new(),
+            })
+        }),
+        speech: job.opts.speech,
+        held: Vec::new(),
+        held_finish: None,
+        parked_at: None,
     });
     None
+}
+
+/// Whether slot `i` is idle and not the reserved partner of a live CFG owner.
+fn slot_free(slots: &[Option<Slot>], i: usize) -> bool {
+    slots[i].is_none() && !(i % 2 == 1 && slots[i - 1].as_ref().is_some_and(|s| s.cfg.is_some()))
 }
 
 /// Return a slot's KV blocks to the arena (no-op when the slot never got one).
@@ -1812,6 +2003,11 @@ fn run_one_tick(
     Option<DecodeProgress>,
 ) {
     let bucket = key.and_then(|k| bundle.bucket(k));
+    for slot in slots.iter_mut() {
+        if slot.as_ref().is_some_and(|s| s.parked_at.is_some()) {
+            flush_parked(slot, &arena);
+        }
+    }
     let mut tokens_this_tick = 0usize;
     #[cfg_attr(not(any(feature = "cuda", feature = "hsa")), allow(unused_mut))]
     let mut tick_fault: Option<crate::DeviceErrorInfo> = None;
@@ -1937,7 +2133,12 @@ fn run_one_tick(
                     .iter()
                     .take(cap)
                     .filter_map(|slot| slot.as_ref())
-                    .filter(|slot| slot.step == 0 && slot.pf_pos == 0 && !slot.respond.is_closed())
+                    .filter(|slot| {
+                        slot.step == 0
+                            && slot.pf_pos == 0
+                            && !slot.respond.is_closed()
+                            && !slot.serial_prefill()
+                    })
                     .map(|slot| {
                         slot.prompt_ids
                             .len()
@@ -1956,7 +2157,11 @@ fn run_one_tick(
                         let Some(slot) = slots[i].as_ref() else {
                             continue;
                         };
-                        if slot.step != 0 || slot.pf_pos != 0 || slot.respond.is_closed() {
+                        if slot.step != 0
+                            || slot.pf_pos != 0
+                            || slot.respond.is_closed()
+                            || slot.serial_prefill()
+                        {
                             continue;
                         }
                         if slot.pf_pos == 0 {
@@ -2230,9 +2435,13 @@ fn run_one_tick(
                 } else {
                     pf_interleave_rows()
                 };
+                // Short serial-only prompts (speech) share one tick up to the interleave budget:
+                // nothing packs them, and one per tick leaves the decode batch starved.
+                let mut serial_rows = 0usize;
                 loop {
                     let Some(i) = (0..slots.len().min(cap))
-                        .find(|&i| slots[i].as_ref().map(|s| s.step == 0).unwrap_or(false))
+                        .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step == 0))
+                        .min_by_key(|&i| slots[i].as_ref().map(|s| (s.class, s.arrived)))
                     else {
                         break;
                     };
@@ -2259,6 +2468,8 @@ fn run_one_tick(
                         }
                     }
                     let t_pf = std::time::Instant::now();
+                    let (serial, pf_before) =
+                        slot_opt.as_ref().map_or((false, 0), |s| (s.serial_prefill(), s.pf_pos));
                     let res = gpu_prefill_advance(
                         &mut *e,
                         i,
@@ -2304,12 +2515,17 @@ fn run_one_tick(
                             fail_slot(slot_opt, &arena, err);
                         }
                     }
+                    if serial {
+                        serial_rows += slot_opt
+                            .as_ref()
+                            .map_or(usize::MAX, |s| s.pf_pos.saturating_sub(pf_before));
+                    }
                     if co_scheduled
-                        || gpu_prefill_should_yield(
+                        || (gpu_prefill_should_yield(
                             !feeds.is_empty(),
                             defer_decode,
                             slot_opt.as_ref(),
-                        )
+                        ) && !(serial && serial_rows < pf_interleave_rows()))
                     {
                         // New decoders join next tick; their first token was already emitted.
                         break;
@@ -2345,8 +2561,9 @@ fn run_one_tick(
                         slots[i]
                             .as_ref()
                             .map(|s| {
-                                gpu_argmax_eligible(&s.gen.params)
-                                    || (sampled_multi && dev_sample_spec(s).is_some())
+                                !s.plain_decode()
+                                    && (gpu_argmax_eligible(&s.gen.params)
+                                        || (sampled_multi && dev_sample_spec(s).is_some()))
                             })
                             .unwrap_or(true)
                     });
@@ -2490,12 +2707,21 @@ fn run_one_tick(
                     Ok(()) => {
                         let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                         decode_progress = completed_decode(&feeds, 1);
+                        let cfg_drawn = match gpu_cfg_draws(&mut *e, &feeds, &mut slots, &mut toks) {
+                            Ok(drawn) => drawn,
+                            Err(err) => {
+                                note_fault(&mut tick_fault, &err);
+                                fail_feeds(&mut slots, &feeds, &arena, &err);
+                                false
+                            }
+                        };
                         for (&(i, _), &argmax_tok) in feeds.iter().zip(toks.iter()) {
                             let slot_opt = &mut slots[i];
-                            let was_dev = dev_specs
-                                .as_ref()
-                                .map(|_| slot_opt.as_ref().map_or(false, |s| dev_sample_spec(s).is_some()))
-                                .unwrap_or(false);
+                            let was_dev = cfg_drawn && slot_opt.as_ref().is_some_and(|s| s.cfg.is_some())
+                                || dev_specs
+                                    .as_ref()
+                                    .map(|_| slot_opt.as_ref().map_or(false, |s| dev_sample_spec(s).is_some()))
+                                    .unwrap_or(false);
                             gpu_finish_and_emit_token(
                                 &mut *e,
                                 i,
@@ -2552,7 +2778,7 @@ fn run_one_tick(
             );
             })();
             for (slot, request) in result.0.iter().enumerate().take(e.batch()) {
-                if request.is_none() {
+                if request.is_none() && slot_free(&result.0, slot) {
                     e.retire_slot(slot, result.5.is_none() && !disconnected[slot]);
                 }
             }
@@ -3804,15 +4030,20 @@ fn run_one_tick(
 /// Decode feeds: every live slot past prefill, with its last token.
 #[cfg(feature = "cuda")]
 fn gpu_decode_feeds(slots: &[Option<Slot>], cap: usize) -> Vec<(usize, u32)> {
-    slots
-        .iter()
-        .enumerate()
-        .take(cap)
-        .filter_map(|(i, s)| {
-            let s = s.as_ref()?;
-            (s.step > 0).then(|| (i, *s.out_ids.last().expect("step > 0 implies output")))
-        })
-        .collect()
+    let mut feeds = Vec::with_capacity(cap);
+    for (i, s) in slots.iter().enumerate().take(cap) {
+        let Some(s) = s.as_ref() else { continue };
+        if s.step == 0 || s.parked_at.is_some() {
+            continue;
+        }
+        let last = *s.out_ids.last().expect("step > 0 implies output");
+        feeds.push((i, last));
+        // The CFG partner steps on the same token.
+        if s.cfg.is_some() && i + 1 < cap {
+            feeds.push((i + 1, last));
+        }
+    }
+    feeds
 }
 
 /// Whether every fed row can run in the decode pipeline: the device advance feeds the
@@ -3821,7 +4052,10 @@ fn gpu_decode_feeds(slots: &[Option<Slot>], cap: usize) -> Vec<(usize, u32)> {
 fn gpu_pipe_rows(feeds: &[(usize, u32)], slots: &[Option<Slot>]) -> bool {
     !feeds.is_empty()
         && feeds.iter().all(|&(i, _)| {
-            slots[i].as_ref().map(|s| gpu_argmax_eligible(&s.gen.params)).unwrap_or(true)
+            slots[i]
+                .as_ref()
+                .map(|s| gpu_argmax_eligible(&s.gen.params) && !s.plain_decode())
+                .unwrap_or(true)
         })
 }
 
@@ -4590,8 +4824,30 @@ fn gpu_prefill_advance(
     if slot.prompt_ids.is_empty() {
         return Err(crate::RuntimeError::Rejected("empty prompt".into()));
     }
+    let total = slot.prompt_ids.len() + slot.gen.max_tokens.max(1);
     if slot.pf_pos == 0 {
-        e.begin_slot(slot_idx, slot.prompt_ids.len() + slot.gen.max_tokens.max(1))?;
+        e.begin_slot(slot_idx, total)?;
+    }
+    if let Some(sp) = slot.speech.as_deref() {
+        // The pair prefills as one unit: the unconditional member to completion on the partner
+        // first, its last-row logits stashed before the owner's prefill overwrites row 0.
+        if let (0, Some(cfg), Some(run)) = (slot.pf_pos, sp.cfg.as_ref(), slot.cfg.as_mut()) {
+            let partner = slot_idx + 1;
+            e.begin_slot(partner, total)?;
+            let mut c0 = 0;
+            loop {
+                gpu_speech_prefill_inputs(e, partner, c0, &cfg.uncond_overlay, &sp.overlay_pos, sp.pos_base)?;
+                match e.prefill_chunk(partner, &slot.prompt_ids, usize::MAX)? {
+                    PrefillStep::Progress(end) => c0 = end,
+                    PrefillStep::Done(_) => break,
+                }
+            }
+            e.logits_row(0, &mut run.uncond)?;
+            if let Some(base) = sp.pos_base {
+                e.write_tensor("in.pos_base", (partner * 4) as u64, &base.to_le_bytes())?;
+            }
+        }
+        gpu_speech_prefill_inputs(e, slot_idx, slot.pf_pos, &sp.overlay, &sp.overlay_pos, sp.pos_base)?;
     }
     let tok = if e.has_prefill() {
         match e.prefill_chunk(slot_idx, &slot.prompt_ids, cap_rows)? {
@@ -4642,7 +4898,98 @@ fn gpu_prefill_advance(
         slot = slot_idx,
         "gpu: prompt consumed"
     );
+    if let Some(base) = slot.speech.as_ref().and_then(|s| s.pos_base) {
+        e.write_tensor("in.pos_base", (slot_idx * 4) as u64, &base.to_le_bytes())?;
+    }
+    if let Some(run) = slot.cfg.as_mut() {
+        e.logits_row(0, &mut run.cond)?;
+        return Ok(Some(cfg_draw(slot)));
+    }
     gpu_finish_token(e, 0, slot, tok).map(Some)
+}
+
+/// Refuse a packet with per-row host inputs (`in.encoder_overlay`, `in.pos_base`) that also
+/// serves a launch-row-compacted prefill (batched/packed prefill, mixed step, token batch): those
+/// would read one job's overlay or position base for another job's rows.
+#[cfg(feature = "cuda")]
+pub fn check_speech_packet(e: &crate::exec::gpu::GpuEngine) -> Result<()> {
+    let overlay = e.tensor_bytes("in.encoder_overlay").is_some();
+    if !overlay && e.tensor_bytes("in.pos_base").is_none() {
+        return Ok(());
+    }
+    if e.pf_batch_enabled() || e.token_batch_enabled() || e.mixed_step_rows(1, 1).is_some() {
+        return Err(crate::RuntimeError::Rejected(
+            "packet has per-row host inputs (overlay / position base) and a batched prefill, \
+             mixed-step or token-batch program; those run only through serial prefill"
+                .into(),
+        ));
+    }
+    if overlay && !e.has_prefill() {
+        return Err(crate::RuntimeError::Rejected(
+            "overlay packet has no prefill programs".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Stage a speech job's per-slot inputs for its next prefill chunk starting at prompt row `c0`:
+/// the overlay rows that chunk covers (compacted to overlay row 0) and a chunk-relative
+/// `in.encoder_overlay_index`. Rewritten before EVERY chunk: the overlay tensor is shared by all
+/// slots and another job may have prefilled in between.
+#[cfg(feature = "cuda")]
+fn gpu_speech_prefill_inputs(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slot_idx: usize,
+    c0: usize,
+    overlay: &[f32],
+    overlay_pos: &[u32],
+    pos_base: Option<u32>,
+) -> Result<()> {
+    // A decode launch covering this row before the prompt is in must not find a stale base above
+    // its reset position (`EmbedPosBf16` traps on pos < base); the real base lands at Done.
+    if c0 == 0 && pos_base.is_some() {
+        e.write_tensor("in.pos_base", (slot_idx * 4) as u64, &0u32.to_le_bytes())?;
+    }
+    if overlay_pos.is_empty() {
+        return Ok(());
+    }
+    if !e.has_prefill() {
+        return Err(crate::RuntimeError::Rejected(
+            "overlay prompts need the packet's prefill programs".into(),
+        ));
+    }
+    let hidden = overlay.len() / overlay_pos.len();
+    let index_rows = e
+        .tensor_bytes("in.encoder_overlay_index")
+        .ok_or_else(|| crate::RuntimeError::Rejected("packet has no in.encoder_overlay_index".into()))?
+        as usize
+        / 4;
+    // Every row a prefill launch may read, padded bucket rows included.
+    let window = index_rows.min(e.pf_max_rows().max(1));
+    let mut index = Vec::new();
+    let (lo, hi) = speech_overlay_index(overlay_pos, c0, window, &mut index);
+    if hi > lo {
+        e.write_tensor(
+            "in.encoder_overlay",
+            0,
+            bytemuck::cast_slice(&overlay[lo * hidden..hi * hidden]),
+        )?;
+    }
+    e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&index))
+}
+
+/// The chunk-relative overlay index for launch rows `[c0, c0 + window)`: the overlay rows
+/// `lo..hi` whose prompt positions fall there, renumbered from 0; every other row `u32::MAX`.
+#[cfg(any(feature = "cuda", test))]
+fn speech_overlay_index(pos: &[u32], c0: usize, window: usize, index: &mut Vec<u32>) -> (usize, usize) {
+    let lo = pos.partition_point(|&p| (p as usize) < c0);
+    let hi = pos.partition_point(|&p| (p as usize) < c0.saturating_add(window));
+    index.clear();
+    index.resize(window, u32::MAX);
+    for (k, &p) in pos[lo..hi].iter().enumerate() {
+        index[p as usize - c0] = k as u32;
+    }
+    (lo, hi)
 }
 
 /// The per-step stochastic draw for one slot, with the request's OpenAI `seed`
@@ -4693,6 +5040,11 @@ fn gpu_finish_token(
     slot: &mut Slot,
     argmax_tok: u32,
 ) -> Result<u32> {
+    if let Some(run) = slot.cfg.as_mut() {
+        e.logits_row(row + 1, &mut run.uncond)?;
+        e.logits_row(row, &mut run.cond)?;
+        return Ok(cfg_draw(slot));
+    }
     if !gpu_argmax_eligible(&slot.gen.params) {
         let mut logits = e.take_logits_buf();
         logits.clear();
@@ -4704,6 +5056,56 @@ fn gpu_finish_token(
         return Ok(tok);
     }
     Ok(argmax_tok)
+}
+
+/// Draw every fed CFG owner's token from ONE download of the step's logits rows (instead of two
+/// synchronous row reads per pair) into its `toks` entry. Returns whether any was drawn.
+#[cfg(feature = "cuda")]
+fn gpu_cfg_draws(
+    e: &mut crate::exec::gpu::GpuEngine,
+    feeds: &[(usize, u32)],
+    slots: &mut [Option<Slot>],
+    toks: &mut [u32],
+) -> Result<bool> {
+    if !feeds.iter().any(|&(i, _)| slots[i].as_ref().is_some_and(|s| s.cfg.is_some())) {
+        return Ok(false);
+    }
+    thread_local! {
+        static RAW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let vocab = e.vocab();
+    let rows = decode_feed_extent(feeds).unwrap_or(0);
+    RAW.with_borrow_mut(|raw| {
+        raw.resize(rows * vocab * 2, 0);
+        e.read_tensor_range("act.logits", 0, raw)?;
+        let row = |r: usize, out: &mut Vec<f32>| {
+            out.clear();
+            out.extend(
+                raw[r * vocab * 2..(r + 1) * vocab * 2]
+                    .chunks_exact(2)
+                    .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)),
+            );
+        };
+        for (k, &(i, _)) in feeds.iter().enumerate() {
+            let Some(slot) = slots[i].as_mut() else { continue };
+            let Some(run) = slot.cfg.as_mut() else { continue };
+            row(i, &mut run.cond);
+            row(i + 1, &mut run.uncond);
+            toks[k] = cfg_draw(slot);
+        }
+        Ok(true)
+    })
+}
+
+/// A CFG owner's next token from its stashed (cond, uncond) logits.
+#[cfg(feature = "cuda")]
+fn cfg_draw(slot: &mut Slot) -> u32 {
+    let (Some(run), Some(cfg)) = (slot.cfg.as_mut(), slot.speech.as_ref().and_then(|s| s.cfg.as_ref())) else {
+        unreachable!("cfg_draw on a CFG owner")
+    };
+    let u = run.rng.as_mut().map(|r| r.unit());
+    let history = cfg.history.iter().chain(&slot.out_ids).copied();
+    crate::text::sample::sample_cfg(&cfg.params, &run.cond, &run.uncond, history, u, &mut run.scratch)
 }
 
 #[cfg(feature = "cuda")]
@@ -4856,12 +5258,16 @@ fn handle_produced_token(
     slot.step += 1;
     *tokens_this_tick += 1;
 
-    let delta = incremental_delta(
-        bundle.tokenizer().as_ref(),
-        &slot.out_ids,
-        &mut slot.prefix_offset,
-        &mut slot.read_offset,
-    );
+    let delta = if slot.raw_tokens {
+        String::new()
+    } else {
+        incremental_delta(
+            bundle.tokenizer().as_ref(),
+            &slot.out_ids,
+            &mut slot.prefix_offset,
+            &mut slot.read_offset,
+        )
+    };
 
     // Token sends leave one channel entry for Done/Err. Backpressure ends
     // this request explicitly without blocking another model's submission thread.
@@ -4908,6 +5314,19 @@ fn handle_produced_token(
     } else {
         (delta, false)
     };
+    let stop_max = slot.step >= slot.gen.max_tokens.max(1);
+    // A raw-token consumer that is behind (or already parked) keeps its tokens here, in order,
+    // and its slot stops being fed until `flush_parked` drains them.
+    if slot.raw_tokens && (slot.parked_at.is_some() || (!stop_token && slot.respond.capacity() <= 1)) {
+        if !stop_token {
+            slot.held.push(token);
+        }
+        if stop_token || stop_max {
+            slot.held_finish = Some(if stop_token { FinishReason::Stop } else { FinishReason::Length });
+        }
+        slot.parked_at.get_or_insert_with(Instant::now);
+        return false;
+    }
     if !stop_token && slot.respond.capacity() <= 1 {
         let _ = slot
             .respond
@@ -4936,7 +5355,6 @@ fn handle_produced_token(
     if slot.step == 1 && crate::obs::host::on() {
         crate::obs::host::first_token(slot.prompt_ids.len(), slot.arrived.elapsed());
     }
-    let stop_max = slot.step >= slot.gen.max_tokens.max(1);
     if stop_token || stop_max || stop_string {
         let reason = if stop_max && !stop_token && !stop_string {
             FinishReason::Length
@@ -4961,6 +5379,57 @@ fn handle_produced_token(
         return disconnected;
     }
     false
+}
+
+/// Drain a parked raw-token slot into its consumer's free capacity (one entry stays reserved for
+/// the terminal). Returns true when the slot was freed: finished, disconnected, or parked past
+/// [`PARK_TIMEOUT`].
+fn flush_parked(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>) -> bool {
+    let Some(slot) = slot_opt.as_mut() else { return false };
+    let Some(since) = slot.parked_at else { return false };
+    if slot.respond.is_closed() {
+        if let Some(taken) = slot_opt.take() {
+            release_kv(arena, taken.kv);
+        }
+        return true;
+    }
+    let mut sent = 0;
+    while sent < slot.held.len() && slot.respond.capacity() > 1 {
+        let id = slot.held[sent];
+        if slot.respond.try_send(StreamChunk::Token { id, text: String::new() }).is_err() {
+            break;
+        }
+        sent += 1;
+    }
+    slot.held.drain(..sent);
+    if slot.held.is_empty() {
+        let Some(reason) = slot.held_finish.take() else {
+            slot.parked_at = None;
+            return false;
+        };
+        if let Some(telemetry) = slot.telemetry.as_mut() {
+            telemetry.finish(reason, slot.executed);
+        }
+        let _ = slot.respond.try_send(StreamChunk::Done {
+            executed: slot.executed,
+            reason,
+            usage: crate::serve::stream::TokenUsage {
+                prompt_tokens: slot.prompt_ids.len(),
+                cached_tokens: slot.cached_tokens,
+                completion_tokens: slot.out_ids.len(),
+            },
+        });
+    } else if since.elapsed() > PARK_TIMEOUT {
+        let _ = slot.respond.try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
+            "response consumer is too slow".into(),
+        )));
+    } else {
+        return false;
+    }
+    if let Some(taken) = slot_opt.take() {
+        release_kv(arena, taken.kv);
+    }
+    true
 }
 
 /// One token's worth of stop-string bookkeeping.
@@ -5078,6 +5547,35 @@ mod tests {
     /// With stop "STOP" and deltas "abcST" then "OPdef", the match is only findable on the
     /// second — by which time "abcST" has been sent. `stop_prefix_held` is what withholds the
     /// "ST" so the client sees "abc".
+    #[test]
+    fn speech_overlay_index_is_chunk_relative_and_compacted() {
+        // Audio rows at prompt positions 3..9 of a prompt chunked 4 rows at a time.
+        let pos: Vec<u32> = (3..9).collect();
+        let mut index = Vec::new();
+        assert_eq!(speech_overlay_index(&pos, 0, 4, &mut index), (0, 1));
+        assert_eq!(index, [u32::MAX, u32::MAX, u32::MAX, 0]);
+        assert_eq!(speech_overlay_index(&pos, 4, 4, &mut index), (1, 5));
+        assert_eq!(index, [0, 1, 2, 3]);
+        assert_eq!(speech_overlay_index(&pos, 8, 4, &mut index), (5, 6));
+        assert_eq!(index, [0, u32::MAX, u32::MAX, u32::MAX]);
+        assert_eq!(speech_overlay_index(&pos, 12, 4, &mut index), (6, 6));
+        assert!(index.iter().all(|&i| i == u32::MAX));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn raw_token_jobs_stream_ids_without_text() {
+        let (mut slot, mut rx) = prefill_test_slot();
+        slot.as_mut().unwrap().raw_tokens = true;
+        let bundle = prefill_test_bundle("raw-tokens");
+        let mut n = 0;
+        assert!(!handle_produced_token(&mut slot, &None, &bundle, 104, 1, &mut n, Some(&[])));
+        match rx.try_recv().unwrap() {
+            StreamChunk::Token { id, text } => assert_eq!((id, text.as_str()), (104, "")),
+            _ => panic!("expected a token"),
+        }
+    }
+
     #[test]
     fn a_stop_string_split_across_deltas_does_not_leak_its_prefix() {
         let stops = vec!["STOP".to_string()];
@@ -5272,6 +5770,7 @@ mod tests {
             gen: GenParams::default(),
             arrived: Instant::now(),
             respond,
+            opts: Default::default(),
         }
     }
 
@@ -5379,6 +5878,7 @@ mod tests {
             gen: GenParams::default(),
             arrived: Instant::now(),
             respond,
+            opts: Default::default(),
         };
         metrics.queued_requests.store(1, Ordering::Relaxed);
         assert!(tx.try_send(MuxMsg::Job(job, Instant::now())).is_ok());
@@ -5410,6 +5910,7 @@ mod tests {
             &metrics,
             &EngineHealth::Healthy,
             None,
+            false,
         )
         .is_none());
         assert!(slots[0].is_none());
@@ -5429,6 +5930,7 @@ mod tests {
             },
             arrived,
             respond,
+            opts: Default::default(),
         };
         ((job, arrived), rx)
     }
@@ -5455,6 +5957,7 @@ mod tests {
             &metrics,
             &EngineHealth::Healthy,
             Some(budget),
+            false,
         )
         .is_none());
         (metrics, slots, budget, vec![rx])
@@ -5495,6 +5998,7 @@ mod tests {
                 &metrics,
                 &EngineHealth::Healthy,
                 Some(budget),
+                false,
             );
 
             assert_eq!(
@@ -5536,6 +6040,7 @@ mod tests {
                 &metrics,
                 &EngineHealth::Healthy,
                 Some(budget),
+                false,
             );
         };
         pass(&mut slots, &mut waiting);
@@ -5580,6 +6085,7 @@ mod tests {
             &metrics,
             &EngineHealth::Healthy,
             None,
+            false,
         );
 
         assert_eq!(waiting.len(), 1, "the disconnected entry is gone");
@@ -5596,7 +6102,7 @@ mod tests {
         assert_eq!(queue_ttl_with(1_000.0, None), 40_000.0);
         assert_eq!(queue_ttl_with(250.0, Some(600_000.0)), 600_000.0);
         assert!(queue_ttl_with(250.0, Some(0.0)).is_infinite());
-        assert_eq!(queue_verdict(false, 1e9, 250.0), Queued::Expired);
+        assert_eq!(queue_verdict(false, 1e9, 250.0, JobClass::Normal), Queued::Expired);
     }
 
     #[test]
@@ -5624,6 +6130,7 @@ mod tests {
             &metrics,
             &EngineHealth::Healthy,
             None,
+            false,
         );
 
         assert!(waiting.is_empty());
@@ -5633,6 +6140,167 @@ mod tests {
             rx.try_recv(),
             Ok(StreamChunk::Err(crate::RuntimeError::Rejected(_)))
         ));
+    }
+
+    /// A critical arrival is seated ahead of older normal ones; a bulk one past its (shorter)
+    /// TTL is shed while a normal one of the same age still waits.
+    #[test]
+    fn waiting_is_served_by_class_and_bulk_goes_stale_first() {
+        let now = Instant::now();
+        let metrics = Arc::new(Metrics::default());
+        let mut slots: Vec<Option<Slot>> = std::iter::repeat_with(|| None).take(1).collect();
+        let mut waiting = std::collections::VecDeque::new();
+        let ms = |v: f64| std::time::Duration::from_secs_f64(v / 1e3);
+        let (normal, _rx_n) = queued_job(10, now - ms(50.0));
+        let ((mut critical, t), _rx_c) = queued_job(20, now - ms(10.0));
+        critical.opts.class = JobClass::Critical;
+        let stale = now - ms(queue_ttl_ms(250.0) * 0.5);
+        let ((mut bulk, tb), mut rx_b) = queued_job(30, stale);
+        bulk.opts.class = JobClass::Bulk;
+        let (old_normal, _rx_o) = queued_job(40, stale);
+        waiting.extend([normal, (critical, t), (bulk, tb), old_normal]);
+        metrics.queued_requests.store(4, Ordering::Relaxed);
+        drain_waiting(
+            &mut waiting, &mut slots, 1, now, 250.0, None, &metrics, &EngineHealth::Healthy, None,
+            false,
+        );
+        assert_eq!(slots[0].as_ref().unwrap().prompt_ids.len(), 20);
+        assert!(matches!(rx_b.try_recv(), Ok(StreamChunk::Err(_))));
+        let left: Vec<_> = waiting.iter().map(|(j, _)| j.prompt_ids.len()).collect();
+        assert_eq!(left, [10, 40]);
+    }
+
+    fn cfg_job(prompt: usize) -> ((Job, Instant), crate::serve::stream::ChunkReceiver) {
+        let ((mut job, t), rx) = queued_job(prompt, Instant::now());
+        job.opts.speech = Some(Box::new(SpeechJob {
+            cfg: Some(CfgJob {
+                uncond_overlay: Vec::new(),
+                params: crate::text::sample::CfgParams {
+                    cfg_weight: 0.5,
+                    temperature: 1.0,
+                    min_p: 0.0,
+                    top_p: 1.0,
+                    repetition_penalty: 1.0,
+                },
+                history: Vec::new(),
+                seed: None,
+            }),
+            ..Default::default()
+        }));
+        ((job, t), rx)
+    }
+
+    /// A CFG pair takes an even slot and its odd partner, charges KV for both, and keeps the
+    /// partner from every other job while the owner lives; a job that finds only such slots
+    /// waits instead of being refused.
+    #[test]
+    fn cfg_pairs_seat_on_even_odd_slots_and_reserve_the_partner() {
+        let metrics = Arc::new(Metrics::default());
+        let mut slots: Vec<Option<Slot>> = std::iter::repeat_with(|| None).take(4).collect();
+        let admit = |slots: &mut Vec<Option<Slot>>, (job, t): (Job, Instant), budget| {
+            admit_into(slots, 4, job, t, None, &metrics, &EngineHealth::Healthy, budget, false)
+        };
+        let (plain, _r0) = queued_job(10, Instant::now());
+        assert!(admit(&mut slots, plain, None).is_none());
+        let (pair, _r1) = cfg_job(10);
+        assert!(admit(&mut slots, pair, None).is_none());
+        assert!(slots[2].as_ref().is_some_and(|s| s.cfg.is_some()) && slots[3].is_none());
+        assert!(!slot_free(&slots, 3) && slot_free(&slots, 1));
+        let (plain, _r2) = queued_job(10, Instant::now());
+        assert!(admit(&mut slots, plain, None).is_none());
+        assert!(slots[1].is_some() && slots[3].is_none());
+        // Only the reserved partner is idle: both kinds wait.
+        let (pair, mut r3) = cfg_job(10);
+        assert!(admit(&mut slots, pair, None).is_some());
+        let (plain, mut r4) = queued_job(10, Instant::now());
+        assert!(admit(&mut slots, plain, None).is_some());
+        assert!(r3.try_recv().is_err() && r4.try_recv().is_err());
+        // The pair's KV is charged twice: 3 live rows-holders x 11 + a new pair's 22 > 50.
+        slots[1] = None;
+        let budget = crate::sched::admission::KvBudget::linear(1, 50);
+        let (pair, _r5) = cfg_job(10);
+        assert!(admit(&mut slots, pair, Some(budget)).is_some());
+    }
+
+    /// The partner steps on its owner's token, right after it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cfg_owners_feed_their_partner() {
+        let (mut owner, _rx) = prefill_test_slot();
+        {
+            let s = owner.as_mut().unwrap();
+            s.step = 1;
+            s.out_ids.push(7);
+            s.cfg = Some(Box::new(CfgRun { rng: None, cond: Vec::new(), uncond: Vec::new(), scratch: Vec::new() }));
+        }
+        let slots = vec![owner, None];
+        assert_eq!(gpu_decode_feeds(&slots, 2), [(0, 7), (1, 7)]);
+    }
+
+    /// A full downstream stage keeps a request queued, answered with nothing.
+    #[test]
+    fn a_full_downstream_keeps_the_request_queued() {
+        let metrics = Arc::new(Metrics::default());
+        let mut slots: Vec<Option<Slot>> = std::iter::repeat_with(|| None).take(1).collect();
+        let ((job, arrived), mut rx) = queued_job(10, Instant::now());
+        let held = admit_into(
+            &mut slots, 1, job, arrived, None, &metrics, &EngineHealth::Healthy, None, true,
+        );
+        assert!(held.is_some() && slots[0].is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A raw-token consumer that falls behind is parked, not cut: its tokens are held in order,
+    /// the slot leaves the decode feeds, and they are delivered with the terminal once it drains.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_slow_raw_token_consumer_is_parked_then_drained() {
+        let (mut slot, mut rx) = prefill_test_slot();
+        {
+            let s = slot.as_mut().unwrap();
+            s.raw_tokens = true;
+            s.gen.max_tokens = 40;
+        }
+        let bundle = prefill_test_bundle("park");
+        let mut n = 0;
+        for t in 0..34u32 {
+            assert!(!handle_produced_token(&mut slot, &None, &bundle, t, 1, &mut n, Some(&[99])));
+        }
+        let s = slot.as_ref().unwrap();
+        assert!(s.parked_at.is_some() && s.held.len() == 2);
+        assert!(gpu_decode_feeds(std::slice::from_ref(&slot), 1).is_empty());
+        assert!(!handle_produced_token(&mut slot, &None, &bundle, 99, 1, &mut n, Some(&[99])));
+        let mut got = Vec::new();
+        while let Ok(StreamChunk::Token { id, .. }) = rx.try_recv() {
+            got.push(id);
+        }
+        assert!(!flush_parked(&mut slot, &None) || slot.is_none());
+        while let Ok(c) = rx.try_recv() {
+            match c {
+                StreamChunk::Token { id, .. } => got.push(id),
+                StreamChunk::Done { reason, .. } => assert!(matches!(reason, FinishReason::Stop)),
+                StreamChunk::Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(slot.is_none(), "finished after the drain");
+        assert_eq!(got, (0..34).collect::<Vec<_>>());
+    }
+
+    /// A parked consumer that never drains is cut after the park timeout.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_parked_consumer_is_cut_after_the_timeout() {
+        let (mut slot, _rx) = prefill_test_slot();
+        slot.as_mut().unwrap().raw_tokens = true;
+        let bundle = prefill_test_bundle("park-timeout");
+        let mut n = 0;
+        for t in 0..40u32 {
+            handle_produced_token(&mut slot, &None, &bundle, t, 1, &mut n, Some(&[]));
+        }
+        assert!(!flush_parked(&mut slot, &None));
+        slot.as_mut().unwrap().parked_at = Some(Instant::now() - PARK_TIMEOUT - PARK_TIMEOUT);
+        assert!(flush_parked(&mut slot, &None));
+        assert!(slot.is_none());
     }
 
     /// Aging must always come first, or a request would be shed before it ever blocks the
@@ -5648,9 +6316,9 @@ mod tests {
             );
         }
         // A disconnect outranks a TTL expiry: there is nobody left to answer 429.
-        assert_eq!(queue_verdict(true, 1e9, 250.0), Queued::Disconnected);
-        assert_eq!(queue_verdict(false, 1e9, 250.0), Queued::Expired);
-        assert_eq!(queue_verdict(false, 0.0, 250.0), Queued::Retry);
+        assert_eq!(queue_verdict(true, 1e9, 250.0, JobClass::Normal), Queued::Disconnected);
+        assert_eq!(queue_verdict(false, 1e9, 250.0, JobClass::Normal), Queued::Expired);
+        assert_eq!(queue_verdict(false, 0.0, 250.0, JobClass::Normal), Queued::Retry);
         // A nonsensical SLO must not produce a zero or negative bound.
         assert!(queue_aging_ms(f64::NAN).is_finite() && queue_aging_ms(-1.0) > 0.0);
     }
@@ -5826,6 +6494,13 @@ mod tests {
                 arrived: Instant::now(),
                 stop_tail: String::new(),
                 stop_pending: String::new(),
+                class: JobClass::Normal,
+                raw_tokens: false,
+                speech: None,
+                cfg: None,
+                held: Vec::new(),
+                held_finish: None,
+                parked_at: None,
             }),
             rx,
         )

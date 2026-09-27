@@ -253,6 +253,7 @@ pub async fn completions(
         gen,
         arrived: std::time::Instant::now(),
         respond: tx,
+        opts: Default::default(),
     };
     if crate::obs::host::on() {
         crate::obs::host::submitted(n_prompt, t_arrive.elapsed());

@@ -175,10 +175,25 @@ pub(crate) trait AudioLmExecution: Send {
 /// directory supplies only the tokenizer and chat template.
 pub struct AudioLmAsr {
     execution: Box<dyn AudioLmExecution>,
+    prompt: AudioLmPrompt,
+}
+
+/// The host side of an audio LM request: log-mel frontend, prompt layout, output parsing. Shared by
+/// the private [`AudioLmAsr`] loop and the serve mux path (`asr::serving`).
+pub struct AudioLmPrompt {
     frontend: PacketLogMelFrontend,
     tokenizer: Arc<dyn Tokenize>,
     template: Arc<ChatTemplate>,
     contract: AudioLmContract,
+}
+
+/// One request's prompt: encoder features, token ids, and the ids' audio placeholder positions
+/// (one per encoder row, in order).
+pub struct AudioLmRequest {
+    pub features: MelFeatures,
+    pub ids: Vec<u32>,
+    pub audio_positions: Vec<usize>,
+    pub language: Option<String>,
 }
 
 struct AudioLmContract {
@@ -318,10 +333,7 @@ impl super::Transcriber for AudioLmAsr {
     }
 
     fn finalization_policy(&self) -> super::FinalizationPolicy {
-        super::FinalizationPolicy {
-            final_padding_samples: super::frontend::SAMPLE_RATE as usize,
-            final_padding_amplitude: 100.0 / 32768.0,
-        }
+        self.prompt.finalization_policy()
     }
     fn transcribe(
         &mut self,
@@ -341,16 +353,8 @@ impl super::Transcriber for AudioLmAsr {
     }
 }
 
-impl AudioLmAsr {
+impl AudioLmPrompt {
     pub fn load(packet: &std::path::Path, checkpoint: &std::path::Path) -> Result<Self> {
-        Self::load_with_backend(packet, checkpoint, "auto").map(|(engine, _)| engine)
-    }
-
-    pub fn load_with_backend(
-        packet: &std::path::Path,
-        checkpoint: &std::path::Path,
-        backend: &str,
-    ) -> Result<(Self, &'static str)> {
         let (contract, frontend) = AudioLmContract::load(packet)?;
         let tokenizer = load_tokenizer(checkpoint);
         if tokenizer.is_byte_fallback() {
@@ -361,12 +365,26 @@ impl AudioLmAsr {
         }
         let template = ChatTemplate::load(checkpoint)
             .ok_or_else(|| RuntimeError::Rejected("ASR requires the checkpoint chat template".into()))?;
-        let (execution, loaded_backend) = load_execution(packet, checkpoint, backend, contract.hidden)?;
-        Ok((Self { execution, frontend, tokenizer, template, contract }, loaded_backend))
+        Ok(Self { frontend, tokenizer, template, contract })
     }
 
-    pub fn batch_capacity(&self) -> usize {
-        self.execution.batch_capacity()
+    pub fn hidden(&self) -> usize {
+        self.contract.hidden
+    }
+
+    pub fn max_tokens(&self) -> usize {
+        self.contract.max_tokens
+    }
+
+    pub fn stop(&self) -> &[u32] {
+        &self.contract.stop
+    }
+
+    pub fn finalization_policy(&self) -> super::FinalizationPolicy {
+        super::FinalizationPolicy {
+            final_padding_samples: super::frontend::SAMPLE_RATE as usize,
+            final_padding_amplitude: 100.0 / 32768.0,
+        }
     }
 
     pub fn language(&self, requested: Option<&str>) -> Result<Option<String>> {
@@ -388,23 +406,15 @@ impl AudioLmAsr {
             .ok_or_else(|| RuntimeError::Rejected(format!("unsupported ASR language {requested:?}")))
     }
 
-    fn prefill_audio(
-        &mut self,
-        slot: usize,
+    /// Features, prompt ids and placeholder positions for one recording; `max_context` bounds
+    /// prompt + `max_tokens`.
+    pub fn request(
+        &self,
         samples: &[f32],
         language: Option<&str>,
         context: &str,
-        cancel: &AtomicBool,
-    ) -> Result<PrefilledAudio> {
-        let started = std::time::Instant::now();
-        let cancelled = || {
-            if cancel.load(Ordering::Relaxed) {
-                Err(RuntimeError::Rejected("ASR cancelled".into()))
-            } else {
-                Ok(())
-            }
-        };
-        cancelled()?;
+        max_context: usize,
+    ) -> Result<AudioLmRequest> {
         let language = self.language(language)?;
         let c = &self.contract;
         if self.tokenizer.encode(context).len() > c.context_max_tokens
@@ -439,22 +449,73 @@ impl AudioLmAsr {
             .len()
             .checked_add(c.max_tokens)
             .ok_or_else(|| RuntimeError::ContextLength("ASR prompt length overflows".into()))?;
-        if required_context > self.execution.max_context() {
+        if required_context > max_context {
             return Err(RuntimeError::ContextLength(format!(
                 "ASR needs {} prompt + {} output positions; bundle has {}",
                 ids.len(),
                 c.max_tokens,
-                self.execution.max_context()
+                max_context
             )));
         }
-        let positions: Vec<_> = ids
+        let audio_positions: Vec<_> = ids
             .iter()
             .enumerate()
             .filter_map(|(i, &id)| (id == c.placeholder).then_some(i))
             .collect();
-        if positions.len() != rows {
+        if audio_positions.len() != rows {
             return Err(RuntimeError::Rejected("ASR placeholder count mismatch".into()));
         }
+        Ok(AudioLmRequest { features, ids, audio_positions, language })
+    }
+
+    /// The transcript of generated ids (stop token excluded).
+    pub fn transcript(&self, output: &[u32], language: Option<&str>) -> Result<Transcript> {
+        self.contract.parse(&self.tokenizer.decode(output), language)
+    }
+}
+
+impl AudioLmAsr {
+    pub fn load(packet: &std::path::Path, checkpoint: &std::path::Path) -> Result<Self> {
+        Self::load_with_backend(packet, checkpoint, "auto").map(|(engine, _)| engine)
+    }
+
+    pub fn load_with_backend(
+        packet: &std::path::Path,
+        checkpoint: &std::path::Path,
+        backend: &str,
+    ) -> Result<(Self, &'static str)> {
+        let prompt = AudioLmPrompt::load(packet, checkpoint)?;
+        let (execution, loaded_backend) = load_execution(packet, checkpoint, backend, prompt.contract.hidden)?;
+        Ok((Self { execution, prompt }, loaded_backend))
+    }
+
+    pub fn batch_capacity(&self) -> usize {
+        self.execution.batch_capacity()
+    }
+
+    pub fn language(&self, requested: Option<&str>) -> Result<Option<String>> {
+        self.prompt.language(requested)
+    }
+
+    fn prefill_audio(
+        &mut self,
+        slot: usize,
+        samples: &[f32],
+        language: Option<&str>,
+        context: &str,
+        cancel: &AtomicBool,
+    ) -> Result<PrefilledAudio> {
+        let started = std::time::Instant::now();
+        let cancelled = || {
+            if cancel.load(Ordering::Relaxed) {
+                Err(RuntimeError::Rejected("ASR cancelled".into()))
+            } else {
+                Ok(())
+            }
+        };
+        cancelled()?;
+        let AudioLmRequest { features, ids, audio_positions: positions, language } =
+            self.prompt.request(samples, language, context, self.execution.max_context())?;
         cancelled()?;
         let frontend_ms = started.elapsed().as_secs_f64() * 1000.0;
         let prepared = self.execution.prefill(
@@ -463,7 +524,7 @@ impl AudioLmAsr {
                 features: &features,
                 token_ids: &ids,
                 audio_positions: &positions,
-                hidden: self.contract.hidden,
+                hidden: self.prompt.contract.hidden,
             },
         )?;
         cancelled()?;
@@ -502,12 +563,12 @@ impl AudioLmAsr {
         };
         let decode_started = std::time::Instant::now();
         let mut output = Vec::new();
-        let max_tokens = self.contract.max_tokens;
+        let max_tokens = self.prompt.contract.max_tokens;
         for step in 0..max_tokens {
             cancelled()?;
-            if self.contract.stop.contains(&token) {
+            if self.prompt.contract.stop.contains(&token) {
                 let result =
-                    self.contract.parse(&self.tokenizer.decode(&output), language.as_deref())?;
+                    self.prompt.contract.parse(&self.prompt.tokenizer.decode(&output), language.as_deref())?;
                 let elapsed = started.elapsed().as_secs_f64();
                 let audio_seconds = samples.len() as f64 / super::frontend::SAMPLE_RATE as f64;
                 tracing::info!(
@@ -614,7 +675,7 @@ impl AudioLmAsr {
         let mut kvlen = vec![1; batch];
         let decode_started = std::time::Instant::now();
         let mut launched_decode_rows = 0usize;
-        let max_tokens = self.contract.max_tokens;
+        let max_tokens = self.prompt.contract.max_tokens;
         for step in 0..max_tokens {
             for slot in 0..ready.len() {
                 let request_index = request_indices[slot];
@@ -633,9 +694,9 @@ impl AudioLmAsr {
                 let request = ready[slot]
                     .as_ref()
                     .expect("unfinished request is prepared");
-                if self.contract.stop.contains(&tokens[slot]) {
-                    results[request_index] = Some(self.contract.parse(
-                        &self.tokenizer.decode(&output[slot]),
+                if self.prompt.contract.stop.contains(&tokens[slot]) {
+                    results[request_index] = Some(self.prompt.contract.parse(
+                        &self.prompt.tokenizer.decode(&output[slot]),
                         request.language.as_deref(),
                     ));
                     ready[slot] = None;

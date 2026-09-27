@@ -18,6 +18,7 @@ use std::path::Path;
 use plow_asset::packet_pipeline::PacketPipeline;
 
 use crate::exec::gpu::{GpuEngine, PrefillStep};
+pub use crate::text::sample::{sample_cfg, CfgParams, SplitMix};
 use crate::{Result, RuntimeError};
 
 pub const DRIVER: &str = "tts.guided_lm.v1";
@@ -72,6 +73,16 @@ impl GuidedLmContract {
             top_p: f("lm.top_p_f32")?,
             repetition_penalty: f("lm.repetition_penalty_f32")?,
         })
+    }
+
+    pub fn cfg(&self) -> CfgParams {
+        CfgParams {
+            cfg_weight: self.cfg_weight,
+            temperature: self.temperature,
+            min_p: self.min_p,
+            top_p: self.top_p,
+            repetition_penalty: self.repetition_penalty,
+        }
     }
 
     pub fn load(assets: &Path) -> Result<Option<Self>> {
@@ -186,119 +197,8 @@ impl PromptTables {
     }
 }
 
-/// Deterministic per-request draws (splitmix64).
-#[derive(Clone)]
-pub struct Rng(u64);
-impl Rng {
-    pub fn new(seed: u64) -> Self {
-        Rng(seed ^ 0x9E37_79B9_7F4A_7C15)
-    }
-    pub fn unit(&mut self) -> f32 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32
-    }
-}
-
-/// The reference sampling chain over one CFG pair: cond + w(cond - uncond), repetition penalty
-/// over the sequence so far (BOS included, as the reference's `generated_ids`), temperature,
-/// min_p, top_p, then a draw. `u` in [0,1); `None` = greedy (argmax of the guided logits).
-pub fn sample_cfg(c: &GuidedLmContract, cond: &[f32], uncond: &[f32], history: &[u32], u: Option<f32>, scratch: &mut Vec<f32>) -> u32 {
-    scratch.clear();
-    scratch.extend(cond.iter().zip(uncond).map(|(a, b)| a + c.cfg_weight * (a - b)));
-    let Some(u) = u else {
-        return argmax(scratch);
-    };
-    let p = c.repetition_penalty;
-    if p != 1.0 {
-        for &t in history {
-            if let Some(x) = scratch.get_mut(t as usize) {
-                *x = if *x < 0.0 { *x * p } else { *x / p };
-            }
-        }
-    }
-    let inv_t = 1.0 / c.temperature;
-    let m = scratch.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut total = 0.0f32;
-    for x in scratch.iter_mut() {
-        *x = ((*x - m) * inv_t).exp();
-        total += *x;
-    }
-    // min_p over probabilities == min_p over unnormalised weights (the max weight is 1).
-    let floor = c.min_p;
-    let mut kept = 0.0f32;
-    for x in scratch.iter_mut() {
-        if *x < floor {
-            *x = 0.0;
-        } else {
-            kept += *x;
-        }
-    }
-    if c.top_p < 1.0 {
-        let mut order: Vec<usize> = (0..scratch.len()).filter(|&i| scratch[i] > 0.0).collect();
-        order.sort_by(|&a, &b| scratch[b].total_cmp(&scratch[a]));
-        let (mut acc, mut cut) = (0.0f32, order.len());
-        for (k, &i) in order.iter().enumerate() {
-            acc += scratch[i];
-            if acc >= c.top_p * kept {
-                cut = k + 1;
-                break;
-            }
-        }
-        for &i in &order[cut..] {
-            kept -= scratch[i];
-            scratch[i] = 0.0;
-        }
-    }
-    let _ = total;
-    let target = u * kept;
-    let mut acc = 0.0f32;
-    for (i, &x) in scratch.iter().enumerate() {
-        acc += x;
-        if x > 0.0 && acc > target {
-            return i as u32;
-        }
-    }
-    argmax(scratch)
-}
-
-fn argmax(v: &[f32]) -> u32 {
-    let mut best = 0;
-    for (i, &x) in v.iter().enumerate() {
-        if x > v[best] {
-            best = i;
-        }
-    }
-    best as u32
-}
-
-/// One request in flight on a slot pair.
-pub struct GuidedJob {
-    pub voice: String,
-    pub text: String,
-    /// `None` = greedy guided decoding (the numerics gate); `Some(seed)` = the sampling chain.
-    pub seed: Option<u64>,
-    pub max_tokens: Option<usize>,
-}
-
-struct Active {
-    job_index: usize,
-    cond: usize,
-    uncond: usize,
-    history: Vec<u32>,
-    out: Vec<u32>,
-    rng: Rng,
-    greedy: bool,
-    max: usize,
-    last: u32,
-    started: std::time::Instant,
-    prefill_us: u64,
-}
-
-/// T3 over a `GpuEngine` it owns: prefill and CFG decode for a batch of jobs, continuous over
-/// slot pairs (a finished pair is refilled from the pending queue before the next step).
+/// T3 on a `GpuEngine` it owns, one CFG pair at a time: the numerics gate (`examples/t3_check`).
+/// Serving runs T3 on the model's mux (`tts::guided_speech`).
 pub struct GuidedLm {
     pub e: GpuEngine,
     pub c: GuidedLmContract,
@@ -307,15 +207,6 @@ pub struct GuidedLm {
     uncond: Vec<f32>,
     scratch: Vec<f32>,
     raw: Vec<u8>,
-}
-
-/// Per-job result: speech tokens (stop excluded) and timing.
-#[derive(Debug, Clone, Default)]
-pub struct GuidedOutput {
-    pub tokens: Vec<u32>,
-    pub prefill_us: u64,
-    pub decode_us: u64,
-    pub steps: usize,
 }
 
 impl GuidedLm {
@@ -329,10 +220,6 @@ impl GuidedLm {
         }
         let tables = PromptTables::load(assets, c.hidden)?;
         Ok(GuidedLm { e, c, tables, logits: Vec::new(), uncond: Vec::new(), scratch: Vec::new(), raw: Vec::new() })
-    }
-
-    pub fn pairs(&self) -> usize {
-        self.e.batch() / 2
     }
 
     /// Prefill one CFG member on `slot`; returns its last-row logits in `self.logits`.
@@ -366,35 +253,6 @@ impl GuidedLm {
         Ok(())
     }
 
-    fn admit(&mut self, job: &GuidedJob, index: usize, pair: usize) -> Result<Active> {
-        let t0 = std::time::Instant::now();
-        let ids = self.tables.text_ids(&job.text)?;
-        let (cond, uncond) = (2 * pair, 2 * pair + 1);
-        let rows = self.tables.prefill_rows(&self.c, &job.voice, &ids, true)?;
-        self.prefill_member(uncond, &rows)?;
-        std::mem::swap(&mut self.logits, &mut self.uncond);
-        let rows = self.tables.prefill_rows(&self.c, &job.voice, &ids, false)?;
-        self.prefill_member(cond, &rows)?;
-        let greedy = job.seed.is_none();
-        let mut a = Active {
-            job_index: index,
-            cond,
-            uncond,
-            history: vec![self.c.start_speech],
-            out: Vec::new(),
-            rng: Rng::new(job.seed.unwrap_or(0)),
-            greedy,
-            max: job.max_tokens.unwrap_or(self.c.max_speech_tokens).min(self.c.max_speech_tokens),
-            last: 0,
-            started: t0,
-            prefill_us: 0,
-        };
-        let u = (!greedy).then(|| a.rng.unit());
-        a.last = sample_cfg(&self.c, &self.logits, &self.uncond, &a.history, u, &mut self.scratch);
-        a.prefill_us = t0.elapsed().as_micros() as u64;
-        Ok(a)
-    }
-
     /// Numerics probe: text ids and the (cond, uncond) last-prefill logits on slot pair 0.
     pub fn probe_prefill(&mut self, voice: &str, text: &str) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
         let ids = self.tables.text_ids(text)?;
@@ -406,114 +264,27 @@ impl GuidedLm {
         Ok((ids, cond, self.logits.clone()))
     }
 
-    /// Run every job to completion; `on_done(index, output)` fires as each finishes.
-    pub fn run(&mut self, jobs: &[GuidedJob], on_done: impl FnMut(usize, GuidedOutput)) -> Result<()> {
-        let mut it = jobs.iter();
-        self.serve(
-            |_| {
-                it.next().map(|j| GuidedJob {
-                    voice: j.voice.clone(),
-                    text: j.text.clone(),
-                    seed: j.seed,
-                    max_tokens: j.max_tokens,
-                })
-            },
-            |_, _| true,
-            on_done,
-        )
-    }
-
-    /// Continuous batching over slot pairs. `next(block)` supplies the next job (arrival index =
-    /// call order); it is polled while a pair is free and asked to BLOCK only when nothing is in
-    /// flight, and `None` from a blocking call ends the loop. While other requests are decoding at
-    /// most one job is admitted (two prefills) per step, so a burst of arrivals does not stall live
-    /// streams. `on_token(index, token)` fires for each speech token as it is committed and returns
-    /// false to cancel the request (its pair is freed). `on_done(index, output)` fires as each job
-    /// finishes; a job whose admission fails (unknown voice, text too long) is reported through
-    /// `on_done` with no tokens and does not stop the loop.
-    pub fn serve(
-        &mut self,
-        mut next: impl FnMut(bool) -> Option<GuidedJob>,
-        mut on_token: impl FnMut(usize, u32) -> bool,
-        mut on_done: impl FnMut(usize, GuidedOutput),
-    ) -> Result<()> {
-        let mut arrivals = 0usize;
-        let mut active: Vec<Option<Active>> = (0..self.pairs()).map(|_| None).collect();
+    /// Greedy guided decoding of one request on slot pair 0: speech tokens, stop excluded.
+    pub fn greedy(&mut self, voice: &str, text: &str, max_tokens: usize) -> Result<Vec<u32>> {
+        let ids = self.tables.text_ids(text)?;
+        let rows = self.tables.prefill_rows(&self.c, voice, &ids, true)?;
+        self.prefill_member(1, &rows)?;
+        std::mem::swap(&mut self.logits, &mut self.uncond);
+        let rows = self.tables.prefill_rows(&self.c, voice, &ids, false)?;
+        self.prefill_member(0, &rows)?;
+        let p = self.c.cfg();
+        let mut out = Vec::new();
         let mut toks = Vec::new();
-        let mut feeds = Vec::new();
-        let mut closed = false;
-        loop {
-            let live = active.iter().any(Option::is_some);
-            for pair in 0..active.len() {
-                if active[pair].is_some() || closed {
-                    continue;
-                }
-                let idle = active.iter().all(Option::is_none);
-                let Some(job) = next(idle) else {
-                    closed = idle;
-                    break;
-                };
-                let index = arrivals;
-                arrivals += 1;
-                match self.admit(&job, index, pair) {
-                    Ok(a) => active[pair] = Some(a),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "guided LM: request rejected at admission");
-                        on_done(index, GuidedOutput::default());
-                    }
-                }
-                if live {
-                    break;
-                }
-            }
-            for pair in 0..active.len() {
-                let finished = active[pair].as_ref().is_some_and(|a| a.last == self.c.stop_speech || a.out.len() >= a.max);
-                if finished {
-                    let a = active[pair].take().expect("checked");
-                    let steps = a.out.len();
-                    on_done(
-                        a.job_index,
-                        GuidedOutput { tokens: a.out, prefill_us: a.prefill_us, decode_us: a.started.elapsed().as_micros() as u64, steps },
-                    );
-                }
-            }
-            if active.iter().all(Option::is_none) {
-                if closed {
-                    return Ok(());
-                }
-                continue;
-            }
-            feeds.clear();
-            for slot in active.iter_mut() {
-                let Some(a) = slot.as_mut() else { continue };
-                a.out.push(a.last);
-                a.history.push(a.last);
-                if !on_token(a.job_index, a.last) {
-                    // Cancelled: the caller already dropped the request; free the pair now.
-                    *slot = None;
-                    continue;
-                }
-                feeds.push((a.cond, a.last));
-                feeds.push((a.uncond, a.last));
-            }
-            if feeds.is_empty() {
-                continue;
-            }
-            self.e.step_slots(&feeds, &mut toks)?;
-            for pair in 0..active.len() {
-                let Some(a) = active[pair].as_ref() else { continue };
-                if a.out.len() >= a.max {
-                    continue;
-                }
-                let (cond, uncond) = (a.cond, a.uncond);
-                self.read_logits_row(uncond)?;
-                std::mem::swap(&mut self.logits, &mut self.uncond);
-                self.read_logits_row(cond)?;
-                let a = active[pair].as_mut().expect("checked");
-                let u = (!a.greedy).then(|| a.rng.unit());
-                a.last = sample_cfg(&self.c, &self.logits, &self.uncond, &a.history, u, &mut self.scratch);
-            }
+        let mut last = sample_cfg(&p, &self.logits, &self.uncond, [], None, &mut self.scratch);
+        while last != self.c.stop_speech && out.len() < max_tokens {
+            out.push(last);
+            self.e.step_slots(&[(0, last), (1, last)], &mut toks)?;
+            self.read_logits_row(1)?;
+            std::mem::swap(&mut self.logits, &mut self.uncond);
+            self.read_logits_row(0)?;
+            last = sample_cfg(&p, &self.logits, &self.uncond, [], None, &mut self.scratch);
         }
+        Ok(out)
     }
 }
 
@@ -544,17 +315,17 @@ mod tests {
 
     #[test]
     fn guided_greedy_and_sampling_respect_the_chain() {
-        let c = contract();
+        let c = contract().cfg();
         let cond = [1.0, 3.0, 2.0, -1.0, 0.0, 2.9];
         let uncond = [1.0, 3.0, 0.0, -1.0, 0.0, 3.0];
         let mut s = Vec::new();
         // guided = cond + 0.5*(cond - uncond): [1, 3, 3, -1, 0, 2.85] -> argmax first max = 1
-        assert_eq!(sample_cfg(&c, &cond, &uncond, &[], None, &mut s), 1);
+        assert_eq!(sample_cfg(&c, &cond, &uncond, [], None, &mut s), 1);
         // penalty(tok 1) then /0.8: weights exp((x - 3)/0.8) = [.082, .535, 1, .0067, .0235, .829];
         // min_p 0.05 keeps {0, 1, 2, 5}, and every kept token is reachable.
         let mut seen = std::collections::BTreeSet::new();
         for i in 0..1000 {
-            let t = sample_cfg(&c, &cond, &uncond, &[1], Some(i as f32 / 1000.0), &mut s);
+            let t = sample_cfg(&c, &cond, &uncond, [1], Some(i as f32 / 1000.0), &mut s);
             assert!([0, 1, 2, 5].contains(&t), "drew {t}");
             seen.insert(t);
         }

@@ -73,6 +73,7 @@ async fn request_opts(
         gen,
         arrived: Instant::now(),
         respond: tx,
+        opts: Default::default(),
     })
     .map_err(|_| ())
     .expect("submit");

@@ -19,7 +19,7 @@ use axum::Json;
 use parking_lot::Mutex;
 use serde::Deserialize;
 
-use super::codec::Codec;
+use super::codec::{Codec, Urgency};
 use super::{pcm16, wav_header, SpeechContract};
 use crate::serve::stream::{self as stream_mod, StreamChunk};
 use crate::serve::AppState;
@@ -52,31 +52,53 @@ pub struct SpeechRequest {
     pub max_tokens: Option<usize>,
 }
 
-/// Speech pipelines that own their engine (`tts.guided_lm.v1`), by served model name.
-fn workers() -> &'static Mutex<HashMap<String, Arc<super::guided_speech::GuidedSpeechWorker>>> {
-    static W: OnceLock<Mutex<HashMap<String, Arc<super::guided_speech::GuidedSpeechWorker>>>> = OnceLock::new();
-    W.get_or_init(Default::default)
+/// Guided speech front-ends (`tts.guided_lm.v1`) by asset directory, bound on first use.
+fn guided_models() -> &'static Mutex<HashMap<PathBuf, Option<Arc<super::guided_speech::GuidedSpeech>>>> {
+    static M: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<super::guided_speech::GuidedSpeech>>>>> = OnceLock::new();
+    M.get_or_init(Default::default)
 }
 
-/// Split `plowrt serve --assets` into text-engine assets and self-hosted speech pipelines. Each
-/// `tts.guided_lm.v1` asset starts a guided speech worker (its own engine on `device`) served under
-/// the directory name; the rest go to the text registry unchanged.
-pub fn start_speech_workers(assets: Vec<PathBuf>, device: u8) -> crate::Result<Vec<PathBuf>> {
-    let mut text = Vec::new();
-    for dir in assets {
-        if super::guided_lm::GuidedLmContract::load(&dir)?.is_none() {
-            text.push(dir);
-            continue;
-        }
-        let name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        let w = super::guided_speech::GuidedSpeechWorker::start(&dir, device)?;
-        tracing::info!(model = %name, dir = %dir.display(), "tts: chatterbox speech pipeline ready");
-        workers().lock().insert(name, Arc::new(w));
+fn guided_model(
+    assets: &Path,
+    credit: Arc<crate::sched::admission::DownstreamCredit>,
+) -> Result<Option<Arc<super::guided_speech::GuidedSpeech>>, String> {
+    if let Some(m) = guided_models().lock().get(assets) {
+        return Ok(m.clone());
     }
-    Ok(text)
+    let model = if super::guided_lm::GuidedLmContract::load(assets).map_err(|e| e.to_string())?.is_some() {
+        let g = super::guided_speech::GuidedSpeech::start(assets, credit).map_err(|e| e.to_string())?;
+        tracing::info!(dir = %assets.display(), "tts: guided speech pipeline bound to the serve mux");
+        Some(Arc::new(g))
+    } else {
+        None
+    };
+    guided_models().lock().insert(assets.to_path_buf(), model.clone());
+    Ok(model)
 }
 
-async fn speech_on_worker(w: Arc<super::guided_speech::GuidedSpeechWorker>, req: SpeechRequest, t_arrive: Instant) -> Response {
+/// Bind every served speech model's host stages now (vocoder / codec graphs, prompt tables), so
+/// the first request does not pay them.
+pub fn preload(state: &AppState) {
+    for slug in state.registry.slugs() {
+        let (Some(_), Ok(bundle)) = (state.mux(&slug), state.registry.get(&slug)) else {
+            continue;
+        };
+        let bound = guided_model(&bundle.dir, state.downstream(&slug)).and_then(|g| match g {
+            Some(_) => Ok(()),
+            None => speech_model(&bundle.dir, state.downstream(&slug)).map(drop),
+        });
+        if let Err(e) = bound {
+            tracing::warn!(%slug, error = %e, "tts: speech pipeline failed to bind");
+        }
+    }
+}
+
+async fn speech_on_guided(
+    w: Arc<super::guided_speech::GuidedSpeech>,
+    mux: crate::serve::mux::ModelMux,
+    req: SpeechRequest,
+    t_arrive: Instant,
+) -> Response {
     let wav = match req.response_format.as_deref().unwrap_or("wav") {
         "wav" => true,
         "pcm" => false,
@@ -89,7 +111,7 @@ async fn speech_on_worker(w: Arc<super::guided_speech::GuidedSpeechWorker>, req:
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
     });
     if req.stream {
-        let mut ev = match w.synthesize_stream(req.voice.clone(), req.input.clone(), seed) {
+        let mut ev = match w.synthesize_stream(&mux, req.voice.clone(), req.input.clone(), seed) {
             Ok(rx) => rx,
             Err(e) => return server_error(e),
         };
@@ -125,7 +147,7 @@ async fn speech_on_worker(w: Arc<super::guided_speech::GuidedSpeechWorker>, req:
         let ct = if wav { "audio/wav" } else { "audio/pcm" };
         return ([(header::CONTENT_TYPE, ct)], body).into_response();
     }
-    match w.synthesize(req.voice.clone(), req.input.clone(), seed).await {
+    match w.synthesize(&mux, req.voice.clone(), req.input.clone(), seed).await {
         Err(e) => server_error(e),
         Ok(a) => {
             let audio_s = a.pcm.len() as f64 / f64::from(w.sample_rate);
@@ -151,14 +173,19 @@ fn speech_models() -> &'static Mutex<HashMap<PathBuf, Option<Arc<SpeechModel>>>>
     M.get_or_init(Default::default)
 }
 
-pub fn speech_model(assets: &Path) -> Result<Option<Arc<SpeechModel>>, String> {
+/// `credit` is the serving model's downstream credit; the codec's backlog gates its admission.
+pub fn speech_model(
+    assets: &Path,
+    credit: Arc<crate::sched::admission::DownstreamCredit>,
+) -> Result<Option<Arc<SpeechModel>>, String> {
     if let Some(m) = speech_models().lock().get(assets) {
         return Ok(m.clone());
     }
     let model = match SpeechContract::load(assets).map_err(|e| e.to_string())? {
         None => None,
         Some(contract) => {
-            let codec = Codec::load(assets)?;
+            let mut codec = Codec::load(assets)?;
+            codec.couple(credit);
             if codec.frame_codes != contract.frame_codes || codec.frame_samples != contract.frame_samples {
                 return Err(format!(
                     "codec packet frames ({} codes, {} samples) disagree with the speech contract ({}, {})",
@@ -194,13 +221,16 @@ pub async fn speech(
         Err(e) => return crate::serve::api_error(e.status(), e.body_text(), "invalid_request_error", Some("invalid_json"), None),
     };
     let t_arrive = Instant::now();
-    // Bound first: a guard in the `if let` scrutinee would live across the await.
-    let worker = workers().lock().get(&req.model).cloned();
-    if let Some(w) = worker {
-        return speech_on_worker(w, req, t_arrive).await;
-    }
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
+    } else if !state.registry.contains(&req.model) {
+        // A speech asset is also addressable by its directory name.
+        let by_dir = state.registry.slugs().into_iter().find(|slug| {
+            state.registry.get(slug).is_ok_and(|b| b.dir.file_name().is_some_and(|n| n == req.model.as_str()))
+        });
+        if let Some(slug) = by_dir {
+            req.model = slug;
+        }
     }
     if let Some(mgr) = state.manager_for(&req.model) {
         if mgr.manages(&req.model) {
@@ -218,7 +248,12 @@ pub async fn speech(
             Some("model".into()),
         );
     };
-    let model = match tokio::task::block_in_place(|| speech_model(&bundle.dir)) {
+    match tokio::task::block_in_place(|| guided_model(&bundle.dir, state.downstream(&req.model))) {
+        Ok(Some(g)) => return speech_on_guided(g, mux, req, t_arrive).await,
+        Ok(None) => {}
+        Err(e) => return server_error(format!("speech pipeline: {e}")),
+    }
+    let model = match tokio::task::block_in_place(|| speech_model(&bundle.dir, state.downstream(&req.model))) {
         Ok(Some(m)) => m,
         Ok(None) => return bad(format!("model '{}' declares no speech pipeline", req.model), "model"),
         Err(e) => return server_error(format!("speech pipeline: {e}")),
@@ -253,7 +288,12 @@ pub async fn speech(
     gen.stop_token_ids = c.stops.clone();
 
     let (tx, rx) = stream_mod::channel();
-    let job = crate::serve::mux::Job { prompt_ids, gen, arrived: Instant::now(), respond: tx };
+    let opts = crate::serve::mux::JobOpts {
+        class: if req.stream { crate::serve::mux::JobClass::Critical } else { crate::serve::mux::JobClass::Normal },
+        raw_tokens: true,
+        speech: None,
+    };
+    let job = crate::serve::mux::Job { prompt_ids, gen, arrived: Instant::now(), respond: tx, opts };
     if let Err(err) = mux.submit_arrived(job, t_arrive, Some(mux.ingress())) {
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
@@ -312,7 +352,7 @@ pub async fn speech(
 async fn decode_all(model: &SpeechModel, codes: &[i32], frames: usize, seed: u64) -> Result<Vec<f32>, String> {
     let (fc, fs, max) = (model.contract.frame_codes, model.contract.frame_samples, model.codec.max_frames);
     if frames <= max {
-        return model.codec.decode(codes.to_vec(), frames, seed).await;
+        return model.codec.decode(codes.to_vec(), frames, seed, Urgency::Whole).await;
     }
     let window = model.codec.window;
     let step = max - 2 * window;
@@ -321,7 +361,7 @@ async fn decode_all(model: &SpeechModel, codes: &[i32], frames: usize, seed: u64
     while s < frames {
         let e = (s + step).min(frames);
         let (ws, we) = (s.saturating_sub(window), (e + window).min(frames));
-        let w = model.codec.decode(codes[ws * fc..we * fc].to_vec(), we - ws, seed ^ s as u64).await?;
+        let w = model.codec.decode(codes[ws * fc..we * fc].to_vec(), we - ws, seed ^ s as u64, Urgency::Whole).await?;
         pcm.extend_from_slice(&w[(s - ws) * fs..(e - ws) * fs]);
         s = e;
     }
@@ -396,7 +436,8 @@ async fn stream_task(
         }
         if let Some((s, e, upto)) = stream_step(frames.len() / fc, emitted, done, model.codec.window, model.codec.lookahead) {
             let window = frames[s * fc..e * fc].to_vec();
-            match model.codec.decode(window, e - s, seed ^ (emitted as u64).wrapping_mul(0x9E37_79B9)).await {
+            let urgency = if emitted == 0 { Urgency::First } else { Urgency::Stream };
+            match model.codec.decode(window, e - s, seed ^ (emitted as u64).wrapping_mul(0x9E37_79B9), urgency).await {
                 Ok(pcm) => {
                     let mut bytes = Vec::new();
                     pcm16(&pcm[(emitted - s) * fs..(upto - s) * fs], &mut bytes);

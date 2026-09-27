@@ -1,8 +1,8 @@
-//! The guided speech worker: a guided token LM (`tts.t3_cfg.v1` packet on its own `GpuEngine`)
-//! feeding a token vocoder (`s3gen.pkt`, a `codec.v1` packet on the packet runtime). Two threads:
-//! the LM thread batches requests continuously over CFG slot pairs and forwards each speech token
-//! as it is committed; the render thread renders batches of utterances, so decoding never waits on
-//! audio rendering.
+//! Guided speech on `plowrt serve`: a guided token LM (`tts.guided_lm.v1`, served by the model's
+//! continuous-batching mux as CFG slot pairs) feeding a token vocoder (`s3gen.pkt`, a `codec.v1`
+//! packet on the packet runtime). Each request is a mux job whose prefill rows are host
+//! embeddings; its speech tokens are forwarded, as they are committed, to one render thread that
+//! renders batches of utterances, so decoding never waits on audio rendering.
 //!
 //! Streaming (schedule from the vocoder packet's `stream.*` parameters): the vocoder is not causal
 //! over tokens, so a stream re-renders its whole token prefix every `chunk` tokens and emits the
@@ -10,19 +10,21 @@
 //! tail. The noise streams are keyed by frame, so re-renders of a prefix agree up to that
 //! lookahead. A render sharing the GPU with the LM's back-to-back cooperative decode launches runs
 //! several times slower, so the LM pauses while a batch holding a first chunk renders: first audio
-//! is then prefill + `first` tokens + one uncontended render.
+//! is then prefill + `first` tokens + one uncontended render. The pause is the mux's downstream
+//! urgency ([`DownstreamCredit::set_urgent`]).
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
 use super::codec::Codec;
-use super::guided_lm::{GuidedLm, GuidedJob};
+use super::guided_lm::{GuidedLmContract, PromptTables};
+use crate::sched::admission::DownstreamCredit;
+use crate::serve::mux::{CfgJob, Job, JobClass, JobOpts, ModelMux, SpeechJob, SubmitError};
+use crate::serve::stream::StreamChunk;
 use crate::{Result, RuntimeError};
 
-/// Requests waiting for a slot pair; beyond this the route answers 429.
-const QUEUE: usize = 64;
 pub const QUEUE_FULL: &str = "speech request queue full";
 
 /// The vocoder packet beside the LM packet.
@@ -71,23 +73,23 @@ enum Reply {
     Stream(tokio::sync::mpsc::UnboundedSender<StreamEvent>),
 }
 
-struct SpeechRequest {
-    voice: String,
-    text: String,
-    seed: u64,
-    reply: Reply,
-}
-
 enum S3Msg {
     Open { id: usize, voice: String, seed: u64, reply: Reply },
     Token { id: usize, token: u32 },
     Close { id: usize, t3_ms: f64 },
+    /// The LM failed the request.
+    Fail { id: usize, error: String },
     /// The client went away: forget the utterance.
     Drop { id: usize },
 }
 
-pub struct GuidedSpeechWorker {
-    tx: parking_lot::Mutex<mpsc::SyncSender<SpeechRequest>>,
+/// The host side of a guided speech model: prompt tables and contract (from the packet) and the
+/// render thread. The LM itself is the registry model's mux.
+pub struct GuidedSpeech {
+    c: GuidedLmContract,
+    tables: PromptTables,
+    render: parking_lot::Mutex<mpsc::Sender<S3Msg>>,
+    next_id: AtomicUsize,
     pub sample_rate: u32,
 }
 
@@ -174,7 +176,7 @@ impl Utterance {
     }
 }
 
-fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, urgent: &AtomicBool) {
+fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, credit: &DownstreamCredit) {
     let max_batch = 8;
     let mut live: HashMap<usize, Utterance> = HashMap::new();
     let apply = |live: &mut HashMap<usize, Utterance>, m: S3Msg| match m {
@@ -192,6 +194,11 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, urgent:
         S3Msg::Close { id, t3_ms } => {
             if let Some(u) = live.get_mut(&id) {
                 u.t3_ms = Some(t3_ms);
+            }
+        }
+        S3Msg::Fail { id, error } => {
+            if let Some(u) = live.remove(&id) {
+                u.fail(error);
             }
         }
         S3Msg::Drop { id } => {
@@ -228,14 +235,16 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, urgent:
         }
         let first = due.iter().any(|k| live[k].first_chunk());
         // Cleared on every exit, a panicking render included, so the LM never waits forever.
-        struct Urgent<'a>(&'a AtomicBool);
+        struct Urgent<'a>(&'a DownstreamCredit);
         impl Drop for Urgent<'_> {
             fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
+                self.0.set_urgent(false);
             }
         }
-        urgent.store(first, Ordering::Release);
-        let guard = Urgent(urgent);
+        if first {
+            credit.set_urgent(true);
+        }
+        let guard = Urgent(credit);
         let t = std::time::Instant::now();
         // Submitted together so the vocoder worker batches them into one launch.
         let renders: Vec<_> = due
@@ -275,111 +284,127 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, urgent:
     }
 }
 
-impl GuidedSpeechWorker {
-    pub fn start(assets: &Path, device: u8) -> Result<Self> {
-        let (tx, rx) = mpsc::sync_channel::<SpeechRequest>(QUEUE);
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+impl GuidedSpeech {
+    /// Bind the packet's prompt tables and start the render thread. `credit` is the serving
+    /// model's downstream credit: the vocoder's backlog gates the model's admission, and a render
+    /// holding a first chunk holds its ticks.
+    pub fn start(assets: &Path, credit: Arc<DownstreamCredit>) -> Result<Self> {
+        let c = GuidedLmContract::load(assets)?
+            .ok_or_else(|| RuntimeError::Rejected(format!("{} declares no guided LM pipeline", assets.display())))?;
+        let tables = PromptTables::load(assets, c.hidden)?;
         let (s_tx, s_rx) = mpsc::channel::<S3Msg>();
-        let dir = assets.to_path_buf();
-        let dir2 = dir.clone();
         let (s_ready_tx, s_ready_rx) = mpsc::channel::<Result<()>>();
-        let urgent = Arc::new(AtomicBool::new(false));
-        let urgent2 = Arc::clone(&urgent);
-        std::thread::Builder::new()
-            .name("plow-tts-t3".into())
-            .spawn(move || {
-                let mut t3 = match GuidedLm::load(&dir, device) {
-                    Ok(t) => t,
-                    Err(e) => return drop(ready_tx.send(Err(e))),
-                };
-                let valid_below = t3.c.valid_below;
-                let _ = ready_tx.send(Ok(()));
-                // Per request: arrival time and, for a stream, a handle to tell a vanished client.
-                let started: std::cell::RefCell<HashMap<usize, (std::time::Instant, Option<tokio::sync::mpsc::UnboundedSender<StreamEvent>>)>> =
-                    Default::default();
-                let arrivals = std::cell::Cell::new(0usize);
-                let res = t3.serve(
-                    |block| {
-                        let req = if block { rx.recv().ok() } else { rx.try_recv().ok() }?;
-                        let id = arrivals.get();
-                        arrivals.set(id + 1);
-                        let probe = match &req.reply {
-                            Reply::Stream(tx) => Some(tx.clone()),
-                            Reply::Whole(_) => None,
-                        };
-                        started.borrow_mut().insert(id, (std::time::Instant::now(), probe));
-                        let _ = s_tx.send(S3Msg::Open { id, voice: req.voice.clone(), seed: req.seed, reply: req.reply });
-                        Some(GuidedJob { voice: req.voice, text: req.text, seed: Some(req.seed), max_tokens: None })
-                    },
-                    |id, token| {
-                        if started.borrow().get(&id).and_then(|(_, p)| p.as_ref()).is_some_and(|p| p.is_closed()) {
-                            started.borrow_mut().remove(&id);
-                            let _ = s_tx.send(S3Msg::Drop { id });
-                            return false;
-                        }
-                        while urgent.load(Ordering::Acquire) {
-                            std::thread::sleep(std::time::Duration::from_micros(50));
-                        }
-                        if token < valid_below {
-                            let _ = s_tx.send(S3Msg::Token { id, token });
-                        }
-                        true
-                    },
-                    |id, _| {
-                        if let Some((t0, _)) = started.borrow_mut().remove(&id) {
-                            let _ = s_tx.send(S3Msg::Close { id, t3_ms: t0.elapsed().as_secs_f64() * 1e3 });
-                        }
-                    },
-                );
-                if let Err(e) = res {
-                    tracing::error!(error = %e, "chatterbox T3 worker stopped");
-                }
-            })
-            .map_err(|e| RuntimeError::Device(e.to_string()))?;
-        ready_rx.recv().map_err(|e| RuntimeError::Device(e.to_string()))??;
-        // After the engine: its backend loads the real driver by path. The stage's static CUDA
-        // runtime then resolves `libcuda.so.1` to that library instead of searching (which can
-        // land on a toolkit stub: "driver version is insufficient").
+        let dir = assets.to_path_buf();
         std::thread::Builder::new()
             .name("plow-tts-render".into())
             .spawn(move || {
-                let vocoder = match Codec::load_packet(&dir2.join(VOCODER)) {
+                let mut vocoder = match Codec::load_packet(&dir.join(VOCODER)) {
                     Ok(v) => v,
                     Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Device(e)))),
                 };
+                vocoder.couple(Arc::clone(&credit));
                 let sc = match Schedule::from_codec(&vocoder) {
                     Ok(sc) => sc,
                     Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Rejected(e)))),
                 };
                 let _ = s_ready_tx.send(Ok(()));
-                render_loop(&vocoder, sc, s_rx, &urgent2);
+                render_loop(&vocoder, sc, s_rx, &credit);
             })
             .map_err(|e| RuntimeError::Device(e.to_string()))?;
         s_ready_rx.recv().map_err(|e| RuntimeError::Device(e.to_string()))??;
-        Ok(GuidedSpeechWorker { tx: parking_lot::Mutex::new(tx), sample_rate: 24000 })
+        Ok(GuidedSpeech { c, tables, render: parking_lot::Mutex::new(s_tx), next_id: AtomicUsize::new(0), sample_rate: 24000 })
     }
 
-    fn submit(&self, voice: String, text: String, seed: u64, reply: Reply) -> std::result::Result<(), String> {
-        self.tx.lock().try_send(SpeechRequest { voice, text, seed, reply }).map_err(|e| match e {
-            mpsc::TrySendError::Full(_) => QUEUE_FULL.to_string(),
-            mpsc::TrySendError::Disconnected(_) => "speech worker stopped".to_string(),
+    /// The mux job for one request: both CFG members' prefill rows as overlays, the decode
+    /// position base, the packet's sampling chain.
+    fn job(&self, voice: &str, text: &str, seed: u64, class: JobClass, respond: crate::serve::stream::ChunkSender) -> Result<Job> {
+        let c = &self.c;
+        let ids = self.tables.text_ids(text)?;
+        let cond = self.tables.prefill_rows(c, voice, &ids, false)?;
+        let uncond = self.tables.prefill_rows(c, voice, &ids, true)?;
+        let n = cond.len() / c.hidden;
+        let mut gen = crate::serve::GenParams::default();
+        gen.max_tokens = c.max_speech_tokens;
+        gen.params.temperature = 0.0;
+        gen.stop_token_ids = vec![c.stop_speech];
+        Ok(Job {
+            prompt_ids: vec![0; n],
+            gen,
+            arrived: std::time::Instant::now(),
+            respond,
+            opts: JobOpts {
+                class,
+                raw_tokens: true,
+                speech: Some(Box::new(SpeechJob {
+                    overlay: cond,
+                    overlay_pos: (0..n as u32).collect(),
+                    // Decode token k takes speech_pos[k + 1]: base = prefill rows - 1.
+                    pos_base: Some(n as u32 - 1),
+                    cfg: Some(CfgJob { uncond_overlay: uncond, params: c.cfg(), history: vec![c.start_speech], seed: Some(seed) }),
+                })),
+            },
         })
     }
 
-    pub async fn synthesize(&self, voice: String, text: String, seed: u64) -> std::result::Result<SpeechAudio, String> {
+    fn submit(&self, mux: &ModelMux, voice: String, text: String, seed: u64, reply: Reply) -> std::result::Result<(), String> {
+        let (respond, mut tokens) = crate::serve::stream::channel();
+        let probe = match &reply {
+            Reply::Stream(tx) => Some(tx.clone()),
+            Reply::Whole(_) => None,
+        };
+        let class = if probe.is_some() { JobClass::Critical } else { JobClass::Normal };
+        let job = self.job(&voice, &text, seed, class, respond).map_err(|e| e.to_string())?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let render = self.render.lock().clone();
+        let _ = render.send(S3Msg::Open { id, voice, seed, reply });
+        if let Err(e) = mux.submit(job) {
+            let _ = render.send(S3Msg::Drop { id });
+            return Err(match e {
+                SubmitError::Full(_) => QUEUE_FULL.to_string(),
+                SubmitError::Closed(_) => "speech model dispatcher unavailable".to_string(),
+            });
+        }
+        let valid_below = self.c.valid_below;
+        let t0 = std::time::Instant::now();
+        tokio::spawn(async move {
+            let msg = loop {
+                let msg = match tokens.recv().await {
+                    Some(StreamChunk::Token { id: token, .. }) => {
+                        // A vanished stream client: dropping `tokens` frees the pair next tick.
+                        if probe.as_ref().is_some_and(|p| p.is_closed()) {
+                            break S3Msg::Drop { id };
+                        }
+                        if token < valid_below {
+                            let _ = render.send(S3Msg::Token { id, token });
+                        }
+                        continue;
+                    }
+                    Some(StreamChunk::Done { .. }) => S3Msg::Close { id, t3_ms: t0.elapsed().as_secs_f64() * 1e3 },
+                    Some(StreamChunk::Err(e)) => S3Msg::Fail { id, error: e.to_string() },
+                    None => S3Msg::Fail { id, error: "speech LM stream ended without a result".into() },
+                };
+                break msg;
+            };
+            let _ = render.send(msg);
+        });
+        Ok(())
+    }
+
+    pub async fn synthesize(&self, mux: &ModelMux, voice: String, text: String, seed: u64) -> std::result::Result<SpeechAudio, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.submit(voice, text, seed, Reply::Whole(reply))?;
-        rx.await.map_err(|_| "chatterbox worker dropped the request".to_string())?
+        self.submit(mux, voice, text, seed, Reply::Whole(reply))?;
+        rx.await.map_err(|_| "chatterbox render dropped the request".to_string())?
     }
 
     pub fn synthesize_stream(
         &self,
+        mux: &ModelMux,
         voice: String,
         text: String,
         seed: u64,
     ) -> std::result::Result<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>, String> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.submit(voice, text, seed, Reply::Stream(tx))?;
+        self.submit(mux, voice, text, seed, Reply::Stream(tx))?;
         Ok(rx)
     }
 }

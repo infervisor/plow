@@ -332,6 +332,7 @@ async fn kv_oom_sheds_excess_requests() {
             },
             arrived: std::time::Instant::now(),
             respond: tx,
+            opts: Default::default(),
         };
         assert!(m.submit(job).is_ok());
         // Peek at the very first chunk to distinguish admit vs OOM.
@@ -391,6 +392,7 @@ async fn cancellation_frees_the_slot() {
         },
         arrived: std::time::Instant::now(),
         respond: tx1,
+        opts: Default::default(),
     };
     assert!(m.submit(job1).is_ok());
 
@@ -407,6 +409,7 @@ async fn cancellation_frees_the_slot() {
         },
         arrived: std::time::Instant::now(),
         respond: tx2,
+        opts: Default::default(),
     };
     assert!(m.submit(job2).is_ok());
 

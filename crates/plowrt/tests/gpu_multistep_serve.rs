@@ -32,6 +32,7 @@ fn submit(
             gen,
             arrived: std::time::Instant::now(),
             respond: tx,
+            opts: Default::default(),
         })
         .map_err(|_| ())
         .expect("submit");

@@ -229,6 +229,98 @@ pub fn sample_with_scratch(
     probs.last().map(|(i, _)| *i as u32).unwrap_or(0)
 }
 
+/// Classifier-free guidance over a (conditional, unconditional) logits pair, then the reference
+/// sampling chain: repetition penalty, temperature, min_p, top_p.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CfgParams {
+    pub cfg_weight: f32,
+    pub temperature: f32,
+    pub min_p: f32,
+    pub top_p: f32,
+    pub repetition_penalty: f32,
+}
+
+/// Deterministic per-request draws (splitmix64).
+#[derive(Clone, Debug)]
+pub struct SplitMix(u64);
+
+impl SplitMix {
+    pub fn new(seed: u64) -> Self {
+        SplitMix(seed ^ 0x9E37_79B9_7F4A_7C15)
+    }
+
+    pub fn unit(&mut self) -> f32 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+/// cond + w(cond - uncond), the repetition penalty once per `history` occurrence, temperature,
+/// min_p, top_p, then a draw at `u` in [0,1); `None` = greedy (argmax of the guided logits).
+pub fn sample_cfg(
+    p: &CfgParams,
+    cond: &[f32],
+    uncond: &[f32],
+    history: impl IntoIterator<Item = u32>,
+    u: Option<f32>,
+    scratch: &mut Vec<f32>,
+) -> u32 {
+    scratch.clear();
+    scratch.extend(cond.iter().zip(uncond).map(|(a, b)| a + p.cfg_weight * (a - b)));
+    let Some(u) = u else {
+        return argmax(scratch);
+    };
+    if p.repetition_penalty != 1.0 {
+        for t in history {
+            if let Some(x) = scratch.get_mut(t as usize) {
+                *x = if *x < 0.0 { *x * p.repetition_penalty } else { *x / p.repetition_penalty };
+            }
+        }
+    }
+    let inv_t = 1.0 / p.temperature;
+    let m = scratch.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    for x in scratch.iter_mut() {
+        *x = ((*x - m) * inv_t).exp();
+    }
+    // min_p over probabilities == min_p over unnormalised weights (the max weight is 1).
+    let mut kept = 0.0f32;
+    for x in scratch.iter_mut() {
+        if *x < p.min_p {
+            *x = 0.0;
+        } else {
+            kept += *x;
+        }
+    }
+    if p.top_p < 1.0 {
+        let mut order: Vec<usize> = (0..scratch.len()).filter(|&i| scratch[i] > 0.0).collect();
+        order.sort_by(|&a, &b| scratch[b].total_cmp(&scratch[a]));
+        let (mut acc, mut cut) = (0.0f32, order.len());
+        for (k, &i) in order.iter().enumerate() {
+            acc += scratch[i];
+            if acc >= p.top_p * kept {
+                cut = k + 1;
+                break;
+            }
+        }
+        for &i in &order[cut..] {
+            kept -= scratch[i];
+            scratch[i] = 0.0;
+        }
+    }
+    let target = u * kept;
+    let mut acc = 0.0f32;
+    for (i, &x) in scratch.iter().enumerate() {
+        acc += x;
+        if x > 0.0 && acc > target {
+            return i as u32;
+        }
+    }
+    argmax(scratch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -334,6 +334,9 @@ pub struct AppState {
     /// Per-slug bucket muxer handles. Populated at startup by `main::serve`
     /// after the registry is loaded; read (Sender-clone) on the request path.
     muxes: RwLock<FxHashMap<String, mux::ModelMux>>,
+    /// Per-slug backlog of the stage the model's output feeds; outlives reloads so a stage
+    /// bound once keeps gating every later dispatcher.
+    downstream: RwLock<FxHashMap<String, Arc<crate::sched::admission::DownstreamCredit>>>,
     /// Per-slug GPU engines ([`engine::ServeEngine`] — sm_120 or gfx950).
     /// Installed at startup for bundles that ship a device blob; when present
     /// the mux drives real GPU decode steps instead of the CPU reference.
@@ -433,6 +436,7 @@ impl AppState {
             metrics: Arc::new(Metrics::default()),
             model_metrics: RwLock::new(FxHashMap::default()),
             muxes: RwLock::new(FxHashMap::default()),
+            downstream: RwLock::new(FxHashMap::default()),
             #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
             gpu: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "cuda")]
@@ -554,6 +558,14 @@ impl AppState {
             }
             turns
         });
+    }
+
+    /// `slug`'s downstream credit (created on first use; unlimited until a stage sets a limit).
+    pub fn downstream(&self, slug: &str) -> Arc<crate::sched::admission::DownstreamCredit> {
+        if let Some(c) = self.downstream.read().get(slug) {
+            return Arc::clone(c);
+        }
+        Arc::clone(self.downstream.write().entry(slug.to_string()).or_default())
     }
 
     /// The co-tenant turn for `slug`'s device group, when turns are installed.
@@ -892,7 +904,7 @@ pub fn app(state: Arc<AppState>) -> Router {
     let router = Router::new();
     #[cfg(feature = "cuda")]
     let router = router.route("/v1/audio/speech", post(crate::tts::serving::speech));
-    router
+    let router = router
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/completions", post(completion::completions))
         .route("/tokenize", post(tokenize::tokenize))
@@ -916,7 +928,10 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/trace", get(trace_handler))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(state)
+        .with_state(Arc::clone(&state));
+    #[cfg(feature = "cuda")]
+    let router = router.merge(crate::asr::serving::AsrServer::for_serve(state).transcription_router(true));
+    router
 }
 
 /// `GET /trace` — Chrome-trace JSON from traced live runs (§O, `--trace`).

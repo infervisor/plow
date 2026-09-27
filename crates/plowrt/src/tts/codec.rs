@@ -14,16 +14,33 @@ use crate::exec::packet_runtime::{load_packet_runtime, PacketAsset, PacketTensor
 pub const PACKET: &str = "codec.pkt";
 const DRIVER: &str = "codec.v1";
 
+/// Launch order of pending work, most urgent first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Urgency {
+    /// A stream's first audio.
+    First,
+    /// A stream's later windows.
+    Stream,
+    /// A whole utterance nobody hears until it is done.
+    Whole,
+}
+
 struct Job {
     codes: Vec<i32>,
     frames: usize,
     seed: u64,
     voice: u32,
+    urgency: Urgency,
     reply: tokio::sync::oneshot::Sender<Result<Vec<f32>, String>>,
+    /// Backlog charged to the feeding model's mux until this job is answered.
+    _work: Option<crate::sched::admission::DownstreamWork>,
 }
 
 pub struct Codec {
     tx: Mutex<mpsc::Sender<Job>>,
+    credit: Option<std::sync::Arc<crate::sched::admission::DownstreamCredit>>,
+    /// Largest batch one launch holds.
+    pub max_batch: usize,
     pub max_frames: usize,
     pub frame_codes: usize,
     pub frame_samples: usize,
@@ -76,6 +93,7 @@ impl Codec {
                     Err(e) => return drop(ready_tx.send(Err(e))),
                 };
                 let info = (
+                    bound.capacities.iter().map(|c| c.0).max().unwrap_or(1),
                     bound.capacities.iter().map(|c| c.1).max().unwrap_or(0),
                     bound.frame_codes,
                     bound.frame_samples,
@@ -88,22 +106,45 @@ impl Codec {
                 run(rx, bound);
             })
             .map_err(|e| e.to_string())?;
-        let (max_frames, frame_codes, frame_samples, window, lookahead, voices, parameters) =
+        let (max_batch, max_frames, frame_codes, frame_samples, window, lookahead, voices, parameters) =
             ready_rx.recv().map_err(|e| e.to_string())??;
-        Ok(Codec { tx: Mutex::new(tx), max_frames, frame_codes, frame_samples, window, lookahead, voices, parameters })
+        Ok(Codec {
+            tx: Mutex::new(tx),
+            credit: None,
+            max_batch,
+            max_frames,
+            frame_codes,
+            frame_samples,
+            window,
+            lookahead,
+            voices,
+            parameters,
+        })
+    }
+
+    /// Charge this stage's backlog to the feeding model's admission: past two full launches of
+    /// pending work, the model seats no new request.
+    pub fn couple(&mut self, credit: std::sync::Arc<crate::sched::admission::DownstreamCredit>) {
+        credit.set_limit(2 * self.max_batch);
+        self.credit = Some(credit);
     }
 
     /// `frames * frame_codes` codebook ids -> `frames * frame_samples` samples.
-    pub async fn decode(&self, codes: Vec<i32>, frames: usize, seed: u64) -> Result<Vec<f32>, String> {
-        self.decode_voice(codes, frames, seed, 0).await
+    pub async fn decode(&self, codes: Vec<i32>, frames: usize, seed: u64, urgency: Urgency) -> Result<Vec<f32>, String> {
+        self.decode_as(codes, frames, seed, 0, urgency).await
     }
 
     /// [`Self::decode`] for the packet's voice `voice` (an index into [`Self::voices`]).
     pub async fn decode_voice(&self, codes: Vec<i32>, frames: usize, seed: u64, voice: u32) -> Result<Vec<f32>, String> {
+        self.decode_as(codes, frames, seed, voice, Urgency::Stream).await
+    }
+
+    async fn decode_as(&self, codes: Vec<i32>, frames: usize, seed: u64, voice: u32, urgency: Urgency) -> Result<Vec<f32>, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
+        let _work = self.credit.as_ref().map(|c| c.work());
         self.tx
             .lock()
-            .send(Job { codes, frames, seed, voice, reply })
+            .send(Job { codes, frames, seed, voice, urgency, reply, _work })
             .map_err(|_| "codec worker stopped".to_string())?;
         rx.await.map_err(|_| "codec worker dropped the job".to_string())?
     }
@@ -235,12 +276,17 @@ fn run(rx: mpsc::Receiver<Job>, mut codec: Bound) {
     while let Ok(first) = rx.recv() {
         pending.push(first);
         pending.extend(rx.try_iter());
-        // Longest first so each launch's capacity is set by its first job.
-        pending.sort_by_key(|j| std::cmp::Reverse(j.frames));
+        // Most urgent first; within an urgency longest first, so a launch's capacity is mostly
+        // set by its first job.
+        pending.sort_by_key(|j| (j.urgency, std::cmp::Reverse(j.frames)));
         while !pending.is_empty() {
-            let frames = pending[0].frames;
+            let mut frames = pending[0].frames;
             let mut n = 1;
-            while n < pending.len() && n < max_batch && codec.capacity(n + 1, frames).is_some() {
+            while n < pending.len()
+                && n < max_batch
+                && codec.capacity(n + 1, frames.max(pending[n].frames)).is_some()
+            {
+                frames = frames.max(pending[n].frames);
                 n += 1;
             }
             let batch: Vec<Job> = pending.drain(..n).collect();

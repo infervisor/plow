@@ -22,15 +22,56 @@ use super::{
     FinalizationPolicy, Transcriber, Transcript, TranscriptionInput,
 };
 
+#[cfg(feature = "cuda")]
+mod shared;
+#[cfg(feature = "cuda")]
+pub use shared::preload;
+
 const BATCH_FORMATION_WINDOW: Duration = Duration::from_millis(5);
 
 pub struct AsrServer {
-    pub model: String,
-    mux: AsrMux,
+    backend: Backend,
     uploads: Arc<Semaphore>,
     sessions: Arc<Semaphore>,
     next_session: AtomicU64,
-    finalization: FinalizationPolicy,
+}
+
+enum Backend {
+    /// `plowrt asr`: one model on a private cohort engine.
+    Cohort { model: String, mux: AsrMux, finalization: FinalizationPolicy },
+    /// `plowrt serve`: any registry model with a causal audio pipeline, through its text mux.
+    #[cfg(feature = "cuda")]
+    Serve(Arc<crate::serve::AppState>),
+}
+
+/// Where one request's transcription runs.
+#[derive(Clone)]
+enum Route {
+    Cohort(AsrMux),
+    #[cfg(feature = "cuda")]
+    Shared(Arc<shared::SharedAsr>, crate::serve::mux::ModelMux),
+}
+
+impl Route {
+    fn submit(
+        &self,
+        samples: Vec<f32>,
+        language: Option<String>,
+        context: String,
+        cancel: Arc<AtomicBool>,
+        final_pass: bool,
+    ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
+        match self {
+            Route::Cohort(mux) => {
+                let _ = final_pass;
+                mux.submit(samples, language, context, cancel)
+            }
+            #[cfg(feature = "cuda")]
+            Route::Shared(asr, mux) => {
+                asr.submit(mux.clone(), samples, language, context, cancel, final_pass)
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -166,18 +207,45 @@ impl AsrServer {
     pub fn new(model: String, engine: impl Transcriber + 'static) -> Arc<Self> {
         let (mux, ingress_capacity, finalization) = AsrMux::spawn(Box::new(engine));
         Arc::new(Self {
-            model,
-            mux,
+            backend: Backend::Cohort { model, mux, finalization },
             uploads: Arc::new(Semaphore::new(ingress_capacity)),
             sessions: Arc::new(Semaphore::new(ingress_capacity)),
             next_session: AtomicU64::new(1),
-            finalization,
         })
     }
+
+    /// Transcription for every model `state` serves whose packet declares a causal audio pipeline:
+    /// the prompt and encoder run here, the decoder on the model's continuous-batching mux.
+    #[cfg(feature = "cuda")]
+    pub fn for_serve(state: Arc<crate::serve::AppState>) -> Arc<Self> {
+        Arc::new(Self {
+            backend: Backend::Serve(state),
+            uploads: Arc::new(Semaphore::new(shared::UPLOADS)),
+            sessions: Arc::new(Semaphore::new(shared::UPLOADS)),
+            next_session: AtomicU64::new(1),
+        })
+    }
+
+    async fn route(&self, model: &str) -> Result<(Route, FinalizationPolicy), Response> {
+        match &self.backend {
+            Backend::Cohort { model: served, mux, finalization } => {
+                if model != served {
+                    return Err(failure(StatusCode::NOT_FOUND, "unknown ASR model"));
+                }
+                Ok((Route::Cohort(mux.clone()), *finalization))
+            }
+            #[cfg(feature = "cuda")]
+            Backend::Serve(state) => shared::route(state, model).await,
+        }
+    }
     pub fn router(self: Arc<Self>, websocket: bool) -> Router {
-        let mut router = Router::new()
-            .route("/v1/audio/transcriptions", post(transcription))
-            .route("/health", get(|| async { StatusCode::OK }));
+        self.transcription_router(websocket)
+            .route("/health", get(|| async { StatusCode::OK }))
+    }
+
+    /// The transcription routes alone, to merge into another server's router.
+    pub fn transcription_router(self: Arc<Self>, websocket: bool) -> Router {
+        let mut router = Router::new().route("/v1/audio/transcriptions", post(transcription));
         if websocket {
             router = router.route("/v1/audio/transcriptions/stream", get(upgrade));
         }
@@ -252,9 +320,10 @@ async fn transcription(State(state): State<Arc<AsrServer>>, mut multipart: Multi
     let Some(model) = fields.get("model") else {
         return failure(StatusCode::BAD_REQUEST, "model is required");
     };
-    if model != &state.model {
-        return failure(StatusCode::NOT_FOUND, "unknown ASR model");
-    }
+    let route = match state.route(model).await {
+        Ok((route, _)) => route,
+        Err(response) => return response,
+    };
     let format = fields
         .remove("response_format")
         .unwrap_or_else(|| "json".into());
@@ -289,10 +358,7 @@ async fn transcription(State(state): State<Arc<AsrServer>>, mut multipart: Multi
     };
     drop(upload);
     let cancel = Cancellation(Arc::new(AtomicBool::new(false)));
-    let work = match state
-        .mux
-        .submit(samples, language, context, cancel.0.clone())
-    {
+    let work = match route.submit(samples, language, context, cancel.0.clone(), true) {
         Ok(work) => work,
         Err(SubmitError::Full) => return failure(StatusCode::TOO_MANY_REQUESTS, "ASR queue full"),
         Err(SubmitError::Closed) => {
@@ -379,17 +445,20 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
     else {
         return;
     };
-    let start = match serde_json::from_str::<Start>(&text) {
+    let routed = match serde_json::from_str::<Start>(&text) {
         Ok(s)
             if s.kind == "start"
                 && s.version == 1
-                && s.model == state.model
                 && s.sample_rate == SAMPLE_RATE
                 && s.format == "pcm_s16le" =>
         {
-            s
+            state.route(&s.model).await.ok().map(|r| (s, r))
         }
-        _ => {
+        _ => None,
+    };
+    let (start, (route, finalization)) = match routed {
+        Some(routed) => routed,
+        None => {
             send(
                 &mut socket,
                 json!({"type":"error","message":"invalid start","terminal":true}),
@@ -401,7 +470,7 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
     let language = start.language.clone();
     let partials = start.partials;
     let session = state.next_session.fetch_add(1, Ordering::Relaxed);
-    let max_audio_samples = MAX_SAMPLES.saturating_sub(state.finalization.final_padding_samples);
+    let max_audio_samples = MAX_SAMPLES.saturating_sub(finalization.final_padding_samples);
     let initial_credit = 16000usize.min(max_audio_samples);
     if !send(&mut socket,json!({"type":"ready","version":1,"session_id":session.to_string(),
         "sample_rate":SAMPLE_RATE,"format":"pcm_s16le","max_chunk_bytes":32000,"credit_samples":initial_credit,
@@ -477,16 +546,12 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
             }
             append_final_padding(
                 &mut samples,
-                state.finalization.final_padding_samples,
-                state.finalization.final_padding_amplitude,
+                finalization.final_padding_samples,
+                finalization.final_padding_amplitude,
             );
-            if let Some(p) = pending.take() {
-                let _ = p.await;
-            }
-            let mut work = match state
-                .mux
-                .submit(samples, language, start.prompt, cancel.0.clone())
-            {
+            // The final supersedes an in-flight partial; dropping its receiver cancels it.
+            drop(pending.take());
+            let mut work = match route.submit(samples, language, start.prompt, cancel.0.clone(), true) {
                 Ok(work) => work,
                 Err(SubmitError::Full) => {
                     send(
@@ -547,7 +612,7 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
         if partials && pending.is_none() && samples.len() >= partial_at + PARTIAL_STRIDE {
             partial_at = samples.len();
             // A full queue skips this partial; the next stride retries.
-            pending = state.mux.submit(samples.clone(), language.clone(), start.prompt.clone(), cancel.0.clone()).ok();
+            pending = route.submit(samples.clone(), language.clone(), start.prompt.clone(), cancel.0.clone(), false).ok();
         }
         let grant = (16000 - samples.len() % 16000)
             .min(max_audio_samples - samples.len())
