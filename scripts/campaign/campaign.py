@@ -21,6 +21,7 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 import os
 import shlex
 import shutil
@@ -410,7 +411,37 @@ def run(cmd: list[str], env: dict, log: Path) -> int:
 
 
 def nix(cmd: list[str]) -> list[str]:
+    # A box without nix may run the recipe in an equivalent hand-built shell, but only when asked
+    # explicitly (PLOW_CAMPAIGN_NO_NIX=1); build-record.json records which one ran.
+    if os.environ.get("PLOW_CAMPAIGN_NO_NIX") == "1":
+        return cmd
     return ["nix", "develop", "--command", *cmd]
+
+
+def expand(value: str, out: Path) -> str:
+    """Recipe placeholders: `{out}` (the build dir), `{repo}`, `{env:VAR}`, `{hf:org/name}` (the
+    snapshot of a Hugging Face repo in $HF_HUB_CACHE / $HF_HOME/hub)."""
+    def hf(repo: str) -> str:
+        hub = os.environ.get("HF_HUB_CACHE") or os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
+        snaps = sorted(Path(hub, "models--" + repo.replace("/", "--"), "snapshots").glob("*"))
+        if not snaps:
+            die(f"hf:{repo} is not in {hub}; download it first")
+        return str(snaps[-1])
+    def sub(m: "re.Match") -> str:
+        key = m.group(1)
+        if key == "out":
+            return str(out)
+        if key == "repo":
+            return str(REPO)
+        if key.startswith("env:"):
+            v = os.environ.get(key[4:])
+            if v is None:
+                die(f"recipe needs ${key[4:]}")
+            return v
+        if key.startswith("hf:"):
+            return hf(key[3:])
+        die(f"unknown recipe placeholder {{{key}}}")
+    return re.sub(r"\{([a-z]+(?::[^}]+)?)\}", sub, str(value))
 
 
 def env_with(base: dict, extra: dict) -> dict:
@@ -430,7 +461,18 @@ def cmd_build(a: argparse.Namespace) -> None:
         die(f"{out} exists and is not empty; a build is reproducible only into a fresh dir")
     out.mkdir(parents=True, exist_ok=True)
     log = out / "build.log"
-    plowc = REPO / "target" / "release" / "plowc"
+    cell["hf_dir"] = expand(cell["hf_dir"], out)
+    emit = dict(emit, env={k: expand(v, out) for k, v in emit.get("env", {}).items()},
+                args=[expand(x, out) for x in emit.get("args", [])])
+    # Prep steps (checkpoint reshaping, codec exports) run before the emit, in order.
+    for step in r.get("prep", []):
+        print(f"== prep {step['name']}", file=sys.stderr)
+        py = expand(step.get("python", "{env:PYREF}" if os.environ.get("PYREF") else "python3"), out)
+        cmd = [py, str(REPO / step["script"]), *[expand(x, out) for x in step.get("args", [])]]
+        penv = env_with(os.environ, {k: expand(v, out) for k, v in step.get("env", {}).items()})
+        if run(cmd, penv, log):
+            die(f"prep {step['name']} failed; see build.log")
+    plowc = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowc"
     if not plowc.exists():
         die("target/release/plowc missing: nix develop -c cargo build -p plowc --release")
 
@@ -504,6 +546,8 @@ def cmd_build(a: argparse.Namespace) -> None:
         "object_overrides": object_overrides,
         "commit": git("rev-parse", "HEAD"),
         "dirty": bool(git("status", "--porcelain")),
+        "nix": os.environ.get("PLOW_CAMPAIGN_NO_NIX") != "1",
+        "prep": [s.get("name") for s in r.get("prep", [])],
         "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and p.suffix in (".pkt", ".cubin", ".elf", ".co", ".json", ".h")},
         "objects": {p.name: sha(p) for p in sorted((out / "objects").glob("*")) if p.is_file() and p.suffix in (".cubin", ".elf", ".co")} if (out / "objects").exists() else {},

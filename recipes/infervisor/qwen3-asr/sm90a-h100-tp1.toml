@@ -1,0 +1,55 @@
+# Qwen3-ASR-1.7B on H100: audio encoder lowered to encoder.pkt (generic FP32 speech ops on the
+# speech interpreter object; Whisper log-mel frontend parameters + filterbank embedded) and the
+# Qwen3 decoder as a causal.v1 packet with the audio-LM contract (prompt layout, markers,
+# languages, stop ids) as packet strings/parameters.
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (this box only) \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/qwen3-asr/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Gate: WER on the 73-clip LibriSpeech dummy set (scripts/asr/nvidia/get_audio.py) = 3.913%
+# (vLLM reference scripts/asr/nvidia/ref_bench.py: 3.913%).
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "qwen3-asr"
+label = "sm90a-h100-tp1"
+network = "qwen3"
+doc = "docs/runtime/tts.md"
+tracker = "plans/tts-veena-chatterbox-h200-tracker.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:Qwen/Qwen3-ASR-1.7B"
+
+[cell]
+name = "qwen3-asr-h100"
+hf_dir = "{hf:Qwen/Qwen3-ASR-1.7B}"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 2048
+
+[emit]
+emit = "devblob+cubin"
+[emit.env]
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+# Speech-shaped rungs: prefill rows = audio rows (13 per second) + prompt (~60-420), so
+# 128/256/384/512; decode 1..16. Encoder buckets 400..3000 frames come from the lowering.
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "256,384"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+
+[bench]
+kind = "asr"
+client = "crates/plowrt/examples/asr/packet_dataset.rs"
+manifest = "scripts/asr/nvidia/get_audio.py"
+reference = "scripts/asr/nvidia/ref_bench.py"
