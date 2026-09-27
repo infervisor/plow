@@ -555,3 +555,81 @@ extern "C" __global__ void plow_sample_cfg(
         cnt[p] += 1u;
     }
 }
+
+/* OpenAI logprobs for one logits row (`text::logprobs::RowStats` on device), so a greedy row that
+ * asks for them downloads 43 floats instead of its whole vocabulary row.
+ *   out[0] = logsumexp(row)   out[1] = row[tok]   out[2] = 1 when the top-k may be inexact
+ *   out[3 .. 3+k] = top-k ids (u32 bits), out[3+k .. 3+2k] = their logits; best first, ties to
+ *   the lower id (the host order).
+ * Each thread keeps its 4 best entries; the block then pops the global best k times. A thread
+ * whose 4 entries all make the top-k might have held a fifth: out[2] = 1 and the caller falls
+ * back to the host row. */
+#define PLOW_LP_LOCAL 4
+__device__ __forceinline__ unsigned long long lp_key(float v, unsigned i) {
+    const unsigned u = __float_as_uint(v);
+    const unsigned o = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return ((unsigned long long)o << 32) | (unsigned long long)(~i);
+}
+extern "C" __global__ void plow_logprob_stats(
+    const __nv_bfloat16* __restrict__ logits, float* __restrict__ out, unsigned row, unsigned tok,
+    unsigned V, unsigned k) {
+    __shared__ float part[PLOW_SMP_WARPS];
+    __shared__ unsigned long long kpart[PLOW_SMP_WARPS];
+    __shared__ unsigned long long sh_win;
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const __nv_bfloat16* r = logits + (size_t)row * V;
+    float lv[PLOW_LP_LOCAL];
+    unsigned li[PLOW_LP_LOCAL];
+#pragma unroll
+    for (int j = 0; j < PLOW_LP_LOCAL; j++) { lv[j] = -INFINITY; li[j] = 0xFFFFFFFFu; }
+    float m = -INFINITY;
+    for (unsigned i = tid; i < V; i += PLOW_SMP_THREADS) {
+        const float x = __bfloat162float(r[i]);
+        m = fmaxf(m, x);
+        if (x > lv[PLOW_LP_LOCAL - 1]) {
+            /* strict >: an equal later index stays behind the earlier one */
+            int j = PLOW_LP_LOCAL - 1;
+            while (j > 0 && x > lv[j - 1]) { lv[j] = lv[j - 1]; li[j] = li[j - 1]; j--; }
+            lv[j] = x; li[j] = i;
+        }
+    }
+    m = block_max(m, part);
+    float s = 0.0f;
+    for (unsigned i = tid; i < V; i += PLOW_SMP_THREADS) s += expf(__bfloat162float(r[i]) - m);
+    s = block_sum(s, part);
+    int head = 0;
+    bool inexact = false;
+    for (unsigned n = 0; n < k; n++) {
+        unsigned long long best = head < PLOW_LP_LOCAL && li[head] != 0xFFFFFFFFu ? lp_key(lv[head], li[head]) : 0ull;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const unsigned long long x = __shfl_xor_sync(0xffffffffu, best, o, 32);
+            best = x > best ? x : best;
+        }
+        if (lane == 0) kpart[warp] = best;
+        __syncthreads();
+        if (tid == 0) {
+            unsigned long long w = kpart[0];
+            for (unsigned q = 1; q < PLOW_SMP_WARPS; q++) w = kpart[q] > w ? kpart[q] : w;
+            sh_win = w;
+        }
+        __syncthreads();
+        const unsigned long long w = sh_win;
+        if (w != 0ull && head < PLOW_LP_LOCAL && lp_key(lv[head], li[head]) == w) {
+            out[3 + n] = __uint_as_float(li[head]);
+            out[3 + k + n] = lv[head];
+            head++;
+            inexact |= head == PLOW_LP_LOCAL && n + 1 < k;
+        } else if (w == 0ull && tid == 0) {
+            out[3 + n] = __uint_as_float(0xFFFFFFFFu);
+            out[3 + k + n] = -INFINITY;
+        }
+        __syncthreads();
+    }
+    const int any_inexact = __syncthreads_or(inexact);
+    if (tid == 0) {
+        out[0] = m + logf(s);
+        out[1] = __bfloat162float(r[tok]);
+        out[2] = any_inexact ? 1.0f : 0.0f;
+    }
+}

@@ -5444,6 +5444,10 @@ fn gpu_finish_token(
         return Ok(cfg_draw(slot));
     }
     if !gpu_argmax_eligible(&slot.gen.params) {
+        if let Some(lp) = greedy_device_logprobs(e, row, &slot.gen.params, argmax_tok)? {
+            slot.lp = Some(Box::new(lp));
+            return Ok(argmax_tok);
+        }
         let mut logits = e.take_logits_buf();
         logits.clear();
         e.logits_row(row, &mut logits)?;
@@ -5453,18 +5457,54 @@ fn gpu_finish_token(
             || p.presence_penalty != 0.0
             || p.frequency_penalty != 0.0
             || !p.logit_bias.is_empty();
-        let raw = (stats.is_some() && adjusted).then(|| logits.clone());
-        crate::text::sample::apply_penalties(&mut logits, &slot.out_ids, &slot.gen.params);
-        let rng = slot_rng01(slot);
-        let tok = crate::text::sample::sample(&logits, &slot.gen.params, None, rng);
+        // Greedy logprobs rows keep the device argmax (same bf16 row, same lowest-id tie-break).
+        let tok = if p.temperature <= 0.0 && !adjusted {
+            argmax_tok
+        } else {
+            let raw = (stats.is_some() && adjusted).then(|| logits.clone());
+            crate::text::sample::apply_penalties(&mut logits, &slot.out_ids, &slot.gen.params);
+            let tok = crate::text::sample::sample(&logits, &slot.gen.params, None, slot_rng01(slot));
+            if let Some(raw) = raw {
+                logits = raw;
+            }
+            tok
+        };
         if let Some(stats) = stats {
-            let logit = raw.as_deref().unwrap_or(&logits)[tok as usize];
-            slot.lp = Some(Box::new(stats.finish(logit)));
+            slot.lp = Some(Box::new(stats.finish(logits[tok as usize])));
         }
         e.return_logits_buf(logits);
         return Ok(tok);
     }
     Ok(argmax_tok)
+}
+
+/// A greedy, unadjusted logprobs row: its statistics come from `plow_logprob_stats` on device
+/// (43 floats back instead of the 512 KiB row). `None` when the row needs the host path, the
+/// sampler object has no stats kernel, or its top-k is flagged inexact.
+#[cfg(feature = "cuda")]
+fn greedy_device_logprobs(
+    e: &mut crate::exec::gpu::GpuEngine,
+    row: usize,
+    p: &crate::text::sample::SamplingParams,
+    tok: u32,
+) -> Result<Option<crate::text::logprobs::TokenLogprobs>> {
+    let Some(req) = p.logprobs else { return Ok(None) };
+    if p.temperature > 0.0
+        || p.repetition_penalty != 1.0
+        || p.presence_penalty != 0.0
+        || p.frequency_penalty != 0.0
+        || !p.logit_bias.is_empty()
+    {
+        return Ok(None);
+    }
+    let k = u32::from(req.top.min(crate::text::logprobs::MAX_TOP_LOGPROBS));
+    let mut out = [0f32; crate::exec::gpu::LOGPROB_STATS_MAX];
+    if !e.logprob_stats(row, tok, k, &mut out)? || out[2] != 0.0 {
+        return Ok(None);
+    }
+    let k = k as usize;
+    let top = (0..k).map(|i| (out[3 + i].to_bits(), out[3 + k + i])).filter(|&(t, _)| t != u32::MAX).collect();
+    Ok(Some(crate::text::logprobs::RowStats::from_parts(out[0], req.raw_logits, top).finish(out[1])))
 }
 
 /// Draw every fed CFG owner's token from ONE download of the step's logits rows (instead of two

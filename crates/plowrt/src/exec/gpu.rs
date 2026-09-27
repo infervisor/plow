@@ -3182,6 +3182,9 @@ impl DevSample {
 /// Uniform draws per row the sampler slab holds: the widest sampled multi-step quantum.
 const SAMPLE_RNG_STEPS: usize = 64;
 
+/// `plow_logprob_stats` output floats at the widest `top_logprobs`.
+pub const LOGPROB_STATS_MAX: usize = 3 + 2 * crate::text::logprobs::MAX_TOP_LOGPROBS as usize;
+
 /// Device sampler state: the `plow_sample` kernel + its per-slot parameter and
 /// scratch buffers, all sized to the engine batch × vocab at load.
 struct Sampler {
@@ -3201,6 +3204,9 @@ struct Sampler {
     batch: usize,
     /// `plow_sample_cfg` (absent on older objects: CFG pairs keep the host draw).
     f_cfg: Option<KernelFn>,
+    /// `plow_logprob_stats` and its `[3 + 2 * MAX_TOP_LOGPROBS]` f32 output (absent on older
+    /// objects: logprob rows download the whole logits row).
+    lp: Option<(KernelFn, DeviceMem)>,
     /// Guided-draw buffers, allocated on the first CFG pair.
     cfg: Option<CfgSlab>,
     /// Steps of guided draws staged by [`GpuEngine::stage_cfg`] for the next decode call.
@@ -6333,6 +6339,10 @@ impl GpuEngine {
         let d_params = be.alloc(0, slab as u64)?;
         let d_escratch = be.alloc(0, (batch * vocab * 4) as u64)?;
         let f_cfg = be.get_function(&module, "plow_sample_cfg").ok();
+        let lp = match be.get_function(&module, "plow_logprob_stats") {
+            Ok(f) => Some((f, be.alloc(0, (LOGPROB_STATS_MAX * 4) as u64)?)),
+            Err(_) => None,
+        };
         tracing::info!(cubin = %cubin.display(), cfg = f_cfg.is_some(), "device sampler enabled (PLOW_DEV_SAMPLE=1)");
         Ok(Some(Sampler {
             f,
@@ -6343,6 +6353,7 @@ impl GpuEngine {
             threads,
             batch,
             f_cfg,
+            lp,
             cfg: None,
             cfg_staged: 0,
         }))
@@ -10645,6 +10656,39 @@ impl GpuEngine {
     /// Used when the request wants stochastic sampling; the greedy path
     /// consumes the device argmax without ever moving the row. Prefill writes
     /// its logits to row 0 regardless of the slot (lm_head M == 1).
+    /// OpenAI logprobs of logits row `b` on device (`plow_logprob_stats`): `out[..3 + 2k]` =
+    /// `[logsumexp, row[tok], inexact, top-k ids (u32 bits), their logits]`. `Ok(false)` when the
+    /// sampler object has no such kernel.
+    pub fn logprob_stats(&mut self, b: usize, tok: u32, k: u32, out: &mut [f32; LOGPROB_STATS_MAX]) -> Result<bool> {
+        let Some((f, dev, threads)) = self.sampler.as_ref().and_then(|s| s.lp.as_ref().map(|(f, d)| (*f, d.base, s.threads)))
+        else {
+            return Ok(false);
+        };
+        if b >= self.batch || tok as usize >= self.vocab || 3 + 2 * k as usize > LOGPROB_STATS_MAX {
+            return Err(RuntimeError::Rejected(format!("logprob_stats: row {b} tok {tok} k {k} out of range")));
+        }
+        let mut a_logits = self.devp[self.t_logits].base;
+        let mut a_out = dev;
+        let (mut a_row, mut a_tok, mut a_v, mut a_k) = (b as u32, tok, self.vocab as u32, k);
+        let mut a = [
+            &mut a_logits as *mut u64 as *mut std::ffi::c_void,
+            &mut a_out as *mut u64 as *mut std::ffi::c_void,
+            &mut a_row as *mut u32 as *mut std::ffi::c_void,
+            &mut a_tok as *mut u32 as *mut std::ffi::c_void,
+            &mut a_v as *mut u32 as *mut std::ffi::c_void,
+            &mut a_k as *mut u32 as *mut std::ffi::c_void,
+        ];
+        self.be.launch_kernel(f, 1, threads, 0, &mut a, Some(&self.stream))?;
+        self.be.stream_synchronize(&self.stream)?;
+        let n = 3 + 2 * k as usize;
+        let mut raw = [0u8; LOGPROB_STATS_MAX * 4];
+        self.be.memcpy_dtoh(&mut raw[..n * 4], dev)?;
+        for (o, c) in out.iter_mut().zip(raw[..n * 4].chunks_exact(4)) {
+            *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        Ok(true)
+    }
+
     pub fn logits_row(&mut self, b: usize, out: &mut Vec<f32>) -> Result<()> {
         if b >= self.batch {
             return Err(RuntimeError::Rejected(format!(
