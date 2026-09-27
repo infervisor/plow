@@ -41,7 +41,9 @@ impl Registry {
     /// other's weights under it, with nothing in the log.
     pub fn load(&self, dir: impl AsRef<Path>, slug: Option<String>) -> Result<String> {
         let bundle = ModelBundle::load(dir)?;
-        let slug = slug.unwrap_or_else(|| bundle.network().to_string());
+        let slug = slug
+            .or_else(|| bundle.manifest.served_name.clone())
+            .unwrap_or_else(|| bundle.network().to_string());
         let mut models = self.models.write();
         if models.contains_key(&slug) {
             return Err(RuntimeError::Msg(format!(

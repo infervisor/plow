@@ -45,6 +45,8 @@ args = ["{out}/prep/snac"]
 
 [emit]
 emit = "devblob+cubin"
+# The OpenAI `model` id plowrt serves the bundle under (weights.json served_name).
+args = ["--served-name", "veena"]
 [emit.env]
 PLOW_TTS_PROFILE = "veena"
 PLOW_TTS_CODEC_DIR = "{out}/prep/snac"

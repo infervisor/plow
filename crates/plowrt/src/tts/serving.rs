@@ -223,14 +223,6 @@ pub async fn speech(
     let t_arrive = Instant::now();
     if let Some(canonical) = state.registry.resolve(&req.model) {
         req.model = canonical;
-    } else if !state.registry.contains(&req.model) {
-        // A speech asset is also addressable by its directory name.
-        let by_dir = state.registry.slugs().into_iter().find(|slug| {
-            state.registry.get(slug).is_ok_and(|b| b.dir.file_name().is_some_and(|n| n == req.model.as_str()))
-        });
-        if let Some(slug) = by_dir {
-            req.model = slug;
-        }
     }
     if let Some(mgr) = state.manager_for(&req.model) {
         if mgr.manages(&req.model) {

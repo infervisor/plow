@@ -49,6 +49,11 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["model", "net"])]
     hf_dir: Option<PathBuf>,
 
+    /// The `model` id `plowrt serve` registers the bundle under (written to `weights.json`).
+    /// Default: the HF repo id when `--hf-dir` is a hub-cache snapshot, else the network slug.
+    #[arg(long)]
+    served_name: Option<String>,
+
     /// Bucket preset: quick (2×2), default (3×3), serve (5×5 crossed), longctx (3×4).
     /// Overrides --batch and --seq when provided.
     #[arg(long, value_enum)]
@@ -1919,6 +1924,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         // the hand-written stub the build scripts used to emit.
         let manifest = plow_asset::Manifest {
             network: slug.clone(),
+            served_name: cli.served_name.clone().or_else(|| plowc::hf_config::hub_repo_id(&dir)),
             gpu: cli.gpu.clone(),
             num_gpus: cli.num_gpus,
             parallel: format!("{:?}", cli.parallel).to_lowercase(),

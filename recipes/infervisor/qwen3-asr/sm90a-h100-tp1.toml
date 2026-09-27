@@ -39,6 +39,8 @@ max_ctx = 2048
 
 [emit]
 emit = "devblob+cubin"
+# The OpenAI `model` id plowrt serves the bundle under (weights.json served_name).
+args = ["--served-name", "qwen3-asr"]
 [emit.env]
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 # Speech-shaped rungs: prefill rows = audio rows (13 per second) + prompt (~60-420), so

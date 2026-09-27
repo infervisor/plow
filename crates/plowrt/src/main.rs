@@ -3213,7 +3213,7 @@ async fn bringup_runtime(
     }
     tracing::info!(
         models = registry.len(),
-        aliases = served_model_name.len(),
+        aliases = registry.alias_pairs().len(),
         trace,
         "registry ready"
     );

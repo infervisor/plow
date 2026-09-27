@@ -37,7 +37,7 @@ python scripts/tts/snac_export.py $SNAC
 PLOW_TTS_CODEC_DIR=$SNAC PLOW_TTS_PROFILE=veena PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32 \
   PLOW_EMIT_PREFILL_CUBLASLT=1 PLOW_NO_GLU_FUSE=1 PLOW_FUSE_KV_HNR=1 \
   plowc --hf-dir $VEENA --gpu h100 --arch sm_90a --max-ctx 2048 \
-        --emit devblob+cubin --out $ASSETS
+        --emit devblob+cubin --served-name veena --out $ASSETS
 
 plowrt serve --assets $ASSETS --port 8080
 curl -s localhost:8080/v1/audio/speech -H 'content-type: application/json' \
@@ -59,14 +59,27 @@ penalty switches that request to host sampling).
 python scripts/tts/chatterbox_prep.py $T3_HF          # Llama-shaped T3 checkpoint + voice rows
 python scripts/tts/s3gen_export.py $S3GEN             # S3Gen weights + voices for the packet
 PLOW_TTS_VOCODER_DIR=$S3GEN PLOW_EMIT_PREFILL_CUBLASLT=1 PLOW_NO_GLU_FUSE=1 \
-  plowc --hf-dir $T3_HF --gpu h100 --arch sm_90a --max-ctx 2048 --emit devblob+cubin --out $CBX
+  plowc --hf-dir $T3_HF --gpu h100 --arch sm_90a --max-ctx 2048 --emit devblob+cubin \
+        --served-name chatterbox --out $CBX
 
-plowrt serve --assets $CBX --port 8080     # served under the asset directory name
+plowrt serve --assets $CBX --port 8080
 ```
 
-The T3 asset is not a text model: `serve` starts a guided speech worker for it
-(its own engine; two slots per request for guidance; `s3gen.pkt` renders audio) and routes
-`/v1/audio/speech` requests whose `model` is the directory name to it.
+The T3 asset runs on the shared text mux as guided jobs (two slots per request for
+guidance); `s3gen.pkt` renders audio on a render thread.
+
+## Model names
+
+`plowc --served-name NAME` writes `served_name` into `weights.json`; `plowrt serve` registers
+the bundle under it (default: the HF repo id for a hub-cache `--hf-dir`, else the network
+slug). The recipes set `veena`, `chatterbox` and `qwen3-asr`.
+
+## Co-serving
+
+One `plowrt serve --assets $ASR --assets $VEENA --assets $CBX` serves all three from one GPU:
+each model has its own mux and KV, and the device changes hands at launch boundaries
+(`--co-sched free|rr`). `scripts/tts/plow_coserve_probe.sh` runs each model alone, the
+switch latency (`switch_bench.py`) and all three under concurrent load in one lease.
 
 ## Validation tools (`scripts/tts/`)
 

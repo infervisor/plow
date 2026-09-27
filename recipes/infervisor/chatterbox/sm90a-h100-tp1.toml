@@ -54,6 +54,8 @@ env = { PYTHONPATH = "" }
 
 [emit]
 emit = "devblob+cubin"
+# The OpenAI `model` id plowrt serves the bundle under (weights.json served_name).
+args = ["--served-name", "chatterbox"]
 [emit.env]
 PLOW_TTS_VOCODER_DIR = "{out}/prep/s3gen"
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
