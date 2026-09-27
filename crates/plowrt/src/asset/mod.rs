@@ -115,6 +115,15 @@ impl ModelBundle {
         &self.manifest.network
     }
 
+    /// Tokens its downstream stage consumes together (a speech packet's codec frame), 1 when
+    /// none: a decode quantum that ends mid-group holds the finished part of a frame back.
+    pub fn decode_token_group(&self) -> usize {
+        crate::tts::SpeechContract::load(&self.dir)
+            .ok()
+            .flatten()
+            .map_or(1, |c| c.frame_codes.max(1))
+    }
+
     /// The model's tokenizer (real HF tokenizer when available, else bytes).
     pub fn tokenizer(&self) -> &Arc<dyn Tokenize> {
         &self.tokenizer

@@ -1069,6 +1069,23 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             //   per k-step (op_gemv_mma.cuh): 12B B=1/4/16 10.99/11.70/14.25 -> 10.92/11.60/13.94.
             t.insert("gemv_mma_pair".into(), json!(1));
         }
+        // * `gemv_k8`: rungs 2..32 run the tensor-core K-split walk (op_gemv_k8_sm90.cuh), weight
+        //   rows as the mma M. Veena (Llama-3.2-3B) ctx 1024 B=1/2/4/8/16/32 3.44/3.86/3.96/4.09/
+        //   4.45/5.83 -> 3.47/3.46/3.53/3.75/4.18/5.49 ms; Qwen3-ASR 1.7B 2.22/2.51/2.69/2.85/3.15/
+        //   4.29 -> 2.24/2.32/2.41/2.57/2.90/3.96. Measured on hd <= 128 dense packets only.
+        if s.moe_down_inter == 0
+            && !s.moe_dec_group
+            && s.decode_batch >= 2
+            && s.hd.iter().all(|&h| h <= 128)
+            && s.decode_gemv_k.iter().all(|k| k % 32 == 0)
+        {
+            t.insert("gemv_k8".into(), json!(1));
+            // * `gemv_l2pf`: a decode GEMV block waiting on its gate first has the TMA unit pull
+            //   64 KiB of its weight share into L2 (interp_sm120.cu PLOW_NV_GEMV_L2PF_BYTES). Veena
+            //   B=1/2/4/8/16/32 3.46/3.44/3.52/3.74/4.14/5.48 -> 3.42/3.27/3.36/3.58/4.02/5.41 ms;
+            //   32 KiB 3.40/3.32/3.41/3.63, 128 KiB 3.48/3.31/3.40/3.58, 256 KiB 3.68/3.40/3.42/3.60.
+            t.insert("gemv_l2pf".into(), json!(65536));
+        }
         // * `gemv_wide`: rungs past GV_MM_MAX stream the weights once on wgmma
         //   (op_gemv_wide_sm90.cuh) instead of ceil(B / 32) mma.sync passes. Its split-K tiles are
         //   written by other blocks than their owner, so only dense packets (coarse gates) take it.
@@ -2855,6 +2872,14 @@ pub fn config_header(manifest: &Value) -> String {
             }
             if t.get("gemv_wide").is_some() {
                 out.push_str("#ifndef PLOW_NV_GEMV_WIDE\n#define PLOW_NV_GEMV_WIDE 1\n#endif\n");
+            }
+            if t.get("gemv_k8").is_some() {
+                out.push_str("#ifndef PLOW_NV_GEMV_K8\n#define PLOW_NV_GEMV_K8 1\n#endif\n");
+            }
+            if let Some(v) = t.get("gemv_l2pf").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_GEMV_L2PF_BYTES\n#define PLOW_NV_GEMV_L2PF_BYTES {v}u\n#endif\n"
+                ));
             }
             if t.get("fa_tc_hd512").is_some() {
                 out.push_str(

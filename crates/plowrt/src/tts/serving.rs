@@ -416,12 +416,15 @@ async fn collect_codes(c: &SpeechContract, mut rx: stream_mod::ChunkReceiver) ->
 
 /// The emission plan for a stream holding `n` complete frames of which `emitted` are sent:
 /// `Some((window_start, window_end, emit_to))`, or `None` when nothing new is ready.
-fn stream_step(n: usize, emitted: usize, done: bool, window: usize, lookahead: usize) -> Option<(usize, usize, usize)> {
+///
+/// Every window carries `window - lookahead - 1` frames of left context and `lookahead` of right
+/// context (the one-frame window's shape). After the first audio, frames go out `chunk` at a time:
+/// a window costs its codec capacity whatever it emits, and one frame per window made streaming
+/// Veena c64 36% slower than whole-utterance decoding.
+fn stream_step(n: usize, emitted: usize, done: bool, window: usize, lookahead: usize, chunk: usize) -> Option<(usize, usize, usize)> {
     let upto = if done { n } else { n.saturating_sub(lookahead) };
-    (upto > emitted).then(|| {
-        let e = n.min(upto + lookahead);
-        (e.saturating_sub(window).min(emitted), e, upto)
-    })
+    let ready = upto > emitted && (done || emitted == 0 || upto - emitted >= chunk);
+    ready.then(|| (emitted.saturating_sub(window.saturating_sub(lookahead + 1)), n.min(upto + lookahead), upto))
 }
 
 async fn stream_task(
@@ -462,7 +465,13 @@ async fn stream_task(
                 frames.extend(f);
             }
         }
-        if let Some((s, e, upto)) = stream_step(frames.len() / fc, emitted, done, model.codec.window, model.codec.lookahead) {
+        let chunk = (model.codec.min_frames + 1).saturating_sub(model.codec.window).max(1);
+        let lookahead = if emitted == 0 {
+            model.codec.lookahead.min(crate::config::RuntimeConfig::get().tts_first_lookahead)
+        } else {
+            model.codec.lookahead
+        };
+        if let Some((s, e, upto)) = stream_step(frames.len() / fc, emitted, done, model.codec.window, lookahead, chunk) {
             let window = frames[s * fc..e * fc].to_vec();
             let urgency = if emitted == 0 { Urgency::First } else { Urgency::Stream };
             match model.codec.decode(window, e - s, seed ^ (emitted as u64).wrapping_mul(0x9E37_79B9), urgency).await {
@@ -498,24 +507,29 @@ mod tests {
     const LOOKAHEAD: usize = 2;
 
     /// Every frame is emitted exactly once, in order, each with LOOKAHEAD right context until
-    /// the final flush.
+    /// the final flush and the one-frame window's left context; later windows emit CHUNK frames
+    /// and fit the smallest capacity (WINDOW + CHUNK - 1 frames).
     #[test]
     fn stream_plan_covers_each_frame_once() {
-        for total in 1..20 {
-            let (mut emitted, mut seen) = (0, Vec::new());
-            for n in 1..=total {
-                if let Some((s, e, upto)) = stream_step(n, emitted, false, WINDOW, LOOKAHEAD) {
-                    assert!(s <= emitted && upto <= e && e <= n && e - s <= WINDOW + LOOKAHEAD);
-                    assert!(e - upto >= LOOKAHEAD.min(n - upto));
-                    seen.extend(emitted..upto);
-                    emitted = upto;
+        for chunk in 1..=3 {
+            for total in 1..20 {
+                let (mut emitted, mut seen) = (0, Vec::new());
+                for n in 1..=total {
+                    if let Some((s, e, upto)) = stream_step(n, emitted, false, WINDOW, LOOKAHEAD, chunk) {
+                        assert!(s <= emitted && upto <= e && e <= n && e - s <= WINDOW + chunk - 1);
+                        assert!(emitted - s == emitted.min(WINDOW - LOOKAHEAD - 1));
+                        assert!(e - upto >= LOOKAHEAD.min(n - upto));
+                        assert!(emitted == 0 || upto - emitted == chunk);
+                        seen.extend(emitted..upto);
+                        emitted = upto;
+                    }
                 }
+                if let Some((_, e, upto)) = stream_step(total, emitted, true, WINDOW, LOOKAHEAD, chunk) {
+                    assert_eq!((e, upto), (total, total));
+                    seen.extend(emitted..upto);
+                }
+                assert_eq!(seen, (0..total).collect::<Vec<_>>());
             }
-            if let Some((_, e, upto)) = stream_step(total, emitted, true, WINDOW, LOOKAHEAD) {
-                assert_eq!((e, upto), (total, total));
-                seen.extend(emitted..upto);
-            }
-            assert_eq!(seen, (0..total).collect::<Vec<_>>());
         }
     }
 }

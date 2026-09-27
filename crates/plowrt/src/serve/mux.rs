@@ -818,6 +818,7 @@ pub fn spawn(
         // An inline dispatcher already is that thread.
         let engine_thread = (has_gpu && !inline_tick)
             .then(|| crate::exec::engine_thread::EngineThread::spawn(format!("plow-eng-{slug}")));
+        let token_group = bundle.decode_token_group();
 
         loop {
             // Preempt ([`ModelMux::preempt`]): kill every live slot NOW.
@@ -1229,7 +1230,7 @@ pub fn spawn(
                     // the next completion land in the same wave (two prefills back to back).
                     1
                 } else if device_quantum > 1 {
-                    device_quantum.max(MultiStep::for_batch(live as i64).steps)
+                    group_aligned(device_quantum.max(MultiStep::for_batch(live as i64).steps), token_group)
                 } else {
                     MultiStep::for_batch(live as i64).steps
                 }
@@ -4428,6 +4429,17 @@ fn amd_defer_decode(enabled: bool, prefill_remains: bool) -> bool {
 }
 
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+/// A quantum of whole token groups when it holds at least one (Veena's 7-code frames: 8 -> 7).
+/// Measured H100 Veena served: c1 TTFA 100.0 -> 89.4 ms, stream c8 19.1 -> 20.2 aps.
+fn group_aligned(steps: u32, group: usize) -> u32 {
+    let g = group as u32;
+    if g > 1 && steps >= g {
+        steps / g * g
+    } else {
+        steps
+    }
+}
+
 fn multistep_requested(remaining: usize, scheduler_steps: usize, configured: usize) -> usize {
     remaining.min(scheduler_steps).min(configured.max(1))
 }

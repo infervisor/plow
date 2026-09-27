@@ -96,6 +96,11 @@ pub struct RuntimeConfig {
     #[arg(long = "idle-dispatch", env = "PLOW_IDLE_DISPATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub idle_dispatch: bool,
 
+    /// Frames of right context a speech stream's FIRST audio waits for (later windows keep the
+    /// codec's own lookahead): Veena needs one frame fewer before it speaks. Capped by the codec's.
+    #[arg(long = "tts-first-lookahead", env = "PLOW_TTS_FIRST_LOOKAHEAD", default_value_t = 1, global = true)]
+    pub tts_first_lookahead: usize,
+
     /// How long a finished `X-Session-Id` request's KV (and an ASR session's audio and encoder
     /// windows) stays retained for the session's next request, in ms. 0 disables retention.
     #[arg(long = "session-ttl-ms", env = "PLOW_SESSION_TTL_MS", default_value_t = 60_000, global = true)]

@@ -207,6 +207,23 @@ pub(crate) fn odd_group_gf(gqa: u32) -> u32 {
     }
 }
 
+/// NVIDIA dense decode with no FLASH_MERGE packet: the hd128 row-group flash body
+/// (`fa_decode_rg_item`, op_attention.cuh) normalizes in its own fold at one split and merges on
+/// the last-arriving split otherwise, through the `mrgc` counters. Per packet, not per rung: the
+/// decode ladder requires every rung's instruction list to match.
+pub(crate) fn nv_decode_merge_fold(c: &Cfg, fp8_kv: bool) -> bool {
+    !emit_is_amd()
+        && !emit_is_apple()
+        && c.tp == 1
+        && !fp8_kv
+        && c.hd_full == 128
+        && c.hd_slide == 128
+        && c.kvh_full == c.kvh_slide
+        && c.kvh_full > 0
+        && c.heads % c.kvh_full == 0
+        && (2..=4).contains(&(c.heads / c.kvh_full))
+}
+
 pub(crate) fn attention_decode_ns(
     batch: u32,
     heads: u32,
@@ -4790,6 +4807,14 @@ fn emit_phase(
         } else {
             ns
         };
+        // Row-group flash + merge fold (nv_decode_merge_fold): about one work item per SM, at
+        // most 8 splits. H100 Veena ctx 1024 measured best at ns 6-8/8/4/2/1 for B=1/2/4/8/16.
+        let nv_fold = gemv_family && !amd && n.mrgc != TENSOR_NONE;
+        let ns = if nv_fold {
+            (n_cu / (t * (heads / gf))).clamp(1, 8)
+        } else {
+            ns
+        };
         // PLOW_NS_ABS pins nsplit directly. MEASURED on Qwen3-4B (all-global, GQA 4, MI350X):
         // the default mul=2 (ns=16) OVER-SPLITS flash_decode — each split's fixed overhead (Q
         // re-staging + the flash_merge partial + its barriers) dominates the tiny per-split KV
@@ -5384,6 +5409,8 @@ fn emit_phase(
         // epilogue and the packet's own coarse completion signal covers the merge, so o_proj
         // just re-points its dep at the flash op with no threshold change.
         let fuse_merge = fuse_hnr && n.mrgc != TENSOR_NONE;
+        // See nv_decode_merge_fold: flash writes `n.at` itself, j[1] = at | mrgc << 16.
+        let dec_fused = nv_fold;
         let c_fa = if fuse_hnr {
             // NRF fold packet: flash depends on the three RAW projections directly (the hnr
             // level is gone). Operands per the exec's unpacking map; kv_rows gets nothing —
@@ -5516,6 +5543,10 @@ fn emit_phase(
                 if t > 1 {
                     d.j[0] = t * kvh * kvr;
                 }
+                if dec_fused {
+                    assert!(n.at < (1 << 16) && n.mrgc < (1 << 16), "fold handles overflow j[1]");
+                    d.j[1] = n.at | (n.mrgc << 16);
+                }
             })
         } else {
             let fa_op = if fp8_kv {
@@ -5584,7 +5615,7 @@ fn emit_phase(
         // When fused, flash_prefill already wrote the normalized bf16 to n.at, so there is no
         // FlashMerge op and o_proj depends on the flash op directly. Coarse: n.at row r needs
         // every head of its q-tile, which is spread across the flash workgroups.
-        let attn_deps = if fused || fuse_merge {
+        let attn_deps = if fused || fuse_merge || dec_fused {
             vec![c_fa]
         } else {
             // L1: fold a D-chunk axis into the merge's work id so it can occupy more than
@@ -7607,13 +7638,14 @@ impl<'a> DenseGqaEmitter<'a> {
         // [MERGE-FOLD] opt-in (PLOW_FUSE_MERGE=1) and rides the NRF packet's spare bits, so it
         // additionally requires the hnr fold's per-layer gates at emit time — this flag only
         // declares the counter tensor. Same arch scoping as nrn_fold (gfx942, measured there).
-        let merge_fold = amd
+        let merge_fold = (amd
             && amd_target::active().1 == hwspec::IsaLevel::Gfx942
             && fp8
             && c.arch.is_gemma()
             && !c.moe
             && emit_config::active().fuse_hnr
-            && emit_config::active().fuse_merge;
+            && emit_config::active().fuse_merge)
+            || nv_decode_merge_fold(c, fp8_kv);
         let tn = declare(
             &mut tb,
             c,

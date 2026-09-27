@@ -42,6 +42,8 @@ pub struct Codec {
     /// Largest batch one launch holds.
     pub max_batch: usize,
     pub max_frames: usize,
+    /// Frames the smallest capacity holds: a shorter window costs as much.
+    pub min_frames: usize,
     pub frame_codes: usize,
     pub frame_samples: usize,
     /// Streaming: frames of context a decode window carries, and right context before a frame
@@ -95,6 +97,7 @@ impl Codec {
                 let info = (
                     bound.capacities.iter().map(|c| c.0).max().unwrap_or(1),
                     bound.capacities.iter().map(|c| c.1).max().unwrap_or(0),
+                    bound.capacities.iter().map(|c| c.1).min().unwrap_or(0),
                     bound.frame_codes,
                     bound.frame_samples,
                     bound.window,
@@ -106,13 +109,14 @@ impl Codec {
                 run(rx, bound);
             })
             .map_err(|e| e.to_string())?;
-        let (max_batch, max_frames, frame_codes, frame_samples, window, lookahead, voices, parameters) =
+        let (max_batch, max_frames, min_frames, frame_codes, frame_samples, window, lookahead, voices, parameters) =
             ready_rx.recv().map_err(|e| e.to_string())??;
         Ok(Codec {
             tx: Mutex::new(tx),
             credit: None,
             max_batch,
             max_frames,
+            min_frames,
             frame_codes,
             frame_samples,
             window,

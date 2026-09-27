@@ -714,6 +714,160 @@ __device__ __forceinline__ void fa_decode_qk_mma(float* scores, const __nv_bfloa
 }
 #endif
 
+/* hd128 GQA decode item, row-group body (GF 2..4: Veena GF3, Qwen3 GF2). The tile body pays ~6
+ * block barriers per 256-row tile and streams K, then V, with nothing overlapping them: measured
+ * H100 Veena ctx 1024, 20-29 us per layer at B=2..8 against a 10 us KV floor. Here D/8 lanes own
+ * one row (16 B each; a warp load is two contiguous rows), K and V of U rows are issued together,
+ * each lane group keeps its own online softmax for the GF heads, and the NGRP group states fold
+ * once per item through smem. Sum order differs from the tile body.
+ * `out` != null: no FLASH_MERGE follows. At nsplit == 1 the fold normalizes into `out`; otherwise
+ * every split publishes its partial and bumps `ctr` (this (b, head-group)'s counter), and the
+ * last arrival merges into `out` and re-zeroes the counter (zeroed once at load). The next
+ * token's flash on this layer sits behind this packet's consumers, so the reset cannot race. */
+#ifndef PLOW_NV_FA_RG
+#define PLOW_NV_FA_RG 1
+#endif
+#ifndef PLOW_NV_FA_RG_U
+#define PLOW_NV_FA_RG_U 4
+#endif
+template <int D, int GF>
+__device__ __forceinline__ void fa_decode_rg_item(
+    float* __restrict__ Opart, float* __restrict__ mlpart, __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ kbase,
+    const __nv_bfloat16* __restrict__ vbase, unsigned b, unsigned n_head, unsigned h0,
+    unsigned nsplit, unsigned sp, unsigned lo, unsigned hi, unsigned kv_mask, float scale,
+    float* lds, unsigned* __restrict__ ctr) {
+    constexpr unsigned LPR = D / 8, GPW = 32u / LPR, NGRP = PLOW_NV_WARPS * GPW;
+    constexpr int U = PLOW_NV_FA_RG_U;
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned sub = lane % LPR, grp = warp * GPW + lane / LPR;
+    float qf[GF][8], m[GF], l[GF], o[GF][8];
+#pragma unroll
+    for (int g = 0; g < GF; g++) {
+        const bf16v8 q8 = ld_glob8(Q + ((size_t)b * n_head + h0 + g) * D + sub * 8u);
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            qf[g][i] = __bfloat162float(q8.x[i]) * FA_SCALE(scale);
+            o[g][i] = 0.0f;
+        }
+        m[g] = FA_NEG_INF;
+        l[g] = 0.0f;
+    }
+    /* Block-uniform trip count: the lane reductions are full-warp shuffles. */
+    for (unsigned base = lo; base < hi; base += NGRP * U) {
+        const unsigned r0 = base + grp;
+        bf16v8 k8[U], v8[U];
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            const unsigned r = min(r0 + NGRP * (unsigned)u, hi - 1u);
+            const size_t off = (size_t)(r & kv_mask) * D + sub * 8u;
+            k8[u] = ld_glob8_cs(kbase + off);
+            v8[u] = ld_glob8_cs(vbase + off);
+        }
+        float sc[GF][U];
+#pragma unroll
+        for (int u = 0; u < U; u++)
+#pragma unroll
+            for (int g = 0; g < GF; g++) {
+                float d = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; i++) d = fmaf(__bfloat162float(k8[u].x[i]), qf[g][i], d);
+#pragma unroll
+                for (unsigned s = LPR / 2; s > 0; s >>= 1) d += __shfl_xor_sync(0xffffffffu, d, s, 32);
+                sc[g][u] = r0 + NGRP * (unsigned)u < hi ? d : FA_NEG_INF;
+            }
+#pragma unroll
+        for (int g = 0; g < GF; g++) {
+            float mx = m[g];
+#pragma unroll
+            for (int u = 0; u < U; u++) mx = fmaxf(mx, sc[g][u]);
+            /* A group with no live row yet keeps mx = NEG_INF (finite): shift by 0 so the dead
+             * rows' weights are ex2(NEG_INF) = 0, not ex2(0) = 1. */
+            const float mref = mx > FA_NEG_INF ? mx : 0.0f;
+            const float corr = FA_EXP(m[g] - mref);
+            l[g] *= corr;
+#pragma unroll
+            for (int i = 0; i < 8; i++) o[g][i] *= corr;
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+                const float p = FA_EXP(sc[g][u] - mref);
+                l[g] += p;
+#pragma unroll
+                for (int i = 0; i < 8; i++) o[g][i] = fmaf(p, __bfloat162float(v8[u].x[i]), o[g][i]);
+            }
+            m[g] = mx;
+        }
+    }
+    float* go = lds;              /* [NGRP][D] */
+    float* gm = lds + NGRP * D;   /* [NGRP] */
+    float* gl = gm + NGRP;        /* [NGRP] */
+#pragma unroll
+    for (int g = 0; g < GF; g++) {
+        __syncthreads(); /* the previous head's (or item's) fold has read go/gm/gl */
+#pragma unroll
+        for (int i = 0; i < 8; i++) go[grp * D + sub * 8u + i] = o[g][i];
+        if (sub == 0) { gm[grp] = m[g]; gl[grp] = l[g]; }
+        __syncthreads();
+        const size_t row = (size_t)b * n_head + h0 + g;
+        for (unsigned d = tid; d < (unsigned)D; d += PLOW_NV_THREADS) {
+            float M = FA_NEG_INF;
+#pragma unroll
+            for (unsigned j = 0; j < NGRP; j++) M = fmaxf(M, gm[j]);
+            float acc = 0.0f, L = 0.0f;
+#pragma unroll
+            for (unsigned j = 0; j < NGRP; j++) {
+                const float w = FA_EXP(gm[j] - M);
+                acc = fmaf(go[j * D + d], w, acc);
+                L = fmaf(gl[j], w, L);
+            }
+            if (out && nsplit == 1) {
+                out[row * D + d] = __float2bfloat16(L > 0.0f ? acc / L : 0.0f);
+            } else {
+                Opart[(row * nsplit + sp) * D + d] = acc;
+                if (d == 0) {
+                    mlpart[(row * nsplit + sp) * 2] = M;
+                    mlpart[(row * nsplit + sp) * 2 + 1] = L;
+                }
+            }
+        }
+    }
+    if (!out || nsplit == 1) return;
+    /* The interpreter's own signal pattern: the barrier publishes the block's partial stores to
+     * thread 0, whose device fence then releases them ahead of the bump (and acquires after). */
+    __syncthreads();
+    unsigned* arrived = (unsigned*)gl;
+    if (tid == 0) {
+        __threadfence();
+        arrived[0] = atomicAdd(ctr, 1u);
+        __threadfence();
+    }
+    __syncthreads();
+    if (arrived[0] != nsplit - 1u) return;
+    /* Every (m, l) once into smem, all in flight together: a per-thread loop over L2 loads here
+     * serializes nsplit round trips and cost the B=1 step more than the FLASH_MERGE it replaces. */
+    const size_t row0 = (size_t)b * n_head + h0;
+    float2* mls = (float2*)go; /* [GF][nsplit] */
+    for (unsigned i = tid; i < GF * nsplit; i += PLOW_NV_THREADS)
+        mls[i] = __ldcg((const float2*)mlpart + row0 * nsplit + i);
+    __syncthreads();
+    for (unsigned i = tid; i < GF * (unsigned)D; i += PLOW_NV_THREADS) {
+        const unsigned g = i / D, d = i % D;
+        const float2* m2 = mls + g * nsplit;
+        float M = FA_NEG_INF;
+        for (unsigned s = 0; s < nsplit; s++) M = fmaxf(M, m2[s].x);
+        const float* op = Opart + (row0 + g) * nsplit * D + d;
+        float acc = 0.0f, L = 0.0f;
+#pragma unroll 4
+        for (unsigned s = 0; s < nsplit; s++) {
+            const float w = FA_EXP(m2[s].x - M);
+            acc = fmaf(__ldcg(op + (size_t)s * D), w, acc);
+            L = fmaf(m2[s].y, w, L);
+        }
+        out[(row0 + g) * D + d] = __float2bfloat16(L > 0.0f ? acc / L : 0.0f);
+    }
+    if (tid == 0) atomicExch(ctr, 0u);
+}
+
 
 
 /* Persistent-grid body: this block runs work items `slice, slice+nblk, ...`.
@@ -728,6 +882,96 @@ __device__ __forceinline__ void fa_decode_qk_mma(float* scores, const __nv_bfloa
 #ifndef PLOW_NV_KVBOUNDS
 #define PLOW_NV_KVBOUNDS 0
 #endif
+/* hd64, one query head per KV head (GF 1: Chatterbox T3). The tile body's per-thread K row is 8
+ * dependent-address 16 B loads 128 B apart per lane, and every 256-row tile pays ~8 block
+ * barriers for the softmax, so a <=256-row split item is barrier/latency bound (T3 B=128 ctx 800:
+ * FlashDecode 1.93 TB/s, 58% of the step). Here 8 lanes own one row (16 B each: a warp load is 4
+ * whole contiguous rows, K and V issued together), every 8-lane group runs its own online softmax
+ * over rows g, g+32, ... of the item, and the 32 group states fold once per item through smem.
+ * Same (Opart, mlpart) contract as the tile body; the sum order differs (not bit-identical). */
+#ifndef PLOW_NV_FA_D64W
+#define PLOW_NV_FA_D64W 1
+#endif
+__device__ __forceinline__ void fa_decode_d64_item(float* __restrict__ op, float* __restrict__ ml,
+                                                   const __nv_bfloat16* __restrict__ q,
+                                                   const __nv_bfloat16* __restrict__ kbase,
+                                                   const __nv_bfloat16* __restrict__ vbase,
+                                                   unsigned lo, unsigned hi, unsigned kv_mask,
+                                                   float scale, float* lds) {
+    constexpr int U = 4; /* rows per group in flight; 8 measured no better (T3 B=2..128) */
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned sub = lane & 7u, grp = warp * 4u + (lane >> 3); /* 32 groups of 8 lanes */
+    float qf[8];
+    {
+        const bf16v8 q8 = ld_glob8(q + sub * 8u);
+#pragma unroll
+        for (int i = 0; i < 8; i++) qf[i] = __bfloat162float(q8.x[i]) * FA_SCALE(scale);
+    }
+    float m = FA_NEG_INF, l = 0.0f, o[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) o[i] = 0.0f;
+    /* Group g takes rows lo + g + 32*j: a warp's 4 groups read 4 consecutive rows (512 B). The
+     * trip count is block-uniform: the lane reductions below are full-warp shuffles. */
+    for (unsigned base = lo; base < hi; base += 32u * U) {
+        const unsigned r0 = base + grp;
+        bf16v8 k8[U], v8[U];
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            const unsigned r = min(r0 + 32u * (unsigned)u, hi - 1u);
+            const size_t off = (size_t)(r & kv_mask) * 64u + sub * 8u;
+            k8[u] = ld_glob8_cs(kbase + off);
+            v8[u] = ld_glob8_cs(vbase + off);
+        }
+        float sc[U];
+        float mx = m;
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            float d = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; i++) d = fmaf(__bfloat162float(k8[u].x[i]), qf[i], d);
+            d += __shfl_xor_sync(0xffffffffu, d, 1, 32);
+            d += __shfl_xor_sync(0xffffffffu, d, 2, 32);
+            d += __shfl_xor_sync(0xffffffffu, d, 4, 32);
+            sc[u] = d;
+            if (r0 + 32u * (unsigned)u < hi) mx = fmaxf(mx, d);
+        }
+        const float corr = FA_EXP(m - mx);
+        l *= corr;
+#pragma unroll
+        for (int i = 0; i < 8; i++) o[i] *= corr;
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            const float pw = r0 + 32u * (unsigned)u < hi ? FA_EXP(sc[u] - mx) : 0.0f;
+            l += pw;
+#pragma unroll
+            for (int i = 0; i < 8; i++) o[i] = fmaf(pw, __bfloat162float(v8[u].x[i]), o[i]);
+        }
+        m = mx;
+    }
+    float* go = lds;              /* [32][64] */
+    float* gm = lds + 32 * 64;    /* [32] */
+    float* gl = gm + 32;          /* [32] */
+    __syncthreads(); /* the previous item's fold has read go/gm/gl */
+#pragma unroll
+    for (int i = 0; i < 8; i++) go[grp * 64u + sub * 8u + i] = o[i];
+    if (sub == 0) { gm[grp] = m; gl[grp] = l; }
+    __syncthreads();
+    if (tid < 64u) {
+        float M = FA_NEG_INF;
+#pragma unroll 8
+        for (int g = 0; g < 32; g++) M = fmaxf(M, gm[g]);
+        float acc = 0.0f, L = 0.0f;
+#pragma unroll 8
+        for (int g = 0; g < 32; g++) {
+            const float w = FA_EXP(gm[g] - M);
+            acc = fmaf(go[g * 64 + tid], w, acc);
+            L = fmaf(gl[g], w, L);
+        }
+        op[tid] = acc;
+        if (tid == 0) { ml[0] = M; ml[1] = L; }
+    }
+}
+
 template <int D, int GF, bool FP8KV = false, bool SZKV = false, bool SLOTMAP = false>
 __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                const __nv_bfloat16* __restrict__ Q,
@@ -739,7 +983,13 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                unsigned nblk, float* lds, unsigned kv_cap = 0,
                                const float* __restrict__ k_scale = nullptr,
                                const float* __restrict__ v_scale = nullptr,
-                               const int* __restrict__ decode_slot = nullptr) {
+                               const int* __restrict__ decode_slot = nullptr,
+                               __nv_bfloat16* __restrict__ out = nullptr,
+                               unsigned* __restrict__ merge_ctr = nullptr) {
+    constexpr bool RG = PLOW_NV_FA_RG && D == 128 && GF >= 2 && GF <= 4 && !FP8KV && !SZKV;
+    if constexpr (!RG) {
+        if (out) __trap(); /* a merge-folded packet needs the row-group body */
+    }
     /* A work item carries GF CONSECUTIVE query heads sharing one KV head (needs GF | gqa).
      * Indexing by head-GROUP, not by kv_head, is what makes GF < gqa correct. */
     static_assert(GF <= (int)PLOW_NV_WARPS || (PLOW_NV_FA_GF16_BENCH && GF == 16), "unsupported decode GQA grouping");
@@ -799,6 +1049,18 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         const size_t kv_batch = slot;
         const __nv_bfloat16* kbase = K + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * D;
         const __nv_bfloat16* vbase = V + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * D;
+        if constexpr (PLOW_NV_FA_D64W && D == 64 && GF == 1 && !FP8KV && !SZKV) {
+            const size_t oi = (size_t)(b * n_head + h0) * nsplit + sp;
+            fa_decode_d64_item(Opart + oi * D, mlpart + oi * 2, Q + ((size_t)b * n_head + h0) * D,
+                               kbase, vbase, lo, hi, kv_mask, scale, lds);
+            continue;
+        }
+        if constexpr (RG) {
+            fa_decode_rg_item<D, GF>(Opart, mlpart, out, Q, kbase, vbase, b, n_head, h0, nsplit,
+                                     sp, lo, hi, kv_mask, scale, lds,
+                                     merge_ctr ? merge_ctr + b * n_grp + hg : nullptr);
+            continue;
+        }
         /* FP8 KV: the cache is uint8 e4m3 (1 byte/elem, HALF the bytes) + a PER-ROW f32 scale, in
          * the SAME head-major RING layout. These byte bases and the per-(kv_head) scale slice are
          * unused on the bf16 instantiation (FP8KV=false compiles them out). */
@@ -1299,6 +1561,31 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                             for (int u = 0; u < 8; u++)
                                 oacc[g][u] = fmaf(pw, __bfloat162float(vv[c].x[u]), oacc[g][u]);
                         }
+                }
+            }
+            if constexpr (!FP8KV && !SZKV) {
+                /* The ragged last batch (at most VU-1 rows) with its loads still in flight: a
+                 * row past rmax re-reads the tile's last live row (in bounds, finite) at weight
+                 * 0 and adds exactly +0, so the sum is unchanged. The one-row loop below kept a
+                 * single load in flight; at hd64 GF1 a <=224-row split item is ALL tail. */
+                if (r < rmax) {
+                    bf16v8 vv[VU];
+#pragma unroll
+                    for (int c = 0; c < VU; c++) {
+                        const unsigned rc = min(r + (unsigned)c * NG, rmax - 1u);
+                        vv[c] = ld_glob8_cs(vbase + (size_t)((kv0 + rc) & kv_mask) * D + dbase);
+                    }
+#pragma unroll
+                    for (int c = 0; c < VU; c++)
+#pragma unroll
+                        for (int g = 0; g < GF; g++) {
+                            const unsigned rc = r + (unsigned)c * NG;
+                            const float pw = rc < rmax ? Ssm[g * FA_DEC_TILE + rc] : 0.0f;
+#pragma unroll
+                            for (int u = 0; u < 8; u++)
+                                oacc[g][u] = fmaf(pw, __bfloat162float(vv[c].x[u]), oacc[g][u]);
+                        }
+                    r = rmax;
                 }
             }
             for (; r < rmax; r += NG) {
