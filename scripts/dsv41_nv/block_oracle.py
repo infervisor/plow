@@ -163,7 +163,8 @@ def ref_decode(layer, lens, steps, outdir, attn_only):
 
         def post_first(*a, **k):
             y = orig_post(*a, **k)
-            cap.setdefault("attn", y)
+            if "attn" not in cap:
+                cap["attn"], cap["post"], cap["comb"] = y, a[2], a[3]
             return y
 
         blk.hc_post = post_first
@@ -180,7 +181,26 @@ def ref_decode(layer, lens, steps, outdir, attn_only):
             cap.clear()
             npy_write(os.path.join(outdir, f"pre_{bi}.npy"), h[0].reshape(-1, h.shape[-1]).float().cpu().numpy())
             state.append(bufs())
+        orig_sa, seen = mr.sparse_attn, []
+
+        def sa_first(q, kv, sink, idx, scale):
+            o = orig_sa(q, kv, sink, idx, scale)
+            seen.append((q.detach().clone(), idx.detach().clone(), o.detach().clone()))
+            return o
+
+        orig_attn, attn_out = blk.attn.forward, []
+
+        def attn_first(*a, **k):
+            y = orig_attn(*a, **k)
+            if mr.sparse_attn is sa_first:
+                attn_out.append(y.detach().clone())
+            return y
+
+        blk.attn.forward = attn_first
+
+        mixes = []
         for s in range(steps):
+            mr.sparse_attn = sa_first if s == 0 else orig_sa
             xs, ys = [], []
             for bi, t in enumerate(lens):
                 for n, b in blk.named_buffers():
@@ -192,11 +212,27 @@ def ref_decode(layer, lens, steps, outdir, attn_only):
                 out, _ = blk(h, t + s, mr.make_identity_pre_mix(h, hc), None)
                 if attn_only:
                     out = cap["attn"]
+                    if s == 0:
+                        mixes.append((cap["post"].reshape(1, -1).float(), cap["comb"].reshape(1, -1).float()))
                 state[bi] = bufs()
                 xs.append(h[0].reshape(-1, h.shape[-1]))
                 ys.append(out[0].reshape(-1, out.shape[-1]))
             npy_write(os.path.join(outdir, f"dec_x_{s}.npy"), torch.cat(xs).float().cpu().numpy())
             npy_write(os.path.join(outdir, f"dec_ref_{s}.npy"), torch.cat(ys).float().cpu().numpy())
+            if s == 0:  # step-0 attention internals, slot-major: q (roped), o (before inverse rope), topk rows
+                for name, k in (("q", 0), ("o", 2)):
+                    npy_write(os.path.join(outdir, f"ref0_{name}.npy"),
+                              torch.cat([t[k].reshape(-1, t[k].shape[-1]) for t in seen]).float().cpu().numpy())
+                for k, name in ((0, "post"), (1, "comb")):
+                    if mixes:
+                        npy_write(os.path.join(outdir, f"ref0_{name}.npy"), torch.cat([m[k] for m in mixes]).cpu().numpy())
+                npy_write(os.path.join(outdir, "ref0_attn.npy"),
+                          torch.cat([t.reshape(-1, t.shape[-1]) for t in attn_out]).float().cpu().numpy())
+                wid = max(t[1].numel() for t in seen)
+                npy_write(os.path.join(outdir, "ref0_idx.npy"),
+                          torch.cat([torch.nn.functional.pad(t[1].reshape(1, -1), (0, wid - t[1].numel()), value=-1)
+                                     for t in seen]).float().cpu().numpy())
+        mr.sparse_attn = orig_sa
     json.dump({"layer": layer, "lens": lens, "steps": steps, "attn_only": attn_only}, open(os.path.join(outdir, "decode.json"), "w"))
     print(f"wrote {outdir}: lens={lens} steps={steps} attn_only={attn_only}")
 
