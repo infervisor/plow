@@ -1006,7 +1006,7 @@ fn the_routed_experts_run_glms_prefill_body_at_v41_shapes() {
     // The shared expert is emitted separately (block-FP8, op 198); the MoE body only combines it.
     let sh = b.tensor("act.shared", (t as u64) * (cfg.hidden as u64) * 2);
     super::dsv41::emit_dsv41_moe(
-        &mut b, &cfg, &w, 0, tp, t, x_out, xn2, c_norm, (sh, c_norm), &mut xgate, &all, cfg.hidden,
+        &mut b, &cfg, &w, 0, tp, t, x_out, xn2, c_norm, (sh, c_norm), &mut xgate, &all, cfg.hidden, t,
     );
     let p = b.finish();
 

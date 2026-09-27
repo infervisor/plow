@@ -315,6 +315,89 @@ mod cuda {
             (i.name.clone(), fixed.max(1) as usize)
         });
         let hidden = desc.hidden as usize;
+        // `--decode-dir`: decode-check on every rank (oracle ref_decode files), rank 0's output written.
+        if let Some(dir) = flag("--decode-dir") {
+            let dir = PathBuf::from(dir);
+            let out_tensor = flag("--out-tensor").ok_or("tp-check --decode-dir needs --out-tensor")?;
+            let chunk: usize = flag("--pf-chunk").and_then(|v| v.parse().ok()).unwrap_or(1024);
+            let mut pre = Vec::new();
+            while dir.join(format!("pre_{}.npy", pre.len())).exists() {
+                pre.push(npy::read_f32(&dir.join(format!("pre_{}.npy", pre.len())))?.1);
+            }
+            let mut xs = Vec::new();
+            while dir.join(format!("dec_x_{}.npy", xs.len())).exists() {
+                xs.push(npy::read_f32(&dir.join(format!("dec_x_{}.npy", xs.len())))?.1);
+            }
+            let (nb, steps) = (pre.len(), xs.len());
+            let barrier = Barrier::new(n);
+            let dumps = flag("--dump-tensors");
+            let (group, pre, xs, barrier, in_name, out_tensor, dumps, dir) = (&group, &pre, &xs, &barrier, &in_name, &out_tensor, &dumps, &dir);
+            // Every launch meets its peers in the collectives: all ranks enter it with zeroed counters.
+            let fence = |rank: usize| -> Result<(), plowrt::RuntimeError> {
+                barrier.wait();
+                if rank == 0 {
+                    group.zero_xctr()?;
+                }
+                barrier.wait();
+                Ok(())
+            };
+            let outs: Vec<Vec<Vec<f32>>> = std::thread::scope(|s| {
+                let hs: Vec<_> = engines
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(rank, e)| {
+                        s.spawn(move || -> Result<Vec<Vec<f32>>, plowrt::RuntimeError> {
+                            let mut last = vec![0u32; nb];
+                            for (b, x) in pre.iter().enumerate() {
+                                let t = x.len() / (mult * hidden);
+                                let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
+                                e.begin_slot(b, t + steps + 2)?;
+                                let mut c0 = 0;
+                                last[b] = loop {
+                                    let rows = chunk.min(t - c0) * mult * hidden;
+                                    e.upload_activation(in_name, &x[c0 * mult * hidden..][..rows])?;
+                                    c0 += chunk;
+                                    fence(rank)?;
+                                    if let plowrt::exec::gpu::PrefillStep::Done(tok) = e.prefill_chunk(b, &prompt, chunk)? {
+                                        break tok;
+                                    }
+                                };
+                            }
+                            let mut outs = Vec::new();
+                            let mut toks = Vec::new();
+                            for x in xs {
+                                e.upload_activation(in_name, x)?;
+                                let feeds: Vec<_> = last.iter().enumerate().map(|(b, &tk)| (b, tk)).collect();
+                                fence(rank)?;
+                                let t0 = Instant::now();
+                                e.step_slots(&feeds, &mut toks)?;
+                                if rank == 0 {
+                                    println!("tp-decode: step B={nb} {:.3} ms", t0.elapsed().as_secs_f64() * 1e3);
+                                }
+                                last.copy_from_slice(&toks[..nb]);
+                                outs.push(e.download_activation(out_tensor)?[..nb * mult * hidden].to_vec());
+                                if rank == 0 && outs.len() == 1 {
+                                    for name in dumps.iter().flat_map(|n| n.split(',')) {
+                                        let mut raw = vec![0u8; e.tensor_bytes(name).expect("unknown dump tensor") as usize];
+                                        e.read_tensor(name, &mut raw)?;
+                                        std::fs::write(dir.join(format!("plow0_{name}.bin")), raw).expect("dump write");
+                                    }
+                                }
+                            }
+                            Ok(outs)
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().expect("run thread")).collect::<Result<Vec<_>, _>>()
+            })?;
+            for (st, o) in outs[0].iter().enumerate() {
+                let same = outs.iter().all(|r| r[st] == *o);
+                let bad = o.iter().filter(|v| !v.is_finite()).count();
+                npy::write_f32(&dir.join(format!("dec_plow_{st}.npy")), &[nb * mult, hidden], o)?;
+                println!("tp-decode: step {st} ranks identical={same} nonfinite={bad}");
+            }
+            return Ok(());
+        }
         let (t, xin) = if let Some(p) = flag("--in") {
             let (shape, data) = npy::read_f32(Path::new(&p))?;
             assert_eq!(shape.len(), 2, "--in must be [rows, hidden]");

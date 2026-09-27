@@ -1668,6 +1668,8 @@ pub(crate) fn emit_dsv41_moe(
     xgate: &mut u32,
     cus: &[u32],
     peer_w: u32,
+    // Rows of the blob's LARGEST program: slot B's offset is one value for every program.
+    slot_t: u32,
 ) -> u32 {
     let shared_pre = Some(shared.1);
     assert_eq!(
@@ -1762,7 +1764,7 @@ pub(crate) fn emit_dsv41_moe(
     n.fu_scale = sc.fu_scale;
     // The UNIT, not this op's width: see `dsv41_peer_width`. The combine writes `t * hidden * 2`
     // at this offset either way; what changes is where slot B begins.
-    n.slot_b = (t as u64 * peer_w as u64 * 2) as u32;
+    n.slot_b = (slot_t as u64 * peer_w as u64 * 2) as u32;
     super::emit_glm_moe_ffn_prefill(
         b,
         &gc,
@@ -2990,7 +2992,7 @@ pub(crate) fn emit_dsv41_block(
         );
         let c_moe = emit_dsv41_moe(
             &mut b, c, &w, l, tp, t, xnext, ffn.xn, c_sh, (ffn.sh_part, c_sh), &mut xgate, &all,
-            peer_w,
+            peer_w, t,
         );
         // CAPTURED, not discarded: it is the next layer's only dependency, and the thing that
         // makes the chain a chain rather than 40 layers racing on one residual buffer.
@@ -3049,6 +3051,7 @@ pub(crate) fn emit_dsv41_block(
             layers,
             tp,
             ctx,
+            t,
             pos,
             (cos, sin),
             (cos_c, sin_c),
@@ -3153,6 +3156,7 @@ fn emit_dsv41_decode_program(
     layers: &[u32],
     tp: u32,
     ctx: u32,
+    slot_t: u32,
     pos: u32,
     (cos, sin): (u32, u32),
     (cos_c, sin_c): (u32, u32),
@@ -3160,6 +3164,7 @@ fn emit_dsv41_decode_program(
 ) -> &'static str {
     let bsz = st.dbatch;
     let all = b.all();
+    let peer_w = dsv41_peer_width(c, layers);
     let mhc = declare_dsv41_mhc(b, c, bsz, tp);
     let engram = declare_dsv41_engram(b, c, layers, bsz);
     let compress = declare_dsv41_compress(b, c, layers, bsz, ctx);
@@ -3209,8 +3214,23 @@ fn emit_dsv41_decode_program(
             deps = vec![c_post];
             continue;
         }
-        panic!("PLOW_DSV41_DECODE=full: the routed-MoE decode op is not wired yet; use `attn`");
+        let c_pre2 = emit_dsv41_mhc_pre(b, c, w, &mhc, l, true, ri, pi, bsz, tp, &[c_post]);
+        pi += 1;
+        let (ffn, c_sh) = emit_dsv41_ffn_shared(b, c, w, &all, l, tp, mhc.layer_input, bsz, &[c_pre2]);
+        let xnext = b.tensor("act.xnext", bsz as u64 * c.hidden as u64 * 2);
+        let c_moe = emit_dsv41_moe(b, c, w, l, tp, bsz, xnext, ffn.xn, c_sh, (ffn.sh_part, c_sh), &mut xgate, &all, peer_w, slot_t);
+        let c_layer = emit_dsv41_mhc_post(b, c, &mhc, xnext, ri, bsz, tp, &[c_moe]);
+        ri ^= 1;
+        deps = vec![c_layer];
     }
+    // The decode arm of op 85 reduces K-split items through scratch + self-resetting counters (t6).
+    let n_cu = all.len() as u64;
+    let scratch = b.tensor("act.moe_dec_scratch", (2 * n_cu * 8 * 512 + n_cu * 8) * 4);
+    b.for_each_inst_mut(|d| {
+        if d.op == DevOp::MoeGroupGluPf as u16 {
+            d.t[6] = scratch;
+        }
+    });
     if ri == 0 { "act.hc_residual_a" } else { "act.hc_residual_b" }
 }
 

@@ -197,6 +197,23 @@ def ref_decode(layer, lens, steps, outdir, attn_only):
             return y
 
         blk.attn.forward = attn_first
+        ffn_cap = {k: [] for k in ("ffn_in", "ffn_out", "ffn_idx", "ffn_w", "ffn_sh")}
+        orig_ffn, orig_gate, orig_sh = blk.ffn.forward, blk.ffn.gate.forward, blk.ffn.shared_experts.forward
+
+        def on(f, keys):
+            def g(*a, **k):
+                y = f(*a, **k)
+                if mr.sparse_attn is sa_first:
+                    for key, v in zip(keys, y if isinstance(y, tuple) else (y,)):
+                        ffn_cap[key].append(v.detach().reshape(1 if key != "ffn_in" else -1, -1).float().clone())
+                    if keys == ("ffn_out",):
+                        ffn_cap["ffn_in"].append(a[0].detach().reshape(1, -1).float().clone())
+                return y
+            return g
+
+        blk.ffn.forward = on(orig_ffn, ("ffn_out",))
+        blk.ffn.gate.forward = on(orig_gate, ("ffn_w", "ffn_idx"))
+        blk.ffn.shared_experts.forward = on(orig_sh, ("ffn_sh",))
 
         mixes = []
         for s in range(steps):
@@ -226,6 +243,9 @@ def ref_decode(layer, lens, steps, outdir, attn_only):
                 for k, name in ((0, "post"), (1, "comb")):
                     if mixes:
                         npy_write(os.path.join(outdir, f"ref0_{name}.npy"), torch.cat([m[k] for m in mixes]).cpu().numpy())
+                for key, v in ffn_cap.items():
+                    if v:
+                        npy_write(os.path.join(outdir, f"ref0_{key}.npy"), torch.cat(v).cpu().numpy())
                 npy_write(os.path.join(outdir, "ref0_attn.npy"),
                           torch.cat([t.reshape(-1, t.shape[-1]) for t in attn_out]).float().cpu().numpy())
                 wid = max(t[1].numel() for t in seen)
