@@ -1545,10 +1545,17 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 #endif
 #if !PLOW_NV_PREFILL && defined(PLOW_NV_HOPPER) && defined(PLOW_HAS_GEMM) && PLOW_HAS_GEMM
-    /* Decode-rung bf16 projections with no GEMV op of their own (V4.1 indexer wk / weights_proj):
-     * the prefill wgmma body at rows = rung batch. Mapless only; needs its full staging arena. */
+    /* Decode-rung bf16 projections with no GEMV op of their own (V4.1 indexer wk / weights_proj).
+     * M <= 8: warp-per-output GEMV (one wgmma tile would put all of K on one block). Larger rungs:
+     * the prefill wgmma body at rows = rung batch. Mapless only; the wgmma needs its full arena. */
     case PLOW_DOP_GEMM:
-        if (PLOW_NV_ARENA_FLOATS * sizeof(float) < PGM90_ARENA * sizeof(__nv_bfloat16) || in->i[6] || in->i[7]) __trap();
+        if (in->i[6] || in->i[7]) __trap();
+        if (in->i[0] <= 8u) {
+            d_gemv((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1],
+                   in->i[2], slice, nblk);
+            break;
+        }
+        if (PLOW_NV_ARENA_FLOATS * sizeof(float) < PGM90_ARENA * sizeof(__nv_bfloat16)) __trap();
         d_gemm_sm90((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1],
                     in->i[2], in->i[4], slice, nblk, (__nv_bfloat16*)arena);
         break;
