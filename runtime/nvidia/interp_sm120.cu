@@ -422,6 +422,16 @@ __device__ unsigned      g_tr_wait[PLOW_TRACE_MAX];
 __device__ unsigned long long g_tr_gate[PLOW_TRACE_MAX];
 __device__ unsigned long long g_tr_body[PLOW_TRACE_MAX];
 __device__ unsigned long long g_tr_sig[PLOW_TRACE_MAX];
+/* Per-instruction wall span over ALL blocks (%globaltimer ns): g_sp_lo holds ~min(body start),
+ * g_sp_hi max(body end), so both are zero-initialised and updated by atomicMax. */
+#define PLOW_SPAN_MAX 1024
+__device__ unsigned long long g_sp_lo[PLOW_SPAN_MAX];
+__device__ unsigned long long g_sp_hi[PLOW_SPAN_MAX];
+__device__ __forceinline__ unsigned long long plow_gtimer() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+    return t;
+}
 #endif
 #if !PLOW_NV_PTXSYNC
 /* Release before signal / acquire after the gate — one device-scope fence, exactly where
@@ -3406,6 +3416,7 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         __syncthreads(); /* every counter in the list is now satisfied */
 #if PLOW_NV_TRACE
         if (tr) t_gate1 = clock64();
+        if (threadIdx.x == 0 && e.inst < PLOW_SPAN_MAX) atomicMax(&g_sp_lo[e.inst], ~plow_gtimer());
 #endif
 
 #if PLOW_NV_PTXSYNC == 1 || PLOW_NV_PTXSYNC == 3
@@ -3458,6 +3469,7 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         __syncthreads(); /* retire this block's stores before the release */
 #if PLOW_NV_TRACE
         if (tr) t_body1 = clock64();
+        if (threadIdx.x == 0 && e.inst < PLOW_SPAN_MAX) atomicMax(&g_sp_hi[e.inst], plow_gtimer());
 #endif
 
 #if PLOW_NV_PTXSYNC != 1 && PLOW_NV_PTXSYNC != 3

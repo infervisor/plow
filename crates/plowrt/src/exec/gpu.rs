@@ -10580,6 +10580,25 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// Per-instruction wall spans `(start_ns, end_ns)` of the decode module's launches since
+    /// [`Self::trace_spans_reset`] (`-DPLOW_NV_TRACE=1`); `None` on a normal cubin.
+    pub fn trace_spans(&self) -> Result<Option<Vec<(u64, u64)>>> {
+        let (mut lo, mut hi) = (Vec::new(), Vec::new());
+        if !self.be.module_global_bytes(&self.module, "g_sp_lo", 8192, &mut lo)?
+            || !self.be.module_global_bytes(&self.module, "g_sp_hi", 8192, &mut hi)?
+        {
+            return Ok(None);
+        }
+        let u = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap());
+        Ok(Some(lo.chunks(8).zip(hi.chunks(8)).map(|(l, h)| (!u(l), u(h))).collect()))
+    }
+
+    pub fn trace_spans_reset(&self) -> Result<()> {
+        self.be.module_global_zero(&self.module, "g_sp_lo", 8192)?;
+        self.be.module_global_zero(&self.module, "g_sp_hi", 8192)?;
+        Ok(())
+    }
+
     /// [`Self::trace_summary`] against the PREFILL module (`-DPLOW_NV_TRACE=1`
     /// on the `_pf` build): block-0 per-packet gate/body/signal by opcode.
     /// `Ok(None)` when there is no prefill module or it carries no trace.

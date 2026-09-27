@@ -329,6 +329,7 @@ mod cuda {
                 xs.push(npy::read_f32(&dir.join(format!("dec_x_{}.npy", xs.len())))?.1);
             }
             let (nb, steps) = (pre.len(), xs.len());
+            let iters: usize = flag("--dec-iters").and_then(|v| v.parse().ok()).unwrap_or(0);
             let barrier = Barrier::new(n);
             let dumps = flag("--dump-tensors");
             let (group, pre, xs, barrier, in_name, out_tensor, dumps, dir) = (&group, &pre, &xs, &barrier, &in_name, &out_tensor, &dumps, &dir);
@@ -351,7 +352,7 @@ mod cuda {
                             for (b, x) in pre.iter().enumerate() {
                                 let t = x.len() / (mult * hidden);
                                 let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
-                                e.begin_slot(b, t + steps + 2)?;
+                                e.begin_slot(b, t + steps + iters + 2)?;
                                 let mut c0 = 0;
                                 last[b] = loop {
                                     let rows = chunk.min(t - c0) * mult * hidden;
@@ -381,6 +382,37 @@ mod cuda {
                                         let mut raw = vec![0u8; e.tensor_bytes(name).expect("unknown dump tensor") as usize];
                                         e.read_tensor(name, &mut raw)?;
                                         std::fs::write(dir.join(format!("plow0_{name}.bin")), raw).expect("dump write");
+                                    }
+                                }
+                            }
+                            let mut ms = Vec::with_capacity(iters);
+                            e.trace_reset()?;
+                            for _ in 0..iters {
+                                let feeds: Vec<_> = last.iter().enumerate().map(|(b, &tk)| (b, tk)).collect();
+                                fence(rank)?;
+                                let t0 = Instant::now();
+                                e.step_slots(&feeds, &mut toks)?;
+                                ms.push(t0.elapsed().as_secs_f64() * 1e3);
+                                last.copy_from_slice(&toks[..nb]);
+                            }
+                            if rank == 0 && iters > 0 {
+                                let mean = ms.iter().sum::<f64>() / iters as f64;
+                                let min = ms.iter().cloned().fold(f64::MAX, f64::min);
+                                println!("tp-decode: {iters} timed steps B={nb} mean {mean:.3} ms min {min:.3} ms");
+                                if let Some(tr) = e.trace_summary()? {
+                                    println!("tp-decode trace: {tr}");
+                                }
+                            }
+                            if iters > 0 {
+                                // One more step, spans only: the per-instruction critical path.
+                                let feeds: Vec<_> = last.iter().enumerate().map(|(b, &tk)| (b, tk)).collect();
+                                fence(rank)?;
+                                e.trace_spans_reset()?;
+                                e.step_slots(&feeds, &mut toks)?;
+                                if let (0, Some(sp)) = (rank, e.trace_spans()?) {
+                                    let t0 = sp.iter().filter(|s| s.1 > 0).map(|s| s.0).min().unwrap_or(0);
+                                    for (i, (a, b)) in sp.iter().enumerate().filter(|(_, s)| s.1 > 0) {
+                                        println!("span {i:4} start {:8.1} us  end {:8.1} us  dur {:7.1} us", (a - t0) as f64 / 1e3, (b - t0) as f64 / 1e3, (b - a) as f64 / 1e3);
                                     }
                                 }
                             }
