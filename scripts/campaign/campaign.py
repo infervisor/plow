@@ -556,7 +556,8 @@ def cmd_build(a: argparse.Namespace) -> None:
     print(f"built {assets}\nrecord {out / 'build-record.json'}", file=sys.stderr)
     # With the GPU on this box, select the exact-shape cuBLASLt algorithms now and packetize
     # them (leased); without it, plowc has already packetized the tune store's rows.
-    if not a.no_probe and (assets / "build.json").exists() and gpu_matches(cell.get("gpu", "")):
+    # Speech/ASR recipes carry no completion gate to probe against.
+    if not a.no_probe and "gate_prompt" in r.get("bench", {}) and (assets / "build.json").exists() and gpu_matches(cell.get("gpu", "")):
         if (assets / "cublaslt_algos.jsonl").exists():
             print("probe: table already packetized from the tune store; skipping", file=sys.stderr)
         else:
