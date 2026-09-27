@@ -1069,6 +1069,16 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             //   per k-step (op_gemv_mma.cuh): 12B B=1/4/16 10.99/11.70/14.25 -> 10.92/11.60/13.94.
             t.insert("gemv_mma_pair".into(), json!(1));
         }
+        // * `gemv_wide`: rungs past GV_MM_MAX stream the weights once on wgmma
+        //   (op_gemv_wide_sm90.cuh) instead of ceil(B / 32) mma.sync passes. Its split-K tiles are
+        //   written by other blocks than their owner, so only dense packets (coarse gates) take it.
+        if s.moe_down_inter == 0
+            && !s.moe_dec_group
+            && s.decode_batch > 32
+            && s.decode_gemv_k.iter().all(|k| k % 64 == 0)
+        {
+            t.insert("gemv_wide".into(), json!(1));
+        }
     }
     // * `fa_spart`: decode attention parks its score partials in smem (op_attention.cuh,
     //   PLOW_NV_FA_SPART) and holds 8 hd256 rows in flight. 12B 11.03/11.45/11.98/13.04/15.24 ->
@@ -1104,6 +1114,11 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     //   claim change), so it rides in `tuning` and the pairing hash.
     if let Some(v) = crate::emit_config::active().fa_mmaqk.filter(|v| *v != 0) {
         t.insert("fa_mmaqk".into(), json!(v));
+    } else if sm90a && s.moe_down_inter == 0 && s.gqa >= 2 && s.hd.iter().all(|&d| d <= 128) {
+        // * `fa_mmaqk` bit 2: hd64/hd128 decode scores on the tensor cores. h100 step_bench ms at
+        //   B=1/8/32 ctx 1024, Veena (hd128, GQA 3): 3.648/4.858/6.881 -> 3.514/4.513/6.405;
+        //   ctx 1900: 3.770/5.415/8.171 -> 3.615/4.978/7.518.
+        t.insert("fa_mmaqk".into(), json!(4));
     }
     t
 }
@@ -2837,6 +2852,9 @@ pub fn config_header(manifest: &Value) -> String {
             }
             if t.get("gemv_mma_pair").is_some() {
                 out.push_str("#ifndef PLOW_NV_GEMV_MMA_PAIR\n#define PLOW_NV_GEMV_MMA_PAIR 1\n#endif\n");
+            }
+            if t.get("gemv_wide").is_some() {
+                out.push_str("#ifndef PLOW_NV_GEMV_WIDE\n#define PLOW_NV_GEMV_WIDE 1\n#endif\n");
             }
             if t.get("fa_tc_hd512").is_some() {
                 out.push_str(

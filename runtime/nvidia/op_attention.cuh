@@ -159,10 +159,12 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #define PLOW_NV_FA_MMAQK_DEPTH 8
 #endif
 /* Bit 0: hd256. Bit 1: hd512, where it replaces the staged-K score of PLOW_NV_FA_TC_GQA8_HD512
- * (whose P.V stays). */
+ * (whose P.V stays). Bit 2: hd64/hd128 with GF 2..8 (the per-thread score row there is 32
+ * scattered sectors per warp load; at GF 1 seven eighths of the mma is padding). */
 #define FA_DEC_MMAQK(D, GF)                                                                    \
-    (((((PLOW_NV_FA_MMAQK) & 1) && (D) == 256) || (((PLOW_NV_FA_MMAQK) & 2) && (D) == 512)) && \
-     ((GF) == 2 || (GF) == 4 || (GF) == 8 || (GF) == 16))
+    ((((((PLOW_NV_FA_MMAQK) & 1) && (D) == 256) || (((PLOW_NV_FA_MMAQK) & 2) && (D) == 512)) && \
+      ((GF) == 2 || (GF) == 4 || (GF) == 8 || (GF) == 16)) ||                                  \
+     (((PLOW_NV_FA_MMAQK) & 4) && (D) <= 128 && (D) % 32 == 0 && (GF) >= 2 && (GF) <= 8))
 /* Rows per stage of the TC P.V ring. The staged-K score walks 64-row stages, so 64 there; with
  * the mma score (bit 1) the ring only feeds P.V and 32 halves the claim (hd512/GF8 154 -> 91 KiB),
  * which the dense 12B pays for in L1: p12m B=1/4/16 ctx 1024 10.663/11.204/13.384 -> 10.591/
@@ -703,8 +705,10 @@ __device__ __forceinline__ void fa_decode_qk_mma(float* scores, const __nv_bfloa
             if (8u * hs + 2u * t < (unsigned)GF) {
                 float* s0 = scores + (8u * hs + 2u * t) * FA_DEC_TILE;
                 float* s1 = s0 + FA_DEC_TILE;
-                if (r0 < rmax) { s0[r0] = acc[hs][0] * sc; s1[r0] = acc[hs][1] * sc; }
-                if (r1 < rmax) { s0[r1] = acc[hs][2] * sc; s1[r1] = acc[hs][3] * sc; }
+                /* Odd GF: head 2t+1 == GF is past the score rows. */
+                const bool h1 = 8u * hs + 2u * t + 1u < (unsigned)GF;
+                if (r0 < rmax) { s0[r0] = acc[hs][0] * sc; if (h1) s1[r0] = acc[hs][1] * sc; }
+                if (r1 < rmax) { s0[r1] = acc[hs][2] * sc; if (h1) s1[r1] = acc[hs][3] * sc; }
             }
     }
 }

@@ -61,9 +61,11 @@ PLOW_TTS_VOCODER_DIR = "{out}/prep/s3gen"
 PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
 # Speech-shaped rungs: prefill rows = voice rows + text + 2 (~200-350), so 128/256/384/512;
 # decode 1..32 slots = 16 concurrent requests as CFG pairs.
+# Decode ladder: rungs past 32 run the one-pass wide GEMV (`_gw` object); 48/96 pay 5-13% over
+# rounding up to 64/128 (Veena step_bench ctx 1024: 8.21 vs 9.08, 11.56 vs 13.28 ms), 3/6/12/24 < 3%.
 PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "256,384"
-PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
 

@@ -518,6 +518,7 @@ option(PLOW_SM120_CUBIN_SEG "Also emit the _pfseg (fat) and _pfgemm (lean occ-2)
 option(PLOW_CUBIN_PACKED_PREFILL "Emit ordinary and packet-request ABI segmented prefill pairs" OFF)
 option(PLOW_CUBIN_ROUTED_DECODE "Also emit the _routed decode cubin for cuBLASLt-routed MoE rungs" OFF)
 option(PLOW_CUBIN_SPEECH "Also emit the _speech decode cubin carrying the FP32 speech arms (ASR encoder)" OFF)
+option(PLOW_CUBIN_GEMV_WIDE "Also emit the _gw decode cubin carrying the wide-rung wgmma GEMV (sm_90a)" OFF)
 
 # GQA fusion factor for the FULL-attention (hd512) flash-decode instantiation.
 # Measured: GF_FULL should equal `gqa` when the full layers have kv_heads == 1
@@ -602,6 +603,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     # Second axis of the routed decode object: the decode axis minus the expert GEMV arms.
     set(_ax_routed -DPLOW_NV_DECODE_ROUTED=1)
     set(_ax_speech -DPLOW_NV_SPEECH=1)
+    set(_ax_gw -DPLOW_NV_GW_OBJECT=1)
     if(PLOW_NV_PF_GEMV_HEAD)
         list(APPEND _ax_prefill -DPLOW_NV_PF_GEMV_HEAD=1)
         list(APPEND _ax_seg_fat -DPLOW_NV_PF_GEMV_HEAD=1)
@@ -670,6 +672,11 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
             string(LENGTH "${_vstem}_speech" _len_speech)
             list(APPEND _cubin_rows
                 "${_vstem}_speech|_Z${_len_speech}${_vstem}_speech11PlowProgram|_ax_decode|_ax_speech")
+        endif()
+        if(PLOW_CUBIN_GEMV_WIDE AND _varch STREQUAL "sm_90a")
+            string(LENGTH "${_vstem}_gw" _len_gw)
+            list(APPEND _cubin_rows
+                "${_vstem}_gw|_Z${_len_gw}${_vstem}_gw11PlowProgram|_ax_decode|_ax_gw")
         endif()
         if(PLOW_SM120_CUBIN_FP8KV)
             list(APPEND _cubin_rows

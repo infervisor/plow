@@ -373,7 +373,10 @@ impl GpuEngine {
             let (function, smem) = match &self.routed_decode {
                 Some(routed) => (routed.function, routed.smem),
                 None if self.moe_lt_decode => (self.f, self.smem_narrow),
-                None => (self.f, self.smem),
+                None => self
+                    .gemv_wide
+                    .as_ref()
+                    .map_or((self.f, self.smem), |o| (o.function, o.smem)),
             };
             self.be.launch_cooperative(
                 role.map_or(function, |r| r.function),

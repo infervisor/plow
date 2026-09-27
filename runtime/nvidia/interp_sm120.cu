@@ -81,6 +81,24 @@ extern "C" __device__ unsigned plow_row_gather_1 = 1;
 #ifdef PLOW_CONFIG
 #include PLOW_CONFIG
 #endif
+#if defined(PLOW_NV_GW_OBJECT) && PLOW_NV_GW_OBJECT
+/* The `_gw` object runs the batched rungs (8 rows and up): the single-row GEMV kernels are dead in
+ * it, and compiled in they cost its live arms registers (the entry is one function at the cap).
+ * Veena step_bench ms at B=2/8/16/32 ctx 1024, the ordinary object with and without them:
+ * 4.289/4.517/4.822/6.471 -> 4.197/4.357/4.632/5.967. */
+#undef PLOW_NV_GEMV_XREG
+#define PLOW_NV_GEMV_XREG 0
+#undef PLOW_NV_GEMV_KPANEL
+#define PLOW_NV_GEMV_KPANEL 0
+#undef PLOW_NV_GEMV_RB
+#define PLOW_NV_GEMV_RB 0
+#undef PLOW_NV_RB_GEMV
+#define PLOW_NV_RB_GEMV 0
+#undef PLOW_NV_RB_QKV
+#define PLOW_NV_RB_QKV 0
+#undef PLOW_NV_RB_LMHEAD
+#define PLOW_NV_RB_LMHEAD 0
+#endif
 #ifndef PLOW_PACKET_HASH
 /* 0 = a GENERAL object: built with every arm, pairs with any packet. */
 #define PLOW_PACKET_HASH 0ull
@@ -234,6 +252,22 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #endif
 #include "op_norm.cuh"
 #include "op_gemm.cuh"
+/* Rungs wider than GV_MM_MAX stream the weights once on wgmma (op_gemv_wide_sm90.cuh). The arm
+ * lives only in the sibling `_gw` decode object (PLOW_NV_GW_OBJECT) that plowrt launches for the
+ * batched rungs, so the ordinary decode object — the B=1 rung — is the object it was without it.
+ * Manifest-set on dense packets whose ladder passes 32. */
+#ifndef PLOW_NV_GEMV_WIDE
+#define PLOW_NV_GEMV_WIDE 0
+#endif
+#ifndef PLOW_NV_GW_OBJECT
+#define PLOW_NV_GW_OBJECT 0
+#endif
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_WIDE && PLOW_NV_GW_OBJECT && !PLOW_NV_PREFILL && !PLOW_NV_SPEECH
+#define PLOW_NV_GW_ACTIVE 1
+#include "op_gemv_wide_sm90.cuh"
+#else
+#define PLOW_NV_GW_ACTIVE 0
+#endif
 #if defined(PLOW_NV_GEMM_SPLITK) && PLOW_NV_GEMM_SPLITK
 #include "op_gemm_splitk.cuh"
 #endif
@@ -763,6 +797,8 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _gf8)
 #elif PLOW_NV_DECODE_ROUTED
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _routed)
+#elif PLOW_NV_GW_OBJECT
+#define PLOW_SYM(n) PLOW_NV_CAT(n, _gw)
 #else
 #define PLOW_SYM(n) n
 #endif
@@ -945,9 +981,15 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 /* The grouped-MoE ring joins the LAUNCH claim only. Folded into the base arena it would also
  * raise PLOW_NV_GEMV_STAGING_BYTES, which moves the wide rungs' GEMVs onto the staged arm. */
 #if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && !PLOW_NV_PREFILL
-#define PLOW_NV_MOE_GROUP_ARENA ((PGM_MOE_ARENA_SM90 + 1) / 2) /* bf16 ring, in floats */
+#define PLOW_NV_MOE_GROUP_ARENA0 ((PGM_MOE_ARENA_SM90 + 1) / 2) /* bf16 ring, in floats */
 #else
-#define PLOW_NV_MOE_GROUP_ARENA 0
+#define PLOW_NV_MOE_GROUP_ARENA0 0
+#endif
+#if PLOW_NV_GW_ACTIVE
+#define PLOW_NV_MOE_GROUP_ARENA                                                               \
+    (PLOW_NV_MOE_GROUP_ARENA0 > GW_ARENA_FLOATS_MAX ? PLOW_NV_MOE_GROUP_ARENA0 : GW_ARENA_FLOATS_MAX)
+#else
+#define PLOW_NV_MOE_GROUP_ARENA PLOW_NV_MOE_GROUP_ARENA0
 #endif
 #define PLOW_NV_ARENA_FLOATS0                                                                 \
     (PLOW_NV_BASE_ARENA_FLOATS > PLOW_NV_M16_ARENA_FLOATS ? PLOW_NV_BASE_ARENA_FLOATS : PLOW_NV_M16_ARENA_FLOATS)
@@ -1000,8 +1042,9 @@ extern "C" __device__ unsigned PLOW_SYM(plow_gemm_splitk_abi) = 1;
 #endif
 #if PLOW_NV_EMBED_SMEM
 extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes) = PLOW_NV_ARENA_FLOATS * sizeof(float);
-#if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && !PLOW_NV_PREFILL
-/* The claim of a rung that never runs the grouped-MoE arm; the loader launches those with it. */
+#if defined(PLOW_NV_HOPPER) && (PLOW_MOE_DEC_GROUP || PLOW_NV_GW_ACTIVE) && !PLOW_NV_PREFILL
+/* The claim of a rung that never runs the grouped-MoE (or wide-GEMV) arm; the loader launches
+ * those with it. */
 extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes_narrow) = PLOW_NV_ARENA_FLOATS0 * sizeof(float);
 #endif
 extern "C" __device__ unsigned PLOW_SYM(plow_debug_max_inst) = 999999u;
@@ -1967,6 +2010,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                        (__nv_bfloat16*)arena);
             break;
         }
+#if PLOW_NV_GW_ACTIVE
+        if (in->i[0] > GV_MM_MAX && !TEN(7) &&
+            d_gemv_wide<GW_PLAIN>(gw_args((const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                                          (const __nv_bfloat16*)TEN(2), nullptr, nullptr,
+                                          (__nv_bfloat16*)TEN(0), nullptr, nullptr, in->i[1], 0u, 0u,
+                                          in->i[0], in->i[2], 0u),
+                                  slice, nblk, arena))
+            break;
+#endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_M16_MMA
         static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_GEMV_M16_ARENA_BYTES);
         if (in->i[0] == 16 && in->i[1] >= 1024 && in->i[2] && !(in->i[2] % 64)) {
@@ -2062,6 +2114,16 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 
     /* Kernel arg order is (Nq, Nk, Nv, K): K lives in i2 but is passed LAST. */
     case PLOW_DOP_GEMV_QKV:
+#if PLOW_NV_GW_ACTIVE
+        if (in->i[0] > GV_MM_MAX && !(in->i[5] && in->i[6] && in->i[7]) &&
+            d_gemv_wide<GW_QKV>(gw_args((const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                                        (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(6),
+                                        (__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                                        (__nv_bfloat16*)TEN(5), in->i[1], in->i[3], in->i[4],
+                                        in->i[0], in->i[2], 0u),
+                                slice, nblk, arena))
+            break;
+#endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
         if (!PLOW_NV_GEMV_MMA_B1 && in->i[0] == 1 && PLOW_NV_XREG_K(in->i[2]) &&
             (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
@@ -2169,6 +2231,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                            /*store=*/true, in->i[5], slice, nblk, (__nv_bfloat16*)arena);
             break;
         }
+#if PLOW_NV_GW_ACTIVE
+        if (in->i[0] > GV_MM_MAX &&
+            d_gemv_wide<GW_GLU>(gw_args((const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                                        (const __nv_bfloat16*)TEN(5), nullptr, (__nv_bfloat16*)TEN(0),
+                                        nullptr, nullptr, in->i[1], 0u, 0u, in->i[0], in->i[2],
+                                        in->i[5]),
+                                slice, nblk, arena))
+            break;
+#endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
         if (!PLOW_NV_GEMV_MMA_B1 && in->i[0] == 1 && PLOW_NV_XREG_K(in->i[2]) &&
             (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||

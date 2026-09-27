@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             e.consume_prompt(b, &prompt, &mut toks)?
         };
         println!(
-            "slot {b}: prompt consumed in {:.3} s",
+            "slot {b}: prompt consumed in {:.4} s",
             t0.elapsed().as_secs_f64()
         );
     }
@@ -116,8 +116,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         last.copy_from_slice(&toks);
     }
     if let Some((lo, hi)) = sweep {
+        let base_pos: Vec<usize> = (0..slots).map(|_| ctx + warmup).collect();
+        let base_last = last.clone();
         for cap in (lo..=hi).chain([u32::MAX]) {
             e.set_debug_max_inst(cap)?;
+            // Same kv length at every cap: a drifting position biases each delta by the
+            // attention's per-token cost.
+            for (b, &p) in base_pos.iter().enumerate() {
+                e.rewind_slot(b, p)?;
+            }
+            last.copy_from_slice(&base_last);
             for _ in 0..4 {
                 e.step_slots(&feeds_of(&last), &mut toks)?;
             }

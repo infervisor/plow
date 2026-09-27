@@ -2202,6 +2202,8 @@ pub struct GpuEngine {
     routed_decode: Option<Arc<moe_lt::RoutedDecode>>,
     /// Keeps the routed decode object loaded for the rung graphs that captured it.
     _routed_object: Option<Arc<moe_lt::RoutedDecode>>,
+    /// The `_gw` object the widest chain launches instead of `f` (8 rows and up).
+    gemv_wide: Option<Arc<decode_object::BoundDecodeObject>>,
     /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
     /// (bucket, slot-tensor-base, segment range) — one cuGraphLaunch replaces ~480 kernel
     /// submits. A routed bucket's launches run the ranges between its attention segments.
@@ -4829,6 +4831,27 @@ impl GpuEngine {
                 .module_global_u32(&module, "plow_arena_bytes_narrow")?
                 .map_or(smem, |narrow| narrow.min(smem)),
         };
+        // Rungs of 8 rows and up launch the `_gw` sibling object; those wider than GV_MM_MAX
+        // with its full claim (the wide-GEMV ring). At 2/4 rows the two objects are within ~1%
+        // either way (Chatterbox's CFG pair is 1% faster on the ordinary one).
+        let gemv_wide = match gemv_mm_cap {
+            Some(cap) if decode_objects.is_none() && nv_config.cubin.is_none() && nv_config.kernel.is_none() => {
+                decode_object::load_gemv_wide(
+                    &be,
+                    assets_dir,
+                    profile.decode_file.trim_end_matches(".cubin"),
+                    &module,
+                    grid,
+                )?
+                .map(|object| (cap as usize, object))
+            }
+            _ => None,
+        };
+        let wide_object = |rows: usize| {
+            gemv_wide.as_ref().filter(|_| rows >= 8).map(|(cap, (narrow, full))| {
+                Arc::clone(if rows > *cap { full } else { narrow })
+            })
+        };
         let decode_rungs = if select_decode_rungs {
             blob.decode_progs()[..blob.decode_progs().len() - 1]
                 .iter()
@@ -4940,6 +4963,7 @@ impl GpuEngine {
                     } else {
                         DecodeRung::upload(&be, g, kernarg)?
                     };
+                    rung.object = wide_object(rung.rows);
                     if let (Some(metadata), Some(objects)) = (&decode_objects, &bound_objects) {
                         rung.object = Some(Arc::clone(&objects[&metadata.programs[index].object]));
                         tracing::info!(
@@ -5982,6 +6006,7 @@ impl GpuEngine {
             moe_lt_decode: moe_lt_routed,
             routed_decode: routed_widest,
             _routed_object: routed_decode,
+            gemv_wide: wide_object(blob.decode_progs().last().map_or(1, |g| g.t as usize)),
             decode_packet_roles,
             seg_graphs: std::collections::HashMap::new(),
             smem_pf,
@@ -6452,6 +6477,16 @@ impl GpuEngine {
                 v.kv.ensure_rows(b, 1)?;
             }
         }
+        Ok(())
+    }
+
+    /// Bench-only: move slot `b` back to position `len` (at most its current one), keeping the
+    /// cache rows below it, so repeated timed steps read the same kv length.
+    pub fn rewind_slot(&mut self, b: usize, len: usize) -> Result<()> {
+        if self.vmm.is_some() || self.recurrent.is_some() || len > self.pos[b] as usize {
+            return Err(RuntimeError::Rejected("rewind_slot: unsupported slot state".into()));
+        }
+        self.pos[b] = len as _;
         Ok(())
     }
 
@@ -10564,6 +10599,9 @@ impl GpuEngine {
     /// Skip every decode instruction at or past `limit` (profiling by instruction caps: the
     /// marginal step time of instruction i is time(limit = i + 1) - time(limit = i)).
     pub fn set_debug_max_inst(&self, limit: u32) -> Result<bool> {
+        if let Some(gw) = &self.gemv_wide {
+            self.be.module_global_set_u32(gw.module(), "plow_debug_max_inst_gw", limit)?;
+        }
         self.be.module_global_set_u32(&self.module, "plow_debug_max_inst", limit)
     }
 

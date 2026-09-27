@@ -2101,6 +2101,9 @@ fn build_cubin_from_manifest(
     if routed_decode_required(&man) {
         args.push("-DPLOW_CUBIN_ROUTED_DECODE=ON".into());
     }
+    if man.pointer("/tuning/gemv_wide").is_some() {
+        args.push("-DPLOW_CUBIN_GEMV_WIDE=ON".into());
+    }
     if segmented || manifest_requires_segmented_prefill(&man) {
         args.push("-DPLOW_SM120_CUBIN_SEG=ON".into());
     }

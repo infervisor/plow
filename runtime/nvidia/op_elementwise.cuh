@@ -206,10 +206,57 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
  * BATCH>1 (serving pending #4): logits are [n_batch][n] and each sequence gets its OWN argmax —
  * one token per sequence, no cross-sequence bleed. `part` is [n_batch][nblk]; the packed index
  * stays within the sequence's own [0,n) vocab row. n_batch==0/1 is byte-identical (part[slice]). */
+/* BATCH>1: every block used to scan a 1/nblk sliver of EVERY row, one block reduction per row
+ * (Veena B=128: 222 us). Here the (row, chunk) items are spread over the blocks: G = nblk / B
+ * contiguous chunks per row (one whole row per item once B >= nblk). A row's chunk-0 item
+ * zero-fills its unused slots, and 0 is below every packed key, so ARGMAX_FIN's fold picks the
+ * same token. */
+static __device__ void d_argmax_rows(unsigned long long* __restrict__ part,
+                                     const __nv_bfloat16* __restrict__ x, unsigned n, unsigned B,
+                                     unsigned slice, unsigned nblk, unsigned long long* lds) {
+    const unsigned G = nblk >= B ? nblk / B : 1u;
+    for (unsigned w = slice; w < B * G; w += nblk) {
+        const unsigned b = w / G, c = w % G;
+        const __nv_bfloat16* xb = x + (size_t)b * n;
+        const unsigned mis = (unsigned)(((size_t)b * n) & 7u);
+        const unsigned h = mis ? min(8u - mis, n) : 0u;
+        const unsigned nv = (n - h) / 8;
+        const unsigned v0 = (unsigned)(((unsigned long long)c * nv) / G);
+        const unsigned v1 = (unsigned)(((unsigned long long)(c + 1u) * nv) / G);
+        unsigned long long best = 0;
+        for (unsigned iv = v0 + threadIdx.x; iv < v1; iv += PLOW_NV_THREADS) {
+            const bf16v8 v = ld_glob8_cs(xb + h + (size_t)iv * 8);
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const unsigned long long p = amax_pack(v.x[j], h + iv * 8 + (unsigned)j);
+                best = p > best ? p : best;
+            }
+        }
+        if (c == 0) {
+            for (unsigned i = threadIdx.x; i < h; i += PLOW_NV_THREADS) {
+                const unsigned long long p = amax_pack(xb[i], i);
+                best = p > best ? p : best;
+            }
+            for (unsigned i = h + nv * 8 + threadIdx.x; i < n; i += PLOW_NV_THREADS) {
+                const unsigned long long p = amax_pack(xb[i], i);
+                best = p > best ? p : best;
+            }
+            for (unsigned i = G + threadIdx.x; i < nblk; i += PLOW_NV_THREADS)
+                part[(size_t)b * nblk + i] = 0ull;
+        }
+        best = block_max_u64(best, lds);
+        if (threadIdx.x == 0) part[(size_t)b * nblk + c] = best;
+    }
+}
+
 static __device__ void d_argmax(unsigned long long* __restrict__ part, const __nv_bfloat16* __restrict__ x,
                          unsigned n, unsigned n_batch, unsigned slice, unsigned nblk,
                          unsigned long long* lds) {
     const unsigned B = n_batch ? n_batch : 1u;
+    if (B > 1u) {
+        d_argmax_rows(part, x, n, B, slice, nblk, lds);
+        return;
+    }
     for (unsigned b = 0; b < B; b++) {
         const __nv_bfloat16* xb = x + (size_t)b * n;
         unsigned long long best = 0;
@@ -253,9 +300,11 @@ static __device__ void d_argmax(unsigned long long* __restrict__ part, const __n
  * byte-identical (ids[0] from part[0..nparts)). */
 static __device__ void d_argmax_fin(int* __restrict__ ids, const unsigned long long* __restrict__ part,
                              unsigned nparts, unsigned n_batch, unsigned slice) {
-    if (slice != 0 || threadIdx.x != 0) return;
     const unsigned B = n_batch ? n_batch : 1u;
-    for (unsigned b = 0; b < B; b++) {
+    /* One thread per sequence (it was thread 0 for all of them: 128 x 64 dependent loads, 207 us
+     * at Veena B=128). */
+    if (slice != 0 || threadIdx.x >= B) return;
+    for (unsigned b = threadIdx.x; b < B; b += blockDim.x) {
         const unsigned long long* pb = part + (size_t)b * nparts;
         unsigned long long best = 0;
         for (unsigned i = 0; i < nparts; i++) best = pb[i] > best ? pb[i] : best;
