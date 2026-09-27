@@ -19,6 +19,7 @@
 //! come from the rewrite's fused sites over the S3Gen graph (`nn_graph` `chatterbox_s3gen`),
 //! subject to [`ConvFusions`]' cost model; without sites they are the hand choices below.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::pipeline::{
@@ -33,12 +34,17 @@ pub const PIPELINE: &str = "vocoder.synth";
 pub const PACKET: &str = "s3gen.pkt";
 
 /// (batch, speech tokens) capacities. The encoder's attention bias is `[B*8][T][T]` f32 with
-/// T = 2 (prompt + tokens), so large batches get short buckets.
+/// T = 2 (prompt + tokens), so large batches get short buckets. Wide batches fill the machine's
+/// GEMM tiles (a B=8 CFM step is already compute-bound), so they are where concurrent requests
+/// gain throughput; every item pays the capacity's token count, so the wide batches get finer
+/// token steps (streaming first chunks are ~20 tokens, whole utterances ~100).
 pub const S3GEN_CAPACITIES: &[(u32, u32)] = &[
-    (1, 64), (1, 128), (1, 256), (1, 512), (1, 1000),
+    (1, 32), (1, 64), (1, 128), (1, 256), (1, 512), (1, 1000),
     (2, 128), (2, 256), (2, 512),
-    (4, 128), (4, 256),
-    (8, 64), (8, 128), (8, 256),
+    (4, 64), (4, 128), (4, 256),
+    (8, 32), (8, 64), (8, 96), (8, 128), (8, 192), (8, 256),
+    (16, 32), (16, 64), (16, 96), (16, 128), (16, 192), (16, 256),
+    (32, 32), (32, 64), (32, 96), (32, 128),
 ];
 
 const D_ENC: u32 = 512;
@@ -194,6 +200,7 @@ pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<
     let mut prefix = PacketPrefix { model, programs: Vec::new(), input: inputs.tokens, output: inputs.tokens, input_shape: vec![u64::from(bmax * nmax)] };
     let mut names = HashMap::new();
     let mut roles = BTreeMap::new();
+    let tap_major = RefCell::new(HashMap::new());
     for &(batch, tokens) in &caps {
         let lo = Lowering { cfg: &cfg, inputs, b: batch, n: tokens };
         let mut stage = 0;
@@ -202,7 +209,7 @@ pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<
                        body: &dyn Fn(&mut Ops) -> Result<(), String>|
          -> Result<PacketPrefix, String> {
             let program = prefix.model.progs.len() as u32;
-            let mut ops = Ops::new(prefix.program(), std::mem::take(names), ConvFusions(sites));
+            let mut ops = Ops::new(prefix.program(), std::mem::take(names), ConvFusions(sites), &tap_major);
             body(&mut ops)?;
             let (prefix, n) = ops.finish(batch * tokens);
             *names = n;
@@ -218,9 +225,17 @@ pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<
     }
     let reader = crate::checkpoint::TensorReader::open(dir)?;
     let mut derived = Derived { reader: &reader, cfg: &cfg, nmax, cache: HashMap::new() };
+    let tap_major = tap_major.into_inner();
     for tensor in &mut prefix.model.tensors {
         if let Some(name) = tensor.name.strip_prefix("w.") {
-            let bytes = derived.bytes(name)?;
+            let mut bytes = derived.bytes(name)?;
+            if let Some(&(cout, cin, k, stride)) = tap_major.get(&tensor.name) {
+                bytes = if stride > 0 {
+                    crate::codec::to_phase_major(&bytes, cin, cout, k, stride)
+                } else {
+                    to_tap_major(&bytes, cout, cin, k)
+                };
+            }
             if bytes.len() as u64 != tensor.bytes {
                 return Err(format!("{name}: {} bytes, expected {}", bytes.len(), tensor.bytes));
             }
@@ -250,11 +265,19 @@ struct Ops<'s> {
     writer: HashMap<u32, u32>,
     readers: HashMap<u32, Vec<u32>>,
     fuse: ConvFusions<'s>,
+    /// Conv weights stored tap-major (`[cout][kernel][cin]`), or phase-major for a transposed conv
+    /// (stride > 0): name -> (cout, cin, kernel, stride).
+    tap_major: &'s RefCell<HashMap<String, (u32, u32, u32, u32)>>,
 }
 
 impl<'s> Ops<'s> {
-    fn new(p: StageProgram, names: HashMap<String, u32>, fuse: ConvFusions<'s>) -> Self {
-        Self { p, names, writer: HashMap::new(), readers: HashMap::new(), fuse }
+    fn new(
+        p: StageProgram,
+        names: HashMap<String, u32>,
+        fuse: ConvFusions<'s>,
+        tap_major: &'s RefCell<HashMap<String, (u32, u32, u32, u32)>>,
+    ) -> Self {
+        Self { p, names, writer: HashMap::new(), readers: HashMap::new(), fuse, tap_major }
     }
 
     fn finish(self, tag: u32) -> (PacketPrefix, HashMap<String, u32>) {
@@ -295,7 +318,10 @@ impl<'s> Ops<'s> {
     fn conv(&mut self, x: u32, out: &str, c: Conv<'_>) -> Result<u32, String> {
         let weight = format!("w.{}.w", c.w);
         let act_in = c.act_in != Activation::None;
-        let fuse_in = act_in && self.fuse.input_act(&weight, c.k, true);
+        // The split-bf16 tile loads a k-tap conv's input k times: past a cheap activation, one
+        // separate pass is cheaper than applying it on every load.
+        let cheap = matches!(c.act_in, Activation::LeakyRelu);
+        let fuse_in = act_in && (cheap || c.transpose) && self.fuse.input_act(&weight, c.k, true);
         let fuse_out = c.act_out != Activation::None && self.fuse.output_act(&weight, true);
         let fuse_res = c.residual.is_some() && self.fuse.residual(&weight, true);
         let mut raw = c;
@@ -346,6 +372,21 @@ impl<'s> Ops<'s> {
         let weight = format!("w.{}.w", c.w);
         let bias = c.bias.then(|| c.bias_name.map_or_else(|| format!("w.{}.b", c.w), |b| format!("w.{b}")));
         let alpha = c.alpha.map(|a| format!("w.{a}"));
+        // Non-transposed k-tap convs with 16-byte channel runs take the split-bf16 wide tile, which
+        // reads (tap, channel) columns contiguously from tap-major weights; transposed ones read
+        // each output phase's columns from phase-major weights.
+        let tap_major = if c.transpose {
+            c.groups == 1 && c.cin % 4 == 0 && c.cout >= 16
+        } else {
+            c.k > 1 && c.groups == 1 && c.cin % 4 == 0
+        };
+        if tap_major {
+            let shape = (c.cout, c.cin, c.k, if c.transpose { c.stride } else { 0 });
+            let prev = self.tap_major.borrow_mut().insert(weight.clone(), shape);
+            if prev.is_some_and(|p| p != shape) {
+                return Err(format!("{weight}: used with two conv shapes"));
+            }
+        }
         self.op(&reads, out, |p, output, deps| {
             p.conv1d_f32(x, c.transpose, deps, Conv1dF32Stage {
                 output,
@@ -369,6 +410,8 @@ impl<'s> Ops<'s> {
                 output_activation: c.act_out,
                 slope: c.slope,
                 weight_f16: false,
+                split_bf16: !c.transpose,
+                weight_tap_major: tap_major,
             })
         })
     }
@@ -870,13 +913,29 @@ impl Lowering<'_> {
         let mut cur = x;
         for (j, &d) in dils.iter().enumerate() {
             let (c1, a1, c2, a2) = (format!("{pre}.d{j}.c1"), format!("{pre}.d{j}.a1"), format!("{pre}.d{j}.c2"), format!("{pre}.d{j}.a2"));
+            // snake(cur) in one pass (cur stays the residual); conv1 applies conv2's snake as its
+            // output activation, so conv2 reads its input as is.
+            let a1n = format!("w.{a1}");
+            let pre = o.op(&[cur], "act.s3gen.pre", |p, output, deps| {
+                p.unary_f32(cur, deps, UnaryF32Stage {
+                    output,
+                    param: Some(TensorRef::Named(&a1n)),
+                    rows: self.b * rows,
+                    width: ch,
+                    stride: 0,
+                    col0: 0,
+                    kind: Activation::Snake,
+                    p0: 0.0,
+                    p1: 0.0,
+                })
+            })?;
             let mut c = Conv::new(&c1, self.b, rows, ch, ch, k);
             c.dil = d;
             c.pad = (d * (k - 1) / 2, d * (k - 1) / 2);
-            c.alpha = Some(&a1);
-            c.act_in = Activation::Snake;
+            c.alpha = Some(&a2);
+            c.act_out = Activation::Snake;
             c.lengths = Some(len);
-            let t = o.conv(cur, "act.s3gen.rbt", c)?;
+            let t = o.conv_op(pre, "act.s3gen.rbt", c)?;
             let next = if j + 1 == dils.len() {
                 out
             } else if o.name_of(cur) == "act.s3gen.rbp" {
@@ -886,8 +945,6 @@ impl Lowering<'_> {
             };
             let mut c = Conv::new(&c2, self.b, rows, ch, ch, k);
             c.pad = ((k - 1) / 2, (k - 1) / 2);
-            c.alpha = Some(&a2);
-            c.act_in = Activation::Snake;
             c.residual = Some(cur);
             c.lengths = Some(len);
             cur = o.conv(t, next, c)?;
@@ -1108,6 +1165,21 @@ struct Derived<'a> {
     cache: HashMap<String, Vec<f32>>,
 }
 
+/// `[cout][cin][k]` f32 bytes -> `[cout][k][cin]`.
+fn to_tap_major(bytes: &[u8], cout: u32, cin: u32, k: u32) -> Vec<u8> {
+    let (cout, cin, k) = (cout as usize, cin as usize, k as usize);
+    let mut out = vec![0u8; bytes.len()];
+    for o in 0..cout {
+        for i in 0..cin {
+            for t in 0..k {
+                let (src, dst) = (((o * cin + i) * k + t) * 4, ((o * k + t) * cin + i) * 4);
+                out[dst..dst + 4].copy_from_slice(&bytes[src..src + 4]);
+            }
+        }
+    }
+    out
+}
+
 fn le_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -1222,6 +1294,9 @@ fn pipeline_section(
         ("stream.chunk_tokens".into(), 25),
         ("stream.hold_tokens".into(), 3),
         ("stream.fade_samples".into(), 480),
+        // Whole-utterance renders gather up to 8 items for 200 ms (see the render loop).
+        ("render.min_batch".into(), 8),
+        ("render.hold_ms".into(), 200),
     ]);
     let strings = BTreeMap::from([("voices".into(), cfg.voices.join("\n"))]);
     let metadata = PacketPipelines {

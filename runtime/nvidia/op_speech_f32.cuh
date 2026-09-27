@@ -1002,6 +1002,212 @@ static __device__ __forceinline__ void sp_tc_gemm(unsigned M, unsigned N, unsign
     }
 }
 
+/* ---- wide split-bf16 tile: 128 x BN outputs (BN 128: 8 warps as 2 (M) x 4 (N) of 64x32; BN 64:
+ * 4 x 2 of 32x32), BK = 32. Each thread loads 16-byte runs of both operands (loader seg()) one
+ * k-tile ahead into registers, applies A's input activation, splits x = hi + lo (bf16,
+ * round-to-nearest) and stores both halves to a double-buffered stage the warps read with
+ * ldmatrix: one barrier per k-tile. Per k16 lo*hi + hi*lo + hi*hi: ~2^-17 relative per product
+ * (3xTF32 keeps ~2^-21) at half 3xTF32's tensor-core cost. Measured ~40-60 TF (cuBLAS FP32 SGEMM
+ * 35-43 TF on the same shapes); the tile is bound by operand traffic and per-k-tile overhead
+ * (f32 operands at 32 FLOP per byte), not by the tensor cores. Accumulating straight into acc (no
+ * per-k-tile partial) measured the same error at K <= 1024 and frees 64 registers. */
+#define SPB_BK 32u
+#define SPB_LDS 40u
+template <unsigned BN>
+struct SpB {
+    static constexpr unsigned BM = 128, MI = BN == 128 ? 4 : 2, WMW = BN == 128 ? 2 : 4, PA = BM / 32,
+                              PB = BN / 32, LDO = BN + 8;
+    static constexpr unsigned SPL = (BM + BN) * SPB_LDS * 2 * 2;
+    static constexpr unsigned BYTES = 2 * SPL > BM * LDO * 4 ? 2 * SPL : BM * LDO * 4;
+    static_assert(BN == 128 || BN == 64, "wide tile width");
+    static_assert(BYTES <= SP_ARENA_FLOATS * 4, "wide tile stages");
+};
+/* Non-volatile: the scheduler may interleave independent MMAs. */
+__device__ __forceinline__ void sp_mma_bf16x(float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void sp_split4(__nv_bfloat16* hi, __nv_bfloat16* lo, float4 v) {
+    const __nv_bfloat162 h0 = __floats2bfloat162_rn(v.x, v.y), h1 = __floats2bfloat162_rn(v.z, v.w);
+    const float2 f0 = __bfloat1622float2(h0), f1 = __bfloat1622float2(h1);
+    const __nv_bfloat162 l0 = __floats2bfloat162_rn(v.x - f0.x, v.y - f0.y);
+    const __nv_bfloat162 l1 = __floats2bfloat162_rn(v.z - f1.x, v.w - f1.y);
+    uint2 uh, ul;
+    uh.x = *(const unsigned*)&h0; uh.y = *(const unsigned*)&h1;
+    ul.x = *(const unsigned*)&l0; ul.y = *(const unsigned*)&l1;
+    *(uint2*)hi = uh;
+    *(uint2*)lo = ul;
+}
+__device__ __forceinline__ float4 sp_ldg4z(const float* p) {
+    return p ? __ldg((const float4*)p) : make_float4(0.f, 0.f, 0.f, 0.f);
+}
+template <unsigned BN, class LA, class LB>
+static __device__ __forceinline__ void sp_w_tile(unsigned m0, unsigned n0, unsigned M, unsigned N, unsigned K,
+                                                 const LA& la, const LB& lb, float* arena,
+                                                 float (&acc)[SpB<BN>::MI][4][4]) {
+    using W = SpB<BN>;
+    constexpr unsigned MI = W::MI;
+    char* split = (char*)arena;
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned wm = (warp % W::WMW) * (MI * 16u), wn = (warp / W::WMW) * 32u;
+    const unsigned sr = tid >> 3, sc = (tid & 7u) * 4u;
+    const unsigned nk = (K + SPB_BK - 1) / SPB_BK;
+    decltype(la.row(0u, 0u)) ra[W::PA];
+    decltype(lb.row(0u, 0u)) rb[W::PB];
+#pragma unroll
+    for (unsigned p = 0; p < W::PA; p++) ra[p] = la.row(m0 + sr + 32u * p, M);
+#pragma unroll
+    for (unsigned p = 0; p < W::PB; p++) rb[p] = lb.row(n0 + sr + 32u * p, N);
+    float4 va[W::PA], vb[W::PB];
+    unsigned amask = 0; /* which of va hold loaded (not padding) elements */
+    auto load = [&](unsigned kt) {
+        const unsigned k = kt * SPB_BK + sc;
+        amask = 0;
+#pragma unroll
+        for (unsigned p = 0; p < W::PA; p++) {
+            const float* src = k < K ? la.seg(ra[p], k) : nullptr;
+            va[p] = sp_ldg4z(src);
+            amask |= (unsigned)(src != nullptr) << p;
+        }
+#pragma unroll
+        for (unsigned p = 0; p < W::PB; p++) vb[p] = sp_ldg4z(k < K ? lb.seg(rb[p], k) : nullptr);
+    };
+    auto store = [&](unsigned kt) {
+        const unsigned k = kt * SPB_BK + sc;
+        __nv_bfloat16* ahi = (__nv_bfloat16*)(split + (kt & 1u) * W::SPL);
+        __nv_bfloat16* alo = ahi + W::BM * SPB_LDS;
+        __nv_bfloat16* bhi = alo + W::BM * SPB_LDS;
+        __nv_bfloat16* blo = bhi + BN * SPB_LDS;
+#pragma unroll
+        for (unsigned p = 0; p < W::PA; p++) {
+            const unsigned r = sr + 32u * p;
+            float4 v = va[p];
+            if (LA::PRE && (amask >> p & 1u)) v = la.pre(v, k);
+            sp_split4(ahi + r * SPB_LDS + sc, alo + r * SPB_LDS + sc, v);
+        }
+#pragma unroll
+        for (unsigned p = 0; p < W::PB; p++) {
+            const unsigned r = sr + 32u * p;
+            sp_split4(bhi + r * SPB_LDS + sc, blo + r * SPB_LDS + sc, vb[p]);
+        }
+    };
+#pragma unroll
+    for (unsigned i = 0; i < MI; i++)
+#pragma unroll
+        for (unsigned j = 0; j < 4; j++)
+#pragma unroll
+            for (unsigned r = 0; r < 4; r++) acc[i][j][r] = 0.f;
+    load(0u);
+    store(0u);
+    __syncthreads();
+    for (unsigned kt = 0; kt < nk; kt++) {
+        /* The next k-tile's loads are in flight across this one's MMAs; its stores go to the other
+         * buffer, whose readers (k-tile kt - 1) the previous barrier retired. */
+        if (kt + 1 < nk) load(kt + 1);
+        const __nv_bfloat16* ahi = (const __nv_bfloat16*)(split + (kt & 1u) * W::SPL);
+        const __nv_bfloat16* alo = ahi + W::BM * SPB_LDS;
+        const __nv_bfloat16* bhi = alo + W::BM * SPB_LDS;
+        const __nv_bfloat16* blo = bhi + BN * SPB_LDS;
+#pragma unroll
+        for (unsigned ks = 0; ks < SPB_BK; ks += 16) {
+            unsigned bh[2][4], bl[2][4];
+            const unsigned bo = (wn + (lane & 7u) + ((lane >> 4) << 3)) * SPB_LDS + ks + ((lane >> 3) & 1u) * 8u;
+#pragma unroll
+            for (unsigned q = 0; q < 2; q++) {
+                sp_ldsm4(bh[q], bhi + bo + q * 16u * SPB_LDS);
+                sp_ldsm4(bl[q], blo + bo + q * 16u * SPB_LDS);
+            }
+            const unsigned ao = (wm + (lane & 15u)) * SPB_LDS + ks + (lane >> 4) * 8u;
+#pragma unroll
+            for (unsigned i = 0; i < MI; i++) {
+                unsigned ah[4], al[4];
+                sp_ldsm4(ah, ahi + ao + i * 16u * SPB_LDS);
+                sp_ldsm4(al, alo + ao + i * 16u * SPB_LDS);
+                /* Pass-major over j: consecutive MMAs never share an accumulator. */
+#pragma unroll
+                for (unsigned pass = 0; pass < 3; pass++)
+#pragma unroll
+                    for (unsigned j = 0; j < 4; j++) {
+                        const unsigned q = j >> 1, h = (j & 1u) * 2u;
+                        const unsigned(&b)[2][4] = pass == 1 ? bl : bh;
+                        sp_mma_bf16x(acc[i][j], pass == 0 ? al : ah, b[q][h], b[q][h + 1]);
+                    }
+            }
+        }
+        if (kt + 1 < nk) store(kt + 1);
+        __syncthreads();
+    }
+}
+struct SpConvEpi1;
+template <unsigned BN>
+static __device__ __forceinline__ void sp_w_conv_store(unsigned m0, unsigned n0, unsigned M, unsigned N,
+                                                       const SpConvEpi1& ep, const float (&acc)[SpB<BN>::MI][4][4]);
+template <class T> struct SpIsConvEpi { static constexpr bool value = false; };
+template <> struct SpIsConvEpi<SpConvEpi1> { static constexpr bool value = true; };
+/* sp_tc_store for the wide tile: fragments through smem, then four consecutive columns per thread
+ * (Conv1d's float4 epilogue: sp_w_conv_store). */
+template <unsigned BN, class EP>
+static __device__ __forceinline__ void sp_w_store(unsigned m0, unsigned n0, unsigned M, unsigned N, const EP& ep,
+                                                  const float (&acc)[SpB<BN>::MI][4][4], float* arena) {
+    using W = SpB<BN>;
+    constexpr unsigned LDO = W::LDO;
+    if constexpr (SpIsConvEpi<EP>::value) {
+        if (ep.v4) return sp_w_conv_store<BN>(m0, n0, M, N, ep, acc);
+    }
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned mb = (warp % W::WMW) * (W::MI * 16u) + (lane >> 2), nb = (warp / W::WMW) * 32u + (lane & 3u) * 2u;
+#pragma unroll
+    for (unsigned i = 0; i < W::MI; i++)
+#pragma unroll
+        for (unsigned j = 0; j < 4; j++)
+#pragma unroll
+            for (unsigned h = 0; h < 2; h++)
+                *(float2*)(arena + (mb + i * 16u + h * 8u) * LDO + nb + j * 8u) =
+                    make_float2(acc[i][j][2 * h], acc[i][j][2 * h + 1]);
+    __syncthreads();
+
+    const unsigned rows = min(W::BM, M - m0), cols = min(BN, N - n0);
+    constexpr unsigned G = W::BM * BN / 4u / PLOW_NV_THREADS;
+    float4 ld[G];
+#pragma unroll
+    for (unsigned i = 0; i < G; i++) {
+        const unsigned e = threadIdx.x + i * PLOW_NV_THREADS, r = e / (BN / 4u), c = (e % (BN / 4u)) * 4u;
+        if (r < rows && c < cols) ld[i] = sp_ep4_load(ep, m0 + r, n0 + c, min(4u, cols - c));
+    }
+#pragma unroll
+    for (unsigned i = 0; i < G; i++) {
+        const unsigned e = threadIdx.x + i * PLOW_NV_THREADS, r = e / (BN / 4u), c = (e % (BN / 4u)) * 4u;
+        if (r < rows && c < cols) sp_ep4(ep, m0 + r, n0 + c, arena + r * LDO + c, min(4u, cols - c), ld[i]);
+    }
+    __syncthreads();
+}
+/* Output tiles of the wide path over the op's blocks; tile order walks N fastest so neighbouring
+ * blocks share A rows in L2. */
+template <unsigned BN, class LA, class LB, class EP>
+static __device__ __forceinline__ void sp_w_gemm(unsigned M, unsigned N, unsigned K, const LA& la, const LB& lb,
+                                                 const EP& ep, unsigned slice, unsigned nblk, float* arena) {
+    const unsigned tn = (N + BN - 1) / BN, tiles = ((M + SpB<BN>::BM - 1) / SpB<BN>::BM) * tn;
+    for (unsigned tile = slice; tile < tiles; tile += nblk) {
+        const unsigned m0 = (tile / tn) * SpB<BN>::BM, n0 = (tile % tn) * BN;
+        float acc[SpB<BN>::MI][4][4];
+        sp_w_tile<BN>(m0, n0, M, N, K, la, lb, arena, acc);
+        sp_w_store<BN>(m0, n0, M, N, ep, acc, arena);
+    }
+}
+/* The wide tile's width for an op with the split-bf16 flag. Taken at every size, so an item's
+ * result does not depend on the batch it runs in (the k order per output is the tile's alone);
+ * a single item's ~9 m-tiles still beat the 64x64 3xTF32 path. */
+__device__ __forceinline__ unsigned sp_w_width(unsigned M, unsigned N, unsigned nblk) {
+    const unsigned mt = (M + 127u) / 128u, t128 = mt * ((N + 127u) / 128u), t64 = mt * ((N + 63u) / 64u);
+    /* Rounds over the blocks times the tile's cost (a 128x64 tile ~0.55 of a 128x128 one): a
+     * short last round of wide tiles (N = 256 at ~9k rows: 144 tiles on 132 blocks) idles most
+     * of the machine for a whole tile. */
+    const unsigned c128 = N > 64u ? (t128 + nblk - 1u) / nblk * 20u : ~0u;
+    const unsigned c64 = (t64 + nblk - 1u) / nblk * 11u;
+    return c128 <= c64 ? 128u : 64u;
+}
+
 /* DenseGemmF32 (170). flags: 1 = bf16-round, 2 = bf16 erf-GELU (implies the round), 4 = bf16
  * weights, 8 = A (and f32 W) bf16-representable -> bf16 tensor cores, 16 = 3xTF32 tensor cores.
  * i5 != 0: weight row stride, and i6 < i5 names a one-hot weight column added in. t4: optional
@@ -1317,6 +1523,74 @@ static __device__ __noinline__ void d_conv2d_f32(float* __restrict__ out, const 
 #define SPL_COLS 1024
 static_assert(PLOW_NV_WARPS * SPL_COLS <= SP_ARENA_FLOATS, "layernorm row stage");
 /* With `stats` (RowStatsF32, 204) only [rows][2] = (mean, inverse std) is written. */
+/* LayerNormF32 (double statistics) over rows of 128..512 columns: each lane holds its float4s of
+ * R rows in registers, so a row is read once and R rows' loads are in flight together (one row
+ * per warp is latency-bound). */
+static __device__ __noinline__ void sp_layernorm_rows(float* __restrict__ out, const float* __restrict__ x,
+                                                      const float* __restrict__ gamma, const float* __restrict__ beta,
+                                                      unsigned rows, unsigned feat, unsigned flags, float eps,
+                                                      unsigned slice, unsigned nblk, float* stats) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    constexpr unsigned R = 2, V = 4;
+    const unsigned nv = feat / 128u;
+    for (unsigned row0 = (slice * PLOW_NV_WARPS + warp) * R; row0 < rows; row0 += nblk * PLOW_NV_WARPS * R) {
+        float4 v[R][V];
+#pragma unroll
+        for (unsigned r = 0; r < R; r++)
+#pragma unroll
+            for (unsigned u = 0; u < V; u++)
+                if (u < nv && row0 + r < rows) v[r][u] = __ldg((const float4*)(x + (size_t)(row0 + r) * feat + u * 128u + lane * 4u));
+        float mean[R], inv[R];
+#pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            double sum = 0.0;
+#pragma unroll
+            for (unsigned u = 0; u < V; u++)
+                if (u < nv) sum += (double)v[r][u].x + (double)v[r][u].y + (double)v[r][u].z + (double)v[r][u].w;
+            mean[r] = (float)(sp_warp_sum_d(sum) / feat);
+            double sq = 0.0;
+#pragma unroll
+            for (unsigned u = 0; u < V; u++)
+                if (u < nv) {
+                    const double a = __fsub_rn(v[r][u].x, mean[r]), b = __fsub_rn(v[r][u].y, mean[r]);
+                    const double c = __fsub_rn(v[r][u].z, mean[r]), d = __fsub_rn(v[r][u].w, mean[r]);
+                    sq += a * a + b * b + c * c + d * d;
+                }
+            inv[r] = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn((float)(sp_warp_sum_d(sq) / feat), eps)));
+        }
+        if (stats) {
+            if (lane < R && row0 + lane < rows) {
+                float m = mean[0], iv = inv[0];
+#pragma unroll
+                for (unsigned r = 1; r < R; r++)
+                    if (lane == r) m = mean[r], iv = inv[r];
+                *(float2*)(stats + 2 * (size_t)(row0 + lane)) = make_float2(m, iv);
+            }
+            continue;
+        }
+#pragma unroll
+        for (unsigned u = 0; u < V; u++) {
+            if (u >= nv) continue;
+            const unsigned c = u * 128u + lane * 4u;
+            const float4 g = gamma ? __ldg((const float4*)(gamma + c)) : make_float4(1.f, 1.f, 1.f, 1.f);
+            const float4 b = beta ? __ldg((const float4*)(beta + c)) : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+            for (unsigned r = 0; r < R; r++) {
+                if (row0 + r >= rows) continue;
+                const float xa[4] = {v[r][u].x, v[r][u].y, v[r][u].z, v[r][u].w}, ga[4] = {g.x, g.y, g.z, g.w},
+                            ba[4] = {b.x, b.y, b.z, b.w};
+                float y[4];
+#pragma unroll
+                for (unsigned q = 0; q < 4; q++) {
+                    const float t = __fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(xa[q], mean[r]), inv[r]), ga[q]), ba[q]);
+                    y[q] = flags & 1u ? sp_bf16(t) : t;
+                }
+                *(float4*)(out + (size_t)(row0 + r) * feat + c) = make_float4(y[0], y[1], y[2], y[3]);
+            }
+        }
+    }
+}
+
 static __device__ __noinline__ void d_layernorm_f32(float* __restrict__ out, const float* __restrict__ x,
                                        const float* __restrict__ gamma, const float* __restrict__ beta,
                                        unsigned rows, unsigned feat, unsigned flags, float eps,
@@ -1429,6 +1703,11 @@ static __device__ __noinline__ void d_layernorm_f32(float* __restrict__ out, con
             }
             __syncwarp();
         }
+        return;
+    }
+    if (feat % 128u == 0 && feat <= 512u && sp_aligned(x, 16) && (!out || sp_aligned(out, 16)) &&
+        (!gamma || sp_aligned(gamma, 16)) && (!beta || sp_aligned(beta, 16))) {
+        sp_layernorm_rows(out, x, gamma, beta, rows, feat, flags, eps, slice, nblk, stats);
         return;
     }
     for (unsigned row = slice * PLOW_NV_WARPS + warp; row < rows; row += nblk * PLOW_NV_WARPS) {
@@ -2124,7 +2403,7 @@ struct SpConvArgs {
     float* out; const float* x; const void* w; const float* bias; const float* alpha;
     const float* residual; const unsigned* lengths; const float* row_scale;
     unsigned batch, in_rows, cin, cout, kernel, stride, dil, groups, cg, ng, before, after, mode, pre,
-        post, wf16, out_rows, opad, cg_mul, cg_shift;
+        post, wf16, tapmajor, phasemajor, ptaps, out_rows, opad, cg_mul, cg_shift;
     float slope;
     /* c / cg for c < 2^31 (Granlund-Montgomery; the tap index of a GEMM column). */
     __device__ unsigned div_cg(unsigned c) const { return (__umulhi(c, cg_mul) + c) >> cg_shift; }
@@ -2133,6 +2412,10 @@ struct SpConvArgs {
     }
     __device__ float w_at(size_t i) const {
         return wf16 ? sp_f16(((const uint16_t*)w)[i]) : ((const float*)w)[i];
+    }
+    /* Conv1d weight index: [cout][cg][kernel], or [cout][kernel][cg] with flags bit 15. */
+    __device__ size_t widx(unsigned o, unsigned ci, unsigned tap) const {
+        return tapmajor ? ((size_t)o * kernel + tap) * cg + ci : ((size_t)o * cg + ci) * kernel + tap;
     }
     __device__ float pre_at(float v, unsigned c) const {
         if (!pre) return v;
@@ -2173,9 +2456,14 @@ __device__ __forceinline__ bool sp_conv_args(const PlowDevInst* in, void* const*
     const unsigned flags = in->fj[2].u;
     a.mode = transpose ? 0u : flags & 3u;
     a.pre = (flags >> 4) & 15u; a.post = (flags >> 8) & 15u; a.wf16 = (flags >> 12) & 1u;
+    a.tapmajor = transpose ? 0u : (flags >> 15) & 1u;
+    /* ConvTranspose1d flags bit 15: weights [stride][cout][ceil(kernel/stride)][cg], one phase's
+     * (tap, channel) columns contiguous per output channel (taps past the kernel are zero). */
+    a.phasemajor = transpose ? (flags >> 15) & 1u : 0u;
+    a.ptaps = a.stride ? (a.kernel + a.stride - 1u) / a.stride : 0u;
     a.slope = in->fj[0].f;
     if (!a.kernel || !a.stride || !a.dil || !a.groups || a.cin % a.groups || a.cout % a.groups ||
-        a.mode > 2u || !sp_act_conv_ok(a.pre) || !sp_act_conv_ok(a.post) || a.post == 12u || !a.in_rows)
+        a.mode > 2u || !sp_act_conv_ok(a.pre) || !sp_act_conv_ok(a.post) || (a.post == 12u && a.pre != 0u) || !a.in_rows)
         return false;
     a.cg = a.cin / a.groups; a.ng = a.cout / a.groups;
     a.cg_shift = 0;
@@ -2205,7 +2493,7 @@ static __device__ __forceinline__ void sp_conv1d_direct(const SpConvArgs& a, uns
             if (u < 0) continue;
             const float* xr = a.x + ((size_t)b * a.in_rows + u) * a.cin + c0;
             for (unsigned i = 0; i < a.cg; i++)
-                acc = fmaf(a.pre_at(xr[i], c0 + i), a.w_at(((size_t)o * a.cg + i) * a.kernel + k), acc);
+                acc = fmaf(a.pre_at(xr[i], c0 + i), a.w_at(a.widx(o, i, k)), acc);
         }
         a.store(e, o, acc);
     }
@@ -2392,21 +2680,26 @@ struct SpRowConv1 {
 struct SpRowConvW {
     SpConvArgs a; unsigned c0, n0, K, phase; bool vec, transpose;
     __device__ long long row(unsigned n, unsigned N) const { return n < N ? (long long)(n0 + n) : -1ll; }
+    /* Row n's column 0 in a contiguous layout (pointwise, tap-major or phase-major weights). */
+    __device__ size_t base(long long n) const {
+        return transpose ? ((size_t)phase * a.cout + (size_t)n) * a.ptaps * a.cg : (size_t)n * K;
+    }
     __device__ float at(long long n, unsigned c) const {
         if (c >= K) return 0.f;
         const unsigned tap = a.div_cg(c), ci = c - tap * a.cg;
+        if (transpose && a.phasemajor) return a.w_at(base(n) + c);
         if (transpose)
             return a.w_at(((size_t)(c0 + ci) * a.ng + (size_t)(n - n0)) * a.kernel + phase + tap * a.stride);
-        return a.w_at(((size_t)n * a.cg + ci) * a.kernel + tap);
+        return a.w_at(a.widx((unsigned)n, ci, tap));
     }
     __device__ float4 load4(long long n, unsigned c) const {
         if (n < 0 || c >= K) return make_float4(0.f, 0.f, 0.f, 0.f);
-        if (vec) return __ldg((const float4*)((const float*)a.w + (size_t)n * K + c));
+        if (vec) return __ldg((const float4*)((const float*)a.w + base(n) + c));
         return make_float4(at(n, c), at(n, c + 1), at(n, c + 2), at(n, c + 3));
     }
 };
 /* ConvTranspose weights [cin][ng][kernel]: consecutive n are `kernel` apart, consecutive k far. */
-__device__ __forceinline__ bool sp_rowfast(const SpRowConvW& l) { return l.transpose; }
+__device__ __forceinline__ bool sp_rowfast(const SpRowConvW& l) { return l.transpose && !l.a.phasemajor; }
 /* cp.async hooks (sp_tcx_tile). */
 __device__ __forceinline__ bool sp_async(const SpRowConv1&) { return true; }
 __device__ __forceinline__ bool sp_segs(const SpRowConv1& l) { return l.vec; }
@@ -2430,15 +2723,18 @@ __device__ __forceinline__ const float* sp_elem(const SpRowConvW& l, long long n
     if (n < 0 || c >= l.K) return nullptr;
     const unsigned tap = l.a.div_cg(c), ci = c - tap * l.a.cg;
     const float* w = (const float*)l.a.w;
+    if (l.transpose && l.a.phasemajor) return w + l.base(n) + c;
     if (l.transpose)
         return w + ((size_t)(l.c0 + ci) * l.a.ng + (size_t)(n - l.n0)) * l.a.kernel + l.phase + tap * l.a.stride;
-    return w + ((size_t)n * l.a.cg + ci) * l.a.kernel + tap;
+    return w + l.a.widx((unsigned)n, ci, tap);
 }
 __device__ __forceinline__ const float* sp_seg(const SpRowConvW& l, long long n, unsigned c) {
-    return n < 0 || c >= l.K ? nullptr : (const float*)l.a.w + (size_t)n * l.K + c;
+    return n < 0 || c >= l.K ? nullptr : (const float*)l.a.w + l.base(n) + c;
 }
 struct SpConvEpi1 {
     SpConvArgs a; unsigned n0, n_p, q_lo, phase; bool transpose;
+    /* cout % 2 == 0 and out / residual / bias 8-byte aligned (the wide tile's direct epilogue). */
+    bool v4 = false;
     __device__ void operator()(unsigned m, unsigned n, float acc) const {
         const unsigned o = n0 + n;
         unsigned b, t;
@@ -2502,6 +2798,161 @@ __device__ __forceinline__ void sp_ep4(const SpConvEpi1& ep, unsigned m, unsigne
     }
 }
 
+/* The wide tile's Conv1d epilogue straight from the fragments (no smem stage, no barrier): float2
+ * bias / residual / output per fragment row, the output activation dispatched once per tile. */
+template <unsigned BN, class F>
+static __device__ __forceinline__ void sp_w_conv_rows(unsigned m0, unsigned n0, unsigned M, unsigned N,
+                                                      const SpConvEpi1& ep, const float (&acc)[SpB<BN>::MI][4][4],
+                                                      F f) {
+    using W = SpB<BN>;
+    const SpConvArgs& a = ep.a;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned mb = m0 + (warp % W::WMW) * (W::MI * 16u) + (lane >> 2);
+    const unsigned nb = n0 + (warp / W::WMW) * 32u + (lane & 3u) * 2u;
+    float2 bias[4], alpha[4];
+#pragma unroll
+    for (unsigned j = 0; j < 4; j++) {
+        const unsigned o = nb + j * 8u;
+        bias[j] = a.bias && o < N ? __ldg((const float2*)(a.bias + o)) : make_float2(0.f, 0.f);
+        alpha[j] = a.alpha && o < N ? make_float2(a.alpha[o], a.alpha[o + 1]) : make_float2(a.slope, a.slope);
+    }
+    /* Per fragment row pair: row bases and residual loads before the stores (out may alias
+     * residual, so later loads cannot move above earlier stores). */
+#pragma unroll
+    for (unsigned i = 0; i < W::MI; i++) {
+        size_t rb[2];
+        float2 res[2][4];
+#pragma unroll
+        for (unsigned h = 0; h < 2; h++) {
+            const unsigned m = mb + i * 16u + h * 8u;
+            rb[h] = m < M ? ep.row_base(m) : 0;
+#pragma unroll
+            for (unsigned j = 0; j < 4; j++) {
+                const unsigned o = nb + j * 8u;
+                res[h][j] = a.residual && m < M && (long long)rb[h] >= 0 && o < N
+                                ? __ldg((const float2*)(a.residual + rb[h] + o))
+                                : make_float2(0.f, 0.f);
+            }
+        }
+#pragma unroll
+        for (unsigned h = 0; h < 2; h++) {
+            const unsigned m = mb + i * 16u + h * 8u;
+            if (m >= M) continue;
+            size_t base = rb[h];
+            const bool ok = (long long)base >= 0;
+            if (!ok) base = ~base;
+#pragma unroll
+            for (unsigned j = 0; j < 4; j++) {
+                const unsigned o = nb + j * 8u;
+                if (o >= N) continue;
+                float2 y = make_float2(0.f, 0.f);
+                if (ok) {
+                    y.x = f(__fadd_rn(acc[i][j][2 * h], bias[j].x), alpha[j].x);
+                    y.y = f(__fadd_rn(acc[i][j][2 * h + 1], bias[j].y), alpha[j].y);
+                    if (a.row_scale) {
+                        const float sc = a.row_scale[base / a.cout];
+                        y.x = __fmul_rn(sc, y.x); y.y = __fmul_rn(sc, y.y);
+                    }
+                    if (a.residual) { y.x = __fadd_rn(y.x, res[h][j].x); y.y = __fadd_rn(y.y, res[h][j].y); }
+                }
+                *(float2*)(a.out + base + o) = y;
+            }
+        }
+    }
+}
+template <unsigned BN>
+static __device__ __forceinline__ void sp_w_conv_store(unsigned m0, unsigned n0, unsigned M, unsigned N,
+                                                       const SpConvEpi1& ep, const float (&acc)[SpB<BN>::MI][4][4]) {
+    const unsigned post = ep.a.post;
+    switch (post) {
+    case 0: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float) { return x; }); break;
+    case 9: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return x >= 0.0f ? x : __fmul_rn(x, p); }); break;
+    /* The output activations the speech lowerings use are inlined: a call keeps every live
+     * accumulator on the stack around it. */
+    case 1: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(1u, x, p, 0.f); }); break;
+    case 5: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(5u, x, p, 0.f); }); break;
+    case 7: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(7u, x, p, 0.f); }); break;
+    case 8: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(8u, x, p, 0.f); }); break;
+    case 10: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(10u, x, p, 0.f); }); break;
+    case 11: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_act(11u, x, p, 0.f); }); break;
+    case 12: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [](float x, float p) { return sp_snake(x, p); }); break;
+    default: sp_w_conv_rows<BN>(m0, n0, M, N, ep, acc, [post](float x, float p) { return sp_act_call(post, x, p); }); break;
+    }
+}
+
+/* The wide tile's operands as a few scalars (the generic SpRowConv1/SpRowConvW state, re-read per
+ * copy, made the k-loop issue-bound): A is the zero-padded implicit im2col (pointwise: one row),
+ * with a leaky-ReLU input activation or none; B the tap-major weight rows. */
+template <bool PW, bool LEAKY>
+struct SpWConvA {
+    static constexpr bool PRE = LEAKY;
+    struct Row { const float* xb; int u0, len; };
+    const SpConvArgs* a;
+    const float* x; unsigned cin, dil, cg_mul, cg_shift; float slope;
+    __device__ Row row(unsigned m, unsigned M) const {
+        if (m >= M) return Row{nullptr, 0, 0};
+        const unsigned b = m / a->out_rows, t = m - b * a->out_rows;
+        if (a->lengths && t >= a->conv_len(b)) return Row{nullptr, 0, 0};
+        const int u0 = (int)(t * a->stride) - (int)a->before, len = (int)a->length(b);
+        const float* xb = x + (size_t)b * a->in_rows * cin;
+        if (PW) return (unsigned)u0 < (unsigned)len ? Row{xb + (size_t)u0 * cin, 0, 0} : Row{nullptr, 0, 0};
+        return Row{xb, u0, len};
+    }
+    __device__ const float* seg(const Row& r, unsigned c) const {
+        if (!r.xb) return nullptr;
+        if (PW) return r.xb + c;
+        const unsigned tap = (__umulhi(c, cg_mul) + c) >> cg_shift, ci = c - tap * cin;
+        const int u = r.u0 + (int)(tap * dil);
+        return (unsigned)u < (unsigned)r.len ? r.xb + (size_t)u * cin + ci : nullptr;
+    }
+    __device__ float4 pre(float4 v, unsigned) const {
+        v.x = v.x >= 0.0f ? v.x : __fmul_rn(v.x, slope); v.y = v.y >= 0.0f ? v.y : __fmul_rn(v.y, slope);
+        v.z = v.z >= 0.0f ? v.z : __fmul_rn(v.z, slope); v.w = v.w >= 0.0f ? v.w : __fmul_rn(v.w, slope);
+        return v;
+    }
+};
+struct SpWRowsB {
+    const float* w; unsigned K;
+    __device__ const float* row(unsigned n, unsigned N) const { return n < N ? w + (size_t)n * K : nullptr; }
+    __device__ const float* seg(const float* r, unsigned c) const { return r ? r + c : nullptr; }
+};
+template <unsigned BN, bool PW, bool LEAKY>
+static __device__ __forceinline__ void sp_conv1d_wide_run(const SpConvArgs& a, unsigned slice, unsigned nblk) {
+    const unsigned M = a.batch * a.out_rows, K = a.kernel * a.cg;
+    const SpWConvA<PW, LEAKY> la{&a, a.x, a.cin, a.dil, a.cg_mul, a.cg_shift, a.slope};
+    const SpWRowsB lb{(const float*)a.w, K};
+    const bool v4 = a.cout % 2u == 0 && sp_aligned(a.out, 8) && (!a.residual || sp_aligned(a.residual, 8)) &&
+                    (!a.bias || sp_aligned(a.bias, 8));
+    const SpConvEpi1 ep{a, 0u, a.out_rows, 0u, 0u, false, v4};
+    sp_w_gemm<BN>(M, a.cout, K, la, lb, ep, slice, nblk, sp_smem);
+}
+/* flags bit 14: the split-bf16 wide tile's width when it applies and fills the machine, else 0.
+ * It covers groups == 1, zero padding, f32 16-byte-aligned operands with cin % 4 == 0, tap-major
+ * weights when kernel > 1, and no input activation but leaky ReLU. */
+__device__ __forceinline__ unsigned sp_w_conv_width(const PlowDevInst* in, const SpConvArgs& a, unsigned nblk) {
+    if (!((in->fj[2].u >> 14) & 1u) || a.groups != 1u || a.cin % 4u || !sp_aligned(a.x, 16) || a.wf16 ||
+        a.mode != 0u || !(a.pre == 0u || (a.pre == 9u && !a.alpha)) || !(a.kernel == 1u || a.tapmajor) ||
+        !sp_aligned(a.w, 16))
+        return 0u;
+    return sp_w_width(a.batch * a.out_rows, a.cout, nblk);
+}
+/* Out of line so d_conv1d_f32's 64x64 paths do not share its register allocation. Callers
+ * guarantee groups == 1, zero padding, f32 16-byte-aligned operands
+ * with cin % 4 == 0, tap-major weights when kernel > 1, and no input activation but leaky ReLU. */
+static __device__ __forceinline__ void sp_conv1d_wide_body(const SpConvArgs& a, unsigned bn, unsigned slice, unsigned nblk) {
+    const bool pw = a.kernel == 1u, leaky = a.pre == 9u;
+    if (bn == 128u) {
+        if (pw) leaky ? sp_conv1d_wide_run<128, true, true>(a, slice, nblk) : sp_conv1d_wide_run<128, true, false>(a, slice, nblk);
+        else leaky ? sp_conv1d_wide_run<128, false, true>(a, slice, nblk) : sp_conv1d_wide_run<128, false, false>(a, slice, nblk);
+    } else {
+        if (pw) leaky ? sp_conv1d_wide_run<64, true, true>(a, slice, nblk) : sp_conv1d_wide_run<64, true, false>(a, slice, nblk);
+        else leaky ? sp_conv1d_wide_run<64, false, true>(a, slice, nblk) : sp_conv1d_wide_run<64, false, false>(a, slice, nblk);
+    }
+}
+static __device__ __noinline__ void d_conv1d_wide(const SpConvArgs& a, unsigned bn, unsigned slice, unsigned nblk) {
+    sp_conv1d_wide_body(a, bn, slice, nblk);
+}
+
 static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* const* T, bool transpose, unsigned slice,
                                     unsigned nblk, float* arena) {
     arena = sp_smem;
@@ -2514,10 +2965,12 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
         return;
     }
     const bool avec = a.cg % 4u == 0 && a.cin % 4u == 0 && sp_aligned(a.x, 16);
+    if (!transpose && sp_w_conv_width(in, a, nblk)) return d_conv1d_wide(a, sp_w_conv_width(in, a, nblk), slice, nblk);
     const unsigned phases = transpose ? a.stride : 1u;
     /* flags bit 13: 3xTF32 tensor cores on 64x64 tiles, except when FP32 FFMA's 128x128 tiles
      * already fill the machine for a transposed conv or one with an input activation (FFMA's wider
-     * tiles apply the activation to fewer copies of A, and gather fewer ConvT weights). Devgen's
+     * tiles apply the activation to fewer copies of A, and gather fewer ConvT weights; with
+     * phase-major ConvT weights the gather is gone and the tensor cores win). Devgen's
      * conv1d_units mirrors the choice. */
     auto count = [&](unsigned bm, unsigned bn) {
         unsigned total = 0;
@@ -2532,7 +2985,7 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
         }
         return total;
     };
-    const bool tc = ((in->fj[2].u >> 13) & 1u) && ((!transpose && !a.pre) || count(SPG_BM, SPG_BN) < nblk);
+    const bool tc = ((in->fj[2].u >> 13) & 1u) && ((!transpose && !a.pre) || count(SPG_BM, SPG_BN) < nblk || a.phasemajor);
     const unsigned BM = tc ? SPT_BM : SPG_BM, BN = tc ? SPT_BN : SPG_BN;
     const unsigned tn = (a.ng + BN - 1) / BN;
     const unsigned total = count(BM, BN);
@@ -2551,7 +3004,8 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
         }
         const unsigned g = rem / (mt * tn), r2 = rem - g * mt * tn;
         const unsigned c0 = g * a.cg, n0 = g * a.ng, K = taps * a.cg;
-        const bool bvec = !transpose && a.kernel == 1u && !a.wf16 && a.cg % 4u == 0 && sp_aligned(a.w, 16);
+        const bool bvec = (transpose ? a.phasemajor : (a.kernel == 1u || a.tapmajor)) && !a.wf16 && a.cg % 4u == 0 &&
+                          sp_aligned(a.w, 16);
         const SpRowConv1 la{a, c0, K, n_p, q_lo, p, avec, transpose, !transpose && a.kernel == 1u};
         const SpRowConvW lb{a, c0, n0, K, p, bvec, transpose};
         const SpConvEpi1 ep{a, n0, n_p, q_lo, p, transpose};

@@ -421,6 +421,14 @@ pub struct Conv1dF32Stage<'a> {
     pub output_activation: Activation,
     pub slope: f32,
     pub weight_f16: bool,
+    /// Flag bit 14: split-bf16 wide tensor-core tiles where they fill the machine (~2^-17 relative
+    /// per product; the default 3xTF32 keeps ~2^-21) at half the tensor-core cost.
+    pub split_bf16: bool,
+    /// Flag bit 15: Conv1d weights `[cout][kernel][cin/groups]` instead of
+    /// `[cout][cin/groups][kernel]`; ConvTranspose1d weights `[stride][cout][ceil(kernel /
+    /// stride)][cin/groups]` (zero past the kernel) instead of `[cin][cout/groups][kernel]`. Either
+    /// way a GEMM column run (tap, channels) is contiguous.
+    pub weight_tap_major: bool,
 }
 
 impl Conv1dF32Stage<'_> {
@@ -1159,7 +1167,9 @@ impl StageProgram {
             || (transpose && stage.pad_mode != PadMode::Zero)
             || !valid_activation(stage.input_activation)
             || !valid_activation(stage.output_activation)
-            || stage.output_activation == Activation::Snake
+            // One alpha tensor: a snake output activation reads it per output channel, so the
+            // input takes no activation.
+            || (stage.output_activation == Activation::Snake && stage.input_activation != Activation::None)
         {
             return Err("invalid convolution geometry".into());
         }
@@ -1171,11 +1181,13 @@ impl StageProgram {
             f32_bytes(product(&[stage.batch, stage.in_rows, stage.in_channels])?)?,
             "convolution input",
         )?;
-        let weight_bytes = product(&[
-            stage.out_channels,
-            stage.in_channels / stage.groups,
-            stage.kernel,
-        ])? * if stage.weight_f16 { 2 } else { 4 };
+        let taps = if transpose && stage.weight_tap_major {
+            stage.kernel.div_ceil(stage.stride) * stage.stride
+        } else {
+            stage.kernel
+        };
+        let weight_bytes = product(&[stage.out_channels, stage.in_channels / stage.groups, taps])?
+            * if stage.weight_f16 { 2 } else { 4 };
         let weight = self.resolve(stage.weight, weight_bytes, "convolution weight")?;
         let bias = match stage.bias {
             Some(bias) => self.resolve(bias, u64::from(stage.out_channels) * 4, "convolution bias")?,
@@ -1206,7 +1218,9 @@ impl StageProgram {
             | (stage.input_activation.code() << 4)
             | (stage.output_activation.code() << 8)
             | (u32::from(stage.weight_f16) << 12)
-            | (1 << 13);
+            | (1 << 13)
+            | (u32::from(stage.split_bf16) << 14)
+            | (u32::from(stage.weight_tap_major) << 15);
         let op = if transpose { DevOp::ConvTranspose1dF32 } else { DevOp::Conv1dF32 };
         let units = conv1d_units(&stage, transpose, out_rows, self.builder.n_cu());
         self.emit(op, units, deps, output, |d| {
@@ -1656,7 +1670,8 @@ fn conv1d_units(stage: &Conv1dF32Stage<'_>, transpose: bool, out_rows: u32, n_cu
     };
     // 3xTF32 on 64x64 tiles, except FP32 FFMA on 128x128 tiles when those fill the machine for
     // a transposed conv or one with an input activation.
-    let ffma = (transpose || stage.input_activation != Activation::None) && tiles(128) >= u64::from(n_cu);
+    let ffma = ((transpose && !stage.weight_tap_major) || (!transpose && stage.input_activation != Activation::None))
+        && tiles(128) >= u64::from(n_cu);
     if ffma { tiles(128) } else { tiles(64) }
 }
 
@@ -1830,7 +1845,7 @@ mod tests {
                     weight_type: DenseWeight::F32,
                     input_bf16_exact: false,
                     layer_norm: None,
-                },
+                    },
             )
             .unwrap();
         let query = prefix.output;
@@ -1849,7 +1864,7 @@ mod tests {
                     weight_type: DenseWeight::F32,
                     input_bf16_exact: false,
                     layer_norm: None,
-                },
+                    },
             )
             .unwrap();
         let key = prefix.output;
@@ -1983,6 +1998,8 @@ mod tests {
             output_activation: Activation::None,
             slope: 0.0,
             weight_f16: false,
+            split_bf16: false,
+            weight_tap_major: false,
         };
         let mut p = prefix.program();
         let a = p.conv1d_f32(x, false, &[], conv("h", "w1", 7, 3, 9, Activation::Snake, None)).unwrap();

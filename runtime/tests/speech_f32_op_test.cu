@@ -521,6 +521,8 @@ struct ConvSpec {
     float slope;
     bool tc = false; /* flags bit 13: 3xTF32 tensor cores */
     bool row_scale = false; /* t7 (Conv1d) */
+    bool wide = false; /* flags bit 14: split-bf16 wide tiles */
+    bool tapmajor = false; /* flags bit 15: weights [cout][kernel][cin/groups] */
 };
 
 static unsigned conv_out_rows(const ConvSpec& s, bool transpose) {
@@ -535,6 +537,24 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     const size_t wn = (size_t)s.cout * (s.cin / s.groups) * s.kernel;
     const float amp = 1.5f / sqrtf((float)(s.cin / s.groups * s.kernel));
     unsigned w = s.f16 ? c.f16(wn, amp) : c.f32(wn, amp);
+    if (s.tapmajor && transpose) {
+        /* [cin][cout][k] -> [stride][cout][ceil(k/stride)][cin] (groups == 1), zero past k. */
+        const unsigned taps = (s.kernel + s.stride - 1) / s.stride, es = s.f16 ? 2 : 4;
+        std::vector<uint8_t> src = c.host[w];
+        c.host[w].assign((size_t)s.stride * s.cout * taps * s.cin * es, 0);
+        for (unsigned i = 0; i < s.cin; i++)
+            for (unsigned o = 0; o < s.cout; o++)
+                for (unsigned k = 0; k < s.kernel; k++)
+                    memcpy(&c.host[w][((((size_t)(k % s.stride) * s.cout + o) * taps + k / s.stride) * s.cin + i) * es],
+                           &src[(((size_t)i * s.cout + o) * s.kernel + k) * es], es);
+    } else if (s.tapmajor) {
+        const unsigned cg = s.cin / s.groups, es = s.f16 ? 2 : 4;
+        std::vector<uint8_t> src = c.host[w];
+        for (unsigned o = 0; o < s.cout; o++)
+            for (unsigned i = 0; i < cg; i++)
+                for (unsigned k = 0; k < s.kernel; k++)
+                    memcpy(&c.host[w][(((size_t)o * s.kernel + k) * cg + i) * es], &src[(((size_t)o * cg + i) * s.kernel + k) * es], es);
+    }
     unsigned b = s.bias ? c.f32(s.cout, 0.2f) : PLOW_TENSOR_NONE;
     unsigned a = s.alpha ? c.f32(std::max(s.cin, s.cout), 0.4f, 0.6f) : PLOW_TENSOR_NONE;
     unsigned r = s.residual ? c.f32((size_t)s.batch * out_rows * s.cout, 1.f) : PLOW_TENSOR_NONE;
@@ -545,7 +565,8 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     c.in.i[0] = s.batch; c.in.i[1] = s.in_rows; c.in.i[2] = s.cin; c.in.i[3] = s.cout;
     c.in.i[4] = s.kernel; c.in.i[5] = s.stride; c.in.i[6] = s.dil_or_opad; c.in.i[7] = s.groups;
     c.in.fj[0].f = s.slope; c.in.fj[1].u = pads(s.before, s.after);
-    c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u);
+    c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u) | (s.wide ? 1u << 14 : 0u) |
+                   (s.tapmajor ? 1u << 15 : 0u);
 }
 
 static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
@@ -908,6 +929,16 @@ static void bench_signal() {
         Case c; unsigned o; build_conv(c, s, false, o);
         bench("Conv1dF32 dense k7 512->512 snake [2][2048]", c, 2.0 * 4096 * 512 * 512 * 7, 0);
     }
+    {
+        ConvSpec s{64, 256, 512, 256, 16, 8, 0, 1, 4, 4, 0, 12, 0, false, true, true, false, {}, 0.f, true};
+        for (bool pm : {false, true}) {
+            s.tapmajor = pm;
+            Case c; unsigned o; build_conv(c, s, true, o);
+            const double out_rows = conv_out_rows(s, true);
+            bench(pm ? "ConvTranspose1dF32 phase-major 512->256 k16 s8 [64][256]" : "ConvTranspose1dF32 512->256 k16 s8 [64][256]",
+                  c, 2.0 * 64 * out_rows * 256 * 512 * 2, 0);
+        }
+    }
     for (bool tc : {false, true}) {
         ConvSpec s{2, 256, 1024, 512, 16, 8, 0, 1, 4, 4, 0, 12, 0, false, true, true, false, {}, 0.f, tc};
         Case c; unsigned o; build_conv(c, s, true, o);
@@ -1009,6 +1040,7 @@ int main(int argc, char** argv) {
         }
         bench_dense(104, 1024, 7680, 1 | 4 | 8);
         bench_dense(1, 64, 64, 1 | 4 | 8);
+
         bench_conv(8, 128, 100, 1, 480);
         bench_conv(8, 128, 100, 1, 480, 512);
         bench_conv(8, 64, 50, 480, 480);
@@ -1128,6 +1160,41 @@ int main(int argc, char** argv) {
     t_attention("AttentionF32 tc 8x64 causal bias fused", 2, 300, 8, 64, {300, 217}, true, true, true, true);
     t_attention("AttentionF32 tc 4x64 ragged rows", 1, 77, 4, 64, {}, false, false, false, true);
     t_attention("AttentionF32 tc s3gen 8x64 2x570 fused", 2, 570, 8, 64, {}, false, false, true, true);
+    /* Split-bf16 wide tiles (~2^-17 per product) and tap-major weights. */
+    {
+        ConvSpec w1{2, 4200, 256, 512, 1, 1, 1, 1, 0, 0, 0, 0, 11, false, true, false, true, {4200, 3000}, 0.f, true};
+        w1.wide = true;
+        t_conv1d("Conv1dF32 wide pointwise gelu +res len", w1, 1e-4);
+        ConvSpec w2{16, 570, 256, 256, 3, 1, 1, 1, 2, 0, 0, 9, 10, false, true, false, false,
+                    {570, 400, 570, 1, 570, 570, 300, 570, 570, 570, 2, 570, 570, 569, 570, 100}, 0.1f, true};
+        w2.wide = w2.tapmajor = true;
+        t_conv1d("Conv1dF32 wide k3 tap-major leaky->mish len", w2, 1e-4);
+        ConvSpec w3{4, 8192, 64, 64, 11, 1, 3, 1, 15, 15, 0, 12, 0, false, true, true, true, {8192, 5000, 8192, 100},
+                    0.f, true};
+        w3.wide = w3.tapmajor = true;
+        t_conv1d("Conv1dF32 wide k11 d3 snake 64 tap-major +res", w3, 1e-4);
+        ConvSpec w4{2, 100, 64, 96, 5, 1, 2, 1, 4, 4, 0, 0, 7, false, true, false, false, {}, 0.f, true};
+        w4.wide = w4.tapmajor = true;
+        t_conv1d("Conv1dF32 wide tap-major k5 small M", w4, 1e-4);
+        ConvSpec w6{4, 8192, 64, 64, 7, 1, 3, 1, 9, 9, 0, 0, 12, false, true, true, false, {8192, 5000, 1, 8192}, 0.f, true};
+        w6.wide = w6.tapmajor = true;
+        t_conv1d("Conv1dF32 wide k7 d3 snake-out tap-major len", w6, 1e-4);
+        ConvSpec w7{2, 300, 64, 64, 7, 1, 3, 1, 9, 9, 0, 0, 12, false, true, true, true, {300, 170}, 0.f, true};
+        t_conv1d("Conv1dF32 k7 snake-out +res (64x64 tiles)", w7);
+        ConvSpec w5{2, 1000, 64, 1, 7, 1, 1, 1, 3, 3, 0, 9, 1, false, true, false, false, {1000, 500}, 0.01f, true};
+        w5.tapmajor = true;
+        t_conv1d("Conv1dF32 tap-major narrow 64->1 (direct)", w5);
+    }
+    {
+        ConvSpec p1{2, 128, 1024, 512, 16, 8, 0, 1, 4, 4, 0, 12, 0, false, true, true, false, {128, 77}, 0.f, true};
+        p1.tapmajor = true;
+        t_convt1d("ConvT1dF32 phase-major 1024->512 k16 s8 snake", p1);
+        ConvSpec p2{8, 256, 128, 64, 7, 3, 0, 1, 2, 2, 0, 9, 0, false, true, false, true, {256, 100, 1, 256, 256, 256, 30, 256}, 0.1f, true};
+        p2.tapmajor = true;
+        t_convt1d("ConvT1dF32 phase-major k7 s3 leaky +res len", p2);
+    }
+    t_layernorm("LayerNormF32 double rows 9120x256", 9120, 256, 0, true);
+    t_layernorm("LayerNormF32 double rows 1001x512 bf16", 1001, 512, 1, true);
     {
         ConvSpec cs[] = {
             {2, 1024, 512, 512, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true, {}, 0.f, true},

@@ -660,7 +660,7 @@ G_K(g_conv1d_f32) {
     const uint32_t pre = (flags >> 4) & 15u, post = (flags >> 8) & 15u;
     const float slope = in->fj[0].f;
     if (!kernel || !stride || !dilation || !groups || cin % groups || cout % groups ||
-        mode > 2u || !g_act_valid_conv(pre) || !g_act_valid_conv(post) || post == 12u)
+        mode > 2u || !g_act_valid_conv(pre) || !g_act_valid_conv(post) || (post == 12u && pre != 0u))
         return;
     const uint64_t span = (uint64_t)dilation * (kernel - 1u) + 1u;
     if (in_rows + pad_before + pad_after < span) return;
@@ -686,8 +686,10 @@ G_K(g_conv1d_f32) {
                     const uint32_t c = c0 + i;
                     const float v = g_act_f32(pre, x[((size_t)b * in_rows + u) * cin + c],
                                               alpha ? alpha[c] : slope, 0.0f);
-                    sum += (double)v * g_weight(weight, (flags >> 12) & 1u,
-                                                ((size_t)o * cg + i) * kernel + k);
+                    /* flags bit 15: weights [cout][kernel][cg] instead of [cout][cg][kernel]. */
+                    const size_t wi = (flags >> 15) & 1u ? ((size_t)o * kernel + k) * cg + i
+                                                         : ((size_t)o * cg + i) * kernel + k;
+                    sum += (double)v * g_weight(weight, (flags >> 12) & 1u, wi);
                 }
             }
             float value = g_act_f32(post, (float)sum, alpha ? alpha[o] : slope, 0.0f);
@@ -714,7 +716,7 @@ G_K(g_conv_transpose1d_f32) {
     const uint32_t pre = (flags >> 4) & 15u, post = (flags >> 8) & 15u;
     const float slope = in->fj[0].f;
     if (!in_rows || !kernel || !stride || !groups || cin % groups || cout % groups ||
-        !g_act_valid_conv(pre) || !g_act_valid_conv(post) || post == 12u)
+        !g_act_valid_conv(pre) || !g_act_valid_conv(post) || (post == 12u && pre != 0u))
         return;
     const int64_t full = (int64_t)(in_rows - 1u) * stride + kernel + output_padding;
     if (full <= (int64_t)crop_before + crop_after) return;
@@ -742,8 +744,12 @@ G_K(g_conv_transpose1d_f32) {
                     const uint32_t c = c0 + i;
                     const float v = g_act_f32(pre, x[((size_t)b * in_rows + s) * cin + c],
                                               alpha ? alpha[c] : slope, 0.0f);
-                    sum += (double)v * g_weight(weight, (flags >> 12) & 1u,
-                                                ((size_t)c * ng + on) * kernel + k);
+                    /* flags bit 15: weights [stride][cout][ceil(kernel/stride)][cg]. */
+                    const uint32_t taps = (kernel + stride - 1u) / stride;
+                    const size_t wi = (flags >> 15) & 1u
+                                          ? (((size_t)(k % stride) * cout + o) * taps + k / stride) * cg + i
+                                          : ((size_t)c * ng + on) * kernel + k;
+                    sum += (double)v * g_weight(weight, (flags >> 12) & 1u, wi);
                 }
             }
             float value = g_act_f32(post, (float)sum, alpha ? alpha[o] : slope, 0.0f);

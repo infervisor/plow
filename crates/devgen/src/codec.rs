@@ -168,7 +168,12 @@ pub fn lower_snac(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<&
     let reader = crate::checkpoint::TensorReader::open(dir)?;
     for tensor in &mut prefix.model.tensors {
         if let Some(name) = tensor.name.strip_prefix("w.") {
-            let (dtype, bytes) = reader.read(name)?;
+            let (dtype, mut bytes) = reader.read(name)?;
+            if let Some(b) = cfg.blocks.iter().enumerate().find(|(i, _)| name == format!("blk{i}.up.w")).map(|(_, b)| b) {
+                if b.cin % 4 == 0 && b.cout >= 16 {
+                    bytes = to_phase_major(&bytes, b.cin, b.cout, b.kernel, b.stride);
+                }
+            }
             if dtype != "F32" || bytes.len() as u64 != tensor.bytes {
                 return Err(format!("{name}: {dtype} {} bytes, expected F32 {}", bytes.len(), tensor.bytes));
             }
@@ -360,6 +365,30 @@ fn snac_program(
     Ok(p.finish(batch * frames))
 }
 
+/// A transposed conv's weights go phase-major (flag bit 15) when the tensor-core loader can read
+/// them in 16-byte runs. Mirrors the weight permutation in [`lower_snac`].
+fn phase_major(c: &Conv) -> bool {
+    c.transpose && c.groups == 1 && c.cin % 4 == 0 && c.cout >= 16
+}
+
+/// ConvTranspose weights `[cin][cout][kernel]` (f32 bytes, one group) -> `[stride][cout][taps][cin]`
+/// with `taps = ceil(kernel / stride)`, zero past the kernel.
+pub(crate) fn to_phase_major(bytes: &[u8], cin: u32, cout: u32, kernel: u32, stride: u32) -> Vec<u8> {
+    let (cin, cout, kernel, stride) = (cin as usize, cout as usize, kernel as usize, stride as usize);
+    let taps = kernel.div_ceil(stride);
+    let mut out = vec![0u8; stride * cout * taps * cin * 4];
+    for i in 0..cin {
+        for o in 0..cout {
+            for k in 0..kernel {
+                let src = ((i * cout + o) * kernel + k) * 4;
+                let dst = (((k % stride) * cout + o) * taps + k / stride) * cin + i;
+                out[dst * 4..dst * 4 + 4].copy_from_slice(&bytes[src..src + 4]);
+            }
+        }
+    }
+    out
+}
+
 /// One convolution of the decoder in its unfused meaning: `residual + act_out(conv(act_in(x)))`.
 struct Conv {
     output: &'static str,
@@ -432,6 +461,8 @@ fn fused_conv(p: &mut StageProgram, fuse: ConvFusions<'_>, x: u32, dep: u32, c: 
         output_activation: if fuse_out { c.act_out } else { Activation::None },
         slope: 0.0,
         weight_f16: false,
+        split_bf16: false,
+        weight_tap_major: phase_major(&c),
     })?;
     let out_rows = if c.transpose {
         (c.in_rows - 1) * c.stride + c.kernel + c.dilation - 2 * c.pad

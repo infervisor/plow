@@ -9,9 +9,11 @@
 //! audio of all but the last `hold` tokens, crossfading `fade` samples into the previous render's
 //! tail. The noise streams are keyed by frame, so re-renders of a prefix agree up to that
 //! lookahead. A render sharing the GPU with the LM's back-to-back cooperative decode launches runs
-//! several times slower, so the LM pauses while a batch holding a first chunk renders: first audio
-//! is then prefill + `first` tokens + one uncontended render. The pause is the mux's downstream
-//! urgency ([`DownstreamCredit::set_urgent`]).
+//! several times slower, so at low load the LM pauses while a batch holding a first chunk renders:
+//! first audio is then prefill + `first` tokens + one uncontended render. The pause is the mux's
+//! downstream urgency ([`DownstreamCredit::set_urgent`]). Whole utterances are rendered in batches
+//! (`render.min_batch` / `render.hold_ms`): a lone small render costs several times more GPU per
+//! utterance, taken from the LM.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -38,6 +40,11 @@ struct Schedule {
     fade: usize,
     samples_per_token: usize,
     max_tokens: usize,
+    /// Batch forming: a render of fewer than `min_batch` utterances (no first chunk among them)
+    /// waits up to `batch_hold` for more while others are still being generated. Small vocoder
+    /// batches cost several times more GPU per utterance, and that time comes out of the LM's.
+    min_batch: usize,
+    batch_hold: std::time::Duration,
 }
 
 impl Schedule {
@@ -50,6 +57,8 @@ impl Schedule {
             fade: p("stream.fade_samples")?,
             samples_per_token: c.frame_samples,
             max_tokens: c.max_frames,
+            min_batch: c.parameters.get("render.min_batch").map_or(1, |&v| v as usize),
+            batch_hold: std::time::Duration::from_millis(c.parameters.get("render.hold_ms").copied().unwrap_or(0)),
         })
     }
 }
@@ -177,8 +186,9 @@ impl Utterance {
 }
 
 fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, credit: &DownstreamCredit) {
-    let max_batch = 8;
+    let max_batch = vocoder.max_batch;
     let mut live: HashMap<usize, Utterance> = HashMap::new();
+    let mut held_since: Option<std::time::Instant> = None;
     let apply = |live: &mut HashMap<usize, Utterance>, m: S3Msg| match m {
         S3Msg::Open { id, voice, seed, reply } => {
             live.insert(
@@ -229,10 +239,27 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, credit:
             let class = if u.first_chunk() { 0 } else if u.t3_ms.is_some() { 1 } else { 2 };
             (class, u.rendered as isize - u.tokens.len() as isize, *k)
         });
+        // First chunks render by themselves: joined with longer renders they would pay the
+        // batch's token capacity and wait for its whole launch.
+        if due.first().is_some_and(|k| live[k].first_chunk()) {
+            due.retain(|k| live[k].first_chunk());
+        }
         due.truncate(max_batch);
         if due.is_empty() {
             continue;
         }
+        if !live[&due[0]].first_chunk() && due.len() < sc.min_batch.min(max_batch) && live.len() > due.len() {
+            let left = sc.batch_hold.saturating_sub(held_since.get_or_insert_with(std::time::Instant::now).elapsed());
+            if !left.is_zero() {
+                match rx.recv_timeout(left) {
+                    Ok(m) => apply(&mut live, m),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+                continue;
+            }
+        }
+        held_since = None;
         let first = due.iter().any(|k| live[k].first_chunk());
         // Cleared on every exit, a panicking render included, so the LM never waits forever.
         struct Urgent<'a>(&'a DownstreamCredit);
@@ -241,7 +268,9 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, credit:
                 self.0.set_urgent(false);
             }
         }
-        if first {
+        // Pausing the LM buys a lone stream its first audio sooner; with many utterances in flight
+        // every pause delays all of them (and the requests queued behind them) instead.
+        if first && live.len() <= sc.min_batch.max(1) {
             credit.set_urgent(true);
         }
         let guard = Urgent(credit);
@@ -467,7 +496,16 @@ mod tests {
         (u, rx)
     }
 
-    const SC: Schedule = Schedule { first: 20, chunk: 25, hold: 3, fade: 480, samples_per_token: 960, max_tokens: 1000 };
+    const SC: Schedule = Schedule {
+        first: 20,
+        chunk: 25,
+        hold: 3,
+        fade: 480,
+        samples_per_token: 960,
+        max_tokens: 1000,
+        min_batch: 1,
+        batch_hold: std::time::Duration::ZERO,
+    };
 
     /// Renders of a growing prefix emit every sample exactly once, in order, then Done.
     #[test]
