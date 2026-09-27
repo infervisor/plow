@@ -798,7 +798,7 @@ fn the_shared_expert_uses_the_clamped_swiglu_not_plain_silu() {
     let all: Vec<u32> = (0..304u32).collect();
     let t = 512u32;
     let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
-    let (act, _) = super::dsv41::emit_dsv41_ffn_shared(&mut b, &cfg, &w, &all, 0, 1, x, t, &[]);
+    let (act, _) = super::dsv41::emit_dsv41_ffn_shared(&mut b, &cfg, &w, &all, 0, 1, x, t, &[], false);
     let p = b.finish();
 
     let glu = p
