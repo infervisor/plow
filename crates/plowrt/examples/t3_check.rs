@@ -35,20 +35,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let want_ids: Vec<u32> = serde_json::from_value(r["text_ids"].clone())?;
         let cref: Vec<f64> = serde_json::from_value(r["cond_logits"].clone())?;
         let uref: Vec<f64> = serde_json::from_value(r["uncond_logits"].clone())?;
-        let (ids, cond, uncond) = t3.probe_prefill("default", text)?;
+        let lang = r["language"].as_str();
+        let (ids, cond, uncond) = t3.probe_prefill("default", text, lang)?;
         let (rc, ru) = (rel(&cond, &cref), rel(&uncond, &uref));
         let am = |v: &[f32]| (0..v.len()).max_by(|&i, &j| v[i].total_cmp(&v[j])).unwrap_or(0);
         let top1 = am(&cond) == argmax(&cref) && am(&uncond) == argmax(&uref);
         let want: Vec<u32> = serde_json::from_value(r["greedy_cfg"].clone())?;
-        let got = t3.greedy("default", text, want.len())?;
+        let got = t3.greedy("default", text, lang, want.len())?;
         let agree = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
         let ids_ok = ids == want_ids;
         println!(
-            "ids {} | logits rel-L2 cond {rc:.4} uncond {ru:.4} top1 {} | greedy agree {agree}/{} | {:?}",
+            "{} ids {} | logits rel-L2 cond {rc:.4} uncond {ru:.4} top1 {} | greedy agree {agree}/{} | {:?}",
+            lang.unwrap_or("-"),
             if ids_ok { "ok" } else { "MISMATCH" },
             if top1 { "ok" } else { "DIFF" },
             want.len(),
-            &text[..text.len().min(40)]
+            text.chars().take(24).collect::<String>()
         );
         ok &= ids_ok && rc < 0.05 && ru < 0.05 && top1;
     }

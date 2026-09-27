@@ -117,6 +117,8 @@ def main():
     ap.add_argument("--skip-cer", action="store_true")
     ap.add_argument("--rand-tokens", default="43,100,200", help="token counts of the random-token cases")
     ap.add_argument("--asr-python", default=sys.executable, help="python with transformers + jiwer for asr_check.py")
+    ap.add_argument("--s3gen-weights", default=None, help="snapshot file replacing the stock S3Gen weights "
+                    "(Multilingual V3: s3gen_v3.safetensors); the packet must be exported from the same file")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     import torch, soundfile as sf, perth
@@ -126,6 +128,13 @@ def main():
     from chatterbox.models.s3gen import hifigan
 
     tts = ChatterboxTTS.from_pretrained(device="cuda")
+    if args.s3gen_weights:
+        import glob
+        from safetensors.torch import load_file
+        snap = glob.glob(os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+                                      "hub/models--ResembleAI--chatterbox/snapshots/*/"))[0]
+        tts.s3gen.load_state_dict(load_file(os.path.join(snap, args.s3gen_weights)), strict=False)
+        tts.s3gen.to("cuda").eval()
     s3, gen = tts.s3gen, tts.conds.gen
     pk = Packet(args.packet, args.runner)
     P, Pf = gen["prompt_token"].shape[1], gen["prompt_feat"].shape[1]

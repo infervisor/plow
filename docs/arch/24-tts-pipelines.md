@@ -15,7 +15,7 @@ stream scheduling) runs on CPU threads from packet metadata.
 | Driver | Packet | What the host does |
 |---|---|---|
 | `tts.codec_lm.v1` | `model.pkt` (causal LM whose vocabulary carries codec codes; Veena) | prompt template + prefix/suffix ids, stop ids, code demux; the LM runs on the text engine's mux |
-| `tts.guided_lm.v1` | `model.pkt` (causal LM with classifier-free guidance; Chatterbox T3) | text rules + tokenizer, prefill rows from `in.prompt.*` tensors, CFG slot pairs, sampling chain from `lm.*` parameters (host, or the sampler object's `plow_sample_cfg` with `--cfg-device`) |
+| `tts.guided_lm.v1` | `model.pkt` (causal LM with classifier-free guidance; Chatterbox T3) | text rules (per request language) + tokenizer, prefill rows from `in.prompt.*` tensors, CFG slot pairs, sampling chain from `lm.*` parameters (host, or the sampler object's `plow_sample_cfg` with `--cfg-device`) |
 | `codec.v1` | `codec.pkt` (SNAC), `s3gen.pkt` (S3Gen) | pick the (batch, units) capacity, write codes/tokens, per-item lengths, seeds and voice index, run one program sequence, read PCM |
 
 Emission: `PLOW_TTS_PROFILE=veena` (+ `PLOW_TTS_CODEC_DIR`, the export of
@@ -41,8 +41,14 @@ captures every capacity's CUDA graph at load.
 ## Serving
 
 `/v1/audio/speech` accepts `model`, `input`, `voice`, `response_format`
-(`wav` | `pcm`, 24 kHz mono s16), `stream`, and sampling overrides
-(`temperature`, `top_p`, `repetition_penalty`, `seed`, `max_tokens`).
+(`wav` | `pcm`, 24 kHz mono s16), `stream`, `language` (packets with language selection), and
+sampling overrides (`temperature`, `top_p`, `repetition_penalty`, `seed`, `max_tokens`).
+
+Text rules are pipeline strings (`text.rules`; `text.rules.lang.<code>` run at the rule
+`language`; `text.default_language`) interpreted by `crates/plowrt/src/text/rules.rs`: generic
+kinds (replace, case, NFKD, prefix, char maps, longest-match dictionaries, code point drops, CRF
+word segmentation) over named tables in the packet's `text_tables.v1` metadata section. A new
+language or normalization is a prep change, not a runtime one.
 
 - `tts.codec_lm.v1`: the request is a token-id `Job` on the model's mux. With `stream: true`
   each completed frame decodes a window (`stream.window_frames`) and emits the frames that have

@@ -9,20 +9,27 @@ Per request: ttfa_s (first audio byte, streaming) or latency_s, audio_s, rtf. Su
 p90 TTFA, aggregate audio seconds per wall second. Writes DIR/<tag>.json and optional wavs
 plus texts.json for scripts/tts/asr_check.py.
 """
-import argparse, concurrent.futures as cf, json, os, statistics, sys, threading, time, urllib.request
+import argparse, concurrent.futures as cf, http.client, json, os, statistics, sys, threading, time, urllib.error, urllib.request
 
 sys.path.insert(0, os.path.dirname(__file__))
 from veena_ref import PROMPTS as VEENA_PROMPTS
 from chatterbox_ref import PROMPTS as CBX_TEXTS
+from mtl_prompts import PROMPTS as MTL_PROMPTS
+
+# Multilingual prompt set: each text carries its request `language`.
+LANG_OF = {t: l for l, t in MTL_PROMPTS}
 
 SR = 24000
 
 
 SESSION = None
+PROMPT_SET = None
 
 
 def one(url, model, voice, text, stream, seed, extra):
     body = dict(model=model, input=text, voice=voice, response_format="pcm", stream=stream, seed=seed, **extra)
+    if PROMPT_SET == "chatterbox-mtl":
+        body["language"] = LANG_OF[text]
     headers = {"Content-Type": "application/json"}
     if SESSION:
         # One X-Session-Id per client thread: its requests run one after another in the session.
@@ -30,16 +37,21 @@ def one(url, model, voice, text, stream, seed, extra):
     req = urllib.request.Request(f"{url}/v1/audio/speech", data=json.dumps(body).encode(), headers=headers)
     t0 = time.perf_counter()
     ttfa, chunks = None, []
-    with urllib.request.urlopen(req, timeout=900) as r:
-        while True:
-            b = r.read1(65536) if stream else r.read()
-            if not b:
-                break
-            if ttfa is None:
-                ttfa = time.perf_counter() - t0
-            chunks.append(b)
-            if not stream:
-                break
+    try:
+        with urllib.request.urlopen(req, timeout=900) as r:
+            while True:
+                b = r.read1(65536) if stream else r.read()
+                if not b:
+                    break
+                if ttfa is None:
+                    ttfa = time.perf_counter() - t0
+                chunks.append(b)
+                if not stream:
+                    break
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+        # Overload (429 / queue TTL) or a stream cut mid-body: a failed request, not a failed run.
+        print(f"request failed: {e}", file=sys.stderr)
+        chunks = []
     total = time.perf_counter() - t0
     pcm = b"".join(chunks)
     return dict(ttfa_s=ttfa, latency_s=total, audio_s=len(pcm) / 2 / SR, pcm=pcm)
@@ -62,16 +74,18 @@ def main():
     ap.add_argument("--tag", default=None)
     ap.add_argument("--wav", action="store_true")
     ap.add_argument("--warmup", type=int, default=2)
-    ap.add_argument("--prompt-set", choices=["veena", "chatterbox"], default="veena")
+    ap.add_argument("--prompt-set", choices=["veena", "chatterbox", "chatterbox-mtl"], default="veena")
     ap.add_argument("--voice", default=None, help="override every prompt's voice")
     ap.add_argument("--session", default=None, help="X-Session-Id prefix (one session per client thread)")
     args = ap.parse_args()
-    global SESSION
-    SESSION = args.session
+    global SESSION, PROMPT_SET
+    SESSION, PROMPT_SET = args.session, args.prompt_set
     os.makedirs(args.out, exist_ok=True)
     tag = args.tag or f"{'stream' if args.stream else 'full'}_c{args.conc}"
     extra = dict(temperature=0.0) if args.greedy else {}
     prompts = VEENA_PROMPTS if args.prompt_set == "veena" else [("default", t) for t in CBX_TEXTS]
+    if args.prompt_set == "chatterbox-mtl":
+        prompts = [("default", t) for _, t in MTL_PROMPTS]
     if args.voice:
         prompts = [(args.voice, t) for _, t in prompts]
     jobs = [(prompts[i % len(prompts)], i) for i in range(args.n)]
@@ -88,7 +102,7 @@ def main():
             import numpy as np, soundfile as sf
             name = f"{tag}_{i:02d}_{spk}.wav"
             sf.write(f"{args.out}/{name}", np.frombuffer(r["pcm"], dtype="<i2"), SR)
-            texts[name] = text
+            texts[name] = dict(text=text, language=LANG_OF[text]) if args.prompt_set == "chatterbox-mtl" else text
         rows.append(dict(i=i, speaker=spk, ttfa_s=r["ttfa_s"], latency_s=r["latency_s"], audio_s=r["audio_s"],
                          rtf=r["latency_s"] / r["audio_s"] if r["audio_s"] else None))
     ok = [r for r in rows if r["audio_s"] > 0]

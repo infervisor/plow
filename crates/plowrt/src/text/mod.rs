@@ -5,4 +5,5 @@ pub mod guided;
 pub mod logprobs;
 pub mod sample;
 pub mod rules;
+pub mod segment;
 pub mod tokenizer;

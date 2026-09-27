@@ -373,8 +373,8 @@ extern "C" __global__ void plow_sample(
  * host guided sampler (`text::sample::sample_cfg`) on device, so a pair decodes with no host
  * round trip (and rides a multi-step quantum).
  *   g_i = c_i + w (c_i - u_i)            (explicit _rn ops: no FMA contraction, the host rounding)
- *   repetition penalty once per occurrence of i in the row's history (counts[b][i]):
- *     g < 0 ? g * p : g / p, applied counts times
+ *   repetition penalty once if i occurs in the row's history (counts[b][i] > 0), as HF's
+ *     RepetitionPenaltyLogitsProcessor: g < 0 ? g * p : g / p
  *   e_i = exp((g_i - max g) / t); e_i < min_p -> 0
  *   top_p < 1: the shortest descending (weight, index) prefix of the min_p-kept set whose
  *     mass reaches top_p * kept (the host's sort, as an exact threshold + index-order ties)
@@ -446,7 +446,7 @@ extern "C" __global__ void plow_sample_cfg(
         float m = -3.4e38f;
         for (unsigned i = lo; i < hi; i++) {
             float g = guided(i);
-            for (unsigned n = cnt[i]; n > 0u; n--) g = g < 0.0f ? __fmul_rn(g, pen) : __fdiv_rn(g, pen);
+            if (cnt[i] > 0u) g = g < 0.0f ? __fmul_rn(g, pen) : __fdiv_rn(g, pen);
             e[i] = g;
             m = fmaxf(m, g);
         }

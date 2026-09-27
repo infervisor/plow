@@ -60,6 +60,7 @@ pub fn t3_pipeline_section(
     spec: CausalPipelineSpec<'_>,
     pos_base: u32,
     params: &[(String, u64)],
+    dir: &std::path::Path,
 ) -> Result<SectionData, String> {
     use plow_asset::packet_pipeline::{PipelineDType, PipelineTensor};
     let causal = causal_pipeline_section(model, spec)?;
@@ -79,7 +80,18 @@ pub fn t3_pipeline_section(
     // the unconditional CFG member keeps positions but drops the text table.
     pipe.parameters.insert("prompt.bos_repeat".into(), 2);
     pipe.parameters.insert("cfg.uncond_drops_text".into(), 1);
-    pipe.strings.insert("text.rules".into(), T3_TEXT_RULES.into());
+    match t3_text_frontend(dir)? {
+        Some(f) => {
+            pipe.strings.insert("text.rules".into(), f.rules);
+            for (code, rules) in f.languages {
+                pipe.strings.insert(format!("text.rules.lang.{code}"), rules);
+            }
+            pipe.strings.insert("text.default_language".into(), f.default_language);
+        }
+        None => {
+            pipe.strings.insert("text.rules".into(), T3_TEXT_RULES.into());
+        }
+    }
     for t in model.tensors.iter().filter(|t| t.name.starts_with("in.prompt.")) {
         pipe.tensors.insert(
             t.name.clone(),
@@ -175,6 +187,58 @@ pub fn t3_host_tables(dir: &std::path::Path, hidden: u32) -> Result<Vec<packet::
         tables.push(packet::devbuild::TensorDecl { name, bytes: bytes.len() as u64, init: Some(bytes) });
     }
     Ok(tables)
+}
+
+/// A prep-written multilingual text frontend (`text_frontend.json`): the rule list, one rule list
+/// per language code, the default language, and the tables under `text_tables/`.
+struct TextFrontend {
+    rules: String,
+    languages: Vec<(String, String)>,
+    default_language: String,
+    tables: Vec<String>,
+}
+
+fn t3_text_frontend(dir: &std::path::Path) -> Result<Option<TextFrontend>, String> {
+    let p = dir.join("text_frontend.json");
+    if !p.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| format!("{}: {e}", p.display()))?;
+    let bad = |k: &str| format!("{}: bad or missing {k}", p.display());
+    let s = |k: &str| v[k].as_str().map(str::to_string).ok_or_else(|| bad(k));
+    Ok(Some(TextFrontend {
+        rules: s("rules")?,
+        languages: v["languages"]
+            .as_object()
+            .ok_or_else(|| bad("languages"))?
+            .iter()
+            .map(|(k, r)| r.as_str().map(|r| (k.clone(), r.to_string())).ok_or_else(|| bad("languages")))
+            .collect::<Result<_, _>>()?,
+        default_language: s("default_language")?,
+        tables: v["tables"]
+            .as_array()
+            .ok_or_else(|| bad("tables"))?
+            .iter()
+            .map(|t| t.as_str().map(str::to_string).ok_or_else(|| bad("tables")))
+            .collect::<Result<_, _>>()?,
+    }))
+}
+
+/// The frontend's tables as the `text_tables.v1` metadata section (host data: repeated
+/// `u32 name_len, name, u64 len, data`), or `None` without a frontend.
+pub fn t3_text_tables_section(dir: &std::path::Path) -> Result<Option<SectionData>, String> {
+    let Some(f) = t3_text_frontend(dir)? else { return Ok(None) };
+    let mut data = Vec::new();
+    for name in &f.tables {
+        let p = dir.join("text_tables").join(name);
+        let t = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        data.extend((name.len() as u32).to_le_bytes());
+        data.extend(name.as_bytes());
+        data.extend((t.len() as u64).to_le_bytes());
+        data.extend(t);
+    }
+    Ok(Some(SectionData { kind: packet::devbuild::SECT_METADATA, name: "text_tables.v1".into(), data }))
 }
 
 /// Chatterbox's `punc_norm` plus its `[SPACE]` tokenizer convention, as generic text rules

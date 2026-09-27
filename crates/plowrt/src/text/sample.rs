@@ -262,8 +262,9 @@ impl SplitMix {
     }
 }
 
-/// cond + w(cond - uncond), the repetition penalty once per `history` occurrence, temperature,
-/// min_p, top_p, then a draw at `u` in [0,1); `None` = greedy (argmax of the guided logits).
+/// cond + w(cond - uncond), the repetition penalty once per distinct `history` token (as HF's
+/// `RepetitionPenaltyLogitsProcessor`: gather / scatter), temperature, min_p, top_p, then a draw at
+/// `u` in [0,1); `None` = greedy (argmax of the guided logits).
 pub fn sample_cfg(
     p: &CfgParams,
     cond: &[f32],
@@ -307,11 +308,23 @@ fn sample_guided(
         return argmax(scratch);
     };
     if p.repetition_penalty != 1.0 {
-        for t in history {
-            if let Some(x) = scratch.get_mut(t as usize) {
-                *x = if *x < 0.0 { *x * p.repetition_penalty } else { *x / p.repetition_penalty };
-            }
+        thread_local! {
+            static SEEN: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        SEEN.with(|seen| {
+            let mut seen = seen.borrow_mut();
+            seen.clear();
+            seen.resize(scratch.len().div_ceil(64), 0);
+            for t in history {
+                let (w, bit) = (t as usize / 64, 1u64 << (t % 64));
+                if let (Some(x), Some(s)) = (scratch.get_mut(t as usize), seen.get_mut(w)) {
+                    if *s & bit == 0 {
+                        *s |= bit;
+                        *x = if *x < 0.0 { *x * p.repetition_penalty } else { *x / p.repetition_penalty };
+                    }
+                }
+            }
+        });
     }
     let inv_t = 1.0 / p.temperature;
     let m = scratch.iter().copied().fold(f32::NEG_INFINITY, f32::max);

@@ -45,10 +45,12 @@ struct Schedule {
     /// batches cost several times more GPU per utterance, and that time comes out of the LM's.
     min_batch: usize,
     batch_hold: std::time::Duration,
+    /// Final tokens whose audio is cut from the utterance (`lm.trim_tail_tokens`).
+    trim_tail: usize,
 }
 
 impl Schedule {
-    fn from_codec(c: &Codec) -> std::result::Result<Self, String> {
+    fn from_codec(c: &Codec, trim_tail: usize) -> std::result::Result<Self, String> {
         let p = |k: &str| c.parameters.get(k).map(|&v| v as usize).ok_or(format!("vocoder packet lacks {k}"));
         Ok(Self {
             first: p("stream.first_tokens")?,
@@ -59,6 +61,7 @@ impl Schedule {
             max_tokens: c.max_frames,
             min_batch: c.parameters.get("render.min_batch").map_or(1, |&v| v as usize),
             batch_hold: std::time::Duration::from_millis(c.parameters.get("render.hold_ms").copied().unwrap_or(0)),
+            trim_tail,
         })
     }
 }
@@ -137,6 +140,11 @@ impl Utterance {
         self.s3gen_ms += ms;
         self.rendered = self.tokens.len();
         let last = self.t3_ms.is_some();
+        let pcm = if last {
+            &pcm[..pcm.len().min(self.tokens.len().saturating_sub(sc.trim_tail).max(1) * sc.samples_per_token)]
+        } else {
+            pcm
+        };
         match &self.reply {
             Reply::Whole(_) => {
                 let Reply::Whole(tx) = std::mem::replace(&mut self.reply, Reply::Stream(tokio::sync::mpsc::unbounded_channel().0))
@@ -321,6 +329,7 @@ impl GuidedSpeech {
         let c = GuidedLmContract::load(assets)?
             .ok_or_else(|| RuntimeError::Rejected(format!("{} declares no guided LM pipeline", assets.display())))?;
         let tables = PromptTables::load(assets, c.hidden)?;
+        let trim_tail = c.trim_tail_tokens;
         let (s_tx, s_rx) = mpsc::channel::<S3Msg>();
         let (s_ready_tx, s_ready_rx) = mpsc::channel::<Result<()>>();
         let dir = assets.to_path_buf();
@@ -332,7 +341,7 @@ impl GuidedSpeech {
                     Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Device(e)))),
                 };
                 vocoder.couple(Arc::clone(&credit));
-                let sc = match Schedule::from_codec(&vocoder) {
+                let sc = match Schedule::from_codec(&vocoder, trim_tail) {
                     Ok(sc) => sc,
                     Err(e) => return drop(s_ready_tx.send(Err(RuntimeError::Rejected(e)))),
                 };
@@ -350,6 +359,7 @@ impl GuidedSpeech {
         &self,
         voice: &str,
         text: &str,
+        lang: Option<&str>,
         seed: u64,
         class: JobClass,
         respond: crate::serve::stream::ChunkSender,
@@ -357,7 +367,7 @@ impl GuidedSpeech {
         report: Option<crate::serve::session::Report>,
     ) -> Result<Job> {
         let c = &self.c;
-        let ids = self.tables.text_ids(text)?;
+        let ids = self.tables.text_ids(text, lang)?;
         let cond = self.tables.prefill_rows(c, voice, &ids, false)?;
         let uncond = self.tables.prefill_rows(c, voice, &ids, true)?;
         let n = cond.len() / c.hidden;
@@ -399,6 +409,7 @@ impl GuidedSpeech {
         mux: &ModelMux,
         voice: String,
         text: String,
+        lang: Option<&str>,
         seed: u64,
         reply: Reply,
         ids: &crate::serve::session::RequestIds,
@@ -410,7 +421,7 @@ impl GuidedSpeech {
             Reply::Whole(_) => None,
         };
         let class = if probe.is_some() { JobClass::Critical } else { JobClass::Normal };
-        let job = self.job(&voice, &text, seed, class, respond, ids, report).map_err(|e| e.to_string())?;
+        let job = self.job(&voice, &text, lang, seed, class, respond, ids, report).map_err(|e| e.to_string())?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let render = self.render.lock().clone();
         let _ = render.send(S3Msg::Open { id, voice, seed, reply });
@@ -447,17 +458,23 @@ impl GuidedSpeech {
         Ok(())
     }
 
+    /// The request's language as the packet's text rules resolve it (400 on an unsupported one).
+    pub fn language(&self, lang: Option<&str>) -> std::result::Result<Option<String>, String> {
+        self.tables.language(lang).map_err(|e| e.to_string())
+    }
+
     pub async fn synthesize(
         &self,
         mux: &ModelMux,
         voice: String,
         text: String,
+        lang: Option<&str>,
         seed: u64,
         ids: &crate::serve::session::RequestIds,
         report: Option<crate::serve::session::Report>,
     ) -> std::result::Result<SpeechAudio, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.submit(mux, voice, text, seed, Reply::Whole(reply), ids, report)?;
+        self.submit(mux, voice, text, lang, seed, Reply::Whole(reply), ids, report)?;
         rx.await.map_err(|_| "chatterbox render dropped the request".to_string())?
     }
 
@@ -466,12 +483,13 @@ impl GuidedSpeech {
         mux: &ModelMux,
         voice: String,
         text: String,
+        lang: Option<&str>,
         seed: u64,
         ids: &crate::serve::session::RequestIds,
         report: Option<crate::serve::session::Report>,
     ) -> std::result::Result<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>, String> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.submit(mux, voice, text, seed, Reply::Stream(tx), ids, report)?;
+        self.submit(mux, voice, text, lang, seed, Reply::Stream(tx), ids, report)?;
         Ok(rx)
     }
 }
@@ -505,6 +523,7 @@ mod tests {
         max_tokens: 1000,
         min_batch: 1,
         batch_hold: std::time::Duration::ZERO,
+        trim_tail: 0,
     };
 
     /// Renders of a growing prefix emit every sample exactly once, in order, then Done.

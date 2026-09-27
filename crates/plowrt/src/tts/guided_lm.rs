@@ -41,6 +41,8 @@ pub struct GuidedLmContract {
     pub min_p: f32,
     pub top_p: f32,
     pub repetition_penalty: f32,
+    /// Speech tokens at the end of an utterance whose audio is cut (the reference drops them).
+    pub trim_tail_tokens: usize,
 }
 
 impl GuidedLmContract {
@@ -72,6 +74,7 @@ impl GuidedLmContract {
             min_p: f("lm.min_p_f32")?,
             top_p: f("lm.top_p_f32")?,
             repetition_penalty: f("lm.repetition_penalty_f32")?,
+            trim_tail_tokens: p.parameters.get("lm.trim_tail_tokens").copied().unwrap_or(0) as usize,
         })
     }
 
@@ -110,7 +113,7 @@ pub struct PromptTables {
     bos_repeat: usize,
     uncond_drops_text: bool,
     voices: HashMap<String, Vec<f32>>,
-    rules: String,
+    rules: crate::text::rules::TextRules,
     tokenizer: tokenizers::Tokenizer,
 }
 
@@ -142,8 +145,17 @@ impl PromptTables {
             .iter()
             .find(|p| p.driver == DRIVER)
             .ok_or_else(|| RuntimeError::Rejected(format!("packet has no {DRIVER} pipeline")))?;
-        let rules = pipe.strings.get("text.rules").cloned().unwrap_or_default();
-        crate::text::rules::validate(&rules)?;
+        let tables = match blob.reserved_metadata(&raw, crate::text::rules::Tables::SECTION)? {
+            Some(b) => crate::text::rules::Tables::parse(b)?,
+            None => Default::default(),
+        };
+        const LANG: &str = "text.rules.lang.";
+        let rules = crate::text::rules::TextRules::compile(
+            pipe.strings.get("text.rules").map_or("", String::as_str),
+            pipe.strings.iter().filter_map(|(k, v)| Some((k.strip_prefix(LANG)?, v.as_str()))),
+            pipe.strings.get("text.default_language").map(String::as_str),
+            &tables,
+        )?;
         let tk = assets.join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tk)
             .map_err(|e| RuntimeError::Rejected(format!("{}: {e}", tk.display())))?;
@@ -164,9 +176,14 @@ impl PromptTables {
         self.voices.keys().map(String::as_str)
     }
 
-    /// Tokenize after the packet's text rules.
-    pub fn text_ids(&self, text: &str) -> Result<Vec<u32>> {
-        let t = crate::text::rules::apply(&self.rules, text)?;
+    /// The language a request selects (`None` for a packet without language selection).
+    pub fn language(&self, lang: Option<&str>) -> Result<Option<String>> {
+        self.rules.resolve(lang)
+    }
+
+    /// Tokenize after the packet's text rules; `lang` as resolved by [`Self::language`].
+    pub fn text_ids(&self, text: &str, lang: Option<&str>) -> Result<Vec<u32>> {
+        let t = self.rules.apply(text, lang)?;
         let enc = self.tokenizer.encode(t, true).map_err(|e| RuntimeError::Rejected(format!("tokenize: {e}")))?;
         Ok(enc.get_ids().to_vec())
     }
@@ -230,14 +247,20 @@ impl GuidedLm {
             return Err(RuntimeError::ContextLength(format!("T3 prompt {n} rows > overlay capacity {}", self.c.overlay_rows)));
         }
         self.e.begin_slot(slot, n + self.c.max_speech_tokens + 2)?;
-        self.e.write_tensor("in.encoder_overlay", 0, bytemuck::cast_slice(rows))?;
-        let index: Vec<u32> = (0..self.c.overlay_rows as u32).map(|i| if (i as usize) < n { i } else { u32::MAX }).collect();
-        self.e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&index))?;
         self.e.write_tensor("in.pos_base", (slot * 4) as u64, &((n - 1) as u32).to_le_bytes())?;
         let ids = vec![0u32; n];
-        match self.e.prefill_chunk(slot, &ids, n)? {
-            PrefillStep::Done(_) => {}
-            PrefillStep::Progress(_) => return Err(RuntimeError::Rejected("T3 prefill must fit one chunk".into())),
+        // Chunk-relative overlay rows, as the mux stages them: launch row r reads overlay row r.
+        let window = self.c.overlay_rows.min(self.e.pf_max_rows().max(1));
+        let mut c0 = 0;
+        loop {
+            let hi = n.min(c0 + window);
+            self.e.write_tensor("in.encoder_overlay", 0, bytemuck::cast_slice(&rows[c0 * h..hi * h]))?;
+            let index: Vec<u32> = (0..self.c.overlay_rows).map(|r| if c0 + r < hi { r as u32 } else { u32::MAX }).collect();
+            self.e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(&index))?;
+            match self.e.prefill_chunk(slot, &ids, n)? {
+                PrefillStep::Done(_) => break,
+                PrefillStep::Progress(p) => c0 = p,
+            }
         }
         self.read_logits_row(0)
     }
@@ -254,8 +277,9 @@ impl GuidedLm {
     }
 
     /// Numerics probe: text ids and the (cond, uncond) last-prefill logits on slot pair 0.
-    pub fn probe_prefill(&mut self, voice: &str, text: &str) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
-        let ids = self.tables.text_ids(text)?;
+    pub fn probe_prefill(&mut self, voice: &str, text: &str, lang: Option<&str>) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
+        let lang = self.tables.language(lang)?;
+        let ids = self.tables.text_ids(text, lang.as_deref())?;
         let rows = self.tables.prefill_rows(&self.c, voice, &ids, false)?;
         self.prefill_member(0, &rows)?;
         let cond = self.logits.clone();
@@ -265,8 +289,9 @@ impl GuidedLm {
     }
 
     /// Greedy guided decoding of one request on slot pair 0: speech tokens, stop excluded.
-    pub fn greedy(&mut self, voice: &str, text: &str, max_tokens: usize) -> Result<Vec<u32>> {
-        let ids = self.tables.text_ids(text)?;
+    pub fn greedy(&mut self, voice: &str, text: &str, lang: Option<&str>, max_tokens: usize) -> Result<Vec<u32>> {
+        let lang = self.tables.language(lang)?;
+        let ids = self.tables.text_ids(text, lang.as_deref())?;
         let rows = self.tables.prefill_rows(&self.c, voice, &ids, true)?;
         self.prefill_member(1, &rows)?;
         std::mem::swap(&mut self.logits, &mut self.uncond);
@@ -310,6 +335,7 @@ mod tests {
             min_p: 0.05,
             top_p: 1.0,
             repetition_penalty: 1.2,
+            trim_tail_tokens: 0,
         }
     }
 
@@ -330,5 +356,18 @@ mod tests {
             seen.insert(t);
         }
         assert_eq!(seen.into_iter().collect::<Vec<_>>(), [0, 1, 2, 5]);
+    }
+
+    /// The penalty applies once per distinct history token (HF gather / scatter), not per occurrence.
+    #[test]
+    fn repetition_penalty_once_per_distinct_token() {
+        let c = contract().cfg();
+        let cond = [1.0, 3.0, 2.0, -1.0, 0.0, 2.9];
+        let uncond = [1.0, 3.0, 0.0, -1.0, 0.0, 3.0];
+        let mut s = Vec::new();
+        for i in 0..1000 {
+            let u = Some(i as f32 / 1000.0);
+            assert_eq!(sample_cfg(&c, &cond, &uncond, [1, 1, 1, 5, 5], u, &mut s), sample_cfg(&c, &cond, &uncond, [1, 5], u, &mut s));
+        }
     }
 }

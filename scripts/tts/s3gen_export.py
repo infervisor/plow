@@ -38,14 +38,14 @@ def snapshot():
     return c[0]
 
 
-def load_s3gen():
+def load_s3gen(weights="s3gen.safetensors"):
     import perth
     if getattr(perth, "PerthImplicitWatermarker", None) is None:
         perth.PerthImplicitWatermarker = perth.DummyWatermarker
     from safetensors.torch import load_file
     from chatterbox.models.s3gen import S3Gen
     m = S3Gen()
-    m.load_state_dict(load_file(os.path.join(snapshot(), "s3gen.safetensors")), strict=False)
+    m.load_state_dict(load_file(os.path.join(snapshot(), weights)), strict=False)
     return m.eval()
 
 
@@ -54,6 +54,7 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--voice", action="append", default=[], help="NAME=conds.pt (default: the builtin voice)")
     ap.add_argument("--max-tokens", type=int, default=1000)
+    ap.add_argument("--weights", default="s3gen.safetensors", help="snapshot file (Multilingual V3: s3gen_v3.safetensors)")
     args = ap.parse_args()
     from safetensors.torch import save_file
 
@@ -62,7 +63,7 @@ def main():
     def put(name, t):
         T[name] = torch.as_tensor(t).detach().double().float().contiguous()
 
-    m = load_s3gen()
+    m = load_s3gen(args.weights)
     fl, enc, h = m.flow, m.flow.encoder, m.mel2wav
     est = fl.decoder.estimator
     voices = args.voice or [f"default={os.path.join(snapshot(), 'conds.pt')}"]

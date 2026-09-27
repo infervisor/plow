@@ -51,6 +51,10 @@ pub struct SpeechRequest {
     pub seed: Option<u64>,
     #[serde(default)]
     pub max_tokens: Option<usize>,
+    /// ISO 639-1 code of the input's language for multilingual models (e.g. `zh`); default is the
+    /// packet's `text.default_language`. Models without language selection reject it.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// Guided speech front-ends (`tts.guided_lm.v1`) by asset directory, bound on first use.
@@ -114,8 +118,12 @@ async fn speech_on_guided(
     let seed = req.seed.unwrap_or_else(|| {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
     });
+    let lang = match w.language(req.language.as_deref()) {
+        Ok(l) => l,
+        Err(e) => return bad(e, "language"),
+    };
     if req.stream {
-        let mut ev = match w.synthesize_stream(&mux, req.voice.clone(), req.input.clone(), seed, ids, report) {
+        let mut ev = match w.synthesize_stream(&mux, req.voice.clone(), req.input.clone(), lang.as_deref(), seed, ids, report) {
             Ok(rx) => rx,
             Err(e) => return server_error(e),
         };
@@ -154,7 +162,7 @@ async fn speech_on_guided(
         let ct = if wav { "audio/wav" } else { "audio/pcm" };
         return ([(header::CONTENT_TYPE, ct)], body).into_response();
     }
-    match w.synthesize(&mux, req.voice.clone(), req.input.clone(), seed, ids, report).await {
+    match w.synthesize(&mux, req.voice.clone(), req.input.clone(), lang.as_deref(), seed, ids, report).await {
         Err(e) => server_error(e),
         Ok(a) => {
             let audio_s = a.pcm.len() as f64 / f64::from(w.sample_rate);

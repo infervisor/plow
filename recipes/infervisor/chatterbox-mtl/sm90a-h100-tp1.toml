@@ -1,0 +1,76 @@
+# Chatterbox Multilingual V3 (ResembleAI/chatterbox t3_mtl23ls_v3 + s3gen_v3, 23 languages) on H100:
+# the English Chatterbox pipeline (tts.guided_lm.v1 T3 with CFG pairs + s3gen.pkt) with the
+# multilingual text frontend as packet data (text rules per language + the text_tables.v1 section:
+# pkuseg CRF + Cangjie for zh, kakasi dictionary for ja). Requests select the language with
+# `"language": "<ISO 639-1>"` (default en). Every stage is a plowc packet.
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (this box only) CBX_PY=<python with upstream chatterbox (mtl_tts v3)> \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/chatterbox-mtl/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Gates: text ids vs the reference frontend (crates/plowrt/examples/t3_text_check.rs +
+# scripts/tts/mtl_text_ref.py), T3 last-prefill logits vs fp32 (t3_check.rs + t3_mtl_ref.py),
+# s3gen mel rel-L2 vs torch (s3gen_packet_check.py --s3gen-weights s3gen_v3.safetensors), Whisper
+# CER per language (asr_check.py, language-aware) next to the reference's own CER.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "chatterbox-mtl"
+label = "sm90a-h100-tp1"
+network = "llama"
+doc = "docs/runtime/tts.md"
+tracker = "plans/tts-veena-chatterbox-h200-tracker.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:ResembleAI/chatterbox"
+
+[cell]
+name = "chatterbox-mtl-h100"
+hf_dir = "{out}/prep/t3"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 2048
+
+[[prep]]
+name = "t3-mtl-checkpoint"
+script = "scripts/tts/chatterbox_mtl_prep.py"
+python = "{env:CBX_PY}"
+args = ["{out}/prep/t3", "--t3", "t3_mtl23ls_v3.safetensors"]
+env = { PYTHONPATH = "" }
+
+[[prep]]
+name = "s3gen-v3-export"
+script = "scripts/tts/s3gen_export.py"
+python = "{env:CBX_PY}"
+args = ["{out}/prep/s3gen", "--weights", "s3gen_v3.safetensors"]
+env = { PYTHONPATH = "" }
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "chatterbox-mtl"]
+[emit.env]
+PLOW_TTS_VOCODER_DIR = "{out}/prep/s3gen"
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+# Same rungs and knobs as the English recipe: T3 has the same shape (only the text table grows
+# 704 -> 2454 rows, a host table).
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "256,384"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_FUSE_KV_HNR = "1"
+
+[bench]
+kind = "speech"
+client = "scripts/tts/tts_bench.py"
+arms = ["--conc 1 --stream --wav --n 24 --prompt-set chatterbox-mtl --voice default", "--conc 1 --n 24 --prompt-set chatterbox-mtl --voice default --tag full_c1", "--conc 16 --stream --n 48 --prompt-set chatterbox-mtl --voice default", "--conc 16 --n 48 --prompt-set chatterbox-mtl --voice default --tag full_c16"]
+reference = "scripts/tts/chatterbox_mtl_ref.py"

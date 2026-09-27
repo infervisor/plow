@@ -9976,9 +9976,11 @@ fn emit_dense_gqa(
                 },
                 emitter.tn.pos_base,
                 &c.speech_params,
+                &dir,
             )
             .unwrap_or_else(|error| panic!("T3 speech packet pipeline: {error}")),
         );
+        sections.extend(tts::t3_text_tables_section(&dir).unwrap_or_else(|e| panic!("T3 text tables: {e}")));
     } else if c.encoder_overlay_rows > 0 && !block_mode {
         sections.push(
             pipeline::causal_pipeline_section(
