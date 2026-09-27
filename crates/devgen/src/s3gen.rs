@@ -153,9 +153,9 @@ fn length_scales(cfg: &Config) -> [(u32, u32); 7] {
     [(1, p), (2, 2 * p), (2, 0), (2 * u0, 0), (2 * u0 * u1, 0), (2 * u0 * u1 * u2, 1), (2 * cfg.frame_samples(), 0)]
 }
 
-/// `s3gen.pkt` for the S3Gen export in `dir` (scripts/tts/s3gen_export.py), with the rewrite's
+/// `s3gen.pkt` (model + pipeline section) for the S3Gen export in `dir` (scripts/tts/s3gen_export.py), with the rewrite's
 /// fused sites of that export's graph when plowc extracted them.
-pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<&RewriteSites>) -> Result<Vec<u8>, String> {
+pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<&RewriteSites>) -> Result<(packet::devbuild::Model, packet::devbuild::SectionData), String> {
     let cfg = Config::parse(
         &serde_json::from_slice(&std::fs::read(dir.join("config.json")).map_err(|e| format!("{}: {e}", dir.display()))?)
             .map_err(|e| format!("s3gen config: {e}"))?,
@@ -228,7 +228,7 @@ pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<
         }
     }
     let section = pipeline_section(&prefix, &cfg, roles, &inputs, bmax, nmax, &names)?;
-    Ok(prefix.model.to_blob_v6(&[section]))
+    Ok((prefix.model, section))
 }
 
 #[derive(Clone, Copy)]

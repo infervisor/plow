@@ -101,9 +101,9 @@ pub const SNAC_CAPACITIES: &[(u32, u32)] = &[
     (1, 128), (4, 128),
 ];
 
-/// `codec.pkt` for the exported SNAC decoder in `dir` (scripts/tts/snac_export.py), with the
+/// `codec.pkt` (model + pipeline section) for the exported SNAC decoder in `dir` (scripts/tts/snac_export.py), with the
 /// rewrite's fused sites of that export's graph when plowc extracted them.
-pub fn lower_snac(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<&RewriteSites>) -> Result<Vec<u8>, String> {
+pub fn lower_snac(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<&RewriteSites>) -> Result<(packet::devbuild::Model, packet::devbuild::SectionData), String> {
     let cfg = SnacConfig::parse(
         &serde_json::from_slice(&std::fs::read(dir.join("config.json")).map_err(|e| format!("{}: {e}", dir.display()))?)
             .map_err(|e| format!("snac config: {e}"))?,
@@ -176,7 +176,7 @@ pub fn lower_snac(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<&
         }
     }
     let section = pipeline_section(&prefix, &cfg, roles, bmax, max_rows, &lengths, seed)?;
-    Ok(prefix.model.to_blob_v6(&[section]))
+    Ok((prefix.model, section))
 }
 
 #[allow(clippy::too_many_arguments)]

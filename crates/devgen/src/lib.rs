@@ -7245,6 +7245,112 @@ pub(crate) fn write_lean_receipts(packet: &std::path::Path, lean: &LeanReport) {
         .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
 }
 
+/// Batch runner for sidecar-packet obligations: `(checkpoint, payload)` requests in, the
+/// certificates (as JSON) and the verifier digest out. `Ok(None)` = verifier not runnable.
+pub type SidecarVerifier = Box<
+    dyn Fn(&[(&'static str, serde_json::Value)]) -> Result<Option<(Vec<serde_json::Value>, String)>, String>
+        + Send,
+>;
+
+static SIDECAR_VERIFIER: std::sync::Mutex<Option<SidecarVerifier>> = std::sync::Mutex::new(None);
+
+/// Checkpoint D (logical tensor effects) for every sidecar packet (`encoder.pkt`, `codec.pkt`,
+/// `s3gen.pkt`) emitted later in this process. Not installed = those packets are not checked.
+pub fn install_sidecar_verifier(verify: SidecarVerifier) {
+    *SIDECAR_VERIFIER.lock().unwrap_or_else(|e| e.into_inner()) = Some(verify);
+}
+
+/// The sidecar's logical-effect obligations (one Lean check per distinct obligation), verified
+/// BEFORE its blob is written (a rejection aborts emission), then the blob and
+/// `<stem>.lean-checks.json`.
+fn write_sidecar_packet(
+    path: &std::path::Path,
+    model: &packet::devbuild::Model,
+    sections: &[packet::devbuild::SectionData],
+) {
+    use plow_asset::certificates::{request_sha256, CompileCheckReceipt, SemanticScope, SidecarCheckReceipts};
+    let name = path.display();
+    let mut requests: Vec<(&'static str, serde_json::Value)> = Vec::new();
+    let mut digests = std::collections::HashMap::new();
+    let mut program_checks = Vec::new();
+    let mut first_program = Vec::new();
+    plow_asset::program::with_model(model, |packet| {
+        for program in 0..packet.programs.len() {
+            match plow_asset::logical_effects::obligation(packet, program) {
+                Ok(request) => {
+                    let digest = request_sha256(&request).expect("request digest");
+                    let index = *digests.entry(digest).or_insert_with(|| {
+                        requests.push(("D", request));
+                        first_program.push(program);
+                        requests.len() - 1
+                    });
+                    program_checks.push(Some(index));
+                }
+                Err(reason) => {
+                    eprintln!("  {name}: program {program} logical effects NOT checked: {reason}");
+                    program_checks.push(None);
+                }
+            }
+        }
+    });
+    let verdict = match SIDECAR_VERIFIER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        None => Err("no sidecar verifier installed"),
+        Some(verify) => match verify(&requests) {
+            Ok(Some(result)) => Ok(result),
+            Ok(None) => Err("verifier not runnable"),
+            Err(error) => panic!("{name}: logical effects batch failed: {error}"),
+        },
+    };
+    let checks_path = plow_asset::certificates::sidecar_checks_file(path);
+    let receipts = match verdict {
+        Err(reason) => {
+            eprintln!("  {name}: Lean checks skipped ({reason}); not verified");
+            None
+        }
+        Ok((certs, verifier_sha256)) => {
+            assert_eq!(certs.len(), requests.len(), "{name}: certificate count");
+            let mut checks = Vec::new();
+            for ((cert, (checkpoint, request)), program) in certs.into_iter().zip(requests).zip(first_program) {
+                if cert.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+                    panic!("{name}: program {program}: logical tensor effects REJECTED: {}",
+                        cert.get("reason").and_then(serde_json::Value::as_str).unwrap_or(""));
+                }
+                checks.push(CompileCheckReceipt {
+                    program: Some(program),
+                    scope: SemanticScope::LogicalTensorEffects,
+                    checkpoint: checkpoint.into(),
+                    request_sha256: request_sha256(&request).expect("request digest"),
+                    verifier_sha256: verifier_sha256.clone(),
+                    request,
+                    response: cert,
+                });
+            }
+            eprintln!("  {name}: logical tensor effects Lean-checked for {} of {} programs ({} distinct)",
+                program_checks.iter().flatten().count(), program_checks.len(), checks.len());
+            Some((checks, program_checks))
+        }
+    };
+    let blob = model.to_blob_v6(sections);
+    std::fs::write(path, &blob).unwrap_or_else(|error| panic!("{name}: {error}"));
+    let Some((checks, program_checks)) = receipts else {
+        // A stale file would describe an older blob.
+        let _ = std::fs::remove_file(&checks_path);
+        return;
+    };
+    let compiler = std::fs::read(std::env::current_exe().expect("compiler executable path"))
+        .expect("read compiler executable for check binding");
+    let receipts = SidecarCheckReceipts {
+        schema: 1,
+        packet_sha256: plow_asset::decode_objects::image_sha256(&blob),
+        compiler_sha256: plow_asset::decode_objects::image_sha256(&compiler),
+        checks,
+        program_checks,
+    };
+    receipts.validate_packet(&blob).expect("sidecar check receipt binding");
+    std::fs::write(&checks_path, serde_json::to_vec(&receipts).expect("serialize sidecar checks"))
+        .unwrap_or_else(|error| panic!("{}: {error}", checks_path.display()));
+}
+
 /// Read-only verification hook for [`run_verified`], called with the finished
 /// [`packet::devbuild::Model`] immediately before the blob is written
 /// (dense-GQA path only for now). An `Err` ABORTS emission.
@@ -10270,26 +10376,26 @@ fn emit_dense_gqa(
         let section = encoder
             .pipeline_section(3000)
             .unwrap_or_else(|error| panic!("Qwen audio packet metadata: {error}"));
-        encoder.prefix.model.to_blob_v6(&[section])
+        (encoder.prefix.model, section)
     });
     std::fs::write(&out, blob).unwrap();
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().0;
-        let blob = codec::lower_snac(dir, n_cu, m.target, sites).unwrap_or_else(|error| panic!("codec packet: {error}"));
+        let (model, section) = codec::lower_snac(dir, n_cu, m.target, sites).unwrap_or_else(|error| panic!("codec packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name("codec.pkt");
-        std::fs::write(&path, blob).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  codec packet -> {}", path.display());
     }
     if let Some(dir) = ecfg.tts_vocoder.as_deref().filter(|_| !block_mode) {
         let sites = whole_graph_audio_sites().1;
-        let blob = s3gen::lower_s3gen(dir, n_cu, m.target, sites).unwrap_or_else(|error| panic!("s3gen packet: {error}"));
+        let (model, section) = s3gen::lower_s3gen(dir, n_cu, m.target, sites).unwrap_or_else(|error| panic!("s3gen packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
-        std::fs::write(&path, blob).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  s3gen packet -> {}", path.display());
     }
-    if let Some(blob) = audio_blob {
+    if let Some((model, section)) = audio_blob {
         let path = std::path::Path::new(&out).with_file_name("encoder.pkt");
-        std::fs::write(&path, blob).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        write_sidecar_packet(&path, &model, &[section]);
         eprintln!("  audio encoder packet -> {}", path.display());
     }
     if let Some(plan) = channel_plan {

@@ -18,6 +18,13 @@ fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         Residual | Glu | NormResidual | Gemm | Gemv | QuantFp8Block128 => 3,
         AddNorm | NormResidualNorm | MlaBmmFp8 => 4,
         GemmFp8Block128 => 5,
+        // Generic speech FP32 ops (runtime/nvidia/op_speech_f32.cuh): out = t0, inputs after it.
+        Q8GemmF32 | LayerNormF32 | ScaledAddF32 | GluF32 | CausalDepthwiseConv1dF32
+        | RelativeAttentionF32 | SiluF32 | DenseGemmF32 | EmbedF16F32 | ArgmaxF32 | ReluF32
+        | BroadcastAddF32 | Conv2dF32 | PackNcfwRowsF32 | GroupedAttentionF32 | EmbedOverlayBf16
+        | GemmF32 | GatherRowsF32 | CopyColsF32 | Conv1dF32 | ConvTranspose1dF32 | UnaryF32
+        | BinaryF32 | CumSumF64 | RandF32 | AttentionF32 | RowStatsF32 => 2,
+        LstmCellF32 => 3,
         _ => return Err(format!("unaudited logical effects for {op:?}")),
     };
     if d.t[..required].contains(&TENSOR_NONE16) {
@@ -33,7 +40,42 @@ fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         // The multi-output QB/split variants require their own footprint audit.
         GemmFp8Block128 if d.i[4] == 0 && d.t[5..].iter().all(|&h| h == TENSOR_NONE16) => Ok(&[0]),
         MlaBmmFp8 if d.i[4] == 0 => Ok(&[0]),
+        // The split-K workspace (tickets + partials) is written by every DenseGemmF32 sharing it.
+        DenseGemmF32 if d.t[4] != TENSOR_NONE16 => Ok(&[0, 4]),
+        LstmCellF32 => Ok(&[0, 1]),
+        Q8GemmF32 | LayerNormF32 | ScaledAddF32 | GluF32 | CausalDepthwiseConv1dF32
+        | RelativeAttentionF32 | SiluF32 | DenseGemmF32 | EmbedF16F32 | ArgmaxF32 | ReluF32
+        | BroadcastAddF32 | Conv2dF32 | PackNcfwRowsF32 | GroupedAttentionF32 | EmbedOverlayBf16
+        | GemmF32 | GatherRowsF32 | CopyColsF32 | Conv1dF32 | ConvTranspose1dF32 | UnaryF32
+        | BinaryF32 | CumSumF64 | RandF32 | AttentionF32 | RowStatsF32 => Ok(&[0]),
         op => Err(format!("unaudited logical effects for {op:?}")),
+    }
+}
+
+/// Residue band of a strided f32 access: every element index `e` it touches has
+/// `e % stride` in `[lo, hi)` (Plow.Speech.band_elem_residue). `None` = whole tensor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Band {
+    stride: u32,
+    lo: u32,
+    hi: u32,
+}
+
+fn band(d: &DevInst64, slot: usize) -> Option<Band> {
+    let make = |stride: u32, offset: u32, cols: u32, item_stride: u32| {
+        let hi = offset.checked_add(cols)?;
+        (stride > 0 && cols > 0 && hi <= stride && item_stride % stride == 0)
+            .then_some(Band { stride, lo: offset, hi })
+    };
+    match (DevOp::from_u16(d.op)?, slot) {
+        // out[b*j1 + r*i5 + i6 + c], x[b*j0 + r*i3 + i4 + c], c < i2.
+        (DevOp::CopyColsF32, 0) => make(d.i[5], d.i[6], d.i[2], d.fj[2]),
+        (DevOp::CopyColsF32, 1) => make(d.i[3], d.i[4], d.i[2], d.fj[1]),
+        // out[r*(j0 or width) + j1 + c], c < width.
+        (DevOp::GatherRowsF32, 0) => {
+            make(if d.fj[1] == 0 { d.i[1] } else { d.fj[1] }, d.fj[2], d.i[1], 0)
+        }
+        _ => None,
     }
 }
 
@@ -153,7 +195,7 @@ pub fn obligation(packet: &Packet<'_>, index: usize) -> Result<Value, String> {
     let exit = count + 1;
     let n = count + 2;
     let mut accesses = Vec::new();
-    let mut users: BTreeMap<u16, BTreeMap<usize, bool>> = BTreeMap::new();
+    let mut users: BTreeMap<u16, BTreeMap<usize, (bool, Option<Band>)>> = BTreeMap::new();
     for (pc, inst) in program.insts.iter().enumerate() {
         let writes = outputs(inst)?;
         if inst.op == DevOp::Nop as u16 {
@@ -176,12 +218,13 @@ pub fn obligation(packet: &Packet<'_>, index: usize) -> Result<Value, String> {
                 return Err("empty or aliased effect tensor".into());
             }
             let write = writes.contains(&slot);
+            let band = band(inst, slot);
             users
                 .entry(handle)
                 .or_default()
                 .entry(pc + 1)
-                .and_modify(|prior| *prior |= write)
-                .or_insert(write);
+                .and_modify(|prior| *prior = (prior.0 | write, prior.1.filter(|b| Some(*b) == band)))
+                .or_insert((write, band));
         }
     }
     if users.is_empty() {
@@ -207,33 +250,50 @@ pub fn obligation(packet: &Packet<'_>, index: usize) -> Result<Value, String> {
     let mut logical_offset = 0u64;
     for (&handle, tasks) in &users {
         let tensor = &packet.tensors[handle as usize];
+        // Bands are comparable only under one stride, and a whole-tensor access covers every
+        // residue only when the stride fits the tensor.
+        let mut strides = tasks.values().filter_map(|(_, b)| b.map(|b| b.stride));
+        let banded = strides.next().filter(|&s| {
+            strides.all(|t| t == s) && u64::from(s) * 4 <= tensor.bytes
+        });
+        let extent = |band: Option<Band>| match band.filter(|_| banded.is_some()) {
+            Some(b) => (u64::from(b.lo) * 4, u64::from(b.hi - b.lo) * 4),
+            None => (0, tensor.bytes),
+        };
         leases.push(
             json!({"pool":handle,"allocation":handle,"generation":0,"owner":0,
             "offset":0,"size":tensor.bytes,"acquire":0,"retire":exit,"cancel":null}),
         );
         address_map.push(json!({"name":format!("tensor:{handle}"),"cls":"Persistent",
             "offset":logical_offset,"size":tensor.bytes,
-            "writers":tasks.iter().filter_map(|(&task,&write)| write.then_some(task)).collect::<Vec<_>>(),
+            "writers":tasks.iter().filter_map(|(&task,&(write,_))| write.then_some(task)).collect::<Vec<_>>(),
             "readers":tasks.keys().copied().collect::<Vec<_>>() }));
         logical_offset = logical_offset
             .checked_add(tensor.bytes)
             .ok_or("logical effect extent overflow")?;
-        for (&task, &write) in tasks {
+        for (&task, &(write, band)) in tasks {
+            let (offset, size) = extent(band);
             accesses.push(
                 json!({"task":task,"pool":handle,"allocation":handle,"generation":0,
-                "owner":0,"offset":0,"size":tensor.bytes,"write":write}),
+                "owner":0,"offset":offset,"size":size,"write":write}),
             );
             needed.entry(0).or_default().insert(task);
             needed.entry(task).or_default().insert(exit);
-            for (&other, &other_write) in tasks.range((task + 1)..) {
-                if write || other_write {
+            for (&other, &(other_write, other_band)) in tasks.range((task + 1)..) {
+                let (other_offset, other_size) = extent(other_band);
+                if (write || other_write)
+                    && offset < other_offset + other_size
+                    && other_offset < offset + size
+                {
                     needed.entry(task).or_default().insert(other);
                 }
             }
         }
     }
     needed.entry(0).or_default().insert(exit);
-    let mut paths = Vec::new();
+    // One parent-pointer tree per source (Lean `treeBefore`), pruned to the chains of the
+    // needed targets. Every edge runs from a lower to a higher task, so parent < node.
+    let mut trees = Vec::new();
     for (source, targets) in needed {
         let mut parent = vec![usize::MAX; n];
         let mut queue = VecDeque::from([source]);
@@ -246,29 +306,26 @@ pub fn obligation(packet: &Packet<'_>, index: usize) -> Result<Value, String> {
                 }
             }
         }
+        let mut kept: Vec<Option<usize>> = vec![None; n];
         for target in targets {
-            if parent[target] == usize::MAX {
-                continue;
-            } // Lean rejects the uncovered conflict.
-            let mut via = Vec::new();
-            let mut node = parent[target];
-            while node != source {
-                via.push(node);
+            // An unreached target stays uncovered and Lean rejects the conflict.
+            let mut node = target;
+            while node != source && parent[node] != usize::MAX && kept[node].is_none() {
+                kept[node] = Some(parent[node]);
                 node = parent[node];
             }
-            via.reverse();
-            paths.push(json!({"source":source,"target":target,"via":via}));
         }
+        trees.push(json!({"source":source,"parent":kept}));
     }
     let dependencies: Vec<_> = edges.iter().map(|&(s, t)| [s + 1, t + 1]).collect();
     Ok(json!({
-        "logical_effect_scope": "whole_declared_tensors; distinct logical pools; entry/exit lifetime; kernel bounds, physical aliases, runtime retirement and fence implementation external",
+        "logical_effect_scope": "whole_declared_tensors, strided f32 copies/gathers as stride-residue bands; distinct logical pools; entry/exit lifetime; kernel bounds, physical aliases, runtime retirement and fence implementation external",
         "task_graph":{"n":n,"edges":dependencies},
         "protocol":{"waits":waits,"succs":(0..n).map(|id|vec![id]).collect::<Vec<_>>(),
             "threshold":(0..n).map(|id|(id.to_string(),1)).collect::<BTreeMap<_,_>>(),
             "resource":(0..n).collect::<Vec<_>>(),"stream_idx":vec![0;n]},
         "dependency_paths":vec![Vec::<usize>::new();edges.len()],
-        "address_map":address_map,"address_paths":paths,
+        "address_map":address_map,"address_trees":trees,
         "memory_effects":{"schema":1,"leases":leases,"accesses":accesses,
             "fence_counters":(0..n).collect::<Vec<_>>()}
     }))

@@ -1115,6 +1115,22 @@ fn devblob_verify_hook(
     nvidia_target: bool,
 ) -> Result<devgen::VerifyHook, Box<dyn std::error::Error>> {
     use lean_verify::checkpoints::schedule as lv;
+    if do_verify {
+        devgen::install_sidecar_verifier(Box::new(|requests| {
+            match lean_verify::call_batch_bound(requests) {
+                Ok((certs, verifier_sha256)) => Ok(Some((
+                    certs.iter().map(serde_json::to_value).collect::<Result<_, _>>()
+                        .map_err(|error| error.to_string())?,
+                    verifier_sha256,
+                ))),
+                Err(e) if e.is_binary_unusable() => {
+                    warn!(error = %e, "sidecar lean checks skipped: verifier not runnable");
+                    Ok(None)
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }));
+    }
     Ok(Box::new(move |m: &packet::devbuild::Model| {
         let mut rep = devgen::LeanReport::default();
         if do_oracle {
