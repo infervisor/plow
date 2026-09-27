@@ -526,8 +526,9 @@ pub(crate) struct Dsv41ProjAct {
 /// and together with `wo_a`/`wo_b` they are **82.98 TFLOP of the 281.6 TFLOP 8k prefill** -- the
 /// single largest term after the routed experts, and the reason the block-fp8 arm was item 0.
 ///
-/// Returns the scratch plus the instruction id of the last op, so the caller can chain the
-/// attention core onto it.
+/// Returns the scratch plus the last op of each branch (`[kv, q]`): the two chains are parallel,
+/// so a consumer of `q` must wait on both. Prefill isolation orders them anyway; a single-segment
+/// decode program does not.
 ///
 /// # What is NOT here
 ///
@@ -545,7 +546,7 @@ pub(crate) fn emit_dsv41_attn_proj(
     x: u32,
     t: u32,
     deps: &[u32],
-) -> (Dsv41ProjAct, u32) {
+) -> (Dsv41ProjAct, [u32; 2]) {
     let hidden = c.hidden;
     let q_lora = c.q_lora;
     assert_eq!(c.heads % tp, 0, "tp={tp} must divide {} heads", c.heads);
@@ -642,8 +643,7 @@ pub(crate) fn emit_dsv41_attn_proj(
         d.i[1] = kv_out;
         d.f[0] = eps;
     });
-    let _ = c_q;
-    (act, c_kv)
+    (act, [c_kv, c_q])
 }
 
 /// CSA2's write side: the compressed-KV cache the whole chain shares, and one source's scratch.
@@ -2848,11 +2848,11 @@ pub(crate) fn emit_dsv41_block(
         // dependency list even though the core does not read the cache yet: the cache is shared
         // with LATER layers, and an op outside the chain's dependency order is an op the
         // scheduler may float past the layer that reads it.
-        let mut core_deps = vec![c_proj];
+        let mut core_deps = c_proj.to_vec();
         // Decode state: the ring is seeded from the normed latent BEFORE the core ropes it in place.
         if let Some(st) = &st {
             core_deps.push(super::dsv41_decode::emit_dsv41_ring_seed(
-                &mut b, c, st, &all, l, proj.kv, pos, kvlen, lcos, lsin, t, &[c_proj],
+                &mut b, c, st, &all, l, proj.kv, pos, kvlen, lcos, lsin, t, &c_proj,
             ));
         }
         if c.kv_source.contains(&l) {
@@ -2862,7 +2862,7 @@ pub(crate) fn emit_dsv41_block(
             // With decode state, this source's cache is its own per-slot `kv.cmp{l}`.
             let cps = st.as_ref().map(|st| Dsv41Compress { cache: st.cmp[&l], kv: cp.kv, gate: cp.gate, latent: cp.latent });
             let c_cmp = emit_dsv41_compressor(
-                &mut b, c, &w, &all, cps.as_ref().unwrap_or(cp), l, proj.xn, lcos, lsin, t, &[c_proj],
+                &mut b, c, &w, &all, cps.as_ref().unwrap_or(cp), l, proj.xn, lcos, lsin, t, &c_proj,
             );
             core_deps.push(c_cmp);
             if let Some(st) = &st {
@@ -3171,7 +3171,7 @@ fn emit_dsv41_decode_program(
             lsin,
             ctx,
             attn_o,
-            &[c_proj],
+            &c_proj,
         );
         let (out, c_out) = emit_dsv41_attn_out(b, c, w, &all, l, tp, attn_o, bsz, &mut xgate, &[c_core]);
         let c_post = emit_dsv41_mhc_post(b, c, &mhc, out.o, ri, bsz, tp, &c_out);

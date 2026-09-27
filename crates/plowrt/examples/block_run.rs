@@ -10,7 +10,7 @@
 //!                              [--pf-chunk N] [--pf-cap ROWS]
 //!   block_run <asset-dir> mixed-check --rows 128 --decode 1
 //!   block_run <asset-dir> packed-check
-//!   block_run <asset-dir> decode-check --dir <oracle ref_decode dir> [--dump-tensors name,name]
+//!   block_run <asset-dir> decode-check --dir <oracle ref_decode dir> [--out-tensor name] [--pf-chunk rows] [--dump-tensors name,name]
 //!
 //! `check` feeds a hidden-state into `act.x` (an .npy or a seeded synthetic),
 //! launches one prefill bucket, reads `act.x` back, and prints shape / min /
@@ -488,6 +488,9 @@ mod cuda {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let dir = PathBuf::from(flag("--dir").ok_or("decode-check needs --dir")?);
         let in_name = desc.inputs.first().map_or("act.x".to_string(), |i| i.name.clone());
+        // The decode rung's output buffer need not be the prefill block's (attention-only rungs
+        // stop at the ping-pong residual `act.hc_residual_b`).
+        let out_tensor = flag("--out-tensor").unwrap_or_else(|| out_name.to_string());
         let mut pre = Vec::new();
         while dir.join(format!("pre_{}.npy", pre.len())).exists() {
             pre.push(npy::read_f32(&dir.join(format!("pre_{}.npy", pre.len())))?.1);
@@ -503,12 +506,21 @@ mod cuda {
         let x0 = npy::read_f32(&dir.join("dec_x_0.npy"))?;
         let mult = x0.0[0] / nb;
         let mut last = vec![0u32; nb];
+        let chunk: usize = flag("--pf-chunk").and_then(|v| v.parse().ok()).unwrap_or(1024);
         for (b, x) in pre.iter().enumerate() {
             let t = x.len() / (mult * hidden);
             let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
             e.begin_slot(b, t + steps + 2)?;
-            e.upload_activation(&in_name, x)?;
-            last[b] = e.prefill_slot(b, &prompt)?;
+            // Block mode has no embed: each chunk's input rows are uploaded before it runs.
+            let mut c0 = 0;
+            last[b] = loop {
+                let rows = chunk.min(t - c0) * mult * hidden;
+                e.upload_activation(&in_name, &x[c0 * mult * hidden..][..rows])?;
+                c0 += chunk;
+                if let plowrt::exec::gpu::PrefillStep::Done(tok) = e.prefill_chunk(b, &prompt, chunk)? {
+                    break tok;
+                }
+            };
             println!("decode-check: slot {b} prefilled T={t}");
         }
         let mut toks = Vec::new();
@@ -520,7 +532,7 @@ mod cuda {
             e.step_slots(&feeds, &mut toks)?;
             let ms = t0.elapsed().as_secs_f64() * 1e3;
             last.copy_from_slice(&toks[..nb]);
-            let out = e.download_activation(out_name)?;
+            let out = e.download_activation(&out_tensor)?;
             let rows = nb * mult;
             let bad = out[..rows * hidden].iter().filter(|v| !v.is_finite()).count();
             npy::write_f32(&dir.join(format!("dec_plow_{s}.npy")), &[rows, hidden], &out[..rows * hidden])?;
