@@ -5,6 +5,30 @@ compile to plow packets and serve as OpenAI `POST /v1/audio/speech` from
 `plowrt serve`. Design: [24 — TTS pipelines](../arch/24-tts-pipelines.md).
 Every stage is a plowc packet; plowrt ships no model-specific code or native library.
 
+## Recipes
+
+The checked-in recipes are the source of truth for the knobs and rungs (the commands below
+are the same steps by hand):
+
+| model | recipe |
+|---|---|
+| Veena | `recipes/infervisor/veena/sm90a-h100-tp1.toml` |
+| Chatterbox | `recipes/infervisor/chatterbox/sm90a-h100-tp1.toml` |
+| Qwen3-ASR | `recipes/infervisor/qwen3-asr/sm90a-h100-tp1.toml` |
+
+```sh
+# prep steps (exports) run first; build-record.json pins commit, prep and every hash
+python3 scripts/campaign/campaign.py build recipes/infervisor/veena/sm90a-h100-tp1.toml --out $OUT
+```
+
+Hosts without nix: `PLOW_CAMPAIGN_NO_NIX=1`, `CARGO_TARGET_DIR` holding a release `plowc`,
+`PYREF` (torch + snac) and, for Chatterbox, `CBX_PY` (chatterbox-tts 0.1.7).
+
+Reproduced 2026-09-27 at 7c0a7f7e into fresh directories (H100): every packet
+(`model.pkt`, `encoder.pkt`, `codec.pkt`, `s3gen.pkt`) byte-identical to the working assets,
+cubins SASS-identical; Qwen3-ASR WER 3.913% (p50 60.1 ms), SNAC parity rel-L2 ≤ 5.3e-6,
+Chatterbox CER 0.000, Veena CER 0.026 (the code-mixed prompt is translated by the Whisper judge).
+
 ## Veena
 
 ```sh
