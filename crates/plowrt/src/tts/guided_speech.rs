@@ -317,7 +317,16 @@ impl GuidedSpeech {
 
     /// The mux job for one request: both CFG members' prefill rows as overlays, the decode
     /// position base, the packet's sampling chain.
-    fn job(&self, voice: &str, text: &str, seed: u64, class: JobClass, respond: crate::serve::stream::ChunkSender) -> Result<Job> {
+    fn job(
+        &self,
+        voice: &str,
+        text: &str,
+        seed: u64,
+        class: JobClass,
+        respond: crate::serve::stream::ChunkSender,
+        request: &crate::serve::session::RequestIds,
+        report: Option<crate::serve::session::Report>,
+    ) -> Result<Job> {
         let c = &self.c;
         let ids = self.tables.text_ids(text)?;
         let cond = self.tables.prefill_rows(c, voice, &ids, false)?;
@@ -331,6 +340,11 @@ impl GuidedSpeech {
         // packed prefill uses for it.
         let mut prompt_ids = vec![0; n];
         prompt_ids[n - 1] = c.start_speech;
+        let overlay_pos: Vec<u32> = (0..n as u32).collect();
+        // Both CFG members' rows key a position: a session reuses the voice conditioning prefix.
+        let session = request.session.as_ref().and_then(|_| {
+            request.ticket(crate::serve::session::row_keys(&prompt_ids, &overlay_pos, &[&cond, &uncond]), report)
+        });
         Ok(Job {
             prompt_ids,
             gen,
@@ -339,9 +353,10 @@ impl GuidedSpeech {
             opts: JobOpts {
                 class,
                 raw_tokens: true,
+                session,
                 speech: Some(Box::new(SpeechJob {
                     overlay: cond,
-                    overlay_pos: (0..n as u32).collect(),
+                    overlay_pos,
                     // Decode token k takes speech_pos[k + 1]: base = prefill rows - 1.
                     pos_base: Some(n as u32 - 1),
                     cfg: Some(CfgJob { uncond_overlay: uncond, params: c.cfg(), history: vec![c.start_speech], seed: Some(seed) }),
@@ -350,14 +365,23 @@ impl GuidedSpeech {
         })
     }
 
-    fn submit(&self, mux: &ModelMux, voice: String, text: String, seed: u64, reply: Reply) -> std::result::Result<(), String> {
+    fn submit(
+        &self,
+        mux: &ModelMux,
+        voice: String,
+        text: String,
+        seed: u64,
+        reply: Reply,
+        ids: &crate::serve::session::RequestIds,
+        report: Option<crate::serve::session::Report>,
+    ) -> std::result::Result<(), String> {
         let (respond, mut tokens) = crate::serve::stream::channel();
         let probe = match &reply {
             Reply::Stream(tx) => Some(tx.clone()),
             Reply::Whole(_) => None,
         };
         let class = if probe.is_some() { JobClass::Critical } else { JobClass::Normal };
-        let job = self.job(&voice, &text, seed, class, respond).map_err(|e| e.to_string())?;
+        let job = self.job(&voice, &text, seed, class, respond, ids, report).map_err(|e| e.to_string())?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let render = self.render.lock().clone();
         let _ = render.send(S3Msg::Open { id, voice, seed, reply });
@@ -394,9 +418,17 @@ impl GuidedSpeech {
         Ok(())
     }
 
-    pub async fn synthesize(&self, mux: &ModelMux, voice: String, text: String, seed: u64) -> std::result::Result<SpeechAudio, String> {
+    pub async fn synthesize(
+        &self,
+        mux: &ModelMux,
+        voice: String,
+        text: String,
+        seed: u64,
+        ids: &crate::serve::session::RequestIds,
+        report: Option<crate::serve::session::Report>,
+    ) -> std::result::Result<SpeechAudio, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.submit(mux, voice, text, seed, Reply::Whole(reply))?;
+        self.submit(mux, voice, text, seed, Reply::Whole(reply), ids, report)?;
         rx.await.map_err(|_| "chatterbox render dropped the request".to_string())?
     }
 
@@ -406,9 +438,11 @@ impl GuidedSpeech {
         voice: String,
         text: String,
         seed: u64,
+        ids: &crate::serve::session::RequestIds,
+        report: Option<crate::serve::session::Report>,
     ) -> std::result::Result<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>, String> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.submit(mux, voice, text, seed, Reply::Stream(tx))?;
+        self.submit(mux, voice, text, seed, Reply::Stream(tx), ids, report)?;
         Ok(rx)
     }
 }

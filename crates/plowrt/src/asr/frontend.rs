@@ -28,6 +28,15 @@ pub enum AudioError {
 }
 
 pub fn decode_wav(bytes: &[u8]) -> std::result::Result<Vec<f32>, AudioError> {
+    let samples = decode_wav_chunk(bytes)?;
+    if samples.len() < SAMPLE_RATE as usize / 2 {
+        return Err(AudioError::Invalid("audio must contain at least 0.5 seconds".into()));
+    }
+    Ok(samples)
+}
+
+/// [`decode_wav`] for a piece of a longer recording: any length up to 30 seconds.
+pub fn decode_wav_chunk(bytes: &[u8]) -> std::result::Result<Vec<f32>, AudioError> {
     let invalid = |message| AudioError::Invalid(message);
     let mut reader = hound::WavReader::new(Cursor::new(bytes))
         .map_err(|e| invalid(format!("invalid WAV: {e}")))?;
@@ -39,9 +48,6 @@ pub fn decode_wav(bytes: &[u8]) -> std::result::Result<Vec<f32>, AudioError> {
     }
     if reader.duration() as usize > MAX_SAMPLES {
         return Err(AudioError::TooLong);
-    }
-    if reader.duration() < SAMPLE_RATE / 2 {
-        return Err(invalid("audio must contain at least 0.5 seconds".into()));
     }
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float if spec.bits_per_sample == 32 => reader

@@ -9,7 +9,7 @@ Per request: ttfa_s (first audio byte, streaming) or latency_s, audio_s, rtf. Su
 p90 TTFA, aggregate audio seconds per wall second. Writes DIR/<tag>.json and optional wavs
 plus texts.json for scripts/tts/asr_check.py.
 """
-import argparse, concurrent.futures as cf, json, os, statistics, sys, time, urllib.request
+import argparse, concurrent.futures as cf, json, os, statistics, sys, threading, time, urllib.request
 
 sys.path.insert(0, os.path.dirname(__file__))
 from veena_ref import PROMPTS as VEENA_PROMPTS
@@ -18,10 +18,16 @@ from chatterbox_ref import PROMPTS as CBX_TEXTS
 SR = 24000
 
 
+SESSION = None
+
+
 def one(url, model, voice, text, stream, seed, extra):
     body = dict(model=model, input=text, voice=voice, response_format="pcm", stream=stream, seed=seed, **extra)
-    req = urllib.request.Request(f"{url}/v1/audio/speech", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if SESSION:
+        # One X-Session-Id per client thread: its requests run one after another in the session.
+        headers["X-Session-Id"] = f"{SESSION}-{threading.get_ident()}"
+    req = urllib.request.Request(f"{url}/v1/audio/speech", data=json.dumps(body).encode(), headers=headers)
     t0 = time.perf_counter()
     ttfa, chunks = None, []
     with urllib.request.urlopen(req, timeout=900) as r:
@@ -58,7 +64,10 @@ def main():
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--prompt-set", choices=["veena", "chatterbox"], default="veena")
     ap.add_argument("--voice", default=None, help="override every prompt's voice")
+    ap.add_argument("--session", default=None, help="X-Session-Id prefix (one session per client thread)")
     args = ap.parse_args()
+    global SESSION
+    SESSION = args.session
     os.makedirs(args.out, exist_ok=True)
     tag = args.tag or f"{'stream' if args.stream else 'full'}_c{args.conc}"
     extra = dict(temperature=0.0) if args.greedy else {}

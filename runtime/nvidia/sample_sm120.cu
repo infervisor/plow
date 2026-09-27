@@ -368,3 +368,190 @@ extern "C" __global__ void plow_sample(
         out_ids[b] = (int)p;
     }
 }
+
+/* Classifier-free guided draw for CFG pairs: conditional row b, unconditional row b + 1, the
+ * host guided sampler (`text::sample::sample_cfg`) on device, so a pair decodes with no host
+ * round trip (and rides a multi-step quantum).
+ *   g_i = c_i + w (c_i - u_i)            (explicit _rn ops: no FMA contraction, the host rounding)
+ *   repetition penalty once per occurrence of i in the row's history (counts[b][i]):
+ *     g < 0 ? g * p : g / p, applied counts times
+ *   e_i = exp((g_i - max g) / t); e_i < min_p -> 0
+ *   top_p < 1: the shortest descending (weight, index) prefix of the min_p-kept set whose
+ *     mass reaches top_p * kept (the host's sort, as an exact threshold + index-order ties)
+ *   draw: the lowest index whose inclusive prefix of kept weights exceeds rng01 * kept
+ * t <= 0 is the host's greedy: argmax of g before the penalty, lowest index on ties.
+ * The token goes to BOTH members' in.ids and is counted into the owner's history row.
+ * prm is [6][B] f32: flag (nonzero = owner), w, penalty, t, top_p, min_p. */
+__device__ __forceinline__ unsigned long long argmax_key(float v, unsigned i) {
+    const unsigned bits = __float_as_uint(v);
+    const unsigned key = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+    return ((unsigned long long)key << 32) | (unsigned long long)(~i);
+}
+
+__device__ __forceinline__ unsigned long long block_max_u64(unsigned long long v, unsigned long long* ipart) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const unsigned long long x = __shfl_xor_sync(0xffffffffu, v, o, 32);
+        v = x > v ? x : v;
+    }
+    if (lane == 0) ipart[warp] = v;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned long long r = ipart[0];
+#pragma unroll
+        for (unsigned w = 1; w < PLOW_SMP_WARPS; w++) r = ipart[w] > r ? ipart[w] : r;
+        ipart[0] = r;
+    }
+    __syncthreads();
+    const unsigned long long r = ipart[0];
+    __syncthreads();
+    return r;
+}
+
+extern "C" __global__ void plow_sample_cfg(
+    const __nv_bfloat16* __restrict__ logits, int* __restrict__ ids, const float* __restrict__ prm,
+    const float* __restrict__ rng01, unsigned* __restrict__ counts, float* __restrict__ escratch,
+    unsigned V, unsigned B) {
+    const unsigned b = blockIdx.x;
+    if (b + 1u >= B || prm[b] == 0.0f) return;
+    __shared__ float part[PLOW_SMP_WARPS];
+    __shared__ unsigned long long ipart[PLOW_SMP_WARPS];
+    __shared__ float pre[PLOW_SMP_THREADS];
+    __shared__ unsigned sh_pick;
+    const float w = prm[B + b], pen = prm[2u * B + b], t = prm[3u * B + b];
+    const float tp = prm[4u * B + b], mp = prm[5u * B + b];
+    const __nv_bfloat16* c = logits + (size_t)b * V;
+    const __nv_bfloat16* u = c + V;
+    unsigned* cnt = counts + (size_t)b * V;
+    float* e = escratch + (size_t)b * V;
+    const unsigned T = PLOW_SMP_THREADS, tid = threadIdx.x;
+    const unsigned chunk = (V + T - 1u) / T;
+    const unsigned lo = min(V, tid * chunk), hi = min(V, lo + chunk);
+    auto guided = [&](unsigned i) {
+        const float a = __bfloat162float(c[i]), z = __bfloat162float(u[i]);
+        return __fadd_rn(a, __fmul_rn(w, __fsub_rn(a, z)));
+    };
+    if (tid == 0) sh_pick = 0xFFFFFFFFu;
+
+    if (t <= 1e-6f) {
+        unsigned long long best = 0;
+        for (unsigned i = lo; i < hi; i++) {
+            const unsigned long long k = argmax_key(guided(i), i);
+            best = k > best ? k : best;
+        }
+        best = block_max_u64(best, ipart);
+        if (tid == 0) sh_pick = ~(unsigned)(best & 0xFFFFFFFFull);
+    } else {
+        float m = -3.4e38f;
+        for (unsigned i = lo; i < hi; i++) {
+            float g = guided(i);
+            for (unsigned n = cnt[i]; n > 0u; n--) g = g < 0.0f ? __fmul_rn(g, pen) : __fdiv_rn(g, pen);
+            e[i] = g;
+            m = fmaxf(m, g);
+        }
+        m = block_max(m, part);
+        const float inv_t = __fdiv_rn(1.0f, t);
+        float s = 0.0f;
+        for (unsigned i = lo; i < hi; i++) {
+            float x = expf(__fmul_rn(__fsub_rn(e[i], m), inv_t));
+            x = x < mp ? 0.0f : x;
+            e[i] = x;
+            s += x;
+        }
+        const float kept = block_sum(s, part);
+        if (tp < 1.0f) {
+            /* The host keeps the shortest prefix of the descending (weight, index) order whose
+             * mass reaches want: its smallest weight v is the largest float with
+             * mass(e >= v) >= want (bisected on the bit pattern, exact), weights above v stay,
+             * and of the weights equal to v the lowest-index n do. */
+            const float want = tp * kept;
+            unsigned blo = 0u, bhi = 0x3F800001u; /* mass(e >= 0) = kept >= want; nothing > 1 */
+#pragma unroll 1
+            while (bhi - blo > 1u) {
+                const unsigned mid = blo + ((bhi - blo) >> 1);
+                if (mass_ge(e, V, __uint_as_float(mid), part) >= want) blo = mid; else bhi = mid;
+            }
+            const float v = __uint_as_float(blo);
+            float above = 0.0f, ties = 0.0f;
+            for (unsigned i = lo; i < hi; i++) {
+                above += e[i] > v ? e[i] : 0.0f;
+                ties += e[i] == v ? 1.0f : 0.0f;
+            }
+            const float need = fmaxf(1.0f, ceilf((want - block_sum(above, part)) / v));
+            pre[tid] = ties;
+            __syncthreads();
+            for (unsigned d = 1; d < T; d <<= 1) {
+                const float add = tid >= d ? pre[tid - d] : 0.0f;
+                __syncthreads();
+                pre[tid] += add;
+                __syncthreads();
+            }
+            float rank = pre[tid] - ties;
+            __syncthreads();
+            for (unsigned i = lo; i < hi; i++) {
+                if (e[i] == v) {
+                    if (rank >= need) e[i] = 0.0f;
+                    rank += 1.0f;
+                } else if (e[i] < v) {
+                    e[i] = 0.0f;
+                }
+            }
+        }
+        /* Inverse CDF in index order: thread tid owns [lo, hi); exclusive prefix of the chunk
+         * sums by warp shuffles plus one pass over the warp totals. */
+        float mine = 0.0f;
+        for (unsigned i = lo; i < hi; i++) mine += e[i];
+        const unsigned lane = tid & 31u, warp = tid >> 5;
+        float incl = mine;
+#pragma unroll
+        for (unsigned d = 1; d < 32u; d <<= 1) {
+            const float x = __shfl_up_sync(0xffffffffu, incl, d, 32);
+            if (lane >= d) incl += x;
+        }
+        if (lane == 31u) pre[warp] = incl;
+        __syncthreads();
+        if (warp == 0) {
+            float w_incl = lane < PLOW_SMP_WARPS ? pre[lane] : 0.0f;
+#pragma unroll
+            for (unsigned d = 1; d < 32u; d <<= 1) {
+                const float x = __shfl_up_sync(0xffffffffu, w_incl, d, 32);
+                if (lane >= d) w_incl += x;
+            }
+            if (lane < PLOW_SMP_WARPS) pre[32u + lane] = w_incl;
+        }
+        __syncthreads();
+        const float total = pre[32u + PLOW_SMP_WARPS - 1u];
+        const float target = rng01[b] * total;
+        const float excl = (warp ? pre[32u + warp - 1u] : 0.0f) + incl - mine;
+        if (mine > 0.0f && target >= excl && target < excl + mine) {
+            float acc = excl;
+            unsigned last = 0xFFFFFFFFu, pick = 0xFFFFFFFFu;
+            for (unsigned i = lo; i < hi; i++) {
+                if (e[i] > 0.0f) {
+                    last = i;
+                    acc += e[i];
+                    if (acc > target) { pick = i; break; }
+                }
+            }
+            sh_pick = pick != 0xFFFFFFFFu ? pick : last; /* chunk-sum rounding: its last kept */
+        }
+        __syncthreads();
+        if (sh_pick == 0xFFFFFFFFu) { /* rng01 * kept rounded onto the mass edge: the host's argmax */
+            unsigned long long best = 0;
+            for (unsigned i = lo; i < hi; i++) {
+                const unsigned long long k = argmax_key(e[i], i);
+                best = k > best ? k : best;
+            }
+            best = block_max_u64(best, ipart);
+            if (tid == 0) sh_pick = ~(unsigned)(best & 0xFFFFFFFFull);
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned p = sh_pick;
+        ids[b] = (int)p;
+        ids[b + 1u] = (int)p;
+        cnt[p] += 1u;
+    }
+}

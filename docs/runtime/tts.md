@@ -68,6 +68,13 @@ plowrt serve --assets $CBX --port 8080
 The T3 asset runs on the shared text mux as guided jobs (two slots per request for
 guidance); `s3gen.pkt` renders audio on a render thread.
 
+Each token is drawn from the pair's logits with the packet's `lm.*` chain (guidance weight,
+repetition penalty, temperature, min_p, top_p). The host draws by default; `--cfg-device` /
+`PLOW_CFG_DEVICE=1` draws on the device (`plow_sample_cfg` in `sample_sm120.cubin`: same
+uniforms, per-slot penalty history, token written to both members; `--cfg-multistep` also runs
+pairs in the multi-step quantum). It stays off because it lost served aps at c16..c64 (H100: the
+host draw's gap paced T3 so utterances closed in batches; without it S3Gen renders batch smaller).
+
 ## Concurrency
 
 Speech requests take the LLM path on each model's mux: packed prefill (several requests' prompt
@@ -85,6 +92,15 @@ Admission: requests past the slots queue (4 engine batches of ingress; the ASR f
 its own requests in flight at 256 and waits for mux room instead of answering 429). A CFG
 request takes two slots, so the 128-slot rung serves 64 Chatterbox requests; the rest queue
 (`DECODE_RUNG_MAX` = 128 is the packet format's decode/prefill boundary).
+
+## Sessions and streaming
+
+`X-Request-Id` / `X-Session-Id` (`docs/runtime/sessions.md`): a session's requests resume the KV
+of its previous one (Chatterbox: the voice conditioning rows of both CFG members; Veena: the
+prefix and speaker tokens; Qwen3-ASR: the prompt and completed audio windows). Qwen3-ASR streams
+over HTTP (`stream=true` SSE, `append=true` / `final=true` uploads in a session) and the
+WebSocket, both doing O(new audio) work per partial. Idle sessions go after
+`PLOW_SESSION_TTL_MS` (60 s); a live request always evicts retained KV it needs.
 
 ## Model names
 

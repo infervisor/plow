@@ -52,6 +52,7 @@ use crate::sched::admission::LoadEstimator;
 use crate::sched::batching::{cold_start_hold_ms, select_bucket};
 use crate::sched::multistep::MultiStep;
 use crate::sched::rungs::{DecodeRungs, RungController, RungLoad};
+use crate::serve::session::{Retention, Seat, SessionTicket};
 use crate::serve::stream::{ChunkSender, FinishReason, StreamChunk};
 use crate::serve::{
     bucket_has_sample_batch, reference_logits_row, sample_vocab, AppState, GenParams,
@@ -213,6 +214,8 @@ pub struct JobOpts {
     pub raw_tokens: bool,
     /// Host-built prefill rows for a speech/audio packet; `None` for text.
     pub speech: Option<Box<SpeechJob>>,
+    /// `X-Session-Id`: resume the session's retained rows, and retain this request's.
+    pub session: Option<Box<SessionTicket>>,
 }
 
 /// Queue priority. Orders the waiting queue and serial prefill, and scales the queue TTL.
@@ -283,6 +286,8 @@ struct CfgRun {
     cond: Vec<f32>,
     uncond: Vec<f32>,
     scratch: Vec<f32>,
+    /// The engine holds this pair's penalty history: its draws run on the device.
+    dev_seeded: bool,
 }
 
 /// Handle to a per-model dispatcher — cheap to clone (wraps a Sender).
@@ -532,6 +537,11 @@ struct Slot {
     held: Vec<u32>,
     held_finish: Option<FinishReason>,
     parked_at: Option<Instant>,
+    /// A session request's retention seat; dropped with the slot, it retires the rows.
+    session: Option<Seat>,
+    /// Retained cache rows this sequence starts from (the engine keeps them at `begin_slot`).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    resume: usize,
 }
 
 impl Slot {
@@ -666,6 +676,13 @@ pub fn spawn(
         .and_then(|e| e.lock().kv_admission_budget());
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let kv_budget: Option<crate::sched::admission::KvBudget> = None;
+    #[cfg(feature = "cuda")]
+    let (resume_supported, prefix_cache, kv_row_bytes) = state.gpu_engine(&slug).map_or((false, false, 0), |e| {
+        let e = e.lock();
+        (e.slot_resume_supported(), e.is_cuda() && e.prefix_cache_enabled(), e.kv_row_bytes())
+    });
+    #[cfg(not(feature = "cuda"))]
+    let (resume_supported, prefix_cache, kv_row_bytes) = (false, false, 0);
     if let Some(b) = kv_budget {
         tracing::info!(
             %slug,
@@ -747,6 +764,12 @@ pub fn spawn(
 
     let dispatcher = async move {
         let mut slots: Vec<Option<Slot>> = (0..capacity).map(|_| None).collect();
+        let mut retention = Retention::new(
+            resume_supported,
+            prefix_cache,
+            kv_budget.map_or(kv_row_bytes, |b| b.bytes_per_token),
+            rung_widths.as_deref().unwrap_or(&[]),
+        );
         let mut freed_last_tick = false;
         let mut load = LoadEstimator::default();
         let mut host_window = crate::obs::host::Window::default();
@@ -801,9 +824,12 @@ pub fn spawn(
             // Checked at every loop top because a full slot table never
             // reaches the message channel between ticks — this flag is the
             // one bounded-latency path in.
+            retention.collect(Instant::now());
+            retention.publish(&metrics);
             if preempt_seen.swap(false, Ordering::AcqRel) {
                 turn.release();
                 preempt_slots(&mut slots, &arena).await;
+                retention.table.clear();
                 while let Some((job, _)) = waiting.pop_front() {
                     metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
                     Metrics::inc(&metrics.rejected);
@@ -863,7 +889,7 @@ pub fn spawn(
                 match msg {
                     MuxMsg::Job(job, arrived) => {
                         note_arrival(job.arrived, &mut load, &metrics);
-                        let held = admit_into(
+                        let held = admit_session(
                             &mut slots,
                             usize::MAX,
                             job,
@@ -873,6 +899,7 @@ pub fn spawn(
                             &health,
                             kv_budget,
                             downstream.full(),
+                            &mut retention,
                         );
                         if let Some(j) = held {
                             Metrics::inc(&metrics.queued_requests);
@@ -962,7 +989,7 @@ pub fn spawn(
             // A short hold when we still have empty slots and no live work
             // yet keeps us from waking up on a single arrival amid a burst.
             if !waiting.is_empty() {
-                drain_waiting(
+                drain_waiting_session(
                     &mut waiting,
                     &mut slots,
                     admission_limit,
@@ -973,6 +1000,7 @@ pub fn spawn(
                     &health,
                     kv_budget,
                     downstream.full(),
+                    &mut retention,
                 );
             }
             let idle = slots[..admission_limit]
@@ -1013,7 +1041,7 @@ pub fn spawn(
                                 match msg {
                                     MuxMsg::Job(job, arrived) => {
                                         note_arrival(job.arrived, &mut load, &metrics);
-                                        if let Some(j) = admit_into(
+                                        if let Some(j) = admit_session(
                                             &mut slots,
                                             admission_limit,
                                             job,
@@ -1023,6 +1051,7 @@ pub fn spawn(
                                             &health,
                                             kv_budget,
                                             downstream.full(),
+                                            &mut retention,
                                         ) {
                                             Metrics::inc(&metrics.queued_requests);
                                             waiting.push_back(j);
@@ -1057,7 +1086,7 @@ pub fn spawn(
                             match msg {
                                 MuxMsg::Job(job, arrived) => {
                                     note_arrival(job.arrived, &mut load, &metrics);
-                                    if let Some(j) = admit_into(
+                                    if let Some(j) = admit_session(
                                         &mut slots,
                                         admission_limit,
                                         job,
@@ -1067,6 +1096,7 @@ pub fn spawn(
                                         &health,
                                         kv_budget,
                                         downstream.full(),
+                                        &mut retention,
                                     ) {
                                         Metrics::inc(&metrics.queued_requests);
                                         waiting.push_back(j);
@@ -1568,6 +1598,7 @@ fn waited_ms(now: Instant, arrived: Instant) -> f64 {
 ///
 /// A request that can never fit is not this function's problem — [`seat`] answers
 /// [`Denied::ExceedsWholeBudget`] terminally, so the aging rule can never block on one.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn drain_waiting(
     waiting: &mut std::collections::VecDeque<(Job, Instant)>,
@@ -1580,6 +1611,35 @@ fn drain_waiting(
     health: &EngineHealth,
     kv_budget: Option<crate::sched::admission::KvBudget>,
     downstream_full: bool,
+) {
+    drain_waiting_session(
+        waiting,
+        slots,
+        admission_limit,
+        now,
+        slo_ms,
+        arena,
+        metrics,
+        health,
+        kv_budget,
+        downstream_full,
+        &mut Retention::off(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_waiting_session(
+    waiting: &mut std::collections::VecDeque<(Job, Instant)>,
+    slots: &mut [Option<Slot>],
+    admission_limit: usize,
+    now: Instant,
+    slo_ms: f64,
+    arena: Option<&SharedKvState>,
+    metrics: &Arc<Metrics>,
+    health: &EngineHealth,
+    kv_budget: Option<crate::sched::admission::KvBudget>,
+    downstream_full: bool,
+    retention: &mut Retention,
 ) {
     waiting.retain(|(job, arrived)| {
         let class = job.opts.class;
@@ -1618,7 +1678,7 @@ fn drain_waiting(
         let Some((job, arrived)) = waiting.pop_front() else {
             break;
         };
-        match admit_into(
+        match admit_session(
             slots,
             admission_limit,
             job,
@@ -1628,6 +1688,7 @@ fn drain_waiting(
             health,
             kv_budget,
             downstream_full,
+            retention,
         ) {
             Some(held) => {
                 let blocks = waited_ms(now, held.1) >= aging;
@@ -1655,6 +1716,7 @@ fn drain_waiting(
 /// `limit` bounds which slots a NEW request may take (the decode-rung admission window); the
 /// budget is charged over every live slot, including those above the limit, because their KV is
 /// just as resident.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn admit_into(
     slots: &mut [Option<Slot>],
@@ -1667,6 +1729,36 @@ fn admit_into(
     kv_budget: Option<crate::sched::admission::KvBudget>,
     downstream_full: bool,
 ) -> Option<(Job, Instant)> {
+    admit_session(
+        slots,
+        limit,
+        job,
+        arrived,
+        arena,
+        metrics,
+        health,
+        kv_budget,
+        downstream_full,
+        &mut Retention::off(),
+    )
+}
+
+/// [`admit_into`] with session retention: a session request resumes its retained slot when its
+/// rows still match; a retained slot never holds back a live request (the least recently used
+/// one is evicted for it, and for the KV budget).
+#[allow(clippy::too_many_arguments)]
+fn admit_session(
+    slots: &mut [Option<Slot>],
+    limit: usize,
+    job: Job,
+    arrived: Instant,
+    arena: Option<&SharedKvState>,
+    metrics: &Arc<Metrics>,
+    health: &EngineHealth,
+    kv_budget: Option<crate::sched::admission::KvBudget>,
+    downstream_full: bool,
+    retention: &mut Retention,
+) -> Option<(Job, Instant)> {
     if job.respond.is_closed() {
         return None;
     }
@@ -1676,31 +1768,69 @@ fn admit_into(
     // A CFG pair holds two engine slots' KV.
     let want = seq_upper as u64 * (1 + pair as u64);
     let lim = limit.min(slots.len());
-    let free_slot = if pair {
-        (0..lim.saturating_sub(1))
-            .step_by(2)
-            .find(|&i| slots[i].is_none() && slots[i + 1].is_none())
-    } else {
-        (0..lim).find(|&i| slot_free(slots, i))
+    let session = job.opts.session.as_deref().map(|t| t.session.clone());
+    let resume = job
+        .opts
+        .session
+        .as_deref()
+        .and_then(|t| retention.table.lookup(&t.session, &t.keys, pair, lim, Instant::now()))
+        .filter(|r| slots[r.slot].is_none() && (!pair || slots[r.slot + 1].is_none()));
+    let find_free = |slots: &[Option<Slot>], table: &crate::serve::session::RetainTable| {
+        if pair {
+            (0..lim.saturating_sub(1)).step_by(2).find(|&i| {
+                slots[i].is_none() && slots[i + 1].is_none() && !table.holds(i) && !table.holds(i + 1)
+            })
+        } else {
+            (0..lim).find(|&i| slot_free(slots, i) && !table.holds(i))
+        }
     };
+    // Decode launches cover every slot up to the highest live one, so a retained slot must not push
+    // a live request past the rung the live set already runs (or the slack): evict the least
+    // recently used retained slot below it instead, and resume only where a fresh seat would not
+    // sit lower.
+    let floor = retention.floor(slots.iter().rposition(Option::is_some).map_or(0, |i| i + 1));
+    let resume = resume.filter(|r| r.slot < floor || slots[..r.slot].iter().all(Option::is_some));
+    let mut free_slot = match resume {
+        Some(r) => Some(r.slot),
+        None => find_free(slots, &retention.table),
+    };
+    while free_slot.is_none() && retention.table.evict_lru(lim, None) {
+        free_slot = find_free(slots, &retention.table);
+    }
+    while let Some(f) = free_slot.filter(|&f| resume.is_none() && f >= floor) {
+        if !retention.table.evict_lru(f, None) {
+            break;
+        }
+        free_slot = find_free(slots, &retention.table);
+    }
     // Idle slots that cannot take this job (a lone slot for a pair, a live pair's partner) free
     // up as requests retire: queue, do not refuse.
     if free_slot.is_none() && !(pair && slots.len() < 2) && slots[..lim].iter().any(Option::is_none) {
         return Some((job, arrived));
     }
-    let committed = slots.iter().flatten().map(|s| {
-        reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len())
-            * (1 + s.cfg.is_some() as u64)
-    });
-
-    let idx = match seat(
-        matches!(health, EngineHealth::Dead(_)),
-        free_slot,
-        want,
-        committed,
-        kv_budget,
-        downstream_full,
-    ) {
+    let seated = loop {
+        let committed = slots
+            .iter()
+            .flatten()
+            .map(|s| {
+                reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len())
+                    * (1 + s.cfg.is_some() as u64)
+            })
+            .chain(retention.table.rows_except(session.as_deref()));
+        match seat(
+            matches!(health, EngineHealth::Dead(_)),
+            free_slot,
+            want,
+            committed,
+            kv_budget,
+            downstream_full,
+        ) {
+            Err(Denied::KvBudgetFull { .. })
+                if retention.table.evict_lru(usize::MAX, session.as_deref()) => {}
+            seated => break seated,
+        }
+    };
+    let idx = match seated {
         Ok(idx) => idx,
         Err(denied) => {
             // Retryable: stays queued, says nothing, costs no slot. This is the whole
@@ -1781,7 +1911,14 @@ fn admit_into(
         job.arrived,
         job.prompt_ids.len(),
     ));
+    if let Some(session) = &session {
+        retention.table.forget(session);
+    }
+    let resume = resume.filter(|r| r.slot == idx).map_or(0, |r| r.rows);
+    let speech = job.opts.speech.is_some();
     slots[idx] = Some(Slot {
+        session: retention.seat(job.opts.session, idx, pair, speech, resume, metrics),
+        resume,
         telemetry,
         prompt_ids: job.prompt_ids,
         out_ids: Vec::new(),
@@ -1806,6 +1943,7 @@ fn admit_into(
                 cond: Vec::new(),
                 uncond: Vec::new(),
                 scratch: Vec::new(),
+                dev_seeded: false,
             })
         }),
         speech: job.opts.speech,
@@ -2624,6 +2762,8 @@ fn run_one_tick(
                 // Device-sampleable rows ride the quantum too when the sampler is loaded:
                 // `plow_sample` runs between each decode and advance.
                 let sampled_multi = e.multistep_sampling();
+                // CFG pairs draw on the device (`plow_sample_cfg`), so they can ride the quantum.
+                let cfg_dev = gpu_cfg_device(e) && crate::config::RuntimeConfig::get().nv.cfg_multistep;
                 let use_multi = !use_pipe
                     && steps > 1
                     && e.multistep_quantum().is_some()
@@ -2631,6 +2771,9 @@ fn run_one_tick(
                         slots[i]
                             .as_ref()
                             .map(|s| {
+                                if s.cfg.is_some() {
+                                    return sampled_multi && cfg_dev;
+                                }
                                 !s.plain_decode()
                                     && (gpu_argmax_eligible(&s.gen.params)
                                         || (sampled_multi && dev_sample_spec(s).is_some()))
@@ -2712,9 +2855,12 @@ fn run_one_tick(
                     let rng = |b: usize, k: usize| draws.get(b * quantum + k).copied().unwrap_or(0.0);
                     let sample = (!specs.is_empty())
                         .then_some((specs.as_slice(), &rng as &dyn Fn(usize, usize) -> f32));
+                    let staged = gpu_stage_cfg(&mut *e, &feeds, &mut slots, requested);
                     let t_call = crate::obs::host::on().then(Instant::now);
-                    match e.multi_step_sampled_at_most(&feeds, requested, sample, &mut toks) {
+                    let res = staged.and_then(|_| e.multi_step_sampled_at_most(&feeds, requested, sample, &mut toks));
+                    match res {
                         Ok(k) => {
+                            gpu_cfg_advance(&feeds, &mut slots, k);
                             let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                             decode_progress = completed_decode(&feeds, k);
                             for (ri, &(i, _)) in feeds.iter().enumerate() {
@@ -2772,17 +2918,25 @@ fn run_one_tick(
                     None
                 };
                 let t_call = crate::obs::host::on().then(Instant::now);
-                let step_res = e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks);
+                let (cfg_dev, step_res) = match gpu_stage_cfg(&mut *e, &feeds, &mut slots, 1) {
+                    Ok(d) => (d, e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks)),
+                    Err(err) => (false, Err(err)),
+                };
                 match step_res {
                     Ok(()) => {
                         let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                         decode_progress = completed_decode(&feeds, 1);
-                        let cfg_drawn = match gpu_cfg_draws(&mut *e, &feeds, &mut slots, &mut toks) {
-                            Ok(drawn) => drawn,
-                            Err(err) => {
-                                note_fault(&mut tick_fault, &err);
-                                fail_feeds(&mut slots, &feeds, &arena, &err);
-                                false
+                        let cfg_drawn = if cfg_dev {
+                            gpu_cfg_advance(&feeds, &mut slots, 1);
+                            true
+                        } else {
+                            match gpu_cfg_draws(&mut *e, &feeds, &mut slots, &mut toks) {
+                                Ok(drawn) => drawn,
+                                Err(err) => {
+                                    note_fault(&mut tick_fault, &err);
+                                    fail_feeds(&mut slots, &feeds, &arena, &err);
+                                    false
+                                }
                             }
                         };
                         for (&(i, _), &argmax_tok) in feeds.iter().zip(toks.iter()) {
@@ -4618,9 +4772,15 @@ fn gpu_prefill_batched_pass(
             let admitted = (|| -> Result<()> {
                 for row in [i, i + 1].into_iter().take(1 + pair as usize) {
                     let fresh = !e.packed_slot_ready(row);
+                    if fresh && request.resume > 0 && !e.resume_slot(row, request.resume) {
+                        request.resume = 0;
+                    }
                     let Some(frontier) = e.admit_packed_slot(row, &request.prompt_ids, total)? else {
                         continue;
                     };
+                    if let Some(ttl) = request.session.as_ref().and_then(|s| s.pin_ttl()).filter(|_| fresh) {
+                        e.hold_session_prefix(row, ttl);
+                    }
                     if fresh && request.speech.as_ref().is_some_and(|sp| sp.pos_base.is_some()) {
                         // A decode launch covering this row before its prompt is in must not find
                         // a stale base above the reset position (`EmbedPosBf16` traps on pos < base).
@@ -4630,7 +4790,7 @@ fn gpu_prefill_batched_pass(
                         Some(run) => run.partner_pf = frontier,
                         None => {
                             request.pf_pos = frontier;
-                            request.cached_tokens = e.attached_rows(i) as usize;
+                            request.cached_tokens = (e.attached_rows(i) as usize).max(request.resume.min(frontier));
                         }
                     }
                 }
@@ -4924,7 +5084,15 @@ fn gpu_prefill_advance(
     }
     let total = slot.prompt_ids.len() + slot.gen.max_tokens.max(1);
     if slot.pf_pos == 0 {
+        let resume = slot.resume > 0 && slot.cfg.is_none() && e.resume_slot(slot_idx, slot.resume);
         e.begin_slot(slot_idx, total)?;
+        if resume {
+            slot.pf_pos = slot.resume;
+            slot.cached_tokens = slot.resume;
+        }
+        if let Some(ttl) = slot.session.as_ref().and_then(|s| s.pin_ttl()) {
+            e.hold_session_prefix(slot_idx, ttl);
+        }
     }
     if let Some(sp) = slot.speech.as_deref() {
         // The pair prefills as one unit: the unconditional member to completion on the partner
@@ -5293,23 +5461,107 @@ fn gpu_cfg_draws(
     RAW.with_borrow_mut(|raw| {
         raw.resize(rows * vocab * 2, 0);
         e.read_tensor_range("act.logits", 0, raw)?;
-        let row = |r: usize, out: &mut Vec<f32>| {
-            out.clear();
-            out.extend(
-                raw[r * vocab * 2..(r + 1) * vocab * 2]
-                    .chunks_exact(2)
-                    .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)),
-            );
-        };
+        let raw: &[u8] = raw;
+        let row = |r: usize| &raw[r * vocab * 2..(r + 1) * vocab * 2];
+        // The owners' draws are independent (each reads its own rows, writes its own slot) and
+        // ~40 us each at vocab 8194, serial they were 2.4 ms of GPU-idle time per step at 64
+        // pairs: spread them over the rayon pool.
+        let mut at = vec![usize::MAX; slots.len()];
         for (k, &(i, _)) in feeds.iter().enumerate() {
-            let Some(slot) = slots[i].as_mut() else { continue };
-            let Some(run) = slot.cfg.as_mut() else { continue };
-            row(i, &mut run.cond);
-            row(i + 1, &mut run.uncond);
-            toks[k] = cfg_draw(slot);
+            at[i] = k;
+        }
+        let mut owners: Vec<(usize, &mut Slot)> = slots
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                let s = s.as_mut().filter(|s| s.cfg.is_some() && at[i] != usize::MAX)?;
+                Some((i, s))
+            })
+            .collect();
+        use rayon::prelude::*;
+        let drawn: Vec<(usize, u32)> = owners
+            .par_iter_mut()
+            .map(|(i, slot)| (at[*i], cfg_draw_bf16(slot, row(*i), row(*i + 1))))
+            .collect();
+        for (k, tok) in drawn {
+            toks[k] = tok;
         }
         Ok(true)
     })
+}
+
+/// Stage every fed CFG owner's next `steps` guided draws on the device (`plow_sample_cfg`),
+/// seeding its penalty history on the first. `Ok(false)` = no owner fed or no device CFG sampler
+/// (the host draws). The uniforms are the owner's next `steps` SplitMix draws, the host path's.
+#[cfg(feature = "cuda")]
+fn gpu_stage_cfg(
+    e: &mut crate::exec::gpu::GpuEngine,
+    feeds: &[(usize, u32)],
+    slots: &mut [Option<Slot>],
+    steps: usize,
+) -> Result<bool> {
+    if !gpu_cfg_device(e) {
+        return Ok(false);
+    }
+    let mut rows = Vec::new();
+    let mut draws = Vec::new();
+    for &(i, _) in feeds {
+        let Some(slot) = slots[i].as_mut() else { continue };
+        let (Some(run), Some(cfg)) = (slot.cfg.as_mut(), slot.speech.as_ref().and_then(|s| s.cfg.as_ref())) else {
+            continue;
+        };
+        if !run.dev_seeded {
+            e.cfg_seed_history(i, cfg.history.iter().chain(&slot.out_ids).copied())?;
+            run.dev_seeded = true;
+        }
+        let p = &cfg.params;
+        let mut rng = run.rng.clone();
+        rows.push((
+            i,
+            crate::exec::gpu::DevCfg {
+                weight: p.cfg_weight,
+                penalty: p.repetition_penalty,
+                temp: if rng.is_some() { p.temperature } else { 0.0 },
+                top_p: p.top_p,
+                min_p: p.min_p,
+            },
+        ));
+        draws.extend((0..steps).map(|_| rng.as_mut().map_or(0.0, |r| r.unit())));
+    }
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    e.stage_cfg(&rows, &draws, steps)?;
+    Ok(true)
+}
+
+/// CFG pairs draw on the device: the sampler object has `plow_sample_cfg` and `--cfg-device`.
+#[cfg(feature = "cuda")]
+fn gpu_cfg_device(e: &crate::exec::gpu::GpuEngine) -> bool {
+    e.cfg_sampling() && crate::config::RuntimeConfig::get().nv.cfg_device
+}
+
+/// Advance every fed CFG owner's SplitMix past the `k` device draws it consumed.
+#[cfg(feature = "cuda")]
+fn gpu_cfg_advance(feeds: &[(usize, u32)], slots: &mut [Option<Slot>], k: usize) {
+    for &(i, _) in feeds {
+        if let Some(rng) = slots[i].as_mut().and_then(|s| s.cfg.as_mut()?.rng.as_mut()) {
+            for _ in 0..k {
+                rng.unit();
+            }
+        }
+    }
+}
+
+/// A CFG owner's next token from its (cond, uncond) rows of the step's bf16 logits.
+#[cfg(feature = "cuda")]
+fn cfg_draw_bf16(slot: &mut Slot, cond: &[u8], uncond: &[u8]) -> u32 {
+    let (Some(run), Some(cfg)) = (slot.cfg.as_mut(), slot.speech.as_ref().and_then(|s| s.cfg.as_ref())) else {
+        unreachable!("cfg_draw on a CFG owner")
+    };
+    let u = run.rng.as_mut().map(|r| r.unit());
+    let history = cfg.history.iter().chain(&slot.out_ids).copied();
+    crate::text::sample::sample_cfg_bf16(&cfg.params, cond, uncond, history, u, &mut run.scratch)
 }
 
 /// A CFG owner's next token from its stashed (cond, uncond) logits.
@@ -5471,6 +5723,9 @@ fn handle_produced_token(
     slot.out_ids.push(token);
     slot.executed += exec;
     slot.step += 1;
+    if let Some(seat) = slot.session.as_mut() {
+        seat.on_token(token);
+    }
     *tokens_this_tick += 1;
 
     let delta = if slot.raw_tokens {
@@ -6446,7 +6701,7 @@ mod tests {
             let s = owner.as_mut().unwrap();
             s.step = 1;
             s.out_ids.push(7);
-            s.cfg = Some(Box::new(CfgRun { rng: None, partner_pf: 0, cond: Vec::new(), uncond: Vec::new(), scratch: Vec::new() }));
+            s.cfg = Some(Box::new(CfgRun { rng: None, partner_pf: 0, cond: Vec::new(), uncond: Vec::new(), scratch: Vec::new(), dev_seeded: false }));
         }
         let slots = vec![owner, None];
         assert_eq!(gpu_decode_feeds(&slots, 2), [(0, 7), (1, 7)]);
@@ -6758,6 +7013,8 @@ mod tests {
                 held: Vec::new(),
                 held_finish: None,
                 parked_at: None,
+                session: None,
+                resume: 0,
             }),
             rx,
         )
@@ -7530,5 +7787,152 @@ mod host_bench {
                 p90(wake)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::serve::session::{RetainTable, SessionTicket};
+    use std::time::Duration;
+
+    fn retention() -> Retention {
+        // One launch width covering the whole table: seating never widens it.
+        Retention::with_table(RetainTable::new(Duration::from_secs(60), 0), &[16], 0)
+    }
+
+    fn job(prompt: &[u32], session: Option<&str>) -> ((Job, Instant), crate::serve::stream::ChunkReceiver) {
+        let (respond, rx) = crate::serve::stream::channel();
+        let t = Instant::now();
+        let job = Job {
+            prompt_ids: prompt.to_vec(),
+            gen: GenParams { max_tokens: 4, ..GenParams::default() },
+            arrived: t,
+            respond,
+            opts: JobOpts {
+                session: session.map(|s| {
+                    Box::new(SessionTicket {
+                        session: s.into(),
+                        request: "r".into(),
+                        keys: crate::serve::session::row_keys(prompt, &[], &[]),
+                        report: None,
+                    })
+                }),
+                ..Default::default()
+            },
+        };
+        ((job, t), rx)
+    }
+
+    fn admit(
+        slots: &mut [Option<Slot>],
+        r: &mut Retention,
+        (job, t): (Job, Instant),
+        budget: Option<crate::sched::admission::KvBudget>,
+    ) -> Option<(Job, Instant)> {
+        let metrics = Arc::new(Metrics::default());
+        admit_session(slots, slots.len(), job, t, None, &metrics, &EngineHealth::Healthy, budget, false, r)
+    }
+
+    /// Run slot `i` to one produced token and free it, as a finished request would.
+    fn finish(slots: &mut [Option<Slot>], r: &mut Retention, i: usize) {
+        let mut slot = slots[i].take().expect("live");
+        if let Some(seat) = slot.session.as_mut() {
+            seat.on_token(99);
+        }
+        drop(slot);
+        r.collect(Instant::now());
+    }
+
+    #[test]
+    fn a_session_resumes_its_retained_slot_and_other_requests_keep_off_it() {
+        let mut slots: Vec<Option<Slot>> = std::iter::repeat_with(|| None).take(4).collect();
+        let mut r = retention();
+        let (a, _ra) = job(&[1, 2, 3, 4, 5, 6], Some("s"));
+        assert!(admit(&mut slots, &mut r, a, None).is_none());
+        assert_eq!(slots[0].as_ref().unwrap().resume, 0);
+        finish(&mut slots, &mut r, 0);
+        assert!(r.table.holds(0), "the finished session request is retained");
+
+        let (plain, _rp) = job(&[1, 2, 3], None);
+        assert!(admit(&mut slots, &mut r, plain, None).is_none());
+        assert!(slots[0].is_none() && slots[1].is_some(), "a live request takes a free slot first");
+        let (other, _ro) = job(&[1, 2, 3, 4, 5, 6, 7], Some("t"));
+        assert!(admit(&mut slots, &mut r, other, None).is_none());
+        assert_eq!(slots[2].as_ref().unwrap().resume, 0, "sessions never share rows");
+
+        let (next, _rn) = job(&[1, 2, 3, 4, 9, 9, 9], Some("s"));
+        assert!(admit(&mut slots, &mut r, next, None).is_none());
+        assert_eq!(slots[0].as_ref().unwrap().resume, 4, "the shared prefix resumes");
+        assert!(!r.table.holds(0));
+    }
+
+    #[test]
+    fn retained_slots_yield_to_live_requests_and_the_evicted_session_recomputes() {
+        let mut slots: Vec<Option<Slot>> = std::iter::repeat_with(|| None).take(2).collect();
+        let mut r = retention();
+        for (i, s) in ["a", "b"].into_iter().enumerate() {
+            let (j, _rx) = job(&[1, 2, 3], Some(s));
+            assert!(admit(&mut slots, &mut r, j, None).is_none());
+            finish(&mut slots, &mut r, i);
+        }
+        assert_eq!(r.table.len(), 2);
+        let (plain, _rp) = job(&[5, 6], None);
+        assert!(admit(&mut slots, &mut r, plain, None).is_none(), "retained KV never queues a live request");
+        assert!(slots[0].is_some() && !r.table.holds(0), "the least recently used session went");
+        let (again, _rg) = job(&[1, 2, 3], Some("a"));
+        assert!(admit(&mut slots, &mut r, again, None).is_none());
+        assert_eq!(slots[1].as_ref().unwrap().resume, 0, "evicted: a plain recompute");
+        assert!(r.table.is_empty());
+    }
+
+    #[test]
+    fn retained_slots_never_push_a_live_request_past_the_slack() {
+        let mut slots: Vec<Option<Slot>> = std::iter::repeat_with(|| None).take(16).collect();
+        let mut r = Retention::with_table(RetainTable::new(Duration::from_secs(60), 0), &[1, 2, 4, 8, 16], 0);
+        // Ten sessions live at once (the launch is 16 wide), then all idle.
+        for i in 0..10 {
+            let (j, _rx) = job(&[1, 2, 3], Some(&format!("s{i}")));
+            assert!(admit(&mut slots, &mut r, j, None).is_none());
+        }
+        for i in 0..10 {
+            finish(&mut slots, &mut r, i);
+        }
+        assert_eq!(r.table.len(), 10);
+        // Slots 0..10 are retained; the next free one (10) would widen the idle launch (1) to 16:
+        // the least recently used retained slot (0) goes and the request decodes at width 1.
+        let (plain, _rp) = job(&[5, 6], None);
+        assert!(admit(&mut slots, &mut r, plain, None).is_none());
+        assert!(slots[0].is_some() && r.table.len() == 9);
+    }
+
+    #[test]
+    fn retained_rows_count_against_the_kv_budget_and_are_evicted_for_it() {
+        let mut slots: Vec<Option<Slot>> = std::iter::repeat_with(|| None).take(4).collect();
+        let mut r = retention();
+        let (a, _ra) = job(&[1; 20], Some("a"));
+        assert!(admit(&mut slots, &mut r, a, None).is_none());
+        finish(&mut slots, &mut r, 0);
+        assert_eq!(r.table.rows(), 20);
+        // 20 retained + 24 wanted > 40: the retained rows go, the request is seated.
+        let budget = crate::sched::admission::KvBudget::linear(1, 40);
+        let (b, _rb) = job(&[2; 20], None);
+        assert!(admit(&mut slots, &mut r, b, Some(budget)).is_none());
+        assert!(r.table.is_empty());
+    }
+
+    #[test]
+    fn without_a_ticket_or_with_retention_off_nothing_is_retained() {
+        let mut slots: Vec<Option<Slot>> = std::iter::repeat_with(|| None).take(2).collect();
+        let mut r = retention();
+        let (a, _ra) = job(&[1, 2, 3], None);
+        assert!(admit(&mut slots, &mut r, a, None).is_none());
+        finish(&mut slots, &mut r, 0);
+        let mut off = Retention::off();
+        let (b, _rb) = job(&[1, 2, 3], Some("s"));
+        assert!(admit(&mut slots, &mut off, b, None).is_none());
+        assert!(slots[0].as_ref().unwrap().session.is_none());
+        finish(&mut slots, &mut off, 0);
+        assert!(r.table.is_empty() && off.table.is_empty());
     }
 }

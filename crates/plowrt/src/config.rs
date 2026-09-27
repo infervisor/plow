@@ -96,6 +96,23 @@ pub struct RuntimeConfig {
     #[arg(long = "idle-dispatch", env = "PLOW_IDLE_DISPATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub idle_dispatch: bool,
 
+    /// How long a finished `X-Session-Id` request's KV (and an ASR session's audio and encoder
+    /// windows) stays retained for the session's next request, in ms. 0 disables retention.
+    #[arg(long = "session-ttl-ms", env = "PLOW_SESSION_TTL_MS", default_value_t = 60_000, global = true)]
+    pub session_ttl_ms: u64,
+
+    /// Retained session sequences per model; 0 = bounded by the slots (a live request that needs a
+    /// slot always evicts the least recently used one).
+    #[arg(long = "session-max", env = "PLOW_SESSION_MAX", default_value_t = 0, global = true)]
+    pub session_max: usize,
+
+    /// Slots a live request may be seated past because retained sessions hold the ones below:
+    /// decode launches cover every slot up to the highest live one, so by default (0) retention
+    /// never widens the launch the live requests already run; a request seated higher evicts the
+    /// least recently used retained slot below it.
+    #[arg(long = "session-slack", env = "PLOW_SESSION_SLACK", default_value_t = 0, global = true)]
+    pub session_slack: usize,
+
     /// Tokenize prompts without computing offsets (same ids).
     #[arg(long = "encode-fast", env = "PLOW_ENCODE_FAST", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub encode_fast: bool,
@@ -712,6 +729,21 @@ pub struct NvidiaRuntimeConfig {
     /// are not delayed behind K-step quanta and completions do not batch into arrival waves.
     #[arg(long = "multistep-adaptive", env = "PLOW_MULTISTEP_ADAPTIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub multistep_adaptive: bool,
+
+    /// CFG pairs draw on the device (`plow_sample_cfg` in the sampler object) instead of from
+    /// the host's copy of both logits rows. Off by default: Chatterbox served on H100 (T3 sharing
+    /// the GPU with the S3Gen render) lost aps at c16/c32/c64 (17.0/19.6/19.0 vs 18.7/20.5/21.9,
+    /// means of two runs): the host draw's per-step gap paced T3, and without it utterances
+    /// close in a trickle, so renders batch smaller (2.6 vs 3.1 per launch) and cost 10% more per
+    /// token. c1: T3 unchanged (0.5% faster), host share 12-18% -> 0.1% at c16..c64.
+    #[arg(long = "cfg-device", env = "PLOW_CFG_DEVICE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub cfg_device: bool,
+
+    /// With `--cfg-device`, CFG pairs also ride the `--multistep` quantum. Off: one step per tick
+    /// — measured Chatterbox served, H100: K=8 vs 1 c16 17.25 vs 18.75 aps, c1 T3 1.634 vs 1.606
+    /// ms/token (a quantum overshoots the stop and delays prefill and first-chunk renders).
+    #[arg(long = "cfg-multistep", env = "PLOW_CFG_MULTISTEP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub cfg_multistep: bool,
 
     /// Lookahead-1 decode pipeline (CUDA): the next decode step is enqueued before the host waits
     /// on the current one, so streaming, stop checks and scheduling overlap the device step and

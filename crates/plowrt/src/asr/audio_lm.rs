@@ -40,6 +40,8 @@ pub(crate) struct PacketAudioEncoder {
     output_rows: usize,
     output_width: usize,
     chunking: AudioChunking,
+    /// Attention window of the encoder, in rows (0: unwindowed).
+    window_rows: usize,
 }
 
 /// How features map to encoder rows: fixed-size frame chunks, each producing
@@ -84,6 +86,7 @@ impl PacketAudioEncoder {
         let output_rows = usize_param("output_rows")?;
         let feature_bins = usize_param("feature_bins")?;
         let output_width = usize_param("output_width")?;
+        let window_rows = packet.optional_parameter("attention.window_rows").unwrap_or(0) as usize;
         let chunks = feature_frames.div_ceil(chunking.chunk_frames);
         let input_bytes = chunks
             .checked_mul(feature_bins)
@@ -100,7 +103,7 @@ impl PacketAudioEncoder {
         {
             return Err(RuntimeError::Rejected("audio packet geometry is inconsistent".into()));
         }
-        Ok(Self { packet, feature_frames, feature_bins, output_rows, output_width, chunking })
+        Ok(Self { packet, feature_frames, feature_bins, output_rows, output_width, chunking, window_rows })
     }
 
     pub(crate) fn accepts(&self, frames: usize) -> bool {
@@ -143,6 +146,11 @@ impl PacketAudioEncoder {
         )?;
         output.truncate(valid_rows * self.output_width);
         Ok(output)
+    }
+
+    /// Encoder rows one attention window spans (0: unwindowed).
+    pub(crate) fn window_rows(&self) -> usize {
+        self.window_rows
     }
 
     pub(crate) fn output_width(&self) -> usize {
@@ -416,6 +424,14 @@ impl AudioLmPrompt {
         max_context: usize,
     ) -> Result<AudioLmRequest> {
         let language = self.language(language)?;
+        self.check_context(context)?;
+        let features = self.features(samples)?;
+        let rows = self.contract.chunking.rows(features.frames);
+        let (ids, audio_positions) = self.prompt(rows, language.as_deref(), context, max_context)?;
+        Ok(AudioLmRequest { features, ids, audio_positions, language })
+    }
+
+    fn check_context(&self, context: &str) -> Result<()> {
         let c = &self.contract;
         if self.tokenizer.encode(context).len() > c.context_max_tokens
             || c.forbidden.iter().any(|marker| context.contains(marker.as_str()))
@@ -425,6 +441,11 @@ impl AudioLmPrompt {
                 c.context_max_tokens
             )));
         }
+        Ok(())
+    }
+
+    /// The encoder's input for one recording: `[bin][frame]` log-mel features.
+    pub fn features(&self, samples: &[f32]) -> Result<MelFeatures> {
         let log_mel = self.frontend.extract(samples)?;
         let mut features = MelFeatures { values: vec![0.0; log_mel.values.len()], frames: log_mel.frames };
         for frame in 0..log_mel.frames {
@@ -432,7 +453,19 @@ impl AudioLmPrompt {
                 features.values[bin * log_mel.frames + frame] = log_mel.values[frame * log_mel.bins + bin];
             }
         }
-        let rows = c.chunking.rows(features.frames);
+        Ok(features)
+    }
+
+    /// Prompt ids around `rows` audio placeholders, and the placeholders' positions. `language`
+    /// is the resolved name ([`Self::language`]).
+    pub fn prompt(
+        &self,
+        rows: usize,
+        language: Option<&str>,
+        context: &str,
+        max_context: usize,
+    ) -> Result<(Vec<u32>, Vec<usize>)> {
+        let c = &self.contract;
         let mut messages = c.messages.clone();
         fill_context(&mut messages, context);
         let messages = messages.as_array().cloned().unwrap_or_default();
@@ -441,7 +474,7 @@ impl AudioLmPrompt {
             return Err(RuntimeError::Rejected("ASR template needs exactly one audio marker".into()));
         }
         let mut prompt = prompt.replace(c.marker.as_str(), &c.marker.repeat(rows));
-        if let Some(language) = &language {
+        if let Some(language) = language {
             prompt.push_str(&c.language_suffix.replace("{language}", language));
         }
         let ids = self.tokenizer.encode(&prompt);
@@ -465,7 +498,30 @@ impl AudioLmPrompt {
         if audio_positions.len() != rows {
             return Err(RuntimeError::Rejected("ASR placeholder count mismatch".into()));
         }
-        Ok(AudioLmRequest { features, ids, audio_positions, language })
+        Ok((ids, audio_positions))
+    }
+
+    /// Resolve `language` and check `context` once for a stream of partial prompts.
+    pub fn stream_language(&self, language: Option<&str>, context: &str) -> Result<Option<String>> {
+        let language = self.language(language)?;
+        self.check_context(context)?;
+        Ok(language)
+    }
+
+    pub(crate) fn chunking(&self) -> AudioChunking {
+        self.contract.chunking
+    }
+
+    /// The transcript text generated so far (`None` until the text itself begins): what a
+    /// streamed transcript has shown when these ids have been decoded.
+    pub fn text_so_far(&self, output: &[u32], language: Option<&str>) -> Option<String> {
+        let decoded = self.tokenizer.decode(output);
+        let text = if language.is_some() {
+            decoded.as_str()
+        } else {
+            decoded.split_once(self.contract.text_marker.as_str())?.1
+        };
+        Some(text.trim_start().trim_end_matches('\u{fffd}').to_owned())
     }
 
     /// The transcript of generated ids (stop token excluded).

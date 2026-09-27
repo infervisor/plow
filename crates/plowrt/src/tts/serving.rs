@@ -21,6 +21,7 @@ use serde::Deserialize;
 
 use super::codec::{Codec, Urgency};
 use super::{pcm16, wav_header, SpeechContract};
+use crate::serve::session::{InFlight, RequestIds};
 use crate::serve::stream::{self as stream_mod, StreamChunk};
 use crate::serve::AppState;
 
@@ -98,6 +99,9 @@ async fn speech_on_guided(
     mux: crate::serve::mux::ModelMux,
     req: SpeechRequest,
     t_arrive: Instant,
+    ids: &RequestIds,
+    in_flight: InFlight,
+    report: Option<crate::serve::session::Report>,
 ) -> Response {
     let wav = match req.response_format.as_deref().unwrap_or("wav") {
         "wav" => true,
@@ -111,7 +115,7 @@ async fn speech_on_guided(
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
     });
     if req.stream {
-        let mut ev = match w.synthesize_stream(&mux, req.voice.clone(), req.input.clone(), seed) {
+        let mut ev = match w.synthesize_stream(&mux, req.voice.clone(), req.input.clone(), seed, ids, report) {
             Ok(rx) => rx,
             Err(e) => return server_error(e),
         };
@@ -143,11 +147,14 @@ async fn speech_on_guided(
                 }
             }
         });
-        let body = Body::from_stream(futures::stream::poll_fn(move |cx| out_rx.poll_recv(cx)));
+        let body = Body::from_stream(futures::stream::poll_fn(move |cx| {
+            let _held = &in_flight;
+            out_rx.poll_recv(cx)
+        }));
         let ct = if wav { "audio/wav" } else { "audio/pcm" };
         return ([(header::CONTENT_TYPE, ct)], body).into_response();
     }
-    match w.synthesize(&mux, req.voice.clone(), req.input.clone(), seed).await {
+    match w.synthesize(&mux, req.voice.clone(), req.input.clone(), seed, ids, report).await {
         Err(e) => server_error(e),
         Ok(a) => {
             let audio_s = a.pcm.len() as f64 / f64::from(w.sample_rate);
@@ -214,7 +221,29 @@ fn server_error(msg: impl Into<String>) -> Response {
 
 pub async fn speech(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     req: Result<Json<SpeechRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let ids = match RequestIds::from_headers(&headers) {
+        Ok(ids) => ids,
+        Err(e) => return bad(e, "x-session-id"),
+    };
+    let (report, report_rx) = ids.report();
+    let mut response = speech_with(state, req, &ids, report).await;
+    ids.stamp(&mut response);
+    if response.status().is_success() {
+        if let Some(cache) = crate::serve::session::CacheOutcome::received(report_rx).await {
+            cache.stamp(&mut response);
+        }
+    }
+    response
+}
+
+async fn speech_with(
+    state: Arc<AppState>,
+    req: Result<Json<SpeechRequest>, axum::extract::rejection::JsonRejection>,
+    ids: &RequestIds,
+    report: Option<crate::serve::session::Report>,
 ) -> Response {
     let Json(mut req) = match req {
         Ok(r) => r,
@@ -240,8 +269,11 @@ pub async fn speech(
             Some("model".into()),
         );
     };
+    let Some(in_flight) = ids.begin(&req.model) else {
+        return crate::serve::api_error(StatusCode::CONFLICT, format!("request {} is already in flight in this session", ids.request), "invalid_request_error", Some("duplicate_request_id"), None);
+    };
     match tokio::task::block_in_place(|| guided_model(&bundle.dir, state.downstream(&req.model))) {
-        Ok(Some(g)) => return speech_on_guided(g, mux, req, t_arrive).await,
+        Ok(Some(g)) => return speech_on_guided(g, mux, req, t_arrive, ids, in_flight, report).await,
         Ok(None) => {}
         Err(e) => return server_error(format!("speech pipeline: {e}")),
     }
@@ -284,6 +316,7 @@ pub async fn speech(
         class: if req.stream { crate::serve::mux::JobClass::Critical } else { crate::serve::mux::JobClass::Normal },
         raw_tokens: true,
         speech: None,
+        session: ids.session.as_ref().and_then(|_| ids.ticket(crate::serve::session::row_keys(&prompt_ids, &[], &[]), report)),
     };
     let job = crate::serve::mux::Job { prompt_ids, gen, arrived: Instant::now(), respond: tx, opts };
     if let Err(err) = mux.submit_arrived(job, t_arrive, Some(mux.ingress())) {
@@ -307,7 +340,10 @@ pub async fn speech(
         }
         tokio::spawn(stream_task(Arc::clone(&model), rx, out_tx, seed, t_arrive));
         let mut out_rx = out_rx;
-        let body = Body::from_stream(futures::stream::poll_fn(move |cx| out_rx.poll_recv(cx)));
+        let body = Body::from_stream(futures::stream::poll_fn(move |cx| {
+            let _held = &in_flight;
+            out_rx.poll_recv(cx)
+        }));
         return ([(header::CONTENT_TYPE, content_type)], body).into_response();
     }
     let (codes, n_tokens) = match collect_codes(c, rx).await {

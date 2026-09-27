@@ -2326,6 +2326,10 @@ pub struct GpuEngine {
     /// Per-slot rows served from the prefix cache by the current sequence's
     /// attach (0 = cold). Feeds per-request `usage.cached_tokens`.
     vmm_attached: Vec<u32>,
+    /// Cache rows the next `begin_slot` keeps (a retained session prefix); 0 = start cold.
+    resume_rows: Vec<u32>,
+    /// A session sequence's retire pins its published prefix in the VMM cache for this long.
+    session_pin: Vec<Option<std::time::Duration>>,
     vmm_active: Vec<bool>,
     packed_admission: Vec<PackedAdmission>,
     kv_admission_epoch: u64,
@@ -2371,6 +2375,8 @@ pub struct GpuEngine {
     mixed_step: Option<mixed_step::MixedCudaStep>,
     token_batch: Option<token_batch::CudaTokenBatch>,
     kv_admission: Option<crate::sched::admission::KvBudget>,
+    /// Bytes of every batch-major `kv.*` tensor one cache row takes (static per-slot KV).
+    kv_row_bytes: u64,
     slot_generations: Vec<u32>,
 }
 
@@ -3193,6 +3199,31 @@ struct Sampler {
     threads: u32,
     #[allow(dead_code)]
     batch: usize,
+    /// `plow_sample_cfg` (absent on older objects: CFG pairs keep the host draw).
+    f_cfg: Option<KernelFn>,
+    /// Guided-draw buffers, allocated on the first CFG pair.
+    cfg: Option<CfgSlab>,
+    /// Steps of guided draws staged by [`GpuEngine::stage_cfg`] for the next decode call.
+    cfg_staged: usize,
+}
+
+/// `plow_sample_cfg` inputs: `[6][batch]` f32 params (flag, weight, penalty, temperature, top_p,
+/// min_p) then `[SAMPLE_RNG_STEPS][batch]` uniforms, and the `[batch][vocab]` u32 history counts.
+struct CfgSlab {
+    host: PinnedHost,
+    dev: DeviceMem,
+    counts: DeviceMem,
+}
+
+/// One CFG owner's guided sampling chain (the device form of `text::sample::CfgParams`;
+/// `temp <= 0` = greedy).
+#[derive(Clone, Copy, Debug)]
+pub struct DevCfg {
+    pub weight: f32,
+    pub penalty: f32,
+    pub temp: f32,
+    pub top_p: f32,
+    pub min_p: f32,
 }
 
 /// Bounded device multi-step state (plan stage 5: `PLOW_MULTISTEP=K`). The
@@ -6056,6 +6087,8 @@ impl GpuEngine {
             batch,
             pos: vec![0; batch],
             vmm_attached: vec![0; batch],
+            resume_rows: vec![0; batch],
+            session_pin: vec![None; batch],
             vmm_active: vec![false; batch],
             packed_admission: vec![PackedAdmission::Pending; batch],
             kv_admission_epoch: 0,
@@ -6078,6 +6111,14 @@ impl GpuEngine {
             mixed_step,
             token_batch: None,
             kv_admission,
+            kv_row_bytes: blob
+                .tensors
+                .iter()
+                .filter(|t| t.name.starts_with("kv."))
+                .map(|t| t.bytes)
+                .sum::<u64>()
+                .checked_div(batch as u64 * (blob.tensors[t_pos].bytes / 4))
+                .unwrap_or(0),
             slot_generations: vec![0; batch],
         };
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
@@ -6291,7 +6332,8 @@ impl GpuEngine {
         let params = be.host_alloc_pinned(slab)?;
         let d_params = be.alloc(0, slab as u64)?;
         let d_escratch = be.alloc(0, (batch * vocab * 4) as u64)?;
-        tracing::info!(cubin = %cubin.display(), "device sampler enabled (PLOW_DEV_SAMPLE=1)");
+        let f_cfg = be.get_function(&module, "plow_sample_cfg").ok();
+        tracing::info!(cubin = %cubin.display(), cfg = f_cfg.is_some(), "device sampler enabled (PLOW_DEV_SAMPLE=1)");
         Ok(Some(Sampler {
             f,
             _module: module,
@@ -6300,6 +6342,9 @@ impl GpuEngine {
             d_escratch,
             threads,
             batch,
+            f_cfg,
+            cfg: None,
+            cfg_staged: 0,
         }))
     }
 
@@ -6393,6 +6438,10 @@ impl GpuEngine {
         self.batch
     }
 
+    pub fn kv_row_bytes(&self) -> u64 {
+        self.kv_row_bytes
+    }
+
     pub fn kv_admission(&self) -> Option<crate::sched::admission::KvBudget> {
         self.kv_admission
     }
@@ -6431,6 +6480,7 @@ impl GpuEngine {
     /// reset — `in.kvlen` bounds what the attention reads, so rewinding
     /// `pos[b]` to 0 makes the slot's old cache rows unreachable.
     pub fn begin_slot(&mut self, b: usize, total: usize) -> Result<()> {
+        let keep = self.resume_rows.get_mut(b).map_or(0, std::mem::take);
         if b >= self.batch {
             return Err(RuntimeError::Rejected(format!(
                 "slot {b} out of range (engine batch {})",
@@ -6466,7 +6516,8 @@ impl GpuEngine {
         if crate::config::RuntimeConfig::get().prefix_cache_output() {
             self.vmm_publish(b, self.pos[b]);
         }
-        self.pos[b] = 0;
+        self.pos[b] = keep;
+        self.session_pin[b] = None;
         self.vmm_attached[b] = 0;
         if let Some(v) = &self.vmm {
             self.vmm_active[b] = true;
@@ -6490,6 +6541,34 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// Whether a finished sequence's cache rows survive in its slot until the next `begin_slot`:
+    /// static per-slot KV (no VMM mappings to drop, no recurrent state to reset).
+    pub fn slot_resume_supported(&self) -> bool {
+        self.vmm.is_none() && self.recurrent.is_none()
+    }
+
+    /// Make the next `begin_slot(b, ..)` keep slot `b`'s first `rows` cache rows (a retained
+    /// session prefix) and start its sequence there. Refused (the sequence starts cold) unless the
+    /// slot still holds that many rows.
+    pub fn resume_slot(&mut self, b: usize, rows: usize) -> bool {
+        let ok = self.slot_resume_supported()
+            && b < self.batch
+            && rows <= self.pos[b] as usize
+            && rows < self.max_ctx
+            && self.pipe.as_ref().is_none_or(|p| !p.holds(b));
+        self.resume_rows[b] = if ok { rows as u32 } else { 0 };
+        ok
+    }
+
+    /// Slot `b`'s current sequence belongs to a session: when it retires, its published prefix
+    /// (prompt and, with `PLOW_PREFIX_CACHE_OUTPUT`, output blocks) is pinned for `ttl` in the VMM
+    /// prefix cache, evicted only after every unpinned block.
+    pub fn hold_session_prefix(&mut self, b: usize, ttl: std::time::Duration) {
+        if self.vmm_prefix_enabled() && b < self.batch {
+            self.session_pin[b] = Some(ttl);
+        }
+    }
+
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
         if let Some(pipe) = self.pipe.as_mut().filter(|p| p.holds(b)) {
             pipe.retire[b] = Some(cache_output);
@@ -6505,6 +6584,9 @@ impl GpuEngine {
         }
         if cache_output && crate::config::RuntimeConfig::get().prefix_cache_output() {
             self.vmm_publish(b, self.pos[b]);
+        }
+        if let (Some(ttl), Some(v)) = (self.session_pin[b].take(), self.vmm.as_ref()) {
+            v.kv.pin_prefix(&self.seq_tokens[b], std::time::Instant::now() + ttl);
         }
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
@@ -6732,6 +6814,7 @@ impl GpuEngine {
         toks: &mut Vec<u32>,
     ) -> Result<()> {
         toks.clear();
+        let cfg_steps = self.take_cfg_staged();
         if feeds.is_empty() {
             return Ok(());
         }
@@ -6910,6 +6993,9 @@ impl GpuEngine {
             ];
             self.be
                 .launch_kernel(sf, bsz as u32, sthreads, 0, &mut a, Some(&self.stream))?;
+        }
+        if cfg_steps > 0 {
+            self.launch_cfg(0)?;
         }
 
         // Token readback: `in.ids` (rewritten by `ARGMAX_FIN`, or by the
@@ -7261,6 +7347,7 @@ impl GpuEngine {
         out: &mut Vec<u32>,
     ) -> Result<usize> {
         out.clear();
+        let cfg_steps = self.take_cfg_staged();
         let sample = sample.filter(|(specs, _)| specs.iter().any(|s| s.temp > 0.0));
         if sample.is_some() && self.sampler.is_none() {
             return Err(RuntimeError::Rejected("sampled multi-step needs the device sampler".into()));
@@ -7273,7 +7360,7 @@ impl GpuEngine {
             feeds.iter().map(|&(slot, _)| slot),
             &self.pos,
             self.max_ctx,
-            requested,
+            if cfg_steps > 0 { requested.min(cfg_steps) } else { requested },
             if sample.is_some() { ms.quantum.min(SAMPLE_RNG_STEPS) } else { ms.quantum },
         )
         .map_err(|error| RuntimeError::Rejected(error.to_string()))?;
@@ -7411,6 +7498,9 @@ impl GpuEngine {
                 ];
                 self.be
                     .launch_kernel(sf, bsz as u32, sthreads, 0, &mut a, Some(&self.stream))?;
+            }
+            if cfg_steps > 0 {
+                self.launch_cfg(step)?;
             }
             let mut a_ids = self.devp[self.t_ids].base;
             let mut a_pos = self.devp[self.t_pos].base;
@@ -7909,6 +7999,113 @@ impl GpuEngine {
     /// rows through [`Self::step_slots_sampled`] instead of the vocab-row D2H.
     pub fn dev_sample_enabled(&self) -> bool {
         self.sampler.is_some()
+    }
+
+    /// Whether CFG pairs (conditional row b, unconditional row b + 1) can draw on the device.
+    pub fn cfg_sampling(&self) -> bool {
+        self.sampler.as_ref().is_some_and(|s| s.f_cfg.is_some())
+    }
+
+    fn cfg_slab(&mut self) -> Result<&mut CfgSlab> {
+        let (bsz, vocab) = (self.batch, self.vocab);
+        let smp = self
+            .sampler
+            .as_mut()
+            .filter(|s| s.f_cfg.is_some())
+            .ok_or_else(|| RuntimeError::Rejected("no device CFG sampler".into()))?;
+        if smp.cfg.is_none() {
+            let bytes = (6 + SAMPLE_RNG_STEPS) * bsz * 4;
+            smp.cfg = Some(CfgSlab {
+                host: self.be.host_alloc_pinned(bytes)?,
+                dev: self.be.alloc(0, bytes as u64)?,
+                counts: self.be.alloc(0, (bsz * vocab * 4) as u64)?,
+            });
+        }
+        Ok(smp.cfg.as_mut().expect("allocated"))
+    }
+
+    /// Reset CFG owner `slot`'s device penalty history to the occurrence counts of `history`.
+    pub fn cfg_seed_history(&mut self, slot: usize, history: impl IntoIterator<Item = u32>) -> Result<()> {
+        let vocab = self.vocab;
+        if slot >= self.batch {
+            return Err(RuntimeError::Rejected(format!("CFG slot {slot} out of range")));
+        }
+        let mut row = vec![0u32; vocab];
+        for t in history {
+            if let Some(c) = row.get_mut(t as usize) {
+                *c += 1;
+            }
+        }
+        let base = self.cfg_slab()?.counts.base + (slot * vocab * 4) as u64;
+        self.be.memcpy_htod(base, bytemuck::cast_slice(&row))?;
+        self.be.synchronize()
+    }
+
+    /// Stage guided draws for the next [`Self::step_slots_sampled`] (`steps == 1`) or
+    /// [`Self::multi_step_sampled_at_most`] (up to `steps` tokens): `rows` are the CFG owners, and
+    /// `draws[r * steps + k]` is owner `r`'s uniform for its k-th token. After the decode (and
+    /// `plow_sample`), `plow_sample_cfg` writes each owner's token to both members' `in.ids`.
+    pub fn stage_cfg(&mut self, rows: &[(usize, DevCfg)], draws: &[f32], steps: usize) -> Result<()> {
+        let bsz = self.batch;
+        if steps == 0 || steps > SAMPLE_RNG_STEPS || draws.len() != rows.len() * steps {
+            return Err(RuntimeError::Rejected("stage_cfg: bad draw extent".into()));
+        }
+        if rows.iter().any(|&(b, _)| b + 1 >= bsz) {
+            return Err(RuntimeError::Rejected("stage_cfg: CFG owner without a partner row".into()));
+        }
+        self.cfg_slab()?;
+        let smp = self.sampler.as_mut().expect("cfg_slab checked");
+        let slab = smp.cfg.as_mut().expect("allocated");
+        let raw: &mut [f32] = bytemuck::cast_slice_mut(slab.host.as_mut_slice());
+        let (prm, rng) = raw.split_at_mut(6 * bsz);
+        prm[..bsz].fill(0.0);
+        for (r, &(b, c)) in rows.iter().enumerate() {
+            for (j, v) in [1.0, c.weight, c.penalty, c.temp, c.top_p, c.min_p].into_iter().enumerate() {
+                prm[j * bsz + b] = v;
+            }
+            for k in 0..steps {
+                rng[k * bsz + b] = draws[r * steps + k];
+            }
+        }
+        let n = (6 + steps) * bsz * 4;
+        // SAFETY: the pinned slab lives on self past the step's synchronize.
+        unsafe {
+            self.be.memcpy_htod_async(slab.dev.base, &slab.host.as_slice()[..n], &self.stream)?;
+        }
+        smp.cfg_staged = steps;
+        Ok(())
+    }
+
+    /// Steps of guided draws staged for this decode call (consumed: the next call stages anew).
+    fn take_cfg_staged(&mut self) -> usize {
+        self.sampler.as_mut().map_or(0, |s| std::mem::take(&mut s.cfg_staged))
+    }
+
+    /// Launch the staged guided draw for quantum step `step`.
+    fn launch_cfg(&mut self, step: usize) -> Result<()> {
+        let bsz = self.batch;
+        let smp = self.sampler.as_ref().expect("staged");
+        let (Some(f), Some(slab)) = (smp.f_cfg, smp.cfg.as_ref()) else {
+            return Err(RuntimeError::Rejected("CFG draw staged without the device CFG sampler".into()));
+        };
+        let mut a_logits = self.devp[self.t_logits].base;
+        let mut a_ids = self.devp[self.t_ids].base;
+        let mut a_prm = slab.dev.base;
+        let mut a_rng = slab.dev.base + ((6 + step) * bsz * 4) as u64;
+        let mut a_cnt = slab.counts.base;
+        let mut a_es = smp.d_escratch.base;
+        let (mut a_v, mut a_b) = (self.vocab as u32, bsz as u32);
+        let mut a = [
+            &mut a_logits as *mut u64 as *mut std::ffi::c_void,
+            &mut a_ids as *mut u64 as *mut std::ffi::c_void,
+            &mut a_prm as *mut u64 as *mut std::ffi::c_void,
+            &mut a_rng as *mut u64 as *mut std::ffi::c_void,
+            &mut a_cnt as *mut u64 as *mut std::ffi::c_void,
+            &mut a_es as *mut u64 as *mut std::ffi::c_void,
+            &mut a_v as *mut u32 as *mut std::ffi::c_void,
+            &mut a_b as *mut u32 as *mut std::ffi::c_void,
+        ];
+        self.be.launch_kernel(f, bsz as u32, smp.threads, 0, &mut a, Some(&self.stream))
     }
 
     /// Whether packet-selected or legacy opt-in cross-request prefill is active.

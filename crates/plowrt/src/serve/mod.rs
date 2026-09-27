@@ -26,6 +26,7 @@ pub mod openai;
 pub mod placement;
 pub mod reasoning;
 pub mod stream;
+pub mod session;
 #[cfg(all(test, any(feature = "hsa", feature = "cpu")))]
 mod step_lowering_tests;
 pub mod template;

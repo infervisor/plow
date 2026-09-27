@@ -71,6 +71,15 @@ pub struct ServingMetrics {
     /// met the TTFT target, the TBT target (mean inter-token time), and both (goodput).
     pub slo_requests: AtomicU64,
     pub slo_ttft_met: AtomicU64,
+    /// `X-Session-Id` retention (see `serve::session`): admissions that resumed retained rows,
+    /// that found none, the rows resumed, entries evicted, and what is retained now.
+    pub session_hits: AtomicU64,
+    pub session_misses: AtomicU64,
+    pub session_reused_rows: AtomicU64,
+    pub session_evictions: AtomicU64,
+    pub session_retained: AtomicU64,
+    pub session_retained_rows: AtomicU64,
+    pub session_retained_bytes: AtomicU64,
     pub slo_tbt_met: AtomicU64,
     pub slo_met: AtomicU64,
     pub ttft: Histogram,
@@ -198,6 +207,48 @@ impl ServingMetrics {
             "counter",
             "Judged requests whose time to first token met PLOW_TTFT_SLO_MS.",
             |m: &Metrics, _| m.serving.slo_ttft_met.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_session_hits_total",
+            "counter",
+            "Session requests that resumed retained KV rows.",
+            |m: &Metrics, _| m.serving.session_hits.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_session_misses_total",
+            "counter",
+            "Session requests that found no retained KV rows to resume.",
+            |m: &Metrics, _| m.serving.session_misses.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_session_reused_tokens_total",
+            "counter",
+            "Prompt rows resumed from retained session KV instead of prefilled.",
+            |m: &Metrics, _| m.serving.session_reused_rows.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_session_evictions_total",
+            "counter",
+            "Retained session sequences dropped: idle TTL, a live request, the KV budget or the cap.",
+            |m: &Metrics, _| m.serving.session_evictions.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_session_retained",
+            "gauge",
+            "Session sequences whose KV is retained.",
+            |m: &Metrics, _| m.serving.session_retained.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_session_retained_tokens",
+            "gauge",
+            "KV rows retained for sessions (a CFG pair counts both members).",
+            |m: &Metrics, _| m.serving.session_retained_rows.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_session_retained_bytes",
+            "gauge",
+            "KV bytes retained for sessions (rows times the engine's KV bytes per row).",
+            |m: &Metrics, _| m.serving.session_retained_bytes.load(Relaxed)
         );
         scalar!(
             "plowrt_slo_tbt_met_total",

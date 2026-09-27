@@ -9,18 +9,19 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 use super::{
-    frontend::{decode_wav, AudioError, MAX_SAMPLES, SAMPLE_RATE},
+    frontend::{decode_wav, decode_wav_chunk, AudioError, MAX_SAMPLES, SAMPLE_RATE},
     FinalizationPolicy, Transcriber, Transcript, TranscriptionInput,
 };
+use crate::serve::session::RequestIds;
 
 #[cfg(feature = "cuda")]
 mod shared;
@@ -33,8 +34,20 @@ pub struct AsrServer {
     backend: Backend,
     uploads: Arc<Semaphore>,
     sessions: Arc<Semaphore>,
-    next_session: AtomicU64,
+    /// Recordings sent as `append` uploads, by (model, `X-Session-Id`).
+    recordings: parking_lot::Mutex<HashMap<(String, Arc<str>), Arc<tokio::sync::Mutex<Recording>>>>,
 }
+
+/// One session's recording so far (HTTP `append` uploads), until its `final` upload.
+#[derive(Default)]
+struct Recording {
+    samples: Vec<f32>,
+    windows: Arc<parking_lot::Mutex<WindowCache>>,
+    used: Option<Instant>,
+}
+
+/// Recordings a process keeps at once; past it the least recently used idle one goes.
+const MAX_RECORDINGS: usize = 1024;
 
 enum Backend {
     /// `plowrt asr`: one model on a private cohort engine.
@@ -52,6 +65,30 @@ enum Route {
     Shared(Arc<shared::SharedAsr>, crate::serve::mux::ModelMux),
 }
 
+/// Encoder rows of a growing recording's completed attention windows, one entry per window, kept
+/// for its later partial transcripts.
+#[derive(Default)]
+pub(crate) struct WindowCache {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    rows: Vec<Arc<[f32]>>,
+}
+
+/// How one transcription runs beyond its audio.
+#[derive(Default)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) struct AsrOpts {
+    /// The answer a client waits on (a final); otherwise a revisable partial.
+    pub final_pass: bool,
+    /// With a session: the decoder rows are retained for, and resumed from, its requests.
+    pub ids: Option<RequestIds>,
+    /// A partial of a growing recording: reuse (and extend) its completed windows' encoder rows.
+    pub windows: Option<Arc<parking_lot::Mutex<WindowCache>>>,
+    /// Transcript text deltas as the decoder produces them.
+    pub deltas: Option<mpsc::UnboundedSender<String>>,
+    /// What the session's admission reused.
+    pub report: Option<crate::serve::session::Report>,
+}
+
 impl Route {
     fn submit(
         &self,
@@ -59,18 +96,25 @@ impl Route {
         language: Option<String>,
         context: String,
         cancel: Arc<AtomicBool>,
-        final_pass: bool,
+        opts: AsrOpts,
     ) -> Result<oneshot::Receiver<crate::Result<Transcript>>, SubmitError> {
         match self {
             Route::Cohort(mux) => {
-                let _ = final_pass;
+                let _ = opts;
                 mux.submit(samples, language, context, cancel)
             }
             #[cfg(feature = "cuda")]
-            Route::Shared(asr, mux) => {
-                asr.submit(mux.clone(), samples, language, context, cancel, final_pass)
-            }
+            Route::Shared(asr, mux) => asr.submit(mux.clone(), samples, language, context, cancel, opts),
         }
+    }
+
+    /// Whether this route keeps session state (retained decoder rows, appended audio).
+    fn sessions(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        if matches!(self, Route::Shared(..)) {
+            return true;
+        }
+        false
     }
 }
 
@@ -210,7 +254,7 @@ impl AsrServer {
             backend: Backend::Cohort { model, mux, finalization },
             uploads: Arc::new(Semaphore::new(ingress_capacity)),
             sessions: Arc::new(Semaphore::new(ingress_capacity)),
-            next_session: AtomicU64::new(1),
+            recordings: Default::default(),
         })
     }
 
@@ -222,8 +266,32 @@ impl AsrServer {
             backend: Backend::Serve(state),
             uploads: Arc::new(Semaphore::new(shared::UPLOADS)),
             sessions: Arc::new(Semaphore::new(shared::UPLOADS)),
-            next_session: AtomicU64::new(1),
+            recordings: Default::default(),
         })
+    }
+
+    /// A session's recording, created on first use. Idle recordings go after the session TTL
+    /// (60 s when retention is off), and past [`MAX_RECORDINGS`] the least recently used idle one.
+    fn recording(&self, model: &str, session: &Arc<str>) -> Arc<tokio::sync::Mutex<Recording>> {
+        let ttl = Some(crate::serve::session::retention_ttl())
+            .filter(|t| !t.is_zero())
+            .unwrap_or(Duration::from_secs(60));
+        let now = Instant::now();
+        let idle = |r: &Arc<tokio::sync::Mutex<Recording>>| r.try_lock().ok().map(|r| r.used);
+        let mut map = self.recordings.lock();
+        map.retain(|_, r| !matches!(idle(r), Some(Some(used)) if now.saturating_duration_since(used) >= ttl));
+        let key = (model.to_owned(), session.clone());
+        if map.len() >= MAX_RECORDINGS && !map.contains_key(&key) {
+            let lru = map
+                .iter()
+                .filter_map(|(k, r)| Some((k.clone(), idle(r)?.unwrap_or(now))))
+                .min_by_key(|&(_, used)| used)
+                .map(|(k, _)| k);
+            if let Some(k) = lru {
+                map.remove(&k);
+            }
+        }
+        map.entry(key).or_default().clone()
     }
 
     async fn route(&self, model: &str) -> Result<(Route, FinalizationPolicy), Response> {
@@ -276,7 +344,29 @@ fn runtime_failure(error: crate::RuntimeError) -> Response {
     failure(status, error)
 }
 
-async fn transcription(State(state): State<Arc<AsrServer>>, mut multipart: Multipart) -> Response {
+async fn transcription(
+    State(state): State<Arc<AsrServer>>,
+    headers: axum::http::HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    let ids = match RequestIds::from_headers(&headers) {
+        Ok(ids) => ids,
+        Err(e) => return failure(StatusCode::BAD_REQUEST, e),
+    };
+    let mut response = transcribe_upload(state, multipart, &ids).await;
+    ids.stamp(&mut response);
+    response
+}
+
+fn form_bool(fields: &std::collections::HashMap<String, String>, name: &str) -> Result<bool, Response> {
+    match fields.get(name).map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("false" | "0") => Ok(false),
+        Some("true" | "1") => Ok(true),
+        Some(_) => Err(failure(StatusCode::BAD_REQUEST, format!("{name} must be true or false"))),
+    }
+}
+
+async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids: &RequestIds) -> Response {
     let upload = match state.uploads.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => return failure(StatusCode::TOO_MANY_REQUESTS, "too many ASR uploads"),
@@ -304,7 +394,8 @@ async fn transcription(State(state): State<Arc<AsrServer>>, mut multipart: Multi
         } else {
             if !matches!(
                 name.as_str(),
-                "model" | "language" | "prompt" | "response_format" | "temperature"
+                "model" | "language" | "prompt" | "response_format" | "temperature" | "stream" | "append" | "final"
+                    | "offset"
             ) || fields.contains_key(&name)
             {
                 return failure(StatusCode::BAD_REQUEST, "unknown or duplicate field");
@@ -317,10 +408,10 @@ async fn transcription(State(state): State<Arc<AsrServer>>, mut multipart: Multi
             fields.insert(name, value);
         }
     }
-    let Some(model) = fields.get("model") else {
+    let Some(model) = fields.get("model").cloned() else {
         return failure(StatusCode::BAD_REQUEST, "model is required");
     };
-    let route = match state.route(model).await {
+    let route = match state.route(&model).await {
         Ok((route, _)) => route,
         Err(response) => return response,
     };
@@ -339,51 +430,220 @@ async fn transcription(State(state): State<Arc<AsrServer>>, mut multipart: Multi
     {
         return failure(StatusCode::BAD_REQUEST, "ASR supports greedy decoding only");
     }
-    let Some(file) = file else {
+    let (stream, append, finish) = match (form_bool(&fields, "stream"), form_bool(&fields, "append"), form_bool(&fields, "final")) {
+        (Ok(s), Ok(a), Ok(f)) => (s, a, f),
+        (Err(e), ..) | (_, Err(e), _) | (.., Err(e)) => return e,
+    };
+    let recorded = append || finish;
+    if recorded && (ids.session.is_none() || !route.sessions()) {
+        return failure(StatusCode::BAD_REQUEST, "append/final need an X-Session-Id on plowrt serve");
+    }
+    let Some(in_flight) = ids.begin(&model) else {
+        return failure(StatusCode::CONFLICT, format!("request {} is already in flight in this session", ids.request));
+    };
+    if file.is_none() && !finish {
         return failure(StatusCode::BAD_REQUEST, "file is required");
+    }
+    let offset = match fields.get("offset").map(|v| v.trim().parse::<usize>()) {
+        None => None,
+        Some(Ok(offset)) if recorded => Some(offset),
+        Some(_) => return failure(StatusCode::BAD_REQUEST, "offset must be a sample count, with append or final"),
     };
     let language = fields.remove("language");
     let context = fields.remove("prompt").unwrap_or_default();
-    let samples = match tokio::task::spawn_blocking(move || decode_wav(&file)).await {
-        Ok(Ok(samples)) => samples,
-        Ok(Err(error)) => {
-            let status = match &error {
-                AudioError::Invalid(_) => StatusCode::BAD_REQUEST,
-                AudioError::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                AudioError::TooLong => StatusCode::PAYLOAD_TOO_LARGE,
-            };
-            return failure(status, error);
-        }
-        Err(error) => return failure(StatusCode::INTERNAL_SERVER_ERROR, error),
+    let samples = match file {
+        None => Vec::new(),
+        Some(file) => match tokio::task::spawn_blocking(move || if recorded { decode_wav_chunk(&file) } else { decode_wav(&file) }).await {
+            Ok(Ok(samples)) => samples,
+            Ok(Err(error)) => {
+                let status = match &error {
+                    AudioError::Invalid(_) => StatusCode::BAD_REQUEST,
+                    AudioError::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    AudioError::TooLong => StatusCode::PAYLOAD_TOO_LARGE,
+                };
+                return failure(status, error);
+            }
+            Err(error) => return failure(StatusCode::INTERNAL_SERVER_ERROR, error),
+        },
     };
     drop(upload);
+    let (report, report_rx) = ids.report();
+    let mut opts = AsrOpts { final_pass: !recorded || finish, ids: Some(ids.clone()), report, ..Default::default() };
+    // A session recording: append, then transcribe all of it (partial) or finish it (final).
+    let mut recorded_samples = 0;
+    let (samples, recording) = if recorded {
+        let session = ids.session.clone().expect("checked");
+        let recording = state.recording(&model, &session);
+        let mut rec = recording.clone().lock_owned().await;
+        // The client's count of samples it sent before this upload: a recording this process lost
+        // (restart, failover, TTL) or one out of step is refused with what it holds, and the client
+        // resends from there.
+        if offset.is_some_and(|o| o != rec.samples.len()) {
+            let expected = rec.samples.len();
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error":{"message":format!("session recording holds {expected} samples; resend from offset {expected}"),
+                    "type":"transcription_error","code":"session_audio_offset"},"expected_offset":expected})),
+            )
+                .into_response();
+        }
+        if rec.samples.len() + samples.len() > MAX_SAMPLES {
+            return failure(StatusCode::PAYLOAD_TOO_LARGE, "session audio exceeds 30 seconds");
+        }
+        rec.samples.extend_from_slice(&samples);
+        rec.used = Some(Instant::now());
+        recorded_samples = rec.samples.len();
+        let all = if finish {
+            rec.windows = Default::default();
+            std::mem::take(&mut rec.samples)
+        } else {
+            opts.windows = Some(rec.windows.clone());
+            rec.samples.clone()
+        };
+        if !finish && all.len() < SAMPLE_RATE as usize / 2 {
+            let reply = json!({"text": "", "final": false, "offset": recorded_samples});
+            return if stream {
+                sse_events(vec![transcript_event("transcript.text.done", ids, reply)])
+            } else if format == "text" {
+                String::new().into_response()
+            } else {
+                Json(reply).into_response()
+            };
+        }
+        (all, Some(rec))
+    } else {
+        (samples, None)
+    };
     let cancel = Cancellation(Arc::new(AtomicBool::new(false)));
-    let work = match route.submit(samples, language, context, cancel.0.clone(), true) {
+    let (delta_tx, delta_rx) = mpsc::unbounded_channel();
+    if stream {
+        opts.deltas = Some(delta_tx);
+    }
+    let work = match route.submit(samples, language, context, cancel.0.clone(), opts) {
         Ok(work) => work,
         Err(SubmitError::Full) => return failure(StatusCode::TOO_MANY_REQUESTS, "ASR queue full"),
         Err(SubmitError::Closed) => {
             return failure(StatusCode::SERVICE_UNAVAILABLE, "ASR engine unavailable")
         }
     };
-    match work.await {
-        Ok(Ok(result)) if format == "text" => result.text.into_response(),
-        Ok(Ok(result)) => Json(json!({"text":result.text})).into_response(),
-        Ok(Err(error)) => runtime_failure(error),
-        Err(error) => failure(StatusCode::SERVICE_UNAVAILABLE, error),
+    let finals = !recorded || finish;
+    let offset = recorded.then_some(recorded_samples);
+    if stream {
+        let cache = crate::serve::session::CacheOutcome::received(report_rx).await;
+        let mut response = sse_transcript(work, delta_rx, ids.clone(), finals, offset, cache, (in_flight, cancel, recording));
+        if let Some(cache) = cache {
+            cache.stamp(&mut response);
+        }
+        return response;
     }
+    let result = work.await;
+    drop((in_flight, recording));
+    let mut response = match result {
+        Ok(Ok(result)) if format == "text" => result.text.into_response(),
+        Ok(Ok(result)) if recorded => Json(json!({"text":result.text,"final":finals,"offset":recorded_samples})).into_response(),
+        Ok(Ok(result)) => Json(json!({"text":result.text})).into_response(),
+        Ok(Err(error)) => return runtime_failure(error),
+        Err(error) => return failure(StatusCode::SERVICE_UNAVAILABLE, error),
+    };
+    if let Some(cache) = crate::serve::session::CacheOutcome::received(report_rx).await {
+        cache.stamp(&mut response);
+    }
+    response
 }
 
-async fn upgrade(State(state): State<Arc<AsrServer>>, ws: WebSocketUpgrade) -> Response {
+fn transcript_event(kind: &str, ids: &RequestIds, mut body: serde_json::Value) -> axum::response::sse::Event {
+    body["type"] = kind.into();
+    body["request_id"] = ids.request.as_ref().into();
+    if let Some(session) = &ids.session {
+        body["session_id"] = session.as_ref().into();
+    }
+    axum::response::sse::Event::default().data(body.to_string())
+}
+
+fn sse_events(events: Vec<axum::response::sse::Event>) -> Response {
+    let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
+    axum::response::sse::Sse::new(stream).into_response()
+}
+
+/// OpenAI streamed transcription: `transcript.text.delta` events as the decoder produces text, then
+/// `transcript.text.done` with the whole transcript (`final: false` for a session's partial).
+fn sse_transcript<H: Send + 'static>(
+    mut work: oneshot::Receiver<crate::Result<Transcript>>,
+    mut deltas: mpsc::UnboundedReceiver<String>,
+    ids: RequestIds,
+    finals: bool,
+    offset: Option<usize>,
+    cache: Option<crate::serve::session::CacheOutcome>,
+    held: H,
+) -> Response {
+    let (tx, mut rx) = mpsc::channel::<axum::response::sse::Event>(64);
+    tokio::spawn(async move {
+        let _held = held;
+        let mut shown = String::new();
+        let result = loop {
+            tokio::select! {
+                Some(delta) = deltas.recv() => {
+                    shown.push_str(&delta);
+                    if tx.send(transcript_event("transcript.text.delta", &ids, json!({"delta": delta}))).await.is_err() {
+                        return;
+                    }
+                }
+                result = &mut work => break result,
+            }
+        };
+        let event = match result {
+            Ok(Ok(result)) => {
+                while let Ok(delta) = deltas.try_recv() {
+                    shown.push_str(&delta);
+                    let _ = tx.send(transcript_event("transcript.text.delta", &ids, json!({"delta": delta}))).await;
+                }
+                if let Some(rest) = result.text.strip_prefix(shown.as_str()).filter(|r| !r.is_empty()) {
+                    let _ = tx.send(transcript_event("transcript.text.delta", &ids, json!({"delta": rest}))).await;
+                }
+                let mut done = json!({"text": result.text, "language": result.language, "final": finals});
+                if let Some(offset) = offset {
+                    done["offset"] = offset.into();
+                }
+                if let Some(cache) = cache {
+                    done["session_cache"] = cache.status.as_str().into();
+                    done["cached_tokens"] = cache.rows.into();
+                }
+                transcript_event("transcript.text.done", &ids, done)
+            }
+            Ok(Err(error)) => transcript_event("error", &ids, json!({"message": error.to_string()})),
+            Err(error) => transcript_event("error", &ids, json!({"message": error.to_string()})),
+        };
+        let _ = tx.send(event).await;
+    });
+    let stream = futures::stream::poll_fn(move |cx| rx.poll_recv(cx).map(|e| e.map(Ok::<_, std::convert::Infallible>)));
+    axum::response::sse::Sse::new(stream).into_response()
+}
+
+async fn upgrade(
+    State(state): State<Arc<AsrServer>>,
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let mut ids = match RequestIds::from_headers(&headers) {
+        Ok(ids) => ids,
+        Err(e) => return failure(StatusCode::BAD_REQUEST, e),
+    };
     let permit = match state.sessions.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => return failure(StatusCode::TOO_MANY_REQUESTS, "too many ASR sessions"),
     };
-    ws.max_message_size(65536)
+    // Each connection is a session: its partials resume the decoder rows the last one retained.
+    ids.session.get_or_insert_with(|| format!("ws-{}", ids.request).into());
+    let echo = ids.clone();
+    let mut response = ws
+        .max_message_size(65536)
         .max_frame_size(65536)
         .on_upgrade(move |socket| async move {
-            stream(state, socket, permit).await;
+            stream(state, socket, permit, ids).await;
         })
-        .into_response()
+        .into_response();
+    echo.stamp(&mut response);
+    response
 }
 
 #[derive(serde::Deserialize)]
@@ -403,7 +663,9 @@ struct Start {
     partials: bool,
 }
 
-/// Audio between partial transcriptions; each re-transcribes the whole buffer so far.
+/// Audio between partial transcriptions. On `plowrt serve` a partial encodes only the open encoder
+/// window and resumes the connection's retained decoder rows; the cohort engine re-transcribes the
+/// whole buffer.
 const PARTIAL_STRIDE: usize = SAMPLE_RATE as usize;
 
 fn common_prefix_bytes(a: &str, b: &str) -> usize {
@@ -435,7 +697,7 @@ fn append_final_padding(samples: &mut Vec<f32>, count: usize, amplitude: f32) {
     }
 }
 
-async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSemaphorePermit) {
+async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSemaphorePermit, ids: RequestIds) {
     let cancel = Cancellation(Arc::new(AtomicBool::new(false)));
     let Some(Ok(Message::Text(text))) =
         tokio::time::timeout(Duration::from_secs(30), socket.recv())
@@ -469,10 +731,18 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
     };
     let language = start.language.clone();
     let partials = start.partials;
-    let session = state.next_session.fetch_add(1, Ordering::Relaxed);
+    let session = ids.session.clone().unwrap_or_default();
+    let windows: Arc<parking_lot::Mutex<WindowCache>> = Default::default();
+    let request = |final_pass| AsrOpts {
+        final_pass,
+        ids: Some(RequestIds { request: RequestIds::generated().request, session: ids.session.clone() }),
+        windows: (!final_pass).then(|| windows.clone()),
+        deltas: None,
+        report: None,
+    };
     let max_audio_samples = MAX_SAMPLES.saturating_sub(finalization.final_padding_samples);
     let initial_credit = 16000usize.min(max_audio_samples);
-    if !send(&mut socket,json!({"type":"ready","version":1,"session_id":session.to_string(),
+    if !send(&mut socket,json!({"type":"ready","version":1,"session_id":&*session,"request_id":&*ids.request,
         "sample_rate":SAMPLE_RATE,"format":"pcm_s16le","max_chunk_bytes":32000,"credit_samples":initial_credit,
         "max_audio_samples":max_audio_samples,"partial_mode":if partials {"revision"} else {"final_only"}})).await{return;}
     let mut samples = Vec::new();
@@ -551,7 +821,7 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
             );
             // The final supersedes an in-flight partial; dropping its receiver cancels it.
             drop(pending.take());
-            let mut work = match route.submit(samples, language, start.prompt, cancel.0.clone(), true) {
+            let mut work = match route.submit(samples, language, start.prompt, cancel.0.clone(), request(true)) {
                 Ok(work) => work,
                 Err(SubmitError::Full) => {
                     send(
@@ -612,7 +882,7 @@ async fn stream(state: Arc<AsrServer>, mut socket: WebSocket, _permit: OwnedSema
         if partials && pending.is_none() && samples.len() >= partial_at + PARTIAL_STRIDE {
             partial_at = samples.len();
             // A full queue skips this partial; the next stride retries.
-            pending = route.submit(samples.clone(), language.clone(), start.prompt.clone(), cancel.0.clone(), false).ok();
+            pending = route.submit(samples.clone(), language.clone(), start.prompt.clone(), cancel.0.clone(), request(false)).ok();
         }
         let grant = (16000 - samples.len() % 16000)
             .min(max_audio_samples - samples.len())

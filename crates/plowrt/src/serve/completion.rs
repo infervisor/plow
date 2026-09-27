@@ -38,13 +38,32 @@ fn request_id() -> String {
     format!("cmpl-{:016x}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
+/// `X-Request-Id` / `X-Session-Id`: echoed on the response; a session's requests resume the rows
+/// its previous request retained.
 pub async fn completions(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    req: Result<Json<CompletionRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let ids = match crate::serve::session::RequestIds::from_headers(&headers) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return crate::serve::api_error(axum::http::StatusCode::BAD_REQUEST, e, "invalid_request_error", Some("invalid_value"), None)
+        }
+    };
+    let mut response = completions_with(state, req, &ids).await;
+    ids.stamp(&mut response);
+    response
+}
+
+async fn completions_with(
+    state: Arc<AppState>,
     // `Result<Json<..>, JsonRejection>` rather than `Json<..>`: axum's default
     // rejection is a PLAIN-TEXT 400/415/422, and a client that calls
     // `resp.json()` on a 4xx — every OpenAI SDK does — raises a decode error
     // instead of showing the user what was wrong with their request.
     req: Result<Json<CompletionRequest>, axum::extract::rejection::JsonRejection>,
+    ids: &crate::serve::session::RequestIds,
 ) -> Response {
     let Json(mut req) = match req {
         Ok(r) => r,
@@ -248,12 +267,26 @@ pub async fn completions(
     let n_prompt = prompt_ids.len();
     let (tx, rx) = stream_mod::channel();
     let response_prompt_ids = req.return_token_ids.then(|| prompt_ids.clone());
+    let Some(in_flight) = ids.begin(&req.model) else {
+        return crate::serve::api_error(
+            axum::http::StatusCode::CONFLICT,
+            format!("request {} is already in flight in this session", ids.request),
+            "invalid_request_error",
+            Some("duplicate_request_id"),
+            None,
+        );
+    };
+    let (report, report_rx) = ids.report();
+    let session = ids.session.as_ref().and_then(|_| ids.ticket(crate::serve::session::row_keys(&prompt_ids, &[], &[]), report));
     let job = crate::serve::mux::Job {
         prompt_ids,
         gen,
         arrived: std::time::Instant::now(),
         respond: tx,
-        opts: Default::default(),
+        opts: crate::serve::mux::JobOpts {
+            session,
+            ..Default::default()
+        },
     };
     if crate::obs::host::on() {
         crate::obs::host::submitted(n_prompt, t_arrive.elapsed());
@@ -281,9 +314,10 @@ pub async fn completions(
 
     let id = request_id();
     let created = now_secs();
-    if req.stream {
+    let cache = crate::serve::session::CacheOutcome::received(report_rx).await;
+    let mut response = if req.stream {
         let include_usage = req.stream_options.map(|o| o.include_usage).unwrap_or(false);
-        sse_response(
+        let sse = sse_response(
             id,
             requested_model.clone(),
             rx,
@@ -291,11 +325,15 @@ pub async fn completions(
             t_arrive,
             n_prompt,
             created,
-        )
-        .into_response()
+        );
+        crate::serve::session::hold_until_sent(sse.into_response(), in_flight)
     } else {
         buffer_and_reply(id, requested_model, rx, response_prompt_ids, created).await
+    };
+    if let Some(cache) = cache {
+        cache.stamp(&mut response);
     }
+    response
 }
 
 async fn buffer_and_reply(

@@ -1849,6 +1849,18 @@ impl VmmKv {
         }
     }
 
+    /// Keep `tokens`' published whole blocks last in eviction order until `until` (a session's
+    /// prefix, see `serve::session`). Eviction still takes them once nothing else is left.
+    pub fn pin_prefix(&self, tokens: &[u32], until: std::time::Instant) {
+        if !self.prefix_reuse {
+            return;
+        }
+        let s = &self.shared;
+        let rows = tokens.len() / s.block_rows as usize * s.block_rows as usize;
+        let hashes = hash_blocks(&tokens[..rows], s.block_rows);
+        s.inner.lock().cache.pin(&hashes, tokens, until);
+    }
+
     /// Turn sub-`block_rows` matching on ([`try_attach`](Self::try_attach) /
     /// [`publish_fine`](Self::publish_fine)): below `ceiling` rows, share content at
     /// `fine_rows`-row granularity instead of leaving it an unshareable private copy. Off by
