@@ -19,6 +19,7 @@
 #if defined(__HIP_DEVICE_COMPILE__)
 #include "op_compress.h"
 #include "op_elementwise.h"
+#include "op_engram.h"
 #include "op_hyperconn.h"
 #include "op_moe.h"
 #else
@@ -368,8 +369,181 @@ static void act_case() {
     hipFree(dg); hipFree(du); hipFree(dout); hipFree(dmo);
 }
 
+
+__global__ __launch_bounds__(256, 1) void k_engram(bf16* x, const bf16* kv, const bf16* qw,
+                                                   const bf16* kw, const unsigned char* tmask,
+                                                   unsigned T, unsigned n, unsigned hidden,
+                                                   float eps) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    __shared__ float part[PLOW_WAVES];
+    d_engram_gate(x, kv, qw, kw, tmask, T, n, hidden, eps, blockIdx.x, gridDim.x, part);
+#endif
+}
+
+/* Engram gate + mix against the reference (model.py:352-366) recomputed here in double.
+ *
+ * `masked_at` shuts the gate for one token; that token must come back BIT-IDENTICAL, which is a
+ * stronger check than "close to the reference" and is the property the image-span mask exists
+ * for -- a masked position passes through, it does not get a zero value added to it. */
+static void engram_case(unsigned T, unsigned n, unsigned hidden, int masked_at) {
+    const float eps = 1e-6f;
+    std::vector<bf16> x((size_t)T * n * hidden), kv((size_t)T * (n + 1) * hidden);
+    std::vector<bf16> qw((size_t)n * hidden), kw((size_t)n * hidden);
+    for (auto& v : x) v = f2b(rnd());
+    for (auto& v : kv) v = f2b(rnd());
+    for (auto& v : qw) v = f2b(rnd());
+    for (auto& v : kw) v = f2b(rnd());
+    std::vector<unsigned char> tm(T, 1);
+    if (masked_at >= 0) tm[(unsigned)masked_at] = 0;
+    const std::vector<bf16> x0 = x;
+
+    auto* dX = up(x);
+    auto* dKv = up(kv);
+    auto* dQ = up(qw);
+    auto* dK = up(kw);
+    auto* dM = up(tm);
+    hipLaunchKernelGGL(k_engram, dim3(T < 64 ? T : 64), dim3(256), 0, 0, dX, dKv, dQ, dK,
+                       masked_at >= 0 ? dM : (const unsigned char*)nullptr, T, n, hidden, eps);
+    ck(hipDeviceSynchronize());
+    ck(hipMemcpy(x.data(), dX, x.size() * sizeof(bf16), hipMemcpyDeviceToHost));
+
+    double worst = 0.0;
+    int untouched_ok = 1, gates_nontrivial = 0;
+    for (unsigned t = 0; t < T; t++) {
+        const bool masked = masked_at >= 0 && t == (unsigned)masked_at;
+        const bf16* vrow = &kv[(size_t)t * (n + 1) * hidden + (size_t)n * hidden];
+        for (unsigned c = 0; c < n; c++) {
+            double ssh = 0.0, ssk = 0.0, dot = 0.0;
+            for (unsigned d = 0; d < hidden; d++) {
+                const double h = b2f(x0[((size_t)t * n + c) * hidden + d]);
+                const double k = b2f(kv[(size_t)t * (n + 1) * hidden + (size_t)c * hidden + d]);
+                ssh += h * h;
+                ssk += k * k;
+                dot += h * ((double)b2f(qw[(size_t)c * hidden + d]) *
+                            (double)b2f(kw[(size_t)c * hidden + d])) * k;
+            }
+            double gate = 0.0;
+            if (!masked) {
+                const double rstd = (1.0 / std::sqrt(ssh / hidden + eps)) *
+                                    (1.0 / std::sqrt(ssk / hidden + eps));
+                const double dv = dot * rstd / std::sqrt((double)hidden);
+                const double mag = std::sqrt(std::max(std::fabs(dv), 1e-6));
+                gate = 1.0 / (1.0 + std::exp(-std::copysign(mag, dv)));
+                if (gate > 0.01 && gate < 0.99) gates_nontrivial++;
+            }
+            for (unsigned d = 0; d < hidden; d++) {
+                const size_t i = ((size_t)t * n + c) * hidden + d;
+                const double want = (double)b2f(x0[i]) + gate * (double)b2f(vrow[d]);
+                const double got = b2f(x[i]);
+                if (masked && x[i] != x0[i]) untouched_ok = 0;
+                const double den = std::max(1.0, std::fabs(want));
+                worst = std::max(worst, std::fabs(got - want) / den);
+            }
+        }
+    }
+    char det[192];
+    std::snprintf(det, sizeof det,
+                  "(T=%u n=%u hidden=%u worst rel %.2e, %d non-saturated gates, masked token "
+                  "untouched=%d)",
+                  T, n, hidden, worst, gates_nontrivial, untouched_ok);
+    say("engram gate + mix", worst < 5e-3 && untouched_ok && gates_nontrivial > 0, det);
+    hipFree(dX); hipFree(dKv); hipFree(dQ); hipFree(dK); hipFree(dM);
+}
+
+
+/* One OCP e4m3 byte -> double, by the format's definition rather than by calling the device
+ * helper: this is the ORACLE, so it must not share code with what it checks. Bias 7, and the
+ * all-ones exponent with a full mantissa is the only NaN. */
+static double ocp_e4m3(unsigned char b) {
+    const int sgn = (b >> 7) & 1, e = (b >> 3) & 0xF, m = b & 0x7;
+    const double s = sgn ? -1.0 : 1.0;
+    if (e == 0) return s * std::ldexp((double)m / 8.0, -6); /* subnormal: 2^-6 * m/8 */
+    return s * std::ldexp(1.0 + (double)m / 8.0, e - 7);
+}
+
+
+__global__ __launch_bounds__(256, 1) void k_engembed(bf16* out, const unsigned char* table,
+                                                     const unsigned char* scale, const int* ids,
+                                                     unsigned T, unsigned n_cols,
+                                                     unsigned head_dim, unsigned blk,
+                                                     unsigned vocab_start, unsigned part_rows) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    d_engram_embed(out, table, scale, ids, T, n_cols, head_dim, blk, vocab_start, part_rows,
+                   blockIdx.x, gridDim.x);
+#endif
+}
+
+/* Engram's gathered table read, against a host dequant of the same bytes.
+ *
+ * The SHARD MASK is the half worth testing hardest: ids below `vocab_start` and ids past the end
+ * of this rank's rows must both produce zeros, and the low side is the one that bites -- an
+ * unsigned `id - vocab_start` turns a below-range id into a huge in-range-looking index and reads
+ * straight past the shard. So the case deliberately plants ids on both sides and at both
+ * boundaries. */
+static void engembed_case(unsigned T, unsigned n_cols, unsigned head_dim, unsigned blk,
+                          unsigned vocab_start, unsigned part_rows) {
+    const unsigned width = n_cols * head_dim, spr = head_dim / blk;
+    std::vector<unsigned char> table((size_t)part_rows * head_dim);
+    std::vector<unsigned char> scale((size_t)part_rows * spr);
+    for (auto& v : table) v = (unsigned char)(std::rand() & 0xFF);
+    /* e8m0 around 2^0: 127 +/- 3, so the scales are ordinary small powers of two and a wrong
+     * block index shows up as a factor of 2..8 rather than hiding in the noise. */
+    for (auto& v : scale) v = (unsigned char)(124 + (std::rand() % 7));
+
+    std::vector<int> ids((size_t)T * n_cols);
+    for (size_t i = 0; i < ids.size(); i++)
+        ids[i] = (int)(vocab_start + (unsigned)(std::rand() % (int)part_rows));
+    /* Plant the out-of-range cases: below the window, at its first and last row, and past it. */
+    ids[0] = (int)vocab_start - 1;
+    ids[1] = (int)vocab_start;
+    ids[2] = (int)(vocab_start + part_rows - 1);
+    ids[3] = (int)(vocab_start + part_rows);
+    ids[4] = 0;
+
+    std::vector<bf16> out((size_t)T * width, f2b(-1.0f));
+    auto* dT = up(table);
+    auto* dS = up(scale);
+    auto* dI = up(ids);
+    auto* dO = up(out);
+    hipLaunchKernelGGL(k_engembed, dim3(T < 64 ? T : 64), dim3(256), 0, 0, dO, dT, dS, dI, T,
+                       n_cols, head_dim, blk, vocab_start, part_rows);
+    ck(hipDeviceSynchronize());
+    ck(hipMemcpy(out.data(), dO, out.size() * sizeof(bf16), hipMemcpyDeviceToHost));
+
+    double worst = 0.0;
+    int zeroed = 0, nonzero = 0, bad_zero = 0;
+    for (unsigned t = 0; t < T; t++)
+        for (unsigned c = 0; c < n_cols; c++) {
+            const long long local = (long long)ids[(size_t)t * n_cols + c] - (long long)vocab_start;
+            const bool in = local >= 0 && local < (long long)part_rows;
+            for (unsigned d = 0; d < head_dim; d++) {
+                const double got = b2f(out[(size_t)t * width + c * head_dim + d]);
+                if (!in) {
+                    if (got != 0.0) bad_zero++;
+                    zeroed++;
+                    continue;
+                }
+                const size_t r = (size_t)local;
+                /* host dequant: OCP e4m3 byte, times 2^(e8m0 - 127) for this 32-block */
+                const double v = ocp_e4m3(table[r * head_dim + d]);
+                const double sc = std::ldexp(1.0, (int)scale[r * spr + d / blk] - 127);
+                const double want = v * sc;
+                if (want != 0.0) nonzero++;
+                const double den = std::max(1.0, std::fabs(want));
+                worst = std::max(worst, std::fabs(got - want) / den);
+            }
+        }
+    char det[192];
+    std::snprintf(det, sizeof det,
+                  "(T=%u cols=%u hd=%u blk=%u worst rel %.2e, %d masked elems all zero=%d, %d "
+                  "non-zero reads)",
+                  T, n_cols, head_dim, blk, worst, zeroed, bad_zero == 0, nonzero);
+    say("engram gathered table read", worst < 5e-3 && bad_zero == 0 && nonzero > 0, det);
+    hipFree(dT); hipFree(dS); hipFree(dI); hipFree(dO);
+}
+
 int main() {
-    std::printf("DeepSeek-V4 router / mHC-head / inverse-RoPE / clamped-SwiGLU arms\n");
+    std::printf("DeepSeek-V4 router / mHC-head / inverse-RoPE / clamped-SwiGLU / engram arms\n");
     router_case("router SIGMOID+norm (SHIPPED, must not move)", 256, 8, SIG | NORM, 1.0f, true);
     router_case("router SOFTMAX (SHIPPED, must not move)", 128, 4, NORM, 1.0f, false);
     router_case("router sqrtsoftplus + bias + norm, scale 1.5", 256, 6, SQSP | NORM, 1.5f, true);
@@ -383,6 +557,11 @@ int main() {
     irope_case(3, 8, 512, 64, 0);
     irope_case(17, 8, 512, 64, 1000);
     act_case();
+    engram_case(7, 4, 5120, -1);
+    engram_case(5, 4, 5120, 2);
+    engram_case(3, 4, 512, 1);
+    engembed_case(6, 24, 256, 32, 1000, 4096);
+    engembed_case(4, 8, 256, 32, 0, 512);
     std::printf("%s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }

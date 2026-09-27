@@ -36,7 +36,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
-use crate::device::{Backend, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg, Module};
+use crate::device::{Backend, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg, Module, PeerMemory};
 use crate::{DeviceErrorInfo, Result, RuntimeError};
 
 pub(crate) mod lt;
@@ -251,11 +251,14 @@ driver_api! {
     cuMemcpyHtoDAsync_v2: fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult,
     cuMemcpyDtoHAsync_v2: fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult,
     cuMemcpyDtoDAsync_v2: fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult,
+    cuCtxEnablePeerAccess: fn(CUcontext, u32) -> CUresult,
+    cuMemcpyPeerAsync: fn(CUdeviceptr, CUcontext, CUdeviceptr, CUcontext, usize, CUstream) -> CUresult,
     cuMemcpy3DAsync_v2: fn(*const CUDA_MEMCPY3D, CUstream) -> CUresult,
     cuMemsetD8Async: fn(CUdeviceptr, u8, usize, CUstream) -> CUresult,
     cuEventCreate: fn(*mut CUevent, u32) -> CUresult,
     cuEventDestroy_v2: fn(CUevent) -> CUresult,
     cuEventRecord: fn(CUevent, CUstream) -> CUresult,
+    cuStreamWaitEvent: fn(CUstream, CUevent, u32) -> CUresult,
     cuEventQuery: fn(CUevent) -> CUresult,
     cuEventSynchronize: fn(CUevent) -> CUresult,
     cuEventElapsedTime: fn(*mut f32, CUevent, CUevent) -> CUresult,
@@ -1725,6 +1728,17 @@ impl CudaBackend {
         )
     }
 
+    /// Make every later op on `stream` wait for `event` (which may have been recorded on another
+    /// device's stream) without blocking the host.
+    pub fn stream_wait_event(&self, stream: &CudaStream, event: &CudaEvent) -> Result<()> {
+        self.bind()?;
+        // SAFETY: live event/stream handles.
+        self.check(
+            unsafe { (self.api.cuStreamWaitEvent)(stream.raw as CUstream, event.raw as CUevent, 0) },
+            "cuStreamWaitEvent",
+        )
+    }
+
     /// Non-blocking completion poll: `Ok(true)` once every op preceding the
     /// event's record has retired.
     pub fn event_query(&self, event: &CudaEvent) -> Result<bool> {
@@ -1868,6 +1882,45 @@ impl CudaBackend {
             win32_handle_meta_data: std::ptr::null_mut(),
             alloc_flags: [0; 8],
         }
+    }
+
+    /// Let kernels on this device dereference `peer`'s allocations (NVLink/PCIe P2P). Idempotent:
+    /// an already-enabled pair is not an error.
+    pub fn enable_peer_access(&self, peer: &CudaBackend) -> Result<()> {
+        self.bind()?;
+        // SAFETY: both contexts are live primary contexts retained by their backends.
+        let rc = unsafe { (self.api.cuCtxEnablePeerAccess)(peer.ctx as CUcontext, 0) };
+        const CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED: CUresult = 704;
+        if rc == CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED {
+            return Ok(());
+        }
+        self.check(rc, "cuCtxEnablePeerAccess")
+    }
+
+    /// Copy `bytes` from `src` on `src_dev` to `dst` on this device, ordered on `stream` (this device's).
+    pub fn memcpy_peer_async(
+        &self,
+        dst: u64,
+        src_dev: &CudaBackend,
+        src: u64,
+        bytes: u64,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.bind()?;
+        self.check(
+            // SAFETY: caller keeps both device ranges live through stream completion.
+            unsafe {
+                (self.api.cuMemcpyPeerAsync)(
+                    dst,
+                    self.ctx as CUcontext,
+                    src,
+                    src_dev.ctx as CUcontext,
+                    bytes as usize,
+                    stream.raw as CUstream,
+                )
+            },
+            "cuMemcpyPeerAsync",
+        )
     }
 
     pub fn memcpy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
@@ -2141,7 +2194,41 @@ impl Drop for CudaBackend {
     }
 }
 
+/// Peer regions are ordinary device allocations: under UVA the owner's address is valid on every
+/// device whose context enabled peer access to it ([`CudaBackend::enable_peer_access`], which the
+/// TP group does for every ordered pair before bring-up).
+impl PeerMemory for CudaBackend {
+    fn ordinal(&self) -> u8 {
+        self.device_ordinal
+    }
+
+    fn peer_agent_count(&self) -> u32 {
+        self.device_count().unwrap_or(1)
+    }
+
+    fn alloc_peer(&self, bytes: u64, peers: &[u8]) -> Result<DeviceMem> {
+        if !peers.contains(&self.device_ordinal) {
+            return Err(RuntimeError::Device(format!(
+                "peer allow-list {peers:?} omits the owner (dev {})",
+                self.device_ordinal
+            )));
+        }
+        Backend::alloc(self, self.device_ordinal, bytes)
+    }
+
+    fn zero_peer(&self, dptr: u64, bytes: u64) -> Result<()> {
+        self.memset_d8(dptr, 0, bytes as usize)
+    }
+
+    fn copy_peer_blocking(&self, _dst_ordinal: u8, dst: u64, src: u64, bytes: u64) -> Result<()> {
+        self.memcpy_dtod(dst, src, bytes)
+    }
+}
+
 impl Backend for CudaBackend {
+    fn peer(&self) -> Option<&dyn PeerMemory> {
+        Some(self)
+    }
     fn class(&self) -> ExecutorClass {
         ExecutorClass::SmNv
     }

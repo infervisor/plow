@@ -521,9 +521,19 @@ fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
                 n_group: 1,
                 topk_group: 1,
             });
-            let flags = u32::from(matches!(scoring, nn_graph::op::MoeScoring::Sigmoid))
-                | (u32::from(*norm_topk) << 1)
-                | (u32::from(*correction_bias) << 2);
+            // TWO bits for the scoring function, not one. It was a single
+            // `is_sigmoid` bit while `MoeScoring` had two variants; a third
+            // (`SqrtSoftplus`, DeepSeek V4/V4.1) would have encoded as 0 —
+            // identical to `Softmax` — and two routers that score differently
+            // would have shared a `ModelOp`.
+            let scoring_bits = match scoring {
+                nn_graph::op::MoeScoring::Softmax => 0,
+                nn_graph::op::MoeScoring::Sigmoid => 1,
+                nn_graph::op::MoeScoring::SqrtSoftplus => 2,
+            };
+            let flags = scoring_bits
+                | (u32::from(*norm_topk) << 2)
+                | (u32::from(*correction_bias) << 3);
             model(
                 ModelOpKind::MoeRouter,
                 node.inputs.len() as i64,

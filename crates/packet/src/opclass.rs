@@ -49,6 +49,14 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | MlaMaterializePack
         | FlashMlaMaterializedPrefill
         | DsaPoolCompress
+        | CompressPool
+        | CompressRopeQuant
+        | RopeInverseO
+        | SparseAttnDecode
+        | SparseAttnMerge
+        | CompressDecodeStep
+        | IndexScoreDecode
+        | IndexSelectDecode
         | DsaPoolExpand
         | DsaPoolStash
         | DsaQQuant
@@ -103,7 +111,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
 
         Gemm | GemmNorm | GemmSmall | GemmMed | GemmGlu | GemmFp8 | GemmMedFp8 | GemmSmallFp8
         | GemmGluFp8 | GemmMxfp4 | GemmWide | GemmC5 | GemmMedMxfp4 | GemmSmallMxfp4
-        | GemmWideMxfp4 | GemmC5Mxfp4 | GemmWideFp8 | GemmC5Fp8 | GemmFp8Blk | GemmGluMxfp4
+        | GemmWideMxfp4 | GemmC5Mxfp4 | GemmWideFp8 | GemmC5Fp8 | GemmFp8Blk | GemmFp8Mx | GemmGluMxfp4
         | GemmSplitK | GemmF32 | DenseGluFp8Blk | GemmAffineQ4 | Q8GemmF32 | DenseGemmF32
         | Conv2dF32 | GemmFp8Block128 | GemmFp8Block128Split4 | MlaBmmFp8 => &["gemm"],
         GemmLtPf | GemmBlkPf => &["gemm", "native_route"],
@@ -113,7 +121,11 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | GemvAffineQ4 => &["gemv"],
 
         RmsNorm | RowRms | NormResidual | AddNorm | NormResidualNorm | LayerNorm | QwenRmsNorm
-        | QwenGatedNorm | KdaGatedNorm | LayerNormF32 => &["norm"],
+        | QwenGatedNorm | KdaGatedNorm | LayerNormF32
+        // Engram's gate is two RMS reductions over `hidden` driving a gated residual add, so
+        // its cost and its knob scope are a norm's, not the hc machinery's -- it mixes INTO the
+        // mHC stream but carries none of the Sinkhorn/combine state HyperConnPre does.
+        | EngramGate => &["norm"],
 
         KdaConv | KdaGate | Mamba2Scan | KdaStateStep | KdaConv3 | KdaStateStepG
         | KdaConvStateStepG | KdaChunkPrepare | KdaChunkIntra | KdaChunkWu | KdaChunkCarry
@@ -123,7 +135,10 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
 
         Argmax | ArgmaxFin | GemvArgmax | RowGather | ArgmaxF32 => &["sample"],
 
-        Nop | Residual | Sum4Bf16 | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32 | CastF32Bf16
+        // Engram's table read is a gather-and-dequantize, the same shape of work as `Embed`
+        // and `RowGather` -- no reduction, no coupling between rows.
+        EngramEmbed
+        | Nop | Residual | Sum4Bf16 | Glu | Embed | SoftCap | QuantFp8 | ActQuantMx | SituGlu | ZeroF32 | CastF32Bf16
         | PerLayerInput | ScaledAddF32 | GluF32 | SiluF32 | ReluF32 | BroadcastAddF32 | EmbedF16F32
         | EmbedOverlayBf16 | PackNcfwRowsF32 | QuantFp8Block128 => &["elementwise"],
     }

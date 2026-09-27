@@ -3178,6 +3178,187 @@ static __device__ void d_moe_router_topk_pf_nv(
     }
 }
 
+/* The router for f32 logits / sqrt-softplus scoring (flags 8 / 32, DeepSeek-V4.1: model.py Gate):
+ * one WARP per token, n_exp <= 512 held 16 per lane. score = sqrt(softplus(l)) (32), sigmoid (1)
+ * or softmax; selection by k rounds of warp argmax over the key (score + bias, lowest index on
+ * ties); gate = the unbiased score, normalised over the k when flag 2, times route_scale. */
+static __device__ void d_moe_router_topk_pf_warp(unsigned char* table, const void* logit, const float* bias, unsigned E,
+                                                 unsigned ksel, unsigned flags, float route_scale, unsigned T, unsigned slice,
+                                                 unsigned nblk) {
+    if (ksel > 16u || E == 0u || E > 512u) { if (threadIdx.x == 0) __trap(); return; }
+    const unsigned lane = threadIdx.x & 31u, warps = blockDim.x >> 5;
+    for (unsigned tok = slice * warps + (threadIdx.x >> 5); tok < T; tok += nblk * warps) {
+        float sc[16];
+        unsigned long long key[16];
+        float mx = -INFINITY;
+#pragma unroll
+        for (unsigned q = 0; q < 16u; q++) {
+            const unsigned e = lane + q * 32u;
+            float l = -INFINITY;
+            if (e < E)
+                l = (flags & 8u) ? static_cast<const float*>(logit)[(size_t)tok * E + e]
+                                 : __bfloat162float(static_cast<const bf16*>(logit)[(size_t)tok * E + e]);
+            sc[q] = l;
+            mx = fmaxf(mx, l);
+        }
+        if (!(flags & 33u)) {  // softmax
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            float sum = 0.f;
+#pragma unroll
+            for (unsigned q = 0; q < 16u; q++) {
+                sc[q] = lane + q * 32u < E ? expf(sc[q] - mx) : 0.f;
+                sum += sc[q];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+#pragma unroll
+            for (unsigned q = 0; q < 16u; q++) sc[q] /= sum;
+        }
+#pragma unroll
+        for (unsigned q = 0; q < 16u; q++) {
+            const unsigned e = lane + q * 32u;
+            if (e >= E) {
+                key[q] = 0ull;
+                continue;
+            }
+            const float l = sc[q];
+            if (flags & 32u) sc[q] = sqrtf(log1pf(expf(-fabsf(l))) + fmaxf(l, 0.f));
+            else if (flags & 1u) sc[q] = 1.f / (1.f + expf(-l));
+            const float v = sc[q] + (bias ? bias[e] : 0.f);
+            uint32_t b = __float_as_uint(v);
+            b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+            key[q] = ((unsigned long long)b << 20) | (unsigned long long)(1048575u - e);
+        }
+        unsigned sel[16];
+        float gate[16], sum = 0.f;
+        for (unsigned j = 0; j < ksel; j++) {
+            unsigned long long best = 0ull;
+#pragma unroll
+            for (unsigned q = 0; q < 16u; q++) best = key[q] > best ? key[q] : best;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                const unsigned long long y = __shfl_xor_sync(0xffffffffu, best, o);
+                best = y > best ? y : best;
+            }
+            const unsigned e = 1048575u - (unsigned)(best & 0xFFFFFu);
+            float g = 0.f;
+#pragma unroll
+            for (unsigned q = 0; q < 16u; q++)
+                if (key[q] == best) {
+                    g = sc[q];
+                    key[q] = 0ull;
+                }
+            g = __shfl_sync(0xffffffffu, g, e & 31u);
+            sel[j] = e;
+            gate[j] = g;
+            sum += g;
+        }
+        if (lane == 0) {
+            unsigned char* trow = table + (size_t)tok * ksel * 8u;
+            for (unsigned j = 0; j < ksel; j++) {
+                float g = gate[j];
+                if ((flags & 2u) && sum != 0.f) g /= sum;
+                *(unsigned*)(trow + (size_t)j * 8u) = sel[j];
+                *(float*)(trow + (size_t)j * 8u + 4u) = g * route_scale;
+            }
+        }
+    }
+}
+
+constexpr unsigned kNvMpfBm = 64u; /* rows per expert tile in the align meta */
+/* The multi-packet align (i3 = phase 1..4, i4 = npart; runtime/amd/op_moe.h d_moe_align_pf): the
+ * packet boundary is the grid barrier. meta = rowoff[E] | mcnt[E] | tilep[E+1] | partial[npart][E].
+ *   1: per-part expert histogram of its slot range   2: (one CTA) exclusive scan over parts per
+ *   expert, tile prefix   3: every padded row -> UNUSED   4: scatter each part's slots in slot
+ *   order, so the row arrays are deterministic. arena: E u32. */
+static __device__ void d_moe_align_pf_phased(int* meta, const unsigned char* table, unsigned* row_token, unsigned* row_partidx,
+                                             float* row_gate, unsigned T, unsigned E, unsigned ksel, unsigned phase, unsigned npart,
+                                             unsigned slice, unsigned nblk, unsigned* cnt) {
+    const unsigned tid = threadIdx.x, nslot = T * ksel;
+    int* rowoff = meta;
+    int* mcnt = meta + E;
+    int* tilep = meta + 2u * E;
+    unsigned* partial = reinterpret_cast<unsigned*>(meta + 3u * E + 1u);
+    auto expert = [&](unsigned s) { return table ? *(const unsigned*)(table + (size_t)s * 8u) : 0u; };
+    if (phase == 1u || phase == 4u) {
+        for (unsigned part = slice; part < npart; part += nblk) {
+            const unsigned first = (unsigned)(((unsigned long long)nslot * part) / npart);
+            const unsigned last = (unsigned)(((unsigned long long)nslot * (part + 1u)) / npart);
+            for (unsigned e = tid; e < E; e += blockDim.x) cnt[e] = phase == 1u ? 0u : (unsigned)rowoff[e] + partial[(size_t)part * E + e];
+            __syncthreads();
+            if (phase == 1u) {
+                for (unsigned s = first + tid; s < last; s += blockDim.x) {
+                    const unsigned e = expert(s);
+                    if (e < E) atomicAdd(&cnt[e], 1u);
+                }
+                __syncthreads();
+                for (unsigned e = tid; e < E; e += blockDim.x) partial[(size_t)part * E + e] = cnt[e];
+            } else if (tid < 32u) {  // one warp walks the range in slot order
+                for (unsigned base = first; base < last; base += 32u) {
+                    const unsigned s = base + tid;
+                    const unsigned e = s < last ? expert(s) : ~0u;
+                    const unsigned peers = __match_any_sync(0xffffffffu, e);
+                    const unsigned leader = __ffs(peers) - 1u, rank = __popc(peers & ((1u << tid) - 1u));
+                    unsigned pos0 = 0;
+                    if (tid == leader && e < E) {
+                        pos0 = cnt[e];
+                        cnt[e] = pos0 + __popc(peers);
+                    }
+                    pos0 = __shfl_sync(0xffffffffu, pos0, leader);
+                    if (e < E) {
+                        const unsigned pos = pos0 + rank;
+                        row_token[pos] = s / ksel;
+                        row_partidx[pos] = s;
+                        row_gate[pos] = table ? *(const float*)(table + (size_t)s * 8u + 4u) : 1.0f;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        return;
+    }
+    if (phase == 2u) {
+        if (slice != 0u) return;
+        const unsigned chunk = (E + blockDim.x - 1u) / blockDim.x, b0 = min(tid * chunk, E), b1 = min(b0 + chunk, E);
+        unsigned tiles = 0;
+        for (unsigned e = b0; e < b1; e++) {
+            unsigned total = 0;
+            for (unsigned p = 0; p < npart; p++) {
+                const size_t at = (size_t)p * E + e;
+                const unsigned c = partial[at];
+                partial[at] = total;
+                total += c;
+            }
+            mcnt[e] = (int)total;
+            tiles += (total + kNvMpfBm - 1u) / kNvMpfBm;
+        }
+        cnt[tid] = tiles;
+        __syncthreads();
+        for (unsigned off = 1u; off < blockDim.x; off <<= 1u) {
+            const unsigned add = tid >= off ? cnt[tid - off] : 0u;
+            __syncthreads();
+            cnt[tid] += add;
+            __syncthreads();
+        }
+        unsigned tp = tid ? cnt[tid - 1u] : 0u;
+        for (unsigned e = b0; e < b1; e++) {
+            tilep[e] = (int)tp;
+            rowoff[e] = (int)(tp * kNvMpfBm);
+            tp += ((unsigned)mcnt[e] + kNvMpfBm - 1u) / kNvMpfBm;
+        }
+        if (tid == blockDim.x - 1u) tilep[E] = (int)cnt[tid];
+        __syncthreads();
+        return;
+    }
+    const unsigned total_pad = (unsigned)tilep[E] * kNvMpfBm;
+    for (unsigned r = slice * blockDim.x + tid; r < total_pad; r += nblk * blockDim.x) {
+        row_token[r] = PLOW_EXPERT_UNUSED;
+        row_partidx[r] = PLOW_EXPERT_UNUSED;
+        row_gate[r] = 0.0f;
+    }
+}
+
 static __device__ void d_moe_align_pf_nv(
     int* meta, const unsigned char* table, unsigned* row_token, unsigned* row_partidx,
     float* row_gate, unsigned T, unsigned E, unsigned ksel, unsigned slice) {
@@ -3265,7 +3446,43 @@ static __device__ void d_moe_down_mx_pf(
 static __device__ void d_moe_combine_pf_nv(
     bf16* out, const bf16* residual, const bf16* shared, const float* part,
     unsigned H, unsigned ksel, unsigned T, unsigned slice, unsigned nblk) {
-    const size_t total = (size_t)(T ? T : 1u) * H;
+    const unsigned rows = T ? T : 1u;
+    if (H % 8u == 0u) {
+        /* 8 columns per thread: 16 B bf16 and 2 x 16 B f32 per slot, 32-bit index math */
+        const unsigned h8 = H / 8u;
+        for (unsigned c = slice * blockDim.x + threadIdx.x; c < rows * h8; c += nblk * blockDim.x) {
+            const unsigned tok = c / h8, h = (c - tok * h8) * 8u;
+            const size_t i = (size_t)tok * H + h;
+            float v[8] = {};
+            auto add_bf8 = [&](const bf16* src) {
+                const uint4 u = *reinterpret_cast<const uint4*>(src + i);
+                const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    v[2 * q] += __uint_as_float(w[q] << 16);
+                    v[2 * q + 1] += __uint_as_float(w[q] & 0xffff0000u);
+                }
+            };
+            if (residual) add_bf8(residual);
+            if (shared) add_bf8(shared);
+            const float* p = part + (size_t)tok * ksel * H + h;
+            for (unsigned j = 0; j < ksel; j++) {
+                const float4 a = *reinterpret_cast<const float4*>(p + (size_t)j * H);
+                const float4 b = *reinterpret_cast<const float4*>(p + (size_t)j * H + 4);
+                v[0] += a.x; v[1] += a.y; v[2] += a.z; v[3] += a.w;
+                v[4] += b.x; v[5] += b.y; v[6] += b.z; v[7] += b.w;
+            }
+            uint32_t o[4];
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const __nv_bfloat162 pr = __floats2bfloat162_rn(v[2 * q], v[2 * q + 1]);
+                o[q] = *reinterpret_cast<const uint32_t*>(&pr);
+            }
+            *reinterpret_cast<uint4*>(out + i) = make_uint4(o[0], o[1], o[2], o[3]);
+        }
+        return;
+    }
+    const size_t total = (size_t)rows * H;
     for (size_t i = (size_t)slice * blockDim.x + threadIdx.x; i < total;
          i += (size_t)nblk * blockDim.x) {
         const unsigned tok = (unsigned)(i / H), h = (unsigned)(i - (size_t)tok * H);

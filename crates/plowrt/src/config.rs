@@ -1166,6 +1166,24 @@ pub struct AmdRuntimeConfig {
     )]
     pub moe_prefill_ep_max_extra_bytes: Option<u64>,
 
+    /// Expert-parallel ownership cut points: `ranks + 1` ascending expert indices, starting at 0
+    /// and ending at the routed expert count, replacing the even split.
+    ///
+    /// The even split assumes uniform routing, and routing is not uniform: at 8k on V4.1 only 153
+    /// of 384 experts take any row, one takes 5868 against a mean of 128, and the even split's
+    /// per-rank TILE load (what the grouped GEMM bills) runs 1.558x. A rank that finishes early
+    /// waits at the next reduction, so the imbalance is paid in full at XREDUCE2.
+    ///
+    /// Cut points are a CALIBRATION, not a property of the model: they must come from a routing
+    /// histogram of representative traffic (`--dump act.moe_meta`). Unset keeps the even split.
+    #[arg(
+        long = "amd-moe-ep-cuts",
+        env = "PLOW_MOE_EP_CUTS",
+        hide = true,
+        global = true
+    )]
+    pub moe_ep_cuts: Option<String>,
+
     /// Graph-derived spill-isolated prefill phase objects with one prebuilt AQL replay per rank.
     /// Default off until an exact full-network gate demonstrates a device-time win.
     #[arg(long = "amd-phase-objects", env = "PLOW_PHASE_OBJECTS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

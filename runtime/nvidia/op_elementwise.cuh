@@ -19,9 +19,10 @@
  * makes EMBED read a null pointer. */
 static __device__ void d_embed(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ table,
                         const int* __restrict__ ids, unsigned ntok, unsigned hidden, float scale,
-                        unsigned slice, unsigned nblk) {
-    for (unsigned t = slice; t < ntok; t += nblk) {
-        const size_t src = (size_t)ids[t] * hidden, dst = (size_t)t * hidden;
+                        unsigned slice, unsigned nblk, unsigned rep = 1) {
+    /* rep > 1: token t fills rows t*rep .. t*rep+rep-1 (V4.1's hc_mult copies of the stream) */
+    for (unsigned r = slice; r < ntok * rep; r += nblk) {
+        const size_t src = (size_t)ids[r / rep] * hidden, dst = (size_t)r * hidden;
         if ((hidden & 7u) == 0) {
             for (unsigned i = threadIdx.x * 8; i < hidden; i += PLOW_NV_THREADS * 8) {
                 const bf16v8 v = ld_glob8(table + src + i);
@@ -111,10 +112,19 @@ static __device__ void d_softcap(__nv_bfloat16* __restrict__ out, const __nv_bfl
     }
 }
 
-/* Gated MLP: act(gate) * up. i1=act selects SiLU (1, Qwen) vs gelu_tanh (0, Gemma). */
+/* Gated MLP: act(gate) * up. i1=act selects SiLU (1, Qwen) vs gelu_tanh (0, Gemma); 4 is
+ * DeepSeek-V4's clamped SwiGLU, silu(min(g, limit)) * clamp(u, -limit, limit) (f1 = limit). */
+static __device__ __forceinline__ float glu_pair(float g, float u, unsigned act, float limit) {
+    if (act == 4u) return act_silu(fminf(g, limit)) * fminf(fmaxf(u, -limit), limit);
+    float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
+    if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
+#endif
+    return a * u;
+}
 static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ gate,
                       const __nv_bfloat16* __restrict__ up, unsigned n, unsigned act,
-                      unsigned slice, unsigned nblk) {
+                      unsigned slice, unsigned nblk, float limit = 0.0f) {
     const unsigned stride = nblk * PLOW_NV_THREADS * 8;
     const unsigned i0 = (slice * PLOW_NV_THREADS + threadIdx.x) * 8;
     const unsigned nfull = n & ~7u;
@@ -126,12 +136,7 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
         bf16v8 vo;
 #pragma unroll
         for (int j = 0; j < 8; j++) {
-            const float g = __bfloat162float(vg.x[j]);
-            float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
-#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
-            if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
-#endif
-            vo.x[j] = __float2bfloat16(a * __bfloat162float(vu.x[j]));
+            vo.x[j] = __float2bfloat16(glu_pair(__bfloat162float(vg.x[j]), __bfloat162float(vu.x[j]), act, limit));
         }
         return vo;
     };
@@ -151,12 +156,7 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
         for (unsigned i = i0; i < n; i += stride) {
             if (i < nfull) continue;
             for (unsigned j = i; j < n; j++) {
-                const float g = __bfloat162float(gate[j]);
-                float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
-#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
-                if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
-#endif
-                out[j] = __float2bfloat16(a * __bfloat162float(up[j]));
+                out[j] = __float2bfloat16(glu_pair(__bfloat162float(gate[j]), __bfloat162float(up[j]), act, limit));
             }
         }
     }

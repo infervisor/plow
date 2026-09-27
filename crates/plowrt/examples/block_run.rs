@@ -10,6 +10,7 @@
 //!                              [--pf-chunk N] [--pf-cap ROWS]
 //!   block_run <asset-dir> mixed-check --rows 128 --decode 1
 //!   block_run <asset-dir> packed-check
+//!   block_run <asset-dir> decode-check --dir <oracle ref_decode dir> [--dump-tensors name,name]
 //!
 //! `check` feeds a hidden-state into `act.x` (an .npy or a seeded synthetic),
 //! launches one prefill bucket, reads `act.x` back, and prints shape / min /
@@ -177,6 +178,9 @@ mod cuda {
         let ckpt = std::env::var("PLOW_CHECKPOINT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| asset.join("checkpoint"));
+        if verb == "tp-check" {
+            return tp_check(&asset, &ckpt, &desc, &flag);
+        }
         let be = Arc::new(plowrt::device::cuda::CudaBackend::new(0)?);
         let mut e = plowrt::exec::gpu::GpuEngine::load(be, &asset, &ckpt)?;
         println!(
@@ -196,7 +200,21 @@ mod cuda {
             .unwrap_or_else(|| "act.x".to_string());
 
         match verb.as_str() {
-            "check" => check(&mut e, hidden, &out_name, &flag),
+            "check" => {
+                // The input tensor and its row multiplier: rows = T x the product of the fixed
+                // non-hidden dims (DeepSeek-V4.1's mHC residual is [4, T, hidden]).
+                let (in_name, mult) = desc.inputs.first().map_or(("act.x".to_string(), 1), |i| {
+                    let fixed: i64 = i.shape[..i.shape.len().saturating_sub(1)]
+                        .iter()
+                        .map(|d| match d {
+                            plow_asset::Dim::Fixed(v) => *v,
+                            plow_asset::Dim::Symbolic(_) => 1,
+                        })
+                        .product();
+                    (i.name.clone(), fixed.max(1) as usize)
+                });
+                check(&mut e, hidden, &in_name, mult, &out_name, &flag)
+            }
             "bench" => {
                 // `bench` prefills every slot, so it still needs the _pf object.
                 if !e.has_prefill() {
@@ -209,7 +227,151 @@ mod cuda {
             }
             "mixed-check" => mixed_check(&mut e, &desc, hidden, &out_name, &flag),
             "packed-check" => packed_check(&mut e, &desc, hidden, &out_name),
-            other => Err(format!("unknown verb {other:?} (check|bench|mixed-check)").into()),
+            "decode-check" => decode_check(&mut e, &desc, hidden, &out_name, &flag),
+            other => Err(format!("unknown verb {other:?} (check|bench|mixed-check|decode-check)").into()),
+        }
+    }
+
+    /// `tp-check`: the block's tensor-parallel packet on every visible GPU, one engine per rank on
+    /// its own thread. Each run zeroes every rank's xctr between two barriers, then all ranks
+    /// prefill concurrently (their collectives meet in the peer region). The replicated output must
+    /// be byte-identical on every rank; rank 0's is written with `--out` and dumped like `check`.
+    fn tp_check(
+        asset: &Path,
+        ckpt: &Path,
+        desc: &plow_asset::BlockDescriptor,
+        flag: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use packet::dev::DevOp;
+        use plowrt::device::cuda::CudaBackend;
+        use plowrt::exec::gpu::{GpuEngine, NvTpBind};
+        use plowrt::exec::tp::{PeerLayout, TpGroup};
+        use std::sync::Barrier;
+
+        let pkt = plowrt::asset::devblob::DevBlob::find_in_dir(asset)?.ok_or("no packet")?;
+        let raw = std::fs::read(&pkt)?;
+        let blob = plowrt::asset::devblob::DevBlob::parse(&raw)?;
+        let tp = blob.tp.clone().ok_or("tp-check needs a tensor-parallel packet")?;
+        let n_xctr = blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .filter_map(|d| match DevOp::from_u16(d.op) {
+                Some(DevOp::XReduce) => Some(d.i[3]),
+                Some(DevOp::XReduceTwoShot) => Some(d.i[3].max(d.i[4])),
+                _ => None,
+            })
+            .max()
+            .map_or(0, |g| g + 1);
+        let max_tokens = (tp.slot_bytes / (tp.hidden as u64 * 2)) as u32;
+        let layout = PeerLayout::new(tp.hidden, max_tokens, n_xctr).ok_or("peer layout not 128 B aligned")?;
+        let n = tp.n_gpu as usize;
+        let bes: Vec<Arc<CudaBackend>> = (0..n as u8).map(|d| CudaBackend::new(d).map(Arc::new)).collect::<Result<_, _>>()?;
+        for a in &bes {
+            for b in &bes {
+                if !Arc::ptr_eq(a, b) {
+                    a.enable_peer_access(b)?;
+                }
+            }
+        }
+        let group = TpGroup::bringup(bes.iter().map(|b| Arc::clone(b) as Arc<dyn plowrt::device::Backend>).collect(), layout)?;
+        group.verify_peer_visibility()?;
+        println!("tp-check: {n} ranks, hidden={} max_tokens={max_tokens} n_xctr={n_xctr} peer region {} KiB", tp.hidden, group.layout().bytes() / 1024);
+
+        let binds: Vec<NvTpBind> = group
+            .ranks()
+            .iter()
+            .map(|r| NvTpBind {
+                rank: r.rank(),
+                n_gpu: n as u32,
+                peer_table: r.peer_scratch_table(),
+                xctr: r.xctr(),
+                scratch_base: r.scratch_base(),
+                slot_b: tp.slot_bytes,
+                slot_bytes: tp.slot_bytes,
+            })
+            .collect();
+        let mut engines: Vec<GpuEngine> = std::thread::scope(|s| {
+            let hs: Vec<_> = bes
+                .iter()
+                .zip(&binds)
+                .map(|(be, bind)| {
+                    let be = Arc::clone(be);
+                    let bind = *bind;
+                    s.spawn(move || GpuEngine::load_tp(be, asset, ckpt, Some(bind)))
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().expect("load thread")).collect::<Result<Vec<_>, _>>()
+        })?;
+
+        let (in_name, mult) = desc.inputs.first().map_or(("act.x".to_string(), 1), |i| {
+            let fixed: i64 = i.shape[..i.shape.len().saturating_sub(1)]
+                .iter()
+                .map(|d| match d {
+                    plow_asset::Dim::Fixed(v) => *v,
+                    plow_asset::Dim::Symbolic(_) => 1,
+                })
+                .product();
+            (i.name.clone(), fixed.max(1) as usize)
+        });
+        let hidden = desc.hidden as usize;
+        let (t, xin) = if let Some(p) = flag("--in") {
+            let (shape, data) = npy::read_f32(Path::new(&p))?;
+            assert_eq!(shape.len(), 2, "--in must be [rows, hidden]");
+            assert_eq!(shape[1], hidden);
+            (shape[0] / mult, data)
+        } else {
+            let t: usize = flag("--ctx").and_then(|s| s.parse().ok()).unwrap_or(128);
+            (t, synth(t * mult, hidden))
+        };
+        let repeat: usize = flag("--repeat").and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+        let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
+        let barrier = Barrier::new(n);
+        let group = &group;
+        let (xin, in_name, prompt, barrier) = (&xin, &in_name, &prompt, &barrier);
+        std::thread::scope(|s| {
+            let hs: Vec<_> = engines
+                .iter_mut()
+                .enumerate()
+                .map(|(rank, e)| {
+                    s.spawn(move || -> Result<(), plowrt::RuntimeError> {
+                        for _ in 0..repeat {
+                            e.begin_slot(0, t + 1)?;
+                            e.upload_activation(in_name, xin)?;
+                            barrier.wait();
+                            if rank == 0 {
+                                group.zero_xctr()?;
+                            }
+                            barrier.wait();
+                            let t0 = Instant::now();
+                            e.prefill_slot(0, prompt)?;
+                            let ms = t0.elapsed().as_secs_f64() * 1e3;
+                            barrier.wait();
+                            if rank == 0 {
+                                println!("  launched prefill(T={t}) on {n} ranks in {ms:.3} ms (rank 0)");
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            hs.into_iter().try_for_each(|h| h.join().expect("run thread"))
+        })?;
+
+        let out_name = desc.outputs.first().map(|o| o.name.clone()).unwrap_or_else(|| "act.x".to_string());
+        let outs: Vec<Vec<f32>> = engines.iter_mut().map(|e| e.download_activation(&out_name)).collect::<Result<_, _>>()?;
+        let rows = t * mult * hidden;
+        let same = outs.iter().all(|o| o[..rows] == outs[0][..rows]);
+        let nonfinite = outs[0][..rows].iter().filter(|v| !v.is_finite()).count();
+        println!("  {out_name}: ranks identical={same} nonfinite={nonfinite}");
+        if let Some(p) = flag("--out") {
+            npy::write_f32(Path::new(&p), &[t * mult, hidden], &outs[0][..rows])?;
+            println!("  wrote {p}");
+        }
+        if same && nonfinite == 0 {
+            Ok(())
+        } else {
+            Err("tp-check: ranks disagree or non-finite output".into())
         }
     }
 
@@ -311,6 +473,66 @@ mod cuda {
         println!(
             "packed-check: sparse slots 3/15, absolute starts 31/95, ragged rows 33/31 parity=PASS"
         );
+        Ok(())
+    }
+
+    /// `decode-check`: replays `block_oracle.py ref_decode` output. Prefills slot b from
+    /// `pre_{b}.npy`, then per step uploads `dec_x_{s}.npy` (slot-major rows) and runs one decode
+    /// step over every slot, writing the block output to `dec_plow_{s}.npy`.
+    fn decode_check(
+        e: &mut plowrt::exec::gpu::GpuEngine,
+        desc: &plow_asset::BlockDescriptor,
+        hidden: usize,
+        out_name: &str,
+        flag: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = PathBuf::from(flag("--dir").ok_or("decode-check needs --dir")?);
+        let in_name = desc.inputs.first().map_or("act.x".to_string(), |i| i.name.clone());
+        let mut pre = Vec::new();
+        while dir.join(format!("pre_{}.npy", pre.len())).exists() {
+            pre.push(npy::read_f32(&dir.join(format!("pre_{}.npy", pre.len())))?.1);
+        }
+        let mut steps = 0;
+        while dir.join(format!("dec_x_{steps}.npy")).exists() {
+            steps += 1;
+        }
+        let nb = pre.len();
+        if nb == 0 || steps == 0 || nb > e.batch() {
+            return Err(format!("decode-check: {nb} slots / {steps} steps (engine batch {})", e.batch()).into());
+        }
+        let x0 = npy::read_f32(&dir.join("dec_x_0.npy"))?;
+        let mult = x0.0[0] / nb;
+        let mut last = vec![0u32; nb];
+        for (b, x) in pre.iter().enumerate() {
+            let t = x.len() / (mult * hidden);
+            let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
+            e.begin_slot(b, t + steps + 2)?;
+            e.upload_activation(&in_name, x)?;
+            last[b] = e.prefill_slot(b, &prompt)?;
+            println!("decode-check: slot {b} prefilled T={t}");
+        }
+        let mut toks = Vec::new();
+        for s in 0..steps {
+            let x = npy::read_f32(&dir.join(format!("dec_x_{s}.npy")))?.1;
+            e.upload_activation(&in_name, &x)?;
+            let feeds: Vec<_> = last.iter().enumerate().map(|(b, &tk)| (b, tk)).collect();
+            let t0 = Instant::now();
+            e.step_slots(&feeds, &mut toks)?;
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            last.copy_from_slice(&toks[..nb]);
+            let out = e.download_activation(out_name)?;
+            let rows = nb * mult;
+            let bad = out[..rows * hidden].iter().filter(|v| !v.is_finite()).count();
+            npy::write_f32(&dir.join(format!("dec_plow_{s}.npy")), &[rows, hidden], &out[..rows * hidden])?;
+            if s == 0 {
+                for name in flag("--dump-tensors").iter().flat_map(|n| n.split(',')) {
+                    let mut raw = vec![0u8; usize::try_from(e.tensor_bytes(name).ok_or("unknown dump tensor")?)?];
+                    e.read_tensor(name, &mut raw)?;
+                    std::fs::write(dir.join(format!("plow0_{name}.bin")), raw)?;
+                }
+            }
+            println!("decode-check: step {s} B={nb} {ms:.3} ms nonfinite={bad}");
+        }
         Ok(())
     }
 
@@ -544,6 +766,8 @@ mod cuda {
     fn check(
         e: &mut plowrt::exec::gpu::GpuEngine,
         hidden: usize,
+        in_name: &str,
+        mult: usize,
         out_name: &str,
         flag: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -567,16 +791,17 @@ mod cuda {
         // Input: an .npy [T, hidden] or a seeded synthetic (default T=128).
         let (t, xin) = if let Some(p) = flag("--in") {
             let (shape, data) = npy::read_f32(Path::new(&p))?;
-            assert_eq!(shape.len(), 2, "--in must be [T, hidden]");
+            assert_eq!(shape.len(), 2, "--in must be [rows, hidden]");
             assert_eq!(
                 shape[1], hidden,
                 "--in hidden {} != block hidden {hidden}",
                 shape[1]
             );
-            (shape[0], data)
+            assert_eq!(shape[0] % mult, 0, "--in rows must be a multiple of {mult}");
+            (shape[0] / mult, data)
         } else {
             let t: usize = flag("--ctx").and_then(|s| s.parse().ok()).unwrap_or(128);
-            (t, synth(t, hidden))
+            (t, synth(t * mult, hidden))
         };
         println!(
             "check: T={t} hidden={hidden} (input {})",
@@ -601,7 +826,7 @@ mod cuda {
             let repeat: usize = flag("--repeat").and_then(|s| s.parse().ok()).unwrap_or(1);
             for _ in 0..repeat.max(1) {
                 e.begin_slot(0, t + 1)?;
-                e.upload_activation("act.x", &xin)?;
+                e.upload_activation(in_name, &xin)?;
                 let t0 = Instant::now();
                 e.prefill_slot(0, &prompt)?;
                 println!(
@@ -626,7 +851,7 @@ mod cuda {
         };
 
         let out = e.download_activation(out_name)?;
-        let out = &out[..t * hidden]; // trim pad rows past T
+        let out = &out[..t * mult * hidden]; // trim pad rows past T
         let (mut mn, mut mx, mut sum, mut nan, mut inf) =
             (f32::INFINITY, f32::NEG_INFINITY, 0.0f64, 0usize, 0usize);
         for &v in out {
@@ -659,7 +884,7 @@ mod cuda {
         );
 
         if let Some(p) = flag("--out") {
-            npy::write_f32(Path::new(&p), &[t, hidden], out)?;
+            npy::write_f32(Path::new(&p), &[t * mult, hidden], out)?;
             println!("  wrote {p}");
         }
         if let Some((dir, tensors)) = dumps {

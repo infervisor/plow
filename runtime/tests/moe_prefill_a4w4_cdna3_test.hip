@@ -212,10 +212,19 @@ int main(int argc, char** argv) {
     const bool DECODE4_BASELINE = getenv("MPA4C3_DECODE4_BENCH") != nullptr;
     const bool W2_TOUCH_BENCH = getenv("MPA4C3_W2_TOUCH_BENCH") != nullptr;
     const bool DECODE4 = getenv("MPA4C3_DECODE4") != nullptr || DECODE4_BASELINE || W2_TOUCH_BENCH;
-    const bool K3_SHAPE = BENCH || DECODE4;
-    const unsigned H = K3_SHAPE ? 3584 : 512, IM = 384,
-                   NTOK = DECODE4 ? 4 : (BENCH ? 4096 : 8),
-                   NEXP = K3_SHAPE ? 896 : 2, BM = 64, GRID = K3_SHAPE ? 304 : 5;
+    /* MPA4C3_DSV41=1: DeepSeek-V4.1-Flash's TP8 prefill geometry, and the first shape in this
+     * file whose I_moe is NOT a multiple of the staged K tile. `moe_inter` 2304 over 8 ranks is
+     * 288 = 2.25 * MPF4_BK, so the DOWN GEMM builds a PARTIAL last k-tile and the GLU builds a
+     * partial last n-tile. Every other shape here (IM = 384) divides evenly, which is exactly
+     * why the unguarded K tail went unseen: it is only reachable on a partial tile. */
+    const bool DSV41 = getenv("MPA4C3_DSV41") != nullptr;
+    const bool K3_SHAPE = BENCH || DECODE4 || DSV41;
+    const unsigned H = DSV41 ? 5120 : (K3_SHAPE ? 3584 : 512),
+                   IM = DSV41 ? 288 : 384,
+                   TOPK = DSV41 ? 6 : 16,
+                   NTOK = DSV41 ? 1024 : (DECODE4 ? 4 : (BENCH ? 4096 : 8)),
+                   NEXP = DSV41 ? 384 : (K3_SHAPE ? 896 : 2), BM = 64,
+                   GRID = K3_SHAPE ? 304 : 5;
     const unsigned decode4_experts[] = {
         187, 228, 280, 346, 460, 608, 632, 647, 712, 713, 759, 769, 800, 819, 829, 864,
     };
@@ -226,8 +235,8 @@ int main(int argc, char** argv) {
         const bool decode4_selected =
             std::find(decode4_experts, decode4_end, e) != decode4_end;
         real_rows_v[e] = DECODE4 ? (decode4_selected ? 4u : 0u)
-                                 : (K3_SHAPE ? (NTOK * 16 / NEXP +
-                                                (e < (NTOK * 16) % NEXP))
+                                 : (K3_SHAPE ? (NTOK * TOPK / NEXP +
+                                                (e < (NTOK * TOPK) % NEXP))
                                              : (e == 0 ? 70 : 50));
         pad_rows_v[e] = K3_SHAPE ? ((real_rows_v[e] + BM - 1) / BM * BM)
                                  : (e == 0 ? 128 : 64);

@@ -221,6 +221,7 @@ fn moe(nn: &mut Nn, cfg: &DeepSeekConfig, p: &str, x: TensorId, h: i64) -> Tenso
         },
         cfg.norm_topk_prob,
         cfg.routed_scaling_factor,
+        crate::op::MoeScoring::Sigmoid,
     );
     let routed_experts = register_experts(nn, cfg, p, h);
     nn.expert_binding(ExpertLayerBinding {

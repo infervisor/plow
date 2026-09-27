@@ -267,6 +267,9 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
       PLOW_KDA_CONV_STEP_DB) [ "$val" = 1 ] && : "${PLOW_K3_KDA_CONV_STEP_DB:=1}" ;;
       PLOW_MOE_PF_ATOMIC)    [ "$val" = 1 ] && : "${PLOW_MOE_PF_ATOMIC:=1}" ;;
       PLOW_MOE_PF_DET)       [ "$val" = 1 ] && : "${PLOW_MOE_PF_DET:=1}" ;;
+      PLOW_DSV41_BLKFP8)     [ "$val" = 1 ] && : "${PLOW_DSV41_BLKFP8:=1}" ;;
+      PLOW_DSV41_ENGRAM)     [ "$val" = 1 ] && : "${PLOW_DSV41_ENGRAM:=1}" ;;
+      PLOW_DSV4_CSA2)        [ "$val" = 1 ] && : "${PLOW_DSV4_CSA2:=1}" ;;
       PLOW_GLM_FUSE_QNORM)   [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_QNORM:=1}" ;;
       PLOW_GLM_FUSE_POST)    [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_POST:=1}" ;;
       PLOW_GLM_FUSE_SEAM_RN) [ "$val" = 1 ] && : "${PLOW_GLM_FUSE_SEAM_RN:=1}" ;;
@@ -622,6 +625,81 @@ esac
 # script otherwise builds. Arm the queue interpretation on exactly the K3 A4W4 rows; hierarchy
 # remains a separate, unmeasured PLOW_L2HIER_PF experiment.
 AX_K3_A4W4="-DPLOW_L2_PLACE_DISPATCH=1"
+# V4.1's MoE TILE. DeepSeek-V4.1-Flash routes top-6 over 384 experts at TP8, so `down`'s K is
+# moe_intermediate/TP = 288 -- a five-iteration k-loop that cannot amortize anything. Two ceiling
+# instruments (docs/amd/deepseek-v41-flash-mi300x.md 12.25) showed the pair is bound by NEITHER its
+# k-loop (capping it at one tile moved DOWN -0.24%) NOR its scatter (issuing 1 store in 16 moved it
+# +3.2%): the cost is the fixed per-tile overhead of 27,648 output tiles per layer per rank, which
+# is what the MPF_BM note below predicts and what raising BM halves.
+#
+# MEASURED at 8k/TP8, both arms built with both hoists off so the A/B is the tile and not the hoist:
+#   BM=64    DOWN 119.4 ms   GLU 74.0 ms   model 833.8 ms
+#   BM=128   DOWN  72.0 ms   GLU 49.7 ms   model 755.4 ms
+# The metadata hoist is worth ~6.6 ms at BM=64 (827.2 ms with it), and it CANNOT ride BM=128 --
+# both hoists `#error` unless MPF_BM == PLOW_WAVE. 78.5 ms beats 6.6 ms, so V4.1 takes the tile.
+#
+# 192 IS THE CEILING AND IT BEATS 128, because at V4.1's shape BM cuts BOTH terms at once. The
+# align op pads each expert to a whole tile, and TP8 puts all 385 experts (384 routed + the shared
+# fold) on every rank with T*k/385 ~ 149 gathered rows each. BM=128 therefore spends TWO tiles per
+# expert and pads 149 rows to 256 -- 72% waste -- where BM=192 spends ONE and pads to 192, 29%.
+# Half the tiles AND half the padded rows. 256 does not exist: (256+256)*64*2 = 65,536 B against
+# `plow_smem`'s 64,512, while (192+256)*64*2 = 57,344 fits with MPF_DBUF still 1.
+#
+# MEASURED, layer 2 at 8k/TP8, three interleaved repeats per arm (docs 12.46):
+#   BM=64    DOWN 2489.4 us   GLU 1574.0 us   pair 4063
+#   BM=128   DOWN 1275.8 us   GLU 1011.5 us   pair 2361 / 2354 / 2402
+#   BM=192   DOWN  971.2 us   GLU  613.4 us   pair 1609 / 1588 / 1571   <- default
+# -33% on the pair, -783 us on the layer, min-to-min 16,102 -> 15,374. Exits hold min/max to the
+# printed digit; the EXIT MEAN is not a parity signal here and never was -- one unchanged object
+# returns -0.000712 and -0.000713 on consecutive runs, so the MoE reduction is run-order dependent
+# at the 1e-6 level. Requires the mla.rs MPF_BM sizing bound at 192 and a RE-EMITTED packet: an
+# object whose tile exceeds the bound its packet was sized from is an out-of-bounds device write.
+#
+# Confined to PLOW_PREFILL_DSV41 so no other model's objects move. Each default is `:-`, so a
+# caller's own value wins INDIVIDUALLY -- the whole block used to sit behind `[ -z "$MPF_BM" ]`,
+# which meant that naming MPF_BM to A/B the MoE tile silently also dropped GF=8, both router
+# knobs and both epilogue settings. That A/B then measures five changes and reads as a tile
+# result; the BM=64-vs-128 numbers above were taken that way and the EPI note is the only reason
+# they survive. Scope the guard to the assignment it belongs to.
+if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ]; then
+  # 64, AND IT IS NOT A TUNING CHOICE. V4.1's routed experts are MXFP4, so its grouped MoE runs
+  # `d_moe_group_pf_a4w4`, which strides its gathered rows by MPF4_BM -- a fixed 64, asserted, and
+  # set by the MFMA fragment map rather than by a tile budget. `d_moe_align_pf` pads to MPF_BM.
+  # Unequal, the body covers `tiles_e * 64` of each expert's rows and drops the rest.
+  #
+  # THE SWEEP THIS REPLACES WAS MEASURING THAT. "192k64 1583.7, 384k32 998.4, 512k32 868.4 us,
+  # -45.2% on the pair" is what deleting arithmetic looks like: each arm raised MPF_BM, which cut
+  # the tile count, while every tile still covered 64 rows. At 512 the GLU wrote 8,783 of 49,152
+  # live routed rows -- 17.9% -- and the exits did not move, because the block exit's min/max/mean
+  # over a 335 MB residual is an attention statistic and a missing routed FFN does not disturb it.
+  # op_moe.h now static_asserts MPF_BM == MPF4_BM so this cannot be chosen again by accident.
+  #
+  # PLOW_MOE_GEMMA_PF=0 comes with it: the Gemma grouped-MoE twin asserts APT >= 8, and
+  # BM=64/BK=32 gives 4. AX_DECODE has carried the same pairing since its own BK=32 recut.
+  MPF_BM="${MPF_BM:-64}"
+  MPF_BK="${MPF_BK:-32}"
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_GEMMA_PF=0"
+  # n_head = 64/TP, so TP8 gives 8 and GF=8 reads the gathered latent ONCE instead of twice:
+  # FLASH_GATHER_PREFILL 3276 -> 3031 us, layer -321 us, exits identical. The dispatch falls back
+  # to GF=4 when 8 does not divide n_head.
+  PLOW_FA_GATHER_GF="${PLOW_FA_GATHER_GF:-8}"
+  # The k-block-max selection with the LOCAL first pass. n_exp = 384 fits 4*PLOW_THREADS, so the
+  # local pass loads every key to registers once and the k rounds never re-scan: 351 -> 255 us.
+  # The header defaults PLOW_MOE_ROUTER_SELECT to PLOW_K3 and _LOCAL reached only the K3 decode
+  # row, so a V4.1 object could not take either. All three arms pick the same keys in the same
+  # order; exits are identical.
+  PLOW_MOE_ROUTER_SELECT="${PLOW_MOE_ROUTER_SELECT:-2}"
+  PLOW_MOE_ROUTER_SELECT_LOCAL="${PLOW_MOE_ROUTER_SELECT_LOCAL:-1}"
+  # V4.1's routed experts are MXFP4, so its DOWN epilogue is `d_moe_group_pf_a4w4`'s, not the
+  # `_t` one PLOW_MOE_PF_EPI (default on) covers -- the hoist has to come from _SIB or V4.1 pays
+  # the per-element `row_partidx`/`row_gate` drain in full. Measured on the 8k layer-2 rung:
+  # DOWN 2657.7 -> 2260.6 us and the layer 15072 -> 14810, output BYTE-IDENTICAL.
+  PLOW_MOE_PF_EPI_SIB="${PLOW_MOE_PF_EPI_SIB:-1}"
+  # The hoist `#error`s unless MPF_BM == PLOW_WAVE, so it cannot default ON at any other tile.
+  if [ "$MPF_BM" = 64 ]; then PLOW_MOE_PF_EPI="${PLOW_MOE_PF_EPI:-1}"; else PLOW_MOE_PF_EPI=0; fi
+  PLOW_K3_A4W4_EPI="${PLOW_K3_A4W4_EPI:-0}"
+fi
+
 case "${PLOW_KDA_PF_STATE_RESIDENT:-0}" in
   0) AX_K3_PF_STATE="" ;;
   1) AX_K3_PF_STATE="-DPLOW_KDA_PF_STATE_RESIDENT=1" ;;
@@ -788,8 +866,16 @@ fi
 # worst case over all of them, so two more full-column-wave bodies must not be forced on the
 # GLM / V3 blobs that never emit a NoPE packet. Without it the NoPE bit still TRAPS, so a
 # blob that needs the arm and an object that lacks it is a hard stop, not a wrong answer.
+# THE PF2 SPELLING IS THE ONE THAT MATTERS, and setting only the other name shipped an object
+# the loader refuses. `interp.hip` emits the marker plowrt looks for --
+# `plow_mla_pf2_nope_arm` -- under `#if PLOW_MLA_PF2_NOPE_ARM`, and its compatibility shim runs
+# ONE WAY: `#ifndef PLOW_MLA_PF_NOPE_ARM / #define PLOW_MLA_PF_NOPE_ARM PLOW_MLA_PF2_NOPE_ARM`.
+# Defining the non-2 name therefore satisfies the body and leaves the MARKER undefined, so the
+# object compiles the arm and cannot prove it: a V4.1 rung at T=8192 routes its NoPE MLA segment
+# to the flash object and the load dies with "has no zero-rope V2 arm". Define the pf2 name and
+# the shim gives the other for free.
 if [ "${PLOW_MLA_PF_NOPE:-0}" = 1 ]; then
-  AX_FLASH="$AX_FLASH -DPLOW_MLA_PF_NOPE_ARM=1"
+  AX_FLASH="$AX_FLASH -DPLOW_MLA_PF2_NOPE_ARM=1"
 fi
 
 # OPT-IN (PLOW_DSA_IDX64=1): the 64-index-head arm of the DSA prefill indexer score (op 117).
@@ -825,6 +911,49 @@ fi
 if [ "${PLOW_XR_NOWAIT:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_XR_NOWAIT=1"
 fi
+
+# PLOW_WPE on the PREFILL object. The decode arms already set this (see the AX_DECODE blocks
+# above); prefill never did, so it takes the default PLOW_WAVES/4 = 2 waves/SIMD and the
+# 256-register budget. That is the right default for a megakernel whose allocation is the union of
+# every op, and it is also why V4.1's mHC GemvF32 is latency-bound: 320 iterations of dependent
+# loads with only two waves on a SIMD to cover them. Raising this forces the allocator lower and it
+# will spill; whether the extra latency hiding outruns the spill is the measurement, exactly as
+# interp.hip's PLOW_WPE note says. Unset keeps the object byte-identical.
+if [ -n "${PLOW_WPE:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_WPE=${PLOW_WPE}"
+fi
+
+# PLOW_GEMV_F32_ARM picks how d_gemv_f32's wide-M arm splits (row, column) across waves -- see
+# op_gemm_common.h. All three arms are bit-identical; they differ in HBM traffic and in how much
+# work a wave has to hide latency behind, which only hardware can rank. Unset keeps the object
+# byte-identical to arm 0, the shipped one.
+if [ -n "${PLOW_GEMV_F32_ARM:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_GEMV_F32_ARM=${PLOW_GEMV_F32_ARM}"
+fi
+
+# PLOW_GEMV_F32_MR: rows per wave in arm 6. 1 reproduces arm 5 exactly (bit-identical at every
+# MR); higher amortises each f32 W load over MR fmas, cutting the op's 16.1 GB of W read volume
+# by MR at the cost of MR*CG accumulators on a kernel already at the 256-VGPR cap. See
+# op_gemm_common.h -- arm 3 is the cautionary precedent for spending registers here.
+if [ -n "${PLOW_GEMV_F32_MR:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_GEMV_F32_MR=${PLOW_GEMV_F32_MR}"
+fi
+
+# PLOW_HC_WAVE_TOKEN=0 restores d_hyperconn_pre's shipped workgroup-per-token block. The default
+# arm gives a WAVE a token so the eight Sinkhorn serial sections of a block run concurrently; it
+# is not bit-identical (the sum of squares reassociates), which is why it is a named knob.
+if [ -n "${PLOW_HC_WAVE_TOKEN:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_HC_WAVE_TOKEN=${PLOW_HC_WAVE_TOKEN}"
+fi
+
+# GM_MX_BK sizes op 198's k-tile. 32 is the default and the shipped encoding; 64 is legal because
+# GM_MX_PROMOTE drains at the 32-element SCALE boundary, which is a cluster boundary at any BK that
+# is a multiple of 32. Value-identical up to f32 accumulation order (the promotion order is the
+# same; the staging is not). BM/BN ride the same hatch.
+for v in GM_MX_BM GM_MX_BN GM_MX_BK; do
+  eval "x=\${$v:-}"
+  if [ -n "$x" ]; then AX_PREFILL="$AX_PREFILL -D$v=$x"; fi
+done
 
 # Diagnostic-only XREDUCE2 / XREDUCE phase timeline in PlowTraceRec. Never a serve asset.
 if [ "${PLOW_XR_TRACE_PHASES:-0}" = 1 ]; then
@@ -957,6 +1086,75 @@ fi
 if [ "${PLOW_MOE_PF_ABL:-0}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_ABL=${PLOW_MOE_PF_ABL}"
 fi
+# CEILING INSTRUMENT ONLY (PLOW_MOE_PF_EPIABL=1): the DOWN scatter issuing 1 of every 16 stores.
+# WRONG OUTPUT by construction, never a serve asset. See op_moe.h.
+if [ "${PLOW_MOE_PF_EPIABL:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_EPIABL=${PLOW_MOE_PF_EPIABL}"
+fi
+
+# CEILING INSTRUMENT ONLY (PLOW_MOE_PF_A4W4_DQABL=1): the a4w4 grouped MoE k-loop with the
+# fp4 -> bf16 dequant removed and its loads and LDS stores kept (op_moe.h
+# PLOW_MOE_PF_A4W4_DQABL). WRONG OUTPUT by construction, never a serve asset. Rides AX_PREFILL,
+# which is what carries $AX_A4W4 to the DSV41 rows. NOT YET MEASURED.
+if [ "${PLOW_MOE_PF_A4W4_DQABL:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_A4W4_DQABL=${PLOW_MOE_PF_A4W4_DQABL}"
+fi
+
+# CEILING INSTRUMENT ONLY (PLOW_FA_GATHER_ABL=1): the gathered flash reading a FIXED 64-row window
+# instead of its top_k scattered cache rows. Same loads, same scores, same softmax, same PV --
+# only the addresses are tamed, so ablated minus full prices the gather's RANDOM ACCESS alone.
+# WRONG OUTPUT by construction, never a serve asset. See op_attention_common.h.
+if [ "${PLOW_FA_GATHER_ABL:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_FA_GATHER_ABL=${PLOW_FA_GATHER_ABL}"
+  AX_FLASH="$AX_FLASH -DPLOW_FA_GATHER_ABL=${PLOW_FA_GATHER_ABL}"
+fi
+
+# PLOW_FA_GATHER_MFMA=1: route FLASH_GATHER_PREFILL to the head-packed MFMA body. One work item
+# is one query token with all n_head heads in the MFMA M-dimension, so the token's own top_k set
+# stages to LDS once and the scores and PV run on the matrix core. Correct output; opt-in until
+# hardware ranks it against the scalar arm.
+if [ "${PLOW_FA_GATHER_MFMA:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_FA_GATHER_MFMA=${PLOW_FA_GATHER_MFMA}"
+  AX_FLASH="$AX_FLASH -DPLOW_FA_GATHER_MFMA=${PLOW_FA_GATHER_MFMA}"
+fi
+
+# PLOW_FA_GATHER_GF: heads per group in the NoPE gathered prefill, i.e. how many times the
+# gathered latent is re-streamed (n_head/GF groups). Correct output at any legal GF.
+if [ -n "${PLOW_FA_GATHER_GF:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_FA_GATHER_GF=${PLOW_FA_GATHER_GF}"
+  AX_FLASH="$AX_FLASH -DPLOW_FA_GATHER_GF=${PLOW_FA_GATHER_GF}"
+fi
+
+# PLOW_MLA_PF_MFMA_SPLIT=0: keep the SPLIT dense prefill on the scalar body (the A/B control).
+if [ -n "${PLOW_MLA_PF_MFMA_SPLIT:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MLA_PF_MFMA_SPLIT=${PLOW_MLA_PF_MFMA_SPLIT}"
+  AX_FLASH="$AX_FLASH -DPLOW_MLA_PF_MFMA_SPLIT=${PLOW_MLA_PF_MFMA_SPLIT}"
+fi
+
+# PLOW_IDXSEL_SCAN=0: restore the top-k selector's serial 256-bin boundary walk (the A/B control).
+if [ -n "${PLOW_IDXSEL_SCAN:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_IDXSEL_SCAN=${PLOW_IDXSEL_SCAN}"
+  AX_FLASH="$AX_FLASH -DPLOW_IDXSEL_SCAN=${PLOW_IDXSEL_SCAN}"
+fi
+
+# PLOW_IDXPF_PACKFAST=0: restore the DSA indexer's span-fastest work order (the A/B control).
+if [ -n "${PLOW_IDXPF_PACKFAST:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_IDXPF_PACKFAST=${PLOW_IDXPF_PACKFAST}"
+  AX_FLASH="$AX_FLASH -DPLOW_IDXPF_PACKFAST=${PLOW_IDXPF_PACKFAST}"
+fi
+
+# PLOW_FMERGE_VEC=0: restore d_flash_merge's workgroup-per-item scalar loop (the A/B control).
+if [ -n "${PLOW_FMERGE_VEC:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_FMERGE_VEC=${PLOW_FMERGE_VEC}"
+  AX_FLASH="$AX_FLASH -DPLOW_FMERGE_VEC=${PLOW_FMERGE_VEC}"
+fi
+
+# CEILING INSTRUMENT ONLY (PLOW_FA_GMFMA_ABL): deletes one term of the head-packed gathered flash
+# to price it. WRONG OUTPUT by construction, never a serve asset. See op_attention_common.h.
+if [ "${PLOW_FA_GMFMA_ABL:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_FA_GMFMA_ABL=${PLOW_FA_GMFMA_ABL}"
+  AX_FLASH="$AX_FLASH -DPLOW_FA_GMFMA_ABL=${PLOW_FA_GMFMA_ABL}"
+fi
 
 # MPF_BM A/B escape hatch for the PREFILL objects (the decode row has carried its MPF_BK twin
 # since the OCC4 recut). The grouped MoE prefill GEMM is the term that binds once attention is
@@ -974,6 +1172,15 @@ fi
 # EPI=0 too, or the measurement is the hoist and not the tile.
 if [ -n "${MPF_BM:-}" ]; then
   AX_PREFILL="$AX_PREFILL -DMPF_BM=$MPF_BM"
+fi
+# MPF_BK for the PREFILL row, the twin of the decode row's. The single-buffered tile is
+# (MPF_BM+MPF_BN)*MPF_BK*2 bytes against plow_smem, so at BN=256/BK=64 the arena caps BM at 192
+# ((192+256)*64*2 = 57,344 <= 64,512; 256 would need 65,536). BK=32 halves the tile and reopens
+# BM to 512 — and per op_moe.h's own note, halving BK doubles the k-passes but each expert weight
+# byte still crosses HBM exactly once, so the stream the grouped form exists to amortise is
+# unchanged. Compare any BM against a BK-matched control, or the measurement is BK and not BM.
+if [ -n "${MPF_BK:-}" ]; then
+  AX_PREFILL="$AX_PREFILL -DMPF_BK=$MPF_BK"
 fi
 
 # OPT-IN (PLOW_MOE_PF_EPI_SIB=1): THE SAME HOIST AT THE TWO SIBLING SITES (op_moe.h
@@ -1108,6 +1315,74 @@ if [ "${PLOW_MOE_PF_DET:-1}" != 0 ]; then
   fi
 fi
 
+# OPT-IN (PLOW_DSV41_BLKFP8=1): op 198, the [32,32] block-FP8 GEMM DeepSeek-V4.1-Flash's dense
+# and shared-expert projections are stored in. It is a separate opcode from op 107 rather than a
+# field on it -- `const unsigned char*` against `const float*`, over a grid blocked 32 on both axes
+# instead of 128 -- so the arm is additive and costs nothing when the packet does not ask for it.
+#
+# PREFILL ROWS ONLY: `exec_gemm_fp8_mx` lives inside `#if PLOW_BUCKET_PREFILL` (interp.hip:2681).
+#
+# Marker-checked, not silently skipped. `plow_dsv41_blkfp8_arm` is the symbol plowrt looks for, and
+# without it the load is REFUSED by name -- which is what a V4.1 rung did here on its first attempt.
+# The refusal is the point: the AMD dispatch `default:` does not trap, so an unbuilt arm would leave
+# every block-FP8 projection's output untouched and the prefill would complete with garbage.
+if [ "${PLOW_DSV41_BLKFP8:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_DSV41_BLKFP8=1"
+fi
+
+# OPT-IN (PLOW_DSV41_ENGRAM=1): ops 196/197, DeepSeek-V4.1-Flash's Engram conditional memory, on
+# layers 1 and 14 only. Same shape as the arm above and marker-checked the same way -- plowrt looks
+# for `plow_dsv41_engram_arm` and REFUSES the load by name without it, because the AMD dispatch's
+# `default:` does not trap, so an unbuilt arm would leave the gather and the gate writing nothing
+# and the prefill would complete with garbage.
+#
+# The C side and the packet side both already existed; this line did not, so the first layer-1
+# packet emitted, built 53 objects, reached the queue and was refused at load. The refusal worked
+# exactly as designed -- it is the reason that was a wasted queue slot rather than a wrong number.
+if [ "${PLOW_DSV41_ENGRAM:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_DSV41_ENGRAM=1"
+fi
+
+# OPT-IN (PLOW_DSV4_CSA2=1): ops 194/195/199, the CSA2 compressor, the inverse RoPE on the
+# attention output and the compressed-row rope+quant tail. Marker-checked as `plow_dsv4_csa2_arm`.
+#
+# THE SAME LINE THE ENGRAM ARM WAS MISSING, found the same way and before it cost a queue slot:
+# the C side, the ISA, the dispatch and `manifest.rs`'s `requires` all named PLOW_DSV4_CSA2 and
+# nothing here turned it into a -D. Op 195 makes this reach every V4.1 layer, not only the four
+# with a compressor -- `apply_rotary_emb(o[..., -rd:], freqs_cis, True)` runs on all 40 -- so an
+# object without it now refuses a layer-0 packet that used to load.
+if [ "${PLOW_DSV4_CSA2:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_DSV4_CSA2=1"
+fi
+
+# OPT-IN (PLOW_PREFILL_DSV41=1): make the ORDINARY prefill rows able to run a DeepSeek-V4.1 packet.
+#
+# V4.1 loads `interp_prefill_mla_moe` ($AX_PREFILL $AX_MLA $AX_MOE) and needs three axes that row
+# does not carry. Each is marker-checked, so a missing one is a refusal by name at load rather than
+# a wrong answer -- and the three refusals are how this list was assembled, one GPU attempt each:
+#
+#   PLOW_K3        -- `HyperConnPre`, `HyperConnPost` and `GemvF32`, which are V4.1's mHC. None of
+#                     them are Kimi ops and none are KDA, but they live inside `#if PLOW_K3`
+#                     (interp.hip:3485-3887), so that is the axis that compiles them today.
+#   PLOW_QWEN_GDN  -- op 142, per-head norm + interior-range rotary. Qwen's name, V4.1's rope.
+#   $AX_A4W4       -- the MXFP4 grouped MoE body its 384 routed experts run on.
+#
+# NOT DRIVEN FROM THE PACKET'S `requires`, deliberately. A K3 packet also requires PLOW_K3, and
+# auto-mapping would start compiling these into every ordinary prefill row of every K3 build --
+# objects those packets never load. That is a decision about every build, so it is stated on a
+# command line rather than inferred from a field.
+#
+# Measured rather than assumed: adding PLOW_K3 to this row moved `interp_prefill_mla_moe` not at
+# all on registers (256 VGPR, 122 spills, before and after) and 160 B on LDS. A narrow
+# `#if PLOW_MHC` guard is still the better shape; it is not urgent on that evidence.
+if [ "${PLOW_PREFILL_DSV41:-0}" = 1 ]; then
+  # $AX_K3_A4W4_TUNE rides along because V4.1's routed experts ARE a4w4 (12.83): without it
+  # PLOW_MOE_PF_A4W4_C3_BK / _PRIO reach only the K3 rows and V4.1 cannot A/B the kernel it
+  # actually dispatches. The defaults (BK 64, PRIO 1) are unchanged by adding the axis -- they
+  # were chosen on K3's shapes, and V4.1's DOWN is K=288, 4.5 tiles at BK=64.
+  AX_PREFILL="$AX_PREFILL -DPLOW_K3=1 -DGV_UNROLL=14 -DPLOW_QWEN_GDN=1 $AX_A4W4 $AX_K3_A4W4_TUNE"
+fi
+
 # CEILING INSTRUMENT ONLY (PLOW_MLA_PF2_ABL=1..4): the V2 MLA prefill's ablation probes —
 # one cost term deleted each (op_attention.h d_flash_mla_prefill_v2): 1 = no K-slab stage,
 # 2 = no QK MFMA, 3 = no softmax math, 4 = no PV. WRONG OUTPUT by construction, never a
@@ -1179,7 +1454,7 @@ if [ "${PLOW_MLA_FOLD_TB:-8}" != 0 ]; then
 fi
 
 # DEFAULT ON for the gfx942 PREFILL and FLASH objects (2026-09-11): the three glue memory arms —
-# PLOW_COMBINE_VEC (8-wide k==1 MoE combine, op_moe.h), PLOW_RN_ROWS (RMSNorm issues R rows of
+# PLOW_COMBINE_VEC (8-wide MoE combine at any k, op_moe.h), PLOW_RN_ROWS (RMSNorm issues R rows of
 # loads before reducing any, op_norm.h) and PLOW_RESID_U (residual keeps U iterations of loads in
 # flight, op_elementwise.h). Rollback per axis: PLOW_COMBINE_VEC=0, PLOW_RN_ROWS=0, PLOW_RESID_U=0
 # (1 is also the shipped single-row / non-unrolled body for the last two).
@@ -1197,6 +1472,30 @@ AX_GLUE=""
 [ "${PLOW_COMBINE_VEC:-1}" = 0 ] || AX_GLUE="$AX_GLUE -DPLOW_COMBINE_VEC=${PLOW_COMBINE_VEC:-1}"
 case "${PLOW_RN_ROWS:-2}" in 0|1) ;; *) AX_GLUE="$AX_GLUE -DPLOW_RN_ROWS=${PLOW_RN_ROWS:-2}" ;; esac
 case "${PLOW_RESID_U:-4}" in 0|1) ;; *) AX_GLUE="$AX_GLUE -DPLOW_RESID_U=${PLOW_RESID_U:-4}" ;; esac
+# PLOW_HC_VEC8=0: restore the hyper-connection ops' per-element scalar loops (the A/B control).
+if [ -n "${PLOW_HC_VEC8:-}" ]; then
+  AX_GLUE="$AX_GLUE -DPLOW_HC_VEC8=${PLOW_HC_VEC8}"
+fi
+
+# PLOW_CMP_VEC8=0: restore d_compress_rope_quant's per-channel scalar reads (the A/B control).
+if [ -n "${PLOW_CMP_VEC8:-}" ]; then
+  AX_GLUE="$AX_GLUE -DPLOW_CMP_VEC8=${PLOW_CMP_VEC8}"
+fi
+# PLOW_CMP_TAB4=0: restore d_compress_rope_quant's per-pair scalar cos/sin reads (the A/B control).
+if [ -n "${PLOW_CMP_TAB4:-}" ]; then
+  AX_GLUE="$AX_GLUE -DPLOW_CMP_TAB4=${PLOW_CMP_TAB4}"
+fi
+
+# ROUTER SELECTION ARM for the PREFILL objects. The header defaults PLOW_MOE_ROUTER_SELECT to
+# PLOW_K3 and the _LOCAL variant is only ever handed to the K3 DECODE row (AX_K3_ROUTER_LOCAL
+# above), so a non-K3 prefill object has never been able to take either. All three arms pick the
+# same keys in the same order; this is a scheduling A/B, not a numerics one.
+if [ -n "${PLOW_MOE_ROUTER_SELECT:-}" ]; then
+  AX_GLUE="$AX_GLUE -DPLOW_MOE_ROUTER_SELECT=${PLOW_MOE_ROUTER_SELECT}"
+fi
+if [ -n "${PLOW_MOE_ROUTER_SELECT_LOCAL:-}" ]; then
+  AX_GLUE="$AX_GLUE -DPLOW_MOE_ROUTER_SELECT_LOCAL=${PLOW_MOE_ROUTER_SELECT_LOCAL}"
+fi
 AX_PREFILL="$AX_PREFILL$AX_GLUE"
 AX_FLASH="$AX_FLASH$AX_GLUE"
 

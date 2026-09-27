@@ -14,6 +14,12 @@ kernelcaps = { workspace = true }
 tunedb = { workspace = true }
 hwspec = { workspace = true }
 plow-asset = { workspace = true }
+# V4.1's config is parsed and validated ONCE, here -- `costmodel` above already pulls
+# nn-graph in transitively, so this is a direct edge onto a crate already in the tree and
+# not a new dependency. The alternative was a second V4.1 reader beside `cfg_glm`, which
+# would drift on exactly the fields that are easy to misread (`compress_ratios` and
+# `kv_source_layer_ids` disagree by construction).
+nn-graph = { workspace = true }
 serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
