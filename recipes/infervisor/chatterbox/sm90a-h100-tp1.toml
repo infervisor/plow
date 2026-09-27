@@ -68,6 +68,9 @@ PLOW_PF_LADDER_APPEND = "256,384"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
+# One k+v HeadNormRope packet per layer (token-identical): T3 decode step, step_bench H100,
+# B=1/2/32/128 ctx 1000: 1.557/1.690/3.461/10.018 -> 1.531/1.649/3.377/9.917 ms.
+PLOW_FUSE_KV_HNR = "1"
 
 [bench]
 kind = "speech"

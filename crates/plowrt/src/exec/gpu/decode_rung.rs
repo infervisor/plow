@@ -276,6 +276,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     | DevOp::NormResidualNorm
                     | DevOp::AddNorm
                     | DevOp::Embed
+                    | DevOp::EmbedPosBf16
                     | DevOp::FlashDecode
                     | DevOp::FlashDecodeFp8
                     | DevOp::FlashMerge,
