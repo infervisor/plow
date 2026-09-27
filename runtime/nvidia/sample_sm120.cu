@@ -4,18 +4,17 @@
  * exactly as ARGMAX_FIN does for greedy — so `temperature > 0` no longer downloads the whole
  * vocabulary row to the host, and the host softmax+full-vocab sort leaves the critical path.
  *
- * SEMANTICS (the device sampler's own contract; the host CPU sampler stays as the reference /
- * debug mode). Given per-row temperature t, top_k, top_p, min_p and a uniform rng01 in [0,1):
- *   e_i    = exp((l_i - lmax) / t)                    (unnormalised softmax weight, e in (0,1])
- *   min_p  keeps e_i >= min_p                          (max weight is 1, so this is p_i >= min_p*p_max)
- *   top_k  keeps the k largest weights                 (threshold = the k-th largest e_i)
- *   top_p  keeps the smallest high-weight set whose mass >= top_p * total
- *   draw   inverse-CDF over the kept set in INDEX order, target = rng01 * sum(kept e_i)
- * The three truncations compose into ONE weight floor; the draw is index-order (no device
- * sort) — deterministic for a fixed rng01 and distributionally exact vs the kept set. The
- * two boundary searches (top_k, top_p) are threshold bisections, each a handful of O(V) block
- * reductions; min_p is a direct floor. t <= 0 is greedy argmax with the ARGMAX tie-break
- * (lowest index wins), byte-identical to d_argmax_fin.
+ * SEMANTICS: the host sampler's (`text::sample::sample_with_scratch`). Given per-row temperature
+ * t, top_k, top_p, min_p and a uniform rng01 in [0,1), with p_i = softmax(l_i / t):
+ *   top_k  keeps the k largest (ties at the k-th value: lowest index first)
+ *   min_p  keeps p_i >= min_p * p_max
+ *   top_p  keeps the shortest descending prefix whose mass reaches top_p (crossing token kept)
+ *   draw   inverse-CDF over the kept set in descending order, target = rng01 * kept mass
+ * `sample_select` implements it for every row with a truncation. Rows it cannot hold (more than
+ * PLOW_SMP_CAND candidates) fall back to the legacy threshold path
+ * below: one weight floor from bisections, index-order draw — the same distribution up to the
+ * top_p boundary token. t <= 0 is greedy argmax with the ARGMAX tie-break (lowest index wins),
+ * byte-identical to d_argmax_fin.
  *
  * NOT handled on device (host keeps these; the engine only routes rows the device can finish):
  *   - repetition/frequency/presence penalties (need per-row token history — DeviceRunState),
@@ -86,122 +85,276 @@ __device__ __forceinline__ float count_ge(const float* e, unsigned V, float floo
     return block_sum(c, part);
 }
 
-/* FAST PATH for rows with top_p < 1 and no top_k (the TTS/chat default).
- *
- * Exact candidate filter: with c = max(eps, min_p), eps = (1 - top_p) * total / V, every weight
- * below eps sums to at most (1 - top_p) * total, so the top_p floor is >= eps and no weight below
- * c can be kept. For every floor >= c the candidates' mass equals the full vocabulary's, so the
- * bisection over the candidates finds the same floor the full-vocabulary one does. A peaked row
- * leaves a few hundred candidates; three streaming passes over the bf16 logits (max, total,
- * compact) replace ~27 passes over an f32 scratch copy, with contiguous per-thread chunks and
- * independent loads so the passes are not latency-bound on one SM.
- *
- * The draw is inverse-CDF in ascending INDEX order over the kept set (the legacy path's order is
- * thread-strided); for a fixed rng01 the token can differ from the legacy path, the distribution
- * does not. Returns false (nothing written) when the candidates overflow PLOW_SMP_CAND. */
-__device__ bool sample_fast(const __nv_bfloat16* __restrict__ row, unsigned V, float t, float tp,
-                            float mp, float u, int* __restrict__ out) {
-    __shared__ unsigned c_idx[PLOW_SMP_CAND];
-    __shared__ float c_e[PLOW_SMP_CAND];
-    __shared__ float part[PLOW_SMP_WARPS];
-    __shared__ unsigned cnt[PLOW_SMP_THREADS];
-    __shared__ float pre[PLOW_SMP_THREADS];
-    __shared__ unsigned sh_pick;
+/* Ordered 16-bit key of a bf16 value: a larger key is a larger value (the ARGMAX key). */
+__device__ __forceinline__ unsigned bf16_key(unsigned short bits) {
+    return (bits & 0x8000u) ? (unsigned)(unsigned short)~bits : (unsigned)(bits | 0x8000u);
+}
+
+/* Row element j of a uint4 (8 bf16) word. */
+__device__ __forceinline__ unsigned short bf16_lane(const uint4& q, unsigned j) {
+    const unsigned w = j < 2u ? q.x : j < 4u ? q.y : j < 6u ? q.z : q.w;
+    return (unsigned short)(j & 1u ? w >> 16 : w & 0xffffu);
+}
+
+/* Warp-aggregated shared histogram increment; `bin` >= 256 means no element. */
+__device__ __forceinline__ void hist_add(unsigned* hist, unsigned bin) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned peers = __match_any_sync(0xffffffffu, bin);
+    if (bin < 256u && lane == (unsigned)(__ffs(peers) - 1)) atomicAdd(&hist[bin], (unsigned)__popc(peers));
+}
+
+/* The highest bin whose count, summed from bin 255 downwards, reaches `need` (warp 0 only).
+ * Returns (bin, count strictly above it) through `sel`. */
+__device__ __forceinline__ void hist_pick(const unsigned* hist, unsigned need, unsigned* sel) {
+    const unsigned lane = threadIdx.x & 31u;
+    unsigned mine = 0;
+#pragma unroll
+    for (unsigned j = 0; j < 8u; j++) mine += hist[255u - lane * 8u - j];
+    unsigned incl = mine;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const unsigned x = __shfl_up_sync(0xffffffffu, incl, o, 32);
+        if ((int)lane >= o) incl += x;
+    }
+    const unsigned hit = __ballot_sync(0xffffffffu, incl >= need);
+    const unsigned first = hit ? (unsigned)(__ffs(hit) - 1) : 31u;
+    if (lane == first) {
+        unsigned above = incl - mine;
+        unsigned bin = 255u - lane * 8u;
+        for (unsigned j = 0; j < 8u; j++, bin--) {
+            if (above + hist[bin] >= need || j == 7u) break;
+            above += hist[bin];
+        }
+        sel[0] = bin;
+        sel[1] = above;
+    }
+}
+
+/* Every element of the row once per thread-uniform trip: f(live, index, bf16 bits). 16-byte
+ * vector loads when the row allows them (V % 8 == 0 and an aligned base), else coalesced scalar
+ * loads. The trip count is the same for every thread, so f may use warp collectives. */
+template <typename F>
+__device__ __forceinline__ void row_walk(const __nv_bfloat16* __restrict__ row, unsigned V, F&& f) {
     const unsigned T = PLOW_SMP_THREADS, tid = threadIdx.x;
-    const unsigned chunk = (V + T - 1u) / T;
-    const unsigned lo = min(V, tid * chunk), hi = min(V, lo + chunk);
-
-    float m = -3.4e38f;
-    for (unsigned i = lo; i < hi; i += 8u) {
-        float v[8];
+    if ((V & 7u) == 0u && (reinterpret_cast<size_t>(row) & 15u) == 0u) {
+        const uint4* q = reinterpret_cast<const uint4*>(row);
+        const unsigned words = V / 8u, iters = (words + T - 1u) / T;
+        for (unsigned it = 0; it < iters; it++) {
+            const unsigned w = it * T + tid;
+            const bool live = w < words;
+            const uint4 v = live ? q[w] : make_uint4(0u, 0u, 0u, 0u);
 #pragma unroll
-        for (unsigned j = 0; j < 8u; j++) v[j] = i + j < hi ? __bfloat162float(row[i + j]) : -3.4e38f;
-#pragma unroll
-        for (unsigned j = 0; j < 8u; j++) m = fmaxf(m, v[j]);
-    }
-    m = block_max(m, part);
-    const float inv_t = 1.0f / t;
-    float s = 0.0f;
-    for (unsigned i = lo; i < hi; i += 8u) {
-        float v[8];
-#pragma unroll
-        for (unsigned j = 0; j < 8u; j++) v[j] = i + j < hi ? __bfloat162float(row[i + j]) : -3.4e38f;
-#pragma unroll
-        for (unsigned j = 0; j < 8u; j++) s += i + j < hi ? expf((v[j] - m) * inv_t) : 0.0f;
-    }
-    const float total = block_sum(s, part);
-    const float c = fmaxf((1.0f - tp) * total / (float)V, mp);
-
-    /* Compact candidates in index order: count per chunk, exclusive scan, write. */
-    unsigned n = 0;
-    for (unsigned i = lo; i < hi; i += 8u) {
-        float v[8];
-#pragma unroll
-        for (unsigned j = 0; j < 8u; j++) v[j] = i + j < hi ? __bfloat162float(row[i + j]) : -3.4e38f;
-#pragma unroll
-        for (unsigned j = 0; j < 8u; j++) n += (i + j < hi && expf((v[j] - m) * inv_t) >= c) ? 1u : 0u;
-    }
-    cnt[tid] = n;
-    __syncthreads();
-    for (unsigned d = 1; d < T; d <<= 1) {
-        const unsigned add = tid >= d ? cnt[tid - d] : 0u;
-        __syncthreads();
-        cnt[tid] += add;
-        __syncthreads();
-    }
-    const unsigned N = cnt[T - 1u];
-    if (N > PLOW_SMP_CAND || N == 0u) return false; /* uniform across the block */
-    unsigned o = cnt[tid] - n;
-    for (unsigned i = lo; i < hi && o < cnt[tid]; i++) {
-        const float e = expf((__bfloat162float(row[i]) - m) * inv_t);
-        if (e >= c) { c_idx[o] = i; c_e[o] = e; o++; }
-    }
-    __syncthreads();
-
-    /* Largest floor whose kept mass exceeds top_p * total (the legacy bisection, over N). */
-    const float want = tp * total;
-    float flo = 0.0f, fhi = 1.0f;
-#pragma unroll 1
-    for (int it = 0; it < 24; it++) {
-        const float mid = 0.5f * (flo + fhi);
-        float ms = 0.0f;
-        for (unsigned k = tid; k < N; k += T) ms += c_e[k] >= mid ? c_e[k] : 0.0f;
-        if (block_sum(ms, part) > want) flo = mid; else fhi = mid;
-    }
-    const float floor = fmaxf(flo, mp);
-
-    /* Inverse CDF in index order: thread tid owns candidates [tid*q, tid*q+q). */
-    const unsigned q = (N + T - 1u) / T;
-    const unsigned k0 = min(N, tid * q), k1 = min(N, k0 + q);
-    float mine = 0.0f;
-    for (unsigned k = k0; k < k1; k++) mine += c_e[k] >= floor ? c_e[k] : 0.0f;
-    pre[tid] = mine;
-    if (tid == 0) sh_pick = 0xFFFFFFFFu;
-    __syncthreads();
-    for (unsigned d = 1; d < T; d <<= 1) {
-        const float add = tid >= d ? pre[tid - d] : 0.0f;
-        __syncthreads();
-        pre[tid] += add;
-        __syncthreads();
-    }
-    const float target = u * pre[T - 1u];
-    const float excl = pre[tid] - mine;
-    if (mine > 0.0f && target >= excl && target < excl + mine) {
-        float acc = excl;
-        for (unsigned k = k0; k < k1; k++) {
-            if (c_e[k] >= floor) {
-                acc += c_e[k];
-                if (acc > target) { sh_pick = c_idx[k]; break; }
-            }
+            for (unsigned j = 0; j < 8u; j++) f(live, w * 8u + j, bf16_lane(v, j));
+        }
+    } else {
+        const unsigned short* r = reinterpret_cast<const unsigned short*>(row);
+        const unsigned iters = (V + T - 1u) / T;
+        for (unsigned it = 0; it < iters; it++) {
+            const unsigned i = it * T + tid;
+            const bool live = i < V;
+            f(live, i, live ? r[i] : (unsigned short)0u);
         }
     }
-    __syncthreads();
-    if (tid == 0) {
-        unsigned p = sh_pick;
-        if (p == 0xFFFFFFFFu) /* rng01 rounded onto the mass edge: lowest-index kept token */
-            for (unsigned k = 0; k < N; k++) if (c_e[k] >= floor) { p = c_idx[k]; break; }
-        *out = (int)p;
+}
+
+/* In warp 0: the first j < n whose inclusive prefix of w[0..] reaches `target` (n if none), and
+ * the prefix sum of w[0..n) through `sum`. */
+__device__ __forceinline__ unsigned warp_first_ge(const float* w, unsigned n, float target, float* sum) {
+    const unsigned lane = threadIdx.x & 31u;
+    float acc = 0.0f;
+    unsigned found = n;
+    for (unsigned base = 0; base < n; base += 32u) {
+        const unsigned j = base + lane;
+        float incl = j < n ? w[j] : 0.0f;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const float x = __shfl_up_sync(0xffffffffu, incl, o, 32);
+            if ((int)lane >= o) incl += x;
+        }
+        incl += acc;
+        const unsigned hit = __ballot_sync(0xffffffffu, j < n && incl >= target);
+        if (hit && found == n) found = base + (unsigned)(__ffs(hit) - 1);
+        acc = __shfl_sync(0xffffffffu, incl, 31);
     }
+    *sum = acc;
+    return found;
+}
+
+/* The host sampler's semantics (`text::sample::sample_with_scratch`) on device, for rows with at
+ * least one truncation. With p_i = softmax(l / t) over the whole vocabulary:
+ *   top_k  keeps the k largest (ties at the k-th value: lowest index first),
+ *   min_p  keeps p_i >= min_p * p_max,
+ *   top_p  keeps the shortest descending prefix whose mass reaches top_p (the crossing token
+ *          included),
+ *   draw   inverse CDF over the kept set in DESCENDING order, target = rng01 * kept mass.
+ * Candidates are found without a vocabulary-sized scratch: top_k by a radix select on the bf16
+ * keys (two 256-bin histograms), otherwise by the exact filter e_i >= max(eps, min_p) with
+ * eps = (1 - top_p) * total / V (every weight below eps sums to at most (1 - top_p) * total, so the
+ * descending prefix reaches top_p * total before any of them). Three streaming passes over the
+ * bf16 row, then a bitonic sort of the <= PLOW_SMP_CAND candidates in shared memory.
+ * Returns false (nothing written) when the candidates overflow. */
+__device__ bool sample_select(const __nv_bfloat16* __restrict__ row, unsigned V, float t, int k,
+                              float tp, float mp, float u, int* __restrict__ out) {
+    __shared__ unsigned c_idx[PLOW_SMP_CAND];
+    __shared__ float c_w[PLOW_SMP_CAND];
+    __shared__ unsigned hist[256];
+    __shared__ float part[PLOW_SMP_WARPS];
+    __shared__ unsigned sel[2];
+    __shared__ unsigned n_cand;
+    __shared__ int pick;
+    const unsigned T = PLOW_SMP_THREADS, tid = threadIdx.x;
+    if (k > PLOW_SMP_CAND) return false;
+    const float inv_t = 1.0f / t;
+    const bool by_rank = k > 0;
+    if (tid < 256u) hist[tid] = 0u;
+    if (tid == 0) n_cand = 0u;
+    __syncthreads();
+
+    /* Pass 1: max, online softmax mass, and the high-byte histogram of the keys. */
+    float m = -3.4e38f, s = 0.0f;
+    row_walk(row, V, [&](bool live, unsigned, unsigned short bits) {
+        if (live) {
+            const float l = __bfloat162float(__ushort_as_bfloat16(bits));
+            if (l > m) { s = s * expf((m - l) * inv_t) + 1.0f; m = l; }
+            else s += expf((l - m) * inv_t);
+        }
+        if (by_rank) hist_add(hist, live ? bf16_key(bits) >> 8 : 256u);
+    });
+    const float mx = block_max(m, part);
+    const float total = block_sum(m > -3.4e38f ? s * expf((m - mx) * inv_t) : 0.0f, part);
+
+    /* Candidate bound: the k-th largest key (low byte by a second pass), or a weight floor. */
+    unsigned kkey = 0u;
+    float wfloor = 0.0f;
+    if (by_rank) {
+        if (tid < 32u) hist_pick(hist, (unsigned)k, sel);
+        __syncthreads();
+        const unsigned hi = sel[0], need = (unsigned)k - sel[1];
+        __syncthreads();
+        if (tid < 256u) hist[tid] = 0u;
+        __syncthreads();
+        row_walk(row, V, [&](bool live, unsigned, unsigned short bits) {
+            const unsigned key = bf16_key(bits);
+            hist_add(hist, live && (key >> 8) == hi ? (key & 255u) : 256u);
+        });
+        __syncthreads();
+        if (tid < 32u) hist_pick(hist, need, sel);
+        __syncthreads();
+        kkey = (hi << 8) | sel[0];
+    } else {
+        wfloor = fmaxf(tp < 1.0f ? (1.0f - tp) * total / (float)V : 0.0f, mp);
+    }
+
+    /* Pass 3: compact the candidates (any order; the sort below fixes it). */
+    row_walk(row, V, [&](bool live, unsigned i, unsigned short bits) {
+        const float e = expf((__bfloat162float(__ushort_as_bfloat16(bits)) - mx) * inv_t);
+        const bool keep = live && (by_rank ? bf16_key(bits) >= kkey : e >= wfloor);
+        const unsigned ballot = __ballot_sync(0xffffffffu, keep);
+        if (!ballot) return;
+        const unsigned lane = tid & 31u;
+        unsigned base = 0u;
+        if (lane == (unsigned)(__ffs(ballot) - 1)) base = atomicAdd(&n_cand, (unsigned)__popc(ballot));
+        base = __shfl_sync(0xffffffffu, base, __ffs(ballot) - 1);
+        const unsigned slot = base + __popc(ballot & ((1u << lane) - 1u));
+        if (keep && slot < PLOW_SMP_CAND) { c_idx[slot] = i; c_w[slot] = e; }
+    });
+    __syncthreads();
+    unsigned N = n_cand;
+    if (N == 0u || N > PLOW_SMP_CAND) return false; /* uniform across the block */
+
+    /* A wide nucleus: narrow the candidates to the top_p/min_p kept set before sorting. The
+     * bisected floor sits just below the crossing token's weight (the largest floor whose kept
+     * mass still exceeds top_p * total), so the set keeps every token the sorted cut below can
+     * keep; the cut then fixes the exact boundary. */
+    if (!by_rank && N > 64u && (tp < 1.0f || mp > 0.0f)) {
+        float flo = 0.0f;
+        if (tp < 1.0f) {
+            const float want = tp * total;
+            float fhi = 1.0f;
+#pragma unroll 1
+            for (int it = 0; it < 24; it++) {
+                const float mid = 0.5f * (flo + fhi);
+                float ms = 0.0f;
+                for (unsigned i = tid; i < N; i += T) ms += c_w[i] >= mid ? c_w[i] : 0.0f;
+                if (block_sum(ms, part) > want) flo = mid; else fhi = mid;
+            }
+        }
+        const float keep_floor = fmaxf(flo, mp);
+        constexpr unsigned PER = (PLOW_SMP_CAND + PLOW_SMP_THREADS - 1) / PLOW_SMP_THREADS;
+        float rw[PER];
+        unsigned ri[PER];
+#pragma unroll
+        for (unsigned k = 0; k < PER; k++) {
+            const unsigned i = tid + k * T;
+            rw[k] = i < N ? c_w[i] : -1.0f;
+            ri[k] = i < N ? c_idx[i] : 0u;
+        }
+        if (tid == 0) n_cand = 0u;
+        __syncthreads();
+#pragma unroll
+        for (unsigned k = 0; k < PER; k++) {
+            const bool keep = rw[k] >= keep_floor;
+            const unsigned ballot = __ballot_sync(0xffffffffu, keep);
+            if (!ballot) continue;
+            const unsigned lane = tid & 31u;
+            unsigned base = 0u;
+            if (lane == (unsigned)(__ffs(ballot) - 1)) base = atomicAdd(&n_cand, (unsigned)__popc(ballot));
+            base = __shfl_sync(0xffffffffu, base, __ffs(ballot) - 1);
+            if (keep) {
+                const unsigned slot = base + __popc(ballot & ((1u << lane) - 1u));
+                c_w[slot] = rw[k];
+                c_idx[slot] = ri[k];
+            }
+        }
+        __syncthreads();
+        N = n_cand;
+    }
+
+    /* Sort descending by weight, ascending index on ties (the rank order top_k truncates). */
+    unsigned n2 = 1u;
+    while (n2 < N) n2 <<= 1;
+    for (unsigned i = N + tid; i < n2; i += T) { c_w[i] = -1.0f; c_idx[i] = 0xFFFFFFFFu; }
+    __syncthreads();
+    for (unsigned size = 2u; size <= n2; size <<= 1) {
+        for (unsigned stride = size >> 1; stride > 0u; stride >>= 1) {
+            for (unsigned i = tid; i < n2; i += T) {
+                const unsigned j = i ^ stride;
+                if (j <= i) continue;
+                const float wi = c_w[i], wj = c_w[j];
+                const unsigned ii = c_idx[i], ij = c_idx[j];
+                const bool j_first = wj > wi || (wj == wi && ij < ii);
+                const bool i_first = wi > wj || (wi == wj && ii < ij);
+                if ((i & size) == 0u ? j_first : i_first) {
+                    c_w[i] = wj; c_w[j] = wi; c_idx[i] = ij; c_idx[j] = ii;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    /* Truncate (top_k, min_p on a descending list are prefixes; then top_p), then draw. */
+    if (tid < 32u) {
+        unsigned n = by_rank ? min(N, (unsigned)k) : N;
+        if (mp > 0.0f) {
+            unsigned cut = n;
+            for (unsigned base = 0; base < n && cut == n; base += 32u) {
+                const unsigned j = base + (tid & 31u);
+                const unsigned hit = __ballot_sync(0xffffffffu, j < n && c_w[j] < mp);
+                if (hit) cut = base + (unsigned)(__ffs(hit) - 1);
+            }
+            n = max(cut, 1u);
+        }
+        float kept;
+        if (tp < 1.0f) {
+            const unsigned j = warp_first_ge(c_w, n, tp * total, &kept);
+            n = min(n, j + 1u);
+        }
+        warp_first_ge(c_w, n, 0.0f, &kept);
+        const unsigned j = warp_first_ge(c_w, n, u * kept, &kept);
+        if (tid == 0) pick = (int)c_idx[min(j, n - 1u)];
+    }
+    __syncthreads();
+    if (tid == 0) *out = pick;
     return true;
 }
 
@@ -262,8 +415,8 @@ extern "C" __global__ void plow_sample(
         return;
     }
 
-    if (top_k[b] <= 0 && top_p[b] < 1.0f &&
-        sample_fast(row, V, t, top_p[b], min_p[b], rng01[b], out_ids + b))
+    if ((top_k[b] > 0 || top_p[b] < 1.0f || min_p[b] > 0.0f) &&
+        sample_select(row, V, t, top_k[b], top_p[b], min_p[b], rng01[b], out_ids + b))
         return;
 
     /* Weights e_i = exp((l_i - lmax)/t), materialised to scratch (reused by every pass). */

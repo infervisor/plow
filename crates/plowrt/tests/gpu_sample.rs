@@ -28,12 +28,10 @@ fn bf16_bits_to_f32(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
 
-/// CPU reference: the device sampler's exact semantics.
-/// `bf` is the row as bf16 bits. Returns the sampled token.
+/// CPU reference: greedy is the ARGMAX key (lowest index on ties); stochastic rows use the host
+/// sampler, whose semantics the device sampler implements.
 fn cpu_sample(bf: &[u16], t: f32, top_k: i32, top_p: f32, min_p: f32, rng01: f32) -> u32 {
-    let v = bf.len();
     if t <= 1e-6 {
-        // Argmax with the ARGMAX packed key (lowest index breaks ties).
         let mut best: u64 = 0;
         for (i, &bits) in bf.iter().enumerate() {
             let key = if bits & 0x8000 != 0 {
@@ -46,59 +44,15 @@ fn cpu_sample(bf: &[u16], t: f32, top_k: i32, top_p: f32, min_p: f32, rng01: f32
         }
         return !((best & 0xFFFF_FFFF) as u32);
     }
-    let inv_t = 1.0 / t;
-    let lmax = bf
-        .iter()
-        .map(|&b| bf16_bits_to_f32(b))
-        .fold(f32::NEG_INFINITY, f32::max);
-    let e: Vec<f32> = bf
-        .iter()
-        .map(|&b| ((bf16_bits_to_f32(b) - lmax) * inv_t).exp())
-        .collect();
-    let total: f32 = e.iter().sum();
-
-    let count_ge = |floor: f32| e.iter().filter(|&&w| w >= floor).count();
-    let mass_ge = |floor: f32| e.iter().filter(|&&w| w >= floor).sum::<f32>();
-
-    let mut floor = min_p;
-    if top_k > 0 {
-        let (mut lo, mut hi) = (0.0f32, 1.0f32);
-        for _ in 0..24 {
-            let mid = 0.5 * (lo + hi);
-            if count_ge(mid) as i32 > top_k {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        floor = floor.max(lo);
-    }
-    if top_p < 1.0 {
-        let want = top_p * total;
-        let (mut lo, mut hi) = (0.0f32, 1.0f32);
-        for _ in 0..24 {
-            let mid = 0.5 * (lo + hi);
-            if mass_ge(mid) > want {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        floor = floor.max(lo);
-    }
-    let kept: f32 = mass_ge(floor);
-    let target = rng01 * kept;
-    let mut acc = 0.0f32;
-    for (i, &w) in e.iter().enumerate() {
-        if w >= floor {
-            acc += w;
-            if acc > target {
-                return i as u32;
-            }
-        }
-    }
-    // Mass edge: highest-weight kept token.
-    (0..v).find(|&i| e[i] >= floor).unwrap_or(0) as u32
+    let logits: Vec<f32> = bf.iter().map(|&b| bf16_bits_to_f32(b)).collect();
+    let params = plowrt::text::sample::SamplingParams {
+        temperature: t,
+        top_k: top_k.max(0) as usize,
+        top_p,
+        min_p,
+        ..Default::default()
+    };
+    plowrt::text::sample::sample(&logits, &params, None, rng01)
 }
 
 const SRC: &str = include_str!("../../../runtime/nvidia/sample_sm120.cu");
@@ -124,10 +78,14 @@ fn device_sampler_matches_cpu_reference() {
     let src = dir.join("sample_sm120.cu");
     let cubin = dir.join("sample_sm120.cubin");
     std::fs::write(&src, SRC).unwrap();
-    let out = std::process::Command::new("/usr/local/cuda/bin/nvcc")
-        .env_clear()
-        .env("PATH", "/usr/local/cuda/bin:/usr/bin:/bin")
-        .args(["-arch=native", "-cubin", "-o"])
+    let nvcc = std::env::var("PLOW_NVCC").unwrap_or_else(|_| "/usr/local/cuda/bin/nvcc".into());
+    let mut cmd = std::process::Command::new(&nvcc);
+    cmd.env_clear().env("PATH", "/usr/local/cuda/bin:/usr/bin:/bin");
+    if let Ok(flags) = std::env::var("NVCC_PREPEND_FLAGS") {
+        cmd.env("NVCC_PREPEND_FLAGS", flags);
+    }
+    let out = cmd
+        .args(["-arch=native", "-O3", "-cubin", "-o"])
         .arg(&cubin)
         .arg(&src)
         .output()
@@ -142,6 +100,7 @@ fn device_sampler_matches_cpu_reference() {
     let be = CudaBackend::new(0).expect("CUDA backend");
     let module = be.module_load(&image).unwrap();
     let f = be.get_function(&module, "plow_sample").unwrap();
+    let threads = be.module_global_u32(&module, "plow_sample_threads").unwrap().unwrap_or(256);
     let stream = be.stream_create().unwrap();
 
     // A realistic logits row (V=8192): real model logits after softmax are
@@ -149,7 +108,10 @@ fn device_sampler_matches_cpu_reference() {
     // top_p=0.95 nucleus is a well-conditioned few-dozen-token set, not a flat
     // thousand-token band. Model it as exponential decay over a shuffled index
     // (so the peak isn't at index 0) plus small per-token jitter.
-    const V: usize = 8192;
+    // 8191: an odd vocabulary (Veena's is 156951) leaves every row after the first unaligned,
+    // which takes the scalar-load walk.
+    #[allow(non_snake_case)]
+    for V in [8192usize, 8191] {
     let mut logits_f = vec![0.0f32; V];
     for (i, l) in logits_f.iter_mut().enumerate() {
         // Deterministic pseudo-rank in [0, V) from a hash, so the distribution
@@ -245,7 +207,7 @@ fn device_sampler_matches_cpu_reference() {
                 &mut p_v as *mut u32 as *mut std::ffi::c_void,
                 &mut p_b as *mut u32 as *mut std::ffi::c_void,
             ];
-            be.launch_kernel(f, B as u32, 256, 0, &mut a, Some(&stream))
+            be.launch_kernel(f, B as u32, threads, 0, &mut a, Some(&stream))
                 .unwrap();
             be.stream_synchronize(&stream).unwrap();
             be.download(&d_ids, 0, bytemuck::cast_slice_mut(ids))
@@ -296,18 +258,19 @@ fn device_sampler_matches_cpu_reference() {
             / (2.0 * B as f64);
         let distinct = dev_hist.iter().filter(|&&c| c > 0).count();
         eprintln!(
-            "case {ci} t={} k={} p={} min_p={}: TVD(device,cpu)={tvd:.4}, {distinct} distinct tokens",
+            "V={V} case {ci} t={} k={} p={} min_p={}: TVD(device,cpu)={tvd:.4}, {distinct} distinct tokens",
             c.t, c.top_k, c.top_p, c.min_p,
         );
         assert!(
-            tvd < 0.05,
-            "case {ci}: device/cpu distributions differ (TVD {tvd:.4} >= 0.05)"
+            tvd < 0.01,
+            "case {ci}: device/cpu distributions differ (TVD {tvd:.4} >= 0.01)"
         );
         // Truncation actually happened (not sampling the whole vocab).
         assert!(
             distinct < V / 2,
             "case {ci}: kept set implausibly large ({distinct})"
         );
+    }
     }
     be.module_unload(&module).unwrap();
 }

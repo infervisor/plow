@@ -175,7 +175,7 @@ fn device_rows_match_host_sampler_distribution() {
     let mut logits = Vec::new();
     e.logits_row(0, &mut logits).expect("logits");
     const N: usize = 4096;
-    for (temp, top_k, top_p) in [(1.0f32, 64i32, 0.95f32), (1.3, 40, 1.0)] {
+    for (temp, top_k, top_p) in [(1.0f32, 64i32, 0.95f32), (0.7, 0, 0.9), (1.3, 40, 1.0), (1.0, 0, 0.99)] {
         let params = SamplingParams { temperature: temp, top_k: top_k as usize, top_p, ..Default::default() };
         let mut host = std::collections::HashMap::<u32, usize>::new();
         let mut dev = std::collections::HashMap::<u32, usize>::new();
