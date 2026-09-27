@@ -1091,6 +1091,14 @@ impl Builder {
         self.ops[counter as usize].isolated |= !self.isolate_ignored;
     }
 
+    /// Amend already-emitted instructions: an operand a shared emit helper does not take, bound by
+    /// the one caller that needs it.
+    pub fn for_each_inst_mut(&mut self, mut f: impl FnMut(&mut DevInst)) {
+        for op in &mut self.ops {
+            f(&mut op.inst);
+        }
+    }
+
     /// Make [`Builder::isolate`] a no-op: a single-launch program (a decode rung on the one
     /// interpreter object) reuses emitters that isolate ops for prefill role objects.
     pub fn ignore_isolate(&mut self) {

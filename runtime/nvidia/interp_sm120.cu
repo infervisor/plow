@@ -238,6 +238,12 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #include "op_engram.cuh"     /* V4.1 Engram (ops 196/197) + f32 argmax (op 173) */
 #include "op_sparse_attn_decode.cuh" /* V4.1 batched decode attention (ops 201/202) */
 #include "op_index_decode.cuh"       /* V4.1 batched decode indexer (ops 204/205) */
+#if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && defined(PLOW_HAS_MOE_GROUP_GLU_PF) && PLOW_HAS_MOE_GROUP_GLU_PF
+#define PLOW_NV_MOE_DEC_V41 1
+#include "op_moe_decode_v41.cuh" /* V4.1 routed experts at decode rows (ops 85/86 decode arms) */
+#else
+#define PLOW_NV_MOE_DEC_V41 0
+#endif
 #include "op_compress.cuh" /* V4.1 KV compressor tail (ops 194/195/199) */
 #if PLOW_NV_PREFILL
 #include "op_index_pf.cuh" /* DSA sparse-prefill indexer (ops 117-119) */
@@ -928,9 +934,16 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
     (PLOW_NV_FA_ARENA > PLOW_NV_FP8_M1_ARENA                                                   \
          ? (PLOW_NV_FA_ARENA > (plow_v41fa::SMEM_BYTES + 3u) / 4u ? PLOW_NV_FA_ARENA : (plow_v41fa::SMEM_BYTES + 3u) / 4u) \
          : (PLOW_NV_FP8_M1_ARENA > (plow_v41fa::SMEM_BYTES + 3u) / 4u ? PLOW_NV_FP8_M1_ARENA : (plow_v41fa::SMEM_BYTES + 3u) / 4u))
-#elif !PLOW_NV_PREFILL && defined(PLOW_HAS_SPARSE_ATTN_DECODE) && PLOW_HAS_SPARSE_ATTN_DECODE
-/* DeepSeek-V4.1 batched decode attention (op_sparse_attn_decode.cuh) stages Q + KV tiles + idx. */
-#define PLOW_NV_KERNEL_ARENA ((plow_sad::SMEM_BYTES + 3u) / 4u)
+#elif !PLOW_NV_PREFILL && ((defined(PLOW_HAS_SPARSE_ATTN_DECODE) && PLOW_HAS_SPARSE_ATTN_DECODE) || PLOW_NV_MOE_DEC_V41)
+/* DeepSeek-V4.1 decode: batched attention (op_sparse_attn_decode.cuh) stages Q + KV tiles + idx; the
+ * routed experts (op_moe_decode_v41.cuh) a bulk-copy ring per warp, sized here for E <= 384. */
+#if PLOW_NV_MOE_DEC_V41
+#define PLOW_NV_MOE_DEC_BYTES (unsigned)moe_decode_v41_smem_bytes(384u, PLOW_NV_WARPS)
+#else
+#define PLOW_NV_MOE_DEC_BYTES 0u
+#endif
+#define PLOW_NV_KERNEL_ARENA \
+    (((plow_sad::SMEM_BYTES > PLOW_NV_MOE_DEC_BYTES ? plow_sad::SMEM_BYTES : PLOW_NV_MOE_DEC_BYTES) + 3u) / 4u)
 #else
 #define PLOW_NV_KERNEL_ARENA (PLOW_NV_FA_ARENA > PLOW_NV_FP8_M1_ARENA ? PLOW_NV_FA_ARENA : PLOW_NV_FP8_M1_ARENA)
 #endif
@@ -1376,6 +1389,25 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
 #endif /* !PLOW_NV_GEMM_ONLY (norms) */
 
+#if PLOW_NV_MOE_DEC_V41
+    /* Routed experts at decode rows: the prefill role's MXFP4 operands (i3 = 2). GLU t6 = split-K
+     * scratch, its counters (zeroed, left zero) after moe_glu_decode_v41_scratch_floats floats. */
+    case PLOW_DOP_MOE_GROUP_GLU_PF:
+        if (in->i[3] != 2u || PLOW_NV_ARENA_FLOATS * sizeof(float) < moe_decode_v41_smem_bytes(in->i[2], PLOW_NV_WARPS) || !TEN(6))
+            __trap();
+        d_moe_glu_decode_v41((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned long long*)TEN(2),
+                             (const unsigned long long*)TEN(3), (const int*)TEN(4), (const unsigned*)TEN(5), (const float*)TEN(7),
+                             in->i[0], in->i[1], in->i[2], in->i[5], in->fj[1].f, (float*)TEN(6),
+                             (unsigned*)((float*)TEN(6) + moe_glu_decode_v41_scratch_floats(nblk, PLOW_NV_WARPS)), slice, nblk,
+                             (unsigned char*)arena);
+        break;
+    case PLOW_DOP_MOE_GROUP_DOWN_PF:
+        if (in->i[3] != 2u || in->i[1] > 64u * plow_mdv::DOWN_NSUB || PLOW_NV_ARENA_FLOATS * sizeof(float) < moe_decode_v41_smem_bytes(in->i[2], PLOW_NV_WARPS)) __trap();
+        d_moe_down_decode_v41((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned long long*)TEN(2),
+                              (const unsigned long long*)TEN(3), (const int*)TEN(4), (const unsigned*)TEN(6), (const float*)TEN(7),
+                              in->i[0], in->i[1], in->i[2], slice, nblk, (unsigned char*)arena);
+        break;
+#endif
 #if !PLOW_NV_PREFILL && defined(PLOW_NV_HOPPER) && defined(PLOW_HAS_GEMM) && PLOW_HAS_GEMM
     /* Decode-rung bf16 projections with no GEMV op of their own (V4.1 indexer wk / weights_proj):
      * the prefill wgmma body at rows = rung batch. Mapless only; needs its full staging arena. */
