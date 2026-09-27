@@ -8,62 +8,35 @@ OpenAI `POST /v1/audio/speech` route on `plowrt serve`.
 
 ## Drivers
 
-| Driver | Model family | Stages | Engine |
-|---|---|---|---|
-| `tts.codec_lm.v1` | Veena / Orpheus: a causal LM whose vocabulary carries audio-codec codes | LM (packet) → SNAC-24k codec | the text engine's continuous-batching mux |
-| `tts.t3_cfg.v1` | Chatterbox: T3 speech-token LM with classifier-free guidance | T3 (packet) → S3Gen (encoder, flow matching, vocoder) | its own `GpuEngine`, owned by a speech worker |
+Every stage is a plowc-emitted packet on the generic interpreter; plowrt binds drivers by name
+and never names a model. Host work (tokenization, text rules, sampling, prompt-row assembly,
+stream scheduling) runs on CPU threads from packet metadata.
 
-Both are emitted by devgen: `tts.codec_lm.v1` with `plowc --tts-profile veena`
-(`crates/devgen/src/tts.rs`, family constants in `SpeechProfile`),
-`tts.t3_cfg.v1` from the `chatterbox_t3` block the prep script writes into
-`config.json` (`scripts/tts/chatterbox_prep.py`).
-
-## Contracts
-
-`tts.codec_lm.v1` carries the causal roles (`prefill.<rows>`, `decode.<rows>`,
-`tokens`, `positions`, `kv_lengths`) and, as u64 parameters:
-
-- `prompt.format` (1 = `<spk_{voice}> {input}`), `prompt.prefix.*`, `prompt.suffix.*`, `stop.*`;
-- `codec.kind` (1 = SNAC-24k, 7 codes per 85.3 ms frame in Orpheus order),
-  `codec.frame_codes`, `codec.codebook`, `codec.frame_samples`, `audio.token_base`,
-  `audio.sample_rate`;
-- `tokens.per_char_frames_f32`, `tokens.max_new_cap`, `sampling.temperature_f32`,
-  `sampling.top_p_f32` (floats as `f32::to_bits`, the pipeline-schema convention).
-
-A voice is valid when its speaker tag is one vocabulary token; the runtime needs
-no voice list.
-
-`tts.t3_cfg.v1` adds the embedding handoff roles `overlay` / `overlay_index`
-(every prefill row is a host embedding: voice conditioning rows, text
-embeddings with learned positions, two BOS rows) and `pos_base` (the per-slot
-speech start for the decode embedding), plus `t3.*` parameters: text and speech
-control ids, `max_speech_tokens`, `cfg_weight_f32`, `temperature_f32`,
-`min_p_f32`, `top_p_f32`, `repetition_penalty_f32`, `s3_valid_below`.
-
-## Device operations
-
-| Op | What | Backends |
+| Driver | Packet | What the host does |
 |---|---|---|
-| `EmbedOverlayBf16` (179) | row = `table[tok]` or a BF16-rounded host overlay row | CPU golden, Metal, CUDA |
-| `EmbedPosBf16` (194) | `table[tok] + pos_table[pos - base]` per row | CPU golden, CUDA |
+| `tts.codec_lm.v1` | `model.pkt` (causal LM whose vocabulary carries codec codes; Veena) | prompt template + prefix/suffix ids, stop ids, code demux; the LM runs on the text engine's mux |
+| `tts.guided_lm.v1` | `model.pkt` (causal LM with classifier-free guidance; Chatterbox T3) | text rules + tokenizer, prefill rows from `in.prompt.*` tensors, CFG slot pairs, sampling chain from `lm.*` parameters |
+| `codec.v1` | `codec.pkt` (SNAC), `s3gen.pkt` (S3Gen) | pick the (batch, units) capacity, write codes/tokens, per-item lengths, seeds and voice index, run one program sequence, read PCM |
 
-`EmbedOverlayBf16` is the same generic encoder-to-decoder handoff Qwen3-ASR
-uses. `EmbedPosBf16` is T3's decode embedding (`speech_emb` + learned
-`speech_pos_emb`).
+Emission: `PLOW_TTS_PROFILE=veena` (+ `PLOW_TTS_CODEC_DIR`, the export of
+`scripts/tts/snac_export.py`) or a `chatterbox_t3` config block (+ `PLOW_TTS_VOCODER_DIR`, the
+export of `scripts/tts/s3gen_export.py`). Both codec packets run on the speech interpreter
+object (`interp_sm90a_speech.cubin`), built by `--emit devblob+cubin` when a codec packet is
+present.
 
-## Codec stages
+## Codec packets
 
-Codec stages are native CUDA shared objects shipped in the asset's `codec/`
-directory, built by the same `plowc --emit devblob+cubin` pass as the
-interpreter objects (CMake `PLOW_TTS_SNAC`):
+- `codec.pkt` (`crates/devgen/src/codec.rs`): SNAC-24k from generic ops — code demux (CopyCols),
+  projected codebooks (GatherRows), conv1d / conv-transpose1d with snake, RandF32 noise, tanh.
+  One program per `(batch, frames)` capacity; per-item valid lengths and seeds make an item decode
+  exactly as it would alone. Parity with the reference decoder: rel-L2 ~4e-6.
+- `s3gen.pkt` (`crates/devgen/src/s3gen.rs`): conformer encoder (relative-position attention as
+  AttentionF32 + bias), ten CFG Euler steps with baked `t`/`dt`, HiFT vocoder (fp64 SineGen phase
+  via CumSumF64, iSTFT as a conv-transpose). One program sequence per `(batch, tokens)` capacity;
+  voices are packet tensors selected by index. Mel rel-L2 vs torch fp32 ~1e-6.
 
-- `codec/libplow_snac.so` + `codec/snac24k.bin` (`runtime/nvidia/snac`): SNAC-24k decode,
-  fp32-accurate (three-pass TF32 GEMMs), one CUDA graph per `(batch, frames)` shape.
-- `codec/libplow_s3gen.so` + `codec/s3gen.bin` + `codec/voices/*.bin` (`runtime/nvidia/s3gen`).
-
-The codec worker (`crates/plowrt/src/tts/codec.rs`) batches decodes of equal
-frame count across concurrent requests into one call, so streams share codec
-launches the way they share LM decode steps.
+The codec driver (`crates/plowrt/src/tts/codec.rs`) batches pending decodes into one launch and
+captures every capacity's CUDA graph at load.
 
 ## Serving
 
@@ -71,25 +44,20 @@ launches the way they share LM decode steps.
 (`wav` | `pcm`, 24 kHz mono s16), `stream`, and sampling overrides
 (`temperature`, `top_p`, `repetition_penalty`, `seed`, `max_tokens`).
 
-- `tts.codec_lm.v1`: the request is a token-id `Job` on the model's mux. With
-  `stream: true` each completed frame decodes a window of 6 frames and emits the
-  frames that have 2 frames of right context (`stream_step`); the final flush
-  emits the rest. The LM stream is drained on its own task so a slow codec never
-  backs up the mux.
-- `tts.t3_cfg.v1`: `serve` hands such assets to a Chatterbox worker instead of
-  the text registry. The T3 thread batches requests continuously over slot
-  pairs (conditional / unconditional), combines their logits on the host
-  (`cond + w (cond - uncond)`, repetition penalty, temperature, min_p) and feeds
-  the drawn token to both slots; finished token sequences go to the S3Gen
-  thread.
+- `tts.codec_lm.v1`: the request is a token-id `Job` on the model's mux. With `stream: true`
+  each completed frame decodes a window (`stream.window_frames`) and emits the frames that have
+  `stream.lookahead_frames` of right context; the final flush emits the rest.
+- `tts.guided_lm.v1`: `serve` hands such assets to a guided speech worker (its own engine; two
+  slots per request). Tokens stream to the render thread as they are committed; streams
+  re-render their prefix every `stream.chunk_tokens` and emit all but `stream.hold_tokens`,
+  crossfading `stream.fade_samples`; the LM yields while a first chunk renders.
 
 ## Adding another TTS family
 
-1. Reuse `tts.codec_lm.v1` (a new `SpeechProfile` + codec kind) or `tts.t3_cfg.v1`, or
-   introduce a versioned driver when the host state machine differs.
-2. Declare roles and the numeric contract in devgen; the runtime binds them.
-3. Gate the LM against an fp32 reference on last-prefill logits (rel-L2, top-1), and
-   the codec stage against its PyTorch module (rel-L2).
-4. Gate the whole pipeline on Whisper round-trip CER (`scripts/tts/asr_check.py`) and
-   measure TTFA / RTF / audio seconds per second against the existing serving stack with
-   the same client (`scripts/tts/tts_bench.py`).
+1. Reuse a driver (new profile / parameters / strings) or introduce a versioned driver when the
+   host state machine differs; declare roles and the contract in devgen.
+2. Lower every compute stage to a packet from generic ops (add a generic op with a CPU golden
+   and a CUDA arm when one is missing — never a model-specific op or a native library).
+3. Gate the LM on last-prefill logits vs fp32 (rel-L2, top-1), each codec packet vs its PyTorch
+   module (rel-L2), and the pipeline on Whisper CER (`scripts/tts/asr_check.py`); measure with
+   `scripts/tts/tts_bench.py` against the reference stack using the same client.
