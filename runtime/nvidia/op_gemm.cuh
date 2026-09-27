@@ -143,6 +143,15 @@ template <class F> __device__ __forceinline__ void gemv_walk(unsigned M, F f) {
 
 /* C[m][n] = dot(x[m][:], W[n][:]). W is [N, K] — HF nn.Linear layout, row n is output n. */
 #if PLOW_NV_GEMV_MMA
+/* The paired walk (PLOW_NV_GEMV_MMA_PAIR) skips a ragged last row block (N % 8 != 0) when it falls
+ * as the second of a pair, leaving those outputs stale (Veena's 156951-row head: the last 7 logits
+ * at B >= 2; Chatterbox T3's 8194: the last 2). This pass recomputes the ragged rows after the
+ * walk, in the block that owns them. OUT OF LINE so the walk's code is unchanged. */
+template <bool BIAS>
+__device__ __noinline__ void gemv_rows_ragged_tail(__nv_bfloat16* C, const __nv_bfloat16* x,
+                                                   const __nv_bfloat16* W, unsigned M, unsigned N,
+                                                   unsigned K, unsigned slice, unsigned nblk,
+                                                   const __nv_bfloat16* bias);
 /* dot8 fallbacks of the tensor-core rungs, for a K the walk cannot take (no Gemma-4 K is one).
  * OUT OF LINE: inlined into every MM instance they are dead weight in the decode entry's register
  * budget, which every rung pays for. */
@@ -182,6 +191,9 @@ __device__ __forceinline__ void gemv_rows(__nv_bfloat16* __restrict__ C,
     if constexpr (TC && (MM >= 2 || PLOW_NV_GEMV_MMA_B1)) {
         if ((K & 31u) == 0u) {
             gemv_rows_mma<BIAS, (MM + 15) / 16, (MM <= 8)>(C, x, W, M, N, K, slice, nblk, bias);
+#if PLOW_NV_GEMV_MMA_PAIR
+            if (N & 7u) gemv_rows_ragged_tail<BIAS>(C, x, W, M, N, K, slice, nblk, bias);
+#endif
         } else {
             gemv_rows_dot4<BIAS>(C, x, W, M, N, K, slice, nblk, bias);
         }
@@ -246,6 +258,30 @@ __device__ __noinline__ void gemv_rows_dot4(__nv_bfloat16* C, const __nv_bfloat1
         const unsigned rows = (M - m0 < 4u) ? (M - m0) : 4u;
         gemv_rows<4, gv_un<4>::v, BIAS, false>(C + (size_t)m0 * N, x + (size_t)m0 * K, W, rows, N,
                                                K, slice, nblk, bias);
+    }
+}
+
+template <bool BIAS>
+__device__ __noinline__ void gemv_rows_ragged_tail(__nv_bfloat16* C, const __nv_bfloat16* x,
+                                                   const __nv_bfloat16* W, unsigned M, unsigned N,
+                                                   unsigned K, unsigned slice, unsigned nblk,
+                                                   const __nv_bfloat16* bias) {
+    const unsigned nrb = (N + 7u) >> 3, per = (nrb + nblk - 1u) / nblk;
+    if (slice * per >= nrb || slice * per + per < nrb) return; /* not the owner of the last block */
+    __syncthreads(); /* after the walk's own stores to these rows */
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK, warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned n0 = N & ~7u, nr = N - n0;
+    for (unsigned p = warp; p < M * nr; p += PLOW_NV_WARPS) {
+        const unsigned m = p / nr, n = n0 + p % nr;
+        const __nv_bfloat16* xr = x + (size_t)m * K;
+        const __nv_bfloat16* wr = W + (size_t)n * K;
+        float acc = 0.0f;
+        for (unsigned k = lane * 8u; k < K; k += 32u * 8u) acc = dot8(ld_glob8(wr + k), ld_glob8(xr + k), acc);
+        acc = warp_sum32(acc);
+        if (lane == 0) {
+            if constexpr (BIAS) acc += __bfloat162float(bias[n]);
+            C[(size_t)m * N + n] = __float2bfloat16(acc);
+        }
     }
 }
 #endif
