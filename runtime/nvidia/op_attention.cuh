@@ -730,6 +730,10 @@ __device__ __forceinline__ void fa_decode_qk_mma(float* scores, const __nv_bfloa
 #ifndef PLOW_NV_FA_RG_U
 #define PLOW_NV_FA_RG_U 4
 #endif
+/* The row-group body on hd256 / hd512 too (a warp per row). */
+#ifndef PLOW_NV_FA_RG_WIDE
+#define PLOW_NV_FA_RG_WIDE 0
+#endif
 template <int D, int GF>
 __device__ __forceinline__ void fa_decode_rg_item(
     float* __restrict__ Opart, float* __restrict__ mlpart, __nv_bfloat16* __restrict__ out,
@@ -737,18 +741,24 @@ __device__ __forceinline__ void fa_decode_rg_item(
     const __nv_bfloat16* __restrict__ vbase, unsigned b, unsigned n_head, unsigned h0,
     unsigned nsplit, unsigned sp, unsigned lo, unsigned hi, unsigned kv_mask, float scale,
     float* lds, unsigned* __restrict__ ctr) {
-    constexpr unsigned LPR = D / 8, GPW = 32u / LPR, NGRP = PLOW_NV_WARPS * GPW;
-    constexpr int U = PLOW_NV_FA_RG_U;
+    /* D > 256: a warp owns a row and each lane NCH 8-element chunks, 256 elements apart. */
+    constexpr unsigned NCH = D > 256 ? D / 256 : 1;
+    constexpr unsigned LPR = D / (8 * NCH), GPW = 32u / LPR, NGRP = PLOW_NV_WARPS * GPW;
+    constexpr int U = D > 256 ? (PLOW_NV_FA_RG_U > 2 ? 2 : PLOW_NV_FA_RG_U) : PLOW_NV_FA_RG_U;
+    constexpr int E = 8 * NCH;
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     const unsigned sub = lane % LPR, grp = warp * GPW + lane / LPR;
-    float qf[GF][8], m[GF], l[GF], o[GF][8];
+    float qf[GF][E], m[GF], l[GF], o[GF][E];
 #pragma unroll
     for (int g = 0; g < GF; g++) {
-        const bf16v8 q8 = ld_glob8(Q + ((size_t)b * n_head + h0 + g) * D + sub * 8u);
 #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            qf[g][i] = __bfloat162float(q8.x[i]) * FA_SCALE(scale);
-            o[g][i] = 0.0f;
+        for (int c = 0; c < (int)NCH; c++) {
+            const bf16v8 q8 = ld_glob8(Q + ((size_t)b * n_head + h0 + g) * D + c * LPR * 8u + sub * 8u);
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                qf[g][c * 8 + i] = __bfloat162float(q8.x[i]) * FA_SCALE(scale);
+                o[g][c * 8 + i] = 0.0f;
+            }
         }
         m[g] = FA_NEG_INF;
         l[g] = 0.0f;
@@ -756,13 +766,16 @@ __device__ __forceinline__ void fa_decode_rg_item(
     /* Block-uniform trip count: the lane reductions are full-warp shuffles. */
     for (unsigned base = lo; base < hi; base += NGRP * U) {
         const unsigned r0 = base + grp;
-        bf16v8 k8[U], v8[U];
+        bf16v8 k8[U][NCH], v8[U][NCH];
 #pragma unroll
         for (int u = 0; u < U; u++) {
             const unsigned r = min(r0 + NGRP * (unsigned)u, hi - 1u);
-            const size_t off = (size_t)(r & kv_mask) * D + sub * 8u;
-            k8[u] = ld_glob8_cs(kbase + off);
-            v8[u] = ld_glob8_cs(vbase + off);
+#pragma unroll
+            for (int c = 0; c < (int)NCH; c++) {
+                const size_t off = (size_t)(r & kv_mask) * D + c * LPR * 8u + sub * 8u;
+                k8[u][c] = ld_glob8_cs(kbase + off);
+                v8[u][c] = ld_glob8_cs(vbase + off);
+            }
         }
         float sc[GF][U];
 #pragma unroll
@@ -771,7 +784,10 @@ __device__ __forceinline__ void fa_decode_rg_item(
             for (int g = 0; g < GF; g++) {
                 float d = 0.0f;
 #pragma unroll
-                for (int i = 0; i < 8; i++) d = fmaf(__bfloat162float(k8[u].x[i]), qf[g][i], d);
+                for (int c = 0; c < (int)NCH; c++)
+#pragma unroll
+                    for (int i = 0; i < 8; i++)
+                        d = fmaf(__bfloat162float(k8[u][c].x[i]), qf[g][c * 8 + i], d);
 #pragma unroll
                 for (unsigned s = LPR / 2; s > 0; s >>= 1) d += __shfl_xor_sync(0xffffffffu, d, s, 32);
                 sc[g][u] = r0 + NGRP * (unsigned)u < hi ? d : FA_NEG_INF;
@@ -787,13 +803,16 @@ __device__ __forceinline__ void fa_decode_rg_item(
             const float corr = FA_EXP(m[g] - mref);
             l[g] *= corr;
 #pragma unroll
-            for (int i = 0; i < 8; i++) o[g][i] *= corr;
+            for (int i = 0; i < E; i++) o[g][i] *= corr;
 #pragma unroll
             for (int u = 0; u < U; u++) {
                 const float p = FA_EXP(sc[g][u] - mref);
                 l[g] += p;
 #pragma unroll
-                for (int i = 0; i < 8; i++) o[g][i] = fmaf(p, __bfloat162float(v8[u].x[i]), o[g][i]);
+                for (int c = 0; c < (int)NCH; c++)
+#pragma unroll
+                    for (int i = 0; i < 8; i++)
+                        o[g][c * 8 + i] = fmaf(p, __bfloat162float(v8[u][c].x[i]), o[g][c * 8 + i]);
             }
             m[g] = mx;
         }
@@ -805,7 +824,9 @@ __device__ __forceinline__ void fa_decode_rg_item(
     for (int g = 0; g < GF; g++) {
         __syncthreads(); /* the previous head's (or item's) fold has read go/gm/gl */
 #pragma unroll
-        for (int i = 0; i < 8; i++) go[grp * D + sub * 8u + i] = o[g][i];
+        for (int c = 0; c < (int)NCH; c++)
+#pragma unroll
+            for (int i = 0; i < 8; i++) go[grp * D + c * LPR * 8u + sub * 8u + i] = o[g][c * 8 + i];
         if (sub == 0) { gm[grp] = m[g]; gl[grp] = l[g]; }
         __syncthreads();
         const size_t row = (size_t)b * n_head + h0 + g;
@@ -986,7 +1007,8 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                const int* __restrict__ decode_slot = nullptr,
                                __nv_bfloat16* __restrict__ out = nullptr,
                                unsigned* __restrict__ merge_ctr = nullptr) {
-    constexpr bool RG = PLOW_NV_FA_RG && D == 128 && GF >= 2 && GF <= 4 && !FP8KV && !SZKV;
+    constexpr bool RG = PLOW_NV_FA_RG && (D == 128 || (PLOW_NV_FA_RG_WIDE && (D == 256 || D == 512))) &&
+                        GF >= 2 && GF <= 4 && !FP8KV && !SZKV;
     if constexpr (!RG) {
         if (out) __trap(); /* a merge-folded packet needs the row-group body */
     }

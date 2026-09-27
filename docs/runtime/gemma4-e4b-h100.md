@@ -191,10 +191,10 @@ TTFT first turn p50 / later turns p50 (p90) ms, TPOT p50 ms, out tok/s:
   default) wins: at 64 calls the later-turn TTFT beats vLLM. At 200 calls TPOT doubles and
   queueing sets TTFT.
 * **Publish rule.** A prompt tail shorter than one VMM block is published only from its second
-  sighting (`vmm.rs` `enable_shared_publish`). So a brand-new call's turn 2 reuses only the
-  whole blocks of a prefix that another call already sent (the shared system prompt), not its
-  own turn 1 tail. The session bench's shared system prompt covers this; a unique ~380-token
-  first turn sent back-to-back gets 0 cached rows.
+  sighting (`vmm.rs` `enable_shared_publish`), except for a session (`X-Session-Id`): its
+  boundaries publish on the first sighting (`VmmKv::note_session`), so a new call's turn 2 reuses
+  its own turn 1 tail. A unique ~380-token first turn sent back-to-back: turn 2 cached 0/397 ->
+  352/397 rows.
 
 ## Kernel work and where the time goes
 
@@ -220,7 +220,8 @@ floor and full hd512 ~1.7x.
 | device `plow_logprob_stats` + vectorized host log-sum-exp | logprobs cost at c64 -87% -> -43% | in |
 | `PLOW_SEG_FA512=all` + cuBLASLt prefill projections | prefill 2000 rows 70 -> 48 ms (single request); packed/cached serve 16 ms | in |
 | `PLOW_FUSE_KV_HNR=1` | 604 -> 580 decode insts; step within noise | not adopted |
-| `gemv_k8` for hd <= 512 (K-split tensor-core GEMV, 2..32 rows) | B=2/8/16/32 6.83/7.40/8.50/10.22 -> 6.25/6.83/7.96/9.65 ms; B=1 +0.06 ms | measured; the manifest gate (hd <= 128) is shared with other hd256/512 models, so not changed |
+| `gemv_k8` for hd <= 512 (K-split tensor-core GEMV, 1..32 rows; manifest gate: E-series packets, i.e. `GluStrided` present) | B=1/2/8/16/32 6.93/6.82/7.40/8.50/10.22 -> 6.22/6.25/6.83/7.96/9.65 ms (B=1 via `PLOW_NV_GEMV_K8_MIN=1`) | in |
+| `PLOW_NV_FA_RG_WIDE` (hd256/512 flash decode on the row-group body: a warp per row, K and V of 4 rows in flight; E-series gate) | B=1/8/32/64/128 6.22/6.83/9.61/12.63/17.75 -> 6.15/6.63/9.05/11.98/16.42 ms; B=64 sliding 52 -> 40 us/layer, full 153 -> 110 | in |
 | `gemv_k8` + 64 KiB L2 prefetch | B=1 +0.25 ms, B>=64 +0.2 ms | rejected |
 | wide GEMV `_gw` (B >= 48) | already selected by the manifest (`gemv_wide`); B=48 -> 64 costs +0.4 ms only | unchanged |
 
@@ -245,9 +246,5 @@ ASR and TTS, lower `max_ctx` (4096 halves the KV) before moving the table.
   * use the device sampler for temperature > 0 rows (they still download the row).
 * **Prompt logprobs** (`echo`, `prompt_logprobs`) are refused. The full raw logits row is not
   exposed over HTTP (the top 20 logits only).
-* **Sub-block prefix tails** publish on second sighting, so a new call's turn 2 misses its own
-  turn 1 tail.
-* **`gemv_k8` for hd256/512 packets** is an 8% step win at B=2..32. It needs a gate that does not
-  change the other Gemma-4 recipes unmeasured.
 * **Unused segment objects.** The segment script's pfseg/pfgemm objects fault on this packet
   (`CUDA_ERROR_LAUNCH_FAILED`). Only the flash objects are used.

@@ -719,6 +719,9 @@ impl GpuEngine {
             tracing::info!(slot = b, p_a, "vmm_publish skipped: p_a == 0");
             return;
         }
+        if self.session_pin[b].is_some() {
+            v.kv.note_session(b, toks);
+        }
         let step = crate::config::RuntimeConfig::get()
             .amd_prefix_fine_rows()
             .map_or(v.kv.block_rows(), |step| step.max(32));

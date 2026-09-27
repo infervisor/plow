@@ -1299,6 +1299,20 @@ impl VmmKv {
         self.shared_publish = true;
     }
 
+    /// `seq` holds a session (`X-Session-Id`): its next turn extends these tokens, so its
+    /// tailed boundaries publish on the first sighting ([`Self::enable_shared_publish`]).
+    pub fn note_session(&self, seq: usize, tokens: &[u32]) {
+        if !self.shared_publish || tokens.len() < LEAD_ROWS {
+            return;
+        }
+        let mut inner = self.shared.inner.lock();
+        note_lead(&mut inner, seq, tokens);
+        if let Some(key) = inner.lead[seq] {
+            let seen = inner.lead_seen.entry(key).or_insert(0);
+            *seen = (*seen).max(2);
+        }
+    }
+
     /// The request in `seq` finished: queue its [`Job::CopyOut`] ([`Self::enable_release_retire`]).
     pub fn retire_released(&self, seq: usize) {
         if !self.release_retire {
@@ -4379,6 +4393,23 @@ mod tests {
         p.ensure_rows(0, 32).unwrap();
         p.publish_at(0, &other, 20, 4, |_| panic!("unseen lead must not snapshot")).unwrap();
         assert_eq!(p.stats().publishes_skipped, 2);
+    }
+
+    /// A session's tailed boundary publishes on its first sighting: its next turn extends it.
+    #[test]
+    fn session_publishes_its_tail_on_the_first_sighting() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        p.enable_shared_publish();
+        let pr = prompt(32);
+        assert!(p.try_attach(0, &pr).unwrap().is_none());
+        p.ensure_rows(0, 32).unwrap();
+        p.note_session(0, &pr);
+        p.publish_at(0, &pr, 20, 4, |_| Ok(())).unwrap();
+        assert_eq!(p.stats().publishes_skipped, 0);
+        p.begin_seq(0);
+        p.ensure_rows(1, 1).unwrap();
+        assert_eq!(p.try_attach(1, &pr).unwrap().expect("session tail published").rows, 20);
     }
 
     /// A whole-block boundary has no tail: it is what the second request sharing a prefix
