@@ -80,7 +80,7 @@ async fn request_opts(
     let (mut ids, mut text, mut fin) = (Vec::new(), String::new(), None);
     while let Some(chunk) = rx.recv().await {
         match chunk {
-            StreamChunk::Token { id, text: delta } => {
+            StreamChunk::Token { id, text: delta, .. } => {
                 ids.push(id);
                 text.push_str(&delta);
             }
