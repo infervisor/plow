@@ -1626,7 +1626,10 @@ pub enum DevOp {
     /// projection's raw output) t4=residual(in,[T,n,hidden]bf16) t5=hc_scale(in,[3]f32)
     /// t6=hc_base(in,[n3]f32) t7=pre_pair(in/out,[2,T,n]f32, TENSOR_NONE when
     /// pre_mode=0)` · `i0=T i1=n i2=hidden i3=sinkhorn_repeat i4=pre_in_half
-    /// i5=pre_mode` · `f0=rms_eps f1=hc_eps`.
+    /// i5=pre_mode i6=mix_parts` · `f0=rms_eps f1=hc_eps`.
+    ///
+    /// `i6 > 1` (NVIDIA decode): `t3` is [`DevOp::GemvF32`]'s `i4=1` output, `i6` K-slice
+    /// partials `[i6][T,n3]`, summed here in slice order.
     HyperConnPre = 128,
     /// GLM5-Next's hyper-connections (mHC) post-block — the companion to
     /// [`DevOp::HyperConnPre`], ported the same way from `mhc_post_torch`.
@@ -1824,6 +1827,9 @@ pub enum DevOp {
     ///
     /// `t3`/`i3` (NVIDIA): split K `i3` ways; `t3` holds u32 row-block counters (zero at load, reset
     /// after use) padded to 256 B, then `i3` f32 partials `[M][N]`, summed in split order.
+    ///
+    /// `i4=1` (NVIDIA decode, `M <= 8`): no `t3`; `C` is `[i3][M][N]`, CTA `s` writing K slice
+    /// `s`'s partial, left for the consumer to sum ([`DevOp::HyperConnPre`] `i6`).
     GemvF32 = 135,
     /// Packed causal convolution plus SiLU. BF16 x/out[B,C], weight[C,W], and mutable history[B,C,W-1] (oldest first); optional I32 active[B] masks writes.
     ///
