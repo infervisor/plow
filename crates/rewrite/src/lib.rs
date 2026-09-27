@@ -122,6 +122,17 @@ pub fn fused_sites_for_config(config_json: &str) -> Result<FusedSites, SitesErro
     Ok(fused.sites())
 }
 
+/// [`fused_sites_for_config`] for a standalone audio network export (`model_type` `snac`,
+/// `chatterbox_s3gen`): the fused sites of its whole graph, which `devgen::codec` /
+/// `devgen::s3gen` lower. Symbolic lengths stay unbound: no rule reads a shape.
+pub fn fused_sites_for_codec_config(config_json: &str) -> Result<FusedSites, SitesError> {
+    let graph = nn_graph::models::build_from_config_json(config_json)
+        .map_err(|e| SitesError::Unavailable(e.to_string()))?;
+    let (fused, _) =
+        rewrite_graph_outputs(&graph).map_err(|e| SitesError::Rewrite(e.to_string()))?;
+    Ok(fused.sites())
+}
+
 /// Saturate the fusion rules over `g` and report per-fused-op e-graph match
 /// counts WITHOUT extracting a term. For analysis-only callers (the devblob
 /// path's fusion report): extraction can trip an upstream egglog-2.0.0 panic

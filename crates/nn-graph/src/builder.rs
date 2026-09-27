@@ -633,6 +633,83 @@ impl Nn {
         self.emit(Op::Conv1dDepthwise { kernel }, vec![x, w])
     }
 
+    /// Channels-last 1-D convolution of `[B, T, in_c]` with checkpoint tensors named exactly
+    /// `weight` (`[out_c, in_c / groups, kernel]`) and `bias`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d(
+        &mut self,
+        weight: &str,
+        bias: Option<&str>,
+        x: TensorId,
+        in_c: i64,
+        out_c: i64,
+        kernel: i64,
+        op: Op,
+    ) -> TensorId {
+        let (w_dims, b_len) = match op {
+            Op::Conv1d { groups, .. } => ([out_c, in_c / i64::from(groups.max(1)), kernel], out_c),
+            Op::ConvTranspose1d { groups, .. } => {
+                ([in_c, out_c / i64::from(groups.max(1)), kernel], out_c)
+            }
+            _ => panic!("conv1d builder takes Op::Conv1d or Op::ConvTranspose1d"),
+        };
+        let w = self.param(weight, w_dims.map(Dim::stat));
+        let mut inputs = vec![x, w];
+        if let Some(bias) = bias {
+            inputs.push(self.param(bias, [Dim::stat(b_len)]));
+        }
+        self.emit(op, inputs)
+    }
+
+    /// `y = x · Wᵀ (+ b)` with checkpoint tensors named exactly `weight` (`[out, in]`) and `bias`.
+    pub fn linear_named(
+        &mut self,
+        weight: &str,
+        bias: Option<&str>,
+        x: TensorId,
+        in_f: i64,
+        out_f: i64,
+    ) -> TensorId {
+        let w = self.param(weight, [Dim::stat(out_f), Dim::stat(in_f)]);
+        let mut inputs = vec![x, w];
+        if let Some(bias) = bias {
+            inputs.push(self.param(bias, [Dim::stat(out_f)]));
+        }
+        self.emit(
+            Op::Linear {
+                out_features: out_f,
+                bias: bias.is_some(),
+            },
+            inputs,
+        )
+    }
+
+    /// LayerNorm with checkpoint tensors named exactly `weight` and `bias`.
+    pub fn layernorm_named(
+        &mut self,
+        weight: &str,
+        bias: &str,
+        x: TensorId,
+        hidden: i64,
+        eps: f32,
+    ) -> TensorId {
+        let w = self.param(weight, [Dim::stat(hidden)]);
+        let b = self.param(bias, [Dim::stat(hidden)]);
+        self.emit(Op::LayerNorm { eps }, vec![x, w, b])
+    }
+
+    /// Embedding lookup in a checkpoint table named exactly `table` (`[vocab, hidden]`).
+    pub fn embedding_named(&mut self, table: &str, ids: TensorId, vocab: i64, hidden: i64) -> TensorId {
+        let t = self.param(table, [Dim::stat(vocab), Dim::stat(hidden)]);
+        self.emit(Op::Embedding, vec![ids, t])
+    }
+
+    /// Snake activation over the last axis with a per-channel `alpha` named exactly `alpha`.
+    pub fn snake(&mut self, alpha: &str, x: TensorId, channels: i64) -> TensorId {
+        let a = self.param(alpha, [Dim::stat(channels)]);
+        self.emit(Op::Act(ActKind::Snake), vec![x, a])
+    }
+
     /// Linear attention with a carried recurrent state.
     ///
     /// `beta` is `[B, S, heads]` — one write-strength scalar per token and head.

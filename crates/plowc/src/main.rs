@@ -979,6 +979,30 @@ fn rewrite_sites(
     resolve_rewrite_sites(sites, explicit)
 }
 
+/// [`rewrite_sites`] for an audio network export directory (`PLOW_TTS_CODEC_DIR`,
+/// `PLOW_TTS_VOCODER_DIR`), or `None` without one.
+fn audio_rewrite_sites(
+    dir: Option<&std::path::Path>,
+    explicit: bool,
+) -> Result<Option<devgen::RewriteSites>, String> {
+    let Some(dir) = dir else { return Ok(None) };
+    let sites = std::fs::read_to_string(dir.join("config.json"))
+        .map_err(|e| rewrite::SitesError::Unavailable(format!("{}: {e}", dir.display())))
+        .and_then(|json| rewrite::fused_sites_for_codec_config(&json));
+    match sites {
+        Ok(sites) => {
+            info!(
+                network = %dir.display(),
+                kinds = sites.len(),
+                sites = sites.values().map(|w| w.len()).sum::<usize>(),
+                "PLOW_EMIT_REWRITE: devgen lowers the audio network's extracted fused graph"
+            );
+            Ok(Some(sites))
+        }
+        Err(e) => resolve_rewrite_sites(Err(e), explicit),
+    }
+}
+
 /// A default-on knob cannot refuse an emit: a missing rewrite falls back to the hand fusions
 /// unless `PLOW_EMIT_REWRITE=1` was set explicitly.
 fn resolve_rewrite_sites(
@@ -1709,6 +1733,12 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if cli.emit_cfg.emit_rewrite {
         let explicit = devgen::emit_config::explicitly_set("emit_rewrite");
         whole_graph_fusions.rewrite_sites = rewrite_sites(&dir, explicit)?;
+        // The audio networks emitted beside the LM (`codec.pkt`, `s3gen.pkt`) lower their own
+        // exports' graphs the same way.
+        whole_graph_fusions.codec_sites =
+            audio_rewrite_sites(cli.emit_cfg.tts_codec.as_deref(), explicit)?;
+        whole_graph_fusions.vocoder_sites =
+            audio_rewrite_sites(cli.emit_cfg.tts_vocoder.as_deref(), explicit)?;
     }
 
     // The Lean gates on the devblob path. BOTH ARE ON BY DEFAULT (disable with

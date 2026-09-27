@@ -131,6 +131,15 @@ pub(crate) fn is_fused(op: &str) -> bool {
             | "FusedPackedAttnGate"
             | "FusedMaterializedResidualBlock"
             | "FusedMaterializedResidual3Block"
+            | "FusedActConv1d"
+            | "FusedParamActConv1d"
+            | "FusedConv1dAct"
+            | "FusedConv1dResidual"
+            | "FusedActConv1dResidual"
+            | "FusedParamActConv1dResidual"
+            | "FusedParamActConv1dAct"
+            | "FusedLinearBiasResidual"
+            | "FusedLayerNormLinearBiasAct"
     )
 }
 

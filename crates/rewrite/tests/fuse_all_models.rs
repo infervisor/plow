@@ -315,10 +315,10 @@ fn fuse_siglip() {
         fused.contains("FusedLayerNormLinearBias") || fused.contains("FusedResidualLayerNorm"),
         "norm→linear or residual+norm fusion did not fire in SigLIP"
     );
-    // Linear+Act fusion fires on the MLP up-projection (GeluTanh).
+    // Linear+Act fusion fires on the MLP up-projection (GeluTanh), with its pre-norm.
     assert!(
-        fused.contains("FusedLinearBiasAct"),
-        "linear+act fusion did not fire in SigLIP MLP"
+        fused.contains("FusedLayerNormLinearBiasAct"),
+        "layernorm+linear+act fusion did not fire in SigLIP MLP"
     );
     // The bias-preserving fusion drops NO weight (norm bias + linear bias kept).
     assert_eq!(

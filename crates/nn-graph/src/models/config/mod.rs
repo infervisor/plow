@@ -19,7 +19,9 @@ mod qwen3_5;
 mod qwen_image_dit;
 mod qwen_image_vae;
 mod qwen_vl;
+mod s3gen;
 mod siglip;
+mod snac;
 
 pub use deepseek::DeepSeekConfig;
 pub use deepseek_v4::{
@@ -36,7 +38,9 @@ pub use qwen3_5::Qwen35Config;
 pub use qwen_image_dit::QwenImageDitConfig;
 pub use qwen_image_vae::QwenImageVaeConfig;
 pub use qwen_vl::QwenVlVisionConfig;
+pub use s3gen::S3GenConfig;
 pub use siglip::SiglipConfig;
+pub use snac::{SnacBlock, SnacConfig};
 
 use crate::DType;
 
@@ -76,6 +80,11 @@ pub enum ModelConfig {
     QwenVl(QwenVlVisionConfig),
     QwenImageDit(QwenImageDitConfig),
     QwenImageVae(QwenImageVaeConfig),
+    /// SNAC audio-codec decoder (`scripts/tts/snac_export.py`).
+    Snac(SnacConfig),
+    /// Chatterbox S3Gen: token encoder, CFM estimator and HiFT vocoder
+    /// (`scripts/tts/s3gen_export.py`).
+    S3Gen(S3GenConfig),
 }
 
 impl ModelConfig {
@@ -208,6 +217,8 @@ impl ModelConfig {
                 "{mt} (Nemotron Mamba-2 hybrid is not implemented in the nn-graph packet path; \
                  the devblob backend currently supports only explicit single-block emission)"
             ))),
+            "snac" => Ok(ModelConfig::Snac(serde_json::from_value(v)?)),
+            "chatterbox_s3gen" => Ok(ModelConfig::S3Gen(serde_json::from_value(v)?)),
             "siglip" | "siglip_vision_model" => {
                 let sub = sub_config(&v, "vision_config");
                 Ok(ModelConfig::Siglip(serde_json::from_value(sub)?))

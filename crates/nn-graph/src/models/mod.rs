@@ -21,7 +21,9 @@ mod qwen3_5;
 mod qwen_image_dit;
 mod qwen_image_vae;
 mod qwen_vl;
+mod s3gen;
 mod siglip;
+mod snac;
 
 pub use config::{ConfigError, ModelConfig};
 
@@ -88,6 +90,8 @@ pub fn build_graph(cfg: &ModelConfig, bucket: &ShapeBucket) -> Result<Graph, Bui
         ModelConfig::QwenVl(c) => qwen_vl::build(c),
         ModelConfig::QwenImageDit(c) => qwen_image_dit::build(c, bucket),
         ModelConfig::QwenImageVae(c) => qwen_image_vae::build(c, bucket),
+        ModelConfig::Snac(c) => snac::build(c),
+        ModelConfig::S3Gen(c) => s3gen::build(c),
     };
     infer_shapes(&mut graph)?;
     Ok(graph)
@@ -114,6 +118,8 @@ pub fn build_encoder_graph(cfg: &ModelConfig, taps: &[u32]) -> Result<Graph, Bui
                 ModelConfig::QwenVl(_) => "qwen_vl",
                 ModelConfig::QwenImageDit(_) => "qwen_image_dit",
                 ModelConfig::QwenImageVae(_) => "qwen_image_vae",
+                ModelConfig::Snac(_) => "snac",
+                ModelConfig::S3Gen(_) => "chatterbox_s3gen",
                 ModelConfig::Qwen35(_) => "qwen3_5",
                 ModelConfig::Llama(_) | ModelConfig::Qwen3(_) => unreachable!(),
             }))

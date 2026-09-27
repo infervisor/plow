@@ -128,6 +128,17 @@ impl Ctx<'_> {
             }
 
             // Shape-preserving unary ops.
+            Op::Act(crate::op::ActKind::Snake) => {
+                self.expect_arity(inputs, 2)?;
+                let x = self.input_shape(inputs, 0)?;
+                let alpha = self.input_shape(inputs, 1)?;
+                let c = x.dims().last().ok_or_else(|| self.err("snake input must have rank >= 1"))?;
+                if alpha.rank() != 1 || alpha.dim(0).provably_ne(c) {
+                    return Err(self.err(format!("snake alpha must be [{c}], got {alpha:?}")));
+                }
+                Ok(x)
+            }
+
             Op::Act(_) | Op::Scale(_) | Op::Softmax { .. } => {
                 self.expect_arity(inputs, 1)?;
                 self.input_shape(inputs, 0)
@@ -463,6 +474,42 @@ impl Ctx<'_> {
                 Ok(x)
             }
 
+            Op::Conv1d {
+                stride,
+                dilation,
+                groups,
+                padding,
+                ..
+            } => {
+                let (x, k, out_c) = self.conv1d_operands(inputs, 1, *groups)?;
+                let span = i64::from(*dilation) * (k - 1) + 1;
+                let padded = x
+                    .dim(1)
+                    .add(&Dim::stat(i64::from(padding.0) + i64::from(padding.1) - span));
+                let out_t = padded
+                    .div_static(i64::from(*stride))
+                    .ok_or_else(|| {
+                        self.err(format!("stride {stride} does not divide the padded length {padded}"))
+                    })?
+                    .add(&Dim::stat(1));
+                Ok(Shape::new([x.dim(0).clone(), out_t, out_c]))
+            }
+
+            Op::ConvTranspose1d {
+                stride,
+                groups,
+                crop,
+                output_padding,
+            } => {
+                let (x, k, out_c) = self.conv1d_operands(inputs, 0, *groups)?;
+                let out_t = x.dim(1).sub(&Dim::stat(1)).mul(&Dim::stat(i64::from(*stride))).add(
+                    &Dim::stat(
+                        k + i64::from(*output_padding) - i64::from(crop.0) - i64::from(crop.1),
+                    ),
+                );
+                Ok(Shape::new([x.dim(0).clone(), out_t, out_c]))
+            }
+
             Op::LinearAttention {
                 kind,
                 num_heads,
@@ -610,6 +657,44 @@ impl Ctx<'_> {
                 Ok(prefix)
             }
         }
+    }
+
+    /// `(x, kernel, out_channels)` of a channels-last conv. `in_axis` is the weight axis holding
+    /// the per-group input channels (1 for Conv1d, 0 holding all of them for ConvTranspose1d).
+    fn conv1d_operands(
+        &self,
+        inputs: &[TensorId],
+        in_axis: usize,
+        groups: u32,
+    ) -> Result<(Shape, i64, Dim), InferError> {
+        self.expect_arity_range(inputs, 2, 3)?;
+        let x = self.input_shape(inputs, 0)?;
+        let w = self.input_shape(inputs, 1)?;
+        if x.rank() != 3 || w.rank() != 3 {
+            return Err(self.err("conv1d expects [B, T, C] input and a rank-3 weight"));
+        }
+        let g = i64::from(groups.max(1));
+        let c = req_static(self, x.dim(2), "input channels")?;
+        let w_in = req_static(self, w.dim(in_axis), "weight input channels")?;
+        let per_group = if in_axis == 1 { w_in * g } else { w_in };
+        if c != per_group || c % g != 0 {
+            return Err(self.err(format!(
+                "conv1d channel mismatch: input {c}, weight {w_in} at groups {g}"
+            )));
+        }
+        let k = req_static(self, w.dim(2), "kernel")?;
+        let out_c = if in_axis == 1 {
+            w.dim(0).clone()
+        } else {
+            Dim::stat(req_static(self, w.dim(1), "weight output channels")? * g)
+        };
+        if let Some(&b) = inputs.get(2) {
+            let bias = self.graph.tensor(b).shape.clone();
+            if bias.is_some_and(|b| b.rank() != 1 || b.dim(0).provably_ne(&out_c)) {
+                return Err(self.err(format!("conv1d bias must be [{out_c}]")));
+            }
+        }
+        Ok((x, k, out_c))
     }
 
     fn expect_arity_range(

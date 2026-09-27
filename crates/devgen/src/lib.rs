@@ -7121,6 +7121,11 @@ pub struct WholeGraphFusionDecisions {
     /// `PLOW_EMIT_REWRITE`: the egglog rewrite's fused sites over the complete graph. Ignored
     /// with the knob off.
     pub rewrite_sites: Option<RewriteSites>,
+    /// `PLOW_EMIT_REWRITE` for `codec.pkt` (`PLOW_TTS_CODEC_DIR`): the fused sites of the codec
+    /// export's own graph. `None` keeps `codec`'s hand fusions.
+    pub codec_sites: Option<RewriteSites>,
+    /// The same for `s3gen.pkt` (`PLOW_TTS_VOCODER_DIR`).
+    pub vocoder_sites: Option<RewriteSites>,
 }
 
 /// Fused kind → the checkpoint weight names anchoring its instances (`rewrite::FusedSites`).
@@ -7144,6 +7149,17 @@ static WHOLE_GRAPH_FUSIONS: std::sync::atomic::AtomicPtr<WholeGraphFusionDecisio
 fn install_whole_graph_fusions(decisions: WholeGraphFusionDecisions) {
     let ptr = Box::into_raw(Box::new(decisions));
     WHOLE_GRAPH_FUSIONS.store(ptr, std::sync::atomic::Ordering::Release);
+}
+
+/// `(codec, vocoder)` fused sites of [`WholeGraphFusionDecisions`], once installed.
+fn whole_graph_audio_sites() -> (Option<&'static RewriteSites>, Option<&'static RewriteSites>) {
+    let ptr = WHOLE_GRAPH_FUSIONS.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return (None, None);
+    }
+    // SAFETY: as `whole_graph_parallel_linear2`: installed once per compile, never freed.
+    let decisions: &'static WholeGraphFusionDecisions = unsafe { &*ptr };
+    (decisions.codec_sites.as_ref(), decisions.vocoder_sites.as_ref())
 }
 
 pub(crate) fn whole_graph_parallel_linear2(n0: u32, n1_local: u32, k: u32) -> bool {
@@ -10258,13 +10274,15 @@ fn emit_dense_gqa(
     });
     std::fs::write(&out, blob).unwrap();
     if let Some(dir) = ecfg.tts_codec.as_deref().filter(|_| !block_mode) {
-        let blob = codec::lower_snac(dir, n_cu, m.target).unwrap_or_else(|error| panic!("codec packet: {error}"));
+        let sites = whole_graph_audio_sites().0;
+        let blob = codec::lower_snac(dir, n_cu, m.target, sites).unwrap_or_else(|error| panic!("codec packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name("codec.pkt");
         std::fs::write(&path, blob).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         eprintln!("  codec packet -> {}", path.display());
     }
     if let Some(dir) = ecfg.tts_vocoder.as_deref().filter(|_| !block_mode) {
-        let blob = s3gen::lower_s3gen(dir, n_cu, m.target).unwrap_or_else(|error| panic!("s3gen packet: {error}"));
+        let sites = whole_graph_audio_sites().1;
+        let blob = s3gen::lower_s3gen(dir, n_cu, m.target, sites).unwrap_or_else(|error| panic!("s3gen packet: {error}"));
         let path = std::path::Path::new(&out).with_file_name(s3gen::PACKET);
         std::fs::write(&path, blob).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         eprintln!("  s3gen packet -> {}", path.display());

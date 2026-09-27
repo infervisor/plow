@@ -2,7 +2,7 @@
 //! leaves inlined as `(Input "name")` / `(Weight "name")`. Returns the body and
 //! the root variable to extract.
 
-use nn_graph::op::{ActKind, EwKind, ReduceKind};
+use nn_graph::op::{ActKind, EwKind, PadMode, ReduceKind};
 use nn_graph::{Graph, Op, Origin, TensorId};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -153,7 +153,8 @@ fn term_for(
             format!("(Attention {} {} {} {})", e(0)?, e(1)?, e(2)?, quote(&cfg))
         }
         Op::Elementwise(k) => format!("(Ew {} {} {})", quote(ew(*k)), e(0)?, e(1)?),
-        Op::Act(k) => format!("(Act {} {})", quote(act(*k)), e(0)?),
+        Op::Act(ActKind::Snake) => format!("(ActP {} {} {})", quote(&act(ActKind::Snake)), e(0)?, e(1)?),
+        Op::Act(k) => format!("(Act {} {})", quote(&act(*k)), e(0)?),
         Op::Softmax { axis } => format!("(Softmax {} {})", e(0)?, axis),
         Op::Concat { axis } => {
             // n-ary concat → binary chain: (Concat axis a (Concat axis b c))
@@ -329,6 +330,37 @@ fn term_for(
                 "heads={num_heads};kv={num_kv_heads};hd={head_dim};topk={top_k}"
             ))
         ),
+        // Conv1d and ConvTranspose1d share one term: which one, and its geometry, ride in the
+        // config token, like `Attention`'s; no rule branches on them.
+        Op::Conv1d {
+            stride,
+            dilation,
+            groups,
+            padding,
+            pad_mode,
+        } => {
+            let mode = match pad_mode {
+                PadMode::Zero => "zero",
+                PadMode::Reflect => "reflect",
+            };
+            let cfg = format!(
+                "conv;s={stride};d={dilation};g={groups};pad={},{};mode={mode}",
+                padding.0, padding.1
+            );
+            conv1d(e(0)?, e(1)?, inputs.get(2).map(|_| e(2)).transpose()?, &cfg)
+        }
+        Op::ConvTranspose1d {
+            stride,
+            groups,
+            crop,
+            output_padding,
+        } => {
+            let cfg = format!(
+                "transpose;s={stride};g={groups};crop={},{};op={output_padding}",
+                crop.0, crop.1
+            );
+            conv1d(e(0)?, e(1)?, inputs.get(2).map(|_| e(2)).transpose()?, &cfg)
+        }
         // --- Kimi-K3 ---
         Op::Conv1dDepthwise { kernel } => {
             format!("(Conv1dDepthwise {} {} {})", e(0)?, e(1)?, kernel)
@@ -395,16 +427,31 @@ fn ew(k: EwKind) -> &'static str {
     }
 }
 
-fn act(k: ActKind) -> &'static str {
+fn act(k: ActKind) -> String {
     match k {
-        ActKind::Silu => "silu",
-        ActKind::Gelu => "gelu",
-        ActKind::GeluTanh => "gelu_tanh",
-        ActKind::Tanh => "tanh",
-        ActKind::Relu => "relu",
-        ActKind::Sigmoid => "sigmoid",
-        ActKind::QuickGelu => "quick_gelu",
+        ActKind::Silu => "silu".into(),
+        ActKind::Gelu => "gelu".into(),
+        ActKind::GeluTanh => "gelu_tanh".into(),
+        ActKind::Tanh => "tanh".into(),
+        ActKind::Relu => "relu".into(),
+        ActKind::Sigmoid => "sigmoid".into(),
+        ActKind::QuickGelu => "quick_gelu".into(),
+        ActKind::Mish => "mish".into(),
+        ActKind::Elu => "elu".into(),
+        // The slope is part of the function: two slopes must not hash-cons together.
+        ActKind::LeakyRelu(slope) => format!("leaky_relu:{}", f64lit(slope)),
+        ActKind::Abs => "abs".into(),
+        ActKind::Snake => "snake".into(),
     }
+}
+
+/// A missing bias is the `(NoBias)` leaf, so one term (and one rule) covers both forms.
+fn conv1d(x: String, w: String, bias: Option<String>, cfg: &str) -> String {
+    format!(
+        "(Conv1d {x} {w} {} {})",
+        bias.unwrap_or_else(|| "(NoBias)".into()),
+        quote(cfg)
+    )
 }
 
 fn reduce(k: ReduceKind) -> &'static str {

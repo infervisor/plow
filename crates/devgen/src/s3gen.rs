@@ -14,6 +14,10 @@
 //! `[item*heads][t][t]` is `(q + u)·P[t - j] / 8 + (v - u)·P[t - j] / 8` (a grouped 1x1
 //! convolution against the capacity's projected position table, then a diagonal copy), plus a
 //! per-item key mask.
+//!
+//! Fusions (each convolution's and linear's input activation, output activation and residual)
+//! come from the rewrite's fused sites over the S3Gen graph (`nn_graph` `chatterbox_s3gen`),
+//! subject to [`ConvFusions`]' cost model; without sites they are the hand choices below.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -22,6 +26,8 @@ use crate::pipeline::{
     Emitted, GatherRowsF32Stage, LayerNormRowsF32Stage, PacketPrefix, PadMode, RandCoord, RandF32Stage,
     StageProgram, TensorRef, UnaryF32Stage,
 };
+use crate::rewrite_lower::{ActAt, ConvFusions};
+use crate::RewriteSites;
 
 pub const PIPELINE: &str = "vocoder.synth";
 pub const PACKET: &str = "s3gen.pkt";
@@ -147,8 +153,9 @@ fn length_scales(cfg: &Config) -> [(u32, u32); 7] {
     [(1, p), (2, 2 * p), (2, 0), (2 * u0, 0), (2 * u0 * u1, 0), (2 * u0 * u1 * u2, 1), (2 * cfg.frame_samples(), 0)]
 }
 
-/// `s3gen.pkt` for the S3Gen export in `dir` (scripts/tts/s3gen_export.py).
-pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32) -> Result<Vec<u8>, String> {
+/// `s3gen.pkt` for the S3Gen export in `dir` (scripts/tts/s3gen_export.py), with the rewrite's
+/// fused sites of that export's graph when plowc extracted them.
+pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<&RewriteSites>) -> Result<Vec<u8>, String> {
     let cfg = Config::parse(
         &serde_json::from_slice(&std::fs::read(dir.join("config.json")).map_err(|e| format!("{}: {e}", dir.display()))?)
             .map_err(|e| format!("s3gen config: {e}"))?,
@@ -195,7 +202,7 @@ pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32) -> Result<Vec<
                        body: &dyn Fn(&mut Ops) -> Result<(), String>|
          -> Result<PacketPrefix, String> {
             let program = prefix.model.progs.len() as u32;
-            let mut ops = Ops::new(prefix.program(), std::mem::take(names));
+            let mut ops = Ops::new(prefix.program(), std::mem::take(names), ConvFusions(sites));
             body(&mut ops)?;
             let (prefix, n) = ops.finish(batch * tokens);
             *names = n;
@@ -237,16 +244,17 @@ struct Inputs {
 
 /// A [`StageProgram`] with read/write hazard tracking: every op depends on the last writer of
 /// each tensor it reads and on the last writer and every later reader of the tensor it writes.
-struct Ops {
+struct Ops<'s> {
     p: StageProgram,
     names: HashMap<String, u32>,
     writer: HashMap<u32, u32>,
     readers: HashMap<u32, Vec<u32>>,
+    fuse: ConvFusions<'s>,
 }
 
-impl Ops {
-    fn new(p: StageProgram, names: HashMap<String, u32>) -> Self {
-        Self { p, names, writer: HashMap::new(), readers: HashMap::new() }
+impl<'s> Ops<'s> {
+    fn new(p: StageProgram, names: HashMap<String, u32>, fuse: ConvFusions<'s>) -> Self {
+        Self { p, names, writer: HashMap::new(), readers: HashMap::new(), fuse }
     }
 
     fn finish(self, tag: u32) -> (PacketPrefix, HashMap<String, u32>) {
@@ -281,7 +289,57 @@ impl Ops {
         self.names.iter().find(|(_, &v)| v == h).map(|(k, _)| k.clone()).expect("tensor declared by name")
     }
 
+    /// `c` with the fusions [`Self::fuse`] decides; an unfused piece runs as its own `UnaryF32` /
+    /// `BinaryF32` pass (an input activation in place when `c.input_is_temp`, else into
+    /// `act.s3gen.pre`).
     fn conv(&mut self, x: u32, out: &str, c: Conv<'_>) -> Result<u32, String> {
+        let weight = format!("w.{}.w", c.w);
+        let act_in = c.act_in != Activation::None;
+        let fuse_in = act_in && self.fuse.input_act(&weight, c.k, true);
+        let fuse_out = c.act_out != Activation::None && self.fuse.output_act(&weight, true);
+        let fuse_res = c.residual.is_some() && self.fuse.residual(&weight, true);
+        let mut raw = c;
+        let mut x = x;
+        if act_in && !fuse_in {
+            let (rows, param) = (c.batch * c.rows, c.alpha.map(|a| format!("w.{a}")));
+            let target = if c.input_is_temp { self.name_of(x) } else { "act.s3gen.pre".to_string() };
+            x = self.op(&[x], &target, |p, output, deps| {
+                p.unary_f32(x, deps, UnaryF32Stage {
+                    output,
+                    param: param.as_deref().map(TensorRef::Named),
+                    rows,
+                    width: c.cin,
+                    stride: 0,
+                    col0: 0,
+                    kind: c.act_in,
+                    p0: c.slope,
+                    p1: 0.0,
+                })
+            })?;
+            (raw.act_in, raw.alpha) = (Activation::None, None);
+        }
+        if !fuse_out {
+            raw.act_out = Activation::None;
+        }
+        if !fuse_res {
+            raw.residual = None;
+        }
+        let y = self.conv_op(x, out, raw)?;
+        let out_rows = if c.transpose {
+            (c.rows - 1) * c.stride + c.k + c.dil - c.pad.0 - c.pad.1
+        } else {
+            (c.rows + c.pad.0 + c.pad.1 - c.dil * (c.k - 1) - 1) / c.stride + 1
+        };
+        if c.act_out != Activation::None && !fuse_out {
+            self.unary(y, c.batch * out_rows, c.cout, 0, 0, c.act_out, c.slope, 0.0)?;
+        }
+        if let Some(r) = c.residual.filter(|_| !fuse_res) {
+            self.binary(y, r, BinaryOp::Add, (1, c.batch * out_rows, c.cout), (0, c.cout, 1), None)?;
+        }
+        Ok(y)
+    }
+
+    fn conv_op(&mut self, x: u32, out: &str, c: Conv<'_>) -> Result<u32, String> {
         let mut reads = vec![x];
         reads.extend(c.residual);
         reads.extend(c.lengths);
@@ -466,6 +524,8 @@ struct Conv<'a> {
     lengths: Option<u32>,
     residual: Option<u32>,
     transpose: bool,
+    /// `x` is dead after this conv, so an unfused input activation may overwrite it.
+    input_is_temp: bool,
 }
 
 impl<'a> Conv<'a> {
@@ -491,6 +551,7 @@ impl<'a> Conv<'a> {
             lengths: None,
             residual: None,
             transpose: false,
+            input_is_temp: false,
         }
     }
 }
@@ -625,14 +686,22 @@ impl Lowering<'_> {
         let e0 = o.gather(Table::Weight("emb", cfg.vocab), Some(idx), "act.s3gen.e0", Gather { rows: b * t0, width: D_ENC, vocab: cfg.vocab, per_item: t0, repeat: 1, index_stride: t0, ..Default::default() })?;
         let e1 = o.linear(e0, "act.s3gen.e1", "enc.embed", b * t0, D_ENC, D_ENC, true, Activation::None, None)?;
         let e0 = o.layer_norm(e1, "act.s3gen.e0", "enc.embed.ln", b * t0, D_ENC, 1e-5)?;
+        // leaky(0.01) between the two pre-lookahead convs.
+        let leaky = o.fuse.between("w.enc.la1.w", "w.enc.la2.w", 3, ActAt::ProducerOutput);
         let mut c = Conv::new("enc.la1", b, t0, D_ENC, D_ENC, 4);
         c.pad = (0, 3);
-        c.act_out = Activation::LeakyRelu;
+        if leaky != ActAt::ConsumerInput {
+            c.act_out = Activation::LeakyRelu;
+        }
         c.slope = 0.01;
         c.lengths = Some(inp.lengths.tok);
         let e1 = o.conv(e0, "act.s3gen.e1", c)?;
         let mut c = Conv::new("enc.la2", b, t0, D_ENC, D_ENC, 3);
         c.pad = (2, 0);
+        if leaky == ActAt::ConsumerInput {
+            c.act_in = Activation::LeakyRelu;
+            c.slope = 0.01;
+        }
         c.residual = Some(e0);
         c.lengths = Some(inp.lengths.tok);
         let e2 = o.conv(e1, "act.s3gen.e2", c)?;
@@ -778,8 +847,9 @@ impl Lowering<'_> {
         h = causal("cfm.upc", h, o, out)?;
         let y = causal("cfm.fin", h, o, "act.s3gen.y1")?;
         o.layer_norm(y, "act.s3gen.y1", "cfm.fin.ln", r, D_CFM, 1e-5)?;
-        o.unary(y, r, D_CFM, 0, 0, Activation::Mish, 0.0, 0.0)?;
         let mut c = Conv::new("cfm.proj", b2, t1, D_CFM, MEL, 1);
+        c.act_in = Activation::Mish;
+        c.input_is_temp = true;
         c.lengths = Some(len2);
         let d = o.conv(y, "act.s3gen.d", c)?;
         let rows = b * t1;
@@ -837,13 +907,26 @@ impl Lowering<'_> {
         // F0 predictor.
         let mut v = mel;
         let mut cin = MEL;
+        let mut elu_in = false;
         for i in 0..F0_CONVS {
             let w = format!("hift.f0.c{i}");
+            // ELU after each conv; the last one's only candidate host is this conv.
+            let elu = if i + 1 < F0_CONVS {
+                o.fuse.between(&format!("w.{w}.w"), &format!("w.hift.f0.c{}.w", i + 1), 3, ActAt::ProducerOutput)
+            } else {
+                ActAt::ProducerOutput
+            };
             let mut c = Conv::new(&w, b, g, cin, 512, 3);
             c.pad = (1, 1);
-            c.act_out = Activation::Elu;
+            if elu_in {
+                c.act_in = Activation::Elu;
+            }
+            if elu != ActAt::ConsumerInput {
+                c.act_out = Activation::Elu;
+            }
             c.lengths = Some(lg);
             v = o.conv(v, if i % 2 == 0 { "act.s3gen.va" } else { "act.s3gen.vb" }, c)?;
+            elu_in = elu == ActAt::ConsumerInput;
             cin = 512;
         }
         let mut c = Conv::new("hift.f0.cls", b, g, 512, 1, 1);
@@ -899,8 +982,14 @@ impl Lowering<'_> {
         c.lengths = Some(lw);
         let stft = o.conv(src, "act.s3gen.stft", c)?;
         // Mel -> waveform.
+        // leaky(0.1) between the pre conv and the first upsampling.
+        let leaky0 = o.fuse.between("w.hift.pre.w", "w.hift.up0.w", cfg.upsample[0][1], ActAt::ConsumerInput);
         let mut c = Conv::new("hift.pre", b, g, MEL, 512, 7);
         c.pad = (3, 3);
+        if leaky0 != ActAt::ConsumerInput {
+            c.act_out = Activation::LeakyRelu;
+            c.slope = 0.1;
+        }
         c.lengths = Some(lg);
         let mut x = o.conv(mel, "act.s3gen.xa", c)?;
         let rows_in = [g, rows_out[0], rows_out[1]];
@@ -928,7 +1017,9 @@ impl Lowering<'_> {
             c.stride = u;
             c.dil = 0;
             c.pad = if last { (pad - 1, pad) } else { (pad, pad) };
-            c.act_in = Activation::LeakyRelu;
+            if i > 0 || leaky0 == ActAt::ConsumerInput {
+                c.act_in = Activation::LeakyRelu;
+            }
             c.slope = 0.1;
             c.lengths = Some(len_in[i]);
             c.residual = (!last).then_some(si);

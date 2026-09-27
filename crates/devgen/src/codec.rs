@@ -6,13 +6,19 @@
 //! convolution + tanh head. Every (batch, frames) capacity is one program; per-item valid lengths
 //! at each time resolution and per-item noise seeds make every item decode exactly as it would
 //! alone.
+//!
+//! Fusions (each convolution's input activation, output activation and residual) come from the
+//! rewrite's fused sites over the SNAC graph (`nn_graph` `snac`, `rewrite` conv1d rules), subject
+//! to [`ConvFusions`]' cost model; without sites they are the hand choices below.
 
 use std::collections::BTreeMap;
 
 use crate::pipeline::{
-    Activation, BinaryF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage, GatherRowsF32Stage,
-    PacketPrefix, PadMode, RandCoord, RandF32Stage, TensorRef, UnaryF32Stage,
+    Activation, BinaryF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage, Emitted, GatherRowsF32Stage,
+    PacketPrefix, PadMode, RandCoord, RandF32Stage, StageProgram, TensorRef, UnaryF32Stage,
 };
+use crate::rewrite_lower::ConvFusions;
+use crate::RewriteSites;
 
 pub const PIPELINE: &str = "codec.decode";
 
@@ -95,8 +101,9 @@ pub const SNAC_CAPACITIES: &[(u32, u32)] = &[
     (1, 128), (4, 128),
 ];
 
-/// `codec.pkt` for the exported SNAC decoder in `dir` (scripts/tts/snac_export.py).
-pub fn lower_snac(dir: &std::path::Path, n_cu: u32, target: u32) -> Result<Vec<u8>, String> {
+/// `codec.pkt` for the exported SNAC decoder in `dir` (scripts/tts/snac_export.py), with the
+/// rewrite's fused sites of that export's graph when plowc extracted them.
+pub fn lower_snac(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<&RewriteSites>) -> Result<Vec<u8>, String> {
     let cfg = SnacConfig::parse(
         &serde_json::from_slice(&std::fs::read(dir.join("config.json")).map_err(|e| format!("{}: {e}", dir.display()))?)
             .map_err(|e| format!("snac config: {e}"))?,
@@ -155,7 +162,7 @@ pub fn lower_snac(dir: &std::path::Path, n_cu: u32, target: u32) -> Result<Vec<u
     let mut roles = BTreeMap::new();
     for &(batch, frames) in SNAC_CAPACITIES {
         let program = prefix.model.progs.len();
-        prefix = snac_program(prefix, &cfg, batch, frames, codes, seed, &lengths, &per_level)?;
+        prefix = snac_program(prefix, &cfg, ConvFusions(sites), batch, frames, codes, seed, &lengths, &per_level)?;
         roles.insert(format!("decode.b{batch}.f{frames}"), program as u32);
     }
     let reader = crate::checkpoint::TensorReader::open(dir)?;
@@ -176,6 +183,7 @@ pub fn lower_snac(dir: &std::path::Path, n_cu: u32, target: u32) -> Result<Vec<u
 fn snac_program(
     prefix: PacketPrefix,
     cfg: &SnacConfig,
+    fuse: ConvFusions<'_>,
     batch: u32,
     frames: u32,
     codes: u32,
@@ -231,70 +239,52 @@ fn snac_program(
         })?;
         last = Some(e.done);
     }
-    let conv = |output: &'static str, weight: String, bias: Option<String>, alpha: Option<String>, in_rows: u32, cin: u32, cout: u32, kernel: u32, dilation: u32, groups: u32, pad: u32, len: u32, act_in: Activation, act_out: Activation, residual: Option<u32>| {
-        (output, weight, bias, alpha, in_rows, cin, cout, kernel, dilation, groups, pad, len, act_in, act_out, residual)
-    };
-    let run_conv = |p: &mut crate::pipeline::StageProgram, x: u32, dep: u32, spec: (&'static str, String, Option<String>, Option<String>, u32, u32, u32, u32, u32, u32, u32, u32, Activation, Activation, Option<u32>)| {
-        let (output, weight, bias, alpha, in_rows, cin, cout, kernel, dilation, groups, pad, len, act_in, act_out, residual) = spec;
-        p.conv1d_f32(x, false, &[dep], Conv1dF32Stage {
-            output: TensorRef::Named(output),
-            weight: TensorRef::Named(&weight),
-            bias: bias.as_deref().map(TensorRef::Named),
-            alpha: alpha.as_deref().map(TensorRef::Named),
-            residual,
-            lengths: Some(len),
-            batch,
-            in_rows,
-            in_channels: cin,
-            out_channels: cout,
-            kernel,
-            stride: 1,
-            dilation_or_output_padding: dilation,
-            groups,
-            pad_before: pad,
-            pad_after: pad,
-            pad_mode: PadMode::Zero,
-            input_activation: act_in,
-            output_activation: act_out,
-            slope: 0.0,
-            weight_f16: false,
-        })
+    let conv = |output: &'static str, weight: &str, bias: Option<String>, in_rows: u32, cin: u32, cout: u32, kernel: u32| Conv {
+        output,
+        weight: weight.to_string(),
+        bias,
+        alpha: None,
+        batch,
+        in_rows,
+        cin,
+        cout,
+        kernel,
+        stride: 1,
+        dilation: 1,
+        groups: 1,
+        pad: 0,
+        len: lengths[0],
+        act_in: Activation::None,
+        act_out: Activation::None,
+        residual: None,
+        transpose: false,
+        input_is_temp: false,
     };
     let z_h = p_handle(&p, "act.codec.a");
     let a_handle = z_h;
-    let e = run_conv(&mut p, z_h, last.unwrap(), conv("act.codec.b", "w.pre.dw.w".into(), Some("w.pre.dw.b".into()), None, t0, latent, latent, 7, 1, latent, 3, lengths[0], Activation::None, Activation::None, None))?;
+    let mut c = conv("act.codec.b", "w.pre.dw.w", Some("w.pre.dw.b".into()), t0, latent, latent, 7);
+    c.groups = latent;
+    c.pad = 3;
+    let e = fused_conv(&mut p, fuse, z_h, last.unwrap(), c)?;
     let pre_out = cfg.blocks.first().map_or(latent, |b| b.cin);
-    let mut x = run_conv(&mut p, e.output, e.done, conv("act.codec.a", "w.pre.pw.w".into(), Some("w.pre.pw.b".into()), None, t0, latent, pre_out, 1, 1, 1, 0, lengths[0], Activation::None, Activation::None, None))?;
+    let mut x = fused_conv(&mut p, fuse, e.output, e.done, conv("act.codec.a", "w.pre.pw.w", Some("w.pre.pw.b".into()), t0, latent, pre_out, 1))?;
     let mut rows = t0;
     for (i, b) in cfg.blocks.iter().enumerate() {
         // Transposed convolution (input snake), crop `padding` on both sides.
-        let up = p.conv1d_f32(x.output, true, &[x.done], Conv1dF32Stage {
-            output: TensorRef::Named("act.codec.b"),
-            weight: TensorRef::Named(&format!("w.blk{i}.up.w")),
-            bias: Some(TensorRef::Named(&format!("w.blk{i}.up.b"))),
-            alpha: Some(TensorRef::Named(&format!("w.blk{i}.snake"))),
-            residual: None,
-            lengths: Some(lengths[i]),
-            batch,
-            in_rows: rows,
-            in_channels: b.cin,
-            out_channels: b.cout,
-            kernel: b.kernel,
-            stride: b.stride,
-            dilation_or_output_padding: b.output_padding,
-            groups: 1,
-            pad_before: b.padding,
-            pad_after: b.padding,
-            pad_mode: PadMode::Zero,
-            input_activation: Activation::Snake,
-            output_activation: Activation::None,
-            slope: 0.0,
-            weight_f16: false,
-        })?;
+        let mut c = conv("act.codec.b", &format!("w.blk{i}.up.w"), Some(format!("w.blk{i}.up.b")), rows, b.cin, b.cout, b.kernel);
+        c.alpha = Some(format!("w.blk{i}.snake"));
+        c.act_in = Activation::Snake;
+        c.transpose = true;
+        c.stride = b.stride;
+        c.dilation = b.output_padding;
+        c.pad = b.padding;
+        c.len = lengths[i];
+        let up = fused_conv(&mut p, fuse, x.output, x.done, c)?;
         rows = (rows - 1) * b.stride + b.kernel + b.output_padding - 2 * b.padding;
         let len = lengths[i + 1];
         // Noise injection: x + n[b, t] * (x @ Wn^T), n ~ N(0, 1) keyed (seed, block, item, row).
-        // After the previous block consumed the shared noise buffer (write-after-read).
+        // After the previous block consumed the shared noise buffer (write-after-read). The
+        // rewrite extracts it as `FusedGatedResidual`, which no op executes.
         let noise = p.rand_f32(seed, &[x.done], RandF32Stage {
             output: TensorRef::Named("act.codec.noise"),
             items: batch,
@@ -313,7 +303,9 @@ fn snac_program(
             scale: 1.0,
             offset: 0.0,
         })?;
-        let proj = run_conv(&mut p, up.output, up.done, conv("act.codec.c", format!("w.blk{i}.noise.w"), None, None, rows, b.cout, b.cout, 1, 1, 1, 0, len, Activation::None, Activation::None, None))?;
+        let mut c = conv("act.codec.c", &format!("w.blk{i}.noise.w"), None, rows, b.cout, b.cout, 1);
+        c.len = len;
+        let proj = fused_conv(&mut p, fuse, up.output, up.done, c)?;
         let scaled = p.binary_f32(proj.output, noise.output, &[proj.done, noise.done], BinaryF32Stage {
             output: TensorRef::Handle(proj.output),
             op: BinaryOp::Mul,
@@ -338,28 +330,142 @@ fn snac_program(
         })?;
         for (j, &d) in b.dilations.iter().enumerate() {
             let pre = format!("w.blk{i}.ru{j}");
-            let h = run_conv(&mut p, x.output, x.done, conv("act.codec.c", format!("{pre}.dw.w"), Some(format!("{pre}.dw.b")), Some(format!("{pre}.a1")), rows, b.cout, b.cout, 7, d, b.cout, 3 * d, len, Activation::Snake, Activation::None, None))?;
-            // Snake before the pointwise conv as its own pass: fused into a wide GEMM it is
-            // recomputed per output tile.
-            let s = p.unary_f32(h.output, &[h.done], UnaryF32Stage {
-                output: TensorRef::Handle(h.output),
-                param: Some(TensorRef::Named(&format!("{pre}.a2"))),
-                rows: batch * rows,
-                width: b.cout,
-                stride: 0,
-                col0: 0,
-                kind: Activation::Snake,
-                p0: 0.0,
-                p1: 0.0,
-            })?;
+            let mut c = conv("act.codec.c", &format!("{pre}.dw.w"), Some(format!("{pre}.dw.b")), rows, b.cout, b.cout, 7);
+            c.alpha = Some(format!("{pre}.a1"));
+            c.act_in = Activation::Snake;
+            c.dilation = d;
+            c.groups = b.cout;
+            c.pad = 3 * d;
+            c.len = len;
+            let h = fused_conv(&mut p, fuse, x.output, x.done, c)?;
             let target = if x.output == a_handle { "act.codec.b" } else { "act.codec.a" };
-            x = run_conv(&mut p, s.output, s.done, conv(target, format!("{pre}.pw.w"), Some(format!("{pre}.pw.b")), None, rows, b.cout, b.cout, 1, 1, 1, 0, len, Activation::None, Activation::None, Some(x.output)))?;
+            let mut c = conv(target, &format!("{pre}.pw.w"), Some(format!("{pre}.pw.b")), rows, b.cout, b.cout, 1);
+            c.alpha = Some(format!("{pre}.a2"));
+            c.act_in = Activation::Snake;
+            c.residual = Some(x.output);
+            c.len = len;
+            c.input_is_temp = true;
+            x = fused_conv(&mut p, fuse, h.output, h.done, c)?;
         }
     }
     let last_c = cfg.blocks.last().map_or(latent, |b| b.cout);
-    let out = run_conv(&mut p, x.output, x.done, conv("act.codec.pcm", "w.out.w".into(), Some("w.out.b".into()), Some("w.out.snake".into()), rows, last_c, 1, 7, 1, 1, 3, lengths[cfg.blocks.len()], Activation::Snake, Activation::Tanh, None))?;
+    let mut c = conv("act.codec.pcm", "w.out.w", Some("w.out.b".into()), rows, last_c, 1, 7);
+    c.alpha = Some("w.out.snake".into());
+    c.act_in = Activation::Snake;
+    c.act_out = Activation::Tanh;
+    c.pad = 3;
+    c.len = lengths[cfg.blocks.len()];
+    let out = fused_conv(&mut p, fuse, x.output, x.done, c)?;
     debug_assert_eq!(out.output, p_handle(&p, "act.codec.pcm"));
     Ok(p.finish(batch * frames))
+}
+
+/// One convolution of the decoder in its unfused meaning: `residual + act_out(conv(act_in(x)))`.
+struct Conv {
+    output: &'static str,
+    weight: String,
+    bias: Option<String>,
+    /// Snake alpha of `act_in`.
+    alpha: Option<String>,
+    batch: u32,
+    in_rows: u32,
+    cin: u32,
+    cout: u32,
+    kernel: u32,
+    stride: u32,
+    /// Output padding for a transposed convolution.
+    dilation: u32,
+    groups: u32,
+    pad: u32,
+    len: u32,
+    act_in: Activation,
+    act_out: Activation,
+    residual: Option<u32>,
+    transpose: bool,
+    /// `x` is dead after this conv, so an unfused input activation may overwrite it.
+    input_is_temp: bool,
+}
+
+/// `c` with the fusions `fuse` decides; an unfused piece runs as its own `UnaryF32` /
+/// `BinaryF32` pass (an input activation in place when `x` is a temporary, else into
+/// `act.codec.s`).
+fn fused_conv(p: &mut StageProgram, fuse: ConvFusions<'_>, x: u32, dep: u32, c: Conv) -> Result<Emitted, String> {
+    let act_in = c.act_in != Activation::None;
+    let fuse_in = act_in && fuse.input_act(&c.weight, c.kernel, true);
+    let fuse_out = c.act_out != Activation::None && fuse.output_act(&c.weight, true);
+    let fuse_res = c.residual.is_some() && fuse.residual(&c.weight, true);
+    let (mut x, mut dep) = (x, dep);
+    if act_in && !fuse_in {
+        let output = if c.input_is_temp { TensorRef::Handle(x) } else { TensorRef::Named("act.codec.s") };
+        let e = p.unary_f32(x, &[dep], UnaryF32Stage {
+            output,
+            param: c.alpha.as_deref().map(TensorRef::Named),
+            rows: c.batch * c.in_rows,
+            width: c.cin,
+            stride: 0,
+            col0: 0,
+            kind: c.act_in,
+            p0: 0.0,
+            p1: 0.0,
+        })?;
+        (x, dep) = (e.output, e.done);
+    }
+    let e = p.conv1d_f32(x, c.transpose, &[dep], Conv1dF32Stage {
+        output: TensorRef::Named(c.output),
+        weight: TensorRef::Named(&c.weight),
+        bias: c.bias.as_deref().map(TensorRef::Named),
+        alpha: if fuse_in { c.alpha.as_deref().map(TensorRef::Named) } else { None },
+        residual: if fuse_res { c.residual } else { None },
+        lengths: Some(c.len),
+        batch: c.batch,
+        in_rows: c.in_rows,
+        in_channels: c.cin,
+        out_channels: c.cout,
+        kernel: c.kernel,
+        stride: c.stride,
+        dilation_or_output_padding: c.dilation,
+        groups: c.groups,
+        pad_before: c.pad,
+        pad_after: c.pad,
+        pad_mode: PadMode::Zero,
+        input_activation: if fuse_in { c.act_in } else { Activation::None },
+        output_activation: if fuse_out { c.act_out } else { Activation::None },
+        slope: 0.0,
+        weight_f16: false,
+    })?;
+    let out_rows = if c.transpose {
+        (c.in_rows - 1) * c.stride + c.kernel + c.dilation - 2 * c.pad
+    } else {
+        c.in_rows + 2 * c.pad - c.dilation * (c.kernel - 1)
+    };
+    let mut e = e;
+    if c.act_out != Activation::None && !fuse_out {
+        e = p.unary_f32(e.output, &[e.done], UnaryF32Stage {
+            output: TensorRef::Handle(e.output),
+            param: None,
+            rows: c.batch * out_rows,
+            width: c.cout,
+            stride: 0,
+            col0: 0,
+            kind: c.act_out,
+            p0: 0.0,
+            p1: 0.0,
+        })?;
+    }
+    if let Some(r) = c.residual.filter(|_| !fuse_res) {
+        e = p.binary_f32(e.output, r, &[e.done], BinaryF32Stage {
+            output: TensorRef::Handle(e.output),
+            op: BinaryOp::Add,
+            items: 1,
+            rows: c.batch * out_rows,
+            width: c.cout,
+            b_item_stride: 0,
+            b_row_stride: c.cout,
+            b_col_stride: 1,
+            scale: None,
+        })?;
+    }
+    Ok(e)
 }
 
 fn p_handle(p: &crate::pipeline::StageProgram, name: &str) -> u32 {
