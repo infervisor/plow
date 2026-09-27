@@ -445,6 +445,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_chunk", Some("PLOW_PF_CHUNK"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.pf_no_chunk", Some("PLOW_PF_NO_CHUNK"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_no_interleave", Some("PLOW_PF_NO_INTERLEAVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.ride_fixed", Some("PLOW_RIDE_FIXED"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_defer_decode", Some("PLOW_PF_DEFER_DECODE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.serve_policy", Some("PLOW_SERVE_POLICY"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_span_policy", Some("PLOW_PF_SPAN_POLICY"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),

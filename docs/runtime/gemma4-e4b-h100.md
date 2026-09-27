@@ -151,25 +151,83 @@ Roofline = (9.22 GB weights incl. the 1.34 GB tied lm_head + B × 66 MB KV at ct
 
 `scripts/llm/gemma_voice_bench.sh plow|vllm` runs the same client against both servers: TTFT
 p50 ms / TPOT p50 ms / output tok/s. vLLM 0.28 runs from `$PYREF` (`--max-num-seqs 256`,
-`--max-model-len 8192`).
+`--max-model-len 8192`). Plow runs the recipe (`--multistep-adaptive`, unified token batch).
 
-| conc | vLLM 0.28 | plow A: default (token batch) | plow B: `--token-batch=false` |
-|---|---|---|---|
-| 1 | 39.6 / 5.88 / 162 | **29.4** / 8.07 / 120 | 29.6 / 8.06 / 121 |
-| 8 | 66.9 / 6.13 / 1176 | 146 / 9.76 / 741 | 67.3 / 10.1 / 745 |
-| 32 | 232 / 7.61 / 3160 | 414 / 20.9 / 1219 | **72.1** / 18.9 / 1589 |
-| 64 | 270 / 9.91 / 4994 | 1038 / 49.1 / 943 | **72.5** / 29.7 / 2004 |
-| 128 | 483 / 16.1 / 6311 | 2174 / 150 / 692 | **227** / 50.0 / 2302 |
-| 200 | 1349 / 33.2 / 3801 | 15357 / 130 / 689 | 3657 / 49.2 / 2516 |
+The client sends no `temperature`, so every request samples with the checkpoint's generation
+config (T=1, top_k=64, top_p=0.95). "greedy" pins `temperature: 0` (`BENCH_ARGS`).
 
-Both plow configs use `--multistep-adaptive`. Only cold 1000-token prompts arrive here. Plow
-wins TTFT through c128 (B), and vLLM wins TPOT and throughput from c8 up:
+| conc | vLLM sampled | vLLM greedy | plow before (host-sampled rows) | plow sampled | plow greedy (fixed ride) |
+|---|---|---|---|---|---|
+| 1 | 39.6 / 5.88 / 162 | 36.3 / 5.70 / 168 | 29.4 / 8.07 / 120 | **26.0** / 7.02 / 138 | **25.1** / 6.86 / 141 |
+| 8 | 66.9 / 6.13 / 1176 | 62.8 / 5.91 / 1228 | 146 / 9.76 / 741 | 90.5 / 8.27 / 894 | 88.9 / 8.05 / 916 |
+| 32 | 232 / 7.61 / 3160 | 215 / 7.22 / 3303 | 414 / 20.9 / 1219 | **167** / 13.0 / 2119 | **168** / 12.7 / 2158 |
+| 64 | 270 / 9.91 / 4994 | 254 / 9.09 / 5302 | 1038 / 49.1 / 943 | 335 / 19.5 / 2701 | 357 / 19.0 / 2763 |
+| 128 | 483 / 16.1 / 6311 | 381 / 16.5 / 6786 | 2174 / 150 / 692 | 446 / 28.8 / 3398 | 445 / 30.4 / 3251 |
+| 200 | 1349 / 33.2 / 3801 | 887 / 16.3 / 7525 | 15357 / 130 / 689 | 3060 / 29.3 / 3555 | 3022 / 28.9 / 3373 |
 
-* **Step time.** The decode step is at 30-40% of roofline (next section). vLLM's c64 TPOT of
-  9.9 ms is below plow's 12.6 ms step.
-* **Mixed ticks.** Under unified token batching (A), decode rows ride the prefill program
-  whenever a prompt is in flight (~18 ms fixed per mixed tick), so a steady stream of cold prompts
-  collapses TPOT at c64 and up. B alternates prefill and decode launches instead.
+Measured on the packet before the E-series decode kernels in the table further down (`gemv_k8`
+gate, row-group flash decode: greedy c1 141 -> 158, c32 2150 -> 2321, c128 3178 -> 3322).
+
+* **What was wrong before.** Each sampled row that rode a prefill launch downloaded its 512 KB
+  logits row and ran the host sampler (a full sort of 262144 entries, ~4 ms per row). At c64 that
+  put 264 ms into every mixed tick. Every sampled row now draws on the device (`plow_sample`,
+  `launch_sampler_rows` after the packed terminal), including each prompt's first token and the
+  serial and compact paths. c64 943 -> 2719 tok/s, c128 692 -> 3398 (with `sched::ride`).
+* **`plow_sample`** keeps the host sampler's kept set: exact bf16 radix-select for top-k, the
+  top_p cut keeps the token that crosses p, min_p, no f32 scratch (`sample_sm120.cu`). Sampled
+  TV distance device vs host on real prefill logits: 0.0024 (T=1, k=64, p=0.95), 0.0000
+  (T=0.7, p=0.9), 0.0005 (T=1.3, k=40), 0.0276 (p=0.99, 390 tokens kept; bound 0.105)
+  (`tests/gpu_sample_serve.rs`, `tests/gpu_sample.rs`).
+* **Where plow stands.** TTFT is ahead at c1 and c32 (c128 within noise of vLLM sampled). From
+  c8 up vLLM wins throughput: 1.3x at c8, 1.5x at c32, 1.9-2.3x at c64-c200. c8 TTFT (90 vs
+  63 ms) is lost to the decode step: a new prompt waits for the running 8-step quantum.
+
+### Where the tick time goes (`PLOW_PACKLOG`, c64 sampled)
+
+| | mixed ticks (share of wall, mean) | decode ticks | host gap | idle |
+|---|---|---|---|---|
+| before | 82%, 264 ms | 17% | <1% | <0.5% |
+| after | 51%, 53 ms | 48% | <1% | <0.5% |
+
+The device is busy >99% of wall in both. So host overlap (pipelining the next tick's staging)
+buys at most 1%, and it was not built. What is left is device time per token:
+
+* **Prefill rate (OSL=1, packed 1000-row prompts).** Plow 21.4 µs/row vs vLLM 13.2 µs/row.
+  The prefill-only served rate at c32 is 50 req/s vs 76. Per-op split of a 2000-row launch
+  (44 ms, segment-site timing):
+
+  | op | share |
+  |---|---|
+  | Gemm (cuBLASLt, ~700 TFLOP/s) | 51% |
+  | FlashPrefill | 18% |
+  | norm / head-norm+RoPE | 16% |
+  | Glu | 9% |
+  | final norm + lm_head + argmax | 3% |
+  | PLE (op 205) | 2% |
+
+  The GEMMs are near vLLM's. The ~10 µs/row of non-GEMM work is the gap.
+* **Ceiling.** At ISL 1000 / OSL 128 every output token carries 1000/128 = 7.8 prompt rows,
+  195 µs of prefill at 21.4 µs/row. That caps output at ~5100 tok/s with zero decode cost. Add
+  the decode step (13.4 ms at B=63, ~18 ms at B=128) and the measured 2700-3300 tok/s is what
+  this prefill and step allow. The first wave's TTFT at c64+ is also bound by the prefill rate.
+  The throughput gap at c≥32 is a kernel gap (prefill non-GEMM ops, decode step at 30-40% of
+  roofline), not a scheduling one.
+* **Ride or step.** A decode row riding a prefill launch costs ~0.16 ms. A standalone step costs
+  8.5 + 0.077·B ms. Below ~50 rows riding is cheaper, above ~100 the step is. At c128 the
+  non-riding arm (`PLOW_PF_NO_INTERLEAVE=1`) served 3405 vs 3097 tok/s. `sched::ride` measures
+  both costs per engine and picks per launch: rows ride iff `per-row ride ms × rows ≤ step ms`
+  (EWMAs of the observed launches and steps, one launch in 32 explores the other arm).
+  `PLOW_RIDE_FIXED=1` restores always-ride. Sampled, adaptive vs fixed (two adaptive runs):
+
+  | conc | fixed | adaptive |
+  |---|---|---|
+  | 1-64 | 138 / 895 / 2127 / 2719 | 138 / 892-893 / 2118-2122 / 2717-2720 |
+  | 128 | 435 / 30.9 / 3193 | 446-459 / 28.8-28.9 / 3391-3398 (+6%) |
+  | 200 | 3117 / 30.2 / 3294 | 3060-3077 / 29.3-29.6 / 3555-3558 (+8%) |
+
+  TPOT p99 at c128/c200 drops from 44-45 ms to 39-40 ms.
+* **Rejected.** Smaller prefill launches (`PLOW_PF_INTERLEAVE=1024` / `512`) lose 18-35%: they
+  pay the launch skeleton more often for the same rows. Host overlap is worth <1% (above).
 
 ### Voice sessions: `scripts/llm/session_bench.py`
 
@@ -180,10 +238,10 @@ its default automatic prefix caching.
 
 TTFT first turn p50 / later turns p50 (p90) ms, TPOT p50 ms, out tok/s:
 
-| calls | vLLM 0.28 (APC) | plow A: default (token batch) | plow B: `--token-batch=false` |
-|---|---|---|---|
-| 64 | 33 / 47 (77), 8.5, 2322 | 51 / **42 (65)**, 18.6, 1754 | 74 / 143 (293), 28.3, 1334 |
-| 200 | 98 / 202 (488), 17.3, 4943 | 87 / 622 (924), 39.4, 3016 | 1793 / 4522 (4646), 33.2, 1428 |
+| calls | vLLM 0.28 (APC) | plow A: default (token batch) | plow B: `--token-batch=false` | plow A, device-sampled rows |
+|---|---|---|---|---|
+| 64 | 33 / 47 (77), 8.5, 2322 | 51 / **42 (65)**, 18.6, 1754 | 74 / 143 (293), 28.3, 1334 | 39 / **39 (57)**, 18.7, 1771 |
+| 200 | 98 / 202 (488), 17.3, 4943 | 87 / 622 (924), 39.4, 3016 | 1793 / 4522 (4646), 33.2, 1428 | 82 / 657 (841), 40.5, 2977 |
 
 * **Cache hits.** Plow reports 86-87% of later-turn prompt rows cached (`X-Session-Cache:
   prefix-cache`). vLLM caches too but does not report it in usage.
@@ -236,14 +294,16 @@ ASR and TTS, lower `max_ctx` (4096 halves the KV) before moving the table.
   * B=1: the fixed interpreter skeleton (1.2 ms) and down_proj at 50% bandwidth.
   * B>=64: sliding flash decode at ~3x its floor.
   * vLLM's TPOT is lower at c>=8 as a result.
-* **Cold-prompt throughput at c>=64.** Under unified token batching, mixed ticks cost ~18 ms, so
-  A collapses (c64 943 tok/s vs B 2004 vs vLLM 4994). B wins cold throughput and loses session
-  TTFT. The scheduler should pick per tick; today it is a static flag.
+* **Cold-prompt throughput at c>=32 (KERNEL).** Sampled rows now draw on the device, so mixed
+  ticks no longer collapse (c64 943 -> 2701 tok/s). vLLM still serves 1.5-2.3x. The limits are
+  the prefill rate (21.4 vs 13.2 µs/row, non-GEMM ops) and the decode step (above). No tick
+  policy closes this; see "Where the tick time goes".
+* **c8 TTFT (SCHED).** 90 ms vs vLLM 63: a new prompt waits for the running multistep quantum.
 * **Logprobs and multi-step.** A logprobs row leaves device multi-step; c64 still costs -43%.
   Next steps:
   * batch the stats kernel over all rows of a tick;
   * let it run inside a multi-step quantum;
-  * use the device sampler for temperature > 0 rows (they still download the row).
+  * temperature > 0 logprobs rows still download the row.
 * **Prompt logprobs** (`echo`, `prompt_logprobs`) are refused. The full raw logits row is not
   exposed over HTTP (the top 20 logits only).
 * **Unused segment objects.** The segment script's pfseg/pfgemm objects fault on this packet

@@ -2496,9 +2496,14 @@ fn run_one_tick(
                 let mut completed = std::mem::take(&mut obs.host.prefill_tokens);
                 completed.clear();
                 let mut dev_sampled = false;
+                if obs.host.ride.needs_widths() {
+                    let widths: Vec<usize> = e.effective_decode_rungs().iter().map(|&w| w as usize).collect();
+                    obs.host.ride.set_widths(&widths);
+                }
                 if let Some(f) = gpu_prefill_batched_pass(
                     &mut *e, &mut slots, cap, &arena, feeds.is_empty(), co_scheduled, &mut completed,
                     &mut feeds, &mut obs.host.token_batch_tokens, pipe_prefill, &mut dev_sampled,
+                    &mut obs.host.ride,
                 ) {
                     if tick_fault.is_none() {
                         tick_fault = Some(f);
@@ -2868,9 +2873,11 @@ fn run_one_tick(
                         .then_some((specs.as_slice(), &rng as &dyn Fn(usize, usize) -> f32));
                     let staged = gpu_stage_cfg(&mut *e, &feeds, &mut slots, requested);
                     let t_call = crate::obs::host::on().then(Instant::now);
+                    let t_step = Instant::now();
                     let res = staged.and_then(|_| e.multi_step_sampled_at_most(&feeds, requested, sample, &mut toks));
                     match res {
                         Ok(k) => {
+                            obs.host.ride.observe_step(feeds.len(), t_step.elapsed().as_secs_f64() * 1e3 / k.max(1) as f64);
                             gpu_cfg_advance(&feeds, &mut slots, k);
                             let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                             decode_progress = completed_decode(&feeds, k);
@@ -2929,12 +2936,14 @@ fn run_one_tick(
                     None
                 };
                 let t_call = crate::obs::host::on().then(Instant::now);
+                let t_step = Instant::now();
                 let (cfg_dev, step_res) = match gpu_stage_cfg(&mut *e, &feeds, &mut slots, 1) {
                     Ok(d) => (d, e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks)),
                     Err(err) => (false, Err(err)),
                 };
                 match step_res {
                     Ok(()) => {
+                        obs.host.ride.observe_step(feeds.len(), t_step.elapsed().as_secs_f64() * 1e3);
                         let t_emit = host_engine_call(t_call, feeds.len(), tokens_this_tick);
                         decode_progress = completed_decode(&feeds, 1);
                         let cfg_drawn = if cfg_dev {
@@ -4723,14 +4732,21 @@ fn gpu_prefill_batched_pass(
     unified_output: &mut Vec<(u32, u32)>,
     pipelined: bool,
     dev_sampled: &mut bool,
+    ride: &mut crate::sched::ride::RideCost,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
     completed.clear();
     *dev_sampled = false;
     let compact = e.has_packed_terminal();
-    let unified =
+    let mut unified =
         e.token_batch_enabled() && !crate::config::RuntimeConfig::get().pf_no_interleave;
+    // Whether this tick's decode rows may still leave the launch for their own step
+    // (`sched::ride`): decided once, when the launch's bucket is known.
+    let mut ride_open = unified
+        && !pipelined
+        && !feeds.is_empty()
+        && !crate::config::RuntimeConfig::get().ride_fixed;
     let withheld = usize::from(!compact);
     // Pipelined, a prompt whose first token is still on the device can decode from it: the row
     // joins the next launch instead of idling one while the host reads that token back.
@@ -4748,7 +4764,7 @@ fn gpu_prefill_batched_pass(
     } else {
         Default::default()
     };
-    let decode_rows = if unified { feeds.len() + pending_first.len() } else { 0 };
+    let mut decode_rows = if unified { feeds.len() + pending_first.len() } else { 0 };
     let mut tick_fault: Option<crate::DeviceErrorInfo> = None;
     let budget_max = e.pf_max_rows();
     if budget_max == 0 {
@@ -4764,12 +4780,11 @@ fn gpu_prefill_batched_pass(
             .map_or(1, |sp| sp.overlay.len() / sp.overlay_pos.len());
         bytes as usize / 4 / hidden.max(1)
     });
-    let per_launch = (if cold && !bounded_tick {
+    let launch_cap = if cold && !bounded_tick {
         budget_max
     } else {
         pf_interleave_rows().min(budget_max)
-    })
-    .min(budget_max.saturating_sub(decode_rows));
+    };
     // Bound each candidate before fair sharing. Short requests return unused
     // rows to later candidates in the same launch.
     let chunk_cap = pf_chunk_rows().min(e.pf_request_max_rows());
@@ -4870,6 +4885,13 @@ fn gpu_prefill_batched_pass(
             return tick_fault;
         }
         let avail: usize = candidates.iter().map(|c| c.span.n_rows as usize).sum();
+        if std::mem::take(&mut ride_open)
+            && !ride.ride(e.pf_pack_budget(avail.min(launch_cap)), feeds.len())
+        {
+            unified = false;
+            decode_rows = 0;
+        }
+        let per_launch = launch_cap.min(budget_max.saturating_sub(decode_rows));
         // Every overlay row of a launch is staged at once: bound its rows by the overlay's.
         let per_launch = per_launch.min(overlay_rows.unwrap_or(usize::MAX)).max(1);
         let per_launch = if adaptive {
@@ -4939,6 +4961,9 @@ fn gpu_prefill_batched_pass(
                 unified
             );
         }
+        let riders = if unified { feeds.len() + pending_first.len() } else { 0 };
+        let launch_bucket = e.pf_pack_budget(pack.iter().map(|p| p.2).sum::<usize>() + riders);
+        let t_launch = Instant::now();
         let res = if unified {
             use plow_asset::token_batch::{Phase, Request, Selection};
             // A feed or pack entry whose slot vanished mid-tick is skipped, not a panic:
@@ -5056,6 +5081,9 @@ fn gpu_prefill_batched_pass(
                     Ok(())
                 })
         };
+        if res.is_ok() && !pipelined {
+            ride.observe_launch(launch_bucket, riders, t_launch.elapsed().as_secs_f64() * 1e3);
+        }
         match res {
             Ok(()) => {
                 if unified {

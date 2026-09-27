@@ -226,6 +226,11 @@ pub struct RuntimeConfig {
     #[arg(long = "pf-no-interleave", env = "PLOW_PF_NO_INTERLEAVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_no_interleave: bool,
 
+    /// Always ride decode rows in the prefill launch (the pre-`sched::ride` behaviour) instead of
+    /// choosing per launch from measured costs.
+    #[arg(long = "ride-fixed", env = "PLOW_RIDE_FIXED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub ride_fixed: bool,
+
     /// Throughput mode: run prefill chains to completion, skip decode until all
     /// prompts are resident. Trades streaming latency for aggregate tok/s.
     #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

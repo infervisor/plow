@@ -59,9 +59,10 @@ role_files = ["interp_sm90a_pffa.cubin", "interp_sm90a_pfpackedfa.cubin"]
 [emit_roles.env]
 
 # Voice-agent turns (X-Session-Id, cached prefix + short suffix): unified token batching (the
-# default) with adaptive multistep; 64 calls x 6 turns later-turn TTFT p50 42 ms vs 143 ms with
-# PLOW_TOKEN_BATCH=0. Cold 1000-token prompts at c>=64 prefer PLOW_TOKEN_BATCH=0 (2004 vs 943
-# out tok/s at c64). docs/runtime/gemma4-e4b-h100.md.
+# default) with adaptive multistep; 64 calls x 6 turns later-turn TTFT p50 39 ms vs 143 ms with
+# PLOW_TOKEN_BATCH=0. Cold 1000-token prompts: 2719 out tok/s at c64, 3555 at c200 (sampled
+# rows draw on the device; decode rows ride a prefill launch only while that is cheaper than a
+# step, `sched::ride`). docs/runtime/gemma4-e4b-h100.md.
 [serve]
 env = { PLOW_MULTISTEP_ADAPTIVE = "true" }
 

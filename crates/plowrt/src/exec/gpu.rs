@@ -10355,10 +10355,14 @@ impl GpuEngine {
         self.packed_token_body(&chunks)?;
         for r in reqs {
             self.pos[r.slot] = (r.c0 + r.len) as u32;
-            if self.vmm_prefix_enabled() && r.c0 + r.len + 1 >= r.prompt.len() {
+            // The history follows every chunk: the prompt's next chunk may ride a token batch,
+            // which checks its frontier against it.
+            if self.vmm_prefix_enabled() {
                 let end = r.c0 + r.len;
                 self.seq_tokens[r.slot].clear();
                 self.seq_tokens[r.slot].extend_from_slice(&r.prompt[..end]);
+            }
+            if self.vmm_prefix_enabled() && r.c0 + r.len + 1 >= r.prompt.len() {
                 self.vmm_publish(r.slot, r.prompt.len().saturating_sub(1) as u32);
                 self.vmm_prefill_done(r.slot);
             }
