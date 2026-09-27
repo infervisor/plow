@@ -2252,7 +2252,7 @@ pub enum DevOp {
     /// (`op_gemm_common.h` `d_gemm_fp8_mx` -> `d_gemm_t<WFP8MX>`).
     ///
     /// `t0=out(bf16[T][N]) t1=x(bf16[T][K]) t2=w(fp8 e4m3 OCP[N][K])
-    /// t3=scale(ue8m0[ceil(N/32)][ceil(K/32)]) t4=xs?` · `i0=T i1=N i2=K i3=groups i4=a_row0 i5=c_row0 i6=fp8?`.
+    /// t3=scale(ue8m0[ceil(N/32)][ceil(K/32)]) t4=xs? t5=scratch?` · `i0=T i1=N i2=K i3=groups i4=a_row0 i5=c_row0 i6=fp8?`.
     ///
     /// `i3 = groups` > 1 makes it block-diagonal (the output LoRA `wo_a` below TP8): `out` is
     /// `[T][groups*N]`, `x` `[T][groups*K]`, `w` `[groups*N][K]`, and group `g` multiplies `x`
@@ -2261,6 +2261,10 @@ pub enum DevOp {
     ///
     /// `i6 = 1` (sm_90a role only): `x` is e4m3 `[T][K]` and `t4` its ue8m0 scales `[T][K/32]`,
     /// ActQuantMx's `t2` form (`K % 128 == 0`).
+    ///
+    /// `t5` (NVIDIA decode arm, optional): split-K scratch, `plow_gv8::sk_scratch_bytes(T, n_cu)`
+    /// bytes whose leading per-tile counters are zero at rest. With it a tile's K range may split
+    /// across CTAs; two ops that can run concurrently must not share one.
     ///
     /// The scale grid is row-major with K innermost. `K % 32 == 0` is REQUIRED -- the kernel is
     /// the KEXACT instantiation at BK=32 -- and every V4.1 projection satisfies it by

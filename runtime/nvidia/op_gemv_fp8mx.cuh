@@ -57,6 +57,18 @@ __device__ __forceinline__ unsigned splits(unsigned tiles, unsigned kb, unsigned
     while (s < 8u && tiles * s * 2u <= nblk * 8u && kb % (s * 2u) == 0) s *= 2u;
     return s;
 }
+/* Cross-CTA split-K (a scratch is bound): one (tile, split) item per warp of the whole grid, any S <= K/32
+ * with uneven K ranges. A warp's K walk is a serial chain (~0.25 us per 32-wide block at T <= 8), so the
+ * shortest walk is the lowest latency. */
+__host__ __device__ constexpr unsigned sk_splits(unsigned tiles, unsigned kb, unsigned nblk) {
+    return tiles >= nblk * 8u ? 1u : (nblk * 8u / tiles < kb ? nblk * 8u / tiles : kb);
+}
+/* scratch layout: SK_TILES per-tile arrival counters (zero at rest), then one NT x 128-float partial per item. The
+ * counter block is fixed-size so ops of different shapes can share one scratch without partials landing on counters. */
+constexpr unsigned SK_TILES = 4096u;
+__host__ __device__ constexpr size_t sk_scratch_bytes(unsigned T, unsigned nblk) {
+    return SK_TILES * 4u + (size_t)nblk * 8u * ((T + 7u) / 8u) * 128u * 4u;
+}
 
 struct Gv8Args {
     const uint8_t *x, *xs, *W, *ws;
@@ -194,18 +206,29 @@ __device__ __forceinline__ void tile(const Gv8Args& a, unsigned grp, unsigned n0
 }
 
 template <unsigned NT, bool FP8>
-__device__ __noinline__ void run(__nv_bfloat16* __restrict__ C, const Gv8Args& a_, unsigned slice, unsigned nblk, float* arena) {
+__device__ __noinline__ void run(__nv_bfloat16* __restrict__ C, const Gv8Args& a_, unsigned slice, unsigned nblk, float* arena,
+                                 uint8_t* scratch) {
     const Gv8Args a = a_;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3u;
-    const unsigned ld_c = a.groups * a.N, tiles = a.groups * (a.N / 16u), S = splits(tiles, a.kb, nblk), per_cta = 8u / S;
-    const unsigned sk = warp % S, kb_per = a.kb / S;
+    const unsigned ld_c = a.groups * a.N, tiles = a.groups * (a.N / 16u);
+    /* items are (tile, split) pairs, split-minor; item base + warp keeps a tile's in-CTA splits on consecutive warps */
+    const bool gsk = scratch != nullptr;
+    if (gsk && tiles > SK_TILES) __trap();
+    /* Cross-CTA splits (scratch only) when they shorten a warp's K walk by >= 8 blocks; below that the published-partial
+     * round trip costs more. In-CTA splits divide 8, so their segments always hold the whole tile and never publish. */
+    const unsigned s_in = splits(tiles, a.kb, nblk), s_x = gsk ? sk_splits(tiles, a.kb, nblk) : 1u;
+    const unsigned S = a.kb / s_in >= a.kb / s_x + 8u ? s_x : s_in, items = tiles * S;
+    unsigned* const ctr = reinterpret_cast<unsigned*>(scratch);
+    float* const part = reinterpret_cast<float*>(scratch + SK_TILES * 4u);
     const uint32_t ring = (uint32_t)__cvta_generic_to_shared(arena) + warp * a.depth * STAGE;
-    for (unsigned tile0 = slice * per_cta; tile0 < tiles; tile0 += nblk * per_cta) {
-        const unsigned t = tile0 + warp / S;
-        const bool live = t < tiles;
+    for (unsigned base = slice * 8u; base < items; base += nblk * 8u) {
+        const unsigned it = base + warp;
+        const bool live = it < items;
+        const unsigned t = it / S, sk = it - t * S;
         const unsigned grp = live ? t / (a.N / 16u) : 0u, n0 = live ? (t % (a.N / 16u)) * 16u : 0u;
         float acc[NT][4] = {};
-        if (live) tile<NT, FP8>(a, grp, n0, sk * kb_per, (sk + 1u) * kb_per, ring, acc);
+        if (live) tile<NT, FP8>(a, grp, n0, a.kb * sk / S, a.kb * (sk + 1u) / S, ring, acc);
+        bool store = live && S == 1u;
         if (S > 1u) {
             __syncthreads(); /* the rings are drained; the arena becomes the split-K exchange */
             float* red = arena + (size_t)warp * (NT * 128u);
@@ -215,16 +238,51 @@ __device__ __noinline__ void run(__nv_bfloat16* __restrict__ C, const Gv8Args& a
 #pragma unroll
                     for (unsigned i = 0; i < 4u; i++) red[j * 128u + i * 32u + lane] = acc[j][i];
             __syncthreads();
-            if (live && sk == 0u)
-                for (unsigned s2 = 1; s2 < S; s2++) {
-                    const float* o = arena + (size_t)(warp + s2) * (NT * 128u);
+            /* A segment is this CTA's run of consecutive warps on one tile; its first warp sums them in K order. A
+             * segment holding the whole tile stores; otherwise (cross-CTA split) it publishes its partial and the
+             * tile's last segment to arrive sums all of them in K order (deterministic) and re-arms the counter. */
+            const unsigned seg0 = max(t * S, base);
+            if (live && it == seg0) {
+                const unsigned seg1 = min(min(t * S + S, base + 8u), items);
+                for (unsigned w2 = warp + 1u; w2 < warp + (seg1 - seg0); w2++) {
+                    const float* o = arena + (size_t)w2 * (NT * 128u);
 #pragma unroll
                     for (unsigned j = 0; j < NT; j++)
 #pragma unroll
                         for (unsigned i = 0; i < 4u; i++) acc[j][i] += o[j * 128u + i * 32u + lane];
                 }
+                if (seg0 == t * S && seg1 == t * S + S) {
+                    store = true;
+                } else {
+                    float* const my = part + (size_t)seg0 * (NT * 128u);
+#pragma unroll
+                    for (unsigned j = 0; j < NT; j++)
+#pragma unroll
+                        for (unsigned i = 0; i < 4u; i++) __stcg(my + j * 128u + i * 32u + lane, acc[j][i]);
+                    __threadfence();
+                    __syncwarp();
+                    const unsigned nseg = (t * S + S - 1u) / 8u - (t * S) / 8u + 1u;
+                    unsigned last = 0;
+                    if (lane == 0) last = atomicAdd(ctr + t, 1u) == nseg - 1u;
+                    store = __shfl_sync(~0u, last, 0) != 0u;
+                    if (store) {
+                        __threadfence();
+                        for (unsigned q = 0, i0 = t * S; i0 < t * S + S; q++, i0 = ((t * S) / 8u + q) * 8u) {
+                            const float* const o = part + (size_t)i0 * (NT * 128u);
+#pragma unroll
+                            for (unsigned j = 0; j < NT; j++)
+#pragma unroll
+                                for (unsigned i = 0; i < 4u; i++) {
+                                    const float v = __ldcg(o + j * 128u + i * 32u + lane);
+                                    acc[j][i] = q ? acc[j][i] + v : v;
+                                }
+                        }
+                        if (lane == 0) ctr[t] = 0u;
+                    }
+                }
+            }
         }
-        if (live && sk == 0u) {
+        if (store) {
 #pragma unroll
             for (unsigned j = 0; j < NT; j++) {
                 const unsigned c0 = j * 8u + t4 * 2u;
@@ -246,25 +304,26 @@ __device__ __noinline__ void run(__nv_bfloat16* __restrict__ C, const Gv8Args& a
 
 /* C[t][g*N + n] = sum_k x[t][g*K + k] * W[g*N + n][k], t < T <= 64, over `groups` diagonal blocks.
  * arena: >= plow_gv8::arena_floats(2) floats (and >= 8 * 8 * 128 when split); deeper rings use up
- * to arena_floats(MAX_D). */
+ * to arena_floats(MAX_D). scratch: nullptr (splits stay inside a CTA) or plow_gv8::sk_scratch_bytes(T, nblk) bytes
+ * whose counters are zero, left zero. */
 __device__ __noinline__ void d_gemv_fp8mx(__nv_bfloat16* __restrict__ C, const uint8_t* __restrict__ x, const uint8_t* __restrict__ xs,
                                           const uint8_t* __restrict__ W, const uint8_t* __restrict__ ws, unsigned T, unsigned N,
                                           unsigned K, unsigned groups, bool fp8, unsigned slice, unsigned nblk, float* arena,
-                                          unsigned arena_floats_) {
+                                          unsigned arena_floats_, uint8_t* scratch = nullptr) {
     using namespace plow_gv8;
     unsigned depth = MAX_D;
     while (depth > 2u && arena_floats(depth) > arena_floats_) depth--;
     const Gv8Args a{x, xs, W, ws, T, N, K, groups, K / 32u, groups * K, depth};
     const unsigned nt = (T + 7u) / 8u;
     if (fp8) {
-        if (nt <= 1u) run<1, true>(C, a, slice, nblk, arena);
-        else if (nt <= 2u) run<2, true>(C, a, slice, nblk, arena);
-        else if (nt <= 4u) run<4, true>(C, a, slice, nblk, arena);
-        else run<8, true>(C, a, slice, nblk, arena);
+        if (nt <= 1u) run<1, true>(C, a, slice, nblk, arena, scratch);
+        else if (nt <= 2u) run<2, true>(C, a, slice, nblk, arena, scratch);
+        else if (nt <= 4u) run<4, true>(C, a, slice, nblk, arena, scratch);
+        else run<8, true>(C, a, slice, nblk, arena, scratch);
     } else {
-        if (nt <= 1u) run<1, false>(C, a, slice, nblk, arena);
-        else if (nt <= 2u) run<2, false>(C, a, slice, nblk, arena);
-        else if (nt <= 4u) run<4, false>(C, a, slice, nblk, arena);
-        else run<8, false>(C, a, slice, nblk, arena);
+        if (nt <= 1u) run<1, false>(C, a, slice, nblk, arena, scratch);
+        else if (nt <= 2u) run<2, false>(C, a, slice, nblk, arena, scratch);
+        else if (nt <= 4u) run<4, false>(C, a, slice, nblk, arena, scratch);
+        else run<8, false>(C, a, slice, nblk, arena, scratch);
     }
 }

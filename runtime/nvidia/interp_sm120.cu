@@ -1295,7 +1295,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                      (const uint8_t*)TEN(1) + (size_t)in->i[4] * ldx * esz,
                      in->i[6] ? (const uint8_t*)TEN(4) + (size_t)in->i[4] * (ldx / 32u) : nullptr, (const uint8_t*)TEN(2),
                      (const uint8_t*)TEN(3), in->i[0], in->i[1], in->i[2], groups, in->i[6] != 0, slice, nblk, arena,
-                     PLOW_NV_ARENA_FLOATS);
+                     PLOW_NV_ARENA_FLOATS, (uint8_t*)TEN(5));
         break;
     }
     case PLOW_DOP_ENGRAM_EMBED:

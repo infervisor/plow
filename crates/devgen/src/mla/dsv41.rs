@@ -3174,7 +3174,9 @@ fn emit_dsv41_decode_program(
     let mut ri = 0usize;
     let mut pi = 0usize;
     let mut deps: Vec<u32> = Vec::new();
+    let mut layer_start = Vec::with_capacity(layers.len());
     for &l in layers {
+        layer_start.push(b.op_count());
         if c.engram_layers.contains(&l) {
             let e = engram.as_ref().expect("declared for this chain");
             deps = vec![emit_dsv41_engram(b, c, w, &all, e, l, tp, bsz, mhc.residual[ri], &mut xgate, &deps)];
@@ -3226,7 +3228,33 @@ fn emit_dsv41_decode_program(
     // The decode arm of op 85 reduces K-split items through scratch + self-resetting counters (t6).
     let n_cu = all.len() as u64;
     let scratch = b.tensor("act.moe_dec_scratch", (2 * n_cu * 8 * 512 + n_cu * 8) * 4);
+    // GemmFp8Mx's cross-CTA split-K scratch (t5), one per op ordinal within a layer: ops of one
+    // layer may run concurrently, while layer l + 1 starts only after all of layer l.
+    let is_gv8 = |d: &DevInst| d.op == DevOp::GemmFp8Mx as u16;
+    let (mut idx, mut li, mut ord, mut n_ord) = (0usize, 0usize, 0usize, 0usize);
     b.for_each_inst_mut(|d| {
+        while li + 1 < layer_start.len() && idx == layer_start[li + 1] {
+            (li, ord) = (li + 1, 0);
+        }
+        if is_gv8(d) {
+            ord += 1;
+            n_ord = n_ord.max(ord);
+        }
+        idx += 1;
+    });
+    // plow_gv8::sk_scratch_bytes: 4096 tile counters, then one [ceil(T/8)][128] f32 partial per warp
+    let gv8_bytes = 4096 * 4 + n_cu * 8 * u64::from(bsz.div_ceil(8)) * 128 * 4;
+    let gv8: Vec<u32> = (0..n_ord).map(|o| b.tensor(&format!("act.gv8_scratch.{o}"), gv8_bytes)).collect();
+    (idx, li, ord) = (0, 0, 0);
+    b.for_each_inst_mut(|d| {
+        while li + 1 < layer_start.len() && idx == layer_start[li + 1] {
+            (li, ord) = (li + 1, 0);
+        }
+        if is_gv8(d) {
+            d.t[5] = gv8[ord];
+            ord += 1;
+        }
+        idx += 1;
         if d.op == DevOp::MoeGroupGluPf as u16 {
             d.t[6] = scratch;
         }

@@ -1091,6 +1091,12 @@ impl Builder {
         self.ops[counter as usize].isolated |= !self.isolate_ignored;
     }
 
+    /// Instructions emitted so far; with [`Builder::for_each_inst_mut`] (emission order) it marks
+    /// where a caller's range began.
+    pub fn op_count(&self) -> usize {
+        self.ops.len()
+    }
+
     /// Amend already-emitted instructions: an operand a shared emit helper does not take, bound by
     /// the one caller that needs it.
     pub fn for_each_inst_mut(&mut self, mut f: impl FnMut(&mut DevInst)) {
