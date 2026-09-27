@@ -541,10 +541,25 @@ __device__ __forceinline__ unsigned sp_pack_bf16(float2 v) {
     const __nv_bfloat162 h = __floats2bfloat162_rn(v.x, v.y);
     return *(const unsigned*)&h;
 }
+/* DenseGemmF32 flag 128: every row sums K exactly as a split-K launch of `rows[r]` rows would
+ * (sp_tc_splits over devgen's dense_blocks at `ncu` units), in one block: per chunk of k-steps a
+ * fresh partial, folded in chunk order. Rows packed from several requests then give the bits
+ * each request gets alone. */
+struct SpRefSplit { const unsigned* rows; unsigned ncu; };
+__device__ __forceinline__ unsigned sp_ref_chunk(unsigned rows, unsigned N, unsigned K, unsigned ncu) {
+    const unsigned steps = (K + 63u) / 64u, tiles = ((rows + 63u) / 64u) * ((N + 63u) / 64u);
+    if (!rows || !steps || tiles > SPT_TICKETS || tiles * 2u > ncu) return steps;
+    const unsigned par = min(ncu / tiles, steps), cd = (steps + par - 1u) / par;
+    const unsigned blocks = tiles * ((steps + cd - 1u) / cd);
+    unsigned s = tiles * 2u <= blocks ? blocks / tiles : 1u;
+    s = s > steps ? steps : (s ? s : 1u);
+    return (steps + s - 1u) / s;
+}
 static __device__ __forceinline__ void sp_tc_tile_async(unsigned m0, unsigned n0, unsigned M, unsigned N,
                                                         unsigned kb, unsigned ke, const SpRowF32& la,
                                                         const SpRowBf16& lb, float* arena,
-                                                        float (&acc)[2][2][4], const SpLn* ln) {
+                                                        float (&acc)[2][2][4], const SpLn* ln,
+                                                        const SpRefSplit* rs = nullptr) {
     char* smem = (char*)arena;
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     const unsigned wm = (warp & 1u) * 32u, wn = (warp >> 1) * 16u, g = lane >> 2, t = lane & 3u;
@@ -575,6 +590,16 @@ static __device__ __forceinline__ void sp_tc_tile_async(unsigned m0, unsigned n0
         for (int j = 0; j < 2; j++)
 #pragma unroll
             for (int r = 0; r < 4; r++) acc[i][j][r] = 0.f;
+    unsigned ref_chunk[2][2] = {{nk, nk}, {nk, nk}};
+    float ref_tot[2][2][4] = {};
+    if (rs)
+#pragma unroll
+        for (int i = 0; i < 2; i++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const unsigned row = m0 + wm + i * 16 + g + h * 8;
+                ref_chunk[i][h] = row < M ? sp_ref_chunk(rs->rows[row], N, ke, rs->ncu) : nk;
+            }
 #pragma unroll
     for (unsigned s = 0; s + 1 < SPA_NS; s++) issue(s);
     for (unsigned kt = 0; kt < nk; kt++) {
@@ -630,6 +655,32 @@ static __device__ __forceinline__ void sp_tc_tile_async(unsigned m0, unsigned n0
             for (int j = 0; j < 2; j++)
 #pragma unroll
                 for (int r = 0; r < 4; r++) acc[i][j][r] = __fadd_rn(acc[i][j][r], part[i][j][r]);
+        if (rs) {
+#pragma unroll
+            for (int i = 0; i < 2; i++)
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    if (ref_chunk[i][h] >= nk || ((kt + 1u) % ref_chunk[i][h] && kt + 1u < nk)) continue;
+#pragma unroll
+                    for (int j = 0; j < 2; j++)
+#pragma unroll
+                        for (int r = 2 * h; r < 2 * h + 2; r++) {
+                            ref_tot[i][j][r] = __fadd_rn(ref_tot[i][j][r], acc[i][j][r]);
+                            acc[i][j][r] = 0.f;
+                        }
+                }
+        }
+    }
+    if (rs) {
+#pragma unroll
+        for (int i = 0; i < 2; i++)
+#pragma unroll
+            for (int h = 0; h < 2; h++)
+                if (ref_chunk[i][h] < nk)
+#pragma unroll
+                    for (int j = 0; j < 2; j++)
+#pragma unroll
+                        for (int r = 2 * h; r < 2 * h + 2; r++) acc[i][j][r] = ref_tot[i][j][r];
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
     __syncthreads();
@@ -946,7 +997,8 @@ __device__ __forceinline__ unsigned sp_tc_splits(unsigned tiles, unsigned ksteps
 template <bool TF32, bool ASYNC = false, class LA, class LB, class EP>
 static __device__ __forceinline__ void sp_tc_gemm(unsigned M, unsigned N, unsigned K, const LA& la, const LB& lb,
                                                const EP& ep, unsigned slice, unsigned nblk, float* arena,
-                                               float* scratch, const SpLn* ln = nullptr) {
+                                               float* scratch, const SpLn* ln = nullptr,
+                                               const SpRefSplit* rs = nullptr) {
     using C = SpTc<TF32>;
     const unsigned tn = (N + SPT_BN - 1) / SPT_BN, tiles = ((M + SPT_BM - 1) / SPT_BM) * tn;
     const unsigned ksteps = (K + C::BK - 1) / C::BK;
@@ -957,7 +1009,7 @@ static __device__ __forceinline__ void sp_tc_gemm(unsigned M, unsigned N, unsign
         const unsigned m0 = (tile / tn) * SPT_BM, n0 = (tile % tn) * SPT_BN;
         const unsigned kb = s * chunk * C::BK, ke = min(K, kb + chunk * C::BK);
         float acc[2][2][4];
-        if constexpr (ASYNC) sp_tc_tile_async(m0, n0, M, N, kb, ke, la, lb, arena, acc, ln);
+        if constexpr (ASYNC) sp_tc_tile_async(m0, n0, M, N, kb, ke, la, lb, arena, acc, ln, rs);
         else if (sp_async(la) && sp_async(lb)) sp_tcx_tile<TF32>(m0, n0, M, N, kb, ke, la, lb, arena, acc);
         else sp_tc_tile<TF32>(m0, n0, M, N, kb, ke, la, lb, arena, acc);
         if (S == 1u) {
@@ -1211,7 +1263,7 @@ __device__ __forceinline__ unsigned sp_w_width(unsigned M, unsigned N, unsigned 
 /* DenseGemmF32 (170). flags: 1 = bf16-round, 2 = bf16 erf-GELU (implies the round), 4 = bf16
  * weights, 8 = A (and f32 W) bf16-representable -> bf16 tensor cores, 16 = 3xTF32 tensor cores.
  * i5 != 0: weight row stride, and i6 < i5 names a one-hot weight column added in. t4: optional
- * split-K scratch (sp_tc_gemm). */
+ * split-K scratch (sp_tc_gemm); with flag 128 instead per-row reference rows (SpRefSplit, j0 units). */
 struct SpDenseEpi {
     float* out; const float* bias; const void* w; unsigned n, stride, onehot, flags, relu;
     __device__ void operator()(unsigned m, unsigned c, float acc) const {
@@ -1239,7 +1291,7 @@ static __device__ __noinline__ void d_dense_gemm_f32(float* __restrict__ out, co
                                         unsigned m, unsigned n, unsigned k, unsigned activation,
                                         unsigned a_row0, unsigned wstride_op, unsigned onehot,
                                         unsigned flags, unsigned slice, unsigned nblk, float* arena,
-                                        float* scratch, const SpLn* ln) {
+                                        float* scratch, const SpLn* ln, const SpRefSplit* rs = nullptr) {
     arena = sp_smem;
     const unsigned stride = wstride_op ? wstride_op : k;
     x += (size_t)a_row0 * k;
@@ -1249,7 +1301,8 @@ static __device__ __noinline__ void d_dense_gemm_f32(float* __restrict__ out, co
     if (flags & 4u) {
         const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
         if ((flags & 8u) && (k & 7u) == 0 && (stride & 7u) == 0 && sp_aligned(x, 16) && sp_aligned(wb, 16)) {
-            sp_tc_gemm<false, true>(m, n, k, la, SpRowBf16{wb, k, stride, true}, ep, slice, nblk, arena, scratch, ln);
+            sp_tc_gemm<false, true>(m, n, k, la, SpRowBf16{wb, k, stride, true}, ep, slice, nblk, arena,
+                                    rs ? nullptr : scratch, ln, rs);
             return;
         }
         const SpRowBf16 lb{wb, k, stride, (stride & 3u) == 0 && sp_aligned(wb, 8)};
@@ -1891,10 +1944,13 @@ static __device__ __noinline__ void d_grouped_attention_f32(float* __restrict__ 
                                                unsigned hw, unsigned group_rows, unsigned flags,
                                                unsigned slice, unsigned nblk, float* arena) {
     arena = sp_smem;
-    const unsigned valid_rows = valid ? *valid : rows;
+    /* flags 8: `valid` is a group table {count, (first row, rows) x count}, so packed utterances
+     * attend only within their own windows. */
+    const bool table = (flags & 8u) && valid;
+    const unsigned valid_rows = table ? rows : valid ? *valid : rows;
     if (hw == 0 || width % hw != 0 || group_rows == 0 || group_rows > 256u || valid_rows == 0 ||
         valid_rows > rows) return;
-    const unsigned heads = width / hw, groups = (valid_rows + group_rows - 1) / group_rows;
+    const unsigned heads = width / hw, groups = table ? valid[0] : (valid_rows + group_rows - 1) / group_rows;
     const unsigned chunks = (group_rows + PLOW_NV_WARPS - 1) / PLOW_NV_WARPS;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     float* sc = arena + warp * 256u;
@@ -1909,8 +1965,9 @@ static __device__ __noinline__ void d_grouped_attention_f32(float* __restrict__ 
     const bool vec = hw % 4u == 0 && width % 4u == 0 && sp_aligned(key, 16) && sp_aligned(value, 16);
     for (unsigned item = slice; item < groups * heads * chunks; item += nblk) {
         const unsigned chunk = item % chunks, gh = item / chunks, g = gh / heads, head = gh - g * heads;
-        const unsigned first = g * group_rows;
-        const unsigned last = first + group_rows < valid_rows ? first + group_rows : valid_rows;
+        const unsigned first = table ? valid[1u + 2u * g] : g * group_rows;
+        const unsigned span = table ? min(valid[2u + 2u * g], group_rows) : group_rows;
+        const unsigned last = first < valid_rows ? min(first + span, valid_rows) : first;
         const unsigned n = last - first;
         if (chunk * PLOW_NV_WARPS >= n) continue;
         const float* kb = key + (size_t)first * width + head * hw;
@@ -3450,6 +3507,13 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
             d_dense_gemm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3), in->i[0],
                              in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], slice, nblk, arena,
                              (float*)SP_TEN(4), &ln);
+            break;
+        }
+        if (in->i[7] & 128u) {
+            const SpRefSplit rs{(const unsigned*)SP_TEN(4), in->fj[1].u};
+            d_dense_gemm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3), in->i[0],
+                             in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], in->i[7], slice, nblk, arena,
+                             nullptr, nullptr, &rs);
             break;
         }
         d_dense_gemm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), SP_TEN(2), (const float*)SP_TEN(3), in->i[0],

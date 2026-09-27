@@ -27,6 +27,25 @@ pub trait PacketRuntime: Send {
     fn tensor(&self, name: &str) -> Option<PacketTensor>;
     fn write_tensor(&mut self, tensor: PacketTensor, bytes: &[u8]) -> Result<()>;
     fn read_tensor(&self, tensor: PacketTensor, bytes: &mut [u8]) -> Result<()>;
+    /// Write `bytes` at byte `offset` of `tensor`; the rest keeps its contents.
+    fn write_tensor_at(&mut self, tensor: PacketTensor, offset: usize, bytes: &[u8]) -> Result<()> {
+        let mut all = vec![0; tensor.bytes];
+        self.read_tensor(tensor, &mut all)?;
+        all.get_mut(offset..offset.saturating_add(bytes.len()))
+            .ok_or_else(|| RuntimeError::Device("packet tensor write is outside its bounds".into()))?
+            .copy_from_slice(bytes);
+        self.write_tensor(tensor, &all)
+    }
+    /// Read `bytes.len()` bytes from byte `offset` of `tensor`.
+    fn read_tensor_at(&self, tensor: PacketTensor, offset: usize, bytes: &mut [u8]) -> Result<()> {
+        let mut all = vec![0; tensor.bytes];
+        self.read_tensor(tensor, &mut all)?;
+        bytes.copy_from_slice(
+            all.get(offset..offset.saturating_add(bytes.len()))
+                .ok_or_else(|| RuntimeError::Device("packet tensor read is outside its bounds".into()))?,
+        );
+        Ok(())
+    }
     fn copy_tensor(
         &mut self,
         source: PacketTensor,
@@ -106,6 +125,10 @@ impl ForwardPacket {
 
     pub fn runtime(&self) -> &dyn PacketRuntime {
         self.runtime.as_ref()
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut dyn PacketRuntime {
+        self.runtime.as_mut()
     }
 
     pub fn backend(&self) -> &'static str {

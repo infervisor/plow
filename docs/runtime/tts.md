@@ -88,6 +88,16 @@ Packed prefill of 8 x 60-row prompts, one launch vs serial (H100): Veena 10.0 vs
 Chatterbox T3 7.1 vs 29.4 ms, Qwen3-ASR 7.5 vs 38.9 ms. A CFG pair's two members are
 separate packed requests; the request's first token is drawn once both rows are in.
 
+Qwen3-ASR's audio encoder batches too: queued utterances share one `encoder.pkt` launch
+(`packed.{chunks}.{stage}`, 4..192 100-frame chunks), back to back by chunk. `GroupedAttentionF32`
+flag 8 keeps each utterance's attention inside its own windows (a group table), and
+`DenseGemmF32` flag 128 sums each row's K as that utterance's single-utterance capacity splits
+it (per-row reference rows), so every transcript is bit-identical to the request run alone; a
+lone utterance runs its single-utterance capacity. The encoder's ops are fused 12 per program.
+H100, 292 requests: RTFx 92 / 252 / 397 / 393 / 394 before, 98 / 505 / 670 / 702 / 776 after
+at c1 / 16 / 32 / 64 / 128; p50 63 -> 59 ms at c1, 981 -> 532 ms at c64; WER 3.913% at every
+level. c1 is decode-bound (~2.3 ms per token).
+
 Admission: requests past the slots queue (4 engine batches of ingress; the ASR front bounds
 its own requests in flight at 256 and waits for mux room instead of answering 429). A CFG
 request takes two slots, so the 128-slot rung serves 64 Chatterbox requests; the rest queue

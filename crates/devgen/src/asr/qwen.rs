@@ -2,7 +2,7 @@ use crate::conv2d::{
     self, Conv2dSpec, Conv2dStage, ConvActivation, ConvKind, ConvLayout, ConvWeight,
 };
 use crate::pipeline::{
-    DenseActivation, DenseF32Stage, DenseLayerNorm, DenseWeight, GroupedAttentionF32Stage,
+    DenseActivation, DenseF32Stage, DenseLayerNorm, DenseSplit, DenseWeight, GroupedAttentionF32Stage,
     InitializedAddF32Stage, LayerNormF32Stage, PacketPrefix, RowStatsF32Stage, ScaledAddF32Stage,
     TensorRef,
 };
@@ -23,7 +23,12 @@ pub struct AudioEncoderPackets {
     pub output_shape: [u32; 4],
     feature_frames: u32,
     valid_rows: u32,
+    groups: u32,
+    split_rows: u32,
+    /// Utterances packed chunk by chunk (group-table attention) instead of one per capacity.
+    packed: bool,
     capacity_programs: BTreeMap<u32, Vec<usize>>,
+    packed_programs: BTreeMap<u32, Vec<usize>>,
     frontend: Option<(u32, BTreeMap<String, u64>, [u64; 2])>,
 }
 
@@ -36,15 +41,21 @@ pub enum AudioWeightDType {
 impl AudioEncoderPackets {
     pub fn merge_capacity(&mut self, mut bucket: AudioEncoderPackets) -> Result<(), String> {
         let capacity = bucket.feature_frames;
+        let (programs, own) = if bucket.packed {
+            (&self.packed_programs, self.packed)
+        } else {
+            (&self.capacity_programs, !self.packed)
+        };
         if capacity == 0
-            || capacity >= self.feature_frames
-            || self.capacity_programs.contains_key(&capacity)
+            || (own && capacity >= self.feature_frames)
+            || programs.contains_key(&capacity)
             || bucket.rows > self.rows
             || bucket.prefix.model.n_cu != self.prefix.model.n_cu
             || bucket.prefix.model.target != self.prefix.model.target
             || !bucket.prefix.model.gen.is_empty()
             || bucket.prefix.model.tensors.len() != self.prefix.model.tensors.len()
             || !bucket.capacity_programs.is_empty()
+            || !bucket.packed_programs.is_empty()
         {
             return Err("incompatible Qwen audio encoder capacity".into());
         }
@@ -93,7 +104,11 @@ impl AudioEncoderPackets {
             );
             merged.push(index);
         }
-        self.capacity_programs.insert(capacity, merged);
+        if bucket.packed {
+            self.packed_programs.insert(capacity / 100, merged);
+        } else {
+            self.capacity_programs.insert(capacity, merged);
+        }
         Ok(())
     }
 
@@ -164,16 +179,33 @@ impl AudioEncoderPackets {
             .pipelines
             .first_mut()
             .ok_or("Qwen audio packet has no pipeline")?;
+        let own = if self.packed { format!("packed.{}", feature_frames / 100) } else { format!("forward.{feature_frames}") };
         for (stage, &program) in self.prefix.programs.iter().enumerate() {
-            pipeline
-                .programs
-                .insert(format!("forward.{feature_frames}.{stage}"), program as u32);
+            pipeline.programs.insert(format!("{own}.{stage}"), program as u32);
         }
         for (&capacity, programs) in &self.capacity_programs {
             for (stage, &program) in programs.iter().enumerate() {
                 pipeline
                     .programs
                     .insert(format!("forward.{capacity}.{stage}"), program as u32);
+            }
+        }
+        // `packed.{chunks}.{stage}`: utterances packed chunk by chunk, with the `groups` table.
+        for (&chunks, programs) in &self.packed_programs {
+            for (stage, &program) in programs.iter().enumerate() {
+                pipeline
+                    .programs
+                    .insert(format!("packed.{chunks}.{stage}"), program as u32);
+            }
+        }
+        if self.packed {
+            // The unbucketed forward sequence is the largest single-utterance capacity.
+            let (_, largest) = self
+                .capacity_programs
+                .last_key_value()
+                .ok_or("packed Qwen audio packet has no single-utterance capacity")?;
+            for (stage, &program) in largest.iter().enumerate() {
+                pipeline.programs.insert(format!("forward.{stage}"), program as u32);
             }
         }
         pipeline
@@ -185,6 +217,9 @@ impl AudioEncoderPackets {
         pipeline.parameters.insert("feature_bins".into(), 128);
         pipeline.parameters.insert("output_width".into(), 2048);
         pipeline.parameters.insert("qwen_audio_graph_v1".into(), 1);
+        pipeline
+            .parameters
+            .insert("attention.window_rows".into(), u64::from(self.output_shape[3] * 8));
         pipeline.tensors.insert(
             "valid_rows".into(),
             plow_asset::packet_pipeline::PipelineTensor {
@@ -193,6 +228,22 @@ impl AudioEncoderPackets {
                     .clone(),
                 dtype: PipelineDType::U32,
                 shape: vec![1],
+            },
+        );
+        pipeline.tensors.insert(
+            "split_rows".into(),
+            plow_asset::packet_pipeline::PipelineTensor {
+                name: self.prefix.model.tensors[self.split_rows as usize].name.clone(),
+                dtype: PipelineDType::U32,
+                shape: vec![self.prefix.model.tensors[self.split_rows as usize].bytes / 4],
+            },
+        );
+        pipeline.tensors.insert(
+            "groups".into(),
+            plow_asset::packet_pipeline::PipelineTensor {
+                name: self.prefix.model.tensors[self.groups as usize].name.clone(),
+                dtype: PipelineDType::U32,
+                shape: vec![self.prefix.model.tensors[self.groups as usize].bytes / 4],
             },
         );
         if let Some((tensor, parameters, shape)) = &self.frontend {
@@ -224,7 +275,23 @@ impl AudioEncoderPackets {
 }
 
 pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncoderPackets, String> {
-    if !(50..=3000).contains(&feature_frames) || n_cu == 0 {
+    if !(50..=3000).contains(&feature_frames) {
+        return Err("invalid Qwen audio encoder geometry".into());
+    }
+    lower(feature_frames, n_cu, false)
+}
+
+/// `chunks` 100-frame chunks of any number of utterances, each starting on a chunk; the `groups`
+/// table lists every utterance's attention windows `(first row, valid rows)`.
+pub fn lower_packed_audio_encoder(chunks: u32, n_cu: u32) -> Result<AudioEncoderPackets, String> {
+    if chunks == 0 || chunks > 1024 {
+        return Err("invalid packed Qwen audio encoder geometry".into());
+    }
+    lower(chunks * 100, n_cu, true)
+}
+
+fn lower(feature_frames: u32, n_cu: u32, packed: bool) -> Result<AudioEncoderPackets, String> {
+    if n_cu == 0 {
         return Err("invalid Qwen audio encoder geometry".into());
     }
     let chunks = feature_frames.div_ceil(100);
@@ -275,7 +342,19 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
         packets.output_width,
     ];
     let rows = qwen_audio_rows(feature_frames);
-    let mut prefix = packets.pack_ncfw_rows(rows)?.append_dense_f32(
+    let mut prefix = packets.pack_ncfw_rows(rows)?;
+    let mut builder = packet::devbuild::Builder::new(prefix.model.n_cu);
+    builder.set_tensor_dedup(true);
+    builder.adopt_tensors(std::mem::take(&mut prefix.model.tensors));
+    let valid_rows = builder.tensor("in.qwen.audio_valid_rows", 4);
+    // At most one window per chunk (an utterance takes at least one).
+    let groups = builder.tensor("in.qwen.audio_groups", 4 * (1 + 2 * u64::from(chunks)));
+    // Per row: the rows of its utterance's single-utterance capacity, whose split-K it reproduces.
+    let split_rows = builder.tensor("in.qwen.audio_split_rows", 4 * u64::from(rows));
+    let attention_rows = if packed { groups } else { valid_rows };
+    let split = if packed { DenseSplit::Reference(split_rows) } else { DenseSplit::Parallel };
+    prefix.model.tensors = builder.tensors();
+    prefix = prefix.append_dense_f32(
         rows,
         DenseF32Stage {
             output: "act.qwen.conv_projection",
@@ -288,13 +367,9 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             weight_type: DenseWeight::Bf16,
             input_bf16_exact: true,
             layer_norm: None,
+            split,
         },
     )?;
-    let mut builder = packet::devbuild::Builder::new(prefix.model.n_cu);
-    builder.set_tensor_dedup(true);
-    builder.adopt_tensors(std::mem::take(&mut prefix.model.tensors));
-    let valid_rows = builder.tensor("in.qwen.audio_valid_rows", 4);
-    prefix.model.tensors = builder.tensors();
     let projection = prefix.output;
     let positions = qwen_positions(rows as usize, 1024, output_shape[3] as usize);
     prefix = prefix.append_initialized_add_f32(InitializedAddF32Stage {
@@ -340,6 +415,7 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
                 weight_type: DenseWeight::Bf16,
                 input_bf16_exact: true,
                 layer_norm: None,
+                split,
             },
         )?;
         first_qkv[index] = prefix.output;
@@ -351,7 +427,8 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
         rows,
         GroupedAttentionF32Stage {
             output: "act.qwen.layers.0.attention",
-            valid_rows: Some(valid_rows),
+            valid_rows: Some(attention_rows),
+            group_table: packed,
             width: 1024,
             head_width: 64,
             group_rows: output_shape[3] * 8,
@@ -374,6 +451,7 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             weight_type: DenseWeight::Bf16,
             input_bf16_exact: true,
             layer_norm: None,
+            split,
         },
     )?;
     let attention_projection = prefix.output;
@@ -413,6 +491,7 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             weight_type: DenseWeight::Bf16,
             input_bf16_exact: true,
             layer_norm: None,
+            split,
         },
     )?;
     prefix = prefix.append_dense_f32(
@@ -428,6 +507,7 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             weight_type: DenseWeight::Bf16,
             input_bf16_exact: true,
             layer_norm: None,
+            split,
         },
     )?;
     let fc2 = prefix.output;
@@ -450,7 +530,9 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             ffn_width: 4096,
             head_width: 64,
             group_rows: output_shape[3] * 8,
-            valid_rows: Some(valid_rows),
+            valid_rows: Some(attention_rows),
+            group_table: packed,
+            split,
             first_layer: 1,
             layers: 23,
             weight_prefix: "thinker.audio_tower",
@@ -484,6 +566,7 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             weight_type: DenseWeight::Bf16,
             input_bf16_exact: true,
             layer_norm: None,
+            split,
         },
     )?;
     prefix = prefix.append_dense_f32(
@@ -499,8 +582,10 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             weight_type: DenseWeight::Bf16,
             input_bf16_exact: true,
             layer_norm: None,
+            split,
         },
     )?;
+    fuse_programs(&mut prefix, FUSED_OPS)?;
     Ok(AudioEncoderPackets {
         rows,
         input,
@@ -515,10 +600,88 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
         output_shape,
         feature_frames,
         valid_rows,
+        groups,
+        split_rows,
+        packed,
         capacity_programs: BTreeMap::new(),
+        packed_programs: BTreeMap::new(),
         frontend: None,
         prefix,
     })
+}
+
+/// Ops per fused encoder program: a sequence pays a launch per program rather than per op, and
+/// at the largest bucket one program still ends every few ms, so other streams' kernels (the
+/// decoder's) interleave.
+const FUSED_OPS: usize = 12;
+
+/// Fold runs of `ops` consecutive single-segment programs into one program each, every op waiting
+/// for the previous one to retire: the order separate launches gave.
+fn fuse_programs(prefix: &mut PacketPrefix, ops: usize) -> Result<(), String> {
+    use packet::dev::DevOp;
+    let model = &mut prefix.model;
+    let n_cu = model.n_cu as usize;
+    let mut progs = Vec::new();
+    let mut prog_t = Vec::new();
+    let mut programs = Vec::new();
+    let mut run: Vec<usize> = Vec::new();
+    let mut flush = |run: &mut Vec<usize>, model: &packet::devbuild::Model| -> Result<(), String> {
+        if run.is_empty() {
+            return Ok(());
+        }
+        let mut builder = packet::devbuild::Builder::new(model.n_cu);
+        builder.set_tensor_dedup(true);
+        builder.adopt_tensors(model.tensors.clone());
+        let mut previous: Option<u32> = None;
+        for &p in run.iter() {
+            let program = &model.progs[p];
+            if program.gq_seg_ofs.len() != 2 || program.l2_domains != 0 || program.stream_ofs.len() < n_cu {
+                return Err("Qwen audio program is not a single unplaced segment".into());
+            }
+            for (k, inst) in program.insts.iter().enumerate() {
+                let mut cus = vec![u32::MAX; usize::from(inst.blocks)];
+                for cu in 0..n_cu {
+                    let start = program.stream_ofs[cu] as usize;
+                    for entry in &program.stream[start..start + program.stream_len[cu] as usize] {
+                        if entry.inst as usize == k {
+                            *cus.get_mut(entry.slice as usize).ok_or("Qwen audio slice out of range")? = cu as u32;
+                        }
+                    }
+                }
+                if cus.contains(&u32::MAX) {
+                    return Err("Qwen audio op has an unplaced slice".into());
+                }
+                let op = DevOp::from_u16(inst.op).ok_or("Qwen audio op is unknown")?;
+                let deps: Vec<u32> = previous.into_iter().collect();
+                previous = Some(builder.emit(op, cus, &deps, |fused| {
+                    fused.t = inst.t;
+                    fused.i = inst.i;
+                    fused.f = inst.f;
+                    fused.j = inst.j;
+                }));
+            }
+        }
+        let program = builder.finish();
+        if program.gq_seg_ofs.len() != 2 {
+            return Err("fused Qwen audio program is segmented".into());
+        }
+        programs.push(progs.len());
+        prog_t.push(model.prog_t[run[0]]);
+        progs.push(program);
+        run.clear();
+        Ok(())
+    };
+    for &p in &prefix.programs {
+        run.push(p);
+        if run.len() == ops {
+            flush(&mut run, model)?;
+        }
+    }
+    flush(&mut run, model)?;
+    model.progs = progs;
+    model.prog_t = prog_t;
+    prefix.programs = programs;
+    Ok(())
 }
 
 pub fn qwen_audio_rows(frames: u32) -> u32 {
@@ -556,6 +719,8 @@ pub struct AudioTransformerSpec<'a> {
     pub head_width: u32,
     pub group_rows: u32,
     pub valid_rows: Option<u32>,
+    pub group_table: bool,
+    pub split: DenseSplit,
     pub first_layer: u32,
     pub layers: u32,
     pub weight_prefix: &'a str,
@@ -639,6 +804,7 @@ pub fn append_audio_transformer_layers(
                     weight_type: DenseWeight::Bf16,
                     input_bf16_exact: true,
                     layer_norm: qkv_norm,
+                    split: spec.split,
                 },
             )?;
             qkv[index] = prefix.output;
@@ -651,6 +817,7 @@ pub fn append_audio_transformer_layers(
             GroupedAttentionF32Stage {
                 output: &format!("{activations}.attention"),
                 valid_rows: spec.valid_rows,
+                group_table: spec.group_table,
                 width: spec.width,
                 head_width: spec.head_width,
                 group_rows: spec.group_rows,
@@ -672,6 +839,7 @@ pub fn append_audio_transformer_layers(
                 weight_type: DenseWeight::Bf16,
                 input_bf16_exact: true,
                 layer_norm: None,
+                split: spec.split,
             },
         )?;
         let attention_projection = prefix.output;
@@ -735,6 +903,7 @@ pub fn append_audio_transformer_layers(
                 weight_type: DenseWeight::Bf16,
                 input_bf16_exact: true,
                 layer_norm: fc1_norm,
+                split: spec.split,
             },
         )?;
         prefix = prefix.append_dense_f32(
@@ -750,6 +919,7 @@ pub fn append_audio_transformer_layers(
                 weight_type: DenseWeight::Bf16,
                 input_bf16_exact: true,
                 layer_norm: None,
+                split: spec.split,
             },
         )?;
         let ffn = prefix.output;
@@ -801,6 +971,8 @@ mod tests {
                 head_width: 2,
                 group_rows: 2,
                 valid_rows: None,
+                group_table: false,
+                split: DenseSplit::Parallel,
                 first_layer: 0,
                 layers: 1,
                 weight_prefix: "tower",
@@ -850,6 +1022,8 @@ mod tests {
                 head_width: 2,
                 group_rows: 2,
                 valid_rows: None,
+                group_table: false,
+                split: DenseSplit::Parallel,
                 first_layer: 3,
                 layers: 2,
                 weight_prefix: "tower",
@@ -892,7 +1066,9 @@ mod tests {
         assert_eq!(packets.rows, 7);
         assert_eq!(packets.output_shape, [1, 480, 16, 7]);
         assert_eq!(packets.prefix.input_shape, [1, 128, 50]);
-        assert_eq!(packets.prefix.programs.len(), 271);
+        assert_eq!(packets.prefix.programs.len(), 271usize.div_ceil(FUSED_OPS));
+        let ops: usize = packets.prefix.programs.iter().map(|&p| packets.prefix.model.progs[p].insts.len()).sum();
+        assert_eq!(ops, 273);
         assert_eq!(
             packets.prefix.model.tensors[packets.input as usize].name,
             "in.conv2d"
@@ -928,13 +1104,53 @@ mod tests {
         packets
             .merge_capacity(lower_audio_encoder(100, 4).unwrap())
             .unwrap();
-        assert_eq!(packets.prefix.model.progs.len(), 542);
+        assert_eq!(packets.prefix.model.progs.len(), 2 * 271usize.div_ceil(FUSED_OPS));
         let section = packets.pipeline_section(200).unwrap();
         let metadata: plow_asset::packet_pipeline::PacketPipelines =
             serde_json::from_slice(&section.data).unwrap();
         let programs = &metadata.pipelines[0].programs;
-        assert!(programs.contains_key("forward.100.270"));
-        assert!(programs.contains_key("forward.200.270"));
+        let last = 271usize.div_ceil(FUSED_OPS) - 1;
+        assert!(programs.contains_key(&format!("forward.100.{last}")));
+        assert!(programs.contains_key(&format!("forward.200.{last}")));
+    }
+
+    #[test]
+    fn packed_buckets_share_the_largest_tensor_table() {
+        let mut packets = lower_packed_audio_encoder(4, 4).unwrap();
+        packets.merge_capacity(lower_packed_audio_encoder(2, 4).unwrap()).unwrap();
+        packets.merge_capacity(lower_audio_encoder(300, 4).unwrap()).unwrap();
+        packets.merge_capacity(lower_audio_encoder(100, 4).unwrap()).unwrap();
+        assert!(packets.merge_capacity(lower_audio_encoder(100, 4).unwrap()).is_err());
+        let attention = packets
+            .prefix
+            .model
+            .progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .find(|i| DevOp::from_u16(i.op) == Some(DevOp::GroupedAttentionF32))
+            .unwrap();
+        assert_eq!(attention.i[4], 7 | 8);
+        assert_eq!(attention.t[4], packets.groups);
+        let dense: Vec<_> = packets.packed_programs[&2]
+            .iter()
+            .flat_map(|&p| &packets.prefix.model.progs[p].insts)
+            .filter(|i| DevOp::from_u16(i.op) == Some(DevOp::DenseGemmF32))
+            .collect();
+        assert!(dense.iter().all(|i| i.i[7] & 128 != 0 && i.t[4] == packets.split_rows && i.j[0] == 4));
+        let single = &packets.prefix.model.progs[packets.capacity_programs[&300][0]].insts[4];
+        assert_eq!(DevOp::from_u16(single.op), Some(DevOp::DenseGemmF32));
+        assert_eq!(single.i[7] & 128, 0);
+        let section = packets.pipeline_section(400).unwrap();
+        let metadata: plow_asset::packet_pipeline::PacketPipelines =
+            serde_json::from_slice(&section.data).unwrap();
+        let pipeline = &metadata.pipelines[0];
+        let last = 271usize.div_ceil(FUSED_OPS) - 1;
+        for role in ["packed.4", "packed.2", "forward.300", "forward.100"] {
+            assert!(pipeline.programs.contains_key(&format!("{role}.{last}")), "{role}");
+        }
+        assert_eq!(pipeline.programs["forward.0"], pipeline.programs["forward.300.0"]);
+        assert_eq!(pipeline.tensors["groups"].shape, [9]);
+        assert_eq!(pipeline.parameters["output_rows"], 52);
     }
 }
 

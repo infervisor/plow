@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use packet::dev::{DevProgram, CTR_STRIDE};
 
-use super::{pod_bytes, slab_carve, BLOCK};
+use super::{pod_bytes, BLOCK};
 use crate::asset::devblob::DevBlob;
 use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, GraphExec, KernelFn};
 use crate::device::{Backend, DeviceMem, Module};
@@ -37,6 +37,9 @@ pub struct CudaPacketRuntime {
     names: Vec<String>,
     tensors: Vec<DeviceMem>,
     _table: DeviceMem,
+    /// Every program's counters and cursors, in program order: a run of consecutive programs
+    /// zeroes its counters with one memset.
+    _counters: DeviceMem,
     programs: Vec<Program>,
     /// One CUDA graph per program sequence (every pointer is fixed at load, so a capture stays
     /// valid); `None` once capture failed for that sequence.
@@ -90,8 +93,19 @@ impl CudaPacketRuntime {
         let table = be.alloc(0, (ptrs.len() * 8).max(8) as u64)?;
         be.upload(&table, 0, pod_bytes(&ptrs))?;
 
+        let regions: Vec<(usize, usize)> = blob
+            .progs
+            .iter()
+            .map(|p| {
+                let segments = p.gq_seg_ofs.len().saturating_sub(1);
+                ((p.n_counter as usize * CTR_STRIDE as usize * 4).max(4), segments * CTR_STRIDE as usize * 4)
+            })
+            .collect();
+        let slab_bytes: usize = regions.iter().map(|&(c, k)| (c + k).next_multiple_of(256)).sum();
+        let counter_slab = be.alloc(0, slab_bytes.max(4) as u64)?;
+        let mut slab_offset = 0u64;
         let mut programs = Vec::with_capacity(blob.progs.len());
-        for p in &blob.progs {
+        for (p, &(counter_only, cursor_bytes)) in blob.progs.iter().zip(&regions) {
             if p.gq_seg_ofs.len() < 2 || p.l2_domains != 0 {
                 return Err(RuntimeError::Rejected(format!("{}: program needs an unplaced global-queue stream", path.display())));
             }
@@ -111,9 +125,9 @@ impl CudaPacketRuntime {
             let d_succs = upload(pod_bytes(&p.succs))?;
             let d_gq_stream = upload(pod_bytes(&p.gq_stream))?;
             let d_gq_seg = upload(pod_bytes(&p.gq_seg_ofs))?;
-            let counter_only = (p.n_counter as usize * CTR_STRIDE as usize * 4).max(4);
-            let cursor_bytes = segments * CTR_STRIDE as usize * 4;
-            let (slab, [counters, cursors]) = slab_carve(&be, [counter_only, cursor_bytes])?;
+            let counters = counter_slab.base + slab_offset;
+            let cursors = counters + counter_only as u64;
+            slab_offset += (counter_only + cursor_bytes).next_multiple_of(256) as u64;
             let kernarg = DevProgram {
                 insts: d_inst.base,
                 stream: d_stream.base,
@@ -121,7 +135,7 @@ impl CudaPacketRuntime {
                 stream_len: d_slen.base,
                 waits: d_waits.base,
                 succs: d_succs.base,
-                counters: counters.base,
+                counters,
                 tensors: table.base,
                 trace: 0,
                 cur_seg: 0,
@@ -130,7 +144,7 @@ impl CudaPacketRuntime {
                 n_seg: 1,
                 gq_stream: d_gq_stream.base,
                 gq_seg_ofs: d_gq_seg.base,
-                gq_cursor: cursors.base,
+                gq_cursor: cursors,
                 xctr: 0,
                 peer_scratch: 0,
                 rank: 0,
@@ -145,9 +159,9 @@ impl CudaPacketRuntime {
             programs.push(Program {
                 kernarg,
                 segments,
-                counters: slab.base,
+                counters,
                 counter_bytes: counter_only + cursor_bytes,
-                _tables: vec![d_inst, d_stream, d_sofs, d_slen, d_waits, d_succs, d_gq_stream, d_gq_seg, slab],
+                _tables: vec![d_inst, d_stream, d_sofs, d_slen, d_waits, d_succs, d_gq_stream, d_gq_seg],
             });
         }
         let stream = be.stream_create()?;
@@ -164,6 +178,7 @@ impl CudaPacketRuntime {
             names: blob.tensors.iter().map(|t| t.name.clone()).collect(),
             tensors,
             _table: table,
+            _counters: counter_slab,
             programs,
             graphs: std::collections::HashMap::new(),
             last_us: 0.0,
@@ -185,9 +200,17 @@ impl CudaPacketRuntime {
     }
 
     fn enqueue(&self, programs: &[usize]) -> Result<()> {
+        let consecutive = programs.windows(2).all(|w| w[1] == w[0] + 1);
+        if let (true, Some(&first), Some(&last)) = (consecutive, programs.first(), programs.last()) {
+            let (first, last) = (&self.programs[first], &self.programs[last]);
+            let bytes = (last.counters + last.counter_bytes as u64 - first.counters) as usize;
+            self.be.memset_d8_async(first.counters, 0, bytes, &self.stream)?;
+        }
         for &program in programs {
             let p = &self.programs[program];
-            self.be.memset_d8_async(p.counters, 0, p.counter_bytes, &self.stream)?;
+            if !consecutive {
+                self.be.memset_d8_async(p.counters, 0, p.counter_bytes, &self.stream)?;
+            }
             for seg in 0..p.segments {
                 let mut arg = p.kernarg;
                 arg.gq_seg_ofs += (seg * 4) as u64;
@@ -220,6 +243,18 @@ impl PacketRuntime for CudaPacketRuntime {
         let mem = self.mem(tensor)?;
         check_transfer(tensor, tensor.handle, mem.len as usize, bytes.len())?;
         self.be.download(mem, 0, bytes)
+    }
+
+    fn write_tensor_at(&mut self, tensor: PacketTensor, offset: usize, bytes: &[u8]) -> Result<()> {
+        let mem = self.mem(tensor)?;
+        check_transfer(tensor, tensor.handle, mem.len as usize, mem.len as usize)?;
+        self.be.upload(mem, offset as u64, bytes)
+    }
+
+    fn read_tensor_at(&self, tensor: PacketTensor, offset: usize, bytes: &mut [u8]) -> Result<()> {
+        let mem = self.mem(tensor)?;
+        check_transfer(tensor, tensor.handle, mem.len as usize, mem.len as usize)?;
+        self.be.download(mem, offset as u64, bytes)
     }
 
     fn copy_tensor(

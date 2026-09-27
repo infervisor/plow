@@ -183,6 +183,17 @@ pub struct DenseF32Stage<'a> {
     pub input_bf16_exact: bool,
     /// Normalize the input on load (DenseGemmF32 LayerNorm prologue).
     pub layer_norm: Option<DenseLayerNorm<'a>>,
+    pub split: DenseSplit,
+}
+
+/// How a tensor-core DenseGemmF32 splits K.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseSplit {
+    /// Over idle blocks while the tiles do not fill the machine (the order depends on `rows`).
+    Parallel,
+    /// Every row sums K as a `Parallel` launch of `rows[row]` rows would (a u32 per row; flag
+    /// 128): rows packed from several requests give each request's own bits.
+    Reference(u32),
 }
 
 /// DenseGemmF32's LayerNorm prologue (flag bit 5): `A' = (A - mean) * inv * gamma + beta` with
@@ -256,6 +267,9 @@ pub struct LayerNormF32Stage<'a> {
 pub struct GroupedAttentionF32Stage<'a> {
     pub output: &'a str,
     pub valid_rows: Option<u32>,
+    /// `valid_rows` is a group table `{count, (first row, rows) x count}` (flag 8): packed
+    /// utterances, each attending within its own windows.
+    pub group_table: bool,
     pub width: u32,
     pub head_width: u32,
     pub group_rows: u32,
@@ -680,16 +694,35 @@ impl PacketPrefix {
             stage.output_width,
             stage.input_width,
             tensor_cores,
+            stage.split == DenseSplit::Parallel,
             self.model.n_cu,
         );
+        if let DenseSplit::Reference(rows_ref) = stage.split {
+            if !tensor_cores
+                || stage.layer_norm.is_some()
+                || stage.input_width % 8 != 0
+                || rows_ref as usize >= builder.n_tensors()
+                || builder.tensor_bytes(rows_ref) < u64::from(rows) * 4
+            {
+                return Err("reference split needs bf16 tensor cores, no prologue and a row table".into());
+            }
+        }
+        // Declared under either split, so both lowerings share one tensor table.
         let scratch = if tensor_cores {
-            builder.tensor(
+            let scratch = builder.tensor(
                 DENSE_SPLITK_SCRATCH,
                 (u64::from(DENSE_SPLITK_TICKETS) + u64::from(self.model.n_cu) * 64 * 64) * 4,
-            )
+            );
+            match stage.split {
+                DenseSplit::Parallel => scratch,
+                DenseSplit::Reference(rows_ref) => rows_ref,
+            }
         } else {
             packet::dev::TENSOR_NONE
         };
+        let reference = matches!(stage.split, DenseSplit::Reference(_));
+        let flags = flags | (u32::from(reference) << 7);
+        let n_cu = self.model.n_cu;
         builder.emit(
             DevOp::DenseGemmF32,
             repeated(self.model.n_cu, blocks),
@@ -704,6 +737,9 @@ impl PacketPrefix {
                     activation,
                 ]);
                 instruction.i[7] = flags;
+                if reference {
+                    instruction.j[0] = n_cu;
+                }
             },
         );
         let program = self.model.progs.len();
@@ -854,6 +890,7 @@ impl PacketPrefix {
             || stage.head_width == 0
             || stage.width % stage.head_width != 0
             || !(1..=256).contains(&stage.group_rows)
+            || (stage.group_table && stage.valid_rows.is_none())
         {
             return Err("invalid grouped-attention geometry".into());
         }
@@ -870,7 +907,8 @@ impl PacketPrefix {
         let output = builder.tensor(stage.output, tensor_bytes(rows, stage.width, 4)?);
         let flags = u32::from(stage.round_score_bf16)
             | (u32::from(stage.round_probability_bf16) << 1)
-            | (u32::from(stage.round_output_bf16) << 2);
+            | (u32::from(stage.round_output_bf16) << 2)
+            | (u32::from(stage.group_table) << 3);
         let heads = stage.width / stage.head_width;
         // One slice per (group, head, 8-row query chunk), as the interpreter decomposes it.
         let blocks = rows
@@ -1683,12 +1721,12 @@ const DENSE_SPLITK_TICKETS: u32 = 1024;
 /// DenseGemmF32 slices, mirroring the interpreter's decomposition (op_speech_f32.cuh): FP32 FFMA
 /// uses 128x128 tiles; the tensor-core path 64x64 tiles, split over K (BK = 64) until the tiles
 /// fill the machine.
-fn dense_blocks(rows: u32, n: u32, k: u32, tensor_cores: bool, n_cu: u32) -> u32 {
+fn dense_blocks(rows: u32, n: u32, k: u32, tensor_cores: bool, split_k: bool, n_cu: u32) -> u32 {
     if !tensor_cores {
         return (rows.div_ceil(128) * n.div_ceil(128)).clamp(1, n_cu);
     }
     let tiles = rows.div_ceil(64) * n.div_ceil(64);
-    if tiles > DENSE_SPLITK_TICKETS || tiles * 2 > n_cu {
+    if !split_k || tiles > DENSE_SPLITK_TICKETS || tiles * 2 > n_cu {
         return tiles.min(n_cu);
     }
     let steps = k.div_ceil(64).max(1);
@@ -1786,6 +1824,7 @@ mod tests {
                 weight_type: DenseWeight::F32,
                 input_bf16_exact: false,
                 layer_norm: None,
+                split: DenseSplit::Parallel,
             },
         )
         .unwrap();
@@ -1845,7 +1884,8 @@ mod tests {
                     weight_type: DenseWeight::F32,
                     input_bf16_exact: false,
                     layer_norm: None,
-                    },
+                    split: DenseSplit::Parallel,
+                },
             )
             .unwrap();
         let query = prefix.output;
@@ -1864,7 +1904,8 @@ mod tests {
                     weight_type: DenseWeight::F32,
                     input_bf16_exact: false,
                     layer_norm: None,
-                    },
+                    split: DenseSplit::Parallel,
+                },
             )
             .unwrap();
         let key = prefix.output;
@@ -1880,6 +1921,7 @@ mod tests {
                 GroupedAttentionF32Stage {
                     output: "attention",
                     valid_rows: None,
+                    group_table: false,
                     width: 5,
                     head_width: 5,
                     group_rows: 3,

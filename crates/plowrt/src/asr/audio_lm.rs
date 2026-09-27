@@ -5,7 +5,7 @@ use super::{
     frontend::{MelFeatures, PacketLogMelFrontend},
     Transcript,
 };
-use crate::exec::packet_runtime::ForwardPacket;
+use crate::exec::packet_runtime::{ForwardPacket, PacketTensor};
 use crate::serve::template::ChatTemplate;
 use crate::text::tokenizer::{load_tokenizer, Tokenize};
 use crate::{Result, RuntimeError};
@@ -35,12 +35,21 @@ pub(crate) struct AudioLmPrefilled {
 
 pub(crate) struct PacketAudioEncoder {
     pub(crate) packet: ForwardPacket,
+    /// Largest single-utterance capacity.
     feature_frames: usize,
     feature_bins: usize,
-    output_rows: usize,
     output_width: usize,
     chunking: AudioChunking,
-    /// Attention window of the encoder, in rows (0: unwindowed).
+    /// Single-utterance capacities (frames), ascending.
+    single: Vec<(u32, Vec<usize>)>,
+    /// Packed capacities (chunks of any number of utterances), ascending.
+    packed: Vec<(usize, Vec<usize>)>,
+    input: PacketTensor,
+    output: PacketTensor,
+    valid_rows: PacketTensor,
+    groups: Option<PacketTensor>,
+    split_rows: Option<PacketTensor>,
+    /// Attention window of the packed programs, in rows.
     window_rows: usize,
 }
 
@@ -82,36 +91,75 @@ impl PacketAudioEncoder {
             usize::try_from(packet.parameter(name)?)
                 .map_err(|_| RuntimeError::Rejected(format!("audio packet parameter {name:?} overflows")))
         };
-        let feature_frames = usize_param("input_frames")?;
+        let input_frames = usize_param("input_frames")?;
         let output_rows = usize_param("output_rows")?;
         let feature_bins = usize_param("feature_bins")?;
         let output_width = usize_param("output_width")?;
+        let pipeline = packet.pipeline();
+        let single = pipeline.program_capacity_sequences("forward")?;
+        let packed: Vec<(usize, Vec<usize>)> = pipeline
+            .program_capacity_sequences("packed")?
+            .into_iter()
+            .map(|(chunks, programs)| (chunks as usize, programs))
+            .collect();
+        let groups = pipeline.tensor("groups").ok();
+        let split_rows = pipeline.tensor("split_rows").ok();
         let window_rows = packet.optional_parameter("attention.window_rows").unwrap_or(0) as usize;
-        let chunks = feature_frames.div_ceil(chunking.chunk_frames);
-        let input_bytes = chunks
+        let feature_frames = single.last().map_or(input_frames, |&(frames, _)| frames as usize);
+        let max_chunks = input_frames.div_ceil(chunking.chunk_frames);
+        let input_bytes = max_chunks
             .checked_mul(feature_bins)
             .and_then(|elements| elements.checked_mul(chunking.chunk_frames * std::mem::size_of::<f32>()));
         let output_bytes = output_rows
             .checked_mul(output_width)
             .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()));
-        if feature_frames == 0
+        if input_frames == 0
             || feature_bins == 0
             || output_width == 0
-            || output_rows != chunking.rows(feature_frames)
+            || feature_frames > input_frames
+            || output_rows != chunking.rows(input_frames)
             || input_bytes != Some(packet.input_bytes())
             || output_bytes != Some(packet.output_bytes())
+            || packed.last().is_some_and(|&(chunks, _)| chunks > max_chunks)
+            || (!packed.is_empty()
+                && (window_rows == 0
+                    || groups.is_none_or(|g| g.bytes < 4 * (1 + 2 * packed.last().unwrap().0))
+                    || split_rows.is_none_or(|t| t.bytes < 4 * output_rows)))
         {
             return Err(RuntimeError::Rejected("audio packet geometry is inconsistent".into()));
         }
-        Ok(Self { packet, feature_frames, feature_bins, output_rows, output_width, chunking, window_rows })
+        Ok(Self {
+            input: pipeline.tensor("input")?,
+            output: pipeline.tensor("output")?,
+            valid_rows: pipeline.tensor("valid_rows")?,
+            packet,
+            feature_frames,
+            feature_bins,
+            output_width,
+            chunking,
+            single,
+            packed,
+            groups,
+            split_rows,
+            window_rows,
+        })
     }
 
     pub(crate) fn accepts(&self, frames: usize) -> bool {
         (1..=self.feature_frames).contains(&frames)
     }
 
-    pub(crate) fn encode(&mut self, features: &MelFeatures) -> Result<Vec<f32>> {
-        if !self.accepts(features.frames)
+    /// Largest number of 100-frame chunks one packed launch holds (0: no packed programs).
+    pub(crate) fn max_packed_chunks(&self) -> usize {
+        self.packed.last().map_or(0, |&(chunks, _)| chunks)
+    }
+
+    pub(crate) fn chunks(&self, frames: usize) -> usize {
+        frames.div_ceil(self.chunking.chunk_frames)
+    }
+
+    fn check(&self, features: &MelFeatures) -> Result<()> {
+        if features.frames == 0
             || self
                 .feature_bins
                 .checked_mul(features.frames)
@@ -119,33 +167,129 @@ impl PacketAudioEncoder {
         {
             return Err(RuntimeError::Rejected("audio features do not match packet capacity".into()));
         }
+        Ok(())
+    }
+
+    /// `[chunk][bin][frame]` encoder input for features starting at chunk `first`, tail zeroed.
+    fn stage(&self, features: &MelFeatures, input: &mut [f32], first: usize) {
         let chunk = self.chunking.chunk_frames;
-        let chunks = self.feature_frames.div_ceil(chunk);
-        let mut input = vec![0.0f32; chunks * self.feature_bins * chunk];
-        for batch in 0..chunks {
+        for batch in 0..self.chunks(features.frames) {
             for bin in 0..self.feature_bins {
-                for frame in 0..chunk {
-                    let source_frame = batch * chunk + frame;
-                    if source_frame < features.frames {
-                        let v = features.values[bin * features.frames + source_frame];
-                        input[(batch * self.feature_bins + bin) * chunk + frame] =
-                            if self.chunking.round_bf16 { round_bf16(v) } else { v };
-                    }
+                let row = &mut input[((first + batch) * self.feature_bins + bin) * chunk..][..chunk];
+                let source = &features.values[bin * features.frames..][..features.frames];
+                for (frame, value) in row.iter_mut().enumerate() {
+                    *value = match source.get(batch * chunk + frame) {
+                        Some(&v) if self.chunking.round_bf16 => round_bf16(v),
+                        Some(&v) => v,
+                        None => 0.0,
+                    };
                 }
             }
         }
-        let mut output = vec![0.0f32; self.output_rows * self.output_width];
+    }
+
+    fn launch(&mut self, programs: &[usize], writes: &[(PacketTensor, &[u8])], output: &mut [u8]) -> Result<()> {
+        let runtime = self.packet.runtime_mut();
+        runtime.begin_execution()?;
+        let result = (|| {
+            for &(tensor, bytes) in writes {
+                runtime.write_tensor_at(tensor, 0, bytes)?;
+            }
+            runtime.run_sequence(programs)?;
+            runtime.read_tensor_at(self.output, 0, output)
+        })();
+        let ended = runtime.end_execution();
+        result.and(ended)
+    }
+
+    pub(crate) fn encode(&mut self, features: &MelFeatures) -> Result<Vec<f32>> {
+        self.check(features)?;
+        let requested = u32::try_from(features.frames)
+            .map_err(|_| RuntimeError::Rejected("audio feature frame count overflows".into()))?;
+        let (capacity, programs) = self
+            .single
+            .iter()
+            .find(|(capacity, _)| *capacity >= requested)
+            .map(|(capacity, programs)| (*capacity as usize, programs.clone()))
+            .ok_or_else(|| RuntimeError::Rejected("audio features do not match packet capacity".into()))?;
+        let chunk = self.chunking.chunk_frames;
+        let mut input = vec![0.0f32; self.chunks(capacity) * self.feature_bins * chunk];
+        self.stage(features, &mut input, 0);
         let valid_rows = self.chunking.rows(features.frames);
         let valid_rows_u32 = u32::try_from(valid_rows)
             .map_err(|_| RuntimeError::Rejected("audio packet row count overflows".into()))?;
-        self.packet.write("valid_rows", &valid_rows_u32.to_le_bytes())?;
-        self.packet.run_for_capacity(
-            features.frames.try_into().map_err(|_| RuntimeError::Rejected("audio feature frame count overflows".into()))?,
-            bytemuck::cast_slice(&input),
-            bytemuck::cast_slice_mut(&mut output),
-        )?;
-        output.truncate(valid_rows * self.output_width);
+        let mut output = vec![0.0f32; valid_rows * self.output_width];
+        let writes = [(self.input, bytemuck::cast_slice(&input)), (self.valid_rows, &valid_rows_u32.to_le_bytes()[..])];
+        self.launch(&programs, &writes, bytemuck::cast_slice_mut(&mut output))?;
         Ok(output)
+    }
+
+    /// Several utterances in one packed launch (their chunks back to back, each attending only
+    /// within its own windows and summing as its single-utterance capacity does): every item's
+    /// rows bit for bit as [`Self::encode`] gives them. Together they must fit
+    /// [`Self::max_packed_chunks`].
+    pub(crate) fn encode_packed(&mut self, items: &[&MelFeatures]) -> Result<Vec<Vec<f32>>> {
+        let (Some(groups), Some(split_rows), Some(&(max_chunks, _))) = (self.groups, self.split_rows, self.packed.last())
+        else {
+            return items.iter().map(|features| self.encode(features)).collect();
+        };
+        for features in items {
+            self.check(features)?;
+        }
+        let total: usize = items.iter().map(|f| self.chunks(f.frames)).sum();
+        if total == 0 || total > max_chunks {
+            return Err(RuntimeError::Rejected(format!("{total} audio chunks exceed the packed encoder")));
+        }
+        let programs = self.packed.iter().find(|&&(chunks, _)| chunks >= total).map(|(_, p)| p.clone()).unwrap();
+        let chunk = self.chunking.chunk_frames;
+        let chunk_rows = chunk.div_ceil(self.chunking.frame_stride);
+        let mut input = vec![0.0f32; total * self.feature_bins * chunk];
+        let mut table = vec![0u32];
+        let mut reference = vec![0u32; total * chunk_rows];
+        let mut spans = Vec::with_capacity(items.len());
+        let mut first = 0;
+        for features in items {
+            let capacity = self
+                .single
+                .iter()
+                .map(|&(frames, _)| frames as usize)
+                .find(|&frames| frames >= features.frames)
+                .ok_or_else(|| RuntimeError::Rejected("audio exceeds every single-utterance capacity".into()))?;
+            reference[first * chunk_rows..(first + self.chunks(features.frames)) * chunk_rows]
+                .fill(self.chunking.rows(capacity) as u32);
+            self.stage(features, &mut input, first);
+            let (row, rows) = (first * chunk_rows, self.chunking.rows(features.frames));
+            for window in (0..rows).step_by(self.window_rows) {
+                table.extend([(row + window) as u32, (rows - window).min(self.window_rows) as u32]);
+            }
+            spans.push((row, rows));
+            first += self.chunks(features.frames);
+        }
+        table[0] = ((table.len() - 1) / 2) as u32;
+        let mut output = vec![0.0f32; total * chunk_rows * self.output_width];
+        let writes = [
+            (self.input, bytemuck::cast_slice(&input)),
+            (groups, bytemuck::cast_slice(&table)),
+            (split_rows, bytemuck::cast_slice(&reference)),
+        ];
+        self.launch(&programs, &writes, bytemuck::cast_slice_mut(&mut output))?;
+        let width = self.output_width;
+        Ok(spans.into_iter().map(|(row, rows)| output[row * width..(row + rows) * width].to_vec()).collect())
+    }
+
+    /// Run every capacity once (no valid rows): each sequence's CUDA graph is captured now, not
+    /// under load, where a capture overlapping another thread's context synchronize fails.
+    pub(crate) fn warm(&mut self) -> Result<()> {
+        let mut writes = vec![(self.valid_rows, &[0u8; 4][..])];
+        if let Some(groups) = self.groups {
+            writes.push((groups, &[0u8; 4][..]));
+        }
+        let sequences: Vec<Vec<usize>> =
+            self.single.iter().map(|(_, p)| p.clone()).chain(self.packed.iter().map(|(_, p)| p.clone())).collect();
+        for programs in sequences {
+            self.launch(&programs, &writes, &mut [])?;
+        }
+        Ok(())
     }
 
     /// Encoder rows one attention window spans (0: unwindowed).
@@ -155,6 +299,11 @@ impl PacketAudioEncoder {
 
     pub(crate) fn output_width(&self) -> usize {
         self.output_width
+    }
+
+    /// GPU time of the last launch.
+    pub(crate) fn last_gpu_us(&self) -> f64 {
+        self.packet.runtime().last_run_us()
     }
 }
 

@@ -10460,9 +10460,27 @@ fn emit_dense_gqa(
             .unwrap_or_else(|e| panic!("{e}"))
     });
     let audio_blob = (c.encoder_overlay_rows > 0 && c.speech_pos_rows == 0 && !block_mode).then(|| {
-        let mut encoder = asr::qwen::lower_audio_encoder(3000, n_cu)
-            .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
-        for capacity in [400, 800, 1200, 1600, 2000] {
+        // Single-utterance buckets (forward.v1); on CUDA also packed buckets (chunks of several
+        // utterances, each attending in its own windows and splitting K as its single bucket
+        // would), the largest sizing every shared tensor.
+        let (packed, single): (&[u32], &[u32]) = if arch.starts_with("sm_") {
+            (&[192, 160, 128, 96, 80, 64, 48, 40, 32, 24, 16, 12, 8, 4], &[3000, 400, 800, 1200, 1600, 2000])
+        } else {
+            (&[], &[400, 800, 1200, 1600, 2000])
+        };
+        let mut encoder = match packed.first() {
+            Some(&chunks) => asr::qwen::lower_packed_audio_encoder(chunks, n_cu),
+            None => asr::qwen::lower_audio_encoder(3000, n_cu),
+        }
+        .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
+        for chunks in packed.iter().skip(1) {
+            let bucket = asr::qwen::lower_packed_audio_encoder(*chunks, n_cu)
+                .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
+            encoder
+                .merge_capacity(bucket)
+                .unwrap_or_else(|error| panic!("Qwen audio packet capacity: {error}"));
+        }
+        for &capacity in single {
             let bucket = asr::qwen::lower_audio_encoder(capacity, n_cu)
                 .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"));
             encoder
@@ -10477,7 +10495,7 @@ fn emit_dense_gqa(
             asr::qwen::whisper_frontend(&dir).unwrap_or_else(|error| panic!("Qwen audio frontend: {error}")),
         );
         let section = encoder
-            .pipeline_section(3000)
+            .pipeline_section(packed.first().map_or(3000, |chunks| chunks * 100))
             .unwrap_or_else(|error| panic!("Qwen audio packet metadata: {error}"));
         (encoder.prefix.model, section)
     });

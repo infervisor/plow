@@ -2,7 +2,8 @@
 //! `packet_bench PACKET PIPELINE ROLE [ITERS] [--sweep]`. With `--sweep` every instruction cap
 //! 0..=n_inst is timed in this process (JSON lines `{"cap":..,"us":..}`): the marginal cost of
 //! instruction i is us(cap = i + 1) - us(cap = i). With `--each` and ROLE a prefix, every program
-//! of the role sequence `ROLE.<n>` is timed alone (JSON lines `{"role":..,"program":..,"us":..}`).
+//! of the role sequence `ROLE.<n>` is timed alone (JSON lines `{"role":..,"program":..,"us":..}`);
+//! with `--seq` the whole sequence is timed as one CUDA graph.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -34,6 +35,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             us.sort_by(f64::total_cmp);
             println!("{{\"role\":\"{}.{n}\",\"program\":{program},\"us\":{:.2}}}", pos[2], us[iters / 2]);
         }
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--seq") {
+        // The whole role sequence `ROLE.<n>` as one CUDA graph (inputs zeroed).
+        let programs = pipeline.program_sequence(pos[2])?;
+        for _ in 0..3 {
+            rt.run_sequence(&programs)?;
+        }
+        let mut us: Vec<f64> =
+            (0..iters).map(|_| rt.run_sequence(&programs).map(|_| rt.last_run_us())).collect::<Result<_, _>>()?;
+        us.sort_by(f64::total_cmp);
+        println!("{{\"role\":\"{}\",\"programs\":{},\"us\":{:.2}}}", pos[2], programs.len(), us[iters / 2]);
         return Ok(());
     }
     let program = pipeline.program(pos[2])?;

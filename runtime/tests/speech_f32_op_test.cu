@@ -245,6 +245,53 @@ static void t_dense(const char* name, unsigned m, unsigned n, unsigned k, unsign
     run(name, c, g_dense_gemm_f32, {o}, flags & 3u ? BF16 : FP32, 1e-5, flags & 2u ? (size_t)m * n / 20000 : 0);
 }
 
+/* Flag 128: rows packed from several requests sum K as each request's own split-K launch would.
+ * Each reference runs alone at devgen's block count (split-K on); the packed run (one launch,
+ * reference rows per row) must match it bit for bit. */
+static unsigned dense_ref_blocks(unsigned rows, unsigned n, unsigned k) {
+    const unsigned tiles = (rows + 63) / 64 * ((n + 63) / 64), steps = (k + 63) / 64;
+    if (tiles > SPT_TICKETS || tiles * 2 > 132u) return std::min(tiles, 132u);
+    const unsigned chunk = (steps + std::min(132u / tiles, steps) - 1) / std::min(132u / tiles, steps);
+    return tiles * ((steps + chunk - 1) / chunk);
+}
+static void t_dense_ref(unsigned n, unsigned k, std::vector<unsigned> items) {
+    Case c;
+    unsigned m = 0;
+    for (unsigned r : items) m += r;
+    unsigned o = c.out((size_t)m * n), x = c.f32((size_t)m * k, 1.f), w = c.bf16((size_t)n * k, 0.06f);
+    round_bf16(c, x);
+    unsigned b = c.f32(n, 0.5f), scratch = splitk_scratch(c);
+    std::vector<uint32_t> ref;
+    for (unsigned r : items) ref.insert(ref.end(), r, r);
+    unsigned table = c.u32(ref);
+    c.upload();
+    void** td = upload_table(c.dev);
+    PlowDevInst in = c.in;
+    in.op = PLOW_DOP_DENSE_GEMM_F32;
+    in.t[0] = o; in.t[1] = x; in.t[2] = w; in.t[3] = b; in.t[4] = table;
+    in.i[0] = m; in.i[1] = n; in.i[2] = k; in.i[7] = 1 | 4 | 8 | 128; in.fj[1].u = 132;
+    k_speech<<<g_nblk, 256, kSmem>>>(in, td);
+    CK(cudaDeviceSynchronize());
+    std::vector<uint32_t> packed((size_t)m * n), alone;
+    CK(cudaMemcpy(packed.data(), c.dev[o], packed.size() * 4, cudaMemcpyDeviceToHost));
+    size_t diff = 0;
+    unsigned row0 = 0;
+    for (unsigned r : items) {
+        PlowDevInst one = in;
+        one.t[4] = scratch; one.i[0] = r; one.i[4] = row0; one.i[7] = 1 | 4 | 8; one.fj[1].u = 0;
+        k_speech<<<dense_ref_blocks(r, n, k), 256, kSmem>>>(one, td);
+        CK(cudaDeviceSynchronize());
+        alone.resize((size_t)r * n);
+        CK(cudaMemcpy(alone.data(), c.dev[o], alone.size() * 4, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < alone.size(); i++) diff += alone[i] != packed[(size_t)row0 * n + i];
+        row0 += r;
+    }
+    CK(cudaFree(td));
+    printf("  DenseGemmF32 ref split %ux%u, %zu requests packed: %zu differ -> %s\n", n, k, items.size(), diff,
+           diff ? "FAIL" : "PASS");
+    if (diff) g_fail = 1;
+}
+
 static void t_gemm_bf16(unsigned m, unsigned n, unsigned k) {
     Case c;
     unsigned o = c.out((size_t)m * n), x = c.bf16((size_t)m * k, 1.f), w = c.bf16((size_t)n * k, 0.1f);
@@ -313,6 +360,18 @@ static void t_grouped(const char* name, unsigned rows, unsigned width, unsigned 
     c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = vr;
     c.in.i[0] = rows; c.in.i[1] = width; c.in.i[2] = hw; c.in.i[3] = group; c.in.i[4] = flags;
     run(name, c, g_grouped_attention_f32, {o}, flags & 4u ? BF16 : FP32);
+}
+
+/* flags 8: packed utterances, a {count, (first, rows) x count} group table. */
+static void t_grouped_table(const char* name, unsigned rows, std::vector<uint32_t> table) {
+    Case c;
+    const size_t n = (size_t)rows * 1024;
+    unsigned o = c.out(n), q = c.f32(n, 1.f), k = c.f32(n, 1.f), v = c.f32(n, 1.f);
+    unsigned vr = c.u32(table);
+    c.in.op = PLOW_DOP_GROUPED_ATTENTION_F32;
+    c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = vr;
+    c.in.i[0] = rows; c.in.i[1] = 1024; c.in.i[2] = 64; c.in.i[3] = 104; c.in.i[4] = 7 | 8;
+    run(name, c, g_grouped_attention_f32, {o}, BF16);
 }
 
 static void t_relative(const char* name, unsigned rows, unsigned width, unsigned heads, unsigned chunk,
@@ -1082,6 +1141,11 @@ int main(int argc, char** argv) {
     t_dense("DenseGemmF32 f32w onehot", 45, 67, 33, 0, 0, 0, 35, 34, false);
     t_dense("DenseGemmF32 bf16w onehot bf16", 45, 67, 36, 1 | 4, 0, 0, 37, 36, true);
     t_gemm_bf16(33, 70, 96);
+    t_dense_ref(1024, 1024, {104, 52, 156, 13, 390, 208});
+    t_dense_ref(1024, 1024, {104, 52, 156, 13, 390, 208, 390, 390, 260});
+    t_dense_ref(1024, 4096, {104, 52, 260});
+    t_dense_ref(4096, 1024, {104, 52});
+    t_dense_ref(1024, 7680, {104, 52, 156});
     t_q8(70, 130, 512, 0);
     t_q8(20, 96, 256, 1);
     /* Qwen3-ASR conv stages: NCFW in/out, f32 weights, GELU bf16; then other layouts/flags. */
@@ -1097,6 +1161,8 @@ int main(int argc, char** argv) {
     t_grouped("GroupedAttentionF32 qwen 300 v290", 300, 1024, 64, 104, 7, 290);
     t_grouped("GroupedAttentionF32 fp32 g256 (global K)", 300, 256, 64, 256, 0, -1);
     t_grouped("GroupedAttentionF32 hw80 g50", 130, 320, 80, 50, 1, 111);
+    t_grouped_table("GroupedAttentionF32 qwen packed table", 13 * 19,
+                    {4, 0, 104, 104, 36, 143, 35, 182, 60});
     t_relative("RelativeAttentionF32 chunked", 40, 256, 4, 8, 2);
     t_relative("RelativeAttentionF32 full hw320", 21, 640, 2, 1, 0xFFFFFFFFu);
     t_elementwise();

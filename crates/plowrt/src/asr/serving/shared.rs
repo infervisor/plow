@@ -30,6 +30,56 @@ struct Encode {
     respond: oneshot::Sender<Result<Vec<f32>>>,
 }
 
+/// Every queued utterance shares the next packed launch, in arrival order, as many as its largest
+/// capacity holds; a lone utterance (or a packet without packed programs) runs alone.
+fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEncoder) {
+    let max_chunks = encoder.max_packed_chunks();
+    let mut pending: std::collections::VecDeque<Encode> = Default::default();
+    while let Ok(first) = rx.recv() {
+        pending.push_back(first);
+        while !pending.is_empty() {
+            pending.extend(rx.try_iter());
+            let mut chunks = 0;
+            let n = pending
+                .iter()
+                .take_while(|job| {
+                    chunks += encoder.chunks(job.features.frames);
+                    chunks <= max_chunks
+                })
+                .count();
+            // One utterance runs its single-utterance capacity: the same bits, a shorter launch.
+            if n <= 1 {
+                let job = pending.pop_front().unwrap();
+                let _ = job.respond.send(encoder.encode(&job.features));
+                continue;
+            }
+            let batch: Vec<Encode> = pending.drain(..n).collect();
+            let features: Vec<&MelFeatures> = batch.iter().map(|job| &job.features).collect();
+            let started = Instant::now();
+            let encoded = encoder.encode_packed(&features);
+            tracing::debug!(
+                items = n,
+                chunks = features.iter().map(|f| encoder.chunks(f.frames)).sum::<usize>(),
+                gpu_ms = encoder.last_gpu_us() / 1e3,
+                wall_ms = started.elapsed().as_secs_f64() * 1e3,
+                "asr: packed encoder launch"
+            );
+            match encoded {
+                Ok(rows) => {
+                    for (job, rows) in batch.into_iter().zip(rows) {
+                        let _ = job.respond.send(Ok(rows));
+                    }
+                }
+                Err(e) => {
+                    for job in batch {
+                        let _ = job.respond.send(Err(RuntimeError::Msg(format!("ASR encoder: {e}"))));
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(super) struct SharedAsr {
     prompt: Arc<AudioLmPrompt>,
     encode: std::sync::mpsc::Sender<Encode>,
@@ -47,6 +97,9 @@ impl SharedAsr {
         let checkpoint = if checkpoint.is_dir() { checkpoint } else { dir.to_path_buf() };
         let prompt = AudioLmPrompt::load(&dir.join("model.pkt"), &checkpoint)?;
         let mut encoder = PacketAudioEncoder::load(&dir.join("encoder.pkt"), "cuda")?;
+        let warm = Instant::now();
+        encoder.warm()?;
+        tracing::info!(ms = warm.elapsed().as_millis() as u64, packed_chunks = encoder.max_packed_chunks(), "asr: encoder graphs warmed");
         if encoder.output_width() != prompt.hidden() {
             return Err(RuntimeError::Rejected("audio packet output width does not match the decoder".into()));
         }
@@ -55,11 +108,7 @@ impl SharedAsr {
         let (encode, rx) = std::sync::mpsc::channel::<Encode>();
         std::thread::Builder::new()
             .name("plow-asr-encoder".into())
-            .spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    let _ = job.respond.send(encoder.encode(&job.features));
-                }
-            })
+            .spawn(move || encode_loop(rx, encoder))
             .map_err(|e| RuntimeError::Msg(format!("spawn ASR encoder thread: {e}")))?;
         Ok(Self {
             prompt: Arc::new(prompt),

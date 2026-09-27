@@ -517,17 +517,24 @@ G_K(g_grouped_attention_f32) {
     const float* value = PLOW_CPU_TEN(in, T, 3);
     const uint32_t rows = in->i[0], width = in->i[1], head_width = in->i[2];
     const uint32_t group_rows = in->i[3], flags = in->i[4];
-    const uint32_t valid_rows = in->t[4] == PLOW_TENSOR_NONE
+    /* flags 8: t4 is a group table {count, (first row, rows) x count}. */
+    const uint32_t* table = (flags & 8u) && in->t[4] != PLOW_TENSOR_NONE
+        ? (const uint32_t*)T[in->t[4]] : NULL;
+    const uint32_t valid_rows = table || in->t[4] == PLOW_TENSOR_NONE
         ? rows : *(const uint32_t*)T[in->t[4]];
     if (head_width == 0 || width % head_width != 0 || group_rows == 0 ||
         group_rows > 256 || valid_rows == 0 || valid_rows > rows)
         return;
     const uint32_t heads = width / head_width;
-    for (uint32_t item = slice; item < valid_rows * heads; item += nblk) {
-        const uint32_t row = item / heads, head = item % heads;
-        const uint32_t first = row / group_rows * group_rows;
-        uint32_t last = first + group_rows;
+    const uint32_t groups = table ? table[0] : (valid_rows + group_rows - 1) / group_rows;
+    for (uint32_t item = slice; item < groups * group_rows * heads; item += nblk) {
+        const uint32_t head = item % heads, g = item / heads / group_rows;
+        const uint32_t first = table ? table[1 + 2 * g] : g * group_rows;
+        const uint32_t span = table && table[2 + 2 * g] < group_rows ? table[2 + 2 * g] : group_rows;
+        const uint32_t row = first + item / heads % group_rows;
+        uint32_t last = first + span;
         if (last > valid_rows) last = valid_rows;
+        if (row >= last) continue;
         float scores[256], maximum = -INFINITY;
         const size_t qb = (size_t)row * width + head * head_width;
         for (uint32_t kr = first; kr < last; kr++) {

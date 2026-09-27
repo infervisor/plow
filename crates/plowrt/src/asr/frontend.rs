@@ -309,16 +309,22 @@ impl LogMelFrontend {
             }
         }
         let mut values = vec![0.0; frames * config.bins];
-        let mut spectrum = vec![Complex32::default(); config.fft];
-        let mut scratch = vec![Complex32::default(); self.fft.get_inplace_scratch_len()];
-        let mut power = vec![0.0; spectrum_bins];
         let window_offset = if config.center_window {
             (config.fft - config.window) / 2
         } else {
             0
         };
         let center_pad = config.fft / 2;
-        for frame in 0..frames {
+        let buffers = || {
+            (
+                vec![Complex32::default(); config.fft],
+                vec![Complex32::default(); self.fft.get_inplace_scratch_len()],
+                vec![0.0f32; spectrum_bins],
+            )
+        };
+        let frame_values = |(spectrum, scratch, power): &mut (Vec<Complex32>, Vec<Complex32>, Vec<f32>),
+                            frame: usize,
+                            out: &mut [f32]| {
             spectrum.fill(Complex32::default());
             for index in 0..config.window {
                 let padded_index = frame * config.hop + window_offset + index;
@@ -341,11 +347,11 @@ impl LogMelFrontend {
                 };
                 spectrum[window_offset + index].re = sample * self.window[index];
             }
-            self.fft.process_with_scratch(&mut spectrum, &mut scratch);
-            for (power, value) in power.iter_mut().zip(&spectrum) {
+            self.fft.process_with_scratch(spectrum, scratch);
+            for (power, value) in power.iter_mut().zip(spectrum.iter()) {
                 *power = value.norm_sqr();
             }
-            for bin in 0..config.bins {
+            for (bin, out) in out.iter_mut().enumerate() {
                 let range = self.filter_ranges[bin].clone();
                 let energy = self.filters
                     [bin * spectrum_bins + range.start..bin * spectrum_bins + range.end]
@@ -354,7 +360,25 @@ impl LogMelFrontend {
                     .map(|(filter, power)| filter * power)
                     .sum::<f32>();
                 let energy = if shaping.log_floor { energy.max(config.log_guard) } else { energy + config.log_guard };
-                values[frame * config.bins + bin] = if shaping.log10 { energy.log10() } else { energy.ln() };
+                *out = if shaping.log10 { energy.log10() } else { energy.ln() };
+            }
+        };
+        // Frames are independent: a request's frontend spreads over the rayon pool (c1 latency).
+        #[cfg(feature = "hf-tokenizer")]
+        {
+            use rayon::prelude::*;
+            const FRAMES_PER_TASK: usize = 64;
+            values.par_chunks_mut(config.bins * FRAMES_PER_TASK).enumerate().for_each_init(buffers, |b, (task, out)| {
+                for (i, out) in out.chunks_exact_mut(config.bins).enumerate() {
+                    frame_values(b, task * FRAMES_PER_TASK + i, out);
+                }
+            });
+        }
+        #[cfg(not(feature = "hf-tokenizer"))]
+        {
+            let mut b = buffers();
+            for (frame, out) in values.chunks_exact_mut(config.bins).enumerate() {
+                frame_values(&mut b, frame, out);
             }
         }
         if shaping.dynamic_range > 0.0 {
