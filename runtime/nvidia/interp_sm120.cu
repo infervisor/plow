@@ -2586,6 +2586,12 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_ROUTER_TOPK_PF
     case PLOW_DOP_MOE_ROUTER_TOPK_PF:
         if (TEN(2) || in->i[0] || in->i[6] > 1u || in->i[7] > 1u || in->i[5] || (in->i[3] & 16u)) { __trap(); break; }
+        if ((in->i[3] & 33u) && in->i[4] <= nblk && in->i[1] <= 2u * blockDim.x && in->i[2] <= 16u &&
+            (blockDim.x >> 5) * in->i[2] <= 64u) {
+            d_moe_router_topk_pf_block((unsigned char*)TEN(0), TEN(1), (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr, in->i[1],
+                                       in->i[2], in->i[3], in->fj[0].f, in->i[4], slice, nblk, (uint32_t*)arena);
+            break;
+        }
         if (in->i[3] & 40u) {
             d_moe_router_topk_pf_warp((unsigned char*)TEN(0), TEN(1), (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr, in->i[1],
                                       in->i[2], in->i[3], in->fj[0].f, in->i[4], slice, nblk);
@@ -2606,6 +2612,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             break;
         }
         if (in->i[4]) { __trap(); break; }
+        if (in->i[0] * in->i[2] <= 1024u && (in->i[1] + in->i[0] * in->i[2] + blockDim.x) * 4u <= PLOW_NV_ARENA_FLOATS * sizeof(float)) {
+            d_moe_align_pf_small((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2), (unsigned*)TEN(3), (float*)TEN(4),
+                                 in->i[0], in->i[1], in->i[2], slice, (unsigned*)arena);
+            break;
+        }
         d_moe_align_pf_nv((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
                           (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2],
                           slice);

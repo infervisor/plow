@@ -374,6 +374,66 @@ __device__ __forceinline__ void d_gemm_f32(float* __restrict__ C, const __nv_bfl
         dot_form<true>(C, a16, W, M, N, K, slice, nblk, arena);
         return;
     }
+    if (M <= 8u && K % 8u == 0u && arena_floats >= 256u) {
+        /* decode rows: a block takes columns slice + j*nblk (4 at a time), its 256 threads split K 8
+         * elements each, warp sums meet in the arena in warp order. Exact bf16 products, f32 sums. */
+        const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, warps = blockDim.x >> 5;
+        float* red = arena;  // [warps][4 cols][8 rows]
+        for (unsigned n0 = slice; n0 < N; n0 += 4u * nblk) {
+            float acc[4][8] = {};
+            /* NI K-slots per thread per pass, every weight load of the pass issued before any math:
+             * one HBM round trip per pass instead of one per slot */
+            constexpr unsigned NI = 3;
+            for (unsigned kb = tid * 8u; kb < K; kb += NI * blockDim.x * 8u) {
+                uint4 wv[NI][4];
+#pragma unroll
+                for (unsigned i = 0; i < NI; i++) {
+                    const unsigned k = kb + i * blockDim.x * 8u;
+#pragma unroll
+                    for (unsigned j = 0; j < 4u; j++) {
+                        const unsigned n = n0 + j * nblk;
+                        wv[i][j] = k < K && n < N ? __ldg(reinterpret_cast<const uint4*>(w16 + (size_t)n * K + k)) : make_uint4(0, 0, 0, 0);
+                    }
+                }
+#pragma unroll
+                for (unsigned i = 0; i < NI; i++) {
+                    const unsigned k = kb + i * blockDim.x * 8u;
+                    if (k >= K) break;
+#pragma unroll
+                    for (unsigned m = 0; m < 8u; m++) {
+                        if (m >= M) break;
+                        const uint4 au = *reinterpret_cast<const uint4*>(a16 + (size_t)m * K + k);
+                        const uint32_t aa[4] = {au.x, au.y, au.z, au.w};
+#pragma unroll
+                        for (unsigned j = 0; j < 4u; j++) {
+                            const uint32_t ww[4] = {wv[i][j].x, wv[i][j].y, wv[i][j].z, wv[i][j].w};
+#pragma unroll
+                            for (int q = 0; q < 4; q++) {
+                                acc[j][m] = fmaf(__uint_as_float(aa[q] << 16), __uint_as_float(ww[q] << 16), acc[j][m]);
+                                acc[j][m] = fmaf(__uint_as_float(aa[q] & 0xffff0000u), __uint_as_float(ww[q] & 0xffff0000u), acc[j][m]);
+                            }
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (unsigned j = 0; j < 4u; j++)
+#pragma unroll
+                for (unsigned m = 0; m < 8u; m++) {
+                    const float v = warp_sum(acc[j][m]);
+                    if (lane == 0) red[warp * 32u + j * 8u + m] = v;
+                }
+            __syncthreads();
+            if (tid < 32u) {
+                const unsigned j = tid >> 3, m = tid & 7u, n = n0 + j * nblk;
+                float v = 0.f;
+                for (unsigned w2 = 0; w2 < warps; w2++) v += red[w2 * 32u + tid];
+                if (m < M && n < N) C[(size_t)m * N + n] = v;
+            }
+            __syncthreads();
+        }
+        return;
+    }
     uint16_t* const base = reinterpret_cast<uint16_t*>(arena);
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     const unsigned wm = warp & 3u, wn = warp >> 2;  // warp tile rows wm*32, cols wn*32
