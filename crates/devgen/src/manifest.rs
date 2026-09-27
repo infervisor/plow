@@ -1014,7 +1014,9 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
 ///   arm needs `I_moe % (32 / sg * 8) == 0` and silently falls back otherwise, hence the guard.
 fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     let mut t = Map::new();
-    t.insert("gv_mm_max".into(), json!(next_pow2(s.decode_batch.max(1))));
+    // Capped at 32: wider arms exceed the 48 KiB static shared memory of the interpreter entry
+    // (GV_MM_MAX=128 is 0x19610 bytes); rungs above it walk ceil(B / 32) weight passes.
+    t.insert("gv_mm_max".into(), json!(next_pow2(s.decode_batch.max(1)).min(32)));
     // TILE PROVENANCE. Written because its absence made a real regression unauditable: for
     // several days every AMD compile selected GEMM tiles from the ANALYTICAL MODEL (both tuning
     // cells were wholly stale against the current build digest) and nothing in the emitted
