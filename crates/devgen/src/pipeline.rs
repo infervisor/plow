@@ -178,6 +178,52 @@ pub struct DenseF32Stage<'a> {
     pub activation: DenseActivation,
     pub round_bf16: bool,
     pub weight_type: DenseWeight,
+    /// The input holds only bf16-representable values (its producer rounds to bf16). With bf16
+    /// weights the GEMM then runs on bf16 tensor cores with exact products.
+    pub input_bf16_exact: bool,
+    /// Normalize the input on load (DenseGemmF32 LayerNorm prologue).
+    pub layer_norm: Option<DenseLayerNorm<'a>>,
+}
+
+/// DenseGemmF32's LayerNorm prologue (flag bit 5): `A' = (A - mean) * inv * gamma + beta` with
+/// per-row `stats` (`[rows][2]` = mean, inverse std, from RowStatsF32) — LayerNormF32's exact
+/// arithmetic; `round_bf16` (flag bit 6) rounds `A'` to bf16 like LayerNormF32's flag bit 0.
+#[derive(Clone, Copy)]
+pub struct DenseLayerNorm<'a> {
+    pub stats: u32,
+    pub gamma: Option<TensorRef<'a>>,
+    pub beta: Option<TensorRef<'a>>,
+    pub round_bf16: bool,
+}
+
+/// RowStatsF32: LayerNormF32's per-row `(mean, inverse std)` into `[rows][2]`.
+#[derive(Clone, Copy)]
+pub struct RowStatsF32Stage<'a> {
+    pub output: TensorRef<'a>,
+    pub rows: u32,
+    pub width: u32,
+    pub epsilon: f32,
+    /// LayerNormF32 flag bit 1: float sums in row order (else double).
+    pub ordered_statistics: bool,
+}
+
+/// DenseGemmF32 inside a [`StageProgram`] (no split-K: ops of one program may overlap).
+#[derive(Clone, Copy)]
+pub struct DenseF32ProgramStage<'a> {
+    pub output: TensorRef<'a>,
+    pub weight: TensorRef<'a>,
+    pub bias: Option<TensorRef<'a>>,
+    pub rows: u32,
+    pub input_width: u32,
+    pub output_width: u32,
+    pub activation: DenseActivation,
+    pub round_bf16: bool,
+    pub weight_type: DenseWeight,
+    /// Input (after any prologue) and f32 weights are bf16-representable: bf16 tensor cores.
+    pub operands_bf16_exact: bool,
+    /// Otherwise run 3xTF32 tensor cores (FP32-accurate) instead of FP32 FFMA.
+    pub tf32x3: bool,
+    pub layer_norm: Option<DenseLayerNorm<'a>>,
 }
 
 pub struct InitializedAddF32Stage<'a> {
@@ -597,19 +643,52 @@ impl PacketPrefix {
             .map(|name| builder.tensor(name, u64::from(stage.output_width) * 4))
             .unwrap_or(packet::dev::TENSOR_NONE);
         let activation = u32::from(stage.activation == DenseActivation::Relu);
+        let ln_round = stage.layer_norm.is_some_and(|ln| ln.round_bf16);
+        let tensor_cores = (stage.input_bf16_exact || ln_round) && stage.weight_type == DenseWeight::Bf16;
         let flags = u32::from(stage.round_bf16)
             | (u32::from(stage.activation == DenseActivation::GeluErfBf16) << 1)
-            | (u32::from(stage.weight_type == DenseWeight::Bf16) << 2);
-        let blocks = rows
-            .div_ceil(128)
-            .checked_mul(stage.output_width.div_ceil(64))
-            .ok_or("dense dispatch geometry overflows")?;
+            | (u32::from(stage.weight_type == DenseWeight::Bf16) << 2)
+            | (u32::from(tensor_cores) << 3)
+            | (u32::from(stage.layer_norm.is_some()) << 5)
+            | (u32::from(ln_round) << 6);
+        let prologue = match stage.layer_norm {
+            Some(ln) => {
+                if ln.stats as usize >= builder.n_tensors() || builder.tensor_bytes(ln.stats) < tensor_bytes(rows, 2, 4)? {
+                    return Err("dense layer-norm stats tensor is missing or short".into());
+                }
+                let width = u64::from(stage.input_width) * 4;
+                let affine = |b: &mut Builder, t: Option<TensorRef<'_>>| match t {
+                    Some(TensorRef::Named(name)) => Ok(b.tensor(name, width)),
+                    Some(TensorRef::Handle(h)) if (h as usize) < b.n_tensors() && b.tensor_bytes(h) >= width => Ok(h),
+                    Some(TensorRef::Handle(_)) => Err("dense layer-norm affine tensor is missing".to_string()),
+                    None => Ok(packet::dev::TENSOR_NONE),
+                };
+                [ln.stats, affine(&mut builder, ln.gamma)?, affine(&mut builder, ln.beta)?]
+            }
+            None => [packet::dev::TENSOR_NONE; 3],
+        };
+        let blocks = dense_blocks(
+            rows,
+            stage.output_width,
+            stage.input_width,
+            tensor_cores,
+            self.model.n_cu,
+        );
+        let scratch = if tensor_cores {
+            builder.tensor(
+                DENSE_SPLITK_SCRATCH,
+                (u64::from(DENSE_SPLITK_TICKETS) + u64::from(self.model.n_cu) * 64 * 64) * 4,
+            )
+        } else {
+            packet::dev::TENSOR_NONE
+        };
         builder.emit(
             DevOp::DenseGemmF32,
             repeated(self.model.n_cu, blocks),
             &[],
             |instruction| {
-                instruction.t[..4].copy_from_slice(&[output, source, weight, bias]);
+                instruction.t[..5].copy_from_slice(&[output, source, weight, bias, scratch]);
+                instruction.t[5..8].copy_from_slice(&prologue);
                 instruction.i[..4].copy_from_slice(&[
                     rows,
                     stage.output_width,
@@ -785,10 +864,13 @@ impl PacketPrefix {
             | (u32::from(stage.round_probability_bf16) << 1)
             | (u32::from(stage.round_output_bf16) << 2);
         let heads = stage.width / stage.head_width;
+        // One slice per (group, head, 8-row query chunk), as the interpreter decomposes it.
         let blocks = rows
+            .div_ceil(stage.group_rows.max(1))
             .checked_mul(heads)
+            .and_then(|items| items.checked_mul(stage.group_rows.div_ceil(8)))
             .ok_or("grouped-attention dispatch geometry overflows")?
-            .div_ceil(32);
+            .clamp(1, self.model.n_cu);
         builder.emit(
             DevOp::GroupedAttentionF32,
             repeated(self.model.n_cu, blocks),
@@ -1053,6 +1135,17 @@ impl StageProgram {
         deps: &[u32],
         stage: Conv1dF32Stage<'_>,
     ) -> Result<Emitted, String> {
+        self.conv1d_f32_with(x, transpose, deps, stage, packet::dev::TENSOR_NONE)
+    }
+
+    fn conv1d_f32_with(
+        &mut self,
+        x: u32,
+        transpose: bool,
+        deps: &[u32],
+        stage: Conv1dF32Stage<'_>,
+        row_scale: u32,
+    ) -> Result<Emitted, String> {
         let valid_activation = |a: Activation| !matches!(a, Activation::Clamp | Activation::ScaleShift);
         if stage.batch == 0
             || stage.kernel == 0
@@ -1108,13 +1201,14 @@ impl StageProgram {
             PadMode::Reflect => 1,
             PadMode::Replicate => 2,
         };
+        // Bit 13: the GEMM-shaped cases run 3xTF32 tensor cores (FP32-accurate) on 64x64 tiles.
         let flags = pad_mode
             | (stage.input_activation.code() << 4)
             | (stage.output_activation.code() << 8)
-            | (u32::from(stage.weight_f16) << 12);
+            | (u32::from(stage.weight_f16) << 12)
+            | (1 << 13);
         let op = if transpose { DevOp::ConvTranspose1dF32 } else { DevOp::Conv1dF32 };
-        let units = product(&[stage.batch, out_rows])?.div_ceil(128)
-            * u64::from(stage.out_channels.div_ceil(128));
+        let units = conv1d_units(&stage, transpose, out_rows, self.builder.n_cu());
         self.emit(op, units, deps, output, |d| {
             d.t[..7].copy_from_slice(&[
                 output,
@@ -1125,6 +1219,7 @@ impl StageProgram {
                 stage.residual.unwrap_or(packet::dev::TENSOR_NONE),
                 stage.lengths.unwrap_or(packet::dev::TENSOR_NONE),
             ]);
+            d.t[7] = row_scale;
             d.i = [
                 stage.batch,
                 stage.in_rows,
@@ -1307,7 +1402,9 @@ impl StageProgram {
         };
         let out_elements = product(&[stage.batch, stage.q_rows, width])?;
         let output = self.resolve(stage.output, f32_bytes(out_elements)?, "attention output")?;
-        let units = product(&[stage.batch, stage.heads, stage.q_rows.div_ceil(64)])?;
+        // head_width 64 runs 3xTF32 tensor cores (flag bit 1) on 128-query tiles.
+        let tc = stage.head_width == 64;
+        let units = product(&[stage.batch, stage.heads, stage.q_rows.div_ceil(if tc { 128 } else { 64 })])?;
         self.emit(DevOp::AttentionF32, units, deps, output, |d| {
             d.t[..6].copy_from_slice(&[
                 output,
@@ -1324,7 +1421,7 @@ impl StageProgram {
                 stage.heads,
                 stage.head_width,
                 stage.in_stride,
-                u32::from(stage.causal),
+                u32::from(stage.causal) | (u32::from(tc) << 1),
                 stage.bias_head_stride,
             ];
             d.f[0] = stage.scale;
@@ -1373,7 +1470,100 @@ impl StageProgram {
     }
 }
 
+impl StageProgram {
+    /// RowStatsF32: `[rows][2]` = LayerNormF32's (mean, inverse std) per row.
+    pub fn row_stats_f32(&mut self, x: u32, deps: &[u32], stage: RowStatsF32Stage<'_>) -> Result<Emitted, String> {
+        if stage.rows == 0 || stage.width == 0 || !stage.epsilon.is_finite() || stage.epsilon <= 0.0 {
+            return Err("invalid row-statistics stage".into());
+        }
+        self.input(x, f32_bytes(product(&[stage.rows, stage.width])?)?, "row-statistics input")?;
+        let output = self.resolve(stage.output, f32_bytes(product(&[stage.rows, 2])?)?, "row statistics")?;
+        // One warp per row, eight warps per slice (LayerNormF32's decomposition).
+        self.emit(DevOp::RowStatsF32, u64::from(stage.rows).div_ceil(8), deps, output, |d| {
+            d.t[..2].copy_from_slice(&[output, x]);
+            d.i[..3].copy_from_slice(&[stage.rows, stage.width, u32::from(stage.ordered_statistics) << 1]);
+            d.f[0] = stage.epsilon;
+        })
+    }
+
+    /// DenseGemmF32, optionally with the LayerNorm prologue.
+    pub fn dense_f32(&mut self, x: u32, deps: &[u32], stage: DenseF32ProgramStage<'_>) -> Result<Emitted, String> {
+        if stage.rows == 0 || stage.input_width == 0 || stage.output_width == 0 {
+            return Err("invalid dense geometry".into());
+        }
+        self.input(x, f32_bytes(product(&[stage.rows, stage.input_width])?)?, "dense input")?;
+        let esize = match stage.weight_type {
+            DenseWeight::F32 => 4,
+            DenseWeight::Bf16 => 2,
+        };
+        let weight =
+            self.resolve(stage.weight, product(&[stage.output_width, stage.input_width])? * esize, "dense weight")?;
+        let bias = match stage.bias {
+            Some(b) => self.resolve(b, u64::from(stage.output_width) * 4, "dense bias")?,
+            None => packet::dev::TENSOR_NONE,
+        };
+        let prologue = match stage.layer_norm {
+            Some(ln) => {
+                self.input(ln.stats, f32_bytes(product(&[stage.rows, 2])?)?, "dense layer-norm stats")?;
+                let width = u64::from(stage.input_width) * 4;
+                let mut affine = |t: Option<TensorRef<'_>>, what| match t {
+                    Some(t) => self.resolve(t, width, what),
+                    None => Ok(packet::dev::TENSOR_NONE),
+                };
+                [ln.stats, affine(ln.gamma, "dense layer-norm gamma")?, affine(ln.beta, "dense layer-norm beta")?]
+            }
+            None => [packet::dev::TENSOR_NONE; 3],
+        };
+        let output =
+            self.resolve(stage.output, f32_bytes(product(&[stage.rows, stage.output_width])?)?, "dense output")?;
+        let ln_round = stage.layer_norm.is_some_and(|ln| ln.round_bf16);
+        let tensor_cores = stage.operands_bf16_exact || (ln_round && stage.weight_type == DenseWeight::Bf16);
+        let flags = u32::from(stage.round_bf16)
+            | (u32::from(stage.activation == DenseActivation::GeluErfBf16) << 1)
+            | (u32::from(stage.weight_type == DenseWeight::Bf16) << 2)
+            | (u32::from(tensor_cores) << 3)
+            | (u32::from(!tensor_cores && stage.tf32x3) << 4)
+            | (u32::from(stage.layer_norm.is_some()) << 5)
+            | (u32::from(ln_round) << 6);
+        let units = if tensor_cores || stage.tf32x3 {
+            u64::from(stage.rows.div_ceil(64)) * u64::from(stage.output_width.div_ceil(64))
+        } else {
+            u64::from(stage.rows.div_ceil(128)) * u64::from(stage.output_width.div_ceil(128))
+        };
+        self.emit(DevOp::DenseGemmF32, units, deps, output, |d| {
+            d.t[..4].copy_from_slice(&[output, x, weight, bias]);
+            d.t[5..8].copy_from_slice(&prologue);
+            d.i[..4].copy_from_slice(&[
+                stage.rows,
+                stage.output_width,
+                stage.input_width,
+                u32::from(stage.activation == DenseActivation::Relu),
+            ]);
+            d.i[7] = flags;
+        })
+    }
+
+    /// Conv1dF32 with the row-scaled residual epilogue: `out = residual + row_scale[b][t] *
+    /// post(conv(x) + bias)`, `row_scale` f32 `[batch][out_rows]` (slot t7).
+    pub fn conv1d_f32_row_scaled(
+        &mut self,
+        x: u32,
+        deps: &[u32],
+        stage: Conv1dF32Stage<'_>,
+        row_scale: u32,
+    ) -> Result<Emitted, String> {
+        let out_rows = stage.out_rows(false).ok_or("convolution output is empty")?;
+        self.input(row_scale, f32_bytes(product(&[stage.batch, out_rows])?)?, "convolution row scale")?;
+        self.conv1d_f32_with(x, false, deps, stage, row_scale)
+    }
+}
+
 impl PacketPrefix {
+    /// Append a single-op RowStatsF32 program; its output becomes the prefix output.
+    pub fn append_row_stats_f32(self, x: u32, stage: RowStatsF32Stage<'_>) -> Result<Self, String> {
+        self.append_one(stage.rows, |p| p.row_stats_f32(x, &[], stage))
+    }
+
     /// Open a multi-stage program; see [`StageProgram`].
     pub fn program(mut self) -> StageProgram {
         let mut builder = Builder::new(self.model.n_cu);
@@ -1444,6 +1634,51 @@ fn tensor_bytes(rows: u32, columns: u32, element_bytes: u32) -> Result<u64, Stri
         .checked_mul(u64::from(columns))
         .and_then(|count| count.checked_mul(u64::from(element_bytes)))
         .ok_or_else(|| "tensor size overflows".into())
+}
+
+/// Conv1dF32 / ConvTranspose1dF32 slices, mirroring the interpreter's paths (op_speech_f32.cuh
+/// d_conv1d_f32): depthwise 64-row x 64-channel tiles; the direct form per 256 outputs; the GEMM
+/// form 64x64 tiles per (group, phase). `slices` caps the result at the machine.
+fn conv1d_units(stage: &Conv1dF32Stage<'_>, transpose: bool, out_rows: u32, n_cu: u32) -> u64 {
+    let (batch, cout) = (u64::from(stage.batch), u64::from(stage.out_channels));
+    let cg = stage.in_channels / stage.groups;
+    let ng = stage.out_channels / stage.groups;
+    if !transpose && cg == 1 && ng == 1 {
+        return batch * u64::from(out_rows).div_ceil(64) * cout.div_ceil(64);
+    }
+    if ng < 16 || cg * stage.kernel < 16 {
+        return (batch * u64::from(out_rows) * cout).div_ceil(256);
+    }
+    let phases = if transpose { stage.stride } else { 1 };
+    let per_phase = u64::from(out_rows.div_ceil(phases));
+    let tiles = |tile: u64| {
+        u64::from(stage.groups) * u64::from(phases) * (batch * per_phase).div_ceil(tile) * u64::from(ng).div_ceil(tile)
+    };
+    // 3xTF32 on 64x64 tiles, except FP32 FFMA on 128x128 tiles when those fill the machine for
+    // a transposed conv or one with an input activation.
+    let ffma = (transpose || stage.input_activation != Activation::None) && tiles(128) >= u64::from(n_cu);
+    if ffma { tiles(128) } else { tiles(64) }
+}
+
+/// Split-K scratch shared by every tensor-core DenseGemmF32 (each in its own program, so they
+/// never overlap): `DENSE_SPLITK_TICKETS` zeroed u32 tickets, then one 64x64 f32 partial per block.
+const DENSE_SPLITK_SCRATCH: &str = "scratch.dense_f32_splitk";
+const DENSE_SPLITK_TICKETS: u32 = 1024;
+
+/// DenseGemmF32 slices, mirroring the interpreter's decomposition (op_speech_f32.cuh): FP32 FFMA
+/// uses 128x128 tiles; the tensor-core path 64x64 tiles, split over K (BK = 64) until the tiles
+/// fill the machine.
+fn dense_blocks(rows: u32, n: u32, k: u32, tensor_cores: bool, n_cu: u32) -> u32 {
+    if !tensor_cores {
+        return (rows.div_ceil(128) * n.div_ceil(128)).clamp(1, n_cu);
+    }
+    let tiles = rows.div_ceil(64) * n.div_ceil(64);
+    if tiles > DENSE_SPLITK_TICKETS || tiles * 2 > n_cu {
+        return tiles.min(n_cu);
+    }
+    let steps = k.div_ceil(64).max(1);
+    let chunk = steps.div_ceil((n_cu / tiles).min(steps));
+    tiles * steps.div_ceil(chunk)
 }
 
 fn repeated(n_cu: u32, blocks: u32) -> Vec<u32> {
@@ -1534,6 +1769,8 @@ mod tests {
                 activation: DenseActivation::GeluErfBf16,
                 round_bf16: false,
                 weight_type: DenseWeight::F32,
+                input_bf16_exact: false,
+                layer_norm: None,
             },
         )
         .unwrap();
@@ -1591,6 +1828,8 @@ mod tests {
                     activation: DenseActivation::None,
                     round_bf16: true,
                     weight_type: DenseWeight::F32,
+                    input_bf16_exact: false,
+                    layer_norm: None,
                 },
             )
             .unwrap();
@@ -1608,6 +1847,8 @@ mod tests {
                     activation: DenseActivation::None,
                     round_bf16: true,
                     weight_type: DenseWeight::F32,
+                    input_bf16_exact: false,
+                    layer_norm: None,
                 },
             )
             .unwrap();
@@ -1824,12 +2065,12 @@ mod tests {
         let c = &insts[0];
         assert_eq!(c.i, [2, 100, 64, 64, 7, 1, 3, 1]);
         assert_eq!(c.j[0], 9 | (9 << 16));
-        assert_eq!(c.j[1], packet::dev::ACT_SNAKE << 4);
+        assert_eq!(c.j[1], packet::dev::ACT_SNAKE << 4 | 1 << 13);
         assert_eq!(c.t[6], lengths);
         assert_eq!(insts[1].t[5], x);
         let t = &insts[2];
         assert_eq!(t.f[0], 0.1);
-        assert_eq!(t.j[1], packet::dev::ACT_LEAKY_RELU << 4);
+        assert_eq!(t.j[1], packet::dev::ACT_LEAKY_RELU << 4 | 1 << 13);
         assert_eq!(prefix.model.tensors[up.output as usize].bytes, 2 * 800 * 32 * 4);
         assert_eq!(prefix.model.tensors[insts[2].t[2] as usize].bytes, 64 * 32 * 16 * 4);
         assert_eq!(insts[3].i[5], 2);
@@ -1885,7 +2126,7 @@ mod tests {
         assert_eq!(prefix.programs, [0, 1]);
         let a = &prefix.model.progs[0].insts[0];
         assert_eq!(DevOp::from_u16(a.op), Some(DevOp::AttentionF32));
-        assert_eq!(a.i[6], 1);
+        assert_eq!(a.i[6], 1 | 2);
         assert_eq!(prefix.model.tensors[prefix.output as usize].bytes, 2 * 480 * 9 * 4);
         let c = &prefix.model.progs[1].insts[0];
         assert_eq!(c.i[..5], [2, 480, 9, 1, 2]);

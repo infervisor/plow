@@ -53,6 +53,7 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_CUMSUM_F64] = g_cumsum_f64;
     tab[PLOW_DOP_RAND_F32] = g_rand_f32;
     tab[PLOW_DOP_ATTENTION_F32] = g_attention_f32;
+    tab[PLOW_DOP_ROW_STATS_F32] = g_row_stats_f32;
     tab[PLOW_DOP_GEMM] = g_gemm;
     tab[PLOW_DOP_GEMM_F32] = g_gemm_f32;
     tab[PLOW_DOP_GEMM_SMALL] = g_gemm_small;

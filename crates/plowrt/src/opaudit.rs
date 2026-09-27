@@ -304,6 +304,7 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::MlaBmmFp8 => a_rows("i0=M, head-interleaved BF16 rows with fused group128 quantization"),
         DevOp::Q8GemmF32 => a_rows("i0=M, dense FP32 rows"),
         DevOp::LayerNormF32 => a_rows("i0=rows"),
+        DevOp::RowStatsF32 => a_rows("i0=rows"),
         DevOp::ScaledAddF32 => a_elem("i0=n"),
         DevOp::GluF32 => a_rows("i0=rows"),
         DevOp::SiluF32 => a_elem("i0=n"),

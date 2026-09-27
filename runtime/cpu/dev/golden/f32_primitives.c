@@ -51,6 +51,37 @@ G_K(g_q8_gemm_f32) {
     }
 }
 
+/* LayerNormF32's statistics of one row: flags bit 1 = float sums in row order, else double. */
+static void g_ln_stats(const float* xr, uint32_t feat, uint32_t flags, float eps, float* mean, float* inv) {
+    if (flags & 2u) {
+        float sum = 0.0f, square_sum = 0.0f;
+        for (uint32_t i = 0; i < feat; i++) sum += xr[i];
+        *mean = sum / feat;
+        for (uint32_t i = 0; i < feat; i++) {
+            const float v = xr[i] - *mean;
+            square_sum += v * v;
+        }
+        *inv = 1.0f / sqrtf(square_sum / feat + eps);
+    } else {
+        double sum = 0.0;
+        for (uint32_t i = 0; i < feat; i++) sum += xr[i];
+        *mean = (float)(sum / feat);
+        double square_sum = 0.0;
+        for (uint32_t i = 0; i < feat; i++) {
+            const double v = xr[i] - *mean;
+            square_sum += v * v;
+        }
+        *inv = 1.0f / sqrtf((float)(square_sum / feat) + eps);
+    }
+}
+
+/* LayerNormF32's per-element normalization; flags bit 0 rounds to bf16. */
+static float g_ln_apply(float x, float mean, float inv, const float* gamma, const float* beta, uint32_t i,
+                        uint32_t round) {
+    const float value = (x - mean) * inv * (gamma ? gamma[i] : 1.0f) + (beta ? beta[i] : 0.0f);
+    return round ? plow_bf2f(plow_f2bf(value)) : value;
+}
+
 G_K(g_layernorm_f32) {
     (void)ctx;
     float* out = PLOW_CPU_TEN(in, T, 0);
@@ -62,32 +93,19 @@ G_K(g_layernorm_f32) {
         const float* xr = x + (size_t)row * feat;
         float* yr = out + (size_t)row * feat;
         float mean, inv;
-        if (in->i[2] & 2u) {
-            float sum = 0.0f, square_sum = 0.0f;
-            for (uint32_t i = 0; i < feat; i++) sum += xr[i];
-            mean = sum / feat;
-            for (uint32_t i = 0; i < feat; i++) {
-                const float v = xr[i] - mean;
-                square_sum += v * v;
-            }
-            inv = 1.0f / sqrtf(square_sum / feat + in->fj[0].f);
-        } else {
-            double sum = 0.0;
-            for (uint32_t i = 0; i < feat; i++) sum += xr[i];
-            mean = (float)(sum / feat);
-            double square_sum = 0.0;
-            for (uint32_t i = 0; i < feat; i++) {
-                const double v = xr[i] - mean;
-                square_sum += v * v;
-            }
-            inv = 1.0f / sqrtf((float)(square_sum / feat) + in->fj[0].f);
-        }
-        for (uint32_t i = 0; i < feat; i++) {
-            float value = (xr[i] - mean) * inv * (gamma ? gamma[i] : 1.0f) +
-                          (beta ? beta[i] : 0.0f);
-            yr[i] = in->i[2] & 1u ? plow_bf2f(plow_f2bf(value)) : value;
-        }
+        g_ln_stats(xr, feat, in->i[2], in->fj[0].f, &mean, &inv);
+        for (uint32_t i = 0; i < feat; i++) yr[i] = g_ln_apply(xr[i], mean, inv, gamma, beta, i, in->i[2] & 1u);
     }
+}
+
+/* RowStatsF32: LayerNormF32's (mean, inverse std) per row, same flags and epsilon. */
+G_K(g_row_stats_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const float* x = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t rows = in->i[0], feat = in->i[1];
+    for (uint32_t row = slice; row < rows; row += nblk)
+        g_ln_stats(x + (size_t)row * feat, feat, in->i[2], in->fj[0].f, &out[2 * row], &out[2 * row + 1]);
 }
 
 G_K(g_scaled_add_f32) {
@@ -136,7 +154,13 @@ G_K(g_dense_gemm_f32) {
     const uint32_t weight_stride = in->i[5] ? in->i[5] : k;
     const uint32_t onehot = in->i[6];
     const uint32_t flags = in->i[7];
-    x += (size_t)in->i[4] * k;
+    /* flags bit 5: LayerNorm prologue, A' = (A - mean) * inv * gamma + beta per row stats t5
+     * ([rows][2], indexed like A including a_row0), gamma t6?, beta t7?; bit 6 rounds A' to bf16. */
+    const float* stats = flags & 32u ? (const float*)PLOW_CPU_TEN(in, T, 5) : NULL;
+    const float* ln_gamma = PLOW_CPU_TEN(in, T, 6);
+    const float* ln_beta = PLOW_CPU_TEN(in, T, 7);
+    const uint32_t row0 = in->i[4];
+    x += (size_t)row0 * k;
     uint32_t lo, hi;
     g_range(n, slice, nblk, &lo, &hi);
     for (uint32_t row = 0; row < m; row++) {
@@ -146,7 +170,11 @@ G_K(g_dense_gemm_f32) {
                 const size_t wi = (size_t)column * weight_stride + inner;
                 const float w = flags & 4u ? plow_bf2f(((const plow_bf16*)weight)[wi])
                                            : ((const float*)weight)[wi];
-                sum += (double)x[(size_t)row * k + inner] * w;
+                float a = x[(size_t)row * k + inner];
+                if (stats)
+                    a = g_ln_apply(a, stats[2 * ((size_t)row0 + row)], stats[2 * ((size_t)row0 + row) + 1],
+                                   ln_gamma, ln_beta, inner, flags & 64u);
+                sum += (double)a * w;
             }
             if (in->i[5] && onehot < weight_stride) {
                 const size_t wi = (size_t)column * weight_stride + onehot;
@@ -624,6 +652,7 @@ G_K(g_conv1d_f32) {
     const float* alpha = PLOW_CPU_TEN(in, T, 4);
     const float* residual = PLOW_CPU_TEN(in, T, 5);
     const uint32_t* lengths = PLOW_CPU_TEN(in, T, 6);
+    const float* row_scale = PLOW_CPU_TEN(in, T, 7);
     const uint32_t batch = in->i[0], in_rows = in->i[1], cin = in->i[2], cout = in->i[3];
     const uint32_t kernel = in->i[4], stride = in->i[5], dilation = in->i[6], groups = in->i[7];
     const uint32_t pad_before = in->fj[1].u & 0xFFFFu, pad_after = in->fj[1].u >> 16;
@@ -662,6 +691,7 @@ G_K(g_conv1d_f32) {
                 }
             }
             float value = g_act_f32(post, (float)sum, alpha ? alpha[o] : slope, 0.0f);
+            if (row_scale) value = row_scale[m] * value;
             out[oi] = residual ? value + residual[oi] : value;
         }
     }

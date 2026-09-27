@@ -2,8 +2,9 @@ use crate::conv2d::{
     self, Conv2dSpec, Conv2dStage, ConvActivation, ConvKind, ConvLayout, ConvWeight,
 };
 use crate::pipeline::{
-    DenseActivation, DenseF32Stage, DenseWeight, GroupedAttentionF32Stage, InitializedAddF32Stage,
-    LayerNormF32Stage, PacketPrefix, ScaledAddF32Stage,
+    DenseActivation, DenseF32Stage, DenseLayerNorm, DenseWeight, GroupedAttentionF32Stage,
+    InitializedAddF32Stage, LayerNormF32Stage, PacketPrefix, RowStatsF32Stage, ScaledAddF32Stage,
+    TensorRef,
 };
 use std::collections::BTreeMap;
 
@@ -251,7 +252,7 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             kind: ConvKind::Standard,
             activation: ConvActivation::GeluErfBf16,
             output_layout: ConvLayout::ChannelsFramesWidth,
-            weight_type: ConvWeight::F32,
+            weight_type: ConvWeight::Bf16InF32,
         })
         .collect();
     let packets = conv2d::lower(
@@ -285,6 +286,8 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             activation: DenseActivation::None,
             round_bf16: true,
             weight_type: DenseWeight::Bf16,
+            input_bf16_exact: true,
+            layer_norm: None,
         },
     )?;
     let mut builder = packet::devbuild::Builder::new(prefix.model.n_cu);
@@ -335,6 +338,8 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
                 activation: DenseActivation::None,
                 round_bf16: true,
                 weight_type: DenseWeight::Bf16,
+                input_bf16_exact: true,
+                layer_norm: None,
             },
         )?;
         first_qkv[index] = prefix.output;
@@ -367,6 +372,8 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             activation: DenseActivation::None,
             round_bf16: true,
             weight_type: DenseWeight::Bf16,
+            input_bf16_exact: true,
+            layer_norm: None,
         },
     )?;
     let attention_projection = prefix.output;
@@ -404,6 +411,8 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             activation: DenseActivation::GeluErfBf16,
             round_bf16: true,
             weight_type: DenseWeight::Bf16,
+            input_bf16_exact: true,
+            layer_norm: None,
         },
     )?;
     prefix = prefix.append_dense_f32(
@@ -417,6 +426,8 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             activation: DenseActivation::None,
             round_bf16: true,
             weight_type: DenseWeight::Bf16,
+            input_bf16_exact: true,
+            layer_norm: None,
         },
     )?;
     let fc2 = prefix.output;
@@ -444,6 +455,7 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             layers: 23,
             weight_prefix: "thinker.audio_tower",
             activation_prefix: "act.qwen",
+            fuse_layer_norm: false,
         },
     )?;
     let transformer_output = prefix.output;
@@ -470,6 +482,8 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             activation: DenseActivation::GeluErfBf16,
             round_bf16: true,
             weight_type: DenseWeight::Bf16,
+            input_bf16_exact: true,
+            layer_norm: None,
         },
     )?;
     prefix = prefix.append_dense_f32(
@@ -483,6 +497,8 @@ pub fn lower_audio_encoder(feature_frames: u32, n_cu: u32) -> Result<AudioEncode
             activation: DenseActivation::None,
             round_bf16: true,
             weight_type: DenseWeight::Bf16,
+            input_bf16_exact: true,
+            layer_norm: None,
         },
     )?;
     Ok(AudioEncoderPackets {
@@ -544,6 +560,10 @@ pub struct AudioTransformerSpec<'a> {
     pub layers: u32,
     pub weight_prefix: &'a str,
     pub activation_prefix: &'a str,
+    /// RowStatsF32 + DenseGemmF32 LayerNorm prologue instead of LayerNormF32 -> DenseGemmF32
+    /// (bit-identical). Off by default: a packet runtime must implement both (op 204, dense
+    /// flag bits 5/6); the Metal interpreter does not yet.
+    pub fuse_layer_norm: bool,
 }
 
 pub fn append_audio_transformer_layers(
@@ -565,19 +585,44 @@ pub fn append_audio_transformer_layers(
         let weights = format!("{}.layers.{layer}", spec.weight_prefix);
         let activations = format!("{}.layers.{layer}", spec.activation_prefix);
         let residual = prefix.output;
-        prefix = prefix.append_layer_norm_f32(
-            spec.rows,
-            LayerNormF32Stage {
-                output: &format!("{activations}.self_attn_norm"),
-                gamma: Some(&format!("{weights}.self_attn_layer_norm.weight")),
-                beta: Some(&format!("{weights}.self_attn_layer_norm.bias")),
-                width: spec.width,
-                epsilon: 1e-5,
-                round_bf16: true,
-                ordered_statistics: true,
-            },
-        )?;
-        let normalized = prefix.output;
+        let attn_gamma = format!("{weights}.self_attn_layer_norm.weight");
+        let attn_beta = format!("{weights}.self_attn_layer_norm.bias");
+        let (normalized, qkv_norm) = if spec.fuse_layer_norm {
+            prefix = prefix.append_row_stats_f32(
+                residual,
+                RowStatsF32Stage {
+                    output: TensorRef::Named(&format!("{activations}.self_attn_norm_stats")),
+                    rows: spec.rows,
+                    width: spec.width,
+                    epsilon: 1e-5,
+                    ordered_statistics: true,
+                },
+            )?;
+            let stats = prefix.output;
+            (
+                residual,
+                Some(DenseLayerNorm {
+                    stats,
+                    gamma: Some(TensorRef::Named(&attn_gamma)),
+                    beta: Some(TensorRef::Named(&attn_beta)),
+                    round_bf16: true,
+                }),
+            )
+        } else {
+            prefix = prefix.append_layer_norm_f32(
+                spec.rows,
+                LayerNormF32Stage {
+                    output: &format!("{activations}.self_attn_norm"),
+                    gamma: Some(&attn_gamma),
+                    beta: Some(&attn_beta),
+                    width: spec.width,
+                    epsilon: 1e-5,
+                    round_bf16: true,
+                    ordered_statistics: true,
+                },
+            )?;
+            (prefix.output, None)
+        };
         let mut qkv = [0; 3];
         for (index, name) in ["q_proj", "k_proj", "v_proj"].into_iter().enumerate() {
             prefix = prefix.append_dense_f32_from(
@@ -592,6 +637,8 @@ pub fn append_audio_transformer_layers(
                     activation: DenseActivation::None,
                     round_bf16: true,
                     weight_type: DenseWeight::Bf16,
+                    input_bf16_exact: true,
+                    layer_norm: qkv_norm,
                 },
             )?;
             qkv[index] = prefix.output;
@@ -623,6 +670,8 @@ pub fn append_audio_transformer_layers(
                 activation: DenseActivation::None,
                 round_bf16: true,
                 weight_type: DenseWeight::Bf16,
+                input_bf16_exact: true,
+                layer_norm: None,
             },
         )?;
         let attention_projection = prefix.output;
@@ -637,18 +686,42 @@ pub fn append_audio_transformer_layers(
             },
         )?;
         let attention_residual = prefix.output;
-        prefix = prefix.append_layer_norm_f32(
-            spec.rows,
-            LayerNormF32Stage {
-                output: &format!("{activations}.final_norm"),
-                gamma: Some(&format!("{weights}.final_layer_norm.weight")),
-                beta: Some(&format!("{weights}.final_layer_norm.bias")),
-                width: spec.width,
-                epsilon: 1e-5,
+        let ffn_gamma = format!("{weights}.final_layer_norm.weight");
+        let ffn_beta = format!("{weights}.final_layer_norm.bias");
+        let fc1_norm = if spec.fuse_layer_norm {
+            prefix = prefix.append_row_stats_f32(
+                attention_residual,
+                RowStatsF32Stage {
+                    output: TensorRef::Named(&format!("{activations}.final_norm_stats")),
+                    rows: spec.rows,
+                    width: spec.width,
+                    epsilon: 1e-5,
+                    ordered_statistics: true,
+                },
+            )?;
+            let stats = prefix.output;
+            prefix.output = attention_residual;
+            Some(DenseLayerNorm {
+                stats,
+                gamma: Some(TensorRef::Named(&ffn_gamma)),
+                beta: Some(TensorRef::Named(&ffn_beta)),
                 round_bf16: true,
-                ordered_statistics: true,
-            },
-        )?;
+            })
+        } else {
+            prefix = prefix.append_layer_norm_f32(
+                spec.rows,
+                LayerNormF32Stage {
+                    output: &format!("{activations}.final_norm"),
+                    gamma: Some(&ffn_gamma),
+                    beta: Some(&ffn_beta),
+                    width: spec.width,
+                    epsilon: 1e-5,
+                    round_bf16: true,
+                    ordered_statistics: true,
+                },
+            )?;
+            None
+        };
         prefix = prefix.append_dense_f32(
             spec.rows,
             DenseF32Stage {
@@ -660,6 +733,8 @@ pub fn append_audio_transformer_layers(
                 activation: DenseActivation::GeluErfBf16,
                 round_bf16: true,
                 weight_type: DenseWeight::Bf16,
+                input_bf16_exact: true,
+                layer_norm: fc1_norm,
             },
         )?;
         prefix = prefix.append_dense_f32(
@@ -673,6 +748,8 @@ pub fn append_audio_transformer_layers(
                 activation: DenseActivation::None,
                 round_bf16: true,
                 weight_type: DenseWeight::Bf16,
+                input_bf16_exact: true,
+                layer_norm: None,
             },
         )?;
         let ffn = prefix.output;
@@ -695,6 +772,55 @@ mod tests {
     use super::*;
     use packet::dev::DevOp;
     use packet::devbuild::{Builder, Model};
+
+    #[test]
+    fn fused_layer_norm_emits_row_stats_and_dense_prologue() {
+        let mut builder = Builder::new(4);
+        let input = builder.tensor("positioned", 2 * 4 * 4);
+        let prefix = PacketPrefix {
+            model: Model {
+                n_cu: 4,
+                target: 0,
+                tensors: builder.tensors(),
+                progs: Vec::new(),
+                kv_row_insts: Vec::new(),
+                prog_t: Vec::new(),
+                gen: Vec::new(),
+            },
+            programs: Vec::new(),
+            input,
+            output: input,
+            input_shape: vec![2, 4],
+        };
+        let prefix = append_audio_transformer_layers(
+            prefix,
+            AudioTransformerSpec {
+                rows: 2,
+                width: 4,
+                ffn_width: 8,
+                head_width: 2,
+                group_rows: 2,
+                valid_rows: None,
+                first_layer: 0,
+                layers: 1,
+                weight_prefix: "tower",
+                activation_prefix: "act.audio",
+                fuse_layer_norm: true,
+            },
+        )
+        .unwrap();
+        let ops: Vec<_> =
+            prefix.model.progs.iter().map(|p| DevOp::from_u16(p.insts[0].op).unwrap()).collect();
+        assert_eq!(ops[0], DevOp::RowStatsF32);
+        assert!(!ops.contains(&DevOp::LayerNormF32));
+        let stats = prefix.model.progs[0].insts[0].t[0];
+        let q = &prefix.model.progs[1].insts[0];
+        assert_eq!(DevOp::from_u16(q.op), Some(DevOp::DenseGemmF32));
+        assert_eq!(q.i[7], 1 | 4 | 8 | 32 | 64);
+        assert_eq!(q.t[1], input);
+        assert_eq!(q.t[5], stats);
+        assert_eq!(prefix.model.progs[0].insts[0].i[2], 2);
+    }
 
     #[test]
     fn emits_ordered_packet_layers() {
@@ -728,6 +854,7 @@ mod tests {
                 layers: 2,
                 weight_prefix: "tower",
                 activation_prefix: "act.audio",
+                fuse_layer_norm: false,
             },
         )
         .unwrap();
@@ -740,7 +867,7 @@ mod tests {
             .find(|tensor| tensor.name == "tower.layers.4.self_attn.q_proj.weight")
             .unwrap();
         assert_eq!(weight.bytes, 4 * 4 * 2);
-        assert_eq!(prefix.model.progs[1].insts[0].i[7], 5);
+        assert_eq!(prefix.model.progs[1].insts[0].i[7], 13);
         let layer_three = prefix
             .model
             .tensors

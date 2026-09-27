@@ -115,7 +115,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | GemvAffineQ4 => &["gemv"],
 
         RmsNorm | RowRms | NormResidual | AddNorm | NormResidualNorm | LayerNorm | QwenRmsNorm
-        | QwenGatedNorm | KdaGatedNorm | LayerNormF32 => &["norm"],
+        | QwenGatedNorm | KdaGatedNorm | LayerNormF32 | RowStatsF32 => &["norm"],
 
         KdaConv | KdaGate | Mamba2Scan | KdaStateStep | KdaConv3 | KdaStateStepG
         | KdaConvStateStepG | KdaChunkPrepare | KdaChunkIntra | KdaChunkWu | KdaChunkCarry

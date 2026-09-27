@@ -1965,8 +1965,14 @@ pub enum DevOp {
     /// stride and also adds the weight at `implicit_onehot_col`, allowing a compiler to fuse an
     /// appended one-hot feature without materializing it. Numerical flag `i7` bit 0 rounds the
     /// result to BF16; bit 1 applies erf-GELU with BF16 input/output rounding; bit 2 selects
-    /// row-major BF16 weights instead of FP32.
-    /// `t0=C t1=A t2=W t3=bias?` ·
+    /// row-major BF16 weights instead of FP32. Precision hints (results stay within FP32
+    /// accumulation-order noise): bit 3 asserts A (and FP32 W) hold BF16-representable values,
+    /// allowing BF16 tensor cores; bit 4 allows 3xTF32 tensor cores. `scratch` (optional, the
+    /// NVIDIA split-K workspace) is 1024 zeroed u32 tickets then `blocks` 64x64 f32 partials.
+    /// Bit 5: LayerNorm prologue, A is read as LayerNormF32 would write it,
+    /// `(a - stats[r].0) * stats[r].1 * gamma[k] + beta[k]` (row `r` counted like A, including
+    /// `a_row0`; `stats` from RowStatsF32); bit 6 rounds that to bf16 (LayerNormF32 flag bit 0).
+    /// `t0=C t1=A t2=W t3=bias? t4=scratch? t5=stats? t6=gamma? t7=beta?` ·
     /// `i0=M i1=N i2=K i3=activation i4=a_row0 i5=weight_stride? i6=implicit_onehot_col i7=flags`.
     DenseGemmF32 = 170,
     /// Gather one FP16 embedding row and convert it to FP32.
@@ -1985,7 +1991,9 @@ pub enum DevOp {
     /// FP32 2D convolution with FP16/FP32 weights and FP32 bias. Flag bit 0 selects depthwise,
     /// bit 1 applies ReLU, bits 2..3 select output layout, bits 4..5 select input layout
     /// (`0=NHWC, 1=NFCW, 2=NCFW`), bit 6 selects FP32 weights, and bit 7 applies erf-GELU with
-    /// BF16 rounding. `j1=batch` defaults to one.
+    /// BF16 rounding. Precision hints: bit 8 asserts the input and FP32 weights are
+    /// BF16-representable (BF16 tensor cores), bit 9 allows 3xTF32 tensor cores.
+    /// `j1=batch` defaults to one.
     /// `t0=out t1=x t2=weight t3=bias(f32)` ·
     /// `i0=in_frames i1=in_width i2=in_channels i3=out_channels i4=kernel i5=stride
     /// i6=pad_before i7=pad_after j0=flags j1=batch`.
@@ -2119,10 +2127,12 @@ pub enum DevOp {
     /// mode (0 zero, 1 reflect, 2 replicate), bits 4..7 input activation, bits 8..11 output
     /// activation (codes [`ACT_TANH`]..[`ACT_RELU`], 13 and 14 invalid here; `f0` is the
     /// leaky-ReLU slope, `alpha[channel]` the snake alpha of the channel it is applied to),
-    /// bit 12 FP16 weights.
+    /// bit 12 FP16 weights, bit 13 allows 3xTF32 tensor cores (FP32-accurate) for the GEMM form.
+    /// Optional `row_scale` f32 `[batch][out_rows]` scales each row after the output activation,
+    /// before the residual: `out = residual + row_scale[b][t] * post(bias + conv)`.
     /// `t0=out(f32[batch,out_rows,out_channels]) t1=x(f32[batch,in_rows,in_channels])
     /// t2=weight(f32|f16[out_channels,in_channels/groups,kernel]) t3=bias? t4=alpha?
-    /// t5=residual? t6=lengths(u32[batch])?` ·
+    /// t5=residual? t6=lengths(u32[batch])? t7=row_scale?` ·
     /// `i0=batch i1=in_rows i2=in_channels i3=out_channels i4=kernel i5=stride i6=dilation
     /// i7=groups` · `f0=slope` · `j0=pads j1=flags`.
     Conv1dF32 = 197,
@@ -2174,11 +2184,15 @@ pub enum DevOp {
     /// `in_stride` 0 = `heads*head_width`). Score `f0 * q.k + bias[h*bias_head_stride +
     /// r*kv_rows + j]`, softmax over keys `j < key_lengths[b]` (and `j <= r` with flag bit 0); a
     /// row with no visible key is zero. Output is dense `[batch,q_rows,heads*head_width]`.
-    /// `head_width` is 64 or 128.
+    /// `head_width` is 64 or 128. Flag bit 1 allows 3xTF32 tensor cores (FP32-accurate).
     /// `t0=out t1=query t2=key t3=value t4=key_lengths(u32[batch])? t5=bias?` ·
     /// `i0=batch i1=q_rows i2=kv_rows i3=heads i4=head_width i5=in_stride i6=flags
     /// i7=bias_head_stride` · `f0=scale` · `j0=k_col0 j1=v_col0`.
     AttentionF32 = 203,
+    /// LayerNormF32's row statistics alone: `out[r] = (mean, 1/sqrt(var + eps))` computed exactly
+    /// as LayerNormF32 does (flag bit 1 ordered FP32 sums, else FP64), for DenseGemmF32's
+    /// LayerNorm prologue. `t0=out(f32[rows][2]) t1=x` · `i0=rows i1=feat i2=flags` · `f0=eps`.
+    RowStatsF32 = 204,
 }
 
 /// Activation codes shared by [`DevOp::UnaryF32`] (`kind`) and the convolution input/output
@@ -2424,6 +2438,7 @@ impl DevOp {
         DevOp::CumSumF64,
         DevOp::RandF32,
         DevOp::AttentionF32,
+        DevOp::RowStatsF32,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2648,6 +2663,7 @@ impl DevOp {
             DevOp::CumSumF64 => "PLOW_DOP_CUMSUM_F64",
             DevOp::RandF32 => "PLOW_DOP_RAND_F32",
             DevOp::AttentionF32 => "PLOW_DOP_ATTENTION_F32",
+            DevOp::RowStatsF32 => "PLOW_DOP_ROW_STATS_F32",
         }
     }
 
@@ -2701,7 +2717,8 @@ impl DevOp {
     /// 184..193 for the FP8 block-128 GEMM/MoE/MLA/indexer family; 194 -> 195 for
     /// `EmbedPosBf16 = 194` (Chatterbox T3 learned speech positions).
     /// 195 -> 204 for `GatherRowsF32 = 195` .. `AttentionF32 = 203` (generic FP32 signal ops).
-    pub const COUNT: u16 = 204;
+    /// 204 -> 205 for `RowStatsF32 = 204` (DenseGemmF32's LayerNorm prologue statistics).
+    pub const COUNT: u16 = 205;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

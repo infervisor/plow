@@ -301,7 +301,7 @@ const DOC: &[S] = &[
     S { op: DevOp::CausalDepthwiseConv1dF32, t: &["out", "x", "weight"], i: &["rows", "channels", "kernel"], f: &[], j: &[] },
     S { op: DevOp::RelativeAttentionF32, t: &["context", "query", "key", "value", "position", "bias_u", "bias_v"], i: &["rows", "width", "heads", "chunk_size", "left_chunks"], f: &[], j: &[] },
     S { op: DevOp::SiluF32, t: &["out", "x"], i: &["n"], f: &[], j: &[] },
-    S { op: DevOp::DenseGemmF32, t: &["C", "A", "W", "bias?"], i: &["M", "N", "K", "activation", "a_row0", "weight_stride?", "implicit_onehot_col", "flags"], f: &[], j: &[] },
+    S { op: DevOp::DenseGemmF32, t: &["C", "A", "W", "bias?", "scratch?", "stats?", "gamma?", "beta?"], i: &["M", "N", "K", "activation", "a_row0", "weight_stride?", "implicit_onehot_col", "flags"], f: &[], j: &[] },
     S { op: DevOp::EmbedF16F32, t: &["out", "table", "token"], i: &["vocab", "width"], f: &[], j: &[] },
     S { op: DevOp::LstmCellF32, t: &["h_new", "c_new", "gates", "c_prev"], i: &["width"], f: &[], j: &[] },
     S { op: DevOp::ArgmaxF32, t: &["ids", "x"], i: &["rows", "width"], f: &[], j: &[] },
@@ -314,13 +314,14 @@ const DOC: &[S] = &[
     S { op: DevOp::EmbedOverlayBf16, t: &["out", "table", "tokens", "overlay", "overlay_index"], i: &["rows", "width", "vocab", "overlay_rows"], f: &[], j: &[] },
     S { op: DevOp::GatherRowsF32, t: &["out", "table", "index?"], i: &["rows", "width", "vocab", "rows_per_item", "repeat", "index_item_stride", "table_item_stride", "flags"], f: &[], j: &["out_stride", "out_col0"] },
     S { op: DevOp::CopyColsF32, t: &["out", "x"], i: &["items", "rows", "cols", "in_stride", "in_offset", "out_stride", "out_offset"], f: &[], j: &["in_item_stride", "out_item_stride"] },
-    S { op: DevOp::Conv1dF32, t: &["out", "x", "weight", "bias?", "alpha?", "residual?", "lengths?"], i: &["batch", "in_rows", "in_channels", "out_channels", "kernel", "stride", "dilation", "groups"], f: &["slope"], j: &["pads", "flags"] },
+    S { op: DevOp::Conv1dF32, t: &["out", "x", "weight", "bias?", "alpha?", "residual?", "lengths?", "row_scale?"], i: &["batch", "in_rows", "in_channels", "out_channels", "kernel", "stride", "dilation", "groups"], f: &["slope"], j: &["pads", "flags"] },
     S { op: DevOp::ConvTranspose1dF32, t: &["out", "x", "weight", "bias?", "alpha?", "residual?", "lengths?"], i: &["batch", "in_rows", "in_channels", "out_channels", "kernel", "stride", "output_padding", "groups"], f: &["slope"], j: &["crops", "flags"] },
     S { op: DevOp::UnaryF32, t: &["out", "x", "param?"], i: &["rows", "width", "kind", "stride", "col0"], f: &["p0", "p1"], j: &[] },
     S { op: DevOp::BinaryF32, t: &["out", "a", "b"], i: &["items", "rows", "width", "op", "b_item_stride", "b_row_stride", "b_col_stride", "flags"], f: &["scale"], j: &[] },
     S { op: DevOp::CumSumF64, t: &["out", "x", "column_scale?", "lengths?"], i: &["items", "rows", "width", "x_width", "flags"], f: &["scale", "post_scale"], j: &[] },
     S { op: DevOp::RandF32, t: &["out", "seed"], i: &["items", "rows", "width", "stream", "stream_shift", "coords", "a_offset", "b_offset"], f: &["scale", "offset"], j: &["", "flags"] },
     S { op: DevOp::AttentionF32, t: &["out", "query", "key", "value", "key_lengths?", "bias?"], i: &["batch", "q_rows", "kv_rows", "heads", "head_width", "in_stride", "flags", "bias_head_stride"], f: &["scale"], j: &["k_col0", "v_col0"] },
+    S { op: DevOp::RowStatsF32, t: &["out", "x"], i: &["rows", "feat", "flags"], f: &["eps"], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

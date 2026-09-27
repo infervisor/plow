@@ -52,6 +52,7 @@ GOLDEN(g_binary_f32);
 GOLDEN(g_cumsum_f64);
 GOLDEN(g_rand_f32);
 GOLDEN(g_attention_f32);
+GOLDEN(g_row_stats_f32);
 }
 typedef void (*golden_fn)(const PlowDevInst*, uint32_t, uint32_t, void* const*, PlowCpuCtx*);
 
@@ -134,8 +135,11 @@ static const size_t kSmem = SP_ARENA_FLOATS * sizeof(float);
 
 enum Mode { FP32, BF16, INT, F64 };
 
+/* flips: BF16 elements allowed past 1 ulp. A bf16-rounded GELU amplifies a one-ulp flip of its
+ * rounded input (an fp32 summation-order effect) to several output ulps; the FFMA and tensor-core
+ * GEMMs both show 3e-6..3e-5 of elements so at K = 1024..4320 (the budget is 5e-5). */
 static void run(const char* name, Case& c, golden_fn golden, std::vector<unsigned> outs, Mode mode,
-                double tol = 1e-5) {
+                double tol = 1e-5, size_t flips = 0) {
     c.upload();
     std::vector<void*> th;
     for (auto& h : c.host) th.push_back(h.data());
@@ -192,10 +196,11 @@ static void run(const char* name, Case& c, golden_fn golden, std::vector<unsigne
                 bad++;
             }
         }
-        const bool pass = bad == 0;
+        const bool pass = bad <= flips;
         printf("  %-34s t%-2u n=%-8zu exact=%6.2f%%  max|d|/rms=%-9.3g%s -> %s\n", name, o, n,
                100.0 * exact / n, maxd,
-               mode == BF16 ? (maxulp ? "  (<=1 bf16 ulp)" : "") : "", pass ? "PASS" : "FAIL");
+               mode == BF16 ? (bad ? "  (gelu flips)" : maxulp ? "  (<=1 bf16 ulp)" : "") : "", pass ? "PASS" : "FAIL");
+        if (bad && pass) printf("    %zu flipped elements (budget %zu)\n", bad, flips);
         if (!pass) {
             printf("    %zu bad elements\n", bad);
             g_fail = 1;
@@ -203,19 +208,41 @@ static void run(const char* name, Case& c, golden_fn golden, std::vector<unsigne
     }
 }
 
+/* Round a host f32 tensor to bf16-representable values (what flag "bf16-exact" promises). */
+static void round_bf16(Case& c, unsigned id) {
+    float* p = (float*)c.host[id].data();
+    for (size_t i = 0; i < c.host[id].size() / 4; i++) {
+        const uint32_t u = (uint32_t)f2bf(p[i]) << 16;
+        memcpy(&p[i], &u, 4);
+    }
+}
+/* Split-K scratch for the tensor-core GEMMs: tickets + one 64x64 partial per block. */
+static unsigned splitk_scratch(Case& c) {
+    const size_t bytes = (SPT_TICKETS + (size_t)g_nblk * SPT_BM * SPT_BN) * 4;
+    unsigned id = c.add(bytes);
+    memset(c.host[id].data(), 0, bytes);
+    return id;
+}
+
 static void t_dense(const char* name, unsigned m, unsigned n, unsigned k, unsigned flags,
-                    unsigned act, unsigned row0, unsigned stride, unsigned onehot, bool bias) {
+                    unsigned act, unsigned row0, unsigned stride, unsigned onehot, bool bias,
+                    bool scratch = false) {
     Case c;
     const unsigned ws = stride ? stride : k;
     unsigned o = c.out((size_t)m * n);
     unsigned x = c.f32((size_t)(m + row0) * k, 1.f);
     unsigned w = flags & 4u ? c.bf16((size_t)n * ws, 0.06f) : c.f32((size_t)n * ws, 0.06f);
+    if (flags & 8u) {
+        round_bf16(c, x);
+        if (!(flags & 4u)) round_bf16(c, w);
+    }
     unsigned b = bias ? c.f32(n, 0.5f) : PLOW_TENSOR_NONE;
     c.in.op = PLOW_DOP_DENSE_GEMM_F32;
     c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b;
+    if (scratch) c.in.t[4] = splitk_scratch(c);
     c.in.i[0] = m; c.in.i[1] = n; c.in.i[2] = k; c.in.i[3] = act; c.in.i[4] = row0;
     c.in.i[5] = stride; c.in.i[6] = onehot; c.in.i[7] = flags;
-    run(name, c, g_dense_gemm_f32, {o}, flags & 3u ? BF16 : FP32);
+    run(name, c, g_dense_gemm_f32, {o}, flags & 3u ? BF16 : FP32, 1e-5, flags & 2u ? (size_t)m * n / 20000 : 0);
 }
 
 static void t_gemm_bf16(unsigned m, unsigned n, unsigned k) {
@@ -254,13 +281,15 @@ static void t_conv(const char* name, unsigned batches, unsigned frames, unsigned
     unsigned x = c.f32((size_t)batches * frames * width * ic, 1.f);
     const size_t wn = (size_t)oc * stored * kernel * kernel;
     unsigned w = flags & 64u ? c.f32(wn, 0.1f) : c.f16(wn, 0.1f);
+    if ((flags & 256u) || strstr(name, "same data")) { round_bf16(c, x); round_bf16(c, w); }
     unsigned b = c.f32(oc, 0.2f);
     c.in.op = PLOW_DOP_CONV2D_F32;
     c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b;
     c.in.i[0] = frames; c.in.i[1] = width; c.in.i[2] = ic; c.in.i[3] = oc;
     c.in.i[4] = kernel; c.in.i[5] = stride; c.in.i[6] = pb; c.in.i[7] = pa;
     c.in.fj[1].u = flags; c.in.fj[2].u = batches;
-    run(name, c, g_conv2d_f32, {o}, flags & 128u ? BF16 : FP32);
+    const size_t n = (size_t)batches * of * ow * oc;
+    run(name, c, g_conv2d_f32, {o}, flags & 128u ? BF16 : FP32, 1e-5, flags & 128u ? n / 20000 : 0);
 }
 
 static void t_layernorm(const char* name, unsigned rows, unsigned feat, unsigned flags, bool affine) {
@@ -379,7 +408,8 @@ static void t_elementwise() {
     }
 }
 
-static void bench_conv(unsigned batches, unsigned frames, unsigned width, unsigned ic, unsigned oc) {
+static void bench_conv(unsigned batches, unsigned frames, unsigned width, unsigned ic, unsigned oc,
+                       unsigned extra = 0) {
     const unsigned of = (frames - 1) / 2 + 1, ow = (width - 1) / 2 + 1;
     float *o, *x, *w, *b;
     CK(cudaMalloc(&o, (size_t)batches * of * ow * oc * 4));
@@ -395,7 +425,7 @@ static void bench_conv(unsigned batches, unsigned frames, unsigned width, unsign
     in.op = PLOW_DOP_CONV2D_F32;
     in.t[0] = 0; in.t[1] = 1; in.t[2] = 2; in.t[3] = 3;
     in.i[0] = frames; in.i[1] = width; in.i[2] = ic; in.i[3] = oc; in.i[4] = 3; in.i[5] = 2;
-    in.i[6] = 1; in.i[7] = 1; in.fj[1].u = 64 | 128 | (2 << 2) | (2 << 4); in.fj[2].u = batches;
+    in.i[6] = 1; in.i[7] = 1; in.fj[1].u = extra | 64 | 128 | (2 << 2) | (2 << 4); in.fj[2].u = batches;
     k_speech<<<g_nblk, 256, kSmem>>>(in, td);
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
@@ -407,25 +437,28 @@ static void bench_conv(unsigned batches, unsigned frames, unsigned width, unsign
     float ms;
     CK(cudaEventElapsedTime(&ms, e0, e1));
     ms /= reps;
-    printf("  bench Conv2dF32 3x3/2 %ux%ux%u ic=%u oc=%u: %.3f ms  %.1f GFLOP/s\n", batches, frames, width,
-           ic, oc, ms, 2.0 * batches * of * ow * oc * ic * 9 / (ms * 1e6));
+    printf("  bench Conv2dF32%s%s 3x3/2 %ux%ux%u ic=%u oc=%u: %.3f ms  %.1f GFLOP/s\n", extra & 256u ? " tc" : "", extra & 512u ? " tf32x3" : "",
+           batches, frames, width, ic, oc, ms, 2.0 * batches * of * ow * oc * ic * 9 / (ms * 1e6));
     cudaFree(o); cudaFree(x); cudaFree(w); cudaFree(b); cudaFree(td);
 }
 
-static void bench_dense(unsigned m, unsigned n, unsigned k) {
-    float *o, *x, *b;
+static void bench_dense(unsigned m, unsigned n, unsigned k, unsigned flags = 1u | 4u) {
+    float *o, *x, *b, *sc;
     uint16_t* w;
+    const size_t sc_bytes = (SPT_TICKETS + (size_t)g_nblk * SPT_BM * SPT_BN) * 4;
     CK(cudaMalloc(&o, (size_t)m * n * 4)); CK(cudaMalloc(&x, (size_t)m * k * 4));
-    CK(cudaMalloc(&w, (size_t)n * k * 2)); CK(cudaMalloc(&b, (size_t)n * 4));
+    CK(cudaMalloc(&w, (size_t)n * k * 2)); CK(cudaMalloc(&b, (size_t)n * 4)); CK(cudaMalloc(&sc, sc_bytes));
     CK(cudaMemset(x, 0, (size_t)m * k * 4)); CK(cudaMemset(w, 0, (size_t)n * k * 2)); CK(cudaMemset(b, 0, n * 4));
-    std::vector<void*> ptrs = {o, x, w, b};
+    CK(cudaMemset(sc, 0, sc_bytes));
+    std::vector<void*> ptrs = {o, x, w, b, sc};
     void** td = upload_table(ptrs);
     PlowDevInst in;
     memset(&in, 0, sizeof(in));
     for (auto& t : in.t) t = PLOW_TENSOR_NONE;
     in.op = PLOW_DOP_DENSE_GEMM_F32;
     in.t[0] = 0; in.t[1] = 1; in.t[2] = 2; in.t[3] = 3;
-    in.i[0] = m; in.i[1] = n; in.i[2] = k; in.i[7] = 1u | 4u;
+    if (flags & 8u) in.t[4] = 4;
+    in.i[0] = m; in.i[1] = n; in.i[2] = k; in.i[7] = flags;
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
     for (int i = 0; i < 3; i++) k_speech<<<g_nblk, 256, kSmem>>>(in, td);
@@ -437,9 +470,9 @@ static void bench_dense(unsigned m, unsigned n, unsigned k) {
     float ms;
     CK(cudaEventElapsedTime(&ms, e0, e1));
     ms /= reps;
-    printf("  bench DenseGemmF32 bf16w M=%u N=%u K=%u nblk=%d: %.3f ms  %.1f GFLOP/s\n", m, n, k, g_nblk,
-           ms, 2.0 * m * n * k / (ms * 1e6));
-    cudaFree(o); cudaFree(x); cudaFree(w); cudaFree(b); cudaFree(td);
+    printf("  bench DenseGemmF32 bf16w%s M=%u N=%u K=%u nblk=%d: %.4f ms  %.1f GFLOP/s  %.1f GB/s(W)\n",
+           flags & 8u ? " tc" : "", m, n, k, g_nblk, ms, 2.0 * m * n * k / (ms * 1e6), 2.0 * n * k / (ms * 1e6));
+    cudaFree(o); cudaFree(x); cudaFree(w); cudaFree(b); cudaFree(sc); cudaFree(td);
 }
 
 /* ---- generic signal ops (195-203) ---------------------------------------------------------- */
@@ -486,6 +519,8 @@ struct ConvSpec {
     bool f16, bias, alpha, residual;
     std::vector<uint32_t> lengths;
     float slope;
+    bool tc = false; /* flags bit 13: 3xTF32 tensor cores */
+    bool row_scale = false; /* t7 (Conv1d) */
 };
 
 static unsigned conv_out_rows(const ConvSpec& s, bool transpose) {
@@ -504,12 +539,13 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     unsigned a = s.alpha ? c.f32(std::max(s.cin, s.cout), 0.4f, 0.6f) : PLOW_TENSOR_NONE;
     unsigned r = s.residual ? c.f32((size_t)s.batch * out_rows * s.cout, 1.f) : PLOW_TENSOR_NONE;
     unsigned l = s.lengths.empty() ? PLOW_TENSOR_NONE : c.u32(s.lengths);
+    if (s.row_scale) c.in.t[7] = c.f32((size_t)s.batch * out_rows, 1.f);
     c.in.op = transpose ? PLOW_DOP_CONV_TRANSPOSE1D_F32 : PLOW_DOP_CONV1D_F32;
     c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b; c.in.t[4] = a; c.in.t[5] = r; c.in.t[6] = l;
     c.in.i[0] = s.batch; c.in.i[1] = s.in_rows; c.in.i[2] = s.cin; c.in.i[3] = s.cout;
     c.in.i[4] = s.kernel; c.in.i[5] = s.stride; c.in.i[6] = s.dil_or_opad; c.in.i[7] = s.groups;
     c.in.fj[0].f = s.slope; c.in.fj[1].u = pads(s.before, s.after);
-    c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16);
+    c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u);
 }
 
 static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
@@ -559,6 +595,106 @@ static void t_binary() {
         c.in.i[4] = t.bis; c.in.i[5] = t.brs; c.in.i[6] = t.bcs; c.in.i[7] = t.flags; c.in.fj[0].f = -0.7f;
         run(t.name, c, g_binary_f32, {o}, FP32, 0.0);
     }
+}
+
+static void t_vec_elementwise() {
+    {
+        Case c; const unsigned rows = 97, width = 40, stride = 48, col0 = 8;
+        unsigned o = c.f32(rows * stride, 1.f), x = c.f32(rows * stride, 4.f), p = c.f32(width, 0.5f, 0.7f);
+        c.in.op = PLOW_DOP_UNARY_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = p;
+        c.in.i[0] = rows; c.in.i[1] = width; c.in.i[2] = 12; c.in.i[3] = stride; c.in.i[4] = col0;
+        run("UnaryF32 snake float4", c, g_unary_f32, {o}, FP32, 1e-5);
+    }
+    struct B { const char* name; unsigned op, bis, brs, bcs, bn, flags; };
+    const unsigned items = 3, rows = 45, width = 36;
+    const B cases[] = {
+        {"BinaryF32 add full float4", 0, rows * width, width, 1, items * rows * width, 0},
+        {"BinaryF32 mul row-scalar float4", 2, rows, 1, 0, items * rows, 1},
+        {"BinaryF32 sub item-scalar float4", 1, 1, 0, 0, items, 0},
+    };
+    for (const B& t : cases) {
+        Case c;
+        unsigned o = c.out(items * rows * width), a = c.f32(items * rows * width, 2.f), b = c.f32(t.bn, 1.f, 1.5f);
+        c.in.op = PLOW_DOP_BINARY_F32; c.in.t[0] = o; c.in.t[1] = a; c.in.t[2] = b;
+        c.in.i[0] = items; c.in.i[1] = rows; c.in.i[2] = width; c.in.i[3] = t.op;
+        c.in.i[4] = t.bis; c.in.i[5] = t.brs; c.in.i[6] = t.bcs; c.in.i[7] = t.flags; c.in.fj[0].f = -0.7f;
+        run(t.name, c, g_binary_f32, {o}, FP32, 0.0);
+    }
+}
+
+/* RowStatsF32 vs golden; then LayerNormF32 -> DenseGemmF32 against the fused prologue
+ * (RowStatsF32 -> DenseGemmF32 flag 32), both on the GPU: bit-identical outputs expected. */
+static void t_row_stats(const char* name, unsigned rows, unsigned feat, unsigned flags) {
+    Case c;
+    unsigned o = c.out((size_t)rows * 2), x = c.f32((size_t)rows * feat, 2.f, 0.5f);
+    c.in.op = PLOW_DOP_ROW_STATS_F32; c.in.t[0] = o; c.in.t[1] = x;
+    c.in.i[0] = rows; c.in.i[1] = feat; c.in.i[2] = flags; c.in.fj[0].f = 1e-5f;
+    run(name, c, g_row_stats_f32, {o}, FP32, 0.0);
+}
+static void launch(const PlowDevInst& in, const std::vector<void*>& ptrs) {
+    void** td = upload_table(ptrs);
+    k_speech<<<g_nblk, 256, kSmem>>>(in, td);
+    CK(cudaGetLastError());
+    CK(cudaDeviceSynchronize());
+    CK(cudaFree(td));
+}
+static void t_ln_gemm(const char* name, unsigned m, unsigned n, unsigned k, unsigned ln_flags, unsigned dense_flags,
+                      unsigned row0) {
+    /* Golden fused vs GPU fused. */
+    Case c;
+    const unsigned rows = m + row0;
+    unsigned o = c.out((size_t)m * n), x = c.f32((size_t)rows * k, 2.f, 0.3f);
+    unsigned w = dense_flags & 4u ? c.bf16((size_t)n * k, 0.06f) : c.f32((size_t)n * k, 0.06f);
+    unsigned b = c.f32(n, 0.5f), sc = splitk_scratch(c), st = c.out((size_t)rows * 2);
+    unsigned g = c.f32(k, 0.5f, 1.f), be = c.f32(k, 0.2f);
+    c.upload();
+    std::vector<float> stats((size_t)rows * 2);
+    {   /* stats on the GPU (RowStatsF32), mirrored to the host for the golden */
+        PlowDevInst in; memset(&in, 0, sizeof(in)); for (auto& t : in.t) t = PLOW_TENSOR_NONE;
+        in.op = PLOW_DOP_ROW_STATS_F32; in.t[0] = st; in.t[1] = x;
+        in.i[0] = rows; in.i[1] = k; in.i[2] = ln_flags; in.fj[0].f = 1e-5f;
+        launch(in, c.dev);
+        CK(cudaMemcpy(c.host[st].data(), c.dev[st], rows * 8, cudaMemcpyDeviceToHost));
+        memcpy(stats.data(), c.host[st].data(), rows * 8);
+        std::vector<float> ref(rows * 2);
+        std::vector<void*> th; for (auto& h : c.host) th.push_back(h.data());
+        std::vector<uint8_t> save = c.host[st];
+        g_row_stats_f32(&in, 0, 1, th.data(), nullptr);
+        if (memcmp(save.data(), c.host[st].data(), rows * 8)) { printf("  %s: RowStats mismatch\n", name); g_fail = 1; }
+    }
+    /* Unfused GPU chain: LayerNormF32 -> DenseGemmF32 (flags without the prologue bits). */
+    float* ln_out; float* chain;
+    CK(cudaMalloc(&ln_out, (size_t)rows * k * 4)); CK(cudaMalloc(&chain, (size_t)m * n * 4));
+    {
+        std::vector<void*> ptrs = c.dev; ptrs.push_back(ln_out); ptrs.push_back(chain);
+        const unsigned lo = (unsigned)ptrs.size() - 2, ch = lo + 1;
+        PlowDevInst in; memset(&in, 0, sizeof(in)); for (auto& t : in.t) t = PLOW_TENSOR_NONE;
+        in.op = PLOW_DOP_LAYERNORM_F32; in.t[0] = lo; in.t[1] = x; in.t[2] = g; in.t[3] = be;
+        in.i[0] = rows; in.i[1] = k; in.i[2] = ln_flags; in.fj[0].f = 1e-5f;
+        launch(in, ptrs);
+        memset(&in, 0, sizeof(in)); for (auto& t : in.t) t = PLOW_TENSOR_NONE;
+        in.op = PLOW_DOP_DENSE_GEMM_F32; in.t[0] = ch; in.t[1] = lo; in.t[2] = w; in.t[3] = b; in.t[4] = sc;
+        in.i[0] = m; in.i[1] = n; in.i[2] = k; in.i[4] = row0; in.i[7] = dense_flags;
+        launch(in, ptrs);
+    }
+    c.in.op = PLOW_DOP_DENSE_GEMM_F32;
+    c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = w; c.in.t[3] = b; c.in.t[4] = sc; c.in.t[5] = st; c.in.t[6] = g;
+    c.in.t[7] = be;
+    c.in.i[0] = m; c.in.i[1] = n; c.in.i[2] = k; c.in.i[4] = row0;
+    c.in.i[7] = dense_flags | 32u | (ln_flags & 1u ? 64u : 0u);
+    /* run() re-uploads host buffers: keep the stats the GPU produced. */
+    memcpy(c.host[st].data(), stats.data(), rows * 8);
+    for (void* p : c.dev) cudaFree(p);
+    c.dev.clear();
+    run(name, c, g_dense_gemm_f32, {o}, dense_flags & 3u ? BF16 : FP32, 1e-5, dense_flags & 2u ? (size_t)m * n / 20000 : 0);
+    std::vector<uint32_t> fused((size_t)m * n), unfused((size_t)m * n);
+    CK(cudaMemcpy(fused.data(), c.dev[o], fused.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(unfused.data(), chain, unfused.size() * 4, cudaMemcpyDeviceToHost));
+    size_t diff = 0;
+    for (size_t i = 0; i < fused.size(); i++) diff += fused[i] != unfused[i];
+    printf("  %-34s     n=%-8zu fused vs LayerNorm->Dense on GPU: %s\n", name, fused.size(), diff ? "DIFFER" : "bit-identical");
+    if (diff) { printf("    %zu differing elements\n", diff); g_fail = 1; }
+    cudaFree(ln_out); cudaFree(chain);
 }
 
 static void t_cumsum() {
@@ -674,7 +810,7 @@ static void t_rand() {
 }
 
 static void t_attention(const char* name, unsigned batch, unsigned rows, unsigned heads, unsigned hw,
-                        std::vector<uint32_t> lengths, bool causal, bool bias, bool fused) {
+                        std::vector<uint32_t> lengths, bool causal, bool bias, bool fused, bool tc = false) {
     Case c;
     const unsigned width = heads * hw, stride = fused ? 3 * width : width;
     unsigned o = c.out((size_t)batch * rows * width);
@@ -691,7 +827,7 @@ static void t_attention(const char* name, unsigned batch, unsigned rows, unsigne
     c.in.op = PLOW_DOP_ATTENTION_F32;
     c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = l; c.in.t[5] = bs;
     c.in.i[0] = batch; c.in.i[1] = rows; c.in.i[2] = rows; c.in.i[3] = heads; c.in.i[4] = hw;
-    c.in.i[5] = fused ? stride : 0; c.in.i[6] = causal; c.in.i[7] = rows * rows;
+    c.in.i[5] = fused ? stride : 0; c.in.i[6] = causal | (tc ? 2u : 0u); c.in.i[7] = rows * rows;
     c.in.fj[0].f = 1.0f / sqrtf((float)hw);
     c.in.fj[1].u = fused ? width : 0; c.in.fj[2].u = fused ? 2 * width : 0;
     run(name, c, g_attention_f32, {o}, FP32, 2e-5);
@@ -719,6 +855,30 @@ static void bench(const char* name, Case& c, double flops, double bytes, int rep
 }
 
 static void bench_signal() {
+    {
+        Case c; const unsigned rows = 32 * 16384, width = 64;
+        unsigned o = c.out((size_t)rows * width), x = c.f32((size_t)rows * width, 4.f);
+        unsigned p = c.f32(width, 0.5f, 0.7f);
+        c.in.op = PLOW_DOP_UNARY_F32; c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = p;
+        c.in.i[0] = rows; c.in.i[1] = width; c.in.i[2] = 12;
+        bench("UnaryF32 snake [32*16384][64]", c, 0, 8.0 * rows * width, 5);
+    }
+    {
+        Case c; const unsigned rows = 32 * 16384, width = 64;
+        unsigned o = c.out((size_t)rows * width), a = c.f32((size_t)rows * width, 1.f), b = c.f32((size_t)rows * width, 1.f);
+        c.in.op = PLOW_DOP_BINARY_F32; c.in.t[0] = o; c.in.t[1] = a; c.in.t[2] = b;
+        c.in.i[0] = 1; c.in.i[1] = rows; c.in.i[2] = width; c.in.i[3] = 0; c.in.i[4] = rows * width;
+        c.in.i[5] = width; c.in.i[6] = 1;
+        bench("BinaryF32 add full [32*16384][64]", c, 0, 12.0 * rows * width, 5);
+    }
+    {
+        Case c; const unsigned rows = 32 * 16384, width = 64;
+        unsigned o = c.out((size_t)rows * width), a = c.f32((size_t)rows * width, 1.f), b = c.f32(rows, 1.f);
+        c.in.op = PLOW_DOP_BINARY_F32; c.in.t[0] = o; c.in.t[1] = a; c.in.t[2] = b;
+        c.in.i[0] = 1; c.in.i[1] = rows; c.in.i[2] = width; c.in.i[3] = 2; c.in.i[4] = rows; c.in.i[5] = 1;
+        c.in.i[6] = 0;
+        bench("BinaryF32 mul row-scalar [32*16384][64]", c, 0, 8.0 * rows * width, 5);
+    }
     {
         Case c; const unsigned m = 16384, n = 512, k = 512;
         unsigned o = c.out((size_t)m * n), x = c.f32((size_t)m * k, 1.f), w = c.f32((size_t)n * k, 0.05f);
@@ -748,11 +908,31 @@ static void bench_signal() {
         Case c; unsigned o; build_conv(c, s, false, o);
         bench("Conv1dF32 dense k7 512->512 snake [2][2048]", c, 2.0 * 4096 * 512 * 512 * 7, 0);
     }
-    {
-        ConvSpec s{2, 256, 1024, 512, 16, 8, 0, 1, 4, 4, 0, 12, 0, false, true, true, false, {}, 0.f};
+    for (bool tc : {false, true}) {
+        ConvSpec s{2, 256, 1024, 512, 16, 8, 0, 1, 4, 4, 0, 12, 0, false, true, true, false, {}, 0.f, tc};
         Case c; unsigned o; build_conv(c, s, true, o);
         const double out_rows = conv_out_rows(s, true);
-        bench("ConvTranspose1dF32 1024->512 k16 s8 [2][256]", c, 2.0 * 2 * out_rows * 512 * 1024 * 2, 0);
+        bench(tc ? "ConvTranspose1dF32 tc 1024->512 k16 s8 [2][256]" : "ConvTranspose1dF32 1024->512 k16 s8 [2][256]",
+              c, 2.0 * 2 * out_rows * 512 * 1024 * 2, 0);
+    }
+    for (bool tc : {false, true}) {
+        ConvSpec s{1, 32, 1024, 512, 16, 8, 0, 1, 4, 4, 0, 12, 0, false, true, true, false, {32}, 0.f, tc};
+        Case c; unsigned o; build_conv(c, s, true, o);
+        const double out_rows = conv_out_rows(s, true);
+        bench(tc ? "ConvTranspose1dF32 tc 1024->512 k16 s8 [1][32]" : "ConvTranspose1dF32 1024->512 k16 s8 [1][32]",
+              c, 2.0 * out_rows * 512 * 1024 * 2, 0);
+    }
+    for (bool tc : {false, true}) {
+        ConvSpec s{32, 2048, 256, 256, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true, {}, 0.f, tc};
+        Case c; unsigned o; build_conv(c, s, false, o);
+        bench(tc ? "Conv1dF32 tc pointwise 256->256 +res [32][2048]" : "Conv1dF32 pointwise 256->256 +res [32][2048]",
+              c, 2.0 * 32 * 2048 * 256 * 256, 0);
+    }
+    for (bool tc : {false, true}) {
+        ConvSpec s{2, 8192, 512, 512, 1, 1, 1, 1, 0, 0, 0, 12, 0, false, true, true, true, {}, 0.f, tc};
+        Case c; unsigned o; build_conv(c, s, false, o);
+        bench(tc ? "Conv1dF32 tc pointwise +snake +residual 16k" : "Conv1dF32 pointwise +snake +residual 16k (2)",
+              c, 2.0 * 16384 * 512 * 512, 0);
     }
     {
         Case c;
@@ -775,6 +955,91 @@ int main(int argc, char** argv) {
     CK(cudaFuncSetAttribute(k_speech, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kSmem));
     printf("speech_f32_op_test on %s (%d SMs), nblk=%d, arena=%zu B\n", prop.name, g_nblk, g_nblk, kSmem);
 
+    if (argc > 1 && !strcmp(argv[1], "--bench-codec")) {
+        for (bool tc : {false, true}) {
+            ConvSpec s{32, 16384, 64, 64, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true,
+                       std::vector<uint32_t>(32, 16384), 0.f, tc};
+            Case c; unsigned o; build_conv(c, s, false, o);
+            bench(tc ? "Conv1dF32 tc pointwise 64->64 +res len [32][16384]" : "Conv1dF32 pointwise 64->64 +res len [32][16384]",
+                  c, 2.0 * 32 * 16384 * 64 * 64, 12.0 * 32 * 16384 * 64, 5);
+        }
+        for (bool tc : {false, true}) {
+            ConvSpec s{32, 2048, 256, 256, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true,
+                       std::vector<uint32_t>(32, 2048), 0.f, tc};
+            Case c; unsigned o; build_conv(c, s, false, o);
+            bench(tc ? "Conv1dF32 tc pointwise 256->256 +res len [32][2048]" : "Conv1dF32 pointwise 256->256 +res len [32][2048]",
+                  c, 2.0 * 32 * 2048 * 256 * 256, 12.0 * 32 * 2048 * 256, 5);
+        }
+        /* S3Gen CFM transformer block shapes (B=1 T=128 -> 1140 rows). */
+        const unsigned cfm[][2] = {{256, 1536}, {512, 256}, {256, 1024}, {1024, 256}};
+        for (auto& sh : cfm) {
+            ConvSpec s{1, 1140, sh[0], sh[1], 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true};
+            Case c; unsigned o; build_conv(c, s, false, o);
+            char name[80];
+            snprintf(name, sizeof(name), "Conv1dF32 tc pointwise %u->%u [1][1140]", sh[0], sh[1]);
+            bench(name, c, 2.0 * 1140 * sh[0] * sh[1], 0);
+        }
+        {
+            Case c;
+            unsigned o = c.out(1140 * 256), x = c.f32(1140 * 256, 2.f, 0.5f), g = c.f32(256, 0.5f, 1.f), b = c.f32(256, 0.2f);
+            c.in.op = PLOW_DOP_LAYERNORM_F32;
+            c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = g; c.in.t[3] = b;
+            c.in.i[0] = 1140; c.in.i[1] = 256; c.in.i[2] = 0; c.in.fj[0].f = 1e-5f;
+            bench("LayerNormF32 double 1140x256", c, 0, 8.0 * 1140 * 256);
+        }
+        {
+            Case c;
+            const unsigned batch = 2, rows = 570, heads = 8, hw = 64, width = heads * hw, stride = 3 * width;
+            unsigned o = c.out((size_t)batch * rows * width), q = c.f32((size_t)batch * rows * stride, 1.f);
+            c.in.op = PLOW_DOP_ATTENTION_F32;
+            c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = q; c.in.t[3] = q;
+            c.in.i[0] = batch; c.in.i[1] = rows; c.in.i[2] = rows; c.in.i[3] = heads; c.in.i[4] = hw; c.in.i[5] = stride;
+            c.in.fj[0].f = 0.125f; c.in.fj[1].u = width; c.in.fj[2].u = 2 * width;
+            bench("AttentionF32 8x64 2x570 fused", c, 4.0 * batch * heads * hw * rows * rows, 0);
+            c.in.i[6] = 2;
+            bench("AttentionF32 tc 8x64 2x570 fused", c, 4.0 * batch * heads * hw * rows * rows, 0);
+        }
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--bench-dense")) {
+        for (unsigned m : {104u, 390u}) {
+            bench_dense(m, 1024, 1024, 1 | 4 | 8);
+            bench_dense(m, 4096, 1024, 2 | 4 | 8);
+            bench_dense(m, 1024, 4096, 1 | 4 | 8);
+        }
+        bench_dense(104, 1024, 7680, 1 | 4 | 8);
+        bench_dense(1, 64, 64, 1 | 4 | 8);
+        bench_conv(8, 128, 100, 1, 480);
+        bench_conv(8, 128, 100, 1, 480, 512);
+        bench_conv(8, 64, 50, 480, 480);
+        bench_conv(8, 64, 50, 480, 480, 256);
+        bench_conv(8, 32, 25, 480, 480, 256);
+        bench_conv(30, 64, 50, 480, 480, 256);
+        for (unsigned rows : {104u, 390u}) {
+            Case c;
+            unsigned o = c.out((size_t)rows * 1024), x = c.f32((size_t)rows * 1024, 2.f, 0.5f);
+            unsigned g = c.f32(1024, 0.5f, 1.f), b = c.f32(1024, 0.2f);
+            c.in.op = PLOW_DOP_LAYERNORM_F32;
+            c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = g; c.in.t[3] = b;
+            c.in.i[0] = rows; c.in.i[1] = 1024; c.in.i[2] = 3; c.in.fj[0].f = 1e-5f;
+            char name[64];
+            snprintf(name, sizeof(name), "LayerNormF32 ordered bf16 %ux1024", rows);
+            bench(name, c, 0, 8.0 * rows * 1024);
+        }
+        for (unsigned rows : {104u, 390u}) {
+            Case c;
+            const size_t n = (size_t)rows * 1024;
+            unsigned o = c.out(n), q = c.f32(n, 1.f), k = c.f32(n, 1.f), v = c.f32(n, 1.f);
+            unsigned vr = c.u32({rows - 10});
+            c.in.op = PLOW_DOP_GROUPED_ATTENTION_F32;
+            c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = vr;
+            c.in.i[0] = rows; c.in.i[1] = 1024; c.in.i[2] = 64; c.in.i[3] = 104; c.in.i[4] = 7;
+            char name[64];
+            snprintf(name, sizeof(name), "GroupedAttentionF32 qwen %ux1024 g104", rows);
+            bench(name, c, 4.0 * rows * 104 * 1024, 0);
+        }
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "--bench-only")) {
         bench_signal();
         return 0;
@@ -840,6 +1105,70 @@ int main(int argc, char** argv) {
     t_attention("AttentionF32 8x64 2x1200 lengths", 2, 1200, 8, 64, {1200, 1000}, false, false, false);
     t_attention("AttentionF32 2x128 causal bias fused", 2, 300, 2, 128, {300, 217}, true, true, true);
     t_attention("AttentionF32 4x64 ragged rows", 1, 77, 4, 64, {}, false, false, false);
+    /* Tensor-core GEMM paths (after the fixed-seed cases above, so their data is unchanged). */
+    t_vec_elementwise();
+    t_row_stats("RowStatsF32 ordered 104x1024", 104, 1024, 3);
+    t_row_stats("RowStatsF32 double 1140x256", 1140, 256, 0);
+    t_ln_gemm("DenseGemmF32 LN-prologue tc-bf16 qwen q", 104, 1024, 1024, 3, 1 | 4 | 8, 0);
+    t_ln_gemm("DenseGemmF32 LN-prologue tc-bf16 gelu fc1", 104, 4096, 1024, 3, 2 | 4 | 8, 0);
+    t_ln_gemm("DenseGemmF32 LN-prologue ffma bf16w row0", 77, 130, 72, 3, 1 | 4, 3);
+    t_ln_gemm("DenseGemmF32 LN-prologue 3xtf32 s3gen", 1140, 256, 256, 0, 16, 0);
+    t_ln_gemm("DenseGemmF32 LN-prologue ffma f32w", 60, 100, 256, 0, 0, 2);
+    {
+        ConvSpec rs[] = {
+            {2, 1024, 128, 128, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true, {1024, 700}, 0.f, true, true},
+            {2, 300, 64, 64, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true, {}, 0.f, false, true},
+            {2, 256, 64, 64, 7, 1, 3, 64, 9, 9, 0, 12, 0, false, true, true, true, {}, 0.f, false, true},
+        };
+        t_conv1d("Conv1dF32 row_scale tc pointwise +res len", rs[0]);
+        t_conv1d("Conv1dF32 row_scale ffma pointwise +res", rs[1]);
+        t_conv1d("Conv1dF32 row_scale depthwise snake +res", rs[2]);
+    }
+    t_attention("AttentionF32 tc 8x64 2x1200 lengths", 2, 1200, 8, 64, {1200, 1000}, false, false, false, true);
+    t_attention("AttentionF32 tc 8x64 causal bias fused", 2, 300, 8, 64, {300, 217}, true, true, true, true);
+    t_attention("AttentionF32 tc 4x64 ragged rows", 1, 77, 4, 64, {}, false, false, false, true);
+    t_attention("AttentionF32 tc s3gen 8x64 2x570 fused", 2, 570, 8, 64, {}, false, false, true, true);
+    {
+        ConvSpec cs[] = {
+            {2, 1024, 512, 512, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true, {}, 0.f, true},
+            {2, 2048, 512, 512, 1, 1, 1, 1, 0, 0, 0, 12, 0, false, true, true, true, {2048, 1500}, 0.f, true},
+            {2, 300, 64, 80, 7, 1, 3, 1, 9, 9, 1, 9, 1, true, true, false, false, {300, 211}, 0.1f, true},
+            {2, 199, 64, 64, 5, 2, 1, 2, 2, 2, 2, 8, 0, false, false, false, false, {}, 0.f, true},
+        };
+        const char* names[] = {"Conv1dF32 tc pointwise 512 2k +res", "Conv1dF32 tc pointwise snake +res len",
+                               "Conv1dF32 tc dense k7 reflect leaky->tanh len", "Conv1dF32 tc stride2 replicate groups2"};
+        for (int i = 0; i < 4; i++) t_conv1d(names[i], cs[i]);
+        ConvSpec ts[] = {
+            {2, 128, 1024, 512, 16, 8, 0, 1, 4, 4, 0, 12, 0, false, true, true, false, {128, 77}, 0.f, true},
+            {2, 60, 128, 64, 11, 5, 1, 1, 3, 2, 0, 9, 0, true, true, false, true, {}, 0.1f, true},
+            {1, 50, 64, 96, 7, 3, 0, 2, 2, 2, 0, 0, 0, false, true, false, false, {}, 0.f, true},
+        };
+        const char* tnames[] = {"ConvT1dF32 tc 1024->512 k16 s8 snake", "ConvT1dF32 tc k11 s5 leaky f16 opad",
+                                "ConvT1dF32 tc groups2 k7 s3"};
+        for (int i = 0; i < 3; i++) t_convt1d(tnames[i], ts[i]);
+    }
+    t_conv("Conv2dF32 tc-3xtf32 qwen stage1", 2, 128, 100, 1, 48, 3, 2, 1, 1, 512 | 64 | 128 | (2 << 2) | (2 << 4));
+    t_conv("Conv2dF32 tc-bf16 qwen stage2", 2, 64, 50, 48, 64, 3, 2, 1, 1, 256 | 64 | 128 | (2 << 2) | (2 << 4));
+    t_conv("Conv2dF32 tc-bf16 wide multi-tile", 8, 64, 50, 48, 320, 3, 2, 1, 1, 256 | 64 | 128 | (2 << 2) | (2 << 4));
+    t_conv("Conv2dF32 tc-bf16 wide NFWC out", 8, 64, 50, 48, 320, 3, 2, 1, 1, 256 | 64 | (0 << 2) | (2 << 4));
+    {
+        /* Same data through the FFMA path: its GELU flip count is the baseline the budget covers. */
+        const uint32_t seed = rng_s;
+        t_conv("Conv2dF32 tc-bf16 qwen stage3 480", 3, 16, 25, 480, 480, 3, 2, 1, 1, 256 | 64 | 128 | (2 << 2) | (2 << 4));
+        rng_s = seed;
+        t_conv("Conv2dF32 ffma qwen stage3 480 (same data)", 3, 16, 25, 480, 480, 3, 2, 1, 1, 64 | 128 | (2 << 2) | (2 << 4));
+    }
+    t_conv("Conv2dF32 tc-3xtf32 f32 NFCW->NFWC relu", 2, 17, 11, 12, 20, 3, 1, 1, 0, 512 | 64 | 2 | (1 << 4));
+    t_dense("DenseGemmF32 tc-bf16 qwen q 104x1024x1024 splitk", 104, 1024, 1024, 1 | 4 | 8, 0, 0, 0, 0, true, true);
+    t_dense("DenseGemmF32 tc-bf16 fc2 104x1024x4096 splitk", 104, 1024, 4096, 1 | 4 | 8, 0, 0, 0, 0, true, true);
+    t_dense("DenseGemmF32 tc-bf16 390x4096x1024", 390, 4096, 1024, 1 | 4 | 8, 0, 0, 0, 0, true, true);
+    t_dense("DenseGemmF32 tc-bf16 gelu 390x4096x1024", 390, 4096, 1024, 2 | 4 | 8, 0, 0, 0, 0, true, true);
+    t_dense("DenseGemmF32 tc-bf16 conv_out 77x1024x7680", 77, 1024, 7680, 1 | 4 | 8, 0, 0, 0, 0, false, true);
+    t_dense("DenseGemmF32 tc-bf16 nosplit ragged 45x67x36", 45, 67, 36, 1 | 4 | 8, 0, 0, 37, 36, true);
+    t_dense("DenseGemmF32 tc-bf16 f32w relu row0", 77, 130, 70, 8, 1, 3, 0, 0, true, true);
+    t_dense("DenseGemmF32 tc-3xtf32 f32w 300x520x700", 300, 520, 700, 16, 0, 0, 0, 0, true);
+    t_dense("DenseGemmF32 tc-3xtf32 f32w splitk 50x130x2000", 50, 130, 2000, 16, 1, 2, 0, 0, true, true);
+    t_dense("DenseGemmF32 tc-3xtf32 onehot", 45, 67, 33, 16, 0, 0, 35, 34, false);
 
     if (argc > 1 && !strcmp(argv[1], "--bench")) {
         bench_signal();
@@ -848,6 +1177,13 @@ int main(int argc, char** argv) {
         bench_dense(1500, 4096, 1024);
         bench_dense(1500, 1024, 4096);
         bench_dense(1500, 5120, 1280);
+        for (unsigned m : {104u, 390u, 1500u}) {
+            bench_dense(m, 1024, 1024, 1 | 4 | 8);
+            bench_dense(m, 4096, 1024, 2 | 4 | 8);
+            bench_dense(m, 1024, 4096, 1 | 4 | 8);
+        }
+        bench_dense(104, 1024, 7680, 1 | 4 | 8);
+        bench_dense(104, 1024, 1024);
         bench_conv(30, 64, 50, 480, 480);
     }
     printf(g_fail ? "FAIL\n" : "ALL PASS\n");

@@ -72,6 +72,7 @@ G_K(g_binary_f32);
 G_K(g_cumsum_f64);
 G_K(g_rand_f32);
 G_K(g_attention_f32);
+G_K(g_row_stats_f32);
 /* affine_q4.c */
 G_K(g_gemv_affine_q4);
 G_K(g_gemm_affine_q4);

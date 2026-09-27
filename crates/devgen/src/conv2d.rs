@@ -29,6 +29,8 @@ pub enum ConvActivation {
 pub enum ConvWeight {
     F16,
     F32,
+    /// FP32 storage of bf16-representable values (a bf16 checkpoint widened at embed time).
+    Bf16InF32,
 }
 
 #[derive(Clone, Copy)]
@@ -219,7 +221,7 @@ pub fn lower(
             weight_elements
                 * match stage.weight_type {
                     ConvWeight::F16 => 2,
-                    ConvWeight::F32 => 4,
+                    ConvWeight::F32 | ConvWeight::Bf16InF32 => 4,
                 },
         );
         let bias = builder.tensor(stage.bias, u64::from(stage.output_channels) * 4);
@@ -239,7 +241,18 @@ pub fn lower(
             .checked_mul(output_frames)
             .and_then(|count| count.checked_mul(output_width))
             .ok_or("convolution output size overflows")?;
-        let blocks = if pointwise || tiled_3x3_nchw {
+        // The input is bf16-exact when the previous stage rounded its GELU to bf16.
+        let tensor_cores = stage.kind == ConvKind::Standard
+            && stage.weight_type == ConvWeight::Bf16InF32
+            && index > 0
+            && stages[index - 1].activation == ConvActivation::GeluErfBf16;
+        // Otherwise a standard conv with FP32 weights runs 3xTF32 tensor cores (FP32-accurate).
+        let tf32x3 = !tensor_cores
+            && stage.kind == ConvKind::Standard
+            && stage.weight_type != ConvWeight::F16;
+        let blocks = if tensor_cores || tf32x3 {
+            (spatial.div_ceil(64) * stage.output_channels.div_ceil(64)).clamp(1, n_cu)
+        } else if pointwise || tiled_3x3_nchw {
             spatial
                 .div_ceil(128)
                 .checked_mul(stage.output_channels.div_ceil(64))
@@ -266,7 +279,9 @@ pub fn lower(
                     stage.pad_before,
                     stage.pad_after,
                 ]);
-                instruction.j[0] = flags(stage, layout);
+                instruction.j[0] = flags(stage, layout)
+                    | (u32::from(tensor_cores) << 8)
+                    | (u32::from(tf32x3) << 9);
                 instruction.j[1] = spec.batches;
             },
         ));
@@ -305,7 +320,7 @@ fn flags(stage: &Conv2dStage<'_>, input_layout: ConvLayout) -> u32 {
         | (u32::from(stage.activation == ConvActivation::Relu) << 1)
         | (layout_code(stage.output_layout) << 2)
         | (layout_code(input_layout) << 4)
-        | (u32::from(stage.weight_type == ConvWeight::F32) << 6)
+        | (u32::from(stage.weight_type != ConvWeight::F16) << 6)
         | (u32::from(stage.activation == ConvActivation::GeluErfBf16) << 7)
 }
 
@@ -394,7 +409,7 @@ mod tests {
         .unwrap();
         assert_eq!((packets.output_frames, packets.output_width), (4, 5));
         let inst = &packets.model.progs[0].insts[0];
-        assert_eq!(inst.j, [2 << 4 | 2 << 2 | 1 << 6 | 1 << 7, 3]);
+        assert_eq!(inst.j, [2 << 4 | 2 << 2 | 1 << 6 | 1 << 7 | 1 << 9, 3]);
         let prefix = packets.pack_ncfw_rows(15).unwrap();
         assert_eq!(prefix.input_shape, [3, 1, 8, 10]);
         assert_eq!(prefix.programs, [0, 1]);

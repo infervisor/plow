@@ -207,6 +207,8 @@ pub fn class_of(op: DevOp) -> RowClass {
         // strides, `[batch][rows]` geometry); only the pure elementwise one is row-agnostic.
         GatherRowsF32 | CopyColsF32 | Conv1dF32 | ConvTranspose1dF32 | BinaryF32 | CumSumF64
         | RandF32 | AttentionF32 => RowClass::C,
+        // Per-row statistics: row-agnostic like LayerNormF32.
+        RowStatsF32 => RowClass::A,
         UnaryF32 => RowClass::A,
 
         // ---- D: per-sequence carried state -------------------------------------------------
