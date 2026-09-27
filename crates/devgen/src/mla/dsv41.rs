@@ -2633,7 +2633,38 @@ pub(crate) fn emit_dsv41_block(
     ctx: u32,
     t: u32,
 ) -> (crate::Model, plow_asset::BlockDescriptor) {
+    emit_dsv41_chain(c, layers, tp, n_cu, ctx, t, false)
+}
+
+/// The whole model's token interface: embed in front of the chain, norm + head + greedy argmax
+/// behind it, token ids in and sampled ids out through `in.ids`.
+pub(crate) struct Dsv41ModelIo {
+    ids: u32,
+    embed: u32,
+    norm: u32,
+    /// This rank's `vocab / tp` rows; the loader slices by the declared size.
+    head: u32,
+    xn: u32,
+    logits: u32,
+    amax: u32,
+    vocab_l: u32,
+}
+
+/// `model`: embed + tail around the chain (`layers` must then be the whole stack).
+pub(crate) fn emit_dsv41_chain(
+    c: &Dsv41Cfg,
+    layers: &[u32],
+    tp: u32,
+    n_cu: u32,
+    ctx: u32,
+    t: u32,
+    model: bool,
+) -> (crate::Model, plow_asset::BlockDescriptor) {
     assert!(!layers.is_empty(), "--block needs at least one layer");
+    assert!(
+        !model || layers.iter().copied().eq(0..layers.len() as u32),
+        "a model emit runs layers 0.. in order"
+    );
     let l = layers[0];
     for &li in layers {
         let parts = dsv41_layer_parts(c, li);
@@ -2671,8 +2702,26 @@ pub(crate) fn emit_dsv41_block(
     let nv = !crate::emit_is_amd();
     // Unused by a block, declared because the CUDA engine binds every packet's token-id input
     // and logits output by name.
-    tb.tensor("in.ids", (t as u64) * 4);
+    let ids = tb.tensor("in.ids", (t as u64) * 4);
     tb.tensor("act.logits", 4);
+    let io = model.then(|| {
+        let vocab = c.raw.vocab_size as u32;
+        assert_eq!(vocab % tp, 0, "vocab {vocab} must split over tp={tp}");
+        let vocab_l = vocab / tp;
+        let rows = dbatch.max(1) as u64;
+        let h = c.hidden as u64;
+        Dsv41ModelIo {
+            ids,
+            embed: tb.tensor("embed.weight", vocab as u64 * h * 2),
+            norm: tb.tensor("norm.weight", h * 2),
+            head: tb.tensor("head.weight", vocab_l as u64 * h * 2),
+            xn: tb.tensor("act.head_xn", (t as u64) * h * 2),
+            logits: tb.tensor("act.logits", rows * vocab_l as u64 * 2),
+            amax: tb.tensor("act.amax", rows * crate::AMAX_BLOCKS as u64 * 8),
+            vocab_l,
+        }
+    });
+    assert!(!model || dbatch > 0, "a whole-model emit needs PLOW_DSV41_DECODE=full");
     // TWO ROPE TABLES, and which one a layer takes is decided by `compress_ratio`, not by what
     // the layer does with it. `Attention.__init__` (`model.py:680-687`) builds ONE `freqs_cis` per
     // layer and every rope in that layer -- the query's, the latent's, the compressor's, the
@@ -2811,7 +2860,10 @@ pub(crate) fn emit_dsv41_block(
             );
         }
     }
-    let mut deps: Vec<u32> = Vec::new();
+    let mut deps: Vec<u32> = match &io {
+        Some(io) => vec![emit_dsv41_embed(&mut b, c, io, &all, mhc.residual[0], t)],
+        None => Vec::new(),
+    };
     // The sublayer index, counting attention and FFN separately: it is what picks the `pre_pair`
     // half, so it must advance twice per layer and never reset. See `emit_dsv41_mhc_pre`.
     let mut pi = 0usize;
@@ -3008,6 +3060,10 @@ pub(crate) fn emit_dsv41_block(
         ri ^= 1;
         deps = vec![c_layer];
     }
+    if let Some(io) = &io {
+        let last = *layers.last().unwrap();
+        emit_dsv41_tail(&mut b, c, &w, &mhc, io, last, ri, pi, t, false, tp, &mut xgate, &all, &deps);
+    }
 
     // PLOW_DSV41_OPS=<n>: emit only the first n ops of the layer. A profiling cut, not a
     // feature -- the run times of successive prefixes difference into a per-op cost, which is
@@ -3056,6 +3112,7 @@ pub(crate) fn emit_dsv41_block(
             (cos, sin),
             (cos_c, sin_c),
             decode_mode.as_deref() == Some("attn"),
+            io.as_ref(),
         ));
     }
     let decode = db.finish();
@@ -3144,6 +3201,96 @@ pub(crate) fn emit_dsv41_block(
     (m, d)
 }
 
+/// `in.ids[0..rows]` -> `residual`, each token's row written `hc_mult` times (`[T][hc][hidden]`),
+/// which is `h.unsqueeze(2).repeat(1, 1, hc_mult, 1)` (model.py:1258).
+fn emit_dsv41_embed(b: &mut Builder, c: &Dsv41Cfg, io: &Dsv41ModelIo, all: &[u32], residual: u32, rows: u32) -> u32 {
+    b.emit(DevOp::Embed, all.to_vec(), &[], |d| {
+        d.t[0] = residual;
+        d.t[1] = io.embed;
+        d.t[2] = io.ids;
+        d.i[0] = rows;
+        d.i[1] = c.hidden;
+        d.i[2] = c.hc_mult;
+        d.f[0] = 1.0;
+    })
+}
+
+/// `hc_pre(h, pre_mix)` with the last FFN's pre-mix, `norm`, the vocab-sharded head, greedy argmax
+/// into `in.ids` (model.py:1268-1270). The collapse is a Deferred mHC pre on the last layer's attn
+/// weights: its own mixes are computed and never read, its `layer_input` is the collapse.
+/// Prefill samples the last real row (`i4`, re-patched per chunk); decode samples every slot.
+#[allow(clippy::too_many_arguments)]
+fn emit_dsv41_tail(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    w: &Dsv41Weights,
+    mhc: &Dsv41Mhc,
+    io: &Dsv41ModelIo,
+    last: u32,
+    ri: usize,
+    pi: usize,
+    rows: u32,
+    decode: bool,
+    tp: u32,
+    xgate: &mut u32,
+    all: &[u32],
+    deps: &[u32],
+) -> u32 {
+    let c_pre = emit_dsv41_mhc_pre(b, c, w, mhc, last, false, ri, pi, rows, tp, deps);
+    let c_n = b.emit(DevOp::RmsNorm, all.to_vec(), &[c_pre], |d| {
+        d.t[0] = io.xn;
+        d.t[1] = mhc.layer_input;
+        d.t[2] = io.norm;
+        d.i[0] = rows;
+        d.i[1] = c.hidden;
+        d.f[0] = c.eps;
+    });
+    let (m, row0, op) = if decode {
+        (rows, 0, DevOp::Gemv)
+    } else {
+        (1, rows - 1, crate::pick_tile(1, io.vocab_l, c.hidden, b.n_cu(), kernelcaps::QuantScheme::None))
+    };
+    let c_lm = b.emit(op, all.to_vec(), &[c_n], |d| {
+        d.t[0] = io.logits;
+        d.t[1] = io.xn;
+        d.t[2] = io.head;
+        d.i[0] = m;
+        d.i[1] = io.vocab_l;
+        d.i[2] = c.hidden;
+        d.i[4] = row0;
+    });
+    let nb = if decode && rows > 1 { rows } else { 0 };
+    let c_am = b.emit(DevOp::Argmax, (0..crate::AMAX_BLOCKS).collect(), &[c_lm], |d| {
+        d.t[0] = io.amax;
+        d.t[1] = io.logits;
+        d.i[0] = io.vocab_l;
+        d.i[1] = nb;
+    });
+    if tp > 1 {
+        let n_batch = nb.max(1);
+        let value_lines = packet::devbuild::xargmax_value_lines(n_batch)
+            .unwrap_or_else(|| panic!("XArgmaxFin carries at most {} sequences", packet::devbuild::XARGMAX_MAX_BATCH));
+        let gate = *xgate;
+        *xgate += 1 + value_lines;
+        b.emit(DevOp::XArgmaxFin, vec![0u32], &[c_am], |d| {
+            d.t[0] = io.ids;
+            d.t[1] = io.amax;
+            d.i[0] = crate::AMAX_BLOCKS;
+            d.i[1] = n_batch;
+            d.i[2] = io.vocab_l;
+            d.i[3] = gate;
+            d.i[4] = gate + 1;
+        })
+    } else {
+        b.emit(DevOp::ArgmaxFin, vec![0u32], &[c_am], |d| {
+            d.t[0] = io.ids;
+            d.t[1] = io.amax;
+            d.i[0] = crate::AMAX_BLOCKS;
+            d.i[1] = nb;
+        })
+    }
+}
+
 /// The batched decode program for a block chain: rows are slots, one token each. `attn_only`
 /// stops each layer after the attention sublayer (bring-up). Returns the output residual's name.
 #[allow(clippy::too_many_arguments)]
@@ -3161,7 +3308,9 @@ fn emit_dsv41_decode_program(
     (cos, sin): (u32, u32),
     (cos_c, sin_c): (u32, u32),
     attn_only: bool,
+    io: Option<&Dsv41ModelIo>,
 ) -> &'static str {
+    assert!(io.is_none() || !attn_only, "a whole-model decode runs the full layer");
     let bsz = st.dbatch;
     let all = b.all();
     let peer_w = dsv41_peer_width(c, layers);
@@ -3173,7 +3322,10 @@ fn emit_dsv41_decode_program(
     let mut xgate = 0u32;
     let mut ri = 0usize;
     let mut pi = 0usize;
-    let mut deps: Vec<u32> = Vec::new();
+    let mut deps: Vec<u32> = match io {
+        Some(io) => vec![emit_dsv41_embed(b, c, io, &all, mhc.residual[0], bsz)],
+        None => Vec::new(),
+    };
     for &l in layers {
         if c.engram_layers.contains(&l) {
             let e = engram.as_ref().expect("declared for this chain");
@@ -3222,6 +3374,10 @@ fn emit_dsv41_decode_program(
         let c_layer = emit_dsv41_mhc_post(b, c, &mhc, xnext, ri, bsz, tp, &[c_moe]);
         ri ^= 1;
         deps = vec![c_layer];
+    }
+    if let Some(io) = io {
+        let last = *layers.last().unwrap();
+        emit_dsv41_tail(b, c, w, &mhc, io, last, ri, pi, bsz, true, tp, &mut xgate, &all, &deps);
     }
     // The decode arm of op 85 reduces K-split items through scratch + self-resetting counters (t6).
     let n_cu = all.len() as u64;

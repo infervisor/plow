@@ -8400,13 +8400,23 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                         .unwrap_or_else(|| ctx.min(1024));
                     mla::dsv41_emit_block(
                         &dir, &layers, ctx, t, &out, n_cu, tp, rope_gen, &arch, verify.as_ref(),
+                        emit_config::active().dsv41_head,
                     );
                     return;
                 }
                 Err(report) => panic!("{report}"),
             }
         }
-        panic!("{}", dsv41_refusal(&dir));
+        // The whole model: every layer, embed in front, norm + head + argmax behind.
+        let c = mla::cfg_dsv41(&dir)
+            .unwrap_or_else(|e| panic!("deepseek_v41: the config does not parse: {e}"));
+        let layers: Vec<u32> = (0..c.layers).collect();
+        if let Err(report) = layers.iter().try_fold((), |_, &li| mla::dsv41_emit_block_plan(&c, li).map(|_| ())) {
+            panic!("{report}\n{}", dsv41_refusal(&dir));
+        }
+        let t = mla::glm_prefill_buckets_env(ctx).0.last().copied().unwrap_or_else(|| ctx.min(1024));
+        mla::dsv41_emit_block(&dir, &layers, ctx, t, &out, n_cu, tp, rope_gen, &arch, verify.as_ref(), true);
+        return;
     }
     if model_type == "glm5_next" {
         assert!(

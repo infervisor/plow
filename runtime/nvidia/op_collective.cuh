@@ -138,3 +138,42 @@ __device__ __forceinline__ void d_xreduce_twoshot_nv(const PlowProgram& prog, __
         }
     }
 }
+
+/* PLOW_DOP_XARGMAX_FIN (28): t0=ids t1=part i0=nparts i1=n_batch i2=vocab_l i3=gate i4=first value line.
+ * Folds this rank's block partials per sequence, rebases the winner to the global vocab id, publishes
+ * (key | ~id) into its OWN value lines (16 u64 per 128 B counter line), then every rank takes the max
+ * over all ranks' lines -- the same order everywhere, so all ranks write identical ids. */
+#define PLOW_XAMAX_LINE 16u
+#define PLOW_XAMAX_MAX_BATCH 128u
+__device__ __forceinline__ void d_xargmax_fin_nv(const PlowProgram& prog, int* ids, const unsigned long long* part, uint32_t nparts,
+                                                 uint32_t n_batch, uint32_t vocab_l, uint32_t gate, uint32_t val_id, unsigned slice) {
+    using namespace plow_xc;
+    if (slice != 0) return;
+    const uint32_t B = n_batch ? n_batch : 1u, N = prog.n_gpu, rank = prog.rank;
+    if (B > PLOW_XAMAX_MAX_BATCH) __trap();
+    auto val_at = [&](uint32_t r, uint32_t b) {
+        return reinterpret_cast<unsigned long long*>(ctr(prog, r, val_id + b / PLOW_XAMAX_LINE)) + b % PLOW_XAMAX_LINE;
+    };
+    for (uint32_t b = threadIdx.x; b < B; b += blockDim.x) {
+        const unsigned long long* pb = part + (size_t)b * nparts;
+        unsigned long long best = 0;
+        for (uint32_t i = 0; i < nparts; i++) best = pb[i] > best ? pb[i] : best;
+        const uint32_t gi = ~(uint32_t)(best & 0xFFFFFFFFu) + rank * vocab_l;
+        *val_at(rank, b) = (best & 0xFFFFFFFF00000000ull) | (unsigned long long)(uint32_t)~gi;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        for (uint32_t r = 0; r < N; r++) signal(ctr(prog, r, gate));
+        wait(prog, gate, N);
+    }
+    __syncthreads();
+    for (uint32_t b = threadIdx.x; b < B; b += blockDim.x) {
+        unsigned long long best = 0;
+        for (uint32_t r = 0; r < N; r++) {
+            const unsigned long long v = __ldcv(val_at(r, b));
+            best = v > best ? v : best;
+        }
+        ids[b] = (int)~(uint32_t)(best & 0xFFFFFFFFull);
+    }
+}

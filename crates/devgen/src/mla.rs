@@ -12585,10 +12585,11 @@ pub(crate) fn dsv41_emit_block(
     rope_gen: bool,
     target: &str,
     verify: Option<&crate::VerifyHook>,
+    model: bool,
 ) {
     let l = layers[0];
     let c = dsv41::cfg_dsv41(dir).unwrap_or_else(|e| panic!("deepseek_v41 --block {l}: {e}"));
-    let (mut m, desc) = dsv41::emit_dsv41_block(&c, layers, tp, n_cu, ctx, t);
+    let (mut m, desc) = dsv41::emit_dsv41_chain(&c, layers, tp, n_cu, ctx, t, model);
     let section = write_block_descriptor(out, &desc);
     if !rope_gen {
         m.bake_gen();

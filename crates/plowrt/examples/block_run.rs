@@ -259,6 +259,9 @@ mod cuda {
             .filter_map(|d| match DevOp::from_u16(d.op) {
                 Some(DevOp::XReduce) => Some(d.i[3]),
                 Some(DevOp::XReduceTwoShot) => Some(d.i[3].max(d.i[4])),
+                Some(DevOp::XArgmaxFin) => {
+                    Some(d.i[4] + packet::devbuild::xargmax_value_lines(d.i[1].max(1)).unwrap_or(1) - 1)
+                }
                 _ => None,
             })
             .max()
@@ -316,16 +319,27 @@ mod cuda {
         });
         let hidden = desc.hidden as usize;
         // `--decode-dir`: decode-check on every rank (oracle ref_decode files), rank 0's output written.
+        // `--tokens`: a model packet (embed + head): prompts from `prompt_{b}.npy`, `--steps` greedy
+        // decode steps, every sampled id written to `plow_tokens.npy` [1 + steps][slots].
         if let Some(dir) = flag("--decode-dir") {
             let dir = PathBuf::from(dir);
-            let out_tensor = flag("--out-tensor").ok_or("tp-check --decode-dir needs --out-tensor")?;
+            let tokens = flag("--tokens").is_some();
+            let out_tensor = if tokens {
+                String::new()
+            } else {
+                flag("--out-tensor").ok_or("tp-check --decode-dir needs --out-tensor")?
+            };
             let chunk: usize = flag("--pf-chunk").and_then(|v| v.parse().ok()).unwrap_or(1024);
+            let src = if tokens { "prompt" } else { "pre" };
             let mut pre = Vec::new();
-            while dir.join(format!("pre_{}.npy", pre.len())).exists() {
-                pre.push(npy::read_f32(&dir.join(format!("pre_{}.npy", pre.len())))?.1);
+            while dir.join(format!("{src}_{}.npy", pre.len())).exists() {
+                pre.push(npy::read_f32(&dir.join(format!("{src}_{}.npy", pre.len())))?.1);
             }
             let mut xs = Vec::new();
-            while dir.join(format!("dec_x_{}.npy", xs.len())).exists() {
+            if tokens {
+                xs = vec![Vec::new(); flag("--steps").and_then(|v| v.parse().ok()).unwrap_or(3)];
+            }
+            while !tokens && dir.join(format!("dec_x_{}.npy", xs.len())).exists() {
                 xs.push(npy::read_f32(&dir.join(format!("dec_x_{}.npy", xs.len())))?.1);
             }
             let (nb, steps) = (pre.len(), xs.len());
@@ -350,13 +364,19 @@ mod cuda {
                         s.spawn(move || -> Result<Vec<Vec<f32>>, plowrt::RuntimeError> {
                             let mut last = vec![0u32; nb];
                             for (b, x) in pre.iter().enumerate() {
-                                let t = x.len() / (mult * hidden);
-                                let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
+                                let t = if tokens { x.len() } else { x.len() / (mult * hidden) };
+                                let prompt: Vec<u32> = if tokens {
+                                    x.iter().map(|&v| v as u32).collect()
+                                } else {
+                                    (0..t as u32).map(|i| 100 + (i % 1000)).collect()
+                                };
                                 e.begin_slot(b, t + steps + iters + 2)?;
                                 let mut c0 = 0;
                                 last[b] = loop {
                                     let rows = chunk.min(t - c0) * mult * hidden;
-                                    e.upload_activation(in_name, &x[c0 * mult * hidden..][..rows])?;
+                                    if !tokens {
+                                        e.upload_activation(in_name, &x[c0 * mult * hidden..][..rows])?;
+                                    }
                                     c0 += chunk;
                                     fence(rank)?;
                                     if let plowrt::exec::gpu::PrefillStep::Done(tok) = e.prefill_chunk(b, &prompt, chunk)? {
@@ -365,9 +385,14 @@ mod cuda {
                                 };
                             }
                             let mut outs = Vec::new();
+                            if tokens {
+                                outs.push(last.iter().map(|&v| v as f32).collect());
+                            }
                             let mut toks = Vec::new();
                             for x in xs {
-                                e.upload_activation(in_name, x)?;
+                                if !tokens {
+                                    e.upload_activation(in_name, x)?;
+                                }
                                 let feeds: Vec<_> = last.iter().enumerate().map(|(b, &tk)| (b, tk)).collect();
                                 fence(rank)?;
                                 let t0 = Instant::now();
@@ -376,8 +401,12 @@ mod cuda {
                                     println!("tp-decode: step B={nb} {:.3} ms", t0.elapsed().as_secs_f64() * 1e3);
                                 }
                                 last.copy_from_slice(&toks[..nb]);
-                                outs.push(e.download_activation(out_tensor)?[..nb * mult * hidden].to_vec());
-                                if rank == 0 && outs.len() == 1 {
+                                if tokens {
+                                    outs.push(last.iter().map(|&v| v as f32).collect());
+                                } else {
+                                    outs.push(e.download_activation(out_tensor)?[..nb * mult * hidden].to_vec());
+                                }
+                                if rank == 0 && outs.len() == 1 + tokens as usize {
                                     for name in dumps.iter().flat_map(|n| n.split(',')) {
                                         let mut raw = vec![0u8; e.tensor_bytes(name).expect("unknown dump tensor") as usize];
                                         e.read_tensor(name, &mut raw)?;
@@ -422,6 +451,13 @@ mod cuda {
                     .collect();
                 hs.into_iter().map(|h| h.join().expect("run thread")).collect::<Result<Vec<_>, _>>()
             })?;
+            if flag("--tokens").is_some() {
+                let same = outs.iter().all(|r| r == &outs[0]);
+                let flat: Vec<f32> = outs[0].iter().flatten().copied().collect();
+                npy::write_f32(&dir.join("plow_tokens.npy"), &[outs[0].len(), outs[0][0].len()], &flat)?;
+                println!("tp-model: ranks identical={same} tokens={:?}", outs[0]);
+                return Ok(());
+            }
             for (st, o) in outs[0].iter().enumerate() {
                 let same = outs.iter().all(|r| r[st] == *o);
                 let bad = o.iter().filter(|v| !v.is_finite()).count();

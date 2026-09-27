@@ -148,6 +148,65 @@ def load_block(layer, max_seq):
     return mr, args, blk, emb
 
 
+def ref_model(nlayers, lens, steps, outdir):
+    """A truncated model: embed -> layers 0..nlayers-1 -> hc_pre -> norm -> head -> argmax
+    (Transformer.forward), per slot, prompt then `steps` greedy decode tokens. Writes prompt_{b}.npy
+    (ids as f32), ref_tokens.npy [1 + steps][B] and ref_margin.npy (top1 - top2 logit)."""
+    from safetensors import safe_open
+    os.makedirs(outdir, exist_ok=True)
+    blocks = []
+    for layer in range(nlayers):
+        mr, args, blk, emb = load_block(layer, max(8192, max(lens) + steps + 8))
+        blocks.append(blk)
+    index = json.load(open(os.path.join(CKPT, "model.safetensors.index.json")))["weight_map"]
+    get = lambda n: safe_open(os.path.join(CKPT, index[n]), framework="pt", device="cuda").get_tensor(n)
+    norm = mr.RMSNorm(args.dim, args.norm_eps)
+    norm.weight.data.copy_(get("norm.weight"))
+    head = get("head.weight").float()
+    hc = args.hc_mult
+    torch.manual_seed(0)
+    bufs = lambda: [{n: b.detach().clone() for n, b in blk.named_buffers() if "freqs" not in n} for blk in blocks]
+
+    def run(ids, start):
+        h = emb[ids].to(torch.bfloat16).view(1, ids.numel(), 1, -1).repeat(1, 1, hc, 1)
+        pre_mix = mr.make_identity_pre_mix(h, hc)
+        for blk in blocks:
+            h, pre_mix = blk(h, start, pre_mix, None)
+        x = blocks[-1].hc_pre(h, pre_mix)
+        logits = norm(x)[0, -1].float() @ head.T
+        top = torch.topk(logits, 2).values
+        return int(logits.argmax()), float(top[0] - top[1])
+
+    toks, margins, state = [], [], []
+    with torch.inference_mode():
+        row, mrow = [], []
+        for bi, t in enumerate(lens):
+            for blk in blocks:
+                for n, b in blk.named_buffers():
+                    if "freqs" not in n:
+                        b.zero_() if "score_state" not in n else b.fill_(-float("inf"))
+            ids = torch.randint(1000, 100000, (t,), device="cuda")
+            npy_write(os.path.join(outdir, f"prompt_{bi}.npy"), ids.float().cpu().numpy())
+            tok, mg = run(ids, 0)
+            row.append(tok), mrow.append(mg)
+            state.append(bufs())
+        toks.append(row), margins.append(mrow)
+        for s in range(steps):
+            row, mrow = [], []
+            for bi, t in enumerate(lens):
+                for blk, st in zip(blocks, state[bi]):
+                    for n, b in blk.named_buffers():
+                        if n in st:
+                            b.copy_(st[n])
+                tok, mg = run(torch.tensor([toks[-1][bi]], device="cuda"), t + s)
+                row.append(tok), mrow.append(mg)
+                state[bi] = bufs()
+            toks.append(row), margins.append(mrow)
+    npy_write(os.path.join(outdir, "ref_tokens.npy"), np.array(toks, dtype=np.float32))
+    npy_write(os.path.join(outdir, "ref_margin.npy"), np.array(margins, dtype=np.float32))
+    print(f"wrote {outdir}: layers={nlayers} lens={lens} steps={steps} tokens={toks}")
+
+
 def ref_decode(layer, lens, steps, outdir, attn_only):
     """Prefill each slot b to lens[b] tokens (start_pos 0), then `steps` one-token decode steps for
     every slot. Slots are independent sequences: the block's per-sequence buffers (window ring,
@@ -274,5 +333,7 @@ if __name__ == "__main__":
         ref(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
     elif sys.argv[1] == "ref_decode":  # ref_decode <layer> <len,len,...> <steps> <outdir> [attn]
         ref_decode(int(sys.argv[2]), [int(v) for v in sys.argv[3].split(",")], int(sys.argv[4]), sys.argv[5], len(sys.argv) > 6 and sys.argv[6] == "attn")
+    elif sys.argv[1] == "ref_model":  # ref_model <nlayers> <len,len,...> <steps> <outdir>
+        ref_model(int(sys.argv[2]), [int(v) for v in sys.argv[3].split(",")], int(sys.argv[4]), sys.argv[5])
     else:
         cmp(sys.argv[2], sys.argv[3])
