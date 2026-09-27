@@ -3230,6 +3230,12 @@ fn emit_dsv41_decode_program(
         if d.op == DevOp::MoeGroupGluPf as u16 {
             d.t[6] = scratch;
         }
+        // Decode payloads are B rows: one-shot (one cross-GPU handshake) beats reduce-scatter +
+        // all-gather (two) until the peer reads dominate.
+        if d.op == DevOp::XReduceTwoShot as u16 && d.i[0] as u64 * 2 <= 256 << 10 && d.i[5] == 0 {
+            d.op = DevOp::XReduce as u16;
+            d.i[4] = 0;
+        }
     });
     if ri == 0 { "act.hc_residual_a" } else { "act.hc_residual_b" }
 }
