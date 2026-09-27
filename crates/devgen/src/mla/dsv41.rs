@@ -2375,6 +2375,8 @@ const DSV41_ACT_SWIGLU_CLAMP: u32 = 4;
 
 /// Scratch for the FFN's pre-norm and the shared expert.
 pub(crate) struct Dsv41FfnAct {
+    /// The FFN RMSNorm's completion: what the router needs, before the shared expert.
+    pub(crate) c_xn: u32,
     /// Residual after the FFN RMSNorm, `[T][hidden]` bf16.
     pub(crate) xn: u32,
     /// Shared-expert gate and up, each `[T][moe_inter / tp]` bf16.
@@ -2409,6 +2411,9 @@ pub(crate) fn emit_dsv41_ffn_shared(
     x: u32,
     t: u32,
     deps: &[u32],
+    // The combine reads the partial locally either way. Slot 0 is only safe while attention's
+    // reduce is two-shot (below); the decode program's one-shot reduce needs a local buffer.
+    local_part: bool,
 ) -> (Dsv41FfnAct, u32) {
     let hidden = c.hidden;
     assert_eq!(
@@ -2420,7 +2425,8 @@ pub(crate) fn emit_dsv41_ffn_shared(
     // PER-RANK. `w1`/`w3` are OutSplit over `moe_inter` and `w2` is InSplit over it, so all three
     // are DECLARED at `inter / tp` and every intermediate activation is that wide too.
     let inter = c.moe_inter / tp;
-    let act = Dsv41FfnAct {
+    let mut act = Dsv41FfnAct {
+        c_xn: 0,
         xn: b.tensor(&format!("act.l{l}.ffn_xn"), (t as u64) * (hidden as u64) * 2),
         sh_gate: b.tensor(&format!("act.l{l}.sh_gate"), (t as u64) * (inter as u64) * 2),
         sh_up: b.tensor(&format!("act.l{l}.sh_up"), (t as u64) * (inter as u64) * 2),
@@ -2445,7 +2451,9 @@ pub(crate) fn emit_dsv41_ffn_shared(
         // a rank cannot complete it until every peer has both contributed and published its band,
         // which is exactly "finished reading slot 0". `AmdTpGroup::run_rung` also drains every rank
         // between segments, and the two reduces are in different segments.
-        sh_part: if tp == 1 {
+        sh_part: if local_part && tp > 1 {
+            b.tensor("act.sh_part", (t as u64) * (hidden as u64) * 2)
+        } else if tp == 1 {
             // A group of one has no peer region, so the down projection writes an ordinary buffer.
             b.tensor(&format!("act.l{l}.sh_out"), (t as u64) * (hidden as u64) * 2)
         } else {
@@ -2462,6 +2470,7 @@ pub(crate) fn emit_dsv41_ffn_shared(
         d.i[1] = hidden;
         d.f[0] = eps;
     });
+    act.c_xn = c_xn;
     // Gate and up read the SAME input and have no dependence on each other.
     let c_g = emit_pf_gemm_fp8_mx(
         b,
@@ -3040,7 +3049,7 @@ pub(crate) fn emit_dsv41_chain(
             c_pre2
         };
         let (ffn, c_sh) = emit_dsv41_ffn_shared(
-            &mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre2],
+            &mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre2], false,
         );
         let c_moe = emit_dsv41_moe(
             &mut b, c, &w, l, tp, t, xnext, ffn.xn, c_sh, (ffn.sh_part, c_sh), &mut xgate, &all,
@@ -3368,9 +3377,9 @@ fn emit_dsv41_decode_program(
         }
         let c_pre2 = emit_dsv41_mhc_pre(b, c, w, &mhc, l, true, ri, pi, bsz, tp, &[c_post]);
         pi += 1;
-        let (ffn, c_sh) = emit_dsv41_ffn_shared(b, c, w, &all, l, tp, mhc.layer_input, bsz, &[c_pre2]);
+        let (ffn, c_sh) = emit_dsv41_ffn_shared(b, c, w, &all, l, tp, mhc.layer_input, bsz, &[c_pre2], true);
         let xnext = b.tensor("act.xnext", bsz as u64 * c.hidden as u64 * 2);
-        let c_moe = emit_dsv41_moe(b, c, w, l, tp, bsz, xnext, ffn.xn, c_sh, (ffn.sh_part, c_sh), &mut xgate, &all, peer_w, slot_t);
+        let c_moe = emit_dsv41_moe(b, c, w, l, tp, bsz, xnext, ffn.xn, ffn.c_xn, (ffn.sh_part, c_sh), &mut xgate, &all, peer_w, slot_t);
         let c_layer = emit_dsv41_mhc_post(b, c, &mhc, xnext, ri, bsz, tp, &[c_moe]);
         ri ^= 1;
         deps = vec![c_layer];
