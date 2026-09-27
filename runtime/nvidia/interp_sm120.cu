@@ -1317,11 +1317,12 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_HYPER_CONN_PRE:
         d_hyperconn_pre((float*)TEN(0), (float*)TEN(1), (__nv_bfloat16*)TEN(2), (const float*)TEN(3),
                         (const __nv_bfloat16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6), in->i[0], in->i[1],
-                        in->i[2], in->i[3], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)TEN(7), in->i[4], in->i[5]);
+                        in->i[2], in->i[3], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)TEN(7), in->i[4], in->i[5], in->i[6],
+                        arena, PLOW_NV_ARENA_FLOATS);
         break;
     case PLOW_DOP_GEMV_F32:
         d_gemv_f32((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk, arena,
-                   PLOW_NV_ARENA_FLOATS, (unsigned char*)TEN(3), in->i[3]);
+                   PLOW_NV_ARENA_FLOATS, (unsigned char*)TEN(3), in->i[3], in->i[4]);
         break;
     case PLOW_DOP_GEMM_F32:
         d_gemm_f32((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk,
@@ -3394,6 +3395,10 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 
 #if PLOW_GEMV_PREFETCH && !PLOW_NV_PREFILL && PLOW_NV_GEMV_MMA
         if (wait_len) plow_gemv_prefetch(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
+#endif
+#if !PLOW_NV_PREFILL
+        if (wait_len && in->op == PLOW_DOP_GEMV_F32 && in->i[4] == 1u && e.slice < in->i[3])
+            d_gemv_f32_kpart_pf((const float*)prog.tensors[in->t[2]], in->i[1], in->i[2], in->i[3], e.slice);
 #endif
 #if PLOW_NV_TRACE
         const bool tr = (blockIdx.x == 0 && threadIdx.x == 0 && g_tr_n < PLOW_TRACE_MAX);

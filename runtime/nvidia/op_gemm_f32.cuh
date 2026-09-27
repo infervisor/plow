@@ -293,11 +293,87 @@ __device__ __noinline__ void d_gemv_f32_splitk(float* __restrict__ C, const uint
     __syncthreads();
 }
 
+/* Decode form (M <= 8, i4 = 1): CTA s of S owns K slice s for EVERY output and writes its partial
+ * C[s][M][N]; the consumer (HyperConnPre, i6 = S) sums the S slices in order. Each CTA reads its x
+ * slice once and no CTA waits on another. Both loops stay ROLLED: the decode interpreter is one huge
+ * function whose op bodies are cold in the instruction cache every step, so an unrolled body costs
+ * more in i-cache misses than it saves -- cp.async keeps every load in flight instead. */
+namespace plow_f32 {
+__host__ __device__ constexpr unsigned kpart_arena_floats(unsigned M, unsigned N, unsigned ks) {
+    return N * (ks + 4u) + M * (ks + 8u) / 2u;
+}
+}  // namespace plow_f32
+
+__device__ __forceinline__ void d_gemv_f32_kpart(float* __restrict__ C, const uint16_t* __restrict__ x, const float* __restrict__ W,
+                                                 unsigned M, unsigned N, unsigned K, unsigned S, unsigned slice, unsigned nblk,
+                                                 float* arena) {
+    using namespace plow_f32;
+    __shared__ float red[512];
+    const unsigned ks = K / S, lw = ks + 4u, lx = ks + 8u;  // padded rows: conflict-free float4 reads
+    float* ws = arena;
+    uint16_t* xs = reinterpret_cast<uint16_t*>(arena + N * lw);
+    const unsigned wc = N * (ks / 4u), xc = M * (ks / 8u);
+    for (unsigned s = slice; s < S; s += nblk) {
+#pragma unroll 1
+        for (unsigned e = threadIdx.x; e < wc + xc; e += blockDim.x) {
+            if (e < wc) {
+                const unsigned n = e / (ks / 4u), c = (e % (ks / 4u)) * 4u;
+                cp16(ws + n * lw + c, W + (size_t)n * K + (size_t)s * ks + c, true);
+            } else {
+                const unsigned m = (e - wc) / (ks / 8u), c = ((e - wc) % (ks / 8u)) * 8u;
+                cp16(xs + m * lx + c, x + (size_t)m * K + (size_t)s * ks + c, true);
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        __syncthreads();
+        /* thread (output, half of the slice) */
+#pragma unroll 1
+        for (unsigned o = threadIdx.x; o < M * N * 2u; o += blockDim.x) {
+            const unsigned out = o >> 1, h = (o & 1u) * (ks / 2u);
+            const float* wr = ws + (out % N) * lw + h;
+            const uint16_t* xr = xs + (out / N) * lx + h;
+            float acc = 0.f;
+#pragma unroll 2
+            for (unsigned k = 0; k < ks / 2u; k += 4u) {
+                const float4 w4 = *reinterpret_cast<const float4*>(wr + k);
+                const uint2 x2 = *reinterpret_cast<const uint2*>(xr + k);
+                acc = fmaf(__uint_as_float(x2.x << 16), w4.x, acc);
+                acc = fmaf(__uint_as_float(x2.x & 0xffff0000u), w4.y, acc);
+                acc = fmaf(__uint_as_float(x2.y << 16), w4.z, acc);
+                acc = fmaf(__uint_as_float(x2.y & 0xffff0000u), w4.w, acc);
+            }
+            red[o] = acc;
+        }
+        __syncthreads();
+        for (unsigned out = threadIdx.x; out < M * N; out += blockDim.x)
+            C[((size_t)s * M + out / N) * N + out % N] = red[2u * out] + red[2u * out + 1u];
+        __syncthreads();
+    }
+}
+
+/* Pre-gate L2 prefetch of the W slice `d_gemv_f32_kpart` reads: W does not depend on the producer,
+ * so its DRAM latency hides behind the wait. */
+__device__ __forceinline__ void d_gemv_f32_kpart_pf(const float* __restrict__ W, unsigned N, unsigned K, unsigned S, unsigned slice) {
+    const unsigned lines = K / S * 4u / 128u;
+    for (unsigned e = threadIdx.x; e < N * lines; e += blockDim.x)
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(reinterpret_cast<const char*>(W + (size_t)(e / lines) * K + (size_t)slice * (K / S)) +
+                                                     (e % lines) * 128u));
+}
+
 __device__ __forceinline__ void d_gemv_f32(float* __restrict__ C, const __nv_bfloat16* __restrict__ X, const float* __restrict__ W,
                                            unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk, float* arena,
-                                           unsigned arena_floats, unsigned char* scratch = nullptr, unsigned splits = 0) {
+                                           unsigned arena_floats, unsigned char* scratch = nullptr, unsigned splits = 0,
+                                           unsigned partial_out = 0) {
     using namespace plow_f32;
     const uint16_t* x = reinterpret_cast<const uint16_t*>(X);
+    if (partial_out) {
+        const unsigned ks = splits ? K / splits : 0u;
+        if (splits < 2u || M > 8u || K % splits || ks % 8u || M * N * 2u > 512u || arena_floats < kpart_arena_floats(M, N, ks))
+            __trap();
+        d_gemv_f32_kpart(C, x, W, M, N, K, splits, slice, nblk, arena);
+        return;
+    }
     if (scratch && splits > 1u && N <= 32u && K % (splits * GV_KC) == 0 && blockDim.x == 256u && arena_floats >= SK_ARENA_FLOATS) {
         d_gemv_f32_splitk(C, x, W, M, N, K, splits, scratch, slice, nblk, arena);
         return;

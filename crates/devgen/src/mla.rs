@@ -711,33 +711,62 @@ pub(crate) fn emit_mhc_pre(
     // NVIDIA prefill: split K 8 ways through a scratch of partials + row-block counters
     // (op_gemm_f32.cuh d_gemv_f32_splitk); the 16-row form re-reads all of `fn_w` per row block.
     let k = hc_mult * hidden;
-    let splits = if !crate::emit_is_amd() && rows >= 256 && k % (8 * 128) == 0 { 8u32 } else { 0 };
-    let scratch = if splits > 1 {
+    let nv = !crate::emit_is_amd();
+    // NVIDIA decode: `d_gemv_f32_kpart`, one CTA per K slice of `4q` columns writing
+    // [S][rows][mix] partials that the pre-op sums (i6), so no CTA re-reads x or waits on another.
+    let kpart = (nv && rows <= 8 && mix <= 32)
+        .then(|| {
+            [32u32, 64, 128, 256]
+                .into_iter()
+                .find(|&q| k % (q * 4) == 0 && k / (q * 4) <= b.n_cu() && rows * mix * 2 <= 512)
+        })
+        .flatten()
+        .map(|q| k / (q * 4));
+    let splits = if let Some(s) = kpart {
+        s
+    } else if nv && rows >= 256 && k % (8 * 128) == 0 {
+        8u32
+    } else {
+        0
+    };
+    let scratch = if kpart.is_none() && splits > 1 {
         let blocks = rows.div_ceil(64) as u64;
         let bytes = (blocks * 4).div_ceil(256) * 256 + splits as u64 * rows as u64 * mix as u64 * 4;
         b.tensor("act.gemv_f32_split", bytes)
     } else {
         TENSOR_NONE
     };
-    let cm = b.emit(DevOp::GemvF32, b.all(), deps, |d| {
-        d.t[0] = h.mixes;
-        d.t[1] = h.residual;
-        d.t[2] = h.fn_w;
-        d.t[3] = scratch;
-        d.i[0] = rows;
-        d.i[1] = mix;
-        d.i[2] = k;
-        d.i[3] = splits;
-    });
+    let mixes = match kpart {
+        Some(s) => b.tensor("act.hc_mix_parts", s as u64 * rows as u64 * mix as u64 * 4),
+        None => h.mixes,
+    };
+    let cm = b.emit(
+        DevOp::GemvF32,
+        kpart.map_or_else(|| b.all(), |s| (0..s).collect()),
+        deps,
+        |d| {
+            d.t[0] = mixes;
+            d.t[1] = h.residual;
+            d.t[2] = h.fn_w;
+            d.t[3] = scratch;
+            d.i[0] = rows;
+            d.i[1] = mix;
+            d.i[2] = k;
+            d.i[3] = splits;
+            d.i[4] = kpart.is_some() as u32;
+        },
+    );
+    // NVIDIA decode: several blocks per token (`d_hyperconn_pre`'s `T <= nblk` path).
+    let pre_blocks = if nv { rows * 2 } else { rows };
     b.emit(
         DevOp::HyperConnPre,
-        (0..rows.min(b.n_cu())).collect(),
+        (0..pre_blocks.min(b.n_cu())).collect(),
         &[cm],
         |d| {
             d.t[0] = h.post_mix;
             d.t[1] = h.comb_mix;
             d.t[2] = h.layer_input;
-            d.t[3] = h.mixes;
+            d.t[3] = mixes;
             d.t[4] = h.residual;
             d.t[5] = h.scale;
             d.t[6] = h.base;
@@ -748,6 +777,7 @@ pub(crate) fn emit_mhc_pre(
             d.i[3] = sinkhorn;
             d.i[4] = pre_in_half;
             d.i[5] = pre_mode;
+            d.i[6] = kpart.unwrap_or(0);
             d.f[0] = eps;
             d.f[1] = hc_eps;
         },
@@ -768,9 +798,12 @@ pub(crate) fn emit_mhc_post(
     rows: u32,
     deps: &[u32],
 ) -> u32 {
+    // NVIDIA: one thread per 8 columns of a token, so a decode step's few rows want more than
+    // `rows` blocks of 256 threads.
+    let blocks = if crate::emit_is_amd() { rows } else { rows.max((rows * hidden / 8).div_ceil(256)) };
     b.emit(
         DevOp::HyperConnPost,
-        (0..rows.min(b.n_cu())).collect(),
+        (0..blocks.min(b.n_cu())).collect(),
         deps,
         |d| {
             d.t[0] = out;
