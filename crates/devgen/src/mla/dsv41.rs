@@ -737,6 +737,7 @@ pub(crate) fn emit_dsv41_compressor(
     cos: u32,
     sin: u32,
     t: u32,
+    chunk: Option<(u32, u32)>,
     deps: &[u32],
 ) -> u32 {
     let hd = c.head_dim;
@@ -861,6 +862,12 @@ pub(crate) fn emit_dsv41_compressor(
         d.i[4] = ratio;
         d.i[5] = 0;
         d.i[6] = 2; // PLOW_CMP_Q_FP4_E4M3
+        // A later prefill chunk appends at `pos[0] / ratio` instead of overwriting row 0.
+        if let Some((pos, kvlen)) = chunk {
+            d.t[4] = pos;
+            d.t[5] = kvlen;
+            d.j[1] = 1 << 30;
+        }
     })
 }
 
@@ -987,6 +994,7 @@ pub(crate) fn emit_dsv41_indexer(
     xn: u32,
     qr: u32,
     kvlen: u32,
+    pos: Option<u32>,
     cos: u32,
     sin: u32,
     t: u32,
@@ -1074,6 +1082,11 @@ pub(crate) fn emit_dsv41_indexer(
             d.i[5] = 0;
             d.i[6] = 1; // PLOW_CMP_Q_FP4_POW2 -- E8M0, the fp4_act_quant default
             d.i[7] = 1;
+            if let Some(pos) = pos {
+                d.t[4] = pos;
+                d.t[5] = kvlen;
+                d.j[1] = 1 << 30;
+            }
         }));
     }
 
@@ -1106,6 +1119,11 @@ pub(crate) fn emit_dsv41_indexer(
         d.i[5] = 0;
         d.i[6] = 1;
         d.i[7] = hi;
+        // Row r ropes at pos[r], the token's absolute position in any prefill chunk.
+        if let Some(pos) = pos {
+            d.t[4] = pos;
+            d.j[1] = 1 << 31;
+        }
     });
     let c_w = bf16_gemm(
         b,
@@ -1808,6 +1826,8 @@ pub(crate) fn emit_dsv41_attn_core(
     kv: u32,
     kvlen: u32,
     pos: u32,
+    // The slot's window ring: a later prefill chunk reads the window's rows before it from here.
+    ring: Option<u32>,
     cos: u32,
     sin: u32,
     // The shared compressed cache, the shared selection and `index_topk`, when this layer reads
@@ -1927,6 +1947,7 @@ pub(crate) fn emit_dsv41_attn_core(
         Some((cache, uni, topk)) if !crate::emit_is_amd() => {
             let c_fu = b.emit(DevOp::FlashMlaPrefill, all.clone(), &[c_q, c_kv], |d| {
                 d.t[0] = act.o;
+                d.t[1] = ring.unwrap_or(TENSOR_NONE);
                 d.t[2] = act.qr;
                 d.t[3] = sink;
                 d.t[4] = cache;
@@ -1955,7 +1976,7 @@ pub(crate) fn emit_dsv41_attn_core(
                 d.t[0] = act.opart;
                 d.t[1] = act.mlpart;
                 d.t[2] = act.qr;
-                d.t[3] = act.qr; // NoPE: the rope operands are unused
+                d.t[3] = ring.unwrap_or(act.qr); // NoPE: no rope operand; the role object's ring slot
                 d.t[4] = act.kvr;
                 d.t[5] = act.kvr;
                 d.t[6] = kvlen;
@@ -2055,6 +2076,11 @@ pub(crate) fn emit_dsv41_attn_core(
         d.i[2] = hd;
         d.i[3] = rope;
         d.i[4] = 0;
+        // Per-row positions: a later prefill chunk's rows are not at 0..t.
+        if !crate::emit_is_amd() {
+            d.t[3] = pos;
+            d.i[5] = 1;
+        }
     });
     (act, c_ir)
 }
@@ -2640,6 +2666,7 @@ pub(crate) fn emit_dsv41_block(
     };
     assert!(dbatch <= 64, "V4.1 decode projections run the T <= 64 GEMV arm; dbatch {dbatch}");
     let kvlen = tb.tensor("in.kvlen", dbatch.max(1) as u64 * 4);
+    let nv = !crate::emit_is_amd();
     // Unused by a block, declared because the CUDA engine binds every packet's token-id input
     // and logits output by name.
     tb.tensor("in.ids", (t as u64) * 4);
@@ -2849,12 +2876,6 @@ pub(crate) fn emit_dsv41_block(
         // with LATER layers, and an op outside the chain's dependency order is an op the
         // scheduler may float past the layer that reads it.
         let mut core_deps = c_proj.to_vec();
-        // Decode state: the ring is seeded from the normed latent BEFORE the core ropes it in place.
-        if let Some(st) = &st {
-            core_deps.push(super::dsv41_decode::emit_dsv41_ring_seed(
-                &mut b, c, st, &all, l, proj.kv, pos, kvlen, lcos, lsin, t, &c_proj,
-            ));
-        }
         if c.kv_source.contains(&l) {
             let cp = compress
                 .as_ref()
@@ -2862,7 +2883,8 @@ pub(crate) fn emit_dsv41_block(
             // With decode state, this source's cache is its own per-slot `kv.cmp{l}`.
             let cps = st.as_ref().map(|st| Dsv41Compress { cache: st.cmp[&l], kv: cp.kv, gate: cp.gate, latent: cp.latent });
             let c_cmp = emit_dsv41_compressor(
-                &mut b, c, &w, &all, cps.as_ref().unwrap_or(cp), l, proj.xn, lcos, lsin, t, &c_proj,
+                &mut b, c, &w, &all, cps.as_ref().unwrap_or(cp), l, proj.xn, lcos, lsin, t, nv.then_some((pos, kvlen)),
+                &c_proj,
             );
             core_deps.push(c_cmp);
             if let Some(st) = &st {
@@ -2912,6 +2934,7 @@ pub(crate) fn emit_dsv41_block(
                 proj.xn,
                 proj.q_an,
                 kvlen,
+                nv.then_some(pos),
                 lcos,
                 lsin,
                 t,
@@ -2933,10 +2956,16 @@ pub(crate) fn emit_dsv41_block(
                 Some((cache, ix.uni, dsv41_index_topk(c, t, ratio)))
             }
         };
+        let ring = st.as_ref().filter(|_| nv).map(|st| st.win[&l]);
         let (core, c_core) = emit_dsv41_attn_core(
-            &mut b, c, &w, &all, l, tp, proj.q, proj.kv, kvlen, pos, lcos, lsin, compressed, t,
+            &mut b, c, &w, &all, l, tp, proj.q, proj.kv, kvlen, pos, ring, lcos, lsin, compressed, t,
             ctx, &core_deps,
         );
+        // Decode state: the ring takes this chunk's tail only after the core read the previous one.
+        let c_core = match &st {
+            Some(st) => super::dsv41_decode::emit_dsv41_ring_seed(&mut b, c, st, &all, l, proj.kv, pos, kvlen, t, &[c_core]),
+            None => c_core,
+        };
         let (_out, c_out) =
             emit_dsv41_attn_out(&mut b, c, &w, &all, l, tp, core.o, t, &mut xgate, &[c_core]);
         // Under SP the attention answer never becomes `_out.o`: the seam reduce-SCATTERED it, so

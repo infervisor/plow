@@ -2300,11 +2300,15 @@ pub enum DevOp {
     /// A third call site, differing from the other two only in `i3`/`i6`/`i7`.
     ///
     /// Batched decode (`j1` bit 31): row `r` is slot `r` at `pos[r]`, gated on its own group
-    /// completing, written to out row `r * j0 + pos[r] / ratio` (wrapped by `j1 & 0x7fffffff`
+    /// completing, written to out row `r * j0 + pos[r] / ratio` (wrapped by `j1 & 0x3fffffff`
     /// when nonzero: the window ring), or row `r` when `j0 == 0` (the indexer query).
     /// `t5 = kvlen` with the batched bit is the PREFILL SEED of one slot: chunk row `r` at `pos[r]`
     /// writes row `pos[r] / ratio` (wrapped), skipping rows at or past `kvlen[0]` and, on a ring,
     /// rows older than the ring holds.
+    ///
+    /// Prefill chunk (`j1` bit 30, NVIDIA): chunk-local src row `r` lands at cache row
+    /// `pos[0] / ratio + r`, rotated there; `t5 = kvlen` skips groups not complete below it. This
+    /// is what lets a prompt span several prefill launches.
     CompressRopeQuant = 199,
     /// DeepSeek-V4.1's activation quant ahead of a [`DevOp::GemmFp8Mx`], as a FAKE quant
     /// (`runtime/common/op_act_quant_mx.h`): kernel.py `act_quant(x, 32, "ue8m0")` -- per 32-element

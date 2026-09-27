@@ -1323,8 +1323,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_COMPRESS_ROPE_QUANT:
         d_compress_rope_quant((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const float*)TEN(2), (const float*)TEN(3), in->i[0],
                               in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6], slice, nblk, (const int*)TEN(4),
-                              in->i[7] ? in->i[7] : 1u, in->fj[2].u >> 31, in->fj[1].u, in->fj[2].u & 0x7fffffffu,
-                              (const int*)TEN(5));
+                              in->i[7] ? in->i[7] : 1u, in->fj[2].u >> 31, in->fj[1].u, in->fj[2].u & 0x3fffffffu,
+                              (const int*)TEN(5), (in->fj[2].u >> 30) & 1u);
         break;
     case PLOW_DOP_SPARSE_ATTN_DECODE:
         if (PLOW_NV_ARENA_FLOATS * sizeof(float) < plow_sad::SMEM_BYTES || in->i[1] % 16u || in->i[4] + in->i[2] > plow_sad::MAX_ROWS) __trap();

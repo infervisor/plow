@@ -110,6 +110,7 @@ struct Args {
     const __nv_bfloat16* q;
     const __nv_bfloat16* kv;   // union rows (gathered / fused), window rows (window arm)
     const __nv_bfloat16* win;  // window rows
+    const __nv_bfloat16* ring; // the slot's window ring: rows before this chunk (q_pos0 > 0 only)
     const unsigned char* uni;
     const float* sinks;
     unsigned n_head, window, n_tok, kv_mask, cap, nsplit, sp0, gsplit, q_pos0, P, HB, n_packs, n_hb, hdr, blocks, slice;
@@ -408,6 +409,9 @@ extern "C" __global__ __launch_bounds__(384, 1) void plow_sm90a_pfflash_v41(Plow
                     args.kv = static_cast<const __nv_bfloat16*>(prog.tensors[in->t[4]]);
                     args.win = fused ? static_cast<const __nv_bfloat16*>(prog.tensors[in->t[5]]) : args.kv;
                     args.uni = gather ? static_cast<const unsigned char*>(prog.tensors[in->t[7]]) : nullptr;
+                    /* the ring rides the slot each arm leaves unused: t1 (fused), t3 (window) */
+                    const unsigned t_ring = fused ? in->t[1] : !gather ? in->t[3] : PLOW_TENSOR_NONE;
+                    args.ring = t_ring != PLOW_TENSOR_NONE ? static_cast<const __nv_bfloat16*>(prog.tensors[t_ring]) : nullptr;
                     args.sinks = fused && in->t[3] != PLOW_TENSOR_NONE ? static_cast<const float*>(prog.tensors[in->t[3]]) : nullptr;
                     args.fused = fused;
                     args.has_win = fused || !gather;
@@ -441,6 +445,7 @@ extern "C" __global__ __launch_bounds__(384, 1) void plow_sm90a_pfflash_v41(Plow
                 const uint16_t* q16 = reinterpret_cast<const uint16_t*>(a.q);
                 const uint16_t* kv16 = reinterpret_cast<const uint16_t*>(a.kv);
                 const uint16_t* win16 = reinterpret_cast<const uint16_t*>(a.win);
+                const uint16_t* ring16 = reinterpret_cast<const uint16_t*>(a.ring);
                 /* a warp instruction moves 4 whole 128 B lines: lane chunk c8 = lt % 8 of a 64-dim region, rows
                  * lt / 8 + 16 k (k < 4) */
                 const unsigned c8 = lt & 7u, rg = lt >> 3;
@@ -469,6 +474,10 @@ extern "C" __global__ __launch_bounds__(384, 1) void plow_sm90a_pfflash_v41(Plow
                     auto row_src = [&](unsigned g) -> const uint16_t* {
                         if (g < rw.nw) {
                             const unsigned pos = rw.w_lo + g;
+                            /* a later prefill chunk: `win` holds only this chunk's rows, the ring the
+                             * window's rows before it */
+                            if (ring16) return pos < a.q_pos0 ? ring16 + (size_t)(pos & (a.window - 1u)) * D
+                                                              : win16 + (size_t)(pos - a.q_pos0) * D;
                             return win16 + (size_t)(a.kv_mask == 0xFFFFFFFFu ? pos : (pos & a.kv_mask)) * D;
                         }
                         if (g < n_rows) return kv16 + (size_t)upos[g - rw.nw] * D;

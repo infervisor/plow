@@ -205,20 +205,25 @@ __device__ __forceinline__ void d_compress_rope_quant(__nv_bfloat16* __restrict_
                                                       unsigned d, unsigned rd, unsigned qblk, unsigned ratio, unsigned row_base,
                                                       unsigned qmode, unsigned slice, unsigned nblk, const int* __restrict__ pos,
                                                       unsigned n_head, unsigned batched = 0, unsigned slot_stride = 0,
-                                                      unsigned ring_mask = 0, const int* __restrict__ kvlen = nullptr) {
+                                                      unsigned ring_mask = 0, const int* __restrict__ kvlen = nullptr,
+                                                      unsigned chunk = 0) {
     using namespace plow_cmp;
     const unsigned c_rope0 = d - rd;
     if (d % qblk || qblk % 8u || qblk > 32u || c_rope0 % 8u || (rd / 2u) % 4u) __trap();
-    if (!batched && pos != nullptr && ((pos[0] + 1) % (int)ratio) != 0) return;
-    const unsigned rbase = batched ? 0u : pos != nullptr ? (unsigned)pos[0] / ratio : row_base;
+    /* chunk: a prefill chunk's local rows r land at cache row pos[0]/ratio + r (pos[0] = chunk start,
+     * a multiple of ratio); rows whose group is not complete below kvlen are skipped. */
+    if (!batched && !chunk && pos != nullptr && ((pos[0] + 1) % (int)ratio) != 0) return;
+    const unsigned rbase = batched || chunk ? 0u : pos != nullptr ? (unsigned)pos[0] / ratio : row_base;
+    const unsigned obase = chunk ? (unsigned)pos[0] / ratio : 0u;
     const unsigned nb = d / qblk;
     const size_t total = (size_t)n_rows * n_head * nb;
     const uint16_t* s16 = reinterpret_cast<const uint16_t*>(src);
     uint16_t* o16 = reinterpret_cast<uint16_t*>(out);
     for (size_t w = (size_t)slice * blockDim.x + threadIdx.x; w < total; w += (size_t)nblk * blockDim.x) {
         const unsigned it = (unsigned)(w / nb), c0 = (unsigned)(w % nb) * qblk, r = it / n_head;
-        size_t off = ((size_t)rbase * n_head + it) * d, ooff = off;
-        size_t tb = (size_t)((rbase + r) * ratio) * (rd / 2u);
+        size_t off = ((size_t)rbase * n_head + it) * d, ooff = off + (size_t)obase * n_head * d;
+        size_t tb = (size_t)((rbase + obase + r) * ratio) * (rd / 2u);
+        if (chunk && kvlen && (int)((obase + r + 1u) * ratio) > kvlen[0]) continue;
         if (batched) {
             const int p = pos[r];
             if ((p + 1) % (int)ratio) continue;
