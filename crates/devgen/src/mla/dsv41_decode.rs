@@ -60,24 +60,24 @@ pub(crate) fn declare_dsv41_state(b: &mut Builder, c: &Dsv41Cfg, layers: &[u32],
     st
 }
 
-/// Prefill: seed this slot's window ring from the chunk's normed latent rows `[kvlen-W, kvlen)`,
-/// roped and fp8 fake-quantized exactly as the chunk's own attention sees them (the rope + fp8
-/// pair of `emit_dsv41_attn_core`, one op). Must run before that core ropes `kv` in place.
+/// Prefill: seed this slot's window ring with the chunk's rows `[kvlen-W, kvlen)` of `kv` as the
+/// attention core left them (roped and fp8 fake-quantized in place), copied without a second rope;
+/// the re-quant at the same pow2 blocks is exact. It runs AFTER the core, because a later chunk's
+/// core reads the previous chunk's tail from this ring.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_dsv41_ring_seed(
-    b: &mut Builder, c: &Dsv41Cfg, st: &Dsv41State, cus: &[u32], l: u32, kv: u32, pos: u32, kvlen: u32, cos: u32, sin: u32, t: u32,
-    deps: &[u32],
+    b: &mut Builder, c: &Dsv41Cfg, st: &Dsv41State, cus: &[u32], l: u32, kv: u32, pos: u32, kvlen: u32, t: u32, deps: &[u32],
 ) -> u32 {
     b.emit(DevOp::CompressRopeQuant, cus.to_vec(), deps, |d| {
         d.t[0] = st.win[&l];
         d.t[1] = kv;
-        d.t[2] = cos;
-        d.t[3] = sin;
+        d.t[2] = TENSOR_NONE;
+        d.t[3] = TENSOR_NONE;
         d.t[4] = pos;
         d.t[5] = kvlen;
         d.i[0] = t;
         d.i[1] = c.head_dim;
-        d.i[2] = c.qk_rope;
+        d.i[2] = 0; // no rope: `kv` is already roped
         d.i[3] = 32;
         d.i[4] = 1;
         d.i[5] = 0;

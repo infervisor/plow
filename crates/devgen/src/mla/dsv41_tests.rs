@@ -1142,7 +1142,7 @@ fn the_attention_core_is_windowed_nope_mla_over_the_shared_latent() {
     let cos = b.tensor("gen.cos", (ctx as u64) * 32 * 4);
     let sin = b.tensor("gen.sin", (ctx as u64) * 32 * 4);
     let (act, _) = super::dsv41::emit_dsv41_attn_core(
-        &mut b, &cfg, &w, &all, 0, tp, q, kv, kvlen, pos, cos, sin, None, t, ctx, &[],
+        &mut b, &cfg, &w, &all, 0, tp, q, kv, kvlen, pos, None, cos, sin, None, t, ctx, &[],
     );
     let p = b.finish();
 
@@ -1256,7 +1256,7 @@ fn the_compressor_pools_with_no_ape_and_stops_before_the_rope() {
     let xn = b.tensor("act.xn", (t as u64) * (cfg.hidden as u64) * 2);
     let cos = b.tensor("gen.cos", (ctx as u64) * 32 * 4);
     let sin = b.tensor("gen.sin", (ctx as u64) * 32 * 4);
-    super::dsv41::emit_dsv41_compressor(&mut b, &cfg, &w, &all, &cp, l, xn, cos, sin, t, &[]);
+    super::dsv41::emit_dsv41_compressor(&mut b, &cfg, &w, &all, &cp, l, xn, cos, sin, t, None, &[]);
     let p = b.finish();
 
     let pool = p
@@ -1317,7 +1317,7 @@ fn layer_twenty_compresses_at_ratio_one_with_no_pool() {
     let xn = b.tensor("act.xn", (t as u64) * (cfg.hidden as u64) * 2);
     let cos = b.tensor("gen.cos", (ctx as u64) * 32 * 4);
     let sin = b.tensor("gen.sin", (ctx as u64) * 32 * 4);
-    super::dsv41::emit_dsv41_compressor(&mut b, &cfg, &w, &all, &cp, l, xn, cos, sin, t, &[]);
+    super::dsv41::emit_dsv41_compressor(&mut b, &cfg, &w, &all, &cp, l, xn, cos, sin, t, None, &[]);
     let p = b.finish();
 
     assert!(

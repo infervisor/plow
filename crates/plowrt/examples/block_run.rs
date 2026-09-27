@@ -831,12 +831,29 @@ mod cuda {
         //  - decode-only blocks (GLM/Kimi MLA, Nemotron Mamba/GQA/MoE — the
         //    emit path has prefill_buckets=[]): drive ONE decode step (M=1) on a
         //    single row, mirroring step_bench's no-prefill branch.
+        // `--pf-chunk N`: the prompt in launches of at most N rows, each chunk's input uploaded
+        // before it and its output rows collected after it (block mode has no embed).
+        let mut chunked: Option<Vec<f32>> = None;
         let t = if e.has_prefill() {
             let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
             // `--repeat N`: the same real input N times, so a timing read (PLOW_PF_SEG_TIME)
             // can skip the cold first launch.
             let repeat: usize = flag("--repeat").and_then(|s| s.parse().ok()).unwrap_or(1);
-            for _ in 0..repeat.max(1) {
+            if let Some(chunk) = flag("--pf-chunk").and_then(|s| s.parse::<usize>().ok()) {
+                e.begin_slot(0, t + 1)?;
+                let mut acc = Vec::with_capacity(t * mult * hidden);
+                let mut c0 = 0;
+                while c0 < t {
+                    let rows = chunk.min(t - c0) * mult * hidden;
+                    e.upload_activation(in_name, &xin[c0 * mult * hidden..][..rows])?;
+                    e.prefill_chunk(0, &prompt, chunk)?;
+                    acc.extend_from_slice(&e.download_activation(out_name)?[..rows]);
+                    c0 += chunk;
+                }
+                println!("  launched prefill(T={t}) in chunks of {chunk}");
+                chunked = Some(acc);
+            }
+            for _ in 0..if chunked.is_some() { 0 } else { repeat.max(1) } {
                 e.begin_slot(0, t + 1)?;
                 e.upload_activation(in_name, &xin)?;
                 let t0 = Instant::now();
@@ -862,7 +879,10 @@ mod cuda {
             1
         };
 
-        let out = e.download_activation(out_name)?;
+        let out = match chunked {
+            Some(v) => v,
+            None => e.download_activation(out_name)?,
+        };
         let out = &out[..t * mult * hidden]; // trim pad rows past T
         let (mut mn, mut mx, mut sum, mut nan, mut inf) =
             (f32::INFINITY, f32::NEG_INFINITY, 0.0f64, 0usize, 0usize);
