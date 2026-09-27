@@ -3794,6 +3794,10 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
                                          in->i[3], in->i[4], e.slice, nb);
                 else
                     d_xreduce_nv(prog, (__nv_bfloat16*)prog.tensors[in->t[0]], in->i[0], in->i[2], in->i[3], e.slice, nb);
+            } else if (in->op == PLOW_DOP_XARGMAX_FIN) {
+                if (prog.n_gpu < 2) __trap();
+                d_xargmax_fin_nv(prog, (int*)prog.tensors[in->t[0]], (const unsigned long long*)prog.tensors[in->t[1]], in->i[0],
+                                 in->i[1], in->i[2], in->i[3], in->i[4], e.slice);
             } else
 #endif
             plow_exec(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid, arena

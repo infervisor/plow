@@ -345,7 +345,8 @@ pub fn slice_for<'a>(
     // catch it. `full == want` (the default) keeps the replicated path exactly.
     let shard = match shard {
         Shard::Replicated
-            if name.ends_with("lm_head.weight") && want != 0 && full == want * tp as u64 =>
+            // `head.weight` is DeepSeek-V4.1's spelling.
+            if (name.ends_with("lm_head.weight") || name == "head.weight") && want != 0 && full == want * tp as u64 =>
         {
             Shard::Column
         }
