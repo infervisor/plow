@@ -34,8 +34,8 @@ pub(super) struct SharedAsr {
     prompt: Arc<AudioLmPrompt>,
     encode: std::sync::mpsc::Sender<Encode>,
     max_context: usize,
-    /// Requests between submit and their answer. Sized to the mux ingress, so a full mux is
-    /// reported here, synchronously, as a full queue.
+    /// Requests between submit and their answer: the front's bound. Past it a request is refused
+    /// at once; under it a request waits in the mux queue (a full ingress makes submit wait).
     inflight: Arc<Semaphore>,
 }
 
@@ -61,7 +61,7 @@ impl SharedAsr {
             prompt: Arc::new(prompt),
             encode,
             max_context,
-            inflight: Arc::new(Semaphore::new(batch.saturating_mul(4).max(1))),
+            inflight: Arc::new(Semaphore::new(batch.saturating_mul(4).max(UPLOADS))),
         })
     }
 
@@ -148,7 +148,7 @@ impl SharedAsr {
                 })),
             },
         };
-        mux.submit(job).map_err(|e| match e {
+        mux.submit_wait(job).await.map_err(|e| match e {
             crate::serve::mux::SubmitError::Full(_) => RuntimeError::Rejected("ASR queue full".into()),
             crate::serve::mux::SubmitError::Closed(_) => RuntimeError::Msg("model dispatcher unavailable".into()),
         })?;

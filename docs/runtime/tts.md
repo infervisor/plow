@@ -68,6 +68,24 @@ plowrt serve --assets $CBX --port 8080
 The T3 asset runs on the shared text mux as guided jobs (two slots per request for
 guidance); `s3gen.pkt` renders audio on a render thread.
 
+## Concurrency
+
+Speech requests take the LLM path on each model's mux: packed prefill (several requests' prompt
+rows in one launch; the host overlay rows, CFG pairs' conditional and unconditional rows and
+the position bases staged per launch row) and, in the same tick, the decode launch. All three
+packets carry the packed-prefill contract (hd64/128 attention, `EmbedOverlayBf16` /
+`EmbedPosBf16`). The unified token batch (decode rows inside the prefill launch) stays off for
+them: it is qualified on hd256/512 only, and overlay rows would need its row order.
+
+Packed prefill of 8 x 60-row prompts, one launch vs serial (H100): Veena 10.0 vs 50.0 ms,
+Chatterbox T3 7.1 vs 29.4 ms, Qwen3-ASR 7.5 vs 38.9 ms. A CFG pair's two members are
+separate packed requests; the request's first token is drawn once both rows are in.
+
+Admission: requests past the slots queue (4 engine batches of ingress; the ASR front bounds
+its own requests in flight at 256 and waits for mux room instead of answering 429). A CFG
+request takes two slots, so the 128-slot rung serves 64 Chatterbox requests; the rest queue
+(`DECODE_RUNG_MAX` = 128 is the packet format's decode/prefill boundary).
+
 ## Model names
 
 `plowc --served-name NAME` writes `served_name` into `weights.json`; `plowrt serve` registers

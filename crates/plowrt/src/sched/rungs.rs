@@ -10,6 +10,10 @@ const NARROW_TICKS: u32 = 32;
 const MIN_DWELL_TICKS: u32 = 64;
 const MIN_THROUGHPUT_SAMPLES: u64 = 4;
 const THROUGHPUT_HYSTERESIS: f64 = 1.03;
+/// Narrowing under a backlog idles the slots it takes back while requests wait for them, so it
+/// needs a win above sampling noise: Veena at c128 narrowed 64 -> 32 on a ~3% estimate (samples
+/// taken beside the codec's GPU work) and held 50 requests queued for 10 s.
+const THROUGHPUT_BACKLOG_HYSTERESIS: f64 = 1.10;
 
 /// Number of leading slots a decode dispatch must cover.
 ///
@@ -216,7 +220,7 @@ impl RungController {
             .saturating_add(load.queued)
             .min(self.rungs.width(self.rungs.len() - 1));
         let demand_seat = self.rungs.covering(demanded);
-        let seat = self.throughput_seat(demand_seat);
+        let seat = self.throughput_seat(demand_seat, load.queued);
         let mut reason = if actual > self.target {
             RungReason::Occupied
         } else {
@@ -310,7 +314,7 @@ impl RungController {
         load.oldest_wait_ms.max(0.0) + waves as f64 * self.service_ms(rung)
     }
 
-    fn throughput_seat(&self, demand_seat: usize) -> usize {
+    fn throughput_seat(&self, demand_seat: usize, queued: usize) -> usize {
         if demand_seat == 0 {
             return demand_seat;
         }
@@ -343,7 +347,14 @@ impl RungController {
         (0..demand_seat)
             .filter(|&rung| self.stats[rung].samples >= MIN_THROUGHPUT_SAMPLES)
             .max_by(|&a, &b| capacity(a).total_cmp(&capacity(b)))
-            .filter(|&rung| capacity(rung) > demanded_capacity * THROUGHPUT_HYSTERESIS)
+            .filter(|&rung| {
+                let margin = if queued > 0 {
+                    THROUGHPUT_BACKLOG_HYSTERESIS
+                } else {
+                    THROUGHPUT_HYSTERESIS
+                };
+                capacity(rung) > demanded_capacity * margin
+            })
             .unwrap_or(demand_seat)
     }
 }
@@ -536,6 +547,22 @@ mod tests {
         saturated.mean_output_tokens = 700.0;
         let admission = c.decide(saturated).admission;
         assert_eq!(c.width(admission), 16);
+    }
+
+    /// A marginal capacity edge narrows an idle queue's window but not a backlog's.
+    #[test]
+    fn a_backlog_keeps_the_wide_rung_on_a_marginal_throughput_edge() {
+        let mut c = controller(&[1, 2, 4, 8, 16, 32]);
+        for _ in 0..MIN_THROUGHPUT_SAMPLES {
+            // 16 rows / 10 ms vs 32 rows / 21 ms: rung 16 is ~5% faster.
+            c.observe_decode(4, 10.0, NonZeroUsize::MIN);
+            c.observe_decode(5, 21.0, NonZeroUsize::MIN);
+        }
+        c.target = 5;
+        c.decide(load(32, 40));
+        assert_eq!(c.admission_limit(), 32);
+        let d = c.decide(load(32, 0));
+        assert_eq!((c.admission_limit(), d.reason), (16, RungReason::Throughput));
     }
 
     #[test]

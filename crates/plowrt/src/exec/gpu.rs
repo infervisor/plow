@@ -91,6 +91,21 @@ use decode_rung::{
     validate_decode_ladder, validate_moe_lt_ladder, DecodeRung, DecodeSelection,
 };
 
+/// Whether the packet's full caches can be VMM-mapped block by block: a cache head smaller than
+/// one granule cannot, and such a KV is small enough to keep resident.
+pub(crate) fn live_kv_mappable(
+    blob: &DevBlob,
+    manifest: Option<&plow_asset::live_kv::Manifest>,
+    granularity: u64,
+) -> bool {
+    let layout = match manifest {
+        Some(m) => crate::memory::vmm::LiveKvLayout::from_manifest(blob, m),
+        None => crate::memory::vmm::LiveKvLayout::from_blob(blob),
+    };
+    let hint = u64::from(RuntimeConfig::get().vmm_block_mib()) << 20;
+    layout.is_ok_and(|layout| layout.geometry.block_bytes(granularity, hint).is_ok())
+}
+
 pub(crate) fn live_rings_for_capacity(
     configured: bool,
     live: bool,
@@ -1685,6 +1700,8 @@ struct SegPf {
     /// Exact packed BF16 HD256/GQA2 local attention. Class-3 segments launch here.
     fa256_gqa2: Option<(KernelFn, u32, u32)>,
     class_policy: crate::asset::devblob::SegmentClassPolicy,
+    /// Both objects skip padding rows whose slot is -1 (`PLOW_NV_MASKED_PADDING`).
+    masked_padding: bool,
     _m_flash: Module,
     _m_gemm: Module,
     _m_fa512: Option<Module>,
@@ -3850,7 +3867,7 @@ impl GpuEngine {
         let mut vmm = {
             let run = || {
                 let config = RuntimeConfig::get();
-                let live = config.nv_live_kv_enabled(
+                let mut live = config.nv_live_kv_enabled(
                     packed_prefill.is_some(),
                     live_kv_manifest.as_ref().is_some_and(|manifest| {
                         manifest.caches.iter().any(|cache| cache.window == 0)
@@ -3858,7 +3875,14 @@ impl GpuEngine {
                     prefix_requested,
                 );
                 if live && !config.nv_vmm_live() {
-                    tracing::info!("live KV allocation enabled by packet metadata");
+                    let mappable = crate::memory::vmm::VmmOps::granularity(be.as_ref())
+                        .is_ok_and(|gran| live_kv_mappable(&blob, live_kv_manifest.as_ref(), gran));
+                    if mappable {
+                        tracing::info!("live KV allocation enabled by packet metadata");
+                    } else {
+                        tracing::info!("live KV allocation off: cache head below one VMM granule");
+                        live = false;
+                    }
                 }
                 let configured_rings = config.nv_vmm_live_rings();
                 let rings = live_rings_for_capacity(
@@ -8272,7 +8296,11 @@ impl GpuEngine {
                 if fa256_gqa2.is_none() {
                     inferred_policy.fa256_gqa2 = false;
                 }
+                let masked = plow_asset::packed_prefill::MASKED_PADDING_CAPABILITY;
+                let masked_padding = be.module_global_u32(&m1, masked)? == Some(1)
+                    && be.module_global_u32(&m2, masked)? == Some(1);
                 let mut sp = SegPf {
+                    masked_padding,
                     f_flash: f1,
                     smem_flash: s1,
                     grid_flash: g1,
@@ -10085,10 +10113,16 @@ impl GpuEngine {
                     &self.pos,
                     bucket.t as usize,
                     self.max_ctx,
+                    // Padding rows mask to slot -1 only on objects that skip them; otherwise
+                    // they continue the last request's rows (its own later writes cover them).
                     self.packed_prefill
                         .as_ref()
                         .and_then(|p| p.max_request_rows)
-                        .or(Some(self.pf_max_rows() as u32)),
+                        .or(self
+                            .seg_pf
+                            .as_ref()
+                            .is_some_and(|sp| sp.masked_padding)
+                            .then(|| self.pf_max_rows() as u32)),
                 )
                 .map_err(RuntimeError::Rejected)?,
             )

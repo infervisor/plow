@@ -226,7 +226,7 @@ impl Manifest {
                     && !c.pair.contains(&self.position)
                     && !c.pair.contains(&self.kv_length)
                     && c.heads > 0
-                    && matches!(c.hd, 64 | 256 | 512)
+                    && matches!(c.hd, 64 | 128 | 256 | 512)
                     && c.stride > 0
                     && if c.window == 0 {
                         c.stride == self.max_ctx && c.mask == u32::MAX
@@ -633,6 +633,10 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::GemvQkv
                 | DevOp::GemvArgmax
                 | DevOp::Embed
+                // Speech embeddings: a token gather plus host overlay rows (by launch row) or a
+                // learned position at a per-slot base. Neither names a cache or a generated map.
+                | DevOp::EmbedOverlayBf16
+                | DevOp::EmbedPosBf16
                 | DevOp::Argmax
                 | DevOp::ArgmaxFin
                 | DevOp::SoftCap

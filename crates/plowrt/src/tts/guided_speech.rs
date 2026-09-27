@@ -327,8 +327,12 @@ impl GuidedSpeech {
         gen.max_tokens = c.max_speech_tokens;
         gen.params.temperature = 0.0;
         gen.stop_token_ids = vec![c.stop_speech];
+        // Every row is an overlay; the last (BOS) is also a decode embedding at `pos_base`, which
+        // packed prefill uses for it.
+        let mut prompt_ids = vec![0; n];
+        prompt_ids[n - 1] = c.start_speech;
         Ok(Job {
-            prompt_ids: vec![0; n],
+            prompt_ids,
             gen,
             arrived: std::time::Instant::now(),
             respond,

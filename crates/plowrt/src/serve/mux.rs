@@ -244,9 +244,13 @@ const PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// packet's `in.encoder_overlay` / `in.encoder_overlay_index`) and whose decode embedding may
 /// offset a learned position by a per-slot base (`EmbedPosBf16`: `in.pos_base`).
 ///
-/// Both packet ops index their inputs by LAUNCH row, and the overlay is one global tensor, so such
-/// jobs run only through the serial per-slot prefill (which rewrites the overlay before each of
-/// their chunks) and the plain decode launch (launch row == slot).
+/// Both packet ops index their inputs by LAUNCH row, and the overlay is one global tensor: every
+/// prefill launch rewrites it for the rows it carries (serial: one chunk; packed: every member's
+/// rows at their launch offsets), and decode runs the plain launch (launch row == slot).
+///
+/// Packed prefill runs `prompt_ids[..n - 1]` and embeds the last prompt row through the decode
+/// program (`EmbedPosBf16` at `pos_base`), so when an overlay covers that row, `prompt_ids[n - 1]`
+/// must be the token whose decode embedding the overlay row is.
 #[derive(Default)]
 pub struct SpeechJob {
     /// `[rows][hidden]` f32, one row per entry of `overlay_pos`.
@@ -274,6 +278,8 @@ pub struct CfgJob {
 /// A CFG owner's host state: its draws and reused logits buffers.
 struct CfgRun {
     rng: Option<crate::text::sample::SplitMix>,
+    /// The partner's prefill frontier on the packed route (the owner's is `Slot::pf_pos`).
+    partner_pf: usize,
     cond: Vec<f32>,
     uncond: Vec<f32>,
     scratch: Vec<f32>,
@@ -431,6 +437,23 @@ impl ModelMux {
         }
     }
 
+    /// As [`Self::submit`], but a full ingress queue waits for room instead of failing: for a front
+    /// that bounds its own requests in flight.
+    pub async fn submit_wait(&self, job: Job) -> std::result::Result<(), SubmitError> {
+        Metrics::inc(&self.metrics.requests);
+        self.metrics.serving.max_tokens.tokens(job.gen.max_tokens);
+        Metrics::inc(&self.metrics.queued_requests);
+        let arrived = job.arrived;
+        self.tx.send(MuxMsg::Job(job, arrived)).await.map_err(|mpsc::error::SendError(msg)| {
+            self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+            Metrics::inc(&self.metrics.rejected);
+            match msg {
+                MuxMsg::Job(job, _) => SubmitError::Closed(job),
+                MuxMsg::Drain(_) => unreachable!("sent a job"),
+            }
+        })
+    }
+
     /// Initiate graceful drain: no new requests accepted, all live slots run to
     /// completion. Returns when every in-flight slot has finished. Use before
     /// `Registry::unload` to avoid mid-generation errors.
@@ -512,7 +535,7 @@ struct Slot {
 }
 
 impl Slot {
-    /// Rows that must take the serial prefill path (see [`SpeechJob`]).
+    /// Rows the mixed-step program cannot carry: it does not stage overlays (see [`SpeechJob`]).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn serial_prefill(&self) -> bool {
         self.speech.is_some()
@@ -1779,6 +1802,7 @@ fn admit_into(
         cfg: pair.then(|| {
             Box::new(CfgRun {
                 rng: job.opts.speech.as_ref().and_then(|s| s.cfg.as_ref()?.seed).map(crate::text::sample::SplitMix::new),
+                partner_pf: 0,
                 cond: Vec::new(),
                 uncond: Vec::new(),
                 scratch: Vec::new(),
@@ -2339,7 +2363,24 @@ fn run_one_tick(
                         })
                     });
                 }
+                let mut guided: smallvec::SmallVec<[usize; 8]> = Default::default();
                 for (row, &(i, token)) in completed.iter().enumerate() {
+                    // A speech prompt's last row: stage its position base; a CFG member's logits
+                    // wait in its owner until both members have their row.
+                    match gpu_speech_prompt_done(&mut *e, &mut slots, row, i) {
+                        Ok(None) => continue,
+                        Ok(Some((owner, true))) => {
+                            guided.push(owner);
+                            continue;
+                        }
+                        Ok(Some((_, false))) => {}
+                        Err(err) => {
+                            note_fault(&mut tick_fault, &err);
+                            let owner = if slots[i].is_some() { i } else { i - 1 };
+                            fail_slot(&mut slots[owner], &arena, err);
+                            continue;
+                        }
+                    }
                     gpu_finish_and_emit_token(
                         &mut *e,
                         row,
@@ -2353,6 +2394,22 @@ fn run_one_tick(
                         stop.as_slice(),
                         &mut tick_fault,
                         &mut disconnected,
+                    );
+                }
+                guided.dedup();
+                for owner in guided {
+                    let Some(slot) = slots[owner].as_mut() else { continue };
+                    if slot.step != 0 || !packed_prompt_done(&slots, owner, 0) {
+                        continue;
+                    }
+                    let token = cfg_draw(slots[owner].as_mut().expect("checked Some"));
+                    disconnected[owner] |= gpu_emit_slot_token(
+                        &mut slots[owner],
+                        &arena,
+                        bundle,
+                        token,
+                        &mut tokens_this_tick,
+                        stop.as_slice(),
                     );
                 }
                 obs.host.prefill_tokens = completed;
@@ -2402,7 +2459,10 @@ fn run_one_tick(
                             );
                             continue;
                         }
-                        if !e.packed_slot_ready(i) || s.pf_pos + 1 != n {
+                        if !e.packed_slot_ready(i)
+                            || s.pf_pos + 1 != n
+                            || !packed_prompt_done(&slots, i, 1)
+                        {
                             continue; // still mid-prefill
                         }
                         if s.respond.is_closed() {
@@ -2412,13 +2472,23 @@ fn run_one_tick(
                             }
                             continue;
                         }
-                        let last = *slots[i]
-                            .as_ref()
-                            .expect("checked Some")
-                            .prompt_ids
-                            .last()
-                            .expect("n >= 1");
+                        let last = *s.prompt_ids.last().expect("n >= 1");
+                        let pair = s.cfg.is_some();
+                        // The decode launch embeds the last prompt row at its position base.
+                        if let Some(base) = s.speech.as_ref().and_then(|sp| sp.pos_base) {
+                            let written = [i, i + 1][..1 + pair as usize].iter().try_for_each(|&row| {
+                                e.write_tensor("in.pos_base", (row * 4) as u64, &base.to_le_bytes())
+                            });
+                            if let Err(err) = written {
+                                note_fault(&mut tick_fault, &err);
+                                fail_slot(&mut slots[i], &arena, err);
+                                continue;
+                            }
+                        }
                         feeds.push((i, last));
+                        if pair {
+                            feeds.push((i + 1, last));
+                        }
                     }
                 }
             } else {
@@ -4506,6 +4576,16 @@ fn gpu_prefill_batched_pass(
     if budget_max == 0 {
         return tick_fault;
     }
+    // Overlay rows one launch can stage, when the packet splices host rows.
+    let overlay_rows = e.tensor_bytes("in.encoder_overlay").map(|bytes| {
+        let hidden = slots
+            .iter()
+            .flatten()
+            .filter_map(|s| s.speech.as_deref())
+            .find(|sp| !sp.overlay_pos.is_empty())
+            .map_or(1, |sp| sp.overlay.len() / sp.overlay_pos.len());
+        bytes as usize / 4 / hidden.max(1)
+    });
     let per_launch = (if cold && !bounded_tick {
         budget_max
     } else {
@@ -4533,16 +4613,31 @@ fn gpu_prefill_batched_pass(
             if request.prompt_ids.is_empty() {
                 continue;
             }
-            match e.admit_packed_slot(
-                i,
-                &request.prompt_ids,
-                request.prompt_ids.len() + request.gen.max_tokens.max(1),
-            ) {
-                Ok(Some(frontier)) => {
-                    request.pf_pos = frontier;
-                    request.cached_tokens = e.attached_rows(i) as usize;
+            let total = request.prompt_ids.len() + request.gen.max_tokens.max(1);
+            let pair = request.cfg.is_some();
+            let admitted = (|| -> Result<()> {
+                for row in [i, i + 1].into_iter().take(1 + pair as usize) {
+                    let fresh = !e.packed_slot_ready(row);
+                    let Some(frontier) = e.admit_packed_slot(row, &request.prompt_ids, total)? else {
+                        continue;
+                    };
+                    if fresh && request.speech.as_ref().is_some_and(|sp| sp.pos_base.is_some()) {
+                        // A decode launch covering this row before its prompt is in must not find
+                        // a stale base above the reset position (`EmbedPosBf16` traps on pos < base).
+                        e.write_tensor("in.pos_base", (row * 4) as u64, &0u32.to_le_bytes())?;
+                    }
+                    match request.cfg.as_mut().filter(|_| row != i) {
+                        Some(run) => run.partner_pf = frontier,
+                        None => {
+                            request.pf_pos = frontier;
+                            request.cached_tokens = e.attached_rows(i) as usize;
+                        }
+                    }
                 }
-                Ok(None) => {}
+                Ok(())
+            })();
+            match admitted {
+                Ok(_) => {}
                 Err(err) => {
                     tracing::warn!(
                         slot = i,
@@ -4558,20 +4653,17 @@ fn gpu_prefill_batched_pass(
         }
         // Gather candidate spans directly; counting admitted rows and filtering slots in one pass.
         let now = Instant::now();
-        let candidates: Vec<crate::sched::step::Candidate> = slots
-            .iter()
-            .enumerate()
-            .take(cap)
-            .filter_map(|(i, slot)| {
-                let s = slot.as_ref()?;
+        let candidates: Vec<crate::sched::step::Candidate> = (0..cap.min(slots.len()))
+            .filter_map(|i| {
+                let (s, pf_pos) = pack_row(slots, i)?;
                 let n = s.prompt_ids.len();
-                if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || s.pf_pos + withheld >= n {
+                if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || pf_pos + withheld >= n {
                     return None;
                 }
-                let remaining = e.pf_plan_slice(n - withheld - s.pf_pos, chunk_cap);
+                let remaining = e.pf_plan_slice(n - withheld - pf_pos, chunk_cap);
                 let n_rows = u32::try_from(remaining).ok()?;
                 let slot_u32 = u32::try_from(i).ok()?;
-                let kv_row0 = u32::try_from(s.pf_pos).ok()?;
+                let kv_row0 = u32::try_from(pf_pos).ok()?;
                 let span = packet::dev::PrefillSpan {
                     row0: 0,
                     n_rows,
@@ -4594,6 +4686,8 @@ fn gpu_prefill_batched_pass(
             return tick_fault;
         }
         let avail: usize = candidates.iter().map(|c| c.span.n_rows as usize).sum();
+        // Every overlay row of a launch is staged at once: bound its rows by the overlay's.
+        let per_launch = per_launch.min(overlay_rows.unwrap_or(usize::MAX)).max(1);
         let per_launch = if adaptive {
             let mut queue: Vec<(u64, usize)> =
                 candidates.iter().map(|c| (c.arrival, c.span.n_rows as usize)).collect();
@@ -4724,20 +4818,26 @@ fn gpu_prefill_batched_pass(
             }
             result
         } else {
+            let staged = match overlay_rows {
+                Some(_) => gpu_speech_pack_inputs(e, slots, &pack),
+                None => Ok(()),
+            };
             let reqs: Vec<PfBatchReq> = pack
                 .iter()
                 .map(|&(i, c0, len)| PfBatchReq {
                     slot: i,
-                    prompt: &slots[i].as_ref().expect("packed slot is Some").prompt_ids,
+                    prompt: &pack_row(slots, i).expect("packed row is live").0.prompt_ids,
                     c0,
                     len,
                 })
                 .collect();
-            if compact {
-                e.prefill_batched_complete(&reqs, completed)
-            } else {
-                e.prefill_batched(&reqs)
-            }
+            staged.and_then(|()| {
+                if compact {
+                    e.prefill_batched_complete(&reqs, completed)
+                } else {
+                    e.prefill_batched(&reqs)
+                }
+            })
         };
         match res {
             Ok(()) => {
@@ -4745,7 +4845,7 @@ fn gpu_prefill_batched_pass(
                     feeds.clear();
                 }
                 for &(i, c0, len) in &pack {
-                    slots[i].as_mut().expect("packed slot is Some").pf_pos = c0 + len;
+                    set_pack_frontier(slots, i, c0 + len);
                 }
                 let last_slot = pack.last().expect("pack is non-empty").0;
                 let last_finished = slots[last_slot]
@@ -4774,7 +4874,8 @@ fn gpu_prefill_batched_pass(
                     }
                 }
                 for &(i, _, _) in &pack {
-                    fail_slot(&mut slots[i], arena, fanout_err(&err, &msg));
+                    let owner = if slots[i].is_some() { i } else { i - 1 };
+                    fail_slot(&mut slots[owner], arena, fanout_err(&err, &msg));
                     if unified {
                         e.retire_slot(i, false);
                     }
@@ -4788,15 +4889,12 @@ fn gpu_prefill_batched_pass(
         // Cold path: stop as soon as any request is ready so its first token
         // fires this tick; the rest continue next tick (with decoders live).
         let any_ready = pack.iter().any(|&(i, _, _)| {
-            slots[i]
-                .as_ref()
-                .map(|s| {
-                    e.packed_slot_ready(i)
-                        && s.step == 0
-                        && !s.prompt_ids.is_empty()
-                        && s.pf_pos + withheld >= s.prompt_ids.len()
-                })
-                .unwrap_or(false)
+            slots[i].as_ref().is_some_and(|s| {
+                e.packed_slot_ready(i)
+                    && s.step == 0
+                    && !s.prompt_ids.is_empty()
+                    && packed_prompt_done(slots, i, withheld)
+            })
         });
         if any_ready {
             return tick_fault;
@@ -4908,19 +5006,19 @@ fn gpu_prefill_advance(
     gpu_finish_token(e, 0, slot, tok).map(Some)
 }
 
-/// Refuse a packet with per-row host inputs (`in.encoder_overlay`, `in.pos_base`) that also
-/// serves a launch-row-compacted prefill (batched/packed prefill, mixed step, token batch): those
-/// would read one job's overlay or position base for another job's rows.
+/// Refuse a packet with per-row host inputs (`in.encoder_overlay`, `in.pos_base`) whose prefill
+/// may run through a route that does not stage them per launch row: the mixed step and the unified
+/// token batch. Serial and packed prefill stage every member's rows ([`gpu_speech_pack_inputs`]).
 #[cfg(feature = "cuda")]
 pub fn check_speech_packet(e: &crate::exec::gpu::GpuEngine) -> Result<()> {
     let overlay = e.tensor_bytes("in.encoder_overlay").is_some();
     if !overlay && e.tensor_bytes("in.pos_base").is_none() {
         return Ok(());
     }
-    if e.pf_batch_enabled() || e.token_batch_enabled() || e.mixed_step_rows(1, 1).is_some() {
+    if e.token_batch_enabled() || e.mixed_step_rows(1, 1).is_some() {
         return Err(crate::RuntimeError::Rejected(
-            "packet has per-row host inputs (overlay / position base) and a batched prefill, \
-             mixed-step or token-batch program; those run only through serial prefill"
+            "packet has per-row host inputs (overlay / position base) and a mixed-step or \
+             token-batch program, which do not stage them per row"
                 .into(),
         ));
     }
@@ -4990,6 +5088,123 @@ fn speech_overlay_index(pos: &[u32], c0: usize, window: usize, index: &mut Vec<u
         index[p as usize - c0] = k as u32;
     }
     (lo, hi)
+}
+
+/// The request behind engine row `i` and that row's prefill frontier: the slot's own, or its CFG
+/// owner's partner frontier when `i` is a live pair's partner.
+#[cfg(any(feature = "cuda", test))]
+fn pack_row(slots: &[Option<Slot>], i: usize) -> Option<(&Slot, usize)> {
+    match slots.get(i)?.as_ref() {
+        Some(s) => Some((s, s.pf_pos)),
+        None => {
+            let owner = slots.get(i.checked_sub(1)?)?.as_ref()?;
+            Some((owner, owner.cfg.as_ref()?.partner_pf))
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn set_pack_frontier(slots: &mut [Option<Slot>], i: usize, frontier: usize) {
+    if let Some(s) = slots[i].as_mut() {
+        s.pf_pos = frontier;
+    } else if let Some(run) = i.checked_sub(1).and_then(|o| slots[o].as_mut()?.cfg.as_mut()) {
+        run.partner_pf = frontier;
+    }
+}
+
+/// Whether owner `i`'s packed prefill (both members of a CFG pair) left only the `withheld` rows.
+#[cfg(any(feature = "cuda", test))]
+fn packed_prompt_done(slots: &[Option<Slot>], i: usize, withheld: usize) -> bool {
+    slots[i].as_ref().is_some_and(|s| {
+        let n = s.prompt_ids.len();
+        s.pf_pos + withheld >= n && s.cfg.as_ref().is_none_or(|run| run.partner_pf + withheld >= n)
+    })
+}
+
+/// The overlay and its launch-row index for one packed launch: each member's overlay rows inside
+/// its chunk, at the chunk's launch offset, compacted in pack order. Written for every launch of
+/// an overlay packet, so a row no member overlays never reads a stale index.
+#[cfg(any(feature = "cuda", test))]
+fn speech_pack_overlay(
+    slots: &[Option<Slot>],
+    pack: &[(usize, usize, usize)],
+    window: usize,
+    rows: &mut Vec<f32>,
+    index: &mut Vec<u32>,
+) {
+    rows.clear();
+    index.clear();
+    index.resize(window, u32::MAX);
+    let mut launch_row = 0usize;
+    let mut k = 0u32;
+    for &(i, c0, len) in pack {
+        let partner = slots[i].is_none();
+        if let Some(sp) = pack_row(slots, i).and_then(|(s, _)| s.speech.as_deref()) {
+            let src = match (partner, sp.cfg.as_ref()) {
+                (true, Some(cfg)) => &cfg.uncond_overlay,
+                _ => &sp.overlay,
+            };
+            let hidden = src.len() / sp.overlay_pos.len().max(1);
+            let lo = sp.overlay_pos.partition_point(|&p| (p as usize) < c0);
+            let hi = sp.overlay_pos.partition_point(|&p| (p as usize) < c0 + len);
+            for &p in &sp.overlay_pos[lo..hi] {
+                if let Some(row) = index.get_mut(launch_row + p as usize - c0) {
+                    *row = k;
+                }
+                k += 1;
+            }
+            rows.extend_from_slice(&src[lo * hidden..hi * hidden]);
+        }
+        launch_row += len;
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_speech_pack_inputs(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slots: &[Option<Slot>],
+    pack: &[(usize, usize, usize)],
+) -> Result<()> {
+    thread_local! {
+        static STAGE: std::cell::RefCell<(Vec<f32>, Vec<u32>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
+    let index_rows = e
+        .tensor_bytes("in.encoder_overlay_index")
+        .ok_or_else(|| crate::RuntimeError::Rejected("packet has no in.encoder_overlay_index".into()))?
+        as usize
+        / 4;
+    let window = index_rows.min(e.pf_max_rows().max(1));
+    STAGE.with_borrow_mut(|(rows, index)| {
+        speech_pack_overlay(slots, pack, window, rows, index);
+        if !rows.is_empty() {
+            e.write_tensor("in.encoder_overlay", 0, bytemuck::cast_slice(rows))?;
+        }
+        e.write_tensor("in.encoder_overlay_index", 0, bytemuck::cast_slice(index))
+    })
+}
+
+/// A packed launch completed engine row `i`'s prompt (compact terminal, logits row `row`). Writes
+/// a speech job's decode position base and, for a CFG member, stashes the row's logits in its
+/// owner: `Some((owner, true))`, drawn once both members are in. `Some((i, false))` for an
+/// ordinary row, `None` for a row whose request is gone.
+#[cfg(feature = "cuda")]
+fn gpu_speech_prompt_done(
+    e: &mut crate::exec::gpu::GpuEngine,
+    slots: &mut [Option<Slot>],
+    row: usize,
+    i: usize,
+) -> Result<Option<(usize, bool)>> {
+    let partner = slots[i].is_none();
+    let owner = if partner { i.checked_sub(1).filter(|&o| slots[o].is_some()) } else { Some(i) };
+    let Some(owner) = owner else { return Ok(None) };
+    let Some(slot) = slots[owner].as_mut() else { return Ok(None) };
+    if let Some(base) = slot.speech.as_ref().and_then(|sp| sp.pos_base) {
+        e.write_tensor("in.pos_base", (i * 4) as u64, &base.to_le_bytes())?;
+    }
+    let Some(run) = slot.cfg.as_mut() else { return Ok(Some((owner, false))) };
+    e.logits_row(row, if partner { &mut run.uncond } else { &mut run.cond })?;
+    Ok(Some((owner, true)))
 }
 
 /// The per-step stochastic draw for one slot, with the request's OpenAI `seed`
@@ -6231,10 +6446,52 @@ mod tests {
             let s = owner.as_mut().unwrap();
             s.step = 1;
             s.out_ids.push(7);
-            s.cfg = Some(Box::new(CfgRun { rng: None, cond: Vec::new(), uncond: Vec::new(), scratch: Vec::new() }));
+            s.cfg = Some(Box::new(CfgRun { rng: None, partner_pf: 0, cond: Vec::new(), uncond: Vec::new(), scratch: Vec::new() }));
         }
         let slots = vec![owner, None];
         assert_eq!(gpu_decode_feeds(&slots, 2), [(0, 7), (1, 7)]);
+    }
+
+    /// A packed launch stages each member's overlay rows at its launch offset, in pack order: a
+    /// pair's partner reads the unconditional rows, and a row no member overlays is unmapped.
+    #[test]
+    fn packed_overlay_rows_land_at_each_members_launch_offset() {
+        let metrics = Arc::new(Metrics::default());
+        let mut slots: Vec<Option<Slot>> = std::iter::repeat_with(|| None).take(4).collect();
+        // Slot 0: an audio job, overlay rows at prompt positions 1..3, hidden 2.
+        let ((mut job, t), _r0) = queued_job(6, Instant::now());
+        job.opts.speech = Some(Box::new(SpeechJob {
+            overlay: vec![1.0, 1.0, 2.0, 2.0],
+            overlay_pos: vec![1, 2],
+            ..Default::default()
+        }));
+        assert!(admit_into(&mut slots, 4, job, t, None, &metrics, &EngineHealth::Healthy, None, false).is_none());
+        // Slots 2/3: a CFG pair whose every row is an overlay.
+        let ((mut job, t), _r1) = cfg_job(3);
+        {
+            let sp = job.opts.speech.as_mut().unwrap();
+            sp.overlay = vec![10.0, 10.0, 11.0, 11.0, 12.0, 12.0];
+            sp.overlay_pos = vec![0, 1, 2];
+            sp.cfg.as_mut().unwrap().uncond_overlay = vec![20.0, 20.0, 21.0, 21.0, 22.0, 22.0];
+        }
+        assert!(admit_into(&mut slots, 4, job, t, None, &metrics, &EngineHealth::Healthy, None, false).is_none());
+        assert!(slots[2].as_ref().is_some_and(|s| s.cfg.is_some()) && slots[3].is_none());
+
+        // Launch: slot 0 rows [0, 2), partner rows [1, 3), owner rows [0, 2).
+        let pack = [(0, 0, 2), (3, 1, 2), (2, 0, 2)];
+        let (mut rows, mut index) = (Vec::new(), Vec::new());
+        speech_pack_overlay(&slots, &pack, 8, &mut rows, &mut index);
+        assert_eq!(index, [u32::MAX, 0, 1, 2, 3, 4, u32::MAX, u32::MAX]);
+        assert_eq!(rows, [1.0, 1.0, 21.0, 21.0, 22.0, 22.0, 10.0, 10.0, 11.0, 11.0]);
+
+        // Frontiers: the partner's lives in its owner; the pair is done when both members are.
+        assert_eq!(pack_row(&slots, 3).map(|(_, pf)| pf), Some(0));
+        set_pack_frontier(&mut slots, 2, 2);
+        assert!(!packed_prompt_done(&slots, 2, 1));
+        set_pack_frontier(&mut slots, 3, 2);
+        assert_eq!(pack_row(&slots, 3).map(|(_, pf)| pf), Some(2));
+        assert!(packed_prompt_done(&slots, 2, 1) && !packed_prompt_done(&slots, 2, 0));
+        assert!(pack_row(&slots, 1).is_none());
     }
 
     /// A full downstream stage keeps a request queued, answered with nothing.

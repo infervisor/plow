@@ -62,7 +62,18 @@ impl CudaTokenBatch {
             && e.packed_prefill.is_some()
             && e.has_packed_terminal()
             && e.recurrent.is_none()
-            && e.mixed_step.is_none())
+            && e.mixed_step.is_none()
+            // Host rows spliced by launch row (overlay) or a decode-only embedding (position
+            // base): the batch embeds decode rows through the prefill program, in its own order.
+            && e.handle_of("in.encoder_overlay").is_none()
+            && e.handle_of("in.pos_base").is_none()
+            // Decode rows ride as one-row requests of the packed prefill attention, which is
+            // qualified only on the hd256/512 attention arms. At hd128 (Veena, H100, c64) its
+            // ticks carried ~77 one-row requests and served 27.1 audio s/s against 33.8 for
+            // packed prefill plus the ordinary decode launch.
+            && e.prefill.iter().all(|b| {
+                b.flash_sites.iter().all(|&pc| matches!(b.h_inst[pc].i[6], 256 | 512))
+            }))
         .then(|| Self {
             staging: TokenBatchStaging::with_capacity(e.pf_max_rows(), e.batch),
             fired: false,

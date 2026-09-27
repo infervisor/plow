@@ -190,7 +190,10 @@ impl BlobPlan {
                 )
             });
             let prefix_requested = config.nv_vmm_prefix() == Some(true) || prefix_layout.is_some();
-            if config.nv_live_kv_enabled(packed, full, prefix_requested) {
+            if config.nv_live_kv_enabled(packed, full, prefix_requested)
+                && (config.nv_vmm_live()
+                    || crate::exec::gpu::live_kv_mappable(&blob, manifest.as_ref(), granularity))
+            {
                 let layout = match manifest.as_ref() {
                     Some(m) => crate::memory::vmm::LiveKvLayout::from_manifest(&blob, m)?,
                     None => crate::memory::vmm::LiveKvLayout::from_blob(&blob)?,
