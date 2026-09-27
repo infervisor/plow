@@ -20,6 +20,7 @@ pub mod head;
 pub mod policy;
 #[cfg(feature = "cuda")]
 pub mod manager;
+pub mod logprobs;
 pub mod models;
 pub mod mux;
 pub mod openai;

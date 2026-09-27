@@ -8446,6 +8446,12 @@ impl GpuEngine {
                     // context, dead engine, every request 503. Refuse the mismatch here, the
                     // way a missing object is already refused. Absent symbol = older cubin,
                     // unconstrained (same convention as plow_arena_bytes).
+                    if inferred_policy.fa512_mode == 2
+                        && hd256_capability == Some(0)
+                        && config.nv.pf_seg_fa512.is_none()
+                    {
+                        inferred_policy.fa512_mode = 1;
+                    }
                     if inferred_policy.fa512_mode == 2 && hd256_capability == Some(0) {
                         return Err(RuntimeError::Device(format!(
                             "PLOW_PF_SEG_FA512=all classes hd256 flash onto {fa_file}, but that \

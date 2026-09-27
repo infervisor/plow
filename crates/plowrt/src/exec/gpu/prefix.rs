@@ -158,7 +158,9 @@ impl GpuEngine {
                 && g.elem_slide == 2
                 && g.hd_full == 512
                 && g.hd_slide == 256
-                && g.window == 1024
+                // 512: Gemma-4 E4B (KV-shared layers read their source's rings); cached and
+                // cold prompts give identical logprobs (docs/runtime/gemma4-e4b-h100.md).
+                && matches!(g.window, 512 | 1024)
                 && !layout.slide.is_empty()
                 && recurrent_state_layout(&blob.tensors, g.batch as usize)
                     .ok()?

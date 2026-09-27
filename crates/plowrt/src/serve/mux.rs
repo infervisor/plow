@@ -542,6 +542,8 @@ struct Slot {
     /// Retained cache rows this sequence starts from (the engine keeps them at `begin_slot`).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     resume: usize,
+    /// The next token's OpenAI logprobs, set by the sampler when the request asked for them.
+    lp: Option<Box<crate::text::logprobs::TokenLogprobs>>,
 }
 
 impl Slot {
@@ -1951,6 +1953,7 @@ fn admit_session(
         held: Vec::new(),
         held_finish: None,
         parked_at: None,
+        lp: None,
     });
     None
 }
@@ -5444,9 +5447,20 @@ fn gpu_finish_token(
         let mut logits = e.take_logits_buf();
         logits.clear();
         e.logits_row(row, &mut logits)?;
+        let p = &slot.gen.params;
+        let stats = p.logprobs.map(|r| crate::text::logprobs::RowStats::of(&logits, r));
+        let adjusted = p.repetition_penalty != 1.0
+            || p.presence_penalty != 0.0
+            || p.frequency_penalty != 0.0
+            || !p.logit_bias.is_empty();
+        let raw = (stats.is_some() && adjusted).then(|| logits.clone());
         crate::text::sample::apply_penalties(&mut logits, &slot.out_ids, &slot.gen.params);
         let rng = slot_rng01(slot);
         let tok = crate::text::sample::sample(&logits, &slot.gen.params, None, rng);
+        if let Some(stats) = stats {
+            let logit = raw.as_deref().unwrap_or(&logits)[tok as usize];
+            slot.lp = Some(Box::new(stats.finish(logit)));
+        }
         e.return_logits_buf(logits);
         return Ok(tok);
     }
@@ -5826,6 +5840,7 @@ fn handle_produced_token(
             .try_send(StreamChunk::Token {
                 id: token,
                 text: delta,
+                logprobs: slot.lp.take(),
             })
             .is_err()
     {
@@ -5878,7 +5893,7 @@ fn flush_parked(slot_opt: &mut Option<Slot>, arena: &Option<SharedKvState>) -> b
     let mut sent = 0;
     while sent < slot.held.len() && slot.respond.capacity() > 1 {
         let id = slot.held[sent];
-        if slot.respond.try_send(StreamChunk::Token { id, text: String::new() }).is_err() {
+        if slot.respond.try_send(StreamChunk::Token { id, text: String::new(), logprobs: None }).is_err() {
             break;
         }
         sent += 1;
@@ -6053,7 +6068,7 @@ mod tests {
         let mut n = 0;
         assert!(!handle_produced_token(&mut slot, &None, &bundle, 104, 1, &mut n, Some(&[])));
         match rx.try_recv().unwrap() {
-            StreamChunk::Token { id, text } => assert_eq!((id, text.as_str()), (104, "")),
+            StreamChunk::Token { id, text, .. } => assert_eq!((id, text.as_str()), (104, "")),
             _ => panic!("expected a token"),
         }
     }
@@ -7027,6 +7042,7 @@ mod tests {
                 parked_at: None,
                 session: None,
                 resume: 0,
+                lp: None,
             }),
             rx,
         )

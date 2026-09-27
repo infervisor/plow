@@ -875,6 +875,8 @@ impl DevProg {
         let mut mapped_gemm = vec![false; n_seg];
         let mut mapless_w8a16 = vec![false; n_seg];
         let mut hd512 = vec![false; n_seg];
+        let mut flash = vec![false; n_seg];
+        let mut other_for_flash = vec![false; n_seg];
         let mut hd256_gqa2 = vec![false; n_seg];
         let mut other_for_gemm = vec![false; n_seg];
         let mut other_for_hd512 = vec![false; n_seg];
@@ -904,6 +906,9 @@ impl DevProg {
             let is_hd512 = inst.op == DevOp::FlashPrefill as u16 && inst.i[6] == 512;
             hd512[seg] |= is_hd512;
             other_for_hd512[seg] |= !is_hd512;
+            let is_flash = inst.op == DevOp::FlashPrefill as u16;
+            flash[seg] |= is_flash;
+            other_for_flash[seg] |= !is_flash;
 
             let is_gqa2 = inst.is_hd256_gqa2_sliding_prefill();
             hd256_gqa2[seg] |= is_gqa2;
@@ -920,7 +925,15 @@ impl DevProg {
             .any(|(&present, &other)| present && !other);
         SegmentClassPolicy {
             pure_mode: if w8a16 { 3 } else if pure { 1 } else { 0 },
-            fa512_mode: if hd512
+            // Every flash segment isolated, hd256 ones included: the packet was emitted
+            // `PLOW_SEG_FA512=all` (the loader downgrades to 1 when the object has no hd256 arm).
+            fa512_mode: if flash.iter().zip(&other_for_flash).all(|(&f, &o)| !f || !o)
+                && flash.iter().zip(&hd512).any(|(&f, &h)| f && !h)
+                && hd512.iter().any(|&h| h)
+                && !hd256_gqa2.iter().any(|&g| g)
+            {
+                2
+            } else if hd512
                 .iter()
                 .zip(&other_for_hd512)
                 .any(|(&present, &other)| present && !other)

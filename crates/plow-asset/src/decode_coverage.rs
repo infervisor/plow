@@ -58,7 +58,7 @@ impl DenseBf16 {
     pub fn validate(&self) -> Result<(), String> {
         let [abi, gf256, gf512, staging, mm, arena] = self.0;
         if abi != 1
-            || !matches!(gf256, 2 | 6)
+            || !matches!(gf256, 2 | 4 | 6)
             || !matches!(gf512, 1 | 2 | 4 | 8 | 16)
             || !matches!(mm, 8 | 16 | 32)
             || staging > arena

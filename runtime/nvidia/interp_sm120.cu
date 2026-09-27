@@ -517,8 +517,8 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #ifndef PLOW_NV_FA_GF_HD256
 #define PLOW_NV_FA_GF_HD256 2
 #endif
-#if PLOW_NV_FA_GF_HD256 != 2 && PLOW_NV_FA_GF_HD256 != 6
-#error "PLOW_NV_FA_GF_HD256 must be2 or6; incompatible GQA retainsGF2"
+#if PLOW_NV_FA_GF_HD256 != 2 && PLOW_NV_FA_GF_HD256 != 4 && PLOW_NV_FA_GF_HD256 != 6
+#error "PLOW_NV_FA_GF_HD256 must be 2, 4 or 6; incompatible GQA retains GF2"
 #endif
 #define PLOW_NV_FA_HD 128 /* Qwen3 head_dim; the only instantiation the DEFAULT build carries */
 
@@ -1952,6 +1952,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_GLU:
         d_glu((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
               in->i[0], in->i[1], slice, nblk);
+        break;
+
+    case PLOW_DOP_GLU_STRIDED:
+        d_glu_strided((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                      in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk);
         break;
 
 #if PLOW_NV_PREFILL && defined(PLOW_NV_PF_GEMV_HEAD) && PLOW_NV_PF_GEMV_HEAD

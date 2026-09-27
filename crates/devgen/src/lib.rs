@@ -1877,6 +1877,11 @@ struct Tn {
     ple_raw: u32,
     ple_pp: u32,
     ple: u32,
+    // NVIDIA has no op-155 arm: the block runs as Gemv/GluStrided/Gemv/NormResidual(Norm) through
+    // gate `[rows][P]`, gated input `[rows][P]` and projection `[rows][H]`.
+    ple_g: u32,
+    ple_a: u32,
+    ple_y: u32,
     qg: u32,
     kg: u32,
     vg: u32,
@@ -2298,6 +2303,21 @@ fn declare(
         },
         ple: if c.ple > 0 {
             ac(b, "ple", (rows * c.layers * c.ple) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
+        ple_g: if ple_split_on(c) {
+            ac(b, "ple_g", (rows * c.ple) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
+        ple_a: if ple_split_on(c) {
+            ac(b, "ple_a", (rows * c.ple) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
+        ple_y: if ple_split_on(c) {
+            ac(b, "ple_y", (rows * c.hidden) as u64 * BF16)
         } else {
             TENSOR_NONE
         },
@@ -6642,6 +6662,57 @@ fn emit_phase(
         // fold the next layer's input norm in (decode), TENSOR_NONE leaves it to a RmsNorm packet.
         let ple_block =
             |b: &mut Builder, cus: Vec<u32>, nrows: u32, dep: u32, hn_out: u32, gnext: u32| -> u32 {
+                if ple_split_on(c) {
+                    assert!(
+                        !fp8 && !mx4 && !affine_q4,
+                        "E-series per-layer input split: bf16 weights only"
+                    );
+                    let none = TENSOR_NONE;
+                    let (h, p) = (c.hidden, c.ple);
+                    let cg = proj(
+                        b, n.ple_g, n.x, w.plg, none, none, none, none, none, nrows, p, h, none,
+                        all.clone(), &[dep, c_ple],
+                    );
+                    let ca = b.emit(DevOp::GluStrided, (0..nrows.min(n_cu).max(1)).collect(), &[cg], |d| {
+                        d.t[0] = n.ple_a;
+                        d.t[1] = n.ple_g;
+                        d.t[2] = n.ple;
+                        d.i[0] = nrows;
+                        d.i[1] = p;
+                        d.i[2] = l as u32 * p;
+                        d.i[3] = c.layers * p;
+                        d.i[4] = 0;
+                    });
+                    let cy = proj(
+                        b, n.ple_y, n.ple_a, w.plp, none, none, none, none, none, nrows, h, p, none,
+                        all.clone(), &[ca],
+                    );
+                    return if hn_out != TENSOR_NONE {
+                        b.emit(DevOp::NormResidualNorm, cus, &[cy], |d| {
+                            d.t[0] = hn_out;
+                            d.t[1] = n.x;
+                            d.t[2] = n.x;
+                            d.t[3] = n.ple_y;
+                            d.t[4] = w.g_pl;
+                            d.t[5] = gnext;
+                            d.i[0] = nrows;
+                            d.i[1] = h;
+                            d.f[0] = c.eps;
+                            d.f[1] = ls[l];
+                        })
+                    } else {
+                        b.emit(DevOp::NormResidual, cus, &[cy], |d| {
+                            d.t[0] = n.x;
+                            d.t[1] = n.x;
+                            d.t[2] = n.ple_y;
+                            d.t[3] = w.g_pl;
+                            d.i[0] = nrows;
+                            d.i[1] = h;
+                            d.f[0] = c.eps;
+                            d.f[1] = ls[l];
+                        })
+                    };
+                }
                 b.emit(DevOp::PerLayerInput, cus, &[dep, c_ple], |d| {
                     d.t[0] = n.x;
                     d.t[1] = w.plg;
@@ -10539,6 +10610,11 @@ fn split2(n: u32, a: u32, b: u32) -> (Vec<u32>, Vec<u32>) {
 /// probe; the GLM twin `PLOW_GLM_GEMV_WG` measured −1.4 ms at cap 152 on gfx942). Unset ⇒
 /// byte-identical. Applied at the decode call sites only — prefill GEMM splitting is
 /// tile-based and must not see it.
+/// Gemma-4 E-series per-layer input block as generic ops (NVIDIA: no op-155 arm).
+fn ple_split_on(c: &Cfg) -> bool {
+    c.ple > 0 && !emit_is_amd() && !emit_is_apple()
+}
+
 fn gemv_wg_env() -> Option<u32> {
     emit_config::active().gemv_wg.filter(|&c| c > 0)
 }
@@ -10626,9 +10702,10 @@ fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool) {
         return;
     }
     // The CUDA interpreter carries the embedding-overlay handoff (op 179) too.
-    let cuda_ok = |op: DevOp| cuda && op == DevOp::EmbedOverlayBf16;
-    const CPU_OR_METAL_ONLY: [DevOp; 4] = [
+    let cuda_ok = |op: DevOp| cuda && matches!(op, DevOp::EmbedOverlayBf16 | DevOp::GluStrided);
+    const CPU_OR_METAL_ONLY: [DevOp; 5] = [
         DevOp::PerLayerInput,
+        DevOp::GluStrided,
         DevOp::GemvAffineQ4,
         DevOp::GemmAffineQ4,
         DevOp::EmbedOverlayBf16,

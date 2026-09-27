@@ -277,6 +277,7 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::GemmC5Fp8, RowField::Rows(0)),
     (DevOp::GemmSplitK, RowField::Rows(0)),
     (DevOp::PerLayerInput, RowField::Rows(0)),
+    (DevOp::GluStrided, RowField::Rows(0)),
     (DevOp::FlashMlaPrefill, RowField::Rows(4)),
     (DevOp::FlashMlaPrefillFp8, RowField::Rows(4)),
     // The union header and causal query bases must use the same row count as flash.

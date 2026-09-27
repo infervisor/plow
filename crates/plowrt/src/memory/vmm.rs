@@ -193,6 +193,13 @@ impl VmmGeometry {
             }
         }
         let u = |k: &str| t.get(k).and_then(|x| x.as_u64()).map(|x| x as u32);
+        // Gemma-4 E-series: the trailing `num_kv_shared_layers` read an earlier layer's cache
+        // and own none.
+        if let (Some(n), Some(shared)) = (u("num_hidden_layers"), u("num_kv_shared_layers")) {
+            let own = n.saturating_sub(shared);
+            full_layers.retain(|&l| l < own);
+            slide_layers.retain(|&l| l < own);
+        }
         let kvh_slide = u("num_key_value_heads")?;
         let kvh_full = u("num_global_key_value_heads").unwrap_or(kvh_slide);
         let hd_slide = u("head_dim")?;

@@ -126,7 +126,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         Argmax | ArgmaxFin | GemvArgmax | RowGather | ArgmaxF32 => &["sample"],
 
         Nop | Residual | Sum4Bf16 | Glu | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32 | CastF32Bf16
-        | PerLayerInput | ScaledAddF32 | GluF32 | SiluF32 | ReluF32 | BroadcastAddF32 | EmbedF16F32
+        | PerLayerInput | GluStrided | ScaledAddF32 | GluF32 | SiluF32 | ReluF32 | BroadcastAddF32 | EmbedF16F32
         | EmbedOverlayBf16 | EmbedPosBf16 | PackNcfwRowsF32 | QuantFp8Block128 | GatherRowsF32
         | CopyColsF32 | UnaryF32 | BinaryF32 | RandF32 => &["elementwise"],
     }

@@ -1448,6 +1448,10 @@ enum {
     PLOW_DOP_RAND_F32 = 202,
     PLOW_DOP_ATTENTION_F32 = 203,
     PLOW_DOP_ROW_STATS_F32 = 204,
+    /* op 5 with a strided, column-offset `up`: out[r][p] = bf16(act(gate[r][p])) * up[r*stride+col0+p].
+     * t0=out t1=gate t2=up  i0=rows i1=width i2=col0 i3=stride i4=act (0 gelu_tanh, 1 silu).
+     * Gemma-4 E-series per-layer input gate where op 155 has no arm (CUDA). */
+    PLOW_DOP_GLU_STRIDED = 205,
 
     PLOW_DOP__COUNT
 };

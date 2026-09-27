@@ -14,6 +14,7 @@ G_K(g_nop);
 /* elementwise.c */
 G_K(g_residual);
 G_K(g_glu);
+G_K(g_glu_strided);
 G_K(g_softcap);
 G_K(g_cast_f32_bf16);
 G_K(g_row_gather);

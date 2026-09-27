@@ -332,6 +332,8 @@ struct Shapes {
     gqa: u32,
     /// KV heads on the full-attention sites — the `GF_FULL = gqa` rule's guard.
     full_kv_heads: u32,
+    /// `n_head / n_kv_head` over the hd256 decode sites (0 = none, or they disagree).
+    gqa_hd256: u32,
     /// Decode batch: `n_batch` on the decode program's flash sites.
     decode_batch: u32,
     /// `I_moe` on the Gemma decode expert-down sites (`i[2]`); 0 when the packet has none.
@@ -511,6 +513,10 @@ fn shapes(m: &Model) -> Shapes {
                         if kvh > 0 && hd >= s.hd.iter().copied().max().unwrap_or(0) {
                             s.gqa = nh / kvh;
                             s.full_kv_heads = kvh;
+                        }
+                        if hd == 256 && kvh > 0 {
+                            let g = nh / kvh;
+                            s.gqa_hd256 = if s.gqa_hd256 == 0 || s.gqa_hd256 == g { g } else { u32::MAX };
                         }
                     }
                 }
@@ -1114,6 +1120,11 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         t.insert("fa_tc_hd512".into(), json!(1));
     } else if sm90a && s.moe_down_inter > 0 && s.decode_batch >= 8 {
         t.insert("fa_rb256".into(), json!(4));
+    }
+    // * `gf256`: sliding (hd256) decode reads each KV row once for 4 query heads instead of twice
+    //   at GF 2 when every hd256 site has a GQA-4 group (Gemma-4 E4B: 8 q / 2 kv heads).
+    if sm90a && s.gqa_hd256 != u32::MAX && s.gqa_hd256 % 4 == 0 && s.gqa_hd256 > 0 {
+        t.insert("gf256".into(), json!(4));
     }
     if s.full_kv_heads == 1 && s.gqa > 0 {
         // The template is instantiated at 1|2|4|8; 16 (the whole Gemma-4-12B group, one K/V
@@ -2834,6 +2845,11 @@ pub fn config_header(manifest: &Value) -> String {
             if v >= 2 && manifest.get("arch").and_then(Value::as_str) == Some("sm_90a") {
                 out.push_str("#ifndef PLOW_NV_GEMV_MMA\n#define PLOW_NV_GEMV_MMA 1\n#endif\n");
             }
+        }
+        if let Some(v) = t.get("gf256").and_then(Value::as_u64) {
+            out.push_str(&format!(
+                "#ifndef PLOW_NV_FA_GF_HD256\n#define PLOW_NV_FA_GF_HD256 {v}\n#endif\n"
+            ));
         }
         if let Some(v) = t.get("gf_full").and_then(Value::as_u64) {
             out.push_str(&format!(

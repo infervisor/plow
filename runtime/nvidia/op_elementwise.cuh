@@ -149,6 +149,20 @@ static __device__ void d_softcap(__nv_bfloat16* __restrict__ out, const __nv_bfl
 }
 
 /* Gated MLP: act(gate) * up. i1=act selects SiLU (1, Qwen) vs gelu_tanh (0, Gemma). */
+/* Op 205: out[r][p] = bf16(act(gate[r][p])) * up[r*stride + col0 + p]. */
+static __device__ void d_glu_strided(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ gate,
+                                     const __nv_bfloat16* __restrict__ up, unsigned rows, unsigned width,
+                                     unsigned col0, unsigned stride, unsigned act, unsigned slice,
+                                     unsigned nblk) {
+    const unsigned n = rows * width;
+    for (unsigned i = slice * PLOW_NV_THREADS + threadIdx.x; i < n; i += nblk * PLOW_NV_THREADS) {
+        const unsigned r = i / width, p = i - r * width;
+        const float g = __bfloat162float(gate[i]);
+        const float a = __bfloat162float(__float2bfloat16((act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g)));
+        out[i] = __float2bfloat16(a * __bfloat162float(up[(size_t)r * stride + col0 + p]));
+    }
+}
+
 static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ gate,
                       const __nv_bfloat16* __restrict__ up, unsigned n, unsigned act,
                       unsigned slice, unsigned nblk) {

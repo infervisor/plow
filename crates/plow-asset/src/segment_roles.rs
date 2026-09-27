@@ -71,6 +71,23 @@ pub const CUBLASLT_PREFILL_GEMMA4_26B_SHAPES: [(u32, u32); 8] = [
     (2816, 2112),
 ];
 
+/// Gemma-4 E4B (hidden 2560, 8 q / 2 kv heads, sliding hd 256, full hd 512, inter 10240, 42
+/// layers x 256 per-layer inputs): q/k/v/o for both layer kinds, unfused gate/up, down, the
+/// per-layer input gate/projection and the per-layer model projection.
+pub const CUBLASLT_PREFILL_GEMMA4_E4B_SHAPES: [(u32, u32); 11] = [
+    (2048, 2560),
+    (4096, 2560),
+    (512, 2560),
+    (1024, 2560),
+    (2560, 2048),
+    (2560, 4096),
+    (10240, 2560),
+    (2560, 10240),
+    (256, 2560),
+    (2560, 256),
+    (10752, 2560),
+];
+
 /// Llama-3.2-3B (Veena: hidden 3072, 24/8 heads, inter 8192) and Chatterbox T3 (Llama-520M:
 /// hidden 1024, inter 4096) projections: q/o, k/v, down, and gate/up when emitted unfused
 /// (`PLOW_NO_GLU_FUSE`). On h200 the native object's 128-row segment cost ~1.95 ms per Veena
@@ -103,6 +120,7 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
             || CUBLASLT_PREFILL_SPEECH_ROWS.contains(&m))
         && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
             || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k))
+            || CUBLASLT_PREFILL_GEMMA4_E4B_SHAPES.contains(&(n, k))
             || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))
             || CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k)))
 }

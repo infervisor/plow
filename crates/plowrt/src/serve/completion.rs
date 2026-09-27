@@ -112,10 +112,22 @@ async fn completions_with(
             Some("echo".into()),
         );
     }
-    if req.logprobs.as_ref().is_some_and(|v| !v.is_null()) {
+    let logprobs = match crate::serve::logprobs::parse_completion(req.logprobs.as_ref(), req.logprobs_mode.as_deref()) {
+        Ok(lp) => lp,
+        Err((msg, param)) => {
+            return crate::serve::api_error(
+                axum::http::StatusCode::BAD_REQUEST,
+                msg,
+                "invalid_request_error",
+                Some("invalid_value"),
+                Some(param.into()),
+            )
+        }
+    };
+    if logprobs.is_some() && !cfg!(feature = "cuda") {
         return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
-            "`logprobs` is not implemented; it is refused rather than returned as null",
+            "`logprobs` is served by the CUDA engine only",
             "invalid_request_error",
             Some("unsupported_parameter"),
             Some("logprobs".into()),
@@ -182,6 +194,7 @@ async fn completions_with(
         gen.stop = stop.list();
     }
     gen.seed = req.seed;
+    gen.params.logprobs = logprobs;
     gen.min_tokens = req.sampling.min_tokens.unwrap_or(0) as usize;
     gen.stop_token_ids = req.sampling.stop_token_ids.clone().unwrap_or_default();
     if gen.min_tokens > gen.max_tokens {
@@ -267,6 +280,10 @@ async fn completions_with(
     let n_prompt = prompt_ids.len();
     let (tx, rx) = stream_mod::channel();
     let response_prompt_ids = req.return_token_ids.then(|| prompt_ids.clone());
+    let lp_fmt = logprobs.map(|_| crate::serve::logprobs::TokenText {
+        tok: bundle.tokenizer().clone(),
+        as_ids: req.return_tokens_as_token_ids.unwrap_or(false),
+    });
     let Some(in_flight) = ids.begin(&req.model) else {
         return crate::serve::api_error(
             axum::http::StatusCode::CONFLICT,
@@ -325,10 +342,11 @@ async fn completions_with(
             t_arrive,
             n_prompt,
             created,
+            lp_fmt,
         );
         crate::serve::session::hold_until_sent(sse.into_response(), in_flight)
     } else {
-        buffer_and_reply(id, requested_model, rx, response_prompt_ids, created).await
+        buffer_and_reply(id, requested_model, rx, response_prompt_ids, created, lp_fmt).await
     };
     if let Some(cache) = cache {
         cache.stamp(&mut response);
@@ -342,14 +360,19 @@ async fn buffer_and_reply(
     mut rx: stream_mod::ChunkReceiver,
     prompt_token_ids: Option<Vec<u32>>,
     created: u64,
+    lp_fmt: Option<crate::serve::logprobs::TokenText>,
 ) -> Response {
     let mut text = String::new();
+    let mut lps = crate::serve::logprobs::CompletionLogprobs::default();
     let mut completion_token_ids = Vec::new();
     let mut finish = None;
     let mut usage = None;
     while let Some(chunk) = rx.recv().await {
         match chunk {
-            StreamChunk::Token { id, text: delta } => {
+            StreamChunk::Token { id, text: delta, logprobs } => {
+                if let (Some(fmt), Some(lp)) = (&lp_fmt, &logprobs) {
+                    lps.push(fmt, id, lp, text.len());
+                }
                 text.push_str(&delta);
                 if prompt_token_ids.is_some() {
                     completion_token_ids.push(id);
@@ -386,7 +409,7 @@ async fn buffer_and_reply(
         choices: vec![CompletionChoice {
             index: 0,
             text,
-            logprobs: None,
+            logprobs: lp_fmt.map(|_| serde_json::to_value(lps).unwrap_or_default()),
             finish_reason: Some(finish.as_openai()),
             // `Preempted` widens to "length" on the wire; without this the
             // caller cannot tell an operator-forced stop from max_tokens.
@@ -409,9 +432,12 @@ fn sse_response(
     t_arrive: std::time::Instant,
     n_prompt: usize,
     created: u64,
+    lp_fmt: Option<crate::serve::logprobs::TokenText>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     struct SseState {
         rx: stream_mod::ChunkReceiver,
+        /// Streamed text length so far (`text_offset`).
+        offset: usize,
         first: bool,
         done: bool,
         pending: std::collections::VecDeque<Event>,
@@ -419,6 +445,7 @@ fn sse_response(
     let body = stream::unfold(
         SseState {
             rx,
+            offset: 0,
             first: true,
             done: false,
             pending: std::collections::VecDeque::new(),
@@ -426,6 +453,7 @@ fn sse_response(
         move |mut st| {
             let model = model.clone();
             let request_id = request_id.clone();
+            let lp_fmt = lp_fmt.clone();
             async move {
                 if st.done {
                     return None;
@@ -442,7 +470,15 @@ fn sse_response(
                     }
                 };
                 let (choice, tail_usage, terminate) = match chunk {
-                    StreamChunk::Token { text, .. } => {
+                    StreamChunk::Token { id, text, logprobs } => {
+                        let logprobs = lp_fmt.as_ref().map(|fmt| {
+                            let mut lps = crate::serve::logprobs::CompletionLogprobs::default();
+                            if let Some(lp) = &logprobs {
+                                lps.push(fmt, id, lp, st.offset);
+                            }
+                            serde_json::to_value(lps).unwrap_or_default()
+                        });
+                        st.offset += text.len();
                         if st.first {
                             st.first = false;
                             crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, n_prompt);
@@ -455,7 +491,7 @@ fn sse_response(
                             vec![CompletionChoice {
                                 index: 0,
                                 text,
-                                logprobs: None,
+                                logprobs,
                                 finish_reason: None,
                                 x_plow_finish_reason: None,
                             }],

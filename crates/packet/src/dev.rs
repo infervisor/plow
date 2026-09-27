@@ -2193,6 +2193,12 @@ pub enum DevOp {
     /// as LayerNormF32 does (flag bit 1 ordered FP32 sums, else FP64), for DenseGemmF32's
     /// LayerNorm prologue. `t0=out(f32[rows][2]) t1=x` · `i0=rows i1=feat i2=flags` · `f0=eps`.
     RowStatsF32 = 204,
+    /// [`DevOp::Glu`] with a strided, column-offset `up` (bf16): `out[r][p] = bf16(act(gate[r][p]))
+    /// * up[r*stride + col0 + p]` for `r < rows, p < width`; `act` as op 5 (0 gelu_tanh, 1 silu).
+    /// Gemma-4 E-series per-layer input gate on GPUs without [`DevOp::PerLayerInput`]: `up` is
+    /// the `[T][layers*P]` per-layer input table, `col0 = layer*P`.
+    /// `t0=out t1=gate t2=up` · `i0=rows i1=width i2=col0 i3=stride i4=act`.
+    GluStrided = 205,
 }
 
 /// Activation codes shared by [`DevOp::UnaryF32`] (`kind`) and the convolution input/output
@@ -2439,6 +2445,7 @@ impl DevOp {
         DevOp::RandF32,
         DevOp::AttentionF32,
         DevOp::RowStatsF32,
+        DevOp::GluStrided,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2664,6 +2671,7 @@ impl DevOp {
             DevOp::RandF32 => "PLOW_DOP_RAND_F32",
             DevOp::AttentionF32 => "PLOW_DOP_ATTENTION_F32",
             DevOp::RowStatsF32 => "PLOW_DOP_ROW_STATS_F32",
+            DevOp::GluStrided => "PLOW_DOP_GLU_STRIDED",
         }
     }
 
@@ -2718,7 +2726,8 @@ impl DevOp {
     /// `EmbedPosBf16 = 194` (Chatterbox T3 learned speech positions).
     /// 195 -> 204 for `GatherRowsF32 = 195` .. `AttentionF32 = 203` (generic FP32 signal ops).
     /// 204 -> 205 for `RowStatsF32 = 204` (DenseGemmF32's LayerNorm prologue statistics).
-    pub const COUNT: u16 = 205;
+    /// 205 -> 206 for `GluStrided = 205` (Gemma-4 E-series per-layer input gate on CUDA).
+    pub const COUNT: u16 = 206;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

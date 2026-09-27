@@ -9,6 +9,7 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_NOP] = g_nop;
     tab[PLOW_DOP_RESIDUAL] = g_residual;
     tab[PLOW_DOP_GLU] = g_glu;
+    tab[PLOW_DOP_GLU_STRIDED] = g_glu_strided;
     tab[PLOW_DOP_SOFTCAP] = g_softcap;
     tab[PLOW_DOP_CAST_F32_BF16] = g_cast_f32_bf16;
     tab[PLOW_DOP_ROW_GATHER] = g_row_gather;

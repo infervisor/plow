@@ -15,7 +15,7 @@ fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         Nop => 0,
         ZeroF32 => 1,
         RmsNorm | CastF32Bf16 => 2,
-        Residual | Glu | NormResidual | Gemm | Gemv | QuantFp8Block128 => 3,
+        Residual | Glu | GluStrided | NormResidual | Gemm | Gemv | QuantFp8Block128 => 3,
         AddNorm | NormResidualNorm | MlaBmmFp8 => 4,
         GemmFp8Block128 => 5,
         // Generic speech FP32 ops (runtime/nvidia/op_speech_f32.cuh): out = t0, inputs after it.
@@ -32,7 +32,7 @@ fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
     }
     match op {
         Nop => Ok(&[]),
-        Residual | Glu | NormResidual | Gemm | ZeroF32 | CastF32Bf16 => Ok(&[0]),
+        Residual | Glu | GluStrided | NormResidual | Gemm | ZeroF32 | CastF32Bf16 => Ok(&[0]),
         AddNorm | NormResidualNorm => Ok(&[0, 1]),
         RmsNorm if d.t[3] == TENSOR_NONE16 && d.t[4] == TENSOR_NONE16 => Ok(&[0]),
         Gemv if d.i[3] == 0 => Ok(&[0]),

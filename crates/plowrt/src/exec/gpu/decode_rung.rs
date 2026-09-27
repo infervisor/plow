@@ -258,9 +258,17 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     }
                     d.i[field] = 0;
                 }
+                // Gemma-4 E-series: the per-layer input norm runs over `t * layers` rows.
+                Some(DevOp::RmsNorm) if d.i[0] != g.t => {
+                    if d.i[0] == 0 || d.i[0] % g.t != 0 {
+                        return Err(reject("invalid norm row extent"));
+                    }
+                    d.i[0] /= g.t;
+                }
                 Some(
                     DevOp::RmsNorm
                     | DevOp::RowRms
+                    | DevOp::GluStrided
                     | DevOp::HeadNormRope
                     | DevOp::HeadNormRopeFp8
                     | DevOp::Gemm
@@ -410,13 +418,13 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
             } else {
                 0
             };
+            // A second reader with the same geometry is KV sharing (Gemma-4 E-series), not aliasing.
+            let geometry = (heads, hd, stride, mask, pair_mode, scale);
             if blob
                 .tensors
                 .get(id as usize)
                 .is_none_or(|t| t.bytes != bytes || t.init.is_some())
-                || caches
-                    .insert(id, (heads, hd, stride, mask, pair_mode, scale))
-                    .is_some()
+                || caches.insert(id, geometry).is_some_and(|old| old != geometry)
                 || [pos, kvlen, ids].contains(&(id as usize))
             {
                 return Err(reject("invalid or aliased KV tensor extent"));

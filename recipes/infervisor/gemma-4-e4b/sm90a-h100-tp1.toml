@@ -1,0 +1,62 @@
+# Gemma 4 E4B-it (google/gemma-4-E4B-it) on H100: text LLM of the voice-agent server (co-served
+# with Qwen3-ASR and Chatterbox). Per-layer input embeddings (E-series PLE), 5:1 sliding(512):full
+# attention, 18 trailing KV-shared layers, final-logit softcap 30. Served with logprobs.
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (this box only) \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/gemma-4-e4b/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Gates: scripts/llm/gemma_logit_parity.py (served logprobs vs HF transformers bf16);
+# bench: scripts/llm/gemma_voice_bench.sh (plowbench conventions, vLLM reference same client).
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "gemma-4-e4b"
+label = "sm90a-h100-tp1"
+network = "gemma4"
+doc = "docs/runtime/gemma4-e4b-h100.md"
+tracker = "plans/tts-veena-chatterbox-h200-tracker.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:google/gemma-4-E4B-it"
+
+[cell]
+name = "gemma-4-e4b-h100"
+hf_dir = "{hf:google/gemma-4-E4B-it}"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 8192
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "gemma-4-e4b"]
+[emit.env]
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+# Voice-agent turns: prompts ~200-2000 rows -> prefill 64..2048; decode up to 128 concurrent.
+PLOW_MAX_CHUNK = "2048"
+PLOW_PF_LADDER_APPEND = "64,256"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+# Every flash segment isolated: hd256 sliding + hd512 full attention run in interp_sm90a_pffa
+# (prefill 2000 rows 70 -> 48 ms). Needs the pffa/pfpackedfa role objects below.
+PLOW_SEG_FA512 = "all"
+
+# base emit -> segment objects (PLOW_NVCC / NVCC_PREPEND_FLAGS pick the toolkit) -> role emit.
+# Only the flash objects are taken; the script's pfseg/pfgemm set faults on this packet.
+[objects]
+script = "scripts/build_sm90a_gemma4_segments.sh"
+role_files = ["interp_sm90a_pffa.cubin", "interp_sm90a_pfpackedfa.cubin"]
+
+[emit_roles.env]
+
+[bench]
+kind = "chat"

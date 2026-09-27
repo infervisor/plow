@@ -27,6 +27,8 @@ pub struct SamplingParams {
     pub frequency_penalty: f32,
     /// (token, bias) additive logit adjustments.
     pub logit_bias: Vec<(u32, f32)>,
+    /// OpenAI `logprobs`: report each generated token's (and its alternatives') log-probability.
+    pub logprobs: Option<crate::text::logprobs::LogprobRequest>,
 }
 
 impl SamplingParams {
@@ -42,6 +44,7 @@ impl SamplingParams {
             || self.presence_penalty != 0.0
             || self.frequency_penalty != 0.0
             || !self.logit_bias.is_empty()
+            || self.logprobs.is_some()
     }
 }
 
@@ -56,6 +59,7 @@ impl Default for SamplingParams {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             logit_bias: Vec::new(),
+            logprobs: None,
         }
     }
 }

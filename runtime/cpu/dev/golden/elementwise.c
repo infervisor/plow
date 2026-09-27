@@ -34,6 +34,23 @@ G_K(g_glu) {
         out[i] = plow_f2bf(g_glu_pair(plow_bf2f(gate[i]), plow_bf2f(up[i]), act, f0, f1));
 }
 
+/* Op 205: t0=out t1=gate t2=up  i0=rows i1=width i2=col0 i3=stride i4=act.
+ * out[r][p] = bf16(act(gate[r][p])) * up[r*stride + col0 + p] (HF rounds the act output). */
+G_K(g_glu_strided) {
+    (void)ctx;
+    plow_bf16* out = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* gate = PLOW_CPU_TEN(in, T, 1);
+    const plow_bf16* up = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t rows = in->i[0], w = in->i[1], col0 = in->i[2], stride = in->i[3], act = in->i[4];
+    uint32_t lo, hi;
+    g_range(rows * w, slice, nblk, &lo, &hi);
+    for (uint32_t i = lo; i < hi; i++) {
+        const uint32_t r = i / w, p = i % w;
+        const float a = plow_bf2f(plow_f2bf(g_act_gate_only(plow_bf2f(gate[i]), act)));
+        out[i] = plow_f2bf(a * plow_bf2f(up[(size_t)r * stride + col0 + p]));
+    }
+}
+
 /* t0=out t1=x  i0=n  f0=cap.  out = cap * tanh(x / cap). */
 G_K(g_softcap) {
     (void)ctx;
