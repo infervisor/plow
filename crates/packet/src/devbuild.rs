@@ -427,6 +427,8 @@ pub struct Builder {
     cur_join: u32,
     /// See [`Builder::ignore_isolate`].
     isolate_ignored: bool,
+    /// See [`Builder::memo`].
+    memo: std::collections::HashMap<String, Vec<u32>>,
     /// See [`Builder::set_gq_order_asap`]. Default on; `PLOW_GQ_ORDER=emit` restores emit order.
     gq_order_asap: bool,
     /// See [`Builder::set_gq_order_seg`]. Default on; `PLOW_GQ_ORDER=asap` keeps program-wide
@@ -700,6 +702,7 @@ impl Builder {
             uniseg_forced: false,
             cur_join: 0,
             isolate_ignored: false,
+            memo: std::collections::HashMap::new(),
             gq_order_asap: knobs.gq_order.as_deref() != Some("emit"),
             gq_order_seg: !matches!(knobs.gq_order.as_deref(), Some("emit") | Some("asap")),
             packed_prefill_segments: false,
@@ -1115,6 +1118,12 @@ impl Builder {
     /// interpreter object) reuses emitters that isolate ops for prefill role objects.
     pub fn ignore_isolate(&mut self) {
         self.isolate_ignored = true;
+    }
+
+    /// Emitter-owned memo of handles within this program, for reusing a derived value (e.g. a
+    /// quantized copy) whose key fully determines it.
+    pub fn memo(&mut self) -> &mut std::collections::HashMap<String, Vec<u32>> {
+        &mut self.memo
     }
 
     pub fn set_decode_mla_bf16_segments(&mut self) {

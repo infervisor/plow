@@ -2140,6 +2140,11 @@ fn nv_fp8_mx_act(b: &mut Builder, cus: &[u32], x: u32, rows: u32, k: u32, deps: 
     if crate::emit_is_amd() {
         return (x, TENSOR_NONE, deps.to_vec());
     }
+    // Same input, same producer completion => same bytes: several projections of one row share a copy.
+    let key = format!("act_quant_mx:{x}:{rows}:{k}:{fp8}:{deps:?}");
+    if let Some(v) = b.memo().get(&key) {
+        return (v[0], v[1], vec![v[2]]);
+    }
     let name = format!("{}.fq{}", b.tensor_name(x), b.n_insts());
     let fq = b.tensor(&name, rows as u64 * k as u64 * if fp8 { 1 } else { 2 });
     let xs = if fp8 { b.tensor(&format!("{name}.s"), rows as u64 * (k as u64 / 32)) } else { TENSOR_NONE };
@@ -2150,6 +2155,7 @@ fn nv_fp8_mx_act(b: &mut Builder, cus: &[u32], x: u32, rows: u32, k: u32, deps: 
         d.i[0] = rows;
         d.i[1] = k;
     });
+    b.memo().insert(key, vec![fq, xs, c]);
     (fq, xs, vec![c])
 }
 
