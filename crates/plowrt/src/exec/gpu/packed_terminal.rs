@@ -70,7 +70,7 @@ fn layout(insts: &[DevInst64], rows: u32, logits: usize, ids: usize) -> Option<[
     Some(tail)
 }
 
-fn chain(insts: Vec<DevInst64>, grid: u32, rows: u32) -> plow_asset::aux_program::Program {
+pub(super) fn chain(insts: Vec<DevInst64>, grid: u32, rows: u32) -> plow_asset::aux_program::Program {
     let mut per_cu = vec![Vec::new(); grid as usize];
     let mut queue = Vec::new();
     let mut waits = Vec::new();

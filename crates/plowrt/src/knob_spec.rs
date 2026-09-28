@@ -512,6 +512,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.pf_seg_fa512", Some("PLOW_PF_SEG_FA512"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_seg_fa256_gqa2", Some("PLOW_PF_SEG_FA256_GQA2"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.pf_seg_graph", Some("PLOW_PF_SEG_GRAPH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.pf_shared_tail", Some("PLOW_PF_SHARED_TAIL"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.pf_seg_v2", Some("PLOW_PF_SEG_V2"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.pf_attn_gemm", Some("PLOW_PF_ATTN_GEMM"), Layer::Runtime, Domain::Bool, UNSET, PF_ATTN_GEMM_AUTO),
     KnobSpec::new("rt.pf_attn_gemm_tile", Some("PLOW_PF_ATTN_GEMM_TILE"), Layer::Runtime, U32, Default::Static(Val::Nat(2048)), OPT_IN),

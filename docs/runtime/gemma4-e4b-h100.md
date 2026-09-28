@@ -359,6 +359,82 @@ gather plus an H2D copy of 21.5 KB per token on the critical path of every step 
 The weights (9.4 GB) plus the table fit with 36 GiB of KV at 128 × 8192. For co-serving with
 ASR and TTS, lower `max_ctx` (4096 halves the KV) before moving the table.
 
+## Prefill per op (packed, one cold request)
+
+Measured is `PLOW_PF_SEG_TIME` segment wall time, which includes the 4-6 µs per-segment
+interpreter/launch floor (a body-less skeleton build runs the 255 light segments in 1.17 ms).
+Roofline is max(FLOP / 989 TF/s, bytes / 3.35 TB/s). The rows are one non-shared sliding layer,
+plus the hd512 flash of a full layer. Build: `PLOW_TMA_GEMM=1`, `PLOW_SEG_CLASS_SLICE=1`, v3
+flash, FATLITE light object, cuBLASLt projections.
+
+| op (per layer) | rows | GFLOP | MB | roofline µs | measured µs | % of roofline | implementation |
+|---|---|---|---|---|---|---|---|
+| q_proj GEMM | 1000 | 10.5 | 19.7 | 10.6 | 23 | 46% | cuBLASLt |
+| k_proj GEMM | 1000 | 2.6 | 8.8 | 2.7 | 12 | 22% | cuBLASLt |
+| v_proj GEMM | 1000 | 2.6 | 8.8 | 2.7 | 12 | 22% | cuBLASLt |
+| HeadNormRope q/k/v | 1000 | 0.0 | 13.3 | 4.0 | 19 | 21% | interp (FATLITE) |
+| FlashPrefill hd256 sliding | 1000 | 4.2 | 12.3 | 4.2 | 50 | 8% | interp v3 (pffa) |
+| FlashPrefill hd512 full | 1000 | 8.2 | 20.5 | 8.3 | 106 | 8% | interp v3 (pffa) |
+| o_proj GEMM | 1000 | 10.5 | 19.7 | 10.6 | 25 | 42% | cuBLASLt |
+| NormResidual+RmsNorm | 1000 | 0.0 | 20.5 | 6.1 | 28 | 22% | interp |
+| gate_proj GEMM | 1000 | 52.4 | 78.0 | 53.0 | 76 | 70% | cuBLASLt |
+| up_proj GEMM | 1000 | 52.4 | 78.0 | 53.0 | 74 | 72% | cuBLASLt |
+| GeGLU | 1000 | 0.0 | 61.4 | 18.3 | 39 | 47% | interp |
+| down_proj GEMM | 1000 | 52.4 | 78.0 | 53.0 | 74 | 72% | cuBLASLt |
+| NormResidual | 1000 | 0.0 | 15.4 | 4.6 | 19 | 24% | interp |
+| PLE gate GEMM | 1000 | 1.3 | 6.9 | 2.1 | 11 | 19% | cuBLASLt |
+| PLE GluStrided (205) | 1000 | 0.0 | 1.5 | 0.5 | 12 | 4% | interp |
+| PLE proj GEMM | 1000 | 1.3 | 6.9 | 2.1 | 9 | 23% | cuBLASLt |
+| NormResidual+RmsNorm (layer end) | 1000 | 0.0 | 20.5 | 6.1 | 22 | 28% | interp |
+| q_proj GEMM | 2000 | 21.0 | 28.9 | 21.2 | 40 | 53% | cuBLASLt |
+| k_proj GEMM | 2000 | 5.2 | 14.9 | 5.3 | 17 | 31% | cuBLASLt |
+| v_proj GEMM | 2000 | 5.2 | 14.9 | 5.3 | 16 | 33% | cuBLASLt |
+| HeadNormRope q/k/v | 2000 | 0.0 | 26.6 | 7.9 | 30 | 26% | interp (FATLITE) |
+| FlashPrefill hd256 sliding | 2000 | 8.4 | 24.6 | 8.5 | 54 | 16% | interp v3 (pffa) |
+| FlashPrefill hd512 full | 2000 | 32.8 | 41.0 | 33.1 | 199 | 17% | interp v3 (pffa) |
+| o_proj GEMM | 2000 | 21.0 | 28.9 | 21.2 | 38 | 56% | cuBLASLt |
+| NormResidual+RmsNorm | 2000 | 0.0 | 41.0 | 12.2 | 38 | 32% | interp |
+| gate_proj GEMM | 2000 | 104.9 | 103.6 | 106.0 | 142 | 75% | cuBLASLt |
+| up_proj GEMM | 2000 | 104.9 | 103.6 | 106.0 | 138 | 77% | cuBLASLt |
+| GeGLU | 2000 | 0.0 | 122.9 | 36.7 | 66 | 56% | interp |
+| down_proj GEMM | 2000 | 104.9 | 103.6 | 106.0 | 136 | 78% | cuBLASLt |
+| NormResidual | 2000 | 0.0 | 30.7 | 9.2 | 25 | 37% | interp |
+| PLE gate GEMM | 2000 | 2.6 | 12.6 | 3.8 | 11 | 34% | cuBLASLt |
+| PLE GluStrided (205) | 2000 | 0.0 | 3.1 | 0.9 | 15 | 6% | interp |
+| PLE proj GEMM | 2000 | 2.6 | 12.6 | 3.8 | 11 | 34% | cuBLASLt |
+| NormResidual+RmsNorm (layer end) | 2000 | 0.0 | 41.0 | 12.2 | 34 | 36% | interp |
+
+Whole launch (in-kernel, sum of segments):
+
+| rows | all 42 layers on every row | KV-shared tail on sampled rows | vLLM served |
+|---|---|---|---|
+| 1000 | 21.3 ms (21.3 µs/row) | 17.3 ms (17.3 µs/row) | |
+| 2000 | 34.7 ms (17.4 µs/row) | 25.2 ms (12.6 µs/row) | 13.2 µs/row (c32) |
+
+**KV-shared tail** (`plow_asset::kv_shared_tail`, `PLOW_PF_SHARED_TAIL`, on by default). The last
+18 layers of E4B write no KV cache, so on the packed/token-batch route only the sampled rows
+(prompt-final rows and riding decode rows) run them:
+* the body stops at the tail boundary;
+* RowGather moves the sampled rows' `act.x`, `act.hn` and `act.ple` to rows 0..n;
+* the smallest bucket then runs its tail segments with each row as a one-row request at its own
+  position, over a counter image that marks the prefix as done.
+
+The packet declares the boundary per bucket, so the path is model-generic. A packet without the
+section, or a launch with more sampled rows than slots, runs the whole program. At 1-2 sampled
+rows the tail costs 5.0 ms per launch. Most of that is 18 bucket-64 GEMM passes (~130 µs/layer)
+and v3 flash at one query row (50 µs hd256, 170 µs hd512, latency-bound).
+
+Served prefill-only (ISL 1000, OSL 1, temperature 0, `--multistep-adaptive`):
+
+| | c1 req/s | c32 req/s | c32 TTFT p50 |
+|---|---|---|---|
+| all rows, all layers | 30.3 | 55.4 | 72.6 ms |
+| KV-shared tail | 34.9 | 77.3 | 50.9 ms |
+| vLLM | 26.5 | 75.7 | 384 ms |
+
+Voice sessions (`session_bench.py`, 64 calls × 6 turns, 87% of later-turn prompt tokens cached):
+later-turn TTFT p50 is 35.5 ms without the tail and 31.8 ms with it.
+
 ## Gaps
 
 * **Decode step at 30-41% of roofline.**
@@ -367,7 +443,7 @@ ASR and TTS, lower `max_ctx` (4096 halves the KV) before moving the table.
   * vLLM's TPOT is lower at c>=8 as a result.
 * **Cold-prompt throughput at c>=32 (KERNEL).** Sampled rows now draw on the device, so mixed
   ticks no longer collapse (c64 943 -> 2701 tok/s). vLLM still serves 1.5-2.3x. The limits are
-  the prefill rate (21.4 vs 13.2 µs/row, non-GEMM ops) and the decode step (above). No tick
+  the decode step (above); the prefill rate now matches vLLM on long prompts (see "Prefill per op"). No tick
   policy closes this; see "Where the tick time goes".
 * **c8 TTFT (SCHED).** 90 ms vs vLLM 63: a new prompt waits for the running multistep quantum.
 * **Logprobs.** Greedy logprobs rows cost ~1% at c32/c64 (batched device stats). Left:

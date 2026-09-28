@@ -84,6 +84,7 @@ pub mod packet_exec;
 mod moe_lt;
 mod native_decode;
 mod packed_terminal;
+mod shared_tail;
 mod token_batch;
 use cublaslt::{CublasLtDecodeRoute, LibraryRoute};
 use decode_rung::{
@@ -2369,6 +2370,12 @@ pub struct GpuEngine {
     prefill_turn: usize,
     packed_prefill: Option<plow_asset::packed_prefill::Manifest>,
     packed_terminal: Option<packed_terminal::PackedTerminal>,
+    /// KV-shared tail runner (`plow_asset::kv_shared_tail`) for the token-batch route.
+    shared_tail: Option<shared_tail::SharedTail>,
+    /// Restricts the next `launch_prefill_chain` to these segments.
+    pf_seg_window: Option<std::ops::Range<usize>>,
+    /// The next packed body stops at its bucket's KV-shared tail boundary.
+    pf_seg_prefix: bool,
     attention_gemm: Option<attention_gemm::AttentionGemm>,
     /// Request table of the prefill launch being enqueued, for `attention_gemm`.
     attention_requests: Vec<attention_gemm::Request>,
@@ -3451,6 +3458,13 @@ impl GpuEngine {
             .map(|bytes| {
                 serde_json::from_slice::<plow_asset::packed_prefill::Manifest>(bytes)
                     .map_err(|e| RuntimeError::Rejected(format!("packed prefill metadata: {e}")))
+            })
+            .transpose()?;
+        let kv_shared_tail_metadata = blob
+            .reserved_metadata(&raw, plow_asset::kv_shared_tail::SECTION)?
+            .map(|bytes| {
+                serde_json::from_slice::<plow_asset::kv_shared_tail::Manifest>(bytes)
+                    .map_err(|e| RuntimeError::Rejected(format!("kv-shared tail metadata: {e}")))
             })
             .transpose()?;
         let config = RuntimeConfig::get();
@@ -6124,6 +6138,9 @@ impl GpuEngine {
             prefill_turn: 0,
             packed_prefill,
             packed_terminal: None,
+            shared_tail: None,
+            pf_seg_window: None,
+            pf_seg_prefix: false,
             attention_gemm,
             attention_requests: Vec::new(),
             mixed_step,
@@ -6140,6 +6157,8 @@ impl GpuEngine {
             slot_generations: vec![0; batch],
         };
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
+        engine.shared_tail =
+            shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
         engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
         if config.token_batch {
             tracing::info!(
@@ -9720,6 +9739,10 @@ impl GpuEngine {
     fn warm_seg_graphs(&mut self, bi: usize, arg: &DevProgram) -> Result<()> {
         let segments = self.prefill[bi].seg_class.len();
         self.ensure_seg_graph(bi, arg, 0..segments)?;
+        if let Some(boundary) = self.shared_tail.as_ref().map(|t| t.boundary_segment(bi)) {
+            self.ensure_seg_graph(bi, arg, 0..boundary)?;
+            self.ensure_seg_graph(bi, arg, boundary..segments)?;
+        }
         if self.attention_gemm.is_some() {
             for (start, end) in self.seg_graph_pieces(bi) {
                 self.ensure_seg_graph(bi, arg, start..end)?;
@@ -9986,7 +10009,9 @@ impl GpuEngine {
             let mut routed_index = 0;
             if !seg_time_probe && !fat_only_probe && rt.nv.pf_seg_graph {
                 let tensors = arg.tensors as u64;
-                let pieces = if routed {
+                let pieces = if let Some(window) = self.pf_seg_window.clone() {
+                    vec![(window.start, window.end)]
+                } else if routed {
                     self.seg_graph_pieces(bi)
                 } else {
                     vec![(0, seg_class.len())]
@@ -10041,7 +10066,11 @@ impl GpuEngine {
             // price the cooperative-launch overhead (241 fat launches/chunk).
             let noncoop = rt.nv.pf_seg_noncoop;
             let mut evs: Vec<(usize, u8, CudaEvent, CudaEvent)> = Vec::new();
+            let window = self.pf_seg_window.clone().unwrap_or(0..seg_class.len());
             for (seg, &cls) in seg_class.iter().enumerate() {
+                if !window.contains(&seg) {
+                    continue;
+                }
                 if let (true, Some(Some(site)), Some(route)) = (
                     routed,
                     self.prefill[bi].attention_gemm_segments.get(seg),
@@ -10676,7 +10705,12 @@ impl GpuEngine {
             self.be
                 .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
             if self.packed_prefill.is_some() {
-                self.launch_prefill_chain(
+                self.pf_seg_window = self
+                    .shared_tail
+                    .as_ref()
+                    .filter(|_| self.pf_seg_prefix)
+                    .map(|tail| 0..tail.boundary_segment(bi));
+                let chain = self.launch_prefill_chain(
                     bi,
                     arg,
                     f_pf,
@@ -10685,7 +10719,9 @@ impl GpuEngine {
                     total,
                     tc,
                     synchronize,
-                )
+                );
+                self.pf_seg_window = None;
+                chain
             } else {
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
                 self.be.launch_cooperative(

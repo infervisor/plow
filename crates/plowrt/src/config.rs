@@ -912,6 +912,11 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-seg-graph", env = "PLOW_PF_SEG_GRAPH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_graph: bool,
 
+    /// Packed prefill runs a KV-shared model's trailing KV-shared layers for the sampled rows
+    /// only (`plow_asset::kv_shared_tail`); `false` runs every row through every layer.
+    #[arg(long = "pf-shared-tail", env = "PLOW_PF_SHARED_TAIL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_shared_tail: bool,
+
     /// Segment-classing v2 ("1") / q8 variant ("q8").
     #[arg(long = "pf-seg-v2", env = "PLOW_PF_SEG_V2", global = true)]
     pub pf_seg_v2: Option<String>,

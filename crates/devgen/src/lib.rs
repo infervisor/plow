@@ -4523,6 +4523,17 @@ fn emit_phase(
     // (b tensor, gamma_b, gamma_n, layer_scale) of a skipped NRN2, consumed by the next
     // iteration's q/k/v emission. Crosses loop iterations by construction.
     let mut nrn_pending: Option<(u32, u32, u32, f32)> = None;
+    // First layer of the trailing KV-shared run: a prefill program marks where its row-local
+    // tail begins (plow_asset::kv_shared_tail).
+    let shared_tail_start = (!decode && !block_mode && !hj && tp == 1 && block.end == c.layers as usize)
+        .then(|| {
+            (0..c.layers as usize)
+                .rev()
+                .take_while(|&l| c.kv_is_shared(l))
+                .last()
+        })
+        .flatten()
+        .filter(|&l| l > 0 && block.contains(&l));
 
     for l in block.clone() {
         let full = c.is_full[l];
@@ -4891,6 +4902,9 @@ fn emit_phase(
             rec(cn);
             cn
         };
+        if shared_tail_start == Some(l) {
+            b.mark_shared_tail();
+        }
         let (qkv_src, qkv_g) = (n.hn, TENSOR_NONE);
 
         // q, k and v are INDEPENDENT. Running all three on all 256 CUs makes them serialise
@@ -9736,6 +9750,7 @@ fn emit_dense_gqa(
         && (!amd || std::env::var_os("PLOW_L2_PLACE_PREFILL").is_some());
     let mut progs = Vec::new();
     let mut tlist = Vec::new();
+    let mut shared_tail_marks: Vec<Option<u32>> = Vec::new();
     let mut hetero_progs: Vec<hetero::ProgPlan> = Vec::new();
     let mut channel_progs = Vec::new();
     let packed_prefill = amd
@@ -9829,6 +9844,7 @@ fn emit_dense_gqa(
                 segments: coll.segments,
             });
         }
+        shared_tail_marks.push(b.shared_tail_mark());
         progs.push(b.finish());
         tlist.push(if packed {
             packet::devbuild::packed_prefill_program_t(t)
@@ -10298,6 +10314,17 @@ fn emit_dense_gqa(
             Err(error) => panic!("packed request contract: {error}"),
         }
     }
+    if packed_prefill_emitted {
+        let first_shared = (0..c.layers as usize)
+            .rev()
+            .take_while(|&l| c.kv_is_shared(l))
+            .last();
+        if let Some(section) =
+            first_shared.and_then(|l| kv_shared_tail_section(&m, &shared_tail_marks, l as u32))
+        {
+            sections.push(section);
+        }
+    }
     if projection_bindings.is_some() || packed_prefill_emitted {
         let manifest = plow_asset::program::with_model(&m, plow_asset::live_kv::emit)
             .unwrap_or_else(|error| panic!("compiled LIVE KV geometry: {error}"));
@@ -10745,4 +10772,77 @@ fn check_cpu_or_metal_opcode_coverage(m: &Model, supported: bool, cuda: bool) {
         "this packet carries opcode(s) only the CPU and Apple (metal3) interpreters currently \
          implement: {bad:?}; emit with --gpu <apple part> or a CPU target"
     );
+}
+
+/// The `kv_shared_tail` section for a packed-prefill packet whose every prefill program marked
+/// its KV-shared tail and carries the same per-row activations across the boundary. `None`
+/// (with a note) otherwise: the runtime then runs whole programs.
+fn kv_shared_tail_section(
+    m: &packet::devbuild::Model,
+    marks: &[Option<u32>],
+    first_layer: u32,
+) -> Option<packet::devbuild::SectionData> {
+    let prefill = packet::devbuild::decode_rung_lo(&m.prog_t);
+    if prefill == 0 || marks.len() < prefill || marks[..prefill].iter().any(Option::is_none) {
+        return None;
+    }
+    let max_rows = m.prog_t[..prefill]
+        .iter()
+        .map(|&t| packet::devbuild::program_rows(t))
+        .max()?;
+    let activation = |h: u16| {
+        m.tensors
+            .get(h as usize)
+            .is_some_and(|t| t.name.starts_with("act.") && t.init.is_none())
+    };
+    let mut carried: Option<Vec<u16>> = None;
+    let mut boundaries = Vec::with_capacity(prefill);
+    for (program, mark) in m.progs[..prefill].iter().zip(marks) {
+        let boundary = mark.unwrap() as usize;
+        if boundary == 0 || boundary >= program.insts.len() {
+            return None;
+        }
+        let insts: Vec<_> = program.insts.iter().map(|d| d.pack()).collect();
+        let set = plow_asset::kv_shared_tail::carried_reads(&insts, boundary, activation);
+        if carried.as_ref().is_some_and(|c| *c != set) {
+            eprintln!("  kv-shared tail not emitted: carried activations differ across buckets");
+            return None;
+        }
+        carried = Some(set);
+        boundaries.push(boundary as u32);
+    }
+    let carried = carried?
+        .into_iter()
+        .map(|h| {
+            let bytes = m.tensors[h as usize].bytes;
+            (bytes % u64::from(max_rows) == 0).then(|| plow_asset::kv_shared_tail::Carried {
+                tensor: h,
+                row_bytes: (bytes / u64::from(max_rows)) as u32,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let manifest = plow_asset::kv_shared_tail::Manifest {
+        version: plow_asset::kv_shared_tail::VERSION,
+        first_layer,
+        boundaries,
+        carried,
+    };
+    if let Err(error) = manifest.validate(prefill) {
+        eprintln!("  kv-shared tail not emitted: {error}");
+        return None;
+    }
+    eprintln!(
+        "  kv-shared tail from layer {}: carried {:?}",
+        manifest.first_layer,
+        manifest
+            .carried
+            .iter()
+            .map(|c| (m.tensors[c.tensor as usize].name.as_str(), c.row_bytes))
+            .collect::<Vec<_>>()
+    );
+    Some(packet::devbuild::SectionData {
+        kind: packet::devbuild::SECT_METADATA,
+        name: plow_asset::kv_shared_tail::SECTION.into(),
+        data: serde_json::to_vec(&manifest).unwrap(),
+    })
 }

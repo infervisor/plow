@@ -278,12 +278,25 @@ impl GpuEngine {
             // behind the flag rather than running on every decode step.
             let timed = RuntimeConfig::get().nv.step_time;
             let t_enq = timed.then(std::time::Instant::now);
-            if pipelined {
-                self.packed_token_body_enqueue_device(&chunks, &device_ids)?;
+            // KV-shared tail: the body stops at the tail boundary and the tail runs the sampled
+            // rows alone, which the terminal then finds at rows 0..n.
+            let tail_rows = self.shared_tail_rows(&chunks, &sample_rows);
+            self.pf_seg_prefix = tail_rows.is_some();
+            let body = if pipelined {
+                self.packed_token_body_enqueue_device(&chunks, &device_ids)
             } else {
-                self.packed_token_body_enqueue(&chunks)?;
-            }
+                self.packed_token_body_enqueue(&chunks)
+            };
+            self.pf_seg_prefix = false;
+            body?;
             body_enqueued = true;
+            let (sample_rows, real_rows) = match &tail_rows {
+                Some(rows) => {
+                    self.shared_tail_enqueue(rows, real_rows)?;
+                    ((0..rows.len() as u32).collect(), rows.len())
+                }
+                None => (sample_rows, real_rows),
+            };
             let enqueue_ns = t_enq.map_or(0, |t| t.elapsed().as_nanos() as u64);
             let mut terminal = self
                 .packed_terminal

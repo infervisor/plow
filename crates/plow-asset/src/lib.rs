@@ -703,6 +703,7 @@ pub mod fp8_m1_role;
 pub mod segment_roles;
 
 pub mod packed_prefill;
+pub mod kv_shared_tail;
 
 pub mod packet_pipeline;
 
