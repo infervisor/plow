@@ -518,6 +518,10 @@ pub(crate) struct Dsv41ProjAct {
     /// `xn @ wkv`, the shared latent, `[T][head_dim]` bf16. ONE row per token for ALL 64
     /// heads -- the absorbed MLA's defining shape, and why num_key_value_heads is 1.
     pub(crate) kv: u32,
+    /// Completions of `xn` and `q_an`, for consumers that read only those (the decode
+    /// compressor and indexer projections), not the whole projection.
+    pub(crate) c_xn: u32,
+    pub(crate) c_qan: u32,
 }
 
 /// Emit one layer's attention PROJECTION chain: the four GEMMs that feed the attention core.
@@ -565,7 +569,9 @@ pub(crate) fn emit_dsv41_attn_proj(
     // it, and num_key_value_heads is 1.
     let kv_out = c.head_dim;
 
-    let act = Dsv41ProjAct {
+    let mut act = Dsv41ProjAct {
+        c_xn: 0,
+        c_qan: 0,
         xn: b.tensor(&format!("act.l{l}.xn"), (t as u64) * (hidden as u64) * 2),
         q_a: b.tensor(&format!("act.l{l}.q_a"), (t as u64) * (q_lora as u64) * 2),
         q_an: b.tensor(&format!("act.l{l}.q_an"), (t as u64) * (q_lora as u64) * 2),
@@ -606,6 +612,8 @@ pub(crate) fn emit_dsv41_attn_proj(
         d.i[1] = q_lora;
         d.f[0] = eps;
     });
+    act.c_xn = c_xn;
+    act.c_qan = c_qan;
     let c_q = emit_pf_gemm_fp8_mx(
         b,
         cus,
