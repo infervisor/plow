@@ -1146,15 +1146,23 @@ impl Builder {
         self.ops[counter as usize].gq_delay += ranks;
     }
 
-    /// Re-place an emitted op (coarse deps only) on `cus` and amend its immediates: for a caller
-    /// that fuses a follow-on op into one a shared emit helper produced.
-    pub fn amend(&mut self, counter: u32, cus: Vec<u32>, f: impl FnOnce(&mut DevInst)) {
+    /// Amend an emitted op's immediates and optionally re-place it (coarse deps only) on `cus`: for
+    /// a caller that fuses a neighbouring op into one a shared emit helper produced.
+    pub fn amend(&mut self, counter: u32, cus: Option<Vec<u32>>, f: impl FnOnce(&mut DevInst)) {
         let op = &mut self.ops[counter as usize];
-        assert!(op.deps.iter().all(|d| matches!(d, Dep::Coarse(_))));
-        op.inst.blocks = cus.len() as u16;
-        op.work = vec![1; cus.len()];
-        op.cus = cus;
+        if let Some(cus) = cus {
+            assert!(op.deps.iter().all(|d| matches!(d, Dep::Coarse(_))));
+            op.inst.blocks = cus.len() as u16;
+            op.work = vec![1; cus.len()];
+            op.cus = cus;
+        }
         f(&mut op.inst);
+    }
+
+    /// Replace an emitted op's dependencies with coarse ones on `deps` (all emitted before it).
+    pub fn rewire(&mut self, counter: u32, deps: &[u32]) {
+        assert!(deps.iter().all(|&d| d < counter));
+        self.ops[counter as usize].deps = deps.iter().map(|&c| Dep::Coarse(c)).collect();
     }
 
     /// A second instance of an emitted op (coarse deps only), on the same CUs and deps, amended
