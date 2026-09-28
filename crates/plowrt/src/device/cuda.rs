@@ -892,6 +892,41 @@ impl CudaBackend {
         Ok(m.0)
     }
 
+    /// Rank-3 byte map, no swizzle, L2 256 B promotion: globalDim `dims` (innermost first),
+    /// byte strides of dims 1 and 2, box `boxd`. The V4.1 decode MoE's expert-slab view.
+    pub fn encode_tmap_u8_3d(&self, base: u64, dims: [u64; 3], strides: [u64; 2], boxd: [u32; 3]) -> Result<[u8; 128]> {
+        let f = self
+            .tmap_encode
+            .ok_or_else(|| RuntimeError::Device("cuTensorMapEncodeTiled unresolved (driver < CUDA 12.0)".into()))?;
+        #[repr(C, align(128))]
+        struct Buf([u8; 128]);
+        let mut m = Buf([0u8; 128]);
+        let es = [1u32, 1u32, 1u32];
+        self.check(
+            unsafe { bind_context(&self.api, self.ctx, self.freer.context_id) },
+            "cuCtxSetCurrent",
+        )?;
+        // SAFETY: as encode_tmap; rank 3, UINT8=0, SWIZZLE_NONE=0, L2_PROMOTION_L2_256B=3.
+        let rc = unsafe {
+            f(
+                &mut m as *mut Buf as *mut c_void,
+                0,
+                3,
+                base as *mut c_void,
+                dims.as_ptr(),
+                strides.as_ptr(),
+                boxd.as_ptr(),
+                es.as_ptr(),
+                0,
+                0,
+                3,
+                0,
+            )
+        };
+        self.check(rc, "cuTensorMapEncodeTiled(u8 3d)")?;
+        Ok(m.0)
+    }
+
     fn encode_tmap(
         &self,
         base: u64,

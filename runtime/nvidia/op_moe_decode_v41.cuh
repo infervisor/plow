@@ -14,9 +14,11 @@
  * All chunks form one stream cut into equal contiguous per-warp shares (no wave tail at any B). A GLU
  * item cut by a share boundary goes through scratch: the last of its warps (counter, self-resetting)
  * folds the partials in share order.
- * Weights stream through a per-warp ring of TMA bulk copies (cp.async.bulk + mbarrier): a GLU chunk
- * is 256 B of each of 32 gate or up rows (scale words are register-prefetched; bulk copies cost
- * ~10 issue slots each, so they are kept few and large), a DOWN chunk 32 whole rows with scales. Per-lane loads of 64 B row pieces
+ * Weights stream through a per-warp ring of TMA copies (+ mbarrier): a GLU chunk is 256 B of each of
+ * 32 gate or up rows, ONE tensor copy through the slab map the runtime writes ahead of the weight
+ * slab (experts.rs EXPERT_TMAP_BYTES; 32 separate 256 B bulk copies serialized on the SM's TMA unit
+ * and capped GLU near 1.1 TB/s); scale words are register-prefetched. A DOWN chunk is 32 whole rows
+ * with scales (two bulk copies). Per-lane loads of 64 B row pieces
  * (ld or cp.async) cap near 2 TB/s once decode ALU shares the warp; the bulk ring keeps S - 1 chunks
  * in flight while the warp decodes, across unit boundaries.
  * K is PERMUTED, consistently for weights and tokens: in a 128-wide (GLU) / 64-wide (DOWN) sub-chunk
@@ -107,6 +109,12 @@ __device__ __forceinline__ void mbar_wait(uint32_t b, uint32_t parity) {
         asm volatile("{\n.reg .pred p;\nmbarrier.try_wait.parity.shared.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;\n}\n"
                      : "=r"(ok) : "r"(b), "r"(parity) : "memory");
 }
+__device__ __forceinline__ void tma3(uint32_t dst, const void* map, unsigned c0, unsigned c1, unsigned c2, uint32_t bar) {
+    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];\n" ::"r"(dst),
+                 "l"(map), "r"(c0), "r"(c1), "r"(c2), "r"(bar) : "memory");
+}
+/* the slab map (experts.rs EXPERT_TMAP_BYTES ahead of expert 0's gate) */
+constexpr unsigned TMAP_BYTES = 4096;
 __device__ __forceinline__ void bulk(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
     asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" ::"r"(dst), "l"(src), "r"(bytes),
                  "r"(bar) : "memory");
@@ -131,7 +139,9 @@ struct Ring {
 __device__ __forceinline__ Ring ring_open(unsigned char* smem, unsigned E, int S) {
     const unsigned wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
     const uint32_t base = (uint32_t)__cvta_generic_to_shared(smem) + (uint32_t)pfx_bytes(E);
-    Ring r{base + nw * BAR_BYTES + wid * RING_BYTES, base + wid * BAR_BYTES, 0u, 0u};
+    /* tensor copies land 128 B aligned; the arena itself is only 16 B aligned */
+    const uint32_t ring = (base + nw * BAR_BYTES + 127u) & ~127u;
+    Ring r{ring + wid * RING_BYTES, base + wid * BAR_BYTES, 0u, 0u};
     if ((int)(threadIdx.x & 31u) < S) mbar_init(r.bar + (threadIdx.x & 31u) * 8u);
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
     __syncwarp();
@@ -188,11 +198,12 @@ struct GluArgs {
     const unsigned long long *wtab, *stab;
     const int *rowoff, *cnt, *pfx;
     unsigned H, E, ntile, nch, a, b;  /* [a, b): this warp's share of the items * nch chunk stream */
+    const void* tmap;
 };
 struct GluUnit {
-    const uint8_t *w0, *w1, *s0, *s1;  /* gate / up rows f0.. */
+    const uint8_t *s0, *s1;            /* gate / up scale rows f0.. */
     int k0, k1, row0, rend;            /* chunks [k0, k1) of item it */
-    unsigned f0, it;
+    unsigned f0, it, mat;             /* mat: the gate matrix's index in the slab map */
 };
 __device__ __forceinline__ GluUnit glu_unit(const GluArgs& A, unsigned it) {
     GluUnit U;
@@ -200,11 +211,10 @@ __device__ __forceinline__ GluUnit glu_unit(const GluArgs& A, unsigned it) {
     unsigned e, tg;
     group_of(A.pfx, A.E, it / A.ntile, e, tg);
     U.f0 = (it % A.ntile) * 32;
+    U.mat = e * 3;
     U.row0 = A.rowoff[e] + (int)(tg * TOK);
     U.rend = min(A.rowoff[e] + A.cnt[e], U.row0 + (int)TOK);
-    const size_t ldw = A.H / 2, lds = A.H / 32;
-    U.w0 = (const uint8_t*)A.wtab[(size_t)e * 3] + U.f0 * ldw;
-    U.w1 = (const uint8_t*)A.wtab[(size_t)e * 3 + 1] + U.f0 * ldw;
+    const size_t lds = A.H / 32;
     U.s0 = (const uint8_t*)A.stab[(size_t)e * 3] + U.f0 * lds;
     U.s1 = (const uint8_t*)A.stab[(size_t)e * 3 + 1] + U.f0 * lds;
     U.k0 = (int)(max(A.a, it * A.nch) - it * A.nch);
@@ -212,13 +222,13 @@ __device__ __forceinline__ GluUnit glu_unit(const GluArgs& A, unsigned it) {
     return U;
 }
 /* chunk c: 512 k (kr = c / 2) of gate (c even) or up (c odd) rows f0 .. f0 + 31, 256 B each */
-__device__ __forceinline__ void glu_issue(Ring& r, const GluUnit& U, int c, size_t ldw) {
-    const unsigned lane = threadIdx.x & 31u;
+__device__ __forceinline__ void glu_issue(Ring& r, const GluUnit& U, int c, const void* tmap) {
     const uint32_t sl = r.slot(r.issued, GLU_S, GLU_SLOT), b = r.bar_of(r.issued, GLU_S);
     r.issued++;
-    if (lane == 0) mbar_expect(b, GLU_SLOT);
-    __syncwarp();
-    bulk(sl + lane * 256, ((c & 1) ? U.w1 : U.w0) + lane * ldw + (size_t)(c >> 1) * 256, 256, b);
+    if ((threadIdx.x & 31u) == 0) {
+        mbar_expect(b, GLU_SLOT);
+        tma3(sl, tmap, (unsigned)(c >> 1) * 256u, U.f0, U.mat + (unsigned)(c & 1), b);
+    }
 }
 struct GluCursor {
     unsigned it;
@@ -232,7 +242,7 @@ __device__ __forceinline__ void glu_top_up(Ring& r, GluCursor& q, const GluArgs&
             q.U = glu_unit(A, ++q.it);
             q.c = q.U.k0;
         }
-        glu_issue(r, q.U, q.c++, A.H / 2);
+        glu_issue(r, q.U, q.c++, A.tmap);
     }
 }
 /* thread t's token k of k-range kr, sub j: kr*512 + j*128 + t*32 .. +32 (xp includes t*32) */
@@ -254,18 +264,25 @@ __device__ __forceinline__ void glu_scales(uint32_t (&w)[4], const GluUnit& U, i
 #pragma unroll
     for (int i = 0; i < 4; i++) w[i] = __ldg(reinterpret_cast<const uint32_t*>(S + ((i >> 1) * 16 + (i & 1) * 8 + g) * lds + (size_t)(c >> 1) * 16 + t * 4));
 }
-/* one chunk into tiles 2*MAT, 2*MAT + 1. With `next`, sub j's tokens are reloaded for k-range kr + 1
- * as soon as they are paired. */
-template <int MAT>
-__device__ __forceinline__ void glu_chunk(uint32_t sl, uint32_t (&tk)[4][16], const uint32_t (&sw)[4], float (&acc)[4][4],
-                                          const __nv_bfloat16* xp, int kr, bool next) {
+/* one chunk into tiles 2 * mat, 2 * mat + 1 (the pair is swapped through `cur` with selects, so
+ * the mma chain and its order are the unrolled form's). Rolled over the four 128-k subs with this
+ * sub's tokens loaded one ahead: a compact body, since its cold fetch is paid every step. */
+__device__ __forceinline__ void glu_chunk(uint32_t sl, const uint32_t (&sw)[4], float (&acc)[4][4], const __nv_bfloat16* xp, int kr,
+                                          unsigned mat) {
     const unsigned lane = threadIdx.x & 31u, g = lane >> 2, t = lane & 3u;
+    float cur[2][4];
 #pragma unroll
+    for (int q = 0; q < 2; q++)
+#pragma unroll
+        for (int k = 0; k < 4; k++) cur[q][k] = mat ? acc[2 + q][k] : acc[q][k];
+    uint32_t tk[16];
+    glu_tok(tk, xp, kr, 0);
+#pragma unroll 1
     for (int j = 0; j < 4; j++) {
         uint32_t bp[16];
 #pragma unroll
-        for (int i = 0; i < 4; i++) pair_tok(&tk[j][4 * i], &bp[4 * i]);
-        if (MAT == 1 && next) glu_tok(tk[j], xp, kr + 1, j);
+        for (int i = 0; i < 4; i++) pair_tok(&tk[4 * i], &bp[4 * i]);
+        if (j < 3) glu_tok(tk, xp, kr, j + 1);
 #pragma unroll
         for (int q = 0; q < 2; q++) {
             uint32_t ap[2][16];
@@ -282,10 +299,17 @@ __device__ __forceinline__ void glu_chunk(uint32_t sl, uint32_t (&tk)[4][16], co
 #pragma unroll
             for (int st = 0; st < 8; st++) {
                 const uint32_t aa[4] = {ap[0][2 * st], ap[1][2 * st], ap[0][2 * st + 1], ap[1][2 * st + 1]};
-                mma(acc[MAT * 2 + q], aa, bp[2 * st], bp[2 * st + 1]);
+                mma(cur[q], aa, bp[2 * st], bp[2 * st + 1]);
             }
         }
     }
+#pragma unroll
+    for (int q = 0; q < 2; q++)
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            acc[q][k] = mat ? acc[q][k] : cur[q][k];
+            acc[2 + q][k] = mat ? cur[q][k] : acc[2 + q][k];
+        }
 }
 
 struct DownArgs {
@@ -339,7 +363,7 @@ __device__ __forceinline__ void down_top_up(Ring& r, DownCursor& q, const DownAr
 /* Dynamic smem both entry points need (16 B aligned): E prefix ints, an mbarrier block and a bulk ring
  * per warp. */
 __host__ __device__ constexpr size_t moe_decode_v41_smem_bytes(unsigned E, unsigned warps) {
-    return plow_mdv::pfx_bytes(E) + (size_t)warps * (plow_mdv::BAR_BYTES + plow_mdv::RING_BYTES);
+    return plow_mdv::pfx_bytes(E) + (size_t)warps * (plow_mdv::BAR_BYTES + plow_mdv::RING_BYTES) + 128;
 }
 /* GLU split-item partials: floats of scratch and u32 counters, for nblk blocks of `warps` warps */
 __host__ __device__ constexpr size_t moe_glu_decode_v41_scratch_floats(unsigned nblk, unsigned warps) {
@@ -360,7 +384,7 @@ __device__ void d_moe_glu_decode_v41(__nv_bfloat16* fu, const __nv_bfloat16* x, 
     const unsigned n = group_prefix(meta + E, E, pfx) * ntile * nch;
     const unsigned nw = blockDim.x >> 5, gw = slice * nw + (threadIdx.x >> 5), tw = min(nblk * nw, n);
     const unsigned a = gw < tw ? share(gw, n, tw) : n, b = gw < tw ? share(gw + 1, n, tw) : n;
-    const GluArgs A{wtab, stab, meta, meta + E, pfx, H, E, ntile, nch, a, b};
+    const GluArgs A{wtab, stab, meta, meta + E, pfx, H, E, ntile, nch, a, b, (const char*)wtab[0] - TMAP_BYTES};
     const unsigned lane = threadIdx.x & 31u, g = lane >> 2, t = lane & 3u;
     Ring r = ring_open(smem, E, GLU_S);
     GluCursor q{a / nch, 0, {}};
@@ -377,25 +401,19 @@ __device__ void d_moe_glu_decode_v41(__nv_bfloat16* fu, const __nv_bfloat16* x, 
         float acc[4][4];
 #pragma unroll
         for (int i = 0; i < 4; i++) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
-        uint32_t tk[4][16], sw[2][4];
+        uint32_t sw[4];
+        glu_scales(sw, U, U.k0, H / 32);
+#pragma unroll 1
+        for (int c = U.k0; c < U.k1; c++) {
+            uint32_t swn[4];
+            if (c + 1 < U.k1) glu_scales(swn, U, c + 1, H / 32);
+            const uint32_t sl = r.wait(GLU_S, GLU_SLOT);
+            glu_chunk(sl, sw, acc, xp, c >> 1, (unsigned)c & 1u);
+            __syncwarp();
+            r.used++;
+            glu_top_up(r, q, A);
 #pragma unroll
-        for (int j = 0; j < 4; j++) glu_tok(tk[j], xp, U.k0 >> 1, j);
-        if (U.k0 & 1) glu_scales(sw[1], U, U.k0, H / 32);
-        else glu_scales(sw[0], U, U.k0, H / 32);
-        for (int kr = U.k0 >> 1; 2 * kr < U.k1; kr++) {
-#pragma unroll
-            for (int v = 0; v < 2; v++) {
-                const int c = 2 * kr + v;
-                if (c >= U.k0 && c < U.k1) {
-                    if (c + 1 < U.k1) glu_scales(sw[v ^ 1], U, c + 1, H / 32);
-                    const uint32_t sl = r.wait(GLU_S, GLU_SLOT);
-                    if (v == 0) glu_chunk<0>(sl, tk, sw[0], acc, xp, kr, false);
-                    else glu_chunk<1>(sl, tk, sw[1], acc, xp, kr, c + 1 < U.k1);
-                    __syncwarp();
-                    r.used++;
-                    glu_top_up(r, q, A);
-                }
-            }
+            for (int i = 0; i < 4; i++) sw[i] = swn[i];
         }
         if (U.k0 > 0 || U.k1 < (int)nch) {
             /* contributors wf .. wl, in share order; partial slot 0 = a warp's first item, 1 = its last */
@@ -481,29 +499,26 @@ __device__ void d_moe_down_decode_v41(float* part, const __nv_bfloat16* fu, cons
     for (unsigned gi = a / nb; a < b && gi * nb < b; gi++) {
         const DownUnit U = down_unit(A, gi);
         const int p0 = U.row0 + (int)g;
-        uint32_t tb[DOWN_NSUB][8];
-#pragma unroll
-        for (int s = 0; s < DOWN_NSUB; s++)
-#pragma unroll
-            for (int i = 0; i < 2; i++) {
-                if (s < (int)nsub && p0 < U.rend) {
-                    const uint4 v = __ldg(reinterpret_cast<const uint4*>(fu + (size_t)p0 * I + s * 64 + t * 16) + i);
-                    tb[s][4 * i] = v.x, tb[s][4 * i + 1] = v.y, tb[s][4 * i + 2] = v.z, tb[s][4 * i + 3] = v.w;
-                } else {
-                    tb[s][4 * i] = tb[s][4 * i + 1] = tb[s][4 * i + 2] = tb[s][4 * i + 3] = 0u;
-                }
-            }
+        /* thread's token row p0, k = s * 64 + t * 16 .. + 16; rows past the group read row0 (their
+         * output columns are never stored) */
+        const uint4* tp = reinterpret_cast<const uint4*>(fu + (size_t)(p0 < U.rend ? p0 : U.row0) * I + t * 16);
         for (int c = U.c0; c < U.c1; c++) {
             float acc[2][4];
 #pragma unroll
             for (int i = 0; i < 2; i++) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
             const uint32_t sl = r.wait(DOWN_S, 17 * I);
-#pragma unroll
-            for (int s = 0; s < DOWN_NSUB; s++) {
-                if (s >= (int)nsub) break;
+            /* rolled over the I / 64 sub-blocks: a compact body (cold code is paid every step) */
+            uint4 n0 = tp[0], n1 = tp[1];
+#pragma unroll 1
+            for (unsigned s = 0; s < nsub; s++) {
+                const uint32_t tb[8] = {n0.x, n0.y, n0.z, n0.w, n1.x, n1.y, n1.z, n1.w};
+                if (s + 1 < nsub) {
+                    n0 = tp[(s + 1) * 8];
+                    n1 = tp[(s + 1) * 8 + 1];
+                }
                 uint32_t bp[8];
-                pair_tok(&tb[s][0], &bp[0]);
-                pair_tok(&tb[s][4], &bp[4]);
+                pair_tok(&tb[0], &bp[0]);
+                pair_tok(&tb[4], &bp[4]);
 #pragma unroll
                 for (int qq = 0; qq < 2; qq++) {
                     uint32_t ap[2][8];

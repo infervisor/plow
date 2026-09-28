@@ -17,13 +17,20 @@ pub(crate) fn binds(name: &str) -> bool {
     name.ends_with("expert_weight_table") || name.ends_with("expert_scale_table")
 }
 
+/// Bytes ahead of the weight slab's first matrix: a `CUtensorMap` over the slab as
+/// `[E * 3][I][H / 2]` bytes (gate / up rows, box `[1][32][256]`) that the sm_90a decode MoE GLU
+/// streams with one TMA copy per chunk (`op_moe_decode_v41.cuh`, `wtab[0] - EXPERT_TMAP_BYTES`).
+pub(crate) const EXPERT_TMAP_BYTES: u64 = 4096;
+
 /// Fills every plain expert table pair in `blob`. Returns the slabs, which must outlive the engine.
+/// `tmap(base, dims, strides, box)` encodes a rank-3 byte tensor map.
 pub(crate) fn bind_packed_experts(
     blob: &DevBlob,
     ckpt: &Checkpoint,
     devp: &[DeviceMem],
     alloc: impl Fn(u64) -> Result<DeviceMem>,
     upload: impl Fn(&DeviceMem, u64, &[u8]) -> Result<()>,
+    tmap: impl Fn(u64, [u64; 3], [u64; 2], [u32; 3]) -> Result<[u8; 128]>,
     rank: u32,
     n_gpu: u32,
 ) -> Result<Vec<DeviceMem>> {
@@ -66,8 +73,15 @@ pub(crate) fn bind_packed_experts(
         }
         let w_stride = slice(&probe)?.len() as u64;
         let s_stride = slice(&en.scale_of(0, 0, false))?.len() as u64;
-        let d_w = alloc(n_exp as u64 * 3 * w_stride)?;
+        let d_w = alloc(EXPERT_TMAP_BYTES + n_exp as u64 * 3 * w_stride)?;
         let d_s = alloc(n_exp as u64 * 3 * s_stride)?;
+        let w_base = d_w.base + EXPERT_TMAP_BYTES;
+        let rows = (shape0[0] as u64) / n_gpu as u64;
+        let row_bytes = w_stride / rows;
+        if shape0.len() == 2 && rows * row_bytes == w_stride && row_bytes % 256 == 0 {
+            let m = tmap(w_base, [row_bytes, rows, n_exp as u64 * 3], [row_bytes, w_stride], [256, 32, 1])?;
+            upload(&d_w, 0, &m)?;
+        }
         for e in 0..n_exp {
             for j in 0..3 {
                 for (name, dst, stride) in [(en.weight_of(e, j, false), &d_w, w_stride), (en.scale_of(e, j, false), &d_s, s_stride)] {
@@ -75,11 +89,12 @@ pub(crate) fn bind_packed_experts(
                     if bytes.len() as u64 != stride {
                         return Err(RuntimeError::Device(format!("{name}: {} B, expert 0's is {stride} B", bytes.len())));
                     }
-                    upload(dst, (e as u64 * 3 + j as u64) * stride, &bytes)?;
+                    let off = if std::ptr::eq(dst, &d_w) { EXPERT_TMAP_BYTES } else { 0 };
+                    upload(dst, off + (e as u64 * 3 + j as u64) * stride, &bytes)?;
                 }
             }
         }
-        let wtab = packed_expert_table(d_w.base, w_stride, n_exp, 0..n_exp);
+        let wtab = packed_expert_table(w_base, w_stride, n_exp, 0..n_exp);
         let stab = packed_expert_table(d_s.base, s_stride, n_exp, 0..n_exp);
         upload(&devp[i_ewt], 0, bytemuck::cast_slice(&wtab))?;
         upload(&devp[i_est], 0, bytemuck::cast_slice(&stab))?;
