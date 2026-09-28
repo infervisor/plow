@@ -10593,9 +10593,20 @@ impl GpuEngine {
         Ok(Some(lo.chunks(8).zip(hi.chunks(8)).map(|(l, h)| (!u(l), u(h))).collect()))
     }
 
+    /// Per (inst, block) `[claim, gate pass, body end]` globaltimer ns, `[3][128][256]`
+    /// (`-DPLOW_NV_TRACE=1`); `None` on a normal cubin.
+    pub fn trace_block_spans(&self) -> Result<Option<Vec<u64>>> {
+        let mut b = Vec::new();
+        if !self.be.module_global_bytes(&self.module, "g_bk", 3 * 128 * 256 * 8, &mut b)? {
+            return Ok(None);
+        }
+        Ok(Some(b.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()))
+    }
+
     pub fn trace_spans_reset(&self) -> Result<()> {
         self.be.module_global_zero(&self.module, "g_sp_lo", 8192)?;
         self.be.module_global_zero(&self.module, "g_sp_hi", 8192)?;
+        self.be.module_global_zero(&self.module, "g_bk", 3 * 128 * 256 * 8)?;
         Ok(())
     }
 

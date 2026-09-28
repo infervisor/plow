@@ -427,6 +427,11 @@ __device__ unsigned long long g_tr_sig[PLOW_TRACE_MAX];
 #define PLOW_SPAN_MAX 1024
 __device__ unsigned long long g_sp_lo[PLOW_SPAN_MAX];
 __device__ unsigned long long g_sp_hi[PLOW_SPAN_MAX];
+/* Per (inst, block) [claim | gate pass | body end] for the first PLOW_BK_INSTS insts: separates a
+ * slow body from a staggered start. A block keeps its first claim/gate and its last end. */
+#define PLOW_BK_INSTS 128
+#define PLOW_BK_BLOCKS 256
+__device__ unsigned long long g_bk[3][PLOW_BK_INSTS][PLOW_BK_BLOCKS];
 __device__ __forceinline__ unsigned long long plow_gtimer() {
     unsigned long long t;
     asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
@@ -3417,6 +3422,8 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         const bool tr = (blockIdx.x == 0 && threadIdx.x == 0 && g_tr_n < PLOW_TRACE_MAX);
         long long t_gate0 = 0, t_gate1 = 0, t_body1 = 0;
         if (tr) t_gate0 = clock64();
+        const bool bk = threadIdx.x == 0 && e.inst < PLOW_BK_INSTS && blockIdx.x < PLOW_BK_BLOCKS;
+        if (bk && !g_bk[0][e.inst][blockIdx.x]) g_bk[0][e.inst][blockIdx.x] = plow_gtimer();
 #endif
         /* Gate: one thread per counter, polled concurrently. */
         for (unsigned w = threadIdx.x; w < wait_len; w += blockDim.x) {
@@ -3435,6 +3442,7 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #if PLOW_NV_TRACE
         if (tr) t_gate1 = clock64();
         if (threadIdx.x == 0 && e.inst < PLOW_SPAN_MAX) atomicMax(&g_sp_lo[e.inst], ~plow_gtimer());
+        if (bk && !g_bk[1][e.inst][blockIdx.x]) g_bk[1][e.inst][blockIdx.x] = plow_gtimer();
 #endif
 
 #if PLOW_NV_PTXSYNC == 1 || PLOW_NV_PTXSYNC == 3
@@ -3492,6 +3500,7 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #if PLOW_NV_TRACE
         if (tr) t_body1 = clock64();
         if (threadIdx.x == 0 && e.inst < PLOW_SPAN_MAX) atomicMax(&g_sp_hi[e.inst], plow_gtimer());
+        if (bk) g_bk[2][e.inst][blockIdx.x] = plow_gtimer();
 #endif
 
 #if PLOW_NV_PTXSYNC != 1 && PLOW_NV_PTXSYNC != 3
