@@ -1191,8 +1191,11 @@ def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[li
         return steps, [f"{q(py)} {sc('scripts/tts/asr_check.py')} {d}/gate*.wav --texts {d}/texts.json --max-cer 1{whisper} "
                        f"> {d}/asr.txt 2>{d}/asr.log"]
     if kind == "s3gen_rel_l2":
+        runner = g.get("runner") or os.environ.get("CARGO_TARGET_DIR", str(REPO / "target")) + "/release/examples/packet_run"
+        if not Path(runner).exists():
+            die(f"{runner} missing: cargo build --release -p plowrt --features cuda --example packet_run")
         return [], [f"{q(py)} {sc('scripts/tts/s3gen_packet_check.py')} --packet {q(str(assets / 's3gen.pkt'))} "
-                    f"--runner {q(g.get('runner') or os.environ.get('CARGO_TARGET_DIR', str(REPO / 'target')) + '/release/examples/packet_run')} "
+                    f"--runner {q(runner)} "
                     f"--out {d} --skip-cer {args} "
                     f"> {d}/check.log 2>&1"]
     die(f"unknown gate kind {kind}")
@@ -1282,7 +1285,11 @@ def cmd_gate(a: argparse.Namespace) -> None:
             (out / k).mkdir(exist_ok=True)
             py = x(cfg[k].get("python") or gates.get("python") or "python3")
             s1, s2 = gate_steps(k, cfg[k], py, out, assets)
-            tag = lambda step: f"{step} || echo 'GATE_STEP_FAIL {k}'"
+            # Like [[prep]].env: a gate's interpreter may need its own environment (CBX_PY must not
+            # see the host PYTHONPATH's packages built for another Python).
+            genv = " ".join(f"{q}={shlex.quote(x(v))}" for q, v in cfg[k].get("env", {}).items())
+            pre = f"env {genv} " if genv else ""
+            tag = lambda step: f"{pre}{step} || echo 'GATE_STEP_FAIL {k}'"
             up += [tag(s) for s in s1]
             down += [tag(s) for s in s2]
         if up:

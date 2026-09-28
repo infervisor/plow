@@ -85,6 +85,7 @@ cer_median_max = 0.05
 cer_lang_max = 0.2
 [gates.s3gen_rel_l2]
 python = "{env:CBX_PY}"
+env = { PYTHONPATH = "" }
 args = ["--s3gen-weights", "s3gen_v3.safetensors"]
 rel_l2_max = 1e-3
 timeout_s = 1800

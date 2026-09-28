@@ -88,5 +88,6 @@ arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice default"
 cer_median_max = 0.05
 [gates.s3gen_rel_l2]
 python = "{env:CBX_PY}"
+env = { PYTHONPATH = "" }
 rel_l2_max = 1e-3
 timeout_s = 1800
