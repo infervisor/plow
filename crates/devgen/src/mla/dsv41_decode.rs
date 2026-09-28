@@ -10,6 +10,14 @@ use super::*;
 use std::collections::BTreeMap;
 
 /// The compressed ratio of layer `l`, 0 for a window-only layer.
+/// The first CUs covering `threads` work items at 256 per block. A decode op whose work fits a few
+/// blocks otherwise hands out ~130 slices that are almost all empty, and every block that claims one
+/// waits on this op's gate instead of claiming independent work further down the queue. The kernels
+/// below all stride their work by (slice, nblk), so fewer slices partition it identically.
+fn few_cus(cus: &[u32], threads: u32) -> Vec<u32> {
+    cus[..(threads.div_ceil(256).max(1) as usize).min(cus.len())].to_vec()
+}
+
 pub(crate) fn dsv41_ratio(c: &Dsv41Cfg, l: u32) -> u32 {
     match c.raw.attn_kind(l) {
         nn_graph::models::config::V41Attn::Window => 0,
@@ -169,7 +177,7 @@ pub(crate) fn emit_dsv41_attn_decode(
     let ratio = dsv41_ratio(c, l);
 
     // q: interior rope at pos[row], in place (rows are slots).
-    let c_q = b.emit(DevOp::QwenHeadNormRope, all.clone(), deps, |d| {
+    let c_q = b.emit(DevOp::QwenHeadNormRope, few_cus(cus, bsz * nh_l * rope / 8), deps, |d| {
         d.t[0] = proj.q;
         d.t[1] = proj.q;
         d.t[2] = TENSOR_NONE;
@@ -186,7 +194,7 @@ pub(crate) fn emit_dsv41_attn_decode(
         d.i[7] = nope;
     });
     // kv: rope + fp8 fake quant straight into ring row pos % W (`_window_kv`, decode branch).
-    let c_ring = b.emit(DevOp::CompressRopeQuant, all.clone(), deps, |d| {
+    let c_ring = b.emit(DevOp::CompressRopeQuant, few_cus(cus, bsz * hd / 4), deps, |d| {
         d.t[0] = st.win[&l];
         d.t[1] = proj.kv;
         d.t[2] = cos;
@@ -219,7 +227,7 @@ pub(crate) fn emit_dsv41_attn_decode(
                 d.i[1] = hd;
                 d.i[2] = c.hidden;
             });
-            b.emit(DevOp::RmsNorm, all.clone(), &[c_kv], |d| {
+            b.emit(DevOp::RmsNorm, few_cus(cus, bsz * 256), &[c_kv], |d| {
                 d.t[0] = cp.latent;
                 d.t[1] = cp.kv;
                 d.t[2] = w.get(l, "attn.compressor.norm.weight");
@@ -244,7 +252,7 @@ pub(crate) fn emit_dsv41_attn_decode(
             let c_kv = f32_gemm(b, cp.kv, w.get(l, "attn.compressor.wkv.weight"), "ckv");
             let c_gt = f32_gemm(b, cp.gate, w.get(l, "attn.compressor.wgate.weight"), "cgate");
             let (sk, ss) = st.cst[&l];
-            b.emit(DevOp::CompressDecodeStep, all.clone(), &[c_kv, c_gt], |d| {
+            b.emit(DevOp::CompressDecodeStep, few_cus(cus, bsz * 256), &[c_kv, c_gt], |d| {
                 d.t[0] = cp.latent;
                 d.t[1] = sk;
                 d.t[2] = ss;
@@ -262,7 +270,7 @@ pub(crate) fn emit_dsv41_attn_decode(
         let ix = ix.expect("kv_source layers are index sources");
         let (di, hdi) = (c.index_dim, c.head_dim);
         let op = crate::pick_tile(bsz, di, hdi, b.n_cu(), kernelcaps::QuantScheme::None);
-        let c_k = b.emit(op, all.clone(), &[c_lat], |d| {
+        let c_k = b.emit(op, few_cus(cus, di.div_ceil(8) * 256), &[c_lat], |d| {
             d.t[0] = ix.k;
             d.t[1] = cp.latent;
             d.t[2] = w.get(l, "attn.indexer.wk.weight");
@@ -270,7 +278,7 @@ pub(crate) fn emit_dsv41_attn_decode(
             d.i[1] = di;
             d.i[2] = hdi;
         });
-        let c_kn = b.emit(DevOp::RmsNorm, all.clone(), &[c_k], |d| {
+        let c_kn = b.emit(DevOp::RmsNorm, few_cus(cus, bsz * 256), &[c_k], |d| {
             d.t[0] = ix.kn;
             d.t[1] = ix.k;
             d.t[2] = w.get(l, "attn.indexer.k_norm.weight");
@@ -279,7 +287,7 @@ pub(crate) fn emit_dsv41_attn_decode(
             d.f[0] = c.eps;
         });
         let append = |b: &mut Builder, out: u32, src: u32, d_: u32, qblk: u32, qmode: u32, dep: u32| {
-            b.emit(DevOp::CompressRopeQuant, all.clone(), &[dep], |d| {
+            b.emit(DevOp::CompressRopeQuant, few_cus(cus, bsz * d_ / 4), &[dep], |d| {
                 d.t[0] = out;
                 d.t[1] = src;
                 d.t[2] = cos;
@@ -309,7 +317,7 @@ pub(crate) fn emit_dsv41_attn_decode(
         let c_q = crate::mla::emit_pf_gemm_fp8_mx(
             b, cus, ix.q, proj.q_an, w.get(l, "attn.indexer.wq_b.weight"), w.get(l, "attn.indexer.wq_b.scale"), bsz, hi * di, c.q_lora, deps,
         );
-        let c_qr = b.emit(DevOp::CompressRopeQuant, all.clone(), &[c_q], |d| {
+        let c_qr = b.emit(DevOp::CompressRopeQuant, few_cus(cus, bsz * hi * di / 4), &[c_q], |d| {
             d.t[0] = ix.qr;
             d.t[1] = ix.q;
             d.t[2] = cos;
@@ -327,7 +335,7 @@ pub(crate) fn emit_dsv41_attn_decode(
             d.j[1] = 1u32 << 31;
         });
         let op = crate::pick_tile(bsz, hi, c.hidden, b.n_cu(), kernelcaps::QuantScheme::None);
-        let c_w = b.emit(op, all.clone(), deps, |d| {
+        let c_w = b.emit(op, few_cus(cus, hi.div_ceil(8) * 256), deps, |d| {
             d.t[0] = ix.w;
             d.t[1] = proj.xn;
             d.t[2] = w.get(l, "attn.indexer.weights_proj.weight");
@@ -350,7 +358,7 @@ pub(crate) fn emit_dsv41_attn_decode(
             d.i[3] = ratio;
             d.f[0] = (di as f32).powf(-0.5) * (hi as f32).powf(-0.5);
         });
-        attn_deps.push(b.emit(DevOp::IndexSelectDecode, all.clone(), &[c_sc], |d| {
+        attn_deps.push(b.emit(DevOp::IndexSelectDecode, few_cus(cus, bsz * 256), &[c_sc], |d| {
             d.t[0] = da.idx;
             d.t[1] = da.score;
             d.t[2] = pos;
@@ -384,7 +392,7 @@ pub(crate) fn emit_dsv41_attn_decode(
         d.f[0] = 1.0 / (hd as f32).sqrt();
     });
     let c_at = if da.nsplit > 1 {
-        b.emit(DevOp::SparseAttnMerge, all.clone(), &[c_at], |d| {
+        b.emit(DevOp::SparseAttnMerge, few_cus(cus, bsz * nh_l * 4 * 32), &[c_at], |d| {
             d.t[0] = attn_o;
             d.t[1] = da.attn_part;
             d.t[2] = sink;
@@ -396,7 +404,7 @@ pub(crate) fn emit_dsv41_attn_decode(
         c_at
     };
     // `apply_rotary_emb(o[..., -rd:], freqs_cis, True)` at each slot's own position.
-    b.emit(DevOp::RopeInverseO, all.clone(), &[c_at], |d| {
+    b.emit(DevOp::RopeInverseO, few_cus(cus, bsz * nh_l * rope / 2), &[c_at], |d| {
         d.t[0] = attn_o;
         d.t[1] = cos;
         d.t[2] = sin;
