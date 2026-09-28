@@ -223,6 +223,59 @@ int main(int argc, char** argv) {
 #else
     const float t_old = timeit(run_old), t_v3 = timeit(run_v3);
 #endif
+    /* Layer-like timing: a graph of back-to-back launches over rotating K/V copies (> L2 in
+     * total, no eviction kernel, no host launch cost), as fa_decode_bench.cu times decode. */
+    float t_v3g = 0.0f;
+    {
+        const size_t kvb = kvn * 2;
+        const int nrot = (int)std::max<size_t>(2, std::min<size_t>(16, (256ull << 20) / (2 * kvb) + 1));
+        std::vector<const void*> rmaps(nrot);
+        std::vector<void*> keep;
+        for (int i = 0; i < nrot; i++) {
+            bf16 *k2 = dk, *v2 = dv;
+            if (i) {
+                CK(cudaMalloc(&k2, kvb)); CK(cudaMalloc(&v2, kvb));
+                CK(cudaMemcpy(k2, dk, kvb, cudaMemcpyDeviceToDevice));
+                CK(cudaMemcpy(v2, dv, kvb, cudaMemcpyDeviceToDevice));
+                keep.push_back(k2); keep.push_back(v2);
+            }
+            std::vector<CUtensorMap> b2(2 * nreq);
+            for (unsigned sl = 0; sl < nreq; sl++) {
+                const uint64_t dims[]{HD, g.stride, KVH};
+                const uint64_t strides[]{HD * 2ull, (uint64_t)HD * g.stride * 2ull};
+                const uint32_t box[]{64, FA3_BOX, 1}, steps[]{1, 1, 1};
+                for (int op = 0; op < 2; op++) {
+                    void* base = (char*)(op ? (void*)v2 : (void*)k2) + (size_t)sl * KVH * g.stride * HD * 2;
+                    CD(cuTensorMapEncodeTiled(&b2[2 * sl + op], CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, base, dims,
+                                              strides, box, steps, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                              CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                                              CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+                }
+            }
+            CUtensorMap* db2 = up(b2);
+            std::vector<uint64_t> t2(nreq);
+            for (unsigned sl = 0; sl < nreq; sl++) t2[sl] = (uint64_t)(db2 + 2 * sl);
+            uint64_t* dt2 = up(t2);
+            rmaps[i] = nreq > 1 ? (const void*)dt2 : (const void*)db2;
+        }
+        cudaStream_t st; CK(cudaStreamCreate(&st));
+        cudaGraph_t gr; cudaGraphExec_t ge;
+        CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
+        for (int it = 0; it < 4; it++)
+            for (int i = 0; i < nrot; i++)
+                k_v3<<<grid, 256, sm_v3, st>>>(gk, dreq, dq, o_v3, kv_arg, rmaps[i]);
+        CK(cudaStreamEndCapture(st, &gr));
+        CK(cudaGraphInstantiate(&ge, gr, 0));
+        CK(cudaGraphLaunch(ge, st)); CK(cudaStreamSynchronize(st));
+        std::vector<float> ts;
+        for (int rep = 0; rep < 5; rep++) {
+            CK(cudaEventRecord(e0, st)); CK(cudaGraphLaunch(ge, st)); CK(cudaEventRecord(e1, st));
+            CK(cudaEventSynchronize(e1));
+            float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); ts.push_back(ms * 1000 / (4 * nrot));
+        }
+        std::sort(ts.begin(), ts.end());
+        t_v3g = ts[ts.size() / 2];
+    }
     double flops = 0;
     for (unsigned r = 0; r < qlen; r++) {
         const unsigned qabs = kvlen - qlen + r;
@@ -230,6 +283,7 @@ int main(int argc, char** argv) {
         flops += 4.0 * n * HD * H;
     }
     flops *= nreq;
+    std::printf("v3g %.1f us | ", t_v3g);
     std::printf("hd%d rows %u kv %u nreq %u H %u/%u | old %.1f us (%.0f TF/s) relL2 %.2e regs %d lmem %zu | "
                 "v3 %.1f us (%.0f TF/s) relL2 %.2e regs %d lmem %zu nonfinite %zu | x%.2f %s\n",
                 HD, rows, kvlen, nreq, H, KVH, t_old, flops / t_old * 1e-6, worst[0], a_old.numRegs,

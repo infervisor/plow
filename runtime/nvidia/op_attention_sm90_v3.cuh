@@ -24,6 +24,14 @@
 #define FA3_BOX 32
 #endif
 
+/* GQA-packed short requests: a request whose gqa x qlen rows fit one 64-row block (a decode row
+ * riding a packed prefill launch, a short session suffix) is one item per KV head, its rows
+ * m = g * qlen + r stacked over the group's heads, instead of one item per query head that
+ * each stream the whole KV. At hd256 the two warpgroups take alternate KV tiles of that block
+ * and fold their (m, l, O) through smem at the end. */
+#ifndef PLOW_NV_FA_V3_PACK
+#define PLOW_NV_FA_V3_PACK 0
+#endif
 #ifndef FA3_INLINE
 #define FA3_INLINE __forceinline__
 #endif
@@ -126,14 +134,20 @@ __device__ FA3_INLINE void d_flash_prefill_sm90_v3(
     const unsigned gqa = n_head / n_kv_head;
     const float lscale = FA_SCALE(scale);
 
+    /* Items of a request: one per KV head when GQA-packed, else (query tile, head). */
+    auto req_items = [&](unsigned qlen) -> unsigned {
+        if (qlen == 0) return 0u;
+        if (PLOW_NV_FA_V3_PACK && qlen * gqa <= 64u) return n_kv_head;
+        return ((qlen + ROWS - 1) / ROWS) * n_head;
+    };
     unsigned n_work = 0;
     if (req) {
         for (int r = 0; r < req[0]; r++) {
             const int qlen = req[2 + 4 * r];
-            if (qlen > 0) n_work += (unsigned)((qlen + ROWS - 1) / ROWS) * n_head;
+            if (qlen > 0) n_work += req_items((unsigned)qlen);
         }
     } else {
-        n_work = ((seq_q + ROWS - 1) / ROWS) * n_head;
+        n_work = req_items(seq_q);
     }
 
     /* Snake over rounds + heaviest query tile first inside a request: causal items grow with
@@ -150,8 +164,7 @@ __device__ FA3_INLINE void d_flash_prefill_sm90_v3(
                 int r = 0, qlen;
                 for (;;) {
                     qlen = req[2 + 4 * r];
-                    const unsigned nw_r =
-                        qlen > 0 ? (unsigned)((qlen + ROWS - 1) / ROWS) * n_head : 0u;
+                    const unsigned nw_r = qlen > 0 ? req_items((unsigned)qlen) : 0u;
                     if (rem < nw_r) break;
                     rem -= nw_r;
                     r++;
@@ -163,17 +176,24 @@ __device__ FA3_INLINE void d_flash_prefill_sm90_v3(
                 qoff = (size_t)rq0 * n_head * HD;
                 map = (const void*)((const uint64_t*)mapkv)[slot];
             }
-            const unsigned ntq = (sq + ROWS - 1) / ROWS;
-            h = rem % n_head;
-            q0 = (ntq - 1u - rem / n_head) * ROWS;
+            if (PLOW_NV_FA_V3_PACK && sq * gqa <= 64u) {
+                h = rem * gqa; /* first head of the group */
+                q0 = 0;
+            } else {
+                const unsigned ntq = (sq + ROWS - 1) / ROWS;
+                h = rem % n_head;
+                q0 = (ntq - 1u - rem / n_head) * ROWS;
+            }
         }
         const unsigned hkv = h / gqa;
+        /* packed: block row m is head h + m / sq, query row m % sq */
+        const bool pk = PLOW_NV_FA_V3_PACK && sq * gqa <= 64u;
         const unsigned hi = skv;
 
         /* KV tile range: union over the item's rows (window floor of the oldest row, causal cap
          * of the newest). */
         const long item_lo_q = (long)qp0 + q0;
-        const long item_hi_q = item_lo_q + ROWS - 1;
+        const long item_hi_q = pk ? item_lo_q + (long)sq - 1 : item_lo_q + ROWS - 1;
         unsigned eff_lo = 0;
         if (window) {
             const long wfloor = item_lo_q - (long)window + 1;
@@ -228,9 +248,14 @@ __device__ FA3_INLINE void d_flash_prefill_sm90_v3(
             const __nv_bfloat16* Qh = Q + qoff + (size_t)h * HD + col0;
             for (int i = lt; i < 64 * NSUB_W * 8; i += 128) {
                 const int c = i & 7, sub = (i >> 3) & (NSUB_W - 1), r = i >> 5;
-                const bool in = row0 + (unsigned)r < sq;
+                unsigned qr = row0 + (unsigned)r, hg = 0;
+                if (pk) {
+                    qr = (unsigned)r % sq;
+                    hg = (unsigned)r / sq;
+                }
+                const bool in = pk ? hg < gqa : qr < sq;
                 sm90_cp16(Qs + sub * QT + sm90_swz_off<64, 8>(r, c),
-                          Qh + (in ? (size_t)(row0 + r) * n_head * HD + sub * 64 + c * 8 : 0),
+                          Qh + (in ? ((size_t)qr * n_head + hg) * HD + sub * 64 + c * 8 : 0),
                           in ? 16 : 0);
             }
             sm90_cp_commit();
@@ -239,9 +264,12 @@ __device__ FA3_INLINE void d_flash_prefill_sm90_v3(
             fa90_wg_bar(wg);
         }
 
-        const long wq_lo = item_lo_q + (SPLIT ? 0 : 64 * wg); /* this wg's oldest row */
-        const long wq_hi = wq_lo + 63;
-        const int qabsA = (int)wq_lo + rA, qabsB = (int)wq_lo + rB;
+        const long wq_lo = item_lo_q + (SPLIT || pk ? 0 : 64 * wg); /* this wg's oldest row */
+        const long wq_hi = pk ? item_hi_q : wq_lo + 63;
+        const int qabsA = pk ? (int)item_lo_q + rA % (int)sq : (int)wq_lo + rA;
+        const int qabsB = pk ? (int)item_lo_q + rB % (int)sq : (int)wq_lo + rB;
+        /* hd256 packed: the warpgroups split the KV tiles (wg w takes t % 2 == w). */
+        const bool kvsplit = !SPLIT && pk;
 
         /* This wg's compute tiles [tb, te]: tiles wholly below its window or above its causal
          * cap are skipped (only the non-split layout has any). */
@@ -429,6 +457,13 @@ __device__ FA3_INLINE void d_flash_prefill_sm90_v3(
          * other's softmax and MMAs, and the pipelined form measured no faster while needing 255
          * registers (it spills inside the interpreter). */
         for (int t = tb; t <= te; t++) {
+            if (kvsplit && (t & 1) != wg) {
+                wait_full(0, t);
+                wait_full(1, t);
+                release(0, t);
+                release(1, t);
+                continue;
+            }
             float S[NS0];
             wait_full(0, t);
             qk_issue(t, S);
@@ -452,20 +487,64 @@ __device__ FA3_INLINE void d_flash_prefill_sm90_v3(
             release(1, t);
         }
 
+        if (kvsplit) {
+            /* Fold wg 1's partial state into wg 0 through the (drained) K/V rings. */
+            float* X = (float*)Ks + (size_t)lt * (4 + NSUB_W * 32);
+            fa3_bar(3, 256); /* both warpgroups are past their last reads of the rings */
+            if (wg == 1) {
+                X[0] = mA; X[1] = lA; X[2] = mB; X[3] = lB;
+#pragma unroll
+                for (int nt = 0; nt < NSUB_W; nt++)
+#pragma unroll
+                    for (int i = 0; i < 32; i++) X[4 + nt * 32 + i] = Oacc[nt][i];
+                fa90_async_proxy_fence();
+            }
+            fa3_bar(3, 256);
+            if (wg == 0) {
+                const float MA = fmaxf(mA, X[0]), MB = fmaxf(mB, X[2]);
+                const float a0 = mA == FA_NEG_INF ? 0.0f : FA_EXP(mA - MA);
+                const float a1 = X[0] == FA_NEG_INF ? 0.0f : FA_EXP(X[0] - MA);
+                const float b0 = mB == FA_NEG_INF ? 0.0f : FA_EXP(mB - MB);
+                const float b1 = X[2] == FA_NEG_INF ? 0.0f : FA_EXP(X[2] - MB);
+                lA = lA * a0 + X[1] * a1;
+                lB = lB * b0 + X[3] * b1;
+#pragma unroll
+                for (int nt = 0; nt < NSUB_W; nt++)
+#pragma unroll
+                    for (int nb = 0; nb < 8; nb++)
+#pragma unroll
+                        for (int e = 0; e < 2; e++) {
+                            Oacc[nt][4 * nb + e] =
+                                Oacc[nt][4 * nb + e] * a0 + X[4 + nt * 32 + 4 * nb + e] * a1;
+                            Oacc[nt][4 * nb + 2 + e] =
+                                Oacc[nt][4 * nb + 2 + e] * b0 + X[4 + nt * 32 + 4 * nb + 2 + e] * b1;
+                        }
+            }
+        }
         const float iA = lA > 0.0f ? 1.0f / lA : 0.0f;
         const float iB = lB > 0.0f ? 1.0f / lB : 0.0f;
-        const unsigned raA = q0 + (SPLIT ? 0u : 64u * (unsigned)wg) + (unsigned)rA;
-        const unsigned raB = raA + 8u;
+        /* Output rows of this lane: (query row, head) for rA and rB. */
+        unsigned raA = q0 + (SPLIT ? 0u : 64u * (unsigned)wg) + (unsigned)rA, raB = raA + 8u;
+        unsigned hA = h, hB = h;
+        bool okA = raA < sq, okB = raB < sq;
+        if (pk) {
+            hA = h + (unsigned)rA / sq;
+            hB = h + (unsigned)rB / sq;
+            okA = (unsigned)rA < gqa * sq && !(kvsplit && wg == 1);
+            okB = (unsigned)rB < gqa * sq && !(kvsplit && wg == 1);
+            raA = (unsigned)rA % sq;
+            raB = (unsigned)rB % sq;
+        }
 #pragma unroll
         for (int nt = 0; nt < NSUB_W; nt++)
 #pragma unroll
             for (int nb = 0; nb < 8; nb++) {
                 const int col = (SPLIT ? 256 * wg : 0) + nt * 64 + 8 * nb + 2 * (lane & 3);
-                if (raA < sq)
-                    *(__nv_bfloat162*)(O + qoff + ((size_t)raA * n_head + h) * HD + col) =
+                if (okA)
+                    *(__nv_bfloat162*)(O + qoff + ((size_t)raA * n_head + hA) * HD + col) =
                         __floats2bfloat162_rn(Oacc[nt][4 * nb] * iA, Oacc[nt][4 * nb + 1] * iA);
-                if (raB < sq)
-                    *(__nv_bfloat162*)(O + qoff + ((size_t)raB * n_head + h) * HD + col) =
+                if (okB)
+                    *(__nv_bfloat162*)(O + qoff + ((size_t)raB * n_head + hB) * HD + col) =
                         __floats2bfloat162_rn(Oacc[nt][4 * nb + 2] * iB,
                                               Oacc[nt][4 * nb + 3] * iB);
             }

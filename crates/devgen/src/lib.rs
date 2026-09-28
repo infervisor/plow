@@ -212,12 +212,16 @@ pub(crate) fn odd_group_gf(gqa: u32) -> u32 {
 /// the last-arriving split otherwise, through the `mrgc` counters. Per packet, not per rung: the
 /// decode ladder requires every rung's instruction list to match.
 pub(crate) fn nv_decode_merge_fold(c: &Cfg, fp8_kv: bool) -> bool {
+    // hd256/512 ride the row-group body only on the E-series objects (manifest `fa_rg_wide`).
+    let wide = emit_config::active().nv_fa_fold_wide
+        && c.ple > 0
+        && matches!(c.hd_full, 256 | 512)
+        && matches!(c.hd_slide, 256 | 512);
     !emit_is_amd()
         && !emit_is_apple()
         && c.tp == 1
         && !fp8_kv
-        && c.hd_full == 128
-        && c.hd_slide == 128
+        && ((c.hd_full == 128 && c.hd_slide == 128) || wide)
         && c.kvh_full == c.kvh_slide
         && c.kvh_full > 0
         && c.heads % c.kvh_full == 0
@@ -4841,8 +4845,16 @@ fn emit_phase(
         // Row-group flash + merge fold (nv_decode_merge_fold): about one work item per SM, at
         // most 8 splits. H100 Veena ctx 1024 measured best at ns 6-8/8/4/2/1 for B=1/2/4/8/16.
         let nv_fold = gemv_family && !amd && n.mrgc != TENSOR_NONE;
+        // hd256/512 (E4B h100, standalone fold sweep, B=1..32): the fold tail merges up to 33
+        // splits for less than a split's KV costs; best at one wave, 16 splits of a 512-row
+        // window, 33 of a full layer (hd512 B=1 ctx 4096 ns 8/16/33: 43.8/26.7/20.0 us).
+        let ns_cap = match hd {
+            256 | 512 if win > 0 => 16,
+            256 | 512 => 33,
+            _ => 8,
+        };
         let ns = if nv_fold {
-            (n_cu / (t * (heads / gf))).clamp(1, 8)
+            (n_cu / (t * (heads / gf))).clamp(1, ns_cap)
         } else {
             ns
         };

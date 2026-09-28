@@ -1108,6 +1108,11 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         if k8_ple && !k8_small_hd {
             t.insert("fa_rg_wide".into(), json!(1));
         }
+        // * `fa_rgm`: hd128 row-group flash decode on the mma.sync item fed by per-warp bulk-copy
+        //   rings (PLOW_NV_FA_RGM).
+        if k8_small_hd && s.hd.contains(&128) && crate::emit_config::active().nv_fa_mma_hd128 {
+            t.insert("fa_rgm".into(), json!(1));
+        }
         if t.contains_key("gemv_k8") && k8_small_hd {
             // * `gemv_l2pf`: a decode GEMV block waiting on its gate first has the TMA unit pull
             //   64 KiB of its weight share into L2 (interp_sm120.cu PLOW_NV_GEMV_L2PF_BYTES). Veena
@@ -2918,6 +2923,9 @@ pub fn config_header(manifest: &Value) -> String {
             }
             if t.get("fa_rg_wide").is_some() {
                 out.push_str("#ifndef PLOW_NV_FA_RG_WIDE\n#define PLOW_NV_FA_RG_WIDE 1\n#endif\n");
+            }
+            if t.get("fa_rgm").is_some() {
+                out.push_str("#ifndef PLOW_NV_FA_RGM\n#define PLOW_NV_FA_RGM 1\n#endif\n");
             }
             if let Some(v) = t.get("gemv_k8_min").and_then(Value::as_u64) {
                 out.push_str(&format!(

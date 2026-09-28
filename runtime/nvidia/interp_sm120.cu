@@ -2444,7 +2444,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
                 (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
                 in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,              \
-                (const int*)TEN(6));                                                            \
+                (const int*)TEN(6), fold_out, fold_ctr);                                        \
         else                                                                                   \
             d_flash_decode<DD, GG>(                                                            \
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \

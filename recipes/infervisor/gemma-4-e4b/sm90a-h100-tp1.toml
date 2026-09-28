@@ -66,6 +66,8 @@ script = "scripts/build_sm90a_gemma4_segments.sh"
 role_files = ["interp_sm90a_pffa.cubin", "interp_sm90a_pfpackedfa.cubin", "interp_sm90a_pfpackedseg.cubin"]
 [objects.env]
 PLOW_BUILD_FA_V3 = "2"
+# GQA-packed short requests (token-batch riders): 64 one-row requests hd512 kv 1024 360 -> 115 us.
+PLOW_BUILD_FA_V3_PACK = "1"
 
 [emit_roles.env]
 

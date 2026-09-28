@@ -285,6 +285,15 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FUSE_MERGE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fuse_merge: bool,
 
+    /// NVIDIA E-series (hd256/512 row-group) flash decode normalizes / merges in its last split
+    /// (merge fold): no FlashMerge op.
+    #[arg(long, env = "PLOW_NV_FA_FOLD_WIDE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_fa_fold_wide: bool,
+
+    /// NVIDIA hd128 row-group flash decode on the mma.sync staged item (PLOW_NV_FA_RGM).
+    #[arg(long, env = "PLOW_NV_FA_MMA_HD128", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_fa_mma_hd128: bool,
+
     /// Head-number split (3*nhn <= n_cu).
     #[arg(long, env = "PLOW_HN_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub hn_split: bool,
@@ -1420,6 +1429,8 @@ impl EmitConfig {
             no_fuse_nrn: env_bool("PLOW_NO_FUSE_NRN"),
             fuse_hnr: env_bool("PLOW_FUSE_HNR"),
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
+            nv_fa_fold_wide: env_bool_default_true("PLOW_NV_FA_FOLD_WIDE"),
+            nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),

@@ -239,8 +239,7 @@ fn decode_tails(
         for d in &mut insts[mark..end] {
             match DevOp::from_u16(d.op) {
                 Some(DevOp::FlashDecode) => {
-                    // The slot-map arm has no merge fold.
-                    if d.fj[2] != 0 || d.t[6] != TENSOR_NONE16 {
+                    if d.t[6] != TENSOR_NONE16 {
                         ok = false;
                     }
                     d.t[6] = slot_handle;
