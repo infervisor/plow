@@ -41,8 +41,9 @@ __device__ __forceinline__ float round_e4m3(float y) {
     const float a = fabsf(y);
     if (a == 0.f) return y;
     const int e = (int)((__float_as_uint(a) >> 23) & 0xffu) - 127;
-    const float quantum = __uint_as_float((uint32_t)((e < -6 ? -6 : e) - 3 + 127) << 23);
-    const float q = fminf(rintf(a / quantum) * quantum, 448.f);
+    const uint32_t qe = (uint32_t)((e < -6 ? -6 : e) - 3 + 127);
+    const float quantum = __uint_as_float(qe << 23), inv = __uint_as_float((254u - qe) << 23);
+    const float q = fminf(rintf(a * inv) * quantum, 448.f);
     return y < 0.f ? -q : q;
 }
 /* nearest e2m1 (ties to even), |y| <= 6: 0 .5 1 1.5 2 3 4 6 */
@@ -56,6 +57,13 @@ __device__ __forceinline__ float block_scale(float amax, unsigned qmode) {
     if (qmode == PLOW_CMP_Q_FP8_POW2) return pow2_ceil(fmaxf(amax, 1e-4f) * (1.0f / 448.0f));
     if (qmode == PLOW_CMP_Q_FP4_POW2) return pow2_ceil(fmaxf(amax, 7.052966328760454e-38f) * (1.0f / 6.0f));
     return round_e4m3(fmaxf(amax, 0.01171875f) / 6.0f);
+}
+/* quant_rt with `inv` = 1/s, exact for the power-of-two scales (qmodes 0, 1), so the multiply
+ * rounds like the division; the E4M3 scale (qmode 2) ignores `inv` and keeps the division. */
+__device__ __forceinline__ float quant_rt_inv(float x, float s, float inv, unsigned qmode) {
+    if (qmode == PLOW_CMP_Q_FP8_POW2) return rbf(round_e4m3(fminf(fmaxf(x * inv, -448.f), 448.f)) * s);
+    if (qmode == PLOW_CMP_Q_FP4_POW2) return rbf(round_e2m1(fminf(fmaxf(x * inv, -6.f), 6.f)) * s);
+    return rbf(round_e2m1(fminf(fmaxf(x / s, -6.f), 6.f)) * s);
 }
 __device__ __forceinline__ float quant_rt(float x, float s, unsigned qmode) {
     if (qmode == PLOW_CMP_Q_FP8_POW2) return rbf(round_e4m3(fminf(fmaxf(x / s, -448.f), 448.f)) * s);
@@ -219,7 +227,14 @@ __device__ __forceinline__ void d_compress_rope_quant(__nv_bfloat16* __restrict_
     const size_t total = (size_t)n_rows * n_head * nb;
     const uint16_t* s16 = reinterpret_cast<const uint16_t*>(src);
     uint16_t* o16 = reinterpret_cast<uint16_t*>(out);
-    for (size_t w = (size_t)slice * blockDim.x + threadIdx.x; w < total; w += (size_t)nblk * blockDim.x) {
+    /* One quant block per L = qblk / 4 adjacent lanes, 4 elements each: an item's serial chain of
+     * divisions on one thread cost ~1.3 us per 8 elements at decode's few warps. L divides 32 and
+     * every lane of a group takes the same branches, so the group mask is exact. */
+    const unsigned L = qblk / 4u, lw = threadIdx.x & 31u;
+    const unsigned gmask = (L == 32u ? 0xffffffffu : ((1u << L) - 1u)) << (lw & ~(L - 1u));
+    for (size_t t = (size_t)slice * blockDim.x + threadIdx.x; t < total * L; t += (size_t)nblk * blockDim.x) {
+        const size_t w = t / L;
+        const unsigned q4 = (unsigned)(t % L) * 4u;
         const unsigned it = (unsigned)(w / nb), c0 = (unsigned)(w % nb) * qblk, r = it / n_head;
         size_t off = ((size_t)rbase * n_head + it) * d, ooff = off + (size_t)obase * n_head * d;
         size_t tb = (size_t)((rbase + obase + r) * ratio) * (rd / 2u);
@@ -237,42 +252,29 @@ __device__ __forceinline__ void d_compress_rope_quant(__nv_bfloat16* __restrict_
             }
             tb = (size_t)(g * ratio) * (rd / 2u);
         }
-        float v[32];
-        float amax = 0.f;
+        const unsigned c4 = c0 + q4;
+        const uint2 raw = *reinterpret_cast<const uint2*>(s16 + off + c4);
+        float x[4] = {__uint_as_float(raw.x << 16), __uint_as_float(raw.x & 0xffff0000u), __uint_as_float(raw.y << 16),
+                      __uint_as_float(raw.y & 0xffff0000u)};
+        if (c4 >= c_rope0) {
+            const size_t mb = tb + ((c4 - c_rope0) >> 1);
+            const float2 cv = *reinterpret_cast<const float2*>(cosb + mb);
+            const float2 sv = *reinterpret_cast<const float2*>(sinb + mb);
+            const float cs[2] = {cv.x, cv.y}, sn[2] = {sv.x, sv.y};
 #pragma unroll
-        for (unsigned i0 = 0; i0 < 32u; i0 += 8u) {
-            if (i0 >= qblk) break;
-            const unsigned c8 = c0 + i0;
-            float x[8];
-            unpack8(*reinterpret_cast<const uint4*>(s16 + off + c8), x);
-            if (c8 >= c_rope0) {
-                const size_t mb = tb + ((c8 - c_rope0) >> 1);
-                const float4 cv = *reinterpret_cast<const float4*>(cosb + mb);
-                const float4 sv = *reinterpret_cast<const float4*>(sinb + mb);
-                const float cs[4] = {cv.x, cv.y, cv.z, cv.w}, sn[4] = {sv.x, sv.y, sv.z, sv.w};
-#pragma unroll
-                for (int p = 0; p < 4; p++) {
-                    const float a = x[2 * p], b = x[2 * p + 1];
-                    x[2 * p] = rbf(a * cs[p] - b * sn[p]);
-                    x[2 * p + 1] = rbf(a * sn[p] + b * cs[p]);
-                }
-            }
-#pragma unroll
-            for (int j = 0; j < 8; j++) {
-                v[i0 + j] = x[j];
-                amax = fmaxf(amax, fabsf(x[j]));
+            for (int p = 0; p < 2; p++) {
+                const float a = x[2 * p], b = x[2 * p + 1];
+                x[2 * p] = rbf(a * cs[p] - b * sn[p]);
+                x[2 * p + 1] = rbf(a * sn[p] + b * cs[p]);
             }
         }
-        const float s = block_scale(amax, qmode);
-#pragma unroll
-        for (unsigned i0 = 0; i0 < 32u; i0 += 8u) {
-            if (i0 >= qblk) break;
-            uint32_t pk[4];
-#pragma unroll
-            for (int q = 0; q < 4; q++)
-                pk[q] = (uint32_t)to_bf(quant_rt(v[i0 + 2 * q], s, qmode)) | ((uint32_t)to_bf(quant_rt(v[i0 + 2 * q + 1], s, qmode)) << 16);
-            *reinterpret_cast<uint4*>(o16 + ooff + c0 + i0) = make_uint4(pk[0], pk[1], pk[2], pk[3]);
-        }
+        float amax = fmaxf(fmaxf(fabsf(x[0]), fabsf(x[1])), fmaxf(fabsf(x[2]), fabsf(x[3])));
+        for (unsigned o = 1; o < L; o <<= 1) amax = fmaxf(amax, __shfl_xor_sync(gmask, amax, o));
+        const float sc = block_scale(amax, qmode);
+        const float inv = __uint_as_float((254u - (__float_as_uint(sc) >> 23)) << 23); /* 1/sc for the pow2 qmodes */
+        const uint32_t p0 = (uint32_t)to_bf(quant_rt_inv(x[0], sc, inv, qmode)) | ((uint32_t)to_bf(quant_rt_inv(x[1], sc, inv, qmode)) << 16);
+        const uint32_t p1 = (uint32_t)to_bf(quant_rt_inv(x[2], sc, inv, qmode)) | ((uint32_t)to_bf(quant_rt_inv(x[3], sc, inv, qmode)) << 16);
+        *reinterpret_cast<uint2*>(o16 + ooff + c4) = make_uint2(p0, p1);
     }
 }
 
