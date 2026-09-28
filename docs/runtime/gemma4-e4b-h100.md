@@ -174,17 +174,35 @@ config (T=1, top_k=64, top_p=0.95). "greedy" pins `temperature: 0` (`BENCH_ARGS`
 Measured on the packet before the E-series decode kernels in the table further down (`gemv_k8`
 gate, row-group flash decode: greedy c1 141 -> 158, c32 2150 -> 2321, c128 3178 -> 3322).
 
-The same grid on the current packet (100166a6: E-series decode kernels, FA3 prefill, `gemv_k8`
-tuning):
+The same grid on later packets. Cells are TTFT p50 ms / TPOT p50 ms / output tok/s:
 
-| conc | plow sampled | plow greedy |
-|---|---|---|
-| 1 | **23.8** / 6.03 / 159 | **23.4** / 5.86 / 165 |
-| 8 | 78.3 / 7.21 / 1025 | 76.7 / 6.95 / 1060 |
-| 32 | **162** / 11.6 / 2377 | **152** / 11.2 / 2454 |
-| 64 | 301 / 17.6 / 3041 | 298 / 16.9 / 3117 |
-| 128 | 890 / 24.2 / 3570 | 399 / 25.6 / 3838 |
-| 200 | 4013 / 26.9 / 3493 | 2555 / 25.4 / 4010 |
+* 100166a6: E-series decode kernels, FA3 prefill, `gemv_k8` tuning.
+* 54f789dd: adds the KV-shared-tail prefill skip (f8ed564e), where layers 24-41 run only for sampled rows.
+
+| conc | 100166a6 sampled | 100166a6 greedy | 54f789dd sampled | 54f789dd greedy | vLLM greedy |
+|---|---|---|---|---|---|
+| 1 | 23.8 / 6.03 / 159 | 23.4 / 5.86 / 165 | **19.2** / 6.02 / 161 | **19.0** / 5.86 / 166 | 36.3 / 5.70 / 168 |
+| 8 | 78.3 / 7.21 / 1025 | 76.7 / 6.95 / 1060 | **56.0** / 6.97 / 1074 | **55.7** / 6.76 / 1105 | 62.8 / 5.91 / 1228 |
+| 32 | 162 / 11.6 / 2377 | 152 / 11.2 / 2454 | **128** / 10.7 / 2626 | **129** / 10.5 / 2694 | 215 / 7.22 / 3303 |
+| 64 | 301 / 17.6 / 3041 | 298 / 16.9 / 3117 | 270 / 15.8 / 3447 | 264 / 15.4 / 3525 | 254 / 9.09 / 5302 |
+| 128 | 890 / 24.2 / 3570 | 399 / 25.6 / 3838 | 402 / 23.4 / 4274 | 387 / 23.0 / 4381 | 381 / 16.5 / 6786 |
+| 200 | 4013 / 26.9 / 3493 | 2555 / 25.4 / 4010 | 2105 / 23.9 / 4385 | 2048 / 22.3 / 4538 | 887 / 16.3 / 7525 |
+
+On 54f789dd:
+
+* Prefill-only (OSL=1): c1 19.0 ms, c32 77.1 req/s, c64 81.8 req/s, i.e. 12.2 µs/row served,
+  against vLLM's 75.7 req/s at c32. A tick is 25.9 ms per 1979 packed rows, with a 1.0% host gap.
+* Sessions (`session_bench.py`, sampled): 64 calls, later-turn TTFT p50 33.7 ms (p90 64), TPOT
+  15.2 ms, 1943 tok/s. 200 calls: 406 ms (p90 578), TPOT 32.3 ms, 3572 tok/s.
+* Plow's TTFT now leads vLLM from c1 through c32 (c8 56 vs 63 ms). vLLM's throughput leads by
+  1.23x at c32, 1.5x at c64, 1.55x at c128 and 1.65x at c200.
+* c64 `PLOW_PACKLOG`: decode ticks are 54% of the device time (49 rows, 52.7 ms per multistep
+  tick), mixed ticks 41% (1922 prefill rows + 51 riders, 31.4 ms), host 0.3%.
+* Riding costs ~0.09 ms/row against ~0.2 ms/row for a separate step, so `sched::ride` keeps
+  riding. Smaller launches that would let more ticks carry riders (`PLOW_PF_INTERLEAVE=1024`)
+  still lose 15-22%: c32 / c64 / c128 2093 / 2659 / 3297 vs 2453 / 3313 / 4231 tok/s, two runs
+  each.
+* The gap is the decode step (KERNEL).
 
 * **What was wrong before.** Each sampled row that rode a prefill launch downloaded its 512 KB
   logits row and ran the host sampler (a full sort of 262144 entries, ~4 ms per row). At c64 that
@@ -196,9 +214,10 @@ tuning):
   TV distance device vs host on real prefill logits: 0.0024 (T=1, k=64, p=0.95), 0.0000
   (T=0.7, p=0.9), 0.0005 (T=1.3, k=40), 0.0276 (p=0.99, 390 tokens kept; bound 0.105)
   (`tests/gpu_sample_serve.rs`, `tests/gpu_sample.rs`).
-* **Where plow stands.** TTFT is ahead at c1 and c32. From c8 up vLLM wins throughput: 1.2x
-  at c8, 1.3x at c32, 1.7x at c64-c128 (greedy).
-* **c8 TTFT (77 vs 63 ms) is the prefill rate, not the quantum.**
+* **Where plow stood at 100166a6.** TTFT was ahead at c1 and c32. From c8 up vLLM won
+  throughput: 1.2x at c8, 1.3x at c32, 1.7x at c64-c128 (greedy).
+* **c8 TTFT (77 vs 63 ms at 100166a6; 56 ms after the tail skip) was the prefill rate, not the
+  quantum.**
   * Cutting a running multistep quantum on arrival measured nothing: c8 TTFT 76.0 vs 77.0 ms,
     c1 TPOT unchanged. Adaptive multistep already runs single steps while an arrival is likely.
   * Per request, the closed-loop client keeps prompts arriving in groups of 2-8. vLLM prefills a
@@ -358,7 +377,24 @@ TTFA, then underrun turns and the run's wall time:
 * With partials back at the 1 s audio cadence, the same calls offer the load a real user would.
   The TTS-bound SLOs then look worse per turn at 20-30 calls, while ASR device time per turn
   falls 27-30%.
-* The binding limit is still the TTS render.
+* The binding limit at 54f789dd was still the TTS render.
+
+On 6492ac30 (windowed streaming TTS, MTL assets with the re-emitted `s3gen.pkt`, E4B packet
+re-emitted with the KV-shared-tail skip), `--co-sched deadline`:
+
+| calls | ASR final | ASR partial | LLM TTFT | TTS TTFA | underrun | errors | wall | SLOs |
+|---|---|---|---|---|---|---|---|---|
+| 10 | 95/388 | 36/491 | 14/166 | 171/774 | 0/30 | 0 | 78 s | **pass** |
+| 20 | 180/561 | 32/454 | 37/656 | 249/899 | 0/60 | 0 | 85 s | TTFA p95, ASR p95 |
+| 30 | 353/789 | 71/349 | 85/531 | 806/2406 | 4/90 | 0 | 85 s | TTFA, ASR p95 |
+| 50 | 464/1353 | 149/734 | 88/598 | 708/2194 | 0/150 | 0 | 89 s | TTFA, ASR p95 |
+| 100 | 1216/3282 | 218/678 | 128/1728 | 2720/4455 | 245/300 | 0 | 112 s | all but partials |
+
+* Windowed render moves the playback limit out to 50-100 calls: 0 underruns through 50 calls,
+  where every earlier build underran on most turns.
+* The device is 65% busy in mux ticks at 50 calls and 82% at 100.
+* Through 50 calls the SLOs lost are the p95 tails of ASR final (≤500 ms) and TTS first audio
+  (≤800 ms), while the medians pass.
 
 **Capacity, not order, is the limit.**
 
