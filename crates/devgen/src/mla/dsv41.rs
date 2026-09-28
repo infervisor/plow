@@ -1598,12 +1598,21 @@ pub(crate) fn dsv41_pre_fusable(t: u32, tp: u32) -> bool {
     !crate::emit_is_amd() && t <= 8 && sp_abl_rows(t, tp) == t
 }
 
-/// Fold the sublayer RMSNorm into `HyperConnPre` `p`: one block per token writes the normalized
-/// collapse into `xn` (bit-identical to the `RmsNorm` op) and skips post/comb, which the caller
-/// computes beside it with `Builder::fork_op(p, |d| d.j[1] = 4)` for the sublayer's HyperConnPost.
-/// Removes the norm's hop from the critical path.
+/// Split decode `HyperConnPre` `p` (inputs `deps`) in two, one block per token each: `p` keeps
+/// only the collapse, whose gates are the PREVIOUS sublayer's pre, so it waits on `deps` rather
+/// than on the mixes GEMV; the returned twin computes this sublayer's pre/post/comb from the mixes
+/// and is what the sublayer's HyperConnPost must wait on. Pair with `dsv41_fuse_pre_norm`.
+pub(crate) fn dsv41_split_pre(b: &mut Builder, p: u32, t: u32, deps: &[u32]) -> u32 {
+    let twin = b.fork_op(p, |d| d.j[1] = 4);
+    b.amend(twin, Some((0..t).collect()), |_| {});
+    b.rewire(p, deps);
+    twin
+}
+
+/// Fold the sublayer RMSNorm into the collapse half of a `dsv41_split_pre` pair: `p` writes the
+/// normalized collapse into `xn` (bit-identical to the `RmsNorm` op). Removes the norm's hop.
 fn dsv41_fuse_pre_norm(b: &mut Builder, p: u32, xn: u32, gamma: u32, eps: f32, t: u32) -> u32 {
-    b.amend(p, (0..t).collect(), |d| {
+    b.amend(p, Some((0..t).collect()), |d| {
         assert_eq!((d.op, d.f[0], d.j[1]), (DevOp::HyperConnPre as u16, eps, 0));
         d.t[2] = xn;
         d.i[7] = gamma;
@@ -2532,26 +2541,43 @@ pub(crate) fn emit_dsv41_ffn_shared(
         b.defer_gq(c_u, 3);
     }
     let limit = c.raw.swiglu_limit;
-    let c_act = b.emit(DevOp::Glu, all.clone(), &[c_g, c_u], |d| {
-        d.t[0] = act.sh_act;
-        d.t[1] = act.sh_gate;
-        d.t[2] = act.sh_up;
-        d.i[0] = t * inter;
-        d.i[1] = DSV41_ACT_SWIGLU_CLAMP;
-        d.f[1] = limit;
-    });
+    // Decode: the down GEMV applies the GLU while staging its input (GemmFp8Mx mode 3, the Glu
+    // op's bf16 rows then mode 2's quantization), which removes the Glu op and its hop.
+    let fold_glu = local_part && !crate::emit_is_amd() && b.memo().contains_key(super::NV_FOLD_ACT_QUANT);
+    let (down_x, down_deps) = if fold_glu {
+        (act.sh_gate, vec![c_g, c_u])
+    } else {
+        let c_act = b.emit(DevOp::Glu, all.clone(), &[c_g, c_u], |d| {
+            d.t[0] = act.sh_act;
+            d.t[1] = act.sh_gate;
+            d.t[2] = act.sh_up;
+            d.i[0] = t * inter;
+            d.i[1] = DSV41_ACT_SWIGLU_CLAMP;
+            d.f[1] = limit;
+        });
+        (act.sh_act, vec![c_act])
+    };
     let c_down = emit_pf_gemm_fp8_mx(
         b,
         cus,
         act.sh_part,
-        act.sh_act,
+        down_x,
         w.get(l, "ffn.shared_experts.w2.weight"),
         w.get(l, "ffn.shared_experts.w2.scale"),
         t,
         hidden,
         inter,
-        &[c_act],
+        &down_deps,
     );
+    if fold_glu {
+        b.amend(c_down, None, |d| {
+            assert_eq!(d.i[6], 2, "the GLU fold rides on the in-op quantization (mode 2)");
+            d.i[6] = 3;
+            d.t[4] = act.sh_up;
+            d.i[7] = DSV41_ACT_SWIGLU_CLAMP;
+            d.f[1] = limit;
+        });
+    }
     // NO CROSS-RANK SUM HERE, and that is the contract, not an omission. `d_moe_combine_pf`
     // computes `out = residual + shared + SUM_slot part` and the band reduce that FOLLOWS it sums
     // `out` across ranks, so the `shared` it is handed must be the row-parallel PARTIAL. GLM says
@@ -3378,10 +3404,10 @@ fn emit_dsv41_decode_program(
         }
         let fuse = dsv41_pre_fusable(bsz, tp);
         let c_pre = emit_dsv41_mhc_pre(b, c, w, &mhc, l, false, ri, pi, bsz, tp, &deps);
+        let c_mix = if fuse { dsv41_split_pre(b, c_pre, bsz, &deps) } else { c_pre };
         pi += 1;
         let (proj, c_proj) =
             emit_dsv41_attn_proj(b, c, w, &all, l, tp, mhc.layer_input, bsz, &[c_pre], fuse.then_some(c_pre));
-        let c_mix = if fuse { b.fork_op(c_pre, |d| d.j[1] = 4) } else { c_pre };
         let (lcos, lsin) = if matches!(c.raw.attn_kind(l), nn_graph::models::config::V41Attn::Window) {
             (cos, sin)
         } else {
@@ -3415,6 +3441,7 @@ fn emit_dsv41_decode_program(
             continue;
         }
         let c_pre2 = emit_dsv41_mhc_pre(b, c, w, &mhc, l, true, ri, pi, bsz, tp, &[c_post]);
+        let c_mix2 = if fuse { dsv41_split_pre(b, c_pre2, bsz, &[c_post]) } else { c_pre2 };
         pi += 1;
         let (ffn, c_sh) = emit_dsv41_ffn_shared(
             b,
@@ -3429,7 +3456,6 @@ fn emit_dsv41_decode_program(
             true,
             fuse.then_some(c_pre2),
         );
-        let c_mix2 = if fuse { b.fork_op(c_pre2, |d| d.j[1] = 4) } else { c_pre2 };
         let xnext = b.tensor("act.xnext", bsz as u64 * c.hidden as u64 * 2);
         let c_moe = emit_dsv41_moe(b, c, w, l, tp, bsz, xnext, ffn.xn, ffn.c_xn, (ffn.sh_part, c_sh), &mut xgate, &all, peer_w, slot_t);
         let c_layer = emit_dsv41_mhc_post(b, c, &mhc, xnext, ri, bsz, tp, &[c_moe, c_mix2]);

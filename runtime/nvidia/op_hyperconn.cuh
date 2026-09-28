@@ -128,10 +128,11 @@ __device__ __forceinline__ float sinkhorn4_warp(const float* __restrict__ mrow, 
  * t3=mixes(in,[T,24]f32) t4=residual(in,[T,4,hidden]bf16) t5=hc_scale[3] t6=hc_base[24]
  * t7=pre_pair([2,T,4]f32) · i0=T i1=n i2=hidden i3=sinkhorn_repeat i4=pre_in_half i5=pre_mode
  * i6=mix_parts: > 1 means t3 holds GemvF32's K-slice partials [i6][T,24] (decode), summed here
- * j1=split (decode, one block per token): 0 = everything; bit 0 = t2 is the sublayer RMSNorm of
- * the collapse with gamma = tensor i7 (bit-identical to the RmsNorm op), bit 1 = no post/comb
- * (Sinkhorn), bit 2 = post/comb ONLY. The decode chain runs {bits 0|1} on its critical path and
- * {bit 2} beside it: comb_mix is not read until the sublayer's HyperConnPost. */
+ * j1=split (decode, one block per token): 0 = everything; bit 0 = ONLY t2, as the sublayer
+ * RMSNorm of the collapse with gamma = tensor i7 (bit-identical to the RmsNorm op): the collapse
+ * gates are the incoming pre (DEFER/SEED), so this reads neither t3 nor this sublayer's norm and
+ * need not wait for the mixes GEMV; bit 1 = no post/comb (Sinkhorn); bit 2 = no collapse (pre,
+ * post, comb only). The decode chain runs {bits 0|1} on its critical path and {bit 2} beside it. */
 __device__ __forceinline__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict__ comb_mix, __nv_bfloat16* __restrict__ layer_input,
                                                 const float* __restrict__ mixes, const __nv_bfloat16* __restrict__ residual,
                                                 const float* __restrict__ hc_scale, const float* __restrict__ hc_base, unsigned T, unsigned n,
@@ -154,12 +155,13 @@ __device__ __forceinline__ void d_hyperconn_pre(float* __restrict__ post_mix, fl
         __shared__ float s_red[32], s_g[4], s_par[56], s_mp[10][24];
         const unsigned sub = nblk / T;
         if (slice >= T * sub) return;
-        if (split && (sub != 1u || ((split & 1u) && (!gamma || hidden / 8u > 3u * blockDim.x)))) __trap();
+        const bool mixless = split & 1u;
+        if (split && (sub != 1u || (mixless && (!gamma || hidden / 8u > 3u * blockDim.x || pre_mode == PLOW_HC_PRE_OWN)))) __trap();
         const unsigned t = slice / sub, part = slice % sub, tid = threadIdx.x;
         const uint16_t* rrow = res + (size_t)t * nh;
         uint16_t* rs = reinterpret_cast<uint16_t*>(arena);
         float* ps = arena + nh / 2u;
-        const unsigned rc = nh / 8u, pc = mix_parts > 1u ? mix_parts * 6u : 0u;
+        const unsigned rc = nh / 8u, pc = mix_parts > 1u && !mixless ? mix_parts * 6u : 0u;
 #pragma unroll 1
         for (unsigned e = tid; e < rc + pc; e += blockDim.x) {
             if (e < rc)
@@ -177,7 +179,7 @@ __device__ __forceinline__ void d_hyperconn_pre(float* __restrict__ post_mix, fl
         __syncthreads();
         float ss = 0.0f;
 #pragma unroll 1
-        for (unsigned i = tid * 8u; i < nh; i += blockDim.x * 8u) {
+        for (unsigned i = tid * 8u; i < (mixless ? 0u : nh); i += blockDim.x * 8u) {
             float v[8];
             unpack8(*reinterpret_cast<const uint4*>(rs + i), v);
 #pragma unroll
@@ -189,7 +191,7 @@ __device__ __forceinline__ void d_hyperconn_pre(float* __restrict__ post_mix, fl
         const unsigned mg = min(10u, blockDim.x / 24u), per = (mix_parts + mg - 1u) / mg;
         if (ln == 0) s_red[wv] = ss;
         if (tid < 56u) s_par[tid] = pv;
-        if (mix_parts > 1u && tid < mg * 24u) {
+        if (mix_parts > 1u && !mixless && tid < mg * 24u) {
             const unsigned j = tid % 24u, q = tid / 24u;
             float mp = 0.0f;
 #pragma unroll 1
@@ -197,7 +199,7 @@ __device__ __forceinline__ void d_hyperconn_pre(float* __restrict__ post_mix, fl
             s_mp[q][j] = mp;
         }
         __syncthreads();
-        if (mix_parts > 1u) {
+        if (mix_parts > 1u && !mixless) {
             if (tid < 24u) {
                 float v = 0.0f;
                 for (unsigned q = 0; q < mg; q++) v += s_mp[q][tid];
@@ -205,7 +207,10 @@ __device__ __forceinline__ void d_hyperconn_pre(float* __restrict__ post_mix, fl
             }
             __syncthreads();
         }
-        if (tid == 0) {
+        if (tid == 0 && mixless) {
+#pragma unroll
+            for (unsigned j = 0; j < 4u; j++) s_g[j] = pre_mode == PLOW_HC_PRE_SEED ? (j == 0 ? 1.0f : 0.0f) : s_par[51 + j];
+        } else if (tid == 0) {
             float s = 0.0f;
             for (unsigned w2 = 0; w2 < warps; w2++) s += s_red[w2];
             s_red[31] = rsqrtf(s / (float)nh + rms_eps);
@@ -213,7 +218,7 @@ __device__ __forceinline__ void d_hyperconn_pre(float* __restrict__ post_mix, fl
             float g[4];
 #pragma unroll
             for (unsigned j = 0; j < 4u; j++) g[j] = 1.0f / (1.0f + expf(-((s_par[j] * inv) * s_par[48] + s_par[24 + j]))) + hc_eps;
-            if (pre_mode != PLOW_HC_PRE_OWN && part == 0 && !(split & 4u)) {
+            if (pre_mode != PLOW_HC_PRE_OWN && part == 0) {
                 float* po = pre_pair + (size_t)(pre_in_half ^ 1u) * T * 4u + (size_t)t * 4u;
 #pragma unroll
                 for (unsigned j = 0; j < 4u; j++) po[j] = g[j];
