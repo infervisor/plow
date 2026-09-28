@@ -51,6 +51,24 @@ curl -s localhost:8080/v1/audio/speech -H 'content-type: application/json' \
 The runtime `dlopen`s `libcublasLt.so`, so the CUDA library directory must be
 on `LD_LIBRARY_PATH`.
 
+The recipe also sets `PLOW_EMIT_DECODE_CUBLASLT=1` with `PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS=48`.
+With that, decode rungs of 48+ rows run their projections on cuBLASLt, and narrower rungs stay
+in the interpreter.
+
+| step_bench ctx 1024, ms | B=32 | B=48 | B=64 | B=96 | B=128 |
+|---|---|---|---|---|---|
+| interpreter only | 5.42 | 7.80 | 8.55 | 11.07 | 12.66 |
+| cuBLASLt from 48 rows | 5.42 | 6.97 | 7.69 | 9.40 | 10.98 |
+| cuBLASLt from 32 rows | 6.16 | | | | |
+
+Served greedy output tok/s, ISL 128 / OSL 512, unique seed per cell:
+
+| concurrency | 32 | 64 | 128 |
+|---|---|---|---|
+| interpreter only | 6550 | 7878 | 12055 |
+| cuBLASLt from 48 rows | 6562 | 9756 | 14722 |
+| vLLM | | 12863 | 19972 |
+
 Voices are the checkpoint's speaker tags (`kavya`, `agastya`, `maitri`, `vinaya`).
 Defaults: temperature 0.4, top_p 0.9, no repetition penalty (device sampling; a
 penalty switches that request to host sampling).

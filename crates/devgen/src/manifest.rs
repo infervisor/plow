@@ -1105,9 +1105,12 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             // 12 / (1|2): E4B B=1/4/8 6.14/6.30/6.62 -> 5.82/6.02/6.36 ms (3 and 6: +0.2-0.3).
             // `gemv_k8_max_gw`: the _gw object's walk takes M <= 64 (8 tiles) instead of the
             // two-pass mma walk: B=48/64 11.66/11.98 -> 10.99/11.79 ms, B=32/128 unchanged.
+            // `gemv_k8_unb`: 16 k32 load batches (not 12) on the 2..8-tile arms: B=16/32
+            // 6.95/8.67 -> 6.77/8.60 ms; 24 loses (8.82 at B=32).
             if k8_ple && !k8_small_hd {
                 t.insert("gemv_k8_min".into(), json!(1));
                 t.insert("gemv_k8_unb1".into(), json!(2));
+                t.insert("gemv_k8_unb".into(), json!(16));
                 t.insert("gemv_k8_max_gw".into(), json!(64));
             }
         }
@@ -2944,6 +2947,11 @@ pub fn config_header(manifest: &Value) -> String {
             if let Some(v) = t.get("gemv_k8_min").and_then(Value::as_u64) {
                 out.push_str(&format!(
                     "#ifndef PLOW_NV_GEMV_K8_MIN\n#define PLOW_NV_GEMV_K8_MIN {v}\n#endif\n"
+                ));
+            }
+            if let Some(v) = t.get("gemv_k8_unb").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_GEMV_K8_UNB\n#define PLOW_NV_GEMV_K8_UNB {v}\n#endif\n"
                 ));
             }
             if let Some(v) = t.get("gemv_k8_unb1").and_then(Value::as_u64) {

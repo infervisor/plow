@@ -148,10 +148,10 @@ Roofline = (9.22 GB weights incl. the 1.34 GB tied lm_head + B × 66 MB KV at ct
 
 | slots | 1 | 8 | 32 | 48 | 64 | 96 | 128 |
 |---|---|---|---|---|---|---|---|
-| step ms | 5.91 | 6.42 | 9.11 | 9.89 | 10.19 | 12.35 | 12.84 |
+| step ms | 5.75 | 6.14 | 8.59 | 9.65 | 9.91 | 12.02 | 12.40 |
 | roofline ms | 2.83 | 2.96 | 3.44 | 3.75 | 4.07 | 4.70 | 5.33 |
-| % of roofline | 48 | 46 | 38 | 38 | 40 | 38 | 42 |
-| tok/s (slots / step) | 169 | 1246 | 3512 | 4853 | 6281 | 7773 | 9969 |
+| % of roofline | 49 | 48 | 40 | 39 | 41 | 39 | 43 |
+| tok/s (slots / step) | 174 | 1303 | 3727 | 4976 | 6461 | 7987 | 10320 |
 
 Rungs of 48+ rows run their projections on cuBLASLt (see "Decode rungs vs roofline").
 
@@ -202,6 +202,13 @@ On 54f789dd:
   previous cell's prompts (one `--seed`). With unique prompts per cell (`pb_bench` now seeds per
   cell), greedy c64 is 3438 vs 4187 tok/s (1.22x) and c128 3973 vs 5103 (1.28x).
   [throughput-audit.md](throughput-audit.md) has the accounting.
+* a6308d71 + cuBLASLt decode rungs (48+ rows) + `gemv_k8` UNB16, greedy, unique seed per cell,
+  TTFT p50 / TPOT p50 / tok/s: c1 15.9 / 5.74 / 169, c8 41.9 / 6.40 / 1176, c32 47.7 / 10.4 /
+  2870, c64 77.6 / 13.8 / 4185 (vLLM 4187), c128 115 / 20.9 / 5393 (vLLM 5103). Loaded parity
+  with 60 background streams: top1 0.992, KL mean 8.3e-4. The c128 TTFT p50 moves between cells
+  with the prompt set (92.6 vs 121.6 ms across two seeds). On one seed with `PLOW_PACKLOG`, the
+  routed and native packets have the same tick structure and TTFT (96.0 vs 96.3 ms); only the
+  decode ms/step differs (12.9 vs 16.4).
 * c64 `PLOW_PACKLOG`: decode ticks are 54% of the device time (49 rows, 52.7 ms per multistep
   tick), mixed ticks 41% (1922 prefill rows + 51 riders, 31.4 ms), host 0.3%.
 * Riding costs ~0.09 ms/row against ~0.2 ms/row for a separate step, so `sched::ride` keeps
@@ -533,7 +540,9 @@ floor and full hd512 ~1.7x.
 | `PLOW_NV_GEMV_K8_UNB1=2` (two k32 steps in flight on the gemv_k8 one-tile arm, M <= 8) | B=1/4/8 6.14/6.30/6.62 -> 5.82/6.02/6.36 ms; UNB1 3 and 6 lose 0.2-0.3 ms | in |
 | `PLOW_NV_GEMV_K8_MAX_GW=64` (gemv_k8 8-tile arm for 33..64 rows in the `_gw` object) | B=48/64 11.66/11.98 -> 10.99/11.79 ms; B=32/128 unchanged | in |
 | cuBLASLt projections on the 48+ row rungs (`PLOW_EMIT_DECODE_CUBLASLT=1`, `PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS=48`) | B=48/64/96/128 11.0/11.9/15.6/16.4 -> 9.9/10.2/12.3/12.8 ms; served greedy (unique seed per cell) c64 3516 -> 3708 tok/s (TPOT 16.5 -> 15.7 ms), c128 3974 -> 4301 (29.0 -> 27.1); c1-c32 unchanged; parity with 60 background streams top1 0.984, KL 7.1e-4 | in |
+| `PLOW_NV_GEMV_K8_UNB=16` (16 k32 load batches in flight on the gemv_k8 2..8-tile arms; E-series manifest) | B=16/32 6.95/8.67 -> 6.77/8.60 ms; other rungs unchanged; 24 loses (B=32 8.82) | in |
 | the same route from 32 rows, or with k/v/PLE projections left in the interpreter (4 MiB floor) | B=32 9.11 -> 9.68; B=64/128 10.19/12.84 -> 10.31/14.54 (the PLE gate is 1.2 ms native at B=128) | rejected |
+| PDL (programmatic dependent launch) between the interpreter windows and cuBLASLt kernels of a routed rung | B=48/64/96/128 9.62/9.88/11.94/12.39 -> 9.61/9.88/11.98/12.39 ms | rejected |
 | stream-K fixup by the last contributor (`_gw` wide GEMV) | standalone GLU M=64 57 -> 51 us (down unchanged); in the entry B=32..128 +0.2..+1.7 ms | rejected |
 | flash KV pulled into L2 before the gate (128 KiB..1 MiB per slice) / KV loads `evict_last` or default-cached | B>=32 +0.04..+0.3 ms / +0.3..+1.4 ms (weight streaming loses its L2) | rejected |
 | RG flash with the next rows' K/V prefetched in registers | stack 272 -> 3744 B (the entry is at the 255-register cap), 2x slower | rejected |
