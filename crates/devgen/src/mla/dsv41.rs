@@ -2597,6 +2597,9 @@ pub(crate) fn emit_dsv41_ffn_shared(
     (act, c_down)
 }
 
+/// Slices the decode shared-expert down GEMV runs on beside the routed DOWN.
+const DSV41_SHARED_DOWN_CUS: usize = 16;
+
 /// One sublayer a V4.1 rung has to emit, and whether it is emitted yet.
 ///
 /// This exists so the answer to "what is missing" comes from RUNNING plowc rather than from
@@ -3466,7 +3469,17 @@ fn emit_dsv41_decode_program(
             fuse.then_some(c_pre2),
         );
         let xnext = b.tensor("act.xnext", bsz as u64 * c.hidden as u64 * 2);
+        let n_moe = b.n_insts() as u32;
         let c_moe = emit_dsv41_moe(b, c, w, l, tp, bsz, xnext, ffn.xn, ffn.c_xn, (ffn.sh_part, c_sh), &mut xgate, &all, peer_w, slot_t);
+        // The shared down GEMV becomes ready while the routed GLU holds the grid; queued between
+        // GLU and DOWN it delays DOWN by its whole span. Give it its own DSV41_SHARED_DOWN_CUS
+        // slices so the grid runs it beside DOWN, which keeps the rest.
+        if !crate::emit_is_amd() && all.len() > 2 * DSV41_SHARED_DOWN_CUS {
+            let split = all.len() - DSV41_SHARED_DOWN_CUS;
+            let down = (n_moe..c_moe).find(|&k| b.inst(k).op == DevOp::MoeGroupDownPf as u16).expect("routed DOWN");
+            b.amend(down, Some(all[..split].to_vec()), |_| {});
+            b.amend(c_sh, Some(all[split..].to_vec()), |_| {});
+        }
         let c_layer = emit_dsv41_mhc_post(b, c, &mhc, xnext, ri, bsz, tp, &[c_moe, c_mix2]);
         ri ^= 1;
         deps = vec![c_layer];
