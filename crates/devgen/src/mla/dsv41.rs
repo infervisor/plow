@@ -3322,6 +3322,7 @@ fn emit_dsv41_decode_program(
     assert!(io.is_none() || !attn_only, "a whole-model decode runs the full layer");
     let bsz = st.dbatch;
     b.memo().insert(super::NV_FOLD_ACT_QUANT.into(), Vec::new());
+    b.set_gq_order_critical(true);
     let all = b.all();
     let peer_w = dsv41_peer_width(c, layers);
     let mhc = declare_dsv41_mhc(b, c, bsz, tp);

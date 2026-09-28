@@ -434,6 +434,8 @@ pub struct Builder {
     /// See [`Builder::set_gq_order_seg`]. Default on; `PLOW_GQ_ORDER=asap` keeps program-wide
     /// ranks and `=emit` keeps emit order.
     gq_order_seg: bool,
+    /// See [`Builder::set_gq_order_critical`]. Off unless an emitter asks for it.
+    gq_order_crit: bool,
     /// Split descriptor-consuming prefill families into independent wave classes.
     /// Callers must enable this only for prefill programs.
     packed_prefill_segments: bool,
@@ -703,6 +705,7 @@ impl Builder {
             memo: std::collections::HashMap::new(),
             gq_order_asap: knobs.gq_order.as_deref() != Some("emit"),
             gq_order_seg: !matches!(knobs.gq_order.as_deref(), Some("emit") | Some("asap")),
+            gq_order_crit: false,
             packed_prefill_segments: false,
             rowsplit_arm: None,
             token_batch_band: None,
@@ -808,6 +811,51 @@ impl Builder {
     /// strictly above its producers), so counters and windows are untouched.
     pub fn set_gq_order_seg(&mut self, on: bool) {
         self.gq_order_seg = on;
+    }
+
+    /// Order the queue by a critical-path list schedule instead of ASAP levels: among the ops whose
+    /// producers are already placed, the one with the longest chain of consumers below it goes
+    /// first (ties keep emit order). For programs whose narrow chains (few-slice ops) would
+    /// otherwise queue behind a wide independent op of the same ASAP level: V4.1 decode's
+    /// compressor step -> index key -> norm -> append chain waited ~8 us behind the indexer's
+    /// `wq_b` GEMV. Still topological, so the queue's deadlock-freedom argument holds.
+    pub fn set_gq_order_critical(&mut self, on: bool) {
+        self.gq_order_crit = on;
+    }
+
+    /// Queue position per op under [`Builder::set_gq_order_critical`].
+    fn gq_crit_ranks(&self) -> Vec<u32> {
+        let n = self.ops.len();
+        let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut indeg = vec![0u32; n];
+        for i in 0..n {
+            for d in &self.ops[i].deps {
+                let p = d.producer() as usize;
+                if p < i {
+                    succ[p].push(i);
+                    indeg[i] += 1;
+                }
+            }
+        }
+        let mut bl = vec![0u32; n];
+        for i in (0..n).rev() {
+            bl[i] = 1 + succ[i].iter().map(|&s| bl[s]).max().unwrap_or(0);
+        }
+        let mut ready: std::collections::BinaryHeap<(u32, std::cmp::Reverse<usize>)> =
+            (0..n).filter(|&i| indeg[i] == 0).map(|i| (bl[i], std::cmp::Reverse(i))).collect();
+        let mut rank = vec![0u32; n];
+        let mut k = 0u32;
+        while let Some((_, std::cmp::Reverse(i))) = ready.pop() {
+            rank[i] = k;
+            k += 1;
+            for &s in &succ[i] {
+                indeg[s] -= 1;
+                if indeg[s] == 0 {
+                    ready.push((bl[s], std::cmp::Reverse(s)));
+                }
+            }
+        }
+        rank
     }
 
     /// Earliest-start rank per op. With `seg_of`, a producer in an earlier segment contributes
@@ -3038,7 +3086,9 @@ impl Builder {
         // op-major order within each window; cross-window deps remain counter-gated.
         // With `gq_order_asap`, each window is ordered by earliest-start rank instead (see
         // `set_gq_order_asap`); ties keep op-major order and the order stays topological.
-        let asap = if self.gq_order_asap {
+        let asap = if self.gq_order_crit {
+            Some(self.gq_crit_ranks())
+        } else if self.gq_order_asap {
             Some(self.gq_asap_ranks(self.gq_order_seg.then_some(&seg_of[..])))
         } else {
             None
