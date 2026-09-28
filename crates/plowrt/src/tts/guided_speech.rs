@@ -307,8 +307,12 @@ fn initial_phase(seed: u64, harmonics: usize) -> Vec<f32> {
         .collect()
 }
 
-fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, credit: &DownstreamCredit) {
+fn render_loop(vocoder: &Codec, base: Schedule, rx: mpsc::Receiver<S3Msg>, credit: &DownstreamCredit) {
     let max_batch = vocoder.max_batch;
+    // More live streams than one launch holds: the device is the bottleneck, so a started stream
+    // waits for a window filling the widest capacity at the full batch (lowest cost per token).
+    let full = vocoder.window_capacities.iter().filter(|c| c.0 >= max_batch).map(|c| c.1).max().unwrap_or(0);
+    let wide = Schedule { chunk: base.chunk.max(full.saturating_sub(base.context + base.hold)), ..base };
     let mut live: HashMap<usize, Utterance> = HashMap::new();
     let mut held_since: Option<std::time::Instant> = None;
     let apply = |live: &mut HashMap<usize, Utterance>, m: S3Msg| match m {
@@ -350,6 +354,7 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, credit:
         }
     };
     loop {
+        let sc = if base.windowed() && live.len() > max_batch { wide } else { base };
         if !live.values().any(|u| u.due(&sc)) {
             match rx.recv() {
                 Ok(m) => apply(&mut live, m),

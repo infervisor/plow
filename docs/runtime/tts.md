@@ -166,6 +166,10 @@ batch x (frames + `render.item_frames` 4), the H100 cost of a cached render in f
 every window to it; the rest of a clipped window's tokens go in a later launch. Before, a launch
 padded every window to its longest one and rounded up to the next capacity (33 frames ran as 64):
 at c200 only 34% of the rendered capacity frames became delivered audio (56% fitted).
+With more live streams than one launch holds (the device is the bottleneck), a started stream
+waits for a window that fills the widest capacity at the full batch (`b64.t64`: 53 new tokens
+instead of `stream.chunk_tokens` 25), the lowest render cost per token: stream c128 51.5 -> 53.7,
+c200 49.3 -> 52.7 aps (TTFA p50 9.9 -> 8.7 s), 200-request streamed CER median 0.000 either way.
 `PLOW_TTS_STREAM_WINDOWS=0` restores prefix re-renders. Each CFM step is 4 programs (`CFM_PARTS`):
 the LM's decode launches get in only between programs.
 
@@ -212,7 +216,10 @@ and at c16, per language ar 0.028, de 0, en 0, es 0, fr 0.011, hi 0.145, ja 0.01
 | 128 | 42.2 | 49.9 | 4.7 / 6.0 s | 0 |
 | 200 | 37.3 | 52.2 | 9.4 / 10.4 s | 0 |
 
-English Chatterbox: stream c16 32.8, c64 43.4 aps (was 29.9 / 33.1), CER 0.000. The codec's
+English Chatterbox: stream c16 32.8, c64 43.4 aps (was 29.9 / 33.1), CER 0.000. TTS-only
+`scripts/voice/call_sim.py` (3 turns per call, 3 s user turns, calls ramped over 10 s): 64 calls
+TTFA p50 / p95 658 / 995 ms, no underrun; 128 calls 1.9 / 2.7 s, underrun p95 623 ms (138 of 384
+turns over 100 ms); 200 calls 2.2 / 3.5 s, underrun p50 / p95 153 / 1009 ms (331 of 600). The codec's
 per-launch trace (`RUST_LOG=plowrt::tts::codec_launch=debug`: jobs, frames, capacity, H2D / run /
 D2H us) put the render at 89% of wall time at c200 with host copies under 0.3%.
 
