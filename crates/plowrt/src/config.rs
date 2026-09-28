@@ -326,9 +326,11 @@ pub struct RuntimeConfig {
     pub pin: Vec<String>,
 
     /// How co-resident models take a shared GPU: `free` (private streams, the
-    /// driver admits whoever is ready — fastest, and the default) or `rr`
+    /// driver admits whoever is ready — fastest, and the default), `rr`
     /// (round-robin turns, which bounds starvation and makes the interleaving
-    /// reproducible at the cost of overlap).
+    /// reproducible at the cost of overlap) or `deadline` (turns by urgency: an
+    /// ASR final, a speech stream's start or a prompt owed its first token go
+    /// ahead of decode, decode ahead of partial transcripts; see `serve::cosched`).
     #[arg(
         long = "co-sched",
         env = "PLOW_CO_SCHED",
@@ -1232,6 +1234,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "live-ctx", env = "PLOW_LIVE_CTX", global = true)]
     pub live_ctx: Option<u32>,
 
+    /// Per-model live bound, `<served name>=<ctx>[,...]`, over `--live-ctx`: co-served models
+    /// size their KV apart (an ASR and a TTS packet at 1024 next to an LLM at its ceiling).
+    #[arg(long = "live-ctx-models", env = "PLOW_LIVE_CTX_MODELS", global = true)]
+    pub live_ctx_models: Option<String>,
+
     /// Fraction of the free-after-load device memory the mux may commit to admitted
     /// sequences' KV. Below 1.0 so transient prefill workspaces and allocator fragmentation
     /// are not competing with a budget that already counts every byte. `0` disables the
@@ -1703,6 +1710,22 @@ impl RuntimeConfig {
         self.amd.live_ctx.or_else(|| {
             Self::env_nonempty("PLOW_LIVE_CTX").and_then(|v| v.parse().ok())
         })
+    }
+
+    /// Live bound for the packet in `assets_dir`: its served name's `--live-ctx-models` entry,
+    /// else [`Self::live_ctx`].
+    pub fn live_ctx_for(&self, assets_dir: &std::path::Path) -> Option<u32> {
+        let spec = self.amd.live_ctx_models.clone().or_else(|| Self::env_nonempty("PLOW_LIVE_CTX_MODELS"));
+        let per_model = spec.and_then(|spec| {
+            let bytes = std::fs::read(assets_dir.join("weights.json")).ok()?;
+            let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            let slug = v.get("served_name")?.as_str()?.to_owned();
+            spec.split(',').find_map(|kv| {
+                let (k, n) = kv.split_once('=')?;
+                (k.trim() == slug).then(|| n.trim().parse().ok()).flatten()
+            })
+        });
+        per_model.or_else(|| self.live_ctx())
     }
 
     #[cfg(feature = "cuda")]

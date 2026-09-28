@@ -563,8 +563,8 @@ impl AudioLmPrompt {
             .ok_or_else(|| RuntimeError::Rejected(format!("unsupported ASR language {requested:?}")))
     }
 
-    /// Features, prompt ids and placeholder positions for one recording; `max_context` bounds
-    /// prompt + `max_tokens`.
+    /// Features, prompt ids and placeholder positions for one recording; the prompt must leave
+    /// `max_context` at least one output position.
     pub fn request(
         &self,
         samples: &[f32],
@@ -627,15 +627,12 @@ impl AudioLmPrompt {
             prompt.push_str(&c.language_suffix.replace("{language}", language));
         }
         let ids = self.tokenizer.encode(&prompt);
-        let required_context = ids
-            .len()
-            .checked_add(c.max_tokens)
-            .ok_or_else(|| RuntimeError::ContextLength("ASR prompt length overflows".into()))?;
-        if required_context > max_context {
+        // Served, the transcript budget (`max_tokens`) is fitted to the context by the mux, so a
+        // narrowed bound (`--live-ctx-models`) caps long transcripts instead of refusing audio.
+        if ids.len() >= max_context {
             return Err(RuntimeError::ContextLength(format!(
-                "ASR needs {} prompt + {} output positions; bundle has {}",
+                "ASR needs {} prompt positions plus output; bundle has {}",
                 ids.len(),
-                c.max_tokens,
                 max_context
             )));
         }
@@ -721,6 +718,15 @@ impl AudioLmAsr {
         cancelled()?;
         let AudioLmRequest { features, ids, audio_positions: positions, language } =
             self.prompt.request(samples, language, context, self.execution.max_context())?;
+        // This loop decodes the whole `max_tokens` budget itself, so it needs the room up front.
+        let max_tokens = self.prompt.contract.max_tokens;
+        if ids.len() + max_tokens > self.execution.max_context() {
+            return Err(RuntimeError::ContextLength(format!(
+                "ASR needs {} prompt + {max_tokens} output positions; bundle has {}",
+                ids.len(),
+                self.execution.max_context()
+            )));
+        }
         cancelled()?;
         let frontend_ms = started.elapsed().as_secs_f64() * 1000.0;
         let prepared = self.execution.prefill(

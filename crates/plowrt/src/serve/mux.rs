@@ -240,6 +240,30 @@ impl JobClass {
     }
 }
 
+/// How long a critical job keeps deadline urgency. An ASR final is done well inside it; a speech
+/// stream past it is sustained by throughput, not by jumping co-tenants for every token.
+const CRITICAL_SPAN: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// The most urgent work this model holds, for [`crate::serve::cosched::CoSched::Deadline`]: a
+/// prompt still owed its first token, or a critical job (an ASR final, a speech stream's start)
+/// inside [`CRITICAL_SPAN`], is a deadline; decode is throughput; bulk-only work (partial
+/// transcripts) waits.
+fn turn_urgency(slots: &[Option<Slot>], waiting: &std::collections::VecDeque<(Job, Instant)>) -> crate::serve::cosched::Urgency {
+    use crate::serve::cosched::Urgency;
+    let now = Instant::now();
+    let live = slots.iter().flatten().map(|s| (s.class, s.step == 0, s.arrived));
+    let queued = waiting.iter().map(|(j, _)| (j.opts.class, true, j.arrived));
+    live.chain(queued).fold(Urgency::Bulk, |best, (class, first_token_owed, arrived)| {
+        let u = match class {
+            JobClass::Bulk => Urgency::Bulk,
+            _ if first_token_owed => Urgency::Deadline,
+            JobClass::Critical if now.saturating_duration_since(arrived) < CRITICAL_SPAN => Urgency::Deadline,
+            _ => Urgency::Normal,
+        };
+        best.min(u)
+    })
+}
+
 /// How long a raw-token consumer may hold its slot parked before the request is cut.
 const PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1210,7 +1234,13 @@ pub fn spawn(
             // One tick: advance every live slot by N tokens (multi-step).
             // Handed to the blocking pool so the dispatcher task stays hot
             // for arrivals.
-            let steps = if cfg.multi_step {
+            let urgency = turn_urgency(&slots, &waiting);
+            // A co-tenant with more urgent work is waiting for the device: a K-step quantum
+            // here would hold it for all K.
+            let outranked = device_turn.as_ref().is_some_and(|dt| dt.outranked(urgency));
+            let steps = if outranked {
+                1
+            } else if cfg.multi_step {
                 #[cfg(any(feature = "cuda", feature = "hsa"))]
                 let device_quantum = crate::config::RuntimeConfig::get().multistep();
                 #[cfg(not(any(feature = "cuda", feature = "hsa")))]
@@ -1268,7 +1298,7 @@ pub fn spawn(
                 tokio::select! {
                     biased;
                     _ = preempt_wake.notified() => continue,
-                    _ = turn.take(dt) => {}
+                    _ = turn.take_at(dt, urgency) => {}
                 }
             }
             if preempt_seen.load(Ordering::Acquire) {
@@ -4806,6 +4836,7 @@ fn gpu_prefill_batched_pass(
             if request.prompt_ids.is_empty() {
                 continue;
             }
+            fit_speech_budget(request, e.max_ctx());
             let total = request.prompt_ids.len() + request.gen.max_tokens.max(1);
             let pair = request.cfg.is_some();
             let admitted = (|| -> Result<()> {
@@ -5147,6 +5178,17 @@ fn gpu_prefill_batched_pass(
     }
 }
 
+/// A speech job's `max_tokens` is its packet's cap (an ASR transcript, a TTS utterance), not a
+/// client's ask: under a live context bound (`--live-ctx-models`) the stream ends at the context
+/// instead of the request failing.
+#[cfg(feature = "cuda")]
+fn fit_speech_budget(slot: &mut Slot, max_ctx: usize) {
+    if slot.speech.is_some() {
+        let room = max_ctx.saturating_sub(slot.prompt_ids.len()).max(1);
+        slot.gen.max_tokens = slot.gen.max_tokens.min(room);
+    }
+}
+
 /// Advance a prefilling slot: one prompt chunk through the prefill bucket
 /// chain into engine slot `slot_idx`'s KV ring (bucket capped at `cap_rows`),
 /// or whole-prompt decode-only consumption (one launch per prompt token) when
@@ -5167,6 +5209,7 @@ fn gpu_prefill_advance(
     if slot.prompt_ids.is_empty() {
         return Err(crate::RuntimeError::Rejected("empty prompt".into()));
     }
+    fit_speech_budget(slot, e.max_ctx());
     let total = slot.prompt_ids.len() + slot.gen.max_tokens.max(1);
     if slot.pf_pos == 0 {
         let resume = slot.resume > 0 && slot.cfg.is_none() && e.resume_slot(slot_idx, slot.resume);

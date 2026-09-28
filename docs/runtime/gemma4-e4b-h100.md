@@ -254,6 +254,67 @@ TTFT first turn p50 / later turns p50 (p90) ms, TPOT p50 ms, out tok/s:
   its own turn 1 tail. A unique ~380-token first turn sent back-to-back: turn 2 cached 0/397 ->
   352/397 rows.
 
+## Voice co-serving: ASR + E4B + Chatterbox-MTL on one H100
+
+One `plowrt serve --assets <qwen3-asr> --assets <chatterbox-mtl> --assets <gemma-4-e4b>` (LLM
+last: its KV admission budget is sampled from what the others leave). Load
+`scripts/voice/call_sim.py` (streaming ASR appends, chat turn, streaming TTS, `X-Session-Id`, 3
+turns, `--language en`).
+
+**Memory.** Every packet reserves `[slots][ctx]` KV at its emitted ceiling: ASR 28 GiB, MTL
+30 GiB, and E4B ~36 GiB resident (sliding rings of 4096 rows × 128 slots are 20 GiB of it). That
+is 94 GiB plus ~7-8 GiB each for the ASR encoder and the S3Gen vocoder, so the planner swapped
+models on every turn (S1 thrash, `cuMemAlloc` OOM in the vocoder). Per model live context bounds
+fit the three in 73 GiB:
+
+```sh
+PLOW_LIVE_CTX_MODELS=qwen3-asr=768,chatterbox-mtl=512   # --live-ctx-models
+```
+
+* `ctx_bound::narrow` takes non-indexer packets below 2048 (the 2048 floor is the DSA indexer's
+  selection width). The planner narrows the same way, so it plans what the engine loads.
+* A speech job's `max_tokens` is its packet's cap (ASR 1024 transcript tokens, MTL 1000 speech
+  tokens), not the client's, so under a narrowed bound the mux fits it to the context instead of
+  refusing the request (`fit_speech_budget`). At 768 an ASR prompt of 29 s of audio leaves ~330
+  transcript tokens; at 512 an MTL utterance keeps ~400 speech tokens (16 s).
+
+**Scheduling.** The persistent cooperative grid takes the whole device, so the three models
+time-share it. `--co-sched deadline` gives the turn by urgency:
+
+1. A deadline: a prompt owed its first token (LLM TTFT, an ASR final, a speech stream's first
+   audio), or a critical job in its first second.
+2. Decode throughput.
+3. Partial transcripts (bulk).
+
+A waiter moves up one class per 100 ms waited. A holder keeps the device for 20 ms while a peer
+of its class waits, and runs single-step ticks while outranked.
+
+call_sim p50/p95 ms (ASR final, LLM TTFT, TTS time to first audio), and turns with >100 ms
+playback underrun:
+
+| calls | free | rr | deadline |
+|---|---|---|---|
+| 10 | 379/1422, 46/201, 404/1421, 2/30 | 308/1138, 27/318, 493/1442, 7/30 | 107/957, 16/52, 271/687, 5/30 |
+| 20 | 900/2605, 173/852, 711/2495, 29/60 | 609/2205, 32/580, 972/2329, 46/60 | 203/894, 41/351, 421/1165, 32/60 |
+| 30 | 2292/5280, 252/776, 703/2620, 43/90 (4 errors) | 1268/2858, 41/730, 1489/5978, 80/90 | 546/2424, 135/875, 1443/5442, 61/90 |
+| 50 | 1930/8557, 355/1223, 1987/9296, 117/150 (10 errors) | 2611/5361, 245/1437, 2732/3913, 138/150 | 699/6705, 110/1100, 819/3433, 128/150 |
+
+Deadline turns cut the p50s 2-4x at 10-20 calls and meet the TTFT and TTFA SLOs at 10 calls.
+The ASR final p95 and underrun SLOs fail from 10 calls, and everything fails from 20.
+
+**Capacity, not order, is the limit.**
+
+* A call_sim turn is ~14 s: ~7 s of user speech, ~1 s for the ASR final and the LLM, 5.1 s of
+  reply audio, 1 s of think time.
+* 200 calls therefore need ~72 s of Chatterbox-MTL audio per second in real time.
+* MTL streaming tops out at ~12.5 audio-s/s with the whole device ([tts.md](tts.md)): each chunk
+  re-renders the utterance's whole token prefix through S3Gen.
+* Mux ticks alone keep the device 50-58% busy at 10-20 calls, and the vocoder renders run on top
+  of them outside the turn.
+* 200 calls need the TTS render ~6x cheaper. Streaming partials make ASR the next cost (~0.3 s of
+  device per turn at 50 calls).
+* E4B is the smallest share: ~64 tokens per turn at low batch.
+
 ## Kernel work and where the time goes
 
 B=1 op costs (`step_bench --sweep`, instruction-cap deltas, earlier build of the same program):

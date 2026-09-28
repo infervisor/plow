@@ -3448,7 +3448,7 @@ impl GpuEngine {
             .find(|t| t.name == "in.pos")
             .map(|t| (t.bytes / 4) as usize)
             .unwrap_or(0);
-        if let Some(want) = config.live_ctx() {
+        if let Some(want) = config.live_ctx_for(assets_dir) {
             if want as usize > packet_max_ctx {
                 if !config.nv_vmm_live() && config.nv_vmm_prefix() != Some(true) {
                     return Err(RuntimeError::Rejected(
