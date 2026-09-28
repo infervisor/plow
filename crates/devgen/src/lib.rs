@@ -4588,7 +4588,7 @@ fn emit_phase(
             && !shared
             && !fp8
             && !mx4
-            && !emit_config::active().decode_cublaslt
+            && !emit_config::active().decode_cublaslt_at(t)
             && !emit_config::active().decode_native_tc
             && !affine_q4
             && gemv_fused_input_fits(amd, t, c.hidden)
@@ -5863,7 +5863,7 @@ fn emit_phase(
         let glu_fused = !affine_q4
             && gemv_family
             && gemv_fused_input_fits(amd, t, c.hidden)
-            && !emit_config::active().decode_cublaslt
+            && !emit_config::active().decode_cublaslt_at(t)
             && !emit_config::active().decode_native_tc;
         let gemma4_glu_role = !gemv_family
             && emit_config::active().gemma4_sm90_gemm_glu_role

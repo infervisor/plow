@@ -148,10 +148,12 @@ Roofline = (9.22 GB weights incl. the 1.34 GB tied lm_head + B × 66 MB KV at ct
 
 | slots | 1 | 8 | 32 | 48 | 64 | 96 | 128 |
 |---|---|---|---|---|---|---|---|
-| step ms | 6.87 | 7.40 | 10.21 | 12.25 | 12.62 | 16.74 | 17.59 |
+| step ms | 5.91 | 6.42 | 9.11 | 9.89 | 10.19 | 12.35 | 12.84 |
 | roofline ms | 2.83 | 2.96 | 3.44 | 3.75 | 4.07 | 4.70 | 5.33 |
-| % of roofline | 41 | 40 | 34 | 31 | 32 | 28 | 30 |
-| tok/s (slots / step) | 146 | 1081 | 3134 | 3918 | 5071 | 5735 | 7277 |
+| % of roofline | 48 | 46 | 38 | 38 | 40 | 38 | 42 |
+| tok/s (slots / step) | 169 | 1246 | 3512 | 4853 | 6281 | 7773 | 9969 |
+
+Rungs of 48+ rows run their projections on cuBLASLt (see "Decode rungs vs roofline").
 
 ### Served: `vllm bench serve` random ISL 1000 / OSL 128, completions, ignore_eos
 
@@ -486,6 +488,10 @@ floor and full hd512 ~1.7x.
 | `PLOW_NV_FA_RG_WIDE` (hd256/512 flash decode on the row-group body: a warp per row, K and V of 4 rows in flight; E-series gate) | B=1/8/32/64/128 6.22/6.83/9.61/12.63/17.75 -> 6.15/6.63/9.05/11.98/16.42 ms; B=64 sliding 52 -> 40 us/layer, full 153 -> 110 | in |
 | `PLOW_NV_GEMV_K8_UNB1=2` (two k32 steps in flight on the gemv_k8 one-tile arm, M <= 8) | B=1/4/8 6.14/6.30/6.62 -> 5.82/6.02/6.36 ms; UNB1 3 and 6 lose 0.2-0.3 ms | in |
 | `PLOW_NV_GEMV_K8_MAX_GW=64` (gemv_k8 8-tile arm for 33..64 rows in the `_gw` object) | B=48/64 11.66/11.98 -> 10.99/11.79 ms; B=32/128 unchanged | in |
+| cuBLASLt projections on the 48+ row rungs (`PLOW_EMIT_DECODE_CUBLASLT=1`, `PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS=48`) | B=48/64/96/128 11.0/11.9/15.6/16.4 -> 9.9/10.2/12.3/12.8 ms; served greedy (unique seed per cell) c64 3516 -> 3708 tok/s (TPOT 16.5 -> 15.7 ms), c128 3974 -> 4301 (29.0 -> 27.1); c1-c32 unchanged; parity with 60 background streams top1 0.984, KL 7.1e-4 | in |
+| the same route from 32 rows, or with k/v/PLE projections left in the interpreter (4 MiB floor) | B=32 9.11 -> 9.68; B=64/128 10.19/12.84 -> 10.31/14.54 (the PLE gate is 1.2 ms native at B=128) | rejected |
+| stream-K fixup by the last contributor (`_gw` wide GEMV) | standalone GLU M=64 57 -> 51 us (down unchanged); in the entry B=32..128 +0.2..+1.7 ms | rejected |
+| flash KV pulled into L2 before the gate (128 KiB..1 MiB per slice) / KV loads `evict_last` or default-cached | B>=32 +0.04..+0.3 ms / +0.3..+1.4 ms (weight streaming loses its L2) | rejected |
 | RG flash with the next rows' K/V prefetched in registers | stack 272 -> 3744 B (the entry is at the 255-register cap), 2x slower | rejected |
 | `gemv_k8` + 64 KiB L2 prefetch | B=1 +0.25 ms, B>=64 +0.2 ms | rejected |
 | wide GEMV `_gw` (B >= 48) | already selected by the manifest (`gemv_wide`); B=48 -> 64 costs +0.4 ms only | unchanged |
@@ -574,6 +580,56 @@ Served prefill-only (ISL 1000, OSL 1, temperature 0, `--multistep-adaptive`):
 
 Voice sessions (`session_bench.py`, 64 calls × 6 turns, 87% of later-turn prompt tokens cached):
 later-turn TTFT p50 is 35.5 ms without the tail and 31.8 ms with it.
+
+### Decode rungs vs roofline
+
+Per-op instruction-cap sweeps (`step_bench --sweep`, ctx 1024) of the native program on every
+rung. Roofline = bytes / 3.35 TB/s; cell = measured ms (% of roofline).
+
+| B | step | skeleton | roofline | gate+up | down | o_proj | qkv | flash hd256 | flash hd512 | lm_head | PLE gate |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 5.81 | 1.22 | 2.79 (48%) | 1.52 (87%) | 0.81 (81%) | 0.25 (61%) | 0.15 (86%) | 0.24 (5%) | 0.10 (9%) | 0.43 (93%) | 0.07 |
+| 8 | 6.36 | 1.36 | 2.95 (46%) | 1.58 (84%) | 0.93 (71%) | 0.19 (82%) | 0.14 (95%) | 0.57 (15%) | 0.22 (31%) | 0.48 (84%) | 0.12 |
+| 16 | 7.45 | 1.42 | 3.12 (42%) | 1.66 (80%) | 0.93 (71%) | 0.27 (57%) | 0.20 (65%) | 1.04 (17%) | 0.40 (35%) | 0.49 (82%) | 0.17 |
+| 32 | 9.08 | 1.48 | 3.46 (38%) | 2.06 (64%) | 1.27 (53%) | 0.37 (42%) | 0.27 (49%) | 0.96 (36%) | 0.61 (46%) | 0.60 (67%) | 0.35 |
+| 48 | 10.95 | 1.53 | 3.81 (35%) | 3.11 (43%) | 1.77 (38%) | 0.54 (30%) | 0.38 (35%) | 1.06 (50%) | 0.69 (61%) | 0.51 (81%) | 0.29 |
+| 64 | 11.76 | 1.55 | 4.16 (35%) | 3.24 (41%) | 1.95 (35%) | 0.62 (26%) | 0.48 (28%) | 1.08 (65%) | 0.74 (76%) | 0.50 (82%) | 0.34 |
+| 96 | 15.51 | 1.67 | 4.85 (31%) | 3.19 (42%) | 1.60 (43%) | 0.66 (25%) | 0.70 (19%) | 2.34 (45%) | 1.41 (60%) | 0.72 (58%) | 0.95 |
+| 128 | 16.39 | 1.77 | 5.54 (34%) | 3.33 (41%) | 1.45 (48%) | 0.57 (30%) | 0.71 (19%) | 2.55 (55%) | 1.46 (77%) | 0.70 (60%) | 1.19 |
+
+Implementation per rung: gate+up/down/o/qkv run `gemv_k8` (1-tile arm B<=8, 2/4/8 tiles to 64
+rows) and the `_gw` wgmma wide GEMV above 64; lm_head the row-block walk; flash the row-group
+body. The skeleton (cap 0: every gate and dispatch, no bodies) is 1.2-1.8 ms.
+
+The projections are the gap from 32 rows up. cuBLAS on the same shapes (42 layer copies so the
+weights stream from HBM, CUDA graph, % of 3.35 TB/s), per layer in us:
+
+| op (N x K) | M=1 | M=32 | M=64 | M=128 |
+|---|---|---|---|---|
+| gate+up (2 x 10240 x 2560) | 37.3 (84%) | 38.3 (83%) | 38.3 (84%) | 41.1 (80%) |
+| down (2560 x 10240) | 21.8 (72%) | 23.1 (69%) | 23.9 (68%) | 26.7 (62%) |
+| o_proj (2560 x 2048) | 6.3 (49%) | 6.7 (48%) | 6.8 (49%) | 7.2 (49%) |
+| q+k+v (3072 x 2560) | 8.0 (58%) | 8.4 (57%) | 8.4 (58%) | 9.1 (57%) |
+| lm_head (262144 x 2560) | 443 (91%) | 456 (89%) | 474 (87%) | 485 (87%) |
+
+Native at B=64: gate+up 77 us, down 46, o 15, qkv 20 per layer. The standalone `_gw` wide GEMV
+streams at cuBLAS speed without its stream-K fixup (down M=64 23.7 us, gate+up 44), and the
+fixup costs 10-14 us per op. `PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS=48` therefore routes every
+layer projection of the 48+ row rungs to cuBLASLt:
+
+* The rungs are unfused (gate, up, q, k, v separate) and segmented, one captured graph per rung.
+* The rungs below 48 keep the fused interpreter program, with bit-identical tokens.
+* The routed rungs' interpreter windows launch on the `_gw` object.
+* Multistep stays on.
+
+| B | 48 | 64 | 96 | 128 |
+|---|---|---|---|---|
+| native ms | 11.01 | 11.86 | 15.57 | 16.42 |
+| routed ms | 9.89 | 10.19 | 12.35 | 12.84 |
+
+A routed step is ~14 launches per layer (8 matmuls, 6 interpreter windows): about 3 ms of the
+B=128 step is launch gaps. Leaving k/v and the PLE projections in the interpreter cuts launches
+but loses (the PLE input gate runs at 2% of roofline natively at B>=96).
 
 ## Gaps
 

@@ -3678,10 +3678,16 @@ impl GpuEngine {
         let kv_maps = kv_tensor_maps(&blob.tensors, &blob.gen, blob.decode_prog()?.t as usize)?;
         let recurrent = recurrent_state_layout(&blob.tensors, blob.decode_prog()?.t as usize)?;
         let configured_multistep = RuntimeConfig::get().multistep();
+        // A ladder routing only its wide rungs keeps multistep: those rungs launch their captured
+        // graphs from the quantum loop, as the MoE-routed rungs do.
+        let cublaslt_every_rung = cublaslt_enabled
+            && (blob.progs.len() - blob.decode_progs().len()..blob.progs.len()).all(|index| {
+                segment_roles.as_ref().is_some_and(|roles| roles.program(index).is_some())
+            });
         let multistep_disabled_by_decode = decode_objects.is_some()
             || prepared_contexts.is_some()
             || !decode_packet_roles.is_empty()
-            || cublaslt_enabled
+            || cublaslt_every_rung
             || recurrent.is_some();
         let effective_multistep = if multistep_disabled_by_decode {
             if configured_multistep > 1 {
@@ -4922,13 +4928,15 @@ impl GpuEngine {
                 .iter()
                 .enumerate()
                 .map(|(index, g)| {
-                    let mut rung = if let Some(lt) = &cublaslt {
-                        let roles = &segment_roles
-                            .as_ref()
-                            .unwrap()
-                            .program(blob.progs.len() - blob.decode_progs().len() + index)
-                            .unwrap()
-                            .roles;
+                    let program = blob.progs.len() - blob.decode_progs().len() + index;
+                    let projection_roles = segment_roles
+                        .as_ref()
+                        .and_then(|r| r.program(program))
+                        .map(|p| &p.roles)
+                        .filter(|roles| {
+                            roles.iter().copied().any(plow_asset::segment_roles::is_projection)
+                        });
+                    let mut rung = if let (Some(lt), Some(roles)) = (&cublaslt, projection_roles) {
                         let segments = cublaslt::decode_segments(g, &blob.tensors, roles)?;
                         let waits = cublaslt::ordered_waits(g, &segments, &[])?;
                         let mut insts = g.insts.clone();
@@ -4947,11 +4955,14 @@ impl GpuEngine {
                             &waits,
                             &g.gq_seg_ofs,
                         )?;
+                        // The interpreter windows run the rung's own object (the `_gw` arms).
+                        let (function, smem) = wide_object(g.t as usize)
+                            .map_or((f, smem), |object| (object.function, object.smem));
                         rung.library = Some(cublaslt::CublasLtDecodeGraph::capture(
                             &be,
                             &stream,
                             rung.kernarg,
-                            f,
+                            function,
                             grid,
                             smem,
                             cublaslt::library_routes(routes),

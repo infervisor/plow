@@ -46,6 +46,11 @@ PLOW_MAX_CHUNK = "2048"
 PLOW_PF_LADDER_APPEND = "64,256"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
+# Decode rungs of 48+ rows run every layer projection as a cuBLASLt matmul inside the rung's
+# captured graph; narrower rungs keep the fused interpreter program (bit-identical tokens).
+# step_bench ctx 1024 B=48/64/96/128 11.0/11.9/15.6/16.4 -> 9.9/10.2/12.3/12.8 ms.
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "48"
 # Every flash segment isolated: hd256 sliding + hd512 full attention run in interp_sm90a_pffa
 # (prefill 2000 rows 70 -> 48 ms). Needs the pffa/pfpackedfa role objects below.
 PLOW_SEG_FA512 = "all"

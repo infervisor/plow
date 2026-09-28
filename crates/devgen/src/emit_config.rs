@@ -1226,6 +1226,11 @@ pub struct EmitConfig {
     #[arg(long = "emit-decode-cublaslt", env = "PLOW_EMIT_DECODE_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_cublaslt: bool,
 
+    /// With `decode_cublaslt`: only decode rungs of at least this many rows take the route; the
+    /// narrower rungs keep the fused interpreter program. Unset = every rung.
+    #[arg(long = "emit-decode-cublaslt-min-rows", env = "PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS")]
+    pub decode_cublaslt_min_rows: Option<u32>,
+
     /// Emit the measured SM90 BF16 prefill projections as packet-declared cuBLASLt segments.
     #[arg(long = "emit-prefill-cublaslt", env = "PLOW_EMIT_PREFILL_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub prefill_cublaslt: bool,
@@ -1618,6 +1623,7 @@ impl EmitConfig {
             qwen_fp8_m1_tma: env_bool("PLOW_QWEN_FP8_M1_TMA"),
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
             decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),
+            decode_cublaslt_min_rows: env_u32("PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS"),
             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
             moe_pf_lt: env_bool("PLOW_EMIT_MOE_PF_LT"),
             moe_dec_lt: env_bool("PLOW_EMIT_MOE_DEC_LT"),
@@ -1745,6 +1751,11 @@ impl EmitConfig {
     /// Resolve the layer truncation from --layers.
     pub fn layer_cfg(&self) -> (bool, Option<u32>, Option<u32>) {
         Self::parse_layers(self.layers.as_deref().unwrap_or("all"))
+    }
+
+    /// Whether a decode rung of `rows` rows takes the cuBLASLt decode route.
+    pub fn decode_cublaslt_at(&self, rows: u32) -> bool {
+        self.decode_cublaslt && rows >= self.decode_cublaslt_min_rows.unwrap_or(1)
     }
 
     /// Whether any fp8 weight encoding is active.

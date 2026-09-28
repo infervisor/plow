@@ -6,7 +6,8 @@ use plow_asset::segment_roles::{
 };
 
 pub(crate) fn apply(model: &mut Model) -> Result<SectionData, String> {
-    apply_projections(model, false)
+    let min_rows = crate::emit_config::active().decode_cublaslt_min_rows.unwrap_or(1);
+    apply_projections(model, false, min_rows)
 }
 
 pub(crate) fn apply_prefill(
@@ -325,9 +326,12 @@ fn prefill_eligible(model: &Model, op: &packet::dev::DevInst, rows: u32, profile
     })
 }
 
-fn apply_projections(model: &mut Model, head: bool) -> Result<SectionData, String> {
+fn apply_projections(model: &mut Model, head: bool, min_rows: u32) -> Result<SectionData, String> {
     let mut programs = Vec::new();
     for index in packet::devbuild::decode_rung_lo(&model.prog_t)..model.progs.len() {
+        if packet::devbuild::program_rows(model.prog_t[index]) < min_rows {
+            continue;
+        }
         let roles = apply_program(model, index, head)?;
         programs.push(serde_json::json!({"index": index, "roles": roles}));
     }
@@ -370,7 +374,7 @@ pub(crate) fn apply_native(
     {
         return Err("native decode object has no B32 capability".into());
     }
-    let mut section = apply_projections(model, true)?;
+    let mut section = apply_projections(model, true, 1)?;
     let mut roles = plow_asset::segment_roles::SegmentRoles::from_bytes(&section.data)?;
     for p in &mut roles.programs {
         for role in &mut p.roles {
@@ -412,6 +416,8 @@ fn apply_program(model: &mut Model, index: usize, head: bool) -> Result<Vec<u8>,
     }
     let mut builder = Builder::new(model.n_cu);
     builder.force_uniseg();
+    // The runtime's library segments need an instruction-major queue.
+    builder.set_gq_order_asap(false);
     builder.adopt_tensors(model.tensors.clone());
     let mut projections = Vec::new();
     for (pc, inst) in old.insts.iter().enumerate() {
@@ -422,7 +428,7 @@ fn apply_program(model: &mut Model, index: usize, head: bool) -> Result<Vec<u8>,
                     && (name.ends_with("lm_head.weight") || name.ends_with("embed_tokens.weight")))
         };
         if selected
-            && (!(1..=32).contains(&inst.i[0])
+            && (!(1..=plow_asset::segment_roles::CUBLASLT_DECODE_MAX_ROWS).contains(&inst.i[0])
                 || inst.i[0] != model.prog_t[index]
                 || inst.i[1] == 0
                 || inst.i[2] == 0
@@ -603,6 +609,17 @@ mod tests {
             tensor.bytes = extent;
         }
         model
+    }
+
+    #[test]
+    fn routes_only_the_wide_rungs() {
+        let mut m = model_rows(&[128, 8, 64]);
+        let narrow = m.progs[1].to_blob();
+        let metadata = apply_projections(&mut m, false, 16).unwrap();
+        let roles = plow_asset::segment_roles::SegmentRoles::from_bytes(&metadata.data).unwrap();
+        assert_eq!(roles.programs.len(), 1);
+        assert_eq!(roles.programs[0].index, 2);
+        assert_eq!(m.progs[1].to_blob(), narrow);
     }
 
     #[test]

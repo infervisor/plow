@@ -438,7 +438,9 @@ fn projection_segments(
     let fail = || RuntimeError::Rejected("invalid packet-declared projection segments".into());
     let rows = packet::devbuild::program_rows(program.t);
     if match phase {
-        ProjectionPhase::Decode => !(1..=32).contains(&rows),
+        ProjectionPhase::Decode => {
+            !(1..=plow_asset::segment_roles::CUBLASLT_DECODE_MAX_ROWS).contains(&rows)
+        }
         ProjectionPhase::Prefill(_) => rows > plow_asset::segment_roles::CUBLASLT_PREFILL_MAX_ROWS,
     } || program.l2_domains != 0
         || program.gq_stream.is_empty()

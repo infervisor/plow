@@ -33,6 +33,8 @@ pub fn is_projection(role: u8) -> bool {
 }
 
 pub const CUBLASLT_PREFILL_MAX_ROWS: u32 = 16384;
+/// Widest decode rung whose projections may run as cuBLASLt segments.
+pub const CUBLASLT_DECODE_MAX_ROWS: u32 = 128;
 pub const CUBLASLT_PREFILL_ROWS: [u32; 3] = [128, 256, 512];
 /// 1088 / 1152 / 4160 are fine-grained rungs (`PLOW_PF_LADDER_APPEND`): BOS makes an N-token prompt
 /// N+1 rows. Left out, such a rung ran every projection on the native GEMM object. Measured on
