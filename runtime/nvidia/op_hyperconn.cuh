@@ -127,13 +127,18 @@ __device__ __forceinline__ float sinkhorn4_warp(const float* __restrict__ mrow, 
 /* t0=post_mix(out,[T,4]f32) t1=comb_mix(out,[T,4,4]f32) t2=layer_input(out,[T,hidden]bf16)
  * t3=mixes(in,[T,24]f32) t4=residual(in,[T,4,hidden]bf16) t5=hc_scale[3] t6=hc_base[24]
  * t7=pre_pair([2,T,4]f32) · i0=T i1=n i2=hidden i3=sinkhorn_repeat i4=pre_in_half i5=pre_mode
- * i6=mix_parts: > 1 means t3 holds GemvF32's K-slice partials [i6][T,24] (decode), summed here */
+ * i6=mix_parts: > 1 means t3 holds GemvF32's K-slice partials [i6][T,24] (decode), summed here
+ * j1=split (decode, one block per token): 0 = everything; bit 0 = t2 is the sublayer RMSNorm of
+ * the collapse with gamma = tensor i7 (bit-identical to the RmsNorm op), bit 1 = no post/comb
+ * (Sinkhorn), bit 2 = post/comb ONLY. The decode chain runs {bits 0|1} on its critical path and
+ * {bit 2} beside it: comb_mix is not read until the sublayer's HyperConnPost. */
 __device__ __forceinline__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict__ comb_mix, __nv_bfloat16* __restrict__ layer_input,
                                                 const float* __restrict__ mixes, const __nv_bfloat16* __restrict__ residual,
                                                 const float* __restrict__ hc_scale, const float* __restrict__ hc_base, unsigned T, unsigned n,
                                                 unsigned hidden, unsigned repeat, float rms_eps, float hc_eps, unsigned slice, unsigned nblk,
                                                 float* __restrict__ pre_pair, unsigned pre_in_half, unsigned pre_mode,
-                                                unsigned mix_parts, float* arena = nullptr, unsigned arena_floats = 0) {
+                                                unsigned mix_parts, float* arena = nullptr, unsigned arena_floats = 0,
+                                                unsigned split = 0, const __nv_bfloat16* __restrict__ gamma = nullptr) {
     using namespace plow_hc;
     if (n != 4u || hidden % 8u) __trap();
     const unsigned warps = blockDim.x >> 5, wv = threadIdx.x >> 5, ln = threadIdx.x & 31u;
@@ -149,6 +154,7 @@ __device__ __forceinline__ void d_hyperconn_pre(float* __restrict__ post_mix, fl
         __shared__ float s_red[32], s_g[4], s_par[56], s_mp[10][24];
         const unsigned sub = nblk / T;
         if (slice >= T * sub) return;
+        if (split && (sub != 1u || ((split & 1u) && (!gamma || hidden / 8u > 3u * blockDim.x)))) __trap();
         const unsigned t = slice / sub, part = slice % sub, tid = threadIdx.x;
         const uint16_t* rrow = res + (size_t)t * nh;
         uint16_t* rs = reinterpret_cast<uint16_t*>(arena);
@@ -207,7 +213,7 @@ __device__ __forceinline__ void d_hyperconn_pre(float* __restrict__ post_mix, fl
             float g[4];
 #pragma unroll
             for (unsigned j = 0; j < 4u; j++) g[j] = 1.0f / (1.0f + expf(-((s_par[j] * inv) * s_par[48] + s_par[24 + j]))) + hc_eps;
-            if (pre_mode != PLOW_HC_PRE_OWN && part == 0) {
+            if (pre_mode != PLOW_HC_PRE_OWN && part == 0 && !(split & 4u)) {
                 float* po = pre_pair + (size_t)(pre_in_half ^ 1u) * T * 4u + (size_t)t * 4u;
 #pragma unroll
                 for (unsigned j = 0; j < 4u; j++) po[j] = g[j];
@@ -219,7 +225,7 @@ __device__ __forceinline__ void d_hyperconn_pre(float* __restrict__ post_mix, fl
                                                         : s_par[51 + j];
         }
         __syncthreads();
-        if (part == 0 && wv == warps - 1u) {
+        if (part == 0 && wv == warps - 1u && !(split & 2u)) {
             const float inv = s_red[31];
             if (ln < 4u)
                 post_mix[(size_t)t * 4u + ln] = (1.0f / (1.0f + expf(-((s_par[4 + ln] * inv) * s_par[49] + s_par[28 + ln])))) * PLOW_HC_POST_MULT;
@@ -229,6 +235,52 @@ __device__ __forceinline__ void d_hyperconn_pre(float* __restrict__ post_mix, fl
         const float g0 = s_g[0], g1 = s_g[1], g2 = s_g[2], g3 = s_g[3];
         uint16_t* lrow = reinterpret_cast<uint16_t*>(layer_input) + (size_t)t * hidden;
         const unsigned h8 = hidden / 8u;
+        if (split & 4u) {
+            __syncthreads(); /* the arena is the next op's */
+            return;
+        }
+        if (split & 1u) {
+            /* d_rmsnorm's block path on the bf16 collapse: the same thread -> chunk map
+             * (tid + c * 256), sum order and formula, so the output is the RmsNorm op's bytes */
+            uint4 xv[3];
+            float ss2 = 0.0f;
+#pragma unroll
+            for (unsigned c = 0; c < 3u; c++) {
+                const unsigned c8 = tid + c * blockDim.x;
+                if (c8 < h8) {
+                    float v0[8], v1[8], v2[8], v3[8], acc[8];
+                    unpack8(*reinterpret_cast<const uint4*>(rs + c8 * 8u), v0);
+                    unpack8(*reinterpret_cast<const uint4*>(rs + hidden + c8 * 8u), v1);
+                    unpack8(*reinterpret_cast<const uint4*>(rs + 2u * hidden + c8 * 8u), v2);
+                    unpack8(*reinterpret_cast<const uint4*>(rs + 3u * hidden + c8 * 8u), v3);
+#pragma unroll
+                    for (int u = 0; u < 8; u++) acc[u] = fmaf(g3, v3[u], fmaf(g2, v2[u], fmaf(g1, v1[u], g0 * v0[u])));
+                    xv[c] = pack8(acc);
+                    unpack8(xv[c], acc);
+#pragma unroll
+                    for (int u = 0; u < 8; u++) {
+                        const float f = acc[u];
+                        ss2 += f * f;
+                    }
+                }
+            }
+            const float inv2 = rsqrtf(block_sum(ss2, s_red) * __fdividef(1.0f, (float)hidden) + rms_eps);
+            const uint16_t* gm = reinterpret_cast<const uint16_t*>(gamma);
+#pragma unroll
+            for (unsigned c = 0; c < 3u; c++) {
+                const unsigned c8 = tid + c * blockDim.x;
+                if (c8 < h8) {
+                    float v[8], gw[8], o[8];
+                    unpack8(xv[c], v);
+                    unpack8(*reinterpret_cast<const uint4*>(gm + c8 * 8u), gw);
+#pragma unroll
+                    for (int u = 0; u < 8; u++) o[u] = __bfloat162float(__float2bfloat16(v[u] * inv2 * norm_weight(gw[u])));
+                    *reinterpret_cast<uint4*>(lrow + c8 * 8u) = pack8(o);
+                }
+            }
+            __syncthreads(); /* the arena is the next op's */
+            return;
+        }
 #pragma unroll 1
         for (unsigned c8 = part * h8 / sub + tid; c8 < (part + 1u) * h8 / sub; c8 += blockDim.x) {
             float v0[8], v1[8], v2[8], v3[8], acc[8];

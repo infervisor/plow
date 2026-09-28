@@ -550,6 +550,8 @@ pub(crate) fn emit_dsv41_attn_proj(
     x: u32,
     t: u32,
     deps: &[u32],
+    // The HyperConnPre to fold this sublayer's RMSNorm into (see `dsv41_fuse_pre_norm`).
+    fuse_pre: Option<u32>,
 ) -> (Dsv41ProjAct, [u32; 2]) {
     let hidden = c.hidden;
     let q_lora = c.q_lora;
@@ -583,14 +585,17 @@ pub(crate) fn emit_dsv41_attn_proj(
     // eps is 1e-20 on this model, not the 1e-6 every other family uses. Reading it from the
     // config rather than writing a constant is the same rule the scale grid follows.
     let eps = c.eps;
-    let c_xn = b.emit(DevOp::RmsNorm, all.clone(), deps, |d| {
-        d.t[0] = act.xn;
-        d.t[1] = x;
-        d.t[2] = w.get(l, "attn_norm.weight");
-        d.i[0] = t;
-        d.i[1] = hidden;
-        d.f[0] = eps;
-    });
+    let c_xn = match fuse_pre {
+        Some(p) => dsv41_fuse_pre_norm(b, p, act.xn, w.get(l, "attn_norm.weight"), eps, t),
+        None => b.emit(DevOp::RmsNorm, all.clone(), deps, |d| {
+            d.t[0] = act.xn;
+            d.t[1] = x;
+            d.t[2] = w.get(l, "attn_norm.weight");
+            d.i[0] = t;
+            d.i[1] = hidden;
+            d.f[0] = eps;
+        }),
+    };
 
     let c_qa = emit_pf_gemm_fp8_mx(
         b,
@@ -1596,6 +1601,25 @@ pub(crate) fn emit_dsv41_mhc_pre(
     )
 }
 
+/// NVIDIA decode: whether `dsv41_fuse_pre_norm` applies (one block per token, whole rows).
+pub(crate) fn dsv41_pre_fusable(t: u32, tp: u32) -> bool {
+    !crate::emit_is_amd() && t <= 8 && sp_abl_rows(t, tp) == t
+}
+
+/// Fold the sublayer RMSNorm into `HyperConnPre` `p`: one block per token writes the normalized
+/// collapse into `xn` (bit-identical to the `RmsNorm` op) and skips post/comb, which the caller
+/// computes beside it with `Builder::fork_op(p, |d| d.j[1] = 4)` for the sublayer's HyperConnPost.
+/// Removes the norm's hop from the critical path.
+fn dsv41_fuse_pre_norm(b: &mut Builder, p: u32, xn: u32, gamma: u32, eps: f32, t: u32) -> u32 {
+    b.amend(p, (0..t).collect(), |d| {
+        assert_eq!((d.op, d.f[0], d.j[1]), (DevOp::HyperConnPre as u16, eps, 0));
+        d.t[2] = xn;
+        d.i[7] = gamma;
+        d.j[1] = 3;
+    });
+    p
+}
+
 /// The mHC POST half: mix `raw` back across the residual copies, into the OTHER buffer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_dsv41_mhc_post(
@@ -2422,6 +2446,7 @@ pub(crate) fn emit_dsv41_ffn_shared(
     // The combine reads the partial locally either way. Slot 0 is only safe while attention's
     // reduce is two-shot (below); the decode program's one-shot reduce needs a local buffer.
     local_part: bool,
+    fuse_pre: Option<u32>,
 ) -> (Dsv41FfnAct, u32) {
     let hidden = c.hidden;
     assert_eq!(
@@ -2470,14 +2495,17 @@ pub(crate) fn emit_dsv41_ffn_shared(
     };
     let all = cus.to_vec();
     let eps = c.eps;
-    let c_xn = b.emit(DevOp::RmsNorm, all.clone(), deps, |d| {
-        d.t[0] = act.xn;
-        d.t[1] = x;
-        d.t[2] = w.get(l, "ffn_norm.weight");
-        d.i[0] = t;
-        d.i[1] = hidden;
-        d.f[0] = eps;
-    });
+    let c_xn = match fuse_pre {
+        Some(p) => dsv41_fuse_pre_norm(b, p, act.xn, w.get(l, "ffn_norm.weight"), eps, t),
+        None => b.emit(DevOp::RmsNorm, all.clone(), deps, |d| {
+            d.t[0] = act.xn;
+            d.t[1] = x;
+            d.t[2] = w.get(l, "ffn_norm.weight");
+            d.i[0] = t;
+            d.i[1] = hidden;
+            d.f[0] = eps;
+        }),
+    };
     act.c_xn = c_xn;
     // Gate and up read the SAME input and have no dependence on each other.
     let c_g = emit_pf_gemm_fp8_mx(
@@ -2504,6 +2532,13 @@ pub(crate) fn emit_dsv41_ffn_shared(
         hidden,
         &[c_xn],
     );
+    if local_part {
+        // Decode: the shared expert is needed only by the combine, after the routed experts. Let
+        // the router chain (router GEMM -> top-k -> align, 4 and 1 blocks) claim the grid first
+        // so the routed GLU is not queued behind the shared gate/up GEMVs.
+        b.defer_gq(c_g, 3);
+        b.defer_gq(c_u, 3);
+    }
     let limit = c.raw.swiglu_limit;
     let c_act = b.emit(DevOp::Glu, all.clone(), &[c_g, c_u], |d| {
         d.t[0] = act.sh_act;
@@ -2930,7 +2965,7 @@ pub(crate) fn emit_dsv41_chain(
             c_pre
         };
         let (proj, c_proj) =
-            emit_dsv41_attn_proj(&mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre]);
+            emit_dsv41_attn_proj(&mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre], None);
         // Every rope in a layer reads that layer's ONE `freqs_cis`, and which table that is comes
         // from `compress_ratio` alone -- see the two tables above.
         let (lcos, lsin) = if matches!(
@@ -3057,7 +3092,7 @@ pub(crate) fn emit_dsv41_chain(
             c_pre2
         };
         let (ffn, c_sh) = emit_dsv41_ffn_shared(
-            &mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre2], false,
+            &mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre2], false, None,
         );
         let c_moe = emit_dsv41_moe(
             &mut b, c, &w, l, tp, t, xnext, ffn.xn, c_sh, (ffn.sh_part, c_sh), &mut xgate, &all,
@@ -3350,9 +3385,12 @@ fn emit_dsv41_decode_program(
             let e = engram.as_ref().expect("declared for this chain");
             deps = vec![emit_dsv41_engram(b, c, w, &all, e, l, tp, bsz, mhc.residual[ri], &mut xgate, &deps)];
         }
+        let fuse = dsv41_pre_fusable(bsz, tp);
         let c_pre = emit_dsv41_mhc_pre(b, c, w, &mhc, l, false, ri, pi, bsz, tp, &deps);
         pi += 1;
-        let (proj, c_proj) = emit_dsv41_attn_proj(b, c, w, &all, l, tp, mhc.layer_input, bsz, &[c_pre]);
+        let (proj, c_proj) =
+            emit_dsv41_attn_proj(b, c, w, &all, l, tp, mhc.layer_input, bsz, &[c_pre], fuse.then_some(c_pre));
+        let c_mix = if fuse { b.fork_op(c_pre, |d| d.j[1] = 4) } else { c_pre };
         let (lcos, lsin) = if matches!(c.raw.attn_kind(l), nn_graph::models::config::V41Attn::Window) {
             (cos, sin)
         } else {
@@ -3379,7 +3417,7 @@ fn emit_dsv41_decode_program(
             &c_proj,
         );
         let (out, c_out) = emit_dsv41_attn_out(b, c, w, &all, l, tp, attn_o, bsz, &mut xgate, &[c_core]);
-        let c_post = emit_dsv41_mhc_post(b, c, &mhc, out.o, ri, bsz, tp, &c_out);
+        let c_post = emit_dsv41_mhc_post(b, c, &mhc, out.o, ri, bsz, tp, &[&c_out[..], &[c_mix]].concat());
         ri ^= 1;
         if attn_only {
             deps = vec![c_post];
@@ -3387,10 +3425,23 @@ fn emit_dsv41_decode_program(
         }
         let c_pre2 = emit_dsv41_mhc_pre(b, c, w, &mhc, l, true, ri, pi, bsz, tp, &[c_post]);
         pi += 1;
-        let (ffn, c_sh) = emit_dsv41_ffn_shared(b, c, w, &all, l, tp, mhc.layer_input, bsz, &[c_pre2], true);
+        let (ffn, c_sh) = emit_dsv41_ffn_shared(
+            b,
+            c,
+            w,
+            &all,
+            l,
+            tp,
+            mhc.layer_input,
+            bsz,
+            &[c_pre2],
+            true,
+            fuse.then_some(c_pre2),
+        );
+        let c_mix2 = if fuse { b.fork_op(c_pre2, |d| d.j[1] = 4) } else { c_pre2 };
         let xnext = b.tensor("act.xnext", bsz as u64 * c.hidden as u64 * 2);
         let c_moe = emit_dsv41_moe(b, c, w, l, tp, bsz, xnext, ffn.xn, ffn.c_xn, (ffn.sh_part, c_sh), &mut xgate, &all, peer_w, slot_t);
-        let c_layer = emit_dsv41_mhc_post(b, c, &mhc, xnext, ri, bsz, tp, &[c_moe]);
+        let c_layer = emit_dsv41_mhc_post(b, c, &mhc, xnext, ri, bsz, tp, &[c_moe, c_mix2]);
         ri ^= 1;
         deps = vec![c_layer];
     }

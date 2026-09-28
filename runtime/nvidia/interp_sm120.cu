@@ -1461,7 +1461,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         d_hyperconn_pre((float*)TEN(0), (float*)TEN(1), (__nv_bfloat16*)TEN(2), (const float*)TEN(3),
                         (const __nv_bfloat16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6), in->i[0], in->i[1],
                         in->i[2], in->i[3], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)TEN(7), in->i[4], in->i[5], in->i[6],
-                        arena, PLOW_NV_ARENA_FLOATS);
+                        arena, PLOW_NV_ARENA_FLOATS, in->fj[2].u,
+                        in->fj[2].u & 1u ? (const __nv_bfloat16*)T[in->i[7]] : nullptr);
         break;
     case PLOW_DOP_GEMV_F32:
         d_gemv_f32((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk, arena,
