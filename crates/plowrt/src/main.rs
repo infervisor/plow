@@ -3494,13 +3494,19 @@ async fn bringup_runtime(
                     ?policy,
                     "placement: group ready"
                 );
-                let be = backends
+                let group_bes: Vec<_> = group
+                    .ordinals
                     .iter()
-                    .find(|(d, _)| *d == group.first())
-                    .map(|(_, b)| Arc::clone(b))
-                    .expect("group ordinal came from the opened set");
-                let mgr = Arc::new(plowrt::serve::manager::ModelManager::new(
-                    be, &state, mux_cfg, mine, budget,
+                    .map(|o| {
+                        backends
+                            .iter()
+                            .find(|(d, _)| d == o)
+                            .map(|(_, b)| Arc::clone(b))
+                            .expect("group ordinal came from the opened set")
+                    })
+                    .collect();
+                let mgr = Arc::new(plowrt::serve::manager::ModelManager::new_group(
+                    group_bes, &state, mux_cfg, mine, budget,
                 )?);
                 let index = managers.len();
                 for slug in members {
