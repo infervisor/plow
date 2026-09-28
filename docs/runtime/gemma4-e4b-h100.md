@@ -456,32 +456,36 @@ flash, FATLITE light object, cuBLASLt projections.
 | PLE proj GEMM | 2000 | 2.6 | 12.6 | 3.8 | 11 | 34% | cuBLASLt |
 | NormResidual+RmsNorm (layer end) | 2000 | 0.0 | 41.0 | 12.2 | 34 | 36% | interp |
 
-Whole launch (in-kernel, sum of segments):
+Whole launch (in-kernel):
 
-| rows | all 42 layers on every row | KV-shared tail on sampled rows | vLLM served |
+| rows | all 42 layers on every row | tail as prefill segments (pf_2) | tail as a decode step |
 |---|---|---|---|
-| 1000 | 21.3 ms (21.3 µs/row) | 17.3 ms (17.3 µs/row) | |
-| 2000 | 34.7 ms (17.4 µs/row) | 25.2 ms (12.6 µs/row) | 13.2 µs/row (c32) |
+| 1000 | 21.3 ms (21.3 µs/row) | 17.3 ms | 14.7 ms (14.7 µs/row) |
+| 2000 | 34.7 ms (17.4 µs/row) | 25.2 ms | 22.4 ms (11.2 µs/row) |
 
 **KV-shared tail** (`plow_asset::kv_shared_tail`, `PLOW_PF_SHARED_TAIL`, on by default). The last
 18 layers of E4B write no KV cache, so on the packed/token-batch route only the sampled rows
 (prompt-final rows and riding decode rows) run them:
 * the body stops at the tail boundary;
 * RowGather moves the sampled rows' `act.x`, `act.hn` and `act.ple` to rows 0..n;
-* the smallest bucket then runs its tail segments with each row as a one-row request at its own
-  position, over a counter image that marks the prefix as done.
+* the smallest decode rung with at least n rows then runs from its own tail boundary to its
+  end: its GEMV/gemv_k8 projections, flash decode reading each row's slot through the packed
+  slot map (`t6`), and its lm_head/argmax, which leave the ids and logits in rows 0..n for the
+  terminal.
 
-The packet declares the boundary per bucket, so the path is model-generic. A packet without the
-section, or a launch with more sampled rows than slots, runs the whole program. At 1-2 sampled
-rows the tail costs 5.0 ms per launch. Most of that is 18 bucket-64 GEMM passes (~130 µs/layer)
-and v3 flash at one query row (50 µs hd256, 170 µs hd512, latency-bound).
+A counter image marks the skipped prefix as done. For 1-2 rows this costs 2.76 ms, including the
+lm_head. The earlier path ran the smallest prefill bucket's tail segments and the separate
+terminal, which took 5.0 + 0.9 ms. That path remains the fallback when no decode rung holds n
+rows. A packet without the section, or a launch with more sampled rows than slots, runs the
+whole program.
 
 Served prefill-only (ISL 1000, OSL 1, temperature 0, `--multistep-adaptive`):
 
 | | c1 req/s | c32 req/s | c32 TTFT p50 |
 |---|---|---|---|
 | all rows, all layers | 30.3 | 55.4 | 72.6 ms |
-| KV-shared tail | 34.9 | 77.3 | 50.9 ms |
+| KV-shared tail, prefill segments | 34.9 | 77.3 | 50.9 ms |
+| KV-shared tail, decode step | 35.1 | 83.4 | 47.6 ms |
 | vLLM | 26.5 | 75.7 | 384 ms |
 
 Voice sessions (`session_bench.py`, 64 calls × 6 turns, 87% of later-turn prompt tokens cached):

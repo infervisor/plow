@@ -32,6 +32,10 @@ pub struct Manifest {
     pub first_layer: u32,
     /// Tail start instruction per prefill program, in program-table order.
     pub boundaries: Vec<u32>,
+    /// Tail start instruction per decode rung (the programs after the prefill ones), `0` where a
+    /// rung has none. The rung's tail up to its lm_head runs the sampled rows as a decode step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decode_boundaries: Vec<u32>,
     pub carried: Vec<Carried>,
 }
 

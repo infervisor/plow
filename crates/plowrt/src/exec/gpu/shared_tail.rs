@@ -8,6 +8,18 @@
 use super::*;
 use packet::dev::TENSOR_NONE16;
 
+/// A decode rung's tail window: the rung's layers from the KV-shared boundary up to its lm_head,
+/// with its flash reading each row's slot from the packed slot map.
+struct DecodeTail {
+    /// Index into `GpuEngine::decode_rungs`.
+    rung: usize,
+    rows: usize,
+    kernarg: DevProgram,
+    /// The rung's counter slab as the skipped prefix leaves it.
+    image: DeviceMem,
+    _tables: Vec<DeviceMem>,
+}
+
 pub(crate) struct SharedTail {
     /// First tail segment of each prefill bucket.
     boundary: Vec<usize>,
@@ -22,6 +34,7 @@ pub(crate) struct SharedTail {
     gather_counter_bytes: usize,
     _gather_tables: Vec<DeviceMem>,
     _gather_tensors: DeviceMem,
+    decode: Vec<DecodeTail>,
     host_rows: Vec<u32>,
     positions: Vec<i32>,
     slots: Vec<i32>,
@@ -146,8 +159,10 @@ impl SharedTail {
         e.be.upload(&tensors, 0, pod_bytes(&pointers))?;
         let (gather_arg, _, gather_counter_bytes, tables) =
             super::mixed_step::upload_program(&e.be, &program, tensors.base, 0, 0)?;
+        let decode = decode_tails(e, blob, manifest)?;
         tracing::info!(
             first_layer = manifest.first_layer,
+            decode_rungs = decode.len(),
             carried = carried.len(),
             boundaries = ?boundary,
             "kv-shared tail: packed prefill runs the trailing KV-shared layers on sampled rows"
@@ -163,6 +178,7 @@ impl SharedTail {
             gather_counter_bytes,
             _gather_tables: tables,
             _gather_tensors: tensors,
+            decode,
             host_rows: Vec::with_capacity(capacity),
             positions: Vec::new(),
             slots: Vec::new(),
@@ -174,6 +190,121 @@ impl SharedTail {
     pub(crate) fn fits(&self, n: usize) -> bool {
         n <= self.capacity
     }
+}
+
+/// Counter slab image after every stream entry of `insts < mark` has signalled.
+fn prefix_image(g: &DevProg, mark: usize, bytes: usize) -> Vec<u32> {
+    let mut image = vec![0u32; bytes / 4];
+    for s in g.gq_stream.iter().filter(|s| (s.inst as usize) < mark) {
+        for &c in &g.succs[s.succ_ofs as usize..(s.succ_ofs + u32::from(s.succ_len)) as usize] {
+            image[c as usize * CTR_STRIDE as usize] += 1;
+        }
+    }
+    image
+}
+
+fn decode_tails(
+    e: &GpuEngine,
+    blob: &DevBlob,
+    manifest: &plow_asset::kv_shared_tail::Manifest,
+) -> Result<Vec<DecodeTail>> {
+    let Some(slot_handle) = e.packed_prefill.as_ref().map(|p| p.slot) else {
+        return Ok(Vec::new());
+    };
+    let first = blob.progs.iter().position(|p| p.role.is_decode_rung());
+    let mut out = Vec::new();
+    for (index, rung) in e.decode_rungs.iter().enumerate() {
+        if rung.library.is_some() {
+            continue;
+        }
+        let Some((k, g)) = first.and_then(|first| {
+            blob.progs[first..]
+                .iter()
+                .enumerate()
+                .find(|(_, p)| p.role.is_decode_rung() && p.t as usize == rung.rows)
+        }) else {
+            continue;
+        };
+        let mark = manifest.decode_boundaries.get(k).copied().unwrap_or(0) as usize;
+        // Through the rung's own lm_head/argmax: the ids and logits land in rows 0..n, where
+        // the packed terminal would have put them.
+        let end = rung.host_insts.len();
+        let head = rung.host_insts.iter().any(|d| d.t[0] as usize == e.t_logits)
+            && rung.host_insts.iter().any(|d| d.t[0] as usize == e.t_ids);
+        if mark == 0 || mark >= end || !head {
+            continue;
+        }
+        let mut insts = rung.host_insts.clone();
+        let mut ok = true;
+        for d in &mut insts[mark..end] {
+            match DevOp::from_u16(d.op) {
+                Some(DevOp::FlashDecode) => {
+                    // The slot-map arm has no merge fold.
+                    if d.fj[2] != 0 || d.t[6] != TENSOR_NONE16 {
+                        ok = false;
+                    }
+                    d.t[6] = slot_handle;
+                }
+                Some(
+                    DevOp::HeadNormRope
+                    | DevOp::HeadNormRopeFp8
+                    | DevOp::FlashDecodeFp8
+                    | DevOp::FlashPrefill
+                    | DevOp::FlashPrefillFp8,
+                ) if insts_writes_kv(d, e) => ok = false,
+                _ => {}
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let stream: Vec<_> = g
+            .gq_stream
+            .iter()
+            .filter(|s| (mark..end).contains(&(s.inst as usize)))
+            .map(|s| {
+                let mut s = *s;
+                s.seg = 0;
+                s
+            })
+            .collect();
+        let upload = |bytes: &[u8]| -> Result<DeviceMem> {
+            let mem = e.be.alloc(0, bytes.len().max(4) as u64)?;
+            if !bytes.is_empty() {
+                e.be.upload(&mem, 0, bytes)?;
+            }
+            Ok(mem)
+        };
+        let tables = vec![
+            upload(pod_bytes(&insts))?,
+            upload(pod_bytes(&stream))?,
+            upload(pod_bytes(&[0u32, stream.len() as u32]))?,
+        ];
+        let image = e.be.alloc(0, rung.counter_bytes as u64)?;
+        e.be.upload(&image, 0, pod_bytes(&prefix_image(g, mark, rung.counter_bytes)))?;
+        let kernarg = DevProgram {
+            insts: tables[0].base,
+            gq_stream: tables[1].base,
+            gq_seg_ofs: tables[2].base,
+            cur_seg: 0,
+            ..rung.kernarg
+        };
+        out.push(DecodeTail {
+            rung: index,
+            rows: rung.rows,
+            kernarg,
+            image,
+            _tables: tables,
+        });
+    }
+    Ok(out)
+}
+
+/// A KV write inside the tail window would make it unsound; the manifest says there is none.
+fn insts_writes_kv(d: &DevInst64, e: &GpuEngine) -> bool {
+    e.tensor_names
+        .get(d.t[0] as usize)
+        .is_some_and(|name| name.starts_with("kv."))
 }
 
 impl GpuEngine {
@@ -236,7 +367,67 @@ impl GpuEngine {
                 )?;
             }
 
-            // 2. The tail bucket's request tables: row r is a one-row request at its position.
+            // 2a. A decode rung holding n rows runs the tail as a decode step: row r reads slot
+            // rows[r].1's cache at kvlen position+1. Pad rows read one row of the first slot.
+            if let Some(d) = tail.decode.iter().filter(|d| d.rows >= n).min_by_key(|d| d.rows) {
+                let (slot0, rows_d) = (rows[0].1 as i32, d.rows);
+                tail.positions.clear();
+                tail.slots.clear();
+                tail.table.clear();
+                for &(_, slot, pos) in rows {
+                    tail.positions.push(pos as i32);
+                    tail.slots.push(slot as i32);
+                    tail.table.push(pos as i32 + 1);
+                }
+                tail.positions.resize(rows_d, 0);
+                tail.slots.resize(rows_d, slot0);
+                tail.table.resize(rows_d, 1);
+                let pb = self.pf_batch.as_ref().expect("packed");
+                // SAFETY: the sources live on `tail` until the stream drains.
+                unsafe {
+                    self.be.memcpy_htod_async(
+                        self.devp[self.t_pos].base,
+                        bytemuck::cast_slice(&tail.positions),
+                        &self.stream,
+                    )?;
+                    self.be.memcpy_htod_async(
+                        pb.d_slot.base,
+                        bytemuck::cast_slice(&tail.slots),
+                        &self.stream,
+                    )?;
+                    self.be.memcpy_htod_async(
+                        self.devp[self.t_kvlen].base,
+                        bytemuck::cast_slice(&tail.table),
+                        &self.stream,
+                    )?;
+                }
+                let rung = &self.decode_rungs[d.rung];
+                self.be.memcpy_dtod_async(
+                    rung.counters.base,
+                    d.image.base,
+                    rung.counter_bytes as u64,
+                    &self.stream,
+                )?;
+                let mut arg = d.kernarg;
+                let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+                let object = rung.object.as_deref();
+                if let Some(terminal) = self.packed_terminal.as_mut() {
+                    terminal.skip_next();
+                }
+                return self.be.launch_cooperative(
+                    object.map_or(self.f, |o| o.function),
+                    object.map_or(self.grid, |o| o.grid),
+                    object.map_or(BLOCK, |o| o.block),
+                    object.map_or(
+                        if rung.group_arena { self.smem } else { self.smem_narrow },
+                        |o| o.smem,
+                    ),
+                    &mut params,
+                    Some(&self.stream),
+                );
+            }
+
+            // 2b. The tail bucket's request tables: row r is a one-row request at its position.
             let bt = self
                 .prefill
                 .iter()

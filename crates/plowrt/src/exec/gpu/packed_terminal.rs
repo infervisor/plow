@@ -18,6 +18,8 @@ pub(super) struct PackedTerminal {
     insts: [Vec<DevInst64>; 2],
     stage: usize,
     host_ids: PinnedHost,
+    /// The next launch's ids and logits are already in place (the KV-shared tail ran the head).
+    skip: bool,
 }
 
 fn layout(insts: &[DevInst64], rows: u32, logits: usize, ids: usize) -> Option<[DevInst64; 5]> {
@@ -268,6 +270,7 @@ impl PackedTerminal {
             _tables: tables,
             host_rows: [Vec::with_capacity(capacity), Vec::with_capacity(capacity)],
             host_ids: e.be.host_alloc_pinned(capacity * 4)?,
+            skip: false,
         }))
     }
 
@@ -288,8 +291,12 @@ impl PackedTerminal {
         i
     }
 
+    pub(super) fn skip_next(&mut self) {
+        self.skip = true;
+    }
+
     pub(super) fn launch(&mut self, e: &GpuEngine, live: usize, i: usize) -> Result<()> {
-        if self.host_rows[i].is_empty() {
+        if std::mem::take(&mut self.skip) || self.host_rows[i].is_empty() {
             return Ok(());
         }
         if self.host_rows[i].len() > self.capacity

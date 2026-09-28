@@ -4525,7 +4525,7 @@ fn emit_phase(
     let mut nrn_pending: Option<(u32, u32, u32, f32)> = None;
     // First layer of the trailing KV-shared run: a prefill program marks where its row-local
     // tail begins (plow_asset::kv_shared_tail).
-    let shared_tail_start = (!decode && !block_mode && !hj && tp == 1 && block.end == c.layers as usize)
+    let shared_tail_start = (!block_mode && !hj && tp == 1 && block.end == c.layers as usize)
         .then(|| {
             (0..c.layers as usize)
                 .rev()
@@ -9906,6 +9906,7 @@ fn emit_dense_gqa(
             &mut scratch
         };
         emitter.emit_decode(&mut bd, rb, dmode, sink);
+        shared_tail_marks.push(bd.shared_tail_mark());
         progs.push(bd.finish());
         tlist.push(rb);
     }
@@ -10783,9 +10784,17 @@ fn kv_shared_tail_section(
     first_layer: u32,
 ) -> Option<packet::devbuild::SectionData> {
     let prefill = packet::devbuild::decode_rung_lo(&m.prog_t);
-    if prefill == 0 || marks.len() < prefill || marks[..prefill].iter().any(Option::is_none) {
+    if prefill == 0
+        || marks.len() != m.progs.len()
+        || marks[..prefill].iter().any(Option::is_none)
+    {
         return None;
     }
+    // Decode rungs that carry the same boundary let the runtime run the tail as a decode step.
+    let decode_boundaries: Vec<u32> = marks[prefill..]
+        .iter()
+        .map(|&mark| mark.unwrap_or(0))
+        .collect();
     let max_rows = m.prog_t[..prefill]
         .iter()
         .map(|&t| packet::devbuild::program_rows(t))
@@ -10825,6 +10834,7 @@ fn kv_shared_tail_section(
         version: plow_asset::kv_shared_tail::VERSION,
         first_layer,
         boundaries,
+        decode_boundaries,
         carried,
     };
     if let Err(error) = manifest.validate(prefill) {
