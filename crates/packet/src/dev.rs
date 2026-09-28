@@ -2185,7 +2185,12 @@ pub enum DevOp {
     /// r*kv_rows + j]`, softmax over keys `j < key_lengths[b]` (and `j <= r` with flag bit 0); a
     /// row with no visible key is zero. Output is dense `[batch,q_rows,heads*head_width]`.
     /// `head_width` is 64 or 128. Flag bit 1 allows 3xTF32 tensor cores (FP32-accurate).
-    /// `t0=out t1=query t2=key t3=value t4=key_lengths(u32[batch])? t5=bias?` ·
+    /// With `prefix` (a cached key prefix), item `b`'s keys are rows `[0, i7)` of block
+    /// `prefix_index[b]` of `prefix` (`[blocks][i7][K | V]`, `2*heads*head_width` wide) followed
+    /// by its `kv_rows` own rows (key lengths count both; `i7` is the prefix row count; no bias,
+    /// no causal mask).
+    /// `t0=out t1=query t2=key t3=value t4=key_lengths(u32[batch])? t5=bias? t6=prefix?
+    /// t7=prefix_index(u32[batch])?` ·
     /// `i0=batch i1=q_rows i2=kv_rows i3=heads i4=head_width i5=in_stride i6=flags
     /// i7=bias_head_stride` · `f0=scale` · `j0=k_col0 j1=v_col0`.
     AttentionF32 = 203,

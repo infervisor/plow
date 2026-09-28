@@ -54,8 +54,10 @@ language or normalization is a prep change, not a runtime one.
   each completed frame decodes a window (`stream.window_frames`) and emits the frames that have
   `stream.lookahead_frames` of right context; the final flush emits the rest.
 - `tts.guided_lm.v1`: `serve` hands such assets to a guided speech worker (its own engine; two
-  slots per request). Tokens stream to the render thread as they are committed; streams
-  re-render their prefix every `stream.chunk_tokens` and emit all but `stream.hold_tokens`,
+  slots per request). Tokens stream to the render thread as they are committed; every
+  `stream.chunk_tokens` a stream renders its new tokens plus `stream.context_tokens` of left
+  context on the vocoder's cached-prompt capacities (the voice prompt's attention K/V computed once
+  at load; without them, the whole prefix) and emits all but `stream.hold_tokens`,
   crossfading `stream.fade_samples`; the LM yields while a first chunk renders.
 
 ## Adding another TTS family

@@ -146,10 +146,51 @@ Served (`tts_bench.py --prompt-set chatterbox-mtl`, 24 prompts in 8 languages, ~
 | 128 | 32.1 | 13.9 s | 9.4 | 27 / 32 s | stream 59/256 |
 | 200 | 32.6 | 21.9 s | 9.3 | 29 / 32 s | stream 200/400 |
 
-200 calls at ~30% speaking need ~60 real-time streams: full synthesis tops out at ~33 aps (0.55x
-the need), streaming at ~12.5 aps (0.2x). Streams re-render their whole prefix every chunk
-(`stream.chunk_tokens`), so S3Gen spends ~2.7x the whole-utterance GPU per audio second, and past
-64 streams renders queue behind decode and requests hit the 30 s queue TTL.
+The table above is before streaming windows and the codec readback fix (2026-09-27).
+
+### Streaming windows
+
+A stream renders only its new tokens: `s3gen.pkt` carries cached-prompt capacities
+(`csynth.b{B}.t{T}`) whose CFM runs the item's own tokens plus the prompt's last 8 mel rows and
+attends to the voice prompt's attention K/V (`AttentionF32` with a key prefix), which the
+`prefill.v{V}` programs compute once at load from the prompt alone (the prompt rows do not attend
+to the tokens, unlike the reference; the encoder still sees prompt + tokens). Each window is the
+new tokens plus `stream.context_tokens` (8) of left context; its NSF source continues the stream's
+harmonic phase at the seam (`phase` / `seam` / `next_seam` tensors), and the render crossfades
+`stream.fade_samples` as before. Due windows share one launch; while every due window has
+`render.slack_ms` (600) of audio buffered, or up to `render.window_hold_ms` (500) while most live
+streams are not due, the launch waits for more (wider launches cost less per token).
+`PLOW_TTS_STREAM_WINDOWS=0` restores prefix re-renders. Each CFM step is 4 programs (`CFM_PARTS`):
+the LM's decode launches get in only between programs.
+
+Gates (H100, 2bcf79b9 + this change): `scripts/tts/s3gen_cached_check.py` (packet vs a torch
+implementation of the same computation) mel rel-L2 5e-6..1.2e-5. Whisper CER, 96 streamed
+requests (4 x the 24-prompt set), windows vs prefix re-render: median 0.000 / 0.000; per
+language ar 0.027 / 0.027, de 0 / 0, en 0 / 0, es 0 / 0, fr 0.011 / 0.011, hi 0.187 / 0.175,
+ja 0.017 / 0.000, zh 0 / 0 (reference hi 0.108, ja 0.050); left context 16 / 32 tokens gave
+hi 0.120 / 0.133, ja 0.017 / 0.000 at 27-29 vs 25 aps (c64) — within the run-to-run spread, so 8
+stays. Seam spectral flux at window boundaries equals the mid-chunk control (p50 1.27 / 1.26).
+English Chatterbox CER 0.000 (stream and full), Veena 0.008, Qwen3-ASR WER 3.913%.
+
+Served, same client (MTL, 24 prompts in 8 languages, ~3.7 s each):
+
+| conc | stream aps before | stream aps | TTFA p50 / p90 | failed | full aps |
+|---|---|---|---|---|---|
+| 1 | 3.1 | 7.2 | 165 / 168 ms | 0 | 11.5 |
+| 16 | 10.2 | 31.4 | 0.86 / 1.0 s | 0 | |
+| 32 | 11.8 | 32.0 | 1.6 / 1.7 s | 0 | |
+| 64 | 12.5 | 31.6 | 3.1 / 4.5 s | 0 | 33.6 |
+| 128 | 9.4 | 42.2 | 8.2 / 10.2 s | 0 (was 59/256) | |
+| 200 | 9.3 | 37.3 | 15 / 16 s | 0 (was 200/400) | 35.1 |
+
+English Chatterbox: stream c1 7.2 aps (TTFA 165 ms), c16 29.9, c64 33.1; full c64 34.3.
+Closed-loop clients past ~64 streams queue at the 128-slot T3 rung (a CFG pair per request), so
+TTFA there is mostly queueing.
+
+Standalone GPU time (packet_bench): `synth.b32.t96` 1.49 s (0.49 ms per token), `csynth.b32.t64`
+0.68 s (0.33 ms per token incl. 8 context rows); a CFM step 137 vs 59 ms. Served, the render and
+the T3 decode launches contend for the device (T3 ~80 ms per token per stream at c64 vs a 6.5 ms
+standalone step at 128 rows).
 
 Stock reference (fp32, one request at a time): 1.31 aps, RTF 0.69 (T3 21 ms / token).
 
@@ -228,6 +269,7 @@ a whole encoder/codec/vocoder sequence (worse: a 166 ms S3Gen render then blocks
 | `plow_speech_probe.sh`, `vllm_speech_probe.sh` | plowrt vs vLLM+SNAC speech servers, same client, one lease each |
 | `snac_export.py`, `s3gen_export.py` | exports the codec lowerings read (`PLOW_TTS_CODEC_DIR`, `PLOW_TTS_VOCODER_DIR`) |
 | `s3gen_packet_check.py`, `crates/plowrt/examples/codec_check.rs` | codec packet numerics vs torch / the reference decoders |
+| `s3gen_cached_check.py` | `s3gen.pkt` cached-prompt capacities (prefill + windows, NSF phase carry) vs torch |
 | `crates/plowrt/examples/packet_bench.rs` | per-program GPU time; with `PLOW_DEBUG_MAX_INST` per-op costs |
 | `snac_check.py`, `sample_kernel_bench.py` | reference SNAC library and sampler numerics/latency |
 | `crates/plowrt/examples/t3_check.rs` | T3 logits gate vs `t3_ref.py` / `t3_mtl_ref.py` (per-prompt `language`) |

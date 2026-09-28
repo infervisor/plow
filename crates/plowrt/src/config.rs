@@ -108,6 +108,12 @@ pub struct RuntimeConfig {
     #[arg(long = "asr-partial-duty", env = "PLOW_ASR_PARTIAL_DUTY", default_value_t = 0.5, global = true)]
     pub asr_partial_duty: f64,
 
+    /// Streams of a guided speech model render windows (new tokens + left context) on the
+    /// vocoder packet's cached-prompt capacities when it has them; off: every chunk re-renders
+    /// the stream's whole prefix with the prompt.
+    #[arg(long = "tts-stream-windows", env = "PLOW_TTS_STREAM_WINDOWS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_stream_windows: bool,
+
     /// How long a finished `X-Session-Id` request's KV (and an ASR session's audio and encoder
     /// windows) stays retained for the session's next request, in ms. 0 disables retention.
     #[arg(long = "session-ttl-ms", env = "PLOW_SESSION_TTL_MS", default_value_t = 60_000, global = true)]

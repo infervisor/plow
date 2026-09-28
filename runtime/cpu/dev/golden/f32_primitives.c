@@ -879,24 +879,30 @@ G_K(g_attention_f32) {
     const float* key = PLOW_CPU_TEN(in, T, 2);
     const float* value = PLOW_CPU_TEN(in, T, 3);
     const uint32_t* key_lengths = PLOW_CPU_TEN(in, T, 4);
-    const float* bias = PLOW_CPU_TEN(in, T, 5);
+    /* Optional key prefix: item b's keys are rows [0, i7) of prefix block t7[b] ([K | V] rows,
+     * 2 * width wide), then its kv_rows own rows. */
+    const float* prefix = PLOW_CPU_TEN(in, T, 6);
+    const uint32_t* prefix_index = PLOW_CPU_TEN(in, T, 7);
+    const uint32_t pre = prefix ? in->i[7] : 0u;
+    const float* bias = prefix ? NULL : PLOW_CPU_TEN(in, T, 5);
     const uint32_t batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
     const uint32_t hw = in->i[4], width = heads * hw;
     const uint32_t stride = in->i[5] ? in->i[5] : width, causal = in->i[6] & 1u;
     const uint32_t k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
-    if (!hw || !kv_rows) return;
-    double* p = malloc(sizeof(double) * kv_rows);
+    if (!hw || !(pre + kv_rows)) return;
+    double* p = malloc(sizeof(double) * (pre + kv_rows));
     double* acc = malloc(sizeof(double) * hw);
     uint32_t lo, hi;
     g_range(batch * heads * q_rows, slice, nblk, &lo, &hi);
     for (uint32_t index = lo; index < hi; index++) {
         const uint32_t b = index / (heads * q_rows), h = index / q_rows % heads, r = index % q_rows;
-        uint32_t visible = g_item_rows(key_lengths, b, kv_rows);
+        uint32_t visible = g_item_rows(key_lengths, b, pre + kv_rows);
         if (causal && r + 1u < visible) visible = r + 1u;
         const float* q = query + ((size_t)b * q_rows + r) * stride + (size_t)h * hw;
         double maximum = -INFINITY;
         for (uint32_t j = 0; j < visible; j++) {
-            const float* k = key + ((size_t)b * kv_rows + j) * stride + k_col0 + (size_t)h * hw;
+            const float* k = j < pre ? prefix + ((size_t)prefix_index[b] * pre + j) * 2u * width + (size_t)h * hw
+                                     : key + ((size_t)b * kv_rows + j - pre) * stride + k_col0 + (size_t)h * hw;
             double dot = 0.0;
             for (uint32_t c = 0; c < hw; c++) dot += (double)q[c] * k[c];
             p[j] = dot * in->fj[0].f +
@@ -907,7 +913,8 @@ G_K(g_attention_f32) {
         for (uint32_t c = 0; c < hw; c++) acc[c] = 0.0;
         for (uint32_t j = 0; j < visible; j++) {
             const double e = exp(p[j] - maximum);
-            const float* v = value + ((size_t)b * kv_rows + j) * stride + v_col0 + (size_t)h * hw;
+            const float* v = j < pre ? prefix + ((size_t)prefix_index[b] * pre + j) * 2u * width + width + (size_t)h * hw
+                                     : value + ((size_t)b * kv_rows + j - pre) * stride + v_col0 + (size_t)h * hw;
             denominator += e;
             for (uint32_t c = 0; c < hw; c++) acc[c] += e * v[c];
         }

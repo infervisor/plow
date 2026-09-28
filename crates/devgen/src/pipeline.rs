@@ -543,6 +543,18 @@ pub struct AttentionF32Stage<'a> {
     pub causal: bool,
     pub scale: f32,
     pub bias_head_stride: u32,
+    /// Keys before each item's own: rows of a cached prefix block (see [`AttentionPrefix`]).
+    pub prefix: Option<AttentionPrefix>,
+}
+
+/// A key prefix for [`AttentionF32Stage`]: item `b` first attends to the `rows` rows of block
+/// `index[b]` of `table` (`[blocks][rows][K | V]`, each `2 * heads * head_width` wide).
+#[derive(Clone, Copy)]
+pub struct AttentionPrefix {
+    pub table: u32,
+    pub index: u32,
+    pub blocks: u32,
+    pub rows: u32,
 }
 
 /// Several stages emitted into ONE program (one launch), ordered by explicit dependencies:
@@ -1444,6 +1456,13 @@ impl StageProgram {
         if let Some(lengths) = stage.key_lengths {
             self.input(lengths, u64::from(stage.batch) * 4, "attention key lengths")?;
         }
+        if let Some(p) = stage.prefix {
+            if stage.bias.is_some() || stage.causal || p.rows == 0 {
+                return Err("attention prefix: no bias or causal mask, and at least one row".into());
+            }
+            self.input(p.table, f32_bytes(product(&[p.blocks, p.rows, 2 * width])?)?, "attention prefix")?;
+            self.input(p.index, u64::from(stage.batch) * 4, "attention prefix index")?;
+        }
         let bias = match stage.bias {
             Some(bias) => {
                 let span = u64::from(stage.heads - 1) * u64::from(stage.bias_head_stride)
@@ -1458,13 +1477,15 @@ impl StageProgram {
         let tc = stage.head_width == 64;
         let units = product(&[stage.batch, stage.heads, stage.q_rows.div_ceil(if tc { 128 } else { 64 })])?;
         self.emit(DevOp::AttentionF32, units, deps, output, |d| {
-            d.t[..6].copy_from_slice(&[
+            d.t.copy_from_slice(&[
                 output,
                 query,
                 key,
                 value,
                 stage.key_lengths.unwrap_or(packet::dev::TENSOR_NONE),
                 bias,
+                stage.prefix.map_or(packet::dev::TENSOR_NONE, |p| p.table),
+                stage.prefix.map_or(packet::dev::TENSOR_NONE, |p| p.index),
             ]);
             d.i = [
                 stage.batch,
@@ -1474,7 +1495,7 @@ impl StageProgram {
                 stage.head_width,
                 stage.in_stride,
                 u32::from(stage.causal) | (u32::from(tc) << 1),
-                stage.bias_head_stride,
+                stage.prefix.map_or(stage.bias_head_stride, |p| p.rows),
             ];
             d.f[0] = stage.scale;
             d.j = [stage.k_col0, stage.v_col0];
@@ -2161,6 +2182,7 @@ mod tests {
                     causal: true,
                     scale: 0.125,
                     bias_head_stride: 0,
+                    prefix: None,
                 },
             )
             .unwrap()

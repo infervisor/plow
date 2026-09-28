@@ -320,7 +320,7 @@ const DOC: &[S] = &[
     S { op: DevOp::BinaryF32, t: &["out", "a", "b"], i: &["items", "rows", "width", "op", "b_item_stride", "b_row_stride", "b_col_stride", "flags"], f: &["scale"], j: &[] },
     S { op: DevOp::CumSumF64, t: &["out", "x", "column_scale?", "lengths?"], i: &["items", "rows", "width", "x_width", "flags"], f: &["scale", "post_scale"], j: &[] },
     S { op: DevOp::RandF32, t: &["out", "seed"], i: &["items", "rows", "width", "stream", "stream_shift", "coords", "a_offset", "b_offset"], f: &["scale", "offset"], j: &["", "flags"] },
-    S { op: DevOp::AttentionF32, t: &["out", "query", "key", "value", "key_lengths?", "bias?"], i: &["batch", "q_rows", "kv_rows", "heads", "head_width", "in_stride", "flags", "bias_head_stride"], f: &["scale"], j: &["k_col0", "v_col0"] },
+    S { op: DevOp::AttentionF32, t: &["out", "query", "key", "value", "key_lengths?", "bias?", "prefix?", "prefix_index?"], i: &["batch", "q_rows", "kv_rows", "heads", "head_width", "in_stride", "flags", "bias_head_stride"], f: &["scale"], j: &["k_col0", "v_col0"] },
     S { op: DevOp::GluStrided, t: &["out", "gate", "up"], i: &["rows", "width", "col0", "stride", "act"], f: &[], j: &[] },
     S { op: DevOp::RowStatsF32, t: &["out", "x"], i: &["rows", "feat", "flags"], f: &["eps"], j: &[] },
 ];

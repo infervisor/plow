@@ -62,7 +62,7 @@ class Packet:
         self.packet, self.runner = packet, runner
         meta = self._meta()
         self.params = meta["parameters"]
-        self.caps = sorted({tuple(int(x) for x in re.match(r"synth\.b(\d+)\.t(\d+)\.", r).groups()) for r in meta["programs"]})
+        self.caps = sorted({tuple(int(x) for x in re.match(r"synth\.b(\d+)\.t(\d+)\.", r).groups()) for r in meta["programs"] if r.startswith("synth.")})
         self.spt = self.params["codec.frame_samples"]
 
     def _meta(self):

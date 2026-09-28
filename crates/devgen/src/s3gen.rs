@@ -23,7 +23,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::pipeline::{
-    Activation, AttentionF32Stage, BinaryF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage, CumSumF64Stage,
+    Activation, AttentionF32Stage, AttentionPrefix, BinaryF32Stage, BinaryOp, Conv1dF32Stage, CopyColsF32Stage, CumSumF64Stage,
     Emitted, GatherRowsF32Stage, LayerNormRowsF32Stage, PacketPrefix, PadMode, RandCoord, RandF32Stage,
     StageProgram, TensorRef, UnaryF32Stage,
 };
@@ -47,6 +47,19 @@ pub const S3GEN_CAPACITIES: &[(u32, u32)] = &[
     (32, 32), (32, 64), (32, 96), (32, 128),
 ];
 
+/// Cached-prompt capacities (`csynth`): the CFM runs only the item's own tokens and attends to
+/// its voice's prompt K/V, which the `prefill` programs compute once from the prompt alone (the
+/// prompt rows do not attend to the tokens, unlike the reference). A streaming window then costs
+/// its own tokens instead of prompt + prefix. The encoder still sees prompt + tokens.
+pub const S3GEN_CACHED_CAPACITIES: &[(u32, u32)] = &[
+    (1, 32), (1, 64), (1, 128), (1, 256),
+    (4, 32), (4, 64),
+    (8, 32), (8, 64), (8, 128),
+    (16, 32), (16, 64), (16, 128),
+    (32, 32), (32, 64), (32, 128),
+    (64, 32), (64, 64),
+];
+
 const D_ENC: u32 = 512;
 const D_CFM: u32 = 256;
 const HEADS: u32 = 8;
@@ -55,6 +68,9 @@ const ENC_LAYERS: (u32, u32) = (6, 4);
 const TBLOCKS: u32 = 4;
 const MID_BLOCKS: u32 = 12;
 const F0_CONVS: u32 = 5;
+/// Programs per Euler step. A render shares the device with the LM's decode launches, which get
+/// in only between programs: shorter programs keep the LM's cadence.
+const CFM_PARTS: u32 = 4;
 
 struct Config {
     sampling_rate: u32,
@@ -178,8 +194,9 @@ pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<
         return Err("unsupported S3Gen export".into());
     }
     let caps: Vec<(u32, u32)> = S3GEN_CAPACITIES.iter().copied().filter(|&(_, n)| n <= cfg.max_tokens).collect();
-    let bmax = caps.iter().map(|c| c.0).max().ok_or("no S3Gen capacity fits max_tokens")?;
-    let nmax = caps.iter().map(|c| c.1).max().unwrap_or(1);
+    let cached: Vec<(u32, u32)> = S3GEN_CACHED_CAPACITIES.iter().copied().filter(|&(_, n)| n <= cfg.max_tokens).collect();
+    let bmax = caps.iter().chain(&cached).map(|c| c.0).max().ok_or("no S3Gen capacity fits max_tokens")?;
+    let nmax = caps.iter().chain(&cached).map(|c| c.1).max().unwrap_or(1);
     let mut model = packet::devbuild::Model { n_cu, target, tensors: Vec::new(), progs: Vec::new(), kv_row_insts: Vec::new(), prog_t: Vec::new(), gen: Vec::new() };
     let mut builder = packet::devbuild::Builder::new(n_cu);
     builder.set_tensor_dedup(true);
@@ -188,6 +205,9 @@ pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<
         voice: builder.tensor("in.s3gen.voice", u64::from(bmax) * 4),
         seed: builder.tensor("in.s3gen.seed", u64::from(bmax) * 8),
         count: builder.tensor("in.s3gen.lengths.0", u64::from(bmax) * 4),
+        phase: builder.tensor("in.s3gen.phase", u64::from(bmax * cfg.harmonics) * 4),
+        seam: builder.tensor("in.s3gen.seam", u64::from(bmax) * 4),
+        next_seam: builder.tensor("in.s3gen.next_seam", u64::from(bmax) * 4),
         nmax,
         lengths: {
             let h: Vec<u32> = (0..7).map(|k| builder.tensor(&format!("act.s3gen.len.{k}"), u64::from(bmax) * 4)).collect();
@@ -201,8 +221,17 @@ pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<
     let mut names = HashMap::new();
     let mut roles = BTreeMap::new();
     let tap_major = RefCell::new(HashMap::new());
-    for &(batch, tokens) in &caps {
-        let lo = Lowering { cfg: &cfg, inputs, b: batch, n: tokens };
+    // Prefill programs first: they declare the voice caches the cached capacities read.
+    let voices = (0..cfg.voices.len() as u32).map(|v| (1, 0, Mode::Prefill(v)));
+    let family = |list: &[(u32, u32)], mode: Mode| list.iter().map(move |&(b, n)| (b, n, mode)).collect::<Vec<_>>();
+    let all: Vec<(u32, u32, Mode)> = voices.chain(family(&caps, Mode::Full)).chain(family(&cached, Mode::Cached)).collect();
+    for (batch, tokens, mode) in all {
+        let lo = Lowering { cfg: &cfg, inputs, b: batch, n: tokens, mode };
+        let role = match mode {
+            Mode::Full => format!("synth.b{batch}.t{tokens}"),
+            Mode::Cached => format!("csynth.b{batch}.t{tokens}"),
+            Mode::Prefill(v) => format!("prefill.v{v}"),
+        };
         let mut stage = 0;
         let mut run = |prefix: PacketPrefix,
                        names: &mut HashMap<String, u32>,
@@ -211,17 +240,22 @@ pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<
             let program = prefix.model.progs.len() as u32;
             let mut ops = Ops::new(prefix.program(), std::mem::take(names), ConvFusions(sites), &tap_major);
             body(&mut ops)?;
-            let (prefix, n) = ops.finish(batch * tokens);
+            let (prefix, n) = ops.finish((batch * tokens).max(1));
             *names = n;
-            roles.insert(format!("synth.b{batch}.t{tokens}.{stage}"), program);
+            roles.insert(format!("{role}.{stage}"), program);
             stage += 1;
             Ok(prefix)
         };
         prefix = run(prefix, &mut names, &|o| lo.encoder(o))?;
+        let h = std::cell::Cell::new(0);
         for step in 0..cfg.t_span.len() - 1 {
-            prefix = run(prefix, &mut names, &|o| lo.cfm_step(o, step))?;
+            for part in 0..CFM_PARTS {
+                prefix = run(prefix, &mut names, &|o| lo.cfm_part(o, step, part, &h))?;
+            }
         }
-        prefix = run(prefix, &mut names, &|o| lo.vocoder(o))?;
+        if !matches!(mode, Mode::Prefill(_)) {
+            prefix = run(prefix, &mut names, &|o| lo.vocoder(o))?;
+        }
     }
     let reader = crate::checkpoint::TensorReader::open(dir)?;
     let mut derived = Derived { reader: &reader, cfg: &cfg, nmax, cache: HashMap::new() };
@@ -253,8 +287,24 @@ struct Inputs {
     seed: u32,
     /// Speech tokens per item (host).
     count: u32,
+    /// Cached capacities: per item, the NSF phase (per harmonic) the source must have at sample
+    /// `seam`, and the sample `next_seam` whose phase is read back into `phase` for the next window.
+    phase: u32,
+    seam: u32,
+    next_seam: u32,
     nmax: u32,
     lengths: Lengths,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The reference: the CFM over prompt + tokens.
+    Full,
+    /// Voice `v`'s prompt alone through the encoder and the CFM, writing the prompt rows' attention
+    /// K/V of every Euler step and transformer block to the voice caches.
+    Prefill(u32),
+    /// The CFM over the tokens only, attending to [cached prompt K/V | own K/V].
+    Cached,
 }
 
 /// A [`StageProgram`] with read/write hazard tracking: every op depends on the last writer of
@@ -624,6 +674,16 @@ struct Lowering<'a> {
     inputs: Inputs,
     b: u32,
     n: u32,
+    mode: Mode,
+}
+
+/// Cached capacities recompute the prompt's last mel rows with the item's own (their causal
+/// convolutions then start from the prompt, not from zeros); the cache holds the rows before.
+const PROMPT_TAIL_ROWS: u32 = 8;
+
+/// Voice cache of Euler step `step`, transformer block `k`: `[voice][cond | uncond][cached rows][K | V]`.
+fn kv_cache(step: usize, k: u32) -> String {
+    format!("act.s3gen.kvc.s{step}.b{k}")
 }
 
 impl Lowering<'_> {
@@ -637,6 +697,21 @@ impl Lowering<'_> {
 
     fn gen(&self) -> u32 {
         2 * self.n
+    }
+
+    /// CFM rows per item.
+    fn tc(&self) -> u32 {
+        if self.mode == Mode::Cached { PROMPT_TAIL_ROWS + self.gen() } else { self.t1() }
+    }
+
+    /// The first generated mel row among the CFM rows.
+    fn mel0(&self) -> u32 {
+        if self.mode == Mode::Cached { PROMPT_TAIL_ROWS } else { 2 * self.cfg.prompt }
+    }
+
+    /// Prompt mel rows whose attention K/V come from the voice cache.
+    fn cached_rows(&self) -> u32 {
+        2 * self.cfg.prompt - PROMPT_TAIL_ROWS
     }
 
     /// Rows at each HiFT stage output (the last is the STFT frame count).
@@ -695,6 +770,7 @@ impl Lowering<'_> {
                 causal: false,
                 scale: 1.0 / ((D_ENC / HEADS) as f32).sqrt(),
                 bias_head_stride: t * t,
+                prefix: None,
             })
         })?;
         let xn = o.name_of(x);
@@ -724,8 +800,10 @@ impl Lowering<'_> {
             o.gather(Table::Weight(&table, inp.nmax + 1), Some(inp.count), &format!("act.s3gen.len.{k}"), g)?;
         }
         // Token ids [b][prompt | tokens] (u32 bit patterns moved by the f32 copy / gather).
-        let idx = o.copy(inp.tokens, "act.s3gen.idx", (b, 1, n), (n, n, 0), (t0, t0, p))?;
-        o.gather(Table::Weight("voice.prompt_token", nv), Some(inp.voice), "act.s3gen.idx", Gather { rows: b, width: p, vocab: nv, per_item: 1, repeat: 1, index_stride: 1, out_stride: t0, ..Default::default() })?;
+        if n > 0 {
+            o.copy(inp.tokens, "act.s3gen.idx", (b, 1, n), (n, n, 0), (t0, t0, p))?;
+        }
+        let idx = o.gather(Table::Weight("voice.prompt_token", nv), Some(inp.voice), "act.s3gen.idx", Gather { rows: b, width: p, vocab: nv, per_item: 1, repeat: 1, index_stride: 1, out_stride: t0, ..Default::default() })?;
         let e0 = o.gather(Table::Weight("emb", cfg.vocab), Some(idx), "act.s3gen.e0", Gather { rows: b * t0, width: D_ENC, vocab: cfg.vocab, per_item: t0, repeat: 1, index_stride: t0, ..Default::default() })?;
         let e1 = o.linear(e0, "act.s3gen.e1", "enc.embed", b * t0, D_ENC, D_ENC, true, Activation::None, None)?;
         let e0 = o.layer_norm(e1, "act.s3gen.e0", "enc.embed.ln", b * t0, D_ENC, 1e-5)?;
@@ -769,21 +847,48 @@ impl Lowering<'_> {
         }
         let a = o.layer_norm(x, "act.s3gen.a", "enc.after_ln", t1 * b, D_ENC, 1e-5)?;
         let mu = o.linear(a, "act.s3gen.mu", "enc.proj", t1 * b, D_ENC, MEL, true, Activation::None, None)?;
-        // Estimator input [2b][t1][x | mu | spks | cond]; the unconditional half's context is 0.
-        let w = 4 * MEL;
-        o.copy(mu, "act.s3gen.x320", (b, t1, MEL), (MEL, b * MEL, 0), (t1 * w, w, MEL))?;
-        o.gather(Table::Weight("voice.spks", nv), Some(inp.voice), "act.s3gen.x320", Gather { rows: b * t1, width: MEL, vocab: nv, per_item: t1, repeat: t1, index_stride: 1, out_stride: w, out_col0: 2 * MEL, ..Default::default() })?;
-        let pf = 2 * p;
-        let cond = o.gather(Table::Weight("voice.prompt_feat", nv), Some(inp.voice), "act.s3gen.cond", Gather { rows: b, width: pf * MEL, vocab: nv, per_item: 1, repeat: 1, index_stride: 1, out_stride: t1 * MEL, ..Default::default() })?;
+        // Estimator input [2b][tc][x | mu | spks | cond] over the CFM rows (the last tc of t1);
+        // the unconditional half's context is 0.
+        let (w, tc) = (4 * MEL, self.tc());
+        o.copy(mu, "act.s3gen.x320", (b, tc, MEL), (MEL, b * MEL, (t1 - tc) * b * MEL), (tc * w, w, MEL))?;
+        o.gather(Table::Weight("voice.spks", nv), Some(inp.voice), "act.s3gen.x320", Gather { rows: b * tc, width: MEL, vocab: nv, per_item: tc, repeat: tc, index_stride: 1, out_stride: w, out_col0: 2 * MEL, ..Default::default() })?;
         let zeros = o.gather(Table::Weight("const.zeros", 1), None, "act.s3gen.zeros", Gather { rows: 1, width: w, vocab: 1, per_item: 1, repeat: 1, ..Default::default() })?;
-        o.copy(zeros, "act.s3gen.cond", (b, t1 - pf, MEL), (0, 0, 0), (t1 * MEL, MEL, pf * MEL))?;
-        o.copy(cond, "act.s3gen.x320", (b, t1, MEL), (t1 * MEL, MEL, 0), (t1 * w, w, 3 * MEL))?;
-        o.copy(zeros, "act.s3gen.x320", (1, b * t1, w), (0, 0, 0), (0, w, b * t1 * w))?;
+        if self.mode == Mode::Cached {
+            let r = PROMPT_TAIL_ROWS;
+            o.gather(Table::Weight("voice.prompt_tail", nv), Some(inp.voice), "act.s3gen.cond", Gather { rows: b, width: r * MEL, vocab: nv, per_item: 1, repeat: 1, index_stride: 1, out_stride: tc * MEL, ..Default::default() })?;
+            let cond = o.copy(zeros, "act.s3gen.cond", (b, tc - r, MEL), (0, 0, 0), (tc * MEL, MEL, r * MEL))?;
+            o.copy(cond, "act.s3gen.x320", (b, tc, MEL), (tc * MEL, MEL, 0), (tc * w, w, 3 * MEL))?;
+        } else {
+            let pf = 2 * p;
+            let cond = o.gather(Table::Weight("voice.prompt_feat", nv), Some(inp.voice), "act.s3gen.cond", Gather { rows: b, width: pf * MEL, vocab: nv, per_item: 1, repeat: 1, index_stride: 1, out_stride: t1 * MEL, ..Default::default() })?;
+            if t1 > pf {
+                o.copy(zeros, "act.s3gen.cond", (b, t1 - pf, MEL), (0, 0, 0), (t1 * MEL, MEL, pf * MEL))?;
+            }
+            o.copy(cond, "act.s3gen.x320", (b, t1, MEL), (t1 * MEL, MEL, 0), (t1 * w, w, 3 * MEL))?;
+        }
+        o.copy(zeros, "act.s3gen.x320", (1, b * tc, w), (0, 0, 0), (0, w, b * tc * w))?;
         // CFM state x = z ~ N(0, 1) (stream 1, keyed by mel frame and bin).
-        o.rand(inp.seed, "act.s3gen.xt", (b, t1, MEL), 1, true, 1.0, 0.0)?;
-        // Guidance lengths: the unconditional half repeats the conditional one.
-        o.copy(inp.lengths.mel, "act.s3gen.len2", (1, 1, b), (0, 0, 0), (0, 0, 0))?;
-        o.copy(inp.lengths.mel, "act.s3gen.len2", (1, 1, b), (0, 0, 0), (0, 0, b))?;
+        o.rand(inp.seed, "act.s3gen.xt", (b, tc, MEL), 1, true, 1.0, 0.0)?;
+        // Guidance lengths (valid CFM rows): the unconditional half repeats the conditional one.
+        if self.mode == Mode::Cached {
+            for half in 0..2 {
+                let g = Gather { rows: b, width: 1, vocab: inp.nmax + 1, per_item: 1, repeat: 1, index_stride: 1, out_stride: 1, out_col0: half * b, ..Default::default() };
+                o.gather(Table::Weight("s3gen.len.cfm", inp.nmax + 1), Some(inp.count), "act.s3gen.len2", g)?;
+            }
+        } else {
+            o.copy(inp.lengths.mel, "act.s3gen.len2", (1, 1, b), (0, 0, 0), (0, 0, 0))?;
+            o.copy(inp.lengths.mel, "act.s3gen.len2", (1, 1, b), (0, 0, 0), (0, 0, b))?;
+        }
+        if self.mode == Mode::Cached {
+            // Keys: the prompt's cached rows then the item's own, prompt + tokens mel rows in all.
+            o.copy(inp.lengths.mel, "act.s3gen.klen2", (1, 1, b), (0, 0, 0), (0, 0, 0))?;
+            o.copy(inp.lengths.mel, "act.s3gen.klen2", (1, 1, b), (0, 0, 0), (0, 0, b))?;
+            // Cache row of each guidance item: 2 * voice (+ 1 for the unconditional half).
+            for half in 0..2 {
+                let g = Gather { rows: b, width: 1, vocab: nv, per_item: 1, repeat: 1, index_stride: 1, out_stride: 1, out_col0: half * b, ..Default::default() };
+                o.gather(Table::Weight(&format!("s3gen.kvidx.{half}"), nv), Some(inp.voice), "act.s3gen.kvidx", g)?;
+            }
+        }
         Ok(())
     }
 
@@ -794,7 +899,7 @@ impl Lowering<'_> {
 
     /// CausalResnetBlock1D `j` of Euler step `step` on `x` (`cin` channels) into `out`.
     fn resnet(&self, o: &mut Ops, step: usize, j: u32, x: u32, cin: u32, out: &str) -> Result<u32, String> {
-        let (b2, t1) = (2 * self.b, self.t1());
+        let (b2, t1) = (2 * self.b, self.tc());
         let (r, len2) = (b2 * t1, Self::len2(o));
         let p = format!("cfm.r{j}");
         let (c1, c2, res) = (format!("{p}.c1"), format!("{p}.c2"), format!("{p}.res"));
@@ -818,15 +923,46 @@ impl Lowering<'_> {
         o.conv(x, out, c)
     }
 
-    /// BasicTransformerBlock `k` on `h` (`[2b][t1][256]`), in place.
-    fn tblock(&self, o: &mut Ops, k: u32, h: u32) -> Result<(), String> {
-        let (b2, t1) = (2 * self.b, self.t1());
+    /// BasicTransformerBlock `k` of Euler step `step` on `h` (`[2b][tc][256]`), in place.
+    fn tblock(&self, o: &mut Ops, step: usize, k: u32, h: u32) -> Result<(), String> {
+        let (b2, t1) = (2 * self.b, self.tc());
         let (r, len2) = (b2 * t1, Self::len2(o));
         let inner = HEADS * 64;
         let p = format!("cfm.tb{k}");
         let hn = o.name_of(h);
         let a = o.layer_norm(h, "act.s3gen.a", &format!("{p}.ln1"), r, D_CFM, 1e-5)?;
         let qkv = o.linear(a, "act.s3gen.qkv", &format!("{p}.qkv"), r, D_CFM, 3 * inner, false, Activation::None, None)?;
+        let (pp, nv2) = (self.cached_rows(), 2 * self.cfg.voices.len() as u32);
+        let cache = kv_cache(step, k);
+        if let Mode::Prefill(v) = self.mode {
+            // Both guidance halves' cached prompt rows (K | V columns) into blocks 2v, 2v + 1.
+            let row = pp * 2 * inner;
+            o.copy(qkv, &cache, (2, pp, 2 * inner), (t1 * 3 * inner, 3 * inner, inner), (row, 2 * inner, 2 * v * row))?;
+        }
+        if self.mode == Mode::Cached {
+            // Keys: the voice's cached prompt rows (block kvidx[item]), then the item's own.
+            let (table, idx, klen) = (o.names[cache.as_str()], o.names["act.s3gen.kvidx"], o.names["act.s3gen.klen2"]);
+            let att = o.op(&[qkv, klen, table, idx], "act.s3gen.att", |pp_, output, deps| {
+                pp_.attention_f32(qkv, qkv, qkv, deps, AttentionF32Stage {
+                    output,
+                    key_lengths: Some(klen),
+                    bias: None,
+                    batch: b2,
+                    q_rows: t1,
+                    kv_rows: t1,
+                    heads: HEADS,
+                    head_width: 64,
+                    in_stride: 3 * inner,
+                    k_col0: inner,
+                    v_col0: 2 * inner,
+                    causal: false,
+                    scale: 0.125,
+                    bias_head_stride: 0,
+                    prefix: Some(AttentionPrefix { table, index: idx, blocks: nv2, rows: pp }),
+                })
+            })?;
+            return self.tblock_tail(o, &p, att, h, &hn, r);
+        }
         let att = o.op(&[qkv, len2], "act.s3gen.att", |pp, output, deps| {
             pp.attention_f32(qkv, qkv, qkv, deps, AttentionF32Stage {
                 output,
@@ -843,23 +979,31 @@ impl Lowering<'_> {
                 causal: false,
                 scale: 0.125,
                 bias_head_stride: 0,
+                prefix: None,
             })
         })?;
-        o.linear(att, &hn, &format!("{p}.out"), r, inner, D_CFM, true, Activation::None, Some(h))?;
+        self.tblock_tail(o, &p, att, h, &hn, r)
+    }
+
+    /// Attention output projection and feed-forward of block `p`, in place on `h`.
+    fn tblock_tail(&self, o: &mut Ops, p: &str, att: u32, h: u32, hn: &str, r: u32) -> Result<(), String> {
+        let inner = HEADS * 64;
+        o.linear(att, hn, &format!("{p}.out"), r, inner, D_CFM, true, Activation::None, Some(h))?;
         let a = o.layer_norm(h, "act.s3gen.a", &format!("{p}.ln3"), r, D_CFM, 1e-5)?;
         let f = o.linear(a, "act.s3gen.ff", &format!("{p}.ff1"), r, D_CFM, 4 * D_CFM, true, Activation::GeluErf, None)?;
-        o.linear(f, &hn, &format!("{p}.ff2"), r, 4 * D_CFM, D_CFM, true, Activation::None, Some(h))?;
+        o.linear(f, hn, &format!("{p}.ff2"), r, 4 * D_CFM, D_CFM, true, Activation::None, Some(h))?;
         Ok(())
     }
 
-    /// One Euler step of the guided flow: `x += dt * ((1 + cfg) v_cond - cfg v_uncond)`.
-    fn cfm_step(&self, o: &mut Ops, step: usize) -> Result<(), String> {
-        let (b, t1) = (self.b, self.t1());
+    /// Part `part` of [`CFM_PARTS`] of one Euler step of the guided flow,
+    /// `x += dt * ((1 + cfg) v_cond - cfg v_uncond)`: the first starts from the state, each runs its
+    /// share of the mid blocks, the last ends with the update. `h` carries the hidden state's
+    /// tensor between parts.
+    fn cfm_part(&self, o: &mut Ops, step: usize, part: u32, h: &std::cell::Cell<u32>) -> Result<(), String> {
+        let (b, t1) = (self.b, self.tc());
         let (b2, r, w) = (2 * b, 2 * b * t1, 4 * MEL);
         let len2 = Self::len2(o);
         let xt = o.names["act.s3gen.xt"];
-        o.copy(xt, "act.s3gen.x320", (b, t1, MEL), (t1 * MEL, MEL, 0), (t1 * w, w, 0))?;
-        let x320 = o.copy(xt, "act.s3gen.x320", (b, t1, MEL), (t1 * MEL, MEL, 0), (t1 * w, w, b * t1 * w))?;
         let other = |o: &Ops, h: u32| if o.name_of(h) == "act.s3gen.h0" { "act.s3gen.h1" } else { "act.s3gen.h0" };
         let causal = |w: &'static str, x: u32, o: &mut Ops, out: &str| -> Result<u32, String> {
             let mut c = Conv::new(w, b2, t1, D_CFM, D_CFM, 3);
@@ -867,24 +1011,32 @@ impl Lowering<'_> {
             c.lengths = Some(len2);
             o.conv(x, out, c)
         };
-        let mut h = self.resnet(o, step, 0, x320, w, "act.s3gen.h0")?;
-        for i in 0..TBLOCKS {
-            self.tblock(o, i, h)?;
-        }
-        let cat = o.copy(h, "act.s3gen.cat", (1, r, D_CFM), (0, D_CFM, 0), (0, 2 * D_CFM, D_CFM))?;
-        h = causal("cfm.down", h, o, "act.s3gen.h1")?;
-        for j in 1..=MID_BLOCKS {
-            let out = other(o, h);
-            h = self.resnet(o, step, j, h, D_CFM, out)?;
+        if part == 0 {
+            o.copy(xt, "act.s3gen.x320", (b, t1, MEL), (t1 * MEL, MEL, 0), (t1 * w, w, 0))?;
+            let x320 = o.copy(xt, "act.s3gen.x320", (b, t1, MEL), (t1 * MEL, MEL, 0), (t1 * w, w, b * t1 * w))?;
+            let x = self.resnet(o, step, 0, x320, w, "act.s3gen.h0")?;
             for i in 0..TBLOCKS {
-                self.tblock(o, TBLOCKS * j + i, h)?;
+                self.tblock(o, step, i, x)?;
+            }
+            o.copy(x, "act.s3gen.cat", (1, r, D_CFM), (0, D_CFM, 0), (0, 2 * D_CFM, D_CFM))?;
+            h.set(causal("cfm.down", x, o, "act.s3gen.h1")?);
+        }
+        for j in MID_BLOCKS * part / CFM_PARTS + 1..=MID_BLOCKS * (part + 1) / CFM_PARTS {
+            let out = other(o, h.get());
+            h.set(self.resnet(o, step, j, h.get(), D_CFM, out)?);
+            for i in 0..TBLOCKS {
+                self.tblock(o, step, TBLOCKS * j + i, h.get())?;
             }
         }
-        o.copy(h, "act.s3gen.cat", (1, r, D_CFM), (0, D_CFM, 0), (0, 2 * D_CFM, 0))?;
+        if part + 1 < CFM_PARTS {
+            return Ok(());
+        }
+        let mut h = h.get();
+        let cat = o.copy(h, "act.s3gen.cat", (1, r, D_CFM), (0, D_CFM, 0), (0, 2 * D_CFM, 0))?;
         let out = other(o, h);
         h = self.resnet(o, step, MID_BLOCKS + 1, cat, 2 * D_CFM, out)?;
         for i in 0..TBLOCKS {
-            self.tblock(o, TBLOCKS * (MID_BLOCKS + 1) + i, h)?;
+            self.tblock(o, step, TBLOCKS * (MID_BLOCKS + 1) + i, h)?;
         }
         let out = other(o, h);
         h = causal("cfm.upc", h, o, out)?;
@@ -954,13 +1106,12 @@ impl Lowering<'_> {
 
     fn vocoder(&self, o: &mut Ops) -> Result<(), String> {
         let (cfg, inp, b) = (self.cfg, self.inputs, self.b);
-        let (t1, g, wav) = (self.t1(), self.gen(), self.wav());
+        let (tc, g, wav) = (self.tc(), self.gen(), self.wav());
         let rows_out = self.stage_rows();
         let f = rows_out[2];
         let (lg, lf, lw) = (inp.lengths.gen, inp.lengths.stage[2], inp.lengths.wav);
-        let pf = 2 * cfg.prompt;
         let xt = o.names["act.s3gen.xt"];
-        let mel = o.copy(xt, "act.s3gen.mel", (b, g, MEL), (t1 * MEL, MEL, pf * MEL), (g * MEL, MEL, 0))?;
+        let mel = o.copy(xt, "act.s3gen.mel", (b, g, MEL), (tc * MEL, MEL, self.mel0() * MEL), (g * MEL, MEL, 0))?;
         // F0 predictor.
         let mut v = mel;
         let mut cin = MEL;
@@ -1017,9 +1168,19 @@ impl Lowering<'_> {
                 post_scale: std::f32::consts::TAU,
             })
         })?;
-        let pv = o.rand(inp.seed, "act.s3gen.pv", (b, 1, nh), 2, false, std::f32::consts::TAU, -0.5)?;
-        o.unary(pv, b, 1, nh, 0, Activation::ScaleShift, 0.0, 0.0)?;
-        o.binary(sine, pv, BinaryOp::Add, (b, wav, nh), (nh, 0, 1), None)?;
+        if self.mode == Mode::Cached {
+            // A window continues its stream's source: phase = the host's phase at sample `seam`
+            // plus the window's own increments from there; the phase at `next_seam` goes back.
+            let at = Gather { rows: b, width: nh, vocab: wav, per_item: 1, repeat: 1, index_stride: 1, table_stride: wav, ..Default::default() };
+            let c0 = o.gather(Table::Tensor(sine, b * wav), Some(inp.seam), "act.s3gen.pv", at)?;
+            o.binary(c0, inp.phase, BinaryOp::Sub, (1, b, nh), (0, nh, 1), None)?;
+            o.binary(sine, c0, BinaryOp::Sub, (b, wav, nh), (nh, 0, 1), None)?;
+            o.gather(Table::Tensor(sine, b * wav), Some(inp.next_seam), "act.s3gen.phase_out", at)?;
+        } else {
+            let pv = o.rand(inp.seed, "act.s3gen.pv", (b, 1, nh), 2, false, std::f32::consts::TAU, -0.5)?;
+            o.unary(pv, b, 1, nh, 0, Activation::ScaleShift, 0.0, 0.0)?;
+            o.binary(sine, pv, BinaryOp::Add, (b, wav, nh), (nh, 0, 1), None)?;
+        }
         o.unary(sine, b * wav, nh, 0, 0, Activation::Sin, 0.0, 0.0)?;
         o.binary(sine, uv, BinaryOp::Mul, (b * g, fs, nh), (1, 0, 0), Some(cfg.sine_amp))?;
         let noise = o.rand(inp.seed, "act.s3gen.noise", (b, wav, nh), 3, true, 1.0, 0.0)?;
@@ -1205,6 +1366,16 @@ impl Derived<'_> {
                 let (a, _) = harmonic_scale(self.cfg.sampling_rate);
                 return Ok(le_bytes(&(1..=self.cfg.harmonics).map(|i| i as f32 * a).collect::<Vec<_>>()));
             }
+            "voice.prompt_tail" => {
+                let (pf, r) = (2 * self.cfg.prompt as usize * MEL as usize, (PROMPT_TAIL_ROWS * MEL) as usize);
+                let feat = self.f32s("voice.prompt_feat")?;
+                return Ok(feat.chunks_exact(pf).flat_map(|v| le_bytes(&v[pf - r..])).collect());
+            }
+            "s3gen.len.cfm" => return Ok((0..=self.nmax).flat_map(|n| (2 * n + PROMPT_TAIL_ROWS).to_le_bytes()).collect()),
+            "s3gen.kvidx.0" | "s3gen.kvidx.1" => {
+                let half = u32::from(name.ends_with('1'));
+                return Ok((0..self.cfg.voices.len() as u32).flat_map(|v| (2 * v + half).to_le_bytes()).collect());
+            }
             "voice.prompt_token" => {
                 let (dtype, bytes) = self.reader.read(name)?;
                 return if dtype == "I32" { Ok(bytes) } else { Err(format!("{name}: {dtype}, expected I32")) };
@@ -1281,6 +1452,15 @@ fn pipeline_section(
         ("lengths.0".into(), u32s(inputs.count, u64::from(bmax))),
         ("pcm".into(), PipelineTensor { name: t(pcm), dtype: PipelineDType::F32, shape: vec![u64::from(bmax * nmax * samples)] }),
     ]);
+    let mut tensors = tensors;
+    if let Some(&out) = names.get("act.s3gen.phase_out") {
+        let f32s = |h: u32, n: u64| PipelineTensor { name: t(h), dtype: PipelineDType::F32, shape: vec![n] };
+        let nh = u64::from(bmax * cfg.harmonics);
+        tensors.insert("phase".into(), f32s(inputs.phase, nh));
+        tensors.insert("phase_out".into(), f32s(out, nh));
+        tensors.insert("seam".into(), u32s(inputs.seam, u64::from(bmax)));
+        tensors.insert("next_seam".into(), u32s(inputs.next_seam, u64::from(bmax)));
+    }
     // The host writes each item's token count; every other resolution is derived on device.
     let parameters = BTreeMap::from([
         ("codec.frame_codes".into(), 1),
@@ -1297,6 +1477,14 @@ fn pipeline_section(
         // Whole-utterance renders gather up to 8 items for 200 ms (see the render loop).
         ("render.min_batch".into(), 8),
         ("render.hold_ms".into(), 200),
+        // Cached windows: tokens of left context re-rendered before the first new one, and the
+        // NSF harmonics whose phase a window carries.
+        ("stream.context_tokens".into(), 8),
+        // Window launches: wait for more windows while every due one has 600 ms of audio
+        // buffered, or up to 500 ms while most live streams are not due (up to the widest batch).
+        ("render.slack_ms".into(), 600),
+        ("render.window_hold_ms".into(), 500),
+        ("vocoder.harmonics".into(), u64::from(cfg.harmonics)),
     ]);
     let strings = BTreeMap::from([("voices".into(), cfg.voices.join("\n"))]);
     let metadata = PacketPipelines {

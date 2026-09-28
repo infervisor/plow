@@ -913,6 +913,26 @@ static void t_attention(const char* name, unsigned batch, unsigned rows, unsigne
     run(name, c, g_attention_f32, {o}, FP32, 2e-5);
 }
 
+/* Keys = [prefix block index[b] (pre rows, [K | V] rows) | own rows of a fused QKV tensor]. */
+static void t_attention_prefix(const char* name, unsigned batch, unsigned rows, unsigned pre, unsigned blocks,
+                               std::vector<uint32_t> index, std::vector<uint32_t> lengths, bool tc) {
+    Case c;
+    const unsigned heads = 8, hw = 64, width = heads * hw, stride = 3 * width;
+    unsigned o = c.out((size_t)batch * rows * width);
+    unsigned qkv = c.f32((size_t)batch * rows * stride, 1.f);
+    unsigned pf = c.f32((size_t)blocks * pre * 2 * width, 1.f);
+    unsigned ix = c.u32(index);
+    unsigned l = lengths.empty() ? PLOW_TENSOR_NONE : c.u32(lengths);
+    c.in.op = PLOW_DOP_ATTENTION_F32;
+    c.in.t[0] = o; c.in.t[1] = qkv; c.in.t[2] = qkv; c.in.t[3] = qkv; c.in.t[4] = l; c.in.t[5] = PLOW_TENSOR_NONE;
+    c.in.t[6] = pf; c.in.t[7] = ix;
+    c.in.i[0] = batch; c.in.i[1] = rows; c.in.i[2] = rows; c.in.i[3] = heads; c.in.i[4] = hw;
+    c.in.i[5] = stride; c.in.i[6] = tc ? 2u : 0u; c.in.i[7] = pre;
+    c.in.fj[0].f = 0.125f;
+    c.in.fj[1].u = width; c.in.fj[2].u = 2 * width;
+    run(name, c, g_attention_f32, {o}, FP32, 2e-5);
+}
+
 static void bench(const char* name, Case& c, double flops, double bytes, int reps = 20) {
     c.upload();
     void** td = upload_table(c.dev);
@@ -1226,6 +1246,9 @@ int main(int argc, char** argv) {
     t_attention("AttentionF32 tc 8x64 causal bias fused", 2, 300, 8, 64, {300, 217}, true, true, true, true);
     t_attention("AttentionF32 tc 4x64 ragged rows", 1, 77, 4, 64, {}, false, false, false, true);
     t_attention("AttentionF32 tc s3gen 8x64 2x570 fused", 2, 570, 8, 64, {}, false, false, true, true);
+    t_attention_prefix("AttentionF32 prefix 306+72 lengths", 4, 72, 306, 2, {0, 1, 0, 1}, {378, 350, 320, 306}, false);
+    t_attention_prefix("AttentionF32 tc prefix 306+72 lengths", 4, 72, 306, 2, {0, 1, 0, 1}, {378, 350, 320, 306}, true);
+    t_attention_prefix("AttentionF32 tc prefix 306+136", 2, 136, 306, 2, {1, 0}, {}, true);
     /* Split-bf16 wide tiles (~2^-17 per product) and tap-major weights. */
     {
         ConvSpec w1{2, 4200, 256, 512, 1, 1, 1, 1, 0, 0, 0, 0, 11, false, true, false, true, {4200, 3000}, 0.f, true};

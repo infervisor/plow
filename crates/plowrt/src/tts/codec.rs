@@ -25,13 +25,30 @@ pub enum Urgency {
     Whole,
 }
 
+/// A window of a stream on a cached capacity (`csynth`): the source carries the stream's phase,
+/// which is `phase` (per harmonic) at sample `seam` of the window; the reply's phase is the
+/// source's at sample `next_seam`.
+#[derive(Clone, Debug, Default)]
+pub struct Window {
+    pub seam: u32,
+    pub next_seam: u32,
+    pub phase: Vec<f32>,
+}
+
+/// A decode's PCM and, for a [`Window`], the source phase at its `next_seam`.
+pub struct Decoded {
+    pub pcm: Vec<f32>,
+    pub phase: Vec<f32>,
+}
+
 struct Job {
     codes: Vec<i32>,
     frames: usize,
     seed: u64,
     voice: u32,
     urgency: Urgency,
-    reply: tokio::sync::oneshot::Sender<Result<Vec<f32>, String>>,
+    window: Option<Window>,
+    reply: tokio::sync::oneshot::Sender<Result<Decoded, String>>,
     /// Backlog charged to the feeding model's mux until this job is answered.
     _work: Option<crate::sched::admission::DownstreamWork>,
 }
@@ -52,14 +69,23 @@ pub struct Codec {
     pub lookahead: usize,
     /// Voice names in voice-index order (empty when the packet takes no voice).
     pub voices: Vec<String>,
+    /// Largest window a cached capacity holds (0: the packet has none).
+    pub max_window: usize,
     /// Optional packet parameters (e.g. a streaming schedule).
     pub parameters: std::collections::BTreeMap<String, u64>,
 }
 
+type Capacity = (usize, usize, Vec<usize>);
+
 struct Bound {
     runtime: Box<dyn crate::exec::packet_runtime::PacketRuntime>,
     /// (batch, frames, programs in order), ascending by batch * frames.
-    capacities: Vec<(usize, usize, Vec<usize>)>,
+    capacities: Vec<Capacity>,
+    /// The same for windows ([`Window`]) on the cached capacities.
+    cached: Vec<Capacity>,
+    /// Window source phase in/out and seams (packets with cached capacities).
+    phase: Option<[PacketTensor; 4]>,
+    harmonics: usize,
     codes: PacketTensor,
     seed: PacketTensor,
     voice: Option<PacketTensor>,
@@ -94,8 +120,9 @@ impl Codec {
                     Ok(b) => b,
                     Err(e) => return drop(ready_tx.send(Err(e))),
                 };
+                let max_window = bound.cached.iter().map(|c| c.1).max().unwrap_or(0);
                 let info = (
-                    bound.capacities.iter().map(|c| c.0).max().unwrap_or(1),
+                    bound.capacities.iter().chain(&bound.cached).map(|c| c.0).max().unwrap_or(1),
                     bound.capacities.iter().map(|c| c.1).max().unwrap_or(0),
                     bound.capacities.iter().map(|c| c.1).min().unwrap_or(0),
                     bound.frame_codes,
@@ -104,12 +131,13 @@ impl Codec {
                     bound.lookahead,
                     bound.voices.clone(),
                     bound.parameters.clone(),
+                    max_window,
                 );
                 let _ = ready_tx.send(Ok(info));
                 run(rx, bound);
             })
             .map_err(|e| e.to_string())?;
-        let (max_batch, max_frames, min_frames, frame_codes, frame_samples, window, lookahead, voices, parameters) =
+        let (max_batch, max_frames, min_frames, frame_codes, frame_samples, window, lookahead, voices, parameters, max_window) =
             ready_rx.recv().map_err(|e| e.to_string())??;
         Ok(Codec {
             tx: Mutex::new(tx),
@@ -122,6 +150,7 @@ impl Codec {
             window,
             lookahead,
             voices,
+            max_window,
             parameters,
         })
     }
@@ -135,20 +164,33 @@ impl Codec {
 
     /// `frames * frame_codes` codebook ids -> `frames * frame_samples` samples.
     pub async fn decode(&self, codes: Vec<i32>, frames: usize, seed: u64, urgency: Urgency) -> Result<Vec<f32>, String> {
-        self.decode_as(codes, frames, seed, 0, urgency).await
+        self.decode_as(codes, frames, seed, 0, urgency, None).await.map(|d| d.pcm)
     }
 
     /// [`Self::decode`] for the packet's voice `voice` (an index into [`Self::voices`]).
     pub async fn decode_voice(&self, codes: Vec<i32>, frames: usize, seed: u64, voice: u32) -> Result<Vec<f32>, String> {
-        self.decode_as(codes, frames, seed, voice, Urgency::Stream).await
+        self.decode_as(codes, frames, seed, voice, Urgency::Stream, None).await.map(|d| d.pcm)
     }
 
-    async fn decode_as(&self, codes: Vec<i32>, frames: usize, seed: u64, voice: u32, urgency: Urgency) -> Result<Vec<f32>, String> {
+    /// A stream window on the cached capacities (`max_window > 0`).
+    pub async fn decode_window(&self, codes: Vec<i32>, frames: usize, seed: u64, voice: u32, window: Window) -> Result<Decoded, String> {
+        self.decode_as(codes, frames, seed, voice, Urgency::Stream, Some(window)).await
+    }
+
+    async fn decode_as(
+        &self,
+        codes: Vec<i32>,
+        frames: usize,
+        seed: u64,
+        voice: u32,
+        urgency: Urgency,
+        window: Option<Window>,
+    ) -> Result<Decoded, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _work = self.credit.as_ref().map(|c| c.work());
         self.tx
             .lock()
-            .send(Job { codes, frames, seed, voice, urgency, reply, _work })
+            .send(Job { codes, frames, seed, voice, urgency, window, reply, _work })
             .map_err(|_| "codec worker stopped".to_string())?;
         rx.await.map_err(|_| "codec worker dropped the job".to_string())?
     }
@@ -162,6 +204,8 @@ fn bind(path: &Path) -> Result<Bound, String> {
     let pipeline = asset.bind_driver(DRIVER, runtime.as_ref()).map_err(e)?;
     let param = |k: &str| pipeline.parameter(k).map(|v| v as usize).map_err(e);
     let mut sequences: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> = Default::default();
+    let mut cached: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> = Default::default();
+    let mut prefill: std::collections::BTreeMap<u32, Vec<(usize, usize)>> = Default::default();
     for (role, program) in pipeline.programs() {
         let parts: Vec<&str> = role.split('.').collect();
         let dims = |b: &str, u: &str, bp: &str, up: &str| {
@@ -173,45 +217,81 @@ fn bind(path: &Path) -> Result<Bound, String> {
                     sequences.entry(key).or_default().push((0, program));
                 }
             }
-            ["synth", b, t, stage] => {
+            ["synth", b, t, stage] | ["csynth", b, t, stage] => {
                 if let (Some(key), Ok(stage)) = (dims(b, t, "b", "t"), stage.parse::<usize>()) {
-                    sequences.entry(key).or_default().push((stage, program));
+                    let family = if parts[0] == "synth" { &mut sequences } else { &mut cached };
+                    family.entry(key).or_default().push((stage, program));
+                }
+            }
+            ["prefill", v, stage] => {
+                if let (Some(v), Ok(stage)) = (v.strip_prefix('v').and_then(|v| v.parse::<u32>().ok()), stage.parse::<usize>()) {
+                    prefill.entry(v).or_default().push((stage, program));
                 }
             }
             _ => {}
         }
     }
-    let mut capacities: Vec<(usize, usize, Vec<usize>)> = sequences
-        .into_iter()
-        .map(|((b, f), mut stages)| {
-            stages.sort();
-            (b, f, stages.into_iter().map(|(_, p)| p).collect())
-        })
-        .collect();
+    let ordered = |mut stages: Vec<(usize, usize)>| -> Vec<usize> {
+        stages.sort();
+        stages.into_iter().map(|(_, p)| p).collect()
+    };
+    let family = |seqs: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>>| -> Vec<Capacity> {
+        let mut caps: Vec<Capacity> = seqs.into_iter().map(|((b, f), stages)| (b, f, ordered(stages))).collect();
+        caps.sort_by_key(|&(b, f, _)| (b * f, f));
+        caps
+    };
+    let capacities = family(sequences);
+    let cached = family(cached);
     if capacities.is_empty() {
         return Err("codec packet declares no decode capacity".into());
     }
-    capacities.sort_by_key(|&(b, f, _)| (b * f, f));
     // Run every capacity once now: each program sequence is captured as a CUDA graph on first
     // use, and a capture that overlaps another thread's context synchronize (the LM engine) fails.
     let t = std::time::Instant::now();
     let mut runtime = runtime;
-    for (_, _, programs) in &capacities {
+    for (_, _, programs) in capacities.iter().chain(&cached) {
         runtime.run_sequence(programs).map_err(e)?;
     }
-    tracing::info!(capacities = capacities.len(), ms = t.elapsed().as_millis() as u64, "codec graphs warmed");
+    tracing::info!(capacities = capacities.len() + cached.len(), ms = t.elapsed().as_millis() as u64, "codec graphs warmed");
     let lengths = (0..param("lengths.count")?)
         .map(|k| Ok((pipeline.tensor(&format!("lengths.{k}")).map_err(e)?, param(&format!("lengths.{k}.rows_per_frame"))?)))
         .collect::<Result<Vec<_>, String>>()?;
+    let seed = pipeline.tensor("seed").map_err(e)?;
+    let voice = pipeline.tensor("voice").ok();
+    // The cached capacities read each voice's prompt K/V: fill them once, from the prompt alone.
+    if !cached.is_empty() {
+        let (Some(voice), Some(&(count, _))) = (voice, lengths.first()) else {
+            return Err("cached codec capacities need voice and length inputs".into());
+        };
+        for (v, stages) in prefill {
+            let zero = |t: PacketTensor| vec![0u8; t.bytes];
+            let mut vb = zero(voice);
+            vb[..4].copy_from_slice(&v.to_le_bytes());
+            runtime.write_tensor(voice, &vb).map_err(e)?;
+            runtime.write_tensor(count, &zero(count)).map_err(e)?;
+            let mut sb = zero(seed);
+            sb[..8].copy_from_slice(&0x5eed_u64.to_le_bytes());
+            runtime.write_tensor(seed, &sb).map_err(e)?;
+            runtime.run_sequence(&ordered(stages)).map_err(e)?;
+        }
+    }
+    let phase = ["phase", "phase_out", "seam", "next_seam"].map(|k| pipeline.tensor(k).ok());
+    let phase = phase.iter().all(Option::is_some).then(|| phase.map(Option::unwrap));
+    if !cached.is_empty() && phase.is_none() {
+        return Err("cached codec capacities without the window phase tensors".into());
+    }
     Ok(Bound {
+        cached,
+        phase,
+        harmonics: pipeline.parameter("vocoder.harmonics").map(|v| v as usize).unwrap_or(0),
         codes: pipeline.tensor("codes").map_err(e)?,
-        seed: pipeline.tensor("seed").map_err(e)?,
+        seed,
         pcm: pipeline.tensor("pcm").map_err(e)?,
         frame_codes: param("codec.frame_codes")?,
         frame_samples: param("codec.frame_samples")?,
         window: param("stream.window_frames")?,
         lookahead: param("stream.lookahead_frames")?,
-        voice: pipeline.tensor("voice").ok(),
+        voice,
         voices: pipeline.optional_string("voices").map(|v| v.lines().map(str::to_owned).collect()).unwrap_or_default(),
         parameters: asset
             .pipelines()
@@ -226,19 +306,22 @@ fn bind(path: &Path) -> Result<Bound, String> {
 }
 
 impl Bound {
-    /// The smallest capacity holding `batch` items of `frames` frames.
-    fn capacity(&self, batch: usize, frames: usize) -> Option<&(usize, usize, Vec<usize>)> {
-        self.capacities.iter().find(|&&(b, f, _)| b >= batch && f >= frames)
+    /// The smallest capacity (of the window family when `window`) holding `batch` items of
+    /// `frames` frames.
+    fn capacity(&self, window: bool, batch: usize, frames: usize) -> Option<&Capacity> {
+        let family = if window { &self.cached } else { &self.capacities };
+        family.iter().find(|&&(b, f, _)| b >= batch && f >= frames)
     }
 
-    fn decode(&mut self, jobs: &[Job]) -> Result<Vec<Vec<f32>>, String> {
+    fn decode(&mut self, jobs: &[Job]) -> Result<Vec<Decoded>, String> {
         let frames = jobs.iter().map(|j| j.frames).max().unwrap_or(0);
+        let window = jobs[0].window.is_some();
         let (cb, cf, programs) = self
-            .capacity(jobs.len(), frames)
+            .capacity(window, jobs.len(), frames)
             .cloned()
             .ok_or_else(|| format!("{} x {frames} frames exceeds every codec capacity", jobs.len()))?;
         let fc = self.frame_codes;
-        // Only the capacity's region of the (widest-capacity) codes and PCM tensors moves: the
+        // Only the capacity's region of the (widest-capacity) input and output tensors moves: the
         // whole PCM tensor is hundreds of MB.
         let mut codes = vec![0u32; cb * cf * fc];
         for (i, j) in jobs.iter().enumerate() {
@@ -267,17 +350,42 @@ impl Bound {
             }
             self.runtime.write_tensor(voice, bytemuck::cast_slice(&v)).map_err(e)?;
         }
+        let nh = self.harmonics;
+        let windows = if window { self.phase } else { None };
+        if let Some([phase, _, seam, next_seam]) = windows {
+            let mut p = vec![0f32; phase.bytes / 4];
+            let (mut s, mut ns) = (vec![0u32; seam.bytes / 4], vec![0u32; next_seam.bytes / 4]);
+            for (i, w) in jobs.iter().filter_map(|j| j.window.as_ref()).enumerate() {
+                p[i * nh..][..w.phase.len().min(nh)].copy_from_slice(&w.phase[..w.phase.len().min(nh)]);
+                (s[i], ns[i]) = (w.seam, w.next_seam);
+            }
+            self.runtime.write_tensor(phase, bytemuck::cast_slice(&p)).map_err(e)?;
+            self.runtime.write_tensor(seam, bytemuck::cast_slice(&s)).map_err(e)?;
+            self.runtime.write_tensor(next_seam, bytemuck::cast_slice(&ns)).map_err(e)?;
+        }
         self.runtime.run_sequence(&programs).map_err(e)?;
         let mut pcm = vec![0f32; cb * cf * self.frame_samples];
         self.runtime.read_tensor_at(self.pcm, 0, bytemuck::cast_slice_mut(&mut pcm)).map_err(e)?;
+        let mut phase_out = Vec::new();
+        if let Some([_, out, _, _]) = windows {
+            phase_out = vec![0f32; out.bytes / 4];
+            self.runtime.read_tensor(out, bytemuck::cast_slice_mut(&mut phase_out)).map_err(e)?;
+        }
         let per = cf * self.frame_samples;
         debug_assert!(cb * per <= pcm.len());
-        Ok(jobs.iter().enumerate().map(|(i, j)| pcm[i * per..i * per + j.frames * self.frame_samples].to_vec()).collect())
+        Ok(jobs
+            .iter()
+            .enumerate()
+            .map(|(i, j)| Decoded {
+                pcm: pcm[i * per..i * per + j.frames * self.frame_samples].to_vec(),
+                phase: if window { phase_out[i * nh..(i + 1) * nh].to_vec() } else { Vec::new() },
+            })
+            .collect())
     }
 }
 
 fn run(rx: mpsc::Receiver<Job>, mut codec: Bound) {
-    let max_batch = codec.capacities.iter().map(|c| c.0).max().unwrap_or(1);
+    let max_batch = codec.capacities.iter().chain(&codec.cached).map(|c| c.0).max().unwrap_or(1);
     let mut pending: Vec<Job> = Vec::new();
     while let Ok(first) = rx.recv() {
         pending.push(first);
@@ -286,16 +394,25 @@ fn run(rx: mpsc::Receiver<Job>, mut codec: Bound) {
         // set by its first job.
         pending.sort_by_key(|j| (j.urgency, std::cmp::Reverse(j.frames)));
         while !pending.is_empty() {
+            // One family per launch: the first job's, then the next jobs of that family that fit.
+            let window = pending[0].window.is_some();
             let mut frames = pending[0].frames;
-            let mut n = 1;
-            while n < pending.len()
-                && n < max_batch
-                && codec.capacity(n + 1, frames.max(pending[n].frames)).is_some()
-            {
-                frames = frames.max(pending[n].frames);
-                n += 1;
+            let mut take = vec![0];
+            for (k, j) in pending.iter().enumerate().skip(1) {
+                if take.len() >= max_batch {
+                    break;
+                }
+                if j.window.is_some() != window {
+                    continue;
+                }
+                if codec.capacity(window, take.len() + 1, frames.max(j.frames)).is_none() {
+                    break;
+                }
+                frames = frames.max(j.frames);
+                take.push(k);
             }
-            let batch: Vec<Job> = pending.drain(..n).collect();
+            let mut batch: Vec<Job> = take.iter().rev().map(|&k| pending.remove(k)).collect();
+            batch.reverse();
             if frames == 0 || batch.iter().any(|j| j.codes.len() != j.frames * codec.frame_codes) {
                 for j in batch {
                     let _ = j.reply.send(Err("codec job has no frames or a partial frame".into()));

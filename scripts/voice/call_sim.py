@@ -11,7 +11,8 @@ X-Session-Id session that loops turns of
 
 SLOs (per turn, p95 over all turns): ASR final latency (last chunk sent -> final transcript),
 LLM TTFT, TTS time to first audio, and playback underrun (audio not there when the player needs
-it). Without --llm-model the agent replies with --reply text (TTS-only load).
+it). Without --llm-model the agent replies with --reply text; without --asr-model the user speaks
+for --user-s seconds without transcription (with neither: TTS-only load).
 """
 import argparse, asyncio, io, json, random, statistics, time, uuid
 
@@ -112,9 +113,13 @@ async def call(s, a, idx, clips, rec):
     for turn in range(a.turns):
         row = dict(call=idx, turn=turn)
         try:
-            clip = clips[rng.randrange(len(clips))]
-            text, row["asr_final_s"], partials = await asr_turn(s, a, sid, clip)
-            row["asr_partial_p50_s"] = statistics.median(partials) if partials else None
+            if a.asr_model:
+                clip = clips[rng.randrange(len(clips))]
+                text, row["asr_final_s"], partials = await asr_turn(s, a, sid, clip)
+                row["asr_partial_p50_s"] = statistics.median(partials) if partials else None
+            else:
+                await asyncio.sleep(a.user_s)
+                text = "Hello."
             history.append({"role": "user", "content": text or "Hello."})
             if a.llm_model:
                 reply, row["llm_ttft_s"], row["llm_total_s"] = await llm_turn(s, a, sid, history)
@@ -129,7 +134,7 @@ async def call(s, a, idx, clips, rec):
 
 
 async def main_async(a):
-    m = json.load(open(a.manifest))
+    m = json.load(open(a.manifest)) if a.asr_model else []
     clips = []
     for c in m[: a.clips]:
         x, sr = sf.read(c["path"], dtype="float32")
@@ -170,12 +175,13 @@ def main():
     ap.add_argument("--ramp-s", type=float, default=10.0, help="stagger call starts over this window")
     ap.add_argument("--think-s", type=float, default=1.0)
     ap.add_argument("--chunk-s", type=float, default=1.0)
-    ap.add_argument("--asr-model", required=True)
+    ap.add_argument("--asr-model")
+    ap.add_argument("--user-s", type=float, default=3.0, help="user speech per turn without --asr-model")
     ap.add_argument("--llm-model")
     ap.add_argument("--tts-model", required=True)
     ap.add_argument("--voice", default="default")
     ap.add_argument("--language")
-    ap.add_argument("--manifest", required=True)
+    ap.add_argument("--manifest", help="ASR clips (with --asr-model)")
     ap.add_argument("--clips", type=int, default=73)
     ap.add_argument("--system", default="You are a concise, friendly phone assistant. Answer in one or two short sentences.")
     ap.add_argument("--reply", default="Sure, I can help with that. Could you tell me a little more about what you need?")

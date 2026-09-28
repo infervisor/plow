@@ -480,6 +480,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.load_profile", Some("PLOW_LOAD_PROFILE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.multistep", Some("PLOW_MULTISTEP"), Layer::Runtime, U32, Default::Static(Val::Nat(8)), OPT_IN),
     KnobSpec::new("rt.multistep_adaptive", Some("PLOW_MULTISTEP_ADAPTIVE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("rt.tts_stream_windows", Some("PLOW_TTS_STREAM_WINDOWS"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.cfg_device", Some("PLOW_CFG_DEVICE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.cfg_multistep", Some("PLOW_CFG_MULTISTEP"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.decode_pipeline", Some("PLOW_DECODE_PIPELINE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),

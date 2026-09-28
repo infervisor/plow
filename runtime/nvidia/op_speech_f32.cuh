@@ -3078,7 +3078,10 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
     }
 }
 
-/* ---- AttentionF32 (203): fp32 flash attention. One block per (item, head, 64-query tile); BK-key
+/* ---- AttentionF32 (203): fp32 flash attention. Optional key prefix (t6, t7, i7): item b's keys
+ * are rows [0, i7) of prefix block t7[b] (t6 is [blocks][i7][K | V], 2 * heads * hw wide) followed
+ * by its kv_rows own rows; key lengths count both. No bias or causal mask with a prefix.
+ * One block per (item, head, 64-query tile); BK-key
  * tiles staged through smem; a thread owns 4 query
  * rows x 4*BK/64 keys of S and 4 rows x head_width/16 columns of O, with the row statistics
  * reduced over its 16-lane group. */
@@ -3109,14 +3112,17 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
     const float* key = (const float*)SP_TEN(2);
     const float* value = (const float*)SP_TEN(3);
     const unsigned* lengths = (const unsigned*)SP_TEN(4);
-    const float* bias = (const float*)SP_TEN(5);
+    const float* prefix = (const float*)SP_TEN(6);
+    const unsigned* pidx = (const unsigned*)SP_TEN(7);
+    const unsigned pre = prefix ? in->i[7] : 0u;
+    const float* bias = prefix ? nullptr : (const float*)SP_TEN(5);
     const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
     const unsigned width = heads * HW, stride = in->i[5] ? in->i[5] : width;
     const bool causal = in->i[6] & 1u;
     const unsigned bias_hs = in->i[7], k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
     const float scale = in->fj[0].f;
     const bool vec = stride % 4u == 0 && k_col0 % 4u == 0 && v_col0 % 4u == 0 && sp_aligned(query, 16) &&
-                     sp_aligned(key, 16) && sp_aligned(value, 16);
+                     sp_aligned(key, 16) && sp_aligned(value, 16) && (!prefix || sp_aligned(prefix, 16));
     const unsigned tid = threadIdx.x, tx = tid & 15u, ty = tid >> 4;
     const unsigned qtiles = (q_rows + SPF_BQ - 1) / SPF_BQ;
     constexpr unsigned D4 = HW / 4, QPER = SPF_BQ * D4 / PLOW_NV_THREADS, PER = BK * D4 / PLOW_NV_THREADS;
@@ -3124,7 +3130,7 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
     for (unsigned item = slice; item < batch * heads * qtiles; item += nblk) {
         const unsigned qt = item % qtiles, bh = item / qtiles, h = bh % heads, b = bh / heads;
         const unsigned q0 = qt * SPF_BQ;
-        const unsigned klen = lengths && lengths[b] < kv_rows ? lengths[b] : kv_rows;
+        const unsigned klen = lengths && lengths[b] < pre + kv_rows ? lengths[b] : pre + kv_rows;
         const unsigned kend = causal ? min(klen, q0 + SPF_BQ) : klen;
         /* Every stage issues all of its loads into registers before the first smem store: with
          * one block per SM, a load-store-load loop exposes the full memory latency per element. */
@@ -3159,8 +3165,12 @@ static __device__ __noinline__ void sp_attention_f32(const PlowDevInst* in, void
             for (unsigned p = 0; p < PER; p++) {
                 const unsigned e = tid + p * PLOW_NV_THREADS, j = e / D4, d = (e - j * D4) * 4u;
                 kr[p] = vr[p] = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (k0 + j < kend) {
-                    const size_t base = ((size_t)b * kv_rows + k0 + j) * stride + h * HW + d;
+                if (k0 + j < pre && k0 + j < kend) {
+                    const size_t pb = ((size_t)pidx[b] * pre + k0 + j) * (2u * width) + h * HW + d;
+                    kr[p] = sp_ld4(prefix + pb, vec);
+                    vr[p] = sp_ld4(prefix + pb + width, vec);
+                } else if (k0 + j < kend) {
+                    const size_t base = ((size_t)b * kv_rows + k0 + j - pre) * stride + h * HW + d;
                     kr[p] = sp_ld4(key + base + k_col0, vec);
                     vr[p] = sp_ld4(value + base + v_col0, vec);
                 }
@@ -3288,7 +3298,10 @@ static __device__ __noinline__ void sp_attention_tc64(const PlowDevInst* in, voi
     const float* key = (const float*)SP_TEN(2);
     const float* value = (const float*)SP_TEN(3);
     const unsigned* lengths = (const unsigned*)SP_TEN(4);
-    const float* bias = (const float*)SP_TEN(5);
+    const float* prefix = (const float*)SP_TEN(6);
+    const unsigned* pidx = (const unsigned*)SP_TEN(7);
+    const unsigned pre = prefix ? in->i[7] : 0u;
+    const float* bias = prefix ? nullptr : (const float*)SP_TEN(5);
     const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
     const unsigned width = heads * HW, stride = in->i[5] ? in->i[5] : width;
     const bool causal = in->i[6] & 1u;
@@ -3299,7 +3312,7 @@ static __device__ __noinline__ void sp_attention_tc64(const PlowDevInst* in, voi
     for (unsigned item = slice; item < batch * heads * qtiles; item += nblk) {
         const unsigned qt = item % qtiles, bh = item / qtiles, h = bh % heads, b = bh / heads;
         const unsigned q0 = qt * SPQ_BQ;
-        const unsigned klen = lengths && lengths[b] < kv_rows ? lengths[b] : kv_rows;
+        const unsigned klen = lengths && lengths[b] < pre + kv_rows ? lengths[b] : pre + kv_rows;
         const unsigned kend = causal ? min(klen, q0 + SPQ_BQ) : klen;
         const unsigned ra = q0 + warp * 16u + g, rb = ra + 8u;
         unsigned qh[8][4], ql[8][4];
@@ -3324,11 +3337,19 @@ static __device__ __noinline__ void sp_attention_tc64(const PlowDevInst* in, voi
                 float* vs = ks + SPQ_BK * SPQ_LDK;
 #pragma unroll
                 for (unsigned p = 0; p < 4; p++) {
-                    const unsigned e = tid + p * PLOW_NV_THREADS, j = e >> 4, d = (e & 15u) * 4u;
-                    const bool ok = k0 + j < kend;
-                    const size_t base = ((size_t)b * kv_rows + k0 + j) * stride + h * HW + d;
-                    sp_cp16(ks + j * SPQ_LDK + d, ok ? key + base + k_col0 : key, ok);
-                    sp_cp16(vs + j * SPQ_LDV + d, ok ? value + base + v_col0 : value, ok);
+                    const unsigned e = tid + p * PLOW_NV_THREADS, j = e >> 4, d = (e & 15u) * 4u, kj = k0 + j;
+                    const bool ok = kj < kend;
+                    const float *kp = key, *vp = value;
+                    if (ok && kj < pre) {
+                        kp = prefix + ((size_t)pidx[b] * pre + kj) * (2u * width) + h * HW + d;
+                        vp = kp + width;
+                    } else if (ok) {
+                        const size_t base = ((size_t)b * kv_rows + kj - pre) * stride + h * HW + d;
+                        kp = key + base + k_col0;
+                        vp = value + base + v_col0;
+                    }
+                    sp_cp16(ks + j * SPQ_LDK + d, kp, ok);
+                    sp_cp16(vs + j * SPQ_LDV + d, vp, ok);
                 }
             }
             asm volatile("cp.async.commit_group;\n" ::);
@@ -3461,7 +3482,7 @@ static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void*
     const unsigned stride = in->i[5] ? in->i[5] : in->i[3] * in->i[4];
     const bool vec = stride % 4u == 0 && in->fj[1].u % 4u == 0 && in->fj[2].u % 4u == 0 &&
                      sp_aligned(SP_TEN(1), 16) && sp_aligned(SP_TEN(2), 16) && sp_aligned(SP_TEN(3), 16) &&
-                     sp_aligned(SP_TEN(0), 8);
+                     sp_aligned(SP_TEN(0), 8) && (!SP_TEN(6) || sp_aligned(SP_TEN(6), 16));
     /* flags bit 1 (i6): 3xTF32 tensor cores. */
     if (in->i[4] == 64u && (in->i[6] & 2u) && vec) sp_attention_tc64(in, T, slice, nblk, arena);
     else if (in->i[4] == 64u) sp_attention_f32<64, 128>(in, T, slice, nblk, arena);
