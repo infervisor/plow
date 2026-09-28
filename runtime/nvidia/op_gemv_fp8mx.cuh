@@ -14,23 +14,28 @@
  * chunk is one add), and a chunk's 4 blocks are unrolled so the next block's token fragments and
  * scales load under this block's MMAs. Split-K over the S warps of one CTA, summed in the arena in
  * split order.
+ * Tokens and scales come from shared memory: the CTA stages x (and xs) once, and each warp its tile's
+ * weight-scale row, so the per-block operand loads are shared-memory hits instead of L2 round trips
+ * (the interpreter's arena leaves ~30 KB of L1). mode 2 quantizes a bf16 x into that stage with
+ * ActQuantMx's exact numerics (d_act_quant_mx), so decode needs no separate ActQuantMx op.
  */
 #pragma once
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include "../common/op_act_quant_mx.h"
 
 namespace plow_gv8 {
-constexpr unsigned MAX_T = 64, CB = 4, PITCH = CB * 32u + 16u, STAGE = 16u * PITCH, MAX_D = 4;
+constexpr unsigned MAX_T = 64, CB = 4, PITCH = CB * 32u + 16u, STAGE = 16u * PITCH, MAX_D = 4, WSB = 256;
 /* arena floats a warp ring of `d` stages needs, for all 8 warps */
 __host__ __device__ constexpr unsigned arena_floats(unsigned d) { return 8u * d * STAGE / 4u; }
 __device__ __forceinline__ float e8m0(uint8_t b) { return __uint_as_float((uint32_t)b << 23); }
 __device__ __forceinline__ void mma_e4m3(float* d, const uint32_t* a, const uint32_t* b) {
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+    asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
                  : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(0.f));
 }
 __device__ __forceinline__ void mma_bf16_z(float* d, const uint32_t* a, const uint32_t* b) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
                  : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(0.f));
 }
@@ -44,12 +49,10 @@ __device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint16_t v) {
     return (__float_as_uint(lo) >> 16) | (__float_as_uint(hi) & 0xffff0000u);
 }
 __device__ __forceinline__ void cp16(uint32_t dst, const void* src, bool valid) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(valid ? 16 : 0));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(valid ? 16 : 0) : "memory");
 }
 __device__ __forceinline__ uint2 lds8(uint32_t a) {
-    uint2 v;
-    asm volatile("ld.shared.v2.u32 {%0,%1}, [%2];\n" : "=r"(v.x), "=r"(v.y) : "r"(a));
-    return v;
+    return *reinterpret_cast<const uint2*>(__cvta_shared_to_generic(a));
 }
 /* split-K ways: the tile count times S should fill the machine's warps, S | 8, K/32 % S == 0 */
 __device__ __forceinline__ unsigned splits(unsigned tiles, unsigned kb, unsigned nblk) {
@@ -61,6 +64,8 @@ __device__ __forceinline__ unsigned splits(unsigned tiles, unsigned kb, unsigned
 struct Gv8Args {
     const uint8_t *x, *xs, *W, *ws;
     unsigned T, N, K, groups, kb, ld_x, depth;
+    uint8_t* wsb; /* per-warp WSB-byte weight-scale rows (shared), or null */
+    unsigned probe;
 };
 
 /* One block's token operand: NT fragments (+ their two scale bytes each for fp8). */
@@ -92,13 +97,13 @@ struct TokRows {
 #pragma unroll
         for (unsigned j = 0; j < NT; j++) {
             if (FP8) {
-                const uint2 v = __ldg(reinterpret_cast<const uint2*>(x + frag[j] + b * 32u));
+                const uint2 v = *reinterpret_cast<const uint2*>(x + frag[j] + b * 32u);
                 o.v[j][0] = v.x;
                 o.v[j][1] = v.y;
-                o.s[j][0] = e8m0(__ldg(xs + s0[j] + b));
-                o.s[j][1] = e8m0(__ldg(xs + s1[j] + b));
+                o.s[j][0] = e8m0(xs[s0[j] + b]);
+                o.s[j][1] = e8m0(xs[s1[j] + b]);
             } else {
-                const uint4 v = __ldg(reinterpret_cast<const uint4*>(x + frag[j] + b * 64u));
+                const uint4 v = *reinterpret_cast<const uint4*>(x + frag[j] + b * 64u);
                 o.v[j][0] = v.x;
                 o.v[j][1] = v.y;
                 o.v[j][2] = v.z;
@@ -109,9 +114,9 @@ struct TokRows {
 };
 /* cp.async.wait_group D - 1 (the immediate must be constant) */
 __device__ __forceinline__ void wait_ring(unsigned d) {
-    if (d == 4u) asm volatile("cp.async.wait_group 3;\n" ::);
-    else if (d == 3u) asm volatile("cp.async.wait_group 2;\n" ::);
-    else asm volatile("cp.async.wait_group 1;\n" ::);
+    if (d == 4u) asm volatile("cp.async.wait_group 3;\n" ::: "memory");
+    else if (d == 3u) asm volatile("cp.async.wait_group 2;\n" ::: "memory");
+    else asm volatile("cp.async.wait_group 1;\n" ::: "memory");
 }
 template <unsigned NT, bool FP8>
 __device__ __forceinline__ void tile(const Gv8Args& a, unsigned grp, unsigned n0, unsigned b_lo, unsigned b_hi, uint32_t ring,
@@ -130,15 +135,26 @@ __device__ __forceinline__ void tile(const Gv8Args& a, unsigned grp, unsigned n0
 #pragma unroll
             for (unsigned i = 0; i < 4u; i++) cp16(wdst + stage * STAGE + i * 4u * PITCH, wsrc + i * wstep + wo, wv);
         }
-        asm volatile("cp.async.commit_group;\n" ::);
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
     };
+#if PLOW_NV_TRACE
+    const bool pr = a.probe && threadIdx.x == 0;
+    if (pr) plow_probe(a.probe + 2u);
+#endif
     for (unsigned c = 0; c + 1u < D; c++) issue(c, c);
-    /* the next block's token fragments and weight scale load under this block's MMAs (the unrolled chunk renames them) */
     const uint8_t* wsr = a.ws + (size_t)((grp * a.N + n0) / 32u) * a.kb;
+    if (a.wsb && kbw <= WSB) {
+        uint8_t* buf = a.wsb + (threadIdx.x >> 5) * WSB;
+        __syncwarp(); /* the previous tile's readers are done */
+#pragma unroll 8
+        for (unsigned i = lane; i < kbw; i += 32u) buf[i] = __ldg(wsr + b_lo + i);
+        __syncwarp();
+        wsr = buf - b_lo;
+    }
     const TokRows<NT, FP8> rows(a, grp);
-    Tok<NT, FP8> nx;
-    rows.load(nx, b_lo);
-    float swn = e8m0(__ldg(wsr + b_lo));
+#if PLOW_NV_TRACE
+    if (pr) plow_probe(a.probe + 3u);
+#endif
     const uint32_t wfr = ring + g * PITCH + t4 * 8u;
     unsigned sc = 0, si = D - 1u;
     for (unsigned c = 0; c < chunks; c++) {
@@ -153,11 +169,9 @@ __device__ __forceinline__ void tile(const Gv8Args& a, unsigned grp, unsigned n0
         for (unsigned bl = 0; bl < CB; bl++) {
             const unsigned b = b_lo + c * CB + bl;
             if (b < b_hi) {
-                const Tok<NT, FP8> cur = nx;
-                const float sw = swn;
-                const unsigned bn = min(b + 1u, b_hi - 1u);
-                rows.load(nx, bn);
-                swn = e8m0(__ldg(wsr + bn));
+                Tok<NT, FP8> cur;
+                rows.load(cur, b);
+                const float sw = e8m0(wsr[b]);
                 const uint2 wa = lds8(wfr + so + bl * 32u), wb = lds8(wfr + so + 8u * PITCH + bl * 32u);
                 if (FP8) {
                     const uint32_t am[4] = {wa.x, wb.x, wa.y, wb.y};
@@ -188,8 +202,11 @@ __device__ __forceinline__ void tile(const Gv8Args& a, unsigned grp, unsigned n0
                 }
             }
         }
+#if PLOW_NV_TRACE
+        if (pr && c < 24u) plow_probe(a.probe + 4u + c);
+#endif
     }
-    asm volatile("cp.async.wait_group 0;\n" ::);
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     __syncwarp();
 }
 
@@ -249,12 +266,57 @@ __device__ __noinline__ void run(__nv_bfloat16* __restrict__ C, const Gv8Args& a
  * to arena_floats(MAX_D). */
 __device__ __noinline__ void d_gemv_fp8mx(__nv_bfloat16* __restrict__ C, const uint8_t* __restrict__ x, const uint8_t* __restrict__ xs,
                                           const uint8_t* __restrict__ W, const uint8_t* __restrict__ ws, unsigned T, unsigned N,
-                                          unsigned K, unsigned groups, bool fp8, unsigned slice, unsigned nblk, float* arena,
+                                          unsigned K, unsigned groups, unsigned mode, unsigned slice, unsigned nblk, float* arena,
                                           unsigned arena_floats_) {
     using namespace plow_gv8;
+    /* mode: 0 = bf16 x, 1 = e4m3 x + ue8m0 xs, 2 = bf16 x quantized here (e4m3 + ue8m0, as ActQuantMx) */
+    const bool fp8 = mode != 0u;
+    const unsigned ldx = groups * K, xn = T * ldx * (fp8 ? 1u : 2u), xsn = fp8 ? T * (ldx / 32u) : 0u;
+    const unsigned xb = (xn + 15u) & ~15u, xsb = (xsn + 15u) & ~15u, stage = (xb + xsb + 8u * WSB) / 4u;
+    const bool st = arena_floats(2) + stage <= arena_floats_;
+    if (mode == 2u && !st) __trap();
+    const unsigned used = st ? stage : 0u;
     unsigned depth = MAX_D;
-    while (depth > 2u && arena_floats(depth) > arena_floats_) depth--;
-    const Gv8Args a{x, xs, W, ws, T, N, K, groups, K / 32u, groups * K, depth};
+    while (depth > 2u && arena_floats(depth) + used > arena_floats_) depth--;
+    uint8_t* const sx = reinterpret_cast<uint8_t*>(arena);
+#if PLOW_NV_TRACE
+    __shared__ unsigned probe_base;
+    if (threadIdx.x == 0) {
+        probe_base = slice == 0 ? plow_probe_begin() : 0u;
+        if (probe_base) {
+            plow_probe(probe_base);
+            g_probe[probe_base + 30u] = blockIdx.x;
+        }
+    }
+    __syncthreads();
+    const unsigned probe = probe_base;
+#else
+    const unsigned probe = 0;
+#endif
+    if (st) {
+        if (mode == 2u) {
+            d_act_quant_mx(reinterpret_cast<uint16_t*>(sx), reinterpret_cast<const uint16_t*>(x), T, ldx, 0u, 1u, sx + xb);
+        } else {
+            /* 4 loads in flight per thread per round */
+            const unsigned step = blockDim.x * 16u;
+            for (unsigned o = threadIdx.x * 16u; o < xn; o += 4u * step) {
+                uint4 v[4];
+#pragma unroll
+                for (unsigned u = 0; u < 4u; u++)
+                    if (o + u * step < xn) v[u] = *reinterpret_cast<const uint4*>(x + o + u * step);
+#pragma unroll
+                for (unsigned u = 0; u < 4u; u++)
+                    if (o + u * step < xn) *reinterpret_cast<uint4*>(sx + o + u * step) = v[u];
+            }
+            for (unsigned o = threadIdx.x; o < xsn; o += blockDim.x) sx[xb + o] = xs[o];
+        }
+        __syncthreads();
+    }
+#if PLOW_NV_TRACE
+    if (threadIdx.x == 0 && probe) plow_probe(probe + 1u);
+#endif
+    const Gv8Args a{st ? sx : x, st ? sx + xb : xs, W, ws, T, N, K, groups, K / 32u, ldx, depth, st ? sx + xb + xsb : nullptr, probe};
+    arena += used;
     const unsigned nt = (T + 7u) / 8u;
     if (fp8) {
         if (nt <= 1u) run<1, true>(C, a, slice, nblk, arena);
@@ -267,4 +329,7 @@ __device__ __noinline__ void d_gemv_fp8mx(__nv_bfloat16* __restrict__ C, const u
         else if (nt <= 4u) run<4, false>(C, a, slice, nblk, arena);
         else run<8, false>(C, a, slice, nblk, arena);
     }
+#if PLOW_NV_TRACE
+    if (threadIdx.x == 0 && probe) plow_probe(probe + 28u);
+#endif
 }

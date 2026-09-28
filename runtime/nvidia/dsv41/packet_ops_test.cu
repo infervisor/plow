@@ -11,6 +11,21 @@ extern "C" __global__ void t_act_quant_mx8(uint8_t* out, uint8_t* scale, const u
     d_act_quant_mx(reinterpret_cast<uint16_t*>(out), x, rows, k, blockIdx.x, gridDim.x, scale);
 }
 
+#if PLOW_NV_TRACE
+__device__ unsigned long long g_probe[4096];
+__device__ __forceinline__ void plow_probe(unsigned i) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+    if (i < 4096u) g_probe[i] = t;
+}
+__device__ __forceinline__ unsigned plow_probe_begin() { return 1u + 32u * (unsigned)atomicAdd(&g_probe[0], 1ull); }
+extern "C" __global__ void t_probe_read(unsigned long long* out) {
+    for (unsigned i = threadIdx.x; i < 4096u; i += blockDim.x) {
+        out[i] = g_probe[i];
+        g_probe[i] = 0;
+    }
+}
+#endif
 #include "../op_gemm_f32.cuh"
 #include "../op_gemv_fp8mx.cuh"
 extern "C" __global__ void __launch_bounds__(256, 1) t_gemv_fp8mx(__nv_bfloat16* c, const uint8_t* x, const uint8_t* xs, const uint8_t* w,
@@ -20,7 +35,44 @@ extern "C" __global__ void __launch_bounds__(256, 1) t_gemv_fp8mx(__nv_bfloat16*
     /* rep r reads weight copy r mod copies (laid out back to back), so timing sees HBM, not L2 */
     const size_t wb = (size_t)groups * n * k, sb = (size_t)groups * (n / 32) * (k / 32);
     for (unsigned r = 0, cp = 0; r < reps; r++, cp = cp + 1u == copies ? 0u : cp + 1u)
-        d_gemv_fp8mx(c, x, xs, w + cp * wb, ws + cp * sb, t, n, k, groups, fp8 != 0, blockIdx.x, gridDim.x, arena, arena_f);
+        d_gemv_fp8mx(c, x, xs, w + cp * wb, ws + cp * sb, t, n, k, groups, fp8, blockIdx.x, gridDim.x, arena, arena_f);
+}
+/* grid barrier between reps (the interpreter's gate): bar zeroed by the host, monotone */
+__device__ __forceinline__ void t_gbar(unsigned* bar, unsigned& gen) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        gen += gridDim.x;
+        __threadfence();
+        atomicAdd(bar, 1u);
+        while (*(volatile unsigned*)bar < gen) {
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+/* like t_gemv_fp8mx, but a grid barrier between reps so each rep pays its own latency (mode 1 =
+ * barrier only) */
+extern "C" __global__ void __launch_bounds__(256, 1) t_gemv_fp8mx_sync(__nv_bfloat16* c, const uint8_t* x, const uint8_t* xs, const uint8_t* w,
+                                                                    const uint8_t* ws, unsigned t, unsigned n, unsigned k, unsigned groups,
+                                                                    unsigned fp8, unsigned reps, unsigned copies, unsigned arena_f,
+                                                                    unsigned* bar, unsigned mode) {
+    extern __shared__ float arena[];
+    const size_t wb = (size_t)groups * n * k, sb = (size_t)groups * (n / 32) * (k / 32);
+    unsigned gen = 0;
+    for (unsigned r = 0, cp = 0; r < reps; r++, cp = cp + 1u == copies ? 0u : cp + 1u) {
+#ifdef T_ICACHE_FLUSH
+        /* ~320 KB of straight-line code between reps: the GEMV's code is cold, as in the interpreter */
+        {
+            float z = (float)threadIdx.x;
+#pragma unroll
+            for (int i = 0; i < 20000; i++) z = fmaf(z, 1.0001f, (float)i);
+            if (z == 12345.f) *bar = 0u;
+        }
+#endif
+        t_gbar(bar, gen);
+        if (mode == 0)
+            d_gemv_fp8mx(c, x, xs, w + cp * wb, ws + cp * sb, t, n, k, groups, fp8, blockIdx.x, gridDim.x, arena, arena_f);
+    }
 }
 extern "C" __global__ void __launch_bounds__(256) t_gemm_f32(float* c, const __nv_bfloat16* a, const __nv_bfloat16* w, unsigned m, unsigned n,
                                                              unsigned k, unsigned char* scratch, unsigned splits) {
