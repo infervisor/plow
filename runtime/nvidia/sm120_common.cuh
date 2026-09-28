@@ -24,6 +24,17 @@
 #define PLOW_NV_LANE_MASK 31u
 #define PLOW_NV_WARP_SHIFT 5u
 
+/* Programmatic dependent launch (host: CudaBackend::launch_cooperative_pdl). A kernel launched
+ * with programmatic stream serialization may start while its predecessor drains; this blocks
+ * until the predecessor has completed and flushed. Call it before the first read of anything
+ * the predecessor writes. Without the attribute it returns at once. An object whose kernels all
+ * do so exports `extern "C" __device__ unsigned plow_pdl_wait_1 = 1;` (PDL_WAIT_MARKER). */
+__device__ __forceinline__ void plow_pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+
 /* 16-byte store, the partner of op_attention.cuh's ld_glob8. */
 __device__ __forceinline__ void st_glob8(__nv_bfloat16* p, const bf16v8& v) {
     *(uint4*)p = *(const uint4*)&v;

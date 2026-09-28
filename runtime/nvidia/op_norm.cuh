@@ -425,6 +425,9 @@ static __device__ void d_add_norm(__nv_bfloat16* __restrict__ out, __nv_bfloat16
 #ifndef PLOW_NV_PF_ROW_TEAM
 #define PLOW_NV_PF_ROW_TEAM 1
 #endif
+#ifndef PLOW_NV_PF_TEAM_GN_EARLY
+#define PLOW_NV_PF_TEAM_GN_EARLY 1
+#endif
 template <int TEAM>
 static __device__ __forceinline__ float team_sum(float v, float* part) {
     constexpr int TW = TEAM / 32;
@@ -461,16 +464,26 @@ static __device__ void norm_residual_team(__nv_bfloat16* __restrict__ out, __nv_
         const bool live = row < rows;
         const size_t base = (size_t)(live ? row : 0u) * feat;
         bf16v8 av[TV], bv[TV], wv[TV];
+#if PLOW_NV_PF_TEAM_GN_EARLY
+        /* gn with the other operands: one load round trip per pass instead of two. */
+        bf16v8 gv[TV];
+#endif
 #pragma unroll
         for (int c = 0; c < TV; c++) {
             const unsigned v = tl + (unsigned)c * TEAM;
             av[c] = bf16v8_zero();
             bv[c] = bf16v8_zero();
             wv[c] = bf16v8_zero();
+#if PLOW_NV_PF_TEAM_GN_EARLY
+            gv[c] = bf16v8_zero();
+#endif
             if (live && v < nv) {
                 bv[c] = ld_glob8(b + base + v * 8u);
                 av[c] = ld_glob8(a + base + v * 8u);
                 if (gb) wv[c] = ld_glob8(gb + v * 8u);
+#if PLOW_NV_PF_TEAM_GN_EARLY
+                if (NRN && gn) gv[c] = ld_glob8(gn + v * 8u);
+#endif
             }
         }
         float ss = 0.0f;
@@ -498,12 +511,17 @@ static __device__ void norm_residual_team(__nv_bfloat16* __restrict__ out, __nv_
             av[c] = r;
         }
         if constexpr (NRN) {
+#if PLOW_NV_PF_TEAM_GN_EARLY
+#pragma unroll
+            for (int c = 0; c < TV; c++) wv[c] = gv[c];
+#else
 #pragma unroll
             for (int c = 0; c < TV; c++) {
                 const unsigned v = tl + (unsigned)c * TEAM;
                 wv[c] = bf16v8_zero();
                 if (live && v < nv && gn) wv[c] = ld_glob8(gn + v * 8u);
             }
+#endif
             const float invr = rsqrtf(team_sum<TEAM>(ssr, part + PLOW_NV_WARPS) * inv_feat + eps);
 #pragma unroll
             for (int c = 0; c < TV; c++) {
@@ -979,6 +997,22 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
         if constexpr (!INTERLEAVE && (HD % 256) == 0) {
             constexpr unsigned C = HD / 128, CH = C / 2;
             float v[4 * C], g[4 * C];
+            /* The rope table row hangs off pos[t]: issue pos, then x/gamma, then cos/sin, so the
+             * table fetch overlaps the x fetch and the norm instead of following them (two
+             * dependent round trips per (token, head), not three). HD 512 keeps the late fetch:
+             * its 32 live row values leave no registers for the table under the 128 cap. */
+            constexpr bool early = HD <= 256;
+            float4 cc[CH], sv[CH];
+            const unsigned pt = cosb ? (unsigned)pos[t] : 0u;
+            auto table = [&] {
+                const size_t p = (size_t)pt * (HD / 2);
+#pragma unroll
+                for (unsigned c = 0; c < CH; c++) {
+                    const size_t j = p + 4u * (lane + 32u * c);
+                    cc[c] = *(const float4*)(cosb + j);
+                    sv[c] = *(const float4*)(sinb + j);
+                }
+            };
 #pragma unroll
             for (unsigned c = 0; c < C; c++) {
                 const ushort4 xv = *(const ushort4*)(x + ibase + 4u * (lane + 32u * c));
@@ -997,6 +1031,7 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
                     for (int k = 0; k < 4; k++) g[4 * c + k] = 1.0f;
                 }
             }
+            if (early && cosb) table();
             float inv = 1.0f;
             if (!skip_norm) {
                 float ss = 0.0f;
@@ -1013,15 +1048,12 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
                 for (unsigned e = 0; e < 4 * C; e++)
                     v[e] = __bfloat162float(__float2bfloat16(v[e]));
 #endif
-                const size_t p = (size_t)pos[t] * (HD / 2);
+                if (!early) table();
                 float r[4 * C];
 #pragma unroll
                 for (unsigned c = 0; c < CH; c++) {
-                    const size_t j = p + 4u * (lane + 32u * c);
-                    const float4 cc = *(const float4*)(cosb + j);
-                    const float4 sv = *(const float4*)(sinb + j);
-                    const float* cp = (const float*)&cc;
-                    const float* sp = (const float*)&sv;
+                    const float* cp = (const float*)&cc[c];
+                    const float* sp = (const float*)&sv[c];
 #pragma unroll
                     for (int k = 0; k < 4; k++) {
                         const unsigned lo = 4 * c + k, hi = 4 * (c + CH) + k;

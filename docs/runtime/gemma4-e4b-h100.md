@@ -637,18 +637,77 @@ What pf_4 changed:
   * Reduction order differs from T17: parity 0.992 / KL 7.2e-4 (gate: top-1 >= 0.97, KL < 1e-3).
     Greedy text changes on one of the three probe prompts (hash 6e26e0ab -> 68b329da);
     paired projections alone keep all three hashes.
-* Per-segment floor: the interpreter prologue is only the claim, the gate and one fence. The
-  4–6 µs is the cooperative launch plus block ramp of a 264-block, 99 KB-smem kernel. Claim
-  prefetch (a static first claim plus claim-ahead) did not move it, and it regressed the
-  decode tail. Not attempted: PDL across segments. nvjet kernels would need
-  `griddepcontrol.wait` to be safe as dependents.
+
+**Where a light segment's time goes** (pf_5; `-DPLOW_NV_ENTRY_TRACE=1` object with
+`PLOW_PF_ENTRY_TRACE=1`: per-block `%globaltimer` stamps, medians over 264 blocks, 1000 rows):
+
+| segment | nsys µs | block start spread | claim | entry + inst | gate | body (first item) | exit |
+|---|---|---|---|---|---|---|---|
+| NormResidual | 10.6 | 0.6 | 0.4 | 0.6 | 0.1 | 7.8 | 0.4 |
+| PLE GluStrided (205) | 7.5 | 0.3 | 0.4 | 0.6 | 0.1 | 2.3 | 0.4 |
+| NormResidualNorm | 12.7 | 0.3 | 0.4 | 0.6 | 0.1 | 9.6 | 0.5 |
+| HeadNormRope q,k,v (3 items/block) | 15.3 | 0.5 | 0.4 | 0.6 | 0.1 | 7.0 | 7.2 (items 2–3) |
+| NormResidualNorm | 15.3 | 0.8 | 0.4 | 0.6 | 0.1 | 11.6 | 0.5 |
+| GeGLU | 27.4 | 0.7 | 0.5 | 0.6 | 0.1 | 25.0 | 0.8 |
+
+* The fixed interpreter cost is ~2.5 µs per segment:
+  * ~1 µs launch (nsys duration minus the in-kernel span);
+  * ~0.5 µs block start spread;
+  * ~1 µs of dependent loads: segment window, claim atomic, stream entry, instruction.
+* The rest is op body. Most bodies are latency-bound: 2–3 dependent HBM round trips per row
+  or head, not bandwidth.
+* PDL cannot hide the launch here. The gap between an nvjet node and the next interpreter node
+  is already 0.37 µs, with or without PDL, because nvjet does not trigger its dependents early.
+
+What pf_5 changed:
+* **Segment gates** (`PLOW_PF_SEGMENT_GATES`, on; all models; `exec/gpu/segment_gates.rs`).
+  In a multi-segment prefill bucket, every segment is its own ordered launch. At load, the
+  runtime drops:
+  * each wait on a producer in an earlier segment;
+  * each counter bump that no same-segment consumer waits on.
+
+  Per work item that removes the counter poll and its acquire fence, plus the release fence
+  and the atomic bump. Results:
+  * E4B HeadNormRope 20 → 17 µs;
+  * E4B 1000 rows −0.28 ms;
+  * Veena 500 rows 9.38 → 9.18 ms, 1000 rows 20.72 → 20.45 ms.
+* **PDL helper, not wired into prefill.** The helper is `CudaBackend::launch_cooperative_pdl`
+  plus `function_waits_on_pdl`, and on the device `plow_pdl_wait()` in `sm120_common.cuh`.
+  Every interpreter entry now waits first and exports `plow_pdl_wait_1`.
+  * Launching each prefill interpreter segment that follows a kernel node programmatically saved
+    only ~0.04 ms.
+  * It also shifted E4B numerics deterministically: parity 0.985 → 0.974 over 3 runs, versus
+    0.985 with it off. The cause is not identified, so prefill does not use it.
+  * Any PDL user should gate on parity.
+* **HeadNormRope, hd256:** the rope-table fetch (`pos[t]` → cos/sin) is issued with the x
+  fetch instead of after the norm: 16.8 → 15.3 µs at 1000 rows, 26 → 22.6 µs at 2000.
+* **NormResidualNorm row teams** load `gn` with the other operands
+  (`PLOW_NV_PF_TEAM_GN_EARLY`): one load round trip per pass instead of two.
+* **Tried and dropped:**
+  * static first claim (block b takes item b; no exit atomic): neutral;
+  * two (token, head) tasks per HeadNormRope warp iteration: slower, because the 128-register
+    FATLITE object spills;
+  * q beside the k/v pair on a side stream inside the capture: slower (13.36 → 13.48 ms), the
+    two GEMMs slow each other more than they overlap.
 
 Whole launch (in-kernel):
 
-| rows | all 42 layers on every row | tail as prefill segments (pf_2) | tail as a decode step | pf_4 |
-|---|---|---|---|---|
-| 1000 | 21.3 ms (21.3 µs/row) | 17.3 ms | 14.7 ms (14.7 µs/row) | 13.7 ms (13.7 µs/row) |
-| 2000 | 34.7 ms (17.4 µs/row) | 25.2 ms | 22.4 ms (11.2 µs/row) | 20.9 ms (10.5 µs/row) |
+| rows | all 42 layers on every row | tail as prefill segments (pf_2) | tail as a decode step | pf_4 | pf_5 |
+|---|---|---|---|---|---|
+| 1000 | 21.3 ms (21.3 µs/row) | 17.3 ms | 14.7 ms (14.7 µs/row) | 13.7 ms (13.7 µs/row) | 13.3 ms (13.3 µs/row) |
+| 2000 | 34.7 ms (17.4 µs/row) | 25.2 ms | 22.4 ms (11.2 µs/row) | 20.9 ms (10.5 µs/row) | 20.6 ms (10.3 µs/row) |
+
+pf_4 → pf_5 measured back to back on one GPU: 1000 rows 13.59 → 13.31 ms (13.3 µs/row), 2000 rows 20.74 →
+20.62 ms. At 1000 rows the remaining time is:
+
+| part | ms |
+|---|---|
+| KV-shared tail decode step | 2.7 |
+| flash | 1.3 |
+| cuBLASLt GEMMs | 6.4 |
+| light ops, ~2.5 µs fixed per segment × 146 | 2.2 |
+
+Reaching 12 µs/row needs the tail and flash work (decode and attention owners), not light ops.
 
 **KV-shared tail** (`plow_asset::kv_shared_tail`, `PLOW_PF_SHARED_TAIL`, on by default). The last
 18 layers of E4B write no KV cache, so on the packed/token-batch route only the sampled rows

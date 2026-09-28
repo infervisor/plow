@@ -46,6 +46,13 @@ extern "C" __device__ unsigned plow_mixed_interpreter
  * can-fire are different claims, and only the second licenses a measurement. */
 extern "C" __device__ unsigned plow_token_batch_abi_1 = 1;
 extern "C" __device__ unsigned plow_row_gather_1 = 1;
+#ifndef PLOW_NV_ENTRY_TRACE
+#define PLOW_NV_ENTRY_TRACE 0
+#endif
+/* Every interpreter entry starts with plow_pdl_wait(): the host may launch it programmatically. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+extern "C" __device__ unsigned plow_pdl_wait_1 = 1;
+#endif
 
 /* ---- OPTIONAL per-packet arm selection (plow_config.h) ---------------------------------
  * -DPLOW_CONFIG='"plow_config.h"' includes a header devgen generated FROM THE EMITTED
@@ -3335,6 +3342,28 @@ __global__ __maxnreg__(128) void PLOW_SYM(interp_sm120)(PlowProgram prog) {
 __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(interp_sm120)(PlowProgram prog) {
 #endif
     extern __shared__ float arena[];
+#if PLOW_NV_ENTRY_TRACE
+    /* DIAGNOSTIC (off): per-block %globaltimer stamps of one segment launch into prog.trace,
+     * 8 u64 per (segment, block): entry, after the PDL wait, first item claimed, first item's
+     * entry/inst loaded, gate passed, first body retired, exit; slot 7 = first op | waits<<32. */
+    unsigned long long* const etr =
+        prog.trace ? (unsigned long long*)prog.trace + ((size_t)prog.cur_seg * 528u + blockIdx.x) * 8
+                   : nullptr;
+#define PLOW_ET(k)                                                                    \
+    do {                                                                              \
+        if (etr && threadIdx.x == 0) {                                                \
+            unsigned long long t_;                                                    \
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_));                    \
+            etr[k] = t_;                                                              \
+        }                                                                             \
+    } while (0)
+    bool et_first = true;
+#else
+#define PLOW_ET(k) do {} while (0)
+#endif
+    PLOW_ET(0);
+    plow_pdl_wait();
+    PLOW_ET(1);
 #if PLOW_NV_SKELETON
 #ifndef PLOW_NV_SKEL_PAD
 #define PLOW_NV_SKEL_PAD 160
@@ -3427,8 +3456,18 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         __syncthreads();
         const unsigned ix = gq_lo + gq_claim;
         if (ix >= gq_hi) break;
+#if PLOW_NV_ENTRY_TRACE
+        if (et_first) PLOW_ET(2);
+#endif
         const PlowStreamEnt e = ld_stream_ent(my + ix);
         const PlowDevInst* in = prog.insts + e.inst;
+#if PLOW_NV_ENTRY_TRACE
+        if (et_first) {
+            if (threadIdx.x == 0 && etr)
+                etr[7] = (unsigned long long)in->op | ((unsigned long long)e.wait_len << 32);
+            PLOW_ET(3);
+        }
+#endif
 #else
     const unsigned cu = blockIdx.x;
     const unsigned n = prog.stream_len[cu];
@@ -3484,6 +3523,9 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         if (wait_len) asm volatile("fence.acquire.gpu;" ::: "memory");
 #endif
         __syncthreads(); /* every counter in the list is now satisfied */
+#if PLOW_NV_ENTRY_TRACE
+        if (et_first) PLOW_ET(4);
+#endif
 #if PLOW_NV_TRACE
         if (tr) t_gate1 = clock64();
 #endif
@@ -3521,6 +3563,12 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #endif
 
         __syncthreads(); /* retire this block's stores before the release */
+#if PLOW_NV_ENTRY_TRACE
+        if (et_first) {
+            PLOW_ET(5);
+            et_first = false;
+        }
+#endif
 #if PLOW_NV_TRACE
         if (tr) t_body1 = clock64();
 #endif
@@ -3553,6 +3601,7 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         }
 #endif
     }
+    PLOW_ET(6);
 }
 
 /* ---- host-side launch helper -----------------------------------------------------------

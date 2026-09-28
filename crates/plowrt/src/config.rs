@@ -943,6 +943,16 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-shared-tail", env = "PLOW_PF_SHARED_TAIL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_shared_tail: bool,
 
+    /// Multi-segment prefill buckets drop the waits and counter bumps a segment launch boundary
+    /// already orders (`exec::gpu::segment_gates`).
+    #[arg(long = "pf-segment-gates", env = "PLOW_PF_SEGMENT_GATES", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_segment_gates: bool,
+
+    /// Diagnostic: with a `-DPLOW_NV_ENTRY_TRACE=1` light object, log per-segment entry-stage
+    /// timings of each captured prefill chain.
+    #[arg(long = "pf-entry-trace", env = "PLOW_PF_ENTRY_TRACE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_entry_trace: bool,
+
     /// Segment-classing v2 ("1") / q8 variant ("q8").
     #[arg(long = "pf-seg-v2", env = "PLOW_PF_SEG_V2", global = true)]
     pub pf_seg_v2: Option<String>,

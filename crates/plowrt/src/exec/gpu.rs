@@ -84,6 +84,7 @@ pub mod packet_exec;
 mod moe_lt;
 mod native_decode;
 mod packed_terminal;
+mod segment_gates;
 mod shared_tail;
 mod token_batch;
 use cublaslt::{CublasLtDecodeRoute, LibraryRoute};
@@ -2376,6 +2377,8 @@ pub struct GpuEngine {
     pf_seg_window: Option<std::ops::Range<usize>>,
     /// The next packed body stops at its bucket's KV-shared tail boundary.
     pf_seg_prefix: bool,
+    /// `PLOW_PF_ENTRY_TRACE`: per-(segment, block) stamps of a `-DPLOW_NV_ENTRY_TRACE=1` object.
+    entry_trace: Option<DeviceMem>,
     attention_gemm: Option<attention_gemm::AttentionGemm>,
     /// Request table of the prefill launch being enqueued, for `attention_gemm`.
     attention_requests: Vec<attention_gemm::Request>,
@@ -6156,6 +6159,7 @@ impl GpuEngine {
             shared_tail: None,
             pf_seg_window: None,
             pf_seg_prefix: false,
+            entry_trace: None,
             attention_gemm,
             attention_requests: Vec::new(),
             mixed_step,
@@ -9089,15 +9093,31 @@ impl GpuEngine {
                     "MoE prefill experts routed to cuBLASLt grouped matmuls"
                 );
             }
+            let waits = cublaslt_waits.as_deref().unwrap_or(&g.waits);
+            // Every launch path of a multi-segment bucket runs its segments as ordered launches.
+            let gates = (config.nv.pf_segment_gates
+                && seg_mode
+                && seg_class.len() > 1
+                && qwen_segments.is_empty())
+            .then(|| segment_gates::segment_local(g, waits))
+            .flatten();
+            if let Some(gates) = &gates {
+                tracing::debug!(
+                    bucket = g.t,
+                    dropped_waits = gates.dropped_waits,
+                    dropped_succs = gates.dropped_succs,
+                    "prefill gates across segment boundaries dropped"
+                );
+            }
             let d_inst = upload_pod(pod_bytes(&h_inst))?;
-            let d_stream = upload_pod(pod_bytes(&g.stream))?;
+            let d_stream =
+                upload_pod(pod_bytes(gates.as_ref().map_or(&g.stream, |x| &x.stream)))?;
             let d_sofs = upload_pod(pod_bytes(&g.stream_ofs))?;
             let d_slen = upload_pod(pod_bytes(&g.stream_len))?;
-            let d_waits = upload_pod(pod_bytes(
-                cublaslt_waits.as_deref().unwrap_or(&g.waits),
-            ))?;
-            let d_succs = upload_pod(pod_bytes(&g.succs))?;
-            let d_gq_stream = upload_pod(pod_bytes(&g.gq_stream))?;
+            let d_waits = upload_pod(pod_bytes(gates.as_ref().map_or(waits, |x| &x.waits)))?;
+            let d_succs = upload_pod(pod_bytes(gates.as_ref().map_or(&g.succs, |x| &x.succs)))?;
+            let d_gq_stream =
+                upload_pod(pod_bytes(gates.as_ref().map_or(&g.gq_stream, |x| &x.gq_stream)))?;
             let d_gq_seg = upload_pod(pod_bytes(&g.gq_seg_ofs))?;
             // Combined counter/cursor slab (plan: counter improvements #1):
             // the bucket's own GQ cursor sits at its counter block's tail, so
@@ -9867,6 +9887,17 @@ impl GpuEngine {
             return Ok(());
         }
         let seg_class = self.prefill[bi].seg_class[range.clone()].to_vec();
+        let mut arg = *arg;
+        if crate::config::RuntimeConfig::get().nv.pf_entry_trace {
+            if self.entry_trace.is_none() {
+                let segments = self.prefill.iter().map(|b| b.seg_class.len()).max().unwrap_or(1);
+                let mem = self.be.alloc(0, segments as u64 * 528 * 64)?;
+                self.be.memset_d8(mem.base, 0, mem.len as usize)?;
+                self.entry_trace = Some(mem);
+            }
+            arg.trace = self.entry_trace.as_ref().expect("allocated").base;
+        }
+        let arg = &arg;
         let has_external = self.prefill[bi].cublaslt_segments.iter().any(Option::is_some)
             || self.prefill[bi].moe_lt_segments.iter().any(Option::is_some)
             || self.prefill[bi]
@@ -9968,6 +9999,64 @@ impl GpuEngine {
             bucket = bi,
             "seg graph built"
         );
+        Ok(())
+    }
+
+    /// Summarize and clear the `PLOW_PF_ENTRY_TRACE` stamps of the chain just launched: per
+    /// interpreter segment, the launch span and the median of each entry stage over its blocks.
+    fn log_entry_trace(&mut self, bi: usize) -> Result<()> {
+        let Some(mem) = &self.entry_trace else {
+            return Ok(());
+        };
+        self.be.stream_synchronize(&self.stream)?;
+        let mut raw = vec![0u8; mem.len as usize];
+        self.be.download(mem, 0, &mut raw)?;
+        let words: Vec<u64> = raw
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
+            .collect();
+        let segments = self.prefill[bi].seg_class.len();
+        let blocks = 528;
+        let mut lines = Vec::new();
+        for seg in 0..segments {
+            let recs: Vec<&[u64]> = (0..blocks)
+                .map(|b| &words[(seg * blocks + b) * 8..(seg * blocks + b + 1) * 8])
+                .filter(|r| r[0] != 0 && r[6] != 0)
+                .collect();
+            if recs.is_empty() {
+                continue;
+            }
+            let start = recs.iter().map(|r| r[0]).min().unwrap_or(0);
+            let end = recs.iter().map(|r| r[6]).max().unwrap_or(0);
+            let median = |a: usize, b: usize| {
+                let mut v: Vec<u64> = recs
+                    .iter()
+                    .filter(|r| r[a] != 0 && r[b] != 0)
+                    .map(|r| r[b].saturating_sub(r[a]))
+                    .collect();
+                v.sort_unstable();
+                v.get(v.len() / 2).copied().unwrap_or(0)
+            };
+            let last_start = recs.iter().map(|r| r[0]).max().unwrap_or(0) - start;
+            let worked = recs.iter().filter(|r| r[5] != 0).count();
+            lines.push(format!(
+                "seg {seg} op {} waits {} blocks {}/{} span {} ramp {} wait {} claim {} ent {} gate {} body {} exit {}",
+                recs[0][7] & 0xffff,
+                recs[0][7] >> 32,
+                worked,
+                recs.len(),
+                end - start,
+                last_start,
+                median(0, 1),
+                median(1, 2),
+                median(2, 3),
+                median(3, 4),
+                median(4, 5),
+                median(5, 6),
+            ));
+        }
+        self.be.memset_d8(mem.base, 0, mem.len as usize)?;
+        tracing::info!(bucket = bi, "entry trace (ns)\n{}", lines.join("\n"));
         Ok(())
     }
 
@@ -10096,6 +10185,9 @@ impl GpuEngine {
                 }
                 let rest = next..seg_class.len();
                 self.run_routed_segments(bi, rest, grouped, rows, &mut routed_index)?;
+                if rt.nv.pf_entry_trace {
+                    self.log_entry_trace(bi)?;
+                }
                 if synchronize {
                 if let Err(e) = self.be.stream_synchronize(&self.stream) {
                     tracing::warn!(
