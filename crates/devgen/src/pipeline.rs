@@ -1478,9 +1478,18 @@ impl StageProgram {
         };
         let out_elements = product(&[stage.batch, stage.q_rows, width])?;
         let output = self.resolve(stage.output, f32_bytes(out_elements)?, "attention output")?;
-        // head_width 64 runs 3xTF32 tensor cores (flag bit 1) on 128-query tiles.
+        // head_width 64 runs 3xTF32 tensor cores (flag bit 1), one block per run of 8 16-row query
+        // tiles in each item's (head, tile) order (per head when a head has a single tile).
         let tc = stage.head_width == 64;
-        let units = product(&[stage.batch, stage.heads, stage.q_rows.div_ceil(if tc { 128 } else { 64 })])?;
+        let n16 = stage.q_rows.div_ceil(16);
+        let units = match (tc, n16 >= 2) {
+            (true, true) => {
+                let tiles = stage.heads.checked_mul(n16).ok_or("attention tiles overflow")?;
+                product(&[stage.batch, tiles.div_ceil(8)])?
+            }
+            (true, false) => product(&[stage.batch, stage.heads])?,
+            (false, _) => product(&[stage.batch, stage.heads, stage.q_rows.div_ceil(64)])?,
+        };
         self.emit(DevOp::AttentionF32, units, deps, output, |d| {
             d.t.copy_from_slice(&[
                 output,

@@ -1102,6 +1102,23 @@ int main(int argc, char** argv) {
             c.in.i[0] = rows; c.in.i[1] = feat; c.in.i[2] = 0; c.in.fj[0].f = 1e-5f;
             bench("CFM LayerNormF32 8704x256", c, 0, 8.0 * rows * feat);
         }
+        for (unsigned rows : {136u, 72u}) {
+            /* CFM self-attention: 64 CFG items, 8 heads x 64, fused QKV, 306-row prompt prefix. */
+            Case c; const unsigned batch = 64, heads = 8, hw = 64, width = heads * hw, stride = 3 * width, pre = 306;
+            std::vector<uint32_t> ix(batch);
+            for (unsigned i = 0; i < batch; i++) ix[i] = i % 2;
+            unsigned o = c.out((size_t)batch * rows * width), qkv = c.f32((size_t)batch * rows * stride, 1.f);
+            unsigned pf = c.f32((size_t)2 * pre * 2 * width, 1.f), x = c.u32(ix);
+            c.in.op = PLOW_DOP_ATTENTION_F32;
+            c.in.t[0] = o; c.in.t[1] = qkv; c.in.t[2] = qkv; c.in.t[3] = qkv; c.in.t[4] = PLOW_TENSOR_NONE;
+            c.in.t[5] = PLOW_TENSOR_NONE; c.in.t[6] = pf; c.in.t[7] = x;
+            c.in.i[0] = batch; c.in.i[1] = rows; c.in.i[2] = rows; c.in.i[3] = heads; c.in.i[4] = hw;
+            c.in.i[5] = stride; c.in.i[6] = 2u; c.in.i[7] = pre;
+            c.in.fj[0].f = 0.125f; c.in.fj[1].u = width; c.in.fj[2].u = 2 * width;
+            char name[80];
+            snprintf(name, sizeof(name), "CFM AttentionF32 tc b64 q%u kv%u+306", rows, rows);
+            bench(name, c, 4.0 * batch * heads * hw * rows * (rows + pre), 0);
+        }
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "--bench-codec")) {
@@ -1285,6 +1302,7 @@ int main(int argc, char** argv) {
     t_attention("AttentionF32 tc 8x64 causal bias fused", 2, 300, 8, 64, {300, 217}, true, true, true, true);
     t_attention("AttentionF32 tc 4x64 ragged rows", 1, 77, 4, 64, {}, false, false, false, true);
     t_attention("AttentionF32 tc s3gen 8x64 2x570 fused", 2, 570, 8, 64, {}, false, false, true, true);
+    t_attention("AttentionF32 tc 8x64 causal bias 2x72", 2, 72, 8, 64, {72, 50}, true, true, true, true);
     t_attention_prefix("AttentionF32 prefix 306+72 lengths", 4, 72, 306, 2, {0, 1, 0, 1}, {378, 350, 320, 306}, false);
     t_attention_prefix("AttentionF32 tc prefix 306+72 lengths", 4, 72, 306, 2, {0, 1, 0, 1}, {378, 350, 320, 306}, true);
     t_attention_prefix("AttentionF32 tc prefix 306+136", 2, 136, 306, 2, {1, 0}, {}, true);

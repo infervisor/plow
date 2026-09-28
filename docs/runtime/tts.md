@@ -331,6 +331,30 @@ language as before; English c16 / c64 35.4 / 44.2 aps, CER 0.000; Qwen3-ASR WER 
 CFM step) and calls the hook between them, so a co-scheduler can hand the device to T3 mid-render.
 Without a hook a render stays one launch.
 
+Attention with packed query tiles: a block's 8 warps take 8 consecutive 16-row query tiles of an
+item's (head, tile) list, so 136 query rows cost 8.5 warp tiles instead of two 128-row tiles; the
+at most 2 (q >= 128 rows, 32-key K/V tiles) or 5 (16-key tiles) heads a run touches are staged side
+by side. Same 3xTF32 products and softmax order. The LayerNorm rows kernel is back to 2 rows per
+warp (8 rows ran slower in the packet). Standalone (`--bench-cfm`, b64, 306-row prefix): q136 469
+-> 286 us, q72 212 -> 176 us. `csynth.b32.t64` program 2 with real inputs: attention 4972 -> 3531
+us, LayerNorm 1065 -> 820 us, program 11.85 -> 9.99 ms. Render (`--seq`): `b32.t64` 644 -> 556
+ms, `b64.t32` 663 -> 603 ms, `b8.t32` 173 -> 157 ms. Served, same client, same lease (MTL stream
+aps; the previous row is the wgmma build, rerun):
+
+| conc | before | packed attention | TTFA p50 / p90 |
+|---|---|---|---|
+| 64 | 47.1 | 49.5 | 1.7 / 2.4 s |
+| 128 | 55.7 | 56.5 | 3.9 / 5.3 s |
+| 200 | 57.8 | 61.3 | 7.5 / 8.7 s |
+
+c1 7.3, c16 37.7 aps. Mel rel-L2 5e-6 to 1e-5; CER median 0.000 (96 at c1, 200 at c200), per
+language unchanged; English c64 49.9 aps, CER 0.000; Qwen3-ASR WER 3.913%; Veena CER 0.008, c64
+57.7 aps. The same build served at 53.9 and 57.8 aps at c200 in two runs, so single A/B runs
+carry about 7% noise.
+
+The encoder (program 0, 40 ms) spends 11 ms in the relative-position bias: a diagonal
+`CopyColsF32` of `[b*8][t][t]` scores and the key-mask add, at 0.3-1.1 ms each.
+
 ## Concurrency
 
 Speech requests take the LLM path on each model's mux: packed prefill (several requests' prompt

@@ -1582,12 +1582,12 @@ static_assert(PLOW_NV_WARPS * SPL_COLS <= SP_ARENA_FLOATS, "layernorm row stage"
 /* LayerNormF32 (double statistics) over rows of 128..512 columns: each lane holds its float4s of
  * R rows in registers, so a row is read once and R rows' loads are in flight together (one row
  * per warp is latency-bound). */
-template <unsigned R, unsigned V>
 static __device__ __noinline__ void sp_layernorm_rows(float* __restrict__ out, const float* __restrict__ x,
                                                       const float* __restrict__ gamma, const float* __restrict__ beta,
                                                       unsigned rows, unsigned feat, unsigned flags, float eps,
                                                       unsigned slice, unsigned nblk, float* stats) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    constexpr unsigned R = 2, V = 4;
     const unsigned nv = feat / 128u;
     for (unsigned row0 = (slice * PLOW_NV_WARPS + warp) * R; row0 < rows; row0 += nblk * PLOW_NV_WARPS * R) {
         float4 v[R][V];
@@ -1763,9 +1763,7 @@ static __device__ __noinline__ void d_layernorm_f32(float* __restrict__ out, con
     }
     if (feat % 128u == 0 && feat <= 512u && sp_aligned(x, 16) && (!out || sp_aligned(out, 16)) &&
         (!gamma || sp_aligned(gamma, 16)) && (!beta || sp_aligned(beta, 16))) {
-        /* Rows per warp in flight (a row's reduction chain is latency-bound), within registers. */
-        if (feat <= 256u) sp_layernorm_rows<8, 2>(out, x, gamma, beta, rows, feat, flags, eps, slice, nblk, stats);
-        else sp_layernorm_rows<2, 4>(out, x, gamma, beta, rows, feat, flags, eps, slice, nblk, stats);
+        sp_layernorm_rows(out, x, gamma, beta, rows, feat, flags, eps, slice, nblk, stats);
         return;
     }
     for (unsigned row = slice * PLOW_NV_WARPS + warp; row < rows; row += nblk * PLOW_NV_WARPS) {
@@ -3754,6 +3752,207 @@ static __device__ __noinline__ void sp_attention_tc64(const PlowDevInst* in, voi
     }
 }
 
+/* sp_attention_tc64 with query tiles packed across heads: item b's (head, 16-row tile) list is cut
+ * into runs of 8, one per block and one tile per warp, so 136 query rows cost 8.5 warp tiles
+ * instead of 16 (two 128-row tiles). The at most HS heads a run touches have their KT-key K/V
+ * tiles staged side by side. Same products, splits and softmax order as sp_attention_tc64. */
+template <int KT, int HS>
+static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, void* const* T, unsigned slice,
+                                                       unsigned nblk) {
+    float* const arena = sp_smem;
+    constexpr int HW = 64, SLOT = KT * (SPQ_LDK + SPQ_LDV), NJ = KT / 8;
+    static_assert(2 * HS * SLOT <= SP_ARENA_FLOATS, "packed tc attention stages");
+    float* out = (float*)SP_TEN(0);
+    const float* query = (const float*)SP_TEN(1);
+    const float* key = (const float*)SP_TEN(2);
+    const float* value = (const float*)SP_TEN(3);
+    const unsigned* lengths = (const unsigned*)SP_TEN(4);
+    const float* prefix = (const float*)SP_TEN(6);
+    const unsigned* pidx = (const unsigned*)SP_TEN(7);
+    const unsigned pre = prefix ? in->i[7] : 0u;
+    const float* bias = prefix ? nullptr : (const float*)SP_TEN(5);
+    const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
+    const unsigned width = heads * HW, stride = in->i[5] ? in->i[5] : width;
+    const bool causal = in->i[6] & 1u;
+    const unsigned bias_hs = in->i[7], k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
+    const float scale = in->fj[0].f;
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, g = lane >> 2, t = lane & 3u;
+    const unsigned n16 = (q_rows + 15u) / 16u, tiles = heads * n16, runs = (tiles + 7u) / 8u;
+    for (unsigned item = slice; item < batch * runs; item += nblk) {
+        const unsigned b = item / runs, u0 = (item % runs) * 8u, u = u0 + warp;
+        const bool live = u < tiles;
+        const unsigned h0 = u0 / n16, nh = min(u0 + 7u, tiles - 1u) / n16 - h0 + 1u;
+        const unsigned h = live ? u / n16 : h0, q0 = live ? (u % n16) * 16u : 0u;
+        const unsigned klen = lengths && lengths[b] < pre + kv_rows ? lengths[b] : pre + kv_rows;
+        unsigned kend = klen;
+        if (causal) {
+            unsigned top = 0;
+            for (unsigned w = u0; w < u0 + 8u && w < tiles; w++) top = max(top, (w % n16) * 16u + 16u);
+            kend = min(klen, top);
+        }
+        const unsigned ra = q0 + g, rb = ra + 8u;
+        unsigned qh[8][4], ql[8][4];
+#pragma unroll
+        for (int ks = 0; ks < 8; ks++) {
+            const float* qa = query + ((size_t)b * q_rows + ra) * stride + h * HW + ks * 8 + t;
+            const float* qb = query + ((size_t)b * q_rows + rb) * stride + h * HW + ks * 8 + t;
+            const bool oa = live && ra < q_rows, ob = live && rb < q_rows;
+            const float x[4] = {oa ? qa[0] : 0.f, ob ? qb[0] : 0.f, oa ? qa[4] : 0.f, ob ? qb[4] : 0.f};
+#pragma unroll
+            for (int r = 0; r < 4; r++) sp_split(x[r], qh[ks][r], ql[ks][r]);
+        }
+        float o[8][4], mrow[2] = {-INFINITY, -INFINITY}, lrow[2] = {0.f, 0.f};
+#pragma unroll
+        for (int n = 0; n < 8; n++)
+#pragma unroll
+            for (int r = 0; r < 4; r++) o[n][r] = 0.f;
+        auto issue = [&](unsigned kt) {
+            const unsigned k0 = kt * KT;
+            if (k0 < kend) {
+                float* stage = arena + (kt & 1u) * HS * SLOT;
+                for (unsigned e = tid; e < nh * KT * 16u; e += PLOW_NV_THREADS) {
+                    const unsigned hs = e / (KT * 16u), j = (e / 16u) % KT, d = (e & 15u) * 4u, kj = k0 + j,
+                                   hh = h0 + hs;
+                    const bool ok = kj < kend;
+                    const float *kp = key, *vp = value;
+                    if (ok && kj < pre) {
+                        kp = prefix + ((size_t)pidx[b] * pre + kj) * (2u * width) + hh * HW + d;
+                        vp = kp + width;
+                    } else if (ok) {
+                        const size_t base = ((size_t)b * kv_rows + kj - pre) * stride + hh * HW + d;
+                        kp = key + base + k_col0;
+                        vp = value + base + v_col0;
+                    }
+                    float* ks = stage + hs * SLOT;
+                    sp_cp16(ks + j * SPQ_LDK + d, kp, ok);
+                    sp_cp16(ks + KT * SPQ_LDK + j * SPQ_LDV + d, vp, ok);
+                }
+            }
+            asm volatile("cp.async.commit_group;\n" ::);
+        };
+        const unsigned nkt = (kend + KT - 1) / KT;
+        issue(0);
+        for (unsigned kt = 0; kt < nkt; kt++) {
+            asm volatile("cp.async.wait_group 0;\n" ::);
+            __syncthreads();
+            issue(kt + 1);
+            if (!live) continue;
+            const float* ks = arena + (kt & 1u) * HS * SLOT + (h - h0) * SLOT;
+            const float* vs = ks + KT * SPQ_LDK;
+            const unsigned k0 = kt * KT;
+            float sc[NJ][4];
+#pragma unroll
+            for (int j = 0; j < NJ; j++)
+#pragma unroll
+                for (int r = 0; r < 4; r++) sc[j][r] = 0.f;
+#pragma unroll
+            for (int kk = 0; kk < 8; kk++)
+#pragma unroll
+                for (int j = 0; j < NJ; j++) {
+                    const float* kp = ks + (j * 8 + g) * SPQ_LDK + kk * 8 + t;
+                    unsigned bh0, bl0, bh1, bl1;
+                    sp_split(kp[0], bh0, bl0);
+                    sp_split(kp[4], bh1, bl1);
+                    sp_mma_tf32(sc[j], ql[kk], bh0, bh1);
+                    sp_mma_tf32(sc[j], qh[kk], bl0, bl1);
+                    sp_mma_tf32(sc[j], qh[kk], bh0, bh1);
+                }
+            float mt[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+            for (int j = 0; j < NJ; j++)
+#pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    const unsigned kj = k0 + j * 8 + 2 * t + (r & 1), row = r < 2 ? ra : rb;
+                    float v = sc[j][r] * scale;
+                    if (kj < kend && (!causal || kj <= row)) {
+                        if (bias && row < q_rows) v += bias[(size_t)h * bias_hs + (size_t)row * kv_rows + kj];
+                    } else {
+                        v = -INFINITY;
+                    }
+                    sc[j][r] = v;
+                    mt[r >> 1] = fmaxf(mt[r >> 1], v);
+                }
+            float corr[2], ps[2] = {0.f, 0.f};
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                mt[i] = fmaxf(mt[i], __shfl_xor_sync(0xffffffffu, mt[i], 1));
+                mt[i] = fmaxf(mt[i], __shfl_xor_sync(0xffffffffu, mt[i], 2));
+                const float mnew = fmaxf(mrow[i], mt[i]);
+                corr[i] = mnew == -INFINITY ? 1.f : expf(mrow[i] - mnew);
+                mrow[i] = mnew;
+            }
+#pragma unroll
+            for (int j = 0; j < NJ; j++)
+#pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    const float p = sc[j][r] == -INFINITY ? 0.f : expf(sc[j][r] - mrow[r >> 1]);
+                    sc[j][r] = p;
+                    ps[r >> 1] += p;
+                }
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                ps[i] += __shfl_xor_sync(0xffffffffu, ps[i], 1);
+                ps[i] += __shfl_xor_sync(0xffffffffu, ps[i], 2);
+                lrow[i] = lrow[i] * corr[i] + ps[i];
+            }
+#pragma unroll
+            for (int n = 0; n < 8; n++)
+#pragma unroll
+                for (int r = 0; r < 4; r++) o[n][r] *= corr[r >> 1];
+            float pv[8][4];
+#pragma unroll
+            for (int n = 0; n < 8; n++)
+#pragma unroll
+                for (int r = 0; r < 4; r++) pv[n][r] = 0.f;
+            const unsigned s1 = (lane & ~3u) | (t >> 1), s2 = s1 + 2u;
+#pragma unroll
+            for (int kk = 0; kk < NJ; kk++) {
+                float x[4];
+                {
+                    const float c0a = __shfl_sync(0xffffffffu, sc[kk][0], s1), c1a = __shfl_sync(0xffffffffu, sc[kk][1], s1);
+                    const float c2a = __shfl_sync(0xffffffffu, sc[kk][2], s1), c3a = __shfl_sync(0xffffffffu, sc[kk][3], s1);
+                    const float c0b = __shfl_sync(0xffffffffu, sc[kk][0], s2), c1b = __shfl_sync(0xffffffffu, sc[kk][1], s2);
+                    const float c2b = __shfl_sync(0xffffffffu, sc[kk][2], s2), c3b = __shfl_sync(0xffffffffu, sc[kk][3], s2);
+                    x[0] = t & 1u ? c1a : c0a;
+                    x[1] = t & 1u ? c3a : c2a;
+                    x[2] = t & 1u ? c1b : c0b;
+                    x[3] = t & 1u ? c3b : c2b;
+                }
+                unsigned ah[4], al[4];
+#pragma unroll
+                for (int r = 0; r < 4; r++) sp_split(x[r], ah[r], al[r]);
+#pragma unroll
+                for (int n = 0; n < 8; n++) {
+                    const float* vp = vs + (kk * 8 + t) * SPQ_LDV + n * 8 + g;
+                    unsigned bh0, bl0, bh1, bl1;
+                    sp_split(vp[0], bh0, bl0);
+                    sp_split(vp[4 * SPQ_LDV], bh1, bl1);
+                    sp_mma_tf32(pv[n], al, bh0, bh1);
+                    sp_mma_tf32(pv[n], ah, bl0, bl1);
+                    sp_mma_tf32(pv[n], ah, bh0, bh1);
+                }
+            }
+#pragma unroll
+            for (int n = 0; n < 8; n++)
+#pragma unroll
+                for (int r = 0; r < 4; r++) o[n][r] += pv[n][r];
+        }
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        __syncthreads();
+        if (!live) continue;
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const unsigned r = i ? rb : ra;
+            if (r >= q_rows) continue;
+            const float inv = lrow[i] > 0.f ? 1.0f / lrow[i] : 0.f;
+            float* orow = out + ((size_t)b * q_rows + r) * width + h * HW;
+#pragma unroll
+            for (int n = 0; n < 8; n++)
+                *(float2*)(orow + n * 8 + 2 * t) = make_float2(o[n][2 * i] * inv, o[n][2 * i + 1] * inv);
+        }
+    }
+}
+
 static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk,
                                        float* arena) {
     arena = sp_smem;
@@ -3762,7 +3961,13 @@ static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void*
                      sp_aligned(SP_TEN(1), 16) && sp_aligned(SP_TEN(2), 16) && sp_aligned(SP_TEN(3), 16) &&
                      sp_aligned(SP_TEN(0), 8) && (!SP_TEN(6) || sp_aligned(SP_TEN(6), 16));
     /* flags bit 1 (i6): 3xTF32 tensor cores. */
-    if (in->i[4] == 64u && (in->i[6] & 2u) && vec) sp_attention_tc64(in, T, slice, nblk, arena);
+    if (in->i[4] == 64u && (in->i[6] & 2u) && vec) {
+        /* Packed query tiles once a run of 8 spans at most 2 heads (KT 32) or 5 (KT 16). */
+        const unsigned n16 = (in->i[1] + 15u) / 16u;
+        if (n16 >= 8u) sp_attention_tc64p<32, 2>(in, T, slice, nblk);
+        else if (n16 >= 2u) sp_attention_tc64p<16, 5>(in, T, slice, nblk);
+        else sp_attention_tc64(in, T, slice, nblk, arena);
+    }
     else if (in->i[4] == 64u) sp_attention_f32<64, 128>(in, T, slice, nblk, arena);
     else if (in->i[4] == 128u) sp_attention_f32<128, 64>(in, T, slice, nblk, arena);
 }
