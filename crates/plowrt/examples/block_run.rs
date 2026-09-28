@@ -443,6 +443,10 @@ mod cuda {
                                     for (i, (a, b)) in sp.iter().enumerate().filter(|(_, s)| s.1 > 0) {
                                         println!("span {i:4} start {:8.1} us  end {:8.1} us  dur {:7.1} us", (a - t0) as f64 / 1e3, (b - t0) as f64 / 1e3, (b - a) as f64 / 1e3);
                                     }
+                                    if let Some(bk) = e.trace_block_spans()? {
+                                        let us: Vec<f32> = bk.iter().map(|&v| if v == 0 { -1.0 } else { (v as f64 - t0 as f64) as f32 / 1e3 }).collect();
+                                        npy::write_f32(&dir.join("block_spans.npy"), &[3, 128, 256], &us).expect("block_spans.npy");
+                                    }
                                 }
                             }
                             Ok(outs)
