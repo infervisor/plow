@@ -2470,6 +2470,13 @@ fn run_one_tick(
                                     slots[slot].as_mut().expect("packed slot is Some").pf_pos =
                                         start + len;
                                 }
+                                if let Err(err) = gpu_batch_logprobs(
+                                    &mut *e,
+                                    feeds.iter().enumerate().map(|(row, &(slot, _))| (row, slot, toks[row])),
+                                    &mut slots,
+                                ) {
+                                    tracing::warn!(error = %err, "gpu: batched logprob stats failed; per-row path");
+                                }
                                 for (row, &(slot, _)) in feeds.iter().enumerate() {
                                     let slot_opt = &mut slots[slot];
                                     let Some(request) = slot_opt.as_mut() else {
@@ -2547,6 +2554,13 @@ fn run_one_tick(
                     });
                 }
                 let mut guided: smallvec::SmallVec<[usize; 8]> = Default::default();
+                if let Err(err) = gpu_batch_logprobs(
+                    &mut *e,
+                    completed.iter().enumerate().map(|(row, &(i, token))| (row, i, token)),
+                    &mut slots,
+                ) {
+                    tracing::warn!(error = %err, "gpu: batched logprob stats failed; per-row path");
+                }
                 for (row, &(i, token)) in completed.iter().enumerate() {
                     // A speech prompt's last row: stage its position base; a CFG member's logits
                     // wait in its owner until both members have their row.
@@ -2989,6 +3003,13 @@ fn run_one_tick(
                                 }
                             }
                         };
+                        if let Err(err) = gpu_batch_logprobs(
+                            &mut *e,
+                            feeds.iter().zip(toks.iter()).map(|(&(i, _), &t)| (i, i, t)),
+                            &mut slots,
+                        ) {
+                            tracing::warn!(error = %err, "gpu: batched logprob stats failed; per-row path");
+                        }
                         for (&(i, _), &argmax_tok) in feeds.iter().zip(toks.iter()) {
                             let slot_opt = &mut slots[i];
                             let was_dev = cfg_drawn && slot_opt.as_ref().is_some_and(|s| s.cfg.is_some())
@@ -5569,6 +5590,10 @@ fn gpu_finish_token(
         return Ok(cfg_draw(slot));
     }
     if !gpu_argmax_eligible(&slot.gen.params) {
+        // Filled for this step by `gpu_batch_logprobs`.
+        if slot.lp.is_some() && greedy_stats_k(&slot.gen.params).is_some() {
+            return Ok(argmax_tok);
+        }
         if let Some(lp) = greedy_device_logprobs(e, row, &slot.gen.params, argmax_tok)? {
             slot.lp = Some(Box::new(lp));
             return Ok(argmax_tok);
@@ -5603,6 +5628,62 @@ fn gpu_finish_token(
     Ok(argmax_tok)
 }
 
+/// The top-k a greedy, unadjusted logprobs row asks the device stats kernel for; `None` when the
+/// row needs the host path.
+#[cfg(feature = "cuda")]
+fn greedy_stats_k(p: &crate::text::sample::SamplingParams) -> Option<u32> {
+    let req = p.logprobs?;
+    let adjusted = p.repetition_penalty != 1.0
+        || p.presence_penalty != 0.0
+        || p.frequency_penalty != 0.0
+        || !p.logit_bias.is_empty();
+    (p.temperature <= 0.0 && !adjusted).then(|| u32::from(req.top.min(crate::text::logprobs::MAX_TOP_LOGPROBS)))
+}
+
+/// Logprobs from device statistics `out` (`plow_logprob_stats` layout) for `k` alternatives.
+#[cfg(feature = "cuda")]
+fn stats_logprobs(out: &[f32], k: usize, raw_logits: bool) -> crate::text::logprobs::TokenLogprobs {
+    let top = (0..k).map(|i| (out[3 + i].to_bits(), out[3 + k + i])).filter(|&(t, _)| t != u32::MAX).collect();
+    crate::text::logprobs::RowStats::from_parts(out[0], raw_logits, top).finish(out[1])
+}
+
+/// Every greedy logprobs row of a step through one `plow_logprob_stats_rows` launch and one
+/// readback, instead of a launch and a synchronous read per row. `rows` = (logits row, slot,
+/// token). Fills `slot.lp` for the rows it serves; the rest (an inexact top-k, an object without
+/// the batched kernel) keep [`gpu_finish_token`]'s per-row path.
+#[cfg(feature = "cuda")]
+fn gpu_batch_logprobs(
+    e: &mut crate::exec::gpu::GpuEngine,
+    rows: impl Iterator<Item = (usize, usize, u32)>,
+    slots: &mut [Option<Slot>],
+) -> Result<()> {
+    let mut reqs: smallvec::SmallVec<[(u32, u32, u32); 32]> = Default::default();
+    let mut owners: smallvec::SmallVec<[usize; 32]> = Default::default();
+    for (row, i, tok) in rows {
+        let Some(slot) = slots[i].as_ref().filter(|s| s.cfg.is_none()) else { continue };
+        if let Some(k) = greedy_stats_k(&slot.gen.params) {
+            reqs.push((row as u32, tok, k));
+            owners.push(i);
+        }
+    }
+    if reqs.is_empty() {
+        return Ok(());
+    }
+    let mut out = Vec::with_capacity(reqs.len());
+    if !e.logprob_stats_rows(&reqs, &mut out)? {
+        return Ok(());
+    }
+    for ((&i, &(_, _, k)), stats) in owners.iter().zip(&reqs).zip(&out) {
+        if stats[2] != 0.0 {
+            continue;
+        }
+        let slot = slots[i].as_mut().expect("checked Some");
+        let raw = slot.gen.params.logprobs.is_some_and(|r| r.raw_logits);
+        slot.lp = Some(Box::new(stats_logprobs(stats, k as usize, raw)));
+    }
+    Ok(())
+}
+
 /// A greedy, unadjusted logprobs row: its statistics come from `plow_logprob_stats` on device
 /// (43 floats back instead of the 512 KiB row). `None` when the row needs the host path, the
 /// sampler object has no stats kernel, or its top-k is flagged inexact.
@@ -5613,23 +5694,12 @@ fn greedy_device_logprobs(
     p: &crate::text::sample::SamplingParams,
     tok: u32,
 ) -> Result<Option<crate::text::logprobs::TokenLogprobs>> {
-    let Some(req) = p.logprobs else { return Ok(None) };
-    if p.temperature > 0.0
-        || p.repetition_penalty != 1.0
-        || p.presence_penalty != 0.0
-        || p.frequency_penalty != 0.0
-        || !p.logit_bias.is_empty()
-    {
-        return Ok(None);
-    }
-    let k = u32::from(req.top.min(crate::text::logprobs::MAX_TOP_LOGPROBS));
+    let (Some(req), Some(k)) = (p.logprobs, greedy_stats_k(p)) else { return Ok(None) };
     let mut out = [0f32; crate::exec::gpu::LOGPROB_STATS_MAX];
     if !e.logprob_stats(row, tok, k, &mut out)? || out[2] != 0.0 {
         return Ok(None);
     }
-    let k = k as usize;
-    let top = (0..k).map(|i| (out[3 + i].to_bits(), out[3 + k + i])).filter(|&(t, _)| t != u32::MAX).collect();
-    Ok(Some(crate::text::logprobs::RowStats::from_parts(out[0], req.raw_logits, top).finish(out[1])))
+    Ok(Some(stats_logprobs(&out, k as usize, req.raw_logits)))
 }
 
 /// Draw every fed CFG owner's token from ONE download of the step's logits rows (instead of two

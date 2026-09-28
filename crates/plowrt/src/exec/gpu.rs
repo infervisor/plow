@@ -3207,10 +3207,22 @@ struct Sampler {
     /// `plow_logprob_stats` and its `[3 + 2 * MAX_TOP_LOGPROBS]` f32 output (absent on older
     /// objects: logprob rows download the whole logits row).
     lp: Option<(KernelFn, DeviceMem)>,
+    /// `plow_logprob_stats_rows` (absent on older objects: one `lp` launch per row).
+    lp_rows: Option<LpRows>,
     /// Guided-draw buffers, allocated on the first CFG pair.
     cfg: Option<CfgSlab>,
     /// Steps of guided draws staged by [`GpuEngine::stage_cfg`] for the next decode call.
     cfg_staged: usize,
+}
+
+/// Batched logprob statistics: `[batch][3]` u32 requests (row, token, k) in, `[batch]
+/// [LOGPROB_STATS_MAX]` f32 out, both staged through pinned memory.
+struct LpRows {
+    f: KernelFn,
+    req: PinnedHost,
+    d_req: DeviceMem,
+    out: PinnedHost,
+    d_out: DeviceMem,
 }
 
 /// `plow_sample_cfg` inputs: `[6][batch]` f32 params (flag, weight, penalty, temperature, top_p,
@@ -6343,6 +6355,16 @@ impl GpuEngine {
             Ok(f) => Some((f, be.alloc(0, (LOGPROB_STATS_MAX * 4) as u64)?)),
             Err(_) => None,
         };
+        let lp_rows = match be.get_function(&module, "plow_logprob_stats_rows") {
+            Ok(f) => Some(LpRows {
+                f,
+                req: be.host_alloc_pinned(batch * 3 * 4)?,
+                d_req: be.alloc(0, (batch * 3 * 4) as u64)?,
+                out: be.host_alloc_pinned(batch * LOGPROB_STATS_MAX * 4)?,
+                d_out: be.alloc(0, (batch * LOGPROB_STATS_MAX * 4) as u64)?,
+            }),
+            Err(_) => None,
+        };
         tracing::info!(cubin = %cubin.display(), cfg = f_cfg.is_some(), "device sampler enabled (PLOW_DEV_SAMPLE=1)");
         Ok(Some(Sampler {
             f,
@@ -6354,6 +6376,7 @@ impl GpuEngine {
             batch,
             f_cfg,
             lp,
+            lp_rows,
             cfg: None,
             cfg_staged: 0,
         }))
@@ -10765,6 +10788,68 @@ impl GpuEngine {
         Ok(true)
     }
 
+    /// [`Self::logprob_stats`] for every request of a step in one launch and one readback:
+    /// `reqs[i] = (logits row, token, k)`, `out[i]` its statistics. `Ok(false)` when the sampler
+    /// object has no `plow_logprob_stats_rows`.
+    pub fn logprob_stats_rows(
+        &mut self,
+        reqs: &[(u32, u32, u32)],
+        out: &mut Vec<[f32; LOGPROB_STATS_MAX]>,
+    ) -> Result<bool> {
+        out.clear();
+        let (batch, vocab) = (self.batch, self.vocab);
+        let Some((threads, lp)) = self.sampler.as_mut().and_then(|s| Some((s.threads, s.lp_rows.as_mut()?)))
+        else {
+            return Ok(false);
+        };
+        if reqs.is_empty() {
+            return Ok(true);
+        }
+        if reqs.len() > batch
+            || reqs.iter().any(|&(row, tok, k)| {
+                row as usize >= batch || tok as usize >= vocab || 3 + 2 * k as usize > LOGPROB_STATS_MAX
+            })
+        {
+            return Err(RuntimeError::Rejected("logprob_stats_rows: request out of range".into()));
+        }
+        let n = reqs.len();
+        {
+            let req: &mut [u32] = bytemuck::cast_slice_mut(&mut lp.req.as_mut_slice()[..n * 12]);
+            for (dst, &(row, tok, k)) in req.chunks_exact_mut(3).zip(reqs) {
+                dst.copy_from_slice(&[row, tok, k]);
+            }
+        }
+        let mut a_logits = self.devp[self.t_logits].base;
+        let (mut a_out, mut a_req, mut a_ids) = (lp.d_out.base, lp.d_req.base, 0u64);
+        let (mut a_v, mut a_stride) = (vocab as u32, LOGPROB_STATS_MAX as u32);
+        let mut a = [
+            &mut a_logits as *mut u64 as *mut std::ffi::c_void,
+            &mut a_out as *mut u64 as *mut std::ffi::c_void,
+            &mut a_req as *mut u64 as *mut std::ffi::c_void,
+            &mut a_ids as *mut u64 as *mut std::ffi::c_void,
+            &mut a_v as *mut u32 as *mut std::ffi::c_void,
+            &mut a_stride as *mut u32 as *mut std::ffi::c_void,
+        ];
+        // SAFETY: both pinned slabs live on self past the synchronize below.
+        unsafe {
+            self.be.memcpy_htod_async(lp.d_req.base, &lp.req.as_slice()[..n * 12], &self.stream)?;
+            self.be.launch_kernel(lp.f, n as u32, threads, 0, &mut a, Some(&self.stream))?;
+            self.be.memcpy_dtoh_async(
+                &mut lp.out.as_mut_slice()[..n * LOGPROB_STATS_MAX * 4],
+                lp.d_out.base,
+                &self.stream,
+            )?;
+        }
+        self.be.stream_synchronize(&self.stream)?;
+        let got: &[f32] = bytemuck::cast_slice(&lp.out.as_slice()[..n * LOGPROB_STATS_MAX * 4]);
+        out.extend(got.chunks_exact(LOGPROB_STATS_MAX).map(|c| {
+            let mut row = [0f32; LOGPROB_STATS_MAX];
+            row.copy_from_slice(c);
+            row
+        }));
+        Ok(true)
+    }
+
     pub fn logits_row(&mut self, b: usize, out: &mut Vec<f32>) -> Result<()> {
         if b >= self.batch {
             return Err(RuntimeError::Rejected(format!(
@@ -11257,6 +11342,9 @@ mod recurrent_tests;
 
 #[cfg(test)]
 mod qwen_tests;
+
+#[cfg(test)]
+mod logprob_rows_tests;
 
 #[cfg(test)]
 #[test]

@@ -723,7 +723,7 @@ __device__ __forceinline__ unsigned long long lp_key(float v, unsigned i) {
     const unsigned o = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
     return ((unsigned long long)o << 32) | (unsigned long long)(~i);
 }
-extern "C" __global__ void plow_logprob_stats(
+__device__ __forceinline__ void lp_stats_row(
     const __nv_bfloat16* __restrict__ logits, float* __restrict__ out, unsigned row, unsigned tok,
     unsigned V, unsigned k) {
     __shared__ float part[PLOW_SMP_WARPS];
@@ -785,4 +785,23 @@ extern "C" __global__ void plow_logprob_stats(
         out[1] = __bfloat162float(r[tok]);
         out[2] = any_inexact ? 1.0f : 0.0f;
     }
+}
+
+extern "C" __global__ void plow_logprob_stats(
+    const __nv_bfloat16* __restrict__ logits, float* __restrict__ out, unsigned row, unsigned tok,
+    unsigned V, unsigned k) {
+    lp_stats_row(logits, out, row, tok, V, k);
+}
+
+/* One block per request: req[3i..3i+3] = (logits row, token, k); its stats land at
+ * out + i * out_stride. One launch and one readback for every logprobs row of a step. With
+ * `ids` the token is the row's sampled id on the device (ids[row]), not req's: a device
+ * multi-step quantum can run this after each step's sampler without a host round trip. */
+extern "C" __global__ void plow_logprob_stats_rows(
+    const __nv_bfloat16* __restrict__ logits, float* __restrict__ out,
+    const unsigned* __restrict__ req, const int* __restrict__ ids, unsigned V,
+    unsigned out_stride) {
+    const unsigned* q = req + 3u * blockIdx.x;
+    const unsigned tok = ids ? (unsigned)ids[q[0]] : q[1];
+    lp_stats_row(logits, out + (size_t)blockIdx.x * out_stride, q[0], tok, V, q[2]);
 }

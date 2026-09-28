@@ -89,11 +89,17 @@ The engine applies three measures in order:
 
 Output tok/s, same prompts, `top_logprobs=20` on every request vs none:
 
-| conc | first version (libm exp, host row) | vectorized host | device stats (now) |
-|---|---|---|---|
-| 1 | -17.8% | -6.3% | -2.7% |
-| 32 | -81.7% | -54.0% | -32.0% |
-| 64 | -87.1% | -63.6% | -43.4% |
+| conc | first version (libm exp, host row) | vectorized host | device stats per row | batched device stats (now) |
+|---|---|---|---|---|
+| 1 | -17.8% | -6.3% | -2.7% | – |
+| 32 | -81.7% | -54.0% | -32.0% (-25.8% re-measured) | -1.2% |
+| 64 | -87.1% | -63.6% | -43.4% (-31.6% re-measured) | -1.3% |
+
+The mux gathers every greedy logprobs row of a step (decode, mixed step, token batch) into one
+`plow_logprob_stats_rows` launch and one readback (`gpu_batch_logprobs`); the per-row path
+remains for inexact top-k and older sampler objects. Re-measured greedy, `--logprobs 20`, same
+build: c32 2004 -> 1980 tok/s, c64 2636 -> 2599 (per row: 1487, 1804). Parity with batched
+stats: top1 371/376, KL mean 7.1e-4.
 
 ## Correctness vs HF transformers (bf16)
 
@@ -337,6 +343,7 @@ floor and full hd512 ~1.7x.
 | NVIDIA PLE decomposition + `GluStrided` (op 205, grid-stride over all CUs) | op 155 had no CUDA arm; GluStrided 12.7 µs/layer at B=64 | in |
 | `PLOW_NV_FA_GF_HD256=4` (sliding decode reads each KV row once for 4 q heads) | B=64 13.32 -> 12.63 ms, B=128 18.63 -> 17.59; B=1 +0.17 ms | in |
 | device `plow_logprob_stats` + vectorized host log-sum-exp | logprobs cost at c64 -87% -> -43% | in |
+| `plow_logprob_stats_rows`, one launch per step from the mux | logprobs cost at c64 -32% -> -1.3% | in |
 | `PLOW_SEG_FA512=all` + cuBLASLt prefill projections | prefill 2000 rows 70 -> 48 ms (single request); packed/cached serve 16 ms | in |
 | `PLOW_FUSE_KV_HNR=1` | 604 -> 580 decode insts; step within noise | not adopted |
 | `gemv_k8` for hd <= 512 (K-split tensor-core GEMV, 1..32 rows; manifest gate: E-series packets, i.e. `GluStrided` present) | B=1/2/8/16/32 6.93/6.82/7.40/8.50/10.22 -> 6.22/6.25/6.83/7.96/9.65 ms (B=1 via `PLOW_NV_GEMV_K8_MIN=1`) | in |
@@ -363,10 +370,9 @@ ASR and TTS, lower `max_ctx` (4096 halves the KV) before moving the table.
   the prefill rate (21.4 vs 13.2 µs/row, non-GEMM ops) and the decode step (above). No tick
   policy closes this; see "Where the tick time goes".
 * **c8 TTFT (SCHED).** 90 ms vs vLLM 63: a new prompt waits for the running multistep quantum.
-* **Logprobs and multi-step.** A logprobs row leaves device multi-step; c64 still costs -43%.
-  Next steps:
-  * batch the stats kernel over all rows of a tick;
-  * let it run inside a multi-step quantum;
+* **Logprobs.** Greedy logprobs rows cost ~1% at c32/c64 (batched device stats). Left:
+  * run the stats inside a multi-step quantum (the kernel's `ids` argument reads each row's
+    token from the device, so a quantum can run it after each step's sampler);
   * temperature > 0 logprobs rows still download the row.
 * **Prompt logprobs** (`echo`, `prompt_logprobs`) are refused. The full raw logits row is not
   exposed over HTTP (the top 20 logits only).
