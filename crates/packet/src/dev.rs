@@ -2379,7 +2379,8 @@ pub enum DevOp {
     /// (`op_gemm_common.h` `d_gemm_fp8_mx` -> `d_gemm_t<WFP8MX>`).
     ///
     /// `t0=out(bf16[T][N]) t1=x(bf16[T][K]) t2=w(fp8 e4m3 OCP[N][K])
-    /// t3=scale(ue8m0[ceil(N/32)][ceil(K/32)]) t4=xs?` · `i0=T i1=N i2=K i3=groups i4=a_row0 i5=c_row0 i6=fp8?`.
+    /// t3=scale(ue8m0[ceil(N/32)][ceil(K/32)]) t4=xs? t5=part?` · `i0=T i1=N i2=K i3=groups i4=a_row0 i5=c_row0 i6=fp8?` ·
+    /// `j1=parts`.
     ///
     /// `i3 = groups` > 1 makes it block-diagonal (the output LoRA `wo_a` below TP8): `out` is
     /// `[T][groups*N]`, `x` `[T][groups*K]`, `w` `[groups*N][K]`, and group `g` multiplies `x`
@@ -2388,6 +2389,9 @@ pub enum DevOp {
     ///
     /// `i6 = 1` (sm_90a role only): `x` is e4m3 `[T][K]` and `t4` its ue8m0 scales `[T][K/32]`,
     /// ActQuantMx's `t2` form (`K % 128 == 0`).
+    ///
+    /// Decode rows only: `t5 = part` scratch with `j1 = parts` cuts each 16-row tile's K into up to
+    /// `parts` pieces across CTAs, summed in a fixed order by the tile's last arriver.
     ///
     /// The scale grid is row-major with K innermost. `K % 32 == 0` is REQUIRED -- the kernel is
     /// the KEXACT instantiation at BK=32 -- and every V4.1 projection satisfies it by

@@ -2197,6 +2197,26 @@ fn nv_fp8_mx_act(b: &mut Builder, cus: &[u32], x: u32, rows: u32, k: u32, deps: 
 /// and so saves the op 212 and its hop.
 pub(crate) const NV_FOLD_ACT_QUANT: &str = "nv_fold_act_quant";
 
+/// Decode GemmFp8Mx over narrow N: the kernel's in-CTA split (`plow_gv8::splits`) leaves most of
+/// the grid's warps idle when N has few 16-row tiles, so it can cut each tile's K into up to
+/// `parts` pieces across CTAs (one warp each, at least one 4-block chunk each) and sum them in a
+/// fixed order. Returns the part scratch (`counters[tiles]` padded to 256 B, then f32
+/// `[tiles][parts][NT * 128]`) and `parts`, or `(TENSOR_NONE, 0)` where the in-CTA split is as wide.
+fn nv_gemv_fp8mx_parts(b: &mut Builder, nblk: u32, out: u32, t: u32, nn: u32, k: u32) -> (u32, u32) {
+    let (tiles, kb) = (nn / 16, k / 32);
+    let mut s = 1u32;
+    while s < 8 && tiles * s * 2 <= nblk * 8 && kb % (s * 2) == 0 {
+        s *= 2;
+    }
+    let parts = (nblk * 8 / tiles.max(1)).min(kb / 4);
+    if parts <= s {
+        return (TENSOR_NONE, 0);
+    }
+    let nt = t.div_ceil(8).next_power_of_two();
+    let bytes = (tiles as u64 * 4).div_ceil(256) * 256 + tiles as u64 * parts as u64 * nt as u64 * 128 * 4;
+    (b.tensor(&format!("act.gv_part.{out}"), bytes), parts)
+}
+
 /// [`emit_pf_gemm_fp8_mx`] over ONE row band: `t` rows starting at `row0` of both A and C. The
 /// weight and its scale grid are indexed by N and K only, so they do not move with the rows, and
 /// disjoint bands over the same tiles sum identically to the whole -- which is what lets the
@@ -2255,18 +2275,21 @@ fn emit_pf_gemm_fp8_mx_band(
         let (x, xs, deps) = nv_fp8_mx_act(b, cus, x, rows, k, deps, k % 128 == 0);
         (x, xs, deps, (xs != TENSOR_NONE) as u32)
     };
+    let (part, parts) = if fold { nv_gemv_fp8mx_parts(b, cus.len() as u32, out, t, nn, k) } else { (TENSOR_NONE, 0) };
     let c = b.emit(DevOp::GemmFp8Mx, cus.to_vec(), &deps, |d| {
         d.t[0] = out;
         d.t[1] = x;
         d.t[2] = wt;
         d.t[3] = sc;
         d.t[4] = xs;
+        d.t[5] = part;
         d.i[6] = mode;
         d.i[0] = t;
         d.i[1] = nn;
         d.i[2] = k;
         d.i[4] = row0; // a_row0
         d.i[5] = row0; // c_row0
+        d.j[1] = parts;
     });
     if !crate::emit_is_amd() {
         b.isolate(c);

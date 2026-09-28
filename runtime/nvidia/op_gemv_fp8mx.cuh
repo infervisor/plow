@@ -18,6 +18,10 @@
  * weight-scale row, so the per-block operand loads are shared-memory hits instead of L2 round trips
  * (the interpreter's arena leaves ~30 KB of L1). mode 2 quantizes a bf16 x into that stage with
  * ActQuantMx's exact numerics (d_act_quant_mx), so decode needs no separate ActQuantMx op.
+ * Narrow N (few 16-row tiles) leaves most of the grid's warps idle under the in-CTA split. With a
+ * `part` scratch the op instead cuts every tile's K into P parts, one warp each across all CTAs:
+ * a warp writes its f32 partial, and the tile's last arriver sums parts 0..P-1 in order (so the
+ * result does not depend on arrival order) and stores C.
  */
 #pragma once
 #include <cuda_bf16.h>
@@ -259,6 +263,57 @@ __device__ __noinline__ void run(__nv_bfloat16* __restrict__ C, const Gv8Args& a
         if (S > 1u) __syncthreads();
     }
 }
+/* part: u32 counters[tiles] (zero, self-resetting) padded to 256 B, then f32 [tiles][pstride][NT*128]. */
+template <unsigned NT, bool FP8>
+__device__ __noinline__ void run_parts(__nv_bfloat16* __restrict__ C, const Gv8Args& a_, unsigned slice, unsigned nblk, float* arena,
+                                       unsigned char* part, unsigned P, unsigned pstride) {
+    const Gv8Args a = a_;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3u;
+    const unsigned ld_c = a.groups * a.N, tn = a.N / 16u, tiles = a.groups * tn, items = tiles * P;
+    unsigned* cnt = reinterpret_cast<unsigned*>(part);
+    float* pf = reinterpret_cast<float*>(part + ((tiles * 4ull + 255ull) / 256ull) * 256ull);
+    const uint32_t ring = (uint32_t)__cvta_generic_to_shared(arena) + warp * a.depth * STAGE;
+    for (unsigned it = slice * 8u + warp; it < items; it += nblk * 8u) {
+        const unsigned t = it / P, q = it % P, grp = t / tn, n0 = (t % tn) * 16u;
+        float acc[NT][4] = {};
+        tile<NT, FP8>(a, grp, n0, a.kb * q / P, a.kb * (q + 1u) / P, ring, acc);
+        float* dst = pf + ((size_t)t * pstride + q) * (NT * 128u);
+#pragma unroll
+        for (unsigned j = 0; j < NT; j++)
+#pragma unroll
+            for (unsigned i = 0; i < 4u; i++) __stcg(dst + j * 128u + i * 32u + lane, acc[j][i]);
+        __threadfence();
+        __syncwarp();
+        unsigned old = 0;
+        if (lane == 0) old = atomicAdd(cnt + t, 1u);
+        if (__shfl_sync(0xffffffffu, old, 0) != P - 1u) continue;
+        __threadfence();
+        const float* src = pf + (size_t)t * pstride * (NT * 128u);
+#pragma unroll
+        for (unsigned j = 0; j < NT; j++)
+#pragma unroll
+            for (unsigned i = 0; i < 4u; i++) acc[j][i] = __ldcg(src + j * 128u + i * 32u + lane);
+        for (unsigned q2 = 1; q2 < P; q2++)
+#pragma unroll
+            for (unsigned j = 0; j < NT; j++)
+#pragma unroll
+                for (unsigned i = 0; i < 4u; i++) acc[j][i] += __ldcg(src + (size_t)q2 * (NT * 128u) + j * 128u + i * 32u + lane);
+        if (lane == 0) cnt[t] = 0u;
+#pragma unroll
+        for (unsigned j = 0; j < NT; j++) {
+            const unsigned c0 = j * 8u + t4 * 2u;
+            const size_t col = (size_t)grp * a.N + n0 + g;
+            if (c0 < a.T) {
+                C[(size_t)c0 * ld_c + col] = __float2bfloat16_rn(acc[j][0]);
+                C[(size_t)c0 * ld_c + col + 8u] = __float2bfloat16_rn(acc[j][2]);
+            }
+            if (c0 + 1u < a.T) {
+                C[(size_t)(c0 + 1u) * ld_c + col] = __float2bfloat16_rn(acc[j][1]);
+                C[(size_t)(c0 + 1u) * ld_c + col + 8u] = __float2bfloat16_rn(acc[j][3]);
+            }
+        }
+    }
+}
 }  // namespace plow_gv8
 
 /* C[t][g*N + n] = sum_k x[t][g*K + k] * W[g*N + n][k], t < T <= 64, over `groups` diagonal blocks.
@@ -268,7 +323,7 @@ __device__ __noinline__ void d_gemv_fp8mx(__nv_bfloat16* __restrict__ C, const u
                                           const uint8_t* __restrict__ W, const uint8_t* __restrict__ ws, unsigned T, unsigned N,
                                           unsigned K, unsigned groups, unsigned mode, unsigned slice, unsigned nblk, float* arena,
                                           unsigned arena_floats_, const __nv_bfloat16* __restrict__ up = nullptr, unsigned act = 0,
-                                          float limit = 0.0f) {
+                                          float limit = 0.0f, unsigned char* part = nullptr, unsigned pmax = 0) {
     using namespace plow_gv8;
     /* mode: 0 = bf16 x, 1 = e4m3 x + ue8m0 xs, 2 = bf16 x quantized here (e4m3 + ue8m0, as ActQuantMx),
      * 3 = as 2 on the Glu op's rows bf16(glu_pair(x, up, act, limit)): x is the gate */
@@ -353,7 +408,21 @@ __device__ __noinline__ void d_gemv_fp8mx(__nv_bfloat16* __restrict__ C, const u
     const Gv8Args a{st ? sx : x, st ? sx + xb : xs, W, ws, T, N, K, groups, K / 32u, ldx, depth, st ? sx + xb + xsb : nullptr, probe};
     arena += used;
     const unsigned nt = (T + 7u) / 8u;
-    if (fp8) {
+    /* cross-CTA parts only where they add warps over the in-CTA split */
+    const unsigned tiles = groups * (N / 16u), P = part ? min(min(pmax, nblk * 8u / tiles), K / 32u) : 0u;
+    if (P > splits(tiles, K / 32u, nblk)) {
+        if (fp8) {
+            if (nt <= 1u) run_parts<1, true>(C, a, slice, nblk, arena, part, P, pmax);
+            else if (nt <= 2u) run_parts<2, true>(C, a, slice, nblk, arena, part, P, pmax);
+            else if (nt <= 4u) run_parts<4, true>(C, a, slice, nblk, arena, part, P, pmax);
+            else run_parts<8, true>(C, a, slice, nblk, arena, part, P, pmax);
+        } else {
+            if (nt <= 1u) run_parts<1, false>(C, a, slice, nblk, arena, part, P, pmax);
+            else if (nt <= 2u) run_parts<2, false>(C, a, slice, nblk, arena, part, P, pmax);
+            else if (nt <= 4u) run_parts<4, false>(C, a, slice, nblk, arena, part, P, pmax);
+            else run_parts<8, false>(C, a, slice, nblk, arena, part, P, pmax);
+        }
+    } else if (fp8) {
         if (nt <= 1u) run<1, true>(C, a, slice, nblk, arena);
         else if (nt <= 2u) run<2, true>(C, a, slice, nblk, arena);
         else if (nt <= 4u) run<4, true>(C, a, slice, nblk, arena);

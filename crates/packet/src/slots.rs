@@ -328,7 +328,7 @@ const DOC: &[S] = &[
     S { op: DevOp::RopeInverseO, t: &["o", "cosb", "sinb", "pos"], i: &["n_tok", "n_head", "D", "rd", "pos0", "per_row?"], f: &[], j: &[] },
     S { op: DevOp::EngramGate, t: &["x", "kv", "q_weight", "k_weight", "token_mask"], i: &["T", "n", "hidden"], f: &["norm_eps"], j: &[] },
     S { op: DevOp::EngramEmbed, t: &["out", "table", "scale", "ids"], i: &["T", "n_cols", "head_dim", "blk", "vocab_start", "part_rows"], f: &[], j: &[] },
-    S { op: DevOp::GemmFp8Mx, t: &["out", "x", "w", "scale", "xs?"], i: &["T", "N", "K", "groups", "a_row0", "c_row0", "fp8?"], f: &[], j: &[] },
+    S { op: DevOp::GemmFp8Mx, t: &["out", "x", "w", "scale", "xs?", "part?"], i: &["T", "N", "K", "groups", "a_row0", "c_row0", "fp8?"], f: &[], j: &["", "parts"] },
     S { op: DevOp::ActQuantMx, t: &["out", "x", "scale?"], i: &["rows", "K"], f: &[], j: &[] },
     S { op: DevOp::CompressRopeQuant, t: &["out", "src", "cosb", "sinb", "pos", "kvlen?"], i: &["n_rows", "d", "rd", "qblk", "ratio", "row_base", "qmode", "n_head"], f: &[], j: &["slot_stride?", "batched_ring?"] },
     S { op: DevOp::SparseAttnDecode, t: &["o", "q", "ring", "cmp?", "idx?", "pos", "sink", "scratch"], i: &["B", "H", "W", "cmp_stride", "topk", "nsplit"], f: &["scale"], j: &[] },
