@@ -88,6 +88,7 @@ mod packed_terminal;
 mod segment_gates;
 mod shared_tail;
 mod token_batch;
+mod tp_serve;
 use cublaslt::{CublasLtDecodeRoute, LibraryRoute};
 use decode_rung::{
     decode_rung_index, decode_selection, effective_decode_widths, validate_cublaslt_ladder,
@@ -2431,6 +2432,9 @@ pub struct GpuEngine {
     /// Bytes of every batch-major `kv.*` tensor one cache row takes (static per-slot KV).
     kv_row_bytes: u64,
     slot_generations: Vec<u32>,
+    /// Rank 0 of a tensor-parallel group: the other ranks' engines and the group's fence
+    /// ([`Self::load_tp_group`]). Last, so it drops after this rank's buffers.
+    tp_lead: Option<Box<tp_serve::TpLead>>,
 }
 
 /// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
@@ -6424,6 +6428,7 @@ impl GpuEngine {
                 .checked_div(batch as u64 * (blob.tensors[t_pos].bytes / 4))
                 .unwrap_or(0),
             slot_generations: vec![0; batch],
+            tp_lead: None,
         };
         if let Some(t) = &tp {
             for k in std::iter::once(&mut engine.kernarg).chain(engine.prefill.iter_mut().map(|b| &mut b.kernarg)) {
@@ -6433,10 +6438,27 @@ impl GpuEngine {
                 k.n_gpu = t.n_gpu;
             }
         }
-        engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
-        engine.shared_tail =
-            shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
-        engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
+        if tp.is_some() {
+            // Every rank must run the identical launch sequence, each launch behind the fence
+            // (`load_tp_group`), and a rank's logits row is only its vocab shard: no queued or
+            // batched launch paths, no captured graph, greedy tokens only.
+            if engine.vmm_prefix_enabled() {
+                return Err(RuntimeError::Rejected(
+                    "tensor-parallel serving does not support the VMM prefix cache (unset PLOW_VMM_PREFIX)".into(),
+                ));
+            }
+            engine.sampler = None;
+            engine.multistep = None;
+            engine.pipe = None;
+            engine.mixed_step = None;
+            engine.pf_batch = None;
+            engine.cublaslt_decode_capture = false;
+        } else {
+            engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
+            engine.shared_tail =
+                shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
+            engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
+        }
         if config.token_batch {
             tracing::info!(
                 route = "unified-token-batch",
@@ -6813,6 +6835,7 @@ impl GpuEngine {
     /// reset — `in.kvlen` bounds what the attention reads, so rewinding
     /// `pos[b]` to 0 makes the slot's old cache rows unreachable.
     pub fn begin_slot(&mut self, b: usize, total: usize) -> Result<()> {
+        self.tp_post_begin(b, total);
         let keep = self.resume_rows.get_mut(b).map_or(0, std::mem::take);
         if b >= self.batch {
             return Err(RuntimeError::Rejected(format!(
@@ -6879,7 +6902,8 @@ impl GpuEngine {
     /// Whether a finished sequence's cache rows survive in its slot until the next `begin_slot`:
     /// static per-slot KV (no VMM mappings to drop, no recurrent state to reset).
     pub fn slot_resume_supported(&self) -> bool {
-        self.vmm.is_none() && self.recurrent.is_none()
+        // A TP follower never sees `resume_slot`, so its slot would restart cold.
+        self.vmm.is_none() && self.recurrent.is_none() && !self.is_tp()
     }
 
     /// Make the next `begin_slot(b, ..)` keep slot `b`'s first `rows` cache rows (a retained
@@ -6908,6 +6932,7 @@ impl GpuEngine {
     }
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
+        self.tp_post_retire(b, cache_output);
         if let Some(pipe) = self.pipe.as_mut().filter(|p| p.holds(b)) {
             pipe.retire[b] = Some(cache_output);
             return;
@@ -7168,7 +7193,7 @@ impl GpuEngine {
     /// token, so `toks[b]` is the final token — no vocab-row D2H). `temp <= 0`
     /// rows keep the greedy `ARGMAX_FIN` token. `None`, an all-greedy `specs`,
     /// or no loaded sampler → the greedy path, byte-identical to before.
-    pub fn step_slots_sampled(
+    fn step_slots_sampled_local(
         &mut self,
         feeds: &[(usize, u32)],
         specs: Option<&[DevSample]>,
@@ -9676,7 +9701,7 @@ impl GpuEngine {
         }
     }
 
-    pub fn prefill_chunk(&mut self, b: usize, prompt: &[u32], cap: usize) -> Result<PrefillStep> {
+    fn prefill_chunk_local(&mut self, b: usize, prompt: &[u32], cap: usize) -> Result<PrefillStep> {
         let cap = cap.min(self.pf_request_max_rows());
         let Some(f_pf) = self.f_pf else {
             return Err(RuntimeError::Rejected("prefill object not loaded".into()));

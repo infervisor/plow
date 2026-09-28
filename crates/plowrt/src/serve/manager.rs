@@ -352,6 +352,8 @@ pub struct ModelManager {
     /// request, so upgrades only fail during process teardown.
     state: Weak<AppState>,
     be: Arc<CudaBackend>,
+    /// The device group, `be` first: a tensor-parallel bundle as wide as it loads across all of it.
+    group: Vec<Arc<CudaBackend>>,
     mux_cfg: MuxConfig,
     /// Registered models. Behind a lock because the control plane registers
     /// new assets dirs while the server is live; cloned out of the lock at every
@@ -382,9 +384,21 @@ impl ModelManager {
         models: Vec<(String, PathBuf, PathBuf)>,
         budget: Option<u64>,
     ) -> Result<ModelManager> {
+        Self::new_group(vec![be], state, mux_cfg, models, budget)
+    }
+
+    /// [`Self::new`] over a device group (`group[0]` is the manager's backend).
+    pub fn new_group(
+        group: Vec<Arc<CudaBackend>>,
+        state: &Arc<AppState>,
+        mux_cfg: MuxConfig,
+        models: Vec<(String, PathBuf, PathBuf)>,
+        budget: Option<u64>,
+    ) -> Result<ModelManager> {
+        let be = Arc::clone(group.first().ok_or_else(|| RuntimeError::Rejected("empty device group".into()))?);
         let mut managed = Vec::with_capacity(models.len());
         for (slug, dir, ckpt) in models {
-            check_single_device(&slug, &dir)?;
+            check_tp_width(&slug, &dir, group.len())?;
             let plan = BlobPlan::from_dir_with_device(
                 &dir,
                 Some((be.granularity()?, be.compute_capability())),
@@ -418,6 +432,7 @@ impl ModelManager {
         Ok(ModelManager {
             state: Arc::downgrade(state),
             be,
+            group,
             mux_cfg,
             models: RwLock::new(managed),
             switch: tokio::sync::Mutex::new(()),
@@ -461,7 +476,7 @@ impl ModelManager {
                 dir.display()
             )));
         }
-        check_single_device(slug, &dir)?;
+        check_tp_width(slug, &dir, self.group.len())?;
         let plan = BlobPlan::from_dir_with_device(
             &dir,
             Some((self.be.granularity()?, self.be.compute_capability())),
@@ -1011,9 +1026,13 @@ impl ModelManager {
         let (free_before, _) = self.be.mem_info().map_err(EnsureError::Load)?;
         let pool_before = VmmOps::pool_bytes(&*self.be);
         let be = Arc::clone(&self.be);
+        let group = (tp_degree(&m.dir).map_err(EnsureError::Load)? > 1).then(|| self.group.clone());
         let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
         let engine =
-            tokio::task::spawn_blocking(move || crate::exec::gpu::GpuEngine::load(be, &dir, &ckpt))
+            tokio::task::spawn_blocking(move || match group {
+                Some(g) => crate::exec::gpu::GpuEngine::load_tp_group(&g, &dir, &ckpt),
+                None => crate::exec::gpu::GpuEngine::load(be, &dir, &ckpt),
+            })
                 .await
                 .map_err(|e| EnsureError::Load(RuntimeError::Msg(format!("load task: {e}"))))?
                 .map_err(EnsureError::Load)?;
@@ -1050,25 +1069,18 @@ impl ModelManager {
     }
 }
 
-/// Refuse a bundle compiled for tensor parallelism.
+/// Refuse a tensor-parallel bundle whose degree is not this manager's group width.
 ///
-/// A `ModelManager` owns exactly ONE backend and `GpuEngine::load` takes one
-/// backend, so the CUDA serving engine is single-device. Placement can form a
-/// group several ordinals wide (`--place` sizes groups by the widest declared
-/// TP degree), but only the group's first device would ever be handed to the
-/// engine — so a TP4 bundle would load as if it were TP1: no peer buffers, no
-/// rank wiring, one quarter of the weights, and confident wrong output rather
-/// than an error.
-///
-/// AMD serves TP through `AmdServe`, which is deliberately not under this
-/// manager. Until a CUDA TP engine exists, refusing is the honest answer.
-fn check_single_device(slug: &str, dir: &Path) -> Result<()> {
-    let tp = tp_degree(dir)?;
-    if tp > 1 {
+/// A TP bundle loads one rank per group device (`GpuEngine::load_tp_group`). On a
+/// narrower group it would load a subset of the shards and answer with them;
+/// `--place` sizes groups by the widest declared TP degree, so a narrower one
+/// means a mixed-degree placement this engine cannot serve.
+fn check_tp_width(slug: &str, dir: &Path, width: usize) -> Result<()> {
+    let tp = tp_degree(dir)? as usize;
+    if tp > 1 && tp != width {
         return Err(RuntimeError::Rejected(format!(
-            "{slug} declares tensor-parallel degree {tp}, and the CUDA serving engine is \
-             single-device (one backend per engine). Serving it here would load one shard \
-             and answer with it. Compile a TP1 bundle, or serve it on the AMD engine."
+            "{slug} declares tensor-parallel degree {tp}, but its device group is {width} wide. \
+             Serve it with --devices giving exactly {tp} GPUs per group."
         )));
     }
     Ok(())
