@@ -237,12 +237,15 @@ pub struct JobOpts {
 /// Queue priority. Orders the waiting queue and serial prefill, and scales the queue TTL.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum JobClass {
-    /// A user is waiting on this one's first output (a stream's first audio, an ASR final).
-    Critical = 0,
+    /// A user is waiting on this one's whole, short output: an ASR final (end of speech to
+    /// transcript is the turn's first deadline).
+    Final = 0,
+    /// A user is waiting on this one's first output (a stream's first audio).
+    Critical = 1,
     #[default]
-    Normal = 1,
+    Normal = 2,
     /// Yields to everything else, and is superseded if it waits: revisable partial results.
-    Bulk = 2,
+    Bulk = 3,
 }
 
 impl JobClass {
@@ -250,7 +253,7 @@ impl JobClass {
     /// has been superseded by the time it would run.
     fn ttl_scale(self) -> f64 {
         match self {
-            JobClass::Critical | JobClass::Normal => 1.0,
+            JobClass::Final | JobClass::Critical | JobClass::Normal => 1.0,
             JobClass::Bulk => 0.1,
         }
     }
@@ -274,24 +277,32 @@ impl QuantumCut {
     }
 }
 
-/// How long a critical job keeps deadline urgency. An ASR final is done well inside it; a speech
-/// stream past it is sustained by throughput, not by jumping co-tenants for every token.
+/// How long a critical job keeps deadline urgency: a speech stream past it is sustained by
+/// throughput, not by jumping co-tenants for every token.
 const CRITICAL_SPAN: std::time::Duration = std::time::Duration::from_millis(1000);
 
-/// The most urgent work this model holds, for [`crate::serve::cosched::CoSched::Deadline`]: a
-/// prompt still owed its first token, or a critical job (an ASR final, a speech stream's start)
-/// inside [`CRITICAL_SPAN`], is a deadline; decode is throughput; bulk-only work (partial
-/// transcripts) waits.
+/// Tokens a critical job keeps deadline urgency for however long it has waited: a speech stream's
+/// first chunks. Past both this and [`CRITICAL_SPAN`] it is throughput.
+const CRITICAL_TOKENS: usize = 48;
+
+/// The most urgent work this model holds, for [`crate::serve::cosched::CoSched::Deadline`]: an
+/// ASR final first; then a prompt still owed its first token, or a speech stream's start, is a
+/// deadline; decode is throughput; bulk-only work (partial transcripts) waits.
 fn turn_urgency(slots: &[Option<Slot>], waiting: &std::collections::VecDeque<(Job, Instant)>) -> crate::serve::cosched::Urgency {
     use crate::serve::cosched::Urgency;
     let now = Instant::now();
-    let live = slots.iter().flatten().map(|s| (s.class, s.step == 0, s.arrived));
-    let queued = waiting.iter().map(|(j, _)| (j.opts.class, true, j.arrived));
-    live.chain(queued).fold(Urgency::Bulk, |best, (class, first_token_owed, arrived)| {
+    let live = slots.iter().flatten().map(|s| (s.class, s.step, s.arrived));
+    let queued = waiting.iter().map(|(j, _)| (j.opts.class, 0, j.arrived));
+    live.chain(queued).fold(Urgency::Bulk, |best, (class, step, arrived)| {
         let u = match class {
             JobClass::Bulk => Urgency::Bulk,
-            _ if first_token_owed => Urgency::Deadline,
-            JobClass::Critical if now.saturating_duration_since(arrived) < CRITICAL_SPAN => Urgency::Deadline,
+            JobClass::Final => Urgency::Final,
+            _ if step == 0 => Urgency::Deadline,
+            JobClass::Critical
+                if step < CRITICAL_TOKENS || now.saturating_duration_since(arrived) < CRITICAL_SPAN =>
+            {
+                Urgency::Deadline
+            }
             _ => Urgency::Normal,
         };
         best.min(u)

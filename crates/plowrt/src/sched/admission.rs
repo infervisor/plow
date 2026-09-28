@@ -196,6 +196,8 @@ pub struct DownstreamCredit {
     /// dispatcher holds its next tick until this clears.
     urgent: std::sync::atomic::AtomicBool,
     released: tokio::sync::Notify,
+    /// The serving model's device turn under `--co-sched deadline`: the stage's launches take it.
+    turn: std::sync::OnceLock<std::sync::Arc<crate::serve::cosched::DeviceTurn>>,
 }
 
 /// One unit of downstream backlog, returned on drop.
@@ -232,6 +234,17 @@ impl DownstreamCredit {
 
     pub fn urgent(&self) -> bool {
         self.urgent.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_device_turn(&self, turn: std::sync::Arc<crate::serve::cosched::DeviceTurn>) {
+        if turn.mode() == crate::serve::cosched::CoSched::Deadline {
+            let _ = self.turn.set(turn);
+        }
+    }
+
+    /// The device turn the stage's launches take, under `--co-sched deadline` only.
+    pub fn device_turn(&self) -> Option<&std::sync::Arc<crate::serve::cosched::DeviceTurn>> {
+        self.turn.get()
     }
 
     /// Resolves when some backlog finishes or urgency clears.

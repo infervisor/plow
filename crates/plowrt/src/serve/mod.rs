@@ -564,10 +564,14 @@ impl AppState {
 
     /// `slug`'s downstream credit (created on first use; unlimited until a stage sets a limit).
     pub fn downstream(&self, slug: &str) -> Arc<crate::sched::admission::DownstreamCredit> {
-        if let Some(c) = self.downstream.read().get(slug) {
-            return Arc::clone(c);
+        let known = self.downstream.read().get(slug).cloned();
+        let credit = known.unwrap_or_else(|| Arc::clone(self.downstream.write().entry(slug.to_string()).or_default()));
+        if credit.device_turn().is_none() {
+            if let Some(turn) = self.device_turn(slug) {
+                credit.set_device_turn(turn);
+            }
         }
-        Arc::clone(self.downstream.write().entry(slug.to_string()).or_default())
+        credit
     }
 
     /// The co-tenant turn for `slug`'s device group, when turns are installed.

@@ -27,11 +27,17 @@ pub(super) const UPLOADS: usize = 256;
 
 struct Encode {
     features: MelFeatures,
+    /// A final's audio: encoded ahead of partials, and on a deadline device turn.
+    urgent: bool,
     respond: oneshot::Sender<Result<Vec<f32>>>,
 }
 
 /// Every queued utterance shares the next packed launch, in arrival order, as many as its largest
 /// capacity holds; a lone utterance (or a packet without packed programs) runs alone.
+///
+/// Finals go first. (The encoder stays off the co-tenant device turn: taking it there made a
+/// final's encode wait out other models' ticks, 52 -> 212 ms p50 at 50 calls, where running
+/// alongside them costs less.)
 fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEncoder) {
     let max_chunks = encoder.max_packed_chunks();
     let mut pending: std::collections::VecDeque<Encode> = Default::default();
@@ -39,6 +45,7 @@ fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEn
         pending.push_back(first);
         while !pending.is_empty() {
             pending.extend(rx.try_iter());
+            pending.make_contiguous().sort_by_key(|job| !job.urgent);
             let mut chunks = 0;
             let n = pending
                 .iter()
@@ -142,10 +149,10 @@ impl SharedAsr {
         Ok(rx)
     }
 
-    async fn encode_rows(&self, features: MelFeatures) -> Result<Vec<f32>> {
+    async fn encode_rows(&self, features: MelFeatures, urgent: bool) -> Result<Vec<f32>> {
         let (tx, rx) = oneshot::channel();
         self.encode
-            .send(Encode { features, respond: tx })
+            .send(Encode { features, urgent, respond: tx })
             .map_err(|_| RuntimeError::Msg("ASR encoder thread is gone".into()))?;
         rx.await.map_err(|_| RuntimeError::Msg("ASR encoder thread is gone".into()))?
     }
@@ -170,7 +177,7 @@ impl SharedAsr {
         .await
         .map_err(|e| RuntimeError::Msg(format!("ASR prompt task: {e}")))??;
         cancelled(cancel)?;
-        let overlay = self.encode_rows(features).await?;
+        let overlay = self.encode_rows(features, opts.final_pass).await?;
         cancelled(cancel)?;
         let (result, _) =
             self.decode(mux, ids, audio_positions, overlay, Vec::new(), language, cancel, opts, answer, arrived).await?;
@@ -214,7 +221,7 @@ impl SharedAsr {
         if stable * wf < features.frames {
             pieces.push((stable * wf, features.frames));
         }
-        let encoded = futures::future::try_join_all(pieces.iter().map(|&(a, b)| self.encode_rows(slice_frames(&features, a, b)))).await?;
+        let encoded = futures::future::try_join_all(pieces.iter().map(|&(a, b)| self.encode_rows(slice_frames(&features, a, b), false))).await?;
         cancelled(cancel)?;
         let fresh = stable - cached.len();
         let hidden = self.prompt.hidden();
@@ -290,7 +297,7 @@ impl SharedAsr {
             arrived,
             respond,
             opts: JobOpts {
-                class: if opts.final_pass { JobClass::Critical } else { JobClass::Bulk },
+                class: if opts.final_pass { JobClass::Final } else { JobClass::Bulk },
                 raw_tokens: true,
                 session,
                 speech: Some(Box::new(SpeechJob { overlay, overlay_pos, pos_base: None, cfg: None })),
@@ -302,6 +309,8 @@ impl SharedAsr {
         })?;
         let mut output = forced;
         let mut shown = 0usize;
+        let submitted = arrived.elapsed();
+        let mut first_token = None;
         let cached_tokens = loop {
             let chunk = tokio::select! {
                 chunk = stream.recv() => chunk,
@@ -311,6 +320,7 @@ impl SharedAsr {
             match chunk {
                 Some(StreamChunk::Token { id, .. }) => {
                     cancelled(cancel)?;
+                    first_token.get_or_insert_with(|| arrived.elapsed());
                     output.push(id);
                     if let Some(deltas) = &opts.deltas {
                         if let Some(text) = self.prompt.text_so_far(&output, language.as_deref()) {
@@ -336,6 +346,8 @@ impl SharedAsr {
             output_tokens = output.len(),
             final_pass = opts.final_pass,
             encoded_ms = encoded.as_secs_f64() * 1e3,
+            submitted_ms = submitted.as_secs_f64() * 1e3,
+            first_token_ms = first_token.unwrap_or_default().as_secs_f64() * 1e3,
             total_ms = arrived.elapsed().as_secs_f64() * 1e3,
             "ASR completed (serve mux)"
         );

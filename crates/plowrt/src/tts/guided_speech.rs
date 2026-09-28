@@ -405,7 +405,14 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, credit:
         }
         // Pausing the LM buys a lone stream its first audio sooner; with many utterances in flight
         // every pause delays all of them (and the requests queued behind them) instead.
-        if first && live.len() <= sc.min_batch.max(1) {
+        // Under `--co-sched deadline` the render takes the device turn like a mux tick instead.
+        let mut turn = crate::serve::cosched::Turn::default();
+        if let Some(dt) = credit.device_turn() {
+            let now = std::time::Instant::now();
+            let due_now = first || due.iter().any(|k| live[k].started.is_some() && live[k].buffered(now, &sc) <= sc.slack);
+            let urgency = if due_now { crate::serve::cosched::Urgency::Deadline } else { crate::serve::cosched::Urgency::Normal };
+            futures::executor::block_on(turn.take_at(dt, urgency));
+        } else if first && live.len() <= sc.min_batch.max(1) {
             credit.set_urgent(true);
         }
         let guard = Urgent(credit);
@@ -433,7 +440,7 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, credit:
             })
             .collect();
         let results = futures::executor::block_on(futures::future::join_all(renders));
-        drop(guard);
+        drop((guard, turn));
         let ms = t.elapsed().as_secs_f64() * 1e3;
         tracing::debug!(renders = due.len(), tokens = ?spans.iter().map(|s| s.end - s.start).collect::<Vec<_>>(), ms, "vocoder render");
         for ((k, pcm), span) in due.into_iter().zip(results).zip(spans) {

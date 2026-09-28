@@ -400,6 +400,50 @@ re-emitted with the KV-shared-tail skip), `--co-sched deadline`:
 * Through 50 calls the SLOs lost are the p95 tails of ASR final (≤500 ms) and TTS first audio
   (≤800 ms), while the medians pass.
 
+**Turn order for the finals (sched_8).** A traced ASR final at 30-50 calls (debug log `ASR
+completed (serve mux)`: encoded / submitted / first_token / total) spent its time decoding. The
+median was 330 ms and p95 1.9 s from first token to done, for ~22 tokens. Each token needed a
+turn, and the final's urgency tied with every LLM prompt and TTS stream start.
+
+* `JobClass::Final` / `Urgency::Final`: an ASR final outranks every other deadline. The
+  first-token-to-done time drops to 64 / 263 ms (p50 / p95).
+* Finals go ahead of partials in the encoder queue.
+* A critical speech stream keeps deadline urgency for its first 48 tokens as well as its first
+  second.
+* The S3Gen render takes the device turn like a mux tick (`DownstreamCredit::device_turn`). A
+  launch with a first chunk, or a stream at or under its playback slack, takes it at deadline
+  urgency, otherwise normal. This only happens under `--co-sched deadline`, which replaces the
+  LM pause (`set_urgent`) there.
+* Rejected: running the ASR encoder under the turn. The final's encode p50 went 52 -> 212 ms,
+  because concurrent with other models' ticks it costs less than waiting them out.
+
+call_sim at 5eea79c4 vs + sched_8, `--co-sched deadline`. Cells are p50/p95 ms, with SLO passes
+in bold:
+
+| calls | build | ASR final | LLM TTFT | TTS TTFA | underrun |
+|---|---|---|---|---|---|
+| 30 | HEAD | 383/945 | 153/**510** | 423/1338 | 0/90 |
+| 30 | + sched_8 | 160/**428** | 44/**351** | 412/1024 | 0/90 |
+| 50 | HEAD | 501/1680 | 178/1016 | 658/1621 | 3/150 |
+| 50 | + sched_8 | 193/546 | 84/**375** | 541/1043 | 2/150 |
+| 100 | HEAD | 1255/3492 | 368/2881 | 2219/4043 | 227/300 |
+| 100 | + sched_8 | 205/1356 | 150/**490** | 1748/3440 | 215/300 |
+
+* LLM total time per turn rises (1.3 -> 1.5 s at 30 calls, 1.4 -> 2.4 s at 50): the decode yields
+  to the finals and the stream starts.
+* Chatterbox-MTL alone, streamed, two interleaved runs each, audio s/s:
+
+  | | c64 | c128 |
+  |---|---|---|
+  | HEAD, free | 33.8 / 31.1 | 39.3 / 35.9 |
+  | + sched_8, free | 34.2 / 33.9 | 39.2 / 36.1 |
+  | + sched_8, `--co-sched deadline` | 33.1 / 31.3 | 35.8 / 35.3 |
+
+  Free (the default) is unchanged. Deadline is within the run-to-run spread at c64 and ~5%
+  under the free mean at c128. 0 failures.
+* What remains through 50 calls is TTS first audio (p95 ~1.0 s against 0.8 s) and the final's
+  encode tail (frontend + encoder queue, server-side p95 553 ms at 50 calls).
+
 **Capacity, not order, is the limit.**
 
 * A call_sim turn is ~14 s: ~7 s of user speech, ~1 s for the ASR final and the LLM, 5.1 s of

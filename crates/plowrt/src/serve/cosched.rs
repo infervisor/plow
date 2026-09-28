@@ -84,13 +84,15 @@ pub struct DeviceTurn {
 /// How soon a model needs the device, most urgent first ([`CoSched::Deadline`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Urgency {
-    /// A user-facing deadline is running: an ASR final, a speech stream being played, a prompt
-    /// waiting for its first token.
-    Deadline = 0,
+    /// A whole short result a user waits on (an ASR final): its every step is on the deadline.
+    Final = 0,
+    /// A user-facing deadline is running: a speech stream's first audio, a prompt waiting for
+    /// its first token.
+    Deadline = 1,
     /// Decode throughput.
-    Normal = 1,
+    Normal = 2,
     /// Revisable work only (partial transcripts).
-    Bulk = 2,
+    Bulk = 3,
 }
 
 /// A waiter moves up one [`Urgency`] class per `AGE` waited: bulk work gets the device within
