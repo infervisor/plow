@@ -4661,6 +4661,12 @@ fn gpu_finish_token(
     slot: &mut Slot,
     argmax_tok: u32,
 ) -> Result<u32> {
+    if !gpu_argmax_eligible(&slot.gen.params) && e.is_tp() {
+        // A tensor-parallel rank's logits row is its vocab shard; only the collective argmax is whole.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!("tensor-parallel engine: sampling parameters ignored, tokens are greedy"));
+        return Ok(argmax_tok);
+    }
     if !gpu_argmax_eligible(&slot.gen.params) {
         let mut logits = e.take_logits_buf();
         logits.clear();
