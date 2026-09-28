@@ -9395,6 +9395,11 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
         let nv_mx = enc == MoeEnc::Mxfp4 && !crate::emit_is_amd();
         let (glu_x, glu_deps) = if nv_mx {
             let (fq, _, dq) = nv_fp8_mx_act(b, &all, n.xn2, t, h, &[c_rn2], false);
+            if b.memo().contains_key(NV_FOLD_ACT_QUANT) {
+                // Decode: only the GLU (after top-k -> align) reads it. Queued at the router GEMM's
+                // rank it holds the grid in front of top-k; this puts it after the router chain.
+                b.defer_gq(dq[0], 3);
+            }
             (fq, vec![c_align, dq[0]])
         } else {
             (n.xn2, vec![c_align, c_rn2])
