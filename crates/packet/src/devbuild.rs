@@ -323,6 +323,7 @@ struct Op {
     deps: Vec<Dep>,
     counter: u32,   // the coarse counter this op bumps
     work: Vec<u32>, // per-slice cost, from the cost model. See `select_granularity`.
+    gq_delay: u32,  // added to its ASAP rank: see `Builder::defer_gq`
 }
 
 /// Dependency graph for one complete emitted program. Fusion discovery runs on this graph only
@@ -823,7 +824,7 @@ impl Builder {
                     s = s.max(start[p] + cost);
                 }
             }
-            start[i] = s;
+            start[i] = s + self.ops[i].gq_delay;
         }
         start
     }
@@ -1089,6 +1090,54 @@ impl Builder {
         self.cur_join += 1;
     }
 
+    /// Push an op `ranks` later in the ASAP claim order (`set_gq_order_asap`) without adding a
+    /// dependency: for work whose consumer is far off, so a short chain that is ready at the
+    /// same rank claims the grid first. The order stays topological (a consumer still ranks
+    /// above every producer).
+    pub fn defer_gq(&mut self, counter: u32, ranks: u32) {
+        self.ops[counter as usize].gq_delay += ranks;
+    }
+
+    /// Re-place an emitted op (coarse deps only) on `cus` and amend its immediates: for a caller
+    /// that fuses a follow-on op into one a shared emit helper produced.
+    pub fn amend(&mut self, counter: u32, cus: Vec<u32>, f: impl FnOnce(&mut DevInst)) {
+        let op = &mut self.ops[counter as usize];
+        assert!(op.deps.iter().all(|d| matches!(d, Dep::Coarse(_))));
+        op.inst.blocks = cus.len() as u16;
+        op.work = vec![1; cus.len()];
+        op.cus = cus;
+        f(&mut op.inst);
+    }
+
+    /// A second instance of an emitted op (coarse deps only), on the same CUs and deps, amended
+    /// by `f`.
+    pub fn fork_op(&mut self, counter: u32, f: impl FnOnce(&mut DevInst)) -> u32 {
+        let src = &self.ops[counter as usize];
+        let deps = src
+            .deps
+            .iter()
+            .map(|d| match d {
+                Dep::Coarse(c) => Dep::Coarse(*c),
+                _ => panic!("fork_op: coarse deps only"),
+            })
+            .collect();
+        let (mut inst, cus) = (src.inst, src.cus.clone());
+        f(&mut inst);
+        let c = self.ops.len() as u32;
+        self.ops.push(Op {
+            inst,
+            isolated: false,
+            keep_single_grid: false,
+            join: self.cur_join,
+            work: vec![1; cus.len()],
+            cus,
+            deps,
+            counter: c,
+            gq_delay: 0,
+        });
+        c
+    }
+
     /// Preserve an operation as its own segment without dropping dependency edges.
     pub fn isolate(&mut self, counter: u32) {
         self.ops[counter as usize].isolated |= !self.isolate_ignored;
@@ -1197,6 +1246,7 @@ impl Builder {
             deps,
             counter,
             work,
+            gq_delay: 0,
         });
         counter
     }

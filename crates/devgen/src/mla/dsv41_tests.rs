@@ -556,7 +556,7 @@ fn the_attention_projection_chain_emits_against_the_real_weights() {
     let all: Vec<u32> = (0..304u32).collect();
     let t = 512u32;
     let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
-    let (act, _last) = super::dsv41::emit_dsv41_attn_proj(&mut b, &cfg, &w, &all, 0, 1, x, t, &[]);
+    let (act, _last) = super::dsv41::emit_dsv41_attn_proj(&mut b, &cfg, &w, &all, 0, 1, x, t, &[], None);
     let p = b.finish();
 
     // Two RmsNorm + four... no: two norms and THREE GEMMs (q_a, q_b, kv). wo_a/wo_b are the
@@ -616,7 +616,7 @@ fn the_latent_and_the_query_are_parallel_branches_off_the_same_norm() {
     let all: Vec<u32> = (0..304u32).collect();
     let t = 512u32;
     let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
-    let (act, _) = super::dsv41::emit_dsv41_attn_proj(&mut b, &cfg, &w, &all, 0, 1, x, t, &[]);
+    let (act, _) = super::dsv41::emit_dsv41_attn_proj(&mut b, &cfg, &w, &all, 0, 1, x, t, &[], None);
     let p = b.finish();
     let kv = p.insts.iter().find(|d| d.t[0] == act.kv).unwrap();
     let qa = p.insts.iter().find(|d| d.t[0] == act.q_a).unwrap();
@@ -798,7 +798,7 @@ fn the_shared_expert_uses_the_clamped_swiglu_not_plain_silu() {
     let all: Vec<u32> = (0..304u32).collect();
     let t = 512u32;
     let x = b.tensor("act.x", (t as u64) * (cfg.hidden as u64) * 2);
-    let (act, _) = super::dsv41::emit_dsv41_ffn_shared(&mut b, &cfg, &w, &all, 0, 1, x, t, &[], false);
+    let (act, _) = super::dsv41::emit_dsv41_ffn_shared(&mut b, &cfg, &w, &all, 0, 1, x, t, &[], false, None);
     let p = b.finish();
 
     let glu = p
