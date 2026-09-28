@@ -101,6 +101,13 @@ pub struct RuntimeConfig {
     #[arg(long = "tts-first-lookahead", env = "PLOW_TTS_FIRST_LOOKAHEAD", default_value_t = 1, global = true)]
     pub tts_first_lookahead: usize,
 
+    /// Share of a streaming ASR session's time its partial transcripts may keep the model busy:
+    /// after a partial that took `t`, the session's appends answer the previous partial's text
+    /// until `t * (1 / duty - 1)` has passed. Idle, partials take far less than the 1 s append
+    /// cadence and all run; loaded, they stop crowding out finals. 1 = every append transcribes.
+    #[arg(long = "asr-partial-duty", env = "PLOW_ASR_PARTIAL_DUTY", default_value_t = 0.5, global = true)]
+    pub asr_partial_duty: f64,
+
     /// How long a finished `X-Session-Id` request's KV (and an ASR session's audio and encoder
     /// windows) stays retained for the session's next request, in ms. 0 disables retention.
     #[arg(long = "session-ttl-ms", env = "PLOW_SESSION_TTL_MS", default_value_t = 60_000, global = true)]

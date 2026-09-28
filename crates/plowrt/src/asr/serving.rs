@@ -44,6 +44,8 @@ struct Recording {
     samples: Vec<f32>,
     windows: Arc<parking_lot::Mutex<WindowCache>>,
     used: Option<Instant>,
+    /// The last partial transcript and when the next may run (`--asr-partial-duty`).
+    partial: Option<(String, Instant)>,
 }
 
 /// Recordings a process keeps at once; past it the least recently used idle one goes.
@@ -71,6 +73,9 @@ enum Route {
 pub(crate) struct WindowCache {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     rows: Vec<Arc<[f32]>>,
+    /// The last partial's output tokens: the next partial forces all but their tail.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    draft: Vec<u32>,
 }
 
 /// How one transcription runs beyond its audio.
@@ -471,7 +476,7 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
     let mut opts = AsrOpts { final_pass: !recorded || finish, ids: Some(ids.clone()), report, ..Default::default() };
     // A session recording: append, then transcribe all of it (partial) or finish it (final).
     let mut recorded_samples = 0;
-    let (samples, recording) = if recorded {
+    let (samples, mut recording) = if recorded {
         let session = ids.session.clone().expect("checked");
         let recording = state.recording(&model, &session);
         let mut rec = recording.clone().lock_owned().await;
@@ -495,8 +500,14 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         recorded_samples = rec.samples.len();
         let all = if finish {
             rec.windows = Default::default();
+            rec.partial = None;
             std::mem::take(&mut rec.samples)
         } else {
+            // Inside the session's partial duty cycle: answer the last partial again.
+            if let Some((text, _)) = rec.partial.as_ref().filter(|(_, next)| !stream && Instant::now() < *next) {
+                let reply = json!({"text": text, "final": false, "offset": recorded_samples});
+                return if format == "text" { text.clone().into_response() } else { Json(reply).into_response() };
+            }
             opts.windows = Some(rec.windows.clone());
             rec.samples.clone()
         };
@@ -536,7 +547,13 @@ async fn transcribe_upload(state: Arc<AsrServer>, mut multipart: Multipart, ids:
         }
         return response;
     }
+    let started = Instant::now();
     let result = work.await;
+    if let (Some(rec), false, Ok(Ok(result))) = (recording.as_mut(), finals, &result) {
+        let duty = crate::config::RuntimeConfig::get().asr_partial_duty.clamp(0.01, 1.0);
+        let rest = started.elapsed().mul_f64(1.0 / duty - 1.0);
+        rec.partial = Some((result.text.clone(), Instant::now() + rest));
+    }
     drop((in_flight, recording));
     let mut response = match result {
         Ok(Ok(result)) if format == "text" => result.text.into_response(),

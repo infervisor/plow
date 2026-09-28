@@ -172,7 +172,9 @@ impl SharedAsr {
         cancelled(cancel)?;
         let overlay = self.encode_rows(features).await?;
         cancelled(cancel)?;
-        self.decode(mux, ids, audio_positions, overlay, language, cancel, opts, answer, arrived).await
+        let (result, _) =
+            self.decode(mux, ids, audio_positions, overlay, Vec::new(), language, cancel, opts, answer, arrived).await?;
+        Ok(result)
     }
 
     /// A revisable partial transcript of a growing recording: the encoder rows of its completed
@@ -232,7 +234,18 @@ impl SharedAsr {
         let rows = overlay.len() / hidden;
         let (ids, audio_positions) = self.prompt.prompt(rows, language.as_deref(), &context, self.max_context)?;
         tracing::debug!(frames = features.frames, windows_cached = cached.len(), windows_encoded = fresh, open_frames = features.frames - stable * wf, "asr: partial encode");
-        self.decode(mux, ids, audio_positions, overlay, language, cancel, opts, answer, arrived).await
+        // Local agreement: the previous partial's transcript, less its last DRAFT_TAIL tokens, is
+        // forced as prompt rows (one prefill, and resumed from the session's retained rows)
+        // instead of decoded token by token again. Partials are revisable; the final decodes the
+        // whole recording from scratch.
+        let forced = {
+            let w = windows.lock();
+            w.draft[..w.draft.len().saturating_sub(DRAFT_TAIL)].to_vec()
+        };
+        let (result, output) =
+            self.decode(mux, ids, audio_positions, overlay, forced, language, cancel, opts, answer, arrived).await?;
+        windows.lock().draft = output;
+        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -242,12 +255,15 @@ impl SharedAsr {
         ids: Vec<u32>,
         audio_positions: Vec<usize>,
         overlay: Vec<f32>,
+        forced: Vec<u32>,
         language: Option<String>,
         cancel: &AtomicBool,
         mut opts: AsrOpts,
         answer: &mut oneshot::Sender<Result<Transcript>>,
         arrived: Instant,
-    ) -> Result<Transcript> {
+    ) -> Result<(Transcript, Vec<u32>)> {
+        let mut ids = ids;
+        ids.extend_from_slice(&forced);
         if overlay.len() != audio_positions.len() * self.prompt.hidden() {
             return Err(RuntimeError::Rejected(format!(
                 "{} audio rows for {} placeholders",
@@ -258,7 +274,7 @@ impl SharedAsr {
         let encoded = arrived.elapsed();
 
         let mut gen = crate::serve::GenParams::default();
-        gen.max_tokens = self.prompt.max_tokens();
+        gen.max_tokens = self.prompt.max_tokens().saturating_sub(forced.len()).max(1);
         gen.params.temperature = 0.0;
         gen.stop_token_ids = self.prompt.stop().to_vec();
         let prompt_tokens = ids.len();
@@ -284,7 +300,7 @@ impl SharedAsr {
             crate::serve::mux::SubmitError::Full(_) => RuntimeError::Rejected("ASR queue full".into()),
             crate::serve::mux::SubmitError::Closed(_) => RuntimeError::Msg("model dispatcher unavailable".into()),
         })?;
-        let mut output = Vec::new();
+        let mut output = forced;
         let mut shown = 0usize;
         let cached_tokens = loop {
             let chunk = tokio::select! {
@@ -313,7 +329,7 @@ impl SharedAsr {
                 None => return Err(RuntimeError::Msg("ASR stream ended without a result".into())),
             }
         };
-        let result = self.prompt.transcript(&output, language.as_deref());
+        let result = self.prompt.transcript(&output, language.as_deref()).map(|t| (t, output.clone()));
         tracing::debug!(
             prompt_tokens,
             cached_tokens,
@@ -326,6 +342,10 @@ impl SharedAsr {
         result
     }
 }
+
+/// Tokens at the end of a partial's transcript that the next partial decodes again: the words the
+/// open audio window may still revise.
+const DRAFT_TAIL: usize = 4;
 
 /// Frames the log-mel STFT window reaches past a frame (centered, ±`fft/2` samples), with slack.
 const STABLE_MARGIN_FRAMES: usize = 4;

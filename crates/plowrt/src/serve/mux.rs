@@ -240,6 +240,24 @@ impl JobClass {
     }
 }
 
+/// Ends a running multistep quantum early (`GpuEngine::multi_step_sampled_at_most`'s `cut`) when
+/// a co-tenant with more urgent work starts waiting for the device (`--co-sched deadline`): an
+/// 8-step LLM quantum is 50-100 ms of an ASR final's budget. (Cutting on a new arrival as well
+/// measured nothing at c1-c32: adaptive multistep already runs single steps while one is likely.)
+#[cfg(feature = "cuda")]
+struct QuantumCut {
+    turn: Option<(Arc<crate::serve::cosched::DeviceTurn>, crate::serve::cosched::Urgency)>,
+}
+#[cfg(not(feature = "cuda"))]
+struct QuantumCut;
+
+#[cfg(feature = "cuda")]
+impl QuantumCut {
+    fn fire(&self) -> bool {
+        self.turn.as_ref().is_some_and(|(dt, mine)| dt.outranked(*mine))
+    }
+}
+
 /// How long a critical job keeps deadline urgency. An ASR final is done well inside it; a speech
 /// stream past it is sustained by throughput, not by jumping co-tenants for every token.
 const CRITICAL_SPAN: std::time::Duration = std::time::Duration::from_millis(1000);
@@ -1269,6 +1287,15 @@ pub fn spawn(
             } else {
                 1
             };
+            #[cfg(feature = "cuda")]
+            let quantum_cut = QuantumCut {
+                turn: device_turn
+                    .clone()
+                    .filter(|dt| dt.mode() == crate::serve::cosched::CoSched::Deadline)
+                    .map(|dt| (dt, urgency)),
+            };
+            #[cfg(not(feature = "cuda"))]
+            let quantum_cut = QuantumCut;
             let bundle_ref = Arc::clone(&bundle);
             let state_ref = Arc::clone(&state);
             let slug_for_tick = slug.clone();
@@ -1333,6 +1360,7 @@ pub fn spawn(
                     steps,
                     cfg.multi_step,
                     co_scheduled,
+                    quantum_cut,
                 );
                 (out, t_body.map_or(0, |t| t.elapsed().as_nanos() as u64))
             };
@@ -2185,6 +2213,7 @@ fn run_one_tick(
         allow(unused_variables)
     )]
     co_scheduled: bool,
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] quantum_cut: QuantumCut,
 ) -> (
     Vec<Option<Slot>>,
     Option<BucketBufs>,
@@ -2918,7 +2947,9 @@ fn run_one_tick(
                     let staged = gpu_stage_cfg(&mut *e, &feeds, &mut slots, requested);
                     let t_call = crate::obs::host::on().then(Instant::now);
                     let t_step = Instant::now();
-                    let res = staged.and_then(|_| e.multi_step_sampled_at_most(&feeds, requested, sample, &mut toks));
+                    let cut = || quantum_cut.fire();
+                    let cut = quantum_cut.turn.is_some().then_some(&cut as &dyn Fn() -> bool);
+                    let res = staged.and_then(|_| e.multi_step_sampled_at_most(&feeds, requested, sample, cut, &mut toks));
                     match res {
                         Ok(k) => {
                             obs.host.ride.observe_step(feeds.len(), t_step.elapsed().as_secs_f64() * 1e3 / k.max(1) as f64);

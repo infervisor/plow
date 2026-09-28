@@ -99,7 +99,16 @@ A partial does O(new audio) work: the Qwen3-ASR encoder is chunk-local (conv) an
 (attention, 8 s windows), so each window is encoded once, when the audio has passed its end, and
 cached with the recording; a partial encodes only the open window and resumes the decoder rows
 through the completed windows from the previous partial. The prompt suffix after the audio rows
-(`<|audio_end|><|im_end|>\n<|im_start|>assistant\n`) and the transcript are recomputed per partial.
+(`<|audio_end|><|im_end|>\n<|im_start|>assistant\n`) is recomputed per partial.
+
+The previous partial's transcript, less its last 4 tokens, is forced as prompt rows (local
+agreement), so a partial prefills those rows once (resumed from the session's retained rows) and
+decodes only the tail. Tokens are not decoded one at a time from the start again.
+
+Under load the model stops re-transcribing every append: after a partial that took `t`, the
+session's appends answer the last partial's text until `t × (1/duty − 1)` has passed
+(`--asr-partial-duty`, default 0.5). Idle partials take 30-50 ms against a 1 s append cadence, so
+they all run.
 
 The final is exact: it runs the full frontend and encoder over the whole recording, like a
 one-shot request, and resumes only rows whose content matches. Cached window rows are not
@@ -138,10 +147,19 @@ One client unless noted; Qwen3-ASR `asr-goal/v5` assets, Veena staged, Chatterbo
 | Chatterbox stream c1 TTFA, CER | 219.0 ms, 0.000 | 219.1 ms, 0.000 (35 rows resumed) |
 | Veena stream c1 TTFA, CER | 101.9 ms, 0.011 | 101.6 ms, 0.011 (2 rows resumed) |
 
-A partial's cost is dominated by decoding its transcript (~2.2 ms/token, every partial from the
-start: the partial's text rows are discarded), so the O(new audio) encoder and prefill take 8%
-off the last partial's latency and 3% off the stream's total. Verifying the previous partial's
-transcript as a draft (one prefill instead of token-by-token decode) is the remaining lever. Speech TTFA is set by the codec's first chunk; the conditioning prefix a
+A partial's cost used to be dominated by decoding its transcript (~2.2 ms/token, every partial
+from the start), so the O(new audio) encoder and prefill took only 8% off the last partial's
+latency. Forcing the previous partial's stable prefix removes that decode
+(`session_stream_bench.py`, `PLOW_ASR_PARTIAL_DUTY=1`, H100, 2026-09-28):
+
+| | decode every partial from the start | forced prefix |
+|---|---|---|
+| 73 clips, 1 s appends: partial p50 / p90 / max | 46.2 / 90.1 / 208 ms | 27.5 / 32.8 / 38.7 ms |
+| same: engine time, final WER | 24.0 s, 0.03913 | 12.8 s, 0.03913 (73/73 finals identical) |
+| 28.8 s clip: partial p50 / p90, engine time per stream | 126 / 202 ms, 3.37 s | 31 / 36 ms, 0.78 s |
+
+Partials stay revisable. 373 of 443 are identical to the from-scratch partials (2.7% of words
+differ), and 357 of 443 agree with the final up to their last two words (388 from scratch). Speech TTFA is set by the codec's first chunk; the conditioning prefix a
 session saves is under a millisecond of prefill. A resumed prefill is not bit-identical to a
 one-launch prefill (it is a chunked prefill split at the resume row): greedy Veena turn-2 text
 matched the plain run 3/8 times, diverging within 0-3 audio tokens in 3 trials.

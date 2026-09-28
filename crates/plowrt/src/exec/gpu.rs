@@ -3271,6 +3271,8 @@ struct MultiStep {
     /// `[batch]` i32 active-row flags (device) + pinned staging.
     d_fed: DeviceMem,
     fed_host: PinnedHost,
+    /// Per-step completion events (alternating) for a quantum that may be cut short.
+    step_done: [CudaEvent; 2],
 }
 
 /// Lookahead-1 decode pipeline (`PLOW_DECODE_PIPELINE`). A queued step is [counter reset ->
@@ -6474,6 +6476,7 @@ impl GpuEngine {
             ring_host,
             d_fed,
             fed_host,
+            step_done: [be.event_create(false)?, be.event_create(false)?],
         }))
     }
 
@@ -7380,7 +7383,7 @@ impl GpuEngine {
         requested: usize,
         out: &mut Vec<u32>,
     ) -> Result<usize> {
-        self.multi_step_sampled_at_most(feeds, requested, None, out)
+        self.multi_step_sampled_at_most(feeds, requested, None, None, out)
     }
 
     /// Whether a quantum can sample on the device (sampler loaded).
@@ -7392,11 +7395,15 @@ impl GpuEngine {
     /// is batch-wide ([`Self::step_slots_sampled`]'s contract; `rng01` ignored) and `rng(slot,
     /// k)` is the uniform for the row's k-th token of this quantum. `plow_sample` runs between
     /// each decode and `plow_advance`, so the sampled token is what advance appends and feeds.
+    ///
+    /// `cut`: polled after each step retires (the next one already queued, so the device never
+    /// waits on it); `true` ends the quantum there. A CFG quantum is not cut.
     pub fn multi_step_sampled_at_most(
         &mut self,
         feeds: &[(usize, u32)],
         requested: usize,
         sample: Option<(&[DevSample], &dyn Fn(usize, usize) -> f32)>,
+        cut: Option<&dyn Fn() -> bool>,
         out: &mut Vec<u32>,
     ) -> Result<usize> {
         out.clear();
@@ -7527,6 +7534,8 @@ impl GpuEngine {
 
         // Enqueue [memset → decode → (sample) → advance] × K on the stream — no sync.
         let advance_grid = (bsz as u32).div_ceil(256);
+        let cut = cut.filter(|_| cfg_steps == 0 && k > 1);
+        let mut done = k;
         for step in 0..k {
             self.reset_selected_decode_counters(rung)?;
             self.launch_selected_decode(rung)?;
@@ -7573,7 +7582,20 @@ impl GpuEngine {
             ];
             self.be
                 .launch_kernel(f_adv, advance_grid, 256, 0, &mut a, Some(&self.stream))?;
+            if let Some(cut) = cut {
+                let ms = self.multistep.as_ref().expect("checked");
+                self.be.event_record(&ms.step_done[step % 2], &self.stream)?;
+                if step >= 1 && step + 1 < k {
+                    self.be.event_synchronize(&ms.step_done[(step - 1) % 2])?;
+                    if cut() {
+                        done = step + 1;
+                        break;
+                    }
+                }
+            }
         }
+        let k_ring = k;
+        let k = done;
 
         // One D2H of the whole ring, then the single sync.
         // SAFETY: ring_host lives on self past the synchronize.
@@ -7605,7 +7627,7 @@ impl GpuEngine {
             out.reserve(feeds.len() * k);
             for &(b, _) in feeds {
                 for step in 0..k {
-                    out.push(ring[b * k + step] as u32);
+                    out.push(ring[b * k_ring + step] as u32);
                 }
             }
         }

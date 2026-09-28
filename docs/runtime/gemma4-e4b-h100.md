@@ -174,6 +174,18 @@ config (T=1, top_k=64, top_p=0.95). "greedy" pins `temperature: 0` (`BENCH_ARGS`
 Measured on the packet before the E-series decode kernels in the table further down (`gemv_k8`
 gate, row-group flash decode: greedy c1 141 -> 158, c32 2150 -> 2321, c128 3178 -> 3322).
 
+The same grid on the current packet (100166a6: E-series decode kernels, FA3 prefill, `gemv_k8`
+tuning):
+
+| conc | plow sampled | plow greedy |
+|---|---|---|
+| 1 | **23.8** / 6.03 / 159 | **23.4** / 5.86 / 165 |
+| 8 | 78.3 / 7.21 / 1025 | 76.7 / 6.95 / 1060 |
+| 32 | **162** / 11.6 / 2377 | **152** / 11.2 / 2454 |
+| 64 | 301 / 17.6 / 3041 | 298 / 16.9 / 3117 |
+| 128 | 890 / 24.2 / 3570 | 399 / 25.6 / 3838 |
+| 200 | 4013 / 26.9 / 3493 | 2555 / 25.4 / 4010 |
+
 * **What was wrong before.** Each sampled row that rode a prefill launch downloaded its 512 KB
   logits row and ran the host sampler (a full sort of 262144 entries, ~4 ms per row). At c64 that
   put 264 ms into every mixed tick. Every sampled row now draws on the device (`plow_sample`,
@@ -184,9 +196,31 @@ gate, row-group flash decode: greedy c1 141 -> 158, c32 2150 -> 2321, c128 3178 
   TV distance device vs host on real prefill logits: 0.0024 (T=1, k=64, p=0.95), 0.0000
   (T=0.7, p=0.9), 0.0005 (T=1.3, k=40), 0.0276 (p=0.99, 390 tokens kept; bound 0.105)
   (`tests/gpu_sample_serve.rs`, `tests/gpu_sample.rs`).
-* **Where plow stands.** TTFT is ahead at c1 and c32 (c128 within noise of vLLM sampled). From
-  c8 up vLLM wins throughput: 1.3x at c8, 1.5x at c32, 1.9-2.3x at c64-c200. c8 TTFT (90 vs
-  63 ms) is lost to the decode step: a new prompt waits for the running 8-step quantum.
+* **Where plow stands.** TTFT is ahead at c1 and c32. From c8 up vLLM wins throughput: 1.2x
+  at c8, 1.3x at c32, 1.7x at c64-c128 (greedy).
+* **c8 TTFT (77 vs 63 ms) is the prefill rate, not the quantum.**
+  * Cutting a running multistep quantum on arrival measured nothing: c8 TTFT 76.0 vs 77.0 ms,
+    c1 TPOT unchanged. Adaptive multistep already runs single steps while an arrival is likely.
+  * Per request, the closed-loop client keeps prompts arriving in groups of 2-8. vLLM prefills a
+    group of 8 x 1000 rows in one ~60 ms step (every request at 62-64 ms).
+  * Plow runs 2048-row launches (~36 ms each), so a group finishes pair by pair: 31, 62, 77 ms.
+  * Only a faster prefill closes it: 17.4 µs/row in-kernel against the ~8 µs/row vLLM's
+    one-step group implies.
+* **Prefill-only launches carry no scheduler overhead.**
+  * Served OSL=1 at c64 runs 58 req/s = 17.2 µs/row. Launches are packed full, and partial
+    chunks fill the tail (`chunks=[72,1000,976]` in 2048 rows).
+  * A tick is 35.5-36.6 ms per 2048 rows against the 34.8 ms kernel launch. The host gap is 0.8%.
+  * The older 21.3 µs/row served figure predates the FA3 prefill.
+* **TPOT at c64-c128 is throughput, not tick policy.**
+  * In a closed loop at fixed concurrency, E2E = c x 128 / throughput. At c64 that is 2.69 s,
+    and TTFT + 127 x TPOT must fit in it.
+  * vLLM's 9.1 ms TPOT comes with 5302 tok/s. A tick policy can only move time between TTFT
+    and TPOT.
+  * At c64 the device is busy 99.7% of wall: 48% mixed ticks (1922 prefill rows + 51 riders,
+    42.5 ms), 47% decode, 0.3% host.
+  * Riding costs 0.13 ms/row against a 0.2 ms/row step at B=51, so the ride model picks right.
+  * Per request, 1000 prefill rows are 17.4 ms of device and 128 decode tokens at B~50 are
+    ~28 ms. That bounds c64 near 2900-3100 tok/s, and plow measures 3041-3117.
 
 ### Where the tick time goes (`PLOW_PACKLOG`, c64 sampled)
 
@@ -307,6 +341,24 @@ playback underrun:
 
 Deadline turns cut the p50s 2-4x at 10-20 calls and meet the TTFT and TTFA SLOs at 10 calls.
 The ASR final p95 and underrun SLOs fail from 10 calls, and everything fails from 20.
+
+With cheap ASR partials (forced prefix, duty cycle; [sessions.md](sessions.md)) and a deadline
+co-tenant cutting a running LLM multistep quantum, measured on the current E4B packet and the
+windowed-render MTL assets. Each cell is p50/p95 ms for ASR final, ASR partial, LLM TTFT and TTS
+TTFA, then underrun turns and the run's wall time:
+
+| calls | HEAD 100166a6 | + sched_6 |
+|---|---|---|
+| 10 | 114/621, 228/1005, 17/196, 187/504, 2/30, 82 s | 108/583, 34/751, 14/413, 192/409, 0/30, 83 s |
+| 20 | 181/809, 573/1907, 39/746, 254/1135, 13/60, 106 s | 405/1066, 29/1587, 65/666, 345/1309, 24/60, 90 s |
+| 30 | 316/1574, 538/1726, 100/775, 428/1674, 45/90 (5 errors), 120 s | 319/1783, 116/602, 202/1154, 495/1846, 72/90, 93 s |
+
+* With HEAD, slow partials held each call's append loop back, and 20-30 calls ran 16-29% longer
+  (wall).
+* With partials back at the 1 s audio cadence, the same calls offer the load a real user would.
+  The TTS-bound SLOs then look worse per turn at 20-30 calls, while ASR device time per turn
+  falls 27-30%.
+* The binding limit is still the TTS render.
 
 **Capacity, not order, is the limit.**
 
