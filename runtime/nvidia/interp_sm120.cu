@@ -893,11 +893,23 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #else
 #define PLOW_NV_PRE_A256 FA_PRE_SMEM_FLOATS(256, 64, PLOW_NV_FA256_BKV)
 #endif
+/* v3 falls back to the shipped body (no TMA map / nsplit > 1), so its claim is a max. */
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_FA_V3
+#define PLOW_NV_FA3_A256 FA3_SMEM_FLOATS(256)
+#define PLOW_NV_FA3_A512 FA3_SMEM_FLOATS(512)
+#else
+#define PLOW_NV_FA3_A256 0
+#define PLOW_NV_FA3_A512 0
+#endif
+#define PLOW_NV_PRE_A256X                                                                      \
+    (PLOW_NV_PRE_A256 > PLOW_NV_FA3_A256 ? PLOW_NV_PRE_A256 : PLOW_NV_FA3_A256)
+#define PLOW_NV_PRE_A512X                                                                      \
+    (PLOW_NV_PRE_A512 > PLOW_NV_FA3_A512 ? PLOW_NV_PRE_A512 : PLOW_NV_FA3_A512)
 #if PLOW_NV_FA_ONLY_HD256_ONLY
-#define PLOW_NV_PRE_A0 PLOW_NV_PRE_A256
+#define PLOW_NV_PRE_A0 PLOW_NV_PRE_A256X
 #else
 #define PLOW_NV_PRE_A0                                                                         \
-    (PLOW_NV_PRE_A256 > PLOW_NV_PRE_A512 ? PLOW_NV_PRE_A256 : PLOW_NV_PRE_A512)
+    (PLOW_NV_PRE_A256X > PLOW_NV_PRE_A512X ? PLOW_NV_PRE_A256X : PLOW_NV_PRE_A512X)
 #endif
 #define PLOW_NV_PRE_A128 FA_PRE_SMEM_FLOATS(128, 64, PLOW_NV_FA128_BKV)
 #define PLOW_NV_PRE_A                                                                          \

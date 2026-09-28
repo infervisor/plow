@@ -2015,6 +2015,7 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
  * fp8-KV arm, and every sm_120a build — is untouched and byte-identical. */
 #if defined(PLOW_NV_HOPPER)
 #include "op_attention_sm90.cuh"
+#include "op_attention_sm90_v3.cuh"
 /* Single-stage BF16 WGMMA never dispatches the legacy layout. */
 #define FA_PRE_SMEM_FLOATS(HD, BQ, BKV)                                                             \
     (FA_SM90_WG_ELIGIBLE(HD, BQ, BKV) && PLOW_NV_FA_PIPE                                            \
@@ -3935,6 +3936,24 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
     /* sm_90a FORK first: when the wgmma arm claims the shape (always for <256,64,32>; for
      * <512,64,16> under PLOW_NV_FA512_WG) it beats the px4 mma.sync arm below. */
     if constexpr (FA_SM90_WG_ELIGIBLE(HD, BQ, BKV)) {
+#if PLOW_NV_FA_V3
+        /* v3 needs the TMA K/V maps and the fused (nsplit 1) epilogue; anything else keeps
+         * the shipped body. */
+        if constexpr (HD == 256 || HD == 512) {
+            if (nsplit == 1 && O && mapkv) {
+                d_flash_prefill_sm90_v3<HD>(Q, O, seq_q, seq_kv, n_head, n_kv_head, q_pos0, window,
+                                            kv_stride, kv_mask, scale, slice, nblk, lds, req,
+                                            mapkv);
+                return;
+            }
+#if PLOW_NV_FA_V3 >= 2
+            /* v3-only object: the shipped bodies are not compiled in. */
+            __trap();
+            return;
+#endif
+        }
+        if constexpr (!(PLOW_NV_FA_V3 >= 2 && (HD == 256 || HD == 512)))
+#endif
         d_flash_prefill_sm90<HD, BQ, BKV>(Opart, mlpart, Q, K, V, O, seq_q, seq_kv, n_head,
                                           n_kv_head, q_pos0, window, nsplit, kv_stride, kv_mask,
                                           scale, slice, nblk, lds, req, mapkv);
@@ -4412,7 +4431,12 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
             }
             d_flash_prefill<HD, BQ, BKV>(Opart, mlpart, Q + qoff, K + kvoff, V + kvoff,
                                          O ? O + qoff : O, sq, skv, n_head, n_kv_head, qp0, window,
-                                         ns, kv_stride, kv_mask, scale, slice, nblk, lds);
+                                         ns, kv_stride, kv_mask, scale, slice, nblk, lds
+#if PLOW_NV_FA_V3
+                                         /* the single-request map covers the whole cache */
+                                         , nullptr, req ? nullptr : mapkv
+#endif
+            );
         }
     }
 }

@@ -155,12 +155,62 @@ static __device__ void d_glu_strided(__nv_bfloat16* __restrict__ out, const __nv
                                      unsigned col0, unsigned stride, unsigned act, unsigned slice,
                                      unsigned nblk) {
     const unsigned n = rows * width;
+    if (((width | stride | col0) & 7u) == 0) {
+        /* 8 elements per thread-step, 16-byte accesses, two steps in flight: the scalar loop
+         * below was one dependent 2-byte load pair per step (latency-bound, ~20 us per op at
+         * 2k rows). Same per-element math. */
+        const unsigned n8 = n >> 3, w8 = width >> 3, step = nblk * PLOW_NV_THREADS;
+        auto one = [&](const bf16v8& g, const bf16v8& u) {
+            bf16v8 o;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float x = __bfloat162float(g.x[j]);
+                const float a = __bfloat162float(
+                    __float2bfloat16((act == PLOW_ACT_SILU_) ? act_silu(x) : act_gelu_tanh(x)));
+                o.x[j] = __float2bfloat16(a * __bfloat162float(u.x[j]));
+            }
+            return o;
+        };
+        unsigned v = slice * PLOW_NV_THREADS + threadIdx.x;
+        for (; v + step < n8; v += 2 * step) {
+            const unsigned v1 = v + step;
+            const unsigned r0 = v / w8, r1 = v1 / w8;
+            const bf16v8 g0 = ld_glob8(gate + (size_t)v * 8), g1 = ld_glob8(gate + (size_t)v1 * 8);
+            const bf16v8 u0 = ld_glob8(up + (size_t)r0 * stride + col0 + (v - r0 * w8) * 8);
+            const bf16v8 u1 = ld_glob8(up + (size_t)r1 * stride + col0 + (v1 - r1 * w8) * 8);
+            st_glob8(out + (size_t)v * 8, one(g0, u0));
+            st_glob8(out + (size_t)v1 * 8, one(g1, u1));
+        }
+        if (v < n8) {
+            const unsigned r = v / w8;
+            st_glob8(out + (size_t)v * 8,
+                     one(ld_glob8(gate + (size_t)v * 8),
+                         ld_glob8(up + (size_t)r * stride + col0 + (v - r * w8) * 8)));
+        }
+        return;
+    }
     for (unsigned i = slice * PLOW_NV_THREADS + threadIdx.x; i < n; i += nblk * PLOW_NV_THREADS) {
         const unsigned r = i / width, p = i - r * width;
         const float g = __bfloat162float(gate[i]);
         const float a = __bfloat162float(__float2bfloat16((act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g)));
         out[i] = __float2bfloat16(a * __bfloat162float(up[(size_t)r * stride + col0 + p]));
     }
+}
+
+/* Prefill GeGLU: the hardware tanh (one MUFU.TANH, rel err ~2^-11) instead of tanhf's ~20
+ * instruction sequence; the result is rounded to bf16 (2^-9) before use. Decode keeps tanhf. */
+#ifndef PLOW_NV_PF_FAST_TANH
+#define PLOW_NV_PF_FAST_TANH 1
+#endif
+__device__ __forceinline__ float act_gelu_tanh_pf(float x) {
+#if PLOW_NV_PREFILL && PLOW_NV_PF_FAST_TANH
+    float t;
+    const float c = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+    asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(c));
+    return 0.5f * x * (1.0f + t);
+#else
+    return act_gelu_tanh(x);
+#endif
 }
 
 static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ gate,
@@ -178,7 +228,7 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
 #pragma unroll
         for (int j = 0; j < 8; j++) {
             const float g = __bfloat162float(vg.x[j]);
-            float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+            float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh_pf(g);
 #if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
             if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
 #endif

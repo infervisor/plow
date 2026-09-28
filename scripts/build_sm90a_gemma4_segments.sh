@@ -114,6 +114,7 @@ for gemma_packed in 0 1; do
         -DPLOW_NV_FA_ONLY_HD256_ONLY="${PLOW_BUILD_FA_HD256_ONLY:-0}"
         -DPLOW_NV_FA512_WG=1 -DPLOW_NV_FA512_BKV=32
         -DPLOW_NV_PACKED_FA_WGMMA=1 -DPLOW_NV_PACKED_FA_TMA=1
+        -DPLOW_NV_FA_V3="${PLOW_BUILD_FA_V3:-0}"
       )
     fi
     "${gemma_nvcc[@]}" \

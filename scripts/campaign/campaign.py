@@ -516,6 +516,9 @@ def cmd_build(a: argparse.Namespace) -> None:
         # CLI overrides win over the recipe's role env too, so an A/B can switch a role off.
         if run(nix([*base_args, "--out", str(assets)]), env_with(env_with(common, roles.get("env", {})), overrides), log):
             die("role emit failed; see build.log")
+        # The role emit rebuilds its own cmake cubins (e.g. *_pfpackedseg); the recipe's object wins.
+        for f in objects.get("role_files", []) if objects else []:
+            (assets / f).write_bytes((obj_dir / f).read_bytes())
     else:
         assets = out / "assets"
         print("== emit", file=sys.stderr)

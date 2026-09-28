@@ -49,12 +49,18 @@ PLOW_EMIT_PREFILL_CUBLASLT = "1"
 # Every flash segment isolated: hd256 sliding + hd512 full attention run in interp_sm90a_pffa
 # (prefill 2000 rows 70 -> 48 ms). Needs the pffa/pfpackedfa role objects below.
 PLOW_SEG_FA512 = "all"
+# TMA K/V maps feed the v3 flash body; class slicing gives the occ-2 light (FATLITE) and GEMM
+# objects 2*n_cu slices.
+PLOW_TMA_GEMM = "1"
+PLOW_SEG_CLASS_SLICE = "1"
 
 # base emit -> segment objects (PLOW_NVCC / NVCC_PREPEND_FLAGS pick the toolkit) -> role emit.
-# Only the flash objects are taken; the script's pfseg/pfgemm set faults on this packet.
+# Only the flash objects (v3 body) and the FATLITE light object are taken.
 [objects]
 script = "scripts/build_sm90a_gemma4_segments.sh"
-role_files = ["interp_sm90a_pffa.cubin", "interp_sm90a_pfpackedfa.cubin"]
+role_files = ["interp_sm90a_pffa.cubin", "interp_sm90a_pfpackedfa.cubin", "interp_sm90a_pfpackedseg.cubin"]
+[objects.env]
+PLOW_BUILD_FA_V3 = "2"
 
 [emit_roles.env]
 
