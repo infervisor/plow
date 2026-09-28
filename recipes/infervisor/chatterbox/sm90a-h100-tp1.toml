@@ -77,3 +77,16 @@ kind = "speech"
 client = "scripts/tts/tts_bench.py"
 arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice default", "--conc 1 --n 16 --prompt-set chatterbox --voice default --tag full_c1", "--conc 8 --stream --n 32 --prompt-set chatterbox --voice default", "--conc 8 --n 32 --prompt-set chatterbox --voice default --tag full_c8"]
 reference = "scripts/tts/chatterbox_ref.py"
+
+# `campaign.py gate <recipe> --assets <dir> --out <dir>`. PYREF: Whisper CER (median 0.000, n=32);
+# CBX_PY: chatterbox-tts for the S3Gen reference (mel rel-L2 ~1e-6). packet_run: cargo build
+# --release -p plowrt --features cuda --example packet_run.
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice default", "--conc 8 --stream --wav --n 16 --prompt-set chatterbox --voice default"]
+cer_median_max = 0.05
+[gates.s3gen_rel_l2]
+python = "{env:CBX_PY}"
+rel_l2_max = 1e-3
+timeout_s = 1800

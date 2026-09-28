@@ -67,3 +67,11 @@ kind = "speech"
 client = "scripts/tts/tts_bench.py"
 arms = ["--conc 1 --stream --wav --n 16", "--conc 1 --n 16", "--conc 8 --stream --n 32", "--conc 32 --stream --n 64", "--conc 64 --stream --n 128"]
 reference = "scripts/tts/vllm_speech_probe.sh"
+
+# `campaign.py gate <recipe> --assets <dir> --out <dir>`: Whisper CER of served speech (python with
+# transformers + jiwer + librosa). Median CER 0.016 (n=80) at 820aa3ba.
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16", "--conc 32 --stream --wav --n 64"]
+cer_median_max = 0.05

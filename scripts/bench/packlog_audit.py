@@ -2,38 +2,44 @@
 """packlog_audit.py server.log [segment...]: tick accounting from PLOW_PF_PACKLOG=1 lines.
 Per segment (split at >1 s idle): tokens, device time by tick kind (mixed / prefill-only / decode),
 host gap and idle, launch padding, decode steps and rows per step, riders priced against the
-pure-launch baseline, and time-weighted slot occupancy. See docs/runtime/throughput-audit.md."""
+pure-launch baseline, and time-weighted slot occupancy. See docs/runtime/throughput-audit.md.
+Importable: segments(path) and account(segment) feed scripts/bench/waterfall.py."""
 import re, sys, collections
 tickre = re.compile(r"PACKLOG TICK t_ms=([\d.]+) prefill_ms=([\d.]+) decode_ms=([\d.]+) did_prefill=(\d) decode_rows=(\d+)(?: steps=(\d+) tokens=(\d+) live=(\d+) prefilling=(\d+))?")
 packre = re.compile(r"PACKLOG PACK reqs=(\d+) rows=(\d+) decode_feeds=(\d+) unified=(\w+)")
 rre = re.compile(r"PACKLOG R=(\d+) rows=(\d+) bucket=(\d+) chunks=\[([^\]]*)\]")
-segs = []; cur = None; prev = None; pend_pack = []; pend_r = []
-for line in open(sys.argv[1], errors="replace"):
-    m = packre.search(line)
-    if m: pend_pack.append((int(m[2]), int(m[3]), m[4] == "true")); continue
-    m = rre.search(line)
-    if m:
-        ch = [int(x) for x in m[4].split(",") if x]
-        pend_r.append(dict(n=int(m[1]), rows=int(m[2]), bucket=int(m[3]), riders=sum(1 for c in ch if c == 1), pf=sum(c for c in ch if c > 1)))
-        continue
-    m = tickre.search(line)
-    if not m: continue
-    t, pf, dc = float(m[1]), float(m[2]), float(m[3])
-    tk = dict(t=t, pf=pf, dc=dc, did=int(m[4]), rows=int(m[5]), steps=int(m[6]) if m[6] else None,
-              tokens=int(m[7]) if m[7] else None, live=int(m[8]) if m[8] else None,
-              prefilling=int(m[9]) if m[9] else None, packs=pend_pack, launches=pend_r)
-    pend_pack, pend_r = [], []
-    g = None if prev is None else t - prev - pf - dc
-    prev = t
-    if g is None or g > 1000:
-        cur = dict(ticks=[], gap=0.0, idle=0.0, t0=t - pf - dc); segs.append(cur)
-    elif g >= 5: cur["idle"] += g
-    else: cur["gap"] += max(g, 0)
-    cur["ticks"].append(tk); cur["t1"] = t
-want = [int(a) for a in sys.argv[2:]] or range(len(segs))
-for si in want:
-    s = segs[si]; T = s["ticks"]
-    if len(T) < 20: continue
+
+
+def segments(path):
+    segs = []; cur = None; prev = None; pend_pack = []; pend_r = []
+    for line in open(path, errors="replace"):
+        m = packre.search(line)
+        if m: pend_pack.append((int(m[2]), int(m[3]), m[4] == "true")); continue
+        m = rre.search(line)
+        if m:
+            ch = [int(x) for x in m[4].split(",") if x]
+            pend_r.append(dict(n=int(m[1]), rows=int(m[2]), bucket=int(m[3]), riders=sum(1 for c in ch if c == 1), pf=sum(c for c in ch if c > 1)))
+            continue
+        m = tickre.search(line)
+        if not m: continue
+        t, pf, dc = float(m[1]), float(m[2]), float(m[3])
+        tk = dict(t=t, pf=pf, dc=dc, did=int(m[4]), rows=int(m[5]), steps=int(m[6]) if m[6] else None,
+                  tokens=int(m[7]) if m[7] else None, live=int(m[8]) if m[8] else None,
+                  prefilling=int(m[9]) if m[9] else None, packs=pend_pack, launches=pend_r)
+        pend_pack, pend_r = [], []
+        g = None if prev is None else t - prev - pf - dc
+        prev = t
+        if g is None or g > 1000:
+            cur = dict(ticks=[], gap=0.0, idle=0.0, t0=t - pf - dc); segs.append(cur)
+        elif g >= 5: cur["idle"] += g
+        else: cur["gap"] += max(g, 0)
+        cur["ticks"].append(tk); cur["t1"] = t
+    return segs
+
+
+def account(s):
+    """One segment's accounting; times in ms."""
+    T = s["ticks"]
     wall = s["t1"] - s["t0"]
     # pure launch baseline per bucket (prefill launches with no riders)
     pure = collections.defaultdict(list)
@@ -43,7 +49,7 @@ for si in want:
     pmed = {b: sorted(v)[len(v)//2] for b, v in pure.items()}
     acc = collections.defaultdict(lambda: collections.Counter())
     pad_ms = 0.0; ride_extra = 0.0; riders_tot = 0; pf_rows = 0; launch_ms = 0.0
-    dec_hist = collections.Counter(); steps_tot = 0; dec_tok = 0; tokens = 0
+    dec_hist = collections.Counter(); tokens = 0
     occ = []
     for tk in T:
         L = tk["launches"]; ride = sum(l["riders"] for l in L)
@@ -66,7 +72,14 @@ for si in want:
                 dec_hist[(tk["rows"] // 8 * 8, tk["steps"])] += 1
         if tk["tokens"] is not None: tokens += tk["tokens"]
         if tk["live"] is not None: occ.append((tk["pf"] + tk["dc"], tk["live"], tk["prefilling"]))
-    print(f"== segment {si}: {len(T)} ticks, wall {wall/1e3:.3f} s, tokens {tokens} ({tokens/wall*1e3:.0f} tok/s)")
+    return dict(ticks=len(T), wall=wall, tokens=tokens, acc=acc, gap=s["gap"], idle=s["idle"],
+                pf_rows=pf_rows, launch_ms=launch_ms, pad_ms=pad_ms, pmed=pmed, riders=riders_tot,
+                ride_extra=ride_extra, occ=occ, dec_hist=dec_hist)
+
+
+def report(si, d):
+    wall, tokens, acc = d["wall"], d["tokens"], d["acc"]
+    print(f"== segment {si}: {d['ticks']} ticks, wall {wall/1e3:.3f} s, tokens {tokens} ({tokens/wall*1e3:.0f} tok/s)")
     for k in ("mixed", "prefill", "decode"):
         a = acc[k]
         if not a["n"]: continue
@@ -76,12 +89,20 @@ for si in want:
         if k != "decode":
             extra = f" pf_rows/t {a['pf_rows']/a['n']:.0f} riders/t {a['riders']/a['n']:.1f}"
         print(f"  {k:8s} n={a['n']:5d} {a['ms']/1e3:7.3f} s {100*a['ms']/wall:5.1f}% mean {a['ms']/a['n']:6.2f} ms{extra}")
-    print(f"  host gap {s['gap']/1e3:.3f} s ({100*s['gap']/wall:.1f}%)  idle {s['idle']/1e3:.3f} s ({100*s['idle']/wall:.1f}%)")
-    print(f"  prefill rows {pf_rows}; launches {launch_ms/1e3:.3f} s, padding (bucket-rows)/bucket {pad_ms/1e3:.3f} s ({100*pad_ms/wall:.1f}% of wall)")
-    print(f"  pure launch median ms by bucket {dict(sorted(pmed.items()))}")
-    if riders_tot: print(f"  riders {riders_tot}: launch time over pure {ride_extra/1e3:.3f} s = {ride_extra/riders_tot*1e3:.1f} us/rider")
+    print(f"  host gap {d['gap']/1e3:.3f} s ({100*d['gap']/wall:.1f}%)  idle {d['idle']/1e3:.3f} s ({100*d['idle']/wall:.1f}%)")
+    print(f"  prefill rows {d['pf_rows']}; launches {d['launch_ms']/1e3:.3f} s, padding (bucket-rows)/bucket {d['pad_ms']/1e3:.3f} s ({100*d['pad_ms']/wall:.1f}% of wall)")
+    print(f"  pure launch median ms by bucket {dict(sorted(d['pmed'].items()))}")
+    if d["riders"]: print(f"  riders {d['riders']}: launch time over pure {d['ride_extra']/1e3:.3f} s = {d['ride_extra']/d['riders']*1e3:.1f} us/rider")
+    occ = d["occ"]
     if occ:
         tw = sum(o[0] for o in occ) or 1
         print(f"  time-weighted live slots {sum(o[0]*o[1] for o in occ)/tw:.1f}, prefilling {sum(o[0]*o[2] for o in occ)/tw:.1f}")
-    if dec_hist:
-        print("  decode ticks (rows//8*8, steps): n", sorted(dec_hist.items()))
+    if d["dec_hist"]:
+        print("  decode ticks (rows//8*8, steps): n", sorted(d["dec_hist"].items()))
+
+
+if __name__ == "__main__":
+    segs = segments(sys.argv[1])
+    for si in [int(a) for a in sys.argv[2:]] or range(len(segs)):
+        if len(segs[si]["ticks"]) < 20: continue
+        report(si, account(segs[si]))

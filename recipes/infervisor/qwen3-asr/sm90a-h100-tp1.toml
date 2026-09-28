@@ -58,3 +58,12 @@ kind = "asr"
 client = "crates/plowrt/examples/asr/packet_dataset.rs"
 manifest = "scripts/asr/nvidia/get_audio.py"
 reference = "scripts/asr/nvidia/ref_bench.py"
+
+# `campaign.py gate <recipe> --assets <dir> --out <dir>`. ASR_MANIFEST: the 73-clip set
+# (scripts/asr/nvidia/get_audio.py). WER 3.913% (= the vLLM reference) at conc 1 and 16.
+[gates]
+python = "{env:PYREF}"
+[gates.asr_wer]
+manifest = "{env:ASR_MANIFEST}"
+conc = "1,16"
+wer_max = 0.045

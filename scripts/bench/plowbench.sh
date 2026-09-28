@@ -143,6 +143,11 @@ pb_is_amd() {
 }
 
 pb_require_nix() {
+    # A box without nix (PLOW_CAMPAIGN_NO_NIX=1, as campaign.py) runs in a hand-built shell instead.
+    if [ "${PLOW_CAMPAIGN_NO_NIX:-0}" = 1 ]; then
+        pb_ok "PLOW_CAMPAIGN_NO_NIX=1: hand-built shell (CUDA_PATH=${CUDA_PATH:-unset})"
+        return 0
+    fi
     if [ -z "${ROCM_PATH:-}" ]; then
         pb_bad "not inside 'nix develop' (ROCM_PATH unset) — build and serve tasks need it"
         return 1
@@ -430,6 +435,30 @@ pb_bench() {
     local rc=$?
     [ $rc -eq 0 ] || echo "   arm $tag: bench exited $rc (see $res/$tag.bench.log)"
     return $rc
+}
+
+# pb_cell <resdir> <tag> <model> <conc> <nprompts> <isl> <osl> [extra...] — pb_bench bracketed by
+# CELL_BEGIN/CELL_END wall-clock markers in <resdir>/cells.log, which vllm_metrics.py (reference
+# engine steps, prefix-cache hits) and waterfall.py (plow PACKLOG segments) split the run by.
+pb_cell() {
+    local res="$1" tag="$2" rc
+    mkdir -p "$res"
+    echo "CELL_BEGIN $tag $(date +%s.%N)" >> "$res/cells.log"
+    pb_bench "$@"; rc=$?
+    echo "CELL_END $tag $(date +%s.%N)" >> "$res/cells.log"
+    return $rc
+}
+
+# pb_metrics_start <resdir> / pb_metrics_stop — poll a vLLM/SGLang-style /metrics every 50 ms into
+# <resdir>/metrics.tsv for the whole session (scripts/bench/vllm_metrics.py).
+pb_metrics_start() {
+    python3 "$(dirname "${BASH_SOURCE[0]}")/vllm_metrics.py" poll "$PB_SERVER_PORT" "$1/metrics.tsv" &
+    PB_METRICS_PID=$!
+}
+pb_metrics_stop() {
+    [ -n "${PB_METRICS_PID:-}" ] || return 0
+    kill "$PB_METRICS_PID" 2>/dev/null; wait "$PB_METRICS_PID" 2>/dev/null
+    PB_METRICS_PID=
 }
 
 # pb_result <resdir> <tag> — print the result JSON path, wherever the client decided to put it.

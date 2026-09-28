@@ -74,3 +74,17 @@ kind = "speech"
 client = "scripts/tts/tts_bench.py"
 arms = ["--conc 1 --stream --wav --n 24 --prompt-set chatterbox-mtl --voice default", "--conc 1 --n 24 --prompt-set chatterbox-mtl --voice default --tag full_c1", "--conc 16 --stream --n 48 --prompt-set chatterbox-mtl --voice default", "--conc 16 --n 48 --prompt-set chatterbox-mtl --voice default --tag full_c16"]
 reference = "scripts/tts/chatterbox_mtl_ref.py"
+
+# `campaign.py gate <recipe> --assets <dir> --out <dir>`. Whisper CER per language: median 0.000
+# (n=32), worst language fr 0.148 at 820aa3ba. CBX_PY: upstream chatterbox (mtl_tts v3).
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox-mtl --voice default", "--conc 8 --stream --wav --n 16 --prompt-set chatterbox-mtl --voice default"]
+cer_median_max = 0.05
+cer_lang_max = 0.2
+[gates.s3gen_rel_l2]
+python = "{env:CBX_PY}"
+args = ["--s3gen-weights", "s3gen_v3.safetensors"]
+rel_l2_max = 1e-3
+timeout_s = 1800

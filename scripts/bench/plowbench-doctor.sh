@@ -102,6 +102,35 @@ for d in /workspace /; do
 done
 
 echo
+echo "[7] worktree vs HEAD (harness files, recipe)"
+# A shared worktree whose HEAD moved (commits written from another index) keeps stale copies of the
+# scripts and recipes; a run from it measures something other than HEAD says.
+stale=$(git -C "$WT" status --porcelain -- recipes scripts/bench scripts/campaign scripts/voice scripts/llm scripts/tts 2>/dev/null)
+if [ -n "$stale" ]; then
+    pb_warn "$(echo "$stale" | wc -l) harness/recipe file(s) differ from HEAD $(git -C "$WT" rev-parse --short HEAD) in $WT:"
+    echo "$stale" | head -6 | sed 's/^/          /'
+    pb_info "stale copy or uncommitted edits: run from a detached worktree (git worktree add --detach <dir> HEAD)"
+else
+    pb_ok "harness scripts and recipes match HEAD $(git -C "$WT" rev-parse --short HEAD 2>/dev/null)"
+fi
+REC="${ASSETS:+$ASSETS/../build-record.json}"
+if [ -n "$REC" ] && [ -f "$REC" ]; then
+    python3 - "$REC" "$WT" <<'PYEOF'
+import hashlib, json, os, subprocess, sys
+r = json.load(open(sys.argv[1])); wt = sys.argv[2]
+path = r.get("recipe", "")
+rel = path.split("/recipes/", 1)[-1] if "/recipes/" in path else None
+head = subprocess.run(["git", "-C", wt, "show", f"HEAD:recipes/{rel}"], capture_output=True).stdout if rel else b""
+if not head:
+    print(f"  WARN  build-record recipe {path} is not in HEAD's recipes/")
+elif hashlib.sha256(head).hexdigest() != r.get("recipe_sha256"):
+    print(f"  WARN  assets were built from a recipes/{rel} that differs from HEAD's (rebuild, or say why)")
+else:
+    print(f"  ok    assets built from HEAD's recipes/{rel}")
+PYEOF
+fi
+
+echo
 if [ "$PB_FAIL" -gt 0 ]; then
     echo "RESULT: $PB_FAIL failure(s), $PB_WARN warning(s) — DO NOT lease a GPU yet."
     exit 1

@@ -74,3 +74,12 @@ env = { PLOW_MULTISTEP_ADAPTIVE = "true" }
 
 [bench]
 kind = "chat"
+
+# `campaign.py gate <recipe> --assets <dir> --out <dir>` (one lease). PYREF: python with torch +
+# transformers. Measured at 820aa3ba: top1 0.9867 (371/376), KL mean 7.1e-4, max 1.6e-2.
+[gates]
+python = "{env:PYREF}"
+[gates.llm_logit_parity]
+hf_dir = "{hf:google/gemma-4-E4B-it}"
+top1_min = 0.98
+kl_mean_max = 2e-3
