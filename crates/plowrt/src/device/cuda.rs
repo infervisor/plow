@@ -2252,7 +2252,9 @@ impl PeerMemory for CudaBackend {
     }
 
     fn zero_peer(&self, dptr: u64, bytes: u64) -> Result<()> {
-        self.memset_d8(dptr, 0, bytes as usize)
+        // cuMemsetD8 may return before the zero lands; a peer launched next must not race it.
+        self.memset_d8(dptr, 0, bytes as usize)?;
+        CudaBackend::synchronize(self)
     }
 
     fn copy_peer_blocking(&self, _dst_ordinal: u8, dst: u64, src: u64, bytes: u64) -> Result<()> {

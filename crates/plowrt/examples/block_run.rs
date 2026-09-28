@@ -349,12 +349,9 @@ mod cuda {
             let (group, pre, xs, barrier, in_name, out_tensor, dumps, dir) = (&group, &pre, &xs, &barrier, &in_name, &out_tensor, &dumps, &dir);
             // Every launch meets its peers in the collectives: all ranks enter it with zeroed counters.
             let fence = |rank: usize| -> Result<(), plowrt::RuntimeError> {
+                let zeroed = group.zero_rank_xctr(rank);
                 barrier.wait();
-                if rank == 0 {
-                    group.zero_xctr()?;
-                }
-                barrier.wait();
-                Ok(())
+                zeroed
             };
             let outs: Vec<Vec<Vec<f32>>> = std::thread::scope(|s| {
                 let hs: Vec<_> = engines

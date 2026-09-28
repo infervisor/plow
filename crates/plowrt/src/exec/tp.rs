@@ -634,6 +634,19 @@ impl TpGroup {
         Ok(())
     }
 
+    /// Zero rank `r`'s own counters, from that rank's thread, once ITS last dispatch has drained.
+    ///
+    /// Sound without a barrier before it: every peer store into a rank's region is followed by
+    /// a signal that rank waits on, so a drained rank has no inbound store left in flight. What
+    /// must still precede ANY rank's next launch is every rank's zeroing: one barrier after.
+    pub fn zero_rank_xctr(&self, r: usize) -> Result<()> {
+        let r = &self.ranks[r];
+        r.backend
+            .peer()
+            .ok_or_else(|| RuntimeError::Device(format!("rank {} lost its peer facility", r.rank)))?
+            .zero_peer(r.xctr, self.layout.xstate_bytes())
+    }
+
     /// After a drain: assert no cross-GPU gate was left PARTIALLY signalled.
     ///
     /// # The failure this exists for
