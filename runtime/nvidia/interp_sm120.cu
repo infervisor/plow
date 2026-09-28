@@ -223,6 +223,17 @@ extern "C" __device__ unsigned plow_pdl_wait_1 = 1;
 #endif
 #endif
 
+#if PLOW_NV_TRACE
+/* In-op probe stamps (%globaltimer ns) for trace builds: g_probe[0] counts block 0's probed
+ * invocations, each owning 32 slots from 1 + 32 * n. */
+__device__ unsigned long long g_probe[4096];
+__device__ __forceinline__ void plow_probe(unsigned i) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+    if (i < 4096u) g_probe[i] = t;
+}
+__device__ __forceinline__ unsigned plow_probe_begin() { return 1u + 32u * (unsigned)atomicAdd(&g_probe[0], 1ull); }
+#endif
 #include "op_attention.cuh" /* validated: d_flash_decode / d_flash_merge (harvested) */
 #if PLOW_NV_PACKED_REQUEST && defined(PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY) && !PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY
 #error "packed-request object requires packed-prefill packet topology"
