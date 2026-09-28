@@ -1303,14 +1303,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_GEMM_FP8_MX: {
         /* decode rows only; prefill runs op 198 on the sm_90a role object */
         const unsigned groups = in->i[3] ? in->i[3] : 1u, ldx = groups * in->i[2];
-        if (in->i[0] > plow_gv8::MAX_T || in->i[1] % 32u || in->i[2] % 32u || (in->i[6] && !TEN(4)) ||
+        /* i6: 0 = bf16 x, 1 = e4m3 x + t4 scales, 2 = bf16 x quantized in the op (ActQuantMx numerics) */
+        if (in->i[0] > plow_gv8::MAX_T || in->i[1] % 32u || in->i[2] % 32u || in->i[6] > 2u || (in->i[6] == 1u && !TEN(4)) ||
             PLOW_NV_ARENA_FLOATS < plow_gv8::arena_floats(2))
             __trap();
-        const unsigned esz = in->i[6] ? 1u : 2u;
+        const unsigned esz = in->i[6] == 1u ? 1u : 2u;
         d_gemv_fp8mx((__nv_bfloat16*)TEN(0) + (size_t)in->i[5] * groups * in->i[1],
                      (const uint8_t*)TEN(1) + (size_t)in->i[4] * ldx * esz,
-                     in->i[6] ? (const uint8_t*)TEN(4) + (size_t)in->i[4] * (ldx / 32u) : nullptr, (const uint8_t*)TEN(2),
-                     (const uint8_t*)TEN(3), in->i[0], in->i[1], in->i[2], groups, in->i[6] != 0, slice, nblk, arena,
+                     in->i[6] == 1u ? (const uint8_t*)TEN(4) + (size_t)in->i[4] * (ldx / 32u) : nullptr, (const uint8_t*)TEN(2),
+                     (const uint8_t*)TEN(3), in->i[0], in->i[1], in->i[2], groups, in->i[6], slice, nblk, arena,
                      PLOW_NV_ARENA_FLOATS);
         break;
     }

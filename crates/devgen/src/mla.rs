@@ -2192,6 +2192,11 @@ fn nv_fp8_mx_act(b: &mut Builder, cus: &[u32], x: u32, rows: u32, k: u32, deps: 
     (fq, xs, vec![c])
 }
 
+/// [`Builder::memo`] key marking a decode program: there op 198 runs on the interpreter's
+/// decode-row arm, which quantizes a small x itself (i6 = 2, ActQuantMx's numerics, any K % 32)
+/// and so saves the op 200 and its hop.
+pub(crate) const NV_FOLD_ACT_QUANT: &str = "nv_fold_act_quant";
+
 /// [`emit_pf_gemm_fp8_mx`] over ONE row band: `t` rows starting at `row0` of both A and C. The
 /// weight and its scale grid are indexed by N and K only, so they do not move with the rows, and
 /// disjoint bands over the same tiles sum identically to the whole -- which is what lets the
@@ -2242,14 +2247,21 @@ fn emit_pf_gemm_fp8_mx_band(
         b.tensor_name(sc)
     );
     // The fp8 wgmma tile promotes per 32 over K steps of 128.
-    let (x, xs, deps) = nv_fp8_mx_act(b, cus, x, row0 + t, k, deps, k % 128 == 0);
+    let rows = row0 + t;
+    let fold = !crate::emit_is_amd() && rows <= 64 && rows as u64 * k as u64 <= 64 << 10 && b.memo().contains_key(NV_FOLD_ACT_QUANT);
+    let (x, xs, deps, mode) = if fold {
+        (x, TENSOR_NONE, deps.to_vec(), 2)
+    } else {
+        let (x, xs, deps) = nv_fp8_mx_act(b, cus, x, rows, k, deps, k % 128 == 0);
+        (x, xs, deps, (xs != TENSOR_NONE) as u32)
+    };
     let c = b.emit(DevOp::GemmFp8Mx, cus.to_vec(), &deps, |d| {
         d.t[0] = out;
         d.t[1] = x;
         d.t[2] = wt;
         d.t[3] = sc;
         d.t[4] = xs;
-        d.i[6] = (xs != TENSOR_NONE) as u32;
+        d.i[6] = mode;
         d.i[0] = t;
         d.i[1] = nn;
         d.i[2] = k;
