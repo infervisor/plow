@@ -267,14 +267,16 @@ __device__ __noinline__ void run(__nv_bfloat16* __restrict__ C, const Gv8Args& a
 __device__ __noinline__ void d_gemv_fp8mx(__nv_bfloat16* __restrict__ C, const uint8_t* __restrict__ x, const uint8_t* __restrict__ xs,
                                           const uint8_t* __restrict__ W, const uint8_t* __restrict__ ws, unsigned T, unsigned N,
                                           unsigned K, unsigned groups, unsigned mode, unsigned slice, unsigned nblk, float* arena,
-                                          unsigned arena_floats_) {
+                                          unsigned arena_floats_, const __nv_bfloat16* __restrict__ up = nullptr, unsigned act = 0,
+                                          float limit = 0.0f) {
     using namespace plow_gv8;
-    /* mode: 0 = bf16 x, 1 = e4m3 x + ue8m0 xs, 2 = bf16 x quantized here (e4m3 + ue8m0, as ActQuantMx) */
+    /* mode: 0 = bf16 x, 1 = e4m3 x + ue8m0 xs, 2 = bf16 x quantized here (e4m3 + ue8m0, as ActQuantMx),
+     * 3 = as 2 on the Glu op's rows bf16(glu_pair(x, up, act, limit)): x is the gate */
     const bool fp8 = mode != 0u;
     const unsigned ldx = groups * K, xn = T * ldx * (fp8 ? 1u : 2u), xsn = fp8 ? T * (ldx / 32u) : 0u;
     const unsigned xb = (xn + 15u) & ~15u, xsb = (xsn + 15u) & ~15u, stage = (xb + xsb + 8u * WSB) / 4u;
     const bool st = arena_floats(2) + stage <= arena_floats_;
-    if (mode == 2u && !st) __trap();
+    if (mode >= 2u && !st) __trap();
     const unsigned used = st ? stage : 0u;
     unsigned depth = MAX_D;
     while (depth > 2u && arena_floats(depth) + used > arena_floats_) depth--;
@@ -294,8 +296,41 @@ __device__ __noinline__ void d_gemv_fp8mx(__nv_bfloat16* __restrict__ C, const u
     const unsigned probe = 0;
 #endif
     if (st) {
-        if (mode == 2u) {
-            d_act_quant_mx(reinterpret_cast<uint16_t*>(sx), reinterpret_cast<const uint16_t*>(x), T, ldx, 0u, 1u, sx + xb);
+        if (mode >= 2u) {
+            const uint16_t* xq = reinterpret_cast<const uint16_t*>(x);
+            if (mode == 3u) {
+                /* staged past the quantized copy, where the ring (not live yet) goes */
+                __nv_bfloat16* gx = reinterpret_cast<__nv_bfloat16*>(arena + stage);
+                const unsigned n = T * ldx;
+                if ((n * 2u + 3u) / 4u + stage > arena_floats_) __trap();
+                /* 16 B loads, all issued before the first store (gx may alias for the compiler) */
+                constexpr unsigned R = 4u;
+                const unsigned step = blockDim.x * 8u;
+                for (unsigned o0 = threadIdx.x * 8u; o0 < n; o0 += R * step) {
+                    uint4 vg[R], vu[R];
+#pragma unroll
+                    for (unsigned r = 0; r < R; r++)
+                        if (o0 + r * step < n) {
+                            vg[r] = *reinterpret_cast<const uint4*>(x + (size_t)(o0 + r * step) * 2u);
+                            vu[r] = *reinterpret_cast<const uint4*>(up + o0 + r * step);
+                        }
+#pragma unroll
+                    for (unsigned r = 0; r < R; r++)
+                        if (o0 + r * step < n) {
+                            const __nv_bfloat16* g8 = reinterpret_cast<const __nv_bfloat16*>(&vg[r]);
+                            const __nv_bfloat16* u8 = reinterpret_cast<const __nv_bfloat16*>(&vu[r]);
+                            uint4 vo;
+                            __nv_bfloat16* o8 = reinterpret_cast<__nv_bfloat16*>(&vo);
+#pragma unroll
+                            for (unsigned j = 0; j < 8u; j++)
+                                o8[j] = __float2bfloat16(glu_pair(__bfloat162float(g8[j]), __bfloat162float(u8[j]), act, limit));
+                            *reinterpret_cast<uint4*>(gx + o0 + r * step) = vo;
+                        }
+                }
+                __syncthreads();
+                xq = reinterpret_cast<const uint16_t*>(gx);
+            }
+            d_act_quant_mx(reinterpret_cast<uint16_t*>(sx), xq, T, ldx, 0u, 1u, sx + xb);
         } else {
             /* 4 loads in flight per thread per round */
             const unsigned step = blockDim.x * 16u;
