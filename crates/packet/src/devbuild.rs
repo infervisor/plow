@@ -1046,6 +1046,11 @@ impl Builder {
         self.ops.len()
     }
 
+    /// The instruction op `counter` emitted.
+    pub fn inst(&self, counter: u32) -> &DevInst {
+        &self.ops[counter as usize].inst
+    }
+
     /// The declared name of handle `h`.
     pub fn tensor_name(&self, h: u32) -> &str {
         &self.tensors[h as usize].name
