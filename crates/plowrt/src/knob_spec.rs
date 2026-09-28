@@ -82,6 +82,9 @@ const CHUNK_PUBLISH_QUALIFIED: Status = Status::Qualified {
         "docs/flags-reference.md: `=0` is the rollback",
     ],
 };
+const STALE_RESERVE_QUALIFIED: Status = Status::Qualified {
+    evidence: &["docs/runtime/throughput-audit.md §6: E4B H100 unique-prompt T4 A/B, admission ensure_rows p50 1154 -> 1 us, c64 3405/3010 -> 3482/3482 tok/s, g32 TTFT 100/142 -> 56/56 ms, nsys c64 GPU idle 5.0 -> 3.0%; sessions 64 calls later TTFT 39.8 -> 34.1 ms, cached 0.87 unchanged"],
+};
 const PROMOTED: Status = Status::Qualified {
     evidence: &["docs/flags-reference.md: a promoted default; `=false` is the rollback"],
 };
@@ -466,6 +469,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.preload", Some("PLOW_PRELOAD"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.kv_pool_mib", Some("PLOW_KV_POOL_MIB"), Layer::Runtime, USIZE, Default::Static(Val::Nat(512)), OPT_IN),
     KnobSpec::new("rt.vmm_deferred_reclaim", Some("PLOW_VMM_DEFERRED_RECLAIM"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.vmm_stale_reserve", Some("PLOW_VMM_STALE_RESERVE"), Layer::Runtime, Domain::Bool, ON, STALE_RESERVE_QUALIFIED),
     KnobSpec::new("rt.vmm_publish_shared", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::Runtime, Domain::Bool, ON, PUBLISH_SHARED_QUALIFIED),
     KnobSpec::new("rt.prefix_cache_output", Some("PLOW_PREFIX_CACHE_OUTPUT"), Layer::Runtime, Domain::Bool, ON, CACHE_OUTPUT_QUALIFIED),
     KnobSpec::new("rt.prefix_inflight_wait", Some("PLOW_PREFIX_INFLIGHT_WAIT"), Layer::Runtime, Domain::Bool, ON, INFLIGHT_WAIT_QUALIFIED),
@@ -661,6 +665,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_TEST_K3_SNAPSHOTS", Some("PLOW_TEST_K3_SNAPSHOTS"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_TEST_MOE_ROWS", Some("PLOW_TEST_MOE_ROWS"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_VMM_DEFERRED_RECLAIM", Some("PLOW_VMM_DEFERRED_RECLAIM"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_VMM_STALE_RESERVE", Some("PLOW_VMM_STALE_RESERVE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_VMM_PUBLISH_SHARED", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_VMM_LIVE", Some("PLOW_VMM_LIVE"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
     KnobSpec::new("env.PLOW_VMM_LIVE_RINGS", Some("PLOW_VMM_LIVE_RINGS"), Layer::RawEnv, Domain::Str, UNSET, DIAG),

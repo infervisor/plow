@@ -855,6 +855,9 @@ struct Inner {
     copying: Vec<bool>,
     /// [`CopySlot::Spare`] handles, counted against the reuse pool cap with `pooled`.
     spares: u32,
+    /// [`VmmKv::enable_stale_reserve`]: the reclaimer leaves a retired window's private blocks
+    /// mapped while they and the pool fit the pool cap.
+    stale_reserve: bool,
     /// A [`copy_out`] chunk is reading `seq`'s row-0 window mappings with the lock released.
     copy_reading: Vec<bool>,
     /// Whole blocks mapped per sequence (uniform across tracks/heads).
@@ -1077,6 +1080,7 @@ impl VmmKv {
                 jobs: None,
                 copying: vec![false; batch],
                 spares: 0,
+                stale_reserve: false,
                 copy_reading: vec![false; batch],
                 seq_blocks: vec![0; batch],
                 cache,
@@ -1271,6 +1275,16 @@ impl VmmKv {
         if let Some(tx) = &self.premap_tx {
             self.shared.inner.lock().jobs = Some(tx.clone());
         }
+    }
+
+    /// Keep a retired window's private blocks mapped for the slot's next occupant instead of
+    /// having the pool thread unmap them, so its admission reuses them in place (no map or
+    /// set_access on the request path). Bounded: stale plus pooled blocks stay within the reuse
+    /// pool cap, beyond which the reclaimer unmaps as before, and [`create_block`] unmaps a kept
+    /// block of any slot before it would report OOM. Needs [`Self::enable_deferred_reclaim`].
+    pub fn enable_stale_reserve(&mut self) {
+        let mut inner = self.shared.inner.lock();
+        inner.stale_reserve = inner.jobs.is_some();
     }
 
     /// Move the inline row-0 unmap of a recycled slot out of admission: [`Self::retire_released`]
@@ -2463,9 +2477,15 @@ fn ensure_rows(s: &Shared, seq: usize, rows: u32, generation: Option<u64>) -> Re
     }
     let target = rows.div_ceil(s.block_rows);
     let kvh = s.geo.kvh_full;
-    for k in inner.seq_blocks[seq]..target {
-        for t in 0..inner.tracks.len() {
-            for h in 0..kvh {
+    let first = inner.seq_blocks[seq];
+    // Blocks mapped this call and not yet granted access: `(k, id)` of one (track, head) window,
+    // whose columns are VA-adjacent, so each contiguous run takes ONE set_access (the ~69 µs call)
+    // instead of one per block.
+    let mut run: smallvec::SmallVec<[(u32, u32); 8]> = smallvec::SmallVec::new();
+    for t in 0..inner.tracks.len() {
+        for h in 0..kvh {
+            run.clear();
+            for k in first..target {
                 let slot = slot_index(s, seq, h, k);
                 let va = slot_va(s, &inner.tracks[t], seq, h, k);
                 match inner.tracks[t].slots[slot] {
@@ -2488,24 +2508,52 @@ fn ensure_rows(s: &Shared, seq: usize, rows: u32, generation: Option<u64>) -> Re
                     }
                     Slot::Empty => {}
                 }
-                let id = create_block(s, &mut inner)?;
-                let handle = inner.blocks[id as usize].handle;
-                if let Err(error) = s.ops.map(va, s.block_bytes, handle) {
-                    deref_block(s, &mut inner, id);
+                let mapped = create_block(s, &mut inner).and_then(|id| {
+                    let handle = inner.blocks[id as usize].handle;
+                    s.ops.map(va, s.block_bytes, handle).map(|()| id).map_err(|error| {
+                        deref_block(s, &mut inner, id);
+                        error
+                    })
+                });
+                match mapped {
+                    Ok(id) => run.push((k, id)),
+                    Err(error) => {
+                        unwind_run(s, &mut inner, t, seq, h, &run);
+                        return Err(error);
+                    }
+                }
+            }
+            let mut i = 0;
+            while i < run.len() {
+                let mut j = i + 1;
+                while j < run.len() && run[j].0 == run[j - 1].0 + 1 {
+                    j += 1;
+                }
+                let va = slot_va(s, &inner.tracks[t], seq, h, run[i].0);
+                if let Err(error) = s.ops.set_access(va, (j - i) as u64 * s.block_bytes) {
+                    unwind_run(s, &mut inner, t, seq, h, &run[i..]);
                     return Err(error);
                 }
-                if let Err(error) = s.ops.set_access(va, s.block_bytes) {
-                    s.ops.unmap(va, s.block_bytes);
-                    deref_block(s, &mut inner, id);
-                    return Err(error);
+                for &(k, id) in &run[i..j] {
+                    inner.tracks[t].slots[slot_index(s, seq, h, k)] = Slot::Live(id);
                 }
-                inner.tracks[t].slots[slot] = Slot::Live(id);
+                i = j;
             }
         }
-        inner.seq_blocks[seq] = k + 1;
-        s.frontier[seq].store((k + 1) * s.block_rows, Ordering::Release);
+    }
+    if target > first {
+        inner.seq_blocks[seq] = target;
+        s.frontier[seq].store(target * s.block_rows, Ordering::Release);
     }
     Ok(())
+}
+
+/// Unmap and drop blocks [`ensure_rows`] mapped but never granted access; their slots stay empty.
+fn unwind_run(s: &Shared, inner: &mut Inner, t: usize, seq: usize, h: u32, run: &[(u32, u32)]) {
+    for &(k, id) in run {
+        s.ops.unmap(slot_va(s, &inner.tracks[t], seq, h, k), s.block_bytes);
+        deref_block(s, inner, id);
+    }
 }
 
 /// Create one physical block — reuse-pool first ([`VmmKv::enable_block_pool`]),
@@ -2537,12 +2585,40 @@ fn create_block(s: &Shared, inner: &mut Inner) -> Result<u32> {
                 if e.is_fatal() {
                     return Err(e);
                 }
-                if !evict_one(s, inner, false) {
+                if !steal_stale(s, inner) && !evict_one(s, inner, false) {
                     return Err(RuntimeError::Oom(format!("vmm kv block: {e}")));
                 }
             }
         }
     }
+}
+
+/// Under [`VmmKv::enable_stale_reserve`], unmap one retired window's private block and park its
+/// handle in the pool (over the cap if need be: [`create_block`] takes it next). `false` when
+/// the reserve is off or empty, so memory the reserve holds never turns into an admission OOM.
+fn steal_stale(s: &Shared, inner: &mut Inner) -> bool {
+    if !inner.stale_reserve {
+        return false;
+    }
+    let found = inner.tracks.iter().enumerate().find_map(|(t, track)| {
+        track.slots.iter().enumerate().find_map(|(slot, state)| match *state {
+            Slot::Stale(id) if inner.blocks[id as usize].refs == 1 => Some((t, slot, id)),
+            _ => None,
+        })
+    });
+    let Some((t, slot, id)) = found else { return false };
+    let va = inner.tracks[t].va
+        + (slot as u64 / s.bph as u64) * s.head_span
+        + (slot as u64 % s.bph as u64) * s.block_bytes;
+    s.ops.unmap(va, s.block_bytes);
+    inner.tracks[t].slots[slot] = Slot::Empty;
+    inner.stats.blocks_stale -= 1;
+    inner.stats.blocks_reclaimed += 1;
+    if let Some(handle) = unref_block(s, inner, id) {
+        inner.pooled.push(handle);
+        inner.stats.blocks_pooled += 1;
+    }
+    true
 }
 
 /// Slot a block into the table, recycling a freed id when one exists.
@@ -3254,11 +3330,18 @@ fn reclaim_stale(s: &Shared, seq: usize) {
         let _turn = reclaim_turn();
         let mut inner = s.inner.lock();
         let mut next = None;
+        // Private blocks may stay for the next occupant while the reserve fits the pool cap.
+        let keep_private = inner.stale_reserve
+            && inner.stats.blocks_stale as usize + inner.pooled.len() + inner.spares as usize
+                <= s.pool_cap.load(Ordering::Relaxed) as usize;
         'scan: for k in 1..s.bph {
             for t in 0..inner.tracks.len() {
                 for h in 0..kvh {
                     let slot = slot_index(s, seq, h, k);
                     if let Slot::Stale(id) = inner.tracks[t].slots[slot] {
+                        if keep_private && inner.blocks[id as usize].refs == 1 {
+                            continue;
+                        }
                         next = Some((t, h, k, slot, id));
                         break 'scan;
                     }
@@ -4045,6 +4128,8 @@ mod tests {
         releases: AtomicU64,
         maps: AtomicU64,
         unmaps: AtomicU64,
+        /// Successful `set_access` calls (one per granted VA run).
+        accesses: AtomicU64,
         allocs: AtomicU64,
         frees: AtomicU64,
         fail_creates: AtomicI64,
@@ -4155,6 +4240,7 @@ mod tests {
             {
                 return Err(RuntimeError::Device("mock set-access failure".into()));
             }
+            self.accesses.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn alloc(&self, _bytes: u64) -> Result<u64> {
@@ -6007,6 +6093,97 @@ mod tests {
         drop(p);
         assert_eq!(ops.unmaps.load(Ordering::SeqCst), 12 + 16);
         assert_eq!(ops.releases.load(Ordering::SeqCst), 16, "no leak at drop");
+    }
+
+    /// A window's columns of one (track, head) are VA-adjacent: growing it grants access once per
+    /// run, not once per block.
+    #[test]
+    fn ensure_rows_grants_access_once_per_contiguous_run() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        p.ensure_rows(0, 32).unwrap(); // 4 columns x 4 tracks
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 16);
+        assert_eq!(ops.accesses.load(Ordering::SeqCst), 4, "one grant per (track, head)");
+        assert_eq!(p.mapped_rows(0), 32);
+        p.ensure_rows(1, 9).unwrap(); // 2 columns
+        assert_eq!(ops.accesses.load(Ordering::SeqCst), 8);
+        p.ensure_rows(1, 17).unwrap(); // grows by one column
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 16 + 8 + 4);
+        assert_eq!(ops.accesses.load(Ordering::SeqCst), 12);
+    }
+
+    /// A failed grant on a later run unmaps that run and keeps the frontier where it was.
+    #[test]
+    fn a_failed_run_grant_unwinds_the_run_and_keeps_the_frontier() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        ops.fail_access.store(2, Ordering::SeqCst); // the second (track, head) run
+        assert!(p.ensure_rows(0, 32).is_err());
+        assert_eq!(p.mapped_rows(0), 0);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4, "the ungranted run only");
+        assert_eq!(p.stats().blocks_live, 4, "the granted run stays mapped");
+        p.ensure_rows(0, 32).unwrap();
+        assert_eq!(p.mapped_rows(0), 32);
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 8 + 12);
+    }
+
+    /// With the stale reserve, a retired window's private columns stay mapped for the slot's next
+    /// occupant: its regrowth makes no driver call.
+    #[test]
+    fn stale_reserve_keeps_private_columns_for_the_next_occupant() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(16 * 64);
+        p.enable_deferred_reclaim();
+        p.enable_stale_reserve();
+        p.ensure_rows(0, 32).unwrap();
+        p.begin_seq(0);
+        p.sync_reclaim();
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 0, "private columns kept mapped");
+        assert_eq!(p.stats().blocks_stale, 12);
+        p.ensure_rows(0, 32).unwrap();
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 16, "regrowth reuses in place");
+        assert_eq!(p.stats().blocks_stale, 0);
+        assert_eq!(p.stats().blocks_live, 16);
+    }
+
+    /// A retire is kept only while kept plus parked blocks fit the pool cap; past it the
+    /// reclaimer unmaps as before (parking up to the cap, releasing the rest).
+    #[test]
+    fn stale_reserve_is_bounded_by_the_pool_cap() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(8 * 64);
+        p.enable_deferred_reclaim();
+        p.enable_stale_reserve();
+        p.ensure_rows(0, 32).unwrap();
+        p.begin_seq(0);
+        p.sync_reclaim();
+        let st = p.stats();
+        assert_eq!(st.blocks_stale, 0, "a retire that does not fit is reclaimed as before");
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 12);
+        assert_eq!(st.blocks_pooled, 8);
+    }
+
+    /// Memory the reserve holds is never an OOM: a create that fails unmaps a kept block of any
+    /// slot and reuses its handle.
+    #[test]
+    fn stale_reserve_yields_its_blocks_before_an_admission_oom() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_recycling(16 * 64);
+        p.enable_deferred_reclaim();
+        p.enable_stale_reserve();
+        p.ensure_rows(0, 32).unwrap();
+        p.begin_seq(0);
+        p.sync_reclaim();
+        assert_eq!(p.stats().blocks_stale, 12);
+        ops.fail_creates.store(1_000, Ordering::SeqCst);
+        p.ensure_rows(1, 24).unwrap(); // 12 blocks, all taken from seq 0's reserve
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 16);
+        assert_eq!(p.stats().blocks_stale, 0);
+        assert_eq!(p.mapped_rows(1), 24);
+        assert!(p.ensure_rows(1, 32).is_err(), "nothing left to yield");
     }
 
     /// A published (cache-shared) column 0 cannot be handed over — the next

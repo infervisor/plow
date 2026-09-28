@@ -398,6 +398,12 @@ pub struct RuntimeConfig {
     #[arg(long = "vmm-deferred-reclaim", env = "PLOW_VMM_DEFERRED_RECLAIM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_deferred_reclaim: bool,
 
+    /// CUDA VMM KV (with `--vmm-deferred-reclaim`): leave a retired window's private blocks
+    /// mapped for the slot's next occupant, within the `--kv-pool-mib` cap, instead of unmapping
+    /// them on the pool thread and mapping fresh ones at the next admission. `0` is the rollback.
+    #[arg(long = "vmm-stale-reserve", env = "PLOW_VMM_STALE_RESERVE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_stale_reserve: bool,
+
     /// CUDA VMM prefix cache: snapshot a sequence's boundary into the cache only once its
     /// leading 32 tokens were seen on another sequence, so unique-prompt workloads pay no
     /// snapshot copies. `0` publishes every sequence.
@@ -1934,6 +1940,14 @@ impl RuntimeConfig {
         select_compat(
             self.vmm_deferred_reclaim,
             Self::env_bool("PLOW_VMM_DEFERRED_RECLAIM"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn vmm_stale_reserve(&self) -> bool {
+        select_compat(
+            self.vmm_stale_reserve,
+            Self::env_bool("PLOW_VMM_STALE_RESERVE"),
             !Self::is_initialized(),
         )
     }

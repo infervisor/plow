@@ -15,7 +15,7 @@ a plain LLM. plow runs HEAD 5eea79c4 on the E4B packet with the KV-shared-tail s
   5103 (1.28x), not 3525 vs 5302 and 4381 vs 6786.
 * **Throughput is set by device time per request, and plow spends more of it in decode.** The
   scheduler itself costs ≤ 2.5% (host gap 0.4%, bucket padding 1.0-1.6%). Admission's VMM mapping
-  adds 2.7% (runtime). The rest is kernel time:
+  added 2.7% (runtime; fixed by the stale reserve, §6). The rest is kernel time:
   * the batched decode step's per-row marginal cost: 94 µs/row vs 27 at B 1→64, ctx 1024;
   * the rider tail, which runs on the same kernels;
   * plow's prefill is 21% faster than vLLM's and pays back part of it.
@@ -95,7 +95,7 @@ live row ride.
 | prefill rows: 12.2 µs (plow, full 2048-row launch) vs 15.4 µs (vLLM) | **−3.19** | **−3.19** | kernel (plow ahead) | — |
 | decode-tick steps: 0.197 vs 0.119 ms/token (c64), 0.152 vs 0.076 (c128) | **+7.88** | **+5.58** | kernel: batched decode marginal | decode + attention agents |
 | riders (tail window + terminal) vs vLLM's per-token decode cost | **+1.51** | **+4.44** | kernel (same GEMV/attention), plus host admission inside the tick | decode agent; VMM owner |
-| — of which VMM KV mapping at admission (GPU idle) | 1.0 | 1.0 | runtime | VMM / prefix-cache owner |
+| — of which VMM KV mapping at admission (GPU idle) | 1.0 | 1.0 | runtime | fixed: `PLOW_VMM_STALE_RESERVE` (§6) |
 | partial or padded prefill-only launches | +0.29 | +0.20 | scheduler (≤1%) | — |
 | host gap between ticks | +0.13 | +0.13 | scheduler (0.4%) | — |
 | **plow (wall / requests)** | **37.14** | **32.14** | | |
@@ -190,7 +190,7 @@ That is roughly GEMV +2.3 ms and hd128 attention +0.9 ms over vLLM.
 |---|---|---|
 | host gap between ticks (dispatcher, handoff) | 0.4% of wall at c64 and c128 | not a leak |
 | GPU idle inside ticks (nsys) | 5.1% (vLLM 4.3%); ~2.8 ms at each mixed-tick boundary, none between decode steps | see the next row |
-| KV admission VMM mapping (`admit_packed_slot` → `ensure_rows(total + max(block, 2048))`) | 1.0 ms per new prompt (p50 1018 µs, 192 per cell), serialized before the launch; 2.7% of c64 wall | **runtime leak**: map + set_access per 2 MiB block on the critical path, because a published prompt's blocks cannot be reused in place |
+| KV admission VMM mapping (`admit_packed_slot` → `ensure_rows(total + max(block, 2048))`) | 1.0 ms per new prompt (p50 1018 µs, 192 per cell), serialized before the launch; 2.7% of c64 wall | **runtime leak, fixed** (below) |
 | launch staging, emit and detok, retire loop | 30 µs, 136 µs (54 tokens), 78 µs per tick | not a leak |
 | bucket padding (a 1061-row pack in a 2048 bucket) | 1.0-1.6% of wall | minor |
 | decode rung padding (rung chosen by highest slot) | rows ≈ extent at c64; at c128 106 rows run rung 128 because the other slots are prefilling | inherent to fixed slots |
@@ -198,16 +198,62 @@ That is roughly GEMV +2.3 ms and hd128 attention +0.9 ms over vLLM.
 | prefill-first starving decode | every live row rides the launch unless `sched::ride` prices a separate step cheaper; TPOT is set by mixed-tick length | policy (TTFT ↔ TPOT) |
 | ride vs step | per-launch EWMA picks the cheaper arm (§4) | correct |
 
-The admission fix belongs to the VMM owner. Three options, in order of risk:
+### The admission leak and its fix (`PLOW_VMM_STALE_RESERVE`, default on)
 
-1. Batch `cuMemSetAccess` over each contiguous (track, head) run instead of per block. This
-   halves the driver calls.
-2. Leave the rows past this launch's `mapped_ends` to after the launch is enqueued, overlapped
-   with the device. The launch and decode paths already map what they write, so the admission
-   reservation only guards against OOM. The trade is the OOM-at-admission guarantee.
-3. Keep a background-mapped reserve of private blocks, so admission finds `Live` blocks.
+What admission cost, per new E4B prompt at c64 (a probe on `ensure_rows`):
 
-Expected gain: ≤ 2.7% at c64/c128, and more on session turns with short suffixes.
+* It maps 16 fresh 2 MiB blocks: column 1 of 8 full-layer tracks × 2 KV heads. `block_rows` is
+  2048 and the window is `1128 + 2048` rows.
+* The cost splits into `cuMemSetAccess` ~56 µs per block (~0.9 ms), creates ~0.4 ms (the pool
+  was usually dry) and maps ~0.07 ms.
+* In-place reuse never happened: 0 of ~27 blocks per admission. The pool thread had already
+  unmapped the previous occupant's private columns (`reclaim_stale`), so the next occupant of
+  the same slot mapped them again.
+
+Two changes (`memory/vmm.rs`):
+
+* **Coalesced grants (shared, both backends).** `ensure_rows` maps each (track, head) window
+  first, then grants access once per VA-contiguous run instead of once per block, as
+  `try_attach` already did. A failed grant unmaps its run and leaves the frontier unchanged.
+  E4B's admission grows one column, so this alone measures neutral: c64 3403 vs 3405 tok/s. It
+  pays off for multi-column growth: long prompts, and AMD.
+* **Stale reserve (CUDA only; `enable_stale_reserve`, AMD untouched).**
+  * The reclaimer leaves a retired window's private blocks mapped while stale plus pooled
+    blocks fit the `--kv-pool-mib` cap. Past the cap it unmaps as before.
+  * The slot's next occupant reuses them in place, with no driver call.
+  * Reserved blocks are never an OOM: before `create_block` evicts the prefix cache or reports
+    OOM, it unmaps a kept block of any slot and reuses the handle (`steal_stale`).
+  * Idle HBM stays bounded by the same cap the pool already had.
+
+A/B on E4B H100, unique prompts per cell, greedy, cells g32 → g64 → g128 on a fresh server.
+Arms are TTFT p50 ms / tok/s:
+
+| cell | HEAD | HEAD run 2 | reserve | reserve run 2 | grants only |
+|---|---|---|---|---|---|
+| g32 | 100 / 2288 | 142 / 2158 | **56 / 2535** | **56 / 2528** | 61 / 2497 |
+| g64 | 102 / 3405 | 143 / 3010 | **95 / 3482** | **96 / 3482** | 102 / 3403 |
+| g128 | 169 / 3947 | 210 / 3558 | 210 / 3633 | 123 / 4050 | 129 / 3948 |
+
+* **Admission `ensure_rows`** goes from p50 1154 µs to 1 µs. p90 stays ~1.3 ms from the first
+  wave, before any slot retires.
+* **c64 mixed tick** goes from 32.28 to 30.76 ms. Decode ticks are unchanged at 11.82 ms/step.
+* **nsys c64 on a warmed server:**
+  * GPU idle 5.0% → 3.0%.
+  * Idle in 1-10 ms gaps 233 → 45 ms.
+  * 3427 → 3503 tok/s (+2.2%).
+* **Spreads.** The treatment's spread is under 0.3% at g32/g64; HEAD's run 2 was a slow arm.
+  g128 is bimodal in both arms (TTFT 123-210 ms), so not convictable.
+* **Sessions (64 calls, `session_bench.py`):**
+  * later-turn TTFT p50 39.8 → 34.1 ms (p99 126 → 97);
+  * TPOT 15.3 → 14.9 ms;
+  * 1927 → 1964 tok/s;
+  * cached fraction unchanged at 0.87.
+
+`PLOW_VMM_STALE_RESERVE=0` is the rollback.
+
+A first version counted kept blocks against the pool's cap in `unref_block` too. That released
+freed blocks instead of parking them, so later admissions paid `cuMemCreate` (p90 4.8 ms), and
+c64 lost 10.6%. The shipped rule gates only the reclaimer's decision.
 
 ## 7. What vLLM and SGLang do that plow does not
 

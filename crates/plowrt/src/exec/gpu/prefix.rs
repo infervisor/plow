@@ -383,6 +383,9 @@ impl GpuEngine {
                     kv.enable_block_pool(crate::memory::vmm::kv_pool_cap());
                     if rt.vmm_deferred_reclaim() {
                         kv.enable_deferred_reclaim();
+                        if rt.vmm_stale_reserve() {
+                            kv.enable_stale_reserve();
+                        }
                     }
                     if rt.vmm_publish_shared() {
                         kv.enable_shared_publish();
