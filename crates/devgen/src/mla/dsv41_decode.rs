@@ -219,7 +219,7 @@ pub(crate) fn emit_dsv41_attn_decode(
         let rows = ctx / ratio;
         let c_lat = if ratio == 1 {
             let op = crate::pick_tile(bsz, hd, c.hidden, b.n_cu(), kernelcaps::QuantScheme::None);
-            let c_kv = b.emit(op, all.clone(), deps, |d| {
+            let c_kv = b.emit(op, all.clone(), &[proj.c_xn], |d| {
                 d.t[0] = cp.kv;
                 d.t[1] = proj.xn;
                 d.t[2] = w.get(l, "attn.compressor.wkv.weight");
@@ -238,7 +238,7 @@ pub(crate) fn emit_dsv41_attn_decode(
         } else {
             let f32_gemm = |b: &mut Builder, out: u32, weight: u32, role: &str| {
                 let (split, splits) = crate::mla::nv_gemm_f32_split(b, all.len(), role, bsz, hd, c.hidden);
-                b.emit(DevOp::GemmF32, all.clone(), deps, |d| {
+                b.emit(DevOp::GemmF32, all.clone(), &[proj.c_xn], |d| {
                     d.t[0] = out;
                     d.t[1] = proj.xn;
                     d.t[2] = weight;
@@ -315,7 +315,7 @@ pub(crate) fn emit_dsv41_attn_decode(
         let src = dsv41_src_of(c, l).expect("an index layer reads some source's keys");
         let (hi, di) = (c.index_heads, c.index_dim);
         let c_q = crate::mla::emit_pf_gemm_fp8_mx(
-            b, cus, ix.q, proj.q_an, w.get(l, "attn.indexer.wq_b.weight"), w.get(l, "attn.indexer.wq_b.scale"), bsz, hi * di, c.q_lora, deps,
+            b, cus, ix.q, proj.q_an, w.get(l, "attn.indexer.wq_b.weight"), w.get(l, "attn.indexer.wq_b.scale"), bsz, hi * di, c.q_lora, &[proj.c_qan],
         );
         let c_qr = b.emit(DevOp::CompressRopeQuant, few_cus(cus, bsz * hi * di / 4), &[c_q], |d| {
             d.t[0] = ix.qr;
@@ -335,7 +335,7 @@ pub(crate) fn emit_dsv41_attn_decode(
             d.j[1] = 1u32 << 31;
         });
         let op = crate::pick_tile(bsz, hi, c.hidden, b.n_cu(), kernelcaps::QuantScheme::None);
-        let c_w = b.emit(op, few_cus(cus, hi.div_ceil(8) * 256), deps, |d| {
+        let c_w = b.emit(op, few_cus(cus, hi.div_ceil(8) * 256), &[proj.c_xn], |d| {
             d.t[0] = ix.w;
             d.t[1] = proj.xn;
             d.t[2] = w.get(l, "attn.indexer.weights_proj.weight");
