@@ -4813,6 +4813,7 @@ impl GpuEngine {
                 &mut insts,
                 &devp,
                 None,
+                false,
             )?)
         } else if moe_lt_routed {
             let routes = moe_lt::decode_routes(
@@ -4946,6 +4947,7 @@ impl GpuEngine {
                             &mut insts,
                             &devp,
                             Some(&cublaslt_decode),
+                            false,
                         )?;
                         let mut rung = DecodeRung::upload_with_insts(
                             &be,
@@ -9049,6 +9051,7 @@ impl GpuEngine {
                     &mut h_inst,
                     devp,
                     None,
+                    config.nv.lt_pair,
                 )?
             };
             let mut moe_lt_segments = Vec::new();
@@ -9879,12 +9882,20 @@ impl GpuEngine {
                 });
         let g = if has_external {
             let capture_stream = self.be.stream_create()?;
-            let untouched: Vec<_> = self.prefill[bi]
+            let mut untouched: Vec<_> = self.prefill[bi]
                 .moe_lt_segments
                 .iter()
                 .flatten()
                 .flat_map(moe_lt::MoeLtRoute::glue)
                 .collect();
+            // Interpreter segments never touch cuBLASLt's workspace, so the workspace memset a
+            // library call captures may run beside the segment that precedes it.
+            for (seg, &class) in seg_class.iter().enumerate() {
+                let (function, ..) = self.prefill_segment_kernel(bi, seg + range.start, class, false)?;
+                if !untouched.contains(&function) {
+                    untouched.push(function);
+                }
+            }
             self.be.graph_capture_hoisting(&capture_stream, &untouched, || {
                 for (seg, &class) in seg_class.iter().enumerate() {
                     let seg = seg + range.start;

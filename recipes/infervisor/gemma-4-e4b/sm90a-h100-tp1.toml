@@ -54,10 +54,13 @@ PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "48"
 # Every flash segment isolated: hd256 sliding + hd512 full attention run in interp_sm90a_pffa
 # (prefill 2000 rows 70 -> 48 ms). Needs the pffa/pfpackedfa role objects below.
 PLOW_SEG_FA512 = "all"
-# TMA K/V maps feed the v3 flash body; class slicing gives the occ-2 light (FATLITE) and GEMM
-# objects 2*n_cu slices.
+# TMA K/V maps feed the v3 flash body; class slicing gives the occ-2 GEMM objects 2*n_cu
+# slices, and SLICE_ALL the occ-2 light (FATLITE) object too (half its blocks idled on n_cu).
 PLOW_TMA_GEMM = "1"
 PLOW_SEG_CLASS_SLICE = "1"
+PLOW_SEG_SLICE_ALL = "1"
+# Prefill sandwich seams as one NormResidualNorm (row-team body): 1000 rows 13.9 -> 13.7 ms.
+PLOW_PF_GFUSE = "1"
 
 # base emit -> segment objects (PLOW_NVCC / NVCC_PREPEND_FLAGS pick the toolkit) -> role emit.
 # Only the flash objects (v3 body) and the FATLITE light object are taken.

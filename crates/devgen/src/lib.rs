@@ -4493,6 +4493,9 @@ fn emit_phase(
     let seam_fused = |b: &Builder, gamma: u32| -> bool {
         if fuse_norm {
             rewrite_lower::fused(b, rewrite_lower::Lowering::AddNorm, gamma).unwrap_or(true)
+        } else if gfuse && !gemv_family && gamma == n.fin {
+            // The packed terminal (plowrt packed_terminal::layout) starts at the final RmsNorm.
+            false
         } else if gfuse {
             rewrite_lower::fused(b, rewrite_lower::Lowering::NormResidualNorm, gamma)
                 .unwrap_or(gemv_family || emit_config::active().pf_gfuse)

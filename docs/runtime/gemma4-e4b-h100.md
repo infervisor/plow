@@ -546,12 +546,65 @@ flash, FATLITE light object, cuBLASLt projections.
 | PLE proj GEMM | 2000 | 2.6 | 12.6 | 3.8 | 11 | 34% | cuBLASLt |
 | NormResidual+RmsNorm (layer end) | 2000 | 0.0 | 41.0 | 12.2 | 34 | 36% | interp |
 
+pf_4 (current build; nsys kernel time, same layer; `*` = changed by pf_4):
+
+| op (per layer) | rows | roofline µs | measured µs | % | implementation |
+|---|---|---|---|---|---|
+| q_proj GEMM | 1000 | 10.6 | 17 | 62% | cuBLASLt |
+| k+v proj GEMM * | 1000 | 5.3 | 12 | 44% | cuBLASLt strided batch of 2 (was 2 × 12) |
+| HeadNormRope q/k/v | 1000 | 4.0 | 20 | 20% | interp, 264 slices |
+| NormResidualNorm (post-attn) * | 1000 | 6.1 | 17 | 36% | interp row teams (was NR+RmsNorm 28) |
+| gate+up GEMM * | 1000 | 106 | 139 | 76% | cuBLASLt strided batch of 2 (was 76 + 74) |
+| GeGLU * | 1000 | 18.3 | 28 | 65% | interp, 264 slices (was 39) |
+| down_proj GEMM | 1000 | 53.0 | 69 | 77% | cuBLASLt |
+| NormResidual * | 1000 | 4.6 | 13 | 35% | interp row teams (was 19) |
+| PLE GluStrided (205) * | 1000 | 0.5 | 9 | 6% | interp (was 12) |
+| NormResidualNorm (layer end) * | 1000 | 6.1 | 15 | 42% | interp row teams (was 22) |
+| q_proj GEMM | 2000 | 21.2 | 29 | 73% | cuBLASLt |
+| k+v proj GEMM * | 2000 | 10.6 | 16 | 66% | cuBLASLt strided batch of 2 (was 17 + 16) |
+| HeadNormRope q/k/v | 2000 | 7.9 | 30 | 26% | interp |
+| NormResidualNorm (post-attn) * | 2000 | 12.2 | 26 | 47% | interp row teams (was 38) |
+| gate+up GEMM * | 2000 | 212 | 267 | 79% | cuBLASLt strided batch of 2 (was 142 + 138) |
+| GeGLU * | 2000 | 36.7 | 51 | 72% | interp (was 66) |
+| NormResidual * | 2000 | 9.2 | 19 | 48% | interp row teams (was 25) |
+| NormResidualNorm (layer end) * | 2000 | 12.2 | 22 | 55% | interp row teams (was 34) |
+
+What pf_4 changed:
+* **Paired projections** (`PLOW_LT_PAIR`, on by default). This is generic across models. Two
+  adjacent cuBLASLt projection segments that have the same shape and the same input, and
+  write disjoint outputs, run as one strided-batch matmul. The input's batch stride is 0.
+  The algorithm is timed at load on the live operands. The second segment becomes a no-op.
+  * On E4B this pairs k/v and gate/up.
+  * On Veena (Llama, 28 layers) it pairs 56 segments.
+  * Veena in-kernel prefill: 500 rows 9.62 → 9.37 ms, 1000 rows 21.2 → 20.7 ms.
+* **Workspace memset hoist.** cuBLASLt's captured workspace memset now runs beside the
+  preceding interpreter segment instead of after it. Removes the ~7 µs bubble before each
+  paired GEMM.
+* **Light slices** (`PLOW_SEG_SLICE_ALL=1` in the recipe). Light ops were emitted with n_cu
+  (132) slices for the occ-2 FATLITE grid of 264, so half of the grid idled. GLU went
+  39 → 28 µs.
+* **Row teams + prefill seam fusion** (`PLOW_PF_GFUSE=1` in the recipe, row-team body behind
+  `PLOW_NV_PF_ROW_TEAM`).
+  * Each row is owned by a team of 128 threads. Every operand of the row is loaded in one
+    round trip.
+  * Replaces T17 warp-per-row, which ran 2–3 dependent load batches per pass and parked
+    half the warps.
+  * The final seam stays unfused, because the packed terminal starts at the final RmsNorm.
+  * Reduction order differs from T17: parity 0.992 / KL 7.2e-4 (gate: top-1 >= 0.97, KL < 1e-3).
+    Greedy text changes on one of the three probe prompts (hash 6e26e0ab -> 68b329da);
+    paired projections alone keep all three hashes.
+* Per-segment floor: the interpreter prologue is only the claim, the gate and one fence. The
+  4–6 µs is the cooperative launch plus block ramp of a 264-block, 99 KB-smem kernel. Claim
+  prefetch (a static first claim plus claim-ahead) did not move it, and it regressed the
+  decode tail. Not attempted: PDL across segments. nvjet kernels would need
+  `griddepcontrol.wait` to be safe as dependents.
+
 Whole launch (in-kernel):
 
-| rows | all 42 layers on every row | tail as prefill segments (pf_2) | tail as a decode step |
-|---|---|---|---|
-| 1000 | 21.3 ms (21.3 µs/row) | 17.3 ms | 14.7 ms (14.7 µs/row) |
-| 2000 | 34.7 ms (17.4 µs/row) | 25.2 ms | 22.4 ms (11.2 µs/row) |
+| rows | all 42 layers on every row | tail as prefill segments (pf_2) | tail as a decode step | pf_4 |
+|---|---|---|---|---|
+| 1000 | 21.3 ms (21.3 µs/row) | 17.3 ms | 14.7 ms (14.7 µs/row) | 13.7 ms (13.7 µs/row) |
+| 2000 | 34.7 ms (17.4 µs/row) | 25.2 ms | 22.4 ms (11.2 µs/row) | 20.9 ms (10.5 µs/row) |
 
 **KV-shared tail** (`plow_asset::kv_shared_tail`, `PLOW_PF_SHARED_TAIL`, on by default). The last
 18 layers of E4B write no KV cache, so on the packed/token-batch route only the sampled rows

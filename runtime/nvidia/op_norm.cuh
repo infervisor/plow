@@ -416,11 +416,151 @@ static __device__ void d_add_norm(__nv_bfloat16* __restrict__ out, __nv_bfloat16
  * ALIASES `a` in the caller (in-place residual), so every read of `a` is hoisted into registers
  * before any store to out. Distinct from d_add_norm: there the norm is on the SUM a+b and both
  * resid and normed outputs are written; here the norm is on `b` only and there is one output. */
+/* PREFILL ROW TEAMS: TEAM threads own one row, every operand of the row is loaded in ONE round
+ * trip (TV 16-byte vectors per thread per operand), and the row RMS is a warp_sum32 plus a
+ * TEAM/32-way shared-memory fold. The warp-per-row T17 body walks a row in ceil(feat/1024)
+ * dependent load batches per pass and parks half the warps at ~4 rows per block (1024 rows on
+ * 264 blocks); here every row is one batch. Reduction order differs from T17 in the last ulp.
+ * `resid` may alias `a` (NRN); b/out are distinct. part needs 2 * PLOW_NV_WARPS floats. */
+#ifndef PLOW_NV_PF_ROW_TEAM
+#define PLOW_NV_PF_ROW_TEAM 1
+#endif
+template <int TEAM>
+static __device__ __forceinline__ float team_sum(float v, float* part) {
+    constexpr int TW = TEAM / 32;
+    v = warp_sum32(v);
+    if constexpr (TW == 1) {
+        return v;
+    } else {
+        const unsigned w = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+        if ((threadIdx.x & PLOW_NV_LANE_MASK) == 0) part[w] = v;
+        __syncthreads();
+        const unsigned w0 = w & ~(unsigned)(TW - 1);
+        float t = 0.0f;
+#pragma unroll
+        for (int i = 0; i < TW; i++) t += part[w0 + i];
+        return t;
+    }
+}
+
+/* NRN = 1: resid = (a + RMSNorm(b, gb)) * scale -> resid (bf16), out = RMSNorm(resid, gn).
+ * NRN = 0: out = (a + RMSNorm(b, gb)) * scale (NORM_RESIDUAL; resid/gn unused). */
+template <int TEAM, int TV, bool NRN>
+static __device__ void norm_residual_team(__nv_bfloat16* __restrict__ out, __nv_bfloat16* resid,
+                                          const __nv_bfloat16* a, const __nv_bfloat16* __restrict__ b,
+                                          const __nv_bfloat16* __restrict__ gb,
+                                          const __nv_bfloat16* __restrict__ gn, unsigned rows,
+                                          unsigned feat, float eps, float scale, unsigned slice,
+                                          unsigned nblk, float* part) {
+    constexpr unsigned TEAMS = PLOW_NV_THREADS / TEAM;
+    const unsigned team = threadIdx.x / TEAM, tl = threadIdx.x % TEAM;
+    const unsigned nv = feat >> 3;
+    const float inv_feat = __fdividef(1.0f, (float)feat);
+    for (unsigned k0 = 0; slice + k0 * nblk < rows; k0 += TEAMS) {
+        const unsigned row = slice + (k0 + team) * nblk;
+        const bool live = row < rows;
+        const size_t base = (size_t)(live ? row : 0u) * feat;
+        bf16v8 av[TV], bv[TV], wv[TV];
+#pragma unroll
+        for (int c = 0; c < TV; c++) {
+            const unsigned v = tl + (unsigned)c * TEAM;
+            av[c] = bf16v8_zero();
+            bv[c] = bf16v8_zero();
+            wv[c] = bf16v8_zero();
+            if (live && v < nv) {
+                bv[c] = ld_glob8(b + base + v * 8u);
+                av[c] = ld_glob8(a + base + v * 8u);
+                if (gb) wv[c] = ld_glob8(gb + v * 8u);
+            }
+        }
+        float ss = 0.0f;
+#pragma unroll
+        for (int c = 0; c < TV; c++)
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float f = __bfloat162float(bv[c].x[j]);
+                ss += f * f;
+            }
+        const float invb = rsqrtf(team_sum<TEAM>(ss, part) * inv_feat + eps);
+        float ssr = 0.0f;
+#pragma unroll
+        for (int c = 0; c < TV; c++) {
+            bf16v8 r;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float g = gb ? norm_weight(__bfloat162float(wv[c].x[j])) : 1.0f;
+                r.x[j] = __float2bfloat16(
+                    (__bfloat162float(av[c].x[j]) + gemma_postnorm_round(__bfloat162float(bv[c].x[j]) * invb * g)) *
+                    scale);
+                const float f = __bfloat162float(r.x[j]);
+                ssr += f * f;
+            }
+            av[c] = r;
+        }
+        if constexpr (NRN) {
+#pragma unroll
+            for (int c = 0; c < TV; c++) {
+                const unsigned v = tl + (unsigned)c * TEAM;
+                wv[c] = bf16v8_zero();
+                if (live && v < nv && gn) wv[c] = ld_glob8(gn + v * 8u);
+            }
+            const float invr = rsqrtf(team_sum<TEAM>(ssr, part + PLOW_NV_WARPS) * inv_feat + eps);
+#pragma unroll
+            for (int c = 0; c < TV; c++) {
+                const unsigned v = tl + (unsigned)c * TEAM;
+                if (live && v < nv) {
+                    bf16v8 o;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const float g = gn ? norm_weight(__bfloat162float(wv[c].x[j])) : 1.0f;
+                        o.x[j] = __float2bfloat16(__bfloat162float(av[c].x[j]) * invr * g);
+                    }
+                    st_glob8(resid + base + v * 8u, av[c]);
+                    st_glob8(out + base + v * 8u, o);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int c = 0; c < TV; c++) {
+                const unsigned v = tl + (unsigned)c * TEAM;
+                if (live && v < nv) st_glob8(out + base + v * 8u, av[c]);
+            }
+        }
+        if constexpr (TEAM > 32) __syncthreads(); /* part[] is reused by the next pass */
+    }
+}
+
+/* True when a row team took the op. Prefill objects only; decode keeps its reduction order. */
+template <bool NRN>
+static __device__ __forceinline__ bool norm_residual_teams(
+    __nv_bfloat16* out, __nv_bfloat16* resid, const __nv_bfloat16* a, const __nv_bfloat16* b,
+    const __nv_bfloat16* gb, const __nv_bfloat16* gn, unsigned rows, unsigned feat, float eps,
+    float scale, unsigned slice, unsigned nblk, float* part) {
+#if defined(PLOW_NV_PREFILL) && PLOW_NV_PREFILL && PLOW_NV_PF_ROW_TEAM
+    if (rows < PLOW_NV_T17_MIN_ROWS || (feat & 7u) != 0) return false;
+    const unsigned nv = feat >> 3;
+    /* TV <= 3: the object's 128-register cap spills a 64-thread TV=5 team. */
+    if (nv <= 128u * 3u) {
+        norm_residual_team<128, 3, NRN>(out, resid, a, b, gb, gn, rows, feat, eps, scale, slice, nblk, part);
+    } else if (nv <= 256u * 3u) {
+        norm_residual_team<256, 3, NRN>(out, resid, a, b, gb, gn, rows, feat, eps, scale, slice, nblk, part);
+    } else {
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* a,
                                 const __nv_bfloat16* __restrict__ b,
                                 const __nv_bfloat16* __restrict__ gamma, unsigned rows,
                                 unsigned feat, float eps, float scale, unsigned slice,
                                 unsigned nblk, float* part) {
+    if (norm_residual_teams<false>(out, nullptr, a, b, gamma, nullptr, rows, feat, eps, scale, slice,
+                                   nblk, part))
+        return;
     if (PLOW_NV_T17_MIN_ROWS && rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
         /* T17 warp-per-row — see d_rmsnorm. */
         const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
@@ -566,6 +706,8 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
                                      const __nv_bfloat16* __restrict__ gn, unsigned rows,
                                      unsigned feat, float eps, float scale, unsigned slice,
                                      unsigned nblk, float* part) {
+    if (norm_residual_teams<true>(out, resid, a, b, gb, gn, rows, feat, eps, scale, slice, nblk, part))
+        return;
 #if PLOW_NV_NRN_WPR
     if (PLOW_NV_T17_MIN_ROWS && rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
         const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;

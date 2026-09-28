@@ -354,7 +354,7 @@ unsafe impl Send for GraphExec {}
 unsafe impl Sync for GraphExec {}
 
 /// A loaded-kernel handle (a `CUfunction`, valid for the module's lifetime).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct KernelFn(usize);
 
 /// The freer every owned [`DeviceMem`] carries ([`crate::device::DeviceFree`]).

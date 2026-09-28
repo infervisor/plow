@@ -212,6 +212,31 @@ impl Lt {
         weight: u64,
         template: Option<&Plan>,
     ) -> Result<Arc<Plan>> {
+        self.plan_impl(m, n, k, weight, template, None)
+    }
+
+    /// Two same-shape projections of one input as a strided batch of 2 (input batch stride 0):
+    /// `weight`/`output` are batch 0, `pair` gives batch 1's element offsets.
+    pub(crate) fn pair_plan(
+        self: &Arc<Self>,
+        m: u32,
+        n: u32,
+        k: u32,
+        weight: u64,
+        pair: Pair,
+    ) -> Result<Arc<Plan>> {
+        self.plan_impl(m, n, k, weight, None, Some(pair))
+    }
+
+    fn plan_impl(
+        self: &Arc<Self>,
+        m: u32,
+        n: u32,
+        k: u32,
+        weight: u64,
+        template: Option<&Plan>,
+        pair: Option<Pair>,
+    ) -> Result<Arc<Plan>> {
         if template.is_some_and(|p| {
             !Arc::ptr_eq(self, &p.lt) || p.shape.0 < m || (p.shape.1, p.shape.2) != (n, k)
         }) {
@@ -248,22 +273,48 @@ impl Lt {
                 ),
                 "Lt transpose",
             )?;
-            for (dst, rows, cols, ld) in [
+            let strides = pair.map_or([0; 3], |p| [p.w_stride, 0, p.c_stride]);
+            for ((dst, rows, cols, ld), stride) in [
                 (&mut plan.w, k as u64, n as u64, k as i64),
                 (&mut plan.a, k as u64, m as u64, k as i64),
                 (&mut plan.c, n as u64, m as u64, n as i64),
-            ] {
+            ]
+            .into_iter()
+            .zip(strides)
+            {
                 raw = std::ptr::null_mut();
                 check(
                     (self.api.cublasLtMatrixLayoutCreate)(&mut raw, 14, rows, cols, ld),
                     "Lt layout",
                 )?;
                 *dst = raw as usize;
+                if pair.is_some() {
+                    let batch = 2i32;
+                    // Layout attributes: BATCH_COUNT = 5 (i32), STRIDED_BATCH_OFFSET = 6 (i64).
+                    check(
+                        (self.api.cublasLtMatrixLayoutSetAttribute)(
+                            raw,
+                            5,
+                            &batch as *const _ as *const c_void,
+                            size_of::<i32>(),
+                        ),
+                        "Lt pair batch",
+                    )?;
+                    check(
+                        (self.api.cublasLtMatrixLayoutSetAttribute)(
+                            raw,
+                            6,
+                            &stride as *const i64 as *const c_void,
+                            size_of::<i64>(),
+                        ),
+                        "Lt pair batch stride",
+                    )?;
+                }
             }
             // A rung template pins the widest rung's algorithm; a stored table pins the shape's.
             // Both go through AlgoCheck, so a stale or foreign entry is refused here rather
-            // than at launch.
-            let stored = self.stored.get(&(m, n, k)).copied();
+            // than at launch. The table holds single GEMMs only.
+            let stored = self.stored.get(&(m, n, k)).copied().filter(|_| pair.is_none());
             let pinned = template.map(|t| t.algo).or(stored);
             if let Some(algo) = pinned {
                 plan.algo = algo;
@@ -346,6 +397,7 @@ impl Lt {
                     n,
                     k,
                     weight,
+                    pair,
                 )?;
                 Ok(())
             })();
@@ -765,6 +817,16 @@ impl Drop for Lt {
     }
 }
 
+/// Batch 1 of a [`Lt::pair_plan`]: element offsets from batch 0, and the live input/output
+/// the load-time timing runs on (a strided pair cannot be copied into a scratch ring).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Pair {
+    pub w_stride: i64,
+    pub c_stride: i64,
+    pub input: u64,
+    pub output: u64,
+}
+
 pub(crate) struct Plan {
     lt: Arc<Lt>,
     shape: (u32, u32, u32),
@@ -783,7 +845,11 @@ impl Plan {
         n: u32,
         k: u32,
         weight: u64,
+        pair: Option<Pair>,
     ) -> Result<()> {
+        if let Some(pair) = pair {
+            return self.select_pair(candidates, m, n, k, weight, pair);
+        }
         let be = Arc::clone(&self.lt.be);
         let bytes_w = n as u64 * k as u64 * 2;
         let repeats = ((700 * 1024 * 1024u64).div_ceil(bytes_w)).clamp(2, 16);
@@ -859,6 +925,71 @@ impl Plan {
         );
         self.lt
             .record(m, n, k, &self.algo, candidates[index].workspace, matmul_ms * 1000.0);
+        Ok(())
+    }
+
+    /// Times each candidate on the live operands (warm weights, unlike [`Self::select`]).
+    fn select_pair(
+        &mut self,
+        candidates: &[Heuristic],
+        m: u32,
+        n: u32,
+        k: u32,
+        weight: u64,
+        pair: Pair,
+    ) -> Result<()> {
+        let be = Arc::clone(&self.lt.be);
+        let stream = be.stream_create()?;
+        let start = be.event_create(true)?;
+        let end = be.event_create(true)?;
+        let mut best = f32::INFINITY;
+        let mut selected = None;
+        for (index, candidate) in candidates.iter().enumerate() {
+            if candidate.state != 0 || candidate.workspace > self.lt.workspace.len as usize {
+                continue;
+            }
+            self.algo = candidate.algo;
+            let result = (|| {
+                for _ in 0..4 {
+                    self.run(pair.input, weight, pair.output, &stream)?;
+                }
+                be.event_record(&start, &stream)?;
+                for _ in 0..16 {
+                    self.run(pair.input, weight, pair.output, &stream)?;
+                }
+                be.event_record(&end, &stream)?;
+                be.event_synchronize(&end)?;
+                be.event_elapsed_ms(&start, &end)
+            })();
+            match result {
+                Ok(ms) if ms < best => {
+                    best = ms;
+                    selected = Some(index);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    be.stream_synchronize(&stream)?;
+                    if e.is_fatal() {
+                        return Err(e);
+                    }
+                    tracing::warn!(error = %e, index, "cuBLASLt pair candidate rejected");
+                }
+            }
+        }
+        be.stream_synchronize(&stream)?;
+        let index = selected
+            .ok_or_else(|| RuntimeError::Device("no runnable cuBLASLt pair candidate".into()))?;
+        self.algo = candidates[index].algo;
+        tracing::info!(
+            m,
+            n,
+            k,
+            index,
+            w_stride = pair.w_stride,
+            c_stride = pair.c_stride,
+            matmul_ms = best / 16.0,
+            "cuBLASLt pair algorithm selected"
+        );
         Ok(())
     }
 

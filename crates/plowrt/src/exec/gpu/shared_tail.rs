@@ -103,6 +103,14 @@ impl SharedTail {
             {
                 return Err(reject("boundary does not open a segment"));
             }
+            if bucket
+                .cublaslt_segments
+                .get(seg)
+                .and_then(Option::as_ref)
+                .is_some_and(|r| r.folded())
+            {
+                return Err(reject("boundary splits a paired projection"));
+            }
             if bucket.kernarg.counters != bucket.d_ctr.base
                 || program.n_counter as usize * CTR_STRIDE as usize * 4 > bucket.ctr_bytes
             {

@@ -23,6 +23,11 @@ impl CublasLtDecodeRoute {
     pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
         self.plan.run(self.input, self.weight, self.output, stream)
     }
+
+    /// Executed by the previous segment's paired call.
+    pub(super) fn folded(&self) -> bool {
+        matches!(*self.plan, ProjectionPlan::Folded)
+    }
 }
 
 /// A host library call that replaces one decode segment.
@@ -66,6 +71,7 @@ pub(super) enum ProjectionBackend {
 enum ProjectionPlan {
     Lt(Arc<crate::device::cuda::lt::Plan>),
     Native(native_decode::Plan),
+    Folded,
 }
 
 impl ProjectionPlan {
@@ -73,8 +79,65 @@ impl ProjectionPlan {
         match self {
             Self::Lt(p) => p.run(input, weight, output, stream),
             Self::Native(p) => p.run(input, weight, output, stream),
+            Self::Folded => Ok(()),
         }
     }
+}
+
+/// `[output, input, weight]` of a routed projection, checked aligned and nonaliasing.
+fn operands(segment: &DecodeSegment, insts: &[DevInst64], devp: &[DeviceMem]) -> Result<[u64; 3]> {
+    let d = &insts[segment.instruction];
+    let [output, input, weight] = [
+        devp[d.t[0] as usize].base,
+        devp[d.t[1] as usize].base,
+        devp[d.t[2] as usize].base,
+    ];
+    let end = |base: u64, bytes: u64| {
+        base.checked_add(bytes).ok_or_else(|| {
+            RuntimeError::Rejected("cuBLASLt decode tensor address range overflow".into())
+        })
+    };
+    let output_end = end(output, segment.output_bytes)?;
+    let input_end = end(input, segment.input_bytes)?;
+    let weight_end = end(weight, segment.weight_bytes)?;
+    let overlaps_output = (output < input_end && input < output_end)
+        || (output < weight_end && weight < output_end);
+    if [input, weight, output].iter().any(|p| p % 16 != 0) || overlaps_output {
+        return Err(RuntimeError::Rejected(
+            "cuBLASLt decode requires aligned, nonaliasing tensors".into(),
+        ));
+    }
+    Ok([output, input, weight])
+}
+
+/// Batch 0 `(weight, output)` and the pair strides when segment `b` (adjacent to `a`) is the
+/// same GEMM shape over the same input into a disjoint output.
+fn pair_operands(
+    a: &DecodeSegment,
+    [out_a, in_a, w_a]: [u64; 3],
+    b: &DecodeSegment,
+    [out_b, in_b, w_b]: [u64; 3],
+) -> Option<(u64, u64, crate::device::cuda::lt::Pair)> {
+    if (a.m, a.n, a.k) != (b.m, b.n, b.k) || in_a != in_b || a.output_bytes != b.output_bytes {
+        return None;
+    }
+    let ((w0, o0), (w1, o1)) = if w_a < w_b && out_a < out_b {
+        ((w_a, out_a), (w_b, out_b))
+    } else if w_b < w_a && out_b < out_a {
+        ((w_b, out_b), (w_a, out_a))
+    } else {
+        return None;
+    };
+    if o1 - o0 < a.output_bytes || w1 - w0 < a.weight_bytes {
+        return None;
+    }
+    let pair = crate::device::cuda::lt::Pair {
+        w_stride: i64::try_from((w1 - w0) / 2).ok()?,
+        c_stride: i64::try_from((o1 - o0) / 2).ok()?,
+        input: in_a,
+        output: o0,
+    };
+    Some((w0, o0, pair))
 }
 
 /// `extra` names further `(segment, instruction)` pairs a library route executes.
@@ -164,90 +227,115 @@ pub(super) fn prepare_routes(
     insts: &mut [DevInst64],
     devp: &[DeviceMem],
     templates: Option<&[Option<LibraryRoute>]>,
+    pair: bool,
 ) -> Result<Vec<Option<CublasLtDecodeRoute>>> {
-    let mut routes = Vec::new();
+    let mut routes: Vec<Option<CublasLtDecodeRoute>> = Vec::new();
     if segments.is_empty() {
         return Ok(routes);
     }
+    let pair_lt = match backend {
+        ProjectionBackend::Lt(lt) if pair && templates.is_none() => Some(lt),
+        _ => None,
+    };
     let mut plans = std::collections::HashMap::new();
-    for (index, segment) in segments.into_iter().enumerate() {
-        let route = if let Some(segment) = segment {
-            let d = &mut insts[segment.instruction];
-            let key = (segment.m, segment.n, segment.k);
-            let [output, input, weight] = [
-                devp[d.t[0] as usize].base,
-                devp[d.t[1] as usize].base,
-                devp[d.t[2] as usize].base,
-            ];
-            let end = |base: u64, bytes: u64| {
-                base.checked_add(bytes).ok_or_else(|| {
-                    RuntimeError::Rejected("cuBLASLt decode tensor address range overflow".into())
-                })
-            };
-            let output_end = end(output, segment.output_bytes)?;
-            let input_end = end(input, segment.input_bytes)?;
-            let weight_end = end(weight, segment.weight_bytes)?;
-            let overlaps_output = (output < input_end && input < output_end)
-                || (output < weight_end && weight < output_end);
-            if [input, weight, output].iter().any(|p| p % 16 != 0) || overlaps_output {
-                return Err(RuntimeError::Rejected(
-                    "cuBLASLt decode requires aligned, nonaliasing tensors".into(),
-                ));
-            }
-            let plan = match plans.entry(key) {
-                std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.get()),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let template = templates
-                        .map(|routes| match routes.get(index) {
-                            Some(Some(LibraryRoute::Projection(route))) => Ok(route),
-                            _ => Err(RuntimeError::Rejected(
-                                "cuBLASLt rung template route missing".into(),
-                            )),
-                        })
-                        .transpose()?;
-                    let plan = match backend {
-                        ProjectionBackend::Lt(lt) => {
-                            let template = template
-                                .map(|r| match r.plan.as_ref() {
-                                    ProjectionPlan::Lt(p) => Ok(p.as_ref()),
-                                    _ => Err(RuntimeError::Rejected(
-                                        "decode projection backend changed".into(),
-                                    )),
-                                })
-                                .transpose()?;
-                            ProjectionPlan::Lt(lt.plan(key.0, key.1, key.2, weight, template)?)
-                        }
-                        ProjectionBackend::Native(native) => {
-                            let template = template
-                                .map(|r| match r.plan.as_ref() {
-                                    ProjectionPlan::Native(p) => Ok(p),
-                                    _ => Err(RuntimeError::Rejected(
-                                        "decode projection backend changed".into(),
-                                    )),
-                                })
-                                .transpose()?;
-                            ProjectionPlan::Native(native.plan(key.0, key.1, key.2, template)?)
-                        }
-                    };
-                    Arc::clone(e.insert(Arc::new(plan)))
-                }
-            };
-            d.op = DevOp::Nop as u16;
-            Some(CublasLtDecodeRoute {
-                plan,
-                input,
-                weight,
-                output,
-            })
-        } else {
-            None
+    let mut pair_plans = std::collections::HashMap::new();
+    let mut pairs = 0usize;
+    let mut index = 0;
+    while index < segments.len() {
+        let Some(segment) = segments[index] else {
+            routes.push(None);
+            index += 1;
+            continue;
         };
-        routes.push(route);
+        let key = (segment.m, segment.n, segment.k);
+        let ops = operands(&segment, insts, devp)?;
+        let [output, input, weight] = ops;
+        insts[segment.instruction].op = DevOp::Nop as u16;
+        if let Some(lt) = pair_lt {
+            let next = segments.get(index + 1).copied().flatten();
+            let paired = match next {
+                Some(next) => {
+                    let next_ops = operands(&next, insts, devp)?;
+                    pair_operands(&segment, ops, &next, next_ops).map(|p| (next, p))
+                }
+                None => None,
+            };
+            if let Some((next, (w0, o0, p))) = paired {
+                let plan = match pair_plans.entry((key, p.w_stride, p.c_stride)) {
+                    std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.get()),
+                    std::collections::hash_map::Entry::Vacant(e) => Arc::clone(e.insert(Arc::new(
+                        ProjectionPlan::Lt(lt.pair_plan(key.0, key.1, key.2, w0, p)?),
+                    ))),
+                };
+                insts[next.instruction].op = DevOp::Nop as u16;
+                routes.push(Some(CublasLtDecodeRoute {
+                    plan,
+                    input,
+                    weight: w0,
+                    output: o0,
+                }));
+                routes.push(Some(CublasLtDecodeRoute {
+                    plan: Arc::new(ProjectionPlan::Folded),
+                    input: 0,
+                    weight: 0,
+                    output: 0,
+                }));
+                pairs += 1;
+                index += 2;
+                continue;
+            }
+        }
+        let plan = match plans.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.get()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let template = templates
+                    .map(|routes| match routes.get(index) {
+                        Some(Some(LibraryRoute::Projection(route))) => Ok(route),
+                        _ => Err(RuntimeError::Rejected(
+                            "cuBLASLt rung template route missing".into(),
+                        )),
+                    })
+                    .transpose()?;
+                let plan = match backend {
+                    ProjectionBackend::Lt(lt) => {
+                        let template = template
+                            .map(|r| match r.plan.as_ref() {
+                                ProjectionPlan::Lt(p) => Ok(p.as_ref()),
+                                _ => Err(RuntimeError::Rejected(
+                                    "decode projection backend changed".into(),
+                                )),
+                            })
+                            .transpose()?;
+                        ProjectionPlan::Lt(lt.plan(key.0, key.1, key.2, weight, template)?)
+                    }
+                    ProjectionBackend::Native(native) => {
+                        let template = template
+                            .map(|r| match r.plan.as_ref() {
+                                ProjectionPlan::Native(p) => Ok(p),
+                                _ => Err(RuntimeError::Rejected(
+                                    "decode projection backend changed".into(),
+                                )),
+                            })
+                            .transpose()?;
+                        ProjectionPlan::Native(native.plan(key.0, key.1, key.2, template)?)
+                    }
+                };
+                Arc::clone(e.insert(Arc::new(plan)))
+            }
+        };
+        routes.push(Some(CublasLtDecodeRoute {
+            plan,
+            input,
+            weight,
+            output,
+        }));
+        index += 1;
     }
     tracing::info!(
         segments = routes.len(),
         projections = routes.iter().flatten().count(),
         plans = plans.len(),
+        pairs,
         native = matches!(backend, ProjectionBackend::Native(_)),
         "projection routes prepared"
     );
