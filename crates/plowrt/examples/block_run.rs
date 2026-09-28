@@ -438,19 +438,21 @@ mod cuda {
                                 fence(rank)?;
                                 e.trace_spans_reset()?;
                                 e.step_slots(&feeds, &mut toks)?;
-                                if let (0, Some(sp)) = (rank, e.trace_spans()?) {
+                                if let Some(sp) = e.trace_spans()? {
+                                    // each rank against its own first span: globaltimers are per GPU
                                     let t0 = sp.iter().filter(|s| s.1 > 0).map(|s| s.0).min().unwrap_or(0);
-                                    for (i, (a, b)) in sp.iter().enumerate().filter(|(_, s)| s.1 > 0) {
+                                    let sfx = if rank == 0 { String::new() } else { format!("_r{rank}") };
+                                    for (i, (a, b)) in sp.iter().enumerate().filter(|_| rank == 0).filter(|(_, s)| s.1 > 0) {
                                         println!("span {i:4} start {:8.1} us  end {:8.1} us  dur {:7.1} us", (a - t0) as f64 / 1e3, (b - t0) as f64 / 1e3, (b - a) as f64 / 1e3);
                                     }
                                     if let Some(bk) = e.trace_block_spans()? {
                                         let us: Vec<f32> = bk.iter().map(|&v| if v == 0 { -1.0 } else { (v as f64 - t0 as f64) as f32 / 1e3 }).collect();
-                                        npy::write_f32(&dir.join("block_spans.npy"), &[3, 128, 256], &us).expect("block_spans.npy");
+                                        npy::write_f32(&dir.join(format!("block_spans{sfx}.npy")), &[3, 128, 256], &us).expect("block_spans.npy");
                                     }
                                     if let Some(p) = e.trace_global_u64("g_probe", 4096)? {
                                         let n = p[0] as usize;
                                         let us: Vec<f32> = p[1..1 + 32 * n.min(127)].iter().map(|&v| if v == 0 { -1.0 } else { (v as f64 - t0 as f64) as f32 / 1e3 }).collect();
-                                        npy::write_f32(&dir.join("probe.npy"), &[n.min(127), 32], &us).expect("probe.npy");
+                                        npy::write_f32(&dir.join(format!("probe{sfx}.npy")), &[n.min(127), 32], &us).expect("probe.npy");
                                     }
                                 }
                             }
