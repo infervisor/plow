@@ -424,6 +424,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.prefix_cache", Some("PLOW_PREFIX_CACHE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.idle_dispatch", Some("PLOW_IDLE_DISPATCH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tts_first_lookahead", Some("PLOW_TTS_FIRST_LOOKAHEAD"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1)), OPT_IN),
+    KnobSpec::new("rt.tts_turn_batch", Some("PLOW_TTS_TURN_BATCH"), Layer::Runtime, USIZE, Default::Static(Val::Nat(16)), OPT_IN),
     KnobSpec::new("rt.asr_partial_duty", Some("PLOW_ASR_PARTIAL_DUTY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.5")), OPT_IN),
     KnobSpec::new("rt.session_ttl_ms", Some("PLOW_SESSION_TTL_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(60_000)), OPT_IN),
     KnobSpec::new("rt.session_max", Some("PLOW_SESSION_MAX"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),

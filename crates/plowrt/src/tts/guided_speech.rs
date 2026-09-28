@@ -313,6 +313,8 @@ fn render_loop(vocoder: &Codec, base: Schedule, rx: mpsc::Receiver<S3Msg>, credi
     // waits for a window filling the widest capacity at the full batch (lowest cost per token).
     let full = vocoder.window_capacities.iter().filter(|c| c.0 >= max_batch).map(|c| c.1).max().unwrap_or(0);
     let wide = Schedule { chunk: base.chunk.max(full.saturating_sub(base.context + base.hold)), ..base };
+    let turn_batch = crate::config::RuntimeConfig::get().tts_turn_batch;
+    let launch = if credit.device_turn().is_some() && turn_batch > 0 { turn_batch } else { max_batch };
     let mut live: HashMap<usize, Utterance> = HashMap::new();
     let mut held_since: Option<std::time::Instant> = None;
     let apply = |live: &mut HashMap<usize, Utterance>, m: S3Msg| match m {
@@ -412,7 +414,7 @@ fn render_loop(vocoder: &Codec, base: Schedule, rx: mpsc::Receiver<S3Msg>, credi
             // batch's token capacity and wait for its whole launch.
             due.retain(|k| live[k].first_chunk());
         }
-        due.truncate(max_batch);
+        due.truncate(max_batch.min(launch));
         if due.is_empty() {
             continue;
         }

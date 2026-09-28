@@ -107,9 +107,9 @@ async def tts_turn(s, a, sid, text):
 
 async def call(s, a, idx, clips, rec):
     sid = f"call-{idx}-{uuid.uuid4().hex[:8]}"
-    await asyncio.sleep(random.Random(idx).uniform(0, a.ramp_s))
+    await asyncio.sleep(random.Random(a.seed * 1_000_003 + idx).uniform(0, a.ramp_s))
     history = [{"role": "system", "content": a.system}]
-    rng = random.Random(1000 + idx)
+    rng = random.Random(a.seed * 1_000_003 + 1000 + idx)
     for turn in range(a.turns):
         row = dict(call=idx, turn=turn)
         try:
@@ -173,6 +173,8 @@ def main():
     ap.add_argument("--calls", type=int, default=200)
     ap.add_argument("--turns", type=int, default=3)
     ap.add_argument("--ramp-s", type=float, default=10.0, help="stagger call starts over this window")
+    ap.add_argument("--seed", type=int, default=0, help="clip choice and start offsets; vary per run so "
+                    "repeated runs on one server do not replay the same turns into the prefix cache")
     ap.add_argument("--think-s", type=float, default=1.0)
     ap.add_argument("--chunk-s", type=float, default=1.0)
     ap.add_argument("--asr-model")

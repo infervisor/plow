@@ -108,6 +108,13 @@ pub struct RuntimeConfig {
     #[arg(long = "asr-partial-duty", env = "PLOW_ASR_PARTIAL_DUTY", default_value_t = 0.5, global = true)]
     pub asr_partial_duty: f64,
 
+    /// Under `--co-sched deadline`, most streams one vocoder render launch takes (0 = the packet's
+    /// largest capacity). A launch is one cooperative grid that holds the device to its end (1.4 s
+    /// at 64 streams, 0.45 s at 16), so this bounds how long ASR finals and prompts wait behind
+    /// speech.
+    #[arg(long = "tts-turn-batch", env = "PLOW_TTS_TURN_BATCH", default_value_t = 16, global = true)]
+    pub tts_turn_batch: usize,
+
     /// Streams of a guided speech model render windows (new tokens + left context) on the
     /// vocoder packet's cached-prompt capacities when it has them; off: every chunk re-renders
     /// the stream's whole prefix with the prompt.

@@ -27,7 +27,7 @@ pub(super) const UPLOADS: usize = 256;
 
 struct Encode {
     features: MelFeatures,
-    /// A final's audio: encoded ahead of partials, and on a deadline device turn.
+    /// A final's audio: encoded ahead of partials.
     urgent: bool,
     respond: oneshot::Sender<Result<Vec<f32>>>,
 }
@@ -57,7 +57,16 @@ fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEn
             // One utterance runs its single-utterance capacity: the same bits, a shorter launch.
             if n <= 1 {
                 let job = pending.pop_front().unwrap();
-                let _ = job.respond.send(encoder.encode(&job.features));
+                let started = Instant::now();
+                let rows = encoder.encode(&job.features);
+                tracing::debug!(
+                    frames = job.features.frames,
+                    urgent = job.urgent,
+                    queued = pending.len(),
+                    wall_ms = started.elapsed().as_secs_f64() * 1e3,
+                    "asr: single encoder launch"
+                );
+                let _ = job.respond.send(rows);
                 continue;
             }
             let batch: Vec<Encode> = pending.drain(..n).collect();
@@ -66,6 +75,7 @@ fn encode_loop(rx: std::sync::mpsc::Receiver<Encode>, mut encoder: PacketAudioEn
             let encoded = encoder.encode_packed(&features);
             tracing::debug!(
                 items = n,
+                finals = batch.iter().filter(|job| job.urgent).count(),
                 chunks = features.iter().map(|f| encoder.chunks(f.frames)).sum::<usize>(),
                 gpu_ms = encoder.last_gpu_us() / 1e3,
                 wall_ms = started.elapsed().as_secs_f64() * 1e3,
@@ -176,8 +186,17 @@ impl SharedAsr {
         })
         .await
         .map_err(|e| RuntimeError::Msg(format!("ASR prompt task: {e}")))??;
+        let front = arrived.elapsed();
         cancelled(cancel)?;
+        let frames = features.frames;
         let overlay = self.encode_rows(features, opts.final_pass).await?;
+        tracing::debug!(
+            final_pass = opts.final_pass,
+            frames,
+            frontend_ms = front.as_secs_f64() * 1e3,
+            encode_ms = (arrived.elapsed() - front).as_secs_f64() * 1e3,
+            "asr: front + encode"
+        );
         cancelled(cancel)?;
         let (result, _) =
             self.decode(mux, ids, audio_positions, overlay, Vec::new(), language, cancel, opts, answer, arrived).await?;

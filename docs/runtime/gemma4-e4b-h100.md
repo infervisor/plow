@@ -446,6 +446,50 @@ in bold:
 * What remains through 50 calls is TTS first audio (p95 ~1.0 s against 0.8 s) and the final's
   encode tail (frontend + encoder queue, server-side p95 553 ms at 50 calls).
 
+**Render launches bound the final's tail (sched_9).** Traced finals (debug logs `asr: front +
+encode`, `asr: single|packed encoder launch` with gpu_ms/wall_ms, `vocoder render`):
+
+* The frontend costs 1.2 / 2.8 ms (p50 / p95), and host copies ~1 ms per launch. Neither is the
+  tail.
+* An encoder launch is ~10 ms of work, yet its event-timed GPU span reaches 240-380 ms p95. The
+  encoder is a cooperative grid, so it waits until the device is free.
+* The render is what it waits behind. A vocoder launch is one cooperative grid: 1 stream takes
+  140 ms, 16 take 440 ms, and 64 take 1.35-1.43 s. While it runs, the render also holds the
+  device turn, so the final's prefill and decode ticks wait too (submit -> first token p95
+  500 ms at 100 calls).
+* `--tts-turn-batch` / `PLOW_TTS_TURN_BATCH` (default 16, only under `--co-sched deadline`, 0 =
+  the packet's largest capacity) caps the streams in one render launch. A launch then holds the
+  device for at most ~460 ms.
+* Rejected: the encoder on the device turn at `Urgency::Final`. Final p95 went 444 -> 616 ms at
+  50 calls and 1134 -> 1575 ms at 100, because the encoder waits out whole ticks and renders.
+* Rejected: the encoder on a greatest-priority CUDA stream. A pending grid cannot preempt a
+  running one, so there was no gain (1088 ms at 100 calls). At 30-50 calls p50 went up 20-40 ms.
+* Rejected: a cap of 8 (at 5eea79c4+). ASR final p95 at 100 calls improves to 690 ms, but TTS
+  first audio p95 gets worse than with a cap of 16 (3.1 vs 2.5 s).
+
+call_sim at 827ab0b3, `--co-sched deadline`, seed = call count, two interleaved runs each. Cells
+are p50/p95 ms (ASR final, LLM TTFT, TTS TTFA) and underrun turns:
+
+| calls | cap | ASR final | LLM TTFT | TTS TTFA | underrun |
+|---|---|---|---|---|---|
+| 30 | 0 (HEAD) | 162/348, 168/428 | 100/286, 51/248 | 358/1036, 361/930 | 0, 0 |
+| 30 | 16 | 202/446, 162/455 | 70/283, 91/228 | 419/1000, 431/976 | 1, 0 |
+| 50 | 0 (HEAD) | 224/586, 209/490 | 93/337, 69/274 | 664/3207, 488/944 | 5, 0 |
+| 50 | 16 | 193/506, 234/484 | 62/380, 92/338 | 549/1031, 452/933 | 11, 0 |
+| 100 | 0 (HEAD) | 277/911, 221/940 | 199/4157, 129/707 | 2501/4900, 1680/2852 | 193, 181 |
+| 100 | 16 | 245/**644**, 223/**635** | 128/824, 121/685 | 1244/2222, 1211/3017 | 225, 197 |
+
+* At 100 calls the render launch p95 drops from 444 ms to 274 ms (max 1432 -> 463 ms), and the
+  final's encode p95 from 388 to 182 ms. ASR final p95 meets the 800 ms target. TTS first audio
+  p50 drops by 0.5-1.3 s.
+* At 100 calls underruns rise by 12-32 turns. A launch of 16 costs more per stream than one of
+  64, and TTS is already over capacity there.
+* At 30-50 calls the cap rarely binds, and the cells sit inside the run-to-run spread. Four
+  runs of the same binary at 5eea79c4+ put the 50-call ASR final p95 at 444-711 ms.
+* The ≤500 ms p95 at 50 calls is borderline: 506 and 484 ms. What remains there is the
+  prefill and decode waits behind renders and E4B ticks (submit -> first token p95 ~280 ms).
+  It needs shorter render grids, a render that yields between flow steps, or both.
+
 **Capacity, not order, is the limit.**
 
 * A call_sim turn is ~14 s: ~7 s of user speech, ~1 s for the ASR final and the LLM, 5.1 s of
