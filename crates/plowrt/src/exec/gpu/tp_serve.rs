@@ -2,9 +2,9 @@
 //! follower threads and replay every state-changing call it makes, in order.
 //!
 //! Every launch meets its peers in the collectives, so all ranks enter it with zeroed cross-GPU
-//! counters: barrier, rank 0 zeroes every rank's xctr, barrier, launch (as `block_run tp-check`).
-//! A launching call therefore always passes both barriers on every rank, even one that is about to
-//! fail, or the others would wait for it forever.
+//! counters: each rank zeroes its own xctr once its last launch drained, barrier, launch (as
+//! `block_run tp-check`). A launching call therefore always passes the barrier on every rank, even
+//! one that is about to fail, or the others would wait for it forever.
 
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -32,7 +32,7 @@ struct Follower {
 }
 
 pub(super) struct TpLead {
-    group: TpGroup,
+    group: Arc<TpGroup>,
     barrier: Arc<Barrier>,
     followers: Vec<Follower>,
 }
@@ -46,10 +46,7 @@ impl TpLead {
     }
 
     fn fence(&self) -> Result<()> {
-        self.barrier.wait();
-        let zeroed = self.group.zero_xctr();
-        self.barrier.wait();
-        zeroed
+        fence(&self.group, 0, &self.barrier)
     }
 
     fn collect(&self) -> Result<()> {
@@ -91,7 +88,20 @@ impl Drop for TpLead {
     }
 }
 
-fn follow(mut e: GpuEngine, rx: Receiver<Cmd>, done: Sender<Result<()>>, barrier: Arc<Barrier>) {
+fn fence(group: &TpGroup, rank: usize, barrier: &Barrier) -> Result<()> {
+    let zeroed = group.zero_rank_xctr(rank);
+    barrier.wait();
+    zeroed
+}
+
+fn follow(
+    mut e: GpuEngine,
+    rank: usize,
+    rx: Receiver<Cmd>,
+    done: Sender<Result<()>>,
+    group: Arc<TpGroup>,
+    barrier: Arc<Barrier>,
+) {
     // A failed non-launching call (begin) is reported at the next launch.
     let mut latched: Result<()> = Ok(());
     let mut toks = Vec::new();
@@ -104,15 +114,16 @@ fn follow(mut e: GpuEngine, rx: Receiver<Cmd>, done: Sender<Result<()>>, barrier
             }
             Cmd::Retire(b, cache) => e.retire_slot(b, cache),
             Cmd::Prefill(b, prompt, cap) => {
-                barrier.wait();
-                barrier.wait();
-                let r = std::mem::replace(&mut latched, Ok(())).and_then(|()| e.prefill_chunk(b, &prompt, cap).map(|_| ()));
+                let fenced = fence(&group, rank, &barrier);
+                let r = std::mem::replace(&mut latched, Ok(()))
+                    .and(fenced)
+                    .and_then(|()| e.prefill_chunk(b, &prompt, cap).map(|_| ()));
                 let _ = done.send(r);
             }
             Cmd::Step(feeds) => {
-                barrier.wait();
-                barrier.wait();
+                let fenced = fence(&group, rank, &barrier);
                 let r = std::mem::replace(&mut latched, Ok(()))
+                    .and(fenced)
                     .and_then(|()| e.step_slots_sampled(&feeds, None, &mut toks));
                 let _ = done.send(r);
             }
@@ -190,16 +201,17 @@ impl GpuEngine {
                 .collect::<Result<Vec<_>>>()
         })?;
         let barrier = Arc::new(Barrier::new(engines.len()));
+        let group = Arc::new(group);
         let followers = engines
             .drain(1..)
             .enumerate()
             .map(|(i, e)| {
                 let (tx, rx) = channel();
                 let (dtx, done) = channel();
-                let barrier = Arc::clone(&barrier);
+                let (group, barrier) = (Arc::clone(&group), Arc::clone(&barrier));
                 let thread = std::thread::Builder::new()
                     .name(format!("plow-tp-rank{}", i + 1))
-                    .spawn(move || follow(e, rx, dtx, barrier))
+                    .spawn(move || follow(e, i + 1, rx, dtx, group, barrier))
                     .map_err(|e| RuntimeError::Device(format!("tp follower thread: {e}")))?;
                 Ok(Follower { tx: Some(tx), done, thread: Some(thread) })
             })
