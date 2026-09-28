@@ -280,6 +280,9 @@ floor and full hd512 ~1.7x.
 | `PLOW_FUSE_KV_HNR=1` | 604 -> 580 decode insts; step within noise | not adopted |
 | `gemv_k8` for hd <= 512 (K-split tensor-core GEMV, 1..32 rows; manifest gate: E-series packets, i.e. `GluStrided` present) | B=1/2/8/16/32 6.93/6.82/7.40/8.50/10.22 -> 6.22/6.25/6.83/7.96/9.65 ms (B=1 via `PLOW_NV_GEMV_K8_MIN=1`) | in |
 | `PLOW_NV_FA_RG_WIDE` (hd256/512 flash decode on the row-group body: a warp per row, K and V of 4 rows in flight; E-series gate) | B=1/8/32/64/128 6.22/6.83/9.61/12.63/17.75 -> 6.15/6.63/9.05/11.98/16.42 ms; B=64 sliding 52 -> 40 us/layer, full 153 -> 110 | in |
+| `PLOW_NV_GEMV_K8_UNB1=2` (two k32 steps in flight on the gemv_k8 one-tile arm, M <= 8) | B=1/4/8 6.14/6.30/6.62 -> 5.82/6.02/6.36 ms; UNB1 3 and 6 lose 0.2-0.3 ms | in |
+| `PLOW_NV_GEMV_K8_MAX_GW=64` (gemv_k8 8-tile arm for 33..64 rows in the `_gw` object) | B=48/64 11.66/11.98 -> 10.99/11.79 ms; B=32/128 unchanged | in |
+| RG flash with the next rows' K/V prefetched in registers | stack 272 -> 3744 B (the entry is at the 255-register cap), 2x slower | rejected |
 | `gemv_k8` + 64 KiB L2 prefetch | B=1 +0.25 ms, B>=64 +0.2 ms | rejected |
 | wide GEMV `_gw` (B >= 48) | already selected by the manifest (`gemv_wide`); B=48 -> 64 costs +0.4 ms only | unchanged |
 

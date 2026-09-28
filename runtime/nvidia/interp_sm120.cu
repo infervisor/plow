@@ -257,13 +257,24 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #if PLOW_NV_GEMV_K8
 /* Widest activation rung the K-split walk takes: the decode object holds rungs <= 4 (1-tile arm
  * only), the _gw object 8..32. */
+#ifndef PLOW_NV_GEMV_K8_MAX_GW
+#define PLOW_NV_GEMV_K8_MAX_GW 32
+#endif
 #ifndef PLOW_NV_GEMV_K8_MAX
-#define PLOW_NV_GEMV_K8_MAX (PLOW_NV_GW_OBJECT ? 32 : 8)
+#define PLOW_NV_GEMV_K8_MAX (PLOW_NV_GW_OBJECT ? PLOW_NV_GEMV_K8_MAX_GW : 8)
 #endif
 #ifndef PLOW_NV_GEMV_K8_MIN
 #define PLOW_NV_GEMV_K8_MIN 2
 #endif
-#if PLOW_NV_GEMV_K8_MAX > 8
+#if PLOW_NV_GEMV_K8_MAX > 32
+#define PLOW_NV_K8_CALL(NW, MATS, X, ACT)                                                        \
+    do {                                                                                       \
+        if (in->i[0] <= 8) d_gemv_k8<NW, 1>(MATS, X, in->i[0], in->i[2], ACT, slice, nblk, arena); \
+        else if (in->i[0] <= 16) d_gemv_k8<NW, 2>(MATS, X, in->i[0], in->i[2], ACT, slice, nblk, arena); \
+        else if (in->i[0] <= 32) d_gemv_k8<NW, 4>(MATS, X, in->i[0], in->i[2], ACT, slice, nblk, arena); \
+        else d_gemv_k8<NW, 8>(MATS, X, in->i[0], in->i[2], ACT, slice, nblk, arena);          \
+    } while (0)
+#elif PLOW_NV_GEMV_K8_MAX > 8
 #define PLOW_NV_K8_CALL(NW, MATS, X, ACT)                                                        \
     do {                                                                                       \
         if (in->i[0] <= 8) d_gemv_k8<NW, 1>(MATS, X, in->i[0], in->i[2], ACT, slice, nblk, arena); \

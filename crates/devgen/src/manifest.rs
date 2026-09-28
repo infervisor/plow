@@ -1092,8 +1092,14 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         {
             t.insert("gemv_k8".into(), json!(1));
             // E4B B=1 takes the walk too (M=1 is in its contract): 6.93 -> 6.22 ms.
+            // `gemv_k8_unb1`: two k32 steps in flight on the one-tile (M <= 8) arm instead of
+            // 12 / (1|2): E4B B=1/4/8 6.14/6.30/6.62 -> 5.82/6.02/6.36 ms (3 and 6: +0.2-0.3).
+            // `gemv_k8_max_gw`: the _gw object's walk takes M <= 64 (8 tiles) instead of the
+            // two-pass mma walk: B=48/64 11.66/11.98 -> 10.99/11.79 ms, B=32/128 unchanged.
             if k8_ple && !k8_small_hd {
                 t.insert("gemv_k8_min".into(), json!(1));
+                t.insert("gemv_k8_unb1".into(), json!(2));
+                t.insert("gemv_k8_max_gw".into(), json!(64));
             }
         }
         // * `fa_rg_wide`: hd256/512 flash decode on the row-group body (a warp per row, K and V
@@ -2916,6 +2922,16 @@ pub fn config_header(manifest: &Value) -> String {
             if let Some(v) = t.get("gemv_k8_min").and_then(Value::as_u64) {
                 out.push_str(&format!(
                     "#ifndef PLOW_NV_GEMV_K8_MIN\n#define PLOW_NV_GEMV_K8_MIN {v}\n#endif\n"
+                ));
+            }
+            if let Some(v) = t.get("gemv_k8_unb1").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_GEMV_K8_UNB1\n#define PLOW_NV_GEMV_K8_UNB1 {v}\n#endif\n"
+                ));
+            }
+            if let Some(v) = t.get("gemv_k8_max_gw").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_GEMV_K8_MAX_GW\n#define PLOW_NV_GEMV_K8_MAX_GW {v}\n#endif\n"
                 ));
             }
             if let Some(v) = t.get("gemv_l2pf").and_then(Value::as_u64) {

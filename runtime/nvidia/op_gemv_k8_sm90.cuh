@@ -22,6 +22,10 @@
 #ifndef PLOW_NV_GEMV_K8_UNB
 #define PLOW_NV_GEMV_K8_UNB 12
 #endif
+/* The same budget for the one-tile (M <= 8) arm. */
+#ifndef PLOW_NV_GEMV_K8_UNB1
+#define PLOW_NV_GEMV_K8_UNB1 PLOW_NV_GEMV_K8_UNB
+#endif
 
 #if PLOW_NV_GEMV_K8
 /* Up to three weight matrices stacked on the N axis (q|k|v); a row resolves its own matrix. */
@@ -65,7 +69,8 @@ template <int NW, int MT>
 __device__ PLOW_NV_K8_ATTR void d_gemv_k8(const K8Mats& m, const __nv_bfloat16* __restrict__ x,
                                           unsigned M, unsigned K, unsigned act, unsigned slice,
                                           unsigned nblk, float* red) {
-    constexpr unsigned UNB = PLOW_NV_GEMV_K8_UNB / (NW * MT) > 2u ? PLOW_NV_GEMV_K8_UNB / (NW * MT) : 2u;
+    constexpr unsigned BUDGET = MT == 1 ? PLOW_NV_GEMV_K8_UNB1 : PLOW_NV_GEMV_K8_UNB;
+    constexpr unsigned UNB = BUDGET / (NW * MT) > 2u ? BUDGET / (NW * MT) : 2u;
     constexpr unsigned CE = 128u * MT; /* reduction floats per (row block, split) */
     const unsigned N = NW == 1 ? m.n[0] + m.n[1] + m.n[2] : m.n[0];
     const unsigned S = k8_split(N, K, nblk);
