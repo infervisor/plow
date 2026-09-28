@@ -4411,6 +4411,7 @@ impl GpuEngine {
             &devp,
             |bytes| be.alloc(0, bytes.max(1)),
             |mem, off, src| be.upload(mem, off, src),
+            |base, dims, strides, boxd| be.encode_tmap_u8_3d(base, dims, strides, boxd),
             tp.map_or(0, |t| t.rank),
             tp.map_or(1, |t| t.n_gpu),
         )?;
