@@ -62,6 +62,9 @@ typedef void (*golden_fn)(const PlowDevInst*, uint32_t, uint32_t, void* const*, 
 
 __global__ void __launch_bounds__(256, 1) k_speech(PlowDevInst in, void* const* T) {
     extern __shared__ float arena[];
+#if defined(PLOW_NV_HOPPER)
+    if (sp_wg_conv1d(&in, T, blockIdx.x, gridDim.x)) return;
+#endif
     d_speech_f32(&in, T, blockIdx.x, gridDim.x, arena);
 }
 
@@ -582,6 +585,7 @@ struct ConvSpec {
     bool row_scale = false; /* t7 (Conv1d) */
     bool wide = false; /* flags bit 14: split-bf16 wide tiles */
     bool tapmajor = false; /* flags bit 15: weights [cout][kernel][cin/groups] */
+    bool wg = false; /* flags bit 17: the wgmma arm of the pointwise wide tile (sm_90a) */
 };
 
 static unsigned conv_out_rows(const ConvSpec& s, bool transpose) {
@@ -625,7 +629,7 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     c.in.i[4] = s.kernel; c.in.i[5] = s.stride; c.in.i[6] = s.dil_or_opad; c.in.i[7] = s.groups;
     c.in.fj[0].f = s.slope; c.in.fj[1].u = pads(s.before, s.after);
     c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u) | (s.wide ? 1u << 14 : 0u) |
-                   (s.tapmajor ? 1u << 15 : 0u);
+                   (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u);
 }
 
 static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
@@ -1065,6 +1069,41 @@ int main(int argc, char** argv) {
     CK(cudaFuncSetAttribute(k_speech, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kSmem));
     printf("speech_f32_op_test on %s (%d SMs), nblk=%d, arena=%zu B\n", prop.name, g_nblk, g_nblk, kSmem);
 
+    if (argc > 1 && !strcmp(argv[1], "--bench-cfm")) {
+        /* The S3Gen CFM estimator's GEMMs at csynth.b32.t64 (64 CFG items x 136 rows). */
+        struct G { const char* name; unsigned rows, cin, cout, k, post; bool res, len; };
+        const G gs[] = {
+            {"qkv 256->1536", 8704, 256, 1536, 1, 0, false, false},
+            {"ff1 256->1024 gelu", 8704, 256, 1024, 1, 11, false, false},
+            {"ff2 1024->256 +res", 8704, 1024, 256, 1, 0, true, false},
+            {"out 512->256 +res", 8704, 512, 256, 1, 0, true, false},
+            {"res 320->256 +res len", 136, 320, 256, 1, 0, true, true},
+            {"c1 k3 320->256 len", 136, 320, 256, 3, 0, false, true},
+        };
+        for (const G& g : gs)
+            for (bool wg : {false, true}) {
+                const unsigned batch = g.len ? 64 : 1;
+                ConvSpec s{batch, g.rows, g.cin, g.cout, g.k, 1, 1, 1, g.k - 1u, 0, 0, 0, g.post, false, true, false, g.res,
+                           g.len ? std::vector<uint32_t>(batch, g.rows) : std::vector<uint32_t>{}, 0.f, true};
+                s.wide = true;
+                s.tapmajor = g.k > 1;
+                s.wg = wg;
+                Case c; unsigned o; build_conv(c, s, false, o);
+                char name[96];
+                snprintf(name, sizeof(name), "CFM %s%s", g.name, wg ? " wgmma" : " mma.sync");
+                bench(name, c, 2.0 * batch * g.rows * g.cin * g.cout * g.k, 0);
+            }
+        {
+            Case c; const unsigned rows = 8704, feat = 256;
+            unsigned o = c.out((size_t)rows * feat), x = c.f32((size_t)rows * feat, 2.f, 0.5f);
+            unsigned g = c.f32(feat, 0.5f, 1.f), b = c.f32(feat, 0.2f);
+            c.in.op = PLOW_DOP_LAYERNORM_F32;
+            c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = g; c.in.t[3] = b;
+            c.in.i[0] = rows; c.in.i[1] = feat; c.in.i[2] = 0; c.in.fj[0].f = 1e-5f;
+            bench("CFM LayerNormF32 8704x256", c, 0, 8.0 * rows * feat);
+        }
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "--bench-codec")) {
         for (bool tc : {false, true}) {
             ConvSpec s{32, 16384, 64, 64, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true,
@@ -1268,6 +1307,31 @@ int main(int argc, char** argv) {
         ConvSpec w6{4, 8192, 64, 64, 7, 1, 3, 1, 9, 9, 0, 0, 12, false, true, true, false, {8192, 5000, 1, 8192}, 0.f, true};
         w6.wide = w6.tapmajor = true;
         t_conv1d("Conv1dF32 wide k7 d3 snake-out tap-major len", w6, 1e-4);
+#if defined(PLOW_NV_HOPPER)
+        ConvSpec g1 = w1;
+        g1.wg = true;
+        t_conv1d("Conv1dF32 wide wgmma pointwise gelu +res len", g1, 1e-4);
+        ConvSpec g2{1, 1000, 256, 392, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true};
+        g2.wide = g2.wg = true;
+        t_conv1d("Conv1dF32 wide wgmma pointwise 256->392 ragged", g2, 1e-4);
+        ConvSpec g3{3, 150, 320, 256, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true, {150, 77, 3}, 0.f, true};
+        g3.wide = g3.wg = true;
+        t_conv1d("Conv1dF32 wide wgmma pointwise +res len 3 items", g3, 1e-4);
+        for (ConvSpec* w : {&w2, &w3, &w4, &w6}) {
+            ConvSpec g = *w;
+            g.wg = true;
+            char name[96];
+            snprintf(name, sizeof(name), "Conv1dF32 wide wgmma k%u d%u pre%u post%u", g.kernel, g.dil_or_opad, g.pre, g.post);
+            t_conv1d(name, g, 1e-4);
+        }
+        ConvSpec g5{3, 700, 128, 192, 3, 1, 5, 1, 5, 5, 0, 9, 12, false, true, true, true, {700, 333, 64}, 0.1f, true};
+        g5.wide = g5.tapmajor = g5.wg = true;
+        t_conv1d("Conv1dF32 wide wgmma k3 d5 leaky->snake +res len", g5, 1e-4);
+        ConvSpec g6{64, 136, 320, 256, 3, 1, 1, 1, 2, 0, 0, 0, 0, false, true, false, false, std::vector<uint32_t>(64, 136), 0.f, true};
+        for (unsigned i = 0; i < 64; i += 3) g6.lengths[i] = 40 + i;
+        g6.wide = g6.tapmajor = g6.wg = true;
+        t_conv1d("Conv1dF32 wide wgmma k3 causal 320->256 len (CFM c1)", g6, 1e-4);
+#endif
         ConvSpec w7{2, 300, 64, 64, 7, 1, 3, 1, 9, 9, 0, 0, 12, false, true, true, true, {300, 170}, 0.f, true};
         t_conv1d("Conv1dF32 k7 snake-out +res (64x64 tiles)", w7);
         ConvSpec w5{2, 1000, 64, 1, 7, 1, 1, 1, 3, 3, 0, 9, 1, false, true, false, false, {1000, 500}, 0.01f, true};

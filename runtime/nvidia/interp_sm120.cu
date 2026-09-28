@@ -1959,6 +1959,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_RAND_F32:
     case PLOW_DOP_ATTENTION_F32:
     case PLOW_DOP_ROW_STATS_F32:
+#if defined(PLOW_NV_HOPPER)
+        if (sp_wg_conv1d(in, T, slice, nblk)) break;
+#endif
         d_speech_f32(in, T, slice, nblk, arena);
         break;
 #endif

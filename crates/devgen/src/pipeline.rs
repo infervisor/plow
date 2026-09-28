@@ -443,6 +443,10 @@ pub struct Conv1dF32Stage<'a> {
     /// stride)][cin/groups]` (zero past the kernel) instead of `[cin][cout/groups][kernel]`. Either
     /// way a GEMM column run (tap, channels) is contiguous.
     pub weight_tap_major: bool,
+    /// Flag bit 17: on sm_90a a split-bf16 conv (pointwise, or tap-major with 64-channel groups)
+    /// runs the same product on warpgroup MMA; the interpreter falls back to the wide tile
+    /// elsewhere.
+    pub wgmma: bool,
 }
 
 impl Conv1dF32Stage<'_> {
@@ -1270,7 +1274,8 @@ impl StageProgram {
             | (u32::from(stage.weight_f16) << 12)
             | (1 << 13)
             | (u32::from(stage.split_bf16) << 14)
-            | (u32::from(stage.weight_tap_major) << 15);
+            | (u32::from(stage.weight_tap_major) << 15)
+            | (u32::from(stage.wgmma && stage.split_bf16) << 17);
         let op = if transpose { DevOp::ConvTranspose1dF32 } else { DevOp::Conv1dF32 };
         let units = conv1d_units(&stage, transpose, out_rows, self.builder.n_cu());
         self.emit(op, units, deps, output, |d| {
@@ -2063,6 +2068,7 @@ mod tests {
             weight_f16: false,
             split_bf16: false,
             weight_tap_major: false,
+            wgmma: false,
         };
         let mut p = prefix.program();
         let a = p.conv1d_f32(x, false, &[], conv("h", "w1", 7, 3, 9, Activation::Snake, None)).unwrap();

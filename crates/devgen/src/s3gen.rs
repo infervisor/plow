@@ -462,6 +462,7 @@ impl<'s> Ops<'s> {
                 weight_f16: false,
                 split_bf16: !c.transpose,
                 weight_tap_major: tap_major,
+                wgmma: true,
             })
         })
     }
@@ -1489,6 +1490,8 @@ fn pipeline_section(
         // per item beyond its window.
         ("render.launch_frames".into(), 370),
         ("render.item_frames".into(), u64::from(PROMPT_TAIL_ROWS / 2)),
+        // Yield points for a co-scheduler (`Codec::set_yield`): one CFM step per segment.
+        ("render.yield_programs".into(), u64::from(CFM_PARTS)),
         ("vocoder.harmonics".into(), u64::from(cfg.harmonics)),
     ]);
     let strings = BTreeMap::from([("voices".into(), cfg.voices.join("\n"))]);

@@ -4,6 +4,8 @@
 //! instruction i is us(cap = i + 1) - us(cap = i). With `--each` and ROLE a prefix, every program
 //! of the role sequence `ROLE.<n>` is timed alone (JSON lines `{"role":..,"program":..,"us":..}`);
 //! with `--seq` the whole sequence is timed as one CUDA graph.
+//! `PB_PRE=ROLE,..` runs those programs once first (e.g. the encoder, so a CFM program sees real
+//! key lengths instead of zeroed inputs).
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -50,6 +52,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let program = pipeline.program(pos[2])?;
+    if let Ok(pre) = std::env::var("PB_PRE") {
+        for role in pre.split(',') {
+            rt.run(pipeline.program(role)?)?;
+        }
+    }
     let mut time = |rt: &mut CudaPacketRuntime| -> Result<f64, Box<dyn std::error::Error>> {
         for _ in 0..3 {
             rt.run(program)?;

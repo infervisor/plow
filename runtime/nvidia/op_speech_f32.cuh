@@ -12,6 +12,9 @@
 #include "dev_isa.h"
 #include "sm120_common.cuh"
 #include <cuda_fp16.h>
+#if defined(PLOW_NV_HOPPER)
+#include "sm90_wgmma.cuh"
+#endif
 
 static_assert(PLOW_NV_THREADS == 256, "speech tiles assume 256 threads");
 
@@ -1579,12 +1582,12 @@ static_assert(PLOW_NV_WARPS * SPL_COLS <= SP_ARENA_FLOATS, "layernorm row stage"
 /* LayerNormF32 (double statistics) over rows of 128..512 columns: each lane holds its float4s of
  * R rows in registers, so a row is read once and R rows' loads are in flight together (one row
  * per warp is latency-bound). */
+template <unsigned R, unsigned V>
 static __device__ __noinline__ void sp_layernorm_rows(float* __restrict__ out, const float* __restrict__ x,
                                                       const float* __restrict__ gamma, const float* __restrict__ beta,
                                                       unsigned rows, unsigned feat, unsigned flags, float eps,
                                                       unsigned slice, unsigned nblk, float* stats) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
-    constexpr unsigned R = 2, V = 4;
     const unsigned nv = feat / 128u;
     for (unsigned row0 = (slice * PLOW_NV_WARPS + warp) * R; row0 < rows; row0 += nblk * PLOW_NV_WARPS * R) {
         float4 v[R][V];
@@ -1760,7 +1763,9 @@ static __device__ __noinline__ void d_layernorm_f32(float* __restrict__ out, con
     }
     if (feat % 128u == 0 && feat <= 512u && sp_aligned(x, 16) && (!out || sp_aligned(out, 16)) &&
         (!gamma || sp_aligned(gamma, 16)) && (!beta || sp_aligned(beta, 16))) {
-        sp_layernorm_rows(out, x, gamma, beta, rows, feat, flags, eps, slice, nblk, stats);
+        /* Rows per warp in flight (a row's reduction chain is latency-bound), within registers. */
+        if (feat <= 256u) sp_layernorm_rows<8, 2>(out, x, gamma, beta, rows, feat, flags, eps, slice, nblk, stats);
+        else sp_layernorm_rows<2, 4>(out, x, gamma, beta, rows, feat, flags, eps, slice, nblk, stats);
         return;
     }
     for (unsigned row = slice * PLOW_NV_WARPS + warp; row < rows; row += nblk * PLOW_NV_WARPS) {
@@ -2983,6 +2988,268 @@ static __device__ __forceinline__ void sp_conv1d_wide_run(const SpConvArgs& a, u
     const SpConvEpi1 ep{a, 0u, a.out_rows, 0u, 0u, false, v4};
     sp_w_gemm<BN>(M, a.cout, K, la, lb, ep, slice, nblk, sp_smem);
 }
+#if defined(PLOW_NV_HOPPER)
+/* The pointwise wide tile on Hopper's warpgroup MMA: the same split-bf16 3-pass product
+ * (lo*hi + hi*lo + hi*hi, f32 accumulate) on 128x128 tiles, operands split into 128-byte-swizzled
+ * bf16 rows (BK = 64) that wgmma reads from shared memory while the next k-tile's f32 loads are in
+ * flight; each warpgroup owns 64 rows (m64n128k16). The epilogue stages the finished tile in
+ * shared memory and writes its rows with bulk copies, which drain while the next tile loads. */
+#define SPWG_BK 64u
+#define SPWG_OP (128u * SPWG_BK * 2u)    /* one operand half (hi or lo): 128 rows x 128 B */
+static_assert(4u * SPWG_OP + 1024u <= SP_ARENA_FLOATS * 4u, "wgmma operand stage");
+static_assert(128u * 136u * 4u + 1024u <= SP_ARENA_FLOATS * 4u, "wgmma output stage (rows of 128 + 8 floats)");
+__device__ __forceinline__ void spwg_split_store(char* hi_base, unsigned half, unsigned r, unsigned c4, float4 v) {
+    /* c4: first of 4 consecutive k (multiple of 4); 16-byte chunk c4 / 8, half (c4 / 4) & 1. */
+    const unsigned off = (unsigned)sm90_swz_off<SPWG_BK, 8>((int)r, (int)(c4 >> 3)) + (c4 & 4u);
+    __nv_bfloat16* hi = (__nv_bfloat16*)hi_base + off;
+    sp_split4(hi, hi + half / 2u, v);
+}
+__device__ __forceinline__ void spwg_bulk_store(float* g, const float* s, unsigned bytes) {
+    asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;\n" ::"l"(g),
+                 "r"((unsigned)__cvta_generic_to_shared(s)), "r"(bytes)
+                 : "memory");
+}
+/* m64n64k16 .f32.bf16.bf16, both operands from shared memory (sm90_wgmma.cuh's m64n128k16 at
+ * half width), 32 f32 accumulators per thread. */
+__device__ __forceinline__ void spwg_m64n64k16(float* d, uint64_t da, uint64_t db, int scale_d) {
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "setp.ne.b32 p, %34, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,"
+        "%24,%25,%26,%27,%28,%29,%30,%31}, %32, %33, p, 1, 1, 0, 0;\n"
+        "}\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
+          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+        : "l"(da), "l"(db), "r"(scale_d));
+}
+/* Output activations inlined (a call anywhere in the function serializes the wgmma pipeline,
+ * ptxas C7510): none, tanh, SiLU, ELU, leaky ReLU, Mish, GELU, snake. The common ones get their
+ * own instantiation (P: 0 none, 1 GELU, 2 snake), the rest one uniform switch (P = 3). */
+template <unsigned P>
+__device__ __forceinline__ float spg_post(unsigned post, float x, float p) {
+    if constexpr (P == 0u) return x;
+    if constexpr (P == 1u) return sp_act(11u, x, p, 0.f);
+    if constexpr (P == 2u) return sp_snake(x, p);
+    switch (post) {
+    case 1: return sp_act(1u, x, p, 0.f);
+    case 7: return sp_act(7u, x, p, 0.f);
+    case 8: return sp_act(8u, x, p, 0.f);
+    case 9: return x >= 0.0f ? x : __fmul_rn(x, p);
+    case 10: return sp_act(10u, x, p, 0.f);
+    case 11: return sp_act(11u, x, p, 0.f);
+    case 12: return sp_snake(x, p);
+    default: return x;
+    }
+}
+template <unsigned BN, bool TAPS, unsigned P>
+static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsigned K, const float* x, const float* w,
+                                                  const SpConvEpi1& ep, unsigned slice, unsigned nblk) {
+    char* sm = (char*)sm90_align1024(sp_smem);
+    /* A stage is [Ahi | Alo | Bhi | Blo] (A halves SPWG_OP bytes, B halves BN rows); 128x64 tiles
+     * have two, so the next k-tile's split and stores run under this one's MMAs. */
+    constexpr unsigned BOP = BN * SPWG_BK * 2u, LDO = BN + 8u, NG = BN / 8u, SZ = 2u * SPWG_OP + 2u * BOP;
+    constexpr bool DB = 2u * SZ + 1024u <= SP_ARENA_FLOATS * 4u;
+    char* ahi = sm;
+    char* bhi = sm + 2u * SPWG_OP;
+    float* stage = (float*)sm;         /* the output tile, after the last k-tile's MMAs */
+    const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, wg = warp >> 2;
+    const unsigned sr = tid >> 4, sc = (tid & 15u) * 4u; /* 16 threads per 64-float row, 16 rows per pass */
+    const unsigned tn = (N + BN - 1u) / BN, tiles = ((M + 127u) / 128u) * tn, nk = (K + SPWG_BK - 1u) / SPWG_BK;
+    const SpConvArgs& a = ep.a;
+    bool pending = false; /* bulk stores reading `stage` */
+    for (unsigned tile = slice; tile < tiles; tile += nblk) {
+        const unsigned m0 = (tile / tn) * 128u, n0 = (tile % tn) * BN;
+        /* B rows (tap-major weights) are contiguous: row n at w + n * K. Pointwise A rows too: row m
+         * at x + m * K. With taps, a k-tile lies in one tap (cin % 64 == 0) and A row m of item b,
+         * output row t, reads input row t + tap * dil - before of b (zero outside its length).
+         * Rows past M or N read nothing (their outputs are not stored). */
+        const float* xa = x + (size_t)(m0 + sr) * K + sc;
+        const float* wb = w + (size_t)(n0 + sr) * K + sc;
+        const unsigned ma = M > m0 + sr ? (M - m0 - sr + 15u) / 16u : 0u, nb = N > n0 + sr ? (N - n0 - sr + 15u) / 16u : 0u;
+        const bool leaky = a.pre == 9u;
+        const float* xb[TAPS ? 8 : 1];
+        int t0[TAPS ? 8 : 1], len[TAPS ? 8 : 1];
+        if constexpr (TAPS) {
+#pragma unroll
+            for (unsigned p = 0; p < 8; p++) {
+                const unsigned m = min(m0 + sr + 16u * p, M - 1u), b = m / a.out_rows, t = m - b * a.out_rows;
+                xb[p] = x + (size_t)b * a.in_rows * a.cin + sc;
+                t0[p] = (int)t - (int)a.before;
+                len[p] = p < ma && t < a.conv_len(b) ? (int)a.length(b) : 0;
+            }
+        }
+        float4 va[8], vb[BN / 16u];
+        auto load = [&](unsigned kt) {
+            const unsigned k = kt * SPWG_BK;
+            const bool kin = k + sc < K;
+            if constexpr (TAPS) {
+                const unsigned tap = k / a.cin, ci = k - tap * a.cin;
+#pragma unroll
+                for (unsigned p = 0; p < 8; p++) {
+                    const int u = t0[p] + (int)(tap * a.dil);
+                    float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                    if (kin && (unsigned)u < (unsigned)len[p]) v = __ldg((const float4*)(xb[p] + (size_t)u * a.cin + ci));
+                    if (leaky) {
+                        v.x = v.x >= 0.0f ? v.x : __fmul_rn(v.x, a.slope); v.y = v.y >= 0.0f ? v.y : __fmul_rn(v.y, a.slope);
+                        v.z = v.z >= 0.0f ? v.z : __fmul_rn(v.z, a.slope); v.w = v.w >= 0.0f ? v.w : __fmul_rn(v.w, a.slope);
+                    }
+                    va[p] = v;
+                }
+            } else {
+#pragma unroll
+                for (unsigned p = 0; p < 8; p++)
+                    va[p] = kin && p < ma ? __ldg((const float4*)(xa + (size_t)16u * p * K + k)) : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+#pragma unroll
+            for (unsigned p = 0; p < BN / 16u; p++)
+                vb[p] = kin && p < nb ? __ldg((const float4*)(wb + (size_t)16u * p * K + k)) : make_float4(0.f, 0.f, 0.f, 0.f);
+        };
+        auto store = [&](unsigned b) {
+#pragma unroll
+            for (unsigned p = 0; p < 8; p++) spwg_split_store(ahi + b * SZ, SPWG_OP, sr + 16u * p, sc, va[p]);
+#pragma unroll
+            for (unsigned p = 0; p < BN / 16u; p++) spwg_split_store(bhi + b * SZ, BOP, sr + 16u * p, sc, vb[p]);
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        };
+        load(0u);
+        if (pending) {
+            asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
+            pending = false;
+        }
+        __syncthreads();
+        store(0u);
+        __syncthreads();
+        if (DB && nk > 1u) load(1u);
+        float acc[BN / 2u];
+        for (unsigned kt = 0; kt < nk; kt++) {
+            const unsigned b = DB ? kt & 1u : 0u;
+            const uint64_t dah = sm90_desc(ahi + b * SZ + wg * 64u * 128u), dal = sm90_desc(ahi + b * SZ + SPWG_OP + wg * 64u * 128u);
+            const uint64_t dbh = sm90_desc(bhi + b * SZ), dbl = sm90_desc(bhi + b * SZ + BOP);
+            sm90_wg_fence();
+#pragma unroll
+            for (unsigned s = 0; s < SPWG_BK / 16u; s++) {
+                const uint64_t o = (s * 32u) >> 4; /* +32 B per k16 in the start-address field */
+                if constexpr (BN == 128u) {
+                    wgmma_m64n128k16(acc, dal + o, dbh + o, kt | s ? 1 : 0);
+                    wgmma_m64n128k16(acc, dah + o, dbl + o, 1);
+                    wgmma_m64n128k16(acc, dah + o, dbh + o, 1);
+                } else {
+                    spwg_m64n64k16(acc, dal + o, dbh + o, kt | s ? 1 : 0);
+                    spwg_m64n64k16(acc, dah + o, dbl + o, 1);
+                    spwg_m64n64k16(acc, dah + o, dbh + o, 1);
+                }
+            }
+            sm90_wg_commit();
+            if constexpr (DB) {
+                if (kt + 1u < nk) store(b ^ 1u);
+                if (kt + 2u < nk) load(kt + 2u);
+                sm90_wg_wait<0>();
+                __syncthreads();
+            } else {
+                if (kt + 1u < nk) load(kt + 1u);
+                sm90_wg_wait<0>();
+                __syncthreads();
+                if (kt + 1u < nk) {
+                    store(0u);
+                    __syncthreads();
+                }
+            }
+        }
+        /* Epilogue: bias, activation, row scale, residual in registers (every residual load
+         * issued before the first use); the tile staged row-major. */
+        const unsigned rw = wg * 64u + (warp & 3u) * 16u + (lane >> 2), cw = 2u * (lane & 3u);
+        size_t base[2];
+        bool ok[2];
+#pragma unroll
+        for (unsigned h = 0; h < 2; h++) {
+            const unsigned m = m0 + rw + 8u * h;
+            base[h] = m < M ? ep.row_base(m) : 0;
+            ok[h] = m < M && (long long)base[h] >= 0;
+            if (!ok[h]) base[h] = ~base[h];
+        }
+        float2 res[2][NG];
+#pragma unroll
+        for (unsigned h = 0; h < 2; h++)
+#pragma unroll
+            for (unsigned g = 0; g < NG; g++) {
+                const unsigned o = n0 + 8u * g + cw;
+                res[h][g] = a.residual && ok[h] && o < N ? __ldg((const float2*)(a.residual + base[h] + o)) : make_float2(0.f, 0.f);
+            }
+#pragma unroll
+        for (unsigned g = 0; g < NG; g++) {
+            const unsigned c = 8u * g + cw, o = n0 + c;
+            const bool on = o < N;
+            const float2 bias = a.bias && on ? __ldg((const float2*)(a.bias + o)) : make_float2(0.f, 0.f);
+            const float2 alpha = a.alpha && on ? make_float2(a.alpha[o], a.alpha[o + 1]) : make_float2(a.slope, a.slope);
+#pragma unroll
+            for (unsigned h = 0; h < 2; h++) {
+                float2 y = make_float2(0.f, 0.f);
+                if (ok[h] && on) {
+                    y.x = spg_post<P>(a.post, __fadd_rn(acc[4u * g + 2u * h], bias.x), alpha.x);
+                    y.y = spg_post<P>(a.post, __fadd_rn(acc[4u * g + 2u * h + 1u], bias.y), alpha.y);
+                    if (a.row_scale) {
+                        const float rs = a.row_scale[base[h] / a.cout];
+                        y.x = __fmul_rn(rs, y.x); y.y = __fmul_rn(rs, y.y);
+                    }
+                    y.x = __fadd_rn(y.x, res[h][g].x); y.y = __fadd_rn(y.y, res[h][g].y);
+                }
+                *(float2*)(stage + (rw + 8u * h) * LDO + c) = y;
+            }
+        }
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        __syncthreads();
+        if (tid < 128u && m0 + tid < M) {
+            const unsigned m = m0 + tid, cols = min(BN, N - n0);
+            size_t base = ep.row_base(m);
+            if ((long long)base < 0) base = ~base;
+            spwg_bulk_store(a.out + base + n0, stage + tid * LDO, cols * 4u);
+            asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+            pending = true;
+        }
+    }
+    if (pending) asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+    asm volatile("fence.proxy.async.global;\n" ::: "memory");
+    __threadfence();
+    __syncthreads();
+}
+__device__ __forceinline__ bool spg_post_ok(unsigned post) {
+    return post == 0u || post == 1u || post == 7u || post == 8u || post == 9u || post == 10u || post == 11u || post == 12u;
+}
+__device__ __forceinline__ bool spg_eligible(const SpConvArgs& a) {
+    const bool pw = a.kernel == 1u && a.stride == 1u && a.before == 0u && a.in_rows == a.out_rows && a.cg % 4u == 0 && a.pre == 0u;
+    const bool taps = a.kernel > 1u && a.tapmajor && a.stride == 1u && a.mode == 0u && a.groups == 1u && a.cin % 64u == 0 &&
+                      (a.pre == 0u || (a.pre == 9u && !a.alpha));
+    return (pw || taps) && spg_post_ok(a.post) && a.cout % 4u == 0 && sp_aligned(a.out, 16) &&
+           (!a.residual || sp_aligned(a.residual, 8)) && (!a.bias || sp_aligned(a.bias, 8)) && sp_aligned(a.w, 16) &&
+           sp_aligned(a.x, 16);
+}
+__device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, unsigned nblk) {
+    const unsigned M = a.batch * a.out_rows;
+    const SpConvEpi1 ep{a, 0u, a.out_rows, 0u, 0u, false, true};
+    /* 128x64 tiles where 128x128 ones would leave a short last round (N = 256 at ~9k rows: 136
+     * tiles on 132 blocks); a 128x64 tile costs ~0.65 of a 128x128 one. */
+    const unsigned mt = (M + 127u) / 128u, r128 = (mt * ((a.cout + 127u) / 128u) + nblk - 1u) / nblk,
+                   r64 = (mt * ((a.cout + 63u) / 64u) + nblk - 1u) / nblk;
+    const unsigned K = a.kernel * a.cg;
+    const float* w = (const float*)a.w;
+    const bool wide = 20u * r128 <= 13u * r64;
+    /* The combinations the speech lowerings use: pointwise with none / GELU / other, taps with
+     * none / snake / other. */
+    if (a.kernel == 1u) {
+        if (a.post == 0u) wide ? sp_wg_gemm<128, false, 0>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 0>(M, a.cout, K, a.x, w, ep, slice, nblk);
+        else if (a.post == 11u) wide ? sp_wg_gemm<128, false, 1>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 1>(M, a.cout, K, a.x, w, ep, slice, nblk);
+        else wide ? sp_wg_gemm<128, false, 3>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 3>(M, a.cout, K, a.x, w, ep, slice, nblk);
+    } else {
+        if (a.post == 0u) wide ? sp_wg_gemm<128, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk);
+        else if (a.post == 12u) wide ? sp_wg_gemm<128, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk);
+        else wide ? sp_wg_gemm<128, true, 3>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 3>(M, a.cout, K, a.x, w, ep, slice, nblk);
+    }
+}
+#endif
 /* flags bit 14: the split-bf16 wide tile's width when it applies and fills the machine, else 0.
  * It covers groups == 1, zero padding, f32 16-byte-aligned operands with cin % 4 == 0, tap-major
  * weights when kernel > 1, and no input activation but leaky ReLU. */
@@ -2993,6 +3260,17 @@ __device__ __forceinline__ unsigned sp_w_conv_width(const PlowDevInst* in, const
         return 0u;
     return sp_w_width(a.batch * a.out_rows, a.cout, nblk);
 }
+#if defined(PLOW_NV_HOPPER)
+/* The wgmma arm of Conv1dF32 (flags bit 17), dispatched from the interpreter's inlined body:
+ * wgmma in a called function is serialized (ptxas C7510). False when the op does not qualify. */
+__device__ __forceinline__ bool sp_wg_conv1d(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
+    if (in->op != PLOW_DOP_CONV1D_F32 || !((in->fj[2].u >> 17) & 1u)) return false;
+    SpConvArgs a;
+    if (!sp_conv_args(in, T, false, a) || !sp_w_conv_width(in, a, nblk) || !spg_eligible(a)) return false;
+    sp_wg_run(a, slice, nblk);
+    return true;
+}
+#endif
 /* Out of line so d_conv1d_f32's 64x64 paths do not share its register allocation. Callers
  * guarantee groups == 1, zero padding, f32 16-byte-aligned operands
  * with cin % 4 == 0, tap-major weights when kernel > 1, and no input activation but leaky ReLU. */

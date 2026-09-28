@@ -35,6 +35,10 @@ pub struct Window {
     pub phase: Vec<f32>,
 }
 
+/// Called by the codec worker between the program segments of one launch (see
+/// [`Codec::set_yield`]).
+pub type YieldHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// A decode's PCM and, for a [`Window`], the source phase at its `next_seam`.
 pub struct Decoded {
     pub pcm: Vec<f32>,
@@ -55,6 +59,7 @@ struct Job {
 
 pub struct Codec {
     tx: Mutex<mpsc::Sender<Job>>,
+    yield_hook: std::sync::Arc<Mutex<Option<YieldHook>>>,
     credit: Option<std::sync::Arc<crate::sched::admission::DownstreamCredit>>,
     /// Largest batch one launch holds.
     pub max_batch: usize,
@@ -100,6 +105,9 @@ struct Bound {
     lookahead: usize,
     voices: Vec<String>,
     parameters: std::collections::BTreeMap<String, u64>,
+    yield_hook: std::sync::Arc<Mutex<Option<YieldHook>>>,
+    /// Programs per segment between yield points (0: one segment).
+    yield_programs: usize,
 }
 
 impl Codec {
@@ -115,13 +123,16 @@ impl Codec {
         let path = path.to_path_buf();
         let (tx, rx) = mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = mpsc::channel();
+        let yield_hook = std::sync::Arc::new(Mutex::new(None));
+        let hook = yield_hook.clone();
         std::thread::Builder::new()
             .name("plow-tts-codec".into())
             .spawn(move || {
-                let bound = match bind(&path) {
+                let mut bound = match bind(&path) {
                     Ok(b) => b,
                     Err(e) => return drop(ready_tx.send(Err(e))),
                 };
+                bound.yield_hook = hook;
                 let max_window = bound.cached.iter().map(|c| c.1).max().unwrap_or(0);
                 let info = (
                     bound.capacities.iter().chain(&bound.cached).map(|c| c.0).max().unwrap_or(1),
@@ -144,6 +155,7 @@ impl Codec {
             ready_rx.recv().map_err(|e| e.to_string())??;
         Ok(Codec {
             tx: Mutex::new(tx),
+            yield_hook,
             credit: None,
             max_batch,
             max_frames,
@@ -157,6 +169,13 @@ impl Codec {
             window_capacities,
             parameters,
         })
+    }
+
+    /// Split each launch into segments of `render.yield_programs` programs (a CFM step) and call
+    /// `hook` between them, so a co-scheduler can hand the device to another model mid-render.
+    /// `None` restores one launch per decode.
+    pub fn set_yield(&self, hook: Option<YieldHook>) {
+        *self.yield_hook.lock() = hook;
     }
 
     /// Charge this stage's backlog to the feeding model's admission: past two full launches of
@@ -306,6 +325,8 @@ fn bind(path: &Path) -> Result<Bound, String> {
         lengths,
         capacities,
         runtime,
+        yield_hook: Default::default(),
+        yield_programs: pipeline.parameter("render.yield_programs").map(|v| v as usize).unwrap_or(0),
     })
 }
 
@@ -369,8 +390,24 @@ impl Bound {
             self.runtime.write_tensor(next_seam, bytemuck::cast_slice(&ns)).map_err(e)?;
         }
         let t1 = std::time::Instant::now();
-        self.runtime.run_sequence(&programs).map_err(e)?;
-        let (t2, gpu_us) = (std::time::Instant::now(), self.runtime.last_run_us());
+        let hook = self.yield_hook.lock().clone();
+        let mut gpu_us = 0.0;
+        match hook.filter(|_| self.yield_programs > 0) {
+            Some(hook) => {
+                for (k, segment) in programs.chunks(self.yield_programs).enumerate() {
+                    if k > 0 {
+                        hook();
+                    }
+                    self.runtime.run_sequence(segment).map_err(e)?;
+                    gpu_us += self.runtime.last_run_us();
+                }
+            }
+            None => {
+                self.runtime.run_sequence(&programs).map_err(e)?;
+                gpu_us = self.runtime.last_run_us();
+            }
+        }
+        let t2 = std::time::Instant::now();
         let mut pcm = vec![0f32; cb * cf * self.frame_samples];
         self.runtime.read_tensor_at(self.pcm, 0, bytemuck::cast_slice_mut(&mut pcm)).map_err(e)?;
         let mut phase_out = Vec::new();

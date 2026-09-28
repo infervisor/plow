@@ -275,6 +275,62 @@ ldmatrix results consumed by the next instruction (8 warps per SM, one block). A
 (flag bit 16, tried) saved 7-22% per GEMM and 9-10% per render but moved the mel 3e-3 rel-L2 from
 the torch reference (was 1e-5), so it was dropped.
 
+The sweep above ran the CFM program on zeroed inputs, where the key lengths are 0 and attention
+skips its keys. With the encoder run first (`PB_PRE=csynth.b32.t64.0 packet_bench ... --sweep`),
+program 1 of `csynth.b32.t64` (16 transformer blocks) takes 16.8 ms, not 9.9 ms, and attention
+is its largest op:
+
+| op (program 1, real inputs) | n | mma.sync us | wgmma us |
+|---|---|---|---|
+| AttentionF32 (3xTF32, 128-query tiles) | 16 | 5899 | 6543 |
+| Conv1dF32 qkv 256->1536 | 16 | 2594 | 1885 |
+| Conv1dF32 ff1 256->1024 +gelu | 16 | 2377 | 1821 |
+| Conv1dF32 ff2 1024->256 +res | 16 | 1939 | 1606 |
+| Conv1dF32 out 512->256 +res | 16 | 1328 | 1082 |
+| LayerNormF32 | 40 | 880 | 1350 |
+| Conv1dF32 resnet k3 | 9 | 848 | 727 |
+| **program** | | 16791 | 15938 |
+
+Attention runs one block per (item, head, 128-query tile): 136 query rows take two tiles, the
+second 8 rows full, so it does 1.9x the needed work.
+
+Warpgroup MMA (flags bit 17, sm_90a): the split-bf16 3-pass product on `wgmma.m64nNk16` from
+128-byte-swizzled bf16 operand stages (BK 64, double-buffered at N = 64), f32 loads of the next
+k-tile in flight during the MMAs, and an epilogue staged in shared memory and written with
+`cp.async.bulk`. It covers pointwise convs and tap-major k-tap convs with 64-channel groups
+(implicit im2col). Tiles are 128x128, or 128x64 where a 128-wide grid would leave a short last
+round. `wgmma` must be inlined into the interpreter kernel (in a called function ptxas serializes
+it, C7510), so it is dispatched from `plow_exec` with 12 instantiations (ptxas ~2 h for the speech
+cubin). Standalone (`speech_f32_op_test --bench-cfm`, 8704 rows):
+
+| GEMM | mma.sync us | wgmma us |
+|---|---|---|
+| qkv 256->1536 | 165 | 112 |
+| ff1 256->1024 +gelu | 141 | 103 |
+| ff2 1024->256 +res | 124 | 90 |
+| out 512->256 +res | 78 | 53 |
+| resnet res 320->256 | 60 | 41 |
+| resnet c1 k3 320->256 | 124 | 88 |
+
+Numerics are unchanged (mel rel-L2 5e-6 to 1.2e-5 vs the torch reference; same pass order). The
+render is 5.6% faster (`packet_bench --seq`: `csynth.b32.t64` 682 -> 644 ms, `b64.t32` 701 -> 663
+ms): the GEMMs lose 25%, but in the same cubin LayerNorm and attention got slower (register
+allocation of the shared interpreter kernel). Served, same client, same lease (MTL stream aps):
+
+| conc | before | wgmma | TTFA p90 |
+|---|---|---|---|
+| 64 | 43.4 | 44.2 | 2.6 s |
+| 128 | 50.5 | 52.5 | 5.6 s |
+| 200 | 52.8 | 53.9 | 10.4 s |
+
+c1 7.1, c16 35.8, c32 40.2 aps; full c64 37.9. CER median 0.000 (96 at c1, 200 at c200), per
+language as before; English c16 / c64 35.4 / 44.2 aps, CER 0.000; Qwen3-ASR WER 3.913%; Veena CER
+0.008.
+
+`Codec::set_yield` splits each render into segments of `render.yield_programs` programs (4: one
+CFM step) and calls the hook between them, so a co-scheduler can hand the device to T3 mid-render.
+Without a hook a render stays one launch.
+
 ## Concurrency
 
 Speech requests take the LLM path on each model's mux: packed prefill (several requests' prompt
