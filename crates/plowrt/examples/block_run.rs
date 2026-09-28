@@ -447,6 +447,11 @@ mod cuda {
                                         let us: Vec<f32> = bk.iter().map(|&v| if v == 0 { -1.0 } else { (v as f64 - t0 as f64) as f32 / 1e3 }).collect();
                                         npy::write_f32(&dir.join("block_spans.npy"), &[3, 128, 256], &us).expect("block_spans.npy");
                                     }
+                                    if let Some(p) = e.trace_global_u64("g_probe", 4096)? {
+                                        let n = p[0] as usize;
+                                        let us: Vec<f32> = p[1..1 + 32 * n.min(127)].iter().map(|&v| if v == 0 { -1.0 } else { (v as f64 - t0 as f64) as f32 / 1e3 }).collect();
+                                        npy::write_f32(&dir.join("probe.npy"), &[n.min(127), 32], &us).expect("probe.npy");
+                                    }
                                 }
                             }
                             Ok(outs)

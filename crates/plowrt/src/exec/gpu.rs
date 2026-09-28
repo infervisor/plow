@@ -10603,7 +10603,17 @@ impl GpuEngine {
         Ok(Some(b.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()))
     }
 
+    /// A `u64` array global of the decode module (`-DPLOW_NV_TRACE=1` probes); `None` when absent.
+    pub fn trace_global_u64(&self, name: &str, n: usize) -> Result<Option<Vec<u64>>> {
+        let mut b = Vec::new();
+        if !self.be.module_global_bytes(&self.module, name, n * 8, &mut b)? {
+            return Ok(None);
+        }
+        Ok(Some(b.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()))
+    }
+
     pub fn trace_spans_reset(&self) -> Result<()> {
+        self.be.module_global_zero(&self.module, "g_probe", 4096 * 8)?;
         self.be.module_global_zero(&self.module, "g_sp_lo", 8192)?;
         self.be.module_global_zero(&self.module, "g_sp_hi", 8192)?;
         self.be.module_global_zero(&self.module, "g_bk", 3 * 128 * 256 * 8)?;
