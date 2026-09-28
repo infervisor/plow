@@ -238,14 +238,16 @@ impl Bound {
             .cloned()
             .ok_or_else(|| format!("{} x {frames} frames exceeds every codec capacity", jobs.len()))?;
         let fc = self.frame_codes;
-        let mut codes = vec![0u32; self.codes.bytes / 4];
+        // Only the capacity's region of the (widest-capacity) codes and PCM tensors moves: the
+        // whole PCM tensor is hundreds of MB.
+        let mut codes = vec![0u32; cb * cf * fc];
         for (i, j) in jobs.iter().enumerate() {
             for (k, &c) in j.codes.iter().enumerate() {
                 codes[i * cf * fc + k] = c.clamp(0, i32::MAX) as u32;
             }
         }
         let e = |x: crate::RuntimeError| x.to_string();
-        self.runtime.write_tensor(self.codes, bytemuck::cast_slice(&codes)).map_err(e)?;
+        self.runtime.write_tensor_at(self.codes, 0, bytemuck::cast_slice(&codes)).map_err(e)?;
         for &(tensor, per_frame) in &self.lengths {
             let mut len = vec![0u32; tensor.bytes / 4];
             for (i, j) in jobs.iter().enumerate() {
@@ -266,8 +268,8 @@ impl Bound {
             self.runtime.write_tensor(voice, bytemuck::cast_slice(&v)).map_err(e)?;
         }
         self.runtime.run_sequence(&programs).map_err(e)?;
-        let mut pcm = vec![0f32; self.pcm.bytes / 4];
-        self.runtime.read_tensor(self.pcm, bytemuck::cast_slice_mut(&mut pcm)).map_err(e)?;
+        let mut pcm = vec![0f32; cb * cf * self.frame_samples];
+        self.runtime.read_tensor_at(self.pcm, 0, bytemuck::cast_slice_mut(&mut pcm)).map_err(e)?;
         let per = cf * self.frame_samples;
         debug_assert!(cb * per <= pcm.len());
         Ok(jobs.iter().enumerate().map(|(i, j)| pcm[i * per..i * per + j.frames * self.frame_samples].to_vec()).collect())
