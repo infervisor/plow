@@ -32,6 +32,19 @@
 #ifndef PLOW_NV_FA_V3_PACK
 #define PLOW_NV_FA_V3_PACK 0
 #endif
+/* Split-KV for launches with fewer items than half the grid (a few riders, a short session
+ * suffix): each item's KV tiles are cut into up to FA3_NSK_MAX chunks, one CTA each. A chunk
+ * writes its unnormalised (m, l, O) to `ws`; the last chunk to arrive (per-item counter)
+ * merges them into O and re-zeroes the counter. The value is the workspace's slot count
+ * (devgen `fa_ws`: [slots] u32 counters | [slots][128][2] f32 m,l | [slots][128][512] f32 O);
+ * 0 = off. */
+#ifndef PLOW_NV_FA_V3_SPLITKV
+#define PLOW_NV_FA_V3_SPLITKV 0
+#endif
+#define FA3_NSK_MAX 16u
+#ifndef FA3_SPLIT_MIN_TILES
+#define FA3_SPLIT_MIN_TILES 2
+#endif
 #ifndef FA3_INLINE
 #define FA3_INLINE __forceinline__
 #endif
@@ -86,12 +99,81 @@ __device__ __forceinline__ void fa3_bar(int id, int threads) {
 }
 
 /* noinline: its own register allocation instead of the megakernel's merged pressure. */
-template <int HD>
-__device__ FA3_INLINE void d_flash_prefill_sm90_v3(
+/* Split-KV (PLOW_NV_FA_V3_SPLITKV) workspace: [SL] u32 counters | [SL][128][2] f32 (m, l) |
+ * [SL][128][HD] f32 O, one slot per chunk work item. */
+#define FA3_WS_ML(ws) ((ws) + PLOW_NV_FA_V3_SPLITKV)
+#define FA3_WS_O(ws) ((ws) + PLOW_NV_FA_V3_SPLITKV * (1 + 128 * 2))
+
+/* After a chunk published its unnormalised state: the last chunk of the item to arrive merges
+ * all of them into the bf16 output and re-zeroes the item's counter. Item row ri maps to
+ * (query row, head) as the unsplit epilogue does; `scr` is the CTA's idle Q staging area. */
+template <int HD, bool SPLIT>
+__device__ __noinline__ void fa3_chunk_merge(float* __restrict__ ws, unsigned bitem, unsigned nsk,
+                                             unsigned nchunk, bool pk,
+                                             __nv_bfloat16* __restrict__ O, unsigned q0,
+                                             unsigned sq, unsigned h, unsigned gqa,
+                                             unsigned n_head, float* scr) {
+    unsigned* const ctr = (unsigned*)ws;
+    const float* const wml = FA3_WS_ML(ws);
+    const float* const wo = FA3_WS_O(ws);
+    __threadfence();
+    __syncthreads();
+    __shared__ unsigned last;
+    if (threadIdx.x == 0) last = atomicAdd(ctr + bitem, 1u) == nchunk - 1u;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const unsigned rows = (pk || SPLIT) ? 64u : 128u;
+    const unsigned s0 = bitem * nsk; /* the item's first chunk slot */
+    for (unsigned ri = threadIdx.x; ri < rows; ri += PLOW_NV_THREADS) {
+        float M = FA_NEG_INF;
+        for (unsigned c = 0; c < nchunk; c++)
+            M = fmaxf(M, __ldcg(wml + ((size_t)(s0 + c) * 128 + ri) * 2));
+        float L = 0.0f;
+        for (unsigned c = 0; c < nchunk; c++) {
+            const float2 v = __ldcg((const float2*)(wml + ((size_t)(s0 + c) * 128 + ri) * 2));
+            const float w = v.x == FA_NEG_INF ? 0.0f : FA_EXP(v.x - M);
+            scr[c * 128 + ri] = w;
+            L = fmaf(v.y, w, L);
+        }
+        const float il = L > 0.0f ? 1.0f / L : 0.0f;
+        for (unsigned c = 0; c < nchunk; c++) scr[c * 128 + ri] *= il;
+    }
+    __syncthreads();
+    for (unsigned i = threadIdx.x; i < rows * (HD / 4); i += PLOW_NV_THREADS) {
+        const unsigned ri = i / (HD / 4), c4 = i % (HD / 4);
+        unsigned qr = q0 + ri, hh = h;
+        bool ok = qr < sq;
+        if (pk) {
+            ok = ri < gqa * sq;
+            hh = h + ri / sq;
+            qr = ri % sq;
+        }
+        if (!ok) continue;
+        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (unsigned c = 0; c < nchunk; c++) {
+            const float w = scr[c * 128 + ri];
+            const float4 v = __ldcg((const float4*)(wo + ((size_t)(s0 + c) * 128 + ri) * HD) + c4);
+            acc.x = fmaf(v.x, w, acc.x);
+            acc.y = fmaf(v.y, w, acc.y);
+            acc.z = fmaf(v.z, w, acc.z);
+            acc.w = fmaf(v.w, w, acc.w);
+        }
+        __nv_bfloat162* o2 = (__nv_bfloat162*)(O + ((size_t)qr * n_head + hh) * HD) + 2u * c4;
+        o2[0] = __floats2bfloat162_rn(acc.x, acc.y);
+        o2[1] = __floats2bfloat162_rn(acc.z, acc.w);
+    }
+    if (threadIdx.x == 0) ctr[bitem] = 0u;
+}
+
+/* KVC: the split-KV instantiation. The unsplit one carries none of its code, so the bulk
+ * prefill's register allocation is untouched (the merged body cost hd512 1000 rows +4%). */
+template <int HD, bool KVC>
+__device__ FA3_INLINE void fa3_v3_body(
     const __nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ O, unsigned seq_q,
     unsigned seq_kv, unsigned n_head, unsigned n_kv_head, unsigned q_pos0, unsigned window,
     unsigned kv_stride, unsigned kv_mask, float scale, unsigned slice, unsigned nblk, float* lds,
-    const int* __restrict__ req, const void* __restrict__ mapkv) {
+    const int* __restrict__ req, const void* __restrict__ mapkv, float* __restrict__ ws) {
     static_assert(HD == 256 || HD == 512, "v3 covers the Gemma hd256 / hd512 layers");
     static_assert(PLOW_NV_THREADS == 256u, "2 warpgroups");
     constexpr bool SPLIT = FA3_SPLIT(HD);
@@ -149,17 +231,25 @@ __device__ FA3_INLINE void d_flash_prefill_sm90_v3(
     } else {
         n_work = req_items(seq_q);
     }
+    /* KV chunks per item (1 = the unsplit body). */
+    unsigned nsk = 1;
+    if (KVC) {
+        nsk = min(min(nblk, (unsigned)PLOW_NV_FA_V3_SPLITKV) / n_work, FA3_NSK_MAX);
+        if (nsk < 2u) nsk = 1;
+    }
+    n_work *= nsk;
 
     /* Snake over rounds + heaviest query tile first inside a request: causal items grow with
      * the tile index, and pairing round-0 heavy with round-1 light balances the CTAs. */
     for (unsigned round = 0; round * nblk < n_work; round++) {
         const unsigned witem = round * nblk + ((round & 1u) ? nblk - 1u - slice : slice);
         if (witem >= n_work) continue;
+        const unsigned bitem = witem / nsk, csp = witem % nsk;
         unsigned h, q0, sq = seq_q, skv = seq_kv, qp0 = q_pos0;
         size_t qoff = 0;
         const void* map = mapkv;
         {
-            unsigned rem = witem;
+            unsigned rem = bitem;
             if (req) {
                 int r = 0, qlen;
                 for (;;) {
@@ -201,7 +291,21 @@ __device__ FA3_INLINE void d_flash_prefill_sm90_v3(
         }
         long cap = (long)hi - 1;
         if (item_hi_q < cap) cap = item_hi_q;
-        const int ntile = (cap >= (long)eff_lo) ? (int)((cap - (long)eff_lo) / BKV) + 1 : 0;
+        int ntile = (cap >= (long)eff_lo) ? (int)((cap - (long)eff_lo) / BKV) + 1 : 0;
+        /* This chunk's tiles; chunks past the item's last tile have no work. */
+        unsigned nchunk = 1;
+        if (nsk > 1u && ntile > 0) {
+            const int per = max(FA3_SPLIT_MIN_TILES, (ntile + (int)nsk - 1) / (int)nsk);
+            nchunk = (unsigned)((ntile + per - 1) / per);
+            if (csp >= nchunk) continue;
+            if (nchunk > 1u) {
+                eff_lo += csp * (unsigned)per * BKV;
+                ntile = min(per, ntile - (int)csp * per);
+            }
+        } else if (csp > 0u) {
+            continue;
+        }
+        const bool kvchunk = KVC && nchunk > 1u;
 
         /* op 0 = K, 1 = V */
         auto issue = [&](int op, int t) {
@@ -508,6 +612,8 @@ __device__ FA3_INLINE void d_flash_prefill_sm90_v3(
                 const float b1 = X[2] == FA_NEG_INF ? 0.0f : FA_EXP(X[2] - MB);
                 lA = lA * a0 + X[1] * a1;
                 lB = lB * b0 + X[3] * b1;
+                mA = MA;
+                mB = MB;
 #pragma unroll
                 for (int nt = 0; nt < NSUB_W; nt++)
 #pragma unroll
@@ -520,6 +626,31 @@ __device__ FA3_INLINE void d_flash_prefill_sm90_v3(
                                 Oacc[nt][4 * nb + 2 + e] * b0 + X[4 + nt * 32 + 4 * nb + 2 + e] * b1;
                         }
             }
+        }
+        if constexpr (KVC) if (kvchunk) {
+            /* publish this chunk's unnormalised (m, l, O), rows by item row index */
+            if (!(kvsplit && wg == 1)) {
+                const unsigned riA = (SPLIT || pk ? 0u : 64u * (unsigned)wg) + (unsigned)rA;
+                float* const oA = FA3_WS_O(ws) + ((size_t)witem * 128 + riA) * HD;
+                float* const oB = oA + 8 * HD;
+#pragma unroll
+                for (int nt = 0; nt < NSUB_W; nt++)
+#pragma unroll
+                    for (int nb = 0; nb < 8; nb++) {
+                        const int col = (SPLIT ? 256 * wg : 0) + nt * 64 + 8 * nb + 2 * (lane & 3);
+                        __stcg((float2*)(oA + col), make_float2(Oacc[nt][4 * nb], Oacc[nt][4 * nb + 1]));
+                        __stcg((float2*)(oB + col),
+                               make_float2(Oacc[nt][4 * nb + 2], Oacc[nt][4 * nb + 3]));
+                    }
+                if ((!SPLIT || wg == 0) && (lane & 3) == 0) {
+                    float* const ml = FA3_WS_ML(ws) + ((size_t)witem * 128 + riA) * 2;
+                    __stcg((float2*)ml, make_float2(mA, lA));
+                    __stcg((float2*)(ml + 16), make_float2(mB, lB));
+                }
+            }
+            fa3_chunk_merge<HD, SPLIT>(ws, bitem, nsk, nchunk, pk, O + qoff, q0, sq, h, gqa,
+                                       n_head, (float*)base);
+            continue;
         }
         const float iA = lA > 0.0f ? 1.0f / lA : 0.0f;
         const float iB = lB > 0.0f ? 1.0f / lB : 0.0f;
@@ -550,5 +681,39 @@ __device__ FA3_INLINE void d_flash_prefill_sm90_v3(
             }
     }
     __syncthreads(); /* the static barriers / counters are re-initialised by the next call */
+}
+
+template <int HD>
+__device__ FA3_INLINE void d_flash_prefill_sm90_v3(
+    const __nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ O, unsigned seq_q,
+    unsigned seq_kv, unsigned n_head, unsigned n_kv_head, unsigned q_pos0, unsigned window,
+    unsigned kv_stride, unsigned kv_mask, float scale, unsigned slice, unsigned nblk, float* lds,
+    const int* __restrict__ req, const void* __restrict__ mapkv, float* __restrict__ ws = nullptr) {
+    /* hd512 only: an hd256 layer is sliding (<= 9 tiles) and splitting it measured no faster. */
+    if constexpr (PLOW_NV_FA_V3_SPLITKV > 0 && FA3_SPLIT(HD)) {
+        if (ws) {
+            /* the body's item count, split when it leaves half the grid idle */
+            const unsigned gqa = n_head / n_kv_head;
+            auto items = [&](unsigned qlen) -> unsigned {
+                if (qlen == 0) return 0u;
+                if (PLOW_NV_FA_V3_PACK && qlen * gqa <= 64u) return n_kv_head;
+                return ((qlen + 63u) / 64u) * n_head;
+            };
+            unsigned n = 0;
+            if (req) {
+                for (int r = 0; r < req[0]; r++)
+                    if (req[2 + 4 * r] > 0) n += items((unsigned)req[2 + 4 * r]);
+            } else {
+                n = items(seq_q);
+            }
+            if (n > 0 && 2u * n <= nblk) {
+                fa3_v3_body<HD, true>(Q, O, seq_q, seq_kv, n_head, n_kv_head, q_pos0, window,
+                                      kv_stride, kv_mask, scale, slice, nblk, lds, req, mapkv, ws);
+                return;
+            }
+        }
+    }
+    fa3_v3_body<HD, false>(Q, O, seq_q, seq_kv, n_head, n_kv_head, q_pos0, window, kv_stride,
+                           kv_mask, scale, slice, nblk, lds, req, mapkv, ws);
 }
 

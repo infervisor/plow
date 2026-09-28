@@ -451,6 +451,8 @@ struct Shapes {
     /// Opcode names present, for the encoding-aware corrections below. Kept as names because that
     /// is what `features` keys on, and the two must not disagree.
     ops_present: BTreeSet<String>,
+    /// Slots of the v3 prefill split-KV workspace a fused flash prefill carries in t1 (0 = none).
+    fa_ws_slots: u32,
 }
 
 /// Was this opcode emitted anywhere in the packet?
@@ -522,6 +524,9 @@ fn shapes(m: &Model) -> Shapes {
                 }
                 // `… i2=n_head i3=n_kv_head … i6=hd`
                 DevOp::FlashPrefill | DevOp::FlashPrefillFp8 => {
+                    if m.tensors.get(inst.t[1] as usize).is_some_and(|t| t.name == "act.fa_ws") {
+                        s.fa_ws_slots = m.n_cu;
+                    }
                     s.hd.insert(inst.i[6]);
                     s.kv_heads.insert(inst.i[3]);
                     s.kv_dtype
@@ -1023,6 +1028,10 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     // Capped at 32: wider arms exceed the 48 KiB static shared memory of the interpreter entry
     // (GV_MM_MAX=128 is 0x19610 bytes); rungs above it walk ceil(B / 32) weight passes.
     t.insert("gv_mm_max".into(), json!(next_pow2(s.decode_batch.max(1)).min(32)));
+    // * `fa_v3_splitkv`: the fused v3 flash prefill carries the split-KV workspace (`fa_ws`).
+    if s.fa_ws_slots > 0 {
+        t.insert("fa_v3_splitkv".into(), json!(s.fa_ws_slots));
+    }
     // TILE PROVENANCE. Written because its absence made a real regression unauditable: for
     // several days every AMD compile selected GEMM tiles from the ANALYTICAL MODEL (both tuning
     // cells were wholly stale against the current build digest) and nothing in the emitted
@@ -2923,6 +2932,11 @@ pub fn config_header(manifest: &Value) -> String {
             }
             if t.get("fa_rg_wide").is_some() {
                 out.push_str("#ifndef PLOW_NV_FA_RG_WIDE\n#define PLOW_NV_FA_RG_WIDE 1\n#endif\n");
+            }
+            if let Some(v) = t.get("fa_v3_splitkv").and_then(Value::as_u64) {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_FA_V3_SPLITKV\n#define PLOW_NV_FA_V3_SPLITKV {v}\n#endif\n"
+                ));
             }
             if t.get("fa_rgm").is_some() {
                 out.push_str("#ifndef PLOW_NV_FA_RGM\n#define PLOW_NV_FA_RGM 1\n#endif\n");

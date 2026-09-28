@@ -59,11 +59,11 @@ __global__ void __launch_bounds__(256, 1) k_old(Geo g, const int* req, const bf1
 }
 
 __global__ void __launch_bounds__(256, 1) k_v3(Geo g, const int* req, const bf16* q, bf16* out,
-                                               unsigned kvlen, const void* maps) {
+                                               unsigned kvlen, const void* maps, float* ws) {
     extern __shared__ float arena[];
     d_flash_prefill_sm90_v3<HD>(q, out, g.rows, kvlen, g.n_head, g.n_kv, kvlen - g.rows,
                                 g.window, g.stride, g.mask, g.scale, blockIdx.x, gridDim.x, arena,
-                                req, maps);
+                                req, maps, ws);
 }
 
 __global__ void evict(unsigned* d, size_t n) {
@@ -158,7 +158,15 @@ int main(int argc, char** argv) {
     Geo gk = g;
     if (nreq > 1) gk.rows = rows;
     auto run_old = [&] { k_old<<<grid, 256, sm_old>>>(gk, dreq, dq, dk, dv, o_old, kv_arg, maps); };
-    auto run_v3 = [&] { k_v3<<<grid, 256, sm_v3>>>(gk, dreq, dq, o_v3, kv_arg, maps); };
+    /* split-KV workspace (PLOW_NV_FA_V3_SPLITKV slots), zeroed like the packet's fa_ws */
+    float* ws = nullptr;
+#if PLOW_NV_FA_V3_SPLITKV
+    {
+        const size_t wsb = (size_t)PLOW_NV_FA_V3_SPLITKV * (1 + 128 * 2 + 128 * 512) * 4;
+        CK(cudaMalloc(&ws, wsb)); CK(cudaMemset(ws, 0, wsb));
+    }
+#endif
+    auto run_v3 = [&] { k_v3<<<grid, 256, sm_v3>>>(gk, dreq, dq, o_v3, kv_arg, maps, ws); };
     CK(cudaMemset(o_old, 0xff, qn * 2)); CK(cudaMemset(o_v3, 0xff, qn * 2));
 #ifndef FAB_NO_OLD
     run_old(); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
@@ -263,7 +271,7 @@ int main(int argc, char** argv) {
         CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
         for (int it = 0; it < 4; it++)
             for (int i = 0; i < nrot; i++)
-                k_v3<<<grid, 256, sm_v3, st>>>(gk, dreq, dq, o_v3, kv_arg, rmaps[i]);
+                k_v3<<<grid, 256, sm_v3, st>>>(gk, dreq, dq, o_v3, kv_arg, rmaps[i], ws);
         CK(cudaStreamEndCapture(st, &gr));
         CK(cudaGraphInstantiate(&ge, gr, 0));
         CK(cudaGraphLaunch(ge, st)); CK(cudaStreamSynchronize(st));

@@ -165,3 +165,81 @@ With 8 or fewer riders there are fewer items than SMs. That case needs split-KV,
   B=64 ctx 1024 standalone is 95 us, vs 98.5 us for the shipped body.
 * Veena B=64 flash in-model is 113 us/layer × 28 = 3.2 ms. That is 71% of the 3.35 TB/s floor
   (80 us) and 81% of the ~2.9 TB/s practical peak.
+
+## attn_2
+
+### Split-KV for small v3 prefill launches
+
+`PLOW_NV_FA_SPLIT_PREFILL` is an emit knob, default on. When on, devgen declares the `act.fa_ws`
+workspace and the fused hd256/512 flash prefill carries it in t1. t1 is `mlpart`, which the fused
+v3 path does not use. The manifest then emits `PLOW_NV_FA_V3_SPLITKV = n_cu`.
+
+The split applies only to hd512 launches with at most nblk/2 items:
+
+* Each item's KV tiles are cut into up to 16 chunks of at least 2 tiles, one CTA per chunk.
+* The last chunk to arrive (per-item counter in `fa_ws`) merges the chunks and re-zeroes its
+  counter.
+* Everything else runs a separate instantiation without the split code. Merging the two paths
+  into one body cost hd512 1000 rows +4% (195 -> 221 registers).
+* hd256 layers are sliding, at most 9 tiles, so they are not split.
+
+Standalone results, `fa_v3_bench` graph-timed, hd512, 8/2 heads, µs:
+
+| launch | before | after |
+|---|---|---|
+| 1 rider, kv 1024 | 88.2 | 30.8 |
+| 8 riders, kv 1024 | 90.6 | 43.1 |
+| 1 rider, kv 4096 | 337 | 47.6 |
+| 8 riders, kv 4096 | 333 | 78.5 |
+| 32-row suffix, kv 2048 | 172 | 54.7 |
+| 128 rows, kv 4096 | 336 | 87.8 |
+| 256 rows, kv 2048 | 173 | 73.4 |
+| 512 rows, kv 2048 | 171 | 117 |
+| 1000 rows | 90.0 | 89.7 |
+| 2000 rows | 179 | 176 |
+
+hd256 is unchanged: 21.7 / 33.6 / 34.6 µs.
+
+E4B in-model checks:
+
+* Parity with `gemma_logit_parity.py` is top1 0.9879, KL 7.65e-4.
+* The KV-shared tail still engages.
+* `session_bench` with 64 calls × 6 turns: later-turn TTFT p50/p90/p99 is 34.3/79.9/107 ms before
+  and 33.3/75.3/102 ms after.
+* c1 and c64 serving are unchanged.
+
+### hd128 decode (Veena): the in-model gap
+
+The attn_1 "base 114 us" standalone number included the inlined fold tail, the same regression as
+at hd512. Corrected numbers at B=64, ctx 1024:
+
+| body | standalone us | in-model us |
+|---|---|---|
+| row-group body | 101.7 | 113 |
+| RGM | 98.5 | 108 |
+| FlashInfer | 96.5 | — |
+| floor | 80 | — |
+
+A per-block `%globaltimer` probe (step_bench B=64, one layer):
+
+* All 132 blocks enter flash within 1 µs.
+* 116 blocks run 4 items and 16 blocks run 3.
+* The per-item time is about 11% longer in the model than standalone for both bodies: RGM median
+  block 105 vs 94 µs, row-group body 116 vs 98 µs.
+* The SM clock is the same, about 1.83 GHz.
+* nsys shows the decode step as one `interp_sm90a_gw` launch with nothing running concurrently.
+
+These did not reproduce the in-model loss in the standalone bench:
+
+* a 12 GB rotating KV footprint (TLB);
+* in-model KV strides (ring stride 2048);
+* a 99-200 KB dynamic smem carveout.
+
+With every layer's flash run 3× (`PLOW_NV_FA_DUP`), the repeat passes cost 97 µs (RGM) and 110 µs
+(row-group body). Those repeats re-read KV partly from L2, so they do not show the cold in-model
+cost.
+
+In-model step time with RGM: B=128 -1%, B=64 ±0, B=8..32 +2..4%. It stays off.
+
+At the practical ~2.9 TB/s the ceiling for Veena B=64 flash is 28 × (113 − 92) ≈ 0.6 ms. At the
+3.35 TB/s floor it is 0.9 ms. A −0.7 ms step therefore needs fp8 KV, not a faster bf16 body.

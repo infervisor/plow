@@ -1871,6 +1871,10 @@ struct Tn {
     // One shared tensor across layers for the same serial-chain reason. TENSOR_NONE unless the
     // fold is enabled, so every other blob stays byte-identical.
     mrgc: u32,
+    // Split-KV workspace of the sm_90a v3 flash prefill (PLOW_NV_FA_V3_SPLITKV): per slot a u32
+    // counter, 128 rows of (m, l) and 128 x hd_max f32 of O; n_cu slots. Zeroed at load and
+    // self-cleaning like `mrgc`. Carried in the fused prefill flash's t1 (mlpart, unused there).
+    fa_ws: u32,
     hn: u32,
     // Gemma-4 E-series per-layer inputs (TENSOR_NONE elsewhere): the packed embedding table
     // [vocab][L*P], the context projection [L*P][H] and its norm gamma [P]; activations
@@ -2267,6 +2271,21 @@ fn declare(
         // (b, head-group) slot the kernel indexes exists whatever GF the hd selects.
         mrgc: if merge_fold {
             ac(b, "mrgc", (dbatch.max(1) * c.heads) as u64 * 4)
+        } else {
+            TENSOR_NONE
+        },
+        fa_ws: if emit_config::active().nv_fa_split_prefill
+            && emit_config::active().tma_gemm
+            && !emit_is_amd()
+            && !emit_is_apple()
+            && c.tp == 1
+            && !fp8_kv
+            && matches!(c.hd_full, 256 | 512)
+            && matches!(c.hd_slide, 256 | 512)
+        {
+            let slots = b.n_cu() as u64;
+            let hd_max = c.hd_full.max(c.hd_slide) as u64;
+            ac(b, "fa_ws", slots * (1 + 128 * 2 + 128 * hd_max) * 4)
         } else {
             TENSOR_NONE
         },
@@ -5636,6 +5655,9 @@ fn emit_phase(
                 d.t[7] = n.vcs[l]; // fp8-KV per-row scales (NONE in bf16 mode)
                 if let Some(h) = fa_tm {
                     d.t[7] = h;
+                    if fused && n.fa_ws != TENSOR_NONE {
+                        d.t[1] = n.fa_ws;
+                    }
                 }
                 // Fused epilogue: t[5] is the final bf16 attention output (n.at). When !fused
                 // it stays NONE and flash_prefill writes the f32 partial for d_flash_merge.

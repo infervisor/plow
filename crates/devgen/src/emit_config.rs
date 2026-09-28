@@ -294,6 +294,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NV_FA_MMA_HD128", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub nv_fa_mma_hd128: bool,
 
+    /// sm_90a v3 flash prefill splits the KV of launches with few items across CTAs (riders,
+    /// short session suffixes) through the `fa_ws` workspace.
+    #[arg(long, env = "PLOW_NV_FA_SPLIT_PREFILL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_fa_split_prefill: bool,
+
     /// Head-number split (3*nhn <= n_cu).
     #[arg(long, env = "PLOW_HN_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub hn_split: bool,
@@ -1431,6 +1436,7 @@ impl EmitConfig {
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
             nv_fa_fold_wide: env_bool_default_true("PLOW_NV_FA_FOLD_WIDE"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
+            nv_fa_split_prefill: env_bool_default_true("PLOW_NV_FA_SPLIT_PREFILL"),
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),

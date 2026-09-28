@@ -4556,9 +4556,10 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
          * the shipped body. */
         if constexpr (HD == 256 || HD == 512) {
             if (nsplit == 1 && O && mapkv) {
+                /* fused: mlpart carries the split-KV workspace (devgen `fa_ws`) */
                 d_flash_prefill_sm90_v3<HD>(Q, O, seq_q, seq_kv, n_head, n_kv_head, q_pos0, window,
                                             kv_stride, kv_mask, scale, slice, nblk, lds, req,
-                                            mapkv);
+                                            mapkv, mlpart);
                 return;
             }
 #if PLOW_NV_FA_V3 >= 2
