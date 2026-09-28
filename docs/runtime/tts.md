@@ -315,6 +315,23 @@ solo-normalized shares sum to ~1.0 (`free`) and ~1.3 (`rr`). Use `rr` when co-se
 Tried and reverted (no gain): single-step ticks while a co-tenant waits, and holding the turn for
 a whole encoder/codec/vocoder sequence (worse: a 166 ms S3Gen render then blocks everyone).
 
+### Voice agent co-serve
+
+Qwen3-ASR + Gemma 4 E4B + Chatterbox-MTL in one `plowrt serve`: `--co-sched deadline`,
+`PLOW_LIVE_CTX_MODELS=qwen3-asr=768,chatterbox-mtl=512`, `--session-ttl-ms 60000`, LLM assets
+last. `scripts/voice/serve_voice_agent.sh` launches it under `gpulease` + `timeout`, runs
+`scripts/voice/call_sim.py` per call count and prints the SLO table
+(`scripts/voice/slo_table.py`):
+
+```sh
+# assets: campaign.py build recipes/infervisor/{qwen3-asr,gemma-4-e4b,chatterbox-mtl}/sm90a-h100-tp1.toml --out $VA_BUILD_ROOT/<model>
+VA_BUILD_ROOT=<dir> MANIFEST=<asr clips.json> PY=<python with aiohttp numpy soundfile> \
+  scripts/voice/serve_voice_agent.sh calls <resdir> 10 20 30   # or: serve <resdir>
+```
+
+Memory and scheduling rationale and results: [gemma4-e4b-h100.md](gemma4-e4b-h100.md) "Voice
+co-serving".
+
 ## Validation tools (`scripts/tts/`)
 
 | tool | use |
