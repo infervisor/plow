@@ -60,6 +60,10 @@ struct Schedule {
     slack: std::time::Duration,
     window_hold: std::time::Duration,
     window_batch: usize,
+    /// Render cost model for fitting windows to a capacity, in frames: a launch's floor and each
+    /// item's frames beyond its window (the prompt tail).
+    launch_frames: usize,
+    item_frames: usize,
     sample_rate: f64,
 }
 
@@ -82,6 +86,8 @@ impl Schedule {
             slack: std::time::Duration::from_millis(c.parameters.get("render.slack_ms").copied().unwrap_or(600)),
             window_hold: std::time::Duration::from_millis(c.parameters.get("render.window_hold_ms").copied().unwrap_or(500)),
             window_batch: c.parameters.get("render.window_batch").map_or(c.max_batch, |&v| v as usize),
+            launch_frames: c.parameters.get("render.launch_frames").map_or(370, |&v| v as usize),
+            item_frames: c.parameters.get("render.item_frames").map_or(4, |&v| v as usize),
             sample_rate: c.parameters.get("audio.sample_rate").map_or(24000.0, |&v| v as f64),
         })
     }
@@ -89,6 +95,29 @@ impl Schedule {
     fn windowed(&self) -> bool {
         self.max_window > 0
     }
+}
+
+/// Window length for one launch of stream windows: of the cached capacities' frame counts, the one
+/// delivering the most new tokens per unit of render cost. `jobs` are (tokens available from the
+/// window start, left context, closed). Windows are clipped to it, so a launch pays for no
+/// padding beyond the windows too short to fill it.
+fn fit_window(caps: &[(usize, usize)], jobs: &[(usize, usize, bool)], sc: &Schedule) -> usize {
+    let mut best = (0.0, sc.max_window);
+    for f in caps.iter().map(|c| c.1).collect::<std::collections::BTreeSet<_>>() {
+        let Some(batch) = caps.iter().filter(|c| c.1 == f && c.0 >= jobs.len()).map(|c| c.0).min() else { continue };
+        let new: usize = jobs
+            .iter()
+            .map(|&(avail, ctx, closed)| {
+                let hold = if closed && avail <= f { 0 } else { sc.hold };
+                avail.min(f).saturating_sub(ctx + hold)
+            })
+            .sum();
+        let yield_ = new as f64 / (sc.launch_frames + batch * (f + sc.item_frames)) as f64;
+        if yield_ > best.0 {
+            best = (yield_, f);
+        }
+    }
+    best.1
 }
 
 #[derive(Debug, Clone)]
@@ -174,13 +203,13 @@ impl Utterance {
 
     /// What the next render covers: a stream window `[emitted - context, now)` (at most
     /// `max_window` tokens) on the cached capacities, else the whole prefix.
-    fn span(&self, sc: &Schedule) -> Span {
+    fn span(&self, sc: &Schedule, limit: usize) -> Span {
         let n = self.tokens.len();
         if !(sc.windowed() && matches!(self.reply, Reply::Stream(_))) {
             return Span { start: 0, end: n.min(sc.max_tokens), last: self.t3_ms.is_some() };
         }
         let start = (self.emitted / sc.samples_per_token).saturating_sub(sc.context);
-        let end = n.min(start + sc.max_window);
+        let end = n.min(start + limit.min(sc.max_window));
         Span { start, end, last: self.t3_ms.is_some() && end == n }
     }
 
@@ -395,6 +424,28 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, credit:
             }
         }
         held_since = None;
+        let mut limit = sc.max_window;
+        if sc.windowed() && stream(&live[&due[0]]) {
+            let jobs: Vec<(usize, usize, bool)> = due
+                .iter()
+                .map(|k| {
+                    let (u, s) = (&live[k], live[k].span(&sc, sc.max_window));
+                    (u.tokens.len() - s.start, u.emitted / sc.samples_per_token - s.start, u.t3_ms.is_some())
+                })
+                .collect();
+            limit = fit_window(&vocoder.window_capacities, &jobs, &sc);
+            // A window adding no audio at that length waits for the next launch.
+            let hold = sc.hold;
+            due.retain(|k| {
+                let u = &live[k];
+                let s = u.span(&sc, limit);
+                let ctx = u.emitted / sc.samples_per_token - s.start;
+                u.rendered == 0 || s.last || s.end - s.start > ctx + hold
+            });
+            if due.is_empty() {
+                continue;
+            }
+        }
         let first = due.iter().any(|k| live[k].first_chunk());
         // Cleared on every exit, a panicking render included, so the LM never waits forever.
         struct Urgent<'a>(&'a DownstreamCredit);
@@ -418,7 +469,7 @@ fn render_loop(vocoder: &Codec, sc: Schedule, rx: mpsc::Receiver<S3Msg>, credit:
         let guard = Urgent(credit);
         let t = std::time::Instant::now();
         // Submitted together so the vocoder worker batches them into one launch.
-        let spans: Vec<Span> = due.iter().map(|k| live[k].span(&sc)).collect();
+        let spans: Vec<Span> = due.iter().map(|k| live[k].span(&sc, limit)).collect();
         let renders: Vec<_> = due
             .iter()
             .zip(&spans)
@@ -672,6 +723,8 @@ mod tests {
         slack: std::time::Duration::ZERO,
         window_hold: std::time::Duration::ZERO,
         window_batch: 1,
+        launch_frames: 370,
+        item_frames: 4,
         sample_rate: 24000.0,
     };
 
@@ -683,7 +736,7 @@ mod tests {
                 u.t3_ms = Some(1.0);
             }
             while u.due(sc) {
-                let span = u.span(sc);
+                let span = u.span(sc, sc.max_window);
                 let base = span.start * sc.samples_per_token;
                 let pcm: Vec<f32> = (base..span.end * sc.samples_per_token).map(|i| (i % 1024) as f32).collect();
                 let more = u.take(Decoded { pcm, phase: vec![0.0; sc.harmonics] }, span, 1.0, sc);
@@ -718,6 +771,17 @@ mod tests {
         assert_eq!(next, total * sc.samples_per_token);
     }
 
+    #[test]
+    fn fitted_window_trades_padding_for_length() {
+        let caps = [(1, 32), (8, 32), (8, 64), (64, 32), (64, 64)];
+        let sc = Schedule { max_window: 64, ..SC };
+        // Long backlogs fill the widest window; short ones would pad it.
+        assert_eq!(fit_window(&caps, &[(70, 8, false); 40], &sc), 64);
+        assert_eq!(fit_window(&caps, &[(34, 8, false); 40], &sc), 32);
+        // Batch of 1: a lone first chunk.
+        assert_eq!(fit_window(&caps, &[(20, 0, false)], &sc), 32);
+    }
+
     /// Windows of `context` left tokens (capped at `max_window`) emit every sample exactly once.
     #[test]
     fn stream_windows_cover_each_sample_once() {
@@ -741,7 +805,7 @@ mod tests {
             }
             if u.due(&SC) {
                 let pcm: Vec<f32> = (0..n * SC.samples_per_token).map(|i| (i % 1024) as f32).collect();
-                let more = u.take(Decoded { pcm, phase: Vec::new() }, u.span(&SC), 1.0, &SC);
+                let more = u.take(Decoded { pcm, phase: Vec::new() }, u.span(&SC, SC.max_window), 1.0, &SC);
                 assert_eq!(more, n != 90);
             }
         }

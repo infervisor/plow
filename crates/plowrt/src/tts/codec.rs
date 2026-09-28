@@ -71,6 +71,8 @@ pub struct Codec {
     pub voices: Vec<String>,
     /// Largest window a cached capacity holds (0: the packet has none).
     pub max_window: usize,
+    /// The cached capacities as (batch, frames).
+    pub window_capacities: Vec<(usize, usize)>,
     /// Optional packet parameters (e.g. a streaming schedule).
     pub parameters: std::collections::BTreeMap<String, u64>,
 }
@@ -132,12 +134,13 @@ impl Codec {
                     bound.voices.clone(),
                     bound.parameters.clone(),
                     max_window,
+                    bound.cached.iter().map(|c| (c.0, c.1)).collect::<Vec<_>>(),
                 );
                 let _ = ready_tx.send(Ok(info));
                 run(rx, bound);
             })
             .map_err(|e| e.to_string())?;
-        let (max_batch, max_frames, min_frames, frame_codes, frame_samples, window, lookahead, voices, parameters, max_window) =
+        let (max_batch, max_frames, min_frames, frame_codes, frame_samples, window, lookahead, voices, parameters, max_window, window_capacities) =
             ready_rx.recv().map_err(|e| e.to_string())??;
         Ok(Codec {
             tx: Mutex::new(tx),
@@ -151,6 +154,7 @@ impl Codec {
             lookahead,
             voices,
             max_window,
+            window_capacities,
             parameters,
         })
     }
@@ -321,6 +325,7 @@ impl Bound {
             .cloned()
             .ok_or_else(|| format!("{} x {frames} frames exceeds every codec capacity", jobs.len()))?;
         let fc = self.frame_codes;
+        let t0 = std::time::Instant::now();
         // Only the capacity's region of the (widest-capacity) input and output tensors moves: the
         // whole PCM tensor is hundreds of MB.
         let mut codes = vec![0u32; cb * cf * fc];
@@ -363,7 +368,9 @@ impl Bound {
             self.runtime.write_tensor(seam, bytemuck::cast_slice(&s)).map_err(e)?;
             self.runtime.write_tensor(next_seam, bytemuck::cast_slice(&ns)).map_err(e)?;
         }
+        let t1 = std::time::Instant::now();
         self.runtime.run_sequence(&programs).map_err(e)?;
+        let (t2, gpu_us) = (std::time::Instant::now(), self.runtime.last_run_us());
         let mut pcm = vec![0f32; cb * cf * self.frame_samples];
         self.runtime.read_tensor_at(self.pcm, 0, bytemuck::cast_slice_mut(&mut pcm)).map_err(e)?;
         let mut phase_out = Vec::new();
@@ -371,6 +378,19 @@ impl Bound {
             phase_out = vec![0f32; out.bytes / 4];
             self.runtime.read_tensor(out, bytemuck::cast_slice_mut(&mut phase_out)).map_err(e)?;
         }
+        tracing::debug!(
+            target: "plowrt::tts::codec_launch",
+            jobs = jobs.len(),
+            window,
+            frames,
+            cb,
+            cf,
+            h2d_us = (t1 - t0).as_micros() as u64,
+            run_us = (t2 - t1).as_micros() as u64,
+            gpu_us = gpu_us as u64,
+            d2h_us = t2.elapsed().as_micros() as u64,
+            "codec launch"
+        );
         let per = cf * self.frame_samples;
         debug_assert!(cb * per <= pcm.len());
         Ok(jobs

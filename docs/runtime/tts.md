@@ -160,6 +160,12 @@ harmonic phase at the seam (`phase` / `seam` / `next_seam` tensors), and the ren
 `stream.fade_samples` as before. Due windows share one launch; while every due window has
 `render.slack_ms` (600) of audio buffered, or up to `render.window_hold_ms` (500) while most live
 streams are not due, the launch waits for more (wider launches cost less per token).
+Each launch fits its windows to one capacity length: of the cached capacities' frame counts it
+takes the one delivering the most new tokens per unit of render cost (`render.launch_frames` 370 +
+batch x (frames + `render.item_frames` 4), the H100 cost of a cached render in frames) and clips
+every window to it; the rest of a clipped window's tokens go in a later launch. Before, a launch
+padded every window to its longest one and rounded up to the next capacity (33 frames ran as 64):
+at c200 only 34% of the rendered capacity frames became delivered audio (56% fitted).
 `PLOW_TTS_STREAM_WINDOWS=0` restores prefix re-renders. Each CFM step is 4 programs (`CFM_PARTS`):
 the LM's decode launches get in only between programs.
 
@@ -193,6 +199,56 @@ the T3 decode launches contend for the device (T3 ~80 ms per token per stream at
 standalone step at 128 rows).
 
 Stock reference (fp32, one request at a time): 1.31 aps, RTF 0.69 (T3 21 ms / token).
+
+Fitted windows (5eea79c4 + this change, same client; 96-request streamed CER median 0.000 at c1
+and at c16, per language ar 0.028, de 0, en 0, es 0, fr 0.011, hi 0.145, ja 0.017, zh 0):
+
+| conc | stream aps before | stream aps | TTFA p50 / p90 | failed |
+|---|---|---|---|---|
+| 1 | 7.2 | 7.1 | 165 / 165 ms | 0 |
+| 16 | 31.4 | 35.1 | 0.80 / 0.89 s | 0 |
+| 32 | 32.0 | 35.8 | 1.4 / 1.8 s | 0 |
+| 64 | 31.6 | 42.6 | 1.9 / 2.7 s | 0 |
+| 128 | 42.2 | 49.9 | 4.7 / 6.0 s | 0 |
+| 200 | 37.3 | 52.2 | 9.4 / 10.4 s | 0 |
+
+English Chatterbox: stream c16 32.8, c64 43.4 aps (was 29.9 / 33.1), CER 0.000. The codec's
+per-launch trace (`RUST_LOG=plowrt::tts::codec_launch=debug`: jobs, frames, capacity, H2D / run /
+D2H us) put the render at 89% of wall time at c200 with host copies under 0.3%.
+
+### S3Gen per op
+
+Per-op marginal GPU time (`packet_bench PACKET vocoder.synth ROLE N --sweep`: instruction i costs
+us(cap i+1) - us(cap i)) against a roofline of max(FLOPs / 989 TFLOP/s bf16, bytes / 3.35 TB/s),
+`csynth.b32.t64` (64 CFG items x 136 rows = 8704 rows), one CFM step (programs 5-8, 56 transformer
+blocks + 14 resnets). Timings came from a shared GPU (other agents' unleased processes), so read
+the ratios, not the last digit.
+
+| op | shape (rows x K x N) | impl | n | GFLOP | roofline us | measured us | % roof | % step |
+|---|---|---|---|---|---|---|---|---|
+| Conv1dF32 qkv | 8704x256x1536 | split-bf16 x3 | 56 | 383 | 1069 | 8957 | 12 | 23.3 |
+| Conv1dF32 ff1 +gelu | 8704x256x1024 | split-bf16 x3 | 56 | 256 | 762 | 8308 | 9 | 21.6 |
+| Conv1dF32 ff2 +res | 8704x1024x256 | split-bf16 x3 | 56 | 256 | 911 | 6902 | 13 | 17.9 |
+| Conv1dF32 out +res | 8704x512x256 | split-bf16 x3 | 56 | 128 | 605 | 4389 | 14 | 11.4 |
+| LayerNormF32 | 8704x256 | f32 | 141 | 1.6 | 750 | 3057 | 25 | 7.9 |
+| AttentionF32 (prefix 306) | b64 q136 kv136+306 h8x64 | f32 tc | 56 | 441 | 1234 | 1941 | 64 | 5.0 |
+| Conv1dF32 resnet k3 | 8704x768x256 | split-bf16 x3 | 26 | 89 | 145 | 2345 | 6 | 6.1 |
+| Conv1dF32 resnet res | 8704x256x256 | split-bf16 x3 | 12 | 14 | 97 | 683 | 14 | 1.8 |
+| GatherRows (time emb add) | 8704x256 | f32 | 14 | 0 | 74 | 620 | 12 | 1.6 |
+| Unary mish | 8704x256 | f32 | 29 | 0 | 154 | 469 | 33 | 1.2 |
+| **step** | | | | 1593 | 5888 | 38498 | 15 | |
+
+The encoder (program 0: conformer over prompt + tokens, 39 ms) and HiFT (program 41: 53 ms, its
+k3..k11 convs at 8-15% of roofline, snake unaries at 27%) are 13% of the render; the 10 CFM steps
+are 87%. Per delivered audio second a full `csynth.b32.t64` launch (53 new tokens per window) costs
+10 ms of GPU, `b64.t32` (21 new tokens) 13 ms.
+
+The GEMMs run at 9-14% of the bf16 roofline; standalone (`speech_f32_op_test --bench-cfm`) qkv
+takes 185 us, of which 3 us is the MMAs (dropping them: 182 us), 15 us the global loads, 67 us the
+epilogue, and 85 us the k-loop skeleton alone (split, shared stores, barriers, ldmatrix), with the
+ldmatrix results consumed by the next instruction (8 warps per SM, one block). A single bf16 pass
+(flag bit 16, tried) saved 7-22% per GEMM and 9-10% per render but moved the mel 3e-3 rel-L2 from
+the torch reference (was 1e-5), so it was dropped.
 
 ## Concurrency
 

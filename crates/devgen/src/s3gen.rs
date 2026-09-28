@@ -1484,6 +1484,11 @@ fn pipeline_section(
         // buffered, or up to 500 ms while most live streams are not due (up to the widest batch).
         ("render.slack_ms".into(), 600),
         ("render.window_hold_ms".into(), 500),
+        // Window length per launch (render loop): an H100 cached render costs ~96 ms + 0.13 ms
+        // per mel row, i.e. a floor of ~370 frames (2 rows each) and PROMPT_TAIL_ROWS / 2 frames
+        // per item beyond its window.
+        ("render.launch_frames".into(), 370),
+        ("render.item_frames".into(), u64::from(PROMPT_TAIL_ROWS / 2)),
         ("vocoder.harmonics".into(), u64::from(cfg.harmonics)),
     ]);
     let strings = BTreeMap::from([("voices".into(), cfg.voices.join("\n"))]);
