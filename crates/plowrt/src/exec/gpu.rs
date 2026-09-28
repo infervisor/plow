@@ -6590,9 +6590,11 @@ impl GpuEngine {
     /// Bench-only: move slot `b` back to position `len` (at most its current one), keeping the
     /// cache rows below it, so repeated timed steps read the same kv length.
     pub fn rewind_slot(&mut self, b: usize, len: usize) -> Result<()> {
-        if self.vmm.is_some() || self.recurrent.is_some() || len > self.pos[b] as usize {
+        if self.recurrent.is_some() || len > self.pos[b] as usize {
             return Err(RuntimeError::Rejected("rewind_slot: unsupported slot state".into()));
         }
+        // VMM rows below the old position stay mapped; only the prefix history shrinks with it.
+        self.seq_tokens[b].truncate(len);
         self.pos[b] = len as _;
         Ok(())
     }
@@ -6714,14 +6716,25 @@ impl GpuEngine {
                 }
             }
         }
+        let host_t = pf_packlog_on().then(std::time::Instant::now);
+        let mut marks = [0u64; 3];
         let started = (|| {
             self.begin_slot(b, total)?;
+            if let Some(t) = host_t {
+                marks[0] = t.elapsed().as_nanos() as u64;
+            }
             let frontier = self.attach_prompt(b, prompt)?;
+            if let Some(t) = host_t {
+                marks[1] = t.elapsed().as_nanos() as u64;
+            }
             if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
                 // Wider decode rungs write idle rows too. Reserve those before
                 // one request can consume their remaining physical pages.
                 for slot in 0..self.batch {
                     v.kv.ensure_rows(slot, 1)?;
+                }
+                if let Some(t) = host_t {
+                    marks[2] = t.elapsed().as_nanos() as u64;
                 }
                 let margin = (v.kv.block_rows() as usize).max(self.pf_max_rows());
                 let rows = total.saturating_add(margin).min(self.max_ctx);
@@ -6729,6 +6742,18 @@ impl GpuEngine {
             }
             Ok(frontier)
         })();
+        if let Some(t) = host_t {
+            let us = |ns: u64| ns as f64 / 1e3;
+            let end = t.elapsed().as_nanos() as u64;
+            eprintln!(
+                "PACKLOG ADMIT slot={} begin_us={:.0} attach_us={:.0} ensure_all_us={:.0} ensure_rows_us={:.0}",
+                b,
+                us(marks[0]),
+                us(marks[1].saturating_sub(marks[0])),
+                us(marks[2].saturating_sub(marks[1])),
+                us(end.saturating_sub(marks[2].max(marks[1])))
+            );
+        }
         match started {
             Ok(frontier) => {
                 self.packed_admission[b] = PackedAdmission::Ready;

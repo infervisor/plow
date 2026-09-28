@@ -196,6 +196,10 @@ On 54f789dd:
   15.2 ms, 1943 tok/s. 200 calls: 406 ms (p90 578), TPOT 32.3 ms, 3572 tok/s.
 * Plow's TTFT now leads vLLM from c1 through c32 (c8 56 vs 63 ms). vLLM's throughput leads by
   1.23x at c32, 1.5x at c64, 1.55x at c128 and 1.65x at c200.
+* **The vLLM columns at c64 and up are inflated by prefix-cache hits.** Every cell reused the
+  previous cell's prompts (one `--seed`). With unique prompts per cell (`pb_bench` now seeds per
+  cell), greedy c64 is 3438 vs 4187 tok/s (1.22x) and c128 3973 vs 5103 (1.28x).
+  [throughput-audit.md](throughput-audit.md) has the accounting.
 * c64 `PLOW_PACKLOG`: decode ticks are 54% of the device time (49 rows, 52.7 ms per multistep
   tick), mixed ticks 41% (1922 prefill rows + 51 riders, 31.4 ms), host 0.3%.
 * Riding costs ~0.09 ms/row against ~0.2 ms/row for a separate step, so `sched::ride` keeps

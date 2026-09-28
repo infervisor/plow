@@ -410,13 +410,18 @@ pb_bench() {
     local lib="${PB_VLLM_ROCM_LIB:-/opt/rocm/core-7.14/lib}"
     local tokz="${PB_TOKENIZER:-zai-org/GLM-5.3}"
     PB_ARM_N=$((PB_ARM_N + 1))
+    # One seed per cell unless PB_SEED pins it. With range ratio 0 a shared seed makes each cell's
+    # first prompts the previous cell's (and a shorter ISL a prefix of a longer one), so a server
+    # with a large prefix cache (vLLM APC) skips prefill the other side computes: E4B c64/c128
+    # served ~50% cached prompts on vLLM, ~0% on plow.
+    local seed="${PB_SEED:-$((8193 + conc * 131 + isl * 7 + osl))}"
     mkdir -p "$res"
     echo "$PB_ARM_N" > "$res/$tag.armorder"
     timeout --foreground --kill-after=10s -s TERM "${PB_BENCH_TIMEOUT:-3000}" env VLLM_ROCM_LIB="$lib" "$v" \
         -m vllm.entrypoints.cli.main bench serve \
         --backend vllm --host 127.0.0.1 --port "$PB_SERVER_PORT" --model "$model" \
         --tokenizer "$tokz" --trust-remote-code --dataset-name random \
-        --seed "${PB_SEED:-8193}" --num-prompts "$np" \
+        --seed "$seed" --num-prompts "$np" \
         --random-input-len "$isl" --random-output-len "$osl" --random-range-ratio 0 \
         --max-concurrency "$conc" --request-rate "${PB_RATE:-inf}" --ignore-eos \
         --percentile-metrics ttft,tpot,itl,e2el --save-result --save-detailed \

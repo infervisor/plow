@@ -84,15 +84,31 @@ mod packlog {
 
     /// One line per mux tick: when it ended, what its prefill pass and decode launch cost, and
     /// how many rows decoded. The cumulative summary below hides WHICH ticks carried prefill.
-    pub(crate) fn tick(prefill_ns: u64, decode_ns: u64, did_prefill: bool, rows: usize) {
+    /// `steps` is the decode quantum the launch ran, `tokens` the tokens the tick emitted, and
+    /// `live`/`prefilling` the occupied slots and those still in prefill when the tick began.
+    pub(crate) fn tick(
+        prefill_ns: u64,
+        decode_ns: u64,
+        did_prefill: bool,
+        rows: usize,
+        steps: usize,
+        tokens: usize,
+        live: usize,
+        prefilling: usize,
+    ) {
         let t = START.get_or_init(std::time::Instant::now).elapsed();
         eprintln!(
-            "PACKLOG TICK t_ms={:.1} prefill_ms={:.2} decode_ms={:.2} did_prefill={} decode_rows={}",
+            "PACKLOG TICK t_ms={:.1} prefill_ms={:.2} decode_ms={:.2} did_prefill={} decode_rows={} \
+             steps={} tokens={} live={} prefilling={}",
             t.as_secs_f64() * 1e3,
             prefill_ns as f64 / 1e6,
             decode_ns as f64 / 1e6,
             did_prefill as u8,
-            rows
+            rows,
+            steps,
+            tokens,
+            live,
+            prefilling
         );
     }
 
@@ -2553,6 +2569,12 @@ fn run_one_tick(
             }
 
             let pack_t = packlog::on().then(Instant::now);
+            let (pack_live, pack_prefilling) = if pack_t.is_some() {
+                let live = slots.iter().take(cap).flatten();
+                (live.clone().count(), live.filter(|s| s.step == 0).count())
+            } else {
+                (0, 0)
+            };
             // The unified token batch decodes `feeds` inside the prefill pass and clears
             // them; the rung controller still owes that step its progress.
             let feeds_before = decode_feed_extent(&feeds);
@@ -3084,7 +3106,16 @@ fn run_one_tick(
         }
             if let Some(dt) = dec_t {
                 let decode_ns = dt.elapsed().as_nanos() as u64;
-                packlog::tick(pack_prefill_ns, decode_ns, did_prefill, feeds.len());
+                packlog::tick(
+                    pack_prefill_ns,
+                    decode_ns,
+                    did_prefill,
+                    feeds.len(),
+                    decode_progress.map_or(0, |p| p.steps.get()),
+                    tokens_this_tick,
+                    pack_live,
+                    pack_prefilling,
+                );
                 packlog::record(
                     pack_prefill_ns,
                     decode_ns,
@@ -4874,6 +4905,7 @@ fn gpu_prefill_batched_pass(
         crate::config::RuntimeConfig::get().pf_interleave_adaptive,
     );
     loop {
+        let host_t = packlog::on().then(Instant::now);
         for (i, slot) in slots.iter_mut().enumerate().take(cap) {
             let Some(request) = slot.as_mut().filter(|s| s.step == 0) else {
                 continue;
@@ -5035,13 +5067,14 @@ fn gpu_prefill_batched_pass(
         if pack.is_empty() {
             return tick_fault;
         }
-        if packlog::on() {
+        if let Some(t) = host_t {
             eprintln!(
-                "PACKLOG PACK reqs={} rows={} decode_feeds={} unified={}",
+                "PACKLOG PACK reqs={} rows={} decode_feeds={} unified={} admit_plan_us={:.0}",
                 pack.len(),
                 pack.iter().map(|p| p.2).sum::<usize>(),
                 feeds.len(),
-                unified
+                unified,
+                t.elapsed().as_secs_f64() * 1e6
             );
         }
         let riders = if unified { feeds.len() + pending_first.len() } else { 0 };
