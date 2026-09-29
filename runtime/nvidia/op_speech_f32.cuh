@@ -3102,7 +3102,8 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
          * Rows past M or N read nothing (their outputs are not stored). */
         const float* xa = x + (size_t)(m0 + sr) * lda + gi * K + sc;
         const float* wb = w + (size_t)(og + n0 + sr) * K + sc;
-        const size_t wsn = (size_t)((N + 127u) & ~127u) * 128u; /* bytes of one pre-split half per k-tile */
+        const unsigned wsn = ((N + 127u) & ~127u) * 128u; /* bytes of one pre-split half per k-tile */
+        const char* bsrc = (const char*)w + (size_t)n0 * 128u + tid * 16u;
         const unsigned ma = M > m0 + sr ? (M - m0 - sr + 15u) / 16u : 0u, nb = N > n0 + sr ? (N - n0 - sr + 15u) / 16u : 0u;
         const bool leaky = a.pre == 9u;
         const float* xb[TAPS ? 8 : 1];
@@ -3155,13 +3156,12 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
         };
         /* k-tile kt's pre-split B halves into B buffer b. */
         auto copy_b = [&](unsigned kt, unsigned b) {
-            const char* src = (const char*)w + kt * 2u * wsn + (size_t)n0 * 128u;
-            char* dst = boff(b);
+            const char* src = bsrc + (size_t)kt * 2u * wsn;
+            char* dst = boff(b) + tid * 16u;
 #pragma unroll
             for (unsigned j = 0; j < BN / 32u; j++) {
-                const unsigned o = (j * 256u + tid) * 16u;
-                sm90_cp16(dst + o, src + o, 16);
-                sm90_cp16(dst + BOP + o, src + wsn + o, 16);
+                sm90_cp16(dst + j * 4096u, src + j * 4096u, 16);
+                sm90_cp16(dst + BOP + j * 4096u, src + wsn + j * 4096u, 16);
             }
             sm90_cp_commit();
         };

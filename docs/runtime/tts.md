@@ -522,6 +522,15 @@ steady aps, TTFA p50 7.2 -> 7.1 s; c128 66.7 aps, c64 54.7, c16 41.8, c1 7.7. Me
 1.1e-5; CER median 0.000 (96 at c1, 200 at c200), per language unchanged; English c64 57.0 aps,
 CER 0.000; Qwen3-ASR WER 3.913%; Veena CER 0.008, c64 58.0 aps.
 
+The B copy of that path takes one per-thread source pointer per tile and 32-bit offsets (it was
+recomputing 64-bit addresses per copy): the interpreter stack goes from 5272 to 4920 bytes, the
+spill load it had put on AttentionF32 (6-8% in the packet) is gone, and the GEMM gain shows in the
+render. Render (`--seq`): `b64.t32` 527 -> 500 ms, `b32.t64` 496 -> 479 (CFM program 9.65 -> 9.13
+ms). Served c200 (`--n 800`, six runs each over two leases, alternating order): 68.7 -> 71.7 steady
+aps (67.5 to 69.6 -> 70.3 to 73.0), TTFA p50 7.0 -> 6.8 s; c128 73.5 steady aps, c16
+42.7, c1 8.0. Mel rel-L2 5e-6 to 1.1e-5; CER median 0.000 (96 at c1, 200 at c200), per language
+unchanged; English c64 58.4 aps, CER 0.000; Qwen3-ASR WER 3.913%; Veena CER 0.008, c64 57.8 aps.
+
 ## Concurrency
 
 Speech requests take the LLM path on each model's mux: packed prefill (several requests' prompt
