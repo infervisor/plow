@@ -75,6 +75,8 @@ static void g_ln_stats(const float* xr, uint32_t feat, uint32_t flags, float eps
     }
 }
 
+static float g_act_f32(uint32_t kind, float x, float p0, float p1);
+
 /* LayerNormF32's per-element normalization; flags bit 0 rounds to bf16. */
 static float g_ln_apply(float x, float mean, float inv, const float* gamma, const float* beta, uint32_t i,
                         uint32_t round) {
@@ -88,13 +90,20 @@ G_K(g_layernorm_f32) {
     const float* x = PLOW_CPU_TEN(in, T, 1);
     const float* gamma = PLOW_CPU_TEN(in, T, 2);
     const float* beta = PLOW_CPU_TEN(in, T, 3);
+    const float* add = PLOW_CPU_TEN(in, T, 4);
     const uint32_t rows = in->i[0], feat = in->i[1];
     for (uint32_t row = slice; row < rows; row += nblk) {
         const float* xr = x + (size_t)row * feat;
         float* yr = out + (size_t)row * feat;
         float mean, inv;
         g_ln_stats(xr, feat, in->i[2], in->fj[0].f, &mean, &inv);
-        for (uint32_t i = 0; i < feat; i++) yr[i] = g_ln_apply(xr[i], mean, inv, gamma, beta, i, in->i[2] & 1u);
+        for (uint32_t i = 0; i < feat; i++) {
+            /* flags bits 4-7: activation after the affine; t4: a [feat] row added after it. */
+            float v = g_ln_apply(xr[i], mean, inv, gamma, beta, i, 0);
+            if (in->i[2] >> 4 & 15u) v = g_act_f32(in->i[2] >> 4 & 15u, v, 0.0f, 0.0f);
+            if (add) v += add[i];
+            yr[i] = in->i[2] & 1u ? plow_bf2f(plow_f2bf(v)) : v;
+        }
     }
 }
 

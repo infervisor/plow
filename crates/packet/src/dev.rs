@@ -1938,8 +1938,9 @@ pub enum DevOp {
     Q8GemmF32 = 163,
     /// FP32 LayerNorm with population variance and optional FP32 affine parameters.
     /// Numerical flag `i2` bit 0 rounds each output to BF16; bit 1 computes mean and variance
-    /// with ordered FP32 accumulation.
-    /// `t0=out t1=x t2=gamma? t3=beta?` · `i0=rows i1=feat i2=flags` · `f0=eps`.
+    /// with ordered FP32 accumulation; bits 4-7 apply a parameterless activation (`ACT_*`) after
+    /// the affine, then `add` (a `[feat]` row) is added, both before the BF16 rounding.
+    /// `t0=out t1=x t2=gamma? t3=beta? t4=add?` · `i0=rows i1=feat i2=flags` · `f0=eps`.
     LayerNormF32 = 164,
     /// FP32 scaled residual update: `out = a + scale * b`; output may alias either input.
     /// Numerical flag `i1` bit 0 rounds the result to BF16.

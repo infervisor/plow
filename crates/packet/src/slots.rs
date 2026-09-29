@@ -295,7 +295,7 @@ const DOC: &[S] = &[
     S { op: DevOp::GemmLtPf, t: &["out", "x", "weight"], i: &["T", "N", "K", "mode"], f: &[], j: &[] },
     S { op: DevOp::GemmBlkPf, t: &["out", "x", "weight", "w_scale", "xq", "x_scale", "bias"], i: &["T", "N", "K", "quantize"], f: &[], j: &[] },
     S { op: DevOp::Q8GemmF32, t: &["C", "A", "W", "bias?"], i: &["M", "N", "K", "activation", "a_row0"], f: &[], j: &[] },
-    S { op: DevOp::LayerNormF32, t: &["out", "x", "gamma?", "beta?"], i: &["rows", "feat", "flags"], f: &["eps"], j: &[] },
+    S { op: DevOp::LayerNormF32, t: &["out", "x", "gamma?", "beta?", "add?"], i: &["rows", "feat", "flags"], f: &["eps"], j: &[] },
     S { op: DevOp::ScaledAddF32, t: &["out", "a", "b"], i: &["n", "flags"], f: &["scale"], j: &[] },
     S { op: DevOp::GluF32, t: &["out", "x"], i: &["rows", "width"], f: &[], j: &[] },
     S { op: DevOp::CausalDepthwiseConv1dF32, t: &["out", "x", "weight"], i: &["rows", "channels", "kernel"], f: &[], j: &[] },

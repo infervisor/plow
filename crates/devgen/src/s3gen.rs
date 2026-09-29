@@ -220,7 +220,7 @@ pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<
     let mut prefix = PacketPrefix { model, programs: Vec::new(), input: inputs.tokens, output: inputs.tokens, input_shape: vec![u64::from(bmax * nmax)] };
     let mut names = HashMap::new();
     let mut roles = BTreeMap::new();
-    let tap_major = RefCell::new(HashMap::new());
+    let layouts = RefCell::new(HashMap::new());
     // Prefill programs first: they declare the voice caches the cached capacities read.
     let voices = (0..cfg.voices.len() as u32).map(|v| (1, 0, Mode::Prefill(v)));
     let family = |list: &[(u32, u32)], mode: Mode| list.iter().map(move |&(b, n)| (b, n, mode)).collect::<Vec<_>>();
@@ -238,7 +238,7 @@ pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<
                        body: &dyn Fn(&mut Ops) -> Result<(), String>|
          -> Result<PacketPrefix, String> {
             let program = prefix.model.progs.len() as u32;
-            let mut ops = Ops::new(prefix.program(), std::mem::take(names), ConvFusions(sites), &tap_major);
+            let mut ops = Ops::new(prefix.program(), std::mem::take(names), ConvFusions(sites), &layouts);
             body(&mut ops)?;
             let (prefix, n) = ops.finish((batch * tokens).max(1));
             *names = n;
@@ -259,16 +259,21 @@ pub fn lower_s3gen(dir: &std::path::Path, n_cu: u32, target: u32, sites: Option<
     }
     let reader = crate::checkpoint::TensorReader::open(dir)?;
     let mut derived = Derived { reader: &reader, cfg: &cfg, nmax, cache: HashMap::new() };
-    let tap_major = tap_major.into_inner();
+    let layouts = layouts.into_inner();
     for tensor in &mut prefix.model.tensors {
         if let Some(name) = tensor.name.strip_prefix("w.") {
             let mut bytes = derived.bytes(name)?;
-            if let Some(&(cout, cin, k, stride)) = tap_major.get(&tensor.name) {
-                bytes = if stride > 0 {
-                    crate::codec::to_phase_major(&bytes, cin, cout, k, stride)
-                } else {
-                    to_tap_major(&bytes, cout, cin, k)
-                };
+            if let Some(&WeightLayout { cout, cin, k, stride, tap_major, split }) = layouts.get(&tensor.name) {
+                if tap_major {
+                    bytes = if stride > 0 {
+                        crate::codec::to_phase_major(&bytes, cin, cout, k, stride)
+                    } else {
+                        to_tap_major(&bytes, cout, cin, k)
+                    };
+                }
+                if split {
+                    bytes = crate::pipeline::wgmma_weight_split(&bytes, cout, cin * k);
+                }
             }
             if bytes.len() as u64 != tensor.bytes {
                 return Err(format!("{name}: {} bytes, expected {}", bytes.len(), tensor.bytes));
@@ -315,9 +320,19 @@ struct Ops<'s> {
     writer: HashMap<u32, u32>,
     readers: HashMap<u32, Vec<u32>>,
     fuse: ConvFusions<'s>,
-    /// Conv weights stored tap-major (`[cout][kernel][cin]`), or phase-major for a transposed conv
-    /// (stride > 0): name -> (cout, cin, kernel, stride).
-    tap_major: &'s RefCell<HashMap<String, (u32, u32, u32, u32)>>,
+    layouts: &'s RefCell<HashMap<String, WeightLayout>>,
+}
+
+/// How a conv weight is stored: tap-major (`[cout][kernel][cin]`), or phase-major for a transposed
+/// conv (stride > 0); `split` appends the wgmma pre-split image.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WeightLayout {
+    cout: u32,
+    cin: u32,
+    k: u32,
+    stride: u32,
+    tap_major: bool,
+    split: bool,
 }
 
 impl<'s> Ops<'s> {
@@ -325,9 +340,9 @@ impl<'s> Ops<'s> {
         p: StageProgram,
         names: HashMap<String, u32>,
         fuse: ConvFusions<'s>,
-        tap_major: &'s RefCell<HashMap<String, (u32, u32, u32, u32)>>,
+        layouts: &'s RefCell<HashMap<String, WeightLayout>>,
     ) -> Self {
-        Self { p, names, writer: HashMap::new(), readers: HashMap::new(), fuse, tap_major }
+        Self { p, names, writer: HashMap::new(), readers: HashMap::new(), fuse, layouts }
     }
 
     fn finish(self, tag: u32) -> (PacketPrefix, HashMap<String, u32>) {
@@ -430,10 +445,12 @@ impl<'s> Ops<'s> {
         } else {
             c.k > 1 && c.groups == 1 && c.cin % 4 == 0
         };
-        if tap_major {
-            let shape = (c.cout, c.cin, c.k, if c.transpose { c.stride } else { 0 });
-            let prev = self.tap_major.borrow_mut().insert(weight.clone(), shape);
-            if prev.is_some_and(|p| p != shape) {
+        let split = !c.transpose && c.groups == 1 && c.cin % 4 == 0 && (c.k == 1 || tap_major);
+        if tap_major || split {
+            let stride = if c.transpose { c.stride } else { 0 };
+            let layout = WeightLayout { cout: c.cout, cin: c.cin, k: c.k, stride, tap_major, split };
+            let prev = self.layouts.borrow_mut().insert(weight.clone(), layout);
+            if prev.is_some_and(|p| p != layout) {
                 return Err(format!("{weight}: used with two conv shapes"));
             }
         }
@@ -463,6 +480,7 @@ impl<'s> Ops<'s> {
                 split_bf16: !c.transpose,
                 weight_tap_major: tap_major,
                 wgmma: true,
+                weight_split: split,
             })
         })
     }
@@ -477,7 +495,13 @@ impl<'s> Ops<'s> {
     }
 
     fn layer_norm(&mut self, x: u32, out: &str, w: &str, rows: u32, width: u32, epsilon: f32) -> Result<u32, String> {
+        self.layer_norm_act(x, out, w, rows, width, epsilon, Activation::None, None)
+    }
+
+    /// `layer_norm`, then `act`, then `+ add` (a `[width]` weight row), in one op.
+    fn layer_norm_act(&mut self, x: u32, out: &str, w: &str, rows: u32, width: u32, epsilon: f32, act: Activation, add: Option<&str>) -> Result<u32, String> {
         let (g, b) = (format!("w.{w}.g"), format!("w.{w}.b"));
+        let add = add.map(|a| format!("w.{a}"));
         self.op(&[x], out, |p, output, deps| {
             p.layer_norm_f32(x, deps, LayerNormRowsF32Stage {
                 output,
@@ -486,6 +510,8 @@ impl<'s> Ops<'s> {
                 rows,
                 width,
                 epsilon,
+                activation: act,
+                add_row: add.as_deref().map(TensorRef::Named),
             })
         })
     }
@@ -897,16 +923,13 @@ impl Lowering<'_> {
         c.pad = (2, 0);
         c.lengths = Some(len2);
         let y1 = o.conv(x, "act.s3gen.y1", c)?;
-        o.layer_norm(y1, "act.s3gen.y1", &format!("{p}.ln1"), r, D_CFM, 1e-5)?;
-        o.unary(y1, r, D_CFM, 0, 0, Activation::Mish, 0.0, 0.0)?;
         let tv = format!("cfm.tvec.s{step}.r{j}");
-        o.gather(Table::Weight(&tv, 1), None, "act.s3gen.y1", Gather { rows: r, width: D_CFM, vocab: 1, per_item: r, repeat: r, accumulate: true, ..Default::default() })?;
+        o.layer_norm_act(y1, "act.s3gen.y1", &format!("{p}.ln1"), r, D_CFM, 1e-5, Activation::Mish, Some(&tv))?;
         let mut c = Conv::new(&c2, b2, t1, D_CFM, D_CFM, 3);
         c.pad = (2, 0);
         c.lengths = Some(len2);
         let y2 = o.conv(y1, "act.s3gen.y2", c)?;
-        o.layer_norm(y2, "act.s3gen.y2", &format!("{p}.ln2"), r, D_CFM, 1e-5)?;
-        o.unary(y2, r, D_CFM, 0, 0, Activation::Mish, 0.0, 0.0)?;
+        o.layer_norm_act(y2, "act.s3gen.y2", &format!("{p}.ln2"), r, D_CFM, 1e-5, Activation::Mish, None)?;
         let mut c = Conv::new(&res, b2, t1, cin, D_CFM, 1);
         c.lengths = Some(len2);
         c.residual = Some(y2);

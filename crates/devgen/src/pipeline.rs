@@ -447,6 +447,37 @@ pub struct Conv1dF32Stage<'a> {
     /// % 4 == 0, or tap-major with 64-channel groups) runs the same product on warpgroup MMA; the
     /// interpreter falls back to the other paths elsewhere.
     pub wgmma: bool,
+    /// Flag bit 18: the weight tensor carries [`wgmma_weight_split`]'s image after the f32 weights,
+    /// which an ungrouped wgmma conv copies as its B operand; without it such a conv takes the
+    /// other paths.
+    pub weight_split: bool,
+}
+
+/// The pre-split B operand of an ungrouped wgmma conv (flag bit 18), appended to its f32 weights
+/// `[n][k]` (`k` = kernel * cin, tap-major): zero padding to the next 1024 bytes, then per 64-column
+/// k-tile the bf16 hi halves then the lo halves (`lo = bf16(v - hi)`, both round-to-nearest-even)
+/// of `n` rows padded to 128, each row 128 bytes whose 16-byte chunk `c` sits at `c ^ (row & 7)`.
+pub fn wgmma_weight_split(weights: &[u8], n: u32, k: u32) -> Vec<u8> {
+    let (n, k) = (n as usize, k as usize);
+    let (base, np, tiles) = (weights.len().next_multiple_of(1024), n.next_multiple_of(128), k.div_ceil(64));
+    let mut out = weights.to_vec();
+    out.resize(base + tiles * 2 * np * 128, 0);
+    for (r, row) in weights.chunks_exact(4 * k).enumerate().take(n) {
+        for (j, v) in row.chunks_exact(4).enumerate() {
+            let v = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+            let hi = crate::config::bf16_round(v);
+            let lo = crate::config::bf16_round(v - hi);
+            let at = base + (j / 64) * 2 * np * 128 + r * 128 + ((j % 64 / 8) ^ (r & 7)) * 16 + j % 8 * 2;
+            out[at..at + 2].copy_from_slice(&((hi.to_bits() >> 16) as u16).to_le_bytes());
+            let at = at + np * 128;
+            out[at..at + 2].copy_from_slice(&((lo.to_bits() >> 16) as u16).to_le_bytes());
+        }
+    }
+    out
+}
+
+fn wgmma_weight_split_bytes(f32_bytes: u64, n: u32, k: u32) -> u64 {
+    f32_bytes.next_multiple_of(1024) + u64::from(k.div_ceil(64)) * 2 * u64::from(n.next_multiple_of(128)) * 128
 }
 
 impl Conv1dF32Stage<'_> {
@@ -1229,6 +1260,12 @@ impl StageProgram {
             // One alpha tensor: a snake output activation reads it per output channel, so the
             // input takes no activation.
             || (stage.output_activation == Activation::Snake && stage.input_activation != Activation::None)
+            || (stage.weight_split
+                && (transpose
+                    || stage.groups != 1
+                    || stage.weight_f16
+                    || !(stage.wgmma && stage.split_bf16)
+                    || !(stage.kernel == 1 || stage.weight_tap_major)))
         {
             return Err("invalid convolution geometry".into());
         }
@@ -1245,8 +1282,11 @@ impl StageProgram {
         } else {
             stage.kernel
         };
-        let weight_bytes = product(&[stage.out_channels, stage.in_channels / stage.groups, taps])?
+        let mut weight_bytes = product(&[stage.out_channels, stage.in_channels / stage.groups, taps])?
             * if stage.weight_f16 { 2 } else { 4 };
+        if stage.weight_split {
+            weight_bytes = wgmma_weight_split_bytes(weight_bytes, stage.out_channels, stage.in_channels * stage.kernel);
+        }
         let weight = self.resolve(stage.weight, weight_bytes, "convolution weight")?;
         let bias = match stage.bias {
             Some(bias) => self.resolve(bias, u64::from(stage.out_channels) * 4, "convolution bias")?,
@@ -1280,7 +1320,8 @@ impl StageProgram {
             | (1 << 13)
             | (u32::from(stage.split_bf16) << 14)
             | (u32::from(stage.weight_tap_major) << 15)
-            | (u32::from(stage.wgmma && stage.split_bf16) << 17);
+            | (u32::from(stage.wgmma && stage.split_bf16) << 17)
+            | (u32::from(stage.weight_split) << 18);
         let op = if transpose { DevOp::ConvTranspose1dF32 } else { DevOp::Conv1dF32 };
         let units = conv1d_units(&stage, transpose, out_rows, self.builder.n_cu());
         self.emit(op, units, deps, output, |d| {
@@ -1552,6 +1593,10 @@ pub struct LayerNormRowsF32Stage<'a> {
     pub rows: u32,
     pub width: u32,
     pub epsilon: f32,
+    /// Flag bits 4-7: a parameterless activation after the affine.
+    pub activation: Activation,
+    /// A `[width]` row added after the activation.
+    pub add_row: Option<TensorRef<'a>>,
 }
 
 impl StageProgram {
@@ -1562,7 +1607,9 @@ impl StageProgram {
         deps: &[u32],
         stage: LayerNormRowsF32Stage<'_>,
     ) -> Result<Emitted, String> {
-        if stage.rows == 0 || stage.width == 0 || !stage.epsilon.is_finite() || stage.epsilon <= 0.0 {
+        let parameterless =
+            !matches!(stage.activation, Activation::LeakyRelu | Activation::Snake | Activation::Clamp | Activation::ScaleShift);
+        if stage.rows == 0 || stage.width == 0 || !stage.epsilon.is_finite() || stage.epsilon <= 0.0 || !parameterless {
             return Err("invalid layer-normalization stage".into());
         }
         let bytes = f32_bytes(product(&[stage.rows, stage.width])?)?;
@@ -1574,10 +1621,11 @@ impl StageProgram {
         };
         let gamma = affine(stage.gamma, "layer-norm gamma")?;
         let beta = affine(stage.beta, "layer-norm beta")?;
+        let add = affine(stage.add_row, "layer-norm row")?;
         // One warp per row, eight warps per slice.
         self.emit(DevOp::LayerNormF32, u64::from(stage.rows).div_ceil(8), deps, output, |d| {
-            d.t[..4].copy_from_slice(&[output, x, gamma, beta]);
-            d.i[..3].copy_from_slice(&[stage.rows, stage.width, 0]);
+            d.t[..5].copy_from_slice(&[output, x, gamma, beta, add]);
+            d.i[..3].copy_from_slice(&[stage.rows, stage.width, stage.activation.code() << 4]);
             d.f[0] = stage.epsilon;
         })
     }
@@ -2104,6 +2152,7 @@ mod tests {
             split_bf16: false,
             weight_tap_major: false,
             wgmma: false,
+            weight_split: false,
         };
         let mut p = prefix.program();
         let a = p.conv1d_f32(x, false, &[], conv("h", "w1", 7, 3, 9, Activation::Snake, None)).unwrap();

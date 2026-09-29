@@ -1582,10 +1582,14 @@ static_assert(PLOW_NV_WARPS * SPL_COLS <= SP_ARENA_FLOATS, "layernorm row stage"
 /* LayerNormF32 (double statistics) over rows of 128..512 columns: each lane holds its float4s of
  * R rows in registers, so a row is read once and R rows' loads are in flight together (one row
  * per warp is latency-bound). */
+__device__ __forceinline__ float sp_act(unsigned kind, float x, float p0, float p1);
+static __device__ __noinline__ float sp_act_call(unsigned kind, float x, float p0);
+template <unsigned ACT>
 static __device__ __noinline__ void sp_layernorm_rows(float* __restrict__ out, const float* __restrict__ x,
                                                       const float* __restrict__ gamma, const float* __restrict__ beta,
                                                       unsigned rows, unsigned feat, unsigned flags, float eps,
-                                                      unsigned slice, unsigned nblk, float* stats) {
+                                                      unsigned slice, unsigned nblk, float* stats,
+                                                      const float* __restrict__ add) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     constexpr unsigned R = 2, V = 4;
     const unsigned nv = feat / 128u;
@@ -1630,15 +1634,19 @@ static __device__ __noinline__ void sp_layernorm_rows(float* __restrict__ out, c
             const unsigned c = u * 128u + lane * 4u;
             const float4 g = gamma ? __ldg((const float4*)(gamma + c)) : make_float4(1.f, 1.f, 1.f, 1.f);
             const float4 b = beta ? __ldg((const float4*)(beta + c)) : make_float4(0.f, 0.f, 0.f, 0.f);
+            const float4 ad = add ? __ldg((const float4*)(add + c)) : make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
             for (unsigned r = 0; r < R; r++) {
                 if (row0 + r >= rows) continue;
                 const float xa[4] = {v[r][u].x, v[r][u].y, v[r][u].z, v[r][u].w}, ga[4] = {g.x, g.y, g.z, g.w},
-                            ba[4] = {b.x, b.y, b.z, b.w};
+                            ba[4] = {b.x, b.y, b.z, b.w}, aa[4] = {ad.x, ad.y, ad.z, ad.w};
                 float y[4];
 #pragma unroll
                 for (unsigned q = 0; q < 4; q++) {
-                    const float t = __fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(xa[q], mean[r]), inv[r]), ga[q]), ba[q]);
+                    float t = __fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(xa[q], mean[r]), inv[r]), ga[q]), ba[q]);
+                    if constexpr (ACT == 10u) t = sp_act(10u, t, 0.f, 0.f);
+                    else if constexpr (ACT != 0u) t = sp_act_call(flags >> 4 & 15u, t, 0.f);
+                    if (add) t = __fadd_rn(t, aa[q]);
                     y[q] = flags & 1u ? sp_bf16(t) : t;
                 }
                 *(float4*)(out + (size_t)(row0 + r) * feat + c) = make_float4(y[0], y[1], y[2], y[3]);
@@ -1647,10 +1655,13 @@ static __device__ __noinline__ void sp_layernorm_rows(float* __restrict__ out, c
     }
 }
 
+/* flags bits 4-7 (double statistics): an output activation (sp_act kind, parameterless) after the
+ * affine; t4 (optional, [feat]) added after it, before the bf16 rounding. */
 static __device__ __noinline__ void d_layernorm_f32(float* __restrict__ out, const float* __restrict__ x,
                                        const float* __restrict__ gamma, const float* __restrict__ beta,
                                        unsigned rows, unsigned feat, unsigned flags, float eps,
-                                       unsigned slice, unsigned nblk, float* arena, float* stats = nullptr) {
+                                       unsigned slice, unsigned nblk, float* arena, float* stats = nullptr,
+                                       const float* add = nullptr) {
     arena = sp_smem;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     if (flags & 2u) {
@@ -1761,9 +1772,12 @@ static __device__ __noinline__ void d_layernorm_f32(float* __restrict__ out, con
         }
         return;
     }
+    const unsigned act = flags >> 4 & 15u;
     if (feat % 128u == 0 && feat <= 512u && sp_aligned(x, 16) && (!out || sp_aligned(out, 16)) &&
-        (!gamma || sp_aligned(gamma, 16)) && (!beta || sp_aligned(beta, 16))) {
-        sp_layernorm_rows(out, x, gamma, beta, rows, feat, flags, eps, slice, nblk, stats);
+        (!gamma || sp_aligned(gamma, 16)) && (!beta || sp_aligned(beta, 16)) && (!add || sp_aligned(add, 16))) {
+        if (act == 0u) sp_layernorm_rows<0>(out, x, gamma, beta, rows, feat, flags, eps, slice, nblk, stats, add);
+        else if (act == 10u) sp_layernorm_rows<10>(out, x, gamma, beta, rows, feat, flags, eps, slice, nblk, stats, add);
+        else sp_layernorm_rows<16>(out, x, gamma, beta, rows, feat, flags, eps, slice, nblk, stats, add);
         return;
     }
     for (unsigned row = slice * PLOW_NV_WARPS + warp; row < rows; row += nblk * PLOW_NV_WARPS) {
@@ -1785,6 +1799,8 @@ static __device__ __noinline__ void d_layernorm_f32(float* __restrict__ out, con
         for (unsigned i = lane; i < feat; i += 32u) {
             float v = __fmul_rn(__fsub_rn(xr[i], mean), inv);
             v = __fadd_rn(__fmul_rn(v, gamma ? gamma[i] : 1.0f), beta ? beta[i] : 0.0f);
+            if (act) v = sp_act_call(act, v, 0.f);
+            if (add) v = __fadd_rn(v, add[i]);
             yr[i] = flags & 1u ? sp_bf16(v) : v;
         }
     }
@@ -3043,19 +3059,30 @@ __device__ __forceinline__ float spg_post(unsigned post, float x, float p) {
     default: return x;
     }
 }
+/* The pre-split weight image of an ungrouped wgmma conv (flags bit 18), past the f32 weights
+ * at the next 1024-byte boundary: per 64-column k-tile, the hi then the lo bf16 halves of all
+ * output rows (padded to 128, zero past N and K), each row 128 B swizzled as the B operand, so a
+ * tile's B halves are two contiguous runs of BN rows. */
+__device__ __forceinline__ const float* spwg_wsplit(const SpConvArgs& a) {
+    return (const float*)((const char*)a.w + (((size_t)a.cout * a.cg * a.kernel * 4u + 1023u) & ~(size_t)1023u));
+}
 template <unsigned BN, bool TAPS, unsigned P, bool GR = false>
 static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsigned K, const float* x, const float* w,
                                                   const SpConvEpi1& ep, unsigned slice, unsigned nblk) {
     char* sm = (char*)sm90_align1024(sp_smem);
-    /* A stage is [Ahi | Alo | Bhi | Blo] (A halves SPWG_OP bytes, B halves BN rows); 128x64 tiles
-     * have two, so the next k-tile's split and stores run under this one's MMAs. */
+    /* Operands: A halves SPWG_OP bytes, B halves BN rows. Ungrouped (WS), w is the pre-split
+     * image and B's halves arrive by cp.async into two buffers, the next k-tile's under this one's
+     * MMAs; A has two buffers where they fit (128x64 tiles). Grouped, a stage is [Ahi | Alo | Bhi |
+     * Blo] with both operands split from f32 loads, two stages where they fit. */
+    constexpr bool WS = !GR;
     constexpr unsigned BOP = BN * SPWG_BK * 2u, LDO = BN + 8u, NG = BN / 8u, SZ = 2u * SPWG_OP + 2u * BOP;
-    constexpr bool DB = 2u * SZ + 1024u <= SP_ARENA_FLOATS * 4u;
-    char* ahi = sm;
-    char* bhi = sm + 2u * SPWG_OP;
+    constexpr bool DB = WS ? 4u * SPWG_OP + 4u * BOP + 1024u <= SP_ARENA_FLOATS * 4u : 2u * SZ + 1024u <= SP_ARENA_FLOATS * 4u;
+    constexpr unsigned NA = DB ? 2u : 1u, OPS = WS ? NA * 2u * SPWG_OP + 4u * BOP : NA * SZ;
+    auto aoff = [&](unsigned b) { return sm + (WS ? b * 2u * SPWG_OP : b * SZ); };
+    auto boff = [&](unsigned b) { return sm + (WS ? NA * 2u * SPWG_OP + b * 2u * BOP : b * SZ + 2u * SPWG_OP); };
     float* stage = (float*)sm;         /* the output tile, after the last k-tile's MMAs */
     /* The tile's bias, loaded with its first k-tile and staged past the operand and output stages. */
-    constexpr unsigned BIAS_OFF = (DB ? 2u * SZ : SZ) > 128u * LDO * 4u ? (DB ? 2u * SZ : SZ) : 128u * LDO * 4u;
+    constexpr unsigned BIAS_OFF = OPS > 128u * LDO * 4u ? OPS : 128u * LDO * 4u;
     static_assert(BIAS_OFF + BN * 4u + 1024u <= SP_ARENA_FLOATS * 4u, "wgmma bias stage");
     float* bias_s = (float*)(sm + BIAS_OFF);
     const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, wg = warp >> 2;
@@ -3075,6 +3102,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
          * Rows past M or N read nothing (their outputs are not stored). */
         const float* xa = x + (size_t)(m0 + sr) * lda + gi * K + sc;
         const float* wb = w + (size_t)(og + n0 + sr) * K + sc;
+        const size_t wsn = (size_t)((N + 127u) & ~127u) * 128u; /* bytes of one pre-split half per k-tile */
         const unsigned ma = M > m0 + sr ? (M - m0 - sr + 15u) / 16u : 0u, nb = N > n0 + sr ? (N - n0 - sr + 15u) / 16u : 0u;
         const bool leaky = a.pre == 9u;
         const float* xb[TAPS ? 8 : 1];
@@ -3088,7 +3116,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
                 len[p] = p < ma && t < a.conv_len(b) ? (int)a.length(b) : 0;
             }
         }
-        float4 va[8], vb[BN / 16u];
+        float4 va[8], vb[WS ? 1u : BN / 16u];
         auto load = [&](unsigned kt) {
             const unsigned k = kt * SPWG_BK;
             const bool kin = k + sc < K;
@@ -3110,16 +3138,32 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
                 for (unsigned p = 0; p < 8; p++)
                     va[p] = kin && p < ma ? __ldg((const float4*)(xa + (size_t)16u * p * lda + k)) : make_float4(0.f, 0.f, 0.f, 0.f);
             }
+            if constexpr (!WS) {
 #pragma unroll
-            for (unsigned p = 0; p < BN / 16u; p++)
-                vb[p] = kin && p < nb ? __ldg((const float4*)(wb + (size_t)16u * p * K + k)) : make_float4(0.f, 0.f, 0.f, 0.f);
+                for (unsigned p = 0; p < BN / 16u; p++)
+                    vb[p] = kin && p < nb ? __ldg((const float4*)(wb + (size_t)16u * p * K + k)) : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
         };
         auto store = [&](unsigned b) {
 #pragma unroll
-            for (unsigned p = 0; p < 8; p++) spwg_split_store(ahi + b * SZ, SPWG_OP, sr + 16u * p, sc, va[p]);
+            for (unsigned p = 0; p < 8; p++) spwg_split_store(aoff(b), SPWG_OP, sr + 16u * p, sc, va[p]);
+            if constexpr (!WS) {
 #pragma unroll
-            for (unsigned p = 0; p < BN / 16u; p++) spwg_split_store(bhi + b * SZ, BOP, sr + 16u * p, sc, vb[p]);
+                for (unsigned p = 0; p < BN / 16u; p++) spwg_split_store(boff(b), BOP, sr + 16u * p, sc, vb[p]);
+            }
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        };
+        /* k-tile kt's pre-split B halves into B buffer b. */
+        auto copy_b = [&](unsigned kt, unsigned b) {
+            const char* src = (const char*)w + kt * 2u * wsn + (size_t)n0 * 128u;
+            char* dst = boff(b);
+#pragma unroll
+            for (unsigned j = 0; j < BN / 32u; j++) {
+                const unsigned o = (j * 256u + tid) * 16u;
+                sm90_cp16(dst + o, src + o, 16);
+                sm90_cp16(dst + BOP + o, src + wsn + o, 16);
+            }
+            sm90_cp_commit();
         };
         load(0u);
         const float bpre = a.bias && tid < BN && n0 + tid < N ? __ldg(a.bias + og + n0 + tid) : 0.f;
@@ -3128,15 +3172,20 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             pending = false;
         }
         __syncthreads();
+        if constexpr (WS) copy_b(0u, 0u);
         store(0u);
         if (tid < BN) bias_s[tid] = bpre;
+        if constexpr (WS) {
+            sm90_cp_wait<0>();
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        }
         __syncthreads();
         if (DB && nk > 1u) load(1u);
         float acc[BN / 2u];
         for (unsigned kt = 0; kt < nk; kt++) {
-            const unsigned b = DB ? kt & 1u : 0u;
-            const uint64_t dah = sm90_desc(ahi + b * SZ + wg * 64u * 128u), dal = sm90_desc(ahi + b * SZ + SPWG_OP + wg * 64u * 128u);
-            const uint64_t dbh = sm90_desc(bhi + b * SZ), dbl = sm90_desc(bhi + b * SZ + BOP);
+            const unsigned b = DB ? kt & 1u : 0u, bb = WS ? kt & 1u : b;
+            const uint64_t dah = sm90_desc(aoff(b) + wg * 64u * 128u), dal = sm90_desc(aoff(b) + SPWG_OP + wg * 64u * 128u);
+            const uint64_t dbh = sm90_desc(boff(bb)), dbl = sm90_desc(boff(bb) + BOP);
             sm90_wg_fence();
 #pragma unroll
             for (unsigned s = 0; s < SPWG_BK / 16u; s++) {
@@ -3152,10 +3201,17 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
                 }
             }
             sm90_wg_commit();
+            if constexpr (WS) {
+                if (kt + 1u < nk) copy_b(kt + 1u, bb ^ 1u);
+            }
             if constexpr (DB) {
                 if (kt + 1u < nk) store(b ^ 1u);
                 if (kt + 2u < nk) load(kt + 2u);
                 sm90_wg_wait<0>();
+                if constexpr (WS) {
+                    sm90_cp_wait<0>();
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                }
                 __syncthreads();
             } else {
                 if (kt + 1u < nk) load(kt + 1u);
@@ -3163,6 +3219,10 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
                 __syncthreads();
                 if (kt + 1u < nk) {
                     store(0u);
+                    if constexpr (WS) {
+                        sm90_cp_wait<0>();
+                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    }
                     __syncthreads();
                 }
             }
@@ -3243,7 +3303,7 @@ __device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, u
     const unsigned mt = (M + 127u) / 128u * a.groups, r128 = (mt * ((a.ng + 127u) / 128u) + nblk - 1u) / nblk,
                    r64 = (mt * ((a.ng + 63u) / 64u) + nblk - 1u) / nblk;
     const unsigned K = a.kernel * a.cg;
-    const float* w = (const float*)a.w;
+    const float* w = a.groups > 1u ? (const float*)a.w : spwg_wsplit(a);
     const bool wide = 20u * r128 <= 13u * r64;
     /* The combinations the speech lowerings use: pointwise with none / GELU / other, taps with
      * none / snake / other, grouped pointwise with none. */
@@ -3280,7 +3340,7 @@ __device__ __forceinline__ bool sp_wg_conv1d(const PlowDevInst* in, void* const*
     /* Grouped pointwise convs (group widths % 4 == 0) run per group; the rest as the wide tile. */
     const bool grouped = a.groups > 1u && a.kernel == 1u && a.post == 0u && a.ng % 4u == 0 && a.cin % 4u == 0 &&
                          !a.wf16 && ((in->fj[2].u >> 14) & 1u);
-    if (!grouped && !sp_w_conv_width(in, a, nblk)) return false;
+    if (!grouped && (!((in->fj[2].u >> 18) & 1u) || !sp_w_conv_width(in, a, nblk))) return false;
     sp_wg_run(a, slice, nblk);
     return true;
 }
@@ -4020,7 +4080,7 @@ static __device__ __noinline__ void d_speech_f32(const PlowDevInst* in, void* co
         break;
     case PLOW_DOP_LAYERNORM_F32:
         d_layernorm_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2), (const float*)SP_TEN(3),
-                        in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk, arena);
+                        in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk, arena, nullptr, (const float*)SP_TEN(4));
         break;
     case PLOW_DOP_SCALED_ADD_F32:
         d_scaled_add_f32((float*)SP_TEN(0), (const float*)SP_TEN(1), (const float*)SP_TEN(2), in->i[0],

@@ -464,6 +464,7 @@ fn fused_conv(p: &mut StageProgram, fuse: ConvFusions<'_>, x: u32, dep: u32, c: 
         split_bf16: false,
         weight_tap_major: phase_major(&c),
         wgmma: false,
+        weight_split: false,
     })?;
     let out_rows = if c.transpose {
         (c.in_rows - 1) * c.stride + c.kernel + c.dilation - 2 * c.pad

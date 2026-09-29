@@ -342,13 +342,14 @@ static void t_conv(const char* name, unsigned batches, unsigned frames, unsigned
     run(name, c, g_conv2d_f32, {o}, flags & 128u ? BF16 : FP32, 1e-5, flags & 128u ? n / 20000 : 0);
 }
 
-static void t_layernorm(const char* name, unsigned rows, unsigned feat, unsigned flags, bool affine) {
+static void t_layernorm(const char* name, unsigned rows, unsigned feat, unsigned flags, bool affine, bool add = false) {
     Case c;
     unsigned o = c.out((size_t)rows * feat), x = c.f32((size_t)rows * feat, 2.f, 0.5f);
     unsigned g = affine ? c.f32(feat, 0.5f, 1.f) : PLOW_TENSOR_NONE;
     unsigned b = affine ? c.f32(feat, 0.2f) : PLOW_TENSOR_NONE;
     c.in.op = PLOW_DOP_LAYERNORM_F32;
     c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = g; c.in.t[3] = b;
+    c.in.t[4] = add ? c.f32(feat, 0.7f) : PLOW_TENSOR_NONE;
     c.in.i[0] = rows; c.in.i[1] = feat; c.in.i[2] = flags; c.in.fj[0].f = 1e-5f;
     run(name, c, g_layernorm_f32, {o}, flags & 1u ? BF16 : FP32);
 }
@@ -593,6 +594,33 @@ static unsigned conv_out_rows(const ConvSpec& s, bool transpose) {
     return (s.in_rows + s.before + s.after - s.dil_or_opad * (s.kernel - 1) - 1) / s.stride + 1;
 }
 
+static uint16_t bf16_rn(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return (uint16_t)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+}
+/* Appends the wgmma pre-split image (Conv1dF32 flags bit 18) of f32 weights [n][k]: at the next
+ * 1024-byte boundary, per 64-column k-tile the hi then lo bf16 halves of n rows padded to 128,
+ * each row's 16-byte chunk c at chunk c ^ (row & 7). */
+static void append_wsplit(std::vector<uint8_t>& w, unsigned n, unsigned k) {
+    const size_t base = (w.size() + 1023) & ~(size_t)1023, np = (n + 127) & ~127u, kt = (k + 63) / 64;
+    std::vector<float> f(w.size() / 4);
+    memcpy(f.data(), w.data(), f.size() * 4);
+    w.resize(base + kt * 2 * np * 128, 0);
+    for (size_t t = 0; t < kt; t++)
+        for (size_t r = 0; r < n; r++)
+            for (size_t j = 0; j < 64 && t * 64 + j < k; j++) {
+                const float v = f[r * k + t * 64 + j];
+                const uint16_t hi = bf16_rn(v);
+                const uint32_t hb = (uint32_t)hi << 16;
+                float hf;
+                memcpy(&hf, &hb, 4);
+                const uint16_t lo = bf16_rn(v - hf);
+                const size_t off = base + t * 2 * np * 128 + r * 128 + (((j / 8) ^ (r & 7)) * 16) + (j % 8) * 2;
+                memcpy(&w[off], &hi, 2);
+                memcpy(&w[off + np * 128], &lo, 2);
+            }
+}
 static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) {
     const unsigned out_rows = conv_out_rows(s, transpose);
     o = c.out((size_t)s.batch * out_rows * s.cout);
@@ -618,6 +646,8 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
                 for (unsigned k = 0; k < s.kernel; k++)
                     memcpy(&c.host[w][(((size_t)o * s.kernel + k) * cg + i) * es], &src[(((size_t)o * cg + i) * s.kernel + k) * es], es);
     }
+    const bool wsplit = s.wg && !transpose && s.groups == 1 && !s.f16;
+    if (wsplit) append_wsplit(c.host[w], s.cout, s.cin * s.kernel);
     unsigned b = s.bias ? c.f32(s.cout, 0.2f) : PLOW_TENSOR_NONE;
     unsigned a = s.alpha ? c.f32(std::max(s.cin, s.cout), 0.4f, 0.6f) : PLOW_TENSOR_NONE;
     unsigned r = s.residual ? c.f32((size_t)s.batch * out_rows * s.cout, 1.f) : PLOW_TENSOR_NONE;
@@ -629,7 +659,7 @@ static void build_conv(Case& c, const ConvSpec& s, bool transpose, unsigned& o) 
     c.in.i[4] = s.kernel; c.in.i[5] = s.stride; c.in.i[6] = s.dil_or_opad; c.in.i[7] = s.groups;
     c.in.fj[0].f = s.slope; c.in.fj[1].u = pads(s.before, s.after);
     c.in.fj[2].u = conv_flags(s.mode, s.pre, s.post, s.f16) | (s.tc ? 1u << 13 : 0u) | (s.wide ? 1u << 14 : 0u) |
-                   (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u);
+                   (s.tapmajor ? 1u << 15 : 0u) | (s.wg ? 1u << 17 : 0u) | (wsplit ? 1u << 18 : 0u);
 }
 
 static void t_conv1d(const char* name, const ConvSpec& s, double tol = 2e-5) {
@@ -1125,6 +1155,9 @@ int main(int argc, char** argv) {
             c.in.t[0] = o; c.in.t[1] = x; c.in.t[2] = g; c.in.t[3] = b;
             c.in.i[0] = rows; c.in.i[1] = feat; c.in.i[2] = 0; c.in.fj[0].f = 1e-5f;
             bench("CFM LayerNormF32 8704x256", c, 0, 8.0 * rows * feat);
+            c.in.t[4] = c.f32(feat, 0.7f);
+            c.in.i[2] = 10u << 4;
+            bench("CFM LayerNormF32 + Mish + row 8704x256", c, 0, 8.0 * rows * feat);
         }
         for (unsigned rows : {136u, 72u}) {
             /* CFM self-attention: 64 CFG items, 8 heads x 64, fused QKV, 306-row prompt prefix. */
@@ -1398,6 +1431,10 @@ int main(int argc, char** argv) {
     }
     t_layernorm("LayerNormF32 double rows 9120x256", 9120, 256, 0, true);
     t_layernorm("LayerNormF32 double rows 1001x512 bf16", 1001, 512, 1, true);
+    t_layernorm("LayerNormF32 rows Mish + row 9216x256", 9216, 256, 10u << 4, true, true);
+    t_layernorm("LayerNormF32 rows Mish 1001x256", 1001, 256, 10u << 4, true);
+    t_layernorm("LayerNormF32 rows GELU + row bf16 777x512", 777, 512, 11u << 4 | 1u, true, true);
+    t_layernorm("LayerNormF32 double Mish + row 33x513", 33, 513, 10u << 4, true, true);
     {
         ConvSpec cs[] = {
             {2, 1024, 512, 512, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true, {}, 0.f, true},

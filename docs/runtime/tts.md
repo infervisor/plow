@@ -504,6 +504,24 @@ Two extra cached capacities (`(64, 36)`, `(64, 68)`) cut render per new token by
 the fit picked `(64, 36)` for nearly every c200 launch, but served no faster (66.0 vs 66.3 steady
 aps), so the recipe keeps the 32/64 ladder.
 
+Pre-split weights (Conv1dF32 flags bit 18): devgen appends to an ungrouped split-bf16 conv's f32
+weights the bf16 hi / lo halves of its B operand, per 64-column k-tile and in the 128-byte swizzle
+wgmma reads (`pipeline::wgmma_weight_split`), and the wgmma GEMM copies a tile's halves with
+`cp.async` into two B buffers, the next k-tile's under this one's MMAs, instead of loading and
+splitting f32 rows per thread (same products, bit-identical). An ungrouped wgmma conv without the
+image takes the other paths. The CFM resnet's LayerNorm, Mish and time-embedding add run as one
+LayerNormF32 (flags bits 4-7: a parameterless activation after the affine; t4: a `[feat]` row
+added after it), which drops the UnaryF32 and the accumulating GatherRowsF32. Standalone
+(`--bench-cfm`): qkv 111 -> 98 us, ff1 99 -> 91, ff2 89 -> 81, out 52 -> 48.
+
+The interpreter's stack grows from 4632 to 5272 bytes and its attention runs 6-8% slower in the
+packet (the attention functions' code is unchanged; the interpreter body spills more), which eats
+part of the GEMM gain. Render (`--seq`): `b64.t32` 544 -> 528 ms, `b32.t64` 524 -> 494, `b8.t32`
+150 -> 143; HiFT 46 -> 42 ms. Served c200 (`--n 800`, six runs each, same lease): 67.6 -> 68.1
+steady aps, TTFA p50 7.2 -> 7.1 s; c128 66.7 aps, c64 54.7, c16 41.8, c1 7.7. Mel rel-L2 5e-6 to
+1.1e-5; CER median 0.000 (96 at c1, 200 at c200), per language unchanged; English c64 57.0 aps,
+CER 0.000; Qwen3-ASR WER 3.913%; Veena CER 0.008, c64 58.0 aps.
+
 ## Concurrency
 
 Speech requests take the LLM path on each model's mux: packed prefill (several requests' prompt
