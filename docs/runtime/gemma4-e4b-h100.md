@@ -815,3 +815,72 @@ but loses (the PLE input gate runs at 2% of roofline natively at B>=96).
   exposed over HTTP (the top 20 logits only).
 * **Unused segment objects.** The segment script's pfseg/pfgemm objects fault on this packet
   (`CUDA_ERROR_LAUNCH_FAILED`). Only the flash objects are used.
+
+## Decode step campaign: routed rungs (B=48..128), H100
+
+Base = origin 0ba67dab (recipe as shipped). Final = base + this change + `PLOW_EMIT_DECODE_CUBLASLT_HEAD=1`
+in the recipe. step_bench ctx 1024. The fnv digests are identical to base at B=1/8/32/48/64/96/128,
+so no numerics change.
+
+| B | 1 | 8 | 32 | 48 | 64 | 96 | 128 |
+|---|---|---|---|---|---|---|---|
+| base ms | 5.72 | 6.18 | 8.62 | 9.47 | 9.79 | 11.65 | 12.05 |
+| final ms | 5.72 | 6.15 | 8.60 | 7.45 | 7.63 | 9.35 | 9.68 |
+| vLLM ms (audit trace) | | | | | 7.39 | | 9.43 |
+
+Served (`llm_grid.sh` ISL 128 / OSL 512 greedy, `--multistep-adaptive`, 2 reps, p50):
+
+| cell | base | final | vLLM |
+|---|---|---|---|
+| c1 TPOT / tok/s | 5.70 / 175 | 5.70 / 175 | 5.70 / 174 |
+| c64 TPOT / tok/s | 9.27 / 6759 | 7.18 / 8636 | 6.80 / 8916 |
+| c128 TPOT / tok/s | 11.18 / 11117 | 8.86 / 13932 | 8.40 / 14088 |
+| c64 / c128 TTFT ms | 74 / 110 | 91 / 111 | 181 / 338 |
+| d64x1024 / d128x1024 tok/s | 4921 / 6829 | 5866 / 7828 | 5866 / 7664 |
+
+E4B logit gate (top1), three runs each:
+* final: 0.9845 / 0.9845 / 0.9845.
+* base: 0.9795 / 0.9795 / 0.9795.
+* At a9702c17 the same gate gave 0.9845 / 0.9845 / 0.9795. The gate flips between these two
+  states from run to run.
+
+What changed (all in the routed rungs' captured graph):
+* Every interpreter window between cuBLASLt calls is now a light launch. Gemma objects compile
+  light ABI 2: the instruction and its resolved tensor pointers are passed by value
+  (`__grid_constant__`).
+  * `plow_light` runs AddNorm, Glu, NormResidual, NormResidualNorm and GluStrided.
+  * `light_attn` runs hd256/hd512 HeadNormRope followed by FlashDecode. Each flash block first
+    runs its own rows' HeadNormRope, so there is one launch per layer. The fused q|k|v output is
+    read in place.
+  * The logits tail is `light_capmax` (SoftCap and the chunked Argmax in one pass) followed by
+    `light_tail` (ArgmaxFin).
+* The Lt algorithm is pinned from the widest rung for every rung, so it is chosen on the summed
+  time over all routed widths (48/64/96/128), not at 128 alone. This is skipped with
+  `PLOW_LT_RUNG_ALGOS`.
+* lm_head runs on cuBLASLt: 470 µs at B=64.
+* `d_flash_decode` / `d_flash_decode_slots` take a `CLONE` template parameter. The light clone
+  therefore does not change the interpreter's inlining (stack 576 B, same SASS).
+
+B=64 final step, per step (nsys graph nodes; 7.62 ms span, 0.27 ms of gaps):
+
+| op | µs / step | per layer |
+|---|---|---|
+| light_attn (HNR + flash) | 2004 | 36-38 sliding, ~103 full |
+| gate\|up Lt | 1700 | 40.5 |
+| down Lt + splitK | 1037 | 22.5 + 2.2 |
+| light ops (5 per layer) | 875 | 4.2 |
+| lm_head Lt | 470 | |
+| q\|k\|v, o, PLE gate/proj Lt | ~1000 | 7.6 / 6.0 / 3.7 / ... |
+| head interp window + capmax + fin | 127 | |
+
+At B=128 light_attn is 3778 µs per step (90 µs per layer). That is the 8.5 ms blocker. The
+floors are ~40 µs sliding and ~160 µs full per layer, 2.5 ms per step. vLLM is 33 / 97 µs at
+B=64.
+
+Tried, not kept:
+* Tail ops (SoftCap/Argmax) inside `plow_light`: NormResidual and GluStrided became ~2 µs
+  slower, so the tail got its own kernel.
+* RGM (mma.sync) hd256 flash in the light clone (`PLOW_NV_FA_RGM_LIGHT`): no gain once HNR is
+  fused (B=64 7.71 vs 7.64). It also perturbed the interpreter arena.
+* SIMT split-K kernel for the PLE gate (N 256, K 2560): 19.7 µs with a serial last-block
+  reduce, 14.0 µs with a distributed reduce, vs 6.0 µs on Lt. B=64 was +0.36 ms.

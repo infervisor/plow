@@ -204,6 +204,8 @@ impl Lt {
         }
     }
 
+    /// `rows`: the routed decode rungs the plan's algorithm will serve (it is pinned for all of
+    /// them); load-time timing then sums over those widths instead of timing `m` alone.
     pub(crate) fn plan(
         self: &Arc<Self>,
         m: u32,
@@ -211,8 +213,9 @@ impl Lt {
         k: u32,
         weight: u64,
         template: Option<&Plan>,
+        rows: &[u32],
     ) -> Result<Arc<Plan>> {
-        self.plan_impl(m, n, k, weight, template, None)
+        self.plan_impl(m, n, k, weight, template, None, rows)
     }
 
     /// Two same-shape projections of one input as a strided batch of 2 (input batch stride 0):
@@ -225,10 +228,12 @@ impl Lt {
         weight: u64,
         pair: Pair,
         template: Option<&Plan>,
+        rows: &[u32],
     ) -> Result<Arc<Plan>> {
-        self.plan_impl(m, n, k, weight, template, Some(pair))
+        self.plan_impl(m, n, k, weight, template, Some(pair), rows)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn plan_impl(
         self: &Arc<Self>,
         m: u32,
@@ -237,6 +242,7 @@ impl Lt {
         weight: u64,
         template: Option<&Plan>,
         pair: Option<Pair>,
+        rows: &[u32],
     ) -> Result<Arc<Plan>> {
         if template.is_some_and(|p| {
             !Arc::ptr_eq(self, &p.lt) || p.shape.0 < m || (p.shape.1, p.shape.2) != (n, k)
@@ -366,7 +372,7 @@ impl Lt {
                     ),
                     "Lt workspace",
                 )?;
-                let mut results = [Heuristic::default(); 8];
+                let mut results = [Heuristic::default(); 32];
                 let mut count = 0;
                 check(
                     (self.api.cublasLtMatmulAlgoGetHeuristic)(
@@ -392,6 +398,8 @@ impl Lt {
                         RuntimeError::Device("no supported BF16 cuBLASLt algorithm".into())
                     })?;
                 plan.algo = winner.algo;
+                // More than the top 8 only when timing spans several rungs.
+                let count = if rows.len() > 1 { count } else { count.min(8) };
                 plan.select(
                     results.get(..count as usize).unwrap_or(&[]),
                     m,
@@ -399,6 +407,7 @@ impl Lt {
                     k,
                     weight,
                     pair,
+                    rows,
                 )?;
                 Ok(())
             })();
@@ -841,6 +850,7 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
+    #[allow(clippy::too_many_arguments)]
     fn select(
         &mut self,
         candidates: &[Heuristic],
@@ -849,9 +859,10 @@ impl Plan {
         k: u32,
         weight: u64,
         pair: Option<Pair>,
+        rows: &[u32],
     ) -> Result<()> {
         if let Some(pair) = pair {
-            return self.select_pair(candidates, m, n, k, weight, pair);
+            return self.select_pair(candidates, m, n, k, weight, pair, rows);
         }
         let be = Arc::clone(&self.lt.be);
         let bytes_w = n as u64 * k as u64 * 2;
@@ -873,27 +884,26 @@ impl Plan {
                 continue;
             }
             self.algo = candidate.algo;
-            let run = |i: u64| {
-                self.run(
-                    input.base,
-                    copies.base + i % repeats * bytes_w,
-                    output.base,
-                    &stream,
-                )
-            };
             // Complete a cold weight ring for every candidate; event timing excludes allocation/copy.
-            let result = (|| {
-                for i in 0..repeats {
-                    run(i)?;
+            let result = self.widths(rows, m, n, k, weight, None).and_then(|widths| {
+                let mut total = 0.0;
+                for plan in widths.iter().map(|w| w.as_deref().unwrap_or(&*self)) {
+                    let run = |i: u64| {
+                        plan.run(input.base, copies.base + i % repeats * bytes_w, output.base, &stream)
+                    };
+                    for i in 0..repeats {
+                        run(i)?;
+                    }
+                    be.event_record(&start, &stream)?;
+                    for i in 0..repeats * 2 {
+                        run(i)?;
+                    }
+                    be.event_record(&end, &stream)?;
+                    be.event_synchronize(&end)?;
+                    total += be.event_elapsed_ms(&start, &end)?;
                 }
-                be.event_record(&start, &stream)?;
-                for i in 0..repeats * 2 {
-                    run(i)?;
-                }
-                be.event_record(&end, &stream)?;
-                be.event_synchronize(&end)?;
-                be.event_elapsed_ms(&start, &end)
-            })();
+                Ok(total)
+            });
             match result {
                 Ok(ms) if ms < best => {
                     best = ms;
@@ -914,11 +924,12 @@ impl Plan {
         let index = selected
             .ok_or_else(|| RuntimeError::Device("no runnable cuBLASLt candidate".into()))?;
         self.algo = candidates[index].algo;
-        let matmul_ms = best / (repeats * 2) as f32;
+        let matmul_ms = best / (repeats * 2) as f32 / rows.len().max(1) as f32;
         tracing::info!(
             m,
             n,
             k,
+            ?rows,
             index,
             candidates = candidates.len(),
             workspace = candidates[index].workspace,
@@ -932,6 +943,7 @@ impl Plan {
     }
 
     /// Times each candidate on the live operands (warm weights, unlike [`Self::select`]).
+    #[allow(clippy::too_many_arguments)]
     fn select_pair(
         &mut self,
         candidates: &[Heuristic],
@@ -940,6 +952,7 @@ impl Plan {
         k: u32,
         weight: u64,
         pair: Pair,
+        rows: &[u32],
     ) -> Result<()> {
         let be = Arc::clone(&self.lt.be);
         let stream = be.stream_create()?;
@@ -967,18 +980,22 @@ impl Plan {
                 continue;
             }
             self.algo = candidate.algo;
-            let result = (|| {
-                for i in 0..repeats {
-                    self.run(pair.input, weight_at(i), pair.output, &stream)?;
+            let result = self.widths(rows, m, n, k, weight, Some(pair)).and_then(|widths| {
+                let mut total = 0.0;
+                for plan in widths.iter().map(|w| w.as_deref().unwrap_or(&*self)) {
+                    for i in 0..repeats {
+                        plan.run(pair.input, weight_at(i), pair.output, &stream)?;
+                    }
+                    be.event_record(&start, &stream)?;
+                    for i in 0..16 {
+                        plan.run(pair.input, weight_at(i), pair.output, &stream)?;
+                    }
+                    be.event_record(&end, &stream)?;
+                    be.event_synchronize(&end)?;
+                    total += be.event_elapsed_ms(&start, &end)?;
                 }
-                be.event_record(&start, &stream)?;
-                for i in 0..16 {
-                    self.run(pair.input, weight_at(i), pair.output, &stream)?;
-                }
-                be.event_record(&end, &stream)?;
-                be.event_synchronize(&end)?;
-                be.event_elapsed_ms(&start, &end)
-            })();
+                Ok(total)
+            });
             match result {
                 Ok(ms) if ms < best => {
                     best = ms;
@@ -1005,10 +1022,33 @@ impl Plan {
             index,
             w_stride = pair.w_stride,
             c_stride = pair.c_stride,
-            matmul_ms = best / 16.0,
+            ?rows,
+            matmul_ms = best / 16.0 / rows.len().max(1) as f32,
             "cuBLASLt pair algorithm selected"
         );
         Ok(())
+    }
+
+    /// The current algorithm as a plan at each width of `rows` (`None` = this plan's own `m`),
+    /// or an error when a width cannot run it.
+    fn widths(
+        &self,
+        rows: &[u32],
+        m: u32,
+        n: u32,
+        k: u32,
+        weight: u64,
+        pair: Option<Pair>,
+    ) -> Result<Vec<Option<Arc<Plan>>>> {
+        if rows.is_empty() {
+            return Ok(vec![None]);
+        }
+        rows.iter()
+            .map(|&r| match r == m {
+                true => Ok(None),
+                false => self.lt.plan_impl(r, n, k, weight, Some(self), pair, &[]).map(Some),
+            })
+            .collect()
     }
 
     pub(crate) fn run(&self, a: u64, w: u64, c: u64, stream: &CudaStream) -> Result<()> {

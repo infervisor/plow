@@ -1788,7 +1788,9 @@ __device__ __forceinline__ void fa_decode_d64_item(float* __restrict__ op, float
     }
 }
 
-template <int D, int GF, bool FP8KV = false, bool SZKV = false, bool SLOTMAP = false>
+/* CLONE != 0: a separate instantiation for a second caller (a light kernel), so the
+ * interpreter's copy keeps its single-caller inlining and registers. */
+template <int D, int GF, bool FP8KV = false, bool SZKV = false, bool SLOTMAP = false, int CLONE = 0>
 __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                const __nv_bfloat16* __restrict__ Q,
                                const __nv_bfloat16* __restrict__ K,
@@ -2529,14 +2531,14 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
     }
 }
 
-template <int D, int GF>
+template <int D, int GF, int CLONE = 0>
 __device__ __noinline__ void d_flash_decode_slots(
     float* Opart, float* mlpart, const __nv_bfloat16* Q, const __nv_bfloat16* K,
     const __nv_bfloat16* V, const int* kv_len, unsigned n_batch, unsigned n_head,
     unsigned n_kv_head, unsigned kv_stride, unsigned window, float scale, unsigned nsplit,
     unsigned kv_mask, unsigned slice, unsigned nblk, float* lds, unsigned kv_cap,
     const int* decode_slot, __nv_bfloat16* out = nullptr, unsigned* merge_ctr = nullptr) {
-    d_flash_decode<D, GF, false, false, true>(
+    d_flash_decode<D, GF, false, false, true, CLONE>(
         Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
         nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot, out, merge_ctr);
 }

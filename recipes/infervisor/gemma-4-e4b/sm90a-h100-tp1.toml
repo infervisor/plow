@@ -51,6 +51,9 @@ PLOW_EMIT_PREFILL_CUBLASLT = "1"
 # step_bench ctx 1024 B=48/64/96/128 11.0/11.9/15.6/16.4 -> 9.9/10.2/12.3/12.8 ms.
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "48"
+# lm_head of the routed rungs as one cuBLASLt matmul (vocab 262144, 16-aligned: no head tail):
+# step_bench ctx 1024 B=64/128 7.78/10.12 -> 7.75/9.91 ms.
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 # Every flash segment isolated: hd256 sliding + hd512 full attention run in interp_sm90a_pffa
 # (prefill 2000 rows 70 -> 48 ms). Needs the pffa/pfpackedfa role objects below.
 PLOW_SEG_FA512 = "all"

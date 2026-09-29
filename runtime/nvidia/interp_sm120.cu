@@ -3612,6 +3612,27 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
  * chain, as an ordinary launch: block `blockIdx.x` runs slice `blockIdx.x` of `blocks`, exactly
  * the body the interpreter window would run, without the window's claim loop, gates, fences and
  * counter signals. The host zeroes every wait on the instruction (stream order replaces it). */
+#if PLOW_NV_GEMMA
+/* ABI 2 (Gemma objects): the host passes the instruction and its resolved tensor pointers by
+ * value, so a launch starts on its operands instead of two dependent loads (insts, tensors). */
+struct PlowLightOp {
+    PlowDevInst d;
+    void* t[8];
+    void* fold[2]; /* FlashDecode merge fold: out, counter */
+};
+struct PlowLightSpan {
+    unsigned count;
+    unsigned x_row[4]; /* HeadNormRope x row pitch (fused q|k|v); 0 = own */
+    unsigned fused;    /* op[0..count-1) HeadNormRope feeding op[count-1] FlashDecode, in one launch */
+    PlowLightOp op[4];
+};
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light)(const __grid_constant__ PlowLightOp a) {
+    __shared__ float part[32];
+    const PlowDevInst* in = &a.d;
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+#define LIGHT_TEN(k) (a.t[k])
+#else
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm120_light)(PlowProgram prog,
                                                                                     unsigned inst) {
     __shared__ float part[32];
@@ -3624,6 +3645,7 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
     (((tw_[(k) >> 1] >> (((k) & 1) * 16)) & 0xFFFFu) == PLOW_TENSOR_NONE                       \
          ? nullptr                                                                            \
          : T[(tw_[(k) >> 1] >> (((k) & 1) * 16)) & 0xFFFFu])
+#endif
     switch (in->op) {
     case PLOW_DOP_ADD_NORM:
         d_add_norm((__nv_bfloat16*)LIGHT_TEN(0), (__nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
@@ -3634,6 +3656,24 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
         d_glu((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
               in->i[0], in->i[1], slice, nblk);
         break;
+#if PLOW_NV_GEMMA
+    case PLOW_DOP_NORM_RESIDUAL:
+        d_norm_residual((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+                        (const __nv_bfloat16*)LIGHT_TEN(2), (const __nv_bfloat16*)LIGHT_TEN(3), in->i[0],
+                        in->i[1], in->fj[0].f, in->fj[1].f, slice, nblk, part);
+        break;
+    case PLOW_DOP_NORM_RESIDUAL_NORM:
+        d_norm_residual_norm((__nv_bfloat16*)LIGHT_TEN(0), (__nv_bfloat16*)LIGHT_TEN(1),
+                             (const __nv_bfloat16*)LIGHT_TEN(2), (const __nv_bfloat16*)LIGHT_TEN(3),
+                             (const __nv_bfloat16*)LIGHT_TEN(4), (const __nv_bfloat16*)LIGHT_TEN(5), in->i[0],
+                             in->i[1], in->fj[0].f, in->fj[1].f, slice, nblk, part);
+        break;
+    case PLOW_DOP_GLU_STRIDED:
+        d_glu_strided((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+                      (const __nv_bfloat16*)LIGHT_TEN(2), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
+                      slice, nblk);
+        break;
+#endif
     default:
         __trap();
     }
@@ -3670,11 +3710,73 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
     }
 #undef LIGHT_TEN
 }
-#if !PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_MIXED_STEP
-/* The attention side of a decode layer (HeadNormRope at the object's head dim, then
- * FlashDecode) as its own kernels: `count` independent instructions from `inst` on, block `b`
- * running slice `b` of each. Only these two bodies are compiled in, so the flash row-group loop
- * keeps its registers (the interpreter entry is at the 255-register cap and spills). */
+#if PLOW_NV_GEMMA
+extern "C" __device__ unsigned PLOW_SYM(plow_light_gemma) = 1;
+/* The logits tail (SoftCap, Argmax, ArgmaxFin): its own kernel, so the light kernel's code for
+ * the per-layer ops stays as it was (these cases in it slowed NormResidual/GluStrided ~2 us). */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light_tail)(const __grid_constant__ PlowLightOp a) {
+    __shared__ unsigned long long part[PLOW_NV_WARPS];
+    const PlowDevInst* in = &a.d;
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+    switch (in->op) {
+    case PLOW_DOP_SOFTCAP:
+        d_softcap((__nv_bfloat16*)a.t[0], (const __nv_bfloat16*)a.t[1], in->i[0], in->fj[0].f, slice, nblk);
+        break;
+    case PLOW_DOP_ARGMAX:
+        d_argmax((unsigned long long*)a.t[0], (const __nv_bfloat16*)a.t[1], in->i[0], in->i[1], slice, nblk, part);
+        break;
+    case PLOW_DOP_ARGMAX_FIN:
+        d_argmax_fin((int*)a.t[0], (const unsigned long long*)a.t[1], in->i[0], in->i[1], slice);
+        break;
+    default:
+        __trap();
+    }
+}
+/* SoftCap (in place on the logits) and the batched Argmax over its output in one pass: block
+ * `blockIdx.x` takes chunk c of row b (G = gridDim.x / rows chunks per row) and leaves the
+ * chunk's packed maximum in part[b * P + c], P = the Argmax instruction's part stride; the other
+ * parts of the row are zeroed. The same values and keys as the two instructions, so ArgmaxFin
+ * picks the same token. */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light_capmax)(const __grid_constant__ PlowLightSpan a) {
+    __shared__ unsigned long long lds[PLOW_NV_WARPS];
+    const PlowDevInst* sc = &a.op[0].d;
+    const PlowDevInst* am = &a.op[1].d;
+    const unsigned n = am->i[0], B = am->i[1], P = am->blocks, G = gridDim.x / B;
+    const unsigned b = blockIdx.x / G, c = blockIdx.x % G;
+    const float cap = sc->fj[0].f, inv = 1.0f / cap;
+    const __nv_bfloat16* x = (const __nv_bfloat16*)a.op[0].t[1] + (size_t)b * n;
+    __nv_bfloat16* out = (__nv_bfloat16*)a.op[0].t[0] + (size_t)b * n;
+    unsigned long long* part = (unsigned long long*)a.op[1].t[0] + (size_t)b * P;
+    const unsigned nv = n / 8u, v0 = (unsigned)((unsigned long long)c * nv / G),
+                   v1 = (unsigned)((unsigned long long)(c + 1u) * nv / G);
+    unsigned long long best = 0;
+    auto one = [&](unsigned iv, const bf16v8& v) {
+        bf16v8 o;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            o.x[j] = __float2bfloat16(cap * tanhf(__bfloat162float(v.x[j]) * inv));
+            const unsigned long long p = amax_pack(o.x[j], iv * 8u + (unsigned)j);
+            best = p > best ? p : best;
+        }
+        st_glob8(out + (size_t)iv * 8u, o);
+    };
+    unsigned iv = v0 + threadIdx.x;
+    for (; iv + 3u * PLOW_NV_THREADS < v1; iv += 4u * PLOW_NV_THREADS) {
+        bf16v8 v[4];
+#pragma unroll
+        for (unsigned u = 0; u < 4; u++) v[u] = ld_glob8(x + (size_t)(iv + u * PLOW_NV_THREADS) * 8u);
+#pragma unroll
+        for (unsigned u = 0; u < 4; u++) one(iv + u * PLOW_NV_THREADS, v[u]);
+    }
+    for (; iv < v1; iv += PLOW_NV_THREADS) one(iv, ld_glob8(x + (size_t)iv * 8u));
+    best = block_max_u64(best, lds);
+    if (threadIdx.x == 0) part[c] = best;
+    if (c == 0)
+        for (unsigned i = G + threadIdx.x; i < P; i += PLOW_NV_THREADS) part[i] = 0ull;
+}
+#endif
 /* A fused q|k|v projection's output: HeadNormRope instruction `inst[j]` reads its x from
  * `base + col[j]` with row pitch `row` elements instead of its own x tensor. */
 struct PlowLightX {
@@ -3683,6 +3785,11 @@ struct PlowLightX {
     unsigned inst[3];
     unsigned col[3];
 };
+#if !PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_MIXED_STEP
+/* The attention side of a decode layer (HeadNormRope at the object's head dim, then
+ * FlashDecode) as its own kernels: `count` independent instructions from `inst` on, block `b`
+ * running slice `b` of each. Only these two bodies are compiled in, so the flash row-group loop
+ * keeps its registers (the interpreter entry is at the 255-register cap and spills). */
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
     PLOW_SYM(plow_sm120_light_attn)(PlowProgram prog, unsigned inst, unsigned count,
                                     PlowLightX xs) {
@@ -3868,7 +3975,119 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
         }
     }
 }
-extern "C" __device__ unsigned PLOW_SYM(plow_light_abi) = 1;
+#if PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_MIXED_STEP
+/* Gemma's attention side: HeadNormRope and FlashDecode at hd 256 (sliding) and 512 (full), with
+ * the interpreter's group factors. Same contract as the light_attn above. */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
+    PLOW_SYM(plow_sm120_light_attn)(const __grid_constant__ PlowLightSpan a) {
+    extern __shared__ float arena[];
+    const unsigned first = a.fused ? a.count - 1 : 0;
+    if (a.fused) {
+        /* Each block first runs, for the rows of its own flash items, the HeadNormRope tasks
+         * those items read (q: the item's GF heads; k/v: its KV head), one task per warp, with
+         * the same body and arithmetic as the separate launch. Items of one row on other blocks
+         * write identical values. */
+        const unsigned L = a.count - 1;
+        const PlowDevInst* fl = &a.op[L].d;
+        const unsigned nblk = fl->blocks ? fl->blocks : gridDim.x, slice = blockIdx.x;
+        const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+        const unsigned n_head = fl->i[1], nsplit = fl->i[5];
+        const unsigned GF = fl->i[6] == 256 ? PLOW_NV_FA_GF_HD256 : PLOW_NV_FA_GF_FULL;
+        const unsigned gqa = n_head / fl->i[2], n_grp = n_head / GF;
+        const unsigned n_work = fl->i[0] * n_grp * nsplit;
+        for (unsigned w = slice; slice < nblk && w < n_work; w += nblk) {
+            const unsigned hg = (w / nsplit) % n_grp, b = w / (nsplit * n_grp);
+            unsigned task = 0;
+            for (unsigned j = 0; j < L; j++) {
+                const PlowDevInst* in = &a.op[j].d;
+                const bool q = a.op[j].t[0] == a.op[L].t[2];
+                const unsigned nt = q ? GF : 1u;
+                if (warp >= task && warp < task + nt) {
+                    const unsigned hh = q ? hg * GF + (warp - task) : (hg * GF) / gqa;
+                    const long long nh = in->i[1], hd = in->i[2], stride = in->fj[1].u;
+                    const long long row = a.x_row[j] ? (long long)a.x_row[j] : nh * hd;
+                    /* d_headnorm_rope at ntok 1, nhead warp+1 runs exactly task (t 0, head
+                     * warp) on this warp; shift the operands so that is (row b, head hh). */
+                    const long long ix = b * row + hh * hd - (long long)warp * hd;
+                    const long long io = stride ? ((long long)(b * nh + hh) - warp) * stride * hd
+                                                : (((long long)in->i[3] + b) * nh + hh) * hd -
+                                                      ((long long)in->i[3] * (warp + 1) + warp) * hd;
+                    __nv_bfloat16* out = (__nv_bfloat16*)a.op[j].t[0] + io;
+                    const __nv_bfloat16* x = (const __nv_bfloat16*)a.op[j].t[1] + ix;
+                    __nv_bfloat16* out2 = in->i[7] ? (__nv_bfloat16*)a.op[j].t[6] + io : nullptr;
+                    const __nv_bfloat16* x2 = in->i[7] ? (const __nv_bfloat16*)a.op[j].t[7] + ix : nullptr;
+#define LIGHT_HNR_ROW(DD)                                                                    \
+    d_headnorm_rope<DD>(out, x, (const __nv_bfloat16*)a.op[j].t[2], (const float*)a.op[j].t[3], \
+                        (const float*)a.op[j].t[4], (const int*)a.op[j].t[5] + b, 1u, warp + 1u,   \
+                        in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4], 0u, 1u,        \
+                        in->i[6], nullptr, out2, x2, a.x_row[j])
+                    if (hd == 256)
+                        LIGHT_HNR_ROW(256);
+                    else
+                        LIGHT_HNR_ROW(512);
+#undef LIGHT_HNR_ROW
+                }
+                task += nt;
+            }
+        }
+        __threadfence();
+        __syncthreads();
+    }
+    for (unsigned i = first; i < a.count; i++) {
+        const PlowDevInst* in = &a.op[i].d;
+        const unsigned nblk = in->blocks ? in->blocks : gridDim.x, slice = blockIdx.x;
+        if (i != first) __syncthreads();
+        if (slice >= nblk) continue;
+#define LIGHT_TEN(k) (a.op[i].t[k])
+#define LIGHT_HNR(DD)                                                                        \
+    d_headnorm_rope<DD>((__nv_bfloat16*)LIGHT_TEN(0), x,                                         \
+                        (const __nv_bfloat16*)LIGHT_TEN(2), (const float*)LIGHT_TEN(3),          \
+                        (const float*)LIGHT_TEN(4), (const int*)LIGHT_TEN(5), in->i[0], in->i[1], \
+                        in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4], slice, nblk,   \
+                        in->i[6], nullptr, in->i[7] ? (__nv_bfloat16*)LIGHT_TEN(6) : nullptr,     \
+                        in->i[7] ? (const __nv_bfloat16*)LIGHT_TEN(7) : nullptr, x_row)
+#define LIGHT_FLASH(DD, GG)                                                                  \
+    do {                                                                                     \
+        __nv_bfloat16* const fold_out = (__nv_bfloat16*)a.op[i].fold[0];                    \
+        unsigned* const fold_ctr = (unsigned*)a.op[i].fold[1];                               \
+        if (LIGHT_TEN(6))                                                                    \
+            d_flash_decode_slots<DD, GG, 1>(                                                 \
+                (float*)LIGHT_TEN(0), (float*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2), \
+                (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4),     \
+                (const int*)LIGHT_TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],   \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,            \
+                (const int*)LIGHT_TEN(6), fold_out, fold_ctr);                               \
+        else                                                                                 \
+            d_flash_decode<DD, GG, false, false, false, 1>(                                  \
+                (float*)LIGHT_TEN(0), (float*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2), \
+                (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4),     \
+                (const int*)LIGHT_TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],   \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,   \
+                nullptr, nullptr, fold_out, fold_ctr);                                       \
+    } while (0)
+        const unsigned gqa = in->op == PLOW_DOP_FLASH_DECODE ? in->i[1] / in->i[2] : 0;
+        const __nv_bfloat16* x = (const __nv_bfloat16*)LIGHT_TEN(1);
+        const unsigned x_row = a.x_row[i];
+        if (in->op == PLOW_DOP_HEADNORM_ROPE && in->i[2] == 256 && in->i[5] == 0) {
+            LIGHT_HNR(256);
+        } else if (in->op == PLOW_DOP_HEADNORM_ROPE && in->i[2] == 512 && in->i[5] == 0) {
+            LIGHT_HNR(512);
+        } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == 256 && gqa % PLOW_NV_FA_GF_HD256 == 0) {
+            LIGHT_FLASH(256, PLOW_NV_FA_GF_HD256);
+        } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == 512 && gqa % PLOW_NV_FA_GF_FULL == 0) {
+            LIGHT_FLASH(512, PLOW_NV_FA_GF_FULL);
+        } else {
+            __trap();
+        }
+#undef LIGHT_FLASH
+#undef LIGHT_HNR
+#undef LIGHT_TEN
+    }
+}
+extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = 256;
+extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd2) = 512;
+#endif
+extern "C" __device__ unsigned PLOW_SYM(plow_light_abi) = PLOW_NV_GEMMA ? 2 : 1;
 #endif
 
 /* ---- host-side launch helper -----------------------------------------------------------

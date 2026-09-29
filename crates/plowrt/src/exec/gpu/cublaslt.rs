@@ -199,10 +199,54 @@ enum LightKind {
     Flash([u32; 4]),
 }
 
+/// `PlowLightOp` (light ABI 2): an instruction with its tensor pointers resolved at load.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LightOp {
+    d: DevInst64,
+    t: [u64; 8],
+    fold: [u64; 2],
+}
+
+/// `PlowLightSpan` (light ABI 2): the `light_attn` instructions of one launch.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LightSpan {
+    count: u32,
+    x_row: [u32; 4],
+    fused: u32,
+    op: [LightOp; 4],
+}
+
+impl LightOp {
+    fn resolve(d: &DevInst64, devp: &[DeviceMem]) -> Self {
+        let at = |h: u16| {
+            if h == packet::dev::TENSOR_NONE16 {
+                0
+            } else {
+                devp[h as usize].base
+            }
+        };
+        // `fj[2]` names the merge fold's tensors on FlashDecode only.
+        let fold = if d.op == DevOp::FlashDecode as u16 { d.fj[2] } else { 0 };
+        Self {
+            d: *d,
+            t: d.t.map(at),
+            fold: if fold == 0 {
+                [0; 2]
+            } else {
+                [at(fold as u16), at((fold >> 16) as u16)]
+            },
+        }
+    }
+}
+
 struct LightLaunch {
     function: KernelFn,
     xs: LightX,
     kind: LightKind,
+    /// Light ABI 2: the launch's instructions by value (`Single` = `op[0]`).
+    direct: Option<Box<LightSpan>>,
     instruction: u32,
     blocks: u32,
     block: u32,
@@ -212,6 +256,23 @@ struct LightLaunch {
 impl LightRoute {
     pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
         for launch in &self.launches {
+            if let Some(span) = &launch.direct {
+                let mut span = **span;
+                let mut op = span.op[0];
+                let mut params = [match launch.kind {
+                    LightKind::Single => &mut op as *mut LightOp as *mut std::ffi::c_void,
+                    _ => &mut span as *mut LightSpan as *mut std::ffi::c_void,
+                }];
+                self.be.launch_kernel(
+                    launch.function,
+                    launch.blocks,
+                    launch.block,
+                    launch.smem,
+                    &mut params,
+                    Some(stream),
+                )?;
+                continue;
+            }
             let mut arg = self.kernarg;
             let mut instruction = launch.instruction;
             let (mut count, mut hnr) = match launch.kind {
@@ -249,8 +310,16 @@ impl LightRoute {
 #[derive(Clone, Copy)]
 pub(super) struct LightFunctions {
     single: KernelFn,
-    /// `plow_<arch>_light_attn`, its arena and the head dim it carries.
-    attn: Option<(KernelFn, u32, u32)>,
+    /// `plow_light_gemma`: the single kernel also runs NormResidual(Norm) and GluStrided.
+    gemma: bool,
+    /// `plow_light_abi` 2: instructions and tensor pointers are passed by value.
+    direct: bool,
+    /// `plow_<arch>_light_tail`: SoftCap / Argmax / ArgmaxFin (light ABI 2).
+    tail: Option<KernelFn>,
+    /// `plow_<arch>_light_capmax`: SoftCap and the batched Argmax in one pass.
+    capmax: Option<KernelFn>,
+    /// `plow_<arch>_light_attn`, its arena and the head dims it carries.
+    attn: Option<(KernelFn, u32, [u32; 2])>,
     /// `plow_<arch>_light_head` (unaligned lm_head tail).
     pub(super) head: Option<KernelFn>,
     /// `plow_<arch>_light_flash` (streamed hd128 FlashDecode) and its smem.
@@ -270,9 +339,8 @@ pub(super) fn light_functions(
     stem: &str,
     smem: u32,
 ) -> Result<Option<LightFunctions>> {
-    if !crate::config::RuntimeConfig::get().nv.decode_light
-        || be.module_global_u32(module, "plow_light_abi")? != Some(1)
-    {
+    let abi = be.module_global_u32(module, "plow_light_abi")?;
+    if !crate::config::RuntimeConfig::get().nv.decode_light || !matches!(abi, Some(1 | 2)) {
         return Ok(None);
     }
     let arch = stem.trim_start_matches("interp_");
@@ -281,10 +349,12 @@ pub(super) fn light_functions(
         Some(hd) => {
             let f = be.get_function(module, &format!("plow_{arch}_light_attn"))?;
             be.set_max_dynamic_smem(f, smem)?;
-            Some((f, smem, hd))
+            let hd2 = be.module_global_u32(module, "plow_light_attn_hd2")?.unwrap_or(hd);
+            Some((f, smem, [hd, hd2]))
         }
         _ => None,
     };
+    let gemma = be.module_global_u32(module, "plow_light_gemma")? == Some(1);
     let head = be.get_function(module, &format!("plow_{arch}_light_head")).ok();
     let flash = match be.module_global_u32(module, "plow_light_flash_smem")? {
         Some(bytes) if crate::config::RuntimeConfig::get().nv.decode_light_flash => {
@@ -298,7 +368,17 @@ pub(super) fn light_functions(
         .get_function(module, &format!("plow_{arch}_light_pf"))
         .ok()
         .filter(|_| crate::config::RuntimeConfig::get().nv.prefill_light);
-    Ok(Some(LightFunctions { single, attn, head, flash, prefill }))
+    let tail = if abi == Some(2) {
+        be.get_function(module, &format!("plow_{arch}_light_tail")).ok()
+    } else {
+        None
+    };
+    let capmax = if abi == Some(2) {
+        be.get_function(module, &format!("plow_{arch}_light_capmax")).ok()
+    } else {
+        None
+    };
+    Ok(Some(LightFunctions { single, gemma, direct: abi == Some(2), tail, capmax, attn, head, flash, prefill }))
 }
 
 /// Each light-routable interpreter segment of `g`: `(segment, levels)`, a level being a
@@ -341,18 +421,33 @@ pub(super) fn light_segments(
                 return None;
             }
             let op = |inst: usize| DevOp::from_u16(g.insts[inst].op);
+            // The logits tail (SoftCap -> Argmax -> ArgmaxFin), one launch each.
+            if functions.gemma
+                && functions.tail.is_some()
+                && insts.iter().all(|&i| {
+                    matches!(op(i), Some(DevOp::SoftCap | DevOp::Argmax | DevOp::ArgmaxFin))
+                })
+            {
+                return Some((seg, insts.iter().map(|&i| (i, 0)).collect()));
+            }
             if let [inst] = insts[..] {
-                if matches!(op(inst), Some(DevOp::AddNorm | DevOp::Glu)) {
+                let gemma_op = matches!(
+                    op(inst),
+                    Some(DevOp::NormResidual | DevOp::NormResidualNorm | DevOp::GluStrided)
+                );
+                if matches!(op(inst), Some(DevOp::AddNorm | DevOp::Glu))
+                    || (functions.gemma && gemma_op)
+                {
                     return Some((seg, vec![(inst, 0)]));
                 }
             }
-            let attn_hd = functions.attn.map(|(_, _, hd)| hd);
-            let attn = attn_hd.is_some()
+            let attn_hd = |hd: u32| functions.attn.is_some_and(|(_, _, hds)| hds.contains(&hd));
+            let attn = functions.attn.is_some()
                 && insts.iter().all(|&inst| {
                     let d = &g.insts[inst];
                     match op(inst) {
-                        Some(DevOp::HeadNormRope) => Some(d.i[2]) == attn_hd && d.i[5] == 0,
-                        Some(DevOp::FlashDecode) => Some(d.i[6]) == attn_hd,
+                        Some(DevOp::HeadNormRope) => attn_hd(d.i[2]) && d.i[5] == 0,
+                        Some(DevOp::FlashDecode) => attn_hd(d.i[6]),
                         _ => false,
                     }
                 });
@@ -361,8 +456,10 @@ pub(super) fn light_segments(
             }
             let mut levels: Vec<(usize, usize)> = Vec::new();
             for &inst in &insts {
+                // A by-value span (light ABI 2) carries at most 4 instructions.
                 let joins = levels.last().is_some_and(|&(lo, n)| {
                     lo + n == inst
+                        && !(functions.direct && n >= 4)
                         && waits_of(inst).iter().all(|&w| !(lo..lo + n).contains(&(w as usize)))
                 });
                 match levels.last_mut() {
@@ -427,6 +524,7 @@ pub(super) fn prefill_light_route(
                 function,
                 xs: LightX::default(),
                 kind: LightKind::Single,
+                direct: None,
                 instruction: inst as u32,
                 blocks: u32::from(g.insts[inst].blocks),
                 block: BLOCK,
@@ -607,6 +705,7 @@ pub(super) fn add_light_routes(
     fusions: &[QkvFusion],
     scratch: Option<&Arc<DeviceMem>>,
     folds: &[ArgmaxFold],
+    devp: &[DeviceMem],
 ) {
     for fold in folds {
         if routes.len() <= fold.segment {
@@ -638,6 +737,7 @@ pub(super) fn add_light_routes(
                 blocks: u32::from(g.insts[inst].blocks),
                 block: FLASH_BLOCK,
                 smem,
+                direct: None,
             })
         };
         let folded = folded_hnr(g, levels)
@@ -656,6 +756,17 @@ pub(super) fn add_light_routes(
                     if let Some(launch) = flash(inst, xs, [!0; 4]).filter(|_| n == 1) {
                         return launch;
                     }
+                    let direct = functions.direct.then(|| {
+                        let mut span = LightSpan { count: n as u32, ..Default::default() };
+                        for (j, i) in (inst..inst + n.max(1)).enumerate() {
+                            span.op[j] = LightOp::resolve(&g.insts[i], devp);
+                            if let Some(k) = (0..3).find(|&k| xs.base != 0 && xs.inst[k] == i as u32) {
+                                span.op[j].t[1] = xs.base + u64::from(xs.col[k]) * 2;
+                                span.x_row[j] = xs.row;
+                            }
+                        }
+                        Box::new(span)
+                    });
                     match (n, functions.attn) {
                         (n, Some((function, smem, _))) if n > 0 => LightLaunch {
                             function,
@@ -665,19 +776,51 @@ pub(super) fn add_light_routes(
                             blocks,
                             block: BLOCK,
                             smem,
+                            direct,
                         },
                         _ => LightLaunch {
-                            function: functions.single,
+                            function: match (functions.tail, DevOp::from_u16(g.insts[inst].op)) {
+                                (Some(tail), Some(DevOp::SoftCap | DevOp::Argmax | DevOp::ArgmaxFin)) => {
+                                    tail
+                                }
+                                _ => functions.single,
+                            },
                             xs,
                             kind: LightKind::Single,
                             instruction: inst as u32,
                             blocks,
                             block: BLOCK,
                             smem: 0,
+                            direct,
                         },
                     }
                 })
-                .collect(),
+                .collect::<Vec<LightLaunch>>(),
+        };
+        let launches = match launches.as_slice() {
+            [hnr, flash] if fusable(hnr, flash) => {
+                let (h, f) = (hnr.direct.as_ref().unwrap(), flash.direct.as_ref().unwrap());
+                let n = h.count as usize;
+                let mut span = **h;
+                span.count = n as u32 + 1;
+                span.fused = 1;
+                span.op[n] = f.op[0];
+                vec![LightLaunch {
+                    function: flash.function,
+                    xs: LightX::default(),
+                    kind: LightKind::Attn(n as u32 + 1),
+                    instruction: flash.instruction,
+                    blocks: flash.blocks,
+                    block: flash.block,
+                    smem: flash.smem,
+                    direct: Some(Box::new(span)),
+                }]
+            }
+            [cap, amax, fin] => match capmax(functions, cap, amax) {
+                Some(launch) => vec![launch, clone_launch(fin)],
+                None => launches,
+            },
+            _ => launches,
         };
         routes[*seg] = Some(LibraryRoute::Light(LightRoute {
             be: Arc::clone(be),
@@ -686,6 +829,71 @@ pub(super) fn add_light_routes(
             _scratch: fused.and(scratch.cloned()),
         }));
     }
+}
+
+fn clone_launch(l: &LightLaunch) -> LightLaunch {
+    LightLaunch { direct: l.direct.clone(), ..*l }
+}
+
+/// An in-place SoftCap on the logits followed by the batched Argmax over them, as one
+/// `light_capmax` launch of `rows x G` blocks (G chunks per row, at most the part stride).
+fn capmax(functions: &LightFunctions, cap: &LightLaunch, amax: &LightLaunch) -> Option<LightLaunch> {
+    let function = functions.capmax?;
+    let (c, a) = (&cap.direct.as_ref()?.op[0], &amax.direct.as_ref()?.op[0]);
+    let (n, rows, parts) = (a.d.i[0], a.d.i[1], u32::from(a.d.blocks));
+    let ok = c.d.op == DevOp::SoftCap as u16
+        && a.d.op == DevOp::Argmax as u16
+        && c.t[0] == c.t[1]
+        && a.t[1] == c.t[0]
+        && rows >= 2
+        && n % 8 == 0
+        && u64::from(c.d.i[0]) == u64::from(n) * u64::from(rows);
+    if !ok {
+        return None;
+    }
+    let chunks = (512 / rows).clamp(1, parts);
+    let mut span = LightSpan { count: 2, ..Default::default() };
+    span.op[0] = *c;
+    span.op[1] = *a;
+    Some(LightLaunch {
+        function,
+        xs: LightX::default(),
+        kind: LightKind::Attn(2),
+        instruction: amax.instruction,
+        blocks: rows * chunks,
+        block: BLOCK,
+        smem: 0,
+        direct: Some(Box::new(span)),
+    })
+}
+
+/// A light ABI 2 HeadNormRope level whose every instruction writes the next FlashDecode's
+/// q, k or v (per-batch KV ring), run as that flash launch's per-block prologue.
+fn fusable(hnr: &LightLaunch, flash: &LightLaunch) -> bool {
+    let (Some(h), Some(f), LightKind::Attn(_), LightKind::Attn(1)) =
+        (&hnr.direct, &flash.direct, hnr.kind, flash.kind)
+    else {
+        return false;
+    };
+    let fl = &f.op[0].d;
+    if f.count != 1 || fl.op != DevOp::FlashDecode as u16 || f.op[0].t[6] != 0 || fl.i[2] == 0 {
+        return false;
+    }
+    let [q, k, v] = [f.op[0].t[2], f.op[0].t[3], f.op[0].t[4]];
+    let gqa = fl.i[1] / fl.i[2];
+    let ops = &h.op[..h.count as usize];
+    let tasks: u32 = ops.iter().map(|o| if o.t[0] == q { gqa } else { 1 }).sum();
+    !ops.is_empty()
+        && tasks as usize <= BLOCK as usize / 32
+        && ops.iter().all(|o| {
+            let d = &o.d;
+            let kv = o.t[0] == k || o.t[0] == v;
+            d.op == DevOp::HeadNormRope as u16
+                && matches!(d.i[2], 256 | 512)
+                && d.i[5] == 0
+                && (o.t[0] == q && d.fj[1] == 0 || kv && d.fj[1] != 0 && d.i[6] != 0)
+                && (d.i[7] == 0 || kv && o.t[6] == v)
+        })
 }
 
 /// Every host-launched kernel of `routes` that leaves cuBLASLt's workspace alone.
@@ -727,6 +935,7 @@ impl ProjectionPlan {
         }
     }
 }
+
 
 /// `[output, input, weight]` of a routed projection, checked aligned and nonaliasing.
 fn operands(segment: &DecodeSegment, insts: &[DevInst64], devp: &[DeviceMem]) -> Result<[u64; 3]> {
@@ -880,6 +1089,7 @@ pub(super) fn prepare_routes(
     scratch: Option<&DeviceMem>,
     head: Option<&HeadKernel>,
     folds: &[ArgmaxFold],
+    rows: &[u32],
 ) -> Result<Vec<Option<CublasLtDecodeRoute>>> {
     let mut routes: Vec<Option<CublasLtDecodeRoute>> = Vec::new();
     if segments.is_empty() {
@@ -949,7 +1159,7 @@ pub(super) fn prepare_routes(
             if u64::from(segment.m) * u64::from(fusion.n_total) * 2 > scratch.len {
                 return Err(RuntimeError::Rejected("fused q|k|v scratch too small".into()));
             }
-            let plan = lt.plan(segment.m, fusion.n_total, segment.k, weight, template.filter(|_| pin))?;
+            let plan = lt.plan(segment.m, fusion.n_total, segment.k, weight, template.filter(|_| pin), rows)?;
             for next in segments[index + 1..index + 3].iter().flatten() {
                 insts[next.instruction].op = DevOp::Nop as u16;
             }
@@ -989,7 +1199,7 @@ pub(super) fn prepare_routes(
                 let plan = match pair_plans.entry((key, p.w_stride, p.c_stride)) {
                     std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.get()),
                     std::collections::hash_map::Entry::Vacant(e) => Arc::clone(e.insert(Arc::new(
-                        ProjectionPlan::Lt(lt.pair_plan(key.0, key.1, key.2, w0, p, pair_template)?),
+                        ProjectionPlan::Lt(lt.pair_plan(key.0, key.1, key.2, w0, p, pair_template, rows)?),
                     ))),
                 };
                 insts[next.instruction].op = DevOp::Nop as u16;
@@ -1033,7 +1243,7 @@ pub(super) fn prepare_routes(
                                 )),
                             })
                             .transpose()?;
-                        ProjectionPlan::Lt(lt.plan(key.0, key.1, key.2, weight, template.filter(|_| pin))?)
+                        ProjectionPlan::Lt(lt.plan(key.0, key.1, key.2, weight, template.filter(|_| pin), rows)?)
                     }
                     ProjectionBackend::Native(native) => {
                         let template = template

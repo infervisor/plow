@@ -133,7 +133,22 @@ static __device__ void d_softcap(__nv_bfloat16* __restrict__ out, const __nv_bfl
                           unsigned n, float cap, unsigned slice, unsigned nblk) {
     const float inv = 1.0f / cap;
     const unsigned stride = nblk * PLOW_NV_THREADS * 8;
-    for (unsigned i = (slice * PLOW_NV_THREADS + threadIdx.x) * 8; i < n; i += stride) {
+    unsigned i = (slice * PLOW_NV_THREADS + threadIdx.x) * 8;
+    /* Four 16-byte loads in flight per thread (a batch of logit rows is tens of MB). */
+    for (; i + 3u * stride + 8u <= n; i += 4u * stride) {
+        bf16v8 v[4];
+#pragma unroll
+        for (int u = 0; u < 4; u++) v[u] = ld_glob8(x + i + u * stride);
+#pragma unroll
+        for (int u = 0; u < 4; u++) {
+            bf16v8 o;
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                o.x[j] = __float2bfloat16(cap * tanhf(__bfloat162float(v[u].x[j]) * inv));
+            st_glob8(out + i + u * stride, o);
+        }
+    }
+    for (; i < n; i += stride) {
         if (i + 8 <= n) {
             const bf16v8 v = ld_glob8(x + i);
             bf16v8 o;
@@ -288,7 +303,22 @@ static __device__ void d_argmax_rows(unsigned long long* __restrict__ part,
         const unsigned v0 = (unsigned)(((unsigned long long)c * nv) / G);
         const unsigned v1 = (unsigned)(((unsigned long long)(c + 1u) * nv) / G);
         unsigned long long best = 0;
-        for (unsigned iv = v0 + threadIdx.x; iv < v1; iv += PLOW_NV_THREADS) {
+        unsigned iv = v0 + threadIdx.x;
+        /* Four loads in flight; the max over packed keys does not depend on the visit order. */
+        for (; iv + 3u * PLOW_NV_THREADS < v1; iv += 4u * PLOW_NV_THREADS) {
+            bf16v8 v[4];
+#pragma unroll
+            for (unsigned u = 0; u < 4; u++) v[u] = ld_glob8_cs(xb + h + (size_t)(iv + u * PLOW_NV_THREADS) * 8);
+#pragma unroll
+            for (unsigned u = 0; u < 4; u++)
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const unsigned long long p =
+                        amax_pack(v[u].x[j], h + (iv + u * PLOW_NV_THREADS) * 8 + (unsigned)j);
+                    best = p > best ? p : best;
+                }
+        }
+        for (; iv < v1; iv += PLOW_NV_THREADS) {
             const bf16v8 v = ld_glob8_cs(xb + h + (size_t)iv * 8);
 #pragma unroll
             for (int j = 0; j < 8; j++) {

@@ -4813,6 +4813,26 @@ impl GpuEngine {
             .as_ref()
             .map_or_else(Vec::new, |f| cublaslt::light_segments(g, &cublaslt_segments, f));
         let main_fusions = cublaslt::qkv_fusions(g, &cublaslt_segments, &devp, &main_light);
+        // Every routed rung's width, when the widest rung's Lt algorithms are pinned for all of
+        // them (PLOW_LT_RUNG_ALGOS off).
+        let lt_rows: Vec<u32> = if crate::config::RuntimeConfig::get().nv.lt_rung_algos {
+            Vec::new()
+        } else {
+            let first = blob.progs.len() - blob.decode_progs().len();
+            blob.decode_progs()
+                .iter()
+                .enumerate()
+                .filter(|&(index, _)| {
+                    segment_roles
+                        .as_ref()
+                        .and_then(|r| r.program(first + index))
+                        .is_some_and(|p| {
+                            p.roles.iter().copied().any(plow_asset::segment_roles::is_projection)
+                        })
+                })
+                .map(|(_, p)| packet::devbuild::program_rows(p.t))
+                .collect()
+        };
         // The widest routed rung's unaligned lm_head sizes the head scratch.
         let head_kernel = match (
             light_functions.as_ref().and_then(|f| f.head),
@@ -4876,6 +4896,7 @@ impl GpuEngine {
                 qkv_scratch.as_deref(),
                 head_kernel.as_ref(),
                 &main_folds,
+                &lt_rows,
             )?)
         } else if moe_lt_routed {
             let routes = moe_lt::decode_routes(
@@ -4967,6 +4988,7 @@ impl GpuEngine {
                 &main_fusions,
                 qkv_scratch.as_ref(),
                 &main_folds,
+                &devp,
             );
         }
 
@@ -5041,6 +5063,7 @@ impl GpuEngine {
                             qkv_scratch.as_deref(),
                             head_kernel.as_ref(),
                             &folds,
+                            &[],
                         )?;
                         let mut rung = DecodeRung::upload_with_insts(
                             &be,
@@ -5065,6 +5088,7 @@ impl GpuEngine {
                                 &fusions,
                                 qkv_scratch.as_ref(),
                                 &folds,
+                                &devp,
                             );
                         }
                         rung.library = Some(cublaslt::CublasLtDecodeGraph::capture(
@@ -9192,6 +9216,7 @@ impl GpuEngine {
                     &[],
                     None,
                     None,
+                    &[],
                     &[],
                 )?
             };
