@@ -937,6 +937,22 @@ static void t_attention_prefix(const char* name, unsigned batch, unsigned rows, 
     run(name, c, g_attention_f32, {o}, FP32, 2e-5);
 }
 
+/* Time-major encoder attention: batch 1, items * hpi heads, bias a relative-position table
+ * [t][heads][2t - 1], key lengths per item (group of hpi heads). */
+static void t_attention_rel(const char* name, unsigned items, unsigned t, unsigned hpi, std::vector<uint32_t> lengths) {
+    Case c;
+    const unsigned heads = items * hpi, hw = 64, width = heads * hw, m = 2 * t - 1;
+    unsigned o = c.out((size_t)t * width);
+    unsigned q = c.f32((size_t)t * width, 1.f), k = c.f32((size_t)t * width, 1.f), v = c.f32((size_t)t * width, 1.f);
+    unsigned bs = c.f32((size_t)t * heads * m, 1.f), l = c.u32(lengths);
+    c.in.op = PLOW_DOP_ATTENTION_F32;
+    c.in.t[0] = o; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = l; c.in.t[5] = bs;
+    c.in.i[0] = 1; c.in.i[1] = t; c.in.i[2] = t; c.in.i[3] = heads; c.in.i[4] = hw;
+    c.in.i[5] = 0; c.in.i[6] = 2u | 4u | hpi << 8; c.in.i[7] = m;
+    c.in.fj[0].f = 0.125f;
+    run(name, c, g_attention_f32, {o}, FP32, 2e-5);
+}
+
 static void bench(const char* name, Case& c, double flops, double bytes, int reps = 20) {
     c.upload();
     void** td = upload_table(c.dev);
@@ -1306,6 +1322,8 @@ int main(int argc, char** argv) {
     t_attention_prefix("AttentionF32 prefix 306+72 lengths", 4, 72, 306, 2, {0, 1, 0, 1}, {378, 350, 320, 306}, false);
     t_attention_prefix("AttentionF32 tc prefix 306+72 lengths", 4, 72, 306, 2, {0, 1, 0, 1}, {378, 350, 320, 306}, true);
     t_attention_prefix("AttentionF32 tc prefix 306+136", 2, 136, 306, 2, {1, 0}, {}, true);
+    t_attention_rel("AttentionF32 tc relative table 3x8 t120 lengths", 3, 120, 8, {120, 80, 7});
+    t_attention_rel("AttentionF32 tc relative table 2x8 t150 lengths", 2, 150, 8, {150, 99});
     /* Split-bf16 wide tiles (~2^-17 per product) and tap-major weights. */
     {
         ConvSpec w1{2, 4200, 256, 512, 1, 1, 1, 1, 0, 0, 0, 0, 11, false, true, false, true, {4200, 3000}, 0.f, true};

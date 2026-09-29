@@ -547,6 +547,11 @@ pub struct AttentionF32Stage<'a> {
     pub causal: bool,
     pub scale: f32,
     pub bias_head_stride: u32,
+    /// The bias is a relative-position table `[q_rows][heads][bias_head_stride]`: score `(h, r, j)`
+    /// adds entry `kv_rows - 1 - r + j` of row `r`, head `h` (q_rows == kv_rows, head_width 64).
+    pub relative: bool,
+    /// `key_lengths` holds one length per group of this many heads (0: one per item).
+    pub key_length_heads: u32,
     /// Keys before each item's own: rows of a cached prefix block (see [`AttentionPrefix`]).
     pub prefix: Option<AttentionPrefix>,
 }
@@ -1458,8 +1463,25 @@ impl StageProgram {
         for (tensor, col0, what) in [(key, stage.k_col0, "attention key"), (value, stage.v_col0, "attention value")] {
             self.input(tensor, f32_bytes(strided_span(1, 0, kv_total, stride, col0, width))?, what)?;
         }
+        let groups = match stage.key_length_heads {
+            0 => 1,
+            g if g <= 255 && stage.heads % g == 0 => stage.heads / g,
+            _ => return Err("attention key length groups must divide the heads (at most 255 per group)".into()),
+        };
         if let Some(lengths) = stage.key_lengths {
-            self.input(lengths, u64::from(stage.batch) * 4, "attention key lengths")?;
+            self.input(lengths, u64::from(stage.batch) * u64::from(groups) * 4, "attention key lengths")?;
+        }
+        if stage.relative
+            && (stage.bias.is_none()
+                || stage.q_rows != stage.kv_rows
+                || stage.head_width != 64
+                || stage.q_rows <= 112
+                || stage.bias_head_stride < 2 * stage.kv_rows - 1)
+        {
+            return Err("relative attention: a table bias, q_rows == kv_rows > 112, head_width 64".into());
+        }
+        if stage.key_length_heads != 0 && (!stage.relative || stage.q_rows <= 112) {
+            return Err("attention key length groups: relative attention only".into());
         }
         if let Some(p) = stage.prefix {
             if stage.bias.is_some() || stage.causal || p.rows == 0 {
@@ -1470,8 +1492,12 @@ impl StageProgram {
         }
         let bias = match stage.bias {
             Some(bias) => {
-                let span = u64::from(stage.heads - 1) * u64::from(stage.bias_head_stride)
-                    + product(&[stage.q_rows, stage.kv_rows])?;
+                let span = if stage.relative {
+                    product(&[stage.q_rows, stage.heads, stage.bias_head_stride])?
+                } else {
+                    u64::from(stage.heads - 1) * u64::from(stage.bias_head_stride)
+                        + product(&[stage.q_rows, stage.kv_rows])?
+                };
                 self.resolve(bias, f32_bytes(span)?, "attention bias")?
             }
             None => packet::dev::TENSOR_NONE,
@@ -1508,7 +1534,7 @@ impl StageProgram {
                 stage.heads,
                 stage.head_width,
                 stage.in_stride,
-                u32::from(stage.causal) | (u32::from(tc) << 1),
+                u32::from(stage.causal) | (u32::from(tc) << 1) | (u32::from(stage.relative) << 2) | (stage.key_length_heads << 8),
                 stage.prefix.map_or(stage.bias_head_stride, |p| p.rows),
             ];
             d.f[0] = stage.scale;
@@ -2197,6 +2223,8 @@ mod tests {
                     causal: true,
                     scale: 0.125,
                     bias_head_stride: 0,
+                    relative: false,
+                    key_length_heads: 0,
                     prefix: None,
                 },
             )

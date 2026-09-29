@@ -11,9 +11,9 @@
 //!
 //! Layout notes. The conformer runs time-major (`[t][item][c]`) so relative-position attention is
 //! one batch-1 AttentionF32 with the items folded into the heads: its additive bias
-//! `[item*heads][t][t]` is `(q + u)·P[t - j] / 8 + (v - u)·P[t - j] / 8` (a grouped 1x1
-//! convolution against the capacity's projected position table, then a diagonal copy), plus a
-//! per-item key mask.
+//! `(q + u)·P[t - j] / 8 + (v - u)·P[t - j] / 8` is a grouped 1x1 convolution against the
+//! capacity's projected position table (`[t][item*heads][2t - 1]`), which the attention reads in
+//! place along the diagonal, and each item's keys stop at its length.
 //!
 //! Fusions (each convolution's and linear's input activation, output activation and residual)
 //! come from the rewrite's fused sites over the S3Gen graph (`nn_graph` `chatterbox_s3gen`),
@@ -33,7 +33,7 @@ use crate::RewriteSites;
 pub const PIPELINE: &str = "vocoder.synth";
 pub const PACKET: &str = "s3gen.pkt";
 
-/// (batch, speech tokens) capacities. The encoder's attention bias is `[B*8][T][T]` f32 with
+/// (batch, speech tokens) capacities. The encoder's attention bias is `[T][B*8][2T-1]` f32 with
 /// T = 2 (prompt + tokens), so large batches get short buckets. Wide batches fill the machine's
 /// GEMM tiles (a B=8 CFM step is already compute-bound), so they are where concurrent requests
 /// gain throughput; every item pays the capacity's token count, so the wide batches get finer
@@ -725,19 +725,8 @@ impl Lowering<'_> {
         self.gen() * self.cfg.frame_samples()
     }
 
-    /// Additive key mask `[b][t]`: 0 for rows below the item's length, -1e30 past it.
-    fn key_mask(&self, o: &mut Ops, t: u32, lengths: u32) -> Result<u32, String> {
-        let b = self.b;
-        let ones = o.gather(Table::Weight("const.one", 1), None, "act.s3gen.ones", Gather { rows: b * t, width: 1, vocab: 1, per_item: t, repeat: t, ..Default::default() })?;
-        let mut c = Conv::new("const", b, t, 1, 1, 1);
-        c.bias = false;
-        c.lengths = Some(lengths);
-        let mask = o.conv(ones, "act.s3gen.mask", c)?;
-        o.unary(mask, b * t, 1, 0, 0, Activation::ScaleShift, 1e30, -1e30)
-    }
-
-    /// One conformer layer on the time-major `x` (`[t][b][512]`).
-    fn conformer(&self, o: &mut Ops, i: u32, x: u32, t: u32, mask: u32) -> Result<(), String> {
+    /// One conformer layer on the time-major `x` (`[t][b][512]`); `lengths` masks each item's keys.
+    fn conformer(&self, o: &mut Ops, i: u32, x: u32, t: u32, lengths: u32) -> Result<(), String> {
         let (b, r) = (self.b, t * self.b);
         let p = format!("enc.L{i}");
         let a = o.layer_norm(x, "act.s3gen.a", &format!("{p}.ln_mha"), r, D_ENC, 1e-12)?;
@@ -752,14 +741,13 @@ impl Lowering<'_> {
         let mut c = Conv::new(&rel, 1, r, D_ENC, HEADS * m, 1);
         c.groups = HEADS;
         let bd = o.conv(q, "act.s3gen.bd", c)?;
-        // bias[b*8 + h][t][j] = bd[t][b*8 + h][t - 1 - t + j]: relative position t - j.
-        let bias = o.copy(bd, "act.s3gen.bias", (b * HEADS, t, t), (m, b * HEADS * m - 1, t - 1), (t * t, t, 0))?;
-        o.binary(bias, mask, BinaryOp::Add, (b, HEADS * t, t), (t, 0, 1), None)?;
-        let att = o.op(&[q, k, v, bias], "act.s3gen.att", |pp, output, deps| {
+        // Score (b*8 + h, r, j) adds bd[r][b*8 + h][t - 1 - r + j] (relative position r - j), read in
+        // place by the attention, whose keys stop at the item's length.
+        let att = o.op(&[q, k, v, bd, lengths], "act.s3gen.att", |pp, output, deps| {
             pp.attention_f32(q, k, v, deps, AttentionF32Stage {
                 output,
-                key_lengths: None,
-                bias: Some(TensorRef::Handle(bias)),
+                key_lengths: Some(lengths),
+                bias: Some(TensorRef::Handle(bd)),
                 batch: 1,
                 q_rows: t,
                 kv_rows: t,
@@ -770,7 +758,9 @@ impl Lowering<'_> {
                 v_col0: 0,
                 causal: false,
                 scale: 1.0 / ((D_ENC / HEADS) as f32).sqrt(),
-                bias_head_stride: t * t,
+                bias_head_stride: m,
+                relative: true,
+                key_length_heads: HEADS,
                 prefix: None,
             })
         })?;
@@ -828,9 +818,8 @@ impl Lowering<'_> {
         c.lengths = Some(inp.lengths.tok);
         let e2 = o.conv(e1, "act.s3gen.e2", c)?;
         let x = self.to_time_major(o, e2, "act.s3gen.x", t0, D_ENC)?;
-        let mask = self.key_mask(o, t0, inp.lengths.tok)?;
         for i in 0..ENC_LAYERS.0 {
-            self.conformer(o, i, x, t0, mask)?;
+            self.conformer(o, i, x, t0, inp.lengths.tok)?;
         }
         let e2 = self.to_item_major(o, x, "act.s3gen.e2", t0, D_ENC)?;
         // Nearest x2, then a causal k5 convolution.
@@ -842,9 +831,8 @@ impl Lowering<'_> {
         let e1 = o.linear(e0, "act.s3gen.e1", "enc.up_embed", b * t1, D_ENC, D_ENC, true, Activation::None, None)?;
         let e0 = o.layer_norm(e1, "act.s3gen.e0", "enc.up_embed.ln", b * t1, D_ENC, 1e-5)?;
         let x = self.to_time_major(o, e0, "act.s3gen.x", t1, D_ENC)?;
-        let mask = self.key_mask(o, t1, inp.lengths.mel)?;
         for i in 0..ENC_LAYERS.1 {
-            self.conformer(o, ENC_LAYERS.0 + i, x, t1, mask)?;
+            self.conformer(o, ENC_LAYERS.0 + i, x, t1, inp.lengths.mel)?;
         }
         let a = o.layer_norm(x, "act.s3gen.a", "enc.after_ln", t1 * b, D_ENC, 1e-5)?;
         let mu = o.linear(a, "act.s3gen.mu", "enc.proj", t1 * b, D_ENC, MEL, true, Activation::None, None)?;
@@ -959,6 +947,8 @@ impl Lowering<'_> {
                     causal: false,
                     scale: 0.125,
                     bias_head_stride: 0,
+                    relative: false,
+                    key_length_heads: 0,
                     prefix: Some(AttentionPrefix { table, index: idx, blocks: nv2, rows: pp }),
                 })
             })?;
@@ -980,6 +970,8 @@ impl Lowering<'_> {
                 causal: false,
                 scale: 0.125,
                 bias_head_stride: 0,
+                relative: false,
+                key_length_heads: 0,
                 prefix: None,
             })
         })?;

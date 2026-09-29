@@ -888,6 +888,9 @@ G_K(g_attention_f32) {
     const uint32_t batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
     const uint32_t hw = in->i[4], width = heads * hw;
     const uint32_t stride = in->i[5] ? in->i[5] : width, causal = in->i[6] & 1u;
+    /* i6 bit 2: relative-position bias table [q_rows][heads][i7]; bits 8-15: key lengths per
+     * group of that many heads. */
+    const uint32_t rel = in->i[6] & 4u, lgroup = (in->i[6] >> 8) & 255u;
     const uint32_t k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
     if (!hw || !(pre + kv_rows)) return;
     double* p = malloc(sizeof(double) * (pre + kv_rows));
@@ -896,7 +899,7 @@ G_K(g_attention_f32) {
     g_range(batch * heads * q_rows, slice, nblk, &lo, &hi);
     for (uint32_t index = lo; index < hi; index++) {
         const uint32_t b = index / (heads * q_rows), h = index / q_rows % heads, r = index % q_rows;
-        uint32_t visible = g_item_rows(key_lengths, b, pre + kv_rows);
+        uint32_t visible = g_item_rows(key_lengths, lgroup ? (b * heads + h) / lgroup : b, pre + kv_rows);
         if (causal && r + 1u < visible) visible = r + 1u;
         const float* q = query + ((size_t)b * q_rows + r) * stride + (size_t)h * hw;
         double maximum = -INFINITY;
@@ -906,7 +909,9 @@ G_K(g_attention_f32) {
             double dot = 0.0;
             for (uint32_t c = 0; c < hw; c++) dot += (double)q[c] * k[c];
             p[j] = dot * in->fj[0].f +
-                   (bias ? bias[(size_t)h * in->i[7] + (size_t)r * kv_rows + j] : 0.0f);
+                   (!bias ? 0.0f
+                    : rel ? bias[((size_t)r * heads + h) * in->i[7] + kv_rows - 1u - r + j]
+                          : bias[(size_t)h * in->i[7] + (size_t)r * kv_rows + j]);
             if (p[j] > maximum) maximum = p[j];
         }
         double denominator = 0.0;

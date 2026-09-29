@@ -3054,6 +3054,10 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
     char* ahi = sm;
     char* bhi = sm + 2u * SPWG_OP;
     float* stage = (float*)sm;         /* the output tile, after the last k-tile's MMAs */
+    /* The tile's bias, loaded with its first k-tile and staged past the operand and output stages. */
+    constexpr unsigned BIAS_OFF = (DB ? 2u * SZ : SZ) > 128u * LDO * 4u ? (DB ? 2u * SZ : SZ) : 128u * LDO * 4u;
+    static_assert(BIAS_OFF + BN * 4u + 1024u <= SP_ARENA_FLOATS * 4u, "wgmma bias stage");
+    float* bias_s = (float*)(sm + BIAS_OFF);
     const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, wg = warp >> 2;
     const unsigned sr = tid >> 4, sc = (tid & 15u) * 4u; /* 16 threads per 64-float row, 16 rows per pass */
     const unsigned tn = (N + BN - 1u) / BN, tiles = ((M + 127u) / 128u) * tn, nk = (K + SPWG_BK - 1u) / SPWG_BK;
@@ -3114,12 +3118,14 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         };
         load(0u);
+        const float bpre = a.bias && tid < BN && n0 + tid < N ? __ldg(a.bias + n0 + tid) : 0.f;
         if (pending) {
             asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
             pending = false;
         }
         __syncthreads();
         store(0u);
+        if (tid < BN) bias_s[tid] = bpre;
         __syncthreads();
         if (DB && nk > 1u) load(1u);
         float acc[BN / 2u];
@@ -3181,7 +3187,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
         for (unsigned g = 0; g < NG; g++) {
             const unsigned c = 8u * g + cw, o = n0 + c;
             const bool on = o < N;
-            const float2 bias = a.bias && on ? __ldg((const float2*)(a.bias + o)) : make_float2(0.f, 0.f);
+            const float2 bias = *(const float2*)(bias_s + c);
             const float2 alpha = a.alpha && on ? make_float2(a.alpha[o], a.alpha[o + 1]) : make_float2(a.slope, a.slope);
 #pragma unroll
             for (unsigned h = 0; h < 2; h++) {
@@ -3756,7 +3762,7 @@ static __device__ __noinline__ void sp_attention_tc64(const PlowDevInst* in, voi
  * into runs of 8, one per block and one tile per warp, so 136 query rows cost 8.5 warp tiles
  * instead of 16 (two 128-row tiles). The at most HS heads a run touches have their KT-key K/V
  * tiles staged side by side. Same products, splits and softmax order as sp_attention_tc64. */
-template <int KT, int HS>
+template <int KT, int HS, bool REL>
 static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, void* const* T, unsigned slice,
                                                        unsigned nblk) {
     float* const arena = sp_smem;
@@ -3773,9 +3779,14 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
     const float* bias = prefix ? nullptr : (const float*)SP_TEN(5);
     const unsigned batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
     const unsigned width = heads * HW, stride = in->i[5] ? in->i[5] : width;
-    const bool causal = in->i[6] & 1u;
+    /* flags (i6) bit 2: the bias is a relative-position table [q_rows][heads][bias_hs], score
+     * (h, r, j) reading entry kv_rows - 1 - r + j; bits 8-15: key lengths per group of that many
+     * heads (0: per item). */
+    const bool causal = in->i[6] & 1u, rel = REL && (in->i[6] & 4u);
+    const unsigned lgroup = REL ? (in->i[6] >> 8) & 255u : 0u;
     const unsigned bias_hs = in->i[7], k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
-    const float scale = in->fj[0].f;
+    /* Scores in log2 units, so the softmax runs on exp2f (as accurate as expf, cheaper). */
+    const float scale = in->fj[0].f * 1.4426950408889634f;
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, g = lane >> 2, t = lane & 3u;
     const unsigned n16 = (q_rows + 15u) / 16u, tiles = heads * n16, runs = (tiles + 7u) / 8u;
     for (unsigned item = slice; item < batch * runs; item += nblk) {
@@ -3783,14 +3794,29 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
         const bool live = u < tiles;
         const unsigned h0 = u0 / n16, nh = min(u0 + 7u, tiles - 1u) / n16 - h0 + 1u;
         const unsigned h = live ? u / n16 : h0, q0 = live ? (u % n16) * 16u : 0u;
-        const unsigned klen = lengths && lengths[b] < pre + kv_rows ? lengths[b] : pre + kv_rows;
+        auto visible = [&](unsigned hh) {
+            const unsigned li = lgroup ? (b * heads + hh) / lgroup : b;
+            return lengths && lengths[li] < pre + kv_rows ? lengths[li] : pre + kv_rows;
+        };
+        const unsigned klen = visible(h);
         unsigned kend = klen;
+        if (lgroup)
+            for (unsigned hs = 0; hs < nh; hs++) kend = max(kend, visible(h0 + hs));
         if (causal) {
             unsigned top = 0;
             for (unsigned w = u0; w < u0 + 8u && w < tiles; w++) top = max(top, (w % n16) * 16u + 16u);
-            kend = min(klen, top);
+            kend = min(kend, top);
         }
         const unsigned ra = q0 + g, rb = ra + 8u;
+        /* Bias rows of ra and rb (null past q_rows), indexed by key. */
+        const float* brow[2];
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const unsigned row = i ? rb : ra;
+            brow[i] = !bias || row >= q_rows ? nullptr
+                      : rel ? bias + ((size_t)row * heads + h) * bias_hs + kv_rows - 1u - row
+                            : bias + (size_t)h * bias_hs + (size_t)row * kv_rows;
+        }
         unsigned qh[8][4], ql[8][4];
 #pragma unroll
         for (int ks = 0; ks < 8; ks++) {
@@ -3864,8 +3890,8 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
                 for (int r = 0; r < 4; r++) {
                     const unsigned kj = k0 + j * 8 + 2 * t + (r & 1), row = r < 2 ? ra : rb;
                     float v = sc[j][r] * scale;
-                    if (kj < kend && (!causal || kj <= row)) {
-                        if (bias && row < q_rows) v += bias[(size_t)h * bias_hs + (size_t)row * kv_rows + kj];
+                    if (kj < klen && (!causal || kj <= row)) {
+                        if (brow[r >> 1]) v += brow[r >> 1][kj] * 1.4426950408889634f;
                     } else {
                         v = -INFINITY;
                     }
@@ -3878,14 +3904,14 @@ static __device__ __noinline__ void sp_attention_tc64p(const PlowDevInst* in, vo
                 mt[i] = fmaxf(mt[i], __shfl_xor_sync(0xffffffffu, mt[i], 1));
                 mt[i] = fmaxf(mt[i], __shfl_xor_sync(0xffffffffu, mt[i], 2));
                 const float mnew = fmaxf(mrow[i], mt[i]);
-                corr[i] = mnew == -INFINITY ? 1.f : expf(mrow[i] - mnew);
+                corr[i] = mnew == -INFINITY ? 1.f : exp2f(mrow[i] - mnew);
                 mrow[i] = mnew;
             }
 #pragma unroll
             for (int j = 0; j < NJ; j++)
 #pragma unroll
                 for (int r = 0; r < 4; r++) {
-                    const float p = sc[j][r] == -INFINITY ? 0.f : expf(sc[j][r] - mrow[r >> 1]);
+                    const float p = sc[j][r] == -INFINITY ? 0.f : exp2f(sc[j][r] - mrow[r >> 1]);
                     sc[j][r] = p;
                     ps[r >> 1] += p;
                 }
@@ -3964,8 +3990,9 @@ static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void*
     if (in->i[4] == 64u && (in->i[6] & 2u) && vec) {
         /* Packed query tiles once a run of 8 spans at most 2 heads (KT 32) or 5 (KT 16). */
         const unsigned n16 = (in->i[1] + 15u) / 16u;
-        if (n16 >= 8u) sp_attention_tc64p<32, 2>(in, T, slice, nblk);
-        else if (n16 >= 2u) sp_attention_tc64p<16, 5>(in, T, slice, nblk);
+        if (in->i[6] & 0xFF04u) sp_attention_tc64p<32, 2, true>(in, T, slice, nblk); /* devgen: q_rows > 112 */
+        else if (n16 >= 8u) sp_attention_tc64p<32, 2, false>(in, T, slice, nblk);
+        else if (n16 >= 2u) sp_attention_tc64p<16, 5, false>(in, T, slice, nblk);
         else sp_attention_tc64(in, T, slice, nblk, arena);
     }
     else if (in->i[4] == 64u) sp_attention_f32<64, 128>(in, T, slice, nblk, arena);

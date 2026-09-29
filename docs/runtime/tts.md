@@ -368,8 +368,28 @@ language unchanged; English c64 49.9 aps, CER 0.000; Qwen3-ASR WER 3.913%; Veena
 57.7 aps. The same build served at 53.9 and 57.8 aps at c200 in two runs, so single A/B runs
 carry about 7% noise.
 
-The encoder (program 0, 40 ms) spends 11 ms in the relative-position bias: a diagonal
-`CopyColsF32` of `[b*8][t][t]` scores and the key-mask add, at 0.3-1.1 ms each.
+Served throughput at c200 is GPU-bound (render ~80% of the device, T3 decode the rest), so it
+follows the render cost: measured with `--n 800` (two runs each, `steady_aps` = audio per second
+over the middle 60% of the run) the wgmma build served 55.4 aps and packed attention 63.3.
+Decode projections on cuBLASLt (`PLOW_EMIT_DECODE_CUBLASLT`, rungs of 48+ rows) cut the T3 step
+at 128 rows from 6.47 to 5.11 ms but served no faster (c200 61.4 aps), so the recipe keeps the
+GEMV rungs.
+
+Encoder relative-position bias read in place (AttentionF32 flags bit 2: the bias is a table
+`[q_rows][heads][bias_head_stride]` and score `(h, r, j)` reads entry `kv_rows - 1 - r + j`; bits
+8-15: key lengths per group of that many heads). The conformer's grouped 1x1 relpos convolution
+now feeds the attention directly; the diagonal `CopyColsF32` into `[b*8][t][t]` and the key-mask
+add (at b64.t32 9.5 and 7.4 ms of the 59 ms encoder) are gone. The softmax runs in log2 units on
+`exp2f` (log2 e folded into the scale; standalone attention -4 to -11%, same error), and the wgmma
+GEMM stages its bias in shared memory with the tile's first k-tile. Issuing the next tile's loads
+before the epilogue (standalone qkv 112 -> 92 us) spilled registers in the interpreter kernel and
+made every op slower (render +31%), so it is not in.
+
+Render (`--seq`): `b64.t32` 602 -> 565 ms (encoder 59 -> 41 ms, CFM 496 -> 478), `b64.t64` 952 ->
+894, `b32.t64` 557 -> 528. Served c200 (`--n 800`, two runs): 61.0 -> 66.7 steady aps (60.6 /
+61.4 -> 64.5 / 65.8 aps), TTFA p50 7.9 -> 7.4 s; c128 61.6 aps. Mel rel-L2 5e-6 to 1.2e-5; CER
+median 0.000 (96 at c1, 200 at c200); English c64 54.6 aps, CER 0.000; Qwen3-ASR WER 3.913%;
+Veena CER 0.008, c64 57.9 aps.
 
 ## Concurrency
 
