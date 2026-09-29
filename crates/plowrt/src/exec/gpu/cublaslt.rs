@@ -34,6 +34,7 @@ impl CublasLtDecodeRoute {
 pub(super) enum LibraryRoute {
     Projection(CublasLtDecodeRoute),
     Moe(moe_lt::MoeLtRoute),
+    Light(LightRoute),
 }
 
 impl LibraryRoute {
@@ -41,7 +42,216 @@ impl LibraryRoute {
         match self {
             Self::Projection(route) => route.run(stream),
             Self::Moe(route) => route.run(stream),
+            Self::Light(route) => route.run(stream),
         }
+    }
+}
+
+/// An interpreter segment run as ordinary launches of the decode object's light kernels: one
+/// per level of independent instructions, one block per packet slice, no claim loop or gates.
+pub(super) struct LightRoute {
+    be: Arc<CudaBackend>,
+    kernarg: DevProgram,
+    launches: Vec<LightLaunch>,
+}
+
+struct LightLaunch {
+    function: KernelFn,
+    /// `None`: the one-instruction `plow_<arch>_light` kernel; `Some(n)`: `light_attn` over
+    /// `n` instructions from `instruction`.
+    count: Option<u32>,
+    instruction: u32,
+    blocks: u32,
+    smem: u32,
+}
+
+impl LightRoute {
+    fn run(&self, stream: &CudaStream) -> Result<()> {
+        for launch in &self.launches {
+            let mut arg = self.kernarg;
+            let mut instruction = launch.instruction;
+            let mut count = launch.count.unwrap_or(0);
+            let mut params = [
+                &mut arg as *mut DevProgram as *mut std::ffi::c_void,
+                &mut instruction as *mut u32 as *mut std::ffi::c_void,
+                &mut count as *mut u32 as *mut std::ffi::c_void,
+            ];
+            let params = if launch.count.is_some() { &mut params[..] } else { &mut params[..2] };
+            self.be.launch_kernel(
+                launch.function,
+                launch.blocks,
+                BLOCK,
+                launch.smem,
+                params,
+                Some(stream),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LightFunctions {
+    single: KernelFn,
+    /// `plow_<arch>_light_attn`, its arena and the head dim it carries.
+    attn: Option<(KernelFn, u32, u32)>,
+}
+
+/// The light kernels of the decode object `module` (`<stem>` = `interp_<arch>`), when it has
+/// them and `PLOW_DECODE_LIGHT` is on. `smem` = the object's arena, which `light_attn` takes.
+pub(super) fn light_functions(
+    be: &CudaBackend,
+    module: &Module,
+    stem: &str,
+    smem: u32,
+) -> Result<Option<LightFunctions>> {
+    if !crate::config::RuntimeConfig::get().nv.decode_light
+        || be.module_global_u32(module, "plow_light_abi")? != Some(1)
+    {
+        return Ok(None);
+    }
+    let arch = stem.trim_start_matches("interp_");
+    let single = be.get_function(module, &format!("plow_{arch}_light"))?;
+    let attn = match be.module_global_u32(module, "plow_light_attn_hd")? {
+        Some(hd) => {
+            let f = be.get_function(module, &format!("plow_{arch}_light_attn"))?;
+            be.set_max_dynamic_smem(f, smem)?;
+            Some((f, smem, hd))
+        }
+        _ => None,
+    };
+    Ok(Some(LightFunctions { single, attn }))
+}
+
+/// Each light-routable interpreter segment of `g`: `(segment, levels)`, a level being a
+/// contiguous instruction range whose members do not wait on each other. A lone AddNorm or Glu
+/// takes the one-instruction kernel; a segment of HeadNormRope / FlashDecode at the object's
+/// head dim takes `light_attn`.
+pub(super) fn light_segments(
+    g: &DevProg,
+    library: &[Option<DecodeSegment>],
+    functions: &LightFunctions,
+) -> Vec<(usize, Vec<(usize, usize)>)> {
+    let waits_of = |inst: usize| -> Vec<u32> {
+        g.gq_stream
+            .iter()
+            .filter(|e| e.inst as usize == inst)
+            .flat_map(|e| &g.waits[e.wait_ofs as usize..e.wait_ofs as usize + e.wait_len as usize])
+            .map(|w| w.id)
+            .collect()
+    };
+    (0..g.gq_seg_ofs.len().saturating_sub(1))
+        .filter(|&seg| library.get(seg).copied().flatten().is_none())
+        .filter_map(|seg| {
+            let entries = &g.gq_stream[g.gq_seg_ofs[seg] as usize..g.gq_seg_ofs[seg + 1] as usize];
+            let mut insts: Vec<usize> = Vec::new();
+            for e in entries {
+                if insts.last() != Some(&(e.inst as usize)) {
+                    insts.push(e.inst as usize);
+                }
+            }
+            // Every instruction's entries are contiguous and cover its slices once, in order.
+            let whole = insts.iter().all(|&inst| {
+                let d = &g.insts[inst];
+                let own: Vec<_> = entries.iter().filter(|e| e.inst as usize == inst).collect();
+                d.blocks != 0
+                    && own.len() == d.blocks as usize
+                    && own.iter().enumerate().all(|(i, e)| e.slice as usize == i)
+            });
+            let distinct = insts.iter().collect::<std::collections::BTreeSet<_>>().len() == insts.len();
+            if !whole || !distinct {
+                return None;
+            }
+            let op = |inst: usize| DevOp::from_u16(g.insts[inst].op);
+            if let [inst] = insts[..] {
+                if matches!(op(inst), Some(DevOp::AddNorm | DevOp::Glu)) {
+                    return Some((seg, vec![(inst, 0)]));
+                }
+            }
+            let attn_hd = functions.attn.map(|(_, _, hd)| hd);
+            let attn = attn_hd.is_some()
+                && insts.iter().all(|&inst| {
+                    let d = &g.insts[inst];
+                    match op(inst) {
+                        Some(DevOp::HeadNormRope) => Some(d.i[2]) == attn_hd && d.i[5] == 0,
+                        Some(DevOp::FlashDecode) => Some(d.i[6]) == attn_hd,
+                        _ => false,
+                    }
+                });
+            if !attn {
+                return None;
+            }
+            let mut levels: Vec<(usize, usize)> = Vec::new();
+            for &inst in &insts {
+                let joins = levels.last().is_some_and(|&(lo, n)| {
+                    lo + n == inst
+                        && waits_of(inst).iter().all(|&w| !(lo..lo + n).contains(&(w as usize)))
+                });
+                match levels.last_mut() {
+                    Some((_, n)) if joins => *n += 1,
+                    _ => levels.push((inst, 1)),
+                }
+            }
+            Some((seg, levels))
+        })
+        .collect()
+}
+
+/// `(segment, instruction)` of every instruction a light route executes.
+pub(super) fn light_instructions(light: &[(usize, Vec<(usize, usize)>)]) -> Vec<(usize, usize)> {
+    light
+        .iter()
+        .flat_map(|(seg, levels)| {
+            levels
+                .iter()
+                .flat_map(move |&(lo, n)| (lo..lo + n.max(1)).map(move |inst| (*seg, inst)))
+        })
+        .collect()
+}
+
+/// Replace each light segment's (empty) route with its launches.
+pub(super) fn add_light_routes(
+    routes: &mut Vec<Option<LibraryRoute>>,
+    be: &Arc<CudaBackend>,
+    functions: &LightFunctions,
+    kernarg: DevProgram,
+    g: &DevProg,
+    light: &[(usize, Vec<(usize, usize)>)],
+) {
+    for (seg, levels) in light {
+        if routes.len() <= *seg {
+            routes.resize_with(seg + 1, || None);
+        }
+        let launches = levels
+            .iter()
+            .map(|&(inst, n)| {
+                let blocks = (inst..inst + n.max(1))
+                    .map(|i| u32::from(g.insts[i].blocks))
+                    .max()
+                    .unwrap_or(1);
+                match (n, functions.attn) {
+                    (n, Some((function, smem, _))) if n > 0 => LightLaunch {
+                        function,
+                        count: Some(n as u32),
+                        instruction: inst as u32,
+                        blocks,
+                        smem,
+                    },
+                    _ => LightLaunch {
+                        function: functions.single,
+                        count: None,
+                        instruction: inst as u32,
+                        blocks,
+                        smem: 0,
+                    },
+                }
+            })
+            .collect();
+        routes[*seg] = Some(LibraryRoute::Light(LightRoute {
+            be: Arc::clone(be),
+            kernarg,
+            launches,
+        }));
     }
 }
 
@@ -49,7 +259,8 @@ impl LibraryRoute {
 fn glue_kernels<'a>(routes: impl Iterator<Item = &'a LibraryRoute>) -> Vec<KernelFn> {
     routes
         .filter_map(|route| match route {
-            LibraryRoute::Moe(route) => Some(route.glue()),
+            LibraryRoute::Moe(route) => Some(route.glue().collect::<Vec<_>>()),
+            LibraryRoute::Light(route) => Some(route.launches.iter().map(|l| l.function).collect()),
             LibraryRoute::Projection(_) => None,
         })
         .flatten()
@@ -117,6 +328,7 @@ fn pair_operands(
     [out_a, in_a, w_a]: [u64; 3],
     b: &DecodeSegment,
     [out_b, in_b, w_b]: [u64; 3],
+    cold: bool,
 ) -> Option<(u64, u64, crate::device::cuda::lt::Pair)> {
     if (a.m, a.n, a.k) != (b.m, b.n, b.k) || in_a != in_b || a.output_bytes != b.output_bytes {
         return None;
@@ -136,6 +348,7 @@ fn pair_operands(
         c_stride: i64::try_from((o1 - o0) / 2).ok()?,
         input: in_a,
         output: o0,
+        cold,
     };
     Some((w0, o0, pair))
 }
@@ -228,14 +441,32 @@ pub(super) fn prepare_routes(
     devp: &[DeviceMem],
     templates: Option<&[Option<LibraryRoute>]>,
     pair: bool,
+    decode: bool,
 ) -> Result<Vec<Option<CublasLtDecodeRoute>>> {
     let mut routes: Vec<Option<CublasLtDecodeRoute>> = Vec::new();
     if segments.is_empty() {
         return Ok(routes);
     }
     let pair_lt = match backend {
-        ProjectionBackend::Lt(lt) if pair && templates.is_none() => Some(lt),
+        ProjectionBackend::Lt(lt) if pair => Some(lt),
         _ => None,
+    };
+    // A rung pairs exactly where its template (the widest rung) paired, and pins that pair's
+    // algorithm.
+    let template_pair = |index: usize| -> Result<Option<Option<&crate::device::cuda::lt::Plan>>> {
+        let Some(routes) = templates else {
+            return Ok(Some(None));
+        };
+        match (routes.get(index), routes.get(index + 1)) {
+            (
+                Some(Some(LibraryRoute::Projection(route))),
+                Some(Some(LibraryRoute::Projection(next))),
+            ) if next.folded() => match route.plan.as_ref() {
+                ProjectionPlan::Lt(plan) => Ok(Some(Some(plan.as_ref()))),
+                _ => Err(RuntimeError::Rejected("decode projection backend changed".into())),
+            },
+            _ => Ok(None),
+        }
     };
     let mut plans = std::collections::HashMap::new();
     let mut pair_plans = std::collections::HashMap::new();
@@ -251,12 +482,16 @@ pub(super) fn prepare_routes(
         let ops = operands(&segment, insts, devp)?;
         let [output, input, weight] = ops;
         insts[segment.instruction].op = DevOp::Nop as u16;
-        if let Some(lt) = pair_lt {
+        let pair_template = match pair_lt {
+            Some(_) => template_pair(index)?,
+            None => None,
+        };
+        if let (Some(lt), Some(pair_template)) = (pair_lt, pair_template) {
             let next = segments.get(index + 1).copied().flatten();
             let paired = match next {
                 Some(next) => {
                     let next_ops = operands(&next, insts, devp)?;
-                    pair_operands(&segment, ops, &next, next_ops).map(|p| (next, p))
+                    pair_operands(&segment, ops, &next, next_ops, decode).map(|p| (next, p))
                 }
                 None => None,
             };
@@ -264,7 +499,7 @@ pub(super) fn prepare_routes(
                 let plan = match pair_plans.entry((key, p.w_stride, p.c_stride)) {
                     std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.get()),
                     std::collections::hash_map::Entry::Vacant(e) => Arc::clone(e.insert(Arc::new(
-                        ProjectionPlan::Lt(lt.pair_plan(key.0, key.1, key.2, w0, p)?),
+                        ProjectionPlan::Lt(lt.pair_plan(key.0, key.1, key.2, w0, p, pair_template)?),
                     ))),
                 };
                 insts[next.instruction].op = DevOp::Nop as u16;

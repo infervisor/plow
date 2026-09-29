@@ -69,6 +69,22 @@ Served greedy output tok/s, ISL 128 / OSL 512, unique seed per cell:
 | cuBLASLt from 48 rows | 6562 | 9756 | 14722 |
 | vLLM | | 12863 | 19972 |
 
+Between library calls a routed rung used to run each AddNorm, Glu and attention span as an
+interpreter window, about 5-7 us of fixed cost each. `PLOW_DECODE_LIGHT` (default on) runs them as
+ordinary launches of the same bodies: `plow_<arch>_light` for a lone AddNorm or Glu, and
+`plow_<arch>_light_attn` for HeadNormRope + FlashDecode at the object's head dim. The rungs also
+pair k|v and gate|up into one strided batch-2 cuBLASLt call (`PLOW_LT_PAIR`). The pair algorithm
+is timed on cold weight copies and pinned from the widest rung. Tokens are unchanged: the
+step_bench digest is equal at every rung.
+
+| step_bench ms, ctx 384 / 1024 | B=64 | B=128 |
+|---|---|---|
+| cuBLASLt from 48 rows | 6.07 / 7.70 | 7.71 / 10.99 |
+| + pairs, light kernels | 5.04 / 6.66 | 6.61 / 9.86 |
+
+Served with the same client: c64 9755 -> 11544 and c128 14674 -> 16802 tok/s. Streaming c64 goes
+from 66.1 to 70.8 aps. c1 TPOT is 3.35 -> 3.36 ms. CER median 0 (n=80).
+
 Voices are the checkpoint's speaker tags (`kavya`, `agastya`, `maitri`, `vinaya`).
 Defaults: temperature 0.4, top_p 0.9, no repetition penalty (device sampling; a
 penalty switches that request to host sampling).

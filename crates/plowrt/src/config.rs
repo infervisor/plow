@@ -1026,10 +1026,15 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "lt-algos-write", env = "PLOW_LT_ALGOS_WRITE", global = true)]
     pub lt_algos_write: Option<String>,
 
-    /// Prefill runs two adjacent cuBLASLt projections of one input and shape (k/v, gate/up)
-    /// as one strided-batch matmul.
+    /// Prefill and routed decode rungs run two adjacent cuBLASLt projections of one input and
+    /// shape (k/v, gate/up) as one strided-batch matmul.
     #[arg(long = "lt-pair", env = "PLOW_LT_PAIR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub lt_pair: bool,
+
+    /// A routed decode rung's one-instruction AddNorm / Glu segments run as ordinary launches
+    /// of the decode object's light kernel instead of interpreter windows.
+    #[arg(long = "decode-light", env = "PLOW_DECODE_LIGHT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_light: bool,
 
     /// Serve a packet's `MOE_PREFILL_CUBLASLT` segments (emit `PLOW_EMIT_MOE_PF_LT`) with
     /// cuBLASLt grouped matmuls in every prefill bucket of at least this many rows. Unset = every

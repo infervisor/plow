@@ -224,8 +224,9 @@ impl Lt {
         k: u32,
         weight: u64,
         pair: Pair,
+        template: Option<&Plan>,
     ) -> Result<Arc<Plan>> {
-        self.plan_impl(m, n, k, weight, None, Some(pair))
+        self.plan_impl(m, n, k, weight, template, Some(pair))
     }
 
     fn plan_impl(
@@ -825,6 +826,8 @@ pub(crate) struct Pair {
     pub c_stride: i64,
     pub input: u64,
     pub output: u64,
+    /// Time candidates on cold weights (decode: every layer's pair streams its weights from HBM).
+    pub cold: bool,
 }
 
 pub(crate) struct Plan {
@@ -942,6 +945,21 @@ impl Plan {
         let stream = be.stream_create()?;
         let start = be.event_create(true)?;
         let end = be.event_create(true)?;
+        // Cold: a ring of copies of the pair's weight span when it is small enough, else the live
+        // (L2-warm) operands.
+        let span = (pair.w_stride as u64 + n as u64 * k as u64) * 2;
+        let repeats = if pair.cold { (700 * 1024 * 1024u64).div_ceil(span).clamp(2, 16) } else { 4 };
+        let ring = if pair.cold && span <= 256 * 1024 * 1024 {
+            let ring = be.alloc(0, repeats * span)?;
+            for i in 0..repeats {
+                be.memcpy_dtod(ring.base + i * span, weight, span)?;
+            }
+            Some(ring)
+        } else {
+            None
+        };
+        let weight_at =
+            |i: u64| ring.as_ref().map_or(weight, |ring| ring.base + i % repeats * span);
         let mut best = f32::INFINITY;
         let mut selected = None;
         for (index, candidate) in candidates.iter().enumerate() {
@@ -950,12 +968,12 @@ impl Plan {
             }
             self.algo = candidate.algo;
             let result = (|| {
-                for _ in 0..4 {
-                    self.run(pair.input, weight, pair.output, &stream)?;
+                for i in 0..repeats {
+                    self.run(pair.input, weight_at(i), pair.output, &stream)?;
                 }
                 be.event_record(&start, &stream)?;
-                for _ in 0..16 {
-                    self.run(pair.input, weight, pair.output, &stream)?;
+                for i in 0..16 {
+                    self.run(pair.input, weight_at(i), pair.output, &stream)?;
                 }
                 be.event_record(&end, &stream)?;
                 be.event_synchronize(&end)?;

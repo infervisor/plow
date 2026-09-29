@@ -3607,6 +3607,96 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
     PLOW_ET(6);
 }
 
+#if !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
+/* A lone light instruction (AddNorm, Glu) between two host library calls of a routed decode
+ * chain, as an ordinary launch: block `blockIdx.x` runs slice `blockIdx.x` of `blocks`, exactly
+ * the body the interpreter window would run, without the window's claim loop, gates, fences and
+ * counter signals. The host zeroes every wait on the instruction (stream order replaces it). */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm120_light)(PlowProgram prog,
+                                                                                    unsigned inst) {
+    __shared__ float part[32];
+    const PlowDevInst* in = prog.insts + inst;
+    void* const* T = prog.tensors;
+    const uint4 tv_ = *reinterpret_cast<const uint4*>(in->t);
+    const unsigned tw_[4] = {tv_.x, tv_.y, tv_.z, tv_.w};
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+#define LIGHT_TEN(k)                                                                        \
+    (((tw_[(k) >> 1] >> (((k) & 1) * 16)) & 0xFFFFu) == PLOW_TENSOR_NONE                       \
+         ? nullptr                                                                            \
+         : T[(tw_[(k) >> 1] >> (((k) & 1) * 16)) & 0xFFFFu])
+    switch (in->op) {
+    case PLOW_DOP_ADD_NORM:
+        d_add_norm((__nv_bfloat16*)LIGHT_TEN(0), (__nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
+                   (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4), in->i[0], in->i[1],
+                   in->fj[0].f, slice, nblk, part);
+        break;
+    case PLOW_DOP_GLU:
+        d_glu((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
+              in->i[0], in->i[1], slice, nblk);
+        break;
+    default:
+        __trap();
+    }
+#undef LIGHT_TEN
+}
+#if !PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_MIXED_STEP
+/* The attention side of a decode layer (HeadNormRope at the object's head dim, then
+ * FlashDecode) as its own kernels: `count` independent instructions from `inst` on, block `b`
+ * running slice `b` of each. Only these two bodies are compiled in, so the flash row-group loop
+ * keeps its registers (the interpreter entry is at the 255-register cap and spills). */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
+    PLOW_SYM(plow_sm120_light_attn)(PlowProgram prog, unsigned inst, unsigned count) {
+    extern __shared__ float arena[];
+    void* const* T = prog.tensors;
+    for (unsigned i = inst; i < inst + count; i++) {
+        const PlowDevInst* in = prog.insts + i;
+        const unsigned nblk = in->blocks ? in->blocks : gridDim.x, slice = blockIdx.x;
+        if (i != inst) __syncthreads();
+        if (slice >= nblk) continue;
+        const uint4 tv_ = *reinterpret_cast<const uint4*>(in->t);
+        const unsigned tw_[4] = {tv_.x, tv_.y, tv_.z, tv_.w};
+#define LIGHT_TEN(k)                                                                        \
+    (((tw_[(k) >> 1] >> (((k) & 1) * 16)) & 0xFFFFu) == PLOW_TENSOR_NONE                       \
+         ? nullptr                                                                            \
+         : T[(tw_[(k) >> 1] >> (((k) & 1) * 16)) & 0xFFFFu])
+        if (in->op == PLOW_DOP_HEADNORM_ROPE && in->i[2] == PLOW_NV_FA_HD && in->i[5] == 0) {
+            d_headnorm_rope<PLOW_NV_FA_HD>(
+                (__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+                (const __nv_bfloat16*)LIGHT_TEN(2), (const float*)LIGHT_TEN(3),
+                (const float*)LIGHT_TEN(4), (const int*)LIGHT_TEN(5), in->i[0], in->i[1],
+                in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4], slice, nblk, in->i[6],
+                nullptr, in->i[7] ? (__nv_bfloat16*)LIGHT_TEN(6) : nullptr,
+                in->i[7] ? (const __nv_bfloat16*)LIGHT_TEN(7) : nullptr);
+        } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == PLOW_NV_FA_HD &&
+                   (in->i[1] / in->i[2]) % PLOW_NV_FA_GF == 0) {
+            const unsigned fold = in->fj[2].u;
+            __nv_bfloat16* const fold_out = fold ? (__nv_bfloat16*)T[fold & 0xFFFFu] : nullptr;
+            unsigned* const fold_ctr = fold ? (unsigned*)T[fold >> 16] : nullptr;
+            if (LIGHT_TEN(6))
+                d_flash_decode_slots<PLOW_NV_FA_HD, PLOW_NV_FA_GF>(
+                    (float*)LIGHT_TEN(0), (float*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
+                    (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4),
+                    (const int*)LIGHT_TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
+                    in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,
+                    (const int*)LIGHT_TEN(6), fold_out, fold_ctr);
+            else
+                d_flash_decode<PLOW_NV_FA_HD, PLOW_NV_FA_GF>(
+                    (float*)LIGHT_TEN(0), (float*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
+                    (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4),
+                    (const int*)LIGHT_TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
+                    in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,
+                    nullptr, nullptr, fold_out, fold_ctr);
+        } else {
+            __trap();
+        }
+#undef LIGHT_TEN
+    }
+}
+extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = PLOW_NV_FA_HD;
+#endif
+extern "C" __device__ unsigned PLOW_SYM(plow_light_abi) = 1;
+#endif
+
 /* ---- host-side launch helper -----------------------------------------------------------
  * Grid comes from cudaOccupancyMaxActiveBlocksPerMultiprocessor x multiProcessorCount, cached
  * once. Co-residency is the CORRECTNESS condition, not a tuning knob: a block that is not

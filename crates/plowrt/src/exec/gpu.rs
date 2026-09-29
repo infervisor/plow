@@ -4797,8 +4797,25 @@ impl GpuEngine {
         } else {
             0
         };
+        let light_functions = if cublaslt_enabled {
+            cublaslt::light_functions(
+                &be,
+                &module,
+                profile.decode_file.trim_end_matches(".cubin"),
+                smem,
+            )?
+        } else {
+            None
+        };
+        let main_light = light_functions
+            .as_ref()
+            .map_or_else(Vec::new, |f| cublaslt::light_segments(g, &cublaslt_segments, f));
         let ordered_waits = if cublaslt_enabled {
-            Some(cublaslt::ordered_waits(g, &cublaslt_segments, &[])?)
+            Some(cublaslt::ordered_waits(
+                g,
+                &cublaslt_segments,
+                &cublaslt::light_instructions(&main_light),
+            )?)
         } else if moe_lt_routed {
             let none = vec![None; moe_lt_segments.len()];
             Some(cublaslt::ordered_waits_for(
@@ -4809,14 +4826,15 @@ impl GpuEngine {
         } else {
             None
         };
-        let cublaslt_decode = if let Some(lt) = &cublaslt {
+        let mut cublaslt_decode = if let Some(lt) = &cublaslt {
             cublaslt::library_routes(cublaslt::prepare_routes(
                 lt,
                 cublaslt_segments,
                 &mut insts,
                 &devp,
                 None,
-                false,
+                crate::config::RuntimeConfig::get().nv.lt_pair,
+                true,
             )?)
         } else if moe_lt_routed {
             let routes = moe_lt::decode_routes(
@@ -4897,6 +4915,9 @@ impl GpuEngine {
             n_prefill_rows: 0,
             token_batch: 0,
         };
+        if let Some(functions) = &light_functions {
+            cublaslt::add_light_routes(&mut cublaslt_decode, &be, functions, kernarg, g, &main_light);
+        }
 
         let stream = be.stream_create()?;
         // An explicit --nv-smem speaks for every rung; an object without the symbol has one claim.
@@ -4942,7 +4963,14 @@ impl GpuEngine {
                         });
                     let mut rung = if let (Some(lt), Some(roles)) = (&cublaslt, projection_roles) {
                         let segments = cublaslt::decode_segments(g, &blob.tensors, roles)?;
-                        let waits = cublaslt::ordered_waits(g, &segments, &[])?;
+                        let light = light_functions
+                            .as_ref()
+                            .map_or_else(Vec::new, |f| cublaslt::light_segments(g, &segments, f));
+                        let waits = cublaslt::ordered_waits(
+                            g,
+                            &segments,
+                            &cublaslt::light_instructions(&light),
+                        )?;
                         let mut insts = g.insts.clone();
                         let routes = cublaslt::prepare_routes(
                             lt,
@@ -4950,7 +4978,8 @@ impl GpuEngine {
                             &mut insts,
                             &devp,
                             Some(&cublaslt_decode),
-                            false,
+                            crate::config::RuntimeConfig::get().nv.lt_pair,
+                            true,
                         )?;
                         let mut rung = DecodeRung::upload_with_insts(
                             &be,
@@ -4963,6 +4992,17 @@ impl GpuEngine {
                         // The interpreter windows run the rung's own object (the `_gw` arms).
                         let (function, smem) = wide_object(g.t as usize)
                             .map_or((f, smem), |object| (object.function, object.smem));
+                        let mut routes = cublaslt::library_routes(routes);
+                        if let Some(functions) = &light_functions {
+                            cublaslt::add_light_routes(
+                                &mut routes,
+                                &be,
+                                functions,
+                                rung.kernarg,
+                                g,
+                                &light,
+                            );
+                        }
                         rung.library = Some(cublaslt::CublasLtDecodeGraph::capture(
                             &be,
                             &stream,
@@ -4970,7 +5010,7 @@ impl GpuEngine {
                             function,
                             grid,
                             smem,
-                            cublaslt::library_routes(routes),
+                            routes,
                         )?);
                         rung
                     } else if let Some(roles) = segment_roles
@@ -9056,6 +9096,7 @@ impl GpuEngine {
                     devp,
                     None,
                     config.nv.lt_pair,
+                    false,
                 )?
             };
             let mut moe_lt_segments = Vec::new();
