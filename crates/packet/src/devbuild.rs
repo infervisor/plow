@@ -481,6 +481,8 @@ pub struct Builder {
     /// Coarse dep edges removed by the transitive reduction in [`Builder::finish`].
     /// Reported so an emitter can log it; the reduction itself is unconditional.
     tr_dropped: usize,
+    /// First instruction of the KV-shared tail (see `plow_asset::kv_shared_tail`).
+    shared_tail_mark: Option<u32>,
 }
 
 fn mla_prefill_segment_class(op: u16, n_tok: u32) -> Option<u8> {
@@ -720,6 +722,7 @@ impl Builder {
             tensor_dedup: false,
             cu_cap: None,
             tr_dropped: 0,
+            shared_tail_mark: None,
         }
     }
 
@@ -989,6 +992,15 @@ impl Builder {
 
     pub fn n_insts(&self) -> usize {
         self.ops.len()
+    }
+
+    /// Record the next instruction as the start of the KV-shared tail.
+    pub fn mark_shared_tail(&mut self) {
+        self.shared_tail_mark = Some(self.ops.len() as u32);
+    }
+
+    pub fn shared_tail_mark(&self) -> Option<u32> {
+        self.shared_tail_mark
     }
 
     /// The declared name of handle `h`.

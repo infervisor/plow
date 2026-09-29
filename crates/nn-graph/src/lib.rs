@@ -61,5 +61,5 @@ pub use graph::{
     RoutedExpertBinding, TensorId, TensorInfo, WeightSpec,
 };
 pub use infer::{infer_shapes, InferError};
-pub use op::{ActKind, EwKind, LinearAttnKind, MoeGroups, MoeScoring, Op, ReduceKind};
+pub use op::{ActKind, EwKind, LinearAttnKind, MoeGroups, MoeScoring, Op, PadMode, ReduceKind};
 pub use shape::Shape;

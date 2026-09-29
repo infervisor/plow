@@ -96,6 +96,48 @@ pub struct RuntimeConfig {
     #[arg(long = "idle-dispatch", env = "PLOW_IDLE_DISPATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub idle_dispatch: bool,
 
+    /// Frames of right context a speech stream's FIRST audio waits for (later windows keep the
+    /// codec's own lookahead): Veena needs one frame fewer before it speaks. Capped by the codec's.
+    #[arg(long = "tts-first-lookahead", env = "PLOW_TTS_FIRST_LOOKAHEAD", default_value_t = 1, global = true)]
+    pub tts_first_lookahead: usize,
+
+    /// Share of a streaming ASR session's time its partial transcripts may keep the model busy:
+    /// after a partial that took `t`, the session's appends answer the previous partial's text
+    /// until `t * (1 / duty - 1)` has passed. Idle, partials take far less than the 1 s append
+    /// cadence and all run; loaded, they stop crowding out finals. 1 = every append transcribes.
+    #[arg(long = "asr-partial-duty", env = "PLOW_ASR_PARTIAL_DUTY", default_value_t = 0.5, global = true)]
+    pub asr_partial_duty: f64,
+
+    /// Under `--co-sched deadline`, most streams one vocoder render launch takes (0 = the packet's
+    /// largest capacity). A launch is one cooperative grid that holds the device to its end (1.4 s
+    /// at 64 streams, 0.45 s at 16), so this bounds how long ASR finals and prompts wait behind
+    /// speech.
+    #[arg(long = "tts-turn-batch", env = "PLOW_TTS_TURN_BATCH", default_value_t = 16, global = true)]
+    pub tts_turn_batch: usize,
+
+    /// Streams of a guided speech model render windows (new tokens + left context) on the
+    /// vocoder packet's cached-prompt capacities when it has them; off: every chunk re-renders
+    /// the stream's whole prefix with the prompt.
+    #[arg(long = "tts-stream-windows", env = "PLOW_TTS_STREAM_WINDOWS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tts_stream_windows: bool,
+
+    /// How long a finished `X-Session-Id` request's KV (and an ASR session's audio and encoder
+    /// windows) stays retained for the session's next request, in ms. 0 disables retention.
+    #[arg(long = "session-ttl-ms", env = "PLOW_SESSION_TTL_MS", default_value_t = 60_000, global = true)]
+    pub session_ttl_ms: u64,
+
+    /// Retained session sequences per model; 0 = bounded by the slots (a live request that needs a
+    /// slot always evicts the least recently used one).
+    #[arg(long = "session-max", env = "PLOW_SESSION_MAX", default_value_t = 0, global = true)]
+    pub session_max: usize,
+
+    /// Slots a live request may be seated past because retained sessions hold the ones below:
+    /// decode launches cover every slot up to the highest live one, so by default (0) retention
+    /// never widens the launch the live requests already run; a request seated higher evicts the
+    /// least recently used retained slot below it.
+    #[arg(long = "session-slack", env = "PLOW_SESSION_SLACK", default_value_t = 0, global = true)]
+    pub session_slack: usize,
+
     /// Tokenize prompts without computing offsets (same ids).
     #[arg(long = "encode-fast", env = "PLOW_ENCODE_FAST", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub encode_fast: bool,
@@ -204,6 +246,11 @@ pub struct RuntimeConfig {
     #[arg(long = "pf-no-interleave", env = "PLOW_PF_NO_INTERLEAVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_no_interleave: bool,
 
+    /// Always ride decode rows in the prefill launch (the pre-`sched::ride` behaviour) instead of
+    /// choosing per launch from measured costs.
+    #[arg(long = "ride-fixed", env = "PLOW_RIDE_FIXED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub ride_fixed: bool,
+
     /// Throughput mode: run prefill chains to completion, skip decode until all
     /// prompts are resident. Trades streaming latency for aggregate tok/s.
     #[arg(long = "pf-defer-decode", env = "PLOW_PF_DEFER_DECODE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -299,9 +346,11 @@ pub struct RuntimeConfig {
     pub pin: Vec<String>,
 
     /// How co-resident models take a shared GPU: `free` (private streams, the
-    /// driver admits whoever is ready — fastest, and the default) or `rr`
+    /// driver admits whoever is ready — fastest, and the default), `rr`
     /// (round-robin turns, which bounds starvation and makes the interleaving
-    /// reproducible at the cost of overlap).
+    /// reproducible at the cost of overlap) or `deadline` (turns by urgency: an
+    /// ASR final, a speech stream's start or a prompt owed its first token go
+    /// ahead of decode, decode ahead of partial transcripts; see `serve::cosched`).
     #[arg(
         long = "co-sched",
         env = "PLOW_CO_SCHED",
@@ -355,6 +404,12 @@ pub struct RuntimeConfig {
     /// thread. `0` restores the synchronous unmap.
     #[arg(long = "vmm-deferred-reclaim", env = "PLOW_VMM_DEFERRED_RECLAIM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_deferred_reclaim: bool,
+
+    /// CUDA VMM KV (with `--vmm-deferred-reclaim`): leave a retired window's private blocks
+    /// mapped for the slot's next occupant, within the `--kv-pool-mib` cap, instead of unmapping
+    /// them on the pool thread and mapping fresh ones at the next admission. `0` is the rollback.
+    #[arg(long = "vmm-stale-reserve", env = "PLOW_VMM_STALE_RESERVE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_stale_reserve: bool,
 
     /// CUDA VMM prefix cache: snapshot a sequence's boundary into the cache only once its
     /// leading 32 tokens were seen on another sequence, so unique-prompt workloads pay no
@@ -713,6 +768,21 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "multistep-adaptive", env = "PLOW_MULTISTEP_ADAPTIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub multistep_adaptive: bool,
 
+    /// CFG pairs draw on the device (`plow_sample_cfg` in the sampler object) instead of from
+    /// the host's copy of both logits rows. Off by default: Chatterbox served on H100 (T3 sharing
+    /// the GPU with the S3Gen render) lost aps at c16/c32/c64 (17.0/19.6/19.0 vs 18.7/20.5/21.9,
+    /// means of two runs): the host draw's per-step gap paced T3, and without it utterances
+    /// close in a trickle, so renders batch smaller (2.6 vs 3.1 per launch) and cost 10% more per
+    /// token. c1: T3 unchanged (0.5% faster), host share 12-18% -> 0.1% at c16..c64.
+    #[arg(long = "cfg-device", env = "PLOW_CFG_DEVICE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub cfg_device: bool,
+
+    /// With `--cfg-device`, CFG pairs also ride the `--multistep` quantum. Off: one step per tick
+    /// — measured Chatterbox served, H100: K=8 vs 1 c16 17.25 vs 18.75 aps, c1 T3 1.634 vs 1.606
+    /// ms/token (a quantum overshoots the stop and delays prefill and first-chunk renders).
+    #[arg(long = "cfg-multistep", env = "PLOW_CFG_MULTISTEP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub cfg_multistep: bool,
+
     /// Lookahead-1 decode pipeline (CUDA): the next decode step is enqueued before the host waits
     /// on the current one, so streaming, stop checks and scheduling overlap the device step and
     /// every token streams as it is produced. Takes over from the K-step `--multistep` quantum
@@ -868,6 +938,21 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-seg-graph", env = "PLOW_PF_SEG_GRAPH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_seg_graph: bool,
 
+    /// Packed prefill runs a KV-shared model's trailing KV-shared layers for the sampled rows
+    /// only (`plow_asset::kv_shared_tail`); `false` runs every row through every layer.
+    #[arg(long = "pf-shared-tail", env = "PLOW_PF_SHARED_TAIL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_shared_tail: bool,
+
+    /// Multi-segment prefill buckets drop the waits and counter bumps a segment launch boundary
+    /// already orders (`exec::gpu::segment_gates`).
+    #[arg(long = "pf-segment-gates", env = "PLOW_PF_SEGMENT_GATES", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_segment_gates: bool,
+
+    /// Diagnostic: with a `-DPLOW_NV_ENTRY_TRACE=1` light object, log per-segment entry-stage
+    /// timings of each captured prefill chain.
+    #[arg(long = "pf-entry-trace", env = "PLOW_PF_ENTRY_TRACE", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub pf_entry_trace: bool,
+
     /// Segment-classing v2 ("1") / q8 variant ("q8").
     #[arg(long = "pf-seg-v2", env = "PLOW_PF_SEG_V2", global = true)]
     pub pf_seg_v2: Option<String>,
@@ -926,6 +1011,10 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-trace-log", env = "PLOW_PF_TRACE_LOG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_trace_log: bool,
 
+    /// Diagnostic: name why a decode rung failed ladder normalization (widest-rung fallback).
+    #[arg(long = "ladder-debug", env = "PLOW_LADDER_DEBUG", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub ladder_debug: bool,
+
     /// Per-shape cuBLASLt algorithm table (JSONL, see `device::cuda::lt::StoredAlgo`): each
     /// `(m, n, k)` BF16 shape uses the pinned algorithm after `cublasLtMatmulAlgoCheck` accepts
     /// it; a rejected entry falls back to the heuristic plus load-time timing.
@@ -936,6 +1025,50 @@ pub struct NvidiaRuntimeConfig {
     /// a `--lt-algos` table (a build stage with the GPU, or a first serve).
     #[arg(long = "lt-algos-write", env = "PLOW_LT_ALGOS_WRITE", global = true)]
     pub lt_algos_write: Option<String>,
+
+    /// Prefill and routed decode rungs run two adjacent cuBLASLt projections of one input and
+    /// shape (k/v, gate/up) as one strided-batch matmul.
+    #[arg(long = "lt-pair", env = "PLOW_LT_PAIR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub lt_pair: bool,
+
+    /// Each narrower routed decode rung times its own cuBLASLt algorithms (singles, pairs, fused
+    /// q|k|v) instead of reusing the widest rung's. Opt-in per model (a rung's tokens can change
+    /// with its algorithm: E4B B=64 digest moves). Veena step_bench ctx 384: B=32/48/64
+    /// -4/-5/-3%, digests equal.
+    #[arg(long = "lt-rung-algos", env = "PLOW_LT_RUNG_ALGOS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub lt_rung_algos: bool,
+
+    /// A routed decode rung's one-instruction AddNorm / Glu segments run as ordinary launches
+    /// of the decode object's light kernel instead of interpreter windows.
+    #[arg(long = "decode-light", env = "PLOW_DECODE_LIGHT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_light: bool,
+
+    /// A light attention level that is one hd128 FlashDecode (nsplit 1, merge folded) runs the
+    /// streamed body (`plow_<arch>_light_flash`): a producer warp feeds K/V through a smem ring
+    /// across the block's items. Bit-identical to the row-group body.
+    #[arg(long = "decode-light-flash", env = "PLOW_DECODE_LIGHT_FLASH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_light_flash: bool,
+
+    /// Gemma hd256 light attention levels run `plow_<arch>_light_attn_s` (hd256 bodies only,
+    /// two blocks per SM, twice the blocks): E4B B=64/128 ctx 1024 7.63/9.70 -> 7.56/9.54 ms,
+    /// digests equal. Off: they run `light_attn`, one block per SM.
+    #[arg(long = "decode-light-attn-s", env = "PLOW_DECODE_LIGHT_ATTN_S", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_light_attn_s: bool,
+
+    /// A routed decode rung whose unaligned lm_head runs through the light head kernel computes
+    /// the greedy argmax there too, and skips the packet's Argmax/ArgmaxFin window.
+    #[arg(long = "decode-head-argmax", env = "PLOW_DECODE_HEAD_ARGMAX", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_head_argmax: bool,
+
+    /// A prefill bucket's lone RmsNorm / Residual / SiLU Glu segments run as ordinary launches
+    /// of the decode object's `plow_<arch>_light_pf` kernel instead of interpreter windows.
+    #[arg(long = "prefill-light", env = "PLOW_PREFILL_LIGHT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefill_light: bool,
+
+    /// A routed decode rung's q, k and v projections run as one cuBLASLt matmul when their
+    /// weights are contiguous and a light attention launch reads the three outputs.
+    #[arg(long = "decode-lt-qkv", env = "PLOW_DECODE_LT_QKV", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_lt_qkv: bool,
 
     /// Serve a packet's `MOE_PREFILL_CUBLASLT` segments (emit `PLOW_EMIT_MOE_PF_LT`) with
     /// cuBLASLt grouped matmuls in every prefill bucket of at least this many rows. Unset = every
@@ -1185,6 +1318,11 @@ pub struct AmdRuntimeConfig {
     /// policy terms, which saturate from 16384 up) and what is refused.
     #[arg(long = "live-ctx", env = "PLOW_LIVE_CTX", global = true)]
     pub live_ctx: Option<u32>,
+
+    /// Per-model live bound, `<served name>=<ctx>[,...]`, over `--live-ctx`: co-served models
+    /// size their KV apart (an ASR and a TTS packet at 1024 next to an LLM at its ceiling).
+    #[arg(long = "live-ctx-models", env = "PLOW_LIVE_CTX_MODELS", global = true)]
+    pub live_ctx_models: Option<String>,
 
     /// Fraction of the free-after-load device memory the mux may commit to admitted
     /// sequences' KV. Below 1.0 so transient prefill workspaces and allocator fragmentation
@@ -1659,6 +1797,22 @@ impl RuntimeConfig {
         })
     }
 
+    /// Live bound for the packet in `assets_dir`: its served name's `--live-ctx-models` entry,
+    /// else [`Self::live_ctx`].
+    pub fn live_ctx_for(&self, assets_dir: &std::path::Path) -> Option<u32> {
+        let spec = self.amd.live_ctx_models.clone().or_else(|| Self::env_nonempty("PLOW_LIVE_CTX_MODELS"));
+        let per_model = spec.and_then(|spec| {
+            let bytes = std::fs::read(assets_dir.join("weights.json")).ok()?;
+            let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            let slug = v.get("served_name")?.as_str()?.to_owned();
+            spec.split(',').find_map(|kv| {
+                let (k, n) = kv.split_once('=')?;
+                (k.trim() == slug).then(|| n.trim().parse().ok()).flatten()
+            })
+        });
+        per_model.or_else(|| self.live_ctx())
+    }
+
     #[cfg(feature = "cuda")]
     pub(crate) fn nv_vmm_prefix(&self) -> Option<bool> {
         if !self.prefix_cache {
@@ -1847,6 +2001,14 @@ impl RuntimeConfig {
         select_compat(
             self.vmm_deferred_reclaim,
             Self::env_bool("PLOW_VMM_DEFERRED_RECLAIM"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn vmm_stale_reserve(&self) -> bool {
+        select_compat(
+            self.vmm_stale_reserve,
+            Self::env_bool("PLOW_VMM_STALE_RESERVE"),
             !Self::is_initialized(),
         )
     }

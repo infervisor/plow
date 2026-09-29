@@ -1,0 +1,89 @@
+# Veena (maya-research/Veena) on H100: Llama-3.2-3B codec LM (tts.codec_lm.v1) + SNAC-24k decoder
+# lowered to codec.pkt. Every stage is a plowc packet; plowrt ships no model-specific code.
+#
+#   PLOW_CAMPAIGN_NO_NIX=1 (this box only) PYREF=<python with torch+snac> \
+#   python3 scripts/campaign/campaign.py build recipes/infervisor/veena/sm90a-h100-tp1.toml --out <fresh dir>
+#
+# Gates: codec parity vs the reference SNAC decoder (rel-L2 ~1e-6) and Whisper CER
+# (scripts/tts/asr_check.py, median 0.008); speech bench: scripts/tts/tts_bench.py against
+# `plowrt serve` and the vLLM+SNAC server (scripts/tts/vllm_speech_probe.sh), same client.
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "veena"
+label = "sm90a-h100-tp1"
+network = "llama"
+doc = "docs/runtime/tts.md"
+tracker = "plans/tts-veena-chatterbox-h200-tracker.md"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+
+[checkpoint]
+source = "hf:maya-research/Veena"
+codec = "hf:hubertsiuzdak/snac_24khz"
+
+[cell]
+name = "veena-h100"
+hf_dir = "{hf:maya-research/Veena}"
+gpu = "h100"
+arch = "sm_90a"
+n_cu = 132
+n_gpu = 1
+max_ctx = 2048
+
+# SNAC decoder export (folded weight norm, torch layouts) read by the codec lowering.
+[[prep]]
+name = "snac-export"
+script = "scripts/tts/snac_export.py"
+args = ["{out}/prep/snac"]
+
+[emit]
+emit = "devblob+cubin"
+# The OpenAI `model` id plowrt serves the bundle under (weights.json served_name).
+args = ["--served-name", "veena"]
+[emit.env]
+PLOW_TTS_PROFILE = "veena"
+PLOW_TTS_CODEC_DIR = "{out}/prep/snac"
+PLOW_VERIFY_BIN = "{repo}/lean-plow/.lake/build/bin/plow_verify"
+# Speech-shaped rungs: prompts are ~20-60 rows, so prefill 64..512 instead of 128..2048;
+# decode up to 32 concurrent streams (the GV_MM_MAX=32 object keeps B=1 within 1%).
+# Decode ladder: rungs past 32 run the one-pass wide GEMV (`_gw` object); 48/96 pay 5-13% over
+# rounding up to 64/128 (Veena step_bench ctx 1024: 8.21 vs 9.08, 11.56 vs 13.28 ms), 3/6/12/24 < 3%.
+PLOW_MAX_CHUNK = "512"
+PLOW_PF_LADDER_APPEND = "64,256"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+# Decode rungs of 32+ rows run their projections on cuBLASLt, with paired k|v and gate|up,
+# fused q|k|v and light kernels between library calls (step_bench ctx 384 B=32 4.60 -> 4.26 ms;
+# B=16 loses 3.61 -> 3.94). The lm_head runs its 16-aligned columns on cuBLASLt too (B=128 -3%).
+PLOW_EMIT_DECODE_CUBLASLT = "1"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
+PLOW_NO_GLU_FUSE = "1"
+PLOW_FUSE_KV_HNR = "1"
+
+# Served flags (campaign serve/bench/gate). The lookahead-1 decode pipeline overlaps the host's
+# read-out and streaming with the next step (greedy c64/c128 +3-5%, c1 TPOT and CER unchanged);
+# --lt-rung-algos times cuBLASLt algorithms per rung (step_bench B=32..64 -3..-5%, digests equal).
+[serve]
+extra_args = "--multistep-adaptive --decode-pipeline --lt-rung-algos"
+
+[bench]
+kind = "speech"
+client = "scripts/tts/tts_bench.py"
+arms = ["--conc 1 --stream --wav --n 16", "--conc 1 --n 16", "--conc 8 --stream --n 32", "--conc 32 --stream --n 64", "--conc 64 --stream --n 128"]
+reference = "scripts/tts/vllm_speech_probe.sh"
+
+# `campaign.py gate <recipe> --assets <dir> --out <dir>`: Whisper CER of served speech (python with
+# transformers + jiwer + librosa). Median CER 0.016 (n=80) at 820aa3ba.
+[gates]
+python = "{env:PYREF}"
+[gates.tts_cer]
+arms = ["--conc 1 --stream --wav --n 16", "--conc 32 --stream --wav --n 64"]
+cer_median_max = 0.05

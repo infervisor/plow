@@ -198,6 +198,18 @@ name = "asr_batch_dataset"
 path = "examples/asr/batch_dataset.rs"
 
 [[example]]
+name = "packet_bench"
+path = "examples/packet_bench.rs"
+
+[[example]]
+name = "codec_check"
+path = "examples/codec_check.rs"
+
+[[example]]
+name = "packet_run"
+path = "examples/packet_run.rs"
+
+[[example]]
 name = "asr_stream"
 path = "examples/asr/stream.rs"
 
@@ -306,4 +318,9 @@ required-features = ["gguf"]
 [[example]]
 name = "step_bench"
 path = "examples/step_bench.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "t3_check"
+path = "examples/t3_check.rs"
 required-features = ["cuda"]

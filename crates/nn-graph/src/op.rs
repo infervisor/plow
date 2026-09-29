@@ -6,7 +6,7 @@
 //! to tiles. Shape-inference rules for each op live in [`crate::infer`].
 
 /// Pointwise activation functions.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ActKind {
     Silu,
     Gelu,
@@ -15,6 +15,23 @@ pub enum ActKind {
     Relu,
     Sigmoid,
     QuickGelu,
+    /// `x * tanh(softplus(x))`.
+    Mish,
+    /// ELU with alpha 1.
+    Elu,
+    /// `x` for `x >= 0`, else `slope * x`.
+    LeakyRelu(f32),
+    Abs,
+    /// `x + sin^2(alpha[c] x) / (alpha[c] + 1e-9)` with a per-channel (last-axis) `alpha`. The only
+    /// parameterized kind: `Op::Act(Snake)` takes inputs `[x, alpha]`.
+    Snake,
+}
+
+/// Padding fill of [`Op::Conv1d`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PadMode {
+    Zero,
+    Reflect,
 }
 
 /// Binary elementwise operations (numpy broadcasting).
@@ -71,7 +88,8 @@ pub enum Op {
         frequency_dim: u32,
     },
 
-    /// Pointwise activation. Inputs `[x]`. Shape-preserving.
+    /// Pointwise activation. Inputs `[x]` (`[x, alpha]` for [`ActKind::Snake`]).
+    /// Shape-preserving.
     Act(ActKind),
 
     /// Binary elementwise with broadcasting. Inputs `[a, b]`.
@@ -221,6 +239,30 @@ pub enum Op {
     /// an input no prefill ever reads.
     Conv1dDepthwise { kernel: u32 },
 
+    /// Channels-last 1-D convolution, torch `Conv1d` semantics over `[B, T, C]`.
+    /// Inputs `[x, weight]` or `[x, weight, bias]` with `weight: [out_c, in_c / groups, kernel]`.
+    /// `out_T = (T + pad.0 + pad.1 - dilation * (kernel - 1) - 1) / stride + 1`.
+    Conv1d {
+        stride: u32,
+        dilation: u32,
+        groups: u32,
+        /// `(before, after)` along T.
+        padding: (u32, u32),
+        pad_mode: PadMode,
+    },
+
+    /// Channels-last transposed 1-D convolution, torch `ConvTranspose1d` semantics over
+    /// `[B, T, C]`. Inputs `[x, weight]` or `[x, weight, bias]` with
+    /// `weight: [in_c, out_c / groups, kernel]`.
+    /// `out_T = (T - 1) * stride + kernel + output_padding - crop.0 - crop.1`; torch's symmetric
+    /// `padding` is `crop = (padding, padding)`.
+    ConvTranspose1d {
+        stride: u32,
+        groups: u32,
+        crop: (u32, u32),
+        output_padding: u32,
+    },
+
     /// Linear (sub-quadratic) attention with a carried recurrent state.
     ///
     /// Inputs `[q, k, v, gate, beta, A_log, dt_bias]`: q/k/v are rank-4
@@ -350,6 +392,8 @@ impl Op {
             Op::DsaIndexer { .. } => "dsa_indexer",
             Op::DsaAttention { .. } => "dsa_attention",
             Op::Conv1dDepthwise { .. } => "conv1d_depthwise",
+            Op::Conv1d { .. } => "conv1d",
+            Op::ConvTranspose1d { .. } => "conv_transpose1d",
             Op::LinearAttention { .. } => "linear_attention",
             Op::SituGlu { .. } => "situ_glu",
             Op::BlockResidual { .. } => "block_residual",

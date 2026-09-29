@@ -70,6 +70,7 @@ async fn run_sweep_point(
                 },
                 arrived: Instant::now(),
                 respond: tx,
+                opts: Default::default(),
             };
             let _ = mux_c.submit(job);
 

@@ -66,6 +66,7 @@ fn job(respond: ChunkSender, max_tokens: usize) -> Job {
         },
         arrived: std::time::Instant::now(),
         respond,
+        opts: Default::default(),
     }
 }
 

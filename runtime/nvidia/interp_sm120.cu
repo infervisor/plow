@@ -46,6 +46,13 @@ extern "C" __device__ unsigned plow_mixed_interpreter
  * can-fire are different claims, and only the second licenses a measurement. */
 extern "C" __device__ unsigned plow_token_batch_abi_1 = 1;
 extern "C" __device__ unsigned plow_row_gather_1 = 1;
+#ifndef PLOW_NV_ENTRY_TRACE
+#define PLOW_NV_ENTRY_TRACE 0
+#endif
+/* Every interpreter entry starts with plow_pdl_wait(): the host may launch it programmatically. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+extern "C" __device__ unsigned plow_pdl_wait_1 = 1;
+#endif
 
 /* ---- OPTIONAL per-packet arm selection (plow_config.h) ---------------------------------
  * -DPLOW_CONFIG='"plow_config.h"' includes a header devgen generated FROM THE EMITTED
@@ -80,6 +87,24 @@ extern "C" __device__ unsigned plow_row_gather_1 = 1;
 #endif
 #ifdef PLOW_CONFIG
 #include PLOW_CONFIG
+#endif
+#if defined(PLOW_NV_GW_OBJECT) && PLOW_NV_GW_OBJECT
+/* The `_gw` object runs the batched rungs (8 rows and up): the single-row GEMV kernels are dead in
+ * it, and compiled in they cost its live arms registers (the entry is one function at the cap).
+ * Veena step_bench ms at B=2/8/16/32 ctx 1024, the ordinary object with and without them:
+ * 4.289/4.517/4.822/6.471 -> 4.197/4.357/4.632/5.967. */
+#undef PLOW_NV_GEMV_XREG
+#define PLOW_NV_GEMV_XREG 0
+#undef PLOW_NV_GEMV_KPANEL
+#define PLOW_NV_GEMV_KPANEL 0
+#undef PLOW_NV_GEMV_RB
+#define PLOW_NV_GEMV_RB 0
+#undef PLOW_NV_RB_GEMV
+#define PLOW_NV_RB_GEMV 0
+#undef PLOW_NV_RB_QKV
+#define PLOW_NV_RB_QKV 0
+#undef PLOW_NV_RB_LMHEAD
+#define PLOW_NV_RB_LMHEAD 0
 #endif
 #ifndef PLOW_PACKET_HASH
 /* 0 = a GENERAL object: built with every arm, pairs with any packet. */
@@ -223,11 +248,67 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #include "op_mla.cuh"        /* MLA (DeepSeek/GLM/Kimi) latent decode + fused merge-fold (P1) */
 #include "op_dsa.cuh"        /* GLM DSA indexer: score (mma.sync) + top-k select (P3) */
 #include "op_elementwise.cuh"
+#ifndef PLOW_NV_SPEECH
+#define PLOW_NV_SPEECH 0
+#endif
+#if PLOW_NV_SPEECH
+#include "op_speech_f32.cuh"
+#endif
 #ifndef PLOW_NV_PREFILL
 #define PLOW_NV_PREFILL 0
 #endif
 #include "op_norm.cuh"
 #include "op_gemm.cuh"
+#if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL
+#include "op_gemv_k8_sm90.cuh"
+#if PLOW_NV_GEMV_K8
+/* Widest activation rung the K-split walk takes: the decode object holds rungs <= 4 (1-tile arm
+ * only), the _gw object 8..32. */
+#ifndef PLOW_NV_GEMV_K8_MAX_GW
+#define PLOW_NV_GEMV_K8_MAX_GW 32
+#endif
+#ifndef PLOW_NV_GEMV_K8_MAX
+#define PLOW_NV_GEMV_K8_MAX (PLOW_NV_GW_OBJECT ? PLOW_NV_GEMV_K8_MAX_GW : 8)
+#endif
+#ifndef PLOW_NV_GEMV_K8_MIN
+#define PLOW_NV_GEMV_K8_MIN 2
+#endif
+#if PLOW_NV_GEMV_K8_MAX > 32
+#define PLOW_NV_K8_CALL(NW, MATS, X, ACT)                                                        \
+    do {                                                                                       \
+        if (in->i[0] <= 8) d_gemv_k8<NW, 1>(MATS, X, in->i[0], in->i[2], ACT, slice, nblk, arena); \
+        else if (in->i[0] <= 16) d_gemv_k8<NW, 2>(MATS, X, in->i[0], in->i[2], ACT, slice, nblk, arena); \
+        else if (in->i[0] <= 32) d_gemv_k8<NW, 4>(MATS, X, in->i[0], in->i[2], ACT, slice, nblk, arena); \
+        else d_gemv_k8<NW, 8>(MATS, X, in->i[0], in->i[2], ACT, slice, nblk, arena);          \
+    } while (0)
+#elif PLOW_NV_GEMV_K8_MAX > 8
+#define PLOW_NV_K8_CALL(NW, MATS, X, ACT)                                                        \
+    do {                                                                                       \
+        if (in->i[0] <= 8) d_gemv_k8<NW, 1>(MATS, X, in->i[0], in->i[2], ACT, slice, nblk, arena); \
+        else if (in->i[0] <= 16) d_gemv_k8<NW, 2>(MATS, X, in->i[0], in->i[2], ACT, slice, nblk, arena); \
+        else d_gemv_k8<NW, 4>(MATS, X, in->i[0], in->i[2], ACT, slice, nblk, arena);          \
+    } while (0)
+#else
+#define PLOW_NV_K8_CALL(NW, MATS, X, ACT) d_gemv_k8<NW, 1>(MATS, X, in->i[0], in->i[2], ACT, slice, nblk, arena)
+#endif
+#endif
+#endif
+/* Rungs wider than GV_MM_MAX stream the weights once on wgmma (op_gemv_wide_sm90.cuh). The arm
+ * lives only in the sibling `_gw` decode object (PLOW_NV_GW_OBJECT) that plowrt launches for the
+ * batched rungs, so the ordinary decode object — the B=1 rung — is the object it was without it.
+ * Manifest-set on dense packets whose ladder passes 32. */
+#ifndef PLOW_NV_GEMV_WIDE
+#define PLOW_NV_GEMV_WIDE 0
+#endif
+#ifndef PLOW_NV_GW_OBJECT
+#define PLOW_NV_GW_OBJECT 0
+#endif
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_WIDE && PLOW_NV_GW_OBJECT && !PLOW_NV_PREFILL && !PLOW_NV_SPEECH
+#define PLOW_NV_GW_ACTIVE 1
+#include "op_gemv_wide_sm90.cuh"
+#else
+#define PLOW_NV_GW_ACTIVE 0
+#endif
 #if defined(PLOW_NV_GEMM_SPLITK) && PLOW_NV_GEMM_SPLITK
 #include "op_gemm_splitk.cuh"
 #endif
@@ -447,15 +528,18 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
  * level; RTX experiments opt in with -DPLOW_NV_FA_GF_FULL=4 or 8. */
 #define PLOW_NV_FA_GF_FULL PLOW_NV_FA_GF
 #endif
+/* 3 is a whole odd GQA group (Llama-3.2-3B: 24/8). Only the generic hd<=128 body instantiates it;
+ * the hd512 full-attention arms exist only in Gemma builds. */
 #if PLOW_NV_FA_GF_FULL != 1 && PLOW_NV_FA_GF_FULL != 2 && PLOW_NV_FA_GF_FULL != 4 && \
-    PLOW_NV_FA_GF_FULL != 8 && !(PLOW_NV_FA_GF_FULL == 16 && PLOW_NV_FA_GF16_BENCH)
+    PLOW_NV_FA_GF_FULL != 8 && !(PLOW_NV_FA_GF_FULL == 16 && PLOW_NV_FA_GF16_BENCH) && \
+    !(PLOW_NV_FA_GF_FULL == 3 && !PLOW_NV_GEMMA)
 #error "PLOW_NV_FA_GF_FULL requires {1,2,4,8}, or16 with wide softmax reductions"
 #endif
 #ifndef PLOW_NV_FA_GF_HD256
 #define PLOW_NV_FA_GF_HD256 2
 #endif
-#if PLOW_NV_FA_GF_HD256 != 2 && PLOW_NV_FA_GF_HD256 != 6
-#error "PLOW_NV_FA_GF_HD256 must be2 or6; incompatible GQA retainsGF2"
+#if PLOW_NV_FA_GF_HD256 != 2 && PLOW_NV_FA_GF_HD256 != 4 && PLOW_NV_FA_GF_HD256 != 6
+#error "PLOW_NV_FA_GF_HD256 must be 2, 4 or 6; incompatible GQA retains GF2"
 #endif
 #define PLOW_NV_FA_HD 128 /* Qwen3 head_dim; the only instantiation the DEFAULT build carries */
 
@@ -734,6 +818,8 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _fp8m1)
 #elif PLOW_NV_GEMV512_ROLE
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _gemv512)
+#elif PLOW_NV_SPEECH
+#define PLOW_SYM(n) PLOW_NV_CAT(n, _speech)
 #elif PLOW_NV_PREFILL && PLOW_NV_PACKED_REQUEST && PLOW_NV_SEG_GEMM
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _pfpackedgemm)
 #elif PLOW_NV_PREFILL && PLOW_NV_PACKED_REQUEST && PLOW_NV_FA_ONLY
@@ -752,6 +838,8 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _gf8)
 #elif PLOW_NV_DECODE_ROUTED
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _routed)
+#elif PLOW_NV_GW_OBJECT
+#define PLOW_SYM(n) PLOW_NV_CAT(n, _gw)
 #else
 #define PLOW_SYM(n) n
 #endif
@@ -823,11 +911,23 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #else
 #define PLOW_NV_PRE_A256 FA_PRE_SMEM_FLOATS(256, 64, PLOW_NV_FA256_BKV)
 #endif
+/* v3 falls back to the shipped body (no TMA map / nsplit > 1), so its claim is a max. */
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_FA_V3
+#define PLOW_NV_FA3_A256 FA3_SMEM_FLOATS(256)
+#define PLOW_NV_FA3_A512 FA3_SMEM_FLOATS(512)
+#else
+#define PLOW_NV_FA3_A256 0
+#define PLOW_NV_FA3_A512 0
+#endif
+#define PLOW_NV_PRE_A256X                                                                      \
+    (PLOW_NV_PRE_A256 > PLOW_NV_FA3_A256 ? PLOW_NV_PRE_A256 : PLOW_NV_FA3_A256)
+#define PLOW_NV_PRE_A512X                                                                      \
+    (PLOW_NV_PRE_A512 > PLOW_NV_FA3_A512 ? PLOW_NV_PRE_A512 : PLOW_NV_FA3_A512)
 #if PLOW_NV_FA_ONLY_HD256_ONLY
-#define PLOW_NV_PRE_A0 PLOW_NV_PRE_A256
+#define PLOW_NV_PRE_A0 PLOW_NV_PRE_A256X
 #else
 #define PLOW_NV_PRE_A0                                                                         \
-    (PLOW_NV_PRE_A256 > PLOW_NV_PRE_A512 ? PLOW_NV_PRE_A256 : PLOW_NV_PRE_A512)
+    (PLOW_NV_PRE_A256X > PLOW_NV_PRE_A512X ? PLOW_NV_PRE_A256X : PLOW_NV_PRE_A512X)
 #endif
 #define PLOW_NV_PRE_A128 FA_PRE_SMEM_FLOATS(128, 64, PLOW_NV_FA128_BKV)
 #define PLOW_NV_PRE_A                                                                          \
@@ -934,18 +1034,43 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 /* The grouped-MoE ring joins the LAUNCH claim only. Folded into the base arena it would also
  * raise PLOW_NV_GEMV_STAGING_BYTES, which moves the wide rungs' GEMVs onto the staged arm. */
 #if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && !PLOW_NV_PREFILL
-#define PLOW_NV_MOE_GROUP_ARENA ((PGM_MOE_ARENA_SM90 + 1) / 2) /* bf16 ring, in floats */
+#define PLOW_NV_MOE_GROUP_ARENA0 ((PGM_MOE_ARENA_SM90 + 1) / 2) /* bf16 ring, in floats */
 #else
-#define PLOW_NV_MOE_GROUP_ARENA 0
+#define PLOW_NV_MOE_GROUP_ARENA0 0
 #endif
-#define PLOW_NV_ARENA_FLOATS0                                                                 \
+#if PLOW_NV_GW_ACTIVE
+#define PLOW_NV_MOE_GROUP_ARENA                                                               \
+    (PLOW_NV_MOE_GROUP_ARENA0 > GW_ARENA_FLOATS_MAX ? PLOW_NV_MOE_GROUP_ARENA0 : GW_ARENA_FLOATS_MAX)
+#else
+#define PLOW_NV_MOE_GROUP_ARENA PLOW_NV_MOE_GROUP_ARENA0
+#endif
+/* The K-split GEMV's reduction (op_gemv_k8_sm90.cuh) runs on the narrow claim: NW=2 x 8 split
+ * slots x 128 floats per 8-row activation tile. */
+#if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
+#define PLOW_NV_K8_ARENA_FLOATS (2u * 8u * 128u * ((PLOW_NV_GEMV_K8_MAX + 7u) / 8u))
+#else
+#define PLOW_NV_K8_ARENA_FLOATS 0u
+#endif
+#define PLOW_NV_ARENA_FLOATS00                                                                \
     (PLOW_NV_BASE_ARENA_FLOATS > PLOW_NV_M16_ARENA_FLOATS ? PLOW_NV_BASE_ARENA_FLOATS : PLOW_NV_M16_ARENA_FLOATS)
+#define PLOW_NV_ARENA_FLOATS0                                                                 \
+    (PLOW_NV_ARENA_FLOATS00 > PLOW_NV_K8_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS00 : PLOW_NV_K8_ARENA_FLOATS)
+#if PLOW_NV_SPEECH
+#define PLOW_NV_ARENA_FLOATS1                                                                 \
+    (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)
+#define PLOW_NV_ARENA_FLOATS                                                                  \
+    (PLOW_NV_ARENA_FLOATS1 > SP_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS1 : SP_ARENA_FLOATS)
+#else
 #define PLOW_NV_ARENA_FLOATS                                                                  \
     (PLOW_NV_ARENA_FLOATS0 > PLOW_NV_MOE_GROUP_ARENA ? PLOW_NV_ARENA_FLOATS0 : PLOW_NV_MOE_GROUP_ARENA)
+#endif
 #endif
 #if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
 static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES,
               "FP8 decode WGMMA requires its full arena; incompatible role flags are unsupported");
+#endif
+#if PLOW_NV_SPEECH
+static_assert(PLOW_NV_ARENA_FLOATS >= SP_ARENA_FLOATS, "speech arms need their arena");
 #endif
 /* block_max_u64 needs PLOW_NV_WARPS u64 = 2*WARPS floats; block_sum needs WARPS floats. Both
  * fit inside the flash claim at any supported head dim, but the max above keeps that true if
@@ -979,8 +1104,9 @@ extern "C" __device__ unsigned PLOW_SYM(plow_gemm_splitk_abi) = 1;
 #endif
 #if PLOW_NV_EMBED_SMEM
 extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes) = PLOW_NV_ARENA_FLOATS * sizeof(float);
-#if defined(PLOW_NV_HOPPER) && PLOW_MOE_DEC_GROUP && !PLOW_NV_PREFILL
-/* The claim of a rung that never runs the grouped-MoE arm; the loader launches those with it. */
+#if defined(PLOW_NV_HOPPER) && (PLOW_MOE_DEC_GROUP || PLOW_NV_GW_ACTIVE) && !PLOW_NV_PREFILL
+/* The claim of a rung that never runs the grouped-MoE (or wide-GEMV) arm; the loader launches
+ * those with it. */
 extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes_narrow) = PLOW_NV_ARENA_FLOATS0 * sizeof(float);
 #endif
 extern "C" __device__ unsigned PLOW_SYM(plow_debug_max_inst) = 999999u;
@@ -1800,6 +1926,51 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 in->i[0], in->i[1], in->fj[0].f, slice, nblk);
         break;
 
+    case PLOW_DOP_EMBED_OVERLAY_BF16:
+        d_embed_overlay((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned*)TEN(2),
+                        (const float*)TEN(3), (const unsigned*)TEN(4), in->i[0], in->i[1], in->i[2],
+                        in->i[3], slice, nblk);
+        break;
+#if PLOW_NV_SPEECH
+    case PLOW_DOP_Q8_GEMM_F32:
+    case PLOW_DOP_LAYERNORM_F32:
+    case PLOW_DOP_SCALED_ADD_F32:
+    case PLOW_DOP_GLU_F32:
+    case PLOW_DOP_CAUSAL_DEPTHWISE_CONV1D_F32:
+    case PLOW_DOP_RELATIVE_ATTENTION_F32:
+    case PLOW_DOP_SILU_F32:
+    case PLOW_DOP_DENSE_GEMM_F32:
+    case PLOW_DOP_EMBED_F16_F32:
+    case PLOW_DOP_LSTM_CELL_F32:
+    case PLOW_DOP_ARGMAX_F32:
+    case PLOW_DOP_RELU_F32:
+    case PLOW_DOP_BROADCAST_ADD_F32:
+    case PLOW_DOP_CONV2D_F32:
+    case PLOW_DOP_PACK_NCFW_ROWS_F32:
+    case PLOW_DOP_GROUPED_ATTENTION_F32:
+    case PLOW_DOP_GEMM_F32:
+    case PLOW_DOP_GATHER_ROWS_F32:
+    case PLOW_DOP_COPY_COLS_F32:
+    case PLOW_DOP_CONV1D_F32:
+    case PLOW_DOP_CONV_TRANSPOSE1D_F32:
+    case PLOW_DOP_UNARY_F32:
+    case PLOW_DOP_BINARY_F32:
+    case PLOW_DOP_CUMSUM_F64:
+    case PLOW_DOP_RAND_F32:
+    case PLOW_DOP_ATTENTION_F32:
+    case PLOW_DOP_ROW_STATS_F32:
+#if defined(PLOW_NV_HOPPER)
+        if (sp_wg_conv1d(in, T, slice, nblk)) break;
+#endif
+        d_speech_f32(in, T, slice, nblk, arena);
+        break;
+#endif
+    case PLOW_DOP_EMBED_POS_BF16:
+        d_embed_pos((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned*)TEN(2),
+                    (const __nv_bfloat16*)TEN(3), (const unsigned*)TEN(4), (const unsigned*)TEN(5),
+                    in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
+        break;
+
     /* Terminal row selection for the unified token batch. One arm serves BOTH NVIDIA images:
      * interp_sm90a.cu is a wrapper TU that renames the public symbols and then includes this
      * file, so there is no second switch to keep in step. */
@@ -1817,6 +1988,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_GLU:
         d_glu((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
               in->i[0], in->i[1], slice, nblk);
+        break;
+
+    case PLOW_DOP_GLU_STRIDED:
+        d_glu_strided((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                      in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk);
         break;
 
 #if PLOW_NV_PREFILL && defined(PLOW_NV_PF_GEMV_HEAD) && PLOW_NV_PF_GEMV_HEAD
@@ -1904,6 +2080,23 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                        (__nv_bfloat16*)arena);
             break;
         }
+#if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
+        if (in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX && !TEN(7) && k8_split(in->i[1], in->i[2], nblk)) {
+            const K8Mats mats{{(const __nv_bfloat16*)TEN(2), nullptr, nullptr},
+                              {(__nv_bfloat16*)TEN(0), nullptr, nullptr}, {in->i[1], 0u, 0u}};
+            PLOW_NV_K8_CALL(1, mats, (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2], 0u);
+            break;
+        }
+#endif
+#if PLOW_NV_GW_ACTIVE
+        if (in->i[0] > GV_MM_MAX && !TEN(7) &&
+            d_gemv_wide<GW_PLAIN>(gw_args((const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                                          (const __nv_bfloat16*)TEN(2), nullptr, nullptr,
+                                          (__nv_bfloat16*)TEN(0), nullptr, nullptr, in->i[1], 0u, 0u,
+                                          in->i[0], in->i[2], 0u),
+                                  slice, nblk, arena))
+            break;
+#endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_M16_MMA
         static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_GEMV_M16_ARENA_BYTES);
         if (in->i[0] == 16 && in->i[1] >= 1024 && in->i[2] && !(in->i[2] % 64)) {
@@ -1999,6 +2192,27 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 
     /* Kernel arg order is (Nq, Nk, Nv, K): K lives in i2 but is passed LAST. */
     case PLOW_DOP_GEMV_QKV:
+#if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
+        if (in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX && !(in->i[5] && in->i[6] && in->i[7]) &&
+            k8_split(in->i[1] + in->i[3] + in->i[4], in->i[2], nblk)) {
+            const K8Mats mats{{(const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
+                               (const __nv_bfloat16*)TEN(6)},
+                              {(__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3), (__nv_bfloat16*)TEN(5)},
+                              {in->i[1], in->i[3], in->i[4]}};
+            PLOW_NV_K8_CALL(1, mats, (const __nv_bfloat16*)TEN(1), 0u);
+            break;
+        }
+#endif
+#if PLOW_NV_GW_ACTIVE
+        if (in->i[0] > GV_MM_MAX && !(in->i[5] && in->i[6] && in->i[7]) &&
+            d_gemv_wide<GW_QKV>(gw_args((const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                                        (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(6),
+                                        (__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                                        (__nv_bfloat16*)TEN(5), in->i[1], in->i[3], in->i[4],
+                                        in->i[0], in->i[2], 0u),
+                                slice, nblk, arena))
+            break;
+#endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
         if (!PLOW_NV_GEMV_MMA_B1 && in->i[0] == 1 && PLOW_NV_XREG_K(in->i[2]) &&
             (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
@@ -2106,6 +2320,23 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                            /*store=*/true, in->i[5], slice, nblk, (__nv_bfloat16*)arena);
             break;
         }
+#if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && PLOW_NV_GEMV_K8
+        if (in->i[0] >= PLOW_NV_GEMV_K8_MIN && in->i[0] <= PLOW_NV_GEMV_K8_MAX && k8_split(in->i[1], in->i[2], nblk)) {
+            const K8Mats mats{{(const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), nullptr},
+                              {(__nv_bfloat16*)TEN(0), nullptr, nullptr}, {in->i[1], 0u, 0u}};
+            PLOW_NV_K8_CALL(2, mats, (const __nv_bfloat16*)TEN(1), in->i[5]);
+            break;
+        }
+#endif
+#if PLOW_NV_GW_ACTIVE
+        if (in->i[0] > GV_MM_MAX &&
+            d_gemv_wide<GW_GLU>(gw_args((const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                                        (const __nv_bfloat16*)TEN(5), nullptr, (__nv_bfloat16*)TEN(0),
+                                        nullptr, nullptr, in->i[1], 0u, 0u, in->i[0], in->i[2],
+                                        in->i[5]),
+                                slice, nblk, arena))
+            break;
+#endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
         if (!PLOW_NV_GEMV_MMA_B1 && in->i[0] == 1 && PLOW_NV_XREG_K(in->i[2]) &&
             (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
@@ -2211,6 +2442,10 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #else
     case PLOW_DOP_FLASH_DECODE: {
         const unsigned gqa = in->i[1] / in->i[2];
+        /* Merge fold (no FLASH_MERGE packet): j1 = out handle | counter handle << 16. */
+        const unsigned fold = in->fj[2].u;
+        __nv_bfloat16* const fold_out = fold ? (__nv_bfloat16*)T[fold & 0xFFFFu] : nullptr;
+        unsigned* const fold_ctr = fold ? (unsigned*)T[fold >> 16] : nullptr;
 #define PLOW_NV_FLASH_DECODE(DD, GG)                                                            \
     do {                                                                                       \
         if (TEN(6))                                                                            \
@@ -2219,13 +2454,14 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
                 (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
                 in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,              \
-                (const int*)TEN(6));                                                            \
+                (const int*)TEN(6), fold_out, fold_ctr);                                        \
         else                                                                                   \
             d_flash_decode<DD, GG>(                                                            \
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
                 (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
-                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u);              \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,     \
+                nullptr, nullptr, fold_out, fold_ctr);                                         \
     } while (0)
 #if PLOW_HAS_FLASH_HD64
         if (in->i[6] == 64 && PLOW_HAS_FLASH_HD64) {
@@ -2449,8 +2685,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         __trap();
 #else
 #if PLOW_HAS_FLASH_HD64
-        if (in->i[3] == 64 && PLOW_HAS_FLASH_HD64 && PLOW_PACKET_ATTENTION_SINKS)
-            d_flash_merge<64, true>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
+        /* HD64 with or without sinks (GPT-OSS carries them; Chatterbox T3 does not). */
+        if (in->i[3] == 64 && PLOW_HAS_FLASH_HD64)
+            d_flash_merge<64, (bool)PLOW_PACKET_ATTENTION_SINKS>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                     (const float*)TEN(2), in->i[0], in->i[1], in->i[2],
                                     slice, nblk,
 #if PLOW_NV_PACKED_REQUEST
@@ -3026,6 +3263,61 @@ __device__ __forceinline__ void plow_gemv_prefetch(const PlowDevInst* in, void* 
     }
 }
 #endif
+/* PRE-GATE L2 WEIGHT PREFETCH for the decode GEMVs. Weights do not depend on the gate, so a
+ * block about to wait on its producers first asks the TMA unit to pull its share of the op's
+ * weight bytes into L2 (one cp.async.bulk.prefetch per contiguous span): the body then starts
+ * on L2 hits instead of paying the DRAM ramp after the gate opens. Slices partition the op's
+ * weight bytes evenly, whichever body later reads them; each slice stops at
+ * PLOW_NV_GEMV_L2PF_BYTES so a 100 MB GLU does not evict the rest of L2. 0 = off. */
+#ifndef PLOW_NV_GEMV_L2PF_BYTES
+#define PLOW_NV_GEMV_L2PF_BYTES 0u
+#endif
+#if PLOW_NV_GEMV_L2PF_BYTES && !PLOW_NV_PREFILL && defined(PLOW_NV_HOPPER)
+__device__ __forceinline__ void plow_l2pf_span(const void* base, size_t bytes, size_t lo, size_t hi) {
+    lo = lo < bytes ? lo : bytes;
+    hi = hi < bytes ? hi : bytes;
+    lo &= ~(size_t)15;
+    hi &= ~(size_t)15;
+    while (lo < hi) {
+        const unsigned n = (unsigned)((hi - lo) < (1u << 20) ? (hi - lo) : (1u << 20));
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"((const char*)base + lo), "r"(n)
+                     : "memory");
+        lo += n;
+    }
+}
+/* Up to three weight tensors laid end to end; slice s takes [s, s+1) * total / nblk, capped. */
+__device__ __forceinline__ void plow_gemv_l2pf(const PlowDevInst* in, void* const* T, unsigned slice,
+                                               unsigned nblk) {
+    const void* w[3] = {nullptr, nullptr, nullptr};
+    size_t n[3] = {0, 0, 0};
+    const size_t K2 = (size_t)in->i[2] * 2u;
+    switch (in->op) {
+    case PLOW_DOP_GEMV:
+        if (in->i[3] != 0u) return;
+        w[0] = T[in->t[2]]; n[0] = (size_t)in->i[1] * K2;
+        break;
+    case PLOW_DOP_GEMV_GLU:
+        w[0] = T[in->t[2]]; w[1] = T[in->t[5]]; n[0] = n[1] = (size_t)in->i[1] * K2;
+        break;
+    case PLOW_DOP_GEMV_QKV:
+        w[0] = T[in->t[2]]; w[1] = T[in->t[4]]; w[2] = T[in->t[6]];
+        n[0] = (size_t)in->i[1] * K2; n[1] = (size_t)in->i[3] * K2; n[2] = (size_t)in->i[4] * K2;
+        break;
+    default:
+        return;
+    }
+    const size_t total = n[0] + n[1] + n[2];
+    const size_t lo = total * slice / nblk;
+    size_t hi = total * (slice + 1u) / nblk;
+    if (hi - lo > (size_t)PLOW_NV_GEMV_L2PF_BYTES) hi = lo + PLOW_NV_GEMV_L2PF_BYTES;
+    size_t off = 0;
+    for (int k = 0; k < 3; k++) {
+        if (w[k] && hi > off && lo < off + n[k])
+            plow_l2pf_span(w[k], n[k], lo > off ? lo - off : 0, hi - off);
+        off += n[k];
+    }
+}
+#endif
 /* Backoff inside the counter-gate poll. 64 ns is the shipped value; 0 spins flat out. */
 #ifndef PLOW_NV_GATE_SLEEP
 #define PLOW_NV_GATE_SLEEP 64
@@ -3053,6 +3345,28 @@ __global__ __maxnreg__(128) void PLOW_SYM(interp_sm120)(PlowProgram prog) {
 __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(interp_sm120)(PlowProgram prog) {
 #endif
     extern __shared__ float arena[];
+#if PLOW_NV_ENTRY_TRACE
+    /* DIAGNOSTIC (off): per-block %globaltimer stamps of one segment launch into prog.trace,
+     * 8 u64 per (segment, block): entry, after the PDL wait, first item claimed, first item's
+     * entry/inst loaded, gate passed, first body retired, exit; slot 7 = first op | waits<<32. */
+    unsigned long long* const etr =
+        prog.trace ? (unsigned long long*)prog.trace + ((size_t)prog.cur_seg * 528u + blockIdx.x) * 8
+                   : nullptr;
+#define PLOW_ET(k)                                                                    \
+    do {                                                                              \
+        if (etr && threadIdx.x == 0) {                                                \
+            unsigned long long t_;                                                    \
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_));                    \
+            etr[k] = t_;                                                              \
+        }                                                                             \
+    } while (0)
+    bool et_first = true;
+#else
+#define PLOW_ET(k) do {} while (0)
+#endif
+    PLOW_ET(0);
+    plow_pdl_wait();
+    PLOW_ET(1);
 #if PLOW_NV_SKELETON
 #ifndef PLOW_NV_SKEL_PAD
 #define PLOW_NV_SKEL_PAD 160
@@ -3145,8 +3459,18 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         __syncthreads();
         const unsigned ix = gq_lo + gq_claim;
         if (ix >= gq_hi) break;
+#if PLOW_NV_ENTRY_TRACE
+        if (et_first) PLOW_ET(2);
+#endif
         const PlowStreamEnt e = ld_stream_ent(my + ix);
         const PlowDevInst* in = prog.insts + e.inst;
+#if PLOW_NV_ENTRY_TRACE
+        if (et_first) {
+            if (threadIdx.x == 0 && etr)
+                etr[7] = (unsigned long long)in->op | ((unsigned long long)e.wait_len << 32);
+            PLOW_ET(3);
+        }
+#endif
 #else
     const unsigned cu = blockIdx.x;
     const unsigned n = prog.stream_len[cu];
@@ -3179,6 +3503,10 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #if PLOW_GEMV_PREFETCH && !PLOW_NV_PREFILL && PLOW_NV_GEMV_MMA
         if (wait_len) plow_gemv_prefetch(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
 #endif
+#if PLOW_NV_GEMV_L2PF_BYTES && !PLOW_NV_PREFILL && defined(PLOW_NV_HOPPER)
+        if (wait_len && threadIdx.x == 0)
+            plow_gemv_l2pf(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid);
+#endif
 #if PLOW_NV_TRACE
         const bool tr = (blockIdx.x == 0 && threadIdx.x == 0 && g_tr_n < PLOW_TRACE_MAX);
         long long t_gate0 = 0, t_gate1 = 0, t_body1 = 0;
@@ -3198,6 +3526,9 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         if (wait_len) asm volatile("fence.acquire.gpu;" ::: "memory");
 #endif
         __syncthreads(); /* every counter in the list is now satisfied */
+#if PLOW_NV_ENTRY_TRACE
+        if (et_first) PLOW_ET(4);
+#endif
 #if PLOW_NV_TRACE
         if (tr) t_gate1 = clock64();
 #endif
@@ -3235,6 +3566,12 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
 #endif
 
         __syncthreads(); /* retire this block's stores before the release */
+#if PLOW_NV_ENTRY_TRACE
+        if (et_first) {
+            PLOW_ET(5);
+            et_first = false;
+        }
+#endif
 #if PLOW_NV_TRACE
         if (tr) t_body1 = clock64();
 #endif
@@ -3267,7 +3604,510 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
         }
 #endif
     }
+    PLOW_ET(6);
 }
+
+#if !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
+/* A lone light instruction (AddNorm, Glu) between two host library calls of a routed decode
+ * chain, as an ordinary launch: block `blockIdx.x` runs slice `blockIdx.x` of `blocks`, exactly
+ * the body the interpreter window would run, without the window's claim loop, gates, fences and
+ * counter signals. The host zeroes every wait on the instruction (stream order replaces it). */
+#if PLOW_NV_GEMMA
+/* ABI 2 (Gemma objects): the host passes the instruction and its resolved tensor pointers by
+ * value, so a launch starts on its operands instead of two dependent loads (insts, tensors). */
+struct PlowLightOp {
+    PlowDevInst d;
+    void* t[8];
+    void* fold[2]; /* FlashDecode merge fold: out, counter */
+};
+struct PlowLightSpan {
+    unsigned count;
+    unsigned x_row[4]; /* HeadNormRope x row pitch (fused q|k|v); 0 = own */
+    unsigned fused;    /* op[0..count-1) HeadNormRope feeding op[count-1] FlashDecode, in one launch */
+    PlowLightOp op[4];
+};
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light)(const __grid_constant__ PlowLightOp a) {
+    __shared__ float part[32];
+    const PlowDevInst* in = &a.d;
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+#define LIGHT_TEN(k) (a.t[k])
+#else
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm120_light)(PlowProgram prog,
+                                                                                    unsigned inst) {
+    __shared__ float part[32];
+    const PlowDevInst* in = prog.insts + inst;
+    void* const* T = prog.tensors;
+    const uint4 tv_ = *reinterpret_cast<const uint4*>(in->t);
+    const unsigned tw_[4] = {tv_.x, tv_.y, tv_.z, tv_.w};
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+#define LIGHT_TEN(k)                                                                        \
+    (((tw_[(k) >> 1] >> (((k) & 1) * 16)) & 0xFFFFu) == PLOW_TENSOR_NONE                       \
+         ? nullptr                                                                            \
+         : T[(tw_[(k) >> 1] >> (((k) & 1) * 16)) & 0xFFFFu])
+#endif
+    switch (in->op) {
+    case PLOW_DOP_ADD_NORM:
+        d_add_norm((__nv_bfloat16*)LIGHT_TEN(0), (__nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
+                   (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4), in->i[0], in->i[1],
+                   in->fj[0].f, slice, nblk, part);
+        break;
+    case PLOW_DOP_GLU:
+        d_glu((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
+              in->i[0], in->i[1], slice, nblk);
+        break;
+#if PLOW_NV_GEMMA
+    case PLOW_DOP_NORM_RESIDUAL:
+        d_norm_residual((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+                        (const __nv_bfloat16*)LIGHT_TEN(2), (const __nv_bfloat16*)LIGHT_TEN(3), in->i[0],
+                        in->i[1], in->fj[0].f, in->fj[1].f, slice, nblk, part);
+        break;
+    case PLOW_DOP_NORM_RESIDUAL_NORM:
+        d_norm_residual_norm((__nv_bfloat16*)LIGHT_TEN(0), (__nv_bfloat16*)LIGHT_TEN(1),
+                             (const __nv_bfloat16*)LIGHT_TEN(2), (const __nv_bfloat16*)LIGHT_TEN(3),
+                             (const __nv_bfloat16*)LIGHT_TEN(4), (const __nv_bfloat16*)LIGHT_TEN(5), in->i[0],
+                             in->i[1], in->fj[0].f, in->fj[1].f, slice, nblk, part);
+        break;
+    case PLOW_DOP_GLU_STRIDED:
+        d_glu_strided((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+                      (const __nv_bfloat16*)LIGHT_TEN(2), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
+                      slice, nblk);
+        break;
+#endif
+    default:
+        __trap();
+    }
+#undef LIGHT_TEN
+}
+/* A prefill bucket's lone RmsNorm / Residual / SiLU Glu, as an ordinary launch like
+ * plow_sm120_light: the prefill object's bodies (RmsNorm takes its warp-per-row path from 32
+ * rows, as the prefill object does), so the outputs are the interpreter window's. */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm120_light_pf)(PlowProgram prog,
+                                                                                       unsigned inst) {
+    __shared__ float part[32];
+    const PlowDevInst* in = prog.insts + inst;
+    void* const* T = prog.tensors;
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+#define LIGHT_TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    switch (in->op) {
+    case PLOW_DOP_RMSNORM:
+        if (LIGHT_TEN(3) || LIGHT_TEN(4)) __trap();
+        d_rmsnorm((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+                  (const __nv_bfloat16*)LIGHT_TEN(2), in->i[0], in->i[1], in->fj[0].f, in->i[2], slice,
+                  nblk, part, nullptr, nullptr, 32u);
+        break;
+    case PLOW_DOP_RESIDUAL:
+        d_residual((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+                   (const __nv_bfloat16*)LIGHT_TEN(2), in->i[0], in->fj[0].f, slice, nblk);
+        break;
+    case PLOW_DOP_GLU:
+        if (in->i[1] != PLOW_ACT_SILU_) __trap();
+        d_glu((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
+              in->i[0], in->i[1], slice, nblk);
+        break;
+    default:
+        __trap();
+    }
+#undef LIGHT_TEN
+}
+#if PLOW_NV_GEMMA
+extern "C" __device__ unsigned PLOW_SYM(plow_light_gemma) = 1;
+/* The logits tail (SoftCap, Argmax, ArgmaxFin): its own kernel, so the light kernel's code for
+ * the per-layer ops stays as it was (these cases in it slowed NormResidual/GluStrided ~2 us). */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light_tail)(const __grid_constant__ PlowLightOp a) {
+    __shared__ unsigned long long part[PLOW_NV_WARPS];
+    const PlowDevInst* in = &a.d;
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+    switch (in->op) {
+    case PLOW_DOP_SOFTCAP:
+        d_softcap((__nv_bfloat16*)a.t[0], (const __nv_bfloat16*)a.t[1], in->i[0], in->fj[0].f, slice, nblk);
+        break;
+    case PLOW_DOP_ARGMAX:
+        d_argmax((unsigned long long*)a.t[0], (const __nv_bfloat16*)a.t[1], in->i[0], in->i[1], slice, nblk, part);
+        break;
+    case PLOW_DOP_ARGMAX_FIN:
+        d_argmax_fin((int*)a.t[0], (const unsigned long long*)a.t[1], in->i[0], in->i[1], slice);
+        break;
+    default:
+        __trap();
+    }
+}
+/* SoftCap (in place on the logits) and the batched Argmax over its output in one pass: block
+ * `blockIdx.x` takes chunk c of row b (G = gridDim.x / rows chunks per row) and leaves the
+ * chunk's packed maximum in part[b * P + c], P = the Argmax instruction's part stride; the other
+ * parts of the row are zeroed. The same values and keys as the two instructions, so ArgmaxFin
+ * picks the same token. */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light_capmax)(const __grid_constant__ PlowLightSpan a) {
+    __shared__ unsigned long long lds[PLOW_NV_WARPS];
+    const PlowDevInst* sc = &a.op[0].d;
+    const PlowDevInst* am = &a.op[1].d;
+    const unsigned n = am->i[0], B = am->i[1], P = am->blocks, G = gridDim.x / B;
+    const unsigned b = blockIdx.x / G, c = blockIdx.x % G;
+    const float cap = sc->fj[0].f, inv = 1.0f / cap;
+    const __nv_bfloat16* x = (const __nv_bfloat16*)a.op[0].t[1] + (size_t)b * n;
+    __nv_bfloat16* out = (__nv_bfloat16*)a.op[0].t[0] + (size_t)b * n;
+    unsigned long long* part = (unsigned long long*)a.op[1].t[0] + (size_t)b * P;
+    const unsigned nv = n / 8u, v0 = (unsigned)((unsigned long long)c * nv / G),
+                   v1 = (unsigned)((unsigned long long)(c + 1u) * nv / G);
+    unsigned long long best = 0;
+    auto one = [&](unsigned iv, const bf16v8& v) {
+        bf16v8 o;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            o.x[j] = __float2bfloat16(cap * tanhf(__bfloat162float(v.x[j]) * inv));
+            const unsigned long long p = amax_pack(o.x[j], iv * 8u + (unsigned)j);
+            best = p > best ? p : best;
+        }
+        st_glob8(out + (size_t)iv * 8u, o);
+    };
+    unsigned iv = v0 + threadIdx.x;
+    for (; iv + 3u * PLOW_NV_THREADS < v1; iv += 4u * PLOW_NV_THREADS) {
+        bf16v8 v[4];
+#pragma unroll
+        for (unsigned u = 0; u < 4; u++) v[u] = ld_glob8(x + (size_t)(iv + u * PLOW_NV_THREADS) * 8u);
+#pragma unroll
+        for (unsigned u = 0; u < 4; u++) one(iv + u * PLOW_NV_THREADS, v[u]);
+    }
+    for (; iv < v1; iv += PLOW_NV_THREADS) one(iv, ld_glob8(x + (size_t)iv * 8u));
+    best = block_max_u64(best, lds);
+    if (threadIdx.x == 0) part[c] = best;
+    if (c == 0)
+        for (unsigned i = G + threadIdx.x; i < P; i += PLOW_NV_THREADS) part[i] = 0ull;
+}
+#endif
+/* A fused q|k|v projection's output: HeadNormRope instruction `inst[j]` reads its x from
+ * `base + col[j]` with row pitch `row` elements instead of its own x tensor. */
+struct PlowLightX {
+    unsigned long long base;
+    unsigned row;
+    unsigned inst[3];
+    unsigned col[3];
+};
+#if !PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_MIXED_STEP
+/* The attention side of a decode layer (HeadNormRope at the object's head dim, then
+ * FlashDecode) as its own kernels: `count` independent instructions from `inst` on, block `b`
+ * running slice `b` of each. Only these two bodies are compiled in, so the flash row-group loop
+ * keeps its registers (the interpreter entry is at the 255-register cap and spills). */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
+    PLOW_SYM(plow_sm120_light_attn)(PlowProgram prog, unsigned inst, unsigned count,
+                                    PlowLightX xs) {
+    extern __shared__ float arena[];
+    void* const* T = prog.tensors;
+    for (unsigned i = inst; i < inst + count; i++) {
+        const PlowDevInst* in = prog.insts + i;
+        const unsigned nblk = in->blocks ? in->blocks : gridDim.x, slice = blockIdx.x;
+        if (i != inst) __syncthreads();
+        if (slice >= nblk) continue;
+        const uint4 tv_ = *reinterpret_cast<const uint4*>(in->t);
+        const unsigned tw_[4] = {tv_.x, tv_.y, tv_.z, tv_.w};
+#define LIGHT_TEN(k)                                                                        \
+    (((tw_[(k) >> 1] >> (((k) & 1) * 16)) & 0xFFFFu) == PLOW_TENSOR_NONE                       \
+         ? nullptr                                                                            \
+         : T[(tw_[(k) >> 1] >> (((k) & 1) * 16)) & 0xFFFFu])
+        if (in->op == PLOW_DOP_HEADNORM_ROPE && in->i[2] == PLOW_NV_FA_HD && in->i[5] == 0) {
+            const __nv_bfloat16* x = (const __nv_bfloat16*)LIGHT_TEN(1);
+            unsigned x_row = 0;
+            for (int j = 0; j < 3; j++)
+                if (xs.base && xs.inst[j] == i) {
+                    x = (const __nv_bfloat16*)xs.base + xs.col[j];
+                    x_row = xs.row;
+                }
+            d_headnorm_rope<PLOW_NV_FA_HD>(
+                (__nv_bfloat16*)LIGHT_TEN(0), x,
+                (const __nv_bfloat16*)LIGHT_TEN(2), (const float*)LIGHT_TEN(3),
+                (const float*)LIGHT_TEN(4), (const int*)LIGHT_TEN(5), in->i[0], in->i[1],
+                in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4], slice, nblk, in->i[6],
+                nullptr, in->i[7] ? (__nv_bfloat16*)LIGHT_TEN(6) : nullptr,
+                in->i[7] ? (const __nv_bfloat16*)LIGHT_TEN(7) : nullptr, x_row);
+        } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == PLOW_NV_FA_HD &&
+                   (in->i[1] / in->i[2]) % PLOW_NV_FA_GF == 0) {
+            const unsigned fold = in->fj[2].u;
+            __nv_bfloat16* const fold_out = fold ? (__nv_bfloat16*)T[fold & 0xFFFFu] : nullptr;
+            unsigned* const fold_ctr = fold ? (unsigned*)T[fold >> 16] : nullptr;
+            if (LIGHT_TEN(6))
+                d_flash_decode_slots<PLOW_NV_FA_HD, PLOW_NV_FA_GF>(
+                    (float*)LIGHT_TEN(0), (float*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
+                    (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4),
+                    (const int*)LIGHT_TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
+                    in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,
+                    (const int*)LIGHT_TEN(6), fold_out, fold_ctr);
+            else
+                d_flash_decode<PLOW_NV_FA_HD, PLOW_NV_FA_GF>(
+                    (float*)LIGHT_TEN(0), (float*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
+                    (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4),
+                    (const int*)LIGHT_TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
+                    in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,
+                    nullptr, nullptr, fold_out, fold_ctr);
+        } else {
+            __trap();
+        }
+#undef LIGHT_TEN
+    }
+}
+extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = PLOW_NV_FA_HD;
+#if PLOW_NV_FA_HD == 128 && PLOW_NV_FA_RG && PLOW_NV_FA_RG_U == 4
+/* A light attention segment's merge-folded hd128 FlashDecode (nsplit 1, no window, no ring wrap)
+ * on the streamed body, bit-identical to the row-group one (d_flash_decode_stream). `hnr[0..3]`
+ * = the q, k, v HeadNormRope instructions it folds in (~0u: none, Q is already roped); their x
+ * may be a fused q|k|v row (`xs`, as in light_attn). */
+extern "C" __global__ void __launch_bounds__(FA_ST_THREADS, 1)
+    PLOW_SYM(plow_sm120_light_flash)(PlowProgram prog, unsigned inst, uint4 hnr, PlowLightX xs) {
+    extern __shared__ __align__(128) unsigned char st_arena[];
+    void* const* T = prog.tensors;
+#define LIGHT_TEN(in, k) ((in)->t[k] == PLOW_TENSOR_NONE ? nullptr : T[(in)->t[k]])
+    const PlowDevInst* in = prog.insts + inst;
+    const unsigned fold = in->fj[2].u;
+    if (in->op != PLOW_DOP_FLASH_DECODE || in->i[6] != 128u || in->i[5] != 1u || in->i[4] != 0u ||
+        in->i[7] != 0xFFFFFFFFu || !fold || (in->i[1] / in->i[2]) % PLOW_NV_FA_GF != 0)
+        __trap();
+    FaStHnr h{};
+    if (hnr.x != ~0u) {
+        const unsigned ids[3] = {hnr.x, hnr.y, hnr.z};
+        const __nv_bfloat16* x[3];
+        unsigned row[3];
+        for (int j = 0; j < 3; j++) {
+            const PlowDevInst* hi = prog.insts + ids[j];
+            x[j] = (const __nv_bfloat16*)LIGHT_TEN(hi, 1);
+            row[j] = hi->i[1] * 128u;
+            for (int c = 0; c < 3; c++)
+                if (xs.base && xs.inst[c] == ids[j]) {
+                    x[j] = (const __nv_bfloat16*)xs.base + xs.col[c];
+                    row[j] = xs.row;
+                }
+        }
+        const PlowDevInst* hq = prog.insts + hnr.x;
+        h = FaStHnr{x[0], x[1], x[2], row[0], row[1], row[2], (const float*)LIGHT_TEN(hq, 3),
+                    (const float*)LIGHT_TEN(hq, 4), (const int*)LIGHT_TEN(hq, 5)};
+    }
+    d_flash_decode_stream<128, PLOW_NV_FA_GF>(
+        (__nv_bfloat16*)T[fold & 0xFFFFu], (const __nv_bfloat16*)LIGHT_TEN(in, 2),
+        (__nv_bfloat16*)LIGHT_TEN(in, 3), (__nv_bfloat16*)LIGHT_TEN(in, 4), (const int*)LIGHT_TEN(in, 5),
+        (const int*)LIGHT_TEN(in, 6), in->i[0], in->i[1], in->i[2], in->i[3], in->fj[0].f, blockIdx.x,
+        gridDim.x, st_arena, h);
+#undef LIGHT_TEN
+}
+extern "C" __device__ unsigned PLOW_SYM(plow_light_flash_smem) = FA_ST_SMEM_BYTES(128);
+#endif
+#endif
+/* An lm_head whose vocab N is not a multiple of 16 (Veena: 156951), after cuBLASLt ran its first
+ * n0 = N & ~15 columns into `src` (pitch n0): copy them into C (pitch N) and compute the last
+ * N - n0 columns here. Grid = M x 8 blocks; chunk 0 of each row also does the tail dots.
+ * `ids` non-null: also the greedy argmax the packet's Argmax/ArgmaxFin pair would compute (same
+ * packed keys, so the same token): each block folds its chunk into best[row], and the row's last
+ * block writes ids[row] and re-zeroes best/ctr for the next launch. */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light_head)(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+                                    const __nv_bfloat16* __restrict__ W,
+                                    const __nv_bfloat16* __restrict__ src, unsigned N, unsigned K,
+                                    unsigned n0, int* __restrict__ ids,
+                                    unsigned long long* __restrict__ best, unsigned* __restrict__ ctr) {
+    __shared__ unsigned long long lds[PLOW_NV_WARPS];
+    /* C's rows are only 2-byte aligned (odd N): 16-byte loads from src, restaged through smem
+     * so each store instruction writes 64 contiguous bytes. */
+    __shared__ __align__(16) __nv_bfloat16 stage[PLOW_NV_WARPS][256];
+    const unsigned r = blockIdx.x >> 3, c = blockIdx.x & 7u;
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const unsigned nv = n0 / 8u;
+    const unsigned lo = (unsigned)((unsigned long long)nv * c / 8u);
+    const unsigned hi = (unsigned)((unsigned long long)nv * (c + 1u) / 8u);
+    const __nv_bfloat16* s = src + (size_t)r * n0;
+    __nv_bfloat16* d = C + (size_t)r * N;
+    unsigned long long bk = 0;
+    for (unsigned base = lo + warp * 32u; base < hi; base += PLOW_NV_THREADS) {
+        const unsigned iv = base + lane;
+        if (iv < hi) {
+            bf16v8 v;
+            *(uint4*)&v = __ldcs((const uint4*)(s + (size_t)iv * 8u));
+            *(uint4*)&stage[warp][lane * 8u] = *(const uint4*)&v;
+            if (ids) {
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const unsigned long long p = amax_pack(v.x[j], iv * 8u + (unsigned)j);
+                    bk = p > bk ? p : bk;
+                }
+            }
+        }
+        __syncwarp();
+        const unsigned n = min(256u, (hi - base) * 8u);
+#pragma unroll
+        for (unsigned k = 0; k < 8u; k++)
+            if (k * 32u + lane < n) d[base * 8u + k * 32u + lane] = stage[warp][k * 32u + lane];
+        __syncwarp();
+    }
+    if (c == 0) {
+        for (unsigned j = n0 + warp; j < N; j += PLOW_NV_THREADS / 32u) {
+            const __nv_bfloat16* w = W + (size_t)j * K;
+            const __nv_bfloat16* xr = x + (size_t)r * K;
+            float acc = 0.0f;
+            /* batches of 16 loads ahead of the (unchanged, sequential) fma chain */
+            unsigned k = lane;
+            for (; k + 15u * 32u < K; k += 16u * 32u) {
+                __nv_bfloat16 xv[16], wv[16];
+#pragma unroll
+                for (int u = 0; u < 16; u++) {
+                    xv[u] = xr[k + u * 32u];
+                    wv[u] = w[k + u * 32u];
+                }
+#pragma unroll
+                for (int u = 0; u < 16; u++) acc = fmaf(__bfloat162float(xv[u]), __bfloat162float(wv[u]), acc);
+            }
+            for (; k < K; k += 32u) acc = fmaf(__bfloat162float(xr[k]), __bfloat162float(w[k]), acc);
+            acc = warp_sum32(acc);
+            const __nv_bfloat16 h = __float2bfloat16(acc);
+            if (lane == 0) {
+                d[j] = h;
+                const unsigned long long p = amax_pack(h, j);
+                bk = p > bk ? p : bk;
+            }
+        }
+    }
+    if (!ids) return;
+    bk = block_max_u64(bk, lds);
+    if (threadIdx.x == 0) {
+        atomicMax(best + r, bk);
+        __threadfence();
+        if (atomicAdd(ctr + r, 1u) == 7u) {
+            const unsigned long long f = atomicExch(best + r, 0ull);
+            ids[r] = (int)~(unsigned)(f & 0xFFFFFFFFull);
+            ctr[r] = 0u;
+        }
+    }
+}
+#if PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_MIXED_STEP
+/* Gemma's attention side: HeadNormRope and FlashDecode at hd 256 (sliding) and 512 (full), with
+ * the interpreter's group factors. Same contract as the light_attn above. WIDE = false compiles
+ * the hd256 bodies only (light_attn_s, two blocks per SM).
+ * PLOW_NV_FA_GF_LIGHT256: the light hd256 item's head group. A head's arithmetic does not depend
+ * on it; GF 2 gives light_attn_s twice the items of GF 4 (both halves read the KV head). */
+#ifndef PLOW_NV_FA_GF_LIGHT256
+#define PLOW_NV_FA_GF_LIGHT256 (PLOW_NV_FA_GF_HD256 == 4 ? 2 : PLOW_NV_FA_GF_HD256)
+#endif
+template <bool WIDE>
+__device__ __forceinline__ void light_attn_gemma(const PlowLightSpan& a, float* arena) {
+    const unsigned first = a.fused ? a.count - 1 : 0;
+    if (a.fused) {
+        /* Each block first runs, for the rows of its own flash items, the HeadNormRope tasks
+         * those items read (q: the item's GF heads; k/v: its KV head), one task per warp, with
+         * the same body and arithmetic as the separate launch. Items of one row on other blocks
+         * write identical values. */
+        const unsigned L = a.count - 1;
+        const PlowDevInst* fl = &a.op[L].d;
+        const unsigned nblk = fl->blocks ? fl->blocks : gridDim.x, slice = blockIdx.x;
+        const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+        const unsigned n_head = fl->i[1], nsplit = fl->i[5];
+        const unsigned GF = fl->i[6] == 256 ? PLOW_NV_FA_GF_LIGHT256 : PLOW_NV_FA_GF_FULL;
+        const unsigned gqa = n_head / fl->i[2], n_grp = n_head / GF;
+        const unsigned n_work = fl->i[0] * n_grp * nsplit;
+        for (unsigned w = slice; slice < nblk && w < n_work; w += nblk) {
+            const unsigned hg = (w / nsplit) % n_grp, b = w / (nsplit * n_grp);
+            unsigned task = 0;
+            for (unsigned j = 0; j < L; j++) {
+                const PlowDevInst* in = &a.op[j].d;
+                const bool q = a.op[j].t[0] == a.op[L].t[2];
+                const unsigned nt = q ? GF : 1u;
+                if (warp >= task && warp < task + nt) {
+                    const unsigned hh = q ? hg * GF + (warp - task) : (hg * GF) / gqa;
+                    const long long nh = in->i[1], hd = in->i[2], stride = in->fj[1].u;
+                    const long long row = a.x_row[j] ? (long long)a.x_row[j] : nh * hd;
+                    /* d_headnorm_rope at ntok 1, nhead warp+1 runs exactly task (t 0, head
+                     * warp) on this warp; shift the operands so that is (row b, head hh). */
+                    const long long ix = b * row + hh * hd - (long long)warp * hd;
+                    const long long io = stride ? ((long long)(b * nh + hh) - warp) * stride * hd
+                                                : (((long long)in->i[3] + b) * nh + hh) * hd -
+                                                      ((long long)in->i[3] * (warp + 1) + warp) * hd;
+                    __nv_bfloat16* out = (__nv_bfloat16*)a.op[j].t[0] + io;
+                    const __nv_bfloat16* x = (const __nv_bfloat16*)a.op[j].t[1] + ix;
+                    __nv_bfloat16* out2 = in->i[7] ? (__nv_bfloat16*)a.op[j].t[6] + io : nullptr;
+                    const __nv_bfloat16* x2 = in->i[7] ? (const __nv_bfloat16*)a.op[j].t[7] + ix : nullptr;
+#define LIGHT_HNR_ROW(DD)                                                                    \
+    d_headnorm_rope<DD>(out, x, (const __nv_bfloat16*)a.op[j].t[2], (const float*)a.op[j].t[3], \
+                        (const float*)a.op[j].t[4], (const int*)a.op[j].t[5] + b, 1u, warp + 1u,   \
+                        in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4], 0u, 1u,        \
+                        in->i[6], nullptr, out2, x2, a.x_row[j])
+                    if (hd == 256)
+                        LIGHT_HNR_ROW(256);
+                    else if constexpr (WIDE)
+                        LIGHT_HNR_ROW(512);
+                    else
+                        __trap();
+#undef LIGHT_HNR_ROW
+                }
+                task += nt;
+            }
+        }
+        __threadfence();
+        __syncthreads();
+    }
+    for (unsigned i = first; i < a.count; i++) {
+        const PlowDevInst* in = &a.op[i].d;
+        const unsigned nblk = in->blocks ? in->blocks : gridDim.x, slice = blockIdx.x;
+        if (i != first) __syncthreads();
+        if (slice >= nblk) continue;
+#define LIGHT_TEN(k) (a.op[i].t[k])
+#define LIGHT_HNR(DD)                                                                        \
+    d_headnorm_rope<DD>((__nv_bfloat16*)LIGHT_TEN(0), x,                                         \
+                        (const __nv_bfloat16*)LIGHT_TEN(2), (const float*)LIGHT_TEN(3),          \
+                        (const float*)LIGHT_TEN(4), (const int*)LIGHT_TEN(5), in->i[0], in->i[1], \
+                        in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4], slice, nblk,   \
+                        in->i[6], nullptr, in->i[7] ? (__nv_bfloat16*)LIGHT_TEN(6) : nullptr,     \
+                        in->i[7] ? (const __nv_bfloat16*)LIGHT_TEN(7) : nullptr, x_row)
+#define LIGHT_FLASH(DD, GG)                                                                  \
+    do {                                                                                     \
+        __nv_bfloat16* const fold_out = (__nv_bfloat16*)a.op[i].fold[0];                    \
+        unsigned* const fold_ctr = (unsigned*)a.op[i].fold[1];                               \
+        if (LIGHT_TEN(6))                                                                    \
+            d_flash_decode_slots<DD, GG, 1>(                                                 \
+                (float*)LIGHT_TEN(0), (float*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2), \
+                (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4),     \
+                (const int*)LIGHT_TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],   \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,            \
+                (const int*)LIGHT_TEN(6), fold_out, fold_ctr);                               \
+        else                                                                                 \
+            d_flash_decode<DD, GG, false, false, false, 1>(                                  \
+                (float*)LIGHT_TEN(0), (float*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2), \
+                (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4),     \
+                (const int*)LIGHT_TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],   \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,   \
+                nullptr, nullptr, fold_out, fold_ctr);                                       \
+    } while (0)
+        const unsigned gqa = in->op == PLOW_DOP_FLASH_DECODE ? in->i[1] / in->i[2] : 0;
+        const __nv_bfloat16* x = (const __nv_bfloat16*)LIGHT_TEN(1);
+        const unsigned x_row = a.x_row[i];
+        if (in->op == PLOW_DOP_HEADNORM_ROPE && in->i[2] == 256 && in->i[5] == 0) {
+            LIGHT_HNR(256);
+        } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == 256 && gqa % PLOW_NV_FA_GF_LIGHT256 == 0) {
+            LIGHT_FLASH(256, PLOW_NV_FA_GF_LIGHT256);
+        } else if constexpr (!WIDE) {
+            __trap();
+        } else if (in->op == PLOW_DOP_HEADNORM_ROPE && in->i[2] == 512 && in->i[5] == 0) {
+            LIGHT_HNR(512);
+        } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == 512 && gqa % PLOW_NV_FA_GF_FULL == 0) {
+            LIGHT_FLASH(512, PLOW_NV_FA_GF_FULL);
+        } else {
+            __trap();
+        }
+#undef LIGHT_FLASH
+#undef LIGHT_HNR
+#undef LIGHT_TEN
+    }
+}
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
+    PLOW_SYM(plow_sm120_light_attn)(const __grid_constant__ PlowLightSpan a) {
+    extern __shared__ float arena[];
+    light_attn_gemma<true>(a, arena);
+}
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 2)
+    PLOW_SYM(plow_sm120_light_attn_s)(const __grid_constant__ PlowLightSpan a) {
+    extern __shared__ float arena[];
+    light_attn_gemma<false>(a, arena);
+}
+extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = 256;
+extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd2) = 512;
+#endif
+extern "C" __device__ unsigned PLOW_SYM(plow_light_abi) = PLOW_NV_GEMMA ? 2 : 1;
+#endif
 
 /* ---- host-side launch helper -----------------------------------------------------------
  * Grid comes from cudaOccupancyMaxActiveBlocksPerMultiprocessor x multiProcessorCount, cached

@@ -44,12 +44,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut same = false;
     let mut multistep = false;
     let mut warmup = 16usize;
+    let mut sweep: Option<(u32, u32)> = None;
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--same" => same = true,
             "--multistep" => multistep = true,
             "--warmup" => warmup = args.next().ok_or("--warmup N")?.parse()?,
+            // `--sweep LO..HI`: time decode steps with instruction caps LO..=HI in this process.
+            "--sweep" => {
+                let r = args.next().ok_or("--sweep LO..HI")?;
+                let (lo, hi) = r.split_once("..").ok_or("--sweep LO..HI")?;
+                sweep = Some((lo.parse()?, hi.parse()?));
+            }
             "--dump-tensors" => dump_names = Some(args.next().ok_or("--dump-tensors a,b")?),
             "--dump-dir" => dump_dir = Some(args.next().ok_or("--dump-dir d")?),
             other => return Err(format!("unknown argument {other}").into()),
@@ -94,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             e.consume_prompt(b, &prompt, &mut toks)?
         };
         println!(
-            "slot {b}: prompt consumed in {:.3} s",
+            "slot {b}: prompt consumed in {:.4} s",
             t0.elapsed().as_secs_f64()
         );
     }
@@ -107,6 +114,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..warmup {
         e.step_slots(&feeds_of(&last), &mut toks)?;
         last.copy_from_slice(&toks);
+    }
+    if let Some((lo, hi)) = sweep {
+        let base_pos: Vec<usize> = (0..slots).map(|_| ctx + warmup).collect();
+        let base_last = last.clone();
+        for cap in (lo..=hi).chain([u32::MAX]) {
+            e.set_debug_max_inst(cap)?;
+            // Same kv length at every cap: a drifting position biases each delta by the
+            // attention's per-token cost.
+            for (b, &p) in base_pos.iter().enumerate() {
+                e.rewind_slot(b, p)?;
+            }
+            last.copy_from_slice(&base_last);
+            for _ in 0..4 {
+                e.step_slots(&feeds_of(&last), &mut toks)?;
+            }
+            let mut v: Vec<f64> = (0..steps)
+                .map(|_| {
+                    let t0 = Instant::now();
+                    e.step_slots(&feeds_of(&last), &mut toks).map(|_| t0.elapsed().as_secs_f64() * 1e3)
+                })
+                .collect::<Result<_, _>>()?;
+            v.sort_by(f64::total_cmp);
+            println!("{{\"cap\":{},\"ms\":{:.4}}}", if cap == u32::MAX { -1 } else { cap as i64 }, v[v.len() / 2]);
+        }
+        return Ok(());
     }
     // Drop prefill + warmup from the trace so the profile is timed-decode only.
     e.trace_reset()?;

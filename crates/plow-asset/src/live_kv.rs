@@ -113,7 +113,8 @@ pub fn emit(packet: &Packet<'_>) -> Result<Manifest> {
     let position = handle("in.pos")?;
     let max_ctx = u32::try_from(packet.tensors[position as usize].bytes / 4)
         .map_err(|_| "context overflow")?;
-    let caches: Vec<_> = widest
+    let mut caches: Vec<Cache> = Vec::new();
+    for c in widest
         .insts
         .iter()
         .filter(|d| {
@@ -131,7 +132,13 @@ pub fn emit(packet: &Packet<'_>) -> Result<Manifest> {
             window: d.i[4],
             mask: d.i[7],
         })
-        .collect();
+    {
+        // KV sharing (Gemma-4 E-series): later layers read an earlier layer's cache with the same
+        // geometry. A second reader with different geometry stays and fails validation.
+        if !caches.contains(&c) {
+            caches.push(c);
+        }
+    }
     let mut maps = Vec::new();
     for g in packet
         .generated
@@ -226,7 +233,7 @@ impl Manifest {
                     && !c.pair.contains(&self.position)
                     && !c.pair.contains(&self.kv_length)
                     && c.heads > 0
-                    && matches!(c.hd, 64 | 256 | 512)
+                    && matches!(c.hd, 64 | 128 | 256 | 512)
                     && c.stride > 0
                     && if c.window == 0 {
                         c.stride == self.max_ctx && c.mask == u32::MAX
@@ -407,7 +414,9 @@ impl Manifest {
                             && (d.i[2], d.i[6], d.i[3], d.i[4], d.i[7])
                                 == (c.heads, c.hd, c.stride, c.window, c.mask)
                     };
-                    require(valid && reads.insert(pair), "attention reader contract")?;
+                    // A repeated reader of one pair is KV sharing (Gemma-4 E-series), same geometry.
+                    require(valid, "attention reader contract")?;
+                    reads.insert(pair);
                 }
                 for (slot, &h) in d.t.iter().enumerate() {
                     require(
@@ -613,6 +622,8 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::HeadNormRopeFp8
                 | DevOp::Residual
                 | DevOp::Glu
+                // Gemma-4 E-series per-layer input gate: activations only (gate, table, out).
+                | DevOp::GluStrided
                 | DevOp::Gemm
                 | DevOp::GemmMed
                 | DevOp::GemmSmall
@@ -633,6 +644,10 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::GemvQkv
                 | DevOp::GemvArgmax
                 | DevOp::Embed
+                // Speech embeddings: a token gather plus host overlay rows (by launch row) or a
+                // learned position at a per-slot base. Neither names a cache or a generated map.
+                | DevOp::EmbedOverlayBf16
+                | DevOp::EmbedPosBf16
                 | DevOp::Argmax
                 | DevOp::ArgmaxFin
                 | DevOp::SoftCap

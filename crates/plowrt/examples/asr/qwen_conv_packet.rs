@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use devgen::asr::qwen::lower_audio_encoder;
+use devgen::asr::audio_lm::lower_audio_encoder;
 use plowrt::asr::frontend::MelFeatures;
 use plowrt::exec::apple::asr::QwenAudioEncoder;
 use plowrt::exec::packet_runtime::{load_packet_runtime, PacketAsset};

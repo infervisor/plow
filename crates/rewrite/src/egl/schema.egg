@@ -80,6 +80,15 @@
   (SnapCons Expr Expr)                ; snapshot, rest
   (SnapNil)                           ; end of the snapshot chain
 
+  ; --- 1-D convolution (audio codecs, vocoders) ---
+  ; Conv1d and ConvTranspose1d are one term: the config token says which, with the stride,
+  ; dilation, groups and padding (opaque to every rule, as `Attention`'s is). A missing bias is
+  ; the `(NoBias)` leaf, so one term and one rule cover both forms.
+  (Conv1d Expr Expr Expr String)      ; x, weight, bias | (NoBias), config-token
+  (NoBias)
+  ; A parameterized pointwise activation: snake's per-channel alpha is a weight operand.
+  (ActP String Expr Expr)             ; kind, x, param
+
   ; --- catch-all for ops not yet in the fusion vocabulary ---
   ; Allows the full graph to lower without error; no rewrite targets Opaque.
   (Opaque String Expr)                ; op_name, single-input passthrough
@@ -142,6 +151,22 @@
       ; x, normw, eps, gate, gate-shape
   (FusedPackedAttnGate Expr Expr Expr i64 String i64 String String String)
       ; mixer, q-input, q-weight, q-out, packed-shape, axis, start, len, gate-shape
+
+  ; Conv1d epilogues/prologues. Each form is one e-node absorbing the activation(s) and/or the
+  ; residual add around a Conv1d term; the combined forms exist because a fused conv is a single
+  ; e-node and every absorbed piece must be strictly cheaper than its unfused spelling.
+  (FusedActConv1d String Expr Expr Expr String)          ; act, x, w, b, cfg  (conv(act(x)))
+  (FusedParamActConv1d String Expr Expr Expr Expr String) ; act, x, param, w, b, cfg
+  (FusedConv1dAct Expr Expr Expr String String)          ; x, w, b, cfg, act  (act(conv(x)))
+  (FusedConv1dResidual Expr Expr Expr String Expr)       ; x, w, b, cfg, r    (r + conv(x))
+  (FusedActConv1dResidual String Expr Expr Expr String Expr)       ; act, x, w, b, cfg, r
+  (FusedParamActConv1dResidual String Expr Expr Expr Expr String Expr) ; act, x, param, w, b, cfg, r
+  (FusedParamActConv1dAct String Expr Expr Expr Expr String String)   ; act, x, param, w, b, cfg, out-act
+  ; LayerNorm → biased Linear → activation (pre-norm FFN up projection).
+  (FusedLayerNormLinearBiasAct Expr Expr Expr Expr Expr f64 i64 String)
+      ; x, normw, normb, linw, linb, eps, out, act
+  ; Residual add into a biased linear's epilogue (r + x·Wᵀ + b).
+  (FusedLinearBiasResidual Expr Expr Expr i64 Expr)      ; x, weight, bias, out, r
 
   ; A compatible block-residual consumer may compute its immediately preceding residual
   ; in-kernel, but must still write that BF16 tensor for its other users. The three-input form is

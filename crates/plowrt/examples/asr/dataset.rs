@@ -1,6 +1,6 @@
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use plowrt::asr::{frontend::decode_wav, qwen::QwenAsr};
+    use plowrt::asr::{frontend::decode_wav, audio_lm::AudioLmAsr};
     use serde_json::{json, Value};
     use std::{io::Write, path::Path, sync::atomic::AtomicBool, time::Instant};
     tracing_subscriber::fmt()
@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .lines()
         .map(serde_json::from_str)
         .collect::<Result<_, _>>()?;
-    let mut engine = QwenAsr::load(Path::new(&args[2]), Path::new(&args[1]))?;
+    let mut engine = AudioLmAsr::load(Path::new(&args[2]), Path::new(&args[1]))?;
     if !single {
         engine.set_tile64_selective(false)?;
         engine.set_direct_epilogue(false)?;

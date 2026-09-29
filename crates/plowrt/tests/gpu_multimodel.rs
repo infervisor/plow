@@ -92,6 +92,7 @@ async fn request(
         gen,
         arrived: Instant::now(),
         respond: tx,
+        opts: Default::default(),
     })
     .map_err(|_| ())
     .expect("submit");
@@ -99,7 +100,7 @@ async fn request(
     let (mut ids, mut text, mut ttft_ms) = (Vec::new(), String::new(), f64::NAN);
     while let Some(chunk) = rx.recv().await {
         match chunk {
-            StreamChunk::Token { id, text: delta } => {
+            StreamChunk::Token { id, text: delta, .. } => {
                 if ids.is_empty() {
                     ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 }

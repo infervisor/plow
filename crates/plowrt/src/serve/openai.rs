@@ -191,12 +191,18 @@ pub struct ChatRequest {
     // unknown fields silently, and a silently dropped `tools` or `n` is a
     // wrong answer that scores as a successful request — the failure mode the
     // image refusal already guards against.
-    #[serde(default)]
-    pub n: Option<u32>,
+    /// OpenAI `logprobs` (bool) / `top_logprobs` (0..=20); see `serve::logprobs`.
     #[serde(default)]
     pub logprobs: Option<serde_json::Value>,
     #[serde(default)]
     pub top_logprobs: Option<serde_json::Value>,
+    /// vLLM names: `"raw_logprobs"` (default) or `"raw_logits"`; per request here.
+    #[serde(default)]
+    pub logprobs_mode: Option<String>,
+    #[serde(default)]
+    pub return_tokens_as_token_ids: Option<bool>,
+    #[serde(default)]
+    pub n: Option<u32>,
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
     #[serde(default)]
@@ -264,8 +270,13 @@ pub struct CompletionRequest {
     pub best_of: Option<u32>,
     #[serde(default)]
     pub echo: Option<bool>,
+    /// OpenAI `logprobs`: alternatives per position, 0..=20; see `serve::logprobs`.
     #[serde(default)]
     pub logprobs: Option<serde_json::Value>,
+    #[serde(default)]
+    pub logprobs_mode: Option<String>,
+    #[serde(default)]
+    pub return_tokens_as_token_ids: Option<bool>,
     #[serde(default)]
     pub suffix: Option<String>,
 }
@@ -532,6 +543,8 @@ impl From<crate::serve::stream::TokenUsage> for Usage {
 pub struct Choice {
     pub index: u32,
     pub message: Message,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<crate::serve::logprobs::ChatLogprobs>,
     pub finish_reason: Option<&'static str>,
     /// Present only when the wire `finish_reason` had to be widened to fit the
     /// OpenAI vocabulary — currently a preemption reported as `"length"`.
@@ -557,6 +570,8 @@ pub struct ChatChunk {
 pub struct ChunkChoice {
     pub index: u32,
     pub delta: Delta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<crate::serve::logprobs::ChatLogprobs>,
     pub finish_reason: Option<&'static str>,
     /// Same widening note as [`Choice::x_plow_finish_reason`]. The streamed
     /// path used to omit it, so an operator-forced stop reached a streaming

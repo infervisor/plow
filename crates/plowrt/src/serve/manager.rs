@@ -162,7 +162,15 @@ impl BlobPlan {
         // packet, so L2-domain placement is irrelevant here. The real guard is in the engine,
         // which checks the CODE OBJECT for `plow_l2_place_dispatch_1`. Using the strict parse
         // made `serve` reject every placed blob before the engine ever saw it.
-        let blob = DevBlob::parse_l2(&raw, true)?;
+        let mut blob = DevBlob::parse_l2(&raw, true)?;
+        // Plan the bound the engine will load at (`GpuEngine::load` narrows the same way).
+        let narrowed = match crate::config::RuntimeConfig::get().live_ctx_for(dir) {
+            Some(want) if crate::exec::ctx_bound::declared_ctx(&blob).is_some_and(|c| want < c) => {
+                crate::exec::ctx_bound::narrow(&mut blob, want)?;
+                true
+            }
+            _ => false,
+        };
         let mut plan = BlobPlan {
             weights_bytes: 0,
             kv_bytes: 0,
@@ -173,7 +181,10 @@ impl BlobPlan {
         }
         if let Some((granularity, capability)) = device_vmm {
             let config = crate::config::RuntimeConfig::get();
-            let manifest = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?;
+            let manifest = match narrowed {
+                true => blob.with_packet_view(plow_asset::live_kv::emit).ok(),
+                false => crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?,
+            };
             let packed = blob
                 .reserved_metadata(&raw, plow_asset::packed_prefill::SECTION)?
                 .is_some();
@@ -190,7 +201,10 @@ impl BlobPlan {
                 )
             });
             let prefix_requested = config.nv_vmm_prefix() == Some(true) || prefix_layout.is_some();
-            if config.nv_live_kv_enabled(packed, full, prefix_requested) {
+            if config.nv_live_kv_enabled(packed, full, prefix_requested)
+                && (config.nv_vmm_live()
+                    || crate::exec::gpu::live_kv_mappable(&blob, manifest.as_ref(), granularity))
+            {
                 let layout = match manifest.as_ref() {
                     Some(m) => crate::memory::vmm::LiveKvLayout::from_manifest(&blob, m)?,
                     None => crate::memory::vmm::LiveKvLayout::from_blob(&blob)?,
@@ -1003,6 +1017,7 @@ impl ModelManager {
                 .await
                 .map_err(|e| EnsureError::Load(RuntimeError::Msg(format!("load task: {e}"))))?
                 .map_err(EnsureError::Load)?;
+        mux::check_speech_packet(&engine).map_err(EnsureError::Load)?;
         let (free_after, _) = self.be.mem_info().map_err(EnsureError::Load)?;
         let pool_after = VmmOps::pool_bytes(&*self.be);
 

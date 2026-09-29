@@ -162,6 +162,50 @@ pub(super) fn bind_module(
     }))
 }
 
+/// The packet's `<stem>_gw.cubin`: the decode interpreter without the single-row GEMV kernels and
+/// with the wide-rung GEMV arm, launched for the batched rungs — `(narrow, full)`
+/// claims, the full one for rungs wider than GV_MM_MAX (the arm's ring). `None` when the packet
+/// ships none; one whose pairing or ABI differs from the main decode object is refused.
+pub(super) fn load_gemv_wide(
+    be: &Arc<CudaBackend>,
+    assets: &Path,
+    stem: &str,
+    main: &Module,
+    grid: u32,
+) -> Result<Option<(Arc<BoundDecodeObject>, Arc<BoundDecodeObject>)>> {
+    let file = format!("{stem}_gw.cubin");
+    let Ok(image) = std::fs::read(assets.join(&file)) else {
+        return Ok(None);
+    };
+    let module = DecodeModule::load(be, &image)?;
+    let function = be.get_function(&module, &format!("_Z{}{stem}_gw11PlowProgram", stem.len() + 3))?;
+    GpuEngine::check_packet_pairing_suffix(be, &module, assets, "_gw")?;
+    for symbol in ["plow_block", "plow_dyn_kvrow", "plow_gemv_mm_cap"] {
+        if be.module_global_u32(&module, &format!("{symbol}_gw"))? != be.module_global_u32(main, symbol)? {
+            return Err(reject(&format!("{file}: {symbol} differs from the decode object")));
+        }
+    }
+    let smem = be.module_global_u32(&module, "plow_arena_bytes_gw")?.unwrap_or(12352);
+    let narrow = be
+        .module_global_u32(&module, "plow_arena_bytes_narrow_gw")?
+        .map_or(smem, |narrow| narrow.min(smem));
+    be.set_max_dynamic_smem(function, smem)?;
+    if be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count() < grid {
+        return Err(reject(&format!("{file}: cannot hold the decode grid {grid}")));
+    }
+    tracing::info!(smem, narrow, "batched-rung decode object loaded");
+    let object = |smem| {
+        Arc::new(BoundDecodeObject { function, grid, block: BLOCK, smem, _module: Arc::clone(&module) })
+    };
+    Ok(Some((object(narrow), object(smem))))
+}
+
+impl BoundDecodeObject {
+    pub(super) fn module(&self) -> &Module {
+        &self._module
+    }
+}
+
 pub(super) fn initial_grid(
     metadata: Option<&DecodeObjects>,
     packet_grid: u32,

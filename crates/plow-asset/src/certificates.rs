@@ -354,6 +354,56 @@ pub struct PacketCheckReceipts {
     pub checks: Vec<CompileCheckReceipt>,
 }
 
+/// `<stem>.lean-checks.json` beside a sidecar packet (`encoder.pkt`, `codec.pkt`, `s3gen.pkt`):
+/// one logical-tensor-effects check per DISTINCT obligation (capacity programs repeat them), and
+/// `program_checks[p]` = the check whose request is program `p`'s obligation (`None` = gap).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SidecarCheckReceipts {
+    pub schema: u32,
+    pub packet_sha256: String,
+    pub compiler_sha256: String,
+    pub checks: Vec<CompileCheckReceipt>,
+    pub program_checks: Vec<Option<usize>>,
+}
+
+pub fn sidecar_checks_file(packet: &std::path::Path) -> std::path::PathBuf {
+    let stem = packet.file_stem().and_then(|s| s.to_str()).unwrap_or("packet");
+    packet.with_file_name(format!("{stem}.{PACKET_CHECKS_FILE}"))
+}
+
+impl SidecarCheckReceipts {
+    pub fn validate_packet(&self, packet: &[u8]) -> Result<(), String> {
+        if self.schema != 1
+            || !is_sha256(&self.compiler_sha256)
+            || self.packet_sha256 != crate::decode_objects::image_sha256(packet)
+        {
+            return Err("sidecar check receipt does not match loaded packet".into());
+        }
+        let mut digests = BTreeSet::new();
+        for (index, check) in self.checks.iter().enumerate() {
+            let first = self.program_checks.iter().position(|c| *c == Some(index));
+            if check.scope != SemanticScope::LogicalTensorEffects
+                || check.checkpoint != "D"
+                || check.program != first
+                || check.program.is_none()
+                || check.request.get("memory_effects").is_none()
+                || !is_sha256(&check.verifier_sha256)
+                || check.request_sha256 != request_sha256(&check.request)?
+                || !digests.insert(&check.request_sha256)
+                || check.response.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+                || check.response.get("checkpoint").and_then(serde_json::Value::as_str) != Some("D")
+            {
+                return Err("invalid, unreferenced or duplicated sidecar check receipt".into());
+            }
+        }
+        if self.program_checks.iter().flatten().any(|&i| i >= self.checks.len()) {
+            return Err("sidecar program check out of range".into());
+        }
+        Ok(())
+    }
+}
+
 impl PacketCheckReceipts {
     pub fn validate_packet(&self, packet: &[u8]) -> Result<(), String> {
         if self.schema != 1

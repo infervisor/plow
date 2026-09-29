@@ -46,6 +46,42 @@ from a `rocm/vllm` **Docker image** unless `VLLM_VENV` is set. Pin one and say w
 
 ---
 
+## Campaign playbook (any model, any GPU)
+
+Order of operations. Each step has a tool; do not write a probe for it.
+
+| # | step | tool |
+|---|---|---|
+| 1 | preflight (CPU) | `plowbench-doctor.sh <assets> <objdir> <plowrt> <arch>`: env, hazards, binaries, packet, objects, lease, disk, **stale harness/recipe copies vs HEAD** |
+| 2 | build from the recipe | `campaign.py build recipes/<ns>/<model>/<cell>.toml --out <fresh dir>` |
+| 3 | accuracy gates | `campaign.py gate <recipe> --assets <out>/assets --out <dir>` runs the recipe's `[gates]` in one lease (logit parity top1/KL, ASR WER, TTS CER per language, S3Gen rel-L2); `--score-only` re-scores, `--dry-run` prints `run.sh` |
+| 4 | baseline grid vs the reference | `scripts/bench/llm_grid.sh plow\|vllm <res>` (same client, unique prompts per cell and repeat, greedy + sampled, 2 repeats, prefill-only and decode-only cells, vLLM `/metrics`, plow PACKLOG); speech: `tts_bench.py`, `served_bench.py`; voice: `scripts/voice/serve_voice_agent.sh calls` |
+| 5 | audit waterfall | `scripts/bench/waterfall.py <res>/plow <res>/vllm`: grid with spread, reference prefix-cache hits (fails > 5%), wall ms/request split (mixed, prefill-only, decode, host gap, idle, padding, riders), decode ms/step side by side. `vllm_metrics.py cells`, `packlog_audit.py`, `nsys_busy.py` are its parts |
+| 6 | matched decode + roofline | `scripts/bench/step_grid.sh <assets> <out>` (step_bench B × ctx + per-instruction sweeps), then `scripts/bench/op_roof.py <out>/disasm.txt --ctx N --sweep B=<jsonl>` (bytes, FLOPs, floor, measured, % roof per op; `--segtime` for prefill; no measurement = floor per rung). GLM/MLA/MoE: `scripts/campaign/op_roofline.py` |
+| 7 | fix, one variable | kernel/runtime change in your own detached worktree |
+| 8 | verify the patch | `scripts/campaign/verify_patch.sh <patch>`: applies to HEAD in a private index, archives `git write-tree`, builds bins/examples/tests, plowrt lib (cuda+hsa), knob tests, plow-asset + packet tests, py_compile / `bash -n` / TOML of touched scripts |
+| 9 | re-measure | the same grid and gates; A/B scoring as in §7 |
+
+Pitfalls this playbook exists for:
+
+* **Prompt reuse.** A fixed client seed replays earlier cells' prompts; vLLM's prefix cache then
+  skips prefill plow computes (41-58% hits made a 1.22x gap look like 1.5x,
+  [throughput-audit.md](../runtime/throughput-audit.md)). `pb_bench` seeds per cell, `llm_grid.sh`
+  per cell and repeat, and `waterfall.py` / `vllm_metrics.py cells` fail on hit rates > 5%.
+* **Temperature.** Always pass it explicitly (`--temperature 0` greedy); report greedy and sampled.
+  Unset, each server applies its own generation-config defaults.
+* **One run per cell.** Two repeats and the spread; a delta inside the spread is not a result.
+* **Unmatched decode.** Compare decode steps at the same B and context (`step_bench` vs the
+  reference's decode-only phase), not TPOT across different batch compositions.
+* **Shared worktree.** Never checkout/stash/reset it; its copies can be stale vs HEAD (the doctor
+  warns). Work in `git worktree add --detach <dir> HEAD`, own `CARGO_TARGET_DIR`, deliver patches.
+* **Lease hygiene.** Wrap every GPU command in `timeout` inside the lease and keep leases short: the
+  queue has no FIFO, other agents wait. `gpulease` has no `--help`: `gpulease --help` takes a lease.
+* **No nix.** On a hand-built box set `PLOW_CAMPAIGN_NO_NIX=1` (campaign.py, the doctor,
+  verify_patch.sh) instead of faking `ROCM_PATH`.
+
+---
+
 ## 1. Check the environment before leasing anything
 
 ```bash
@@ -102,13 +138,13 @@ Knobs it reads: `PLOW_CKPT` (the **prepped** checkpoint — a raw-HF dir will re
 
 | tool | use it for |
 |---|---|
-| `scripts/campaign/campaign.py <build\|serve\|bench\|probe\|cert\|compare\|roofline\|loop\|sweep\|ledger> <recipe>` | the unified campaign driver — a recipe TOML instead of a bespoke probe. See [07 — perf campaign](07-perf-campaign.md). |
+| `scripts/campaign/campaign.py <build\|serve\|bench\|probe\|gate\|cert\|compare\|roofline\|loop\|sweep\|ledger> <recipe>` | the unified campaign driver — a recipe TOML instead of a bespoke probe. See [07 — perf campaign](07-perf-campaign.md). |
 | `scripts/bench_plowrt_serve.sh <assets> <port> <model> <tokenizer> [ready-timeout]` | `vllm bench serve` against a plowrt endpoint, sweeping `IN_LENS` x `CONCS`. Handles tokenizer-by-repo-id resolution and process-group teardown. **It runs the client from a `rocm/vllm` Docker image unless `VLLM_VENV` is set** — so by default it is *not* the same client binary as `plowbench.sh`'s. |
 | `scripts/bench_vllm_chat.sh <hf-repo-id> <tp>` | the symmetric vLLM point, same `--backend openai-chat`. Same Docker-image client as `bench_plowrt_serve.sh` unless `VLLM_VENV` is set — pair it with that script, not with `plowbench.sh`. |
 | `scripts/bench_vllm_rocm.sh`, `scripts/bench_plow_rocm.sh` | the ROCm-side pair. |
 | `scripts/plow_vs_vllm_rocm.py` | the comparison itself. |
 | `scripts/glm53_bench_table.py` | render a result table. |
-| `scripts/bench/plowbench.sh` | **source** this in any new probe. Gives `pb_free_port`, `pb_serve_start <plowrt> <assets> <objdir> <port> <log> [timeout]`, `pb_serve_wait [secs]`, `pb_serve_stop`, `pb_bench <resdir> <tag> <model> <conc> <nprompts> <isl> <osl> [extra…]`, `pb_result <resdir> <tag>`, `pb_model_id`, `pb_detect_arch`, and the artifact checks (`pb_require_nix`, `pb_hazard_env`, `pb_check_plowrt/assets/objects/vllm`). Do not re-implement the readiness poll or the result parsing again. |
+| `scripts/bench/plowbench.sh` | **source** this in any new probe. Gives `pb_free_port`, `pb_serve_start <plowrt> <assets> <objdir> <port> <log> [timeout]`, `pb_serve_wait [secs]`, `pb_serve_stop`, `pb_bench <resdir> <tag> <model> <conc> <nprompts> <isl> <osl> [extra…]`, `pb_cell` (pb_bench + cells.log markers), `pb_metrics_start/stop` (reference `/metrics`), `pb_result <resdir> <tag>`, `pb_model_id`, `pb_detect_arch`, and the artifact checks (`pb_require_nix`, `pb_hazard_env`, `pb_check_plowrt/assets/objects/vllm`). Do not re-implement the readiness poll or the result parsing again. |
 
 ### The result-path trap
 

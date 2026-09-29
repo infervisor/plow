@@ -220,6 +220,25 @@ fn op_detail(op: &Op) -> serde_json::Value {
             "head_dim": head_dim, "top_k": top_k,
         }),
         Op::Conv1dDepthwise { kernel } => json!({ "kernel": kernel }),
+        Op::Conv1d {
+            stride,
+            dilation,
+            groups,
+            padding,
+            pad_mode,
+        } => json!({
+            "stride": stride, "dilation": dilation, "groups": groups,
+            "padding": [padding.0, padding.1], "pad_mode": format!("{pad_mode:?}"),
+        }),
+        Op::ConvTranspose1d {
+            stride,
+            groups,
+            crop,
+            output_padding,
+        } => json!({
+            "stride": stride, "groups": groups, "crop": [crop.0, crop.1],
+            "output_padding": output_padding,
+        }),
         Op::LinearAttention {
             kind,
             num_heads,
@@ -345,7 +364,7 @@ const OP_COLORS = {{
   'embedding': ['#0e1820','#5a9fd4'],
   'rmsnorm': ['#14171c','#8b929c'], 'layernorm': ['#14171c','#8b929c'], 'groupnorm': ['#14171c','#8b929c'],
   'act': ['#0f1d17','#6cc0a0'], 'situ_glu': ['#0f1d17','#6cc0a0'],
-  'conv1d_depthwise': ['#10233a','#5a9fd4'], 'conv2d': ['#10233a','#5a9fd4'], 'conv3d': ['#10233a','#5a9fd4'],
+  'conv1d_depthwise': ['#10233a','#5a9fd4'], 'conv1d': ['#10233a','#5a9fd4'], 'conv_transpose1d': ['#10233a','#5a9fd4'], 'conv2d': ['#10233a','#5a9fd4'], 'conv3d': ['#10233a','#5a9fd4'],
   'moe_router': ['#231708','#b8813a'], 'moe_experts': ['#231708','#b8813a'],
   'dsa_indexer': ['#231708','#b8813a'], 'dsa_attention': ['#132c47','#8fcaf4'],
   'block_residual': ['#211018','#b07a9a'],

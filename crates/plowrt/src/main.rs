@@ -44,7 +44,8 @@ enum Cmd {
     /// Transcribe audio with a compiled ASR packet, or serve it locally.
     #[cfg(any(
         all(feature = "cpu", feature = "gguf"),
-        all(feature = "metal", target_os = "macos")
+        all(feature = "metal", target_os = "macos"),
+        feature = "cuda"
     ))]
     Asr {
         /// Compiled packet asset. `--blob` is retained as a compatibility alias.
@@ -698,7 +699,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Bench { .. } | Cmd::OpAudit { .. } | Cmd::KnobScope { .. } => true,
         #[cfg(any(
             all(feature = "cpu", feature = "gguf"),
-            all(feature = "metal", target_os = "macos")
+            all(feature = "metal", target_os = "macos"),
+            feature = "cuda"
         ))]
         Cmd::Asr { .. } => true,
         _ => false,
@@ -725,7 +727,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.cmd {
         #[cfg(any(
             all(feature = "cpu", feature = "gguf"),
-            all(feature = "metal", target_os = "macos")
+            all(feature = "metal", target_os = "macos"),
+            feature = "cuda"
         ))]
         Cmd::Asr {
             packet,
@@ -1159,7 +1162,8 @@ mod amd_bench_cli_tests {
 
     #[cfg(any(
         all(feature = "cpu", feature = "gguf"),
-        all(feature = "metal", target_os = "macos")
+        all(feature = "metal", target_os = "macos"),
+        feature = "cuda"
     ))]
     #[test]
     fn asr_names_packet_and_tokenizer_inputs() {
@@ -3209,7 +3213,7 @@ async fn bringup_runtime(
     }
     tracing::info!(
         models = registry.len(),
-        aliases = served_model_name.len(),
+        aliases = registry.alias_pairs().len(),
         trace,
         "registry ready"
     );
@@ -3852,6 +3856,15 @@ async fn serve(
     mux_cfg: MuxConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = bringup_runtime(assets, executors, trace, mux_cfg, served_model_name).await?;
+    #[cfg(feature = "cuda")]
+    {
+        let state = Arc::clone(&state);
+        tokio::task::spawn_blocking(move || {
+            plowrt::asr::serving::preload(&state);
+            plowrt::tts::serving::preload(&state);
+        })
+        .await?;
+    }
 
     let router = app(Arc::clone(&state));
 

@@ -32,6 +32,7 @@ fn submit(
             gen,
             arrived: std::time::Instant::now(),
             respond: tx,
+            opts: Default::default(),
         })
         .map_err(|_| ())
         .expect("submit");
@@ -49,7 +50,7 @@ async fn reply(
         let mut text = String::new();
         while let Some(chunk) = rx.recv().await {
             match chunk {
-                StreamChunk::Token { id, text: delta } => {
+                StreamChunk::Token { id, text: delta, .. } => {
                     ids.push(id);
                     text.push_str(&delta);
                 }

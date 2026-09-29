@@ -1,5 +1,6 @@
 #include "golden.h"
 #include <stdint.h>
+#include <stdlib.h>
 
 static float f16_to_f32(uint16_t h) {
     const uint32_t sign = (uint32_t)(h >> 15) << 31;
@@ -50,43 +51,70 @@ G_K(g_q8_gemm_f32) {
     }
 }
 
+/* LayerNormF32's statistics of one row: flags bit 1 = float sums in row order, else double. */
+static void g_ln_stats(const float* xr, uint32_t feat, uint32_t flags, float eps, float* mean, float* inv) {
+    if (flags & 2u) {
+        float sum = 0.0f, square_sum = 0.0f;
+        for (uint32_t i = 0; i < feat; i++) sum += xr[i];
+        *mean = sum / feat;
+        for (uint32_t i = 0; i < feat; i++) {
+            const float v = xr[i] - *mean;
+            square_sum += v * v;
+        }
+        *inv = 1.0f / sqrtf(square_sum / feat + eps);
+    } else {
+        double sum = 0.0;
+        for (uint32_t i = 0; i < feat; i++) sum += xr[i];
+        *mean = (float)(sum / feat);
+        double square_sum = 0.0;
+        for (uint32_t i = 0; i < feat; i++) {
+            const double v = xr[i] - *mean;
+            square_sum += v * v;
+        }
+        *inv = 1.0f / sqrtf((float)(square_sum / feat) + eps);
+    }
+}
+
+static float g_act_f32(uint32_t kind, float x, float p0, float p1);
+
+/* LayerNormF32's per-element normalization; flags bit 0 rounds to bf16. */
+static float g_ln_apply(float x, float mean, float inv, const float* gamma, const float* beta, uint32_t i,
+                        uint32_t round) {
+    const float value = (x - mean) * inv * (gamma ? gamma[i] : 1.0f) + (beta ? beta[i] : 0.0f);
+    return round ? plow_bf2f(plow_f2bf(value)) : value;
+}
+
 G_K(g_layernorm_f32) {
     (void)ctx;
     float* out = PLOW_CPU_TEN(in, T, 0);
     const float* x = PLOW_CPU_TEN(in, T, 1);
     const float* gamma = PLOW_CPU_TEN(in, T, 2);
     const float* beta = PLOW_CPU_TEN(in, T, 3);
+    const float* add = PLOW_CPU_TEN(in, T, 4);
     const uint32_t rows = in->i[0], feat = in->i[1];
     for (uint32_t row = slice; row < rows; row += nblk) {
         const float* xr = x + (size_t)row * feat;
         float* yr = out + (size_t)row * feat;
         float mean, inv;
-        if (in->i[2] & 2u) {
-            float sum = 0.0f, square_sum = 0.0f;
-            for (uint32_t i = 0; i < feat; i++) sum += xr[i];
-            mean = sum / feat;
-            for (uint32_t i = 0; i < feat; i++) {
-                const float v = xr[i] - mean;
-                square_sum += v * v;
-            }
-            inv = 1.0f / sqrtf(square_sum / feat + in->fj[0].f);
-        } else {
-            double sum = 0.0;
-            for (uint32_t i = 0; i < feat; i++) sum += xr[i];
-            mean = (float)(sum / feat);
-            double square_sum = 0.0;
-            for (uint32_t i = 0; i < feat; i++) {
-                const double v = xr[i] - mean;
-                square_sum += v * v;
-            }
-            inv = 1.0f / sqrtf((float)(square_sum / feat) + in->fj[0].f);
-        }
+        g_ln_stats(xr, feat, in->i[2], in->fj[0].f, &mean, &inv);
         for (uint32_t i = 0; i < feat; i++) {
-            float value = (xr[i] - mean) * inv * (gamma ? gamma[i] : 1.0f) +
-                          (beta ? beta[i] : 0.0f);
-            yr[i] = in->i[2] & 1u ? plow_bf2f(plow_f2bf(value)) : value;
+            /* flags bits 4-7: activation after the affine; t4: a [feat] row added after it. */
+            float v = g_ln_apply(xr[i], mean, inv, gamma, beta, i, 0);
+            if (in->i[2] >> 4 & 15u) v = g_act_f32(in->i[2] >> 4 & 15u, v, 0.0f, 0.0f);
+            if (add) v += add[i];
+            yr[i] = in->i[2] & 1u ? plow_bf2f(plow_f2bf(v)) : v;
         }
     }
+}
+
+/* RowStatsF32: LayerNormF32's (mean, inverse std) per row, same flags and epsilon. */
+G_K(g_row_stats_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const float* x = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t rows = in->i[0], feat = in->i[1];
+    for (uint32_t row = slice; row < rows; row += nblk)
+        g_ln_stats(x + (size_t)row * feat, feat, in->i[2], in->fj[0].f, &out[2 * row], &out[2 * row + 1]);
 }
 
 G_K(g_scaled_add_f32) {
@@ -135,7 +163,13 @@ G_K(g_dense_gemm_f32) {
     const uint32_t weight_stride = in->i[5] ? in->i[5] : k;
     const uint32_t onehot = in->i[6];
     const uint32_t flags = in->i[7];
-    x += (size_t)in->i[4] * k;
+    /* flags bit 5: LayerNorm prologue, A' = (A - mean) * inv * gamma + beta per row stats t5
+     * ([rows][2], indexed like A including a_row0), gamma t6?, beta t7?; bit 6 rounds A' to bf16. */
+    const float* stats = flags & 32u ? (const float*)PLOW_CPU_TEN(in, T, 5) : NULL;
+    const float* ln_gamma = PLOW_CPU_TEN(in, T, 6);
+    const float* ln_beta = PLOW_CPU_TEN(in, T, 7);
+    const uint32_t row0 = in->i[4];
+    x += (size_t)row0 * k;
     uint32_t lo, hi;
     g_range(n, slice, nblk, &lo, &hi);
     for (uint32_t row = 0; row < m; row++) {
@@ -145,7 +179,11 @@ G_K(g_dense_gemm_f32) {
                 const size_t wi = (size_t)column * weight_stride + inner;
                 const float w = flags & 4u ? plow_bf2f(((const plow_bf16*)weight)[wi])
                                            : ((const float*)weight)[wi];
-                sum += (double)x[(size_t)row * k + inner] * w;
+                float a = x[(size_t)row * k + inner];
+                if (stats)
+                    a = g_ln_apply(a, stats[2 * ((size_t)row0 + row)], stats[2 * ((size_t)row0 + row) + 1],
+                                   ln_gamma, ln_beta, inner, flags & 64u);
+                sum += (double)a * w;
             }
             if (in->i[5] && onehot < weight_stride) {
                 const size_t wi = (size_t)column * weight_stride + onehot;
@@ -331,6 +369,28 @@ G_K(g_embed_overlay_bf16) {
     }
 }
 
+G_K(g_embed_pos_bf16) {
+    (void)ctx;
+    plow_bf16* out = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* table = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t* tokens = PLOW_CPU_TEN(in, T, 2);
+    const plow_bf16* pos_table = PLOW_CPU_TEN(in, T, 3);
+    const uint32_t* pos = PLOW_CPU_TEN(in, T, 4);
+    const uint32_t* base = PLOW_CPU_TEN(in, T, 5);
+    const uint32_t rows = in->i[0], width = in->i[1], vocab = in->i[2], pos_rows = in->i[3];
+    const uint64_t count64 = (uint64_t)rows * width;
+    if (!rows || !width || !vocab || !pos_rows || count64 > UINT32_MAX) return;
+    uint32_t lo, hi;
+    g_range((uint32_t)count64, slice, nblk, &lo, &hi);
+    for (uint32_t index = lo; index < hi; index++) {
+        const uint32_t row = index / width, column = index % width;
+        const uint32_t p = pos[row] - base[row];
+        if (tokens[row] >= vocab || pos[row] < base[row] || p >= pos_rows) return;
+        out[index] = plow_f2bf(plow_bf2f(table[(size_t)tokens[row] * width + column]) +
+                               plow_bf2f(pos_table[(size_t)p * width + column]));
+    }
+}
+
 G_K(g_lstm_cell_f32) {
     (void)ctx;
     float* h_new = PLOW_CPU_TEN(in, T, 0);
@@ -466,17 +526,24 @@ G_K(g_grouped_attention_f32) {
     const float* value = PLOW_CPU_TEN(in, T, 3);
     const uint32_t rows = in->i[0], width = in->i[1], head_width = in->i[2];
     const uint32_t group_rows = in->i[3], flags = in->i[4];
-    const uint32_t valid_rows = in->t[4] == PLOW_TENSOR_NONE
+    /* flags 8: t4 is a group table {count, (first row, rows) x count}. */
+    const uint32_t* table = (flags & 8u) && in->t[4] != PLOW_TENSOR_NONE
+        ? (const uint32_t*)T[in->t[4]] : NULL;
+    const uint32_t valid_rows = table || in->t[4] == PLOW_TENSOR_NONE
         ? rows : *(const uint32_t*)T[in->t[4]];
     if (head_width == 0 || width % head_width != 0 || group_rows == 0 ||
         group_rows > 256 || valid_rows == 0 || valid_rows > rows)
         return;
     const uint32_t heads = width / head_width;
-    for (uint32_t item = slice; item < valid_rows * heads; item += nblk) {
-        const uint32_t row = item / heads, head = item % heads;
-        const uint32_t first = row / group_rows * group_rows;
-        uint32_t last = first + group_rows;
+    const uint32_t groups = table ? table[0] : (valid_rows + group_rows - 1) / group_rows;
+    for (uint32_t item = slice; item < groups * group_rows * heads; item += nblk) {
+        const uint32_t head = item % heads, g = item / heads / group_rows;
+        const uint32_t first = table ? table[1 + 2 * g] : g * group_rows;
+        const uint32_t span = table && table[2 + 2 * g] < group_rows ? table[2 + 2 * g] : group_rows;
+        const uint32_t row = first + item / heads % group_rows;
+        uint32_t last = first + span;
         if (last > valid_rows) last = valid_rows;
+        if (row >= last) continue;
         float scores[256], maximum = -INFINITY;
         const size_t qb = (size_t)row * width + head * head_width;
         for (uint32_t kr = first; kr < last; kr++) {
@@ -506,4 +573,368 @@ G_K(g_grouped_attention_f32) {
             context[qb + col] = flags & 4u ? plow_bf2f(plow_f2bf(sum)) : sum;
         }
     }
+}
+
+/* ---- generic FP32 signal ops (195-203). Activation codes: packet::dev::ACT_*. ---- */
+
+static float g_act_f32(uint32_t kind, float x, float p0, float p1) {
+    switch (kind) {
+    case 1: return tanhf(x);
+    case 2: return sinf(x);
+    case 3: return cosf(x);
+    case 4: return expf(x);
+    case 5: return fabsf(x);
+    case 6: return 1.0f / (1.0f + expf(-x));
+    case 7: return x / (1.0f + expf(-x));
+    case 8: return x > 0.0f ? x : expm1f(x);
+    case 9: return x >= 0.0f ? x : x * p0;
+    case 10: return x * tanhf(log1pf(expf(x)));
+    case 11: return 0.5f * x * (1.0f + erff(x * 0.70710678118654752f));
+    case 12: {
+        const float s = sinf(p0 * x);
+        return x + 1.0f / (p0 + 1e-9f) * (s * s);
+    }
+    case 13: return fminf(fmaxf(x, p0), p1);
+    case 14: return x * p0 + p1;
+    case 15: return x > 0.0f ? x : 0.0f;
+    default: return x;
+    }
+}
+
+static int g_act_valid_conv(uint32_t kind) { return kind != 13u && kind != 14u; }
+
+static float g_weight(const void* weight, int f16, size_t i) {
+    return f16 ? f16_to_f32(((const uint16_t*)weight)[i]) : ((const float*)weight)[i];
+}
+
+G_K(g_gather_rows_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const void* table = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t* index = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t rows = in->i[0], width = in->i[1], vocab = in->i[2];
+    const uint32_t per_item = in->i[3] ? in->i[3] : rows, repeat = in->i[4] ? in->i[4] : 1u;
+    const uint32_t flags = in->i[7];
+    const uint32_t out_stride = in->fj[1].u ? in->fj[1].u : width, out_col0 = in->fj[2].u;
+    uint32_t lo, hi;
+    g_range(rows, slice, nblk, &lo, &hi);
+    for (uint32_t row = lo; row < hi; row++) {
+        const uint32_t item = row / per_item, local = row % per_item / repeat;
+        const uint32_t source = index ? index[(size_t)item * in->i[5] + local] : local;
+        const size_t table_row = (size_t)item * in->i[6] + source;
+        for (uint32_t column = 0; column < width; column++) {
+            const float value = source < vocab
+                ? g_weight(table, flags & 1u, table_row * width + column) : 0.0f;
+            float* o = out + (size_t)row * out_stride + out_col0 + column;
+            *o = flags & 2u ? *o + value : value;
+        }
+    }
+}
+
+G_K(g_copy_cols_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const float* x = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t items = in->i[0], rows = in->i[1], cols = in->i[2];
+    uint32_t lo, hi;
+    g_range(items * rows, slice, nblk, &lo, &hi);
+    for (uint32_t index = lo; index < hi; index++) {
+        const uint32_t item = index / rows, row = index % rows;
+        const float* src = x + (size_t)item * in->fj[1].u + (size_t)row * in->i[3] + in->i[4];
+        float* dst = out + (size_t)item * in->fj[2].u + (size_t)row * in->i[5] + in->i[6];
+        for (uint32_t column = 0; column < cols; column++) dst[column] = src[column];
+    }
+}
+
+/* Input row `u` of an item with `length` valid rows under pad `mode`; -1 reads as zero. */
+static int64_t g_pad_row(int64_t u, int64_t length, uint32_t mode) {
+    if (u >= 0 && u < length) return u;
+    if (mode == 1u) u = u < 0 ? -u : 2 * (length - 1) - u;
+    else if (mode == 2u) u = u < 0 ? 0 : length - 1;
+    else return -1;
+    return u >= 0 && u < length ? u : -1;
+}
+
+static uint32_t g_item_rows(const uint32_t* lengths, uint32_t item, uint32_t rows) {
+    return lengths && lengths[item] < rows ? lengths[item] : rows;
+}
+
+G_K(g_conv1d_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const float* x = PLOW_CPU_TEN(in, T, 1);
+    const void* weight = PLOW_CPU_TEN(in, T, 2);
+    const float* bias = PLOW_CPU_TEN(in, T, 3);
+    const float* alpha = PLOW_CPU_TEN(in, T, 4);
+    const float* residual = PLOW_CPU_TEN(in, T, 5);
+    const uint32_t* lengths = PLOW_CPU_TEN(in, T, 6);
+    const float* row_scale = PLOW_CPU_TEN(in, T, 7);
+    const uint32_t batch = in->i[0], in_rows = in->i[1], cin = in->i[2], cout = in->i[3];
+    const uint32_t kernel = in->i[4], stride = in->i[5], dilation = in->i[6], groups = in->i[7];
+    const uint32_t pad_before = in->fj[1].u & 0xFFFFu, pad_after = in->fj[1].u >> 16;
+    const uint32_t flags = in->fj[2].u, mode = flags & 3u;
+    const uint32_t pre = (flags >> 4) & 15u, post = (flags >> 8) & 15u;
+    const float slope = in->fj[0].f;
+    if (!kernel || !stride || !dilation || !groups || cin % groups || cout % groups ||
+        mode > 2u || !g_act_valid_conv(pre) || !g_act_valid_conv(post) || (post == 12u && pre != 0u))
+        return;
+    const uint64_t span = (uint64_t)dilation * (kernel - 1u) + 1u;
+    if (in_rows + pad_before + pad_after < span) return;
+    const uint32_t out_rows = (uint32_t)((in_rows + pad_before + pad_after - span) / stride + 1u);
+    const uint32_t cg = cin / groups, ng = cout / groups;
+    uint32_t lo, hi;
+    g_range(batch * out_rows, slice, nblk, &lo, &hi);
+    for (uint32_t m = lo; m < hi; m++) {
+        const uint32_t b = m / out_rows, t = m % out_rows;
+        const uint32_t length = g_item_rows(lengths, b, in_rows);
+        const uint64_t padded = (uint64_t)length + pad_before + pad_after;
+        const uint64_t out_length = padded >= span ? (padded - span) / stride + 1u : 0u;
+        for (uint32_t o = 0; o < cout; o++) {
+            const size_t oi = (size_t)m * cout + o;
+            if (t >= out_length) { out[oi] = 0.0f; continue; }
+            const uint32_t c0 = o / ng * cg;
+            double sum = bias ? bias[o] : 0.0;
+            for (uint32_t k = 0; k < kernel; k++) {
+                const int64_t u = g_pad_row((int64_t)t * stride + (int64_t)k * dilation - pad_before,
+                                            length, mode);
+                if (u < 0) continue;
+                for (uint32_t i = 0; i < cg; i++) {
+                    const uint32_t c = c0 + i;
+                    const float v = g_act_f32(pre, x[((size_t)b * in_rows + u) * cin + c],
+                                              alpha ? alpha[c] : slope, 0.0f);
+                    /* flags bit 15: weights [cout][kernel][cg] instead of [cout][cg][kernel]. */
+                    const size_t wi = (flags >> 15) & 1u ? ((size_t)o * kernel + k) * cg + i
+                                                         : ((size_t)o * cg + i) * kernel + k;
+                    sum += (double)v * g_weight(weight, (flags >> 12) & 1u, wi);
+                }
+            }
+            float value = g_act_f32(post, (float)sum, alpha ? alpha[o] : slope, 0.0f);
+            if (row_scale) value = row_scale[m] * value;
+            out[oi] = residual ? value + residual[oi] : value;
+        }
+    }
+}
+
+G_K(g_conv_transpose1d_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const float* x = PLOW_CPU_TEN(in, T, 1);
+    const void* weight = PLOW_CPU_TEN(in, T, 2);
+    const float* bias = PLOW_CPU_TEN(in, T, 3);
+    const float* alpha = PLOW_CPU_TEN(in, T, 4);
+    const float* residual = PLOW_CPU_TEN(in, T, 5);
+    const uint32_t* lengths = PLOW_CPU_TEN(in, T, 6);
+    const uint32_t batch = in->i[0], in_rows = in->i[1], cin = in->i[2], cout = in->i[3];
+    const uint32_t kernel = in->i[4], stride = in->i[5], output_padding = in->i[6];
+    const uint32_t groups = in->i[7];
+    const uint32_t crop_before = in->fj[1].u & 0xFFFFu, crop_after = in->fj[1].u >> 16;
+    const uint32_t flags = in->fj[2].u;
+    const uint32_t pre = (flags >> 4) & 15u, post = (flags >> 8) & 15u;
+    const float slope = in->fj[0].f;
+    if (!in_rows || !kernel || !stride || !groups || cin % groups || cout % groups ||
+        !g_act_valid_conv(pre) || !g_act_valid_conv(post) || (post == 12u && pre != 0u))
+        return;
+    const int64_t full = (int64_t)(in_rows - 1u) * stride + kernel + output_padding;
+    if (full <= (int64_t)crop_before + crop_after) return;
+    const uint32_t out_rows = (uint32_t)(full - crop_before - crop_after);
+    const uint32_t cg = cin / groups, ng = cout / groups;
+    uint32_t lo, hi;
+    g_range(batch * out_rows, slice, nblk, &lo, &hi);
+    for (uint32_t m = lo; m < hi; m++) {
+        const uint32_t b = m / out_rows, t = m % out_rows;
+        const uint32_t length = g_item_rows(lengths, b, in_rows);
+        const int64_t out_length = length
+            ? (int64_t)(length - 1u) * stride + kernel + output_padding - crop_before - crop_after
+            : 0;
+        for (uint32_t o = 0; o < cout; o++) {
+            const size_t oi = (size_t)m * cout + o;
+            if ((int64_t)t >= out_length) { out[oi] = 0.0f; continue; }
+            const uint32_t c0 = o / ng * cg, on = o % ng;
+            double sum = bias ? bias[o] : 0.0;
+            for (uint32_t k = 0; k < kernel; k++) {
+                const int64_t num = (int64_t)t + crop_before - k;
+                if (num < 0 || num % stride) continue;
+                const int64_t s = num / stride;
+                if (s >= length) continue;
+                for (uint32_t i = 0; i < cg; i++) {
+                    const uint32_t c = c0 + i;
+                    const float v = g_act_f32(pre, x[((size_t)b * in_rows + s) * cin + c],
+                                              alpha ? alpha[c] : slope, 0.0f);
+                    /* flags bit 15: weights [stride][cout][ceil(kernel/stride)][cg]. */
+                    const uint32_t taps = (kernel + stride - 1u) / stride;
+                    const size_t wi = (flags >> 15) & 1u
+                                          ? (((size_t)(k % stride) * cout + o) * taps + k / stride) * cg + i
+                                          : ((size_t)c * ng + on) * kernel + k;
+                    sum += (double)v * g_weight(weight, (flags >> 12) & 1u, wi);
+                }
+            }
+            float value = g_act_f32(post, (float)sum, alpha ? alpha[o] : slope, 0.0f);
+            out[oi] = residual ? value + residual[oi] : value;
+        }
+    }
+}
+
+G_K(g_unary_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const float* x = PLOW_CPU_TEN(in, T, 1);
+    const float* param = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t rows = in->i[0], width = in->i[1], kind = in->i[2];
+    const uint32_t stride = in->i[3] ? in->i[3] : width, col0 = in->i[4];
+    uint32_t lo, hi;
+    g_range(rows, slice, nblk, &lo, &hi);
+    for (uint32_t row = lo; row < hi; row++)
+        for (uint32_t column = 0; column < width; column++) {
+            const size_t i = (size_t)row * stride + col0 + column;
+            out[i] = g_act_f32(kind, x[i], param ? param[column] : in->fj[0].f, in->fj[1].f);
+        }
+}
+
+G_K(g_binary_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const float* a = PLOW_CPU_TEN(in, T, 1);
+    const float* b = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t items = in->i[0], rows = in->i[1], width = in->i[2], op = in->i[3];
+    if (op > 5u) return;
+    uint32_t lo, hi;
+    g_range(items * rows, slice, nblk, &lo, &hi);
+    for (uint32_t index = lo; index < hi; index++) {
+        const uint32_t item = index / rows, row = index % rows;
+        for (uint32_t column = 0; column < width; column++) {
+            const size_t i = (size_t)index * width + column;
+            const float av = a[i];
+            const float bv = b[(size_t)item * in->i[4] + (size_t)row * in->i[5] +
+                               (size_t)column * in->i[6]];
+            float v = op == 0u ? av + bv : op == 1u ? av - bv : op == 2u ? av * bv
+                    : op == 3u ? av / bv : op == 4u ? fmaxf(av, bv) : fminf(av, bv);
+            out[i] = in->i[7] & 1u ? in->fj[0].f * v : v;
+        }
+    }
+}
+
+G_K(g_cumsum_f64) {
+    (void)ctx;
+    void* out = PLOW_CPU_TEN(in, T, 0);
+    const float* x = PLOW_CPU_TEN(in, T, 1);
+    const float* column_scale = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t* lengths = PLOW_CPU_TEN(in, T, 3);
+    const uint32_t items = in->i[0], rows = in->i[1], width = in->i[2];
+    const uint32_t x_width = in->i[3] ? in->i[3] : width, flags = in->i[4];
+    uint32_t lo, hi;
+    g_range(items * width, slice, nblk, &lo, &hi);
+    for (uint32_t index = lo; index < hi; index++) {
+        const uint32_t item = index / width, column = index % width;
+        const uint32_t length = g_item_rows(lengths, item, rows);
+        const double scale = (double)(column_scale ? column_scale[column] : 1.0f) * in->fj[0].f;
+        double sum = 0.0;
+        for (uint32_t row = 0; row < rows; row++) {
+            const double value = row < length
+                ? (double)x[((size_t)item * rows + row) * x_width + column % x_width] : 0.0;
+            if (!(flags & 1u)) sum += value;
+            double v = sum * scale;
+            if (flags & 2u) v -= floor(v);
+            v *= in->fj[1].f;
+            const size_t o = ((size_t)item * rows + row) * width + column;
+            if (flags & 4u) ((double*)out)[o] = v;
+            else ((float*)out)[o] = (float)v;
+            if (flags & 1u) sum += value;
+        }
+    }
+}
+
+static uint64_t g_mix64(uint64_t z) {
+    z += 0x9e3779b97f4a7c15ull;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+
+G_K(g_rand_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const uint64_t* seed = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t items = in->i[0], rows = in->i[1], width = in->i[2];
+    const uint32_t stream = in->i[3], shift = in->i[4], coords = in->i[5];
+    const uint32_t flags = in->fj[2].u;
+    if (shift > 63u || (coords & 3u) > 2u || ((coords >> 2) & 3u) > 2u) return;
+    uint32_t lo, hi;
+    g_range(items * rows, slice, nblk, &lo, &hi);
+    for (uint32_t index = lo; index < hi; index++) {
+        const uint32_t item = index / rows, row = index % rows;
+        const uint64_t s = seed[flags & 2u ? 0u : item];
+        for (uint32_t column = 0; column < width; column++) {
+            const uint32_t coord[3] = {row, column, item};
+            const uint64_t a = (uint32_t)(coord[coords & 3u] + in->i[6]);
+            const uint64_t b = (uint32_t)(coord[(coords >> 2) & 3u] + in->i[7]);
+            const uint64_t h = g_mix64(s ^ g_mix64(((uint64_t)stream << shift) ^ (a << 32) ^ b));
+            float v;
+            if (flags & 1u) {
+                const double u1 = (double)((h >> 40) + 1u) / 16777216.0;
+                const double u2 = (double)(g_mix64(h) >> 40) / 16777216.0;
+                v = (float)(sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2));
+            } else {
+                v = (float)(h >> 40) * (1.0f / 16777216.0f);
+            }
+            out[(size_t)index * width + column] = (v + in->fj[1].f) * in->fj[0].f;
+        }
+    }
+}
+
+G_K(g_attention_f32) {
+    (void)ctx;
+    float* out = PLOW_CPU_TEN(in, T, 0);
+    const float* query = PLOW_CPU_TEN(in, T, 1);
+    const float* key = PLOW_CPU_TEN(in, T, 2);
+    const float* value = PLOW_CPU_TEN(in, T, 3);
+    const uint32_t* key_lengths = PLOW_CPU_TEN(in, T, 4);
+    /* Optional key prefix: item b's keys are rows [0, i7) of prefix block t7[b] ([K | V] rows,
+     * 2 * width wide), then its kv_rows own rows. */
+    const float* prefix = PLOW_CPU_TEN(in, T, 6);
+    const uint32_t* prefix_index = PLOW_CPU_TEN(in, T, 7);
+    const uint32_t pre = prefix ? in->i[7] : 0u;
+    const float* bias = prefix ? NULL : PLOW_CPU_TEN(in, T, 5);
+    const uint32_t batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3];
+    const uint32_t hw = in->i[4], width = heads * hw;
+    const uint32_t stride = in->i[5] ? in->i[5] : width, causal = in->i[6] & 1u;
+    /* i6 bit 2: relative-position bias table [q_rows][heads][i7]; bits 8-15: key lengths per
+     * group of that many heads. */
+    const uint32_t rel = in->i[6] & 4u, lgroup = (in->i[6] >> 8) & 255u;
+    const uint32_t k_col0 = in->fj[1].u, v_col0 = in->fj[2].u;
+    if (!hw || !(pre + kv_rows)) return;
+    double* p = malloc(sizeof(double) * (pre + kv_rows));
+    double* acc = malloc(sizeof(double) * hw);
+    uint32_t lo, hi;
+    g_range(batch * heads * q_rows, slice, nblk, &lo, &hi);
+    for (uint32_t index = lo; index < hi; index++) {
+        const uint32_t b = index / (heads * q_rows), h = index / q_rows % heads, r = index % q_rows;
+        uint32_t visible = g_item_rows(key_lengths, lgroup ? (b * heads + h) / lgroup : b, pre + kv_rows);
+        if (causal && r + 1u < visible) visible = r + 1u;
+        const float* q = query + ((size_t)b * q_rows + r) * stride + (size_t)h * hw;
+        double maximum = -INFINITY;
+        for (uint32_t j = 0; j < visible; j++) {
+            const float* k = j < pre ? prefix + ((size_t)prefix_index[b] * pre + j) * 2u * width + (size_t)h * hw
+                                     : key + ((size_t)b * kv_rows + j - pre) * stride + k_col0 + (size_t)h * hw;
+            double dot = 0.0;
+            for (uint32_t c = 0; c < hw; c++) dot += (double)q[c] * k[c];
+            p[j] = dot * in->fj[0].f +
+                   (!bias ? 0.0f
+                    : rel ? bias[((size_t)r * heads + h) * in->i[7] + kv_rows - 1u - r + j]
+                          : bias[(size_t)h * in->i[7] + (size_t)r * kv_rows + j]);
+            if (p[j] > maximum) maximum = p[j];
+        }
+        double denominator = 0.0;
+        for (uint32_t c = 0; c < hw; c++) acc[c] = 0.0;
+        for (uint32_t j = 0; j < visible; j++) {
+            const double e = exp(p[j] - maximum);
+            const float* v = j < pre ? prefix + ((size_t)prefix_index[b] * pre + j) * 2u * width + width + (size_t)h * hw
+                                     : value + ((size_t)b * kv_rows + j - pre) * stride + v_col0 + (size_t)h * hw;
+            denominator += e;
+            for (uint32_t c = 0; c < hw; c++) acc[c] += e * v[c];
+        }
+        float* o = out + ((size_t)b * q_rows + r) * width + (size_t)h * hw;
+        for (uint32_t c = 0; c < hw; c++) o[c] = visible ? (float)(acc[c] / denominator) : 0.0f;
+    }
+    free(p);
+    free(acc);
 }

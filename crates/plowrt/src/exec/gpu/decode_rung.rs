@@ -47,7 +47,7 @@ pub(super) fn effective_decode_widths(
 }
 
 pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
-    validate_decode_ladder_impl(blob, false)
+    validate_decode_ladder_impl(blob, false, &[])
 }
 
 pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) -> Result<bool> {
@@ -56,15 +56,22 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
     }
     let start = blob.progs.len() - blob.decode_progs().len();
     let mut previous_roles = None;
+    let mut routed = Vec::new();
+    let mut native = true;
     for (index, program) in blob.progs.iter().enumerate().skip(start) {
-        let roles = &metadata
-            .program(index)
-            .ok_or_else(|| {
-                RuntimeError::Rejected(
-                    "cuBLASLt ladder requires roles for every decode width".into(),
-                )
-            })?
-            .roles;
+        // Rungs below the packet's routed width keep one interpreter launch; the routed rungs
+        // above them must all be routed (the widest one is).
+        let Some(roles) = metadata.program(index).map(|p| &p.roles) else {
+            if !native {
+                return Err(RuntimeError::Rejected(
+                    "cuBLASLt ladder requires roles for every rung above the first routed one".into(),
+                ));
+            }
+            program.check_coarse_single_segment()?;
+            continue;
+        };
+        native = false;
+        routed.push(index);
         if !roles
             .iter()
             .copied()
@@ -81,7 +88,7 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
     }
     blob.with_packet_view(|packet| {
         let mut previous = None;
-        for program in &packet.programs[start..] {
+        for program in routed.iter().map(|&index| &packet.programs[index]) {
             let mut stream = program.stream.to_vec();
             let mut queue = program.gq_stream.to_vec();
             for entry in stream.iter_mut().chain(&mut queue) {
@@ -103,7 +110,9 @@ pub(super) fn validate_cublaslt_ladder(blob: &DevBlob, metadata: &SegmentRoles) 
         Ok(())
     })
     .map_err(RuntimeError::Rejected)?;
-    validate_decode_ladder_impl(blob, true)
+    let classes: Vec<bool> =
+        (start..blob.progs.len()).map(|index| routed.contains(&index)).collect();
+    validate_decode_ladder_impl(blob, true, &classes)
 }
 
 /// A ladder whose grouped-arm rungs declare `MOE_DECODE_CUBLASLT` segments. Every rung is
@@ -120,10 +129,12 @@ pub(super) fn validate_moe_lt_ladder(blob: &DevBlob, metadata: &SegmentRoles) ->
             None => program.check_coarse_single_segment()?,
         }
     }
-    validate_decode_ladder_impl(blob, true)
+    validate_decode_ladder_impl(blob, true, &[])
 }
 
-fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> {
+/// `routed[i]`: decode rung `i` runs the cuBLASLt projection program. Rungs are held to the same
+/// normalized program only within their class (fused interpreter vs. routed).
+fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool]) -> Result<bool> {
     let splitk = blob
         .with_packet_view(plow_asset::splitk::validate)
         .map_err(RuntimeError::Rejected)?;
@@ -179,8 +190,9 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
     let widest = programs.last().expect("multiple programs");
     let mut compatible = true;
     let mut same_shape = true;
-    let mut normalized = Vec::new();
+    let mut normalized = [Vec::new(), Vec::new()];
     for (index, g) in programs.iter().enumerate() {
+        let normalized = &mut normalized[usize::from(routed.get(index).copied().unwrap_or(false))];
         let logical = splitk.as_ref().map(|proof| &proof.canonical[index]);
         if let Some(proof) = &splitk {
             if proof.canonical[index].dependencies != proof.canonical[0].dependencies {
@@ -258,9 +270,17 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     }
                     d.i[field] = 0;
                 }
+                // Gemma-4 E-series: the per-layer input norm runs over `t * layers` rows.
+                Some(DevOp::RmsNorm) if d.i[0] != g.t => {
+                    if d.i[0] == 0 || d.i[0] % g.t != 0 {
+                        return Err(reject("invalid norm row extent"));
+                    }
+                    d.i[0] /= g.t;
+                }
                 Some(
                     DevOp::RmsNorm
                     | DevOp::RowRms
+                    | DevOp::GluStrided
                     | DevOp::HeadNormRope
                     | DevOp::HeadNormRopeFp8
                     | DevOp::Gemm
@@ -276,6 +296,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     | DevOp::NormResidualNorm
                     | DevOp::AddNorm
                     | DevOp::Embed
+                    | DevOp::EmbedPosBf16
                     | DevOp::FlashDecode
                     | DevOp::FlashDecodeFp8
                     | DevOp::FlashMerge,
@@ -305,7 +326,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
                     }
                 }
                 _ => {
-                    if std::env::var_os("PLOW_LADDER_DEBUG").is_some() {
+                    if crate::config::RuntimeConfig::get().nv.ladder_debug {
                         eprintln!(
                             "ladder: rung {index} inst {} op {} has no normalization arm",
                             insts.len(),
@@ -318,11 +339,11 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
             insts.push(d);
         }
         if normalized.is_empty() {
-            normalized = insts;
-        } else if normalized != insts {
+            *normalized = insts;
+        } else if *normalized != insts {
             // Falling back here is SILENT (Ok(false) -> the widest rung runs every step), and it
             // reads exactly like a large kernel regression. Name the first difference.
-            if std::env::var_os("PLOW_LADDER_DEBUG").is_some() {
+            if crate::config::RuntimeConfig::get().nv.ladder_debug {
                 if normalized.len() != insts.len() {
                     eprintln!(
                         "ladder: rung {index} has {} insts, rung 0 has {}",
@@ -367,7 +388,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
             continue;
         }
         let fp8 = d.op == DevOp::FlashDecodeFp8 as u16;
-        if !matches!(d.i[6], 64 | 256 | 512)
+        if !matches!(d.i[6], 64 | 128 | 256 | 512)
             || (fp8 && d.i[6] == 64)
             || (!fp8 && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16))
         {
@@ -409,13 +430,13 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool) -> Result<bool> 
             } else {
                 0
             };
+            // A second reader with the same geometry is KV sharing (Gemma-4 E-series), not aliasing.
+            let geometry = (heads, hd, stride, mask, pair_mode, scale);
             if blob
                 .tensors
                 .get(id as usize)
                 .is_none_or(|t| t.bytes != bytes || t.init.is_some())
-                || caches
-                    .insert(id, (heads, hd, stride, mask, pair_mode, scale))
-                    .is_some()
+                || caches.insert(id, geometry).is_some_and(|old| old != geometry)
                 || [pos, kvlen, ids].contains(&(id as usize))
             {
                 return Err(reject("invalid or aliased KV tensor extent"));
@@ -659,7 +680,7 @@ impl DecodeRung {
 
 
 #[cfg(test)]
-mod ladder_diag {
+mod tests {
     use super::*;
 
     /// CPU-only reproduction of the ladder decision. The real check runs during a GPU load, so
@@ -673,8 +694,8 @@ mod ladder_diag {
         let buf = std::fs::read(&path).expect("read blob");
         let blob = DevBlob::parse(&buf).expect("parse devblob");
         eprintln!("decode rungs: {:?}", blob.decode_rungs());
-        eprintln!("segmented=false -> {:?}", validate_decode_ladder_impl(&blob, false));
-        eprintln!("segmented=true  -> {:?}", validate_decode_ladder_impl(&blob, true));
+        eprintln!("segmented=false -> {:?}", validate_decode_ladder_impl(&blob, false, &[]));
+        eprintln!("segmented=true  -> {:?}", validate_decode_ladder_impl(&blob, true, &[]));
         // Which of the three validators gpu.rs picks is decided here, and picking the
         // non-segmented one makes a perfectly good ladder read as unqualified.
         let prefill = blob.prefill_progs().len();

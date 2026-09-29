@@ -52,6 +52,10 @@ impl Phase {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub network: String,
+    /// The `model` id the bundle is served under (`plowc --served-name`, else the HF repo id
+    /// of a hub-cache snapshot). `None` serves it under `network`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_name: Option<String>,
     pub gpu: String,
     pub num_gpus: usize,
     pub parallel: String,
@@ -699,6 +703,7 @@ pub mod fp8_m1_role;
 pub mod segment_roles;
 
 pub mod packed_prefill;
+pub mod kv_shared_tail;
 
 pub mod packet_pipeline;
 

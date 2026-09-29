@@ -172,6 +172,71 @@ theorem witnessedBefore_sound {tg : TaskGraph} (p : CounterProtocol tg)
   have checked := checkPath_sound p w.source w.target w.via hp
   simpa [hs, ht] using checked
 
+/-- Parent-pointer reachability certificate rooted at `a`: `parent[v] = some q` with `q < v`
+    and a direct edge `q → v`. Parents strictly decrease, so every chain ends; the certificate
+    is `n` numbers per source instead of one explicit path per queried pair. -/
+def treeChain {tg : TaskGraph} (p : CounterProtocol tg) (a : Fin tg.n)
+    (parent : Array (Option Nat)) (b : Fin tg.n) : Bool :=
+  if a = b then true else
+  match parent[b.val]? with
+  | some (some q) =>
+    if h : q < b.val then
+      directEdgeB p ⟨q, Nat.lt_trans h b.isLt⟩ b && treeChain p a parent ⟨q, Nat.lt_trans h b.isLt⟩
+    else false
+  | _ => false
+termination_by b.val
+
+theorem treeChain_sound {tg : TaskGraph} (p : CounterProtocol tg) (a : Fin tg.n)
+    (parent : Array (Option Nat)) (b : Fin tg.n) (h : treeChain p a parent b = true) :
+    a = b ∨ happensBefore p a b := by
+  rw [treeChain] at h
+  by_cases hab : a = b
+  · exact Or.inl hab
+  · simp only [hab, if_false] at h
+    split at h
+    · rename_i q _
+      split at h
+      · rename_i hlt
+        simp only [Bool.and_eq_true] at h
+        have edge := directEdgeB_sound p _ b h.1
+        rcases treeChain_sound p a parent ⟨q, Nat.lt_trans hlt b.isLt⟩ h.2 with same | before
+        · rw [same]; exact Or.inr edge
+        · exact Or.inr (happensBefore.trans before edge)
+      · simp at h
+    · simp at h
+termination_by b.val
+
+/-- `trees[a]` is the parent array of the certificate rooted at `a`, if supplied. -/
+def treeBefore {tg : TaskGraph} (p : CounterProtocol tg) (trees : Array (Option (Array (Option Nat))))
+    (a b : Fin tg.n) : Bool :=
+  decide (a ≠ b) && match trees[a.val]? with
+    | some (some parent) => treeChain p a parent b
+    | _ => false
+
+theorem treeBefore_sound {tg : TaskGraph} (p : CounterProtocol tg)
+    (trees : Array (Option (Array (Option Nat)))) (a b : Fin tg.n)
+    (h : treeBefore p trees a b = true) : happensBefore p a b := by
+  simp only [treeBefore, Bool.and_eq_true, decide_eq_true_eq] at h
+  obtain ⟨hne, h⟩ := h
+  split at h
+  · rename_i parent _
+    rcases treeChain_sound p a parent b h with same | before
+    · exact absurd same hne
+    · exact before
+  · simp at h
+
+/-- A decidable happens-before oracle together with its soundness. -/
+structure Witness {tg : TaskGraph} (p : CounterProtocol tg) where
+  before : Fin tg.n → Fin tg.n → Bool
+  sound : ∀ a b, before a b = true → happensBefore p a b
+
+def Witness.ofPaths {tg : TaskGraph} (p : CounterProtocol tg) (paths : List (PathWitness tg)) :
+    Witness p := ⟨witnessedBefore p paths, witnessedBefore_sound p paths⟩
+
+def Witness.ofTrees {tg : TaskGraph} (p : CounterProtocol tg)
+    (trees : Array (Option (Array (Option Nat)))) : Witness p :=
+  ⟨treeBefore p trees, treeBefore_sound p trees⟩
+
 def readersBeforeWritersVia {tg : TaskGraph} (p : CounterProtocol tg)
     (paths : List (PathWitness tg)) (readers writers : List (Fin tg.n)) : Bool :=
   readers.all fun r => writers.all fun w => witnessedBefore p paths r w

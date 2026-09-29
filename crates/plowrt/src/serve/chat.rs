@@ -31,13 +31,32 @@ fn request_id() -> String {
 }
 
 /// Handler: dispatches to the streaming or non-streaming path.
+/// `X-Request-Id` / `X-Session-Id`: echoed on the response; a session's requests resume the rows
+/// its previous request retained.
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    req: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let ids = match crate::serve::session::RequestIds::from_headers(&headers) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return crate::serve::api_error(axum::http::StatusCode::BAD_REQUEST, e, "invalid_request_error", Some("invalid_value"), None)
+        }
+    };
+    let mut response = chat_completions_with(state, req, &ids).await;
+    ids.stamp(&mut response);
+    response
+}
+
+async fn chat_completions_with(
+    state: Arc<AppState>,
     // `Result<Json<..>, JsonRejection>` rather than `Json<..>`: axum's default
     // rejection is a PLAIN-TEXT 400/415/422, and a client that calls
     // `resp.json()` on a 4xx — every OpenAI SDK does — raises a decode error
     // instead of showing the user what was wrong with their request.
     req: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
+    ids: &crate::serve::session::RequestIds,
 ) -> Response {
     let Json(mut req) = match req {
         Ok(r) => r,
@@ -122,8 +141,6 @@ pub async fn chat_completions(
         (&req.functions, "functions"),
         (&req.function_call, "function_call"),
         (&req.response_format, "response_format"),
-        (&req.logprobs, "logprobs"),
-        (&req.top_logprobs, "top_logprobs"),
     ] {
         if val.as_ref().is_some_and(|v| !v.is_null()) {
             return crate::serve::api_error(
@@ -257,6 +274,31 @@ pub async fn chat_completions(
         gen.stop = stop.list();
     }
     gen.seed = req.seed;
+    gen.params.logprobs = match crate::serve::logprobs::parse_chat(
+        req.logprobs.as_ref(),
+        req.top_logprobs.as_ref(),
+        req.logprobs_mode.as_deref(),
+    ) {
+        Ok(lp) => lp,
+        Err((msg, param)) => {
+            return crate::serve::api_error(
+                axum::http::StatusCode::BAD_REQUEST,
+                msg,
+                "invalid_request_error",
+                Some("invalid_value"),
+                Some(param.into()),
+            )
+        }
+    };
+    if gen.params.logprobs.is_some() && !cfg!(feature = "cuda") {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "`logprobs` is served by the CUDA engine only",
+            "invalid_request_error",
+            Some("unsupported_parameter"),
+            Some("logprobs".into()),
+        );
+    }
     gen.min_tokens = req.sampling.min_tokens.unwrap_or(0) as usize;
     gen.stop_token_ids = req.sampling.stop_token_ids.clone().unwrap_or_default();
     if gen.min_tokens > gen.max_tokens {
@@ -323,12 +365,31 @@ pub async fn chat_completions(
         bundle.tokenizer().encode(&prompt)
     });
     let n_prompt = prompt_ids.len();
+    let lp_fmt = gen.params.logprobs.map(|_| crate::serve::logprobs::TokenText {
+        tok: bundle.tokenizer().clone(),
+        as_ids: req.return_tokens_as_token_ids.unwrap_or(false),
+    });
     let (tx, rx) = stream_mod::channel();
+    let Some(in_flight) = ids.begin(&req.model) else {
+        return crate::serve::api_error(
+            axum::http::StatusCode::CONFLICT,
+            format!("request {} is already in flight in this session", ids.request),
+            "invalid_request_error",
+            Some("duplicate_request_id"),
+            None,
+        );
+    };
+    let (report, report_rx) = ids.report();
+    let session = ids.session.as_ref().and_then(|_| ids.ticket(crate::serve::session::row_keys(&prompt_ids, &[], &[]), report));
     let job = crate::serve::mux::Job {
         prompt_ids,
         gen,
         arrived: std::time::Instant::now(),
         respond: tx,
+        opts: crate::serve::mux::JobOpts {
+            session,
+            ..Default::default()
+        },
     };
     if crate::obs::host::on() {
         crate::obs::host::submitted(n_prompt, t_arrive.elapsed());
@@ -357,9 +418,10 @@ pub async fn chat_completions(
     let request_id = request_id();
     // Stamped ONCE and repeated on every chunk of a stream, as OpenAI does.
     let created = now_secs();
-    if req.stream {
+    let cache = crate::serve::session::CacheOutcome::received(report_rx).await;
+    let mut response = if req.stream {
         let include_usage = req.stream_options.map(|o| o.include_usage).unwrap_or(false);
-        sse_response(
+        let sse = sse_response(
             request_id,
             requested_model,
             rx,
@@ -369,8 +431,9 @@ pub async fn chat_completions(
             created,
             reasoning_mode,
             reasoning_open,
-        )
-        .into_response()
+            lp_fmt,
+        );
+        crate::serve::session::hold_until_sent(sse.into_response(), in_flight)
     } else {
         buffer_and_reply(
             request_id,
@@ -379,9 +442,14 @@ pub async fn chat_completions(
             created,
             reasoning_mode,
             reasoning_open,
+            lp_fmt,
         )
         .await
+    };
+    if let Some(cache) = cache {
+        cache.stamp(&mut response);
     }
+    response
 }
 
 /// Pick the chat template a GPU-served model wants.
@@ -618,8 +686,10 @@ async fn buffer_and_reply(
     created: u64,
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
+    lp_fmt: Option<crate::serve::logprobs::TokenText>,
 ) -> Response {
     let mut text = String::new();
+    let mut lp_content = Vec::new();
     // Driven PER TOKEN, exactly as the streamed path drives it — same type,
     // same order — so the two cannot disagree, and `trace_tokens` is a real
     // token count rather than a count of calls.
@@ -639,7 +709,10 @@ async fn buffer_and_reply(
     let mut usage: Option<Usage> = None;
     while let Some(chunk) = rx.recv().await {
         match chunk {
-            StreamChunk::Token { text: delta, .. } => {
+            StreamChunk::Token { id, text: delta, logprobs } => {
+                if let (Some(fmt), Some(lp)) = (&lp_fmt, &logprobs) {
+                    lp_content.push(crate::serve::logprobs::chat_entry(fmt, id, lp));
+                }
                 text.push_str(&delta);
                 let (r, c) = split.push(&delta);
                 reasoning_buf.push_str(&r.unwrap_or_default());
@@ -713,6 +786,7 @@ async fn buffer_and_reply(
                 content: Some(Content::Text(answer)),
                 reasoning_content: reasoning,
             },
+            logprobs: lp_fmt.map(|_| crate::serve::logprobs::ChatLogprobs { content: lp_content }),
             // The WIRE value, which is not always the internal one: a
             // preemption is reported as "length" because "preempted" is not an
             // OpenAI finish_reason and a typed client rejects the response on
@@ -757,6 +831,7 @@ fn sse_response(
     created: u64,
     reasoning_mode: crate::serve::reasoning::ReasoningMode,
     reasoning_open: bool,
+    lp_fmt: Option<crate::serve::logprobs::TokenText>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
 
     // State threaded through the unfold: the receiver, and the tail frames
@@ -783,6 +858,7 @@ fn sse_response(
         move |mut st| {
             let model = model.clone();
             let request_id = request_id.clone();
+            let lp_fmt = lp_fmt.clone();
             async move {
                 if st.done {
                     return None;
@@ -811,7 +887,13 @@ fn sse_response(
                     }
                 };
                 let (frame, terminate) = match chunk {
-                    StreamChunk::Token { text, .. } => {
+                    StreamChunk::Token { id, text, logprobs } => {
+                        let logprobs = lp_fmt.as_ref().map(|fmt| crate::serve::logprobs::ChatLogprobs {
+                            content: logprobs
+                                .iter()
+                                .map(|lp| crate::serve::logprobs::chat_entry(fmt, id, lp))
+                                .collect(),
+                        });
                         let role = st.role_pending.then(|| {
                             st.role_pending = false;
                             "assistant"
@@ -837,6 +919,7 @@ fn sse_response(
                                     content,
                                     reasoning_content: reasoning,
                                 },
+                                logprobs,
                                 finish_reason: None,
                                 x_plow_finish_reason: None,
                             }],
@@ -861,6 +944,7 @@ fn sse_response(
                                     content: flushed_c,
                                     reasoning_content: flushed_r,
                                 },
+                                logprobs: None,
                                 // The wire value: "preempted" is not an OpenAI
                                 // finish_reason and a typed client rejects it.
                                 finish_reason: Some(reason.as_openai()),

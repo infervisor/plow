@@ -285,6 +285,25 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FUSE_MERGE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fuse_merge: bool,
 
+    /// NVIDIA E-series (hd256/512 row-group) flash decode normalizes / merges in its last split
+    /// (merge fold): no FlashMerge op.
+    #[arg(long, env = "PLOW_NV_FA_FOLD_WIDE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_fa_fold_wide: bool,
+
+    /// NVIDIA hd128 row-group flash decode on the mma.sync staged item (PLOW_NV_FA_RGM).
+    #[arg(long, env = "PLOW_NV_FA_MMA_HD128", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_fa_mma_hd128: bool,
+
+    /// NVIDIA hd <= 128 dense packets: the one-row decode rung also takes the `gemv_k8` walk, with
+    /// two k32 steps in flight on its one-tile arm (`gemv_k8_min` 1, `gemv_k8_unb1` 2).
+    #[arg(long, env = "PLOW_NV_GEMV_K8_B1", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_gemv_k8_b1: bool,
+
+    /// sm_90a v3 flash prefill splits the KV of launches with few items across CTAs (riders,
+    /// short session suffixes) through the `fa_ws` workspace.
+    #[arg(long, env = "PLOW_NV_FA_SPLIT_PREFILL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_fa_split_prefill: bool,
+
     /// Head-number split (3*nhn <= n_cu).
     #[arg(long, env = "PLOW_HN_SPLIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub hn_split: bool,
@@ -312,6 +331,21 @@ pub struct EmitConfig {
     /// (op_attention.cuh PLOW_NV_FA_MMAQK): bit 0 = hd256 layers, bit 1 = hd512 layers.
     #[arg(long, env = "PLOW_FA_MMAQK")]
     pub fa_mmaqk: Option<u32>,
+
+    /// Declare the packet a speech model: emit a `tts.codec_lm.v1` pipeline ("speech") carrying
+    /// the codec/prompt contract of the named family (`veena`). Metadata only; programs unchanged.
+    #[arg(long, env = "PLOW_TTS_PROFILE")]
+    pub tts_profile: Option<String>,
+
+    /// Exported codec decoder (scripts/tts/snac_export.py) to lower into `codec.pkt` beside the
+    /// speech packet.
+    #[arg(long, env = "PLOW_TTS_CODEC_DIR")]
+    pub tts_codec: Option<std::path::PathBuf>,
+
+    /// Exported S3Gen token-to-waveform model (scripts/tts/s3gen_export.py) to lower into
+    /// `s3gen.pkt` beside the speech packet.
+    #[arg(long, env = "PLOW_TTS_VOCODER_DIR")]
+    pub tts_vocoder: Option<std::path::PathBuf>,
 
     /// Widen the flash-merge dispatch by this factor (diagnostic; measured no effect).
     #[arg(long, env = "PLOW_FLASH_MERGE_DSPLIT", hide = true)]
@@ -1211,6 +1245,15 @@ pub struct EmitConfig {
     #[arg(long = "emit-decode-cublaslt", env = "PLOW_EMIT_DECODE_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_cublaslt: bool,
 
+    /// With `decode_cublaslt`: only decode rungs of at least this many rows take the route; the
+    /// narrower rungs keep the fused interpreter program. Unset = every rung.
+    #[arg(long = "emit-decode-cublaslt-min-rows", env = "PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS")]
+    pub decode_cublaslt_min_rows: Option<u32>,
+
+    /// With `decode_cublaslt`: the routed rungs' lm_head is a library segment too.
+    #[arg(long = "emit-decode-cublaslt-head", env = "PLOW_EMIT_DECODE_CUBLASLT_HEAD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_cublaslt_head: bool,
+
     /// Emit the measured SM90 BF16 prefill projections as packet-declared cuBLASLt segments.
     #[arg(long = "emit-prefill-cublaslt", env = "PLOW_EMIT_PREFILL_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub prefill_cublaslt: bool,
@@ -1400,12 +1443,19 @@ impl EmitConfig {
             no_fuse_nrn: env_bool("PLOW_NO_FUSE_NRN"),
             fuse_hnr: env_bool("PLOW_FUSE_HNR"),
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
+            nv_fa_fold_wide: env_bool_default_true("PLOW_NV_FA_FOLD_WIDE"),
+            nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
+            nv_gemv_k8_b1: env_bool("PLOW_NV_GEMV_K8_B1"),
+            nv_fa_split_prefill: env_bool_default_true("PLOW_NV_FA_SPLIT_PREFILL"),
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),
             moe_combine_blocks: env_u32("PLOW_MOE_COMBINE_BLOCKS"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
             attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
             fa_mmaqk: env_u32("PLOW_FA_MMAQK"),
+            tts_profile: env_str("PLOW_TTS_PROFILE"),
+            tts_codec: env_str("PLOW_TTS_CODEC_DIR").map(std::path::PathBuf::from),
+            tts_vocoder: env_str("PLOW_TTS_VOCODER_DIR").map(std::path::PathBuf::from),
             flash_merge_dsplit: env_u32("PLOW_FLASH_MERGE_DSPLIT"),
             ns_mul: env_u32("PLOW_NS_MUL"),
             ns_abs: env_u32("PLOW_NS_ABS"),
@@ -1600,6 +1650,8 @@ impl EmitConfig {
             qwen_fp8_m1_tma: env_bool("PLOW_QWEN_FP8_M1_TMA"),
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
             decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),
+            decode_cublaslt_min_rows: env_u32("PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS"),
+            decode_cublaslt_head: env_bool("PLOW_EMIT_DECODE_CUBLASLT_HEAD"),
             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
             moe_pf_lt: env_bool("PLOW_EMIT_MOE_PF_LT"),
             moe_dec_lt: env_bool("PLOW_EMIT_MOE_DEC_LT"),
@@ -1727,6 +1779,11 @@ impl EmitConfig {
     /// Resolve the layer truncation from --layers.
     pub fn layer_cfg(&self) -> (bool, Option<u32>, Option<u32>) {
         Self::parse_layers(self.layers.as_deref().unwrap_or("all"))
+    }
+
+    /// Whether a decode rung of `rows` rows takes the cuBLASLt decode route.
+    pub fn decode_cublaslt_at(&self, rows: u32) -> bool {
+        self.decode_cublaslt && rows >= self.decode_cublaslt_min_rows.unwrap_or(1)
     }
 
     /// Whether any fp8 weight encoding is active.

@@ -1574,3 +1574,47 @@ fn kimi_k3_never_builds_as_k2() {
         "a K3 config must not produce an all-softmax (K2-shaped) graph"
     );
 }
+
+// --- Audio networks (the SNAC / S3Gen exports' config.json) ---
+
+const SNAC: &str = r#"{"model_type": "snac", "codebook_size": 4096, "vq_strides": [4, 2, 1],
+  "latent_dim": 768, "blocks": [
+    {"stride": 8, "kernel": 16, "padding": 4, "output_padding": 0, "cin": 1024, "cout": 512, "dilations": [1, 3, 9]},
+    {"stride": 8, "kernel": 16, "padding": 4, "output_padding": 0, "cin": 512, "cout": 256, "dilations": [1, 3, 9]},
+    {"stride": 4, "kernel": 8, "padding": 2, "output_padding": 0, "cin": 256, "cout": 128, "dilations": [1, 3, 9]},
+    {"stride": 2, "kernel": 4, "padding": 1, "output_padding": 0, "cin": 128, "cout": 64, "dilations": [1, 3, 9]}]}"#;
+
+const S3GEN: &str = r#"{"model_type": "chatterbox_s3gen", "vocab": 6561,
+  "upsample": [[8, 16, 4], [5, 11, 3], [3, 7, 2]], "source_downs": [[30, 15, 7], [6, 3, 1], [1, 1, 0]],
+  "source_resblocks": [[7, [1, 3, 5]], [7, [1, 3, 5]], [11, [1, 3, 5]]],
+  "resblocks": [[3, [1, 3, 5]], [7, [1, 3, 5]], [11, [1, 3, 5]], [3, [1, 3, 5]], [7, [1, 3, 5]],
+    [11, [1, 3, 5]], [3, [1, 3, 5]], [7, [1, 3, 5]], [11, [1, 3, 5]]],
+  "n_fft": 16, "harmonics": 9}"#;
+
+#[test]
+fn snac_decodes_2048_samples_per_frame() {
+    let g = build_from_config_json(SNAC).expect("build snac");
+    assert_fully_inferred(&g);
+    assert_eq!(output_shape_str(&g), "[B, 2048*F, 1]");
+    let convs = g.count_ops(|op| matches!(op, nn_graph::Op::Conv1d { .. }));
+    let convt = g.count_ops(|op| matches!(op, nn_graph::Op::ConvTranspose1d { .. }));
+    // stem 2 + per block (noise 1 + 3 units x 2) + head 1; one transposed conv per block.
+    assert_eq!((convs, convt), (2 + 4 * 7 + 1, 4));
+    let snakes = g.count_ops(|op| matches!(op, nn_graph::Op::Act(nn_graph::ActKind::Snake)));
+    assert_eq!(snakes, 4 * 7 + 1);
+}
+
+#[test]
+fn s3gen_encoder_estimator_and_vocoder_shapes() {
+    let g = build_from_config_json(S3GEN).expect("build s3gen");
+    assert_fully_inferred(&g);
+    let shapes: Vec<String> = g
+        .outputs
+        .iter()
+        .map(|&o| g.tensor(o).shape.clone().unwrap().display_with(&g.syms))
+        .collect();
+    // mu, the estimator's velocity, F0, and the STFT-frame post conv (120 frames per mel + 1).
+    assert_eq!(shapes, ["[B, 2*S, 80]", "[B, T, 80]", "[B, T, 1]", "[B, 1 + 120*T, 18]"]);
+    let attention = g.count_ops(|op| matches!(op, nn_graph::Op::Attention { .. }));
+    assert_eq!(attention, 10 + 14 * 4);
+}

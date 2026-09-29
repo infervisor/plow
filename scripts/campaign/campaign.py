@@ -9,6 +9,7 @@
     campaign.py loop    <recipe.toml> [--out DIR] [--profile realtime]
     campaign.py sweep   <recipe.toml> --param KNOB --values V1,V2 [--out DIR]
     campaign.py ledger  <results.csv> --cell NAME --note TEXT [--provisional]
+    campaign.py gate    <recipe.toml> --assets DIR --out DIR [--only K] [--dry-run|--score-only]
 
 The recipe pins everything that decides a number: checkpoint revision, precision, emit
 knobs and flags, object-build gates, serve-side mirrors, and the client protocol. Every
@@ -21,6 +22,7 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 import os
 import shlex
 import shutil
@@ -410,7 +412,37 @@ def run(cmd: list[str], env: dict, log: Path) -> int:
 
 
 def nix(cmd: list[str]) -> list[str]:
+    # A box without nix may run the recipe in an equivalent hand-built shell, but only when asked
+    # explicitly (PLOW_CAMPAIGN_NO_NIX=1); build-record.json records which one ran.
+    if os.environ.get("PLOW_CAMPAIGN_NO_NIX") == "1":
+        return cmd
     return ["nix", "develop", "--command", *cmd]
+
+
+def expand(value: str, out: Path) -> str:
+    """Recipe placeholders: `{out}` (the build dir), `{repo}`, `{env:VAR}`, `{hf:org/name}` (the
+    snapshot of a Hugging Face repo in $HF_HUB_CACHE / $HF_HOME/hub)."""
+    def hf(repo: str) -> str:
+        hub = os.environ.get("HF_HUB_CACHE") or os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
+        snaps = sorted(Path(hub, "models--" + repo.replace("/", "--"), "snapshots").glob("*"))
+        if not snaps:
+            die(f"hf:{repo} is not in {hub}; download it first")
+        return str(snaps[-1])
+    def sub(m: "re.Match") -> str:
+        key = m.group(1)
+        if key == "out":
+            return str(out)
+        if key == "repo":
+            return str(REPO)
+        if key.startswith("env:"):
+            v = os.environ.get(key[4:])
+            if v is None:
+                die(f"recipe needs ${key[4:]}")
+            return v
+        if key.startswith("hf:"):
+            return hf(key[3:])
+        die(f"unknown recipe placeholder {{{key}}}")
+    return re.sub(r"\{([a-z]+(?::[^}]+)?)\}", sub, str(value))
 
 
 def env_with(base: dict, extra: dict) -> dict:
@@ -430,7 +462,18 @@ def cmd_build(a: argparse.Namespace) -> None:
         die(f"{out} exists and is not empty; a build is reproducible only into a fresh dir")
     out.mkdir(parents=True, exist_ok=True)
     log = out / "build.log"
-    plowc = REPO / "target" / "release" / "plowc"
+    cell["hf_dir"] = expand(cell["hf_dir"], out)
+    emit = dict(emit, env={k: expand(v, out) for k, v in emit.get("env", {}).items()},
+                args=[expand(x, out) for x in emit.get("args", [])])
+    # Prep steps (checkpoint reshaping, codec exports) run before the emit, in order.
+    for step in r.get("prep", []):
+        print(f"== prep {step['name']}", file=sys.stderr)
+        py = expand(step.get("python", "{env:PYREF}" if os.environ.get("PYREF") else "python3"), out)
+        cmd = [py, str(REPO / step["script"]), *[expand(x, out) for x in step.get("args", [])]]
+        penv = env_with(os.environ, {k: expand(v, out) for k, v in step.get("env", {}).items()})
+        if run(cmd, penv, log):
+            die(f"prep {step['name']} failed; see build.log")
+    plowc = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release" / "plowc"
     if not plowc.exists():
         die("target/release/plowc missing: nix develop -c cargo build -p plowc --release")
 
@@ -474,6 +517,9 @@ def cmd_build(a: argparse.Namespace) -> None:
         # CLI overrides win over the recipe's role env too, so an A/B can switch a role off.
         if run(nix([*base_args, "--out", str(assets)]), env_with(env_with(common, roles.get("env", {})), overrides), log):
             die("role emit failed; see build.log")
+        # The role emit rebuilds its own cmake cubins (e.g. *_pfpackedseg); the recipe's object wins.
+        for f in objects.get("role_files", []) if objects else []:
+            (assets / f).write_bytes((obj_dir / f).read_bytes())
     else:
         assets = out / "assets"
         print("== emit", file=sys.stderr)
@@ -504,6 +550,8 @@ def cmd_build(a: argparse.Namespace) -> None:
         "object_overrides": object_overrides,
         "commit": git("rev-parse", "HEAD"),
         "dirty": bool(git("status", "--porcelain")),
+        "nix": os.environ.get("PLOW_CAMPAIGN_NO_NIX") != "1",
+        "prep": [s.get("name") for s in r.get("prep", [])],
         "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "hashes": {p.name: sha(p) for p in sorted(assets.glob("*")) if p.is_file() and p.suffix in (".pkt", ".cubin", ".elf", ".co", ".json", ".h")},
         "objects": {p.name: sha(p) for p in sorted((out / "objects").glob("*")) if p.is_file() and p.suffix in (".cubin", ".elf", ".co")} if (out / "objects").exists() else {},
@@ -512,7 +560,8 @@ def cmd_build(a: argparse.Namespace) -> None:
     print(f"built {assets}\nrecord {out / 'build-record.json'}", file=sys.stderr)
     # With the GPU on this box, select the exact-shape cuBLASLt algorithms now and packetize
     # them (leased); without it, plowc has already packetized the tune store's rows.
-    if not a.no_probe and (assets / "build.json").exists() and gpu_matches(cell.get("gpu", "")):
+    # Speech/ASR recipes carry no completion gate to probe against.
+    if not a.no_probe and "gate_prompt" in r.get("bench", {}) and (assets / "build.json").exists() and gpu_matches(cell.get("gpu", "")):
         if (assets / "cublaslt_algos.jsonl").exists():
             print("probe: table already packetized from the tune store; skipping", file=sys.stderr)
         else:
@@ -1108,6 +1157,180 @@ def cmd_sweep(a: argparse.Namespace) -> None:
             print(f"  in={k[0]:<5} C={k[1]:<2} | TTFT: {ttft_s:>9} | TPOT: {tpot_s:>8} | {vs_ref}")
 
 
+# ---------------------------------------------------------------- gate
+# Accuracy gates declared in the recipe's [gates] table, run in one lease and scored uniformly, so
+# every patch is validated the same way. Presets (a [gates.<kind>] table each):
+#   llm_logit_parity  served logprobs vs HF bf16 (scripts/llm/gemma_logit_parity.py): top1_min, kl_mean_max
+#   asr_wer           /v1/audio/transcriptions over a manifest (served_bench.py): wer_max
+#   tts_cer           tts_bench.py --wav arms, Whisper round trip (asr_check.py): cer_median_max, cer_lang_max
+#   s3gen_rel_l2      s3gen.pkt vs torch (s3gen_packet_check.py, packet_run): rel_l2_max
+# Each may set `python` (default [gates].python, else python3), `args` (extra client args) and
+# `timeout_s`. Placeholders as in `build`, plus {assets}, {target} (cargo target dir) and {out}.
+GATE_KINDS = ("llm_logit_parity", "asr_wer", "tts_cer", "s3gen_rel_l2")
+
+
+def gate_steps(kind: str, g: dict, py: str, out: Path, assets: Path) -> tuple[list[str], list[str]]:
+    """(steps while the server is up, steps after it stops); each writes into out/<kind>/."""
+    d = shlex.quote(str(out / kind))
+    q = shlex.quote
+    sc = lambda rel: q(str(REPO / rel))
+    args = " ".join(q(x) for x in g.get("args", []))
+    if kind == "llm_logit_parity":
+        hf = q(g["hf_dir"])
+        return ([f"{q(py)} {sc('scripts/llm/gemma_logit_parity.py')} plow \"$PB_SERVER_PORT\" {hf} {d}/plow.json > {d}/plow.log 2>&1"],
+                [f"{q(py)} {sc('scripts/llm/gemma_logit_parity.py')} hf {hf} {d}/plow.json {d}/hf.json > {d}/hf.log 2>&1",
+                 f"{q(py)} {sc('scripts/llm/gemma_logit_parity.py')} report {d}/plow.json {d}/hf.json > {d}/parity.md 2>&1"])
+    if kind == "asr_wer":
+        return ([f"{q(py)} {sc('scripts/asr/nvidia/served_bench.py')} --url \"http://127.0.0.1:$PB_SERVER_PORT\" "
+                 f"--model \"$MODEL\" --manifest {q(g['manifest'])} --conc {q(str(g.get('conc', '1,16')))} {args} "
+                 f"> {d}/served.jsonl 2>{d}/served.log"], [])
+    if kind == "tts_cer":
+        steps = [f"{q(py)} {sc('scripts/tts/tts_bench.py')} --url \"http://127.0.0.1:$PB_SERVER_PORT\" --model \"$MODEL\" "
+                 f"--out {d} {arm} --tag gate{i} >> {d}/bench.log 2>&1" for i, arm in enumerate(g["arms"])]
+        whisper = f" --model {q(g['whisper'])}" if g.get("whisper") else ""
+        return steps, [f"{q(py)} {sc('scripts/tts/asr_check.py')} {d}/gate*.wav --texts {d}/texts.json --max-cer 1{whisper} "
+                       f"> {d}/asr.txt 2>{d}/asr.log"]
+    if kind == "s3gen_rel_l2":
+        runner = g.get("runner") or os.environ.get("CARGO_TARGET_DIR", str(REPO / "target")) + "/release/examples/packet_run"
+        if not Path(runner).exists():
+            die(f"{runner} missing: cargo build --release -p plowrt --features cuda --example packet_run")
+        return [], [f"{q(py)} {sc('scripts/tts/s3gen_packet_check.py')} --packet {q(str(assets / 's3gen.pkt'))} "
+                    f"--runner {q(runner)} "
+                    f"--out {d} --skip-cer {args} "
+                    f"> {d}/check.log 2>&1"]
+    die(f"unknown gate kind {kind}")
+
+
+def gate_score(kind: str, g: dict, d: Path) -> dict:
+    """{metric: value, ..., "pass": bool, "why": [...]} from the files gate_steps wrote."""
+    txt = lambda name: (d / name).read_text(errors="replace") if (d / name).is_file() else ""
+    res, why = {}, []
+    def lim(metric, value, key, upper=True):
+        res[metric] = value
+        if key in g and value is not None and (value > g[key] if upper else value < g[key]):
+            why.append(f"{metric} {value:.4g} {'>' if upper else '<'} {key} {g[key]}")
+    if kind == "llm_logit_parity":
+        m = re.search(r"all: top1 (\d+)/(\d+) \(([\d.]+)\).*?KL mean ([\d.e+-]+) max ([\d.e+-]+)", txt("parity.md"))
+        if not m:
+            return dict(res, **{"pass": False, "why": ["no report (see plow.log / hf.log)"]})
+        lim("top1", float(m[3]), "top1_min", upper=False)
+        lim("kl_mean", float(m[4]), "kl_mean_max")
+        lim("kl_max", float(m[5]), "kl_max_max")
+    elif kind == "asr_wer":
+        rows = [json.loads(ln) for ln in txt("served.jsonl").splitlines() if ln.startswith("{")]
+        if not rows:
+            return {"pass": False, "why": ["no served_bench rows (see served.log)"]}
+        lim("wer", max(r["wer"] for r in rows), "wer_max")
+        res["errors"] = sum(r["errors"] for r in rows)
+        if res["errors"]:
+            why.append(f"{res['errors']} failed requests")
+    elif kind == "tts_cer":
+        a = txt("asr.txt")
+        m = re.search(r"MEDIAN_CER=([\d.]+) n=(\d+)", a)
+        if not m:
+            return {"pass": False, "why": ["no CER (see bench.log / asr.log)"]}
+        lim("cer_median", float(m[1]), "cer_median_max")
+        res["n"] = int(m[2])
+        langs = {l: float(c) for l, c in re.findall(r"LANG (\S+) median_CER=([\d.]+)", a)}
+        if langs:
+            res["cer_lang"] = langs
+            worst = max(langs, key=langs.get)
+            lim("cer_lang_worst", langs[worst], "cer_lang_max")
+            res["cer_lang_worst_lang"] = worst
+        failed = sum(json.loads(ln).get("failed", 0) for ln in txt("bench.log").splitlines() if ln.startswith("{"))
+        if failed:
+            why.append(f"{failed} failed TTS requests")
+    elif kind == "s3gen_rel_l2":
+        rels = [float(m[1]) for m in re.finditer(r"^\s*(?:rand|t3_)\S*\s+\d+\s.*?\|\s+([\d.e+-]+)", txt("check.log"), re.M)]
+        if not rels:
+            return {"pass": False, "why": ["no numerics rows (see check.log)"]}
+        lim("mel_rel_l2_max", max(rels), "rel_l2_max")
+    res["pass"] = not why
+    res["why"] = why
+    return res
+
+
+def cmd_gate(a: argparse.Namespace) -> None:
+    with open(a.recipe, "rb") as f:
+        r = tomllib.load(f)
+    gates = dict(r.get("gates", {}))
+    kinds = [k for k in GATE_KINDS if k in gates and (not a.only or k in a.only.split(","))]
+    if not kinds:
+        die(f"{a.recipe}: no [gates.<kind>] tables ({', '.join(GATE_KINDS)})")
+    assets = Path(a.assets).resolve()
+    out = Path(a.out).resolve()
+    target = os.environ.get("CARGO_TARGET_DIR", str(REPO / "target"))
+    def x(v):
+        if a.score_only:  # only the thresholds matter; do not demand the run's env or snapshots
+            return v
+        return expand(str(v).replace("{assets}", str(assets)).replace("{target}", target), out)
+    cfg = {k: {kk: ([x(i) for i in vv] if isinstance(vv, list) else x(vv) if isinstance(vv, str) else vv)
+               for kk, vv in gates[k].items()} for k in kinds}
+    if not a.score_only:
+        if not (assets / "model.pkt").exists():
+            die(f"{assets}/model.pkt missing")
+        out.mkdir(parents=True, exist_ok=True)
+        serve = dict(r.get("serve", {}))
+        env = {k: str(v) for k, v in serve.get("env", {}).items()}
+        env.update(dict(kv.split("=", 1) for kv in (a.env or [])))
+        full = env_with(os.environ, env)
+        packet_env(r, assets, full)
+        env.update({k: full[k] for k in ("PLOW_PF_SEG_DIR", "PLOW_LT_ALGOS") if k in full})
+        plowrt = Path(a.plowrt or serve.get("plowrt") or Path(target) / "release" / "plowrt").resolve()
+        shutil.copy2(plowrt, out / "plowrt")
+        lines = ["#!/usr/bin/env bash", "set -u", "source " + shlex.quote(str(REPO / "scripts/bench/plowbench.sh"))]
+        lines += [f"export {k}={shlex.quote(v)}" for k, v in sorted(env.items())]
+        up, down = [], []
+        for k in kinds:
+            (out / k).mkdir(exist_ok=True)
+            py = x(cfg[k].get("python") or gates.get("python") or "python3")
+            s1, s2 = gate_steps(k, cfg[k], py, out, assets)
+            # Like [[prep]].env: a gate's interpreter may need its own environment (CBX_PY must not
+            # see the host PYTHONPATH's packages built for another Python).
+            genv = " ".join(f"{q}={shlex.quote(x(v))}" for q, v in cfg[k].get("env", {}).items())
+            pre = f"env {genv} " if genv else ""
+            tag = lambda step: f"{pre}{step} || echo 'GATE_STEP_FAIL {k}'"
+            up += [tag(s) for s in s1]
+            down += [tag(s) for s in s2]
+        if up:
+            lines += ["PB_SERVER_PORT=$(pb_free_port)",
+                      "PB_SERVER_LOG=" + shlex.quote(str(out / "serve.log")),
+                      "SERVE_EXTRA=(" + " ".join(shlex.quote(v) for v in shlex.split(serve.get("extra_args", ""))) + ")",
+                      "PLOW_HSACO=" + shlex.quote(str(assets)) + " " + shlex.quote(str(out / "plowrt")) +
+                      " serve --assets " + shlex.quote(str(assets)) + ' --port "$PB_SERVER_PORT" "${SERVE_EXTRA[@]}" > "$PB_SERVER_LOG" 2>&1 &',
+                      "PB_SERVER_PID=$!", "trap pb_serve_stop EXIT",
+                      f"pb_serve_wait {int(gates.get('ready_s', 900))} || exit 3", "MODEL=$(pb_model_id)", *up,
+                      "pb_serve_stop"]
+        lines += down
+        (out / "run.sh").write_text("\n".join(lines) + "\n")
+        subprocess.run(["bash", "-n", str(out / "run.sh")], check=True)
+        run_s = int(a.timeout or sum(int(cfg[k].get("timeout_s", 900)) for k in kinds) + 300)
+        cmd = [str(GPULEASE), "-n", "1", a.label or f"gate-{r.get('name', Path(a.recipe).parent.name)}",
+               "timeout", "--kill-after=30s", str(run_s), "bash", str(out / "run.sh")]
+        if a.dry_run:
+            print(shlex.join(cmd))
+            print((out / "run.sh").read_text())
+            return
+        rc = run(cmd, dict(os.environ), out / "gate.log")
+        print(f"gate run rc={rc}; log {out / 'gate.log'}", file=sys.stderr)
+    if not out.is_dir():
+        die(f"{out}: no gate run to score")
+    scores = {k: gate_score(k, cfg[k], out / k) for k in kinds}
+    record = dict(recipe=str(Path(a.recipe).resolve()), recipe_sha256=sha(Path(a.recipe)), assets=str(assets),
+                  commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain")),
+                  utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), gates=scores,
+                  thresholds={k: {kk: v for kk, v in gates[k].items() if kk.endswith(("_min", "_max"))} for k in kinds},
+                  **{"pass": all(v["pass"] for v in scores.values())})
+    (out / "gates.json").write_text(json.dumps(record, indent=1) + "\n")
+    print("| gate | result | metrics | why |\n|---|---|---|---|")
+    for k, v in scores.items():
+        metrics = ", ".join(f"{m}={val:.4g}" if isinstance(val, float) else f"{m}={val}"
+                            for m, val in v.items() if m not in ("pass", "why", "cer_lang"))
+        print(f"| {k} | {'PASS' if v['pass'] else '**FAIL**'} | {metrics} | {'; '.join(v['why'])} |")
+    if not record["pass"]:
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------- ledger
 def cmd_ledger(a: argparse.Namespace) -> None:
     res = Path(a.results).resolve()
@@ -1230,6 +1453,15 @@ def main() -> None:
     sw.add_argument("--out"); sw.add_argument("--profile"); sw.add_argument("--concs"); sw.add_argument("--in-lens")
     sw.add_argument("--reference"); sw.add_argument("--env", action="append", metavar="K=V")
     sw.set_defaults(f=cmd_sweep)
+    ga = sp.add_parser("gate", help="run the recipe's [gates] (accuracy) in one lease and score them")
+    ga.add_argument("recipe"); ga.add_argument("--assets", required=True); ga.add_argument("--out", required=True)
+    ga.add_argument("--only", help="comma-separated gate kinds")
+    ga.add_argument("--plowrt", help="plowrt binary (default [serve].plowrt, else $CARGO_TARGET_DIR/release/plowrt)")
+    ga.add_argument("--env", action="append", metavar="K=V", help="server env override")
+    ga.add_argument("--label"); ga.add_argument("--timeout", type=int, help="run timeout inside the lease, s")
+    ga.add_argument("--dry-run", action="store_true", help="write and print run.sh; no lease")
+    ga.add_argument("--score-only", action="store_true", help="re-score an existing --out dir")
+    ga.set_defaults(f=cmd_gate)
     l = sp.add_parser("ledger"); l.add_argument("results"); l.add_argument("--cell", required=True); l.add_argument("--note", required=True)
     l.add_argument("--provisional", action="store_true"); l.set_defaults(f=cmd_ledger)
     a = p.parse_args()

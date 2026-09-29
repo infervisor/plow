@@ -9,6 +9,7 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_NOP] = g_nop;
     tab[PLOW_DOP_RESIDUAL] = g_residual;
     tab[PLOW_DOP_GLU] = g_glu;
+    tab[PLOW_DOP_GLU_STRIDED] = g_glu_strided;
     tab[PLOW_DOP_SOFTCAP] = g_softcap;
     tab[PLOW_DOP_CAST_F32_BF16] = g_cast_f32_bf16;
     tab[PLOW_DOP_ROW_GATHER] = g_row_gather;
@@ -36,6 +37,7 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_DENSE_GEMM_F32] = g_dense_gemm_f32;
     tab[PLOW_DOP_EMBED_F16_F32] = g_embed_f16_f32;
     tab[PLOW_DOP_EMBED_OVERLAY_BF16] = g_embed_overlay_bf16;
+    tab[PLOW_DOP_EMBED_POS_BF16] = g_embed_pos_bf16;
     tab[PLOW_DOP_LSTM_CELL_F32] = g_lstm_cell_f32;
     tab[PLOW_DOP_ARGMAX_F32] = g_argmax_f32;
     tab[PLOW_DOP_RELU_F32] = g_relu_f32;
@@ -43,6 +45,16 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_CONV2D_F32] = g_conv2d_f32;
     tab[PLOW_DOP_PACK_NCFW_ROWS_F32] = g_pack_ncfw_rows_f32;
     tab[PLOW_DOP_GROUPED_ATTENTION_F32] = g_grouped_attention_f32;
+    tab[PLOW_DOP_GATHER_ROWS_F32] = g_gather_rows_f32;
+    tab[PLOW_DOP_COPY_COLS_F32] = g_copy_cols_f32;
+    tab[PLOW_DOP_CONV1D_F32] = g_conv1d_f32;
+    tab[PLOW_DOP_CONV_TRANSPOSE1D_F32] = g_conv_transpose1d_f32;
+    tab[PLOW_DOP_UNARY_F32] = g_unary_f32;
+    tab[PLOW_DOP_BINARY_F32] = g_binary_f32;
+    tab[PLOW_DOP_CUMSUM_F64] = g_cumsum_f64;
+    tab[PLOW_DOP_RAND_F32] = g_rand_f32;
+    tab[PLOW_DOP_ATTENTION_F32] = g_attention_f32;
+    tab[PLOW_DOP_ROW_STATS_F32] = g_row_stats_f32;
     tab[PLOW_DOP_GEMM] = g_gemm;
     tab[PLOW_DOP_GEMM_F32] = g_gemm_f32;
     tab[PLOW_DOP_GEMM_SMALL] = g_gemm_small;

@@ -38,8 +38,8 @@ use crate::{Result, RuntimeError};
 use packet::ctx_bound::{self, Scaling};
 use packet::dev::DevOp;
 
-/// Below this the emitter's `min(_, ctx)` policy terms stop saturating fast
-/// enough to mean anything: `glm_dsa_select_width` is `min(index_topk, ctx)` and
+/// Below this (indexer packets only) the emitter's `min(_, ctx)` policy terms stop saturating
+/// fast enough to mean anything: `glm_dsa_select_width` is `min(index_topk, ctx)` and
 /// `index_topk` is 2048, so a packet narrowed under it carries a selection width
 /// wider than the cache it selects from.
 const MIN_LIVE_CTX: u32 = 2048;
@@ -47,6 +47,28 @@ const MIN_LIVE_CTX: u32 = 2048;
 /// The bound under which the narrowed packet stops being the packet `plowc`
 /// would have emitted. See the module header.
 const POLICY_SATURATION_CTX: u32 = 16384;
+
+/// A DSA indexer packet (its tensors or ops): the only kind whose selection width ties a floor to
+/// the live bound.
+fn has_indexer(blob: &DevBlob) -> bool {
+    blob.tensors
+        .iter()
+        // Not a bare "index": speech packets carry `in.encoder_overlay_index`.
+        .any(|t| t.name.contains("kidx") || t.name.contains("indexer"))
+        || blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
+            matches!(
+                DevOp::from_u16(d.op),
+                Some(
+                    DevOp::IndexScore
+                        | DevOp::IndexSelect
+                        | DevOp::IndexScorePf
+                        | DevOp::IndexSelectPf
+                        | DevOp::IndexUnionPf
+                        | DevOp::IndexTpPf
+                )
+            )
+        })
+}
 
 /// The context a packet was emitted at, from the only tensor whose extent is
 /// unambiguously it. This is the same derivation `AmdEngine::max_ctx` uses, and
@@ -85,7 +107,7 @@ pub fn rescale(
 
     if want < ceiling {
         // Narrowing checks
-        if want < MIN_LIVE_CTX {
+        if want < MIN_LIVE_CTX && has_indexer(blob) {
             return Err(err(format!(
                 "PLOW_LIVE_CTX={want} is below the {MIN_LIVE_CTX}-token floor: the emitter's \
                  selection width is min(index_topk, ctx) and index_topk is 2048, so a narrower \
@@ -103,26 +125,7 @@ pub fn rescale(
     } else {
         // Widening checks
         // 2.3 Refuse DSA/indexer: NV dense only in v1
-        let has_indexer_tensors = blob
-            .tensors
-            .iter()
-            .any(|t| t.name.contains("kidx") || t.name.contains("index"));
-        let has_indexer_ops = blob.progs.iter().any(|p| {
-            p.insts.iter().any(|d| {
-                matches!(
-                    DevOp::from_u16(d.op),
-                    Some(
-                        DevOp::IndexScore
-                            | DevOp::IndexSelect
-                            | DevOp::IndexScorePf
-                            | DevOp::IndexSelectPf
-                            | DevOp::IndexUnionPf
-                            | DevOp::IndexTpPf
-                    )
-                )
-            })
-        });
-        if has_indexer_tensors || has_indexer_ops {
+        if has_indexer(blob) {
             return Err(err(
                 "PLOW_LIVE_CTX: widening DSA/indexer packets is unsupported in v1 (NV dense only)"
                     .into(),
@@ -649,8 +652,10 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_under_the_selection_width_is_refused() {
+    fn a_bound_under_the_selection_width_is_refused_on_an_indexer_packet() {
+        assert_eq!(narrow(&mut mla_blob(CEILING), 1024).unwrap(), 1024, "no indexer, no floor");
         let mut b = mla_blob(CEILING);
+        b.tensors.push(DevTensor { name: "layers.0.kidx".into(), bytes: 64, init: None });
         let e = narrow(&mut b, 1024).unwrap_err().to_string();
         assert!(e.contains("floor"), "{e}");
     }

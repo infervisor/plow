@@ -23,6 +23,7 @@ fn job(respond: ChunkSender) -> Job {
         },
         arrived: Instant::now(),
         respond,
+        opts: Default::default(),
     }
 }
 

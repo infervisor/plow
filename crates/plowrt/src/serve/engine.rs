@@ -365,6 +365,26 @@ impl ServeEngine {
         }
     }
 
+    /// KV bytes one cache row takes (0: unknown).
+    pub fn kv_row_bytes(&self) -> u64 {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.kv_row_bytes(),
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        }
+    }
+
+    /// Whether a finished sequence's rows survive in its slot for a session's next request.
+    pub fn slot_resume_supported(&self) -> bool {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.slot_resume_supported(),
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
     pub fn prefix_cache_enabled(&self) -> bool {
         match self {
             #[cfg(feature = "cuda")]
