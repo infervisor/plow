@@ -3977,10 +3977,15 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
 }
 #if PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_MIXED_STEP
 /* Gemma's attention side: HeadNormRope and FlashDecode at hd 256 (sliding) and 512 (full), with
- * the interpreter's group factors. Same contract as the light_attn above. */
-extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
-    PLOW_SYM(plow_sm120_light_attn)(const __grid_constant__ PlowLightSpan a) {
-    extern __shared__ float arena[];
+ * the interpreter's group factors. Same contract as the light_attn above. WIDE = false compiles
+ * the hd256 bodies only (light_attn_s, two blocks per SM).
+ * PLOW_NV_FA_GF_LIGHT256: the light hd256 item's head group. A head's arithmetic does not depend
+ * on it; GF 2 gives light_attn_s twice the items of GF 4 (both halves read the KV head). */
+#ifndef PLOW_NV_FA_GF_LIGHT256
+#define PLOW_NV_FA_GF_LIGHT256 (PLOW_NV_FA_GF_HD256 == 4 ? 2 : PLOW_NV_FA_GF_HD256)
+#endif
+template <bool WIDE>
+__device__ __forceinline__ void light_attn_gemma(const PlowLightSpan& a, float* arena) {
     const unsigned first = a.fused ? a.count - 1 : 0;
     if (a.fused) {
         /* Each block first runs, for the rows of its own flash items, the HeadNormRope tasks
@@ -3992,7 +3997,7 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
         const unsigned nblk = fl->blocks ? fl->blocks : gridDim.x, slice = blockIdx.x;
         const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
         const unsigned n_head = fl->i[1], nsplit = fl->i[5];
-        const unsigned GF = fl->i[6] == 256 ? PLOW_NV_FA_GF_HD256 : PLOW_NV_FA_GF_FULL;
+        const unsigned GF = fl->i[6] == 256 ? PLOW_NV_FA_GF_LIGHT256 : PLOW_NV_FA_GF_FULL;
         const unsigned gqa = n_head / fl->i[2], n_grp = n_head / GF;
         const unsigned n_work = fl->i[0] * n_grp * nsplit;
         for (unsigned w = slice; slice < nblk && w < n_work; w += nblk) {
@@ -4023,8 +4028,10 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
                         in->i[6], nullptr, out2, x2, a.x_row[j])
                     if (hd == 256)
                         LIGHT_HNR_ROW(256);
-                    else
+                    else if constexpr (WIDE)
                         LIGHT_HNR_ROW(512);
+                    else
+                        __trap();
 #undef LIGHT_HNR_ROW
                 }
                 task += nt;
@@ -4070,10 +4077,12 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
         const unsigned x_row = a.x_row[i];
         if (in->op == PLOW_DOP_HEADNORM_ROPE && in->i[2] == 256 && in->i[5] == 0) {
             LIGHT_HNR(256);
+        } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == 256 && gqa % PLOW_NV_FA_GF_LIGHT256 == 0) {
+            LIGHT_FLASH(256, PLOW_NV_FA_GF_LIGHT256);
+        } else if constexpr (!WIDE) {
+            __trap();
         } else if (in->op == PLOW_DOP_HEADNORM_ROPE && in->i[2] == 512 && in->i[5] == 0) {
             LIGHT_HNR(512);
-        } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == 256 && gqa % PLOW_NV_FA_GF_HD256 == 0) {
-            LIGHT_FLASH(256, PLOW_NV_FA_GF_HD256);
         } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == 512 && gqa % PLOW_NV_FA_GF_FULL == 0) {
             LIGHT_FLASH(512, PLOW_NV_FA_GF_FULL);
         } else {
@@ -4083,6 +4092,16 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
 #undef LIGHT_HNR
 #undef LIGHT_TEN
     }
+}
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
+    PLOW_SYM(plow_sm120_light_attn)(const __grid_constant__ PlowLightSpan a) {
+    extern __shared__ float arena[];
+    light_attn_gemma<true>(a, arena);
+}
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 2)
+    PLOW_SYM(plow_sm120_light_attn_s)(const __grid_constant__ PlowLightSpan a) {
+    extern __shared__ float arena[];
+    light_attn_gemma<false>(a, arena);
 }
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = 256;
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd2) = 512;

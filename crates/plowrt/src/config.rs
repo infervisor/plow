@@ -1049,6 +1049,12 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "decode-light-flash", env = "PLOW_DECODE_LIGHT_FLASH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub decode_light_flash: bool,
 
+    /// Gemma hd256 light attention levels run `plow_<arch>_light_attn_s` (hd256 bodies only,
+    /// two blocks per SM, twice the blocks): E4B B=64/128 ctx 1024 7.63/9.70 -> 7.56/9.54 ms,
+    /// digests equal. Off: they run `light_attn`, one block per SM.
+    #[arg(long = "decode-light-attn-s", env = "PLOW_DECODE_LIGHT_ATTN_S", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_light_attn_s: bool,
+
     /// A routed decode rung whose unaligned lm_head runs through the light head kernel computes
     /// the greedy argmax there too, and skips the packet's Argmax/ArgmaxFin window.
     #[arg(long = "decode-head-argmax", env = "PLOW_DECODE_HEAD_ARGMAX", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

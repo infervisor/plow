@@ -884,3 +884,53 @@ Tried, not kept:
   fused (B=64 7.71 vs 7.64). It also perturbed the interpreter arena.
 * SIMT split-K kernel for the PLE gate (N 256, K 2560): 19.7 µs with a serial last-block
   reduce, 14.0 µs with a distributed reduce, vs 6.0 µs on Lt. B=64 was +0.36 ms.
+
+### Round 2: sliding attention two blocks per SM, PLE projection on cuBLASLt, served config
+
+Base = 372b9314 (round 1). step_bench ctx 1024; "rung algos" is `PLOW_LT_RUNG_ALGOS=1`, as served.
+
+| B | 1 | 8 | 32 | 48 | 64 | 96 | 128 |
+|---|---|---|---|---|---|---|---|
+| round 1 ms | 5.72 | 6.15 | 8.60 | 7.45 | 7.63 | 9.35 | 9.68 |
+| round 2 ms | 5.72 | 6.15 | 8.59 | 7.29 | 7.52 | 9.10 | 9.52 |
+| + rung algos ms | | | | 7.13-7.16 | 7.42-7.44 | 9.00-9.14 | 9.47 |
+
+Served (same grid; recipe serve env `PLOW_DECODE_PIPELINE`, `PLOW_LT_RUNG_ALGOS`), p50:
+
+| cell | round 1 | round 2 | vLLM |
+|---|---|---|---|
+| c1 TPOT / tok/s | 5.70 / 175 | 5.69 / 175 | 5.70 / 174 |
+| c64 TPOT / tok/s | 7.18 / 8636 | 6.80 / 9169 | 6.80 / 8916 |
+| c128 TPOT / tok/s | 8.86 / 13932 | 8.43 / 14662 | 8.40 / 14088 |
+| c64 / c128 TTFT ms | 91 / 111 | 51 / 80 | 181 / 338 |
+| d64x1024 / d128x1024 tok/s | 5866 / 7828 | 6139 / 8078 | 5866 / 7664 |
+
+E4B logit gate (served config): 0.9845 / 0.9845 / 0.9845 (round 1: 0.9845 x3).
+
+* `plow_light_attn_s`: the sliding layers' HeadNormRope + flash compiled alone (hd256 bodies,
+  `__launch_bounds__(256, 2)`, 128 registers) and launched at twice the blocks, with the light
+  item's head group at 2 (`PLOW_NV_FA_GF_LIGHT256`; per-head arithmetic unchanged, so the
+  digests are too). Sliding layer 36 -> 33 us at B=64, 67 -> 62 us at B=128.
+  `PLOW_DECODE_LIGHT_ATTN_S` (default on) routes it.
+* `PLOW_EMIT_DECODE_CUBLASLT_HEAD` also routes `per_layer_model_projection` (2560 -> 10752) to
+  cuBLASLt: the step's head interpreter window 92 us -> two windows of 19.5 us + a 29 us
+  matmul at B=64. Changes the routed rungs' digests (Lt sum order); gate unchanged.
+* Recipe serve env: the decode pipeline and per-rung Lt algorithms. With rung algos the B<128
+  rungs time their own algorithms at load, so their digests can differ between loads
+  (B=48/96 moved between two runs here); the B=128 template is stable.
+
+B=64 served-config step (7.44 ms span, 0.27 ms gaps), per step: gate|up 1718 us (40 per layer),
+sliding attention 1176 (33.6), down + splitK 1007, light ops 909 (4.3 each), full attention 744
+(106), lm_head 460, other projections ~1000, head windows + logits tail 74.
+
+B=128 (9.50 ms span): sliding 2174 us (62 per layer), full 1424 (203), gate|up 1751, light ops
+1007, down + splitK 1113, lm_head 474. Attention is 3.6 ms of the step against a ~2.8 ms KV-read
+floor (sliding ~45 us, full ~175 us per layer at B=128); 8.5 ms would need ~1 ms more.
+
+Tried, not kept:
+* hd512 layers on a two-per-SM clone at head group 2 (`light_attn_f`): full layer 105 -> 107 us.
+* Both head dims in one two-per-SM kernel: 128 registers with 256 B of stack, B=64 7.80 ms.
+* Three blocks per SM for the sliding clone: 80 registers, spills, B=64 8.37 ms.
+* Head group 2 on the one-per-SM light_attn (hd256 or hd512): B=64 7.95 / 7.86 ms.
+* Warp-per-row NormResidualNorm with batched loads: no change (decode rungs take the block
+  path); NRN costs 3.9 us alone vs 5-7 us in the graph, not explained.

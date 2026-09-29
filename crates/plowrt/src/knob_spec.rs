@@ -510,6 +510,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.lt_rung_algos", Some("PLOW_LT_RUNG_ALGOS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.decode_light", Some("PLOW_DECODE_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_light_flash", Some("PLOW_DECODE_LIGHT_FLASH"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
+    KnobSpec::new("rt.decode_light_attn_s", Some("PLOW_DECODE_LIGHT_ATTN_S"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_head_argmax", Some("PLOW_DECODE_HEAD_ARGMAX"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.prefill_light", Some("PLOW_PREFILL_LIGHT"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_lt_qkv", Some("PLOW_DECODE_LT_QKV"), Layer::Runtime, Domain::Bool, ON, PROMOTED),

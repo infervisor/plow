@@ -426,7 +426,9 @@ fn apply_program(model: &mut Model, index: usize, head: bool) -> Result<Vec<u8>,
             let name = &model.tensors[inst.t[2] as usize].name;
             name.contains(".layers.")
                 || (head
-                    && (name.ends_with("lm_head.weight") || name.ends_with("embed_tokens.weight")))
+                    && (name.ends_with("lm_head.weight")
+                        || name.ends_with("embed_tokens.weight")
+                        || name.ends_with("per_layer_model_projection.weight")))
         };
         if selected
             && (!(1..=plow_asset::segment_roles::CUBLASLT_DECODE_MAX_ROWS).contains(&inst.i[0])

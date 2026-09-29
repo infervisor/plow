@@ -320,6 +320,8 @@ pub(super) struct LightFunctions {
     capmax: Option<KernelFn>,
     /// `plow_<arch>_light_attn`, its arena and the head dims it carries.
     attn: Option<(KernelFn, u32, [u32; 2])>,
+    /// `plow_<arch>_light_attn_s`: the hd256 attention alone, two blocks per SM.
+    attn_s: Option<KernelFn>,
     /// `plow_<arch>_light_head` (unaligned lm_head tail).
     pub(super) head: Option<KernelFn>,
     /// `plow_<arch>_light_flash` (streamed hd128 FlashDecode) and its smem.
@@ -378,7 +380,14 @@ pub(super) fn light_functions(
     } else {
         None
     };
-    Ok(Some(LightFunctions { single, gemma, direct: abi == Some(2), tail, capmax, attn, head, flash, prefill }))
+    let attn_s = match be.get_function(module, &format!("plow_{arch}_light_attn_s")) {
+        Ok(f) if crate::config::RuntimeConfig::get().nv.decode_light_attn_s => {
+            be.set_max_dynamic_smem(f, ATTN_S_SMEM)?;
+            Some(f)
+        }
+        _ => None,
+    };
+    Ok(Some(LightFunctions { single, gemma, direct: abi == Some(2), tail, capmax, attn, attn_s, head, flash, prefill }))
 }
 
 /// Each light-routable interpreter segment of `g`: `(segment, levels)`, a level being a
@@ -822,12 +831,46 @@ pub(super) fn add_light_routes(
             },
             _ => launches,
         };
+        let launches = launches.into_iter().map(|l| sliding(functions, l)).collect();
         routes[*seg] = Some(LibraryRoute::Light(LightRoute {
             be: Arc::clone(be),
             kernarg,
             launches,
             _scratch: fused.and(scratch.cloned()),
         }));
+    }
+}
+
+/// `light_attn_s` arena: the hd256 row-group fold (8 groups x 256 f32 + m/l).
+const ATTN_S_SMEM: u32 = 16 << 10;
+
+/// An hd256 attention launch on `light_attn_s`, at twice the blocks (two per SM).
+fn sliding(functions: &LightFunctions, launch: LightLaunch) -> LightLaunch {
+    let (Some(function), LightKind::Attn(_), Some(span)) = (functions.attn_s, launch.kind, launch.direct.as_ref())
+    else {
+        return launch;
+    };
+    let ops = &span.op[..span.count as usize];
+    let hd256 = ops.iter().all(|o| {
+        let d = &o.d;
+        d.op == DevOp::HeadNormRope as u16 && d.i[2] == 256 || d.op == DevOp::FlashDecode as u16 && d.i[6] == 256
+    });
+    let Some(blocks) = launch.blocks.checked_mul(2).filter(|&b| b <= u32::from(u16::MAX)) else {
+        return launch;
+    };
+    if !hd256 || ops.iter().any(|o| o.d.blocks == 0) {
+        return launch;
+    }
+    let mut span = **span;
+    for o in &mut span.op[..span.count as usize] {
+        o.d.blocks = o.d.blocks.saturating_mul(2);
+    }
+    LightLaunch {
+        function,
+        blocks,
+        smem: ATTN_S_SMEM,
+        direct: Some(Box::new(span)),
+        ..launch
     }
 }
 
