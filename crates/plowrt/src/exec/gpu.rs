@@ -4821,12 +4821,22 @@ impl GpuEngine {
                 .map(|s| u64::from(s.m) * u64::from(s.n & !15) * 2)
                 .max(),
         ) {
-            (Some(function), Some(bytes)) => Some(cublaslt::HeadKernel {
-                be: Arc::clone(&be),
-                function,
-                scratch: Arc::new(be.alloc(0, bytes)?),
-            }),
+            (Some(function), Some(bytes)) => {
+                let rows = u64::from(plow_asset::segment_roles::CUBLASLT_DECODE_MAX_ROWS);
+                let amax = be.alloc(0, rows * 12)?;
+                be.memset_d8(amax.base, 0, (rows * 12) as usize)?;
+                Some(cublaslt::HeadKernel {
+                    be: Arc::clone(&be),
+                    function,
+                    scratch: Arc::new(be.alloc(0, bytes)?),
+                    amax: Some(Arc::new(amax)),
+                })
+            }
             _ => None,
+        };
+        let main_folds = match &cublaslt {
+            Some(lt) => cublaslt::argmax_folds(g, &cublaslt_segments, &devp, lt, head_kernel.as_ref()),
+            None => Vec::new(),
         };
         let qkv_scratch = match main_fusions.iter().map(|f| f.n_total).max() {
             Some(n) => Some(Arc::new(be.alloc(
@@ -4839,7 +4849,7 @@ impl GpuEngine {
             Some(cublaslt::ordered_waits(
                 g,
                 &cublaslt_segments,
-                &cublaslt::light_instructions(&main_light),
+                &[cublaslt::light_instructions(&main_light), cublaslt::fold_instructions(&main_folds)].concat(),
             )?)
         } else if moe_lt_routed {
             let none = vec![None; moe_lt_segments.len()];
@@ -4863,6 +4873,7 @@ impl GpuEngine {
                 &main_fusions,
                 qkv_scratch.as_deref(),
                 head_kernel.as_ref(),
+                &main_folds,
             )?)
         } else if moe_lt_routed {
             let routes = moe_lt::decode_routes(
@@ -4953,6 +4964,7 @@ impl GpuEngine {
                 &main_light,
                 &main_fusions,
                 qkv_scratch.as_ref(),
+                &main_folds,
             );
         }
 
@@ -5003,10 +5015,11 @@ impl GpuEngine {
                         let light = light_functions
                             .as_ref()
                             .map_or_else(Vec::new, |f| cublaslt::light_segments(g, &segments, f));
+                        let folds = cublaslt::argmax_folds(g, &segments, &devp, lt, head_kernel.as_ref());
                         let waits = cublaslt::ordered_waits(
                             g,
                             &segments,
-                            &cublaslt::light_instructions(&light),
+                            &[cublaslt::light_instructions(&light), cublaslt::fold_instructions(&folds)].concat(),
                         )?;
                         let mut insts = g.insts.clone();
                         let fusions = if qkv_scratch.is_some() {
@@ -5025,6 +5038,7 @@ impl GpuEngine {
                             &fusions,
                             qkv_scratch.as_deref(),
                             head_kernel.as_ref(),
+                            &folds,
                         )?;
                         let mut rung = DecodeRung::upload_with_insts(
                             &be,
@@ -5048,6 +5062,7 @@ impl GpuEngine {
                                 &light,
                                 &fusions,
                                 qkv_scratch.as_ref(),
+                                &folds,
                             );
                         }
                         rung.library = Some(cublaslt::CublasLtDecodeGraph::capture(
@@ -9147,6 +9162,7 @@ impl GpuEngine {
                     &[],
                     None,
                     None,
+                    &[],
                 )?
             };
             let mut moe_lt_segments = Vec::new();

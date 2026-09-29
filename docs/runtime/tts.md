@@ -85,6 +85,51 @@ step_bench digest is equal at every rung.
 Served with the same client: c64 9755 -> 11544 and c128 14674 -> 16802 tok/s. Streaming c64 goes
 from 66.1 to 70.8 aps. c1 TPOT is 3.35 -> 3.36 ms. CER median 0 (n=80).
 
+The routed rungs' attention and head, since 0472d5c5 (fused q|k|v, lm_head on cuBLASLt, routes from
+32 rows):
+
+* `PLOW_DECODE_LIGHT_FLASH` (default on) runs a light attention segment's hd128 FlashDecode as
+  `plow_<arch>_light_flash` (`d_flash_decode_stream`). One producer warp streams each block's K/V
+  rows through a 4-stage smem ring (64 rows of K and V per stage) with `cp.async.bulk`, across item
+  boundaries. The eight row-group warps run the row-group body's arithmetic unchanged. The
+  register body keeps ~32 KiB in flight per SM and drains at every item, which leaves short
+  contexts latency-bound.
+* When that segment is the layer's q/k/v HeadNormRope (no norm, no gamma) plus the flash, the one
+  launch also does the HeadNormRope. The producer ropes the item's q rows into the ring and writes
+  the new k/v cache rows, then `fence.proxy.async` before it streams them.
+* `PLOW_DECODE_HEAD_ARGMAX` (default on): the unaligned-lm_head kernel also computes the greedy
+  argmax (the same packed keys) and writes `ids`. The packet's Argmax/ArgmaxFin window launches
+  nothing. The kernel's copy is now 16-byte loads restaged through smem, with the tail dots
+  batching their loads.
+
+Outputs and new KV rows are bit-identical to the row-group body plus separate HeadNormRope
+(`experiments/fa_stream_hnr_bench.cu`). The step_bench token digest is equal at every rung and
+context below.
+
+| hd128, 24/8 heads, stride 2048, us | B=64 ctx 384 | B=128 ctx 384 | B=128 ctx 1024 |
+|---|---|---|---|
+| HeadNormRope + row-group flash | 51.5 | 96.1 | 224.6 |
+| streamed, HeadNormRope folded | 41.3 | 75.7 | 181.4 |
+| KV floor (3.35 TB/s) | 30.1 | 60.1 | 160.3 |
+
+In-model at B=128 ctx 384, per layer: HeadNormRope + flash 7.5 + 96-99 us -> 82.6 us. Per step,
+lm_head tail + Argmax window: 54 + 52 us -> 46 us.
+
+| step_bench ms, ctx 384 / 1024 | B=32 | B=64 | B=128 |
+|---|---|---|---|
+| 0472d5c5 | 4.28 / 5.08 | 4.89 / 6.52 | 6.30 / 9.57 |
+| + streamed flash, HNR fold, head argmax | 4.01 / 4.83 | 4.51 / 6.03 | 5.65 / 8.62 |
+
+Served output tok/s, same client and settings as above:
+
+| | c1 TPOT ms | c64 | c128 | stream c64 aps |
+|---|---|---|---|---|
+| 0472d5c5 | 3.36 | 11928 | 17615 | 71.8 |
+| this | 3.36 | 12871 | 19419 | 77.8 |
+| this, `--decode-pipeline` | | 13307 | 20291 | 75.0 |
+
+CER median 0 (n=80). E4B step_bench digests are unchanged at B=1/64/128.
+
 Voices are the checkpoint's speaker tags (`kavya`, `agastya`, `maitri`, `vinaya`).
 Defaults: temperature 0.4, top_p 0.9, no repetition penalty (device sampling; a
 penalty switches that request to host sampling).

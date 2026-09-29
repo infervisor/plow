@@ -1036,6 +1036,17 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "decode-light", env = "PLOW_DECODE_LIGHT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub decode_light: bool,
 
+    /// A light attention level that is one hd128 FlashDecode (nsplit 1, merge folded) runs the
+    /// streamed body (`plow_<arch>_light_flash`): a producer warp feeds K/V through a smem ring
+    /// across the block's items. Bit-identical to the row-group body.
+    #[arg(long = "decode-light-flash", env = "PLOW_DECODE_LIGHT_FLASH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_light_flash: bool,
+
+    /// A routed decode rung whose unaligned lm_head runs through the light head kernel computes
+    /// the greedy argmax there too, and skips the packet's Argmax/ArgmaxFin window.
+    #[arg(long = "decode-head-argmax", env = "PLOW_DECODE_HEAD_ARGMAX", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_head_argmax: bool,
+
     /// A routed decode rung's q, k and v projections run as one cuBLASLt matmul when their
     /// weights are contiguous and a light attention launch reads the three outputs.
     #[arg(long = "decode-lt-qkv", env = "PLOW_DECODE_LT_QKV", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

@@ -28,6 +28,9 @@ pub(super) struct HeadKernel {
     pub(super) be: Arc<CudaBackend>,
     pub(super) function: KernelFn,
     pub(super) scratch: Arc<DeviceMem>,
+    /// Zeroed per-row argmax state for a folded Argmax/ArgmaxFin: `best` u64 then `ctr` u32,
+    /// `CUBLASLT_DECODE_MAX_ROWS` each. The kernel re-zeroes what it uses.
+    pub(super) amax: Option<Arc<DeviceMem>>,
 }
 
 struct HeadTail {
@@ -36,6 +39,76 @@ struct HeadTail {
     n: u32,
     k: u32,
     n0: u32,
+    /// The folded ArgmaxFin's ids, or 0.
+    ids: u64,
+}
+
+/// A decode segment holding only the lm_head's greedy Argmax + ArgmaxFin, computed by the head
+/// kernel instead (`plow_<arch>_light_head` with ids): the segment launches nothing.
+#[derive(Clone, Copy)]
+pub(super) struct ArgmaxFold {
+    segment: usize,
+    head_segment: usize,
+    argmax: usize,
+    fin: usize,
+    ids: u64,
+}
+
+/// An lm_head `segment` that cuBLASLt serves through the head kernel (see HeadTail).
+fn head_tail(segment: &DecodeSegment, backend: &ProjectionBackend, head: Option<&HeadKernel>) -> Option<HeadKernel> {
+    head.filter(|_| segment.n % 16 != 0 && segment.n > 16 && matches!(backend, ProjectionBackend::Lt(_)))
+        .filter(|h| u64::from(segment.m) * u64::from(segment.n & !15) * 2 <= h.scratch.len)
+        .cloned()
+}
+
+/// The Argmax/ArgmaxFin segments of `g` that directly follow a head-kernel lm_head and read
+/// exactly its logits.
+pub(super) fn argmax_folds(
+    g: &DevProg,
+    segments: &[Option<DecodeSegment>],
+    devp: &[DeviceMem],
+    backend: &ProjectionBackend,
+    head: Option<&HeadKernel>,
+) -> Vec<ArgmaxFold> {
+    if !crate::config::RuntimeConfig::get().nv.decode_head_argmax || head.is_none_or(|h| h.amax.is_none()) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        let Some(segment) = segment else { continue };
+        if head_tail(segment, backend, head).is_none()
+            || segment.m > plow_asset::segment_roles::CUBLASLT_DECODE_MAX_ROWS
+            || segments.get(index + 1).copied().flatten().is_some()
+            || index + 2 >= g.gq_seg_ofs.len()
+        {
+            continue;
+        }
+        let seg = index + 1;
+        let mut insts: Vec<usize> = Vec::new();
+        for e in &g.gq_stream[g.gq_seg_ofs[seg] as usize..g.gq_seg_ofs[seg + 1] as usize] {
+            if !insts.contains(&(e.inst as usize)) {
+                insts.push(e.inst as usize);
+            }
+        }
+        let [a, f] = insts[..] else { continue };
+        let (h, da, df) = (&g.insts[segment.instruction], &g.insts[a], &g.insts[f]);
+        if da.op == DevOp::Argmax as u16
+            && df.op == DevOp::ArgmaxFin as u16
+            && da.t[1] == h.t[0]
+            && da.i[0] == segment.n
+            && da.i[1] == segment.m
+            && df.t[1] == da.t[0]
+            && df.i[1] == segment.m
+        {
+            out.push(ArgmaxFold { segment: seg, head_segment: index, argmax: a, fin: f, ids: devp[df.t[0] as usize].base });
+        }
+    }
+    out
+}
+
+/// `(segment, instruction)` of every instruction a folded argmax segment skips.
+pub(super) fn fold_instructions(folds: &[ArgmaxFold]) -> Vec<(usize, usize)> {
+    folds.iter().flat_map(|f| [(f.segment, f.argmax), (f.segment, f.fin)]).collect()
 }
 
 impl CublasLtDecodeRoute {
@@ -47,6 +120,14 @@ impl CublasLtDecodeRoute {
         self.plan.run(self.input, self.weight, scratch, stream)?;
         let (mut c, mut x, mut w, mut src) = (self.output, self.input, self.weight, scratch);
         let (mut n, mut k, mut n0) = (tail.n, tail.k, tail.n0);
+        let (mut ids, mut best, mut ctr) = match (&tail.kernel.amax, tail.ids) {
+            (Some(amax), ids) if ids != 0 => (
+                ids,
+                amax.base,
+                amax.base + 8 * u64::from(plow_asset::segment_roles::CUBLASLT_DECODE_MAX_ROWS),
+            ),
+            _ => (0, 0, 0),
+        };
         let mut params = [
             &mut c as *mut u64 as *mut std::ffi::c_void,
             &mut x as *mut u64 as *mut std::ffi::c_void,
@@ -55,6 +136,9 @@ impl CublasLtDecodeRoute {
             &mut n as *mut u32 as *mut std::ffi::c_void,
             &mut k as *mut u32 as *mut std::ffi::c_void,
             &mut n0 as *mut u32 as *mut std::ffi::c_void,
+            &mut ids as *mut u64 as *mut std::ffi::c_void,
+            &mut best as *mut u64 as *mut std::ffi::c_void,
+            &mut ctr as *mut u64 as *mut std::ffi::c_void,
         ];
         tail.kernel
             .be
@@ -104,14 +188,24 @@ pub(super) struct LightX {
     col: [u32; 3],
 }
 
+/// Which light kernel a launch runs, with its extra parameters.
+#[derive(Clone, Copy)]
+enum LightKind {
+    /// The one-instruction `plow_<arch>_light`.
+    Single,
+    /// `light_attn` over this many instructions.
+    Attn(u32),
+    /// `light_flash`: the q, k, v HeadNormRope instructions it folds in, or all `!0`.
+    Flash([u32; 4]),
+}
+
 struct LightLaunch {
     function: KernelFn,
     xs: LightX,
-    /// `None`: the one-instruction `plow_<arch>_light` kernel; `Some(n)`: `light_attn` over
-    /// `n` instructions from `instruction`.
-    count: Option<u32>,
+    kind: LightKind,
     instruction: u32,
     blocks: u32,
+    block: u32,
     smem: u32,
 }
 
@@ -120,19 +214,29 @@ impl LightRoute {
         for launch in &self.launches {
             let mut arg = self.kernarg;
             let mut instruction = launch.instruction;
-            let mut count = launch.count.unwrap_or(0);
+            let (mut count, mut hnr) = match launch.kind {
+                LightKind::Attn(n) => (n, [0; 4]),
+                LightKind::Flash(h) => (0, h),
+                LightKind::Single => (0, [0; 4]),
+            };
             let mut xs = launch.xs;
             let mut params = [
                 &mut arg as *mut DevProgram as *mut std::ffi::c_void,
                 &mut instruction as *mut u32 as *mut std::ffi::c_void,
-                &mut count as *mut u32 as *mut std::ffi::c_void,
+                match launch.kind {
+                    LightKind::Flash(_) => &mut hnr as *mut [u32; 4] as *mut std::ffi::c_void,
+                    _ => &mut count as *mut u32 as *mut std::ffi::c_void,
+                },
                 &mut xs as *mut LightX as *mut std::ffi::c_void,
             ];
-            let params = if launch.count.is_some() { &mut params[..] } else { &mut params[..2] };
+            let params = match launch.kind {
+                LightKind::Single => &mut params[..2],
+                _ => &mut params[..],
+            };
             self.be.launch_kernel(
                 launch.function,
                 launch.blocks,
-                BLOCK,
+                launch.block,
                 launch.smem,
                 params,
                 Some(stream),
@@ -149,7 +253,12 @@ pub(super) struct LightFunctions {
     attn: Option<(KernelFn, u32, u32)>,
     /// `plow_<arch>_light_head` (unaligned lm_head tail).
     pub(super) head: Option<KernelFn>,
+    /// `plow_<arch>_light_flash` (streamed hd128 FlashDecode) and its smem.
+    flash: Option<(KernelFn, u32)>,
 }
+
+/// `FA_ST_THREADS`: eight row-group warps and the producer warp.
+const FLASH_BLOCK: u32 = BLOCK + 32;
 
 /// The light kernels of the decode object `module` (`<stem>` = `interp_<arch>`), when it has
 /// them and `PLOW_DECODE_LIGHT` is on. `smem` = the object's arena, which `light_attn` takes.
@@ -175,7 +284,15 @@ pub(super) fn light_functions(
         _ => None,
     };
     let head = be.get_function(module, &format!("plow_{arch}_light_head")).ok();
-    Ok(Some(LightFunctions { single, attn, head }))
+    let flash = match be.module_global_u32(module, "plow_light_flash_smem")? {
+        Some(bytes) if crate::config::RuntimeConfig::get().nv.decode_light_flash => {
+            let f = be.get_function(module, &format!("plow_{arch}_light_flash"))?;
+            be.set_max_dynamic_smem(f, bytes)?;
+            Some((f, bytes))
+        }
+        _ => None,
+    };
+    Ok(Some(LightFunctions { single, attn, head, flash }))
 }
 
 /// Each light-routable interpreter segment of `g`: `(segment, levels)`, a level being a
@@ -343,6 +460,74 @@ pub(super) fn qkv_fusions(
     out
 }
 
+/// A merge-folded hd128 FlashDecode the streamed `light_flash` body serves: nsplit 1, no window,
+/// no ring wrap.
+fn streamed_flash(d: &DevInst64) -> bool {
+    d.op == DevOp::FlashDecode as u16
+        && d.i[6] == 128
+        && d.i[5] == 1
+        && d.i[4] == 0
+        && d.i[7] == u32::MAX
+        && d.fj[2] != 0
+}
+
+/// A light attention segment `light_flash` runs whole: one level of the q, k and v HeadNormRope
+/// (no norm, no gamma, hd128, per-sequence KV rows at `pos`), then a streamed FlashDecode that
+/// reads exactly their outputs and is the only reader of the roped q. Returns the flash
+/// instruction and the q, k, v instructions.
+fn folded_hnr(g: &DevProg, levels: &[(usize, usize)]) -> Option<(usize, [u32; 4])> {
+    let [(lo, 3), (fi, 1)] = levels[..] else { return None };
+    let f = &g.insts[fi];
+    let none = packet::dev::TENSOR_NONE16;
+    if !streamed_flash(f) || f.t[6] != none {
+        return None;
+    }
+    let (mut q, mut k, mut v) = (None, None, None);
+    for i in lo..lo + 3 {
+        let d = &g.insts[i];
+        if d.op != DevOp::HeadNormRope as u16
+            || d.i[2] != 128
+            || d.i[4] != 1
+            || d.i[5] != 0
+            || d.i[7] != 0
+            || d.t[2] != none
+            || d.i[0] != f.i[0]
+        {
+            return None;
+        }
+        match (d.fj[1] != 0, d.t[3] != none) {
+            (false, true) => q = Some(i),
+            (true, true) => k = Some(i),
+            (true, false) => v = Some(i),
+            _ => return None,
+        }
+    }
+    let (q, k, v) = (q?, k?, v?);
+    let [dq, dk, dv] = [&g.insts[q], &g.insts[k], &g.insts[v]];
+    let kv_ok = |d: &DevInst64| {
+        d.i[1] == f.i[2] && d.i[6] == f.i[0] && d.fj[1] == f.i[3] && d.fj[2] == u32::MAX && d.t[5] == dq.t[5]
+    };
+    let q_out = dq.t[0];
+    // Nothing but the flash reads the roped q before it is next written.
+    let sole = g.insts[q + 1..]
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (q + 1 + i, d))
+        .take_while(|(_, d)| d.t[0] != q_out)
+        .all(|(i, d)| i == fi || !d.t[1..].contains(&q_out));
+    let ok = dq.t[0] == f.t[2]
+        && dk.t[0] == f.t[3]
+        && dv.t[0] == f.t[4]
+        && dq.i[1] == f.i[1]
+        && dq.i[3] == 0
+        && dq.fj[1] == 0
+        && dk.t[3..6] == dq.t[3..6]
+        && kv_ok(dk)
+        && kv_ok(dv)
+        && sole;
+    ok.then_some((fi, [q as u32, k as u32, v as u32, 0]))
+}
+
 /// Replace each light segment's (empty) route with its launches.
 pub(super) fn add_light_routes(
     routes: &mut Vec<Option<LibraryRoute>>,
@@ -353,7 +538,19 @@ pub(super) fn add_light_routes(
     light: &[(usize, Vec<(usize, usize)>)],
     fusions: &[QkvFusion],
     scratch: Option<&Arc<DeviceMem>>,
+    folds: &[ArgmaxFold],
 ) {
+    for fold in folds {
+        if routes.len() <= fold.segment {
+            routes.resize_with(fold.segment + 1, || None);
+        }
+        routes[fold.segment] = Some(LibraryRoute::Light(LightRoute {
+            be: Arc::clone(be),
+            kernarg,
+            launches: Vec::new(),
+            _scratch: None,
+        }));
+    }
     for (seg, levels) in light {
         let fused = fusions.iter().find(|f| f.segment + 3 == *seg).zip(scratch).map(|(f, s)| {
             LightX {
@@ -364,35 +561,56 @@ pub(super) fn add_light_routes(
         if routes.len() <= *seg {
             routes.resize_with(seg + 1, || None);
         }
-        let launches = levels
-            .iter()
-            .enumerate()
-            .map(|(level, &(inst, n))| {
-                let xs = fused.filter(|_| level == 0).unwrap_or_default();
-                let blocks = (inst..inst + n.max(1))
-                    .map(|i| u32::from(g.insts[i].blocks))
-                    .max()
-                    .unwrap_or(1);
-                match (n, functions.attn) {
-                    (n, Some((function, smem, _))) if n > 0 => LightLaunch {
-                        function,
-                        xs,
-                        count: Some(n as u32),
-                        instruction: inst as u32,
-                        blocks,
-                        smem,
-                    },
-                    _ => LightLaunch {
-                        function: functions.single,
-                        xs,
-                        count: None,
-                        instruction: inst as u32,
-                        blocks,
-                        smem: 0,
-                    },
-                }
+        let flash = |inst: usize, xs: LightX, hnr: [u32; 4]| {
+            functions.flash.filter(|_| streamed_flash(&g.insts[inst])).map(|(function, smem)| LightLaunch {
+                function,
+                xs,
+                kind: LightKind::Flash(hnr),
+                instruction: inst as u32,
+                blocks: u32::from(g.insts[inst].blocks),
+                block: FLASH_BLOCK,
+                smem,
             })
-            .collect();
+        };
+        let folded = folded_hnr(g, levels)
+            .and_then(|(inst, hnr)| flash(inst, fused.unwrap_or_default(), hnr));
+        let launches = match folded {
+            Some(launch) => vec![launch],
+            None => levels
+                .iter()
+                .enumerate()
+                .map(|(level, &(inst, n))| {
+                    let xs = fused.filter(|_| level == 0).unwrap_or_default();
+                    let blocks = (inst..inst + n.max(1))
+                        .map(|i| u32::from(g.insts[i].blocks))
+                        .max()
+                        .unwrap_or(1);
+                    if let Some(launch) = flash(inst, xs, [!0; 4]).filter(|_| n == 1) {
+                        return launch;
+                    }
+                    match (n, functions.attn) {
+                        (n, Some((function, smem, _))) if n > 0 => LightLaunch {
+                            function,
+                            xs,
+                            kind: LightKind::Attn(n as u32),
+                            instruction: inst as u32,
+                            blocks,
+                            block: BLOCK,
+                            smem,
+                        },
+                        _ => LightLaunch {
+                            function: functions.single,
+                            xs,
+                            kind: LightKind::Single,
+                            instruction: inst as u32,
+                            blocks,
+                            block: BLOCK,
+                            smem: 0,
+                        },
+                    }
+                })
+                .collect(),
+        };
         routes[*seg] = Some(LibraryRoute::Light(LightRoute {
             be: Arc::clone(be),
             kernarg,
@@ -593,6 +811,7 @@ pub(super) fn prepare_routes(
     fusions: &[QkvFusion],
     scratch: Option<&DeviceMem>,
     head: Option<&HeadKernel>,
+    folds: &[ArgmaxFold],
 ) -> Result<Vec<Option<CublasLtDecodeRoute>>> {
     let mut routes: Vec<Option<CublasLtDecodeRoute>> = Vec::new();
     if segments.is_empty() {
@@ -630,10 +849,11 @@ pub(super) fn prepare_routes(
             continue;
         };
         // An lm_head with an unaligned vocab: cuBLASLt serves its aligned columns (see HeadTail).
-        let tail = head
-            .filter(|_| segment.n % 16 != 0 && segment.n > 16 && matches!(backend, ProjectionBackend::Lt(_)))
-            .filter(|h| u64::from(segment.m) * u64::from(segment.n & !15) * 2 <= h.scratch.len)
-            .cloned();
+        let tail = head_tail(&segment, backend, head);
+        let fold = folds.iter().find(|f| f.head_segment == index);
+        if fold.is_some() && tail.is_none() {
+            return Err(RuntimeError::Rejected("folded argmax without its head kernel".into()));
+        }
         let key = (
             segment.m,
             if tail.is_some() { segment.n & !15 } else { segment.n },
@@ -771,6 +991,7 @@ pub(super) fn prepare_routes(
                 n: segment.n,
                 k: segment.k,
                 n0: key.1,
+                ids: fold.map_or(0, |f| f.ids),
             }),
         }));
         index += 1;

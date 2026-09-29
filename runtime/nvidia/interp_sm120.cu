@@ -3709,31 +3709,132 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
     }
 }
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = PLOW_NV_FA_HD;
+#if PLOW_NV_FA_HD == 128 && PLOW_NV_FA_RG && PLOW_NV_FA_RG_U == 4
+/* A light attention segment's merge-folded hd128 FlashDecode (nsplit 1, no window, no ring wrap)
+ * on the streamed body, bit-identical to the row-group one (d_flash_decode_stream). `hnr[0..3]`
+ * = the q, k, v HeadNormRope instructions it folds in (~0u: none, Q is already roped); their x
+ * may be a fused q|k|v row (`xs`, as in light_attn). */
+extern "C" __global__ void __launch_bounds__(FA_ST_THREADS, 1)
+    PLOW_SYM(plow_sm120_light_flash)(PlowProgram prog, unsigned inst, uint4 hnr, PlowLightX xs) {
+    extern __shared__ __align__(128) unsigned char st_arena[];
+    void* const* T = prog.tensors;
+#define LIGHT_TEN(in, k) ((in)->t[k] == PLOW_TENSOR_NONE ? nullptr : T[(in)->t[k]])
+    const PlowDevInst* in = prog.insts + inst;
+    const unsigned fold = in->fj[2].u;
+    if (in->op != PLOW_DOP_FLASH_DECODE || in->i[6] != 128u || in->i[5] != 1u || in->i[4] != 0u ||
+        in->i[7] != 0xFFFFFFFFu || !fold || (in->i[1] / in->i[2]) % PLOW_NV_FA_GF != 0)
+        __trap();
+    FaStHnr h{};
+    if (hnr.x != ~0u) {
+        const unsigned ids[3] = {hnr.x, hnr.y, hnr.z};
+        const __nv_bfloat16* x[3];
+        unsigned row[3];
+        for (int j = 0; j < 3; j++) {
+            const PlowDevInst* hi = prog.insts + ids[j];
+            x[j] = (const __nv_bfloat16*)LIGHT_TEN(hi, 1);
+            row[j] = hi->i[1] * 128u;
+            for (int c = 0; c < 3; c++)
+                if (xs.base && xs.inst[c] == ids[j]) {
+                    x[j] = (const __nv_bfloat16*)xs.base + xs.col[c];
+                    row[j] = xs.row;
+                }
+        }
+        const PlowDevInst* hq = prog.insts + hnr.x;
+        h = FaStHnr{x[0], x[1], x[2], row[0], row[1], row[2], (const float*)LIGHT_TEN(hq, 3),
+                    (const float*)LIGHT_TEN(hq, 4), (const int*)LIGHT_TEN(hq, 5)};
+    }
+    d_flash_decode_stream<128, PLOW_NV_FA_GF>(
+        (__nv_bfloat16*)T[fold & 0xFFFFu], (const __nv_bfloat16*)LIGHT_TEN(in, 2),
+        (__nv_bfloat16*)LIGHT_TEN(in, 3), (__nv_bfloat16*)LIGHT_TEN(in, 4), (const int*)LIGHT_TEN(in, 5),
+        (const int*)LIGHT_TEN(in, 6), in->i[0], in->i[1], in->i[2], in->i[3], in->fj[0].f, blockIdx.x,
+        gridDim.x, st_arena, h);
+#undef LIGHT_TEN
+}
+extern "C" __device__ unsigned PLOW_SYM(plow_light_flash_smem) = FA_ST_SMEM_BYTES(128);
+#endif
 #endif
 /* An lm_head whose vocab N is not a multiple of 16 (Veena: 156951), after cuBLASLt ran its first
  * n0 = N & ~15 columns into `src` (pitch n0): copy them into C (pitch N) and compute the last
- * N - n0 columns here. Grid = M x 8 blocks; chunk 0 of each row also does the tail dots. */
+ * N - n0 columns here. Grid = M x 8 blocks; chunk 0 of each row also does the tail dots.
+ * `ids` non-null: also the greedy argmax the packet's Argmax/ArgmaxFin pair would compute (same
+ * packed keys, so the same token): each block folds its chunk into best[row], and the row's last
+ * block writes ids[row] and re-zeroes best/ctr for the next launch. */
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
     PLOW_SYM(plow_sm120_light_head)(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                                     const __nv_bfloat16* __restrict__ W,
                                     const __nv_bfloat16* __restrict__ src, unsigned N, unsigned K,
-                                    unsigned n0) {
+                                    unsigned n0, int* __restrict__ ids,
+                                    unsigned long long* __restrict__ best, unsigned* __restrict__ ctr) {
+    __shared__ unsigned long long lds[PLOW_NV_WARPS];
+    /* C's rows are only 2-byte aligned (odd N): 16-byte loads from src, restaged through smem
+     * so each store instruction writes 64 contiguous bytes. */
+    __shared__ __align__(16) __nv_bfloat16 stage[PLOW_NV_WARPS][256];
     const unsigned r = blockIdx.x >> 3, c = blockIdx.x & 7u;
-    const unsigned lo = (unsigned)((unsigned long long)n0 * c / 8u);
-    const unsigned hi = (unsigned)((unsigned long long)n0 * (c + 1u) / 8u);
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const unsigned nv = n0 / 8u;
+    const unsigned lo = (unsigned)((unsigned long long)nv * c / 8u);
+    const unsigned hi = (unsigned)((unsigned long long)nv * (c + 1u) / 8u);
     const __nv_bfloat16* s = src + (size_t)r * n0;
     __nv_bfloat16* d = C + (size_t)r * N;
-    for (unsigned j = lo + threadIdx.x; j < hi; j += PLOW_NV_THREADS) d[j] = s[j];
-    if (c != 0) return;
-    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
-    for (unsigned j = n0 + warp; j < N; j += PLOW_NV_THREADS / 32u) {
-        const __nv_bfloat16* w = W + (size_t)j * K;
-        const __nv_bfloat16* xr = x + (size_t)r * K;
-        float acc = 0.0f;
-        for (unsigned k = lane; k < K; k += 32u)
-            acc = fmaf(__bfloat162float(xr[k]), __bfloat162float(w[k]), acc);
-        acc = warp_sum32(acc);
-        if (lane == 0) d[j] = __float2bfloat16(acc);
+    unsigned long long bk = 0;
+    for (unsigned base = lo + warp * 32u; base < hi; base += PLOW_NV_THREADS) {
+        const unsigned iv = base + lane;
+        if (iv < hi) {
+            bf16v8 v;
+            *(uint4*)&v = __ldcs((const uint4*)(s + (size_t)iv * 8u));
+            *(uint4*)&stage[warp][lane * 8u] = *(const uint4*)&v;
+            if (ids) {
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const unsigned long long p = amax_pack(v.x[j], iv * 8u + (unsigned)j);
+                    bk = p > bk ? p : bk;
+                }
+            }
+        }
+        __syncwarp();
+        const unsigned n = min(256u, (hi - base) * 8u);
+#pragma unroll
+        for (unsigned k = 0; k < 8u; k++)
+            if (k * 32u + lane < n) d[base * 8u + k * 32u + lane] = stage[warp][k * 32u + lane];
+        __syncwarp();
+    }
+    if (c == 0) {
+        for (unsigned j = n0 + warp; j < N; j += PLOW_NV_THREADS / 32u) {
+            const __nv_bfloat16* w = W + (size_t)j * K;
+            const __nv_bfloat16* xr = x + (size_t)r * K;
+            float acc = 0.0f;
+            /* batches of 16 loads ahead of the (unchanged, sequential) fma chain */
+            unsigned k = lane;
+            for (; k + 15u * 32u < K; k += 16u * 32u) {
+                __nv_bfloat16 xv[16], wv[16];
+#pragma unroll
+                for (int u = 0; u < 16; u++) {
+                    xv[u] = xr[k + u * 32u];
+                    wv[u] = w[k + u * 32u];
+                }
+#pragma unroll
+                for (int u = 0; u < 16; u++) acc = fmaf(__bfloat162float(xv[u]), __bfloat162float(wv[u]), acc);
+            }
+            for (; k < K; k += 32u) acc = fmaf(__bfloat162float(xr[k]), __bfloat162float(w[k]), acc);
+            acc = warp_sum32(acc);
+            const __nv_bfloat16 h = __float2bfloat16(acc);
+            if (lane == 0) {
+                d[j] = h;
+                const unsigned long long p = amax_pack(h, j);
+                bk = p > bk ? p : bk;
+            }
+        }
+    }
+    if (!ids) return;
+    bk = block_max_u64(bk, lds);
+    if (threadIdx.x == 0) {
+        atomicMax(best + r, bk);
+        __threadfence();
+        if (atomicAdd(ctr + r, 1u) == 7u) {
+            const unsigned long long f = atomicExch(best + r, 0ull);
+            ids[r] = (int)~(unsigned)(f & 0xFFFFFFFFull);
+            ctr[r] = 0u;
+        }
     }
 }
 extern "C" __device__ unsigned PLOW_SYM(plow_light_abi) = 1;
