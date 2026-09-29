@@ -369,3 +369,42 @@ with 66/2,062 errors (3.201% WER). Qwen cohorts contain up to four recordings; N
 sequential. The earlier 40.156 s Qwen legacy-executor result and 12.686 s NeMo-Speech
 result remain local controls. These development-subset results share the same manifest and
 scorer but are not a published-benchmark or state-of-the-art claim.
+
+## H100 single-request latency (Qwen3-ASR 1.7B, sm90a tp1)
+
+c1 timeline for a typical manifest clip (server debug log medians over 73 clips, nsys for the GPU split):
+
+| phase | time |
+|---|---|
+| HTTP + client | ~2.5 ms |
+| feature extraction (CPU) | 1.2–1.3 ms |
+| audio encoder | ~6.2 ms (conv front end 1.9 ms, then 22 × ~180 µs) |
+| prefill + first token | 4.7 ms (prefill span 4.33 ms, lm_head 0.38 ms) |
+| decode | ~20 × 2.12 ms (2.08 ms kernel + ~45 µs host gap) ≈ 42 ms |
+
+Decode sets the latency. At B=1 the step reads 3.44 GB of bf16 weights, a 1.03 ms floor at 3.35 TB/s.
+The measured 2.10 ms reaches 49% of that. The interpreter skeleton (all gates and signals, no bodies)
+costs 0.58 ms by itself. A 42 ms c1 target would need ≤1.37 ms per step.
+
+`PLOW_NV_GEMV_K8_B1` (on in the recipe) sends the one-row decode rung through the `gemv_k8` walk, with
+two k32 steps in flight (`gemv_k8_min` 1, `gemv_k8_unb1` 2).
+- step_bench ctx 128: B=1/2/4 2.105/2.086/2.100 → 2.005/2.042/2.042 ms, B=8/16 unchanged.
+- Token digests are unchanged.
+- Served, two interleaved runs:
+
+| | c1 p50 | c1 p90 | c64 RTFx | c128 RTFx | WER |
+|---|---|---|---|---|---|
+| before | 56.9 ms | 100.3 ms | 693 | 749 | 3.913% |
+| after | 55.2 ms | 96.5 ms | 728 | 758 | 3.913% |
+
+These made no gain at B=1:
+- unroll 4/6/16
+- L2 prefetch off or 128K
+- `PLOW_GEMV_PREFETCH`
+- scheduler off
+- gate sleep 0
+- claim-ahead GQ scheduling (2.0 → 3.0 ms)
+- prefill graph pieces
+- segment class slicing
+- folding each AddNorm into its consuming GEMV (−17 µs at B=1; the per-block norm staging costs
+  about as much as the phases it removes, and removing AddNorm outright only bounds the gain at 165 µs)

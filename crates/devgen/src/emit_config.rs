@@ -294,6 +294,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NV_FA_MMA_HD128", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub nv_fa_mma_hd128: bool,
 
+    /// NVIDIA hd <= 128 dense packets: the one-row decode rung also takes the `gemv_k8` walk, with
+    /// two k32 steps in flight on its one-tile arm (`gemv_k8_min` 1, `gemv_k8_unb1` 2).
+    #[arg(long, env = "PLOW_NV_GEMV_K8_B1", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_gemv_k8_b1: bool,
+
     /// sm_90a v3 flash prefill splits the KV of launches with few items across CTAs (riders,
     /// short session suffixes) through the `fa_ws` workspace.
     #[arg(long, env = "PLOW_NV_FA_SPLIT_PREFILL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1440,6 +1445,7 @@ impl EmitConfig {
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
             nv_fa_fold_wide: env_bool_default_true("PLOW_NV_FA_FOLD_WIDE"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
+            nv_gemv_k8_b1: env_bool("PLOW_NV_GEMV_K8_B1"),
             nv_fa_split_prefill: env_bool_default_true("PLOW_NV_FA_SPLIT_PREFILL"),
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fuse_kv_hnr: env_bool("PLOW_FUSE_KV_HNR"),

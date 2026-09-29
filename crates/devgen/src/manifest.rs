@@ -1113,6 +1113,12 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
                 t.insert("gemv_k8_unb".into(), json!(16));
                 t.insert("gemv_k8_max_gw".into(), json!(64));
             }
+            // PLOW_NV_GEMV_K8_B1 (hd <= 128): Qwen3-ASR 1.7B ctx 128 B=1/2/4/8/16 2.105/2.086/2.100/
+            // 2.204/2.327 -> 2.005/2.042/2.042/2.188/2.325 ms, token digests unchanged.
+            if k8_small_hd && crate::emit_config::active().nv_gemv_k8_b1 {
+                t.insert("gemv_k8_min".into(), json!(1));
+                t.insert("gemv_k8_unb1".into(), json!(2));
+            }
         }
         // * `fa_rg_wide`: hd256/512 flash decode on the row-group body (a warp per row, K and V
         //   of 4 rows in flight) instead of the tile body. E4B h100 ctx 1024 B=1/8/32/64/128

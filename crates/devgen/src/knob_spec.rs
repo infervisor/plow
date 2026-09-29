@@ -1064,6 +1064,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.fuse_merge", Some("PLOW_FUSE_MERGE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_fa_fold_wide", Some("PLOW_NV_FA_FOLD_WIDE"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.nv_fa_mma_hd128", Some("PLOW_NV_FA_MMA_HD128"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.nv_gemv_k8_b1", Some("PLOW_NV_GEMV_K8_B1"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_fa_split_prefill", Some("PLOW_NV_FA_SPLIT_PREFILL"), Layer::Emit, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("emit.hn_split", Some("PLOW_HN_SPLIT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fuse_kv_hnr", Some("PLOW_FUSE_KV_HNR"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
