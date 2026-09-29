@@ -1109,6 +1109,14 @@ int main(int argc, char** argv) {
                 snprintf(name, sizeof(name), "CFM %s%s", g.name, wg ? " wgmma" : " mma.sync");
                 bench(name, c, 2.0 * batch * g.rows * g.cin * g.cout * g.k, 0);
             }
+        for (bool wg : {false, true}) {
+            /* Encoder relative-position table: grouped 1x1, 8 heads x 64 -> 756 (b64, t 378). */
+            ConvSpec s{1, 24192, 512, 8 * 756, 1, 1, 1, 8, 0, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true};
+            s.wide = true;
+            s.wg = wg;
+            Case c; unsigned o; build_conv(c, s, false, o);
+            bench(wg ? "ENC relpos g8 512->6048 wgmma" : "ENC relpos g8 512->6048 3xTF32", c, 2.0 * 24192 * 64 * 6048, 0);
+        }
         {
             Case c; const unsigned rows = 8704, feat = 256;
             unsigned o = c.out((size_t)rows * feat), x = c.f32((size_t)rows * feat, 2.f, 0.5f);
@@ -1367,6 +1375,12 @@ int main(int argc, char** argv) {
         for (unsigned i = 0; i < 64; i += 3) g6.lengths[i] = 40 + i;
         g6.wide = g6.tapmajor = g6.wg = true;
         t_conv1d("Conv1dF32 wide wgmma k3 causal 320->256 len (CFM c1)", g6, 1e-4);
+        ConvSpec g7{1, 1000, 512, 8 * 380, 1, 1, 1, 8, 0, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true};
+        g7.wide = g7.wg = true;
+        t_conv1d("Conv1dF32 wgmma grouped pointwise g8 64->380 (relpos)", g7, 1e-4);
+        ConvSpec g8{2, 300, 256, 4 * 68, 1, 1, 1, 4, 0, 0, 0, 0, 0, false, true, false, true, {300, 123}, 0.f, true};
+        g8.wide = g8.wg = true;
+        t_conv1d("Conv1dF32 wgmma grouped pointwise g4 +res len", g8, 1e-4);
 #endif
         ConvSpec w7{2, 300, 64, 64, 7, 1, 3, 1, 9, 9, 0, 0, 12, false, true, true, true, {300, 170}, 0.f, true};
         t_conv1d("Conv1dF32 k7 snake-out +res (64x64 tiles)", w7);

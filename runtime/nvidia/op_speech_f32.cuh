@@ -3043,7 +3043,7 @@ __device__ __forceinline__ float spg_post(unsigned post, float x, float p) {
     default: return x;
     }
 }
-template <unsigned BN, bool TAPS, unsigned P>
+template <unsigned BN, bool TAPS, unsigned P, bool GR = false>
 static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsigned K, const float* x, const float* w,
                                                   const SpConvEpi1& ep, unsigned slice, unsigned nblk) {
     char* sm = (char*)sm90_align1024(sp_smem);
@@ -3060,17 +3060,21 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
     float* bias_s = (float*)(sm + BIAS_OFF);
     const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, wg = warp >> 2;
     const unsigned sr = tid >> 4, sc = (tid & 15u) * 4u; /* 16 threads per 64-float row, 16 rows per pass */
-    const unsigned tn = (N + BN - 1u) / BN, tiles = ((M + 127u) / 128u) * tn, nk = (K + SPWG_BK - 1u) / SPWG_BK;
     const SpConvArgs& a = ep.a;
+    /* GR (pointwise groups): N and K per group, A rows cin apart; group g's tiles read columns
+     * g * K of A and write columns g * N. */
+    const unsigned G = GR ? a.groups : 1u, lda = GR ? a.cin : K;
+    const unsigned tn = (N + BN - 1u) / BN, tiles = ((M + 127u) / 128u) * G * tn, nk = (K + SPWG_BK - 1u) / SPWG_BK;
     bool pending = false; /* bulk stores reading `stage` */
     for (unsigned tile = slice; tile < tiles; tile += nblk) {
-        const unsigned m0 = (tile / tn) * 128u, n0 = (tile % tn) * BN;
+        const unsigned mg = tile / tn, gi = GR ? mg % G : 0u, m0 = (GR ? mg / G : mg) * 128u, n0 = (tile % tn) * BN,
+                       og = gi * N;
         /* B rows (tap-major weights) are contiguous: row n at w + n * K. Pointwise A rows too: row m
          * at x + m * K. With taps, a k-tile lies in one tap (cin % 64 == 0) and A row m of item b,
          * output row t, reads input row t + tap * dil - before of b (zero outside its length).
          * Rows past M or N read nothing (their outputs are not stored). */
-        const float* xa = x + (size_t)(m0 + sr) * K + sc;
-        const float* wb = w + (size_t)(n0 + sr) * K + sc;
+        const float* xa = x + (size_t)(m0 + sr) * lda + gi * K + sc;
+        const float* wb = w + (size_t)(og + n0 + sr) * K + sc;
         const unsigned ma = M > m0 + sr ? (M - m0 - sr + 15u) / 16u : 0u, nb = N > n0 + sr ? (N - n0 - sr + 15u) / 16u : 0u;
         const bool leaky = a.pre == 9u;
         const float* xb[TAPS ? 8 : 1];
@@ -3104,7 +3108,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             } else {
 #pragma unroll
                 for (unsigned p = 0; p < 8; p++)
-                    va[p] = kin && p < ma ? __ldg((const float4*)(xa + (size_t)16u * p * K + k)) : make_float4(0.f, 0.f, 0.f, 0.f);
+                    va[p] = kin && p < ma ? __ldg((const float4*)(xa + (size_t)16u * p * lda + k)) : make_float4(0.f, 0.f, 0.f, 0.f);
             }
 #pragma unroll
             for (unsigned p = 0; p < BN / 16u; p++)
@@ -3118,7 +3122,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         };
         load(0u);
-        const float bpre = a.bias && tid < BN && n0 + tid < N ? __ldg(a.bias + n0 + tid) : 0.f;
+        const float bpre = a.bias && tid < BN && n0 + tid < N ? __ldg(a.bias + og + n0 + tid) : 0.f;
         if (pending) {
             asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
             pending = false;
@@ -3181,14 +3185,14 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
 #pragma unroll
             for (unsigned g = 0; g < NG; g++) {
                 const unsigned o = n0 + 8u * g + cw;
-                res[h][g] = a.residual && ok[h] && o < N ? __ldg((const float2*)(a.residual + base[h] + o)) : make_float2(0.f, 0.f);
+                res[h][g] = a.residual && ok[h] && o < N ? __ldg((const float2*)(a.residual + base[h] + og + o)) : make_float2(0.f, 0.f);
             }
 #pragma unroll
         for (unsigned g = 0; g < NG; g++) {
             const unsigned c = 8u * g + cw, o = n0 + c;
             const bool on = o < N;
             const float2 bias = *(const float2*)(bias_s + c);
-            const float2 alpha = a.alpha && on ? make_float2(a.alpha[o], a.alpha[o + 1]) : make_float2(a.slope, a.slope);
+            const float2 alpha = a.alpha && on ? make_float2(a.alpha[og + o], a.alpha[og + o + 1]) : make_float2(a.slope, a.slope);
 #pragma unroll
             for (unsigned h = 0; h < 2; h++) {
                 float2 y = make_float2(0.f, 0.f);
@@ -3210,7 +3214,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             const unsigned m = m0 + tid, cols = min(BN, N - n0);
             size_t base = ep.row_base(m);
             if ((long long)base < 0) base = ~base;
-            spwg_bulk_store(a.out + base + n0, stage + tid * LDO, cols * 4u);
+            spwg_bulk_store(a.out + base + og + n0, stage + tid * LDO, cols * 4u);
             asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
             pending = true;
         }
@@ -3236,17 +3240,19 @@ __device__ __forceinline__ void sp_wg_run(const SpConvArgs& a, unsigned slice, u
     const SpConvEpi1 ep{a, 0u, a.out_rows, 0u, 0u, false, true};
     /* 128x64 tiles where 128x128 ones would leave a short last round (N = 256 at ~9k rows: 136
      * tiles on 132 blocks); a 128x64 tile costs ~0.65 of a 128x128 one. */
-    const unsigned mt = (M + 127u) / 128u, r128 = (mt * ((a.cout + 127u) / 128u) + nblk - 1u) / nblk,
-                   r64 = (mt * ((a.cout + 63u) / 64u) + nblk - 1u) / nblk;
+    const unsigned mt = (M + 127u) / 128u * a.groups, r128 = (mt * ((a.ng + 127u) / 128u) + nblk - 1u) / nblk,
+                   r64 = (mt * ((a.ng + 63u) / 64u) + nblk - 1u) / nblk;
     const unsigned K = a.kernel * a.cg;
     const float* w = (const float*)a.w;
     const bool wide = 20u * r128 <= 13u * r64;
     /* The combinations the speech lowerings use: pointwise with none / GELU / other, taps with
-     * none / snake / other. */
-    if (a.kernel == 1u) {
-        if (a.post == 0u) wide ? sp_wg_gemm<128, false, 0>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 0>(M, a.cout, K, a.x, w, ep, slice, nblk);
-        else if (a.post == 11u) wide ? sp_wg_gemm<128, false, 1>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 1>(M, a.cout, K, a.x, w, ep, slice, nblk);
-        else wide ? sp_wg_gemm<128, false, 3>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 3>(M, a.cout, K, a.x, w, ep, slice, nblk);
+     * none / snake / other, grouped pointwise with none. */
+    if (a.groups > 1u) {
+        sp_wg_gemm<128, false, 0, true>(M, a.ng, K, a.x, w, ep, slice, nblk);
+    } else if (a.kernel == 1u) {
+        if (a.post == 0u) wide ? sp_wg_gemm<128, false, 0>(M, a.ng, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 0>(M, a.ng, K, a.x, w, ep, slice, nblk);
+        else if (a.post == 11u) wide ? sp_wg_gemm<128, false, 1>(M, a.ng, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 1>(M, a.ng, K, a.x, w, ep, slice, nblk);
+        else wide ? sp_wg_gemm<128, false, 3>(M, a.ng, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, false, 3>(M, a.ng, K, a.x, w, ep, slice, nblk);
     } else {
         if (a.post == 0u) wide ? sp_wg_gemm<128, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 0>(M, a.cout, K, a.x, w, ep, slice, nblk);
         else if (a.post == 12u) wide ? sp_wg_gemm<128, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk) : sp_wg_gemm<64, true, 2>(M, a.cout, K, a.x, w, ep, slice, nblk);
@@ -3270,7 +3276,11 @@ __device__ __forceinline__ unsigned sp_w_conv_width(const PlowDevInst* in, const
 __device__ __forceinline__ bool sp_wg_conv1d(const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
     if (in->op != PLOW_DOP_CONV1D_F32 || !((in->fj[2].u >> 17) & 1u)) return false;
     SpConvArgs a;
-    if (!sp_conv_args(in, T, false, a) || !sp_w_conv_width(in, a, nblk) || !spg_eligible(a)) return false;
+    if (!sp_conv_args(in, T, false, a) || !spg_eligible(a)) return false;
+    /* Grouped pointwise convs (group widths % 4 == 0) run per group; the rest as the wide tile. */
+    const bool grouped = a.groups > 1u && a.kernel == 1u && a.post == 0u && a.ng % 4u == 0 && a.cin % 4u == 0 &&
+                         !a.wf16 && ((in->fj[2].u >> 14) & 1u);
+    if (!grouped && !sp_w_conv_width(in, a, nblk)) return false;
     sp_wg_run(a, slice, nblk);
     return true;
 }
@@ -3988,10 +3998,11 @@ static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void*
                      sp_aligned(SP_TEN(0), 8) && (!SP_TEN(6) || sp_aligned(SP_TEN(6), 16));
     /* flags bit 1 (i6): 3xTF32 tensor cores. */
     if (in->i[4] == 64u && (in->i[6] & 2u) && vec) {
-        /* Packed query tiles once a run of 8 spans at most 2 heads (KT 32) or 5 (KT 16). */
+        /* Packed query tiles once a run of 8 spans at most 2 heads (KT 32), 3 (KT 24) or 5 (KT 16). */
         const unsigned n16 = (in->i[1] + 15u) / 16u;
         if (in->i[6] & 0xFF04u) sp_attention_tc64p<32, 2, true>(in, T, slice, nblk); /* devgen: q_rows > 112 */
         else if (n16 >= 8u) sp_attention_tc64p<32, 2, false>(in, T, slice, nblk);
+        else if (n16 >= 4u) sp_attention_tc64p<24, 3, false>(in, T, slice, nblk);
         else if (n16 >= 2u) sp_attention_tc64p<16, 5, false>(in, T, slice, nblk);
         else sp_attention_tc64(in, T, slice, nblk, arena);
     }

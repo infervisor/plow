@@ -443,9 +443,9 @@ pub struct Conv1dF32Stage<'a> {
     /// stride)][cin/groups]` (zero past the kernel) instead of `[cin][cout/groups][kernel]`. Either
     /// way a GEMM column run (tap, channels) is contiguous.
     pub weight_tap_major: bool,
-    /// Flag bit 17: on sm_90a a split-bf16 conv (pointwise, or tap-major with 64-channel groups)
-    /// runs the same product on warpgroup MMA; the interpreter falls back to the wide tile
-    /// elsewhere.
+    /// Flag bit 17: on sm_90a a split-bf16 conv (pointwise, grouped pointwise with group widths
+    /// % 4 == 0, or tap-major with 64-channel groups) runs the same product on warpgroup MMA; the
+    /// interpreter falls back to the other paths elsewhere.
     pub wgmma: bool,
 }
 

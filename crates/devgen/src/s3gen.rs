@@ -12,7 +12,7 @@
 //! Layout notes. The conformer runs time-major (`[t][item][c]`) so relative-position attention is
 //! one batch-1 AttentionF32 with the items folded into the heads: its additive bias
 //! `(q + u)·P[t - j] / 8 + (v - u)·P[t - j] / 8` is a grouped 1x1 convolution against the
-//! capacity's projected position table (`[t][item*heads][2t - 1]`), which the attention reads in
+//! capacity's projected position table (`[t][item*heads][2t - 1 padded to 4]`), which the attention reads in
 //! place along the diagonal, and each item's keys stop at its length.
 //!
 //! Fusions (each convolution's and linear's input activation, output activation and residual)
@@ -33,7 +33,7 @@ use crate::RewriteSites;
 pub const PIPELINE: &str = "vocoder.synth";
 pub const PACKET: &str = "s3gen.pkt";
 
-/// (batch, speech tokens) capacities. The encoder's attention bias is `[T][B*8][2T-1]` f32 with
+/// (batch, speech tokens) capacities. The encoder's attention bias is `[T][B*8][~2T]` f32 with
 /// T = 2 (prompt + tokens), so large batches get short buckets. Wide batches fill the machine's
 /// GEMM tiles (a B=8 CFM step is already compute-bound), so they are where concurrent requests
 /// gain throughput; every item pays the capacity's token count, so the wide batches get finer
@@ -736,7 +736,8 @@ impl Lowering<'_> {
         let q = o.conv(a, "act.s3gen.q", c)?;
         let k = o.linear(a, "act.s3gen.k", &format!("{p}.k"), r, D_ENC, D_ENC, true, Activation::None, None)?;
         let v = o.linear(a, "act.s3gen.v", &format!("{p}.v"), r, D_ENC, D_ENC, true, Activation::None, None)?;
-        let m = 2 * t - 1;
+        // Table rows per head, padded to a multiple of 4 (the grouped GEMM's column groups).
+        let m = (2 * t - 1).next_multiple_of(4);
         let rel = format!("{p}.relpos.t{t}");
         let mut c = Conv::new(&rel, 1, r, D_ENC, HEADS * m, 1);
         c.groups = HEADS;
@@ -1398,8 +1399,9 @@ impl Derived<'_> {
         Ok(bytes)
     }
 
-    /// Grouped 1x1 weight `[head][2t-1][64]` (row m <-> relative position t-1-m, already / 8) of
-    /// layer `layer`'s projected position table for `t` rows, or its bias `(v - u)_head · row`.
+    /// Grouped 1x1 weight `[head][2t-1 padded to a multiple of 4][64]` (row m <-> relative position
+    /// t-1-m, already / 8; padding rows zero) of layer `layer`'s projected position table for `t`
+    /// rows, or its bias `(v - u)_head · row`.
     fn relpos(&mut self, layer: u32, t: u32, bias: bool) -> Result<Vec<f32>, String> {
         let rows = self.cfg.relpos_rows[usize::from(layer >= ENC_LAYERS.0)];
         if t > rows {
@@ -1408,6 +1410,7 @@ impl Derived<'_> {
         let vu = self.f32s(&format!("enc.L{layer}.pos_vu"))?.clone();
         let table = self.f32s(&format!("enc.L{layer}.relpos"))?;
         let (m, dk, width) = (2 * t as usize - 1, (D_ENC / HEADS) as usize, D_ENC as usize);
+        let pad = m.next_multiple_of(4) - m;
         let first = (rows - t) as usize;
         let mut out = Vec::with_capacity(HEADS as usize * m * if bias { 1 } else { dk });
         for h in 0..HEADS as usize {
@@ -1419,6 +1422,7 @@ impl Derived<'_> {
                     out.extend_from_slice(row);
                 }
             }
+            out.resize(out.len() + pad * if bias { 1 } else { dk }, 0.0);
         }
         Ok(out)
     }

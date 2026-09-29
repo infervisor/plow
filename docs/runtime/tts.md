@@ -484,6 +484,26 @@ Render (`--seq`): `b64.t32` 602 -> 565 ms (encoder 59 -> 41 ms, CFM 496 -> 478),
 median 0.000 (96 at c1, 200 at c200); English c64 54.6 aps, CER 0.000; Qwen3-ASR WER 3.913%;
 Veena CER 0.008, c64 57.9 aps.
 
+Queries of 4 to 7 tiles (the 72-row window) run 24-key K/V tiles with 3 heads side by side
+instead of 32-key tiles with 2. The encoder's grouped 1x1 relpos convolution (`[t][b*8][2t-1]`
+per head, 64 input channels per group) runs on warpgroup MMA: the tile decode walks (row tile,
+group), and the A operand steps by the full input row. The position table's per-head stride is
+padded to a multiple of 4 (the wgmma path needs 4-aligned rows). The grouped case is its own
+template instance so the ungrouped CFM GEMMs keep their registers (a shared runtime-grouped path
+made them 3-20% slower). Standalone relpos `b8 512 -> 6048`: 3xTF32 2.25 ms -> 0.57 ms.
+
+Render (`--seq`): `b64.t32` 565 -> 544 ms (encoder 41 -> 30 ms, CFM program 13.6 -> 13.3 ms),
+`b64.t64` 894 -> 885, `b32.t64` 528 -> 523, `b8.t32` 157 -> 150. Served c200 (`--n 800`, two runs
+each, same lease): the runtime-grouped variant served 65.8 -> 67.5 steady aps against the
+previous build, and this build 66.4 -> 67.8 (67.0 / 67.6 aps) against that variant; TTFA p50 7.2
+s. c128 67.9 aps, c64 55.5, c16 40.3, c1 7.6. Mel rel-L2 5e-6 to 1.1e-5; CER median 0.000 (96 at
+c1, 200 at c200), per language unchanged; English c64 55.0 aps, CER 0.000; Qwen3-ASR
+WER 3.913%; Veena CER 0.008, c64 57.9 aps.
+
+Two extra cached capacities (`(64, 36)`, `(64, 68)`) cut render per new token by 13% and 5%, and
+the fit picked `(64, 36)` for nearly every c200 launch, but served no faster (66.0 vs 66.3 steady
+aps), so the recipe keeps the 32/64 ladder.
+
 ## Concurrency
 
 Speech requests take the LLM path on each model's mux: packed prefill (several requests' prompt
