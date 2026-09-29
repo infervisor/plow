@@ -210,7 +210,7 @@ struct LightLaunch {
 }
 
 impl LightRoute {
-    fn run(&self, stream: &CudaStream) -> Result<()> {
+    pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
         for launch in &self.launches {
             let mut arg = self.kernarg;
             let mut instruction = launch.instruction;
@@ -255,6 +255,8 @@ pub(super) struct LightFunctions {
     pub(super) head: Option<KernelFn>,
     /// `plow_<arch>_light_flash` (streamed hd128 FlashDecode) and its smem.
     flash: Option<(KernelFn, u32)>,
+    /// `plow_<arch>_light_pf`: a prefill bucket's lone RmsNorm / Residual / SiLU Glu.
+    pub(super) prefill: Option<KernelFn>,
 }
 
 /// `FA_ST_THREADS`: eight row-group warps and the producer warp.
@@ -292,7 +294,11 @@ pub(super) fn light_functions(
         }
         _ => None,
     };
-    Ok(Some(LightFunctions { single, attn, head, flash }))
+    let prefill = be
+        .get_function(module, &format!("plow_{arch}_light_pf"))
+        .ok()
+        .filter(|_| crate::config::RuntimeConfig::get().nv.prefill_light);
+    Ok(Some(LightFunctions { single, attn, head, flash, prefill }))
 }
 
 /// Each light-routable interpreter segment of `g`: `(segment, levels)`, a level being a
@@ -367,6 +373,68 @@ pub(super) fn light_segments(
             Some((seg, levels))
         })
         .collect()
+}
+
+/// A prefill bucket's interpreter segments of at most three RmsNorm / Residual / SiLU Glu
+/// instructions (`plow_<arch>_light_pf`, one launch each in program order), skipping `library`
+/// segments.
+pub(super) fn prefill_light_segments(g: &DevProg, library: &[Option<usize>]) -> Vec<(usize, Vec<usize>)> {
+    (0..g.gq_seg_ofs.len().saturating_sub(1))
+        .filter(|&seg| library.get(seg).copied().flatten().is_none())
+        .filter_map(|seg| {
+            let entries = &g.gq_stream[g.gq_seg_ofs[seg] as usize..g.gq_seg_ofs[seg + 1] as usize];
+            let mut insts: Vec<usize> = Vec::new();
+            for e in entries {
+                if insts.last() != Some(&(e.inst as usize)) {
+                    insts.push(e.inst as usize);
+                }
+            }
+            let none = packet::dev::TENSOR_NONE16;
+            let ok = (1..=3).contains(&insts.len())
+                && insts.windows(2).all(|w| w[0] < w[1])
+                && insts.iter().all(|&inst| {
+                    let d = &g.insts[inst];
+                    let own: Vec<_> = entries.iter().filter(|e| e.inst as usize == inst).collect();
+                    d.blocks != 0
+                        && own.len() == d.blocks as usize
+                        && own.iter().enumerate().all(|(i, e)| e.slice as usize == i)
+                        && match DevOp::from_u16(d.op) {
+                            Some(DevOp::RmsNorm) => d.t[3] == none && d.t[4] == none,
+                            Some(DevOp::Residual) => true,
+                            Some(DevOp::Glu) => d.i[1] == 1,
+                            _ => false,
+                        }
+                });
+            ok.then_some((seg, insts))
+        })
+        .collect()
+}
+
+/// One light route running `insts` of a prefill bucket, in order.
+pub(super) fn prefill_light_route(
+    be: &Arc<CudaBackend>,
+    function: KernelFn,
+    kernarg: DevProgram,
+    g: &DevProg,
+    insts: &[usize],
+) -> LightRoute {
+    LightRoute {
+        be: Arc::clone(be),
+        kernarg,
+        launches: insts
+            .iter()
+            .map(|&inst| LightLaunch {
+                function,
+                xs: LightX::default(),
+                kind: LightKind::Single,
+                instruction: inst as u32,
+                blocks: u32::from(g.insts[inst].blocks),
+                block: BLOCK,
+                smem: 0,
+            })
+            .collect(),
+        _scratch: None,
+    }
 }
 
 /// `(segment, instruction)` of every instruction a light route executes.
@@ -821,8 +889,9 @@ pub(super) fn prepare_routes(
         ProjectionBackend::Lt(lt) if pair => Some(lt),
         _ => None,
     };
-    // A rung pairs exactly where its template (the widest rung) paired, and pins that pair's
-    // algorithm.
+    // A rung pairs exactly where its template (the widest rung) paired. It pins the template's
+    // algorithms only with PLOW_LT_RUNG_ALGOS off; otherwise it times its own.
+    let pin = !crate::config::RuntimeConfig::get().nv.lt_rung_algos;
     let template_pair = |index: usize| -> Result<Option<Option<&crate::device::cuda::lt::Plan>>> {
         let Some(routes) = templates else {
             return Ok(Some(None));
@@ -832,6 +901,7 @@ pub(super) fn prepare_routes(
                 Some(Some(LibraryRoute::Projection(route))),
                 Some(Some(LibraryRoute::Projection(next))),
             ) if next.folded() => match route.plan.as_ref() {
+                ProjectionPlan::Lt(_) if !pin => Ok(Some(None)),
                 ProjectionPlan::Lt(plan) => Ok(Some(Some(plan.as_ref()))),
                 _ => Err(RuntimeError::Rejected("decode projection backend changed".into())),
             },
@@ -879,7 +949,7 @@ pub(super) fn prepare_routes(
             if u64::from(segment.m) * u64::from(fusion.n_total) * 2 > scratch.len {
                 return Err(RuntimeError::Rejected("fused q|k|v scratch too small".into()));
             }
-            let plan = lt.plan(segment.m, fusion.n_total, segment.k, weight, template)?;
+            let plan = lt.plan(segment.m, fusion.n_total, segment.k, weight, template.filter(|_| pin))?;
             for next in segments[index + 1..index + 3].iter().flatten() {
                 insts[next.instruction].op = DevOp::Nop as u16;
             }
@@ -963,7 +1033,7 @@ pub(super) fn prepare_routes(
                                 )),
                             })
                             .transpose()?;
-                        ProjectionPlan::Lt(lt.plan(key.0, key.1, key.2, weight, template)?)
+                        ProjectionPlan::Lt(lt.plan(key.0, key.1, key.2, weight, template.filter(|_| pin))?)
                     }
                     ProjectionBackend::Native(native) => {
                         let template = template

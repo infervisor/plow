@@ -3639,6 +3639,37 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
     }
 #undef LIGHT_TEN
 }
+/* A prefill bucket's lone RmsNorm / Residual / SiLU Glu, as an ordinary launch like
+ * plow_sm120_light: the prefill object's bodies (RmsNorm takes its warp-per-row path from 32
+ * rows, as the prefill object does), so the outputs are the interpreter window's. */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm120_light_pf)(PlowProgram prog,
+                                                                                       unsigned inst) {
+    __shared__ float part[32];
+    const PlowDevInst* in = prog.insts + inst;
+    void* const* T = prog.tensors;
+    const unsigned slice = blockIdx.x, nblk = gridDim.x;
+#define LIGHT_TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    switch (in->op) {
+    case PLOW_DOP_RMSNORM:
+        if (LIGHT_TEN(3) || LIGHT_TEN(4)) __trap();
+        d_rmsnorm((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+                  (const __nv_bfloat16*)LIGHT_TEN(2), in->i[0], in->i[1], in->fj[0].f, in->i[2], slice,
+                  nblk, part, nullptr, nullptr, 32u);
+        break;
+    case PLOW_DOP_RESIDUAL:
+        d_residual((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+                   (const __nv_bfloat16*)LIGHT_TEN(2), in->i[0], in->fj[0].f, slice, nblk);
+        break;
+    case PLOW_DOP_GLU:
+        if (in->i[1] != PLOW_ACT_SILU_) __trap();
+        d_glu((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
+              in->i[0], in->i[1], slice, nblk);
+        break;
+    default:
+        __trap();
+    }
+#undef LIGHT_TEN
+}
 #if !PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_MIXED_STEP
 /* The attention side of a decode layer (HeadNormRope at the object's head dim, then
  * FlashDecode) as its own kernels: `count` independent instructions from `inst` on, block `b`

@@ -68,6 +68,12 @@ PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_NO_GLU_FUSE = "1"
 PLOW_FUSE_KV_HNR = "1"
 
+# Served flags (campaign serve/bench/gate). The lookahead-1 decode pipeline overlaps the host's
+# read-out and streaming with the next step (greedy c64/c128 +3-5%, c1 TPOT and CER unchanged);
+# --lt-rung-algos times cuBLASLt algorithms per rung (step_bench B=32..64 -3..-5%, digests equal).
+[serve]
+extra_args = "--multistep-adaptive --decode-pipeline --lt-rung-algos"
+
 [bench]
 kind = "speech"
 client = "scripts/tts/tts_bench.py"

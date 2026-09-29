@@ -116,8 +116,9 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
                           const __nv_bfloat16* __restrict__ gamma, unsigned rows, unsigned feat,
                           float eps, unsigned out_row0, unsigned slice, unsigned nblk,
                           float* part, uint8_t* __restrict__ xq = nullptr,
-                          float* __restrict__ ascale = nullptr) {
-    if (PLOW_NV_T17_MIN_ROWS && rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
+                          float* __restrict__ ascale = nullptr,
+                          unsigned t17_min_rows = PLOW_NV_T17_MIN_ROWS) {
+    if (t17_min_rows && rows >= t17_min_rows && (feat & 7u) == 0) {
         /* T17 warp-per-row (see header comment). Row set of this block is unchanged:
          * {slice + k*nblk}; warp w takes k ≡ w (mod WARPS). */
         const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;

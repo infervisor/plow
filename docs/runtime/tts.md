@@ -130,6 +130,54 @@ Served output tok/s, same client and settings as above:
 
 CER median 0 (n=80). E4B step_bench digests are unchanged at B=1/64/128.
 
+The recipe's `[serve] extra_args` add `--decode-pipeline` and `--lt-rung-algos` for Veena only.
+Also:
+
+* Packed hd128 prefill runs one varlen `d_flash_prefill` pass over all requests instead of one
+  pass per request.
+* `PLOW_PREFILL_LIGHT` (default on) runs a prefill bucket's lone RmsNorm, Residual and SiLU Glu
+  segments between cuBLASLt calls as `plow_<arch>_light_pf` launches from the decode object,
+  instead of interpreter windows. They use the prefill object's bodies, with RmsNorm's
+  warp-per-row path from 32 rows, so the step_bench digests do not change.
+
+`--decode-pipeline` is off by default because it was added opt-in. It covers greedy rows only,
+and an unforeseen stop costs one discarded step. Pipelined prefill stays off.
+
+Pipeline A/B on the veena40_1 objects, two runs each:
+
+| | c1 TPOT ms | c64 | c128 | stream c1 TTFA p50 ms | stream c64 aps | stream c64 TTFA p50/p90 ms |
+|---|---|---|---|---|---|---|
+| off | 3.42 / 3.38 | 12638 / 12780 | 18440 / 19334 | 66 / 60 | 74.6 / 76.8 | 177/226, 167/182 |
+| `--decode-pipeline` | 3.36 / 3.35 | 13158 / 13266 | 20225 / 20267 | 58 / 57 | 73.7 / 74.2 | 149/176, 150/183 |
+
+Served greedy text at c64/c128 already differs from run to run without the pipeline (about 167 of
+192 outputs match), because the rung a request decodes on depends on arrival. c1 is identical.
+
+`--lt-rung-algos` makes each routed rung time its own cuBLASLt algorithms instead of pinning the
+widest rung's. It is off by default: Veena's digests are unchanged, but E4B's B=64 digest moves.
+With it, step_bench B=32/48/64 goes from 4.01/4.29/4.50 to 3.84/4.07/4.36 ms.
+
+Served, ctx 384, same client:
+
+| | c1 TPOT ms | c64 | c128 | stream c64 aps | stream c64 TTFA p50/p90 ms |
+|---|---|---|---|---|---|
+| veena40_1, `--decode-pipeline` | 3.36 | 13307 | 20291 | 75.0 | |
+| + `--lt-rung-algos` | | 13618-13693 | 20192-20308 | | |
+| + varlen packed prefill | 3.36 | 13759 / 13726 | 20472 / 20434 | 76.9 / 71.5 | 132/174 |
+| + prefill light | 3.35 | 13742 / 13818 | 20577 / 20601 | 76.2 / 76.3 | 139/171, 138/170 |
+
+Tried and dropped:
+
+* HeadNormRope in `light_pf`. It saved another ~0.1%, but its digests differ from the prefill
+  object's HeadNormRope.
+* Scheduler knobs:
+  * `--pf-batch`, `--pf-interleave-adaptive` and `--pf-interleave 0/4096` gave no gain.
+  * `--pf-defer-decode` gave c64 +2% but c128 -3%, and a TTFT hit.
+
+With the recipe flags, the gate CER median is 0.005 (n=80). The step_bench digests are those of
+veena40_1 at B=1/32/64/128, and E4B's are unchanged at B=1/64/128. In-model at B=128 ctx 384,
+o_proj on cuBLASLt takes 14.5 us per layer, against 9.3-10 us in torch.
+
 Voices are the checkpoint's speaker tags (`kavya`, `agastya`, `maitri`, `vinaya`).
 Defaults: temperature 0.4, top_p 0.9, no repetition penalty (device sampling; a
 penalty switches that request to host sampling).

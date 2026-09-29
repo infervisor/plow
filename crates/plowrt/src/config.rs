@@ -1031,6 +1031,13 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "lt-pair", env = "PLOW_LT_PAIR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub lt_pair: bool,
 
+    /// Each narrower routed decode rung times its own cuBLASLt algorithms (singles, pairs, fused
+    /// q|k|v) instead of reusing the widest rung's. Opt-in per model (a rung's tokens can change
+    /// with its algorithm: E4B B=64 digest moves). Veena step_bench ctx 384: B=32/48/64
+    /// -4/-5/-3%, digests equal.
+    #[arg(long = "lt-rung-algos", env = "PLOW_LT_RUNG_ALGOS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub lt_rung_algos: bool,
+
     /// A routed decode rung's one-instruction AddNorm / Glu segments run as ordinary launches
     /// of the decode object's light kernel instead of interpreter windows.
     #[arg(long = "decode-light", env = "PLOW_DECODE_LIGHT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -1046,6 +1053,11 @@ pub struct NvidiaRuntimeConfig {
     /// the greedy argmax there too, and skips the packet's Argmax/ArgmaxFin window.
     #[arg(long = "decode-head-argmax", env = "PLOW_DECODE_HEAD_ARGMAX", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub decode_head_argmax: bool,
+
+    /// A prefill bucket's lone RmsNorm / Residual / SiLU Glu segments run as ordinary launches
+    /// of the decode object's `plow_<arch>_light_pf` kernel instead of interpreter windows.
+    #[arg(long = "prefill-light", env = "PLOW_PREFILL_LIGHT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefill_light: bool,
 
     /// A routed decode rung's q, k and v projections run as one cuBLASLt matmul when their
     /// weights are contiguous and a light attention launch reads the three outputs.

@@ -1889,6 +1889,8 @@ struct PrefillBucket {
     qwen_segments: Vec<Option<DevInst64>>,
     packet_segment_roles: Vec<u8>,
     cublaslt_segments: Vec<Option<CublasLtDecodeRoute>>,
+    /// `PLOW_PREFILL_LIGHT`: lone norm / residual / GLU segments as light launches.
+    light_segments: Vec<Option<cublaslt::LightRoute>>,
     /// `PLOW_MOE_PF_LT`: grouped-expert segments served by cuBLASLt grouped matmuls.
     moe_lt_segments: Vec<Option<moe_lt::MoeLtRoute>>,
     /// `PLOW_PF_ATTN_GEMM`: `FlashPrefill` segments served by the vendor-GEMM route.
@@ -5396,6 +5398,7 @@ impl GpuEngine {
                 packed_prefill.as_ref(),
                 cublaslt_prefill.as_ref(),
                 moe_lt_decode.clone(),
+                light_functions.as_ref().and_then(|f| f.prefill),
             ) {
                 Ok((f_pf, smem_pf, module_pf, buckets, seg_pf, grid_pf)) => {
                     tracing::info!(
@@ -8493,6 +8496,7 @@ impl GpuEngine {
         packed: Option<&plow_asset::packed_prefill::Manifest>,
         cublaslt_backend: Option<&cublaslt::ProjectionBackend>,
         moe_lt_shared: Option<Arc<moe_lt::MoeLt>>,
+        light_pf: Option<KernelFn>,
     ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>, u32)> {
         let packed_requests = packed.is_some();
         let mut inferred_policy = crate::asset::devblob::SegmentClassPolicy::default();
@@ -9118,6 +9122,32 @@ impl GpuEngine {
             } else {
                 Vec::new()
             };
+            // Lone norm / residual / GLU segments of the Lt-routed buckets: light launches.
+            let light_segments = match light_pf {
+                Some(_) if !projection_segments.is_empty() && seg_mode && qwen_segments.is_empty() => {
+                    let library: Vec<Option<usize>> = (0..g.gq_seg_ofs.len().saturating_sub(1))
+                        .map(|seg| {
+                            projection_segments
+                                .get(seg)
+                                .copied()
+                                .flatten()
+                                .map(|p| p.instruction)
+                                .or(attention_gemm_segments
+                                    .get(seg)
+                                    .copied()
+                                    .flatten()
+                                    .map(|site| site.instruction))
+                        })
+                        .collect();
+                    cublaslt::prefill_light_segments(g, &library)
+                }
+                _ => Vec::new(),
+            };
+            let light_instructions: Vec<(usize, usize)> = light_segments
+                .iter()
+                .flat_map(|(seg, insts)| insts.iter().map(move |&i| (*seg, i)))
+                .chain(moe_instructions.iter().copied())
+                .collect();
             let cublaslt_waits = if projection_segments.is_empty()
                 && moe_instructions.is_empty()
                 && attention_gemm_segments.iter().all(Option::is_none)
@@ -9142,7 +9172,7 @@ impl GpuEngine {
                                 .map(|site| site.instruction))
                     })
                     .collect();
-                Some(cublaslt::ordered_waits_for(g, &library, &moe_instructions)?)
+                Some(cublaslt::ordered_waits_for(g, &library, &light_instructions)?)
             };
             let cublaslt_segments = if projection_segments.is_empty() {
                 Vec::new()
@@ -9330,6 +9360,18 @@ impl GpuEngine {
                 }
             }
 
+            let mut light_routes: Vec<Option<cublaslt::LightRoute>> = Vec::new();
+            if let Some(function) = light_pf {
+                for (seg, insts) in &light_segments {
+                    if light_routes.len() <= *seg {
+                        light_routes.resize_with(seg + 1, || None);
+                    }
+                    light_routes[*seg] = Some(cublaslt::prefill_light_route(be, function, kernarg, g, insts));
+                }
+            }
+            if !light_segments.is_empty() {
+                tracing::info!(bucket = g.t, segments = light_segments.len(), "prefill light segments");
+            }
             buckets.push(PrefillBucket {
                 t: g.t,
                 seg_class: seg_class.clone(),
@@ -9339,6 +9381,7 @@ impl GpuEngine {
                 qwen_segments,
                 packet_segment_roles,
                 cublaslt_segments,
+                light_segments: light_routes,
                 moe_lt_segments,
                 attention_gemm_segments,
                 kernarg,
@@ -10006,6 +10049,7 @@ impl GpuEngine {
         }
         let arg = &arg;
         let has_external = self.prefill[bi].cublaslt_segments.iter().any(Option::is_some)
+            || self.prefill[bi].light_segments.iter().any(Option::is_some)
             || self.prefill[bi].moe_lt_segments.iter().any(Option::is_some)
             || self.prefill[bi]
                 .packet_segment_roles
@@ -10038,6 +10082,10 @@ impl GpuEngine {
                 for (seg, &class) in seg_class.iter().enumerate() {
                     let seg = seg + range.start;
                     if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {
+                        route.run(&capture_stream)?;
+                        continue;
+                    }
+                    if let Some(Some(route)) = self.prefill[bi].light_segments.get(seg) {
                         route.run(&capture_stream)?;
                         continue;
                     }
@@ -10362,6 +10410,10 @@ impl GpuEngine {
                         self.be.event_record(&e1, &self.stream)?;
                         evs.push((seg, cls, e0, e1));
                     }
+                    continue;
+                }
+                if let Some(Some(route)) = self.prefill[bi].light_segments.get(seg) {
+                    route.run(&self.stream)?;
                     continue;
                 }
                 if let Some(Some(route)) = self.prefill[bi].cublaslt_segments.get(seg) {

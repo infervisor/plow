@@ -5215,6 +5215,28 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
             }
         }
 #endif
+#if PLOW_NV_FA_PIPE
+        /* hd128: ONE varlen pass over every request's (q tile, head) items (the stage-2 body,
+         * per-item math identical to the serial loop below) instead of R serial passes that
+         * each fill 2 x n_head of the grid's blocks (Veena 4 x 128-row prompts: 62 us). */
+        if constexpr (HD == 128) {
+            if (O && nsplit == 1) {
+#if defined(PLOW_NV_PACKED_FA_TMA) && PLOW_NV_PACKED_FA_TMA
+                const void* packed_maps = mapkv;
+#else
+                const void* packed_maps = nullptr;
+#endif
+                d_flash_prefill<HD,BQ,BKV>(Opart,mlpart,Q,K,V,O,seq_q,seq_kv,
+                    n_head,n_kv_head,q_pos0,window,nsplit,kv_stride,kv_mask,
+                    scale,slice,nblk,lds,req,packed_maps);
+                const unsigned real=req[1+4*(count-1)]+req[2+4*(count-1)];
+                const size_t begin=(size_t)real*n_head*HD, end=(size_t)seq_q*n_head*HD;
+                for (size_t i=begin+(size_t)slice*blockDim.x+threadIdx.x;i<end;i+=(size_t)nblk*blockDim.x)
+                    O[i]=__float2bfloat16(0.0f);
+                return;
+            }
+        }
+#endif
         for (unsigned r=0; r<count; ++r) {
             const unsigned q0=req[1+4*r], qlen=req[2+4*r], slot=req[3+4*r], kvlen=req[4+4*r];
             const size_t qoff=(size_t)q0*n_head*HD;
