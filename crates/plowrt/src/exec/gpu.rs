@@ -4810,6 +4810,31 @@ impl GpuEngine {
         let main_light = light_functions
             .as_ref()
             .map_or_else(Vec::new, |f| cublaslt::light_segments(g, &cublaslt_segments, f));
+        let main_fusions = cublaslt::qkv_fusions(g, &cublaslt_segments, &devp, &main_light);
+        // The widest routed rung's unaligned lm_head sizes the head scratch.
+        let head_kernel = match (
+            light_functions.as_ref().and_then(|f| f.head),
+            cublaslt_segments
+                .iter()
+                .flatten()
+                .filter(|s| s.n % 16 != 0)
+                .map(|s| u64::from(s.m) * u64::from(s.n & !15) * 2)
+                .max(),
+        ) {
+            (Some(function), Some(bytes)) => Some(cublaslt::HeadKernel {
+                be: Arc::clone(&be),
+                function,
+                scratch: Arc::new(be.alloc(0, bytes)?),
+            }),
+            _ => None,
+        };
+        let qkv_scratch = match main_fusions.iter().map(|f| f.n_total).max() {
+            Some(n) => Some(Arc::new(be.alloc(
+                0,
+                u64::from(plow_asset::segment_roles::CUBLASLT_DECODE_MAX_ROWS) * u64::from(n) * 2,
+            )?)),
+            None => None,
+        };
         let ordered_waits = if cublaslt_enabled {
             Some(cublaslt::ordered_waits(
                 g,
@@ -4835,6 +4860,9 @@ impl GpuEngine {
                 None,
                 crate::config::RuntimeConfig::get().nv.lt_pair,
                 true,
+                &main_fusions,
+                qkv_scratch.as_deref(),
+                head_kernel.as_ref(),
             )?)
         } else if moe_lt_routed {
             let routes = moe_lt::decode_routes(
@@ -4916,7 +4944,16 @@ impl GpuEngine {
             token_batch: 0,
         };
         if let Some(functions) = &light_functions {
-            cublaslt::add_light_routes(&mut cublaslt_decode, &be, functions, kernarg, g, &main_light);
+            cublaslt::add_light_routes(
+                &mut cublaslt_decode,
+                &be,
+                functions,
+                kernarg,
+                g,
+                &main_light,
+                &main_fusions,
+                qkv_scratch.as_ref(),
+            );
         }
 
         let stream = be.stream_create()?;
@@ -4972,6 +5009,11 @@ impl GpuEngine {
                             &cublaslt::light_instructions(&light),
                         )?;
                         let mut insts = g.insts.clone();
+                        let fusions = if qkv_scratch.is_some() {
+                            cublaslt::qkv_fusions(g, &segments, &devp, &light)
+                        } else {
+                            Vec::new()
+                        };
                         let routes = cublaslt::prepare_routes(
                             lt,
                             segments,
@@ -4980,6 +5022,9 @@ impl GpuEngine {
                             Some(&cublaslt_decode),
                             crate::config::RuntimeConfig::get().nv.lt_pair,
                             true,
+                            &fusions,
+                            qkv_scratch.as_deref(),
+                            head_kernel.as_ref(),
                         )?;
                         let mut rung = DecodeRung::upload_with_insts(
                             &be,
@@ -5001,6 +5046,8 @@ impl GpuEngine {
                                 rung.kernarg,
                                 g,
                                 &light,
+                                &fusions,
+                                qkv_scratch.as_ref(),
                             );
                         }
                         rung.library = Some(cublaslt::CublasLtDecodeGraph::capture(
@@ -9097,6 +9144,9 @@ impl GpuEngine {
                     None,
                     config.nv.lt_pair,
                     false,
+                    &[],
+                    None,
+                    None,
                 )?
             };
             let mut moe_lt_segments = Vec::new();

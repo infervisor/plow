@@ -3644,8 +3644,17 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
  * FlashDecode) as its own kernels: `count` independent instructions from `inst` on, block `b`
  * running slice `b` of each. Only these two bodies are compiled in, so the flash row-group loop
  * keeps its registers (the interpreter entry is at the 255-register cap and spills). */
+/* A fused q|k|v projection's output: HeadNormRope instruction `inst[j]` reads its x from
+ * `base + col[j]` with row pitch `row` elements instead of its own x tensor. */
+struct PlowLightX {
+    unsigned long long base;
+    unsigned row;
+    unsigned inst[3];
+    unsigned col[3];
+};
 extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
-    PLOW_SYM(plow_sm120_light_attn)(PlowProgram prog, unsigned inst, unsigned count) {
+    PLOW_SYM(plow_sm120_light_attn)(PlowProgram prog, unsigned inst, unsigned count,
+                                    PlowLightX xs) {
     extern __shared__ float arena[];
     void* const* T = prog.tensors;
     for (unsigned i = inst; i < inst + count; i++) {
@@ -3660,13 +3669,20 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
          ? nullptr                                                                            \
          : T[(tw_[(k) >> 1] >> (((k) & 1) * 16)) & 0xFFFFu])
         if (in->op == PLOW_DOP_HEADNORM_ROPE && in->i[2] == PLOW_NV_FA_HD && in->i[5] == 0) {
+            const __nv_bfloat16* x = (const __nv_bfloat16*)LIGHT_TEN(1);
+            unsigned x_row = 0;
+            for (int j = 0; j < 3; j++)
+                if (xs.base && xs.inst[j] == i) {
+                    x = (const __nv_bfloat16*)xs.base + xs.col[j];
+                    x_row = xs.row;
+                }
             d_headnorm_rope<PLOW_NV_FA_HD>(
-                (__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+                (__nv_bfloat16*)LIGHT_TEN(0), x,
                 (const __nv_bfloat16*)LIGHT_TEN(2), (const float*)LIGHT_TEN(3),
                 (const float*)LIGHT_TEN(4), (const int*)LIGHT_TEN(5), in->i[0], in->i[1],
                 in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4], slice, nblk, in->i[6],
                 nullptr, in->i[7] ? (__nv_bfloat16*)LIGHT_TEN(6) : nullptr,
-                in->i[7] ? (const __nv_bfloat16*)LIGHT_TEN(7) : nullptr);
+                in->i[7] ? (const __nv_bfloat16*)LIGHT_TEN(7) : nullptr, x_row);
         } else if (in->op == PLOW_DOP_FLASH_DECODE && in->i[6] == PLOW_NV_FA_HD &&
                    (in->i[1] / in->i[2]) % PLOW_NV_FA_GF == 0) {
             const unsigned fold = in->fj[2].u;
@@ -3694,6 +3710,32 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
 }
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = PLOW_NV_FA_HD;
 #endif
+/* An lm_head whose vocab N is not a multiple of 16 (Veena: 156951), after cuBLASLt ran its first
+ * n0 = N & ~15 columns into `src` (pitch n0): copy them into C (pitch N) and compute the last
+ * N - n0 columns here. Grid = M x 8 blocks; chunk 0 of each row also does the tail dots. */
+extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS)
+    PLOW_SYM(plow_sm120_light_head)(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+                                    const __nv_bfloat16* __restrict__ W,
+                                    const __nv_bfloat16* __restrict__ src, unsigned N, unsigned K,
+                                    unsigned n0) {
+    const unsigned r = blockIdx.x >> 3, c = blockIdx.x & 7u;
+    const unsigned lo = (unsigned)((unsigned long long)n0 * c / 8u);
+    const unsigned hi = (unsigned)((unsigned long long)n0 * (c + 1u) / 8u);
+    const __nv_bfloat16* s = src + (size_t)r * n0;
+    __nv_bfloat16* d = C + (size_t)r * N;
+    for (unsigned j = lo + threadIdx.x; j < hi; j += PLOW_NV_THREADS) d[j] = s[j];
+    if (c != 0) return;
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    for (unsigned j = n0 + warp; j < N; j += PLOW_NV_THREADS / 32u) {
+        const __nv_bfloat16* w = W + (size_t)j * K;
+        const __nv_bfloat16* xr = x + (size_t)r * K;
+        float acc = 0.0f;
+        for (unsigned k = lane; k < K; k += 32u)
+            acc = fmaf(__bfloat162float(xr[k]), __bfloat162float(w[k]), acc);
+        acc = warp_sum32(acc);
+        if (lane == 0) d[j] = __float2bfloat16(acc);
+    }
+}
 extern "C" __device__ unsigned PLOW_SYM(plow_light_abi) = 1;
 #endif
 

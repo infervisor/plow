@@ -17,11 +17,48 @@ pub(super) struct CublasLtDecodeRoute {
     input: u64,
     weight: u64,
     output: u64,
+    tail: Option<HeadTail>,
+}
+
+/// The light head kernel and its scratch: an lm_head whose N is not a multiple of 16 runs its
+/// first `N & !15` columns on cuBLASLt into the scratch (aligned pitch), then the kernel copies
+/// them into the logits and computes the rest.
+#[derive(Clone)]
+pub(super) struct HeadKernel {
+    pub(super) be: Arc<CudaBackend>,
+    pub(super) function: KernelFn,
+    pub(super) scratch: Arc<DeviceMem>,
+}
+
+struct HeadTail {
+    kernel: HeadKernel,
+    rows: u32,
+    n: u32,
+    k: u32,
+    n0: u32,
 }
 
 impl CublasLtDecodeRoute {
     pub(super) fn run(&self, stream: &CudaStream) -> Result<()> {
-        self.plan.run(self.input, self.weight, self.output, stream)
+        let Some(tail) = &self.tail else {
+            return self.plan.run(self.input, self.weight, self.output, stream);
+        };
+        let scratch = tail.kernel.scratch.base;
+        self.plan.run(self.input, self.weight, scratch, stream)?;
+        let (mut c, mut x, mut w, mut src) = (self.output, self.input, self.weight, scratch);
+        let (mut n, mut k, mut n0) = (tail.n, tail.k, tail.n0);
+        let mut params = [
+            &mut c as *mut u64 as *mut std::ffi::c_void,
+            &mut x as *mut u64 as *mut std::ffi::c_void,
+            &mut w as *mut u64 as *mut std::ffi::c_void,
+            &mut src as *mut u64 as *mut std::ffi::c_void,
+            &mut n as *mut u32 as *mut std::ffi::c_void,
+            &mut k as *mut u32 as *mut std::ffi::c_void,
+            &mut n0 as *mut u32 as *mut std::ffi::c_void,
+        ];
+        tail.kernel
+            .be
+            .launch_kernel(tail.kernel.function, tail.rows * 8, BLOCK, 0, &mut params, Some(stream))
     }
 
     /// Executed by the previous segment's paired call.
@@ -53,10 +90,23 @@ pub(super) struct LightRoute {
     be: Arc<CudaBackend>,
     kernarg: DevProgram,
     launches: Vec<LightLaunch>,
+    _scratch: Option<Arc<DeviceMem>>,
+}
+
+/// `PlowLightX` (interp_sm120.cu): HeadNormRope `inst[j]` reads x at `base + col[j]`, row
+/// pitch `row` elements (a fused q|k|v projection's output); `base` 0 = no override.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct LightX {
+    base: u64,
+    row: u32,
+    inst: [u32; 3],
+    col: [u32; 3],
 }
 
 struct LightLaunch {
     function: KernelFn,
+    xs: LightX,
     /// `None`: the one-instruction `plow_<arch>_light` kernel; `Some(n)`: `light_attn` over
     /// `n` instructions from `instruction`.
     count: Option<u32>,
@@ -71,10 +121,12 @@ impl LightRoute {
             let mut arg = self.kernarg;
             let mut instruction = launch.instruction;
             let mut count = launch.count.unwrap_or(0);
+            let mut xs = launch.xs;
             let mut params = [
                 &mut arg as *mut DevProgram as *mut std::ffi::c_void,
                 &mut instruction as *mut u32 as *mut std::ffi::c_void,
                 &mut count as *mut u32 as *mut std::ffi::c_void,
+                &mut xs as *mut LightX as *mut std::ffi::c_void,
             ];
             let params = if launch.count.is_some() { &mut params[..] } else { &mut params[..2] };
             self.be.launch_kernel(
@@ -95,6 +147,8 @@ pub(super) struct LightFunctions {
     single: KernelFn,
     /// `plow_<arch>_light_attn`, its arena and the head dim it carries.
     attn: Option<(KernelFn, u32, u32)>,
+    /// `plow_<arch>_light_head` (unaligned lm_head tail).
+    pub(super) head: Option<KernelFn>,
 }
 
 /// The light kernels of the decode object `module` (`<stem>` = `interp_<arch>`), when it has
@@ -120,7 +174,8 @@ pub(super) fn light_functions(
         }
         _ => None,
     };
-    Ok(Some(LightFunctions { single, attn }))
+    let head = be.get_function(module, &format!("plow_{arch}_light_head")).ok();
+    Ok(Some(LightFunctions { single, attn, head }))
 }
 
 /// Each light-routable interpreter segment of `g`: `(segment, levels)`, a level being a
@@ -209,6 +264,85 @@ pub(super) fn light_instructions(light: &[(usize, Vec<(usize, usize)>)]) -> Vec<
         .collect()
 }
 
+/// A q|k|v projection triple run as one cuBLASLt matmul into a scratch row of
+/// `n_total` columns, read in place by the next light attention launch's HeadNormRope.
+#[derive(Clone, Copy)]
+pub(super) struct QkvFusion {
+    /// Segment of the q projection; k and v follow it.
+    pub(super) segment: usize,
+    pub(super) n_total: u32,
+    xs: LightX,
+}
+
+/// The q|k|v triples of `g` that can run as one matmul: three adjacent projection segments
+/// over one input and K, their weights contiguous (q, k, v), each output read only by one
+/// unfused HeadNormRope in the first launch of the light attention segment that follows.
+pub(super) fn qkv_fusions(
+    g: &DevProg,
+    segments: &[Option<DecodeSegment>],
+    devp: &[DeviceMem],
+    light: &[(usize, Vec<(usize, usize)>)],
+) -> Vec<QkvFusion> {
+    if !crate::config::RuntimeConfig::get().nv.decode_lt_qkv {
+        return Vec::new();
+    }
+    let t = |inst: usize, slot: usize| g.insts[inst].t[slot] as usize;
+    let mut out = Vec::new();
+    for (seg, window) in segments.windows(3).enumerate() {
+        let [Some(q), Some(k), Some(v)] = window else { continue };
+        let Some((_, levels)) = light.iter().find(|(s, _)| *s == seg + 3) else { continue };
+        let Some(&(lo, n)) = levels.first() else { continue };
+        let [iq, ik, iv] = [q.instruction, k.instruction, v.instruction];
+        let weight = |i: usize| devp[t(i, 2)].base;
+        let input = |i: usize| devp[t(i, 1)].base;
+        if q.m != k.m
+            || k.m != v.m
+            || q.k != k.k
+            || k.k != v.k
+            || k.n != v.n
+            || input(iq) != input(ik)
+            || input(ik) != input(iv)
+            || weight(iq) + q.weight_bytes != weight(ik)
+            || weight(ik) + k.weight_bytes != weight(iv)
+        {
+            continue;
+        }
+        let hnr = |producer: usize| {
+            (lo..lo + n).find(|&i| {
+                g.insts[i].op == DevOp::HeadNormRope as u16
+                    && t(i, 1) == t(producer, 0)
+                    && g.insts[i].i[7] == 0
+            })
+        };
+        let (Some(hq), Some(hk), Some(hv)) = (hnr(iq), hnr(ik), hnr(iv)) else { continue };
+        // Until the next write of the producer's output (activations are reused per layer).
+        let sole_reader = |producer: usize, reader: usize| {
+            let out = t(producer, 0);
+            g.insts[producer + 1..]
+                .iter()
+                .enumerate()
+                .map(|(i, d)| (producer + 1 + i, d))
+                .take_while(|(_, d)| d.t[0] as usize != out)
+                .all(|(i, d)| i == reader || !d.t[1..].iter().any(|&h| h as usize == out))
+        };
+        if !(sole_reader(iq, hq) && sole_reader(ik, hk) && sole_reader(iv, hv)) {
+            continue;
+        }
+        let n_total = q.n + k.n + v.n;
+        out.push(QkvFusion {
+            segment: seg,
+            n_total,
+            xs: LightX {
+                base: 0,
+                row: n_total,
+                inst: [hq as u32, hk as u32, hv as u32],
+                col: [0, q.n, q.n + k.n],
+            },
+        });
+    }
+    out
+}
+
 /// Replace each light segment's (empty) route with its launches.
 pub(super) fn add_light_routes(
     routes: &mut Vec<Option<LibraryRoute>>,
@@ -217,14 +351,24 @@ pub(super) fn add_light_routes(
     kernarg: DevProgram,
     g: &DevProg,
     light: &[(usize, Vec<(usize, usize)>)],
+    fusions: &[QkvFusion],
+    scratch: Option<&Arc<DeviceMem>>,
 ) {
     for (seg, levels) in light {
+        let fused = fusions.iter().find(|f| f.segment + 3 == *seg).zip(scratch).map(|(f, s)| {
+            LightX {
+                base: s.base,
+                ..f.xs
+            }
+        });
         if routes.len() <= *seg {
             routes.resize_with(seg + 1, || None);
         }
         let launches = levels
             .iter()
-            .map(|&(inst, n)| {
+            .enumerate()
+            .map(|(level, &(inst, n))| {
+                let xs = fused.filter(|_| level == 0).unwrap_or_default();
                 let blocks = (inst..inst + n.max(1))
                     .map(|i| u32::from(g.insts[i].blocks))
                     .max()
@@ -232,6 +376,7 @@ pub(super) fn add_light_routes(
                 match (n, functions.attn) {
                     (n, Some((function, smem, _))) if n > 0 => LightLaunch {
                         function,
+                        xs,
                         count: Some(n as u32),
                         instruction: inst as u32,
                         blocks,
@@ -239,6 +384,7 @@ pub(super) fn add_light_routes(
                     },
                     _ => LightLaunch {
                         function: functions.single,
+                        xs,
                         count: None,
                         instruction: inst as u32,
                         blocks,
@@ -251,6 +397,7 @@ pub(super) fn add_light_routes(
             be: Arc::clone(be),
             kernarg,
             launches,
+            _scratch: fused.and(scratch.cloned()),
         }));
     }
 }
@@ -434,6 +581,7 @@ pub(super) fn ordered_waits_for(
     Ok(waits)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_routes(
     backend: &ProjectionBackend,
     segments: Vec<Option<DecodeSegment>>,
@@ -442,6 +590,9 @@ pub(super) fn prepare_routes(
     templates: Option<&[Option<LibraryRoute>]>,
     pair: bool,
     decode: bool,
+    fusions: &[QkvFusion],
+    scratch: Option<&DeviceMem>,
+    head: Option<&HeadKernel>,
 ) -> Result<Vec<Option<CublasLtDecodeRoute>>> {
     let mut routes: Vec<Option<CublasLtDecodeRoute>> = Vec::new();
     if segments.is_empty() {
@@ -478,10 +629,59 @@ pub(super) fn prepare_routes(
             index += 1;
             continue;
         };
-        let key = (segment.m, segment.n, segment.k);
+        // An lm_head with an unaligned vocab: cuBLASLt serves its aligned columns (see HeadTail).
+        let tail = head
+            .filter(|_| segment.n % 16 != 0 && segment.n > 16 && matches!(backend, ProjectionBackend::Lt(_)))
+            .filter(|h| u64::from(segment.m) * u64::from(segment.n & !15) * 2 <= h.scratch.len)
+            .cloned();
+        let key = (
+            segment.m,
+            if tail.is_some() { segment.n & !15 } else { segment.n },
+            segment.k,
+        );
         let ops = operands(&segment, insts, devp)?;
         let [output, input, weight] = ops;
         insts[segment.instruction].op = DevOp::Nop as u16;
+        if let (Some(fusion), Some(scratch), ProjectionBackend::Lt(lt)) = (
+            fusions.iter().find(|f| f.segment == index),
+            scratch,
+            backend,
+        ) {
+            let template = templates
+                .map(|routes| match routes.get(index) {
+                    Some(Some(LibraryRoute::Projection(route))) => match route.plan.as_ref() {
+                        ProjectionPlan::Lt(p) => Ok(p.as_ref()),
+                        _ => Err(RuntimeError::Rejected("decode projection backend changed".into())),
+                    },
+                    _ => Err(RuntimeError::Rejected("cuBLASLt rung template route missing".into())),
+                })
+                .transpose()?;
+            if u64::from(segment.m) * u64::from(fusion.n_total) * 2 > scratch.len {
+                return Err(RuntimeError::Rejected("fused q|k|v scratch too small".into()));
+            }
+            let plan = lt.plan(segment.m, fusion.n_total, segment.k, weight, template)?;
+            for next in segments[index + 1..index + 3].iter().flatten() {
+                insts[next.instruction].op = DevOp::Nop as u16;
+            }
+            routes.push(Some(CublasLtDecodeRoute {
+                plan: Arc::new(ProjectionPlan::Lt(plan)),
+                input,
+                weight,
+                output: scratch.base,
+                tail: None,
+            }));
+            for _ in 0..2 {
+                routes.push(Some(CublasLtDecodeRoute {
+                    plan: Arc::new(ProjectionPlan::Folded),
+                    input: 0,
+                    weight: 0,
+                    output: 0,
+                    tail: None,
+                }));
+            }
+            index += 3;
+            continue;
+        }
         let pair_template = match pair_lt {
             Some(_) => template_pair(index)?,
             None => None,
@@ -508,12 +708,14 @@ pub(super) fn prepare_routes(
                     input,
                     weight: w0,
                     output: o0,
+                    tail: None,
                 }));
                 routes.push(Some(CublasLtDecodeRoute {
                     plan: Arc::new(ProjectionPlan::Folded),
                     input: 0,
                     weight: 0,
                     output: 0,
+                    tail: None,
                 }));
                 pairs += 1;
                 index += 2;
@@ -563,6 +765,13 @@ pub(super) fn prepare_routes(
             input,
             weight,
             output,
+            tail: tail.map(|kernel| HeadTail {
+                kernel,
+                rows: segment.m,
+                n: segment.n,
+                k: segment.k,
+                n0: key.1,
+            }),
         }));
         index += 1;
     }

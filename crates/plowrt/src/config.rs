@@ -1036,6 +1036,11 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "decode-light", env = "PLOW_DECODE_LIGHT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub decode_light: bool,
 
+    /// A routed decode rung's q, k and v projections run as one cuBLASLt matmul when their
+    /// weights are contiguous and a light attention launch reads the three outputs.
+    #[arg(long = "decode-lt-qkv", env = "PLOW_DECODE_LT_QKV", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub decode_lt_qkv: bool,
+
     /// Serve a packet's `MOE_PREFILL_CUBLASLT` segments (emit `PLOW_EMIT_MOE_PF_LT`) with
     /// cuBLASLt grouped matmuls in every prefill bucket of at least this many rows. Unset = every
     /// bucket that carries them; `0` = the segments run in the interpreter.

@@ -1245,6 +1245,10 @@ pub struct EmitConfig {
     #[arg(long = "emit-decode-cublaslt-min-rows", env = "PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS")]
     pub decode_cublaslt_min_rows: Option<u32>,
 
+    /// With `decode_cublaslt`: the routed rungs' lm_head is a library segment too.
+    #[arg(long = "emit-decode-cublaslt-head", env = "PLOW_EMIT_DECODE_CUBLASLT_HEAD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_cublaslt_head: bool,
+
     /// Emit the measured SM90 BF16 prefill projections as packet-declared cuBLASLt segments.
     #[arg(long = "emit-prefill-cublaslt", env = "PLOW_EMIT_PREFILL_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub prefill_cublaslt: bool,
@@ -1641,6 +1645,7 @@ impl EmitConfig {
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
             decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),
             decode_cublaslt_min_rows: env_u32("PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS"),
+            decode_cublaslt_head: env_bool("PLOW_EMIT_DECODE_CUBLASLT_HEAD"),
             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
             moe_pf_lt: env_bool("PLOW_EMIT_MOE_PF_LT"),
             moe_dec_lt: env_bool("PLOW_EMIT_MOE_DEC_LT"),

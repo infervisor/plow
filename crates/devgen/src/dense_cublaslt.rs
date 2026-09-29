@@ -6,8 +6,9 @@ use plow_asset::segment_roles::{
 };
 
 pub(crate) fn apply(model: &mut Model) -> Result<SectionData, String> {
-    let min_rows = crate::emit_config::active().decode_cublaslt_min_rows.unwrap_or(1);
-    apply_projections(model, false, min_rows)
+    let config = crate::emit_config::active();
+    let min_rows = config.decode_cublaslt_min_rows.unwrap_or(1);
+    apply_projections(model, config.decode_cublaslt_head, min_rows)
 }
 
 pub(crate) fn apply_prefill(

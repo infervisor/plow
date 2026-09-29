@@ -926,6 +926,9 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
                                  * flash does not wait on -- a read-before-write race. */
                                 , __nv_bfloat16* __restrict__ out2 = nullptr
                                 , const __nv_bfloat16* __restrict__ x2 = nullptr
+                                /* x's row pitch in elements when x is a column slice of a
+                                 * wider row (a fused q|k|v projection); 0 = nhead * hd. */
+                                , unsigned x_row = 0
                                 ) {
     static_assert(HD % 64 == 0,
                   "head_dim must be a multiple of 64 so the half-split RoPE partner (i, i+HD/2) "
@@ -957,7 +960,7 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
             if (!mixed_row.active) continue;
         }
 #endif
-        const size_t ibase = ((size_t)t * nhead + hh) * hd;
+        const size_t ibase = x_row ? (size_t)t * x_row + (size_t)hh * hd : ((size_t)t * nhead + hh) * hd;
         /* KV write (out_stride!=0): per-row slot map (batched prefill), per-batch ring when
          * n_batch_kv!=0 (the row index derives from pos[t] — at n_batch_kv==1 this is the
          * B=1 decode ring with NO host i[3] patch, plan plowrt-gpu-exec-critical-path

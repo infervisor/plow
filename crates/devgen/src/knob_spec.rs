@@ -1242,6 +1242,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.qwen_w8a8_prefill", Some("PLOW_QWEN_W8A8_PREFILL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_cublaslt", Some("PLOW_EMIT_DECODE_CUBLASLT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.decode_cublaslt_min_rows", Some("PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.decode_cublaslt_head", Some("PLOW_EMIT_DECODE_CUBLASLT_HEAD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.prefill_cublaslt", Some("PLOW_EMIT_PREFILL_CUBLASLT"), Layer::Emit, Domain::Bool, LT_GLU_DEFAULT, LT_GLU_QUALIFIED),
     KnobSpec::new("emit.moe_pf_lt", Some("PLOW_EMIT_MOE_PF_LT"), Layer::Emit, Domain::Bool, GEMMA4_HOPPER_MOE_ON, MOE_LT_EMIT_QUALIFIED),
     KnobSpec::new("emit.moe_dec_lt", Some("PLOW_EMIT_MOE_DEC_LT"), Layer::Emit, Domain::Bool, GEMMA4_MOE_DEC_LT_DEFAULT, MOE_LT_EMIT_QUALIFIED),

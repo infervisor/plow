@@ -40,6 +40,7 @@
 #define plow_sm120_launch plow_sm90a_launch
 #define plow_sm120_light plow_sm90a_light
 #define plow_sm120_light_attn plow_sm90a_light_attn
+#define plow_sm120_light_head plow_sm90a_light_head
 
 #include "interp_sm120.cu"
 

@@ -59,10 +59,12 @@ PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "64,256"
 PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
-# Decode rungs of 48+ rows run their projections on cuBLASLt (step_bench ctx 1024 B=48/64/96/128
-# 7.80/8.55/11.07/12.66 -> 6.94/7.67/9.40/10.92 ms; from 32 rows B=32 loses 5.42 -> 6.16).
+# Decode rungs of 32+ rows run their projections on cuBLASLt, with paired k|v and gate|up,
+# fused q|k|v and light kernels between library calls (step_bench ctx 384 B=32 4.60 -> 4.26 ms;
+# B=16 loses 3.61 -> 3.94). The lm_head runs its 16-aligned columns on cuBLASLt too (B=128 -3%).
 PLOW_EMIT_DECODE_CUBLASLT = "1"
-PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "48"
+PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "32"
+PLOW_EMIT_DECODE_CUBLASLT_HEAD = "1"
 PLOW_NO_GLU_FUSE = "1"
 PLOW_FUSE_KV_HNR = "1"
 
