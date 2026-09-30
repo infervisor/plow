@@ -68,6 +68,10 @@ PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
 PLOW_FUSE_KV_HNR = "1"
+# Opt-ins measured on this model: packed prefill at hd64/hd128, and the dense hd <= 128 decode
+# tuning (gemv_k8 + L2 prefetch, tensor-core decode scores, classic B=1 GEMVs below K 3840).
+PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
+PLOW_NV_DENSE_TUNE = "1"
 
 [bench]
 kind = "speech"

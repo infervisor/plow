@@ -2332,6 +2332,10 @@ pub struct GpuEngine {
     vmm_attached: Vec<u32>,
     /// Cache rows the next `begin_slot` keeps (a retained session prefix); 0 = start cold.
     resume_rows: Vec<u32>,
+    /// Smallest `stride - window` over the packet's sliding caches (rings of `stride` rows): a
+    /// retained prefix of `rows` is intact only while the sequence stopped within this many rows
+    /// past it (the VMM prefix cache's `publish_boundary` rule). None: no sliding cache.
+    resume_ring_slack: Option<u32>,
     /// A session sequence's retire pins its published prefix in the VMM cache for this long.
     session_pin: Vec<Option<std::time::Duration>>,
     vmm_active: Vec<bool>,
@@ -6196,6 +6200,12 @@ impl GpuEngine {
                 })
             });
 
+        let resume_ring_slack = live_kv_manifest
+            .clone()
+            .or_else(|| blob.with_packet_view(plow_asset::live_kv::emit).ok())
+            .and_then(|m| {
+                m.caches.iter().filter(|c| c.window > 0).map(|c| c.stride.saturating_sub(c.window)).min()
+            });
         let mut engine = GpuEngine {
             be,
             f,
@@ -6267,6 +6277,7 @@ impl GpuEngine {
             pos: vec![0; batch],
             vmm_attached: vec![0; batch],
             resume_rows: vec![0; batch],
+            resume_ring_slack,
             session_pin: vec![None; batch],
             vmm_active: vec![false; batch],
             packed_admission: vec![PackedAdmission::Pending; batch],
@@ -6759,8 +6770,11 @@ impl GpuEngine {
             && b < self.batch
             && rows <= self.pos[b] as usize
             && rows < self.max_ctx
+            && self.resume_ring_slack.is_none_or(|s| self.pos[b] as usize - rows <= s as usize)
             && self.pipe.as_ref().is_none_or(|p| !p.holds(b));
-        self.resume_rows[b] = if ok { rows as u32 } else { 0 };
+        if let Some(r) = self.resume_rows.get_mut(b) {
+            *r = if ok { rows as u32 } else { 0 };
+        }
         ok
     }
 

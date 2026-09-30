@@ -54,6 +54,12 @@ PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_NO_GLU_FUSE = "1"
 # One-row decode rung on the gemv_k8 walk: step_bench ctx 128 B=1 2.105 -> 2.005 ms, B=2/4 -50 us.
 PLOW_NV_GEMV_K8_B1 = "1"
+# hd128 row-group flash decode with merge fold (gated here; changes attention sum order).
+PLOW_NV_FA_FOLD = "1"
+# Opt-ins measured on this model: packed prefill at hd64/hd128, and the dense hd <= 128 decode
+# tuning (gemv_k8 + L2 prefetch, tensor-core decode scores, classic B=1 GEMVs below K 3840).
+PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
+PLOW_NV_DENSE_TUNE = "1"
 
 [bench]
 kind = "asr"

@@ -4571,7 +4571,6 @@ fn amd_defer_decode(enabled: bool, prefill_remains: bool) -> bool {
     enabled && prefill_remains
 }
 
-#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 /// A quantum of whole token groups when it holds at least one (Veena's 7-code frames: 8 -> 7).
 /// Measured H100 Veena served: c1 TTFA 100.0 -> 89.4 ms, stream c8 19.1 -> 20.2 aps.
 fn group_aligned(steps: u32, group: usize) -> u32 {

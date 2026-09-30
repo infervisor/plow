@@ -1027,7 +1027,19 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     let mut t = Map::new();
     // Capped at 32: wider arms exceed the 48 KiB static shared memory of the interpreter entry
     // (GV_MM_MAX=128 is 0x19610 bytes); rungs above it walk ceil(B / 32) weight passes.
-    t.insert("gv_mm_max".into(), json!(next_pow2(s.decode_batch.max(1)).min(32)));
+    // AMD objects size their GEMV walk from PLOW_GEMV_MM, not GV_MM_MAX: uncapped there.
+    let gv_mm_max = next_pow2(s.decode_batch.max(1));
+    let gv_mm_max = if arch.starts_with("gfx") { gv_mm_max } else { gv_mm_max.min(32) };
+    t.insert("gv_mm_max".into(), json!(gv_mm_max));
+    // * `fa_rg`: hd128 decode on the row-group flash body, which the merge fold requires
+    //   (nv_decode_merge_fold; PLOW_NV_FA_FOLD opt-in).
+    if arch.starts_with("sm_")
+        && s.hd.contains(&128)
+        && s.hd.iter().all(|&h| h <= 128)
+        && crate::emit_config::active().nv_fa_fold
+    {
+        t.insert("fa_rg".into(), json!(1));
+    }
     // * `fa_v3_splitkv`: the fused v3 flash prefill carries the split-KV workspace (`fa_ws`).
     if s.fa_ws_slots > 0 {
         t.insert("fa_v3_splitkv".into(), json!(s.fa_ws_slots));
@@ -1072,12 +1084,20 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     // * `gemv_mma_b1`: a DENSE packet also walks its B=1 GEMVs on the tensor cores, which drops the
     //   classic B=1 kernels altogether: 12B 12.60/13.01/13.59 -> 11.93/12.60/13.16. The MoE 26B
     //   keeps its xreg kernels (B=1 5.66 vs 6.10 on the walk: its dense GEMVs are small).
+    // PLOW_NV_DENSE_TUNE: the hd <= 128 dense decode arms below (MoE packets, GPT-OSS included,
+    // never take them).
+    let dense_tune = sm90a
+        && crate::emit_config::active().nv_dense_tune
+        && s.hd.iter().all(|&h| h <= 128)
+        && !s.ops_present.iter().any(|op| op.starts_with("Moe"));
     if sm90a && !s.decode_gemv_k.is_empty() {
         t.insert("xreg_k".into(), json!(s.decode_gemv_k.iter().collect::<Vec<_>>()));
         if s.moe_down_inter == 0 && s.decode_batch >= 2 && s.decode_gemv_k.iter().all(|k| k % 32 == 0) {
             // Small dense GEMVs keep the classic B=1 kernels, as the MoE 26B does: Veena
             // (Llama-3.2-3B, K 3072/8192) on h200 B=1 3.106 -> 2.979 ms with the walk off.
-            if s.decode_gemv_k.iter().min().is_some_and(|&k| k >= 3840) {
+            // The E-series (`GluStrided`) measured the same way.
+            let classic_b1 = dense_tune || s.ops_present.contains(&op_name(DevOp::GluStrided));
+            if !classic_b1 || s.decode_gemv_k.iter().min().is_some_and(|&k| k >= 3840) {
                 t.insert("gemv_mma_b1".into(), json!(1));
             }
             // * `gemv_mma_pair`: its single-stream walks (down, o_proj, lm_head) take two row blocks
@@ -1091,7 +1111,7 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         //   Gemma-4 E-series (per-layer inputs: `GluStrided`, hd256/512): E4B h100 ctx 1024
         //   B=1/2/8/16/32 6.87/6.82/7.40/8.50/10.22 -> 6.93/6.25/6.82/7.97/9.65 ms, B>=48 unchanged.
         //   The other hd256/512 packets are unmeasured and keep the classic walk.
-        let k8_small_hd = s.hd.iter().all(|&h| h <= 128);
+        let k8_small_hd = dense_tune;
         let k8_ple = s.ops_present.contains(&op_name(DevOp::GluStrided)) && s.hd.iter().all(|&h| h <= 512);
         if s.moe_down_inter == 0
             && !s.moe_dec_group
@@ -1124,11 +1144,13 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         //   of 4 rows in flight) instead of the tile body. E4B h100 ctx 1024 B=1/8/32/64/128
         //   6.22/6.83/9.61/12.63/17.75 -> 6.15/6.63/9.05/11.98/16.42 ms. E-series only (measured).
         if k8_ple && !k8_small_hd {
+            t.insert("fa_rg".into(), json!(1));
             t.insert("fa_rg_wide".into(), json!(1));
         }
         // * `fa_rgm`: hd128 row-group flash decode on the mma.sync item fed by per-warp bulk-copy
         //   rings (PLOW_NV_FA_RGM).
-        if k8_small_hd && s.hd.contains(&128) && crate::emit_config::active().nv_fa_mma_hd128 {
+        if s.hd.iter().all(|&h| h <= 128) && s.hd.contains(&128) && crate::emit_config::active().nv_fa_mma_hd128 {
+            t.insert("fa_rg".into(), json!(1));
             t.insert("fa_rgm".into(), json!(1));
         }
         if t.contains_key("gemv_k8") && k8_small_hd {
@@ -1187,9 +1209,12 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     }
     // * `fa_mmaqk`: the emit's PLOW_FA_MMAQK, opt-in. Object-paired (the score arm and its smem
     //   claim change), so it rides in `tuning` and the pairing hash.
-    if let Some(v) = crate::emit_config::active().fa_mmaqk.filter(|v| *v != 0) {
-        t.insert("fa_mmaqk".into(), json!(v));
-    } else if sm90a && s.moe_down_inter == 0 && s.gqa >= 2 && s.hd.iter().all(|&d| d <= 128) {
+    // An explicit PLOW_FA_MMAQK=0 is off, not "unset".
+    if let Some(v) = crate::emit_config::active().fa_mmaqk {
+        if v != 0 {
+            t.insert("fa_mmaqk".into(), json!(v));
+        }
+    } else if dense_tune && s.gqa >= 2 {
         // * `fa_mmaqk` bit 2: hd64/hd128 decode scores on the tensor cores. h100 step_bench ms at
         //   B=1/8/32 ctx 1024, Veena (hd128, GQA 3): 3.648/4.858/6.881 -> 3.514/4.513/6.405;
         //   ctx 1900: 3.770/5.415/8.171 -> 3.615/4.978/7.518.
@@ -2938,6 +2963,9 @@ pub fn config_header(manifest: &Value) -> String {
             }
             if t.get("gemv_k8").is_some() {
                 out.push_str("#ifndef PLOW_NV_GEMV_K8\n#define PLOW_NV_GEMV_K8 1\n#endif\n");
+            }
+            if t.get("fa_rg").is_some() {
+                out.push_str("#ifndef PLOW_NV_FA_RG\n#define PLOW_NV_FA_RG 1\n#endif\n");
             }
             if t.get("fa_rg_wide").is_some() {
                 out.push_str("#ifndef PLOW_NV_FA_RG_WIDE\n#define PLOW_NV_FA_RG_WIDE 1\n#endif\n");

@@ -290,6 +290,21 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NV_FA_FOLD_WIDE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub nv_fa_fold_wide: bool,
 
+    /// NVIDIA hd128 GQA decode on the row-group flash body with its merge fold (no FlashMerge op).
+    /// Changes the attention sum order, so a recipe opts in after its gate.
+    #[arg(long, env = "PLOW_NV_FA_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_fa_fold: bool,
+
+    /// NVIDIA sm_90a dense (no MoE) hd <= 128 decode tuning: the `gemv_k8` walk with its L2
+    /// prefetch, tensor-core decode scores (`fa_mmaqk` 4) and the classic B=1 GEMVs below K 3840.
+    /// Measured on Veena / Qwen3-ASR / Chatterbox T3; a recipe opts in after its gate.
+    #[arg(long, env = "PLOW_NV_DENSE_TUNE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_dense_tune: bool,
+
+    /// Packed prefill for hd64/hd128 attention (the live-KV and packed contracts accept them).
+    #[arg(long, env = "PLOW_EMIT_PACKED_PREFILL_SMALL_HD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub packed_prefill_small_hd: bool,
+
     /// NVIDIA hd128 row-group flash decode on the mma.sync staged item (PLOW_NV_FA_RGM).
     #[arg(long, env = "PLOW_NV_FA_MMA_HD128", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub nv_fa_mma_hd128: bool,
@@ -1444,6 +1459,9 @@ impl EmitConfig {
             fuse_hnr: env_bool("PLOW_FUSE_HNR"),
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
             nv_fa_fold_wide: env_bool_default_true("PLOW_NV_FA_FOLD_WIDE"),
+            nv_fa_fold: env_bool("PLOW_NV_FA_FOLD"),
+            nv_dense_tune: env_bool("PLOW_NV_DENSE_TUNE"),
+            packed_prefill_small_hd: env_bool("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
             nv_gemv_k8_b1: env_bool("PLOW_NV_GEMV_K8_B1"),
             nv_fa_split_prefill: env_bool_default_true("PLOW_NV_FA_SPLIT_PREFILL"),

@@ -221,7 +221,7 @@ pub(crate) fn nv_decode_merge_fold(c: &Cfg, fp8_kv: bool) -> bool {
         && !emit_is_apple()
         && c.tp == 1
         && !fp8_kv
-        && ((c.hd_full == 128 && c.hd_slide == 128) || wide)
+        && ((c.hd_full == 128 && c.hd_slide == 128 && emit_config::active().nv_fa_fold) || wide)
         && c.kvh_full == c.kvh_slide
         && c.kvh_full > 0
         && c.heads % c.kvh_full == 0
@@ -5284,8 +5284,9 @@ fn emit_phase(
             && emit_config::active().fuse_hnr;
         // Every model this dense emitter serves (Gemma, Llama, Qwen, Chatterbox T3) rotates
         // NeoX-style (rotate_half). HEADNORM_ROPE's legacy pairing is GPT-J interleaved at hd 64
-        // (GLM/Kimi k_rope, emitted elsewhere), so hd 64 must force the half split.
-        let rope_pair = if hd == 64 { packet::dev::ROPE_PAIR_HALF } else { 0 };
+        // (GLM/Kimi k_rope, emitted elsewhere), so hd 64 must force the half split. The AMD
+        // interpreter has no half-split hd64 arm yet, so its packets do not claim one.
+        let rope_pair = if hd == 64 && !amd { packet::dev::ROPE_PAIR_HALF } else { 0 };
         let c_qn = if fuse_hnr {
             0 // no packet: the fold computes q's norm+rope in flash's staging
         } else {
@@ -10316,6 +10317,9 @@ fn emit_dense_gqa(
         }
         let manifest = plow_asset::program::with_model(&m, |p| -> Result<_, String> {
             let live = plow_asset::live_kv::emit(p)?;
+            if !ecfg.packed_prefill_small_hd && live.caches.iter().any(|c| c.hd <= 128) {
+                return Err("hd64/hd128 attention packs only with PLOW_EMIT_PACKED_PREFILL_SMALL_HD".into());
+            }
             let request = plow_asset::packed_prefill::Manifest {
                 version: live.version,
                 max_request_rows: ecfg.max_request_chunk,

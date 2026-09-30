@@ -788,7 +788,7 @@ __device__ __noinline__ void fa_fold_tail(__nv_bfloat16* __restrict__ out,
  * last arrival merges into `out` and re-zeroes the counter (zeroed once at load). The next
  * token's flash on this layer sits behind this packet's consumers, so the reset cannot race. */
 #ifndef PLOW_NV_FA_RG
-#define PLOW_NV_FA_RG 1
+#define PLOW_NV_FA_RG 0  /* manifest `fa_rg` (PLOW_NV_FA_FOLD / E-series fa_rg_wide) */
 #endif
 #ifndef PLOW_NV_FA_RG_U
 #define PLOW_NV_FA_RG_U 4
