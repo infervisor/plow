@@ -11,7 +11,7 @@ Two claims the emit makes by OMISSION, priced here before either is changed.
 
   2. `Attention.forward` ends with `apply_rotary_emb(o[..., -rd:], freqs_cis, True)`
      (`model.py:781`) on EVERY layer, window-only ones included. The emit stops at
-     `FlashMerge`. Op 195 exists for exactly this and has no emit site.
+     `FlashMerge`. Op 207 exists for exactly this and has no emit site.
 
 The interesting question for (1) is whether a CONSISTENT wrong pairing cancels. Both q and
 the latent go through the same op, and a rotation applied in a permuted basis is conjugate to
@@ -112,11 +112,11 @@ def main():
     ok3 = dq.abs().max().item() > 1e-3 and dk.abs().max().item() > 1e-3
 
     # ---- the inverse -----------------------------------------------------------------
-    # op 195 is the conjugate, and `sin -> -sin` is the whole of it. Round-tripping is the
+    # op 207 is the conjugate, and `sin -> -sin` is the whole of it. Round-tripping is the
     # cheapest statement of that.
     rt = rope_interleaved(rope_interleaved(q, cos, sin, pos), cos, sin, pos, inverse=True)
     d_rt = (rt - q).abs().max().item()
-    print(f"[4] irope(rope(q)) == q (op 195 is the conjugate): max|err| = {d_rt:.3e}")
+    print(f"[4] irope(rope(q)) == q (op 207 is the conjugate): max|err| = {d_rt:.3e}")
     ok4 = d_rt < 1e-4
 
     # And what skipping it costs. `o` comes out of the flash still carrying the query's
@@ -124,7 +124,7 @@ def main():
     o = torch.randn(T, H, D)
     o_fixed = rope_interleaved(o, cos, sin, pos, inverse=True)
     d_o = (o - o_fixed).abs().max().item()
-    print(f"[5] attention output with vs without op 195    : max|err| = {d_o:.3e}")
+    print(f"[5] attention output with vs without op 207    : max|err| = {d_o:.3e}")
     ok5 = d_o > 1e-3
 
     print()
@@ -132,8 +132,8 @@ def main():
         "the two rope conventions are different operators": ok1,
         "a CONSISTENT wrong pairing does NOT cancel in the score": ok2,
         "both conventions actually rotate (the table is not degenerate)": ok3,
-        "op 195's sin -> -sin is exactly the inverse of the forward rope": ok4,
-        "omitting op 195 leaves the query's rotation in the attention output": ok5,
+        "op 207's sin -> -sin is exactly the inverse of the forward rope": ok4,
+        "omitting op 207 leaves the query's rotation in the attention output": ok5,
     }
     for k, v in checks.items():
         print(f"  {'PASS' if v else 'FAIL'}  {k}")

@@ -1,5 +1,5 @@
-/* op_engram.cuh -- DeepSeek-V4.1 Engram on the NVIDIA interpreter: ops 197 (the gathered fp8 table
- * read) and 196 (gate + mix), term for term the AMD bodies in runtime/amd/op_engram.h, whose header
+/* op_engram.cuh -- DeepSeek-V4.1 Engram on the NVIDIA interpreter: ops 209 (the gathered fp8 table
+ * read) and 208 (gate + mix), term for term the AMD bodies in runtime/amd/op_engram.h, whose header
  * carries the reference derivation (model.py ParallelEngramEmbedding / Engram.forward).
  *
  * The table may live in device-mapped HOST memory (384M x 256 fp8 = 98 GB per table): a prefill
@@ -11,7 +11,7 @@
 
 #define PLOW_ENGRAM_CLAMP 1e-6f
 
-/* op 196: x [T][n][hidden] in place += gate * value, gate from the normalized dot of each hc copy
+/* op 208: x [T][n][hidden] in place += gate * value, gate from the normalized dot of each hc copy
  * against its key. kv [T][(n+1)*hidden] = n keys then the shared value. tmask [T] optional. */
 __device__ void d_engram_gate(__nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ kv, const __nv_bfloat16* __restrict__ qw,
                               const __nv_bfloat16* __restrict__ kw, const unsigned char* __restrict__ tmask, unsigned T, unsigned n,
@@ -49,7 +49,7 @@ __device__ void d_engram_gate(__nv_bfloat16* __restrict__ x, const __nv_bfloat16
     }
 }
 
-/* op 197: out [T][n_cols*head_dim] bf16 = dequant(table[ids - vocab_start]) with ue8m0 per blk;
+/* op 209: out [T][n_cols*head_dim] bf16 = dequant(table[ids - vocab_start]) with ue8m0 per blk;
  * ids outside this shard's [vocab_start, vocab_start + part_rows) write zeros. */
 __device__ void d_engram_embed(__nv_bfloat16* __restrict__ out, const unsigned char* __restrict__ table,
                                const unsigned char* __restrict__ scale, const int* __restrict__ ids, unsigned T, unsigned n_cols,

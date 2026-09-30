@@ -26,7 +26,7 @@ pub const MOE_PREFILL_CUBLASLT: u8 = 16;
 /// (`PLOW_GEMMA_MOE_DEC_GROUP`), which the CUDA runtime may serve with cuBLASLt grouped matmuls
 /// (`PLOW_MOE_DEC_LT`). Without the runtime knob the rung runs in the interpreter unchanged.
 pub const MOE_DECODE_CUBLASLT: u8 = 17;
-/// DeepSeek-V4.1 prefill: one `GemmFp8Mx` (op 198) per segment on the sm_90a wgmma object
+/// DeepSeek-V4.1 prefill: one `GemmFp8Mx` (op 210) per segment on the sm_90a wgmma object
 /// `interp_sm90a_pfgemm_fp8mx.cubin`.
 pub const FP8MX_PREFILL_GEMM: u8 = 18;
 /// DeepSeek-V4.1 prefill: one `MoeGroupGluPf` or `MoeGroupDownPf` (MXFP4 experts, W4A8) per

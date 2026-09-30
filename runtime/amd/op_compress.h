@@ -118,7 +118,7 @@ __device__ __forceinline__ float cmp_dequant_fp4(unsigned n) {
  * `PLOW_CMP_Q_*` above. The clamp is the reference's, and it is not dead on the fp8 arm: an
  * absmax at the 1e-4 floor makes `x / s` exceed 448 for any channel above the floor.
  *
- * The mode is a runtime argument rather than a template parameter because op 199 picks it per
+ * The mode is a runtime argument rather than a template parameter because op 211 picks it per
  * CALL -- compressed KV and index keys differ only here -- and this runs once per `blk` channels
  * against a pooling loop of `nslot * d`. */
 __device__ __forceinline__ float cmp_block_scale(float amax, unsigned qmode,
@@ -259,7 +259,7 @@ __device__ void d_compress_pool(bf16* __restrict__ out, const bf16* __restrict__
         /* V4.1 STOPS HERE. `Compressor.forward` returns the post-norm latent BEFORE RoPE
          * (model.py:432-434) -- "Pre-RoPE is deliberate: the indexer needs the unrotated form, so
          * Attention rotates afterwards" -- and `_compress_kv` does the rope and the quant only
-         * after the indexer has read it (model.py:751-761). That tail is op 199.
+         * after the indexer has read it (model.py:751-761). That tail is op 211.
          *
          * `epilogue` is a kernel-wide immediate, so this early `continue` is workgroup-uniform and
          * the barriers below stay safe, exactly as the decode gate at the top is. */
@@ -338,7 +338,7 @@ __device__ void d_compress_pool(bf16* __restrict__ out, const bf16* __restrict__
  * Row `rbase + r` ropes at absolute position `(rbase + r) * ratio`: a latent stands for the FIRST
  * token of its group. Interleaved (GPT-J) pairs, as everywhere in this file. `pos` is the decode
  * override, with the same gate and the same slot arithmetic `d_compress_pool` takes, so a decode
- * packet that emits op 194 can emit this one beside it without patching immediates.
+ * packet that emits op 206 can emit this one beside it without patching immediates.
  *
  * `n_head > 1` makes a row `[n_head][d]` and ropes every head at the SAME position -- which is
  * what the indexer's queries are: `apply_rotary_emb(q[..., -rd:], freqs_cis[start:end])` over

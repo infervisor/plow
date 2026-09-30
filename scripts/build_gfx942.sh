@@ -946,7 +946,7 @@ if [ -n "${PLOW_HC_WAVE_TOKEN:-}" ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_HC_WAVE_TOKEN=${PLOW_HC_WAVE_TOKEN}"
 fi
 
-# GM_MX_BK sizes op 198's k-tile. 32 is the default and the shipped encoding; 64 is legal because
+# GM_MX_BK sizes op 210's k-tile. 32 is the default and the shipped encoding; 64 is legal because
 # GM_MX_PROMOTE drains at the 32-element SCALE boundary, which is a cluster boundary at any BK that
 # is a multiple of 32. Value-identical up to f32 accumulation order (the promotion order is the
 # same; the staging is not). BM/BN ride the same hatch.
@@ -1315,7 +1315,7 @@ if [ "${PLOW_MOE_PF_DET:-1}" != 0 ]; then
   fi
 fi
 
-# OPT-IN (PLOW_DSV41_BLKFP8=1): op 198, the [32,32] block-FP8 GEMM DeepSeek-V4.1-Flash's dense
+# OPT-IN (PLOW_DSV41_BLKFP8=1): op 210, the [32,32] block-FP8 GEMM DeepSeek-V4.1-Flash's dense
 # and shared-expert projections are stored in. It is a separate opcode from op 107 rather than a
 # field on it -- `const unsigned char*` against `const float*`, over a grid blocked 32 on both axes
 # instead of 128 -- so the arm is additive and costs nothing when the packet does not ask for it.
@@ -1330,7 +1330,7 @@ if [ "${PLOW_DSV41_BLKFP8:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_DSV41_BLKFP8=1"
 fi
 
-# OPT-IN (PLOW_DSV41_ENGRAM=1): ops 196/197, DeepSeek-V4.1-Flash's Engram conditional memory, on
+# OPT-IN (PLOW_DSV41_ENGRAM=1): ops 208/209, DeepSeek-V4.1-Flash's Engram conditional memory, on
 # layers 1 and 14 only. Same shape as the arm above and marker-checked the same way -- plowrt looks
 # for `plow_dsv41_engram_arm` and REFUSES the load by name without it, because the AMD dispatch's
 # `default:` does not trap, so an unbuilt arm would leave the gather and the gate writing nothing
@@ -1343,12 +1343,12 @@ if [ "${PLOW_DSV41_ENGRAM:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_DSV41_ENGRAM=1"
 fi
 
-# OPT-IN (PLOW_DSV4_CSA2=1): ops 194/195/199, the CSA2 compressor, the inverse RoPE on the
+# OPT-IN (PLOW_DSV4_CSA2=1): ops 206/207/211, the CSA2 compressor, the inverse RoPE on the
 # attention output and the compressed-row rope+quant tail. Marker-checked as `plow_dsv4_csa2_arm`.
 #
 # THE SAME LINE THE ENGRAM ARM WAS MISSING, found the same way and before it cost a queue slot:
 # the C side, the ISA, the dispatch and `manifest.rs`'s `requires` all named PLOW_DSV4_CSA2 and
-# nothing here turned it into a -D. Op 195 makes this reach every V4.1 layer, not only the four
+# nothing here turned it into a -D. Op 207 makes this reach every V4.1 layer, not only the four
 # with a compressor -- `apply_rotary_emb(o[..., -rd:], freqs_cis, True)` runs on all 40 -- so an
 # object without it now refuses a layer-0 packet that used to load.
 if [ "${PLOW_DSV4_CSA2:-0}" = 1 ]; then

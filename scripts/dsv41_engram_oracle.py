@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Are ops 196/197 V4.1's Engram? A numerical oracle on tiny synthetic shapes.
+"""Are ops 208/209 V4.1's Engram? A numerical oracle on tiny synthetic shapes.
 
     PYTHONPATH=/workspace/oracle-venv/site python3 scripts/dsv41_engram_oracle.py
 
 Engram is next on the emit list -- layer 1 is the cheapest remaining layer because its
 `compress_ratio` is 0, so Engram is the ONLY thing it is missing. Three times now a V4.1 subsystem
 has turned out to be a rearrangement of a shipped one with identical tensor shapes and different
-structure (the CSA2 read side, op 194's missing tap, the cross-sublayer mHC), each marked Done on
+structure (the CSA2 read side, op 206's missing tap, the cross-sublayer mHC), each marked Done on
 a reading. So the device side gets measured against the reference before anything is built on it.
 
 `run_ref_*` are transcriptions of `inference/model.py` (`ParallelEngramEmbedding.forward` 312-325,
@@ -43,7 +43,7 @@ def e8m0(x):
     return torch.exp2(torch.round(torch.log2(x.clamp_min(1e-30))))
 
 
-# ---------------------------------------------------------------- op 197 / the embed
+# ---------------------------------------------------------------- op 209 / the embed
 
 
 def run_ref_embed(ids, table, scale, vocab_start, part_rows):
@@ -79,7 +79,7 @@ def run_op_embed(ids, table, scale, vocab_start, part_rows):
     return out
 
 
-# ---------------------------------------------------------------- op 196 / the gate
+# ---------------------------------------------------------------- op 208 / the gate
 
 
 def run_ref_gate(x, kv, qw, kw, tmask):
@@ -138,7 +138,7 @@ def rel(a, b):
 def main():
     checks = {}
 
-    # ---- op 197 ----------------------------------------------------------
+    # ---- op 209 ----------------------------------------------------------
     part_rows, vocab_start = ROWS, 7  # rank 1 of a sharded table
     table = fp8_e4m3(torch.randn(part_rows, HEAD_DIM) * 4).to(torch.float8_e4m3fn)
     scale = e8m0(torch.rand(part_rows, HEAD_DIM // BLK) * 3 + 0.1)
@@ -147,8 +147,8 @@ def main():
     a = run_ref_embed(ids, table.float(), scale, vocab_start, part_rows).flatten(1)
     b = run_op_embed(ids, table.float(), scale, vocab_start, part_rows)
     d1, _ = rel(b, a)
-    print(f"[1] op 197 vs ParallelEngramEmbedding, all in shard : max|err| = {d1:.3e}")
-    checks["op 197's dequant and its flat [n_cols*head_dim] layout are the reference's"] = d1 == 0.0
+    print(f"[1] op 209 vs ParallelEngramEmbedding, all in shard : max|err| = {d1:.3e}")
+    checks["op 209's dequant and its flat [n_cols*head_dim] layout are the reference's"] = d1 == 0.0
 
     # Ids outside the shard. The kernel compares SIGNED, so an id below vocab_start must fall out
     # rather than wrapping to a huge in-range-looking index.
@@ -162,7 +162,7 @@ def main():
     print(f"[2] ... with ids below AND above the shard         : max|err| = {d2:.3e}, out-of-shard = {z:.3e}")
     checks["an id on either side of the shard writes zeros, not a wrapped row"] = d2 == 0.0 and z == 0.0
 
-    # ---- op 196 ----------------------------------------------------------
+    # ---- op 208 ----------------------------------------------------------
     x = torch.randn(TOK, HC, DIM)
     kv = torch.randn(TOK, (HC + 1) * DIM)
     qw = torch.randn(HC, DIM)
@@ -171,8 +171,8 @@ def main():
     a, ga = run_ref_gate(x, kv, qw, kw, None)
     b, gb = run_op_gate(x, kv, qw, kw, None)
     d3, _ = rel(b, a)
-    print(f"[3] op 196 vs Engram.forward, no mask              : max|err| = {d3:.3e}")
-    checks["op 196's gate and mix are Engram.forward's"] = d3 < 1e-12
+    print(f"[3] op 208 vs Engram.forward, no mask              : max|err| = {d3:.3e}")
+    checks["op 208's gate and mix are Engram.forward's"] = d3 < 1e-12
 
     tmask = torch.tensor([True, False, True, True, False])
     a, ga = run_ref_gate(x, kv, qw, kw, tmask)
@@ -227,7 +227,7 @@ def main():
     if bad:
         print(f"{bad} check(s) FAILED")
         return 1
-    print("Ops 196 and 197 ARE V4.1's Engram. The gap for layers 1 and 14 is the EMIT, not the kernels.")
+    print("Ops 208 and 209 ARE V4.1's Engram. The gap for layers 1 and 14 is the EMIT, not the kernels.")
     return 0
 
 

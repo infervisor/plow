@@ -1,14 +1,14 @@
 /* op_compress.cuh -- DeepSeek-V4.1's KV compressor tail on the warp32 interpreters. Same operands and
  * semantics as runtime/amd/op_compress.h (read its notes), restricted to what V4.1 emits:
  *
- * PLOW_DOP_COMPRESS_POOL (194), arm i7 == 2 only: per-channel softmax pool over coff*ratio slots,
+ * PLOW_DOP_COMPRESS_POOL (206), arm i7 == 2 only: per-channel softmax pool over coff*ratio slots,
  *   bf16 round, RMSNorm(gamma), bf16 round, STOP (model.py Compressor.forward). V4's rope/quant and
  *   Hadamard epilogues (i7 0/1) trap.
- * PLOW_DOP_COMPRESS_ROPE_QUANT (199): interleaved rope of the last rd channels at (row_base+r)*ratio,
+ * PLOW_DOP_COMPRESS_ROPE_QUANT (211): interleaved rope of the last rd channels at (row_base+r)*ratio,
  *   then a fake quant per qblk block (kernel.py fp4_act_quant / act_quant, inplace=True). One thread
  *   per block, 16 B loads; needs qblk % 8 == 0, qblk <= 32, (d - rd) % 8 == 0 and (rd/2) % 4 == 0,
  *   which all three V4.1 call sites meet.
- * PLOW_DOP_ROPE_INVERSE_O (195): conjugate rotation of the last rd dims of each head, in place.
+ * PLOW_DOP_ROPE_INVERSE_O (207): conjugate rotation of the last rd dims of each head, in place.
  *
  * The fp4 rounding is nearest-even (the reference's cast); the AMD ladder rounds exact ties away
  * from zero, so the two differ on exact midpoints only.

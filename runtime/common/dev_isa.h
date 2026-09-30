@@ -1470,7 +1470,7 @@ enum {
      * Interleaved (GPT-J) pairs, NOT the half-split HeadNormRope defaults to. In place.
      *   t0=o(in/out) t1=cosb t2=sinb t3=pos(may be 0)
      *   i0=n_tok i1=n_head i2=D i3=rd i4=pos0
-     * `t3` supersedes `i4` when present, for the same reason op 194's does. */
+     * `t3` supersedes `i4` when present, for the same reason op 206's does. */
     PLOW_DOP_ROPE_INVERSE_O = 207,
     /* DeepSeek-V4.1 Engram conditional memory: the gate + mix (`op_engram.h` d_engram_gate,
      * [DSV41-ENGRAM]). The n-gram HASH is host work -- integer over token ids alone, with its

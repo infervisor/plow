@@ -220,7 +220,7 @@ mod hsa {
             // token ids alone -- `plowrt::text::engram::EngramHasher`. A rung has no prompt, so
             // this is the same kind of stand-in as the seeded entry: ids spread over the WHOLE
             // table, which is also what a real hash produces and what exercises the row-split.
-            // Every rank gets the SAME ids, because op 197 subtracts its own shard base; a rank
+            // Every rank gets the SAME ids, because op 209 subtracts its own shard base; a rank
             // seeded differently would gather different rows and the all-reduce would sum rows
             // from eight unrelated n-grams.
             if let Some(b) = g.rank(r).tensor_bytes("in.engram_ids") {

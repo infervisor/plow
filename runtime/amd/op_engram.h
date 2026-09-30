@@ -17,7 +17,7 @@
  *      kernel here. (It cannot be folded into the embed op either: the lookback stops at a dead
  *      token, so a position's ids depend on the mask, not only on its own id.)
  *
- *   2. EMBED -- `d_engram_embed` below, op 197. The 24 ids fetch 24 fp8 rows of
+ *   2. EMBED -- `d_engram_embed` below, op 209. The 24 ids fetch 24 fp8 rows of
  *      `engram_head_dim`, dequantized by their ue8m0 block scales and laid out flat as
  *      `n_hash_cols * head_dim` (6144) per token. The PROJECTION that follows it (`wkv`, to
  *      `dim * (hc_mult + 1)` = 25600) is an ordinary fp8 block-scale GEMM and needs no opcode of
@@ -25,7 +25,7 @@
  *      tensor in the checkpoint by a wide margin -- 384 006 168 rows of 256 fp8 is 98.3 GB, and
  *      there are two of them.
  *
- *   3. GATE + MIX -- `d_engram_gate` below, op 196. `wkv`'s output splits into `hc_mult` keys and
+ *   3. GATE + MIX -- `d_engram_gate` below, op 208. `wkv`'s output splits into `hc_mult` keys and
  *      one shared value; the gate is a normalized dot of the residual stream against the key, and
  *      the value is added into every hc copy under it.
  *
@@ -68,7 +68,7 @@
  * kernel -- the same contract PLOW_HC_POST_MULT carries in op_hyperconn.h. */
 #define PLOW_ENGRAM_CLAMP 1e-6f
 
-/* op 196 — Engram gate + mix, in place on `x`.
+/* op 208 — Engram gate + mix, in place on `x`.
  *
  *   x        [T][n][hidden]   the residual stream's hc copies, bf16, READ AND WRITTEN
  *   kv       [T][(n+1)*hidden] `wkv`'s output: n keys then one shared value, bf16
@@ -141,7 +141,7 @@ __device__ void d_engram_gate(bf16* __restrict__ x, const bf16* __restrict__ kv,
 }
 
 
-/* op 197 — Engram stage 2's gathered table read (`ParallelEngramEmbedding.forward`,
+/* op 209 — Engram stage 2's gathered table read (`ParallelEngramEmbedding.forward`,
  * model.py:296-325). The 24 hash ids fetch 24 fp8 rows of `head_dim`, each dequantized by its
  * own ue8m0 block scales, laid out flat as one `n_cols * head_dim` row per token -- which is
  * exactly the operand `wkv` wants, so no reshape op sits between this and the GEMM.

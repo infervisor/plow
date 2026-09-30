@@ -3,7 +3,7 @@
 //! DeepSeek-V4.1-Flash hashes each position against the `max_ngram_size - 1` tokens before it,
 //! once per (n-gram size, head) pair, into that pair's own prime-sized bucket range. The result
 //! is `(max_ngram_size - 1) * n_heads` = 24 row ids per token, which the device side then gathers
-//! (op 197) and mixes (op 196).
+//! (op 209) and mixes (op 208).
 //!
 //! **This is integer work over TOKEN IDS ALONE.** It reads no activation, so it is not a kernel —
 //! it is a tensor the host builds, like `pos` or `row_token`. It cannot be folded into the embed

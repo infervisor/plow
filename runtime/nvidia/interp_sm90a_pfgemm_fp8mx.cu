@@ -1,4 +1,4 @@
-/* interp_sm90a_pfgemm_fp8mx.cu -- prefill segment role object for PLOW_DOP_GEMM_FP8_MX (op 198).
+/* interp_sm90a_pfgemm_fp8mx.cu -- prefill segment role object for PLOW_DOP_GEMM_FP8_MX (op 210).
  *
  * DeepSeek-V4.1's block-fp8 projections at a [32, 32] ue8m0 grid on the Hopper wgmma tile of
  * op_wg_sm90.cuh: one 128 x 256 output tile per iteration, the producer warpgroup decoding the e4m3

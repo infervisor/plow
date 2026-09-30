@@ -1,4 +1,4 @@
-/* op_gemv_fp8mx.cuh -- PLOW_DOP_GEMM_FP8_MX (op 198) at decode rows (T <= 64) on the interpreter.
+/* op_gemv_fp8mx.cuh -- PLOW_DOP_GEMM_FP8_MX (op 210) at decode rows (T <= 64) on the interpreter.
  *
  * DeepSeek-V4.1's block-fp8 projections at a [32, 32] ue8m0 grid, weight-streaming. The weight is
  * the MMA's A operand (16 output rows per warp tile), the <= 64 tokens are B (NT n8 tiles), and

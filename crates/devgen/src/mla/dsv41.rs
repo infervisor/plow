@@ -196,7 +196,7 @@ pub(crate) fn dsv41_gaps(c: &Dsv41Cfg) -> Vec<String> {
     let [ob, ib] = c.raw.quantization_config.weight_block_size;
     vec![
         // FIRST, because it is now the whole remaining job. The kernel gate that used to lead this
-        // list is CLOSED: op 198 / d_gemm_t<WFP8MX> reads the [{ob}, {ib}] ue8m0 grid, passes 12/12
+        // list is CLOSED: op 210 / d_gemm_t<WFP8MX> reads the [{ob}, {ib}] ue8m0 grid, passes 12/12
         // on gfx942, and `emit_pf_gemm_fp8_mx` emits it. What is left is the emitter around it.
         format!(
             "full-model emit: there is no `declare_dsv41_rows_batched` and no \
@@ -212,7 +212,7 @@ pub(crate) fn dsv41_gaps(c: &Dsv41Cfg) -> Vec<String> {
         format!(
             "CSA2 emit: the compressor runs on the {} kv_source layers {:?} and every one of the \
              {} layers READS that cache, so a per-layer compressor is the wrong shape (ops \
-             194/195 exist and dispatch)",
+             206/207 exist and dispatch)",
             c.kv_source.len(),
             c.kv_source,
             c.layers
@@ -526,7 +526,7 @@ pub(crate) struct Dsv41ProjAct {
 
 /// Emit one layer's attention PROJECTION chain: the four GEMMs that feed the attention core.
 ///
-/// This is where op 198 earns its place. Every GEMM here reads `[32, 32]` ue8m0 block-fp8 weights,
+/// This is where op 210 earns its place. Every GEMM here reads `[32, 32]` ue8m0 block-fp8 weights,
 /// and together with `wo_a`/`wo_b` they are **82.98 TFLOP of the 281.6 TFLOP 8k prefill** -- the
 /// single largest term after the routed experts, and the reason the block-fp8 arm was item 0.
 ///
@@ -672,7 +672,7 @@ pub(crate) struct Dsv41Compress {
     /// `xn @ compressor.wgate^T`, `[T][head_dim]` bf16. Unused at ratio 1, which has no gate.
     pub(crate) gate: u32,
     /// The post-norm, PRE-RoPE latent, `[ctx][head_dim]` bf16 -- what the INDEXER reads, and the
-    /// reason op 194 stops after the norm. Separate from `cache` because op 199 must not
+    /// reason op 206 stops after the norm. Separate from `cache` because op 211 must not
     /// overwrite what the indexer still has to read.
     pub(crate) latent: u32,
 }
@@ -717,18 +717,18 @@ pub(crate) fn declare_dsv41_compress(
 ///
 /// `kv_source_layer_ids` is `[2, 8, 14, 20]` and `compress_ratios` gives 2, 2, 2 and **1**. At
 /// ratio 1 `Compressor.forward` returns on its first line -- `self.norm(self.wkv(x))`, no gate, no
-/// fp32, no pooling (`model.py:461-462`) -- so layer 20 is a plain GEMM plus an RMSNorm and op 194
+/// fp32, no pooling (`model.py:461-462`) -- so layer 20 is a plain GEMM plus an RMSNorm and op 206
 /// must not run at all. `compressor_has_gate` is what the tensor table already keys the `wgate`
 /// weight on, and this uses the same predicate rather than a second reading of the ratio.
 ///
 /// # The pooled form
 ///
-/// Op 194 with `coff = 1` and a NULL `ape`. V4.1 has neither the overlap transform nor the
-/// position-in-block bias -- `scripts/dsv41_csa2_oracle.py` check [1] puts op 194 at max err
+/// Op 206 with `coff = 1` and a NULL `ape`. V4.1 has neither the overlap transform nor the
+/// position-in-block bias -- `scripts/dsv41_csa2_oracle.py` check [1] puts op 206 at max err
 /// 0.000e+00 against the reference on those terms, and check [2] shows a nonzero `ape` is worth
 /// 1.65, so omitting it is a claim and not a formality.
 ///
-/// `i7 = 2` stops the op after the norm. The rope and the fake quant are op 199, because
+/// `i7 = 2` stops the op after the norm. The rope and the fake quant are op 211, because
 /// `Compressor.forward` returns the latent BEFORE RoPE for the indexer's sake and `_compress_kv`
 /// finishes it afterwards (`model.py:751-761`).
 ///
@@ -1055,7 +1055,7 @@ pub(crate) fn emit_dsv41_indexer(
     // "the index keys are derived from the compressor's latent, so only a layer that compresses
     // its own KV can produce them; every other indexer reads them from that layer's cache"
     // (model.py:498-500). And they are derived from the PRE-RoPE latent, which is the whole
-    // reason op 194 stops after the norm.
+    // reason op 206 stops after the norm.
     let mut key_dep: Vec<u32> = Vec::new();
     if c.kv_source.contains(&l) {
         let cp = cp.expect("a kv_source layer has a compressor");
@@ -1079,7 +1079,7 @@ pub(crate) fn emit_dsv41_indexer(
             d.f[0] = c.eps;
         });
         // `fp4_act_quant(k, fp4_block_size, True)` -- blocks of 32 with an E8M0 scale, which is
-        // the OTHER of op 199's two settings. A key stands for its group's first token, so it
+        // the OTHER of op 211's two settings. A key stands for its group's first token, so it
         // ropes at `j * ratio` exactly as the cache row does.
         key_dep.push(b.emit(DevOp::CompressRopeQuant, all.clone(), &[c_kn], |d| {
             d.t[0] = ix.keys;
@@ -1117,7 +1117,7 @@ pub(crate) fn emit_dsv41_indexer(
         deps,
     );
     // One angle per TOKEN across all 32 heads, then fp4 at 32 over each head's whole 128 --
-    // op 199's third call site, `i7 = n_head`.
+    // op 211's third call site, `i7 = n_head`.
     let c_qr = b.emit(DevOp::CompressRopeQuant, all.clone(), &[c_q], |d| {
         d.t[0] = ix.qr;
         d.t[1] = ix.q;
@@ -1314,7 +1314,7 @@ pub(crate) struct Dsv41Engram {
     pub(crate) emb: u32,
     /// `wkv`'s output: `hc_mult` keys then ONE shared value, `[T][(hc_mult + 1) * hidden]` bf16.
     pub(crate) kv: u32,
-    /// `[T][n_cols]` i32, the n-gram row ids. GLOBAL ids, not shard-local: op 197 does the
+    /// `[T][n_cols]` i32, the n-gram row ids. GLOBAL ids, not shard-local: op 209 does the
     /// signed subtract itself so one uploaded tensor serves every rank.
     pub(crate) ids: u32,
 }
@@ -1353,22 +1353,22 @@ pub(crate) fn engram_cols(c: &Dsv41Cfg) -> u32 {
 ///
 /// `Block.__init__` constructs `self.engram` but `Block.forward` never calls it.
 /// `Transformer.forward` does, in the layer loop and ahead of the block (`model.py:1262-1267`),
-/// so op 196 is in place on the hc-EXPANDED stream `[T][hc_mult][hidden]` before this layer's mHC
+/// so op 208 is in place on the hc-EXPANDED stream `[T][hc_mult][hidden]` before this layer's mHC
 /// collapses it. See `dsv41_layer_parts` for what that cost when the table said otherwise.
 ///
 /// # Four ops, and the all-reduce is the reference's own
 ///
-///   1. **op 197**, the gather. The table is 384 006 168 rows of 256 fp8 -- 98.31 GB, so a
+///   1. **op 209**, the gather. The table is 384 006 168 rows of 256 fp8 -- 98.31 GB, so a
 ///      replicated copy does not fit on a 192 GB MI300X at all -- and is row-split. A rank writes
 ///      ZEROS for any id outside its shard.
 ///   2. **`XReduce`**, which sums those shards. This is `ParallelEngramEmbedding.forward`'s own
 ///      `dist.all_reduce(values)` (`model.py:323-324`), not an artifact of this emit, and it is
 ///      why the gather lands in a peer slot rather than in ordinary VRAM.
-///   3. **op 198**, `wkv`. Block-fp8 at a `[32, 32]` ue8m0 grid, `[T][6144] -> [T][25600]`. The
+///   3. **op 210**, `wkv`. Block-fp8 at a `[32, 32]` ue8m0 grid, `[T][6144] -> [T][25600]`. The
 ///      reduce comes BEFORE it, as the reference has it. `wkv` is linear and bias-free so the two
 ///      orders agree in exact arithmetic, but reducing after would quantize partial sums, and it
 ///      would also reduce a tensor four times wider.
-///   4. **op 196**, the gate and mix, in place on the residual.
+///   4. **op 208**, the gate and mix, in place on the residual.
 ///
 /// `token_mask` is `TENSOR_NONE`: it selects image spans, which take part in no n-gram, and a
 /// text-only prefill has none. A VL path must pass it -- a masked token has to pass through
@@ -1704,7 +1704,7 @@ pub(crate) fn emit_dsv41_moe(
     xn2: u32,
     c_norm: u32,
     // The shared expert's output tensor and completion dep. V4.1's shared expert is block-FP8
-    // while these experts are MXFP4, so the caller emits it on op 198 and this only combines it.
+    // while these experts are MXFP4, so the caller emits it on op 210 and this only combines it.
     shared: (u32, u32),
     xgate: &mut u32,
     cus: &[u32],
@@ -2101,7 +2101,7 @@ pub(crate) fn emit_dsv41_attn_core(
     // THE INVERSE ROPE, which this emit used to leave out entirely.
     //
     // `Attention.forward` ends `apply_rotary_emb(o[..., -rd:], freqs_cis, True)` (model.py:781) on
-    // EVERY layer, window-only ones included -- op 195's own header calls it "STRUCTURAL, not
+    // EVERY layer, window-only ones included -- op 207's own header calls it "STRUCTURAL, not
     // cosmetic", because `o` mixes cached rows each rotated by its OWN position and de-rotating by
     // the QUERY's position is what leaves a position-independent latent for the fixed `wo_a`. The
     // op has existed since the CSA2 wiring and had no emit site; a layer without it runs, stays
@@ -2202,11 +2202,11 @@ pub(crate) fn emit_dsv41_attn_out(
 ) -> (Dsv41OutAct, Vec<u32>) {
     let (groups, orow, ocol) = c.wo_a_groups();
     // Rank r's OutSplit rows of wo_a are groups r*gpr .. (r+1)*gpr -- the same cut as its heads,
-    // since a group is heads / o_groups heads -- so below TP8 the rank runs op 198's grouped form.
+    // since a group is heads / o_groups heads -- so below TP8 the rank runs op 210's grouped form.
     assert!(
         groups % tp == 0 && (tp == groups || !crate::emit_is_amd()),
         "the output LoRA is block-diagonal over {groups} groups; tp must divide it (tp is {tp}), \
-         and on AMD equal it -- the AMD arm has no grouped op 198. Missing capability: \
+         and on AMD equal it -- the AMD arm has no grouped op 210. Missing capability: \
          `emit_dsv41_out_lora_tp{tp}`."
     );
     let gpr = groups / tp;
@@ -2434,7 +2434,7 @@ pub(crate) struct Dsv41FfnAct {
 /// Emit the FFN pre-norm and the SHARED expert (not the routed ones).
 ///
 /// The shared expert is block-FP8 on the `[32, 32]` ue8m0 grid like every other dense projection,
-/// which is why it is 23.19 TFLOP of the 8k prefill and why it lands here on op 198 rather than
+/// which is why it is 23.19 TFLOP of the 8k prefill and why it lands here on op 210 rather than
 /// with the routed experts. The ROUTED experts are MXFP4 on ops 85/86 -- a different fetch path
 /// entirely, and the reason this checkpoint needs a mixed encoding at all.
 ///
@@ -2648,7 +2648,7 @@ pub(crate) enum Part {
 ///
 /// The output side needs the same offset with the rotation INVERTED: `model.py:781` and `:1068`
 /// run `apply_rotary_emb(o[..., -rd:], freqs_cis, True)` on the attention output before the output
-/// LoRA reads it. Op 195 already does inverse RoPE; it needs the same interior range.
+/// LoRA reads it. Op 207 already does inverse RoPE; it needs the same interior range.
 ///
 /// Emitting `<512, 64>` here instead would read 64 bytes past every latent row and still produce
 /// fluent output, which is the failure this rung refuses on purpose.
@@ -3533,25 +3533,25 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
     //         h = layer.engram(h, engram_hashes[:, :, layer.engram.layer_hash_index, :], mask)
     //     h, pre_mix = layer(h, start_pos, pre_mix, image_mask)   # model.py:1262-1267
     //
-    // so it reads and writes the hc-EXPANDED residual stream (`[T, hc_mult, dim]`, op 196 is in
+    // so it reads and writes the hc-EXPANDED residual stream (`[T, hc_mult, dim]`, op 208 is in
     // place on it) before this layer's mHC pre ever runs -- not the post-attention activation an
-    // FFN-sublayer position would hand it. `scripts/dsv41_engram_oracle.py` confirms ops 196/197
+    // FFN-sublayer position would hand it. `scripts/dsv41_engram_oracle.py` confirms ops 208/209
     // themselves are the reference's, to 0.000e+00 on the embed and 2.2e-16 on the gate, so the
     // whole of what is left here is placement and plumbing.
     if c.engram_layers.contains(&l) {
         p.push((
-            "engram gather + all-reduce + wkv + gate (ops 197/198/196), BEFORE mhc_pre",
+            "engram gather + all-reduce + wkv + gate (ops 209/210/208), BEFORE mhc_pre",
             Part::Done,
         ));
     }
 
     p.push(("mhc_pre (ops 128/129, cross-sublayer `pre`)", Part::Done));
-    p.push(("attn_norm + q_a/q_b/wkv projections (op 198)", Part::Done));
+    p.push(("attn_norm + q_a/q_b/wkv projections (op 210)", Part::Done));
     if c.kv_source.contains(&l) {
-        // Ops 194 (arm 2: pool, norm, STOP) and 199 (rope + fp4/E4M3 quant), or at layer 20's
-        // ratio 1 a plain GEMM and RMSNorm with no op 194 at all. NOT 195 -- that is the inverse
+        // Ops 206 (arm 2: pool, norm, STOP) and 211 (rope + fp4/E4M3 quant), or at layer 20's
+        // ratio 1 a plain GEMM and RMSNorm with no op 206 at all. NOT 207 -- that is the inverse
         // rope on the attention OUTPUT, which every layer runs and which now sits in the core.
-        p.push(("csa2 compressor (ops 194/199), writes the shared cache", Part::Done));
+        p.push(("csa2 compressor (ops 206/211), writes the shared cache", Part::Done));
     }
     if c.index_source.contains(&l) {
         // Ops 117/118, with the new pool-granular causal bound. "Two-level" is the candidate
@@ -3588,11 +3588,11 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
             Part::Done,
         ));
     }
-    p.push(("output projection wo_a + wo_b (op 198)", Part::Done));
+    p.push(("output projection wo_a + wo_b (op 210)", Part::Done));
     p.push(("output all-reduce (XReduce, wo_b is input-parallel)", Part::Done));
     p.push(("ffn_norm", Part::Done));
     p.push(("moe router + routed experts (ops 85/86, MXFP4)", Part::Done));
-    p.push(("shared expert (op 198 + clamped SwiGLU)", Part::Done));
+    p.push(("shared expert (op 210 + clamped SwiGLU)", Part::Done));
     p.push(("mhc_post", Part::Done));
     p
 }
@@ -3634,7 +3634,7 @@ pub(crate) fn dsv41_emit_block_plan(c: &Dsv41Cfg, l: u32) -> Result<Vec<&'static
          \nA rung is a validation artifact, not a serving model, so it MAY be narrower than the \
          full emit -- but it must not be wrong. A blob missing its attention core loads, runs, and \
          produces fluent-looking garbage, so this refuses instead of writing one.\n\
-         Mostly the emit is the gap -- ops 194/195, 196/197, 198 and 55 exist and pass on gfx942 \
+         Mostly the emit is the gap -- ops 206/207, 208/209, 210 and 55 exist and pass on gfx942 \
          -- but not entirely, and the one kernel difference is easy to miss: `op_compress.h` \
          implements V4's contract, where the fake-quant rounds the per-block scale to a POWER OF \
          TWO. V4.1's compressed KV wants an E4M3 scale at group 16 (`fp4_act_quant(latent, 16, \
@@ -3771,7 +3771,7 @@ pub(crate) fn dsv41_layer_tensors(c: &Dsv41Cfg, l: u32) -> Vec<LayerTensor> {
     }
 
     // Engram, on 2 layers. `embed` is the 98 GB table; `q_weight`/`k_weight` are [hc_mult, hidden]
-    // -- one row per hyper-connection copy, which is what op 196 takes as `qw`/`kw`.
+    // -- one row per hyper-connection copy, which is what op 208 takes as `qw`/`kw`.
     if let Some(rows) = c.raw.engram_rows(l) {
         let rows = rows as u64;
         let (ehd, ehe) = (c.raw.engram_head_dim as u64, c.raw.engram_n_heads as u64);

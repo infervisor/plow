@@ -331,7 +331,7 @@ extern "C" __device__ unsigned plow_dsv41_blkfp8_arm = 1;
 #if PLOW_DSV4_CSA2
 #include "op_compress.h"
 /* CONDITIONALLY compiled, like PLOW_MOE_PF_ATOMIC's marker and unlike the unconditional
- * part16/a8 ones: an object built without the axis has no case for ops 194/195 at all, so a
+ * part16/a8 ones: an object built without the axis has no case for ops 206/207 at all, so a
  * CSA2 packet would fall through the switch. The loader refuses on the missing symbol instead. */
 extern "C" __device__ unsigned plow_dsv4_csa2_arm = 1;
 #endif
@@ -867,13 +867,13 @@ extern "C" __device__ unsigned plow_prefill_nrn_consumer_1 = 1;
  * PLOW_GQ_BATCH must stay 1: claiming >1 packet per fetch-add starves parallelism (a K-wide batch is
  * drained by only n_cu/K workgroups), measured 6-8x slower at K=8. The knob exists only to document
  * that dead end; do not raise it. */
-/* DeepSeek-V4 CSA2 (ops 194/195). Own flag for the same reason PLOW_MOE_PREFILL has one: the
+/* DeepSeek-V4 CSA2 (ops 206/207). Own flag for the same reason PLOW_MOE_PREFILL has one: the
  * compressor is a second pooling body with its own LDS staging, and nothing but a V4 object can
  * reach it. Off => every existing object is byte-identical. */
 #ifndef PLOW_DSV4_CSA2
 #define PLOW_DSV4_CSA2 0
 #endif
-/* DeepSeek-V4.1 Engram (op 196). Its own flag rather than riding PLOW_DSV4_CSA2: a model can
+/* DeepSeek-V4.1 Engram (op 208). Its own flag rather than riding PLOW_DSV4_CSA2: a model can
  * have CSA2 without Engram (V4 does), and only two layers of V4.1 carry a table. Off => every
  * existing object is byte-identical. */
 #ifndef PLOW_DSV41_BLKFP8

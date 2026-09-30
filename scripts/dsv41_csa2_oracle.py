@@ -1,18 +1,18 @@
-"""CSA2 compressor oracle: the V4.1 reference against a model of what op 194 computes.
+"""CSA2 compressor oracle: the V4.1 reference against a model of what op 206 computes.
 
 The reference half is transcribed from the checkpoint's own `inference/model.py` (`class
 Compressor`, 429-486; `RMSNorm`, 281; `apply_rotary_emb`, 392) and `inference/kernel.py`
-(`fp4_act_quant`, 184). The op-194 half is transcribed from `runtime/amd/op_compress.h` --
+(`fp4_act_quant`, 184). The op-206 half is transcribed from `runtime/amd/op_compress.h` --
 its header states the math and `cmp_fake_quant_block` states the epilogue.
 
 It answers three questions that doc 12.10 currently answers by READING:
-  1. does V4.1's compressor equal op 194's with ape = 0 and coff = 1?
+  1. does V4.1's compressor equal op 206's with ape = 0 and coff = 1?
   2. is the per-block scale format the ONLY remaining difference?
   3. what tolerance does a hardware test get to assert?
 
 Checks 7-10 then cover the SPLIT those answers forced. `Compressor.forward` returns the latent
-before RoPE, so op 194 gained an arm that stops after the norm (`PLOW_CMP_EPI_NORM`) and the rope
-and the quant moved to op 199 (`d_compress_rope_quant`), which is where `_compress_kv` and the
+before RoPE, so op 206 gained an arm that stops after the norm (`PLOW_CMP_EPI_NORM`) and the rope
+and the quant moved to op 211 (`d_compress_rope_quant`), which is where `_compress_kv` and the
 indexer's `wk` both do them. Those checks price the pair against the reference end to end, and
 they pin the E4M3 amax floor, which is the one constant in the epilogue that is chosen rather
 than conservative.
@@ -79,7 +79,7 @@ def quant_fp4(q):
 def fake_quant(x, blk, scale_mode):
     """kernel.py fp4_act_quant(inplace=True): quantize then dequantize, back to bf16.
 
-    `scale_mode` is the whole question: op 194 rounds the scale to a POWER OF TWO
+    `scale_mode` is the whole question: op 206 rounds the scale to a POWER OF TWO
     (plow_round_scale); V4.1 asks for an E4M3 scale.
     """
     y = x.float().clone()
@@ -177,7 +177,7 @@ def main():
     d_q = (q_e4m3.float() - lat.float()).abs().max().item()
     print(f"[5] fake-quant(e4m3) vs unquantized latent                : max|err| = {d_q:.3e}")
 
-    # THE QUANT SPAN. op 194's attention arm quantizes [0, d-rd) only -- "rope dims stay bf16
+    # THE QUANT SPAN. op 206's attention arm quantizes [0, d-rd) only -- "rope dims stay bf16
     # for positional precision", citing V4's model.py:510. V4.1 quantizes the WHOLE latent:
     # `fp4_act_quant(latent, 16, True, ...)` with no slice (model.py:760), and `_window_kv`'s
     # own docstring says the window K is "quantized over the whole post-RoPE vector, RoPE tail
@@ -190,7 +190,7 @@ def main():
     print(f"[6] quant span d vs d-rd (rope tail left bf16)            : max|err| = {d_span:.3e}")
     ok5 = d_span > 1e-3
 
-    # ---- the split: op 194 arm 2 (stop after norm) + op 199 -------------------
+    # ---- the split: op 206 arm 2 (stop after norm) + op 211 -------------------
     # A latent stands for the first token of its group, so group j ropes at position j * ratio
     # (model.py:753-756). The tables here are arbitrary; what is under test is that the two
     # halves compose to exactly the reference's one expression.
@@ -224,7 +224,7 @@ def main():
     print(f"[9] index keys (blk 32, E8M0) vs KV settings (blk 16, E4M3): max|err| = {d9:.3e}")
     ok9 = d9 > 1e-3
 
-    # And the tap itself: what op 194 arm 2 writes is what the indexer's `wk` consumes, which is
+    # And the tap itself: what op 206 arm 2 writes is what the indexer's `wk` consumes, which is
     # the pre-RoPE latent and NOT the cache row. If those were interchangeable the split would
     # have been unnecessary.
     d10 = (ref.float() - ref_cache.float()).abs().max().item()
@@ -238,7 +238,7 @@ def main():
         "ratio 1 is a plain projection with no gate": ok3,
         "the scale format is a REAL difference, not a rounding detail": ok4,
         "the quant SPAN differs too: V4.1 quantizes the rope tail, V4 does not": ok5,
-        "op 194 arm 2 + op 199 IS _compress_kv, exactly": ok7,
+        "op 206 arm 2 + op 211 IS _compress_kv, exactly": ok7,
         "the E4M3 amax floor is the one that keeps a zero block's scale nonzero": ok8,
         "the index-key and compressed-KV quant settings are NOT interchangeable": ok9,
         "the pre-RoPE tap is not the cache row, so the split is load-bearing": ok10,

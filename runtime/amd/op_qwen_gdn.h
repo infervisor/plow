@@ -360,7 +360,7 @@ __device__ void d_qwen_headnorm_rope_t(bf16* out, const bf16* in, const bf16* ga
                      *
                      * No bf16 round on the table here, unlike the arm below: `apply_rotary_emb`
                      * multiplies by a complex64 `freqs_cis` in f32 and rounds only the result,
-                     * which is the single `f2bf` on the store. op 194/195 read these same tables
+                     * which is the single `f2bf` on the store. op 206/207 read these same tables
                      * as f32 for the same reason. */
                     const float c = cos[(size_t)pos * half + (lane >> 1)];
                     const float s = sin[(size_t)pos * half + (lane >> 1)];

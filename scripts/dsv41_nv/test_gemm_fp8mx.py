@@ -1,4 +1,4 @@
-"""GemmFp8Mx (op 198) role object in a real packet: the bf16-decode arm (i6 = 0, x = act_quant's
+"""GemmFp8Mx (op 210) role object in a real packet: the bf16-decode arm (i6 = 0, x = act_quant's
 fake-quant bf16) and the fp8 arm (i6 = 1, x = e4m3 + t4 ue8m0 scales) against kernel.py fp8_gemm.
 
   PACKET_OP=<packet_op> FP8MX_CUBIN=<interp_sm90a_pfgemm_fp8mx.cubin> \\

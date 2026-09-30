@@ -1493,7 +1493,7 @@ __device__ void d_gemm_fp8_blk(bf16* C, const bf16* A, const unsigned char* W,
  * drain every 32 k-elements, in the same order, over the same terms -- and halves the tile-level
  * stage and barrier count.
  *
- * MEASURED at V4.1 8k/TP8, op 198 body over 330 packets:
+ * MEASURED at V4.1 8k/TP8, op 210 body over 330 packets:
  *   128x128 BK=32  124.1 ms   straggler 164 us/pk
  *   128x128 BK=64  118.5 ms   straggler 157 us/pk   <-- default
  *    64x128 BK=64  146.4 ms   straggler 117 us/pk

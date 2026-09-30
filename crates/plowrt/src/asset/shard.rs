@@ -224,7 +224,7 @@ pub fn shard_of(name: &str) -> Shard {
         // 384 006 168 rows of 256 fp8 = 98.31 GB, and there are two of them against 192 GB of
         // HBM, so a replicated copy does not fit on one card at all. `ParallelEngramEmbedding`
         // shards exactly this way -- `part_num_embeddings = ceil(rows / world_size)`,
-        // `vocab_start = rank * part` (`model.py:303-305`) -- and op 197 writes zeros for any id
+        // `vocab_start = rank * part` (`model.py:303-305`) -- and op 209 writes zeros for any id
         // outside the shard, which the emit's XReduce then sums. Both `.weight` [rows, 256] and
         // `.scale` [rows, 8] are 2-D and cut on the same row axis, so they ride the one substring.
         "engram.embed.",

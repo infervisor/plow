@@ -269,24 +269,24 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #define PLOW_NV_PREFILL 0
 #endif
 #include "op_norm.cuh"
-#include "../common/op_act_quant_mx.h" /* DeepSeek-V4.1 act fake quant (op 200) */
+#include "../common/op_act_quant_mx.h" /* DeepSeek-V4.1 act fake quant (op 212) */
 #if !defined(PLOW_CONFIG) || PLOW_HAS_XREDUCE || PLOW_HAS_XREDUCE2
 #define NV_COLLECTIVES 1
 #include "op_collective.cuh" /* TP all-reduce (ops 24, 29) */
 #endif
 #include "op_hyperconn.cuh" /* mHC pre/post (ops 128/129) */
 #include "op_gemm_f32.cuh" /* fp32-output projections (ops 135/180) */
-#include "op_gemv_fp8mx.cuh" /* V4.1 block-fp8 [32,32] projections at decode rows (op 198) */
-#include "op_engram.cuh"     /* V4.1 Engram (ops 196/197) + f32 argmax (op 173) */
-#include "op_sparse_attn_decode.cuh" /* V4.1 batched decode attention (ops 201/202) */
-#include "op_index_decode.cuh"       /* V4.1 batched decode indexer (ops 204/205) */
+#include "op_gemv_fp8mx.cuh" /* V4.1 block-fp8 [32,32] projections at decode rows (op 210) */
+#include "op_engram.cuh"     /* V4.1 Engram (ops 208/209) + f32 argmax (op 173) */
+#include "op_sparse_attn_decode.cuh" /* V4.1 batched decode attention (ops 213/214) */
+#include "op_index_decode.cuh"       /* V4.1 batched decode indexer (ops 216/217) */
 #if defined(PLOW_NV_HOPPER) && !PLOW_NV_PREFILL && defined(PLOW_HAS_MOE_GROUP_GLU_PF) && PLOW_HAS_MOE_GROUP_GLU_PF
 #define PLOW_NV_MOE_DEC_V41 1
 #include "op_moe_decode_v41.cuh" /* V4.1 routed experts at decode rows (ops 85/86 decode arms) */
 #else
 #define PLOW_NV_MOE_DEC_V41 0
 #endif
-#include "op_compress.cuh" /* V4.1 KV compressor tail (ops 194/195/199) */
+#include "op_compress.cuh" /* V4.1 KV compressor tail (ops 206/207/211) */
 #if PLOW_NV_PREFILL
 #include "op_index_pf.cuh" /* DSA sparse-prefill indexer (ops 117-119) */
 #include "op_v41_flash.cuh" /* V4.1 sparse attention (op 51, NoPE) */
@@ -1427,7 +1427,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 #endif
     case PLOW_DOP_GEMM_FP8_MX: {
-        /* decode rows only; prefill runs op 198 on the sm_90a role object */
+        /* decode rows only; prefill runs op 210 on the sm_90a role object */
         const unsigned groups = in->i[3] ? in->i[3] : 1u, ldx = groups * in->i[2];
         /* i6: 0 = bf16 x, 1 = e4m3 x + t4 scales, 2 = bf16 x quantized in the op (ActQuantMx numerics),
          * 3 = as 2 on Glu(x = gate, t4 = up, i7 = act, f1 = limit) */

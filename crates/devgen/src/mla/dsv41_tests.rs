@@ -283,7 +283,7 @@ fn the_block_fp8_grid_is_32_not_128_and_the_scales_are_e8m0() {
 ///
 /// This test used to assert the opposite -- that the block-FP8 grid came first -- and it was right
 /// to, because a reader who started building emit features would otherwise have hit
-/// `mla_ckpt_enc`'s refusal with all that work done. That gate is now CLOSED: op 198 and
+/// `mla_ckpt_enc`'s refusal with all that work done. That gate is now CLOSED: op 210 and
 /// `d_gemm_t<WFP8MX>` read the [32,32] ue8m0 grid, pass 12/12 on gfx942, and `emit_pf_gemm_fp8_mx`
 /// emits it.
 ///
@@ -309,7 +309,7 @@ fn the_refusal_leads_with_the_emit_and_the_closed_kernel_gate_is_gone() {
     let joined = gaps.join("\n");
     assert!(
         !joined.contains("block-FP8 at ["),
-        "the block-FP8 grid gate is closed (op 198, verified on gfx942) and must not still be \
+        "the block-FP8 grid gate is closed (op 210, verified on gfx942) and must not still be \
          listed as missing:\n{joined}"
     );
     assert!(
@@ -322,7 +322,7 @@ fn the_refusal_leads_with_the_emit_and_the_closed_kernel_gate_is_gone() {
     assert!(joined.contains("two-level indexer"), "the indexer is still missing:\n{joined}");
 }
 
-/// The op-198 emit primitive, pinned the way `glm_linear_fp8_prefill_routes_to_the_block_fp8_gemm`
+/// The op-210 emit primitive, pinned the way `glm_linear_fp8_prefill_routes_to_the_block_fp8_gemm`
 /// pins 107's: as a PURE function, not by setting a knob. The knob is process-global env state and
 /// cargo runs tests in parallel threads, so a sibling that counts tensors would see this one's
 /// handles appear under it.
@@ -813,7 +813,7 @@ fn the_shared_expert_uses_the_clamped_swiglu_not_plain_silu() {
     );
     assert_eq!([glu.t[1], glu.t[2]], [act.sh_gate, act.sh_up]);
 
-    // Three op-198 GEMMs: gate, up, down. The shared expert is block-FP8, NOT fp4 — that is what
+    // Three op-210 GEMMs: gate, up, down. The shared expert is block-FP8, NOT fp4 — that is what
     // makes this checkpoint mixed, and routing it to the MXFP4 expert path would be the error.
     let g: Vec<_> = p
         .insts
@@ -1003,7 +1003,7 @@ fn the_routed_experts_run_glms_prefill_body_at_v41_shapes() {
         d.f[0] = eps;
     });
     let mut xgate = 0;
-    // The shared expert is emitted separately (block-FP8, op 198); the MoE body only combines it.
+    // The shared expert is emitted separately (block-FP8, op 210); the MoE body only combines it.
     let sh = b.tensor("act.shared", (t as u64) * (cfg.hidden as u64) * 2);
     super::dsv41::emit_dsv41_moe(
         &mut b, &cfg, &w, 0, tp, t, x_out, xn2, c_norm, (sh, c_norm), &mut xgate, &all, cfg.hidden, t,
@@ -1205,14 +1205,14 @@ fn the_attention_core_is_windowed_nope_mla_over_the_shared_latent() {
 
     // THE INVERSE ROPE CLOSES THE CORE, and it is the last op, not an optional epilogue.
     // `Attention.forward` runs it on every layer (model.py:781) and the emit used to stop at the
-    // merge -- op 195 existed with no emit site. Without it `o` still carries the query's
+    // merge -- op 207 existed with no emit site. Without it `o` still carries the query's
     // rotation and the fixed `wo_a` reads a position-DEPENDENT latent.
     let ir = p
         .insts
         .iter()
         .find(|d| d.op == DevOp::RopeInverseO as u16)
         .expect(
-            "the inverse rope on the attention output -- op 195, `apply_rotary_emb(o[..., -rd:], \
+            "the inverse rope on the attention output -- op 207, `apply_rotary_emb(o[..., -rd:], \
              freqs_cis, True)`",
         );
     assert_eq!(ir.t[0], act.o, "in place on the merged output");
@@ -1239,7 +1239,7 @@ fn the_attention_core_is_windowed_nope_mla_over_the_shared_latent() {
 ///     at all -- a declared-and-kept-zero tensor is a promise, a sentinel is a type.
 ///   * `coff = 1`: no overlap transform, so each pool draws from `ratio` slots and not `2*ratio`.
 ///   * `i7 = 2`: pool, norm and STOP. The latent the indexer reads is the PRE-RoPE one
-///     (`model.py:432-434`), and op 199 is what finishes it.
+///     (`model.py:432-434`), and op 211 is what finishes it.
 #[test]
 fn the_compressor_pools_with_no_ape_and_stops_before_the_rope() {
     let Some((cfg, _)) = checkpoint() else {
@@ -1277,7 +1277,7 @@ fn the_compressor_pools_with_no_ape_and_stops_before_the_rope() {
         .insts
         .iter()
         .find(|d| d.op == DevOp::CompressRopeQuant as u16)
-        .expect("op 199 finishes the cache row");
+        .expect("op 211 finishes the cache row");
     assert_eq!(tail.t[0], cp.cache, "the shared cache");
     assert_eq!(tail.t[1], cp.latent, "reading the latent it must NOT overwrite");
     assert_ne!(
@@ -1294,7 +1294,7 @@ fn the_compressor_pools_with_no_ape_and_stops_before_the_rope() {
 /// Layer 20 compresses at ratio 1, and that is a plain projection with NO pool.
 ///
 /// `Compressor.forward` returns on its first line there -- `self.norm(self.wkv(x))`, no gate, no
-/// fp32, no softmax (`model.py:461-462`). An emit that ran op 194 at ratio 1 would take a softmax
+/// fp32, no softmax (`model.py:461-462`). An emit that ran op 206 at ratio 1 would take a softmax
 /// over one slot, which is the identity, and then consult a `wgate` weight the checkpoint does
 /// not ship for that layer.
 #[test]
@@ -1335,7 +1335,7 @@ fn layer_twenty_compresses_at_ratio_one_with_no_pool() {
         .insts
         .iter()
         .find(|d| d.op == DevOp::CompressRopeQuant as u16)
-        .expect("op 199 still finishes the row");
+        .expect("op 211 still finishes the row");
     assert_eq!(tail.i[0], t, "ratio 1: one cache row per TOKEN");
     assert_eq!(tail.i[4], 1);
 }
@@ -1453,7 +1453,7 @@ fn an_index_layer_that_owns_no_keys_derives_none() {
     let _guard = crate::test_env::env_guard();
     assert!(cfg.index_source.contains(&24) && !cfg.kv_source.contains(&24));
     let (m, _) = super::dsv41::emit_dsv41_block(&cfg, &[20, 24], 8, 304, 8192, 256);
-    // op 199 runs three times per KEY-OWNING index layer (cache row, index key, queries) and
+    // op 211 runs three times per KEY-OWNING index layer (cache row, index key, queries) and
     // once for a query-only one. Layer 20 owns keys, layer 24 does not: 3 + 1.
     let tails = m
         .progs[0]
@@ -2042,12 +2042,12 @@ fn a_block_range_emits_every_layer_in_it_chained() {
 ///
 /// `Block.__init__` constructs `self.engram`, which is what makes an FFN-sublayer position look
 /// right, but `Block.forward` never calls it. `Transformer.forward` does, in the layer loop and
-/// ahead of the block (`model.py:1262-1267`), so op 196 is in place on `[T, hc_mult, dim]` --
+/// ahead of the block (`model.py:1262-1267`), so op 208 is in place on `[T, hc_mult, dim]` --
 /// the residual stream's copies -- before this layer's `mhc_pre` collapses them. An emit built off
 /// the old row order would have handed it the post-attention activation instead, which is a
 /// different tensor of a different rank.
 ///
-/// Ops 196/197 themselves ARE the reference's -- `scripts/dsv41_engram_oracle.py` measures
+/// Ops 208/209 themselves ARE the reference's -- `scripts/dsv41_engram_oracle.py` measures
 /// 0.000e+00 on the embed (including the signed out-of-shard compare) and 2.2e-16 on the gate --
 /// so placement and plumbing is the whole of what layers 1 and 14 are still missing.
 #[test]

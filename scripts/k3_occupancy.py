@@ -7,16 +7,27 @@ large straggler when nothing is straggling at all. This prints, per packet, how 
 workgroups did real work and what perfect spread would have cost, which is the question
 a narrow GEMM actually poses.
 
-Usage: k3_occupancy.py <trace.bin> [opcode]   (default 198, GemmFp8Mx)
+Usage: k3_occupancy.py <trace.bin> [opcode | PLOW_DOP_ name]   (default GEMM_FP8_MX)
 """
 
+import os
+import re
 import struct
 import sys
 from collections import defaultdict
 
 REC = struct.Struct("<IIIHHQQQ")
 TPUS = 100.0
-OP = int(sys.argv[2]) if len(sys.argv) > 2 else 198  # default GemmFp8Mx
+
+
+def dop_values():
+    """`PLOW_DOP_*` name -> opcode, read from runtime/common/dev_isa.h beside this script."""
+    isa = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runtime", "common", "dev_isa.h")
+    return {m[1]: int(m[2]) for m in re.finditer(r"PLOW_DOP_(\w+)\s*=\s*(\d+)", open(isa).read())}
+
+
+_arg = sys.argv[2] if len(sys.argv) > 2 else "GEMM_FP8_MX"
+OP = int(_arg) if _arg.isdigit() else dop_values()[_arg.removeprefix("PLOW_DOP_")]
 
 blob = open(sys.argv[1], "rb").read()
 n = len(blob) // REC.size

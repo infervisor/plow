@@ -1438,9 +1438,9 @@ pub(crate) enum MoeEnc {
 /// **Deliberately NOT a [`MoeEnc`] variant.** `MoeEnc` travels in an `i[]` slot on the grouped
 /// expert ops ([`MoeEnc::PREFILL_SLOT`] / [`MoeEnc::DECODE_SLOT`]) and names the EXPERT weights;
 /// the kernel reads the slot and branches. A dense GEMM has no such slot and needs none, because
-/// the OPCODE is the encoding: op 107 reads an f32 `[128,128]` grid, op 198 reads a ue8m0
+/// the OPCODE is the encoding: op 107 reads an f32 `[128,128]` grid, op 210 reads a ue8m0
 /// `[32,32]` one. Putting this in `MoeEnc` would add a wire value that no kernel reads and invite
-/// exactly the substitution op 198 exists to prevent.
+/// exactly the substitution op 210 exists to prevent.
 ///
 /// It exists because DeepSeek-V4.1 is the first checkpoint here whose dense and expert weights
 /// are quantized DIFFERENTLY -- `weight_block_size [32,32]` with `expert_dtype: "fp4"` -- so a
@@ -1453,7 +1453,7 @@ pub(crate) enum DenseEnc {
     /// GLM-5.2/5.3 and DeepSeek-V4.
     Fp8Blk128,
     /// Block-fp8 e4m3 on a `[32, 32]` grid with **ue8m0 byte** scales ->
-    /// [`DevOp::GemmFp8Mx`] (198). DeepSeek-V4.1, and 39.8% of its 8k prefill.
+    /// [`DevOp::GemmFp8Mx`] (210). DeepSeek-V4.1, and 39.8% of its 8k prefill.
     Fp8Mx32,
 }
 
@@ -2059,7 +2059,7 @@ fn emit_pf_gemm_fp8_blk(
 }
 
 /// One DENSE prefill GEMM against DeepSeek-V4.1's `[32, 32]` **ue8m0** block-fp8 weights —
-/// [`DevOp::GemmFp8Mx`] (198). The twin of [`emit_pf_gemm_fp8_blk`], and deliberately a separate
+/// [`DevOp::GemmFp8Mx`] (210). The twin of [`emit_pf_gemm_fp8_blk`], and deliberately a separate
 /// function for the same reason it is a separate opcode.
 ///
 /// `C[t, nn] bf16 = A[t, k] bf16 · W[nn, k] e4m3`, with the checkpoint's own
@@ -2098,7 +2098,7 @@ fn emit_pf_gemm_fp8_mx(
     emit_pf_gemm_fp8_mx_band(b, cus, out, x, wt, sc, t, nn, k, 0, deps)
 }
 
-/// [`emit_pf_gemm_fp8_mx`] over `groups` diagonal blocks (op 198 `i3`): `out [T][groups*nn] = x
+/// [`emit_pf_gemm_fp8_mx`] over `groups` diagonal blocks (op 210 `i3`): `out [T][groups*nn] = x
 /// [T][groups*k] . blockdiag(w [groups*nn][k])^T`, group g reading `x` columns `g*k..` and weight
 /// rows `g*nn..`. The output LoRA below TP8, where one rank owns several of `wo_a`'s groups.
 /// NVIDIA only: the sm_90a role object implements `i3`, the AMD arm traps on it.
@@ -2126,7 +2126,7 @@ pub(crate) fn emit_pf_gemm_fp8_mx_grouped(
     assert_eq!(sb, groups as u64 * (nn as u64 / 32) * (k as u64 / 32), "grouped GemmFp8Mx scale {:?}: {sb} bytes", b.tensor_name(sc));
     // No activation quant: its one caller is V4.1's wo_a, which the reference runs as a bf16
     // einsum against the dequantized weight (convert.py), not as an fp8 x fp8 product.
-    // Its own segment: the NVIDIA role object runs exactly one op 198 per segment.
+    // Its own segment: the NVIDIA role object runs exactly one op 210 per segment.
     let c = b.emit(DevOp::GemmFp8Mx, cus.to_vec(), deps, |d| {
         d.t[0] = out;
         d.t[1] = x;
@@ -2164,8 +2164,8 @@ pub(crate) fn nv_gemm_f32_split(b: &mut Builder, cus: usize, role: &str, m: u32,
 }
 
 /// kernel.py quantizes the activation of every block-fp8 projection (`act_quant(x, 32, "ue8m0")`);
-/// op 198 alone multiplies the bf16 row as it is. On NVIDIA the GEMM therefore reads a quantized
-/// copy (op 200) of its first `rows` rows of `x` (`k` wide), made just before it: e4m3 bytes plus
+/// op 210 alone multiplies the bf16 row as it is. On NVIDIA the GEMM therefore reads a quantized
+/// copy (op 212) of its first `rows` rows of `x` (`k` wide), made just before it: e4m3 bytes plus
 /// ue8m0 scales for the fp8 wgmma tile when `fp8` (returned scale != TENSOR_NONE), else the
 /// fake-quantized bf16. Out of place: the same activation also feeds readers the reference does
 /// not quantize (the MoE router). The AMD emit keeps its w8a16 contract unchanged.
@@ -2192,9 +2192,9 @@ fn nv_fp8_mx_act(b: &mut Builder, cus: &[u32], x: u32, rows: u32, k: u32, deps: 
     (fq, xs, vec![c])
 }
 
-/// [`Builder::memo`] key marking a decode program: there op 198 runs on the interpreter's
+/// [`Builder::memo`] key marking a decode program: there op 210 runs on the interpreter's
 /// decode-row arm, which quantizes a small x itself (i6 = 2, ActQuantMx's numerics, any K % 32)
-/// and so saves the op 200 and its hop.
+/// and so saves the op 212 and its hop.
 pub(crate) const NV_FOLD_ACT_QUANT: &str = "nv_fold_act_quant";
 
 /// [`emit_pf_gemm_fp8_mx`] over ONE row band: `t` rows starting at `row0` of both A and C. The
@@ -10047,7 +10047,7 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
          single value to return: answering with the expert encoding would declare bf16 or fp4 \
          scale grids for projections that are block-fp8 on disk, and answering with the dense one \
          would do the reverse to the experts. Take `mla_ckpt_enc_full` and carry both. The \
-         kernels are NOT the gap -- `DevOp::GemmFp8Mx` (198) and `d_gemm_t<WFP8MX>` exist and \
+         kernels are NOT the gap -- `DevOp::GemmFp8Mx` (210) and `d_gemm_t<WFP8MX>` exist and \
          pass on gfx942. Missing capability: `emit_mixed_dense_expert_encoding`.",
         ck.dense,
         ck.expert

@@ -1,4 +1,4 @@
-/* op_act_quant_mx.h -- PLOW_DOP_ACT_QUANT_MX (op 200), shared by the CUDA and HIP interpreters.
+/* op_act_quant_mx.h -- PLOW_DOP_ACT_QUANT_MX (op 212), shared by the CUDA and HIP interpreters.
  *
  * DeepSeek-V4.1's activation quant ahead of every block-fp8 GEMM (kernel.py `act_quant(x, 32,
  * "ue8m0")`), as a FAKE quant: each 32-element block of a bf16 row is scaled by

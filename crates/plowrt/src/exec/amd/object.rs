@@ -395,11 +395,11 @@ pub(super) const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // DSA indexer prep (HeadNormRope pair_mode 3). An object without the arm runs it as the plain
     // rope on the un-normed key: no trap. A BUILD axis (`#if PLOW_DSA_PREP`).
     ("PLOW_DSA_PREP", &["plow_dsa_prep_arm"]),
-    // DeepSeek-V4 CSA2 (ops 194/195). CONDITIONALLY compiled, like PLOW_MOE_PF_ATOMIC below: an
+    // DeepSeek-V4 CSA2 (ops 206/207). CONDITIONALLY compiled, like PLOW_MOE_PF_ATOMIC below: an
     // object built without -DPLOW_DSV4_CSA2=1 has no case for either op, so the packet would fall
     // through the interpreter's switch rather than compute anything. Refuse at load.
     ("PLOW_DSV4_CSA2", &["plow_dsv4_csa2_arm"]),
-    // Engram (op 196). Same standing as CSA2 above, and the silent failure is worse: the
+    // Engram (op 208). Same standing as CSA2 above, and the silent failure is worse: the
     // packet runs as a no-op and the model answers fluently without its memory.
     ("PLOW_DSV41_ENGRAM", &["plow_dsv41_engram_arm"]),
     ("PLOW_DSV41_BLKFP8", &["plow_dsv41_blkfp8_arm"]),

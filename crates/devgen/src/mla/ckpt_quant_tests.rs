@@ -93,7 +93,7 @@ fn the_v41_checkpoint_parses_as_mixed_rather_than_being_refused_outright() {
 /// side would be a lie about the other: the expert encoding would declare fp4 scale grids for
 /// projections that are block-fp8 on disk, and the dense one would do the reverse to the experts.
 ///
-/// The message must NOT read as a kernel gap, because it is not one — op 198 and
+/// The message must NOT read as a kernel gap, because it is not one — op 210 and
 /// `d_gemm_t<WFP8MX>` exist and pass on gfx942. What is missing is an emitter that can thread two
 /// encodings through one run.
 #[test]

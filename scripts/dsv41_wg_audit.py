@@ -11,6 +11,8 @@ aggregate = sum of all workgroups' busy time
 ideal304  = aggregate / 304, i.e. the wall time if the SAME work filled the machine evenly
 serial    = max / ideal304, the factor by which the op is narrower than the machine
 """
+import os
+import re
 import struct
 import sys
 from collections import defaultdict
@@ -19,12 +21,14 @@ REC = struct.Struct("<IIIHHQQQ")
 TPUS = 100.0
 NCU = 304
 
-OPS = {
-    55: "FLASH_GATHER_PREFILL", 198: "GEMM_FP8_MX", 86: "MOE_GROUP_DOWN_PF",
-    135: "GEMV_F32", 29: "XREDUCE2", 51: "FLASH_MLA_PREFILL", 85: "MOE_GROUP_GLU_PF",
-    87: "MOE_COMBINE_PF", 128: "HYPER_CONN_PRE", 129: "HYPER_CONN_POST",
-    13: "FLASH_MERGE", 83: "MOE_ROUTER_TOPK_PF", 1: "RMSNORM",
-}
+
+def dop_values():
+    """`PLOW_DOP_*` name -> opcode, read from runtime/common/dev_isa.h beside this script."""
+    isa = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runtime", "common", "dev_isa.h")
+    return {m[1]: int(m[2]) for m in re.finditer(r"PLOW_DOP_(\w+)\s*=\s*(\d+)", open(isa).read())}
+
+
+OPS = {v: k for k, v in dop_values().items()}
 
 blob = open(sys.argv[1], "rb").read()
 n = len(blob) // REC.size

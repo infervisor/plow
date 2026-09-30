@@ -2446,7 +2446,7 @@ pub enum DevOp {
     /// `t2` set (NVIDIA): the real quant -- `t0` is e4m3 `[rows][K]` and `t2` the ue8m0 exponents
     /// `[rows][K/32]`.
     ///
-    /// The reference quantizes the activation of EVERY block-fp8 projection; op 198 alone
+    /// The reference quantizes the activation of EVERY block-fp8 projection; op 210 alone
     /// multiplies the unquantized bf16 row (w8a16), which is not the model. Emitted once per
     /// activation, ahead of the GEMMs that share it, as `QuantFp8` is on the w8a8 path.
     ActQuantMx = 212,

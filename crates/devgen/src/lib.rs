@@ -9134,7 +9134,7 @@ fn dsv41_refusal(dir: &std::path::Path) -> String {
 
     out.push_str(
         " The runtime side is most of the way there -- mHC, the DSA indexer, the MXFP4 experts, \
-         the clamped SwiGLU, the CSA2 kernels (ops 194/195) and Engram (ops 196/197) all dispatch \
+         the clamped SwiGLU, the CSA2 kernels (ops 206/207) and Engram (ops 208/209) all dispatch \
          today. What the EMITTER still needs:",
     );
     for (i, gap) in mla::dsv41_gaps(&cfg).iter().enumerate() {

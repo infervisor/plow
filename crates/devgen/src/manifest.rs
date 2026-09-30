@@ -1520,7 +1520,7 @@ fn backend_amd(
     if on("moe_prefill") {
         req.push("PLOW_MOE_PREFILL=1".into());
     }
-    // DeepSeek-V4 CSA2 (ops 194/195). Its own axis for the same reason PLOW_MOE_PREFILL has one:
+    // DeepSeek-V4 CSA2 (ops 206/207). Its own axis for the same reason PLOW_MOE_PREFILL has one:
     // the compressor is a second pooling body with its own LDS staging, and only a V4 object can
     // reach it. An object without the axis has no case for either op, so a CSA2 packet would fall
     // through the interpreter's switch -- which is what `plow_dsv4_csa2_arm` lets the loader
@@ -1528,15 +1528,15 @@ fn backend_amd(
     if has("CompressPool") || has("CompressRopeQuant") || has("RopeInverseO") {
         req.push("PLOW_DSV4_CSA2=1".into());
     }
-    // Engram (op 196). Separate from CSA2 above: V4 has the compressor without the tables, and
+    // Engram (op 208). Separate from CSA2 above: V4 has the compressor without the tables, and
     // only two V4.1 layers carry one. An object without the axis has no case for the op, so the
     // packet would run as a no-op and the stream would simply lose its memory contribution.
     if has("EngramGate") || has("EngramEmbed") {
         req.push("PLOW_DSV41_ENGRAM=1".into());
     }
-    // V4.1's [32,32] ue8m0 block-fp8 GEMM (op 198). Its own axis, not folded into the Engram one:
+    // V4.1's [32,32] ue8m0 block-fp8 GEMM (op 210). Its own axis, not folded into the Engram one:
     // the projections need it on EVERY layer where Engram is on two, and a V4.1 object could in
-    // principle want one without the other. Without the axis there is no case for op 198 and the
+    // principle want one without the other. Without the axis there is no case for op 210 and the
     // packet would fall through the switch, leaving every projection's output untouched.
     if has("GemmFp8Mx") {
         req.push("PLOW_DSV41_BLKFP8=1".into());
